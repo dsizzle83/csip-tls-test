@@ -1,25 +1,28 @@
 #!/bin/bash
 # Generates the test certificate fixtures used by integration tests in
-# the tlsserver package. These are deliberately isolated from the
-# production cert vault at ~/csip-tls-test/certs/ — different CA,
-# different filenames, different scope.
+# the tlsserver and tlsclient packages. Both packages use the same
+# certs, so we generate them once and copy into each package's
+# testdata directory.
 #
-# Run this once after cloning, or whenever you want to refresh the
-# fixtures. The Makefile target `make gen-test-certs` does the same thing.
+# Run: bash scripts/gen-test-certs.sh   (or `make gen-test-certs`)
 set -euo pipefail
 
-cd "$(dirname "$0")"
-CERTS=./certs
+# Find the repo root regardless of where this script is invoked from.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SERVER_CERTS="$REPO_ROOT/internal/tlsserver/testdata/certs"
+CLIENT_CERTS="$REPO_ROOT/internal/tlsclient/testdata/certs"
+
 WORK=$(mktemp -d)
 trap "rm -rf $WORK" EXIT
 
-mkdir -p $CERTS
+mkdir -p "$WORK/certs"
+CERTS="$WORK/certs"
 
 # === Primary test CA ========================================================
 openssl ecparam -name prime256v1 -genkey -noout -out $CERTS/ca-key.pem
 openssl req -x509 -new -key $CERTS/ca-key.pem -days 3650 \
     -out $CERTS/ca-cert.pem \
-    -subj "/CN=tlsserver Test CA" \
+    -subj "/CN=csip-tls-test Test CA" \
     -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" \
     -sha256
@@ -27,7 +30,7 @@ openssl req -x509 -new -key $CERTS/ca-key.pem -days 3650 \
 # === Server cert ============================================================
 openssl ecparam -name prime256v1 -genkey -noout -out $CERTS/server-key.pem
 openssl req -new -key $CERTS/server-key.pem -out $WORK/server.csr \
-    -subj "/CN=tlsserver-test"
+    -subj "/CN=csip-tls-test-server"
 
 cat > $WORK/server-ext.cnf <<'EOF'
 basicConstraints = critical,CA:FALSE
@@ -44,10 +47,10 @@ openssl x509 -req -in $WORK/server.csr \
     -out $CERTS/server-cert.pem -days 365 \
     -extfile $WORK/server-ext.cnf -sha256
 
-# === Good client cert (signed by primary CA) ===============================
+# === Good client cert =======================================================
 openssl ecparam -name prime256v1 -genkey -noout -out $CERTS/client-key.pem
 openssl req -new -key $CERTS/client-key.pem -out $WORK/client.csr \
-    -subj "/CN=tlsserver-test-client"
+    -subj "/CN=csip-tls-test-client"
 
 cat > $WORK/client-ext.cnf <<'EOF'
 basicConstraints = critical,CA:FALSE
@@ -61,8 +64,6 @@ openssl x509 -req -in $WORK/client.csr \
     -extfile $WORK/client-ext.cnf -sha256
 
 # === Wrong CA + client signed by it (negative test fixture) ================
-# This is a completely separate CA used to test that the server rejects
-# client certs not signed by the trusted CA.
 openssl ecparam -name prime256v1 -genkey -noout -out $CERTS/wrong-ca-key.pem
 openssl req -x509 -new -key $CERTS/wrong-ca-key.pem -days 3650 \
     -out $CERTS/wrong-ca-cert.pem \
@@ -82,5 +83,12 @@ openssl x509 -req -in $WORK/wrong.csr \
 chmod 600 $CERTS/*-key.pem
 rm -f $CERTS/ca-cert.srl $CERTS/wrong-ca-cert.srl
 
-echo "✓ Test certs generated in $CERTS/"
-ls -l $CERTS/
+# Distribute to both package testdata dirs
+mkdir -p "$SERVER_CERTS" "$CLIENT_CERTS"
+cp $CERTS/*.pem "$SERVER_CERTS/"
+cp $CERTS/*.pem "$CLIENT_CERTS/"
+
+echo "✓ Test certs generated"
+echo "  → $SERVER_CERTS"
+echo "  → $CLIENT_CERTS"
+ls -l "$SERVER_CERTS"

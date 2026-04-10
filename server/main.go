@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"csip-tls-test/internal/tlsserver"
+	"csip-tls-test/internal/wolfssl"
 )
 
 func main() {
@@ -20,8 +21,8 @@ func main() {
 	)
 	flag.Parse()
 
-	tlsserver.Init()
-	defer tlsserver.Cleanup()
+	wolfssl.Init()
+	defer wolfssl.Cleanup()
 
 	srv, err := tlsserver.New(tlsserver.Config{
 		CACertPath:     *caCert,
@@ -40,13 +41,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-
 	log.Printf("Server listening on %s (mTLS, cipher=%s)",
 		lis.Addr(), tlsserver.DefaultCipherList)
 
-	// Graceful shutdown on SIGINT/SIGTERM. Closing the listener
-	// causes Serve to return cleanly; we then call srv.Close to drain
-	// in-flight handlers and free the wolfSSL ctx.
+	// Graceful shutdown on SIGINT/SIGTERM.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

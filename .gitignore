@@ -1,0 +1,19 @@
+# Build outputs
+bin/
+
+# Test cert fixtures (regenerable via `make gen-test-certs`)
+internal/tlsserver/testdata/certs/
+internal/tlsclient/testdata/certs/
+
+# Golden files DO get committed — they're part of the test suite
+!internal/tlsserver/testdata/golden/
+
+# Go build cache
+*.test
+*.out
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp
+*~

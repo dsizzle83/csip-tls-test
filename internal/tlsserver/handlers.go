@@ -6,9 +6,6 @@ import (
 )
 
 // dcapXML is the canonical DeviceCapability response for Milestone 2.
-// As we implement more 2030.5 resources in later milestones, child
-// links here will be expanded into actual handlers and the SunSpec
-// test harness will be able to walk the resource tree.
 const dcapXML = `<?xml version="1.0" encoding="UTF-8"?>
 <DeviceCapability xmlns="urn:ieee:std:2030.5:ns" href="/dcap">
   <EndDeviceListLink href="/edev" all="0"/>
@@ -17,15 +14,9 @@ const dcapXML = `<?xml version="1.0" encoding="UTF-8"?>
   <TimeLink href="/tm"/>
 </DeviceCapability>`
 
-// route is a deliberately minimal HTTP request router. It only
-// inspects the request line — no header parsing, no body handling.
-// This is sufficient for Milestone 2 GET-only resources. When Milestone
-// 3 introduces POST bodies for SEP XML payloads, this gets replaced by
-// a proper HTTP request parser.
-//
-// Kept as a pure function (no wolfSSL types, no I/O) so it can be
-// unit-tested without spinning up the TLS stack. New routes get added
-// here as switch cases; new resources get tested in handlers_test.go.
+// route is a deliberately minimal HTTP request router. Pure Go, no
+// wolfSSL types — testable as a unit. Replaced by a real HTTP parser
+// when Milestone 3 introduces POST bodies.
 func route(request []byte) []byte {
 	line, _, _ := bytes.Cut(request, []byte("\r\n"))
 	parts := bytes.SplitN(line, []byte(" "), 3)

@@ -1,0 +1,19 @@
+package tlsclient
+
+import "fmt"
+
+// buildGetRequest constructs an HTTP/1.1 GET request for the given path.
+// The Host header is required by HTTP/1.1 and 2030.5 conformance test
+// harnesses verify it; we use the configured server address as the
+// Host value, stripping the port if it's present (the spec wants the
+// hostname only when no port-significance is intended, but accepts the
+// host:port form too — we use host:port for clarity).
+func buildGetRequest(path, host string) []byte {
+	return []byte(fmt.Sprintf(
+		"GET %s HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Accept: application/sep+xml\r\n"+
+			"Connection: close\r\n"+
+			"\r\n",
+		path, host))
+}
