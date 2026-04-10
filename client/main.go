@@ -12,10 +12,10 @@ import (
 
 func main() {
 	var (
-		serverAddr = flag.String("server", "127.0.0.1:11111", "server address:port")
-		caCert     = flag.String("ca", "/home/dmitri/csip-tls-test/internal/tlsclient/testdata/certs/ca-cert.pem", "CA cert PEM path")
-		clientCert = flag.String("cert", "/home/dmitri/csip-tls-test/internal/tlsclient/testdata/certs/client-cert.pem", "client cert PEM path")
-		clientKey  = flag.String("key", "/home/dmitri/csip-tls-test/internal/tlsclient/testdata/certs/client-key.pem", "client key PEM path")
+		serverAddr = flag.String("server", "192.168.0.188:11111", "server address:port")
+		caCert     = flag.String("ca", "/home/dmitri/csip-tls-test/certs/ca-cert.pem", "CA cert PEM path")
+		clientCert = flag.String("cert", "/home/dmitri/csip-tls-test/certs/client-cert.pem", "client cert PEM path")
+		clientKey  = flag.String("key", "/home/dmitri/csip-tls-test/certs/client-key.pem", "client key PEM path")
 		verbose    = flag.Bool("v", false, "verbose: print full DCAP response")
 	)
 	flag.Parse()
