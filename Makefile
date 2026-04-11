@@ -1,6 +1,6 @@
-.PHONY: all build build-server build-client \
+.PHONY: all build build-server build-client sync-pi \
         test test-fast test-integration test-update-golden \
-        gen-test-certs smoke-pi clean help
+        gen-test-certs gen-client-cert smoke-pi clean help
 
 REPO_ROOT     := $(shell pwd)
 SERVER_CERTS  := internal/tlsserver/testdata/certs
@@ -20,6 +20,21 @@ build-server:
 build-client:
 	@mkdir -p bin
 	go build -o bin/client ./client
+
+# Sync source files to the Pi for a native build.
+# wolfSSL headers are not available for arm64 on WSL, so we build on the Pi.
+# The Pi must have Go and wolfSSL installed.
+# Override PI_HOST: make sync-pi PI_HOST=user@hostname
+PI_HOST ?= dmitri@192.168.0.81
+PI_DIR  ?= ~/csip-tls-test
+
+sync-pi:
+	ssh $(PI_HOST) "mkdir -p $(PI_DIR)/client $(PI_DIR)/internal/wolfssl $(PI_DIR)/internal/tlsclient $(PI_DIR)/bin"
+	scp go.mod $(PI_HOST):$(PI_DIR)/
+	scp client/main.go $(PI_HOST):$(PI_DIR)/client/
+	scp internal/wolfssl/wolfssl.go $(PI_HOST):$(PI_DIR)/internal/wolfssl/
+	scp $(filter-out %_test.go, $(wildcard internal/tlsclient/*.go)) $(PI_HOST):$(PI_DIR)/internal/tlsclient/
+	@echo "Source synced. On the Pi, run: cd $(PI_DIR) && go build -o bin/client ./client"
 
 # === Test targets ===========================================================
 
@@ -46,6 +61,12 @@ test-update-golden:
 # Manual cert regeneration.
 gen-test-certs:
 	bash scripts/gen-test-certs.sh
+
+# Generate a client cert for a DER device from the existing production CA.
+# Output lands in certs/client-staging/. SCP to device, then delete staging.
+# Override CN: make gen-client-cert CN=csip-pi-002
+gen-client-cert:
+	bash scripts/gen-client-cert.sh $(CN)
 
 # Auto-generate certs on first test run via dependency tracking.
 $(CA_CERT):
@@ -75,6 +96,8 @@ help:
 	@echo "  make build               Build both client and server binaries"
 	@echo "  make build-server        Build only the server binary"
 	@echo "  make build-client        Build only the client binary"
+	@echo "  make sync-pi             Sync client source to Pi for native build"
+	@echo "                           Override: make sync-pi PI_HOST=user@host"
 	@echo ""
 	@echo "Test:"
 	@echo "  make test                Run all tests (unit + integration)"
@@ -84,6 +107,9 @@ help:
 	@echo ""
 	@echo "Fixtures:"
 	@echo "  make gen-test-certs      Regenerate test cert fixtures"
+	@echo "  make gen-client-cert     Issue a client cert from the production CA"
+	@echo "                           Output: certs/client-staging/ — SCP then delete"
+	@echo "                           Override CN: make gen-client-cert CN=csip-pi-002"
 	@echo ""
 	@echo "Hardware validation:"
 	@echo "  make smoke-pi            Cross-compile, deploy to Pi, run smoke test"

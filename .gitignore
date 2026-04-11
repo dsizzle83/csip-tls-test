@@ -1,5 +1,14 @@
 # Build outputs
 bin/
+gridsim-client
+gridsim-server
+
+# Private keys — never commit, ever.
+# This catches server-key.pem, client-key.pem, vault/ca-key.pem, test keys, all of them.
+*-key.pem
+
+# Temporary client cert staging (SCP private key to device, then delete)
+certs/client-staging/
 
 # Test cert fixtures (regenerable via `make gen-test-certs`)
 internal/tlsserver/testdata/certs/
@@ -8,7 +17,7 @@ internal/tlsclient/testdata/certs/
 # Golden files DO get committed — they're part of the test suite
 !internal/tlsserver/testdata/golden/
 
-# Go build cache
+# Go test artifacts
 *.test
 *.out
 
