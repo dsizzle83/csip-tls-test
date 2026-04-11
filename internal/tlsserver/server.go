@@ -30,6 +30,12 @@ type Server struct {
 	// of the built-in static /dcap route. When nil, the built-in router
 	// is used (safe for existing tests).
 	Handler http.Handler
+
+	// OnClientCert, if non-nil, is called once per successful handshake
+	// with the DER-encoded peer certificate. Use this to extract the LFDI
+	// from the live cert rather than pre-computing it from a file on disk
+	// (Step A). Wired in production to gridsim.SetClientCertDER.
+	OnClientCert func(der []byte)
 }
 
 // New constructs a Server, loading certs and configuring mTLS.
@@ -129,6 +135,11 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	if s.OnHandshake != nil {
 		s.OnHandshake(wolfssl.Version(ssl), wolfssl.CipherName(ssl))
+	}
+	if s.OnClientCert != nil {
+		if der := wolfssl.PeerCertificateDER(ssl); der != nil {
+			s.OnClientCert(der)
+		}
 	}
 
 	s.handleRequest(ssl)

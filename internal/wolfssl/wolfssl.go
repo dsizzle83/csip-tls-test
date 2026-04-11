@@ -175,6 +175,24 @@ func SetFD(ssl unsafe.Pointer, fd int) error {
 	return nil
 }
 
+// PeerCertificateDER returns the DER-encoded peer certificate presented
+// during the handshake, or nil if no cert was presented.
+// Only valid after a successful Accept or Connect call.
+func PeerCertificateDER(ssl unsafe.Pointer) []byte {
+	x509 := C.wolfSSL_get_peer_certificate((*C.WOLFSSL)(ssl))
+	if x509 == nil {
+		return nil
+	}
+	defer C.wolfSSL_X509_free(x509)
+
+	var sz C.int
+	der := C.wolfSSL_X509_get_der(x509, &sz)
+	if der == nil || sz <= 0 {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(der), sz)
+}
+
 // Accept performs the server-side TLS handshake.
 func Accept(ssl unsafe.Pointer) error {
 	ret := int(C.wolfSSL_accept((*C.WOLFSSL)(ssl)))

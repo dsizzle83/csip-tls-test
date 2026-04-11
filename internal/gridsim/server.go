@@ -18,8 +18,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
+	"csip-tls-test/internal/csip/identity"
 	"csip-tls-test/internal/csip/model"
 )
 
@@ -28,9 +30,11 @@ const ContentType = "application/sep+xml"
 
 // Server holds the resource tree and serves it over HTTP.
 type Server struct {
+	mu         sync.RWMutex
 	resources  map[string]interface{} // path → resource struct
 	mux        *http.ServeMux
 	ClientLFDI string // The LFDI of the client we expect to connect
+	clientSFDI uint64 // derived from ClientLFDI; updated by SetClientCertDER
 }
 
 // NewServer creates a grid sim with a complete CSIP conformance resource tree.
@@ -51,6 +55,63 @@ func (s *Server) Handler() http.Handler {
 	return s.mux
 }
 
+// SetClientCertDER derives the LFDI and SFDI from the peer certificate's DER
+// bytes and rebuilds the /edev resource. Call this once per connection after
+// the mTLS handshake completes. Safe to call from any goroutine.
+func (s *Server) SetClientCertDER(der []byte) {
+	lfdi, sfdi := identity.FromCertificateDER(der)
+	s.mu.Lock()
+	s.ClientLFDI = lfdi.String()
+	s.clientSFDI = uint64(sfdi)
+	s.rebuildEndDeviceList()
+	s.mu.Unlock()
+	log.Printf("[gridsim] client identity from cert: LFDI=%s SFDI=%d", lfdi, sfdi)
+}
+
+// rebuildEndDeviceList reconstructs the /edev resource with the current
+// ClientLFDI and clientSFDI. Caller must hold s.mu for writing.
+func (s *Server) rebuildEndDeviceList() {
+	boolTrue := true
+	now := time.Now().Unix()
+
+	s.resources["/edev"] = &model.EndDeviceList{
+		Resource: model.Resource{Href: "/edev"},
+		All:      3,
+		Results:  3,
+		PollRate: 300,
+		EndDevice: []model.EndDevice{
+			{
+				Resource:    model.Resource{Href: "/edev/0"},
+				LFDI:        "0000000000000000000000000000000000000001",
+				SFDI:        100000001,
+				ChangedTime: now - 1000,
+			},
+			{
+				Resource:    model.Resource{Href: "/edev/1"},
+				LFDI:        "0000000000000000000000000000000000000002",
+				SFDI:        100000002,
+				ChangedTime: now - 500,
+			},
+			{
+				Resource:         model.Resource{Href: "/edev/2"},
+				LFDI:             s.ClientLFDI,
+				SFDI:             s.clientSFDI, // uint64, matches model.EndDevice.SFDI
+				ChangedTime:      now,
+				Enabled:          &boolTrue,
+				RegistrationLink: &model.Link{Href: "/edev/2/reg"},
+				DERListLink: &model.ListLink{
+					Link: model.Link{Href: "/edev/2/der"},
+					All:  1,
+				},
+				FunctionSetAssignmentsListLink: &model.ListLink{
+					Link: model.Link{Href: "/edev/2/fsa"},
+					All:  1,
+				},
+			},
+		},
+	}
+}
+
 // handleRequest serves any registered resource as XML with the correct content type.
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -62,7 +123,10 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.mu.RLock()
 	resource, ok := s.resources[path]
+	s.mu.RUnlock()
+
 	if !ok {
 		log.Printf("[gridsim] 404: no resource at %s", path)
 		w.WriteHeader(http.StatusNotFound)
