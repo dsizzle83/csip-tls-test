@@ -1,8 +1,10 @@
 package tlsserver
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"net/http"
 )
 
 // dcapXML is the canonical DeviceCapability response for Milestone 2.
@@ -35,11 +37,56 @@ func route(request []byte) []byte {
 	}
 }
 
+// dispatchHTTP bridges a raw wolfSSL request buffer to an http.Handler.
+// It parses the HTTP request, captures the handler's response via a
+// buffered ResponseWriter, then serialises the result back to raw bytes
+// for wolfssl.Write. Only one round-trip per connection is supported
+// (Connection: close).
+func dispatchHTTP(h http.Handler, raw []byte) []byte {
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
+	if err != nil {
+		return httpResponse(400, "text/plain", []byte("bad request"))
+	}
+	w := &bufferedResponseWriter{
+		header:     make(http.Header),
+		statusCode: http.StatusOK,
+	}
+	h.ServeHTTP(w, req)
+	return httpResponse(w.statusCode, w.header.Get("Content-Type"), w.body.Bytes())
+}
+
+// bufferedResponseWriter captures an http.Handler's response so it can
+// be written back over a raw wolfSSL connection.
+type bufferedResponseWriter struct {
+	header      http.Header
+	body        bytes.Buffer
+	statusCode  int
+	wroteHeader bool
+}
+
+func (w *bufferedResponseWriter) Header() http.Header { return w.header }
+
+func (w *bufferedResponseWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.body.Write(b)
+}
+
+func (w *bufferedResponseWriter) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.statusCode = code
+		w.wroteHeader = true
+	}
+}
+
 func httpResponse(status int, contentType string, body []byte) []byte {
 	statusText := map[int]string{
 		200: "OK",
 		400: "Bad Request",
 		404: "Not Found",
+		405: "Method Not Allowed",
+		500: "Internal Server Error",
 	}[status]
 	if statusText == "" {
 		statusText = "Unknown"

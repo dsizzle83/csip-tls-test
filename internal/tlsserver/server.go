@@ -3,6 +3,7 @@ package tlsserver
 import (
 	"errors"
 	"net"
+	"net/http"
 	"sync"
 	"unsafe"
 
@@ -23,6 +24,12 @@ type Server struct {
 	// to assert CSIP cipher compliance from the server side; production
 	// binaries can use it for structured logging.
 	OnHandshake func(version, cipher string)
+
+	// Handler, if non-nil, is the http.Handler that serves every request.
+	// Set this to sim.Handler() to route requests through gridsim instead
+	// of the built-in static /dcap route. When nil, the built-in router
+	// is used (safe for existing tests).
+	Handler http.Handler
 }
 
 // New constructs a Server, loading certs and configuring mTLS.
@@ -134,6 +141,11 @@ func (s *Server) handleRequest(ssl unsafe.Pointer) {
 	if err != nil || n == 0 {
 		return
 	}
-	resp := route(buf[:n])
+	var resp []byte
+	if s.Handler != nil {
+		resp = dispatchHTTP(s.Handler, buf[:n])
+	} else {
+		resp = route(buf[:n])
+	}
 	_, _ = wolfssl.Write(ssl, resp)
 }
