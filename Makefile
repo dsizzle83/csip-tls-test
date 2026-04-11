@@ -1,4 +1,4 @@
-.PHONY: all build build-server build-client sync-pi \
+.PHONY: all build build-server build-client sync-pi start-server \
         test test-fast test-integration test-update-golden \
         gen-test-certs gen-client-cert smoke-pi clean help
 
@@ -29,12 +29,11 @@ PI_HOST ?= dmitri@192.168.0.81
 PI_DIR  ?= ~/csip-tls-test
 
 sync-pi:
-	ssh $(PI_HOST) "mkdir -p $(PI_DIR)/client $(PI_DIR)/internal/wolfssl $(PI_DIR)/internal/tlsclient $(PI_DIR)/bin"
-	scp go.mod $(PI_HOST):$(PI_DIR)/
-	scp client/main.go $(PI_HOST):$(PI_DIR)/client/
-	scp internal/wolfssl/wolfssl.go $(PI_HOST):$(PI_DIR)/internal/wolfssl/
-	scp $(filter-out %_test.go, $(wildcard internal/tlsclient/*.go)) $(PI_HOST):$(PI_DIR)/internal/tlsclient/
-	@echo "Source synced. On the Pi, run: cd $(PI_DIR) && go build -o bin/client ./client"
+	rsync -a --delete \
+	    --exclude=bin/ --exclude='*-key.pem' --exclude='.git/' \
+	    ./ $(PI_HOST):$(PI_DIR)/
+	ssh $(PI_HOST) "mkdir -p $(PI_DIR)/bin && cd $(PI_DIR) && go build -o bin/client ./client"
+	@echo "Source synced and client built on Pi at $(PI_DIR)/bin/client"
 
 # === Test targets ===========================================================
 
@@ -72,6 +71,11 @@ gen-client-cert:
 $(CA_CERT):
 	@echo "Test certs missing — generating..."
 	@bash scripts/gen-test-certs.sh
+
+# Start the production server (WSL desktop, for Pi smoke test).
+# Run this in a separate terminal before `make smoke-pi`.
+start-server: build-server
+	./bin/server
 
 # === Pi deployment smoke test ==============================================
 
