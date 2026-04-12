@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // dcapXML is the canonical DeviceCapability response for Milestone 2.
@@ -38,21 +39,24 @@ func route(request []byte) []byte {
 }
 
 // dispatchHTTP bridges a raw wolfSSL request buffer to an http.Handler.
-// It parses the HTTP request, captures the handler's response via a
-// buffered ResponseWriter, then serialises the result back to raw bytes
-// for wolfssl.Write. Only one round-trip per connection is supported
-// (Connection: close).
-func dispatchHTTP(h http.Handler, raw []byte) []byte {
+// It parses the HTTP request, injects the peer LFDI as X-Peer-LFDI,
+// captures the handler's response via a buffered ResponseWriter, then
+// serialises the result back to raw bytes for wolfssl.Write. Only one
+// round-trip per connection is supported (Connection: close).
+func dispatchHTTP(h http.Handler, raw []byte, peerLFDI string) []byte {
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
 	if err != nil {
 		return httpResponse(400, "text/plain", []byte("bad request"))
+	}
+	if peerLFDI != "" {
+		req.Header.Set("X-Peer-LFDI", peerLFDI)
 	}
 	w := &bufferedResponseWriter{
 		header:     make(http.Header),
 		statusCode: http.StatusOK,
 	}
 	h.ServeHTTP(w, req)
-	return httpResponse(w.statusCode, w.header.Get("Content-Type"), w.body.Bytes())
+	return buildHTTPResponse(w.statusCode, w.header, w.body.Bytes())
 }
 
 // bufferedResponseWriter captures an http.Handler's response so it can
@@ -80,10 +84,15 @@ func (w *bufferedResponseWriter) WriteHeader(code int) {
 	}
 }
 
-func httpResponse(status int, contentType string, body []byte) []byte {
+// buildHTTPResponse serializes an HTTP response from status, headers, and body.
+// Forwards Content-Type and Location from the handler's response headers.
+func buildHTTPResponse(status int, headers http.Header, body []byte) []byte {
 	statusText := map[int]string{
 		200: "OK",
+		201: "Created",
+		204: "No Content",
 		400: "Bad Request",
+		403: "Forbidden",
 		404: "Not Found",
 		405: "Method Not Allowed",
 		500: "Internal Server Error",
@@ -91,11 +100,29 @@ func httpResponse(status int, contentType string, body []byte) []byte {
 	if statusText == "" {
 		statusText = "Unknown"
 	}
-	return []byte(fmt.Sprintf(
-		"HTTP/1.1 %d %s\r\n"+
-			"Content-Type: %s\r\n"+
-			"Content-Length: %d\r\n"+
-			"Connection: close\r\n"+
-			"\r\n%s",
-		status, statusText, contentType, len(body), body))
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "HTTP/1.1 %d %s\r\n", status, statusText)
+	if ct := headers.Get("Content-Type"); ct != "" {
+		fmt.Fprintf(&sb, "Content-Type: %s\r\n", ct)
+	}
+	if loc := headers.Get("Location"); loc != "" {
+		fmt.Fprintf(&sb, "Location: %s\r\n", loc)
+	}
+	fmt.Fprintf(&sb, "Content-Length: %d\r\n", len(body))
+	fmt.Fprintf(&sb, "Connection: close\r\n")
+	fmt.Fprintf(&sb, "\r\n")
+
+	result := []byte(sb.String())
+	return append(result, body...)
+}
+
+// httpResponse is the convenience wrapper used by route() and error paths.
+// For handler-based responses use buildHTTPResponse directly.
+func httpResponse(status int, contentType string, body []byte) []byte {
+	h := make(http.Header)
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
+	return buildHTTPResponse(status, h, body)
 }

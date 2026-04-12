@@ -59,19 +59,30 @@ The codebase currently has two stacks in development that will converge:
 - `internal/csip/model/` — Go structs for all IEEE 2030.5 resources (`DeviceCapability`, `EndDevice`, `DERProgram`, `DERControl`, etc.) with XML tags matching the 2030.5 schema. XML namespace `urn:ieee:std:2030.5:ns` is mandatory on root elements.
 - `internal/csip/discovery/` — Link walker (`Walker`) that traverses the resource tree starting from `/dcap`. Follows links in XML responses to discover the client's `EndDevice` (by LFDI match), FSAs, DERPrograms, and controls. Never hardcodes URLs beyond `/dcap` — every other URL comes from link attributes. Accepts a `Fetcher` interface so it can be tested without a real server.
 - `internal/csip/identity/` — Derives LFDI and SFDI from X.509 client certs per IEEE 2030.5-2018 §6.3.4. LFDI = leftmost 160 bits of SHA-256 over the cert's DER encoding.
-- `internal/gridsim/` — Minimal IEEE 2030.5 server serving a static conformance test resource tree (CORE-010/CORE-012 setup). `NewServer(clientLFDI string)` takes the LFDI as a string (Step A will change this to be derived live from the mTLS peer cert).
-- `internal/httpclient/` — `Fetcher` implementation over Go's `net/http`. Bridge between the discovery walker and an HTTP server. Will be replaced by a wolfSSL-backed transport in a later milestone.
-- `cmd/client/main.go`, `cmd/server/main.go` — Milestone 3+ binaries using `gridsim` and `httpclient` over plain HTTP (no wolfSSL). Used for discovery/protocol development.
-- `tests/integration_test.go` — End-to-end walk tests: spins up `gridsim` via `httptest.NewServer`, runs `discovery.Walker` through `httpclient.Fetcher`, validates the full resource tree.
+- `internal/gridsim/` — IEEE 2030.5 simulator. Phase 2 features: **LFDI-gated /edev** (returns only the connecting device's EndDevice when `X-Peer-LFDI` header is present; 403 on `/edev/0` and `/edev/1`); **3 DERPrograms** (primacy 1/5/10) with rich DERControls (overlapping/superseded, cancelled, randomized, active list); **MirrorUsagePoint POST flow** (POST `/mup` → 201+Location, POST `/mup/{n}` → 204). `SetClientCertDER(der []byte)` is called once per connection to derive LFDI/SFDI from the live mTLS peer cert and rebuild `/edev`.
+- `internal/httpclient/` — `Fetcher` over Go's `net/http`. Implements both `Get` and `Post(path, body, contentType) ([]byte, location, error)`. Bridge between the discovery walker and an HTTP server.
+- `internal/tlsclient/fetcher.go` — `WolfSSLFetcher` implements `Get` and `Post` (same signature as httpclient). Redials per call.
+- `tests/integration_test.go` — Full Phase 2 test suite: discovery walk (3 programs), DefaultDERControl fallback, MUP POST flow, LFDI-gated filtering, 403 guard.
 
-### Milestone 3 step status
+### Milestone 3 — ALL DONE
 
-| Step | Description | Status |
-|------|-------------|--------|
-| A | gridsim derives LFDI from live mTLS peer cert | **TODO** — requires patching `internal/wolfssl` to expose `wolfSSL_get_peer_certificate`. Same pattern as `RequireClientCert` (add a ~20-line Go wrapper). |
-| B | `WolfSSLFetcher` implements `discovery.Fetcher` | **DONE** — `internal/tlsclient/fetcher.go` |
-| C | `tlsserver` routes requests through `gridsim.Handler()` | **DONE** — `srv.Handler` field + `dispatchHTTP` bridge |
-| D | Single end-to-end integration test (wolfSSL mTLS + gridsim + discovery walker) | **TODO** — depends on A, B, C. B and C are done; can be drafted with static LFDI before A lands. |
+| Step | Status |
+|------|--------|
+| A — LFDI from live peer cert | **DONE** — `wolfssl.PeerCertificateDER` + `OnClientCert` callback + `SetClientCertDER` |
+| B — `WolfSSLFetcher` implements `Fetcher` | **DONE** — `internal/tlsclient/fetcher.go` |
+| C — tlsserver routes through `gridsim.Handler()` | **DONE** — `srv.Handler` + `dispatchHTTP` bridge |
+| D — Full-stack integration test | **DONE** — `tests/wolfssl_integration_test.go` |
+
+### Phase 2 — ALL DONE
+
+- LFDI-gated `/edev` filtering + 403 for non-client EndDevice paths
+- 3 DERPrograms (primacy 1/5/10) with DefaultDERControl per program
+- 4 DERControls in SP program: superseded, supersedes, cancelled, randomized
+- Active DERControl list (currently executing event)
+- MirrorUsagePoint POST flow: POST `/mup` → 201+Location, POST `/mup/{n}` → 204
+- `Post` method on `WolfSSLFetcher` and `httpclient.Fetcher`
+- Model types: `MirrorMeterReading`, `MirrorReadingSet`, `Reading`, `ReadingType`
+- `X-Peer-LFDI` injected by `tlsserver.dispatchHTTP` for per-connection gating
 
 ### Test layering
 

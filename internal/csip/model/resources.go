@@ -371,6 +371,60 @@ type MirrorUsagePointList struct {
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// MirrorMeterReading (telemetry POST payload)
+// ───────────────────────────────────────────────────────────────────────
+
+// ReadingType describes the measurement commodity, units, and accumulation
+// behaviour of a set of readings. IEEE 2030.5 table 22.
+type ReadingType struct {
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns ReadingType"`
+	Resource
+
+	AccumulationBehaviour uint8  `xml:"accumulationBehaviour,omitempty"`
+	CommodityType         uint8  `xml:"commodity,omitempty"`
+	DataQualifier         uint8  `xml:"dataQualifier,omitempty"`
+	FlowDirection         uint8  `xml:"flowDirection,omitempty"`
+	IntervalLength        uint32 `xml:"intervalLength,omitempty"`
+	Kind                  uint8  `xml:"kind,omitempty"`
+	Phase                 uint16 `xml:"phase,omitempty"`
+	PowerOfTenMultiplier  int8   `xml:"powerOfTenMultiplier,omitempty"`
+	Uom                   uint8  `xml:"uom,omitempty"`
+}
+
+// Reading is a single measured value within a MirrorReadingSet.
+type Reading struct {
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns Reading"`
+
+	// LocalID disambiguates multiple readings in one set.
+	LocalID      uint16            `xml:"localID,omitempty"`
+	TimePeriod   *DateTimeInterval `xml:"timePeriod,omitempty"`
+	Value        int64             `xml:"value,omitempty"`
+	QualityFlags uint16            `xml:"qualityFlags,omitempty"`
+}
+
+// MirrorReadingSet is a timestamped batch of readings for one reporting interval.
+type MirrorReadingSet struct {
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns MirrorReadingSet"`
+	Resource
+
+	StartTime int64     `xml:"timePeriod>start"`
+	Duration  uint32    `xml:"timePeriod>duration"`
+	Reading   []Reading `xml:"Reading"`
+}
+
+// MirrorMeterReading is the payload the client POSTs to /mup/{n}
+// to report periodic telemetry. Each POST is one reading set.
+type MirrorMeterReading struct {
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns MirrorMeterReading"`
+	Resource
+
+	MRID             string             `xml:"mRID,omitempty"`
+	Description      string             `xml:"description,omitempty"`
+	ReadingType      *ReadingType       `xml:"ReadingType,omitempty"`
+	MirrorReadingSet []MirrorReadingSet `xml:"MirrorReadingSet,omitempty"`
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // DERStatus, DERCapability, DERSettings (monitoring/reporting)
 // ───────────────────────────────────────────────────────────────────────
 

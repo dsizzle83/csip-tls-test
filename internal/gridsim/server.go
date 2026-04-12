@@ -7,18 +7,24 @@
 // setup for CORE-010 (Function Set Assignments) and CORE-012 (Basic
 // DER Program/Control).
 //
-// This is NOT a production server. It serves static XML. But the XML
-// it serves is conformant to the 2030.5 schema, uses the correct
-// namespace, and follows the link structure that the conformance test
-// expects. This is what your client code will talk to during development.
+// Phase 2 features:
+//   - LFDI-gated /edev: returns only the connecting device's EndDevice
+//     when the X-Peer-LFDI request header is present.
+//   - 403 Forbidden for /edev/0 and /edev/1 (dummy aggregator devices).
+//   - 3 DERPrograms (primacy 1/5/10) with rich DERControlLists.
+//   - MirrorUsagePoint POST flow: POST /mup → 201+Location,
+//     POST /mup/{n} → 204, GET /mup/{n} → the registered MUP.
 package gridsim
 
 import (
 	"encoding/xml"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"csip-tls-test/internal/csip/identity"
@@ -35,6 +41,9 @@ type Server struct {
 	mux        *http.ServeMux
 	ClientLFDI string // The LFDI of the client we expect to connect
 	clientSFDI uint64 // derived from ClientLFDI; updated by SetClientCertDER
+
+	// MirrorUsagePoint store (Phase 2 POST /mup flow)
+	mupNextID int32 // atomic counter for new MUP IDs
 }
 
 // NewServer creates a grid sim with a complete CSIP conformance resource tree.
@@ -95,7 +104,7 @@ func (s *Server) rebuildEndDeviceList() {
 			{
 				Resource:         model.Resource{Href: "/edev/2"},
 				LFDI:             s.ClientLFDI,
-				SFDI:             s.clientSFDI, // uint64, matches model.EndDevice.SFDI
+				SFDI:             s.clientSFDI,
 				ChangedTime:      now,
 				Enabled:          &boolTrue,
 				RegistrationLink: &model.Link{Href: "/edev/2/reg"},
@@ -112,15 +121,36 @@ func (s *Server) rebuildEndDeviceList() {
 	}
 }
 
-// handleRequest serves any registered resource as XML with the correct content type.
+// handleRequest dispatches GET and POST requests.
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
-	log.Printf("[gridsim] %s %s", r.Method, path)
+	peerLFDI := r.Header.Get("X-Peer-LFDI")
+	log.Printf("[gridsim] %s %s (peer=%s)", r.Method, path, peerLFDI)
 
-	if r.Method != http.MethodGet {
-		// For Milestone 3 we only need GET. POST/PUT come in later milestones.
+	switch r.Method {
+	case http.MethodGet:
+		s.handleGET(w, path, peerLFDI)
+	case http.MethodPost:
+		s.handlePOST(w, r, path, peerLFDI)
+	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+	}
+}
+
+func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string) {
+	// LFDI-gated: /edev/0 and /edev/1 are dummy aggregator devices.
+	// A connecting client may only see its own EndDevice sub-resources.
+	if peerLFDI != "" {
+		if path == "/edev/0" || strings.HasPrefix(path, "/edev/0/") ||
+			path == "/edev/1" || strings.HasPrefix(path, "/edev/1/") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		// Return a filtered EndDeviceList showing only the connecting device.
+		if path == "/edev" {
+			s.serveFilteredEndDeviceList(w, peerLFDI)
+			return
+		}
 	}
 
 	s.mu.RLock()
@@ -132,33 +162,129 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+	s.serveXML(w, resource)
+}
 
-	data, err := xml.MarshalIndent(resource, "", "  ")
-	if err != nil {
-		log.Printf("[gridsim] marshal error for %s: %v", path, err)
+// serveFilteredEndDeviceList builds an EndDeviceList containing only the
+// EndDevice whose LFDI matches peerLFDI. Case-insensitive comparison.
+func (s *Server) serveFilteredEndDeviceList(w http.ResponseWriter, peerLFDI string) {
+	s.mu.RLock()
+	edl, ok := s.resources["/edev"].(*model.EndDeviceList)
+	s.mu.RUnlock()
+	if !ok {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	// Prepend XML declaration (required: GEN.052 XML version 1.0, GEN.053 UTF-8)
+	var filtered []model.EndDevice
+	for _, ed := range edl.EndDevice {
+		if strings.EqualFold(ed.LFDI, peerLFDI) {
+			filtered = append(filtered, ed)
+		}
+	}
+	n := uint32(len(filtered))
+	s.serveXML(w, &model.EndDeviceList{
+		Resource:  model.Resource{Href: "/edev"},
+		All:       n,
+		Results:   n,
+		PollRate:  edl.PollRate,
+		EndDevice: filtered,
+	})
+}
+
+func (s *Server) handlePOST(w http.ResponseWriter, r *http.Request, path, peerLFDI string) {
+	switch {
+	case path == "/mup":
+		s.handleMUPCreate(w, r, peerLFDI)
+	case strings.HasPrefix(path, "/mup/"):
+		s.handleMUPReadings(w, r, path)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// handleMUPCreate handles POST /mup to register a new MirrorUsagePoint.
+// Returns 201 Created with a Location header pointing to the new resource.
+func (s *Server) handleMUPCreate(w http.ResponseWriter, r *http.Request, peerLFDI string) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	var mup model.MirrorUsagePoint
+	if err := xml.Unmarshal(body, &mup); err != nil {
+		log.Printf("[gridsim] POST /mup: unmarshal error: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	id := atomic.AddInt32(&s.mupNextID, 1) - 1
+	location := fmt.Sprintf("/mup/%d", id)
+	mup.Href = location
+	if peerLFDI != "" {
+		mup.DeviceLFDI = peerLFDI
+	}
+	if mup.PostRate == 0 {
+		mup.PostRate = 900 // default: 15 min
+	}
+
+	s.mu.Lock()
+	s.resources[location] = &mup
+	// Update the MUP list count and entries.
+	if ml, ok := s.resources["/mup"].(*model.MirrorUsagePointList); ok {
+		ml.All++
+		ml.Results++
+		ml.MirrorUsagePoint = append(ml.MirrorUsagePoint, mup)
+	}
+	s.mu.Unlock()
+
+	w.Header().Set("Location", location)
+	w.WriteHeader(http.StatusCreated)
+	log.Printf("[gridsim] POST /mup → created %s (postRate=%d)", location, mup.PostRate)
+}
+
+// handleMUPReadings handles POST /mup/{n} to accept periodic meter readings.
+// Returns 204 No Content on success.
+func (s *Server) handleMUPReadings(w http.ResponseWriter, r *http.Request, path string) {
+	_, _ = io.ReadAll(r.Body) // drain body; readings are not persisted in the sim
+
+	s.mu.RLock()
+	_, ok := s.resources[path]
+	s.mu.RUnlock()
+
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+	log.Printf("[gridsim] POST %s → readings accepted (204)", path)
+}
+
+// serveXML marshals resource to IEEE 2030.5 XML and writes it to w.
+func (s *Server) serveXML(w http.ResponseWriter, resource interface{}) {
+	data, err := xml.MarshalIndent(resource, "", "  ")
+	if err != nil {
+		log.Printf("[gridsim] marshal error: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	xmlDecl := []byte(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 	body := append(xmlDecl, data...)
-
 	w.Header().Set("Content-Type", ContentType)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	w.WriteHeader(http.StatusOK)
-	w.Write(body)
+	_, _ = w.Write(body)
 }
 
 // buildResourceTree creates the full CSIP conformance test resource tree.
 // This matches CORE-010 setup: 3 EndDevices, the client's device is last,
-// with a full FSA → DERProgram → DERControl chain.
+// with a full FSA → 3 DERPrograms → DERControl chain.
 func (s *Server) buildResourceTree() {
 	boolTrue := true
 	now := time.Now().Unix()
 
 	// ── DeviceCapability (/dcap) ──────────────────────────────
-	// Section 3.2.3: Path to DeviceCapability = /dcap
 	s.resources["/dcap"] = &model.DeviceCapability{
 		Resource: model.Resource{Href: "/dcap"},
 		PollRate: 300,
@@ -175,19 +301,17 @@ func (s *Server) buildResourceTree() {
 	}
 
 	// ── Time (/tm) ────────────────────────────────────────────
-	// CORE-005: quality=7 (intentionally uncoordinated)
 	s.resources["/tm"] = &model.Time{
 		Resource:    model.Resource{Href: "/tm"},
 		CurrentTime: now,
 		DstEndTime:  now - 86400,
 		DstOffset:   3600,
-		TzOffset:    -18000, // EST (Boston)
+		TzOffset:    -18000,
 		Quality:     7,
 		PollRate:    900,
 	}
 
 	// ── EndDeviceList (/edev) ─────────────────────────────────
-	// CORE-010 setup: 3 EndDevices, client's is last (most recent changedTime)
 	s.resources["/edev"] = &model.EndDeviceList{
 		Resource: model.Resource{Href: "/edev"},
 		All:      3,
@@ -207,10 +331,9 @@ func (s *Server) buildResourceTree() {
 				ChangedTime: now - 500,
 			},
 			{
-				// Client's EndDevice
 				Resource:         model.Resource{Href: "/edev/2"},
 				LFDI:             s.ClientLFDI,
-				SFDI:             123456789, // TODO: compute from LFDI
+				SFDI:             123456789,
 				ChangedTime:      now,
 				Enabled:          &boolTrue,
 				RegistrationLink: &model.Link{Href: "/edev/2/reg"},
@@ -227,7 +350,6 @@ func (s *Server) buildResourceTree() {
 	}
 
 	// ── Registration (/edev/2/reg) ────────────────────────────
-	// Section 3.2.3 & 3.2.5: PIN = 111115
 	s.resources["/edev/2/reg"] = &model.Registration{
 		Resource:           model.Resource{Href: "/edev/2/reg"},
 		DateTimeRegistered: now - 86400,
@@ -252,8 +374,8 @@ func (s *Server) buildResourceTree() {
 	// ── DERCapability (/edev/2/der/0/dercap) ──────────────────
 	s.resources["/edev/2/der/0/dercap"] = &model.DERCapability{
 		Resource: model.Resource{Href: "/edev/2/der/0/dercap"},
-		Type:     80,                                             // PV
-		RtgMaxW:  model.ActivePower{Multiplier: 0, Value: 10000}, // 10kW
+		Type:     80,
+		RtgMaxW:  model.ActivePower{Multiplier: 0, Value: 10000},
 	}
 
 	// ── FunctionSetAssignmentsList (/edev/2/fsa) ──────────────
@@ -269,7 +391,7 @@ func (s *Server) buildResourceTree() {
 				Description: "Service Point FSA",
 				DERProgramListLink: &model.ListLink{
 					Link: model.Link{Href: "/edev/2/fsa/0/derp"},
-					All:  1,
+					All:  3,
 				},
 				TimeLink: &model.Link{Href: "/tm"},
 			},
@@ -277,13 +399,15 @@ func (s *Server) buildResourceTree() {
 	}
 
 	// ── DERProgramList (/edev/2/fsa/0/derp) ───────────────────
+	// 3 programs with different primacy levels (lower = higher priority).
 	s.resources["/edev/2/fsa/0/derp"] = &model.DERProgramList{
 		Resource: model.Resource{Href: "/edev/2/fsa/0/derp"},
-		All:      1,
-		Results:  1,
+		All:      3,
+		Results:  3,
 		PollRate: 60,
 		DERProgram: []model.DERProgram{
 			{
+				// Service Point program — highest priority.
 				Resource:              model.Resource{Href: "/derp/0"},
 				MRID:                  "DERP-SP-001",
 				Description:           "Service Point DER Program",
@@ -291,18 +415,68 @@ func (s *Server) buildResourceTree() {
 				DefaultDERControlLink: &model.Link{Href: "/derp/0/dderc"},
 				DERControlListLink: &model.ListLink{
 					Link: model.Link{Href: "/derp/0/derc"},
-					All:  1,
+					All:  4,
 				},
 				ActiveDERControlListLink: &model.ListLink{
 					Link: model.Link{Href: "/derp/0/actderc"},
+					All:  1,
+				},
+			},
+			{
+				// Site-level program — middle priority.
+				Resource:              model.Resource{Href: "/derp/1"},
+				MRID:                  "DERP-SITE-001",
+				Description:           "Site-Level DER Program",
+				Primacy:               5,
+				DefaultDERControlLink: &model.Link{Href: "/derp/1/dderc"},
+				DERControlListLink: &model.ListLink{
+					Link: model.Link{Href: "/derp/1/derc"},
+					All:  2,
+				},
+				ActiveDERControlListLink: &model.ListLink{
+					Link: model.Link{Href: "/derp/1/actderc"},
+					All:  0,
+				},
+			},
+			{
+				// System-level program — lowest priority (utility-wide baseline).
+				Resource:              model.Resource{Href: "/derp/2"},
+				MRID:                  "DERP-SYS-001",
+				Description:           "System-Level DER Program",
+				Primacy:               10,
+				DefaultDERControlLink: &model.Link{Href: "/derp/2/dderc"},
+				DERControlListLink: &model.ListLink{
+					Link: model.Link{Href: "/derp/2/derc"},
+					All:  1,
+				},
+				ActiveDERControlListLink: &model.ListLink{
+					Link: model.Link{Href: "/derp/2/actderc"},
 					All:  0,
 				},
 			},
 		},
 	}
 
+	s.buildProgram0(now)
+	s.buildProgram1(now)
+	s.buildProgram2(now)
+
+	// ── MirrorUsagePointList (/mup) ───────────────────────────
+	s.resources["/mup"] = &model.MirrorUsagePointList{
+		Resource: model.Resource{Href: "/mup"},
+		All:      0,
+		Results:  0,
+	}
+}
+
+// buildProgram0 builds the Service Point program (primacy=1) with a rich
+// set of DERControls that exercise overlapping/superseded, cancelled,
+// randomized, and actively-executing scenarios.
+func (s *Server) buildProgram0(now int64) {
+	boolTrue := true
+	ptrue := true
+
 	// ── DefaultDERControl (/derp/0/dderc) ─────────────────────
-	// CORE-012: active when no DERControl event is running
 	s.resources["/derp/0/dderc"] = &model.DefaultDERControl{
 		Resource:    model.Resource{Href: "/derp/0/dderc"},
 		MRID:        "DDERC-SP-001",
@@ -315,18 +489,81 @@ func (s *Server) buildResourceTree() {
 	}
 
 	// ── DERControlList (/derp/0/derc) ─────────────────────────
-	// CORE-012 setup: one control starting in 3 minutes, duration 2 minutes
+	// Four controls demonstrating the full range of event states:
+	//   SP-001 — scheduled, potentiallySuperseded by SP-002 (same interval, newer)
+	//   SP-002 — scheduled, supersedes SP-001 (same start, longer duration, newer creationTime)
+	//   SP-003 — cancelled (currentStatus=6); client must drop it
+	//   SP-004 — scheduled future, randomizeStart=30s for device staggering
 	eventStart := now + 180 // 3 minutes from now
+
 	s.resources["/derp/0/derc"] = &model.DERControlList{
 		Resource: model.Resource{Href: "/derp/0/derc"},
-		All:      1,
-		Results:  1,
+		All:      4,
+		Results:  4,
 		PollRate: 60,
 		DERControl: []model.DERControl{
 			{
+				// SP-001: superseded by SP-002.
 				Resource:     model.Resource{Href: "/derp/0/derc/0"},
 				MRID:         "DERC-SP-001",
-				Description:  "Limit export to 3kW",
+				Description:  "Limit export to 3kW (potentially superseded)",
+				CreationTime: now,
+				EventStatus: &model.EventStatus{
+					CurrentStatus:         0, // Scheduled
+					DateTime:              now,
+					PotentiallySuperseded: true,
+				},
+				Interval: model.DateTimeInterval{
+					Duration: 120,
+					Start:    eventStart,
+				},
+				DERControlBase: model.DERControlBase{
+					OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 3000},
+				},
+			},
+			{
+				// SP-002: supersedes SP-001 (same start, later creationTime).
+				Resource:     model.Resource{Href: "/derp/0/derc/1"},
+				MRID:         "DERC-SP-002",
+				Description:  "Limit export to 2.5kW (supersedes SP-001)",
+				CreationTime: now + 1,
+				EventStatus: &model.EventStatus{
+					CurrentStatus:         0, // Scheduled
+					DateTime:              now + 1,
+					PotentiallySuperseded: false,
+				},
+				Interval: model.DateTimeInterval{
+					Duration: 300, // longer — will outlast SP-001's window
+					Start:    eventStart,
+				},
+				DERControlBase: model.DERControlBase{
+					OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 2500},
+				},
+			},
+			{
+				// SP-003: cancelled — client must skip it.
+				Resource:     model.Resource{Href: "/derp/0/derc/2"},
+				MRID:         "DERC-SP-003",
+				Description:  "Cancelled control (client must ignore)",
+				CreationTime: now - 600,
+				EventStatus: &model.EventStatus{
+					CurrentStatus:         6, // Cancelled
+					DateTime:              now - 60,
+					PotentiallySuperseded: false,
+				},
+				Interval: model.DateTimeInterval{
+					Duration: 120,
+					Start:    now - 600,
+				},
+				DERControlBase: model.DERControlBase{
+					OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 4000},
+				},
+			},
+			{
+				// SP-004: future control with randomizeStart for device staggering.
+				Resource:     model.Resource{Href: "/derp/0/derc/3"},
+				MRID:         "DERC-SP-004",
+				Description:  "Randomized export limit 3.5kW",
 				CreationTime: now,
 				EventStatus: &model.EventStatus{
 					CurrentStatus:         0, // Scheduled
@@ -334,28 +571,160 @@ func (s *Server) buildResourceTree() {
 					PotentiallySuperseded: false,
 				},
 				Interval: model.DateTimeInterval{
-					Duration: 120,        // 2 minutes
-					Start:    eventStart, // 3 minutes from now
+					Duration: 180,
+					Start:    now + 600,
 				},
+				RandomizeStart: int32Ptr(30),
 				DERControlBase: model.DERControlBase{
-					OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 3000},
+					OpModExpLimW:  &model.ActivePower{Multiplier: 0, Value: 3500},
+					OpModConnect:  &ptrue,
 				},
 			},
 		},
 	}
 
 	// ── ActiveDERControlList (/derp/0/actderc) ────────────────
-	// Empty for now — no active events yet
+	// One control currently executing (started 60s ago, 600s total).
 	s.resources["/derp/0/actderc"] = &model.DERControlList{
 		Resource: model.Resource{Href: "/derp/0/actderc"},
+		All:      1,
+		Results:  1,
+		PollRate: 60,
+		DERControl: []model.DERControl{
+			{
+				Resource:     model.Resource{Href: "/derp/0/actderc/0"},
+				MRID:         "DERC-SP-000",
+				Description:  "Currently active: export limit 2kW",
+				CreationTime: now - 300,
+				EventStatus: &model.EventStatus{
+					CurrentStatus:         1, // Active
+					DateTime:              now - 60,
+					PotentiallySuperseded: false,
+				},
+				Interval: model.DateTimeInterval{
+					Duration: 600,
+					Start:    now - 60,
+				},
+				DERControlBase: model.DERControlBase{
+					OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 2000},
+				},
+			},
+		},
+	}
+}
+
+// buildProgram1 builds the Site-Level program (primacy=5).
+func (s *Server) buildProgram1(now int64) {
+	boolTrue := true
+
+	s.resources["/derp/1/dderc"] = &model.DefaultDERControl{
+		Resource:    model.Resource{Href: "/derp/1/dderc"},
+		MRID:        "DDERC-SITE-001",
+		Description: "Site default: export limit 7kW",
+		DERControlBase: model.DERControlBase{
+			OpModExpLimW:  &model.ActivePower{Multiplier: 0, Value: 7000},
+			OpModConnect:  &boolTrue,
+			OpModEnergize: &boolTrue,
+		},
+	}
+
+	// Two non-overlapping scheduled controls.
+	s.resources["/derp/1/derc"] = &model.DERControlList{
+		Resource: model.Resource{Href: "/derp/1/derc"},
+		All:      2,
+		Results:  2,
+		PollRate: 120,
+		DERControl: []model.DERControl{
+			{
+				Resource:     model.Resource{Href: "/derp/1/derc/0"},
+				MRID:         "DERC-SITE-001",
+				Description:  "Site: limit to 6kW (morning peak)",
+				CreationTime: now,
+				EventStatus: &model.EventStatus{
+					CurrentStatus:         0,
+					DateTime:              now,
+					PotentiallySuperseded: false,
+				},
+				Interval: model.DateTimeInterval{
+					Duration: 3600,
+					Start:    now + 3600,
+				},
+				DERControlBase: model.DERControlBase{
+					OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 6000},
+				},
+			},
+			{
+				Resource:     model.Resource{Href: "/derp/1/derc/1"},
+				MRID:         "DERC-SITE-002",
+				Description:  "Site: limit to 5kW (afternoon peak)",
+				CreationTime: now,
+				EventStatus: &model.EventStatus{
+					CurrentStatus:         0,
+					DateTime:              now,
+					PotentiallySuperseded: false,
+				},
+				Interval: model.DateTimeInterval{
+					Duration: 7200,
+					Start:    now + 7200,
+				},
+				DERControlBase: model.DERControlBase{
+					OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 5000},
+				},
+			},
+		},
+	}
+
+	s.resources["/derp/1/actderc"] = &model.DERControlList{
+		Resource: model.Resource{Href: "/derp/1/actderc"},
 		All:      0,
 		Results:  0,
 	}
+}
 
-	// ── MirrorUsagePointList (/mup) ───────────────────────────
-	// Empty — telemetry setup is Milestone 5
-	s.resources["/mup"] = &model.MirrorUsagePointList{
-		Resource: model.Resource{Href: "/mup"},
+// buildProgram2 builds the System-Level program (primacy=10, lowest priority).
+func (s *Server) buildProgram2(now int64) {
+	boolTrue := true
+
+	s.resources["/derp/2/dderc"] = &model.DefaultDERControl{
+		Resource:    model.Resource{Href: "/derp/2/dderc"},
+		MRID:        "DDERC-SYS-001",
+		Description: "System default: export limit 9kW (utility-wide baseline)",
+		DERControlBase: model.DERControlBase{
+			OpModExpLimW:  &model.ActivePower{Multiplier: 0, Value: 9000},
+			OpModConnect:  &boolTrue,
+			OpModEnergize: &boolTrue,
+		},
+	}
+
+	s.resources["/derp/2/derc"] = &model.DERControlList{
+		Resource: model.Resource{Href: "/derp/2/derc"},
+		All:      1,
+		Results:  1,
+		PollRate: 300,
+		DERControl: []model.DERControl{
+			{
+				Resource:     model.Resource{Href: "/derp/2/derc/0"},
+				MRID:         "DERC-SYS-001",
+				Description:  "System: utility-wide curtailment 8kW",
+				CreationTime: now,
+				EventStatus: &model.EventStatus{
+					CurrentStatus:         0,
+					DateTime:              now,
+					PotentiallySuperseded: false,
+				},
+				Interval: model.DateTimeInterval{
+					Duration: 14400,
+					Start:    now + 1800,
+				},
+				DERControlBase: model.DERControlBase{
+					OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 8000},
+				},
+			},
+		},
+	}
+
+	s.resources["/derp/2/actderc"] = &model.DERControlList{
+		Resource: model.Resource{Href: "/derp/2/actderc"},
 		All:      0,
 		Results:  0,
 	}
@@ -366,3 +735,5 @@ func (s *Server) buildResourceTree() {
 func (s *Server) AddResource(path string, resource interface{}) {
 	s.resources[path] = resource
 }
+
+func int32Ptr(v int32) *int32 { return &v }

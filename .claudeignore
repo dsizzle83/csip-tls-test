@@ -1,0 +1,15 @@
+# .claudeignore
+*.o
+*.a
+*.elf
+*.hex
+*.bin
+build/
+obj/
+vendor/
+node_modules/
+**/*.lock
+**/.git/
+docs/
+examples/
+third_party/

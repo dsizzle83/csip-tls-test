@@ -179,6 +179,34 @@ func (c *Client) Version() string {
 	return wolfssl.Version(c.ssl)
 }
 
+// Post sends an HTTP POST request with body and returns the raw response.
+// Same read-until-close strategy as Get. Connection is consumed by the
+// round trip; call Close + Dial before reusing.
+func (c *Client) Post(path string, body []byte, contentType string) ([]byte, error) {
+	if c.ssl == nil {
+		return nil, errors.New("client not connected; call Dial first")
+	}
+	req := buildPostRequest(path, c.cfg.ServerAddr, body, contentType)
+	if _, err := wolfssl.Write(c.ssl, req); err != nil {
+		return nil, fmt.Errorf("write request: %w", err)
+	}
+	var resp []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := wolfssl.Read(c.ssl, buf)
+		if n > 0 {
+			resp = append(resp, buf[:n]...)
+		}
+		if err != nil || n == 0 {
+			break
+		}
+		if n < len(buf) {
+			break
+		}
+	}
+	return resp, nil
+}
+
 // Get sends a minimal HTTP GET request for the given path and returns
 // the raw response (headers + body). The connection is consumed by
 // the round trip because the current server sends Connection: close;

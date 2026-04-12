@@ -33,6 +33,29 @@ func (f *WolfSSLFetcher) Free() {
 // this call. Status must be 200 and Content-Type must be
 // application/sep+xml (GEN.003); any other response is returned as an error.
 //
+// Post performs a single HTTP POST over a fresh wolfSSL mTLS session.
+// Returns the response body and Location header (for 201 Created).
+// Accepts 201 and 204; any other status is an error.
+func (f *WolfSSLFetcher) Post(path string, body []byte, contentType string) ([]byte, string, error) {
+	if err := f.client.Dial(); err != nil {
+		return nil, "", fmt.Errorf("dial: %w", err)
+	}
+	defer f.client.Close()
+
+	raw, err := f.client.Post(path, body, contentType)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := parseHTTPResponse(raw)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse response from %s: %w", path, err)
+	}
+	if resp.StatusCode != 201 && resp.StatusCode != 204 {
+		return nil, "", fmt.Errorf("POST %s: status %d", path, resp.StatusCode)
+	}
+	return resp.Body, resp.Location, nil
+}
+
 // Get satisfies discovery.Fetcher.
 func (f *WolfSSLFetcher) Get(path string) ([]byte, error) {
 	if err := f.client.Dial(); err != nil {

@@ -13,6 +13,7 @@ import (
 type HTTPResponse struct {
 	StatusCode  int
 	ContentType string
+	Location    string // populated for 201 Created responses
 	Body        []byte
 }
 
@@ -59,13 +60,16 @@ func parseHTTPResponse(raw []byte) (*HTTPResponse, error) {
 		}
 		name := strings.ToLower(strings.TrimSpace(string(line[:colon])))
 		value := strings.TrimSpace(string(line[colon+1:]))
-		if name == "content-type" {
+		switch name {
+		case "content-type":
 			// Strip parameters like "; charset=utf-8" so callers can
 			// compare against bare media types.
 			if semi := strings.IndexByte(value, ';'); semi >= 0 {
 				value = strings.TrimSpace(value[:semi])
 			}
 			resp.ContentType = value
+		case "location":
+			resp.Location = value
 		}
 	}
 

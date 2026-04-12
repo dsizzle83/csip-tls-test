@@ -17,3 +17,16 @@ func buildGetRequest(path, host string) []byte {
 			"\r\n",
 		path, host))
 }
+
+// buildPostRequest constructs an HTTP/1.1 POST request with body.
+func buildPostRequest(path, host string, body []byte, contentType string) []byte {
+	header := fmt.Sprintf(
+		"POST %s HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Content-Type: %s\r\n"+
+			"Content-Length: %d\r\n"+
+			"Connection: close\r\n"+
+			"\r\n",
+		path, host, contentType, len(body))
+	return append([]byte(header), body...)
+}

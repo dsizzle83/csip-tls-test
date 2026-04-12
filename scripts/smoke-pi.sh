@@ -1,12 +1,12 @@
 #!/bin/bash
 # Smoke test: Pi as CSIP client, WSL desktop as mTLS server with gridsim.
 #
-# What it validates (Milestone 3 complete):
+# What it validates (Milestone 3 + Phase 2):
 #   1. mTLS handshake Pi → WSL (cipher ECDHE-ECDSA-AES128-CCM-8)
 #   2. Server extracts LFDI from live peer cert (Step A)
 #   3. Discovery walker traverses /dcap → /edev → /fsa → /derp (Steps B, C)
-#   4. Pi client finds its own EndDevice by LFDI match
-#   5. DERPrograms + DefaultDERControl are discovered
+#   4. Pi client finds its own EndDevice by LFDI match (LFDI-gated /edev)
+#   5. 3 DERPrograms (primacy 1/5/10) + DefaultDERControl discovered
 #
 # Prerequisites:
 #   - Server running on WSL: bin/server (in another terminal, or start-server.sh)
@@ -81,7 +81,7 @@ check "DeviceCapability fetched"   "DeviceCapability fetched"
 check "EndDeviceList discovered"   "EndDeviceList: /edev"
 check "Time fetched"               "Time fetched"
 check "SelfDevice LFDI matched"    "SelfDevice matched by LFDI"
-check "DERPrograms discovered"     "DERPrograms discovered: 1"
+check "DERPrograms discovered"     "DERPrograms discovered: 3"
 check "DefaultDERControl present"  "DefaultDERControl: OpModExpLimW="
 
 if [ "$FAIL" -ne 0 ]; then

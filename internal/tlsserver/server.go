@@ -7,6 +7,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"csip-tls-test/internal/csip/identity"
 	"csip-tls-test/internal/wolfssl"
 )
 
@@ -136,17 +137,23 @@ func (s *Server) handleConn(conn net.Conn) {
 	if s.OnHandshake != nil {
 		s.OnHandshake(wolfssl.Version(ssl), wolfssl.CipherName(ssl))
 	}
-	if s.OnClientCert != nil {
-		if der := wolfssl.PeerCertificateDER(ssl); der != nil {
+
+	// Extract peer LFDI once per connection. Used for LFDI-gated resource
+	// views (X-Peer-LFDI request header) and for the OnClientCert callback.
+	var peerLFDI string
+	if der := wolfssl.PeerCertificateDER(ssl); der != nil {
+		if s.OnClientCert != nil {
 			s.OnClientCert(der)
 		}
+		lfdi, _ := identity.FromCertificateDER(der)
+		peerLFDI = lfdi.String()
 	}
 
-	s.handleRequest(ssl)
+	s.handleRequest(ssl, peerLFDI)
 	wolfssl.Shutdown(ssl)
 }
 
-func (s *Server) handleRequest(ssl unsafe.Pointer) {
+func (s *Server) handleRequest(ssl unsafe.Pointer, peerLFDI string) {
 	buf := make([]byte, 4096)
 	n, err := wolfssl.Read(ssl, buf)
 	if err != nil || n == 0 {
@@ -154,7 +161,7 @@ func (s *Server) handleRequest(ssl unsafe.Pointer) {
 	}
 	var resp []byte
 	if s.Handler != nil {
-		resp = dispatchHTTP(s.Handler, buf[:n])
+		resp = dispatchHTTP(s.Handler, buf[:n], peerLFDI)
 	} else {
 		resp = route(buf[:n])
 	}
