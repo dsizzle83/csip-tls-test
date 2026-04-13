@@ -1,6 +1,8 @@
-.PHONY: all build build-server build-client build-conformance sync-pi \
+.PHONY: all build build-server build-client build-conformance build-modsim \
+        build-modsim-client-pi deploy-modsim-client-pi smoke-modbus-pi sync-pi \
         start-server conformance-pi \
-        test test-fast test-integration test-update-golden \
+        test test-fast test-integration test-update-golden test-southbound \
+        modsim-image modsim-run modsim-stop \
         gen-test-certs gen-client-cert smoke-pi clean help
 
 REPO_ROOT     := $(shell pwd)
@@ -27,6 +29,62 @@ build-client:
 build-conformance:
 	@mkdir -p bin
 	go build -o bin/conformance ./cmd/conformance
+
+build-modsim:
+	@mkdir -p bin
+	go build -o bin/modsim ./cmd/modsim
+
+# Cross-compile the Modbus diagnostic client for the Pi (linux/arm64).
+# No cgo — southbound packages are pure Go.
+build-modsim-client-pi:
+	@mkdir -p bin
+	GOOS=linux GOARCH=arm64 go build -o bin/modsim-client-arm64 ./cmd/modsim-client
+
+# === SunSpec simulator (Docker) ============================================
+
+MODSIM_IMAGE  ?= csip-modsim
+MODSIM_PORT   ?= 5020
+MODSIM_WMAX   ?= 5000
+MODSIM_NAME   ?= modsim
+
+# Build the Docker image for the SunSpec simulator.
+modsim-image:
+	docker build -f Dockerfile.modsim -t $(MODSIM_IMAGE) .
+
+# Start the simulator container in the background.
+# The Modbus TCP port is published to the host so Pi and local clients can reach it.
+modsim-run: modsim-image
+	docker run -d --rm \
+	    --name $(MODSIM_NAME) \
+	    -p $(MODSIM_PORT):$(MODSIM_PORT) \
+	    $(MODSIM_IMAGE) \
+	    -port $(MODSIM_PORT) -wmax $(MODSIM_WMAX)
+	@echo "Simulator running. Modbus TCP → host:$(MODSIM_PORT)"
+	@echo "Stop with: make modsim-stop"
+
+# Stop the simulator container.
+modsim-stop:
+	docker stop $(MODSIM_NAME) 2>/dev/null || true
+
+# Cross-compile and deploy the Modbus diagnostic client to the Pi.
+# The southbound packages are pure Go so no Pi-side toolchain is needed.
+# Override: make deploy-modsim-client-pi PI_HOST=user@host DESKTOP_IP=x.x.x.x
+DESKTOP_IP ?= $(shell hostname -I | awk '{print $$1}')
+
+deploy-modsim-client-pi: build-modsim-client-pi
+	scp bin/modsim-client-arm64 $(PI_HOST):$(PI_DIR)/bin/modsim-client
+	@echo ""
+	@echo "Run on the Pi:"
+	@echo "  $(PI_DIR)/bin/modsim-client -url tcp://$(DESKTOP_IP):$(MODSIM_PORT)"
+
+# Quick end-to-end smoke test: start the simulator, deploy the client to the
+# Pi, run one measurement read, and print the result.
+# Prerequisites: make modsim-run (simulator already started on desktop).
+# Override DESKTOP_IP if the Pi cannot reach the WSL2 address directly.
+smoke-modbus-pi: deploy-modsim-client-pi
+	@echo "Running Modbus smoke test on $(PI_HOST)..."
+	ssh $(PI_HOST) "$(PI_DIR)/bin/modsim-client -url tcp://$(DESKTOP_IP):$(MODSIM_PORT)"
+	@echo "Smoke test complete."
 
 # Sync source files to the Pi for a native build.
 # wolfSSL headers are not available for arm64 on WSL, so we build on the Pi.
@@ -78,7 +136,11 @@ test: $(CA_CERT) test-fast test-integration
 # Fast unit tests across both packages — pure-Go logic only.
 # Pulls cgo for compilation but does no TLS handshakes.
 test-fast:
-	go test ./internal/tlsserver/ ./internal/tlsclient/
+	go test ./internal/tlsserver/ ./internal/tlsclient/ ./internal/southbound/sunspec/
+
+# Southbound unit + integration tests (no hardware required; uses in-process Modbus server).
+test-southbound:
+	go test ./internal/southbound/... ./internal/bridge/...
 
 # Full integration tests with real TLS handshakes. Requires fixtures.
 test-integration: $(CA_CERT)
@@ -142,9 +204,20 @@ help:
 	@echo "  make test                Run all tests (unit + integration)"
 	@echo "  make test-fast           Unit tests only (sub-second)"
 	@echo "  make test-integration    Full TLS handshake tests"
-	@echo "  make test-update-golden  Refresh DCAP golden file"
+	@echo "  make test-southbound     Southbound Modbus/SunSpec tests (in-process server)"
+	@echo ""
+	@echo "Simulator:"
+	@echo "  make modsim-image        Build the Docker image for the SunSpec simulator"
+	@echo "  make modsim-run          Start the simulator container (port 5020)"
+	@echo "  make modsim-stop         Stop the simulator container"
+	@echo "  make build-modsim        Build the simulator binary locally (bin/modsim)"
+	@echo "  make build-modsim-client-pi  Cross-compile Modbus client for Pi (arm64)"
+	@echo "  make deploy-modsim-client-pi Deploy the client binary to the Pi"
+	@echo "  make smoke-modbus-pi     Deploy + run one-shot measurement read on Pi"
+	@echo "                           Override: make smoke-modbus-pi DESKTOP_IP=x.x.x.x"
 	@echo ""
 	@echo "Fixtures:"
+	@echo "  make test-update-golden  Refresh DCAP golden file"
 	@echo "  make gen-test-certs      Regenerate test cert fixtures"
 	@echo "  make gen-client-cert     Issue a client cert from the production CA"
 	@echo "                           Output: certs/client-staging/ — SCP then delete"

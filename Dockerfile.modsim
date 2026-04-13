@@ -1,0 +1,30 @@
+# Multi-stage build for the SunSpec Modbus simulator.
+# Stage 1: build the Go binary for linux/amd64 (matches the desktop host).
+# The simulator is pure Go — no cgo, no wolfSSL — so it cross-compiles cleanly.
+
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -o /modsim ./cmd/modsim
+
+# Stage 2: minimal runtime image.
+FROM alpine:3.19
+
+# Install mbpoll for in-container register inspection/debugging.
+# mbpoll lets you verify the simulator from inside the container:
+#   docker exec modsim mbpoll -t 3 -r 40001 -c 4 -1 localhost 5020
+# RUN apk add --no-cache mbpoll
+
+COPY --from=builder /modsim /usr/local/bin/modsim
+
+EXPOSE 5020
+
+# Default: 5000 W nameplate, port 5020.
+# Override at runtime: docker run ... modsim -wmax 7600
+ENTRYPOINT ["/usr/local/bin/modsim"]
+CMD ["-port", "5020", "-wmax", "5000"]

@@ -97,3 +97,20 @@ The codebase currently has two stacks in development that will converge:
 - The `Fetcher` interface in `discovery` is deliberately minimal (`Get(path string) ([]byte, error)`) to keep discovery decoupled from TLS, HTTP, and connection management.
 - The wolfSSL binding (`internal/wolfssl/wolfssl.go`) is extended by the "add a Go wrapper around one C function" pattern whenever a new C API is needed. See `RequireClientCert` as the reference example.
 - wolfSSL headers are not available for arm64 on WSL — build on the Pi natively. Use `git pull` on the Pi after pushing from WSL; `make gen-test-certs` regenerates the gitignored test fixtures on each machine.
+
+**Southbound stack — Modbus / SunSpec (pure Go, no cgo)**
+- `internal/southbound/device/` — `Device` interface (`ApplyControl`, `ReadMeasurements`, `Status`, `Close`) + `Measurements` and `DeviceStatus` types. The only package that knows about both CSIP and hardware.
+- `internal/southbound/modbus/` — `Transport` interface + `client` implementation wrapping `github.com/simonvetter/modbus`. URL selects physical layer: `"tcp://host:502"`, `"rtu:///dev/ttyUSB0"`, `"rtuovertcp://host:502"`. Swap physical layer by changing the URL — no code changes in sunspec or inverter.
+- `internal/southbound/sunspec/` — SunSpec model scanning (`Scan`), register access (`Reader`), model ID constants (`models.go`), and scale factor math (`scale.go`). `Scan` reads only the model ID+length registers (no data burst) to build the block map. `Reader.ReadModel(id)` and `WriteModel(id, offset, values)` use 0-based offsets within the named model.
+- `internal/southbound/inverter/` — `Inverter` implementing `Device`. Reads measurements from Model 103 (or 101/102 fallback); reads nameplate WMax from Model 121 at startup; applies controls via Model 123 (`Conn` for OpModConnect, `WMaxLimPct` for OpModExpLimW/MaxLimW). Tests use an in-process simonvetter Modbus server — no hardware or simulator needed.
+- `internal/southbound/registry/` — `Registry` holds multiple `Device` instances. Background goroutine polls measurements at a configurable interval and publishes `MeasurementUpdate` values to a buffered channel. `ApplyControl` fans out to all devices.
+- `internal/bridge/` — `Bridge` connects `*scheduler.Scheduler` to `*registry.Registry`. On each tick it evaluates the scheduler and calls `registry.ApplyControl`. Receives program updates from the northbound discovery loop via `SetPrograms`. The only package that imports both CSIP and southbound packages.
+
+### SunSpec register layout quick reference
+- SunSpec header at Modbus 40000 (0-based): two registers `0x5375 0x6E53` ("SunS")
+- Each model block: `[ModelID uint16][Length uint16][Length × data registers]`
+- End sentinel: ModelID = `0xFFFF`
+- Scale factors: `int16` power-of-10; `0x8000` (−32768) = "not implemented" → NaN
+- Key models in use: 1 (Common), 121 (WMax nameplate), 103 (inverter measurements), 123 (immediate controls)
+- Model 123 offsets: `WMaxLimPct`=0, `WMaxLimPct_Ena`=4, `Conn`=16, `WMaxLimPct_SF`=20
+- Model 103 offsets: `W`/`W_SF`=12/13, `Hz`/`Hz_SF`=14/15, `PhVphA`/`V_SF`=8/11, `St`=36
