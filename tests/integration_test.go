@@ -232,6 +232,23 @@ func TestFullDiscoveryOverHTTP(t *testing.T) {
 		t.Fatal("MirrorUsagePointList is nil")
 	}
 
+	// ── Registration PIN verification (BASIC-001, CORE-009) ───
+	// gridsim serves PIN=111115 (CSIP conformance test value, spec §3.2.3).
+	// The client must verify this before trusting any control events.
+	reg, err := walker.VerifyRegistration(tree.SelfDevice, 111115)
+	if err != nil {
+		t.Fatalf("VerifyRegistration: %v", err)
+	}
+	if reg.PIN != 111115 {
+		t.Errorf("PIN = %d, want 111115", reg.PIN)
+	}
+
+	// ── ClockOffset populated from /tm ────────────────────────
+	// gridsim's Time uses time.Now(), so offset should be near zero.
+	if tree.ClockOffset < -5 || tree.ClockOffset > 5 {
+		t.Errorf("ClockOffset = %d, want near 0 (gridsim uses local time)", tree.ClockOffset)
+	}
+
 	t.Log("✓ Full CSIP discovery walk completed successfully")
 	t.Logf("  DeviceCapability: %s (pollRate=%d)", tree.DeviceCapability.Href, tree.DeviceCapability.PollRate)
 	t.Logf("  Time: quality=%d, tz=%d", tree.Time.Quality, tree.Time.TzOffset)

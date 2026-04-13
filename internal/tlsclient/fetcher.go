@@ -56,6 +56,26 @@ func (f *WolfSSLFetcher) Post(path string, body []byte, contentType string) ([]b
 	return resp.Body, resp.Location, nil
 }
 
+// GetStatus performs a GET and returns the raw HTTP status code without
+// enforcing that it must be 200. Used by conformance tests that need to
+// verify the server correctly returns 404, 405, etc.
+func (f *WolfSSLFetcher) GetStatus(path string) (int, []byte, error) {
+	if err := f.client.Dial(); err != nil {
+		return 0, nil, fmt.Errorf("dial: %w", err)
+	}
+	defer f.client.Close()
+
+	raw, err := f.client.Get(path)
+	if err != nil {
+		return 0, nil, err
+	}
+	resp, err := parseHTTPResponse(raw)
+	if err != nil {
+		return 0, nil, fmt.Errorf("parse response from %s: %w", path, err)
+	}
+	return resp.StatusCode, resp.Body, nil
+}
+
 // Get satisfies discovery.Fetcher.
 func (f *WolfSSLFetcher) Get(path string) ([]byte, error) {
 	if err := f.client.Dial(); err != nil {

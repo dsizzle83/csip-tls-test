@@ -188,6 +188,13 @@ func TestFullDiscoveryWalk(t *testing.T) {
 		t.Errorf("Time.TzOffset = %d, want -18000", tree.Time.TzOffset)
 	}
 
+	// CORE-005 / ClockOffset: mock /tm has CurrentTime=1700000000 (past).
+	// ClockOffset = serverTime - localTime; local time is 2026-era so offset is
+	// deeply negative (~−44M s). Verify it was populated (non-zero) and negative.
+	if tree.ClockOffset >= 0 {
+		t.Errorf("ClockOffset = %d, want negative (mock server time is in the past)", tree.ClockOffset)
+	}
+
 	// CORE-009 / BASIC-001: Found our EndDevice by LFDI
 	if tree.SelfDevice == nil {
 		t.Fatal("SelfDevice is nil")

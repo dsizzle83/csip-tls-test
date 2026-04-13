@@ -425,6 +425,68 @@ type MirrorMeterReading struct {
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// Response resources (GEN.044 — client must acknowledge events)
+// ───────────────────────────────────────────────────────────────────────
+
+// Response status codes (IEEE 2030.5 table 27).
+const (
+	ResponseEventReceived  uint8 = 1 // event text received and understood
+	ResponseEventStarted   uint8 = 2 // event interval began
+	ResponseEventCompleted uint8 = 3 // event interval ended
+	ResponseOptIn          uint8 = 4 // client opted in (for opt-in programs)
+	ResponseOptOut         uint8 = 5 // client opted out
+)
+
+// Response is posted by the client to the server's ResponseSetListLink
+// to acknowledge receipt and state transitions of DERControl events.
+// Per GEN.044, a conformant client must POST a Response for each event
+// at each transition: received (1), started (2), completed (3).
+type Response struct {
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns Response"`
+	Resource
+
+	// CreatedDateTime is when this response was generated (server time).
+	CreatedDateTime int64 `xml:"createdDateTime,omitempty"`
+	// EndDeviceLFDI identifies the responding device.
+	EndDeviceLFDI string `xml:"endDeviceLFDI,omitempty"`
+	// Status is one of the ResponseEvent* constants above.
+	Status uint8 `xml:"status"`
+	// Subject is the mRID of the DERControl being acknowledged.
+	Subject string `xml:"subject,omitempty"`
+}
+
+// ResponseSet groups Response resources for a single DERProgram.
+// The server advertises the ResponseSet endpoint via ResponseSetListLink
+// in DeviceCapability.
+type ResponseSet struct {
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns ResponseSet"`
+	Resource
+
+	MRID         string    `xml:"mRID,omitempty"`
+	ResponseList *ListLink `xml:"ResponseListLink,omitempty"`
+}
+
+// ResponseSetList is a collection of ResponseSet resources.
+type ResponseSetList struct {
+	XMLName     xml.Name      `xml:"urn:ieee:std:2030.5:ns ResponseSetList"`
+	Resource
+
+	All         uint32        `xml:"all,attr"`
+	Results     uint32        `xml:"results,attr"`
+	ResponseSet []ResponseSet `xml:"ResponseSet"`
+}
+
+// ResponseList is a collection of Response resources within a ResponseSet.
+type ResponseList struct {
+	XMLName  xml.Name   `xml:"urn:ieee:std:2030.5:ns ResponseList"`
+	Resource
+
+	All      uint32     `xml:"all,attr"`
+	Results  uint32     `xml:"results,attr"`
+	Response []Response `xml:"Response"`
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // DERStatus, DERCapability, DERSettings (monitoring/reporting)
 // ───────────────────────────────────────────────────────────────────────
 

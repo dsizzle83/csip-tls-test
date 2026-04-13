@@ -17,6 +17,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"strings"
+	"time"
 
 	"csip-tls-test/internal/csip/model"
 )
@@ -43,6 +44,11 @@ type ResourceTree struct {
 	Programs          []ProgramState // one per DERProgram
 	MirrorUsagePoints *model.MirrorUsagePointList
 	DERList           *model.DERList
+
+	// ClockOffset is (server time − local time) in seconds, computed from
+	// the /tm resource during discovery. Add this to time.Now().Unix() to get
+	// estimated server time. Required by CSIP for event scheduling.
+	ClockOffset int64
 }
 
 // ProgramState groups a DERProgram with its discovered controls.
@@ -92,6 +98,10 @@ func (w *Walker) Discover(dcapPath string) (*ResourceTree, error) {
 			return nil, fmt.Errorf("step 2 (Time): %w", err)
 		}
 		tree.Time = tm
+		// Clock offset: server time minus local time. Add to time.Now().Unix()
+		// to get estimated server time. Required for correct event scheduling
+		// (CSIP §5.2.1.3: client clock must be within 30s of server time).
+		tree.ClockOffset = tm.CurrentTime - time.Now().Unix()
 	}
 
 	// Step 3: EndDeviceList — find ourselves by LFDI

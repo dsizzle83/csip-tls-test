@@ -44,6 +44,10 @@ type Server struct {
 
 	// MirrorUsagePoint store (Phase 2 POST /mup flow)
 	mupNextID int32 // atomic counter for new MUP IDs
+
+	// Response log (CORE-022: client POSTs Response on event transitions)
+	responseMu sync.Mutex
+	responses  []model.Response
 }
 
 // NewServer creates a grid sim with a complete CSIP conformance resource tree.
@@ -198,6 +202,8 @@ func (s *Server) handlePOST(w http.ResponseWriter, r *http.Request, path, peerLF
 		s.handleMUPCreate(w, r, peerLFDI)
 	case strings.HasPrefix(path, "/mup/"):
 		s.handleMUPReadings(w, r, path)
+	case strings.HasPrefix(path, "/rsps/") && strings.HasSuffix(path, "/r"):
+		s.handleResponsePost(w, r, path)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -297,7 +303,38 @@ func (s *Server) buildResourceTree() {
 			Link: model.Link{Href: "/mup"},
 			All:  0,
 		},
+		ResponseSetListLink: &model.ListLink{
+			Link: model.Link{Href: "/rsps"},
+			All:  1,
+		},
 		SelfDeviceLink: &model.Link{Href: "/sdev"},
+	}
+
+	// ── ResponseSetList (/rsps) ───────────────────────────────
+	// One ResponseSet per program (CORE-022 / GEN.044). Clients POST
+	// Response resources to /rsps/0/r to acknowledge event transitions.
+	s.resources["/rsps"] = &model.ResponseSetList{
+		Resource: model.Resource{Href: "/rsps"},
+		All:      1,
+		Results:  1,
+		ResponseSet: []model.ResponseSet{
+			{
+				Resource: model.Resource{Href: "/rsps/0"},
+				MRID:     "RSP-SP-001",
+				ResponseList: &model.ListLink{
+					Link: model.Link{Href: "/rsps/0/r"},
+					All:  0,
+				},
+			},
+		},
+	}
+	s.resources["/rsps/0"] = &model.ResponseSet{
+		Resource: model.Resource{Href: "/rsps/0"},
+		MRID:     "RSP-SP-001",
+		ResponseList: &model.ListLink{
+			Link: model.Link{Href: "/rsps/0/r"},
+			All:  0,
+		},
 	}
 
 	// ── Time (/tm) ────────────────────────────────────────────
@@ -374,8 +411,25 @@ func (s *Server) buildResourceTree() {
 	// ── DERCapability (/edev/2/der/0/dercap) ──────────────────
 	s.resources["/edev/2/der/0/dercap"] = &model.DERCapability{
 		Resource: model.Resource{Href: "/edev/2/der/0/dercap"},
-		Type:     80,
+		Type:     80, // PV (photovoltaic)
 		RtgMaxW:  model.ActivePower{Multiplier: 0, Value: 10000},
+	}
+
+	// ── DERSettings (/edev/2/der/0/derset) ───────────────────
+	s.resources["/edev/2/der/0/derset"] = &model.DERSettings{
+		Resource:    model.Resource{Href: "/edev/2/der/0/derset"},
+		SetMaxW:     &model.ActivePower{Multiplier: 0, Value: 10000},
+		UpdatedTime: now,
+	}
+
+	// ── DERStatus (/edev/2/der/0/derstat) ────────────────────
+	genConnected := uint8(1)
+	opMode := uint8(1)
+	s.resources["/edev/2/der/0/derstat"] = &model.DERStatus{
+		Resource:             model.Resource{Href: "/edev/2/der/0/derstat"},
+		GenConnectStatus:     &genConnected,
+		OperationalModeStatus: &opMode,
+		ReadingTime:          now,
 	}
 
 	// ── FunctionSetAssignmentsList (/edev/2/fsa) ──────────────
@@ -728,6 +782,39 @@ func (s *Server) buildProgram2(now int64) {
 		All:      0,
 		Results:  0,
 	}
+}
+
+// handleResponsePost handles POST /rsps/{n}/r — client acknowledging an event.
+// Per GEN.044 / CORE-022: client POSTs a Response resource with status
+// 1=Received, 2=Started, or 3=Completed. Returns 201 Created.
+func (s *Server) handleResponsePost(w http.ResponseWriter, r *http.Request, path string) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	var resp model.Response
+	if err := xml.Unmarshal(body, &resp); err != nil {
+		log.Printf("[gridsim] POST %s: unmarshal Response error: %v", path, err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	s.responseMu.Lock()
+	s.responses = append(s.responses, resp)
+	s.responseMu.Unlock()
+	log.Printf("[gridsim] POST %s → Response accepted: subject=%s status=%d",
+		path, resp.Subject, resp.Status)
+	w.WriteHeader(http.StatusCreated)
+}
+
+// ReceivedResponses returns a copy of all Response resources POSTed by
+// clients. Useful for verifying CORE-022 / GEN.044 compliance in tests.
+func (s *Server) ReceivedResponses() []model.Response {
+	s.responseMu.Lock()
+	defer s.responseMu.Unlock()
+	out := make([]model.Response, len(s.responses))
+	copy(out, s.responses)
+	return out
 }
 
 // AddResource lets you inject or override resources in the tree,
