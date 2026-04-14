@@ -3,24 +3,27 @@
 // It wires together the northbound (CSIP / IEEE 2030.5) and southbound
 // (Modbus / SunSpec) stacks:
 //
-//	wolfSSL fetcher → discovery walker → scheduler → bridge → registry → inverter(s)
+//	wolfSSL fetcher → discovery walker → scheduler → bridge → registry → inverter/battery
 //
-// On each discovery cycle (default 60 s) it re-walks /dcap and pushes
-// fresh programs and clock offset into the bridge. The bridge evaluates
-// the scheduler on its own 30 s tick and applies the resulting
-// DERControlBase to all registered devices.
+// Goroutines:
 //
-// Additionally:
-//   - Response POST loop: detects event transitions and POSTs status 2/3
-//     to the server's ResponseSet (GEN.044 / CORE-022).
-//   - MUP telemetry loop: registers MirrorUsagePoints on startup, then
-//     POSTs real-power, voltage, and frequency readings every postRate seconds.
+//	discoveryLoop  — re-walks /dcap every N seconds; updates bridge programs +
+//	                 clock offset; drives the response POST state machine.
+//	telemetryLoop  — registers one MUP per device × {W, V, Hz} at startup;
+//	                 consumes registry.Updates() and POSTs per-device readings.
+//	bridge (internal) — evaluates scheduler every 15 s; calls ApplyControl.
+//	registry (internal) — polls Modbus every 10 s; emits MeasurementUpdates.
+//
+// Response POST state machine (GEN.044 / CORE-022):
+//
+//	Received  (1): posted once when a DERControl event is first seen in the
+//	               DERControlList, even before its time window opens.
+//	Started   (2): posted when the scheduler first makes the event active.
+//	Completed (3): posted when the event expires or is superseded.
 //
 // Usage:
 //
 //	hub [-config hub.json]
-//
-// The config file is JSON; see hub-example.json for the full schema.
 package main
 
 import (
@@ -122,8 +125,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
-	// Shared clock offset (seconds): server_time = time.Now().Unix() + clockOffset.
-	// Updated by discoveryLoop; read by telemetryLoop for timestamping.
+	// Shared clock offset: server_time = time.Now().Unix() + clockOffset.
+	// Written by discoveryLoop; read by telemetryLoop for timestamps.
 	var clockOffset atomic.Int64
 
 	wg.Add(1)
@@ -164,8 +167,6 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 
 // ── Discovery loop ─────────────────────────────────────────────────────────
 
-// discoveryLoop periodically walks the CSIP resource tree and updates the
-// bridge. It also runs the response POST state machine on each cycle.
 func discoveryLoop(
 	ctx context.Context,
 	cfg *Config,
@@ -175,14 +176,10 @@ func discoveryLoop(
 	sched *scheduler.Scheduler,
 	clockOffset *atomic.Int64,
 ) {
-	tracker := &responseTracker{
-		fetcher:         fetcher,
-		lfdi:            lfdi,
-		responseSetPath: cfg.ResponseSetPath,
-	}
+	tracker := newResponseTracker(fetcher, lfdi, cfg.ResponseSetPath)
 
 	// Discover immediately, then on the ticker.
-	runDiscovery(cfg, fetcher, lfdi, b, sched, tracker, clockOffset)
+	runDiscovery(fetcher, lfdi, b, sched, tracker, clockOffset)
 
 	ticker := time.NewTicker(cfg.DiscoveryInterval())
 	defer ticker.Stop()
@@ -192,14 +189,12 @@ func discoveryLoop(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runDiscovery(cfg, fetcher, lfdi, b, sched, tracker, clockOffset)
+			runDiscovery(fetcher, lfdi, b, sched, tracker, clockOffset)
 		}
 	}
 }
 
-// runDiscovery performs one full walk and updates bridge + response tracker.
 func runDiscovery(
-	cfg *Config,
 	fetcher *tlsclient.WolfSSLFetcher,
 	lfdi string,
 	b *bridge.Bridge,
@@ -217,62 +212,92 @@ func runDiscovery(
 	clockOffset.Store(tree.ClockOffset)
 	b.SetPrograms(tree.Programs, tree.ClockOffset)
 
-	// Check active control and drive response POST state machine.
 	serverNow := scheduler.ServerNow(tree.ClockOffset)
 	active := sched.Evaluate(tree.Programs, serverNow)
-	tracker.update(active, tree.ClockOffset)
+	tracker.update(tree, active)
 
 	log.Printf("hub: discovery OK: programs=%d clockOffset=%ds",
 		len(tree.Programs), tree.ClockOffset)
 }
 
 // ── Response POST state machine ────────────────────────────────────────────
+//
+// Full three-transition lifecycle per GEN.044 / CORE-022:
+//   Received  (1) — posted once per event MRID when first seen in DERControlList
+//   Started   (2) — posted when the event's time window becomes active
+//   Completed (3) — posted when the event expires or is superseded
+//
+// The received map persists across discovery cycles so Received is only sent
+// once per MRID per hub process lifetime. On restart the server receives a
+// fresh Received for each event still in the list — servers must tolerate this.
 
-// responseTracker tracks which event was last acknowledged and POSTs
-// status transitions to the server's ResponseSet per GEN.044 / CORE-022.
 type responseTracker struct {
 	fetcher         *tlsclient.WolfSSLFetcher
 	lfdi            string
 	responseSetPath string
+	clockOffset     int64
 
-	lastMRID   string // MRID of last event we sent EventStarted for
-	lastStatus uint8  // last status POSTed for lastMRID (0 = none)
-
-	clockOffset int64
+	received    map[string]bool // event MRIDs for which we have sent Received(1)
+	activeMRID  string          // MRID of the event we last sent Started(2) for
 }
 
-// update compares active with the last-known state and POSTs any required
-// Response transitions.
-func (rt *responseTracker) update(active *scheduler.ActiveControl, clockOffset int64) {
-	rt.clockOffset = clockOffset
+func newResponseTracker(fetcher *tlsclient.WolfSSLFetcher, lfdi, responseSetPath string) *responseTracker {
+	return &responseTracker{
+		fetcher:         fetcher,
+		lfdi:            lfdi,
+		responseSetPath: responseSetPath,
+		received:        make(map[string]bool),
+	}
+}
 
-	// No active event (default control or nothing).
+// update drives all three response transitions based on the latest resource tree
+// and the scheduler's current evaluation.
+func (rt *responseTracker) update(tree *discovery.ResourceTree, active *scheduler.ActiveControl) {
+	rt.clockOffset = tree.ClockOffset
+
+	// ── Phase 1: Received (status=1) ─────────────────────────────────────
+	// Walk every DERControlList in every program. Post Received the first time
+	// we see each event MRID, regardless of whether the event window has opened.
+	for _, ps := range tree.Programs {
+		if ps.Controls == nil {
+			continue
+		}
+		for _, ctrl := range ps.Controls.DERControl {
+			// Skip cancelled events — server has already withdrawn them.
+			if ctrl.EventStatus != nil && ctrl.EventStatus.CurrentStatus == 6 {
+				continue
+			}
+			if !rt.received[ctrl.MRID] {
+				rt.post(ctrl.MRID, model.ResponseEventReceived)
+				rt.received[ctrl.MRID] = true
+			}
+		}
+	}
+
+	// ── Phase 2 & 3: Started (2) and Completed (3) ───────────────────────
 	if active == nil || active.Source == "default" {
-		if rt.lastMRID != "" && rt.lastStatus == model.ResponseEventStarted {
-			rt.post(rt.lastMRID, model.ResponseEventCompleted)
-			rt.lastMRID = ""
-			rt.lastStatus = 0
+		// No active event. If we had one running, it just ended.
+		if rt.activeMRID != "" {
+			rt.post(rt.activeMRID, model.ResponseEventCompleted)
+			rt.activeMRID = ""
 		}
 		return
 	}
 
-	// Active event: detect new or changed event.
-	if active.MRID != rt.lastMRID {
-		// Complete the previous event if one was in progress.
-		if rt.lastMRID != "" && rt.lastStatus == model.ResponseEventStarted {
-			rt.post(rt.lastMRID, model.ResponseEventCompleted)
+	// A new event became active (or the active event changed).
+	if active.MRID != rt.activeMRID {
+		if rt.activeMRID != "" {
+			// Previous event superseded by this one.
+			rt.post(rt.activeMRID, model.ResponseEventCompleted)
 		}
-		// Start the new event.
 		rt.post(active.MRID, model.ResponseEventStarted)
-		rt.lastMRID = active.MRID
-		rt.lastStatus = model.ResponseEventStarted
+		rt.activeMRID = active.MRID
 	}
 
-	// Check if the current event has expired since the last check.
-	if active.ValidUntil > 0 && scheduler.ServerNow(clockOffset) >= active.ValidUntil {
+	// Check whether the active event's window has closed since last check.
+	if active.ValidUntil > 0 && scheduler.ServerNow(tree.ClockOffset) >= active.ValidUntil {
 		rt.post(active.MRID, model.ResponseEventCompleted)
-		rt.lastMRID = ""
-		rt.lastStatus = 0
+		rt.activeMRID = ""
 	}
 }
 
@@ -292,14 +317,23 @@ func (rt *responseTracker) post(mrid string, status uint8) {
 		log.Printf("hub: POST response (mrid=%s status=%d): %v", mrid, status, err)
 		return
 	}
-	log.Printf("hub: response posted: mrid=%s status=%d", mrid, status)
+	statusName := map[uint8]string{1: "Received", 2: "Started", 3: "Completed"}[status]
+	log.Printf("hub: response posted: %s mrid=%s", statusName, mrid)
 }
 
 // ── MUP telemetry loop ─────────────────────────────────────────────────────
+//
+// Registers three MirrorUsagePoints (W, V, Hz) per device at startup, then
+// POSTs per-device readings at mup_post_rate_s intervals. Each device's MUP
+// MRID is derived from the LFDI + device name for stable identity across
+// restarts (the server de-dupes by MRID).
 
-// telemetryLoop registers three MirrorUsagePoints (W, V, Hz) on startup and
-// then posts measurements from the registry at the configured postRate.
-// It exits cleanly on ctx cancellation.
+// deviceMUPs holds the MUP paths assigned by the server for one device.
+type deviceMUPs struct {
+	name  string
+	paths map[string]string // "W" / "V" / "Hz" → /mup/{n}
+}
+
 func telemetryLoop(
 	ctx context.Context,
 	cfg *Config,
@@ -308,9 +342,18 @@ func telemetryLoop(
 	reg *registry.Registry,
 	clockOffset *atomic.Int64,
 ) {
-	mupPaths, err := registerMUPs(fetcher, lfdi, cfg.MUPPostRateS)
-	if err != nil {
-		log.Printf("hub: MUP registration failed: %v — telemetry disabled", err)
+	// Register one set of MUPs per device.
+	var allMUPs []deviceMUPs
+	for _, dc := range cfg.Devices {
+		paths, err := registerDeviceMUPs(fetcher, lfdi, dc.Name, cfg.MUPPostRateS)
+		if err != nil {
+			log.Printf("hub: MUP registration for %s failed: %v — skipping", dc.Name, err)
+			continue
+		}
+		allMUPs = append(allMUPs, deviceMUPs{name: dc.Name, paths: paths})
+	}
+	if len(allMUPs) == 0 {
+		log.Printf("hub: no MUPs registered — telemetry disabled")
 		return
 	}
 
@@ -318,8 +361,7 @@ func telemetryLoop(
 	defer postTicker.Stop()
 
 	updates := reg.Updates()
-	// latest holds the most recent measurement per device name.
-	latest := make(map[string]device.Measurements)
+	latest := make(map[string]device.Measurements) // device name → latest snapshot
 
 	for {
 		select {
@@ -333,26 +375,32 @@ func telemetryLoop(
 			if upd.Err == nil {
 				latest[upd.Name] = upd.Measurements
 			} else {
-				log.Printf("hub: device %s measurement error: %v", upd.Name, upd.Err)
+				log.Printf("hub: device %s poll error: %v", upd.Name, upd.Err)
 			}
 
 		case <-postTicker.C:
-			if len(latest) == 0 {
-				continue
+			for _, dm := range allMUPs {
+				m, ok := latest[dm.name]
+				if !ok {
+					continue // no reading yet for this device
+				}
+				postDeviceMeasurements(fetcher, dm.name, dm.paths, m,
+					clockOffset.Load(), cfg.MUPPostRateS)
 			}
-			postMeasurements(fetcher, mupPaths, aggregateMeasurements(latest), clockOffset.Load())
 		}
 	}
 }
 
-// registerMUPs POSTs three MirrorUsagePoints (/mup) to register them with
-// the server and returns a map from "W"/"V"/"Hz" to the assigned path.
-func registerMUPs(fetcher *tlsclient.WolfSSLFetcher, lfdi string, postRateS int) (map[string]string, error) {
-	// Use the first 8 chars of the LFDI as a stable prefix for MRIDs.
+// registerDeviceMUPs POSTs three MirrorUsagePoints for one device and returns
+// the server-assigned paths. The MRIDs are stable across restarts so the
+// server can de-duplicate them by MRID.
+func registerDeviceMUPs(fetcher *tlsclient.WolfSSLFetcher, lfdi, deviceName string, postRateS int) (map[string]string, error) {
+	// Stable MRID prefix: first 8 chars of LFDI + device name.
 	prefix := lfdi
 	if len(prefix) > 8 {
 		prefix = prefix[:8]
 	}
+	prefix += "-" + deviceName
 
 	type mupDef struct {
 		key  string
@@ -360,9 +408,9 @@ func registerMUPs(fetcher *tlsclient.WolfSSLFetcher, lfdi string, postRateS int)
 		desc string
 	}
 	defs := []mupDef{
-		{"W", prefix + "-MUP-W", "Real Power (W)"},
-		{"V", prefix + "-MUP-V", "Phase Voltage (V)"},
-		{"Hz", prefix + "-MUP-Hz", "Frequency (Hz)"},
+		{"W",  prefix + "-W",  deviceName + " Real Power (W)"},
+		{"V",  prefix + "-V",  deviceName + " Phase Voltage (V)"},
+		{"Hz", prefix + "-Hz", deviceName + " Frequency (Hz)"},
 	}
 
 	paths := make(map[string]string, len(defs))
@@ -370,7 +418,7 @@ func registerMUPs(fetcher *tlsclient.WolfSSLFetcher, lfdi string, postRateS int)
 		mup := model.MirrorUsagePoint{
 			MRID:                d.mrid,
 			Description:         d.desc,
-			RoleFlags:           0x0002, // export
+			RoleFlags:           0x0002,
 			ServiceCategoryKind: 0,
 			Status:              1,
 			DeviceLFDI:          lfdi,
@@ -385,22 +433,23 @@ func registerMUPs(fetcher *tlsclient.WolfSSLFetcher, lfdi string, postRateS int)
 			return nil, fmt.Errorf("register MUP %s: %w", d.key, err)
 		}
 		paths[d.key] = loc
-		log.Printf("hub: MUP registered: %s → %s", d.key, loc)
+		log.Printf("hub: MUP registered: %s/%s → %s", deviceName, d.key, loc)
 	}
 	return paths, nil
 }
 
-// postMeasurements encodes m as three MirrorMeterReading POSTs (W, V, Hz).
-// NaN values are skipped. clockOffset is added to the local wall time
-// to produce the server-relative timestamp.
-func postMeasurements(
+// postDeviceMeasurements encodes m as three MirrorMeterReading POSTs (W, V, Hz)
+// for one device. NaN values are skipped.
+func postDeviceMeasurements(
 	fetcher *tlsclient.WolfSSLFetcher,
-	mupPaths map[string]string,
+	deviceName string,
+	paths map[string]string,
 	m device.Measurements,
 	clockOffset int64,
+	intervalS int,
 ) {
 	now := time.Now().Unix() + clockOffset
-	dur := uint32(300) // nominal 5-minute interval
+	dur := uint32(intervalS)
 
 	type reading struct {
 		key string
@@ -412,48 +461,40 @@ func postMeasurements(
 		{"Hz", m.Hz},
 	}
 
+	posted := 0
 	for _, r := range readings {
-		path, ok := mupPaths[r.key]
+		path, ok := paths[r.key]
 		if !ok || math.IsNaN(r.val) {
 			continue
 		}
 		mmr := model.MirrorMeterReading{
-			MirrorReadingSet: []model.MirrorReadingSet{
-				{
-					StartTime: now - int64(dur),
-					Duration:  dur,
-					Reading: []model.Reading{
-						{
-							Value: int64(math.Round(r.val)),
-							TimePeriod: &model.DateTimeInterval{
-								Start:    now - int64(dur),
-								Duration: dur,
-							},
-						},
+			MirrorReadingSet: []model.MirrorReadingSet{{
+				StartTime: now - int64(dur),
+				Duration:  dur,
+				Reading: []model.Reading{{
+					Value: int64(math.Round(r.val)),
+					TimePeriod: &model.DateTimeInterval{
+						Start:    now - int64(dur),
+						Duration: dur,
 					},
-				},
-			},
+				}},
+			}},
 		}
 		body, err := xml.Marshal(&mmr)
 		if err != nil {
-			log.Printf("hub: marshal MirrorMeterReading %s: %v", r.key, err)
+			log.Printf("hub: marshal %s/%s: %v", deviceName, r.key, err)
 			continue
 		}
 		if _, _, err = fetcher.Post(path, body, "application/sep+xml"); err != nil {
-			log.Printf("hub: POST telemetry %s: %v", r.key, err)
+			log.Printf("hub: POST telemetry %s/%s: %v", deviceName, r.key, err)
+			continue
 		}
+		posted++
 	}
-	log.Printf("hub: telemetry posted: W=%.0f V=%.1f Hz=%.2f", m.W, m.V, m.Hz)
-}
-
-// aggregateMeasurements reduces a per-device measurement map to a single
-// Measurements value. Currently returns the first device's readings; future
-// versions will sum real-power across devices in the same site.
-func aggregateMeasurements(m map[string]device.Measurements) device.Measurements {
-	for _, meas := range m {
-		return meas
+	if posted > 0 {
+		log.Printf("hub: telemetry posted: %s W=%.0f V=%.1f Hz=%.2f",
+			deviceName, m.W, m.V, m.Hz)
 	}
-	return device.Measurements{W: math.NaN(), V: math.NaN(), Hz: math.NaN()}
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
