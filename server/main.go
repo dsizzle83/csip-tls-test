@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"csip-tls-test/internal/gridsim"
+	"csip-tls-test/internal/ocppserver"
 	"csip-tls-test/internal/tlsserver"
 	"csip-tls-test/internal/wolfssl"
 )
@@ -19,6 +20,14 @@ func main() {
 		caCert     = flag.String("ca", "/home/dmitri/csip-tls-test/certs/ca-cert.pem", "CA cert PEM path")
 		serverCert = flag.String("cert", "/home/dmitri/csip-tls-test/certs/server-cert.pem", "server cert PEM path")
 		serverKey  = flag.String("key", "/home/dmitri/csip-tls-test/certs/server-key.pem", "server key PEM path")
+
+		// OCPP 2.0.1 CSMS flags (Security Profile 2: TLS + Basic Auth).
+		// TLS is optional; omit -ocpp-cert/-ocpp-key for plain WebSocket (dev only).
+		ocppPort     = flag.Int("ocpp-port", ocppserver.DefaultPort, "OCPP 2.0.1 CSMS WebSocket port")
+		ocppCert     = flag.String("ocpp-cert", "", "OCPP server TLS cert PEM (enables TLS when set)")
+		ocppKey      = flag.String("ocpp-key", "", "OCPP server TLS key PEM")
+		ocppAuthUser = flag.String("ocpp-user", "", "OCPP basic-auth username (optional)")
+		ocppAuthPass = flag.String("ocpp-pass", "", "OCPP basic-auth password (optional)")
 	)
 	flag.Parse()
 
@@ -50,11 +59,22 @@ func main() {
 	log.Printf("Server listening on %s (mTLS, cipher=%s)",
 		lis.Addr(), tlsserver.DefaultCipherList)
 
+	// Start OCPP 2.0.1 CSMS concurrently.
+	ocppSrv := ocppserver.New(ocppserver.Config{
+		Port:          *ocppPort,
+		CertPath:      *ocppCert,
+		KeyPath:       *ocppKey,
+		BasicAuthUser: *ocppAuthUser,
+		BasicAuthPass: *ocppAuthPass,
+	})
+	go ocppSrv.Start()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
 		log.Printf("shutting down...")
+		ocppSrv.Stop()
 		_ = lis.Close()
 	}()
 
