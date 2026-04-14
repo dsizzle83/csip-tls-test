@@ -1,22 +1,16 @@
-// modsim runs a standalone SunSpec Modbus TCP simulator using the same
-// register layout as the inverter package's in-process test server.
-// It is intended for development and Docker-based integration testing —
-// point your Modbus client (running on the Pi or locally) at it and get
-// a fully-functional 5000 W three-phase inverter without any hardware.
+// modsim runs an animated SunSpec PV inverter simulator for development and
+// Docker-based integration testing. Registers update every 5 seconds to
+// simulate realistic solar power output.
 //
 // Usage:
 //
 //	modsim [-port 5020] [-wmax 5000]
 //
-// The simulator exposes Models 1, 121, 103, and 123 starting at Modbus
-// address 40001 (0-based: 40000). Initial measurement values:
+// Models exposed: 1 (Common), 120 (Nameplate), 121 (Basic Settings),
+// 122 (Extended Status), 103 (Three-Phase Inverter), 123 (Immediate Controls).
 //
-//	W = 3000 W, V = 240.0 V, Hz = 60.00 Hz, PF = 0.968, TmpCab = 35.0 °C
-//	WMax = <wmax> W, WMaxLimPct = 100 %, Conn = 1 (connected)
-//
-// Control writes (Model 123) are accepted and held — the simulator does not
-// simulate any physical response to commands. Use this to validate that your
-// client writes the right register values before connecting to real hardware.
+// W follows a 10-minute sinusoidal irradiance cycle (5–95 % of WMax).
+// Control writes to Model 123 (WMaxLimPct, Conn) are accepted and held.
 package main
 
 import (
@@ -32,16 +26,16 @@ import (
 
 func main() {
 	port := flag.Int("port", 5020, "TCP port to listen on")
-	wmax := flag.Float64("wmax", 5000, "Nameplate WMax in watts (written to Model 121)")
+	wmax := flag.Float64("wmax", 5000, "Nameplate WMax in watts")
 	flag.Parse()
 
 	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
 
-	log.Printf("modsim: starting SunSpec inverter simulator on %s (WMax=%.0f W)", listenURL, *wmax)
-	log.Printf("modsim: models: 1 (Common), 121 (BasicSettings), 103 (Three-Phase Inverter), 123 (ImmediateCtrl)")
-	log.Printf("modsim: initial state: W=3000 V=240 Hz=60 PF=0.968 Conn=1 WMaxLimPct=100%%")
+	log.Printf("modsim: starting animated PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
+	log.Printf("modsim: models: 1 (Common), 120 (Nameplate), 121 (BasicSettings), 122 (ExtStatus), 103 (InverterThreePh), 123 (ImmediateCtrl)")
+	log.Printf("modsim: W cycles 5–95%% of WMax on a 600 s sine; updates every 5 s")
 
-	srv, err := sim.NewServer(listenURL, *wmax)
+	srv, err := sim.NewSolarServer(listenURL, *wmax)
 	if err != nil {
 		log.Fatalf("modsim: %v", err)
 	}

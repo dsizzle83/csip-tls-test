@@ -44,6 +44,7 @@ import (
 	"csip-tls-test/internal/csip/identity"
 	"csip-tls-test/internal/csip/model"
 	"csip-tls-test/internal/csip/scheduler"
+	"csip-tls-test/internal/southbound/battery"
 	"csip-tls-test/internal/southbound/device"
 	"csip-tls-test/internal/southbound/inverter"
 	"csip-tls-test/internal/southbound/registry"
@@ -150,13 +151,14 @@ func main() {
 }
 
 // openDevice constructs a device.Device from a DeviceConfig.
-// Currently only "inverter" is supported.
 func openDevice(dc DeviceConfig) (device.Device, error) {
 	switch dc.Role {
 	case "inverter":
 		return inverter.New(dc.URL, 5*time.Second, dc.UnitID)
+	case "battery":
+		return battery.New(dc.URL, 5*time.Second, dc.UnitID)
 	default:
-		return nil, fmt.Errorf("unknown role %q (supported: inverter)", dc.Role)
+		return nil, fmt.Errorf("unknown role %q (supported: inverter, battery)", dc.Role)
 	}
 }
 

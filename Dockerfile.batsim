@@ -1,0 +1,22 @@
+# Multi-stage build for the SunSpec battery storage simulator.
+# Pure Go — no cgo — so it cross-compiles cleanly on any host.
+
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -o /batsim ./cmd/batsim
+
+FROM alpine:3.19
+COPY --from=builder /batsim /usr/local/bin/batsim
+
+EXPOSE 5021
+
+# Default: 10 kWh, 5000 W peak, port 5021.
+# Override at runtime: docker run ... batsim -kwh 20 -wmax 7600
+ENTRYPOINT ["/usr/local/bin/batsim"]
+CMD ["-port", "5021", "-kwh", "10", "-wmax", "5000"]

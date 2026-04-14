@@ -34,6 +34,10 @@ build-modsim:
 	@mkdir -p bin
 	go build -o bin/modsim ./cmd/modsim
 
+build-batsim:
+	@mkdir -p bin
+	go build -o bin/batsim ./cmd/batsim
+
 # Hub uses wolfSSL (cgo) — must be built natively on Pi.
 # Use sync-hub-pi to sync and build on the Pi in one step.
 build-hub:
@@ -53,7 +57,7 @@ MODSIM_PORT   ?= 5020
 MODSIM_WMAX   ?= 5000
 MODSIM_NAME   ?= modsim
 
-# Build the Docker image for the SunSpec simulator.
+# Build the Docker image for the SunSpec solar simulator.
 modsim-image:
 	docker build -f Dockerfile.modsim -t $(MODSIM_IMAGE) .
 
@@ -71,6 +75,23 @@ modsim-run: modsim-image
 # Stop the simulator container.
 modsim-stop:
 	docker stop $(MODSIM_NAME) 2>/dev/null || true
+
+# ── Docker Compose (solar + battery together) ───────────────────────────────
+
+# Build and start both simulator containers (solar :5020, battery :5021).
+sim-up:
+	docker compose up -d --build
+	@echo "Solar  → host:5020  (PV inverter, animated)"
+	@echo "Battery → host:5021  (Li-Ion storage, animated)"
+	@echo "Stop with: make sim-down"
+
+# Stop and remove simulator containers.
+sim-down:
+	docker compose down
+
+# Stream logs from both simulators.
+sim-logs:
+	docker compose logs -f
 
 # Cross-compile and deploy the Modbus diagnostic client to the Pi.
 # The southbound packages are pure Go so no Pi-side toolchain is needed.

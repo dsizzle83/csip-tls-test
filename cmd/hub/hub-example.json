@@ -5,19 +5,25 @@
   "client_key": "certs/client-key.pem",
   "lfdi": "",
 
-  "discovery_interval_s": 60,
-  "control_interval_s": 30,
+  "discovery_interval_s": 20,
+  "control_interval_s": 15,
   "poll_interval_s": 10,
-  "mup_post_rate_s": 300,
+  "mup_post_rate_s": 60,
 
   "response_set_path": "/rsps/0/r",
 
   "devices": [
     {
-      "name": "inverter-0",
-      "url": "tcp://localhost:5020",
+      "name": "solar-0",
+      "url": "tcp://192.168.0.188:5020",
       "unit_id": 1,
       "role": "inverter"
+    },
+    {
+      "name": "battery-0",
+      "url": "tcp://192.168.0.188:5021",
+      "unit_id": 1,
+      "role": "battery"
     }
   ]
 }

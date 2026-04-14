@@ -1,17 +1,14 @@
-// Package sim provides an in-process SunSpec Modbus TCP server pre-loaded
-// with a realistic three-phase inverter register layout. It is used by:
+// Package sim provides in-process SunSpec Modbus TCP servers for development
+// and integration testing without real hardware.
 //
-//   - inverter package tests (random-port, in-process)
-//   - cmd/modsim (standalone simulator for Docker / desktop development)
+// There are three constructors:
 //
-// Register layout (Models 1 → 121 → 103 → 123 → end marker):
+//   - NewServer — static inverter layout (Models 1/121/103/123); used by tests.
+//   - NewSolarServer — animated PV inverter (Models 1/120/121/122/103/123).
+//   - NewBatteryServer — animated Li-Ion storage (Models 1/120/121/103/123/802).
 //
-//	40000-40001: SunS header
-//	40002-40069: Model 1  (Common, 66 data registers)
-//	40070-40101: Model 121 (Basic Settings, 30 data registers; WMax at offset 0)
-//	40102-40153: Model 103 (Three-Phase Inverter, 50 data registers)
-//	40154-40178: Model 123 (Immediate Controls, 23 data registers)
-//	40179-40180: end marker (0xFFFF, 0)
+// Both animated servers update their registers every 5 seconds to simulate
+// realistic power flow. Stop() shuts down the animation and the Modbus server.
 package sim
 
 import (
@@ -85,19 +82,28 @@ type Server struct {
 	// simulate changing inverter state or verify that a write landed.
 	Regs *RegisterMap
 
-	srv *modbuslib.ModbusServer
+	srv  *modbuslib.ModbusServer
+	stop chan struct{} // closed by Stop to signal the animation goroutine
+	done chan struct{} // closed by animation goroutine when it exits
 }
 
-// NewServer creates and starts a SunSpec inverter simulator listening on
-// listenURL (e.g. "tcp://0.0.0.0:5020" or "tcp://127.0.0.1:5020").
+// NewServer creates and starts a static SunSpec inverter simulator on
+// listenURL (e.g. "tcp://0.0.0.0:5020"). Register values do not change
+// after startup. This variant is used by package inverter tests.
 //
-// wmaxW sets the nameplate peak power in watts (written to Model 121 WMax).
-// A StartupDelay of 20 ms is applied to let the TCP listener bind before
-// the caller dials.
+// For an animated solar or battery simulator use NewSolarServer /
+// NewBatteryServer instead.
 func NewServer(listenURL string, wmaxW float64) (*Server, error) {
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	Populate(regs, wmaxW)
+	return startServer(listenURL, regs)
+}
 
+// startServer is the shared server-launch helper used by all constructors.
+// Callers populate regs before calling; startServer starts the Modbus
+// listener and launches a goroutine that just waits for stop (so that
+// Stop() always works cleanly via the stop/done channels).
+func startServer(listenURL string, regs *RegisterMap) (*Server, error) {
 	srv, err := modbuslib.NewServer(&modbuslib.ServerConfiguration{
 		URL:        listenURL,
 		MaxClients: 8,
@@ -109,14 +115,26 @@ func NewServer(listenURL string, wmaxW float64) (*Server, error) {
 	if err := srv.Start(); err != nil {
 		return nil, fmt.Errorf("sim: start server at %s: %w", listenURL, err)
 	}
-	// Give the kernel a moment to finish binding.
 	time.Sleep(20 * time.Millisecond)
 
-	return &Server{Regs: regs, srv: srv}, nil
+	s := &Server{
+		Regs: regs,
+		srv:  srv,
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	// Default: no animation — just wait for stop.
+	go func() {
+		defer close(s.done)
+		<-s.stop
+	}()
+	return s, nil
 }
 
-// Stop shuts the server down cleanly.
+// Stop shuts the animation goroutine and the Modbus server down cleanly.
 func (s *Server) Stop() {
+	close(s.stop)
+	<-s.done
 	s.srv.Stop()
 }
 

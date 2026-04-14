@@ -1,0 +1,69 @@
+# CSIP DER simulator stack.
+#
+# Three services:
+#   solar    — animated PV inverter   (Modbus TCP :5020)
+#   battery  — animated Li-Ion storage (Modbus TCP :5021)
+#
+# The gridsim (wolfSSL mTLS server) is NOT in this compose because it
+# requires cgo / wolfSSL and TLS certificates. Run it separately:
+#   make start-server
+#
+# Usage:
+#   docker compose up -d          # start all simulators in the background
+#   docker compose logs -f        # stream logs
+#   docker compose down           # stop and remove containers
+#
+# The Pi reaches the simulators at <desktop-IP>:5020 and <desktop-IP>:5021.
+#
+# ── Own IP addresses (macvlan) ───────────────────────────────────────────────
+# On a native Linux host (not WSL2) you can give each container its own LAN IP
+# so the Pi connects directly without port forwarding:
+#
+#   docker network create -d macvlan \
+#     --subnet=192.168.0.0/24 \
+#     --gateway=192.168.0.1 \
+#     -o parent=eth0 csip-lan
+#
+# Then change each service's network section to:
+#   networks:
+#     csip-lan:
+#       ipv4_address: 192.168.0.51   # solar
+#       # or 192.168.0.52            # battery
+#
+# On WSL2, macvlan requires the Hyper-V switch adapter to be in promiscuous
+# mode, which is not supported by default. Use port-mapping (the default
+# below) on WSL2.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  solar:
+    build:
+      context: .
+      dockerfile: Dockerfile.modsim
+    image: csip-solar
+    container_name: csip-solar
+    restart: unless-stopped
+    ports:
+      - "5020:5020"
+    command: ["-port", "5020", "-wmax", "5000"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  battery:
+    build:
+      context: .
+      dockerfile: Dockerfile.batsim
+    image: csip-battery
+    container_name: csip-battery
+    restart: unless-stopped
+    ports:
+      - "5021:5021"
+    command: ["-port", "5021", "-kwh", "10", "-wmax", "5000"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
