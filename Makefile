@@ -1,5 +1,5 @@
-.PHONY: all build build-server build-client build-conformance build-modsim \
-        build-modsim-client-pi deploy-modsim-client-pi smoke-modbus-pi sync-pi \
+.PHONY: all build build-server build-client build-conformance build-modsim build-hub \
+        build-modsim-client-pi deploy-modsim-client-pi smoke-modbus-pi sync-pi sync-hub-pi \
         start-server conformance-pi \
         test test-fast test-integration test-update-golden test-southbound \
         modsim-image modsim-run modsim-stop \
@@ -33,6 +33,12 @@ build-conformance:
 build-modsim:
 	@mkdir -p bin
 	go build -o bin/modsim ./cmd/modsim
+
+# Hub uses wolfSSL (cgo) — must be built natively on Pi.
+# Use sync-hub-pi to sync and build on the Pi in one step.
+build-hub:
+	@mkdir -p bin
+	go build -o bin/hub ./cmd/hub
 
 # Cross-compile the Modbus diagnostic client for the Pi (linux/arm64).
 # No cgo — southbound packages are pure Go.
@@ -101,6 +107,16 @@ sync-pi:
 	    go build -o bin/client ./client && \
 	    go build -o bin/conformance ./cmd/conformance"
 	@echo "Source synced; client and conformance runner built on Pi at $(PI_DIR)/bin/"
+
+# Sync source to Pi and build the hub binary natively (wolfSSL requires native arm64 build).
+sync-hub-pi:
+	rsync -a --delete \
+	    --exclude=bin/ --exclude='*-key.pem' --exclude='.git/' \
+	    ./ $(PI_HOST):$(PI_DIR)/
+	ssh $(PI_HOST) "mkdir -p $(PI_DIR)/bin && cd $(PI_DIR) && \
+	    go build -o bin/hub ./cmd/hub"
+	@echo "Hub built on Pi at $(PI_DIR)/bin/hub"
+	@echo "Run: $(PI_DIR)/bin/hub -config $(PI_DIR)/hub.json"
 
 # Run the CSIP conformance suite on the Pi against the WSL server.
 # Prerequisites:
@@ -197,8 +213,10 @@ help:
 	@echo "  make build               Build client + server (amd64/WSL)"
 	@echo "  make build-server        Build only the server binary"
 	@echo "  make build-client        Build only the client binary"
+	@echo "  make build-hub           Build hub binary (amd64/WSL, requires wolfSSL)"
 	@echo "  make sync-pi             Sync source to Pi; build client + conformance"
 	@echo "                           Override: make sync-pi PI_HOST=user@host"
+	@echo "  make sync-hub-pi         Sync source to Pi and build hub natively (arm64)"
 	@echo ""
 	@echo "Test:"
 	@echo "  make test                Run all tests (unit + integration)"

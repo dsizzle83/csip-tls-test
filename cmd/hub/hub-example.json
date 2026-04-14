@@ -1,0 +1,23 @@
+{
+  "server": "192.168.0.188:11111",
+  "ca_cert": "certs/ca-cert.pem",
+  "client_cert": "certs/client-cert.pem",
+  "client_key": "certs/client-key.pem",
+  "lfdi": "",
+
+  "discovery_interval_s": 60,
+  "control_interval_s": 30,
+  "poll_interval_s": 10,
+  "mup_post_rate_s": 300,
+
+  "response_set_path": "/rsps/0/r",
+
+  "devices": [
+    {
+      "name": "inverter-0",
+      "url": "tcp://localhost:5020",
+      "unit_id": 1,
+      "role": "inverter"
+    }
+  ]
+}
