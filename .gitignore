@@ -2,6 +2,7 @@
 bin/
 gridsim-client
 gridsim-server
+/hub
 
 # Private keys — never commit, ever.
 # This catches server-key.pem, client-key.pem, vault/ca-key.pem, test keys, all of them.

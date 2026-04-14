@@ -63,16 +63,27 @@ func main() {
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
 
-	fetcher, err := tlsclient.NewWolfSSLFetcher(tlsclient.Config{
+	tlsCfg := tlsclient.Config{
 		ServerAddr:     cfg.Server,
 		CACertPath:     cfg.CACert,
 		ClientCertPath: cfg.ClientCert,
 		ClientKeyPath:  cfg.ClientKey,
-	})
-	if err != nil {
-		log.Fatalf("hub: init fetcher: %v", err)
 	}
-	defer fetcher.Free()
+
+	// WolfSSLFetcher is not concurrent-safe (single wolfSSL session per
+	// instance). Give each goroutine its own instance so their Dial/Get/Post
+	// calls never interleave on the same SSL object.
+	fetcherDisc, err := tlsclient.NewWolfSSLFetcher(tlsCfg)
+	if err != nil {
+		log.Fatalf("hub: init fetcher (discovery): %v", err)
+	}
+	defer fetcherDisc.Free()
+
+	fetcherTelm, err := tlsclient.NewWolfSSLFetcher(tlsCfg)
+	if err != nil {
+		log.Fatalf("hub: init fetcher (telemetry): %v", err)
+	}
+	defer fetcherTelm.Free()
 
 	// Derive LFDI from cert if not in config.
 	lfdi := cfg.LFDI
@@ -117,13 +128,13 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		discoveryLoop(ctx, cfg, fetcher, lfdi, b, sched, &clockOffset)
+		discoveryLoop(ctx, cfg, fetcherDisc, lfdi, b, sched, &clockOffset)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		telemetryLoop(ctx, cfg, fetcher, lfdi, reg, &clockOffset)
+		telemetryLoop(ctx, cfg, fetcherTelm, lfdi, reg, &clockOffset)
 	}()
 
 	// ── Shutdown ──────────────────────────────────────────────────────────

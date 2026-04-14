@@ -109,6 +109,7 @@ sync-pi:
 	@echo "Source synced; client and conformance runner built on Pi at $(PI_DIR)/bin/"
 
 # Sync source to Pi and build the hub binary natively (wolfSSL requires native arm64 build).
+# Deprecated in favour of pi-hub (git pull workflow).
 sync-hub-pi:
 	rsync -a --delete \
 	    --exclude=bin/ --exclude='*-key.pem' --exclude='.git/' \
@@ -117,6 +118,27 @@ sync-hub-pi:
 	    go build -o bin/hub ./cmd/hub"
 	@echo "Hub built on Pi at $(PI_DIR)/bin/hub"
 	@echo "Run: $(PI_DIR)/bin/hub -config $(PI_DIR)/hub.json"
+
+# ── Git-based Pi build workflow ─────────────────────────────────────────────
+# Push from WSL with `git push`, then use these targets to pull and build on
+# the Pi over SSH. No rsync needed.
+
+# Pull latest from git and build just the hub binary on the Pi.
+pi-hub:
+	ssh $(PI_HOST) "cd $(PI_DIR) && git pull && mkdir -p bin && go build -o bin/hub ./cmd/hub"
+	@echo "hub built on $(PI_HOST):$(PI_DIR)/bin/hub"
+
+# Pull latest from git and build all Pi binaries (hub + client + conformance).
+pi-build:
+	ssh $(PI_HOST) "cd $(PI_DIR) && git pull && mkdir -p bin && \
+	    go build -o bin/hub ./cmd/hub && \
+	    go build -o bin/client ./client && \
+	    go build -o bin/conformance ./cmd/conformance"
+	@echo "All Pi binaries built on $(PI_HOST):$(PI_DIR)/bin/"
+
+# Run the hub on the Pi (assumes bin/hub already built and hub.json present).
+pi-run:
+	ssh -t $(PI_HOST) "cd $(PI_DIR) && ./bin/hub -config hub.json"
 
 # Run the CSIP conformance suite on the Pi against the WSL server.
 # Prerequisites:
@@ -213,10 +235,11 @@ help:
 	@echo "  make build               Build client + server (amd64/WSL)"
 	@echo "  make build-server        Build only the server binary"
 	@echo "  make build-client        Build only the client binary"
-	@echo "  make build-hub           Build hub binary (amd64/WSL, requires wolfSSL)"
-	@echo "  make sync-pi             Sync source to Pi; build client + conformance"
-	@echo "                           Override: make sync-pi PI_HOST=user@host"
-	@echo "  make sync-hub-pi         Sync source to Pi and build hub natively (arm64)"
+	@echo "  make build-hub           Build hub binary locally (requires wolfSSL)"
+	@echo "  make pi-hub              git pull + build hub on Pi (preferred workflow)"
+	@echo "  make pi-build            git pull + build all Pi binaries on Pi"
+	@echo "  make pi-run              Run hub on Pi via SSH (hub.json must exist)"
+	@echo "  make sync-pi             (legacy) rsync source to Pi; build client + conformance"
 	@echo ""
 	@echo "Test:"
 	@echo "  make test                Run all tests (unit + integration)"
