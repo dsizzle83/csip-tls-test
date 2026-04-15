@@ -84,8 +84,24 @@ func (w *bufferedResponseWriter) WriteHeader(code int) {
 	}
 }
 
+// hopByHopHeaders lists headers that must not be forwarded end-to-end.
+// wolfSSL connections are always Connection: close, so we own these.
+var hopByHopHeaders = map[string]bool{
+	"connection":          true,
+	"keep-alive":          true,
+	"transfer-encoding":   true,
+	"te":                  true,
+	"trailer":             true,
+	"upgrade":             true,
+	"proxy-authorization": true,
+	"proxy-authenticate":  true,
+	// content-length is recalculated from the captured body; skip the handler value.
+	"content-length": true,
+}
+
 // buildHTTPResponse serializes an HTTP response from status, headers, and body.
-// Forwards Content-Type and Location from the handler's response headers.
+// Forwards all response headers set by the handler except hop-by-hop headers;
+// always appends Content-Length and Connection: close.
 func buildHTTPResponse(status int, headers http.Header, body []byte) []byte {
 	statusText := map[int]string{
 		200: "OK",
@@ -103,11 +119,13 @@ func buildHTTPResponse(status int, headers http.Header, body []byte) []byte {
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "HTTP/1.1 %d %s\r\n", status, statusText)
-	if ct := headers.Get("Content-Type"); ct != "" {
-		fmt.Fprintf(&sb, "Content-Type: %s\r\n", ct)
-	}
-	if loc := headers.Get("Location"); loc != "" {
-		fmt.Fprintf(&sb, "Location: %s\r\n", loc)
+	for k, vals := range headers {
+		if hopByHopHeaders[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range vals {
+			fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
+		}
 	}
 	fmt.Fprintf(&sb, "Content-Length: %d\r\n", len(body))
 	fmt.Fprintf(&sb, "Connection: close\r\n")

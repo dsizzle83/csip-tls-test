@@ -35,6 +35,10 @@ type Config struct {
 
 	// Southbound devices
 	Devices []DeviceConfig `json:"devices"`
+
+	// MetricsPort is the TCP port for the Prometheus metrics HTTP server.
+	// Default 9100 (node_exporter convention). Set to 0 to disable.
+	MetricsPort int `json:"metrics_port"`
 }
 
 func (c *Config) DiscoveryInterval() time.Duration {
@@ -76,5 +80,12 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.ResponseSetPath == "" {
 		cfg.ResponseSetPath = "/rsps/0/r"
 	}
+	if cfg.MetricsPort == 0 {
+		cfg.MetricsPort = 9100
+	}
 	return &cfg, nil
+}
+
+func (c *Config) MetricsAddr() string {
+	return fmt.Sprintf(":%d", c.MetricsPort)
 }

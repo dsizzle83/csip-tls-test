@@ -24,7 +24,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"csip-tls-test/internal/csip/identity"
@@ -42,8 +41,9 @@ type Server struct {
 	ClientLFDI string // The LFDI of the client we expect to connect
 	clientSFDI uint64 // derived from ClientLFDI; updated by SetClientCertDER
 
-	// MirrorUsagePoint store (Phase 2 POST /mup flow)
-	mupNextID int32 // atomic counter for new MUP IDs
+	// MirrorUsagePoint store (Phase 2 POST /mup flow).
+	// mupNextID is protected by mu; do not read/write outside the mu lock.
+	mupNextID int32
 
 	// Response log (CORE-022: client POSTs Response on event transitions)
 	responseMu sync.Mutex
@@ -225,9 +225,6 @@ func (s *Server) handleMUPCreate(w http.ResponseWriter, r *http.Request, peerLFD
 		return
 	}
 
-	id := atomic.AddInt32(&s.mupNextID, 1) - 1
-	location := fmt.Sprintf("/mup/%d", id)
-	mup.Href = location
 	if peerLFDI != "" {
 		mup.DeviceLFDI = peerLFDI
 	}
@@ -236,6 +233,12 @@ func (s *Server) handleMUPCreate(w http.ResponseWriter, r *http.Request, peerLFD
 	}
 
 	s.mu.Lock()
+	// Generate ID and store atomically under the same lock to prevent
+	// a gap between ID allocation and resource insertion.
+	id := s.mupNextID
+	s.mupNextID++
+	location := fmt.Sprintf("/mup/%d", id)
+	mup.Href = location
 	s.resources[location] = &mup
 	// Update the MUP list count and entries.
 	if ml, ok := s.resources["/mup"].(*model.MirrorUsagePointList); ok {

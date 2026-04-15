@@ -8,6 +8,7 @@ import (
 
 	ocpp2 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/availability"
+	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/remotecontrol"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/smartcharging"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
 
@@ -84,6 +85,11 @@ func NewOCPPStateTracker(csms ocpp2.CSMS) *OCPPStateTracker {
 		st.connectedAt = time.Now()
 		t.mu.Unlock()
 		log.Printf("[ocpp-tracker] connected: %s", cs.ID())
+
+		// Request current connector status. Some EVSEs only send
+		// StatusNotification on state change, so a freshly-connected station
+		// that is already occupied would never push its state without this.
+		go t.requestStatusNotification(cs.ID())
 	})
 
 	csms.SetChargingStationDisconnectedHandler(func(cs ocpp2.ChargingStationConnection) {
@@ -211,6 +217,31 @@ func (t *OCPPStateTracker) ApplyEVSECommand(cmd orchestrator.EVSECommand) error 
 
 type availabilityForwarder struct {
 	tracker *OCPPStateTracker
+}
+
+// requestStatusNotification asks the station to send a StatusNotification for
+// each of its connectors. Called in a goroutine on connect so that stations
+// which only send StatusNotification on state change still report their initial
+// state to the CSMS (OCPP 2.0.1 §H.2 recommendation).
+func (t *OCPPStateTracker) requestStatusNotification(stationID string) {
+	// Brief settle delay — the OCPP BootNotification/registration exchange may
+	// still be in flight immediately after the WS connect callback fires.
+	time.Sleep(500 * time.Millisecond)
+
+	err := t.csms.TriggerMessage(
+		stationID,
+		func(resp *remotecontrol.TriggerMessageResponse, err error) {
+			if err != nil {
+				log.Printf("[ocpp-tracker] TriggerMessage(StatusNotification) to %s: %v", stationID, err)
+				return
+			}
+			log.Printf("[ocpp-tracker] TriggerMessage(StatusNotification) to %s: %s", stationID, resp.Status)
+		},
+		remotecontrol.MessageTriggerStatusNotification,
+	)
+	if err != nil {
+		log.Printf("[ocpp-tracker] TriggerMessage send to %s: %v", stationID, err)
+	}
 }
 
 func (h *availabilityForwarder) OnHeartbeat(

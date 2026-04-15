@@ -35,8 +35,10 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -120,6 +122,11 @@ func main() {
 	b.Start()
 	defer b.Stop()
 
+	// ── Metrics server ────────────────────────────────────────────────────
+
+	met := newHubMetrics()
+	startMetricsServer(cfg.MetricsAddr(), met)
+
 	// ── Goroutines ────────────────────────────────────────────────────────
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,13 +139,13 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		discoveryLoop(ctx, cfg, fetcherDisc, lfdi, b, sched, &clockOffset)
+		discoveryLoop(ctx, cfg, fetcherDisc, lfdi, b, sched, &clockOffset, met)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		telemetryLoop(ctx, cfg, fetcherTelm, lfdi, reg, &clockOffset)
+		telemetryLoop(ctx, cfg, fetcherTelm, lfdi, reg, &clockOffset, met)
 	}()
 
 	// ── Shutdown ──────────────────────────────────────────────────────────
@@ -175,11 +182,12 @@ func discoveryLoop(
 	b *bridge.Bridge,
 	sched *scheduler.Scheduler,
 	clockOffset *atomic.Int64,
+	met *hubMetrics,
 ) {
 	tracker := newResponseTracker(fetcher, lfdi, cfg.ResponseSetPath)
 
 	// Discover immediately, then on the ticker.
-	runDiscovery(fetcher, lfdi, b, sched, tracker, clockOffset)
+	runDiscovery(fetcher, lfdi, b, sched, tracker, clockOffset, met)
 
 	ticker := time.NewTicker(cfg.DiscoveryInterval())
 	defer ticker.Stop()
@@ -189,7 +197,7 @@ func discoveryLoop(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runDiscovery(fetcher, lfdi, b, sched, tracker, clockOffset)
+			runDiscovery(fetcher, lfdi, b, sched, tracker, clockOffset, met)
 		}
 	}
 }
@@ -201,16 +209,19 @@ func runDiscovery(
 	sched *scheduler.Scheduler,
 	tracker *responseTracker,
 	clockOffset *atomic.Int64,
+	met *hubMetrics,
 ) {
 	walker := discovery.NewWalker(fetcher, lfdi)
 	tree, err := walker.Discover("/dcap")
 	if err != nil {
 		log.Printf("hub: discovery error: %v", err)
+		met.recordDiscovery(false, 0)
 		return
 	}
 
 	clockOffset.Store(tree.ClockOffset)
 	b.SetPrograms(tree.Programs, tree.ClockOffset)
+	met.recordDiscovery(true, tree.ClockOffset)
 
 	serverNow := scheduler.ServerNow(tree.ClockOffset)
 	active := sched.Evaluate(tree.Programs, serverNow)
@@ -331,11 +342,155 @@ func (rt *responseTracker) post(mrid string, status uint8) {
 // LocalID conventions: 1 = real power (W), 2 = phase voltage (cV, ×100),
 // 3 = frequency (cHz, ×100).
 
-// deviceMUP holds the single server-assigned MUP path for one device.
-type deviceMUP struct {
-	name string
-	path string
+// ── Metrics ────────────────────────────────────────────────────────────────
+//
+// hubMetrics collects counters and gauges for the Prometheus text exposition
+// at /metrics on the metrics port (default :9100). No external library is
+// needed — we write the text format directly.
+
+type hubMetrics struct {
+	mu sync.RWMutex
+
+	// latest per-device measurement snapshot (gauges)
+	measurements map[string]device.Measurements
+
+	// cumulative counters
+	discoveryRuns   int64
+	discoveryErrors int64
+	postOK          map[string]int64
+	postErr         map[string]int64
+	clockOffsetS    int64
 }
+
+func newHubMetrics() *hubMetrics {
+	return &hubMetrics{
+		measurements: make(map[string]device.Measurements),
+		postOK:       make(map[string]int64),
+		postErr:      make(map[string]int64),
+	}
+}
+
+func (m *hubMetrics) recordMeasurement(name string, meas device.Measurements) {
+	m.mu.Lock()
+	m.measurements[name] = meas
+	m.mu.Unlock()
+}
+
+func (m *hubMetrics) recordDiscovery(ok bool, clockOffset int64) {
+	m.mu.Lock()
+	m.discoveryRuns++
+	if !ok {
+		m.discoveryErrors++
+	} else {
+		m.clockOffsetS = clockOffset
+	}
+	m.mu.Unlock()
+}
+
+func (m *hubMetrics) recordPost(name string, err error) {
+	m.mu.Lock()
+	if err != nil {
+		m.postErr[name]++
+	} else {
+		m.postOK[name]++
+	}
+	m.mu.Unlock()
+}
+
+// startMetricsServer runs a minimal Prometheus-compatible HTTP server on addr.
+// Exposes /metrics in Prometheus text exposition format and /healthz for
+// liveness checks.
+func startMetricsServer(addr string, m *hubMetrics) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "ok")
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+
+		var sb strings.Builder
+
+		// Discovery counters.
+		sb.WriteString("# HELP csip_hub_discovery_runs_total Total discovery walk attempts\n")
+		sb.WriteString("# TYPE csip_hub_discovery_runs_total counter\n")
+		fmt.Fprintf(&sb, "csip_hub_discovery_runs_total %d\n", m.discoveryRuns)
+
+		sb.WriteString("# HELP csip_hub_discovery_errors_total Discovery walks that failed\n")
+		sb.WriteString("# TYPE csip_hub_discovery_errors_total counter\n")
+		fmt.Fprintf(&sb, "csip_hub_discovery_errors_total %d\n", m.discoveryErrors)
+
+		sb.WriteString("# HELP csip_hub_clock_offset_seconds CSIP server time minus local time\n")
+		sb.WriteString("# TYPE csip_hub_clock_offset_seconds gauge\n")
+		fmt.Fprintf(&sb, "csip_hub_clock_offset_seconds %d\n", m.clockOffsetS)
+
+		// Telemetry POST counters.
+		sb.WriteString("# HELP csip_hub_telemetry_posts_total Successful telemetry POSTs per device\n")
+		sb.WriteString("# TYPE csip_hub_telemetry_posts_total counter\n")
+		for dev, n := range m.postOK {
+			fmt.Fprintf(&sb, `csip_hub_telemetry_posts_total{device=%q} %d`+"\n", dev, n)
+		}
+
+		sb.WriteString("# HELP csip_hub_telemetry_post_errors_total Failed telemetry POSTs per device\n")
+		sb.WriteString("# TYPE csip_hub_telemetry_post_errors_total counter\n")
+		for dev, n := range m.postErr {
+			fmt.Fprintf(&sb, `csip_hub_telemetry_post_errors_total{device=%q} %d`+"\n", dev, n)
+		}
+
+		// Measurement gauges.
+		sb.WriteString("# HELP csip_hub_device_power_W Real AC power per device (W; + export, - import)\n")
+		sb.WriteString("# TYPE csip_hub_device_power_W gauge\n")
+		for dev, meas := range m.measurements {
+			if !math.IsNaN(meas.W) {
+				fmt.Fprintf(&sb, `csip_hub_device_power_W{device=%q} %.3f`+"\n", dev, meas.W)
+			}
+		}
+
+		sb.WriteString("# HELP csip_hub_device_voltage_V Phase voltage per device (V)\n")
+		sb.WriteString("# TYPE csip_hub_device_voltage_V gauge\n")
+		for dev, meas := range m.measurements {
+			if !math.IsNaN(meas.V) {
+				fmt.Fprintf(&sb, `csip_hub_device_voltage_V{device=%q} %.3f`+"\n", dev, meas.V)
+			}
+		}
+
+		sb.WriteString("# HELP csip_hub_device_frequency_Hz AC frequency per device (Hz)\n")
+		sb.WriteString("# TYPE csip_hub_device_frequency_Hz gauge\n")
+		for dev, meas := range m.measurements {
+			if !math.IsNaN(meas.Hz) {
+				fmt.Fprintf(&sb, `csip_hub_device_frequency_Hz{device=%q} %.3f`+"\n", dev, meas.Hz)
+			}
+		}
+
+		fmt.Fprint(w, sb.String())
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		log.Printf("hub: metrics server on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("hub: metrics server: %v", err)
+		}
+	}()
+}
+
+// deviceMUP holds the single server-assigned MUP path for one device
+// and tracks consecutive POST failures for re-registration.
+type deviceMUP struct {
+	name     string
+	path     string
+	failures int // consecutive POST failures; reset to 0 on success
+}
+
+// mupReregisterThreshold is the number of consecutive POST failures that
+// triggers MUP re-registration. Three failures covers transient network
+// hiccups while catching a server restart quickly enough for the demo.
+const mupReregisterThreshold = 3
 
 func telemetryLoop(
 	ctx context.Context,
@@ -344,6 +499,7 @@ func telemetryLoop(
 	lfdi string,
 	reg *registry.Registry,
 	clockOffset *atomic.Int64,
+	met *hubMetrics,
 ) {
 	// Register one MUP per device.
 	var allMUPs []deviceMUP
@@ -377,18 +533,38 @@ func telemetryLoop(
 			}
 			if upd.Err == nil {
 				latest[upd.Name] = upd.Measurements
+				met.recordMeasurement(upd.Name, upd.Measurements)
 			} else {
 				log.Printf("hub: device %s poll error: %v", upd.Name, upd.Err)
 			}
 
 		case <-postTicker.C:
-			for _, dm := range allMUPs {
+			for i := range allMUPs {
+				dm := &allMUPs[i]
 				m, ok := latest[dm.name]
 				if !ok {
 					continue // no reading yet for this device
 				}
-				postDeviceMeasurements(fetcher, dm.name, dm.path, m,
+				postErr := postDeviceMeasurements(fetcher, dm.name, dm.path, m,
 					clockOffset.Load(), cfg.MUPPostRateS)
+				met.recordPost(dm.name, postErr)
+				if postErr != nil {
+					dm.failures++
+					if dm.failures >= mupReregisterThreshold {
+						log.Printf("hub: %d consecutive POST failures for %s; re-registering MUP",
+							dm.failures, dm.name)
+						newPath, rerr := registerDeviceMUP(fetcher, lfdi, dm.name, cfg.MUPPostRateS)
+						if rerr != nil {
+							log.Printf("hub: MUP re-registration for %s failed: %v", dm.name, rerr)
+						} else {
+							log.Printf("hub: MUP re-registered: %s → %s", dm.name, newPath)
+							dm.path = newPath
+							dm.failures = 0
+						}
+					}
+				} else {
+					dm.failures = 0
+				}
 			}
 		}
 	}
@@ -426,7 +602,7 @@ func registerDeviceMUP(fetcher *tlsclient.WolfSSLFetcher, lfdi, deviceName strin
 // postDeviceMeasurements encodes W, V, Hz as a single MirrorMeterReading POST
 // for one device. All three readings go in one ReadingSet, distinguished by
 // LocalID (1=W, 2=cV×100, 3=cHz×100). One POST = one TLS handshake.
-// NaN values are omitted; if all values are NaN the POST is skipped.
+// NaN values are omitted; returns nil if all values are NaN (POST skipped).
 func postDeviceMeasurements(
 	fetcher *tlsclient.WolfSSLFetcher,
 	deviceName string,
@@ -434,7 +610,7 @@ func postDeviceMeasurements(
 	m device.Measurements,
 	clockOffset int64,
 	intervalS int,
-) {
+) error {
 	now := time.Now().Unix() + clockOffset
 	dur := uint32(intervalS)
 	start := now - int64(dur)
@@ -462,7 +638,7 @@ func postDeviceMeasurements(
 		})
 	}
 	if len(readings) == 0 {
-		return
+		return nil
 	}
 
 	mmr := model.MirrorMeterReading{
@@ -475,14 +651,15 @@ func postDeviceMeasurements(
 	body, err := xml.Marshal(&mmr)
 	if err != nil {
 		log.Printf("hub: marshal telemetry %s: %v", deviceName, err)
-		return
+		return err
 	}
 	if _, _, err = fetcher.Post(mupPath, body, "application/sep+xml"); err != nil {
 		log.Printf("hub: POST telemetry %s: %v", deviceName, err)
-		return
+		return err
 	}
 	log.Printf("hub: telemetry posted: %s W=%.0f V=%.1f Hz=%.2f",
 		deviceName, m.W, m.V, m.Hz)
+	return nil
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

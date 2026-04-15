@@ -81,7 +81,11 @@ func (c *Client) Dial() error {
 		return errors.New("client already connected; call Close first")
 	}
 
-	conn, err := net.Dial("tcp", c.cfg.ServerAddr)
+	timeout := c.cfg.DialTimeout
+	if timeout <= 0 {
+		timeout = DefaultDialTimeout
+	}
+	conn, err := net.DialTimeout("tcp", c.cfg.ServerAddr, timeout)
 	if err != nil {
 		return fmt.Errorf("tcp dial %s: %w", c.cfg.ServerAddr, err)
 	}

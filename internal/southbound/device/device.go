@@ -28,7 +28,18 @@ type Device interface {
 }
 
 // Measurements holds a snapshot of electrical measurements from a DER device.
-// All power values are signed: positive = export to grid, negative = import.
+//
+// Sign convention — power fields use the generator/load sign from the device's
+// own perspective (IEC 62053 / SunSpec convention):
+//
+//	W > 0  device is exporting power (solar generating, battery discharging)
+//	W < 0  device is importing power (battery charging, load consuming)
+//
+// The grid meter's W follows the same convention from the meter's perspective:
+//
+//	W > 0  power flowing from grid into site (import)
+//	W < 0  power flowing from site into grid (export)
+//
 // Fields set to math.NaN() are not available from this device.
 type Measurements struct {
 	// AC-side

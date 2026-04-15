@@ -136,6 +136,12 @@ func (ra *RegistryAdapter) UpdateDeviceStatus(name string, s device.DeviceStatus
 }
 
 // ReadSystemState implements orchestrator.SystemReader.
+//
+// Power sign mapping from device.Measurements.W to orchestrator types:
+//
+//	Solar    → SolarState.PowerW      = max(0, W)  (generation is always ≥ 0)
+//	Battery  → BatteryState.PowerW   = W           (+ discharge, − charge)
+//	Meter    → GridState.NetW        += W           (+ import from grid, − export)
 func (ra *RegistryAdapter) ReadSystemState() (orchestrator.SystemState, error) {
 	ra.mu.RLock()
 	defer ra.mu.RUnlock()
