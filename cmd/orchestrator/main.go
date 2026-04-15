@@ -167,12 +167,9 @@ func main() {
 		Debug:    true,
 	})
 
-	// Wire battery actuators (one per battery, via its own registry).
+	// Wire battery actuators. Each actuator targets its specific device by name
+	// via Registry.ApplyControlTo, so all actuators safely share the same registry.
 	for _, bc := range cfg.Batteries {
-		batReg := registry.New(cfg.pollInterval())
-		// In production: use a per-device registry or extend ApplyControl to
-		// target a specific device.  For this example, both share the same reg.
-		_ = batReg
 		act := adapters.NewRegistryBatteryActuator(reg, bc.Name, bc.MaxW)
 		eng.RegisterBatteryActuator(bc.Name, act)
 	}

@@ -46,10 +46,10 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Reporter struct {
-	w         io.Writer // writes to both tee targets
-	passCount int
-	failCount int
-	current   string // current test ID
+	w        io.Writer // writes to both tee targets
+	runCount int       // number of test sections completed (pass + fail)
+	failCount int      // number of test sections that ended with FAIL
+	current  string   // current test ID
 }
 
 func newReporter(logPath string) (*Reporter, func()) {
@@ -95,29 +95,26 @@ func (r *Reporter) detail(format string, args ...interface{}) {
 
 func (r *Reporter) fail(format string, args ...interface{}) {
 	r.printf("  ✗ FAIL  "+format+"\n", args...)
-	r.failCount++
+	// failCount is incremented once per test section in result(), not here,
+	// so that multiple r.fail() calls within one section count as one failure.
 }
 
 func (r *Reporter) result(passed bool) {
 	if passed {
 		r.printf("\n  [%s] RESULT: PASS\n", r.current)
-		r.passCount++
 	} else {
 		r.printf("\n  [%s] RESULT: FAIL\n", r.current)
-		r.passCount++ // count as attempted; failCount already incremented
+		r.failCount++
 	}
+	r.runCount++
 }
 
 func (r *Reporter) summary() {
 	r.printf("\n%s\n", strings.Repeat("═", 72))
 	r.printf("CONFORMANCE TEST SUMMARY\n")
 	r.printf("%s\n", strings.Repeat("═", 72))
-	total := r.passCount
-	passed := total - r.failCount
-	if passed < 0 {
-		passed = 0
-	}
-	r.printf("  Tests run:  %d\n", total)
+	passed := r.runCount - r.failCount
+	r.printf("  Tests run:  %d\n", r.runCount)
 	r.printf("  PASS:       %d\n", passed)
 	r.printf("  FAIL:       %d\n", r.failCount)
 	if r.failCount == 0 {

@@ -323,15 +323,18 @@ func (rt *responseTracker) post(mrid string, status uint8) {
 
 // ── MUP telemetry loop ─────────────────────────────────────────────────────
 //
-// Registers three MirrorUsagePoints (W, V, Hz) per device at startup, then
-// POSTs per-device readings at mup_post_rate_s intervals. Each device's MUP
-// MRID is derived from the LFDI + device name for stable identity across
-// restarts (the server de-dupes by MRID).
+// Registers ONE MirrorUsagePoint per device at startup, then POSTs a single
+// MirrorMeterReading (with one ReadingSet containing W, V, Hz as separate
+// Reading elements distinguished by LocalID) at mup_post_rate_s intervals.
+// One POST per device per interval = one TLS handshake instead of three.
+//
+// LocalID conventions: 1 = real power (W), 2 = phase voltage (cV, ×100),
+// 3 = frequency (cHz, ×100).
 
-// deviceMUPs holds the MUP paths assigned by the server for one device.
-type deviceMUPs struct {
-	name  string
-	paths map[string]string // "W" / "V" / "Hz" → /mup/{n}
+// deviceMUP holds the single server-assigned MUP path for one device.
+type deviceMUP struct {
+	name string
+	path string
 }
 
 func telemetryLoop(
@@ -342,15 +345,15 @@ func telemetryLoop(
 	reg *registry.Registry,
 	clockOffset *atomic.Int64,
 ) {
-	// Register one set of MUPs per device.
-	var allMUPs []deviceMUPs
+	// Register one MUP per device.
+	var allMUPs []deviceMUP
 	for _, dc := range cfg.Devices {
-		paths, err := registerDeviceMUPs(fetcher, lfdi, dc.Name, cfg.MUPPostRateS)
+		path, err := registerDeviceMUP(fetcher, lfdi, dc.Name, cfg.MUPPostRateS)
 		if err != nil {
 			log.Printf("hub: MUP registration for %s failed: %v — skipping", dc.Name, err)
 			continue
 		}
-		allMUPs = append(allMUPs, deviceMUPs{name: dc.Name, paths: paths})
+		allMUPs = append(allMUPs, deviceMUP{name: dc.Name, path: path})
 	}
 	if len(allMUPs) == 0 {
 		log.Printf("hub: no MUPs registered — telemetry disabled")
@@ -384,117 +387,102 @@ func telemetryLoop(
 				if !ok {
 					continue // no reading yet for this device
 				}
-				postDeviceMeasurements(fetcher, dm.name, dm.paths, m,
+				postDeviceMeasurements(fetcher, dm.name, dm.path, m,
 					clockOffset.Load(), cfg.MUPPostRateS)
 			}
 		}
 	}
 }
 
-// registerDeviceMUPs POSTs three MirrorUsagePoints for one device and returns
-// the server-assigned paths. The MRIDs are stable across restarts so the
-// server can de-duplicate them by MRID.
-func registerDeviceMUPs(fetcher *tlsclient.WolfSSLFetcher, lfdi, deviceName string, postRateS int) (map[string]string, error) {
-	// Stable MRID prefix: first 8 chars of LFDI + device name.
+// registerDeviceMUP POSTs one MirrorUsagePoint for a device and returns the
+// server-assigned path. The MRID is stable across restarts so the server can
+// de-duplicate by MRID.
+func registerDeviceMUP(fetcher *tlsclient.WolfSSLFetcher, lfdi, deviceName string, postRateS int) (string, error) {
 	prefix := lfdi
 	if len(prefix) > 8 {
 		prefix = prefix[:8]
 	}
-	prefix += "-" + deviceName
-
-	type mupDef struct {
-		key  string
-		mrid string
-		desc string
+	mup := model.MirrorUsagePoint{
+		MRID:                prefix + "-" + deviceName,
+		Description:         deviceName + " Measurements (W/V/Hz)",
+		RoleFlags:           0x0002,
+		ServiceCategoryKind: 0,
+		Status:              1,
+		DeviceLFDI:          lfdi,
+		PostRate:            uint32(postRateS),
 	}
-	defs := []mupDef{
-		{"W",  prefix + "-W",  deviceName + " Real Power (W)"},
-		{"V",  prefix + "-V",  deviceName + " Phase Voltage (V)"},
-		{"Hz", prefix + "-Hz", deviceName + " Frequency (Hz)"},
+	body, err := xml.Marshal(&mup)
+	if err != nil {
+		return "", fmt.Errorf("marshal MUP: %w", err)
 	}
-
-	paths := make(map[string]string, len(defs))
-	for _, d := range defs {
-		mup := model.MirrorUsagePoint{
-			MRID:                d.mrid,
-			Description:         d.desc,
-			RoleFlags:           0x0002,
-			ServiceCategoryKind: 0,
-			Status:              1,
-			DeviceLFDI:          lfdi,
-			PostRate:            uint32(postRateS),
-		}
-		body, err := xml.Marshal(&mup)
-		if err != nil {
-			return nil, fmt.Errorf("marshal MUP %s: %w", d.key, err)
-		}
-		_, loc, err := fetcher.Post("/mup", body, "application/sep+xml")
-		if err != nil {
-			return nil, fmt.Errorf("register MUP %s: %w", d.key, err)
-		}
-		paths[d.key] = loc
-		log.Printf("hub: MUP registered: %s/%s → %s", deviceName, d.key, loc)
+	_, loc, err := fetcher.Post("/mup", body, "application/sep+xml")
+	if err != nil {
+		return "", fmt.Errorf("register MUP: %w", err)
 	}
-	return paths, nil
+	log.Printf("hub: MUP registered: %s → %s", deviceName, loc)
+	return loc, nil
 }
 
-// postDeviceMeasurements encodes m as three MirrorMeterReading POSTs (W, V, Hz)
-// for one device. NaN values are skipped.
+// postDeviceMeasurements encodes W, V, Hz as a single MirrorMeterReading POST
+// for one device. All three readings go in one ReadingSet, distinguished by
+// LocalID (1=W, 2=cV×100, 3=cHz×100). One POST = one TLS handshake.
+// NaN values are omitted; if all values are NaN the POST is skipped.
 func postDeviceMeasurements(
 	fetcher *tlsclient.WolfSSLFetcher,
 	deviceName string,
-	paths map[string]string,
+	mupPath string,
 	m device.Measurements,
 	clockOffset int64,
 	intervalS int,
 ) {
 	now := time.Now().Unix() + clockOffset
 	dur := uint32(intervalS)
+	start := now - int64(dur)
 
-	type reading struct {
-		key string
-		val float64
+	var readings []model.Reading
+	if !math.IsNaN(m.W) {
+		readings = append(readings, model.Reading{
+			LocalID: 1, // real power, W
+			Value:   int64(math.Round(m.W)),
+			TimePeriod: &model.DateTimeInterval{Start: start, Duration: dur},
+		})
 	}
-	readings := []reading{
-		{"W", m.W},
-		{"V", m.V},
-		{"Hz", m.Hz},
+	if !math.IsNaN(m.V) {
+		readings = append(readings, model.Reading{
+			LocalID: 2, // phase voltage, centi-volts (V × 100)
+			Value:   int64(math.Round(m.V * 100)),
+			TimePeriod: &model.DateTimeInterval{Start: start, Duration: dur},
+		})
+	}
+	if !math.IsNaN(m.Hz) {
+		readings = append(readings, model.Reading{
+			LocalID: 3, // frequency, centi-Hz (Hz × 100)
+			Value:   int64(math.Round(m.Hz * 100)),
+			TimePeriod: &model.DateTimeInterval{Start: start, Duration: dur},
+		})
+	}
+	if len(readings) == 0 {
+		return
 	}
 
-	posted := 0
-	for _, r := range readings {
-		path, ok := paths[r.key]
-		if !ok || math.IsNaN(r.val) {
-			continue
-		}
-		mmr := model.MirrorMeterReading{
-			MirrorReadingSet: []model.MirrorReadingSet{{
-				StartTime: now - int64(dur),
-				Duration:  dur,
-				Reading: []model.Reading{{
-					Value: int64(math.Round(r.val)),
-					TimePeriod: &model.DateTimeInterval{
-						Start:    now - int64(dur),
-						Duration: dur,
-					},
-				}},
-			}},
-		}
-		body, err := xml.Marshal(&mmr)
-		if err != nil {
-			log.Printf("hub: marshal %s/%s: %v", deviceName, r.key, err)
-			continue
-		}
-		if _, _, err = fetcher.Post(path, body, "application/sep+xml"); err != nil {
-			log.Printf("hub: POST telemetry %s/%s: %v", deviceName, r.key, err)
-			continue
-		}
-		posted++
+	mmr := model.MirrorMeterReading{
+		MirrorReadingSet: []model.MirrorReadingSet{{
+			StartTime: start,
+			Duration:  dur,
+			Reading:   readings,
+		}},
 	}
-	if posted > 0 {
-		log.Printf("hub: telemetry posted: %s W=%.0f V=%.1f Hz=%.2f",
-			deviceName, m.W, m.V, m.Hz)
+	body, err := xml.Marshal(&mmr)
+	if err != nil {
+		log.Printf("hub: marshal telemetry %s: %v", deviceName, err)
+		return
 	}
+	if _, _, err = fetcher.Post(mupPath, body, "application/sep+xml"); err != nil {
+		log.Printf("hub: POST telemetry %s: %v", deviceName, err)
+		return
+	}
+	log.Printf("hub: telemetry posted: %s W=%.0f V=%.1f Hz=%.2f",
+		deviceName, m.W, m.V, m.Hz)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

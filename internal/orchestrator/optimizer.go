@@ -107,14 +107,21 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	batteryW := state.TotalBatteryW() // + discharge, - charge
 	evseW := state.TotalEVSEW()
 
-	var surplusW float64 // positive = excess available for battery/grid
+	// Sign conventions (throughout this file):
+	//   solarW   >= 0            (generation)
+	//   batteryW > 0 discharge, < 0 charge
+	//   evseW    >= 0            (consumption)
+	//   Grid.NetW > 0 import from grid, < 0 export to grid
+	//
+	// KCL at the site panel:
+	//   solarW + batteryW + Grid.NetW = homeLoadW + evseW
+	//   homeLoadW = solarW + max(0,batteryW) + Grid.NetW - evseW
+	//     (max(0,batteryW) because charging battery is counted as load, not source)
+	//   surplusW = solarW - homeLoadW   (watts available above home loads)
+	var surplusW float64 // positive = excess solar available for battery/grid
 	if !math.IsNaN(state.Grid.NetW) {
-		// surplus = what solar is producing minus what local loads (excl. EVSE) need
-		// grid.NetW positive = importing, negative = exporting
-		// surplus = solar - (local_load) where local_load = grid.NetW + solar - batteryW - evseW
-		// simplified: surplusW = -grid.NetW + batteryW (positive means exporting)
-		// but for battery decisions, we want: how much power is available above current load?
-		surplusW = solarW - (evseW - batteryW + state.Grid.NetW)
+		homeLoadW := solarW + math.Max(0, batteryW) + state.Grid.NetW - evseW
+		surplusW = solarW - homeLoadW
 	} else {
 		// No grid meter: use solar as the budget baseline.
 		surplusW = solarW
@@ -123,7 +130,6 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	if o.Debug {
 		homeLoadW := math.NaN()
 		if !math.IsNaN(state.Grid.NetW) {
-			// homeLoad = what local appliances (excl. EVSE) are consuming
 			homeLoadW = solarW + math.Max(0, batteryW) + state.Grid.NetW - evseW
 		}
 		fmt.Printf("[optimizer] solarW=%.0f batteryW=%.0f evseW=%.0f homeLoadW=%.0f surplusW=%.0f gridNetW=%.0f\n",

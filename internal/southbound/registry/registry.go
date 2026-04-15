@@ -74,6 +74,25 @@ func (reg *Registry) Remove(name string) error {
 	return nil
 }
 
+// ApplyControlTo calls ApplyControl on the named device only.
+// Returns an error if no device with that name is registered.
+func (reg *Registry) ApplyControlTo(name string, ctrl model.DERControlBase) error {
+	reg.mu.RLock()
+	var target *Entry
+	for _, e := range reg.entries {
+		if e.Name == name {
+			target = e
+			break
+		}
+	}
+	reg.mu.RUnlock()
+
+	if target == nil {
+		return fmt.Errorf("registry: device %q not found", name)
+	}
+	return target.Device.ApplyControl(ctrl)
+}
+
 // ApplyControl calls ApplyControl on every registered device, collecting errors.
 // Partial failures are returned as a combined error string.
 func (reg *Registry) ApplyControl(ctrl model.DERControlBase) error {

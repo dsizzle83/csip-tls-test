@@ -200,9 +200,6 @@ func (c *Client) Post(path string, body []byte, contentType string) ([]byte, err
 		if err != nil || n == 0 {
 			break
 		}
-		if n < len(buf) {
-			break
-		}
 	}
 	return resp, nil
 }
@@ -224,9 +221,9 @@ func (c *Client) Get(path string) ([]byte, error) {
 		return nil, fmt.Errorf("write request: %w", err)
 	}
 
-	// Read until the server closes the connection or our buffer is
-	// full. With Connection: close this is fine; with persistent
-	// connections we'll need Content-Length parsing instead.
+	// Read until the server closes the connection (Connection: close).
+	// Do NOT break on short reads — TLS records can fragment arbitrarily;
+	// a response larger than one record would be silently truncated.
 	var resp []byte
 	buf := make([]byte, 4096)
 	for {
@@ -235,11 +232,6 @@ func (c *Client) Get(path string) ([]byte, error) {
 			resp = append(resp, buf[:n]...)
 		}
 		if err != nil || n == 0 {
-			break
-		}
-		if n < len(buf) {
-			// Partial read means server has nothing more for now.
-			// With Connection: close this is end-of-stream.
 			break
 		}
 	}

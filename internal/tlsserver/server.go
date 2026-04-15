@@ -1,9 +1,12 @@
 package tlsserver
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -154,16 +157,60 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 func (s *Server) handleRequest(ssl unsafe.Pointer, peerLFDI string) {
-	buf := make([]byte, 4096)
-	n, err := wolfssl.Read(ssl, buf)
-	if err != nil || n == 0 {
+	raw := readHTTPMessage(ssl)
+	if len(raw) == 0 {
 		return
 	}
 	var resp []byte
 	if s.Handler != nil {
-		resp = dispatchHTTP(s.Handler, buf[:n], peerLFDI)
+		resp = dispatchHTTP(s.Handler, raw, peerLFDI)
 	} else {
-		resp = route(buf[:n])
+		resp = route(raw)
 	}
 	_, _ = wolfssl.Write(ssl, resp)
+}
+
+// readHTTPMessage reads a complete HTTP request from an open wolfSSL session.
+// It reads until the full header block (\r\n\r\n) is present, parses
+// Content-Length, then reads until the body is fully buffered.
+// This handles TLS record fragmentation and POST bodies larger than 4 KB.
+func readHTTPMessage(ssl unsafe.Pointer) []byte {
+	const maxSize = 1 << 20 // 1 MB safety cap
+	buf := make([]byte, 4096)
+	var data []byte
+	headerEnd := -1
+
+	for len(data) < maxSize {
+		n, err := wolfssl.Read(ssl, buf)
+		if n > 0 {
+			data = append(data, buf[:n]...)
+			if headerEnd < 0 {
+				if idx := bytes.Index(data, []byte("\r\n\r\n")); idx >= 0 {
+					headerEnd = idx + 4
+				}
+			}
+		}
+		if err != nil || n == 0 {
+			return data
+		}
+		if headerEnd >= 0 {
+			need := headerEnd + parseContentLength(data[:headerEnd])
+			if len(data) >= need {
+				return data[:need]
+			}
+		}
+	}
+	return data
+}
+
+// parseContentLength extracts the Content-Length value from raw HTTP headers.
+// Returns 0 if the header is absent or unparseable.
+func parseContentLength(headers []byte) int {
+	for _, line := range strings.Split(string(headers), "\r\n") {
+		if len(line) > 15 && strings.EqualFold(line[:15], "content-length:") {
+			n, _ := strconv.Atoi(strings.TrimSpace(line[15:]))
+			return n
+		}
+	}
+	return 0
 }

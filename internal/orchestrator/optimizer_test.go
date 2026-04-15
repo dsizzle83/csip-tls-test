@@ -438,6 +438,41 @@ func logDecisions(t *testing.T, plan orchestrator.Plan) {
 	}
 }
 
+// ── Surplus calculation with non-zero home load ───────────────────────────────
+//
+// This test catches the historical sign-convention bug where surplusW was
+// computed as solarW - (evseW - batteryW + Grid.NetW), which gave double the
+// correct value when the grid was exporting.  The correct formula is:
+//   homeLoadW = solarW + max(0,batteryW) + Grid.NetW - evseW
+//   surplusW  = solarW - homeLoadW
+
+func TestOptimizer_SurplusRespectHomeLoad(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+
+	// 5 kW solar, 2 kW home load (implied: grid exports 3 kW → NetW = -3000).
+	// Battery has 5 kW headroom.  Surplus = 3 kW, so battery should charge ≤ 3 kW.
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 5000, 10000)}
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 50, 5000)}
+	s.Grid.NetW = -3000 // 3 kW export → 2 kW goes to home loads
+
+	plan := opt.Optimize(s)
+
+	if len(plan.BatteryCommands) == 0 {
+		t.Fatal("expected battery charge command")
+	}
+	cmd := plan.BatteryCommands[0]
+	if cmd.SetpointW >= 0 {
+		t.Errorf("battery setpoint = %.0f; expected negative (charging)", cmd.SetpointW)
+	}
+	// Old (buggy) formula gave surplusW = 8000, charging up to 5 kW.
+	// Correct formula gives surplusW = 3000, so setpoint must be ≥ -3100 (allow rounding).
+	if cmd.SetpointW < -3100 {
+		t.Errorf("battery setpoint = %.0f exceeds available 3 kW surplus — sign-convention bug?", cmd.SetpointW)
+	}
+	logDecisions(t, plan)
+}
+
 // ── BatteryState helpers ──────────────────────────────────────────────────────
 
 func TestBatteryState_AvailableChargeW(t *testing.T) {

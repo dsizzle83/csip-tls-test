@@ -243,9 +243,7 @@ func (a *RegistryBatteryActuator) ApplyBatteryCommand(cmd orchestrator.BatteryCo
 		}
 	}
 
-	// ApplyControl fans out to all devices; for per-device targeting we rely on
-	// the caller having separate Registry instances or a future per-device API.
-	return a.reg.ApplyControl(ctrl)
+	return a.reg.ApplyControlTo(a.devName, ctrl)
 }
 
 // ── SolarActuator ─────────────────────────────────────────────────────────────
