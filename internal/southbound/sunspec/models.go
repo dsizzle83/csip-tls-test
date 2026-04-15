@@ -171,6 +171,92 @@ const (
 	M802_State          = 25  // operational state enum (uint16)
 )
 
+// ── Model 201/202/203 (AC Meter) register offsets ────────────────────────────
+// SunSpec meters sit at the main service entrance and measure net grid power.
+// Sign convention (all three models): W positive = site importing from grid,
+// W negative = site exporting to grid.  This is opposite to the inverter sign
+// convention (positive = export).
+
+// Model IDs for the three meter variants.
+const (
+	ModelMeterSinglePh = uint16(201) // single-phase AC meter
+	ModelMeterSplitPh  = uint16(202) // split-phase (US 240 V) AC meter
+	ModelMeterThreePh  = uint16(203) // three-phase wye AC meter
+)
+
+// Model 201 (Single-Phase AC Meter) — 105 data registers.
+// Source: SunSpec Alliance smdx_00201.xml
+const (
+	M201Len    = 105
+	M201_A     = 0  // Total AC current (int16, A_SF)
+	M201_AphA  = 1  // Phase A current (int16, A_SF)
+	M201_A_SF  = 2  // Current scale factor (int16)
+	M201_PhV   = 3  // Average L-N voltage (int16, V_SF)
+	M201_PhVphA = 4 // Phase A L-N voltage (int16, V_SF)
+	M201_V_SF  = 5  // Voltage scale factor (int16)
+	M201_Hz    = 6  // AC frequency (int16, Hz_SF)
+	M201_Hz_SF = 7  // Frequency scale factor (int16)
+	M201_W     = 8  // Total real power (int16, W_SF); +import −export
+	M201_W_SF  = 9  // Power scale factor (int16)
+	M201_VA    = 10 // Apparent power (int16, VA_SF)
+	M201_VA_SF = 11
+	M201_VAR   = 12 // Reactive power (int16, VAR_SF)
+	M201_VAR_SF = 13
+	M201_PF    = 14 // Avg power factor ×100 (int16, PF_SF)
+	M201_PF_SF = 15
+)
+
+// Model 202 (Split-Phase AC Meter) — 106 data registers.
+const (
+	M202Len     = 106
+	M202_A      = 0  // Total AC current (int16, A_SF)
+	M202_AphA   = 1
+	M202_AphB   = 2
+	M202_A_SF   = 3
+	M202_PhVphA = 4  // Phase A L-N voltage (int16, V_SF)
+	M202_PhVphB = 5
+	M202_V_SF   = 6
+	M202_PPVphAB = 7 // Phase A-B L-L voltage (int16, PPV_SF)
+	M202_PPV_SF = 8
+	M202_Hz     = 9
+	M202_Hz_SF  = 10
+	M202_W      = 11 // Total real power (int16, W_SF); +import −export
+	M202_W_SF   = 12
+)
+
+// Model 203 (Three-Phase Wye AC Meter) — 105 data registers.
+const (
+	M203Len      = 105
+	M203_A       = 0  // Total AC current (int16, A_SF)
+	M203_AphA    = 1
+	M203_AphB    = 2
+	M203_AphC    = 3
+	M203_A_SF    = 4
+	M203_PhV     = 5  // Average L-N voltage (int16, V_SF)
+	M203_PhVphA  = 6
+	M203_PhVphB  = 7
+	M203_PhVphC  = 8
+	M203_V_SF    = 9
+	M203_PPV     = 10 // Average L-L voltage (int16, PPV_SF)
+	M203_PPVphAB = 11
+	M203_PPVphBC = 12
+	M203_PPVphCA = 13
+	M203_PPV_SF  = 14
+	M203_Hz      = 15
+	M203_Hz_SF   = 16
+	M203_W       = 17 // Total real power (int16, W_SF); +import −export
+	M203_W_SF    = 18
+	M203_WphA    = 19
+	M203_WphB    = 20
+	M203_WphC    = 21
+	M203_VA      = 22 // Apparent power (int16, VA_SF)
+	M203_VA_SF   = 23
+	M203_VAR     = 24 // Reactive power (int16, VAR_SF)
+	M203_VAR_SF  = 25
+	M203_PF      = 26 // Avg power factor ×100 (int16, PF_SF)
+	M203_PF_SF   = 27
+)
+
 // ── Model 123 (Immediate Controls) register offsets ───────────────────────────
 // Writes to these registers take immediate effect on the inverter.
 const (
