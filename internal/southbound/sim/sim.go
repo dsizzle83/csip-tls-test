@@ -145,11 +145,11 @@ func NewServer(listenURL string, wmaxW float64) (*Server, error) {
 	return startServer(listenURL, regs)
 }
 
-// startServer is the shared server-launch helper used by all constructors.
-// Callers populate regs before calling; startServer starts the Modbus
-// listener and launches a goroutine that just waits for stop (so that
-// Stop() always works cleanly via the stop/done channels).
-func startServer(listenURL string, regs *RegisterMap) (*Server, error) {
+// startServerRaw starts the Modbus TCP listener and returns a Server with
+// stop/done channels ready but no goroutine started.  Callers must either
+// start a goroutine that closes done (for static servers) or use
+// newAnimatedServer (which starts an animation goroutine).
+func startServerRaw(listenURL string, regs *RegisterMap) (*Server, error) {
 	srv, err := modbuslib.NewServer(&modbuslib.ServerConfiguration{
 		URL:        listenURL,
 		MaxClients: 8,
@@ -163,13 +163,22 @@ func startServer(listenURL string, regs *RegisterMap) (*Server, error) {
 	}
 	time.Sleep(20 * time.Millisecond)
 
-	s := &Server{
+	return &Server{
 		Regs: regs,
 		srv:  srv,
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
+	}, nil
+}
+
+// startServer is the shared server-launch helper for static (non-animated)
+// servers.  It starts a single goroutine that closes done when stop fires.
+func startServer(listenURL string, regs *RegisterMap) (*Server, error) {
+	s, err := startServerRaw(listenURL, regs)
+	if err != nil {
+		return nil, err
 	}
-	// Default: no animation — just wait for stop.
+	// Static server: no animation — just wait for stop.
 	go func() {
 		defer close(s.done)
 		<-s.stop

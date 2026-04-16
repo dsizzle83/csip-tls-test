@@ -50,6 +50,10 @@ build-evsim:
 	@mkdir -p bin
 	go build -o bin/evsim ./cmd/evsim
 
+build-httpsim:
+	@mkdir -p bin
+	go build -o bin/httpsim ./cmd/httpsim
+
 # Hub uses wolfSSL (cgo) — must be built natively on Pi.
 # Use sync-hub-pi to sync and build on the Pi in one step.
 build-hub:
@@ -234,6 +238,11 @@ gen-test-certs:
 # Override CN: make gen-client-cert CN=csip-pi-002
 gen-client-cert:
 	bash scripts/gen-client-cert.sh $(CN)
+
+# Regenerate the production server cert.  Optionally add LAN IPs to the SAN:
+#   make gen-server-cert IPS="192.168.10.1 10.0.0.5"
+gen-server-cert:
+	bash scripts/gen-server-cert.sh $(IPS)
 
 # Auto-generate certs on first test run via dependency tracking.
 $(CA_CERT):

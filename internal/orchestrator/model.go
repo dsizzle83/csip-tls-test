@@ -121,7 +121,8 @@ type EVSEState struct {
 	// SessionActive is true when a vehicle is plugged in and charging.
 	SessionActive bool
 
-	// CurrentA is the current charging current in amperes.
+	// CurrentA is the measured charging current in amperes (from MeterValues).
+	// This is actual current, not the commanded limit.
 	CurrentA float64
 
 	// MaxCurrentA is the EVSE hardware limit in amperes.
@@ -135,6 +136,14 @@ type EVSEState struct {
 
 	// Status is the OCPP ConnectorStatus string ("Available", "Occupied", etc.).
 	Status string
+
+	// SOC is the EV battery state of charge in percent [0, 100].
+	// math.NaN() when no MeterValues with SoC have been received.
+	SOC float64
+
+	// EnergyWh is the cumulative energy delivered this session (Wh).
+	// Zero when no session is active or no MeterValues received.
+	EnergyWh float64
 }
 
 // GridState holds measured and constrained grid values.

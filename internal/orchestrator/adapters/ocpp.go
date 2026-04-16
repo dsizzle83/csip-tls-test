@@ -3,11 +3,13 @@ package adapters
 import (
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"time"
 
 	ocpp2 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/availability"
+	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/meter"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/remotecontrol"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/smartcharging"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
@@ -39,12 +41,18 @@ type stationState struct {
 	connectedAt time.Time
 	// connectors keyed by connector ID (1-based).
 	connectors map[int]*connectorState
-	// currentA is the charging current; 0 if unknown.
+	// currentA is the measured charging current from MeterValues (A).
+	// Updated from Current.Import; initially 0.
 	currentA float64
 	// maxCurrentA is the hardware limit.
 	maxCurrentA float64
 	// voltageV is the supply voltage; default 230 V.
 	voltageV float64
+	// soc is the EV battery state of charge (%) from MeterValues SoC measurand.
+	// math.NaN() until first MeterValues received.
+	soc float64
+	// energyWh is the cumulative session energy (Wh) from MeterValues.
+	energyWh float64
 }
 
 // OCPPStateTracker maintains a real-time view of connected OCPP stations
@@ -78,6 +86,7 @@ func NewOCPPStateTracker(csms ocpp2.CSMS) *OCPPStateTracker {
 				connectors:  make(map[int]*connectorState),
 				maxCurrentA: 32.0,
 				voltageV:    230.0,
+				soc:         math.NaN(),
 			}
 		}
 		st := t.stations[cs.ID()]
@@ -102,6 +111,7 @@ func NewOCPPStateTracker(csms ocpp2.CSMS) *OCPPStateTracker {
 	})
 
 	csms.SetAvailabilityHandler(&availabilityForwarder{tracker: t})
+	csms.SetMeterHandler(&meteringForwarder{tracker: t})
 	return t
 }
 
@@ -135,6 +145,7 @@ func (t *OCPPStateTracker) EVSEStates() []orchestrator.EVSEState {
 				MaxCurrentA: s.maxCurrentA,
 				VoltageV:    s.voltageV,
 				Status:      string(StatusAvailable),
+				SOC:         s.soc,
 			})
 			continue
 		}
@@ -154,6 +165,8 @@ func (t *OCPPStateTracker) EVSEStates() []orchestrator.EVSEState {
 				VoltageV:      s.voltageV,
 				PowerW:        powerW,
 				Status:        string(c.status),
+				SOC:           s.soc,
+				EnergyWh:      s.energyWh,
 			})
 		}
 	}
@@ -207,6 +220,14 @@ func (t *OCPPStateTracker) ApplyEVSECommand(cmd orchestrator.EVSECommand) error 
 
 	select {
 	case err := <-errCh:
+		if err == nil {
+			// Update tracked current so EVSEStates() reflects the commanded limit.
+			t.mu.Lock()
+			if s, ok := t.stations[cmd.StationID]; ok {
+				s.currentA = cmd.MaxCurrentA
+			}
+			t.mu.Unlock()
+		}
 		return err
 	case <-time.After(10 * time.Second):
 		return fmt.Errorf("ocpp-tracker: SetChargingProfile timeout for %s", cmd.StationID)
@@ -263,6 +284,7 @@ func (h *availabilityForwarder) OnStatusNotification(
 			connectors:  make(map[int]*connectorState),
 			maxCurrentA: 32.0,
 			voltageV:    230.0,
+			soc:         math.NaN(),
 		}
 	}
 	s := h.tracker.stations[csID]
@@ -276,4 +298,63 @@ func (h *availabilityForwarder) OnStatusNotification(
 	log.Printf("[ocpp-tracker] StatusNotification cs=%s connector=%d status=%s",
 		csID, req.ConnectorID, status)
 	return &availability.StatusNotificationResponse{}, nil
+}
+
+// ── Metering handler ──────────────────────────────────────────────────────────
+
+type meteringForwarder struct {
+	tracker *OCPPStateTracker
+}
+
+// OnMeterValues updates the tracker with measured values from the charging station.
+// Handles: Current.Import → currentA (actual, not commanded),
+//          SoC → soc, Energy.Active.Import.Register → energyWh.
+func (h *meteringForwarder) OnMeterValues(
+	csID string, req *meter.MeterValuesRequest,
+) (*meter.MeterValuesResponse, error) {
+	h.tracker.mu.Lock()
+	defer h.tracker.mu.Unlock()
+
+	s, ok := h.tracker.stations[csID]
+	if !ok {
+		// Station connected but not yet seen — create a stub entry.
+		s = &stationState{
+			id:          csID,
+			connectors:  make(map[int]*connectorState),
+			maxCurrentA: 32.0,
+			voltageV:    230.0,
+			soc:         math.NaN(),
+		}
+		h.tracker.stations[csID] = s
+	}
+
+	for _, mv := range req.MeterValue {
+		for _, sv := range mv.SampledValue {
+			v := sv.Value
+			switch sv.Measurand {
+			case types.MeasurandCurrentImport:
+				s.currentA = v
+			case types.MeasurandSoC:
+				s.soc = v
+			case types.MeasurandEnergyActiveImportRegister:
+				// Value may carry a multiplier (e.g. kWh × 10^3 = Wh).
+				multiplier := 0
+				if sv.UnitOfMeasure != nil && sv.UnitOfMeasure.Multiplier != nil {
+					multiplier = *sv.UnitOfMeasure.Multiplier
+				}
+				if multiplier != 0 {
+					v *= math.Pow10(multiplier)
+				}
+				s.energyWh = v
+			case types.MeasurandVoltage:
+				if v > 0 {
+					s.voltageV = v
+				}
+			}
+		}
+	}
+
+	log.Printf("[ocpp-tracker] MeterValues cs=%s evse=%d current=%.1fA soc=%.1f%% energy=%.0fWh",
+		csID, req.EvseID, s.currentA, s.soc, s.energyWh)
+	return meter.NewMeterValuesResponse(), nil
 }

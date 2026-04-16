@@ -9,10 +9,11 @@ import (
 
 // DeviceConfig describes one southbound device in the hub config file.
 type DeviceConfig struct {
-	Name   string `json:"name"`
-	URL    string `json:"url"`
-	UnitID uint8  `json:"unit_id"`
-	Role   string `json:"role"` // "inverter"; others TBD
+	Name   string  `json:"name"`
+	URL    string  `json:"url"`
+	UnitID uint8   `json:"unit_id"`
+	Role   string  `json:"role"` // "inverter" | "battery" | "meter" | "load"
+	MaxW   float64 `json:"max_w"` // nameplate capacity (W); used by orchestrator actuators
 }
 
 // Config is the JSON configuration for the hub process.
@@ -39,6 +40,14 @@ type Config struct {
 	// MetricsPort is the TCP port for the Prometheus metrics HTTP server.
 	// Default 9100 (node_exporter convention). Set to 0 to disable.
 	MetricsPort int `json:"metrics_port"`
+
+	// OCPP 2.0.1 CSMS (Security Profile 2). Set OCPPPort to 0 to disable.
+	OCPPPort int    `json:"ocpp_port"` // default 8887 when non-zero
+	OCPPCert string `json:"ocpp_cert"` // TLS cert path; empty → plain WebSocket
+	OCPPKey  string `json:"ocpp_key"`  // TLS key path
+
+	// EngineIntervalS is the orchestrator control tick in seconds. Default 15.
+	EngineIntervalS int `json:"engine_interval_s"`
 }
 
 func (c *Config) DiscoveryInterval() time.Duration {
@@ -88,4 +97,11 @@ func loadConfig(path string) (*Config, error) {
 
 func (c *Config) MetricsAddr() string {
 	return fmt.Sprintf(":%d", c.MetricsPort)
+}
+
+func (c *Config) EngineInterval() time.Duration {
+	if c.EngineIntervalS <= 0 {
+		return 15 * time.Second
+	}
+	return time.Duration(c.EngineIntervalS) * time.Second
 }

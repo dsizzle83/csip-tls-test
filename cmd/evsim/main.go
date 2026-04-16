@@ -1,14 +1,20 @@
-// evsim is an OCPP 2.0.1 charging station client simulator with a built-in
-// HTTP API for GUI inspection and test injection.
+// evsim is an OCPP 2.0.1 charging station client simulator with a realistic
+// EV battery model.  The battery follows a CC/CV charging curve: constant
+// current in the bulk phase (SOC < cvStartSOC) and a linear taper in the
+// absorption phase (SOC ≥ cvStartSOC).  MeterValues are sent to the CSMS
+// periodically so the orchestrator receives actual current, not commanded.
 //
 // Usage:
 //
 //	evsim -csms ws://192.168.10.1:8887/ocpp [-id evse-001] [-connectors 1]
-//	       [-session-interval 180] [-session-duration 120] [-api-port 6024]
+//	       [-battery-kwh 60] [-battery-soc 20] [-sim-speed 1.0]
+//	       [-session-interval 180] [-session-duration 3600]
+//	       [-meter-interval 10] [-voltage 230] [-max-current 32]
+//	       [-api-port 6024]
 //
 // API (default :6024):
 //
-//	GET  /state    — JSON snapshot: connection, connectors, session, last profile
+//	GET  /state    — JSON snapshot: connection, connectors, session, battery
 //	POST /inject   — inject connector status: {"connector_id":1,"status":"Faulted"}
 //	               — trigger session:         {"action":"start_session","connector_id":1}
 //	               — end session:             {"action":"stop_session","connector_id":1}
@@ -20,6 +26,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"sync"
@@ -41,20 +48,30 @@ func main() {
 	stationID       := flag.String("id", "evse-001", "Charging station identifier")
 	numConnectors   := flag.Int("connectors", 1, "Number of connectors")
 	sessionInterval := flag.Int("session-interval", 180, "Seconds between simulated sessions")
-	sessionDuration := flag.Int("session-duration", 120, "Seconds per simulated session")
+	sessionDuration := flag.Int("session-duration", 3600, "Max session duration (seconds); ends early if battery full")
 	apiPort         := flag.Int("api-port", 6024, "HTTP API port (0 to disable)")
+	battKwh         := flag.Float64("battery-kwh", 60.0, "EV battery capacity (kWh)")
+	battSOC         := flag.Float64("battery-soc", 20.0, "Initial battery state of charge (%)")
+	simSpeed        := flag.Float64("sim-speed", 1.0, "Simulation time multiplier (1=real-time, 60=60× faster)")
+	meterIntervalS  := flag.Int("meter-interval", 10, "MeterValues send interval (real seconds)")
+	voltageV        := flag.Float64("voltage", 230.0, "AC supply voltage (V)")
+	maxCurrentA     := flag.Float64("max-current", 32.0, "EVSE hardware max current (A)")
 	flag.Parse()
 
-	log.Printf("evsim: station=%s csms=%s connectors=%d", *stationID, *csmsURL, *numConnectors)
+	log.Printf("evsim: station=%s csms=%s battery=%.0fkWh soc=%.0f%% speed=%.1fx",
+		*stationID, *csmsURL, *battKwh, *battSOC, *simSpeed)
 
 	cs := ocpp2.NewChargingStation(*stationID, nil, nil)
 
+	batt := newEVBattery(*battKwh*1000, *battSOC, *voltageV, *maxCurrentA, *simSpeed)
+
 	h := &csHandler{
-		cs:        cs,
-		stationID: *stationID,
-		csmsURL:   *csmsURL,
+		cs:            cs,
+		stationID:     *stationID,
+		csmsURL:       *csmsURL,
+		batt:          batt,
+		meterInterval: time.Duration(*meterIntervalS) * time.Second,
 	}
-	// Initialise connector states.
 	for i := 1; i <= *numConnectors; i++ {
 		h.setConnector(i, availability.ConnectorStatusAvailable)
 	}
@@ -70,7 +87,6 @@ func main() {
 	h.setConnected(true)
 	log.Printf("evsim: connected")
 
-	// BootNotification
 	bootResp, err := cs.BootNotification(
 		provisioning.BootReasonPowerUp, "CSIP-EV-Simulator", "GreenGrid-Labs",
 	)
@@ -79,19 +95,17 @@ func main() {
 	}
 	log.Printf("evsim: BootNotification status=%s interval=%ds", bootResp.Status, bootResp.Interval)
 
-	// Initial StatusNotification (Available) for each connector.
 	for i := 1; i <= *numConnectors; i++ {
 		sendStatus(cs, h, i, availability.ConnectorStatusAvailable)
 	}
 
-	// API server
 	if *apiPort != 0 {
 		simapi.New(
 			fmt.Sprintf(":%d", *apiPort),
 			func() any { return h.Snapshot() },
 			func(body []byte) error { return h.Inject(cs, body) },
-			nil, // no register dump for OCPP
-			nil, // no animation control for OCPP
+			nil,
+			nil,
 		)
 	}
 
@@ -124,14 +138,202 @@ func main() {
 	}
 }
 
-func simulateSession(cs ocpp2.ChargingStation, h *csHandler, connectorID int, duration time.Duration) {
-	log.Printf("evsim: connector %d — session starting (%v)", connectorID, duration)
+// ── EV battery CC/CV charging model ──────────────────────────────────────────
+//
+// CC phase (0 ≤ SOC < cvStartSOC): constant current at commanded limit.
+// CV phase (cvStartSOC ≤ SOC < 100): current tapers linearly to zero.
+//
+// Energy update per tick:
+//
+//	ΔSOCpct = (actualA × voltageV × Δt_sim_h / capacityWh) × 100
+
+// evBattery models one EV battery over a charging session.
+type evBattery struct {
+	mu sync.Mutex
+
+	CapacityWh  float64 // total usable capacity (Wh)
+	SOC         float64 // current state of charge (0–100 %)
+	VoltageV    float64 // AC supply voltage (V)
+	MaxCurrentA float64 // EVSE hardware max current (A)
+	CVStartSOC  float64 // SOC % where CC→CV transition begins (default 80)
+	SimSpeed    float64 // time multiplier: each real tick covers SimSpeed × dt
+
+	commandedA float64 // current limit from last SetChargingProfile (A)
+	actualA    float64 // actual current per CC/CV model (A)
+	sessionWh  float64 // cumulative energy this session (Wh)
+}
+
+func newEVBattery(capacityWh, initialSOC, voltageV, maxCurrentA, simSpeed float64) *evBattery {
+	return &evBattery{
+		CapacityWh:  capacityWh,
+		SOC:         math.Min(100, math.Max(0, initialSOC)),
+		VoltageV:    voltageV,
+		MaxCurrentA: maxCurrentA,
+		CVStartSOC:  80.0,
+		SimSpeed:    math.Max(0.001, simSpeed),
+	}
+}
+
+// SetCommandedA updates the charging current limit from a SetChargingProfile.
+func (b *evBattery) SetCommandedA(a float64) {
+	b.mu.Lock()
+	b.commandedA = a
+	b.mu.Unlock()
+}
+
+// ResetSession zeros the session energy counter. Call when a new session starts.
+func (b *evBattery) ResetSession() {
+	b.mu.Lock()
+	b.sessionWh = 0
+	b.mu.Unlock()
+}
+
+// Tick advances the battery simulation by dt × SimSpeed of simulated time.
+// Returns (actualA, full): full is true when SOC reaches 100%.
+func (b *evBattery) Tick(dt time.Duration) (actualA float64, full bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.SOC >= 100.0 || b.commandedA <= 0 {
+		b.actualA = 0
+		return 0, b.SOC >= 100.0
+	}
+
+	limit := math.Min(b.commandedA, b.MaxCurrentA)
+
+	if b.SOC < b.CVStartSOC {
+		// CC phase: full current.
+		b.actualA = limit
+	} else {
+		// CV phase: linear taper from full current at cvStartSOC to 0 at 100%.
+		taper := (100.0 - b.SOC) / (100.0 - b.CVStartSOC)
+		b.actualA = limit * math.Max(0, taper)
+	}
+
+	// Advance simulated time.
+	simSec := dt.Seconds() * b.SimSpeed
+	dtH := simSec / 3600.0
+	powerW := b.actualA * b.VoltageV
+	energyWh := powerW * dtH
+
+	b.SOC = math.Min(100.0, b.SOC+(energyWh/b.CapacityWh)*100.0)
+	b.sessionWh += energyWh
+
+	if b.SOC >= 100.0 {
+		b.SOC = 100.0
+		b.actualA = 0
+		return 0, true
+	}
+	return b.actualA, false
+}
+
+// Phase returns "CC" or "CV" based on current SOC.
+func (b *evBattery) Phase() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.SOC < b.CVStartSOC {
+		return "CC"
+	}
+	return "CV"
+}
+
+// State returns a thread-safe snapshot of the battery.
+func (b *evBattery) State() (soc, actualA, sessionWh float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.SOC, b.actualA, b.sessionWh
+}
+
+// ── Session simulation ────────────────────────────────────────────────────────
+
+func simulateSession(cs ocpp2.ChargingStation, h *csHandler, connectorID int, maxDuration time.Duration) {
+	log.Printf("evsim: connector %d — session starting (max %v, SOC=%.1f%%)",
+		connectorID, maxDuration, func() float64 { soc, _, _ := h.batt.State(); return soc }())
+	h.batt.ResetSession()
 	h.setSessionActive(connectorID, true)
 	sendStatus(cs, h, connectorID, availability.ConnectorStatusOccupied)
-	time.Sleep(duration)
+
+	runChargingLoop(cs, h, connectorID, maxDuration)
+
+	// Final reading before closing.
+	soc, cur, energy := h.batt.State()
+	sendMeterValues(cs, h.batt, connectorID, soc, cur, energy)
 	sendStatus(cs, h, connectorID, availability.ConnectorStatusAvailable)
 	h.setSessionActive(connectorID, false)
-	log.Printf("evsim: connector %d — session complete", connectorID)
+
+	soc, _, _ = h.batt.State()
+	log.Printf("evsim: connector %d — session complete, SOC=%.1f%%", connectorID, soc)
+}
+
+// runChargingLoop drives the battery simulation and periodic MeterValues until
+// maxDuration elapses or the battery reaches 100% SOC.
+func runChargingLoop(cs ocpp2.ChargingStation, h *csHandler, connectorID int, maxDuration time.Duration) {
+	simTicker := time.NewTicker(time.Second)
+	defer simTicker.Stop()
+	meterTicker := time.NewTicker(h.meterInterval)
+	defer meterTicker.Stop()
+	deadline := time.NewTimer(maxDuration)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case <-simTicker.C:
+			_, full := h.batt.Tick(time.Second)
+			if full {
+				log.Printf("evsim: connector %d — battery full (100%% SOC)", connectorID)
+				return
+			}
+		case <-meterTicker.C:
+			soc, cur, energy := h.batt.State()
+			sendMeterValues(cs, h.batt, connectorID, soc, cur, energy)
+		case <-deadline.C:
+			return
+		}
+	}
+}
+
+// sendMeterValues sends an OCPP MeterValues message with the five key measurands:
+// Current.Import, Power.Active.Import, Energy.Active.Import.Register, SoC, Voltage.
+func sendMeterValues(cs ocpp2.ChargingStation, batt *evBattery, connectorID int, soc, currentA, energyWh float64) {
+	now := types.NewDateTime(time.Now())
+	powerW := currentA * batt.VoltageV
+
+	mv := types.MeterValue{
+		Timestamp: *now,
+		SampledValue: []types.SampledValue{
+			{
+				Measurand:     types.MeasurandCurrentImport,
+				Value:         currentA,
+				UnitOfMeasure: &types.UnitOfMeasure{Unit: "A"},
+			},
+			{
+				Measurand:     types.MeasurandPowerActiveImport,
+				Value:         powerW,
+				UnitOfMeasure: &types.UnitOfMeasure{Unit: "W"},
+			},
+			{
+				Measurand:     types.MeasurandEnergyActiveImportRegister,
+				Value:         energyWh,
+				UnitOfMeasure: &types.UnitOfMeasure{Unit: "Wh"},
+			},
+			{
+				Measurand: types.MeasurandSoC,
+				Value:     soc,
+			},
+			{
+				Measurand:     types.MeasurandVoltage,
+				Value:         batt.VoltageV,
+				UnitOfMeasure: &types.UnitOfMeasure{Unit: "V"},
+			},
+		},
+	}
+
+	if _, err := cs.MeterValues(connectorID, []types.MeterValue{mv}); err != nil {
+		log.Printf("evsim: MeterValues connector=%d: %v", connectorID, err)
+		return
+	}
+	log.Printf("evsim: MeterValues connector=%d soc=%.1f%% current=%.1fA power=%.0fW energy=%.0fWh phase=%s",
+		connectorID, soc, currentA, powerW, energyWh, batt.Phase())
 }
 
 func sendStatus(cs ocpp2.ChargingStation, h *csHandler, connectorID int, status availability.ConnectorStatus) {
@@ -147,20 +349,28 @@ func sendStatus(cs ocpp2.ChargingStation, h *csHandler, connectorID int, status 
 
 // ── State tracking ────────────────────────────────────────────────────────────
 
-// connectorInfo tracks one connector's status.
 type connectorInfo struct {
 	ID         int                          `json:"id"`
 	Status     availability.ConnectorStatus `json:"status"`
 	LastUpdate time.Time                    `json:"last_update"`
 }
 
-// chargingProfileInfo records the last SetChargingProfile received from the CSMS.
 type chargingProfileInfo struct {
 	ReceivedAt string  `json:"received_at"`
 	EvseID     int     `json:"evse_id"`
 	ProfileID  int     `json:"profile_id"`
 	Purpose    string  `json:"purpose"`
-	LimitA     float64 `json:"limit_A"` // first period limit in amps (if rate unit = A)
+	LimitA     float64 `json:"limit_A"`
+}
+
+// batteryInfo is the JSON-serialisable battery snapshot in EVState.
+type batteryInfo struct {
+	CapacityWh float64 `json:"capacity_Wh"`
+	SOC        float64 `json:"soc_pct"`
+	CurrentA   float64 `json:"current_A"`   // actual (CC/CV model), not commanded
+	PowerW     float64 `json:"power_W"`
+	SessionWh  float64 `json:"session_energy_Wh"`
+	Phase      string  `json:"phase"` // "CC" or "CV"
 }
 
 // EVState is the JSON-serialisable snapshot for GET /state.
@@ -172,9 +382,10 @@ type EVState struct {
 		URL       string `json:"url"`
 		Connected bool   `json:"connected"`
 	} `json:"csms"`
-	Connectors    []connectorInfo     `json:"connectors"`
-	Session       sessionInfo         `json:"session"`
-	LastHeartbeat string              `json:"last_heartbeat,omitempty"`
+	Connectors    []connectorInfo      `json:"connectors"`
+	Session       sessionInfo          `json:"session"`
+	Battery       batteryInfo          `json:"battery"`
+	LastHeartbeat string               `json:"last_heartbeat,omitempty"`
 	LastProfile   *chargingProfileInfo `json:"last_charging_profile,omitempty"`
 }
 
@@ -184,11 +395,12 @@ type sessionInfo struct {
 	StartedAt   string `json:"started_at,omitempty"`
 }
 
-// csHandler implements all CSMS→station handler interfaces and tracks state.
 type csHandler struct {
 	cs        ocpp2.ChargingStation
 	stationID string
 	csmsURL   string
+	batt      *evBattery
+	meterInterval time.Duration
 
 	mu            sync.RWMutex
 	connected     bool
@@ -198,8 +410,8 @@ type csHandler struct {
 	lastProfile   *chargingProfileInfo
 }
 
-func (h *csHandler) setConnected(v bool)       { h.mu.Lock(); h.connected = v; h.mu.Unlock() }
-func (h *csHandler) setLastHeartbeat(t time.Time) { h.mu.Lock(); h.lastHeartbeat = t; h.mu.Unlock() }
+func (h *csHandler) setConnected(v bool)            { h.mu.Lock(); h.connected = v; h.mu.Unlock() }
+func (h *csHandler) setLastHeartbeat(t time.Time)   { h.mu.Lock(); h.lastHeartbeat = t; h.mu.Unlock() }
 
 func (h *csHandler) setConnector(id int, status availability.ConnectorStatus) {
 	h.mu.Lock()
@@ -223,7 +435,7 @@ func (h *csHandler) setSessionActive(connectorID int, active bool) {
 	h.mu.Unlock()
 }
 
-// Snapshot returns a thread-safe copy of current state.
+// Snapshot returns a thread-safe copy of the current state.
 func (h *csHandler) Snapshot() EVState {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -247,15 +459,25 @@ func (h *csHandler) Snapshot() EVState {
 		cc := *c
 		st.Connectors = append(st.Connectors, cc)
 	}
+
+	// Battery snapshot (separate lock to avoid holding both simultaneously).
+	h.mu.RUnlock()
+	soc, cur, sessionWh := h.batt.State()
+	phase := h.batt.Phase()
+	h.mu.RLock()
+
+	st.Battery = batteryInfo{
+		CapacityWh: h.batt.CapacityWh,
+		SOC:        soc,
+		CurrentA:   cur,
+		PowerW:     cur * h.batt.VoltageV,
+		SessionWh:  sessionWh,
+		Phase:      phase,
+	}
 	return st
 }
 
 // Inject handles POST /inject requests from the GUI.
-// Supported actions:
-//
-//	{"connector_id":1, "status":"Faulted"}         — force a connector status
-//	{"action":"start_session", "connector_id":1}   — begin a simulated session
-//	{"action":"stop_session",  "connector_id":1}   — end a simulated session
 func (h *csHandler) Inject(cs ocpp2.ChargingStation, body []byte) error {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -269,10 +491,21 @@ func (h *csHandler) Inject(cs ocpp2.ChargingStation, body []byte) error {
 		}
 		switch action {
 		case "start_session":
-			go simulateSession(cs, h, cid, 60*time.Second)
+			dur := 3600 * time.Second
+			if v, ok := req["duration_s"].(float64); ok && v > 0 {
+				dur = time.Duration(v) * time.Second
+			}
+			go simulateSession(cs, h, cid, dur)
 		case "stop_session":
 			sendStatus(cs, h, cid, availability.ConnectorStatusAvailable)
 			h.setSessionActive(cid, false)
+		case "set_soc":
+			if v, ok := req["soc_pct"].(float64); ok {
+				h.batt.mu.Lock()
+				h.batt.SOC = math.Min(100, math.Max(0, v))
+				h.batt.mu.Unlock()
+				log.Printf("evsim: injected SOC=%.1f%%", v)
+			}
 		default:
 			return fmt.Errorf("inject: unknown action %q", action)
 		}
@@ -344,6 +577,11 @@ func (h *csHandler) OnTriggerMessage(req *remotecontrol.TriggerMessageRequest) (
 			if _, err := h.cs.Heartbeat(); err != nil {
 				log.Printf("evsim: triggered Heartbeat: %v", err)
 			}
+		case remotecontrol.MessageTriggerMeterValues:
+			soc, cur, energy := h.batt.State()
+			for id := range h.connectors {
+				sendMeterValues(h.cs, h.batt, id, soc, cur, energy)
+			}
 		}
 	}()
 	return resp, nil
@@ -360,15 +598,17 @@ func (h *csHandler) OnSetChargingProfile(req *smartcharging.SetChargingProfileRe
 		ProfileID:  p.ID,
 		Purpose:    string(p.ChargingProfilePurpose),
 	}
-	// Extract the first period's limit if the schedule is in amps.
 	if len(p.ChargingSchedule) > 0 && len(p.ChargingSchedule[0].ChargingSchedulePeriod) > 0 {
 		info.LimitA = p.ChargingSchedule[0].ChargingSchedulePeriod[0].Limit
 	}
+	// Feed limit into the battery model so the CC/CV curve uses the new limit.
+	h.batt.SetCommandedA(info.LimitA)
+
 	h.mu.Lock()
 	h.lastProfile = info
 	h.mu.Unlock()
-	log.Printf("evsim: SetChargingProfile evse=%d profile=%d purpose=%s limit=%.1fA",
-		req.EvseID, p.ID, p.ChargingProfilePurpose, info.LimitA)
+	log.Printf("evsim: SetChargingProfile evse=%d profile=%d limit=%.1fA",
+		req.EvseID, p.ID, info.LimitA)
 	return &smartcharging.SetChargingProfileResponse{Status: smartcharging.ChargingProfileStatusAccepted}, nil
 }
 func (h *csHandler) OnGetChargingProfiles(req *smartcharging.GetChargingProfilesRequest) (*smartcharging.GetChargingProfilesResponse, error) {
@@ -378,6 +618,7 @@ func (h *csHandler) OnClearChargingProfile(req *smartcharging.ClearChargingProfi
 	h.mu.Lock()
 	h.lastProfile = nil
 	h.mu.Unlock()
+	h.batt.SetCommandedA(0)
 	return &smartcharging.ClearChargingProfileResponse{Status: smartcharging.ClearChargingProfileStatusAccepted}, nil
 }
 func (h *csHandler) OnGetCompositeSchedule(req *smartcharging.GetCompositeScheduleRequest) (*smartcharging.GetCompositeScheduleResponse, error) {

@@ -63,25 +63,19 @@ func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
 	return &SolarServer{Server: srv, bases: bases, wmaxW: wmaxW}, nil
 }
 
-// newAnimatedServer launches the Modbus TCP server and an animation goroutine.
-// fn receives the Server (for Pause/Resume/Speed access), the register map, and
-// a stop channel; it must return when stop is closed.
+// newAnimatedServer launches the Modbus TCP server and a single animation
+// goroutine.  fn receives the Server (for Pause/Resume/Speed access), the
+// register map, and a stop channel; it must return when stop is closed.
 func newAnimatedServer(listenURL string, regs *RegisterMap, fn func(*Server, *RegisterMap, <-chan struct{})) (*Server, error) {
-	s, err := startServer(listenURL, regs)
+	s, err := startServerRaw(listenURL, regs)
 	if err != nil {
 		return nil, err
 	}
-	anim := &Server{
-		Regs: s.Regs,
-		srv:  s.srv,
-		stop: s.stop,
-		done: make(chan struct{}),
-	}
 	go func() {
-		defer close(anim.done)
-		fn(anim, anim.Regs, anim.stop)
+		defer close(s.done)
+		fn(s, s.Regs, s.stop)
 	}()
-	return anim, nil
+	return s, nil
 }
 
 // ── Snapshot ──────────────────────────────────────────────────────────────────

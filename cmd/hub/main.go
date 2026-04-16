@@ -1,23 +1,27 @@
 // hub is the long-running CSIP DER hub process for a Raspberry Pi.
 //
 // It wires together the northbound (CSIP / IEEE 2030.5) and southbound
-// (Modbus / SunSpec) stacks:
+// (Modbus / SunSpec) stacks via the orchestrator engine:
 //
-//	wolfSSL fetcher → discovery walker → scheduler → bridge → registry → inverter/battery
+//	wolfSSL fetcher → discovery walker → engine.SetCSIPPrograms()
+//	                                           ↓
+//	                               Optimizer.Optimize(SystemState)
+//	                                           ↓
+//	                     BatteryActuator / SolarActuator / EVSEActuator
 //
 // Goroutines:
 //
-//	discoveryLoop  — re-walks /dcap every N seconds; updates bridge programs +
-//	                 clock offset; drives the response POST state machine.
-//	telemetryLoop  — registers one MUP per device × {W, V, Hz} at startup;
-//	                 consumes registry.Updates() and POSTs per-device readings.
-//	bridge (internal) — evaluates scheduler every 15 s; calls ApplyControl.
-//	registry (internal) — polls Modbus every 10 s; emits MeasurementUpdates.
+//	discoveryLoop      — re-walks /dcap every N seconds; calls engine.SetCSIPPrograms();
+//	                     drives the response POST state machine.
+//	telemetryLoop      — registers one MUP per device at startup;
+//	                     consumes registry.Updates() and POSTs per-device readings.
+//	engine (internal)  — evaluates optimizer every EngineIntervalS; applies controls.
+//	registry (internal)— polls Modbus every PollIntervalS; emits MeasurementUpdates.
+//	batteryMetrics     — refreshes SOC/SOH from Modbus battery models.
 //
 // Response POST state machine (GEN.044 / CORE-022):
 //
-//	Received  (1): posted once when a DERControl event is first seen in the
-//	               DERControlList, even before its time window opens.
+//	Received  (1): posted once when a DERControl event is first seen.
 //	Started   (2): posted when the scheduler first makes the event active.
 //	Completed (3): posted when the event expires or is superseded.
 //
@@ -29,6 +33,7 @@ package main
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"encoding/xml"
 	"flag"
@@ -44,11 +49,13 @@ import (
 	"syscall"
 	"time"
 
-	"csip-tls-test/internal/bridge"
 	"csip-tls-test/internal/csip/discovery"
 	"csip-tls-test/internal/csip/identity"
 	"csip-tls-test/internal/csip/model"
 	"csip-tls-test/internal/csip/scheduler"
+	"csip-tls-test/internal/ocppserver"
+	"csip-tls-test/internal/orchestrator"
+	"csip-tls-test/internal/orchestrator/adapters"
 	"csip-tls-test/internal/southbound/battery"
 	"csip-tls-test/internal/southbound/device"
 	"csip-tls-test/internal/southbound/inverter"
@@ -105,6 +112,9 @@ func main() {
 	// ── Southbound ────────────────────────────────────────────────────────
 
 	reg := registry.New(cfg.PollInterval())
+	ra := adapters.NewRegistryAdapter(reg)
+
+	var battDevices []batEntry
 	for _, dc := range cfg.Devices {
 		dev, err := openDevice(dc)
 		if err != nil {
@@ -112,21 +122,65 @@ func main() {
 			continue
 		}
 		reg.Add(&registry.Entry{Name: dc.Name, Addr: dc.URL, Device: dev})
+		ra.RegisterDevice(dc.Name, deviceRole(dc.Role), dc.MaxW)
+		if bat, ok := dev.(*battery.Battery); ok {
+			battDevices = append(battDevices, batEntry{name: dc.Name, bat: bat})
+		}
 		log.Printf("hub: device registered: %s (%s role=%s)", dc.Name, dc.URL, dc.Role)
 	}
 
+	// Separate scheduler for the response tracker. The engine has its own
+	// internal scheduler; this one is only used to drive Received/Started/Completed.
 	sched := scheduler.New()
-	b := bridge.New(sched, reg, cfg.ControlInterval())
+
+	// ── OCPP CSMS ─────────────────────────────────────────────────────────
+
+	var ocppTracker *adapters.OCPPStateTracker
+	if cfg.OCPPPort != 0 {
+		ocppSrv := ocppserver.New(ocppserver.Config{
+			Port:     cfg.OCPPPort,
+			CertPath: cfg.OCPPCert,
+			KeyPath:  cfg.OCPPKey,
+		})
+		go ocppSrv.Start()
+		defer ocppSrv.Stop()
+		ocppTracker = adapters.NewOCPPStateTracker(ocppSrv.CSMS())
+		log.Printf("hub: OCPP CSMS on :%d", cfg.OCPPPort)
+	}
+
+	// ── Orchestrator engine ───────────────────────────────────────────────
+
+	compositeReader := &compositeSystemReader{registry: ra, ocpp: ocppTracker}
+	opt := orchestrator.NewDefaultOptimizer()
+	eng := orchestrator.New(compositeReader, opt, orchestrator.Config{
+		Interval: cfg.EngineInterval(),
+	})
+
+	for _, dc := range cfg.Devices {
+		switch dc.Role {
+		case "battery":
+			eng.RegisterBatteryActuator(dc.Name,
+				adapters.NewRegistryBatteryActuator(reg, dc.Name, dc.MaxW))
+		case "inverter":
+			eng.RegisterSolarActuator(dc.Name,
+				adapters.NewRegistrySolarActuator(reg, dc.MaxW))
+		}
+	}
+	if ocppTracker != nil {
+		eng.RegisterEVSEActuator("*", ocppTracker)
+	}
 
 	reg.Start()
 	defer reg.Stop()
-	b.Start()
-	defer b.Stop()
+	ra.Start()
+	defer ra.Stop()
+	eng.Start()
+	defer eng.Stop()
 
 	// ── Metrics server ────────────────────────────────────────────────────
 
 	met := newHubMetrics()
-	startMetricsServer(cfg.MetricsAddr(), met)
+	startMetricsServer(cfg.MetricsAddr(), met, ocppTracker)
 
 	// ── Goroutines ────────────────────────────────────────────────────────
 
@@ -140,7 +194,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		discoveryLoop(ctx, cfg, fetcherDisc, lfdi, b, sched, &clockOffset, met)
+		discoveryLoop(ctx, cfg, fetcherDisc, lfdi, eng, sched, &clockOffset, met)
 	}()
 
 	wg.Add(1)
@@ -148,6 +202,14 @@ func main() {
 		defer wg.Done()
 		telemetryLoop(ctx, cfg, fetcherTelm, lfdi, reg, &clockOffset, met)
 	}()
+
+	if len(battDevices) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			refreshBatteryMetrics(ctx, battDevices, ra, cfg.PollInterval()*3)
+		}()
+	}
 
 	// ── Shutdown ──────────────────────────────────────────────────────────
 
@@ -175,6 +237,70 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 	}
 }
 
+// deviceRole maps hub config role strings to adapters.DeviceRole.
+func deviceRole(role string) adapters.DeviceRole {
+	switch role {
+	case "battery":
+		return adapters.RoleBattery
+	case "inverter":
+		return adapters.RoleSolar
+	case "meter":
+		return adapters.RoleGridMeter
+	default:
+		return adapters.RoleLoad
+	}
+}
+
+// batEntry pairs a device name with its concrete *battery.Battery for metrics polling.
+type batEntry struct {
+	name string
+	bat  *battery.Battery
+}
+
+// compositeSystemReader merges RegistryAdapter state with OCPP tracker state.
+type compositeSystemReader struct {
+	registry *adapters.RegistryAdapter
+	ocpp     *adapters.OCPPStateTracker // nil if OCPP disabled
+}
+
+func (r *compositeSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
+	state, err := r.registry.ReadSystemState()
+	if err != nil {
+		return state, err
+	}
+	if r.ocpp != nil {
+		state.EVSEs = r.ocpp.EVSEStates()
+	}
+	return state, nil
+}
+
+// refreshBatteryMetrics polls battery SOC/SOH from Modbus and feeds the
+// results into the registry adapter so the optimizer can use live values.
+func refreshBatteryMetrics(
+	ctx context.Context,
+	bats []batEntry,
+	ra *adapters.RegistryAdapter,
+	interval time.Duration,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, b := range bats {
+				m, err := b.bat.ReadBatteryMetrics()
+				if err != nil {
+					log.Printf("hub: battery metrics %s: %v", b.name, err)
+					continue
+				}
+				ra.UpdateBatteryMetrics(b.name, m)
+			}
+		}
+	}
+}
+
 // ── Discovery loop ─────────────────────────────────────────────────────────
 
 func discoveryLoop(
@@ -182,7 +308,7 @@ func discoveryLoop(
 	cfg *Config,
 	fetcher *tlsclient.WolfSSLFetcher,
 	lfdi string,
-	b *bridge.Bridge,
+	eng *orchestrator.Engine,
 	sched *scheduler.Scheduler,
 	clockOffset *atomic.Int64,
 	met *hubMetrics,
@@ -190,7 +316,7 @@ func discoveryLoop(
 	tracker := newResponseTracker(fetcher, lfdi, cfg.ResponseSetPath)
 
 	// Discover immediately, then on the ticker.
-	runDiscovery(fetcher, lfdi, b, sched, tracker, clockOffset, met)
+	runDiscovery(fetcher, lfdi, eng, sched, tracker, clockOffset, met)
 
 	ticker := time.NewTicker(cfg.DiscoveryInterval())
 	defer ticker.Stop()
@@ -200,7 +326,7 @@ func discoveryLoop(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runDiscovery(fetcher, lfdi, b, sched, tracker, clockOffset, met)
+			runDiscovery(fetcher, lfdi, eng, sched, tracker, clockOffset, met)
 		}
 	}
 }
@@ -208,7 +334,7 @@ func discoveryLoop(
 func runDiscovery(
 	fetcher *tlsclient.WolfSSLFetcher,
 	lfdi string,
-	b *bridge.Bridge,
+	eng *orchestrator.Engine,
 	sched *scheduler.Scheduler,
 	tracker *responseTracker,
 	clockOffset *atomic.Int64,
@@ -223,12 +349,13 @@ func runDiscovery(
 	}
 
 	clockOffset.Store(tree.ClockOffset)
-	b.SetPrograms(tree.Programs, tree.ClockOffset)
+	eng.SetCSIPPrograms(tree.Programs, tree.ClockOffset)
 	met.recordDiscovery(true, tree.ClockOffset)
 
 	serverNow := scheduler.ServerNow(tree.ClockOffset)
 	active := sched.Evaluate(tree.Programs, serverNow)
 	tracker.update(tree, active)
+	met.recordCSIPState(len(tree.Programs), active)
 
 	log.Printf("hub: discovery OK: programs=%d clockOffset=%ds",
 		len(tree.Programs), tree.ClockOffset)
@@ -237,9 +364,10 @@ func runDiscovery(
 // ── Response POST state machine ────────────────────────────────────────────
 //
 // Full three-transition lifecycle per GEN.044 / CORE-022:
-//   Received  (1) — posted once per event MRID when first seen in DERControlList
-//   Started   (2) — posted when the event's time window becomes active
-//   Completed (3) — posted when the event expires or is superseded
+//
+//	Received  (1) — posted once per event MRID when first seen in DERControlList
+//	Started   (2) — posted when the event's time window becomes active
+//	Completed (3) — posted when the event expires or is superseded
 //
 // The received map persists across discovery cycles so Received is only sent
 // once per MRID per hub process lifetime. On restart the server receives a
@@ -251,8 +379,8 @@ type responseTracker struct {
 	responseSetPath string
 	clockOffset     int64
 
-	received    map[string]bool // event MRIDs for which we have sent Received(1)
-	activeMRID  string          // MRID of the event we last sent Started(2) for
+	received   map[string]bool // event MRIDs for which we have sent Received(1)
+	activeMRID string          // MRID of the event we last sent Started(2) for
 }
 
 func newResponseTracker(fetcher *tlsclient.WolfSSLFetcher, lfdi, responseSetPath string) *responseTracker {
@@ -348,8 +476,14 @@ func (rt *responseTracker) post(mrid string, status uint8) {
 // ── Metrics ────────────────────────────────────────────────────────────────
 //
 // hubMetrics collects counters and gauges for the Prometheus text exposition
-// at /metrics on the metrics port (default :9100). No external library is
-// needed — we write the text format directly.
+// at /metrics and the JSON snapshot at /status.
+
+// csipControlInfo is the JSON shape for the active CSIP control in /status.
+type csipControlInfo struct {
+	Source     string `json:"source"`
+	MRID       string `json:"mrid,omitempty"`
+	ValidUntil int64  `json:"valid_until,omitempty"`
+}
 
 type hubMetrics struct {
 	mu sync.RWMutex
@@ -363,6 +497,10 @@ type hubMetrics struct {
 	postOK          map[string]int64
 	postErr         map[string]int64
 	clockOffsetS    int64
+
+	// CSIP program state (updated by discoveryLoop)
+	csipPrograms int
+	csipControl  *csipControlInfo
 }
 
 func newHubMetrics() *hubMetrics {
@@ -400,10 +538,26 @@ func (m *hubMetrics) recordPost(name string, err error) {
 	m.mu.Unlock()
 }
 
-// startMetricsServer runs a minimal Prometheus-compatible HTTP server on addr.
-// Exposes /metrics in Prometheus text exposition format and /healthz for
-// liveness checks.
-func startMetricsServer(addr string, m *hubMetrics) {
+func (m *hubMetrics) recordCSIPState(programs int, active *scheduler.ActiveControl) {
+	m.mu.Lock()
+	m.csipPrograms = programs
+	if active != nil && active.Source != "default" {
+		m.csipControl = &csipControlInfo{
+			Source:     active.Source,
+			MRID:       active.MRID,
+			ValidUntil: active.ValidUntil,
+		}
+	} else {
+		m.csipControl = nil
+	}
+	m.mu.Unlock()
+}
+
+// startMetricsServer runs a minimal HTTP server on addr exposing:
+//   - /healthz  liveness check
+//   - /metrics  Prometheus text format
+//   - /status   JSON snapshot (device measurements, CSIP state, OCPP stations)
+func startMetricsServer(addr string, m *hubMetrics, ocppTracker *adapters.OCPPStateTracker) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -471,6 +625,61 @@ func startMetricsServer(addr string, m *hubMetrics) {
 		}
 
 		fmt.Fprint(w, sb.String())
+	})
+
+	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
+		m.mu.RLock()
+		deviceSnap := make(map[string]device.Measurements, len(m.measurements))
+		for k, v := range m.measurements {
+			deviceSnap[k] = v
+		}
+		programs := m.csipPrograms
+		ctrl := m.csipControl
+		clockOff := m.clockOffsetS
+		m.mu.RUnlock()
+
+		type deviceInfo struct {
+			W  float64 `json:"W_W,omitempty"`
+			V  float64 `json:"V_V,omitempty"`
+			Hz float64 `json:"Hz_Hz,omitempty"`
+		}
+		type statusResp struct {
+			Timestamp    string                   `json:"timestamp"`
+			ClockOffsetS int64                    `json:"clock_offset_s"`
+			CSIPPrograms int                      `json:"csip_programs"`
+			CSIPControl  *csipControlInfo         `json:"csip_control,omitempty"`
+			Devices      map[string]deviceInfo    `json:"devices"`
+			EVSEs        []orchestrator.EVSEState `json:"evse_stations,omitempty"`
+		}
+
+		resp := statusResp{
+			Timestamp:    time.Now().UTC().Format(time.RFC3339),
+			ClockOffsetS: clockOff,
+			CSIPPrograms: programs,
+			CSIPControl:  ctrl,
+			Devices:      make(map[string]deviceInfo),
+		}
+		for name, meas := range deviceSnap {
+			info := deviceInfo{}
+			if !math.IsNaN(meas.W) {
+				info.W = meas.W
+			}
+			if !math.IsNaN(meas.V) {
+				info.V = meas.V
+			}
+			if !math.IsNaN(meas.Hz) {
+				info.Hz = meas.Hz
+			}
+			resp.Devices[name] = info
+		}
+		if ocppTracker != nil {
+			resp.EVSEs = ocppTracker.EVSEStates()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("hub: /status encode: %v", err)
+		}
 	})
 
 	srv := &http.Server{Addr: addr, Handler: mux}

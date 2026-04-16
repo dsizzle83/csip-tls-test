@@ -8,6 +8,9 @@ import (
 	"csip-tls-test/internal/southbound/sunspec"
 )
 
+// Compile-time check: Battery must satisfy BatteryMetricsReader.
+var _ orchestrator.BatteryMetricsReader = (*Battery)(nil)
+
 // ReadBatteryMetrics reads battery-specific state from SunSpec Model 802
 // (Lithium Battery) and returns it as an orchestrator.BatteryMetrics.
 // Fields that are not supported by the device are set to math.NaN().
