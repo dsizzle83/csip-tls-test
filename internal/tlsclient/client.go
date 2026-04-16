@@ -4,10 +4,13 @@
 package tlsclient
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"unsafe"
 
 	"csip-tls-test/internal/wolfssl"
@@ -184,8 +187,8 @@ func (c *Client) Version() string {
 }
 
 // Post sends an HTTP POST request with body and returns the raw response.
-// Same read-until-close strategy as Get. Connection is consumed by the
-// round trip; call Close + Dial before reusing.
+// Uses the same Content-Length-aware reader as Get; connection is kept
+// alive after the round trip.
 func (c *Client) Post(path string, body []byte, contentType string) ([]byte, error) {
 	if c.ssl == nil {
 		return nil, errors.New("client not connected; call Dial first")
@@ -194,50 +197,92 @@ func (c *Client) Post(path string, body []byte, contentType string) ([]byte, err
 	if _, err := wolfssl.Write(c.ssl, req); err != nil {
 		return nil, fmt.Errorf("write request: %w", err)
 	}
-	var resp []byte
-	buf := make([]byte, 4096)
-	for {
-		n, err := wolfssl.Read(c.ssl, buf)
-		if n > 0 {
-			resp = append(resp, buf[:n]...)
-		}
-		if err != nil || n == 0 {
-			break
-		}
-	}
-	return resp, nil
+	return c.readResponse()
 }
 
-// Get sends a minimal HTTP GET request for the given path and returns
-// the raw response (headers + body). The connection is consumed by
-// the round trip because the current server sends Connection: close;
-// callers should not reuse the Client without calling Close + Dial.
-//
-// As Milestone 3 introduces persistent connections, this will be
-// updated to keep the session open across requests.
+// Get sends an HTTP GET request for the given path and returns the raw
+// response (headers + body). Uses Content-Length to determine when the
+// response is complete, leaving the TLS session open for subsequent
+// requests on the same connection (persistent / keep-alive).
 func (c *Client) Get(path string) ([]byte, error) {
 	if c.ssl == nil {
 		return nil, errors.New("client not connected; call Dial first")
 	}
-
 	req := buildGetRequest(path, c.cfg.ServerAddr)
 	if _, err := wolfssl.Write(c.ssl, req); err != nil {
 		return nil, fmt.Errorf("write request: %w", err)
 	}
+	return c.readResponse()
+}
 
-	// Read until the server closes the connection (Connection: close).
-	// Do NOT break on short reads — TLS records can fragment arbitrarily;
-	// a response larger than one record would be silently truncated.
-	var resp []byte
-	buf := make([]byte, 4096)
-	for {
-		n, err := wolfssl.Read(c.ssl, buf)
+// readResponse reads one complete HTTP response from the open TLS
+// session. It reads headers until \r\n\r\n, then reads exactly
+// Content-Length body bytes so the connection can be reused.
+// Falls back to read-until-close if Content-Length is absent.
+func (c *Client) readResponse() ([]byte, error) {
+	scratch := make([]byte, 4096)
+	var buf []byte
+	headerEnd := -1
+
+	// Phase 1: buffer until the header block is complete.
+	for headerEnd < 0 {
+		n, err := wolfssl.Read(c.ssl, scratch)
 		if n > 0 {
-			resp = append(resp, buf[:n]...)
+			buf = append(buf, scratch[:n]...)
+			if idx := bytes.Index(buf, []byte("\r\n\r\n")); idx >= 0 {
+				headerEnd = idx + 4
+			}
 		}
 		if err != nil || n == 0 {
 			break
 		}
 	}
-	return resp, nil
+	if headerEnd < 0 {
+		return nil, fmt.Errorf("incomplete HTTP response: no header terminator")
+	}
+
+	// Phase 2: read exactly Content-Length body bytes.
+	cl := responseContentLength(buf[:headerEnd])
+	if cl < 0 {
+		// No Content-Length: fall back to reading until server closes.
+		for {
+			n, err := wolfssl.Read(c.ssl, scratch)
+			if n > 0 {
+				buf = append(buf, scratch[:n]...)
+			}
+			if err != nil || n == 0 {
+				break
+			}
+		}
+		return buf, nil
+	}
+
+	need := headerEnd + cl
+	for len(buf) < need {
+		n, err := wolfssl.Read(c.ssl, scratch)
+		if n > 0 {
+			buf = append(buf, scratch[:n]...)
+		}
+		if err != nil || n == 0 {
+			break
+		}
+	}
+	return buf[:need], nil
+}
+
+// responseContentLength returns the Content-Length value from a raw
+// HTTP header block (the bytes up to and including \r\n\r\n).
+// Returns -1 if the header is absent or cannot be parsed.
+func responseContentLength(headers []byte) int {
+	lower := bytes.ToLower(headers)
+	for _, line := range bytes.Split(lower, []byte("\r\n")) {
+		if bytes.HasPrefix(line, []byte("content-length:")) {
+			val := bytes.TrimSpace(line[len("content-length:"):])
+			n, err := strconv.Atoi(strings.TrimSpace(string(val)))
+			if err == nil {
+				return n
+			}
+		}
+	}
+	return -1
 }

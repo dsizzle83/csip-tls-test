@@ -23,51 +23,232 @@ package sim
 //	DCW    = W × 1.06                        conversion loss overhead
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
 	"time"
 
 	"csip-tls-test/internal/southbound/sunspec"
 )
 
+// SolarBases holds the first data-register address of each model block
+// so that Snapshot and Inject can locate registers without re-scanning.
+type SolarBases struct {
+	M121Base uint16 // Model 121 (Basic Settings) data start
+	M122Base uint16 // Model 122 (Extended Measurements) data start
+	M103Base uint16 // Model 103 (Three-Phase Inverter) data start
+	M123Base uint16 // Model 123 (Immediate Controls) data start
+}
+
+// SolarServer is an animated PV inverter simulator with a built-in API.
+// It embeds *Server so callers can call srv.Stop(), srv.Regs, srv.Pause(), etc.
+type SolarServer struct {
+	*Server
+	bases SolarBases
+	wmaxW float64
+}
+
 // NewSolarServer creates and starts an animated PV inverter simulator.
 // wmaxW is the nameplate peak power in watts.
-func NewSolarServer(listenURL string, wmaxW float64) (*Server, error) {
+func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
-	m103Base, m122Base := populateSolar(regs, wmaxW)
-	return newAnimatedServer(listenURL, regs, func(r *RegisterMap, stop <-chan struct{}) {
-		animateSolar(r, wmaxW, m103Base, m122Base, stop)
+	bases := populateSolar(regs, wmaxW)
+
+	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
+		animateSolar(s, r, wmaxW, bases.M103Base, bases.M122Base, stop)
 	})
+	if err != nil {
+		return nil, err
+	}
+	return &SolarServer{Server: srv, bases: bases, wmaxW: wmaxW}, nil
 }
 
 // newAnimatedServer launches the Modbus TCP server and an animation goroutine.
-// fn receives the register map and a stop channel; it must return when stop is closed.
-func newAnimatedServer(listenURL string, regs *RegisterMap, fn func(*RegisterMap, <-chan struct{})) (*Server, error) {
+// fn receives the Server (for Pause/Resume/Speed access), the register map, and
+// a stop channel; it must return when stop is closed.
+func newAnimatedServer(listenURL string, regs *RegisterMap, fn func(*Server, *RegisterMap, <-chan struct{})) (*Server, error) {
 	s, err := startServer(listenURL, regs)
 	if err != nil {
 		return nil, err
 	}
-	// startServer already launched a goroutine that closes s.done on stop.
-	// We need our own done channel that the animation goroutine closes instead.
 	anim := &Server{
 		Regs: s.Regs,
 		srv:  s.srv,
 		stop: s.stop,
 		done: make(chan struct{}),
 	}
-	// The default goroutine from startServer will close s.done when stop fires —
-	// that's harmless since nobody waits on s.done.
-	// Our animation goroutine closes anim.done so Stop() can drain it.
 	go func() {
 		defer close(anim.done)
-		fn(anim.Regs, anim.stop)
+		fn(anim, anim.Regs, anim.stop)
 	}()
 	return anim, nil
 }
 
-// populateSolar writes the full solar inverter register layout into r.
-// Returns the 0-based Modbus addresses of the first data registers of
-// Model 103 and Model 122 (used by animateSolar).
-func populateSolar(r *RegisterMap, wmaxW float64) (m103Base, m122Base uint16) {
+// ── Snapshot ──────────────────────────────────────────────────────────────────
+
+// SolarState is the JSON-serialisable snapshot returned by GET /state.
+type SolarState struct {
+	Type      string    `json:"type"`
+	Timestamp time.Time `json:"timestamp"`
+	Animation struct {
+		Paused bool    `json:"paused"`
+		Speed  float64 `json:"speed"`
+	} `json:"animation"`
+	Nameplate struct {
+		WMaxW float64 `json:"wmax_W"`
+	} `json:"nameplate"`
+	Measurements struct {
+		W_W     float64 `json:"W_W"`
+		V_V     float64 `json:"V_V"`
+		Hz_Hz   float64 `json:"Hz_Hz"`
+		VA_VA   float64 `json:"VA_VA"`
+		VAr_var float64 `json:"VAr_var"`
+		PF      float64 `json:"PF"`
+		DCV_V   float64 `json:"DCV_V"`
+		DCW_W   float64 `json:"DCW_W"`
+		TmpCab_C float64 `json:"TmpCab_C"`
+		St      int    `json:"St"`
+		StText  string `json:"St_text"`
+	} `json:"measurements"`
+	Controls struct {
+		WMaxLimPct_pct float64 `json:"WMaxLimPct_pct"`
+		WMaxLimPctEna  int     `json:"WMaxLimPct_Ena"`
+		Conn           int     `json:"Conn"`
+	} `json:"controls"`
+}
+
+// Snapshot reads the current register state and returns a decoded SolarState.
+func (ss *SolarServer) Snapshot() SolarState {
+	r := ss.Regs
+	b := ss.bases
+
+	sf := func(addr uint16) int16 { return int16(r.Get(addr)) }
+	signed := func(addr, sfAddr uint16) float64 {
+		return sunspec.ApplyScaleSigned(r.Get(addr), sf(sfAddr))
+	}
+	unsigned := func(addr, sfAddr uint16) float64 {
+		return sunspec.ApplyScaleUint(r.Get(addr), sf(sfAddr))
+	}
+
+	var st SolarState
+	st.Type = "solar"
+	st.Timestamp = time.Now()
+	st.Animation.Paused = ss.IsPaused()
+	st.Animation.Speed = ss.Speed()
+	st.Nameplate.WMaxW = ss.wmaxW
+
+	m := &st.Measurements
+	m.W_W = signed(b.M103Base+sunspec.M103_W, b.M103Base+sunspec.M103_W_SF)
+	m.V_V = unsigned(b.M103Base+sunspec.M103_PhVphA, b.M103Base+sunspec.M103_V_SF)
+	m.Hz_Hz = unsigned(b.M103Base+sunspec.M103_Hz, b.M103Base+sunspec.M103_Hz_SF)
+	m.VA_VA = signed(b.M103Base+sunspec.M103_VA, b.M103Base+sunspec.M103_VA_SF)
+	m.VAr_var = signed(b.M103Base+sunspec.M103_VAr, b.M103Base+sunspec.M103_VAr_SF)
+	m.PF = signed(b.M103Base+sunspec.M103_PF, b.M103Base+sunspec.M103_PF_SF) / 100.0
+	m.DCV_V = unsigned(b.M103Base+sunspec.M103_DCV, b.M103Base+sunspec.M103_DCV_SF)
+	m.DCW_W = signed(b.M103Base+sunspec.M103_DCW, b.M103Base+sunspec.M103_DCW_SF)
+	m.TmpCab_C = signed(b.M103Base+sunspec.M103_TmpCab, b.M103Base+sunspec.M103_Tmp_SF)
+	m.St = int(r.Get(b.M103Base + sunspec.M103_St))
+	m.StText = solarStateText(m.St)
+
+	c := &st.Controls
+	c.WMaxLimPct_pct = signed(b.M123Base+sunspec.M123_WMaxLimPct, b.M123Base+sunspec.M123_WMaxLimPct_SF) / 100.0
+	c.WMaxLimPctEna = int(r.Get(b.M123Base + sunspec.M123_WMaxLimPct_Ena))
+	c.Conn = int(r.Get(b.M123Base + sunspec.M123_Conn))
+
+	return st
+}
+
+// Registers returns the raw SunSpec register contents for the debug panel.
+// Returns a map of "decimal_address" → uint16 value covering all model blocks.
+func (ss *SolarServer) Registers() map[string]uint16 {
+	out := make(map[string]uint16)
+	base := uint16(sunspec.SunSpecBase)
+	// Cover the entire solar layout: 40000–40254
+	for addr := base; addr <= base+254; addr++ {
+		v := ss.Regs.Get(addr)
+		if v != 0 {
+			out[fmt.Sprintf("%d", addr)] = v
+		}
+	}
+	return out
+}
+
+// Inject overrides one or more measurement or control fields.
+// Accepted JSON keys: "W_W", "V_V", "Hz_Hz", "DCV_V", "TmpCab_C",
+// "WMaxLimPct_pct" (0–100), "Conn" (0 or 1), "St" (1–8).
+//
+// Calling Inject does not automatically pause the animation; use
+// POST /control {"cmd":"pause"} first if you want values to persist.
+func (ss *SolarServer) Inject(body []byte) error {
+	var fields map[string]float64
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return fmt.Errorf("inject: %w", err)
+	}
+	r := ss.Regs
+	b := ss.bases
+	sf := func(addr uint16) int16 { return int16(r.Get(addr)) }
+
+	for key, val := range fields {
+		switch key {
+		case "W_W":
+			r.Set(b.M103Base+sunspec.M103_W,
+				sunspec.RawFromScaleSigned(val, sf(b.M103Base+sunspec.M103_W_SF)))
+		case "V_V":
+			v10 := uint16(math.Round(val * 10))
+			r.Set(b.M103Base+sunspec.M103_PhVphA, v10)
+			r.Set(b.M103Base+sunspec.M103_PhVphB, v10)
+			r.Set(b.M103Base+sunspec.M103_PhVphC, v10)
+		case "Hz_Hz":
+			r.Set(b.M103Base+sunspec.M103_Hz,
+				sunspec.RawFromScaleUint(val, sf(b.M103Base+sunspec.M103_Hz_SF)))
+		case "DCV_V":
+			r.Set(b.M103Base+sunspec.M103_DCV,
+				sunspec.RawFromScaleUint(val, sf(b.M103Base+sunspec.M103_DCV_SF)))
+		case "TmpCab_C":
+			r.Set(b.M103Base+sunspec.M103_TmpCab,
+				sunspec.RawFromScaleSigned(val, sf(b.M103Base+sunspec.M103_Tmp_SF)))
+		case "WMaxLimPct_pct":
+			r.Set(b.M123Base+sunspec.M123_WMaxLimPct,
+				sunspec.RawFromScaleSigned(val*100, sf(b.M123Base+sunspec.M123_WMaxLimPct_SF)))
+		case "Conn":
+			r.Set(b.M123Base+sunspec.M123_Conn, uint16(val))
+		case "St":
+			r.Set(b.M103Base+sunspec.M103_St, uint16(val))
+		default:
+			return fmt.Errorf("inject: unknown field %q", key)
+		}
+	}
+	return nil
+}
+
+func solarStateText(st int) string {
+	switch st {
+	case 1:
+		return "off"
+	case 2:
+		return "sleeping"
+	case 3:
+		return "starting"
+	case 4:
+		return "MPPT"
+	case 5:
+		return "throttled"
+	case 6:
+		return "shutting_down"
+	case 7:
+		return "fault"
+	case 8:
+		return "standby"
+	default:
+		return fmt.Sprintf("unknown(%d)", st)
+	}
+}
+
+// ── populate ──────────────────────────────────────────────────────────────────
+
+// populateSolar writes the full solar inverter register layout into r and
+// returns the data-start addresses for each model block.
+func populateSolar(r *RegisterMap, wmaxW float64) SolarBases {
 	sfN := func(v int16) uint16 { return uint16(v) }
 	base := sunspec.SunSpecBase
 
@@ -94,7 +275,7 @@ func populateSolar(r *RegisterMap, wmaxW float64) (m103Base, m122Base uint16) {
 	r.Set(m120+sunspec.M120_VARtg, uint16(wmaxW*1.05))
 	r.Set(m120+sunspec.M120_VArRtgQ1, uint16(int16(wmaxW*0.44)))
 	r.Set(m120+sunspec.M120_ARtg, uint16(wmaxW/240))
-	r.Set(m120+sunspec.M120_PFRtgQ1, uint16(int16(9500))) // 0.95 (sf=-2)
+	r.Set(m120+sunspec.M120_PFRtgQ1, uint16(int16(9500)))
 	r.Set(m120+sunspec.M120_W_SF, 0)
 	r.Set(m120+sunspec.M120_VARtg_SF, 0)
 	r.Set(m120+sunspec.M120_VArRtg_SF, 0)
@@ -106,17 +287,17 @@ func populateSolar(r *RegisterMap, wmaxW float64) (m103Base, m122Base uint16) {
 	const m121Len = 30
 	r.Set(cursor, sunspec.ModelBasicSettings)
 	r.Set(cursor+1, m121Len)
-	m121 := cursor + 2
-	r.Set(m121+sunspec.M121_WMax, uint16(wmaxW))
-	r.Set(m121+sunspec.M121_WMax_SF, 0)
+	m121Base := cursor + 2
+	r.Set(m121Base+sunspec.M121_WMax, uint16(wmaxW))
+	r.Set(m121Base+sunspec.M121_WMax_SF, 0)
 	cursor += 2 + m121Len
 
 	// Model 122 (Extended Measurements) — 44 data regs
 	r.Set(cursor, uint16(122))
 	r.Set(cursor+1, sunspec.M122Len)
-	m122Base = cursor + 2
-	r.Set(m122Base+sunspec.M122_ECPConn, 1) // grid-connected
-	r.Set(m122Base+sunspec.M122_PVConn, 1)  // PV strings connected
+	m122Base := cursor + 2
+	r.Set(m122Base+sunspec.M122_ECPConn, 1)
+	r.Set(m122Base+sunspec.M122_PVConn, 1)
 	r.Set(m122Base+sunspec.M122_WAval, uint16(wmaxW))
 	r.Set(m122Base+sunspec.M122_WAval_SF, 0)
 	cursor += 2 + sunspec.M122Len
@@ -125,14 +306,14 @@ func populateSolar(r *RegisterMap, wmaxW float64) (m103Base, m122Base uint16) {
 	const m103Len = 50
 	r.Set(cursor, sunspec.ModelInverterThreePh)
 	r.Set(cursor+1, m103Len)
-	m103Base = cursor + 2
+	m103Base := cursor + 2
 	r.Set(m103Base+sunspec.M103_W, uint16(int16(3000)))
 	r.Set(m103Base+sunspec.M103_W_SF, 0)
-	r.Set(m103Base+sunspec.M103_PhVphA, 2400) // 240.0 V (sf=-1)
+	r.Set(m103Base+sunspec.M103_PhVphA, 2400)
 	r.Set(m103Base+sunspec.M103_PhVphB, 2400)
 	r.Set(m103Base+sunspec.M103_PhVphC, 2400)
 	r.Set(m103Base+sunspec.M103_V_SF, sfN(-1))
-	r.Set(m103Base+sunspec.M103_Hz, 6000) // 60.00 Hz (sf=-2)
+	r.Set(m103Base+sunspec.M103_Hz, 6000)
 	r.Set(m103Base+sunspec.M103_Hz_SF, sfN(-2))
 	r.Set(m103Base+sunspec.M103_VA, uint16(int16(3100)))
 	r.Set(m103Base+sunspec.M103_VA_SF, 0)
@@ -140,42 +321,46 @@ func populateSolar(r *RegisterMap, wmaxW float64) (m103Base, m122Base uint16) {
 	r.Set(m103Base+sunspec.M103_VAr_SF, 0)
 	r.Set(m103Base+sunspec.M103_PF, uint16(int16(9677)))
 	r.Set(m103Base+sunspec.M103_PF_SF, sfN(-2))
-	r.Set(m103Base+sunspec.M103_DCV, 3800) // 380.0 V (sf=-1)
+	r.Set(m103Base+sunspec.M103_DCV, 3800)
 	r.Set(m103Base+sunspec.M103_DCV_SF, sfN(-1))
 	r.Set(m103Base+sunspec.M103_DCW, uint16(int16(3180)))
 	r.Set(m103Base+sunspec.M103_DCW_SF, 0)
-	r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(470))) // 47.0 °C (sf=-1)
+	r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(470)))
 	r.Set(m103Base+sunspec.M103_Tmp_SF, sfN(-1))
-	r.Set(m103Base+sunspec.M103_St, 4) // MPPT
+	r.Set(m103Base+sunspec.M103_St, 4)
 	cursor += 2 + m103Len
 
 	// Model 123 (Immediate Controls) — 23 data regs
 	const m123Len = 23
 	r.Set(cursor, sunspec.ModelImmediateCtrl)
 	r.Set(cursor+1, m123Len)
-	m123 := cursor + 2
-	r.Set(m123+sunspec.M123_WMaxLimPct, 10000) // 100.00% (sf=-2)
-	r.Set(m123+sunspec.M123_WMaxLimPct_Ena, 1)
-	r.Set(m123+sunspec.M123_WMaxLimPct_SF, sfN(-2))
-	r.Set(m123+sunspec.M123_Conn, 1)
+	m123Base := cursor + 2
+	r.Set(m123Base+sunspec.M123_WMaxLimPct, 10000)
+	r.Set(m123Base+sunspec.M123_WMaxLimPct_Ena, 1)
+	r.Set(m123Base+sunspec.M123_WMaxLimPct_SF, sfN(-2))
+	r.Set(m123Base+sunspec.M123_Conn, 1)
 	cursor += 2 + m123Len
 
-	// End marker
 	r.Set(cursor, sunspec.EndMarker)
 	r.Set(cursor+1, 0)
-	return
+
+	return SolarBases{
+		M121Base: m121Base,
+		M122Base: m122Base,
+		M103Base: m103Base,
+		M123Base: m123Base,
+	}
 }
 
-// animateSolar updates Model 103 and Model 122 WAval every 5 seconds.
-// All values are derived from a 600-second sinusoidal irradiance cycle.
-func animateSolar(r *RegisterMap, wmaxW float64, m103Base, m122Base uint16, stop <-chan struct{}) {
+// ── animation ─────────────────────────────────────────────────────────────────
+
+func animateSolar(s *Server, r *RegisterMap, wmaxW float64, m103Base, m122Base uint16, stop <-chan struct{}) {
 	sfN := func(v int16) uint16 { return uint16(v) }
 	_ = sfN
 
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 
-	// Accumulated energy counter (simplified, wraps as uint16).
 	var whAcc uint16
 
 	for {
@@ -183,62 +368,53 @@ func animateSolar(r *RegisterMap, wmaxW float64, m103Base, m122Base uint16, stop
 		case <-stop:
 			return
 		case <-tick.C:
-			t := float64(time.Now().Unix())
+			if s.IsPaused() {
+				continue
+			}
+			t := s.simTime()
 
-			// Irradiance: 0.05–0.95 × WMax on a 600-second sine cycle.
 			irr := math.Max(0.05, math.Min(0.95, 0.5+0.45*math.Sin(2*math.Pi*t/600)))
 			w := wmaxW * irr
 
-			// Grid voltage: ±2 V, 73-second period.
 			v := 240.0 + 2.0*math.Sin(2*math.Pi*t/73)
-			// Frequency: ±0.05 Hz, 47-second period.
 			hz := 60.0 + 0.05*math.Sin(2*math.Pi*t/47)
-			// Power factor varies slightly.
 			pf := math.Max(0.90, math.Min(0.99, 0.97+0.02*math.Sin(2*math.Pi*t/120)))
 			va := w / pf
 			varPwr := va * math.Sin(math.Acos(pf))
-			// Cabinet temperature: 35–55 °C proportional to output.
 			tmp := 35.0 + 20.0*irr
-			// DC bus voltage tracks irradiance (350–410 V).
 			dcv := 380.0 + 30.0*math.Sin(2*math.Pi*t/600)
 			dcw := w * 1.06
-
-			// Phase currents (A, sf=0, rounded).
 			iph := w / (v * 3)
 
-			// Model 103 updates (scale factors are written once in populateSolar
-			// and never change; we update only the measurement registers here).
 			r.Set(m103Base+sunspec.M103_A, uint16(int16(math.Round(iph*3))))
 			r.Set(m103Base+sunspec.M103_AphA, uint16(int16(math.Round(iph))))
 			r.Set(m103Base+sunspec.M103_AphB, uint16(int16(math.Round(iph))))
 			r.Set(m103Base+sunspec.M103_AphC, uint16(int16(math.Round(iph))))
-			r.Set(m103Base+sunspec.M103_PhVphA, uint16(math.Round(v*10))) // sf=-1
+			r.Set(m103Base+sunspec.M103_PhVphA, uint16(math.Round(v*10)))
 			r.Set(m103Base+sunspec.M103_PhVphB, uint16(math.Round(v*10)))
 			r.Set(m103Base+sunspec.M103_PhVphC, uint16(math.Round(v*10)))
 			r.Set(m103Base+sunspec.M103_PPVphAB, uint16(math.Round(v*10*math.Sqrt(3))))
 			r.Set(m103Base+sunspec.M103_PPVphBC, uint16(math.Round(v*10*math.Sqrt(3))))
 			r.Set(m103Base+sunspec.M103_PPVphCA, uint16(math.Round(v*10*math.Sqrt(3))))
 			r.Set(m103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
-			r.Set(m103Base+sunspec.M103_Hz, uint16(math.Round(hz*100))) // sf=-2
+			r.Set(m103Base+sunspec.M103_Hz, uint16(math.Round(hz*100)))
 			r.Set(m103Base+sunspec.M103_VA, uint16(int16(math.Round(va))))
 			r.Set(m103Base+sunspec.M103_VAr, uint16(int16(math.Round(varPwr))))
-			r.Set(m103Base+sunspec.M103_PF, uint16(int16(math.Round(pf*10000)))) // ×100, sf=-2
-			r.Set(m103Base+sunspec.M103_DCV, uint16(math.Round(dcv*10))) // sf=-1
+			r.Set(m103Base+sunspec.M103_PF, uint16(int16(math.Round(pf*10000))))
+			r.Set(m103Base+sunspec.M103_DCV, uint16(math.Round(dcv*10)))
 			r.Set(m103Base+sunspec.M103_DCW, uint16(int16(math.Round(dcw))))
-			r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10)))) // sf=-1
+			r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10))))
 			r.Set(m103Base+sunspec.M103_TmpSnk, uint16(int16(math.Round((tmp-5)*10))))
 
-			// Operating state: MPPT(4) when producing, Sleeping(2) at minimum.
 			if irr < 0.06 {
-				r.Set(m103Base+sunspec.M103_St, 2) // sleeping
+				r.Set(m103Base+sunspec.M103_St, 2)
 			} else {
-				r.Set(m103Base+sunspec.M103_St, 4) // MPPT
+				r.Set(m103Base+sunspec.M103_St, 4)
 			}
 
-			// Model 122: update WAval (available power) and accumulated energy.
 			r.Set(m122Base+sunspec.M122_WAval, uint16(math.Round(w)))
-			whAcc += uint16(math.Round(w * 5 / 3600)) // 5-second interval in Wh
-			r.Set(m122Base+sunspec.M122_ActWh+3, whAcc) // low word of uint64
+			whAcc += uint16(math.Round(w * 5 / 3600))
+			r.Set(m122Base+sunspec.M122_ActWh+3, whAcc)
 		}
 	}
 }

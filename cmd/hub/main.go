@@ -52,6 +52,7 @@ import (
 	"csip-tls-test/internal/southbound/battery"
 	"csip-tls-test/internal/southbound/device"
 	"csip-tls-test/internal/southbound/inverter"
+	"csip-tls-test/internal/southbound/meter"
 	"csip-tls-test/internal/southbound/registry"
 	"csip-tls-test/internal/tlsclient"
 	"csip-tls-test/internal/wolfssl"
@@ -167,8 +168,10 @@ func openDevice(dc DeviceConfig) (device.Device, error) {
 		return inverter.New(dc.URL, 5*time.Second, dc.UnitID)
 	case "battery":
 		return battery.New(dc.URL, 5*time.Second, dc.UnitID)
+	case "meter", "load":
+		return meter.New(dc.URL, 5*time.Second, dc.UnitID)
 	default:
-		return nil, fmt.Errorf("unknown role %q (supported: inverter, battery)", dc.Role)
+		return nil, fmt.Errorf("unknown role %q (supported: inverter, battery, meter, load)", dc.Role)
 	}
 }
 

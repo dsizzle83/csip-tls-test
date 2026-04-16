@@ -157,17 +157,39 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 func (s *Server) handleRequest(ssl unsafe.Pointer, peerLFDI string) {
-	raw := readHTTPMessage(ssl)
-	if len(raw) == 0 {
+	if s.Handler == nil {
+		// Legacy static router: one request per connection (backward compat).
+		raw := readHTTPMessage(ssl)
+		if len(raw) > 0 {
+			_, _ = wolfssl.Write(ssl, route(raw))
+		}
 		return
 	}
-	var resp []byte
-	if s.Handler != nil {
-		resp = dispatchHTTP(s.Handler, raw, peerLFDI)
-	} else {
-		resp = route(raw)
+
+	// Persistent-connection loop for real handlers.
+	// Exits when the client sends Connection: close, disconnects, or an
+	// I/O error occurs.
+	for {
+		raw := readHTTPMessage(ssl)
+		if len(raw) == 0 {
+			return // client closed connection
+		}
+		connClose := requestWantsClose(raw)
+		resp := dispatchHTTP(s.Handler, raw, peerLFDI, connClose)
+		if _, err := wolfssl.Write(ssl, resp); err != nil {
+			return
+		}
+		if connClose {
+			return
+		}
 	}
-	_, _ = wolfssl.Write(ssl, resp)
+}
+
+// requestWantsClose returns true when the HTTP request contains a
+// Connection: close header. HTTP/1.1 defaults to keep-alive, so the
+// absence of this header means the client wants to reuse the connection.
+func requestWantsClose(raw []byte) bool {
+	return bytes.Contains(bytes.ToLower(raw), []byte("connection: close"))
 }
 
 // readHTTPMessage reads a complete HTTP request from an open wolfSSL session.

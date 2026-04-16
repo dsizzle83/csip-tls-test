@@ -2,6 +2,7 @@ package tlsclient
 
 import (
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -87,4 +88,41 @@ func goodClientConfig(addr string) Config {
 		ClientCertPath: testdataPath("certs/client-cert.pem"),
 		ClientKeyPath:  testdataPath("certs/client-key.pem"),
 	}
+}
+
+// startInProcessServerWithHandler brings up a tlsserver.Server with a
+// custom http.Handler for testing persistent-connection scenarios.
+func startInProcessServerWithHandler(t *testing.T, h http.Handler) (addr string) {
+	t.Helper()
+
+	srv, err := tlsserver.New(tlsserver.Config{
+		CACertPath:     testdataPath("certs/ca-cert.pem"),
+		ServerCertPath: testdataPath("certs/server-cert.pem"),
+		ServerKeyPath:  testdataPath("certs/server-key.pem"),
+	})
+	if err != nil {
+		t.Fatalf("tlsserver.New: %v", err)
+	}
+	srv.Handler = h
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		srv.Close()
+		t.Fatalf("Listen: %v", err)
+	}
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.Serve(lis)
+	}()
+
+	t.Cleanup(func() {
+		_ = lis.Close()
+		if err := <-serveErr; err != nil {
+			t.Errorf("Serve returned error: %v", err)
+		}
+		srv.Close()
+	})
+
+	return lis.Addr().String()
 }

@@ -41,9 +41,9 @@ func route(request []byte) []byte {
 // dispatchHTTP bridges a raw wolfSSL request buffer to an http.Handler.
 // It parses the HTTP request, injects the peer LFDI as X-Peer-LFDI,
 // captures the handler's response via a buffered ResponseWriter, then
-// serialises the result back to raw bytes for wolfssl.Write. Only one
-// round-trip per connection is supported (Connection: close).
-func dispatchHTTP(h http.Handler, raw []byte, peerLFDI string) []byte {
+// serialises the result back to raw bytes for wolfssl.Write.
+// connClose mirrors the client's Connection header back in the response.
+func dispatchHTTP(h http.Handler, raw []byte, peerLFDI string, connClose bool) []byte {
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
 	if err != nil {
 		return httpResponse(400, "text/plain", []byte("bad request"))
@@ -56,7 +56,7 @@ func dispatchHTTP(h http.Handler, raw []byte, peerLFDI string) []byte {
 		statusCode: http.StatusOK,
 	}
 	h.ServeHTTP(w, req)
-	return buildHTTPResponse(w.statusCode, w.header, w.body.Bytes())
+	return buildHTTPResponse(w.statusCode, w.header, w.body.Bytes(), connClose)
 }
 
 // bufferedResponseWriter captures an http.Handler's response so it can
@@ -85,7 +85,7 @@ func (w *bufferedResponseWriter) WriteHeader(code int) {
 }
 
 // hopByHopHeaders lists headers that must not be forwarded end-to-end.
-// wolfSSL connections are always Connection: close, so we own these.
+// Connection management headers are owned by this layer.
 var hopByHopHeaders = map[string]bool{
 	"connection":          true,
 	"keep-alive":          true,
@@ -101,8 +101,10 @@ var hopByHopHeaders = map[string]bool{
 
 // buildHTTPResponse serializes an HTTP response from status, headers, and body.
 // Forwards all response headers set by the handler except hop-by-hop headers;
-// always appends Content-Length and Connection: close.
-func buildHTTPResponse(status int, headers http.Header, body []byte) []byte {
+// always appends Content-Length. Sends Connection: keep-alive when connClose
+// is false (the normal persistent-connection case) or Connection: close when
+// the client requested close or the session is ending.
+func buildHTTPResponse(status int, headers http.Header, body []byte, connClose bool) []byte {
 	statusText := map[int]string{
 		200: "OK",
 		201: "Created",
@@ -128,7 +130,11 @@ func buildHTTPResponse(status int, headers http.Header, body []byte) []byte {
 		}
 	}
 	fmt.Fprintf(&sb, "Content-Length: %d\r\n", len(body))
-	fmt.Fprintf(&sb, "Connection: close\r\n")
+	if connClose {
+		fmt.Fprintf(&sb, "Connection: close\r\n")
+	} else {
+		fmt.Fprintf(&sb, "Connection: keep-alive\r\n")
+	}
 	fmt.Fprintf(&sb, "\r\n")
 
 	result := []byte(sb.String())
@@ -136,11 +142,11 @@ func buildHTTPResponse(status int, headers http.Header, body []byte) []byte {
 }
 
 // httpResponse is the convenience wrapper used by route() and error paths.
-// For handler-based responses use buildHTTPResponse directly.
+// Always sends Connection: close since route is a single-request static handler.
 func httpResponse(status int, contentType string, body []byte) []byte {
 	h := make(http.Header)
 	if contentType != "" {
 		h.Set("Content-Type", contentType)
 	}
-	return buildHTTPResponse(status, h, body)
+	return buildHTTPResponse(status, h, body, true)
 }

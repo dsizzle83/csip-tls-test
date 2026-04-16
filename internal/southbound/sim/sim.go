@@ -14,6 +14,7 @@ package sim
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	modbuslib "github.com/simonvetter/modbus"
@@ -85,6 +86,51 @@ type Server struct {
 	srv  *modbuslib.ModbusServer
 	stop chan struct{} // closed by Stop to signal the animation goroutine
 	done chan struct{} // closed by animation goroutine when it exits
+
+	// Animation control. Safe for concurrent use via atomic / mutex.
+	paused atomic.Bool // when true the animation loop skips register updates
+
+	sfMu  sync.Mutex
+	speed float64 // animation speed multiplier (0 / negative → treated as 1.0)
+}
+
+// Pause suspends the animation without stopping the Modbus server.
+// Register values are frozen at their current state.
+func (s *Server) Pause() { s.paused.Store(true) }
+
+// Resume resumes a paused animation.
+func (s *Server) Resume() { s.paused.Store(false) }
+
+// IsPaused returns true when the animation is currently paused.
+func (s *Server) IsPaused() bool { return s.paused.Load() }
+
+// SetSpeed sets the animation speed multiplier.  A value of 1.0 (default) is
+// real-time; 10.0 runs the simulation 10× faster (600 s cycle in 60 s).
+// Values ≤ 0 reset to 1.0.
+func (s *Server) SetSpeed(f float64) {
+	if f <= 0 {
+		f = 1.0
+	}
+	s.sfMu.Lock()
+	s.speed = f
+	s.sfMu.Unlock()
+}
+
+// Speed returns the current animation speed multiplier.
+func (s *Server) Speed() float64 {
+	s.sfMu.Lock()
+	f := s.speed
+	s.sfMu.Unlock()
+	if f <= 0 {
+		return 1.0
+	}
+	return f
+}
+
+// simTime returns the effective simulation time: Unix seconds × speed factor.
+// All animation formulas should use this instead of time.Now().Unix() directly.
+func (s *Server) simTime() float64 {
+	return float64(time.Now().Unix()) * s.Speed()
 }
 
 // NewServer creates and starts a static SunSpec inverter simulator on

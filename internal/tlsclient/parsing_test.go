@@ -14,7 +14,7 @@ func TestBuildGetRequest_Format(t *testing.T) {
 		"GET /dcap HTTP/1.1\r\n",
 		"Host: 192.168.0.188:11111\r\n",
 		"Accept: application/sep+xml\r\n",
-		"Connection: close\r\n",
+		"Connection: keep-alive\r\n",
 		"\r\n\r\n", // header terminator
 	} {
 		if !strings.Contains(req, want) {

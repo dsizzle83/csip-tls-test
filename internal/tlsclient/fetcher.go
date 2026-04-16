@@ -1,15 +1,22 @@
 package tlsclient
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
-// WolfSSLFetcher implements the discovery.Fetcher interface using
-// wolfSSL mTLS. The wolfSSL context — cert loading and cipher
-// configuration — is created once in NewWolfSSLFetcher and reused
-// across calls. Each Get opens a fresh TLS session, performs one HTTP
-// request, then closes the session (the "redial per request" strategy).
-// Persistent connections are deferred to a later milestone.
+// WolfSSLFetcher implements discovery.Fetcher using wolfSSL mTLS.
+//
+// The wolfSSL context (cert loading and cipher config) is created once
+// in NewWolfSSLFetcher and reused for the lifetime of the fetcher.
+//
+// Persistent connection: the fetcher keeps a single TLS session alive
+// across multiple Get/Post calls, redialing automatically when the
+// server closes the connection or on any I/O error. A mutex serializes
+// requests so the session is never used concurrently.
 type WolfSSLFetcher struct {
 	client *Client
+	mu     sync.Mutex
 }
 
 // NewWolfSSLFetcher allocates a wolfSSL context configured for CSIP mTLS.
@@ -28,27 +35,100 @@ func (f *WolfSSLFetcher) Free() {
 	f.client.Free()
 }
 
-// Get performs a single HTTP GET over a fresh wolfSSL mTLS session and
-// returns the response body. The TLS session is opened and closed within
-// this call. Status must be 200 and Content-Type must be
-// application/sep+xml (GEN.003); any other response is returned as an error.
-//
-// Post performs a single HTTP POST over a fresh wolfSSL mTLS session.
-// Returns the response body and Location header (for 201 Created).
-// Accepts 201 and 204; any other status is an error.
-func (f *WolfSSLFetcher) Post(path string, body []byte, contentType string) ([]byte, string, error) {
-	if err := f.client.Dial(); err != nil {
-		return nil, "", fmt.Errorf("dial: %w", err)
+// ensureDialed dials if not currently connected. Must be called with f.mu held.
+func (f *WolfSSLFetcher) ensureDialed() error {
+	if f.client.ssl != nil {
+		return nil
 	}
-	defer f.client.Close()
+	return f.client.Dial()
+}
 
-	raw, err := f.client.Post(path, body, contentType)
+// doGet executes one GET, reconnecting once on failure. f.mu must be held.
+func (f *WolfSSLFetcher) doGet(path string) (*HTTPResponse, error) {
+	if err := f.ensureDialed(); err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	raw, err := f.client.Get(path)
 	if err != nil {
-		return nil, "", err
+		// Stale connection — close and retry once.
+		f.client.Close()
+		if err2 := f.client.Dial(); err2 != nil {
+			return nil, fmt.Errorf("redial: %w", err2)
+		}
+		raw, err = f.client.Get(path)
+		if err != nil {
+			f.client.Close()
+			return nil, err
+		}
 	}
 	resp, err := parseHTTPResponse(raw)
 	if err != nil {
-		return nil, "", fmt.Errorf("parse response from %s: %w", path, err)
+		return nil, fmt.Errorf("parse response from %s: %w", path, err)
+	}
+	// Server sent Connection: close — preemptively close so the next
+	// call triggers a fresh dial rather than writing on a dead socket.
+	if resp.ConnClose {
+		f.client.Close()
+	}
+	return resp, nil
+}
+
+// doPost executes one POST, reconnecting once on failure. f.mu must be held.
+func (f *WolfSSLFetcher) doPost(path string, body []byte, contentType string) (*HTTPResponse, error) {
+	if err := f.ensureDialed(); err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	raw, err := f.client.Post(path, body, contentType)
+	if err != nil {
+		f.client.Close()
+		if err2 := f.client.Dial(); err2 != nil {
+			return nil, fmt.Errorf("redial: %w", err2)
+		}
+		raw, err = f.client.Post(path, body, contentType)
+		if err != nil {
+			f.client.Close()
+			return nil, err
+		}
+	}
+	resp, err := parseHTTPResponse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse response from %s: %w", path, err)
+	}
+	if resp.ConnClose {
+		f.client.Close()
+	}
+	return resp, nil
+}
+
+// Get satisfies discovery.Fetcher. Returns the response body on 200 with
+// Content-Type application/sep+xml; any other status/type is an error.
+func (f *WolfSSLFetcher) Get(path string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	resp, err := f.doGet(path)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("GET %s: status %d", path, resp.StatusCode)
+	}
+	if resp.ContentType != "application/sep+xml" {
+		return nil, fmt.Errorf("GET %s: Content-Type %q, want application/sep+xml (GEN.003)", path, resp.ContentType)
+	}
+	return resp.Body, nil
+}
+
+// Post performs a single HTTP POST over the persistent wolfSSL session.
+// Returns the response body and Location header (for 201 Created).
+// Accepts 201 and 204; any other status is an error.
+func (f *WolfSSLFetcher) Post(path string, body []byte, contentType string) ([]byte, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	resp, err := f.doPost(path, body, contentType)
+	if err != nil {
+		return nil, "", err
 	}
 	if resp.StatusCode != 201 && resp.StatusCode != 204 {
 		return nil, "", fmt.Errorf("POST %s: status %d", path, resp.StatusCode)
@@ -60,43 +140,12 @@ func (f *WolfSSLFetcher) Post(path string, body []byte, contentType string) ([]b
 // enforcing that it must be 200. Used by conformance tests that need to
 // verify the server correctly returns 404, 405, etc.
 func (f *WolfSSLFetcher) GetStatus(path string) (int, []byte, error) {
-	if err := f.client.Dial(); err != nil {
-		return 0, nil, fmt.Errorf("dial: %w", err)
-	}
-	defer f.client.Close()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
-	raw, err := f.client.Get(path)
+	resp, err := f.doGet(path)
 	if err != nil {
 		return 0, nil, err
 	}
-	resp, err := parseHTTPResponse(raw)
-	if err != nil {
-		return 0, nil, fmt.Errorf("parse response from %s: %w", path, err)
-	}
 	return resp.StatusCode, resp.Body, nil
-}
-
-// Get satisfies discovery.Fetcher.
-func (f *WolfSSLFetcher) Get(path string) ([]byte, error) {
-	if err := f.client.Dial(); err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
-	}
-	defer f.client.Close()
-
-	raw, err := f.client.Get(path)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := parseHTTPResponse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parse response from %s: %w", path, err)
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("GET %s: status %d", path, resp.StatusCode)
-	}
-	if resp.ContentType != "application/sep+xml" {
-		return nil, fmt.Errorf("GET %s: Content-Type %q, want application/sep+xml (GEN.003)", path, resp.ContentType)
-	}
-	return resp.Body, nil
 }

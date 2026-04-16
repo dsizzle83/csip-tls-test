@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"csip-tls-test/internal/csip/discovery"
+	"csip-tls-test/internal/csip/dnssd"
 	"csip-tls-test/internal/csip/identity"
 	"csip-tls-test/internal/tlsclient"
 	"csip-tls-test/internal/wolfssl"
@@ -16,19 +19,67 @@ import (
 
 func main() {
 	var (
-		serverAddr = flag.String("server", "192.168.0.188:11111", "server address:port")
-		caCert     = flag.String("ca", "/home/dmitri/csip-tls-test/certs/ca-cert.pem", "CA cert PEM path")
-		clientCert = flag.String("cert", "/home/dmitri/csip-tls-test/certs/client-cert.pem", "client cert PEM path")
-		clientKey  = flag.String("key", "/home/dmitri/csip-tls-test/certs/client-key.pem", "client key PEM path")
-		lfdi       = flag.String("lfdi", "", "client LFDI (hex, from cert); if empty, derived from -cert")
+		serverAddr      = flag.String("server", "", "server address:port (empty = use DNS-SD discovery)")
+		caCert          = flag.String("ca", "/home/dmitri/csip-tls-test/certs/ca-cert.pem", "CA cert PEM path")
+		clientCert      = flag.String("cert", "/home/dmitri/csip-tls-test/certs/client-cert.pem", "client cert PEM path")
+		clientKey       = flag.String("key", "/home/dmitri/csip-tls-test/certs/client-key.pem", "client key PEM path")
+		lfdi            = flag.String("lfdi", "", "client LFDI (hex); if empty, derived from -cert")
+		discoverTimeout = flag.Duration("discover-timeout", 8*time.Second, "DNS-SD browse timeout when --server is empty")
 	)
 	flag.Parse()
 
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
 
+	// ── Server address resolution ──────────────────────────────────────────
+	// If --server is not provided, use DNS-SD to find an IEEE 2030.5 server
+	// advertising _ieee2030._tls._tcp on the local network.
+	addr := *serverAddr
+	dcapPath := "/dcap"
+
+	if addr == "" {
+		log.Printf("No --server specified; browsing for %s via mDNS (timeout: %s)…",
+			dnssd.ServiceType, *discoverTimeout)
+
+		ctx, cancel := context.WithTimeout(context.Background(), *discoverTimeout)
+		defer cancel()
+
+		servers, err := dnssd.Browse(ctx)
+		if err != nil {
+			log.Fatalf("DNS-SD browse: %v", err)
+		}
+		if len(servers) == 0 {
+			log.Fatalf("DNS-SD: no %s servers found within %s\n"+
+				"  Hint: pass --server host:port to skip discovery",
+				dnssd.ServiceType, *discoverTimeout)
+		}
+
+		// Use the first server found (lowest mDNS priority).
+		chosen := servers[0]
+		log.Printf("DNS-SD: discovered %q at %s (dcap=%s)",
+			chosen.Instance, chosen.Addr(), chosen.DCAPPath)
+		if len(servers) > 1 {
+			log.Printf("DNS-SD: %d additional server(s) found; using first match", len(servers)-1)
+		}
+		addr = chosen.Addr()
+		dcapPath = chosen.DCAPPath
+	}
+
+	// ── LFDI ───────────────────────────────────────────────────────────────
+	var err error
+	clientLFDI := *lfdi
+	if clientLFDI == "" {
+		clientLFDI, err = lfdiFromCertFile(*clientCert)
+		if err != nil {
+			log.Fatalf("derive LFDI from cert: %v", err)
+		}
+	}
+	log.Printf("Client LFDI: %s", clientLFDI)
+	log.Printf("Connecting to %s…", addr)
+
+	// ── Fetcher (persistent mTLS session) ──────────────────────────────────
 	fetcher, err := tlsclient.NewWolfSSLFetcher(tlsclient.Config{
-		ServerAddr:     *serverAddr,
+		ServerAddr:     addr,
 		CACertPath:     *caCert,
 		ClientCertPath: *clientCert,
 		ClientKeyPath:  *clientKey,
@@ -38,25 +89,15 @@ func main() {
 	}
 	defer fetcher.Free()
 
-	// Derive LFDI from cert if not provided on the command line.
-	clientLFDI := *lfdi
-	if clientLFDI == "" {
-		clientLFDI, err = lfdiFromCertFile(*clientCert)
-		if err != nil {
-			log.Fatalf("derive LFDI from cert: %v", err)
-		}
-	}
-	log.Printf("Client LFDI: %s", clientLFDI)
-	log.Printf("Connecting to %s...", *serverAddr)
-
+	// ── Discovery walk ─────────────────────────────────────────────────────
 	walker := discovery.NewWalker(fetcher, clientLFDI)
-	tree, err := walker.Discover("/dcap")
+	tree, err := walker.Discover(dcapPath)
 	if err != nil {
 		log.Fatalf("discovery walk: %v", err)
 	}
 
-	// ── Results ───────────────────────────────────────────────────
-	fmt.Printf("✓ mTLS handshake: ECDHE-ECDSA-AES128-CCM-8 TLSv1.2 (server=%s)\n", *serverAddr)
+	// ── Results ────────────────────────────────────────────────────────────
+	fmt.Printf("✓ mTLS handshake: ECDHE-ECDSA-AES128-CCM-8 TLSv1.2 (server=%s)\n", addr)
 
 	if tree.DeviceCapability != nil {
 		fmt.Printf("✓ DeviceCapability fetched (href=%s, pollRate=%d)\n",

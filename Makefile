@@ -38,6 +38,18 @@ build-batsim:
 	@mkdir -p bin
 	go build -o bin/batsim ./cmd/batsim
 
+build-metersim:
+	@mkdir -p bin
+	go build -o bin/metersim ./cmd/metersim
+
+build-loadsim:
+	@mkdir -p bin
+	go build -o bin/loadsim ./cmd/loadsim
+
+build-evsim:
+	@mkdir -p bin
+	go build -o bin/evsim ./cmd/evsim
+
 # Hub uses wolfSSL (cgo) — must be built natively on Pi.
 # Use sync-hub-pi to sync and build on the Pi in one step.
 build-hub:

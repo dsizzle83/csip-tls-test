@@ -13,7 +13,7 @@ func buildGetRequest(path, host string) []byte {
 		"GET %s HTTP/1.1\r\n"+
 			"Host: %s\r\n"+
 			"Accept: application/sep+xml\r\n"+
-			"Connection: close\r\n"+
+			"Connection: keep-alive\r\n"+
 			"\r\n",
 		path, host))
 }
@@ -25,7 +25,7 @@ func buildPostRequest(path, host string, body []byte, contentType string) []byte
 			"Host: %s\r\n"+
 			"Content-Type: %s\r\n"+
 			"Content-Length: %d\r\n"+
-			"Connection: close\r\n"+
+			"Connection: keep-alive\r\n"+
 			"\r\n",
 		path, host, contentType, len(body))
 	return append([]byte(header), body...)

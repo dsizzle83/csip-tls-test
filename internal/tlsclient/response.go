@@ -11,10 +11,12 @@ import (
 // status, content-type, and body. As we add more 2030.5 features
 // (ETag, Location, etc.) those become fields here.
 type HTTPResponse struct {
-	StatusCode  int
-	ContentType string
-	Location    string // populated for 201 Created responses
-	Body        []byte
+	StatusCode    int
+	ContentType   string
+	Location      string // populated for 201 Created responses
+	ContentLength int    // -1 if header absent
+	ConnClose     bool   // true if server sent Connection: close
+	Body          []byte
 }
 
 // parseHTTPResponse parses a raw HTTP/1.1 response. Pure function with
@@ -50,8 +52,9 @@ func parseHTTPResponse(raw []byte) (*HTTPResponse, error) {
 
 	// Header lines
 	resp := &HTTPResponse{
-		StatusCode: statusCode,
-		Body:       body,
+		StatusCode:    statusCode,
+		ContentLength: -1,
+		Body:          body,
 	}
 	for _, line := range lines[1:] {
 		colon := bytes.IndexByte(line, ':')
@@ -70,6 +73,13 @@ func parseHTTPResponse(raw []byte) (*HTTPResponse, error) {
 			resp.ContentType = value
 		case "location":
 			resp.Location = value
+		case "content-length":
+			n, err := strconv.Atoi(value)
+			if err == nil {
+				resp.ContentLength = n
+			}
+		case "connection":
+			resp.ConnClose = strings.EqualFold(value, "close")
 		}
 	}
 

@@ -13,36 +13,228 @@ package sim
 //	40207–40234: Model 802 (Li-Ion Battery Base,   26 data regs)
 //	40235–40236: end marker
 //
-// Animation runs every 5 s on a 1200-second (20-minute) sinusoidal
-// charge/discharge cycle:
+// Animation runs every 5 s on a 1200-second (20-minute) sinusoidal cycle:
 //
-//	SoC    = 55 + 35·sin(2π·t/1200)          20–90 %
-//	W      = −WMax·0.8·cos(2π·t/1200)        negative=charging, positive=discharging
-//	V      = 240 + 1.5·sin(2π·t/89)          ±1.5 V
-//	Hz     = 60  + 0.03·sin(2π·t/67)         ±0.03 Hz
-//	TmpCab = 25  + 15·|W/WMax|               25–40 °C
+//	SoC = 55 + 35·sin(2π·t/1200)        20–90 %
+//	W   = −WMax·0.8·cos(2π·t/1200)      negative=charging, positive=discharging
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
 	"time"
 
 	"csip-tls-test/internal/southbound/sunspec"
 )
 
-// NewBatteryServer creates and starts an animated Li-Ion battery simulator.
-// wmaxKwh is the energy capacity (kWh); wmaxW is the max charge/discharge rate (W).
-func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*Server, error) {
-	regs := &RegisterMap{regs: make(map[uint16]uint16)}
-	m103Base, m802Base := populateBattery(regs, wmaxKwh, wmaxW)
-	return newAnimatedServer(listenURL, regs, func(r *RegisterMap, stop <-chan struct{}) {
-		animateBattery(r, wmaxW, m103Base, m802Base, stop)
-	})
+// BatteryBases holds the first data-register address of each model block.
+type BatteryBases struct {
+	M121Base uint16 // Model 121 (Basic Settings)
+	M103Base uint16 // Model 103 (Three-Phase Inverter/Converter AC)
+	M123Base uint16 // Model 123 (Immediate Controls)
+	M802Base uint16 // Model 802 (Li-Ion Battery Base)
 }
 
-// populateBattery writes the full battery register layout into r.
-// Returns the 0-based Modbus addresses of the first data registers of
-// Model 103 and Model 802.
-func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) (m103Base, m802Base uint16) {
+// BatteryServer is an animated Li-Ion battery simulator with a built-in API.
+type BatteryServer struct {
+	*Server
+	bases    BatteryBases
+	wmaxW    float64
+	wmaxKwh  float64
+}
+
+// NewBatteryServer creates and starts an animated Li-Ion battery simulator.
+// wmaxKwh is the energy capacity; wmaxW is the max charge/discharge rate.
+func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer, error) {
+	regs := &RegisterMap{regs: make(map[uint16]uint16)}
+	bases := populateBattery(regs, wmaxKwh, wmaxW)
+
+	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
+		animateBattery(s, r, wmaxW, bases.M103Base, bases.M802Base, stop)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &BatteryServer{Server: srv, bases: bases, wmaxW: wmaxW, wmaxKwh: wmaxKwh}, nil
+}
+
+// ── Snapshot ──────────────────────────────────────────────────────────────────
+
+// BatteryState is the JSON-serialisable snapshot returned by GET /state.
+type BatteryState struct {
+	Type      string    `json:"type"`
+	Timestamp time.Time `json:"timestamp"`
+	Animation struct {
+		Paused bool    `json:"paused"`
+		Speed  float64 `json:"speed"`
+	} `json:"animation"`
+	Nameplate struct {
+		WMaxW      float64 `json:"wmax_W"`
+		CapacityWh float64 `json:"capacity_Wh"`
+	} `json:"nameplate"`
+	Measurements struct {
+		W_W      float64 `json:"W_W"`
+		V_V      float64 `json:"V_V"`
+		Hz_Hz    float64 `json:"Hz_Hz"`
+		TmpCab_C float64 `json:"TmpCab_C"`
+		St       int     `json:"St"`
+		StText   string  `json:"St_text"`
+	} `json:"measurements"`
+	Battery struct {
+		SoC_pct  float64 `json:"SoC_pct"`
+		DoD_pct  float64 `json:"DoD_pct"`
+		SoH_pct  float64 `json:"SoH_pct"`
+		ChaSt    int     `json:"ChaSt"`
+		ChaStText string `json:"ChaSt_text"`
+	} `json:"battery"`
+	Controls struct {
+		WMaxLimPct_pct float64 `json:"WMaxLimPct_pct"`
+		Conn           int     `json:"Conn"`
+	} `json:"controls"`
+}
+
+// Snapshot reads current register state and returns a decoded BatteryState.
+func (bs *BatteryServer) Snapshot() BatteryState {
+	r := bs.Regs
+	b := bs.bases
+
+	sf := func(addr uint16) int16 { return int16(r.Get(addr)) }
+	signed := func(addr, sfAddr uint16) float64 {
+		return sunspec.ApplyScaleSigned(r.Get(addr), sf(sfAddr))
+	}
+	unsigned := func(addr, sfAddr uint16) float64 {
+		return sunspec.ApplyScaleUint(r.Get(addr), sf(sfAddr))
+	}
+
+	var st BatteryState
+	st.Type = "battery"
+	st.Timestamp = time.Now()
+	st.Animation.Paused = bs.IsPaused()
+	st.Animation.Speed = bs.Speed()
+	st.Nameplate.WMaxW = bs.wmaxW
+	st.Nameplate.CapacityWh = bs.wmaxKwh * 1000
+
+	m := &st.Measurements
+	m.W_W = signed(b.M103Base+sunspec.M103_W, b.M103Base+sunspec.M103_W_SF)
+	m.V_V = unsigned(b.M103Base+sunspec.M103_PhVphA, b.M103Base+sunspec.M103_V_SF)
+	m.Hz_Hz = unsigned(b.M103Base+sunspec.M103_Hz, b.M103Base+sunspec.M103_Hz_SF)
+	m.TmpCab_C = signed(b.M103Base+sunspec.M103_TmpCab, b.M103Base+sunspec.M103_Tmp_SF)
+	m.St = int(r.Get(b.M103Base + sunspec.M103_St))
+	m.StText = batteryInverterStateText(m.St)
+
+	bat := &st.Battery
+	bat.SoC_pct = unsigned(b.M802Base+uint16(sunspec.M802_SoC), b.M802Base+uint16(sunspec.M802_SoC_SF))
+	bat.DoD_pct = unsigned(b.M802Base+uint16(sunspec.M802_DoD), b.M802Base+uint16(sunspec.M802_DoD_SF))
+	bat.SoH_pct = unsigned(b.M802Base+uint16(sunspec.M802_SoH), b.M802Base+uint16(sunspec.M802_SoH_SF))
+	bat.ChaSt = int(r.Get(b.M802Base + uint16(sunspec.M802_ChaSt)))
+	bat.ChaStText = chaStText(bat.ChaSt)
+
+	c := &st.Controls
+	c.WMaxLimPct_pct = signed(b.M123Base+sunspec.M123_WMaxLimPct, b.M123Base+sunspec.M123_WMaxLimPct_SF) / 100.0
+	c.Conn = int(r.Get(b.M123Base + sunspec.M123_Conn))
+
+	return st
+}
+
+// Registers returns a sparse map of non-zero register values for debugging.
+func (bs *BatteryServer) Registers() map[string]uint16 {
+	out := make(map[string]uint16)
+	base := uint16(sunspec.SunSpecBase)
+	for addr := base; addr <= base+236; addr++ {
+		v := bs.Regs.Get(addr)
+		if v != 0 {
+			out[fmt.Sprintf("%d", addr)] = v
+		}
+	}
+	return out
+}
+
+// Inject overrides one or more fields.
+// Accepted keys: "W_W", "V_V", "Hz_Hz", "TmpCab_C",
+// "SoC_pct" (0–100), "SoH_pct" (0–100),
+// "WMaxLimPct_pct" (0–100), "Conn" (0 or 1), "St" (1–8), "ChaSt" (1–7).
+func (bs *BatteryServer) Inject(body []byte) error {
+	var fields map[string]float64
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return fmt.Errorf("inject: %w", err)
+	}
+	r := bs.Regs
+	b := bs.bases
+	sf := func(addr uint16) int16 { return int16(r.Get(addr)) }
+
+	for key, val := range fields {
+		switch key {
+		case "W_W":
+			r.Set(b.M103Base+sunspec.M103_W,
+				sunspec.RawFromScaleSigned(val, sf(b.M103Base+sunspec.M103_W_SF)))
+		case "V_V":
+			v10 := uint16(math.Round(val * 10))
+			r.Set(b.M103Base+sunspec.M103_PhVphA, v10)
+			r.Set(b.M103Base+sunspec.M103_PhVphB, v10)
+			r.Set(b.M103Base+sunspec.M103_PhVphC, v10)
+		case "Hz_Hz":
+			r.Set(b.M103Base+sunspec.M103_Hz,
+				sunspec.RawFromScaleUint(val, sf(b.M103Base+sunspec.M103_Hz_SF)))
+		case "TmpCab_C":
+			r.Set(b.M103Base+sunspec.M103_TmpCab,
+				sunspec.RawFromScaleSigned(val, sf(b.M103Base+sunspec.M103_Tmp_SF)))
+		case "SoC_pct":
+			r.Set(b.M802Base+uint16(sunspec.M802_SoC),
+				sunspec.RawFromScaleUint(val, int16(r.Get(b.M802Base+uint16(sunspec.M802_SoC_SF)))))
+		case "SoH_pct":
+			r.Set(b.M802Base+uint16(sunspec.M802_SoH),
+				sunspec.RawFromScaleUint(val, int16(r.Get(b.M802Base+uint16(sunspec.M802_SoH_SF)))))
+		case "WMaxLimPct_pct":
+			r.Set(b.M123Base+sunspec.M123_WMaxLimPct,
+				sunspec.RawFromScaleSigned(val*100, sf(b.M123Base+sunspec.M123_WMaxLimPct_SF)))
+		case "Conn":
+			r.Set(b.M123Base+sunspec.M123_Conn, uint16(val))
+		case "St":
+			r.Set(b.M103Base+sunspec.M103_St, uint16(val))
+		case "ChaSt":
+			r.Set(b.M802Base+uint16(sunspec.M802_ChaSt), uint16(val))
+		default:
+			return fmt.Errorf("inject: unknown field %q", key)
+		}
+	}
+	return nil
+}
+
+func batteryInverterStateText(st int) string {
+	switch st {
+	case 4:
+		return "active"
+	case 8:
+		return "standby"
+	default:
+		return fmt.Sprintf("st%d", st)
+	}
+}
+
+func chaStText(st int) string {
+	switch st {
+	case 1:
+		return "off"
+	case 2:
+		return "empty"
+	case 3:
+		return "discharging"
+	case 4:
+		return "charging"
+	case 5:
+		return "full"
+	case 6:
+		return "holding"
+	case 7:
+		return "testing"
+	default:
+		return fmt.Sprintf("chaSt%d", st)
+	}
+}
+
+// ── populate ──────────────────────────────────────────────────────────────────
+
+func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) BatteryBases {
 	sfN := func(v int16) uint16 { return uint16(v) }
 	base := sunspec.SunSpecBase
 
@@ -64,14 +256,14 @@ func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) (m103Base, m802Base
 	r.Set(cursor, sunspec.ModelNameplate)
 	r.Set(cursor+1, sunspec.M120Len)
 	m120 := cursor + 2
-	r.Set(m120+sunspec.M120_DERTyp, 80) // storage
+	r.Set(m120+sunspec.M120_DERTyp, 80)
 	r.Set(m120+sunspec.M120_WRtg, uint16(wmaxW))
 	r.Set(m120+sunspec.M120_VARtg, uint16(wmaxW*1.05))
 	r.Set(m120+sunspec.M120_VArRtgQ1, uint16(int16(wmaxW*0.44)))
-	r.Set(m120+sunspec.M120_VArRtgQ2, uint16(int16(-wmaxW*0.44))) // Q2 discharge
+	r.Set(m120+sunspec.M120_VArRtgQ2, uint16(int16(-wmaxW*0.44)))
 	r.Set(m120+sunspec.M120_ARtg, uint16(wmaxW/240))
-	r.Set(m120+sunspec.M120_PFRtgQ1, uint16(int16(9500))) // 0.95
-	r.Set(m120+sunspec.M120_WHRtg, uint16(wmaxKwh*1000))  // Wh
+	r.Set(m120+sunspec.M120_PFRtgQ1, uint16(int16(9500)))
+	r.Set(m120+sunspec.M120_WHRtg, uint16(wmaxKwh*1000))
 	r.Set(m120+sunspec.M120_AhrRtg, uint16(wmaxKwh*1000/48))
 	r.Set(m120+sunspec.M120_MaxChaRte, uint16(wmaxW))
 	r.Set(m120+sunspec.M120_MaxDisChaRte, uint16(wmaxW))
@@ -90,93 +282,94 @@ func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) (m103Base, m802Base
 	const m121Len = 30
 	r.Set(cursor, sunspec.ModelBasicSettings)
 	r.Set(cursor+1, m121Len)
-	m121 := cursor + 2
-	r.Set(m121+sunspec.M121_WMax, uint16(wmaxW))
-	r.Set(m121+sunspec.M121_WMax_SF, 0)
+	m121Base := cursor + 2
+	r.Set(m121Base+sunspec.M121_WMax, uint16(wmaxW))
+	r.Set(m121Base+sunspec.M121_WMax_SF, 0)
 	cursor += 2 + m121Len
 
-	// Model 103 (Three-Phase Inverter/Converter AC measurements) — 50 data regs
+	// Model 103 (Three-Phase Inverter/Converter AC) — 50 data regs
 	const m103Len = 50
 	r.Set(cursor, sunspec.ModelInverterThreePh)
 	r.Set(cursor+1, m103Len)
-	m103Base = cursor + 2
-	// Initial state: idle (W=0), connected
+	m103Base := cursor + 2
 	r.Set(m103Base+sunspec.M103_W, 0)
 	r.Set(m103Base+sunspec.M103_W_SF, 0)
-	r.Set(m103Base+sunspec.M103_PhVphA, 2400) // 240.0 V (sf=-1)
+	r.Set(m103Base+sunspec.M103_PhVphA, 2400)
 	r.Set(m103Base+sunspec.M103_PhVphB, 2400)
 	r.Set(m103Base+sunspec.M103_PhVphC, 2400)
 	r.Set(m103Base+sunspec.M103_V_SF, sfN(-1))
-	r.Set(m103Base+sunspec.M103_Hz, 6000) // 60.00 Hz (sf=-2)
+	r.Set(m103Base+sunspec.M103_Hz, 6000)
 	r.Set(m103Base+sunspec.M103_Hz_SF, sfN(-2))
 	r.Set(m103Base+sunspec.M103_VA, 0)
 	r.Set(m103Base+sunspec.M103_VA_SF, 0)
 	r.Set(m103Base+sunspec.M103_VAr, 0)
 	r.Set(m103Base+sunspec.M103_VAr_SF, 0)
-	r.Set(m103Base+sunspec.M103_PF, uint16(int16(10000))) // 1.00 (sf=-2)
+	r.Set(m103Base+sunspec.M103_PF, uint16(int16(10000)))
 	r.Set(m103Base+sunspec.M103_PF_SF, sfN(-2))
 	r.Set(m103Base+sunspec.M103_DCV, 0)
 	r.Set(m103Base+sunspec.M103_DCV_SF, sfN(-1))
 	r.Set(m103Base+sunspec.M103_DCW, 0)
 	r.Set(m103Base+sunspec.M103_DCW_SF, 0)
-	r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(250))) // 25.0 °C (sf=-1)
+	r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(250)))
 	r.Set(m103Base+sunspec.M103_Tmp_SF, sfN(-1))
-	r.Set(m103Base+sunspec.M103_St, 8) // standby
+	r.Set(m103Base+sunspec.M103_St, 8)
 	cursor += 2 + m103Len
 
 	// Model 123 (Immediate Controls) — 23 data regs
 	const m123Len = 23
 	r.Set(cursor, sunspec.ModelImmediateCtrl)
 	r.Set(cursor+1, m123Len)
-	m123 := cursor + 2
-	r.Set(m123+sunspec.M123_WMaxLimPct, 10000) // 100.00% (sf=-2)
-	r.Set(m123+sunspec.M123_WMaxLimPct_Ena, 1)
-	r.Set(m123+sunspec.M123_WMaxLimPct_SF, sfN(-2))
-	r.Set(m123+sunspec.M123_Conn, 1)
+	m123Base := cursor + 2
+	r.Set(m123Base+sunspec.M123_WMaxLimPct, 10000)
+	r.Set(m123Base+sunspec.M123_WMaxLimPct_Ena, 1)
+	r.Set(m123Base+sunspec.M123_WMaxLimPct_SF, sfN(-2))
+	r.Set(m123Base+sunspec.M123_Conn, 1)
 	cursor += 2 + m123Len
 
 	// Model 802 (Li-Ion Battery Base) — 26 data regs
 	r.Set(cursor, sunspec.ModelLithiumBattery)
 	r.Set(cursor+1, sunspec.M802Len)
-	m802Base = cursor + 2
+	m802Base := cursor + 2
 	whRtg := uint16(wmaxKwh * 1000)
-	r.Set(m802Base+sunspec.M802_WHRtg, whRtg)
-	r.Set(m802Base+sunspec.M802_WHRtg_SF, 0)
-	r.Set(m802Base+sunspec.M802_AHRtg, uint16(wmaxKwh*1000/48))
-	r.Set(m802Base+sunspec.M802_AHRtg_SF, 0)
-	r.Set(m802Base+sunspec.M802_WChaRteMax, uint16(wmaxW))
-	r.Set(m802Base+sunspec.M802_WDisChaRteMax, uint16(wmaxW))
-	r.Set(m802Base+sunspec.M802_W_SF, 0)
-	r.Set(m802Base+sunspec.M802_DisChaRte, 1) // 1%/day self-discharge
-	r.Set(m802Base+sunspec.M802_DisChaRte_SF, 0)
-	r.Set(m802Base+sunspec.M802_SoCMax, 9500)  // 95% max SoC (sf=-2)
-	r.Set(m802Base+sunspec.M802_SoCMin, 500)   // 5% min SoC
-	r.Set(m802Base+sunspec.M802_SoCRsvMax, 9000)
-	r.Set(m802Base+sunspec.M802_SoCRsvMin, 1000)
-	r.Set(m802Base+sunspec.M802_SoC_SF, sfN(-2)) // register × 0.01 = %
-	r.Set(m802Base+sunspec.M802_SoC, 5500)        // 55.00% initial SoC
-	r.Set(m802Base+sunspec.M802_DoD, 4500)         // 45.00% DoD
-	r.Set(m802Base+sunspec.M802_DoD_SF, sfN(-2))
-	r.Set(m802Base+sunspec.M802_SoH, 10000) // 100.00% healthy (sf=-2)
-	r.Set(m802Base+sunspec.M802_SoH_SF, sfN(-2))
-	r.Set(m802Base+sunspec.M802_ChaSt, 6)   // holding (idle)
-	r.Set(m802Base+sunspec.M802_LocRemCtl, 1) // remote control
-	r.Set(m802Base+sunspec.M802_Typ, 4)       // Li-Ion
-	r.Set(m802Base+sunspec.M802_State, 2)     // connected
+	r.Set(m802Base+uint16(sunspec.M802_WHRtg), whRtg)
+	r.Set(m802Base+uint16(sunspec.M802_WHRtg_SF), 0)
+	r.Set(m802Base+uint16(sunspec.M802_AHRtg), uint16(wmaxKwh*1000/48))
+	r.Set(m802Base+uint16(sunspec.M802_AHRtg_SF), 0)
+	r.Set(m802Base+uint16(sunspec.M802_WChaRteMax), uint16(wmaxW))
+	r.Set(m802Base+uint16(sunspec.M802_WDisChaRteMax), uint16(wmaxW))
+	r.Set(m802Base+uint16(sunspec.M802_W_SF), 0)
+	r.Set(m802Base+uint16(sunspec.M802_DisChaRte), 1)
+	r.Set(m802Base+uint16(sunspec.M802_DisChaRte_SF), 0)
+	r.Set(m802Base+uint16(sunspec.M802_SoCMax), 9500)
+	r.Set(m802Base+uint16(sunspec.M802_SoCMin), 500)
+	r.Set(m802Base+uint16(sunspec.M802_SoCRsvMax), 9000)
+	r.Set(m802Base+uint16(sunspec.M802_SoCRsvMin), 1000)
+	r.Set(m802Base+uint16(sunspec.M802_SoC_SF), sfN(-2))
+	r.Set(m802Base+uint16(sunspec.M802_SoC), 5500)
+	r.Set(m802Base+uint16(sunspec.M802_DoD), 4500)
+	r.Set(m802Base+uint16(sunspec.M802_DoD_SF), sfN(-2))
+	r.Set(m802Base+uint16(sunspec.M802_SoH), 10000)
+	r.Set(m802Base+uint16(sunspec.M802_SoH_SF), sfN(-2))
+	r.Set(m802Base+uint16(sunspec.M802_ChaSt), 6)
+	r.Set(m802Base+uint16(sunspec.M802_LocRemCtl), 1)
+	r.Set(m802Base+uint16(sunspec.M802_Typ), 4)
+	r.Set(m802Base+uint16(sunspec.M802_State), 2)
 	cursor += 2 + sunspec.M802Len
 
-	// End marker
 	r.Set(cursor, sunspec.EndMarker)
 	r.Set(cursor+1, 0)
-	return
+
+	return BatteryBases{
+		M121Base: m121Base,
+		M103Base: m103Base,
+		M123Base: m123Base,
+		M802Base: m802Base,
+	}
 }
 
-// animateBattery updates Model 103 and Model 802 registers every 5 seconds.
-// The cycle period is 1200 seconds (20 minutes).
-//
-//	SoC = 55 + 35·sin(phase)         → 20–90 %
-//	W   = −WMax·0.8·cos(phase)       → negative=charging, positive=discharging
-func animateBattery(r *RegisterMap, wmaxW float64, m103Base, m802Base uint16, stop <-chan struct{}) {
+// ── animation ─────────────────────────────────────────────────────────────────
+
+func animateBattery(s *Server, r *RegisterMap, wmaxW float64, m103Base, m802Base uint16, stop <-chan struct{}) {
 	sfN := func(v int16) uint16 { return uint16(v) }
 	_ = sfN
 
@@ -188,82 +381,71 @@ func animateBattery(r *RegisterMap, wmaxW float64, m103Base, m802Base uint16, st
 		case <-stop:
 			return
 		case <-tick.C:
-			t := float64(time.Now().Unix())
+			if s.IsPaused() {
+				continue
+			}
+			t := s.simTime()
 			phase := 2 * math.Pi * t / 1200
 
-			// State of charge: 20–90 % sinusoidal.
 			soc := 55.0 + 35.0*math.Sin(phase)
-			// Power: positive = discharging (export), negative = charging (import).
-			// W ∝ −d(SoC)/dt so it leads SoC by 90°.
 			w := -wmaxW * 0.80 * math.Cos(phase)
 
-			// Grid measurements.
 			v := 240.0 + 1.5*math.Sin(2*math.Pi*t/89)
 			hz := 60.0 + 0.03*math.Sin(2*math.Pi*t/67)
 			absW := math.Abs(w)
 			tmp := 25.0 + 15.0*(absW/wmaxW)
 
-			// PF is high (near unity) for battery converters.
 			pf := math.Max(0.95, math.Min(0.9999, 0.98+0.015*math.Cos(phase)))
 			va := absW / pf
 			varPwr := va * math.Sin(math.Acos(pf))
 			if w < 0 {
-				varPwr = -varPwr // reactive power sign follows real power direction
+				varPwr = -varPwr
 			}
 
-			// DC battery bus voltage (approximately proportional to SoC).
-			dcv := 44.0 + 6.0*(soc/100.0) // 44–50 V range (×10 for sf=-1 → 440–500)
-			dcw := absW * 1.03              // conversion loss
-
-			// Phase currents.
+			dcv := 44.0 + 6.0*(soc/100.0)
+			dcw := absW * 1.03
 			iph := absW / (v * 3)
 			if w < 0 {
-				iph = -iph // charging = current flowing in
+				iph = -iph
 			}
 
-			// Model 103 updates.
 			r.Set(m103Base+sunspec.M103_A, uint16(int16(math.Round(iph*3))))
 			r.Set(m103Base+sunspec.M103_AphA, uint16(int16(math.Round(iph))))
 			r.Set(m103Base+sunspec.M103_AphB, uint16(int16(math.Round(iph))))
 			r.Set(m103Base+sunspec.M103_AphC, uint16(int16(math.Round(iph))))
-			r.Set(m103Base+sunspec.M103_PhVphA, uint16(math.Round(v*10))) // sf=-1
+			r.Set(m103Base+sunspec.M103_PhVphA, uint16(math.Round(v*10)))
 			r.Set(m103Base+sunspec.M103_PhVphB, uint16(math.Round(v*10)))
 			r.Set(m103Base+sunspec.M103_PhVphC, uint16(math.Round(v*10)))
 			r.Set(m103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
-			r.Set(m103Base+sunspec.M103_Hz, uint16(math.Round(hz*100))) // sf=-2
+			r.Set(m103Base+sunspec.M103_Hz, uint16(math.Round(hz*100)))
 			r.Set(m103Base+sunspec.M103_VA, uint16(int16(math.Round(va))))
 			r.Set(m103Base+sunspec.M103_VAr, uint16(int16(math.Round(varPwr))))
 			r.Set(m103Base+sunspec.M103_PF, uint16(int16(math.Round(pf*10000))))
-			r.Set(m103Base+sunspec.M103_DCV, uint16(math.Round(dcv*10))) // sf=-1
+			r.Set(m103Base+sunspec.M103_DCV, uint16(math.Round(dcv*10)))
 			r.Set(m103Base+sunspec.M103_DCW, uint16(int16(math.Round(dcw))))
-			r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10)))) // sf=-1
+			r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10))))
 
-			// Operating state: 4=MPPT/active, 8=standby at low current.
 			if absW < wmaxW*0.02 {
-				r.Set(m103Base+sunspec.M103_St, 8) // standby
+				r.Set(m103Base+sunspec.M103_St, 8)
 			} else {
-				r.Set(m103Base+sunspec.M103_St, 4) // active
+				r.Set(m103Base+sunspec.M103_St, 4)
 			}
 
-			// Model 802 updates.
-			r.Set(m802Base+sunspec.M802_SoC, uint16(math.Round(soc*100))) // sf=-2 → %
+			r.Set(m802Base+uint16(sunspec.M802_SoC), uint16(math.Round(soc*100)))
 			dod := 100.0 - soc
-			r.Set(m802Base+sunspec.M802_DoD, uint16(math.Round(dod*100)))
+			r.Set(m802Base+uint16(sunspec.M802_DoD), uint16(math.Round(dod*100)))
 
-			// Charge status: 3=discharging, 4=charging, 6=holding.
 			var chaSt uint16
 			switch {
 			case w > wmaxW*0.02:
-				chaSt = 3 // discharging
+				chaSt = 3
 			case w < -wmaxW*0.02:
-				chaSt = 4 // charging
+				chaSt = 4
 			default:
-				chaSt = 6 // holding
+				chaSt = 6
 			}
-			r.Set(m802Base+sunspec.M802_ChaSt, chaSt)
-
-			// Battery state: 2=connected always in this sim.
-			r.Set(m802Base+sunspec.M802_State, 2)
+			r.Set(m802Base+uint16(sunspec.M802_ChaSt), chaSt)
+			r.Set(m802Base+uint16(sunspec.M802_State), 2)
 		}
 	}
 }
