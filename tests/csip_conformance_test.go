@@ -210,7 +210,7 @@ func TestCSIP_CORE003_PollingInteraction(t *testing.T) {
 	}
 
 	// DERControlList pollRate — this is a key one; events are time-sensitive.
-	if env.tree.Programs == nil || len(env.tree.Programs) == 0 {
+	if len(env.tree.Programs) == 0 {
 		t.Fatal("FAIL: no programs discovered")
 	}
 	ps := env.tree.Programs[0]
