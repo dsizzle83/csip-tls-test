@@ -309,6 +309,203 @@ make smoke-modbus-pi DESKTOP_IP=192.168.0.50
 
 `smoke-modbus-pi` cross-compiles, deploys, and runs one read — all from WSL.
 
+---
+
+## SunSpec / Modbus conformance testing
+
+The `bin/modsim-conformance` binary runs a structured test suite against any
+SunSpec-compliant device over Modbus TCP. It mirrors the CSIP conformance
+runner pattern: each check references the relevant SunSpec Alliance model spec
+or IEEE 1547-2018 clause, and the output is human-readable and log-file
+suitable.
+
+**Checks run:**
+
+| ID | What is tested |
+|----|----------------|
+| DISC-001 | SunS magic bytes at address 40000 |
+| DISC-002 | Model 1 (Common) — manufacturer and model strings non-empty |
+| DISC-003 | At least one AC measurement model (M701/103/102/101) present |
+| DISC-004 | Nameplate model present (M702 or M121) |
+| DISC-005 | Controls model present (M704 or M123) |
+| DISC-006 | End sentinel (0xFFFF) properly placed |
+| MEAS-001 | Active power W readable and finite |
+| MEAS-002 | Voltage V in range 85–480 V |
+| MEAS-003 | Frequency Hz in range 45–65 Hz |
+| MEAS-004 | Apparent power VA finite and ≥ \|W\| |
+| MEAS-005 | Reactive power VAr readable |
+| MEAS-006 | Power factor PF in range −1.0..+1.0 |
+| NAME-001 | WMax from M702 or M121 is > 0 W |
+| NAME-002 | Measured W does not exceed nameplate WMax |
+| CTRL-001 | WMaxLimPct write 50% reads back within ±1% |
+| CTRL-002 | WMaxLimPct enable/disable cycle |
+| CTRL-003 | M123 Conn connect/disconnect round-trip |
+| STAT-001 | Operating state St in valid range |
+| STAT-002 | Device reports Connected in initial state |
+| BAT-001 | SoC readable 0–100% (battery only — M713 or M802) |
+| BAT-002 | SoH readable 0–100% (battery only) |
+| BAT-003 | WHRtg (rated energy) > 0 Wh (battery only) |
+
+### Option 1 — Loopback (same machine, useful for CI and quick iteration)
+
+```bash
+# Terminal 1: start the solar inverter simulator
+make build-modsim
+./bin/modsim -port 5020 -api-port 6020
+
+# Terminal 2: run conformance checks against it
+go build -o bin/modsim-conformance ./sim/modsim-conformance
+./bin/modsim-conformance -server 127.0.0.1:5020 -device inverter
+
+# Battery
+./bin/batsim -port 5021 -api-port 6021 &
+./bin/modsim-conformance -server 127.0.0.1:5021 -device battery
+```
+
+### Option 2 — Pi client ↔ desktop simulator (Wireshark-visible traffic)
+
+This is the multi-device topology: the simulator runs on your desktop and the
+conformance runner executes on the Raspberry Pi. All Modbus TCP frames flow
+over your LAN and are visible in Wireshark on either host.
+
+```
+Raspberry Pi (192.168.0.81)                   Desktop / WSL2
+  bin/modsim-conformance  ──── TCP :5020 ───►  bin/modsim  (inverter)
+                          ──── TCP :5021 ───►  bin/batsim  (battery)
+```
+
+**Step 1 — start simulators on the desktop**
+
+```bash
+# In WSL2 or Linux terminal on desktop:
+make build-modsim build-batsim
+
+# Solar inverter on port 5020
+./bin/modsim -port 5020 -api-port 6020 &
+
+# Battery storage on port 5021
+./bin/batsim -port 5021 -kwh 10 -wmax 5000 -api-port 6021 &
+```
+
+If using Docker instead:
+```bash
+make modsim-run                         # inverter on :5020
+docker run -d --rm -p 5021:5021 csip-batsim -port 5021  # battery on :5021
+```
+
+**Step 2 — cross-compile and deploy the conformance runner to the Pi**
+
+The conformance runner is pure Go (no cgo). Cross-compile from WSL:
+
+```bash
+# Build arm64 binary and scp to Pi
+make deploy-modsim-conformance-pi
+
+# Or manually:
+GOOS=linux GOARCH=arm64 go build -o bin/modsim-conformance-arm64 ./sim/modsim-conformance
+scp bin/modsim-conformance-arm64 dmitri@192.168.0.81:~/csip-tls-test/bin/modsim-conformance
+```
+
+**Step 3 — run on the Pi**
+
+```bash
+# SSH into the Pi
+ssh dmitri@192.168.0.81
+
+# Inverter conformance (replace IP with your desktop LAN IP)
+~/csip-tls-test/bin/modsim-conformance \
+    -server 192.168.0.50:5020 \
+    -device inverter \
+    -out    /tmp/modsim-conformance.log
+
+# Battery conformance
+~/csip-tls-test/bin/modsim-conformance \
+    -server 192.168.0.50:5021 \
+    -device battery \
+    -out    /tmp/batsim-conformance.log
+```
+
+Expected output:
+```
+════════════════════════════════════════════════════════════════════════════
+SUNSPEC / IEEE 1547-2018 MODBUS CONFORMANCE TEST
+────────────────────────────────────────────────────────────────────────────
+Server:      192.168.0.50:5020
+Device type: inverter
+...
+────────────────────────────────────────────────────────────────────────────
+[DISC-001] SunSpec Magic Header
+────────────────────────────────────────────────────────────────────────────
+  Req §SunSpec §6.1       Registers 40000-40001 SHALL contain 0x5375 0x6E53
+  ✓ PASS  SunS magic present at address 40000
+...
+════════════════════════════════════════════════════════════════════════════
+SUNSPEC CONFORMANCE TEST SUMMARY
+════════════════════════════════════════════════════════════════════════════
+  Tests run:  22
+  PASS:       22
+  FAIL:       0
+
+  ✓ ALL CONFORMANCE CHECKS PASSED
+```
+
+**Step 3 (shortcut) — one command from WSL**
+
+```bash
+# Prerequisites: simulators already running (step 1 above)
+make modbus-conformance-pi
+
+# Battery:
+make modbus-conformance-pi MODSIM_PORT=5021 MODBUS_DEVICE=battery
+
+# Override desktop IP if needed:
+make modbus-conformance-pi DESKTOP_IP=192.168.0.50
+```
+
+The log is automatically copied from the Pi to `modsim-conformance.log` in
+the repo root.
+
+### Option 3 — Pi client ↔ Pi simulator (two separate Raspberry Pis)
+
+This topology is useful when you want to test against a second Pi acting as a
+Modbus device stub, with no desktop involvement. All traffic is purely
+Pi-to-Pi over your LAN.
+
+```
+Pi-A (test runner, 192.168.0.81)       Pi-B (simulator, 192.168.0.82)
+  bin/modsim-conformance ── TCP :5020 ──►  bin/modsim
+```
+
+**On Pi-B (simulator Pi) — build and start the simulator:**
+```bash
+# On Pi-B (native build, or deploy binary via scp)
+cd ~/csip-tls-test
+go build -o bin/modsim ./sim/modsim
+./bin/modsim -port 5020 -wmax 5000 -api-port 6020
+```
+
+**On Pi-A (conformance runner Pi):**
+```bash
+cd ~/csip-tls-test
+go build -o bin/modsim-conformance ./sim/modsim-conformance
+./bin/modsim-conformance \
+    -server 192.168.0.82:5020 \
+    -device inverter \
+    -out    /tmp/modsim-conformance.log
+```
+
+### In-process (unit test equivalent)
+
+The same conformance checks run in-process as standard Go tests using the
+animated simulator. These run on every `go test` pass with no hardware or
+network setup:
+
+```bash
+go test ./tests/ -run TestModbusConformance -v
+# or via make:
+make test-southbound
+```
+
 ### Troubleshooting
 
 | Symptom | Likely cause | Fix |

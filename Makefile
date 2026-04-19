@@ -1,5 +1,6 @@
 .PHONY: all build build-server build-client build-conformance build-modsim build-hub \
-        build-modsim-client-pi deploy-modsim-client-pi smoke-modbus-pi sync-pi sync-hub-pi \
+        build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
+        deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi sync-hub-pi \
         start-server conformance-pi \
         test test-fast test-integration test-update-golden test-southbound \
         modsim-image modsim-run modsim-stop \
@@ -65,6 +66,19 @@ build-hub:
 build-modsim-client-pi:
 	@mkdir -p bin
 	GOOS=linux GOARCH=arm64 go build -o bin/modsim-client-arm64 ./sim/modsim-client
+
+# Cross-compile the Modbus conformance runner for the Pi (linux/arm64).
+# Runs on the Pi; connects to a simulator on the desktop or another Pi.
+build-modsim-conformance-pi:
+	@mkdir -p bin
+	GOOS=linux GOARCH=arm64 go build -o bin/modsim-conformance-arm64 ./sim/modsim-conformance
+
+# Deploy the Modbus conformance binary to the Pi.
+deploy-modsim-conformance-pi: build-modsim-conformance-pi
+	scp bin/modsim-conformance-arm64 $(PI_HOST):$(PI_DIR)/bin/modsim-conformance
+	@echo ""
+	@echo "Run on the Pi against the desktop simulator:"
+	@echo "  $(PI_DIR)/bin/modsim-conformance -server $(DESKTOP_IP):$(MODSIM_PORT) -device inverter -out /tmp/modsim-conformance.log"
 
 # === SunSpec simulator (Docker) ============================================
 
@@ -203,6 +217,28 @@ conformance-pi:
 	scp $(PI_HOST):/tmp/csip-conformance.log csip-conformance.log
 	@echo "Log saved to: csip-conformance.log"
 
+# Run the Modbus conformance suite on the Pi against the desktop simulator.
+# Prerequisites:
+#   1. Desktop: make modsim-run                  (start solar inverter sim on port 5020)
+#   2. Desktop: make deploy-modsim-conformance-pi (deploy binary to Pi)
+#   3. Pi:      make modbus-conformance-pi        (runs checks, writes log)
+#
+# Override: make modbus-conformance-pi DESKTOP_IP=192.168.0.50 MODSIM_PORT=5020
+# For battery: make modbus-conformance-pi MODSIM_PORT=5021 MODBUS_DEVICE=battery
+MODBUS_DEVICE ?= inverter
+
+modbus-conformance-pi:
+	@echo "Running Modbus conformance suite on $(PI_HOST)..."
+	@echo "Simulator: $(DESKTOP_IP):$(MODSIM_PORT) ($(MODBUS_DEVICE))"
+	ssh $(PI_HOST) "cd $(PI_DIR) && ./bin/modsim-conformance \
+	    -server $(DESKTOP_IP):$(MODSIM_PORT) \
+	    -device $(MODBUS_DEVICE) \
+	    -out   /tmp/modsim-conformance.log"
+	@echo ""
+	@echo "Fetching log from Pi..."
+	scp $(PI_HOST):/tmp/modsim-conformance.log modsim-conformance.log
+	@echo "Log saved to: modsim-conformance.log"
+
 # === Test targets ===========================================================
 
 # Run everything: unit + integration for both packages.
@@ -214,8 +250,10 @@ test-fast:
 	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/southbound/sunspec/
 
 # Southbound unit + integration tests (no hardware required; uses in-process Modbus server).
+# Includes the in-process Modbus conformance suite (TestModbusConformance_*).
 test-southbound:
 	go test ./internal/southbound/... ./internal/bridge/...
+	go test ./tests/ -run TestModbusConformance -v
 
 # Full integration tests with real TLS handshakes. Requires fixtures.
 test-integration: $(CA_CERT)
@@ -311,6 +349,12 @@ help:
 	@echo "  make conformance-pi      Run full CSIP conformance suite on Pi"
 	@echo "                           Requires: make start-server on WSL first"
 	@echo "                           Override: make conformance-pi SERVER=172.x.x.x:11111"
+	@echo "  make build-modsim-conformance-pi  Cross-compile Modbus conformance runner for Pi"
+	@echo "  make deploy-modsim-conformance-pi Deploy conformance runner to Pi"
+	@echo "  make modbus-conformance-pi Run Modbus conformance suite on Pi"
+	@echo "                           Requires: make modsim-run on desktop first"
+	@echo "                           Override: make modbus-conformance-pi DESKTOP_IP=x.x.x.x"
+	@echo "                           Battery:  make modbus-conformance-pi MODSIM_PORT=5021 MODBUS_DEVICE=battery"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean               Remove binaries and test certs"
