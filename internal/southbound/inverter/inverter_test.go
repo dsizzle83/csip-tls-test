@@ -7,7 +7,7 @@ import (
 
 	"csip-tls-test/internal/csip/model"
 	"csip-tls-test/internal/southbound/modbus"
-	"csip-tls-test/internal/southbound/sim"
+	"csip-tls-test/sim/southbound"
 	"csip-tls-test/internal/southbound/sunspec"
 )
 

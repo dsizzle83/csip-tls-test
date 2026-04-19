@@ -10,7 +10,7 @@ import (
 
 	"csip-tls-test/internal/csip/discovery"
 	"csip-tls-test/internal/csip/model"
-	"csip-tls-test/internal/gridsim"
+	"csip-tls-test/sim/gridsim"
 	"csip-tls-test/internal/httpclient"
 )
 

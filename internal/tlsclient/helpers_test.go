@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"csip-tls-test/internal/tlsserver"
+	"csip-tls-test/sim/tlsserver"
 	"csip-tls-test/internal/wolfssl"
 )
 

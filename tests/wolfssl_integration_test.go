@@ -12,9 +12,9 @@ import (
 
 	"csip-tls-test/internal/csip/discovery"
 	"csip-tls-test/internal/csip/identity"
-	"csip-tls-test/internal/gridsim"
+	"csip-tls-test/sim/gridsim"
 	"csip-tls-test/internal/tlsclient"
-	"csip-tls-test/internal/tlsserver"
+	"csip-tls-test/sim/tlsserver"
 	"csip-tls-test/internal/wolfssl"
 )
 

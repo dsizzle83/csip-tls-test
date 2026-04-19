@@ -9,7 +9,7 @@ RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -o /batsim ./cmd/batsim
+    go build -trimpath -o /batsim ./sim/batsim
 
 FROM alpine:3.19
 COPY --from=builder /batsim /usr/local/bin/batsim

@@ -9,7 +9,7 @@ import (
 	"net"
 	"testing"
 
-	"csip-tls-test/internal/southbound/sim"
+	"csip-tls-test/sim/southbound"
 )
 
 // startTestServer launches a SunSpec Modbus TCP server on a random loopback

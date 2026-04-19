@@ -40,7 +40,7 @@ import (
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/smartcharging"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
 
-	"csip-tls-test/internal/simapi"
+	"csip-tls-test/sim/simapi"
 )
 
 func main() {

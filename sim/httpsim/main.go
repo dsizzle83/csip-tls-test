@@ -11,7 +11,7 @@ import (
 	"log"
 	"net/http"
 
-	"csip-tls-test/internal/gridsim"
+	"csip-tls-test/sim/gridsim"
 )
 
 func main() {

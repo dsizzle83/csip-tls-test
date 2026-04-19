@@ -7,17 +7,33 @@ DERMS hub for IEEE 2030.5 / CSIP compliance. Bridges utility grid management (no
 Go 1.21 · wolfSSL cgo (one package) · lorenzodonini/ocpp-go · simonvetter/modbus · grandcat/zeroconf · customtkinter (Python GUI)
 
 ## Directory map
+
+### Product code (the hub device)
 ```
+cmd/hub/               Long-running Pi hub binary — the product
 internal/csip/         2030.5 model, discovery walker, scheduler, identity, DNS-SD
 internal/tlsclient/    wolfSSL mTLS client — persistent keep-alive fetcher
-internal/tlsserver/    wolfSSL mTLS server — multi-request loop, dispatchHTTP bridge
 internal/wolfssl/      ONLY cgo package. wolfSSL_Init is process-global.
-internal/southbound/   Modbus/SunSpec: device, inverter, battery, meter, registry, sim
+internal/southbound/   Modbus/SunSpec: device, inverter, battery, meter, registry
 internal/bridge/       CSIP ↔ southbound glue (imports both sides; nothing else should)
-internal/gridsim/      IEEE 2030.5 HTTP server simulator (pure Go, net/http)
 internal/ocppserver/   OCPP 2.0.1 CSMS (Security Profile 2, pure Go — no wolfSSL)
-cmd/hub/               Long-running Pi hub binary
-cmd/{modsim,batsim,metersim,loadsim,evsim}/  Simulator binaries
+internal/orchestrator/ Control optimizer + cost models + device adapters
+```
+
+### Simulation code (not part of the product)
+```
+sim/server/            mTLS gridsim server (WSL-side, for conformance testing)
+sim/client/            CSIP TLS client smoke test (Pi-side)
+sim/conformance/       Full CSIP conformance test suite (Pi-side)
+sim/{modsim,batsim,metersim,loadsim,evsim}/  Device simulator binaries
+sim/modsim-client/     Modbus diagnostic client
+sim/httpsim/           Plain-HTTP gridsim (no mTLS, dev only)
+sim/orchestrator/      Example orchestrator wiring
+sim/gridsim/           IEEE 2030.5 server simulator library
+sim/tlsserver/         wolfSSL mTLS server library (test harness only)
+sim/simapi/            REST + WebSocket API wrapper for simulator binaries
+sim/southbound/        In-memory Modbus device simulators (no hardware required)
+
 gui/sim_gui.py         CustomTkinter live dashboard for all simulators
 ```
 

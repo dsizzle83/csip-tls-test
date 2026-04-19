@@ -157,6 +157,16 @@ func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string) {
 		}
 	}
 
+	// Keep /tm current: refresh CurrentTime on every GET so the hub's
+	// computed clock offset stays near zero (CSIP §5.2.1.3).
+	if path == "/tm" {
+		s.mu.Lock()
+		if tm, ok := s.resources["/tm"].(*model.Time); ok {
+			tm.CurrentTime = time.Now().Unix()
+		}
+		s.mu.Unlock()
+	}
+
 	s.mu.RLock()
 	resource, ok := s.resources[path]
 	s.mu.RUnlock()

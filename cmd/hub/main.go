@@ -331,6 +331,32 @@ func discoveryLoop(
 	}
 }
 
+// syncSystemClock steps the system real-time clock by offsetS seconds so
+// that local time matches the CSIP server's time (IEEE 2030.5 §10.3).
+//
+// This is a hard step — appropriate for initial sync or when |offset| is
+// large. The kernel equivalent of: date -s @$(( $(date +%s) + offset )).
+//
+// Requires CAP_SYS_TIME. On the Pi: sudo setcap cap_sys_time+ep bin/hub
+// If the process lacks the capability the error is logged and ignored;
+// the hub continues using the software clockOffset instead.
+//
+// Only called when |offsetS| >= 1 — sub-second accuracy is not achievable
+// over HTTPS and unnecessary clock steps cause scheduling jitter.
+func syncSystemClock(offsetS int64) {
+	if offsetS == 0 {
+		return
+	}
+	corrected := time.Now().Add(time.Duration(offsetS) * time.Second)
+	tv := syscall.NsecToTimeval(corrected.UnixNano())
+	if err := syscall.Settimeofday(&tv); err != nil {
+		log.Printf("hub: clock sync skipped (need CAP_SYS_TIME?): %v", err)
+		return
+	}
+	log.Printf("hub: system clock stepped %+ds → %s UTC",
+		offsetS, corrected.UTC().Format(time.RFC3339))
+}
+
 func runDiscovery(
 	fetcher *tlsclient.WolfSSLFetcher,
 	lfdi string,
@@ -347,6 +373,9 @@ func runDiscovery(
 		met.recordDiscovery(false, 0)
 		return
 	}
+
+	// Sync system clock to server time; after the step clockOffset → ~0.
+	syncSystemClock(tree.ClockOffset)
 
 	clockOffset.Store(tree.ClockOffset)
 	eng.SetCSIPPrograms(tree.Programs, tree.ClockOffset)

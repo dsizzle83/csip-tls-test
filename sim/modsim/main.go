@@ -25,8 +25,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"csip-tls-test/internal/simapi"
-	"csip-tls-test/internal/southbound/sim"
+	"csip-tls-test/sim/simapi"
+	"csip-tls-test/sim/southbound"
 )
 
 func main() {

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"csip-tls-test/internal/gridsim"
+	"csip-tls-test/sim/gridsim"
 	"log"
 	"net/http"
 )

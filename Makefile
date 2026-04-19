@@ -6,7 +6,7 @@
         gen-test-certs gen-client-cert smoke-pi clean help
 
 REPO_ROOT     := $(shell pwd)
-SERVER_CERTS  := internal/tlsserver/testdata/certs
+SERVER_CERTS  := sim/tlsserver/testdata/certs
 CLIENT_CERTS  := internal/tlsclient/testdata/certs
 CA_CERT       := $(SERVER_CERTS)/ca-cert.pem
 
@@ -18,41 +18,41 @@ build: build-server build-client
 
 build-server:
 	@mkdir -p bin
-	go build -o bin/server ./server
+	go build -o bin/server ./sim/server
 
 build-client:
 	@mkdir -p bin
-	go build -o bin/client ./client
+	go build -o bin/client ./sim/client
 
 # conformance runner is Pi-only (cgo wolfSSL, arm64)
 # build via sync-pi or directly on the Pi
 build-conformance:
 	@mkdir -p bin
-	go build -o bin/conformance ./cmd/conformance
+	go build -o bin/conformance ./sim/conformance
 
 build-modsim:
 	@mkdir -p bin
-	go build -o bin/modsim ./cmd/modsim
+	go build -o bin/modsim ./sim/modsim
 
 build-batsim:
 	@mkdir -p bin
-	go build -o bin/batsim ./cmd/batsim
+	go build -o bin/batsim ./sim/batsim
 
 build-metersim:
 	@mkdir -p bin
-	go build -o bin/metersim ./cmd/metersim
+	go build -o bin/metersim ./sim/metersim
 
 build-loadsim:
 	@mkdir -p bin
-	go build -o bin/loadsim ./cmd/loadsim
+	go build -o bin/loadsim ./sim/loadsim
 
 build-evsim:
 	@mkdir -p bin
-	go build -o bin/evsim ./cmd/evsim
+	go build -o bin/evsim ./sim/evsim
 
 build-httpsim:
 	@mkdir -p bin
-	go build -o bin/httpsim ./cmd/httpsim
+	go build -o bin/httpsim ./sim/httpsim
 
 # Hub uses wolfSSL (cgo) — must be built natively on Pi.
 # Use sync-hub-pi to sync and build on the Pi in one step.
@@ -64,7 +64,7 @@ build-hub:
 # No cgo — southbound packages are pure Go.
 build-modsim-client-pi:
 	@mkdir -p bin
-	GOOS=linux GOARCH=arm64 go build -o bin/modsim-client-arm64 ./cmd/modsim-client
+	GOOS=linux GOARCH=arm64 go build -o bin/modsim-client-arm64 ./sim/modsim-client
 
 # === SunSpec simulator (Docker) ============================================
 
@@ -141,8 +141,8 @@ sync-pi:
 	    --exclude=bin/ --exclude='*-key.pem' --exclude='.git/' \
 	    ./ $(PI_HOST):$(PI_DIR)/
 	ssh $(PI_HOST) "mkdir -p $(PI_DIR)/bin && cd $(PI_DIR) && \
-	    go build -o bin/client ./client && \
-	    go build -o bin/conformance ./cmd/conformance"
+	    go build -o bin/client ./sim/client && \
+	    go build -o bin/conformance ./sim/conformance"
 	@echo "Source synced; client and conformance runner built on Pi at $(PI_DIR)/bin/"
 
 # Sync source to Pi and build the hub binary natively (wolfSSL requires native arm64 build).
@@ -169,8 +169,8 @@ pi-hub:
 pi-build:
 	ssh $(PI_HOST) "cd $(PI_DIR) && git pull && mkdir -p bin && \
 	    go build -o bin/hub ./cmd/hub && \
-	    go build -o bin/client ./client && \
-	    go build -o bin/conformance ./cmd/conformance"
+	    go build -o bin/client ./sim/client && \
+	    go build -o bin/conformance ./sim/conformance"
 	@echo "All Pi binaries built on $(PI_HOST):$(PI_DIR)/bin/"
 
 # Run the hub on the Pi (assumes bin/hub already built and hub.json present).
@@ -211,7 +211,7 @@ test: $(CA_CERT) test-fast test-integration
 # Fast unit tests across both packages — pure-Go logic only.
 # Pulls cgo for compilation but does no TLS handshakes.
 test-fast:
-	go test ./internal/tlsserver/ ./internal/tlsclient/ ./internal/southbound/sunspec/
+	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/southbound/sunspec/
 
 # Southbound unit + integration tests (no hardware required; uses in-process Modbus server).
 test-southbound:
@@ -219,13 +219,13 @@ test-southbound:
 
 # Full integration tests with real TLS handshakes. Requires fixtures.
 test-integration: $(CA_CERT)
-	go test -tags=integration -v ./internal/tlsserver/ ./internal/tlsclient/
+	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/
 
 # Regenerate the DCAP golden file. Run after intentionally changing
 # the DCAP XML format. The -args separator is required because Go's
 # test command doesn't know our custom -update flag is a boolean.
 test-update-golden:
-	go test ./internal/tlsserver/ -args -update
+	go test ./sim/tlsserver/ -args -update
 
 # === Cert fixtures ==========================================================
 

@@ -8,9 +8,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"csip-tls-test/internal/gridsim"
+	"csip-tls-test/sim/gridsim"
 	"csip-tls-test/internal/ocppserver"
-	"csip-tls-test/internal/tlsserver"
+	"csip-tls-test/sim/tlsserver"
 	"csip-tls-test/internal/wolfssl"
 )
 

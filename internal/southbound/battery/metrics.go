@@ -11,12 +11,11 @@ import (
 // Compile-time check: Battery must satisfy BatteryMetricsReader.
 var _ orchestrator.BatteryMetricsReader = (*Battery)(nil)
 
-// ReadBatteryMetrics reads battery-specific state from SunSpec Model 802
-// (Lithium Battery) and returns it as an orchestrator.BatteryMetrics.
-// Fields that are not supported by the device are set to math.NaN().
-//
-// This method implements orchestrator.BatteryMetricsReader so the orchestrator
-// adapter can extract SOC/SOH without knowing the concrete Battery type.
+// ReadBatteryMetrics reads battery-specific state and returns it as
+// orchestrator.BatteryMetrics. Prefers M713 (DERStorageCapacity, IEEE
+// 1547-2018) for SoC, SoH, and energy capacity; falls back to M802
+// (LithiumBattery) when M713 is absent.
+// Fields not supported by the device are set to math.NaN().
 func (b *Battery) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
 	m := orchestrator.BatteryMetrics{
 		SOC:           math.NaN(),
@@ -26,18 +25,29 @@ func (b *Battery) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
 		MaxDischargeW: math.NaN(),
 	}
 
-	if !b.reader.HasModel(sunspec.ModelLithiumBattery) {
-		// Fall back to nameplate data from Model 121 only.
+	if b.has713 {
+		if err := readMetricsFrom713(b, &m); err != nil {
+			return m, err
+		}
+	} else if b.reader.HasModel(sunspec.ModelLithiumBattery) {
+		if err := readMetricsFrom802(b, &m); err != nil {
+			return m, err
+		}
+	} else {
+		// No storage model: fall back to nameplate WMax only.
 		if !math.IsNaN(b.wmax) {
 			m.MaxChargeW = b.wmax
 			m.MaxDischargeW = b.wmax
 		}
-		return m, nil
 	}
 
-	regs, err := b.reader.ReadModel(sunspec.ModelLithiumBattery)
+	return m, nil
+}
+
+func readMetricsFrom713(b *Battery, m *orchestrator.BatteryMetrics) error {
+	regs, err := b.reader.ReadModel(sunspec.ModelDERStorageCap)
 	if err != nil {
-		return m, fmt.Errorf("battery: read Model 802 for metrics: %w", err)
+		return fmt.Errorf("battery: read M713 for metrics: %w", err)
 	}
 
 	get := func(offset int) uint16 {
@@ -48,7 +58,53 @@ func (b *Battery) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
 	}
 	sf := func(sfOffset int) int16 { return int16(get(sfOffset)) }
 
-	// State of charge (M802_SoC @ offset 14, scale factor @ offset 13).
+	// State of charge (M713_SoC @ 5, scale @ M713_SoC_SF @ 11).
+	if len(regs) > sunspec.M713_SoC {
+		soc := sunspec.ApplyScaleUint(get(sunspec.M713_SoC), sf(sunspec.M713_SoC_SF))
+		if !math.IsNaN(soc) && soc >= 0 {
+			m.SOC = soc
+		}
+	}
+
+	// State of health (M713_SoH @ 6, scale @ M713_SoH_SF @ 12).
+	if len(regs) > sunspec.M713_SoH {
+		soh := sunspec.ApplyScaleUint(get(sunspec.M713_SoH), sf(sunspec.M713_SoH_SF))
+		if !math.IsNaN(soh) && soh >= 0 {
+			m.SOH = soh
+		}
+	}
+
+	// Rated energy in Wh (M713_WHRtg @ 0, scale @ M713_WHRtg_SF @ 9).
+	if len(regs) > sunspec.M713_WHRtg {
+		cap := sunspec.ApplyScaleUint(get(sunspec.M713_WHRtg), sf(sunspec.M713_WHRtg_SF))
+		if !math.IsNaN(cap) && cap > 0 {
+			m.CapacityWh = cap
+		}
+	}
+
+	// M713 has no per-direction charge/discharge power rating — use WMax.
+	if !math.IsNaN(b.wmax) {
+		m.MaxChargeW = b.wmax
+		m.MaxDischargeW = b.wmax
+	}
+
+	return nil
+}
+
+func readMetricsFrom802(b *Battery, m *orchestrator.BatteryMetrics) error {
+	regs, err := b.reader.ReadModel(sunspec.ModelLithiumBattery)
+	if err != nil {
+		return fmt.Errorf("battery: read Model 802 for metrics: %w", err)
+	}
+
+	get := func(offset int) uint16 {
+		if offset < len(regs) {
+			return regs[offset]
+		}
+		return 0
+	}
+	sf := func(sfOffset int) int16 { return int16(get(sfOffset)) }
+
 	if len(regs) > sunspec.M802_SoC {
 		soc := sunspec.ApplyScaleUint(get(sunspec.M802_SoC), sf(sunspec.M802_SoC_SF))
 		if !math.IsNaN(soc) && soc >= 0 {
@@ -56,7 +112,6 @@ func (b *Battery) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
 		}
 	}
 
-	// State of health (M802_SoH @ offset 17, scale factor @ offset 18).
 	if len(regs) > sunspec.M802_SoH {
 		soh := sunspec.ApplyScaleUint(get(sunspec.M802_SoH), sf(sunspec.M802_SoH_SF))
 		if !math.IsNaN(soh) && soh >= 0 {
@@ -64,7 +119,6 @@ func (b *Battery) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
 		}
 	}
 
-	// Capacity in Wh (M802_WHRtg @ offset 0, scale factor @ offset 1).
 	if len(regs) > sunspec.M802_WHRtg {
 		cap := sunspec.ApplyScaleUint(get(sunspec.M802_WHRtg), sf(sunspec.M802_WHRtg_SF))
 		if !math.IsNaN(cap) && cap > 0 {
@@ -72,7 +126,6 @@ func (b *Battery) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
 		}
 	}
 
-	// Max charge / discharge power (M802_WChaRteMax/WDisChaRteMax, shared M802_W_SF).
 	if len(regs) > sunspec.M802_WDisChaRteMax {
 		wSF := sf(sunspec.M802_W_SF)
 		cha := sunspec.ApplyScaleUint(get(sunspec.M802_WChaRteMax), wSF)
@@ -92,5 +145,5 @@ func (b *Battery) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
 		m.MaxDischargeW = b.wmax
 	}
 
-	return m, nil
+	return nil
 }

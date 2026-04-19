@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"csip-tls-test/internal/southbound/sim"
+	"csip-tls-test/sim/southbound"
 )
 
 const defaultTimeout = 2 * time.Second

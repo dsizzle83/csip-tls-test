@@ -34,8 +34,8 @@ type Bridge struct {
 	reg      *registry.Registry
 	interval time.Duration
 
-	mu         sync.RWMutex
-	programs   []discovery.ProgramState
+	mu          sync.RWMutex
+	programs    []discovery.ProgramState
 	clockOffset int64 // server_time = time.Now().Unix() + clockOffset
 
 	stop chan struct{}
@@ -109,6 +109,9 @@ func (b *Bridge) applyOnce() {
 	serverNow := scheduler.ServerNow(clockOffset)
 	active := b.sched.Evaluate(programs, serverNow)
 	if active == nil {
+		///////////////////////////////////////////////////////////////////////////////
+		//  This should initiate a failsafe control to DERs, not actively be ignored //
+		///////////////////////////////////////////////////////////////////////////////
 		return // no active control or default to apply
 	}
 
