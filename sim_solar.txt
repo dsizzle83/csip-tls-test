@@ -116,7 +116,7 @@ STEP 4 — BUILD THE SIMULATOR BINARY
 From ~/csip-tls-test:
 
     mkdir -p bin
-    go build -o bin/modsim ./cmd/modsim
+    go build -o bin/modsim ./sim/modsim
 
 Build time is ~30–60 seconds on a Pi 4 (first build downloads modules).
 Subsequent builds are much faster.
@@ -125,7 +125,7 @@ To update and rebuild after a code change on the hub/desktop:
 
     cd ~/csip-tls-test
     git pull
-    go build -o bin/modsim ./cmd/modsim
+    go build -o bin/modsim ./sim/modsim
 
 ==============================================================================
 STEP 5 — TEST RUN (MANUAL)
@@ -227,4 +227,4 @@ TROUBLESHOOTING
     - Check logs:             journalctl -u modsim -n 50
 
   Binary missing after git pull:
-    - Rebuild:                cd ~/csip-tls-test && go build -o bin/modsim ./cmd/modsim
+    - Rebuild:                cd ~/csip-tls-test && go build -o bin/modsim ./sim/modsim

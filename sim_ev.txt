@@ -119,7 +119,7 @@ STEP 4 — BUILD THE SIMULATOR BINARY
 ==============================================================================
 
     mkdir -p bin
-    go build -o bin/evsim ./cmd/evsim
+    go build -o bin/evsim ./sim/evsim
 
 The evsim binary is pure Go (no cgo), so it builds fast and requires no
 wolfSSL installation. The OCPP protocol uses plain WebSocket (no TLS).
@@ -128,7 +128,7 @@ To update and rebuild:
 
     cd ~/csip-tls-test
     git pull
-    go build -o bin/evsim ./cmd/evsim
+    go build -o bin/evsim ./sim/evsim
 
 ==============================================================================
 STEP 5 — VERIFY CONNECTIVITY TO THE HUB
@@ -275,5 +275,5 @@ TROUBLESHOOTING
       wait for the discovery loop to fetch a program with an active event.
 
   Rebuild after git pull:
-    cd ~/csip-tls-test && go build -o bin/evsim ./cmd/evsim
+    cd ~/csip-tls-test && go build -o bin/evsim ./sim/evsim
     sudo systemctl restart evsim

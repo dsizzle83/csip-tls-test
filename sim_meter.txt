@@ -121,13 +121,13 @@ STEP 4 — BUILD THE SIMULATOR BINARY
 ==============================================================================
 
     mkdir -p bin
-    go build -o bin/metersim ./cmd/metersim
+    go build -o bin/metersim ./sim/metersim
 
 To update and rebuild:
 
     cd ~/csip-tls-test
     git pull
-    go build -o bin/metersim ./cmd/metersim
+    go build -o bin/metersim ./sim/metersim
 
 ==============================================================================
 STEP 5 — TEST RUN (MANUAL)
@@ -222,5 +222,5 @@ TROUBLESHOOTING
     - Test port:    nc -zv 69.0.0.12 5022
 
   Rebuild after git pull:
-    cd ~/csip-tls-test && go build -o bin/metersim ./cmd/metersim
+    cd ~/csip-tls-test && go build -o bin/metersim ./sim/metersim
     sudo systemctl restart metersim

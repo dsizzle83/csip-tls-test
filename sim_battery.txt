@@ -112,13 +112,13 @@ STEP 4 — BUILD THE SIMULATOR BINARY
 ==============================================================================
 
     mkdir -p bin
-    go build -o bin/batsim ./cmd/batsim
+    go build -o bin/batsim ./sim/batsim
 
 To update and rebuild:
 
     cd ~/csip-tls-test
     git pull
-    go build -o bin/batsim ./cmd/batsim
+    go build -o bin/batsim ./sim/batsim
 
 ==============================================================================
 STEP 5 — TEST RUN (MANUAL)
@@ -211,4 +211,4 @@ TROUBLESHOOTING
     - Check logs:   journalctl -u batsim -n 50
 
   Rebuild after git pull:
-    cd ~/csip-tls-test && go build -o bin/batsim ./cmd/batsim && sudo systemctl restart batsim
+    cd ~/csip-tls-test && go build -o bin/batsim ./sim/batsim && sudo systemctl restart batsim
