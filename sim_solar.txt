@@ -21,74 +21,43 @@ HARDWARE
 PLANNED IP ADDRESS ON THE DEMO SWITCH
 --------------------------------------
   Assign this Pi a static IP on your LAN segment.
-  Example used in this guide: 192.168.10.10
-  Hub IP:                      192.168.10.1
+  Example used in this guide: 69.0.0.10
+  Hub IP:                      69.0.0.1
   Adjust all IP references below to match your actual network plan.
 
 ==============================================================================
-STEP 1 — FLASH THE SD CARD
+STEP 1 — CONFIGURE STATIC IP (ETHERNET)
 ==============================================================================
 
-1.  On any desktop, download Raspberry Pi Imager:
-      https://www.raspberrypi.com/software/
+Each Pi has two network interfaces:
+  eth0   Ethernet (demo LAN, 69.0.0.x/24) — static IP; all simulator traffic flows here
+  wlan0  WiFi — DHCP from your router (different subnet); internet/management access only
 
-2.  Insert the microSD card into the desktop.
-
-3.  In Raspberry Pi Imager:
-      OS  →  Raspberry Pi OS Lite (64-bit)   [no desktop needed]
-      Storage → your microSD card
-
-4.  Click the gear icon (Advanced options) and configure:
-      Hostname:        solar-pi
-      SSH:             Enable SSH → "Use password authentication"
-      Username:        pi
-      Password:        (set a strong password)
-      Locale / timezone: set to your local timezone
-
-    Note: configuring SSH here is optional — you are doing initial setup
-    directly on the Pi with keyboard and monitor, not over SSH.
-
-5.  Write the image. Eject the card safely.
-
-==============================================================================
-STEP 2 — FIRST BOOT
-==============================================================================
-
-1.  Insert the microSD card into the Pi.
-2.  Connect the HDMI monitor and USB keyboard.
-3.  Connect the Ethernet cable to the demo switch.
-4.  Connect power. Wait ~60 seconds for the first boot to complete.
-5.  Log in at the console prompt:
-      Login: pi
-      Password: (the password you set in Imager)
-
-==============================================================================
-STEP 3 — CONFIGURE STATIC IP
-==============================================================================
+Leave wlan0 on DHCP. Its subnet (e.g. 192.168.1.x from your router) will differ
+from 69.0.0.x and will not conflict.
 
 Raspberry Pi OS (Bookworm) uses NetworkManager by default.
 
-1.  Find the name of the Ethernet interface:
+1.  Find the Ethernet interface name:
       ip link show
-    Look for an interface like eth0 or enp2s0. This guide uses eth0.
+    Look for eth0 (or enp2s0 on Pi 5). This guide uses eth0.
 
-2.  Set a static IP:
+2.  Set a static IP on eth0:
       sudo nmcli con mod "Wired connection 1" \
         ipv4.method manual \
-        ipv4.addresses 192.168.10.10/24 \
-        ipv4.gateway 192.168.10.1 \
+        ipv4.addresses 69.0.0.10/24 \
+        ipv4.gateway 69.0.0.1 \
         ipv4.dns "8.8.8.8 8.8.4.4"
       sudo nmcli con up "Wired connection 1"
 
-    If you are not sure of the connection name, list them first:
-      sudo nmcli con show
+    To list connection names: sudo nmcli con show
 
 3.  Confirm the IP is active:
       ip addr show eth0
-    You should see 192.168.10.10/24.
+    You should see 69.0.0.10/24.
 
 ==============================================================================
-STEP 4 — INSTALL GO
+STEP 2 — INSTALL GO
 ==============================================================================
 
 1.  Download Go 1.21 for linux/arm64:
@@ -108,22 +77,40 @@ STEP 4 — INSTALL GO
     Expected output: go version go1.21.13 linux/arm64
 
 ==============================================================================
-STEP 5 — CLONE THE REPOSITORY
+STEP 3 — CLONE THE REPOSITORY
 ==============================================================================
 
-1.  Install git (if not already present):
+The repo is private. Set up an SSH deploy key so this Pi can pull without a password.
+
+1.  Install git:
       sudo apt-get update && sudo apt-get install -y git
 
-2.  Clone the repo:
+2.  Generate an SSH key for this Pi:
+      ssh-keygen -t ed25519 -C "solar-pi" -f ~/.ssh/id_ed25519 -N ""
+
+3.  Print the public key — you will paste this into GitHub:
+      cat ~/.ssh/id_ed25519.pub
+
+4.  Add the key to the GitHub repo:
+      - Go to: https://github.com/dsizzle83/csip-tls-test/settings/keys
+      - Click "Add deploy key"
+      - Title: solar-pi
+      - Key: paste the output from step 3
+      - Leave "Allow write access" unchecked (read-only is sufficient)
+      - Click "Add key"
+
+5.  Verify GitHub accepts the key:
+      ssh -T git@github.com
+    Expected: Hi dsizzle83! You've successfully authenticated...
+    ("You've been provided shell access" warning is normal and harmless.)
+
+6.  Clone:
       cd ~
-      git clone <YOUR_REPO_URL> csip-tls-test
+      git clone git@github.com:dsizzle83/csip-tls-test.git csip-tls-test
       cd csip-tls-test
 
-    Replace <YOUR_REPO_URL> with the actual repository URL.
-    If the repo is private, set up an SSH key or personal access token first.
-
 ==============================================================================
-STEP 6 — BUILD THE SIMULATOR BINARY
+STEP 4 — BUILD THE SIMULATOR BINARY
 ==============================================================================
 
 From ~/csip-tls-test:
@@ -141,7 +128,7 @@ To update and rebuild after a code change on the hub/desktop:
     go build -o bin/modsim ./cmd/modsim
 
 ==============================================================================
-STEP 7 — TEST RUN (MANUAL)
+STEP 5 — TEST RUN (MANUAL)
 ==============================================================================
 
 Run in the foreground to confirm it starts correctly:
@@ -154,10 +141,10 @@ Expected output:
     modsim: W cycles 5–95% of WMax on a 600 s sine; updates every 5 s
     modsim: listening — press Ctrl-C to stop
 
-Press Ctrl-C to stop. Proceed to Step 8 to install it as a system service.
+Press Ctrl-C to stop. Proceed to Step 6 to install it as a system service.
 
 ==============================================================================
-STEP 8 — INSTALL AS A SYSTEMD SERVICE (AUTO-START ON BOOT)
+STEP 6 — INSTALL AS A SYSTEMD SERVICE (AUTO-START ON BOOT)
 ==============================================================================
 
 1.  Create the service file:
@@ -199,14 +186,14 @@ STEP 8 — INSTALL AS A SYSTEMD SERVICE (AUTO-START ON BOOT)
 Press Ctrl-C to stop following the log. The service will keep running.
 
 ==============================================================================
-STEP 9 — HUB CONFIGURATION
+STEP 7 — HUB CONFIGURATION
 ==============================================================================
 
 On the hub Pi, add this device entry to hub.json (adjust the IP if needed):
 
     {
       "name": "solar-1",
-      "url":  "tcp://192.168.10.10:5020",
+      "url":  "tcp://69.0.0.10:5020",
       "unit_id": 1,
       "role": "inverter"
     }
@@ -234,7 +221,7 @@ TROUBLESHOOTING
   Cannot connect from hub:
     - Verify static IP:       ip addr show eth0
     - Check firewall:         sudo ufw status    (if enabled, allow port 5020)
-    - Test from another Pi:   nc -zv 192.168.10.10 5020
+    - Test from another Pi:   nc -zv 69.0.0.10 5020
 
   Service fails to start:
     - Check logs:             journalctl -u modsim -n 50

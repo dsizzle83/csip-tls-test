@@ -43,10 +43,6 @@ build-metersim:
 	@mkdir -p bin
 	go build -o bin/metersim ./sim/metersim
 
-build-loadsim:
-	@mkdir -p bin
-	go build -o bin/loadsim ./sim/loadsim
-
 build-evsim:
 	@mkdir -p bin
 	go build -o bin/evsim ./sim/evsim

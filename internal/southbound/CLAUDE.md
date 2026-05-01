@@ -13,7 +13,7 @@ sunspec/   Scan (model discovery, reads IDs only — no data burst).
            scale.go: ApplyScaleSigned/Unsigned, RawFromScaleSigned/Unsigned. 0x8000 → NaN.
 inverter/  Inverter implements Device. Reads Model 103 (or 101/102 fallback), nameplate from 121, controls via 123.
 battery/   BatteryDevice implements Device. Model 103 AC + 802 Li-Ion battery state.
-meter/     MeterDevice for grid meter and home load. Model 201 (single-phase AC).
+meter/     MeterDevice for bi-directional smart meter. Model 201 (single-phase AC).
 registry/  Registry: fan-out ApplyControl, background poll, MeasurementUpdate channel.
 sim/       Animated Modbus TCP servers. NewSolarServer / NewBatteryServer / NewMeterServer.
 ```
@@ -37,7 +37,7 @@ End sentinel: ModelID = `0xFFFF`
 
 ## Simulator API summary
 All sims expose HTTP + WebSocket via `internal/simapi/`:
-- Ports: modsim 5020/6020 · batsim 5021/6021 · metersim 5022/6022 · loadsim 5023/6023 · evsim —/6024
+- Ports: modsim 5020/6020 · batsim 5021/6021 · metersim 5022/6022 · evsim —/6024
 - `GET /state` → typed JSON · `POST /inject {"W_W":3000}` · `POST /control {"cmd":"pause","speed":5}` · `GET /registers` · `GET /ws` (2 s push)
 - CORS wildcard enabled (for Python GUI).
 

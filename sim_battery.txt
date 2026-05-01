@@ -21,65 +21,41 @@ HARDWARE
 
 PLANNED IP ADDRESS ON THE DEMO SWITCH
 --------------------------------------
-  Example used in this guide: 192.168.10.11
-  Hub IP:                      192.168.10.1
+  Example used in this guide: 69.0.0.11
+  Hub IP:                      69.0.0.1
   Adjust all IP references below to match your actual network plan.
 
 ==============================================================================
-STEP 1 — FLASH THE SD CARD
+STEP 1 — CONFIGURE STATIC IP (ETHERNET)
 ==============================================================================
 
-1.  On any desktop, download Raspberry Pi Imager:
-      https://www.raspberrypi.com/software/
+Each Pi has two network interfaces:
+  eth0   Ethernet (demo LAN, 69.0.0.x/24) — static IP; all simulator traffic flows here
+  wlan0  WiFi — DHCP from your router (different subnet); internet/management access only
 
-2.  Insert the microSD card into the desktop.
-
-3.  In Raspberry Pi Imager:
-      OS  →  Raspberry Pi OS Lite (64-bit)
-      Storage → your microSD card
-
-4.  Click the gear icon (Advanced options) and configure:
-      Hostname:        battery-pi
-      SSH:             Enable (optional — initial setup is done at the console)
-      Username:        pi
-      Password:        (set a strong password)
-      Locale / timezone: set to your local timezone
-
-5.  Write the image. Eject the card safely.
-
-==============================================================================
-STEP 2 — FIRST BOOT
-==============================================================================
-
-1.  Insert the microSD card into the Pi.
-2.  Connect the HDMI monitor and USB keyboard.
-3.  Connect the Ethernet cable to the demo switch.
-4.  Connect power. Wait ~60 seconds.
-5.  Log in:
-      Login: pi
-      Password: (the password you set)
-
-==============================================================================
-STEP 3 — CONFIGURE STATIC IP
-==============================================================================
+Leave wlan0 on DHCP. Its subnet (e.g. 192.168.1.x from your router) will differ
+from 69.0.0.x and will not conflict.
 
 1.  Find the Ethernet interface name:
       ip link show
-    This guide assumes eth0.
+    Look for eth0 (or enp2s0 on Pi 5). This guide uses eth0.
 
-2.  Set a static IP:
+2.  Set a static IP on eth0:
       sudo nmcli con mod "Wired connection 1" \
         ipv4.method manual \
-        ipv4.addresses 192.168.10.11/24 \
-        ipv4.gateway 192.168.10.1 \
+        ipv4.addresses 69.0.0.11/24 \
+        ipv4.gateway 69.0.0.1 \
         ipv4.dns "8.8.8.8 8.8.4.4"
       sudo nmcli con up "Wired connection 1"
 
+    To list connection names: sudo nmcli con show
+
 3.  Confirm:
       ip addr show eth0
+    You should see 69.0.0.11/24.
 
 ==============================================================================
-STEP 4 — INSTALL GO
+STEP 2 — INSTALL GO
 ==============================================================================
 
 1.  Download:
@@ -99,19 +75,40 @@ STEP 4 — INSTALL GO
     Expected: go version go1.21.13 linux/arm64
 
 ==============================================================================
-STEP 5 — CLONE THE REPOSITORY
+STEP 3 — CLONE THE REPOSITORY
 ==============================================================================
+
+The repo is private. Set up an SSH deploy key so this Pi can pull without a password.
 
 1.  Install git:
       sudo apt-get update && sudo apt-get install -y git
 
-2.  Clone:
+2.  Generate an SSH key for this Pi:
+      ssh-keygen -t ed25519 -C "battery-pi" -f ~/.ssh/id_ed25519 -N ""
+
+3.  Print the public key — you will paste this into GitHub:
+      cat ~/.ssh/id_ed25519.pub
+
+4.  Add the key to the GitHub repo:
+      - Go to: https://github.com/dsizzle83/csip-tls-test/settings/keys
+      - Click "Add deploy key"
+      - Title: battery-pi
+      - Key: paste the output from step 3
+      - Leave "Allow write access" unchecked (read-only is sufficient)
+      - Click "Add key"
+
+5.  Verify GitHub accepts the key:
+      ssh -T git@github.com
+    Expected: Hi dsizzle83! You've successfully authenticated...
+    ("You've been provided shell access" warning is normal and harmless.)
+
+6.  Clone:
       cd ~
-      git clone <YOUR_REPO_URL> csip-tls-test
+      git clone git@github.com:dsizzle83/csip-tls-test.git csip-tls-test
       cd csip-tls-test
 
 ==============================================================================
-STEP 6 — BUILD THE SIMULATOR BINARY
+STEP 4 — BUILD THE SIMULATOR BINARY
 ==============================================================================
 
     mkdir -p bin
@@ -124,7 +121,7 @@ To update and rebuild:
     go build -o bin/batsim ./cmd/batsim
 
 ==============================================================================
-STEP 7 — TEST RUN (MANUAL)
+STEP 5 — TEST RUN (MANUAL)
 ==============================================================================
 
     ./bin/batsim -port 5021 -kwh 10 -wmax 5000
@@ -138,7 +135,7 @@ Expected output:
 Press Ctrl-C to stop.
 
 ==============================================================================
-STEP 8 — INSTALL AS A SYSTEMD SERVICE
+STEP 6 — INSTALL AS A SYSTEMD SERVICE
 ==============================================================================
 
 1.  Create the service file:
@@ -175,14 +172,14 @@ STEP 8 — INSTALL AS A SYSTEMD SERVICE
       journalctl -u batsim -f
 
 ==============================================================================
-STEP 9 — HUB CONFIGURATION
+STEP 7 — HUB CONFIGURATION
 ==============================================================================
 
 On the hub Pi, add this device entry to hub.json:
 
     {
       "name": "battery-1",
-      "url":  "tcp://192.168.10.11:5021",
+      "url":  "tcp://69.0.0.11:5021",
       "unit_id": 1,
       "role": "battery"
     }
@@ -208,7 +205,7 @@ TROUBLESHOOTING
 
   Cannot connect from hub:
     - Verify IP:    ip addr show eth0
-    - Test port:    nc -zv 192.168.10.11 5021
+    - Test port:    nc -zv 69.0.0.11 5021
 
   Service not starting:
     - Check logs:   journalctl -u batsim -n 50

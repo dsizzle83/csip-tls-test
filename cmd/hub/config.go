@@ -12,7 +12,7 @@ type DeviceConfig struct {
 	Name   string  `json:"name"`
 	URL    string  `json:"url"`
 	UnitID uint8   `json:"unit_id"`
-	Role   string  `json:"role"` // "inverter" | "battery" | "meter" | "load"
+	Role   string  `json:"role"` // "inverter" | "battery" | "meter"
 	MaxW   float64 `json:"max_w"` // nameplate capacity (W); used by orchestrator actuators
 }
 

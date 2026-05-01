@@ -36,7 +36,6 @@ type DeviceRole uint8
 const (
 	RoleBattery DeviceRole = iota
 	RoleSolar
-	RoleLoad // passive load meter
 )
 
 // BatteryState is a read-only snapshot of a battery device.

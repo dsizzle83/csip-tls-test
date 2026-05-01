@@ -18,9 +18,8 @@ import (
 type DeviceRole uint8
 
 const (
-	RoleBattery    DeviceRole = iota
+	RoleBattery   DeviceRole = iota
 	RoleSolar
-	RoleLoad
 	RoleGridMeter // SunSpec AC meter at the main service entrance
 )
 
@@ -31,7 +30,7 @@ type DeviceConfig struct {
 	// MaxW is the device's nameplate power capacity (W).  Used when the live
 	// device does not expose it via ReadBatteryMetrics.
 	MaxW float64
-	// MaxCurrentA is the EVSE hardware limit (A); only used for RoleLoad EVSEs.
+	// MaxCurrentA is the EVSE hardware limit (A).
 	MaxCurrentA float64
 }
 

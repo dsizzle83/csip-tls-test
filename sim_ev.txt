@@ -32,64 +32,43 @@ HARDWARE
 
 PLANNED IP ADDRESS ON THE DEMO SWITCH
 --------------------------------------
-  Example used in this guide: 192.168.10.14
-  Hub IP:                      192.168.10.1   (OCPP CSMS on port 8887)
+  Example used in this guide: 69.0.0.14
+  Hub IP:                      69.0.0.1   (OCPP CSMS on port 8887)
 
 IMPORTANT: The evsim connects to the hub, not the other way around.
 The hub must be running with its OCPP CSMS enabled before evsim starts.
 
 ==============================================================================
-STEP 1 — FLASH THE SD CARD
+STEP 1 — CONFIGURE STATIC IP (ETHERNET)
 ==============================================================================
 
-1.  On any desktop, download Raspberry Pi Imager:
-      https://www.raspberrypi.com/software/
+Each Pi has two network interfaces:
+  eth0   Ethernet (demo LAN, 69.0.0.x/24) — static IP; all simulator traffic flows here
+  wlan0  WiFi — DHCP from your router (different subnet); internet/management access only
 
-2.  Insert the microSD card.
+Leave wlan0 on DHCP. Its subnet (e.g. 192.168.1.x from your router) will differ
+from 69.0.0.x and will not conflict.
 
-3.  In Raspberry Pi Imager:
-      OS  →  Raspberry Pi OS Lite (64-bit)
-      Storage → your microSD card
-
-4.  Advanced options:
-      Hostname:        ev-pi
-      SSH:             Enable (optional)
-      Username:        pi
-      Password:        (set a strong password)
-      Locale / timezone: set to your local timezone
-
-5.  Write the image. Eject safely.
-
-==============================================================================
-STEP 2 — FIRST BOOT
-==============================================================================
-
-1.  Insert the microSD card.
-2.  Connect HDMI + keyboard.
-3.  Connect Ethernet to the demo switch.
-4.  Power on. Wait ~60 seconds.
-5.  Log in (pi / your password).
-
-==============================================================================
-STEP 3 — CONFIGURE STATIC IP
-==============================================================================
-
-1.  Find the Ethernet interface:
+1.  Find the Ethernet interface name:
       ip link show
+    Look for eth0 (or enp2s0 on Pi 5). This guide uses eth0.
 
-2.  Set static IP:
+2.  Set a static IP on eth0:
       sudo nmcli con mod "Wired connection 1" \
         ipv4.method manual \
-        ipv4.addresses 192.168.10.14/24 \
-        ipv4.gateway 192.168.10.1 \
+        ipv4.addresses 69.0.0.14/24 \
+        ipv4.gateway 69.0.0.1 \
         ipv4.dns "8.8.8.8 8.8.4.4"
       sudo nmcli con up "Wired connection 1"
 
+    To list connection names: sudo nmcli con show
+
 3.  Confirm:
       ip addr show eth0
+    You should see 69.0.0.14/24.
 
 ==============================================================================
-STEP 4 — INSTALL GO
+STEP 2 — INSTALL GO
 ==============================================================================
 
     curl -LO https://go.dev/dl/go1.21.13.linux-arm64.tar.gz
@@ -103,16 +82,40 @@ STEP 4 — INSTALL GO
 Expected: go version go1.21.13 linux/arm64
 
 ==============================================================================
-STEP 5 — CLONE THE REPOSITORY
+STEP 3 — CLONE THE REPOSITORY
 ==============================================================================
 
-    sudo apt-get update && sudo apt-get install -y git
-    cd ~
-    git clone <YOUR_REPO_URL> csip-tls-test
-    cd csip-tls-test
+The repo is private. Set up an SSH deploy key so this Pi can pull without a password.
+
+1.  Install git:
+      sudo apt-get update && sudo apt-get install -y git
+
+2.  Generate an SSH key for this Pi:
+      ssh-keygen -t ed25519 -C "ev-pi" -f ~/.ssh/id_ed25519 -N ""
+
+3.  Print the public key — you will paste this into GitHub:
+      cat ~/.ssh/id_ed25519.pub
+
+4.  Add the key to the GitHub repo:
+      - Go to: https://github.com/dsizzle83/csip-tls-test/settings/keys
+      - Click "Add deploy key"
+      - Title: ev-pi
+      - Key: paste the output from step 3
+      - Leave "Allow write access" unchecked (read-only is sufficient)
+      - Click "Add key"
+
+5.  Verify GitHub accepts the key:
+      ssh -T git@github.com
+    Expected: Hi dsizzle83! You've successfully authenticated...
+    ("You've been provided shell access" warning is normal and harmless.)
+
+6.  Clone:
+      cd ~
+      git clone git@github.com:dsizzle83/csip-tls-test.git csip-tls-test
+      cd csip-tls-test
 
 ==============================================================================
-STEP 6 — BUILD THE SIMULATOR BINARY
+STEP 4 — BUILD THE SIMULATOR BINARY
 ==============================================================================
 
     mkdir -p bin
@@ -128,32 +131,32 @@ To update and rebuild:
     go build -o bin/evsim ./cmd/evsim
 
 ==============================================================================
-STEP 7 — VERIFY CONNECTIVITY TO THE HUB
+STEP 5 — VERIFY CONNECTIVITY TO THE HUB
 ==============================================================================
 
 Before starting the evsim, confirm the hub's CSMS port is reachable:
 
-    nc -zv 192.168.10.1 8887
+    nc -zv 69.0.0.1 8887
 
-Expected: Connection to 192.168.10.1 8887 port [tcp/*] succeeded!
+Expected: Connection to 69.0.0.1 8887 port [tcp/*] succeeded!
 
 If this fails:
   - Ensure the hub Pi is powered on and the hub binary is running.
   - Check the hub's firewall: sudo ufw allow 8887/tcp
 
 ==============================================================================
-STEP 8 — TEST RUN (MANUAL)
+STEP 6 — TEST RUN (MANUAL)
 ==============================================================================
 
     ./bin/evsim \
-      -csms ws://192.168.10.1:8887/ocpp \
+      -csms ws://69.0.0.1:8887/ocpp \
       -id evse-001 \
       -connectors 1 \
       -session-interval 180 \
       -session-duration 120
 
 Expected output:
-    evsim: station=evse-001 csms=ws://192.168.10.1:8887/ocpp connectors=1
+    evsim: station=evse-001 csms=ws://69.0.0.1:8887/ocpp connectors=1
     evsim: connected
     evsim: BootNotification status=Accepted heartbeatInterval=60s
     evsim: StatusNotification connector=1 status=Available
@@ -173,7 +176,7 @@ On the hub Pi, you should see in its log:
 Press Ctrl-C to stop.
 
 ==============================================================================
-STEP 9 — INSTALL AS A SYSTEMD SERVICE
+STEP 7 — INSTALL AS A SYSTEMD SERVICE
 ==============================================================================
 
 1.  Create the service file:
@@ -189,7 +192,7 @@ STEP 9 — INSTALL AS A SYSTEMD SERVICE
       User=pi
       WorkingDirectory=/home/pi/csip-tls-test
       ExecStart=/home/pi/csip-tls-test/bin/evsim \
-        -csms ws://192.168.10.1:8887/ocpp \
+        -csms ws://69.0.0.1:8887/ocpp \
         -id evse-001 \
         -connectors 1 \
         -session-interval 180 \
@@ -217,7 +220,7 @@ STEP 9 — INSTALL AS A SYSTEMD SERVICE
       journalctl -u evsim -f
 
 ==============================================================================
-STEP 10 — HUB CONFIGURATION
+STEP 8 — HUB CONFIGURATION
 ==============================================================================
 
 The hub does NOT need a device entry in hub.json for the EV charger.
@@ -239,7 +242,7 @@ PARAMETERS REFERENCE
 ==============================================================================
 
   -csms              string   CSMS WebSocket base URL
-                               (default ws://192.168.10.1:8887/ocpp)
+                               (default ws://69.0.0.1:8887/ocpp)
   -id                string   Charging station identifier (default evse-001)
                                Must be unique if running multiple evsi ms.
   -connectors        int      Number of connectors to simulate (default 1)
@@ -247,7 +250,7 @@ PARAMETERS REFERENCE
   -session-duration  int      Seconds each charging session lasts (default 120)
 
 Example — 2-connector station, faster sessions for demo:
-    ./bin/evsim -csms ws://192.168.10.1:8887/ocpp -id evse-dc50 \
+    ./bin/evsim -csms ws://69.0.0.1:8887/ocpp -id evse-dc50 \
                 -connectors 2 -session-interval 90 -session-duration 60
 
 Multiple EV charger Pis can connect to the same hub CSMS simultaneously,
@@ -258,8 +261,8 @@ TROUBLESHOOTING
 ==============================================================================
 
   BootNotification fails / cannot connect:
-    - Verify hub is running:     ping 192.168.10.1
-    - Verify CSMS port open:     nc -zv 192.168.10.1 8887
+    - Verify hub is running:     ping 69.0.0.1
+    - Verify CSMS port open:     nc -zv 69.0.0.1 8887
     - Check hub log:             journalctl -u hub -n 50   (on hub Pi)
 
   Station connects but hub does not show it:

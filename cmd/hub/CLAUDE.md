@@ -24,10 +24,9 @@ Tracked in `responseState map[MRID]int` inside hub main.
 
 ## Device roles in hub.json
 ```json
-{"role":"solar",   "url":"tcp://192.168.10.10:502"}  → inverter.New (M103/121/123)
-{"role":"battery", "url":"tcp://192.168.10.11:502"}  → battery.New  (M103/802)
-{"role":"meter",   "url":"tcp://192.168.10.12:502"}  → meter.New    (M201)
-{"role":"load",    "url":"tcp://192.168.10.13:502"}  → meter.New    (M201, consume-only)
+{"role":"solar",   "url":"tcp://69.0.0.10:502"}  → inverter.New (M103/121/123)
+{"role":"battery", "url":"tcp://69.0.0.11:502"}  → battery.New  (M103/802)
+{"role":"meter",   "url":"tcp://69.0.0.12:502"}  → meter.New    (M201, bi-directional)
 ```
 
 ## Critical: clock offset

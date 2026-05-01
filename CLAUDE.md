@@ -1,7 +1,7 @@
 # CSIP DER Hub
 
 ## What this system does
-DERMS hub for IEEE 2030.5 / CSIP compliance. Bridges utility grid management (northbound, wolfSSL mTLS) to DER assets — solar PV, battery storage, grid meter, home load, EVSE (southbound, Modbus/SunSpec + OCPP 2.0.1). Target hardware: Raspberry Pi (dev) / NXP i.MX 93 (prod).
+DERMS hub for IEEE 2030.5 / CSIP compliance. Bridges utility grid management (northbound, wolfSSL mTLS) to DER assets — solar PV, battery storage, bi-directional smart meter, EVSE (southbound, Modbus/SunSpec + OCPP 2.0.1). Target hardware: Raspberry Pi (dev) / NXP i.MX 93 (prod).
 
 ## Stack
 Go 1.21 · wolfSSL cgo (one package) · lorenzodonini/ocpp-go · simonvetter/modbus · grandcat/zeroconf · customtkinter (Python GUI)
@@ -25,7 +25,7 @@ internal/orchestrator/ Control optimizer + cost models + device adapters
 sim/server/            mTLS gridsim server (WSL-side, for conformance testing)
 sim/client/            CSIP TLS client smoke test (Pi-side)
 sim/conformance/       Full CSIP conformance test suite (Pi-side)
-sim/{modsim,batsim,metersim,loadsim,evsim}/  Device simulator binaries
+sim/{modsim,batsim,metersim,evsim}/          Device simulator binaries
 sim/modsim-client/     Modbus diagnostic client
 sim/httpsim/           Plain-HTTP gridsim (no mTLS, dev only)
 sim/orchestrator/      Example orchestrator wiring
@@ -48,13 +48,12 @@ make build                                # all binaries → bin/
 # Start simulators (each on own Pi, or localhost):
 bin/modsim   -port 5020 -api-port 6020   # solar PV
 bin/batsim   -port 5021 -api-port 6021   # battery
-bin/metersim -port 5022 -api-port 6022   # grid meter
-bin/loadsim  -port 5023 -api-port 6023   # home load
-bin/evsim    -hub 192.168.10.1:8887 -api-port 6024  # EVSE
+bin/metersim -port 5022 -api-port 6022   # bi-directional smart meter
+bin/evsim    -hub 69.0.0.1:8887 -api-port 6024      # EVSE
 
 # Python GUI (on desktop, not Pi):
 cd gui && pip install -r requirements.txt
-python sim_gui.py --solar 192.168.10.10 --battery 192.168.10.11 ...
+python sim_gui.py --solar 69.0.0.10 --battery 69.0.0.11 --meter 69.0.0.12 ...
 
 make gen-client-cert CN=csip-pi-002      # issue new client cert
 ```
