@@ -211,6 +211,21 @@ func (s SystemState) TotalBatteryW() float64 {
 	return total
 }
 
+// InferredLoadW estimates total site load (home + EV) from the energy balance
+// at the point of common coupling:
+//
+//	load_W = solar_W + battery_W + grid_W
+//
+// All generation and grid import feed the site bus; whatever isn't sent to the
+// grid must be consumed on site.  Returns math.NaN() when no grid meter is
+// present (Grid.NetW is NaN).
+func (s SystemState) InferredLoadW() float64 {
+	if math.IsNaN(s.Grid.NetW) {
+		return math.NaN()
+	}
+	return s.TotalSolarW() + s.TotalBatteryW() + s.Grid.NetW
+}
+
 // TotalEVSEW sums current EV charging load.
 func (s SystemState) TotalEVSEW() float64 {
 	total := 0.0

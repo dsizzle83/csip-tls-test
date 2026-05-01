@@ -5,7 +5,7 @@
 
 OVERVIEW
 --------
-This Pi runs the animated smart meter simulator (cmd/metersim).
+This Pi runs the smart meter simulator (sim/metersim).
 It exposes SunSpec models 1/201 (Single-Phase AC Meter) over Modbus TCP.
 It represents a bi-directional smart meter at the main service entrance,
 measuring net power flow between the site and the utility grid.
@@ -14,10 +14,28 @@ Sign convention (SunSpec Model 201):
   W > 0  site is importing power from the grid (net consumption)
   W < 0  site is exporting power to the grid  (net generation)
 
-Power oscillates from -peak to +peak on a 600-second sine wave,
-crossing zero to show both import and export conditions during the demo.
-Home load is inferred from the energy balance (no separate load meter needed):
-  load_W = solar_W + battery_W - meter_W
+The meter has two operating modes:
+
+  SINE MODE (default)
+    Net power oscillates ±peak W on a 600-second sine wave. Useful for
+    demos when the other simulators run independently.
+
+  LINKED MODE (-solar-api / -battery-api flags)
+    The meter derives its reading from the energy balance at the site bus:
+
+      meter_W = load_W - solar_W - battery_W
+
+    where:
+      load_W     = total site load (home + EV), settable via GUI or inject
+      solar_W    = live AC power read from the solar simapi
+      battery_W  = live AC power read from the battery simapi (+discharge/-charge)
+
+    This preserves real-world behaviour: the hub reads only the meter (as a
+    real installation would) and infers site load from:
+
+      load_W = solar_W + battery_W + meter_W
+
+    The hub logs this on every orchestrator tick as "load=NNNw".
 
 The hub polls it over Modbus TCP every 10 seconds and reports the
 net grid exchange in MirrorUsagePoint telemetry.
@@ -51,12 +69,12 @@ from 69.0.0.x and will not conflict.
     Look for eth0 (or enp2s0 on Pi 5). This guide uses eth0.
 
 2.  Set a static IP on eth0:
-      sudo nmcli con mod "Wired connection 1" \
+      sudo nmcli con mod "netplan-eth0" \
         ipv4.method manual \
         ipv4.addresses 69.0.0.12/24 \
         ipv4.gateway 69.0.0.1 \
         ipv4.dns "8.8.8.8 8.8.4.4"
-      sudo nmcli con up "Wired connection 1"
+      sudo nmcli con up "netplan-eth0"
 
     To list connection names: sudo nmcli con show
 
@@ -133,18 +151,25 @@ To update and rebuild:
 STEP 5 — TEST RUN (MANUAL)
 ==============================================================================
 
+Sine mode (standalone):
     ./bin/metersim -port 5022 -peak 5000
 
-Expected output:
-    metersim: starting grid meter on tcp://0.0.0.0:5022 (peak ±5000 W)
-    metersim: model: 1 (Common), 201 (Single-Phase AC Meter)
-    metersim: W cycles ±5000 W on a 600 s sine; updates every 5 s
+Linked mode (reads solar + battery live):
+    ./bin/metersim -port 5022 \
+      -solar-api http://69.0.0.10:6020 \
+      -battery-api http://69.0.0.11:6021 \
+      -load 3000
+
+Expected output (linked):
+    metersim: linked mode on tcp://0.0.0.0:5022  solar=http://69.0.0.10:6020  battery=http://69.0.0.11:6021  load=3000W
     metersim: listening — press Ctrl-C to stop
 
-During the 600-second cycle, the meter swings through:
-  - Full import (+5000 W) at t = 150 s into cycle
-  - Zero crossing at t = 0 / 300 s
-  - Full export (-5000 W) at t = 450 s into cycle
+In linked mode the meter reading updates every 5 s based on what solar
+and battery are actually doing.  Adjust the load via the GUI Meter tab
+"Site Load (W)" inject field, or via curl:
+    curl -s -X POST http://69.0.0.12:6022/inject \
+         -H 'Content-Type: application/json' \
+         -d '{"LoadW_W": 4500}'
 
 Press Ctrl-C to stop.
 
@@ -164,7 +189,10 @@ STEP 6 — INSTALL AS A SYSTEMD SERVICE
       Type=simple
       User=pi
       WorkingDirectory=/home/pi/csip-tls-test
-      ExecStart=/home/pi/csip-tls-test/bin/metersim -port 5022 -peak 5000
+      ExecStart=/home/pi/csip-tls-test/bin/metersim -port 5022 \
+        -solar-api http://69.0.0.10:6020 \
+        -battery-api http://69.0.0.11:6021 \
+        -load 3000
       Restart=on-failure
       RestartSec=5
       StandardOutput=journal
@@ -206,12 +234,22 @@ orchestrator from the energy balance: load_W = solar_W + battery_W - meter_W.
 PARAMETERS REFERENCE
 ==============================================================================
 
-  -port  int     TCP port to listen on (default 5022)
-  -peak  float   Peak net power magnitude in watts (default 5000)
-                 The meter oscillates between -peak and +peak W.
+  -port         int     Modbus TCP port to listen on (default 5022)
+  -api-port     int     HTTP simapi port (default 6022; 0 to disable)
+  -peak         float   Peak net power magnitude in watts, sine mode only (default 5000)
+  -solar-api    string  Solar simapi base URL, enables linked mode (e.g. http://69.0.0.10:6020)
+  -battery-api  string  Battery simapi base URL, enables linked mode (e.g. http://69.0.0.11:6021)
+  -load         float   Initial site load in watts, linked mode only (default 3000)
+                        Settable at runtime via POST /inject {"LoadW_W": 4500}
 
-Example — 10 kW service entrance:
+Example — sine mode, 10 kW service entrance:
     ./bin/metersim -port 5022 -peak 10000
+
+Example — linked mode, 3 kW default load:
+    ./bin/metersim -port 5022 \
+      -solar-api http://69.0.0.10:6020 \
+      -battery-api http://69.0.0.11:6021 \
+      -load 3000
 
 ==============================================================================
 TROUBLESHOOTING

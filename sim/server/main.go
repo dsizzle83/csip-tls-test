@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 func main() {
 	var (
 		listenAddr = flag.String("listen", "0.0.0.0:11111", "address:port to listen on")
+		adminAddr  = flag.String("admin", "0.0.0.0:11112", "plain HTTP admin API address:port (DERControl management)")
 		caCert     = flag.String("ca", "/home/dmitri/csip-tls-test/certs/ca-cert.pem", "CA cert PEM path")
 		serverCert = flag.String("cert", "/home/dmitri/csip-tls-test/certs/server-cert.pem", "server cert PEM path")
 		serverKey  = flag.String("key", "/home/dmitri/csip-tls-test/certs/server-key.pem", "server key PEM path")
@@ -58,6 +60,15 @@ func main() {
 	}
 	log.Printf("Server listening on %s (mTLS, cipher=%s)",
 		lis.Addr(), tlsserver.DefaultCipherList)
+
+	// Start plain HTTP admin API (DERControl management — no mTLS).
+	go func() {
+		adminSrv := &http.Server{Addr: *adminAddr, Handler: sim.AdminHandler()}
+		log.Printf("Admin API listening on %s (plain HTTP)", *adminAddr)
+		if err := adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("admin serve ended: %v", err)
+		}
+	}()
 
 	// Start OCPP 2.0.1 CSMS concurrently.
 	ocppSrv := ocppserver.New(ocppserver.Config{

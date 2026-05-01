@@ -49,12 +49,12 @@ from 69.0.0.x and will not conflict.
     Look for eth0 (or enp2s0 on Pi 5). This guide uses eth0.
 
 2.  Set a static IP on eth0:
-      sudo nmcli con mod "Wired connection 1" \
+      sudo nmcli con mod "netplan-eth0" \
         ipv4.method manual \
         ipv4.addresses 69.0.0.1/24 \
         ipv4.gateway 69.0.0.1 \
         ipv4.dns "8.8.8.8 8.8.4.4"
-      sudo nmcli con up "Wired connection 1"
+      sudo nmcli con up "netplan-eth0"
 
     Note: the hub IS the gateway for the demo LAN, so gateway = its own IP.
     Device Pis set 69.0.0.1 as their gateway so hub can route if needed.
@@ -164,17 +164,18 @@ STEP 6 — CONFIGURE hub.json
 Edit ~/csip-tls-test/hub.json to match your deployment:
 
     {
-      "csip": {
-        "server_url": "https://<WSL-WIFI-IP>:8443",
-        "ca_cert":     "certs/ca-cert.pem",
-        "client_cert": "certs/client-cert.pem",
-        "client_key":  "certs/client-key.pem",
-        "poll_interval_s": 30
-      },
-      "ocpp": {
-        "listen": ":8887",
-        "path":   "/ocpp"
-      },
+      "server":      "<WSL-WIFI-IP>:11111",
+      "ca_cert":     "certs/ca-cert.pem",
+      "client_cert": "certs/client-cert.pem",
+      "client_key":  "certs/client-key.pem",
+
+      "discovery_interval_s": 20,
+      "control_interval_s":   15,
+      "poll_interval_s":      10,
+      "mup_post_rate_s":      60,
+
+      "ocpp_port": 8887,
+
       "devices": [
         { "name": "solar-1",   "url": "tcp://69.0.0.10:5020", "unit_id": 1, "role": "inverter" },
         { "name": "battery-1", "url": "tcp://69.0.0.11:5021", "unit_id": 1, "role": "battery"  },
@@ -182,8 +183,8 @@ Edit ~/csip-tls-test/hub.json to match your deployment:
       ]
     }
 
-Replace <WSL-WIFI-IP> with the WiFi IP of your WSL machine (find it with
-`ip addr show eth0` inside WSL, or `ipconfig` on Windows under WSL adapter).
+Find your WSL machine's IP: run `ip addr show eth0` inside WSL, or check
+`ipconfig` on Windows and look for the WSL adapter address.
 
 ==============================================================================
 STEP 7 — BUILD THE HUB BINARY
@@ -218,7 +219,7 @@ Expected startup log:
     [modbus] connected: battery-1 tcp://69.0.0.11:5021
     [modbus] connected: meter     tcp://69.0.0.12:5022
     [ocpp] CSMS listening on :8887/ocpp/{id}
-    [csip] walker started → https://<WSL-WIFI-IP>:8443
+    [csip] walker started → <WSL-WIFI-IP>:11111
 
 Press Ctrl-C to stop.
 
@@ -269,7 +270,7 @@ TROUBLESHOOTING
     - Test TLS reachability:     curl --cacert certs/ca-cert.pem \
                                    --cert certs/client-cert.pem \
                                    --key  certs/client-key.pem \
-                                   https://<WSL-WIFI-IP>:8443/dcap
+                                   <WSL-WIFI-IP>:11111/dcap
 
   Modbus device not connecting:
     - Ping from hub:             ping 69.0.0.10   (solar Pi)

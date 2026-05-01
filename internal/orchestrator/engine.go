@@ -204,6 +204,9 @@ func (e *Engine) logPlan(state SystemState, plan Plan) {
 	if !math.IsNaN(state.Grid.NetW) {
 		fmt.Fprintf(&sb, " grid=%.0fW", state.Grid.NetW)
 	}
+	if load := state.InferredLoadW(); !math.IsNaN(load) {
+		fmt.Fprintf(&sb, " load=%.0fW", load)
+	}
 	if state.CSIPControl != nil {
 		fmt.Fprintf(&sb, " csip=%s(%s)", state.CSIPControl.Source, state.CSIPControl.MRID)
 	}
