@@ -35,6 +35,10 @@ type Engine struct {
 	clockOffset int64
 	sched       *scheduler.Scheduler
 
+	// Last plan — updated after every tick; readable from any goroutine.
+	planMu   sync.RWMutex
+	lastPlan Plan
+
 	// Debug mode: print full decision trace on every tick.
 	Debug bool
 
@@ -154,10 +158,23 @@ func (e *Engine) tick() {
 	// 4. Execute plan.
 	e.executePlan(plan)
 
-	// 5. Log decisions.
+	// 5. Store plan for external inspection (e.g. /status endpoint).
+	e.planMu.Lock()
+	e.lastPlan = plan
+	e.planMu.Unlock()
+
+	// 6. Log decisions.
 	if e.Debug || len(plan.Decisions) > 0 {
 		e.logPlan(state, plan)
 	}
+}
+
+// LastPlan returns a snapshot of the most recently computed Plan.
+// Safe for concurrent use from any goroutine.
+func (e *Engine) LastPlan() Plan {
+	e.planMu.RLock()
+	defer e.planMu.RUnlock()
+	return e.lastPlan
 }
 
 // executePlan fans out the plan's commands to the registered actuators.

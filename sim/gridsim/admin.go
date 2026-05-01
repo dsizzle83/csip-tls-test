@@ -3,6 +3,7 @@ package gridsim
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"time"
 
@@ -15,6 +16,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/status", cors(s.handleAdminStatus))
 	mux.HandleFunc("/admin/control", cors(s.handleAdminControl))
+	mux.HandleFunc("/admin/default", cors(s.handleAdminDefault))
 	return mux
 }
 
@@ -31,13 +33,30 @@ func cors(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ── Status ───────────────────────────────────────────────────────────────────
+
 type adminCtrlInfo struct {
-	MRID        string `json:"mrid"`
-	Description string `json:"description"`
-	ExportLimW  int    `json:"export_limit_W"`
-	Start       int64  `json:"start"`
-	DurationS   int    `json:"duration_s"`
-	Status      int    `json:"status"`
+	MRID        string          `json:"mrid"`
+	Description string          `json:"description"`
+	Start       int64           `json:"start"`
+	DurationS   int             `json:"duration_s"`
+	Status      int             `json:"status"`
+	Base        adminBaseInfo   `json:"base"`
+}
+
+// adminBaseInfo mirrors DERControlBase as JSON-friendly nullable fields.
+type adminBaseInfo struct {
+	ExpLimW        *int64   `json:"exp_lim_W,omitempty"`
+	MaxLimW        *int64   `json:"max_lim_W,omitempty"`
+	ImpLimW        *int64   `json:"imp_lim_W,omitempty"`
+	GenLimW        *int64   `json:"gen_lim_W,omitempty"`
+	LoadLimW       *int64   `json:"load_lim_W,omitempty"`
+	FixedW         *int64   `json:"fixed_W,omitempty"`
+	Connect        *bool    `json:"connect,omitempty"`
+	Energize       *bool    `json:"energize,omitempty"`
+	FixedPFInjectW *int64   `json:"fixed_pf_inject_pct,omitempty"`
+	FixedPFAbsorbW *int64   `json:"fixed_pf_absorb_pct,omitempty"`
+	FixedVarPct    *int64   `json:"fixed_var_pct,omitempty"`
 }
 
 type adminProgInfo struct {
@@ -45,6 +64,7 @@ type adminProgInfo struct {
 	MRID        string          `json:"mrid"`
 	Description string          `json:"description"`
 	Primacy     int             `json:"primacy"`
+	Default     *adminBaseInfo  `json:"default,omitempty"`
 	Active      []adminCtrlInfo `json:"active"`
 	Scheduled   []adminCtrlInfo `json:"scheduled"`
 }
@@ -81,6 +101,10 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 			Description: pm.Description,
 			Primacy:     pm.Primacy,
 		}
+		if dderc, ok := s.resources[fmt.Sprintf("/derp/%d/dderc", i)].(*model.DefaultDERControl); ok {
+			b := baseToInfo(dderc.DERControlBase)
+			ap.Default = &b
+		}
 		if actList, ok := s.resources[fmt.Sprintf("/derp/%d/actderc", i)].(*model.DERControlList); ok {
 			for _, c := range actList.DERControl {
 				ap.Active = append(ap.Active, ctrlToInfo(c))
@@ -107,23 +131,85 @@ func ctrlToInfo(c model.DERControl) adminCtrlInfo {
 		Description: c.Description,
 		Start:       c.Interval.Start,
 		DurationS:   int(c.Interval.Duration),
+		Base:        baseToInfo(c.DERControlBase),
 	}
 	if c.EventStatus != nil {
 		info.Status = int(c.EventStatus.CurrentStatus)
 	}
-	if c.DERControlBase.OpModExpLimW != nil {
-		info.ExportLimW = int(c.DERControlBase.OpModExpLimW.Value)
+	return info
+}
+
+func baseToInfo(b model.DERControlBase) adminBaseInfo {
+	info := adminBaseInfo{
+		Connect:  b.OpModConnect,
+		Energize: b.OpModEnergize,
+	}
+	if b.OpModExpLimW != nil {
+		v := apW(b.OpModExpLimW)
+		info.ExpLimW = &v
+	}
+	if b.OpModMaxLimW != nil {
+		v := apW(b.OpModMaxLimW)
+		info.MaxLimW = &v
+	}
+	if b.OpModImpLimW != nil {
+		v := apW(b.OpModImpLimW)
+		info.ImpLimW = &v
+	}
+	if b.OpModGenLimW != nil {
+		v := apW(b.OpModGenLimW)
+		info.GenLimW = &v
+	}
+	if b.OpModLoadLimW != nil {
+		v := apW(b.OpModLoadLimW)
+		info.LoadLimW = &v
+	}
+	if b.OpModFixedW != nil {
+		v := apW(b.OpModFixedW)
+		info.FixedW = &v
+	}
+	if b.OpModFixedPFInjectW != nil {
+		v := int64(b.OpModFixedPFInjectW.Value)
+		info.FixedPFInjectW = &v
+	}
+	if b.OpModFixedPFAbsorbW != nil {
+		v := int64(b.OpModFixedPFAbsorbW.Value)
+		info.FixedPFAbsorbW = &v
+	}
+	if b.OpModFixedVar != nil {
+		v := int64(b.OpModFixedVar.Value.Value)
+		info.FixedVarPct = &v
 	}
 	return info
 }
 
+func apW(ap *model.ActivePower) int64 {
+	return int64(math.Round(float64(ap.Value) * math.Pow10(int(ap.Multiplier))))
+}
+
+// ── Control POST/DELETE ───────────────────────────────────────────────────────
+
+// adminCtrlReq is the JSON body for POST /admin/control.
+// All OpMod fields are optional (nil = not included in the control).
 type adminCtrlReq struct {
-	Program     int    `json:"program"`
-	Description string `json:"description"`
-	ExportLimW  int    `json:"export_limit_W"`
-	StartOffset int    `json:"start_offset_s"`
-	DurationS   int    `json:"duration_s"`
-	Activate    bool   `json:"activate"`
+	Program        int    `json:"program"`
+	Description    string `json:"description"`
+	StartOffset    int    `json:"start_offset_s"` // seconds from now
+	DurationS      int    `json:"duration_s"`     // default 300
+	Activate       bool   `json:"activate"`       // true = replace active list
+
+	// DERControlBase fields — only non-nil ones are included in the event.
+	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
+	MaxLimW        *int64 `json:"max_lim_W,omitempty"`
+	ImpLimW        *int64 `json:"imp_lim_W,omitempty"`
+	GenLimW        *int64 `json:"gen_lim_W,omitempty"`
+	LoadLimW       *int64 `json:"load_lim_W,omitempty"`
+	FixedW         *int64 `json:"fixed_W,omitempty"`
+	Connect        *bool  `json:"connect,omitempty"`
+	Energize       *bool  `json:"energize,omitempty"`
+	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
+	FixedPFAbsorbW *int64 `json:"fixed_pf_absorb_pct,omitempty"`
+	FixedVarPct    *int64 `json:"fixed_var_pct,omitempty"`
 }
 
 func (s *Server) handleAdminControl(w http.ResponseWriter, r *http.Request) {
@@ -158,25 +244,20 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().Unix()
 	ctrl := model.DERControl{
-		Resource:     model.Resource{Href: fmt.Sprintf("/derp/%d/actderc/admin", req.Program)},
+		Resource:     model.Resource{Href: fmt.Sprintf("/derp/%d/derc/admin", req.Program)},
 		MRID:         fmt.Sprintf("DERC-%s-ADMIN-%d", progPrefixes[req.Program], now),
 		Description:  req.Description,
 		CreationTime: now,
 		EventStatus: &model.EventStatus{
-			CurrentStatus: 1, // Active
+			CurrentStatus: 1,
 			DateTime:      now,
 		},
 		Interval: model.DateTimeInterval{
 			Duration: uint32(req.DurationS),
 			Start:    now + int64(req.StartOffset),
 		},
-		DERControlBase: model.DERControlBase{
-			OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: int16(req.ExportLimW)},
-		},
+		DERControlBase: buildBase(req),
 	}
-
-	// Also set ctrl href to the derc path so the walker finds it.
-	ctrl.Resource.Href = fmt.Sprintf("/derp/%d/derc/admin", req.Program)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -233,6 +314,104 @@ func (s *Server) adminCtrlDelete(w http.ResponseWriter, r *http.Request) {
 			list.DERControl = nil
 			list.All = 0
 			list.Results = 0
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// buildBase constructs a DERControlBase from an adminCtrlReq.
+// Only fields that are non-nil in the request are set.
+func buildBase(req adminCtrlReq) model.DERControlBase {
+	b := model.DERControlBase{
+		OpModConnect:  req.Connect,
+		OpModEnergize: req.Energize,
+	}
+	ap16 := func(v *int64) *model.ActivePower {
+		if v == nil {
+			return nil
+		}
+		return &model.ActivePower{Value: int16(*v), Multiplier: 0}
+	}
+	b.OpModExpLimW = ap16(req.ExpLimW)
+	b.OpModMaxLimW = ap16(req.MaxLimW)
+	b.OpModImpLimW = ap16(req.ImpLimW)
+	b.OpModGenLimW = ap16(req.GenLimW)
+	b.OpModLoadLimW = ap16(req.LoadLimW)
+	b.OpModFixedW = ap16(req.FixedW)
+	if req.FixedPFInjectW != nil {
+		b.OpModFixedPFInjectW = &model.SignedPerCent{Value: int16(*req.FixedPFInjectW)}
+	}
+	if req.FixedPFAbsorbW != nil {
+		b.OpModFixedPFAbsorbW = &model.SignedPerCent{Value: int16(*req.FixedPFAbsorbW)}
+	}
+	if req.FixedVarPct != nil {
+		b.OpModFixedVar = &model.FixedVar{
+			RefType: 1, // 1 = rated capacity
+			Value:   model.SignedPerCent{Value: int16(*req.FixedVarPct)},
+		}
+	}
+	return b
+}
+
+// ── DefaultDERControl GET/POST ────────────────────────────────────────────────
+
+// adminDefaultReq is the body for POST /admin/default.
+type adminDefaultReq struct {
+	Program int           `json:"program"`
+	Base    adminCtrlReq  `json:"base"`
+	Clear   bool          `json:"clear,omitempty"`
+}
+
+func (s *Server) handleAdminDefault(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.adminDefaultGet(w, r)
+	case http.MethodPost:
+		s.adminDefaultPost(w, r)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) adminDefaultGet(w http.ResponseWriter, r *http.Request) {
+	prog := 0
+	if p := r.URL.Query().Get("program"); p != "" {
+		fmt.Sscanf(p, "%d", &prog)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	path := fmt.Sprintf("/derp/%d/dderc", prog)
+	if dderc, ok := s.resources[path].(*model.DefaultDERControl); ok {
+		b := baseToInfo(dderc.DERControlBase)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(b)
+		return
+	}
+	w.WriteHeader(http.StatusNotFound)
+}
+
+func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
+	var req adminDefaultReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Program < 0 || req.Program > 2 {
+		http.Error(w, "program must be 0, 1, or 2", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := fmt.Sprintf("/derp/%d/dderc", req.Program)
+	if dderc, ok := s.resources[path].(*model.DefaultDERControl); ok {
+		if req.Clear {
+			dderc.DERControlBase = model.DERControlBase{}
+		} else {
+			dderc.DERControlBase = buildBase(req.Base)
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)

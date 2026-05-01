@@ -51,6 +51,10 @@ build-httpsim:
 	@mkdir -p bin
 	go build -o bin/httpsim ./sim/httpsim
 
+build-dashboard:
+	@mkdir -p bin
+	go build -o bin/dashboard ./cmd/dashboard
+
 # Hub uses wolfSSL (cgo) — must be built natively on Pi.
 # Use sync-hub-pi to sync and build on the Pi in one step.
 build-hub:
@@ -328,6 +332,7 @@ help:
 	@echo "  make modsim-run          Start the simulator container (port 5020)"
 	@echo "  make modsim-stop         Stop the simulator container"
 	@echo "  make build-modsim        Build the simulator binary locally (bin/modsim)"
+	@echo "  make build-dashboard     Build the dashboard binary locally (bin/dashboard)"
 	@echo "  make build-modsim-client-pi  Cross-compile Modbus client for Pi (arm64)"
 	@echo "  make deploy-modsim-client-pi Deploy the client binary to the Pi"
 	@echo "  make smoke-modbus-pi     Deploy + run one-shot measurement read on Pi"

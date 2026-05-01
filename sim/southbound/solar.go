@@ -55,7 +55,7 @@ func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
 	bases := populateSolar(regs, wmaxW)
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
-		animateSolar(s, r, wmaxW, bases.M103Base, bases.M122Base, stop)
+		animateSolar(s, r, wmaxW, bases, stop)
 	})
 	if err != nil {
 		return nil, err
@@ -348,9 +348,10 @@ func populateSolar(r *RegisterMap, wmaxW float64) SolarBases {
 
 // ── animation ─────────────────────────────────────────────────────────────────
 
-func animateSolar(s *Server, r *RegisterMap, wmaxW float64, m103Base, m122Base uint16, stop <-chan struct{}) {
-	sfN := func(v int16) uint16 { return uint16(v) }
-	_ = sfN
+func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, stop <-chan struct{}) {
+	m103Base := bases.M103Base
+	m122Base := bases.M122Base
+	m123Base := bases.M123Base
 
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
@@ -365,17 +366,38 @@ func animateSolar(s *Server, r *RegisterMap, wmaxW float64, m103Base, m122Base u
 			if s.IsPaused() {
 				continue
 			}
+
+			// If disconnected via M123 Conn, zero output and skip animation.
+			if r.Get(m123Base+sunspec.M123_Conn) == 0 {
+				r.Set(m103Base+sunspec.M103_W, 0)
+				r.Set(m103Base+sunspec.M103_VA, 0)
+				r.Set(m103Base+sunspec.M103_VAr, 0)
+				r.Set(m103Base+sunspec.M103_St, 1) // off
+				r.Set(m122Base+sunspec.M122_WAval, 0)
+				continue
+			}
+
 			t := s.simTime()
 
 			irr := math.Max(0.05, math.Min(0.95, 0.5+0.45*math.Sin(2*math.Pi*t/600)))
 			w := wmaxW * irr
+
+			// Apply WMaxLimPct from M123 (written by hub over Modbus).
+			if r.Get(m123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
+				limPct := sunspec.ApplyScaleSigned(
+					r.Get(m123Base+sunspec.M123_WMaxLimPct),
+					int16(r.Get(m123Base+sunspec.M123_WMaxLimPct_SF)),
+				)
+				limW := wmaxW * math.Max(0, limPct) / 100.0
+				w = math.Min(w, limW)
+			}
 
 			v := 240.0 + 2.0*math.Sin(2*math.Pi*t/73)
 			hz := 60.0 + 0.05*math.Sin(2*math.Pi*t/47)
 			pf := math.Max(0.90, math.Min(0.99, 0.97+0.02*math.Sin(2*math.Pi*t/120)))
 			va := w / pf
 			varPwr := va * math.Sin(math.Acos(pf))
-			tmp := 35.0 + 20.0*irr
+			tmp := 35.0 + 20.0*(w/wmaxW)
 			dcv := 380.0 + 30.0*math.Sin(2*math.Pi*t/600)
 			dcw := w * 1.06
 			iph := w / (v * 3)
@@ -400,10 +422,13 @@ func animateSolar(s *Server, r *RegisterMap, wmaxW float64, m103Base, m122Base u
 			r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10))))
 			r.Set(m103Base+sunspec.M103_TmpSnk, uint16(int16(math.Round((tmp-5)*10))))
 
-			if irr < 0.06 {
-				r.Set(m103Base+sunspec.M103_St, 2)
-			} else {
-				r.Set(m103Base+sunspec.M103_St, 4)
+			switch {
+			case irr < 0.06:
+				r.Set(m103Base+sunspec.M103_St, 2) // sleeping
+			case w < wmaxW*irr*0.98:
+				r.Set(m103Base+sunspec.M103_St, 5) // throttled by WMaxLimPct
+			default:
+				r.Set(m103Base+sunspec.M103_St, 4) // MPPT
 			}
 
 			r.Set(m122Base+sunspec.M122_WAval, uint16(math.Round(w)))

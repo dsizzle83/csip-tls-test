@@ -1,0 +1,60 @@
+// cmd/dashboard serves a single-page DERMS dashboard that proxies API
+// calls to the hub, gridsim, and device simulator APIs.
+//
+// Usage:
+//
+//	dashboard -addr :8080 -hub http://hub:9100 -gridsim http://hub:11112 \
+//	          -solar http://solar:6020 -battery http://bat:6021 -meter http://meter:6022
+package main
+
+import (
+	_ "embed"
+	"flag"
+	"log"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+)
+
+//go:embed dashboard.html
+var dashboardHTML []byte
+
+func main() {
+	addr    := flag.String("addr",    ":8080",                  "listen address")
+	hub     := flag.String("hub",     "http://localhost:9100",  "hub metrics/status address")
+	gridsim := flag.String("gridsim", "http://localhost:11112", "gridsim admin address")
+	solar   := flag.String("solar",   "http://localhost:6020",  "solar simapi address")
+	battery := flag.String("battery", "http://localhost:6021",  "battery simapi address")
+	meter   := flag.String("meter",   "http://localhost:6022",  "meter simapi address")
+	flag.Parse()
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(dashboardHTML)
+	})
+
+	mux.Handle("/api/hub/",     stripProxy("/api/hub",     *hub))
+	mux.Handle("/api/gridsim/", stripProxy("/api/gridsim", *gridsim))
+	mux.Handle("/api/solar/",   stripProxy("/api/solar",   *solar))
+	mux.Handle("/api/battery/", stripProxy("/api/battery", *battery))
+	mux.Handle("/api/meter/",   stripProxy("/api/meter",   *meter))
+
+	log.Printf("dashboard: serving at http://%s", *addr)
+	log.Fatal(http.ListenAndServe(*addr, mux))
+}
+
+func stripProxy(prefix, target string) http.Handler {
+	u, err := url.Parse(target)
+	if err != nil {
+		log.Fatalf("invalid target URL %q: %v", target, err)
+	}
+	rp := httputil.NewSingleHostReverseProxy(u)
+	rp.FlushInterval = -1 // immediate flush; required for SSE pass-through
+	return http.StripPrefix(prefix, rp)
+}

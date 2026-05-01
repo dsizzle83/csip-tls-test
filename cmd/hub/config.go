@@ -48,6 +48,10 @@ type Config struct {
 
 	// EngineIntervalS is the orchestrator control tick in seconds. Default 15.
 	EngineIntervalS int `json:"engine_interval_s"`
+
+	// Debug enables verbose orchestrator decision logging on every tick.
+	// Set to true in hub.json to see exactly why commands are or aren't issued.
+	Debug bool `json:"debug"`
 }
 
 func (c *Config) DiscoveryInterval() time.Duration {

@@ -258,26 +258,26 @@ func (a *RegistryBatteryActuator) ApplyBatteryCommand(cmd orchestrator.BatteryCo
 
 // RegistrySolarActuator applies SolarCommands via the registry.
 type RegistrySolarActuator struct {
-	reg  *registry.Registry
-	maxW float64
+	reg     *registry.Registry
+	devName string
+	maxW    float64
 }
 
-// NewRegistrySolarActuator creates an actuator for a solar inverter.
-func NewRegistrySolarActuator(reg *registry.Registry, maxW float64) *RegistrySolarActuator {
-	return &RegistrySolarActuator{reg: reg, maxW: maxW}
+// NewRegistrySolarActuator creates an actuator for the named solar inverter.
+func NewRegistrySolarActuator(reg *registry.Registry, devName string, maxW float64) *RegistrySolarActuator {
+	return &RegistrySolarActuator{reg: reg, devName: devName, maxW: maxW}
 }
 
 // ApplySolarCommand implements orchestrator.SolarActuator.
 func (a *RegistrySolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand) error {
+	var w int16
 	if math.IsNaN(cmd.CurtailToW) {
-		// No curtailment — restore full output (100%).
-		pct := int16(100)
-		return a.reg.ApplyControl(model.DERControlBase{
-			OpModMaxLimW: &model.ActivePower{Value: pct, Multiplier: 0},
-		})
+		// No curtailment — restore full nameplate output.
+		w = int16(a.maxW)
+	} else {
+		w = int16(math.Max(0, cmd.CurtailToW))
 	}
-	w := int16(cmd.CurtailToW)
-	return a.reg.ApplyControl(model.DERControlBase{
+	return a.reg.ApplyControlTo(a.devName, model.DERControlBase{
 		OpModMaxLimW: &model.ActivePower{Value: w, Multiplier: 0},
 	})
 }

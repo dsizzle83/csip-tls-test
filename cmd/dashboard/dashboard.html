@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DERMS Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; font-size: 14px; }
+a { color: #60a5fa; }
+
+/* ── Layout ── */
+.page { display: flex; flex-direction: column; gap: 12px; padding: 12px; min-height: 100vh; }
+.row  { display: flex; gap: 12px; }
+.col  { display: flex; flex-direction: column; gap: 12px; }
+
+/* ── Cards ── */
+.card {
+  background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+  padding: 12px 16px;
+}
+.card h3 { font-size: 11px; font-weight: 600; text-transform: uppercase;
+           letter-spacing: .08em; color: #94a3b8; margin-bottom: 8px; }
+
+/* ── Header ── */
+.header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.header h1 { font-size: 18px; font-weight: 700; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: #475569; display: inline-block; }
+.dot.ok  { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+.dot.err { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+.stat-label { color: #94a3b8; font-size: 12px; }
+.stat-value { font-weight: 600; }
+
+/* ── Power cards ── */
+.power-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.pcard { text-align: center; padding: 16px 12px; }
+.pcard .val { font-size: 28px; font-weight: 700; line-height: 1.1; margin-bottom: 4px; }
+.pcard .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: #94a3b8; }
+.pcard .sub { font-size: 12px; color: #64748b; margin-top: 4px; }
+.pcard.solar  { border-color: #059669; }
+.pcard.battery { border-color: #2563eb; }
+.pcard.grid   { border-color: #d97706; }
+.pcard.load   { border-color: #7c3aed; }
+.c-solar   { color: #34d399; }
+.c-battery { color: #60a5fa; }
+.c-grid    { color: #fbbf24; }
+.c-load    { color: #a78bfa; }
+.c-pos  { color: #4ade80; }
+.c-neg  { color: #f87171; }
+
+/* ── Chart ── */
+.chart-wrap { flex: 1; min-height: 220px; position: relative; }
+
+/* ── CSIP panel ── */
+.csip-active { background: #0f172a; border-radius: 6px; padding: 10px; font-size: 12px; min-height: 40px; }
+.csip-field  { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px solid #1e293b; }
+.csip-field:last-child { border-bottom: none; }
+.csip-field .name  { color: #94a3b8; }
+.csip-field .value { font-weight: 600; color: #fbbf24; }
+.mrid { font-size: 10px; color: #64748b; word-break: break-all; margin-bottom: 6px; }
+
+/* ── Forms ── */
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
+.field { display: flex; flex-direction: column; gap: 3px; }
+.field label { font-size: 11px; color: #94a3b8; }
+.field input, .field select {
+  background: #0f172a; border: 1px solid #334155; border-radius: 4px;
+  color: #e2e8f0; padding: 5px 8px; font-size: 13px; width: 100%;
+}
+.field input:focus, .field select:focus { outline: none; border-color: #60a5fa; }
+.field.full { grid-column: 1 / -1; }
+.check-row  { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.check-row input { width: auto; }
+
+/* ── Buttons ── */
+.btn {
+  padding: 7px 14px; border-radius: 5px; border: none; cursor: pointer;
+  font-size: 13px; font-weight: 600; transition: filter .15s;
+}
+.btn:hover { filter: brightness(1.15); }
+.btn-primary { background: #2563eb; color: #fff; }
+.btn-danger  { background: #dc2626; color: #fff; }
+.btn-sm      { padding: 4px 10px; font-size: 12px; }
+.btn-row     { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+
+/* ── Device cards ── */
+.device-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+.dcard .dval { font-size: 20px; font-weight: 700; }
+.dcard .rows { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; }
+.dcard .row2 { display: flex; justify-content: space-between; font-size: 12px; }
+.dcard .row2 .k { color: #64748b; }
+.dcard .row2 .v { font-weight: 600; }
+.soc-bar-bg { background: #1e293b; border-radius: 4px; height: 8px; margin-top: 6px; overflow: hidden; }
+.soc-bar    { height: 100%; background: #22c55e; border-radius: 4px; transition: width .4s; }
+
+/* ── Status badge ── */
+.badge { display: inline-block; padding: 2px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.badge-on  { background: #14532d; color: #4ade80; }
+.badge-off { background: #7f1d1d; color: #fca5a5; }
+
+/* ── Log stream ── */
+.log-wrap { flex: 1; overflow-y: auto; font-family: monospace; font-size: 11px;
+            background: #020617; border-radius: 6px; padding: 8px; max-height: 220px; }
+.log-line  { color: #94a3b8; padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+.log-line.orch  { color: #67e8f9; }
+.log-line.warn  { color: #fbbf24; }
+.log-line.err   { color: #f87171; }
+
+/* ── Inject section ── */
+.inject-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; }
+.inject-form .field { min-width: 110px; }
+
+/* ── Tabs ── */
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid #334155; margin-bottom: 10px; }
+.tab  { padding: 5px 12px; cursor: pointer; border-radius: 4px 4px 0 0;
+        font-size: 12px; font-weight: 600; color: #64748b; background: none; border: none; }
+.tab.active { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-bottom: 1px solid #1e293b; }
+
+/* ── Responsive ── */
+@media (max-width: 900px) {
+  .power-cards { grid-template-columns: 1fr 1fr; }
+  .device-grid { grid-template-columns: 1fr; }
+  .row { flex-direction: column; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- ── Header ─────────────────────────────────────────────────── -->
+<div class="card header">
+  <h1>DERMS Dashboard</h1>
+  <span id="hub-dot" class="dot" title="Hub connection"></span>
+  <span>
+    <span class="stat-label">Hub</span>
+    <span class="stat-value" id="hub-time">—</span>
+  </span>
+  <span>
+    <span class="stat-label">CSIP programs</span>
+    <span class="stat-value" id="csip-programs">—</span>
+  </span>
+  <span>
+    <span class="stat-label">Clock offset</span>
+    <span class="stat-value" id="clock-offset">—</span>
+  </span>
+  <span>
+    <span class="stat-label">Active control</span>
+    <span class="stat-value" id="csip-source">—</span>
+  </span>
+  <span style="margin-left:auto; font-size:11px; color:#475569" id="last-poll">never polled</span>
+</div>
+
+<!-- ── Power flow ──────────────────────────────────────────────── -->
+<div class="power-cards">
+  <div class="card pcard solar">
+    <div class="val c-solar" id="solar-w">—</div>
+    <div class="lbl">Solar</div>
+    <div class="sub" id="solar-sub">—</div>
+  </div>
+  <div class="card pcard battery">
+    <div class="val c-battery" id="battery-w">—</div>
+    <div class="lbl">Battery</div>
+    <div class="sub" id="battery-sub">—</div>
+  </div>
+  <div class="card pcard grid">
+    <div class="val" id="grid-w">—</div>
+    <div class="lbl">Grid</div>
+    <div class="sub" id="grid-sub">—</div>
+  </div>
+  <div class="card pcard load">
+    <div class="val c-load" id="load-w">—</div>
+    <div class="lbl">Load</div>
+    <div class="sub">inferred</div>
+  </div>
+</div>
+
+<!-- ── Chart ──────────────────────────────────────────────────── -->
+<div class="card" style="padding:12px 16px 8px;">
+  <h3>Power history (last 5 min)</h3>
+  <div class="chart-wrap"><canvas id="power-chart"></canvas></div>
+</div>
+
+<!-- ── Main row: CSIP + Devices ───────────────────────────────── -->
+<div class="row">
+
+  <!-- Left: CSIP panel -->
+  <div class="col" style="flex:0 0 340px;">
+
+    <!-- Active control -->
+    <div class="card">
+      <h3>Active CSIP Control</h3>
+      <div id="csip-active-panel" class="csip-active">No active control</div>
+    </div>
+
+    <!-- DERControl form -->
+    <div class="card">
+      <h3>Send DERControl</h3>
+      <div class="form-grid" id="derc-form">
+
+        <div class="field">
+          <label>Program</label>
+          <select id="derc-prog">
+            <option value="0">0 — Service Point</option>
+            <option value="1">1 — Site</option>
+            <option value="2">2 — System</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Duration (s)</label>
+          <input type="number" id="derc-dur" value="300" min="1">
+        </div>
+        <div class="field">
+          <label>Start offset (s)</label>
+          <input type="number" id="derc-offset" value="0" min="0">
+        </div>
+        <div class="field">
+          <label>Description</label>
+          <input type="text" id="derc-desc" placeholder="Admin control">
+        </div>
+
+        <div class="field full">
+          <div class="check-row">
+            <input type="checkbox" id="derc-activate">
+            <label for="derc-activate">Replace active list (Activate)</label>
+          </div>
+        </div>
+
+        <div style="grid-column:1/-1; border-top:1px solid #334155; padding-top:8px; margin-top:2px;">
+          <div style="font-size:11px;color:#64748b;margin-bottom:6px;">OpMod fields — leave blank to omit</div>
+          <div class="form-grid">
+            <div class="field">
+              <label>ExpLimW (export cap W)</label>
+              <input type="number" id="derc-explim" placeholder="e.g. 3000">
+            </div>
+            <div class="field">
+              <label>MaxLimW (gen cap W)</label>
+              <input type="number" id="derc-maxlim" placeholder="e.g. 5000">
+            </div>
+            <div class="field">
+              <label>ImpLimW (import cap W)</label>
+              <input type="number" id="derc-implim" placeholder="e.g. 4000">
+            </div>
+            <div class="field">
+              <label>GenLimW (gen floor W)</label>
+              <input type="number" id="derc-genlim" placeholder="">
+            </div>
+            <div class="field">
+              <label>LoadLimW (load cap W)</label>
+              <input type="number" id="derc-loadlim" placeholder="">
+            </div>
+            <div class="field">
+              <label>FixedW (fixed setpt W)</label>
+              <input type="number" id="derc-fixedw" placeholder="">
+            </div>
+            <div class="field">
+              <label>FixedPF Inject (%×100)</label>
+              <input type="number" id="derc-pfinj" placeholder="">
+            </div>
+            <div class="field">
+              <label>FixedPF Absorb (%×100)</label>
+              <input type="number" id="derc-pfabs" placeholder="">
+            </div>
+            <div class="field">
+              <label>FixedVar (%×100)</label>
+              <input type="number" id="derc-fixvar" placeholder="">
+            </div>
+            <div class="field">
+              <label>Connect</label>
+              <select id="derc-connect">
+                <option value="">— not set —</option>
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Energize</label>
+              <select id="derc-energize">
+                <option value="">— not set —</option>
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="sendDERC()">Send Control</button>
+        <button class="btn btn-danger btn-sm" onclick="clearDERC(0)" title="Clear program 0 (SP)">Clear SP</button>
+        <button class="btn btn-danger btn-sm" onclick="clearDERC(1)" title="Clear program 1 (Site)">Clear Site</button>
+        <button class="btn btn-danger btn-sm" onclick="clearDERC(2)" title="Clear program 2 (Sys)">Clear Sys</button>
+      </div>
+      <div id="derc-status" style="margin-top:8px;font-size:12px;color:#94a3b8;"></div>
+    </div>
+
+    <!-- Default DERControl -->
+    <div class="card">
+      <h3>Default DERControl (program 0)</h3>
+      <div id="default-panel" class="csip-active" style="margin-bottom:8px;">Loading…</div>
+      <div class="btn-row">
+        <button class="btn btn-primary btn-sm" onclick="loadDefault()">Refresh</button>
+        <button class="btn btn-danger btn-sm" onclick="clearDefault()">Clear Default</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Right: Devices + inject -->
+  <div class="col" style="flex:1;">
+
+    <div class="card">
+      <h3>Devices</h3>
+      <div class="device-grid" id="device-grid">
+        <div class="card dcard" id="solar-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-weight:700;color:#34d399;">Solar</span>
+            <span id="solar-conn" class="badge badge-off">—</span>
+          </div>
+          <div class="dval c-solar" id="d-solar-w">— W</div>
+          <div class="rows" id="d-solar-rows"></div>
+        </div>
+        <div class="card dcard" id="battery-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-weight:700;color:#60a5fa;">Battery</span>
+            <span id="bat-conn" class="badge badge-off">—</span>
+          </div>
+          <div class="dval c-battery" id="d-bat-w">— W</div>
+          <div id="soc-bar-wrap" class="soc-bar-bg"><div class="soc-bar" id="soc-bar" style="width:0%"></div></div>
+          <div class="rows" id="d-bat-rows"></div>
+        </div>
+        <div class="card dcard" id="meter-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-weight:700;color:#fbbf24;">Meter</span>
+            <span id="meter-conn" class="badge badge-off">—</span>
+          </div>
+          <div class="dval" id="d-meter-w">— W</div>
+          <div class="rows" id="d-meter-rows"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Inject controls -->
+    <div class="card">
+      <h3>Device Inject</h3>
+      <div class="tabs">
+        <button class="tab active" onclick="showTab('tab-solar',this)">Solar</button>
+        <button class="tab" onclick="showTab('tab-battery',this)">Battery</button>
+        <button class="tab" onclick="showTab('tab-meter',this)">Meter</button>
+      </div>
+
+      <div id="tab-solar">
+        <div class="inject-form">
+          <div class="field"><label>W_W (override)</label><input type="number" id="inj-solar-w" placeholder="pause first"></div>
+          <div class="field"><label>WMaxLimPct (0-100)</label><input type="number" id="inj-solar-pct" min="0" max="100"></div>
+          <div class="field"><label>Conn (0/1)</label><select id="inj-solar-conn"><option value="">—</option><option value="1">1 (on)</option><option value="0">0 (off)</option></select></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary btn-sm" onclick="injectSolar()">Inject Solar</button>
+          <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155" onclick="ctrlSolar('pause')">Pause anim</button>
+          <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155" onclick="ctrlSolar('resume')">Resume anim</button>
+        </div>
+        <div id="inj-solar-status" style="margin-top:6px;font-size:11px;color:#94a3b8;"></div>
+      </div>
+
+      <div id="tab-battery" style="display:none">
+        <div class="inject-form">
+          <div class="field"><label>SoC_pct (0-100)</label><input type="number" id="inj-bat-soc" min="0" max="100"></div>
+          <div class="field"><label>WMaxLimPct (0-100)</label><input type="number" id="inj-bat-pct" min="0" max="100"></div>
+          <div class="field"><label>Conn (0/1)</label><select id="inj-bat-conn"><option value="">—</option><option value="1">1 (on)</option><option value="0">0 (off)</option></select></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary btn-sm" onclick="injectBattery()">Inject Battery</button>
+          <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155" onclick="ctrlBattery('pause')">Pause anim</button>
+          <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155" onclick="ctrlBattery('resume')">Resume anim</button>
+        </div>
+        <div id="inj-bat-status" style="margin-top:6px;font-size:11px;color:#94a3b8;"></div>
+      </div>
+
+      <div id="tab-meter" style="display:none">
+        <div class="inject-form">
+          <div class="field"><label>W_W (+ import, − export)</label><input type="number" id="inj-meter-w" placeholder="e.g. -500"></div>
+          <div class="field"><label>V_V</label><input type="number" id="inj-meter-v" placeholder="240"></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary btn-sm" onclick="injectMeter()">Inject Meter</button>
+          <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155" onclick="ctrlMeter('pause')">Pause anim</button>
+          <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155" onclick="ctrlMeter('resume')">Resume anim</button>
+        </div>
+        <div id="inj-meter-status" style="margin-top:6px;font-size:11px;color:#94a3b8;"></div>
+      </div>
+    </div>
+
+    <!-- Orchestrator decisions -->
+    <div class="card">
+      <h3>Last Orchestrator Decisions</h3>
+      <div id="decisions-panel" style="font-size:12px;color:#94a3b8;">No decisions yet</div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ── Log stream ──────────────────────────────────────────────── -->
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <h3>Hub Log Stream</h3>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <span id="log-status" style="font-size:11px;color:#64748b;">connecting…</span>
+      <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155" onclick="clearLogs()">Clear</button>
+    </div>
+  </div>
+  <div class="log-wrap" id="log-stream"></div>
+</div>
+
+</div><!-- .page -->
+
+<script>
+'use strict';
+
+// ── Chart setup ────────────────────────────────────────────────────────────────
+const MAX_PTS = 60;
+const chartLabels = [];
+const chartData = { solar: [], battery: [], grid: [], load: [] };
+
+const chart = new Chart(document.getElementById('power-chart').getContext('2d'), {
+  type: 'line',
+  data: {
+    labels: chartLabels,
+    datasets: [
+      { label: 'Solar W',   data: chartData.solar,   borderColor: '#34d399', backgroundColor: '#34d39910', tension: 0.3, pointRadius: 0, borderWidth: 2 },
+      { label: 'Battery W', data: chartData.battery, borderColor: '#60a5fa', backgroundColor: '#60a5fa10', tension: 0.3, pointRadius: 0, borderWidth: 2 },
+      { label: 'Grid W',    data: chartData.grid,    borderColor: '#fbbf24', backgroundColor: '#fbbf2410', tension: 0.3, pointRadius: 0, borderWidth: 2 },
+      { label: 'Load W',    data: chartData.load,    borderColor: '#a78bfa', backgroundColor: '#a78bfa10', tension: 0.3, pointRadius: 0, borderWidth: 2 },
+    ],
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: true,
+    aspectRatio: 3.5,
+    plugins: { legend: { labels: { color: '#94a3b8', boxWidth: 12, font: { size: 11 } } } },
+    scales: {
+      x: { ticks: { color: '#475569', maxTicksLimit: 6, font: { size: 10 } }, grid: { color: '#1e293b' } },
+      y: { ticks: { color: '#475569', font: { size: 10 } }, grid: { color: '#1e293b' } },
+    },
+  },
+});
+
+function pushChart(time, solar, battery, grid, load) {
+  const t = new Date(time).toLocaleTimeString();
+  chartLabels.push(t);
+  chartData.solar.push(solar);
+  chartData.battery.push(battery);
+  chartData.grid.push(isNaN(grid) ? null : grid);
+  chartData.load.push(isNaN(load) ? null : load);
+  if (chartLabels.length > MAX_PTS) {
+    chartLabels.shift();
+    Object.values(chartData).forEach(d => d.shift());
+  }
+  chart.update('none');
+}
+
+// ── Hub status polling ─────────────────────────────────────────────────────────
+async function pollHub() {
+  try {
+    const resp = await fetch('/api/hub/status');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const d = await resp.json();
+
+    document.getElementById('hub-dot').className = 'dot ok';
+    document.getElementById('hub-time').textContent = new Date(d.timestamp).toLocaleTimeString();
+    document.getElementById('csip-programs').textContent = d.csip_programs ?? '?';
+    document.getElementById('clock-offset').textContent = (d.clock_offset_s ?? '?') + 's';
+    document.getElementById('last-poll').textContent = 'updated ' + new Date().toLocaleTimeString();
+
+    const p = d.power || {};
+    const solar   = p.solar_W   ?? 0;
+    const battery = p.battery_W ?? 0;
+    const grid    = p.grid_W    ?? 0;
+    const load    = p.load_W    ?? 0;
+
+    setText('solar-w',   fmt(solar)   + ' W');
+    setText('battery-w', fmt(battery) + ' W');
+    setText('load-w',    fmt(load)    + ' W');
+
+    // Grid: positive = import (bad), negative = export (good)
+    const gEl = document.getElementById('grid-w');
+    gEl.textContent = fmt(grid) + ' W';
+    gEl.className   = 'val ' + (grid > 0 ? 'c-neg' : grid < 0 ? 'c-pos' : '');
+    document.getElementById('grid-sub').textContent = grid > 50 ? '▲ importing' : grid < -50 ? '▼ exporting' : 'balanced';
+
+    setText('solar-sub',   'of ' + fmt((d.devices ? Object.values(d.devices).find(d=>d.role==='solar')?.max_W : 0) || 0) + ' W cap');
+    const batDev = d.devices ? Object.values(d.devices).find(x => x.role === 'battery') : null;
+    if (batDev) setText('battery-sub', 'SOC ' + (batDev.soc_pct ? batDev.soc_pct.toFixed(1) + '%' : '—'));
+
+    // CSIP control
+    const ctrl = d.csip_control;
+    document.getElementById('csip-source').textContent = ctrl ? ctrl.source + ' / ' + (ctrl.mrid || '') : 'none';
+    renderCSIPActive(ctrl);
+
+    // Devices
+    const devs = d.devices || {};
+    Object.entries(devs).forEach(([name, dev]) => {
+      updateHubDevice(name, dev);
+    });
+
+    // Decisions
+    renderDecisions(d.last_plan?.decisions || []);
+
+    // Chart
+    pushChart(d.timestamp, solar, battery, grid, load);
+
+  } catch (e) {
+    document.getElementById('hub-dot').className = 'dot err';
+    document.getElementById('last-poll').textContent = 'error: ' + e.message;
+  }
+}
+
+function renderCSIPActive(ctrl) {
+  const el = document.getElementById('csip-active-panel');
+  if (!ctrl) { el.textContent = 'No active control'; return; }
+  const b = ctrl.base || {};
+  const fields = [
+    ['Source', ctrl.source],
+    ['MRID', ctrl.mrid],
+    ['Valid until', ctrl.valid_until ? new Date(ctrl.valid_until*1000).toLocaleTimeString() : '—'],
+    ctrl.base?.exp_lim_W != null   && ['ExpLimW', ctrl.base.exp_lim_W + ' W'],
+    ctrl.base?.max_lim_W != null   && ['MaxLimW', ctrl.base.max_lim_W + ' W'],
+    ctrl.base?.imp_lim_W != null   && ['ImpLimW', ctrl.base.imp_lim_W + ' W'],
+    ctrl.base?.gen_lim_W != null   && ['GenLimW', ctrl.base.gen_lim_W + ' W'],
+    ctrl.base?.load_lim_W != null  && ['LoadLimW', ctrl.base.load_lim_W + ' W'],
+    ctrl.base?.fixed_W != null     && ['FixedW', ctrl.base.fixed_W + ' W'],
+    ctrl.base?.connect != null     && ['Connect', ctrl.base.connect],
+    ctrl.base?.energize != null    && ['Energize', ctrl.base.energize],
+    ctrl.base?.fixed_pf_inject_pct != null && ['PF Inject', ctrl.base.fixed_pf_inject_pct],
+    ctrl.base?.fixed_pf_absorb_pct != null && ['PF Absorb', ctrl.base.fixed_pf_absorb_pct],
+    ctrl.base?.fixed_var_pct != null && ['FixedVar%', ctrl.base.fixed_var_pct],
+  ].filter(Boolean);
+
+  el.innerHTML = fields.map(([k, v]) =>
+    `<div class="csip-field"><span class="name">${k}</span><span class="value">${v}</span></div>`
+  ).join('');
+}
+
+function renderDecisions(decisions) {
+  const el = document.getElementById('decisions-panel');
+  if (!decisions.length) { el.textContent = 'No decisions this tick'; return; }
+  el.innerHTML = decisions.map(d =>
+    `<div style="padding:4px 0;border-bottom:1px solid #1e293b;">
+      <span style="color:#60a5fa;font-weight:600;">[${d.rule}]</span>
+      <span style="color:#94a3b8;"> ${d.reason}</span>
+      <span style="color:#4ade80;"> → ${d.impact}</span>
+    </div>`
+  ).join('');
+}
+
+// Update device card from hub /status devices map
+function updateHubDevice(name, dev) {
+  if (dev.role === 'solar') {
+    document.getElementById('solar-conn').className = 'badge ' + (dev.connected ? 'badge-on' : 'badge-off');
+    document.getElementById('solar-conn').textContent = dev.connected ? 'ON' : 'OFF';
+    document.getElementById('d-solar-w').textContent = fmt(dev.W_W) + ' W';
+    document.getElementById('d-solar-rows').innerHTML = kv([
+      ['V', dev.V_V ? dev.V_V.toFixed(1) + ' V' : '—'],
+      ['Hz', dev.Hz_Hz ? dev.Hz_Hz.toFixed(2) + ' Hz' : '—'],
+      ['Max', dev.max_W ? dev.max_W + ' W' : '—'],
+    ]);
+  } else if (dev.role === 'battery') {
+    document.getElementById('bat-conn').className = 'badge ' + (dev.connected ? 'badge-on' : 'badge-off');
+    document.getElementById('bat-conn').textContent = dev.connected ? 'ON' : 'OFF';
+    document.getElementById('d-bat-w').textContent = fmt(dev.W_W) + ' W';
+    if (dev.soc_pct) {
+      document.getElementById('soc-bar').style.width = dev.soc_pct + '%';
+      document.getElementById('soc-bar').style.background = dev.soc_pct < 20 ? '#ef4444' : dev.soc_pct < 50 ? '#f59e0b' : '#22c55e';
+    }
+    document.getElementById('d-bat-rows').innerHTML = kv([
+      ['SOC', dev.soc_pct ? dev.soc_pct.toFixed(1) + '%' : '—'],
+      ['V', dev.V_V ? dev.V_V.toFixed(1) + ' V' : '—'],
+      ['Hz', dev.Hz_Hz ? dev.Hz_Hz.toFixed(2) + ' Hz' : '—'],
+    ]);
+  } else if (dev.role === 'meter') {
+    document.getElementById('meter-conn').className = 'badge badge-on';
+    document.getElementById('meter-conn').textContent = 'ON';
+    const mEl = document.getElementById('d-meter-w');
+    mEl.textContent = fmt(dev.W_W) + ' W';
+    mEl.className   = 'dval ' + (dev.W_W > 0 ? 'c-neg' : 'c-pos');
+    document.getElementById('d-meter-rows').innerHTML = kv([
+      ['V', dev.V_V ? dev.V_V.toFixed(1) + ' V' : '—'],
+      ['Hz', dev.Hz_Hz ? dev.Hz_Hz.toFixed(2) + ' Hz' : '—'],
+      ['Flow', dev.W_W > 50 ? '▲ import' : dev.W_W < -50 ? '▼ export' : '≈ zero'],
+    ]);
+  }
+}
+
+// ── Simapi polling ─────────────────────────────────────────────────────────────
+async function pollSim(path, updateFn) {
+  try {
+    const resp = await fetch(path);
+    if (resp.ok) updateFn(await resp.json());
+  } catch (_) {}
+}
+
+// ── SSE log stream ─────────────────────────────────────────────────────────────
+const LOG_MAX = 300;
+let logLines = [];
+
+function connectLogs() {
+  const es = new EventSource('/api/hub/logs');
+  es.onopen  = () => setLogStatus('connected', '#22c55e');
+  es.onerror = () => { setLogStatus('reconnecting…', '#f59e0b'); };
+  es.onmessage = (e) => appendLog(e.data);
+}
+
+function appendLog(line) {
+  logLines.push(line);
+  if (logLines.length > LOG_MAX) logLines.shift();
+  const el = document.getElementById('log-stream');
+  const div = document.createElement('div');
+  div.className = 'log-line' +
+    (line.includes('[orchestrator]') ? ' orch' : '') +
+    (line.toLowerCase().includes('error') || line.toLowerCase().includes('err') ? ' err' : '') +
+    (line.toLowerCase().includes('warn') ? ' warn' : '');
+  div.textContent = line;
+  el.appendChild(div);
+  // Keep scrolled to bottom
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
+    el.scrollTop = el.scrollHeight;
+  }
+  // Trim old lines
+  while (el.children.length > LOG_MAX) el.removeChild(el.firstChild);
+}
+
+function clearLogs() {
+  logLines = [];
+  document.getElementById('log-stream').innerHTML = '';
+}
+
+function setLogStatus(msg, color) {
+  const el = document.getElementById('log-status');
+  el.textContent = msg;
+  el.style.color = color || '#94a3b8';
+}
+
+// ── DERControl form ────────────────────────────────────────────────────────────
+function buildDERCReq() {
+  const intOrNull = id => { const v = document.getElementById(id).value.trim(); return v === '' ? undefined : parseInt(v, 10); };
+  const boolOrNull = id => { const v = document.getElementById(id).value; return v === '' ? undefined : v === 'true'; };
+  const req = {
+    program:        parseInt(document.getElementById('derc-prog').value),
+    duration_s:     intOrNull('derc-dur') || 300,
+    start_offset_s: intOrNull('derc-offset') || 0,
+    description:    document.getElementById('derc-desc').value || undefined,
+    activate:       document.getElementById('derc-activate').checked,
+  };
+  const optInt = (key, id) => { const v = intOrNull(id); if (v != null) req[key] = v; };
+  optInt('exp_lim_W',            'derc-explim');
+  optInt('max_lim_W',            'derc-maxlim');
+  optInt('imp_lim_W',            'derc-implim');
+  optInt('gen_lim_W',            'derc-genlim');
+  optInt('load_lim_W',           'derc-loadlim');
+  optInt('fixed_W',              'derc-fixedw');
+  optInt('fixed_pf_inject_pct',  'derc-pfinj');
+  optInt('fixed_pf_absorb_pct',  'derc-pfabs');
+  optInt('fixed_var_pct',        'derc-fixvar');
+  const conn = boolOrNull('derc-connect');
+  if (conn != null) req.connect = conn;
+  const ener = boolOrNull('derc-energize');
+  if (ener != null) req.energize = ener;
+  return req;
+}
+
+async function sendDERC() {
+  const req = buildDERCReq();
+  setStatus('derc-status', '…sending…', '#94a3b8');
+  try {
+    const resp = await fetch('/api/gridsim/admin/control', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(req),
+    });
+    if (resp.ok) {
+      setStatus('derc-status', '✓ sent (program ' + req.program + ')', '#4ade80');
+    } else {
+      const txt = await resp.text();
+      setStatus('derc-status', '✗ ' + resp.status + ': ' + txt, '#f87171');
+    }
+  } catch (e) {
+    setStatus('derc-status', '✗ ' + e.message, '#f87171');
+  }
+}
+
+async function clearDERC(prog) {
+  setStatus('derc-status', '…clearing program ' + prog + '…', '#94a3b8');
+  try {
+    const resp = await fetch('/api/gridsim/admin/control', {
+      method: 'DELETE', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({program: prog}),
+    });
+    if (resp.ok) {
+      setStatus('derc-status', '✓ cleared program ' + prog, '#4ade80');
+    } else {
+      setStatus('derc-status', '✗ ' + resp.status, '#f87171');
+    }
+  } catch (e) {
+    setStatus('derc-status', '✗ ' + e.message, '#f87171');
+  }
+}
+
+// ── Default DERControl ────────────────────────────────────────────────────────
+async function loadDefault() {
+  try {
+    const resp = await fetch('/api/gridsim/admin/default?program=0');
+    if (!resp.ok) { document.getElementById('default-panel').textContent = 'none'; return; }
+    const b = await resp.json();
+    const fields = Object.entries(b).filter(([,v]) => v != null);
+    if (!fields.length) { document.getElementById('default-panel').textContent = 'empty (no fields set)'; return; }
+    document.getElementById('default-panel').innerHTML = fields.map(([k,v]) =>
+      `<div class="csip-field"><span class="name">${k}</span><span class="value">${v}</span></div>`
+    ).join('');
+  } catch (e) {
+    document.getElementById('default-panel').textContent = 'error: ' + e.message;
+  }
+}
+
+async function clearDefault() {
+  await fetch('/api/gridsim/admin/default', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({program: 0, clear: true}),
+  });
+  loadDefault();
+}
+
+// ── Device inject ─────────────────────────────────────────────────────────────
+async function injectSolar() {
+  const fields = {};
+  const w   = document.getElementById('inj-solar-w').value;
+  const pct = document.getElementById('inj-solar-pct').value;
+  const conn = document.getElementById('inj-solar-conn').value;
+  if (w   !== '') fields['W_W']            = parseFloat(w);
+  if (pct !== '') fields['WMaxLimPct_pct'] = parseFloat(pct);
+  if (conn !== '') fields['Conn']          = parseFloat(conn);
+  if (!Object.keys(fields).length) return;
+  const ok = await apiPost('/api/solar/inject', fields);
+  setStatus('inj-solar-status', ok ? '✓ injected' : '✗ failed', ok ? '#4ade80' : '#f87171');
+}
+
+async function injectBattery() {
+  const fields = {};
+  const soc  = document.getElementById('inj-bat-soc').value;
+  const pct  = document.getElementById('inj-bat-pct').value;
+  const conn = document.getElementById('inj-bat-conn').value;
+  if (soc  !== '') fields['SoC_pct']        = parseFloat(soc);
+  if (pct  !== '') fields['WMaxLimPct_pct'] = parseFloat(pct);
+  if (conn !== '') fields['Conn']           = parseFloat(conn);
+  if (!Object.keys(fields).length) return;
+  const ok = await apiPost('/api/battery/inject', fields);
+  setStatus('inj-bat-status', ok ? '✓ injected' : '✗ failed', ok ? '#4ade80' : '#f87171');
+}
+
+async function injectMeter() {
+  const fields = {};
+  const w = document.getElementById('inj-meter-w').value;
+  const v = document.getElementById('inj-meter-v').value;
+  if (w !== '') fields['W_W'] = parseFloat(w);
+  if (v !== '') fields['V_V'] = parseFloat(v);
+  if (!Object.keys(fields).length) return;
+  const ok = await apiPost('/api/meter/inject', fields);
+  setStatus('inj-meter-status', ok ? '✓ injected' : '✗ failed', ok ? '#4ade80' : '#f87171');
+}
+
+async function ctrlSolar(cmd)   { await apiPost('/api/solar/control',   {cmd}); }
+async function ctrlBattery(cmd) { await apiPost('/api/battery/control', {cmd}); }
+async function ctrlMeter(cmd)   { await apiPost('/api/meter/control',   {cmd}); }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+async function apiPost(url, body) {
+  try {
+    const resp = await fetch(url, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    return resp.ok;
+  } catch (_) { return false; }
+}
+
+function fmt(v) {
+  if (v == null || isNaN(v)) return '—';
+  return v >= 1000 || v <= -1000 ? (v/1000).toFixed(2) + 'k' : Math.round(v).toString();
+}
+
+function setText(id, txt) { document.getElementById(id).textContent = txt; }
+
+function setStatus(id, msg, color) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.style.color = color;
+}
+
+function kv(pairs) {
+  return pairs.map(([k,v]) =>
+    `<div class="row2"><span class="k">${k}</span><span class="v">${v}</span></div>`
+  ).join('');
+}
+
+function showTab(id, btn) {
+  document.querySelectorAll('[id^="tab-"]').forEach(t => t.style.display = 'none');
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(id).style.display = '';
+  btn.classList.add('active');
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+pollHub();
+loadDefault();
+connectLogs();
+setInterval(pollHub, 5000);
+</script>
+</body>
+</html>

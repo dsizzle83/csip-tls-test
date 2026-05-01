@@ -355,6 +355,32 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 		}
 	}
 
+	// ── Final pass: restore full output for unconstrained devices ────────────────
+	//
+	// If a device received no command this tick, explicitly restore it to full
+	// output. Without this, a previous curtailment persists in M123 registers
+	// after the controlling DERControl expires, leaving devices stuck at zero.
+	for _, sol := range state.Solar {
+		if sol.Connected && !hasSolarCommand(plan.SolarCommands, sol.Name) {
+			plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
+				Name:       sol.Name,
+				CurtailToW: math.NaN(), // NaN → restore to full nameplate output
+			})
+		}
+	}
+	for _, b := range state.Batteries {
+		if b.Connected && !hasBatteryCommand(plan.BatteryCommands, b.Name) && b.MaxDischargeW > 0 {
+			// Only restore if SOC is above reserve; below reserve the battery stays
+			// WMaxLimPct-limited to 0 so the animation can't discharge it.
+			if math.IsNaN(b.SOC) || b.SOC > o.SOCReserve {
+				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+					Name:      b.Name,
+					SetpointW: b.MaxDischargeW, // restore full discharge headroom in M123
+				})
+			}
+		}
+	}
+
 	return plan
 }
 
@@ -378,6 +404,16 @@ func nanMin(a, b float64) float64 {
 
 // hasBatteryCommand returns true if a BatteryCommand for name already exists.
 func hasBatteryCommand(cmds []BatteryCommand, name string) bool {
+	for _, c := range cmds {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSolarCommand returns true if a SolarCommand for name already exists.
+func hasSolarCommand(cmds []SolarCommand, name string) bool {
 	for _, c := range cmds {
 		if c.Name == name {
 			return true

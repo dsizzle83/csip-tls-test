@@ -174,7 +174,7 @@ func main() {
 		eng.RegisterBatteryActuator(bc.Name, act)
 	}
 	for _, ic := range cfg.Inverters {
-		act := adapters.NewRegistrySolarActuator(reg, ic.MaxW)
+		act := adapters.NewRegistrySolarActuator(reg, ic.Name, ic.MaxW)
 		eng.RegisterSolarActuator(ic.Name, act)
 	}
 	eng.RegisterEVSEActuator("*", ocppTracker) // wildcard: OCPP tracker handles all EVSEs

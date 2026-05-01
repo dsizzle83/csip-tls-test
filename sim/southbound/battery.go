@@ -50,7 +50,7 @@ func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer,
 	bases := populateBattery(regs, wmaxKwh, wmaxW)
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
-		animateBattery(s, r, wmaxW, bases.M103Base, bases.M802Base, stop)
+		animateBattery(s, r, wmaxW, bases, stop)
 	})
 	if err != nil {
 		return nil, err
@@ -369,9 +369,10 @@ func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) BatteryBases {
 
 // ── animation ─────────────────────────────────────────────────────────────────
 
-func animateBattery(s *Server, r *RegisterMap, wmaxW float64, m103Base, m802Base uint16, stop <-chan struct{}) {
-	sfN := func(v int16) uint16 { return uint16(v) }
-	_ = sfN
+func animateBattery(s *Server, r *RegisterMap, wmaxW float64, bases BatteryBases, stop <-chan struct{}) {
+	m103Base := bases.M103Base
+	m802Base := bases.M802Base
+	m123Base := bases.M123Base
 
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
@@ -389,6 +390,19 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW float64, m103Base, m802Base
 
 			soc := 55.0 + 35.0*math.Sin(phase)
 			w := -wmaxW * 0.80 * math.Cos(phase)
+
+			// Apply M123 controls (written by hub over Modbus).
+			if r.Get(m123Base+sunspec.M123_Conn) == 0 {
+				w = 0
+			} else if r.Get(m123Base+sunspec.M123_WMaxLimPct_Ena) != 0 && w > 0 {
+				// WMaxLimPct limits discharge (positive W) only; charging is unconstrained.
+				limPct := sunspec.ApplyScaleSigned(
+					r.Get(m123Base+sunspec.M123_WMaxLimPct),
+					int16(r.Get(m123Base+sunspec.M123_WMaxLimPct_SF)),
+				)
+				limW := wmaxW * math.Max(0, limPct) / 100.0
+				w = math.Min(w, limW)
+			}
 
 			v := 240.0 + 1.5*math.Sin(2*math.Pi*t/89)
 			hz := 60.0 + 0.03*math.Sin(2*math.Pi*t/67)
