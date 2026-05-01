@@ -175,9 +175,27 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	// Also set ctrl href to the derc path so the walker finds it.
+	ctrl.Resource.Href = fmt.Sprintf("/derp/%d/derc/admin", req.Program)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Write to derc (scheduled list) — this is what the hub's walker reads via
+	// DERControlListLink. The scheduler evaluates the time window and marks it
+	// active when start <= serverNow < start+duration.
+	dercPath := fmt.Sprintf("/derp/%d/derc", req.Program)
+	if dercList, ok := s.resources[dercPath].(*model.DERControlList); ok {
+		if req.Activate {
+			dercList.DERControl = []model.DERControl{ctrl}
+		} else {
+			dercList.DERControl = append(dercList.DERControl, ctrl)
+		}
+		dercList.All = uint32(len(dercList.DERControl))
+		dercList.Results = dercList.All
+	}
+
+	// Also mirror into actderc for status display.
 	actPath := fmt.Sprintf("/derp/%d/actderc", req.Program)
 	if actList, ok := s.resources[actPath].(*model.DERControlList); ok {
 		if req.Activate {
@@ -207,11 +225,15 @@ func (s *Server) adminCtrlDelete(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	actPath := fmt.Sprintf("/derp/%d/actderc", req.Program)
-	if actList, ok := s.resources[actPath].(*model.DERControlList); ok {
-		actList.DERControl = nil
-		actList.All = 0
-		actList.Results = 0
+	for _, path := range []string{
+		fmt.Sprintf("/derp/%d/derc", req.Program),
+		fmt.Sprintf("/derp/%d/actderc", req.Program),
+	} {
+		if list, ok := s.resources[path].(*model.DERControlList); ok {
+			list.DERControl = nil
+			list.All = 0
+			list.Results = 0
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

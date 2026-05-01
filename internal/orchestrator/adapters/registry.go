@@ -109,11 +109,14 @@ func (ra *RegistryAdapter) run() {
 			if !ok {
 				return
 			}
-			if upd.Err != nil {
-				continue // keep stale snapshot on error
-			}
 			ra.mu.Lock()
-			ra.latest[upd.Name] = upd.Measurements
+			if upd.Err != nil {
+				// Mark disconnected; keep stale measurements.
+				ra.status[upd.Name] = device.DeviceStatus{Connected: false}
+			} else {
+				ra.latest[upd.Name] = upd.Measurements
+				ra.status[upd.Name] = device.DeviceStatus{Connected: true, Energized: true}
+			}
 			ra.mu.Unlock()
 		}
 	}
