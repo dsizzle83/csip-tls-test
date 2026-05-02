@@ -274,7 +274,10 @@ func NewRegistrySolarActuator(reg *registry.Registry, devName string, maxW float
 func (a *RegistrySolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand) error {
 	var w int16
 	if math.IsNaN(cmd.CurtailToW) {
-		// No curtailment — restore full nameplate output.
+		if a.maxW <= 0 {
+			return nil // max_w not configured; leave device producing freely
+		}
+		// Restore full nameplate output.
 		w = int16(a.maxW)
 	} else {
 		w = int16(math.Max(0, cmd.CurtailToW))

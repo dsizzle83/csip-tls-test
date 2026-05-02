@@ -17,13 +17,15 @@
       "name": "solar-0",
       "url": "tcp://192.168.0.188:5020",
       "unit_id": 1,
-      "role": "inverter"
+      "role": "inverter",
+      "max_w": 5000
     },
     {
       "name": "battery-0",
       "url": "tcp://192.168.0.188:5021",
       "unit_id": 1,
-      "role": "battery"
+      "role": "battery",
+      "max_w": 5000
     }
   ]
 }
