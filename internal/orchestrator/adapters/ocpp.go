@@ -220,14 +220,6 @@ func (t *OCPPStateTracker) ApplyEVSECommand(cmd orchestrator.EVSECommand) error 
 
 	select {
 	case err := <-errCh:
-		if err == nil {
-			// Update tracked current so EVSEStates() reflects the commanded limit.
-			t.mu.Lock()
-			if s, ok := t.stations[cmd.StationID]; ok {
-				s.currentA = cmd.MaxCurrentA
-			}
-			t.mu.Unlock()
-		}
 		return err
 	case <-time.After(10 * time.Second):
 		return fmt.Errorf("ocpp-tracker: SetChargingProfile timeout for %s", cmd.StationID)

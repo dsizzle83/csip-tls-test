@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/csip/discovery"
+	"csip-tls-test/internal/csip/model"
 	"csip-tls-test/internal/csip/scheduler"
 	"csip-tls-test/internal/southbound/registry"
 )
@@ -109,10 +110,15 @@ func (b *Bridge) applyOnce() {
 	serverNow := scheduler.ServerNow(clockOffset)
 	active := b.sched.Evaluate(programs, serverNow)
 	if active == nil {
-		///////////////////////////////////////////////////////////////////////////////
-		//  This should initiate a failsafe control to DERs, not actively be ignored //
-		///////////////////////////////////////////////////////////////////////////////
-		return // no active control or default to apply
+		// Programs exist but no event or default is active — apply failsafe.
+		// Reconnect all devices (safe state: grid-connected, no power limit).
+		t := true
+		failsafe := model.DERControlBase{OpModConnect: &t}
+		if err := b.reg.ApplyControl(failsafe); err != nil {
+			log.Printf("bridge: apply failsafe: %v", err)
+		}
+		log.Printf("bridge: failsafe applied — programs present but no active control")
+		return
 	}
 
 	if err := b.reg.ApplyControl(active.Base); err != nil {

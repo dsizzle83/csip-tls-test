@@ -16,6 +16,10 @@ import (
 	"csip-tls-test/internal/wolfssl"
 )
 
+const (
+	maxResponseBody = 10 << 20 // 10 MiB — safe ceiling for embedded targets
+)
+
 // Client is a CSIP-compliant mTLS client. It owns a wolfSSL context
 // and, after Dial, a connected SSL session.
 //
@@ -257,6 +261,10 @@ func (c *Client) readResponse() ([]byte, error) {
 		return buf, nil
 	}
 
+	if cl > maxResponseBody {
+		return nil, fmt.Errorf("response body too large: %d bytes (max %d)", cl, maxResponseBody)
+	}
+
 	need := headerEnd + cl
 	for len(buf) < need {
 		n, err := wolfssl.Read(c.ssl, scratch)
@@ -266,6 +274,9 @@ func (c *Client) readResponse() ([]byte, error) {
 		if err != nil || n == 0 {
 			break
 		}
+	}
+	if len(buf) < need {
+		return nil, fmt.Errorf("truncated response: got %d bytes, expected %d", len(buf), need)
 	}
 	return buf[:need], nil
 }

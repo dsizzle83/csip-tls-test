@@ -152,10 +152,10 @@ STEP 5 — TEST RUN (MANUAL)
 ==============================================================================
 
 Sine mode (standalone):
-    ./bin/metersim -port 5022 -peak 5000
+    ./bin/metersim -port 5022 -peak 5000 -api-port 6022
 
 Linked mode (reads solar + battery live):
-    ./bin/metersim -port 5022 \
+    ./bin/metersim -port 5022 -api-port 6022 \
       -solar-api http://69.0.0.10:6020 \
       -battery-api http://69.0.0.11:6021 \
       -load 3000
@@ -189,7 +189,7 @@ STEP 6 — INSTALL AS A SYSTEMD SERVICE
       Type=simple
       User=pi
       WorkingDirectory=/home/pi/csip-tls-test
-      ExecStart=/home/pi/csip-tls-test/bin/metersim -port 5022 \
+      ExecStart=/home/pi/csip-tls-test/bin/metersim -port 5022 -api-port 6022 \
         -solar-api http://69.0.0.10:6020 \
         -battery-api http://69.0.0.11:6021 \
         -load 3000
@@ -243,10 +243,10 @@ PARAMETERS REFERENCE
                         Settable at runtime via POST /inject {"LoadW_W": 4500}
 
 Example — sine mode, 10 kW service entrance:
-    ./bin/metersim -port 5022 -peak 10000
+    ./bin/metersim -port 5022 -peak 10000 -api-port 6022
 
 Example — linked mode, 3 kW default load:
-    ./bin/metersim -port 5022 \
+    ./bin/metersim -port 5022 -api-port 6022 \
       -solar-api http://69.0.0.10:6020 \
       -battery-api http://69.0.0.11:6021 \
       -load 3000

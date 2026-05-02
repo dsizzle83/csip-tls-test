@@ -2,7 +2,6 @@ package discovery
 
 import (
 	"fmt"
-	"sort"
 
 	"csip-tls-test/internal/csip/model"
 )
@@ -31,15 +30,15 @@ func HighestPriorityProgram(programs []ProgramState) *ProgramState {
 	if len(programs) == 0 {
 		return nil
 	}
-	sorted := make([]ProgramState, len(programs))
-	copy(sorted, programs)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].Program.Primacy != sorted[j].Program.Primacy {
-			return sorted[i].Program.Primacy < sorted[j].Program.Primacy
+	best := 0
+	for i := 1; i < len(programs); i++ {
+		if programs[i].Program.Primacy < programs[best].Program.Primacy ||
+			(programs[i].Program.Primacy == programs[best].Program.Primacy &&
+				programs[i].Program.MRID < programs[best].Program.MRID) {
+			best = i
 		}
-		return sorted[i].Program.MRID < sorted[j].Program.MRID
-	})
-	return &sorted[0]
+	}
+	return &programs[best]
 }
 
 // ActiveDefaultControl returns the DefaultDERControl from the highest

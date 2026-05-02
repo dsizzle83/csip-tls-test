@@ -1,0 +1,151 @@
+==============================================================================
+  SIMULATOR DASHBOARD — Desktop / WSL Machine Setup Guide
+  Script: gui/sim_gui.py  |  Stack: Python 3 + CustomTkinter + WebSocket
+==============================================================================
+
+OVERVIEW
+--------
+The dashboard is a live GUI that runs on your desktop (Windows / WSL / Mac).
+It connects to each simulator's HTTP simapi over the demo LAN and to the
+gridsim admin API, displaying real-time readings and allowing manual control.
+
+What it shows and controls:
+  Solar tab     — PV output (W, V), animation state, inject overrides
+  Battery tab   — SoC (%), charge/discharge power, inject overrides
+  Meter tab     — Net grid power (W), site load setting
+  EV tab        — Connector status, session state
+  Grid tab      — Active DERControl events, schedule/cancel export limits
+
+Connections (plain HTTP / WebSocket — no mTLS):
+  Solar simapi    <solar-ip>:6020
+  Battery simapi  <battery-ip>:6021
+  Meter simapi    <meter-ip>:6022
+  EV simapi       <ev-ip>:6024
+  Gridsim admin   <gridsim-ip>:11112
+
+These simapi ports are fixed. Each simulator binary must be started with the
+matching -api-port flag (documented in each sim_*.txt guide).
+
+PREREQUISITES
+-------------
+  - Python 3.10 or later
+  - All simulator Pis running their binaries with -api-port enabled
+  - Gridsim server running on the WSL machine (sim_gridsim.txt)
+
+==============================================================================
+STEP 1 — INSTALL PYTHON DEPENDENCIES
+==============================================================================
+
+1.  Install pip packages (do this once):
+
+      cd ~/csip-tls-test/gui
+      pip install -r requirements.txt
+
+    Packages installed:
+      customtkinter >= 5.2.0    — GUI framework
+      websocket-client >= 1.6.0 — live state streaming from simulators
+      requests >= 2.31.0        — REST calls for inject/control
+
+2.  Verify:
+      python3 -c "import customtkinter; print(customtkinter.__version__)"
+
+    On WSL: if customtkinter cannot find a display, install an X server on
+    Windows (VcXsrv or WSLg) or run the dashboard on Windows Python directly.
+
+    Windows Python (alternative to WSL):
+      - Install Python 3.10+ from python.org
+      - Open a Windows terminal in the repo root
+      - pip install -r gui\requirements.txt
+
+==============================================================================
+STEP 2 — RUN THE DASHBOARD
+==============================================================================
+
+FULL DEMO (all Pis deployed on 69.0.0.x):
+
+    cd ~/csip-tls-test
+    python3 gui/sim_gui.py \
+      --solar   69.0.0.10 \
+      --battery 69.0.0.11 \
+      --meter   69.0.0.12 \
+      --ev      69.0.0.14 \
+      --gridsim <WSL-WIFI-IP>
+
+Replace <WSL-WIFI-IP> with your Windows WiFi IP (e.g. 192.168.1.50).
+The gridsim arg points to the admin API on this machine, port 11112.
+
+LOCALHOST ONLY (no Pis — all sims running on this machine):
+
+    python3 gui/sim_gui.py
+
+    This defaults all hosts to localhost, connecting to the standard ports
+    (6020, 6021, 6022, 6024, 11112).
+
+PARTIAL DEPLOYMENT (some sims on Pis, some on localhost):
+
+    python3 gui/sim_gui.py \
+      --solar 69.0.0.10 \
+      --meter 69.0.0.12
+    # battery and ev default to localhost
+
+==============================================================================
+STEP 3 — USING THE DASHBOARD
+==============================================================================
+
+LIVE STATE TABS (Solar, Battery, Meter, EV)
+  - Live readings update every 2 seconds via WebSocket
+  - "Pause animation" stops the sine wave cycling so you can set fixed values
+  - "Speed" slider controls how fast the animation advances
+  - Inject panel: enter a value and click Set to override a measurement
+    Examples:
+      Solar W      — fix PV output at a specific wattage
+      Battery SoC  — jump to a specific state of charge
+      Meter load   — set the inferred site load for the energy balance
+
+GRID TAB (DERControl)
+  - Shows the current IEEE 2030.5 program tree and active events from gridsim
+  - "Export Limit (W)" field + "Apply" sends a curtailment event via admin API
+    The hub picks this up on its next discovery cycle (~20 s) and applies it
+    to inverter/battery via Modbus setpoints
+  - "Cancel" removes the active control; hub reverts on next cycle
+  - Response log shows the hub's Response POSTs (Received → Started → Completed)
+
+==============================================================================
+PARAMETERS REFERENCE
+==============================================================================
+
+  --host IP       Default host for all simulators (overrides all per-sim defaults)
+  --solar IP      Host/IP of the solar simulator (modsim)         port 6020
+  --battery IP    Host/IP of the battery simulator (batsim)       port 6021
+  --meter IP      Host/IP of the meter simulator (metersim)       port 6022
+  --ev IP         Host/IP of the EV simulator (evsim)             port 6024
+  --gridsim IP    Host/IP of the WSL machine running the server   port 11112
+
+API ports are fixed in the GUI and cannot be changed via flags.
+They match the -api-port defaults in each simulator binary.
+
+==============================================================================
+TROUBLESHOOTING
+==============================================================================
+
+  Tab shows "connecting..." or no data:
+    - Verify the simulator is running with the correct -api-port flag
+      Example: ./bin/modsim -port 5020 -wmax 5000 -api-port 6020
+    - Test the API directly:
+        curl http://69.0.0.10:6020/state
+    - Check firewall on the Pi: sudo ufw status (if ufw is enabled, allow port)
+
+  Grid tab shows "no connection" or empty:
+    - Verify gridsim server is running: curl http://localhost:11112/admin/status
+    - Verify --gridsim IP matches your Windows WiFi IP (not 127.0.0.1)
+
+  GUI does not open (WSL):
+    - WSL requires a working X11/Wayland display
+    - Windows 11 WSLg: should work out of the box
+    - Windows 10: install VcXsrv, set DISPLAY=:0 in WSL
+    - Alternative: run gui/sim_gui.py using Windows Python directly
+        py gui\sim_gui.py --solar 69.0.0.10 ...
+
+  ModuleNotFoundError: No module named 'customtkinter':
+    - Re-run: pip install -r gui/requirements.txt
+    - If using Windows Python: py -m pip install -r gui\requirements.txt

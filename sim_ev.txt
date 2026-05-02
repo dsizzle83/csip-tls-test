@@ -153,7 +153,8 @@ STEP 6 — TEST RUN (MANUAL)
       -id evse-001 \
       -connectors 1 \
       -session-interval 180 \
-      -session-duration 120
+      -session-duration 120 \
+      -api-port 6024
 
 Expected output:
     evsim: station=evse-001 csms=ws://69.0.0.1:8887/ocpp connectors=1
@@ -196,7 +197,8 @@ STEP 7 — INSTALL AS A SYSTEMD SERVICE
         -id evse-001 \
         -connectors 1 \
         -session-interval 180 \
-        -session-duration 120
+        -session-duration 120 \
+        -api-port 6024
       Restart=on-failure
       RestartSec=10
       StandardOutput=journal
@@ -244,10 +246,11 @@ PARAMETERS REFERENCE
   -csms              string   CSMS WebSocket base URL
                                (default ws://69.0.0.1:8887/ocpp)
   -id                string   Charging station identifier (default evse-001)
-                               Must be unique if running multiple evsi ms.
+                               Must be unique if running multiple evsims.
   -connectors        int      Number of connectors to simulate (default 1)
   -session-interval  int      Seconds between charging sessions (default 180)
   -session-duration  int      Seconds each charging session lasts (default 120)
+  -api-port          int      HTTP simapi port for dashboard (default 6024; 0 to disable)
 
 Example — 2-connector station, faster sessions for demo:
     ./bin/evsim -csms ws://69.0.0.1:8887/ocpp -id evse-dc50 \

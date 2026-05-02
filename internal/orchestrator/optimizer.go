@@ -238,13 +238,14 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// ── Rule 4: Demand response / peak discharge ──────────────────────────────
 	// Discharge battery during peak pricing or when grid import would be needed.
 	isDemandResponse := isDRActive(state)
-	isPeakHour := o.CostModel != nil && o.CostModel.IsPeakHour(time.Now())
+	serverNow := time.Unix(time.Now().Unix()+state.ClockOffset, 0)
+	isPeakHour := o.CostModel != nil && o.CostModel.IsPeakHour(serverNow)
 
 	if isDemandResponse || isPeakHour {
 		reason := "demand-response event active"
 		if isPeakHour && !isDemandResponse {
 			reason = fmt.Sprintf("peak TOU hour (rate=%.3f/kWh)",
-				o.CostModel.CurrentRate(time.Now()))
+				o.CostModel.CurrentRate(serverNow))
 		}
 
 		for i, b := range state.Batteries {

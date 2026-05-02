@@ -1,0 +1,219 @@
+==============================================================================
+  IEEE 2030.5 GRID SIMULATOR — WSL Machine Deployment Guide
+  Binary: server  |  Role: CSIP IEEE 2030.5 northbound server (wolfSSL mTLS)
+==============================================================================
+
+OVERVIEW
+--------
+The gridsim server runs on your WSL/Linux machine — not on a Pi. It acts as the
+IEEE 2030.5 utility server that the hub Pi connects to via wolfSSL mTLS.
+
+Ports:
+  11111  mTLS CSIP server   — IEEE 2030.5 endpoints (hub connects here)
+  11112  Admin HTTP API      — DERControl management (dashboard + curl)
+  8887   OCPP 2.0.1 CSMS    — WebSocket; optional during basic demo
+
+The hub Pi reaches the server over your WiFi network (hub wlan0 ↔ WiFi subnet).
+The server cert SAN must include your WSL machine's current WiFi IP address.
+
+START ORDER (full demo):
+  1. Start gridsim server here (WSL)    ← this guide
+  2. Start device simulators on Pis     (sim_solar, sim_battery, sim_meter, sim_ev)
+  3. Start hub on hub Pi                (sim_hub)
+  4. Open dashboard on this machine     (sim_dashboard)
+
+==============================================================================
+STEP 1 — INSTALL wolfSSL
+==============================================================================
+
+The server uses wolfSSL via cgo. Same build requirements as the hub Pi.
+
+1.  Install build tools:
+      sudo apt-get update
+      sudo apt-get install -y build-essential git autoconf libtool
+
+2.  Clone and build wolfSSL:
+      cd ~
+      git clone https://github.com/wolfSSL/wolfssl.git
+      cd wolfssl
+      ./autogen.sh
+      ./configure --enable-tls13 --enable-aesccm --enable-tlsx \
+                  --enable-certgen --enable-opensslall \
+                  --prefix=/usr/local
+      make -j$(nproc)
+      sudo make install
+      sudo ldconfig
+
+3.  Verify:
+      wolfssl-config --version
+
+==============================================================================
+STEP 2 — FIND YOUR WSL WiFi IP
+==============================================================================
+
+The Pi fleet connects to the server over WiFi. Find your WSL machine's IP:
+
+    # In Windows cmd or PowerShell:
+    ipconfig
+
+Look for the "Wi-Fi" adapter IPv4 address (e.g. 192.168.1.x or 10.0.0.x).
+This is <WSL-WIFI-IP> used throughout this guide and in hub.json on the Pi.
+
+Note: the WSL internal eth0 address (172.x.x.x) is NOT reachable from the Pis.
+     Always use the Windows WiFi adapter IP.
+
+You can also check from WSL side:
+    cat /etc/resolv.conf     # nameserver line often shows the host's IP
+    ip route show default    # gateway IP is usually the Windows host
+
+==============================================================================
+STEP 3 — REGENERATE THE SERVER CERT WITH YOUR WiFi IP
+==============================================================================
+
+The mTLS handshake verifies the server cert SAN against the IP the hub dials.
+If the SAN does not include your WiFi IP the hub will reject the connection.
+
+    cd ~/csip-tls-test
+    make gen-server-cert IPS="<WSL-WIFI-IP>"
+
+This produces:
+  certs/server-cert.pem        — updated SAN (safe to commit, no key material)
+  certs/vault/server-key.pem   — private key (gitignored, stays on this machine)
+
+Verify the SAN includes your IP:
+    openssl x509 -noout -ext subjectAltName -in certs/server-cert.pem
+
+If you change WiFi networks (new IP) re-run this step, commit the updated
+server-cert.pem, push, and then git pull on the hub Pi before restarting.
+
+==============================================================================
+STEP 4 — ISSUE / VERIFY THE HUB Pi CLIENT CERT
+==============================================================================
+
+The hub Pi presents a client cert during mTLS. Check whether one already exists:
+
+    ls certs/client-cert.pem
+
+If it does not exist, generate one:
+
+    make gen-client-cert CN=hub-pi-001
+
+Output:
+  certs/client-cert.pem              — public cert (tracked, cloned to Pi via git)
+  certs/client-staging/client-key.pem — private key (gitignored, SCP then delete)
+
+Commit the public cert:
+    git add certs/client-cert.pem
+    git commit -m "add hub Pi client cert"
+    git push
+
+==============================================================================
+STEP 5 — DISTRIBUTE CERTS TO THE HUB Pi
+==============================================================================
+
+The hub needs four files. Three are tracked (pulled via git); only the private
+client key must be SCP'd.
+
+After git push (above), on the hub Pi run git pull to get the public certs:
+    # On hub Pi
+    cd ~/csip-tls-test && git pull
+
+Then SCP only the private key from WSL:
+    # On this WSL machine
+    scp certs/client-staging/client-key.pem \
+        pi@69.0.0.1:~/csip-tls-test/certs/client-key.pem
+
+Delete staging after the copy:
+    rm -rf certs/client-staging
+
+Verify all four files exist on the hub Pi:
+    # On hub Pi
+    ls -la ~/csip-tls-test/certs/
+    # Expected: ca-cert.pem  server-cert.pem  client-cert.pem  client-key.pem
+
+==============================================================================
+STEP 6 — BUILD THE SERVER BINARY
+==============================================================================
+
+Build must run on the WSL machine (cgo + wolfSSL):
+
+    cd ~/csip-tls-test
+    mkdir -p bin
+    CGO_ENABLED=1 go build -o bin/server ./sim/server
+
+To rebuild after code changes:
+    CGO_ENABLED=1 go build -o bin/server ./sim/server
+
+==============================================================================
+STEP 7 — RUN THE SERVER
+==============================================================================
+
+Start the gridsim server before starting the hub Pi:
+
+    cd ~/csip-tls-test
+    ./bin/server \
+      -cert certs/server-cert.pem \
+      -key  certs/vault/server-key.pem \
+      -ca   certs/ca-cert.pem
+
+Expected startup log:
+    [wolfssl] init OK
+    Server listening on 0.0.0.0:11111 (mTLS, cipher=ECDHE-ECDSA-AES128-CCM-8)
+    Admin API listening on 0.0.0.0:11112 (plain HTTP)
+    [ocpp] CSMS listening on :8887/ocpp/{id}
+
+When the hub Pi connects you will see:
+    ✓ mTLS handshake: version=TLSv1.2 cipher=ECDHE-ECDSA-AES128-CCM-8
+
+Press Ctrl-C to stop.
+
+Windows firewall note:
+    If the hub Pi cannot reach port 11111, add an inbound Windows Firewall rule:
+      netsh advfirewall firewall add rule \
+        name="csip-gridsim" protocol=TCP dir=in localport=11111 action=allow
+
+==============================================================================
+STEP 8 — VERIFY THE SERVER (OPTIONAL CURL TEST)
+==============================================================================
+
+From the hub Pi (or from WSL using localhost), test the admin API:
+
+    curl -s http://<WSL-WIFI-IP>:11112/admin/status | python3 -m json.tool
+
+From WSL itself (quick sanity check before Pi is set up):
+
+    curl -s http://localhost:11112/admin/status
+
+To post a DERControl export limit (simulates a utility curtailment event):
+
+    curl -s -X POST http://localhost:11112/admin/control \
+         -H 'Content-Type: application/json' \
+         -d '{"type":"opModExpLimW","value":2000,"duration_s":300}'
+
+To cancel the active control:
+
+    curl -s -X DELETE http://localhost:11112/admin/control
+
+==============================================================================
+TROUBLESHOOTING
+==============================================================================
+
+  mTLS handshake fails on hub Pi:
+    - Verify server cert SAN includes your current WiFi IP:
+        openssl x509 -noout -ext subjectAltName -in certs/server-cert.pem
+    - Verify hub.json "server" field matches your WiFi IP exactly
+    - Check Windows Firewall is not blocking port 11111
+
+  Hub gets "certificate verify failed":
+    - The server cert SAN does not include the dialed IP — re-run Step 3
+
+  Hub gets "no client cert" or authentication error:
+    - The client-key.pem is missing on the hub Pi — re-run Step 5
+    - Verify: ls ~/csip-tls-test/certs/client-key.pem   (on hub Pi)
+
+  Admin API not reachable from hub Pi:
+    - Port 11112 reachable? nc -zv <WSL-WIFI-IP> 11112
+    - Only needed by the dashboard, not by the hub itself
+
+  Rebuild after code change:
+    cd ~/csip-tls-test && CGO_ENABLED=1 go build -o bin/server ./sim/server

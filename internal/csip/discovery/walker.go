@@ -16,6 +16,7 @@ package discovery
 import (
 	"encoding/xml"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -181,7 +182,7 @@ func (w *Walker) Discover(dcapPath string) (*ResourceTree, error) {
 		if err != nil {
 			// MUP failure is not fatal to discovery — we can still operate
 			// without telemetry. Log it but don't fail.
-			_ = err
+			log.Printf("walker: MUP list fetch: %v", err)
 		} else {
 			tree.MirrorUsagePoints = mupList
 		}

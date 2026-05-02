@@ -124,7 +124,7 @@ To update and rebuild:
 STEP 5 — TEST RUN (MANUAL)
 ==============================================================================
 
-    ./bin/batsim -port 5021 -kwh 10 -wmax 5000
+    ./bin/batsim -port 5021 -kwh 10 -wmax 5000 -api-port 6021
 
 Expected output:
     batsim: starting animated battery on tcp://0.0.0.0:5021 (10 kWh, WMax=5000 W)
@@ -150,7 +150,7 @@ STEP 6 — INSTALL AS A SYSTEMD SERVICE
       Type=simple
       User=pi
       WorkingDirectory=/home/pi/csip-tls-test
-      ExecStart=/home/pi/csip-tls-test/bin/batsim -port 5021 -kwh 10 -wmax 5000
+      ExecStart=/home/pi/csip-tls-test/bin/batsim -port 5021 -kwh 10 -wmax 5000 -api-port 6021
       Restart=on-failure
       RestartSec=5
       StandardOutput=journal
@@ -192,12 +192,13 @@ The bridge applies DERControl setpoints by writing to Model 123
 PARAMETERS REFERENCE
 ==============================================================================
 
-  -port  int      TCP port to listen on (default 5021)
-  -kwh   float    Energy capacity in kWh (default 10)
-  -wmax  float    Max charge/discharge rate in watts (default 5000)
+  -port      int      TCP port to listen on (default 5021)
+  -kwh       float    Energy capacity in kWh (default 10)
+  -wmax      float    Max charge/discharge rate in watts (default 5000)
+  -api-port  int      HTTP simapi port for dashboard (default 6021; 0 to disable)
 
 Example — 20 kWh / 10 kW battery:
-    ./bin/batsim -port 5021 -kwh 20 -wmax 10000
+    ./bin/batsim -port 5021 -kwh 20 -wmax 10000 -api-port 6021
 
 ==============================================================================
 TROUBLESHOOTING

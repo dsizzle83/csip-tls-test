@@ -14,6 +14,12 @@ the demo network:
 
 The hub is the ONLY Pi that runs cgo (wolfSSL). All other Pis are pure-Go.
 
+START ORDER (full demo):
+  1. Start gridsim server on WSL         (sim_gridsim.txt)
+  2. Start device simulators on Pis      (sim_solar, sim_battery, sim_meter, sim_ev)
+  3. Start hub on this Pi                ← this guide
+  4. Open dashboard on desktop machine   (sim_dashboard.txt)
+
 HARDWARE
 --------
   - Raspberry Pi 4 or Pi 5 (2 GB RAM minimum)
@@ -174,14 +180,18 @@ Edit ~/csip-tls-test/hub.json to match your deployment:
       "poll_interval_s":      10,
       "mup_post_rate_s":      60,
 
-      "ocpp_port": 8887,
+      "ocpp_port":    8887,
+      "metrics_port": 9100,
 
       "devices": [
-        { "name": "solar-1",   "url": "tcp://69.0.0.10:5020", "unit_id": 1, "role": "inverter" },
-        { "name": "battery-1", "url": "tcp://69.0.0.11:5021", "unit_id": 1, "role": "battery"  },
+        { "name": "solar-1",   "url": "tcp://69.0.0.10:5020", "unit_id": 1, "role": "inverter", "max_w": 5000 },
+        { "name": "battery-1", "url": "tcp://69.0.0.11:5021", "unit_id": 1, "role": "battery",  "max_w": 5000 },
         { "name": "meter",     "url": "tcp://69.0.0.12:5022", "unit_id": 1, "role": "meter"    }
       ]
     }
+
+metrics_port exposes /healthz, /metrics (Prometheus), /status (JSON snapshot),
+and /logs (SSE log stream) on the hub Pi at http://69.0.0.1:9100.
 
 Find your WSL machine's IP: run `ip addr show eth0` inside WSL, or check
 `ipconfig` on Windows and look for the WSL adapter address.

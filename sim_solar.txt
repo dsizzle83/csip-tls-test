@@ -133,7 +133,7 @@ STEP 5 — TEST RUN (MANUAL)
 
 Run in the foreground to confirm it starts correctly:
 
-    ./bin/modsim -port 5020 -wmax 5000
+    ./bin/modsim -port 5020 -wmax 5000 -api-port 6020
 
 Expected output:
     modsim: starting animated PV inverter on tcp://0.0.0.0:5020 (WMax=5000 W)
@@ -159,7 +159,7 @@ STEP 6 — INSTALL AS A SYSTEMD SERVICE (AUTO-START ON BOOT)
       Type=simple
       User=pi
       WorkingDirectory=/home/pi/csip-tls-test
-      ExecStart=/home/pi/csip-tls-test/bin/modsim -port 5020 -wmax 5000
+      ExecStart=/home/pi/csip-tls-test/bin/modsim -port 5020 -wmax 5000 -api-port 6020
       Restart=on-failure
       RestartSec=5
       StandardOutput=journal
@@ -205,11 +205,12 @@ voltage, frequency, and operating state every poll interval (default 10 s).
 PARAMETERS REFERENCE
 ==============================================================================
 
-  -port  int      TCP port to listen on (default 5020)
-  -wmax  float    Nameplate peak power in watts (default 5000)
+  -port      int      TCP port to listen on (default 5020)
+  -wmax      float    Nameplate peak power in watts (default 5000)
+  -api-port  int      HTTP simapi port for dashboard (default 6020; 0 to disable)
 
 Example — 7.5 kW inverter on non-default port:
-    ./bin/modsim -port 5020 -wmax 7500
+    ./bin/modsim -port 5020 -wmax 7500 -api-port 6020
 
 To change parameters after deployment, edit ExecStart in the service file,
 then: sudo systemctl daemon-reload && sudo systemctl restart modsim
