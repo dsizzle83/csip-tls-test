@@ -207,6 +207,20 @@ func (b *Base) ApplyControl(ctrl model.DERControlBase, tag string) error {
 		}
 	}
 
+	// OpModImpLimW: import (charge) limit — maps to the same WMaxLimPct register.
+	// The battery sim applies WMaxLimPct to both charge and discharge magnitude.
+	if ctrl.OpModImpLimW != nil {
+		if b.Has704 {
+			if err := b.SetWMaxLimPct704(ctrl.OpModImpLimW, tag); err != nil {
+				return err
+			}
+		} else {
+			if err := b.SetExportLimit(ctrl.OpModImpLimW, tag); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 

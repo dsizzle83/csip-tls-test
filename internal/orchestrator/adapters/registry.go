@@ -242,14 +242,16 @@ func (a *RegistryBatteryActuator) ApplyBatteryCommand(cmd orchestrator.BatteryCo
 	ctrl.OpModConnect = cmd.Connect
 
 	if !math.IsNaN(cmd.SetpointW) {
+		clamp := func(v float64) int16 {
+			if v > math.MaxInt16 {
+				return math.MaxInt16
+			}
+			return int16(v)
+		}
 		if cmd.SetpointW >= 0 {
-			// Discharge: set export limit to the requested discharge rate.
-			w := int16(cmd.SetpointW)
-			ctrl.OpModExpLimW = &model.ActivePower{Value: w, Multiplier: 0}
+			ctrl.OpModExpLimW = &model.ActivePower{Value: clamp(cmd.SetpointW), Multiplier: 0}
 		} else {
-			// Charge: set import limit to the requested charge rate.
-			w := int16(-cmd.SetpointW) // positive magnitude
-			ctrl.OpModImpLimW = &model.ActivePower{Value: w, Multiplier: 0}
+			ctrl.OpModImpLimW = &model.ActivePower{Value: clamp(-cmd.SetpointW), Multiplier: 0}
 		}
 	}
 

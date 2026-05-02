@@ -249,6 +249,29 @@ func TestBattery_ApplyControl_MaxLimW_FallsBackToExpLimW(t *testing.T) {
 	}
 }
 
+func TestBattery_ApplyControl_ImportLimit(t *testing.T) {
+	b, regs, stop := connectBattery(t)
+	defer stop()
+
+	// 2500 W charge-rate cap / 5000 W nameplate = 50%; sf=-2 → raw = 5000.
+	// OpModImpLimW must write WMaxLimPct just like OpModExpLimW does.
+	ap := model.ActivePower{Value: 2500, Multiplier: 0}
+	if err := b.ApplyControl(model.DERControlBase{OpModImpLimW: &ap}); err != nil {
+		t.Fatalf("ApplyControl import limit: %v", err)
+	}
+
+	m123Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
+	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
+	enaAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct_Ena
+
+	if got := regs.Get(rawAddr); got != 5000 {
+		t.Errorf("WMaxLimPct raw = %d, want 5000 (50%% charge limit with sf=-2)", got)
+	}
+	if regs.Get(enaAddr) != 1 {
+		t.Error("WMaxLimPct_Ena should be 1 after setting import limit")
+	}
+}
+
 func TestBattery_ApplyControl_NilFieldsUnchanged(t *testing.T) {
 	b, regs, stop := connectBattery(t)
 	defer stop()

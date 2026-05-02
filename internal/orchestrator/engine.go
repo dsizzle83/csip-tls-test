@@ -204,6 +204,9 @@ func (e *Engine) executePlan(plan Plan) {
 	for _, cmd := range plan.EVSECommands {
 		a, ok := e.evseActuators[cmd.StationID]
 		if !ok {
+			a, ok = e.evseActuators["*"] // wildcard fallback for single-EVSE setups
+		}
+		if !ok {
 			log.Printf("[orchestrator] no EVSE actuator for %q", cmd.StationID)
 			continue
 		}

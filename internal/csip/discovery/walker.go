@@ -50,6 +50,11 @@ type ResourceTree struct {
 	// the /tm resource during discovery. Add this to time.Now().Unix() to get
 	// estimated server time. Required by CSIP for event scheduling.
 	ClockOffset int64
+
+	// ResponseSetPath is the server-advertised href from DeviceCapability's
+	// ResponseSetListLink.  Use this for response POSTs instead of a
+	// hardcoded default.  Empty if the server did not advertise the link.
+	ResponseSetPath string
 }
 
 // ProgramState groups a DERProgram with its discovered controls.
@@ -91,6 +96,9 @@ func (w *Walker) Discover(dcapPath string) (*ResourceTree, error) {
 		return nil, fmt.Errorf("step 1 (DeviceCapability): %w", err)
 	}
 	tree.DeviceCapability = dcap
+	if dcap.ResponseSetListLink != nil && dcap.ResponseSetListLink.Href != "" {
+		tree.ResponseSetPath = dcap.ResponseSetListLink.Href
+	}
 
 	// Step 2: Time (optional per spec, but CSIP requires it)
 	if dcap.TimeLink != nil {

@@ -455,3 +455,43 @@ func TestDiscoveryGETSequence(t *testing.T) {
 		t.Errorf("unexpected number of GETs: %d", len(m.getCalls))
 	}
 }
+
+func TestDiscover_ResponseSetPath_Populated(t *testing.T) {
+	m := newMockFetcher()
+	buildFullResourceTree(m)
+	// Override /dcap to include ResponseSetListLink.
+	m.serve("/dcap", &model.DeviceCapability{
+		Resource: model.Resource{Href: "/dcap"},
+		PollRate: 300,
+		TimeLink:          &model.Link{Href: "/tm"},
+		EndDeviceListLink: &model.ListLink{Link: model.Link{Href: "/edev"}, All: 3},
+		MirrorUsagePointListLink: &model.ListLink{Link: model.Link{Href: "/mup"}, All: 0},
+		ResponseSetListLink:      &model.ListLink{Link: model.Link{Href: "/rsps/0/r"}, All: 0},
+		SelfDeviceLink: &model.Link{Href: "/sdev"},
+	})
+
+	w := NewWalker(m, testLFDI)
+	tree, err := w.Discover("/dcap")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if tree.ResponseSetPath != "/rsps/0/r" {
+		t.Errorf("ResponseSetPath = %q, want /rsps/0/r", tree.ResponseSetPath)
+	}
+}
+
+func TestDiscover_ResponseSetPath_EmptyWhenAbsent(t *testing.T) {
+	m := newMockFetcher()
+	buildFullResourceTree(m)
+	// buildFullResourceTree serves /dcap without ResponseSetListLink.
+
+	w := NewWalker(m, testLFDI)
+	tree, err := w.Discover("/dcap")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if tree.ResponseSetPath != "" {
+		t.Errorf("ResponseSetPath = %q, want empty when dcap has no ResponseSetListLink",
+			tree.ResponseSetPath)
+	}
+}

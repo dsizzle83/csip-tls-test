@@ -348,6 +348,11 @@ func runDiscovery(
 	eng.SetCSIPPrograms(tree.Programs, tree.ClockOffset)
 	met.recordDiscovery(true, tree.ClockOffset)
 
+	if tree.ResponseSetPath != "" {
+		tracker.responseSetPath = tree.ResponseSetPath
+		log.Printf("hub: ResponseSetPath discovered: %s", tree.ResponseSetPath)
+	}
+
 	serverNow := scheduler.ServerNow(tree.ClockOffset)
 	active := sched.Evaluate(tree.Programs, serverNow)
 	tracker.update(tree, active)

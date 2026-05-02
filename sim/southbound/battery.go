@@ -394,14 +394,14 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW float64, bases BatteryBases
 			// Apply M123 controls (written by hub over Modbus).
 			if r.Get(m123Base+sunspec.M123_Conn) == 0 {
 				w = 0
-			} else if r.Get(m123Base+sunspec.M123_WMaxLimPct_Ena) != 0 && w > 0 {
-				// WMaxLimPct limits discharge (positive W) only; charging is unconstrained.
+			} else if r.Get(m123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
+				// WMaxLimPct limits power magnitude for both charge and discharge.
 				limPct := sunspec.ApplyScaleSigned(
 					r.Get(m123Base+sunspec.M123_WMaxLimPct),
 					int16(r.Get(m123Base+sunspec.M123_WMaxLimPct_SF)),
 				)
 				limW := wmaxW * math.Max(0, limPct) / 100.0
-				w = math.Min(w, limW)
+				w = math.Max(math.Min(w, limW), -limW)
 			}
 
 			v := 240.0 + 1.5*math.Sin(2*math.Pi*t/89)
