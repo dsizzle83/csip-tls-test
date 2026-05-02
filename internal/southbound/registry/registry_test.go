@@ -16,13 +16,13 @@ import (
 
 // mockDevice is a thread-safe device.Device that records calls.
 type mockDevice struct {
-	mu            sync.Mutex
-	measurements  device.Measurements
-	readErr       error
-	applyErr      error
-	applyCalls    int
-	appliedCtrls  []model.DERControlBase
-	closeCalled   bool
+	mu           sync.Mutex
+	measurements device.Measurements
+	readErr      error
+	applyErr     error
+	applyCalls   int
+	appliedCtrls []model.DERControlBase
+	closeCalled  bool
 }
 
 func (m *mockDevice) ReadMeasurements() (device.Measurements, error) {
@@ -151,14 +151,16 @@ func TestRegistry_ApplyControl_NoDevices_NoError(t *testing.T) {
 	}
 }
 
-// ── Poll loop / Updates channel ───────────────────────────────────────────────
+// ── Poll loop / subscriptions ─────────────────────────────────────────────────
 
-func TestRegistry_Updates_ReceivedOnPoll(t *testing.T) {
+func TestRegistry_Subscribe_ReceivedOnPoll(t *testing.T) {
 	const pollInterval = 20 * time.Millisecond
 	reg := registry.New(pollInterval)
 
 	d := &mockDevice{measurements: device.Measurements{W: 1234, Hz: 60.0}}
 	reg.Add(&registry.Entry{Name: "solar", Device: d})
+	updates, unsubscribe := reg.Subscribe()
+	defer unsubscribe()
 
 	reg.Start()
 	defer reg.Stop()
@@ -166,7 +168,7 @@ func TestRegistry_Updates_ReceivedOnPoll(t *testing.T) {
 	// Wait for at least one update (up to 3× the interval).
 	timeout := time.After(3 * pollInterval)
 	select {
-	case upd := <-reg.Updates():
+	case upd := <-updates:
 		if upd.Name != "solar" {
 			t.Errorf("update name = %q, want 'solar'", upd.Name)
 		}
@@ -181,19 +183,21 @@ func TestRegistry_Updates_ReceivedOnPoll(t *testing.T) {
 	}
 }
 
-func TestRegistry_Updates_ErrorPropagated(t *testing.T) {
+func TestRegistry_Subscribe_ErrorPropagated(t *testing.T) {
 	const pollInterval = 20 * time.Millisecond
 	reg := registry.New(pollInterval)
 
 	d := &mockDevice{readErr: errors.New("Modbus timeout")}
 	reg.Add(&registry.Entry{Name: "broken", Device: d})
+	updates, unsubscribe := reg.Subscribe()
+	defer unsubscribe()
 
 	reg.Start()
 	defer reg.Stop()
 
 	timeout := time.After(3 * pollInterval)
 	select {
-	case upd := <-reg.Updates():
+	case upd := <-updates:
 		if upd.Err == nil {
 			t.Error("expected non-nil error in update")
 		}
@@ -213,6 +217,8 @@ func TestRegistry_PollsMultipleDevices(t *testing.T) {
 	dB.measurements = device.Measurements{W: 200}
 	reg.Add(&registry.Entry{Name: "A", Device: dA})
 	reg.Add(&registry.Entry{Name: "B", Device: dB})
+	updates, unsubscribe := reg.Subscribe()
+	defer unsubscribe()
 
 	reg.Start()
 	defer reg.Stop()
@@ -220,7 +226,7 @@ func TestRegistry_PollsMultipleDevices(t *testing.T) {
 	deadline := time.After(5 * pollInterval)
 	for countA.Load() < 1 || countB.Load() < 1 {
 		select {
-		case upd := <-reg.Updates():
+		case upd := <-updates:
 			switch upd.Name {
 			case "A":
 				countA.Add(1)
@@ -231,6 +237,47 @@ func TestRegistry_PollsMultipleDevices(t *testing.T) {
 			t.Fatalf("timed out: A=%d B=%d", countA.Load(), countB.Load())
 		}
 	}
+}
+
+func TestRegistry_Subscribe_MultipleSubscribersReceiveSameUpdate(t *testing.T) {
+	const pollInterval = 20 * time.Millisecond
+	reg := registry.New(pollInterval)
+
+	d := &mockDevice{measurements: device.Measurements{W: 4321, Hz: 60.0}}
+	reg.Add(&registry.Entry{Name: "solar", Device: d})
+
+	subA, unsubscribeA := reg.Subscribe()
+	defer unsubscribeA()
+	subB, unsubscribeB := reg.Subscribe()
+	defer unsubscribeB()
+
+	reg.Start()
+	defer reg.Stop()
+
+	updA := waitForUpdate(t, subA, 3*pollInterval)
+	updB := waitForUpdate(t, subB, 3*pollInterval)
+
+	if updA.Name != "solar" || updB.Name != "solar" {
+		t.Fatalf("subscriber update names = %q/%q, want solar/solar", updA.Name, updB.Name)
+	}
+	if updA.Measurements.W != 4321 || updB.Measurements.W != 4321 {
+		t.Fatalf("subscriber W values = %g/%g, want 4321/4321", updA.Measurements.W, updB.Measurements.W)
+	}
+}
+
+func waitForUpdate(t *testing.T, updates <-chan registry.MeasurementUpdate, timeout time.Duration) registry.MeasurementUpdate {
+	t.Helper()
+
+	select {
+	case upd, ok := <-updates:
+		if !ok {
+			t.Fatal("subscription channel closed")
+		}
+		return upd
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for measurement update")
+	}
+	return registry.MeasurementUpdate{}
 }
 
 // ── Start / Stop ──────────────────────────────────────────────────────────────
@@ -255,11 +302,14 @@ func TestRegistry_Start_Stop(t *testing.T) {
 }
 
 func TestRegistry_UpdatesDropped_WhenConsumerSlow(t *testing.T) {
-	// The channel is buffered(64); overflow updates are dropped, not blocking.
+	// Subscriber channels are buffered; overflow updates are dropped per
+	// subscriber, not blocking the poll loop.
 	// This test just ensures Start/Stop work when updates pile up.
 	reg := registry.New(1 * time.Millisecond)
 	d := &mockDevice{measurements: device.Measurements{W: 1}}
 	reg.Add(&registry.Entry{Name: "fast", Device: d})
+	_, unsubscribe := reg.Subscribe()
+	defer unsubscribe()
 
 	reg.Start()
 	time.Sleep(50 * time.Millisecond) // let it poll many times

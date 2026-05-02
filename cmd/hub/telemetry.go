@@ -50,7 +50,9 @@ func telemetryLoop(
 	postTicker := time.NewTicker(cfg.MUPPostRate())
 	defer postTicker.Stop()
 
-	updates := reg.Updates()
+	updates, unsubscribe := reg.Subscribe()
+	defer unsubscribe()
+
 	latest := make(map[string]device.Measurements)
 
 	for {

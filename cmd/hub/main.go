@@ -14,7 +14,7 @@
 //	discoveryLoop      — re-walks /dcap every N seconds; calls engine.SetCSIPPrograms();
 //	                     drives the response POST state machine.
 //	telemetryLoop      — registers one MUP per device at startup;
-//	                     consumes registry.Updates() and POSTs per-device readings.
+//	                     subscribes to registry updates and POSTs per-device readings.
 //	engine (internal)  — evaluates optimizer every EngineIntervalS; applies controls.
 //	registry (internal)— polls Modbus every PollIntervalS; emits MeasurementUpdates.
 //	batteryMetrics     — refreshes SOC/SOH from Modbus battery models.

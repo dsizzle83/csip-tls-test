@@ -18,7 +18,7 @@ import (
 type DeviceRole uint8
 
 const (
-	RoleBattery   DeviceRole = iota
+	RoleBattery DeviceRole = iota
 	RoleSolar
 	RoleGridMeter // SunSpec AC meter at the main service entrance
 )
@@ -35,8 +35,8 @@ type DeviceConfig struct {
 }
 
 // RegistryAdapter builds an orchestrator.SystemState from a registry.Registry
-// and a set of per-device role assignments.  It subscribes to the registry's
-// Updates channel and maintains a latest-snapshot map.
+// and a set of per-device role assignments. It subscribes to registry
+// measurement updates and maintains a latest-snapshot map.
 //
 // Usage:
 //
@@ -100,7 +100,9 @@ func (ra *RegistryAdapter) Stop() {
 
 func (ra *RegistryAdapter) run() {
 	defer close(ra.done)
-	updates := ra.reg.Updates()
+	updates, unsubscribe := ra.reg.Subscribe()
+	defer unsubscribe()
+
 	for {
 		select {
 		case <-ra.stop:

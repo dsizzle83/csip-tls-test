@@ -3,8 +3,8 @@
 // (hot-swap for testing; on production hardware, typically registered once at
 // startup and held for the process lifetime).
 //
-// The registry exposes a channel of MeasurementUpdate values — the bridge layer
-// consumes these to feed the northbound MUP POST flow.
+// The registry publishes MeasurementUpdate values to any number of subscribers.
+// Slow subscribers drop their own updates without blocking the poll loop.
 package registry
 
 import (
@@ -37,8 +37,9 @@ type Registry struct {
 	mu      sync.RWMutex
 	entries []*Entry
 
-	updates chan MeasurementUpdate
-	dropped atomic.Int64
+	subMu       sync.RWMutex
+	subscribers map[chan MeasurementUpdate]struct{}
+	dropped     atomic.Int64
 
 	pollInterval time.Duration
 	stop         chan struct{}
@@ -49,7 +50,7 @@ type Registry struct {
 // The returned Registry is not yet polling — call Start to begin.
 func New(pollInterval time.Duration) *Registry {
 	return &Registry{
-		updates:      make(chan MeasurementUpdate, 64),
+		subscribers:  make(map[chan MeasurementUpdate]struct{}),
 		pollInterval: pollInterval,
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
@@ -116,11 +117,32 @@ func (reg *Registry) ApplyControl(ctrl model.DERControlBase) error {
 	return nil
 }
 
-// Updates returns the channel on which MeasurementUpdates are published.
-// The channel is buffered (64); if the consumer is slow, old updates are
-// dropped rather than blocking the poll loop.
-func (reg *Registry) Updates() <-chan MeasurementUpdate {
-	return reg.updates
+// Subscribe returns a private channel on which MeasurementUpdates are published
+// and an unsubscribe function that releases the subscription.
+//
+// Each subscriber receives its own buffered channel. Publishing is non-blocking:
+// if a subscriber falls behind, updates for that subscriber are dropped rather
+// than blocking the registry poll loop or other subscribers.
+func (reg *Registry) Subscribe() (<-chan MeasurementUpdate, func()) {
+	ch := make(chan MeasurementUpdate, 64)
+
+	reg.subMu.Lock()
+	reg.subscribers[ch] = struct{}{}
+	reg.subMu.Unlock()
+
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			reg.subMu.Lock()
+			if _, ok := reg.subscribers[ch]; ok {
+				delete(reg.subscribers, ch)
+				close(ch)
+			}
+			reg.subMu.Unlock()
+		})
+	}
+
+	return ch, unsubscribe
 }
 
 // Start launches the background poll goroutine. Call Stop to shut it down.
@@ -133,6 +155,7 @@ func (reg *Registry) Start() {
 func (reg *Registry) Stop() {
 	close(reg.stop)
 	<-reg.done
+	reg.closeSubscribers()
 }
 
 // run is the background poll goroutine.
@@ -161,13 +184,32 @@ func (reg *Registry) poll() {
 	for _, e := range entries {
 		m, err := e.Device.ReadMeasurements()
 		upd := MeasurementUpdate{Name: e.Name, Measurements: m, Err: err}
+		reg.publish(upd)
+	}
+}
+
+func (reg *Registry) publish(upd MeasurementUpdate) {
+	reg.subMu.RLock()
+	defer reg.subMu.RUnlock()
+
+	for ch := range reg.subscribers {
 		select {
-		case reg.updates <- upd:
+		case ch <- upd:
 		default:
 			n := reg.dropped.Add(1)
 			if n == 1 || n%100 == 0 {
-				log.Printf("registry: update channel full, dropped %d total (device=%s)", n, e.Name)
+				log.Printf("registry: subscriber channel full, dropped %d total (device=%s)", n, upd.Name)
 			}
 		}
+	}
+}
+
+func (reg *Registry) closeSubscribers() {
+	reg.subMu.Lock()
+	defer reg.subMu.Unlock()
+
+	for ch := range reg.subscribers {
+		delete(reg.subscribers, ch)
+		close(ch)
 	}
 }
