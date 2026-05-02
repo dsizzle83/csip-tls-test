@@ -29,15 +29,15 @@ func (b *Battery) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
 		if err := readMetricsFrom713(b, &m); err != nil {
 			return m, err
 		}
-	} else if b.reader.HasModel(sunspec.ModelLithiumBattery) {
+	} else if b.Reader.HasModel(sunspec.ModelLithiumBattery) {
 		if err := readMetricsFrom802(b, &m); err != nil {
 			return m, err
 		}
 	} else {
 		// No storage model: fall back to nameplate WMax only.
-		if !math.IsNaN(b.wmax) {
-			m.MaxChargeW = b.wmax
-			m.MaxDischargeW = b.wmax
+		if !math.IsNaN(b.Wmax) {
+			m.MaxChargeW = b.Wmax
+			m.MaxDischargeW = b.Wmax
 		}
 	}
 
@@ -45,7 +45,7 @@ func (b *Battery) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
 }
 
 func readMetricsFrom713(b *Battery, m *orchestrator.BatteryMetrics) error {
-	regs, err := b.reader.ReadModel(sunspec.ModelDERStorageCap)
+	regs, err := b.Reader.ReadModel(sunspec.ModelDERStorageCap)
 	if err != nil {
 		return fmt.Errorf("battery: read M713 for metrics: %w", err)
 	}
@@ -83,16 +83,16 @@ func readMetricsFrom713(b *Battery, m *orchestrator.BatteryMetrics) error {
 	}
 
 	// M713 has no per-direction charge/discharge power rating — use WMax.
-	if !math.IsNaN(b.wmax) {
-		m.MaxChargeW = b.wmax
-		m.MaxDischargeW = b.wmax
+	if !math.IsNaN(b.Wmax) {
+		m.MaxChargeW = b.Wmax
+		m.MaxDischargeW = b.Wmax
 	}
 
 	return nil
 }
 
 func readMetricsFrom802(b *Battery, m *orchestrator.BatteryMetrics) error {
-	regs, err := b.reader.ReadModel(sunspec.ModelLithiumBattery)
+	regs, err := b.Reader.ReadModel(sunspec.ModelLithiumBattery)
 	if err != nil {
 		return fmt.Errorf("battery: read Model 802 for metrics: %w", err)
 	}
@@ -132,17 +132,17 @@ func readMetricsFrom802(b *Battery, m *orchestrator.BatteryMetrics) error {
 		dis := sunspec.ApplyScaleUint(get(sunspec.M802_WDisChaRteMax), wSF)
 		if !math.IsNaN(cha) && cha > 0 {
 			m.MaxChargeW = cha
-		} else if !math.IsNaN(b.wmax) {
-			m.MaxChargeW = b.wmax
+		} else if !math.IsNaN(b.Wmax) {
+			m.MaxChargeW = b.Wmax
 		}
 		if !math.IsNaN(dis) && dis > 0 {
 			m.MaxDischargeW = dis
-		} else if !math.IsNaN(b.wmax) {
-			m.MaxDischargeW = b.wmax
+		} else if !math.IsNaN(b.Wmax) {
+			m.MaxDischargeW = b.Wmax
 		}
-	} else if !math.IsNaN(b.wmax) {
-		m.MaxChargeW = b.wmax
-		m.MaxDischargeW = b.wmax
+	} else if !math.IsNaN(b.Wmax) {
+		m.MaxChargeW = b.Wmax
+		m.MaxDischargeW = b.Wmax
 	}
 
 	return nil

@@ -274,3 +274,40 @@ func TestBridge_ApplyOnce_ConcurrentSafe(t *testing.T) {
 		t.Error("not all goroutines completed")
 	}
 }
+
+// TestBridge_Failsafe_WhenNoActiveControl verifies that when programs exist
+// but no event or default is active, the bridge applies a failsafe
+// (OpModConnect=true) rather than silently doing nothing.
+func TestBridge_Failsafe_WhenNoActiveControl(t *testing.T) {
+	b, d := newBridge(10 * time.Second)
+
+	// Program with no default and an expired event → scheduler returns nil.
+	expiredEvt := model.DERControl{
+		MRID:         "old",
+		CreationTime: time.Now().Unix() - 10000,
+		Interval: model.DateTimeInterval{
+			Start:    time.Now().Unix() - 7200,
+			Duration: 3600, // ended an hour ago
+		},
+	}
+	b.SetPrograms([]discovery.ProgramState{
+		{
+			Program: model.DERProgram{MRID: "prog-no-default", Primacy: 1},
+			Controls: &model.DERControlList{
+				DERControl: []model.DERControl{expiredEvt},
+			},
+		},
+	}, 0)
+
+	b.Start()
+	defer b.Stop()
+	time.Sleep(30 * time.Millisecond)
+
+	if d.callCount() < 1 {
+		t.Fatal("expected failsafe ApplyControl call")
+	}
+	ctrl := d.lastCtrl()
+	if ctrl.OpModConnect == nil || *ctrl.OpModConnect != true {
+		t.Errorf("failsafe should set OpModConnect=true, got %v", ctrl.OpModConnect)
+	}
+}

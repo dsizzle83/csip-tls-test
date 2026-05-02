@@ -156,7 +156,7 @@ func TestApplyControl_Disconnect(t *testing.T) {
 
 	// Verify the Conn register was set to 0.
 	// Find Model 123 base address from the test layout.
-	m123Block, err := sunspec.FindModel(inv.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, err := sunspec.FindModel(inv.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	if err != nil {
 		t.Fatalf("find model 123: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestApplyControl_Connect(t *testing.T) {
 		t.Fatalf("ApplyControl connect: %v", err)
 	}
 
-	m123Block, _ := sunspec.FindModel(inv.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(inv.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	connAddr := m123Block.BaseAddr + sunspec.M123_Conn
 	if got := regs.Get(connAddr); got != 1 {
 		t.Errorf("Conn register = %d after connect, want 1", got)
@@ -199,7 +199,7 @@ func TestApplyControl_ExportLimit(t *testing.T) {
 
 	// WMax=5000, sf=-2 → WMaxLimPct = (2500/5000)*100 = 50.00%
 	// raw = 5000 (50.00 × 10^2, since sf=-2 means raw = pct / 10^-2 = pct × 100)
-	m123Block, _ := sunspec.FindModel(inv.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(inv.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
 	enaAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct_Ena
 
@@ -223,7 +223,7 @@ func TestApplyControl_ExportLimitClamped(t *testing.T) {
 		t.Fatalf("ApplyControl: %v", err)
 	}
 
-	m123Block, _ := sunspec.FindModel(inv.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(inv.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
 	rawVal := regs.Get(rawAddr)
 	// 100.00 with sf=-2 → raw = 10000
@@ -237,7 +237,7 @@ func TestApplyControl_NilFieldsUnchanged(t *testing.T) {
 	defer stop()
 
 	// Find Model 123 Conn address.
-	m123Block, _ := sunspec.FindModel(inv.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(inv.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	connAddr := m123Block.BaseAddr + sunspec.M123_Conn
 
 	before := regs.Get(connAddr)
@@ -259,10 +259,10 @@ func TestWMax_ReadFromModel121(t *testing.T) {
 	inv, _, stop := connect(t)
 	defer stop()
 
-	if math.IsNaN(inv.wmax) {
+	if math.IsNaN(inv.Wmax) {
 		t.Fatal("wmax is NaN; expected 5000 from Model 121")
 	}
-	if inv.wmax != 5000 {
-		t.Errorf("wmax = %g, want 5000", inv.wmax)
+	if inv.Wmax != 5000 {
+		t.Errorf("wmax = %g, want 5000", inv.Wmax)
 	}
 }

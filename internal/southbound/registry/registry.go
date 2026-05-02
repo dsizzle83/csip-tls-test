@@ -9,7 +9,9 @@ package registry
 
 import (
 	"fmt"
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"csip-tls-test/internal/csip/model"
@@ -36,6 +38,7 @@ type Registry struct {
 	entries []*Entry
 
 	updates chan MeasurementUpdate
+	dropped atomic.Int64
 
 	pollInterval time.Duration
 	stop         chan struct{}
@@ -158,10 +161,13 @@ func (reg *Registry) poll() {
 	for _, e := range entries {
 		m, err := e.Device.ReadMeasurements()
 		upd := MeasurementUpdate{Name: e.Name, Measurements: m, Err: err}
-		// Non-blocking send: drop the update if the consumer is behind.
 		select {
 		case reg.updates <- upd:
 		default:
+			n := reg.dropped.Add(1)
+			if n == 1 || n%100 == 0 {
+				log.Printf("registry: update channel full, dropped %d total (device=%s)", n, e.Name)
+			}
 		}
 	}
 }

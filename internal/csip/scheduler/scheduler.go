@@ -97,6 +97,8 @@ func (s *Scheduler) Evaluate(programs []discovery.ProgramState, serverNow int64)
 		return nil
 	}
 
+	s.pruneRandOffsets(programs)
+
 	if hp.Controls != nil && len(hp.Controls.DERControl) > 0 {
 		if ac := s.activeEvent(hp, serverNow); ac != nil {
 			return ac
@@ -211,4 +213,30 @@ func (s *Scheduler) isSuperseded(ctrl *model.DERControl, controls []model.DERCon
 		}
 	}
 	return false
+}
+
+// pruneRandOffsets removes cached randomization offsets for MRIDs that are no
+// longer present in any program's control list.
+func (s *Scheduler) pruneRandOffsets(programs []discovery.ProgramState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.randOffsets) == 0 {
+		return
+	}
+
+	live := make(map[string]struct{}, len(s.randOffsets))
+	for _, ps := range programs {
+		if ps.Controls == nil {
+			continue
+		}
+		for i := range ps.Controls.DERControl {
+			live[ps.Controls.DERControl[i].MRID] = struct{}{}
+		}
+	}
+	for mrid := range s.randOffsets {
+		if _, ok := live[mrid]; !ok {
+			delete(s.randOffsets, mrid)
+		}
+	}
 }

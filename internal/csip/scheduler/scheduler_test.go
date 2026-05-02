@@ -400,3 +400,42 @@ func TestServerNow_PositiveOffset(t *testing.T) {
 		t.Errorf("ServerNow(100) = %d, local = %d, want ~%d", got, local, local+100)
 	}
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// Tests: randOffsets pruning
+// ───────────────────────────────────────────────────────────────────────
+
+func TestPruneRandOffsets_RemovesStaleEntries(t *testing.T) {
+	s := New()
+	r := int32(10)
+
+	evKeep := scheduledEvent("keep", epoch-600, epoch-60, 600, 3000)
+	evKeep.RandomizeStart = &r
+	evStale := scheduledEvent("stale", epoch-600, epoch-60, 600, 3000)
+	evStale.RandomizeStart = &r
+
+	programs := []discovery.ProgramState{makeProgram(1, "SP", 5000, evKeep, evStale)}
+	s.Evaluate(programs, epoch)
+
+	if len(s.randOffsets) != 2 {
+		t.Fatalf("expected 2 cached offsets, got %d", len(s.randOffsets))
+	}
+
+	// Remove evStale from the program.
+	programs = []discovery.ProgramState{makeProgram(1, "SP", 5000, evKeep)}
+	s.Evaluate(programs, epoch)
+
+	if _, ok := s.randOffsets["stale"]; ok {
+		t.Error("stale MRID should have been pruned from randOffsets")
+	}
+	if _, ok := s.randOffsets["keep"]; !ok {
+		t.Error("active MRID 'keep' should be retained in randOffsets")
+	}
+}
+
+func TestPruneRandOffsets_EmptyMapNoPanic(t *testing.T) {
+	s := New()
+	programs := []discovery.ProgramState{makeProgram(1, "SP", 5000)}
+	// Should not panic with empty randOffsets map.
+	s.Evaluate(programs, epoch)
+}

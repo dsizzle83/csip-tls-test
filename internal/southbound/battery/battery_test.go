@@ -104,7 +104,7 @@ func TestBattery_Status_M802ChaSt_Discharging(t *testing.T) {
 	defer stop()
 
 	// Find M802 base and set ChaSt=3 (discharging).
-	m802Block, err := sunspec.FindModel(b.reader.Blocks(), sunspec.ModelLithiumBattery)
+	m802Block, err := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelLithiumBattery)
 	if err != nil {
 		t.Fatalf("find M802: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestBattery_Status_M802State_Disconnected(t *testing.T) {
 	defer stop()
 
 	// Set State to something other than 2/3 → disconnected.
-	m802Block, _ := sunspec.FindModel(b.reader.Blocks(), sunspec.ModelLithiumBattery)
+	m802Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelLithiumBattery)
 	regs.Set(m802Block.BaseAddr+sunspec.M802_State, 0)
 
 	st, err := b.Status()
@@ -146,11 +146,11 @@ func TestBattery_WMax_ReadFromModel121(t *testing.T) {
 	b, _, stop := connectBattery(t)
 	defer stop()
 
-	if math.IsNaN(b.wmax) {
+	if math.IsNaN(b.Wmax) {
 		t.Fatal("wmax is NaN; expected 5000 from Model 121")
 	}
-	if b.wmax != testWMaxW {
-		t.Errorf("wmax = %g, want %g", b.wmax, testWMaxW)
+	if b.Wmax != testWMaxW {
+		t.Errorf("wmax = %g, want %g", b.Wmax, testWMaxW)
 	}
 }
 
@@ -165,7 +165,7 @@ func TestBattery_ApplyControl_Disconnect(t *testing.T) {
 		t.Fatalf("ApplyControl disconnect: %v", err)
 	}
 
-	m123Block, err := sunspec.FindModel(b.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, err := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	if err != nil {
 		t.Fatalf("find M123: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestBattery_ApplyControl_Connect(t *testing.T) {
 		t.Fatalf("ApplyControl connect: %v", err)
 	}
 
-	m123Block, _ := sunspec.FindModel(b.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	if got := regs.Get(m123Block.BaseAddr + sunspec.M123_Conn); got != 1 {
 		t.Errorf("Conn = %d after connect, want 1", got)
 	}
@@ -202,7 +202,7 @@ func TestBattery_ApplyControl_ExportLimit(t *testing.T) {
 		t.Fatalf("ApplyControl export limit: %v", err)
 	}
 
-	m123Block, _ := sunspec.FindModel(b.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
 	enaAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct_Ena
 
@@ -224,7 +224,7 @@ func TestBattery_ApplyControl_ExportLimitClamped(t *testing.T) {
 		t.Fatalf("ApplyControl: %v", err)
 	}
 
-	m123Block, _ := sunspec.FindModel(b.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
 	if got := regs.Get(rawAddr); got != 10000 {
 		t.Errorf("WMaxLimPct raw = %d, want 10000 (clamped 100%% with sf=-2)", got)
@@ -241,7 +241,7 @@ func TestBattery_ApplyControl_MaxLimW_FallsBackToExpLimW(t *testing.T) {
 		t.Fatalf("ApplyControl MaxLimW: %v", err)
 	}
 
-	m123Block, _ := sunspec.FindModel(b.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
 	// 1000/5000 = 20%; sf=-2 → raw = 2000
 	if got := regs.Get(rawAddr); got != 2000 {
@@ -253,7 +253,7 @@ func TestBattery_ApplyControl_NilFieldsUnchanged(t *testing.T) {
 	b, regs, stop := connectBattery(t)
 	defer stop()
 
-	m123Block, _ := sunspec.FindModel(b.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	connAddr := m123Block.BaseAddr + sunspec.M123_Conn
 	before := regs.Get(connAddr)
 
@@ -274,7 +274,7 @@ func TestBattery_ApplyControl_NoModel123_ReturnsError(t *testing.T) {
 
 	// Remove Model 123 from the reader's block list by zeroing the cached blocks.
 	// Find the index of Model 123 and splice it out.
-	original := b.reader.Blocks()
+	original := b.Reader.Blocks()
 	filtered := make([]sunspec.Block, 0, len(original))
 	for _, blk := range original {
 		if blk.ModelID != sunspec.ModelImmediateCtrl {
@@ -306,7 +306,7 @@ func TestBattery_ApplyControl_Multiplier(t *testing.T) {
 		t.Fatalf("ApplyControl: %v", err)
 	}
 
-	m123Block, _ := sunspec.FindModel(b.reader.Blocks(), sunspec.ModelImmediateCtrl)
+	m123Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
 	if got := regs.Get(rawAddr); got != 5000 {
 		t.Errorf("WMaxLimPct raw = %d (via multiplier 25×10²), want 5000", got)
