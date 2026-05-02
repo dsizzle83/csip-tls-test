@@ -7,7 +7,7 @@
 //  2. Applies the resulting DERControlBase to every device in the registry
 //
 // On each measurement tick the registry's poll loop emits MeasurementUpdates;
-// callers can subscribe to those via Registry.Updates() to drive the
+// callers can subscribe to those via Registry.Subscribe() to drive the
 // northbound MUP POST flow.
 //
 // Typical lifecycle:

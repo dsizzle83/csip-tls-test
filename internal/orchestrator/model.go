@@ -7,7 +7,7 @@
 // Data flow:
 //
 //	[CSIP scheduler] ──SetCSIPPrograms──► Engine.state
-//	[Modbus registry] ──Updates()──────► Engine.state
+//	[Modbus registry] ──Subscribe()────► Engine.state
 //	[OCPP tracker] ────EVSEStates()────► Engine.state
 //	                                          │
 //	                                   Optimizer.Optimize()
