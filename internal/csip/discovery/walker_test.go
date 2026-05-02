@@ -459,15 +459,25 @@ func TestDiscoveryGETSequence(t *testing.T) {
 func TestDiscover_ResponseSetPath_Populated(t *testing.T) {
 	m := newMockFetcher()
 	buildFullResourceTree(m)
-	// Override /dcap to include ResponseSetListLink.
+	// dcap points to /rsps (the list), not the POST target directly.
 	m.serve("/dcap", &model.DeviceCapability{
-		Resource: model.Resource{Href: "/dcap"},
-		PollRate: 300,
-		TimeLink:          &model.Link{Href: "/tm"},
+		Resource:         model.Resource{Href: "/dcap"},
+		PollRate:         300,
+		TimeLink:         &model.Link{Href: "/tm"},
 		EndDeviceListLink: &model.ListLink{Link: model.Link{Href: "/edev"}, All: 3},
 		MirrorUsagePointListLink: &model.ListLink{Link: model.Link{Href: "/mup"}, All: 0},
-		ResponseSetListLink:      &model.ListLink{Link: model.Link{Href: "/rsps/0/r"}, All: 0},
-		SelfDeviceLink: &model.Link{Href: "/sdev"},
+		ResponseSetListLink: &model.ListLink{Link: model.Link{Href: "/rsps"}, All: 1},
+		SelfDeviceLink:   &model.Link{Href: "/sdev"},
+	})
+	// /rsps → ResponseSetList → ResponseSet[0].ResponseList.Href is the POST target.
+	m.serve("/rsps", &model.ResponseSetList{
+		Resource: model.Resource{Href: "/rsps"},
+		ResponseSet: []model.ResponseSet{
+			{
+				Resource:     model.Resource{Href: "/rsps/0"},
+				ResponseList: &model.ListLink{Link: model.Link{Href: "/rsps/0/r"}},
+			},
+		},
 	})
 
 	w := NewWalker(m, testLFDI)
@@ -475,8 +485,9 @@ func TestDiscover_ResponseSetPath_Populated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
+	// Must be the nested POST target, NOT the list href.
 	if tree.ResponseSetPath != "/rsps/0/r" {
-		t.Errorf("ResponseSetPath = %q, want /rsps/0/r", tree.ResponseSetPath)
+		t.Errorf("ResponseSetPath = %q, want /rsps/0/r (ResponseSet[0].ResponseListLink)", tree.ResponseSetPath)
 	}
 }
 

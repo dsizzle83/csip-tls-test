@@ -96,8 +96,15 @@ func (w *Walker) Discover(dcapPath string) (*ResourceTree, error) {
 		return nil, fmt.Errorf("step 1 (DeviceCapability): %w", err)
 	}
 	tree.DeviceCapability = dcap
+	// ResponseSetListLink points to the ResponseSetList (/rsps), NOT the POST
+	// target.  Follow it one level deeper to find ResponseSet[0].ResponseList.Href
+	// which is the actual URL to POST Response resources to (/rsps/0/r).
 	if dcap.ResponseSetListLink != nil && dcap.ResponseSetListLink.Href != "" {
-		tree.ResponseSetPath = dcap.ResponseSetListLink.Href
+		if path, err := w.fetchResponseSetPostPath(dcap.ResponseSetListLink.Href); err != nil {
+			log.Printf("walker: ResponseSetList: %v — response posting will use config default", err)
+		} else {
+			tree.ResponseSetPath = path
+		}
 	}
 
 	// Step 2: Time (optional per spec, but CSIP requires it)
@@ -259,6 +266,24 @@ func (w *Walker) fetchDERList(path string) (*model.DERList, error) {
 func (w *Walker) fetchMirrorUsagePointList(path string) (*model.MirrorUsagePointList, error) {
 	var r model.MirrorUsagePointList
 	return &r, w.fetchAndParse(path, &r)
+}
+
+// fetchResponseSetPostPath follows ResponseSetListLink → ResponseSetList →
+// ResponseSet[0].ResponseList.Href to find the URL clients POST Response
+// resources to.  The list-level href (/rsps) and the POST target (/rsps/0/r)
+// are different resources.
+func (w *Walker) fetchResponseSetPostPath(listHref string) (string, error) {
+	var rsl model.ResponseSetList
+	if err := w.fetchAndParse(listHref, &rsl); err != nil {
+		return "", err
+	}
+	if len(rsl.ResponseSet) == 0 {
+		return "", fmt.Errorf("ResponseSetList at %s is empty", listHref)
+	}
+	if rsl.ResponseSet[0].ResponseList == nil || rsl.ResponseSet[0].ResponseList.Href == "" {
+		return "", fmt.Errorf("ResponseSet[0] at %s has no ResponseListLink", listHref)
+	}
+	return rsl.ResponseSet[0].ResponseList.Href, nil
 }
 
 // fetchAndParse is the single point where HTTP and XML meet.
