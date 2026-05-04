@@ -180,7 +180,7 @@ func setupSouthbound(cfg *Config) (reg *registry.Registry, ra *adapters.Registry
 			continue
 		}
 		reg.Add(&registry.Entry{Name: dc.Name, Addr: dc.URL, Device: dev})
-		ra.RegisterDevice(dc.Name, deviceRole(dc.Role), dc.MaxW)
+		ra.RegisterDevice(dc.Name, deviceRole(dc.Role), dc.MaxW, dev)
 		if bat, ok := dev.(*battery.Battery); ok {
 			bats = append(bats, batEntry{name: dc.Name, bat: bat})
 		}
