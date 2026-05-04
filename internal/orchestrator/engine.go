@@ -24,8 +24,10 @@ type Engine struct {
 	optimizer Optimizer
 	interval  time.Duration
 
-	// Actuators — keyed by device name.
-	battActuators map[string]BatteryActuator
+	// Actuators — keyed by device name.  Protected by actuMu so Register* can
+	// be called after Start (e.g. hot-plug EVSE).
+	actuMu         sync.RWMutex
+	battActuators  map[string]BatteryActuator
 	solarActuators map[string]SolarActuator
 	evseActuators  map[string]EVSEActuator
 
@@ -42,8 +44,9 @@ type Engine struct {
 	// Debug mode: print full decision trace on every tick.
 	Debug bool
 
-	stop chan struct{}
-	done chan struct{}
+	stop        chan struct{}
+	done        chan struct{}
+	urgentWake  chan struct{} // poked by SetCSIPPrograms on OpModConnect=false
 }
 
 // Config groups optional Engine tunables.
@@ -71,32 +74,52 @@ func New(reader SystemReader, optimizer Optimizer, cfg Config) *Engine {
 		Debug:          cfg.Debug,
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
+		urgentWake:     make(chan struct{}, 1),
 	}
 }
 
 // RegisterBatteryActuator wires an actuator for the battery device called name.
+// Safe to call after Start.
 func (e *Engine) RegisterBatteryActuator(name string, a BatteryActuator) {
+	e.actuMu.Lock()
 	e.battActuators[name] = a
+	e.actuMu.Unlock()
 }
 
 // RegisterSolarActuator wires an actuator for the solar device called name.
+// Safe to call after Start.
 func (e *Engine) RegisterSolarActuator(name string, a SolarActuator) {
+	e.actuMu.Lock()
 	e.solarActuators[name] = a
+	e.actuMu.Unlock()
 }
 
 // RegisterEVSEActuator wires an actuator for the EVSE station called id.
+// Safe to call after Start.
 func (e *Engine) RegisterEVSEActuator(stationID string, a EVSEActuator) {
+	e.actuMu.Lock()
 	e.evseActuators[stationID] = a
+	e.actuMu.Unlock()
 }
 
 // SetCSIPPrograms updates the CSIP program list used by the control loop.
 // Call this from the northbound discovery goroutine whenever programs change.
 // Safe for concurrent use.
+//
+// If any program contains an OpModConnect=false control, the engine wakes
+// immediately rather than waiting for the next ticker interval.
 func (e *Engine) SetCSIPPrograms(programs []discovery.ProgramState, clockOffset int64) {
 	e.csipMu.Lock()
 	e.programs = programs
 	e.clockOffset = clockOffset
 	e.csipMu.Unlock()
+
+	if hasDisconnectControl(programs) {
+		select {
+		case e.urgentWake <- struct{}{}:
+		default: // already pending; don't block
+		}
+	}
 }
 
 // Start launches the control loop goroutine.  Pair with Stop.
@@ -124,6 +147,9 @@ func (e *Engine) run() {
 		select {
 		case <-e.stop:
 			return
+		case <-e.urgentWake:
+			e.tick()
+			ticker.Reset(e.interval) // skip the tick that would fire after the forced one
 		case <-ticker.C:
 			e.tick()
 		}
@@ -179,8 +205,24 @@ func (e *Engine) LastPlan() Plan {
 
 // executePlan fans out the plan's commands to the registered actuators.
 func (e *Engine) executePlan(plan Plan) {
+	// Snapshot actuator maps under read lock so hardware calls run lock-free.
+	e.actuMu.RLock()
+	batt := make(map[string]BatteryActuator, len(e.battActuators))
+	for k, v := range e.battActuators {
+		batt[k] = v
+	}
+	sol := make(map[string]SolarActuator, len(e.solarActuators))
+	for k, v := range e.solarActuators {
+		sol[k] = v
+	}
+	evse := make(map[string]EVSEActuator, len(e.evseActuators))
+	for k, v := range e.evseActuators {
+		evse[k] = v
+	}
+	e.actuMu.RUnlock()
+
 	for _, cmd := range plan.BatteryCommands {
-		a, ok := e.battActuators[cmd.Name]
+		a, ok := batt[cmd.Name]
 		if !ok {
 			log.Printf("[orchestrator] no battery actuator for %q", cmd.Name)
 			continue
@@ -191,7 +233,7 @@ func (e *Engine) executePlan(plan Plan) {
 	}
 
 	for _, cmd := range plan.SolarCommands {
-		a, ok := e.solarActuators[cmd.Name]
+		a, ok := sol[cmd.Name]
 		if !ok {
 			log.Printf("[orchestrator] no solar actuator for %q", cmd.Name)
 			continue
@@ -202,9 +244,9 @@ func (e *Engine) executePlan(plan Plan) {
 	}
 
 	for _, cmd := range plan.EVSECommands {
-		a, ok := e.evseActuators[cmd.StationID]
+		a, ok := evse[cmd.StationID]
 		if !ok {
-			a, ok = e.evseActuators["*"] // wildcard fallback for single-EVSE setups
+			a, ok = evse["*"] // wildcard fallback for single-EVSE setups
 		}
 		if !ok {
 			log.Printf("[orchestrator] no EVSE actuator for %q", cmd.StationID)
@@ -214,6 +256,27 @@ func (e *Engine) executePlan(plan Plan) {
 			log.Printf("[orchestrator] EVSE %s command error: %v", cmd.StationID, err)
 		}
 	}
+}
+
+// hasDisconnectControl returns true if any program in the list contains an
+// OpModConnect=false control (event or default).  Used to decide whether to
+// wake the engine loop immediately instead of waiting for the next ticker.
+func hasDisconnectControl(programs []discovery.ProgramState) bool {
+	for _, ps := range programs {
+		if ps.DefaultControl != nil {
+			if c := ps.DefaultControl.DERControlBase.OpModConnect; c != nil && !*c {
+				return true
+			}
+		}
+		if ps.Controls != nil {
+			for _, ev := range ps.Controls.DERControl {
+				if c := ev.DERControlBase.OpModConnect; c != nil && !*c {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // logPlan emits a structured summary of the plan to the standard logger.

@@ -11,13 +11,10 @@
 //
 // Goroutines:
 //
-//	discoveryLoop      — re-walks /dcap every N seconds; calls engine.SetCSIPPrograms();
-//	                     drives the response POST state machine.
-//	telemetryLoop      — registers one MUP per device at startup;
-//	                     subscribes to registry updates and POSTs per-device readings.
-//	engine (internal)  — evaluates optimizer every EngineIntervalS; applies controls.
-//	registry (internal)— polls Modbus every PollIntervalS; emits MeasurementUpdates.
-//	batteryMetrics     — refreshes SOC/SOH from Modbus battery models.
+//	discoveryLoop  — re-walks /dcap every N seconds; drives response POST state machine.
+//	telemetryLoop  — registers one MUP per device; POSTs per-device readings.
+//	engine         — evaluates optimizer every EngineIntervalS; applies controls.
+//	registry       — polls Modbus every PollIntervalS; emits MeasurementUpdates.
 //
 // Usage:
 //
@@ -65,57 +62,15 @@ func main() {
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
 
-	tlsCfg := tlsclient.Config{
-		ServerAddr:     cfg.Server,
-		CACertPath:     cfg.CACert,
-		ClientCertPath: cfg.ClientCert,
-		ClientKeyPath:  cfg.ClientKey,
-	}
-
-	fetcherDisc, err := tlsclient.NewWolfSSLFetcher(tlsCfg)
+	fetcherDisc, fetcherTelm, lfdi, err := initTLS(cfg)
 	if err != nil {
-		log.Fatalf("hub: init fetcher (discovery): %v", err)
+		log.Fatalf("hub: %v", err)
 	}
 	defer fetcherDisc.Free()
-
-	fetcherTelm, err := tlsclient.NewWolfSSLFetcher(tlsCfg)
-	if err != nil {
-		log.Fatalf("hub: init fetcher (telemetry): %v", err)
-	}
 	defer fetcherTelm.Free()
 
-	lfdi := cfg.LFDI
-	if lfdi == "" {
-		lfdi, err = lfdiFromCertFile(cfg.ClientCert)
-		if err != nil {
-			log.Fatalf("hub: derive LFDI: %v", err)
-		}
-	}
-	log.Printf("hub: LFDI=%s server=%s", lfdi, cfg.Server)
-
-	// ── Southbound ────────────────────────────────────────────────────────
-
-	reg := registry.New(cfg.PollInterval())
-	ra := adapters.NewRegistryAdapter(reg)
-
-	var battDevices []batEntry
-	for _, dc := range cfg.Devices {
-		dev, err := openDevice(dc)
-		if err != nil {
-			log.Printf("hub: device %s (%s): %v — skipped", dc.Name, dc.URL, err)
-			continue
-		}
-		reg.Add(&registry.Entry{Name: dc.Name, Addr: dc.URL, Device: dev})
-		ra.RegisterDevice(dc.Name, deviceRole(dc.Role), dc.MaxW)
-		if bat, ok := dev.(*battery.Battery); ok {
-			battDevices = append(battDevices, batEntry{name: dc.Name, bat: bat})
-		}
-		log.Printf("hub: device registered: %s (%s role=%s)", dc.Name, dc.URL, dc.Role)
-	}
-
+	reg, ra, battDevices := setupSouthbound(cfg)
 	sched := scheduler.New()
-
-	// ── OCPP CSMS ─────────────────────────────────────────────────────────
 
 	var ocppTracker *adapters.OCPPStateTracker
 	if cfg.OCPPPort != 0 {
@@ -130,29 +85,8 @@ func main() {
 		log.Printf("hub: OCPP CSMS on :%d", cfg.OCPPPort)
 	}
 
-	// ── Orchestrator engine ───────────────────────────────────────────────
-
-	compositeReader := &compositeSystemReader{registry: ra, ocpp: ocppTracker}
-	opt := orchestrator.NewDefaultOptimizer()
-	opt.Debug = cfg.Debug
-	eng := orchestrator.New(compositeReader, opt, orchestrator.Config{
-		Interval: cfg.EngineInterval(),
-		Debug:    cfg.Debug,
-	})
-
-	for _, dc := range cfg.Devices {
-		switch dc.Role {
-		case "battery":
-			eng.RegisterBatteryActuator(dc.Name,
-				adapters.NewRegistryBatteryActuator(reg, dc.Name, dc.MaxW))
-		case "inverter":
-			eng.RegisterSolarActuator(dc.Name,
-				adapters.NewRegistrySolarActuator(reg, dc.Name, dc.MaxW))
-		}
-	}
-	if ocppTracker != nil {
-		eng.RegisterEVSEActuator("*", ocppTracker)
-	}
+	reader := &adapters.CompositeSystemReader{Registry: ra, OCPP: ocppTracker}
+	eng := setupEngine(cfg, reader, reg, ocppTracker)
 
 	reg.Start()
 	defer reg.Stop()
@@ -161,19 +95,17 @@ func main() {
 	eng.Start()
 	defer eng.Stop()
 
-	// ── Metrics server ────────────────────────────────────────────────────
-
 	lb := newLogBroadcaster()
 	log.SetOutput(lb)
-
 	met := newHubMetrics()
-	startMetricsServer(cfg.MetricsAddr(), met, ocppTracker, compositeReader, eng, lb)
-
-	// ── Goroutines ────────────────────────────────────────────────────────
+	if cfg.MetricsEnabled() {
+		startMetricsServer(cfg.MetricsAddr(), met, ocppTracker, reader, eng, lb)
+	} else {
+		log.Printf("hub: metrics/status server disabled (metrics_port=0)")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-
 	var clockOffset atomic.Int64
 
 	wg.Add(1)
@@ -196,8 +128,6 @@ func main() {
 		}()
 	}
 
-	// ── Shutdown ──────────────────────────────────────────────────────────
-
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -208,7 +138,78 @@ func main() {
 	log.Printf("hub: stopped")
 }
 
-// ── Device helpers ────────────────────────────────────────────────────────
+// initTLS creates both TLS fetchers and resolves the device LFDI.
+func initTLS(cfg *Config) (disc, telm *tlsclient.WolfSSLFetcher, lfdi string, err error) {
+	tlsCfg := tlsclient.Config{
+		ServerAddr:     cfg.Server,
+		CACertPath:     cfg.CACert,
+		ClientCertPath: cfg.ClientCert,
+		ClientKeyPath:  cfg.ClientKey,
+	}
+	disc, err = tlsclient.NewWolfSSLFetcher(tlsCfg)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("init fetcher (discovery): %w", err)
+	}
+	telm, err = tlsclient.NewWolfSSLFetcher(tlsCfg)
+	if err != nil {
+		disc.Free()
+		return nil, nil, "", fmt.Errorf("init fetcher (telemetry): %w", err)
+	}
+	lfdi = cfg.LFDI
+	if lfdi == "" {
+		lfdi, err = lfdiFromCertFile(cfg.ClientCert)
+		if err != nil {
+			disc.Free()
+			telm.Free()
+			return nil, nil, "", fmt.Errorf("derive LFDI: %w", err)
+		}
+	}
+	log.Printf("hub: LFDI=%s server=%s", lfdi, cfg.Server)
+	return disc, telm, lfdi, nil
+}
+
+// setupSouthbound opens all configured Modbus devices and registers them with
+// the registry and registry adapter.
+func setupSouthbound(cfg *Config) (reg *registry.Registry, ra *adapters.RegistryAdapter, bats []batEntry) {
+	reg = registry.New(cfg.PollInterval())
+	ra = adapters.NewRegistryAdapter(reg)
+	for _, dc := range cfg.Devices {
+		dev, err := openDevice(dc)
+		if err != nil {
+			log.Printf("hub: device %s (%s): %v — skipped", dc.Name, dc.URL, err)
+			continue
+		}
+		reg.Add(&registry.Entry{Name: dc.Name, Addr: dc.URL, Device: dev})
+		ra.RegisterDevice(dc.Name, deviceRole(dc.Role), dc.MaxW)
+		if bat, ok := dev.(*battery.Battery); ok {
+			bats = append(bats, batEntry{name: dc.Name, bat: bat})
+		}
+		log.Printf("hub: device registered: %s (%s role=%s)", dc.Name, dc.URL, dc.Role)
+	}
+	return reg, ra, bats
+}
+
+// setupEngine creates the optimizer and engine and wires actuators for every device.
+func setupEngine(cfg *Config, reader orchestrator.SystemReader, reg *registry.Registry, ocppTracker *adapters.OCPPStateTracker) *orchestrator.Engine {
+	opt := orchestrator.NewDefaultOptimizer()
+	opt.Debug = cfg.Debug
+	eng := orchestrator.New(reader, opt, orchestrator.Config{
+		Interval: cfg.EngineInterval(),
+		Debug:    cfg.Debug,
+	})
+	for _, dc := range cfg.Devices {
+		switch dc.Role {
+		case "battery":
+			eng.RegisterBatteryActuator(dc.Name, adapters.NewRegistryBatteryActuator(reg, dc.Name, dc.MaxW))
+		case "inverter":
+			eng.RegisterSolarActuator(dc.Name, adapters.NewRegistrySolarActuator(reg, dc.Name, dc.MaxW))
+		}
+	}
+	if ocppTracker != nil {
+		eng.RegisterEVSEActuator("*", ocppTracker)
+	}
+	return eng
+}
 
 func openDevice(dc DeviceConfig) (device.Device, error) {
 	switch dc.Role {
@@ -241,28 +242,7 @@ type batEntry struct {
 	bat  *battery.Battery
 }
 
-type compositeSystemReader struct {
-	registry *adapters.RegistryAdapter
-	ocpp     *adapters.OCPPStateTracker
-}
-
-func (r *compositeSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
-	state, err := r.registry.ReadSystemState()
-	if err != nil {
-		return state, err
-	}
-	if r.ocpp != nil {
-		state.EVSEs = r.ocpp.EVSEStates()
-	}
-	return state, nil
-}
-
-func refreshBatteryMetrics(
-	ctx context.Context,
-	bats []batEntry,
-	ra *adapters.RegistryAdapter,
-	interval time.Duration,
-) {
+func refreshBatteryMetrics(ctx context.Context, bats []batEntry, ra *adapters.RegistryAdapter, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -282,8 +262,6 @@ func refreshBatteryMetrics(
 	}
 }
 
-// ── Discovery loop ─────────────────────────────────────────────────────────
-
 func discoveryLoop(
 	ctx context.Context,
 	cfg *Config,
@@ -295,12 +273,10 @@ func discoveryLoop(
 	met *hubMetrics,
 ) {
 	tracker := newResponseTracker(fetcher, lfdi, cfg.ResponseSetPath)
-
 	runDiscovery(fetcher, lfdi, eng, sched, tracker, clockOffset, met)
 
 	ticker := time.NewTicker(cfg.DiscoveryInterval())
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -309,20 +285,6 @@ func discoveryLoop(
 			runDiscovery(fetcher, lfdi, eng, sched, tracker, clockOffset, met)
 		}
 	}
-}
-
-func syncSystemClock(offsetS int64) {
-	if offsetS == 0 {
-		return
-	}
-	corrected := time.Now().Add(time.Duration(offsetS) * time.Second)
-	tv := syscall.NsecToTimeval(corrected.UnixNano())
-	if err := syscall.Settimeofday(&tv); err != nil {
-		log.Printf("hub: clock sync skipped (need CAP_SYS_TIME?): %v", err)
-		return
-	}
-	log.Printf("hub: system clock stepped %+ds → %s UTC",
-		offsetS, corrected.UTC().Format(time.RFC3339))
 }
 
 func runDiscovery(
@@ -343,7 +305,6 @@ func runDiscovery(
 	}
 
 	syncSystemClock(tree.ClockOffset)
-
 	clockOffset.Store(tree.ClockOffset)
 	eng.SetCSIPPrograms(tree.Programs, tree.ClockOffset)
 	met.recordDiscovery(true, tree.ClockOffset)
@@ -358,11 +319,21 @@ func runDiscovery(
 	tracker.update(tree, active)
 	met.recordCSIPState(len(tree.Programs), active)
 
-	log.Printf("hub: discovery OK: programs=%d clockOffset=%ds",
-		len(tree.Programs), tree.ClockOffset)
+	log.Printf("hub: discovery OK: programs=%d clockOffset=%ds", len(tree.Programs), tree.ClockOffset)
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+func syncSystemClock(offsetS int64) {
+	if offsetS == 0 {
+		return
+	}
+	corrected := time.Now().Add(time.Duration(offsetS) * time.Second)
+	tv := syscall.NsecToTimeval(corrected.UnixNano())
+	if err := syscall.Settimeofday(&tv); err != nil {
+		log.Printf("hub: clock sync skipped (need CAP_SYS_TIME?): %v", err)
+		return
+	}
+	log.Printf("hub: system clock stepped %+ds → %s UTC", offsetS, corrected.UTC().Format(time.RFC3339))
+}
 
 func lfdiFromCertFile(path string) (string, error) {
 	data, err := os.ReadFile(path)

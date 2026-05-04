@@ -1,16 +1,12 @@
-// cmd/orchestrator is an example wiring of the orchestration engine.
+// sim/orchestrator is an example wiring of the orchestration engine.
 //
-// It connects:
-//   - IEEE 2030.5 (CSIP) northbound stack for DER control signals
-//   - Modbus/SunSpec southbound stack for inverters and batteries
-//   - OCPP 2.0.1 CSMS for EV chargers
+// It connects Modbus/SunSpec southbound devices (inverters, batteries, meters)
+// and an OCPP 2.0.1 CSMS to the orchestrator engine, without the CSIP northbound
+// discovery loop.  Use cmd/hub for the full production stack.
 //
-// To run:
+// Usage:
 //
-//	go run ./cmd/orchestrator -config orchestrator.json
-//
-// The JSON config is the same format as cmd/hub, with additional fields for
-// OCPP and the orchestration engine interval.
+//	go run ./sim/orchestrator -config orchestrator.json
 package main
 
 import (
@@ -33,34 +29,29 @@ import (
 	"csip-tls-test/internal/wolfssl"
 )
 
-// Config is the JSON configuration for the orchestrator process.
+// Config is the JSON configuration for this example orchestrator.
 type Config struct {
-	// CSIP / IEEE 2030.5 northbound
 	Server     string `json:"server"`
 	CACert     string `json:"ca_cert"`
 	ClientCert string `json:"client_cert"`
 	ClientKey  string `json:"client_key"`
 
-	// Devices (Modbus URLs)
 	Inverters []DeviceConf `json:"inverters"`
 	Batteries []DeviceConf `json:"batteries"`
-	Meters    []DeviceConf `json:"meters"` // AC grid meters (SunSpec 201/202/203)
+	Meters    []DeviceConf `json:"meters"`
 
-	// OCPP
 	OCPPPort int    `json:"ocpp_port"`
 	OCPPCert string `json:"ocpp_cert"`
 	OCPPKey  string `json:"ocpp_key"`
 
-	// Engine tuning
-	PollIntervalS    int `json:"poll_interval_s"`
-	ControlIntervalS int `json:"control_interval_s"`
-	EngineIntervalS  int `json:"engine_interval_s"`
+	PollIntervalS   int `json:"poll_interval_s"`
+	EngineIntervalS int `json:"engine_interval_s"`
 }
 
 type DeviceConf struct {
-	Name   string `json:"name"`
-	URL    string `json:"url"`
-	UnitID uint8  `json:"unit_id"`
+	Name   string  `json:"name"`
+	URL    string  `json:"url"`
+	UnitID uint8   `json:"unit_id"`
 	MaxW   float64 `json:"max_w"`
 }
 
@@ -87,9 +78,8 @@ func main() {
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
 
-	// ── Southbound: Modbus registry ───────────────────────────────────────────
-
 	reg := registry.New(cfg.pollInterval())
+	ra := adapters.NewRegistryAdapter(reg)
 
 	for _, ic := range cfg.Inverters {
 		inv, err := inverter.New(ic.URL, 5*time.Second, ic.UnitID)
@@ -98,6 +88,7 @@ func main() {
 			continue
 		}
 		reg.Add(&registry.Entry{Name: ic.Name, Addr: ic.URL, Device: inv})
+		ra.RegisterDevice(ic.Name, adapters.RoleSolar, ic.MaxW)
 		log.Printf("orchestrator: inverter registered: %s", ic.Name)
 	}
 
@@ -108,9 +99,11 @@ func main() {
 			continue
 		}
 		reg.Add(&registry.Entry{Name: mc.Name, Addr: mc.URL, Device: mtr})
+		ra.RegisterDevice(mc.Name, adapters.RoleGridMeter, 0)
 		log.Printf("orchestrator: meter registered: %s (model %d)", mc.Name, mtr.ModelID())
 	}
 
+	var battNames []string
 	var battDevices []*battery.Battery
 	for _, bc := range cfg.Batteries {
 		bat, err := battery.New(bc.URL, 5*time.Second, bc.UnitID)
@@ -119,24 +112,11 @@ func main() {
 			continue
 		}
 		reg.Add(&registry.Entry{Name: bc.Name, Addr: bc.URL, Device: bat})
+		ra.RegisterDevice(bc.Name, adapters.RoleBattery, bc.MaxW)
+		battNames = append(battNames, bc.Name)
 		battDevices = append(battDevices, bat)
 		log.Printf("orchestrator: battery registered: %s", bc.Name)
 	}
-
-	// ── Registry adapter (SystemReader) ──────────────────────────────────────
-
-	ra := adapters.NewRegistryAdapter(reg)
-	for _, mc := range cfg.Meters {
-		ra.RegisterDevice(mc.Name, adapters.RoleGridMeter, 0)
-	}
-	for _, ic := range cfg.Inverters {
-		ra.RegisterDevice(ic.Name, adapters.RoleSolar, ic.MaxW)
-	}
-	for _, bc := range cfg.Batteries {
-		ra.RegisterDevice(bc.Name, adapters.RoleBattery, bc.MaxW)
-	}
-
-	// ── OCPP CSMS ─────────────────────────────────────────────────────────────
 
 	ocppSrv := ocppserver.New(ocppserver.Config{
 		Port:     cfg.OCPPPort,
@@ -144,42 +124,26 @@ func main() {
 		KeyPath:  cfg.OCPPKey,
 	})
 	go ocppSrv.Start()
-
+	defer ocppSrv.Stop()
 	ocppTracker := adapters.NewOCPPStateTracker(ocppSrv.CSMS())
 
-	// ── Composite SystemReader that merges registry + OCPP ───────────────────
-
-	compositeReader := &compositeSystemReader{
-		registry: ra,
-		ocpp:     ocppTracker,
-	}
-
-	// ── Optimizer ─────────────────────────────────────────────────────────────
+	reader := &adapters.CompositeSystemReader{Registry: ra, OCPP: ocppTracker}
 
 	opt := orchestrator.NewDefaultOptimizer()
 	opt.CostModel = orchestrator.DefaultTOUCostModel()
 	opt.Debug = true
 
-	// ── Engine ────────────────────────────────────────────────────────────────
-
-	eng := orchestrator.New(compositeReader, opt, orchestrator.Config{
+	eng := orchestrator.New(reader, opt, orchestrator.Config{
 		Interval: cfg.engineInterval(),
 		Debug:    true,
 	})
-
-	// Wire battery actuators. Each actuator targets its specific device by name
-	// via Registry.ApplyControlTo, so all actuators safely share the same registry.
 	for _, bc := range cfg.Batteries {
-		act := adapters.NewRegistryBatteryActuator(reg, bc.Name, bc.MaxW)
-		eng.RegisterBatteryActuator(bc.Name, act)
+		eng.RegisterBatteryActuator(bc.Name, adapters.NewRegistryBatteryActuator(reg, bc.Name, bc.MaxW))
 	}
 	for _, ic := range cfg.Inverters {
-		act := adapters.NewRegistrySolarActuator(reg, ic.Name, ic.MaxW)
-		eng.RegisterSolarActuator(ic.Name, act)
+		eng.RegisterSolarActuator(ic.Name, adapters.NewRegistrySolarActuator(reg, ic.Name, ic.MaxW))
 	}
-	eng.RegisterEVSEActuator("*", ocppTracker) // wildcard: OCPP tracker handles all EVSEs
-
-	// ── Start everything ──────────────────────────────────────────────────────
+	eng.RegisterEVSEActuator("*", ocppTracker)
 
 	reg.Start()
 	defer reg.Stop()
@@ -188,30 +152,17 @@ func main() {
 	eng.Start()
 	defer eng.Stop()
 
-	// Background: refresh battery metrics (SOC/SOH) periodically.
 	ctx, cancel := context.WithCancel(context.Background())
-	go refreshBatteryMetrics(ctx, battDevices, cfg.Batteries, ra, cfg.pollInterval()*3)
-
-	// ── Shutdown ──────────────────────────────────────────────────────────────
+	defer cancel()
+	go refreshBatteryMetrics(ctx, battNames, battDevices, ra, cfg.pollInterval()*3)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-
 	log.Printf("orchestrator: shutting down")
-	cancel()
-	ocppSrv.Stop()
 }
 
-// refreshBatteryMetrics polls battery SOC/SOH from the Modbus connection and
-// feeds it into the registry adapter so the optimizer can use live SOC values.
-func refreshBatteryMetrics(
-	ctx context.Context,
-	bats []*battery.Battery,
-	cfgs []DeviceConf,
-	ra *adapters.RegistryAdapter,
-	interval time.Duration,
-) {
+func refreshBatteryMetrics(ctx context.Context, names []string, bats []*battery.Battery, ra *adapters.RegistryAdapter, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -220,33 +171,15 @@ func refreshBatteryMetrics(
 			return
 		case <-ticker.C:
 			for i, bat := range bats {
-				if i >= len(cfgs) {
-					break
-				}
 				m, err := bat.ReadBatteryMetrics()
 				if err != nil {
-					log.Printf("orchestrator: battery metrics %s: %v", cfgs[i].Name, err)
+					log.Printf("orchestrator: battery metrics %s: %v", names[i], err)
 					continue
 				}
-				ra.UpdateBatteryMetrics(cfgs[i].Name, m)
+				ra.UpdateBatteryMetrics(names[i], m)
 			}
 		}
 	}
-}
-
-// compositeSystemReader merges registry adapter state with OCPP tracker state.
-type compositeSystemReader struct {
-	registry *adapters.RegistryAdapter
-	ocpp     *adapters.OCPPStateTracker
-}
-
-func (r *compositeSystemReader) ReadSystemState() (orchestrator.SystemState, error) {
-	state, err := r.registry.ReadSystemState()
-	if err != nil {
-		return state, err
-	}
-	state.EVSEs = r.ocpp.EVSEStates()
-	return state, nil
 }
 
 func loadConfig(path string) *Config {

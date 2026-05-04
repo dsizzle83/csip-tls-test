@@ -21,9 +21,9 @@ import (
 
 type csipControlInfo struct {
 	Source     string      `json:"source"`
-	MRID      string      `json:"mrid,omitempty"`
-	ValidUntil int64      `json:"valid_until,omitempty"`
-	Base      derBaseJSON `json:"base"`
+	MRID       string      `json:"mrid,omitempty"`
+	ValidUntil int64       `json:"valid_until,omitempty"`
+	Base       derBaseJSON `json:"base"`
 }
 
 type hubMetrics struct {
@@ -82,9 +82,9 @@ func (m *hubMetrics) recordCSIPState(programs int, active *scheduler.ActiveContr
 	if active != nil && active.Source != "default" {
 		m.csipControl = &csipControlInfo{
 			Source:     active.Source,
-			MRID:      active.MRID,
+			MRID:       active.MRID,
 			ValidUntil: active.ValidUntil,
-			Base:      derBaseToJSON(active.Base),
+			Base:       derBaseToJSON(active.Base),
 		}
 	} else {
 		m.csipControl = nil
@@ -92,8 +92,7 @@ func (m *hubMetrics) recordCSIPState(programs int, active *scheduler.ActiveContr
 	m.mu.Unlock()
 }
 
-// ── Log broadcaster ──────────────────────────────────────────────────────────
-
+// logBroadcaster fans out every log.Print line to subscribed SSE clients.
 type logBroadcaster struct {
 	mu      sync.Mutex
 	clients map[chan string]struct{}
@@ -135,8 +134,7 @@ func (b *logBroadcaster) unsubscribe(ch chan string) {
 	b.mu.Unlock()
 }
 
-// ── JSON helpers ─────────────────────────────────────────────────────────────
-
+// derBaseJSON is the JSON-friendly representation of a DERControlBase.
 type derBaseJSON struct {
 	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
 	MaxLimW        *int64 `json:"max_lim_W,omitempty"`
@@ -181,22 +179,31 @@ func derBaseToJSON(b model.DERControlBase) derBaseJSON {
 	return j
 }
 
-// ── HTTP metrics server ──────────────────────────────────────────────────────
-
 func startMetricsServer(addr string, m *hubMetrics, ocppTracker *adapters.OCPPStateTracker, reader orchestrator.SystemReader, eng *orchestrator.Engine, lb *logBroadcaster) {
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
 	})
+	mux.HandleFunc("/metrics", metricsHandler(m))
+	mux.HandleFunc("/status", statusHandler(m, ocppTracker, reader, eng))
+	mux.HandleFunc("/logs", logsHandler(lb))
 
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		log.Printf("hub: metrics server on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("hub: metrics server: %v", err)
+		}
+	}()
+}
+
+func metricsHandler(m *hubMetrics) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
 		m.mu.RLock()
 		defer m.mu.RUnlock()
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-
 		var sb strings.Builder
 
 		sb.WriteString("# HELP csip_hub_discovery_runs_total Total discovery walk attempts\n")
@@ -248,9 +255,46 @@ func startMetricsServer(addr string, m *hubMetrics, ocppTracker *adapters.OCPPSt
 		}
 
 		fmt.Fprint(w, sb.String())
-	})
+	}
+}
 
-	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+func statusHandler(m *hubMetrics, ocppTracker *adapters.OCPPStateTracker, reader orchestrator.SystemReader, eng *orchestrator.Engine) http.HandlerFunc {
+	type deviceInfo struct {
+		Role      string  `json:"role"`
+		W         float64 `json:"W_W"`
+		V         float64 `json:"V_V,omitempty"`
+		Hz        float64 `json:"Hz_Hz,omitempty"`
+		SOC       float64 `json:"soc_pct,omitempty"`
+		MaxW      float64 `json:"max_W,omitempty"`
+		Connected bool    `json:"connected"`
+	}
+	type powerSummary struct {
+		SolarW   float64 `json:"solar_W"`
+		BatteryW float64 `json:"battery_W"`
+		GridW    float64 `json:"grid_W"`
+		LoadW    float64 `json:"load_W"`
+	}
+	type decisionJSON struct {
+		Rule   string `json:"rule"`
+		Reason string `json:"reason"`
+		Impact string `json:"impact"`
+	}
+	type planJSON struct {
+		Timestamp string         `json:"timestamp"`
+		Decisions []decisionJSON `json:"decisions"`
+	}
+	type statusResp struct {
+		Timestamp    string                   `json:"timestamp"`
+		ClockOffsetS int64                    `json:"clock_offset_s"`
+		CSIPPrograms int                      `json:"csip_programs"`
+		CSIPControl  *csipControlInfo         `json:"csip_control,omitempty"`
+		Devices      map[string]deviceInfo    `json:"devices"`
+		Power        powerSummary             `json:"power"`
+		LastPlan     planJSON                 `json:"last_plan"`
+		EVSEs        []orchestrator.EVSEState `json:"evse_stations,omitempty"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -266,41 +310,6 @@ func startMetricsServer(addr string, m *hubMetrics, ocppTracker *adapters.OCPPSt
 
 		sysState, _ := reader.ReadSystemState()
 		lastPlan := eng.LastPlan()
-
-		type deviceInfo struct {
-			Role      string  `json:"role"`
-			W         float64 `json:"W_W"`
-			V         float64 `json:"V_V,omitempty"`
-			Hz        float64 `json:"Hz_Hz,omitempty"`
-			SOC       float64 `json:"soc_pct,omitempty"`
-			MaxW      float64 `json:"max_W,omitempty"`
-			Connected bool    `json:"connected"`
-		}
-		type powerSummary struct {
-			SolarW   float64 `json:"solar_W"`
-			BatteryW float64 `json:"battery_W"`
-			GridW    float64 `json:"grid_W"`
-			LoadW    float64 `json:"load_W"`
-		}
-		type decisionJSON struct {
-			Rule   string `json:"rule"`
-			Reason string `json:"reason"`
-			Impact string `json:"impact"`
-		}
-		type planJSON struct {
-			Timestamp string         `json:"timestamp"`
-			Decisions []decisionJSON `json:"decisions"`
-		}
-		type statusResp struct {
-			Timestamp    string                   `json:"timestamp"`
-			ClockOffsetS int64                    `json:"clock_offset_s"`
-			CSIPPrograms int                      `json:"csip_programs"`
-			CSIPControl  *csipControlInfo         `json:"csip_control,omitempty"`
-			Devices      map[string]deviceInfo    `json:"devices"`
-			Power        powerSummary             `json:"power"`
-			LastPlan     planJSON                 `json:"last_plan"`
-			EVSEs        []orchestrator.EVSEState `json:"evse_stations,omitempty"`
-		}
 
 		devices := make(map[string]deviceInfo)
 		for _, sol := range sysState.Solar {
@@ -359,12 +368,9 @@ func startMetricsServer(addr string, m *hubMetrics, ocppTracker *adapters.OCPPSt
 			loadW = v
 		}
 
-		var decisions []decisionJSON
+		decisions := make([]decisionJSON, 0, len(lastPlan.Decisions))
 		for _, d := range lastPlan.Decisions {
 			decisions = append(decisions, decisionJSON{Rule: d.Rule, Reason: d.Reason, Impact: d.Impact})
-		}
-		if decisions == nil {
-			decisions = []decisionJSON{}
 		}
 
 		resp := statusResp{
@@ -392,9 +398,11 @@ func startMetricsServer(addr string, m *hubMetrics, ocppTracker *adapters.OCPPSt
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			log.Printf("hub: /status encode: %v", err)
 		}
-	})
+	}
+}
 
-	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+func logsHandler(lb *logBroadcaster) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -415,13 +423,5 @@ func startMetricsServer(addr string, m *hubMetrics, ocppTracker *adapters.OCPPSt
 				f.Flush()
 			}
 		}
-	})
-
-	srv := &http.Server{Addr: addr, Handler: mux}
-	go func() {
-		log.Printf("hub: metrics server on %s", addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("hub: metrics server: %v", err)
-		}
-	}()
+	}
 }

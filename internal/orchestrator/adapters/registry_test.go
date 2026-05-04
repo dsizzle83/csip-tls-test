@@ -19,6 +19,16 @@ type mockDevice struct {
 	lastCtrl model.DERControlBase
 }
 
+// mockBatteryDevice extends mockDevice to also implement BatteryMetricsReader.
+type mockBatteryDevice struct {
+	mockDevice
+	battMetrics orchestrator.BatteryMetrics
+}
+
+func (m *mockBatteryDevice) ReadBatteryMetrics() (orchestrator.BatteryMetrics, error) {
+	return m.battMetrics, nil
+}
+
 func (m *mockDevice) ReadMeasurements() (device.Measurements, error) { return m.meas, m.readErr }
 func (m *mockDevice) Status() (device.DeviceStatus, error) {
 	return device.DeviceStatus{Connected: true, Energized: true}, nil
@@ -42,9 +52,9 @@ func setup(t *testing.T) (*registry.Registry, *adapters.RegistryAdapter, *mockDe
 	reg.Add(&registry.Entry{Name: "meter-0", Device: meter})
 
 	ra := adapters.NewRegistryAdapter(reg)
-	ra.RegisterDevice("solar-0", adapters.RoleSolar, 5000)
-	ra.RegisterDevice("battery-0", adapters.RoleBattery, 5000)
-	ra.RegisterDevice("meter-0", adapters.RoleGridMeter, 0)
+	ra.RegisterDevice("solar-0", adapters.RoleSolar, 5000, solar)
+	ra.RegisterDevice("battery-0", adapters.RoleBattery, 5000, bat)
+	ra.RegisterDevice("meter-0", adapters.RoleGridMeter, 0, meter)
 
 	reg.Start()
 	ra.Start()
@@ -96,7 +106,7 @@ func TestRegistryAdapter_SolarPower_ClampedToZero(t *testing.T) {
 	reg.Add(&registry.Entry{Name: "solar-0", Device: d})
 
 	ra := adapters.NewRegistryAdapter(reg)
-	ra.RegisterDevice("solar-0", adapters.RoleSolar, 5000)
+	ra.RegisterDevice("solar-0", adapters.RoleSolar, 5000, d)
 
 	reg.Start()
 	ra.Start()
@@ -130,6 +140,41 @@ func TestRegistryAdapter_BatteryMetrics_Override(t *testing.T) {
 	}
 	if bat.MaxDischargeW != 4500 {
 		t.Errorf("MaxDischargeW = %g, want 4500", bat.MaxDischargeW)
+	}
+}
+
+func TestRegistryAdapter_BatteryMetrics_AutoRead(t *testing.T) {
+	// Battery device implements BatteryMetricsReader — metrics should be populated
+	// automatically without any manual UpdateBatteryMetrics call.
+	reg := registry.New(10 * time.Millisecond)
+	bat := &mockBatteryDevice{
+		mockDevice:  mockDevice{meas: device.Measurements{W: -1000, V: 240, Hz: 60}},
+		battMetrics: orchestrator.BatteryMetrics{SOC: 82.5, SOH: 99.0, CapacityWh: 10000, MaxChargeW: 5000, MaxDischargeW: 5000},
+	}
+	reg.Add(&registry.Entry{Name: "battery-0", Device: bat})
+
+	ra := adapters.NewRegistryAdapter(reg)
+	ra.RegisterDevice("battery-0", adapters.RoleBattery, 5000, bat)
+
+	reg.Start()
+	ra.Start()
+	time.Sleep(50 * time.Millisecond)
+	defer reg.Stop()
+	defer ra.Stop()
+
+	state, err := ra.ReadSystemState()
+	if err != nil {
+		t.Fatalf("ReadSystemState: %v", err)
+	}
+	if len(state.Batteries) == 0 {
+		t.Fatal("expected 1 battery in state")
+	}
+	b := state.Batteries[0]
+	if b.SOC != 82.5 {
+		t.Errorf("SOC = %g, want 82.5 (auto-read from BatteryMetricsReader)", b.SOC)
+	}
+	if b.MaxChargeW != 5000 {
+		t.Errorf("MaxChargeW = %g, want 5000", b.MaxChargeW)
 	}
 }
 

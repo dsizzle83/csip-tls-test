@@ -195,25 +195,20 @@ func TestOptimizer_ExcessSolar_SkipCharge_WhenBatteryFull(t *testing.T) {
 	}
 }
 
-// ── Demand response ───────────────────────────────────────────────────────────
+// ── Fixed dispatch (OpModFixedW) ──────────────────────────────────────────────
 
-func TestOptimizer_DemandResponse_DischargesBattery(t *testing.T) {
+func TestOptimizer_FixedDispatch_DischargesBattery(t *testing.T) {
 	opt := newOpt()
 	s := state0()
 
-	// Active CSIP export limit = demand response signal.
+	// Grid requests 3 kW export (OpModFixedW). No solar → battery must cover it.
 	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 80, 5000)}
 	s.CSIPControl = &orchestrator.CSIPControlState{
-		Base: model.DERControlBase{OpModExpLimW: ap(3000)},
+		Base: model.DERControlBase{OpModFixedW: ap(3000)},
 	}
-	// No solar → DR rule should discharge battery.
-	// Grid.NetW not set → we rely on the battery headroom.
-	// The export limit rule fires but there's no excess to absorb (NetW=NaN and solar=0).
-	// Then DR discharges.
 
 	plan := opt.Optimize(s)
 
-	// Should issue a discharge command for the battery.
 	found := false
 	for _, cmd := range plan.BatteryCommands {
 		if cmd.SetpointW > 0 {
@@ -221,19 +216,19 @@ func TestOptimizer_DemandResponse_DischargesBattery(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("expected battery discharge command during demand response")
+		t.Error("expected battery discharge command for fixed dispatch")
 	}
 	logDecisions(t, plan)
 }
 
-func TestOptimizer_DemandResponse_RespectsSOCReserve(t *testing.T) {
+func TestOptimizer_FixedDispatch_RespectsSOCReserve(t *testing.T) {
 	opt := newOpt()
 	s := state0()
 
-	// Battery at 15% — below SOCReserve=20%; should NOT discharge.
+	// Battery at 15% — below SOCReserve=20%; should NOT discharge even for dispatch.
 	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 15, 5000)}
 	s.CSIPControl = &orchestrator.CSIPControlState{
-		Base: model.DERControlBase{OpModExpLimW: ap(3000)},
+		Base: model.DERControlBase{OpModFixedW: ap(3000)},
 	}
 
 	plan := opt.Optimize(s)
@@ -379,22 +374,18 @@ func TestScenario_ExcessSolarWithEV(t *testing.T) {
 // ── TOU cost model integration ────────────────────────────────────────────────
 
 func TestOptimizer_TOU_PeakHour_DischargeBattery(t *testing.T) {
-	costModel := orchestrator.DefaultTOUCostModel()
 	opt := orchestrator.NewDefaultOptimizer()
-	opt.CostModel = costModel
+	opt.CostModel = orchestrator.DefaultTOUCostModel()
+	// Force 5 pm — within the 16:00–21:00 peak window in DefaultTOUCostModel.
+	opt.NowFunc = func() time.Time {
+		return time.Date(2025, 1, 15, 17, 0, 0, 0, time.Local)
+	}
 
 	s := state0()
 	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 80, 5000)}
 
-	// Force peak conditions by injecting a state with isPeakHour=true
-	// via OpModExpLimW (which also triggers DR).
-	s.CSIPControl = &orchestrator.CSIPControlState{
-		Base: model.DERControlBase{OpModExpLimW: ap(10000)},
-	}
-
 	plan := opt.Optimize(s)
 
-	// DR is active (OpModExpLimW set) → battery should discharge.
 	found := false
 	for _, cmd := range plan.BatteryCommands {
 		if cmd.SetpointW > 0 {
@@ -402,7 +393,7 @@ func TestOptimizer_TOU_PeakHour_DischargeBattery(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("expected battery discharge during DR/peak")
+		t.Error("expected battery discharge during TOU peak hour")
 	}
 }
 
@@ -477,16 +468,34 @@ func TestOptimizer_SurplusRespectHomeLoad(t *testing.T) {
 
 func TestBatteryState_AvailableChargeW(t *testing.T) {
 	b := battery("bat", -2000, 50, 5000) // charging at 2kW, max 5kW
-	// available headroom = 5000 - 2000 = 3000
+	// headroom = MaxChargeW + PowerW = 5000 + (-2000) = 3000
 	if got := b.AvailableChargeW(); math.Abs(got-3000) > 1 {
 		t.Errorf("AvailableChargeW = %.0f, want 3000", got)
 	}
 }
 
+func TestBatteryState_AvailableChargeW_WhenDischarging(t *testing.T) {
+	// Battery discharging at 3kW: full swing to max charge = 5000+3000 = 8000W.
+	// This is the cross-zero case — the battery can swing from +3kW to −5kW.
+	b := battery("bat", 3000, 50, 5000)
+	if got := b.AvailableChargeW(); math.Abs(got-8000) > 1 {
+		t.Errorf("AvailableChargeW when discharging = %.0f, want 8000", got)
+	}
+}
+
 func TestBatteryState_AvailableDischargeW(t *testing.T) {
 	b := battery("bat", 1000, 50, 5000) // discharging at 1kW, max 5kW
+	// headroom = MaxDischargeW − PowerW = 5000 − 1000 = 4000
 	if got := b.AvailableDischargeW(); math.Abs(got-4000) > 1 {
 		t.Errorf("AvailableDischargeW = %.0f, want 4000", got)
+	}
+}
+
+func TestBatteryState_AvailableDischargeW_WhenCharging(t *testing.T) {
+	// Battery charging at 3kW: full swing to max discharge = 5000−(−3000) = 8000W.
+	b := battery("bat", -3000, 50, 5000)
+	if got := b.AvailableDischargeW(); math.Abs(got-8000) > 1 {
+		t.Errorf("AvailableDischargeW when charging = %.0f, want 8000", got)
 	}
 }
 
@@ -499,4 +508,135 @@ func TestBatteryState_Disconnected_ZeroHeadroom(t *testing.T) {
 	if got := b.AvailableDischargeW(); got != 0 {
 		t.Errorf("AvailableDischargeW disconnected = %.0f, want 0", got)
 	}
+}
+
+// TestOptimizer_ExportLimit_SwitchesBatteryFromDischargeToCharge verifies that
+// when the battery is discharging and an export limit is applied, the optimizer
+// commands immediate charging in a single tick rather than only reducing discharge.
+//
+// Scenario: battery +3kW, solar 5kW, load 2kW → 6kW export. Limit = 0W.
+// Required setpoint: 3000 − 6000 = −3000W.  Old (buggy) headroom capped at
+// MaxChargeW=5kW, absorbing only 5kW → setpoint −2000W, still 1kW over limit.
+func TestOptimizer_ExportLimit_SwitchesBatteryFromDischargeToCharge(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 5000, 10000)}
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 3000, 50, 5000)} // discharging
+	s.Grid.NetW = -6000                                                           // 6kW export
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Base: model.DERControlBase{OpModExpLimW: ap(0)},
+	}
+
+	plan := opt.Optimize(s)
+
+	if len(plan.BatteryCommands) == 0 {
+		t.Fatal("expected battery command")
+	}
+	cmd := plan.BatteryCommands[0]
+	// Must absorb the full 6kW excess: 3000 − 6000 = −3000W.
+	if cmd.SetpointW > -2500 {
+		t.Errorf("setpoint = %.0fW; expected ≤ −2500W to absorb the 6kW excess in one tick (was discharging at 3kW)", cmd.SetpointW)
+	}
+	logDecisions(t, plan)
+}
+
+// ── Document scenarios ────────────────────────────────────────────────────────
+
+// Case 1: export limit 1kW, solar 2kW, home 1kW, battery full, EV needs charge.
+// Expected: EV charges using solar surplus; no grid export above limit.
+func TestScenario_Case1_EVChargesWithSolarSurplus(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 2000, 3000)}
+	b := battery("bat-0", 0, 96, 5000) // full (SOC above threshold)
+	s.Batteries = []orchestrator.BatteryState{b}
+	s.Grid.NetW = -1000 // exporting 1kW, exactly at limit
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Base: model.DERControlBase{OpModExpLimW: ap(1000)},
+	}
+	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 32.0, 230.0)}
+
+	plan := opt.Optimize(s)
+
+	// EV should receive a charge command at ≥ 6A (minimum) using solar + grid supplement.
+	if len(plan.EVSECommands) == 0 {
+		t.Fatal("expected EVSE command to charge EV with solar surplus")
+	}
+	cmd := plan.EVSECommands[0]
+	if cmd.MaxCurrentA < 6.0 {
+		t.Errorf("EV should charge at ≥6A minimum, got %.1fA", cmd.MaxCurrentA)
+	}
+	// Battery should not charge (already full).
+	for _, bc := range plan.BatteryCommands {
+		if bc.SetpointW < 0 {
+			t.Errorf("battery should not charge when full (SOC=96%%)")
+		}
+	}
+	logDecisions(t, plan)
+}
+
+// Case 2: grid requests 10kW (OpModFixedW), solar 10kW, home 1kW, battery full.
+// Expected: solar provides 9kW; battery discharges 1kW to cover shortfall.
+func TestScenario_Case2_FixedDispatch_BatteryCoversShortfall(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 10000, 10000)}
+	b := battery("bat-0", 0, 100, 5000) // full, idle
+	s.Batteries = []orchestrator.BatteryState{b}
+	s.Grid.NetW = -9000 // exporting 9kW (solar minus home load)
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Base: model.DERControlBase{OpModFixedW: ap(10000)},
+	}
+
+	plan := opt.Optimize(s)
+
+	// Battery must discharge to cover the 1kW shortfall.
+	found := false
+	for _, cmd := range plan.BatteryCommands {
+		if cmd.SetpointW > 0 {
+			found = true
+			if cmd.SetpointW < 500 || cmd.SetpointW > 2000 {
+				t.Errorf("battery setpoint = %.0fW; expected ~1000W (1kW shortfall)", cmd.SetpointW)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected battery discharge to cover grid dispatch shortfall")
+	}
+	logDecisions(t, plan)
+}
+
+// Case 3: export limit 0W, solar 2kW, home 1kW, battery 50%, EV full.
+// Expected: battery absorbs the 1kW surplus; solar not curtailed.
+// When battery is full: solar gets curtailed instead.
+func TestScenario_Case3_ExportZero_BatteryAbsorbsSurplus(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 2000, 3000)}
+	b := battery("bat-0", 0, 50, 5000)
+	s.Batteries = []orchestrator.BatteryState{b}
+	s.Grid.NetW = -1000 // exporting 1kW (= excess over export limit 0)
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Base: model.DERControlBase{OpModExpLimW: ap(0)},
+	}
+
+	plan := opt.Optimize(s)
+
+	// Battery should charge to absorb the 1kW surplus.
+	found := false
+	for _, cmd := range plan.BatteryCommands {
+		if cmd.SetpointW < 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected battery to absorb 1kW surplus when export=0W")
+	}
+	// Solar should not be curtailed (battery has headroom).
+	for _, sc := range plan.SolarCommands {
+		if !math.IsNaN(sc.CurtailToW) && sc.CurtailToW < 1900 {
+			t.Errorf("solar curtailed to %.0fW; battery has headroom, should not curtail", sc.CurtailToW)
+		}
+	}
+	logDecisions(t, plan)
 }

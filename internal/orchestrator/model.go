@@ -73,23 +73,27 @@ type BatteryState struct {
 	Energized bool
 }
 
-// AvailableChargeW returns how many more watts the battery can absorb right now.
+// AvailableChargeW returns the additional watts of charge power that can be
+// commanded right now — the full swing from the current setpoint down to
+// −MaxChargeW.  When the battery is currently discharging (PowerW > 0) this
+// is larger than MaxChargeW because the discharge headroom can also be
+// redirected into charge.
 func (b BatteryState) AvailableChargeW() float64 {
 	if !b.Connected {
 		return 0
 	}
-	// PowerW is negative when charging. Available headroom = MaxChargeW - abs(current charge rate).
-	currentChargeW := math.Max(0, -b.PowerW)
-	return math.Max(0, b.MaxChargeW-currentChargeW)
+	return math.Max(0, b.MaxChargeW+b.PowerW)
 }
 
-// AvailableDischargeW returns how many more watts the battery can export right now.
+// AvailableDischargeW returns the additional watts of discharge power that can
+// be commanded right now — the full swing from the current setpoint up to
+// +MaxDischargeW.  When the battery is currently charging (PowerW < 0) this
+// is larger than MaxDischargeW.
 func (b BatteryState) AvailableDischargeW() float64 {
 	if !b.Connected || !b.Energized {
 		return 0
 	}
-	currentDischargeW := math.Max(0, b.PowerW)
-	return math.Max(0, b.MaxDischargeW-currentDischargeW)
+	return math.Max(0, b.MaxDischargeW-b.PowerW)
 }
 
 // SolarState is a read-only snapshot of a solar inverter.

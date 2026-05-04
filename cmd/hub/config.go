@@ -37,9 +37,11 @@ type Config struct {
 	// Southbound devices
 	Devices []DeviceConfig `json:"devices"`
 
-	// MetricsPort is the TCP port for the Prometheus metrics HTTP server.
-	// Default 9100 (node_exporter convention). Set to 0 to disable.
-	MetricsPort int `json:"metrics_port"`
+	// MetricsPort is the TCP port for the HTTP metrics/status/logs server.
+	// Omit or set null for the default (9100). Set to 0 to disable entirely.
+	// Using a pointer lets JSON distinguish "not set" (nil → 9100) from
+	// "explicitly zero" (0 → disabled).
+	MetricsPort *int `json:"metrics_port,omitempty"`
 
 	// OCPP 2.0.1 CSMS (Security Profile 2). Set OCPPPort to 0 to disable.
 	OCPPPort int    `json:"ocpp_port"` // default 8887 when non-zero
@@ -93,14 +95,22 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.ResponseSetPath == "" {
 		cfg.ResponseSetPath = "/rsps/0/r"
 	}
-	if cfg.MetricsPort == 0 {
-		cfg.MetricsPort = 9100
-	}
 	return &cfg, nil
 }
 
+// MetricsEnabled reports whether the metrics/status/logs HTTP server should
+// start.  It is disabled when MetricsPort is explicitly set to 0 in config.
+func (c *Config) MetricsEnabled() bool {
+	return c.MetricsPort == nil || *c.MetricsPort != 0
+}
+
+// MetricsAddr returns the listen address for the metrics server.
+// Returns ":9100" when MetricsPort is nil (default).
 func (c *Config) MetricsAddr() string {
-	return fmt.Sprintf(":%d", c.MetricsPort)
+	if c.MetricsPort == nil {
+		return ":9100"
+	}
+	return fmt.Sprintf(":%d", *c.MetricsPort)
 }
 
 func (c *Config) EngineInterval() time.Duration {

@@ -14,6 +14,17 @@ import (
 	"csip-tls-test/internal/southbound/registry"
 )
 
+// clampInt16 converts a float64 to int16, saturating at the type boundaries.
+func clampInt16(v float64) int16 {
+	if v > math.MaxInt16 {
+		return math.MaxInt16
+	}
+	if v < math.MinInt16 {
+		return math.MinInt16
+	}
+	return int16(v)
+}
+
 // DeviceRole classifies a registry entry for the orchestrator.
 type DeviceRole uint8
 
@@ -32,17 +43,26 @@ type DeviceConfig struct {
 	MaxW float64
 	// MaxCurrentA is the EVSE hardware limit (A).
 	MaxCurrentA float64
+	// Dev is the direct device reference used for per-device polling and for
+	// automatically reading BatteryMetrics on battery-role devices.
+	// May be nil for simple measurement-only registrations.
+	Dev device.Device
 }
 
 // RegistryAdapter builds an orchestrator.SystemState from a registry.Registry
 // and a set of per-device role assignments. It subscribes to registry
 // measurement updates and maintains a latest-snapshot map.
 //
+// A dispatcher goroutine fans update messages out to per-device goroutines so
+// that a slow Modbus read on one device never delays state updates from others.
+// Battery-role devices that implement BatteryMetricsReader have their metrics
+// fetched automatically inside their own goroutine after each measurement update.
+//
 // Usage:
 //
 //	ra := adapters.NewRegistryAdapter(reg)
-//	ra.RegisterDevice("inverter-0", adapters.RoleSolar, 10000)
-//	ra.RegisterDevice("battery-0", adapters.RoleBattery, 5000)
+//	ra.RegisterDevice("inverter-0", adapters.RoleSolar, 10000, inverterDev)
+//	ra.RegisterDevice("battery-0", adapters.RoleBattery, 5000, batteryDev)
 //	// wire ra as orchestrator.SystemReader
 type RegistryAdapter struct {
 	reg     *registry.Registry
@@ -57,7 +77,7 @@ type RegistryAdapter struct {
 	grid orchestrator.GridState
 
 	stop chan struct{}
-	done chan struct{}
+	wg   sync.WaitGroup
 }
 
 // NewRegistryAdapter creates an adapter backed by reg.
@@ -70,13 +90,16 @@ func NewRegistryAdapter(reg *registry.Registry) *RegistryAdapter {
 		metrics: make(map[string]orchestrator.BatteryMetrics),
 		grid:    orchestrator.NewGridState(),
 		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
 	}
 }
 
 // RegisterDevice adds a named device with a role assignment.
-func (ra *RegistryAdapter) RegisterDevice(name string, role DeviceRole, maxW float64) {
-	ra.devices = append(ra.devices, DeviceConfig{Name: name, Role: role, MaxW: maxW})
+// dev is the direct device reference; it enables automatic BatteryMetrics polling
+// for battery-role devices and per-device goroutine isolation.  Pass nil to fall
+// back to manual UpdateBatteryMetrics calls (e.g. in tests with mock devices that
+// do not implement BatteryMetricsReader).
+func (ra *RegistryAdapter) RegisterDevice(name string, role DeviceRole, maxW float64, dev device.Device) {
+	ra.devices = append(ra.devices, DeviceConfig{Name: name, Role: role, MaxW: maxW, Dev: dev})
 }
 
 // SetGridState injects externally-measured grid values (e.g. from a grid meter
@@ -88,38 +111,82 @@ func (ra *RegistryAdapter) SetGridState(g orchestrator.GridState) {
 }
 
 // Start begins consuming registry measurement updates.  Pair with Stop.
+//
+// A dispatcher goroutine fans each MeasurementUpdate out to a per-device
+// buffered channel. Per-device goroutines process their own channel so that a
+// slow Modbus read on one device (including BatteryMetrics) never delays state
+// updates from other devices.
 func (ra *RegistryAdapter) Start() {
-	go ra.run()
+	sub, unsubscribe := ra.reg.Subscribe()
+
+	// Build per-device channels.
+	devChans := make(map[string]chan registry.MeasurementUpdate, len(ra.devices))
+	for _, dc := range ra.devices {
+		ch := make(chan registry.MeasurementUpdate, 4)
+		devChans[dc.Name] = ch
+		ra.wg.Add(1)
+		go ra.runDevice(dc, ch)
+	}
+
+	// Dispatcher: drain the subscription channel and route to per-device channels.
+	ra.wg.Add(1)
+	go func() {
+		defer ra.wg.Done()
+		defer unsubscribe()
+		defer func() {
+			for _, ch := range devChans {
+				close(ch)
+			}
+		}()
+		for {
+			select {
+			case <-ra.stop:
+				return
+			case upd, ok := <-sub:
+				if !ok {
+					return
+				}
+				if ch, ok := devChans[upd.Name]; ok {
+					select {
+					case ch <- upd:
+					default: // per-device channel full; drop stale update
+					}
+				}
+			}
+		}
+	}()
 }
 
-// Stop shuts down the update consumer.
+// Stop shuts down all goroutines and waits for them to exit.
 func (ra *RegistryAdapter) Stop() {
 	close(ra.stop)
-	<-ra.done
+	ra.wg.Wait()
 }
 
-func (ra *RegistryAdapter) run() {
-	defer close(ra.done)
-	updates, unsubscribe := ra.reg.Subscribe()
-	defer unsubscribe()
+// runDevice processes measurement updates for one device and, for battery-role
+// devices that implement BatteryMetricsReader, fetches metrics automatically
+// after each successful measurement so the caller needs no manual wiring.
+func (ra *RegistryAdapter) runDevice(dc DeviceConfig, updates <-chan registry.MeasurementUpdate) {
+	defer ra.wg.Done()
+	for upd := range updates { // exits when dispatcher closes the channel
+		ra.mu.Lock()
+		if upd.Err != nil {
+			ra.status[upd.Name] = device.DeviceStatus{Connected: false}
+		} else {
+			ra.latest[upd.Name] = upd.Measurements
+			ra.status[upd.Name] = device.DeviceStatus{Connected: true, Energized: true}
+		}
+		ra.mu.Unlock()
 
-	for {
-		select {
-		case <-ra.stop:
-			return
-		case upd, ok := <-updates:
-			if !ok {
-				return
+		// Auto-fetch battery metrics for devices that support it.
+		if dc.Role == RoleBattery && dc.Dev != nil && upd.Err == nil {
+			if bmr, ok := dc.Dev.(orchestrator.BatteryMetricsReader); ok {
+				if m, err := bmr.ReadBatteryMetrics(); err == nil {
+					ra.mu.Lock()
+					ra.metrics[upd.Name] = m
+					ra.mu.Unlock()
+				}
 			}
-			ra.mu.Lock()
-			if upd.Err != nil {
-				// Mark disconnected; keep stale measurements.
-				ra.status[upd.Name] = device.DeviceStatus{Connected: false}
-			} else {
-				ra.latest[upd.Name] = upd.Measurements
-				ra.status[upd.Name] = device.DeviceStatus{Connected: true, Energized: true}
-			}
-			ra.mu.Unlock()
 		}
 	}
 }
@@ -242,16 +309,10 @@ func (a *RegistryBatteryActuator) ApplyBatteryCommand(cmd orchestrator.BatteryCo
 	ctrl.OpModConnect = cmd.Connect
 
 	if !math.IsNaN(cmd.SetpointW) {
-		clamp := func(v float64) int16 {
-			if v > math.MaxInt16 {
-				return math.MaxInt16
-			}
-			return int16(v)
-		}
 		if cmd.SetpointW >= 0 {
-			ctrl.OpModExpLimW = &model.ActivePower{Value: clamp(cmd.SetpointW), Multiplier: 0}
+			ctrl.OpModExpLimW = &model.ActivePower{Value: clampInt16(cmd.SetpointW), Multiplier: 0}
 		} else {
-			ctrl.OpModImpLimW = &model.ActivePower{Value: clamp(-cmd.SetpointW), Multiplier: 0}
+			ctrl.OpModImpLimW = &model.ActivePower{Value: clampInt16(-cmd.SetpointW), Multiplier: 0}
 		}
 	}
 
@@ -280,9 +341,9 @@ func (a *RegistrySolarActuator) ApplySolarCommand(cmd orchestrator.SolarCommand)
 			return nil // max_w not configured; leave device producing freely
 		}
 		// Restore full nameplate output.
-		w = int16(a.maxW)
+		w = clampInt16(a.maxW)
 	} else {
-		w = int16(math.Max(0, cmd.CurtailToW))
+		w = clampInt16(math.Max(0, cmd.CurtailToW))
 	}
 	return a.reg.ApplyControlTo(a.devName, model.DERControlBase{
 		OpModMaxLimW: &model.ActivePower{Value: w, Multiplier: 0},

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"time"
 
@@ -10,34 +11,34 @@ import (
 
 // DefaultOptimizer is a rule-based + heuristic optimizer.
 //
-// Priority order (higher number = evaluated later, can be overridden):
+// Priority order:
 //
-//  1. Safety      — never exceed device or grid hard limits
-//  2. CSIP        — respect active DERControl commands from the utility
-//  3. Self-use    — battery absorbs excess solar before it hits the grid
-//  4. Demand-resp — battery discharges during peak / demand-response events
-//  5. EV charging — allocate available budget to EVSEs
-//  6. Cost        — time-of-use adjustments (bonus layer, optional)
-//
-// All decisions are recorded in Plan.Decisions for observability.
+//  1. Safety        — CSIP disconnect overrides everything
+//  2. Fixed dispatch — meet an explicit grid export request (OpModFixedW)
+//  3. Export limit  — absorb excess into EVSEs, then battery, then curtail solar
+//  4. Self-use      — route solar surplus to battery
+//  5. TOU peak      — discharge battery during expensive grid hours
+//  6. EV charging   — allocate remaining budget to EVSEs
 type DefaultOptimizer struct {
-	// CostModel is optional; when non-nil it influences battery charge/discharge
-	// decisions based on time-of-use pricing.
+	// CostModel is optional; when non-nil it drives TOU peak discharge.
 	CostModel *TOUCostModel
 
-	// Debug enables step-by-step logging of each rule evaluation.
+	// Debug enables per-rule logging.
 	Debug bool
 
-	// SOCReserve is the minimum SOC [0,100] to keep in the battery for
-	// demand-response readiness.  Default 20%.
+	// SOCReserve is the minimum SOC [0,100] kept for demand-response.  Default 20%.
 	SOCReserve float64
 
-	// SOCFullThreshold is the SOC level above which we stop charging.  Default 95%.
+	// SOCFullThreshold is the SOC above which charging stops.  Default 95%.
 	SOCFullThreshold float64
 
 	// ExcessSolarThreshold is the minimum surplus watts before routing to battery.
 	// Avoids constant tiny adjustments.  Default 100 W.
 	ExcessSolarThreshold float64
+
+	// NowFunc returns the current time.  Nil means time.Now.
+	// Override in tests to inject a deterministic clock.
+	NowFunc func() time.Time
 }
 
 // NewDefaultOptimizer returns an optimizer with sensible defaults.
@@ -49,288 +50,492 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 	}
 }
 
+func (o *DefaultOptimizer) now() time.Time {
+	if o.NowFunc != nil {
+		return o.NowFunc()
+	}
+	return time.Now()
+}
+
+// gridConstraints holds effective export/import/max limits after applying CSIP
+// overrides on top of grid-reported values.  NaN means unconstrained.
+type gridConstraints struct {
+	exportLimitW float64
+	importLimitW float64
+	maxLimitW    float64
+}
+
 // Optimize evaluates all rules against state and returns a Plan.
 func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
-	plan := Plan{Timestamp: time.Now()}
+	plan := Plan{Timestamp: o.now()}
 
-	// ── Rule 1: CSIP disconnect command ──────────────────────────────────────
-	// Highest priority: if the utility says disconnect, we disconnect.
-	if cc := state.CSIPControl; cc != nil {
-		if cc.Base.OpModConnect != nil && !*cc.Base.OpModConnect {
-			for _, b := range state.Batteries {
-				f := false
-				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
-					Name:    b.Name,
-					Connect: &f,
-				})
-			}
-			plan.AddDecision("csip/disconnect",
-				"OpModConnect=false received from utility",
-				fmt.Sprintf("disconnecting %d batteries", len(state.Batteries)))
-			// When disconnecting, there's nothing else to do.
-			return plan
-		}
+	// Rule 1: CSIP disconnect — highest priority, always early-return.
+	if csipDisconnectRule(state.CSIPControl, state.Batteries, &plan) {
+		return plan
 	}
 
-	// ── Derive grid constraints from CSIP ─────────────────────────────────────
-	exportLimitW := state.Grid.ExportLimitW // from grid meter / CSIP
-	importLimitW := state.Grid.ImportLimitW
-	maxLimitW := state.Grid.MaxLimitW
-
-	if cc := state.CSIPControl; cc != nil {
-		if lim := cc.Base.OpModExpLimW; lim != nil {
-			exportLimitW = nanMin(exportLimitW, apW(lim))
-		}
-		if lim := cc.Base.OpModMaxLimW; lim != nil {
-			maxLimitW = nanMin(maxLimitW, apW(lim))
-		}
-		if lim := cc.Base.OpModImpLimW; lim != nil {
-			importLimitW = nanMin(importLimitW, apW(lim))
-		}
-	}
-	// MaxLimW also constrains exports.
-	if !math.IsNaN(maxLimitW) {
-		exportLimitW = nanMin(exportLimitW, maxLimitW)
-	}
-
-	// ── Compute power balance ─────────────────────────────────────────────────
-	//
-	// Available power budget for self-consumption and EV charging:
-	//   surplus = solar - local_load
-	//
-	// We approximate local_load as:
-	//   local_load ≈ -grid.NetW - totalBattery + totalSolar
-	// i.e. whatever is not accounted for by solar and battery = load.
-	//
-	// If we don't have a grid meter (NetW is NaN), fall back to solar only.
-	solarW := state.TotalSolarW()
-	batteryW := state.TotalBatteryW() // + discharge, - charge
-	evseW := state.TotalEVSEW()
-
-	// Sign conventions (throughout this file):
-	//   solarW   >= 0            (generation)
-	//   batteryW > 0 discharge, < 0 charge
-	//   evseW    >= 0            (consumption)
-	//   Grid.NetW > 0 import from grid, < 0 export to grid
-	//
-	// KCL at the site panel:
-	//   solarW + batteryW + Grid.NetW = homeLoadW + evseW
-	//   homeLoadW = solarW + max(0,batteryW) + Grid.NetW - evseW
-	//     (max(0,batteryW) because charging battery is counted as load, not source)
-	//   surplusW = solarW - homeLoadW   (watts available above home loads)
-	var surplusW float64 // positive = excess solar available for battery/grid
-	if !math.IsNaN(state.Grid.NetW) {
-		homeLoadW := solarW + math.Max(0, batteryW) + state.Grid.NetW - evseW
-		surplusW = solarW - homeLoadW
-	} else {
-		// No grid meter: use solar as the budget baseline.
-		surplusW = solarW
-	}
+	limits := deriveGridConstraints(state.Grid, state.CSIPControl)
+	solarW, batteryW, evseW, surplusW := computePowerBalance(state)
+	homeLoadW := state.InferredLoadW()
 
 	if o.Debug {
-		homeLoadW := math.NaN()
-		if !math.IsNaN(state.Grid.NetW) {
-			homeLoadW = solarW + math.Max(0, batteryW) + state.Grid.NetW - evseW
-		}
-		fmt.Printf("[optimizer] solarW=%.0f batteryW=%.0f evseW=%.0f homeLoadW=%.0f surplusW=%.0f gridNetW=%.0f\n",
+		log.Printf("[optimizer] solarW=%.0f batteryW=%.0f evseW=%.0f homeLoadW=%.0f surplusW=%.0f gridNetW=%.0f",
 			solarW, batteryW, evseW, homeLoadW, surplusW, state.Grid.NetW)
 	}
 
-	// ── Rule 2: CSIP export limit enforcement ─────────────────────────────────
-	if !math.IsNaN(exportLimitW) {
-		// Current net export = solar + battery_discharge - local_load - evse
-		netExportW := solarW + math.Max(0, batteryW) - evseW
-		if !math.IsNaN(state.Grid.NetW) {
-			// Use measured value if available (more accurate).
-			netExportW = -state.Grid.NetW // positive = export
+	// Thread a mutable copy of battery states through rules so each rule sees
+	// PowerW updated by prior rules (reflects already-committed setpoints).
+	batteries := make([]BatteryState, len(state.Batteries))
+	copy(batteries, state.Batteries)
+
+	// Rule 2: CSIP fixed dispatch — discharge battery to meet explicit grid export request.
+	batteries = applyFixedDispatchRule(state.CSIPControl, batteries, solarW, homeLoadW, o.SOCReserve, &plan)
+
+	// Rule 3: Export/import limit — absorb excess into EVSEs, battery, then curtail solar.
+	batteries, surplusW = applyExportLimitRule(state.Solar, state.EVSEs, evseW, limits, state.Grid.NetW, o.SOCFullThreshold, surplusW, batteries, &plan)
+
+	// Rule 4: Self-consumption — route solar surplus to battery.
+	batteries, surplusW = applySelfConsumptionRule(batteries, surplusW, o.ExcessSolarThreshold, o.SOCFullThreshold, &plan)
+
+	// Rule 5: TOU peak discharge.
+	// CSIP dispatch (OpModFixedW) is handled in Rule 2; this rule covers autonomous peak shifting.
+	serverNow := time.Unix(o.now().Unix()+state.ClockOffset, 0)
+	isPeak := o.CostModel != nil && o.CostModel.IsPeakHour(serverNow)
+	peakReason := ""
+	if isPeak {
+		peakReason = fmt.Sprintf("peak TOU hour (rate=%.3f/kWh)", o.CostModel.CurrentRate(serverNow))
+	}
+	batteries, surplusW = applyDemandResponseRule(batteries, surplusW, o.SOCReserve, false, isPeak, peakReason, &plan)
+
+	// Rule 6: EV charging allocation.
+	applyEVChargingRule(state.EVSEs, limits, state.Grid.NetW, solarW, surplusW, &plan)
+
+	// Final: restore unconstrained devices so prior setpoints don't persist.
+	applyRestoreRule(state.Solar, batteries, o.SOCReserve, &plan)
+
+	return plan
+}
+
+// ── Rule functions ─────────────────────────────────────────────────────────────
+
+// csipDisconnectRule issues Connect=false commands when the utility sends
+// OpModConnect=false.  Returns true when Optimize should return immediately.
+func csipDisconnectRule(cc *CSIPControlState, batteries []BatteryState, plan *Plan) bool {
+	if cc == nil || cc.Base.OpModConnect == nil || *cc.Base.OpModConnect {
+		return false
+	}
+	f := false
+	for _, b := range batteries {
+		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+			Name:    b.Name,
+			Connect: &f,
+		})
+	}
+	plan.AddDecision("csip/disconnect",
+		"OpModConnect=false received from utility",
+		fmt.Sprintf("disconnecting %d batteries", len(batteries)))
+	return true
+}
+
+// deriveGridConstraints returns the tightest of CSIP and grid-reported limits.
+// NaN in any field means no constraint for that direction.
+func deriveGridConstraints(grid GridState, cc *CSIPControlState) gridConstraints {
+	c := gridConstraints{
+		exportLimitW: grid.ExportLimitW,
+		importLimitW: grid.ImportLimitW,
+		maxLimitW:    grid.MaxLimitW,
+	}
+	if cc != nil {
+		if lim := cc.Base.OpModExpLimW; lim != nil {
+			c.exportLimitW = nanMin(c.exportLimitW, apW(lim))
 		}
-
-		if netExportW > exportLimitW {
-			excessW := netExportW - exportLimitW
-
-			// First: absorb excess into battery if possible (skip batteries at SOC threshold).
-			for i, b := range state.Batteries {
-				if !b.Connected {
-					continue
-				}
-				// Don't charge a battery that's already at its comfort ceiling.
-				if !math.IsNaN(b.SOC) && b.SOC >= o.SOCFullThreshold {
-					continue
-				}
-				headroom := b.AvailableChargeW()
-				absorb := math.Min(headroom, excessW)
-				if absorb > 0 {
-					newSetpoint := b.PowerW - absorb // more negative = more charge
-					plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
-						Name:      b.Name,
-						SetpointW: newSetpoint,
-					})
-					excessW -= absorb
-					state.Batteries[i].PowerW = newSetpoint // update for downstream rules
-					plan.AddDecision("csip/export-limit",
-						fmt.Sprintf("export %.0fW > limit %.0fW; charging battery %s with %.0fW",
-							netExportW, exportLimitW, b.Name, absorb),
-						fmt.Sprintf("battery %s setpoint → %.0fW", b.Name, newSetpoint))
-				}
-			}
-
-			// Second: curtail solar if battery can't absorb everything.
-			if excessW > 1 {
-				for _, sol := range state.Solar {
-					if !sol.Connected {
-						continue
-					}
-					curtailTo := math.Max(0, sol.PowerW-excessW)
-					plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
-						Name:       sol.Name,
-						CurtailToW: curtailTo,
-					})
-					excessW -= (sol.PowerW - curtailTo)
-					plan.AddDecision("csip/export-limit",
-						fmt.Sprintf("curtailing solar %s to %.0fW to stay under export limit %.0fW",
-							sol.Name, curtailTo, exportLimitW),
-						fmt.Sprintf("solar %s curtailed from %.0fW → %.0fW",
-							sol.Name, sol.PowerW, curtailTo))
-					if excessW <= 1 {
-						break
-					}
-				}
-			}
+		if lim := cc.Base.OpModMaxLimW; lim != nil {
+			c.maxLimitW = nanMin(c.maxLimitW, apW(lim))
+		}
+		if lim := cc.Base.OpModImpLimW; lim != nil {
+			c.importLimitW = nanMin(c.importLimitW, apW(lim))
 		}
 	}
+	// MaxLimW is an absolute generation cap that also constrains exports.
+	if !math.IsNaN(c.maxLimitW) {
+		c.exportLimitW = nanMin(c.exportLimitW, c.maxLimitW)
+	}
+	return c
+}
 
-	// ── Rule 3: Self-consumption — absorb excess solar into battery ───────────
-	if surplusW > o.ExcessSolarThreshold {
-		for i, b := range state.Batteries {
-			if !b.Connected || !b.Energized {
-				continue
-			}
-			// Don't charge past SOCFullThreshold.
-			if !math.IsNaN(b.SOC) && b.SOC >= o.SOCFullThreshold {
-				plan.AddDecision("self-consumption",
-					fmt.Sprintf("battery %s SOC=%.1f%% >= full threshold %.1f%%",
-						b.Name, b.SOC, o.SOCFullThreshold),
-					"skip charging — battery full")
-				continue
-			}
-			headroom := b.AvailableChargeW()
-			absorb := math.Min(headroom, surplusW)
-			if absorb < 50 { // below noise floor, skip
-				continue
-			}
-			newSetpoint := b.PowerW - absorb
-			// Don't send a duplicate command if export-limit already set this.
-			if !hasBatteryCommand(plan.BatteryCommands, b.Name) {
-				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
-					Name:      b.Name,
-					SetpointW: newSetpoint,
-				})
-				plan.AddDecision("self-consumption",
-					fmt.Sprintf("%.0fW solar surplus → charging battery %s",
-						surplusW, b.Name),
-					fmt.Sprintf("battery %s setpoint %.0fW", b.Name, newSetpoint))
-			}
-			surplusW -= absorb
-			state.Batteries[i].PowerW = newSetpoint
-		}
+// computePowerBalance returns the site-level power flows and solar surplus.
+//
+// Sign conventions (throughout the optimizer):
+//
+//	solarW   >= 0            (generation)
+//	batteryW > 0 discharge, < 0 charge
+//	evseW    >= 0            (consumption)
+//	Grid.NetW > 0 import from grid, < 0 export
+//
+// surplusW > 0 means solar exceeds home load and is available for battery or grid.
+// When no grid meter is present (NetW=NaN) surplusW equals solarW.
+func computePowerBalance(state SystemState) (solarW, batteryW, evseW, surplusW float64) {
+	solarW = state.TotalSolarW()
+	batteryW = state.TotalBatteryW()
+	evseW = state.TotalEVSEW()
+	if !math.IsNaN(state.Grid.NetW) {
+		// surplusW = solar above home load = export available for battery/grid.
+		// Grid.NetW < 0 means exporting; evseW is already on the site bus.
+		surplusW = -state.Grid.NetW - evseW
+	} else {
+		surplusW = solarW
+	}
+	return
+}
+
+// applyFixedDispatchRule discharges batteries to meet an explicit grid export
+// request (CSIP OpModFixedW).  Solar is credited first; batteries cover the
+// shortfall up to SOC reserve.
+func applyFixedDispatchRule(cc *CSIPControlState, batteries []BatteryState, solarW, homeLoadW, socReserve float64, plan *Plan) []BatteryState {
+	if cc == nil || cc.Base.OpModFixedW == nil {
+		return batteries
+	}
+	targetW := apW(cc.Base.OpModFixedW)
+
+	// How much solar output is already available for grid export?
+	var availableW float64
+	if !math.IsNaN(homeLoadW) {
+		availableW = math.Max(0, solarW-homeLoadW)
+	} else {
+		availableW = solarW // no grid meter — assume all solar can export
 	}
 
-	// ── Rule 4: Demand response / peak discharge ──────────────────────────────
-	// Discharge battery during peak pricing or when grid import would be needed.
-	isDemandResponse := isDRActive(state)
-	serverNow := time.Unix(time.Now().Unix()+state.ClockOffset, 0)
-	isPeakHour := o.CostModel != nil && o.CostModel.IsPeakHour(serverNow)
-
-	if isDemandResponse || isPeakHour {
-		reason := "demand-response event active"
-		if isPeakHour && !isDemandResponse {
-			reason = fmt.Sprintf("peak TOU hour (rate=%.3f/kWh)",
-				o.CostModel.CurrentRate(serverNow))
-		}
-
-		for i, b := range state.Batteries {
-			if !b.Connected || !b.Energized {
-				continue
-			}
-			// Reserve minimum SOC.
-			if !math.IsNaN(b.SOC) && b.SOC <= o.SOCReserve {
-				plan.AddDecision("demand-response",
-					fmt.Sprintf("battery %s SOC=%.1f%% at reserve minimum", b.Name, b.SOC),
-					"skip discharge — protecting reserve")
-				continue
-			}
-			available := b.AvailableDischargeW()
-			if available < 50 {
-				continue
-			}
-			if !hasBatteryCommand(plan.BatteryCommands, b.Name) {
-				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
-					Name:      b.Name,
-					SetpointW: available,
-				})
-				plan.AddDecision("demand-response",
-					reason,
-					fmt.Sprintf("discharging battery %s at %.0fW", b.Name, available))
-				state.Batteries[i].PowerW = available
-				surplusW += available
-			}
-		}
+	if availableW >= targetW {
+		plan.AddDecision("csip/fixed-dispatch",
+			fmt.Sprintf("solar provides %.0fW, covering grid request of %.0fW", availableW, targetW),
+			"no battery discharge needed")
+		return batteries
 	}
 
-	// ── Rule 5: EV charging allocation ───────────────────────────────────────
-	// Distribute available power budget across connected EVSEs.
-	for _, evse := range state.EVSEs {
+	shortfallW := targetW - availableW
+	for i, b := range batteries {
+		if !b.Connected || !b.Energized {
+			continue
+		}
+		if !math.IsNaN(b.SOC) && b.SOC <= socReserve {
+			plan.AddDecision("csip/fixed-dispatch",
+				fmt.Sprintf("battery %s SOC=%.1f%% at reserve minimum", b.Name, b.SOC),
+				"skip discharge — protecting reserve")
+			continue
+		}
+		if hasBatteryCommand(plan.BatteryCommands, b.Name) {
+			continue
+		}
+		available := b.AvailableDischargeW()
+		if available < 50 {
+			continue
+		}
+		dispatchW := math.Min(available, shortfallW)
+		newSetpoint := b.PowerW + dispatchW
+		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+			Name:      b.Name,
+			SetpointW: newSetpoint,
+		})
+		plan.AddDecision("csip/fixed-dispatch",
+			fmt.Sprintf("grid requests %.0fW; solar covers %.0fW; battery %s dispatches %.0fW",
+				targetW, availableW, b.Name, dispatchW),
+			fmt.Sprintf("battery %s setpoint → %.0fW", b.Name, newSetpoint))
+		batteries[i].PowerW = newSetpoint
+		shortfallW -= dispatchW
+		if shortfallW <= 1 {
+			break
+		}
+	}
+	return batteries
+}
+
+// applyExportLimitRule enforces the CSIP/grid export limit.
+// Priority: route excess into EVSEs (boost EV charging) → charge batteries → curtail solar.
+// Returns updated battery states and updated surplusW (reduced by any watts committed to
+// battery charging or EVSE boost, so Rule 6 does not over-allocate the same solar).
+func applyExportLimitRule(solar []SolarState, evses []EVSEState, evseW float64, limits gridConstraints, netW, socFull, surplusW float64, batteries []BatteryState, plan *Plan) ([]BatteryState, float64) {
+	if math.IsNaN(limits.exportLimitW) {
+		return batteries, surplusW
+	}
+
+	var netExportW float64
+	if !math.IsNaN(netW) {
+		netExportW = -netW // positive = exporting
+	} else {
+		// No grid meter: estimate from device states.
+		for _, sol := range solar {
+			netExportW += sol.PowerW
+		}
+		for _, b := range batteries {
+			netExportW += math.Max(0, b.PowerW)
+		}
+		netExportW -= evseW
+	}
+
+	if netExportW <= limits.exportLimitW {
+		return batteries, surplusW
+	}
+	excessW := netExportW - limits.exportLimitW
+	absorbedW := 0.0
+
+	// First: route excess to EVSEs (EVSEs are loads; charging them reduces net export).
+	for _, evse := range evses {
 		if !evse.Connected || !evse.SessionActive {
 			continue
 		}
-
-		maxCurrentA := evse.MaxCurrentA
+		if hasEVSECommand(plan.EVSECommands, evse.StationID, evse.ConnectorID) {
+			continue
+		}
 		voltage := evse.VoltageV
 		if voltage <= 0 {
-			voltage = 230.0 // assume EU nominal
+			voltage = 230.0
 		}
-		maxPowerW := maxCurrentA * voltage
+		additionalW := (evse.MaxCurrentA - evse.CurrentA) * voltage
+		if additionalW < 50 {
+			continue
+		}
+		absorb := math.Min(additionalW, excessW)
+		newCurrentA := evse.CurrentA + absorb/voltage
+		plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+			StationID:   evse.StationID,
+			ConnectorID: evse.ConnectorID,
+			MaxCurrentA: newCurrentA,
+		})
+		plan.AddDecision("csip/export-limit",
+			fmt.Sprintf("export %.0fW > limit %.0fW; routing %.0fW to EV %s",
+				netExportW, limits.exportLimitW, absorb, evse.StationID),
+			fmt.Sprintf("EVSE %s boosted to %.1fA", evse.StationID, newCurrentA))
+		absorbedW += absorb
+		excessW -= absorb
+		if excessW <= 1 {
+			return batteries, surplusW - absorbedW
+		}
+	}
 
-		// Check import limit: reduce EVSE budget if needed.
-		if !math.IsNaN(importLimitW) {
-			// Remaining grid headroom = importLimitW - current grid import
-			// Current grid import ≈ evseW + load - solar - battery
-			gridImportW := math.NaN()
-			if !math.IsNaN(state.Grid.NetW) {
-				gridImportW = state.Grid.NetW
+	// Second: absorb into battery.
+	for i, b := range batteries {
+		if !b.Connected {
+			continue
+		}
+		if hasBatteryCommand(plan.BatteryCommands, b.Name) {
+			continue
+		}
+		if !math.IsNaN(b.SOC) && b.SOC >= socFull {
+			continue
+		}
+		headroom := b.AvailableChargeW()
+		absorb := math.Min(headroom, excessW)
+		if absorb > 0 {
+			newSetpoint := b.PowerW - absorb
+			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+				Name:      b.Name,
+				SetpointW: newSetpoint,
+			})
+			plan.AddDecision("csip/export-limit",
+				fmt.Sprintf("export %.0fW > limit %.0fW; charging battery %s with %.0fW",
+					netExportW, limits.exportLimitW, b.Name, absorb),
+				fmt.Sprintf("battery %s setpoint → %.0fW", b.Name, newSetpoint))
+			absorbedW += absorb
+			excessW -= absorb
+			batteries[i].PowerW = newSetpoint
+		}
+	}
+
+	// Third: curtail solar proportionally across all inverters.
+	if excessW > 1 {
+		totalSolarW := 0.0
+		for _, sol := range solar {
+			if sol.Connected {
+				totalSolarW += sol.PowerW
 			}
-			if !math.IsNaN(gridImportW) && gridImportW >= importLimitW {
-				// Grid import already at limit; suspend EVSE or reduce to zero.
-				plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
-					StationID:   evse.StationID,
-					ConnectorID: evse.ConnectorID,
-					MaxCurrentA: 0, // suspend
+		}
+		if totalSolarW > 0 {
+			fraction := math.Min(1.0, excessW/totalSolarW)
+			for _, sol := range solar {
+				if !sol.Connected {
+					continue
+				}
+				curtailTo := sol.PowerW * (1 - fraction)
+				plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
+					Name:       sol.Name,
+					CurtailToW: curtailTo,
 				})
-				plan.AddDecision("import-limit",
-					fmt.Sprintf("grid import %.0fW at/above limit %.0fW; suspending EVSE %s",
-						gridImportW, importLimitW, evse.StationID),
-					"EVSE session suspended")
-				continue
+				plan.AddDecision("csip/export-limit",
+					fmt.Sprintf("curtailing solar %s to %.0fW to stay under export limit %.0fW",
+						sol.Name, curtailTo, limits.exportLimitW),
+					fmt.Sprintf("solar %s curtailed from %.0fW → %.0fW",
+						sol.Name, sol.PowerW, curtailTo))
 			}
 		}
+	}
 
-		// Throttle EV charging if solar surplus allows — prefer solar self-use.
+	return batteries, surplusW - absorbedW
+}
+
+// applySelfConsumptionRule routes solar surplus into connected batteries.
+// Returns updated battery states and updated surplusW.
+func applySelfConsumptionRule(batteries []BatteryState, surplusW, excessThreshold, socFull float64, plan *Plan) ([]BatteryState, float64) {
+	if surplusW <= excessThreshold {
+		return batteries, surplusW
+	}
+	for i, b := range batteries {
+		if !b.Connected || !b.Energized {
+			continue
+		}
+		if !math.IsNaN(b.SOC) && b.SOC >= socFull {
+			plan.AddDecision("self-consumption",
+				fmt.Sprintf("battery %s SOC=%.1f%% >= full threshold %.1f%%",
+					b.Name, b.SOC, socFull),
+				"skip charging — battery full")
+			continue
+		}
+		headroom := b.AvailableChargeW()
+		absorb := math.Min(headroom, surplusW)
+		if absorb < 50 {
+			continue
+		}
+		newSetpoint := b.PowerW - absorb
+		if !hasBatteryCommand(plan.BatteryCommands, b.Name) {
+			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+				Name:      b.Name,
+				SetpointW: newSetpoint,
+			})
+			plan.AddDecision("self-consumption",
+				fmt.Sprintf("%.0fW solar surplus → charging battery %s", surplusW, b.Name),
+				fmt.Sprintf("battery %s setpoint %.0fW", b.Name, newSetpoint))
+		}
+		surplusW -= absorb
+		batteries[i].PowerW = newSetpoint
+	}
+	return batteries, surplusW
+}
+
+// applyDemandResponseRule discharges batteries during DR events or TOU peak hours.
+// Returns updated battery states and updated surplusW (discharge adds to surplus).
+func applyDemandResponseRule(batteries []BatteryState, surplusW, socReserve float64, isDR, isPeak bool, peakReason string, plan *Plan) ([]BatteryState, float64) {
+	if !isDR && !isPeak {
+		return batteries, surplusW
+	}
+	reason := "demand-response event active"
+	if peakReason != "" {
+		reason = peakReason
+	}
+	for i, b := range batteries {
+		if !b.Connected || !b.Energized {
+			continue
+		}
+		if !math.IsNaN(b.SOC) && b.SOC <= socReserve {
+			plan.AddDecision("demand-response",
+				fmt.Sprintf("battery %s SOC=%.1f%% at reserve minimum", b.Name, b.SOC),
+				"skip discharge — protecting reserve")
+			continue
+		}
+		available := b.AvailableDischargeW()
+		if available < 50 {
+			continue
+		}
+		if !hasBatteryCommand(plan.BatteryCommands, b.Name) {
+			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+				Name:      b.Name,
+				SetpointW: b.MaxDischargeW,
+			})
+			plan.AddDecision("demand-response",
+				reason,
+				fmt.Sprintf("discharging battery %s at %.0fW", b.Name, b.MaxDischargeW))
+			batteries[i].PowerW = b.MaxDischargeW
+			surplusW += available
+		}
+	}
+	return batteries, surplusW
+}
+
+// applyEVChargingRule distributes the available power budget across connected EVSEs.
+//
+// When an export limit is active and there is solar surplus but below the IEC 61851
+// minimum 6 A, the rule supplements from grid to reach 6 A (provided import headroom
+// allows), rather than suspending the session entirely.
+func applyEVChargingRule(evses []EVSEState, limits gridConstraints, netW, solarW, surplusW float64, plan *Plan) {
+	const minChargeA = 6.0 // IEC 61851-1 minimum AC charge current
+
+	for _, evse := range evses {
+		if !evse.Connected || !evse.SessionActive {
+			continue
+		}
+		// Skip EVSEs already commanded (e.g. by export-limit rule).
+		if hasEVSECommand(plan.EVSECommands, evse.StationID, evse.ConnectorID) {
+			continue
+		}
+
+		voltage := evse.VoltageV
+		if voltage <= 0 {
+			voltage = 230.0
+		}
+		maxPowerW := evse.MaxCurrentA * voltage
+		minChargeW := minChargeA * voltage
+
+		// Suspend if grid import is already at or above the limit.
+		if !math.IsNaN(limits.importLimitW) && !math.IsNaN(netW) && netW >= limits.importLimitW {
+			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+				StationID:   evse.StationID,
+				ConnectorID: evse.ConnectorID,
+				MaxCurrentA: 0,
+			})
+			plan.AddDecision("import-limit",
+				fmt.Sprintf("grid import %.0fW at/above limit %.0fW; suspending EVSE %s",
+					netW, limits.importLimitW, evse.StationID),
+				"EVSE session suspended")
+			continue
+		}
+
 		if solarW > 0 && surplusW < maxPowerW {
-			// Only allow EVSE to use what surplus exists + a small grid allowance.
 			budgetW := math.Max(0, surplusW)
-			limitA := budgetW / voltage
-			if limitA < 6 { // below minimum charge current, suspend
+
+			// When an export limit is active and there is solar surplus but below minimum
+			// charge rate, supplement from grid rather than suspending.
+			if !math.IsNaN(limits.exportLimitW) && budgetW > 0 && budgetW < minChargeW {
+				supplementW := minChargeW - budgetW
+				importHeadroom := math.Inf(1) // unconstrained unless import limit set
+				if !math.IsNaN(limits.importLimitW) && !math.IsNaN(netW) {
+					importHeadroom = limits.importLimitW - netW
+				}
+				if supplementW <= importHeadroom {
+					plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+						StationID:   evse.StationID,
+						ConnectorID: evse.ConnectorID,
+						MaxCurrentA: minChargeA,
+					})
+					plan.AddDecision("ev-charging",
+						fmt.Sprintf("%.0fW solar + %.0fW grid supplement → EVSE %s at %.0fA minimum",
+							budgetW, supplementW, evse.StationID, minChargeA),
+						fmt.Sprintf("EVSE %s at %.0fA", evse.StationID, minChargeA))
+					continue
+				}
+				// Import limit would be violated; suspend.
 				plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
 					StationID:   evse.StationID,
 					ConnectorID: evse.ConnectorID,
 					MaxCurrentA: 0,
 				})
 				plan.AddDecision("ev-charging",
-					fmt.Sprintf("insufficient solar surplus (%.0fW < min 1380W); suspending EVSE %s",
+					fmt.Sprintf("%.0fW solar insufficient and import limit prevents supplement; suspending EVSE %s",
 						surplusW, evse.StationID),
+					"EVSE suspended")
+				continue
+			}
+
+			limitA := budgetW / voltage
+			if limitA < minChargeA {
+				plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+					StationID:   evse.StationID,
+					ConnectorID: evse.ConnectorID,
+					MaxCurrentA: 0,
+				})
+				plan.AddDecision("ev-charging",
+					fmt.Sprintf("insufficient solar surplus (%.0fW < min %.0fW); suspending EVSE %s",
+						surplusW, minChargeW, evse.StationID),
 					"EVSE suspended to minimise grid import")
 			} else {
-				limitA = math.Min(limitA, maxCurrentA)
+				limitA = math.Min(limitA, evse.MaxCurrentA)
 				plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
 					StationID:   evse.StationID,
 					ConnectorID: evse.ConnectorID,
@@ -343,25 +548,25 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 				surplusW -= limitA * voltage
 			}
 		} else {
-			// Plenty of surplus or no solar: full rate.
 			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
 				StationID:   evse.StationID,
 				ConnectorID: evse.ConnectorID,
-				MaxCurrentA: maxCurrentA,
+				MaxCurrentA: evse.MaxCurrentA,
 			})
 			plan.AddDecision("ev-charging",
 				fmt.Sprintf("sufficient power available; charging EVSE %s at full %.1fA",
-					evse.StationID, maxCurrentA),
-				fmt.Sprintf("EVSE %s at %.1fA", evse.StationID, maxCurrentA))
+					evse.StationID, evse.MaxCurrentA),
+				fmt.Sprintf("EVSE %s at %.1fA", evse.StationID, evse.MaxCurrentA))
 		}
 	}
+}
 
-	// ── Final pass: restore full output for unconstrained devices ────────────────
-	//
-	// If a device received no command this tick, explicitly restore it to full
-	// output. Without this, a previous curtailment persists in M123 registers
-	// after the controlling DERControl expires, leaving devices stuck at zero.
-	for _, sol := range state.Solar {
+// applyRestoreRule sends restore commands for devices that received no command this
+// tick so that prior setpoints don't latch in Modbus registers.
+// Solar is restored to full output (NaN = nameplate max).
+// Battery is restored to idle (0 W) to clear any stale charge/discharge setpoint.
+func applyRestoreRule(solar []SolarState, batteries []BatteryState, socReserve float64, plan *Plan) {
+	for _, sol := range solar {
 		if sol.Connected && !hasSolarCommand(plan.SolarCommands, sol.Name) {
 			plan.SolarCommands = append(plan.SolarCommands, SolarCommand{
 				Name:       sol.Name,
@@ -369,30 +574,24 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 			})
 		}
 	}
-	for _, b := range state.Batteries {
+	for _, b := range batteries {
 		if b.Connected && !hasBatteryCommand(plan.BatteryCommands, b.Name) && b.MaxDischargeW > 0 {
-			// Only restore if SOC is above reserve; below reserve the battery stays
-			// WMaxLimPct-limited to 0 so the animation can't discharge it.
-			if math.IsNaN(b.SOC) || b.SOC > o.SOCReserve {
+			if math.IsNaN(b.SOC) || b.SOC > socReserve {
 				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 					Name:      b.Name,
-					SetpointW: b.MaxDischargeW, // restore full discharge headroom in M123
+					SetpointW: 0, // idle: clear any latched charge/discharge setpoint
 				})
 			}
 		}
 	}
-
-	return plan
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── helpers ────────────────────────────────────────────────────────────────────
 
-// apW converts a model.ActivePower to watts.
 func apW(ap *model.ActivePower) float64 {
 	return float64(ap.Value) * math.Pow10(int(ap.Multiplier))
 }
 
-// nanMin returns the minimum of a and b, treating NaN as "no constraint" (infinity).
 func nanMin(a, b float64) float64 {
 	if math.IsNaN(a) {
 		return b
@@ -403,7 +602,6 @@ func nanMin(a, b float64) float64 {
 	return math.Min(a, b)
 }
 
-// hasBatteryCommand returns true if a BatteryCommand for name already exists.
 func hasBatteryCommand(cmds []BatteryCommand, name string) bool {
 	for _, c := range cmds {
 		if c.Name == name {
@@ -413,7 +611,6 @@ func hasBatteryCommand(cmds []BatteryCommand, name string) bool {
 	return false
 }
 
-// hasSolarCommand returns true if a SolarCommand for name already exists.
 func hasSolarCommand(cmds []SolarCommand, name string) bool {
 	for _, c := range cmds {
 		if c.Name == name {
@@ -423,14 +620,11 @@ func hasSolarCommand(cmds []SolarCommand, name string) bool {
 	return false
 }
 
-// isDRActive returns true when the active CSIP control carries a demand-response
-// signal — specifically when OpModExpLimW or OpModMaxLimW is set to a value
-// below the sum of device capacities.
-func isDRActive(state SystemState) bool {
-	if state.CSIPControl == nil {
-		return false
+func hasEVSECommand(cmds []EVSECommand, stationID string, connectorID int) bool {
+	for _, c := range cmds {
+		if c.StationID == stationID && c.ConnectorID == connectorID {
+			return true
+		}
 	}
-	base := state.CSIPControl.Base
-	// Any export/generation limit from the utility counts as DR.
-	return base.OpModExpLimW != nil || base.OpModMaxLimW != nil || base.OpModGenLimW != nil
+	return false
 }
