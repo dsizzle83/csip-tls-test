@@ -26,6 +26,7 @@ func main() {
 	solar   := flag.String("solar",   "http://localhost:6020",  "solar simapi address")
 	battery := flag.String("battery", "http://localhost:6021",  "battery simapi address")
 	meter   := flag.String("meter",   "http://localhost:6022",  "meter simapi address")
+	ev      := flag.String("ev",      "http://localhost:6024",  "EV charger simapi address")
 	flag.Parse()
 
 	mux := http.NewServeMux()
@@ -44,6 +45,7 @@ func main() {
 	mux.Handle("/api/solar/",   stripProxy("/api/solar",   *solar))
 	mux.Handle("/api/battery/", stripProxy("/api/battery", *battery))
 	mux.Handle("/api/meter/",   stripProxy("/api/meter",   *meter))
+	mux.Handle("/api/ev/",      stripProxy("/api/ev",      *ev))
 
 	log.Printf("dashboard: serving at http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))

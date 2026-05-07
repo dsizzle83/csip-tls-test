@@ -283,15 +283,28 @@ func statusHandler(m *hubMetrics, ocppTracker *adapters.OCPPStateTracker, reader
 		Timestamp string         `json:"timestamp"`
 		Decisions []decisionJSON `json:"decisions"`
 	}
+	type evseJSON struct {
+		StationID     string   `json:"station_id"`
+		ConnectorID   int      `json:"connector_id"`
+		Connected     bool     `json:"connected"`
+		SessionActive bool     `json:"session_active"`
+		Status        string   `json:"status"`
+		CurrentA      float64  `json:"current_A"`
+		MaxCurrentA   float64  `json:"max_current_A"`
+		VoltageV      float64  `json:"voltage_V"`
+		PowerW        float64  `json:"power_W"`
+		SOC           *float64 `json:"soc_pct,omitempty"` // nil until first MeterValues
+		EnergyWh      float64  `json:"energy_Wh,omitempty"`
+	}
 	type statusResp struct {
-		Timestamp    string                   `json:"timestamp"`
-		ClockOffsetS int64                    `json:"clock_offset_s"`
-		CSIPPrograms int                      `json:"csip_programs"`
-		CSIPControl  *csipControlInfo         `json:"csip_control,omitempty"`
-		Devices      map[string]deviceInfo    `json:"devices"`
-		Power        powerSummary             `json:"power"`
-		LastPlan     planJSON                 `json:"last_plan"`
-		EVSEs        []orchestrator.EVSEState `json:"evse_stations,omitempty"`
+		Timestamp    string         `json:"timestamp"`
+		ClockOffsetS int64          `json:"clock_offset_s"`
+		CSIPPrograms int            `json:"csip_programs"`
+		CSIPControl  *csipControlInfo      `json:"csip_control,omitempty"`
+		Devices      map[string]deviceInfo `json:"devices"`
+		Power        powerSummary          `json:"power"`
+		LastPlan     planJSON              `json:"last_plan"`
+		EVSEs        []evseJSON            `json:"evse_stations,omitempty"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -391,7 +404,24 @@ func statusHandler(m *hubMetrics, ocppTracker *adapters.OCPPStateTracker, reader
 			},
 		}
 		if ocppTracker != nil {
-			resp.EVSEs = ocppTracker.EVSEStates()
+			for _, e := range ocppTracker.EVSEStates() {
+				ej := evseJSON{
+					StationID:     e.StationID,
+					ConnectorID:   e.ConnectorID,
+					Connected:     e.Connected,
+					SessionActive: e.SessionActive,
+					Status:        e.Status,
+					CurrentA:      e.CurrentA,
+					MaxCurrentA:   e.MaxCurrentA,
+					VoltageV:      e.VoltageV,
+					PowerW:        e.PowerW,
+					EnergyWh:      e.EnergyWh,
+				}
+				if !math.IsNaN(e.SOC) {
+					ej.SOC = &e.SOC
+				}
+				resp.EVSEs = append(resp.EVSEs, ej)
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")

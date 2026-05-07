@@ -203,6 +203,42 @@ a { color: #60a5fa; }
   .prog-grid   { grid-template-columns: 1fr; }
   .row { flex-direction: column; }
 }
+
+/* ── Scenarios panel ── */
+.sc-selector { display: flex; gap: 10px; flex-wrap: wrap; }
+.sc-btn {
+  flex: 1; min-width: 160px; padding: 14px 16px; border-radius: 8px; cursor: pointer;
+  border: 2px solid transparent; background: #0f172a; text-align: left;
+  transition: border-color .15s, transform .1s, filter .15s;
+}
+.sc-btn:hover { filter: brightness(1.15); transform: translateY(-1px); }
+.sc-btn.active { border-color: var(--sc-color); }
+.sc-btn .sc-num  { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--sc-color); margin-bottom: 4px; }
+.sc-btn .sc-name { font-size: 13px; font-weight: 700; color: #e2e8f0; margin-bottom: 3px; }
+.sc-btn .sc-sub  { font-size: 11px; color: #64748b; }
+.sc-btn .sc-badge { display: inline-block; margin-top: 6px; padding: 2px 7px; border-radius: 10px;
+                    font-size: 10px; font-weight: 700; background: color-mix(in srgb, var(--sc-color) 20%, transparent); color: var(--sc-color); }
+
+.sc-detail { display: none; }
+.sc-detail.visible { display: block; }
+.sc-narrative { font-size: 14px; line-height: 1.6; color: #cbd5e1; padding: 12px 0 4px; }
+.sc-conditions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+.sc-cond-block { background: #0f172a; border-radius: 6px; padding: 12px; }
+.sc-cond-block h4 { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: #475569; margin-bottom: 8px; }
+.sc-cond-row { display: flex; justify-content: space-between; padding: 3px 0;
+               border-bottom: 1px solid #1e293b; font-size: 12px; }
+.sc-cond-row:last-child { border-bottom: none; }
+.sc-cond-row .ck { color: #64748b; }
+.sc-cond-row .cv { font-weight: 600; color: #e2e8f0; }
+
+.sc-actions { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+.sc-log { font-family: monospace; font-size: 11px; background: #020617; border-radius: 6px;
+          padding: 10px 12px; max-height: 260px; overflow-y: auto; margin-top: 10px; }
+.sc-log-line { padding: 1px 0; color: #64748b; white-space: pre; }
+.sc-log-line.ok  { color: #4ade80; }
+.sc-log-line.err { color: #f87171; }
+.sc-log-line.hdr { color: #a78bfa; font-weight: bold; }
+.sc-log-line.rdy { color: #fbbf24; }
 </style>
 </head>
 <body>
@@ -263,10 +299,11 @@ a { color: #60a5fa; }
 
 <!-- ── Page tabs ──────────────────────────────────────────────── -->
 <div class="page-tabs">
-  <button id="ptab-hub"     class="page-tab active" onclick="switchTab('hub')">Hub</button>
-  <button id="ptab-solar"   class="page-tab"        onclick="switchTab('solar')">Solar Sim</button>
-  <button id="ptab-battery" class="page-tab"        onclick="switchTab('battery')">Battery Sim</button>
-  <button id="ptab-grid"    class="page-tab"        onclick="switchTab('grid')">Grid Controls</button>
+  <button id="ptab-hub"       class="page-tab active" onclick="switchTab('hub')">Hub</button>
+  <button id="ptab-solar"     class="page-tab"        onclick="switchTab('solar')">Solar Sim</button>
+  <button id="ptab-battery"   class="page-tab"        onclick="switchTab('battery')">Battery Sim</button>
+  <button id="ptab-grid"      class="page-tab"        onclick="switchTab('grid')">Grid Controls</button>
+  <button id="ptab-scenarios" class="page-tab"        onclick="switchTab('scenarios')" style="color:#a78bfa;border-color:#7c3aed20;">&#9654; Scenarios</button>
 </div>
 
 <!-- ════════════════════════════════════════════════════════════ -->
@@ -585,6 +622,32 @@ a { color: #60a5fa; }
   </div>
 </div><!-- #ppanel-grid -->
 
+<!-- ════════════════════════════════════════════════════════════ -->
+<!-- SCENARIOS PANEL                                              -->
+<!-- ════════════════════════════════════════════════════════════ -->
+<div id="ppanel-scenarios" class="page-panel" style="display:none">
+
+  <!-- Scenario selector -->
+  <div class="card">
+    <h3>Select a Scenario</h3>
+    <div class="sc-selector" id="sc-selector"></div>
+  </div>
+
+  <!-- Scenario detail -->
+  <div class="card" id="sc-detail-card" style="display:none">
+    <div id="sc-title" style="font-size:18px;font-weight:700;color:#e2e8f0;"></div>
+    <div id="sc-narrative" class="sc-narrative"></div>
+    <div class="sc-conditions" id="sc-conditions"></div>
+    <div class="sc-actions">
+      <button class="btn btn-primary" id="sc-run-btn" onclick="runSelectedScenario()" style="min-width:140px;background:#7c3aed;">&#9654;&nbsp; Run Scenario</button>
+      <button class="btn btn-ghost" onclick="resetAll()" style="min-width:110px;">&#8635;&nbsp; Reset All</button>
+      <span id="sc-run-status" style="font-size:12px;color:#94a3b8;"></span>
+    </div>
+    <div class="sc-log" id="sc-log"><div class="sc-log-line" style="color:#334155;">Select a scenario and press Run.</div></div>
+  </div>
+
+</div><!-- #ppanel-scenarios -->
+
 </div><!-- .page -->
 
 <script>
@@ -659,6 +722,8 @@ function switchTab(name) {
     pollGridStatus();
     loadDefault();
     simIntervals.push(setInterval(pollGridStatus, 5000));
+  } else if (name === 'scenarios') {
+    // no polling needed; scenarios are event-driven
   }
 }
 
@@ -1389,10 +1454,252 @@ function kv(pairs) {
   ).join('');
 }
 
+// ── Scenarios ─────────────────────────────────────────────────────────────────
+
+const SCENARIOS = [
+  {
+    id: 'export-limit',
+    num: '01',
+    title: 'Dynamic Export Limit Compliance',
+    sub: 'Solar capture under utility cap',
+    badge: 'CSIP §4.3',
+    color: '#34d399',
+    narrative: 'Utility caps PCC export at 1 kW while solar is producing 8 kW. ' +
+      'The hub coordinates battery charging (4 kW) and EV charging (2 kW) to absorb excess, ' +
+      'holding export exactly at the limit — no solar curtailed, full CSIP compliance.',
+    initial: { solar_W: 8000, battery_soc: 40, load_W: 1000, ev_soc: 20, ev_session: true },
+    grid: { program: 1, exp_lim_W: 1000, duration_s: 300,
+            description: 'Demo S1: export limit 1 kW', activate: true },
+  },
+  {
+    id: 'ev-deferral',
+    num: '02',
+    title: 'Peak-Rate EV Deferral',
+    sub: 'Cost-aware overnight charging',
+    badge: 'TOU',
+    color: '#60a5fa',
+    narrative: 'EV plugs in at 6 PM needing 80% by morning. Grid signals peak pricing. ' +
+      'Hub pauses EV charging, avoids costly grid imports, then sequences battery → cheap-grid ' +
+      'after off-peak starts — customer target met, bill minimized, zero micromanagement.',
+    initial: { solar_W: 1000, battery_soc: 75, load_W: 2000, ev_soc: 20, ev_session: true },
+    grid: { program: 1, imp_lim_W: 500, duration_s: 300,
+            description: 'Demo S2: peak TOU — limit import', activate: true },
+  },
+  {
+    id: 'outage',
+    num: '03',
+    title: 'Grid Outage Ride-Through',
+    sub: 'Instant DER rebalance on loss of grid',
+    badge: 'Emergency',
+    color: '#f87171',
+    narrative: 'Grid drops without warning. Hub detects the loss, immediately suspends EV ' +
+      'charging, transitions battery to support the site load deficit, and keeps solar ' +
+      'producing — all within seconds, no human action required.',
+    initial: { solar_W: 3500, battery_soc: 50, load_W: 2500, ev_soc: 40, ev_session: true },
+    grid: { program: 0, connect: false, duration_s: 300,
+            description: 'Demo S3: grid outage', activate: true },
+  },
+  {
+    id: 'demand-response',
+    num: '04',
+    title: 'Utility Demand Response',
+    sub: 'Virtual power plant dispatch',
+    badge: 'DR Event',
+    color: '#fbbf24',
+    narrative: 'Utility issues a 4 kW import-reduction dispatch for 20 minutes. ' +
+      'Hub throttles EV charging and ramps battery discharge to hit the target — ' +
+      'actual PCC import drops from 5 kW to 1 kW, matching the utility request precisely.',
+    initial: { solar_W: 0, battery_soc: 60, load_W: 3000, ev_soc: 30, ev_session: true },
+    grid: { program: 1, imp_lim_W: 1000, duration_s: 1200,
+            description: 'Demo S4: DR dispatch — 4 kW reduction', activate: true },
+  },
+  {
+    id: 'self-consumption',
+    num: '05',
+    title: 'Forecasted Solar Self-Consumption',
+    sub: 'Anticipatory optimization',
+    badge: 'Predictive',
+    color: '#a78bfa',
+    narrative: 'Morning forecast shows a midday solar peak. Battery is already 85%. ' +
+      'A dumb controller hits full battery and curtails solar. The hub pre-discharges ' +
+      'battery into the house load, defers EV charging to noon, and reserves headroom — ' +
+      'solar utilization maximized before any curtailment is needed.',
+    initial: { solar_W: 500, battery_soc: 85, load_W: 1500, ev_soc: 60, ev_session: true },
+    grid: { program: 1, exp_lim_W: 500, duration_s: 300,
+            description: 'Demo S5: tight export cap — force absorption', activate: true },
+  },
+];
+
+let selectedScenario = null;
+
+function buildScenarioSelector() {
+  const sel = document.getElementById('sc-selector');
+  sel.innerHTML = '';
+  SCENARIOS.forEach(sc => {
+    const btn = document.createElement('button');
+    btn.className = 'sc-btn';
+    btn.id = 'sc-btn-' + sc.id;
+    btn.style.setProperty('--sc-color', sc.color);
+    btn.innerHTML = `
+      <div class="sc-num">Scenario ${sc.num}</div>
+      <div class="sc-name">${sc.title}</div>
+      <div class="sc-sub">${sc.sub}</div>
+      <div class="sc-badge">${sc.badge}</div>
+    `;
+    btn.onclick = () => selectScenario(sc.id);
+    sel.appendChild(btn);
+  });
+}
+
+function selectScenario(id) {
+  selectedScenario = SCENARIOS.find(s => s.id === id);
+  if (!selectedScenario) return;
+
+  document.querySelectorAll('.sc-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('sc-btn-' + id);
+  if (btn) btn.classList.add('active');
+
+  const sc = selectedScenario;
+  document.getElementById('sc-title').innerHTML =
+    `<span style="color:${sc.color}">S${sc.num}</span>&ensp;${sc.title}`;
+  document.getElementById('sc-narrative').textContent = sc.narrative;
+
+  const ini = sc.initial;
+  const gr  = sc.grid || {};
+  document.getElementById('sc-conditions').innerHTML = `
+    <div class="sc-cond-block">
+      <h4>Initial Site Conditions</h4>
+      ${condRow('Solar output',   fmt(ini.solar_W)   + ' W')}
+      ${condRow('Battery SOC',    ini.battery_soc    + ' %')}
+      ${condRow('Site load',      fmt(ini.load_W)    + ' W')}
+      ${condRow('EV SOC',         ini.ev_soc         + ' %')}
+      ${condRow('EV session',     ini.ev_session ? 'start on run' : 'none')}
+    </div>
+    <div class="sc-cond-block">
+      <h4>Grid Event (DERControl)</h4>
+      ${condRow('Program',        ['SP (primacy 1)', 'Site (primacy 5)', 'System (primacy 10)'][gr.program] || '—')}
+      ${gr.exp_lim_W  != null ? condRow('Export limit',  fmt(gr.exp_lim_W)  + ' W') : ''}
+      ${gr.imp_lim_W  != null ? condRow('Import limit',  fmt(gr.imp_lim_W)  + ' W') : ''}
+      ${gr.connect    != null ? condRow('OpModConnect',  String(gr.connect))         : ''}
+      ${gr.energize   != null ? condRow('OpModEnergize', String(gr.energize))        : ''}
+      ${condRow('Duration',       gr.duration_s + ' s')}
+      ${condRow('Activate',       gr.activate ? 'yes (replace active list)' : 'no')}
+    </div>
+  `;
+
+  document.getElementById('sc-detail-card').style.display = '';
+  document.getElementById('sc-run-status').textContent = '';
+}
+
+function condRow(k, v) {
+  if (!v) return '';
+  return `<div class="sc-cond-row"><span class="ck">${k}</span><span class="cv">${v}</span></div>`;
+}
+
+function scLog(msg, cls = '') {
+  const el = document.getElementById('sc-log');
+  const div = document.createElement('div');
+  div.className = 'sc-log-line' + (cls ? ' ' + cls : '');
+  div.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+
+function clearScLog() {
+  document.getElementById('sc-log').innerHTML = '';
+}
+
+async function runSelectedScenario() {
+  if (!selectedScenario) return;
+  const sc = selectedScenario;
+  const runBtn = document.getElementById('sc-run-btn');
+  runBtn.disabled = true;
+  clearScLog();
+
+  setStatus('sc-run-status', 'Running…', '#fbbf24');
+  scLog(`▶ ${sc.title}`, 'hdr');
+  scLog('─'.repeat(48), 'hdr');
+
+  const ok = async (label, url, body) => {
+    const result = await apiPost(url, body);
+    scLog((result ? '✓ ' : '✗ ') + label, result ? 'ok' : 'err');
+    return result;
+  };
+
+  const ini = sc.initial;
+
+  // Pause animations before injecting fixed values
+  if (ini.solar_W != null) {
+    await ok('Pause solar animation',   '/api/solar/control',   {cmd: 'pause'});
+    await ok(`Solar → ${fmt(ini.solar_W)} W`, '/api/solar/inject', {W_W: ini.solar_W});
+  }
+  if (ini.battery_soc != null) {
+    await ok('Pause battery animation', '/api/battery/control', {cmd: 'pause'});
+    await ok(`Battery SOC → ${ini.battery_soc}%`, '/api/battery/inject',
+             {SoC_pct: ini.battery_soc, W_W: 0});
+  }
+  if (ini.load_W != null) {
+    await ok(`Site load → ${fmt(ini.load_W)} W`, '/api/meter/inject', {LoadW_W: ini.load_W});
+  }
+  if (ini.ev_soc != null) {
+    await ok(`EV SOC → ${ini.ev_soc}%`, '/api/ev/inject',
+             {action: 'set_soc', soc_pct: ini.ev_soc});
+  }
+  if (ini.ev_session) {
+    await ok('EV → start charging session', '/api/ev/inject',
+             {action: 'start_session', connector_id: 1});
+  }
+
+  // Inject grid event
+  if (sc.grid) {
+    await ok('Grid DERControl → ' + (sc.grid.description || 'event'), '/api/gridsim/admin/control', sc.grid);
+  }
+
+  scLog('─'.repeat(48), 'hdr');
+  scLog('Watching hub respond…  (Hub tab → Last Orchestrator Decisions)', 'rdy');
+  setStatus('sc-run-status', '✓ Injected — watching hub', '#4ade80');
+  runBtn.disabled = false;
+
+  pollGridStatus();
+}
+
+async function resetAll() {
+  clearScLog();
+  scLog('↺ Resetting all simulators…', 'hdr');
+
+  for (const prog of [0, 1, 2]) {
+    try {
+      await fetch('/api/gridsim/admin/control', {
+        method: 'DELETE', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({program: prog}),
+      });
+    } catch (_) {}
+  }
+  scLog('✓ Grid controls cleared (programs 0–2)', 'ok');
+
+  await apiPost('/api/solar/control',   {cmd: 'resume'});
+  scLog('✓ Solar animation resumed', 'ok');
+
+  await apiPost('/api/battery/control', {cmd: 'resume'});
+  scLog('✓ Battery animation resumed', 'ok');
+
+  await apiPost('/api/meter/control',   {cmd: 'resume'});
+  scLog('✓ Meter animation resumed', 'ok');
+
+  await apiPost('/api/ev/inject', {action: 'stop_session', connector_id: 1}).catch(() => {});
+  scLog('✓ EV session stopped', 'ok');
+
+  scLog('─'.repeat(48), 'hdr');
+  scLog('Reset complete — all sims back to animated defaults.', 'rdy');
+  setStatus('sc-run-status', '↺ Reset', '#94a3b8');
+  pollGridStatus();
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 pollHub();
 connectLogs();
 setInterval(pollHub, 5000);
+buildScenarioSelector();
 </script>
 </body>
 </html>
