@@ -4,9 +4,9 @@
 //
 //  Sine mode (default): animates net power as a ±peak sine wave.
 //
-//  Linked mode (-solar-api / -battery-api / -ev-api): polls the solar,
-//  battery, and EV charger simapi REST endpoints and computes the meter
-//  reading from the energy balance at the site bus:
+//  Linked mode (-solar-api / -battery-api / -ev-api / -hub-api): polls the
+//  solar, battery, and EV charger endpoints and computes the meter reading
+//  from the energy balance at the site bus:
 //
 //	meter_W = load_W + ev_W - solar_W - battery_W
 //
@@ -14,6 +14,10 @@
 //  EV charging power (positive = consuming), solar_W is generation
 //  (positive = exporting), and battery_W is net battery power
 //  (positive = discharging, negative = charging).
+//
+//  EV power source priority: -hub-api (reads OCPP MeterValues via hub
+//  /status) beats -ev-api (polls evsim directly).  Use -hub-api when the
+//  meter Pi cannot reach the EV Pi's simapi port directly.
 //
 // API (default :6022):
 //
@@ -63,15 +67,16 @@ func main() {
 	solarAPI   := flag.String("solar-api",   "", "Solar simapi base URL for linked mode (e.g. http://69.0.0.10:6020)")
 	batteryAPI := flag.String("battery-api", "", "Battery simapi base URL for linked mode (e.g. http://69.0.0.11:6021)")
 	evAPI      := flag.String("ev-api",      "", "EV charger simapi base URL for linked mode (e.g. http://69.0.0.14:6024)")
+	hubAPI     := flag.String("hub-api",     "", "Hub status API for EV power via OCPP (e.g. http://69.0.0.1:9100); preferred over -ev-api")
 	initLoad   := flag.Float64("load", 3000, "Initial site load in watts (linked mode); injectable via LoadW_W")
 	flag.Parse()
 
 	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
-	linked := *solarAPI != "" || *batteryAPI != "" || *evAPI != ""
+	linked := *solarAPI != "" || *batteryAPI != "" || *evAPI != "" || *hubAPI != ""
 
 	if linked {
-		log.Printf("metersim: linked mode on %s  solar=%s  battery=%s  ev=%s  load=%.0fW",
-			listenURL, *solarAPI, *batteryAPI, *evAPI, *initLoad)
+		log.Printf("metersim: linked mode on %s  solar=%s  battery=%s  ev=%s  hub=%s  load=%.0fW",
+			listenURL, *solarAPI, *batteryAPI, *evAPI, *hubAPI, *initLoad)
 	} else {
 		log.Printf("metersim: sine mode on %s (peak ±%.0f W)", listenURL, *peak)
 	}
@@ -127,7 +132,12 @@ func main() {
 					}
 					sW := fetchW(*solarAPI)
 					bW := fetchW(*batteryAPI)
-					eW := fetchEVW(*evAPI)
+					var eW float64
+					if *hubAPI != "" {
+						eW = fetchHubEVW(*hubAPI)
+					} else {
+						eW = fetchEVW(*evAPI)
+					}
 					mu.Lock()
 					lW := loadW
 					lastSolarW = sW
@@ -260,4 +270,35 @@ func fetchEVW(baseURL string) float64 {
 		return 0
 	}
 	return state.Battery.PowerW
+}
+
+// fetchHubEVW sums power_W across all EVSE stations reported by the hub's
+// /status endpoint.  Uses hub OCPP MeterValues data, which is more reliable
+// than polling the EV Pi's simapi port directly.
+// Returns 0 on any error (fails safe — no phantom load).
+func fetchHubEVW(baseURL string) float64 {
+	if baseURL == "" {
+		return 0
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(baseURL + "/status")
+	if err != nil {
+		log.Printf("metersim: fetchHubEVW %s: %v", baseURL, err)
+		return 0
+	}
+	defer resp.Body.Close()
+	var status struct {
+		EVSEStations []struct {
+			PowerW float64 `json:"power_W"`
+		} `json:"evse_stations"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		log.Printf("metersim: fetchHubEVW decode %s: %v", baseURL, err)
+		return 0
+	}
+	var total float64
+	for _, s := range status.EVSEStations {
+		total += s.PowerW
+	}
+	return total
 }
