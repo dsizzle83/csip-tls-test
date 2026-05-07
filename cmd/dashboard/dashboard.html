@@ -33,7 +33,7 @@ a { color: #60a5fa; }
 .stat-value { font-weight: 600; }
 
 /* ── Power cards ── */
-.power-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.power-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
 .pcard { text-align: center; padding: 16px 12px; }
 .pcard.clickable { cursor: pointer; transition: filter .15s, transform .1s; }
 .pcard.clickable:hover { filter: brightness(1.2); transform: translateY(-1px); }
@@ -44,10 +44,12 @@ a { color: #60a5fa; }
 .pcard.battery { border-color: #2563eb; }
 .pcard.grid    { border-color: #d97706; }
 .pcard.load    { border-color: #7c3aed; }
+.pcard.ev      { border-color: #0e7490; }
 .c-solar   { color: #34d399; }
 .c-battery { color: #60a5fa; }
 .c-grid    { color: #fbbf24; }
 .c-load    { color: #a78bfa; }
+.c-ev      { color: #22d3ee; }
 .c-pos  { color: #4ade80; }
 .c-neg  { color: #f87171; }
 
@@ -106,7 +108,7 @@ a { color: #60a5fa; }
 .btn-row     { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 
 /* ── Device cards ── */
-.device-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+/* .device-grid defined in responsive section below */
 .dcard .dval { font-size: 20px; font-weight: 700; }
 .dcard .rows { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; }
 .dcard .row2 { display: flex; justify-content: space-between; font-size: 12px; }
@@ -196,10 +198,13 @@ a { color: #60a5fa; }
 .anim-running { background: #14532d; color: #4ade80; }
 .anim-paused  { background: #78350f; color: #fcd34d; }
 
+/* ── Device cards ── */
+.device-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+
 /* ── Responsive ── */
 @media (max-width: 900px) {
   .power-cards { grid-template-columns: 1fr 1fr; }
-  .device-grid { grid-template-columns: 1fr; }
+  .device-grid { grid-template-columns: 1fr 1fr; }
   .prog-grid   { grid-template-columns: 1fr; }
   .row { flex-direction: column; }
 }
@@ -289,6 +294,11 @@ a { color: #60a5fa; }
     <div class="lbl">Load</div>
     <div class="sub">inferred</div>
   </div>
+  <div class="card pcard ev clickable" onclick="switchTab('ev')" title="Click to open EV Charger tab">
+    <div class="val c-ev" id="ev-w">—</div>
+    <div class="lbl">EV ↓</div>
+    <div class="sub" id="ev-sub">—</div>
+  </div>
 </div>
 
 <!-- ── Chart ──────────────────────────────────────────────────── -->
@@ -302,6 +312,7 @@ a { color: #60a5fa; }
   <button id="ptab-hub"       class="page-tab active" onclick="switchTab('hub')">Hub</button>
   <button id="ptab-solar"     class="page-tab"        onclick="switchTab('solar')">Solar Sim</button>
   <button id="ptab-battery"   class="page-tab"        onclick="switchTab('battery')">Battery Sim</button>
+  <button id="ptab-ev"         class="page-tab"        onclick="switchTab('ev')">EV Charger</button>
   <button id="ptab-grid"      class="page-tab"        onclick="switchTab('grid')">Grid Controls</button>
   <button id="ptab-scenarios" class="page-tab"        onclick="switchTab('scenarios')" style="color:#a78bfa;border-color:#7c3aed20;">&#9654; Scenarios</button>
 </div>
@@ -357,6 +368,15 @@ a { color: #60a5fa; }
           </div>
           <div class="dval" id="d-meter-w">— W</div>
           <div class="rows" id="d-meter-rows"></div>
+        </div>
+        <div class="card dcard" id="ev-card" onclick="switchTab('ev')" style="cursor:pointer;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-weight:700;color:#22d3ee;">EV Charger</span>
+            <span id="ev-hub-conn" class="badge badge-off">—</span>
+          </div>
+          <div class="dval c-ev" id="d-ev-w">— W</div>
+          <div class="soc-bar-bg" id="soc-bar-ev-wrap"><div class="soc-bar" id="soc-bar-ev" style="width:0%;background:#22d3ee;"></div></div>
+          <div class="rows" id="d-ev-rows"></div>
         </div>
       </div>
     </div>
@@ -623,6 +643,67 @@ a { color: #60a5fa; }
 </div><!-- #ppanel-grid -->
 
 <!-- ════════════════════════════════════════════════════════════ -->
+<!-- EV CHARGER PANEL                                            -->
+<!-- ════════════════════════════════════════════════════════════ -->
+<div id="ppanel-ev" class="page-panel" style="display:none">
+<div class="row">
+
+  <!-- Left: telemetry + inject -->
+  <div class="col" style="flex:0 0 300px;">
+
+    <div class="card">
+      <h3>EV Charger Telemetry (sim direct)</h3>
+      <div id="ev-telem" class="telemetry-panel">Loading…</div>
+      <div style="margin-top:6px;font-size:10px;color:#475569;" id="ev-telem-ts"></div>
+    </div>
+
+    <div class="card">
+      <h3>EV Inject</h3>
+      <div class="inject-form">
+        <div class="field"><label>Set SOC (%)</label><input type="number" id="inj-ev-soc" min="0" max="100" placeholder="e.g. 20"></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary btn-sm" onclick="injectEVSOC()">Set SOC</button>
+      </div>
+      <div class="btn-row" style="margin-top:6px;">
+        <button class="btn btn-ghost btn-sm" onclick="injectEVAction('start_session')">Start Session</button>
+        <button class="btn btn-ghost btn-sm" onclick="injectEVAction('stop_session')">Stop Session</button>
+      </div>
+      <div id="inj-ev-status" style="margin-top:6px;font-size:11px;color:#94a3b8;"></div>
+    </div>
+
+  </div>
+
+  <!-- Right: session & charging profile detail -->
+  <div class="col" style="flex:1;">
+
+    <div class="card">
+      <h3>Session &amp; Charging Profile</h3>
+      <div id="ev-session-panel" class="telemetry-panel" style="min-height:80px;">No session data</div>
+    </div>
+
+    <div class="card">
+      <h3>EV SOC &amp; Power (live)</h3>
+      <div style="display:flex;gap:24px;align-items:center;padding:8px 0;">
+        <div style="flex:0 0 160px;">
+          <div style="font-size:11px;color:#64748b;margin-bottom:4px;">Battery SOC</div>
+          <div class="soc-bar-bg"><div class="soc-bar" id="soc-bar-ev-detail" style="width:0%;background:#22d3ee;"></div></div>
+          <div style="font-size:24px;font-weight:700;color:#22d3ee;margin-top:6px;" id="ev-soc-big">—%</div>
+        </div>
+        <div style="flex:1;">
+          <div style="font-size:11px;color:#64748b;margin-bottom:4px;">Charging Power</div>
+          <div style="font-size:24px;font-weight:700;color:#22d3ee;" id="ev-power-big">— W</div>
+          <div style="font-size:12px;color:#64748b;margin-top:4px;" id="ev-phase-lbl">—</div>
+        </div>
+      </div>
+      <div id="ev-energy-rows" class="rows" style="margin-top:8px;"></div>
+    </div>
+
+  </div>
+</div>
+</div><!-- #ppanel-ev -->
+
+<!-- ════════════════════════════════════════════════════════════ -->
 <!-- SCENARIOS PANEL                                              -->
 <!-- ════════════════════════════════════════════════════════════ -->
 <div id="ppanel-scenarios" class="page-panel" style="display:none">
@@ -656,7 +737,7 @@ a { color: #60a5fa; }
 // ── Chart ──────────────────────────────────────────────────────────────────────
 const MAX_PTS = 60;
 const chartLabels = [];
-const chartData = { solar: [], battery: [], grid: [], load: [] };
+const chartData = { solar: [], battery: [], grid: [], load: [], ev: [] };
 
 const chart = new Chart(document.getElementById('power-chart').getContext('2d'), {
   type: 'line',
@@ -667,6 +748,7 @@ const chart = new Chart(document.getElementById('power-chart').getContext('2d'),
       { label: 'Battery W', data: chartData.battery, borderColor: '#60a5fa', backgroundColor: '#60a5fa10', tension: 0.3, pointRadius: 0, borderWidth: 2 },
       { label: 'Grid W',    data: chartData.grid,    borderColor: '#fbbf24', backgroundColor: '#fbbf2410', tension: 0.3, pointRadius: 0, borderWidth: 2 },
       { label: 'Load W',    data: chartData.load,    borderColor: '#a78bfa', backgroundColor: '#a78bfa10', tension: 0.3, pointRadius: 0, borderWidth: 2 },
+      { label: 'EV W',      data: chartData.ev,      borderColor: '#22d3ee', backgroundColor: '#22d3ee10', tension: 0.3, pointRadius: 0, borderWidth: 2 },
     ],
   },
   options: {
@@ -679,12 +761,13 @@ const chart = new Chart(document.getElementById('power-chart').getContext('2d'),
   },
 });
 
-function pushChart(time, solar, battery, grid, load) {
+function pushChart(time, solar, battery, grid, load, ev) {
   chartLabels.push(new Date(time).toLocaleTimeString());
   chartData.solar.push(solar);
   chartData.battery.push(battery);
   chartData.grid.push(isNaN(grid) ? null : grid);
   chartData.load.push(isNaN(load) ? null : load);
+  chartData.ev.push(isNaN(ev) ? null : ev);
   if (chartLabels.length > MAX_PTS) {
     chartLabels.shift();
     Object.values(chartData).forEach(d => d.shift());
@@ -722,6 +805,9 @@ function switchTab(name) {
     pollGridStatus();
     loadDefault();
     simIntervals.push(setInterval(pollGridStatus, 5000));
+  } else if (name === 'ev') {
+    pollEVState();
+    simIntervals.push(setInterval(pollEVState, 3000));
   } else if (name === 'scenarios') {
     // no polling needed; scenarios are event-driven
   }
@@ -766,8 +852,18 @@ async function pollHub() {
     const devs = d.devices || {};
     Object.entries(devs).forEach(([name, dev]) => updateHubDevice(name, dev));
 
+    const evses = d.evse_stations || [];
+    let evW = 0;
+    if (evses.length) {
+      const ev = evses[0];
+      evW = ev.power_W || 0;
+      setText('ev-w', fmt(evW) + ' W');
+      setText('ev-sub', ev.session_active ? 'charging' : (ev.connected ? 'idle' : 'disconnected'));
+      updateHubEVCard(ev);
+    }
+
     renderDecisions(d.last_plan?.decisions || []);
-    pushChart(d.timestamp, solar, battery, grid, load);
+    pushChart(d.timestamp, solar, battery, grid, load, evW);
 
   } catch (e) {
     document.getElementById('hub-dot').className = 'dot err';
@@ -843,6 +939,22 @@ function updateHubDevice(name, dev) {
       ['Flow', dev.W_W > 50 ? '▲ import' : dev.W_W < -50 ? '▼ export' : '≈ zero'],
     ]);
   }
+}
+
+function updateHubEVCard(ev) {
+  const connEl = document.getElementById('ev-hub-conn');
+  connEl.className = 'badge ' + (ev.connected ? (ev.session_active ? 'badge-warn' : 'badge-on') : 'badge-off');
+  connEl.textContent = ev.connected ? (ev.session_active ? 'CHARGING' : 'ON') : 'OFF';
+  document.getElementById('d-ev-w').textContent = fmt(ev.power_W) + ' W';
+  const soc = ev.soc_pct;
+  if (soc != null) {
+    document.getElementById('soc-bar-ev').style.width = soc + '%';
+  }
+  document.getElementById('d-ev-rows').innerHTML = kv([
+    ['SOC',     soc != null ? soc.toFixed(1) + '%' : '—'],
+    ['Current', ev.current_A ? ev.current_A.toFixed(1) + ' A' : '—'],
+    ['Status',  ev.status || '—'],
+  ]);
 }
 
 // ── Solar sim polling ──────────────────────────────────────────────────────────
@@ -1452,6 +1564,98 @@ function kv(pairs) {
   return pairs.map(([k,v]) =>
     `<div class="row2"><span class="k">${k}</span><span class="v">${v}</span></div>`
   ).join('');
+}
+
+// ── EV sim polling ────────────────────────────────────────────────────────────
+async function pollEVState() {
+  try {
+    const resp = await fetch('/api/ev/state');
+    if (!resp.ok) throw new Error(resp.status);
+    const s = await resp.json();
+    renderEVTelem(s);
+  } catch (e) {
+    document.getElementById('ev-telem').textContent = 'Error: ' + e.message;
+  }
+}
+
+function renderEVTelem(s) {
+  const b    = s.battery  || {};
+  const sess = s.session  || {};
+  const csms = s.csms     || {};
+  const prof = s.last_charging_profile;
+  const conns = s.connectors || [];
+  const connStatus = conns.length ? conns[0].status : '—';
+
+  document.getElementById('ev-telem').innerHTML = telemRows([
+    { section: 'Station' },
+    { k: 'ID',        v: s.station_id || '—' },
+    { k: 'CSMS',      v: csms.connected ? 'connected' : 'disconnected',
+                       cls: csms.connected ? 'c-green' : 'c-red' },
+    { k: 'Connector', v: connStatus },
+    { section: 'Session' },
+    { k: 'Active',    v: sess.active ? 'yes' : 'no', cls: sess.active ? 'c-green' : '' },
+    { k: 'Started',   v: sess.started_at ? new Date(sess.started_at).toLocaleTimeString() : '—' },
+    { k: 'Energy',    v: fmt(b.session_energy_Wh) + ' Wh' },
+    { section: 'EV Battery' },
+    { k: 'SOC',       v: (b.soc_pct ?? 0).toFixed(1) + '%',
+                       cls: (b.soc_pct ?? 0) < 20 ? 'c-red' : (b.soc_pct ?? 0) < 50 ? 'c-amber' : 'c-green' },
+    { k: 'Power',     v: fmt(b.power_W) + ' W', cls: (b.power_W ?? 0) > 100 ? 'c-blue' : '' },
+    { k: 'Current',   v: (b.current_A ?? 0).toFixed(1) + ' A' },
+    { k: 'Phase',     v: b.phase || '—' },
+    { k: 'Capacity',  v: fmt(b.capacity_Wh) + ' Wh' },
+    { section: 'Charging Profile (hub → EVSE)' },
+    { k: 'Limit',     v: prof ? prof.limit_A.toFixed(1) + ' A' : 'none', cls: prof ? 'c-amber' : '' },
+    { k: 'Purpose',   v: prof ? prof.purpose : '—' },
+    { k: 'Received',  v: prof ? new Date(prof.received_at).toLocaleTimeString() : '—' },
+  ]);
+
+  document.getElementById('ev-telem-ts').textContent =
+    'sim time: ' + new Date(s.timestamp).toLocaleTimeString();
+
+  // SOC bar + big numbers
+  const soc = b.soc_pct ?? 0;
+  const bar = document.getElementById('soc-bar-ev-detail');
+  bar.style.width = soc + '%';
+  bar.style.background = soc < 20 ? '#ef4444' : soc < 50 ? '#f59e0b' : '#22d3ee';
+  document.getElementById('ev-soc-big').textContent = soc.toFixed(1) + '%';
+  document.getElementById('ev-power-big').textContent = fmt(b.power_W) + ' W';
+  document.getElementById('ev-phase-lbl').textContent =
+    b.phase ? 'Phase: ' + b.phase + (b.phase === 'CC' ? ' (constant current)' : ' (tapering)') : '';
+
+  // Session / profile detail panel
+  const sp = document.getElementById('ev-session-panel');
+  sp.innerHTML = telemRows([
+    { section: 'Session' },
+    { k: 'Active',      v: sess.active ? 'yes' : 'no', cls: sess.active ? 'c-green' : '' },
+    { k: 'Connector',   v: sess.connector_id || '—' },
+    { k: 'Started at',  v: sess.started_at ? new Date(sess.started_at).toLocaleTimeString() : '—' },
+    { k: 'Session Wh',  v: fmt(b.session_energy_Wh) + ' Wh' },
+    { section: 'Last Charging Profile from Hub' },
+    { k: 'Limit A',    v: prof ? prof.limit_A.toFixed(1) + ' A' : 'none', cls: prof ? 'c-amber' : '' },
+    { k: 'Profile ID', v: prof ? String(prof.profile_id) : '—' },
+    { k: 'Purpose',    v: prof ? prof.purpose : '—' },
+    { k: 'EVSE ID',    v: prof ? String(prof.evse_id) : '—' },
+    { k: 'Received',   v: prof ? new Date(prof.received_at).toLocaleTimeString() : '—' },
+  ]);
+
+  document.getElementById('ev-energy-rows').innerHTML = kv([
+    ['Session energy', fmt(b.session_energy_Wh) + ' Wh'],
+    ['Battery cap',    fmt(b.capacity_Wh)       + ' Wh'],
+  ]);
+}
+
+async function injectEVSOC() {
+  const soc = parseFloat(document.getElementById('inj-ev-soc').value);
+  if (isNaN(soc)) return;
+  const ok = await apiPost('/api/ev/inject', {action: 'set_soc', soc_pct: soc});
+  setStatus('inj-ev-status', ok ? `✓ SOC set to ${soc}%` : '✗ failed', ok ? '#4ade80' : '#f87171');
+  if (ok) pollEVState();
+}
+
+async function injectEVAction(action) {
+  const ok = await apiPost('/api/ev/inject', {action, connector_id: 1});
+  setStatus('inj-ev-status', ok ? `✓ ${action}` : `✗ ${action} failed`, ok ? '#4ade80' : '#f87171');
+  if (ok) setTimeout(pollEVState, 500);
 }
 
 // ── Scenarios ─────────────────────────────────────────────────────────────────

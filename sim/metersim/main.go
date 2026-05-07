@@ -4,13 +4,16 @@
 //
 //  Sine mode (default): animates net power as a ±peak sine wave.
 //
-//  Linked mode (-solar-api / -battery-api): polls the solar and battery
-//  simapi REST endpoints for their current W readings and computes the
-//  meter reading from the energy balance at the site bus:
+//  Linked mode (-solar-api / -battery-api / -ev-api): polls the solar,
+//  battery, and EV charger simapi REST endpoints and computes the meter
+//  reading from the energy balance at the site bus:
 //
-//	meter_W = load_W - solar_W - battery_W
+//	meter_W = load_W + ev_W - solar_W - battery_W
 //
-//  where load_W is the total site load (home + EV, settable via inject).
+//  where load_W is the fixed site load (settable via inject), ev_W is the
+//  EV charging power (positive = consuming), solar_W is generation
+//  (positive = exporting), and battery_W is net battery power
+//  (positive = discharging, negative = charging).
 //
 // API (default :6022):
 //
@@ -43,10 +46,11 @@ type energyBalance struct {
 	LoadW_W        float64 `json:"load_W"`
 	SourceSolarW   float64 `json:"source_solar_W"`
 	SourceBatteryW float64 `json:"source_battery_W"`
+	LoadEVW        float64 `json:"load_ev_W"`
 }
 
 // linkedState embeds the standard meter snapshot and adds the energy balance
-// breakdown so the GUI can display all three components.
+// breakdown so the GUI can display all components.
 type linkedState struct {
 	sim.MeterState
 	EnergyBalance energyBalance `json:"energy_balance"`
@@ -56,17 +60,18 @@ func main() {
 	port       := flag.Int("port", 5022, "Modbus TCP port")
 	peak       := flag.Float64("peak", 5000, "Peak net power magnitude in watts (sine mode only)")
 	apiPort    := flag.Int("api-port", 6022, "HTTP API port (0 to disable)")
-	solarAPI   := flag.String("solar-api", "", "Solar simapi base URL for linked mode (e.g. http://69.0.0.10:6020)")
+	solarAPI   := flag.String("solar-api",   "", "Solar simapi base URL for linked mode (e.g. http://69.0.0.10:6020)")
 	batteryAPI := flag.String("battery-api", "", "Battery simapi base URL for linked mode (e.g. http://69.0.0.11:6021)")
+	evAPI      := flag.String("ev-api",      "", "EV charger simapi base URL for linked mode (e.g. http://69.0.0.14:6024)")
 	initLoad   := flag.Float64("load", 3000, "Initial site load in watts (linked mode); injectable via LoadW_W")
 	flag.Parse()
 
 	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
-	linked := *solarAPI != "" || *batteryAPI != ""
+	linked := *solarAPI != "" || *batteryAPI != "" || *evAPI != ""
 
 	if linked {
-		log.Printf("metersim: linked mode on %s  solar=%s  battery=%s  load=%.0fW",
-			listenURL, *solarAPI, *batteryAPI, *initLoad)
+		log.Printf("metersim: linked mode on %s  solar=%s  battery=%s  ev=%s  load=%.0fW",
+			listenURL, *solarAPI, *batteryAPI, *evAPI, *initLoad)
 	} else {
 		log.Printf("metersim: sine mode on %s (peak ±%.0f W)", listenURL, *peak)
 	}
@@ -79,7 +84,7 @@ func main() {
 	// Shared linked-mode state — protected by mu.
 	var mu sync.Mutex
 	loadW := *initLoad
-	var lastSolarW, lastBattW float64
+	var lastSolarW, lastBattW, lastEVW float64
 
 	// injectFn intercepts LoadW_W (linked-mode load setpoint) and forwards
 	// remaining fields (W_W, V_V, Hz_Hz) to the Modbus register layer.
@@ -122,12 +127,15 @@ func main() {
 					}
 					sW := fetchW(*solarAPI)
 					bW := fetchW(*batteryAPI)
+					eW := fetchEVW(*evAPI)
 					mu.Lock()
 					lW := loadW
 					lastSolarW = sW
 					lastBattW = bW
+					lastEVW = eW
 					mu.Unlock()
-					net := lW - sW - bW
+					// EV charging is a site load (increases grid import).
+					net := lW + eW - sW - bW
 					srv.SetNetW(net)
 				}
 			}
@@ -162,7 +170,7 @@ func main() {
 					return snap
 				}
 				mu.Lock()
-				lw, sw, bw := loadW, lastSolarW, lastBattW
+				lw, sw, bw, ew := loadW, lastSolarW, lastBattW, lastEVW
 				mu.Unlock()
 				return linkedState{
 					MeterState: snap,
@@ -170,6 +178,7 @@ func main() {
 						LoadW_W:        lw,
 						SourceSolarW:   sw,
 						SourceBatteryW: bw,
+						LoadEVW:        ew,
 					},
 				}
 			},
@@ -226,4 +235,29 @@ func fetchW(baseURL string) float64 {
 		return 0
 	}
 	return state.Measurements.W_W
+}
+
+// fetchEVW retrieves the current charging power from an evsim /state endpoint.
+// Returns 0 on any error (fails safe — no phantom load).
+func fetchEVW(baseURL string) float64 {
+	if baseURL == "" {
+		return 0
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(baseURL + "/state")
+	if err != nil {
+		log.Printf("metersim: fetchEVW %s: %v", baseURL, err)
+		return 0
+	}
+	defer resp.Body.Close()
+	var state struct {
+		Battery struct {
+			PowerW float64 `json:"power_W"`
+		} `json:"battery"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		log.Printf("metersim: fetchEVW decode %s: %v", baseURL, err)
+		return 0
+	}
+	return state.Battery.PowerW
 }
