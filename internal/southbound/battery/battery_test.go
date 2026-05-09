@@ -253,8 +253,8 @@ func TestBattery_ApplyControl_ImportLimit(t *testing.T) {
 	b, regs, stop := connectBattery(t)
 	defer stop()
 
-	// 2500 W charge-rate cap / 5000 W nameplate = 50%; sf=-2 → raw = 5000.
-	// OpModImpLimW must write WMaxLimPct just like OpModExpLimW does.
+	// 2500 W / 5000 W nameplate = 50% charge; sf=-2 → signed raw = -5000 (charge direction).
+	// OpModImpLimW now writes a negative WMaxLimPct so the battery sim charges in the right direction.
 	ap := model.ActivePower{Value: 2500, Multiplier: 0}
 	if err := b.ApplyControl(model.DERControlBase{OpModImpLimW: &ap}); err != nil {
 		t.Fatalf("ApplyControl import limit: %v", err)
@@ -264,8 +264,10 @@ func TestBattery_ApplyControl_ImportLimit(t *testing.T) {
 	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
 	enaAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct_Ena
 
-	if got := regs.Get(rawAddr); got != 5000 {
-		t.Errorf("WMaxLimPct raw = %d, want 5000 (50%% charge limit with sf=-2)", got)
+	// -50% × 10^2 = -5000; as uint16 two's-complement = 60536.
+	const wantRaw = uint16(60536)
+	if got := regs.Get(rawAddr); got != wantRaw {
+		t.Errorf("WMaxLimPct raw = %d, want %d (−50%% charge direction, sf=−2)", got, wantRaw)
 	}
 	if regs.Get(enaAddr) != 1 {
 		t.Error("WMaxLimPct_Ena should be 1 after setting import limit")

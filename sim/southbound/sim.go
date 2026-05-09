@@ -24,8 +24,9 @@ import (
 // RegisterMap is a thread-safe Modbus holding-register store. It doubles as
 // the simonvetter RequestHandler so it can be passed directly to NewServer.
 type RegisterMap struct {
-	mu   sync.RWMutex
-	regs map[uint16]uint16
+	mu      sync.RWMutex
+	regs    map[uint16]uint16
+	OnWrite func(startAddr uint16) // called after each write with the first written address
 }
 
 // Get returns the value of a holding register (0-based Modbus address).
@@ -60,7 +61,11 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 		for i, v := range req.Args {
 			r.regs[req.Addr+uint16(i)] = v
 		}
+		cb := r.OnWrite
 		r.mu.Unlock()
+		if cb != nil {
+			cb(req.Addr)
+		}
 		return nil, nil
 	}
 	r.mu.RLock()

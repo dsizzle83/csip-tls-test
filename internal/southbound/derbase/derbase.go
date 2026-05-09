@@ -207,15 +207,15 @@ func (b *Base) ApplyControl(ctrl model.DERControlBase, tag string) error {
 		}
 	}
 
-	// OpModImpLimW: import (charge) limit — maps to the same WMaxLimPct register.
-	// The battery sim applies WMaxLimPct to both charge and discharge magnitude.
+	// OpModImpLimW: import (charge) setpoint.
+	// Uses signed negative WMaxLimPct so the battery sim charges in the right direction.
 	if ctrl.OpModImpLimW != nil {
 		if b.Has704 {
 			if err := b.SetWMaxLimPct704(ctrl.OpModImpLimW, tag); err != nil {
 				return err
 			}
 		} else {
-			if err := b.SetExportLimit(ctrl.OpModImpLimW, tag); err != nil {
+			if err := b.SetImportLimit(ctrl.OpModImpLimW, tag); err != nil {
 				return err
 			}
 		}
@@ -628,6 +628,42 @@ func (b *Base) SetConnect(connect bool, tag string) error {
 	}
 	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_Conn, []uint16{val}); err != nil {
 		return fmt.Errorf("%s: set connect=%v: %w", tag, connect, err)
+	}
+	return nil
+}
+
+// SetImportLimit writes a signed negative WMaxLimPct to M123, commanding the
+// device to absorb power at the requested rate.  This uses a sign convention
+// supported by the battery simulator: negative pct = charge direction.
+func (b *Base) SetImportLimit(ap *model.ActivePower, tag string) error {
+	if math.IsNaN(b.Wmax) || b.Wmax <= 0 {
+		return fmt.Errorf("%s: cannot set import limit: WMax unknown", tag)
+	}
+	requestedW := float64(ap.Value) * math.Pow10(int(ap.Multiplier))
+	if requestedW < 0 {
+		requestedW = 0
+	}
+	if requestedW > b.Wmax {
+		requestedW = b.Wmax
+	}
+	regs, err := b.Reader.ReadModel(sunspec.ModelImmediateCtrl)
+	if err != nil {
+		return fmt.Errorf("%s: read Model 123 for SetImportLimit: %w", tag, err)
+	}
+	if len(regs) <= sunspec.M123_WMaxLimPct_SF {
+		return fmt.Errorf("%s: Model 123 too short", tag)
+	}
+	sf := int16(regs[sunspec.M123_WMaxLimPct_SF])
+	pct := -(requestedW / b.Wmax) * 100.0 // negative = charge direction
+	raw := sunspec.RawFromScaleSigned(pct, sf)
+	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_WMaxLimPct_RmpTms, []uint16{5}); err != nil {
+		return fmt.Errorf("%s: set ramp time: %w", tag, err)
+	}
+	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_WMaxLimPct, []uint16{raw}); err != nil {
+		return fmt.Errorf("%s: write WMaxLimPct (import): %w", tag, err)
+	}
+	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_WMaxLimPct_Ena, []uint16{1}); err != nil {
+		return fmt.Errorf("%s: enable WMaxLimPct: %w", tag, err)
 	}
 	return nil
 }

@@ -1665,12 +1665,13 @@ const SCENARIOS = [
     id: 'export-limit',
     num: '01',
     title: 'Dynamic Export Limit Compliance',
-    sub: 'Solar capture under utility cap',
+    sub: 'Maximise solar behind a utility cap',
     badge: 'CSIP §4.3',
     color: '#34d399',
-    narrative: 'Utility caps PCC export at 1 kW while solar is producing 8 kW. ' +
-      'The hub coordinates battery charging (4 kW) and EV charging (2 kW) to absorb excess, ' +
-      'holding export exactly at the limit — no solar curtailed, full CSIP compliance.',
+    narrative: 'The utility caps grid export at 1 kW while rooftop solar is producing 8 kW. ' +
+      'Without the hub, a simple inverter would curtail 7 kW of clean generation. ' +
+      'The hub immediately dispatches the battery to charge at ~5 kW and ramps EV charging to absorb the rest — ' +
+      'zero solar wasted, the customer earns self-consumption savings, and the grid sees exactly 1 kW.',
     initial: { solar_W: 8000, battery_soc: 40, load_W: 1000, ev_soc: 20, ev_session: true },
     grid: { program: 1, exp_lim_W: 1000, duration_s: 300,
             description: 'Demo S1: export limit 1 kW', activate: true },
@@ -1678,30 +1679,32 @@ const SCENARIOS = [
   {
     id: 'ev-deferral',
     num: '02',
-    title: 'Peak-Rate EV Deferral',
-    sub: 'Cost-aware overnight charging',
-    badge: 'TOU',
+    title: 'Import-Limit / Peak-Rate Deferral',
+    sub: 'Grid import capped — battery defends the site',
+    badge: 'Import Cap',
     color: '#60a5fa',
-    narrative: 'EV plugs in at 6 PM needing 80% by morning. Grid signals peak pricing. ' +
-      'Hub pauses EV charging, avoids costly grid imports, then sequences battery → cheap-grid ' +
-      'after off-peak starts — customer target met, bill minimized, zero micromanagement.',
+    narrative: 'Grid signals a 500 W import cap (e.g. peak pricing or congestion). ' +
+      'Site load is 2 kW with only 1 kW of solar. Without the hub the site would draw 1.5 kW from the grid — ' +
+      'violating the cap. The hub immediately suspends EV charging and dispatches the battery to discharge 1 kW, ' +
+      'holding import to exactly 500 W. Customer avoids peak charges; grid is protected.',
     initial: { solar_W: 1000, battery_soc: 75, load_W: 2000, ev_soc: 20, ev_session: true },
     grid: { program: 1, imp_lim_W: 500, duration_s: 300,
-            description: 'Demo S2: peak TOU — limit import', activate: true },
+            description: 'Demo S2: import cap 500 W', activate: true },
   },
   {
     id: 'outage',
     num: '03',
-    title: 'Grid Outage Ride-Through',
-    sub: 'Instant DER rebalance on loss of grid',
+    title: 'Grid Stress — Zero Import Allowed',
+    sub: 'Battery carries the site load deficit',
     badge: 'Emergency',
     color: '#f87171',
-    narrative: 'Grid drops without warning. Hub detects the loss, immediately suspends EV ' +
-      'charging, transitions battery to support the site load deficit, and keeps solar ' +
-      'producing — all within seconds, no human action required.',
-    initial: { solar_W: 3500, battery_soc: 50, load_W: 2500, ev_soc: 40, ev_session: true },
-    grid: { program: 0, connect: false, duration_s: 300,
-            description: 'Demo S3: grid outage', activate: true },
+    narrative: 'A grid emergency cuts allowed import to zero. Solar covers only part of the 5 kW site load; ' +
+      'the hub must fill the 1.5 kW gap from the battery. ' +
+      'It instantly suspends EV charging (removing ~3.7 kW EV load) and discharges the battery at 1.5 kW — ' +
+      'all within one control cycle, no manual intervention.',
+    initial: { solar_W: 3500, battery_soc: 50, load_W: 5000, ev_soc: 40, ev_session: true },
+    grid: { program: 1, imp_lim_W: 0, duration_s: 300,
+            description: 'Demo S3: emergency — zero import', activate: true },
   },
   {
     id: 'demand-response',
@@ -1710,27 +1713,28 @@ const SCENARIOS = [
     sub: 'Virtual power plant dispatch',
     badge: 'DR Event',
     color: '#fbbf24',
-    narrative: 'Utility issues a 4 kW import-reduction dispatch for 20 minutes. ' +
-      'Hub throttles EV charging and ramps battery discharge to hit the target — ' +
-      'actual PCC import drops from 5 kW to 1 kW, matching the utility request precisely.',
+    narrative: 'Utility issues a demand-response event: reduce grid import to 1 kW for 20 minutes. ' +
+      'The site has no solar and is pulling 3 kW for house loads plus an EV. ' +
+      'The hub throttles the EV to minimum current and discharges the battery at 2 kW, ' +
+      'dropping PCC import from 3+ kW to 1 kW — exactly matching the DR obligation.',
     initial: { solar_W: 0, battery_soc: 60, load_W: 3000, ev_soc: 30, ev_session: true },
     grid: { program: 1, imp_lim_W: 1000, duration_s: 1200,
-            description: 'Demo S4: DR dispatch — 4 kW reduction', activate: true },
+            description: 'Demo S4: DR dispatch — reduce import to 1 kW', activate: true },
   },
   {
     id: 'self-consumption',
     num: '05',
-    title: 'Forecasted Solar Self-Consumption',
-    sub: 'Anticipatory optimization',
+    title: 'Solar Self-Consumption with Export Cap',
+    sub: 'Smart absorption before curtailment kicks in',
     badge: 'Predictive',
     color: '#a78bfa',
-    narrative: 'Morning forecast shows a midday solar peak. Battery is already 85%. ' +
-      'A dumb controller hits full battery and curtails solar. The hub pre-discharges ' +
-      'battery into the house load, defers EV charging to noon, and reserves headroom — ' +
-      'solar utilization maximized before any curtailment is needed.',
-    initial: { solar_W: 500, battery_soc: 85, load_W: 1500, ev_soc: 60, ev_session: true },
+    narrative: 'Morning: 2 kW solar, 1.5 kW load, battery at 80% SOC, export cap 500 W. ' +
+      'Grid is receiving near-limit export (500 W). The hub charges the battery with the remaining surplus, ' +
+      'keeping export at the cap and storing energy for later peak-rate discharge. ' +
+      'Solar is fully utilised — nothing curtailed, nothing wasted.',
+    initial: { solar_W: 2000, battery_soc: 80, load_W: 1500, ev_soc: 60, ev_session: false },
     grid: { program: 1, exp_lim_W: 500, duration_s: 300,
-            description: 'Demo S5: tight export cap — force absorption', activate: true },
+            description: 'Demo S5: solar self-consumption with 500 W export cap', activate: true },
   },
 ];
 
@@ -1832,15 +1836,16 @@ async function runSelectedScenario() {
 
   const ini = sc.initial;
 
-  // Pause animations before injecting fixed values
+  // Solar: pause and pin to scenario wattage.
   if (ini.solar_W != null) {
     await ok('Pause solar animation',   '/api/solar/control',   {cmd: 'pause'});
     await ok(`Solar → ${fmt(ini.solar_W)} W`, '/api/solar/inject', {W_W: ini.solar_W});
   }
+  // Battery: pause, set SOC, reconnect (Conn=1), clear hub setpoint (Ena=0 → free animation until hub writes).
   if (ini.battery_soc != null) {
     await ok('Pause battery animation', '/api/battery/control', {cmd: 'pause'});
     await ok(`Battery SOC → ${ini.battery_soc}%`, '/api/battery/inject',
-             {SoC_pct: ini.battery_soc, W_W: 0});
+             {SoC_pct: ini.battery_soc, W_W: 0, WMaxLimPct_pct: 0, Conn: 1});
   }
   if (ini.load_W != null) {
     await ok(`Site load → ${fmt(ini.load_W)} W`, '/api/meter/inject', {LoadW_W: ini.load_W});
@@ -1852,6 +1857,8 @@ async function runSelectedScenario() {
   if (ini.ev_session) {
     await ok('EV → start charging session', '/api/ev/inject',
              {action: 'start_session', connector_id: 1});
+  } else {
+    await apiPost('/api/ev/inject', {action: 'stop_session', connector_id: 1}).catch(() => {});
   }
 
   // Inject grid event
@@ -1884,8 +1891,10 @@ async function resetAll() {
   await apiPost('/api/solar/control',   {cmd: 'resume'});
   scLog('✓ Solar animation resumed', 'ok');
 
+  // Reconnect battery (Conn=1), clear hub setpoint (WMaxLimPct=0,Ena=0 → free animation).
+  await apiPost('/api/battery/inject',  {Conn: 1, WMaxLimPct_pct: 0});
   await apiPost('/api/battery/control', {cmd: 'resume'});
-  scLog('✓ Battery animation resumed', 'ok');
+  scLog('✓ Battery reconnected and animation resumed', 'ok');
 
   await apiPost('/api/meter/control',   {cmd: 'resume'});
   scLog('✓ Meter animation resumed', 'ok');

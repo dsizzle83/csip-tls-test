@@ -187,6 +187,12 @@ func (bs *BatteryServer) Inject(body []byte) error {
 		case "WMaxLimPct_pct":
 			r.Set(b.M123Base+sunspec.M123_WMaxLimPct,
 				sunspec.RawFromScaleSigned(val*100, sf(b.M123Base+sunspec.M123_WMaxLimPct_SF)))
+			// val=0 means "release hub control"; clear Ena so animation runs free.
+			if val == 0 {
+				r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 0)
+			} else {
+				r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 1)
+			}
 		case "Conn":
 			r.Set(b.M123Base+sunspec.M123_Conn, uint16(val))
 		case "St":
@@ -320,8 +326,8 @@ func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) BatteryBases {
 	r.Set(cursor, sunspec.ModelImmediateCtrl)
 	r.Set(cursor+1, m123Len)
 	m123Base := cursor + 2
-	r.Set(m123Base+sunspec.M123_WMaxLimPct, 10000)
-	r.Set(m123Base+sunspec.M123_WMaxLimPct_Ena, 1)
+	r.Set(m123Base+sunspec.M123_WMaxLimPct, 0)
+	r.Set(m123Base+sunspec.M123_WMaxLimPct_Ena, 0) // hub sets Ena=1 when it takes control
 	r.Set(m123Base+sunspec.M123_WMaxLimPct_SF, sfN(-2))
 	r.Set(m123Base+sunspec.M123_Conn, 1)
 	cursor += 2 + m123Len
@@ -369,10 +375,47 @@ func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) BatteryBases {
 
 // ── animation ─────────────────────────────────────────────────────────────────
 
+// hubBatteryW reads M123 registers and returns the hub-commanded W value.
+// Returns NaN when Ena=0 (no hub command; animation should run freely).
+// Positive W = discharge; negative W = charge.
+// Encodes direction via a signed WMaxLimPct convention: the hub writes
+// a negative percentage for charging and positive for discharging.
+func hubBatteryW(r *RegisterMap, m123Base uint16, wmaxW float64) float64 {
+	if r.Get(m123Base+sunspec.M123_Conn) == 0 {
+		return 0 // disconnected
+	}
+	if r.Get(m123Base+sunspec.M123_WMaxLimPct_Ena) == 0 {
+		return math.NaN() // no hub command; let animation run
+	}
+	raw := r.Get(m123Base + sunspec.M123_WMaxLimPct)
+	sf := int16(r.Get(m123Base + sunspec.M123_WMaxLimPct_SF))
+	pct := sunspec.ApplyScaleSigned(raw, sf) // signed: negative=charge, positive=discharge
+	return wmaxW * pct / 100.0
+}
+
 func animateBattery(s *Server, r *RegisterMap, wmaxW float64, bases BatteryBases, stop <-chan struct{}) {
 	m103Base := bases.M103Base
 	m802Base := bases.M802Base
 	m123Base := bases.M123Base
+
+	// Immediately apply hub M123 writes (e.g. when animation is paused).
+	applyNow := func() {
+		w := hubBatteryW(r, m123Base, wmaxW)
+		if math.IsNaN(w) {
+			return // no hub command; leave registers as-is
+		}
+		r.Set(m103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
+		if math.Abs(w) < wmaxW*0.02 {
+			r.Set(m103Base+sunspec.M103_St, 8) // standby
+		} else {
+			r.Set(m103Base+sunspec.M103_St, 4) // operating
+		}
+	}
+	r.OnWrite = func(startAddr uint16) {
+		if startAddr >= m123Base && startAddr < m123Base+23 {
+			applyNow()
+		}
+	}
 
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
@@ -391,17 +434,9 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW float64, bases BatteryBases
 			soc := 55.0 + 35.0*math.Sin(phase)
 			w := -wmaxW * 0.80 * math.Cos(phase)
 
-			// Apply M123 controls (written by hub over Modbus).
-			if r.Get(m123Base+sunspec.M123_Conn) == 0 {
-				w = 0
-			} else if r.Get(m123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
-				// WMaxLimPct limits power magnitude for both charge and discharge.
-				limPct := sunspec.ApplyScaleSigned(
-					r.Get(m123Base+sunspec.M123_WMaxLimPct),
-					int16(r.Get(m123Base+sunspec.M123_WMaxLimPct_SF)),
-				)
-				limW := wmaxW * math.Max(0, limPct) / 100.0
-				w = math.Max(math.Min(w, limW), -limW)
+			// Hub command overrides animation direction entirely.
+			if hw := hubBatteryW(r, m123Base, wmaxW); !math.IsNaN(hw) {
+				w = hw
 			}
 
 			v := 240.0 + 1.5*math.Sin(2*math.Pi*t/89)

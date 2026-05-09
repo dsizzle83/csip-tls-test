@@ -117,6 +117,9 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	// Rule 3: Export/import limit — absorb excess into EVSEs, battery, then curtail solar.
 	batteries, surplusW = o.applyExportLimitRule(state.Solar, state.EVSEs, evseW, limits, state.Grid.NetW, o.SOCFullThreshold, surplusW, batteries, &plan)
 
+	// Rule 3.5: Import limit enforcement — discharge battery to reduce grid import.
+	batteries = applyImportLimitRule(batteries, limits, state.Grid.NetW, o.SOCReserve, &plan)
+
 	// Rule 4: Self-consumption — route solar surplus to battery.
 	batteries, surplusW = applySelfConsumptionRule(batteries, surplusW, o.ExcessSolarThreshold, o.SOCFullThreshold, &plan)
 
@@ -653,10 +656,56 @@ func applyEVChargingRule(evses []EVSEState, limits gridConstraints, netW, solarW
 	}
 }
 
+// applyImportLimitRule discharges batteries when grid import exceeds the CSIP
+// import limit.  It runs after the export-limit rule (which handles EVSEs and
+// the charge direction) so it only fires on genuine import over-limit events.
+func applyImportLimitRule(batteries []BatteryState, limits gridConstraints, netW, socReserve float64, plan *Plan) []BatteryState {
+	if math.IsNaN(limits.importLimitW) {
+		return batteries
+	}
+	importW := 0.0
+	if !math.IsNaN(netW) {
+		importW = math.Max(0, netW) // positive netW = importing from grid
+	}
+	if importW <= limits.importLimitW {
+		return batteries // within the allowed import window
+	}
+
+	result := make([]BatteryState, len(batteries))
+	copy(result, batteries)
+	deficit := importW - limits.importLimitW
+
+	for i, b := range result {
+		if deficit <= 1 {
+			break
+		}
+		if !b.Connected || hasBatteryCommand(plan.BatteryCommands, b.Name) {
+			continue
+		}
+		if !math.IsNaN(b.SOC) && b.SOC <= socReserve {
+			continue
+		}
+		discharge := math.Min(b.AvailableDischargeW(), deficit)
+		if discharge <= 0 {
+			continue
+		}
+		result[i].PowerW = discharge
+		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+			Name:      b.Name,
+			SetpointW: discharge,
+		})
+		plan.AddDecision("csip/import-limit",
+			fmt.Sprintf("import %.0fW > limit %.0fW; discharging %s at %.0fW", importW, limits.importLimitW, b.Name, discharge),
+			fmt.Sprintf("%s → %.0fW discharge", b.Name, discharge))
+		deficit -= discharge
+	}
+	return result
+}
+
 // applyRestoreRule sends restore commands for devices that received no command this
 // tick so that prior setpoints don't latch in Modbus registers.
 // Solar is restored to full output (NaN = nameplate max).
-// Battery is restored to idle (0 W) to clear any stale charge/discharge setpoint.
+// Battery is idled (0 W) and reconnected so a prior disconnect does not persist.
 func applyRestoreRule(solar []SolarState, batteries []BatteryState, socReserve float64, plan *Plan) {
 	for _, sol := range solar {
 		if sol.Connected && !hasSolarCommand(plan.SolarCommands, sol.Name) {
@@ -666,12 +715,14 @@ func applyRestoreRule(solar []SolarState, batteries []BatteryState, socReserve f
 			})
 		}
 	}
+	reconnect := true
 	for _, b := range batteries {
 		if b.Connected && !hasBatteryCommand(plan.BatteryCommands, b.Name) && b.MaxDischargeW > 0 {
 			if math.IsNaN(b.SOC) || b.SOC > socReserve {
 				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 					Name:      b.Name,
-					SetpointW: 0, // idle: clear any latched charge/discharge setpoint
+					SetpointW: 0,          // idle: clear any stale setpoint
+					Connect:   &reconnect, // re-assert Conn=1 each tick
 				})
 			}
 		}
