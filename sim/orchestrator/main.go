@@ -88,7 +88,7 @@ func main() {
 			continue
 		}
 		reg.Add(&registry.Entry{Name: ic.Name, Addr: ic.URL, Device: inv})
-		ra.RegisterDevice(ic.Name, adapters.RoleSolar, ic.MaxW)
+		ra.RegisterDevice(ic.Name, adapters.RoleSolar, ic.MaxW, inv)
 		log.Printf("orchestrator: inverter registered: %s", ic.Name)
 	}
 
@@ -99,7 +99,7 @@ func main() {
 			continue
 		}
 		reg.Add(&registry.Entry{Name: mc.Name, Addr: mc.URL, Device: mtr})
-		ra.RegisterDevice(mc.Name, adapters.RoleGridMeter, 0)
+		ra.RegisterDevice(mc.Name, adapters.RoleGridMeter, 0, mtr)
 		log.Printf("orchestrator: meter registered: %s (model %d)", mc.Name, mtr.ModelID())
 	}
 
@@ -112,7 +112,7 @@ func main() {
 			continue
 		}
 		reg.Add(&registry.Entry{Name: bc.Name, Addr: bc.URL, Device: bat})
-		ra.RegisterDevice(bc.Name, adapters.RoleBattery, bc.MaxW)
+		ra.RegisterDevice(bc.Name, adapters.RoleBattery, bc.MaxW, bat)
 		battNames = append(battNames, bc.Name)
 		battDevices = append(battDevices, bat)
 		log.Printf("orchestrator: battery registered: %s", bc.Name)

@@ -176,15 +176,16 @@ func setupSouthbound(cfg *Config) (reg *registry.Registry, ra *adapters.Registry
 	for _, dc := range cfg.Devices {
 		dev, err := openDevice(dc)
 		if err != nil {
-			log.Printf("hub: device %s (%s): %v — skipped", dc.Name, dc.URL, err)
-			continue
+			log.Printf("hub: device %s (%s): %v — registering with deferred connect", dc.Name, dc.URL, err)
+			dev = newPendingDevice(dc)
+		} else {
+			log.Printf("hub: device registered: %s (%s role=%s)", dc.Name, dc.URL, dc.Role)
 		}
 		reg.Add(&registry.Entry{Name: dc.Name, Addr: dc.URL, Device: dev})
 		ra.RegisterDevice(dc.Name, deviceRole(dc.Role), dc.MaxW, dev)
 		if bat, ok := dev.(*battery.Battery); ok {
 			bats = append(bats, batEntry{name: dc.Name, bat: bat})
 		}
-		log.Printf("hub: device registered: %s (%s role=%s)", dc.Name, dc.URL, dc.Role)
 	}
 	return reg, ra, bats
 }

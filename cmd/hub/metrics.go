@@ -380,6 +380,12 @@ func statusHandler(m *hubMetrics, ocppTracker *adapters.OCPPStateTracker, reader
 		if v := sysState.InferredLoadW(); !math.IsNaN(v) {
 			loadW = v
 		}
+		// Subtract EV load so load_W reflects site load only (EV is shown separately).
+		if ocppTracker != nil {
+			for _, e := range ocppTracker.EVSEStates() {
+				loadW -= e.PowerW
+			}
+		}
 
 		decisions := make([]decisionJSON, 0, len(lastPlan.Decisions))
 		for _, d := range lastPlan.Decisions {

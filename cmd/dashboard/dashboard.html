@@ -291,8 +291,8 @@ a { color: #60a5fa; }
   </div>
   <div class="card pcard load">
     <div class="val c-load" id="load-w">—</div>
-    <div class="lbl">Load</div>
-    <div class="sub">inferred</div>
+    <div class="lbl">Site Load</div>
+    <div class="sub">excl. EV</div>
   </div>
   <div class="card pcard ev clickable" onclick="switchTab('ev')" title="Click to open EV Charger tab">
     <div class="val c-ev" id="ev-w">—</div>
@@ -791,23 +791,23 @@ function switchTab(name) {
     pollSolarState();
     pollSolarRegs();
     simIntervals.push(
-      setInterval(pollSolarState, 3000),
-      setInterval(pollSolarRegs,  5000)
+      setInterval(pollSolarState, 1000),
+      setInterval(pollSolarRegs,  3000)
     );
   } else if (name === 'battery') {
     pollBatteryState();
     pollBatteryRegs();
     simIntervals.push(
-      setInterval(pollBatteryState, 3000),
-      setInterval(pollBatteryRegs,  5000)
+      setInterval(pollBatteryState, 1000),
+      setInterval(pollBatteryRegs,  3000)
     );
   } else if (name === 'grid') {
     pollGridStatus();
     loadDefault();
-    simIntervals.push(setInterval(pollGridStatus, 5000));
+    simIntervals.push(setInterval(pollGridStatus, 2000));
   } else if (name === 'ev') {
     pollEVState();
-    simIntervals.push(setInterval(pollEVState, 3000));
+    simIntervals.push(setInterval(pollEVState, 2000));
   } else if (name === 'scenarios') {
     // no polling needed; scenarios are event-driven
   }
@@ -1902,7 +1902,7 @@ async function resetAll() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 pollHub();
 connectLogs();
-setInterval(pollHub, 5000);
+setInterval(pollHub, 1000);
 buildScenarioSelector();
 </script>
 </body>

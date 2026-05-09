@@ -654,6 +654,9 @@ func (b *Base) SetExportLimit(ap *model.ActivePower, tag string) error {
 	sf := int16(regs[sunspec.M123_WMaxLimPct_SF])
 	pct := (requestedW / b.Wmax) * 100.0
 	raw := sunspec.RawFromScaleUint(pct, sf)
+	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_WMaxLimPct_RmpTms, []uint16{5}); err != nil {
+		return fmt.Errorf("%s: set ramp time: %w", tag, err)
+	}
 	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_WMaxLimPct, []uint16{raw}); err != nil {
 		return fmt.Errorf("%s: write WMaxLimPct: %w", tag, err)
 	}
