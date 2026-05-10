@@ -469,37 +469,70 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 
 // applySelfConsumptionRule routes solar surplus into connected batteries.
 // Returns updated battery states and updated surplusW.
+//
+// When a battery is already charging and its current rate already covers the
+// measured surplus (e.g. because the grid meter lags), the rule re-issues the
+// current setpoint ("maintain") rather than escalating it each tick.  This
+// prevents a runaway charge ramp when the meter reading is stale.
 func applySelfConsumptionRule(batteries []BatteryState, surplusW, excessThreshold, socFull float64, plan *Plan) ([]BatteryState, float64) {
-	if surplusW <= excessThreshold {
-		return batteries, surplusW
-	}
 	for i, b := range batteries {
 		if !b.Connected || !b.Energized {
 			continue
 		}
-		if !math.IsNaN(b.SOC) && b.SOC >= socFull {
-			plan.AddDecision("self-consumption",
-				fmt.Sprintf("battery %s SOC=%.1f%% >= full threshold %.1f%%",
-					b.Name, b.SOC, socFull),
-				"skip charging — battery full")
+		if hasBatteryCommand(plan.BatteryCommands, b.Name) {
 			continue
 		}
+		if !math.IsNaN(b.SOC) && b.SOC >= socFull {
+			if surplusW > excessThreshold {
+				plan.AddDecision("self-consumption",
+					fmt.Sprintf("battery %s SOC=%.1f%% >= full threshold %.1f%%",
+						b.Name, b.SOC, socFull),
+					"skip charging — battery full")
+			}
+			continue
+		}
+
+		// How much is the battery already absorbing?
+		alreadyAbsorbingW := 0.0
+		if b.PowerW < 0 {
+			alreadyAbsorbingW = -b.PowerW
+		}
+
+		// Additional surplus beyond what this battery is already absorbing.
+		additionalSurplus := math.Max(0, surplusW-alreadyAbsorbingW)
+
+		if additionalSurplus < excessThreshold {
+			// Battery is already covering the surplus; re-issue current setpoint to
+			// prevent the restore rule from clearing it, but do not escalate.
+			if alreadyAbsorbingW > 0 && surplusW > 0 {
+				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+					Name:      b.Name,
+					SetpointW: b.PowerW,
+				})
+				plan.AddDecision("self-consumption",
+					fmt.Sprintf("%.0fW surplus absorbed by %.0fW charge; maintaining battery %s", surplusW, alreadyAbsorbingW, b.Name),
+					fmt.Sprintf("battery %s holds %.0fW", b.Name, b.PowerW))
+				batteries[i].PowerW = b.PowerW
+				surplusW -= alreadyAbsorbingW
+			}
+			continue
+		}
+
+		// Absorb the additional surplus beyond the current charge rate.
 		headroom := b.AvailableChargeW()
-		absorb := math.Min(headroom, surplusW)
+		absorb := math.Min(headroom, additionalSurplus)
 		if absorb < 50 {
 			continue
 		}
 		newSetpoint := b.PowerW - absorb
-		if !hasBatteryCommand(plan.BatteryCommands, b.Name) {
-			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
-				Name:      b.Name,
-				SetpointW: newSetpoint,
-			})
-			plan.AddDecision("self-consumption",
-				fmt.Sprintf("%.0fW solar surplus → charging battery %s", surplusW, b.Name),
-				fmt.Sprintf("battery %s setpoint %.0fW", b.Name, newSetpoint))
-		}
-		surplusW -= absorb
+		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+			Name:      b.Name,
+			SetpointW: newSetpoint,
+		})
+		plan.AddDecision("self-consumption",
+			fmt.Sprintf("%.0fW solar surplus → charging battery %s", surplusW, b.Name),
+			fmt.Sprintf("battery %s setpoint %.0fW", b.Name, newSetpoint))
+		surplusW -= absorb + alreadyAbsorbingW
 		batteries[i].PowerW = newSetpoint
 	}
 	return batteries, surplusW
