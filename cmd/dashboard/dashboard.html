@@ -829,17 +829,9 @@ async function pollHub() {
     const p = d.power || {};
     const solar   = p.solar_W   ?? 0;
     const battery = p.battery_W ?? 0;
-    const grid    = p.grid_W    ?? 0;
-    const load    = p.load_W    ?? 0;
 
     setText('solar-w',   fmt(solar)   + ' W');
     setText('battery-w', fmt(battery) + ' W');
-    setText('load-w',    fmt(load)    + ' W');
-
-    const gEl = document.getElementById('grid-w');
-    gEl.textContent = fmt(grid) + ' W';
-    gEl.className   = 'val ' + (grid > 0 ? 'c-neg' : grid < 0 ? 'c-pos' : '');
-    setText('grid-sub', grid > 50 ? '▲ importing' : grid < -50 ? '▼ exporting' : 'balanced');
 
     setText('solar-sub', 'of ' + fmt((d.devices ? Object.values(d.devices).find(d=>d.role==='solar')?.max_W : 0) || 0) + ' W cap');
     const batDev = d.devices ? Object.values(d.devices).find(x => x.role === 'battery') : null;
@@ -861,6 +853,26 @@ async function pollHub() {
       setText('ev-sub', ev.session_active ? 'charging' : (ev.connected ? 'idle' : 'disconnected'));
       updateHubEVCard(ev);
     }
+
+    // Site load: fixed scenario background consumption when a scenario is active;
+    // otherwise inferred by hub (solar + battery + grid - EV).
+    // Grid: computed from power balance when scenario is active so it reflects
+    // actual device readings rather than a frozen/stale meter reading.
+    let load, grid;
+    if (scenarioSiteLoadW !== null) {
+      load = scenarioSiteLoadW;
+      grid = solar + battery - evW - load; // positive = importing, negative = exporting
+    } else {
+      load = p.load_W ?? 0;
+      grid = p.grid_W ?? 0;
+    }
+
+    setText('load-w', fmt(load) + ' W');
+
+    const gEl = document.getElementById('grid-w');
+    gEl.textContent = fmt(grid) + ' W';
+    gEl.className   = 'val ' + (grid > 0 ? 'c-neg' : grid < 0 ? 'c-pos' : '');
+    setText('grid-sub', grid > 50 ? '▲ importing' : grid < -50 ? '▼ exporting' : 'balanced');
 
     renderDecisions(d.last_plan?.decisions || []);
     pushChart(d.timestamp, solar, battery, grid, load, evW);
@@ -1739,6 +1751,7 @@ const SCENARIOS = [
 ];
 
 let selectedScenario = null;
+let scenarioSiteLoadW = null; // fixed site load for active scenario; null = use hub inference
 
 function buildScenarioSelector() {
   const sel = document.getElementById('sc-selector');
@@ -1824,6 +1837,7 @@ async function runSelectedScenario() {
   runBtn.disabled = true;
   clearScLog();
 
+  scenarioSiteLoadW = ini.load_W ?? 0;
   setStatus('sc-run-status', 'Running…', '#fbbf24');
   scLog(`▶ ${sc.title}`, 'hdr');
   scLog('─'.repeat(48), 'hdr');
@@ -1886,6 +1900,7 @@ async function runSelectedScenario() {
 }
 
 async function resetAll() {
+  scenarioSiteLoadW = null;
   clearScLog();
   scLog('↺ Resetting all simulators…', 'hdr');
 
