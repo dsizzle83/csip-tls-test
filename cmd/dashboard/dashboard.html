@@ -1847,8 +1847,12 @@ async function runSelectedScenario() {
     await ok(`Battery SOC → ${ini.battery_soc}%`, '/api/battery/inject',
              {SoC_pct: ini.battery_soc, W_W: 0, WMaxLimPct_pct: 0, Conn: 1});
   }
-  if (ini.load_W != null) {
-    await ok(`Site load → ${fmt(ini.load_W)} W`, '/api/meter/inject', {LoadW_W: ini.load_W});
+  // Meter: pause animation and pin grid net W to pre-hub initial state.
+  // gridW > 0 = importing, < 0 = exporting.  Hub reads M201_W from this.
+  {
+    const gridW_W = (ini.load_W ?? 0) - (ini.solar_W ?? 0);
+    await ok('Pause meter animation',          '/api/meter/control', {cmd: 'pause'});
+    await ok(`Grid meter → ${fmt(gridW_W)} W`, '/api/meter/inject',  {W_W: gridW_W});
   }
   if (ini.ev_soc != null) {
     await ok(`EV SOC → ${ini.ev_soc}%`, '/api/ev/inject',

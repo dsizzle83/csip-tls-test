@@ -419,22 +419,43 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		if !math.IsNaN(b.SOC) && b.SOC >= socFull {
 			continue
 		}
-		absorb := math.Min(b.AvailableChargeW(), remainingExcessW)
-		if absorb > 0 {
-			newSetpoint := b.PowerW - absorb
+		alreadyAbsorbingW := 0.0
+		if b.PowerW < 0 {
+			alreadyAbsorbingW = -b.PowerW
+		}
+		netNeeded := math.Max(0, remainingExcessW-alreadyAbsorbingW)
+		if netNeeded < 50 {
+			// Already absorbing enough; re-issue current setpoint to hold it.
 			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 				Name:      b.Name,
-				SetpointW: newSetpoint,
+				SetpointW: b.PowerW,
 			})
 			plan.AddDecision("csip/export-limit",
-				fmt.Sprintf("%.0fW excess after EV; charging battery %s with %.0fW",
-					remainingExcessW, b.Name, absorb),
-				fmt.Sprintf("battery %s setpoint → %.0fW", b.Name, newSetpoint))
-			remainingExcessW -= absorb
-			absorbedW += absorb
-			batteries[i].PowerW = newSetpoint
-			surplusW -= absorb
+				fmt.Sprintf("battery %s already absorbing %.0fW ≥ excess %.0fW; holding",
+					b.Name, alreadyAbsorbingW, remainingExcessW),
+				fmt.Sprintf("battery %s holds %.0fW", b.Name, b.PowerW))
+			remainingExcessW -= alreadyAbsorbingW
+			absorbedW += alreadyAbsorbingW
+			surplusW -= alreadyAbsorbingW
+			continue
 		}
+		absorb := math.Min(b.AvailableChargeW(), netNeeded)
+		if absorb < 50 {
+			continue
+		}
+		newSetpoint := b.PowerW - absorb
+		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+			Name:      b.Name,
+			SetpointW: newSetpoint,
+		})
+		plan.AddDecision("csip/export-limit",
+			fmt.Sprintf("%.0fW excess after EV; charging battery %s with additional %.0fW",
+				remainingExcessW, b.Name, absorb),
+			fmt.Sprintf("battery %s setpoint → %.0fW", b.Name, newSetpoint))
+		remainingExcessW -= absorb + alreadyAbsorbingW
+		absorbedW += absorb + alreadyAbsorbingW
+		batteries[i].PowerW = newSetpoint
+		surplusW -= absorb
 	}
 
 	// ── Solar curtailment: last resort, only above the hard limit ───────────────
