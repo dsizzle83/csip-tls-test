@@ -386,6 +386,10 @@ func statusHandler(m *hubMetrics, ocppTracker *adapters.OCPPStateTracker, reader
 				loadW -= e.PowerW
 			}
 		}
+		// Home load is always non-negative; clamp against stale meter artifacts.
+		if loadW < 0 {
+			loadW = 0
+		}
 
 		decisions := make([]decisionJSON, 0, len(lastPlan.Decisions))
 		for _, d := range lastPlan.Decisions {

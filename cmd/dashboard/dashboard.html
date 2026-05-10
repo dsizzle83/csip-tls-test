@@ -1847,10 +1847,17 @@ async function runSelectedScenario() {
     await ok(`Battery SOC → ${ini.battery_soc}%`, '/api/battery/inject',
              {SoC_pct: ini.battery_soc, W_W: 0, WMaxLimPct_pct: 0, Conn: 1});
   }
-  // Meter: pause animation and pin grid net W to pre-hub initial state.
+  // Meter: pause animation and pin grid net W.
+  // For export-limit scenarios pin at the limit (not pre-action) so the hub
+  // sees the site already near the target and makes small steady corrections
+  // rather than dispatching EV+battery to the extreme.
   // gridW > 0 = importing, < 0 = exporting.  Hub reads M201_W from this.
   {
-    const gridW_W = (ini.load_W ?? 0) - (ini.solar_W ?? 0);
+    let gridW_W = (ini.load_W ?? 0) - (ini.solar_W ?? 0);
+    if (sc.grid && sc.grid.exp_lim_W != null) {
+      // Clamp: don't inject more export than the limit allows.
+      gridW_W = Math.max(gridW_W, -sc.grid.exp_lim_W);
+    }
     await ok('Pause meter animation',          '/api/meter/control', {cmd: 'pause'});
     await ok(`Grid meter → ${fmt(gridW_W)} W`, '/api/meter/inject',  {W_W: gridW_W});
   }
