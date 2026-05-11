@@ -862,7 +862,7 @@ async function pollHub() {
     let load, grid;
     if (scenarioSiteLoadW !== null) {
       load = scenarioSiteLoadW;
-      grid = solar + battery - evW - load; // positive = exporting, negative = importing
+      grid = load + evW - solar - battery; // positive = importing, negative = exporting
     } else {
       load = p.load_W ?? 0;
       grid = p.grid_W ?? 0;
@@ -1898,13 +1898,13 @@ async function setupScenario() {
              '/api/battery/inject', {SoC_pct: ini.battery_soc, W_W: 0, WMaxLimPct_pct: 0, Conn: 1});
   }
 
-  // Meter: pause and show the pre-event grid state.
-  // M201_W: negative = exporting, positive = importing.
-  {
-    const meterW = (ini.load_W ?? 0) - (ini.solar_W ?? 0);
-    await ok('Pause meter animation',                  '/api/meter/control', {cmd: 'pause'});
-    await ok(`Grid meter → ${fmt(meterW)} W (pre-event)`, '/api/meter/inject', {W_W: meterW});
-  }
+  // Meter: pause and set to 0 W so the hub sees a balanced grid during setup.
+  // This prevents the self-consumption rule from dispatching the battery before
+  // the grid event fires.  The Grid display is computed from live device readings
+  // (load + EV - solar - battery), so it correctly shows the pre-event surplus
+  // without needing the actual meter to reflect it.
+  await ok('Pause meter animation', '/api/meter/control', {cmd: 'pause'});
+  await ok('Grid meter → 0 W (hub idle)', '/api/meter/inject', {W_W: 0});
 
   // EV: set SOC, stop session (idle for setup — hub starts charging after the event).
   if (ini.ev_soc != null) {
