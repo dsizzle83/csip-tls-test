@@ -441,6 +441,21 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		}
 		absorb := math.Min(b.AvailableChargeW(), netNeeded)
 		if absorb < 50 {
+			// Battery is at (or near) rated capacity — hold current rate so the
+			// restore rule does not idle it.
+			if alreadyAbsorbingW > 0 {
+				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+					Name:      b.Name,
+					SetpointW: b.PowerW,
+				})
+				plan.AddDecision("csip/export-limit",
+					fmt.Sprintf("battery %s at capacity (%.0fW); holding while export limit active",
+						b.Name, alreadyAbsorbingW),
+					fmt.Sprintf("battery %s holds %.0fW", b.Name, b.PowerW))
+				remainingExcessW -= alreadyAbsorbingW
+				absorbedW += alreadyAbsorbingW
+				surplusW -= alreadyAbsorbingW
+			}
 			continue
 		}
 		newSetpoint := b.PowerW - absorb
@@ -543,6 +558,19 @@ func applySelfConsumptionRule(batteries []BatteryState, surplusW, excessThreshol
 		headroom := b.AvailableChargeW()
 		absorb := math.Min(headroom, additionalSurplus)
 		if absorb < 50 {
+			// Battery at capacity — hold current rate so restore rule doesn't idle it.
+			if alreadyAbsorbingW > 0 && surplusW > 0 {
+				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
+					Name:      b.Name,
+					SetpointW: b.PowerW,
+				})
+				plan.AddDecision("self-consumption",
+					fmt.Sprintf("battery %s at capacity (%.0fW); holding while surplus %.0fW remains",
+						b.Name, alreadyAbsorbingW, surplusW),
+					fmt.Sprintf("battery %s holds %.0fW", b.Name, b.PowerW))
+				surplusW -= alreadyAbsorbingW
+				batteries[i].PowerW = b.PowerW
+			}
 			continue
 		}
 		newSetpoint := b.PowerW - absorb

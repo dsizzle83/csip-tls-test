@@ -720,11 +720,12 @@ a { color: #60a5fa; }
     <div id="sc-narrative" class="sc-narrative"></div>
     <div class="sc-conditions" id="sc-conditions"></div>
     <div class="sc-actions">
-      <button class="btn btn-primary" id="sc-run-btn" onclick="runSelectedScenario()" style="min-width:140px;background:#7c3aed;">&#9654;&nbsp; Run Scenario</button>
+      <button class="btn btn-primary" id="sc-setup-btn" onclick="setupScenario()" style="min-width:150px;background:#0e7490;">&#9881;&nbsp; 1. Setup Scene</button>
+      <button class="btn btn-primary" id="sc-event-btn" onclick="sendDERControl()" style="min-width:170px;background:#7c3aed;" disabled>&#9889;&nbsp; 2. Send Grid Event</button>
       <button class="btn btn-ghost" onclick="resetAll()" style="min-width:110px;">&#8635;&nbsp; Reset All</button>
       <span id="sc-run-status" style="font-size:12px;color:#94a3b8;"></span>
     </div>
-    <div class="sc-log" id="sc-log"><div class="sc-log-line" style="color:#334155;">Select a scenario and press Run.</div></div>
+    <div class="sc-log" id="sc-log"><div class="sc-log-line" style="color:#334155;">Select a scenario and press Setup Scene.</div></div>
   </div>
 
 </div><!-- #ppanel-scenarios -->
@@ -861,10 +862,28 @@ async function pollHub() {
     let load, grid;
     if (scenarioSiteLoadW !== null) {
       load = scenarioSiteLoadW;
-      grid = solar + battery - evW - load; // positive = importing, negative = exporting
+      grid = solar + battery - evW - load; // positive = exporting, negative = importing
     } else {
       load = p.load_W ?? 0;
       grid = p.grid_W ?? 0;
+    }
+
+    // After the grid event fires, keep the metersim reading in sync with what
+    // the hub is actually dispatching.  This gives the hub accurate feedback so
+    // it makes proportional decisions (no phantom EV runaway from a stale meter).
+    // M201_W convention: negative = exporting, positive = importing.
+    // Grid.NetW = load + evW - solar - battery  (sign-flipped vs. display grid).
+    if (scenarioDERActive && scenarioSiteLoadW !== null) {
+      const now = Date.now();
+      if (now - lastMeterUpdateMs > 2000) {
+        lastMeterUpdateMs = now;
+        const meterW = scenarioSiteLoadW + evW - solar - battery;
+        fetch('/api/meter/inject', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({W_W: meterW}),
+        }).catch(() => {});
+      }
     }
 
     setText('load-w', fmt(load) + ' W');
@@ -1750,8 +1769,10 @@ const SCENARIOS = [
   },
 ];
 
-let selectedScenario = null;
-let scenarioSiteLoadW = null; // fixed site load for active scenario; null = use hub inference
+let selectedScenario    = null;
+let scenarioSiteLoadW   = null;  // fixed site load for active scenario; null = use hub inference
+let scenarioDERActive   = false; // true after grid event is sent; enables live meter feedback
+let lastMeterUpdateMs   = 0;     // throttle meter injection to ≤ once per 2 s
 
 function buildScenarioSelector() {
   const sel = document.getElementById('sc-selector');
@@ -1810,6 +1831,8 @@ function selectScenario(id) {
 
   document.getElementById('sc-detail-card').style.display = '';
   document.getElementById('sc-run-status').textContent = '';
+  document.getElementById('sc-event-btn').disabled = true;
+  scenarioDERActive = false;
 }
 
 function condRow(k, v) {
@@ -1830,16 +1853,16 @@ function clearScLog() {
   document.getElementById('sc-log').innerHTML = '';
 }
 
-async function runSelectedScenario() {
+async function setupScenario() {
   if (!selectedScenario) return;
   const sc = selectedScenario;
-  const runBtn = document.getElementById('sc-run-btn');
-  runBtn.disabled = true;
   clearScLog();
+  document.getElementById('sc-setup-btn').disabled = true;
+  document.getElementById('sc-event-btn').disabled = true;
+  scenarioDERActive = false;
 
-  scenarioSiteLoadW = ini.load_W ?? 0;
-  setStatus('sc-run-status', 'Running…', '#fbbf24');
-  scLog(`▶ ${sc.title}`, 'hdr');
+  setStatus('sc-run-status', 'Setting up…', '#fbbf24');
+  scLog(`⚙ Setting scene: ${sc.title}`, 'hdr');
   scLog('─'.repeat(48), 'hdr');
 
   const ok = async (label, url, body) => {
@@ -1849,58 +1872,97 @@ async function runSelectedScenario() {
   };
 
   const ini = sc.initial;
+  scenarioSiteLoadW = ini.load_W ?? 0;
 
-  // Solar: pause and pin to scenario wattage.
-  if (ini.solar_W != null) {
-    await ok('Pause solar animation',   '/api/solar/control',   {cmd: 'pause'});
-    await ok(`Solar → ${fmt(ini.solar_W)} W`, '/api/solar/inject', {W_W: ini.solar_W});
+  // Clear any active grid events — hub should be unconstrained during setup.
+  for (const prog of [0, 1, 2]) {
+    try {
+      await fetch('/api/gridsim/admin/control', {
+        method: 'DELETE', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({program: prog}),
+      });
+    } catch (_) {}
   }
-  // Battery: pause, set SOC, reconnect (Conn=1), clear hub setpoint (Ena=0 → free animation until hub writes).
+  scLog('✓ Grid events cleared', 'ok');
+
+  // Solar: pause and pin.
+  if (ini.solar_W != null) {
+    await ok('Pause solar animation',         '/api/solar/control', {cmd: 'pause'});
+    await ok(`Solar → ${fmt(ini.solar_W)} W`, '/api/solar/inject',  {W_W: ini.solar_W});
+  }
+
+  // Battery: pause, set SOC, reconnect, idle.
   if (ini.battery_soc != null) {
     await ok('Pause battery animation', '/api/battery/control', {cmd: 'pause'});
-    await ok(`Battery SOC → ${ini.battery_soc}%`, '/api/battery/inject',
-             {SoC_pct: ini.battery_soc, W_W: 0, WMaxLimPct_pct: 0, Conn: 1});
-  }
-  // Meter: pause animation and pin grid net W.
-  // For export-limit scenarios pin at the limit (not pre-action) so the hub
-  // sees the site already near the target and makes small steady corrections
-  // rather than dispatching EV+battery to the extreme.
-  // gridW > 0 = importing, < 0 = exporting.  Hub reads M201_W from this.
-  {
-    let gridW_W = (ini.load_W ?? 0) - (ini.solar_W ?? 0);
-    if (sc.grid && sc.grid.exp_lim_W != null) {
-      // Clamp: don't inject more export than the limit allows.
-      gridW_W = Math.max(gridW_W, -sc.grid.exp_lim_W);
-    }
-    await ok('Pause meter animation',          '/api/meter/control', {cmd: 'pause'});
-    await ok(`Grid meter → ${fmt(gridW_W)} W`, '/api/meter/inject',  {W_W: gridW_W});
-  }
-  if (ini.ev_soc != null) {
-    await ok(`EV SOC → ${ini.ev_soc}%`, '/api/ev/inject',
-             {action: 'set_soc', soc_pct: ini.ev_soc});
-  }
-  if (ini.ev_session) {
-    await ok('EV → start charging session', '/api/ev/inject',
-             {action: 'start_session', connector_id: 1});
-  } else {
-    await apiPost('/api/ev/inject', {action: 'stop_session', connector_id: 1}).catch(() => {});
+    await ok(`Battery → SOC ${ini.battery_soc}%, idle`,
+             '/api/battery/inject', {SoC_pct: ini.battery_soc, W_W: 0, WMaxLimPct_pct: 0, Conn: 1});
   }
 
-  // Inject grid event
-  if (sc.grid) {
-    await ok('Grid DERControl → ' + (sc.grid.description || 'event'), '/api/gridsim/admin/control', sc.grid);
+  // Meter: pause and show the pre-event grid state.
+  // M201_W: negative = exporting, positive = importing.
+  {
+    const meterW = (ini.load_W ?? 0) - (ini.solar_W ?? 0);
+    await ok('Pause meter animation',                  '/api/meter/control', {cmd: 'pause'});
+    await ok(`Grid meter → ${fmt(meterW)} W (pre-event)`, '/api/meter/inject', {W_W: meterW});
   }
+
+  // EV: set SOC, stop session (idle for setup — hub starts charging after the event).
+  if (ini.ev_soc != null) {
+    await ok(`EV SOC → ${ini.ev_soc}%`, '/api/ev/inject', {action: 'set_soc', soc_pct: ini.ev_soc});
+  }
+  await apiPost('/api/ev/inject', {action: 'stop_session', connector_id: 1}).catch(() => {});
+  scLog('✓ EV idle', 'ok');
 
   scLog('─'.repeat(48), 'hdr');
-  scLog('Watching hub respond…  (Hub tab → Last Orchestrator Decisions)', 'rdy');
-  setStatus('sc-run-status', '✓ Injected — watching hub', '#4ade80');
-  runBtn.disabled = false;
+  scLog('Scene set — grid unconstrained, hub holding devices at initial state.', 'rdy');
+  scLog('Press  ⚡ Send Grid Event  to activate the utility constraint.', 'rdy');
+  setStatus('sc-run-status', '✓ Scene ready', '#4ade80');
+  document.getElementById('sc-setup-btn').disabled = false;
+  document.getElementById('sc-event-btn').disabled = false;
+  pollGridStatus();
+}
 
+async function sendDERControl() {
+  if (!selectedScenario) return;
+  const sc = selectedScenario;
+  if (!sc.grid) { scLog('No grid event defined for this scenario.', 'err'); return; }
+
+  document.getElementById('sc-event-btn').disabled = true;
+  setStatus('sc-run-status', 'Sending event…', '#fbbf24');
+  scLog('─'.repeat(48), 'hdr');
+  scLog(`⚡ Utility constraint: ${sc.grid.description}`, 'hdr');
+
+  const ok = async (label, url, body) => {
+    const result = await apiPost(url, body);
+    scLog((result ? '✓ ' : '✗ ') + label, result ? 'ok' : 'err');
+    return result;
+  };
+
+  const ini = sc.initial;
+
+  // Start EV session if the scenario calls for it — hub will manage the charge rate.
+  if (ini.ev_session) {
+    await ok('EV → start charging session', '/api/ev/inject', {action: 'start_session', connector_id: 1});
+  }
+
+  await ok('DERControl → ' + sc.grid.description, '/api/gridsim/admin/control', sc.grid);
+
+  // Enable live meter feedback: pollHub will now push Grid.NetW = load + EV - solar - battery
+  // to metersim every 2 s so the hub gets accurate real-time grid readings as devices respond.
+  scenarioDERActive = true;
+  lastMeterUpdateMs = 0;
+
+  scLog('─'.repeat(48), 'hdr');
+  scLog('Grid event active — hub is responding.', 'rdy');
+  scLog('Watch Solar / Battery / EV / Grid values update above.', 'rdy');
+  setStatus('sc-run-status', '⚡ Event live — hub responding', '#a78bfa');
+  document.getElementById('sc-event-btn').disabled = false;
   pollGridStatus();
 }
 
 async function resetAll() {
   scenarioSiteLoadW = null;
+  scenarioDERActive = false;
   clearScLog();
   scLog('↺ Resetting all simulators…', 'hdr');
 
@@ -1927,6 +1989,8 @@ async function resetAll() {
 
   await apiPost('/api/ev/inject', {action: 'stop_session', connector_id: 1}).catch(() => {});
   scLog('✓ EV session stopped', 'ok');
+
+  document.getElementById('sc-event-btn').disabled = true;
 
   scLog('─'.repeat(48), 'hdr');
   scLog('Reset complete — all sims back to animated defaults.', 'rdy');
