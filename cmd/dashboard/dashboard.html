@@ -915,12 +915,13 @@ async function pollHub() {
     // the hub is actually dispatching.  This gives the hub accurate feedback so
     // it makes proportional decisions (no phantom EV runaway from a stale meter).
     // M201_W convention: negative = exporting, positive = importing.
-    // Grid.NetW = load + evW - solar - battery  (sign-flipped vs. display grid).
+    // Battery is intentionally excluded: including it creates a feedback loop where
+    // battery charging → meter shows import → hub idles battery → export returns.
     if (scenarioDERActive && scenarioSiteLoadW !== null) {
       const now = Date.now();
       if (now - lastMeterUpdateMs > 2000) {
         lastMeterUpdateMs = now;
-        const meterW = scenarioSiteLoadW + evW - solar - battery;
+        const meterW = scenarioSiteLoadW + evW - solar;
         fetch('/api/meter/inject', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
