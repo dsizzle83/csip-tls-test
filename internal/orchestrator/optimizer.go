@@ -277,13 +277,11 @@ func applyFixedDispatchRule(cc *CSIPControlState, batteries []BatteryState, sola
 
 // applyExportLimitRule enforces the CSIP/grid export limit conservatively.
 //
-// Rather than reacting to the instantaneous meter reading every tick, the rule:
-//  1. Computes a proactive EV setpoint from projected solar surplus vs. a
-//     conservative target (limit × (1 − margin)), so the setpoint is stable.
-//  2. Holds that setpoint until actual export has been below the conservative
-//     target for ExportRelaxCycles consecutive ticks before relaxing.
-//  3. Falls back to battery charging and solar curtailment only when EV alone
-//     cannot cover the remaining excess.
+// Dispatch priority: battery first (absorbs bulk of excess up to rated charge
+// power), then EV (absorbs remainder with hysteretic setpoint), then solar
+// curtailment as last resort.  Battery-first matches the scenario narrative and
+// avoids a round-trip lag: batteries respond in one Modbus write whereas the EV
+// ramps over several OCPP MeterValues intervals.
 func (o *DefaultOptimizer) applyExportLimitRule(
 	solar []SolarState, evses []EVSEState, evseW float64,
 	limits gridConstraints, netW, socFull, surplusW float64,
@@ -330,85 +328,13 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		o.expGuard.safeCount = 0
 	}
 
-	// Proactive EV target: strip out current EV contribution to see what the
-	// site would export without any EV, then compute needed absorption.
+	// Project what the site would export if EVSEs were removed from the bus
+	// (EV consumption is dispatchable, so we plan against the unconstrained surplus).
 	projectedExportW := actualExportW + evseW
-	proactiveAbsW := math.Max(0, projectedExportW-conservativeW)
-
-	// ── EV setpoint (proactive + hysteretic) ──────────────────────────────────
+	remainingExcessW := math.Max(0, projectedExportW-conservativeW)
 	absorbedW := 0.0
-	for i := range evses {
-		ev := &evses[i]
-		if !ev.Connected || !ev.SessionActive {
-			continue
-		}
-		if hasEVSECommand(plan.EVSECommands, ev.StationID, ev.ConnectorID) {
-			continue
-		}
-		voltage := ev.VoltageV
-		if voltage <= 0 {
-			voltage = 230.0
-		}
-		const minChargeA = 6.0 // IEC 61851-1 minimum AC charge current
-		proactiveA := math.Min(proactiveAbsW/voltage, ev.MaxCurrentA)
-		// If the absorb target is nonzero but below the EVSE minimum, bump to
-		// minimum — the shortfall is imported from grid, which the export limit
-		// does not constrain.  If it's truly zero, leave it zero (no session load).
-		if proactiveA > 0 && proactiveA < minChargeA {
-			proactiveA = minChargeA
-		}
 
-		var newCurrentA float64
-		var reason, impact string
-
-		needsClamp := math.IsNaN(o.expGuard.evSetpointA) || actualExportW > conservativeW
-		switch {
-		case needsClamp:
-			// First setpoint this session, or over the conservative target:
-			// compute proactively from solar/load balance, then hold.
-			newCurrentA = proactiveA
-			o.expGuard.evSetpointA = newCurrentA
-			reason = fmt.Sprintf(
-				"export %.0fW (lim %.0fW, target ≤%.0fW); proactive EV set: projected surplus %.0fW",
-				actualExportW, limits.exportLimitW, conservativeW, proactiveAbsW)
-			impact = fmt.Sprintf("EVSE %s → %.1fA [hold]", ev.StationID, newCurrentA)
-
-		case o.expGuard.safeCount >= relaxCycles:
-			// Safely below conservative target for enough cycles: move to the
-			// current proactive setpoint (which may be lower, allowing more export).
-			newCurrentA = proactiveA
-			o.expGuard.evSetpointA = newCurrentA
-			o.expGuard.safeCount = 0 // re-arm the wait period
-			reason = fmt.Sprintf(
-				"export %.0fW safe for %d cycles; relaxing to proactive setpoint",
-				actualExportW, relaxCycles)
-			impact = fmt.Sprintf("EVSE %s → %.1fA", ev.StationID, newCurrentA)
-
-		default:
-			// Hold: re-issue the current setpoint without change.
-			newCurrentA = o.expGuard.evSetpointA
-			reason = fmt.Sprintf(
-				"export %.0fW ≤ %.0fW; holding EV at %.1fA (%d/%d safe cycles)",
-				actualExportW, conservativeW, newCurrentA, o.expGuard.safeCount, relaxCycles)
-			impact = fmt.Sprintf("EVSE %s held at %.1fA", ev.StationID, newCurrentA)
-		}
-
-		plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
-			StationID:   ev.StationID,
-			ConnectorID: ev.ConnectorID,
-			MaxCurrentA: newCurrentA,
-		})
-		plan.AddDecision("csip/export-limit", reason, impact)
-		// Use measured EV power (not commanded) so the battery backstop covers the
-		// gap while the EV is still ramping to its setpoint.  Cap at commanded so
-		// the battery retreats once the EV actually delivers its target current.
-		absorbedW += math.Min(ev.PowerW, newCurrentA*voltage)
-		surplusW -= newCurrentA * voltage
-		break // first active EVSE handles the limit; Rule 6 covers the rest
-	}
-
-	// ── Battery: backstop when EV alone cannot cover the projected excess ───────
-	remainingExcessW := math.Max(0, projectedExportW-conservativeW-absorbedW)
+	// ── Battery first: absorb bulk of excess up to rated charge power ─────────
 	for i, b := range batteries {
 		if remainingExcessW <= 1 {
 			break
@@ -428,27 +354,27 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		}
 		netNeeded := math.Max(0, remainingExcessW-alreadyAbsorbingW)
 		if netNeeded < 50 {
-			// Battery is absorbing at or above what's needed. Reduce toward
-			// the exact remaining excess so the battery backs off as the EV ramps.
+			// Battery already absorbing enough; reduce toward exact target so it
+			// backs off as the EV ramps up.
 			newSetpointW := math.Max(-remainingExcessW, b.PowerW)
 			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 				Name:      b.Name,
 				SetpointW: newSetpointW,
 			})
 			plan.AddDecision("csip/export-limit",
-				fmt.Sprintf("battery %s absorbing %.0fW, excess %.0fW; targeting %.0fW",
+				fmt.Sprintf("battery %s absorbing %.0fW, excess %.0fW; reducing to %.0fW",
 					b.Name, alreadyAbsorbingW, remainingExcessW, newSetpointW),
 				fmt.Sprintf("battery %s → %.0fW", b.Name, newSetpointW))
 			effectiveAbsorbW := math.Min(alreadyAbsorbingW, remainingExcessW)
 			remainingExcessW -= effectiveAbsorbW
 			absorbedW += effectiveAbsorbW
 			surplusW -= effectiveAbsorbW
+			batteries[i].PowerW = newSetpointW
 			continue
 		}
 		absorb := math.Min(b.AvailableChargeW(), netNeeded)
 		if absorb < 50 {
-			// Battery is at (or near) rated capacity — hold current rate so the
-			// restore rule does not idle it.
+			// Battery at rated capacity — hold so restore rule does not idle it.
 			if alreadyAbsorbingW > 0 {
 				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 					Name:      b.Name,
@@ -470,17 +396,85 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 			SetpointW: newSetpoint,
 		})
 		plan.AddDecision("csip/export-limit",
-			fmt.Sprintf("%.0fW excess after EV; charging battery %s with additional %.0fW",
+			fmt.Sprintf("%.0fW excess; charging battery %s with %.0fW",
 				remainingExcessW, b.Name, absorb),
 			fmt.Sprintf("battery %s setpoint → %.0fW", b.Name, newSetpoint))
-		remainingExcessW -= absorb + alreadyAbsorbingW
-		absorbedW += absorb + alreadyAbsorbingW
+		total := absorb + alreadyAbsorbingW
+		remainingExcessW -= total
+		absorbedW += total
 		batteries[i].PowerW = newSetpoint
 		surplusW -= absorb
 	}
 
+	// ── EV: absorb remaining excess with hysteretic setpoint ──────────────────
+	for i := range evses {
+		ev := &evses[i]
+		if !ev.Connected || !ev.SessionActive {
+			continue
+		}
+		if hasEVSECommand(plan.EVSECommands, ev.StationID, ev.ConnectorID) {
+			continue
+		}
+		voltage := ev.VoltageV
+		if voltage <= 0 {
+			voltage = 230.0
+		}
+		const minChargeA = 6.0 // IEC 61851-1 minimum AC charge current
+		proactiveA := math.Min(remainingExcessW/voltage, ev.MaxCurrentA)
+		// If the absorb target is nonzero but below the EVSE minimum, bump to
+		// minimum — the shortfall is imported from grid, which the export limit
+		// does not constrain.  If it's truly zero, leave it zero (no session load).
+		if proactiveA > 0 && proactiveA < minChargeA {
+			proactiveA = minChargeA
+		}
+
+		var newCurrentA float64
+		var reason, impact string
+
+		needsClamp := math.IsNaN(o.expGuard.evSetpointA) || actualExportW > conservativeW
+		switch {
+		case needsClamp:
+			newCurrentA = proactiveA
+			o.expGuard.evSetpointA = newCurrentA
+			reason = fmt.Sprintf(
+				"export %.0fW (lim %.0fW, target ≤%.0fW); battery absorbs %.0fW; EV targets remaining %.0fW",
+				actualExportW, limits.exportLimitW, conservativeW, absorbedW, remainingExcessW)
+			impact = fmt.Sprintf("EVSE %s → %.1fA [hold]", ev.StationID, newCurrentA)
+
+		case o.expGuard.safeCount >= relaxCycles:
+			newCurrentA = proactiveA
+			o.expGuard.evSetpointA = newCurrentA
+			o.expGuard.safeCount = 0
+			reason = fmt.Sprintf(
+				"export %.0fW safe for %d cycles; relaxing EV to proactive setpoint",
+				actualExportW, relaxCycles)
+			impact = fmt.Sprintf("EVSE %s → %.1fA", ev.StationID, newCurrentA)
+
+		default:
+			newCurrentA = o.expGuard.evSetpointA
+			reason = fmt.Sprintf(
+				"export %.0fW ≤ %.0fW; holding EV at %.1fA (%d/%d safe cycles)",
+				actualExportW, conservativeW, newCurrentA, o.expGuard.safeCount, relaxCycles)
+			impact = fmt.Sprintf("EVSE %s held at %.1fA", ev.StationID, newCurrentA)
+		}
+
+		plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+			StationID:   ev.StationID,
+			ConnectorID: ev.ConnectorID,
+			MaxCurrentA: newCurrentA,
+		})
+		plan.AddDecision("csip/export-limit", reason, impact)
+		// Credit measured EV power (not commanded) so the battery stays dispatched
+		// while the EV is still ramping.  Cap at commanded so battery retreats once
+		// the EV delivers its target current.
+		absorbedW += math.Min(ev.PowerW, newCurrentA*voltage)
+		surplusW -= newCurrentA * voltage
+		break // first active EVSE handles the limit; Rule 6 covers the rest
+	}
+
 	// ── Solar curtailment: last resort, only above the hard limit ───────────────
-	if remainingExcessW > 1 {
+	finalExcessW := math.Max(0, projectedExportW-conservativeW-absorbedW)
+	if finalExcessW > 1 {
 		totalSolarW := 0.0
 		for _, sol := range solar {
 			if sol.Connected {
@@ -488,7 +482,7 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 			}
 		}
 		if totalSolarW > 0 {
-			fraction := math.Min(1.0, remainingExcessW/totalSolarW)
+			fraction := math.Min(1.0, finalExcessW/totalSolarW)
 			for _, sol := range solar {
 				if !sol.Connected {
 					continue

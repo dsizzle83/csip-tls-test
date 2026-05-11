@@ -1748,7 +1748,7 @@ const SCENARIOS = [
       'The hub immediately dispatches the battery to charge at ~5 kW and ramps EV charging to absorb the rest — ' +
       'zero solar wasted, the customer earns self-consumption savings, and the grid sees exactly 1 kW.',
     initial: { solar_W: 8000, battery_soc: 40, load_W: 1000, ev_soc: 20, ev_session: true },
-    grid: { program: 1, exp_lim_W: 1000, duration_s: 300,
+    grid: { program: 0, exp_lim_W: 1000, duration_s: 300,
             description: 'Demo S1: export limit 1 kW', activate: true },
   },
   {
@@ -1763,7 +1763,7 @@ const SCENARIOS = [
       'violating the cap. The hub immediately suspends EV charging and dispatches the battery to discharge 1 kW, ' +
       'holding import to exactly 500 W. Customer avoids peak charges; grid is protected.',
     initial: { solar_W: 1000, battery_soc: 75, load_W: 2000, ev_soc: 20, ev_session: true },
-    grid: { program: 1, imp_lim_W: 500, duration_s: 300,
+    grid: { program: 0, imp_lim_W: 500, duration_s: 300,
             description: 'Demo S2: import cap 500 W', activate: true },
   },
   {
@@ -1778,7 +1778,7 @@ const SCENARIOS = [
       'It instantly suspends EV charging (removing ~3.7 kW EV load) and discharges the battery at 1.5 kW — ' +
       'all within one control cycle, no manual intervention.',
     initial: { solar_W: 3500, battery_soc: 50, load_W: 5000, ev_soc: 40, ev_session: true },
-    grid: { program: 1, imp_lim_W: 0, duration_s: 300,
+    grid: { program: 0, imp_lim_W: 0, duration_s: 300,
             description: 'Demo S3: emergency — zero import', activate: true },
   },
   {
@@ -1793,7 +1793,7 @@ const SCENARIOS = [
       'The hub throttles the EV to minimum current and discharges the battery at 2 kW, ' +
       'dropping PCC import from 3+ kW to 1 kW — exactly matching the DR obligation.',
     initial: { solar_W: 0, battery_soc: 60, load_W: 3000, ev_soc: 30, ev_session: true },
-    grid: { program: 1, imp_lim_W: 1000, duration_s: 1200,
+    grid: { program: 0, imp_lim_W: 1000, duration_s: 1200,
             description: 'Demo S4: DR dispatch — reduce import to 1 kW', activate: true },
   },
   {
@@ -1808,7 +1808,7 @@ const SCENARIOS = [
       'keeping export at the cap and storing energy for later peak-rate discharge. ' +
       'Solar is fully utilised — nothing curtailed, nothing wasted.',
     initial: { solar_W: 2000, battery_soc: 80, load_W: 1500, ev_soc: 60, ev_session: false },
-    grid: { program: 1, exp_lim_W: 500, duration_s: 300,
+    grid: { program: 0, exp_lim_W: 500, duration_s: 300,
             description: 'Demo S5: solar self-consumption with 500 W export cap', activate: true },
   },
 ];
