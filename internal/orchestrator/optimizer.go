@@ -399,7 +399,10 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 			MaxCurrentA: newCurrentA,
 		})
 		plan.AddDecision("csip/export-limit", reason, impact)
-		absorbedW += newCurrentA * voltage
+		// Use measured EV power (not commanded) so the battery backstop covers the
+		// gap while the EV is still ramping to its setpoint.  Cap at commanded so
+		// the battery retreats once the EV actually delivers its target current.
+		absorbedW += math.Min(ev.PowerW, newCurrentA*voltage)
 		surplusW -= newCurrentA * voltage
 		break // first active EVSE handles the limit; Rule 6 covers the rest
 	}
@@ -425,18 +428,21 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		}
 		netNeeded := math.Max(0, remainingExcessW-alreadyAbsorbingW)
 		if netNeeded < 50 {
-			// Already absorbing enough; re-issue current setpoint to hold it.
+			// Battery is absorbing at or above what's needed. Reduce toward
+			// the exact remaining excess so the battery backs off as the EV ramps.
+			newSetpointW := math.Max(-remainingExcessW, b.PowerW)
 			plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 				Name:      b.Name,
-				SetpointW: b.PowerW,
+				SetpointW: newSetpointW,
 			})
 			plan.AddDecision("csip/export-limit",
-				fmt.Sprintf("battery %s already absorbing %.0fW ≥ excess %.0fW; holding",
-					b.Name, alreadyAbsorbingW, remainingExcessW),
-				fmt.Sprintf("battery %s holds %.0fW", b.Name, b.PowerW))
-			remainingExcessW -= alreadyAbsorbingW
-			absorbedW += alreadyAbsorbingW
-			surplusW -= alreadyAbsorbingW
+				fmt.Sprintf("battery %s absorbing %.0fW, excess %.0fW; targeting %.0fW",
+					b.Name, alreadyAbsorbingW, remainingExcessW, newSetpointW),
+				fmt.Sprintf("battery %s → %.0fW", b.Name, newSetpointW))
+			effectiveAbsorbW := math.Min(alreadyAbsorbingW, remainingExcessW)
+			remainingExcessW -= effectiveAbsorbW
+			absorbedW += effectiveAbsorbW
+			surplusW -= effectiveAbsorbW
 			continue
 		}
 		absorb := math.Min(b.AvailableChargeW(), netNeeded)
