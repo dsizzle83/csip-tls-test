@@ -303,7 +303,18 @@ a { color: #60a5fa; }
 
 <!-- ── Chart ──────────────────────────────────────────────────── -->
 <div class="card" style="padding:12px 16px 8px;">
-  <h3>Power history (last 5 min)</h3>
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+    <h3 style="margin:0;flex:1;">Power history</h3>
+    <span id="chart-pt-count" style="font-size:11px;color:#475569;"></span>
+    <button id="chart-pause-btn" onclick="toggleChartPause()"
+      style="font-size:11px;padding:3px 10px;border-radius:4px;border:1px solid #334155;background:#1e293b;color:#94a3b8;cursor:pointer;">
+      ⏸ Pause
+    </button>
+    <button onclick="downloadCSV()"
+      style="font-size:11px;padding:3px 10px;border-radius:4px;border:1px solid #334155;background:#1e293b;color:#94a3b8;cursor:pointer;">
+      ⬇ Save CSV
+    </button>
+  </div>
   <div class="chart-wrap"><canvas id="power-chart"></canvas></div>
 </div>
 
@@ -736,9 +747,10 @@ a { color: #60a5fa; }
 'use strict';
 
 // ── Chart ──────────────────────────────────────────────────────────────────────
-const MAX_PTS = 60;
 const chartLabels = [];
 const chartData = { solar: [], battery: [], grid: [], load: [], ev: [] };
+const chartEvents = []; // {idx, label} — scenario annotations for CSV export
+let chartPaused = false;
 
 const chart = new Chart(document.getElementById('power-chart').getContext('2d'), {
   type: 'line',
@@ -763,17 +775,48 @@ const chart = new Chart(document.getElementById('power-chart').getContext('2d'),
 });
 
 function pushChart(time, solar, battery, grid, load, ev) {
+  if (chartPaused) return;
   chartLabels.push(new Date(time).toLocaleTimeString());
   chartData.solar.push(solar);
   chartData.battery.push(battery);
   chartData.grid.push(isNaN(grid) ? null : grid);
   chartData.load.push(isNaN(load) ? null : load);
   chartData.ev.push(isNaN(ev) ? null : ev);
-  if (chartLabels.length > MAX_PTS) {
-    chartLabels.shift();
-    Object.values(chartData).forEach(d => d.shift());
-  }
+  const n = chartLabels.length;
+  document.getElementById('chart-pt-count').textContent = n + ' pts';
   chart.update('none');
+}
+
+function markChartEvent(label) {
+  if (!chartPaused) chartEvents.push({idx: chartLabels.length, label});
+}
+
+function toggleChartPause() {
+  chartPaused = !chartPaused;
+  const btn = document.getElementById('chart-pause-btn');
+  btn.textContent = chartPaused ? '▶ Resume' : '⏸ Pause';
+  btn.style.color  = chartPaused ? '#4ade80' : '#94a3b8';
+}
+
+function downloadCSV() {
+  const keys = ['solar', 'battery', 'grid', 'load', 'ev'];
+  const header = 'time,solar_W,battery_W,grid_W,load_W,ev_W,event\n';
+  const evMap = {};
+  chartEvents.forEach(e => { evMap[e.idx] = (evMap[e.idx] ? evMap[e.idx] + ' | ' : '') + e.label; });
+  const rows = chartLabels.map((t, i) =>
+    [t, ...keys.map(k => chartData[k][i] ?? ''), evMap[i] ?? ''].join(',')
+  ).join('\n');
+
+  const scLog = document.getElementById('sc-log')?.innerText || '';
+  const hubLog = document.getElementById('log-stream')?.innerText || '';
+  const notes = '# Scenario log\n' + scLog + '\n\n# Hub log\n' + hubLog;
+
+  const blob = new Blob([header + rows + '\n\n' + notes.split('\n').map(l => '# ' + l).join('\n')],
+                        {type: 'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'csip-hub-' + new Date().toISOString().replace(/[:.]/g,'-').slice(0,19) + '.csv';
+  a.click();
 }
 
 // ── Page-level tab switching ───────────────────────────────────────────────────
@@ -1916,6 +1959,7 @@ async function setupScenario() {
   scLog('─'.repeat(48), 'hdr');
   scLog('Scene set — grid unconstrained, hub holding devices at initial state.', 'rdy');
   scLog('Press  ⚡ Send Grid Event  to activate the utility constraint.', 'rdy');
+  markChartEvent('SETUP: ' + sc.title);
   setStatus('sc-run-status', '✓ Scene ready', '#4ade80');
   document.getElementById('sc-setup-btn').disabled = false;
   document.getElementById('sc-event-btn').disabled = false;
@@ -1949,6 +1993,7 @@ async function sendDERControl() {
 
   // Enable live meter feedback: pollHub will now push Grid.NetW = load + EV - solar - battery
   // to metersim every 2 s so the hub gets accurate real-time grid readings as devices respond.
+  markChartEvent('EVENT: ' + sc.grid.description);
   scenarioDERActive = true;
   lastMeterUpdateMs = 0;
 
