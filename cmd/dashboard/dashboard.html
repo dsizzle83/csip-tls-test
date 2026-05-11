@@ -1997,6 +1997,20 @@ async function sendDERControl() {
   scenarioDERActive = true;
   lastMeterUpdateMs = 0;
 
+  // Push meter immediately so the hub sees the real grid balance on its next poll
+  // rather than waiting up to 2 s for the first pollHub feedback cycle.
+  // At event-start: EV=0 W (session just began), battery=0 W (idled during setup).
+  if (scenarioSiteLoadW !== null) {
+    const solarW = ini.solar_W ?? 0;
+    const meterNow = scenarioSiteLoadW - solarW; // + evW(0) - batteryW(0)
+    fetch('/api/meter/inject', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({W_W: meterNow}),
+    }).catch(() => {});
+    lastMeterUpdateMs = Date.now();
+  }
+
   scLog('─'.repeat(48), 'hdr');
   scLog('Grid event active — hub is responding.', 'rdy');
   scLog('Watch Solar / Battery / EV / Grid values update above.', 'rdy');

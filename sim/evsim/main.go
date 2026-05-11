@@ -22,6 +22,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -133,7 +134,7 @@ func main() {
 				log.Printf("evsim: Heartbeat: %v", err)
 			}
 		case <-sessionTicker.C:
-			go simulateSession(cs, h, 1, time.Duration(*sessionDuration)*time.Second)
+			h.startSession(cs, 1, time.Duration(*sessionDuration)*time.Second)
 		}
 	}
 }
@@ -246,16 +247,47 @@ func (b *evBattery) State() (soc, actualA, sessionWh float64) {
 
 // ── Session simulation ────────────────────────────────────────────────────────
 
-func simulateSession(cs ocpp2.ChargingStation, h *csHandler, connectorID int, maxDuration time.Duration) {
+// startSession cancels any running session and starts a new one.
+func (h *csHandler) startSession(cs ocpp2.ChargingStation, connectorID int, maxDuration time.Duration) {
+	h.mu.Lock()
+	if h.sessionCancel != nil {
+		h.sessionCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	h.sessionCancel = cancel
+	h.mu.Unlock()
+
+	go simulateSession(ctx, cs, h, connectorID, maxDuration)
+}
+
+// cancelSession stops any running session goroutine and sends Available status.
+func (h *csHandler) cancelSession(cs ocpp2.ChargingStation, connectorID int) {
+	h.mu.Lock()
+	cancel := h.sessionCancel
+	h.sessionCancel = nil
+	h.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	sendStatus(cs, h, connectorID, availability.ConnectorStatusAvailable)
+	h.setSessionActive(connectorID, false)
+}
+
+func simulateSession(ctx context.Context, cs ocpp2.ChargingStation, h *csHandler, connectorID int, maxDuration time.Duration) {
 	log.Printf("evsim: connector %d — session starting (max %v, SOC=%.1f%%)",
 		connectorID, maxDuration, func() float64 { soc, _, _ := h.batt.State(); return soc }())
 	h.batt.ResetSession()
 	h.setSessionActive(connectorID, true)
 	sendStatus(cs, h, connectorID, availability.ConnectorStatusOccupied)
 
-	runChargingLoop(cs, h, connectorID, maxDuration)
+	cancelled := runChargingLoop(ctx, cs, h, connectorID, maxDuration)
 
-	// Final reading before closing.
+	if cancelled {
+		log.Printf("evsim: connector %d — session cancelled", connectorID)
+		return // cancelSession already sent Available and cleared state
+	}
+
+	// Natural end (battery full or deadline).
 	soc, cur, energy := h.batt.State()
 	sendMeterValues(cs, h.batt, connectorID, soc, cur, energy)
 	sendStatus(cs, h, connectorID, availability.ConnectorStatusAvailable)
@@ -266,8 +298,9 @@ func simulateSession(cs ocpp2.ChargingStation, h *csHandler, connectorID int, ma
 }
 
 // runChargingLoop drives the battery simulation and periodic MeterValues until
-// maxDuration elapses or the battery reaches 100% SOC.
-func runChargingLoop(cs ocpp2.ChargingStation, h *csHandler, connectorID int, maxDuration time.Duration) {
+// maxDuration elapses, the battery reaches 100% SOC, or ctx is cancelled.
+// Returns true if cancelled via context.
+func runChargingLoop(ctx context.Context, cs ocpp2.ChargingStation, h *csHandler, connectorID int, maxDuration time.Duration) (cancelled bool) {
 	simTicker := time.NewTicker(time.Second)
 	defer simTicker.Stop()
 	meterTicker := time.NewTicker(h.meterInterval)
@@ -277,17 +310,19 @@ func runChargingLoop(cs ocpp2.ChargingStation, h *csHandler, connectorID int, ma
 
 	for {
 		select {
+		case <-ctx.Done():
+			return true
 		case <-simTicker.C:
 			_, full := h.batt.Tick(time.Second)
 			if full {
 				log.Printf("evsim: connector %d — battery full (100%% SOC)", connectorID)
-				return
+				return false
 			}
 		case <-meterTicker.C:
 			soc, cur, energy := h.batt.State()
 			sendMeterValues(cs, h.batt, connectorID, soc, cur, energy)
 		case <-deadline.C:
-			return
+			return false
 		}
 	}
 }
@@ -408,6 +443,9 @@ type csHandler struct {
 	session       sessionInfo
 	lastHeartbeat time.Time
 	lastProfile   *chargingProfileInfo
+
+	// session cancellation — guarded by mu
+	sessionCancel context.CancelFunc
 }
 
 func (h *csHandler) setConnected(v bool)            { h.mu.Lock(); h.connected = v; h.mu.Unlock() }
@@ -495,10 +533,9 @@ func (h *csHandler) Inject(cs ocpp2.ChargingStation, body []byte) error {
 			if v, ok := req["duration_s"].(float64); ok && v > 0 {
 				dur = time.Duration(v) * time.Second
 			}
-			go simulateSession(cs, h, cid, dur)
+			h.startSession(cs, cid, dur)
 		case "stop_session":
-			sendStatus(cs, h, cid, availability.ConnectorStatusAvailable)
-			h.setSessionActive(cid, false)
+			h.cancelSession(cs, cid)
 		case "set_soc":
 			if v, ok := req["soc_pct"].(float64); ok {
 				h.batt.mu.Lock()
