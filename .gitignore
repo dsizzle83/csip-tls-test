@@ -8,6 +8,14 @@ logs/
 run_demo.txt
 demo-pis.txt
 
+# Root-level binaries (arm64 builds dropped here by cross-compile workflow)
+/evsim
+/metersim
+/modsim-conformance
+
+# Python virtual environment
+gui/.venv/
+
 # Private keys — never commit, ever.
 # This catches server-key.pem, client-key.pem, vault/ca-key.pem, test keys, all of them.
 *-key.pem

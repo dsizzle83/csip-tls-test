@@ -9,7 +9,7 @@ set -euo pipefail
 
 # Find the repo root regardless of where this script is invoked from.
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SERVER_CERTS="$REPO_ROOT/internal/tlsserver/testdata/certs"
+SERVER_CERTS="$REPO_ROOT/sim/tlsserver/testdata/certs"
 CLIENT_CERTS="$REPO_ROOT/internal/tlsclient/testdata/certs"
 
 WORK=$(mktemp -d)
