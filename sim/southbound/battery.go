@@ -464,14 +464,14 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW, wmaxKwh float64, bases Bat
 			hw := hubBatteryW(r, m123Base, wmaxW)
 
 			var w, soc float64
+			// pendingSoC is sticky across free-running ticks so an operator
+			// inject is preserved through the window between "resume" and the
+			// hub picking up the new DERControl.  It is consumed only by the
+			// hub-controlled branch, which uses it to seed the integrator.
 			if !math.IsNaN(hw) {
 				// Hub-controlled: integrate SoC from actual power.
 				w = hw
 				socMu.Lock()
-				// A POST /inject {"SoC_pct": X} always wins, even if the
-				// integrator has already been seeded by a previous run.
-				// Without this, repeated demo cycles drift away from the
-				// freshly-injected setup value.
 				if ptr := pendingSoC.Swap(nil); ptr != nil {
 					socPct = *ptr
 					socSeeded = true
@@ -489,6 +489,18 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW, wmaxKwh float64, bases Bat
 				socPct = math.Max(0, math.Min(100, socPct+dsoc))
 				soc = socPct
 				socMu.Unlock()
+			} else if ptr := pendingSoC.Load(); ptr != nil {
+				// Free-running but operator has set an SoC: hold the injected
+				// value (and keep the battery idle at whatever W the register
+				// already shows) until the hub takes control.
+				socMu.Lock()
+				socPct = *ptr
+				socSeeded = false
+				soc = socPct
+				socMu.Unlock()
+				w = sunspec.ApplyScaleSigned(
+					r.Get(m103Base+sunspec.M103_W),
+					int16(r.Get(m103Base+sunspec.M103_W_SF)))
 			} else {
 				// Free-running: sinusoidal cycle; reset so next hub command re-seeds.
 				soc = 55.0 + 35.0*math.Sin(phase)
