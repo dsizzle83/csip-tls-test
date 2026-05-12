@@ -468,16 +468,17 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW, wmaxKwh float64, bases Bat
 				// Hub-controlled: integrate SoC from actual power.
 				w = hw
 				socMu.Lock()
-				if !socSeeded {
-					// Prefer an injected SOC value (from POST /inject) over the
-					// register, which may have been overwritten by a free-running tick.
-					if ptr := pendingSoC.Swap(nil); ptr != nil {
-						socPct = *ptr
-					} else {
-						raw := r.Get(m802Base + uint16(sunspec.M802_SoC))
-						sf := int16(r.Get(m802Base + uint16(sunspec.M802_SoC_SF)))
-						socPct = sunspec.ApplyScaleUint(raw, sf)
-					}
+				// A POST /inject {"SoC_pct": X} always wins, even if the
+				// integrator has already been seeded by a previous run.
+				// Without this, repeated demo cycles drift away from the
+				// freshly-injected setup value.
+				if ptr := pendingSoC.Swap(nil); ptr != nil {
+					socPct = *ptr
+					socSeeded = true
+				} else if !socSeeded {
+					raw := r.Get(m802Base + uint16(sunspec.M802_SoC))
+					sf := int16(r.Get(m802Base + uint16(sunspec.M802_SoC_SF)))
+					socPct = sunspec.ApplyScaleUint(raw, sf)
 					socSeeded = true
 				}
 				// Effective simulation seconds per real tick includes speed factor.
