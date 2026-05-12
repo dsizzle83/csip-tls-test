@@ -11,9 +11,11 @@ import (
 
 // exportGuard carries state across ticks for the conservative export-limit rule.
 type exportGuard struct {
-	evSetpointA  float64 // last EV current limit issued; math.NaN until first command
-	safeCount    int     // consecutive ticks where actual export ≤ conservative target
-	activeLimitW float64 // limit value when guard was reset; math.NaN = no active limit
+	evSetpointA     float64 // last EV current limit issued; NaN until first command
+	batteryAbsorbW  float64 // last battery absorption (positive watts) commanded; NaN = none
+	safeCount       int     // consecutive ticks where actual export ≤ conservative target
+	activeLimitW    float64 // limit value when guard was reset; NaN = no active limit
+	filteredExportW float64 // low-pass-filtered actual export, used by the controller
 }
 
 // DefaultOptimizer is a rule-based + heuristic optimizer.
@@ -67,9 +69,14 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 		SOCReserve:           20.0,
 		SOCFullThreshold:     95.0,
 		ExcessSolarThreshold: 100.0,
-		ExportMarginFrac:     0.15,
+		ExportMarginFrac:     0.20,
 		ExportRelaxCycles:    5,
-		expGuard:             exportGuard{evSetpointA: math.NaN(), activeLimitW: math.NaN()},
+		expGuard: exportGuard{
+			evSetpointA:     math.NaN(),
+			batteryAbsorbW:  math.NaN(),
+			activeLimitW:    math.NaN(),
+			filteredExportW: math.NaN(),
+		},
 	}
 }
 
@@ -288,18 +295,18 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	batteries []BatteryState, plan *Plan,
 ) ([]BatteryState, float64) {
 	if math.IsNaN(limits.exportLimitW) {
-		o.expGuard = exportGuard{evSetpointA: math.NaN(), activeLimitW: math.NaN()}
+		o.expGuard = exportGuard{evSetpointA: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: math.NaN(), filteredExportW: math.NaN()}
 		return batteries, surplusW
 	}
 
 	// New limit value → start the guard fresh.
 	if limits.exportLimitW != o.expGuard.activeLimitW {
-		o.expGuard = exportGuard{evSetpointA: math.NaN(), activeLimitW: limits.exportLimitW}
+		o.expGuard = exportGuard{evSetpointA: math.NaN(), activeLimitW: limits.exportLimitW, filteredExportW: math.NaN()}
 	}
 
 	margin := o.ExportMarginFrac
 	if margin <= 0 {
-		margin = 0.15
+		margin = 0.20
 	}
 	relaxCycles := o.ExportRelaxCycles
 	if relaxCycles <= 0 {
@@ -307,9 +314,8 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 	conservativeW := limits.exportLimitW * (1.0 - margin)
 
+	// ── Inputs ────────────────────────────────────────────────────────────────
 	// Signed net export at the meter: positive = exporting, negative = importing.
-	// Keep the sign so the conservation identity below stays correct when the
-	// site is currently importing (e.g. because the EV is drawing heavily).
 	signedNetExportW := math.NaN()
 	if !math.IsNaN(netW) {
 		signedNetExportW = -netW
@@ -325,120 +331,184 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 	actualExportW := math.Max(0, signedNetExportW)
 
-	// Track consecutive ticks below the conservative target.
-	if actualExportW <= conservativeW {
+	// Low-pass filter the measured export.  The meter and OCPP MeterValues update
+	// on different cadences (5 s vs 10 s) and the Modbus battery poll is offset
+	// from both; an unfiltered controller bites itself on every desync.
+	// alpha = 0.4 → ~63 % settled in 2 ticks, ~95 % in 5 ticks.
+	const filterAlpha = 0.4
+	if math.IsNaN(o.expGuard.filteredExportW) {
+		o.expGuard.filteredExportW = actualExportW
+	} else {
+		o.expGuard.filteredExportW = filterAlpha*actualExportW + (1-filterAlpha)*o.expGuard.filteredExportW
+	}
+	filteredExportW := o.expGuard.filteredExportW
+
+	if filteredExportW <= conservativeW {
 		o.expGuard.safeCount++
 	} else {
 		o.expGuard.safeCount = 0
 	}
 
-	// Sum current battery absorption across all connected batteries.
-	totalBatteryAbsorbW := 0.0
+	// Measured battery absorption *before* we issue any commands this tick.
+	// This is the quantity needed by the conservation identity, since signedNet
+	// from the meter reflects whatever the battery was doing prior to this tick.
+	measuredBatteryAbsorbW := 0.0
 	for _, b := range batteries {
 		if b.Connected && b.PowerW < 0 {
-			totalBatteryAbsorbW += -b.PowerW
+			measuredBatteryAbsorbW += -b.PowerW
 		}
 	}
+	// Unconstrained export at the site = (solar − load).  Conservation identity
+	// using the meter reading, which already reflects current battery and EV.
+	unconstrainedExportW := signedNetExportW + measuredBatteryAbsorbW + evseW
 
-	// Conservation identity: if we removed the battery and the EV, export at
-	// the meter would be (signed net export) + (battery absorption) + (EV
-	// consumption).  Using the signed value keeps the math correct whether the
-	// site is currently exporting or importing.  This signal is stable across
-	// device-setpoint changes (modulo meter-poll lag) because it cancels out
-	// the contributions of the two devices it is controlling.
-	unconstrainedExportW := signedNetExportW + totalBatteryAbsorbW + evseW
-	totalAbsorptionNeededW := math.Max(0, unconstrainedExportW-conservativeW)
-	remainingAbsorptionW := totalAbsorptionNeededW
-	absorbedW := 0.0
-
-	// ── Battery first: absorb up to rated charge power ────────────────────────
+	// ── Battery: pinned to MaxChargeW for the duration of the event ──────────
+	// The battery is the workhorse; once an export limit is live and SOC < full
+	// it absorbs at its rated charge power and stays there.  We don't try to
+	// trim it cycle-by-cycle — that's what caused the oscillation under lag.
+	batteryAbsorbW := 0.0 // commanded absorption after this tick
 	for i, b := range batteries {
-		if remainingAbsorptionW <= 1 {
-			// No excess to manage — leave the battery to downstream rules
-			// (self-consumption, DR/TOU).  Idling it here would just fight
-			// applySelfConsumptionRule on the next pass.
-			continue
-		}
-		if !b.Connected {
-			continue
-		}
-		if hasBatteryCommand(plan.BatteryCommands, b.Name) {
+		if !b.Connected || hasBatteryCommand(plan.BatteryCommands, b.Name) {
 			continue
 		}
 		if !math.IsNaN(b.SOC) && b.SOC >= socFull {
 			continue
 		}
-		// Assign target absolute absorption from this battery, capped by its
-		// rated charge power. Note we use MaxChargeW (absolute capability), not
-		// AvailableChargeW (headroom from current setpoint), so the command is
-		// an absolute setpoint rather than a delta.
-		absorb := math.Min(b.MaxChargeW, remainingAbsorptionW)
+		if b.MaxChargeW < 50 {
+			continue
+		}
+		// Battery target = the absorption needed to bring the unconstrained
+		// surplus down to the conservative target, capped by rated charge power.
+		need := math.Max(0, unconstrainedExportW-conservativeW)
+		absorb := math.Min(b.MaxChargeW, need)
+
+		// Ratchet: once we've commanded a battery absorption during this limit
+		// episode, don't reduce it just because the next tick's unconstrained
+		// estimate dipped — that's almost certainly OCPP/Modbus poll lag, not
+		// a real change in solar−load.  Only allow reduction after the meter
+		// has been under the conservative target for `relaxCycles` consecutive
+		// ticks (≈ one full meter+OCPP poll window).
+		if !math.IsNaN(o.expGuard.batteryAbsorbW) && o.expGuard.batteryAbsorbW > absorb {
+			if o.expGuard.safeCount < relaxCycles {
+				absorb = o.expGuard.batteryAbsorbW
+			} else {
+				// Sustained undershoot: relax half-way toward the new target.
+				absorb = (absorb + o.expGuard.batteryAbsorbW) / 2
+			}
+		}
+		absorb = math.Min(absorb, b.MaxChargeW)
+
 		if absorb < 50 {
 			continue
 		}
-		newSetpoint := -absorb
+		setpoint := -absorb
 		plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
 			Name:      b.Name,
-			SetpointW: newSetpoint,
+			SetpointW: setpoint,
 		})
 		plan.AddDecision("csip/export-limit",
-			fmt.Sprintf("export limit %.0fW (target ≤%.0fW); unconstrained export %.0fW; battery %s absorbs %.0fW",
+			fmt.Sprintf("export limit %.0fW (target ≤%.0fW); unconstrained %.0fW; battery %s absorbs %.0fW",
 				limits.exportLimitW, conservativeW, unconstrainedExportW, b.Name, absorb),
-			fmt.Sprintf("battery %s setpoint → %.0fW", b.Name, newSetpoint))
-		remainingAbsorptionW -= absorb
-		absorbedW += absorb
-		batteries[i].PowerW = newSetpoint
+			fmt.Sprintf("battery %s → %.0fW", b.Name, setpoint))
+		batteries[i].PowerW = setpoint
+		batteryAbsorbW += absorb
 		surplusW -= absorb
 	}
-
-	// ── EV: absorb any remaining excess after battery ─────────────────────────
-	// Only engage when there is unconstrained excess to manage.  If there is
-	// none, Rule 6 (applyEVChargingRule) handles the EV at full rate.  If the
-	// batteries cover the full absorption need we still hold the EV at the IEC
-	// 61851 minimum so the session doesn't drop — grid import doesn't violate
-	// an export limit.
-	if totalAbsorptionNeededW >= 50 {
-		for i := range evses {
-			ev := &evses[i]
-			if !ev.Connected || !ev.SessionActive {
-				continue
-			}
-			if hasEVSECommand(plan.EVSECommands, ev.StationID, ev.ConnectorID) {
-				continue
-			}
-			voltage := ev.VoltageV
-			if voltage <= 0 {
-				voltage = 230.0
-			}
-			const minChargeA = 6.0 // IEC 61851-1 minimum AC charge current
-
-			targetA := math.Min(remainingAbsorptionW/voltage, ev.MaxCurrentA)
-			if targetA < minChargeA {
-				targetA = minChargeA // never suspend just because batteries cover the load
-			}
-
-			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
-				StationID:   ev.StationID,
-				ConnectorID: ev.ConnectorID,
-				MaxCurrentA: targetA,
-			})
-			plan.AddDecision("csip/export-limit",
-				fmt.Sprintf("unconstrained export %.0fW; battery absorbs %.0fW; EV absorbs remaining %.0fW",
-					unconstrainedExportW, absorbedW, math.Max(0, remainingAbsorptionW)),
-				fmt.Sprintf("EVSE %s → %.1fA", ev.StationID, targetA))
-			evAbsorbW := math.Min(remainingAbsorptionW, targetA*voltage)
-			absorbedW += math.Max(0, evAbsorbW)
-			remainingAbsorptionW = math.Max(0, remainingAbsorptionW-targetA*voltage)
-			surplusW -= targetA * voltage
-			o.expGuard.evSetpointA = targetA
-			break // first active EVSE handles the limit; Rule 6 covers the rest
-		}
-	} else {
-		o.expGuard.evSetpointA = math.NaN()
+	if batteryAbsorbW > 0 {
+		o.expGuard.batteryAbsorbW = batteryAbsorbW
 	}
 
-	// ── Solar curtailment: last resort, only above the hard limit ───────────────
-	finalExcessW := math.Max(0, unconstrainedExportW-conservativeW-absorbedW)
+	// ── EV: trim the residual with a filtered P-controller ───────────────────
+	// Find the first active EVSE; we control one per export-limit event.
+	var ev *EVSEState
+	for i := range evses {
+		if evses[i].Connected && evses[i].SessionActive &&
+			!hasEVSECommand(plan.EVSECommands, evses[i].StationID, evses[i].ConnectorID) {
+			ev = &evses[i]
+			break
+		}
+	}
+
+	if ev != nil {
+		voltage := ev.VoltageV
+		if voltage <= 0 {
+			voltage = 230.0
+		}
+		const (
+			minChargeA  = 6.0   // IEC 61851-1 minimum AC charge current
+			deadbandW   = 200.0 // ignore controller errors smaller than this
+			tightenGain = 1.0   // P-gain for "more EV": correct full error in 1 tick
+			relaxGain   = 0.5   // P-gain for "less EV": back off half-rate, asymmetric
+		)
+
+		var newCurrentA float64
+		var reason string
+
+		// Use the conservation identity for the initial setpoint so we start
+		// in-the-ballpark rather than ramping up from 6 A.  After that, drive
+		// the setpoint with the filtered meter signal.
+		if math.IsNaN(o.expGuard.evSetpointA) {
+			unconstrainedExportW := signedNetExportW + batteryAbsorbW + evseW
+			residualNeed := unconstrainedExportW - batteryAbsorbW - conservativeW
+			startA := math.Min(math.Max(residualNeed/voltage, minChargeA), ev.MaxCurrentA)
+			newCurrentA = startA
+			reason = fmt.Sprintf(
+				"initial EV setpoint: unconstrained %.0fW − battery %.0fW − target %.0fW → %.1fA",
+				unconstrainedExportW, batteryAbsorbW, conservativeW, newCurrentA)
+		} else {
+			error := filteredExportW - conservativeW // positive = over the target
+			switch {
+			case error > deadbandW:
+				// Over target → tighten immediately (full proportional step).
+				delta := tightenGain * error / voltage
+				newCurrentA = math.Min(o.expGuard.evSetpointA+delta, ev.MaxCurrentA)
+				reason = fmt.Sprintf(
+					"filtered export %.0fW > target %.0fW; tighten EV by %.1fA",
+					filteredExportW, conservativeW, delta)
+			case error < -deadbandW && o.expGuard.safeCount >= relaxCycles:
+				// Sustained undershoot → relax slowly so we don't sawtooth.
+				// One relax step per N safe cycles ("N consecutive ticks
+				// under target before reducing").
+				delta := relaxGain * error / voltage // delta is negative
+				newCurrentA = math.Max(o.expGuard.evSetpointA+delta, minChargeA)
+				o.expGuard.safeCount = 0 // require another N cycles to relax again
+				reason = fmt.Sprintf(
+					"under target %.0fW vs %.0fW for ≥%d cycles; relax EV by %.1fA",
+					filteredExportW, conservativeW, relaxCycles, -delta)
+			default:
+				// Inside deadband or not yet earned a relax — hold the setpoint.
+				newCurrentA = o.expGuard.evSetpointA
+				reason = fmt.Sprintf(
+					"holding EV at %.1fA (filtered export %.0fW, target %.0fW, safe %d/%d)",
+					newCurrentA, filteredExportW, conservativeW, o.expGuard.safeCount, relaxCycles)
+			}
+		}
+
+		plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+			StationID:   ev.StationID,
+			ConnectorID: ev.ConnectorID,
+			MaxCurrentA: newCurrentA,
+		})
+		plan.AddDecision("csip/export-limit", reason,
+			fmt.Sprintf("EVSE %s → %.1fA", ev.StationID, newCurrentA))
+		o.expGuard.evSetpointA = newCurrentA
+		surplusW -= newCurrentA * voltage
+	}
+
+	// ── Solar curtailment: last resort, only when the limit is still exceeded ─
+	// Curtailment is a hard-fault safety net, not a control variable, so it
+	// reads the unfiltered measured export.  EV-driven absorption uses the
+	// commanded setpoint (predicted steady-state) so we don't double-curtail
+	// while the OCPP MeterValues / Modbus polls are still catching up.
+	commandedEvW := evseW
+	if ev != nil && !math.IsNaN(o.expGuard.evSetpointA) {
+		voltage := ev.VoltageV
+		if voltage <= 0 {
+			voltage = 230.0
+		}
+		commandedEvW = o.expGuard.evSetpointA * voltage
+	}
+	finalExcessW := math.Max(0, unconstrainedExportW-conservativeW-batteryAbsorbW-commandedEvW)
 	if finalExcessW > 1 {
 		totalSolarW := 0.0
 		for _, sol := range solar {

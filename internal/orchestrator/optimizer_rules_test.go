@@ -226,8 +226,8 @@ func TestExportLimitRule_CurtailsSolarWhenBatteryFull(t *testing.T) {
 
 func TestExportLimitRule_CurtailsProportionally(t *testing.T) {
 	// Two inverters: 6 kW and 4 kW. Export limit 2 kW. Battery full.
-	// Conservative target = 2000 * 0.85 = 1700 W (15% margin).
-	// Excess = 10000 - 1700 = 8300 W. Fraction = 0.83 → pv1→1020W, pv2→680W.
+	// Conservative target = 2000 * 0.80 = 1600 W (20% margin).
+	// Excess = 10000 - 1600 = 8400 W. Fraction = 0.84 → pv1→960W, pv2→640W.
 	solar := []SolarState{ruleSol("pv1", 6000), ruleSol("pv2", 4000)}
 	bats := []BatteryState{ruleBat("bat", 0, 96, 5000)} // SOC above threshold
 	limits := gridConstraints{exportLimitW: 2000, importLimitW: math.NaN(), maxLimitW: math.NaN()}
@@ -238,12 +238,11 @@ func TestExportLimitRule_CurtailsProportionally(t *testing.T) {
 	if len(plan.SolarCommands) != 2 {
 		t.Fatalf("expected 2 solar commands, got %d", len(plan.SolarCommands))
 	}
-	// fraction = 8300/10000 = 0.83; pv1 → 6000*0.17=1020, pv2 → 4000*0.17=680
-	if math.Abs(plan.SolarCommands[0].CurtailToW-1020) > 1 {
-		t.Errorf("pv1 curtailTo = %.0fW, want 1020W", plan.SolarCommands[0].CurtailToW)
+	if math.Abs(plan.SolarCommands[0].CurtailToW-960) > 1 {
+		t.Errorf("pv1 curtailTo = %.0fW, want 960W", plan.SolarCommands[0].CurtailToW)
 	}
-	if math.Abs(plan.SolarCommands[1].CurtailToW-680) > 1 {
-		t.Errorf("pv2 curtailTo = %.0fW, want 680W", plan.SolarCommands[1].CurtailToW)
+	if math.Abs(plan.SolarCommands[1].CurtailToW-640) > 1 {
+		t.Errorf("pv2 curtailTo = %.0fW, want 640W", plan.SolarCommands[1].CurtailToW)
 	}
 }
 
