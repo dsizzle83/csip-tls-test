@@ -898,37 +898,13 @@ async function pollHub() {
       updateHubEVCard(ev);
     }
 
-    // Site load: fixed scenario background consumption when a scenario is active;
-    // otherwise inferred by hub (solar + battery + grid - EV).
-    // Grid: computed from power balance when scenario is active so it reflects
-    // actual device readings rather than a frozen/stale meter reading.
-    let load, grid;
-    if (scenarioSiteLoadW !== null) {
-      load = scenarioSiteLoadW;
-      grid = load + evW - solar - battery; // positive = importing, negative = exporting
-    } else {
-      load = p.load_W ?? 0;
-      grid = p.grid_W ?? 0;
-    }
-
-    // After the grid event fires, keep the metersim reading in sync with what
-    // the hub is actually dispatching.  This gives the hub accurate feedback so
-    // it makes proportional decisions (no phantom EV runaway from a stale meter).
-    // M201_W convention: negative = exporting, positive = importing.
-    // Battery is intentionally excluded: including it creates a feedback loop where
-    // battery charging → meter shows import → hub idles battery → export returns.
-    if (scenarioDERActive && scenarioSiteLoadW !== null) {
-      const now = Date.now();
-      if (now - lastMeterUpdateMs > 2000) {
-        lastMeterUpdateMs = now;
-        const meterW = scenarioSiteLoadW + evW - solar;
-        fetch('/api/meter/inject', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({W_W: meterW}),
-        }).catch(() => {});
-      }
-    }
+    // Site load: hub doesn't measure load directly; during a scenario we know the
+    // synthetic load setpoint, otherwise the hub infers it from solar+battery+grid-EV.
+    // Grid: always read from the hub, which reads metersim. In linked mode metersim
+    // computes meter_W = load + ev - solar - battery from real device APIs, so hub
+    // and dashboard see the same grid number.
+    const load = scenarioSiteLoadW !== null ? scenarioSiteLoadW : (p.load_W ?? 0);
+    const grid = p.grid_W ?? 0;
 
     setText('load-w', fmt(load) + ' W');
 
@@ -1815,8 +1791,6 @@ const SCENARIOS = [
 
 let selectedScenario    = null;
 let scenarioSiteLoadW   = null;  // fixed site load for active scenario; null = use hub inference
-let scenarioDERActive   = false; // true after grid event is sent; enables live meter feedback
-let lastMeterUpdateMs   = 0;     // throttle meter injection to ≤ once per 2 s
 
 function buildScenarioSelector() {
   const sel = document.getElementById('sc-selector');
@@ -1876,7 +1850,6 @@ function selectScenario(id) {
   document.getElementById('sc-detail-card').style.display = '';
   document.getElementById('sc-run-status').textContent = '';
   document.getElementById('sc-event-btn').disabled = true;
-  scenarioDERActive = false;
 }
 
 function condRow(k, v) {
@@ -1903,7 +1876,6 @@ async function setupScenario() {
   clearScLog();
   document.getElementById('sc-setup-btn').disabled = true;
   document.getElementById('sc-event-btn').disabled = true;
-  scenarioDERActive = false;
 
   setStatus('sc-run-status', 'Setting up…', '#fbbf24');
   scLog(`⚙ Setting scene: ${sc.title}`, 'hdr');
@@ -1942,13 +1914,11 @@ async function setupScenario() {
              '/api/battery/inject', {SoC_pct: ini.battery_soc, W_W: 0, WMaxLimPct_pct: 0, Conn: 1});
   }
 
-  // Meter: pause and set to 0 W so the hub sees a balanced grid during setup.
-  // This prevents the self-consumption rule from dispatching the battery before
-  // the grid event fires.  The Grid display is computed from live device readings
-  // (load + EV - solar - battery), so it correctly shows the pre-event surplus
-  // without needing the actual meter to reflect it.
-  await ok('Pause meter animation', '/api/meter/control', {cmd: 'pause'});
-  await ok('Grid meter → 0 W (hub idle)', '/api/meter/inject', {W_W: 0});
+  // Meter: linked mode — set the site load and let metersim compute net power
+  // every 5 s from real solar/battery/EV device APIs. Resume in case a prior
+  // scenario or sine demo paused it.
+  await ok('Meter linked mode → resume', '/api/meter/control', {cmd: 'resume'});
+  await ok(`Site load → ${fmt(scenarioSiteLoadW)} W`, '/api/meter/inject', {LoadW_W: scenarioSiteLoadW});
 
   // EV: set SOC; start session now if scenario wants EV charging before the event fires.
   if (ini.ev_soc != null) {
@@ -2001,26 +1971,10 @@ async function sendDERControl() {
   // injected SOC value set during scene setup.
   await ok('Battery → resume (20× speed)', '/api/battery/control', {cmd: 'resume', speed: 20});
 
-  // Enable live meter feedback: pollHub will now push Grid.NetW = load + EV - solar - battery
-  // to metersim every 2 s so the hub gets accurate real-time grid readings as devices respond.
+  // Metersim is in linked mode: it polls solar/battery/hub-EV APIs every 5 s and
+  // publishes meter_W = load + ev - solar - battery on M201. Nothing browser-side
+  // drives the grid number from here on — the hub reads the real meter reading.
   markChartEvent('EVENT: ' + sc.grid.description);
-  scenarioDERActive = true;
-  lastMeterUpdateMs = 0;
-
-  // Push meter immediately so the hub sees the real grid balance on its next poll
-  // rather than waiting up to 2 s for the first pollHub feedback cycle.
-  // If EV was already charging at setup time, include its initial draw.
-  if (scenarioSiteLoadW !== null) {
-    const solarW = ini.solar_W ?? 0;
-    const evW0 = ini.ev_session_at_setup ? (ini.ev_initial_W ?? 3680) : 0;
-    const meterNow = scenarioSiteLoadW + evW0 - solarW; // battery=0W (idled during setup)
-    fetch('/api/meter/inject', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({W_W: meterNow}),
-    }).catch(() => {});
-    lastMeterUpdateMs = Date.now();
-  }
 
   scLog('─'.repeat(48), 'hdr');
   scLog('Grid event active — hub is responding.', 'rdy');
@@ -2032,7 +1986,6 @@ async function sendDERControl() {
 
 async function resetAll() {
   scenarioSiteLoadW = null;
-  scenarioDERActive = false;
   clearScLog();
   scLog('↺ Resetting all simulators…', 'hdr');
 

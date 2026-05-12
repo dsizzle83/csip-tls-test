@@ -289,7 +289,10 @@ func TestExportLimitRule_UpdatesBatteryPowerW(t *testing.T) {
 
 func TestExportLimitRule_BatteryChargesBeforeEVSE(t *testing.T) {
 	// 5 kW export, limit 2 kW, conservative target 1700 W, excess 3300 W.
-	// Battery has 5 kW headroom — it should absorb all 3300 W; EVSE gets 0A.
+	// Battery has 5 kW headroom — it should absorb all 3300 W.  EV stays at
+	// the IEC 6A minimum: charging from grid import doesn't violate an export
+	// limit, and dropping the EV session every time the battery happens to
+	// cover the excess made sessions visibly stutter in the lab.
 	solar := []SolarState{ruleSol("pv", 5000)}
 	evses := []EVSEState{ruleEVSE("cs-001", true, 16, 230)} // 16A max, currently 0A
 	bats := []BatteryState{ruleBat("bat", 0, 50, 5000)}
@@ -298,17 +301,14 @@ func TestExportLimitRule_BatteryChargesBeforeEVSE(t *testing.T) {
 
 	applyExportLimitRule(solar, evses, 0, limits, -5000, 95, 5000, bats, plan)
 
-	// Battery should absorb all 3300 W of excess (≤ 5 kW capacity).
 	if len(plan.BatteryCommands) == 0 {
 		t.Fatal("expected battery charge command")
 	}
 	if plan.BatteryCommands[0].SetpointW >= 0 {
 		t.Errorf("battery should be charging, got %.0fW", plan.BatteryCommands[0].SetpointW)
 	}
-	// EV gets 0A because battery covered the full excess.
-	if len(plan.EVSECommands) > 0 && plan.EVSECommands[0].MaxCurrentA > 0 {
-		t.Errorf("expected EVSE at 0A (battery covered excess), got %.1fA",
-			plan.EVSECommands[0].MaxCurrentA)
+	if len(plan.EVSECommands) == 0 || plan.EVSECommands[0].MaxCurrentA < 6 {
+		t.Errorf("expected EVSE held at 6A minimum, got %v", plan.EVSECommands)
 	}
 }
 
