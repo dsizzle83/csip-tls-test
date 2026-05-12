@@ -307,21 +307,23 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 	conservativeW := limits.exportLimitW * (1.0 - margin)
 
-	// Measured export at the meter (positive = sending power to grid).
-	// In a settled state actualExportW already reflects whatever the battery is
-	// currently absorbing and whatever the EV is currently consuming.
-	actualExportW := 0.0
+	// Signed net export at the meter: positive = exporting, negative = importing.
+	// Keep the sign so the conservation identity below stays correct when the
+	// site is currently importing (e.g. because the EV is drawing heavily).
+	signedNetExportW := math.NaN()
 	if !math.IsNaN(netW) {
-		actualExportW = math.Max(0, -netW)
+		signedNetExportW = -netW
 	} else {
+		signedNetExportW = 0
 		for _, sol := range solar {
-			actualExportW += sol.PowerW
+			signedNetExportW += sol.PowerW
 		}
 		for _, b := range batteries {
-			actualExportW += math.Max(0, b.PowerW)
+			signedNetExportW += math.Max(0, b.PowerW)
 		}
-		actualExportW -= evseW
+		signedNetExportW -= evseW
 	}
+	actualExportW := math.Max(0, signedNetExportW)
 
 	// Track consecutive ticks below the conservative target.
 	if actualExportW <= conservativeW {
@@ -338,11 +340,13 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		}
 	}
 
-	// Conservation identity: if we removed the battery and the EV, export at the
-	// meter would be (current export) + (battery absorption) + (EV consumption).
-	// This is independent of how those two devices are currently set, so it is a
-	// stable target even when the meter reading lags the device readings.
-	unconstrainedExportW := actualExportW + totalBatteryAbsorbW + evseW
+	// Conservation identity: if we removed the battery and the EV, export at
+	// the meter would be (signed net export) + (battery absorption) + (EV
+	// consumption).  Using the signed value keeps the math correct whether the
+	// site is currently exporting or importing.  This signal is stable across
+	// device-setpoint changes (modulo meter-poll lag) because it cancels out
+	// the contributions of the two devices it is controlling.
+	unconstrainedExportW := signedNetExportW + totalBatteryAbsorbW + evseW
 	totalAbsorptionNeededW := math.Max(0, unconstrainedExportW-conservativeW)
 	remainingAbsorptionW := totalAbsorptionNeededW
 	absorbedW := 0.0
