@@ -407,69 +407,78 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 
 	// ── EV: absorb remaining excess with hysteretic setpoint ──────────────────
-	for i := range evses {
-		ev := &evses[i]
-		if !ev.Connected || !ev.SessionActive {
-			continue
-		}
-		if hasEVSECommand(plan.EVSECommands, ev.StationID, ev.ConnectorID) {
-			continue
-		}
-		voltage := ev.VoltageV
-		if voltage <= 0 {
-			voltage = 230.0
-		}
-		const minChargeA = 6.0 // IEC 61851-1 minimum AC charge current
-		proactiveA := math.Min(remainingExcessW/voltage, ev.MaxCurrentA)
-		// If the absorb target is nonzero but below the EVSE minimum, bump to
-		// minimum — the shortfall is imported from grid, which the export limit
-		// does not constrain.  If it's truly zero, leave it zero (no session load).
-		if proactiveA > 0 && proactiveA < minChargeA {
-			proactiveA = minChargeA
-		}
+	// Only run the EV loop when there is meaningful excess left after battery
+	// absorption.  If there is no excess, the site is not near the export limit
+	// and Rule 6 should charge the EV freely.
+	if remainingExcessW >= 50 {
+		for i := range evses {
+			ev := &evses[i]
+			if !ev.Connected || !ev.SessionActive {
+				continue
+			}
+			if hasEVSECommand(plan.EVSECommands, ev.StationID, ev.ConnectorID) {
+				continue
+			}
+			voltage := ev.VoltageV
+			if voltage <= 0 {
+				voltage = 230.0
+			}
+			const minChargeA = 6.0 // IEC 61851-1 minimum AC charge current
+			proactiveA := math.Min(remainingExcessW/voltage, ev.MaxCurrentA)
+			// If the absorb target is nonzero but below the EVSE minimum, bump to
+			// minimum — the shortfall is imported from grid, which the export limit
+			// does not constrain.  If it's truly zero, leave it zero (no session load).
+			if proactiveA > 0 && proactiveA < minChargeA {
+				proactiveA = minChargeA
+			}
 
-		var newCurrentA float64
-		var reason, impact string
+			var newCurrentA float64
+			var reason, impact string
 
-		needsClamp := math.IsNaN(o.expGuard.evSetpointA) || actualExportW > conservativeW
-		switch {
-		case needsClamp:
-			newCurrentA = proactiveA
-			o.expGuard.evSetpointA = newCurrentA
-			reason = fmt.Sprintf(
-				"export %.0fW (lim %.0fW, target ≤%.0fW); battery absorbs %.0fW; EV targets remaining %.0fW",
-				actualExportW, limits.exportLimitW, conservativeW, absorbedW, remainingExcessW)
-			impact = fmt.Sprintf("EVSE %s → %.1fA [hold]", ev.StationID, newCurrentA)
+			needsClamp := math.IsNaN(o.expGuard.evSetpointA) || actualExportW > conservativeW
+			switch {
+			case needsClamp:
+				newCurrentA = proactiveA
+				o.expGuard.evSetpointA = newCurrentA
+				reason = fmt.Sprintf(
+					"export %.0fW (lim %.0fW, target ≤%.0fW); battery absorbs %.0fW; EV targets remaining %.0fW",
+					actualExportW, limits.exportLimitW, conservativeW, absorbedW, remainingExcessW)
+				impact = fmt.Sprintf("EVSE %s → %.1fA [hold]", ev.StationID, newCurrentA)
 
-		case o.expGuard.safeCount >= relaxCycles:
-			newCurrentA = proactiveA
-			o.expGuard.evSetpointA = newCurrentA
-			o.expGuard.safeCount = 0
-			reason = fmt.Sprintf(
-				"export %.0fW safe for %d cycles; relaxing EV to proactive setpoint",
-				actualExportW, relaxCycles)
-			impact = fmt.Sprintf("EVSE %s → %.1fA", ev.StationID, newCurrentA)
+			case o.expGuard.safeCount >= relaxCycles:
+				newCurrentA = proactiveA
+				o.expGuard.evSetpointA = newCurrentA
+				o.expGuard.safeCount = 0
+				reason = fmt.Sprintf(
+					"export %.0fW safe for %d cycles; relaxing EV to proactive setpoint",
+					actualExportW, relaxCycles)
+				impact = fmt.Sprintf("EVSE %s → %.1fA", ev.StationID, newCurrentA)
 
-		default:
-			newCurrentA = o.expGuard.evSetpointA
-			reason = fmt.Sprintf(
-				"export %.0fW ≤ %.0fW; holding EV at %.1fA (%d/%d safe cycles)",
-				actualExportW, conservativeW, newCurrentA, o.expGuard.safeCount, relaxCycles)
-			impact = fmt.Sprintf("EVSE %s held at %.1fA", ev.StationID, newCurrentA)
+			default:
+				newCurrentA = o.expGuard.evSetpointA
+				reason = fmt.Sprintf(
+					"export %.0fW ≤ %.0fW; holding EV at %.1fA (%d/%d safe cycles)",
+					actualExportW, conservativeW, newCurrentA, o.expGuard.safeCount, relaxCycles)
+				impact = fmt.Sprintf("EVSE %s held at %.1fA", ev.StationID, newCurrentA)
+			}
+
+			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+				StationID:   ev.StationID,
+				ConnectorID: ev.ConnectorID,
+				MaxCurrentA: newCurrentA,
+			})
+			plan.AddDecision("csip/export-limit", reason, impact)
+			// Credit measured EV power (not commanded) so the battery stays dispatched
+			// while the EV is still ramping.  Cap at commanded so battery retreats once
+			// the EV delivers its target current.
+			absorbedW += math.Min(ev.PowerW, newCurrentA*voltage)
+			surplusW -= newCurrentA * voltage
+			break // first active EVSE handles the limit; Rule 6 covers the rest
 		}
-
-		plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
-			StationID:   ev.StationID,
-			ConnectorID: ev.ConnectorID,
-			MaxCurrentA: newCurrentA,
-		})
-		plan.AddDecision("csip/export-limit", reason, impact)
-		// Credit measured EV power (not commanded) so the battery stays dispatched
-		// while the EV is still ramping.  Cap at commanded so battery retreats once
-		// the EV delivers its target current.
-		absorbedW += math.Min(ev.PowerW, newCurrentA*voltage)
-		surplusW -= newCurrentA * voltage
-		break // first active EVSE handles the limit; Rule 6 covers the rest
+	} else {
+		// No excess — release the guard so the next excess event gets a fresh setpoint
+		// and Rule 6 can charge the EV at full rate in the meantime.
+		o.expGuard.evSetpointA = math.NaN()
 	}
 
 	// ── Solar curtailment: last resort, only above the hard limit ───────────────
@@ -676,6 +685,22 @@ func applyEVChargingRule(evses []EVSEState, limits gridConstraints, netW, solarW
 			plan.AddDecision("ev-charging",
 				fmt.Sprintf("no grid constraint; charging EVSE %s at full %.1fA",
 					evse.StationID, evse.MaxCurrentA),
+				fmt.Sprintf("EVSE %s at %.1fA", evse.StationID, evse.MaxCurrentA))
+			continue
+		}
+
+		// Export limit active but site is currently importing (not exporting).
+		// The export-limit rule found no excess to manage, so charge at full rate.
+		// The export-limit rule re-engages automatically once export exceeds the limit.
+		if !math.IsNaN(limits.exportLimitW) && !math.IsNaN(netW) && netW >= 0 {
+			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+				StationID:   evse.StationID,
+				ConnectorID: evse.ConnectorID,
+				MaxCurrentA: evse.MaxCurrentA,
+			})
+			plan.AddDecision("ev-charging",
+				fmt.Sprintf("export limit %.0fW active but site importing %.0fW; EVSE %s at full %.1fA",
+					limits.exportLimitW, netW, evse.StationID, evse.MaxCurrentA),
 				fmt.Sprintf("EVSE %s at %.1fA", evse.StationID, evse.MaxCurrentA))
 			continue
 		}

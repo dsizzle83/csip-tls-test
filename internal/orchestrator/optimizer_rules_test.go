@@ -736,6 +736,26 @@ func TestEVChargingRule_NoSupplementNeededWhenUnconstrained(t *testing.T) {
 	}
 }
 
+func TestEVChargingRule_FullChargeWhenExportLimitActiveButImporting(t *testing.T) {
+	// Export limit active (5 kW CSIP default) but site is currently importing from
+	// grid (netW > 0).  The export-limit rule found no excess; EV should charge at
+	// full rate rather than being throttled by the solar-surplus path.
+	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
+	limits := gridConstraints{exportLimitW: 5000, importLimitW: math.NaN(), maxLimitW: math.NaN()}
+	plan := &Plan{}
+
+	// netW=2880 → site importing 2880W (EV load + home - solar)
+	applyEVChargingRule(evses, limits, 2880, 2000, -880, plan)
+
+	if len(plan.EVSECommands) == 0 {
+		t.Fatal("expected EVSE command")
+	}
+	if plan.EVSECommands[0].MaxCurrentA != 32 {
+		t.Errorf("expected full 32A when export-limited but importing, got %.1fA",
+			plan.EVSECommands[0].MaxCurrentA)
+	}
+}
+
 func TestEVChargingRule_SkipsAlreadyCommandedEVSE(t *testing.T) {
 	// EVSE already has a command from the export-limit rule; EV rule must not override it.
 	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
