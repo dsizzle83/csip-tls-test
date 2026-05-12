@@ -1777,7 +1777,7 @@ const SCENARIOS = [
       'the hub must fill the 1.5 kW gap from the battery. ' +
       'It instantly suspends EV charging (removing ~3.7 kW EV load) and discharges the battery at 1.5 kW — ' +
       'all within one control cycle, no manual intervention.',
-    initial: { solar_W: 3500, battery_soc: 50, load_W: 5000, ev_soc: 40, ev_session: true },
+    initial: { solar_W: 3500, battery_soc: 50, load_W: 5000, ev_soc: 40, ev_session: true, ev_session_at_setup: true },
     grid: { program: 0, imp_lim_W: 0, duration_s: 300,
             description: 'Demo S3: emergency — zero import', activate: true },
   },
@@ -1950,12 +1950,16 @@ async function setupScenario() {
   await ok('Pause meter animation', '/api/meter/control', {cmd: 'pause'});
   await ok('Grid meter → 0 W (hub idle)', '/api/meter/inject', {W_W: 0});
 
-  // EV: set SOC, stop session (idle for setup — hub starts charging after the event).
+  // EV: set SOC; start session now if scenario wants EV charging before the event fires.
   if (ini.ev_soc != null) {
     await ok(`EV SOC → ${ini.ev_soc}%`, '/api/ev/inject', {action: 'set_soc', soc_pct: ini.ev_soc});
   }
-  await apiPost('/api/ev/inject', {action: 'stop_session', connector_id: 1}).catch(() => {});
-  scLog('✓ EV idle', 'ok');
+  if (ini.ev_session_at_setup) {
+    await ok('EV → start charging session (pre-event)', '/api/ev/inject', {action: 'start_session', connector_id: 1});
+  } else {
+    await apiPost('/api/ev/inject', {action: 'stop_session', connector_id: 1}).catch(() => {});
+    scLog('✓ EV idle', 'ok');
+  }
 
   scLog('─'.repeat(48), 'hdr');
   scLog('Scene set — grid unconstrained, hub holding devices at initial state.', 'rdy');
@@ -1985,8 +1989,8 @@ async function sendDERControl() {
 
   const ini = sc.initial;
 
-  // Start EV session if the scenario calls for it — hub will manage the charge rate.
-  if (ini.ev_session) {
+  // Start EV session if the scenario calls for it and it wasn't started during setup.
+  if (ini.ev_session && !ini.ev_session_at_setup) {
     await ok('EV → start charging session', '/api/ev/inject', {action: 'start_session', connector_id: 1});
   }
 
@@ -2005,10 +2009,11 @@ async function sendDERControl() {
 
   // Push meter immediately so the hub sees the real grid balance on its next poll
   // rather than waiting up to 2 s for the first pollHub feedback cycle.
-  // At event-start: EV=0 W (session just began), battery=0 W (idled during setup).
+  // If EV was already charging at setup time, include its initial draw.
   if (scenarioSiteLoadW !== null) {
     const solarW = ini.solar_W ?? 0;
-    const meterNow = scenarioSiteLoadW - solarW; // + evW(0) - batteryW(0)
+    const evW0 = ini.ev_session_at_setup ? (ini.ev_initial_W ?? 3680) : 0;
+    const meterNow = scenarioSiteLoadW + evW0 - solarW; // battery=0W (idled during setup)
     fetch('/api/meter/inject', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},

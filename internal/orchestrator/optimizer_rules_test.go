@@ -504,18 +504,38 @@ func TestEVChargingRule_FullRateWithAmpleSolar(t *testing.T) {
 	}
 }
 
-func TestEVChargingRule_SuspendsWhenSurplusInsufficient(t *testing.T) {
+func TestEVChargingRule_SuspendsWhenZeroSurplusExportAndImportLimited(t *testing.T) {
 	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
 	plan := &Plan{}
 
-	// 1 kW solar, 1 kW surplus → 1000/230 ≈ 4.3A < 6A min → suspend.
-	applyEVChargingRule(evses, noLimits(), math.NaN(), 1000, 1000, plan)
+	// Export limit + import limit both active, zero solar surplus.
+	// budgetW=0 → can't supplement (import headroom=0 from tight import limit), suspend.
+	limits := gridConstraints{exportLimitW: 5000, importLimitW: 0, maxLimitW: math.NaN()}
+	// netW=0 → import headroom = 0 - 0 = 0; supplement of 1380W > 0 headroom → suspend.
+	applyEVChargingRule(evses, limits, 0, 1000, 0, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
 	}
 	if plan.EVSECommands[0].MaxCurrentA != 0 {
-		t.Errorf("expected suspend (0A) when surplus below min, got %.1fA", plan.EVSECommands[0].MaxCurrentA)
+		t.Errorf("expected suspend (0A) when both limits set and no import headroom, got %.1fA",
+			plan.EVSECommands[0].MaxCurrentA)
+	}
+}
+
+func TestEVChargingRule_FullChargeWhenUnconstrained(t *testing.T) {
+	// No export or import limit — EV should charge at full rate regardless of solar surplus.
+	// This covers scenarios like S3 where the EV is charging from grid before an emergency event.
+	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
+	plan := &Plan{}
+
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 1000, 1000, plan)
+
+	if len(plan.EVSECommands) == 0 {
+		t.Fatal("expected EVSE command")
+	}
+	if plan.EVSECommands[0].MaxCurrentA != 32 {
+		t.Errorf("expected full 32A when unconstrained, got %.1fA", plan.EVSECommands[0].MaxCurrentA)
 	}
 }
 
@@ -700,8 +720,9 @@ func TestEVChargingRule_MinCurrentSupplementWithExportLimit(t *testing.T) {
 	}
 }
 
-func TestEVChargingRule_NoSupplementWithoutExportLimit(t *testing.T) {
-	// No export limit — below-minimum surplus should still suspend.
+func TestEVChargingRule_NoSupplementNeededWhenUnconstrained(t *testing.T) {
+	// No export or import limit — EV charges at full rated current even if surplus is low.
+	// Without a constraint there is nothing to supplement against.
 	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
 	plan := &Plan{}
 
@@ -710,8 +731,8 @@ func TestEVChargingRule_NoSupplementWithoutExportLimit(t *testing.T) {
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
 	}
-	if plan.EVSECommands[0].MaxCurrentA != 0 {
-		t.Errorf("expected suspend (0A) without export limit, got %.1fA", plan.EVSECommands[0].MaxCurrentA)
+	if plan.EVSECommands[0].MaxCurrentA != 32 {
+		t.Errorf("expected full 32A when unconstrained, got %.1fA", plan.EVSECommands[0].MaxCurrentA)
 	}
 }
 

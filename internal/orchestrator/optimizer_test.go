@@ -261,11 +261,12 @@ func TestOptimizer_EV_FullRate_WhenSolarAmple(t *testing.T) {
 	}
 }
 
-func TestOptimizer_EV_Throttled_WhenSolarLow(t *testing.T) {
+func TestOptimizer_EV_FullChargeWhenUnconstrained(t *testing.T) {
 	opt := newOpt()
 	s := state0()
 
-	// Only 1 kW solar, EVSE wants up to 32A / 230V = 7.36 kW.
+	// No grid constraint: EV should charge at full 32A regardless of solar level.
+	// Without an export or import limit there is nothing to optimise against.
 	s.Solar = []orchestrator.SolarState{solar("pv-0", 1000, 10000)}
 	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 32.0, 230.0)}
 
@@ -274,10 +275,29 @@ func TestOptimizer_EV_Throttled_WhenSolarLow(t *testing.T) {
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
 	}
-	cmd := plan.EVSECommands[0]
-	// 1000W / 230V ≈ 4.3A — below minimum 6A, so should suspend.
-	if cmd.MaxCurrentA != 0 {
-		t.Errorf("EVSE MaxCurrentA = %.1f, want 0 (suspend) when insufficient solar", cmd.MaxCurrentA)
+	if plan.EVSECommands[0].MaxCurrentA != 32.0 {
+		t.Errorf("EVSE MaxCurrentA = %.1f, want 32A (full) when unconstrained", plan.EVSECommands[0].MaxCurrentA)
+	}
+}
+
+func TestOptimizer_EV_Throttled_WhenExportLimited(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+
+	// Export limit active with only 1 kW solar surplus — EV should be throttled/suspended.
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 1000, 10000)}
+	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 32.0, 230.0)}
+	s.Grid.ExportLimitW = 500
+
+	plan := opt.Optimize(s)
+
+	// Export-limit rule handles the EVSE command; it should not command full rate.
+	evCmd := plan.EVSECommands
+	if len(evCmd) == 0 {
+		t.Fatal("expected EVSE command")
+	}
+	if evCmd[0].MaxCurrentA >= 32.0 {
+		t.Errorf("EVSE MaxCurrentA = %.1f, want < 32A when export-limited with low solar", evCmd[0].MaxCurrentA)
 	}
 }
 

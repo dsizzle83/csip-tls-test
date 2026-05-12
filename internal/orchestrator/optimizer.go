@@ -664,6 +664,22 @@ func applyEVChargingRule(evses []EVSEState, limits gridConstraints, netW, solarW
 			continue
 		}
 
+		// No grid constraint active: charge at full EVSE rated current.
+		// Solar-surplus throttling only makes sense when export is capped —
+		// without a constraint the EV is free to draw from the grid.
+		if math.IsNaN(limits.exportLimitW) && math.IsNaN(limits.importLimitW) {
+			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+				StationID:   evse.StationID,
+				ConnectorID: evse.ConnectorID,
+				MaxCurrentA: evse.MaxCurrentA,
+			})
+			plan.AddDecision("ev-charging",
+				fmt.Sprintf("no grid constraint; charging EVSE %s at full %.1fA",
+					evse.StationID, evse.MaxCurrentA),
+				fmt.Sprintf("EVSE %s at %.1fA", evse.StationID, evse.MaxCurrentA))
+			continue
+		}
+
 		if solarW > 0 && surplusW < maxPowerW {
 			budgetW := math.Max(0, surplusW)
 
