@@ -1992,6 +1992,11 @@ async function sendDERControl() {
 
   await ok('DERControl → ' + sc.grid.description, '/api/gridsim/admin/control', sc.grid);
 
+  // Resume battery animation at 20× speed so SoC visibly integrates during the demo.
+  // Hub control (Ena=1) will override the W setpoint; the integrator seeds from the
+  // injected SOC value set during scene setup.
+  await ok('Battery → resume (20× speed)', '/api/battery/control', {cmd: 'resume', speed: 20});
+
   // Enable live meter feedback: pollHub will now push Grid.NetW = load + EV - solar - battery
   // to metersim every 2 s so the hub gets accurate real-time grid readings as devices respond.
   markChartEvent('EVENT: ' + sc.grid.description);
@@ -2039,9 +2044,9 @@ async function resetAll() {
   await apiPost('/api/solar/control',   {cmd: 'resume'});
   scLog('✓ Solar animation resumed', 'ok');
 
-  // Reconnect battery (Conn=1), clear hub setpoint (WMaxLimPct=0,Ena=0 → free animation).
+  // Reconnect battery: clear hub setpoint (Ena=0 → free animation), reset speed to 1×.
   await apiPost('/api/battery/inject',  {Conn: 1, WMaxLimPct_pct: 0});
-  await apiPost('/api/battery/control', {cmd: 'resume'});
+  await apiPost('/api/battery/control', {cmd: 'resume', speed: 1});
   scLog('✓ Battery reconnected and animation resumed', 'ok');
 
   await apiPost('/api/meter/control',   {cmd: 'resume'});

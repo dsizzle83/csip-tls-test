@@ -22,6 +22,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"csip-tls-test/internal/southbound/sunspec"
@@ -38,9 +40,13 @@ type BatteryBases struct {
 // BatteryServer is an animated Li-Ion battery simulator with a built-in API.
 type BatteryServer struct {
 	*Server
-	bases    BatteryBases
-	wmaxW    float64
-	wmaxKwh  float64
+	bases      BatteryBases
+	wmaxW      float64
+	wmaxKwh    float64
+	// pendingSoC carries a POST /inject {"SoC_pct": X} value to the animation
+	// goroutine so it seeds the integrator from the injected SOC rather than
+	// from whatever the sinusoidal animation last wrote to the register.
+	pendingSoC atomic.Pointer[float64]
 }
 
 // NewBatteryServer creates and starts an animated Li-Ion battery simulator.
@@ -49,13 +55,17 @@ func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer,
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	bases := populateBattery(regs, wmaxKwh, wmaxW)
 
+	// Allocate bs first so the animation closure can reference bs.pendingSoC.
+	bs := &BatteryServer{bases: bases, wmaxW: wmaxW, wmaxKwh: wmaxKwh}
+
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
-		animateBattery(s, r, wmaxW, bases, stop)
+		animateBattery(s, r, wmaxW, wmaxKwh, bases, &bs.pendingSoC, stop)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &BatteryServer{Server: srv, bases: bases, wmaxW: wmaxW, wmaxKwh: wmaxKwh}, nil
+	bs.Server = srv
+	return bs, nil
 }
 
 // ── Snapshot ──────────────────────────────────────────────────────────────────
@@ -181,6 +191,8 @@ func (bs *BatteryServer) Inject(body []byte) error {
 		case "SoC_pct":
 			r.Set(b.M802Base+uint16(sunspec.M802_SoC),
 				sunspec.RawFromScaleUint(val, int16(r.Get(b.M802Base+uint16(sunspec.M802_SoC_SF)))))
+			v := val
+			bs.pendingSoC.Store(&v)
 		case "SoH_pct":
 			r.Set(b.M802Base+uint16(sunspec.M802_SoH),
 				sunspec.RawFromScaleUint(val, int16(r.Get(b.M802Base+uint16(sunspec.M802_SoH_SF)))))
@@ -393,22 +405,38 @@ func hubBatteryW(r *RegisterMap, m123Base uint16, wmaxW float64) float64 {
 	return wmaxW * pct / 100.0
 }
 
-func animateBattery(s *Server, r *RegisterMap, wmaxW float64, bases BatteryBases, stop <-chan struct{}) {
+// animateBattery drives the batsim register bank every 5 real-time seconds.
+//
+// SoC behaviour:
+//   - Free-running (hub Ena=0): SoC follows a sinusoidal cycle for visual demo.
+//   - Hub-controlled (hub Ena=1): SoC integrates actual power against capacity,
+//     so SOC rises when charging and falls when discharging.  The speed
+//     multiplier (via s.Speed()) scales the integration rate so a 10× speed
+//     setting makes SoC move 10× faster for demo visibility.
+//   - POST /inject {"SoC_pct": X}: immediately seeds the integrator so the
+//     hub-controlled path starts from the injected value.
+func animateBattery(s *Server, r *RegisterMap, wmaxW, wmaxKwh float64, bases BatteryBases,
+	pendingSoC *atomic.Pointer[float64], stop <-chan struct{}) {
 	m103Base := bases.M103Base
 	m802Base := bases.M802Base
 	m123Base := bases.M123Base
+
+	// socMu protects socPct and socSeeded across the tick goroutine and OnWrite.
+	var socMu sync.Mutex
+	socPct := 55.0 // initial — overwritten on first hub-controlled tick
+	socSeeded := false
 
 	// Immediately apply hub M123 writes (e.g. when animation is paused).
 	applyNow := func() {
 		w := hubBatteryW(r, m123Base, wmaxW)
 		if math.IsNaN(w) {
-			return // no hub command; leave registers as-is
+			return
 		}
 		r.Set(m103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
 		if math.Abs(w) < wmaxW*0.02 {
-			r.Set(m103Base+sunspec.M103_St, 8) // standby
+			r.Set(m103Base+sunspec.M103_St, 8)
 		} else {
-			r.Set(m103Base+sunspec.M103_St, 4) // operating
+			r.Set(m103Base+sunspec.M103_St, 4)
 		}
 	}
 	r.OnWrite = func(startAddr uint16) {
@@ -416,6 +444,8 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW float64, bases BatteryBases
 			applyNow()
 		}
 	}
+
+	const tickInterval = 5.0 // real seconds between animation ticks
 
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
@@ -431,12 +461,41 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW float64, bases BatteryBases
 			t := s.simTime()
 			phase := 2 * math.Pi * t / 1200
 
-			soc := 55.0 + 35.0*math.Sin(phase)
-			w := -wmaxW * 0.80 * math.Cos(phase)
+			hw := hubBatteryW(r, m123Base, wmaxW)
 
-			// Hub command overrides animation direction entirely.
-			if hw := hubBatteryW(r, m123Base, wmaxW); !math.IsNaN(hw) {
+			var w, soc float64
+			if !math.IsNaN(hw) {
+				// Hub-controlled: integrate SoC from actual power.
 				w = hw
+				socMu.Lock()
+				if !socSeeded {
+					// Prefer an injected SOC value (from POST /inject) over the
+					// register, which may have been overwritten by a free-running tick.
+					if ptr := pendingSoC.Swap(nil); ptr != nil {
+						socPct = *ptr
+					} else {
+						raw := r.Get(m802Base + uint16(sunspec.M802_SoC))
+						sf := int16(r.Get(m802Base + uint16(sunspec.M802_SoC_SF)))
+						socPct = sunspec.ApplyScaleUint(raw, sf)
+					}
+					socSeeded = true
+				}
+				// Effective simulation seconds per real tick includes speed factor.
+				dtSim := tickInterval * s.Speed()
+				capacityWh := wmaxKwh * 1000.0
+				// w > 0 → discharging → SoC falls; w < 0 → charging → SoC rises.
+				dsoc := -w * dtSim * 100.0 / (capacityWh * 3600.0)
+				socPct = math.Max(0, math.Min(100, socPct+dsoc))
+				soc = socPct
+				socMu.Unlock()
+			} else {
+				// Free-running: sinusoidal cycle; reset so next hub command re-seeds.
+				soc = 55.0 + 35.0*math.Sin(phase)
+				w = -wmaxW * 0.80 * math.Cos(phase)
+				socMu.Lock()
+				socPct = soc
+				socSeeded = false
+				socMu.Unlock()
 			}
 
 			v := 240.0 + 1.5*math.Sin(2*math.Pi*t/89)
