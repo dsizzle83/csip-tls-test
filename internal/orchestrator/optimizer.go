@@ -350,20 +350,9 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	// ── Battery first: absorb up to rated charge power ────────────────────────
 	for i, b := range batteries {
 		if remainingAbsorptionW <= 1 {
-			// No more excess to absorb — idle this battery so it stops charging.
-			// applyRestoreRule would do this anyway, but issuing an explicit
-			// command here keeps the decision log honest.
-			if b.Connected && !hasBatteryCommand(plan.BatteryCommands, b.Name) && b.PowerW < 0 {
-				plan.BatteryCommands = append(plan.BatteryCommands, BatteryCommand{
-					Name:      b.Name,
-					SetpointW: 0,
-				})
-				plan.AddDecision("csip/export-limit",
-					fmt.Sprintf("export %.0fW within target %.0fW; idling battery %s",
-						actualExportW, conservativeW, b.Name),
-					fmt.Sprintf("battery %s → 0W", b.Name))
-				batteries[i].PowerW = 0
-			}
+			// No excess to manage — leave the battery to downstream rules
+			// (self-consumption, DR/TOU).  Idling it here would just fight
+			// applySelfConsumptionRule on the next pass.
 			continue
 		}
 		if !b.Connected {
@@ -399,44 +388,49 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 
 	// ── EV: absorb any remaining excess after battery ─────────────────────────
-	// If the batteries cover the full absorption need, the EV is still allowed
-	// to charge — at the IEC 61851 minimum, supplied from grid import (the
-	// export limit doesn't restrict import).  This keeps the session active and
-	// avoids the "EV randomly stops" failure mode.
-	for i := range evses {
-		ev := &evses[i]
-		if !ev.Connected || !ev.SessionActive {
-			continue
-		}
-		if hasEVSECommand(plan.EVSECommands, ev.StationID, ev.ConnectorID) {
-			continue
-		}
-		voltage := ev.VoltageV
-		if voltage <= 0 {
-			voltage = 230.0
-		}
-		const minChargeA = 6.0 // IEC 61851-1 minimum AC charge current
+	// Only engage when there is unconstrained excess to manage.  If there is
+	// none, Rule 6 (applyEVChargingRule) handles the EV at full rate.  If the
+	// batteries cover the full absorption need we still hold the EV at the IEC
+	// 61851 minimum so the session doesn't drop — grid import doesn't violate
+	// an export limit.
+	if totalAbsorptionNeededW >= 50 {
+		for i := range evses {
+			ev := &evses[i]
+			if !ev.Connected || !ev.SessionActive {
+				continue
+			}
+			if hasEVSECommand(plan.EVSECommands, ev.StationID, ev.ConnectorID) {
+				continue
+			}
+			voltage := ev.VoltageV
+			if voltage <= 0 {
+				voltage = 230.0
+			}
+			const minChargeA = 6.0 // IEC 61851-1 minimum AC charge current
 
-		targetA := math.Min(remainingAbsorptionW/voltage, ev.MaxCurrentA)
-		if targetA < minChargeA {
-			targetA = minChargeA // never suspend just because batteries cover the load
-		}
+			targetA := math.Min(remainingAbsorptionW/voltage, ev.MaxCurrentA)
+			if targetA < minChargeA {
+				targetA = minChargeA // never suspend just because batteries cover the load
+			}
 
-		plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
-			StationID:   ev.StationID,
-			ConnectorID: ev.ConnectorID,
-			MaxCurrentA: targetA,
-		})
-		plan.AddDecision("csip/export-limit",
-			fmt.Sprintf("unconstrained export %.0fW; battery absorbs %.0fW; EV absorbs remaining %.0fW",
-				unconstrainedExportW, absorbedW, math.Max(0, remainingAbsorptionW)),
-			fmt.Sprintf("EVSE %s → %.1fA", ev.StationID, targetA))
-		evAbsorbW := math.Min(remainingAbsorptionW, targetA*voltage)
-		absorbedW += math.Max(0, evAbsorbW)
-		remainingAbsorptionW = math.Max(0, remainingAbsorptionW-targetA*voltage)
-		surplusW -= targetA * voltage
-		o.expGuard.evSetpointA = targetA
-		break // first active EVSE handles the limit; Rule 6 covers the rest
+			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+				StationID:   ev.StationID,
+				ConnectorID: ev.ConnectorID,
+				MaxCurrentA: targetA,
+			})
+			plan.AddDecision("csip/export-limit",
+				fmt.Sprintf("unconstrained export %.0fW; battery absorbs %.0fW; EV absorbs remaining %.0fW",
+					unconstrainedExportW, absorbedW, math.Max(0, remainingAbsorptionW)),
+				fmt.Sprintf("EVSE %s → %.1fA", ev.StationID, targetA))
+			evAbsorbW := math.Min(remainingAbsorptionW, targetA*voltage)
+			absorbedW += math.Max(0, evAbsorbW)
+			remainingAbsorptionW = math.Max(0, remainingAbsorptionW-targetA*voltage)
+			surplusW -= targetA * voltage
+			o.expGuard.evSetpointA = targetA
+			break // first active EVSE handles the limit; Rule 6 covers the rest
+		}
+	} else {
+		o.expGuard.evSetpointA = math.NaN()
 	}
 
 	// ── Solar curtailment: last resort, only above the hard limit ───────────────
