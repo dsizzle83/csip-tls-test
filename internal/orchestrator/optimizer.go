@@ -452,52 +452,69 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 			voltage = 230.0
 		}
 		const (
-			minChargeA  = 6.0   // IEC 61851-1 minimum AC charge current
-			deadbandW   = 200.0 // ignore controller errors smaller than this
-			tightenGain = 1.0   // P-gain for "more EV": correct full error in 1 tick
-			relaxGain   = 0.5   // P-gain for "less EV": back off half-rate, asymmetric
+			minChargeA  = 6.0 // IEC 61851-1 minimum AC charge current
+			deadbandA   = 1.0 // hold the setpoint when within 1 A of target
+			maxTightenA = 4.0 // ramp up by at most ~1 kW per tick (smooth, no slam)
+			maxRelaxA   = 2.0 // ramp down even slower so we don't sawtooth
 		)
+
+		// Predicted steady-state EV target from the conservation identity.
+		// unconstrained = solar − load, recovered from the meter and the
+		// commanded battery/EV values (their measured versions reflect the
+		// same OCPP-tracker reading used by metersim in linked mode, so the
+		// lags cancel).  Subtracting batteryAbsorbW gives the residual we
+		// need the EV to handle.
+		unconstrainedExportW := signedNetExportW + batteryAbsorbW + evseW
+		residualNeed := unconstrainedExportW - batteryAbsorbW - conservativeW
+		targetA := math.Min(math.Max(residualNeed/voltage, minChargeA), ev.MaxCurrentA)
 
 		var newCurrentA float64
 		var reason string
 
-		// Use the conservation identity for the initial setpoint so we start
-		// in-the-ballpark rather than ramping up from 6 A.  After that, drive
-		// the setpoint with the filtered meter signal.
 		if math.IsNaN(o.expGuard.evSetpointA) {
-			unconstrainedExportW := signedNetExportW + batteryAbsorbW + evseW
-			residualNeed := unconstrainedExportW - batteryAbsorbW - conservativeW
-			startA := math.Min(math.Max(residualNeed/voltage, minChargeA), ev.MaxCurrentA)
-			newCurrentA = startA
+			// First tick of this limit episode: start at the target itself.
+			// Soft-start in evsim prevents the EV from briefly drawing above
+			// this value before the SetChargingProfile lands.
+			newCurrentA = targetA
 			reason = fmt.Sprintf(
 				"initial EV setpoint: unconstrained %.0fW − battery %.0fW − target %.0fW → %.1fA",
 				unconstrainedExportW, batteryAbsorbW, conservativeW, newCurrentA)
 		} else {
-			error := filteredExportW - conservativeW // positive = over the target
+			// Slew toward the target with a bounded ramp rate.  The target
+			// is a steady-state estimate, so slewing toward it never
+			// overshoots — even if filteredExport is briefly noisy.
+			diffA := targetA - o.expGuard.evSetpointA
 			switch {
-			case error > deadbandW:
-				// Over target → tighten immediately (full proportional step).
-				delta := tightenGain * error / voltage
-				newCurrentA = math.Min(o.expGuard.evSetpointA+delta, ev.MaxCurrentA)
-				reason = fmt.Sprintf(
-					"filtered export %.0fW > target %.0fW; tighten EV by %.1fA",
-					filteredExportW, conservativeW, delta)
-			case error < -deadbandW && o.expGuard.safeCount >= relaxCycles:
-				// Sustained undershoot → relax slowly so we don't sawtooth.
-				// One relax step per N safe cycles ("N consecutive ticks
-				// under target before reducing").
-				delta := relaxGain * error / voltage // delta is negative
-				newCurrentA = math.Max(o.expGuard.evSetpointA+delta, minChargeA)
-				o.expGuard.safeCount = 0 // require another N cycles to relax again
-				reason = fmt.Sprintf(
-					"under target %.0fW vs %.0fW for ≥%d cycles; relax EV by %.1fA",
-					filteredExportW, conservativeW, relaxCycles, -delta)
-			default:
-				// Inside deadband or not yet earned a relax — hold the setpoint.
+			case math.Abs(diffA) < deadbandA:
 				newCurrentA = o.expGuard.evSetpointA
 				reason = fmt.Sprintf(
-					"holding EV at %.1fA (filtered export %.0fW, target %.0fW, safe %d/%d)",
-					newCurrentA, filteredExportW, conservativeW, o.expGuard.safeCount, relaxCycles)
+					"holding EV at %.1fA (target %.1fA within %.1fA deadband; filtered export %.0fW)",
+					newCurrentA, targetA, deadbandA, filteredExportW)
+			case diffA > 0:
+				// Tighten — bounded step.  No safe-cycle gate; closing the
+				// gap on excess export is always allowed.
+				step := math.Min(diffA, maxTightenA)
+				newCurrentA = o.expGuard.evSetpointA + step
+				reason = fmt.Sprintf(
+					"target %.1fA above current %.1fA; ramp EV up by %.1fA",
+					targetA, o.expGuard.evSetpointA, step)
+			default:
+				// Relax — only after sustained undershoot, and at half the
+				// tighten rate.  This is what makes the system underdamped:
+				// it leans toward the limit rather than oscillating.
+				if o.expGuard.safeCount < relaxCycles {
+					newCurrentA = o.expGuard.evSetpointA
+					reason = fmt.Sprintf(
+						"target %.1fA below current %.1fA but only %d/%d safe cycles; hold",
+						targetA, o.expGuard.evSetpointA, o.expGuard.safeCount, relaxCycles)
+				} else {
+					step := math.Max(diffA, -maxRelaxA)
+					newCurrentA = math.Max(o.expGuard.evSetpointA+step, minChargeA)
+					o.expGuard.safeCount = 0
+					reason = fmt.Sprintf(
+						"target %.1fA below current %.1fA after ≥%d safe cycles; ramp EV down by %.1fA",
+						targetA, o.expGuard.evSetpointA, relaxCycles, -step)
+				}
 			}
 		}
 
