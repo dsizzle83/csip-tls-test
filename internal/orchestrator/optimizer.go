@@ -362,11 +362,24 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	// using the meter reading, which already reflects current battery and EV.
 	unconstrainedExportW := signedNetExportW + measuredBatteryAbsorbW + evseW
 
-	// ── Battery: pinned to MaxChargeW for the duration of the event ──────────
-	// The battery is the workhorse; once an export limit is live and SOC < full
-	// it absorbs at its rated charge power and stays there.  We don't try to
-	// trim it cycle-by-cycle — that's what caused the oscillation under lag.
-	batteryAbsorbW := 0.0 // commanded absorption after this tick
+	// ── Battery: command this tick's absorption with SOC-taper handoff ───────
+	// The battery is the workhorse and runs at its taper-adjusted max charge
+	// power.  The EV (below) is computed against the battery's PREDICTED
+	// next-tick contribution, not its current one, so the EV ramps up
+	// *before* the battery ramps down.  Net effect: smooth handoff with no
+	// momentary spike on either device.
+	const (
+		socTaperStart = 80.0 // begin SOC-driven battery taper here
+	)
+	// socStepEstimate is how much SOC is expected to climb per optimizer
+	// tick when the battery is charging at its full MaxChargeW.  At 20× demo
+	// speed with a 10 kWh / 5 kW pack and a 3 s tick, that's ≈ 0.83 %.  This
+	// only needs to be in the right ballpark; it gates the size of the EV
+	// feed-forward step.
+	const socStepEstimate = 1.0
+
+	batteryAbsorbW := 0.0          // commanded absorption this tick (positive watts)
+	predictedBatteryAbsorbW := 0.0 // expected absorption next tick (positive watts)
 	for i, b := range batteries {
 		if !b.Connected || hasBatteryCommand(plan.BatteryCommands, b.Name) {
 			continue
@@ -377,41 +390,33 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		if b.MaxChargeW < 50 {
 			continue
 		}
-		// CC→CV taper: from socTaperStart toward socFull, linearly scale the
-		// battery's effective max charge power from 100% to 0%.  This hands
-		// off absorption duty to the EV smoothly — as the battery's allowed
-		// charge shrinks, the residual (unconstrained − battery) grows and
-		// the EV controller naturally tightens to compensate.  Mirrors the
-		// CC/CV behaviour of a real Li-ion charger.
-		const socTaperStart = 80.0
-		effectiveMaxChargeW := b.MaxChargeW
-		if !math.IsNaN(b.SOC) && b.SOC > socTaperStart && socFull > socTaperStart {
-			factor := math.Max(0, (socFull-b.SOC)/(socFull-socTaperStart))
-			effectiveMaxChargeW = b.MaxChargeW * factor
+		taperFactor := func(soc float64) float64 {
+			if math.IsNaN(soc) || soc <= socTaperStart {
+				return 1.0
+			}
+			if soc >= socFull || socFull <= socTaperStart {
+				return 0.0
+			}
+			return math.Max(0, (socFull-soc)/(socFull-socTaperStart))
 		}
+		effectiveMaxNow := b.MaxChargeW * taperFactor(b.SOC)
+		nextSOC := b.SOC + socStepEstimate
+		effectiveMaxNext := b.MaxChargeW * taperFactor(nextSOC)
 
-		// Battery target = the absorption needed to bring the unconstrained
-		// surplus down to the conservative target, capped by the taper-adjusted
-		// max charge power.
 		need := math.Max(0, unconstrainedExportW-conservativeW)
-		absorb := math.Min(effectiveMaxChargeW, need)
+		absorb := math.Min(effectiveMaxNow, need)
+		predictedNext := math.Min(effectiveMaxNext, need)
 
-		// Ratchet: once we've commanded a battery absorption during this limit
-		// episode, don't reduce it just because the next tick's unconstrained
-		// estimate dipped — that's almost certainly OCPP/Modbus poll lag, not
-		// a real change in solar−load.  Only allow reduction after the meter
-		// has been under the conservative target for `relaxCycles` consecutive
-		// ticks (≈ one full meter+OCPP poll window).  The taper bypasses the
-		// ratchet — a falling MaxChargeW is a real, monotonic signal driven
-		// by the battery, not by transient meter noise.
+		// Ratchet against transient meter noise.  Taper-driven drops bypass
+		// the ratchet — they are real, monotonic, and the EV is being
+		// pre-positioned to compensate.
 		if !math.IsNaN(o.expGuard.batteryAbsorbW) && o.expGuard.batteryAbsorbW > absorb {
-			if absorb >= effectiveMaxChargeW {
-				// taper is the binding constraint — let it through
-			} else if o.expGuard.safeCount < relaxCycles {
-				absorb = math.Min(o.expGuard.batteryAbsorbW, effectiveMaxChargeW)
-			} else {
-				// Sustained undershoot: relax half-way toward the new target.
-				absorb = math.Min((absorb+o.expGuard.batteryAbsorbW)/2, effectiveMaxChargeW)
+			if absorb < effectiveMaxNow {
+				if o.expGuard.safeCount < relaxCycles {
+					absorb = math.Min(o.expGuard.batteryAbsorbW, effectiveMaxNow)
+				} else {
+					absorb = math.Min((absorb+o.expGuard.batteryAbsorbW)/2, effectiveMaxNow)
+				}
 			}
 		}
 
@@ -424,11 +429,12 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 			SetpointW: setpoint,
 		})
 		plan.AddDecision("csip/export-limit",
-			fmt.Sprintf("export limit %.0fW (target ≤%.0fW); unconstrained %.0fW; battery %s absorbs %.0fW",
-				limits.exportLimitW, conservativeW, unconstrainedExportW, b.Name, absorb),
+			fmt.Sprintf("export limit %.0fW (target ≤%.0fW); unconstrained %.0fW; battery %s absorbs %.0fW (next %.0fW)",
+				limits.exportLimitW, conservativeW, unconstrainedExportW, b.Name, absorb, predictedNext),
 			fmt.Sprintf("battery %s → %.0fW", b.Name, setpoint))
 		batteries[i].PowerW = setpoint
 		batteryAbsorbW += absorb
+		predictedBatteryAbsorbW += predictedNext
 		surplusW -= absorb
 	}
 	if batteryAbsorbW > 0 {
@@ -453,68 +459,76 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		}
 		const (
 			minChargeA  = 6.0 // IEC 61851-1 minimum AC charge current
-			deadbandA   = 1.0 // hold the setpoint when within 1 A of target
-			maxTightenA = 4.0 // ramp up by at most ~1 kW per tick (smooth, no slam)
-			maxRelaxA   = 2.0 // ramp down even slower so we don't sawtooth
+			deadbandA   = 0.5 // hold the setpoint within 0.5 A of target
+			maxTightenA = 2.0 // ~460 W/tick — matched to typical battery taper rate
+			maxRelaxA   = 1.0 // half-rate when backing off
 		)
 
-		// Predicted steady-state EV target from the conservation identity.
-		// unconstrained = solar − load, recovered from the meter and the
-		// commanded battery/EV values (their measured versions reflect the
-		// same OCPP-tracker reading used by metersim in linked mode, so the
-		// lags cancel).  Subtracting batteryAbsorbW gives the residual we
-		// need the EV to handle.
-		unconstrainedExportW := signedNetExportW + batteryAbsorbW + evseW
-		residualNeed := unconstrainedExportW - batteryAbsorbW - conservativeW
+		// EV target is computed against the battery's PREDICTED next-tick
+		// absorption, not the current one.  This pre-positions the EV so
+		// that *when* the battery's taper actually reduces its charge on
+		// the next tick, the EV is already absorbing the corresponding
+		// extra surplus — no transient over-export and no transient slam.
+		residualNeed := unconstrainedExportW - predictedBatteryAbsorbW - conservativeW
 		targetA := math.Min(math.Max(residualNeed/voltage, minChargeA), ev.MaxCurrentA)
 
 		var newCurrentA float64
 		var reason string
 
+		// Always start at the IEC minimum on the first tick of an episode.
+		// The slew bounds the ramp from there, so the EV cannot slam on at
+		// session start no matter what the steady-state target works out to.
 		if math.IsNaN(o.expGuard.evSetpointA) {
-			// First tick of this limit episode: start at the target itself.
-			// Soft-start in evsim prevents the EV from briefly drawing above
-			// this value before the SetChargingProfile lands.
-			newCurrentA = targetA
+			newCurrentA = minChargeA
 			reason = fmt.Sprintf(
-				"initial EV setpoint: unconstrained %.0fW − battery %.0fW − target %.0fW → %.1fA",
-				unconstrainedExportW, batteryAbsorbW, conservativeW, newCurrentA)
+				"first tick of export-limit episode; soft-start EV at %.1fA (steady-state target %.1fA)",
+				newCurrentA, targetA)
 		} else {
-			// Slew toward the target with a bounded ramp rate.  The target
-			// is a steady-state estimate, so slewing toward it never
-			// overshoots — even if filteredExport is briefly noisy.
 			diffA := targetA - o.expGuard.evSetpointA
 			switch {
 			case math.Abs(diffA) < deadbandA:
 				newCurrentA = o.expGuard.evSetpointA
 				reason = fmt.Sprintf(
-					"holding EV at %.1fA (target %.1fA within %.1fA deadband; filtered export %.0fW)",
-					newCurrentA, targetA, deadbandA, filteredExportW)
+					"holding EV at %.1fA (target %.1fA, battery now %.0fW → next %.0fW)",
+					newCurrentA, targetA, batteryAbsorbW, predictedBatteryAbsorbW)
 			case diffA > 0:
-				// Tighten — bounded step.  No safe-cycle gate; closing the
-				// gap on excess export is always allowed.
 				step := math.Min(diffA, maxTightenA)
 				newCurrentA = o.expGuard.evSetpointA + step
 				reason = fmt.Sprintf(
-					"target %.1fA above current %.1fA; ramp EV up by %.1fA",
-					targetA, o.expGuard.evSetpointA, step)
+					"target %.1fA (battery next %.0fW); ramp EV up by %.1fA",
+					targetA, predictedBatteryAbsorbW, step)
 			default:
-				// Relax — only after sustained undershoot, and at half the
-				// tighten rate.  This is what makes the system underdamped:
-				// it leans toward the limit rather than oscillating.
 				if o.expGuard.safeCount < relaxCycles {
 					newCurrentA = o.expGuard.evSetpointA
 					reason = fmt.Sprintf(
-						"target %.1fA below current %.1fA but only %d/%d safe cycles; hold",
+						"target %.1fA below %.1fA but only %d/%d safe cycles; hold",
 						targetA, o.expGuard.evSetpointA, o.expGuard.safeCount, relaxCycles)
 				} else {
 					step := math.Max(diffA, -maxRelaxA)
 					newCurrentA = math.Max(o.expGuard.evSetpointA+step, minChargeA)
 					o.expGuard.safeCount = 0
 					reason = fmt.Sprintf(
-						"target %.1fA below current %.1fA after ≥%d safe cycles; ramp EV down by %.1fA",
+						"target %.1fA below %.1fA for ≥%d cycles; ramp EV down by %.1fA",
 						targetA, o.expGuard.evSetpointA, relaxCycles, -step)
 				}
+			}
+		}
+
+		// Pre-flight: validate the (battery, EV) command pair against the
+		// hard export limit before committing.  Using the conservation
+		// identity, the export with these commands is
+		//   predicted_export = unconstrained − battery_now − ev_command
+		// If that would exceed the hard limit, tighten the EV further
+		// (within its rating).  Anything still over the limit falls through
+		// to the solar-curtailment branch below.
+		predictedExportW := unconstrainedExportW - batteryAbsorbW - newCurrentA*voltage
+		if predictedExportW > limits.exportLimitW {
+			excessW := predictedExportW - limits.exportLimitW
+			boost := math.Min(excessW/voltage, ev.MaxCurrentA-newCurrentA)
+			if boost > 0 {
+				newCurrentA += boost
+				reason += fmt.Sprintf("; pre-flight: +%.1fA to stay under hard limit %.0fW",
+					boost, limits.exportLimitW)
 			}
 		}
 

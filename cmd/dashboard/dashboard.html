@@ -1724,7 +1724,7 @@ const SCENARIOS = [
       'The hub immediately dispatches the battery to charge at ~5 kW and ramps EV charging to absorb the rest — ' +
       'zero solar wasted, the customer earns self-consumption savings, and the grid sees exactly 1 kW.',
     initial: { solar_W: 8000, battery_soc: 40, load_W: 1000, ev_soc: 20, ev_session: true },
-    grid: { program: 0, exp_lim_W: 1000, duration_s: 300,
+    grid: { program: 0, exp_lim_W: 1000, duration_s: 600,
             description: 'Demo S1: export limit 1 kW', activate: true },
   },
   {
