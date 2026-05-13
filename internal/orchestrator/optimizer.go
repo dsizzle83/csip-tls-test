@@ -377,26 +377,43 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		if b.MaxChargeW < 50 {
 			continue
 		}
+		// CC→CV taper: from socTaperStart toward socFull, linearly scale the
+		// battery's effective max charge power from 100% to 0%.  This hands
+		// off absorption duty to the EV smoothly — as the battery's allowed
+		// charge shrinks, the residual (unconstrained − battery) grows and
+		// the EV controller naturally tightens to compensate.  Mirrors the
+		// CC/CV behaviour of a real Li-ion charger.
+		const socTaperStart = 80.0
+		effectiveMaxChargeW := b.MaxChargeW
+		if !math.IsNaN(b.SOC) && b.SOC > socTaperStart && socFull > socTaperStart {
+			factor := math.Max(0, (socFull-b.SOC)/(socFull-socTaperStart))
+			effectiveMaxChargeW = b.MaxChargeW * factor
+		}
+
 		// Battery target = the absorption needed to bring the unconstrained
-		// surplus down to the conservative target, capped by rated charge power.
+		// surplus down to the conservative target, capped by the taper-adjusted
+		// max charge power.
 		need := math.Max(0, unconstrainedExportW-conservativeW)
-		absorb := math.Min(b.MaxChargeW, need)
+		absorb := math.Min(effectiveMaxChargeW, need)
 
 		// Ratchet: once we've commanded a battery absorption during this limit
 		// episode, don't reduce it just because the next tick's unconstrained
 		// estimate dipped — that's almost certainly OCPP/Modbus poll lag, not
 		// a real change in solar−load.  Only allow reduction after the meter
 		// has been under the conservative target for `relaxCycles` consecutive
-		// ticks (≈ one full meter+OCPP poll window).
+		// ticks (≈ one full meter+OCPP poll window).  The taper bypasses the
+		// ratchet — a falling MaxChargeW is a real, monotonic signal driven
+		// by the battery, not by transient meter noise.
 		if !math.IsNaN(o.expGuard.batteryAbsorbW) && o.expGuard.batteryAbsorbW > absorb {
-			if o.expGuard.safeCount < relaxCycles {
-				absorb = o.expGuard.batteryAbsorbW
+			if absorb >= effectiveMaxChargeW {
+				// taper is the binding constraint — let it through
+			} else if o.expGuard.safeCount < relaxCycles {
+				absorb = math.Min(o.expGuard.batteryAbsorbW, effectiveMaxChargeW)
 			} else {
 				// Sustained undershoot: relax half-way toward the new target.
-				absorb = (absorb + o.expGuard.batteryAbsorbW) / 2
+				absorb = math.Min((absorb+o.expGuard.batteryAbsorbW)/2, effectiveMaxChargeW)
 			}
 		}
-		absorb = math.Min(absorb, b.MaxChargeW)
 
 		if absorb < 50 {
 			continue

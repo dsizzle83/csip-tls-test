@@ -277,6 +277,11 @@ func simulateSession(ctx context.Context, cs ocpp2.ChargingStation, h *csHandler
 	log.Printf("evsim: connector %d — session starting (max %v, SOC=%.1f%%)",
 		connectorID, maxDuration, func() float64 { soc, _, _ := h.batt.State(); return soc }())
 	h.batt.ResetSession()
+	// Reset the commanded current to the IEC 61851-1 minimum so the EV does
+	// not draw at whatever leftover SetChargingProfile limit the prior session
+	// happened to end at.  The CSMS will issue a fresh limit on its next
+	// control tick (typically within a few seconds).
+	h.batt.SetCommandedA(6.0)
 	h.setSessionActive(connectorID, true)
 	sendStatus(cs, h, connectorID, availability.ConnectorStatusOccupied)
 
