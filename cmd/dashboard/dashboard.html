@@ -1971,6 +1971,11 @@ async function sendDERControl() {
   // injected SOC value set during scene setup.
   await ok('Battery → resume (20× speed)', '/api/battery/control', {cmd: 'resume', speed: 20});
 
+  // Bump EV sim speed too so its SOC ticks at the same demo rate as the battery.
+  // Without this, a 60 kWh pack at 6 A would integrate ~0.04 %/min in real time
+  // and look frozen to the dashboard's 1-decimal display.
+  await apiPost('/api/ev/inject', {action: 'set_sim_speed', speed: 20});
+
   // Metersim is in linked mode: it polls solar/battery/hub-EV APIs every 5 s and
   // publishes meter_W = load + ev - solar - battery on M201. Nothing browser-side
   // drives the grid number from here on — the hub reads the real meter reading.
@@ -2011,6 +2016,7 @@ async function resetAll() {
   scLog('✓ Meter animation resumed', 'ok');
 
   await apiPost('/api/ev/inject', {action: 'stop_session', connector_id: 1}).catch(() => {});
+  await apiPost('/api/ev/inject', {action: 'set_sim_speed', speed: 1}).catch(() => {});
   scLog('✓ EV session stopped', 'ok');
 
   document.getElementById('sc-event-btn').disabled = true;

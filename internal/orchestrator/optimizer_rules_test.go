@@ -522,19 +522,40 @@ func TestEVChargingRule_SuspendsWhenZeroSurplusExportAndImportLimited(t *testing
 	}
 }
 
-func TestEVChargingRule_FullChargeWhenUnconstrained(t *testing.T) {
-	// No export or import limit — EV should charge at full rate regardless of solar surplus.
-	// This covers scenarios like S3 where the EV is charging from grid before an emergency event.
+func TestEVChargingRule_FullChargeWhenUnconstrainedAndNoSolar(t *testing.T) {
+	// No constraint AND no solar production — nothing to throttle against,
+	// so the EV charges at full rate (grid-only scenarios like night charging).
 	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
 	plan := &Plan{}
 
-	applyEVChargingRule(evses, noLimits(), math.NaN(), 1000, 1000, plan)
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 0, 0, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
 	}
 	if plan.EVSECommands[0].MaxCurrentA != 32 {
-		t.Errorf("expected full 32A when unconstrained, got %.1fA", plan.EVSECommands[0].MaxCurrentA)
+		t.Errorf("expected full 32A when unconstrained and solar=0, got %.1fA", plan.EVSECommands[0].MaxCurrentA)
+	}
+}
+
+func TestEVChargingRule_ThrottledWhenUnconstrainedAndLowSolar(t *testing.T) {
+	// Self-consumption priority: with solar producing but below EV max draw,
+	// the EV must throttle to the surplus rather than drawing from the grid.
+	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
+	plan := &Plan{}
+
+	// solar=2000W, surplus=2000W, EV max=32A*230=7360W → should throttle.
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 2000, 2000, plan)
+
+	if len(plan.EVSECommands) == 0 {
+		t.Fatal("expected EVSE command")
+	}
+	got := plan.EVSECommands[0].MaxCurrentA
+	if got >= 32 {
+		t.Errorf("expected throttle below 32A when solar < EV max, got %.1fA", got)
+	}
+	if got < 6 {
+		t.Errorf("expected at least minimum 6A, got %.1fA", got)
 	}
 }
 
@@ -720,18 +741,18 @@ func TestEVChargingRule_MinCurrentSupplementWithExportLimit(t *testing.T) {
 }
 
 func TestEVChargingRule_NoSupplementNeededWhenUnconstrained(t *testing.T) {
-	// No export or import limit — EV charges at full rated current even if surplus is low.
-	// Without a constraint there is nothing to supplement against.
+	// No constraint AND solar amply covers EV draw — no throttle, no supplement.
 	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
 	plan := &Plan{}
 
-	applyEVChargingRule(evses, noLimits(), math.NaN(), 1000, 1000, plan)
+	// solar=20kW, surplus=20kW, EV max=32A*230=7360W → solar amply covers; full rate.
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 20000, 20000, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
 	}
 	if plan.EVSECommands[0].MaxCurrentA != 32 {
-		t.Errorf("expected full 32A when unconstrained, got %.1fA", plan.EVSECommands[0].MaxCurrentA)
+		t.Errorf("expected full 32A when solar comfortably covers EV draw, got %.1fA", plan.EVSECommands[0].MaxCurrentA)
 	}
 }
 

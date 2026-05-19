@@ -261,12 +261,14 @@ func TestOptimizer_EV_FullRate_WhenSolarAmple(t *testing.T) {
 	}
 }
 
-func TestOptimizer_EV_FullChargeWhenUnconstrained(t *testing.T) {
+func TestOptimizer_EV_ThrottledWhenUnconstrainedAndLowSolar(t *testing.T) {
 	opt := newOpt()
 	s := state0()
 
-	// No grid constraint: EV should charge at full 32A regardless of solar level.
-	// Without an export or import limit there is nothing to optimise against.
+	// Self-consumption priority: even with no grid constraint, the EV must not
+	// be driven past available solar surplus or we'd be importing from the
+	// grid to charge the car.  Solar 1 kW + EV at 32A=7.36 kW would import
+	// ~6 kW; throttle instead.
 	s.Solar = []orchestrator.SolarState{solar("pv-0", 1000, 10000)}
 	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 32.0, 230.0)}
 
@@ -275,8 +277,28 @@ func TestOptimizer_EV_FullChargeWhenUnconstrained(t *testing.T) {
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
 	}
-	if plan.EVSECommands[0].MaxCurrentA != 32.0 {
-		t.Errorf("EVSE MaxCurrentA = %.1f, want 32A (full) when unconstrained", plan.EVSECommands[0].MaxCurrentA)
+	if plan.EVSECommands[0].MaxCurrentA >= 32.0 {
+		t.Errorf("EVSE MaxCurrentA = %.1f, want throttled below 32A when solar < EV max",
+			plan.EVSECommands[0].MaxCurrentA)
+	}
+}
+
+func TestOptimizer_EV_FullRateWhenUnconstrainedAndSolarAmple(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+
+	// Solar comfortably covers full EV draw — no need to throttle.
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 10000, 10000)}
+	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 16.0, 230.0)}
+
+	plan := opt.Optimize(s)
+
+	if len(plan.EVSECommands) == 0 {
+		t.Fatal("expected EVSE command")
+	}
+	if plan.EVSECommands[0].MaxCurrentA != 16.0 {
+		t.Errorf("EVSE MaxCurrentA = %.1f, want 16A (full) when solar amply covers EV draw",
+			plan.EVSECommands[0].MaxCurrentA)
 	}
 }
 
@@ -657,6 +679,120 @@ func TestScenario_Case3_ExportZero_BatteryAbsorbsSurplus(t *testing.T) {
 		if !math.IsNaN(sc.CurtailToW) && sc.CurtailToW < 1900 {
 			t.Errorf("solar curtailed to %.0fW; battery has headroom, should not curtail", sc.CurtailToW)
 		}
+	}
+	logDecisions(t, plan)
+}
+
+// Regression for the demo S1 *discovery-gap* overshoot: the dashboard starts
+// the EV session and publishes the export-limit event at the same instant,
+// but the hub doesn't fetch the new event until its next discovery cycle
+// (~15-20 s later).  In the gap the orchestrator sees an active EV session
+// with no grid constraint and used to slam the EV to MaxCurrentA, dragging
+// the site into a multi-second 3 kW grid import.  Verify the unconstrained
+// branch now throttles to the post-battery solar surplus so we never *create*
+// a new import while waiting for the constraint to arrive.
+func TestScenario_S1_DiscoveryGap_NoImportFromUnconstrainedEV(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	// Solar 8 kW, battery 40 % SOC (5 kW max), 1 kW home load, EV session just
+	// started.  No CSIP control yet (mirrors the gap between the EV session
+	// command and the next discovery walk fetching the export limit).
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 8000, 10000)}
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 40, 5000)}
+	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 32.0, 230.0)}
+	s.Grid.NetW = -7000 // exporting 7 kW pre-EV-start
+
+	plan := opt.Optimize(s)
+
+	// Find the EV command.
+	if len(plan.EVSECommands) == 0 {
+		t.Fatal("expected EVSE command")
+	}
+	evA := plan.EVSECommands[0].MaxCurrentA
+
+	// Find the battery charge command.
+	battChargeW := 0.0
+	for _, bc := range plan.BatteryCommands {
+		if bc.SetpointW < 0 {
+			battChargeW += -bc.SetpointW
+		}
+	}
+
+	// Predicted site export after this tick's commands settle:
+	//   8000 (solar) − 1000 (load) − battery_charge − EV
+	predictedExportW := 8000.0 - 1000.0 - battChargeW - evA*230.0
+	if predictedExportW < -100 { // tolerate sub-100W rounding
+		t.Errorf("unconstrained EV would create %.0fW grid import (battery=%.0fW, EV=%.1fA) — self-consumption guardrail failed",
+			-predictedExportW, battChargeW, evA)
+	}
+	logDecisions(t, plan)
+}
+
+// Regression for the "demo S1 overshoot": after the first tick commands
+// battery=-5kW and EV=6A, the Modbus meter settles to the new export within
+// ~1 s but OCPP MeterValues lag ~10 s, so evseW still reports the pre-event
+// current.  The old conservation identity
+//   unconstrainedExportW = signedNetExportW + measuredBatteryAbsorbW + evseW
+// then over-estimated the surplus, the pre-flight branch boosted the EV by
+// 15-20 A, and the site flipped from a clean +620 W export into a 3.4 kW
+// import.  Verify the optimizer no longer over-tightens the EV when evseW is
+// stale relative to the meter.
+func TestScenario_S1_ExportOvershoot_StaleEVMeasurement(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 8000, 10000)}
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 40, 5000)}
+	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 32.0, 230.0)}
+	s.Grid.NetW = -7000
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Base: model.DERControlBase{OpModExpLimW: ap(1000)},
+	}
+
+	// Tick 1 — first time the export limit is seen.  Soft-start should clamp
+	// the EV to 6 A, battery should absorb 5 kW.
+	plan := opt.Optimize(s)
+	if len(plan.EVSECommands) == 0 {
+		t.Fatal("tick 1: expected EVSE command")
+	}
+	if plan.EVSECommands[0].MaxCurrentA != 6.0 {
+		t.Errorf("tick 1: EV MaxCurrentA = %.1fA, want 6.0 (soft-start)",
+			plan.EVSECommands[0].MaxCurrentA)
+	}
+
+	// Tick 2 — the meter has settled to the post-command export (~620 W) but
+	// OCPP MeterValues hasn't arrived yet, so evseW still reports the pre-event
+	// current.  Simulate this skew explicitly.
+	s.Batteries[0].PowerW = -5000   // battery actuator confirmed
+	s.EVSEs[0].CurrentA = 13.4      // stale OCPP reading from pre-event tick
+	s.EVSEs[0].PowerW = 13.4 * 230  // ≈ 3082 W stale
+	s.Grid.NetW = -620              // meter shows 620 W export (post-command reality)
+
+	plan = opt.Optimize(s)
+
+	if len(plan.EVSECommands) == 0 {
+		t.Fatal("tick 2: expected EVSE command")
+	}
+	ev2 := plan.EVSECommands[0].MaxCurrentA
+	if ev2 > 8.0 {
+		t.Errorf("tick 2: EV ramped to %.1fA from 6A despite stale measurement — the pre-flight branch over-tightened (want ≤ 8A)", ev2)
+	}
+
+	// Predicted post-command export should sit just below the 1 kW limit, not
+	// drive the site into import.
+	battCmdW := 0.0
+	for _, bc := range plan.BatteryCommands {
+		if bc.SetpointW < 0 {
+			battCmdW += -bc.SetpointW
+		}
+	}
+	predictedExportW := 8000.0 - 1000.0 - battCmdW - ev2*230.0
+	if predictedExportW < 0 {
+		t.Errorf("tick 2: predicted export %.0fW < 0 — site would import (battery=%.0fW, EV=%.1fA)",
+			predictedExportW, battCmdW, ev2)
+	}
+	if predictedExportW > 1000 {
+		t.Errorf("tick 2: predicted export %.0fW exceeds 1 kW limit (battery=%.0fW, EV=%.1fA)",
+			predictedExportW, battCmdW, ev2)
 	}
 	logDecisions(t, plan)
 }

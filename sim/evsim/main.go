@@ -548,6 +548,13 @@ func (h *csHandler) Inject(cs ocpp2.ChargingStation, body []byte) error {
 				h.batt.mu.Unlock()
 				log.Printf("evsim: injected SOC=%.1f%%", v)
 			}
+		case "set_sim_speed":
+			if v, ok := req["speed"].(float64); ok && v > 0 {
+				h.batt.mu.Lock()
+				h.batt.SimSpeed = v
+				h.batt.mu.Unlock()
+				log.Printf("evsim: sim-speed set to %.1f×", v)
+			}
 		default:
 			return fmt.Errorf("inject: unknown action %q", action)
 		}

@@ -12,6 +12,7 @@ import (
 // exportGuard carries state across ticks for the conservative export-limit rule.
 type exportGuard struct {
 	evSetpointA     float64 // last EV current limit issued; NaN until first command
+	evCmdW          float64 // last EV power commanded (current × voltage at command time); NaN = none
 	batteryAbsorbW  float64 // last battery absorption (positive watts) commanded; NaN = none
 	safeCount       int     // consecutive ticks where actual export ≤ conservative target
 	activeLimitW    float64 // limit value when guard was reset; NaN = no active limit
@@ -73,6 +74,7 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 		ExportRelaxCycles:    5,
 		expGuard: exportGuard{
 			evSetpointA:     math.NaN(),
+			evCmdW:          math.NaN(),
 			batteryAbsorbW:  math.NaN(),
 			activeLimitW:    math.NaN(),
 			filteredExportW: math.NaN(),
@@ -295,13 +297,13 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	batteries []BatteryState, plan *Plan,
 ) ([]BatteryState, float64) {
 	if math.IsNaN(limits.exportLimitW) {
-		o.expGuard = exportGuard{evSetpointA: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: math.NaN(), filteredExportW: math.NaN()}
+		o.expGuard = exportGuard{evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: math.NaN(), filteredExportW: math.NaN()}
 		return batteries, surplusW
 	}
 
 	// New limit value → start the guard fresh.
 	if limits.exportLimitW != o.expGuard.activeLimitW {
-		o.expGuard = exportGuard{evSetpointA: math.NaN(), activeLimitW: limits.exportLimitW, filteredExportW: math.NaN()}
+		o.expGuard = exportGuard{evSetpointA: math.NaN(), evCmdW: math.NaN(), batteryAbsorbW: math.NaN(), activeLimitW: limits.exportLimitW, filteredExportW: math.NaN()}
 	}
 
 	margin := o.ExportMarginFrac
@@ -350,17 +352,65 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 
 	// Measured battery absorption *before* we issue any commands this tick.
-	// This is the quantity needed by the conservation identity, since signedNet
-	// from the meter reflects whatever the battery was doing prior to this tick.
 	measuredBatteryAbsorbW := 0.0
 	for _, b := range batteries {
 		if b.Connected && b.PowerW < 0 {
 			measuredBatteryAbsorbW += -b.PowerW
 		}
 	}
-	// Unconstrained export at the site = (solar − load).  Conservation identity
-	// using the meter reading, which already reflects current battery and EV.
-	unconstrainedExportW := signedNetExportW + measuredBatteryAbsorbW + evseW
+
+	// Detect an active EV early so we can (a) drop stale evCmdW state if the
+	// session has ended and (b) decide which value to use in the conservation
+	// identity below.  The full EV control block re-uses this pointer.
+	var ev *EVSEState
+	for i := range evses {
+		if evses[i].Connected && evses[i].SessionActive &&
+			!hasEVSECommand(plan.EVSECommands, evses[i].StationID, evses[i].ConnectorID) {
+			ev = &evses[i]
+			break
+		}
+	}
+	if ev == nil {
+		o.expGuard.evSetpointA = math.NaN()
+		o.expGuard.evCmdW = math.NaN()
+	}
+
+	// Conservation identity for unconstrained export (= solar − home_load):
+	//   signedNetExportW + batteryAbsorbW + evW
+	// All three terms must reflect the same instant.  In practice the SunSpec
+	// meter and battery poll at ~1 s but OCPP MeterValues lag ~10 s — so right
+	// after we command a new EV current, signedNetExportW already shows the new
+	// draw while measured evseW still reports the old current.  That mismatch
+	// inflates unconstrainedExportW, the pre-flight check below thinks the hard
+	// limit will be breached, and ratchets the EV up by 15-20 A — driving the
+	// site from a steady export into a multi-kW import.
+	//
+	// Once we have prior commanded values, devices have settled to them by the
+	// next 15 s tick.  Use the commands so the three terms are consistent.
+	// On the first tick of an episode (no prior commands), fall back to the
+	// measured values, which are mutually consistent in pre-event steady state.
+	identityBattW := measuredBatteryAbsorbW
+	if !math.IsNaN(o.expGuard.batteryAbsorbW) {
+		identityBattW = o.expGuard.batteryAbsorbW
+	}
+	identityEvW := evseW
+	if !math.IsNaN(o.expGuard.evCmdW) {
+		identityEvW = o.expGuard.evCmdW
+	}
+	unconstrainedExportW := signedNetExportW + identityBattW + identityEvW
+
+	// Hard cap: solar − home_load can never exceed total solar generation.
+	// Defends against any residual measurement skew slipping past the
+	// commanded-value substitution above.
+	totalSolarW := 0.0
+	for _, sol := range solar {
+		if sol.Connected {
+			totalSolarW += sol.PowerW
+		}
+	}
+	if unconstrainedExportW > totalSolarW {
+		unconstrainedExportW = totalSolarW
+	}
 
 	// ── Battery: command this tick's absorption with SOC-taper handoff ───────
 	// The battery is the workhorse and runs at its taper-adjusted max charge
@@ -442,16 +492,8 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 
 	// ── EV: trim the residual with a filtered P-controller ───────────────────
-	// Find the first active EVSE; we control one per export-limit event.
-	var ev *EVSEState
-	for i := range evses {
-		if evses[i].Connected && evses[i].SessionActive &&
-			!hasEVSECommand(plan.EVSECommands, evses[i].StationID, evses[i].ConnectorID) {
-			ev = &evses[i]
-			break
-		}
-	}
-
+	// `ev` was located earlier so the conservation identity could detect a
+	// stale session.
 	if ev != nil {
 		voltage := ev.VoltageV
 		if voltage <= 0 {
@@ -540,6 +582,7 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 		plan.AddDecision("csip/export-limit", reason,
 			fmt.Sprintf("EVSE %s → %.1fA", ev.StationID, newCurrentA))
 		o.expGuard.evSetpointA = newCurrentA
+		o.expGuard.evCmdW = newCurrentA * voltage
 		surplusW -= newCurrentA * voltage
 	}
 
@@ -558,12 +601,6 @@ func (o *DefaultOptimizer) applyExportLimitRule(
 	}
 	finalExcessW := math.Max(0, unconstrainedExportW-conservativeW-batteryAbsorbW-commandedEvW)
 	if finalExcessW > 1 {
-		totalSolarW := 0.0
-		for _, sol := range solar {
-			if sol.Connected {
-				totalSolarW += sol.PowerW
-			}
-		}
 		if totalSolarW > 0 {
 			fraction := math.Min(1.0, finalExcessW/totalSolarW)
 			for _, sol := range solar {
@@ -747,19 +784,37 @@ func applyEVChargingRule(evses []EVSEState, limits gridConstraints, netW, solarW
 			continue
 		}
 
-		// No grid constraint active: charge at full EVSE rated current.
-		// Solar-surplus throttling only makes sense when export is capped —
-		// without a constraint the EV is free to draw from the grid.
+		// No grid constraint active.  Default to full rate, but cap to the
+		// available solar surplus (after this tick's battery command) when
+		// solar is producing — otherwise we'd be importing from the grid to
+		// charge the EV, defeating behind-the-meter PV.  Matters most during
+		// the discovery gap: when a new export-limit event has been published
+		// but the hub hasn't fetched it yet, the EV would otherwise slam to
+		// full and create a several-second 3 kW import.
+		//
+		// surplusW is already net of measured EV consumption (see
+		// computePowerBalance); add evse.PowerW back to size the new EV
+		// command from the unconsumed budget.
 		if math.IsNaN(limits.exportLimitW) && math.IsNaN(limits.importLimitW) {
+			targetA := evse.MaxCurrentA
+			reason := fmt.Sprintf("no grid constraint; charging EVSE %s at full %.1fA",
+				evse.StationID, evse.MaxCurrentA)
+			if solarW > 0 {
+				evBudgetW := surplusW + evse.PowerW
+				budgetA := evBudgetW / voltage
+				if budgetA < targetA {
+					targetA = math.Max(minChargeA, budgetA)
+					reason = fmt.Sprintf("no grid constraint but solar budget %.0fW < EV max %.0fW; throttling EVSE %s to %.1fA to avoid grid import",
+						evBudgetW, evse.MaxCurrentA*voltage, evse.StationID, targetA)
+				}
+			}
 			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
 				StationID:   evse.StationID,
 				ConnectorID: evse.ConnectorID,
-				MaxCurrentA: evse.MaxCurrentA,
+				MaxCurrentA: targetA,
 			})
-			plan.AddDecision("ev-charging",
-				fmt.Sprintf("no grid constraint; charging EVSE %s at full %.1fA",
-					evse.StationID, evse.MaxCurrentA),
-				fmt.Sprintf("EVSE %s at %.1fA", evse.StationID, evse.MaxCurrentA))
+			plan.AddDecision("ev-charging", reason,
+				fmt.Sprintf("EVSE %s at %.1fA", evse.StationID, targetA))
 			continue
 		}
 
