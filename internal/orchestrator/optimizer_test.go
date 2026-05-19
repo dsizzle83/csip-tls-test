@@ -683,6 +683,76 @@ func TestScenario_Case3_ExportZero_BatteryAbsorbsSurplus(t *testing.T) {
 	logDecisions(t, plan)
 }
 
+// Regression for the demo S2 oscillation: solar 1 kW, home load 2 kW,
+// CSIP import cap 500 W.  Pre-fix, the stateless import-limit rule fired
+// only when import strictly exceeded the limit, then applyRestoreRule
+// idled the battery on the next tick, the import jumped back to 1 kW,
+// and the system chattered at the tick period (battery 0→500→0,
+// grid 1000→500→1000).  The fixed rule must hold the discharge across
+// multiple ticks without an external prompt and settle at a steady
+// operating point inside the limit.
+func TestScenario_S2_ImportLimit_NoOscillation(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 1000, 3000)}
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 75, 5000)}
+	s.Grid.NetW = 1000 // importing 1 kW
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Base: model.DERControlBase{OpModImpLimW: ap(500)},
+	}
+
+	// Tick 1 — should command the battery to discharge.
+	plan1 := opt.Optimize(s)
+	dis1 := 0.0
+	for _, bc := range plan1.BatteryCommands {
+		if bc.SetpointW > 0 {
+			dis1 = bc.SetpointW
+		}
+	}
+	if dis1 < 400 {
+		t.Fatalf("tick 1: battery discharge = %.0fW, want ≥400W to pull import below 500W limit", dis1)
+	}
+
+	// Tick 2 — meter now reflects the battery's contribution: import has
+	// dropped to ~500W (right at the hard limit).  The pre-fix rule would
+	// see "at limit, do nothing", let restore idle the battery, and the
+	// import would spike back to 1 kW.  The new rule must hold.
+	s.Batteries[0].PowerW = dis1
+	s.Grid.NetW = math.Max(0, 1000-dis1) // unconstrained 1 kW import minus battery's contribution
+	plan2 := opt.Optimize(s)
+	dis2 := 0.0
+	idledByRestore := false
+	for _, bc := range plan2.BatteryCommands {
+		if bc.SetpointW > 0 {
+			dis2 = bc.SetpointW
+		}
+		if bc.SetpointW == 0 && bc.Connect != nil && *bc.Connect {
+			idledByRestore = true
+		}
+	}
+	if idledByRestore {
+		t.Fatalf("tick 2: applyRestoreRule idled the battery while import limit is active — would cause oscillation")
+	}
+	if dis2 < 400 {
+		t.Errorf("tick 2: battery discharge = %.0fW, want held near tick 1 value %.0fW to avoid oscillation", dis2, dis1)
+	}
+
+	// Tick 3 — another stable read from the meter at the limit.  Must still hold.
+	s.Batteries[0].PowerW = dis2
+	s.Grid.NetW = math.Max(0, 1000-dis2)
+	plan3 := opt.Optimize(s)
+	dis3 := 0.0
+	for _, bc := range plan3.BatteryCommands {
+		if bc.SetpointW > 0 {
+			dis3 = bc.SetpointW
+		}
+	}
+	if dis3 < 400 {
+		t.Errorf("tick 3: battery discharge = %.0fW, want held to defend import limit", dis3)
+	}
+	logDecisions(t, plan3)
+}
+
 // Regression for the demo S1 *discovery-gap* overshoot: the dashboard starts
 // the EV session and publishes the export-limit event at the same instant,
 // but the hub doesn't fetch the new event until its next discovery cycle

@@ -19,6 +19,19 @@ type exportGuard struct {
 	filteredExportW float64 // low-pass-filtered actual export, used by the controller
 }
 
+// importGuard carries state across ticks for the conservative import-limit rule.
+// Mirrors exportGuard: without sticky state the rule fires only when import
+// strictly exceeds the limit, then applyRestoreRule idles the battery on the
+// next tick, the import jumps back over the limit, and the system oscillates
+// at the tick period.  Holding the prior discharge command between ticks
+// (with a relax-cycle ramp-down) settles the controller at a steady operating
+// point just under the limit.
+type importGuard struct {
+	dischargeW   float64 // last battery discharge commanded (positive watts); NaN = none
+	safeCount    int     // consecutive ticks where importW ≤ hard limit
+	activeLimitW float64 // limit value when guard was reset; NaN = no active limit
+}
+
 // DefaultOptimizer is a rule-based + heuristic optimizer.
 //
 // Priority order:
@@ -56,12 +69,21 @@ type DefaultOptimizer struct {
 	// allowed to relax.  Default 5.
 	ExportRelaxCycles int
 
+	// ImportMarginFrac is the safety margin applied to the import limit.
+	// The optimizer targets limit×(1−margin) so the battery sits comfortably
+	// inside the import window rather than chattering across the boundary.
+	// Default 0.20.
+	ImportMarginFrac float64
+
 	// NowFunc returns the current time.  Nil means time.Now.
 	// Override in tests to inject a deterministic clock.
 	NowFunc func() time.Time
 
 	// expGuard holds per-limit-session state for the export-limit rule.
 	expGuard exportGuard
+
+	// impGuard holds per-limit-session state for the import-limit rule.
+	impGuard importGuard
 }
 
 // NewDefaultOptimizer returns an optimizer with sensible defaults.
@@ -72,12 +94,17 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 		ExcessSolarThreshold: 100.0,
 		ExportMarginFrac:     0.20,
 		ExportRelaxCycles:    5,
+		ImportMarginFrac:     0.20,
 		expGuard: exportGuard{
 			evSetpointA:     math.NaN(),
 			evCmdW:          math.NaN(),
 			batteryAbsorbW:  math.NaN(),
 			activeLimitW:    math.NaN(),
 			filteredExportW: math.NaN(),
+		},
+		impGuard: importGuard{
+			dischargeW:   math.NaN(),
+			activeLimitW: math.NaN(),
 		},
 	}
 }
@@ -127,7 +154,7 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	batteries, surplusW = o.applyExportLimitRule(state.Solar, state.EVSEs, evseW, limits, state.Grid.NetW, o.SOCFullThreshold, surplusW, batteries, &plan)
 
 	// Rule 3.5: Import limit enforcement — discharge battery to reduce grid import.
-	batteries = applyImportLimitRule(batteries, limits, state.Grid.NetW, o.SOCReserve, &plan)
+	batteries = o.applyImportLimitRule(batteries, limits, state.Grid.NetW, o.SOCReserve, &plan)
 
 	// Rule 4: Self-consumption — route solar surplus to battery.
 	batteries, surplusW = applySelfConsumptionRule(batteries, surplusW, o.ExcessSolarThreshold, o.SOCFullThreshold, &plan)
@@ -908,27 +935,101 @@ func applyEVChargingRule(evses []EVSEState, limits gridConstraints, netW, solarW
 	}
 }
 
-// applyImportLimitRule discharges batteries when grid import exceeds the CSIP
-// import limit.  It runs after the export-limit rule (which handles EVSEs and
-// the charge direction) so it only fires on genuine import over-limit events.
-func applyImportLimitRule(batteries []BatteryState, limits gridConstraints, netW, socReserve float64, plan *Plan) []BatteryState {
+// applyImportLimitRule discharges batteries to defend the CSIP import limit.
+// Stateful: it ratchets discharge up immediately when import exceeds the hard
+// limit, holds the commanded discharge across ticks (preventing
+// applyRestoreRule from idling the battery), and ramps down only after the
+// import has stayed inside the limit for ExportRelaxCycles consecutive ticks.
+// Without this stickiness the system oscillates at the tick period as
+// described in the demo S2 (import 1 kW → discharge 500 W → import 500 W →
+// restore idles → import 1 kW → ...).
+func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits gridConstraints, netW, socReserve float64, plan *Plan) []BatteryState {
 	if math.IsNaN(limits.importLimitW) {
+		o.impGuard = importGuard{dischargeW: math.NaN(), activeLimitW: math.NaN()}
 		return batteries
 	}
+
+	// New limit value → restart the guard fresh.
+	if limits.importLimitW != o.impGuard.activeLimitW {
+		o.impGuard = importGuard{dischargeW: math.NaN(), activeLimitW: limits.importLimitW}
+	}
+
 	importW := 0.0
 	if !math.IsNaN(netW) {
 		importW = math.Max(0, netW) // positive netW = importing from grid
 	}
+
+	// Measured battery discharge before this tick's commands.  Used as the
+	// first-tick fallback for the conservation identity below.
+	measuredDischargeW := 0.0
+	for _, b := range batteries {
+		if b.Connected && b.PowerW > 0 {
+			measuredDischargeW += b.PowerW
+		}
+	}
+
+	// Conservation identity: the meter import already reflects whatever the
+	// battery is currently discharging.  So the unconstrained import — what
+	// the meter would show with the battery idle — is importW + priorDischarge.
+	// Once we have a prior command, devices have settled to it by the next
+	// 15 s tick, so the commanded value is the consistent term to use.
+	priorDischargeW := measuredDischargeW
+	if !math.IsNaN(o.impGuard.dischargeW) {
+		priorDischargeW = o.impGuard.dischargeW
+	}
+	unconstrainedImportW := importW + priorDischargeW
+
+	margin := o.ImportMarginFrac
+	if margin <= 0 {
+		margin = 0.20
+	}
+	relaxCycles := o.ExportRelaxCycles
+	if relaxCycles <= 0 {
+		relaxCycles = 5
+	}
+	conservativeLimitW := limits.importLimitW * (1.0 - margin)
+
+	// Hysteresis: count safe ticks against the hard limit, not the
+	// conservative one, so we don't refuse to relax when the controller is
+	// sitting steady at the conservative target.
 	if importW <= limits.importLimitW {
-		return batteries // within the allowed import window
+		o.impGuard.safeCount++
+	} else {
+		o.impGuard.safeCount = 0
+	}
+
+	// Target discharge brings unconstrained import down to the conservative limit.
+	targetDischargeW := math.Max(0, unconstrainedImportW-conservativeLimitW)
+
+	// Slew: ratchet up immediately (defend the limit fast), ramp down only
+	// after safeCount accumulates so we don't chatter across the boundary.
+	commandedDischargeW := targetDischargeW
+	if !math.IsNaN(o.impGuard.dischargeW) {
+		prior := o.impGuard.dischargeW
+		if targetDischargeW < prior {
+			if o.impGuard.safeCount < relaxCycles {
+				commandedDischargeW = prior // hold
+			} else {
+				const maxRelaxW = 250.0
+				commandedDischargeW = math.Max(targetDischargeW, prior-maxRelaxW)
+			}
+		}
+	}
+
+	if commandedDischargeW < 50 {
+		// Nothing to defend; let restore idle the battery and clear guard so
+		// a fresh episode starts cleanly on the next over-limit event.
+		o.impGuard.dischargeW = math.NaN()
+		return batteries
 	}
 
 	result := make([]BatteryState, len(batteries))
 	copy(result, batteries)
-	deficit := importW - limits.importLimitW
+	remaining := commandedDischargeW
+	totalCommanded := 0.0
 
 	for i, b := range result {
-		if deficit <= 1 {
+		if remaining < 1 {
 			break
 		}
 		if !b.Connected || hasBatteryCommand(plan.BatteryCommands, b.Name) {
@@ -937,7 +1038,7 @@ func applyImportLimitRule(batteries []BatteryState, limits gridConstraints, netW
 		if !math.IsNaN(b.SOC) && b.SOC <= socReserve {
 			continue
 		}
-		discharge := math.Min(b.AvailableDischargeW(), deficit)
+		discharge := math.Min(b.AvailableDischargeW(), remaining)
 		if discharge <= 0 {
 			continue
 		}
@@ -947,9 +1048,19 @@ func applyImportLimitRule(batteries []BatteryState, limits gridConstraints, netW
 			SetpointW: discharge,
 		})
 		plan.AddDecision("csip/import-limit",
-			fmt.Sprintf("import %.0fW > limit %.0fW; discharging %s at %.0fW", importW, limits.importLimitW, b.Name, discharge),
+			fmt.Sprintf("import %.0fW vs limit %.0fW (target ≤%.0fW); unconstrained %.0fW; %s discharges %.0fW",
+				importW, limits.importLimitW, conservativeLimitW, unconstrainedImportW, b.Name, discharge),
 			fmt.Sprintf("%s → %.0fW discharge", b.Name, discharge))
-		deficit -= discharge
+		remaining -= discharge
+		totalCommanded += discharge
+	}
+
+	if totalCommanded > 0 {
+		o.impGuard.dischargeW = totalCommanded
+	} else {
+		// No battery could actually discharge (all at reserve, etc.).  Clear
+		// guard so we don't carry a phantom setpoint.
+		o.impGuard.dischargeW = math.NaN()
 	}
 	return result
 }
