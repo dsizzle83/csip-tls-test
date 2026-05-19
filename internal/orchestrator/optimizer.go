@@ -28,7 +28,8 @@ type exportGuard struct {
 // point just under the limit.
 type importGuard struct {
 	dischargeW   float64 // last battery discharge commanded (positive watts); NaN = none
-	safeCount    int     // consecutive ticks where importW ≤ hard limit
+	safeCount    int     // consecutive ticks where importW ≤ hard limit (battery ramp-down gate)
+	evSafeCount  int     // consecutive ticks where 0 ≤ importW ≤ hard limit (EV resume gate)
 	activeLimitW float64 // limit value when guard was reset; NaN = no active limit
 }
 
@@ -75,6 +76,14 @@ type DefaultOptimizer struct {
 	// Default 0.20.
 	ImportMarginFrac float64
 
+	// EVImportCooldownCycles is the number of consecutive ticks where actual
+	// grid import is positive and under the hard limit before EV charging is
+	// re-allowed after an import-limit event.  Negative grid (site exporting
+	// due to battery transient) resets the count, preventing the EV from
+	// resuming during the over-discharge settling period.
+	// Default 20 (≈ 1 min at a 3 s engine tick).
+	EVImportCooldownCycles int
+
 	// NowFunc returns the current time.  Nil means time.Now.
 	// Override in tests to inject a deterministic clock.
 	NowFunc func() time.Time
@@ -93,8 +102,9 @@ func NewDefaultOptimizer() *DefaultOptimizer {
 		SOCFullThreshold:     95.0,
 		ExcessSolarThreshold: 100.0,
 		ExportMarginFrac:     0.20,
-		ExportRelaxCycles:    5,
-		ImportMarginFrac:     0.20,
+		ExportRelaxCycles:      5,
+		ImportMarginFrac:       0.20,
+		EVImportCooldownCycles: 20,
 		expGuard: exportGuard{
 			evSetpointA:     math.NaN(),
 			evCmdW:          math.NaN(),
@@ -170,7 +180,16 @@ func (o *DefaultOptimizer) Optimize(state SystemState) Plan {
 	batteries, surplusW = applyDemandResponseRule(batteries, surplusW, o.SOCReserve, false, isPeak, peakReason, &plan)
 
 	// Rule 6: EV charging allocation.
-	applyEVChargingRule(state.EVSEs, limits, state.Grid.NetW, solarW, surplusW, &plan)
+	// Suppress EV while the import guard hasn't accumulated enough consecutive
+	// ticks of stable positive import — prevents EV from resuming during the
+	// battery over-discharge transient that briefly makes the site look like
+	// it has surplus (grid.NetW < 0).
+	cooldown := o.EVImportCooldownCycles
+	if cooldown <= 0 {
+		cooldown = 20
+	}
+	evImportSuppressed := !math.IsNaN(limits.importLimitW) && o.impGuard.evSafeCount < cooldown
+	applyEVChargingRule(state.EVSEs, limits, state.Grid.NetW, solarW, surplusW, evImportSuppressed, &plan)
 
 	// Final: restore unconstrained devices so prior setpoints don't persist.
 	applyRestoreRule(state.Solar, batteries, o.SOCReserve, &plan)
@@ -778,7 +797,12 @@ func applyDemandResponseRule(batteries []BatteryState, surplusW, socReserve floa
 // When an export limit is active and there is solar surplus but below the IEC 61851
 // minimum 6 A, the rule supplements from grid to reach 6 A (provided import headroom
 // allows), rather than suspending the session entirely.
-func applyEVChargingRule(evses []EVSEState, limits gridConstraints, netW, solarW, surplusW float64, plan *Plan) {
+//
+// evImportSuppressed gates EV resumption while the import guard is cooling down:
+// the EV must not charge until the site has demonstrated N consecutive ticks of
+// stable positive import under the cap, preventing it from surging during the
+// battery over-discharge transient.
+func applyEVChargingRule(evses []EVSEState, limits gridConstraints, netW, solarW, surplusW float64, evImportSuppressed bool, plan *Plan) {
 	const minChargeA = 6.0 // IEC 61851-1 minimum AC charge current
 
 	for _, evse := range evses {
@@ -787,6 +811,20 @@ func applyEVChargingRule(evses []EVSEState, limits gridConstraints, netW, solarW
 		}
 		// Skip EVSEs already commanded (e.g. by export-limit rule).
 		if hasEVSECommand(plan.EVSECommands, evse.StationID, evse.ConnectorID) {
+			continue
+		}
+
+		// Hold EV at zero while the import guard is cooling down.
+		if evImportSuppressed {
+			plan.EVSECommands = append(plan.EVSECommands, EVSECommand{
+				StationID:   evse.StationID,
+				ConnectorID: evse.ConnectorID,
+				MaxCurrentA: 0,
+			})
+			plan.AddDecision("import-limit",
+				fmt.Sprintf("EVSE %s suspended: import guard cooling down (need stable import ticks)",
+					evse.StationID),
+				"EVSE suspended during import-limit cooldown")
 			continue
 		}
 
@@ -970,14 +1008,12 @@ func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits
 
 	// Conservation identity: the meter import already reflects whatever the
 	// battery is currently discharging.  So the unconstrained import — what
-	// the meter would show with the battery idle — is importW + priorDischarge.
-	// Once we have a prior command, devices have settled to it by the next
-	// 15 s tick, so the commanded value is the consistent term to use.
-	priorDischargeW := measuredDischargeW
-	if !math.IsNaN(o.impGuard.dischargeW) {
-		priorDischargeW = o.impGuard.dischargeW
-	}
-	unconstrainedImportW := importW + priorDischargeW
+	// the meter would show with the battery idle — is importW + measured discharge.
+	// We intentionally use the measured (not commanded) value: if Modbus readings
+	// are stale across consecutive engine ticks, substituting the prior commanded
+	// value compounds it each tick (unconstrained grows without bound), causing
+	// runaway over-discharge followed by oscillation.
+	unconstrainedImportW := importW + measuredDischargeW
 
 	margin := o.ImportMarginFrac
 	if margin <= 0 {
@@ -998,6 +1034,16 @@ func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits
 		o.impGuard.safeCount = 0
 	}
 
+	// evSafeCount gates EV resumption: only increments when the site is
+	// actually importing (positive netW) and under the cap.  Negative netW
+	// (export due to battery over-discharge) resets it so the EV cannot
+	// resume during the over-discharge settling transient.
+	if !math.IsNaN(netW) && netW >= 0 && netW <= limits.importLimitW {
+		o.impGuard.evSafeCount++
+	} else {
+		o.impGuard.evSafeCount = 0
+	}
+
 	// Target discharge brings unconstrained import down to the conservative limit.
 	targetDischargeW := math.Max(0, unconstrainedImportW-conservativeLimitW)
 
@@ -1012,6 +1058,7 @@ func (o *DefaultOptimizer) applyImportLimitRule(batteries []BatteryState, limits
 			} else {
 				const maxRelaxW = 250.0
 				commandedDischargeW = math.Max(targetDischargeW, prior-maxRelaxW)
+				o.impGuard.safeCount = 0 // restart hold window after each ramp-down step
 			}
 		}
 	}

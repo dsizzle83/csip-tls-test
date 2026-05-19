@@ -478,7 +478,7 @@ func TestEVChargingRule_SuspendsAtImportLimit(t *testing.T) {
 	limits := gridConstraints{exportLimitW: math.NaN(), importLimitW: 3000, maxLimitW: math.NaN()}
 	plan := &Plan{}
 
-	applyEVChargingRule(evses, limits, 3500, 0, 0, plan) // grid 3500 W > limit 3000 W
+	applyEVChargingRule(evses, limits, 3500, 0, 0, false, plan) // grid 3500 W > limit 3000 W
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
@@ -493,7 +493,7 @@ func TestEVChargingRule_FullRateWithAmpleSolar(t *testing.T) {
 	plan := &Plan{}
 
 	// 10 kW solar, 10 kW surplus → EVSE (3.68 kW) gets full rate.
-	applyEVChargingRule(evses, noLimits(), math.NaN(), 10000, 10000, plan)
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 10000, 10000, false, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
@@ -511,7 +511,7 @@ func TestEVChargingRule_SuspendsWhenZeroSurplusExportAndImportLimited(t *testing
 	// budgetW=0 → can't supplement (import headroom=0 from tight import limit), suspend.
 	limits := gridConstraints{exportLimitW: 5000, importLimitW: 0, maxLimitW: math.NaN()}
 	// netW=0 → import headroom = 0 - 0 = 0; supplement of 1380W > 0 headroom → suspend.
-	applyEVChargingRule(evses, limits, 0, 1000, 0, plan)
+	applyEVChargingRule(evses, limits, 0, 1000, 0, false, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
@@ -528,7 +528,7 @@ func TestEVChargingRule_FullChargeWhenUnconstrainedAndNoSolar(t *testing.T) {
 	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
 	plan := &Plan{}
 
-	applyEVChargingRule(evses, noLimits(), math.NaN(), 0, 0, plan)
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 0, 0, false, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
@@ -545,7 +545,7 @@ func TestEVChargingRule_ThrottledWhenUnconstrainedAndLowSolar(t *testing.T) {
 	plan := &Plan{}
 
 	// solar=2000W, surplus=2000W, EV max=32A*230=7360W → should throttle.
-	applyEVChargingRule(evses, noLimits(), math.NaN(), 2000, 2000, plan)
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 2000, 2000, false, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
@@ -563,7 +563,7 @@ func TestEVChargingRule_NoSessionNoCommand(t *testing.T) {
 	evses := []EVSEState{ruleEVSE("cs-001", false, 16, 230)} // no session
 	plan := &Plan{}
 
-	applyEVChargingRule(evses, noLimits(), math.NaN(), 10000, 10000, plan)
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 10000, 10000, false, plan)
 
 	if len(plan.EVSECommands) != 0 {
 		t.Errorf("expected no command with no active session, got %d", len(plan.EVSECommands))
@@ -729,7 +729,7 @@ func TestEVChargingRule_MinCurrentSupplementWithExportLimit(t *testing.T) {
 	plan := &Plan{}
 
 	// netW=-1000 (exporting 1kW), solarW=2000, surplusW=1000.
-	applyEVChargingRule(evses, limits, -1000, 2000, 1000, plan)
+	applyEVChargingRule(evses, limits, -1000, 2000, 1000, false, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
@@ -746,7 +746,7 @@ func TestEVChargingRule_NoSupplementNeededWhenUnconstrained(t *testing.T) {
 	plan := &Plan{}
 
 	// solar=20kW, surplus=20kW, EV max=32A*230=7360W → solar amply covers; full rate.
-	applyEVChargingRule(evses, noLimits(), math.NaN(), 20000, 20000, plan)
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 20000, 20000, false, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
@@ -765,7 +765,7 @@ func TestEVChargingRule_FullChargeWhenExportLimitActiveButImporting(t *testing.T
 	plan := &Plan{}
 
 	// netW=2880 → site importing 2880W (EV load + home - solar)
-	applyEVChargingRule(evses, limits, 2880, 2000, -880, plan)
+	applyEVChargingRule(evses, limits, 2880, 2000, -880, false, plan)
 
 	if len(plan.EVSECommands) == 0 {
 		t.Fatal("expected EVSE command")
@@ -781,7 +781,7 @@ func TestEVChargingRule_SkipsAlreadyCommandedEVSE(t *testing.T) {
 	evses := []EVSEState{ruleEVSE("cs-001", true, 32, 230)}
 	plan := &Plan{EVSECommands: []EVSECommand{{StationID: "cs-001", ConnectorID: 1, MaxCurrentA: 10}}}
 
-	applyEVChargingRule(evses, noLimits(), math.NaN(), 10000, 10000, plan)
+	applyEVChargingRule(evses, noLimits(), math.NaN(), 10000, 10000, false, plan)
 
 	if len(plan.EVSECommands) != 1 {
 		t.Errorf("must not add duplicate EVSE command, got %d", len(plan.EVSECommands))

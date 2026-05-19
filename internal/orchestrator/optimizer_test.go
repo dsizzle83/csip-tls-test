@@ -753,6 +753,57 @@ func TestScenario_S2_ImportLimit_NoOscillation(t *testing.T) {
 	logDecisions(t, plan3)
 }
 
+// Regression for import-limit oscillation when Modbus readings are stale.
+// The engine may tick faster than the poll interval (e.g. 5 s engine vs 10 s
+// poll).  If the prior *commanded* discharge is substituted into the
+// conservation identity, each stale tick adds it again to importW, driving
+// the target ever higher → massive over-discharge → ramp-down → guard reset →
+// battery idles → import spikes → repeat.  Using *measured* discharge breaks
+// the compounding: stale battery=0 means unconstrained = importW + 0, so the
+// target is stable and the guard's hold logic keeps the prior command in place.
+func TestScenario_S2_StaleReadings_NoOscillation(t *testing.T) {
+	opt := newOpt()
+	s := state0()
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 1000, 3000)}
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 75, 5000)}
+	s.Grid.NetW = 1000 // importing 1 kW with battery idle
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Base: model.DERControlBase{OpModImpLimW: ap(500)},
+	}
+
+	// Tick 1 — initial, battery PowerW == 0 (never discharged yet).
+	plan1 := opt.Optimize(s)
+	dis1 := 0.0
+	for _, bc := range plan1.BatteryCommands {
+		if bc.SetpointW > 0 {
+			dis1 = bc.SetpointW
+		}
+	}
+	if dis1 < 200 {
+		t.Fatalf("tick 1: battery discharge = %.0fW, want ≥200W", dis1)
+	}
+
+	// Ticks 2 and 3: Modbus readings are STALE — battery PowerW is still 0
+	// and grid is still 1000 W (Modbus hasn't polled yet).  The pre-fix code
+	// would compound prior commanded discharge into the target, causing runaway.
+	for tick := 2; tick <= 3; tick++ {
+		// Do NOT update s.Batteries[0].PowerW or s.Grid.NetW — simulate stale reads.
+		plan := opt.Optimize(s)
+		var dis float64
+		for _, bc := range plan.BatteryCommands {
+			if bc.SetpointW > dis {
+				dis = bc.SetpointW
+			}
+		}
+		// With the fix, target stays at dis1 and the hold logic keeps the command
+		// near dis1.  With the bug, it would compound to 2×, 3×, … of dis1.
+		if dis > dis1*1.5 {
+			t.Errorf("tick %d: battery discharge = %.0fW (%.1f× tick-1 %.0fW) — compounding detected",
+				tick, dis, dis/dis1, dis1)
+		}
+	}
+}
+
 // Regression for the demo S1 *discovery-gap* overshoot: the dashboard starts
 // the EV session and publishes the export-limit event at the same instant,
 // but the hub doesn't fetch the new event until its next discovery cycle
@@ -865,4 +916,88 @@ func TestScenario_S1_ExportOvershoot_StaleEVMeasurement(t *testing.T) {
 			predictedExportW, battCmdW, ev2)
 	}
 	logDecisions(t, plan)
+}
+
+// Regression for EV oscillation during the S2 import-limit battery transient.
+//
+// When the import guard first fires it commands heavy battery discharge to
+// bring the grid below the 500 W cap.  During that transient the meter may
+// briefly show net export (negative grid.NetW), making surplusW look large and
+// causing the EV charging rule to resume the EV mid-transient.  The resumed
+// EV then kicks the battery into a new over-limit event → suspend → repeat.
+//
+// Fix: EV is blocked until evSafeCount (consecutive ticks of positive import
+// ≤ cap) reaches EVImportCooldownCycles.  Negative netW resets evSafeCount.
+func TestScenario_S2_EV_BlockedDuringImportGuardTransient(t *testing.T) {
+	opt := newOpt()
+	// Shorten cooldown to 3 for test speed; default is 20.
+	opt.EVImportCooldownCycles = 3
+
+	s := state0()
+	s.Solar = []orchestrator.SolarState{solar("pv-0", 1000, 3000)}
+	s.Batteries = []orchestrator.BatteryState{battery("bat-0", 0, 75, 5000)}
+	s.EVSEs = []orchestrator.EVSEState{evse("cs-001", true, 0, 32.0, 230.0)}
+	s.Grid.NetW = 2380 // EV just started, site way over 500 W cap
+	s.CSIPControl = &orchestrator.CSIPControlState{
+		Base: model.DERControlBase{OpModImpLimW: ap(500)},
+	}
+
+	// Tick 1 — import over limit: EV must be suspended.
+	plan1 := opt.Optimize(s)
+	for _, ec := range plan1.EVSECommands {
+		if ec.MaxCurrentA > 0 {
+			t.Errorf("tick 1 (import over limit): EV should be suspended, got %.1fA", ec.MaxCurrentA)
+		}
+	}
+
+	// Tick 2 — battery over-shot, site now exporting (negative netW).
+	// evSafeCount should reset (negative grid), EV must remain suspended.
+	s.Batteries[0].PowerW = 3020
+	s.Grid.NetW = -2020
+	plan2 := opt.Optimize(s)
+	for _, ec := range plan2.EVSECommands {
+		if ec.MaxCurrentA > 0 {
+			t.Errorf("tick 2 (site exporting from over-discharge): EV should remain suspended, got %.1fA", ec.MaxCurrentA)
+		}
+	}
+
+	// Ticks 3–5 — stable positive import under cap; evSafeCount climbs.
+	// EV still blocked until cooldown (3) is reached.
+	s.Batteries[0].PowerW = 600
+	s.Grid.NetW = 400
+	for tick := 3; tick <= 4; tick++ {
+		plan := opt.Optimize(s)
+		for _, ec := range plan.EVSECommands {
+			if ec.MaxCurrentA > 0 {
+				t.Errorf("tick %d (cooldown not reached): EV should still be suspended, got %.1fA", tick, ec.MaxCurrentA)
+			}
+		}
+	}
+
+	// Tick 5 — cooldown complete (3 positive-import-under-cap ticks seen).
+	// EV charging rule runs normally; with surplusW < 0 it will likely stay at 0A,
+	// but the suppression flag must be gone (decision should not say "cooldown").
+	plan5 := opt.Optimize(s)
+	for _, d := range plan5.Decisions {
+		if d.Rule == "import-limit" && len(d.Reason) > 0 {
+			// "cooldown" is in the suspension message from evImportSuppressed
+			if contains(d.Reason, "cooldown") {
+				t.Errorf("tick 5 (cooldown expired): EV still suppressed by cooldown gate: %s", d.Reason)
+			}
+		}
+	}
+	logDecisions(t, plan5)
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || len(s) > 0 && containsStr(s, sub))
+}
+
+func containsStr(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }
