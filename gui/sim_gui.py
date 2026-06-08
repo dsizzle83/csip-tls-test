@@ -942,19 +942,22 @@ class HubPanel(ctk.CTkFrame):
         self._dev_header_row = r  # devices added dynamically below
 
     def _build_evse_section(self) -> None:
-        self._evse_start_row = 0
         self._sec_header(self._right, 0, "EVSE Stations")
-        self._evse_body_row = 1
+        # Dedicated container for the dynamically rebuilt EVSE rows. Clearing
+        # this frame's children never touches the plan section below.
+        self._evse_container = ctk.CTkFrame(self._right, fg_color="transparent")
+        self._evse_container.grid(row=1, column=0, columnspan=2,
+                                  sticky="ew", padx=0, pady=0)
+        self._evse_container.grid_columnconfigure(0, weight=1)
 
     def _build_plan_section(self) -> None:
-        r = 20  # placed below dynamic EVSE rows
-        self._sec_header(self._right, r, "Last Optimizer Plan"); r += 1
+        self._sec_header(self._right, 2, "Last Optimizer Plan")
         self._plan_lbl = ctk.CTkLabel(
             self._right, text="—",
             font=ctk.CTkFont(size=11, family="Courier New"),
             text_color=C_WHITE, anchor="w", justify="left", wraplength=340,
         )
-        self._plan_lbl.grid(row=r, column=0, columnspan=2,
+        self._plan_lbl.grid(row=3, column=0, columnspan=2,
                             sticky="w", padx=18, pady=2)
 
     # ── poll ─────────────────────────────────────────────────────────────────
