@@ -14,6 +14,12 @@
 //   - 3 DERPrograms (primacy 1/5/10) with rich DERControlLists.
 //   - MirrorUsagePoint POST flow: POST /mup → 201+Location,
 //     POST /mup/{n} → 204, GET /mup/{n} → the registered MUP.
+//
+// NOTE: this is a test *fixture* for driving CSIP DER-client (EUT) tests, not a
+// conformant IEEE 2030.5 server. It does not implement list paging query
+// parameters (s/l/a), does not emit a 400 for a missing Host header, and serves
+// a fixed resource tree. Do not present it as a server-under-test; the lab Test
+// Server fills that role.
 package gridsim
 
 import (
@@ -136,8 +142,14 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		s.handleGET(w, path, peerLFDI)
 	case http.MethodPost:
 		s.handlePOST(w, r, path, peerLFDI)
-	default:
+	case http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodHead, http.MethodOptions:
+		// Known HTTP method, not allowed here → 405 with an Allow header
+		// listing valid methods (GEN.045).
+		w.Header().Set("Allow", "GET, POST")
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	default:
+		// Unrecognised method token (e.g. FOO) → 501 Not Implemented.
+		w.WriteHeader(http.StatusNotImplemented)
 	}
 }
 
@@ -831,9 +843,13 @@ func (s *Server) ReceivedResponses() []model.Response {
 }
 
 // AddResource lets you inject or override resources in the tree,
-// useful for testing different scenarios.
+// useful for testing different scenarios. Safe to call while the server is
+// serving — the write is guarded by the same mutex the request handlers use
+// (audit finding Q-2).
 func (s *Server) AddResource(path string, resource interface{}) {
+	s.mu.Lock()
 	s.resources[path] = resource
+	s.mu.Unlock()
 }
 
 func int32Ptr(v int32) *int32 { return &v }

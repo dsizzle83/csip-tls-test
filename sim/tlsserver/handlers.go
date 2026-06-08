@@ -48,6 +48,11 @@ func dispatchHTTP(h http.Handler, raw []byte, peerLFDI string, connClose bool) [
 	if err != nil {
 		return httpResponse(400, "text/plain", []byte("bad request"))
 	}
+	// X-Peer-LFDI conveys the *verified* client identity to the handler. Strip
+	// any client-supplied value first so a peer can never assert its own LFDI;
+	// the only trustworthy source is the certificate from the TLS handshake
+	// (audit finding S-1). If peerLFDI is empty the header stays absent.
+	req.Header.Del("X-Peer-LFDI")
 	if peerLFDI != "" {
 		req.Header.Set("X-Peer-LFDI", peerLFDI)
 	}

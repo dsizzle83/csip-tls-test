@@ -2,6 +2,8 @@ package tlsserver
 
 import (
 	"flag"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,4 +69,34 @@ func TestRoute_DcapHeaders(t *testing.T) {
 			t.Errorf("DCAP response missing %q", want)
 		}
 	}
+}
+
+// TestDispatchHTTP_StripsClientPeerLFDI verifies the trust-boundary fix
+// (audit finding S-1): a client-supplied X-Peer-LFDI header is never trusted.
+// Only the cert-derived value passed by the TLS layer reaches the handler.
+func TestDispatchHTTP_StripsClientPeerLFDI(t *testing.T) {
+	echo := func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, r.Header.Get("X-Peer-LFDI"))
+	}
+	raw := []byte("GET /x HTTP/1.1\r\nHost: h\r\nX-Peer-LFDI: ATTACKER\r\n\r\n")
+
+	// No verified cert: the spoofed header must be dropped, not echoed.
+	got := body(dispatchHTTP(http.HandlerFunc(echo), raw, "", false))
+	if got != "" {
+		t.Errorf("certless: X-Peer-LFDI = %q, want empty (spoof must be stripped)", got)
+	}
+
+	// Verified cert present: handler sees the cert-derived LFDI, not the spoof.
+	got = body(dispatchHTTP(http.HandlerFunc(echo), raw, "REALLFDI", false))
+	if got != "REALLFDI" {
+		t.Errorf("with cert: X-Peer-LFDI = %q, want REALLFDI", got)
+	}
+}
+
+func body(resp []byte) string {
+	parts := strings.SplitN(string(resp), "\r\n\r\n", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return parts[1]
 }
