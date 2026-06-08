@@ -121,7 +121,7 @@ After git push (above), on the hub Pi run git pull to get the public certs:
 Then SCP only the private key from WSL:
     # On this WSL machine
     scp certs/client-staging/client-key.pem \
-        pi@69.0.0.1:~/csip-tls-test/certs/client-key.pem
+        pi@69.0.0.2:~/csip-tls-test/certs/client-key.pem
 
 Delete staging after the copy:
     rm -rf certs/client-staging

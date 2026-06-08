@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-sim_gui.py  —  Live dashboard for DER simulator Pis.
+sim_gui.py  —  Live dashboard for DER simulator Pis + lexa-hub dev kit.
 
   pip install -r requirements.txt
   python sim_gui.py                                      # all sims on localhost
-  python sim_gui.py --host 192.168.10.1                  # all sims on one Pi
   python sim_gui.py --solar 69.0.0.10 \\
                     --battery 69.0.0.11 \\
                     --meter 69.0.0.12 \\
                     --ev 69.0.0.14 \\
-                    --gridsim <WSL-IP>
+                    --hub 69.0.0.2 \\
+                    --gridsim <gridsim-IP>
 
 API ports (fixed):  solar=6020  battery=6021  meter=6022  ev=6024
+Hub API port:       9100  (lexa-api /status)
 Admin API port:     gridsim admin=11112
 """
 
@@ -853,13 +854,215 @@ def _open_reg_window(parent: Any, sim_name: str, data: dict) -> None:
         row=1, column=0, pady=(0, 8), padx=8, sticky="e")
 
 
+# ── HubPanel ─────────────────────────────────────────────────────────────────
+
+class HubPanel(ctk.CTkFrame):
+    """Live dashboard for the lexa-hub API at http://<host>:9100/status."""
+
+    HUB_PORT = 9100
+    POLL_MS  = 2000
+
+    def __init__(self, parent: Any, host: str, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.host     = host
+        self._running = True
+        self._build_ui()
+        self._schedule_poll()
+
+    def _base(self) -> str:
+        return f"http://{self.host}:{self.HUB_PORT}"
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # status bar
+        bar = ctk.CTkFrame(self, height=38, corner_radius=0, fg_color="gray17")
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        bar.grid_columnconfigure(1, weight=1)
+        self._status_lbl = ctk.CTkLabel(
+            bar, text=f"  {self.host}:{self.HUB_PORT}",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color=C_GRAY)
+        self._status_lbl.grid(row=0, column=0, sticky="w", padx=10, pady=6)
+        self._ts_lbl = ctk.CTkLabel(bar, text="", font=ctk.CTkFont(size=11), text_color=C_GRAY)
+        self._ts_lbl.grid(row=0, column=1, sticky="e", padx=10, pady=6)
+
+        # left column: devices + power
+        left = ctk.CTkScrollableFrame(
+            self, label_text="Devices & Power",
+            label_font=ctk.CTkFont(size=13, weight="bold"), corner_radius=6)
+        left.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=8)
+        left.grid_columnconfigure(1, weight=1)
+        self._left = left
+        self._dev_labels:   Dict[str, ctk.CTkLabel] = {}
+        self._power_labels: Dict[str, ctk.CTkLabel] = {}
+        self._build_power_section()
+
+        # right column: EVSE + optimizer
+        right = ctk.CTkScrollableFrame(
+            self, label_text="EVSE & Optimizer",
+            label_font=ctk.CTkFont(size=13, weight="bold"), corner_radius=6)
+        right.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=8)
+        right.grid_columnconfigure(1, weight=1)
+        self._right      = right
+        self._evse_labels:  Dict[str, ctk.CTkLabel] = {}
+        self._plan_lbl:  Optional[ctk.CTkLabel]     = None
+        self._build_evse_section()
+        self._build_plan_section()
+
+    def _sec_header(self, parent: Any, row: int, text: str) -> None:
+        ctk.CTkLabel(
+            parent, text=text,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=C_YELLOW, anchor="w",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=8, pady=(10, 2))
+
+    def _kv_row(self, parent: Any, row: int, key: str,
+                store: Dict[str, ctk.CTkLabel]) -> None:
+        ctk.CTkLabel(
+            parent, text=key, font=ctk.CTkFont(size=12),
+            text_color=C_GRAY, anchor="w",
+        ).grid(row=row, column=0, sticky="w", padx=(18, 4), pady=1)
+        lbl = ctk.CTkLabel(
+            parent, text="—",
+            font=ctk.CTkFont(size=12, family="Courier New"),
+            text_color=C_WHITE, anchor="e",
+        )
+        lbl.grid(row=row, column=1, sticky="e", padx=(4, 10), pady=1)
+        store[key] = lbl
+
+    def _build_power_section(self) -> None:
+        r = 0
+        self._sec_header(self._left, r, "Site Power"); r += 1
+        for k in ("solar_W", "battery_W", "grid_W", "load_W"):
+            self._kv_row(self._left, r, k, self._power_labels); r += 1
+        self._dev_header_row = r  # devices added dynamically below
+
+    def _build_evse_section(self) -> None:
+        self._evse_start_row = 0
+        self._sec_header(self._right, 0, "EVSE Stations")
+        self._evse_body_row = 1
+
+    def _build_plan_section(self) -> None:
+        r = 20  # placed below dynamic EVSE rows
+        self._sec_header(self._right, r, "Last Optimizer Plan"); r += 1
+        self._plan_lbl = ctk.CTkLabel(
+            self._right, text="—",
+            font=ctk.CTkFont(size=11, family="Courier New"),
+            text_color=C_WHITE, anchor="w", justify="left", wraplength=340,
+        )
+        self._plan_lbl.grid(row=r, column=0, columnspan=2,
+                            sticky="w", padx=18, pady=2)
+
+    # ── poll ─────────────────────────────────────────────────────────────────
+
+    def _schedule_poll(self) -> None:
+        threading.Thread(target=self._fetch, daemon=True).start()
+
+    def _fetch(self) -> None:
+        try:
+            r = requests.get(f"{self._base()}/status", timeout=3)
+            data = r.json()
+            self.after(0, lambda: self._update(data))
+            self.after(0, lambda: self._status_lbl.configure(
+                text=f"  {self.host}:{self.HUB_PORT}  ●", text_color=C_GREEN))
+        except Exception as exc:
+            msg = str(exc)
+            self.after(0, lambda m=msg: self._status_lbl.configure(
+                text=f"  {m}", text_color=C_RED))
+        if self._running:
+            self.after(self.POLL_MS, self._schedule_poll)
+
+    # ── update ────────────────────────────────────────────────────────────────
+
+    def _update(self, data: dict) -> None:
+        ts = data.get("timestamp", "")
+        self._ts_lbl.configure(text=ts[:19] if ts else "")
+
+        # power summary
+        pwr = data.get("power", {})
+        for k, lbl in self._power_labels.items():
+            v = pwr.get(k)
+            lbl.configure(text=f"{v:.0f} W" if v is not None else "—")
+
+        # devices (build rows on first call, update after)
+        devs = data.get("devices", {})
+        r = self._dev_header_row
+        if not self._dev_labels and devs:
+            self._sec_header(self._left, r, "Device Readings"); r += 1
+            for name, d in devs.items():
+                role = d.get("role", "")
+                label_key = f"{name} ({role})"
+                self._kv_row(self._left, r, label_key, self._dev_labels); r += 1
+        for name, d in devs.items():
+            role  = d.get("role", "")
+            w     = d.get("W_W")
+            conn  = d.get("connected", False)
+            label_key = f"{name} ({role})"
+            lbl   = self._dev_labels.get(label_key)
+            if lbl:
+                color = C_WHITE if conn else C_RED
+                text  = f"{w:.0f} W" if w is not None else ("—" if conn else "offline")
+                lbl.configure(text=text, text_color=color)
+
+        # EVSE stations (rebuild each update — count can vary)
+        for widget in self._right.winfo_children():
+            info = widget.grid_info()
+            if info and int(info.get("row", 0)) >= 1:
+                widget.destroy()
+        self._evse_labels.clear()
+        evse = data.get("evse_stations", [])
+        seen: set = set()
+        r = 1
+        for st in evse:
+            sid = st.get("station_id", "?")
+            cid = st.get("connector_id", 0)
+            key = f"{sid}:{cid}"
+            if key in seen:
+                continue
+            seen.add(key)
+            conn    = st.get("connected", False)
+            active  = st.get("session_active", False)
+            status  = st.get("status", "—")
+            power   = st.get("power_W") or 0.0
+            color   = C_GREEN if conn else C_GRAY
+            summary = f"{'●' if conn else '○'} {sid}  c{cid}  {status}"
+            if active:
+                summary += f"  {power:.0f}W"
+            ctk.CTkLabel(
+                self._right, text=summary,
+                font=ctk.CTkFont(size=11, family="Courier New"),
+                text_color=color, anchor="w",
+            ).grid(row=r, column=0, columnspan=2, sticky="w", padx=18, pady=1)
+            r += 1
+
+        # optimizer plan
+        plan = data.get("last_plan", {})
+        plan_ts   = (plan.get("timestamp") or "")[:19]
+        decisions = plan.get("decisions") or []
+        if decisions:
+            lines = [f"{plan_ts}"] + [f"  • {d}" for d in decisions]
+        else:
+            lines = [f"{plan_ts}  (no active decisions)"]
+        if self._plan_lbl:
+            self._plan_lbl.configure(text="\n".join(lines))
+
+    def destroy(self) -> None:
+        self._running = False
+        super().destroy()
+
+
 # ── main app ──────────────────────────────────────────────────────────────────
 
 class App(ctk.CTk):
-    def __init__(self, hosts: Dict[str, str], gridsim_host: str) -> None:
+    def __init__(self, hosts: Dict[str, str], gridsim_host: str,
+                 hub_host: str = "69.0.0.2") -> None:
         super().__init__()
-        self.title("DER Simulator Dashboard")
-        self.geometry("1180x660")
+        self.title("DER Simulator Dashboard — lexa-hub")
+        self.geometry("1280x720")
         self.minsize(900, 520)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -875,6 +1078,13 @@ class App(ctk.CTk):
             SimPanel(tab, sim, host, corner_radius=6).grid(
                 row=0, column=0, sticky="nsew")
 
+        # ── Hub tab ──
+        hub_tab = tabs.add("Hub")
+        hub_tab.grid_columnconfigure(0, weight=1)
+        hub_tab.grid_rowconfigure(0, weight=1)
+        HubPanel(hub_tab, hub_host, corner_radius=6).grid(
+            row=0, column=0, sticky="nsew")
+
         # ── Grid tab ──
         grid_tab = tabs.add("Grid")
         grid_tab.grid_columnconfigure(0, weight=1)
@@ -884,31 +1094,33 @@ class App(ctk.CTk):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="DER Simulator Dashboard")
+    p = argparse.ArgumentParser(description="DER Simulator Dashboard — lexa-hub")
     p.add_argument("--host",    default="localhost",
                    help="Default host for all simulators (default: localhost)")
     p.add_argument("--solar",   default=None, metavar="IP",
-                   help="Host for solar simulator Pi")
+                   help="Host for solar simulator Pi (default: 69.0.0.10)")
     p.add_argument("--battery", default=None, metavar="IP",
-                   help="Host for battery simulator Pi")
+                   help="Host for battery simulator Pi (default: 69.0.0.11)")
     p.add_argument("--meter",   default=None, metavar="IP",
-                   help="Host for grid meter simulator Pi")
+                   help="Host for grid meter simulator Pi (default: 69.0.0.12)")
     p.add_argument("--ev",      default=None, metavar="IP",
-                   help="Host for EV charger simulator Pi")
+                   help="Host for EV charger simulator Pi (default: 69.0.0.14)")
+    p.add_argument("--hub",     default="69.0.0.2", metavar="IP",
+                   help="Host for lexa-hub API (default: 69.0.0.2)")
     p.add_argument("--gridsim", default=None, metavar="IP",
                    help="Host for IEEE 2030.5 gridsim admin API (port 11112)")
     args = p.parse_args()
 
     hosts = {
         "_default": args.host,
-        "solar":    args.solar   or args.host,
-        "battery":  args.battery or args.host,
-        "meter":    args.meter   or args.host,
-        "ev":       args.ev      or args.host,
+        "solar":    args.solar   or "69.0.0.10",
+        "battery":  args.battery or "69.0.0.11",
+        "meter":    args.meter   or "69.0.0.12",
+        "ev":       args.ev      or "69.0.0.14",
     }
     gridsim_host = args.gridsim or args.host
 
-    App(hosts, gridsim_host).mainloop()
+    App(hosts, gridsim_host, hub_host=args.hub).mainloop()
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ HARDWARE
 PLANNED IP ADDRESS ON THE DEMO SWITCH
 --------------------------------------
   Example used in this guide: 69.0.0.14
-  Hub IP:                      69.0.0.1   (OCPP CSMS on port 8887)
+  Hub IP:                      69.0.0.2   (OCPP CSMS on port 8887)
 
 IMPORTANT: The evsim connects to the hub, not the other way around.
 The hub must be running with its OCPP CSMS enabled before evsim starts.
@@ -57,7 +57,7 @@ from 69.0.0.x and will not conflict.
       sudo nmcli con mod "netplan-eth0" \
         ipv4.method manual \
         ipv4.addresses 69.0.0.14/24 \
-        ipv4.gateway 69.0.0.1 \
+        ipv4.gateway 69.0.0.2 \
         ipv4.dns "8.8.8.8 8.8.4.4"
       sudo nmcli con up "netplan-eth0"
 
@@ -136,9 +136,9 @@ STEP 5 — VERIFY CONNECTIVITY TO THE HUB
 
 Before starting the evsim, confirm the hub's CSMS port is reachable:
 
-    nc -zv 69.0.0.1 8887
+    nc -zv 69.0.0.2 8887
 
-Expected: Connection to 69.0.0.1 8887 port [tcp/*] succeeded!
+Expected: Connection to 69.0.0.2 8887 port [tcp/*] succeeded!
 
 If this fails:
   - Ensure the hub Pi is powered on and the hub binary is running.
@@ -149,7 +149,7 @@ STEP 6 — TEST RUN (MANUAL)
 ==============================================================================
 
     ./bin/evsim \
-      -csms ws://69.0.0.1:8887/ocpp \
+      -csms ws://69.0.0.2:8887/ocpp \
       -id evse-001 \
       -connectors 1 \
       -session-interval 180 \
@@ -157,7 +157,7 @@ STEP 6 — TEST RUN (MANUAL)
       -api-port 6024
 
 Expected output:
-    evsim: station=evse-001 csms=ws://69.0.0.1:8887/ocpp connectors=1
+    evsim: station=evse-001 csms=ws://69.0.0.2:8887/ocpp connectors=1
     evsim: connected
     evsim: BootNotification status=Accepted heartbeatInterval=60s
     evsim: StatusNotification connector=1 status=Available
@@ -193,7 +193,7 @@ STEP 7 — INSTALL AS A SYSTEMD SERVICE
       User=pi
       WorkingDirectory=/home/pi/csip-tls-test
       ExecStart=/home/pi/csip-tls-test/bin/evsim \
-        -csms ws://69.0.0.1:8887/ocpp \
+        -csms ws://69.0.0.2:8887/ocpp \
         -id evse-001 \
         -connectors 1 \
         -session-interval 180 \
@@ -244,7 +244,7 @@ PARAMETERS REFERENCE
 ==============================================================================
 
   -csms              string   CSMS WebSocket base URL
-                               (default ws://69.0.0.1:8887/ocpp)
+                               (default ws://69.0.0.2:8887/ocpp)
   -id                string   Charging station identifier (default evse-001)
                                Must be unique if running multiple evsims.
   -connectors        int      Number of connectors to simulate (default 1)
@@ -253,7 +253,7 @@ PARAMETERS REFERENCE
   -api-port          int      HTTP simapi port for dashboard (default 6024; 0 to disable)
 
 Example — 2-connector station, faster sessions for demo:
-    ./bin/evsim -csms ws://69.0.0.1:8887/ocpp -id evse-dc50 \
+    ./bin/evsim -csms ws://69.0.0.2:8887/ocpp -id evse-dc50 \
                 -connectors 2 -session-interval 90 -session-duration 60
 
 Multiple EV charger Pis can connect to the same hub CSMS simultaneously,
@@ -264,8 +264,8 @@ TROUBLESHOOTING
 ==============================================================================
 
   BootNotification fails / cannot connect:
-    - Verify hub is running:     ping 69.0.0.1
-    - Verify CSMS port open:     nc -zv 69.0.0.1 8887
+    - Verify hub is running:     ping 69.0.0.2
+    - Verify CSMS port open:     nc -zv 69.0.0.2 8887
     - Check hub log:             journalctl -u hub -n 50   (on hub Pi)
 
   Station connects but hub does not show it:

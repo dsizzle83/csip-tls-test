@@ -51,7 +51,7 @@ HARDWARE
 IP ADDRESS ON THE DEMO SWITCH (69.0.0.x/24 Ethernet LAN)
 ---------------------------------------------------------
   This Pi (meter-pi):  69.0.0.12
-  Hub IP:              69.0.0.1
+  Hub IP:              69.0.0.2
 
 ==============================================================================
 STEP 1 — CONFIGURE STATIC IP (ETHERNET)
@@ -72,7 +72,7 @@ from 69.0.0.x and will not conflict.
       sudo nmcli con mod "netplan-eth0" \
         ipv4.method manual \
         ipv4.addresses 69.0.0.12/24 \
-        ipv4.gateway 69.0.0.1 \
+        ipv4.gateway 69.0.0.2 \
         ipv4.dns "8.8.8.8 8.8.4.4"
       sudo nmcli con up "netplan-eth0"
 

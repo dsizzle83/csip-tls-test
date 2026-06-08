@@ -22,7 +22,7 @@ HARDWARE
 PLANNED IP ADDRESS ON THE DEMO SWITCH
 --------------------------------------
   Example used in this guide: 69.0.0.11
-  Hub IP:                      69.0.0.1
+  Hub IP:                      69.0.0.2
   Adjust all IP references below to match your actual network plan.
 
 ==============================================================================
@@ -44,7 +44,7 @@ from 69.0.0.x and will not conflict.
       sudo nmcli con mod "netplan-eth0" \
         ipv4.method manual \
         ipv4.addresses 69.0.0.11/24 \
-        ipv4.gateway 69.0.0.1 \
+        ipv4.gateway 69.0.0.2 \
         ipv4.dns "8.8.8.8 8.8.4.4"
       sudo nmcli con up "netplan-eth0"
 

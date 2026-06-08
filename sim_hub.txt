@@ -1,296 +1,196 @@
 ==============================================================================
-  HUB Pi — Raspberry Pi Deployment Guide
-  Binary: hub  |  Role: DERMS hub (IEEE 2030.5 northbound + Modbus/OCPP southbound)
+  LEXA-HUB — Digi ConnectCore 93 (i.MX 93) Deployment Guide
+  Repo: lexa-hub  |  Branch: lexa-hub
+  Role: DERMS hub (Modbus/OCPP southbound; IEEE 2030.5 northbound deferred)
 ==============================================================================
 
 OVERVIEW
 --------
-This Pi runs the long-running hub binary (cmd/hub).  It sits at the centre of
-the demo network:
+The hub now runs on a Digi ConnectCore 93 Development Kit (i.MX 93, ARM64)
+rather than a Raspberry Pi. It runs five systemd services:
 
-  Northbound  wolfSSL mTLS → gridsim (IEEE 2030.5 server) on the WSL machine
-  Southbound  Modbus TCP    → modsim / batsim / metersim on device Pis
-              OCPP 2.0.1    → evsim on ev-pi (CSMS listens on port 8887)
+  mosquitto     MQTT broker (localhost:1883) — message bus for all services
+  lexa-modbus   Polls SunSpec/Modbus device Pis; applies control commands
+  lexa-hub      Energy optimizer engine (15 s interval)
+  lexa-ocpp     OCPP 2.0.1 CSMS — EV charger management (port 8887)
+  lexa-api      HTTP status + SSE log stream (port 9100)
 
-The hub is the ONLY Pi that runs cgo (wolfSSL). All other Pis are pure-Go.
+NOTE: lexa-northbound (IEEE 2030.5 / wolfSSL mTLS) and lexa-telemetry are
+deferred — they require CGo + wolfSSL and a cross-toolchain. The dev kit
+runs the pure-Go services only.
 
 START ORDER (full demo):
-  1. Start gridsim server on WSL         (sim_gridsim.txt)
-  2. Start device simulators on Pis      (sim_solar, sim_battery, sim_meter, sim_ev)
-  3. Start hub on this Pi                ← this guide
-  4. Open dashboard on desktop machine   (sim_dashboard.txt)
-
-HARDWARE
---------
-  - Raspberry Pi 4 or Pi 5 (2 GB RAM minimum)
-  - microSD card (16 GB or larger, Class 10 / A1)
-  - Ethernet cable to the demo switch
-  - USB-C power supply (5 V / 3 A)
-  - HDMI monitor + USB keyboard for initial setup
+  1. Start device simulators on Pis      (sim_solar, sim_battery, sim_meter, sim_ev)
+  2. Confirm lexa-hub services are running on the dev kit  ← this guide
+  3. Open dashboard on desktop machine   (sim_dashboard.txt)
 
 IP ADDRESSES ON THE DEMO SWITCH (69.0.0.x/24 Ethernet LAN)
 ------------------------------------------------------------
-  Hub (this Pi):  69.0.0.1
-  solar-pi:       69.0.0.10  (modsim,   port 5020)
-  battery-pi:     69.0.0.11  (batsim,   port 5021)
-  meter-pi:       69.0.0.12  (metersim, port 5022)
-  ev-pi:          69.0.0.14  (evsim,    connects to hub:8887)
-
-  WSL machine (gridsim / IEEE 2030.5 server): see hub.json csip.server_url
-  The WSL machine uses its own IP on your WiFi subnet — not on 69.0.0.x.
+  Hub (dev kit):  69.0.0.2   ← Digi ConnectCore 93
+  solar-pi:       69.0.0.10  (modsim,   port 5020 / simapi 6020)
+  battery-pi:     69.0.0.11  (batsim,   port 5021 / simapi 6021)
+  meter-pi:       69.0.0.12  (metersim, port 5022 / simapi 6022)
+  ev-pi:          69.0.0.14  (evsim,    connects to hub:8887 / simapi 6024)
 
 ==============================================================================
-STEP 1 — CONFIGURE STATIC IP (ETHERNET)
+STEP 1 — CONFIRM SERVICES ARE RUNNING
 ==============================================================================
 
-Each Pi has two network interfaces:
-  eth0   Ethernet (demo LAN, 69.0.0.x/24) — static IP; all hub traffic flows here
-  wlan0  WiFi — DHCP from your router (different subnet); internet/management access only
+SSH to the dev kit:
 
-Leave wlan0 on DHCP. Its subnet (e.g. 192.168.1.x from your router) will differ
-from 69.0.0.x and will not conflict.
+    ssh root@69.0.0.2
 
-1.  Find the Ethernet interface name:
-      ip link show
-    Look for eth0 (or enp2s0 on Pi 5). This guide uses eth0.
+Check service status:
 
-2.  Set a static IP on eth0:
-      sudo nmcli con mod "netplan-eth0" \
-        ipv4.method manual \
-        ipv4.addresses 69.0.0.1/24 \
-        ipv4.gateway 69.0.0.1 \
-        ipv4.dns "8.8.8.8 8.8.4.4"
-      sudo nmcli con up "netplan-eth0"
+    systemctl status mosquitto lexa-modbus lexa-hub lexa-ocpp lexa-api
 
-    Note: the hub IS the gateway for the demo LAN, so gateway = its own IP.
-    Device Pis set 69.0.0.1 as their gateway so hub can route if needed.
+All five should show "active (running)".
 
-    To list connection names: sudo nmcli con show
+Tail live logs:
 
-3.  Confirm:
-      ip addr show eth0
-    You should see 69.0.0.1/24.
+    journalctl -f -u mosquitto -u lexa-modbus -u lexa-hub -u lexa-ocpp -u lexa-api
+
+Expected output once device Pis are up:
+    lexa-modbus: reconnected device inverter-0
+    lexa-modbus: reconnected device battery-0
+    lexa-modbus: reconnected device meter-0
+    [ocpp] connected: evse-001 addr=69.0.0.14:xxxxx
+    [ocpp] BootNotification cs=evse-001 reason=PowerUp
+    [orchestrator] replan: window=...
 
 ==============================================================================
-STEP 2 — INSTALL WOLFSSL (REQUIRED FOR NORTHBOUND TLS)
+STEP 2 — VERIFY THE API
 ==============================================================================
 
-The hub uses wolfSSL via cgo. Install the shared library before building.
+From any machine on the LAN:
 
-1.  Install build tools:
-      sudo apt-get update
-      sudo apt-get install -y build-essential git autoconf libtool
+    curl http://69.0.0.2:9100/status
 
-2.  Clone and build wolfSSL:
-      cd ~
-      git clone https://github.com/wolfSSL/wolfssl.git
-      cd wolfssl
-      ./autogen.sh
-      ./configure --enable-tls13 --enable-aesccm --enable-tlsx \
-                  --enable-certgen --enable-opensslall \
-                  --prefix=/usr/local
-      make -j$(nproc)
-      sudo make install
-      sudo ldconfig
+Returns a JSON snapshot with device readings, site power summary, EVSE state,
+and the latest optimizer plan.
 
-3.  Verify:
-      wolfssl-config --version
+Live log stream (SSE):
+
+    curl -N http://69.0.0.2:9100/logs
 
 ==============================================================================
-STEP 3 — INSTALL GO
+STEP 3 — CONFIGS ON THE DEV KIT
 ==============================================================================
 
-1.  Download:
-      curl -LO https://go.dev/dl/go1.21.13.linux-arm64.tar.gz
+Configs live at /etc/lexa/ on the dev kit. SSH in and edit as needed:
 
-2.  Install:
-      sudo rm -rf /usr/local/go
-      sudo tar -C /usr/local -xzf go1.21.13.linux-arm64.tar.gz
-      rm go1.21.13.linux-arm64.tar.gz
+    ssh root@69.0.0.2
+    vi /etc/lexa/modbus.json    # Modbus device IPs and poll interval
+    vi /etc/lexa/hub.json       # optimizer interval, device names
+    vi /etc/lexa/ocpp.json      # OCPP port and station limits
+    vi /etc/lexa/api.json       # HTTP listen address
 
-3.  Add to PATH:
-      echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-      source ~/.bashrc
+After editing a config, restart the relevant service:
 
-4.  Verify:
-      go version
+    systemctl restart lexa-modbus   # or lexa-hub, lexa-ocpp, lexa-api
 
-==============================================================================
-STEP 4 — CLONE THE REPOSITORY
-==============================================================================
-
-The repo is private. Set up an SSH deploy key so this Pi can pull without a password.
-
-1.  Install git:
-      sudo apt-get install -y git
-
-2.  Generate an SSH key for this Pi:
-      ssh-keygen -t ed25519 -C "hub-pi" -f ~/.ssh/id_ed25519 -N ""
-
-3.  Print the public key — you will paste this into GitHub:
-      cat ~/.ssh/id_ed25519.pub
-
-4.  Add the key to the GitHub repo:
-      - Go to: https://github.com/dsizzle83/csip-tls-test/settings/keys
-      - Click "Add deploy key"
-      - Title: hub-pi
-      - Key: paste the output from step 3
-      - Leave "Allow write access" unchecked (read-only is sufficient)
-      - Click "Add key"
-
-5.  Verify GitHub accepts the key:
-      ssh -T git@github.com
-    Expected: Hi dsizzle83! You've successfully authenticated...
-    ("You've been provided shell access" warning is normal and harmless.)
-
-6.  Clone:
-      cd ~
-      git clone git@github.com:dsizzle83/csip-tls-test.git csip-tls-test
-      cd csip-tls-test
+Current modbus.json device addresses:
+    inverter-0  tcp://69.0.0.10:5020  (modsim, solar PV)
+    battery-0   tcp://69.0.0.11:5021  (batsim, Li-Ion storage)
+    meter-0     tcp://69.0.0.12:5022  (metersim, smart meter)
 
 ==============================================================================
-STEP 5 — INSTALL CERTIFICATES
+STEP 4 — REDEPLOYING BINARIES (after code changes)
 ==============================================================================
 
-The hub needs the CA cert, server cert, and client cert + key for mTLS.
-Copy them from your WSL machine (where they were generated):
+The binaries are cross-compiled on the dev machine and pushed over SCP.
+Build and deploy from the lexa-hub repo root:
 
-    # On WSL machine — push certs to hub Pi
-    scp certs/ca-cert.pem      pi@69.0.0.1:~/csip-tls-test/certs/
-    scp certs/server-cert.pem  pi@69.0.0.1:~/csip-tls-test/certs/
-    scp certs/client-cert.pem  pi@69.0.0.1:~/csip-tls-test/certs/
-    scp certs/client-key.pem   pi@69.0.0.1:~/csip-tls-test/certs/
+    cd ~/projects/lexa-hub
 
-Private keys are gitignored. They must be copied manually — never committed.
+    # Cross-compile all four pure-Go services
+    GOARCH=arm64 GOOS=linux CGO_ENABLED=0 /snap/bin/go build -o bin/arm64/lexa-hub      ./cmd/hub
+    GOARCH=arm64 GOOS=linux CGO_ENABLED=0 /snap/bin/go build -o bin/arm64/lexa-modbus   ./cmd/modbus
+    GOARCH=arm64 GOOS=linux CGO_ENABLED=0 /snap/bin/go build -o bin/arm64/lexa-ocpp     ./cmd/ocpp
+    GOARCH=arm64 GOOS=linux CGO_ENABLED=0 /snap/bin/go build -o bin/arm64/lexa-api      ./cmd/api
 
-==============================================================================
-STEP 6 — CONFIGURE hub.json
-==============================================================================
+    # Push and restart
+    scp bin/arm64/lexa-hub bin/arm64/lexa-modbus bin/arm64/lexa-ocpp bin/arm64/lexa-api \
+        root@69.0.0.2:/usr/local/sbin/
+    ssh root@69.0.0.2 'systemctl restart lexa-modbus lexa-hub lexa-ocpp lexa-api'
 
-Edit ~/csip-tls-test/hub.json to match your deployment:
-
-    {
-      "server":      "<WSL-WIFI-IP>:11111",
-      "ca_cert":     "certs/ca-cert.pem",
-      "client_cert": "certs/client-cert.pem",
-      "client_key":  "certs/client-key.pem",
-
-      "discovery_interval_s": 20,
-      "control_interval_s":   15,
-      "poll_interval_s":      10,
-      "mup_post_rate_s":      60,
-
-      "ocpp_port":    8887,
-      "metrics_port": 9100,
-
-      "devices": [
-        { "name": "solar-1",   "url": "tcp://69.0.0.10:5020", "unit_id": 1, "role": "inverter", "max_w": 5000 },
-        { "name": "battery-1", "url": "tcp://69.0.0.11:5021", "unit_id": 1, "role": "battery",  "max_w": 5000 },
-        { "name": "meter",     "url": "tcp://69.0.0.12:5022", "unit_id": 1, "role": "meter"    }
-      ]
-    }
-
-metrics_port exposes /healthz, /metrics (Prometheus), /status (JSON snapshot),
-and /logs (SSE log stream) on the hub Pi at http://69.0.0.1:9100.
-
-Find your WSL machine's IP: run `ip addr show eth0` inside WSL, or check
-`ipconfig` on Windows and look for the WSL adapter address.
+Mosquitto binary (only needed if rebuilding):
+    # Cross-compile from mosquitto 2.0.18 source with cmake + aarch64-linux-gnu-gcc
+    # See build notes in the lexa-hub repo (no TLS, no websockets)
+    scp <mosquitto-binary> root@69.0.0.2:/usr/local/sbin/mosquitto
+    ssh root@69.0.0.2 'systemctl restart mosquitto'
 
 ==============================================================================
-STEP 7 — BUILD THE HUB BINARY
+STEP 5 — REDEPLOYING SIMULATOR BINARIES TO DEVICE PIS
 ==============================================================================
 
-Build must run on the Pi (cgo + wolfSSL headers are arm64):
+Sim binaries are cross-compiled here and pushed via SCP + paramiko (password auth).
+From the csip-tls-test repo:
 
-    cd ~/csip-tls-test
-    mkdir -p bin
-    CGO_ENABLED=1 go build -o bin/hub ./cmd/hub
+    # Cross-compile
+    cd ~/projects/csip-tls-test
+    GOOS=linux GOARCH=arm64 CGO_ENABLED=0 /snap/bin/go build -o bin/arm64/modsim   ./sim/modsim
+    GOOS=linux GOARCH=arm64 CGO_ENABLED=0 /snap/bin/go build -o bin/arm64/batsim   ./sim/batsim
+    GOOS=linux GOARCH=arm64 CGO_ENABLED=0 /snap/bin/go build -o bin/arm64/metersim ./sim/metersim
+    GOOS=linux GOARCH=arm64 CGO_ENABLED=0 /snap/bin/go build -o bin/arm64/evsim    ./sim/evsim
 
-To update from WSL (push commits, pull on Pi, rebuild):
+    # Push and restart each Pi (all use username: dmitri)
+    scp bin/arm64/modsim   dmitri@69.0.0.10:~/bin/modsim
+    ssh dmitri@69.0.0.10 'pkill modsim; nohup ~/bin/modsim -port 5020 -api-port 6020 > ~/modsim.log 2>&1 &'
 
-    # On WSL
-    git push
-    # On hub Pi
-    cd ~/csip-tls-test && git pull
-    CGO_ENABLED=1 go build -o bin/hub ./cmd/hub
+    scp bin/arm64/batsim   dmitri@69.0.0.11:~/bin/batsim
+    ssh dmitri@69.0.0.11 'pkill batsim; nohup ~/bin/batsim -port 5021 -api-port 6021 > ~/batsim.log 2>&1 &'
 
-==============================================================================
-STEP 8 — TEST RUN (MANUAL)
-==============================================================================
+    scp bin/arm64/metersim dmitri@69.0.0.12:~/bin/metersim
+    ssh dmitri@69.0.0.12 'pkill metersim; nohup ~/bin/metersim -port 5022 -api-port 6022 > ~/metersim.log 2>&1 &'
 
-Start the gridsim server on the WSL machine first, then on the hub Pi:
-
-    ./bin/hub -config hub.json
-
-Expected startup log:
-    [wolfssl] init OK
-    [hub] loading config: hub.json
-    [modbus] connected: solar-1   tcp://69.0.0.10:5020
-    [modbus] connected: battery-1 tcp://69.0.0.11:5021
-    [modbus] connected: meter     tcp://69.0.0.12:5022
-    [ocpp] CSMS listening on :8887/ocpp/{id}
-    [csip] walker started → <WSL-WIFI-IP>:11111
-
-Press Ctrl-C to stop.
+    scp bin/arm64/evsim    dmitri@69.0.0.14:~/bin/evsim
+    ssh dmitri@69.0.0.14 'pkill evsim; nohup ~/bin/evsim -csms ws://69.0.0.2:8887/ocpp -api-port 6024 > ~/evsim.log 2>&1 &'
 
 ==============================================================================
-STEP 9 — INSTALL AS A SYSTEMD SERVICE
+STEP 6 — OPEN THE DASHBOARD
 ==============================================================================
 
-1.  Create the service file:
+From the desktop machine:
 
-      sudo tee /etc/systemd/system/hub.service > /dev/null <<'EOF'
-      [Unit]
-      Description=CSIP DER Hub
-      After=network-online.target
-      Wants=network-online.target
+    cd ~/projects/csip-tls-test/gui
+    pip install -r requirements.txt
+    python sim_gui.py \
+        --solar   69.0.0.10 \
+        --battery 69.0.0.11 \
+        --meter   69.0.0.12 \
+        --ev      69.0.0.14 \
+        --hub     69.0.0.2
 
-      [Service]
-      Type=simple
-      User=pi
-      WorkingDirectory=/home/pi/csip-tls-test
-      ExecStart=/home/pi/csip-tls-test/bin/hub -config hub.json
-      Restart=on-failure
-      RestartSec=10
-      StandardOutput=journal
-      StandardError=journal
+The "Hub" tab shows the live lexa-api status: device readings as seen by the
+hub, site power summary (solar/battery/grid/load W), EVSE station state, and
+the latest optimizer plan decisions.
 
-      [Install]
-      WantedBy=multi-user.target
-      EOF
-
-2.  Enable and start:
-
-      sudo systemctl daemon-reload
-      sudo systemctl enable hub
-      sudo systemctl start hub
-
-3.  Verify:
-
-      sudo systemctl status hub
-      journalctl -u hub -f
+The "Grid" tab connects to the gridsim admin API (IEEE 2030.5 server).
+It will show "Disconnected" if gridsim is not running — that is expected in
+the current lexa-hub setup (northbound is deferred).
 
 ==============================================================================
 TROUBLESHOOTING
 ==============================================================================
 
-  mTLS handshake fails:
-    - Verify certs exist:        ls -la ~/csip-tls-test/certs/
-    - Check gridsim is running:  (on WSL) sudo systemctl status gridsim
-    - Test TLS reachability:     curl --cacert certs/ca-cert.pem \
-                                   --cert certs/client-cert.pem \
-                                   --key  certs/client-key.pem \
-                                   <WSL-WIFI-IP>:11111/dcap
+  Services not starting:
+    ssh root@69.0.0.2
+    journalctl -u lexa-hub -n 50
+    journalctl -u mosquitto -n 20
 
   Modbus device not connecting:
-    - Ping from hub:             ping 69.0.0.10   (solar Pi)
-    - Test port:                 nc -zv 69.0.0.10 5020
-    - Verify device simulator is running on that Pi
+    ping 69.0.0.10            (solar Pi reachable?)
+    nc -zv 69.0.0.10 5020     (modsim port open?)
+    ssh dmitri@69.0.0.10 'pgrep -a modsim'   (process running?)
 
-  OCPP CSMS not accepting evsim:
-    - Check hub log:             journalctl -u hub -n 50
-    - Verify port open:          ss -tlnp | grep 8887
+  OCPP: evsim not connecting to hub:
+    nc -zv 69.0.0.2 8887      (CSMS port open?)
+    ssh dmitri@69.0.0.14 'tail ~/evsim.log'
 
-  Rebuild after git pull:
-    cd ~/csip-tls-test && CGO_ENABLED=1 go build -o bin/hub ./cmd/hub
-    sudo systemctl restart hub
+  Hub API not responding:
+    curl http://69.0.0.2:9100/status
+    ssh root@69.0.0.2 'systemctl status lexa-api'
+
+  Reboot the dev kit (all services auto-start via systemd):
+    ssh root@69.0.0.2 'reboot'
