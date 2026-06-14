@@ -44,9 +44,9 @@ type Engine struct {
 	// Debug mode: print full decision trace on every tick.
 	Debug bool
 
-	stop        chan struct{}
-	done        chan struct{}
-	urgentWake  chan struct{} // poked by SetCSIPPrograms on OpModConnect=false
+	stop       chan struct{}
+	done       chan struct{}
+	urgentWake chan struct{} // poked by SetCSIPPrograms on OpModConnect=false
 }
 
 // Config groups optional Engine tunables.
@@ -171,8 +171,13 @@ func (e *Engine) tick() {
 	clockOffset := e.clockOffset
 	e.csipMu.RUnlock()
 
-	state.ClockOffset = clockOffset
+	// Only the SetCSIPPrograms path owns the clock offset and active control.
+	// When no programs are present, trust whatever the reader populated rather
+	// than overwriting state.ClockOffset with the engine's unused zero — a
+	// bus-driven reader (as in lexa-hub) carries the real CSIP offset, and
+	// clobbering it collapses the optimizer's serverNow to local time.
 	if len(programs) > 0 {
+		state.ClockOffset = clockOffset
 		serverNow := scheduler.ServerNow(clockOffset)
 		active := e.sched.Evaluate(programs, serverNow)
 		state.CSIPControl = FromActiveControl(active)

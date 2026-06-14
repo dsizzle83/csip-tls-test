@@ -40,9 +40,9 @@ type BatteryBases struct {
 // BatteryServer is an animated Li-Ion battery simulator with a built-in API.
 type BatteryServer struct {
 	*Server
-	bases      BatteryBases
-	wmaxW      float64
-	wmaxKwh    float64
+	bases   BatteryBases
+	wmaxW   float64
+	wmaxKwh float64
 	// pendingSoC carries a POST /inject {"SoC_pct": X} value to the animation
 	// goroutine so it seeds the integrator from the injected SOC rather than
 	// from whatever the sinusoidal animation last wrote to the register.
@@ -54,6 +54,14 @@ type BatteryServer struct {
 func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer, error) {
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	bases := populateBattery(regs, wmaxKwh, wmaxW)
+
+	// Install the hub-write hook before the Modbus server starts so the
+	// assignment is never concurrent with a handler reading it (finding MOD-3).
+	regs.OnWrite = func(startAddr uint16) {
+		if startAddr >= bases.M123Base && startAddr < bases.M123Base+23 {
+			applyHubBatteryWrite(regs, bases, wmaxW)
+		}
+	}
 
 	// Allocate bs first so the animation closure can reference bs.pendingSoC.
 	bs := &BatteryServer{bases: bases, wmaxW: wmaxW, wmaxKwh: wmaxKwh}
@@ -91,11 +99,11 @@ type BatteryState struct {
 		StText   string  `json:"St_text"`
 	} `json:"measurements"`
 	Battery struct {
-		SoC_pct  float64 `json:"SoC_pct"`
-		DoD_pct  float64 `json:"DoD_pct"`
-		SoH_pct  float64 `json:"SoH_pct"`
-		ChaSt    int     `json:"ChaSt"`
-		ChaStText string `json:"ChaSt_text"`
+		SoC_pct   float64 `json:"SoC_pct"`
+		DoD_pct   float64 `json:"DoD_pct"`
+		SoH_pct   float64 `json:"SoH_pct"`
+		ChaSt     int     `json:"ChaSt"`
+		ChaStText string  `json:"ChaSt_text"`
 	} `json:"battery"`
 	Controls struct {
 		WMaxLimPct_pct float64 `json:"WMaxLimPct_pct"`
@@ -387,6 +395,22 @@ func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) BatteryBases {
 
 // ── animation ─────────────────────────────────────────────────────────────────
 
+// applyHubBatteryWrite immediately reflects a hub M123 write into the power and
+// state registers (e.g. when the animation is paused). Called from RegisterMap
+// OnWrite after each Modbus write into the M123 block.
+func applyHubBatteryWrite(r *RegisterMap, bases BatteryBases, wmaxW float64) {
+	w := hubBatteryW(r, bases.M123Base, wmaxW)
+	if math.IsNaN(w) {
+		return
+	}
+	r.Set(bases.M103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
+	if math.Abs(w) < wmaxW*0.02 {
+		r.Set(bases.M103Base+sunspec.M103_St, 8)
+	} else {
+		r.Set(bases.M103Base+sunspec.M103_St, 4)
+	}
+}
+
 // hubBatteryW reads M123 registers and returns the hub-commanded W value.
 // Returns NaN when Ena=0 (no hub command; animation should run freely).
 // Positive W = discharge; negative W = charge.
@@ -403,6 +427,30 @@ func hubBatteryW(r *RegisterMap, m123Base uint16, wmaxW float64) float64 {
 	sf := int16(r.Get(m123Base + sunspec.M123_WMaxLimPct_SF))
 	pct := sunspec.ApplyScaleSigned(raw, sf) // signed: negative=charge, positive=discharge
 	return wmaxW * pct / 100.0
+}
+
+// clampToSoC limits commanded power w (>0 discharge, <0 charge) to the energy
+// the pack can physically source or sink over dtSim seconds at its current SoC,
+// returning the (possibly reduced) power and the resulting SoC %.
+//
+// An empty pack cannot keep discharging, nor a full pack keep charging. Without
+// this clamp the sim would report the full commanded power even at 0/100% SoC —
+// fabricating phantom grid export/import and letting a hub that over-commands
+// the battery see free energy, which corrupts cost/energy accounting.
+func clampToSoC(w, socPct, capacityWh, dtSim float64) (float64, float64) {
+	if dtSim <= 0 || capacityWh <= 0 {
+		return w, socPct
+	}
+	// w > 0 → discharging → SoC falls; w < 0 → charging → SoC rises.
+	dsoc := -w * dtSim * 100.0 / (capacityWh * 3600.0)
+	if socPct+dsoc < 0 { // would discharge past empty
+		dsoc = -socPct
+		w = -dsoc * capacityWh * 3600.0 / (100.0 * dtSim)
+	} else if socPct+dsoc > 100 { // would charge past full
+		dsoc = 100 - socPct
+		w = -dsoc * capacityWh * 3600.0 / (100.0 * dtSim)
+	}
+	return w, math.Max(0, math.Min(100, socPct+dsoc))
 }
 
 // animateBattery drives the batsim register bank every 5 real-time seconds.
@@ -425,25 +473,6 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW, wmaxKwh float64, bases Bat
 	var socMu sync.Mutex
 	socPct := 55.0 // initial — overwritten on first hub-controlled tick
 	socSeeded := false
-
-	// Immediately apply hub M123 writes (e.g. when animation is paused).
-	applyNow := func() {
-		w := hubBatteryW(r, m123Base, wmaxW)
-		if math.IsNaN(w) {
-			return
-		}
-		r.Set(m103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
-		if math.Abs(w) < wmaxW*0.02 {
-			r.Set(m103Base+sunspec.M103_St, 8)
-		} else {
-			r.Set(m103Base+sunspec.M103_St, 4)
-		}
-	}
-	r.OnWrite = func(startAddr uint16) {
-		if startAddr >= m123Base && startAddr < m123Base+23 {
-			applyNow()
-		}
-	}
 
 	const tickInterval = 5.0 // real seconds between animation ticks
 
@@ -484,9 +513,9 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW, wmaxKwh float64, bases Bat
 				// Effective simulation seconds per real tick includes speed factor.
 				dtSim := tickInterval * s.Speed()
 				capacityWh := wmaxKwh * 1000.0
-				// w > 0 → discharging → SoC falls; w < 0 → charging → SoC rises.
-				dsoc := -w * dtSim * 100.0 / (capacityWh * 3600.0)
-				socPct = math.Max(0, math.Min(100, socPct+dsoc))
+				// Clamp the commanded power to the energy physically available so
+				// the reported power matches what's delivered (see clampToSoC).
+				w, socPct = clampToSoC(w, socPct, capacityWh, dtSim)
 				soc = socPct
 				socMu.Unlock()
 			} else if ptr := pendingSoC.Load(); ptr != nil {

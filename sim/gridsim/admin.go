@@ -3,6 +3,7 @@ package gridsim
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"time"
@@ -17,6 +18,8 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/status", cors(s.handleAdminStatus))
 	mux.HandleFunc("/admin/control", cors(s.handleAdminControl))
 	mux.HandleFunc("/admin/default", cors(s.handleAdminDefault))
+	mux.HandleFunc("/admin/clock", cors(s.handleAdminClock))
+	mux.HandleFunc("/admin/logs", cors(s.logBuf.ServeHTTP))
 	return mux
 }
 
@@ -36,27 +39,27 @@ func cors(h http.HandlerFunc) http.HandlerFunc {
 // ── Status ───────────────────────────────────────────────────────────────────
 
 type adminCtrlInfo struct {
-	MRID        string          `json:"mrid"`
-	Description string          `json:"description"`
-	Start       int64           `json:"start"`
-	DurationS   int             `json:"duration_s"`
-	Status      int             `json:"status"`
-	Base        adminBaseInfo   `json:"base"`
+	MRID        string        `json:"mrid"`
+	Description string        `json:"description"`
+	Start       int64         `json:"start"`
+	DurationS   int           `json:"duration_s"`
+	Status      int           `json:"status"`
+	Base        adminBaseInfo `json:"base"`
 }
 
 // adminBaseInfo mirrors DERControlBase as JSON-friendly nullable fields.
 type adminBaseInfo struct {
-	ExpLimW        *int64   `json:"exp_lim_W,omitempty"`
-	MaxLimW        *int64   `json:"max_lim_W,omitempty"`
-	ImpLimW        *int64   `json:"imp_lim_W,omitempty"`
-	GenLimW        *int64   `json:"gen_lim_W,omitempty"`
-	LoadLimW       *int64   `json:"load_lim_W,omitempty"`
-	FixedW         *int64   `json:"fixed_W,omitempty"`
-	Connect        *bool    `json:"connect,omitempty"`
-	Energize       *bool    `json:"energize,omitempty"`
-	FixedPFInjectW *int64   `json:"fixed_pf_inject_pct,omitempty"`
-	FixedPFAbsorbW *int64   `json:"fixed_pf_absorb_pct,omitempty"`
-	FixedVarPct    *int64   `json:"fixed_var_pct,omitempty"`
+	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
+	MaxLimW        *int64 `json:"max_lim_W,omitempty"`
+	ImpLimW        *int64 `json:"imp_lim_W,omitempty"`
+	GenLimW        *int64 `json:"gen_lim_W,omitempty"`
+	LoadLimW       *int64 `json:"load_lim_W,omitempty"`
+	FixedW         *int64 `json:"fixed_W,omitempty"`
+	Connect        *bool  `json:"connect,omitempty"`
+	Energize       *bool  `json:"energize,omitempty"`
+	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
+	FixedPFAbsorbW *int64 `json:"fixed_pf_absorb_pct,omitempty"`
+	FixedVarPct    *int64 `json:"fixed_var_pct,omitempty"`
 }
 
 type adminProgInfo struct {
@@ -121,7 +124,52 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(adminStatusResp{
 		Programs:   programs,
-		ServerTime: time.Now().Unix(),
+		ServerTime: s.Now(),
+	})
+}
+
+// ── Clock skew GET/POST ──────────────────────────────────────────────────────
+
+// adminClockReq is the body for POST /admin/clock. Exactly one of the two
+// fields is used: set_unix (absolute CSIP time) wins over offset_s.
+type adminClockReq struct {
+	OffsetS *int64 `json:"offset_s,omitempty"` // skew relative to wall clock
+	SetUnix *int64 `json:"set_unix,omitempty"` // absolute server time to serve "now"
+}
+
+type adminClockResp struct {
+	OffsetS    int64 `json:"offset_s"`
+	ServerTime int64 `json:"server_time"`
+}
+
+func (s *Server) handleAdminClock(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// fall through to the response below
+	case http.MethodPost:
+		var req adminClockReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		switch {
+		case req.SetUnix != nil:
+			s.SetClockSkew(*req.SetUnix - time.Now().Unix())
+		case req.OffsetS != nil:
+			s.SetClockSkew(*req.OffsetS)
+		default:
+			http.Error(w, "offset_s or set_unix required", http.StatusBadRequest)
+			return
+		}
+		log.Printf("[gridsim] clock skew set: offset=%ds server_time=%d", s.ClockSkew(), s.Now())
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(adminClockResp{
+		OffsetS:    s.ClockSkew(),
+		ServerTime: s.Now(),
 	})
 }
 
@@ -192,11 +240,11 @@ func apW(ap *model.ActivePower) int64 {
 // adminCtrlReq is the JSON body for POST /admin/control.
 // All OpMod fields are optional (nil = not included in the control).
 type adminCtrlReq struct {
-	Program        int    `json:"program"`
-	Description    string `json:"description"`
-	StartOffset    int    `json:"start_offset_s"` // seconds from now
-	DurationS      int    `json:"duration_s"`     // default 300
-	Activate       bool   `json:"activate"`       // true = replace active list
+	Program     int    `json:"program"`
+	Description string `json:"description"`
+	StartOffset int    `json:"start_offset_s"` // seconds from now
+	DurationS   int    `json:"duration_s"`     // default 300
+	Activate    bool   `json:"activate"`       // true = replace active list
 
 	// DERControlBase fields — only non-nil ones are included in the event.
 	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
@@ -242,14 +290,27 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		req.Description = "Admin control"
 	}
 
-	now := time.Now().Unix()
+	// Control intervals are stamped in server (possibly skewed) time so the
+	// hub's scheduler — which compares against serverNow from /tm — agrees
+	// with gridsim about when the window opens.
+	now := s.Now()
+	// Event status follows the IEEE 2030.5 event state machine (finding GS-2:
+	// previously always 1/Active, even for events whose window hadn't opened —
+	// a spec-correct client could have started them early).
+	activeNow := req.StartOffset <= 0
+	var status uint8
+	if !activeNow {
+		status = 0 // Scheduled
+	} else {
+		status = 1 // Active
+	}
 	ctrl := model.DERControl{
 		Resource:     model.Resource{Href: fmt.Sprintf("/derp/%d/derc/admin", req.Program)},
 		MRID:         fmt.Sprintf("DERC-%s-ADMIN-%d", progPrefixes[req.Program], now),
 		Description:  req.Description,
 		CreationTime: now,
 		EventStatus: &model.EventStatus{
-			CurrentStatus: 1,
+			CurrentStatus: status,
 			DateTime:      now,
 		},
 		Interval: model.DateTimeInterval{
@@ -276,12 +337,18 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		dercList.Results = dercList.All
 	}
 
-	// Also mirror into actderc for status display.
+	// Mirror into actderc (status display) only when the event window is
+	// already open; ActiveDERControlList must contain active events only.
+	// Activate=true keeps its replace semantics: a future event clears the
+	// stale active list rather than joining it.
 	actPath := fmt.Sprintf("/derp/%d/actderc", req.Program)
 	if actList, ok := s.resources[actPath].(*model.DERControlList); ok {
-		if req.Activate {
+		switch {
+		case req.Activate && activeNow:
 			actList.DERControl = []model.DERControl{ctrl}
-		} else {
+		case req.Activate:
+			actList.DERControl = nil
+		case activeNow:
 			actList.DERControl = append(actList.DERControl, ctrl)
 		}
 		actList.All = uint32(len(actList.DERControl))
@@ -326,18 +393,12 @@ func buildBase(req adminCtrlReq) model.DERControlBase {
 		OpModConnect:  req.Connect,
 		OpModEnergize: req.Energize,
 	}
-	ap16 := func(v *int64) *model.ActivePower {
-		if v == nil {
-			return nil
-		}
-		return &model.ActivePower{Value: int16(*v), Multiplier: 0}
-	}
-	b.OpModExpLimW = ap16(req.ExpLimW)
-	b.OpModMaxLimW = ap16(req.MaxLimW)
-	b.OpModImpLimW = ap16(req.ImpLimW)
-	b.OpModGenLimW = ap16(req.GenLimW)
-	b.OpModLoadLimW = ap16(req.LoadLimW)
-	b.OpModFixedW = ap16(req.FixedW)
+	b.OpModExpLimW = apFromWatts(req.ExpLimW)
+	b.OpModMaxLimW = apFromWatts(req.MaxLimW)
+	b.OpModImpLimW = apFromWatts(req.ImpLimW)
+	b.OpModGenLimW = apFromWatts(req.GenLimW)
+	b.OpModLoadLimW = apFromWatts(req.LoadLimW)
+	b.OpModFixedW = apFromWatts(req.FixedW)
 	if req.FixedPFInjectW != nil {
 		b.OpModFixedPFInjectW = &model.SignedPerCent{Value: int16(*req.FixedPFInjectW)}
 	}
@@ -353,13 +414,29 @@ func buildBase(req adminCtrlReq) model.DERControlBase {
 	return b
 }
 
+// apFromWatts converts a watt value into an ActivePower, scaling into the
+// power-of-ten multiplier when the magnitude exceeds the int16 value range
+// (e.g. 40000 W → value=4000, multiplier=1). nil passes through.
+func apFromWatts(w *int64) *model.ActivePower {
+	if w == nil {
+		return nil
+	}
+	v := *w
+	var mult int8
+	for v > math.MaxInt16 || v < math.MinInt16 {
+		v /= 10
+		mult++
+	}
+	return &model.ActivePower{Value: int16(v), Multiplier: mult}
+}
+
 // ── DefaultDERControl GET/POST ────────────────────────────────────────────────
 
 // adminDefaultReq is the body for POST /admin/default.
 type adminDefaultReq struct {
-	Program int           `json:"program"`
-	Base    adminCtrlReq  `json:"base"`
-	Clear   bool          `json:"clear,omitempty"`
+	Program int          `json:"program"`
+	Base    adminCtrlReq `json:"base"`
+	Clear   bool         `json:"clear,omitempty"`
 }
 
 func (s *Server) handleAdminDefault(w http.ResponseWriter, r *http.Request) {

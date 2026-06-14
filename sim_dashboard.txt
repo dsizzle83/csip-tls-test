@@ -21,7 +21,7 @@ How it works: the browser only ever talks to the dashboard server. The server
 proxies each /api/<backend>/... path to the real backend, so there are no CORS
 issues and the browser needs to reach only one host:port.
 
-  Browser → dashboard :8080 ─┬─ /api/hub/      → 69.0.0.2:9100   (lexa-api)
+  Browser → dashboard :8080 ─┬─ /api/hub/      → 69.0.0.1:9100   (lexa-api)
                              ├─ /api/gridsim/  → localhost:11112 (gridsim admin)
                              ├─ /api/solar/    → 69.0.0.10:6020  (modsim simapi)
                              ├─ /api/battery/  → 69.0.0.11:6021  (batsim simapi)
@@ -45,7 +45,7 @@ FULL DEMO (hub on dev kit, sims on Pis, gridsim on this machine):
 
     cd ~/projects/csip-tls-test
     ./bin/dashboard -addr :8080 \
-      -hub     http://69.0.0.2:9100 \
+      -hub     http://69.0.0.1:9100 \
       -gridsim http://localhost:11112 \
       -solar   http://69.0.0.10:6020 \
       -battery http://69.0.0.11:6021 \
@@ -100,7 +100,7 @@ TROUBLESHOOTING
   A tab shows no data:
     - Verify the backend is up and reachable from this machine:
         curl http://69.0.0.10:6020/state          (solar simapi)
-        curl http://69.0.0.2:9100/status          (hub)
+        curl http://69.0.0.1:9100/status          (hub)
         curl http://localhost:11112/admin/status  (gridsim)
     - The dashboard proxies, so also test through it:
         curl http://localhost:8080/api/solar/state

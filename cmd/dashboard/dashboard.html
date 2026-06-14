@@ -244,6 +244,18 @@ a { color: #60a5fa; }
 .sc-log-line.err { color: #f87171; }
 .sc-log-line.hdr { color: #a78bfa; font-weight: bold; }
 .sc-log-line.rdy { color: #fbbf24; }
+
+/* ── Cost simulation tab ── */
+.cs-kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+.cs-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.cs-table th { text-align: right; padding: 6px 10px; color: #64748b; font-size: 10px;
+               text-transform: uppercase; letter-spacing: .05em;
+               border-bottom: 1px solid #334155; white-space: nowrap; }
+.cs-table td { text-align: right; padding: 6px 10px; border-bottom: 1px solid #1e293b;
+               font-weight: 600; font-family: monospace; white-space: nowrap; }
+.cs-table th:first-child, .cs-table td:first-child { text-align: left; font-family: inherit; }
+.cs-table tr:hover td { background: #0f172a; }
+@media (max-width: 900px) { .cs-kpis { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
 <body>
@@ -326,6 +338,8 @@ a { color: #60a5fa; }
   <button id="ptab-ev"         class="page-tab"        onclick="switchTab('ev')">EV Charger</button>
   <button id="ptab-grid"      class="page-tab"        onclick="switchTab('grid')">Grid Controls</button>
   <button id="ptab-scenarios" class="page-tab"        onclick="switchTab('scenarios')" style="color:#a78bfa;border-color:#7c3aed20;">&#9654; Scenarios</button>
+  <button id="ptab-costsim"   class="page-tab"        onclick="switchTab('costsim')" style="color:#fbbf24;border-color:#d9770620;">&#36; 3-Month Cost Sim</button>
+  <button id="ptab-logs"      class="page-tab"        onclick="switchTab('logs')">Logs</button>
 </div>
 
 <!-- ════════════════════════════════════════════════════════════ -->
@@ -736,12 +750,496 @@ a { color: #60a5fa; }
       <button class="btn btn-ghost" onclick="resetAll()" style="min-width:110px;">&#8635;&nbsp; Reset All</button>
       <span id="sc-run-status" style="font-size:12px;color:#94a3b8;"></span>
     </div>
+    <div id="sc-assert" style="display:none; margin:10px 0 4px; padding:8px 12px; border-radius:8px;
+         background:#1e293b; font-size:13px; color:#94a3b8;"></div>
     <div class="sc-log" id="sc-log"><div class="sc-log-line" style="color:#334155;">Select a scenario and press Setup Scene.</div></div>
+  </div>
+
+  <!-- Test execution history -->
+  <div class="card" id="sc-history-card">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <h3 style="margin:0;">Test Execution History</h3>
+      <button class="btn btn-ghost" onclick="clearAssertHistory()" style="margin-left:auto; font-size:11px;">Clear</button>
+    </div>
+    <div id="sc-history" style="margin-top:8px; font-size:12px; color:#94a3b8;">No test runs yet.</div>
   </div>
 
 </div><!-- #ppanel-scenarios -->
 
+<!-- ════════════════════════════════════════════════════════════ -->
+<!-- 3-MONTH COST SIMULATION PANEL                                 -->
+<!-- ════════════════════════════════════════════════════════════ -->
+<div id="ppanel-costsim" class="page-panel" style="display:none">
+
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+      <div>
+        <h3 style="margin-bottom:4px;">3-Month Cost Simulation — Jun 1 &rarr; Aug 31, 15-minute intervals</h3>
+        <div style="font-size:12px;color:#64748b;max-width:760px;">
+          Accelerated what-if engine (runs in a web worker, fully isolated from the live bench).
+          Replays an identical New England summer — weather, driving, home load, TOU pricing and
+          randomized CSIP DER-control events — through three management policies:
+          <b style="color:#f87171;">Dumb</b>, <b style="color:#60a5fa;">EV Peak-Rate Deferral</b>,
+          and <b style="color:#34d399;">Smart Hub</b> (full orchestration, CSIP-compliant).
+        </div>
+      </div>
+      <button class="btn btn-primary" id="cs-run-btn" onclick="runCostSim()"
+              style="margin-left:auto;min-width:180px;background:#d97706;">&#9654;&nbsp; Run Simulation</button>
+    </div>
+    <div id="cs-progress-wrap" style="display:none;margin-top:12px;">
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:#94a3b8;margin-bottom:4px;">
+        <span id="cs-progress-label">starting…</span><span id="cs-progress-pct">0%</span>
+      </div>
+      <div style="background:#0f172a;border-radius:4px;height:10px;overflow:hidden;">
+        <div id="cs-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#d97706,#fbbf24);transition:width .12s;"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="cs-results" class="col" style="display:none;">
+
+    <!-- KPI cards -->
+    <div class="cs-kpis">
+      <div class="card pcard" style="border-color:#dc2626;">
+        <div class="val c-neg" id="cs-kpi-dumb">—</div>
+        <div class="lbl">Dumb — Net Cost</div>
+        <div class="sub" id="cs-kpi-dumb-sub">—</div>
+      </div>
+      <div class="card pcard" style="border-color:#2563eb;">
+        <div class="val c-battery" id="cs-kpi-def">—</div>
+        <div class="lbl">EV Deferral — Net Cost</div>
+        <div class="sub" id="cs-kpi-def-sub">—</div>
+      </div>
+      <div class="card pcard" style="border-color:#059669;">
+        <div class="val c-solar" id="cs-kpi-smart">—</div>
+        <div class="lbl">Smart Hub — Net Cost</div>
+        <div class="sub" id="cs-kpi-smart-sub">—</div>
+      </div>
+      <div class="card pcard" style="border-color:#d97706;">
+        <div class="val c-grid" id="cs-kpi-savings">—</div>
+        <div class="lbl">Smart Hub Savings</div>
+        <div class="sub" id="cs-kpi-savings-sub">—</div>
+      </div>
+      <div class="card pcard" style="border-color:#7c3aed;">
+        <div class="val c-load" id="cs-kpi-compliance">—</div>
+        <div class="lbl">Grid Compliance (Smart)</div>
+        <div class="sub" id="cs-kpi-compliance-sub">—</div>
+      </div>
+    </div>
+
+    <!-- Overlay charts -->
+    <div class="card" style="padding:12px 16px 8px;">
+      <h3>Daily Energy — Usage vs Production (kWh/day)</h3>
+      <div class="chart-wrap"><canvas id="cs-energy-chart"></canvas></div>
+    </div>
+    <div class="card" style="padding:12px 16px 8px;">
+      <h3>Cumulative Cost ($) — Scenario Overlay</h3>
+      <div class="chart-wrap"><canvas id="cs-cost-chart"></canvas></div>
+    </div>
+
+    <!-- Comparison matrix -->
+    <div class="card">
+      <h3>Scenario Comparison Matrix</h3>
+      <div id="cs-matrix" style="overflow-x:auto;"></div>
+    </div>
+
+    <!-- Assumptions / environment -->
+    <div class="card">
+      <h3>Assumptions &amp; Simulated Environment</h3>
+      <div id="cs-assumptions"></div>
+    </div>
+
+  </div>
+
+  <!-- ── Bench replay: hardware-in-the-loop ── -->
+  <div class="card" id="cs-replay-card">
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+      <div>
+        <h3 style="margin-bottom:4px;">Bench Replay — Hardware-in-the-Loop</h3>
+        <div style="font-size:12px;color:#64748b;max-width:760px;">
+          Replays the synthetic environment above against the <b>real bench</b>: solar/load/EV
+          injected into the Pi sims, DER events issued as real CSIP DERControls, gridsim's clock
+          warped so the hub's TOU windows follow simulated time — and the <b>actual lexa-hub</b>
+          makes every dispatch decision. Cost and compliance are measured from the real meter.
+          Driver runs in the dashboard server, so this tab can be closed during the run.
+        </div>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+        <div class="field"><label>Scope</label>
+          <select id="cs-rp-scope">
+            <option value="92">Full summer (92 days)</option>
+            <option value="7">First week (7 days)</option>
+            <option value="1">Single day (smoke test)</option>
+          </select>
+        </div>
+        <div class="field"><label>Pacing (s / 15-min tick)</label>
+          <select id="cs-rp-tick">
+            <option value="8000">8 s</option>
+            <option value="6000">6 s</option>
+            <option value="12000">12 s</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" id="cs-rp-start" onclick="startBenchReplay()"
+                style="background:#7c3aed;min-width:150px;" disabled>&#9654;&nbsp; Start Replay</button>
+        <button class="btn btn-danger" id="cs-rp-abort" onclick="abortBenchReplay()" style="display:none;">&#9632;&nbsp; Abort</button>
+      </div>
+    </div>
+    <div id="cs-rp-est" style="font-size:11px;color:#475569;margin-top:6px;"></div>
+
+    <div id="cs-rp-live" style="display:none;margin-top:12px;">
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:#94a3b8;margin-bottom:4px;">
+        <span id="cs-rp-label">—</span><span id="cs-rp-pct">0%</span>
+      </div>
+      <div style="background:#0f172a;border-radius:4px;height:10px;overflow:hidden;">
+        <div id="cs-rp-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a78bfa);transition:width .3s;"></div>
+      </div>
+      <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:10px;font-size:12px;">
+        <span><span class="stat-label">Sim time</span> <b id="cs-rp-simtime">—</b></span>
+        <span><span class="stat-label">Measured net</span> <b id="cs-rp-net" class="c-grid">—</b></span>
+        <span><span class="stat-label">Compliance</span> <b id="cs-rp-comp" class="c-load">—</b></span>
+        <span><span class="stat-label">Grid now</span> <b id="cs-rp-grid">—</b></span>
+        <span><span class="stat-label">Constraint</span> <b id="cs-rp-cap" class="c-grid">—</b></span>
+        <span><span class="stat-label">ETA</span> <b id="cs-rp-eta">—</b></span>
+      </div>
+      <div style="margin-top:10px;">
+        <h3 style="margin-bottom:6px;">Live Hub Decisions (real orchestrator)</h3>
+        <div class="log-wrap" id="cs-rp-decisions" style="max-height:140px;"></div>
+      </div>
+    </div>
+
+    <div id="cs-rp-result" style="display:none;margin-top:12px;">
+      <div class="chart-wrap" style="min-height:200px;"><canvas id="cs-rp-chart"></canvas></div>
+      <div id="cs-rp-matrix" style="margin-top:10px;overflow-x:auto;"></div>
+    </div>
+  </div>
+</div><!-- #ppanel-costsim -->
+
+<!-- ════════════════════════════════════════════════════════════ -->
+<!-- UNIFIED LOGS PANEL                                            -->
+<!-- ════════════════════════════════════════════════════════════ -->
+<div id="ppanel-logs" class="page-panel" style="display:none">
+  <div class="card">
+    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+      <h3 style="margin:0;">Protocol / Event Logs</h3>
+      <span id="unilog-chips" style="display:flex; gap:6px; flex-wrap:wrap;"></span>
+      <input id="unilog-search" placeholder="filter text…" oninput="uniLogFilterChanged()"
+             style="background:#0f172a; border:1px solid #1e293b; color:#e2e8f0; border-radius:6px;
+                    padding:4px 8px; font-size:12px; width:170px;">
+      <button class="btn btn-ghost" id="unilog-pause-btn" onclick="toggleUniLogPause()" style="font-size:11px;">&#9208; Pause</button>
+      <button class="btn btn-ghost" onclick="exportUniLog('json')" style="font-size:11px;">Export JSON</button>
+      <button class="btn btn-ghost" onclick="exportUniLog('csv')" style="font-size:11px;">Export CSV</button>
+      <button class="btn btn-ghost" onclick="clearUniLog()" style="font-size:11px;">Clear</button>
+      <span id="unilog-count" style="font-size:11px; color:#475569; margin-left:auto;"></span>
+    </div>
+    <div class="log-wrap" id="unilog-view" style="margin-top:10px; max-height:560px;"></div>
+  </div>
+</div><!-- #ppanel-logs -->
+
 </div><!-- .page -->
+
+<!-- ── 3-month cost simulation engine ─────────────────────────────────────────
+     Runs in a Web Worker (built from this tag via Blob URL) so the 8,832-tick ×
+     3-scenario sweep never blocks the dashboard UI. Entirely synthetic — it
+     never calls the live hub or simulator APIs. -->
+<script type="text/js-worker" id="cs-worker-src">
+'use strict';
+
+const DT  = 0.25;          // h per tick (15 min)
+const TPD = 96;            // ticks per day
+const DAYS = 92;           // Jun 1 – Aug 31
+
+// System sizes
+const PV_KW   = 8.0;                            // rooftop array
+const BAT_KWH = 13.5, BAT_KW = 5.0;             // home battery
+const BAT_RES = 1.35, CHG_EFF = 0.92;           // 10% reserve, charge efficiency
+const EV_KW   = 7.2,  EV_CHG_EFF = 0.90;        // level-2 charger
+
+// TOU tariff: matches lexa-hub's DefaultTOUCostModel so modeled and measured
+// (bench replay) runs share one price basis. Peak 4–9 PM $0.38, partial-peak
+// 7 AM–4 PM $0.18, off-peak 9 PM–7 AM $0.10; export credited at $0.07/kWh.
+// "Peak" for battery dispatch = rate ≥ hub's 0.30 peakThreshold.
+const RATE_PEAK = 0.38, RATE_PARTIAL = 0.18, RATE_OFF = 0.10, EXPORT_CREDIT = 0.07;
+const rateAt   = h => (h >= 16 && h < 21) ? RATE_PEAK : (h >= 7 && h < 16) ? RATE_PARTIAL : RATE_OFF;
+const isPeakH  = h => h >= 16 && h < 21;
+const isOffH   = h => h < 7 || h >= 21;
+
+const INF = Infinity;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+function mulberry32(a) {
+  return function() {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function gauss(rnd, mu, sd) {
+  let u = 0, v = 0;
+  while (!u) u = rnd();
+  while (!v) v = rnd();
+  return mu + sd * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// ── Environment: one shared series for all three scenarios ──────────────────
+function genEnv(seed) {
+  const rnd = mulberry32(seed);
+  const N = DAYS * TPD;
+  const pv = new Float64Array(N), load = new Float64Array(N);
+  const evHome = new Uint8Array(N).fill(1), evArrive = new Float64Array(N);
+  const expCap = new Float64Array(N).fill(INF);
+  const impCap = new Float64Array(N).fill(INF);
+  const genCap = new Float64Array(N).fill(INF);
+  const dates = [], events = [];
+  let clearDays = 0, partlyDays = 0, rainDays = 0, maxHeat = 0, totalTrips = 0;
+
+  let wType = 'clear';
+  const start = Date.UTC(2026, 5, 1);
+
+  for (let d = 0; d < DAYS; d++) {
+    const date = new Date(start + d * 86400000);
+    dates.push((date.getUTCMonth() + 1) + '/' + date.getUTCDate());
+    const dow = date.getUTCDay();
+    const weekend = dow === 0 || dow === 6;
+
+    // Weather: Markov day types (New England summer mix)
+    const r = rnd();
+    if      (wType === 'clear')  wType = r < 0.55 ? 'clear' : r < 0.85 ? 'partly' : 'rain';
+    else if (wType === 'partly') wType = r < 0.35 ? 'clear' : r < 0.75 ? 'partly' : 'rain';
+    else                         wType = r < 0.30 ? 'clear' : r < 0.70 ? 'partly' : 'rain';
+    const heat = wType === 'clear' ? 78 + rnd() * 17
+               : wType === 'partly' ? 73 + rnd() * 14
+               : 66 + rnd() * 9;                                  // °F
+    if (wType === 'clear') clearDays++; else if (wType === 'partly') partlyDays++; else rainDays++;
+    if (heat > maxHeat) maxHeat = heat;
+
+    // EV: weekday commute 7-9 AM out, 4-6 PM back; lighter weekend trips
+    let dep = -1, ret = -1, trip = 0;
+    if (!weekend) {
+      dep = 7 + rnd() * 2;
+      ret = 16 + rnd() * 2;
+      trip = clamp(gauss(rnd, 11, 4), 4, 22);                     // kWh driven
+    } else if (rnd() < 0.65) {
+      dep = 9 + rnd() * 3;
+      ret = dep + 3 + rnd() * 4;
+      trip = clamp(gauss(rnd, 7, 3), 2, 14);
+    }
+    totalTrips += trip;
+
+    let cloud = 0.7;  // random-walk cloud factor for partly days
+    for (let i = 0; i < TPD; i++) {
+      const t = d * TPD + i, h = i * DT;
+
+      // Solar: clear-sky bell (NE summer daylight ~5:25-20:10) × weather factor
+      let wf;
+      if      (wType === 'clear') wf = 0.93 + 0.07 * rnd();
+      else if (wType === 'rain')  wf = 0.10 + 0.15 * rnd();
+      else { cloud = clamp(cloud + (rnd() - 0.5) * 0.25, 0.25, 0.95); wf = cloud; }
+      const sr = 5.4, ss = 20.2;
+      const elev = (h > sr && h < ss) ? Math.sin(Math.PI * (h - sr) / (ss - sr)) : 0;
+      pv[t] = PV_KW * Math.pow(elev, 1.15) * wf;
+
+      // Home load: base + morning/evening bumps + heat-driven A/C with cycling
+      let l = 0.45 + 0.1 * rnd();
+      if (h >= 6  && h < 9)  l += 0.7 * Math.sin(Math.PI * (h - 6) / 3);
+      if (h >= 17 && h < 22) l += 1.0 * Math.sin(Math.PI * (h - 17) / 5);
+      const acF = Math.max(0, (heat - 72) / 22);
+      if (h >= 12 && h < 23) l += acF * 2.6 * Math.sin(Math.PI * (h - 12) / 11) * (0.75 + 0.5 * rnd());
+      load[t] = l;
+
+      if (dep >= 0 && h >= dep && h < ret) evHome[t] = 0;
+    }
+    if (dep >= 0) {
+      const rt = d * TPD + Math.min(TPD - 1, Math.floor(ret / DT));
+      evArrive[rt] = trip;
+    }
+
+    // CSIP DER controls: congestion events, mostly on hot/sunny days
+    const evts = [];
+    if (wType !== 'rain' && rnd() < (heat > 85 ? 0.30 : 0.10)) {
+      const s = 10.5 + rnd() * 2, dur = 2 + rnd() * 3;            // midday solar backfeed
+      if (rnd() < 0.6) evts.push({ type: 'exportCap', limit: +(1 + rnd() * 2).toFixed(1), start: s, end: s + dur });
+      else             evts.push({ type: 'genLimit',  limit: +(PV_KW * (0.35 + rnd() * 0.3)).toFixed(1), start: s, end: s + dur });
+    }
+    if (heat > 86 && rnd() < 0.28) {
+      const s = 16.5 + rnd() * 1.5, dur = 1.5 + rnd() * 2.5;      // evening demand crunch
+      evts.push({ type: 'importCap', limit: +(1.5 + rnd() * 1.5).toFixed(1), start: s, end: s + dur });
+    }
+    for (const e of evts) {
+      events.push({ day: d, ...e });
+      const i0 = Math.max(0, Math.floor(e.start / DT));
+      const i1 = Math.min(TPD - 1, Math.floor(e.end / DT));
+      for (let i = i0; i <= i1; i++) {
+        const t = d * TPD + i;
+        if (e.type === 'exportCap') expCap[t] = Math.min(expCap[t], e.limit);
+        if (e.type === 'importCap') impCap[t] = Math.min(impCap[t], e.limit);
+        if (e.type === 'genLimit')  genCap[t] = Math.min(genCap[t], e.limit);
+      }
+    }
+  }
+  return { pv, load, evHome, evArrive, expCap, impCap, genCap, dates, events,
+           weather: { clear: clearDays, partly: partlyDays, rain: rainDays,
+                      maxHeat: Math.round(maxHeat) },
+           totalTrips };
+}
+
+// ── Scenario policies ────────────────────────────────────────────────────────
+function newState() {
+  return { soc: BAT_KWH * 0.5, evDef: 0, evKWh: 0,
+           imp: 0, exp: 0, peakImp: 0, cost: 0, credit: 0, curt: 0,
+           vio: 0, cons: 0, cum: [] };
+}
+
+// Book energy + cost for the final grid flow and judge DER-control compliance.
+function settle(st, grid, e, pvOut) {
+  if (grid > 0) {
+    st.cost += grid * DT * e.price;
+    st.imp  += grid * DT;
+    if (e.isPeak) st.peakImp += grid * DT;
+  } else {
+    st.credit += -grid * DT * EXPORT_CREDIT;
+    st.exp    += -grid * DT;
+  }
+  if (e.expCap < INF || e.impCap < INF || e.genCap < INF) {
+    st.cons++;
+    const TOL = 0.05;
+    if (-grid > e.expCap + TOL || grid > e.impCap + TOL || pvOut > e.genCap + TOL) st.vio++;
+  }
+}
+
+// 1. Dumb: EV charges on plug-in, battery idle, solar exports blindly,
+//    DER controls ignored.
+function stepDumb(st, e) {
+  const ev = (e.evHome && st.evDef > 0) ? Math.min(EV_KW, st.evDef / DT) : 0;
+  st.evDef -= ev * DT; st.evKWh += ev * DT;
+  settle(st, e.load + ev - e.pv, e, e.pv);
+}
+
+// 2. EV deferral only: EV waits for off-peak rates; everything else dumb.
+function stepDeferral(st, e) {
+  const ev = (e.evHome && st.evDef > 0 && e.isOff) ? Math.min(EV_KW, st.evDef / DT) : 0;
+  st.evDef -= ev * DT; st.evKWh += ev * DT;
+  settle(st, e.load + ev - e.pv, e, e.pv);
+}
+
+// 3. Smart hub: TOU battery dispatch + solar self-consumption + EV deferral,
+//    with CSIP DER controls enforced ahead of economics.
+function stepSmart(st, e) {
+  let pvOut = Math.min(e.pv, e.genCap);            // generation cap → curtail
+  st.curt += (e.pv - pvOut) * DT;
+
+  let ev = (e.evHome && st.evDef > 0 && e.isOff) ? Math.min(EV_KW, st.evDef / DT) : 0;
+  let net = e.load + ev - pvOut;                   // +import / −export
+
+  const room  = (BAT_KWH - st.soc) / (DT * CHG_EFF);          // max charge kW
+  const avail = Math.max(0, (st.soc - BAT_RES) / DT);         // max discharge kW
+  let dis = 0, ch = 0;
+
+  if (net > 0 && e.isPeak) {                       // peak shaving
+    dis = Math.min(net, BAT_KW, avail);
+    net -= dis;
+  } else if (net < 0) {                            // solar self-consumption
+    ch = Math.min(-net, BAT_KW, room);
+    net += ch;
+  }
+
+  if (-net > e.expCap) {                           // export cap: absorb, then curtail
+    const extra = Math.min(-net - e.expCap, BAT_KW - ch, room - ch);
+    if (extra > 0) { ch += extra; net += extra; }
+    if (-net > e.expCap) {
+      const cut = -net - e.expCap;
+      pvOut -= cut; st.curt += cut * DT; net += cut;
+    }
+  }
+
+  if (net > e.impCap) {                            // import cap: shed EV, then battery
+    let need = net - e.impCap;
+    const cutEv = Math.min(ev, need);
+    ev -= cutEv; net -= cutEv;
+    need = net - e.impCap;
+    if (need > 0) {
+      const d2 = Math.min(need, BAT_KW - dis, avail - dis);
+      if (d2 > 0) { dis += d2; net -= d2; }
+    }
+  }
+
+  st.soc += ch * DT * CHG_EFF - dis * DT;
+  st.evDef -= ev * DT; st.evKWh += ev * DT;
+  settle(st, net, e, pvOut);
+}
+
+// ── Main loop: day-by-day, all scenarios in lockstep ─────────────────────────
+self.onmessage = async (msg) => {
+  const seed = msg.data.seed >>> 0;
+
+  // 'env' command: return the raw environment series for this seed so the
+  // dashboard can upload it to the server-side bench-replay driver. Caps are
+  // omitted (they contain Infinity); the events list carries the DER controls.
+  if (msg.data.cmd === 'env') {
+    const env = genEnv(seed);
+    postMessage({ type: 'env', seed, env: {
+      pv: Array.from(env.pv), load: Array.from(env.load),
+      evHome: Array.from(env.evHome), evArrive: Array.from(env.evArrive),
+      events: env.events, dates: env.dates, weather: env.weather,
+    }});
+    return;
+  }
+
+  postMessage({ type: 'progress', pct: 0, label: 'generating summer environment…' });
+  const env = genEnv(seed);
+
+  const sc = { dumb: newState(), deferral: newState(), smart: newState() };
+  const dailyUsage = [], dailyProd = [];
+  let totalLoad = 0, totalPV = 0;
+
+  for (let d = 0; d < DAYS; d++) {
+    let useAcc = 0, prodAcc = 0, tripAcc = 0;
+    for (let i = 0; i < TPD; i++) {
+      const t = d * TPD + i, h = i * DT;
+      const e = { pv: env.pv[t], load: env.load[t], evHome: env.evHome[t] === 1,
+                  isPeak: isPeakH(h), isOff: isOffH(h), price: rateAt(h),
+                  expCap: env.expCap[t], impCap: env.impCap[t], genCap: env.genCap[t] };
+      const arr = env.evArrive[t];
+      if (arr > 0) {
+        tripAcc += arr;
+        for (const k in sc) sc[k].evDef += arr / EV_CHG_EFF;
+      }
+      stepDumb(sc.dumb, e);
+      stepDeferral(sc.deferral, e);
+      stepSmart(sc.smart, e);
+      useAcc += env.load[t] * DT;
+      prodAcc += env.pv[t] * DT;
+    }
+    dailyUsage.push(+(useAcc + tripAcc / EV_CHG_EFF).toFixed(1));
+    dailyProd.push(+prodAcc.toFixed(1));
+    totalLoad += useAcc; totalPV += prodAcc;
+    for (const k in sc) sc[k].cum.push(+(sc[k].cost - sc[k].credit).toFixed(2));
+
+    postMessage({ type: 'progress', pct: (d + 1) / DAYS * 100,
+                  label: 'simulating ' + env.dates[d] + ' — 3 scenarios × 96 ticks/day' });
+    await sleep(12);   // pace for visible progress; total run ≈ 1-2 s
+  }
+
+  const mk = st => ({
+    net: +(st.cost - st.credit).toFixed(2), cost: +st.cost.toFixed(2),
+    credit: +st.credit.toFixed(2), imp: +st.imp.toFixed(1), exp: +st.exp.toFixed(1),
+    peakImp: +st.peakImp.toFixed(1), evKWh: +st.evKWh.toFixed(1), curt: +st.curt.toFixed(1),
+    compliance: st.cons ? +(100 * (1 - st.vio / st.cons)).toFixed(1) : 100,
+    cum: st.cum,
+  });
+
+  postMessage({ type: 'done', results: {
+    seed, dates: env.dates, dailyUsage, dailyProd,
+    scen: { dumb: mk(sc.dumb), deferral: mk(sc.deferral), smart: mk(sc.smart) },
+    events: env.events.length,
+    constrainedHours: +(sc.smart.cons * DT).toFixed(1),
+    weather: env.weather,
+    totalLoad: +totalLoad.toFixed(0), totalPV: +totalPV.toFixed(0),
+    totalTrips: +env.totalTrips.toFixed(0),
+  }});
+};
+</script>
 
 <script>
 'use strict';
@@ -809,7 +1307,8 @@ function downloadCSV() {
 
   const scLog = document.getElementById('sc-log')?.innerText || '';
   const hubLog = document.getElementById('log-stream')?.innerText || '';
-  const notes = '# Scenario log\n' + scLog + '\n\n# Hub log\n' + hubLog;
+  const notes = '# Test execution history\n' + assertHistoryText() +
+                '\n\n# Scenario log\n' + scLog + '\n\n# Hub log\n' + hubLog;
 
   const blob = new Blob([header + rows + '\n\n' + notes.split('\n').map(l => '# ' + l).join('\n')],
                         {type: 'text/csv'});
@@ -854,6 +1353,8 @@ function switchTab(name) {
     simIntervals.push(setInterval(pollEVState, 2000));
   } else if (name === 'scenarios') {
     // no polling needed; scenarios are event-driven
+  } else if (name === 'logs') {
+    renderUniLog(); // stream appends handle the rest
   }
 }
 
@@ -877,9 +1378,9 @@ async function pollHub() {
     setText('solar-w',   fmt(solar)   + ' W');
     setText('battery-w', fmt(battery) + ' W');
 
-    setText('solar-sub', 'of ' + fmt((d.devices ? Object.values(d.devices).find(d=>d.role==='solar')?.max_W : 0) || 0) + ' W cap');
+    setText('solar-sub', 'of ' + fmt((d.devices ? Object.values(d.devices).find(d=>d.role==='inverter')?.max_W : 0) || 0) + ' W cap');
     const batDev = d.devices ? Object.values(d.devices).find(x => x.role === 'battery') : null;
-    if (batDev) setText('battery-sub', 'SOC ' + (batDev.soc_pct ? batDev.soc_pct.toFixed(1) + '%' : '—'));
+    if (batDev) setText('battery-sub', 'SOC ' + (batDev.soc_pct != null && batDev.soc_pct > 0 ? batDev.soc_pct.toFixed(1) + '%' : '—'));
 
     const ctrl = d.csip_control;
     setText('csip-source', ctrl ? ctrl.source + ' / ' + (ctrl.mrid || '') : 'none');
@@ -888,11 +1389,15 @@ async function pollHub() {
     const devs = d.devices || {};
     Object.entries(devs).forEach(([name, dev]) => updateHubDevice(name, dev));
 
+    // A station may report several connector entries; aggregate power across
+    // them and display the active one (previously this read entry [0], which
+    // could be an idle placeholder — the EV looked parked while charging).
     const evses = d.evse_stations || [];
     let evW = 0;
     if (evses.length) {
-      const ev = evses[0];
-      evW = ev.power_W || 0;
+      evW = evses.reduce((sum, e) => sum + (e.power_W || 0), 0);
+      const ev = evses.find(e => e.session_active) ||
+                 evses.reduce((a, b) => ((b.power_W || 0) > (a.power_W || 0) ? b : a));
       setText('ev-w', fmt(evW) + ' W');
       setText('ev-sub', ev.session_active ? 'charging' : (ev.connected ? 'idle' : 'disconnected'));
       updateHubEVCard(ev);
@@ -1726,6 +2231,8 @@ const SCENARIOS = [
     initial: { solar_W: 8000, battery_soc: 40, load_W: 1000, ev_soc: 20, ev_session: true },
     grid: { program: 0, exp_lim_W: 1000, duration_s: 600,
             description: 'Demo S1: export limit 1 kW', activate: true },
+    assert: { kind: 'export_max', limit_W: 1000, tol_W: 150, settle_s: 180, hold_n: 4,
+              label: 'grid export held ≤ 1 kW' },
   },
   {
     id: 'ev-deferral',
@@ -1741,6 +2248,8 @@ const SCENARIOS = [
     initial: { solar_W: 1000, battery_soc: 75, load_W: 2000, ev_soc: 20, ev_session: true },
     grid: { program: 0, imp_lim_W: 500, duration_s: 300,
             description: 'Demo S2: import cap 500 W', activate: true },
+    assert: { kind: 'import_max', limit_W: 500, tol_W: 150, settle_s: 180, hold_n: 4,
+              label: 'grid import held ≤ 500 W' },
   },
   {
     id: 'outage',
@@ -1756,6 +2265,8 @@ const SCENARIOS = [
     initial: { solar_W: 3500, battery_soc: 50, load_W: 5000, ev_soc: 40, ev_session: true, ev_session_at_setup: true },
     grid: { program: 0, imp_lim_W: 0, duration_s: 300,
             description: 'Demo S3: emergency — zero import', activate: true },
+    assert: { kind: 'import_max', limit_W: 0, tol_W: 150, settle_s: 180, hold_n: 4,
+              label: 'grid import held at ≤ 0 W' },
   },
   {
     id: 'demand-response',
@@ -1771,6 +2282,8 @@ const SCENARIOS = [
     initial: { solar_W: 0, battery_soc: 60, load_W: 3000, ev_soc: 30, ev_session: true },
     grid: { program: 0, imp_lim_W: 1000, duration_s: 1200,
             description: 'Demo S4: DR dispatch — reduce import to 1 kW', activate: true },
+    assert: { kind: 'import_max', limit_W: 1000, tol_W: 150, settle_s: 180, hold_n: 4,
+              label: 'grid import held ≤ 1 kW' },
   },
   {
     id: 'self-consumption',
@@ -1786,6 +2299,8 @@ const SCENARIOS = [
     initial: { solar_W: 2000, battery_soc: 80, load_W: 1500, ev_soc: 60, ev_session: false },
     grid: { program: 0, exp_lim_W: 500, duration_s: 300,
             description: 'Demo S5: solar self-consumption with 500 W export cap', activate: true },
+    assert: { kind: 'export_max', limit_W: 500, tol_W: 150, settle_s: 180, hold_n: 4,
+              label: 'grid export held ≤ 500 W' },
   },
 ];
 
@@ -1812,6 +2327,8 @@ function buildScenarioSelector() {
 }
 
 function selectScenario(id) {
+  stopAssertion('scenario changed');
+  document.getElementById('sc-assert').style.display = 'none';
   selectedScenario = SCENARIOS.find(s => s.id === id);
   if (!selectedScenario) return;
 
@@ -1987,9 +2504,11 @@ async function sendDERControl() {
   setStatus('sc-run-status', '⚡ Event live — hub responding', '#a78bfa');
   document.getElementById('sc-event-btn').disabled = false;
   pollGridStatus();
+  startAssertion(sc);
 }
 
 async function resetAll() {
+  stopAssertion('reset');
   scenarioSiteLoadW = null;
   clearScLog();
   scLog('↺ Resetting all simulators…', 'hdr');
@@ -2027,11 +2546,604 @@ async function resetAll() {
   pollGridStatus();
 }
 
+// ── Scenario assertions ───────────────────────────────────────────────────────
+// After a grid event fires, poll the meter and judge the scenario PASS when its
+// condition holds for hold_n consecutive samples within settle_s seconds, FAIL
+// on timeout. Results land in a localStorage-backed execution history.
+
+const ASSERT_POLL_MS = 3000;
+const HISTORY_KEY = 'csip-assert-history';
+let assertState = null; // {sc, spec, startedAt, holdCount, timer}
+
+function condMet(spec, meterW) {
+  if (spec.kind === 'import_max') return meterW <= spec.limit_W + spec.tol_W;
+  if (spec.kind === 'export_max') return -meterW <= spec.limit_W + spec.tol_W;
+  return false;
+}
+
+async function readMeterW() {
+  try {
+    const r = await fetch('/api/meter/state');
+    if (!r.ok) return null;
+    const j = await r.json();
+    return j?.measurements?.W_W ?? null;
+  } catch (_) { return null; }
+}
+
+function setAssertBox(html, border) {
+  const el = document.getElementById('sc-assert');
+  el.style.display = '';
+  el.style.borderLeft = '3px solid ' + (border || '#475569');
+  el.innerHTML = html;
+}
+
+function startAssertion(sc) {
+  stopAssertion('superseded by new run');
+  const spec = sc.assert;
+  if (!spec) return;
+  assertState = {sc, spec, startedAt: Date.now(), holdCount: 0,
+                 timer: setInterval(assertTick, ASSERT_POLL_MS)};
+  scLog(`⏱ Asserting: ${spec.label} — needs ${spec.hold_n} consecutive samples, timeout ${spec.settle_s} s`, 'hdr');
+  setAssertBox(`⏱ <b>Asserting:</b> ${spec.label} — waiting for first sample…`, '#fbbf24');
+}
+
+function stopAssertion(reason) {
+  if (!assertState) return;
+  clearInterval(assertState.timer);
+  assertState = null;
+  scLog(`⏹ Assertion cancelled (${reason})`, '');
+  setAssertBox(`⏹ Assertion cancelled (${reason})`, '#475569');
+}
+
+async function assertTick() {
+  if (!assertState) return;
+  const spec = assertState.spec;
+  const w = await readMeterW();
+  if (!assertState) return; // cancelled while awaiting fetch
+  const elapsed = (Date.now() - assertState.startedAt) / 1000;
+  if (w === null) {
+    setAssertBox(`⏱ <b>Asserting:</b> ${spec.label} — meter unreachable (${elapsed.toFixed(0)} s)`, '#fbbf24');
+  } else {
+    const met = condMet(spec, w);
+    assertState.holdCount = met ? assertState.holdCount + 1 : 0;
+    setAssertBox(
+      `⏱ <b>Asserting:</b> ${spec.label}<br>` +
+      `meter ${fmt(w)} W — ${met ? 'within limit' : 'outside limit'}, ` +
+      `hold ${assertState.holdCount}/${spec.hold_n}, ${elapsed.toFixed(0)}/${spec.settle_s} s`,
+      met ? '#34d399' : '#fbbf24');
+    if (assertState.holdCount >= spec.hold_n) { finishAssertion(true, w, elapsed); return; }
+  }
+  if (elapsed >= spec.settle_s) finishAssertion(false, w, elapsed);
+}
+
+function finishAssertion(passed, w, elapsed) {
+  const {sc, spec} = assertState;
+  clearInterval(assertState.timer);
+  assertState = null;
+
+  const detail = `meter ${w === null ? 'unreachable' : fmt(w) + ' W'} after ${elapsed.toFixed(0)} s`;
+  if (passed) {
+    scLog(`✅ PASS — ${spec.label} (${detail})`, 'ok');
+    setAssertBox(`✅ <b>PASS</b> — ${spec.label} (${detail})`, '#34d399');
+    setStatus('sc-run-status', '✅ PASS', '#34d399');
+  } else {
+    scLog(`❌ FAIL — ${spec.label} not achieved (${detail})`, 'err');
+    setAssertBox(`❌ <b>FAIL</b> — ${spec.label} not achieved (${detail})`, '#f87171');
+    setStatus('sc-run-status', '❌ FAIL', '#f87171');
+  }
+  markChartEvent((passed ? 'PASS: ' : 'FAIL: ') + sc.title);
+  recordAssertResult({
+    at: new Date().toISOString(), scenario: `S${sc.num} ${sc.title}`,
+    label: spec.label, passed, detail,
+  });
+}
+
+function loadAssertHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) || []; }
+  catch (_) { return []; }
+}
+
+function recordAssertResult(entry) {
+  const hist = loadAssertHistory();
+  hist.unshift(entry);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(hist.slice(0, 50)));
+  renderAssertHistory();
+}
+
+function clearAssertHistory() {
+  localStorage.removeItem(HISTORY_KEY);
+  renderAssertHistory();
+}
+
+function renderAssertHistory() {
+  const el = document.getElementById('sc-history');
+  const hist = loadAssertHistory();
+  if (!hist.length) { el.textContent = 'No test runs yet.'; return; }
+  el.innerHTML = hist.map(h => {
+    const t = new Date(h.at).toLocaleString();
+    const mark = h.passed ? '✅' : '❌';
+    const color = h.passed ? '#34d399' : '#f87171';
+    return `<div style="padding:3px 0; border-bottom:1px solid #1e293b;">` +
+           `<span style="color:${color};">${mark}</span> ` +
+           `<span style="color:#64748b;">${t}</span>  ` +
+           `<b style="color:#e2e8f0;">${h.scenario}</b> — ${h.label} ` +
+           `<span style="color:#64748b;">(${h.detail})</span></div>`;
+  }).join('');
+}
+
+// assertHistoryText renders the history for the CSV export notes block.
+function assertHistoryText() {
+  return loadAssertHistory().map(h =>
+    `${h.passed ? 'PASS' : 'FAIL'} ${h.at} ${h.scenario} — ${h.label} (${h.detail})`).join('\n');
+}
+
+// ── Unified protocol log (Logs tab) ──────────────────────────────────────────
+// One EventSource on /api/logs/all (the dashboard server merges every
+// backend's /logs stream — see cmd/dashboard/logmux.go). Client keeps a
+// bounded ring with per-source and free-text filtering plus JSON/CSV export.
+
+const LOG_SOURCES = [
+  {id: 'hub',     name: 'Hub',     proto: 'MQTT/CSIP',   color: '#a78bfa'},
+  {id: 'grid',    name: 'Grid',    proto: 'IEEE 2030.5', color: '#fbbf24'},
+  {id: 'solar',   name: 'Solar',   proto: 'Modbus',      color: '#34d399'},
+  {id: 'battery', name: 'Battery', proto: 'Modbus',      color: '#60a5fa'},
+  {id: 'meter',   name: 'Meter',   proto: 'Modbus',      color: '#e2e8f0'},
+  {id: 'ev',      name: 'EV',      proto: 'OCPP',        color: '#22d3ee'},
+];
+const UNILOG_MAX = 3000;     // entries kept in memory
+const UNILOG_DOM_MAX = 600;  // rows kept in the DOM
+let uniLog = [];             // {at, src, line}
+let uniLogPaused = false;
+let uniLogEnabled = new Set(LOG_SOURCES.map(s => s.id));
+
+function connectUniLog() {
+  const es = new EventSource('/api/logs/all'); // auto-reconnects on error
+  es.onmessage = e => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch (_) { return; }
+    uniLogAppend({at: ev.at, src: ev.src, line: ev.line});
+  };
+  buildUniLogChips();
+}
+
+function uniLogAppend(entry) {
+  uniLog.push(entry);
+  if (uniLog.length > UNILOG_MAX) uniLog.splice(0, uniLog.length - UNILOG_MAX);
+  updateUniLogCount();
+  if (uniLogPaused) return;
+  if (document.getElementById('ppanel-logs').style.display === 'none') return;
+  if (!uniLogMatch(entry)) return;
+  appendUniLogRow(entry);
+}
+
+function uniLogMatch(entry) {
+  if (!uniLogEnabled.has(entry.src)) return false;
+  const q = document.getElementById('unilog-search').value.trim().toLowerCase();
+  return !q || entry.line.toLowerCase().includes(q);
+}
+
+function uniLogRowHTML(entry) {
+  const src = LOG_SOURCES.find(s => s.id === entry.src) || {name: entry.src, color: '#94a3b8'};
+  const t = new Date(entry.at).toLocaleTimeString();
+  return `<span style="color:#475569;">${t}</span> ` +
+         `<span style="color:${src.color}; font-weight:600;">[${src.name}]</span> ` +
+         `<span>${escapeHTML(entry.line)}</span>`;
+}
+
+function appendUniLogRow(entry) {
+  const view = document.getElementById('unilog-view');
+  const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 30;
+  const div = document.createElement('div');
+  div.className = 'sc-log-line';
+  div.innerHTML = uniLogRowHTML(entry);
+  view.appendChild(div);
+  while (view.childElementCount > UNILOG_DOM_MAX) view.removeChild(view.firstChild);
+  if (atBottom) view.scrollTop = view.scrollHeight;
+}
+
+function renderUniLog() {
+  const view = document.getElementById('unilog-view');
+  const rows = uniLog.filter(uniLogMatch).slice(-UNILOG_DOM_MAX);
+  view.innerHTML = rows.map(e => `<div class="sc-log-line">${uniLogRowHTML(e)}</div>`).join('');
+  view.scrollTop = view.scrollHeight;
+  updateUniLogCount();
+}
+
+function updateUniLogCount() {
+  const shown = uniLog.filter(uniLogMatch).length;
+  document.getElementById('unilog-count').textContent =
+    `${shown} shown / ${uniLog.length} buffered`;
+}
+
+function buildUniLogChips() {
+  const el = document.getElementById('unilog-chips');
+  el.innerHTML = LOG_SOURCES.map(s => {
+    const on = uniLogEnabled.has(s.id);
+    return `<button onclick="toggleUniLogSource('${s.id}')" title="${s.proto}"
+      style="font-size:11px; padding:2px 8px; border-radius:10px; cursor:pointer;
+             border:1px solid ${on ? s.color : '#1e293b'};
+             background:${on ? s.color + '22' : 'transparent'};
+             color:${on ? s.color : '#475569'};">${s.name}</button>`;
+  }).join('');
+}
+
+function toggleUniLogSource(id) {
+  if (uniLogEnabled.has(id)) uniLogEnabled.delete(id); else uniLogEnabled.add(id);
+  buildUniLogChips();
+  renderUniLog();
+}
+
+function uniLogFilterChanged() { renderUniLog(); }
+
+function toggleUniLogPause() {
+  uniLogPaused = !uniLogPaused;
+  const btn = document.getElementById('unilog-pause-btn');
+  btn.innerHTML = uniLogPaused ? '&#9654; Resume' : '&#9208; Pause';
+  btn.style.color = uniLogPaused ? '#4ade80' : '';
+  if (!uniLogPaused) renderUniLog(); // catch up on what arrived while paused
+}
+
+function clearUniLog() {
+  uniLog = [];
+  renderUniLog();
+}
+
+function exportUniLog(kind) {
+  const rows = uniLog.filter(uniLogMatch);
+  let blob, ext;
+  if (kind === 'json') {
+    blob = new Blob([JSON.stringify(rows, null, 1)], {type: 'application/json'});
+    ext = 'json';
+  } else {
+    const esc = v => '"' + String(v).replace(/"/g, '""') + '"';
+    const csv = 'time,source,line\n' +
+      rows.map(e => [esc(e.at), esc(e.src), esc(e.line)].join(',')).join('\n');
+    blob = new Blob([csv], {type: 'text/csv'});
+    ext = 'csv';
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'csip-logs-' + new Date().toISOString().replace(/[:.]/g,'-').slice(0,19) + '.' + ext;
+  a.click();
+}
+
+function escapeHTML(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── 3-Month Cost Simulation (UI side) ─────────────────────────────────────────
+// The engine itself lives in the #cs-worker-src script tag and runs in a Web
+// Worker so the dashboard stays responsive while it sweeps Jun–Aug.
+
+let csWorker = null, csEnergyChart = null, csCostChart = null;
+
+function setCsProgress(pct, label) {
+  document.getElementById('cs-progress-bar').style.width = pct + '%';
+  document.getElementById('cs-progress-pct').textContent = pct.toFixed(0) + '%';
+  document.getElementById('cs-progress-label').textContent = label;
+}
+
+function runCostSim() {
+  const btn = document.getElementById('cs-run-btn');
+  btn.disabled = true;
+  btn.innerHTML = '&#8987;&nbsp; Simulating…';
+  document.getElementById('cs-progress-wrap').style.display = '';
+  setCsProgress(0, 'starting worker…');
+
+  if (csWorker) csWorker.terminate();
+  const src = document.getElementById('cs-worker-src').textContent;
+  csWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'application/javascript' })));
+
+  const done = () => { btn.disabled = false; btn.innerHTML = '&#9654;&nbsp; Run Simulation'; };
+  csWorker.onmessage = e => {
+    const m = e.data;
+    if (m.type === 'progress') setCsProgress(m.pct, m.label);
+    else if (m.type === 'done') {
+      setCsProgress(100, 'complete — ' + m.results.events + ' DER events, seed ' + m.results.seed);
+      renderCostSim(m.results);
+      done();
+    }
+  };
+  csWorker.onerror = err => { setCsProgress(0, 'worker error: ' + err.message); done(); };
+
+  csWorker.postMessage({ seed: (Date.now() ^ (Math.random() * 0xffffffff)) >>> 0 });
+}
+
+function csMoney(v) { return (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(2); }
+
+function csChartOpts(yLabel) {
+  return {
+    animation: false, responsive: true, maintainAspectRatio: true, aspectRatio: 3.2,
+    plugins: { legend: { labels: { color: '#94a3b8', boxWidth: 12, font: { size: 11 } } } },
+    scales: {
+      x: { ticks: { color: '#475569', maxTicksLimit: 13, font: { size: 10 } }, grid: { color: '#1e293b' } },
+      y: { ticks: { color: '#475569', font: { size: 10 } }, grid: { color: '#1e293b' },
+           title: { display: true, text: yLabel, color: '#64748b', font: { size: 10 } } },
+    },
+  };
+}
+
+function renderCostSim(r) {
+  csLastResults = r;
+  try { localStorage.setItem(CS_LAST_KEY, JSON.stringify(r)); } catch (_) {}
+  csReplayEnable();
+  document.getElementById('cs-results').style.display = 'flex';
+  const s = r.scen;
+  const savings    = s.dumb.net - s.smart.net;
+  const savingsDef = s.dumb.net - s.deferral.net;
+
+  setText('cs-kpi-dumb',  csMoney(s.dumb.net));
+  setText('cs-kpi-dumb-sub', s.dumb.imp.toFixed(0) + ' kWh imported, ' + s.dumb.peakImp.toFixed(0) + ' on-peak');
+  setText('cs-kpi-def',   csMoney(s.deferral.net));
+  setText('cs-kpi-def-sub', 'saves ' + csMoney(savingsDef) + ' vs dumb');
+  setText('cs-kpi-smart', csMoney(s.smart.net));
+  setText('cs-kpi-smart-sub', s.smart.peakImp.toFixed(0) + ' kWh on-peak, ' + s.smart.curt.toFixed(0) + ' kWh PV curtailed');
+  setText('cs-kpi-savings', csMoney(savings));
+  setText('cs-kpi-savings-sub', s.dumb.net > 0 ? (100 * savings / s.dumb.net).toFixed(0) + '% below dumb baseline' : '—');
+  setText('cs-kpi-compliance', s.smart.compliance.toFixed(1) + '%');
+  setText('cs-kpi-compliance-sub', 'dumb ' + s.dumb.compliance.toFixed(0) + '% · EV-only ' + s.deferral.compliance.toFixed(0) + '%');
+
+  if (csEnergyChart) csEnergyChart.destroy();
+  csEnergyChart = new Chart(document.getElementById('cs-energy-chart').getContext('2d'), {
+    type: 'line',
+    data: { labels: r.dates, datasets: [
+      { label: 'Usage (home + EV)', data: r.dailyUsage, borderColor: '#a78bfa', backgroundColor: '#a78bfa18', fill: true, tension: .3, pointRadius: 0, borderWidth: 2 },
+      { label: 'Solar production',  data: r.dailyProd,  borderColor: '#34d399', backgroundColor: '#34d39918', fill: true, tension: .3, pointRadius: 0, borderWidth: 2 },
+    ]},
+    options: csChartOpts('kWh / day'),
+  });
+
+  if (csCostChart) csCostChart.destroy();
+  csCostChart = new Chart(document.getElementById('cs-cost-chart').getContext('2d'), {
+    type: 'line',
+    data: { labels: r.dates, datasets: [
+      { label: 'Dumb',             data: s.dumb.cum,     borderColor: '#f87171', tension: .2, pointRadius: 0, borderWidth: 2 },
+      { label: 'EV Deferral only', data: s.deferral.cum, borderColor: '#60a5fa', tension: .2, pointRadius: 0, borderWidth: 2 },
+      { label: 'Smart Hub',        data: s.smart.cum,    borderColor: '#34d399', tension: .2, pointRadius: 0, borderWidth: 2 },
+    ]},
+    options: csChartOpts('cumulative $'),
+  });
+
+  const compColor = c => c >= 99 ? '#34d399' : c >= 90 ? '#fbbf24' : '#f87171';
+  const row = (name, color, st, sav) => `<tr>
+    <td><span style="color:${color};font-weight:700;">${name}</span></td>
+    <td>${csMoney(st.net)}</td><td>${csMoney(st.cost)}</td><td>${csMoney(st.credit)}</td>
+    <td>${st.imp.toFixed(0)}</td><td>${st.peakImp.toFixed(0)}</td><td>${st.exp.toFixed(0)}</td>
+    <td>${st.evKWh.toFixed(0)}</td><td>${st.curt.toFixed(0)}</td>
+    <td>${sav == null ? '—' : csMoney(sav)}</td>
+    <td style="color:${compColor(st.compliance)};">${st.compliance.toFixed(1)}%</td></tr>`;
+  document.getElementById('cs-matrix').innerHTML = `<table class="cs-table">
+    <thead><tr><th>Scenario</th><th>Net Cost</th><th>Energy Cost</th><th>Export Credit</th>
+      <th>Import kWh</th><th>Peak Import</th><th>Export kWh</th><th>EV kWh</th>
+      <th>PV Curtailed</th><th>Savings vs Dumb</th><th>DER Compliance</th></tr></thead>
+    <tbody>
+      ${row('1 · Dumb Management', '#f87171', s.dumb, null)}
+      ${row('2 · EV Peak-Rate Deferral', '#60a5fa', s.deferral, savingsDef)}
+      ${row('3 · Smart Hub (Full Orchestration)', '#34d399', s.smart, savings)}
+    </tbody></table>`;
+
+  const w = r.weather;
+  document.getElementById('cs-assumptions').innerHTML = `
+    <div class="sc-conditions" style="grid-template-columns:repeat(3,1fr);margin-top:0;">
+      <div class="sc-cond-block">
+        <h4>Tariff (TOU — matches hub cost model)</h4>
+        ${condRow('Peak (4–9 PM)', '$0.38 /kWh')}
+        ${condRow('Partial-peak (7 AM–4 PM)', '$0.18 /kWh')}
+        ${condRow('Off-peak (9 PM–7 AM)', '$0.10 /kWh')}
+        ${condRow('Export credit', '$0.07 /kWh')}
+      </div>
+      <div class="sc-cond-block">
+        <h4>Site Equipment</h4>
+        ${condRow('Solar array', '8.0 kW')}
+        ${condRow('Home battery', '13.5 kWh / 5 kW, 10% reserve')}
+        ${condRow('EV charger', '7.2 kW level 2')}
+      </div>
+      <div class="sc-cond-block">
+        <h4>Simulated Summer (seed ${r.seed})</h4>
+        ${condRow('Weather', w.clear + ' clear / ' + w.partly + ' partly / ' + w.rain + ' rainy days, max ' + w.maxHeat + ' °F')}
+        ${condRow('Solar generated', r.totalPV + ' kWh')}
+        ${condRow('Home load', r.totalLoad + ' kWh')}
+        ${condRow('EV driving', r.totalTrips + ' kWh')}
+        ${condRow('CSIP DER events', r.events + ' (' + r.constrainedHours + ' constrained h)')}
+      </div>
+    </div>
+    <div style="font-size:11px;color:#475569;margin-top:8px;">
+      Engine: 92 days × 96 ticks × 3 scenarios in a web worker; identical environment series
+      (weather, driving, loads, DER controls) replayed through each policy.
+      Compliance = % of DER-constrained intervals where the site obeyed the active
+      export-cap / import-cap / generation-limit control.
+    </div>`;
+}
+
+// ── Bench replay (hardware-in-the-loop) UI ────────────────────────────────────
+// The driver lives in the dashboard server (cmd/dashboard/replay.go); this UI
+// only uploads the environment, then polls /api/replay/status. The synthetic
+// run's results are kept in localStorage so the modeled-vs-measured comparison
+// survives a page reload mid-overnight-run.
+
+const CS_LAST_KEY = 'csip-costsim-last';
+let csLastResults = null;
+let csReplayChart = null, csReplayPoll = null;
+
+function csReplayEnable() {
+  const btn = document.getElementById('cs-rp-start');
+  btn.disabled = !csLastResults;
+  updateReplayEstimate();
+}
+
+function updateReplayEstimate() {
+  const days = parseInt(document.getElementById('cs-rp-scope').value);
+  const tickMs = parseInt(document.getElementById('cs-rp-tick').value);
+  const hours = days * 96 * tickMs / 3600000;
+  document.getElementById('cs-rp-est').textContent =
+    (csLastResults ? `seed ${csLastResults.seed} — ` : 'run the simulation above first — ') +
+    `estimated duration: ${hours < 1 ? Math.round(hours * 60) + ' min' : hours.toFixed(1) + ' h'} of real time` +
+    (days === 92 ? ' (overnight run; leave the bench powered)' : '');
+}
+document.getElementById('cs-rp-scope').onchange = updateReplayEstimate;
+document.getElementById('cs-rp-tick').onchange = updateReplayEstimate;
+
+function startBenchReplay() {
+  if (!csLastResults) return;
+  const days = parseInt(document.getElementById('cs-rp-scope').value);
+  const tickMs = parseInt(document.getElementById('cs-rp-tick').value);
+  const btn = document.getElementById('cs-rp-start');
+  btn.disabled = true;
+  btn.innerHTML = '&#8987;&nbsp; Starting…';
+
+  // Regenerate the exact environment for the synthetic run's seed and upload.
+  const src = document.getElementById('cs-worker-src').textContent;
+  const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'application/javascript' })));
+  w.onmessage = async e => {
+    if (e.data.type !== 'env') return;
+    w.terminate();
+    try {
+      const resp = await fetch('/api/replay/start', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ seed: e.data.seed, tick_ms: tickMs, start_day: 0, days, env: e.data.env }),
+      });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status + ': ' + await resp.text());
+      beginReplayPolling();
+    } catch (err) {
+      document.getElementById('cs-rp-est').textContent = 'start failed: ' + err.message;
+      btn.disabled = false;
+    }
+    btn.innerHTML = '&#9654;&nbsp; Start Replay';
+  };
+  w.postMessage({ cmd: 'env', seed: csLastResults.seed });
+}
+
+async function abortBenchReplay() {
+  await fetch('/api/replay/abort', { method: 'POST' });
+}
+
+function beginReplayPolling() {
+  if (csReplayPoll) clearInterval(csReplayPoll);
+  csReplayPoll = setInterval(pollReplayStatus, 3000);
+  pollReplayStatus();
+}
+
+async function pollReplayStatus() {
+  let st;
+  try {
+    const resp = await fetch('/api/replay/status');
+    if (!resp.ok) return;
+    st = await resp.json();
+  } catch (_) { return; }
+
+  if (!st.running && !st.finished && !st.aborted && !st.last_error) return; // never ran
+
+  document.getElementById('cs-rp-live').style.display = '';
+  document.getElementById('cs-rp-abort').style.display = st.running ? '' : 'none';
+  document.getElementById('cs-rp-start').disabled = st.running || !csLastResults;
+
+  document.getElementById('cs-rp-bar').style.width = (st.pct || 0) + '%';
+  document.getElementById('cs-rp-pct').textContent = (st.pct || 0).toFixed(1) + '%';
+  document.getElementById('cs-rp-label').textContent = st.running
+    ? `replaying tick ${st.tick}/${st.total_ticks} — hub responding live`
+    : st.aborted ? 'aborted (bench restored)'
+    : st.last_error ? ('failed: ' + st.last_error)
+    : 'complete (bench restored)';
+  setText('cs-rp-simtime', st.sim_time || '—');
+  setText('cs-rp-net', csMoney(st.measured.net_usd || 0));
+  setText('cs-rp-comp', st.measured.constrained_ticks
+    ? (st.measured.compliance_pct ?? 100).toFixed(1) + '% (' + st.measured.violations + ' viol / ' + st.measured.constrained_ticks + ' ticks)'
+    : 'no events yet');
+  const last = st.samples && st.samples.length ? st.samples[st.samples.length - 1] : null;
+  setText('cs-rp-grid', last ? fmt(last.grid_W) + ' W' : '—');
+  setText('cs-rp-cap', last && last.constraint ? last.constraint : 'none');
+  setText('cs-rp-eta', st.running ? formatEta(st.eta_s) : '—');
+
+  renderReplayDecisions(st.samples || []);
+
+  if (!st.running && (st.finished || st.aborted) && st.daily_net && st.daily_net.length) {
+    renderReplayComparison(st);
+  }
+  if (!st.running && csReplayPoll) { clearInterval(csReplayPoll); csReplayPoll = null; }
+  if (st.running && !csReplayPoll) csReplayPoll = setInterval(pollReplayStatus, 3000);
+}
+
+function formatEta(s) {
+  if (s == null) return '—';
+  if (s < 3600) return Math.round(s / 60) + ' min';
+  return (s / 3600).toFixed(1) + ' h';
+}
+
+function renderReplayDecisions(samples) {
+  const el = document.getElementById('cs-rp-decisions');
+  const rows = [];
+  for (const s of samples.slice(-20)) {
+    const mark = s.violation ? ' style="color:#f87171;"' : s.constraint ? ' style="color:#fbbf24;"' : '';
+    const head = `<span style="color:#475569;">${s.sim_time}</span>` +
+                 (s.constraint ? ` <span${mark}>[${escapeHTML(s.constraint)}${s.violation ? ' VIOLATION' : ''}]</span>` : '');
+    if (s.decisions && s.decisions.length) {
+      for (const dec of s.decisions) rows.push(`<div class="log-line orch">${head} ${escapeHTML(dec)}</div>`);
+    } else if (s.constraint) {
+      rows.push(`<div class="log-line">${head}</div>`);
+    }
+  }
+  el.innerHTML = rows.slice(-40).join('') || '<div class="log-line" style="color:#334155;">no decisions yet</div>';
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderReplayComparison(st) {
+  const modeled = csLastResults;
+  document.getElementById('cs-rp-result').style.display = '';
+  const n = st.daily_net.length;
+  const labels = (modeled ? modeled.dates : []).slice(st.start_day, st.start_day + n);
+
+  const datasets = [{
+    label: 'MEASURED — real hub on bench', data: st.daily_net,
+    borderColor: '#fbbf24', backgroundColor: '#fbbf2418', borderWidth: 3, tension: .2, pointRadius: 0,
+  }];
+  if (modeled && modeled.seed === st.seed) {
+    const slice = a => a.slice(st.start_day, st.start_day + n);
+    datasets.push(
+      { label: 'Modeled Smart Hub', data: slice(modeled.scen.smart.cum), borderColor: '#34d399', borderDash: [6, 4], borderWidth: 2, tension: .2, pointRadius: 0 },
+      { label: 'Modeled EV Deferral', data: slice(modeled.scen.deferral.cum), borderColor: '#60a5fa', borderDash: [6, 4], borderWidth: 2, tension: .2, pointRadius: 0 },
+      { label: 'Modeled Dumb', data: slice(modeled.scen.dumb.cum), borderColor: '#f87171', borderDash: [6, 4], borderWidth: 2, tension: .2, pointRadius: 0 },
+    );
+  }
+  if (csReplayChart) csReplayChart.destroy();
+  csReplayChart = new Chart(document.getElementById('cs-rp-chart').getContext('2d'), {
+    type: 'line', data: { labels: labels.length ? labels : st.daily_net.map((_, i) => 'day ' + (i + 1)), datasets },
+    options: csChartOpts('cumulative $ (measured vs modeled)'),
+  });
+
+  let rows = `<tr><td><b style="color:#fbbf24;">MEASURED — real hub</b></td>
+    <td>${csMoney(st.measured.net_usd)}</td><td>${st.measured.import_kwh.toFixed(0)}</td>
+    <td>${st.measured.peak_import_kwh.toFixed(0)}</td><td>${st.measured.export_kwh.toFixed(0)}</td>
+    <td style="color:${st.measured.compliance_pct >= 99 ? '#34d399' : st.measured.compliance_pct >= 90 ? '#fbbf24' : '#f87171'};">
+      ${(st.measured.compliance_pct ?? 100).toFixed(1)}% (${st.measured.violations}/${st.measured.constrained_ticks})</td></tr>`;
+  if (modeled && modeled.seed === st.seed && n === modeled.dates.length) {
+    const s = modeled.scen;
+    const mrow = (name, color, sc) => `<tr><td><span style="color:${color};">${name}</span></td>
+      <td>${csMoney(sc.net)}</td><td>${sc.imp.toFixed(0)}</td><td>${sc.peakImp.toFixed(0)}</td>
+      <td>${sc.exp.toFixed(0)}</td><td>${sc.compliance.toFixed(1)}%</td></tr>`;
+    rows += mrow('Modeled Smart Hub', '#34d399', s.smart) +
+            mrow('Modeled EV Deferral', '#60a5fa', s.deferral) +
+            mrow('Modeled Dumb', '#f87171', s.dumb);
+  }
+  document.getElementById('cs-rp-matrix').innerHTML = `<table class="cs-table">
+    <thead><tr><th>Run</th><th>Net Cost</th><th>Import kWh</th><th>Peak Import</th>
+    <th>Export kWh</th><th>DER Compliance</th></tr></thead><tbody>${rows}</tbody></table>` +
+    (st.measured.sample_errors ? `<div style="font-size:11px;color:#f59e0b;margin-top:6px;">
+      ${st.measured.sample_errors} ticks had unreachable backends and were excluded from cost booking.</div>` : '');
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 pollHub();
 connectLogs();
+connectUniLog();
 setInterval(pollHub, 1000);
 buildScenarioSelector();
+renderAssertHistory();
+// Restore the last synthetic cost-sim run (enables Bench Replay + the
+// modeled-vs-measured comparison after a reload) and re-attach to any
+// replay already running in the dashboard server.
+try { csLastResults = JSON.parse(localStorage.getItem(CS_LAST_KEY)); } catch (_) {}
+csReplayEnable();
+pollReplayStatus();
 </script>
 </body>
 </html>

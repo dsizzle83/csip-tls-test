@@ -3,9 +3,13 @@
   Binary: evsim  |  Protocol: OCPP 2.0.1 WebSocket  |  Connects to hub port 8887
 ==============================================================================
 
+NOTE (2026-06-12): this guide was written for the ConnectCore dev kit era. The
+hub currently runs on hub-pi at 69.0.0.1 — substitute 69.0.0.1 wherever 69.0.0.2
+appears below (the dev kit is offline). Current topology: docs/BENCH.md.
+
 OVERVIEW
 --------
-This Pi runs the OCPP 2.0.1 EV charging station client simulator (cmd/evsim).
+This Pi runs the OCPP 2.0.1 EV charging station client simulator (sim/evsim).
 Unlike the Modbus simulators, evsim is an OUTBOUND connector — it connects TO
 the hub's OCPP CSMS (Central System Management System) rather than listening.
 

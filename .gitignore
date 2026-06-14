@@ -30,6 +30,10 @@ internal/tlsclient/testdata/certs/
 # Golden files DO get committed — they're part of the test suite
 !internal/tlsserver/testdata/golden/
 
+# Bench replay artifacts (per-run, regenerated each replay)
+replay-checkpoint.json
+replay-ticklog-*.csv
+
 # Go test artifacts
 *.test
 *.out

@@ -1,4 +1,8 @@
-# Hub Binary (cmd/hub/)
+# Hub Binary (cmd/hub/) — OBSOLETE
+
+> **This monolith was superseded by the `~/projects/lexa-hub` repo** (six MQTT-connected
+> systemd services). Kept for reference only. Do not extend it, fix bugs in it, or cite it
+> as the product. The notes below describe its historical design.
 
 ## Purpose
 Long-running CSIP DER hub for Raspberry Pi. Wires northbound CSIP discovery ↔ southbound Modbus devices. Config: `hub.json` (see `hub-example.json`).

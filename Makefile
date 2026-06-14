@@ -11,6 +11,15 @@ SERVER_CERTS  := sim/tlsserver/testdata/certs
 CLIENT_CERTS  := internal/tlsclient/testdata/certs
 CA_CERT       := $(SERVER_CERTS)/ca-cert.pem
 
+# wolfSSL sysroot for cgo on machines without a system-wide install (the
+# desktop). No-op where the dir is absent (Pi/WSL with wolfssl installed).
+# The static libwolfssl.a needs -lm (pow/log in dh.c).
+WOLFSSL_SYSROOT ?= $(HOME)/.local/wolfssl-amd64
+ifneq ($(wildcard $(WOLFSSL_SYSROOT)/include),)
+export CGO_CFLAGS  += -I$(WOLFSSL_SYSROOT)/include
+export CGO_LDFLAGS += -L$(WOLFSSL_SYSROOT)/lib -lm
+endif
+
 # === Build targets ==========================================================
 
 all: build

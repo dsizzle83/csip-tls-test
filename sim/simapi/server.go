@@ -9,6 +9,7 @@
 //	POST /control  — animation control; body: {"cmd":"pause"|"resume"|"reset", "speed":N}
 //	GET  /registers — raw Modbus register dump (Modbus sims only; 404 if unsupported)
 //	GET  /ws       — WebSocket: pushes /state JSON every 2 seconds
+//	GET  /logs     — SSE stream of the simulator's log lines (backlog replayed)
 //
 // All endpoints add Access-Control-Allow-Origin: * so a browser-based GUI
 // running on a desktop can talk to a Pi simulator without a proxy.
@@ -53,6 +54,7 @@ type Server struct {
 	injectFn   InjectFunc
 	registersFn RegistersFunc
 	controlFn  ControlFunc
+	logBuf     *LogBuffer
 
 	mu      sync.Mutex
 	clients map[chan []byte]struct{}
@@ -70,6 +72,7 @@ func New(addr string, stateFn StateFunc, injectFn InjectFunc, registersFn Regist
 		injectFn:    injectFn,
 		registersFn: registersFn,
 		controlFn:   controlFn,
+		logBuf:      NewLogBuffer(),
 		clients:     make(map[chan []byte]struct{}),
 	}
 
@@ -79,9 +82,10 @@ func New(addr string, stateFn StateFunc, injectFn InjectFunc, registersFn Regist
 	mux.HandleFunc("/control",   s.handleControl)
 	mux.HandleFunc("/registers", s.handleRegisters)
 	mux.HandleFunc("/ws",        s.handleWS)
+	mux.Handle("/logs",          s.logBuf)
 
 	go func() {
-		log.Printf("[simapi] API server on %s  (GET /state  POST /inject  POST /control  GET /ws)", addr)
+		log.Printf("[simapi] API server on %s  (GET /state  POST /inject  POST /control  GET /ws  GET /logs)", addr)
 		if err := http.ListenAndServe(addr, cors(mux)); err != nil {
 			log.Printf("[simapi] server error on %s: %v", addr, err)
 		}

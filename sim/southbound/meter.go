@@ -13,15 +13,23 @@ package sim
 //
 //	positive = site importing from grid  (utility is a source)
 //	negative = site exporting to grid    (utility is a sink)
+//
+// Power registers (W, VA, VAR) use scale factor 1 (10 W resolution,
+// ±327 670 W range) so large linked-mode sites don't wrap int16.
 
 import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"csip-tls-test/internal/southbound/sunspec"
 )
+
+// meterWSF is the scale factor for the meter's W/VA/VAR registers:
+// raw × 10^1, i.e. 10 W resolution with a ±327 670 W range.
+const meterWSF = int16(1)
 
 // MeterServer is a running SunSpec AC meter simulator.
 // It extends Server with a convenience method for changing the net power
@@ -29,9 +37,16 @@ import (
 type MeterServer struct {
 	*Server
 	// M201Base is the Modbus address of the first data register of Model 201.
-	// Tests can write registers directly:
-	//   srv.Regs.Set(srv.M201Base+sunspec.M201_W, uint16(int16(watts)))
+	// Tests can write registers directly (W uses scale factor meterWSF):
+	//   srv.Regs.Set(srv.M201Base+sunspec.M201_W, sunspec.RawFromScaleSigned(watts, 1))
 	M201Base uint16
+
+	// Energy accumulators (M201 TotWhImp/TotWhExp, finding MTR-2) — integrated
+	// from net power on every SetNetW call.
+	accMu    sync.Mutex
+	accLast  time.Time
+	totImpWh float64
+	totExpWh float64
 }
 
 // NewMeterServer creates and starts a static single-phase AC meter simulator.
@@ -50,10 +65,64 @@ func NewMeterServer(listenURL string, netW float64) (*MeterServer, error) {
 }
 
 // SetNetW updates the W register so ReadMeasurements reflects a new reading.
-// sf=0 so raw == watts; valid range ±32 767 W.
+// sf=1 → raw == tens of watts; valid range ±327 670 W (finding MTR-1: sf=0
+// wrapped at ±32 767 W, reachable in linked mode with EV + load).
+// Each call also integrates the reading into the TotWhImp/TotWhExp energy
+// accumulators (callers update on a fixed tick, so power × elapsed = energy).
 func (ms *MeterServer) SetNetW(netW float64) {
-	ms.Regs.Set(ms.M201Base+uint16(sunspec.M201_W), uint16(int16(netW)))
-	ms.Regs.Set(ms.M201Base+uint16(sunspec.M201_W_SF), 0)
+	ms.Regs.Set(ms.M201Base+uint16(sunspec.M201_W), sunspec.RawFromScaleSigned(netW, meterWSF))
+	ms.Regs.Set(ms.M201Base+uint16(sunspec.M201_W_SF), uint16(meterWSF))
+	writeDerivedPower(ms.Regs, ms.M201Base, netW)
+	ms.accumulate(netW)
+}
+
+// writeDerivedPower refreshes the registers derived from net power: apparent
+// power (fixed 0.95 PF model), reactive power, and current (from the live
+// voltage register). Shared by populateMeter and SetNetW so VA/VAR/A track W
+// instead of staying frozen at their startup values (caught by conformance
+// check MTR-005: VA=0 while W=4 kW).
+func writeDerivedPower(r *RegisterMap, m201Base uint16, netW float64) {
+	const pf = 0.95
+	va := math.Abs(netW) / pf
+	r.Set(m201Base+sunspec.M201_VA, sunspec.RawFromScaleSigned(va, meterWSF))
+	varPwr := netW * 0.329 // ≈ W × tan(acos(0.95))
+	r.Set(m201Base+sunspec.M201_VAR, sunspec.RawFromScaleSigned(varPwr, meterWSF))
+
+	v := sunspec.ApplyScaleUint(r.Get(m201Base+sunspec.M201_PhV), int16(r.Get(m201Base+sunspec.M201_V_SF)))
+	if math.IsNaN(v) || v < 1 {
+		v = 240.0
+	}
+	amps := uint16(int16(math.Round(netW / v)))
+	r.Set(m201Base+sunspec.M201_A, amps)
+	r.Set(m201Base+sunspec.M201_AphA, amps)
+}
+
+// accumulate integrates net power into the M201 energy accumulator registers.
+// Positive net power counts as imported energy, negative as exported.
+func (ms *MeterServer) accumulate(netW float64) {
+	now := time.Now()
+	ms.accMu.Lock()
+	defer ms.accMu.Unlock()
+	if !ms.accLast.IsZero() {
+		dtH := now.Sub(ms.accLast).Hours()
+		// Ignore long gaps (pause, clock step) — they aren't metered time.
+		if dtH > 0 && dtH < 0.1 {
+			if netW >= 0 {
+				ms.totImpWh += netW * dtH
+			} else {
+				ms.totExpWh += -netW * dtH
+			}
+		}
+	}
+	ms.accLast = now
+	ms.setAcc32(sunspec.M201_TotWhImp, uint32(ms.totImpWh))
+	ms.setAcc32(sunspec.M201_TotWhExp, uint32(ms.totExpWh))
+}
+
+// setAcc32 writes a SunSpec acc32 value (most-significant word first).
+func (ms *MeterServer) setAcc32(offset int, v uint32) {
+	ms.Regs.Set(ms.M201Base+uint16(offset), uint16(v>>16))
+	ms.Regs.Set(ms.M201Base+uint16(offset)+1, uint16(v))
 }
 
 // ── Snapshot ──────────────────────────────────────────────────────────────────
@@ -67,12 +136,14 @@ type MeterState struct {
 		Speed  float64 `json:"speed"`
 	} `json:"animation"`
 	Measurements struct {
-		W_W   float64 `json:"W_W"`
-		V_V   float64 `json:"V_V"`
-		Hz_Hz float64 `json:"Hz_Hz"`
-		VA_VA float64 `json:"VA_VA"`
-		PF    float64 `json:"PF"`
-		A_A   float64 `json:"A_A"`
+		W_W         float64 `json:"W_W"`
+		V_V         float64 `json:"V_V"`
+		Hz_Hz       float64 `json:"Hz_Hz"`
+		VA_VA       float64 `json:"VA_VA"`
+		PF          float64 `json:"PF"`
+		A_A         float64 `json:"A_A"`
+		TotWhImp_Wh float64 `json:"TotWhImp_Wh"`
+		TotWhExp_Wh float64 `json:"TotWhExp_Wh"`
 	} `json:"measurements"`
 }
 
@@ -103,6 +174,13 @@ func (ms *MeterServer) Snapshot(simType string) MeterState {
 	m.VA_VA = signed(sunspec.M201_VA, sunspec.M201_VA_SF)
 	m.PF = signed(sunspec.M201_PF, sunspec.M201_PF_SF) / 100.0
 	m.A_A = signed(sunspec.M201_A, sunspec.M201_A_SF)
+	acc32 := func(offset int) float64 {
+		hi := uint32(r.Get(b + uint16(offset)))
+		lo := uint32(r.Get(b + uint16(offset) + 1))
+		return float64(hi<<16 | lo)
+	}
+	m.TotWhImp_Wh = acc32(sunspec.M201_TotWhImp)
+	m.TotWhExp_Wh = acc32(sunspec.M201_TotWhExp)
 
 	return st
 }
@@ -133,7 +211,8 @@ func (ms *MeterServer) Inject(body []byte) error {
 	for key, val := range fields {
 		switch key {
 		case "W_W":
-			r.Set(b+uint16(sunspec.M201_W), uint16(int16(math.Round(val))))
+			r.Set(b+uint16(sunspec.M201_W),
+				sunspec.RawFromScaleSigned(val, int16(r.Get(b+uint16(sunspec.M201_W_SF)))))
 		case "V_V":
 			r.Set(b+uint16(sunspec.M201_PhV), uint16(math.Round(val*10)))
 			r.Set(b+uint16(sunspec.M201_PhVphA), uint16(math.Round(val*10)))
@@ -181,30 +260,24 @@ func populateMeter(r *RegisterMap, netW float64) uint16 {
 	r.Set(m201Base+sunspec.M201_Hz, 6000)
 	r.Set(m201Base+sunspec.M201_Hz_SF, sfN(-2))
 
-	// Net power (sf=0 → raw == watts, range ±32 767 W)
-	r.Set(m201Base+sunspec.M201_W, uint16(int16(netW)))
-	r.Set(m201Base+sunspec.M201_W_SF, 0)
+	// Net power (sf=1 → raw == tens of watts, range ±327 670 W)
+	r.Set(m201Base+sunspec.M201_W, sunspec.RawFromScaleSigned(netW, meterWSF))
+	r.Set(m201Base+sunspec.M201_W_SF, uint16(meterWSF))
 
-	// Apparent power ≈ |W| / pf (sf=0)
-	pf := 0.95
-	va := math.Abs(netW) / pf
-	r.Set(m201Base+sunspec.M201_VA, uint16(int16(va)))
-	r.Set(m201Base+sunspec.M201_VA_SF, 0)
-
-	// Reactive power ≈ W × tan(acos(0.95)) ≈ W × 0.329
-	varPwr := netW * 0.329
-	r.Set(m201Base+sunspec.M201_VAR, uint16(int16(varPwr)))
-	r.Set(m201Base+sunspec.M201_VAR_SF, 0)
+	// Scale factors for the derived registers (values via writeDerivedPower).
+	r.Set(m201Base+sunspec.M201_VA_SF, uint16(meterWSF))
+	r.Set(m201Base+sunspec.M201_VAR_SF, uint16(meterWSF))
+	r.Set(m201Base+sunspec.M201_A_SF, 0) // whole amps
 
 	// Power factor: 9500 × 10^-2 = 0.9500
 	r.Set(m201Base+sunspec.M201_PF, uint16(int16(9500)))
 	r.Set(m201Base+sunspec.M201_PF_SF, sfN(-2))
 
-	// Current: A = W / V (sf=0, whole amps)
-	amps := int16(netW / 240.0)
-	r.Set(m201Base+sunspec.M201_A, uint16(amps))
-	r.Set(m201Base+sunspec.M201_AphA, uint16(amps))
-	r.Set(m201Base+sunspec.M201_A_SF, 0)
+	// Apparent/reactive power and current derived from netW.
+	writeDerivedPower(r, m201Base, netW)
+
+	// Energy accumulators start at zero; raw Wh (sf=0).
+	r.Set(m201Base+sunspec.M201_TotWh_SF, 0)
 
 	cursor += 2 + sunspec.M201Len
 

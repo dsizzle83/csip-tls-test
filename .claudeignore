@@ -1,15 +1,21 @@
-# .claudeignore
+# Build artifacts and binaries
+bin/
+build/
+obj/
 *.o
 *.a
 *.elf
 *.hex
-*.bin
-build/
-obj/
+dashboard
+
+# Vendored / third-party
 vendor/
 node_modules/
+third_party/
 **/*.lock
 **/.git/
-docs/
-examples/
-third_party/
+
+# Captures and logs (large, binary)
+*.pcap
+*.pcapng
+logs/

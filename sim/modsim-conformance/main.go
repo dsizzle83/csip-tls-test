@@ -10,6 +10,7 @@
 //
 //	./bin/modsim-conformance -server 192.168.0.50:5020 -device inverter -out /tmp/modsim-conformance.log
 //	./bin/modsim-conformance -server 192.168.0.51:5021 -device battery  -out /tmp/batsim-conformance.log
+//	./bin/modsim-conformance -server 192.168.0.52:5022 -device meter    -out /tmp/metersim-conformance.log
 //
 // Or run loopback (device on same host, different port):
 //
@@ -1004,7 +1005,7 @@ func checkBAT003(r *Reporter, reader *sunspec.Reader) {
 func main() {
 	var (
 		server  = flag.String("server", "127.0.0.1:5020", "Modbus TCP address:port of the device under test")
-		device  = flag.String("device", "inverter", "device type: inverter or battery")
+		device  = flag.String("device", "inverter", "device type: inverter, battery, or meter")
 		unitID  = flag.Uint("unit", 1, "Modbus unit ID (slave address)")
 		timeout = flag.Duration("timeout", 5*time.Second, "Modbus transaction timeout")
 		outFile = flag.String("out", "", "log file path (empty = stdout only)")
@@ -1053,6 +1054,29 @@ func main() {
 	r.printf("  ✓ SunSpec block scan complete (%d model blocks)\n", len(reader.Blocks()))
 
 	checkDISC002(r, reader)
+
+	// ── Meter device: common-meter checks instead of inverter/battery ────────
+	if *device == "meter" {
+		meterModel := checkMTR001(r, reader)
+		checkDISC006(r, reader)
+		if meterModel == 0 {
+			r.printf("\nFATAL: no AC meter model — cannot run meter checks.\n")
+			r.summary()
+			os.Exit(1)
+		}
+		w := checkMTR002(r, reader, meterModel)
+		checkMTR003(r, reader, meterModel)
+		checkMTR004(r, reader, meterModel)
+		checkMTR005(r, reader, meterModel, w)
+		checkMTR006(r, reader, meterModel)
+
+		r.summary()
+		if r.failCount > 0 {
+			os.Exit(1)
+		}
+		return
+	}
+
 	measModel := checkDISC003(r, reader)
 	nameplateModel := checkDISC004(r, reader)
 	ctrlModel := checkDISC005(r, reader)
@@ -1103,4 +1127,212 @@ func main() {
 	if r.failCount > 0 {
 		os.Exit(1)
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Meter checks (-device meter) — SunSpec common-meter layout, Models 201-203
+// ─────────────────────────────────────────────────────────────────────────────
+// Models 201/202/203 share an identical 105-register point list (verified
+// against the published sunspec/models JSON), so all checks index with the
+// M201_* offsets regardless of which model ID is discovered.
+
+// checkMTR001 verifies an AC meter model is present.
+func checkMTR001(r *Reporter, reader *sunspec.Reader) uint16 {
+	r.section("MTR-001", "AC Meter Model")
+	r.spec("SunSpec meter models", "Meters SHALL expose M201 (1-ph), M202 (split-ph), or M203 (3-ph wye)")
+
+	for _, id := range []uint16{
+		sunspec.ModelMeterSinglePh,
+		sunspec.ModelMeterSplitPh,
+		sunspec.ModelMeterThreePh,
+	} {
+		if reader.HasModel(id) {
+			r.pass("Model %d present", id)
+			r.result(true)
+			return id
+		}
+	}
+	r.fail("no AC meter model found (tried 201, 202, 203)")
+	r.result(false)
+	return 0
+}
+
+// checkMTR002 verifies net real power is readable and finite, and reports the
+// flow direction under the site sign convention (+import / −export).
+func checkMTR002(r *Reporter, reader *sunspec.Reader, meterModel uint16) float64 {
+	r.section("MTR-002", "Net Real Power (W)")
+	r.spec("M20x.W", "Total real power SHALL be present and finite (offset 16, W_SF at 20)")
+
+	regs, err := reader.ReadModel(meterModel)
+	if err != nil {
+		r.fail("read meter model %d: %v", meterModel, err)
+		r.result(false)
+		return math.NaN()
+	}
+	if len(regs) <= sunspec.M201_W_SF {
+		r.fail("meter model too short for W (%d regs)", len(regs))
+		r.result(false)
+		return math.NaN()
+	}
+	if isNaN(regs[sunspec.M201_W]) {
+		r.fail("W register is not-implemented (0x8000)")
+		r.result(false)
+		return math.NaN()
+	}
+	w := sunspec.ApplyScaleSigned(regs[sunspec.M201_W], int16(regs[sunspec.M201_W_SF]))
+	if math.IsNaN(w) {
+		r.fail("W is NaN after scale application")
+		r.result(false)
+		return math.NaN()
+	}
+	dir := "importing from grid"
+	if w < 0 {
+		dir = "exporting to grid"
+	}
+	r.pass("W = %.1f W (site %s)", w, dir)
+	r.result(true)
+	return w
+}
+
+// checkMTR003 verifies AC voltage is plausible.
+func checkMTR003(r *Reporter, reader *sunspec.Reader, meterModel uint16) {
+	r.section("MTR-003", "Voltage (V)")
+	r.spec("M20x.PhV", "L-N voltage SHALL be in range 85-480 V (covers 120/240/400 V systems)")
+
+	regs, err := reader.ReadModel(meterModel)
+	if err != nil {
+		r.fail("read meter model: %v", err)
+		r.result(false)
+		return
+	}
+	sf := int16(regs[sunspec.M201_V_SF])
+	reg := regs[sunspec.M201_PhV]
+	if isNaN(reg) {
+		// PhV (average) is optional on some meters; fall back to phase A.
+		reg = regs[sunspec.M201_PhVphA]
+		r.detail("PhV not implemented — using PhVphA")
+	}
+	v := sunspec.ApplyScaleSigned(reg, sf)
+	if math.IsNaN(v) || v < 85 || v > 480 {
+		r.fail("voltage %.1f V outside plausible range 85-480 V", v)
+		r.result(false)
+		return
+	}
+	r.pass("V = %.1f V", v)
+	r.result(true)
+}
+
+// checkMTR004 verifies AC frequency is plausible.
+func checkMTR004(r *Reporter, reader *sunspec.Reader, meterModel uint16) {
+	r.section("MTR-004", "Frequency (Hz)")
+	r.spec("M20x.Hz", "AC frequency SHALL be in range 45-65 Hz")
+
+	regs, err := reader.ReadModel(meterModel)
+	if err != nil {
+		r.fail("read meter model: %v", err)
+		r.result(false)
+		return
+	}
+	hz := sunspec.ApplyScaleSigned(regs[sunspec.M201_Hz], int16(regs[sunspec.M201_Hz_SF]))
+	if math.IsNaN(hz) || hz < 45 || hz > 65 {
+		r.fail("frequency %.2f Hz outside plausible range 45-65 Hz", hz)
+		r.result(false)
+		return
+	}
+	r.pass("Hz = %.2f Hz", hz)
+	r.result(true)
+}
+
+// checkMTR005 verifies power-quality consistency: |W| ≤ VA (within 1%) and
+// PF within ±100%.
+func checkMTR005(r *Reporter, reader *sunspec.Reader, meterModel uint16, w float64) {
+	r.section("MTR-005", "Power Quality (VA, PF)")
+	r.spec("M20x.VA/PF", "Apparent power SHALL satisfy VA ≥ |W|; PF SHALL be within ±100%")
+
+	regs, err := reader.ReadModel(meterModel)
+	if err != nil {
+		r.fail("read meter model: %v", err)
+		r.result(false)
+		return
+	}
+	ok := true
+
+	if isNaN(regs[sunspec.M201_VA]) {
+		r.warn("VA not implemented (optional point) — skipping VA ≥ |W| check")
+	} else {
+		va := sunspec.ApplyScaleSigned(regs[sunspec.M201_VA], int16(regs[sunspec.M201_VA_SF]))
+		if !math.IsNaN(w) && math.Abs(w) > va*1.01 {
+			r.fail("|W| = %.1f W exceeds VA = %.1f VA", math.Abs(w), va)
+			ok = false
+		} else {
+			r.pass("VA = %.1f VA ≥ |W| = %.1f W", va, math.Abs(w))
+		}
+	}
+
+	if isNaN(regs[sunspec.M201_PF]) {
+		r.warn("PF not implemented (optional point) — skipping PF range check")
+	} else {
+		pf := sunspec.ApplyScaleSigned(regs[sunspec.M201_PF], int16(regs[sunspec.M201_PF_SF]))
+		if math.Abs(pf) > 100.0+1e-9 {
+			r.fail("PF = %.2f%% outside ±100%%", pf)
+			ok = false
+		} else {
+			r.pass("PF = %.2f%%", pf)
+		}
+	}
+	r.result(ok)
+}
+
+// readAcc32 decodes a SunSpec acc32 (most-significant word first).
+func readAcc32(regs []uint16, offset int) uint32 {
+	return uint32(regs[offset])<<16 | uint32(regs[offset+1])
+}
+
+// checkMTR006 verifies the energy accumulators advance monotonically while
+// power is flowing. Two reads, ~6 s apart (one device update tick).
+func checkMTR006(r *Reporter, reader *sunspec.Reader, meterModel uint16) {
+	r.section("MTR-006", "Energy Accumulators (TotWhImp / TotWhExp)")
+	r.spec("M20x.TotWh*", "Accumulators SHALL be non-decreasing; total SHALL advance while |W| > 0")
+
+	regs1, err := reader.ReadModel(meterModel)
+	if err != nil {
+		r.fail("read meter model: %v", err)
+		r.result(false)
+		return
+	}
+	imp1 := readAcc32(regs1, sunspec.M201_TotWhImp)
+	exp1 := readAcc32(regs1, sunspec.M201_TotWhExp)
+	w := sunspec.ApplyScaleSigned(regs1[sunspec.M201_W], int16(regs1[sunspec.M201_W_SF]))
+	r.detail("read 1: TotWhImp=%d Wh  TotWhExp=%d Wh  (W=%.0f)", imp1, exp1, w)
+
+	r.detail("waiting 6 s for an accumulator update tick…")
+	time.Sleep(6 * time.Second)
+
+	regs2, err := reader.ReadModel(meterModel)
+	if err != nil {
+		r.fail("re-read meter model: %v", err)
+		r.result(false)
+		return
+	}
+	imp2 := readAcc32(regs2, sunspec.M201_TotWhImp)
+	exp2 := readAcc32(regs2, sunspec.M201_TotWhExp)
+	r.detail("read 2: TotWhImp=%d Wh  TotWhExp=%d Wh", imp2, exp2)
+
+	if imp2 < imp1 || exp2 < exp1 {
+		r.fail("accumulator decreased (imp %d→%d, exp %d→%d)", imp1, imp2, exp1, exp2)
+		r.result(false)
+		return
+	}
+	if math.Abs(w) > 50 && imp2 == imp1 && exp2 == exp1 {
+		// > 50 W for 6 s ≈ 0.08 Wh — may legitimately round to 0 Wh, so this
+		// is only a warning unless power is substantial.
+		if math.Abs(w) > 1200 { // 1.2 kW × 6 s = 2 Wh — must be visible
+			r.fail("no accumulation despite W = %.0f W", w)
+			r.result(false)
+			return
+		}
+		r.warn("no visible accumulation at W = %.0f W (below resolution)", w)
+	}
+	r.pass("accumulators non-decreasing (imp +%d Wh, exp +%d Wh)", imp2-imp1, exp2-exp1)
+	r.result(true)
 }

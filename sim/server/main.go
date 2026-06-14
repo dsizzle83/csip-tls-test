@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -39,6 +40,10 @@ func main() {
 	// LFDI starts empty; SetClientCertDER fills it in from the peer cert
 	// during each mTLS handshake (Step A: live derivation, not from a file).
 	sim := gridsim.NewServer("")
+
+	// Tee logs into the admin API ring so GET /admin/logs streams them to
+	// the dashboard's unified Logs tab.
+	log.SetOutput(io.MultiWriter(os.Stderr, sim.LogWriter()))
 
 	srv, err := tlsserver.New(tlsserver.Config{
 		CACertPath:     *caCert,

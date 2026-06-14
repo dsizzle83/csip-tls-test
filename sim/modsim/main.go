@@ -20,6 +20,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -45,7 +46,7 @@ func main() {
 
 	if *apiPort != 0 {
 		apiAddr := fmt.Sprintf(":%d", *apiPort)
-		simapi.New(
+		api := simapi.New(
 			apiAddr,
 			func() any { return srv.Snapshot() },
 			srv.Inject,
@@ -68,6 +69,8 @@ func main() {
 				return nil
 			},
 		)
+		// Tee logs into the API ring so the dashboard's Logs tab can stream them.
+		log.SetOutput(io.MultiWriter(os.Stderr, api.LogWriter()))
 	}
 
 	log.Printf("modsim: listening — press Ctrl-C to stop")

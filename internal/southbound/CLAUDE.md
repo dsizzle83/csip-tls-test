@@ -32,14 +32,14 @@ End sentinel: ModelID = `0xFFFF`
 | 103 | St (operating state) | 36 |
 | 121 (nameplate) | WMax, WMax_SF | 0, 22 |
 | 123 (controls) | WMaxLimPct, _Ena, Conn, _SF | 0, 4, 16, 20 |
-| 201 (meter) | W, W_SF | 12, 28 |
+| 201 (meter) | W, W_SF | 16, 20 |
 | 802 (Li-Ion) | SoC, SoH, DoD, ChaSt | 10, 11, 12, 16 |
 
 ## Simulator API summary
 All sims expose HTTP + WebSocket via `internal/simapi/`:
 - Ports: modsim 5020/6020 · batsim 5021/6021 · metersim 5022/6022 · evsim —/6024
 - `GET /state` → typed JSON · `POST /inject {"W_W":3000}` · `POST /control {"cmd":"pause","speed":5}` · `GET /registers` · `GET /ws` (2 s push)
-- CORS wildcard enabled (for Python GUI).
+- CORS wildcard enabled (legacy — the web dashboard proxies same-origin and does not need it).
 
 ## Tests
 Inverter, battery, meter packages test against an in-process simonvetter Modbus server — no hardware required.

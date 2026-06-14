@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -172,7 +173,7 @@ func main() {
 
 	if *apiPort != 0 {
 		apiAddr := fmt.Sprintf(":%d", *apiPort)
-		simapi.New(
+		api := simapi.New(
 			apiAddr,
 			func() any {
 				snap := srv.Snapshot("grid_meter")
@@ -210,6 +211,8 @@ func main() {
 				return nil
 			},
 		)
+		// Tee logs into the API ring so the dashboard's Logs tab can stream them.
+		log.SetOutput(io.MultiWriter(os.Stderr, api.LogWriter()))
 	}
 
 	log.Printf("metersim: listening — press Ctrl-C to stop")

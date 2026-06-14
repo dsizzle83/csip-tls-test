@@ -30,10 +30,12 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"csip-tls-test/internal/csip/identity"
 	"csip-tls-test/internal/csip/model"
+	"csip-tls-test/sim/simapi"
 )
 
 // ContentType is the IEEE 2030.5 mandated content type (GEN.003).
@@ -47,6 +49,14 @@ type Server struct {
 	ClientLFDI string // The LFDI of the client we expect to connect
 	clientSFDI uint64 // derived from ClientLFDI; updated by SetClientCertDER
 
+	// clockSkew (seconds) is added to wall time wherever the server reports
+	// or stamps CSIP time (/tm, admin server_time, control intervals). The
+	// hub derives ClockOffset from /tm, so setting a skew warps the hub's
+	// entire sense of server time — used by the dashboard's accelerated
+	// bench-replay to fast-forward TOU windows and DER event schedules.
+	// Atomic: read in handlers that hold s.mu in different orders.
+	clockSkew atomic.Int64
+
 	// MirrorUsagePoint store (Phase 2 POST /mup flow).
 	// mupNextID is protected by mu; do not read/write outside the mu lock.
 	mupNextID int32
@@ -54,6 +64,11 @@ type Server struct {
 	// Response log (CORE-022: client POSTs Response on event transitions)
 	responseMu sync.Mutex
 	responses  []model.Response
+
+	// logBuf feeds GET /admin/logs (SSE). The sim/server binary tees the
+	// standard logger into LogWriter() so every request log line streams to
+	// the dashboard's unified Logs tab.
+	logBuf *simapi.LogBuffer
 }
 
 // NewServer creates a grid sim with a complete CSIP conformance resource tree.
@@ -63,11 +78,18 @@ func NewServer(clientLFDI string) *Server {
 		resources:  make(map[string]interface{}),
 		mux:        http.NewServeMux(),
 		ClientLFDI: clientLFDI,
+		logBuf:     simapi.NewLogBuffer(),
 	}
 	s.buildResourceTree()
 	s.mux.HandleFunc("/", s.handleRequest)
 	return s
 }
+
+// LogWriter returns the io.Writer the embedding binary tees its standard
+// logger into so GET /admin/logs can stream request logs:
+//
+//	log.SetOutput(io.MultiWriter(os.Stderr, sim.LogWriter()))
+func (s *Server) LogWriter() io.Writer { return s.logBuf }
 
 // Handler returns the http.Handler for use with your TLS server.
 func (s *Server) Handler() http.Handler {
@@ -85,6 +107,24 @@ func (s *Server) SetClientCertDER(der []byte) {
 	s.rebuildEndDeviceList()
 	s.mu.Unlock()
 	log.Printf("[gridsim] client identity from cert: LFDI=%s SFDI=%d", lfdi, sfdi)
+}
+
+// Now returns the server's notion of current CSIP time: wall clock plus the
+// configured skew. Use this for every value a client can observe (/tm,
+// control intervals, admin server_time) so warped time stays coherent.
+func (s *Server) Now() int64 {
+	return time.Now().Unix() + s.clockSkew.Load()
+}
+
+// SetClockSkew sets the offset (seconds) between served CSIP time and the
+// wall clock. Zero restores real time.
+func (s *Server) SetClockSkew(offsetS int64) {
+	s.clockSkew.Store(offsetS)
+}
+
+// ClockSkew returns the currently configured skew in seconds.
+func (s *Server) ClockSkew() int64 {
+	return s.clockSkew.Load()
 }
 
 // rebuildEndDeviceList reconstructs the /edev resource with the current
@@ -170,11 +210,12 @@ func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string) {
 	}
 
 	// Keep /tm current: refresh CurrentTime on every GET so the hub's
-	// computed clock offset stays near zero (CSIP §5.2.1.3).
+	// computed clock offset tracks the configured skew (zero in normal
+	// operation, per CSIP §5.2.1.3; non-zero during accelerated replay).
 	if path == "/tm" {
 		s.mu.Lock()
 		if tm, ok := s.resources["/tm"].(*model.Time); ok {
-			tm.CurrentTime = time.Now().Unix()
+			tm.CurrentTime = s.Now()
 		}
 		s.mu.Unlock()
 	}
@@ -451,10 +492,10 @@ func (s *Server) buildResourceTree() {
 	genConnected := uint8(1)
 	opMode := uint8(1)
 	s.resources["/edev/2/der/0/derstat"] = &model.DERStatus{
-		Resource:             model.Resource{Href: "/edev/2/der/0/derstat"},
-		GenConnectStatus:     &genConnected,
+		Resource:              model.Resource{Href: "/edev/2/der/0/derstat"},
+		GenConnectStatus:      &genConnected,
 		OperationalModeStatus: &opMode,
-		ReadingTime:          now,
+		ReadingTime:           now,
 	}
 
 	// ── FunctionSetAssignmentsList (/edev/2/fsa) ──────────────
@@ -655,8 +696,8 @@ func (s *Server) buildProgram0(now int64) {
 				},
 				RandomizeStart: int32Ptr(30),
 				DERControlBase: model.DERControlBase{
-					OpModExpLimW:  &model.ActivePower{Multiplier: 0, Value: 3500},
-					OpModConnect:  &ptrue,
+					OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 3500},
+					OpModConnect: &ptrue,
 				},
 			},
 		},

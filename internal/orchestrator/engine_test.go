@@ -202,7 +202,7 @@ func TestEngine_SetCSIPPrograms_InjectedIntoState(t *testing.T) {
 		{
 			Program: model.DERProgram{MRID: "prog-1", Primacy: 1},
 			DefaultControl: &model.DefaultDERControl{
-				MRID: "ddc-1",
+				MRID:           "ddc-1",
 				DERControlBase: model.DERControlBase{OpModConnect: &tr},
 			},
 			Controls: &model.DERControlList{
@@ -258,6 +258,28 @@ func TestEngine_SetCSIPPrograms_ConcurrentSafe(t *testing.T) {
 		<-done
 	}
 	eng.Stop()
+}
+
+// TestEngine_PreservesReaderClockOffset mirrors the lexa-hub regression guard:
+// when no CSIP programs are set, tick() must not overwrite the reader-supplied
+// ClockOffset with the engine's unused zero. Only the SetCSIPPrograms path owns
+// the offset; clobbering it would collapse the optimizer's serverNow to local
+// time and disable TOU peak-shaving under a warped (replayed) clock.
+func TestEngine_PreservesReaderClockOffset(t *testing.T) {
+	st := state0()
+	st.ClockOffset = int64(7 * 3600) // e.g. a replay clock warp
+	reader := &mockReader{state: st}
+	opt := &captureStateOptimizer{}
+
+	eng := orchestrator.New(reader, opt, orchestrator.Config{Interval: 10 * time.Millisecond})
+	// No SetCSIPPrograms call: the reader's offset must survive into the optimizer.
+	eng.Start()
+	time.Sleep(30 * time.Millisecond)
+	eng.Stop()
+
+	if got := opt.lastState.ClockOffset; got != int64(7*3600) {
+		t.Fatalf("optimizer saw ClockOffset=%d, want %d — reader offset was clobbered", got, int64(7*3600))
+	}
 }
 
 // ── captureStateOptimizer ─────────────────────────────────────────────────────
