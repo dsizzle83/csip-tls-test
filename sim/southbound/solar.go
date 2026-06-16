@@ -92,17 +92,17 @@ type SolarState struct {
 		WMaxW float64 `json:"wmax_W"`
 	} `json:"nameplate"`
 	Measurements struct {
-		W_W     float64 `json:"W_W"`
-		V_V     float64 `json:"V_V"`
-		Hz_Hz   float64 `json:"Hz_Hz"`
-		VA_VA   float64 `json:"VA_VA"`
-		VAr_var float64 `json:"VAr_var"`
-		PF      float64 `json:"PF"`
-		DCV_V   float64 `json:"DCV_V"`
-		DCW_W   float64 `json:"DCW_W"`
+		W_W      float64 `json:"W_W"`
+		V_V      float64 `json:"V_V"`
+		Hz_Hz    float64 `json:"Hz_Hz"`
+		VA_VA    float64 `json:"VA_VA"`
+		VAr_var  float64 `json:"VAr_var"`
+		PF       float64 `json:"PF"`
+		DCV_V    float64 `json:"DCV_V"`
+		DCW_W    float64 `json:"DCW_W"`
 		TmpCab_C float64 `json:"TmpCab_C"`
-		St      int    `json:"St"`
-		StText  string `json:"St_text"`
+		St       int     `json:"St"`
+		StText   string  `json:"St_text"`
 	} `json:"measurements"`
 	Controls struct {
 		WMaxLimPct_pct float64 `json:"WMaxLimPct_pct"`
@@ -185,8 +185,27 @@ func (ss *SolarServer) Inject(body []byte) error {
 	for key, val := range fields {
 		switch key {
 		case "W_W":
+			// Record the injected value as the panel POTENTIAL (available power)
+			// so a paused animation re-applies WMaxLimPct curtailment to it.
+			// Replay mode pauses the sim and injects PV each tick; without this
+			// the held output would ignore the hub's curtailment commands.
+			r.Set(b.M122Base+sunspec.M122_WAval, uint16(int16(math.Round(val))))
+			// Write the live output as the CURTAILED value (potential clipped by
+			// any active WMaxLimPct), not the raw potential.  Writing the full
+			// potential here would briefly expose an uncurtailed reading between
+			// the inject and the next animation tick — which the linked meter can
+			// sample, spiking export over an active cap for one tick.
+			w := val
+			if r.Get(b.M123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
+				limPct := sunspec.ApplyScaleSigned(
+					r.Get(b.M123Base+sunspec.M123_WMaxLimPct),
+					int16(r.Get(b.M123Base+sunspec.M123_WMaxLimPct_SF)),
+				)
+				limW := ss.wmaxW * math.Max(0, limPct) / 100.0
+				w = math.Min(w, limW)
+			}
 			r.Set(b.M103Base+sunspec.M103_W,
-				sunspec.RawFromScaleSigned(val, sf(b.M103Base+sunspec.M103_W_SF)))
+				sunspec.RawFromScaleSigned(w, sf(b.M103Base+sunspec.M103_W_SF)))
 		case "V_V":
 			v10 := uint16(math.Round(val * 10))
 			r.Set(b.M103Base+sunspec.M103_PhVphA, v10)
@@ -349,10 +368,6 @@ func populateSolar(r *RegisterMap, wmaxW float64) SolarBases {
 // ── animation ─────────────────────────────────────────────────────────────────
 
 func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, stop <-chan struct{}) {
-	m103Base := bases.M103Base
-	m122Base := bases.M122Base
-	m123Base := bases.M123Base
-
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 
@@ -363,77 +378,120 @@ func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, st
 		case <-stop:
 			return
 		case <-tick.C:
-			if s.IsPaused() {
-				continue
-			}
-
-			// If disconnected via M123 Conn, zero output and skip animation.
-			if r.Get(m123Base+sunspec.M123_Conn) == 0 {
-				r.Set(m103Base+sunspec.M103_W, 0)
-				r.Set(m103Base+sunspec.M103_VA, 0)
-				r.Set(m103Base+sunspec.M103_VAr, 0)
-				r.Set(m103Base+sunspec.M103_St, 1) // off
-				r.Set(m122Base+sunspec.M122_WAval, 0)
-				continue
-			}
-
-			t := s.simTime()
-
-			irr := math.Max(0.05, math.Min(0.95, 0.5+0.45*math.Sin(2*math.Pi*t/600)))
-			w := wmaxW * irr
-
-			// Apply WMaxLimPct from M123 (written by hub over Modbus).
-			if r.Get(m123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
-				limPct := sunspec.ApplyScaleSigned(
-					r.Get(m123Base+sunspec.M123_WMaxLimPct),
-					int16(r.Get(m123Base+sunspec.M123_WMaxLimPct_SF)),
-				)
-				limW := wmaxW * math.Max(0, limPct) / 100.0
-				w = math.Min(w, limW)
-			}
-
-			v := 240.0 + 2.0*math.Sin(2*math.Pi*t/73)
-			hz := 60.0 + 0.05*math.Sin(2*math.Pi*t/47)
-			pf := math.Max(0.90, math.Min(0.99, 0.97+0.02*math.Sin(2*math.Pi*t/120)))
-			va := w / pf
-			varPwr := va * math.Sin(math.Acos(pf))
-			tmp := 35.0 + 20.0*(w/wmaxW)
-			dcv := 380.0 + 30.0*math.Sin(2*math.Pi*t/600)
-			dcw := w * 1.06
-			iph := w / (v * 3)
-
-			r.Set(m103Base+sunspec.M103_A, uint16(int16(math.Round(iph*3))))
-			r.Set(m103Base+sunspec.M103_AphA, uint16(int16(math.Round(iph))))
-			r.Set(m103Base+sunspec.M103_AphB, uint16(int16(math.Round(iph))))
-			r.Set(m103Base+sunspec.M103_AphC, uint16(int16(math.Round(iph))))
-			r.Set(m103Base+sunspec.M103_PhVphA, uint16(math.Round(v*10)))
-			r.Set(m103Base+sunspec.M103_PhVphB, uint16(math.Round(v*10)))
-			r.Set(m103Base+sunspec.M103_PhVphC, uint16(math.Round(v*10)))
-			r.Set(m103Base+sunspec.M103_PPVphAB, uint16(math.Round(v*10*math.Sqrt(3))))
-			r.Set(m103Base+sunspec.M103_PPVphBC, uint16(math.Round(v*10*math.Sqrt(3))))
-			r.Set(m103Base+sunspec.M103_PPVphCA, uint16(math.Round(v*10*math.Sqrt(3))))
-			r.Set(m103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
-			r.Set(m103Base+sunspec.M103_Hz, uint16(math.Round(hz*100)))
-			r.Set(m103Base+sunspec.M103_VA, uint16(int16(math.Round(va))))
-			r.Set(m103Base+sunspec.M103_VAr, uint16(int16(math.Round(varPwr))))
-			r.Set(m103Base+sunspec.M103_PF, uint16(int16(math.Round(pf*10000))))
-			r.Set(m103Base+sunspec.M103_DCV, uint16(math.Round(dcv*10)))
-			r.Set(m103Base+sunspec.M103_DCW, uint16(int16(math.Round(dcw))))
-			r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10))))
-			r.Set(m103Base+sunspec.M103_TmpSnk, uint16(int16(math.Round((tmp-5)*10))))
-
-			switch {
-			case irr < 0.06:
-				r.Set(m103Base+sunspec.M103_St, 2) // sleeping
-			case w < wmaxW*irr*0.98:
-				r.Set(m103Base+sunspec.M103_St, 5) // throttled by WMaxLimPct
-			default:
-				r.Set(m103Base+sunspec.M103_St, 4) // MPPT
-			}
-
-			r.Set(m122Base+sunspec.M122_WAval, uint16(math.Round(w)))
-			whAcc += uint16(math.Round(w * 5 / 3600))
-			r.Set(m122Base+sunspec.M122_ActWh+3, whAcc)
+			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), &whAcc)
 		}
+	}
+}
+
+// solarStep advances the inverter registers by one animation tick.  It is split
+// out of animateSolar so the curtailment/pause behaviour can be unit-tested
+// without waiting on the 5 s ticker.
+//
+// When paused it HOLDS the last injected potential (WAval) and freezes the
+// time-varying environment, but still applies the hub's WMaxLimPct — the
+// property the bench replay depends on, since the replay pauses this sim and
+// injects PV each tick while expecting curtailment to take effect.
+func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, simTime float64, whAcc *uint16) {
+	m103Base := bases.M103Base
+	m122Base := bases.M122Base
+	m123Base := bases.M123Base
+
+	// Disconnect (M123 Conn=0) zeroes output in BOTH running and paused modes: a
+	// cease-to-energize command must take effect even when the environment
+	// animation is frozen (replay injects PV each tick with the sim paused).
+	if r.Get(m123Base+sunspec.M123_Conn) == 0 {
+		r.Set(m103Base+sunspec.M103_W, 0)
+		r.Set(m103Base+sunspec.M103_VA, 0)
+		r.Set(m103Base+sunspec.M103_VAr, 0)
+		r.Set(m103Base+sunspec.M103_St, 1) // off
+		r.Set(m122Base+sunspec.M122_WAval, 0)
+		return
+	}
+
+	// potW is the panel's potential (pre-curtailment) output.
+	//   running → the irradiance model drives potW and the time-varying
+	//             environment registers (V, Hz, DCV).
+	//   paused  → HOLD the last injected potential (stored in WAval) and freeze
+	//             the environment, but still fall through to the WMaxLimPct clip
+	//             below.  Without this a paused inverter ignores the hub's
+	//             curtailment and reports the raw injected value — making
+	//             replay-mode curtailment inert (the meter fetches this register
+	//             to compute net grid).
+	var potW, v, pf float64
+	if paused {
+		potW = float64(int16(r.Get(m122Base + sunspec.M122_WAval)))
+		v = float64(r.Get(m103Base+sunspec.M103_PhVphA)) / 10.0
+		pf = float64(int16(r.Get(m103Base+sunspec.M103_PF))) / 10000.0
+	} else {
+		t := simTime
+		irr := math.Max(0.05, math.Min(0.95, 0.5+0.45*math.Sin(2*math.Pi*t/600)))
+		potW = wmaxW * irr
+		v = 240.0 + 2.0*math.Sin(2*math.Pi*t/73)
+		hz := 60.0 + 0.05*math.Sin(2*math.Pi*t/47)
+		pf = math.Max(0.90, math.Min(0.99, 0.97+0.02*math.Sin(2*math.Pi*t/120)))
+		dcv := 380.0 + 30.0*math.Sin(2*math.Pi*t/600)
+		r.Set(m103Base+sunspec.M103_PhVphA, uint16(math.Round(v*10)))
+		r.Set(m103Base+sunspec.M103_PhVphB, uint16(math.Round(v*10)))
+		r.Set(m103Base+sunspec.M103_PhVphC, uint16(math.Round(v*10)))
+		r.Set(m103Base+sunspec.M103_PPVphAB, uint16(math.Round(v*10*math.Sqrt(3))))
+		r.Set(m103Base+sunspec.M103_PPVphBC, uint16(math.Round(v*10*math.Sqrt(3))))
+		r.Set(m103Base+sunspec.M103_PPVphCA, uint16(math.Round(v*10*math.Sqrt(3))))
+		r.Set(m103Base+sunspec.M103_Hz, uint16(math.Round(hz*100)))
+		r.Set(m103Base+sunspec.M103_DCV, uint16(math.Round(dcv*10)))
+	}
+	if v <= 0 {
+		v = 240.0
+	}
+	if pf <= 0 {
+		pf = 0.97
+	}
+
+	// WAval is the available (uncurtailed) potential.
+	r.Set(m122Base+sunspec.M122_WAval, uint16(int16(math.Round(potW))))
+
+	// Apply WMaxLimPct from M123 (written by the hub over Modbus) — in both
+	// running and paused modes, so the hub can curtail a held value.
+	w := potW
+	if r.Get(m123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
+		limPct := sunspec.ApplyScaleSigned(
+			r.Get(m123Base+sunspec.M123_WMaxLimPct),
+			int16(r.Get(m123Base+sunspec.M123_WMaxLimPct_SF)),
+		)
+		limW := wmaxW * math.Max(0, limPct) / 100.0
+		w = math.Min(w, limW)
+	}
+
+	// Power-derived registers (depend on the curtailed w).
+	va := w / pf
+	varPwr := va * math.Sin(math.Acos(pf))
+	tmp := 35.0 + 20.0*(w/wmaxW)
+	dcw := w * 1.06
+	iph := w / (v * 3)
+
+	r.Set(m103Base+sunspec.M103_A, uint16(int16(math.Round(iph*3))))
+	r.Set(m103Base+sunspec.M103_AphA, uint16(int16(math.Round(iph))))
+	r.Set(m103Base+sunspec.M103_AphB, uint16(int16(math.Round(iph))))
+	r.Set(m103Base+sunspec.M103_AphC, uint16(int16(math.Round(iph))))
+	r.Set(m103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
+	r.Set(m103Base+sunspec.M103_VA, uint16(int16(math.Round(va))))
+	r.Set(m103Base+sunspec.M103_VAr, uint16(int16(math.Round(varPwr))))
+	r.Set(m103Base+sunspec.M103_PF, uint16(int16(math.Round(pf*10000))))
+	r.Set(m103Base+sunspec.M103_DCW, uint16(int16(math.Round(dcw))))
+	r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10))))
+	r.Set(m103Base+sunspec.M103_TmpSnk, uint16(int16(math.Round((tmp-5)*10))))
+
+	switch {
+	case potW < wmaxW*0.06:
+		r.Set(m103Base+sunspec.M103_St, 2) // sleeping
+	case w < potW*0.98:
+		r.Set(m103Base+sunspec.M103_St, 5) // throttled by WMaxLimPct
+	default:
+		r.Set(m103Base+sunspec.M103_St, 4) // MPPT
+	}
+
+	// Energy accumulation advances only while running (time moves).
+	if !paused {
+		*whAcc += uint16(math.Round(w * 5 / 3600))
+		r.Set(m122Base+sunspec.M122_ActWh+3, *whAcc)
 	}
 }
