@@ -85,6 +85,26 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 		}
 	})
 
+	t.Run("snapshot exposes potential, and actual never exceeds it", func(t *testing.T) {
+		r, b := newRegs()
+		ss := &SolarServer{Server: &Server{Regs: r}, bases: b, wmaxW: wmax}
+		curtailTo(r, b, 2000)
+		if err := ss.Inject([]byte(`{"W_W":6000}`)); err != nil {
+			t.Fatalf("inject: %v", err)
+		}
+		st := ss.Snapshot()
+		if st.Measurements.Possible_W != 6000 {
+			t.Errorf("Possible_W = %.0fW, want 6000W (panel potential)", st.Measurements.Possible_W)
+		}
+		if st.Measurements.W_W != 2000 {
+			t.Errorf("W_W = %.0fW, want 2000W (curtailed actual)", st.Measurements.W_W)
+		}
+		// The replay curtailment column depends on this invariant holding.
+		if st.Measurements.W_W > st.Measurements.Possible_W {
+			t.Errorf("actual %.0fW > possible %.0fW — physically impossible", st.Measurements.W_W, st.Measurements.Possible_W)
+		}
+	})
+
 	t.Run("paused: disconnect zeroes output", func(t *testing.T) {
 		r, b := newRegs()
 		injectPotential(r, b, 6000)

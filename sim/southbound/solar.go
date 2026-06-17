@@ -92,17 +92,18 @@ type SolarState struct {
 		WMaxW float64 `json:"wmax_W"`
 	} `json:"nameplate"`
 	Measurements struct {
-		W_W      float64 `json:"W_W"`
-		V_V      float64 `json:"V_V"`
-		Hz_Hz    float64 `json:"Hz_Hz"`
-		VA_VA    float64 `json:"VA_VA"`
-		VAr_var  float64 `json:"VAr_var"`
-		PF       float64 `json:"PF"`
-		DCV_V    float64 `json:"DCV_V"`
-		DCW_W    float64 `json:"DCW_W"`
-		TmpCab_C float64 `json:"TmpCab_C"`
-		St       int     `json:"St"`
-		StText   string  `json:"St_text"`
+		W_W        float64 `json:"W_W"`
+		Possible_W float64 `json:"possible_W"` // pre-curtailment potential (M122 WAval)
+		V_V        float64 `json:"V_V"`
+		Hz_Hz      float64 `json:"Hz_Hz"`
+		VA_VA      float64 `json:"VA_VA"`
+		VAr_var    float64 `json:"VAr_var"`
+		PF         float64 `json:"PF"`
+		DCV_V      float64 `json:"DCV_V"`
+		DCW_W      float64 `json:"DCW_W"`
+		TmpCab_C   float64 `json:"TmpCab_C"`
+		St         int     `json:"St"`
+		StText     string  `json:"St_text"`
 	} `json:"measurements"`
 	Controls struct {
 		WMaxLimPct_pct float64 `json:"WMaxLimPct_pct"`
@@ -133,6 +134,10 @@ func (ss *SolarServer) Snapshot() SolarState {
 
 	m := &st.Measurements
 	m.W_W = signed(b.M103Base+sunspec.M103_W, b.M103Base+sunspec.M103_W_SF)
+	// Possible_W is the panel's pre-curtailment potential (WAval). Reading it
+	// from the same register snapshot as W_W lets a sampler compute curtailment
+	// (possible − actual) coherently, with no chance of actual > possible.
+	m.Possible_W = signed(b.M122Base+sunspec.M122_WAval, b.M122Base+sunspec.M122_WAval_SF)
 	m.V_V = unsigned(b.M103Base+sunspec.M103_PhVphA, b.M103Base+sunspec.M103_V_SF)
 	m.Hz_Hz = unsigned(b.M103Base+sunspec.M103_Hz, b.M103Base+sunspec.M103_Hz_SF)
 	m.VA_VA = signed(b.M103Base+sunspec.M103_VA, b.M103Base+sunspec.M103_VA_SF)

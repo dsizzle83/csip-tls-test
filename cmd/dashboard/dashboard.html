@@ -905,6 +905,17 @@ a { color: #60a5fa; }
         <h3 style="margin-bottom:6px;">Live Hub Decisions (real orchestrator)</h3>
         <div class="log-wrap" id="cs-rp-decisions" style="max-height:140px;"></div>
       </div>
+      <div style="margin-top:10px;">
+        <h3 style="margin-bottom:6px;">
+          Compliance Alerts
+          <span style="font-size:11px;color:#64748b;font-weight:normal;">
+            &mdash; 2030.5 <code>CannotComply</code> Responses the hub POSTed to the grid server
+            (e.g. import cap with the battery drained)
+          </span>
+          <b id="cs-rp-alert-count" style="color:#f59e0b;margin-left:6px;"></b>
+        </h3>
+        <div class="log-wrap" id="cs-rp-alerts" style="max-height:120px;"></div>
+      </div>
     </div>
 
     <div id="cs-rp-result" style="display:none;margin-top:12px;">
@@ -3047,7 +3058,9 @@ async function pollReplayStatus() {
   setText('cs-rp-simtime', st.sim_time || '—');
   setText('cs-rp-net', csMoney(st.measured.net_usd || 0));
   setText('cs-rp-comp', st.measured.constrained_ticks
-    ? (st.measured.compliance_pct ?? 100).toFixed(1) + '% (' + st.measured.violations + ' viol / ' + st.measured.constrained_ticks + ' ticks)'
+    ? (st.measured.compliance_pct ?? 100).toFixed(1) + '% (' + st.measured.violations + ' viol'
+        + (st.measured.excused ? ', ' + st.measured.excused + ' excused' : '')
+        + ' / ' + st.measured.constrained_ticks + ' ticks)'
     : 'no events yet');
   const last = st.samples && st.samples.length ? st.samples[st.samples.length - 1] : null;
   setText('cs-rp-grid', last ? fmt(last.grid_W) + ' W' : '—');
@@ -3055,6 +3068,7 @@ async function pollReplayStatus() {
   setText('cs-rp-eta', st.running ? formatEta(st.eta_s) : '—');
 
   renderReplayDecisions(st.samples || []);
+  pollComplianceAlerts();
 
   if (!st.running && (st.finished || st.aborted) && st.daily_net && st.daily_net.length) {
     renderReplayComparison(st);
@@ -3067,6 +3081,36 @@ function formatEta(s) {
   if (s == null) return '—';
   if (s < 3600) return Math.round(s / 60) + ' min';
   return (s / 3600).toFixed(1) + ' h';
+}
+
+// Poll the gridsim for CannotComply Responses the hub has posted. These are the
+// observable proof that the hub reports limits it physically cannot meet (the
+// alert flows hub optimizer → MQTT → northbound → 2030.5 Response → gridsim).
+async function pollComplianceAlerts() {
+  const el = document.getElementById('cs-rp-alerts');
+  if (!el) return;
+  let data;
+  try {
+    const resp = await fetch('/api/gridsim/admin/alerts');
+    if (!resp.ok) return;
+    data = await resp.json();
+  } catch (_) { return; }
+  const alerts = (data && data.alerts) || [];
+  document.getElementById('cs-rp-alert-count').textContent =
+    alerts.length ? `(${alerts.length})` : '';
+  if (!alerts.length) {
+    el.innerHTML = '<div class="log-line" style="color:#334155;">no compliance alerts — hub is meeting every control</div>';
+    return;
+  }
+  const rows = alerts.slice(-40).map(a => {
+    const t = a.received_at ? new Date(a.received_at * 1000).toISOString().slice(11, 19) : '—';
+    return `<div class="log-line" style="color:#f87171;">` +
+           `<span style="color:#475569;">${t}</span> ` +
+           `&#9888; CannotComply (status ${a.status}) for event ` +
+           `<b>${escapeHTML(a.subject || '(default)')}</b></div>`;
+  });
+  el.innerHTML = rows.join('');
+  el.scrollTop = el.scrollHeight;
 }
 
 function renderReplayDecisions(samples) {

@@ -90,6 +90,7 @@ type replaySample struct {
 	EvSOC      float64  `json:"ev_soc"`
 	Constraint string   `json:"constraint,omitempty"` // active DER cap, human form
 	Violation  bool     `json:"violation"`
+	Excused    bool     `json:"excused"` // miss the hub reported as CannotComply (resource-limited)
 	Decisions  []string `json:"decisions,omitempty"`
 }
 
@@ -102,6 +103,7 @@ type replayMeasured struct {
 	PeakImpKWh float64 `json:"peak_import_kwh"`
 	ConsTicks  int     `json:"constrained_ticks"`
 	Violations int     `json:"violations"`
+	Excused    int     `json:"excused"` // resource-limited misses the hub reported (not counted as violations)
 	Compliance float64 `json:"compliance_pct"`
 	SampleErrs int     `json:"sample_errors"`
 }
@@ -255,6 +257,7 @@ func (d *replayDriver) run(ctx context.Context, req replayStartReq) {
 	type tickEvent struct {
 		startTick, endTick int
 		ev                 replayEvent
+		mrid               string // gridsim DERControl mRID, set when the control is posted
 	}
 	var events []tickEvent
 	for _, e := range req.Env.Events {
@@ -342,7 +345,8 @@ func (d *replayDriver) run(ctx context.Context, req replayStartReq) {
 				case "genLimit":
 					body["max_lim_W"] = int64(e.ev.Limit * 1000)
 				}
-				if err := d.post("gridsim", "/admin/control", body); err == nil {
+				if mrid, err := d.postControl(body); err == nil {
+					events[i].mrid = mrid
 					activeEvent = &events[i]
 				}
 			}
@@ -359,7 +363,7 @@ func (d *replayDriver) run(ctx context.Context, req replayStartReq) {
 		// 6. Sample reality and book the tick.
 		var constraint *activeCap
 		if activeEvent != nil {
-			constraint = &activeCap{typ: activeEvent.ev.Type, limW: activeEvent.ev.Limit * 1000}
+			constraint = &activeCap{typ: activeEvent.ev.Type, limW: activeEvent.ev.Limit * 1000, mrid: activeEvent.mrid}
 		}
 		env := tickEnv{
 			possibleSolarW: req.Env.Pv[t] * 1000, // panel potential before any curtailment
@@ -383,6 +387,7 @@ func (d *replayDriver) run(ctx context.Context, req replayStartReq) {
 type activeCap struct {
 	typ  string  // exportCap | importCap | genLimit
 	limW float64 // watts
+	mrid string  // gridsim DERControl mRID (to match CannotComply alerts)
 }
 
 // tickEnv carries the injected environment for a tick — values the loop knows
@@ -401,6 +406,14 @@ func (d *replayDriver) sampleTick(t int, hour float64, simLabel string, constrai
 	gridW, gridOK := d.meterW()
 	hubInfo := d.hubSnapshot()
 
+	// Solar actual + potential, read coherently from the sim itself. Falls back
+	// to the hub's cached reading (and the injected potential) only if the sim
+	// is unreachable this tick.
+	solarW, possibleW, solarOK := d.solarSim()
+	if !solarOK {
+		solarW, possibleW = hubInfo.solarW, env.possibleSolarW
+	}
+
 	price := replayRate(hour)
 	isPeak := hour >= 16 && hour < 21
 
@@ -411,7 +424,7 @@ func (d *replayDriver) sampleTick(t int, hour float64, simLabel string, constrai
 	sample := replaySample{
 		Tick:      t,
 		SimTime:   simLabel,
-		SolarW:    hubInfo.solarW,
+		SolarW:    solarW,
 		BatteryW:  hubInfo.batteryW,
 		EvW:       hubInfo.evW,
 		BatSOC:    hubInfo.batSOC,
@@ -450,8 +463,17 @@ func (d *replayDriver) sampleTick(t int, hour float64, simLabel string, constrai
 			case "importCap":
 				sample.Violation = gridW > constraint.limW+complianceTolW
 			case "genLimit":
-				sample.Violation = hubInfo.solarW > constraint.limW+complianceTolW
+				sample.Violation = solarW > constraint.limW+complianceTolW
 			}
+		}
+		// A miss the hub has reported it cannot meet (CannotComply alert for this
+		// control) is a resource limit, not a control failure — excuse it from the
+		// violation count. A silent miss still counts. Checked only on a miss, so
+		// the extra gridsim call is rare.
+		if sample.Violation && d.reportedCannotComply(constraint.mrid) {
+			sample.Violation = false
+			sample.Excused = true
+			m.Excused++
 		}
 		if sample.Violation {
 			m.Violations++
@@ -466,6 +488,9 @@ func (d *replayDriver) sampleTick(t int, hour float64, simLabel string, constrai
 	d.status.Pct = float64(d.status.Tick) / float64(d.status.TotalTicks) * 100
 	d.status.EtaS = (d.status.TotalTicks - d.status.Tick) * d.status.TickMs / 1000
 
+	// Log the potential coherent with the actual above (same sim snapshot), so
+	// solar_curtailed_kW = possible − actual is exact and never negative.
+	env.possibleSolarW = possibleW
 	d.writeTickRow(t, price, sample, env, gridOK)
 
 	d.status.Samples = append(d.status.Samples, sample)
@@ -488,7 +513,7 @@ var tickLogHeader = []string{
 	"battery_kW(+dis/-chg)", "battery_soc_%",
 	"ev_connected", "ev_soc_%", "ev_draw_kW",
 	"site_load_kW", "net_grid_kW(+imp/-exp)",
-	"constraint", "violation",
+	"constraint", "violation", "excused",
 }
 
 // openTickLog creates the per-tick CSV for this run and writes the header.
@@ -536,13 +561,17 @@ func (d *replayDriver) writeTickRow(t int, price float64, s replaySample, env ti
 	if s.Violation {
 		violation = "1"
 	}
+	excused := "0"
+	if s.Excused {
+		excused = "1"
+	}
 	row := []string{
 		strconv.Itoa(t), s.SimTime, strconv.FormatFloat(price, 'f', 2, 64),
 		kW(s.SolarW), kW(env.possibleSolarW), kW(curtailed),
 		kW(s.BatteryW), pct(s.BatSOC),
 		evConn, pct(s.EvSOC), kW(s.EvW),
 		kW(env.siteLoadW), netGrid,
-		s.Constraint, violation,
+		s.Constraint, violation, excused,
 	}
 	_ = d.tickLogCSV.Write(row)
 	d.tickLogCSV.Flush() // flush each tick so an aborted/crashed run keeps its trace
@@ -582,6 +611,52 @@ func (d *replayDriver) post(name, path string, body map[string]any) error {
 	return nil
 }
 
+// postControl POSTs a DERControl to gridsim's admin API and returns the mRID
+// gridsim assigned, so the driver can later match the hub's CannotComply
+// alerts (keyed by subject mRID) to the control that provoked them.
+func (d *replayDriver) postControl(body map[string]any) (string, error) {
+	buf, _ := json.Marshal(body)
+	resp, err := d.client.Post(d.url("gridsim", "/admin/control"), "application/json", bytes.NewReader(buf))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("gridsim /admin/control: HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		MRID string `json:"mrid"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out.MRID, nil
+}
+
+// reportedCannotComply reports whether the hub has POSTed a CannotComply
+// Response for the given control mRID — i.e. it told the grid server it is
+// physically unable to meet that limit (battery at its SOC reserve). Such
+// misses are excused from the violation count: a reported resource limit is an
+// acceptable outcome, not a control failure. A silent miss (no alert) still
+// counts. Empty mrid never matches.
+func (d *replayDriver) reportedCannotComply(mrid string) bool {
+	if mrid == "" {
+		return false
+	}
+	var out struct {
+		Alerts []struct {
+			Subject string `json:"subject"`
+		} `json:"alerts"`
+	}
+	if err := d.getJSON("gridsim", "/admin/alerts", &out); err != nil {
+		return false
+	}
+	for _, a := range out.Alerts {
+		if a.Subject == mrid {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *replayDriver) getJSON(name, path string, out any) error {
 	resp, err := d.client.Get(d.url(name, path))
 	if err != nil {
@@ -604,6 +679,26 @@ func (d *replayDriver) deleteControls(program int) error {
 	}
 	resp.Body.Close()
 	return nil
+}
+
+// solarSim reads the solar sim's own /state at sample time, returning the
+// inverter's committed output and its pre-curtailment potential from the SAME
+// register snapshot. Sourcing both here — rather than the hub's cached /status
+// for "actual" and the injected Pv[t] for "possible" — keeps them on one clock,
+// so the ticklog can never show actual > possible and the genLimit check is
+// judged on the inverter's real committed watts instead of a stale telemetry
+// reading that lags on the solar curve's falling limb.
+func (d *replayDriver) solarSim() (actualW, possibleW float64, ok bool) {
+	var st struct {
+		Measurements struct {
+			W_W       float64 `json:"W_W"`
+			PossibleW float64 `json:"possible_W"`
+		} `json:"measurements"`
+	}
+	if err := d.getJSON("solar", "/state", &st); err != nil {
+		return 0, 0, false
+	}
+	return st.Measurements.W_W, st.Measurements.PossibleW, true
 }
 
 func (d *replayDriver) meterW() (float64, bool) {

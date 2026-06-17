@@ -64,6 +64,11 @@ type Server struct {
 	// Response log (CORE-022: client POSTs Response on event transitions)
 	responseMu sync.Mutex
 	responses  []model.Response
+	// complianceAlerts records CannotComply (status ≥ alertStatusFloor)
+	// Responses with the server receive time, surfaced via GET /admin/alerts so
+	// the dashboard can show when the hub reports it cannot meet a control.
+	// Guarded by responseMu.
+	complianceAlerts []ComplianceAlert
 
 	// logBuf feeds GET /admin/logs (SSE). The sim/server binary tees the
 	// standard logger into LogWriter() so every request log line streams to
@@ -867,10 +872,47 @@ func (s *Server) handleResponsePost(w http.ResponseWriter, r *http.Request, path
 	}
 	s.responseMu.Lock()
 	s.responses = append(s.responses, resp)
+	if resp.Status >= alertStatusFloor {
+		s.complianceAlerts = append(s.complianceAlerts, ComplianceAlert{
+			Subject:    resp.Subject,
+			Status:     resp.Status,
+			LFDI:       resp.EndDeviceLFDI,
+			ReceivedAt: s.Now(),
+		})
+	}
 	s.responseMu.Unlock()
-	log.Printf("[gridsim] POST %s → Response accepted: subject=%s status=%d",
-		path, resp.Subject, resp.Status)
+	if resp.Status >= alertStatusFloor {
+		log.Printf("[gridsim] ALERT: client reports CANNOT-COMPLY (status=%d) for subject=%s — DER is resource-limited",
+			resp.Status, resp.Subject)
+	} else {
+		log.Printf("[gridsim] POST %s → Response accepted: subject=%s status=%d",
+			path, resp.Subject, resp.Status)
+	}
 	w.WriteHeader(http.StatusCreated)
+}
+
+// alertStatusFloor is the lowest Response status treated as a non-compliance
+// alert rather than a lifecycle acknowledgement. IEEE 2030.5 Table 27 uses
+// 1–7; the LEXA hub reports "cannot comply" in the 0xF0–0xFF manufacturer
+// range (see model.ResponseCannotComply in lexa-hub).
+const alertStatusFloor uint8 = 0xF0
+
+// ComplianceAlert is a CannotComply Response recorded with the server receive
+// time, returned by GET /admin/alerts.
+type ComplianceAlert struct {
+	Subject    string `json:"subject"`     // DERControl mRID the DER cannot meet
+	Status     uint8  `json:"status"`      // 2030.5 Response status (≥ alertStatusFloor)
+	LFDI       string `json:"lfdi"`        // responding device
+	ReceivedAt int64  `json:"received_at"` // gridsim server time (Unix seconds)
+}
+
+// ComplianceAlerts returns a copy of all CannotComply alerts received.
+func (s *Server) ComplianceAlerts() []ComplianceAlert {
+	s.responseMu.Lock()
+	defer s.responseMu.Unlock()
+	out := make([]ComplianceAlert, len(s.complianceAlerts))
+	copy(out, s.complianceAlerts)
+	return out
 }
 
 // ReceivedResponses returns a copy of all Response resources POSTed by

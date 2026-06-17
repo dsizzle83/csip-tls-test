@@ -19,8 +19,27 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/control", cors(s.handleAdminControl))
 	mux.HandleFunc("/admin/default", cors(s.handleAdminDefault))
 	mux.HandleFunc("/admin/clock", cors(s.handleAdminClock))
+	mux.HandleFunc("/admin/alerts", cors(s.handleAdminAlerts))
 	mux.HandleFunc("/admin/logs", cors(s.logBuf.ServeHTTP))
 	return mux
+}
+
+// handleAdminAlerts returns the CannotComply Responses the hub has POSTed —
+// the observable proof that the DER reported it could not meet a control.
+func (s *Server) handleAdminAlerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	alerts := s.ComplianceAlerts()
+	if alerts == nil {
+		alerts = []ComplianceAlert{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"alerts":      alerts,
+		"server_time": s.Now(),
+	})
 }
 
 func cors(h http.HandlerFunc) http.HandlerFunc {
@@ -354,7 +373,9 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		actList.All = uint32(len(actList.DERControl))
 		actList.Results = actList.All
 	}
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]string{"mrid": ctrl.MRID})
 }
 
 func (s *Server) adminCtrlDelete(w http.ResponseWriter, r *http.Request) {

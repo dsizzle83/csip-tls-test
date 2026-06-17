@@ -214,3 +214,37 @@ func TestAdminClock_SkewsServerTimeAndControlStart(t *testing.T) {
 		t.Errorf("offset after reset = %d, want 0", clk.OffsetS)
 	}
 }
+
+// TestAdminAlerts_RecordsCannotComply verifies that only CannotComply Responses
+// (status ≥ alertStatusFloor) register as compliance alerts, and that
+// GET /admin/alerts surfaces them for the dashboard.
+func TestAdminAlerts_RecordsCannotComply(t *testing.T) {
+	s := NewServer("")
+
+	// A normal lifecycle Response (Started=2) must NOT register as an alert.
+	ok := `<Response xmlns="urn:ieee:std:2030.5:ns"><endDeviceLFDI>ABC</endDeviceLFDI><status>2</status><subject>EVT-1</subject></Response>`
+	s.handleResponsePost(httptest.NewRecorder(),
+		httptest.NewRequest("POST", "/rsps/0/r", bytes.NewReader([]byte(ok))), "/rsps/0/r")
+
+	// A CannotComply Response (status 240) must register as an alert.
+	bad := `<Response xmlns="urn:ieee:std:2030.5:ns"><endDeviceLFDI>ABC</endDeviceLFDI><status>240</status><subject>EVT-2</subject></Response>`
+	s.handleResponsePost(httptest.NewRecorder(),
+		httptest.NewRequest("POST", "/rsps/0/r", bytes.NewReader([]byte(bad))), "/rsps/0/r")
+
+	alerts := s.ComplianceAlerts()
+	if len(alerts) != 1 {
+		t.Fatalf("got %d compliance alerts, want 1 (only the CannotComply)", len(alerts))
+	}
+	if alerts[0].Subject != "EVT-2" || alerts[0].Status != 240 {
+		t.Errorf("alert = %+v, want subject=EVT-2 status=240", alerts[0])
+	}
+
+	rec := httptest.NewRecorder()
+	s.AdminHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/admin/alerts", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /admin/alerts = %d, want 200", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("EVT-2")) {
+		t.Errorf("/admin/alerts body missing the alert: %s", rec.Body.String())
+	}
+}
