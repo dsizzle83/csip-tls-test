@@ -43,3 +43,7 @@ replay-ticklog-*.csv
 .idea/
 *.swp
 *~
+
+# python
+__pycache__/
+*.pyc
