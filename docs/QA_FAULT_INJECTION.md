@@ -59,7 +59,21 @@ A sim advertises only the `FaultKind`s it supports and returns `400` for the
 rest. Fault kinds are defined in `sim/southbound/sim.go` (`FaultKind`,
 `FaultSpec`) so all sims share one vocabulary.
 
-### Implemented today: `ack_before_effect`, `reject_write`, `wrong_sign`
+### Implemented today
+
+**Modbus DER (two fault layers — write-time *acceptance* and effect-time *physical response*):**
+`ack_before_effect`, `reject_write`, `enable_gate`, `ramp_limit` (solar);
+`wrong_sign`, `soc_refuse` (battery). **OCPP (CSMS/charger boundary):**
+`profile_reject`, `apply_next_tx`, `min_current_floor`, `stop_metervalues` (evsim).
+**Grid safety:** `disconnect` (gridsim opModConnect=false).
+
+The write layer (`RegisterMap.OnWriteAttempt` → `faultController.intercept`)
+decides what lands in the control register; the effect layer
+(`faultController.effectiveCeilW` for solar slew, `shapeBatteryW` for the battery)
+shapes the device's physical output each animation step. Together they separate
+*commanded* / *accepted* / *effective*, which is where most real bugs hide.
+
+#### Legacy quick reference
 
 ```bash
 # Arm: WMaxLimPct writes ACK at the Modbus layer but take effect 30 s later.
@@ -87,10 +101,16 @@ the device misbehaves:
 - `wrong_sign` (battery) — a signed charge command lands as a discharge, walking
   a low pack toward empty (INV-SOC).
 
-Covered by `TestSolarServer_AckBeforeEffectFault`,
-`TestFaultRejectWrite_DropsControlValue`, `TestFaultWrongSign_InvertsCommand`,
-and the `mayhem` scenarios `reject-write-curtail` / `battery-wrong-sign`
-(diagnosers + invariants unit-tested in `cmd/dashboard/invariants_test.go`).
+Unit-tested in `sim/southbound/faults_test.go` (`reject_write`, `enable_gate`,
+`wrong_sign`, `soc_refuse`, `ramp_limit` slew) and `sim/evsim/faults_test.go`
+(all four OCPP kinds). Driven end-to-end by the `mayhem` scenarios
+`reject-write-curtail`, `enable-gate-curtail`, `ramp-limit-curtail`,
+`battery-wrong-sign`, `battery-soc-refuse`, `ev-profile-reject`, `grid-disconnect`
+— each judged by an INV-* oracle (INV-CONVERGE / INV-SOC / INV-CONNECT), with the
+diagnosers and invariant predicates unit-tested in
+`cmd/dashboard/invariants_test.go` and `cmd/dashboard/mayhem_test.go`. The
+diagnosers distinguish ignore (FAIL) / catch-and-admit (DEGRADED) /
+slew-converging (DEGRADED) / wrong-direction (FAIL) / ceased-to-energize (PASS).
 
 ---
 
@@ -101,8 +121,9 @@ Each row is a reusable injector keyed to an existing seam. Priority: **P1** firs
 
 | Pri | Layer | Fault kind(s) | Seam | Hub MUST |
 |----|-------|---------------|------|----------|
-| P1 | Physical DER | `ack_before_effect` ✅, `reject_write` ✅, `wrong_sign` ✅, `ramp_limit`, `soc_refuse`, `enable_gate` | sim models + `OnWriteAttempt` | not assume success; re-issue or fall back; alarm on non-convergence |
-| P1 | OCPP | `profile_reject`, `apply_next_tx`, `min_current_floor` (6 A), `stop_metervalues` | `evsim` / CSMS | treat reject/timeout as failure (now returns error after the 2026-06 fix); react, don't just log |
+| P1 | Physical DER | `ack_before_effect` ✅, `reject_write` ✅, `wrong_sign` ✅, `enable_gate` ✅, `ramp_limit` ✅, `soc_refuse` ✅ | sim models + `OnWriteAttempt` (write) / `effectiveCeilW`+`shapeBatteryW` (effect) | not assume success; re-issue or fall back; alarm on non-convergence |
+| P1 | OCPP | `profile_reject` ✅, `apply_next_tx` ✅, `min_current_floor` (6 A) ✅, `stop_metervalues` ✅ | `evsim` / CSMS | treat reject/timeout as failure (now returns error after the 2026-06 fix); react, don't just log |
+| P1 | Grid safety | `disconnect` (opModConnect=false) ✅ | gridsim `/admin/control` | cease to energize — drive every DER to ~0 within seconds (INV-CONNECT) |
 | P1 | MQTT | `broker_down`, `retained_redeliver`, `dup_out_of_order` | pause/kill Mosquitto; replay driver | fail-safe when control plane is gone; idempotent commands |
 | P2 | Modbus transport | `crc_error`, `exception_code`, `tcp_drop`, `latency`, `nan_sentinel` (0x8000) | sim wrapper / `toxiproxy` on 502x | stale-expire reading; never act on garbage; surface device-down |
 | P2 | Network | `packet_loss`, `jitter`, `partition`, `dns_fail` | `tc/netem` + `toxiproxy` between nodes | reconnect/backoff; hold last-known-good safely |

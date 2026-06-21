@@ -95,6 +95,41 @@ func TestInvSOC_FlagsWrongWayAtBounds(t *testing.T) {
 	}
 }
 
+// diagnoseDisconnect: a DER still energizing past the reaction window during a
+// disconnect is a FAIL; ceasing within the window is a PASS.
+func TestDiagnoseDisconnect_Verdicts(t *testing.T) {
+	cons := &activeConstraint{Typ: "connect", MRID: "M-conn"}
+
+	// Solar keeps producing well past the reaction window → unsafe back-feed.
+	bad := mkSamples(40, func(i int, s *maySample) {
+		s.DisconnectActive = true
+		s.SolarW = 4000 // still energizing
+	})
+	if f := diagnoseDisconnect(scFor("grid-disconnect"), cons, bad); f.Verdict != "FAIL" {
+		t.Fatalf("back-feeding verdict = %q, want FAIL", f.Verdict)
+	}
+
+	// Solar ceases within the reaction window and holds at 0 → safe.
+	good := mkSamples(40, func(i int, s *maySample) {
+		s.DisconnectActive = true
+		if float64(i) <= mayConvergeDeadlineS {
+			s.SolarW = 4000 // reacting during the grace window
+		} else {
+			s.SolarW = 0
+			s.BatteryW = 0
+		}
+	})
+	if f := diagnoseDisconnect(scFor("grid-disconnect"), cons, good); f.Verdict != "PASS" {
+		t.Fatalf("ceased-to-energize verdict = %q, want PASS", f.Verdict)
+	}
+
+	// Hub never adopts the disconnect → FAIL (upstream of actuation).
+	never := mkSamples(20, func(i int, s *maySample) { s.SolarW = 0 })
+	if f := diagnoseDisconnect(scFor("grid-disconnect"), cons, never); f.Verdict != "FAIL" {
+		t.Fatalf("never-adopted verdict = %q, want FAIL", f.Verdict)
+	}
+}
+
 // diagnoseSOC turns an INV-SOC violation into a FAIL and a clean timeline into a
 // PASS.
 func TestDiagnoseSOC_Verdicts(t *testing.T) {

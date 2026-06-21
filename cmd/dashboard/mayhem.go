@@ -66,12 +66,13 @@ type maySample struct {
 	EvW      float64 `json:"ev_W"`
 	EvSOC    float64 `json:"ev_soc"`
 
-	HubReachable bool    `json:"hub_reachable"`
-	HubAdopted   bool    `json:"hub_adopted"` // hub is applying a CSIP control this tick
-	AdoptedTyp   string  `json:"adopted_typ"` // exportCap|importCap|genLimit|fixed|connect
-	AdoptedLimW  float64 `json:"adopted_lim_W"`
-	AdoptedMRID  string  `json:"adopted_mrid"`
-	ClockOffsetS int64   `json:"clock_offset_s"`
+	HubReachable     bool    `json:"hub_reachable"`
+	HubAdopted       bool    `json:"hub_adopted"`       // hub is applying a CSIP control this tick
+	DisconnectActive bool    `json:"disconnect_active"` // a cease-to-energize (Connect=false) control is in force
+	AdoptedTyp       string  `json:"adopted_typ"`       // exportCap|importCap|genLimit|fixed|connect
+	AdoptedLimW      float64 `json:"adopted_lim_W"`
+	AdoptedMRID      string  `json:"adopted_mrid"`
+	ClockOffsetS     int64   `json:"clock_offset_s"`
 
 	CannotComply bool     `json:"cannot_comply"` // hub posted a CannotComply for the active mRID
 	Decisions    []string `json:"decisions,omitempty"`
@@ -389,6 +390,7 @@ func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
 			s.AdoptedLimW = hub.ctrlLimW
 			s.AdoptedMRID = hub.ctrlMRID
 		}
+		s.DisconnectActive = hub.disconnectActive
 	}
 	// A CannotComply alert is only meaningful while a real control is in force.
 	if cons != nil && cons.MRID != "" {
@@ -871,6 +873,65 @@ func diagnoseSOC(sc *mayScenario, cons *activeConstraint, s []maySample) mayFind
 	return f
 }
 
+// diagnoseDisconnect handles the cease-to-energize scenario: the grid commands an
+// opModConnect=false control and every controllable DER must stop feeding the
+// grid. It judges by INV-CONNECT — after a reaction grace, any solar production
+// or battery discharge while the disconnect is in force is an unsafe back-feed.
+func diagnoseDisconnect(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+
+	adopted := false
+	for _, smp := range s {
+		if smp.DisconnectActive {
+			adopted = true
+			break
+		}
+	}
+	if !adopted {
+		f.Verdict = "FAIL"
+		f.Headline = "hub never adopted the disconnect"
+		f.Diagnosis = []string{
+			"No sample showed a cease-to-energize control in force: the hub's /status never reflected opModConnect=false for this mRID.",
+			"Root cause is upstream of actuation — CSIP discovery / event activation for a Connect control. The DERs were never told to stop.",
+			decisionLine(s),
+		}
+		f.Fix = "Trace northbound adoption of an opModConnect=false DERControl; the disconnect was posted to gridsim but never took effect in the hub."
+		return f
+	}
+
+	// Excuse a bounded reaction window, then any energizing DER is a violation.
+	var viol []invViolation
+	for _, x := range invConnectSafe(s) {
+		if x.T > mayConvergeDeadlineS {
+			viol = append(viol, x)
+		}
+	}
+	if len(viol) == 0 {
+		f.Verdict = "PASS"
+		f.Headline = "all DERs ceased to energize under the disconnect"
+		f.Diagnosis = []string{
+			invSummaryLine("INV-CONNECT", viol),
+			"After the disconnect took effect, solar output and battery discharge fell to ~0 and held there — the hub stopped back-feeding a line the utility commanded dead.",
+		}
+		return f
+	}
+	f.Verdict = "FAIL"
+	f.Headline = fmt.Sprintf("DER still energizing %.0fs into a disconnect", viol[0].T)
+	f.Diagnosis = []string{
+		invSummaryLine("INV-CONNECT", viol),
+		"The hub adopted the cease-to-energize control but a DER kept feeding the grid past the reaction window — the most dangerous failure class: back-feeding a line the utility believes is de-energized.",
+		decisionLine(s),
+	}
+	f.Fix = "On an opModConnect=false control, command every DER to cease energizing (solar WMaxLimPct→0 / disconnect, battery idle, EV stop) and verify measured output reaches ~0 (orchestrator connect handling)."
+	return f
+}
+
 // ── Diagnosis helpers ──────────────────────────────────────────────────────────
 
 func hubVsRealLine(s []maySample) string {
@@ -1128,6 +1189,7 @@ type mayHubState struct {
 	ctrlActive           bool
 	ctrlTyp, ctrlMRID    string
 	ctrlLimW             float64
+	disconnectActive     bool
 	decisions            []string
 }
 
@@ -1198,6 +1260,7 @@ func (d *mayhemDriver) hubState() mayHubState {
 			h.ctrlTyp, h.ctrlLimW = "fixed", float64(*c.Base.FixedW)
 		case c.Base.Connect != nil:
 			h.ctrlTyp = "connect"
+			h.disconnectActive = !*c.Base.Connect
 		}
 	}
 	for _, dec := range st.LastPlan.Decisions {
@@ -1310,6 +1373,22 @@ func (d *mayhemDriver) postCap(typ string, limW float64, holdS int, desc string)
 		return nil, err
 	}
 	return &activeConstraint{Typ: typ, LimW: limW, MRID: mrid}, nil
+}
+
+// postConnect posts a duration-bounded opModConnect control (connect=false is a
+// cease-to-energize disconnect) and returns the constraint to judge against.
+func (d *mayhemDriver) postConnect(connect bool, holdS int, desc string) (*activeConstraint, error) {
+	mrid, err := d.postControl(map[string]any{
+		"program":     0,
+		"duration_s":  holdS + 20,
+		"activate":    true,
+		"description": desc,
+		"connect":     connect,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &activeConstraint{Typ: "connect", LimW: 0, MRID: mrid}, nil
 }
 
 // ── Scenario battery ───────────────────────────────────────────────────────────
@@ -1487,6 +1566,22 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 				_ = d.post("ev", "/fault", map[string]any{"kind": "profile_reject", "clear": true})
 				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
 			},
+		},
+		{
+			ID: "grid-disconnect", Name: "Cease-to-energize: grid commands a disconnect",
+			Category:   "Grid safety (INV-CONNECT)",
+			Hypothesis: "The utility commands an immediate disconnect (opModConnect=false) while the inverter is exporting at full sun and the battery could discharge. Every controllable DER must stop feeding the grid within seconds — back-feeding a line the utility believes is dead is the most dangerous failure there is.",
+			Expected:   "Drive solar output and battery discharge to ~0 within the reaction window and hold there for the whole disconnect. No DER may keep energizing the grid.",
+			HoldS:      45,
+			Fix:        "On an opModConnect=false control, command all DERs to cease energizing and verify measured output reaches ~0 (orchestrator connect handling).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 70, "Conn": 1})
+				d.injectEnv(d.pvHighW, loadLow) // solar exporting at full sun
+				return d.postConnect(false, 45, "mayhem: cease-to-energize disconnect")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseDisconnect,
+			teardown: func(d *mayhemDriver) { d.deleteControls(0) }, // re-energize
 		},
 		{
 			ID: "stale-meter", Name: "Grid meter freezes while the world changes",

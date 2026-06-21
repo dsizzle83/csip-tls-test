@@ -26,6 +26,9 @@ const (
 	// |battery W| above this counts as actively charging/discharging (filters
 	// idle jitter around zero).
 	invSocActiveW = 50.0
+	// A DER feeding more than this into the grid counts as still energizing
+	// during a cease-to-energize disconnect.
+	invConnectEnergizeW = 250.0
 )
 
 // invViolation is one timestamped breach of a named invariant.
@@ -110,6 +113,36 @@ func invSOC(s []maySample) []invViolation {
 				Inv:    "INV-SOC",
 				T:      smp.T,
 				Detail: fmt.Sprintf("charging %.0f W at SoC %.0f%% (≥ ceiling %.0f%%)", -smp.BatteryW, smp.BatSOC, invSocCeilingPct),
+			})
+		}
+	}
+	return v
+}
+
+// invConnectSafe flags any sample where a DER is still energizing the grid while
+// a CSIP disconnect (cease-to-energize) is in force — solar producing or the
+// battery discharging. A disconnect is the most safety-critical control: the hub
+// MUST drive all controllable generation and discharge to ~0. Charging is not
+// flagged (it draws from, not feeds, the grid); the concern is back-feeding a
+// line the utility believes is dead.
+func invConnectSafe(s []maySample) []invViolation {
+	var v []invViolation
+	for _, smp := range s {
+		if !smp.DisconnectActive {
+			continue
+		}
+		if smp.SolarOK && smp.SolarW > invConnectEnergizeW {
+			v = append(v, invViolation{
+				Inv:    "INV-CONNECT",
+				T:      smp.T,
+				Detail: fmt.Sprintf("solar still producing %.0f W during a disconnect", smp.SolarW),
+			})
+		}
+		if smp.BatteryW > invConnectEnergizeW {
+			v = append(v, invViolation{
+				Inv:    "INV-CONNECT",
+				T:      smp.T,
+				Detail: fmt.Sprintf("battery still discharging %.0f W during a disconnect", smp.BatteryW),
 			})
 		}
 	}
