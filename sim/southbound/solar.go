@@ -53,6 +53,7 @@ type SolarServer struct {
 var solarFaultKinds = map[FaultKind]bool{
 	FaultAckBeforeEffect: true,
 	FaultRejectWrite:     true,
+	FaultEnableGate:      true,
 }
 
 // NewSolarServer creates and starts an animated PV inverter simulator.
@@ -69,6 +70,7 @@ func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
 	}
 	ss := &SolarServer{Server: srv, bases: bases, wmaxW: wmaxW}
 	ss.faults.label = "solar"
+	ss.faults.configureGate(bases.M123Base + sunspec.M123_WMaxLimPct_Ena)
 	regs.OnWriteAttempt = ss.interceptWrite
 	return ss, nil
 }

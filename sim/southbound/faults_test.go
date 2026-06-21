@@ -50,6 +50,54 @@ func TestFaultRejectWrite_DropsControlValue(t *testing.T) {
 	}
 }
 
+// TestFaultEnableGate_LandsValueButGatesEnable verifies the enable_gate injector:
+// a curtailment write lands in the WMaxLimPct register (so a hub that verifies by
+// reading the value back is fooled), but the enable flag is forced off so the
+// limit is never enforced — and a later enable-only write cannot re-open it. This
+// is the readback-looks-compliant fixture for INV-CONVERGE.
+func TestFaultEnableGate_LandsValueButGatesEnable(t *testing.T) {
+	const wmax = 8000.0
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	b := populateSolar(r, wmax)
+	ss := &SolarServer{Server: &Server{Regs: r}, bases: b, wmaxW: wmax}
+	cmd := b.M123Base + sunspec.M123_WMaxLimPct
+	ena := b.M123Base + sunspec.M123_WMaxLimPct_Ena
+	ss.faults.configureGate(ena) // NewSolarServer does this; the bare struct does not
+
+	if err := ss.ApplyFault([]byte(`{"kind":"enable_gate"}`)); err != nil {
+		t.Fatalf("arm enable_gate: %v", err)
+	}
+
+	// Hub writes a 25% curtailment and asserts Ena=1 in the same multi-register
+	// write. The value must land (readback shows it) but Ena must be forced to 0.
+	curtail := sunspec.RawFromScaleSigned(25, -2)
+	if applied := ss.interceptWrite(cmd, []uint16{curtail, 1}); applied {
+		t.Fatal("interceptWrite returned apply=true; enable_gate should handle the write")
+	}
+	if got := r.Get(cmd); got != curtail {
+		t.Fatalf("WMaxLimPct after gated write = %d, want %d (value must land for readback)", int16(got), int16(curtail))
+	}
+	if got := r.Get(ena); got != 0 {
+		t.Fatalf("Ena after gated write = %d, want 0 (limit must not be enforced)", got)
+	}
+
+	// A separate enable-only write must not re-open the gate.
+	if applied := ss.interceptWrite(ena, []uint16{1}); applied {
+		t.Fatal("interceptWrite returned apply=true on enable-only write; gate should hold it")
+	}
+	if got := r.Get(ena); got != 0 {
+		t.Fatalf("Ena after enable-only write = %d, want 0 (gate must hold it off)", got)
+	}
+
+	// Clearing restores pass-through: a fresh enable write now lands.
+	if err := ss.ApplyFault([]byte(`{"kind":"enable_gate","clear":true}`)); err != nil {
+		t.Fatalf("clear enable_gate: %v", err)
+	}
+	if applied := ss.interceptWrite(ena, []uint16{1}); !applied {
+		t.Fatal("after clear, interceptWrite should pass through (apply=true)")
+	}
+}
+
 // TestFaultWrongSign_InvertsCommand verifies the wrong_sign injector on the
 // battery: a signed WMaxLimPct command (negative=charge) is applied with its
 // sign flipped, so a commanded charge lands as a discharge. This is the fixture

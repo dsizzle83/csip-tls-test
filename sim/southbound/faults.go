@@ -43,6 +43,22 @@ type faultController struct {
 	ack       ackBeforeEffect
 	reject    bool // FaultRejectWrite: ACK the command at Modbus but never apply it
 	wrongSign bool // FaultWrongSign: apply the command with its sign flipped
+
+	// enable_gate: the commanded limit lands in the control register, but the
+	// enable flag at gateAddr is held off so the limit is never enforced. gateAddr
+	// and hasGate are configured once at wiring time (solar only); a sim that does
+	// not advertise FaultEnableGate leaves hasGate false and never arms it.
+	gate     bool
+	gateAddr uint16
+	hasGate  bool
+}
+
+// configureGate wires the enable-flag register the FaultEnableGate fault holds
+// off. Called once by a sim that advertises the kind (solar's WMaxLimPct_Ena).
+func (fc *faultController) configureGate(gateAddr uint16) {
+	fc.mu.Lock()
+	fc.gateAddr, fc.hasGate = gateAddr, true
+	fc.mu.Unlock()
 }
 
 // intercept implements the RegisterMap.OnWriteAttempt contract for a write that
@@ -56,8 +72,22 @@ type faultController struct {
 // applied immediately so unrelated fields (Ena, Conn) are never collateral.
 func (fc *faultController) intercept(regs *RegisterMap, cmdAddr, startAddr uint16, vals []uint16) bool {
 	fc.mu.Lock()
+	gate, gateAddr, hasGate := fc.gate, fc.gateAddr, fc.hasGate
 	reject, wrongSign, ackArmed, ackDelay := fc.reject, fc.wrongSign, fc.ack.armed, fc.ack.delay
 	fc.mu.Unlock()
+
+	if gate && hasGate {
+		// Apply the write verbatim — the commanded limit lands and is visible on
+		// readback — then force the enable flag off so the limit is never enforced.
+		// Done for ANY write (including an enable-only write) so the gate cannot be
+		// re-opened by a separate Ena=1 write in the next control cycle.
+		for i, v := range vals {
+			regs.Set(startAddr+uint16(i), v)
+		}
+		regs.Set(gateAddr, 0)
+		log.Printf("[fault] enable_gate: %s applied the limit but forced enable reg %d=0 (limit not enforced)", fc.label, gateAddr)
+		return false
+	}
 
 	if !reject && !wrongSign && !ackArmed {
 		return true // no write-time fault armed — apply verbatim
@@ -148,6 +178,13 @@ func (fc *faultController) apply(body []byte, supported map[FaultKind]bool) erro
 	case FaultWrongSign:
 		fc.wrongSign = !spec.Clear
 		log.Printf("[fault] wrong_sign: %s armed=%v", fc.label, fc.wrongSign)
+
+	case FaultEnableGate:
+		if !fc.hasGate {
+			return fmt.Errorf("fault %q: %s has no enable register configured", spec.Kind, fc.label)
+		}
+		fc.gate = !spec.Clear
+		log.Printf("[fault] enable_gate: %s armed=%v", fc.label, fc.gate)
 	}
 	return nil
 }

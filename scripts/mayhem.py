@@ -35,6 +35,7 @@ SCENARIOS = [
     ("export-cap-full-battery", "Zero-export cap, full sun, battery full"),
     ("ack-before-effect", "Inverter ACKs curtailment but lags 45 s"),
     ("reject-write-curtail", "Inverter ACKs the curtailment but ignores it"),
+    ("enable-gate-curtail", "Inverter echoes the limit but never enables it"),
     ("battery-wrong-sign", "Battery executes a commanded charge as a discharge"),
     ("stale-meter", "Grid meter freezes while the world changes"),
     ("battery-empty-import-cap", "Import cap at peak with an empty battery"),

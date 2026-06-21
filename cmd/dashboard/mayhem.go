@@ -1175,6 +1175,7 @@ func (d *mayhemDriver) baseline() error {
 	}
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
 	_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
+	_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 	_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
@@ -1215,6 +1216,7 @@ func (d *mayhemDriver) restoreBench() {
 	}
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
 	_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
+	_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 	_ = d.post("solar", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("battery", "/inject", map[string]any{"Conn": 1, "WMaxLimPct_pct": 0})
@@ -1312,6 +1314,27 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			evaluate: diagnoseConverge,
 			teardown: func(d *mayhemDriver) {
 				_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
+			},
+		},
+		{
+			ID: "enable-gate-curtail", Name: "Inverter echoes the limit but never enables it",
+			Category:   "Closed-loop actuation (INV-CONVERGE)",
+			Hypothesis: "An inverter accepts the WMaxLimPct write and echoes the curtailment value on readback, but its enable flag stays off so the limit is never enforced — output holds at full potential. A hub that 'verifies' by reading the register back is fooled into reporting compliance.",
+			Expected:   "Detect via MEASURED output (not register readback) that the limit never took effect and react (post CannotComply, or use another lever) — never trust the echoed value.",
+			HoldS:      50,
+			Fix:        "Bench shows the hub CATCHES this (it flags the cleared enable flag and posts CannotComply → DEGRADED) but is BLIND to reject-write-curtail under an identical breach (→ FAIL). Verification keys off the enable flag, not the limit value or measured output — complete it so both accept-but-ignore variants are caught. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // battery full → PV curtailment is the only lever
+				d.injectEnv(d.pvHighW, loadLow)
+				if err := d.post("solar", "/fault", map[string]any{"kind": "enable_gate"}); err != nil {
+					return nil, fmt.Errorf("arm enable_gate: %w", err)
+				}
+				return d.postCap("genLimit", 1000, 50, "mayhem: gen limit 1 kW vs an inverter that echoes but never enables it")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseConverge,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
 			},
 		},
 		{

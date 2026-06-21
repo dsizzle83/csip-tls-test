@@ -50,6 +50,15 @@ const (
 	// danger (discharging toward empty when told to charge) is caught by
 	// INV-SOC.
 	FaultWrongSign FaultKind = "wrong_sign"
+
+	// FaultEnableGate lets the commanded limit value land in the control register
+	// (so a hub that "verifies" by reading WMaxLimPct back sees the value it
+	// wrote) while forcing the WMaxLimPct_Ena flag off, so the limit is never
+	// actually enforced and output stays at full potential. It models a device
+	// that accepts and echoes a limit it does not apply — sneakier than
+	// reject_write, since register readback looks compliant. Only measured-effect
+	// verification (INV-CONVERGE) catches it.
+	FaultEnableGate FaultKind = "enable_gate"
 )
 
 // FaultSpec is the parsed body of POST /fault. A sim interprets the fields
