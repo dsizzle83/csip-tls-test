@@ -54,6 +54,7 @@ type BatteryServer struct {
 var batteryFaultKinds = map[FaultKind]bool{
 	FaultRejectWrite: true,
 	FaultWrongSign:   true,
+	FaultSocRefuse:   true,
 }
 
 // NewBatteryServer creates and starts an animated Li-Ion battery simulator.
@@ -62,17 +63,18 @@ func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer,
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	bases := populateBattery(regs, wmaxKwh, wmaxW)
 
+	// Allocate bs first so the write hook and animation closure can shape output
+	// through its faultController (the effect-time soc_refuse fault).
+	bs := &BatteryServer{bases: bases, wmaxW: wmaxW, wmaxKwh: wmaxKwh}
+	bs.faults.label = "battery"
+
 	// Install the hub-write hook before the Modbus server starts so the
 	// assignment is never concurrent with a handler reading it (finding MOD-3).
 	regs.OnWrite = func(startAddr uint16) {
 		if startAddr >= bases.M123Base && startAddr < bases.M123Base+23 {
-			applyHubBatteryWrite(regs, bases, wmaxW)
+			applyHubBatteryWrite(regs, bases, wmaxW, &bs.faults)
 		}
 	}
-
-	// Allocate bs first so the animation closure can reference bs.pendingSoC.
-	bs := &BatteryServer{bases: bases, wmaxW: wmaxW, wmaxKwh: wmaxKwh}
-	bs.faults.label = "battery"
 
 	// Intercept control writes BEFORE they land so reject_write / wrong_sign can
 	// alter the commanded WMaxLimPct; the OnWrite hook above still fires after
@@ -80,7 +82,7 @@ func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer,
 	regs.OnWriteAttempt = bs.interceptWrite
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
-		animateBattery(s, r, wmaxW, wmaxKwh, bases, &bs.pendingSoC, stop)
+		animateBattery(s, r, wmaxW, wmaxKwh, bases, &bs.pendingSoC, &bs.faults, stop)
 	})
 	if err != nil {
 		return nil, err
@@ -426,8 +428,8 @@ func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) BatteryBases {
 // applyHubBatteryWrite immediately reflects a hub M123 write into the power and
 // state registers (e.g. when the animation is paused). Called from RegisterMap
 // OnWrite after each Modbus write into the M123 block.
-func applyHubBatteryWrite(r *RegisterMap, bases BatteryBases, wmaxW float64) {
-	w := hubBatteryW(r, bases.M123Base, wmaxW)
+func applyHubBatteryWrite(r *RegisterMap, bases BatteryBases, wmaxW float64, fc *faultController) {
+	w := fc.shapeBatteryW(hubBatteryW(r, bases.M123Base, wmaxW))
 	if math.IsNaN(w) {
 		return
 	}
@@ -492,7 +494,7 @@ func clampToSoC(w, socPct, capacityWh, dtSim float64) (float64, float64) {
 //   - POST /inject {"SoC_pct": X}: immediately seeds the integrator so the
 //     hub-controlled path starts from the injected value.
 func animateBattery(s *Server, r *RegisterMap, wmaxW, wmaxKwh float64, bases BatteryBases,
-	pendingSoC *atomic.Pointer[float64], stop <-chan struct{}) {
+	pendingSoC *atomic.Pointer[float64], fc *faultController, stop <-chan struct{}) {
 	m103Base := bases.M103Base
 	m802Base := bases.M802Base
 	m123Base := bases.M123Base
@@ -518,7 +520,7 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW, wmaxKwh float64, bases Bat
 			t := s.simTime()
 			phase := 2 * math.Pi * t / 1200
 
-			hw := hubBatteryW(r, m123Base, wmaxW)
+			hw := fc.shapeBatteryW(hubBatteryW(r, m123Base, wmaxW))
 
 			var w, soc float64
 			// pendingSoC is sticky across free-running ticks so an operator

@@ -176,6 +176,52 @@ func TestFaultWrongSign_InvertsCommand(t *testing.T) {
 	}
 }
 
+// TestFaultSocRefuse_ZeroesBatteryOutput verifies the effect-time soc_refuse
+// injector: the hub's discharge setpoint is ACCEPTED (the control register keeps
+// it, so a register readback is fooled) but the pack produces zero power — the
+// accept-but-do-nothing fixture for INV-CONVERGE.
+func TestFaultSocRefuse_ZeroesBatteryOutput(t *testing.T) {
+	const wmaxKwh, wmaxW = 10.0, 5000.0
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	b := populateBattery(r, wmaxKwh, wmaxW)
+	bs := &BatteryServer{Server: &Server{Regs: r}, bases: b, wmaxW: wmaxW, wmaxKwh: wmaxKwh}
+	bs.faults.label = "battery"
+	cmd := b.M123Base + sunspec.M123_WMaxLimPct
+	out := b.M103Base + sunspec.M103_W
+
+	// Hub commands a +50% discharge (signed, positive=discharge): 2500 W.
+	r.Set(b.M123Base+sunspec.M123_Conn, 1)
+	r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 1)
+	sf := int16(r.Get(b.M123Base + sunspec.M123_WMaxLimPct_SF))
+	r.Set(cmd, sunspec.RawFromScaleSigned(50, sf))
+
+	applyHubBatteryWrite(r, b, wmaxW, &bs.faults)
+	if got := int16(r.Get(out)); got != 2500 {
+		t.Fatalf("baseline output = %dW, want 2500W (commanded discharge)", got)
+	}
+
+	// soc_refuse armed: the write still ACKs, the pack produces zero power.
+	if err := bs.ApplyFault([]byte(`{"kind":"soc_refuse"}`)); err != nil {
+		t.Fatalf("arm soc_refuse: %v", err)
+	}
+	applyHubBatteryWrite(r, b, wmaxW, &bs.faults)
+	if got := int16(r.Get(out)); got != 0 {
+		t.Fatalf("output under soc_refuse = %dW, want 0W (pack refused)", got)
+	}
+	if got := int16(r.Get(cmd)); got == 0 {
+		t.Fatal("control register should still hold the accepted setpoint (readback fooled)")
+	}
+
+	// Clearing restores the commanded output.
+	if err := bs.ApplyFault([]byte(`{"kind":"soc_refuse","clear":true}`)); err != nil {
+		t.Fatalf("clear soc_refuse: %v", err)
+	}
+	applyHubBatteryWrite(r, b, wmaxW, &bs.faults)
+	if got := int16(r.Get(out)); got != 2500 {
+		t.Fatalf("output after clear = %dW, want 2500W", got)
+	}
+}
+
 // TestBatteryFaults_UnsupportedKind verifies a sim rejects a kind it does not
 // advertise (the battery does not support ack_before_effect), which simapi
 // turns into a 400.

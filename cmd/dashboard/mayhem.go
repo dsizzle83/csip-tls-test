@@ -1229,6 +1229,7 @@ func (d *mayhemDriver) baseline() error {
 	_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
+	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
 	_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
@@ -1271,6 +1272,7 @@ func (d *mayhemDriver) restoreBench() {
 	_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
+	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
 	_ = d.post("solar", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("battery", "/inject", map[string]any{"Conn": 1, "WMaxLimPct_pct": 0})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
@@ -1433,6 +1435,27 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			evaluate: diagnoseSOC,
 			teardown: func(d *mayhemDriver) {
 				_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
+			},
+		},
+		{
+			ID: "battery-soc-refuse", Name: "Battery accepts the discharge command but does nothing",
+			Category:   "Resource limits (INV-CONVERGE)",
+			Hypothesis: "Under an import cap the hub commands the battery to discharge and cover the load, but the pack's BMS/contactor refuses — it ACKs the setpoint and produces zero power while it still has charge. A hub that assumes the discharge took effect keeps importing over the cap.",
+			Expected:   "Detect that battery power never moved despite the command and react — fall back to another lever or post CannotComply. Never assume the commanded discharge happened.",
+			HoldS:      70,
+			Fix:        "Verify measured battery power against the commanded setpoint; on a non-responding pack, escalate / post CannotComply (orchestrator battery adapter). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1}) // half-full: it HAS charge to give
+				d.injectEnv(300, 5000)                                                     // low PV, heavy load → forced import unless the battery discharges
+				if err := d.post("battery", "/fault", map[string]any{"kind": "soc_refuse"}); err != nil {
+					return nil, fmt.Errorf("arm soc_refuse: %w", err)
+				}
+				return d.postCap("importCap", 0, 70, "mayhem: zero import cap, battery refuses to discharge")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(300, 5000) },
+			evaluate: diagnoseConstraint,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
 			},
 		},
 		{

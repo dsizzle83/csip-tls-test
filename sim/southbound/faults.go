@@ -64,6 +64,24 @@ type faultController struct {
 	effValid  bool
 	lastEffT  time.Time
 	nowFn     func() time.Time
+
+	// soc_refuse (effect-time, battery): the pack accepts the setpoint but
+	// produces zero power. See shapeBatteryW.
+	refuse bool
+}
+
+// shapeBatteryW applies effect-time battery faults to the hub-commanded power
+// (signed: + discharge / − charge). The soc_refuse fault forces it to zero — the
+// pack accepts the setpoint but its contactor/BMS refuses to source or sink. A
+// NaN command (no hub control) is passed through untouched. With no battery
+// effect fault armed it returns commandedW unchanged.
+func (fc *faultController) shapeBatteryW(commandedW float64) float64 {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.refuse && !math.IsNaN(commandedW) {
+		return 0
+	}
+	return commandedW
 }
 
 func (fc *faultController) now() time.Time {
@@ -255,6 +273,10 @@ func (fc *faultController) apply(body []byte, supported map[FaultKind]bool) erro
 		}
 		fc.ramp, fc.rampWPerS, fc.effValid = true, spec.MaxRampWPerS, false
 		log.Printf("[fault] ramp_limit: %s armed, rate=%.0f W/s", fc.label, fc.rampWPerS)
+
+	case FaultSocRefuse:
+		fc.refuse = !spec.Clear
+		log.Printf("[fault] soc_refuse: %s armed=%v", fc.label, fc.refuse)
 	}
 	return nil
 }

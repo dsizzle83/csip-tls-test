@@ -71,6 +71,17 @@ const (
 	// output each animation step, not the register write (see faultController
 	// effectiveCeilW).
 	FaultRampLimit FaultKind = "ramp_limit"
+
+	// FaultSocRefuse makes the battery ACCEPT a charge/discharge setpoint (the
+	// write ACKs and the register holds it) but produce ZERO power — its contactor
+	// or BMS declines to source or sink, a protection lockout that does not report
+	// itself. It is the battery's accept-but-do-nothing (the analog of
+	// reject_write for an inverter): a hub that assumes its commanded discharge
+	// took effect keeps importing over a cap it believed the battery would hold.
+	// Caught only by measuring that battery power never moved (INV-CONVERGE) and
+	// falling back to another lever or posting CannotComply. This is an effect-time
+	// fault (see faultController shapeBatteryW).
+	FaultSocRefuse FaultKind = "soc_refuse"
 )
 
 // FaultSpec is the parsed body of POST /fault. A sim interprets the fields
