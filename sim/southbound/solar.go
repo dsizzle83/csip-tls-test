@@ -25,9 +25,7 @@ package sim
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
-	"sync"
 	"time"
 
 	"csip-tls-test/internal/southbound/sunspec"
@@ -46,20 +44,15 @@ type SolarBases struct {
 // It embeds *Server so callers can call srv.Stop(), srv.Regs, srv.Pause(), etc.
 type SolarServer struct {
 	*Server
-	bases SolarBases
-	wmaxW float64
-
-	ack ackBeforeEffect // ack-before-effect fault state (see ApplyFault)
+	bases  SolarBases
+	wmaxW  float64
+	faults faultController // shared fault-injection state (see faults.go)
 }
 
-// ackBeforeEffect holds the state for the FaultAckBeforeEffect injector: when
-// armed, a WMaxLimPct write is acknowledged at the Modbus layer but its effect
-// on the output is deferred by delay.
-type ackBeforeEffect struct {
-	mu    sync.Mutex
-	armed bool
-	delay time.Duration
-	timer *time.Timer // pending effect application; replaced on each new write
+// solarFaultKinds is the set of POST /fault kinds the solar sim advertises.
+var solarFaultKinds = map[FaultKind]bool{
+	FaultAckBeforeEffect: true,
+	FaultRejectWrite:     true,
 }
 
 // NewSolarServer creates and starts an animated PV inverter simulator.
@@ -75,79 +68,24 @@ func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
 		return nil, err
 	}
 	ss := &SolarServer{Server: srv, bases: bases, wmaxW: wmaxW}
+	ss.faults.label = "solar"
 	regs.OnWriteAttempt = ss.interceptWrite
 	return ss, nil
 }
 
-// interceptWrite is the RegisterMap.OnWriteAttempt hook. With no fault armed it
-// is a pass-through (apply=true). When ack-before-effect is armed and the write
-// covers WMaxLimPct, it applies every other register immediately but holds the
-// WMaxLimPct change for ack.delay, so the inverter keeps its previous ceiling
-// (and output) while the hub has already seen the Modbus write succeed.
+// interceptWrite is the RegisterMap.OnWriteAttempt hook. It delegates to the
+// shared faultController, which acts on the inverter's WMaxLimPct control
+// register (see faults.go). With no fault armed it is a pass-through.
 func (ss *SolarServer) interceptWrite(startAddr uint16, vals []uint16) bool {
-	ss.ack.mu.Lock()
-	armed, delay := ss.ack.armed, ss.ack.delay
-	ss.ack.mu.Unlock()
-	if !armed {
-		return true
-	}
-
-	target := ss.bases.M123Base + sunspec.M123_WMaxLimPct
-	off := int(target) - int(startAddr)
-	if off < 0 || off >= len(vals) {
-		return true // write does not touch WMaxLimPct — apply normally
-	}
-
-	// Apply the rest of the write now (e.g. Ena, Conn), hold WMaxLimPct.
-	for i, v := range vals {
-		if i != off {
-			ss.Regs.Set(startAddr+uint16(i), v)
-		}
-	}
-	newVal := vals[off]
-	ss.ack.mu.Lock()
-	if ss.ack.timer != nil {
-		ss.ack.timer.Stop()
-	}
-	ss.ack.timer = time.AfterFunc(delay, func() {
-		ss.Regs.Set(target, newVal)
-		log.Printf("[fault] ack_before_effect: solar WMaxLimPct=%d now in effect (after %s)", newVal, delay)
-	})
-	ss.ack.mu.Unlock()
-	log.Printf("[fault] ack_before_effect: solar WMaxLimPct=%d ACKed, effect deferred %s", newVal, delay)
-	return false // interceptor handled this write
+	cmdAddr := ss.bases.M123Base + sunspec.M123_WMaxLimPct
+	return ss.faults.intercept(ss.Regs, cmdAddr, startAddr, vals)
 }
 
 // ApplyFault arms or clears a fault for this sim. It is wired to simapi's
 // POST /fault. Body is a FaultSpec JSON object. Supported kinds:
-// "ack_before_effect" (delay_s).
+// "ack_before_effect" (delay_s) and "reject_write".
 func (ss *SolarServer) ApplyFault(body []byte) error {
-	var spec FaultSpec
-	if err := json.Unmarshal(body, &spec); err != nil {
-		return fmt.Errorf("fault: %w", err)
-	}
-	switch spec.Kind {
-	case FaultAckBeforeEffect:
-		ss.ack.mu.Lock()
-		defer ss.ack.mu.Unlock()
-		if spec.Clear {
-			ss.ack.armed = false
-			if ss.ack.timer != nil {
-				ss.ack.timer.Stop()
-			}
-			log.Printf("[fault] ack_before_effect: cleared")
-			return nil
-		}
-		if spec.DelayS <= 0 {
-			return fmt.Errorf("fault %q: delay_s must be > 0", spec.Kind)
-		}
-		ss.ack.armed = true
-		ss.ack.delay = time.Duration(spec.DelayS * float64(time.Second))
-		log.Printf("[fault] ack_before_effect: armed, delay=%s", ss.ack.delay)
-		return nil
-	default:
-		return fmt.Errorf("fault: unsupported kind %q (solar supports %q)", spec.Kind, FaultAckBeforeEffect)
-	}
+	return ss.faults.apply(body, solarFaultKinds)
 }
 
 // newAnimatedServer launches the Modbus TCP server and a single animation

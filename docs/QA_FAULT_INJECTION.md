@@ -59,23 +59,38 @@ A sim advertises only the `FaultKind`s it supports and returns `400` for the
 rest. Fault kinds are defined in `sim/southbound/sim.go` (`FaultKind`,
 `FaultSpec`) so all sims share one vocabulary.
 
-### Implemented today: `ack_before_effect`
+### Implemented today: `ack_before_effect`, `reject_write`, `wrong_sign`
 
 ```bash
 # Arm: WMaxLimPct writes ACK at the Modbus layer but take effect 30 s later.
 curl -X POST 69.0.0.10:6020/fault -d '{"kind":"ack_before_effect","delay_s":30}'
-# Clear:
-curl -X POST 69.0.0.10:6020/fault -d '{"kind":"ack_before_effect","clear":true}'
+# Arm: the inverter ACKs the curtailment write but keeps its old ceiling.
+curl -X POST 69.0.0.10:6020/fault -d '{"kind":"reject_write"}'
+# Arm (battery): a commanded charge executes as a discharge.
+curl -X POST 69.0.0.11:6021/fault -d '{"kind":"wrong_sign"}'
+# Clear (any kind):
+curl -X POST 69.0.0.10:6020/fault -d '{"kind":"reject_write","clear":true}'
 ```
 
-Mechanism (`sim/southbound/solar.go`): a new `RegisterMap.OnWriteAttempt` hook
-lets the sim intercept a write *before* it lands. When armed, a write to
-`M123 WMaxLimPct` is acknowledged at the Modbus protocol layer (the client sees
-success) but the value is held for `delay_s` before it reaches the register that
-drives output. This is the precise condition under which a hub that treats
-**write-success == converged** believes a limit is in force before it actually
-is. The hub should instead detect the lag via measurement (INV-CONVERGE).
-Covered by `TestSolarServer_AckBeforeEffectFault`.
+Mechanism: a shared `faultController` (`sim/southbound/faults.go`), embedded by
+each Modbus sim, owns the armed-fault state and the `RegisterMap.OnWriteAttempt`
+write-time semantics; the sim supplies the address of its control register (the
+signed `M123 WMaxLimPct`) and the set of kinds it advertises (`solarFaultKinds`,
+`batteryFaultKinds`). All three kinds let the Modbus layer return success while
+the device misbehaves:
+
+- `ack_before_effect` (solar) — holds the WMaxLimPct change for `delay_s`, so a
+  hub that treats **write-success == converged** believes a limit is in force
+  before it is. The hub should detect the lag via measurement (INV-CONVERGE).
+- `reject_write` (solar) — the control value never lands; the inverter keeps its
+  old ceiling. Accept-but-ignore — the same INV-CONVERGE failure made permanent.
+- `wrong_sign` (battery) — a signed charge command lands as a discharge, walking
+  a low pack toward empty (INV-SOC).
+
+Covered by `TestSolarServer_AckBeforeEffectFault`,
+`TestFaultRejectWrite_DropsControlValue`, `TestFaultWrongSign_InvertsCommand`,
+and the `mayhem` scenarios `reject-write-curtail` / `battery-wrong-sign`
+(diagnosers + invariants unit-tested in `cmd/dashboard/invariants_test.go`).
 
 ---
 
@@ -86,7 +101,7 @@ Each row is a reusable injector keyed to an existing seam. Priority: **P1** firs
 
 | Pri | Layer | Fault kind(s) | Seam | Hub MUST |
 |----|-------|---------------|------|----------|
-| P1 | Physical DER | `ack_before_effect` ✅, `reject_write`, `ramp_limit`, `soc_refuse`, `enable_gate` | sim models + `OnWriteAttempt` | not assume success; re-issue or fall back; alarm on non-convergence |
+| P1 | Physical DER | `ack_before_effect` ✅, `reject_write` ✅, `wrong_sign` ✅, `ramp_limit`, `soc_refuse`, `enable_gate` | sim models + `OnWriteAttempt` | not assume success; re-issue or fall back; alarm on non-convergence |
 | P1 | OCPP | `profile_reject`, `apply_next_tx`, `min_current_floor` (6 A), `stop_metervalues` | `evsim` / CSMS | treat reject/timeout as failure (now returns error after the 2026-06 fix); react, don't just log |
 | P1 | MQTT | `broker_down`, `retained_redeliver`, `dup_out_of_order` | pause/kill Mosquitto; replay driver | fail-safe when control plane is gone; idempotent commands |
 | P2 | Modbus transport | `crc_error`, `exception_code`, `tcp_drop`, `latency`, `nan_sentinel` (0x8000) | sim wrapper / `toxiproxy` on 502x | stale-expire reading; never act on garbage; surface device-down |

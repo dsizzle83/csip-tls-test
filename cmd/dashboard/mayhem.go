@@ -609,6 +609,7 @@ func diagnoseConstraint(sc *mayScenario, cons *activeConstraint, s []maySample) 
 			fmt.Sprintf("Peak %.0f W over for %.0fs with no admission of failure.", m.PeakBreachW, m.BreachSeconds))
 		f.Fix = "This is the closed-loop gap: add measured-effect verification and emit CannotComply when convergence is not observed within deadline (derbase ApplyControl / OCPP applyCommand)."
 	}
+	diag = append(diag, invSummaryLine("INV-EXPORT", invExport(cons, s)))
 	f.Diagnosis = append(diag, hubVsRealLine(s))
 	return f
 }
@@ -744,6 +745,41 @@ func diagnoseRecovery(sc *mayScenario, cons *activeConstraint, s []maySample) ma
 		f.Headline = "solar eventually recovered but slowly / with a dip"
 		f.Diagnosis = []string{"Output returned to potential but not monotonically — the hub re-established control with a delay worth quantifying against your SLA."}
 	}
+	return f
+}
+
+// diagnoseSOC handles battery-direction faults (wrong_sign / soc_refuse): the
+// question is whether the hub keeps the pack inside its SoC envelope when the
+// device misbehaves. It judges by INV-SOC — a battery that discharges at/below
+// the reserve floor (or charges past the ceiling) is an unsafe state the hub
+// must detect and halt, whatever the device did.
+func diagnoseSOC(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+	viol := invSOC(s)
+	if len(viol) == 0 {
+		f.Verdict = "PASS"
+		f.Headline = "battery stayed within its SoC envelope despite the direction fault"
+		f.Diagnosis = []string{
+			invSummaryLine("INV-SOC", viol),
+			"The pack never discharged below its reserve floor nor charged past its ceiling — the hub kept it safe even though the device was commanded the wrong way.",
+		}
+		return f
+	}
+	f.Verdict = "FAIL"
+	f.Headline = fmt.Sprintf("battery breached its SoC envelope on %d samples", len(viol))
+	f.Diagnosis = []string{
+		invSummaryLine("INV-SOC", viol),
+		"The battery moved the wrong way at its SoC bound (a commanded charge landed as a discharge, or vice versa) and the hub did not detect the divergence and halt it.",
+		"A hub that trusts its own command without verifying the pack's measured direction will walk a low battery toward empty — the silent-actuation failure INV-SOC exists to catch.",
+		decisionLine(s),
+	}
+	f.Fix = "Verify measured battery power direction/SoC trend against the commanded sign; halt and alarm when the pack moves opposite to the command (orchestrator battery adapter)."
 	return f
 }
 
@@ -1101,6 +1137,8 @@ func (d *mayhemDriver) baseline() error {
 		return fmt.Errorf("meter sim: %w", err)
 	}
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
+	_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
+	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 	_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
@@ -1139,6 +1177,8 @@ func (d *mayhemDriver) restoreBench() {
 		d.deleteControls(prog)
 	}
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
+	_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
+	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 	_ = d.post("solar", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("battery", "/inject", map[string]any{"Conn": 1, "WMaxLimPct_pct": 0})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
@@ -1214,6 +1254,48 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			evaluate: diagnoseConverge,
 			teardown: func(d *mayhemDriver) {
 				_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
+			},
+		},
+		{
+			ID: "reject-write-curtail", Name: "Inverter ACKs the curtailment but ignores it",
+			Category:   "Closed-loop actuation (INV-CONVERGE)",
+			Hypothesis: "A real inverter accepts the WMaxLimPct write over Modbus (ACK) but silently keeps producing at its old ceiling — accept-but-ignore. The hub believes the limit is in force the moment the write succeeds.",
+			Expected:   "Detect via measurement that output never reached the commanded limit and react (post CannotComply, or use another lever) — never keep reporting compliance it does not have.",
+			HoldS:      50,
+			Fix:        "Add measured-effect verification to derbase.ApplyControl; today it is write-only. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // battery full → PV curtailment is the only lever
+				d.injectEnv(d.pvHighW, loadLow)
+				if err := d.post("solar", "/fault", map[string]any{"kind": "reject_write"}); err != nil {
+					return nil, fmt.Errorf("arm reject_write: %w", err)
+				}
+				return d.postCap("genLimit", 1000, 50, "mayhem: gen limit 1 kW vs an inverter that ignores it")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseConverge,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
+			},
+		},
+		{
+			ID: "battery-wrong-sign", Name: "Battery executes a commanded charge as a discharge",
+			Category:   "Resource limits (INV-SOC)",
+			Hypothesis: "A battery wired or firmware-flipped in the wrong direction: when the hub commands a charge to soak up excess PV, the pack discharges instead, walking an already-low state of charge toward empty.",
+			Expected:   "Detect the pack moving opposite to the command (SoC falling under a charge command) and halt/alarm before it discharges below the reserve floor.",
+			HoldS:      60,
+			Fix:        "Verify measured battery direction/SoC trend against the commanded sign in the orchestrator battery adapter. (Demonstrates robustness under SIMULATED abuse; the BatteryW sign convention must be confirmed against the live hub /status before trusting the verdict.)",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 12, "Conn": 1}) // low, just above the 10% reserve floor
+				d.injectEnv(d.pvHighW, loadLow)                                            // excess PV → hub wants to charge the battery
+				if err := d.post("battery", "/fault", map[string]any{"kind": "wrong_sign"}); err != nil {
+					return nil, fmt.Errorf("arm wrong_sign: %w", err)
+				}
+				return d.postCap("exportCap", 0, 60, "mayhem: zero export cap drives a battery charge (flipped to discharge)")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseSOC,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 			},
 		},
 		{

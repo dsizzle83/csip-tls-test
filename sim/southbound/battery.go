@@ -47,6 +47,13 @@ type BatteryServer struct {
 	// goroutine so it seeds the integrator from the injected SOC rather than
 	// from whatever the sinusoidal animation last wrote to the register.
 	pendingSoC atomic.Pointer[float64]
+	faults     faultController // shared fault-injection state (see faults.go)
+}
+
+// batteryFaultKinds is the set of POST /fault kinds the battery sim advertises.
+var batteryFaultKinds = map[FaultKind]bool{
+	FaultRejectWrite: true,
+	FaultWrongSign:   true,
 }
 
 // NewBatteryServer creates and starts an animated Li-Ion battery simulator.
@@ -65,6 +72,12 @@ func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer,
 
 	// Allocate bs first so the animation closure can reference bs.pendingSoC.
 	bs := &BatteryServer{bases: bases, wmaxW: wmaxW, wmaxKwh: wmaxKwh}
+	bs.faults.label = "battery"
+
+	// Intercept control writes BEFORE they land so reject_write / wrong_sign can
+	// alter the commanded WMaxLimPct; the OnWrite hook above still fires after
+	// and reflects whatever value actually landed into the power registers.
+	regs.OnWriteAttempt = bs.interceptWrite
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
 		animateBattery(s, r, wmaxW, wmaxKwh, bases, &bs.pendingSoC, stop)
@@ -74,6 +87,21 @@ func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer,
 	}
 	bs.Server = srv
 	return bs, nil
+}
+
+// interceptWrite is the RegisterMap.OnWriteAttempt hook. It delegates to the
+// shared faultController acting on the battery's signed WMaxLimPct control
+// register (negative=charge, positive=discharge). With no fault armed it is a
+// pass-through.
+func (bs *BatteryServer) interceptWrite(startAddr uint16, vals []uint16) bool {
+	cmdAddr := bs.bases.M123Base + sunspec.M123_WMaxLimPct
+	return bs.faults.intercept(bs.Regs, cmdAddr, startAddr, vals)
+}
+
+// ApplyFault arms or clears a fault for this sim. It is wired to simapi's
+// POST /fault. Supported kinds: "reject_write" and "wrong_sign".
+func (bs *BatteryServer) ApplyFault(body []byte) error {
+	return bs.faults.apply(body, batteryFaultKinds)
 }
 
 // ── Snapshot ──────────────────────────────────────────────────────────────────

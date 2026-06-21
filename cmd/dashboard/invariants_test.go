@@ -1,0 +1,118 @@
+package main
+
+import "testing"
+
+// invExport excuses a bounded opening ramp but flags a sustained post-deadline
+// breach.
+func TestInvExport_ExcusesRampFlagsSustained(t *testing.T) {
+	cons := exportCons() // exportCap ≤ 0 W
+
+	// Breach only in the opening settling window (t ≤ deadline): no violation.
+	ramp := mkSamples(int(mayConvergeDeadlineS), func(i int, s *maySample) {
+		s.RealGridW = -2000 // 2 kW export, over the 0 cap
+	})
+	if v := invExport(cons, ramp); len(v) != 0 {
+		t.Fatalf("opening-ramp breach should be excused, got %d violations", len(v))
+	}
+
+	// Breach that persists past the deadline: every late sample is a violation.
+	sustained := mkSamples(int(mayConvergeDeadlineS)+20, func(i int, s *maySample) {
+		s.RealGridW = -2000
+	})
+	v := invExport(cons, sustained)
+	if len(v) != 19 { // samples at t = deadline+1 .. deadline+19 (strictly > deadline)
+		t.Fatalf("sustained breach: got %d violations, want 19", len(v))
+	}
+	if v[0].Inv != "INV-EXPORT" {
+		t.Errorf("violation name = %q, want INV-EXPORT", v[0].Inv)
+	}
+}
+
+// invConverge flags a sustained breach with no admission, but excuses one the
+// hub admitted via CannotComply.
+func TestInvConverge_AdmissionClearsViolation(t *testing.T) {
+	cons := &activeConstraint{Typ: "genLimit", LimW: 1000, MRID: "M-gen"}
+
+	mut := func(i int, s *maySample) {
+		s.SolarW = 4000 // 4 kW, well over the 1 kW gen limit
+		s.SolarPossibleW = 6000
+	}
+	breach := mkSamples(int(mayConvergeDeadlineS)+15, mut)
+	if v := invConverge(cons, breach); len(v) == 0 {
+		t.Fatal("unadmitted sustained breach should violate INV-CONVERGE")
+	} else if v[0].Inv != "INV-CONVERGE" {
+		t.Errorf("violation name = %q, want INV-CONVERGE", v[0].Inv)
+	}
+
+	admitted := mkSamples(int(mayConvergeDeadlineS)+15, func(i int, s *maySample) {
+		mut(i, s)
+		s.CannotComply = true // the hub admitted the limit
+	})
+	if v := invConverge(cons, admitted); len(v) != 0 {
+		t.Fatalf("admitted breach should clear INV-CONVERGE, got %d violations", len(v))
+	}
+}
+
+// invSOC flags discharging at/below the reserve floor and charging at/above the
+// ceiling, and passes a healthy mid-SoC timeline.
+func TestInvSOC_FlagsWrongWayAtBounds(t *testing.T) {
+	// Discharging while empty (the wrong_sign danger): violation.
+	empty := mkSamples(10, func(i int, s *maySample) {
+		s.BatSOC = 8 // below the 10% reserve floor
+		s.BatteryW = 1500
+	})
+	if v := invSOC(empty); len(v) == 0 {
+		t.Fatal("discharging below the reserve floor should violate INV-SOC")
+	} else if v[0].Inv != "INV-SOC" {
+		t.Errorf("violation name = %q, want INV-SOC", v[0].Inv)
+	}
+
+	// Charging while full: violation.
+	full := mkSamples(10, func(i int, s *maySample) {
+		s.BatSOC = 97 // above the 95% ceiling
+		s.BatteryW = -1500
+	})
+	if v := invSOC(full); len(v) == 0 {
+		t.Fatal("charging above the ceiling should violate INV-SOC")
+	}
+
+	// Healthy mid-SoC discharge: no violation.
+	healthy := mkSamples(10, func(i int, s *maySample) {
+		s.BatSOC = 55
+		s.BatteryW = 1500
+	})
+	if v := invSOC(healthy); len(v) != 0 {
+		t.Fatalf("mid-SoC discharge should not violate INV-SOC, got %d", len(v))
+	}
+
+	// Idle near the floor (|W| below the active threshold): no violation.
+	idle := mkSamples(10, func(i int, s *maySample) {
+		s.BatSOC = 8
+		s.BatteryW = 10 // below invSocActiveW
+	})
+	if v := invSOC(idle); len(v) != 0 {
+		t.Fatalf("idle battery at the floor should not violate INV-SOC, got %d", len(v))
+	}
+}
+
+// diagnoseSOC turns an INV-SOC violation into a FAIL and a clean timeline into a
+// PASS.
+func TestDiagnoseSOC_Verdicts(t *testing.T) {
+	cons := &activeConstraint{Typ: "exportCap", LimW: 0, MRID: "M-bat"}
+
+	bad := mkSamples(20, func(i int, s *maySample) {
+		s.BatSOC = 7
+		s.BatteryW = 1800 // discharging while empty
+	})
+	if f := diagnoseSOC(scFor("battery-wrong-sign"), cons, bad); f.Verdict != "FAIL" {
+		t.Fatalf("wrong-way discharge verdict = %q, want FAIL", f.Verdict)
+	}
+
+	good := mkSamples(20, func(i int, s *maySample) {
+		s.BatSOC = 60
+		s.BatteryW = -1200 // charging, healthy mid SoC
+	})
+	if f := diagnoseSOC(scFor("battery-wrong-sign"), cons, good); f.Verdict != "PASS" {
+		t.Fatalf("healthy charge verdict = %q, want PASS", f.Verdict)
+	}
+}

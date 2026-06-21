@@ -35,6 +35,21 @@ const (
 	// physically moves — the case where a hub that assumes write-success ==
 	// converged will believe a limit is in force before it actually is.
 	FaultAckBeforeEffect FaultKind = "ack_before_effect"
+
+	// FaultRejectWrite makes a control write ACK at the Modbus layer while the
+	// device silently keeps its previous setpoint — the value never lands. It
+	// models an actuator that accepts a command and ignores it (accept-but-
+	// ignore). A hub that trusts the write ACK never sees the limit take hold;
+	// only measured-effect verification (INV-CONVERGE) catches it.
+	FaultRejectWrite FaultKind = "reject_write"
+
+	// FaultWrongSign applies a signed control command (e.g. the battery's
+	// signed WMaxLimPct, negative=charge / positive=discharge) with its sign
+	// inverted, so a commanded charge becomes a discharge and vice versa. It
+	// models a device wired or firmware-flipped in the wrong direction; the
+	// danger (discharging toward empty when told to charge) is caught by
+	// INV-SOC.
+	FaultWrongSign FaultKind = "wrong_sign"
 )
 
 // FaultSpec is the parsed body of POST /fault. A sim interprets the fields
