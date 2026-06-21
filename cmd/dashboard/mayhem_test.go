@@ -214,6 +214,43 @@ func TestDiagnoseConverge_UnreportedLagFails(t *testing.T) {
 	assertDiag(t, f, "ACKed")
 }
 
+func TestDiagnoseConverge_RampingTowardLimitIsDegraded(t *testing.T) {
+	// Output slews from far over the cap down toward it, still slightly over at the
+	// end — a bounded slew (ramp_limit), not an ignore. Must be DEGRADED, not FAIL.
+	cons := &activeConstraint{Typ: "genLimit", LimW: 1000, MRID: "M-ramp"}
+	s := mkSamples(40, func(i int, smp *maySample) {
+		smp.HubAdopted, smp.AdoptedTyp = true, "genLimit"
+		w := 5000.0 - float64(i)*110.0 // slews down ~110/sample
+		if w < 1150 {
+			w = 1150 // lands just above the 1000 cap
+		}
+		smp.SolarW = w
+	})
+	f := diagnoseConverge(scFor("ramp"), cons, s)
+	if f.Verdict != "DEGRADED" {
+		t.Fatalf("verdict = %s, want DEGRADED (slewing toward the limit)", f.Verdict)
+	}
+	if !f.Metrics.BreachConverging {
+		t.Error("BreachConverging should be true for a shrinking breach")
+	}
+}
+
+func TestDiagnoseConverge_FlatBreachStaysFail(t *testing.T) {
+	// A flat, never-moving breach (ignore) must NOT be mistaken for a slew.
+	cons := &activeConstraint{Typ: "genLimit", LimW: 1000, MRID: "M-flat"}
+	s := mkSamples(40, func(i int, smp *maySample) {
+		smp.HubAdopted, smp.AdoptedTyp = true, "genLimit"
+		smp.SolarW = 5000 // held flat over the cap
+	})
+	f := diagnoseConverge(scFor("flat"), cons, s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (flat breach, not converging)", f.Verdict)
+	}
+	if f.Metrics.BreachConverging {
+		t.Error("BreachConverging should be false for a flat breach")
+	}
+}
+
 func TestDiagnoseConverge_ReportedLagIsDegraded(t *testing.T) {
 	cons := &activeConstraint{Typ: "genLimit", LimW: 1000, MRID: "M-gen"}
 	s := mkSamples(10, func(i int, s *maySample) {

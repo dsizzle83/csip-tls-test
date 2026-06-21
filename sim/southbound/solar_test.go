@@ -39,7 +39,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 		injectPotential(r, b, 6000)
 		curtailTo(r, b, 2000) // hub caps generation at 2000W
 		var wh uint16
-		solarStep(r, wmax, b, true /*paused*/, 0, &wh)
+		solarStep(r, wmax, b, true /*paused*/, 0, nil, &wh)
 		if got := readW(r, b); got != 2000 {
 			t.Errorf("paused output = %.0fW, want 2000W (curtailed)", got)
 		}
@@ -51,7 +51,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 		// WMaxLimPct disabled (Ena=0) → no clip.
 		r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 0)
 		var wh uint16
-		solarStep(r, wmax, b, true, 0, &wh)
+		solarStep(r, wmax, b, true, 0, nil, &wh)
 		if got := readW(r, b); got != 6000 {
 			t.Errorf("paused output = %.0fW, want 6000W (uncurtailed)", got)
 		}
@@ -62,7 +62,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 		injectPotential(r, b, 3000)
 		curtailTo(r, b, 5000) // ceiling above potential
 		var wh uint16
-		solarStep(r, wmax, b, true, 0, &wh)
+		solarStep(r, wmax, b, true, 0, nil, &wh)
 		if got := readW(r, b); got != 3000 {
 			t.Errorf("paused output = %.0fW, want 3000W (potential, ceiling higher)", got)
 		}
@@ -111,7 +111,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 		injectPotential(r, b, 6000)
 		r.Set(b.M123Base+sunspec.M123_Conn, 0)
 		var wh uint16
-		solarStep(r, wmax, b, true, 0, &wh)
+		solarStep(r, wmax, b, true, 0, nil, &wh)
 		if got := readW(r, b); got != 0 {
 			t.Errorf("disconnected output = %.0fW, want 0W", got)
 		}
@@ -148,7 +148,7 @@ func TestSolarServer_AckBeforeEffectFault(t *testing.T) {
 	// During the delay the inverter still produces at the OLD (100%) ceiling.
 	r.Set(b.M122Base+sunspec.M122_WAval, uint16(int16(6000)))
 	var wh uint16
-	solarStep(r, wmax, b, true, 0, &wh)
+	solarStep(r, wmax, b, true, 0, nil, &wh)
 	if got := readW(); got != 6000 {
 		t.Fatalf("output during delay = %.0fW, want 6000W (curtailment not yet in effect)", got)
 	}
@@ -161,7 +161,7 @@ func TestSolarServer_AckBeforeEffectFault(t *testing.T) {
 	if got := r.Get(target); got != curtailRaw {
 		t.Fatalf("WMaxLimPct after delay = %d, want %d (effect applied)", got, curtailRaw)
 	}
-	solarStep(r, wmax, b, true, 0, &wh)
+	solarStep(r, wmax, b, true, 0, nil, &wh)
 	if got := readW(); got != 2000 {
 		t.Fatalf("output after delay = %.0fW, want 2000W (curtailed)", got)
 	}

@@ -59,14 +59,27 @@ const (
 	// reject_write, since register readback looks compliant. Only measured-effect
 	// verification (INV-CONVERGE) catches it.
 	FaultEnableGate FaultKind = "enable_gate"
+
+	// FaultRampLimit accepts a limit instantly (the control register holds the
+	// commanded value with the enable set) but slews the device's PHYSICAL output
+	// toward the new ceiling at a bounded rate (MaxRampWPerS) instead of snapping
+	// to it. It models an actuator with a real slew rate — unlike reject_write /
+	// enable_gate (which never converge), the device DOES reach the limit, just
+	// not immediately. The hub must tolerate a bounded convergence ramp and only
+	// flag (never silently fail) if output is still over the limit past the
+	// compliance deadline. This is an effect-time fault: it shapes the physical
+	// output each animation step, not the register write (see faultController
+	// effectiveCeilW).
+	FaultRampLimit FaultKind = "ramp_limit"
 )
 
 // FaultSpec is the parsed body of POST /fault. A sim interprets the fields
 // relevant to Kind; Clear removes a previously-armed fault of that Kind.
 type FaultSpec struct {
-	Kind   FaultKind `json:"kind"`
-	DelayS float64   `json:"delay_s,omitempty"` // ack_before_effect: effect delay (seconds)
-	Clear  bool      `json:"clear,omitempty"`   // when true, disarm this Kind
+	Kind         FaultKind `json:"kind"`
+	DelayS       float64   `json:"delay_s,omitempty"`          // ack_before_effect: effect delay (seconds)
+	MaxRampWPerS float64   `json:"max_ramp_w_per_s,omitempty"` // ramp_limit: output slew rate (W/s)
+	Clear        bool      `json:"clear,omitempty"`            // when true, disarm this Kind
 }
 
 // RegisterMap is a thread-safe Modbus holding-register store. It doubles as

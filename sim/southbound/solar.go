@@ -54,6 +54,7 @@ var solarFaultKinds = map[FaultKind]bool{
 	FaultAckBeforeEffect: true,
 	FaultRejectWrite:     true,
 	FaultEnableGate:      true,
+	FaultRampLimit:       true,
 }
 
 // NewSolarServer creates and starts an animated PV inverter simulator.
@@ -62,17 +63,41 @@ func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	bases := populateSolar(regs, wmaxW)
 
+	// Allocate ss first so the animation closure can shape output through its
+	// faultController (the effect-time ramp_limit fault).
+	ss := &SolarServer{bases: bases, wmaxW: wmaxW}
+	ss.faults.label = "solar"
+	ss.faults.configureGate(bases.M123Base + sunspec.M123_WMaxLimPct_Ena)
+
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
-		animateSolar(s, r, wmaxW, bases, stop)
+		animateSolar(s, r, wmaxW, bases, &ss.faults, stop)
 	})
 	if err != nil {
 		return nil, err
 	}
-	ss := &SolarServer{Server: srv, bases: bases, wmaxW: wmaxW}
-	ss.faults.label = "solar"
-	ss.faults.configureGate(bases.M123Base + sunspec.M123_WMaxLimPct_Ena)
+	ss.Server = srv
 	regs.OnWriteAttempt = ss.interceptWrite
 	return ss, nil
+}
+
+// solarCeilingW is the single source of truth for the output ceiling (W) the
+// inverter honours this update: the hub's WMaxLimPct limit when enabled (else
+// full nameplate), shaped by any effect-time fault. fc may be nil (no effect
+// faults). Both Inject and solarStep use it so the commanded limit, the device's
+// physical response, and the meter-visible output never diverge.
+func solarCeilingW(r *RegisterMap, bases SolarBases, wmaxW float64, fc *faultController) float64 {
+	limW := wmaxW
+	if r.Get(bases.M123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
+		limPct := sunspec.ApplyScaleSigned(
+			r.Get(bases.M123Base+sunspec.M123_WMaxLimPct),
+			int16(r.Get(bases.M123Base+sunspec.M123_WMaxLimPct_SF)),
+		)
+		limW = wmaxW * math.Max(0, limPct) / 100.0
+	}
+	if fc != nil {
+		limW = fc.effectiveCeilW(limW)
+	}
+	return limW
 }
 
 // interceptWrite is the RegisterMap.OnWriteAttempt hook. It delegates to the
@@ -223,19 +248,12 @@ func (ss *SolarServer) Inject(body []byte) error {
 			// the held output would ignore the hub's curtailment commands.
 			r.Set(b.M122Base+sunspec.M122_WAval, uint16(int16(math.Round(val))))
 			// Write the live output as the CURTAILED value (potential clipped by
-			// any active WMaxLimPct), not the raw potential.  Writing the full
-			// potential here would briefly expose an uncurtailed reading between
-			// the inject and the next animation tick — which the linked meter can
-			// sample, spiking export over an active cap for one tick.
-			w := val
-			if r.Get(b.M123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
-				limPct := sunspec.ApplyScaleSigned(
-					r.Get(b.M123Base+sunspec.M123_WMaxLimPct),
-					int16(r.Get(b.M123Base+sunspec.M123_WMaxLimPct_SF)),
-				)
-				limW := ss.wmaxW * math.Max(0, limPct) / 100.0
-				w = math.Min(w, limW)
-			}
+			// the honoured ceiling — WMaxLimPct shaped by any effect-time fault),
+			// not the raw potential.  Writing the full potential here would briefly
+			// expose an uncurtailed reading between the inject and the next
+			// animation tick — which the linked meter can sample, spiking export
+			// over an active cap for one tick.
+			w := math.Min(val, solarCeilingW(r, b, ss.wmaxW, &ss.faults))
 			r.Set(b.M103Base+sunspec.M103_W,
 				sunspec.RawFromScaleSigned(w, sf(b.M103Base+sunspec.M103_W_SF)))
 		case "V_V":
@@ -399,7 +417,7 @@ func populateSolar(r *RegisterMap, wmaxW float64) SolarBases {
 
 // ── animation ─────────────────────────────────────────────────────────────────
 
-func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, stop <-chan struct{}) {
+func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, fc *faultController, stop <-chan struct{}) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 
@@ -410,7 +428,7 @@ func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, st
 		case <-stop:
 			return
 		case <-tick.C:
-			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), &whAcc)
+			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), fc, &whAcc)
 		}
 	}
 }
@@ -423,7 +441,7 @@ func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, st
 // time-varying environment, but still applies the hub's WMaxLimPct — the
 // property the bench replay depends on, since the replay pauses this sim and
 // injects PV each tick while expecting curtailment to take effect.
-func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, simTime float64, whAcc *uint16) {
+func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, simTime float64, fc *faultController, whAcc *uint16) {
 	m103Base := bases.M103Base
 	m122Base := bases.M122Base
 	m123Base := bases.M123Base
@@ -481,17 +499,11 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 	// WAval is the available (uncurtailed) potential.
 	r.Set(m122Base+sunspec.M122_WAval, uint16(int16(math.Round(potW))))
 
-	// Apply WMaxLimPct from M123 (written by the hub over Modbus) — in both
-	// running and paused modes, so the hub can curtail a held value.
-	w := potW
-	if r.Get(m123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
-		limPct := sunspec.ApplyScaleSigned(
-			r.Get(m123Base+sunspec.M123_WMaxLimPct),
-			int16(r.Get(m123Base+sunspec.M123_WMaxLimPct_SF)),
-		)
-		limW := wmaxW * math.Max(0, limPct) / 100.0
-		w = math.Min(w, limW)
-	}
+	// Clip the potential to the honoured ceiling — the hub's WMaxLimPct (when
+	// enabled) shaped by any effect-time fault (ramp_limit) — in both running and
+	// paused modes, so the hub can curtail a held value and a slewing device
+	// ramps toward it.
+	w := math.Min(potW, solarCeilingW(r, bases, wmaxW, fc))
 
 	// Power-derived registers (depend on the curtailed w).
 	va := w / pf

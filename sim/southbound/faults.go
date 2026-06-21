@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"time"
 )
@@ -51,6 +52,63 @@ type faultController struct {
 	gate     bool
 	gateAddr uint16
 	hasGate  bool
+
+	// ramp_limit (effect-time): the device accepts the limit instantly but its
+	// physical output ceiling slews toward the command at rampWPerS. effCeilW is
+	// the current honoured ceiling; effValid is false until the first shaping call
+	// seeds it (so arming never causes a jump). nowFn is an injectable clock for
+	// deterministic tests (nil → time.Now). See effectiveCeilW.
+	ramp      bool
+	rampWPerS float64
+	effCeilW  float64
+	effValid  bool
+	lastEffT  time.Time
+	nowFn     func() time.Time
+}
+
+func (fc *faultController) now() time.Time {
+	if fc.nowFn != nil {
+		return fc.nowFn()
+	}
+	return time.Now()
+}
+
+// effectiveCeilW shapes the device's commanded output ceiling (W) into the
+// ceiling it physically honours this update, applying the ramp_limit effect-time
+// fault: when armed, the honoured ceiling slews toward the command at rampWPerS
+// (W/s) using elapsed wall time, modelling an actuator with a bounded slew rate
+// rather than an instant jump. With no effect fault armed it returns
+// commandedCeilW unchanged and resets the slew so a later arming starts fresh.
+//
+// It is driven by elapsed time, not call count, so the 1 Hz Inject path and the
+// 5 s animation step can both call it and the total slew tracks the wall clock.
+func (fc *faultController) effectiveCeilW(commandedCeilW float64) float64 {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if !fc.ramp {
+		fc.effValid = false
+		return commandedCeilW
+	}
+	now := fc.now()
+	if !fc.effValid {
+		fc.effCeilW = commandedCeilW // seed at the current command — no jump on arm
+		fc.effValid = true
+		fc.lastEffT = now
+		return fc.effCeilW
+	}
+	dt := now.Sub(fc.lastEffT).Seconds()
+	fc.lastEffT = now
+	if dt <= 0 {
+		return fc.effCeilW
+	}
+	step := fc.rampWPerS * dt
+	switch {
+	case commandedCeilW > fc.effCeilW:
+		fc.effCeilW = math.Min(commandedCeilW, fc.effCeilW+step)
+	case commandedCeilW < fc.effCeilW:
+		fc.effCeilW = math.Max(commandedCeilW, fc.effCeilW-step)
+	}
+	return fc.effCeilW
 }
 
 // configureGate wires the enable-flag register the FaultEnableGate fault holds
@@ -185,6 +243,18 @@ func (fc *faultController) apply(body []byte, supported map[FaultKind]bool) erro
 		}
 		fc.gate = !spec.Clear
 		log.Printf("[fault] enable_gate: %s armed=%v", fc.label, fc.gate)
+
+	case FaultRampLimit:
+		if spec.Clear {
+			fc.ramp, fc.effValid = false, false
+			log.Printf("[fault] ramp_limit: %s cleared", fc.label)
+			return nil
+		}
+		if spec.MaxRampWPerS <= 0 {
+			return fmt.Errorf("fault %q: max_ramp_w_per_s must be > 0", spec.Kind)
+		}
+		fc.ramp, fc.rampWPerS, fc.effValid = true, spec.MaxRampWPerS, false
+		log.Printf("[fault] ramp_limit: %s armed, rate=%.0f W/s", fc.label, fc.rampWPerS)
 	}
 	return nil
 }

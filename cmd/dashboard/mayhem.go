@@ -79,17 +79,18 @@ type maySample struct {
 
 // mayMetrics is the quantified outcome of a scenario.
 type mayMetrics struct {
-	Samples         int     `json:"samples"`
-	SampleErrors    int     `json:"sample_errors"`
-	BreachSeconds   float64 `json:"breach_seconds"`
-	PeakBreachW     float64 `json:"peak_breach_W"`
-	RecoverySeconds float64 `json:"recovery_seconds"` // -1 = n/a or never recovered
-	ConvergedAtS    float64 `json:"converged_at_s"`   // earliest time after which every sample is within cap; -1 = never
-	TailClean       bool    `json:"tail_clean"`       // the last mayConvergeHoldS seconds are all within cap
-	HubAdopted      bool    `json:"hub_adopted"`
-	HubReacted      bool    `json:"hub_reacted"`
-	ReportedCannot  bool    `json:"reported_cannot_comply"`
-	HubBlind        bool    `json:"hub_blind"`
+	Samples          int     `json:"samples"`
+	SampleErrors     int     `json:"sample_errors"`
+	BreachSeconds    float64 `json:"breach_seconds"`
+	PeakBreachW      float64 `json:"peak_breach_W"`
+	RecoverySeconds  float64 `json:"recovery_seconds"`  // -1 = n/a or never recovered
+	ConvergedAtS     float64 `json:"converged_at_s"`    // earliest time after which every sample is within cap; -1 = never
+	TailClean        bool    `json:"tail_clean"`        // the last mayConvergeHoldS seconds are all within cap
+	BreachConverging bool    `json:"breach_converging"` // breach is shrinking toward the cap (a slew), not holding flat (an ignore)
+	HubAdopted       bool    `json:"hub_adopted"`
+	HubReacted       bool    `json:"hub_reacted"`
+	ReportedCannot   bool    `json:"reported_cannot_comply"`
+	HubBlind         bool    `json:"hub_blind"`
 }
 
 // mayFinding is the per-scenario verdict plus the root-cause story.
@@ -466,6 +467,7 @@ func scanSamples(cons *activeConstraint, s []maySample) mayMetrics {
 	m.HubAdopted = adopted > 0
 	m.HubReacted = reacted > len(s)/4
 	m.ConvergedAtS, m.TailClean = convergence(cons, s)
+	m.BreachConverging = breachConverging(cons, s)
 	// NOTE: HubBlind is intentionally NOT derived from hub-vs-meter grid
 	// divergence here. The hub_grid value is lexa-api's MQTT-relayed display,
 	// which lags the meter's direct register during fast changes — the optimizer
@@ -517,6 +519,41 @@ func convergence(cons *activeConstraint, s []maySample) (convergedAtS float64, t
 		tailClean = false
 	}
 	return convergedAtS, tailClean
+}
+
+// breachConverging reports whether a constraint breach is trending toward
+// compliance — the overage late in the window is well below its peak — rather
+// than holding flat over the limit. It is the signature that separates a device
+// SLEWING to the limit (ramp_limit: the overage shrinks toward zero) from one
+// IGNORING it (reject_write/enable_gate: the overage stays near its peak). The
+// diagnosers use it to call a still-settling slew DEGRADED rather than a FAIL,
+// independent of exactly where the observation window happens to end.
+func breachConverging(cons *activeConstraint, s []maySample) bool {
+	if len(s) < 4 {
+		return false
+	}
+	var peakOver float64
+	for _, smp := range s {
+		if o := breachOver(cons, smp); o > peakOver {
+			peakOver = o
+		}
+	}
+	if peakOver <= 0 {
+		return false // no real breach to converge from
+	}
+	// Mean overage over the last few samples (≥0), smoothing single-sample noise.
+	n := 3
+	if n > len(s) {
+		n = len(s)
+	}
+	var tail float64
+	for _, smp := range s[len(s)-n:] {
+		if o := breachOver(cons, smp); o > 0 {
+			tail += o
+		}
+	}
+	tail /= float64(n)
+	return tail < 0.5*peakOver
 }
 
 // diagnoseConstraint is the core fault analyser for export/import/gen-cap
@@ -640,6 +677,20 @@ func diagnoseConverge(sc *mayScenario, cons *activeConstraint, s []maySample) ma
 		// there without an explicit admission — acceptable, but slow.
 		f.Headline = "device honoured the write late; hub converged once it did"
 		f.Diagnosis = append([]string{"The device ACKed the curtailment at the Modbus layer but withheld the effect (injected fault). The hub drove it within the cap only after the effect landed, not on the ACK."}, f.Diagnosis...)
+		return f
+	}
+	if f.Metrics.BreachConverging {
+		// The output is slewing toward the cap (the overage shrank well below its
+		// peak) but had not fully arrived when the window closed — a bounded slew,
+		// not an ignored command. This is a settling-time concern, not blindness;
+		// it is distinct from a flat, never-moving breach (which falls through to
+		// FAIL below).
+		f.Verdict = "DEGRADED"
+		f.Headline = "device is slewing to the limit; still converging when the window ended"
+		f.Diagnosis = append([]string{
+			"The device ACKed the curtailment and its MEASURED output is ramping toward the limit — the overage shrank far below its peak — but it had not fully reached the cap when the window ended. A bounded slew, not an ignored command.",
+			"Give the device its rated settling time (longer window) or tighten its slew rate; this is a time-to-comply concern, not a closed-loop blindness.",
+		}, f.Diagnosis...)
 		return f
 	}
 	f.Verdict = "FAIL"
@@ -1176,6 +1227,7 @@ func (d *mayhemDriver) baseline() error {
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
 	_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
 	_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
+	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 	_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
@@ -1217,6 +1269,7 @@ func (d *mayhemDriver) restoreBench() {
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
 	_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
 	_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
+	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 	_ = d.post("solar", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("battery", "/inject", map[string]any{"Conn": 1, "WMaxLimPct_pct": 0})
@@ -1335,6 +1388,27 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			evaluate: diagnoseConverge,
 			teardown: func(d *mayhemDriver) {
 				_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
+			},
+		},
+		{
+			ID: "ramp-limit-curtail", Name: "Inverter honours the limit but ramps to it slowly",
+			Category:   "Closed-loop actuation (INV-CONVERGE)",
+			Hypothesis: "An inverter accepts the curtailment instantly (register set) but slews its physical output toward the new ceiling at a bounded rate, sitting over the limit during the ramp before converging. Unlike an ignored write, it DOES reach the limit — just not immediately.",
+			Expected:   "Tolerate a bounded convergence ramp: the limit is reached within the device's slew time. Flag DEGRADED only if convergence exceeds the compliance deadline; never a silent FAIL, and never a spurious CannotComply while it is still converging.",
+			HoldS:      100, // hub sticky-guard latency + the device's 120 W/s slew need ~75s; leave a clean tail
+			Fix:        "Distinguish 'converging toward the limit' from 'ignoring the limit' via the measured-output trend; allow a bounded settling window before escalating. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // battery full → PV curtailment is the only lever
+				d.injectEnv(d.pvHighW, loadLow)
+				if err := d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "max_ramp_w_per_s": 120}); err != nil {
+					return nil, fmt.Errorf("arm ramp_limit: %w", err)
+				}
+				return d.postCap("genLimit", 1000, 100, "mayhem: gen limit 1 kW vs an inverter that slews to it")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseConverge,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
 			},
 		},
 		{

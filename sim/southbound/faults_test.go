@@ -2,9 +2,57 @@ package sim
 
 import (
 	"testing"
+	"time"
 
 	"csip-tls-test/internal/southbound/sunspec"
 )
+
+// TestFaultRampLimit_SlewsTowardCommand verifies the effect-time ramp_limit
+// injector: the honoured output ceiling slews toward the commanded ceiling at the
+// configured rate using elapsed wall time, rather than snapping to it — and
+// reaches the command without overshoot. Uses an injected clock for determinism.
+func TestFaultRampLimit_SlewsTowardCommand(t *testing.T) {
+	supported := map[FaultKind]bool{FaultRampLimit: true}
+	fc := &faultController{label: "solar"}
+	var now time.Time
+	fc.nowFn = func() time.Time { return now }
+
+	// Unarmed: identity pass-through.
+	if got := fc.effectiveCeilW(3000); got != 3000 {
+		t.Fatalf("unarmed effectiveCeilW = %v, want 3000 (identity)", got)
+	}
+
+	// A missing rate is rejected.
+	if err := fc.apply([]byte(`{"kind":"ramp_limit"}`), supported); err == nil {
+		t.Fatal("ramp_limit with no rate should error")
+	}
+
+	if err := fc.apply([]byte(`{"kind":"ramp_limit","max_ramp_w_per_s":100}`), supported); err != nil {
+		t.Fatalf("arm ramp_limit: %v", err)
+	}
+	// First call after arming seeds at the current command — no jump.
+	if got := fc.effectiveCeilW(5000); got != 5000 {
+		t.Fatalf("seed effectiveCeilW = %v, want 5000 (no jump on arm)", got)
+	}
+	// Command drops to 1000 W. After 10 s at 100 W/s the honoured ceiling slews
+	// down 1000 W to 4000 — not a snap to 1000.
+	now = now.Add(10 * time.Second)
+	if got := fc.effectiveCeilW(1000); got != 4000 {
+		t.Fatalf("after 10s slew = %v, want 4000 (5000 - 100*10)", got)
+	}
+	// After enough time it reaches the command and clamps (no overshoot below it).
+	now = now.Add(40 * time.Second)
+	if got := fc.effectiveCeilW(1000); got != 1000 {
+		t.Fatalf("after 50s total = %v, want 1000 (reached command, clamped)", got)
+	}
+	// Clearing restores identity.
+	if err := fc.apply([]byte(`{"kind":"ramp_limit","clear":true}`), supported); err != nil {
+		t.Fatalf("clear ramp_limit: %v", err)
+	}
+	if got := fc.effectiveCeilW(2500); got != 2500 {
+		t.Fatalf("after clear = %v, want identity 2500", got)
+	}
+}
 
 // TestFaultRejectWrite_DropsControlValue verifies the reject_write injector: a
 // control write is ACKed at the Modbus layer (the interceptor reports handled,
