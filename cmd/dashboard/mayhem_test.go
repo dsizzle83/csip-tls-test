@@ -105,6 +105,54 @@ func TestDiagnoseConstraint_CannotComplyIsDegraded(t *testing.T) {
 	}
 }
 
+func TestDiagnoseConstraint_BreachedThenConvergedPasses(t *testing.T) {
+	// Export over the 0-cap for the first 8 s (curtailment ramping in), then net
+	// settles at the cap and HOLDS for the rest of the window. A transient settling
+	// ramp that resolves quickly must be PASS, not a closed-loop FAIL.
+	s := mkSamples(40, func(i int, s *maySample) {
+		s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+		if i < 8 {
+			s.RealGridW, s.HubGridW = -2000, -2000 // exporting over the cap
+			s.SolarW = 6000                        // not yet curtailed
+		} else {
+			s.RealGridW, s.HubGridW = 0, 0 // converged to the cap
+			s.SolarW = 200                 // curtailed (possible 6000)
+		}
+	})
+	f := diagnoseConstraint(scFor("conv"), exportCons(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS (%s)", f.Verdict, f.Headline)
+	}
+	if f.Metrics.ConvergedAtS <= 0 {
+		t.Errorf("ConvergedAtS = %v, want > 0", f.Metrics.ConvergedAtS)
+	}
+	if !f.Metrics.TailClean {
+		t.Error("TailClean should be true")
+	}
+}
+
+func TestDiagnoseConstraint_SlowConvergeDegraded(t *testing.T) {
+	// Breach persists past the settling deadline, then converges and holds. Correct
+	// end state but sluggish → DEGRADED, not PASS and not FAIL.
+	s := mkSamples(60, func(i int, s *maySample) {
+		s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+		if i < 40 { // > mayConvergeDeadlineS seconds of breach
+			s.RealGridW, s.HubGridW = -1500, -1500
+			s.SolarW = 6000
+		} else {
+			s.RealGridW, s.HubGridW = 0, 0
+			s.SolarW = 200
+		}
+	})
+	f := diagnoseConstraint(scFor("slow"), exportCons(), s)
+	if f.Verdict != "DEGRADED" {
+		t.Fatalf("verdict = %s, want DEGRADED (%s)", f.Verdict, f.Headline)
+	}
+	if f.Metrics.ConvergedAtS <= mayConvergeDeadlineS {
+		t.Errorf("ConvergedAtS = %v, want > %d", f.Metrics.ConvergedAtS, mayConvergeDeadlineS)
+	}
+}
+
 func TestDiagnoseConstraint_ClosedLoopGap(t *testing.T) {
 	// Adopted + reacted + NOT cannot-comply + not blind → the dangerous case.
 	s := mkSamples(10, func(i int, s *maySample) {

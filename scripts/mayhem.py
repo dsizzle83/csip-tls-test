@@ -146,7 +146,7 @@ def run(base, only, sample_ms, as_json):
     else:
         _print_report(status)
 
-    s = status.get("summary", {})
+    s = status.get("summary") or {}
     bad = s.get("fail", 0) + s.get("blind", 0)
     return 1 if bad else 0
 
@@ -155,7 +155,8 @@ _seen_findings = set()
 
 
 def _print_new_findings(status):
-    for f in status.get("findings", []):
+    # An empty Go slice marshals to JSON null, so .get(...) can return None.
+    for f in (status.get("findings") or []):
         key = f.get("id")
         if key in _seen_findings:
             continue
@@ -164,8 +165,8 @@ def _print_new_findings(status):
 
 
 def _print_report(status):
-    s = status.get("summary", {})
-    findings = status.get("findings", [])
+    s = status.get("summary") or {}
+    findings = status.get("findings") or []
     print("\n" + "=" * 78)
     print(c(BOLD + "MAYHEM QA REPORT" + RESET, "") if sys.stdout.isatty() else "MAYHEM QA REPORT")
     state = "aborted" if status.get("aborted") else ("FAILED: " + status["last_error"]) if status.get("last_error") else "complete"
