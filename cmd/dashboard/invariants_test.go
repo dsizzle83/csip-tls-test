@@ -115,4 +115,29 @@ func TestDiagnoseSOC_Verdicts(t *testing.T) {
 	if f := diagnoseSOC(scFor("battery-wrong-sign"), cons, good); f.Verdict != "PASS" {
 		t.Fatalf("healthy charge verdict = %q, want PASS", f.Verdict)
 	}
+
+	// SoC stays healthy, but the wrong-way discharge blows the active export cap
+	// with no CannotComply — diagnoseSOC must also judge the cap, not just INV-SOC,
+	// so this is a FAIL rather than a false PASS (T past the settling deadline).
+	capBlown := mkSamples(40, func(i int, s *maySample) {
+		s.BatSOC = 60       // no INV-SOC violation
+		s.BatteryW = 1500   // discharging the wrong way
+		s.RealGridW = -3000 // exporting over the 0 cap
+		s.HubGridW = -3000
+	})
+	if f := diagnoseSOC(scFor("battery-wrong-sign"), cons, capBlown); f.Verdict != "FAIL" {
+		t.Fatalf("cap-blowout w/o CannotComply verdict = %q, want FAIL", f.Verdict)
+	}
+
+	// Same cap breach, but the hub admitted it via CannotComply → DEGRADED.
+	capAdmitted := mkSamples(40, func(i int, s *maySample) {
+		s.BatSOC = 60
+		s.BatteryW = 1500
+		s.RealGridW = -3000
+		s.HubGridW = -3000
+		s.CannotComply = true
+	})
+	if f := diagnoseSOC(scFor("battery-wrong-sign"), cons, capAdmitted); f.Verdict != "DEGRADED" {
+		t.Fatalf("cap-blowout w/ CannotComply verdict = %q, want DEGRADED", f.Verdict)
+	}
 }

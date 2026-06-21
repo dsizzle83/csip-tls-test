@@ -614,37 +614,39 @@ func diagnoseConstraint(sc *mayScenario, cons *activeConstraint, s []maySample) 
 	return f
 }
 
-// diagnoseConverge handles ack-before-effect: the device is KNOWN to lag, so the
-// question is whether the hub detects and reports the lag rather than trusting
-// the write ACK.
+// diagnoseConverge handles the accept-but-don't-converge faults — ack_before_effect
+// (the device lags the write) and reject_write (the device ACKs then ignores it
+// entirely). In both the device ACKs at the Modbus layer but its output never
+// reaches the commanded limit; the question is whether the hub detects that via
+// measurement and reports it rather than trusting the write ACK.
 func diagnoseConverge(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
 	f := diagnoseConstraint(sc, cons, s)
-	// Re-frame: a breach here is expected during the device's ACK-before-effect
-	// window; the verdict turns on whether the hub admitted it.
+	// Re-frame: a breach here is expected while the device withholds the effect;
+	// the verdict turns on whether the hub admitted it.
 	if f.Verdict == "PASS" {
-		f.Headline = "hub absorbed the actuation lag without a sustained breach"
-		f.Diagnosis = append(f.Diagnosis, "Output converged within the cap and held — the lag was covered by the battery, or it cleared before the settling deadline.")
+		f.Headline = "hub held the cap despite the device withholding the commanded effect"
+		f.Diagnosis = append(f.Diagnosis, "Output converged within the cap and held — another lever covered the gap, or the effect arrived before the settling deadline.")
 		return f
 	}
 	if f.Metrics.ReportedCannot {
 		f.Verdict = "DEGRADED"
-		f.Headline = "device lagged the command; hub flagged it"
-		f.Diagnosis = append([]string{"The inverter ACKed the curtailment but its output lagged (injected ack_before_effect). The hub reported the shortfall rather than assuming success — correct."}, f.Diagnosis...)
+		f.Headline = "device did not honour the ACKed write; hub flagged it"
+		f.Diagnosis = append([]string{"The device ACKed the curtailment at the Modbus layer but its output never reached the commanded limit (injected fault). The hub reported the shortfall rather than assuming success — correct."}, f.Diagnosis...)
 		return f
 	}
 	if f.Verdict == "DEGRADED" {
-		// The base diagnoser saw the output converge, but only after the lag
-		// cleared (past the settling deadline). The hub got there without an
-		// explicit admission — acceptable, but slow.
-		f.Headline = "inverter lagged its ACK; hub converged once the lag cleared"
-		f.Diagnosis = append([]string{"The inverter ACKed the curtailment at the Modbus layer but its output lagged (injected ack_before_effect). The hub drove it within the cap only after the lag resolved, not on the ACK."}, f.Diagnosis...)
+		// The base diagnoser saw the output converge, but only after the device
+		// finally honoured the write (past the settling deadline). The hub got
+		// there without an explicit admission — acceptable, but slow.
+		f.Headline = "device honoured the write late; hub converged once it did"
+		f.Diagnosis = append([]string{"The device ACKed the curtailment at the Modbus layer but withheld the effect (injected fault). The hub drove it within the cap only after the effect landed, not on the ACK."}, f.Diagnosis...)
 		return f
 	}
 	f.Verdict = "FAIL"
-	f.Headline = fmt.Sprintf("actuation lag caused a %.0fs breach the hub never reported", f.Metrics.BreachSeconds)
+	f.Headline = fmt.Sprintf("device ACKed but never honoured the curtailment; hub never reported the %.0fs breach", f.Metrics.BreachSeconds)
 	f.Diagnosis = append([]string{
-		"The inverter ACKed the curtailment at the Modbus layer but its output lagged (the injected ack_before_effect fault). The hub treated the write as immediately effective.",
-		"Because the hub never reads back or measures convergence, it kept reporting compliance while real export stayed over the cap for the whole lag window.",
+		"The device ACKed the curtailment at the Modbus layer but its output never reached the commanded limit (the injected fault — a lag, or an outright ignore). The hub treated the write as immediately effective.",
+		"Because the hub never reads back or measures convergence, it kept reporting compliance while real output stayed over the cap for the whole window.",
 	}, f.Diagnosis...)
 	f.Fix = "Closed-loop ACK: after a curtailment write, verify the measured output reaches the target within a deadline; if not, escalate / post CannotComply. (derbase ApplyControl is write-only today.)"
 	return f
@@ -748,11 +750,14 @@ func diagnoseRecovery(sc *mayScenario, cons *activeConstraint, s []maySample) ma
 	return f
 }
 
-// diagnoseSOC handles battery-direction faults (wrong_sign / soc_refuse): the
-// question is whether the hub keeps the pack inside its SoC envelope when the
-// device misbehaves. It judges by INV-SOC — a battery that discharges at/below
-// the reserve floor (or charges past the ceiling) is an unsafe state the hub
-// must detect and halt, whatever the device did.
+// diagnoseSOC handles battery-direction faults (wrong_sign / soc_refuse). A
+// flipped battery is doubly dangerous: it can walk the pack out of its SoC
+// envelope AND blow the very cap it was meant to help meet — a commanded charge
+// that lands as a discharge adds to export instead of soaking it. So it judges
+// BOTH axes: INV-SOC (pack discharging at/below the reserve floor or charging
+// past the ceiling) and the active cap via INV-EXPORT/INV-CONVERGE (the breach
+// the wrong-way discharge causes, and whether the hub admitted it). Judging only
+// INV-SOC would let a scenario PASS while the export cap it posted was wide open.
 func diagnoseSOC(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
 	f := baseFinding(sc)
 	if len(s) == 0 {
@@ -761,25 +766,57 @@ func diagnoseSOC(sc *mayScenario, cons *activeConstraint, s []maySample) mayFind
 		return f
 	}
 	f.Metrics = scanSamples(cons, s)
-	viol := invSOC(s)
-	if len(viol) == 0 {
-		f.Verdict = "PASS"
-		f.Headline = "battery stayed within its SoC envelope despite the direction fault"
+
+	socViol := invSOC(s)
+	expViol := invExport(cons, s)
+	convViol := invConverge(cons, s) // sustained cap breach with no CannotComply
+
+	// FAIL if the pack left its SoC envelope, or the active cap was breached and
+	// never admitted.
+	if len(socViol) > 0 || len(convViol) > 0 {
+		f.Verdict = "FAIL"
+		var diag []string
+		if len(socViol) > 0 {
+			f.Headline = fmt.Sprintf("battery breached its SoC envelope on %d samples", len(socViol))
+			diag = append(diag,
+				invSummaryLine("INV-SOC", socViol),
+				"The battery moved the wrong way at its SoC bound (a commanded charge landed as a discharge, or vice versa) and the hub did not detect the divergence and halt it.",
+				"A hub that trusts its own command without verifying the pack's measured direction will walk a low battery toward empty — the silent-actuation failure INV-SOC exists to catch.")
+		} else {
+			f.Headline = fmt.Sprintf("wrong-direction battery blew the %s cap by up to %.0f W with no CannotComply", cons.Typ, f.Metrics.PeakBreachW)
+			diag = append(diag,
+				"The flipped battery discharged into an active export cap instead of charging to relieve it, and the hub never admitted the resulting breach (no CannotComply).")
+		}
+		// Surface the other axis too so the full picture is visible.
+		diag = append(diag, invSummaryLine("INV-CONVERGE", convViol))
+		if len(socViol) == 0 {
+			diag = append(diag, invSummaryLine("INV-SOC", socViol))
+		}
+		diag = append(diag, decisionLine(s))
+		f.Fix = "Verify measured battery power direction/SoC trend against the commanded sign; halt and alarm when the pack moves opposite to the command (orchestrator battery adapter)."
+		f.Diagnosis = append(diag, hubVsRealLine(s))
+		return f
+	}
+
+	// The cap was breached during the fault but the hub admitted it (CannotComply):
+	// honest, though the wrong-direction device still cost compliance headroom.
+	if len(expViol) > 0 {
+		f.Verdict = "DEGRADED"
+		f.Headline = fmt.Sprintf("battery moved the wrong way and breached the %s cap, but the hub admitted it", cons.Typ)
 		f.Diagnosis = []string{
-			invSummaryLine("INV-SOC", viol),
-			"The pack never discharged below its reserve floor nor charged past its ceiling — the hub kept it safe even though the device was commanded the wrong way.",
+			invSummaryLine("INV-EXPORT", expViol),
+			"The pack discharged the wrong way under the cap, but the hub posted a CannotComply rather than hiding the breach.",
 		}
 		return f
 	}
-	f.Verdict = "FAIL"
-	f.Headline = fmt.Sprintf("battery breached its SoC envelope on %d samples", len(viol))
+
+	f.Verdict = "PASS"
+	f.Headline = "battery stayed within its SoC envelope and held the cap despite the direction fault"
 	f.Diagnosis = []string{
-		invSummaryLine("INV-SOC", viol),
-		"The battery moved the wrong way at its SoC bound (a commanded charge landed as a discharge, or vice versa) and the hub did not detect the divergence and halt it.",
-		"A hub that trusts its own command without verifying the pack's measured direction will walk a low battery toward empty — the silent-actuation failure INV-SOC exists to catch.",
-		decisionLine(s),
+		invSummaryLine("INV-SOC", socViol),
+		invSummaryLine("INV-EXPORT", expViol),
+		"The pack never left its SoC bounds and the active cap held — the hub kept it safe even though the device was commanded the wrong way.",
 	}
-	f.Fix = "Verify measured battery power direction/SoC trend against the commanded sign; halt and alarm when the pack moves opposite to the command (orchestrator battery adapter)."
 	return f
 }
 
@@ -1282,15 +1319,18 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			Category:   "Resource limits (INV-SOC)",
 			Hypothesis: "A battery wired or firmware-flipped in the wrong direction: when the hub commands a charge to soak up excess PV, the pack discharges instead, walking an already-low state of charge toward empty.",
 			Expected:   "Detect the pack moving opposite to the command (SoC falling under a charge command) and halt/alarm before it discharges below the reserve floor.",
-			HoldS:      60,
+			HoldS:      90, // long enough for the wrong-way discharge to walk SoC across the 10% reserve floor
 			Fix:        "Verify measured battery direction/SoC trend against the commanded sign in the orchestrator battery adapter. (Demonstrates robustness under SIMULATED abuse; the BatteryW sign convention must be confirmed against the live hub /status before trusting the verdict.)",
 			setup: func(d *mayhemDriver) (*activeConstraint, error) {
-				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 12, "Conn": 1}) // low, just above the 10% reserve floor
-				d.injectEnv(d.pvHighW, loadLow)                                            // excess PV → hub wants to charge the battery
+				// Start just above the reserve floor so the flipped (discharge)
+				// command drives SoC across it within the window, exercising INV-SOC —
+				// and the same discharge blows the export cap, exercising INV-CONVERGE.
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 10.5, "Conn": 1})
+				d.injectEnv(d.pvHighW, loadLow) // excess PV → hub wants to charge the battery
 				if err := d.post("battery", "/fault", map[string]any{"kind": "wrong_sign"}); err != nil {
 					return nil, fmt.Errorf("arm wrong_sign: %w", err)
 				}
-				return d.postCap("exportCap", 0, 60, "mayhem: zero export cap drives a battery charge (flipped to discharge)")
+				return d.postCap("exportCap", 0, 90, "mayhem: zero export cap drives a battery charge (flipped to discharge)")
 			},
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
 			evaluate: diagnoseSOC,
