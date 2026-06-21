@@ -44,6 +44,7 @@ type Registry struct {
 	pollInterval time.Duration
 	stop         chan struct{}
 	done         chan struct{}
+	stopOnce     sync.Once
 }
 
 // New creates a Registry that polls each device every pollInterval.
@@ -151,11 +152,14 @@ func (reg *Registry) Start() {
 }
 
 // Stop signals the poll goroutine to exit and waits for it to finish.
-// After Stop returns, no further updates will be sent.
+// After Stop returns, no further updates will be sent. Stop is idempotent:
+// repeated calls are safe and only the first signals the goroutine.
 func (reg *Registry) Stop() {
-	close(reg.stop)
-	<-reg.done
-	reg.closeSubscribers()
+	reg.stopOnce.Do(func() {
+		close(reg.stop)
+		<-reg.done
+		reg.closeSubscribers()
+	})
 }
 
 // run is the background poll goroutine.

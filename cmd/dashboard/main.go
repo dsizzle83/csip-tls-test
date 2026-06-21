@@ -71,6 +71,20 @@ func main() {
 	mux.HandleFunc("/api/replay/status", replay.handleStatus)
 	mux.HandleFunc("/api/replay/abort", replay.handleAbort)
 
+	// Mayhem QA driver: adversarial fault-injection suite over the whole bench,
+	// server-side so a run survives the tab closing (see mayhem.go).
+	mayhem := newMayhemDriver(map[string]string{
+		"hub":     *hub,
+		"gridsim": *gridsim,
+		"solar":   *solar,
+		"battery": *battery,
+		"meter":   *meter,
+		"ev":      *ev,
+	})
+	mux.HandleFunc("/api/qa/start", mayhem.handleStart)
+	mux.HandleFunc("/api/qa/status", mayhem.handleStatus)
+	mux.HandleFunc("/api/qa/abort", mayhem.handleAbort)
+
 	log.Printf("dashboard: serving at http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

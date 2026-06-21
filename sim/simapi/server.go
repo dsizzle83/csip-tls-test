@@ -7,6 +7,7 @@
 //	GET  /state    — JSON snapshot of current simulator state (decoded values)
 //	POST /inject   — inject field overrides; body: {"W_W": 4500.0, ...}
 //	POST /control  — animation control; body: {"cmd":"pause"|"resume"|"reset", "speed":N}
+//	POST /fault    — arm/clear a fault injector; body: {"kind":"ack_before_effect","delay_s":30}
 //	GET  /registers — raw Modbus register dump (Modbus sims only; 404 if unsupported)
 //	GET  /ws       — WebSocket: pushes /state JSON every 2 seconds
 //	GET  /logs     — SSE stream of the simulator's log lines (backlog replayed)
@@ -48,16 +49,23 @@ type ControlCmd struct {
 // May be nil to disable POST /control.
 type ControlFunc func(cmd ControlCmd) error
 
+// FaultFunc arms or clears a fault injector from the raw POST /fault body.
+// Each sim parses the body (a sim.FaultSpec) and applies the kinds it
+// supports, returning an error (→ 400) for unsupported kinds or bad params.
+// Registered via SetFaultFn; nil (the default) makes POST /fault return 501.
+type FaultFunc func(body []byte) error
+
 // Server is the HTTP + WebSocket API server embedded by each simulator binary.
 type Server struct {
-	stateFn    StateFunc
-	injectFn   InjectFunc
+	stateFn     StateFunc
+	injectFn    InjectFunc
 	registersFn RegistersFunc
-	controlFn  ControlFunc
-	logBuf     *LogBuffer
+	controlFn   ControlFunc
+	logBuf      *LogBuffer
 
 	mu      sync.Mutex
 	clients map[chan []byte]struct{}
+	faultFn FaultFunc // guarded by mu; set via SetFaultFn, may be nil
 }
 
 var wsUpgrader = websocket.Upgrader{
@@ -77,12 +85,13 @@ func New(addr string, stateFn StateFunc, injectFn InjectFunc, registersFn Regist
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/state",     s.handleState)
-	mux.HandleFunc("/inject",    s.handleInject)
-	mux.HandleFunc("/control",   s.handleControl)
+	mux.HandleFunc("/state", s.handleState)
+	mux.HandleFunc("/inject", s.handleInject)
+	mux.HandleFunc("/control", s.handleControl)
+	mux.HandleFunc("/fault", s.handleFault)
 	mux.HandleFunc("/registers", s.handleRegisters)
-	mux.HandleFunc("/ws",        s.handleWS)
-	mux.Handle("/logs",          s.logBuf)
+	mux.HandleFunc("/ws", s.handleWS)
+	mux.Handle("/logs", s.logBuf)
 
 	go func() {
 		log.Printf("[simapi] API server on %s  (GET /state  POST /inject  POST /control  GET /ws  GET /logs)", addr)
@@ -92,6 +101,14 @@ func New(addr string, stateFn StateFunc, injectFn InjectFunc, registersFn Regist
 	}()
 	go s.broadcastLoop(2 * time.Second)
 	return s
+}
+
+// SetFaultFn registers (or replaces) the fault injector handler wired to
+// POST /fault. Call it after New, before the sim is driven under test.
+func (s *Server) SetFaultFn(fn FaultFunc) {
+	s.mu.Lock()
+	s.faultFn = fn
+	s.mu.Unlock()
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -140,6 +157,30 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.controlFn(cmd); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleFault(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.Lock()
+	fn := s.faultFn
+	s.mu.Unlock()
+	if fn == nil {
+		http.Error(w, "fault injection not supported by this simulator", http.StatusNotImplemented)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := fn(body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

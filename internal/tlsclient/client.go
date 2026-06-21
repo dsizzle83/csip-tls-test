@@ -11,6 +11,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 	"unsafe"
 
 	"csip-tls-test/internal/wolfssl"
@@ -219,17 +221,45 @@ func (c *Client) Get(path string) ([]byte, error) {
 	return c.readResponse()
 }
 
+// setReadTimeout applies a socket receive timeout (SO_RCVTIMEO) so
+// wolfSSL's blocking reads cannot wait longer than d on a stalled
+// server. d <= 0 clears the timeout (block indefinitely).
+func (c *Client) setReadTimeout(d time.Duration) error {
+	if c.file == nil {
+		return errors.New("no connection")
+	}
+	tv := syscall.NsecToTimeval(int64(d))
+	return syscall.SetsockoptTimeval(int(c.file.Fd()), syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+}
+
 // readResponse reads one complete HTTP response from the open TLS
 // session. It reads headers until \r\n\r\n, then reads exactly
 // Content-Length body bytes so the connection can be reused.
 // Falls back to read-until-close if Content-Length is absent.
+//
+// Every read is bounded by ReadTimeout (via SO_RCVTIMEO) and the whole
+// response by an absolute deadline, so a wedged or trickling server
+// cannot stall the caller indefinitely.
 func (c *Client) readResponse() ([]byte, error) {
+	timeout := c.cfg.ReadTimeout
+	if timeout <= 0 {
+		timeout = DefaultReadTimeout
+	}
+	if err := c.setReadTimeout(timeout); err != nil {
+		return nil, fmt.Errorf("set read timeout: %w", err)
+	}
+	defer c.setReadTimeout(0)
+	deadline := time.Now().Add(timeout)
+
 	scratch := make([]byte, 4096)
 	var buf []byte
 	headerEnd := -1
 
 	// Phase 1: buffer until the header block is complete.
 	for headerEnd < 0 {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("read timeout after %s waiting for response headers", timeout)
+		}
 		n, err := wolfssl.Read(c.ssl, scratch)
 		if n > 0 {
 			buf = append(buf, scratch[:n]...)
@@ -250,6 +280,9 @@ func (c *Client) readResponse() ([]byte, error) {
 	if cl < 0 {
 		// No Content-Length: fall back to reading until server closes.
 		for {
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("read timeout after %s reading response body", timeout)
+			}
 			n, err := wolfssl.Read(c.ssl, scratch)
 			if n > 0 {
 				buf = append(buf, scratch[:n]...)
@@ -267,6 +300,9 @@ func (c *Client) readResponse() ([]byte, error) {
 
 	need := headerEnd + cl
 	for len(buf) < need {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("read timeout after %s: got %d of %d bytes", timeout, len(buf), need)
+		}
 		n, err := wolfssl.Read(c.ssl, scratch)
 		if n > 0 {
 			buf = append(buf, scratch[:n]...)

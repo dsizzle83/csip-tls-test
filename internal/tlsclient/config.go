@@ -9,6 +9,11 @@ const DefaultCipherList = "ECDHE-ECDSA-AES128-CCM-8"
 // DefaultDialTimeout is used when Config.DialTimeout is zero.
 const DefaultDialTimeout = 30 * time.Second
 
+// DefaultReadTimeout is used when Config.ReadTimeout is zero. It bounds
+// each response read so a wedged or trickling server cannot stall the
+// caller (e.g. northbound discovery / response posting) indefinitely.
+const DefaultReadTimeout = 30 * time.Second
+
 // Config holds everything needed to construct a Client.
 type Config struct {
 	// ServerAddr is the host:port to connect to.
@@ -32,6 +37,12 @@ type Config struct {
 
 	// DialTimeout is the timeout for TCP connection setup. Zero uses
 	// DefaultDialTimeout (30 s). This bounds the TCP dial and wolfSSL
-	// handshake; per-read/write timeouts are not yet implemented.
+	// handshake.
 	DialTimeout time.Duration
+
+	// ReadTimeout bounds each response read after the handshake. Zero uses
+	// DefaultReadTimeout (30 s). It is enforced as a socket SO_RCVTIMEO so
+	// it interrupts wolfSSL's blocking reads on a wedged server; a request
+	// that exceeds it fails and the session should be re-dialed.
+	ReadTimeout time.Duration
 }

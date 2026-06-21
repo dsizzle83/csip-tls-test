@@ -31,8 +31,8 @@ import (
 )
 
 func main() {
-	port    := flag.Int("port", 5020, "Modbus TCP port")
-	wmax    := flag.Float64("wmax", 5000, "Nameplate WMax in watts")
+	port := flag.Int("port", 5020, "Modbus TCP port")
+	wmax := flag.Float64("wmax", 5000, "Nameplate WMax in watts")
 	apiPort := flag.Int("api-port", 6020, "HTTP API port (0 to disable)")
 	flag.Parse()
 
@@ -69,6 +69,8 @@ func main() {
 				return nil
 			},
 		)
+		// Fault injection: POST /fault {"kind":"ack_before_effect","delay_s":30}.
+		api.SetFaultFn(srv.ApplyFault)
 		// Tee logs into the API ring so the dashboard's Logs tab can stream them.
 		log.SetOutput(io.MultiWriter(os.Stderr, api.LogWriter()))
 	}

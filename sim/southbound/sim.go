@@ -17,16 +17,52 @@ import (
 	"sync/atomic"
 	"time"
 
-	modbuslib "github.com/simonvetter/modbus"
 	"csip-tls-test/internal/southbound/sunspec"
+	modbuslib "github.com/simonvetter/modbus"
 )
+
+// FaultKind enumerates the fault-injection behaviours a sim can be asked to
+// exhibit via the simapi POST /fault endpoint. The set is intentionally open —
+// new kinds are added as the QA fault matrix grows (see
+// docs/QA_FAULT_INJECTION.md). Each sim advertises only the kinds it supports
+// and returns an error for the rest.
+type FaultKind string
+
+const (
+	// FaultAckBeforeEffect makes a control write ACK at the Modbus layer
+	// immediately while its effect on the device output is held back by
+	// Delay. It models hardware that accepts a command before its actuator
+	// physically moves — the case where a hub that assumes write-success ==
+	// converged will believe a limit is in force before it actually is.
+	FaultAckBeforeEffect FaultKind = "ack_before_effect"
+)
+
+// FaultSpec is the parsed body of POST /fault. A sim interprets the fields
+// relevant to Kind; Clear removes a previously-armed fault of that Kind.
+type FaultSpec struct {
+	Kind   FaultKind `json:"kind"`
+	DelayS float64   `json:"delay_s,omitempty"` // ack_before_effect: effect delay (seconds)
+	Clear  bool      `json:"clear,omitempty"`   // when true, disarm this Kind
+}
 
 // RegisterMap is a thread-safe Modbus holding-register store. It doubles as
 // the simonvetter RequestHandler so it can be passed directly to NewServer.
 type RegisterMap struct {
-	mu      sync.RWMutex
-	regs    map[uint16]uint16
-	OnWrite func(startAddr uint16) // called after each write with the first written address
+	mu   sync.RWMutex
+	regs map[uint16]uint16
+
+	// OnWrite, if non-nil, is called after each write with the first written
+	// address (used by the GUI/log tee to notice control writes).
+	OnWrite func(startAddr uint16)
+
+	// OnWriteAttempt, if non-nil, is consulted BEFORE a write lands. Returning
+	// false tells the map not to apply the values itself — the interceptor has
+	// taken responsibility for them. This is the hook fault injection uses to
+	// alter or defer writes (e.g. ack-before-effect). The Modbus layer still
+	// returns success either way, modelling a device that ACKs at the protocol
+	// level. The interceptor is invoked without the map lock held, so it may
+	// freely call Get/Set.
+	OnWriteAttempt func(startAddr uint16, vals []uint16) (apply bool)
 }
 
 // Get returns the value of a holding register (0-based Modbus address).
@@ -58,11 +94,24 @@ func (r *RegisterMap) HandleDiscreteInputs(_ *modbuslib.DiscreteInputsRequest) (
 func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequest) ([]uint16, error) {
 	if req.IsWrite {
 		r.mu.Lock()
-		for i, v := range req.Args {
-			r.regs[req.Addr+uint16(i)] = v
-		}
+		intercept := r.OnWriteAttempt
 		cb := r.OnWrite
 		r.mu.Unlock()
+
+		// Default path (no interceptor): apply the write verbatim. With an
+		// interceptor, let it decide whether the values land now — but always
+		// return success below, so the client sees a protocol-level ACK.
+		apply := true
+		if intercept != nil {
+			apply = intercept(req.Addr, req.Args)
+		}
+		if apply {
+			r.mu.Lock()
+			for i, v := range req.Args {
+				r.regs[req.Addr+uint16(i)] = v
+			}
+			r.mu.Unlock()
+		}
 		if cb != nil {
 			cb(req.Addr)
 		}
@@ -217,9 +266,9 @@ func Populate(r *RegisterMap, wmaxW float64) {
 	r.Set(cursor+0, sunspec.ModelCommon)
 	r.Set(cursor+1, m1Len)
 	m1Base := cursor + 2
-	setStr16(r, m1Base+0, "SunSpec Sim") // Mn (manufacturer, 32 chars = 16 regs)
+	setStr16(r, m1Base+0, "SunSpec Sim")   // Mn (manufacturer, 32 chars = 16 regs)
 	setStr8(r, m1Base+16, "CSIP-Dev-5000") // Md (model, 16 chars = 8 regs)
-	setStr8(r, m1Base+32, "SN-0001")      // SN (serial, 32 chars = 16 regs)
+	setStr8(r, m1Base+32, "SN-0001")       // SN (serial, 32 chars = 16 regs)
 	cursor += 2 + m1Len
 
 	// ── Model 121 (Basic Settings) — 30 data registers ───────────────────────

@@ -30,6 +30,11 @@ a { color: #60a5fa; }
 .dot.ok  { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
 .dot.err { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
 .stat-label { color: #94a3b8; font-size: 12px; }
+.qa-pill { padding: 3px 10px; border-radius: 10px; font-size: 11px; }
+.qa-badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; letter-spacing: .03em; }
+.qa-chk { display:flex; align-items:flex-start; gap:7px; background:#0f172a; border:1px solid #1e293b; border-radius:6px; padding:7px 9px; font-size:12px; cursor:pointer; }
+.qa-chk:hover { border-color:#334155; }
+.qa-chk .qa-cat { color:#64748b; font-size:10.5px; }
 .stat-value { font-weight: 600; }
 
 /* ── Power cards ── */
@@ -339,6 +344,7 @@ a { color: #60a5fa; }
   <button id="ptab-grid"      class="page-tab"        onclick="switchTab('grid')">Grid Controls</button>
   <button id="ptab-scenarios" class="page-tab"        onclick="switchTab('scenarios')" style="color:#a78bfa;border-color:#7c3aed20;">&#9654; Scenarios</button>
   <button id="ptab-costsim"   class="page-tab"        onclick="switchTab('costsim')" style="color:#fbbf24;border-color:#d9770620;">&#36; 3-Month Cost Sim</button>
+  <button id="ptab-qa"        class="page-tab"        onclick="switchTab('qa')" style="color:#f87171;border-color:#dc262620;">&#128293; Mayhem QA</button>
   <button id="ptab-logs"      class="page-tab"        onclick="switchTab('logs')">Logs</button>
 </div>
 
@@ -926,6 +932,110 @@ a { color: #60a5fa; }
 </div><!-- #ppanel-costsim -->
 
 <!-- ════════════════════════════════════════════════════════════ -->
+<!-- MAYHEM QA PANEL                                               -->
+<!-- ════════════════════════════════════════════════════════════ -->
+<div id="ppanel-qa" class="page-panel" style="display:none">
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+      <div>
+        <h3 style="margin-bottom:4px;">&#128293; Mayhem QA — Worst-Case Fault Injection</h3>
+        <div style="font-size:12px;color:#64748b;max-width:820px;">
+          Drives the <b>real bench</b> (all the Pis) through the worst hour a home DERMS hub could see —
+          zero-export caps with no headroom, an inverter that ACKs a command before acting on it, a meter
+          that freezes, a clock that lurches, a battery pinned full or empty, and finally all of it at once.
+          Each scenario declares the behaviour a correct hub must show, samples reality continuously, and
+          diagnoses <b>exactly where</b> fault handling broke. The driver runs in the dashboard server and
+          <b>restores the bench</b> (clock 0, controls cleared, faults cleared, sims 1&times;) on finish or abort.
+        </div>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+        <div class="field"><label>Sample cadence</label>
+          <select id="qa-sample">
+            <option value="1000">1 s</option>
+            <option value="500">0.5 s (fine)</option>
+            <option value="2000">2 s (coarse)</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" id="qa-start" onclick="startMayhem()"
+                style="background:#dc2626;min-width:190px;">&#128293;&nbsp; Run Mayhem Suite</button>
+        <button class="btn btn-danger" id="qa-abort" onclick="abortMayhem()" style="display:none;">&#9632;&nbsp; Abort &amp; restore</button>
+      </div>
+    </div>
+
+    <div style="margin-top:10px;background:#1c1206;border:1px solid #92400e44;border-radius:6px;padding:8px 12px;font-size:11.5px;color:#fbbf24;">
+      &#9888; This perturbs the <b>live bench</b>: it injects extreme conditions and real DERControls and
+      briefly freezes the meter. Don't run it during a demo. It auto-restores when it finishes or you abort.
+    </div>
+
+    <!-- Scenario picker -->
+    <div style="margin-top:12px;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <h3 style="margin:0;">Scenarios</h3>
+        <a href="#" onclick="qaSelectAll(true);return false;" style="font-size:11px;color:#60a5fa;">all</a>
+        <a href="#" onclick="qaSelectAll(false);return false;" style="font-size:11px;color:#60a5fa;">none</a>
+      </div>
+      <div id="qa-scenarios" style="margin-top:6px;display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:6px;"></div>
+    </div>
+
+    <!-- Interpretation guide -->
+    <details style="margin-top:12px;background:#0f172a;border-radius:6px;padding:8px 12px;">
+      <summary style="cursor:pointer;font-weight:600;color:#cbd5e1;">How to read these results</summary>
+      <div style="font-size:12px;color:#94a3b8;margin-top:8px;line-height:1.6;">
+        <p style="margin:4px 0;">Every scenario walks the hub's fault-handling chain and names the first broken link:</p>
+        <div style="font-family:monospace;font-size:11px;color:#cbd5e1;background:#0b1220;padding:6px 10px;border-radius:4px;margin:6px 0;">
+          adopted? &rarr; reacted? &rarr; device complied? &rarr; admitted (CannotComply)? &rarr; could it even see the breach?
+        </div>
+        <ul style="margin:6px 0;padding-left:18px;">
+          <li><b style="color:#34d399;">PASS</b> — held the limit under worst-case conditions. No breach.</li>
+          <li><b style="color:#fbbf24;">DEGRADED</b> — breached, but the hub hit a real physical limit <i>and admitted it</i> (posted <code>CannotComply</code>). Acceptable: a reported resource limit, not a control failure.</li>
+          <li><b style="color:#f87171;">FAIL</b> — breached and the hub mishandled it. The diagnosis says which link broke: never adopted the event, adopted but issued no correction, or commanded a correction that silently never took effect (the closed-loop gap).</li>
+          <li><b style="color:#e879f9;">BLIND</b> — the most dangerous: the hub's own grid view diverged from the real meter, or its sensor froze, so the breach was <i>invisible to the controller</i>. It can't fix what it can't see.</li>
+          <li><b style="color:#94a3b8;">INCONCLUSIVE</b> — couldn't judge (meter unreachable, fault didn't arm). Itself a gap — fix and re-run.</li>
+        </ul>
+        <p style="margin:4px 0;"><b>Metrics</b> on each finding: <b>peak breach</b> (W past the cap), <b>breach seconds</b> (time out of limit), <b>adopted/reacted/cannot-comply/blind</b> (the chain booleans), and <b>sample errors</b> (reads that failed). The <b>live readout</b> shows the real meter vs. the hub's belief side by side — when they diverge, the hub is flying blind in real time.</p>
+        <p style="margin:4px 0;">Triage order: fix <b>BLIND</b> first (safety/observability), then <b>FAIL</b> by category, then re-run the <b>perfect storm</b> — compound failures often hide ordering bugs the single-fault runs miss.</p>
+      </div>
+    </details>
+
+    <!-- Live progress -->
+    <div id="qa-live" style="display:none;margin-top:14px;">
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:#94a3b8;margin-bottom:4px;">
+        <span id="qa-label">—</span><span id="qa-pct">0%</span>
+      </div>
+      <div style="background:#0f172a;border-radius:4px;height:10px;overflow:hidden;">
+        <div id="qa-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#dc2626,#f87171);transition:width .3s;"></div>
+      </div>
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;">
+        <span class="qa-pill" style="background:#06281c;color:#34d399;">PASS <b id="qa-sum-pass">0</b></span>
+        <span class="qa-pill" style="background:#2a2206;color:#fbbf24;">DEGRADED <b id="qa-sum-deg">0</b></span>
+        <span class="qa-pill" style="background:#2a0c0c;color:#f87171;">FAIL <b id="qa-sum-fail">0</b></span>
+        <span class="qa-pill" style="background:#260a2a;color:#e879f9;">BLIND <b id="qa-sum-blind">0</b></span>
+        <span class="qa-pill" style="background:#1e293b;color:#94a3b8;">INCONCL <b id="qa-sum-inc">0</b></span>
+        <span class="qa-pill" style="background:#1e293b;color:#cbd5e1;">worst breach <b id="qa-sum-worst">0 W</b></span>
+      </div>
+
+      <!-- Live readout of the running scenario: real vs hub view -->
+      <div id="qa-now" style="display:none;margin-top:12px;background:#0b1220;border-radius:6px;padding:10px 12px;">
+        <div style="font-size:11px;color:#64748b;margin-bottom:6px;">Running: <b id="qa-now-name" style="color:#cbd5e1;">—</b> <span id="qa-now-phase" style="color:#475569;"></span></div>
+        <div style="display:flex;gap:22px;flex-wrap:wrap;font-size:12px;">
+          <span><span class="stat-label">Real grid (meter)</span> <b id="qa-now-real" class="c-grid">—</b></span>
+          <span><span class="stat-label">Hub believes</span> <b id="qa-now-hub">—</b></span>
+          <span><span class="stat-label">Blindness</span> <b id="qa-now-blind">—</b></span>
+          <span><span class="stat-label">Solar (actual/possible)</span> <b id="qa-now-solar" class="c-solar">—</b></span>
+          <span><span class="stat-label">Battery SOC</span> <b id="qa-now-soc" class="c-battery">—</b></span>
+          <span><span class="stat-label">Hub adopted</span> <b id="qa-now-adopt">—</b></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Findings -->
+    <div id="qa-report-link" style="display:none;margin-top:12px;font-size:11px;color:#64748b;"></div>
+    <div id="qa-findings" style="margin-top:12px;display:flex;flex-direction:column;gap:10px;"></div>
+  </div>
+</div><!-- #ppanel-qa -->
+
+<!-- ════════════════════════════════════════════════════════════ -->
 <!-- UNIFIED LOGS PANEL                                            -->
 <!-- ════════════════════════════════════════════════════════════ -->
 <div id="ppanel-logs" class="page-panel" style="display:none">
@@ -1364,6 +1474,9 @@ function switchTab(name) {
     simIntervals.push(setInterval(pollEVState, 2000));
   } else if (name === 'scenarios') {
     // no polling needed; scenarios are event-driven
+  } else if (name === 'qa') {
+    qaInit();
+    simIntervals.push(setInterval(pollQAStatus, 2000));
   } else if (name === 'logs') {
     renderUniLog(); // stream appends handle the rest
   }
@@ -3081,6 +3194,161 @@ function formatEta(s) {
   if (s == null) return '—';
   if (s < 3600) return Math.round(s / 60) + ' min';
   return (s / 3600).toFixed(1) + ' h';
+}
+
+// ── Mayhem QA (UI side) ───────────────────────────────────────────────────────
+// The driver lives in the dashboard server (cmd/dashboard/mayhem.go); this UI
+// launches it, polls /api/qa/status, and renders the per-scenario diagnoses.
+// IDs/names mirror mayhemDriver.scenarios(); a mismatch only affects the picker.
+const QA_SCENARIOS = [
+  ['export-cap-full-battery', 'Zero-export cap, full sun, battery full', 'Grid compliance'],
+  ['ack-before-effect', 'Inverter ACKs curtailment but lags 45 s', 'Closed-loop actuation'],
+  ['stale-meter', 'Grid meter freezes while the world changes', 'Sensor integrity'],
+  ['battery-empty-import-cap', 'Import cap at peak with an empty battery', 'Resource limits'],
+  ['curtailment-release', 'Generation-limit event ends — solar must recover', 'Recovery'],
+  ['clock-jitter', 'CSIP clock corrections jitter while a cap is active', 'Time integrity'],
+  ['perfect-storm', 'Perfect storm — everything at once', 'Combined worst case'],
+];
+const QA_COLORS = { PASS:'#34d399', DEGRADED:'#fbbf24', FAIL:'#f87171', BLIND:'#e879f9', INCONCLUSIVE:'#94a3b8' };
+let qaPoll = null, qaBuilt = false;
+
+function qaInit() {
+  if (!qaBuilt) {
+    document.getElementById('qa-scenarios').innerHTML = QA_SCENARIOS.map(([id, name, cat]) =>
+      `<label class="qa-chk"><input type="checkbox" class="qa-cb" value="${id}" checked>` +
+      `<span><b>${escapeHTML(name)}</b><br><span class="qa-cat">${escapeHTML(cat)}</span></span></label>`
+    ).join('');
+    qaBuilt = true;
+  }
+  pollQAStatus();
+}
+
+function qaSelectAll(on) { document.querySelectorAll('.qa-cb').forEach(cb => cb.checked = on); }
+
+async function startMayhem() {
+  const only = [...document.querySelectorAll('.qa-cb:checked')].map(cb => cb.value);
+  if (!only.length) { alert('Select at least one scenario.'); return; }
+  if (!confirm('Run Mayhem against the LIVE bench? It injects extreme faults and real DERControls, briefly freezes the meter, and restores the bench when done.')) return;
+  const sampleMs = parseInt(document.getElementById('qa-sample').value);
+  const btn = document.getElementById('qa-start');
+  btn.disabled = true; btn.innerHTML = '&#8987;&nbsp; Starting…';
+  try {
+    const resp = await fetch('/api/qa/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sample_ms: sampleMs, only: only.length === QA_SCENARIOS.length ? [] : only }),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status + ': ' + await resp.text());
+    beginQAPolling();
+  } catch (err) {
+    alert('start failed: ' + err.message);
+    btn.disabled = false;
+  }
+  btn.innerHTML = '&#128293;&nbsp; Run Mayhem Suite';
+}
+
+async function abortMayhem() { await fetch('/api/qa/abort', { method: 'POST' }); }
+
+function beginQAPolling() {
+  if (qaPoll) clearInterval(qaPoll);
+  qaPoll = setInterval(pollQAStatus, 1500);
+  pollQAStatus();
+}
+
+async function pollQAStatus() {
+  let st;
+  try {
+    const resp = await fetch('/api/qa/status');
+    if (!resp.ok) return;
+    st = await resp.json();
+  } catch (_) { return; }
+  if (!st.running && !st.finished && !st.aborted && !(st.findings || []).length && !st.last_error) return; // never ran
+
+  document.getElementById('qa-live').style.display = '';
+  document.getElementById('qa-abort').style.display = st.running ? '' : 'none';
+  document.getElementById('qa-start').disabled = st.running;
+
+  document.getElementById('qa-bar').style.width = (st.pct || 0) + '%';
+  document.getElementById('qa-pct').textContent = Math.round(st.pct || 0) + '%';
+  document.getElementById('qa-label').textContent = st.running
+    ? `scenario ${st.idx}/${st.total} — ${st.current} (${st.phase})`
+    : st.aborted ? 'aborted (bench restored)'
+    : st.last_error ? ('failed: ' + st.last_error)
+    : 'complete (bench restored)';
+
+  const s = st.summary || {};
+  setText('qa-sum-pass', s.pass || 0);
+  setText('qa-sum-deg', s.degraded || 0);
+  setText('qa-sum-fail', s.fail || 0);
+  setText('qa-sum-blind', s.blind || 0);
+  setText('qa-sum-inc', s.inconclusive || 0);
+  setText('qa-sum-worst', fmt(s.worst_peak_breach_W || 0) + ' W');
+
+  qaRenderNow(st);
+  qaRenderFindings(st.findings || []);
+
+  const link = document.getElementById('qa-report-link');
+  if (st.report_path) { link.style.display = ''; link.innerHTML = 'Report written on the dashboard host: <code>' + escapeHTML(st.report_path) + '</code>'; }
+
+  if (!st.running && qaPoll) { clearInterval(qaPoll); qaPoll = null; }
+  if (st.running && !qaPoll) qaPoll = setInterval(pollQAStatus, 1500);
+}
+
+function qaRenderNow(st) {
+  const now = document.getElementById('qa-now');
+  const live = st.live || [];
+  if (!st.running || !live.length) { now.style.display = 'none'; return; }
+  now.style.display = '';
+  const l = live[live.length - 1];
+  setText('qa-now-name', st.current || '—');
+  setText('qa-now-phase', st.phase ? '· ' + st.phase : '');
+  setText('qa-now-real', l.grid_ok ? fmt(l.real_grid_W) + ' W' : 'no read');
+  setText('qa-now-hub', l.hub_reachable ? fmt(l.hub_grid_W) + ' W' : 'unreachable');
+  const div = (l.grid_ok && l.hub_reachable) ? Math.abs(l.real_grid_W - l.hub_grid_W) : 0;
+  const blindEl = document.getElementById('qa-now-blind');
+  blindEl.textContent = (l.grid_ok && l.hub_reachable) ? fmt(div) + ' W' : '—';
+  blindEl.style.color = div > 400 ? '#e879f9' : '#34d399';
+  setText('qa-now-solar', l.solar_ok ? fmt(l.solar_W) + '/' + fmt(l.solar_possible_W) + ' W' : '—');
+  setText('qa-now-soc', (l.bat_soc != null) ? l.bat_soc.toFixed(0) + '%' : '—');
+  const ad = document.getElementById('qa-now-adopt');
+  ad.textContent = l.hub_adopted ? (l.adopted_typ + ' ' + fmt(l.adopted_lim_W) + 'W') : 'no control';
+  ad.style.color = l.hub_adopted ? '#cbd5e1' : '#64748b';
+}
+
+function qaRenderFindings(findings) {
+  const el = document.getElementById('qa-findings');
+  if (!findings.length) { el.innerHTML = '<div style="color:#475569;font-size:12px;">No findings yet.</div>'; return; }
+  el.innerHTML = findings.map(f => {
+    const c = QA_COLORS[f.verdict] || '#94a3b8';
+    const m = f.metrics || {};
+    const chip = (label, val, good) => `<span style="margin-right:14px;"><span class="stat-label">${label}</span> <b style="color:${good === undefined ? '#cbd5e1' : (good ? '#34d399' : '#f87171')}">${val}</b></span>`;
+    const diag = (f.diagnosis || []).map(d => `<li>${escapeHTML(d)}</li>`).join('');
+    return `<div class="card" style="border-left:4px solid ${c};padding:12px;">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span class="qa-badge" style="background:${c}22;color:${c};">${f.verdict}</span>
+        <b style="color:#e2e8f0;">${escapeHTML(f.name)}</b>
+        <span style="color:#475569;font-size:11px;">${escapeHTML(f.category)} · ${escapeHTML(f.id)}</span>
+      </div>
+      <div style="margin-top:6px;color:${c};font-size:13px;">${escapeHTML(f.headline || '')}</div>
+      <div style="margin-top:8px;font-size:11.5px;">
+        ${chip('peak breach', fmt(m.peak_breach_W || 0) + ' W', (m.peak_breach_W || 0) === 0)}
+        ${chip('out of limit', (m.breach_seconds || 0) + ' s', (m.breach_seconds || 0) === 0)}
+        ${chip('adopted', m.hub_adopted ? 'yes' : 'no')}
+        ${chip('reacted', m.hub_reacted ? 'yes' : 'no')}
+        ${chip('CannotComply', m.reported_cannot_comply ? 'yes' : 'no')}
+        ${chip('blind', m.hub_blind ? 'YES' : 'no', !m.hub_blind)}
+        ${chip('sample errs', (m.sample_errors || 0) + '/' + (m.samples || 0))}
+      </div>
+      <details style="margin-top:8px;" ${(f.verdict === 'FAIL' || f.verdict === 'BLIND') ? 'open' : ''}>
+        <summary style="cursor:pointer;font-size:12px;color:#94a3b8;">Diagnosis &amp; where to look</summary>
+        <div style="font-size:12px;color:#94a3b8;margin-top:6px;line-height:1.55;">
+          <div style="margin-bottom:6px;"><span class="stat-label">Represents:</span> ${escapeHTML(f.hypothesis || '')}</div>
+          <div style="margin-bottom:6px;"><span class="stat-label">Expected:</span> ${escapeHTML(f.expected || '')}</div>
+          <ul style="margin:6px 0;padding-left:18px;">${diag}</ul>
+          ${f.fix ? `<div style="margin-top:6px;color:#7dd3fc;">&#128269; Where to look: ${escapeHTML(f.fix)}</div>` : ''}
+        </div>
+      </details>
+    </div>`;
+  }).join('');
 }
 
 // Poll the gridsim for CannotComply Responses the hub has posted. These are the
