@@ -39,6 +39,7 @@ SCENARIOS = [
     ("ramp-limit-curtail", "Inverter honours the limit but ramps to it slowly"),
     ("battery-wrong-sign", "Battery executes a commanded charge as a discharge"),
     ("battery-soc-refuse", "Battery accepts the discharge command but does nothing"),
+    ("ev-profile-reject", "Charger rejects the hub's current-limit profile"),
     ("stale-meter", "Grid meter freezes while the world changes"),
     ("battery-empty-import-cap", "Import cap at peak with an empty battery"),
     ("curtailment-release", "Generation-limit event ends — solar must recover"),

@@ -1230,6 +1230,9 @@ func (d *mayhemDriver) baseline() error {
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
+	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
+		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
+	}
 	_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
@@ -1273,6 +1276,9 @@ func (d *mayhemDriver) restoreBench() {
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
+	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
+		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
+	}
 	_ = d.post("solar", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("battery", "/inject", map[string]any{"Conn": 1, "WMaxLimPct_pct": 0})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
@@ -1456,6 +1462,30 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			evaluate: diagnoseConstraint,
 			teardown: func(d *mayhemDriver) {
 				_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
+			},
+		},
+		{
+			ID: "ev-profile-reject", Name: "Charger rejects the hub's current-limit profile",
+			Category:   "OCPP smart charging (INV-CONVERGE)",
+			Hypothesis: "Under an import cap with an empty battery (so the EV is the only lever) the hub sends a SetChargingProfile to dial the EV down, but the charger rejects smart charging and keeps drawing at full current. A hub that ignores the Rejected status keeps importing over the cap.",
+			Expected:   "Treat the rejected profile as a failure and react — pause the session, use another lever, or post CannotComply. Never assume the EV load dropped.",
+			HoldS:      70,
+			Fix:        "The OCPP bridge returns an error on a rejected/timed-out SetChargingProfile (2026-06 fix); the optimizer must act on it, not just log. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 5, "Conn": 1}) // empty → no battery lever, EV must be cut
+				_ = d.post("ev", "/inject", map[string]any{"action": "set_soc", "soc_pct": 30})
+				_ = d.post("ev", "/inject", map[string]any{"action": "start_session", "connector_id": 1})
+				d.injectEnv(300, 500) // low PV + light base load; the EV is the heavy draw
+				if err := d.post("ev", "/fault", map[string]any{"kind": "profile_reject"}); err != nil {
+					return nil, fmt.Errorf("arm profile_reject: %w", err)
+				}
+				return d.postCap("importCap", 0, 70, "mayhem: zero import cap, charger rejects EV curtailment")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(300, 500) },
+			evaluate: diagnoseConstraint,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("ev", "/fault", map[string]any{"kind": "profile_reject", "clear": true})
+				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
 			},
 		},
 		{

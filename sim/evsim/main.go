@@ -139,6 +139,7 @@ func main() {
 			nil,
 			nil,
 		)
+		api.SetFaultFn(h.ApplyFault)
 		// Tee logs into the API ring so the dashboard's Logs tab can stream them.
 		log.SetOutput(io.MultiWriter(os.Stderr, api.LogWriter()))
 	}
@@ -249,6 +250,7 @@ type evBattery struct {
 	commandedA float64 // current limit from last SetChargingProfile (A)
 	actualA    float64 // actual current per CC/CV model (A)
 	sessionWh  float64 // cumulative energy this session (Wh)
+	minFloorA  float64 // min_current_floor fault: charger won't modulate below this while charging (0 = off)
 }
 
 func newEVBattery(capacityWh, initialSOC, voltageV, maxCurrentA, simSpeed float64) *evBattery {
@@ -266,6 +268,15 @@ func newEVBattery(capacityWh, initialSOC, voltageV, maxCurrentA, simSpeed float6
 func (b *evBattery) SetCommandedA(a float64) {
 	b.mu.Lock()
 	b.commandedA = a
+	b.mu.Unlock()
+}
+
+// SetMinFloorA arms/clears the min_current_floor fault: while charging, the
+// charger will not modulate the current below floorA even when commanded lower
+// (a charger that cannot dim past its minimum). floorA <= 0 clears it.
+func (b *evBattery) SetMinFloorA(floorA float64) {
+	b.mu.Lock()
+	b.minFloorA = floorA
 	b.mu.Unlock()
 }
 
@@ -297,6 +308,12 @@ func (b *evBattery) Tick(dt time.Duration) (actualA float64, full bool) {
 	}
 
 	limit := math.Min(b.commandedA, b.MaxCurrentA)
+	// min_current_floor fault: the charger cannot modulate below its minimum, so a
+	// hub command to dim further is silently floored — the EV keeps drawing more
+	// than commanded.
+	if b.minFloorA > 0 && limit < b.minFloorA {
+		limit = b.minFloorA
+	}
 
 	if b.SOC < b.CVStartSOC {
 		// CC phase: full current.
@@ -512,6 +529,12 @@ func runChargingLoop(ctx context.Context, cs ocpp2.ChargingStation, h *csHandler
 				return sessionBatteryFull
 			}
 		case <-meterTicker.C:
+			if _, _, stopMeter := h.faults.get(); stopMeter {
+				// stop_metervalues fault: keep charging but report nothing, so the
+				// CSMS goes blind to the EV's actual draw. The hub must stop trusting
+				// the stale reading and budget the EV conservatively.
+				continue
+			}
 			soc, cur, energy := h.batt.State()
 			// Legacy MeterValues kept for CSMS implementations that predate
 			// the TransactionEvent handler; the Updated event is the
@@ -736,6 +759,72 @@ type csHandler struct {
 	txID          string
 	txSeqNo       int
 	txConnectorID int
+
+	faults evFaults // OCPP-layer fault injectors (POST /fault)
+}
+
+// evFaults holds the OCPP-layer fault injectors for evsim — the CSMS/charger
+// boundary equivalent of the Modbus sims' faultController. All fields guarded by
+// mu. min_current_floor lives on the evBattery (it shapes the charge current);
+// these three gate the OCPP message behaviour. The zero value is unarmed.
+type evFaults struct {
+	mu            sync.Mutex
+	rejectProfile bool // profile_reject: SetChargingProfile returns Rejected, limit not applied
+	applyNextTx   bool // apply_next_tx: ACCEPT the profile but don't apply it to the live session
+	stopMeter     bool // stop_metervalues: keep charging, stop sending MeterValues / Updated
+}
+
+func (f *evFaults) get() (reject, applyNext, stopMeter bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rejectProfile, f.applyNextTx, f.stopMeter
+}
+
+type evFaultSpec struct {
+	Kind  string  `json:"kind"`
+	AmpsA float64 `json:"amps_a,omitempty"` // min_current_floor: the floor in amps (default 6)
+	Clear bool    `json:"clear,omitempty"`
+}
+
+// ApplyFault arms or clears an OCPP-layer fault injector, wired to simapi
+// POST /fault. Supported kinds: profile_reject, apply_next_tx,
+// min_current_floor (amps_a, default 6 A), stop_metervalues. Each ACKs the OCPP
+// message at the protocol level while the charger misbehaves — the hub must not
+// assume success.
+func (h *csHandler) ApplyFault(body []byte) error {
+	var spec evFaultSpec
+	if err := json.Unmarshal(body, &spec); err != nil {
+		return fmt.Errorf("fault: %w", err)
+	}
+	switch spec.Kind {
+	case "profile_reject":
+		h.faults.mu.Lock()
+		h.faults.rejectProfile = !spec.Clear
+		h.faults.mu.Unlock()
+		log.Printf("[fault] profile_reject: armed=%v", !spec.Clear)
+	case "apply_next_tx":
+		h.faults.mu.Lock()
+		h.faults.applyNextTx = !spec.Clear
+		h.faults.mu.Unlock()
+		log.Printf("[fault] apply_next_tx: armed=%v", !spec.Clear)
+	case "stop_metervalues":
+		h.faults.mu.Lock()
+		h.faults.stopMeter = !spec.Clear
+		h.faults.mu.Unlock()
+		log.Printf("[fault] stop_metervalues: armed=%v", !spec.Clear)
+	case "min_current_floor":
+		floor := spec.AmpsA
+		if spec.Clear {
+			floor = 0
+		} else if floor <= 0 {
+			floor = 6 // OCPP minimum charge current default
+		}
+		h.batt.SetMinFloorA(floor)
+		log.Printf("[fault] min_current_floor: floor=%.1fA", floor)
+	default:
+		return fmt.Errorf("fault: unsupported kind %q for evsim", spec.Kind)
+	}
+	return nil
 }
 
 func (h *csHandler) setLastHeartbeat(t time.Time) { h.mu.Lock(); h.lastHeartbeat = t; h.mu.Unlock() }
@@ -1007,8 +1096,28 @@ func (h *csHandler) OnSetChargingProfile(req *smartcharging.SetChargingProfileRe
 	if len(p.ChargingSchedule) > 0 && len(p.ChargingSchedule[0].ChargingSchedulePeriod) > 0 {
 		info.LimitA = p.ChargingSchedule[0].ChargingSchedulePeriod[0].Limit
 	}
-	// Feed limit into the battery model so the CC/CV curve uses the new limit.
-	h.batt.SetCommandedA(info.LimitA)
+
+	reject, applyNext, _ := h.faults.get()
+	if reject {
+		// profile_reject fault: decline smart charging. The limit is NOT applied;
+		// the EV keeps drawing at its current rate. The hub must treat the Rejected
+		// status as a failure and react (the lexa bridge returns an error after the
+		// 2026-06 fix) — never assume the load dropped.
+		h.mu.Lock()
+		h.lastProfile = info
+		h.mu.Unlock()
+		log.Printf("evsim: SetChargingProfile evse=%d profile=%d REJECTED (fault profile_reject)", req.EvseID, p.ID)
+		return &smartcharging.SetChargingProfileResponse{Status: smartcharging.ChargingProfileStatusRejected}, nil
+	}
+	if applyNext {
+		// apply_next_tx fault: ACCEPT the profile but do not apply it to the live
+		// session — accept-but-ignore. The CSMS sees success while the EV keeps its
+		// prior draw; only the meter reveals the rate never changed.
+		log.Printf("evsim: SetChargingProfile evse=%d profile=%d ACCEPTED but not applied to live session (fault apply_next_tx)", req.EvseID, p.ID)
+	} else {
+		// Feed limit into the battery model so the CC/CV curve uses the new limit.
+		h.batt.SetCommandedA(info.LimitA)
+	}
 
 	h.mu.Lock()
 	h.lastProfile = info
