@@ -65,7 +65,9 @@ rest. Fault kinds are defined in `sim/southbound/sim.go` (`FaultKind`,
 `ack_before_effect`, `reject_write`, `enable_gate`, `ramp_limit` (solar);
 `wrong_sign`, `soc_refuse` (battery). **OCPP (CSMS/charger boundary):**
 `profile_reject`, `apply_next_tx`, `min_current_floor`, `stop_metervalues` (evsim).
-**Grid safety:** `disconnect` (gridsim opModConnect=false).
+**Grid safety:** `disconnect` (gridsim opModConnect=false). **Malformed CSIP**
+(gridsim `POST /admin/malform`, applied at serve time): `empty_program_list`,
+`huge_activepower`, `bad_duration`, `dup_mrid`, `missing_href`.
 
 The write layer (`RegisterMap.OnWriteAttempt` → `faultController.intercept`)
 decides what lands in the control register; the effect layer

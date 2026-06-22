@@ -932,6 +932,67 @@ func diagnoseDisconnect(sc *mayScenario, cons *activeConstraint, s []maySample) 
 	return f
 }
 
+// diagnoseMalform handles the malformed-resource scenario: a buggy/hostile CSIP
+// server serves a non-conformant resource while a safe control is active. The
+// hub must CONTAIN the error — never panic/hang, and never drop the safe control
+// for garbage or "none". It judges survivability first (did /status keep
+// answering), then reuses the constraint oracle to confirm the safe cap held.
+func diagnoseMalform(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	if len(s) == 0 {
+		f := baseFinding(sc)
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples"
+		return f
+	}
+	reach := 0
+	for _, smp := range s {
+		if smp.HubReachable {
+			reach++
+		}
+	}
+	if reach < len(s)/2 {
+		f := baseFinding(sc)
+		f.Metrics = scanSamples(cons, s)
+		f.Verdict = "FAIL"
+		f.Headline = "hub stopped responding under the malformed resource"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub's /status was unreachable on %d of %d samples after the malformed resource was served — a likely panic, hang, or walker deadlock.", len(s)-reach, len(s)),
+			"A buggy or hostile CSIP server must never be able to take the hub down; discovery errors must be contained.",
+			decisionLine(s),
+		}
+		f.Fix = "Harden the northbound walker/parser: bound the walk, validate resources, and fail closed to last-known-good controls on a malformed resource."
+		return f
+	}
+
+	// Survived. The safety oracle: the safe cap must have HELD — the malform must
+	// not have dropped it or replaced it with garbage. Judge by INV-EXPORT (a
+	// SUSTAINED, post-deadline breach), which already excuses the hub's normal
+	// curtailment settling ramp, and excuse it entirely if the hub admitted via
+	// CannotComply. A transient ramp is not a malform failure.
+	f := baseFinding(sc)
+	f.Metrics = scanSamples(cons, s)
+	breaches := invExport(cons, s)
+	if len(breaches) == 0 || f.Metrics.ReportedCannot {
+		f.Verdict = "PASS"
+		f.Headline = "contained the malformed resource and held the safe control"
+		f.Diagnosis = []string{
+			"The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.",
+			invSummaryLine("INV-EXPORT", breaches),
+			hubVsRealLine(s),
+		}
+		return f
+	}
+	f.Verdict = "FAIL"
+	f.Headline = "malformed resource unseated the safe control"
+	f.Diagnosis = []string{
+		invSummaryLine("INV-EXPORT", breaches),
+		"The malformed resource was served while a safe export cap was active, and the cap was then sustained-breached with no CannotComply — the bad resource dropped or corrupted the safe control instead of being contained.",
+		decisionLine(s),
+	}
+	f.Fix = "Harden the northbound walker/parser; on a malformed resource fail closed to last-known-good controls rather than dropping or adopting garbage."
+	return f
+}
+
 // ── Diagnosis helpers ──────────────────────────────────────────────────────────
 
 func hubVsRealLine(s []maySample) string {
@@ -1296,6 +1357,7 @@ func (d *mayhemDriver) baseline() error {
 	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
 		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
 	}
+	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
 	_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
@@ -1342,6 +1404,7 @@ func (d *mayhemDriver) restoreBench() {
 	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
 		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
 	}
+	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
 	_ = d.post("solar", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("battery", "/inject", map[string]any{"Conn": 1, "WMaxLimPct_pct": 0})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
@@ -1582,6 +1645,32 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
 			evaluate: diagnoseDisconnect,
 			teardown: func(d *mayhemDriver) { d.deleteControls(0) }, // re-energize
+		},
+		{
+			ID: "malformed-csip", Name: "Grid server serves a malformed resource",
+			Category:   "CSIP robustness (INV-EXPORT survivability)",
+			Hypothesis: "A buggy or hostile 2030.5 server serves a malformed DERControlList (the same control mRID twice) while a safe export cap is active. The hub must contain the parse error — never panic/hang, never drop the safe control for garbage or 'none'.",
+			Expected:   "Stay up (/status keeps answering) and keep enforcing the active export cap. A malformed resource must not take the hub down or unseat a safe control.",
+			HoldS:      45,
+			Fix:        "Harden the northbound walker/parser; on a malformed resource fail closed to last-known-good controls.",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // battery full → PV curtailment is the only lever
+				d.injectEnv(d.pvHighW, loadLow)
+				cons, err := d.postCap("exportCap", 0, 45, "mayhem: export cap then malformed resource")
+				if err != nil {
+					return nil, err
+				}
+				// Let the hub adopt the safe cap on a clean walk, THEN start serving
+				// garbage — so there is a safe control for the malform to threaten.
+				go func() {
+					time.Sleep(8 * time.Second)
+					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "dup_mrid"})
+				}()
+				return cons, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseMalform,
+			teardown: func(d *mayhemDriver) { _ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true}) },
 		},
 		{
 			ID: "stale-meter", Name: "Grid meter freezes while the world changes",

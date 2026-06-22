@@ -61,6 +61,11 @@ type Server struct {
 	// mupNextID is protected by mu; do not read/write outside the mu lock.
 	mupNextID int32
 
+	// malformKind, when non-empty, makes serveXML emit a deliberately
+	// non-conformant variant of the matching resource (QA fault injection via
+	// POST /admin/malform). Guarded by mu. See malform.go.
+	malformKind string
+
 	// Response log (CORE-022: client POSTs Response on event transitions)
 	responseMu sync.Mutex
 	responses  []model.Response
@@ -340,11 +345,17 @@ func (s *Server) handleMUPReadings(w http.ResponseWriter, r *http.Request, path 
 
 // serveXML marshals resource to IEEE 2030.5 XML and writes it to w.
 func (s *Server) serveXML(w http.ResponseWriter, resource interface{}) {
-	data, err := xml.MarshalIndent(resource, "", "  ")
-	if err != nil {
-		log.Printf("[gridsim] marshal error: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
+	// QA: if a malform mode is armed and matches this resource, serve the
+	// deliberately non-conformant bytes instead of the well-formed marshal.
+	data, malformed := s.malformedXML(resource)
+	if !malformed {
+		var err error
+		data, err = xml.MarshalIndent(resource, "", "  ")
+		if err != nil {
+			log.Printf("[gridsim] marshal error: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 	}
 	xmlDecl := []byte(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 	body := append(xmlDecl, data...)

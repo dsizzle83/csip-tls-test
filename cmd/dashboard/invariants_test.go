@@ -130,6 +130,40 @@ func TestDiagnoseDisconnect_Verdicts(t *testing.T) {
 	}
 }
 
+// diagnoseMalform: surviving + holding the cap is PASS; a hang or an unseated
+// safe control is FAIL — the hub's normal curtailment ramp must NOT be mistaken
+// for a malform failure.
+func TestDiagnoseMalform_Verdicts(t *testing.T) {
+	cons := exportCons() // exportCap ≤ 0
+
+	// Reachable and the cap held (no sustained breach) → contained → PASS.
+	held := mkSamples(40, func(i int, s *maySample) {
+		s.HubReachable = true
+		s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+		s.RealGridW, s.HubGridW = 0, 0
+	})
+	if f := diagnoseMalform(scFor("malformed-csip"), cons, held); f.Verdict != "PASS" {
+		t.Fatalf("contained verdict = %q, want PASS (%s)", f.Verdict, f.Headline)
+	}
+
+	// /status stopped answering → panic/hang → FAIL.
+	dead := mkSamples(40, func(i int, s *maySample) { s.HubReachable = false })
+	if f := diagnoseMalform(scFor("malformed-csip"), cons, dead); f.Verdict != "FAIL" {
+		t.Fatalf("unreachable verdict = %q, want FAIL", f.Verdict)
+	}
+
+	// Survived but the cap was sustained-breached with no CannotComply → the
+	// malform unseated the safe control → FAIL.
+	unseated := mkSamples(40, func(i int, s *maySample) {
+		s.HubReachable = true
+		s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+		s.RealGridW, s.HubGridW = -3000, -3000 // exporting over the 0 cap, sustained
+	})
+	if f := diagnoseMalform(scFor("malformed-csip"), cons, unseated); f.Verdict != "FAIL" {
+		t.Fatalf("unseated verdict = %q, want FAIL", f.Verdict)
+	}
+}
+
 // diagnoseSOC turns an INV-SOC violation into a FAIL and a clean timeline into a
 // PASS.
 func TestDiagnoseSOC_Verdicts(t *testing.T) {

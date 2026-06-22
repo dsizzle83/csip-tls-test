@@ -20,6 +20,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/default", cors(s.handleAdminDefault))
 	mux.HandleFunc("/admin/clock", cors(s.handleAdminClock))
 	mux.HandleFunc("/admin/alerts", cors(s.handleAdminAlerts))
+	mux.HandleFunc("/admin/malform", cors(s.handleAdminMalform))
 	mux.HandleFunc("/admin/logs", cors(s.logBuf.ServeHTTP))
 	return mux
 }
