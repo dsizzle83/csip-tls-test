@@ -2,7 +2,7 @@
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi sync-hub-pi \
         start-server conformance-pi \
-        test test-fast test-integration test-update-golden test-southbound \
+        test test-fast test-integration test-update-golden test-southbound qa qa-bench \
         modsim-image modsim-run modsim-stop \
         gen-test-certs gen-client-cert smoke-pi clean help
 
@@ -257,6 +257,19 @@ test: $(CA_CERT) test-fast test-integration
 # Pulls cgo for compilation but does no TLS handshakes.
 test-fast:
 	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/southbound/sunspec/
+
+# Hostile-QA deterministic-regression gate (Phase 5): fault-injector + diagnoser
+# unit tests, no bench. Add the live mayhem suite with: make qa-bench.
+qa:
+	bash scripts/qa-regression.sh
+
+# Hostile-QA bench suite: unit gate + the full curated mayhem run against the
+# bench dashboard. Override BENCH=... for a different host; add MODE=--matrix for
+# the fault-matrix run mode.
+BENCH ?= http://69.0.0.20:8080
+MODE ?=
+qa-bench:
+	bash scripts/qa-regression.sh --bench $(BENCH) $(MODE)
 
 # Southbound unit + integration tests (no hardware required; uses in-process Modbus server).
 # Includes the in-process Modbus conformance suite (TestModbusConformance_*).

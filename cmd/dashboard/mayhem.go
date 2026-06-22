@@ -188,7 +188,8 @@ type mayScenario struct {
 
 type mayhemStartReq struct {
 	SampleMs int      `json:"sample_ms"`
-	Only     []string `json:"only"` // run only these scenario IDs (empty = all)
+	Only     []string `json:"only"`   // run only these scenario IDs (empty = all)
+	Matrix   bool     `json:"matrix"` // run the fault-matrix run mode instead of the curated suite
 }
 
 func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
@@ -203,6 +204,9 @@ func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	scenarios := d.scenarios()
+	if req.Matrix {
+		scenarios = d.matrixScenarios()
+	}
 	if len(req.Only) > 0 {
 		want := map[string]bool{}
 		for _, id := range req.Only {
@@ -287,6 +291,9 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 
 		d.setPhase(i, sc, "setup")
 		log.Printf("mayhem: [%d/%d] %s — %s", i+1, len(scenarios), sc.ID, sc.Name)
+
+		// Isolate each scenario from the previous one's device/fault state.
+		d.resetForScenario()
 
 		cons := &activeConstraint{Typ: "none"}
 		if sc.setup != nil {
@@ -1348,16 +1355,7 @@ func (d *mayhemDriver) baseline() error {
 	if err := d.post("meter", "/control", map[string]any{"cmd": "resume"}); err != nil {
 		return fmt.Errorf("meter sim: %w", err)
 	}
-	_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
-	_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
-	_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
-	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
-	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
-	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
-	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
-		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
-	}
-	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
+	d.clearAllFaults()
 	_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
@@ -1369,6 +1367,39 @@ func (d *mayhemDriver) baseline() error {
 		d.pvHighW = math.Min(6000, np*0.96)
 	}
 	return nil
+}
+
+// clearAllFaults disarms every fault injector across the bench (Modbus DER
+// faults, OCPP faults, gridsim malform). Shared by baseline, restoreBench, and
+// the per-scenario reset.
+func (d *mayhemDriver) clearAllFaults() {
+	_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
+	_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
+	_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
+	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
+	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
+	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
+	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
+		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
+	}
+	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
+}
+
+// resetForScenario isolates each scenario from the previous one's device state.
+// Without it a device left curtailed (or a fault left armed) by scenario N can
+// mask a fault in scenario N+1 — e.g. a reject_write that "rejects" a new
+// curtailment simply holds the prior scenario's low ceiling, so the breach never
+// shows. It clears every fault, all controls and clock skew, returns the inverter
+// to an uncurtailed start and idles the battery, so each scenario starts clean.
+func (d *mayhemDriver) resetForScenario() {
+	for prog := 0; prog <= 2; prog++ {
+		d.deleteControls(prog)
+	}
+	_ = d.post("gridsim", "/admin/clock", map[string]any{"offset_s": 0})
+	d.clearAllFaults()
+	_ = d.post("solar", "/inject", map[string]any{"WMaxLimPct_pct": 100}) // uncurtail
+	_ = d.post("battery", "/inject", map[string]any{"WMaxLimPct_pct": 0}) // idle
+	_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
 }
 
 // solarNameplateW reads the inverter's nameplate WMax from the solar sim.
@@ -1395,16 +1426,8 @@ func (d *mayhemDriver) restoreBench() {
 	for prog := 0; prog <= 2; prog++ {
 		d.deleteControls(prog)
 	}
-	_ = d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "clear": true})
-	_ = d.post("solar", "/fault", map[string]any{"kind": "reject_write", "clear": true})
-	_ = d.post("solar", "/fault", map[string]any{"kind": "enable_gate", "clear": true})
-	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
-	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
-	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
-	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
-		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
-	}
-	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
+	d.clearAllFaults()
+	_ = d.post("solar", "/inject", map[string]any{"WMaxLimPct_pct": 100}) // uncurtail the inverter
 	_ = d.post("solar", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("battery", "/inject", map[string]any{"Conn": 1, "WMaxLimPct_pct": 0})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})

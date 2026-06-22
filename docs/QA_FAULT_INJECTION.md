@@ -114,6 +114,20 @@ diagnosers and invariant predicates unit-tested in
 diagnosers distinguish ignore (FAIL) / catch-and-admit (DEGRADED) /
 slew-converging (DEGRADED) / wrong-direction (FAIL) / ceased-to-energize (PASS).
 
+### Run modes (Phase 5)
+
+- **Deterministic regression gate** — `make qa` (or `scripts/qa-regression.sh`)
+  runs the fault-injector + diagnoser unit tests; fast, no bench, CI-gatable
+  (non-zero exit on any failure). `make qa-bench` adds the live mayhem suite.
+- **Curated suite** — `scripts/mayhem.py` runs the hand-written scenarios and
+  exits non-zero on any FAIL/BLIND.
+- **Fault matrix** — `scripts/mayhem.py --matrix` (or `make qa-bench MODE=--matrix`)
+  runs a curated, pairwise cross of {grid constraint × device fault} each WITH and
+  WITHOUT a ±60 s clock-jitter modifier (`cmd/dashboard/matrix.go`), so one run
+  sweeps fault×timing interactions. Each scenario is isolated by `resetForScenario`
+  (clears faults/controls, uncurtails the inverter) so one scenario's device state
+  cannot mask a fault in the next.
+
 ---
 
 ## Fault matrix (roadmap)

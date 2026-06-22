@@ -94,9 +94,9 @@ def cmd_abort(base):
     return 0
 
 
-def run(base, only, sample_ms, as_json):
+def run(base, only, sample_ms, as_json, matrix=False):
     # Kick off the run.
-    payload = {"sample_ms": sample_ms, "only": only}
+    payload = {"sample_ms": sample_ms, "only": only, "matrix": matrix}
     try:
         started = api(base, "/api/qa/start", method="POST", body=payload)
     except urllib.error.HTTPError as e:
@@ -220,6 +220,8 @@ def main():
     ap.add_argument("--json", action="store_true", help="emit the raw status JSON instead of a report")
     ap.add_argument("--list", action="store_true", help="list scenario IDs and exit")
     ap.add_argument("--abort", action="store_true", help="abort a run in progress and exit")
+    ap.add_argument("--matrix", action="store_true",
+                    help="run the fault-matrix mode (constraint × fault × clock jitter) instead of the curated suite")
     args = ap.parse_args()
 
     if args.list:
@@ -229,13 +231,16 @@ def main():
         return cmd_abort(args.dashboard)
 
     only = [s.strip() for s in args.only.split(",") if s.strip()]
-    valid = {sid for sid, _ in SCENARIOS}
-    bad = [s for s in only if s not in valid]
-    if bad:
-        print(f"unknown scenario id(s): {', '.join(bad)} (see --list)", file=sys.stderr)
-        return 2
+    # Matrix scenario IDs (matrix/...) are generated server-side, so skip the
+    # curated-suite validation when --matrix is set and let the server filter.
+    if not args.matrix:
+        valid = {sid for sid, _ in SCENARIOS}
+        bad = [s for s in only if s not in valid]
+        if bad:
+            print(f"unknown scenario id(s): {', '.join(bad)} (see --list)", file=sys.stderr)
+            return 2
 
-    return run(args.dashboard, only, args.sample_ms, args.json)
+    return run(args.dashboard, only, args.sample_ms, args.json, args.matrix)
 
 
 if __name__ == "__main__":
