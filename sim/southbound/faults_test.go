@@ -222,6 +222,42 @@ func TestFaultSocRefuse_ZeroesBatteryOutput(t *testing.T) {
 	}
 }
 
+// TestFaultDirectionalDisable verifies charge_disabled / discharge_disabled zero
+// only the matching direction (+ discharge / − charge) and pass the other through.
+func TestFaultDirectionalDisable(t *testing.T) {
+	const discharge, charge = 2500.0, -2500.0
+	var fc faultController
+	fc.label = "battery"
+
+	// discharge_disabled: a discharge is refused, a charge still flows.
+	fc.dischargeDisabled = true
+	if got := fc.shapeBatteryW(discharge); got != 0 {
+		t.Errorf("discharge_disabled: discharge = %.0fW, want 0", got)
+	}
+	if got := fc.shapeBatteryW(charge); got != charge {
+		t.Errorf("discharge_disabled: charge = %.0fW, want %.0f (pass-through)", got, charge)
+	}
+	fc.dischargeDisabled = false
+
+	// charge_disabled: a charge is refused, a discharge still flows.
+	fc.chargeDisabled = true
+	if got := fc.shapeBatteryW(charge); got != 0 {
+		t.Errorf("charge_disabled: charge = %.0fW, want 0", got)
+	}
+	if got := fc.shapeBatteryW(discharge); got != discharge {
+		t.Errorf("charge_disabled: discharge = %.0fW, want %.0f (pass-through)", got, discharge)
+	}
+	fc.chargeDisabled = false
+
+	// Unarmed: both pass through.
+	if got := fc.shapeBatteryW(discharge); got != discharge {
+		t.Errorf("unarmed discharge = %.0fW, want %.0f", got, discharge)
+	}
+	if got := fc.shapeBatteryW(charge); got != charge {
+		t.Errorf("unarmed charge = %.0fW, want %.0f", got, charge)
+	}
+}
+
 // TestFaultTransportRead verifies the transport-layer (Modbus read-path) faults:
 // nan_sentinel rewrites every value to 0x8000, exception_code returns an error,
 // latency delays the read.

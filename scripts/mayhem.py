@@ -39,6 +39,8 @@ SCENARIOS = [
     ("ramp-limit-curtail", "Inverter honours the limit but ramps to it slowly"),
     ("battery-wrong-sign", "Battery executes a commanded charge as a discharge"),
     ("battery-soc-refuse", "Battery accepts the discharge command but does nothing"),
+    ("battery-charge-disabled", "Battery refuses to charge away excess solar"),
+    ("battery-reboot", "Battery drops off the bus mid-control, then reboots"),
     ("ev-profile-reject", "Charger rejects the hub's current-limit profile"),
     ("ev-accept-but-ignore", "Charger ACKs the current-limit profile but ignores it"),
     ("ev-min-current-floor", "Charger cannot throttle below its 6 A minimum"),

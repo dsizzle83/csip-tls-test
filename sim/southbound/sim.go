@@ -101,6 +101,23 @@ const (
 	// device failure). The hub must treat the error as device-down — never act on
 	// a missing reading — and surface it.
 	FaultModbusException FaultKind = "exception_code"
+
+	// ── Directional battery faults — effect-time, act on the commanded power. ──
+
+	// FaultChargeDisabled makes the battery refuse to CHARGE: a commanded charge
+	// (negative power) produces zero while a discharge passes through. Models a
+	// pack whose charge contactor/BMS is disabled or a charge-inhibit flag is set.
+	// A hub that commands the battery to absorb excess solar to hold an export cap,
+	// and assumes it did, keeps exporting over the cap (INV-CONVERGE / INV-EXPORT).
+	FaultChargeDisabled FaultKind = "charge_disabled"
+
+	// FaultDischargeDisabled makes the battery refuse to DISCHARGE: a commanded
+	// discharge (positive power) produces zero while a charge passes through. This
+	// is also the "reserve-only" pack (BMS holding charge above a reserve floor)
+	// as the hub observes it — commanded discharge, zero output. A hub that leans
+	// on the battery to offset an import cap must detect the no-op and fall back or
+	// post CannotComply (INV-CONVERGE).
+	FaultDischargeDisabled FaultKind = "discharge_disabled"
 )
 
 // FaultSpec is the parsed body of POST /fault. A sim interprets the fields

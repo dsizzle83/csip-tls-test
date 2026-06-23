@@ -1194,6 +1194,98 @@ func diagnoseEVFreeze(sc *mayScenario, cons *activeConstraint, s []maySample) ma
 	return f
 }
 
+// diagnoseReboot judges a device that drops off the Modbus bus and later returns
+// (battery-reboot arms exception_code, then clears it mid-scenario). The oracle is
+// three-part: the hub must (1) survive the outage — stay reachable, never hang on
+// the dead device; (2) never report an impossible battery SoC/power while it is
+// down; (3) recover a live reading after it returns. A pack that stays dropped for
+// the whole post-reboot tail is BLIND (the hub never reconnected).
+func diagnoseReboot(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+
+	reach := 0
+	for _, smp := range s {
+		if smp.HubReachable {
+			reach++
+		}
+	}
+	if reach < len(s)/2 {
+		f.Verdict = "FAIL"
+		f.Headline = "hub stopped responding while the battery was off the bus"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub's /status was unreachable on %d of %d samples — a dead battery blocked or crashed its control loop.", len(s)-reach, len(s)),
+			"A device that stops answering must never take the hub down; reads must be bounded by a timeout and the pack marked down.",
+		}
+		f.Fix = "Bound battery reads with a timeout and mark the pack down on error; never block the optimizer on one device (lexa-modbus)."
+		return f
+	}
+
+	// Impossible battery telemetry anywhere ⇒ the hub treated a missing/garbage
+	// read as a real value. SoC is a percentage; battery power is well under 20 kW.
+	garbage := 0
+	var worstSOC float64 = 60
+	for _, smp := range s {
+		if !smp.HubReachable {
+			continue
+		}
+		if smp.BatSOC > 101 || smp.BatSOC < -1 || math.Abs(smp.BatteryW) > 20000 {
+			garbage++
+			if math.Abs(smp.BatSOC-50) > math.Abs(worstSOC-50) {
+				worstSOC = smp.BatSOC
+			}
+		}
+	}
+	if garbage > len(s)/4 {
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("hub reported an impossible battery reading (SoC %.0f%%)", worstSOC)
+		f.Diagnosis = []string{
+			fmt.Sprintf("On %d of %d samples the hub reported a physically-impossible battery SoC/power — it interpreted the exception/garbage from the off-bus pack as a real reading.", garbage, len(s)),
+			"A dropped device must be marked down and its SoC stale-expired, not surfaced as live data.",
+			decisionLine(s),
+		}
+		f.Fix = "On a Modbus exception mark the pack down and stale-expire its SoC; treat 0x8000/0xFFFF as N/A (lexa-modbus / sunspec)."
+		return f
+	}
+
+	// Recovery: after the reboot the pack should read live again. If the entire
+	// post-reboot tail still shows a dead (≈0) SoC, the hub never reconnected.
+	endT := s[len(s)-1].T
+	tailLive, tailSeen := false, false
+	for _, smp := range s {
+		if smp.T < endT-float64(mayConvergeHoldS) || !smp.HubReachable {
+			continue
+		}
+		tailSeen = true
+		if smp.BatSOC > 1 {
+			tailLive = true
+		}
+	}
+	if tailSeen && !tailLive {
+		f.Verdict = "BLIND"
+		f.Headline = "battery never came back after the reboot"
+		f.Diagnosis = []string{
+			"The hub rode out the outage without crashing or reporting garbage, but its battery reading stayed dead (≈0% SoC) through the whole post-reboot tail — it did not re-establish the pack after it returned to the bus.",
+			"A rebooted device that answers again must be re-read; a permanently-dropped pack silently removes a control lever.",
+		}
+		f.Fix = "Re-probe / re-read a device after a Modbus error clears; do not latch it down permanently (lexa-modbus reconnect)."
+		return f
+	}
+
+	f.Verdict = "PASS"
+	f.Headline = "hub rode out the battery reboot and recovered a live reading"
+	f.Diagnosis = []string{
+		"The hub stayed up through the outage, never reported an impossible SoC/power, and read a live battery again after it returned to the bus.",
+		fmt.Sprintf("Final battery reading: SoC %.0f%%, power %.0f W.", s[len(s)-1].BatSOC, s[len(s)-1].BatteryW),
+	}
+	return f
+}
+
 // ── Diagnosis helpers ──────────────────────────────────────────────────────────
 
 func hubVsRealLine(s []maySample) string {
@@ -1610,6 +1702,8 @@ func (d *mayhemDriver) clearAllFaults() {
 	_ = d.post("solar", "/fault", map[string]any{"kind": "ramp_limit", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "wrong_sign", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
+	_ = d.post("battery", "/fault", map[string]any{"kind": "charge_disabled", "clear": true})
+	_ = d.post("battery", "/fault", map[string]any{"kind": "discharge_disabled", "clear": true})
 	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
 		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
 	}
@@ -1869,6 +1963,53 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			evaluate: diagnoseConstraint,
 			teardown: func(d *mayhemDriver) {
 				_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
+			},
+		},
+		{
+			ID: "battery-charge-disabled", Name: "Battery refuses to charge away excess solar",
+			Category:   "Resource limits (INV-CONVERGE)",
+			Hypothesis: "Under a zero-export cap at full sun the hub commands the battery to CHARGE and soak up the excess PV — but the pack's charge contactor is disabled and it ACKs the setpoint while absorbing nothing. A hub that assumes the battery is absorbing keeps exporting over the cap instead of falling back to curtailing the inverter.",
+			Expected:   "Detect that the battery is not actually charging and fall back to its other lever — curtail the inverter — to hold the export cap (or post CannotComply). Never assume the commanded charge happened.",
+			HoldS:      70,
+			Fix:        "Verify measured battery power against the commanded charge; when the pack does not absorb, curtail solar to hold the cap (orchestrator lever fallback). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1}) // room to charge
+				d.injectEnv(d.pvHighW, loadLow)                                            // excess PV → hub wants to charge the battery
+				if err := d.post("battery", "/fault", map[string]any{"kind": "charge_disabled"}); err != nil {
+					return nil, fmt.Errorf("arm charge_disabled: %w", err)
+				}
+				return d.postCap("exportCap", 0, 70, "mayhem: zero export cap, battery refuses to charge")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseConstraint,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("battery", "/fault", map[string]any{"kind": "charge_disabled", "clear": true})
+			},
+		},
+		{
+			ID: "battery-reboot", Name: "Battery drops off the bus mid-control, then reboots",
+			Category:   "Device dropout (INV-TRANSPORT)",
+			Hypothesis: "The battery stops answering Modbus (a watchdog reboot / lost link) for ~20 s while the hub is leaning on it, then comes back. A hub that hangs on the dead device, crashes, or treats the missing/garbage reads as a real SoC/power, mismanages the whole site; on recovery it must re-establish a sane reading.",
+			Expected:   "Ride out the outage: stay up, mark the pack down/stale, never report an impossible SoC or power, and recover a live reading once it returns.",
+			HoldS:      50,
+			Fix:        "Bound battery reads with a timeout, mark the pack down on error and stale-expire its SoC, and re-read cleanly on reconnect (lexa-modbus battery adapter).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 60, "Conn": 1})
+				d.injectEnv(d.pvHighW, loadLow)
+				if err := d.post("battery", "/fault", map[string]any{"kind": "exception_code"}); err != nil {
+					return nil, fmt.Errorf("arm exception_code: %w", err)
+				}
+				return &activeConstraint{Typ: "none"}, nil
+			},
+			perTick: func(d *mayhemDriver, i int) {
+				d.injectEnv(d.pvHighW, loadLow)
+				if i == 20 { // ~20 s in: the pack reboots and answers the bus again
+					_ = d.post("battery", "/fault", map[string]any{"kind": "exception_code", "clear": true})
+				}
+			},
+			evaluate: diagnoseReboot,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("battery", "/fault", map[string]any{"kind": "exception_code", "clear": true})
 			},
 		},
 		{

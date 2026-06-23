@@ -71,6 +71,12 @@ type faultController struct {
 	// produces zero power. See shapeBatteryW.
 	refuse bool
 
+	// charge_disabled / discharge_disabled (effect-time, battery): the pack
+	// refuses only one direction. Sign convention matches shapeBatteryW:
+	// + is discharge, − is charge. See shapeBatteryW.
+	chargeDisabled    bool
+	dischargeDisabled bool
+
 	// Transport-layer (Modbus read-path) faults. See transportRead.
 	nanSentinel     bool // every read returns 0x8000 (SunSpec N/A)
 	latencyMs       int  // per-read delay
@@ -110,7 +116,17 @@ func (fc *faultController) transportRead(vals []uint16) ([]uint16, error) {
 func (fc *faultController) shapeBatteryW(commandedW float64) float64 {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
-	if fc.refuse && !math.IsNaN(commandedW) {
+	if math.IsNaN(commandedW) {
+		return commandedW
+	}
+	if fc.refuse {
+		return 0
+	}
+	// Directional refusal: + is discharge, − is charge.
+	if fc.dischargeDisabled && commandedW > 0 {
+		return 0
+	}
+	if fc.chargeDisabled && commandedW < 0 {
 		return 0
 	}
 	return commandedW
@@ -309,6 +325,14 @@ func (fc *faultController) apply(body []byte, supported map[FaultKind]bool) erro
 	case FaultSocRefuse:
 		fc.refuse = !spec.Clear
 		log.Printf("[fault] soc_refuse: %s armed=%v", fc.label, fc.refuse)
+
+	case FaultChargeDisabled:
+		fc.chargeDisabled = !spec.Clear
+		log.Printf("[fault] charge_disabled: %s armed=%v", fc.label, fc.chargeDisabled)
+
+	case FaultDischargeDisabled:
+		fc.dischargeDisabled = !spec.Clear
+		log.Printf("[fault] discharge_disabled: %s armed=%v", fc.label, fc.dischargeDisabled)
 
 	case FaultNanSentinel:
 		fc.nanSentinel = !spec.Clear

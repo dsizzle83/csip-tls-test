@@ -365,6 +365,50 @@ func TestDiagnoseEVFreeze_FailOnBreach(t *testing.T) {
 	assertDiag(t, f, "lost the import cap")
 }
 
+func noneCons() *activeConstraint { return &activeConstraint{Typ: "none"} }
+
+func TestDiagnoseReboot_RecoversPasses(t *testing.T) {
+	// Hub stays up, SoC stays sane, and the tail shows a live battery.
+	s := mkSamples(40, func(i int, s *maySample) { s.BatSOC = 60; s.BatteryW = -1000 })
+	f := diagnoseReboot(scFor("rb-pass"), noneCons(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS (%s)", f.Verdict, f.Headline)
+	}
+}
+
+func TestDiagnoseReboot_HubDownFails(t *testing.T) {
+	// Hub unreachable for most of the outage → the dead device blocked it.
+	s := mkSamples(40, func(i int, s *maySample) {
+		s.BatSOC = 60
+		s.HubReachable = i < 5
+	})
+	f := diagnoseReboot(scFor("rb-down"), noneCons(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL", f.Verdict)
+	}
+	assertDiag(t, f, "must never take the hub down")
+}
+
+func TestDiagnoseReboot_GarbageSOCFails(t *testing.T) {
+	// Hub surfaces an impossible SoC (255%) from the off-bus pack.
+	s := mkSamples(40, func(i int, s *maySample) { s.BatSOC = 255 })
+	f := diagnoseReboot(scFor("rb-garbage"), noneCons(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL", f.Verdict)
+	}
+	assertDiag(t, f, "impossible battery")
+}
+
+func TestDiagnoseReboot_NeverRecoversBlind(t *testing.T) {
+	// Survived, no garbage, but the battery reads dead (0%) through the whole tail.
+	s := mkSamples(40, func(i int, s *maySample) { s.BatSOC = 0; s.BatteryW = 0 })
+	f := diagnoseReboot(scFor("rb-blind"), noneCons(), s)
+	if f.Verdict != "BLIND" {
+		t.Fatalf("verdict = %s, want BLIND (%s)", f.Verdict, f.Headline)
+	}
+	assertDiag(t, f, "did not re-establish")
+}
+
 func assertDiag(t *testing.T, f mayFinding, want string) {
 	t.Helper()
 	for _, line := range f.Diagnosis {

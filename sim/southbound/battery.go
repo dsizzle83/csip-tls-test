@@ -52,12 +52,14 @@ type BatteryServer struct {
 
 // batteryFaultKinds is the set of POST /fault kinds the battery sim advertises.
 var batteryFaultKinds = map[FaultKind]bool{
-	FaultRejectWrite:     true,
-	FaultWrongSign:       true,
-	FaultSocRefuse:       true,
-	FaultNanSentinel:     true,
-	FaultLatency:         true,
-	FaultModbusException: true,
+	FaultRejectWrite:       true,
+	FaultWrongSign:         true,
+	FaultSocRefuse:         true,
+	FaultChargeDisabled:    true,
+	FaultDischargeDisabled: true,
+	FaultNanSentinel:       true,
+	FaultLatency:           true,
+	FaultModbusException:   true,
 }
 
 // NewBatteryServer creates and starts an animated Li-Ion battery simulator.
