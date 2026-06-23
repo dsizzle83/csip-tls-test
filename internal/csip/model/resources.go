@@ -160,13 +160,14 @@ type FunctionSetAssignments struct {
 	// Subscribable indicates subscription support.
 	Subscribable uint8 `xml:"subscribable,attr,omitempty"`
 
-	// Links to DER program lists, time, pricing, etc.
-	DERProgramListLink    *ListLink `xml:"DERProgramListLink,omitempty"`
-	TariffProfileListLink *ListLink `xml:"TariffProfileListLink,omitempty"`
-	TimeLink              *Link     `xml:"TimeLink,omitempty"`
-	MRID                  string    `xml:"mRID,omitempty"`
-	Description           string    `xml:"description,omitempty"`
-	Version               uint16    `xml:"version,omitempty"`
+	// Links to DER program lists, time, pricing, billing, etc.
+	DERProgramListLink      *ListLink `xml:"DERProgramListLink,omitempty"`
+	TariffProfileListLink   *ListLink `xml:"TariffProfileListLink,omitempty"`
+	CustomerAccountListLink *ListLink `xml:"CustomerAccountListLink,omitempty"`
+	TimeLink                *Link     `xml:"TimeLink,omitempty"`
+	MRID                    string    `xml:"mRID,omitempty"`
+	Description             string    `xml:"description,omitempty"`
+	Version                 uint16    `xml:"version,omitempty"`
 }
 
 // FunctionSetAssignmentsList is a collection of FSA resources.

@@ -130,4 +130,15 @@ func TestMalform_PricingAttacks(t *testing.T) {
 	if _, ok := s.malformedXML(malformCtrlList("M-1")); ok {
 		t.Error("negative_price must not transform a DERControlList")
 	}
+
+	// empty_curve_list strips the curves from a served DERCurveList.
+	curves := &model.DERCurveList{
+		Resource: model.Resource{Href: "/derp/0/dc"}, All: 1, Results: 1,
+		DERCurve: []model.DERCurve{{Resource: model.Resource{Href: "/derp/0/dc/0"}, MRID: "C-1", CurveType: 1}},
+	}
+	s.SetMalform(MalformEmptyCurveList)
+	b, ok = s.malformedXML(curves)
+	if !ok || strings.Contains(string(b), "<DERCurve>") || !strings.Contains(string(b), `all="0"`) {
+		t.Errorf("empty_curve_list not applied:\n%s", b)
+	}
 }

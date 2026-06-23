@@ -35,6 +35,9 @@ const (
 	MalformNegativePrice      = "negative_price"       // ConsumptionTariffInterval price set negative
 	MalformHugePrice          = "huge_price"           // price set to int32 max (1000× and overflow bait)
 	MalformBadPriceMultiplier = "bad_price_multiplier" // TariffProfile pricePowerOfTenMultiplier absurd (10^100)
+
+	// DER curve (§) attack.
+	MalformEmptyCurveList = "empty_curve_list" // DERCurveList served with no curves (link present, curves absent)
 )
 
 var malformKinds = map[string]bool{
@@ -46,6 +49,7 @@ var malformKinds = map[string]bool{
 	MalformNegativePrice:      true,
 	MalformHugePrice:          true,
 	MalformBadPriceMultiplier: true,
+	MalformEmptyCurveList:     true,
 }
 
 // SetMalform arms (kind != "") or clears (kind == "") the malform mode.
@@ -146,6 +150,14 @@ func (s *Server) malformedXML(resource interface{}) ([]byte, bool) {
 			c := *tpl
 			c.TariffProfile = append([]model.TariffProfile(nil), tpl.TariffProfile...)
 			c.TariffProfile[0].PricePowerOfTenMultiplier = 100 // 10^100 — absurd
+			return marshalOrNil(&c)
+		}
+
+	case MalformEmptyCurveList:
+		if cl, ok := resource.(*model.DERCurveList); ok {
+			c := *cl
+			c.DERCurve = nil
+			c.All, c.Results = 0, 0
 			return marshalOrNil(&c)
 		}
 	}

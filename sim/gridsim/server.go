@@ -533,6 +533,10 @@ func (s *Server) buildResourceTree() {
 					Link: model.Link{Href: "/tp"},
 					All:  1,
 				},
+				CustomerAccountListLink: &model.ListLink{
+					Link: model.Link{Href: "/ca"},
+					All:  1,
+				},
 				TimeLink: &model.Link{Href: "/tm"},
 			},
 		},
@@ -556,6 +560,10 @@ func (s *Server) buildResourceTree() {
 				DERControlListLink: &model.ListLink{
 					Link: model.Link{Href: "/derp/0/derc"},
 					All:  4,
+				},
+				DERCurveListLink: &model.ListLink{
+					Link: model.Link{Href: "/derp/0/dc"},
+					All:  1,
 				},
 				ActiveDERControlListLink: &model.ListLink{
 					Link: model.Link{Href: "/derp/0/actderc"},
@@ -601,6 +609,7 @@ func (s *Server) buildResourceTree() {
 	s.buildProgram1(now)
 	s.buildProgram2(now)
 	s.buildPricing(now)
+	s.buildExtended(now)
 
 	// ── MirrorUsagePointList (/mup) ───────────────────────────
 	s.resources["/mup"] = &model.MirrorUsagePointList{

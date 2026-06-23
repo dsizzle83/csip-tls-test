@@ -44,6 +44,7 @@ SCENARIOS = [
     ("conflicting-primacy", "Higher-primacy control must win"),
     ("malformed-csip", "Grid server serves a malformed resource"),
     ("pricing-attack", "Grid server serves malicious pricing"),
+    ("curve-attack", "Grid server serves an empty DER curve list"),
     ("stale-meter", "Grid meter freezes while the world changes"),
     ("battery-empty-import-cap", "Import cap at peak with an empty battery"),
     ("curtailment-release", "Generation-limit event ends — solar must recover"),

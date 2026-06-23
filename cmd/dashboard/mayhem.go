@@ -1792,6 +1792,30 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			teardown: func(d *mayhemDriver) { _ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true}) },
 		},
 		{
+			ID: "curve-attack", Name: "Grid server serves an empty DER curve list",
+			Category:   "CSIP robustness (DER curves §)",
+			Hypothesis: "A program advertises a DERCurveListLink (Volt-VAr) but the server serves an empty curve list while a safe export cap is active. A missing/empty curve must be contained — discovery of optional curves is non-fatal and must never break DER control.",
+			Expected:   "Stay up and keep enforcing the active export cap; the empty curve list is contained. (Like pricing, the hub discovers DER curves but does not yet consume them for control.)",
+			HoldS:      45,
+			Fix:        "Curve discovery failures must stay non-fatal (they are). Curves are discovered but not yet applied to inverter control modes — a wiring gap, not a safety one.",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1})
+				d.injectEnv(d.pvHighW, loadLow)
+				cons, err := d.postCap("exportCap", 0, 45, "mayhem: export cap under empty curve list")
+				if err != nil {
+					return nil, err
+				}
+				go func() {
+					time.Sleep(8 * time.Second)
+					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "empty_curve_list"})
+				}()
+				return cons, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseMalform,
+			teardown: func(d *mayhemDriver) { _ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true}) },
+		},
+		{
 			ID: "stale-meter", Name: "Grid meter freezes while the world changes",
 			Category:   "Sensor integrity (INV-STALE)",
 			Hypothesis: "The revenue meter's reading stops updating (frozen TCP session / hung device) while PV climbs — the hub's grid signal goes stale.",
