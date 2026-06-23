@@ -1351,6 +1351,139 @@ func expiryRecoveryLine(s []maySample) string {
 	return "No solar sample to confirm post-expiry recovery."
 }
 
+// diagnoseBatteryGarbage judges a held transport fault on the battery (the pack's
+// registers read the 0x8000 N/A sentinel, so SoC/power decode to garbage). The hub
+// must stay up and never surface an impossible SoC (a percentage) or power — it
+// must recognise the sentinel as N/A rather than optimise against a fabricated SoC.
+func diagnoseBatteryGarbage(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+
+	reach := 0
+	for _, smp := range s {
+		if smp.HubReachable {
+			reach++
+		}
+	}
+	if reach < len(s)/2 {
+		f.Verdict = "FAIL"
+		f.Headline = "hub stopped responding under the battery transport fault"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub's /status was unreachable on %d of %d samples — a garbage/failed battery read blocked or crashed its control loop.", len(s)-reach, len(s)),
+			"A device returning garbage must never take the hub down; reads must be bounded and the pack marked down.",
+		}
+		f.Fix = sc.Fix
+		return f
+	}
+
+	garbage := 0
+	var worstSOC float64 = 50
+	for _, smp := range s {
+		if !smp.HubReachable {
+			continue
+		}
+		if smp.BatSOC > 101 || smp.BatSOC < -1 || math.Abs(smp.BatteryW) > 20000 {
+			garbage++
+			if math.Abs(smp.BatSOC-50) > math.Abs(worstSOC-50) {
+				worstSOC = smp.BatSOC
+			}
+		}
+	}
+	if garbage > len(s)/4 {
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("hub acted on a garbage battery reading (SoC %.0f%%)", worstSOC)
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub reported a physically-impossible battery SoC/power on %d of %d samples — it interpreted the SunSpec 0x8000 N/A sentinel as a real reading.", garbage, len(s)),
+			"A hub that acts on the not-implemented sentinel optimises against a fabricated SoC; 0x8000 must be treated as N/A and the pack marked unavailable.",
+			decisionLine(s),
+		}
+		f.Fix = sc.Fix
+		return f
+	}
+
+	f.Verdict = "PASS"
+	f.Headline = "hub did not act on the garbage battery reading"
+	f.Diagnosis = []string{
+		"The hub stayed up and never reported an impossible SoC/power under the transport fault — it recognised the sentinel as N/A and held a safe value.",
+		fmt.Sprintf("Final battery reading: SoC %.0f%%, power %.0f W.", s[len(s)-1].BatSOC, s[len(s)-1].BatteryW),
+	}
+	return f
+}
+
+// diagnoseEVFlap judges a flapping EVSE connector (status oscillating
+// Occupied/Faulted while a session is up). The hub must ride it out: stay up,
+// never command EV current over the station max (a sign it mis-tracked the
+// connector), and never surface an impossible EV power. Debouncing the flap is the
+// expected behaviour; thrashing or over-current is the failure.
+func diagnoseEVFlap(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+
+	reach := 0
+	for _, smp := range s {
+		if smp.HubReachable {
+			reach++
+		}
+	}
+	if reach < len(s)/2 {
+		f.Verdict = "FAIL"
+		f.Headline = "hub stopped responding while the connector flapped"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub's /status was unreachable on %d of %d samples — a flapping connector should never take it down.", len(s)-reach, len(s)),
+			"Debounce StatusNotification; a flaky connector must not block the control loop.",
+		}
+		f.Fix = sc.Fix
+		return f
+	}
+
+	if viol := invEVStationMax(s); len(viol) > 0 {
+		f.Metrics.HubBlind = false
+		f.Verdict = "FAIL"
+		f.Headline = "hub commanded EV current over the station max during the flap"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The EVSE drew over its configured station max on %d sample(s) — the hub mis-tracked the flapping connector and over-committed current.", len(viol)),
+			invSummaryLine("INV-EVMAX", viol),
+		}
+		f.Fix = sc.Fix
+		return f
+	}
+
+	garbage := 0
+	for _, smp := range s {
+		if smp.HubReachable && (smp.EvW < -100 || smp.EvW > 25000) {
+			garbage++
+		}
+	}
+	if garbage > len(s)/4 {
+		f.Verdict = "FAIL"
+		f.Headline = "hub reported an impossible EV power during the flap"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub reported a physically-impossible EVSE power on %d of %d samples while the connector flapped.", garbage, len(s)),
+			"A flapping connector must not corrupt the EVSE telemetry the optimizer reads.",
+		}
+		f.Fix = sc.Fix
+		return f
+	}
+
+	f.Verdict = "PASS"
+	f.Headline = "hub stayed stable through the connector flap"
+	f.Diagnosis = []string{
+		"The hub rode out the flapping connector: it stayed up, never commanded EV current over the station max, and reported no impossible EVSE power.",
+		"A flaky connector did not thrash the control loop.",
+	}
+	return f
+}
+
 // ── Diagnosis helpers ──────────────────────────────────────────────────────────
 
 func hubVsRealLine(s []maySample) string {
@@ -2394,6 +2527,51 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
 			evaluate: diagnoseExpiry,
 			teardown: func(d *mayhemDriver) {},
+		},
+		{
+			ID: "battery-nan-sentinel", Name: "Battery registers read the SunSpec N/A sentinel (0x8000)",
+			Category:   "Modbus transport (INV-TRANSPORT)",
+			Hypothesis: "The battery's registers all read 0x8000 — a half-initialised or failed bank. SoC decodes to a wild ~32768% and power to −32768 W. A hub that trusts it optimises against a fabricated SoC and would charge/discharge on garbage; this is the invalid-SoC (255 / NaN-equiv) hazard at the wire.",
+			Expected:   "Treat 0x8000 as N/A, mark the pack unavailable, and never surface an impossible SoC or power.",
+			HoldS:      35,
+			Fix:        "Treat 0x8000 (int16) / 0xFFFF (uint16) as not-implemented → N/A in the SunSpec decode and mark the pack down (lexa-modbus / sunspec).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 55, "Conn": 1})
+				d.injectEnv(d.pvHighW, loadLow)
+				if err := d.post("battery", "/fault", map[string]any{"kind": "nan_sentinel"}); err != nil {
+					return nil, fmt.Errorf("arm nan_sentinel: %w", err)
+				}
+				return &activeConstraint{Typ: "none"}, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseBatteryGarbage,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("battery", "/fault", map[string]any{"kind": "nan_sentinel", "clear": true})
+			},
+		},
+		{
+			ID: "ev-connector-flap", Name: "EVSE connector flaps Occupied/Faulted mid-session",
+			Category:   "OCPP observability (INV-EVMAX)",
+			Hypothesis: "A flaky connector (bad pilot or contactor) rapidly flaps its status between Occupied and Faulted while a session is up. A hub that re-plans on every StatusNotification can thrash its commands or mis-track the session and command current to a connector it believes is free.",
+			Expected:   "Debounce the flapping status, keep the session bounded, never command EV current over the station max, and stay up.",
+			HoldS:      50,
+			Fix:        "Debounce connector StatusNotification and bound EV current to the station max regardless of flap (lexa-ocpp).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("ev", "/inject", map[string]any{"action": "set_soc", "soc_pct": 40})
+				_ = d.post("ev", "/inject", map[string]any{"action": "start_session", "connector_id": 1})
+				d.injectEnv(300, 1500)
+				return &activeConstraint{Typ: "none"}, nil
+			},
+			perTick: func(d *mayhemDriver, i int) {
+				d.injectEnv(300, 1500)
+				st := []string{"Occupied", "Faulted"}[i%2] // flap the connector every tick
+				_ = d.post("ev", "/inject", map[string]any{"connector_id": 1, "status": st})
+			},
+			evaluate: diagnoseEVFlap,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("ev", "/inject", map[string]any{"connector_id": 1, "status": "Available"})
+				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
+			},
 		},
 		{
 			ID: "stale-meter", Name: "Grid meter freezes while the world changes",

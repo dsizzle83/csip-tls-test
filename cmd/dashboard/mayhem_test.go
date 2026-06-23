@@ -367,6 +367,42 @@ func TestDiagnoseEVFreeze_FailOnBreach(t *testing.T) {
 
 func noneCons() *activeConstraint { return &activeConstraint{Typ: "none"} }
 
+func TestDiagnoseBatteryGarbage_RejectedPasses(t *testing.T) {
+	s := mkSamples(30, func(i int, s *maySample) { s.BatSOC = 55; s.BatteryW = 1000 })
+	f := diagnoseBatteryGarbage(scFor("bg-pass"), noneCons(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS (%s)", f.Verdict, f.Headline)
+	}
+}
+
+func TestDiagnoseBatteryGarbage_IngestedFails(t *testing.T) {
+	// 0x8000 decoded as a real SoC ⇒ a wild ~32768%.
+	s := mkSamples(30, func(i int, s *maySample) { s.BatSOC = 32768; s.BatteryW = -32768 })
+	f := diagnoseBatteryGarbage(scFor("bg-fail"), noneCons(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL", f.Verdict)
+	}
+	assertDiag(t, f, "impossible battery")
+}
+
+func TestDiagnoseEVFlap_StablePasses(t *testing.T) {
+	s := mkSamples(30, func(i int, s *maySample) { s.EvW = 3000; s.EvCurrentA = 13; s.EvMaxA = 32 })
+	f := diagnoseEVFlap(scFor("flap-pass"), noneCons(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS (%s)", f.Verdict, f.Headline)
+	}
+}
+
+func TestDiagnoseEVFlap_OverMaxFails(t *testing.T) {
+	// Hub commands current well over the station max ⇒ it mis-tracked the flap.
+	s := mkSamples(30, func(i int, s *maySample) { s.EvW = 9000; s.EvCurrentA = 40; s.EvMaxA = 32 })
+	f := diagnoseEVFlap(scFor("flap-fail"), noneCons(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL", f.Verdict)
+	}
+	assertDiag(t, f, "station max")
+}
+
 func TestDiagnoseExpiry_ReleasedPasses(t *testing.T) {
 	base := int64(1_700_000_000)
 	// Adopted while valid (validUntil far ahead) for the first third, then released.
