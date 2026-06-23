@@ -29,6 +29,11 @@ const (
 	// A DER feeding more than this into the grid counts as still energizing
 	// during a cease-to-energize disconnect.
 	invConnectEnergizeW = 250.0
+	// Grace (s) past a control's validUntil before retaining it is a violation.
+	invExpiredGraceS = 30
+	// EV draw this many amps over the station max counts as a violation (filters
+	// rounding/telemetry noise).
+	invEVMaxTolA = 1.0
 )
 
 // invViolation is one timestamped breach of a named invariant.
@@ -146,6 +151,78 @@ func invConnectSafe(s []maySample) []invViolation {
 			})
 		}
 	}
+	return v
+}
+
+// invExpiredControl flags any sample where the hub is still applying a CSIP
+// control whose validUntil (in server time) has passed by more than the grace
+// window. A hub that keeps enforcing a stale control — or, worse, never lets it
+// expire — is acting on authority the grid server has withdrawn. Server time is
+// the sampler wall clock plus the hub's reported clock offset (CSIP §5.2.1.3).
+func invExpiredControl(s []maySample) []invViolation {
+	var v []invViolation
+	for _, smp := range s {
+		if !smp.HubAdopted || smp.ValidUntil <= 0 || smp.WallUnix == 0 {
+			continue
+		}
+		serverNow := smp.WallUnix + smp.ClockOffsetS
+		if serverNow > smp.ValidUntil+invExpiredGraceS {
+			v = append(v, invViolation{
+				Inv:    "INV-EXPIRED",
+				T:      smp.T,
+				Detail: fmt.Sprintf("control still active %ds past validUntil (+%ds grace)", serverNow-smp.ValidUntil, invExpiredGraceS),
+			})
+		}
+	}
+	return v
+}
+
+// invEVStationMax flags any sample where the EVSE draws more than its configured
+// station maximum — a hub command (or a charger) must never exceed the hardware
+// limit. The effective draw can only exceed it through a telemetry or sign fault,
+// so this doubles as a physical-sanity assertion on the EV channel.
+func invEVStationMax(s []maySample) []invViolation {
+	var v []invViolation
+	for _, smp := range s {
+		if smp.EvMaxA > 0 && smp.EvCurrentA > smp.EvMaxA+invEVMaxTolA {
+			v = append(v, invViolation{
+				Inv:    "INV-EVMAX",
+				T:      smp.T,
+				Detail: fmt.Sprintf("EV drawing %.1f A over station max %.1f A", smp.EvCurrentA, smp.EvMaxA),
+			})
+		}
+	}
+	return v
+}
+
+// connectBackfeed returns the INV-CONNECT violations that PERSIST past the
+// reaction grace — a bounded cease-to-energize ramp (the hub driving the
+// inverter down to zero over the first mayConvergeDeadlineS seconds) is expected
+// and excused, so only a sustained back-feed is a real violation. Shared by
+// diagnoseDisconnect and the safety audit so they never disagree.
+func connectBackfeed(s []maySample) []invViolation {
+	var v []invViolation
+	for _, x := range invConnectSafe(s) {
+		if x.T > mayConvergeDeadlineS {
+			v = append(v, x)
+		}
+	}
+	return v
+}
+
+// safetyAudit is the assertion engine: it runs the cross-cutting safety
+// invariants over every scenario's timeline, independent of that scenario's own
+// oracle, so a violation the targeted diagnoser would miss (a battery over-
+// discharge during an export-cap test, a back-feed during a disconnect, a stale
+// control retained, an impossible EV draw) is still surfaced. The constraint-
+// specific invariants (INV-EXPORT/INV-CONVERGE) are intentionally NOT re-run here
+// — those are the scenario's primary oracle and would double-judge it.
+func safetyAudit(s []maySample) []invViolation {
+	var v []invViolation
+	v = append(v, connectBackfeed(s)...) // excuses the bounded cease-to-energize ramp
+	v = append(v, invSOC(s)...)
+	v = append(v, invExpiredControl(s)...)
+	v = append(v, invEVStationMax(s)...)
 	return v
 }
 

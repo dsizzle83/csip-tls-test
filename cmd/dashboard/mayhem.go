@@ -61,10 +61,12 @@ type maySample struct {
 	SolarPossibleW float64 `json:"solar_possible_W"`
 	SolarOK        bool    `json:"solar_ok"`
 
-	BatteryW float64 `json:"battery_W"`
-	BatSOC   float64 `json:"bat_soc"`
-	EvW      float64 `json:"ev_W"`
-	EvSOC    float64 `json:"ev_soc"`
+	BatteryW   float64 `json:"battery_W"`
+	BatSOC     float64 `json:"bat_soc"`
+	EvW        float64 `json:"ev_W"`
+	EvSOC      float64 `json:"ev_soc"`
+	EvCurrentA float64 `json:"ev_current_A"`     // EVSE draw (A) — for INV-EVMAX
+	EvMaxA     float64 `json:"ev_max_current_A"` // EVSE configured max (A)
 
 	HubReachable     bool    `json:"hub_reachable"`
 	HubAdopted       bool    `json:"hub_adopted"`       // hub is applying a CSIP control this tick
@@ -72,6 +74,8 @@ type maySample struct {
 	AdoptedTyp       string  `json:"adopted_typ"`       // exportCap|importCap|genLimit|fixed|connect
 	AdoptedLimW      float64 `json:"adopted_lim_W"`
 	AdoptedMRID      string  `json:"adopted_mrid"`
+	ValidUntil       int64   `json:"valid_until"` // active control's validUntil (server unix) — for INV-EXPIRED
+	WallUnix         int64   `json:"wall_unix"`   // sampler wall clock (unix) — server time = WallUnix + ClockOffsetS
 	ClockOffsetS     int64   `json:"clock_offset_s"`
 
 	CannotComply bool     `json:"cannot_comply"` // hub posted a CannotComply for the active mRID
@@ -346,6 +350,23 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		}
 		f := ev(sc, cons, samples)
 		f.Fix = sc.Fix
+		// Assertion engine: cross-cutting safety audit, independent of this
+		// scenario's own oracle. Surfaced on every finding; a back-feed during a
+		// disconnect (INV-CONNECT) is a hard safety miss and escalates the verdict.
+		if audit := safetyAudit(samples); len(audit) > 0 {
+			f.Diagnosis = append(f.Diagnosis, "⚠ "+invSummaryLine("SAFETY AUDIT", audit))
+			if f.Verdict == "PASS" || f.Verdict == "DEGRADED" {
+				for _, x := range audit {
+					if x.Inv == "INV-CONNECT" {
+						f.Verdict = "FAIL"
+						f.Headline = "cross-cutting safety violation: " + x.Detail
+						break
+					}
+				}
+			}
+		} else {
+			f.Diagnosis = append(f.Diagnosis, invSummaryLine("SAFETY AUDIT", nil))
+		}
 		d.appendFinding(f)
 
 		if ctx.Err() != nil {
@@ -385,7 +406,7 @@ func (d *mayhemDriver) holdAndSample(ctx context.Context, sc *mayScenario, cons 
 // ── Sampling ──────────────────────────────────────────────────────────────────
 
 func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
-	s := maySample{T: round2(t)}
+	s := maySample{T: round2(t), WallUnix: time.Now().Unix()}
 
 	if gridW, ok := d.meterW(); ok {
 		s.RealGridW, s.GridOK = gridW, true
@@ -402,6 +423,8 @@ func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
 		s.BatSOC = hub.batSOC
 		s.EvW = hub.evW
 		s.EvSOC = hub.evSOC
+		s.EvCurrentA = hub.evCurrentA
+		s.EvMaxA = hub.evMaxA
 		s.ClockOffsetS = hub.clockOffsetS
 		s.Decisions = hub.decisions
 		if hub.ctrlActive {
@@ -409,6 +432,7 @@ func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
 			s.AdoptedTyp = hub.ctrlTyp
 			s.AdoptedLimW = hub.ctrlLimW
 			s.AdoptedMRID = hub.ctrlMRID
+			s.ValidUntil = hub.validUntil
 		}
 		s.DisconnectActive = hub.disconnectActive
 	}
@@ -926,12 +950,7 @@ func diagnoseDisconnect(sc *mayScenario, cons *activeConstraint, s []maySample) 
 	}
 
 	// Excuse a bounded reaction window, then any energizing DER is a violation.
-	var viol []invViolation
-	for _, x := range invConnectSafe(s) {
-		if x.T > mayConvergeDeadlineS {
-			viol = append(viol, x)
-		}
-	}
+	viol := connectBackfeed(s)
 	if len(viol) == 0 {
 		f.Verdict = "PASS"
 		f.Headline = "all DERs ceased to energize under the disconnect"
@@ -1269,10 +1288,12 @@ type mayHubState struct {
 	ok                   bool
 	gridW, batteryW, evW float64
 	batSOC, evSOC        float64
+	evCurrentA, evMaxA   float64
 	clockOffsetS         int64
 	ctrlActive           bool
 	ctrlTyp, ctrlMRID    string
 	ctrlLimW             float64
+	validUntil           int64
 	disconnectActive     bool
 	decisions            []string
 }
@@ -1281,8 +1302,9 @@ func (d *mayhemDriver) hubState() mayHubState {
 	var st struct {
 		ClockOffsetS int64 `json:"clock_offset_s"`
 		CSIPControl  *struct {
-			MRID string `json:"mrid"`
-			Base struct {
+			MRID       string `json:"mrid"`
+			ValidUntil int64  `json:"valid_until"`
+			Base       struct {
 				ExpLimW *int64 `json:"exp_lim_W"`
 				MaxLimW *int64 `json:"max_lim_W"`
 				ImpLimW *int64 `json:"imp_lim_W"`
@@ -1300,8 +1322,10 @@ func (d *mayhemDriver) hubState() mayHubState {
 			GridW    float64 `json:"grid_W"`
 		} `json:"power"`
 		EVSEs []struct {
-			PowerW float64  `json:"power_W"`
-			SOC    *float64 `json:"soc_pct"`
+			PowerW      float64  `json:"power_W"`
+			SOC         *float64 `json:"soc_pct"`
+			CurrentA    float64  `json:"current_A"`
+			MaxCurrentA float64  `json:"max_current_A"`
 		} `json:"evse_stations"`
 		LastPlan struct {
 			Decisions []struct {
@@ -1329,10 +1353,14 @@ func (d *mayhemDriver) hubState() mayHubState {
 		if e.SOC != nil && *e.SOC > 0 {
 			h.evSOC = *e.SOC
 		}
+		if e.CurrentA > h.evCurrentA { // worst (highest-drawing) station
+			h.evCurrentA, h.evMaxA = e.CurrentA, e.MaxCurrentA
+		}
 	}
 	if c := st.CSIPControl; c != nil {
 		h.ctrlActive = true
 		h.ctrlMRID = c.MRID
+		h.validUntil = c.ValidUntil
 		switch {
 		case c.Base.ExpLimW != nil:
 			h.ctrlTyp, h.ctrlLimW = "exportCap", float64(*c.Base.ExpLimW)

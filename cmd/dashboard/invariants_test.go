@@ -130,6 +130,72 @@ func TestDiagnoseDisconnect_Verdicts(t *testing.T) {
 	}
 }
 
+func TestInvExpiredControl_FlagsStaleControl(t *testing.T) {
+	// Control valid until server-time 1000, but the hub still applies it at
+	// server-time 1100 — past validUntil + grace.
+	stale := mkSamples(10, func(i int, s *maySample) {
+		s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+		s.ValidUntil, s.WallUnix, s.ClockOffsetS = 1000, 1100, 0
+	})
+	if v := invExpiredControl(stale); len(v) == 0 {
+		t.Fatal("expected INV-EXPIRED for a control retained past validUntil+grace")
+	}
+	fresh := mkSamples(10, func(i int, s *maySample) {
+		s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+		s.ValidUntil, s.WallUnix = 2000, 1100
+	})
+	if v := invExpiredControl(fresh); len(v) != 0 {
+		t.Errorf("unexpired control flagged: %v", v)
+	}
+}
+
+func TestInvEVStationMax_FlagsOverdraw(t *testing.T) {
+	over := mkSamples(10, func(i int, s *maySample) { s.EvCurrentA, s.EvMaxA = 40, 32 })
+	if v := invEVStationMax(over); len(v) == 0 {
+		t.Fatal("expected INV-EVMAX for EV drawing over station max")
+	}
+	ok := mkSamples(10, func(i int, s *maySample) { s.EvCurrentA, s.EvMaxA = 30, 32 })
+	if v := invEVStationMax(ok); len(v) != 0 {
+		t.Errorf("within-limit EV flagged: %v", v)
+	}
+}
+
+func TestSafetyAudit_CatchesCrossCutting(t *testing.T) {
+	// A SUSTAINED back-feed during a disconnect (past the reaction grace) must be
+	// caught by the audit even though no constraint-specific oracle runs here.
+	bad := mkSamples(40, func(i int, s *maySample) {
+		s.DisconnectActive = true
+		s.SolarW = 4000 // still energizing through the whole window
+	})
+	found := false
+	for _, x := range safetyAudit(bad) {
+		if x.Inv == "INV-CONNECT" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("safetyAudit missed the sustained disconnect back-feed (INV-CONNECT)")
+	}
+
+	// A bounded cease-to-energize ramp (solar at 0 after the grace) is excused.
+	ramp := mkSamples(40, func(i int, s *maySample) {
+		s.DisconnectActive = true
+		if float64(i) <= mayConvergeDeadlineS {
+			s.SolarW = 4000 // ramping down during the grace
+		} else {
+			s.SolarW = 0
+		}
+	})
+	if v := safetyAudit(ramp); len(v) != 0 {
+		t.Errorf("bounded cease-to-energize ramp flagged by audit: %v", v)
+	}
+
+	clean := mkSamples(10, func(i int, s *maySample) { s.SolarW = 0; s.BatteryW = 0 })
+	if v := safetyAudit(clean); len(v) != 0 {
+		t.Errorf("clean timeline flagged: %v", v)
+	}
+}
+
 // diagnoseMalform: surviving + holding the cap is PASS; a hang or an unseated
 // safe control is FAIL — the hub's normal curtailment ramp must NOT be mistaken
 // for a malform failure.
