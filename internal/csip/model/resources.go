@@ -53,14 +53,14 @@ type DeviceCapability struct {
 	PollRate uint32 `xml:"pollRate,attr,omitempty"`
 
 	// Links inherited from FunctionSetAssignmentsBase
-	DERProgramListLink             *ListLink `xml:"DERProgramListLink,omitempty"`
-	TimeLink                       *Link     `xml:"TimeLink,omitempty"`
-	ResponseSetListLink            *ListLink `xml:"ResponseSetListLink,omitempty"`
+	DERProgramListLink  *ListLink `xml:"DERProgramListLink,omitempty"`
+	TimeLink            *Link     `xml:"TimeLink,omitempty"`
+	ResponseSetListLink *ListLink `xml:"ResponseSetListLink,omitempty"`
 
 	// DeviceCapability-specific links
-	EndDeviceListLink              *ListLink `xml:"EndDeviceListLink,omitempty"`
-	MirrorUsagePointListLink       *ListLink `xml:"MirrorUsagePointListLink,omitempty"`
-	SelfDeviceLink                 *Link     `xml:"SelfDeviceLink,omitempty"`
+	EndDeviceListLink        *ListLink `xml:"EndDeviceListLink,omitempty"`
+	MirrorUsagePointListLink *ListLink `xml:"MirrorUsagePointListLink,omitempty"`
+	SelfDeviceLink           *Link     `xml:"SelfDeviceLink,omitempty"`
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -117,10 +117,10 @@ type EndDevice struct {
 	Enabled *bool `xml:"enabled,omitempty"`
 
 	// Links to subordinate resources
-	DERListLink                      *ListLink `xml:"DERListLink,omitempty"`
-	FunctionSetAssignmentsListLink   *ListLink `xml:"FunctionSetAssignmentsListLink,omitempty"`
-	RegistrationLink                 *Link     `xml:"RegistrationLink,omitempty"`
-	LogEventListLink                 *ListLink `xml:"LogEventListLink,omitempty"`
+	DERListLink                    *ListLink `xml:"DERListLink,omitempty"`
+	FunctionSetAssignmentsListLink *ListLink `xml:"FunctionSetAssignmentsListLink,omitempty"`
+	RegistrationLink               *Link     `xml:"RegistrationLink,omitempty"`
+	LogEventListLink               *ListLink `xml:"LogEventListLink,omitempty"`
 }
 
 // EndDeviceList is a collection of EndDevice resources.
@@ -128,10 +128,10 @@ type EndDeviceList struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns EndDeviceList"`
 	Resource
 
-	All       uint32       `xml:"all,attr"`
-	Results   uint32       `xml:"results,attr"`
-	PollRate  uint32       `xml:"pollRate,attr,omitempty"`
-	EndDevice []EndDevice  `xml:"EndDevice"`
+	All       uint32      `xml:"all,attr"`
+	Results   uint32      `xml:"results,attr"`
+	PollRate  uint32      `xml:"pollRate,attr,omitempty"`
+	EndDevice []EndDevice `xml:"EndDevice"`
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -160,23 +160,24 @@ type FunctionSetAssignments struct {
 	// Subscribable indicates subscription support.
 	Subscribable uint8 `xml:"subscribable,attr,omitempty"`
 
-	// Links to DER program lists, time, etc.
-	DERProgramListLink  *ListLink `xml:"DERProgramListLink,omitempty"`
-	TimeLink            *Link     `xml:"TimeLink,omitempty"`
-	MRID                string    `xml:"mRID,omitempty"`
-	Description         string    `xml:"description,omitempty"`
-	Version             uint16    `xml:"version,omitempty"`
+	// Links to DER program lists, time, pricing, etc.
+	DERProgramListLink    *ListLink `xml:"DERProgramListLink,omitempty"`
+	TariffProfileListLink *ListLink `xml:"TariffProfileListLink,omitempty"`
+	TimeLink              *Link     `xml:"TimeLink,omitempty"`
+	MRID                  string    `xml:"mRID,omitempty"`
+	Description           string    `xml:"description,omitempty"`
+	Version               uint16    `xml:"version,omitempty"`
 }
 
 // FunctionSetAssignmentsList is a collection of FSA resources.
 type FunctionSetAssignmentsList struct {
-	XMLName                xml.Name                 `xml:"urn:ieee:std:2030.5:ns FunctionSetAssignmentsList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns FunctionSetAssignmentsList"`
 	Resource
 
-	All                    uint32                    `xml:"all,attr"`
-	Results                uint32                    `xml:"results,attr"`
-	PollRate               uint32                    `xml:"pollRate,attr,omitempty"`
-	FunctionSetAssignments []FunctionSetAssignments  `xml:"FunctionSetAssignments"`
+	All                    uint32                   `xml:"all,attr"`
+	Results                uint32                   `xml:"results,attr"`
+	PollRate               uint32                   `xml:"pollRate,attr,omitempty"`
+	FunctionSetAssignments []FunctionSetAssignments `xml:"FunctionSetAssignments"`
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -201,15 +202,15 @@ type DERProgram struct {
 	Primacy uint8 `xml:"primacy"`
 
 	// Links to subordinate resources
-	DERControlListLink      *ListLink `xml:"DERControlListLink,omitempty"`
-	DERCurveListLink        *ListLink `xml:"DERCurveListLink,omitempty"`
-	DefaultDERControlLink   *Link     `xml:"DefaultDERControlLink,omitempty"`
+	DERControlListLink       *ListLink `xml:"DERControlListLink,omitempty"`
+	DERCurveListLink         *ListLink `xml:"DERCurveListLink,omitempty"`
+	DefaultDERControlLink    *Link     `xml:"DefaultDERControlLink,omitempty"`
 	ActiveDERControlListLink *ListLink `xml:"ActiveDERControlListLink,omitempty"`
 }
 
 // DERProgramList is a collection of DERProgram resources.
 type DERProgramList struct {
-	XMLName    xml.Name     `xml:"urn:ieee:std:2030.5:ns DERProgramList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERProgramList"`
 	Resource
 
 	All        uint32       `xml:"all,attr"`
@@ -251,25 +252,25 @@ type FixedVar struct {
 type DERControlBase struct {
 	// Operating modes — each is optional; the server sends only what it
 	// wants to control.
-	OpModConnect         *bool          `xml:"opModConnect,omitempty"`
-	OpModEnergize        *bool          `xml:"opModEnergize,omitempty"`
-	OpModFixedPFAbsorbW  *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
-	OpModFixedPFInjectW  *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
-	OpModFixedVar        *FixedVar      `xml:"opModFixedVar,omitempty"`
-	OpModFixedW          *ActivePower   `xml:"opModFixedW,omitempty"`
-	OpModMaxLimW         *ActivePower   `xml:"opModMaxLimW,omitempty"`
-	OpModExpLimW         *ActivePower   `xml:"opModExpLimW,omitempty"`
-	OpModGenLimW         *ActivePower   `xml:"opModGenLimW,omitempty"`
-	OpModImpLimW         *ActivePower   `xml:"opModImpLimW,omitempty"`
-	OpModLoadLimW        *ActivePower   `xml:"opModLoadLimW,omitempty"`
-	RampTms              *uint16        `xml:"rampTms,omitempty"`
+	OpModConnect        *bool          `xml:"opModConnect,omitempty"`
+	OpModEnergize       *bool          `xml:"opModEnergize,omitempty"`
+	OpModFixedPFAbsorbW *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
+	OpModFixedPFInjectW *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
+	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"`
+	OpModFixedW         *ActivePower   `xml:"opModFixedW,omitempty"`
+	OpModMaxLimW        *ActivePower   `xml:"opModMaxLimW,omitempty"`
+	OpModExpLimW        *ActivePower   `xml:"opModExpLimW,omitempty"`
+	OpModGenLimW        *ActivePower   `xml:"opModGenLimW,omitempty"`
+	OpModImpLimW        *ActivePower   `xml:"opModImpLimW,omitempty"`
+	OpModLoadLimW       *ActivePower   `xml:"opModLoadLimW,omitempty"`
+	RampTms             *uint16        `xml:"rampTms,omitempty"`
 }
 
 // EventStatus describes the current state of an event.
 type EventStatus struct {
-	CurrentStatus uint8 `xml:"currentStatus"`
-	DateTime      int64 `xml:"dateTime"`
-	PotentiallySuperseded bool `xml:"potentiallySuperseded"`
+	CurrentStatus         uint8 `xml:"currentStatus"`
+	DateTime              int64 `xml:"dateTime"`
+	PotentiallySuperseded bool  `xml:"potentiallySuperseded"`
 }
 
 // DERControl is a time-bound control event within a DERProgram.
@@ -278,22 +279,22 @@ type DERControl struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERControl"`
 	Resource
 
-	MRID            string            `xml:"mRID,omitempty"`
-	Description     string            `xml:"description,omitempty"`
-	Version         uint16            `xml:"version,omitempty"`
-	CreationTime    int64             `xml:"creationTime,omitempty"`
-	EventStatus     *EventStatus      `xml:"EventStatus,omitempty"`
-	Interval        DateTimeInterval  `xml:"interval"`
-	DERControlBase  DERControlBase    `xml:"DERControlBase"`
+	MRID           string           `xml:"mRID,omitempty"`
+	Description    string           `xml:"description,omitempty"`
+	Version        uint16           `xml:"version,omitempty"`
+	CreationTime   int64            `xml:"creationTime,omitempty"`
+	EventStatus    *EventStatus     `xml:"EventStatus,omitempty"`
+	Interval       DateTimeInterval `xml:"interval"`
+	DERControlBase DERControlBase   `xml:"DERControlBase"`
 
 	// Randomize fields for staggering device responses
-	RandomizeStart  *int32  `xml:"randomizeStart,omitempty"`
+	RandomizeStart    *int32 `xml:"randomizeStart,omitempty"`
 	RandomizeDuration *int32 `xml:"randomizeDuration,omitempty"`
 }
 
 // DERControlList is a collection of DERControl events.
 type DERControlList struct {
-	XMLName    xml.Name     `xml:"urn:ieee:std:2030.5:ns DERControlList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERControlList"`
 	Resource
 
 	All        uint32       `xml:"all,attr"`
@@ -309,10 +310,10 @@ type DefaultDERControl struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DefaultDERControl"`
 	Resource
 
-	MRID            string          `xml:"mRID,omitempty"`
-	Description     string          `xml:"description,omitempty"`
-	Version         uint16          `xml:"version,omitempty"`
-	DERControlBase  DERControlBase  `xml:"DERControlBase"`
+	MRID           string         `xml:"mRID,omitempty"`
+	Description    string         `xml:"description,omitempty"`
+	Version        uint16         `xml:"version,omitempty"`
+	DERControlBase DERControlBase `xml:"DERControlBase"`
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -324,9 +325,9 @@ type DER struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DER"`
 	Resource
 
-	DERCapabilityLink  *Link `xml:"DERCapabilityLink,omitempty"`
-	DERSettingsLink    *Link `xml:"DERSettingsLink,omitempty"`
-	DERStatusLink      *Link `xml:"DERStatusLink,omitempty"`
+	DERCapabilityLink   *Link `xml:"DERCapabilityLink,omitempty"`
+	DERSettingsLink     *Link `xml:"DERSettingsLink,omitempty"`
+	DERStatusLink       *Link `xml:"DERStatusLink,omitempty"`
 	DERAvailabilityLink *Link `xml:"DERAvailabilityLink,omitempty"`
 }
 
@@ -361,7 +362,7 @@ type MirrorUsagePoint struct {
 
 // MirrorUsagePointList is a collection of MirrorUsagePoint resources.
 type MirrorUsagePointList struct {
-	XMLName          xml.Name           `xml:"urn:ieee:std:2030.5:ns MirrorUsagePointList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns MirrorUsagePointList"`
 	Resource
 
 	All              uint32             `xml:"all,attr"`
@@ -468,7 +469,7 @@ type ResponseSet struct {
 
 // ResponseSetList is a collection of ResponseSet resources.
 type ResponseSetList struct {
-	XMLName     xml.Name      `xml:"urn:ieee:std:2030.5:ns ResponseSetList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns ResponseSetList"`
 	Resource
 
 	All         uint32        `xml:"all,attr"`
@@ -478,7 +479,7 @@ type ResponseSetList struct {
 
 // ResponseList is a collection of Response resources within a ResponseSet.
 type ResponseList struct {
-	XMLName  xml.Name   `xml:"urn:ieee:std:2030.5:ns ResponseList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns ResponseList"`
 	Resource
 
 	All      uint32     `xml:"all,attr"`
@@ -496,11 +497,11 @@ type DERCapability struct {
 	Resource
 
 	// Type of DER: 0=unknown, 1=virtual, 2=reciprocating engine, 80=PV, 81=wind, 83=storage
-	Type          uint8       `xml:"type"`
-	RtgMaxW       ActivePower `xml:"rtgMaxW"`
-	RtgMaxVA      *ActivePower `xml:"rtgMaxVA,omitempty"`
-	RtgMaxVar     *ActivePower `xml:"rtgMaxVar,omitempty"`
-	RtgMaxChargeW *ActivePower `xml:"rtgMaxChargeRateW,omitempty"`
+	Type             uint8        `xml:"type"`
+	RtgMaxW          ActivePower  `xml:"rtgMaxW"`
+	RtgMaxVA         *ActivePower `xml:"rtgMaxVA,omitempty"`
+	RtgMaxVar        *ActivePower `xml:"rtgMaxVar,omitempty"`
+	RtgMaxChargeW    *ActivePower `xml:"rtgMaxChargeRateW,omitempty"`
 	RtgMaxDischargeW *ActivePower `xml:"rtgMaxDischargeRateW,omitempty"`
 }
 
@@ -509,9 +510,9 @@ type DERSettings struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERSettings"`
 	Resource
 
-	SetMaxW  *ActivePower `xml:"setMaxW,omitempty"`
-	SetMaxVA *ActivePower `xml:"setMaxVA,omitempty"`
-	UpdatedTime int64     `xml:"updatedTime,omitempty"`
+	SetMaxW     *ActivePower `xml:"setMaxW,omitempty"`
+	SetMaxVA    *ActivePower `xml:"setMaxVA,omitempty"`
+	UpdatedTime int64        `xml:"updatedTime,omitempty"`
 }
 
 // DERStatus contains the current operational status of a DER.
@@ -519,7 +520,7 @@ type DERStatus struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERStatus"`
 	Resource
 
-	GenConnectStatus     *uint8 `xml:"genConnectStatus>value,omitempty"`
+	GenConnectStatus      *uint8 `xml:"genConnectStatus>value,omitempty"`
 	OperationalModeStatus *uint8 `xml:"operationalModeStatus>value,omitempty"`
-	ReadingTime          int64  `xml:"readingTime,omitempty"`
+	ReadingTime           int64  `xml:"readingTime,omitempty"`
 }

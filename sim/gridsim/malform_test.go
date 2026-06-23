@@ -89,3 +89,45 @@ func TestMalform_UnknownKindRejected(t *testing.T) {
 		t.Error("unknown malform kind should error")
 	}
 }
+
+func malformTariffList() *model.TariffProfileList {
+	return &model.TariffProfileList{
+		Resource: model.Resource{Href: "/tp"}, All: 1, Results: 1,
+		TariffProfile: []model.TariffProfile{{Resource: model.Resource{Href: "/tp/0"}, MRID: "TP-1", PricePowerOfTenMultiplier: -3, RateComponentListLink: &model.ListLink{Link: model.Link{Href: "/tp/0/rc"}}}},
+	}
+}
+
+func malformConsumptionList() *model.ConsumptionTariffIntervalList {
+	return &model.ConsumptionTariffIntervalList{
+		Resource: model.Resource{Href: "/tp/0/rc/0/tti/0/cti"}, All: 1, Results: 1,
+		ConsumptionTariffInterval: []model.ConsumptionTariffInterval{{Resource: model.Resource{Href: "/tp/0/rc/0/tti/0/cti/0"}, Price: 12000}},
+	}
+}
+
+func TestMalform_PricingAttacks(t *testing.T) {
+	s := &Server{}
+
+	s.SetMalform(MalformBadPriceMultiplier)
+	b, ok := s.malformedXML(malformTariffList())
+	if !ok || !strings.Contains(string(b), "<pricePowerOfTenMultiplier>100<") {
+		t.Errorf("bad_price_multiplier not applied:\n%s", b)
+	}
+
+	s.SetMalform(MalformNegativePrice)
+	b, ok = s.malformedXML(malformConsumptionList())
+	if !ok || !strings.Contains(string(b), "<price>-99999<") {
+		t.Errorf("negative_price not applied:\n%s", b)
+	}
+
+	s.SetMalform(MalformHugePrice)
+	b, _ = s.malformedXML(malformConsumptionList())
+	if !strings.Contains(string(b), "<price>2147483647<") {
+		t.Errorf("huge_price not applied:\n%s", b)
+	}
+
+	// A pricing malform must not transform a DER control list (wrong target).
+	s.SetMalform(MalformNegativePrice)
+	if _, ok := s.malformedXML(malformCtrlList("M-1")); ok {
+		t.Error("negative_price must not transform a DERControlList")
+	}
+}

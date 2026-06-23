@@ -529,6 +529,10 @@ func (s *Server) buildResourceTree() {
 					Link: model.Link{Href: "/edev/2/fsa/0/derp"},
 					All:  3,
 				},
+				TariffProfileListLink: &model.ListLink{
+					Link: model.Link{Href: "/tp"},
+					All:  1,
+				},
 				TimeLink: &model.Link{Href: "/tm"},
 			},
 		},
@@ -596,6 +600,7 @@ func (s *Server) buildResourceTree() {
 	s.buildProgram0(now)
 	s.buildProgram1(now)
 	s.buildProgram2(now)
+	s.buildPricing(now)
 
 	// ── MirrorUsagePointList (/mup) ───────────────────────────
 	s.resources["/mup"] = &model.MirrorUsagePointList{

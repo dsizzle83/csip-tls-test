@@ -30,14 +30,22 @@ const (
 	MalformBadDuration      = "bad_duration"       // a control interval with a ~136-year duration
 	MalformDupMRID          = "dup_mrid"           // a DERControlList with the same control (mRID) twice
 	MalformMissingHref      = "missing_href"       // a DERProgramList with its href stripped — unresolvable
+
+	// Pricing function set (§10.5) attacks.
+	MalformNegativePrice      = "negative_price"       // ConsumptionTariffInterval price set negative
+	MalformHugePrice          = "huge_price"           // price set to int32 max (1000× and overflow bait)
+	MalformBadPriceMultiplier = "bad_price_multiplier" // TariffProfile pricePowerOfTenMultiplier absurd (10^100)
 )
 
 var malformKinds = map[string]bool{
-	MalformEmptyProgramList: true,
-	MalformHugeActivePower:  true,
-	MalformBadDuration:      true,
-	MalformDupMRID:          true,
-	MalformMissingHref:      true,
+	MalformEmptyProgramList:   true,
+	MalformHugeActivePower:    true,
+	MalformBadDuration:        true,
+	MalformDupMRID:            true,
+	MalformMissingHref:        true,
+	MalformNegativePrice:      true,
+	MalformHugePrice:          true,
+	MalformBadPriceMultiplier: true,
 }
 
 // SetMalform arms (kind != "") or clears (kind == "") the malform mode.
@@ -120,8 +128,46 @@ func (s *Server) malformedXML(resource interface{}) ([]byte, bool) {
 				return duplicateFirstDERControl(b), true
 			}
 		}
+
+	case MalformNegativePrice:
+		if cl, ok := copyConsumptionListIfNonEmpty(resource); ok {
+			cl.ConsumptionTariffInterval[0].Price = -99999
+			return marshalOrNil(cl)
+		}
+
+	case MalformHugePrice:
+		if cl, ok := copyConsumptionListIfNonEmpty(resource); ok {
+			cl.ConsumptionTariffInterval[0].Price = 2147483647 // int32 max
+			return marshalOrNil(cl)
+		}
+
+	case MalformBadPriceMultiplier:
+		if tpl, ok := resource.(*model.TariffProfileList); ok && len(tpl.TariffProfile) > 0 {
+			c := *tpl
+			c.TariffProfile = append([]model.TariffProfile(nil), tpl.TariffProfile...)
+			c.TariffProfile[0].PricePowerOfTenMultiplier = 100 // 10^100 — absurd
+			return marshalOrNil(&c)
+		}
 	}
 	return nil, false
+}
+
+// copyConsumptionListIfNonEmpty deep-copies a non-empty ConsumptionTariffInterval
+// list (XML round-trip) for in-place price malformation.
+func copyConsumptionListIfNonEmpty(resource interface{}) (*model.ConsumptionTariffIntervalList, bool) {
+	list, ok := resource.(*model.ConsumptionTariffIntervalList)
+	if !ok || len(list.ConsumptionTariffInterval) == 0 {
+		return nil, false
+	}
+	b, err := xml.Marshal(list)
+	if err != nil {
+		return nil, false
+	}
+	var cp model.ConsumptionTariffIntervalList
+	if err := xml.Unmarshal(b, &cp); err != nil || len(cp.ConsumptionTariffInterval) == 0 {
+		return nil, false
+	}
+	return &cp, true
 }
 
 // copyControlListIfNonEmpty deep-copies a non-empty DERControlList (via an XML

@@ -1767,6 +1767,31 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			teardown: func(d *mayhemDriver) { _ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true}) },
 		},
 		{
+			ID: "pricing-attack", Name: "Grid server serves malicious pricing",
+			Category:   "CSIP robustness (pricing §10.5)",
+			Hypothesis: "A hostile 2030.5 server serves a malformed tariff (an absurd price multiplier, 10^100) while a safe export cap is active. Pricing must affect optimization only WITHIN safety constraints — a bad tariff must never break DER discovery, unseat the safe control, or produce a NaN command.",
+			Expected:   "Stay up and keep enforcing the active export cap; the pricing fault is contained (the walker treats pricing discovery as non-fatal). NOTE: today the hub does not consume CSIP prices — lexa-northbound discovers tariffs but never walks ConsumptionTariffInterval — so a price attack has no behavioural effect by design.",
+			HoldS:      45,
+			Fix:        "Pricing discovery failures must stay non-fatal (they are). Separately, the QA surfaced a gap: wire lexa-northbound to walk ConsumptionTariffInterval so CSIP prices actually drive dispatch — and are then bounded by the safety constraints.",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // full → PV curtailment is the only lever
+				d.injectEnv(d.pvHighW, loadLow)
+				cons, err := d.postCap("exportCap", 0, 45, "mayhem: export cap under malicious pricing")
+				if err != nil {
+					return nil, err
+				}
+				// Let the hub adopt the safe cap, then start serving the bad tariff.
+				go func() {
+					time.Sleep(8 * time.Second)
+					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "bad_price_multiplier"})
+				}()
+				return cons, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseMalform,
+			teardown: func(d *mayhemDriver) { _ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true}) },
+		},
+		{
 			ID: "stale-meter", Name: "Grid meter freezes while the world changes",
 			Category:   "Sensor integrity (INV-STALE)",
 			Hypothesis: "The revenue meter's reading stops updating (frozen TCP session / hung device) while PV climbs — the hub's grid signal goes stale.",

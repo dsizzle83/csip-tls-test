@@ -43,6 +43,7 @@ SCENARIOS = [
     ("grid-disconnect", "Cease-to-energize: grid commands a disconnect"),
     ("conflicting-primacy", "Higher-primacy control must win"),
     ("malformed-csip", "Grid server serves a malformed resource"),
+    ("pricing-attack", "Grid server serves malicious pricing"),
     ("stale-meter", "Grid meter freezes while the world changes"),
     ("battery-empty-import-cap", "Import cap at peak with an empty battery"),
     ("curtailment-release", "Generation-limit event ends — solar must recover"),
