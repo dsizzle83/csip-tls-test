@@ -312,6 +312,59 @@ func TestDiagnoseRecovery_ReturnsToFullPasses(t *testing.T) {
 	}
 }
 
+func importCons1000() *activeConstraint {
+	return &activeConstraint{Typ: "importCap", LimW: 1000, MRID: "M-ev0001freeze"}
+}
+
+func TestDiagnoseEVFreeze_PassTracks(t *testing.T) {
+	// Cap held (800 W < 1000 W) and the hub's EV view matches ground truth.
+	s := mkSamples(12, func(i int, s *maySample) {
+		s.RealGridW, s.HubGridW = 800, 800
+		s.HubAdopted, s.AdoptedTyp = true, "importCap"
+		s.EvSimOK, s.EvSimW, s.EvW = true, 1380, 1380
+	})
+	f := diagnoseEVFreeze(scFor("evf-pass"), importCons1000(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS (%s)", f.Verdict, f.Headline)
+	}
+	if f.Metrics.HubBlind {
+		t.Error("HubBlind should be false when the hub tracks truth")
+	}
+}
+
+func TestDiagnoseEVFreeze_BlindOnDivergence(t *testing.T) {
+	// Cap held, but the hub's MeterValues froze high (1380 W) while the charger
+	// truly curtailed to 400 W — the hub is blind to the EVSE.
+	s := mkSamples(12, func(i int, s *maySample) {
+		s.RealGridW, s.HubGridW = 800, 800
+		s.HubAdopted, s.AdoptedTyp = true, "importCap"
+		s.EvSimOK, s.EvSimW, s.EvW = true, 400, 1380
+	})
+	f := diagnoseEVFreeze(scFor("evf-blind"), importCons1000(), s)
+	if f.Verdict != "BLIND" {
+		t.Fatalf("verdict = %s, want BLIND (%s)", f.Verdict, f.Headline)
+	}
+	if !f.Metrics.HubBlind {
+		t.Error("HubBlind should be true on a sustained hub-vs-truth divergence")
+	}
+	assertDiag(t, f, "froze")
+}
+
+func TestDiagnoseEVFreeze_FailOnBreach(t *testing.T) {
+	// Import cap breached for the whole window and never converged → the hub lost
+	// the cap while blind, which outranks the observability note.
+	s := mkSamples(12, func(i int, s *maySample) {
+		s.RealGridW, s.HubGridW = 1800, 1800
+		s.HubAdopted, s.AdoptedTyp = true, "importCap"
+		s.EvSimOK, s.EvSimW, s.EvW = true, 1380, 1380
+	})
+	f := diagnoseEVFreeze(scFor("evf-fail"), importCons1000(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (%s)", f.Verdict, f.Headline)
+	}
+	assertDiag(t, f, "lost the import cap")
+}
+
 func assertDiag(t *testing.T, f mayFinding, want string) {
 	t.Helper()
 	for _, line := range f.Diagnosis {

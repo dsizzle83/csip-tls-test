@@ -46,6 +46,8 @@ const (
 	// ramp apart from a hub that never converges.
 	mayConvergeDeadlineS = 30 // breach that clears within this many seconds ⇒ a normal settling ramp, not a failure
 	mayConvergeHoldS     = 10 // the cap must stay within-limit for this many trailing seconds to count as converged
+
+	mayEVLiveDrawW = 500 // an EVSE drawing more than this is "actively charging" — the floor for judging hub-vs-truth EV divergence
 )
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -68,6 +70,9 @@ type maySample struct {
 	EvSOC      float64 `json:"ev_soc"`
 	EvCurrentA float64 `json:"ev_current_A"`     // EVSE draw (A) — for INV-EVMAX
 	EvMaxA     float64 `json:"ev_max_current_A"` // EVSE configured max (A)
+	EvSimW     float64 `json:"ev_sim_W"`         // charger's TRUE draw from the ev sim /state (ground truth) — for INV-EVBLIND
+	EvSimA     float64 `json:"ev_sim_A"`         // charger's TRUE current (A), ground truth
+	EvSimOK    bool    `json:"ev_sim_ok"`        // the ev sim reported a coherent charging state this tick
 
 	HubReachable     bool    `json:"hub_reachable"`
 	HubAdopted       bool    `json:"hub_adopted"`       // hub is applying a CSIP control this tick
@@ -414,6 +419,9 @@ func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
 	}
 	if aw, pw, ok := d.solarSim(); ok {
 		s.SolarW, s.SolarPossibleW, s.SolarOK = aw, pw, true
+	}
+	if dw, da, ok := d.evSim(); ok {
+		s.EvSimW, s.EvSimA, s.EvSimOK = dw, da, true
 	}
 
 	hub := d.hubState()
@@ -1101,6 +1109,91 @@ func diagnoseTransport(sc *mayScenario, cons *activeConstraint, s []maySample) m
 	return f
 }
 
+// diagnoseEVFreeze judges the stop_metervalues fault: the charger keeps drawing
+// (and still obeys SetChargingProfile) but stops emitting MeterValues/Updated, so
+// the hub's per-EVSE telemetry freezes at its last value. Under an import cap the
+// hub curtails the EV — its TRUE draw drops while its OCPP view stays frozen high,
+// opening a divergence between what the hub believes and what the charger is doing.
+// Two questions: (1) did the hub still hold the import cap — it can, via the real
+// grid meter, even while blind to the EV channel; (2) did its EV telemetry go
+// stale relative to ground truth. A cap held + frozen telemetry is BLIND: safe for
+// now, but the hub cannot see the EVSE and would miss a later ramp.
+func diagnoseEVFreeze(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	m := scanSamples(cons, s)
+	f.Metrics = m
+	capStr := fmt.Sprintf("%s ≤ %.0f W", cons.Typ, cons.LimW)
+
+	if m.SampleErrors > len(s)/2 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "meter unreachable for most of the run — cannot judge compliance"
+		return f
+	}
+
+	// Observability: does the hub's OCPP view of the EV diverge from ground truth?
+	active, diverge := 0, 0
+	var worstT, worstSim, worstHub float64
+	for _, smp := range s {
+		if !smp.EvSimOK {
+			continue
+		}
+		ref := math.Max(smp.EvSimW, smp.EvW)
+		if ref < mayEVLiveDrawW {
+			continue // nothing meaningful on the EVSE this tick
+		}
+		active++
+		if math.Abs(smp.EvW-smp.EvSimW) > 0.5*ref {
+			diverge++
+			if math.Abs(smp.EvW-smp.EvSimW) > math.Abs(worstHub-worstSim) {
+				worstT, worstSim, worstHub = smp.T, smp.EvSimW, smp.EvW
+			}
+		}
+	}
+	hubBlind := active > 0 && diverge > active/2
+	f.Metrics.HubBlind = hubBlind
+
+	// Safety first: did the import cap hold? A bounded settling ramp is fine.
+	settled := m.BreachSeconds == 0 ||
+		(m.TailClean && m.ConvergedAtS >= 0 && m.ConvergedAtS <= mayConvergeDeadlineS)
+	if !settled && !m.ReportedCannot {
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("%s breached %.0fs while blind to the EVSE", capStr, m.BreachSeconds)
+		f.Diagnosis = []string{
+			fmt.Sprintf("With the charger's MeterValues frozen the hub lost the import cap: peak %.0f W over for %.0fs and it never converged.", m.PeakBreachW, m.BreachSeconds),
+			"A hub must not depend on per-device telemetry it can lose — the real grid meter still showed the breach; the optimizer should have curtailed off that and/or paused the session.",
+			decisionLine(s),
+		}
+		f.Fix = "Stale-expire EVSE MeterValues and fall back to the grid meter for cap compliance; never assume a silent charger is idle (lexa-ocpp / orchestrator)."
+		f.Diagnosis = append(f.Diagnosis, hubVsRealLine(s))
+		return f
+	}
+
+	if hubBlind {
+		f.Verdict = "BLIND"
+		f.Headline = fmt.Sprintf("held %s but the hub's EVSE telemetry froze", capStr)
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub kept the cap (via the real grid meter), but its OCPP view of the EVSE diverged from ground truth on %d of %d active samples.", diverge, active),
+			fmt.Sprintf("At t=%.0fs the charger truly drew %.0f W while the hub still reported %.0f W — its MeterValues had frozen.", worstT, worstSim, worstHub),
+			"Safe for this static scenario, but the hub is blind to that EVSE: if the car ramped or a second load appeared it would not see it. Stale OCPP telemetry must be detected and flagged, not trusted.",
+		}
+		f.Fix = "Track MeterValues freshness per EVSE; mark a charger stale when Updated stops and surface it (lexa-ocpp / telemetry)."
+		return f
+	}
+
+	f.Verdict = "PASS"
+	f.Headline = fmt.Sprintf("held %s and tracked the EVSE through the telemetry gap", capStr)
+	f.Diagnosis = []string{
+		"The hub held the import cap and its EVSE view stayed consistent with ground truth despite the suppressed MeterValues — it did not act on stale telemetry.",
+		fmt.Sprintf("Across %d active-EVSE samples the hub view tracked the charger's true draw (worst divergence %.0f W).", active, math.Abs(worstHub-worstSim)),
+	}
+	return f
+}
+
 // ── Diagnosis helpers ──────────────────────────────────────────────────────────
 
 func hubVsRealLine(s []maySample) string {
@@ -1351,6 +1444,30 @@ func (d *mayhemDriver) solarSim() (actualW, possibleW float64, ok bool) {
 		return 0, 0, false
 	}
 	return st.Measurements.W_W, st.Measurements.PossibleW, true
+}
+
+// evSim reads the charger's TRUE draw straight from the ev sim /state — the
+// ground truth the hub only sees through OCPP MeterValues. Under a
+// stop_metervalues fault the hub's view freezes while this keeps moving, which
+// is exactly how diagnoseEVFreeze tells a blind hub from a sighted one. Returns
+// 0 draw when no session is active.
+func (d *mayhemDriver) evSim() (drawW, currentA float64, ok bool) {
+	var st struct {
+		Session struct {
+			Active bool `json:"active"`
+		} `json:"session"`
+		Battery struct {
+			PowerW   float64 `json:"power_W"`
+			CurrentA float64 `json:"current_A"`
+		} `json:"battery"`
+	}
+	if err := d.getJSON("ev", "/state", &st); err != nil {
+		return 0, 0, false
+	}
+	if !st.Session.Active {
+		return 0, 0, true
+	}
+	return st.Battery.PowerW, st.Battery.CurrentA, true
 }
 
 type mayHubState struct {
@@ -1775,6 +1892,82 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			evaluate: diagnoseConstraint,
 			teardown: func(d *mayhemDriver) {
 				_ = d.post("ev", "/fault", map[string]any{"kind": "profile_reject", "clear": true})
+				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
+			},
+		},
+		{
+			ID: "ev-accept-but-ignore", Name: "Charger ACKs the current-limit profile but ignores it",
+			Category:   "OCPP smart charging (INV-CONVERGE)",
+			Hypothesis: "Under an import cap with an empty battery, the hub sends a SetChargingProfile and the charger returns Accepted — but never applies it and keeps drawing full current. This is worse than an outright reject: the OCPP response says success, so a hub that trusts the ACK believes the EV dialled down when it did not, and imports over the cap.",
+			Expected:   "Verify the EV actually curtailed against the measured draw, not the SetChargingProfile response. On a no-effect ACK, react with another lever or post CannotComply. Never treat 'Accepted' as 'applied'.",
+			HoldS:      70,
+			Fix:        "The optimizer must confirm the commanded EV current against measured draw/MeterValues, not the charging-profile ACK (lexa-ocpp applyCommand / orchestrator verify). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 5, "Conn": 1}) // empty → EV is the only lever
+				_ = d.post("ev", "/inject", map[string]any{"action": "set_soc", "soc_pct": 30})
+				_ = d.post("ev", "/inject", map[string]any{"action": "start_session", "connector_id": 1})
+				d.injectEnv(300, 500)
+				if err := d.post("ev", "/fault", map[string]any{"kind": "apply_next_tx"}); err != nil {
+					return nil, fmt.Errorf("arm apply_next_tx: %w", err)
+				}
+				return d.postCap("importCap", 0, 70, "mayhem: zero import cap, charger ACKs but ignores curtailment")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(300, 500) },
+			evaluate: diagnoseConstraint,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("ev", "/fault", map[string]any{"kind": "apply_next_tx", "clear": true})
+				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
+			},
+		},
+		{
+			ID: "ev-min-current-floor", Name: "Charger cannot throttle below its 6 A minimum",
+			Category:   "OCPP smart charging (INV-CONVERGE)",
+			Hypothesis: "A tight import cap needs the EV below its 6 A OCPP minimum, but the charger floors there — modulation alone cannot satisfy the cap. The only way to comply is to PAUSE the session (drop to 0 A). A hub that just keeps lowering the current limit, or trusts the floored draw as compliant, stays over the cap forever.",
+			Expected:   "Recognise that modulation hit the floor and escalate: suspend/stop the transaction to reach 0 A, or post CannotComply. Do not sit at the 6 A floor over the cap.",
+			HoldS:      70,
+			Fix:        "When the commanded EV current is below the charger minimum and the cap is still breached, suspend the transaction (TransactionEvent/RequestStopTransaction) rather than holding the floor (orchestrator EV lever / lexa-ocpp).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 5, "Conn": 1}) // empty → EV is the only lever
+				_ = d.post("ev", "/inject", map[string]any{"action": "set_soc", "soc_pct": 30})
+				_ = d.post("ev", "/inject", map[string]any{"action": "start_session", "connector_id": 1})
+				d.injectEnv(300, 500)
+				if err := d.post("ev", "/fault", map[string]any{"kind": "min_current_floor", "amps_a": 6}); err != nil {
+					return nil, fmt.Errorf("arm min_current_floor: %w", err)
+				}
+				// 800 W cap: even the 6 A floor (~1.4 kW) plus base load leaves net import
+				// over the cap, so the hub must pause the session to comply.
+				return d.postCap("importCap", 800, 70, "mayhem: 800 W import cap below the charger's 6 A floor")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(300, 500) },
+			evaluate: diagnoseConstraint,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("ev", "/fault", map[string]any{"kind": "min_current_floor", "clear": true})
+				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
+			},
+		},
+		{
+			ID: "ev-meter-freeze", Name: "Charger keeps charging but stops reporting MeterValues",
+			Category:   "OCPP observability (INV-EVBLIND)",
+			Hypothesis: "The charger still obeys SetChargingProfile but stops emitting MeterValues/Updated. Under an import cap the hub curtails the EV — its true draw drops while the hub's OCPP view freezes at the old high value. The hub goes blind to that EVSE: it cannot attribute load, and would miss the car ramping back up.",
+			Expected:   "Hold the cap off the real grid meter (which still works), AND detect that the EVSE telemetry went stale — flag the charger, do not keep trusting a frozen reading.",
+			HoldS:      70,
+			Fix:        "Track MeterValues freshness per EVSE and stale-expire a silent charger; keep cap compliance on the grid meter, not per-device OCPP telemetry (lexa-ocpp / telemetry).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 5, "Conn": 1})
+				_ = d.post("ev", "/inject", map[string]any{"action": "set_soc", "soc_pct": 30})
+				_ = d.post("ev", "/inject", map[string]any{"action": "start_session", "connector_id": 1})
+				d.injectEnv(300, 500)
+				if err := d.post("ev", "/fault", map[string]any{"kind": "stop_metervalues"}); err != nil {
+					return nil, fmt.Errorf("arm stop_metervalues: %w", err)
+				}
+				// A cap the hub CAN meet by modulating the EV — so the true draw moves
+				// (creating the hub-vs-truth divergence) while the cap still holds.
+				return d.postCap("importCap", 1000, 70, "mayhem: import cap while the charger's MeterValues are frozen")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(300, 500) },
+			evaluate: diagnoseEVFreeze,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("ev", "/fault", map[string]any{"kind": "stop_metervalues", "clear": true})
 				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
 			},
 		},
