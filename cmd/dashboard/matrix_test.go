@@ -56,3 +56,33 @@ func TestMatrixScenarios_CrossAndRouting(t *testing.T) {
 		}
 	}
 }
+
+// A chaos run is reproducible: the same seed yields the same scenario sequence
+// (so any failure is replayable), and a different seed explores a different one.
+func TestChaosScenarios_Deterministic(t *testing.T) {
+	d := &mayhemDriver{pvHighW: 4800}
+	a := d.chaosScenarios(42, 6)
+	b := d.chaosScenarios(42, 6)
+	if len(a) != 6 || len(b) != 6 {
+		t.Fatalf("chaos produced %d/%d scenarios, want 6", len(a), len(b))
+	}
+	for i := range a {
+		if a[i].ID != b[i].ID {
+			t.Fatalf("seed 42 not deterministic at %d: %q vs %q", i, a[i].ID, b[i].ID)
+		}
+		if a[i].evaluate == nil || a[i].setup == nil {
+			t.Errorf("chaos scenario %d missing setup/evaluate", i)
+		}
+	}
+	c := d.chaosScenarios(7, 6)
+	same := true
+	for i := range a {
+		if a[i].ID != c[i].ID {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Error("seed 7 produced the same sequence as seed 42 — not actually seeded")
+	}
+}

@@ -127,6 +127,10 @@ slew-converging (DEGRADED) / wrong-direction (FAIL) / ceased-to-energize (PASS).
   sweeps fault×timing interactions. Each scenario is isolated by `resetForScenario`
   (clears faults/controls, uncurtails the inverter) so one scenario's device state
   cannot mask a fault in the next.
+- **Seeded chaos** — `scripts/mayhem.py --chaos [--seed N] [--iterations K]` runs a
+  randomized sequence drawn from the same curated cell templates with random jitter
+  and ±25 % hold perturbation. The seed is reported back (and written into the
+  report), so any failure is replayable byte-for-byte with `--chaos --seed N`.
 
 ---
 

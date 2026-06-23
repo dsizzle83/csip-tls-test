@@ -94,9 +94,10 @@ def cmd_abort(base):
     return 0
 
 
-def run(base, only, sample_ms, as_json, matrix=False):
+def run(base, only, sample_ms, as_json, matrix=False, chaos=False, seed=0, iterations=0):
     # Kick off the run.
-    payload = {"sample_ms": sample_ms, "only": only, "matrix": matrix}
+    payload = {"sample_ms": sample_ms, "only": only, "matrix": matrix,
+               "chaos": chaos, "seed": seed, "iterations": iterations}
     try:
         started = api(base, "/api/qa/start", method="POST", body=payload)
     except urllib.error.HTTPError as e:
@@ -106,6 +107,8 @@ def run(base, only, sample_ms, as_json, matrix=False):
         print(f"cannot reach dashboard at {base}: {e}", file=sys.stderr)
         return 2
 
+    if chaos and not as_json and started.get("chaos_seed"):
+        print(f"Chaos seed: {started['chaos_seed']}  (replay with --chaos --seed {started['chaos_seed']})")
     if not as_json:
         n = started.get("scenarios", "?")
         print(f"{BOLD if sys.stdout.isatty() else ''}Mayhem started{RESET if sys.stdout.isatty() else ''}: "
@@ -222,6 +225,10 @@ def main():
     ap.add_argument("--abort", action="store_true", help="abort a run in progress and exit")
     ap.add_argument("--matrix", action="store_true",
                     help="run the fault-matrix mode (constraint × fault × clock jitter) instead of the curated suite")
+    ap.add_argument("--chaos", action="store_true",
+                    help="run a seeded randomized chaos sequence (replayable via --seed)")
+    ap.add_argument("--seed", type=int, default=0, help="chaos seed (0 = time-derived, reported back for replay)")
+    ap.add_argument("--iterations", type=int, default=6, help="chaos iteration count (default 6)")
     args = ap.parse_args()
 
     if args.list:
@@ -231,16 +238,17 @@ def main():
         return cmd_abort(args.dashboard)
 
     only = [s.strip() for s in args.only.split(",") if s.strip()]
-    # Matrix scenario IDs (matrix/...) are generated server-side, so skip the
-    # curated-suite validation when --matrix is set and let the server filter.
-    if not args.matrix:
+    # Matrix/chaos scenario IDs are generated server-side, so skip the
+    # curated-suite validation in those modes and let the server filter.
+    if not args.matrix and not args.chaos:
         valid = {sid for sid, _ in SCENARIOS}
         bad = [s for s in only if s not in valid]
         if bad:
             print(f"unknown scenario id(s): {', '.join(bad)} (see --list)", file=sys.stderr)
             return 2
 
-    return run(args.dashboard, only, args.sample_ms, args.json, args.matrix)
+    return run(args.dashboard, only, args.sample_ms, args.json,
+               args.matrix, args.chaos, args.seed, args.iterations)
 
 
 if __name__ == "__main__":

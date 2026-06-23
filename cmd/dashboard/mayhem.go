@@ -130,6 +130,7 @@ type mayhemStatus struct {
 	Total      int          `json:"total"`
 	Pct        float64      `json:"pct"`
 	Phase      string       `json:"phase"` // setup|hold|recover|done
+	ChaosSeed  int64        `json:"chaos_seed,omitempty"`
 	ReportPath string       `json:"report_path,omitempty"`
 	Summary    maySummary   `json:"summary"`
 	Findings   []mayFinding `json:"findings"`
@@ -187,9 +188,12 @@ type mayScenario struct {
 // ── HTTP endpoints ────────────────────────────────────────────────────────────
 
 type mayhemStartReq struct {
-	SampleMs int      `json:"sample_ms"`
-	Only     []string `json:"only"`   // run only these scenario IDs (empty = all)
-	Matrix   bool     `json:"matrix"` // run the fault-matrix run mode instead of the curated suite
+	SampleMs   int      `json:"sample_ms"`
+	Only       []string `json:"only"`       // run only these scenario IDs (empty = all)
+	Matrix     bool     `json:"matrix"`     // run the fault-matrix run mode instead of the curated suite
+	Chaos      bool     `json:"chaos"`      // run a seeded randomized chaos sequence
+	Seed       int64    `json:"seed"`       // chaos seed (0 ⇒ time-derived, reported back for replay)
+	Iterations int      `json:"iterations"` // chaos iteration count (0 ⇒ default)
 }
 
 func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +208,15 @@ func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	scenarios := d.scenarios()
-	if req.Matrix {
+	var chaosSeed int64
+	switch {
+	case req.Chaos:
+		chaosSeed = req.Seed
+		if chaosSeed == 0 {
+			chaosSeed = time.Now().UnixNano()
+		}
+		scenarios = d.chaosScenarios(chaosSeed, req.Iterations)
+	case req.Matrix:
 		scenarios = d.matrixScenarios()
 	}
 	if len(req.Only) > 0 {
@@ -238,12 +250,13 @@ func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
 		StartedAt: time.Now(),
 		Total:     len(scenarios),
 		Phase:     "setup",
+		ChaosSeed: chaosSeed,
 	}
 	d.mu.Unlock()
 
 	go d.run(ctx, scenarios, time.Duration(req.SampleMs)*time.Millisecond)
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]any{"scenarios": len(scenarios), "sample_ms": req.SampleMs})
+	_ = json.NewEncoder(w).Encode(map[string]any{"scenarios": len(scenarios), "sample_ms": req.SampleMs, "chaos_seed": chaosSeed})
 }
 
 func (d *mayhemDriver) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -1121,6 +1134,9 @@ func (d *mayhemDriver) writeReport() string {
 	fmt.Fprintf(&b, "Run started %s. %d pass · %d degraded · **%d fail** · **%d blind** · %d inconclusive.\n",
 		st.StartedAt.Format(time.RFC3339), st.Summary.Pass, st.Summary.Degraded, st.Summary.Fail, st.Summary.Blind, st.Summary.Inconclusive)
 	fmt.Fprintf(&b, "Worst breach: %.0f W. Total time out of limit: %.0fs.\n\n", st.Summary.WorstPeakW, st.Summary.TotalBreachS)
+	if st.ChaosSeed != 0 {
+		fmt.Fprintf(&b, "Chaos run — replay this exact sequence with `--chaos --seed %d`.\n\n", st.ChaosSeed)
+	}
 	for _, f := range findings {
 		fmt.Fprintf(&b, "## [%s] %s — %s\n\n", f.Verdict, f.ID, f.Name)
 		fmt.Fprintf(&b, "**%s**\n\n", f.Headline)
