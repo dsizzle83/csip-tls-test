@@ -1286,6 +1286,71 @@ func diagnoseReboot(sc *mayScenario, cons *activeConstraint, s []maySample) mayF
 	return f
 }
 
+// diagnoseExpiry judges whether the hub releases a DERControl at its expiry. The
+// scenario posts a short-lived export cap; once it is past validUntil + grace the
+// hub must stop adopting it. A hub that keeps enforcing an expired control is
+// caught by INV-EXPIRED. If the hub never adopted the control at all the expiry
+// cannot be judged (INCONCLUSIVE) rather than a false PASS.
+func diagnoseExpiry(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+
+	adoptedEver := false
+	for _, smp := range s {
+		if smp.HubAdopted {
+			adoptedEver = true
+			break
+		}
+	}
+	if !adoptedEver {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "hub never adopted the control — cannot judge expiry"
+		f.Diagnosis = []string{
+			"The hub never showed the export cap in csip_control during the window, so whether it expires the control correctly cannot be determined.",
+			"Re-run; CSIP discovery may have missed the short-lived control before it expired.",
+		}
+		return f
+	}
+
+	if viol := invExpiredControl(s); len(viol) > 0 {
+		f.Metrics.HubAdopted = true
+		last := viol[len(viol)-1]
+		f.Verdict = "FAIL"
+		f.Headline = "hub enforced the control past its expiry"
+		f.Diagnosis = []string{
+			fmt.Sprintf("After the control's validUntil (+%ds grace) the hub was still adopting it: %s at t=%.0fs.", invExpiredGraceS, last.Detail, last.T),
+			"An expired DERControl must be released — keeping it enforced curtails the inverter the utility no longer commands.",
+			invSummaryLine("INV-EXPIRED", viol),
+		}
+		f.Fix = sc.Fix
+		return f
+	}
+
+	f.Verdict = "PASS"
+	f.Headline = "hub released the control at expiry"
+	f.Diagnosis = []string{
+		"The hub adopted the export cap while it was valid and dropped it within the grace window after validUntil — it never enforced an expired control.",
+		expiryRecoveryLine(s),
+	}
+	return f
+}
+
+// expiryRecoveryLine reports the inverter's final output vs its potential, the
+// evidence that the cap actually lifted once the control expired.
+func expiryRecoveryLine(s []maySample) string {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i].SolarOK {
+			return fmt.Sprintf("At t=%.0fs the inverter produced %.0f W of %.0f W possible — free to recover once the cap expired.", s[i].T, s[i].SolarW, s[i].SolarPossibleW)
+		}
+	}
+	return "No solar sample to confirm post-expiry recovery."
+}
+
 // ── Diagnosis helpers ──────────────────────────────────────────────────────────
 
 func hubVsRealLine(s []maySample) string {
@@ -2281,6 +2346,54 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
 			evaluate: diagnoseTransport,
 			teardown: func(d *mayhemDriver) { _ = d.post("solar", "/fault", map[string]any{"kind": "latency", "clear": true}) },
+		},
+		{
+			ID: "solar-reboot-forget", Name: "Inverter reboots mid-curtailment and forgets the limit",
+			Category:   "Grid compliance (INV-EXPORT)",
+			Hypothesis: "The hub has curtailed the inverter to hold a zero-export cap, then the inverter reboots and comes back at 100% WMaxLimPct — it forgot the limit and snaps to full output, blowing the cap. A hub that writes the limit once (on adoption) and never re-asserts it leaves the breach standing.",
+			Expected:   "Re-assert the limit after the inverter forgets it: detect the output jump via measurement and re-curtail within a cycle. Periodic idempotent control, not write-once.",
+			HoldS:      70,
+			Fix:        "Re-send the active DER limit every control cycle (idempotent), not only on change; verify measured output against the commanded limit (orchestrator inverter adapter).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 55, "Conn": 1}) // mid-SoC, above reserve — battery is not the focus
+				d.injectEnv(d.pvHighW, loadLow)
+				return d.postCap("exportCap", 0, 70, "mayhem: zero export cap, inverter reboots and forgets curtailment")
+			},
+			perTick: func(d *mayhemDriver, i int) {
+				d.injectEnv(d.pvHighW, loadLow)
+				if i == 25 { // the inverter reboots and forgets its curtailment
+					_ = d.post("solar", "/inject", map[string]any{"WMaxLimPct_pct": 100})
+				}
+			},
+			evaluate: diagnoseConstraint,
+			teardown: func(d *mayhemDriver) {}, // resetForScenario uncurtails the inverter
+		},
+		{
+			ID: "expired-control", Name: "Hub keeps enforcing a DERControl past its expiry",
+			Category:   "CSIP scheduling (INV-EXPIRED)",
+			Hypothesis: "The grid server issues a short export-cap DERControl that expires mid-window. Past validUntil (+grace) the control is dead and the hub must release it. A hub that keeps enforcing an expired control needlessly curtails the inverter forever — lost generation the utility never asked for.",
+			Expected:   "Drop the control at validUntil + grace: stop adopting it and let the inverter recover. Never enforce a DERControl past its expiry.",
+			HoldS:      90,
+			Fix:        "Expire a DERControl at validUntil (+grace) and release its setpoint (csip scheduler Evaluate / orchestrator).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 55, "Conn": 1}) // mid-SoC, above reserve — battery is not the focus
+				d.injectEnv(d.pvHighW, loadLow)
+				// Short-lived export cap: validUntil ≈ +30 s, so it expires ~30 s into
+				// the 90 s window and the +grace boundary (~60 s) leaves a clear tail to
+				// catch a hub that keeps enforcing it.
+				mrid, err := d.postControl(map[string]any{
+					"program": 0, "duration_s": 30, "activate": true,
+					"description": "mayhem: short-lived export cap that must expire",
+					"exp_lim_W":   int64(0),
+				})
+				if err != nil {
+					return nil, fmt.Errorf("post expiring control: %w", err)
+				}
+				return &activeConstraint{Typ: "exportCap", LimW: 0, MRID: mrid}, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseExpiry,
+			teardown: func(d *mayhemDriver) {},
 		},
 		{
 			ID: "stale-meter", Name: "Grid meter freezes while the world changes",

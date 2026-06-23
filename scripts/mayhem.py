@@ -53,6 +53,8 @@ SCENARIOS = [
     ("nan-sentinel", "Inverter returns the SunSpec N/A sentinel (0x8000)"),
     ("modbus-exception", "Inverter returns a Modbus exception on every read"),
     ("modbus-latency", "Inverter responds slowly (800 ms/read)"),
+    ("solar-reboot-forget", "Inverter reboots mid-curtailment and forgets the limit"),
+    ("expired-control", "Hub keeps enforcing a DERControl past its expiry"),
     ("stale-meter", "Grid meter freezes while the world changes"),
     ("battery-empty-import-cap", "Import cap at peak with an empty battery"),
     ("curtailment-release", "Generation-limit event ends — solar must recover"),

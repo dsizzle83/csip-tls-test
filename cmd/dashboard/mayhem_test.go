@@ -367,6 +367,47 @@ func TestDiagnoseEVFreeze_FailOnBreach(t *testing.T) {
 
 func noneCons() *activeConstraint { return &activeConstraint{Typ: "none"} }
 
+func TestDiagnoseExpiry_ReleasedPasses(t *testing.T) {
+	base := int64(1_700_000_000)
+	// Adopted while valid (validUntil far ahead) for the first third, then released.
+	s := mkSamples(30, func(i int, s *maySample) {
+		s.SolarW, s.SolarPossibleW = 4000, 4000
+		s.WallUnix = base + int64(i)
+		if i < 10 {
+			s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+			s.ValidUntil = base + 1000 // not expired while adopted
+		}
+	})
+	f := diagnoseExpiry(scFor("exp-pass"), exportCons(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS (%s)", f.Verdict, f.Headline)
+	}
+}
+
+func TestDiagnoseExpiry_StillEnforcedFails(t *testing.T) {
+	base := int64(1_700_000_000)
+	// Hub keeps adopting a control whose validUntil is well in the past.
+	s := mkSamples(30, func(i int, s *maySample) {
+		s.WallUnix = base + int64(i)
+		s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+		s.ValidUntil = base - 100 // already expired (well past validUntil + grace)
+	})
+	f := diagnoseExpiry(scFor("exp-fail"), exportCons(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (%s)", f.Verdict, f.Headline)
+	}
+	assertDiag(t, f, "must be released")
+}
+
+func TestDiagnoseExpiry_NeverAdoptedInconclusive(t *testing.T) {
+	base := int64(1_700_000_000)
+	s := mkSamples(30, func(i int, s *maySample) { s.WallUnix = base + int64(i) }) // never adopts
+	f := diagnoseExpiry(scFor("exp-inc"), exportCons(), s)
+	if f.Verdict != "INCONCLUSIVE" {
+		t.Fatalf("verdict = %s, want INCONCLUSIVE", f.Verdict)
+	}
+}
+
 func TestDiagnoseReboot_RecoversPasses(t *testing.T) {
 	// Hub stays up, SoC stays sane, and the tail shows a live battery.
 	s := mkSamples(40, func(i int, s *maySample) { s.BatSOC = 60; s.BatteryW = -1000 })
