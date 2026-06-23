@@ -41,6 +41,7 @@ SCENARIOS = [
     ("battery-soc-refuse", "Battery accepts the discharge command but does nothing"),
     ("ev-profile-reject", "Charger rejects the hub's current-limit profile"),
     ("grid-disconnect", "Cease-to-energize: grid commands a disconnect"),
+    ("conflicting-primacy", "Higher-primacy control must win"),
     ("malformed-csip", "Grid server serves a malformed resource"),
     ("stale-meter", "Grid meter freezes while the world changes"),
     ("battery-empty-import-cap", "Import cap at peak with an empty battery"),

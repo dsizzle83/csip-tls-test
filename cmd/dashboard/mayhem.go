@@ -1481,11 +1481,17 @@ func (d *mayhemDriver) restoreBench() {
 	log.Printf("mayhem: bench restored (clock 0, programs cleared, faults cleared, sims at 1×)")
 }
 
-// postCap is a small helper to post a duration-bounded cap control and return
-// the constraint to judge against.
+// postCap posts a duration-bounded cap control to program 0 (primacy 1) and
+// returns the constraint to judge against.
 func (d *mayhemDriver) postCap(typ string, limW float64, holdS int, desc string) (*activeConstraint, error) {
+	return d.postCapProg(0, typ, limW, holdS, desc)
+}
+
+// postCapProg posts a cap control to a specific DERProgram (0/1/2 ⇒ primacy
+// 1/5/10; lower wins), for primacy/conflict scenarios.
+func (d *mayhemDriver) postCapProg(program int, typ string, limW float64, holdS int, desc string) (*activeConstraint, error) {
 	body := map[string]any{
-		"program":     0,
+		"program":     program,
 		"duration_s":  holdS + 20,
 		"activate":    true,
 		"description": desc,
@@ -1712,6 +1718,27 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
 			evaluate: diagnoseDisconnect,
 			teardown: func(d *mayhemDriver) { d.deleteControls(0) }, // re-energize
+		},
+		{
+			ID: "conflicting-primacy", Name: "Higher-primacy control must win",
+			Category:   "CSIP scheduling (primacy)",
+			Hypothesis: "Two export-cap controls are active at once — a permissive 5000 W cap at LOW primacy (program 2 = primacy 10) and a strict 0 W cap at HIGH primacy (program 0 = primacy 1). The hub must enforce the higher-primacy 0 W cap, not the permissive one.",
+			Expected:   "Adopt the highest-primacy active control (exportCap 0 W) and hold export there; a lower-primacy permissive cap must never override it.",
+			HoldS:      70,
+			Fix:        "Scheduler primacy: lower primacy number wins (program 0 beats program 2). Verify adoption picks the highest-priority active control, not the most recent or most permissive.",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // full → PV curtailment is the only lever
+				d.injectEnv(d.pvHighW, loadLow)
+				// Low-primacy permissive cap first, then the high-primacy strict cap
+				// that must win.
+				if _, err := d.postCapProg(2, "exportCap", 5000, 70, "mayhem: low-primacy 5kW export cap"); err != nil {
+					return nil, err
+				}
+				return d.postCapProg(0, "exportCap", 0, 70, "mayhem: high-primacy 0W export cap")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseConstraint,
+			teardown: func(d *mayhemDriver) { d.deleteControls(0); d.deleteControls(2) },
 		},
 		{
 			ID: "malformed-csip", Name: "Grid server serves a malformed resource",
