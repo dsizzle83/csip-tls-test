@@ -52,9 +52,12 @@ type BatteryServer struct {
 
 // batteryFaultKinds is the set of POST /fault kinds the battery sim advertises.
 var batteryFaultKinds = map[FaultKind]bool{
-	FaultRejectWrite: true,
-	FaultWrongSign:   true,
-	FaultSocRefuse:   true,
+	FaultRejectWrite:     true,
+	FaultWrongSign:       true,
+	FaultSocRefuse:       true,
+	FaultNanSentinel:     true,
+	FaultLatency:         true,
+	FaultModbusException: true,
 }
 
 // NewBatteryServer creates and starts an animated Li-Ion battery simulator.
@@ -80,6 +83,7 @@ func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer,
 	// alter the commanded WMaxLimPct; the OnWrite hook above still fires after
 	// and reflects whatever value actually landed into the power registers.
 	regs.OnWriteAttempt = bs.interceptWrite
+	regs.OnRead = bs.faults.transportRead
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
 		animateBattery(s, r, wmaxW, wmaxKwh, bases, &bs.pendingSoC, &bs.faults, stop)

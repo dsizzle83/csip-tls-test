@@ -55,6 +55,9 @@ var solarFaultKinds = map[FaultKind]bool{
 	FaultRejectWrite:     true,
 	FaultEnableGate:      true,
 	FaultRampLimit:       true,
+	FaultNanSentinel:     true,
+	FaultLatency:         true,
+	FaultModbusException: true,
 }
 
 // NewSolarServer creates and starts an animated PV inverter simulator.
@@ -77,6 +80,7 @@ func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
 	}
 	ss.Server = srv
 	regs.OnWriteAttempt = ss.interceptWrite
+	regs.OnRead = ss.faults.transportRead
 	return ss, nil
 }
 

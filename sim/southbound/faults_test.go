@@ -222,6 +222,51 @@ func TestFaultSocRefuse_ZeroesBatteryOutput(t *testing.T) {
 	}
 }
 
+// TestFaultTransportRead verifies the transport-layer (Modbus read-path) faults:
+// nan_sentinel rewrites every value to 0x8000, exception_code returns an error,
+// latency delays the read.
+func TestFaultTransportRead(t *testing.T) {
+	supported := map[FaultKind]bool{FaultNanSentinel: true, FaultLatency: true, FaultModbusException: true}
+	fc := &faultController{label: "solar"}
+	in := []uint16{100, 200, 300}
+
+	// No fault: pass-through.
+	if out, err := fc.transportRead(in); err != nil || len(out) != 3 || out[0] != 100 {
+		t.Fatalf("passthrough = %v, %v", out, err)
+	}
+
+	// nan_sentinel: every value becomes the SunSpec 0x8000 N/A sentinel.
+	if err := fc.apply([]byte(`{"kind":"nan_sentinel"}`), supported); err != nil {
+		t.Fatalf("arm nan_sentinel: %v", err)
+	}
+	out, _ := fc.transportRead(in)
+	for i, v := range out {
+		if v != 0x8000 {
+			t.Fatalf("nan_sentinel[%d] = %#x, want 0x8000", i, v)
+		}
+	}
+	fc.apply([]byte(`{"kind":"nan_sentinel","clear":true}`), supported)
+
+	// exception_code: returns a Modbus error, restored on clear.
+	fc.apply([]byte(`{"kind":"exception_code"}`), supported)
+	if _, err := fc.transportRead(in); err == nil {
+		t.Fatal("exception_code should return an error")
+	}
+	fc.apply([]byte(`{"kind":"exception_code","clear":true}`), supported)
+	if _, err := fc.transportRead(in); err != nil {
+		t.Fatalf("after clear exception_code: %v", err)
+	}
+
+	// latency: the read is delayed by the configured amount.
+	fc.apply([]byte(`{"kind":"latency","latency_ms":40}`), supported)
+	start := time.Now()
+	fc.transportRead(in)
+	if time.Since(start) < 35*time.Millisecond {
+		t.Error("latency fault did not delay the read")
+	}
+	fc.apply([]byte(`{"kind":"latency","clear":true}`), supported)
+}
+
 // TestBatteryFaults_UnsupportedKind verifies a sim rejects a kind it does not
 // advertise (the battery does not support ack_before_effect), which simapi
 // turns into a 400.

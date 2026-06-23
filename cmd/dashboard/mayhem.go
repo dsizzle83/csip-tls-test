@@ -57,9 +57,10 @@ type maySample struct {
 	GridOK    bool    `json:"grid_ok"`
 	HubGridW  float64 `json:"hub_grid_W"`
 
-	SolarW         float64 `json:"solar_W"`
+	SolarW         float64 `json:"solar_W"` // from the solar sim /state (ground truth, not Modbus)
 	SolarPossibleW float64 `json:"solar_possible_W"`
 	SolarOK        bool    `json:"solar_ok"`
+	HubSolarW      float64 `json:"hub_solar_W"` // the hub's Modbus-derived solar reading — for INV-TRANSPORT
 
 	BatteryW   float64 `json:"battery_W"`
 	BatSOC     float64 `json:"bat_soc"`
@@ -419,6 +420,7 @@ func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
 	s.HubReachable = hub.ok
 	if hub.ok {
 		s.HubGridW = hub.gridW
+		s.HubSolarW = hub.solarW
 		s.BatteryW = hub.batteryW
 		s.BatSOC = hub.batSOC
 		s.EvW = hub.evW
@@ -1032,6 +1034,73 @@ func diagnoseMalform(sc *mayScenario, cons *activeConstraint, s []maySample) may
 	return f
 }
 
+// diagnoseTransport handles the Modbus transport-fault scenarios (nan_sentinel,
+// exception_code, latency). The hub MUST NOT act on a bad reading: it must
+// recognise the SunSpec 0x8000 sentinel / a Modbus exception / a hung read as
+// N-A or device-down and hold a safe value — never report a physically-
+// impossible measurement, and never let the slow/failed device take down its
+// control loop. The ground-truth solar value comes from the sim's /state (HTTP,
+// unaffected by the Modbus fault); the hub's Modbus-derived reading is HubSolarW.
+func diagnoseTransport(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+
+	reach := 0
+	for _, smp := range s {
+		if smp.HubReachable {
+			reach++
+		}
+	}
+	if reach < len(s)/2 {
+		f.Verdict = "FAIL"
+		f.Headline = "hub stopped responding under the transport fault"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub's /status was unreachable on %d of %d samples — a slow/failed Modbus device blocked or crashed its control loop.", len(s)-reach, len(s)),
+			"A device that hangs or errors on the wire must never take the hub down; reads must be bounded by a timeout and the device marked stale/down.",
+		}
+		f.Fix = "Bound every Modbus read with a timeout; on error/timeout mark the device stale and fail safe (lexa-modbus). Never block the optimizer on a device."
+		return f
+	}
+
+	// A physically-impossible solar reading means the hub interpreted the 0x8000
+	// sentinel / garbage as a real value instead of detecting device-down. Solar
+	// output is always ≥0 and bounded well under 8 kW on this bench.
+	garbage := 0
+	var worst float64
+	for _, smp := range s {
+		if smp.HubReachable && (smp.HubSolarW < -100 || smp.HubSolarW > 8000) {
+			garbage++
+			if math.Abs(smp.HubSolarW) > math.Abs(worst) {
+				worst = smp.HubSolarW
+			}
+		}
+	}
+	if garbage > len(s)/4 {
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("hub acted on a garbage Modbus reading (solar %.0f W)", worst)
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub reported a physically-impossible solar value (%.0f W) on %d of %d samples — it interpreted the SunSpec 0x8000 N/A sentinel (or an exception/garbage) as a real reading.", worst, garbage, len(s)),
+			"A hub that acts on the not-implemented sentinel will optimise against fabricated data; 0x8000 must be treated as N/A and the source marked unavailable.",
+			decisionLine(s),
+		}
+		f.Fix = "In the SunSpec decode, treat 0x8000 (int16) / 0xFFFF (uint16) as not-implemented → N/A; on a Modbus exception mark the device down (lexa-modbus / sunspec)."
+		return f
+	}
+
+	f.Verdict = "PASS"
+	f.Headline = "hub did not act on the bad Modbus reading"
+	f.Diagnosis = []string{
+		"The hub stayed up and never reported a physically-impossible measurement under the transport fault — it recognised the sentinel/exception as N/A or device-down and held a safe value.",
+		fmt.Sprintf("At t=%.0fs the sim's true solar was %.0f W; the hub reported %.0f W.", s[len(s)-1].T, s[len(s)-1].SolarW, s[len(s)-1].HubSolarW),
+	}
+	return f
+}
+
 // ── Diagnosis helpers ──────────────────────────────────────────────────────────
 
 func hubVsRealLine(s []maySample) string {
@@ -1285,17 +1354,17 @@ func (d *mayhemDriver) solarSim() (actualW, possibleW float64, ok bool) {
 }
 
 type mayHubState struct {
-	ok                   bool
-	gridW, batteryW, evW float64
-	batSOC, evSOC        float64
-	evCurrentA, evMaxA   float64
-	clockOffsetS         int64
-	ctrlActive           bool
-	ctrlTyp, ctrlMRID    string
-	ctrlLimW             float64
-	validUntil           int64
-	disconnectActive     bool
-	decisions            []string
+	ok                           bool
+	gridW, batteryW, evW, solarW float64
+	batSOC, evSOC                float64
+	evCurrentA, evMaxA           float64
+	clockOffsetS                 int64
+	ctrlActive                   bool
+	ctrlTyp, ctrlMRID            string
+	ctrlLimW                     float64
+	validUntil                   int64
+	disconnectActive             bool
+	decisions                    []string
 }
 
 func (d *mayhemDriver) hubState() mayHubState {
@@ -1341,6 +1410,7 @@ func (d *mayhemDriver) hubState() mayHubState {
 	}
 	h.ok = true
 	h.gridW = st.Power.GridW
+	h.solarW = st.Power.SolarW
 	h.batteryW = st.Power.BatteryW
 	h.clockOffsetS = st.ClockOffsetS
 	for _, dev := range st.Devices {
@@ -1425,6 +1495,11 @@ func (d *mayhemDriver) clearAllFaults() {
 	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
 	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
 		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
+	}
+	for _, dev := range []string{"solar", "battery"} {
+		for _, k := range []string{"nan_sentinel", "latency", "exception_code"} {
+			_ = d.post(dev, "/fault", map[string]any{"kind": k, "clear": true})
+		}
 	}
 	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
 }
@@ -1814,6 +1889,64 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
 			evaluate: diagnoseMalform,
 			teardown: func(d *mayhemDriver) { _ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true}) },
+		},
+		{
+			ID: "nan-sentinel", Name: "Inverter returns the SunSpec N/A sentinel (0x8000)",
+			Category:   "Modbus transport (INV-TRANSPORT)",
+			Hypothesis: "The inverter's registers all read the SunSpec 0x8000 'not implemented' sentinel (−32768) — a half-initialised or failed register bank. A hub that treats the sentinel as a real reading sees a wild −32768 W value and optimises against fabricated data.",
+			Expected:   "Recognise 0x8000 as N/A and mark the source unavailable; never report a physically-impossible measurement or act on it.",
+			HoldS:      35,
+			Fix:        "In the SunSpec decode, treat 0x8000 (int16) / 0xFFFF (uint16) as not-implemented → N/A (lexa-modbus / sunspec).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				d.injectEnv(d.pvHighW, loadLow)
+				if err := d.post("solar", "/fault", map[string]any{"kind": "nan_sentinel"}); err != nil {
+					return nil, fmt.Errorf("arm nan_sentinel: %w", err)
+				}
+				return &activeConstraint{Typ: "none"}, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseTransport,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("solar", "/fault", map[string]any{"kind": "nan_sentinel", "clear": true})
+			},
+		},
+		{
+			ID: "modbus-exception", Name: "Inverter returns a Modbus exception on every read",
+			Category:   "Modbus transport (INV-TRANSPORT)",
+			Hypothesis: "The inverter answers every read with a Modbus exception (server device failure). The hub must treat the error as device-down — never act on a missing reading.",
+			Expected:   "Mark the device down/stale and fail safe; never report a fabricated value or block the control loop.",
+			HoldS:      35,
+			Fix:        "On a Modbus exception, mark the device down and stale-expire its reading (lexa-modbus).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				d.injectEnv(d.pvHighW, loadLow)
+				if err := d.post("solar", "/fault", map[string]any{"kind": "exception_code"}); err != nil {
+					return nil, fmt.Errorf("arm exception_code: %w", err)
+				}
+				return &activeConstraint{Typ: "none"}, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseTransport,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("solar", "/fault", map[string]any{"kind": "exception_code", "clear": true})
+			},
+		},
+		{
+			ID: "modbus-latency", Name: "Inverter responds slowly (800 ms/read)",
+			Category:   "Modbus transport (INV-TRANSPORT)",
+			Hypothesis: "The inverter answers every read after an 800 ms delay — a congested or struggling device. An unbounded read blocks the hub's control loop.",
+			Expected:   "Bound the read with a timeout and stale-expire the reading; never let a slow device block the optimizer.",
+			HoldS:      35,
+			Fix:        "Bound every Modbus read with a timeout; on timeout mark the device stale (lexa-modbus).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				d.injectEnv(d.pvHighW, loadLow)
+				if err := d.post("solar", "/fault", map[string]any{"kind": "latency", "latency_ms": 800}); err != nil {
+					return nil, fmt.Errorf("arm latency: %w", err)
+				}
+				return &activeConstraint{Typ: "none"}, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseTransport,
+			teardown: func(d *mayhemDriver) { _ = d.post("solar", "/fault", map[string]any{"kind": "latency", "clear": true}) },
 		},
 		{
 			ID: "stale-meter", Name: "Grid meter freezes while the world changes",

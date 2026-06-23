@@ -82,6 +82,25 @@ const (
 	// falling back to another lever or posting CannotComply. This is an effect-time
 	// fault (see faultController shapeBatteryW).
 	FaultSocRefuse FaultKind = "soc_refuse"
+
+	// ── Transport-layer (Modbus) faults — act on the READ path. ──
+
+	// FaultNanSentinel makes every register read return the SunSpec "not
+	// implemented / not available" sentinel (0x8000 for an int16, i.e. −32768).
+	// A hub that treats the sentinel as a real reading sees a wild −32768 W value;
+	// it MUST recognise the sentinel as N/A and not act on it (and ideally mark
+	// the device unavailable). Models a half-initialised or failed register bank.
+	FaultNanSentinel FaultKind = "nan_sentinel"
+
+	// FaultLatency delays every Modbus read by LatencyMs, modelling a slow or
+	// congested device. The hub must bound its read with a timeout and stale-
+	// expire the reading rather than block its control loop.
+	FaultLatency FaultKind = "latency"
+
+	// FaultModbusException makes every read return a Modbus exception (server
+	// device failure). The hub must treat the error as device-down — never act on
+	// a missing reading — and surface it.
+	FaultModbusException FaultKind = "exception_code"
 )
 
 // FaultSpec is the parsed body of POST /fault. A sim interprets the fields
@@ -90,6 +109,7 @@ type FaultSpec struct {
 	Kind         FaultKind `json:"kind"`
 	DelayS       float64   `json:"delay_s,omitempty"`          // ack_before_effect: effect delay (seconds)
 	MaxRampWPerS float64   `json:"max_ramp_w_per_s,omitempty"` // ramp_limit: output slew rate (W/s)
+	LatencyMs    int       `json:"latency_ms,omitempty"`       // latency: per-read delay (ms)
 	Clear        bool      `json:"clear,omitempty"`            // when true, disarm this Kind
 }
 
@@ -111,6 +131,12 @@ type RegisterMap struct {
 	// level. The interceptor is invoked without the map lock held, so it may
 	// freely call Get/Set.
 	OnWriteAttempt func(startAddr uint16, vals []uint16) (apply bool)
+
+	// OnRead, if non-nil, is consulted on the READ path with the values about to
+	// be returned. It may sleep (latency), rewrite the values (nan_sentinel), or
+	// return an error to make the Modbus layer send an exception. Used by
+	// transport-layer fault injection. Called without the map lock held.
+	OnRead func(vals []uint16) ([]uint16, error)
 }
 
 // Get returns the value of a holding register (0-based Modbus address).
@@ -166,10 +192,18 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 		return nil, nil
 	}
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	result := make([]uint16, req.Quantity)
 	for i := uint16(0); i < req.Quantity; i++ {
 		result[i] = r.regs[req.Addr+i]
+	}
+	onRead := r.OnRead
+	r.mu.RUnlock()
+
+	// Transport-layer fault hook: may sleep (latency), rewrite (nan_sentinel), or
+	// return an error to make the Modbus layer send an exception. Called without
+	// the lock held so latency does not block writers.
+	if onRead != nil {
+		return onRead(result)
 	}
 	return result, nil
 }

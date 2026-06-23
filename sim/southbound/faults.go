@@ -23,6 +23,8 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	modbuslib "github.com/simonvetter/modbus"
 )
 
 // ackBeforeEffect holds the state for the FaultAckBeforeEffect injector: when
@@ -68,6 +70,36 @@ type faultController struct {
 	// soc_refuse (effect-time, battery): the pack accepts the setpoint but
 	// produces zero power. See shapeBatteryW.
 	refuse bool
+
+	// Transport-layer (Modbus read-path) faults. See transportRead.
+	nanSentinel     bool // every read returns 0x8000 (SunSpec N/A)
+	latencyMs       int  // per-read delay
+	modbusException bool // every read returns a Modbus exception
+}
+
+// transportRead is the RegisterMap.OnRead hook. It applies the armed transport
+// faults to a read about to be returned: latency sleeps, exception_code returns
+// a Modbus error, nan_sentinel rewrites every value to the SunSpec 0x8000 N/A
+// sentinel. With none armed it returns the values unchanged.
+func (fc *faultController) transportRead(vals []uint16) ([]uint16, error) {
+	fc.mu.Lock()
+	lat, nan, exc := fc.latencyMs, fc.nanSentinel, fc.modbusException
+	fc.mu.Unlock()
+
+	if lat > 0 {
+		time.Sleep(time.Duration(lat) * time.Millisecond)
+	}
+	if exc {
+		return nil, modbuslib.ErrServerDeviceFailure
+	}
+	if nan {
+		out := make([]uint16, len(vals))
+		for i := range out {
+			out[i] = 0x8000 // SunSpec int16 "not implemented / N/A" sentinel (−32768)
+		}
+		return out, nil
+	}
+	return vals, nil
 }
 
 // shapeBatteryW applies effect-time battery faults to the hub-commanded power
@@ -277,6 +309,26 @@ func (fc *faultController) apply(body []byte, supported map[FaultKind]bool) erro
 	case FaultSocRefuse:
 		fc.refuse = !spec.Clear
 		log.Printf("[fault] soc_refuse: %s armed=%v", fc.label, fc.refuse)
+
+	case FaultNanSentinel:
+		fc.nanSentinel = !spec.Clear
+		log.Printf("[fault] nan_sentinel: %s armed=%v", fc.label, fc.nanSentinel)
+
+	case FaultModbusException:
+		fc.modbusException = !spec.Clear
+		log.Printf("[fault] exception_code: %s armed=%v", fc.label, fc.modbusException)
+
+	case FaultLatency:
+		if spec.Clear {
+			fc.latencyMs = 0
+		} else {
+			ms := spec.LatencyMs
+			if ms <= 0 {
+				ms = 500
+			}
+			fc.latencyMs = ms
+		}
+		log.Printf("[fault] latency: %s latency_ms=%d", fc.label, fc.latencyMs)
 	}
 	return nil
 }
