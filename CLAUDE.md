@@ -29,7 +29,9 @@ sim/southbound/         In-memory Modbus device models (no hardware)
 sim/simapi/             REST + WS + SSE /logs sidecar for every sim
 sim/conformance/        CSIP conformance runner (Pi, cgo)
 sim/modsim-conformance/ Modbus conformance runner (-device inverter|battery|meter)
-cmd/dashboard/          Go proxy + embedded SPA (KPIs, scenarios, logs, register tables)
+cmd/dashboard/          Go proxy + embedded SPA (KPIs, scenarios, logs, register tables);
+                        also hosts the Mayhem hostile-QA engine (mayhem.go, /api/qa/*) and
+                        the Bench Replay driver (replay.go, /api/replay/*)
 internal/csip/          2030.5 model, walker, scheduler, identity, DNS-SD
 internal/tlsclient/     wolfSSL mTLS client (persistent keep-alive fetcher)
 internal/southbound/    Modbus/SunSpec stack (mirrored in lexa-hub — lockstep!)
@@ -58,7 +60,16 @@ scripts/run-conformance.sh        # full CSIP conformance evidence (layers 1-3)
 bin/evsim -csms ws://69.0.0.1:8887/ocpp -api-port 6024   # NOTE: flag is -csms, not -hub
 make gen-client-cert CN=csip-pi-002
 scripts/hub-replay-tune.sh fast|stock   # hub engine/discovery timing for bench replay
+bash scripts/bench-up.sh --fast|--stock # bring desktop services up + set hub timing
+python3 scripts/mayhem.py --dashboard http://localhost:8080   # run the hostile-QA suite
 ```
+
+## Mayhem hostile-QA
+Adversarial HIL fault-injection driving the real bench through 38 worst-case scenarios and
+diagnosing where the hub's fault handling breaks. Engine: `cmd/dashboard/mayhem.go` (`/api/qa/*`,
+dashboard QA tab); headless runner: `scripts/mayhem.py` (`--list`, `--only id,id`, `--json`).
+Verdicts: PASS / DEGRADED / FAIL / BLIND / INCONCLUSIVE. **Bench must be in FAST mode**
+(`bench-up.sh --fast`). Findings + fix log: `docs/QA_TRIAGE_20260624.md`, `docs/QA_FINDINGS.md`.
 
 ## Bench replay (hardware-in-the-loop cost sim)
 Dashboard "3-Month Cost Sim" tab: synthetic 92-day sweep (browser worker) plus **Bench

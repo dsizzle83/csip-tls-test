@@ -1,14 +1,20 @@
 # Mayhem QA — Findings & Mitigation Runbook
 
 **Last updated:** 2026-06-24
-**Status:** Hostile-QA build COMPLETE — 38 curated scenarios. The findings below
-were surfaced against the live hub but the **hub has NOT been changed yet** (we
-built the framework first, on purpose).
-**Next session:** run the *whole* suite against the hub, triage, then start
-**mitigating** the findings in `~/projects/lexa-hub` (separate repo).
+**Status:** Hostile-QA build COMPLETE (38 scenarios) and **mitigation underway**. Full
+suite was run against the live hub (10 FAIL / 2 BLIND / 12 DEGRADED / 14 PASS), the
+hardening commit `9d14747` was deployed, and **7 of the 9 deployed-HEAD FAILs now have
+fixes** in `~/projects/lexa-hub` (closed-loop convergence, CSIP fail-closed, telemetry
+plausibility, battery reserve safety). See **`QA_TRIAGE_20260624.md`** for the per-finding
+root cause, the deploy-vs-fix split, and the implementation log (§6) — that is the current
+source of truth; the catalogue below is the original strategy reference.
 
-> Companions: `QA_FAULT_INJECTION.md` (original strategy/plan), `HARNESS_REVIEW.md`
-> (2026-06 audit), `BENCH.md` (topology/IPs/SSH), `REPLAY_RUNBOOK.md` (HIL driver).
+The 2 remaining BLINDs (`stale-meter`, `ev-meter-freeze`) are diagnoser/environment-limited
+(safe today) — see `QA_TRIAGE_20260624.md` for why, and the production heartbeat fix.
+
+> Companions: `QA_TRIAGE_20260624.md` (current triage + fix log), `QA_FAULT_INJECTION.md`
+> (original strategy/plan), `HARNESS_REVIEW.md` (2026-06 audit), `BENCH.md` (topology/IPs/SSH),
+> `REPLAY_RUNBOOK.md` (HIL driver).
 > The engine is `cmd/dashboard/mayhem.go`; the headless runner is `scripts/mayhem.py`.
 
 ---
