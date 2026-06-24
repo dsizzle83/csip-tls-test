@@ -34,6 +34,9 @@ internal/tlsclient/testdata/certs/
 replay-checkpoint.json
 replay-ticklog-*.csv
 
+# Mayhem QA run reports (per-run, regenerated each suite run)
+qa-mayhem-*.md
+
 # Go test artifacts
 *.test
 *.out
