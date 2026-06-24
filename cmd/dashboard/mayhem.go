@@ -986,6 +986,41 @@ func diagnoseDisconnect(sc *mayScenario, cons *activeConstraint, s []maySample) 
 // hub must CONTAIN the error — never panic/hang, and never drop the safe control
 // for garbage or "none". It judges survivability first (did /status keep
 // answering), then reuses the constraint oracle to confirm the safe cap held.
+// malformScenario builds a CSIP-robustness scenario for one gridsim malform kind:
+// adopt a safe zero-export cap on a clean walk, then (8 s in) start serving the
+// malformed resource and judge with diagnoseMalform — the hub must stay up and
+// keep enforcing the safe cap. The battery is full so PV curtailment is the only
+// lever, isolating "did the bad resource unseat the safe control" from battery
+// behaviour. Shared by the malformed-resource variant suite.
+func malformScenario(id, name, kind, hypothesis string) *mayScenario {
+	const loadLow = 250.0
+	return &mayScenario{
+		ID: id, Name: name,
+		Category:   "CSIP robustness (INV-EXPORT survivability)",
+		Hypothesis: hypothesis,
+		Expected:   "Stay up (/status keeps answering) and keep enforcing the active export cap. A malformed resource must not take the hub down or unseat a safe control.",
+		HoldS:      75, // long enough that a real unseat stays breached to the tail and a transient blip recovers
+		Fix:        "Harden the northbound walker/parser; bound the walk and fail closed to last-known-good controls on a malformed resource.",
+		setup: func(d *mayhemDriver) (*activeConstraint, error) {
+			_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // battery full → PV curtailment is the only lever
+			d.injectEnv(d.pvHighW, loadLow)
+			cons, err := d.postCap("exportCap", 0, 75, "mayhem: export cap then malformed "+kind)
+			if err != nil {
+				return nil, err
+			}
+			// Let the hub adopt the safe cap on a clean walk, THEN serve garbage.
+			go func() {
+				time.Sleep(8 * time.Second)
+				_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": kind})
+			}()
+			return cons, nil
+		},
+		perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+		evaluate: diagnoseMalform,
+		teardown: func(d *mayhemDriver) { _ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true}) },
+	}
+}
+
 func diagnoseMalform(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
 	if len(s) == 0 {
 		f := baseFinding(sc)
@@ -1021,7 +1056,14 @@ func diagnoseMalform(sc *mayScenario, cons *activeConstraint, s []maySample) may
 	f := baseFinding(sc)
 	f.Metrics = scanSamples(cons, s)
 	breaches := invExport(cons, s)
-	if len(breaches) == 0 || f.Metrics.ReportedCannot {
+	// CannotComply excuses a breach only at a GENUINE physical limit. A malform
+	// scenario holds an EXPORT cap, which the hub can always meet by curtailing PV
+	// (and not discharging the battery) — so a sustained export breach here means
+	// the malformed resource unseated or corrupted the safe cap, and a CannotComply
+	// does not excuse exporting freely over a cap the hub could have held. (Import
+	// caps, where an empty battery is a real limit, keep the admission excuse.)
+	excusableCannot := f.Metrics.ReportedCannot && cons.Typ != "exportCap"
+	if len(breaches) == 0 || excusableCannot {
 		f.Verdict = "PASS"
 		f.Headline = "contained the malformed resource and held the safe control"
 		f.Diagnosis = []string{
@@ -1031,11 +1073,26 @@ func diagnoseMalform(sc *mayScenario, cons *activeConstraint, s []maySample) may
 		}
 		return f
 	}
+	// There WAS a post-deadline breach. Distinguish a sustained unseat (the cap
+	// stays breached to the end of the window) from a brief transient the hub then
+	// re-establishes (a clean tail). Only a sustained unseat is a containment
+	// failure; a transient drop that recovers is a DEGRADED resilience note, not a
+	// FAIL — this also keeps a single end-of-window sample from flapping the verdict.
+	if f.Metrics.TailClean {
+		f.Verdict = "DEGRADED"
+		f.Headline = "transiently dropped the safe control under the malformed resource, then recovered"
+		f.Diagnosis = []string{
+			invSummaryLine("INV-EXPORT", breaches),
+			"The malformed resource briefly unseated the active export cap (the inverter exported over it) but the hub re-established the cap before the end of the window — contained, but not seamlessly.",
+			hubVsRealLine(s),
+		}
+		return f
+	}
 	f.Verdict = "FAIL"
 	f.Headline = "malformed resource unseated the safe control"
 	f.Diagnosis = []string{
 		invSummaryLine("INV-EXPORT", breaches),
-		"The malformed resource was served while a safe export cap was active, and the cap was then sustained-breached with no CannotComply — the bad resource dropped or corrupted the safe control instead of being contained.",
+		"The malformed resource was served while a safe export cap was active, and the cap was then sustained-breached through the end of the window — the bad resource dropped or corrupted the safe control instead of being contained. For an export cap the hub can always curtail PV to comply, so a CannotComply does not excuse this.",
 		decisionLine(s),
 	}
 	f.Fix = "Harden the northbound walker/parser; on a malformed resource fail closed to last-known-good controls rather than dropping or adopting garbage."
@@ -2352,12 +2409,12 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			Category:   "CSIP robustness (INV-EXPORT survivability)",
 			Hypothesis: "A buggy or hostile 2030.5 server serves a malformed DERControlList (the same control mRID twice) while a safe export cap is active. The hub must contain the parse error — never panic/hang, never drop the safe control for garbage or 'none'.",
 			Expected:   "Stay up (/status keeps answering) and keep enforcing the active export cap. A malformed resource must not take the hub down or unseat a safe control.",
-			HoldS:      45,
+			HoldS:      75,
 			Fix:        "Harden the northbound walker/parser; on a malformed resource fail closed to last-known-good controls.",
 			setup: func(d *mayhemDriver) (*activeConstraint, error) {
 				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // battery full → PV curtailment is the only lever
 				d.injectEnv(d.pvHighW, loadLow)
-				cons, err := d.postCap("exportCap", 0, 45, "mayhem: export cap then malformed resource")
+				cons, err := d.postCap("exportCap", 0, 75, "mayhem: export cap then malformed resource")
 				if err != nil {
 					return nil, err
 				}
@@ -2373,17 +2430,32 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			evaluate: diagnoseMalform,
 			teardown: func(d *mayhemDriver) { _ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true}) },
 		},
+		malformScenario("malform-missing-href", "Grid server strips the program list's href",
+			"missing_href",
+			"The 2030.5 server serves a DERProgramList with its own href stripped — an unresolvable resource. A hub that dereferences the missing link can NPE/hang or drop the whole program tree (and the safe control with it)."),
+		malformScenario("malform-empty-program", "Grid server serves an empty program list",
+			"empty_program_list",
+			"The server suddenly serves a DERProgramList with zero programs (all=0) while a safe export cap is active. A hub that treats 'no programs' as 'cancel everything' silently drops the active cap instead of keeping last-known-good."),
+		malformScenario("malform-huge-activepower", "Grid server serves an absurd ActivePower limit",
+			"huge_activepower",
+			"A DERControl arrives with an export limit of 32767×10^9 W — overflow bait. A hub that scales it into an int register wraps to garbage (audit GS-1/MTR-1) and may command a wild setpoint or drop the safe cap."),
+		malformScenario("malform-bad-duration", "Grid server serves a ~136-year control interval",
+			"bad_duration",
+			"A DERControl interval is served with a 4294967295 s (~136-year) duration. A hub that trusts it never expires the control, or overflows its expiry math — either pinning a setpoint forever or mis-scheduling the safe cap."),
+		malformScenario("malform-pagination", "Grid server lies about list pagination",
+			"pagination",
+			"The DERProgramList header claims all=999 programs across pages while serving one and advertising no real next page. A pager that trusts all= can loop fetching pages that never come or over-allocate — a discovery DoS that must be bounded."),
 		{
 			ID: "pricing-attack", Name: "Grid server serves malicious pricing",
 			Category:   "CSIP robustness (pricing §10.5)",
 			Hypothesis: "A hostile 2030.5 server serves a malformed tariff (an absurd price multiplier, 10^100) while a safe export cap is active. Pricing must affect optimization only WITHIN safety constraints — a bad tariff must never break DER discovery, unseat the safe control, or produce a NaN command.",
-			Expected:   "Stay up and keep enforcing the active export cap; the pricing fault is contained (the walker treats pricing discovery as non-fatal). NOTE: today the hub does not consume CSIP prices — lexa-northbound discovers tariffs but never walks ConsumptionTariffInterval — so a price attack has no behavioural effect by design.",
-			HoldS:      45,
-			Fix:        "Pricing discovery failures must stay non-fatal (they are). Separately, the QA surfaced a gap: wire lexa-northbound to walk ConsumptionTariffInterval so CSIP prices actually drive dispatch — and are then bounded by the safety constraints.",
+			Expected:   "Stay up and keep enforcing the active export cap; a bad tariff must not perturb the safety control. NOTE: the hub does not consume CSIP prices today (lexa-northbound discovers tariffs but never walks ConsumptionTariffInterval), so a price attack has no INTENDED behavioural effect — but QA observed the malformed tariff TRANSIENTLY drops the export cap mid-walk (DEGRADED) before the hub re-establishes it.",
+			HoldS:      75,
+			Fix:        "Isolate discovery of a malformed leaf resource so it cannot perturb an already-adopted safety control — QA showed a bad tariff briefly unseats the export cap before the hub recovers. Separately, wire lexa-northbound to walk ConsumptionTariffInterval so CSIP prices actually drive dispatch, bounded by the safety constraints.",
 			setup: func(d *mayhemDriver) (*activeConstraint, error) {
 				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // full → PV curtailment is the only lever
 				d.injectEnv(d.pvHighW, loadLow)
-				cons, err := d.postCap("exportCap", 0, 45, "mayhem: export cap under malicious pricing")
+				cons, err := d.postCap("exportCap", 0, 75, "mayhem: export cap under malicious pricing")
 				if err != nil {
 					return nil, err
 				}
@@ -2402,13 +2474,13 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			ID: "curve-attack", Name: "Grid server serves an empty DER curve list",
 			Category:   "CSIP robustness (DER curves §)",
 			Hypothesis: "A program advertises a DERCurveListLink (Volt-VAr) but the server serves an empty curve list while a safe export cap is active. A missing/empty curve must be contained — discovery of optional curves is non-fatal and must never break DER control.",
-			Expected:   "Stay up and keep enforcing the active export cap; the empty curve list is contained. (Like pricing, the hub discovers DER curves but does not yet consume them for control.)",
-			HoldS:      45,
-			Fix:        "Curve discovery failures must stay non-fatal (they are). Curves are discovered but not yet applied to inverter control modes — a wiring gap, not a safety one.",
+			Expected:   "Stay up and keep enforcing the active export cap; an empty curve list must not perturb the safety control. (Like pricing, the hub discovers DER curves but does not yet consume them for control.) QA observed a brief transient cap drop before the hub recovers (DEGRADED).",
+			HoldS:      75,
+			Fix:        "Isolate optional-resource discovery (curves) so a malformed/empty leaf cannot transiently unseat an adopted control. Curves are discovered but not yet applied to inverter control modes — a wiring gap, not a safety one.",
 			setup: func(d *mayhemDriver) (*activeConstraint, error) {
 				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1})
 				d.injectEnv(d.pvHighW, loadLow)
-				cons, err := d.postCap("exportCap", 0, 45, "mayhem: export cap under empty curve list")
+				cons, err := d.postCap("exportCap", 0, 75, "mayhem: export cap under empty curve list")
 				if err != nil {
 					return nil, err
 				}

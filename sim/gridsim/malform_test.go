@@ -76,6 +76,17 @@ func TestMalform_TransformsTargetResources(t *testing.T) {
 		t.Errorf("missing_href: root href not stripped:\n%s", b)
 	}
 
+	// pagination: the program list's all= count lies (claims 999) while the body
+	// still serves its actual program(s) and no real next page.
+	s.SetMalform(MalformPagination)
+	b, ok = s.malformedXML(malformProgList())
+	if !ok || !strings.Contains(string(b), `all="999"`) {
+		t.Errorf("pagination: all= count not inflated:\n%s", b)
+	}
+	if !strings.Contains(string(b), "<DERProgram>") && !strings.Contains(string(b), "<DERProgram ") {
+		t.Errorf("pagination: served body should still contain the real program(s):\n%s", b)
+	}
+
 	// Cleared → pass-through.
 	s.SetMalform("")
 	if _, ok := s.malformedXML(malformProgList()); ok {

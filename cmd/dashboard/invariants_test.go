@@ -228,6 +228,19 @@ func TestDiagnoseMalform_Verdicts(t *testing.T) {
 	if f := diagnoseMalform(scFor("malformed-csip"), cons, unseated); f.Verdict != "FAIL" {
 		t.Fatalf("unseated verdict = %q, want FAIL", f.Verdict)
 	}
+
+	// Sustained export breach WITH a CannotComply must still FAIL: for an export
+	// cap the hub can always curtail PV, so an admission does not excuse exporting
+	// freely over a cap it could have held (the malform unseated it).
+	unseatedCannot := mkSamples(40, func(i int, s *maySample) {
+		s.HubReachable = true
+		s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+		s.RealGridW, s.HubGridW = -3000, -3000
+		s.CannotComply = true
+	})
+	if f := diagnoseMalform(scFor("malformed-csip"), cons, unseatedCannot); f.Verdict != "FAIL" {
+		t.Fatalf("unseated+CannotComply verdict = %q, want FAIL (export cap is always curtailable)", f.Verdict)
+	}
 }
 
 // diagnoseSOC turns an INV-SOC violation into a FAIL and a clean timeline into a

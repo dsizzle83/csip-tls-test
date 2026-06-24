@@ -30,6 +30,7 @@ const (
 	MalformBadDuration      = "bad_duration"       // a control interval with a ~136-year duration
 	MalformDupMRID          = "dup_mrid"           // a DERControlList with the same control (mRID) twice
 	MalformMissingHref      = "missing_href"       // a DERProgramList with its href stripped — unresolvable
+	MalformPagination       = "pagination"         // a DERProgramList whose all= count lies (999 across pages, one served, no next page)
 
 	// Pricing function set (§10.5) attacks.
 	MalformNegativePrice      = "negative_price"       // ConsumptionTariffInterval price set negative
@@ -46,6 +47,7 @@ var malformKinds = map[string]bool{
 	MalformBadDuration:        true,
 	MalformDupMRID:            true,
 	MalformMissingHref:        true,
+	MalformPagination:         true,
 	MalformNegativePrice:      true,
 	MalformHugePrice:          true,
 	MalformBadPriceMultiplier: true,
@@ -111,6 +113,16 @@ func (s *Server) malformedXML(resource interface{}) ([]byte, bool) {
 			if b, ok := marshalOrNil(pl); ok {
 				return stripFirstHref(b), true
 			}
+		}
+
+	case MalformPagination:
+		if pl, ok := resource.(*model.DERProgramList); ok {
+			c := *pl
+			// Claim 999 programs exist across pages while serving only those in
+			// DERProgram and advertising no real next page — bait for a pager that
+			// trusts all= and loops/over-allocates fetching pages that never come.
+			c.All = 999
+			return marshalOrNil(&c)
 		}
 
 	case MalformHugeActivePower:
