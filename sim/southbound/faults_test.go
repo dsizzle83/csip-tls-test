@@ -267,7 +267,7 @@ func TestFaultTransportRead(t *testing.T) {
 	in := []uint16{100, 200, 300}
 
 	// No fault: pass-through.
-	if out, err := fc.transportRead(in); err != nil || len(out) != 3 || out[0] != 100 {
+	if out, err := fc.transportRead(0, in); err != nil || len(out) != 3 || out[0] != 100 {
 		t.Fatalf("passthrough = %v, %v", out, err)
 	}
 
@@ -275,7 +275,7 @@ func TestFaultTransportRead(t *testing.T) {
 	if err := fc.apply([]byte(`{"kind":"nan_sentinel"}`), supported); err != nil {
 		t.Fatalf("arm nan_sentinel: %v", err)
 	}
-	out, _ := fc.transportRead(in)
+	out, _ := fc.transportRead(0, in)
 	for i, v := range out {
 		if v != 0x8000 {
 			t.Fatalf("nan_sentinel[%d] = %#x, want 0x8000", i, v)
@@ -285,22 +285,67 @@ func TestFaultTransportRead(t *testing.T) {
 
 	// exception_code: returns a Modbus error, restored on clear.
 	fc.apply([]byte(`{"kind":"exception_code"}`), supported)
-	if _, err := fc.transportRead(in); err == nil {
+	if _, err := fc.transportRead(0, in); err == nil {
 		t.Fatal("exception_code should return an error")
 	}
 	fc.apply([]byte(`{"kind":"exception_code","clear":true}`), supported)
-	if _, err := fc.transportRead(in); err != nil {
+	if _, err := fc.transportRead(0, in); err != nil {
 		t.Fatalf("after clear exception_code: %v", err)
 	}
 
 	// latency: the read is delayed by the configured amount.
 	fc.apply([]byte(`{"kind":"latency","latency_ms":40}`), supported)
 	start := time.Now()
-	fc.transportRead(in)
+	fc.transportRead(0, in)
 	if time.Since(start) < 35*time.Millisecond {
 		t.Error("latency fault did not delay the read")
 	}
 	fc.apply([]byte(`{"kind":"latency","clear":true}`), supported)
+}
+
+// TestFaultBadScale verifies bad_scale corrupts ONLY the configured scale-factor
+// register (by address, in range) by +1 power of ten, and passes everything else
+// through.
+func TestFaultBadScale(t *testing.T) {
+	supported := map[FaultKind]bool{FaultBadScale: true}
+	fc := &faultController{label: "solar"}
+
+	// Unconfigured → arming is rejected (a sim that doesn't wire a SF register).
+	if err := fc.apply([]byte(`{"kind":"bad_scale"}`), supported); err == nil {
+		t.Fatal("bad_scale without configureScale should error")
+	}
+
+	fc.configureScale(10) // W_SF lives at absolute address 10
+	if err := fc.apply([]byte(`{"kind":"bad_scale"}`), supported); err != nil {
+		t.Fatalf("arm bad_scale: %v", err)
+	}
+
+	// A read starting at 8 covers address 10 at offset 2; SF 0 → +1.
+	in := []uint16{1000, 1000, 0, 1000}
+	out, err := fc.transportRead(8, in)
+	if err != nil {
+		t.Fatalf("transportRead: %v", err)
+	}
+	if int16(out[2]) != 1 {
+		t.Errorf("SF register = %d, want 1 (corrupted +1)", int16(out[2]))
+	}
+	if out[0] != 1000 || out[1] != 1000 || out[3] != 1000 {
+		t.Errorf("non-SF registers altered: %v", out)
+	}
+
+	// A read that does NOT cover the SF register passes through untouched.
+	out2, _ := fc.transportRead(20, in)
+	for i := range in {
+		if out2[i] != in[i] {
+			t.Errorf("out-of-range read altered index %d: %d != %d", i, out2[i], in[i])
+		}
+	}
+
+	fc.apply([]byte(`{"kind":"bad_scale","clear":true}`), supported)
+	out3, _ := fc.transportRead(8, in)
+	if int16(out3[2]) != 0 {
+		t.Errorf("after clear, SF register = %d, want 0 (untouched)", int16(out3[2]))
+	}
 }
 
 // TestBatteryFaults_UnsupportedKind verifies a sim rejects a kind it does not

@@ -102,6 +102,14 @@ const (
 	// a missing reading — and surface it.
 	FaultModbusException FaultKind = "exception_code"
 
+	// FaultBadScale corrupts the SunSpec scale-factor (W_SF) register on the read
+	// path: the raw power register stays scaled for the TRUE SF, but the hub reads a
+	// SF one power-of-ten too high, so it computes ~10× the real output. The sim's
+	// /state ground truth (direct register read) is unaffected, so the hub-vs-truth
+	// divergence is observable. The hub must sanity-check a physically-impossible
+	// scaled reading rather than optimise against it (audit GS-1/MTR-1).
+	FaultBadScale FaultKind = "bad_scale"
+
 	// ── Directional battery faults — effect-time, act on the commanded power. ──
 
 	// FaultChargeDisabled makes the battery refuse to CHARGE: a commanded charge
@@ -149,11 +157,12 @@ type RegisterMap struct {
 	// freely call Get/Set.
 	OnWriteAttempt func(startAddr uint16, vals []uint16) (apply bool)
 
-	// OnRead, if non-nil, is consulted on the READ path with the values about to
-	// be returned. It may sleep (latency), rewrite the values (nan_sentinel), or
-	// return an error to make the Modbus layer send an exception. Used by
-	// transport-layer fault injection. Called without the map lock held.
-	OnRead func(vals []uint16) ([]uint16, error)
+	// OnRead, if non-nil, is consulted on the READ path with the start address and
+	// the values about to be returned. It may sleep (latency), rewrite the values
+	// (nan_sentinel, bad_scale targets a register by address), or return an error to
+	// make the Modbus layer send an exception. Used by transport-layer fault
+	// injection. Called without the map lock held.
+	OnRead func(startAddr uint16, vals []uint16) ([]uint16, error)
 }
 
 // Get returns the value of a holding register (0-based Modbus address).
@@ -220,7 +229,7 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 	// return an error to make the Modbus layer send an exception. Called without
 	// the lock held so latency does not block writers.
 	if onRead != nil {
-		return onRead(result)
+		return onRead(req.Addr, result)
 	}
 	return result, nil
 }

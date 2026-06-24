@@ -251,6 +251,7 @@ type evBattery struct {
 	actualA    float64 // actual current per CC/CV model (A)
 	sessionWh  float64 // cumulative energy this session (Wh)
 	minFloorA  float64 // min_current_floor fault: charger won't modulate below this while charging (0 = off)
+	reportMult float64 // wrong_units fault: multiply reported MeterValues current/power (0/1 = correct, 1000 = mA reported as A)
 }
 
 func newEVBattery(capacityWh, initialSOC, voltageV, maxCurrentA, simSpeed float64) *evBattery {
@@ -277,6 +278,23 @@ func (b *evBattery) SetCommandedA(a float64) {
 func (b *evBattery) SetMinFloorA(floorA float64) {
 	b.mu.Lock()
 	b.minFloorA = floorA
+	b.mu.Unlock()
+}
+
+// ReportCurrentMult returns the wrong_units multiplier applied to reported
+// MeterValues current/power (1 when unarmed). SetReportCurrentMult arms it.
+func (b *evBattery) ReportCurrentMult() float64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.reportMult <= 0 {
+		return 1
+	}
+	return b.reportMult
+}
+
+func (b *evBattery) SetReportCurrentMult(m float64) {
+	b.mu.Lock()
+	b.reportMult = m
 	b.mu.Unlock()
 }
 
@@ -553,13 +571,18 @@ func runChargingLoop(ctx context.Context, cs ocpp2.ChargingStation, h *csHandler
 // Energy.Active.Import.Register, SoC, Voltage.
 func buildMeterValue(batt *evBattery, soc, currentA, energyWh float64) types.MeterValue {
 	now := types.NewDateTime(time.Now())
-	powerW := currentA * batt.VoltageV
+	// wrong_units fault: report current (and the power derived from it) scaled by
+	// reportMult — e.g. milliamps reported under an "A" label, so a hub that trusts
+	// the value+unit reads ~1000× the real current. The unit label is unchanged;
+	// only the magnitude lies, which is exactly the wrong-units hazard.
+	reportedA := currentA * batt.ReportCurrentMult()
+	powerW := reportedA * batt.VoltageV
 	return types.MeterValue{
 		Timestamp: *now,
 		SampledValue: []types.SampledValue{
 			{
 				Measurand:     types.MeasurandCurrentImport,
-				Value:         currentA,
+				Value:         reportedA,
 				UnitOfMeasure: &types.UnitOfMeasure{Unit: "A"},
 			},
 			{
@@ -772,6 +795,7 @@ type evFaults struct {
 	rejectProfile bool // profile_reject: SetChargingProfile returns Rejected, limit not applied
 	applyNextTx   bool // apply_next_tx: ACCEPT the profile but don't apply it to the live session
 	stopMeter     bool // stop_metervalues: keep charging, stop sending MeterValues / Updated
+	applyDelayedS int  // apply_delayed: ACCEPT the profile but apply the new limit only after this many seconds
 }
 
 func (f *evFaults) get() (reject, applyNext, stopMeter bool) {
@@ -780,15 +804,24 @@ func (f *evFaults) get() (reject, applyNext, stopMeter bool) {
 	return f.rejectProfile, f.applyNextTx, f.stopMeter
 }
 
+func (f *evFaults) applyDelay() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.applyDelayedS
+}
+
 type evFaultSpec struct {
-	Kind  string  `json:"kind"`
-	AmpsA float64 `json:"amps_a,omitempty"` // min_current_floor: the floor in amps (default 6)
-	Clear bool    `json:"clear,omitempty"`
+	Kind   string  `json:"kind"`
+	AmpsA  float64 `json:"amps_a,omitempty"`  // min_current_floor: the floor in amps (default 6)
+	DelayS int     `json:"delay_s,omitempty"` // apply_delayed: seconds before the accepted limit takes effect (default 25)
+	Mult   float64 `json:"mult,omitempty"`    // wrong_units: reported-current multiplier (default 1000)
+	Clear  bool    `json:"clear,omitempty"`
 }
 
 // ApplyFault arms or clears an OCPP-layer fault injector, wired to simapi
 // POST /fault. Supported kinds: profile_reject, apply_next_tx,
-// min_current_floor (amps_a, default 6 A), stop_metervalues. Each ACKs the OCPP
+// min_current_floor (amps_a, default 6 A), stop_metervalues, apply_delayed
+// (delay_s, default 25), wrong_units (mult, default 1000). Each ACKs the OCPP
 // message at the protocol level while the charger misbehaves — the hub must not
 // assume success.
 func (h *csHandler) ApplyFault(body []byte) error {
@@ -812,6 +845,29 @@ func (h *csHandler) ApplyFault(body []byte) error {
 		h.faults.stopMeter = !spec.Clear
 		h.faults.mu.Unlock()
 		log.Printf("[fault] stop_metervalues: armed=%v", !spec.Clear)
+	case "apply_delayed":
+		d := 0
+		if !spec.Clear {
+			d = spec.DelayS
+			if d <= 0 {
+				d = 25
+			}
+		}
+		h.faults.mu.Lock()
+		h.faults.applyDelayedS = d
+		h.faults.mu.Unlock()
+		log.Printf("[fault] apply_delayed: delay_s=%d", d)
+	case "wrong_units":
+		if spec.Clear {
+			h.batt.SetReportCurrentMult(1)
+		} else {
+			m := spec.Mult
+			if m <= 0 {
+				m = 1000
+			}
+			h.batt.SetReportCurrentMult(m)
+		}
+		log.Printf("[fault] wrong_units: armed=%v", !spec.Clear)
 	case "min_current_floor":
 		floor := spec.AmpsA
 		if spec.Clear {
@@ -1109,11 +1165,23 @@ func (h *csHandler) OnSetChargingProfile(req *smartcharging.SetChargingProfileRe
 		log.Printf("evsim: SetChargingProfile evse=%d profile=%d REJECTED (fault profile_reject)", req.EvseID, p.ID)
 		return &smartcharging.SetChargingProfileResponse{Status: smartcharging.ChargingProfileStatusRejected}, nil
 	}
+	delayS := h.faults.applyDelay()
 	if applyNext {
 		// apply_next_tx fault: ACCEPT the profile but do not apply it to the live
 		// session — accept-but-ignore. The CSMS sees success while the EV keeps its
 		// prior draw; only the meter reveals the rate never changed.
 		log.Printf("evsim: SetChargingProfile evse=%d profile=%d ACCEPTED but not applied to live session (fault apply_next_tx)", req.EvseID, p.ID)
+	} else if delayS > 0 {
+		// apply_delayed fault: ACCEPT now but apply the new limit only after delayS —
+		// delayed-obey. The CSMS sees success immediately while the EV keeps its prior
+		// draw for the delay window; the hub must verify the rate against measurement.
+		limitA := info.LimitA
+		go func() {
+			time.Sleep(time.Duration(delayS) * time.Second)
+			h.batt.SetCommandedA(limitA)
+			log.Printf("evsim: apply_delayed: profile limit %.1fA now in effect (after %ds)", limitA, delayS)
+		}()
+		log.Printf("evsim: SetChargingProfile evse=%d profile=%d ACCEPTED, apply deferred %ds (fault apply_delayed)", req.EvseID, p.ID, delayS)
 	} else {
 		// Feed limit into the battery model so the CC/CV curve uses the new limit.
 		h.batt.SetCommandedA(info.LimitA)

@@ -58,6 +58,7 @@ var solarFaultKinds = map[FaultKind]bool{
 	FaultNanSentinel:     true,
 	FaultLatency:         true,
 	FaultModbusException: true,
+	FaultBadScale:        true,
 }
 
 // NewSolarServer creates and starts an animated PV inverter simulator.
@@ -71,6 +72,7 @@ func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
 	ss := &SolarServer{bases: bases, wmaxW: wmaxW}
 	ss.faults.label = "solar"
 	ss.faults.configureGate(bases.M123Base + sunspec.M123_WMaxLimPct_Ena)
+	ss.faults.configureScale(bases.M103Base + sunspec.M103_W_SF)
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
 		animateSolar(s, r, wmaxW, bases, &ss.faults, stop)

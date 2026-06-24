@@ -81,15 +81,25 @@ type faultController struct {
 	nanSentinel     bool // every read returns 0x8000 (SunSpec N/A)
 	latencyMs       int  // per-read delay
 	modbusException bool // every read returns a Modbus exception
+
+	// bad_scale (transport, solar): when a read covers scaleAddr (the W_SF
+	// register), its value is rewritten one power-of-ten too high so the hub
+	// computes ~10× the real output. scaleAddr/hasScale are configured once at
+	// wiring time (configureScale); a sim that does not advertise FaultBadScale
+	// leaves hasScale false and never arms it.
+	badScale  bool
+	scaleAddr uint16
+	hasScale  bool
 }
 
 // transportRead is the RegisterMap.OnRead hook. It applies the armed transport
 // faults to a read about to be returned: latency sleeps, exception_code returns
 // a Modbus error, nan_sentinel rewrites every value to the SunSpec 0x8000 N/A
 // sentinel. With none armed it returns the values unchanged.
-func (fc *faultController) transportRead(vals []uint16) ([]uint16, error) {
+func (fc *faultController) transportRead(start uint16, vals []uint16) ([]uint16, error) {
 	fc.mu.Lock()
 	lat, nan, exc := fc.latencyMs, fc.nanSentinel, fc.modbusException
+	bad, scaleAddr, hasScale := fc.badScale, fc.scaleAddr, fc.hasScale
 	fc.mu.Unlock()
 
 	if lat > 0 {
@@ -105,7 +115,23 @@ func (fc *faultController) transportRead(vals []uint16) ([]uint16, error) {
 		}
 		return out, nil
 	}
+	if bad && hasScale && scaleAddr >= start && int(scaleAddr-start) < len(vals) {
+		// Corrupt only the SF register in this read: +1 power of ten ⇒ the hub
+		// scales the (true) raw power up by ~10×. Other registers pass through.
+		out := append([]uint16(nil), vals...)
+		i := int(scaleAddr - start)
+		out[i] = uint16(int16(out[i]) + 1)
+		return out, nil
+	}
 	return vals, nil
+}
+
+// configureScale wires the SunSpec scale-factor register the FaultBadScale fault
+// corrupts on read. Called once by a sim that advertises the kind (solar's W_SF).
+func (fc *faultController) configureScale(scaleAddr uint16) {
+	fc.mu.Lock()
+	fc.scaleAddr, fc.hasScale = scaleAddr, true
+	fc.mu.Unlock()
 }
 
 // shapeBatteryW applies effect-time battery faults to the hub-commanded power
@@ -353,6 +379,13 @@ func (fc *faultController) apply(body []byte, supported map[FaultKind]bool) erro
 			fc.latencyMs = ms
 		}
 		log.Printf("[fault] latency: %s latency_ms=%d", fc.label, fc.latencyMs)
+
+	case FaultBadScale:
+		if !fc.hasScale {
+			return fmt.Errorf("fault %q: %s has no scale register configured", spec.Kind, fc.label)
+		}
+		fc.badScale = !spec.Clear
+		log.Printf("[fault] bad_scale: %s armed=%v", fc.label, fc.badScale)
 	}
 	return nil
 }

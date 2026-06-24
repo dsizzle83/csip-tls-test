@@ -1149,11 +1149,11 @@ func diagnoseTransport(sc *mayScenario, cons *activeConstraint, s []maySample) m
 		f.Verdict = "FAIL"
 		f.Headline = fmt.Sprintf("hub acted on a garbage Modbus reading (solar %.0f W)", worst)
 		f.Diagnosis = []string{
-			fmt.Sprintf("The hub reported a physically-impossible solar value (%.0f W) on %d of %d samples — it interpreted the SunSpec 0x8000 N/A sentinel (or an exception/garbage) as a real reading.", worst, garbage, len(s)),
-			"A hub that acts on the not-implemented sentinel will optimise against fabricated data; 0x8000 must be treated as N/A and the source marked unavailable.",
+			fmt.Sprintf("The hub reported a physically-impossible solar value (%.0f W) on %d of %d samples — it interpreted a transport-layer fault (the 0x8000 N/A sentinel, a Modbus exception, or a corrupted scale factor) as a real reading.", worst, garbage, len(s)),
+			"A hub that acts on garbage transport data optimises against fabricated generation; the sentinel/bad scale must be recognised and the source marked suspect rather than trusted.",
 			decisionLine(s),
 		}
-		f.Fix = "In the SunSpec decode, treat 0x8000 (int16) / 0xFFFF (uint16) as not-implemented → N/A; on a Modbus exception mark the device down (lexa-modbus / sunspec)."
+		f.Fix = "Treat 0x8000/0xFFFF as N/A and a Modbus exception as device-down; sanity-check decoded SunSpec power against the inverter nameplate so a corrupted scale factor cannot pass (lexa-modbus / sunspec)."
 		return f
 	}
 
@@ -1539,6 +1539,91 @@ func diagnoseEVFlap(sc *mayScenario, cons *activeConstraint, s []maySample) mayF
 		"A flaky connector did not thrash the control loop.",
 	}
 	return f
+}
+
+// diagnoseEVUnits judges the wrong_units fault: the charger reports its current
+// ~1000× too high (milliamps under an "A" label). The hub must sanity-check the
+// reading against the station max and reject a physically-impossible current — if
+// it surfaces a current many times the station max (or a wild power), it ingested
+// the mislabeled value and is optimising against fabricated draw.
+func diagnoseEVUnits(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+
+	reach := 0
+	for _, smp := range s {
+		if smp.HubReachable {
+			reach++
+		}
+	}
+	if reach < len(s)/2 {
+		f.Verdict = "FAIL"
+		f.Headline = "hub stopped responding under the wrong-units reading"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub's /status was unreachable on %d of %d samples — a wrong-units MeterValue should never take it down.", len(s)-reach, len(s)),
+		}
+		f.Fix = sc.Fix
+		return f
+	}
+
+	bad := 0
+	var worstA, worstW float64
+	for _, smp := range s {
+		if !smp.HubReachable {
+			continue
+		}
+		impl := false
+		if smp.EvMaxA > 0 && smp.EvCurrentA > smp.EvMaxA*5 { // many times any plausible station max
+			impl = true
+			if smp.EvCurrentA > worstA {
+				worstA = smp.EvCurrentA
+			}
+		}
+		if smp.EvW > 25000 {
+			impl = true
+			if smp.EvW > worstW {
+				worstW = smp.EvW
+			}
+		}
+		if impl {
+			bad++
+		}
+	}
+	if bad > len(s)/4 {
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("hub ingested the wrong-units reading (%.0f A / %.0f W)", worstA, worstW)
+		f.Diagnosis = []string{
+			fmt.Sprintf("On %d of %d samples the hub surfaced a physically-impossible EVSE current/power — it trusted the mislabeled MeterValue (≈1000× the real draw) instead of sanity-checking it against the station max.", bad, len(s)),
+			"A hub that optimises against a fabricated current will mis-plan the whole site; MeterValues must be validated against the EVSE rating before use.",
+			decisionLine(s),
+		}
+		f.Fix = sc.Fix
+		return f
+	}
+
+	f.Verdict = "PASS"
+	f.Headline = "hub rejected the wrong-units reading"
+	f.Diagnosis = []string{
+		"The hub stayed up and never surfaced a physically-impossible EVSE current/power under the wrong-units fault — it validated the MeterValue against the station rating rather than trusting a 1000× draw.",
+		fmt.Sprintf("Worst EVSE reading the hub reported: %.0f A.", maxEvCurrent(s)),
+	}
+	return f
+}
+
+// maxEvCurrent returns the largest EV current the hub reported across the window.
+func maxEvCurrent(s []maySample) float64 {
+	var m float64
+	for _, smp := range s {
+		if smp.EvCurrentA > m {
+			m = smp.EvCurrentA
+		}
+	}
+	return m
 }
 
 // ── Diagnosis helpers ──────────────────────────────────────────────────────────
@@ -1959,7 +2044,7 @@ func (d *mayhemDriver) clearAllFaults() {
 	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "charge_disabled", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "discharge_disabled", "clear": true})
-	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues"} {
+	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues", "apply_delayed", "wrong_units"} {
 		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
 	}
 	for _, dev := range []string{"solar", "battery"} {
@@ -1967,6 +2052,7 @@ func (d *mayhemDriver) clearAllFaults() {
 			_ = d.post(dev, "/fault", map[string]any{"kind": k, "clear": true})
 		}
 	}
+	_ = d.post("solar", "/fault", map[string]any{"kind": "bad_scale", "clear": true})
 	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
 }
 
@@ -2553,6 +2639,26 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			teardown: func(d *mayhemDriver) { _ = d.post("solar", "/fault", map[string]any{"kind": "latency", "clear": true}) },
 		},
 		{
+			ID: "solar-bad-scale", Name: "Inverter serves a corrupted power scale factor",
+			Category:   "Modbus transport (INV-TRANSPORT)",
+			Hypothesis: "The inverter's W_SF (SunSpec power scale factor) register reads one power of ten too high while the raw power register is unchanged, so a hub that applies the scale factor computes ~10× the real output (e.g. 48 kW for a 4.8 kW inverter). A hub that trusts it optimises against fabricated generation.",
+			Expected:   "Recognise a physically-impossible scaled reading (well over nameplate) and reject/clamp it; never act on a 10× generation value.",
+			HoldS:      35,
+			Fix:        "Sanity-check decoded SunSpec power against the inverter nameplate; treat an out-of-range scaled value as suspect (lexa-modbus / sunspec — audit GS-1/MTR-1).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				d.injectEnv(d.pvHighW, loadLow)
+				if err := d.post("solar", "/fault", map[string]any{"kind": "bad_scale"}); err != nil {
+					return nil, fmt.Errorf("arm bad_scale: %w", err)
+				}
+				return &activeConstraint{Typ: "none"}, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+			evaluate: diagnoseTransport,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("solar", "/fault", map[string]any{"kind": "bad_scale", "clear": true})
+			},
+		},
+		{
 			ID: "solar-reboot-forget", Name: "Inverter reboots mid-curtailment and forgets the limit",
 			Category:   "Grid compliance (INV-EXPORT)",
 			Hypothesis: "The hub has curtailed the inverter to hold a zero-export cap, then the inverter reboots and comes back at 100% WMaxLimPct — it forgot the limit and snaps to full output, blowing the cap. A hub that writes the limit once (on adoption) and never re-asserts it leaves the breach standing.",
@@ -2642,6 +2748,59 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			evaluate: diagnoseEVFlap,
 			teardown: func(d *mayhemDriver) {
 				_ = d.post("ev", "/inject", map[string]any{"connector_id": 1, "status": "Available"})
+				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
+			},
+		},
+		{
+			ID: "ev-delayed-obey", Name: "Charger ACKs the current-limit profile but obeys it late",
+			Category:   "OCPP smart charging (INV-CONVERGE)",
+			Hypothesis: "Under an import cap with an empty battery, the hub sends a SetChargingProfile and the charger returns Accepted — but applies the new limit only ~20 s later. The OCPP response says success immediately, so a hub that trusts the ACK believes the EV dialled down while it keeps drawing full for the lag window, importing over the cap.",
+			Expected:   "Verify the EV actually curtailed against the measured draw, not the ACK; tolerate the lag and converge once the limit lands (or admit it). The breach must resolve, not stand.",
+			HoldS:      80,
+			Fix:        "Confirm the commanded EV current against measured draw/MeterValues over a convergence deadline rather than trusting the SetChargingProfile ACK (lexa-ocpp / orchestrator verify). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 12, "Conn": 1}) // just above the 10% reserve floor: a near-empty non-lever, but no INV-SOC noise
+				_ = d.post("ev", "/inject", map[string]any{"action": "set_soc", "soc_pct": 30})
+				_ = d.post("ev", "/inject", map[string]any{"action": "start_session", "connector_id": 1})
+				d.injectEnv(300, 500)
+				if err := d.post("ev", "/fault", map[string]any{"kind": "apply_delayed", "delay_s": 20}); err != nil {
+					return nil, fmt.Errorf("arm apply_delayed: %w", err)
+				}
+				// Satisfiable cap with the EV as the swing lever, set ABOVE the EV's 6 A
+				// minimum draw (~1.6 kW net) so the hub can actually meet it by dialing
+				// the EV down — full EV draw breaches it, and curtailing the EV (once the
+				// 20 s-late profile lands) brings import back under, so the breach RESOLVES
+				// rather than being a forced CannotComply. Isolates "tolerate the lag and
+				// converge" from the min-current floor.
+				return d.postCap("importCap", 2000, 80, "mayhem: 2000 W import cap, charger obeys the profile 20 s late")
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(300, 500) },
+			evaluate: diagnoseConstraint,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("ev", "/fault", map[string]any{"kind": "apply_delayed", "clear": true})
+				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
+			},
+		},
+		{
+			ID: "ev-wrong-units", Name: "Charger reports MeterValues current in the wrong units",
+			Category:   "OCPP observability (INV-EVMAX)",
+			Hypothesis: "The charger reports its current in milliamps under an 'A' label (≈1000× the real value), so a hub that trusts the value+unit reads thousands of amps. A hub that ingests it commands against a fabricated draw, alarms falsely, or computes a wild power — far over any station max.",
+			Expected:   "Sanity-check MeterValues against the station/connector max and reject a physically-impossible current; never surface or optimise against a 1000× reading.",
+			HoldS:      40,
+			Fix:        "Validate MeterValues against the EVSE's rated max (and unit) before use; clamp/reject implausible readings (lexa-ocpp telemetry).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("ev", "/inject", map[string]any{"action": "set_soc", "soc_pct": 40})
+				_ = d.post("ev", "/inject", map[string]any{"action": "start_session", "connector_id": 1})
+				d.injectEnv(300, 1500)
+				if err := d.post("ev", "/fault", map[string]any{"kind": "wrong_units", "mult": 1000}); err != nil {
+					return nil, fmt.Errorf("arm wrong_units: %w", err)
+				}
+				return &activeConstraint{Typ: "none"}, nil
+			},
+			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(300, 1500) },
+			evaluate: diagnoseEVUnits,
+			teardown: func(d *mayhemDriver) {
+				_ = d.post("ev", "/fault", map[string]any{"kind": "wrong_units", "clear": true})
 				_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
 			},
 		},

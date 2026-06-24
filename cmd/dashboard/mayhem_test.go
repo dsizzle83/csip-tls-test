@@ -385,6 +385,25 @@ func TestDiagnoseBatteryGarbage_IngestedFails(t *testing.T) {
 	assertDiag(t, f, "impossible battery")
 }
 
+func TestDiagnoseEVUnits_RejectedPasses(t *testing.T) {
+	// Hub reports a plausible current well under the station max → validated.
+	s := mkSamples(30, func(i int, s *maySample) { s.EvCurrentA = 13; s.EvMaxA = 32; s.EvW = 3000 })
+	f := diagnoseEVUnits(scFor("units-pass"), noneCons(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS (%s)", f.Verdict, f.Headline)
+	}
+}
+
+func TestDiagnoseEVUnits_IngestedFails(t *testing.T) {
+	// Hub surfaces a mislabeled ~1000× current (mA reported as A).
+	s := mkSamples(30, func(i int, s *maySample) { s.EvCurrentA = 13000; s.EvMaxA = 32; s.EvW = 3_000_000 })
+	f := diagnoseEVUnits(scFor("units-fail"), noneCons(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL", f.Verdict)
+	}
+	assertDiag(t, f, "physically-impossible")
+}
+
 func TestDiagnoseEVFlap_StablePasses(t *testing.T) {
 	s := mkSamples(30, func(i int, s *maySample) { s.EvW = 3000; s.EvCurrentA = 13; s.EvMaxA = 32 })
 	f := diagnoseEVFlap(scFor("flap-pass"), noneCons(), s)
