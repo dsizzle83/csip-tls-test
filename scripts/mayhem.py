@@ -30,47 +30,6 @@ import time
 import urllib.error
 import urllib.request
 
-# Mirror of mayhemDriver.scenarios() — for --list and --only validation only.
-SCENARIOS = [
-    ("export-cap-full-battery", "Zero-export cap, full sun, battery full"),
-    ("ack-before-effect", "Inverter ACKs curtailment but lags 45 s"),
-    ("reject-write-curtail", "Inverter ACKs the curtailment but ignores it"),
-    ("enable-gate-curtail", "Inverter echoes the limit but never enables it"),
-    ("ramp-limit-curtail", "Inverter honours the limit but ramps to it slowly"),
-    ("battery-wrong-sign", "Battery executes a commanded charge as a discharge"),
-    ("battery-soc-refuse", "Battery accepts the discharge command but does nothing"),
-    ("battery-charge-disabled", "Battery refuses to charge away excess solar"),
-    ("battery-reboot", "Battery drops off the bus mid-control, then reboots"),
-    ("ev-profile-reject", "Charger rejects the hub's current-limit profile"),
-    ("ev-accept-but-ignore", "Charger ACKs the current-limit profile but ignores it"),
-    ("ev-min-current-floor", "Charger cannot throttle below its 6 A minimum"),
-    ("ev-meter-freeze", "Charger keeps charging but stops reporting MeterValues"),
-    ("grid-disconnect", "Cease-to-energize: grid commands a disconnect"),
-    ("conflicting-primacy", "Higher-primacy control must win"),
-    ("malformed-csip", "Grid server serves a malformed resource"),
-    ("malform-missing-href", "Grid server strips the program list's href"),
-    ("malform-empty-program", "Grid server serves an empty program list"),
-    ("malform-huge-activepower", "Grid server serves an absurd ActivePower limit"),
-    ("malform-bad-duration", "Grid server serves a ~136-year control interval"),
-    ("malform-pagination", "Grid server lies about list pagination"),
-    ("pricing-attack", "Grid server serves malicious pricing"),
-    ("curve-attack", "Grid server serves an empty DER curve list"),
-    ("nan-sentinel", "Inverter returns the SunSpec N/A sentinel (0x8000)"),
-    ("modbus-exception", "Inverter returns a Modbus exception on every read"),
-    ("modbus-latency", "Inverter responds slowly (800 ms/read)"),
-    ("solar-bad-scale", "Inverter serves a corrupted power scale factor"),
-    ("solar-reboot-forget", "Inverter reboots mid-curtailment and forgets the limit"),
-    ("expired-control", "Hub keeps enforcing a DERControl past its expiry"),
-    ("battery-nan-sentinel", "Battery registers read the SunSpec N/A sentinel (0x8000)"),
-    ("ev-connector-flap", "EVSE connector flaps Occupied/Faulted mid-session"),
-    ("ev-delayed-obey", "Charger ACKs the current-limit profile but obeys it late"),
-    ("ev-wrong-units", "Charger reports MeterValues current in the wrong units"),
-    ("stale-meter", "Grid meter freezes while the world changes"),
-    ("battery-empty-import-cap", "Import cap at peak with an empty battery"),
-    ("curtailment-release", "Generation-limit event ends — solar must recover"),
-    ("clock-jitter", "CSIP clock corrections jitter while a cap is active"),
-    ("perfect-storm", "Perfect storm — everything at once"),
-]
 
 # ANSI colors per verdict (suppressed when stdout is not a TTY).
 COLORS = {
@@ -101,10 +60,33 @@ def api(base, path, method="GET", body=None, timeout=10):
         return json.loads(raw) if raw else {}
 
 
-def cmd_list():
+def fetch_scenarios(base):
+    """Return [(id, name), ...] from the dashboard's /api/qa/scenarios.
+
+    The catalogue lives in Go (mayhemDriver.scenarios()); querying it keeps this
+    script from drifting out of sync with a mirrored copy. Returns None if the
+    endpoint is unreachable or unrecognised (e.g. an older dashboard).
+    """
+    try:
+        data = api(base, "/api/qa/scenarios")
+    except (urllib.error.URLError, ValueError):
+        return None
+    scs = data.get("scenarios")
+    if not isinstance(scs, list):
+        return None
+    return [(s.get("id", ""), s.get("name", "")) for s in scs]
+
+
+def cmd_list(base):
+    scs = fetch_scenarios(base)
+    if scs is None:
+        print(f"could not fetch scenarios from {base} — is the dashboard running?",
+              file=sys.stderr)
+        return 2
     print("Mayhem scenarios:")
-    for sid, name in SCENARIOS:
+    for sid, name in scs:
         print(f"  {sid:28s} {name}")
+    return 0
 
 
 def cmd_abort(base):
@@ -255,20 +237,21 @@ def main():
     args = ap.parse_args()
 
     if args.list:
-        cmd_list()
-        return 0
+        return cmd_list(args.dashboard)
     if args.abort:
         return cmd_abort(args.dashboard)
 
     only = [s.strip() for s in args.only.split(",") if s.strip()]
     # Matrix/chaos scenario IDs are generated server-side, so skip the
     # curated-suite validation in those modes and let the server filter.
-    if not args.matrix and not args.chaos:
-        valid = {sid for sid, _ in SCENARIOS}
-        bad = [s for s in only if s not in valid]
-        if bad:
-            print(f"unknown scenario id(s): {', '.join(bad)} (see --list)", file=sys.stderr)
-            return 2
+    if only and not args.matrix and not args.chaos:
+        scs = fetch_scenarios(args.dashboard)
+        if scs is not None:  # validate when we can reach the catalogue; else defer to the server
+            valid = {sid for sid, _ in scs}
+            bad = [s for s in only if s not in valid]
+            if bad:
+                print(f"unknown scenario id(s): {', '.join(bad)} (see --list)", file=sys.stderr)
+                return 2
 
     return run(args.dashboard, only, args.sample_ms, args.json,
                args.matrix, args.chaos, args.seed, args.iterations)

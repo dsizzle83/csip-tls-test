@@ -56,10 +56,12 @@ func TestInvConverge_AdmissionClearsViolation(t *testing.T) {
 // invSOC flags discharging at/below the reserve floor and charging at/above the
 // ceiling, and passes a healthy mid-SoC timeline.
 func TestInvSOC_FlagsWrongWayAtBounds(t *testing.T) {
+	// INV-SOC judges SIMULATOR ground truth, not the hub's view.
 	// Discharging while empty (the wrong_sign danger): violation.
 	empty := mkSamples(10, func(i int, s *maySample) {
-		s.BatSOC = 8 // below the 10% reserve floor
-		s.BatteryW = 1500
+		s.BatterySimOK = true
+		s.BatSimSOC = 8 // below the 10% reserve floor
+		s.BatterySimW = 1500
 	})
 	if v := invSOC(empty); len(v) == 0 {
 		t.Fatal("discharging below the reserve floor should violate INV-SOC")
@@ -69,8 +71,9 @@ func TestInvSOC_FlagsWrongWayAtBounds(t *testing.T) {
 
 	// Charging while full: violation.
 	full := mkSamples(10, func(i int, s *maySample) {
-		s.BatSOC = 97 // above the 95% ceiling
-		s.BatteryW = -1500
+		s.BatterySimOK = true
+		s.BatSimSOC = 97 // above the 95% ceiling
+		s.BatterySimW = -1500
 	})
 	if v := invSOC(full); len(v) == 0 {
 		t.Fatal("charging above the ceiling should violate INV-SOC")
@@ -78,8 +81,9 @@ func TestInvSOC_FlagsWrongWayAtBounds(t *testing.T) {
 
 	// Healthy mid-SoC discharge: no violation.
 	healthy := mkSamples(10, func(i int, s *maySample) {
-		s.BatSOC = 55
-		s.BatteryW = 1500
+		s.BatterySimOK = true
+		s.BatSimSOC = 55
+		s.BatterySimW = 1500
 	})
 	if v := invSOC(healthy); len(v) != 0 {
 		t.Fatalf("mid-SoC discharge should not violate INV-SOC, got %d", len(v))
@@ -87,11 +91,22 @@ func TestInvSOC_FlagsWrongWayAtBounds(t *testing.T) {
 
 	// Idle near the floor (|W| below the active threshold): no violation.
 	idle := mkSamples(10, func(i int, s *maySample) {
-		s.BatSOC = 8
-		s.BatteryW = 10 // below invSocActiveW
+		s.BatterySimOK = true
+		s.BatSimSOC = 8
+		s.BatterySimW = 10 // below invSocActiveW
 	})
 	if v := invSOC(idle); len(v) != 0 {
 		t.Fatalf("idle battery at the floor should not violate INV-SOC, got %d", len(v))
+	}
+
+	// No coherent sim reading: skipped (cannot judge ground truth).
+	noSim := mkSamples(10, func(i int, s *maySample) {
+		s.BatterySimOK = false
+		s.BatSimSOC = 8
+		s.BatterySimW = 1500
+	})
+	if v := invSOC(noSim); len(v) != 0 {
+		t.Fatalf("samples without sim truth should be skipped, got %d", len(v))
 	}
 }
 
@@ -249,16 +264,18 @@ func TestDiagnoseSOC_Verdicts(t *testing.T) {
 	cons := &activeConstraint{Typ: "exportCap", LimW: 0, MRID: "M-bat"}
 
 	bad := mkSamples(20, func(i int, s *maySample) {
-		s.BatSOC = 7
-		s.BatteryW = 1800 // discharging while empty
+		s.BatterySimOK = true
+		s.BatSimSOC = 7
+		s.BatterySimW = 1800 // discharging while empty (simulator ground truth)
 	})
 	if f := diagnoseSOC(scFor("battery-wrong-sign"), cons, bad); f.Verdict != "FAIL" {
 		t.Fatalf("wrong-way discharge verdict = %q, want FAIL", f.Verdict)
 	}
 
 	good := mkSamples(20, func(i int, s *maySample) {
-		s.BatSOC = 60
-		s.BatteryW = -1200 // charging, healthy mid SoC
+		s.BatterySimOK = true
+		s.BatSimSOC = 60
+		s.BatterySimW = -1200 // charging, healthy mid SoC
 	})
 	if f := diagnoseSOC(scFor("battery-wrong-sign"), cons, good); f.Verdict != "PASS" {
 		t.Fatalf("healthy charge verdict = %q, want PASS", f.Verdict)

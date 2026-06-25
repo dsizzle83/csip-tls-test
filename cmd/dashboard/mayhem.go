@@ -64,15 +64,18 @@ type maySample struct {
 	SolarOK        bool    `json:"solar_ok"`
 	HubSolarW      float64 `json:"hub_solar_W"` // the hub's Modbus-derived solar reading — for INV-TRANSPORT
 
-	BatteryW   float64 `json:"battery_W"`
-	BatSOC     float64 `json:"bat_soc"`
-	EvW        float64 `json:"ev_W"`
-	EvSOC      float64 `json:"ev_soc"`
-	EvCurrentA float64 `json:"ev_current_A"`     // EVSE draw (A) — for INV-EVMAX
-	EvMaxA     float64 `json:"ev_max_current_A"` // EVSE configured max (A)
-	EvSimW     float64 `json:"ev_sim_W"`         // charger's TRUE draw from the ev sim /state (ground truth) — for INV-EVBLIND
-	EvSimA     float64 `json:"ev_sim_A"`         // charger's TRUE current (A), ground truth
-	EvSimOK    bool    `json:"ev_sim_ok"`        // the ev sim reported a coherent charging state this tick
+	BatteryW     float64 `json:"battery_W"` // the hub's view (Modbus-derived) — display/observability
+	BatSOC       float64 `json:"bat_soc"`
+	BatterySimW  float64 `json:"battery_sim_W"`   // pack's TRUE net power from the batsim /state (ground truth) — for INV-SOC
+	BatSimSOC    float64 `json:"battery_sim_soc"` // pack's TRUE SoC from the batsim /state (ground truth)
+	BatterySimOK bool    `json:"battery_sim_ok"`  // the batsim reported a coherent state this tick
+	EvW          float64 `json:"ev_W"`
+	EvSOC        float64 `json:"ev_soc"`
+	EvCurrentA   float64 `json:"ev_current_A"`     // EVSE draw (A) — for INV-EVMAX
+	EvMaxA       float64 `json:"ev_max_current_A"` // EVSE configured max (A)
+	EvSimW       float64 `json:"ev_sim_W"`         // charger's TRUE draw from the ev sim /state (ground truth) — for INV-EVBLIND
+	EvSimA       float64 `json:"ev_sim_A"`         // charger's TRUE current (A), ground truth
+	EvSimOK      bool    `json:"ev_sim_ok"`        // the ev sim reported a coherent charging state this tick
 
 	HubReachable     bool    `json:"hub_reachable"`
 	HubAdopted       bool    `json:"hub_adopted"`       // hub is applying a CSIP control this tick
@@ -279,6 +282,29 @@ func (d *mayhemDriver) handleStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(st)
 }
 
+// handleScenarios serves the curated scenario catalogue (id, name, category,
+// hypothesis, expected) so external runners — scripts/mayhem.py --list / --only
+// validation — query it instead of mirroring the Go list and drifting.
+func (d *mayhemDriver) handleScenarios(w http.ResponseWriter, r *http.Request) {
+	type scenarioInfo struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		Category   string `json:"category"`
+		Hypothesis string `json:"hypothesis"`
+		Expected   string `json:"expected"`
+	}
+	scs := d.scenarios()
+	out := make([]scenarioInfo, 0, len(scs))
+	for _, sc := range scs {
+		out = append(out, scenarioInfo{
+			ID: sc.ID, Name: sc.Name, Category: sc.Category,
+			Hypothesis: sc.Hypothesis, Expected: sc.Expected,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"scenarios": out})
+}
+
 func (d *mayhemDriver) handleAbort(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -357,18 +383,15 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		f := ev(sc, cons, samples)
 		f.Fix = sc.Fix
 		// Assertion engine: cross-cutting safety audit, independent of this
-		// scenario's own oracle. Surfaced on every finding; a back-feed during a
-		// disconnect (INV-CONNECT) is a hard safety miss and escalates the verdict.
+		// scenario's own oracle. Surfaced on every finding; a safety violation the
+		// scenario's own oracle would miss (back-feed during a disconnect, a pack
+		// past its reserve, an impossible EV draw, a stale control retained)
+		// escalates the verdict per escalateForAudit so a PASS can never hide one.
 		if audit := safetyAudit(samples); len(audit) > 0 {
 			f.Diagnosis = append(f.Diagnosis, "⚠ "+invSummaryLine("SAFETY AUDIT", audit))
-			if f.Verdict == "PASS" || f.Verdict == "DEGRADED" {
-				for _, x := range audit {
-					if x.Inv == "INV-CONNECT" {
-						f.Verdict = "FAIL"
-						f.Headline = "cross-cutting safety violation: " + x.Detail
-						break
-					}
-				}
+			if nv, hl := escalateForAudit(f.Verdict, audit); nv != f.Verdict {
+				f.Verdict = nv
+				f.Headline = hl
 			}
 		} else {
 			f.Diagnosis = append(f.Diagnosis, invSummaryLine("SAFETY AUDIT", nil))
@@ -422,6 +445,9 @@ func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
 	}
 	if dw, da, ok := d.evSim(); ok {
 		s.EvSimW, s.EvSimA, s.EvSimOK = dw, da, true
+	}
+	if bw, soc, ok := d.batterySim(); ok {
+		s.BatterySimW, s.BatSimSOC, s.BatterySimOK = bw, soc, true
 	}
 
 	hub := d.hubState()
@@ -486,6 +512,36 @@ func breachOver(cons *activeConstraint, s maySample) float64 {
 	return -1
 }
 
+// hubReactedSample reports whether the hub took a visible corrective action for
+// the active constraint on this sample, using the lever appropriate to the
+// constraint — not just solar curtailment. Without this, an import-cap or
+// fixed-dispatch scenario where the hub discharged the battery reads as "no
+// reaction" and gets mislabeled an adoption/command failure.
+//
+// Battery effect is judged from simulator ground truth where available (what the
+// pack physically did), else the hub's view. EV current reduction is not counted:
+// MeterValues carry no idle baseline to measure a reduction against, so an EV-only
+// reaction is left to the per-scenario EV diagnosers rather than this generic
+// metric (the limitation the reviewer flagged — scoped, not papered over).
+func hubReactedSample(cons *activeConstraint, smp maySample) bool {
+	// PV curtailment is a valid correction for any generation/export cap and for
+	// a cease-to-energize (drive generation to zero).
+	if smp.SolarOK && smp.SolarPossibleW-smp.SolarW > mayReactThreshW {
+		return true
+	}
+	battW := smp.BatteryW
+	if smp.BatterySimOK {
+		battW = smp.BatterySimW
+	}
+	switch cons.Typ {
+	case "exportCap", "genLimit":
+		return battW < -mayReactThreshW // charging to absorb the surplus
+	case "importCap", "fixed":
+		return battW > mayReactThreshW // discharging to offset import / meet dispatch
+	}
+	return false
+}
+
 // scanSamples computes the shared metrics every constraint diagnoser needs.
 func scanSamples(cons *activeConstraint, s []maySample) mayMetrics {
 	var m mayMetrics
@@ -503,7 +559,7 @@ func scanSamples(cons *activeConstraint, s []maySample) mayMetrics {
 		if smp.CannotComply {
 			m.ReportedCannot = true
 		}
-		if smp.SolarOK && smp.SolarPossibleW-smp.SolarW > mayReactThreshW {
+		if hubReactedSample(cons, smp) {
 			reacted++
 		}
 		if over := breachOver(cons, smp); over > 0 {
@@ -1900,6 +1956,27 @@ func (d *mayhemDriver) evSim() (drawW, currentA float64, ok bool) {
 		return 0, 0, true
 	}
 	return st.Battery.PowerW, st.Battery.CurrentA, true
+}
+
+// batterySim reads the pack's TRUE net power and SoC straight from the batsim
+// /state — the ground truth the hub only sees through Modbus. INV-SOC must judge
+// the real pack, not the hub's view: under a wrong_sign / soc_refuse fault, or a
+// blind/stale/sanitizing hub, the hub's battery reading can disagree with what
+// the pack is physically doing, and the safety oracle has to catch the latter.
+// Sign matches the hub convention: net W > 0 discharging, < 0 charging.
+func (d *mayhemDriver) batterySim() (netW, socPct float64, ok bool) {
+	var st struct {
+		Battery struct {
+			SoCPct float64 `json:"SoC_pct"`
+		} `json:"battery"`
+		Measurements struct {
+			WW float64 `json:"W_W"`
+		} `json:"measurements"`
+	}
+	if err := d.getJSON("battery", "/state", &st); err != nil {
+		return 0, 0, false
+	}
+	return st.Measurements.WW, st.Battery.SoCPct, true
 }
 
 type mayHubState struct {

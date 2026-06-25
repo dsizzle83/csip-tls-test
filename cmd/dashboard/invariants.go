@@ -99,25 +99,31 @@ func invConverge(cons *activeConstraint, s []maySample) []invViolation {
 // bound: discharging at or below the reserve floor, or charging at or above the
 // ceiling. This is the danger the wrong_sign / soc_refuse faults create — a
 // "charge" command that lands as a discharge walks an already-low pack toward
-// empty. BatteryW > 0 is discharging; < 0 is charging (the batsim convention).
+// empty. Net W > 0 is discharging; < 0 is charging (the batsim convention).
+//
+// It judges the SIMULATOR ground truth (BatterySimW/BatSimSOC), not the hub's
+// Modbus-derived view: a wrong_sign/soc_refuse fault, or a blind/stale/sanitizing
+// hub, can make the hub's battery reading disagree with what the pack physically
+// does — and the safety oracle must catch the physical reality. Samples without a
+// coherent sim reading are skipped (no trustworthy ground truth that tick).
 func invSOC(s []maySample) []invViolation {
 	var v []invViolation
 	for _, smp := range s {
-		if !smp.HubReachable {
-			continue // no trustworthy battery reading this tick
+		if !smp.BatterySimOK {
+			continue // no trustworthy ground-truth battery reading this tick
 		}
 		switch {
-		case smp.BatteryW > invSocActiveW && smp.BatSOC <= invSocReserveFloorPct:
+		case smp.BatterySimW > invSocActiveW && smp.BatSimSOC <= invSocReserveFloorPct:
 			v = append(v, invViolation{
 				Inv:    "INV-SOC",
 				T:      smp.T,
-				Detail: fmt.Sprintf("discharging %.0f W at SoC %.0f%% (≤ reserve floor %.0f%%)", smp.BatteryW, smp.BatSOC, invSocReserveFloorPct),
+				Detail: fmt.Sprintf("discharging %.0f W at SoC %.0f%% (≤ reserve floor %.0f%%)", smp.BatterySimW, smp.BatSimSOC, invSocReserveFloorPct),
 			})
-		case smp.BatteryW < -invSocActiveW && smp.BatSOC >= invSocCeilingPct:
+		case smp.BatterySimW < -invSocActiveW && smp.BatSimSOC >= invSocCeilingPct:
 			v = append(v, invViolation{
 				Inv:    "INV-SOC",
 				T:      smp.T,
-				Detail: fmt.Sprintf("charging %.0f W at SoC %.0f%% (≥ ceiling %.0f%%)", -smp.BatteryW, smp.BatSOC, invSocCeilingPct),
+				Detail: fmt.Sprintf("charging %.0f W at SoC %.0f%% (≥ ceiling %.0f%%)", -smp.BatterySimW, smp.BatSimSOC, invSocCeilingPct),
 			})
 		}
 	}
@@ -224,6 +230,57 @@ func safetyAudit(s []maySample) []invViolation {
 	v = append(v, invExpiredControl(s)...)
 	v = append(v, invEVStationMax(s)...)
 	return v
+}
+
+// auditEscalateMinSamples is how many samples a noise-prone safety invariant
+// (INV-SOC, INV-EVMAX, INV-EXPIRED) must be violated on before it escalates an
+// otherwise-passing verdict. A 1–2 sample HIL transient — a momentary settling
+// discharge as a cap engages, a single telemetry spike — is not a gate-worthy
+// safety failure; a sustained violation is. This mirrors the settling-ramp grace
+// the constraint oracles already apply, and lets the audit be a deployment gate
+// without false-failing on bench timing jitter. INV-CONNECT is exempt: a
+// back-feed during a disconnect is already ramp-excused by connectBackfeed, and
+// any residual is too safety-critical to require repetition.
+const auditEscalateMinSamples = 3
+
+// escalateForAudit decides how a cross-cutting safety-audit result should change a
+// verdict that is otherwise PASS or DEGRADED, so a safety violation the scenario's
+// own oracle would miss is never silently passed:
+//   - INV-CONNECT (back-feed during a cease-to-energize) → FAIL on any occurrence.
+//   - INV-SOC (pack driven past its reserve) / INV-EVMAX (impossible EV draw) →
+//     FAIL when SUSTAINED.
+//   - INV-EXPIRED (hub still enforcing a withdrawn control) → DEGRADED when
+//     sustained: it is acting on withdrawn authority, but a held cap is
+//     conservative and any real harm surfaces as a measured breach the scenario's
+//     own oracle already FAILs — so it floors at DEGRADED and never masks a FAIL.
+//
+// Returns the (possibly unchanged) verdict and, when escalated, a headline. Never
+// downgrades a FAIL/INCONCLUSIVE (it only tightens PASS/DEGRADED).
+func escalateForAudit(verdict string, audit []invViolation) (newVerdict, headline string) {
+	if verdict != "PASS" && verdict != "DEGRADED" {
+		return verdict, ""
+	}
+	count := map[string]int{}
+	firstDetail := map[string]string{}
+	for _, x := range audit {
+		count[x.Inv]++
+		if _, ok := firstDetail[x.Inv]; !ok {
+			firstDetail[x.Inv] = x.Detail
+		}
+	}
+
+	if count["INV-CONNECT"] > 0 {
+		return "FAIL", "cross-cutting safety violation (INV-CONNECT): " + firstDetail["INV-CONNECT"]
+	}
+	for _, inv := range []string{"INV-SOC", "INV-EVMAX"} {
+		if count[inv] >= auditEscalateMinSamples {
+			return "FAIL", "cross-cutting safety violation (" + inv + "): " + firstDetail[inv]
+		}
+	}
+	if count["INV-EXPIRED"] >= auditEscalateMinSamples && verdict == "PASS" {
+		return "DEGRADED", "stale control retained past validUntil: " + firstDetail["INV-EXPIRED"]
+	}
+	return verdict, ""
 }
 
 // invSummaryLine renders a one-line summary of an invariant's violations for a
