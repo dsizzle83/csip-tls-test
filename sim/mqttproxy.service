@@ -1,0 +1,19 @@
+[Unit]
+Description=LEXA QA MQTT fault proxy (mayhem chaos)
+Documentation=https://github.com/dsizzle83/csip-tls-test
+# Sits in front of mosquitto; needs the broker up but must not block it.
+After=mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+# Forward localhost:1882 -> the real broker on localhost:1883; expose the control
+# API on the bench LAN so the desktop dashboard can drive faults.
+ExecStart=/usr/local/sbin/mqttproxy -listen 127.0.0.1:1882 -upstream 127.0.0.1:1883 -control 69.0.0.1:11882
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -3003,5 +3003,6 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			},
 		},
 	}
+	sc = append(sc, d.mqttScenarios()...)
 	return sc
 }

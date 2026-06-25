@@ -27,6 +27,7 @@ func main() {
 	battery := flag.String("battery", "http://localhost:6021", "battery simapi address")
 	meter := flag.String("meter", "http://localhost:6022", "meter simapi address")
 	ev := flag.String("ev", "http://localhost:6024", "EV charger simapi address")
+	mqttproxy := flag.String("mqttproxy", "http://69.0.0.1:11882", "MQTT fault-proxy control API (mayhem chaos)")
 	flag.Parse()
 
 	mux := http.NewServeMux()
@@ -74,12 +75,13 @@ func main() {
 	// Mayhem QA driver: adversarial fault-injection suite over the whole bench,
 	// server-side so a run survives the tab closing (see mayhem.go).
 	mayhem := newMayhemDriver(map[string]string{
-		"hub":     *hub,
-		"gridsim": *gridsim,
-		"solar":   *solar,
-		"battery": *battery,
-		"meter":   *meter,
-		"ev":      *ev,
+		"hub":       *hub,
+		"gridsim":   *gridsim,
+		"solar":     *solar,
+		"battery":   *battery,
+		"meter":     *meter,
+		"ev":        *ev,
+		"mqttproxy": *mqttproxy,
 	})
 	mux.HandleFunc("/api/qa/start", mayhem.handleStart)
 	mux.HandleFunc("/api/qa/status", mayhem.handleStatus)

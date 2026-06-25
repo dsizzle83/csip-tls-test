@@ -79,28 +79,39 @@ type publishCapture struct {
 	ok      bool
 }
 
-// decodePublish parses a single QoS-0 PUBLISH packet (enough for the test).
+// decodePublish parses a single QoS-0 PUBLISH packet, bounding the payload by the
+// packet's remaining-length field so a coalesced trailing DISCONNECT (sent
+// back-to-back by mqttPublish, may arrive in the same TCP read) is not mistaken
+// for payload.
 func decodePublish(b []byte) publishCapture {
 	if len(b) < 2 || b[0]&0xF0 != 0x30 {
 		return publishCapture{}
 	}
 	retain := b[0]&0x01 == 1
-	// skip remaining-length bytes (high bit = continuation)
-	i := 1
-	for i < len(b) && b[i]&0x80 != 0 {
+	// Decode the variable-length remaining-length field.
+	i, remLen, mult := 1, 0, 1
+	for i < len(b) {
+		remLen += int(b[i]&0x7F) * mult
+		more := b[i]&0x80 != 0
 		i++
+		if !more {
+			break
+		}
+		mult *= 128
 	}
-	i++ // last length byte
-	if i+2 > len(b) {
+	if i+remLen > len(b) {
+		remLen = len(b) - i // defensive: never read past the buffer
+	}
+	body := b[i : i+remLen] // exactly this PUBLISH's variable header + payload
+	if len(body) < 2 {
 		return publishCapture{}
 	}
-	tlen := int(b[i])<<8 | int(b[i+1])
-	i += 2
-	if i+tlen > len(b) {
+	tlen := int(body[0])<<8 | int(body[1])
+	if 2+tlen > len(body) {
 		return publishCapture{}
 	}
-	topic := string(b[i : i+tlen])
-	payload := string(b[i+tlen:])
+	topic := string(body[2 : 2+tlen])
+	payload := string(body[2+tlen:])
 	return publishCapture{topic: topic, payload: payload, retain: retain, ok: true}
 }
 
