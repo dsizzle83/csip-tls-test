@@ -201,19 +201,33 @@ func invEVStationMax(s []maySample) []invViolation {
 	return v
 }
 
+// pastSettling drops violations within the opening settling window. A scenario's
+// setup injects extreme device states — a battery forced to 100% or 5% SoC, an
+// inverter at nameplate — and the first mayConvergeDeadlineS seconds are the
+// system settling from that toward the hub's commanded state, not a hub failure.
+// It mirrors the grace invExport and connectBackfeed already apply to the opening
+// ramp, so the safety audit can be a deployment gate without false-failing on a
+// setup transient (e.g. a pack the harness just forced to 100% briefly finishing
+// a charge, or a 5%-injected pack discharging for a tick before the hub's
+// reserve-disconnect engages). A SUSTAINED violation persists past the window and
+// is still caught.
+func pastSettling(v []invViolation) []invViolation {
+	out := v[:0:0]
+	for _, x := range v {
+		if x.T > mayConvergeDeadlineS {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
 // connectBackfeed returns the INV-CONNECT violations that PERSIST past the
 // reaction grace — a bounded cease-to-energize ramp (the hub driving the
 // inverter down to zero over the first mayConvergeDeadlineS seconds) is expected
 // and excused, so only a sustained back-feed is a real violation. Shared by
 // diagnoseDisconnect and the safety audit so they never disagree.
 func connectBackfeed(s []maySample) []invViolation {
-	var v []invViolation
-	for _, x := range invConnectSafe(s) {
-		if x.T > mayConvergeDeadlineS {
-			v = append(v, x)
-		}
-	}
-	return v
+	return pastSettling(invConnectSafe(s))
 }
 
 // safetyAudit is the assertion engine: it runs the cross-cutting safety
@@ -225,10 +239,10 @@ func connectBackfeed(s []maySample) []invViolation {
 // — those are the scenario's primary oracle and would double-judge it.
 func safetyAudit(s []maySample) []invViolation {
 	var v []invViolation
-	v = append(v, connectBackfeed(s)...) // excuses the bounded cease-to-energize ramp
-	v = append(v, invSOC(s)...)
-	v = append(v, invExpiredControl(s)...)
-	v = append(v, invEVStationMax(s)...)
+	v = append(v, connectBackfeed(s)...)               // excuses the bounded cease-to-energize ramp
+	v = append(v, pastSettling(invSOC(s))...)          // excuses the setup-SoC settling transient
+	v = append(v, invExpiredControl(s)...)             // already grace-bounded by validUntil+invExpiredGraceS
+	v = append(v, pastSettling(invEVStationMax(s))...) // excuses an opening EV-current transient
 	return v
 }
 

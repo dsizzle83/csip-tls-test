@@ -211,6 +211,34 @@ func TestSafetyAudit_CatchesCrossCutting(t *testing.T) {
 	}
 }
 
+// The audit excuses an INV-SOC violation confined to the opening settling window
+// (the harness injects an extreme SoC at setup) but still catches a sustained one.
+func TestSafetyAudit_ExcusesSettlingSOC(t *testing.T) {
+	// Empty pack discharging only during settling (t=0..4 ≤ 30s deadline): excused.
+	early := mkSamples(40, func(i int, s *maySample) {
+		if i < 5 {
+			s.BatterySimOK = true
+			s.BatSimSOC = 5
+			s.BatterySimW = 1200 // discharging below reserve, but during settling
+		}
+	})
+	if v := safetyAudit(early); len(v) != 0 {
+		t.Errorf("settling-window INV-SOC should be excused, got %d: %v", len(v), v)
+	}
+
+	// Same drain sustained past the deadline (t=34..39): caught.
+	sustained := mkSamples(40, func(i int, s *maySample) {
+		if i >= 34 {
+			s.BatterySimOK = true
+			s.BatSimSOC = 5
+			s.BatterySimW = 1200
+		}
+	})
+	if v := safetyAudit(sustained); len(v) == 0 {
+		t.Error("a post-settling reserve drain must still be caught by the audit")
+	}
+}
+
 // diagnoseMalform: surviving + holding the cap is PASS; a hang or an unseated
 // safe control is FAIL — the hub's normal curtailment ramp must NOT be mistaken
 // for a malform failure.
