@@ -89,6 +89,9 @@ type maySample struct {
 
 	CannotComply bool     `json:"cannot_comply"` // hub posted a CannotComply for the active mRID
 	Decisions    []string `json:"decisions,omitempty"`
+
+	MeterStale bool `json:"meter_stale"` // hub flagged the grid meter frozen (detected INV-STALE)
+	EvStale    bool `json:"ev_stale"`    // hub flagged an EVSE's telemetry silent (detected INV-EVBLIND)
 }
 
 // mayMetrics is the quantified outcome of a scenario.
@@ -463,6 +466,8 @@ func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
 		s.EvMaxA = hub.evMaxA
 		s.ClockOffsetS = hub.clockOffsetS
 		s.Decisions = hub.decisions
+		s.MeterStale = hub.meterStale
+		s.EvStale = hub.evStale
 		if hub.ctrlActive {
 			s.HubAdopted = true
 			s.AdoptedTyp = hub.ctrlTyp
@@ -848,7 +853,25 @@ func diagnoseStale(sc *mayScenario, cons *activeConstraint, s []maySample) mayFi
 		f.Diagnosis = []string{fmt.Sprintf("Grid reading varied %.0f W over the window — the freeze did not engage, so this run does not test staleness. Confirm the meter sim honoured pause and re-run.", rangeW)}
 		return f
 	}
-	// The meter is frozen. Did the hub keep trusting it?
+	// The meter is frozen. Did the hub DETECT it (surface it as stale) or stay blind?
+	detected := 0
+	for _, smp := range s {
+		if smp.MeterStale {
+			detected++
+		}
+	}
+	if detected >= 3 { // sustained detection, not a one-sample blip
+		f.Verdict = "DEGRADED"
+		f.Headline = fmt.Sprintf("meter frozen at ~%.0f W; hub DETECTED it stale and surfaced it", lo)
+		f.Diagnosis = []string{
+			fmt.Sprintf("The grid meter held within %.0f W for the window, but the hub flagged it as stale (stale_sources) on %d samples — it is no longer flying blind on a dead sensor.", rangeW, detected),
+			"Detection + surfacing is in place (it cross-checks the frozen reading against a moving inverter). Remaining hardening: have the OPTIMIZER fail safe on the flag (conservative limits) rather than only reporting it.",
+			decisionLine(s),
+		}
+		f.Fix = "Detection done (lexa-api stale_sources). Next: gate the optimizer on the stale flag so a frozen grid meter drives conservative limits, not just an alarm."
+		return f
+	}
+
 	f.Metrics.HubBlind = true
 	f.Verdict = "BLIND"
 	f.Headline = fmt.Sprintf("meter frozen at ~%.0f W while conditions changed; hub kept trusting it", lo)
@@ -1283,6 +1306,25 @@ func diagnoseEVFreeze(sc *mayScenario, cons *activeConstraint, s []maySample) ma
 		}
 		f.Fix = "Stale-expire EVSE MeterValues and fall back to the grid meter for cap compliance; never assume a silent charger is idle (lexa-ocpp / orchestrator)."
 		f.Diagnosis = append(f.Diagnosis, hubVsRealLine(s))
+		return f
+	}
+
+	// Did the hub DETECT the silent charger (flag its telemetry stale)? If so it
+	// held the cap off the grid meter AND is aware the per-EVSE view is stale — not
+	// blind, so the divergence is acknowledged rather than silently trusted.
+	evDetected := 0
+	for _, smp := range s {
+		if smp.EvStale {
+			evDetected++
+		}
+	}
+	if hubBlind && evDetected >= 3 {
+		f.Verdict = "PASS"
+		f.Headline = fmt.Sprintf("held %s and flagged the EVSE telemetry stale", capStr)
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub held the import cap off the real grid meter AND detected the charger's MeterValues went silent (flagged stale on %d samples) — it is not blindly trusting a frozen per-device reading.", evDetected),
+			"Correct: cap compliance stays on the grid meter, and the stale EVSE telemetry is surfaced rather than trusted as live.",
+		}
 		return f
 	}
 
@@ -1991,6 +2033,8 @@ type mayHubState struct {
 	validUntil                   int64
 	disconnectActive             bool
 	decisions                    []string
+	meterStale                   bool // hub flagged the grid meter frozen (stale_sources)
+	evStale                      bool // hub flagged an EVSE's telemetry silent
 }
 
 func (d *mayhemDriver) hubState() mayHubState {
@@ -2021,8 +2065,10 @@ func (d *mayhemDriver) hubState() mayHubState {
 			SOC         *float64 `json:"soc_pct"`
 			CurrentA    float64  `json:"current_A"`
 			MaxCurrentA float64  `json:"max_current_A"`
+			Stale       bool     `json:"stale"`
 		} `json:"evse_stations"`
-		LastPlan struct {
+		StaleSources []string `json:"stale_sources"`
+		LastPlan     struct {
 			Decisions []struct {
 				Rule   string `json:"rule"`
 				Reason string `json:"reason"`
@@ -2051,6 +2097,14 @@ func (d *mayhemDriver) hubState() mayHubState {
 		}
 		if e.CurrentA > h.evCurrentA { // worst (highest-drawing) station
 			h.evCurrentA, h.evMaxA = e.CurrentA, e.MaxCurrentA
+		}
+		if e.Stale {
+			h.evStale = true
+		}
+	}
+	for _, src := range st.StaleSources {
+		if !strings.HasPrefix(src, "evse:") { // any non-EVSE stale source is a meter
+			h.meterStale = true
 		}
 	}
 	if c := st.CSIPControl; c != nil {
