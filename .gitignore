@@ -13,6 +13,10 @@ demo-pis.txt
 /metersim
 /modsim-conformance
 
+# Desktop binaries built locally (make build / go build) — never commit
+/dashboard
+/httpsim
+
 # Python virtual environment
 gui/.venv/
 
