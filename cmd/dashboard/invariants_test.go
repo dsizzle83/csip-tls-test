@@ -183,7 +183,7 @@ func TestSafetyAudit_CatchesCrossCutting(t *testing.T) {
 		s.SolarW = 4000 // still energizing through the whole window
 	})
 	found := false
-	for _, x := range safetyAudit(bad) {
+	for _, x := range safetyAudit(nil, bad) {
 		if x.Inv == "INV-CONNECT" {
 			found = true
 		}
@@ -201,12 +201,12 @@ func TestSafetyAudit_CatchesCrossCutting(t *testing.T) {
 			s.SolarW = 0
 		}
 	})
-	if v := safetyAudit(ramp); len(v) != 0 {
+	if v := safetyAudit(nil, ramp); len(v) != 0 {
 		t.Errorf("bounded cease-to-energize ramp flagged by audit: %v", v)
 	}
 
 	clean := mkSamples(10, func(i int, s *maySample) { s.SolarW = 0; s.BatteryW = 0 })
-	if v := safetyAudit(clean); len(v) != 0 {
+	if v := safetyAudit(nil, clean); len(v) != 0 {
 		t.Errorf("clean timeline flagged: %v", v)
 	}
 }
@@ -222,7 +222,7 @@ func TestSafetyAudit_ExcusesSettlingSOC(t *testing.T) {
 			s.BatterySimW = 1200 // discharging below reserve, but during settling
 		}
 	})
-	if v := safetyAudit(early); len(v) != 0 {
+	if v := safetyAudit(nil, early); len(v) != 0 {
 		t.Errorf("settling-window INV-SOC should be excused, got %d: %v", len(v), v)
 	}
 
@@ -234,7 +234,7 @@ func TestSafetyAudit_ExcusesSettlingSOC(t *testing.T) {
 			s.BatterySimW = 1200
 		}
 	})
-	if v := safetyAudit(sustained); len(v) == 0 {
+	if v := safetyAudit(nil, sustained); len(v) == 0 {
 		t.Error("a post-settling reserve drain must still be caught by the audit")
 	}
 }
@@ -332,5 +332,91 @@ func TestDiagnoseSOC_Verdicts(t *testing.T) {
 	})
 	if f := diagnoseSOC(scFor("battery-wrong-sign"), cons, capAdmitted); f.Verdict != "DEGRADED" {
 		t.Fatalf("cap-blowout w/ CannotComply verdict = %q, want DEGRADED", f.Verdict)
+	}
+}
+
+// invHunt: sustained post-settling oscillation around the cap is flagged; a
+// converged hold, a single disturbance, and dithering inside the hysteresis
+// band are not.
+func TestInvHunt_FlagsOscillationExcusesConvergence(t *testing.T) {
+	cons := exportCons() // exportCap ≤ 0 W
+
+	// Hunting: export swings breach ↔ clear recovery every 5 s past settling.
+	hunt := mkSamples(90, func(i int, s *maySample) {
+		if (i/5)%2 == 0 {
+			s.RealGridW = -1500 // exporting 1.5 kW: over the cap
+		} else {
+			s.RealGridW = 800 // importing: clearly recovered (past hysteresis)
+		}
+	})
+	v := invHunt(cons, hunt)
+	if len(v) < invHuntUpCrossings {
+		t.Fatalf("oscillating timeline: got %d up-crossings, want ≥ %d", len(v), invHuntUpCrossings)
+	}
+	if v[0].Inv != "INV-HUNT" {
+		t.Errorf("violation name = %q, want INV-HUNT", v[0].Inv)
+	}
+	if v[0].T <= mayConvergeDeadlineS {
+		t.Errorf("first up-crossing at t=%.0f, must be past the settling deadline", v[0].T)
+	}
+
+	// Converged hold: ramp during settling, then flat under the cap. No hunting.
+	converged := mkSamples(90, func(i int, s *maySample) {
+		if float64(i) <= mayConvergeDeadlineS {
+			s.RealGridW = -2000
+		} else {
+			s.RealGridW = 500
+		}
+	})
+	if v := invHunt(cons, converged); len(v) != 0 {
+		t.Errorf("converged timeline flagged as hunting: %v", v)
+	}
+
+	// A single disturbance (one recovery → one re-entry) is below the threshold.
+	blip := mkSamples(90, func(i int, s *maySample) {
+		switch {
+		case i > 40 && i < 46:
+			s.RealGridW = -1500 // one mid-window breach
+		default:
+			s.RealGridW = 800
+		}
+	})
+	if v := invHunt(cons, blip); len(v) != 0 {
+		t.Errorf("single disturbance flagged as hunting: %v", v)
+	}
+
+	// Dithering ±ε around the cap line without a CLEAR recovery: the hysteresis
+	// band keeps it from counting as repeated up-crossings.
+	dither := mkSamples(90, func(i int, s *maySample) {
+		if i%2 == 0 {
+			s.RealGridW = -200 // marginally over
+		} else {
+			s.RealGridW = 100 // barely under — inside the hysteresis band
+		}
+	})
+	if v := invHunt(cons, dither); len(v) != 0 {
+		t.Errorf("hysteresis-band dither flagged as hunting: %v", v)
+	}
+
+	// No constraint ⇒ no judgement.
+	if v := invHunt(nil, hunt); len(v) != 0 {
+		t.Errorf("nil constraint flagged: %v", v)
+	}
+}
+
+// A sustained hunt demotes a PASS to DEGRADED via the audit escalation; it
+// never touches a FAIL.
+func TestEscalateForAudit_HuntDemotesPass(t *testing.T) {
+	audit := []invViolation{
+		{Inv: "INV-HUNT", T: 40, Detail: "exportCap re-entered breach"},
+	}
+	if v, _ := escalateForAudit("PASS", audit); v != "DEGRADED" {
+		t.Errorf("PASS with sustained hunt = %q, want DEGRADED", v)
+	}
+	if v, _ := escalateForAudit("FAIL", audit); v != "FAIL" {
+		t.Errorf("FAIL must stay FAIL, got %q", v)
+	}
+	if v, _ := escalateForAudit("DEGRADED", audit); v != "DEGRADED" {
+		t.Errorf("DEGRADED must stay DEGRADED, got %q", v)
 	}
 }

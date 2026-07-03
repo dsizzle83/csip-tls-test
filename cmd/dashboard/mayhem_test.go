@@ -540,3 +540,67 @@ func indexFold(s, sub string) int {
 	}
 	return -1
 }
+
+// diagnoseMeterInversion: PASS when the cap truly held, DEGRADED when the hub
+// flagged/admitted while the true breach stood, FAIL when it was confidently
+// wrong (sustained true breach, nothing flagged, nothing admitted).
+func TestDiagnoseMeterInversion_Verdicts(t *testing.T) {
+	sc := scFor("meter-ct-inverted")
+	cons := exportCons() // exportCap ≤ 0 W
+
+	// True export breach the whole window, hub silent → FAIL.
+	silent := mkSamples(60, func(i int, s *maySample) {
+		s.RealGridW = -4000 // ground truth: exporting 4 kW
+		s.HubGridW = 4000   // hub's inverted view: importing 4 kW
+	})
+	if f := diagnoseMeterInversion(sc, cons, silent); f.Verdict != "FAIL" {
+		t.Errorf("silent inverted breach = %s, want FAIL", f.Verdict)
+	}
+
+	// Same breach but the hub flagged the meter → DEGRADED.
+	flagged := mkSamples(60, func(i int, s *maySample) {
+		s.RealGridW = -4000
+		if i > 20 {
+			s.MeterStale = true
+		}
+	})
+	if f := diagnoseMeterInversion(sc, cons, flagged); f.Verdict != "DEGRADED" {
+		t.Errorf("flagged inverted breach = %s, want DEGRADED", f.Verdict)
+	}
+
+	// Same breach, CannotComply posted → DEGRADED.
+	admitted := mkSamples(60, func(i int, s *maySample) {
+		s.RealGridW = -4000
+		if i > 20 {
+			s.CannotComply = true
+		}
+	})
+	if f := diagnoseMeterInversion(sc, cons, admitted); f.Verdict != "DEGRADED" {
+		t.Errorf("admitted inverted breach = %s, want DEGRADED", f.Verdict)
+	}
+
+	// Cap actually held (hub saw through the lie) → PASS.
+	held := mkSamples(60, func(i int, s *maySample) {
+		s.RealGridW = 200 // truly importing a touch — within the cap
+		s.HubGridW = -200
+	})
+	if f := diagnoseMeterInversion(sc, cons, held); f.Verdict != "PASS" {
+		t.Errorf("held cap = %s, want PASS", f.Verdict)
+	}
+
+	// A breach confined to the settling ramp is excused → PASS.
+	ramp := mkSamples(60, func(i int, s *maySample) {
+		if float64(i) <= mayConvergeDeadlineS {
+			s.RealGridW = -4000
+		} else {
+			s.RealGridW = 200
+		}
+	})
+	if f := diagnoseMeterInversion(sc, cons, ramp); f.Verdict != "PASS" {
+		t.Errorf("settling-only breach = %s, want PASS", f.Verdict)
+	}
+
+	if f := diagnoseMeterInversion(sc, cons, nil); f.Verdict != "INCONCLUSIVE" {
+		t.Errorf("no samples = %s, want INCONCLUSIVE", f.Verdict)
+	}
+}

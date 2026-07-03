@@ -364,3 +364,84 @@ func TestBatteryFaults_UnsupportedKind(t *testing.T) {
 		t.Error("unsupported fault kind should return an error")
 	}
 }
+
+// TestFaultInvertSign verifies the meter's CT-clamp-backwards injector: the
+// configured signed registers flip sign on the read path, unconfigured
+// registers pass through, the 0x8000 N/A sentinel is left alone, and the fault
+// only arms on a sim that wired signed registers.
+func TestFaultInvertSign(t *testing.T) {
+	supported := map[FaultKind]bool{FaultInvertSign: true}
+
+	// A controller with no signed registers configured rejects the arm.
+	bare := &faultController{label: "meter"}
+	if err := bare.apply([]byte(`{"kind":"invert_sign"}`), supported); err == nil {
+		t.Fatal("invert_sign with no configured registers should error")
+	}
+
+	fc := &faultController{label: "meter"}
+	fc.configureInvert(10, 12) // signed registers at addrs 10 and 12
+
+	// Unarmed: pass-through.
+	neg500 := uint16(0xFE0C) // int16(-500)
+	in := []uint16{neg500, 42, 300} // addrs 10,11,12
+	if out, _ := fc.transportRead(10, in); int16(out[0]) != -500 || out[1] != 42 || int16(out[2]) != 300 {
+		t.Fatalf("unarmed passthrough = %v", out)
+	}
+
+	if err := fc.apply([]byte(`{"kind":"invert_sign"}`), supported); err != nil {
+		t.Fatalf("arm invert_sign: %v", err)
+	}
+
+	// Armed: configured registers flip; the unconfigured one is untouched, and
+	// the input slice is not mutated in place.
+	out, err := fc.transportRead(10, in)
+	if err != nil {
+		t.Fatalf("transportRead: %v", err)
+	}
+	if int16(out[0]) != 500 || out[1] != 42 || int16(out[2]) != -300 {
+		t.Errorf("inverted read = [%d %d %d], want [500 42 -300]", int16(out[0]), out[1], int16(out[2]))
+	}
+	if int16(in[0]) != -500 {
+		t.Error("transportRead mutated the caller's slice")
+	}
+
+	// A read window that misses every configured register passes through.
+	if out, _ := fc.transportRead(100, []uint16{7}); out[0] != 7 {
+		t.Errorf("out-of-window read altered: %v", out)
+	}
+
+	// The 0x8000 N/A sentinel has no int16 negation — left as-is.
+	if out, _ := fc.transportRead(10, []uint16{0x8000}); out[0] != 0x8000 {
+		t.Errorf("sentinel inverted to %#x, want 0x8000 untouched", out[0])
+	}
+
+	// Clear restores pass-through.
+	fc.apply([]byte(`{"kind":"invert_sign","clear":true}`), supported)
+	if out, _ := fc.transportRead(10, in); int16(out[0]) != -500 {
+		t.Errorf("after clear, read = %d, want -500", int16(out[0]))
+	}
+}
+
+// TestMeterApplyFault verifies the meter advertises exactly the transport set
+// (plus invert_sign) and rejects control-write faults that make no sense for a
+// read-only device.
+func TestMeterApplyFault(t *testing.T) {
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	base := populateMeter(r, 1000)
+	ms := &MeterServer{Server: &Server{Regs: r}, M201Base: base}
+	ms.faults.label = "meter"
+	ms.faults.configureInvert(base + sunspec.M201_W)
+
+	if err := ms.ApplyFault([]byte(`{"kind":"invert_sign"}`)); err != nil {
+		t.Fatalf("invert_sign: %v", err)
+	}
+	if err := ms.ApplyFault([]byte(`{"kind":"latency","latency_ms":100}`)); err != nil {
+		t.Fatalf("latency: %v", err)
+	}
+	if err := ms.ApplyFault([]byte(`{"kind":"reject_write"}`)); err == nil {
+		t.Error("meter should reject reject_write (read-only device)")
+	}
+	if err := ms.ApplyFault([]byte(`{"kind":"wrong_sign"}`)); err == nil {
+		t.Error("meter should reject wrong_sign (that is the battery's write-path fault)")
+	}
+}

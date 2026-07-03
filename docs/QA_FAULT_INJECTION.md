@@ -34,6 +34,7 @@ for an hour" are different severities.
 | **INV-RESTORE** | After a curtailment event ends, solar returns to ≥95% nameplate within N s (guards the restore-path class of bug) | modsim M103 W vs WAval |
 | **INV-EV** | EV meets departure SOC unless physically impossible | evsim transaction meter |
 | **INV-CONVERGE** | Every issued setpoint is reflected in measurement within a deadline, or an alarm fires | hub command log vs meter |
+| **INV-HUNT** | The control loop converges below an active cap and stays — it never oscillates curtail→release→breach around the cap line (≥3 post-settling breach re-entries after clear recoveries = sustained hunting; demotes PASS→DEGRADED) | real meter / modsim vs the active cap |
 
 ---
 
@@ -63,11 +64,21 @@ rest. Fault kinds are defined in `sim/southbound/sim.go` (`FaultKind`,
 
 **Modbus DER (two fault layers — write-time *acceptance* and effect-time *physical response*):**
 `ack_before_effect`, `reject_write`, `enable_gate`, `ramp_limit` (solar);
-`wrong_sign`, `soc_refuse` (battery). **OCPP (CSMS/charger boundary):**
-`profile_reject`, `apply_next_tx`, `min_current_floor`, `stop_metervalues` (evsim).
-**Grid safety:** `disconnect` (gridsim opModConnect=false). **Malformed CSIP**
-(gridsim `POST /admin/malform`, applied at serve time): `empty_program_list`,
+`wrong_sign`, `soc_refuse` (battery). **Meter (transport/read-path only — a
+read-only device):** `invert_sign` (CT clamp installed backwards; flips the
+signed W/VAR/A registers on the Modbus read path while `/state` ground truth
+stays honest), `nan_sentinel`, `latency`, `exception_code`. **OCPP
+(CSMS/charger boundary):** `profile_reject`, `apply_next_tx`,
+`min_current_floor`, `stop_metervalues` (evsim). **Grid safety:** `disconnect`
+(gridsim opModConnect=false). **Malformed CSIP** (gridsim `POST
+/admin/malform`, applied at serve time): `empty_program_list`,
 `huge_activepower`, `bad_duration`, `dup_mrid`, `missing_href`.
+**Northbound outage** (gridsim `POST /admin/outage`, gating only the
+mTLS-served CSIP tree — the admin API stays reachable): `down` (every CSIP
+request 503s immediately: a dead/rebooting head-end), `hang` (each request
+stalls `hang_s` before the 503: a wedged server / black-holing middlebox);
+`duration_s` auto-clears so an aborted run can never leave the bench
+northbound-dead.
 
 The write layer (`RegisterMap.OnWriteAttempt` → `faultController.intercept`)
 decides what lands in the control register; the effect layer

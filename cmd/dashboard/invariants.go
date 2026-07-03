@@ -230,19 +230,70 @@ func connectBackfeed(s []maySample) []invViolation {
 	return pastSettling(invConnectSafe(s))
 }
 
+// invHuntUpCrossings is how many post-settling breach re-entries (recovered →
+// over-cap transitions) count as sustained hunting. One re-entry is a
+// disturbance; several in one window is a control loop oscillating around its
+// setpoint — curtail, release, breach, curtail again. Hardware-killing in the
+// field (contactor/inverter wear) and invisible to breach-seconds totals, which
+// a fast oscillation keeps small.
+const invHuntUpCrossings = 3
+
+// invHuntHysteresisW is how far below the cap line a sample must fall to count
+// as "recovered" before a later breach can score a new up-crossing. Without the
+// dead-band, telemetry noise dithering ±ε around the cap would count as hunting.
+const invHuntHysteresisW = 300.0
+
+// invHunt flags sustained oscillation around the active cap: post-settling
+// samples where measurement re-enters breach after having clearly recovered
+// (below cap − hysteresis), invHuntUpCrossings or more times. A correct sticky
+// controller converges below the cap and stays; a hunting one cycles
+// curtail → release → breach → curtail. Each flagged sample is one re-entry.
+func invHunt(cons *activeConstraint, s []maySample) []invViolation {
+	if cons == nil || cons.Typ == "none" || cons.Typ == "" {
+		return nil
+	}
+	var crossings []invViolation
+	recovered := false // only a clear recovery arms the next up-crossing
+	for _, smp := range s {
+		if smp.T <= mayConvergeDeadlineS {
+			continue // settling ramp — not oscillation evidence
+		}
+		over := breachOver(cons, smp)
+		switch {
+		case over > 0 && recovered:
+			recovered = false
+			crossings = append(crossings, invViolation{
+				Inv:    "INV-HUNT",
+				T:      smp.T,
+				Detail: fmt.Sprintf("%s re-entered breach (+%.0f W over cap %.0f W) after recovering", cons.Typ, over, cons.LimW),
+			})
+		case over < -invHuntHysteresisW:
+			recovered = true
+		}
+	}
+	if len(crossings) < invHuntUpCrossings {
+		return nil // a disturbance or two, not an oscillation
+	}
+	return crossings
+}
+
 // safetyAudit is the assertion engine: it runs the cross-cutting safety
 // invariants over every scenario's timeline, independent of that scenario's own
 // oracle, so a violation the targeted diagnoser would miss (a battery over-
 // discharge during an export-cap test, a back-feed during a disconnect, a stale
-// control retained, an impossible EV draw) is still surfaced. The constraint-
-// specific invariants (INV-EXPORT/INV-CONVERGE) are intentionally NOT re-run here
-// — those are the scenario's primary oracle and would double-judge it.
-func safetyAudit(s []maySample) []invViolation {
+// control retained, an impossible EV draw, a control loop hunting around the
+// cap) is still surfaced. The constraint-specific invariants
+// (INV-EXPORT/INV-CONVERGE) are intentionally NOT re-run here — those are the
+// scenario's primary oracle and would double-judge it. INV-HUNT is
+// constraint-aware but orthogonal to them: it judges the SHAPE of the response
+// (oscillation), not its magnitude, which no breach-seconds oracle sees.
+func safetyAudit(cons *activeConstraint, s []maySample) []invViolation {
 	var v []invViolation
 	v = append(v, connectBackfeed(s)...)               // excuses the bounded cease-to-energize ramp
 	v = append(v, pastSettling(invSOC(s))...)          // excuses the setup-SoC settling transient
 	v = append(v, invExpiredControl(s)...)             // already grace-bounded by validUntil+invExpiredGraceS
 	v = append(v, pastSettling(invEVStationMax(s))...) // excuses an opening EV-current transient
+	v = append(v, invHunt(cons, s)...)                 // already settling-gated and hysteresis-banded
 	return v
 }
 
@@ -293,6 +344,12 @@ func escalateForAudit(verdict string, audit []invViolation) (newVerdict, headlin
 	}
 	if count["INV-EXPIRED"] >= auditEscalateMinSamples && verdict == "PASS" {
 		return "DEGRADED", "stale control retained past validUntil: " + firstDetail["INV-EXPIRED"]
+	}
+	// INV-HUNT is already threshold-gated inside invHunt (≥ invHuntUpCrossings
+	// re-entries), so any presence is sustained oscillation. It demotes a PASS:
+	// the cap was (mostly) met, but by a loop that will grind real hardware.
+	if count["INV-HUNT"] > 0 && verdict == "PASS" {
+		return "DEGRADED", "control loop hunting around the cap: " + firstDetail["INV-HUNT"]
 	}
 	return verdict, ""
 }

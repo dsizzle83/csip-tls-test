@@ -110,6 +110,17 @@ const (
 	// scaled reading rather than optimise against it (audit GS-1/MTR-1).
 	FaultBadScale FaultKind = "bad_scale"
 
+	// FaultInvertSign flips the sign of the configured signed power registers
+	// (W/VAR/A) on the Modbus READ path, modelling the most common metering
+	// installation error in the field: a CT clamp installed backwards. Every watt
+	// the site imports reads as an export and vice versa — values stay perfectly
+	// plausible, only the direction is wrong, so per-sample range checks cannot
+	// catch it. A hub that trusts the reading believes it is compliant while doing
+	// the opposite of what the grid asked (e.g. "import 5 kW" read as "export
+	// 5 kW" under a zero-export cap). The sim's /state ground truth (direct
+	// register read) is unaffected, so the QA oracle still sees physical reality.
+	FaultInvertSign FaultKind = "invert_sign"
+
 	// ── Directional battery faults — effect-time, act on the commanded power. ──
 
 	// FaultChargeDisabled makes the battery refuse to CHARGE: a commanded charge

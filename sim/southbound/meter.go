@@ -47,6 +47,27 @@ type MeterServer struct {
 	accLast  time.Time
 	totImpWh float64
 	totExpWh float64
+
+	// faults is the QA fault injector (POST /fault via simapi). Transport-layer
+	// only — the meter is a read-only device, so all its faults live on the
+	// Modbus read path; Snapshot/ground truth read the registers directly and
+	// stay correct. See meterFaultKinds.
+	faults faultController
+}
+
+// meterFaultKinds is the fault set the meter sim advertises: the transport
+// faults every Modbus device can suffer, plus the meter-specific invert_sign
+// (CT clamp installed backwards).
+var meterFaultKinds = map[FaultKind]bool{
+	FaultInvertSign:      true,
+	FaultNanSentinel:     true,
+	FaultLatency:         true,
+	FaultModbusException: true,
+}
+
+// ApplyFault arms or clears a fault from a POST /fault body. See meterFaultKinds.
+func (ms *MeterServer) ApplyFault(body []byte) error {
+	return ms.faults.apply(body, meterFaultKinds)
 }
 
 // NewMeterServer creates and starts a static single-phase AC meter simulator.
@@ -61,7 +82,21 @@ func NewMeterServer(listenURL string, netW float64) (*MeterServer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &MeterServer{Server: srv, M201Base: m201Base}, nil
+	ms := &MeterServer{Server: srv, M201Base: m201Base}
+	ms.faults.label = "meter"
+	// invert_sign flips the signed instantaneous registers a backwards CT
+	// reverses: real power, reactive power, and the current channels. (VA is
+	// unsigned-magnitude and the energy accumulators keep counting on the wrong
+	// side in a real install too — the instantaneous direction is the lie that
+	// matters to a controller.)
+	ms.faults.configureInvert(
+		m201Base+sunspec.M201_W,
+		m201Base+sunspec.M201_VAR,
+		m201Base+sunspec.M201_A,
+		m201Base+sunspec.M201_AphA,
+	)
+	regs.OnRead = ms.faults.transportRead
+	return ms, nil
 }
 
 // SetNetW updates the W register so ReadMeasurements reflects a new reading.

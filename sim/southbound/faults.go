@@ -90,6 +90,14 @@ type faultController struct {
 	badScale  bool
 	scaleAddr uint16
 	hasScale  bool
+
+	// invert_sign (transport, meter): when a read covers any of invertAddrs
+	// (the signed W/VAR/A registers), that value is sign-flipped — the CT clamp
+	// installed backwards. Configured once at wiring time (configureInvert); a
+	// sim that does not advertise FaultInvertSign leaves invertAddrs empty and
+	// never arms it.
+	invertSign  bool
+	invertAddrs []uint16
 }
 
 // transportRead is the RegisterMap.OnRead hook. It applies the armed transport
@@ -100,6 +108,7 @@ func (fc *faultController) transportRead(start uint16, vals []uint16) ([]uint16,
 	fc.mu.Lock()
 	lat, nan, exc := fc.latencyMs, fc.nanSentinel, fc.modbusException
 	bad, scaleAddr, hasScale := fc.badScale, fc.scaleAddr, fc.hasScale
+	inv, invAddrs := fc.invertSign, fc.invertAddrs
 	fc.mu.Unlock()
 
 	if lat > 0 {
@@ -123,6 +132,27 @@ func (fc *faultController) transportRead(start uint16, vals []uint16) ([]uint16,
 		out[i] = uint16(int16(out[i]) + 1)
 		return out, nil
 	}
+	if inv {
+		// CT clamp backwards: sign-flip only the configured signed registers
+		// covered by this read; everything else passes through. 0x8000 (the
+		// SunSpec N/A sentinel, which has no negation in int16) is left as-is.
+		var out []uint16
+		for _, addr := range invAddrs {
+			if addr < start || int(addr-start) >= len(vals) {
+				continue
+			}
+			if out == nil {
+				out = append([]uint16(nil), vals...)
+			}
+			i := int(addr - start)
+			if v := int16(out[i]); v != -32768 {
+				out[i] = uint16(-v)
+			}
+		}
+		if out != nil {
+			return out, nil
+		}
+	}
 	return vals, nil
 }
 
@@ -131,6 +161,15 @@ func (fc *faultController) transportRead(start uint16, vals []uint16) ([]uint16,
 func (fc *faultController) configureScale(scaleAddr uint16) {
 	fc.mu.Lock()
 	fc.scaleAddr, fc.hasScale = scaleAddr, true
+	fc.mu.Unlock()
+}
+
+// configureInvert wires the signed power registers the FaultInvertSign fault
+// flips on read. Called once by a sim that advertises the kind (the meter's
+// W/VAR/A).
+func (fc *faultController) configureInvert(addrs ...uint16) {
+	fc.mu.Lock()
+	fc.invertAddrs = append([]uint16(nil), addrs...)
 	fc.mu.Unlock()
 }
 
@@ -386,6 +425,13 @@ func (fc *faultController) apply(body []byte, supported map[FaultKind]bool) erro
 		}
 		fc.badScale = !spec.Clear
 		log.Printf("[fault] bad_scale: %s armed=%v", fc.label, fc.badScale)
+
+	case FaultInvertSign:
+		if len(fc.invertAddrs) == 0 {
+			return fmt.Errorf("fault %q: %s has no signed registers configured", spec.Kind, fc.label)
+		}
+		fc.invertSign = !spec.Clear
+		log.Printf("[fault] invert_sign: %s armed=%v", fc.label, fc.invertSign)
 	}
 	return nil
 }

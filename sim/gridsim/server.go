@@ -66,6 +66,13 @@ type Server struct {
 	// POST /admin/malform). Guarded by mu. See malform.go.
 	malformKind string
 
+	// Northbound outage injection (QA fault injection via POST /admin/outage).
+	// outageMode "" = healthy; see outage.go. outageSeq invalidates a pending
+	// auto-clear when a newer arm/clear supersedes it. Guarded by mu.
+	outageMode  string
+	outageHangS int
+	outageSeq   uint64
+
 	// Response log (CORE-022: client POSTs Response on event transitions)
 	responseMu sync.Mutex
 	responses  []model.Response
@@ -186,6 +193,13 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	peerLFDI := r.Header.Get("X-Peer-LFDI")
 	log.Printf("[gridsim] %s %s (peer=%s)", r.Method, path, peerLFDI)
+
+	// Northbound outage injection (QA): fail every CSIP request while armed.
+	// Sits above routing so the whole served tree — including /dcap and /tm —
+	// disappears at once, exactly like a dead or wedged head-end.
+	if s.outageIntercept(w) {
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:

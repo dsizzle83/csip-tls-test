@@ -2,22 +2,22 @@
 //
 // Two modes:
 //
-//  Sine mode (default): animates net power as a ±peak sine wave.
+//	 Sine mode (default): animates net power as a ±peak sine wave.
 //
-//  Linked mode (-solar-api / -battery-api / -ev-api / -hub-api): polls the
-//  solar, battery, and EV charger endpoints and computes the meter reading
-//  from the energy balance at the site bus:
+//	 Linked mode (-solar-api / -battery-api / -ev-api / -hub-api): polls the
+//	 solar, battery, and EV charger endpoints and computes the meter reading
+//	 from the energy balance at the site bus:
 //
-//	meter_W = load_W + ev_W - solar_W - battery_W
+//		meter_W = load_W + ev_W - solar_W - battery_W
 //
-//  where load_W is the fixed site load (settable via inject), ev_W is the
-//  EV charging power (positive = consuming), solar_W is generation
-//  (positive = exporting), and battery_W is net battery power
-//  (positive = discharging, negative = charging).
+//	 where load_W is the fixed site load (settable via inject), ev_W is the
+//	 EV charging power (positive = consuming), solar_W is generation
+//	 (positive = exporting), and battery_W is net battery power
+//	 (positive = discharging, negative = charging).
 //
-//  EV power source priority: -hub-api (reads OCPP MeterValues via hub
-//  /status) beats -ev-api (polls evsim directly).  Use -hub-api when the
-//  meter Pi cannot reach the EV Pi's simapi port directly.
+//	 EV power source priority: -hub-api (reads OCPP MeterValues via hub
+//	 /status) beats -ev-api (polls evsim directly).  Use -hub-api when the
+//	 meter Pi cannot reach the EV Pi's simapi port directly.
 //
 // API (default :6022):
 //
@@ -62,14 +62,14 @@ type linkedState struct {
 }
 
 func main() {
-	port       := flag.Int("port", 5022, "Modbus TCP port")
-	peak       := flag.Float64("peak", 5000, "Peak net power magnitude in watts (sine mode only)")
-	apiPort    := flag.Int("api-port", 6022, "HTTP API port (0 to disable)")
-	solarAPI   := flag.String("solar-api",   "", "Solar simapi base URL for linked mode (e.g. http://69.0.0.10:6020)")
+	port := flag.Int("port", 5022, "Modbus TCP port")
+	peak := flag.Float64("peak", 5000, "Peak net power magnitude in watts (sine mode only)")
+	apiPort := flag.Int("api-port", 6022, "HTTP API port (0 to disable)")
+	solarAPI := flag.String("solar-api", "", "Solar simapi base URL for linked mode (e.g. http://69.0.0.10:6020)")
 	batteryAPI := flag.String("battery-api", "", "Battery simapi base URL for linked mode (e.g. http://69.0.0.11:6021)")
-	evAPI      := flag.String("ev-api",      "", "EV charger simapi base URL for linked mode (e.g. http://69.0.0.14:6024)")
-	hubAPI     := flag.String("hub-api",     "", "Hub status API for EV power via OCPP (e.g. http://69.0.0.1:9100); preferred over -ev-api")
-	initLoad   := flag.Float64("load", 3000, "Initial site load in watts (linked mode); injectable via LoadW_W")
+	evAPI := flag.String("ev-api", "", "EV charger simapi base URL for linked mode (e.g. http://69.0.0.14:6024)")
+	hubAPI := flag.String("hub-api", "", "Hub status API for EV power via OCPP (e.g. http://69.0.0.1:9100); preferred over -ev-api")
+	initLoad := flag.Float64("load", 3000, "Initial site load in watts (linked mode); injectable via LoadW_W")
 	flag.Parse()
 
 	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
@@ -211,6 +211,8 @@ func main() {
 				return nil
 			},
 		)
+		// QA fault injection (invert_sign / nan_sentinel / latency / exception_code).
+		api.SetFaultFn(srv.ApplyFault)
 		// Tee logs into the API ring so the dashboard's Logs tab can stream them.
 		log.SetOutput(io.MultiWriter(os.Stderr, api.LogWriter()))
 	}

@@ -65,11 +65,12 @@ python3 scripts/mayhem.py --dashboard http://localhost:8080   # run the hostile-
 ```
 
 ## Mayhem hostile-QA
-Adversarial HIL fault-injection driving the real bench through 38 worst-case scenarios and
-diagnosing where the hub's fault handling breaks. Engine: `cmd/dashboard/mayhem.go` (`/api/qa/*`,
-dashboard QA tab); headless runner: `scripts/mayhem.py` (`--list`, `--only id,id`, `--json`).
-Verdicts: PASS / DEGRADED / FAIL / BLIND / INCONCLUSIVE. **Bench must be in FAST mode**
-(`bench-up.sh --fast`). Findings + fix log: `docs/QA_TRIAGE_20260624.md`, `docs/QA_FINDINGS.md`.
+Adversarial HIL fault-injection driving the real bench through 51 worst-case scenarios and
+diagnosing where the hub's fault handling breaks. Engine: `cmd/dashboard/mayhem.go` +
+`mayhem_world.go` (`/api/qa/*`, dashboard QA tab); headless runner: `scripts/mayhem.py`
+(`--list`, `--only id,id`, `--json`). Verdicts: PASS / DEGRADED / FAIL / BLIND / INCONCLUSIVE.
+**Bench must be in FAST mode** (`bench-up.sh --fast`). Findings + fix log:
+`docs/QA_TRIAGE_20260624.md`, `docs/QA_FINDINGS.md`; blind-spot review: `docs/QA_GAPS_20260701.md`.
 
 ## Bench replay (hardware-in-the-loop cost sim)
 Dashboard "3-Month Cost Sim" tab: synthetic 92-day sweep (browser worker) plus **Bench

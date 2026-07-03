@@ -390,7 +390,7 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		// scenario's own oracle would miss (back-feed during a disconnect, a pack
 		// past its reserve, an impossible EV draw, a stale control retained)
 		// escalates the verdict per escalateForAudit so a PASS can never hide one.
-		if audit := safetyAudit(samples); len(audit) > 0 {
+		if audit := safetyAudit(cons, samples); len(audit) > 0 {
 			f.Diagnosis = append(f.Diagnosis, "⚠ "+invSummaryLine("SAFETY AUDIT", audit))
 			if nv, hl := escalateForAudit(f.Verdict, audit); nv != f.Verdict {
 				f.Verdict = nv
@@ -1083,7 +1083,14 @@ func malformScenario(id, name, kind, hypothesis string) *mayScenario {
 		setup: func(d *mayhemDriver) (*activeConstraint, error) {
 			_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1}) // battery full → PV curtailment is the only lever
 			d.injectEnv(d.pvHighW, loadLow)
-			cons, err := d.postCap("exportCap", 0, 75, "mayhem: export cap then malformed "+kind)
+			// The BASELINE cap must stay valid through the whole 75 s observation
+			// window: this scenario tests whether the malformed resource UNSEATS a
+			// still-valid control, so the good cap must not legitimately expire
+			// mid-window and score a false FAIL (audit: malform-empty-program was a
+			// test artifact — the hub is correct to release a genuinely expired
+			// control). Post it with a duration well past HoldS + setup + the 8 s
+			// malform delay + settle. (postCap adds a further +20 s pad internally.)
+			cons, err := d.postCap("exportCap", 0, 135, "mayhem: export cap then malformed "+kind)
 			if err != nil {
 				return nil, err
 			}
@@ -2184,7 +2191,11 @@ func (d *mayhemDriver) clearAllFaults() {
 		}
 	}
 	_ = d.post("solar", "/fault", map[string]any{"kind": "bad_scale", "clear": true})
+	for _, k := range []string{"invert_sign", "nan_sentinel", "latency", "exception_code"} {
+		_ = d.post("meter", "/fault", map[string]any{"kind": k, "clear": true})
+	}
 	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
+	d.gridsimOutageClear()
 }
 
 // resetForScenario isolates each scenario from the previous one's device state.
@@ -2313,15 +2324,20 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			Category:   "Closed-loop actuation (INV-CONVERGE)",
 			Hypothesis: "A real inverter accepts the SetPoint over Modbus (ACK) but its output ramps slowly — the hub believes the limit is in force before it is.",
 			Expected:   "Detect that measured output has not reached the commanded limit and react (hold the battery, or post CannotComply) instead of trusting the write ACK.",
-			HoldS:      50,
-			Fix:        "Add measured-effect verification to derbase.ApplyControl; today it is write-only.",
+			// 90 s, not 50: the fault itself lasts 45 s, and the hub needs
+			// discovery latency + genBreachTicks of sustained measurement before
+			// it may honestly post CannotComply. At 50 s the verdict was a coin
+			// flip on discovery timing (QA 2026-07-01: 3/10 FAILs were the race,
+			// not a hub defect); 90 s judges the detection, not the stopwatch.
+			HoldS: 90,
+			Fix:   "Add measured-effect verification to derbase.ApplyControl; today it is write-only.",
 			setup: func(d *mayhemDriver) (*activeConstraint, error) {
 				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1})
 				d.injectEnv(d.pvHighW, loadLow)
 				if err := d.post("solar", "/fault", map[string]any{"kind": "ack_before_effect", "delay_s": 45}); err != nil {
 					return nil, fmt.Errorf("arm ack_before_effect: %w", err)
 				}
-				return d.postCap("genLimit", 1000, 50, "mayhem: gen limit 1 kW vs lagging inverter")
+				return d.postCap("genLimit", 1000, 90, "mayhem: gen limit 1 kW vs lagging inverter")
 			},
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
 			evaluate: diagnoseConverge,
@@ -2970,26 +2986,40 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(300, 5000) },
 			evaluate: diagnoseConstraint,
 		},
-		{
-			ID: "curtailment-release", Name: "Generation-limit event ends — solar must recover",
-			Category:   "Recovery (INV-RESTORE)",
-			Hypothesis: "A generation-limit event curtails the inverter, then expires. The hub must actively release the ceiling — the known stuck-curtailment failure leaves an inverter clamped at its last limit after the event clears.",
-			Expected:   "When the cap lifts, solar climbs back to its full potential within seconds. It must never be left clamped below potential after the event ends.",
-			HoldS:      60, // long tail so a slow ramp can be told apart from a true stuck restore
-			Fix:        "Restore must SET the ceiling to full nameplate, not emit an empty no-op (solarCommandToControl restore path). NOTE: a true device dropout (Modbus link loss) needs the sim's service stopped via SSH — out of scope for this in-process injector.",
-			setup: func(d *mayhemDriver) (*activeConstraint, error) {
-				d.injectEnv(d.pvHighW, loadLow)
-				return d.postCap("genLimit", 1500, 15, "mayhem: gen limit then release")
-			},
-			perTick: func(d *mayhemDriver, i int) {
-				d.injectEnv(d.pvHighW, loadLow)
-				if i == 15 { // event ends ~15s in, leaving ~45s to observe recovery
+		func() *mayScenario {
+			// diagnoseRecovery scenario: the program-0 default (5 kW export cap)
+			// must be suppressed so "release" means "unconstrained" — otherwise
+			// the hub's correct fallback to the default holds solar under the
+			// ≥95% bar and fakes a stuck ceiling (see suppressDefault in
+			// mayhem_world.go; QA v5 artifact).
+			var restoreDefault func()
+			return &mayScenario{
+				ID: "curtailment-release", Name: "Generation-limit event ends — solar must recover",
+				Category:   "Recovery (INV-RESTORE)",
+				Hypothesis: "A generation-limit event curtails the inverter, then expires. The hub must actively release the ceiling — the known stuck-curtailment failure leaves an inverter clamped at its last limit after the event clears.",
+				Expected:   "When the cap lifts, solar climbs back to its full potential within seconds. It must never be left clamped below potential after the event ends.",
+				HoldS:      60, // long tail so a slow ramp can be told apart from a true stuck restore
+				Fix:        "Restore must SET the ceiling to full nameplate, not emit an empty no-op (solarCommandToControl restore path). NOTE: a true device dropout (Modbus link loss) needs the sim's service stopped via SSH — out of scope for this in-process injector.",
+				setup: func(d *mayhemDriver) (*activeConstraint, error) {
+					restoreDefault = d.suppressDefault()
+					d.injectEnv(d.pvHighW, loadLow)
+					return d.postCap("genLimit", 1500, 15, "mayhem: gen limit then release")
+				},
+				perTick: func(d *mayhemDriver, i int) {
+					d.injectEnv(d.pvHighW, loadLow)
+					if i == 15 { // event ends ~15s in, leaving ~45s to observe recovery
+						d.deleteControls(0)
+					}
+				},
+				evaluate: diagnoseRecovery,
+				teardown: func(d *mayhemDriver) {
 					d.deleteControls(0)
-				}
-			},
-			evaluate: diagnoseRecovery,
-			teardown: func(d *mayhemDriver) { d.deleteControls(0) },
-		},
+					if restoreDefault != nil {
+						restoreDefault()
+					}
+				},
+			}
+		}(),
 		{
 			ID: "clock-jitter", Name: "CSIP clock corrections jitter while a cap is active",
 			Category:   "Time integrity",
@@ -3058,5 +3088,6 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 		},
 	}
 	sc = append(sc, d.mqttScenarios()...)
+	sc = append(sc, d.worldScenarios()...)
 	return sc
 }
