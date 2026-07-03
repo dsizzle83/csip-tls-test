@@ -29,6 +29,11 @@ cd ~/projects/lexa-hub && make wolfssl-arm64 && make build-arm64
    then restarts and reports `is-active` per sim.
 3. **MTR-4 lockstep**: never deploy only one side of a SunSpec register-map change —
    hub (`lexa-modbus`) and metersim must go out together or one reads garbage.
+4. **Deploy resets hub timing to STOCK** — `deploy-hub-pi.sh` copies `configs/*.json`
+   over `/etc/lexa/`, wiping FAST-mode tuning. If a Mayhem/replay session is active,
+   re-run `scripts/hub-replay-tune.sh fast 69.0.0.1 dmitri` after every hub deploy, or
+   QA verdicts silently degrade (2026-07-02: stock 15 s engine ticks turned scheduler
+   fixes into phantom FAILs).
 
 ## Verify (always, after any deploy)
 
