@@ -19,7 +19,8 @@
 #   scripts/run-conformance.sh --capture    # layers 1-4 (needs dumpcap perms)
 #
 # wolfSSL: set WOLFSSL_PREFIX to your install, or this script auto-detects
-# the common locations. Build it once with the recipe in sim_gridsim.txt.
+# the common locations. Build it once with the `wolfssl-arm64` Makefile
+# recipe in lexa-hub (see docs/BENCH.md "wolfSSL sysroots").
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -33,7 +34,7 @@ if [[ -z "$WOLFSSL_PREFIX" ]]; then
   done
 fi
 if [[ -z "$WOLFSSL_PREFIX" || ! -f "$WOLFSSL_PREFIX/include/wolfssl/options.h" ]]; then
-  echo "ERROR: wolfSSL not found. Build it (see sim_gridsim.txt STEP 1) and/or"
+  echo "ERROR: wolfSSL not found. Build it (see docs/BENCH.md \"wolfSSL sysroots\") and/or"
   echo "       set WOLFSSL_PREFIX=/path/to/wolfssl-sysroot"
   exit 1
 fi

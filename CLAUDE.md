@@ -11,7 +11,6 @@ The **test bench** for the LEXA DERMS hub. The product itself lives in
 - Web dashboard (`cmd/dashboard`, :8080) — the demo/test UI
 
 `cmd/hub` is the **obsolete** monolith predecessor of lexa-hub. Reference only — never extend it.
-`gui/sim_gui.py` (Tkinter) is **deprecated**; the web dashboard replaced it.
 
 **Lockstep rule:** `internal/southbound/sunspec` register maps are duplicated in lexa-hub
 and must change in both repos together (audit MTR-4). Deploy hub + sims in the same session.
@@ -38,7 +37,6 @@ internal/southbound/    Modbus/SunSpec stack (mirrored in lexa-hub — lockstep!
 internal/ocppserver/    OCPP 2.0.1 CSMS library (pure Go; copy exists in lexa-hub)
 tests/                  Conformance + integration test suites
 docs/                   HARNESS_REVIEW.md (audit findings), BENCH.md (live bench), pcaps
-sim_*.txt               Per-node setup guides (root level, legacy)
 ```
 
 ## Bench & ports

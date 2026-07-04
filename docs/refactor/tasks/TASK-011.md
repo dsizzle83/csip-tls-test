@@ -1,6 +1,6 @@
 # TASK-011 — Delete `gui/sim_gui.py`, root `sim_*.txt`; doc cleanup
 
-*Status: TODO · Phase: P0 · Effort: S (≈2 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-04, fb5b767) · Phase: P0 · Effort: S (≈2 h) · Difficulty: low · Risk: low*
 
 ## Objective
 The deprecated Tkinter GUI and the seven legacy per-node setup guides are deleted;
@@ -102,17 +102,37 @@ This task IS documentation change: README, CLAUDE.md, possibly BENCH.md salvage 
   restructure the skill).
 - Everything under `docs/` history.
 
+## Salvage pass results (run before deletion)
+Skimmed all seven guides against `docs/BENCH.md`, `README.md`, the run-demo skill, the
+Makefile, and (where a guide's claim was about current runtime behavior) the sim source.
+Nothing needed to move into `BENCH.md` — every guide is stale in a way that would
+misdirect rather than inform:
+
+| Guide | What it claimed | Why it's stale / already covered |
+|---|---|---|
+| `sim_hub.txt` | ConnectCore-93 dev-kit hub at `69.0.0.2`, manual SCP deploy of 4 binaries, `mosquitto` cross-compile notes | Hub moved to `69.0.0.1` (`BENCH.md`); deploy is now `lexa-hub/scripts/deploy-hub-pi.sh`; mosquitto build notes explicitly deferred to the lexa-hub repo already |
+| `sim_solar.txt`, `sim_battery.txt` | Per-Pi GitHub deploy-key bootstrap, manual `nmcli` static-IP setup (gateway `69.0.0.2`), hand-written systemd unit (`User=pi`, root unit) | Bench Pis are already provisioned and live (`BENCH.md`); current service model is **user** systemd units + linger under `dmitri@`, not root units under `pi` — the templates describe a service model the bench no longer uses; deploy is automated via `scripts/update-sim-pis.sh` |
+| `sim_meter.txt` | `-solar-api`/`-battery-api` linked-mode flags and formula `meter_W = load_W - solar_W - battery_W` | Incomplete vs. current binary: `sim/metersim/main.go` now also has `-ev-api`/`-hub-api` and documents the current formula (`meter_W = load_W + ev_W - solar_W - battery_W`) directly in the source comment — the code is the more current, more complete, self-maintaining reference |
+| `sim_ev.txt` | Session lifecycle simulated as bare `StatusNotification(Occupied)`→`StatusNotification(Available)` | Contradicts the live OCPP-1 invariant (CLAUDE.md): sessions must be `TransactionEvent` Started/Updated/Ended lifecycles. Salvaging this description would reintroduce a documented-wrong fact |
+| `sim_gridsim.txt` | wolfSSL from-source build recipe (v5.7.6-stable, autoreconf + configure flags), manual cert-chain generation via raw `openssl` commands | Build recipe already lives as the `wolfssl-arm64` Makefile target in `lexa-hub` (confirmed in TASK-002's background, same version/flags); cert generation is already automated via `scripts/gen-server-cert.sh` / `gen-client-cert.sh` + `make gen-client-cert` |
+| `sim_dashboard.txt` | Dashboard proxy routing table, GUI deprecation note | Routing table is implicit in the dashboard's own `-hub/-gridsim/-solar/...` flags and already summarized in CLAUDE.md's port map; GUI note is moot once `gui/` is gone |
+
+No unverified/unique facts were found; none were dropped silently. Two stray references not
+listed in the task's "Verified references to update" were caught by the step-5 grep sweep
+and fixed: `scripts/run-conformance.sh` lines 22 and 36 (wolfSSL build pointer), now
+pointing at `docs/BENCH.md` / the lexa-hub `wolfssl-arm64` Makefile target.
+
 ## Acceptance criteria
-- [ ] `gui/` and all seven `sim_*.txt` gone; `ls sim_*.txt` errors.
-- [ ] Step-5 grep empty (excluding historical docs).
-- [ ] README + CLAUDE.md point only to living docs; salvaged facts (if any) present in BENCH.md and listed in the PR.
-- [ ] `make test-fast` green.
+- [x] `gui/` and all seven `sim_*.txt` gone; `ls sim_*.txt` errors.
+- [x] Step-5 grep empty (excluding historical docs) — after also fixing two hits in `scripts/run-conformance.sh` not in the task's original reference list.
+- [x] README + CLAUDE.md point only to living docs; no facts needed salvaging into BENCH.md (see table above).
+- [x] `make test-fast` green.
 
 ## Regression checklist
-- [ ] `make test-fast` green
-- [ ] Conformance logic tests: unaffected
-- [ ] Mayhem: none
-- [ ] TASK-004 lockstep gate unaffected
+- [x] `make test-fast` green
+- [x] Conformance logic tests: unaffected (docs-only change; `run-conformance.sh` edit is a comment/error-string pointer, not logic)
+- [x] Mayhem: none (not run — task specifies none)
+- [x] TASK-004 lockstep gate unaffected (no `internal/southbound/sunspec` changes)
 
 ## Mayhem scenarios affected
 None.
