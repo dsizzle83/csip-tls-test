@@ -2158,6 +2158,11 @@ func (d *mayhemDriver) baseline() error {
 	}
 	d.clearAllFaults()
 	_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 50, "Conn": 1})
+	// Capture the pack into hub-controlled idle: restoreBench (end of the
+	// previous run) released it to the demo sinusoid, and the hub's deduped
+	// idle command wouldn't re-capture it for up to 60 s (see resetForScenario).
+	_ = d.post("battery", "/inject", map[string]any{"WMaxLimPct_pct": 0})
+	_ = d.post("battery", "/inject", map[string]any{"Ena": 1})
 	_ = d.post("battery", "/control", map[string]any{"cmd": "resume", "speed": 1})
 	_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
 
@@ -2211,7 +2216,15 @@ func (d *mayhemDriver) resetForScenario() {
 	_ = d.post("gridsim", "/admin/clock", map[string]any{"offset_s": 0})
 	d.clearAllFaults()
 	_ = d.post("solar", "/inject", map[string]any{"WMaxLimPct_pct": 100}) // uncurtail
-	_ = d.post("battery", "/inject", map[string]any{"WMaxLimPct_pct": 0}) // idle
+	// Idle the battery under HELD control: pct 0 alone RELEASES the pack to the
+	// free-running demo sinusoid (that is restoreBench's demo semantics), and at
+	// a cycle boundary the hub's idle command is dedupe-suppressed for up to
+	// 60 s — scenario 1 then measured a ±4 kW ghost battery it never commanded
+	// (QA v6: export-cap-full-battery INV-SOC FAIL, 50 s overshoots). The
+	// second POST must be separate: within one body, map order is unspecified
+	// and pct-0's implicit Ena-clear could land after the override.
+	_ = d.post("battery", "/inject", map[string]any{"WMaxLimPct_pct": 0})
+	_ = d.post("battery", "/inject", map[string]any{"Ena": 1}) // hold idle, don't release
 	_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
 }
 
@@ -3025,8 +3038,8 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 			Category:   "Time integrity",
 			Hypothesis: "NTP corrections step the grid server's clock by up to a minute while an export cap is active — event boundaries shift slightly under the hub.",
 			Expected:   "Keep honouring the active cap across the correction: a modest, spec-legal clock step inside the event window must not flap the control or drop enforcement.",
-			HoldS:      35,
-			Fix: "Tolerate a non-monotonic clock-offset step (cmd/hub/state.go expiryConfirmTicks). " +
+			HoldS:      45, // jitter starts at i=10 (post-adoption); 45 s samples the full 7 s offset cycle several times
+			Fix: "Tolerate a non-monotonic clock-offset step across the event window: scheduler holds a still-served, unexpired, ALREADY-ADOPTED event over both an empty resolution and the program's DefaultDERControl (clock-regression guard, both halves). " +
 				"NOTE: a wildly oscillating server clock (±hours) is OUT OF SCOPE — IEEE 2030.5 requires the client to schedule events in SERVER time, so following a non-conformant server's clock is correct, not a bug.",
 			setup: func(d *mayhemDriver) (*activeConstraint, error) {
 				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1})
@@ -3038,8 +3051,25 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 				d.injectEnv(d.pvHighW, loadLow)
 				// Realistic ±60s NTP-style jitter (within the 600s event window),
 				// not a pathological hours-long lurch (a non-conformant server).
-				off := int64((i%5 - 2) * 30)
-				_ = d.post("gridsim", "/admin/clock", map[string]any{"offset_s": off})
+				//
+				// The jitter begins only once the cap is adopted and settled
+				// (i ≥ 10) — the same discipline as clock-jump-forward's "adopted
+				// and settled; now time lurches". Jittering from i=0 straddles the
+				// event's own START boundary: at a −30/−60 s sample the event
+				// legitimately reads not-yet-started (the server clock is
+				// authoritative), the hub correctly enforces the 5 kW default,
+				// and the verdict measures an adoption race instead of the stated
+				// hypothesis (corrections during an ACTIVE cap). QA v6 C3/C4 and
+				// the 2026-07-03 spot-run failed exactly that race.
+				//
+				// The 7 s offset cycle is deliberately COPRIME with the ~5 s
+				// discovery walk period: the old 5 s cycle aliased against it, so
+				// every walk in a given run sampled the same single offset — a
+				// run tested one offset, not jitter (and which offset was luck).
+				if i >= 10 {
+					off := int64((i%7 - 3) * 20) // −60…+60 in 20 s steps, 7 s cycle
+					_ = d.post("gridsim", "/admin/clock", map[string]any{"offset_s": off})
+				}
 			},
 			evaluate: diagnoseConstraint,
 			teardown: func(d *mayhemDriver) { _ = d.post("gridsim", "/admin/clock", map[string]any{"offset_s": 0}) },
