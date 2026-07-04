@@ -1,6 +1,18 @@
 # TASK-003 — CI pipeline: csip-tls-test (build, test-fast, conformance logic)
 
-*Status: TODO · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-04, c6c8f49) · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+
+*Implementation note: `.github/workflows/ci.yml` added (pure-go + cgo-fast jobs).
+Also fixed a pre-existing `.gitignore` bug found while verifying step 6 (git status
+stays clean): the cert-fixture ignore rule pointed at a nonexistent
+`internal/tlsserver/testdata/certs/` instead of `sim/tlsserver/testdata/certs/`, which
+had let 5 generated cert files get committed. Corrected the path and untracked the 5
+files (see commit). No GitHub API credential in this environment (`gh` not installed) —
+could not open a PR or observe remote Actions runs; both jobs' exact commands were
+proven locally instead (see task's suggested PR description / final report for the
+implementing session). A human needs to open the PR from `task/003-ci-pipeline` and
+mark the two jobs as required checks on `main` once branch protection is enabled
+(TASK-001 follow-up).*
 
 ## Objective
 Every PR and push to `main` of `dsizzle83/csip-tls-test` runs GitHub Actions: build of

@@ -48,7 +48,7 @@ line is 09. 07 is the QA-specific slice of the same pipeline.
 
 | Phase | Tasks | Status | Exit campaign | Notes |
 |---|---|---|---|---|
-| P0 Foundations | 001–018 | IN PROGRESS | — | TASK-001 DONE 2026-07-04 (both repos clean/pushed, main==lexa-hub in csip-tls-test, AD-012 hosting decision recorded); branch protection on `main` NOT yet enabled in either GitHub repo — `gh`/API auth unavailable in the execution environment, see AD-012 for the exact command a human needs to run. Next: TASK-002/003 (CI, unblocked). |
+| P0 Foundations | 001–018 | IN PROGRESS | — | TASK-001 DONE 2026-07-04 (both repos clean/pushed, main==lexa-hub in csip-tls-test, AD-012 hosting decision recorded); branch protection on `main` NOT yet enabled in either GitHub repo — `gh`/API auth unavailable in the execution environment, see AD-012 for the exact command a human needs to run. TASK-003 DONE 2026-07-04 (csip-tls-test CI: `.github/workflows/ci.yml`, pure-go + cgo-fast jobs, both proven green via exact-command local reproduction — no gh auth to open a PR or watch remote Actions; also fixed a `.gitignore` cert-fixture path bug found in verification). Next: TASK-002 (lexa-hub CI, unblocked), branch protection + required checks (human, needs API credential). |
 | P1 Shared modules (R2) | 019–024, 082 | NOT STARTED | — | |
 | P2 Device Reconciler (R1) | 025–033 | NOT STARTED | — | Critical path |
 | P3 Time & persistence | 034–043 | NOT STARTED | — | |
