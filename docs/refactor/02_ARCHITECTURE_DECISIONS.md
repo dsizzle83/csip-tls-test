@@ -160,6 +160,35 @@ topics) trigger the re-request path instead of running with zero-values.
 Design in TASK-017; the desired-state document (AD-002) is the first
 new schema born versioned. Pending validation: rolling-upgrade test.
 
+**Decode-policy table (landed TASK-017: `lexa-hub/internal/bus/envelope.go`).**
+
+| Wire shape | Policy | Mechanism |
+|---|---|---|
+| `"v"` absent (indistinguishable from explicit `"v":0`, since the field is `omitempty`) | Legacy v0 — **accepted** while the transition is open | `bus.LegacyV0Accepted` (package var, default `true`) |
+| `1 ≤ v ≤ supported` | Accepted | `bus.CheckVersion` returns `nil` |
+| `v > supported` or `v < 0` | **Reject + alarm** | `bus.CheckVersion` returns `*bus.VersionError`; caller invokes `bus.RejectAndAlarm` |
+| Same-major, unrecognized fields | Ignored (additive evolution stays cheap) | `encoding/json`'s default unmarshal behavior — no extra code |
+| Malformed JSON / non-numeric `"v"` | Not `CheckVersion`'s concern — surfaces at the real `json.Unmarshal` a line later | Documented on `CheckVersion`, single-responsibility |
+| Rejected message on a **retained control-plane** topic | Hold last-known-good now (existing scheduler fail-closed discipline); active re-request is TASK-042 (P3, not yet built) | Not enforced yet — no subscriber calls `CheckVersion` until TASK-018 |
+
+Granularity is per-schema, not global: `bus.MeasurementV`, `bus.BattMetricsV`,
+`bus.ActiveControlV`, `bus.ComplianceAlertV`, `bus.BattCommandV`,
+`bus.SolarCommandV`, `bus.EVSEStateV`, `bus.EVSECommandV`,
+`bus.PricingUpdateV`, `bus.BillingUpdateV`, `bus.FlowReservationRequestV`,
+`bus.FlowReservationStatusV`, `bus.DERScheduleV`, `bus.PlanLogV` — all born
+at `1`. Rejects are counted per-topic (`bus.VersionRejects()`, atomic,
+scraped by TASK-044 once a metrics endpoint exists) and logged rate-limited
+(first occurrence + every 100th per topic) to stay inside the journald
+budget (TASK-009).
+
+TASK-017 is introduce-only: the type, constants, `CheckVersion`, and
+`RejectAndAlarm` exist and are tested, but **nothing is wired** — no
+publisher stamps `v`, no subscriber calls `CheckVersion` yet. That wiring,
+plus the `LegacyV0Accepted → false` flip once every publisher in a family is
+confirmed versioned, is TASK-018. Status stays 🔶 until TASK-018's
+rolling-upgrade test (mixed v0/v1 publishers against a v1 subscriber)
+validates the policy against real traffic.
+
 ## AD-007 🔶 Optimizer split: constraint controller over economic layer, plant model (R4)
 
 **Decision.** Priority-ordered constraint controller (safety > compliance >

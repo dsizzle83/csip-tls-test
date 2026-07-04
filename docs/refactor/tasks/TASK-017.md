@@ -1,6 +1,6 @@
 # TASK-017 — Bus message envelope: `v` field + schema-check design (shared types)
 
-*Status: TODO · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-04, lexa-hub@76a0b9d) · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
 
 ## Objective
 `internal/bus` owns a versioned-envelope convention: an `Envelope` type (`"v"` field)
@@ -145,16 +145,37 @@ decode-policy table.
 - `mqttutil` behavior (untouched in this task).
 
 ## Acceptance criteria
-- [ ] `internal/bus/envelope.go` + tests merged; `go test -race ./internal/bus/` green.
-- [ ] Zero diffs outside `internal/bus` + docs (reviewer verifies).
-- [ ] AD-006 decode-policy table filled in and consistent with the code.
-- [ ] Design-vs-consumers check (018 wiring, 025 desired-state) written in the PR.
+- [x] `internal/bus/envelope.go` + tests merged; `go test -race ./internal/bus/` green.
+- [x] Zero diffs outside `internal/bus` + docs (reviewer verifies).
+- [x] AD-006 decode-policy table filled in and consistent with the code.
+- [x] Design-vs-consumers check (018 wiring, 025 desired-state) written in the PR.
 
 ## Regression checklist
-- [ ] `go test -race ./internal/...` (lexa-hub) green
-- [ ] Conformance logic tests: unaffected
-- [ ] Mayhem: none (no runtime change)
-- [ ] `nan_test.go` untouched and green
+- [x] `go test -race ./internal/...` (lexa-hub) green
+- [x] Conformance logic tests: unaffected
+- [x] Mayhem: none (no runtime change)
+- [x] `nan_test.go` untouched and green
+
+## Design-vs-consumers check (written per step 3 of Implementation strategy)
+
+**(a) TASK-018 wiring.** `mqttutil.Subscribe[T]` (mqttutil.go) will call
+`bus.CheckVersion(topic, m.Payload(), <family>V)` before the existing
+`json.Unmarshal(m.Payload(), &v)`; on a non-nil `*bus.VersionError` it calls
+`bus.RejectAndAlarm(err)` and returns without invoking the handler (mirroring
+today's malformed-JSON log-and-drop branch). `internal/bus` imports only
+`encoding/json`, `fmt`, `log`, `sync`, `sync/atomic` — no import of
+`mqttutil` or anything importing it, so `mqttutil → bus` stays acyclic.
+Publishers gain one line: stamp `Envelope{V: bus.<Family>V}` into the
+outgoing struct before `PublishJSON`/`PublishJSONQoS`. No signature changes
+needed on either helper — `Envelope` is embedded by value, so it just adds
+fields to the marshaled struct.
+
+**(b) TASK-025 desired-state document.** The new schema embeds `Envelope`
+with its own fresh constant (e.g. `bus.DesiredStateV = 1`) exactly like every
+family above; `LegacyV0Accepted` is irrelevant to it on day one since there
+is no legacy publisher for a brand-new topic — every message it ever emits
+carries `v:1` from birth, so its subscriber can pass `supported=1` and never
+exercise the absent-`v` branch until this schema's own v2 arrives.
 
 ## Mayhem scenarios affected
 None yet. `mqtt-malformed-control` / `mqtt-stale-retained` become relevant at TASK-018.
