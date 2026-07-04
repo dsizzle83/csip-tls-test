@@ -28,11 +28,14 @@ gui/.venv/
 certs/client-staging/
 
 # Test cert fixtures (regenerable via `make gen-test-certs`)
-internal/tlsserver/testdata/certs/
+# NOTE: was "internal/tlsserver/testdata/certs/" (no such path exists — the
+# server package lives at sim/tlsserver) until TASK-003 CI work found the typo
+# had let 5 generated cert files get committed under sim/tlsserver/testdata/certs/.
+sim/tlsserver/testdata/certs/
 internal/tlsclient/testdata/certs/
 
 # Golden files DO get committed — they're part of the test suite
-!internal/tlsserver/testdata/golden/
+!sim/tlsserver/testdata/golden/
 
 # Bench replay artifacts (per-run, regenerated each replay)
 replay-checkpoint.json

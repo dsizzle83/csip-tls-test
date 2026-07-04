@@ -1,0 +1,134 @@
+name: CI
+
+# TASK-003: build every sim/dashboard binary, run the fast unit suites, the
+# southbound suites, the QA-harness unit gate, and the protocol/conformance
+# logic tests on every PR and push to main.
+#
+# Two jobs, split on the verified cgo boundary (grep -rl 'internal/wolfssl'
+# --include='*.go' .; grep -rl 'internal/tlsclient' --include='*.go' .):
+#   - pure-go:  everything that is CGO_ENABLED=0 clean. Builds every pure-Go
+#               sim/dashboard binary, vets them, and runs the southbound,
+#               QA-harness unit-gate, and ./tests/ conformance-logic suites.
+#               Verified locally (2026-07-04): `go test ./tests/` and the
+#               qa-regression unit gate need no cert fixtures — the only
+#               tests in those packages that touch testdata/certs are all
+#               `//go:build integration`-tagged and excluded by default.
+#   - cgo-fast: caches a wolfSSL 5.7.6-stable build (identical recipe to
+#               TASK-002 / sim_gridsim.txt Step 1), then runs `make
+#               test-fast` (needs the cgo sysroot even though the TLS
+#               handshake tests inside it are integration-tagged, because
+#               internal/tlsclient itself is a cgo package) and builds the
+#               three cgo binaries (sim/server, sim/client, sim/conformance).
+#
+# Explicitly OUT of scope for hosted CI (bench-touching / hardware-in-the-
+# loop): `make test-integration` (real mTLS handshakes), `scripts/run-
+# conformance.sh`, `make qa-bench`, `scripts/mayhem.py --dashboard ...`, and
+# anything addressing 69.0.0.x. If bench-in-the-loop CI is ever wanted, the
+# designated home is a self-hosted runner labelled [self-hosted, desktop]
+# (the desktop already carries the wolfSSL sysroot at ~/.local/wolfssl-amd64
+# and LAN access to the Pis) — not a hosted runner.
+#
+# cmd/hub is the obsolete monolith (see CLAUDE.md) and is deliberately not
+# built here; it is slated for deletion in TASK-010.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pure-go:
+    name: pure-go
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build sim + dashboard binaries (pure Go)
+        run: |
+          go build ./sim/modsim ./sim/batsim ./sim/metersim ./sim/evsim \
+            ./sim/modsim-client ./sim/modsim-conformance ./sim/httpsim \
+            ./cmd/dashboard ./cmd/mqttproxy
+
+      - name: Vet (pure-Go package set + southbound)
+        run: |
+          go vet ./sim/modsim ./sim/batsim ./sim/metersim ./sim/evsim \
+            ./sim/modsim-client ./sim/modsim-conformance ./sim/httpsim \
+            ./cmd/dashboard ./cmd/mqttproxy \
+            ./sim/southbound/... ./internal/southbound/...
+
+      - name: Southbound + bridge unit tests
+        run: go test ./internal/southbound/... ./internal/bridge/...
+
+      - name: QA-harness unit gate (scripts/qa-regression.sh)
+        run: bash scripts/qa-regression.sh
+
+      - name: Conformance logic tests (go test ./tests/)
+        run: go test -count=1 ./tests/
+
+  cgo-fast:
+    name: cgo-fast
+    runs-on: ubuntu-latest
+    env:
+      WOLFSSL_VERSION: "5.7.6-stable"
+      WOLFSSL_SYSROOT: /home/runner/wolfssl-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache wolfSSL ${{ env.WOLFSSL_VERSION }} sysroot
+        id: cache-wolfssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WOLFSSL_SYSROOT }}
+          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v1
+
+      - name: Install wolfSSL build toolchain
+        if: steps.cache-wolfssl.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y gcc cmake automake autoconf libtool
+
+      - name: Build + install wolfSSL ${{ env.WOLFSSL_VERSION }} (cache miss only)
+        if: steps.cache-wolfssl.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cd /tmp
+          wget -q "https://github.com/wolfSSL/wolfssl/archive/refs/tags/v${WOLFSSL_VERSION}.tar.gz" \
+            -O wolfssl.tar.gz
+          tar xzf wolfssl.tar.gz
+          cd "wolfssl-${WOLFSSL_VERSION}"
+          autoreconf -i
+          mkdir -p /tmp/wolfssl-build
+          cd /tmp/wolfssl-build
+          "/tmp/wolfssl-${WOLFSSL_VERSION}/configure" \
+            --prefix="$WOLFSSL_SYSROOT" \
+            --enable-tls13 --enable-aesccm --enable-tlsx \
+            --enable-certgen --enable-opensslall \
+            --enable-static --disable-shared \
+            --disable-examples --disable-crypttests
+          make -j"$(nproc)"
+          make install prefix="$WOLFSSL_SYSROOT"
+
+      - name: "Export cgo flags (static libwolfssl.a needs -lm: pow/log in dh.c)"
+        run: |
+          echo "CGO_CFLAGS=-I${WOLFSSL_SYSROOT}/include" >> "$GITHUB_ENV"
+          echo "CGO_LDFLAGS=-L${WOLFSSL_SYSROOT}/lib -lm" >> "$GITHUB_ENV"
+
+      - name: make test-fast (cgo compiles; TLS-handshake tests inside stay integration-tagged)
+        run: make test-fast WOLFSSL_SYSROOT="$WOLFSSL_SYSROOT"
+
+      - name: Build cgo binaries (sim/server, sim/client, sim/conformance)
+        run: go build ./sim/server ./sim/client ./sim/conformance

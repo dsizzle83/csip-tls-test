@@ -64,6 +64,12 @@ bash scripts/bench-up.sh --fast|--stock # bring desktop services up + set hub ti
 python3 scripts/mayhem.py --dashboard http://localhost:8080   # run the hostile-QA suite
 ```
 
+CI: `.github/workflows/ci.yml` — `pure-go` (builds, vet, southbound + QA-harness unit
+gate + `go test ./tests/`, all `CGO_ENABLED=0`) and `cgo-fast` (cached wolfSSL 5.7.6,
+`make test-fast` + cgo binary build) on every PR and push to `main`. Bench-touching
+suites (`make test-integration`, `scripts/run-conformance.sh`, `make qa-bench`, anything
+on 69.0.0.x) stay desktop/bench-only, out of hosted CI.
+
 ## Mayhem hostile-QA
 Adversarial HIL fault-injection driving the real bench through 51 worst-case scenarios and
 diagnosing where the hub's fault handling breaks. Engine: `cmd/dashboard/mayhem.go` +
