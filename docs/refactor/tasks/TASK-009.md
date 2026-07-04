@@ -1,6 +1,19 @@
 # TASK-009 — journald rate/size caps + flash wear budget
 
-*Status: TODO · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+*Status: DONE, code only (2026-07-04, lexa-hub@1d47e10 on
+`task/008-009-watchdogs-journald`) · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low ·
+Risk: low — all six unit files carry `LogRateLimitIntervalSec=30` +
+`LogRateLimitBurst=<per-service>`, `systemd/journald-lexa.conf` (200M cap) is created and
+wired into `deploy-hub-pi.sh`, and `docs/FLASH_BUDGET.md` documents the rate/wear math.
+The Burst values and rate table are PRE-DEPLOY ESTIMATES derived from the review's own
+background numbers and each service's documented cadence — the on-bench measurement
+(step 1), the live deploy + `journalctl --disk-usage` verification, the spam-burst
+suppression demo, and the zero-suppression check across the targeted fault scenarios
+(steps 4–5) are ALL deferred to the P0-exit gate, same as TASK-007/008's staged bench
+work (no bench deploy, no service restart this wave). Acceptance-criteria items 2–3 and
+the regression-checklist "Mayhem" and "all services is-active" rows are therefore NOT YET
+satisfied — do not merge until the deploy/measurement wave closes them and
+`FLASH_BUDGET.md`'s table is updated with real numbers.
 
 ## Objective
 Every lexa unit carries explicit journald rate caps, the hub Pi's journal has a bounded
