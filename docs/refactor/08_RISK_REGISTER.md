@@ -1,0 +1,34 @@
+# 08 — Risk Register
+
+*Living document: review at every phase boundary; add rows as risks
+surface, mark mitigated rows with the closing task/campaign. Likelihood ×
+Severity: L/M/H. "Owner" = the role accountable (single-engineer project
+today — the column keeps the discipline for when it isn't).*
+
+| ID | Risk | L | S | Mitigation | Detection | Recovery | Owner | Status |
+|---|---|---|---|---|---|---|---|---|
+| RSK-01 | Guard×guard interaction regression while migrating convergence (W2): deleting/replacing a legacy guard reopens the scenario that created it | H | H | Preservation ledger (TASK-025); shadow mode before every flip; 10-cycle campaign before deletion (032); battery first (Tier-0 net) | Mayhem FAIL-rate vs V6 baseline; named-scenario spot runs | Feature flag → `off`, restart service; git revert deletion commit | Lead | Open |
+| RSK-02 | Wrong-side merge during sunspec fork reconciliation (TASK-020) misreads real hardware, bilaterally invisible (MTR-4 class) | M | H | Hunk-by-hunk review with product as authority; conformance suites at every step; golden fixtures (075) as final referee | modsim-conformance all 3 device types; later fixture divergence | Revert module bump (both repos pin previous version) | Lead | Open |
+| RSK-03 | Optimizer split changes implicit rule-ordering semantics (W1): a conflict the cascade resolved silently resolves differently | M | H | Shadow-mode diff ≥1 week bench (059); per-constraint flips; behavioral tests first (056); STOCK+FAST 10-cycle before deletion (066) | Shadow decision-diff rate; campaign verdicts | Per-constraint config flip back; revert | Lead | Open |
+| RSK-04 | Dependency refresh (006) changes paho reconnect / TLS behavior under the exact faults that protect everything | M | M | Do it in P0, alone, before structural work; broker-restart/latency scenarios as explicit gate | Campaign + mqtt scenarios; soak 48 h | Single revert commit per repo | Lead | Open |
+| RSK-05 | Stale retained control adopted after unclean broker death (§8.3) — field power cuts are routine | M | H | issuedAt staleness bound (042); scenario 043; journal evidence (040) | GAP-01 scenario; INV-EXPIRED | Fresh walk re-adopts; documented operator runbook | Lead | Open |
+| RSK-06 | Local clock step wedges freshness/TOU (§8.4) — first NTP correction in the field | M | H | `utilitytime` monotonic policy (037); scenario (038) | GAP-04 scenario; freshness-stall metric | Service restart re-seeds; policy bounds staleness | Lead | Open |
+| RSK-07 | wolfSSL free/reconnect misorder segfaults northbound under cert-rotation churn (§8.6) | M | M | Reconnect-churn soak (073); fd-timeout paths already landed; crash-only + watchdog restart contains blast | Watchdog fire count; core dumps | systemd restart (5 s); fail-closed scheduler holds last-good | Lead | Open |
+| RSK-08 | Watchdog misconfiguration flaps healthy services (007/008) | M | M | `WatchdogSec ≥ 4×` tick; 48 h bench soak per service; stagger rollout | Restart counters in metrics | Raise interval / disable per unit | Lead | Open |
+| RSK-09 | Broker ACL misses a topic → silently dropped control path (013) | M | H | ACL file generated from `internal/bus/topics` constants; full campaign gate | Campaign; per-topic publish-failure counters | Revert to anonymous localhost config (bench) while fixing | Lead | Open |
+| RSK-10 | Bus envelope rollout (018) breaks rolling upgrade between mixed-version services | M | M | Version-tolerant decode (v absent = v0); upgrade-order documented; bench rolling-restart test | Reject-and-alarm counters | Deploy all services same session (current practice anyway) | Lead | Open |
+| RSK-11 | Single-maintainer bus factor: bench choreography, wolfSSL wrapper, deploy gotchas live in one head + memory files | H | M | P0 converts process to CI/scripts/docs; runbooks per phase; this doc set | — | — | Lead | Open |
+| RSK-12 | Campaign wall-clock (45 min–overnight) throttles the critical path; temptation to skip gates | H | M | Parallel tracks planned around gates (04 §3); nightly scheduled campaigns; never merge radioactive changes ungated | Status table in 00 | — | Lead | Open |
+| RSK-13 | New Mayhem scenarios flake → alarm fatigue → verdicts ignored | M | M | 10× solo stability rule before curation; accepted-DEGRADED ledger; never tune oracles to pass (06 §4.5) | Verdict-drift watch | Quarantine scenario, keep finding open | Lead | Open |
+| RSK-14 | Flash wear from journal + journald + mosquitto autosave kills SD/eMMC in the field (§11) | M | M | Write budget (009); batched fsync + rotation (039); wear telemetry on soak (078) | Soak trends; SMART/wear metrics | Log-level fallback; replaceable media spec for V1.0 hardware | Lead | Open |
+| RSK-15 | Vendor hardware / conformance-lab lead times slip P6 | M | M | Order/book during P2 (04 §3 Track F) | Milestone dates in 00 | Re-sequence P6 tasks; fixtures from partner labs | PM | Open |
+| RSK-16 | Sim-vs-product self-confirmation hides a codec misunderstanding through every green campaign | M | H | Golden fixtures + third-party referee (075); until then treat conformance green as necessary-not-sufficient | Fixture divergence CI | Fix in `lexa-proto`; regenerate conformance evidence | Lead | Open |
+| RSK-17 | Retained desired-state documents (AD-002) create a *new* stale-actuation channel | M | H | seq/issuedAt in schema from day one; reconciler staleness policy; GAP-01 scenario extended to desired-state topics | Reconciler staleness-reject counter | Reconciler ignores stale doc, requests refresh via hub heartbeat | Lead | Open |
+| RSK-18 | Multi-device work (065) invalidates single-EVSE/single-inverter assumptions in ways scenarios don't cover (§8.5) | M | M | Breach-list + per-device sessions designed in (P5); scenario set extended with second devices before flip | Multi-device campaign | Config: second devices removable from bench | Lead | Open |
+| RSK-19 | The roadmap itself drifts: tasks executed by smaller models diverge from intent | M | M | Task acceptance criteria + regression checklists are executable; radioactive-zone rule (05 §12); lead reviews every PR | PR review; campaign gates | Revert; re-brief task with tightened text | Lead | Open |
+
+## Review cadence
+
+- Phase boundary: walk every Open row; close with evidence links; add new.
+- After any SEV-worthy bench incident: add a row + a Mayhem scenario (the
+  existing culture, now written down).
