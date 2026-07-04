@@ -1,8 +1,7 @@
 # TASK-005 — `govulncheck` + dependency audit in CI
 
-*Status: DONE (2026-07-04, commit sha recorded in follow-up doc commit on
-`task/005-govulncheck`) · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low ·
-Risk: low*
+*Status: DONE (2026-07-04, 7449025 on `task/005-govulncheck`) · Phase: P0 ·
+Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
 
 *Implementation note: `scripts/ci/govulncheck.sh` + `scripts/ci/vuln-allowlist.txt`
 added in both repos (identical script content); new `vulncheck` job in both
