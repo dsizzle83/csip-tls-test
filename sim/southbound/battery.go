@@ -206,7 +206,7 @@ func (bs *BatteryServer) Registers() map[string]uint16 {
 // Inject overrides one or more fields.
 // Accepted keys: "W_W", "V_V", "Hz_Hz", "TmpCab_C",
 // "SoC_pct" (0–100), "SoH_pct" (0–100),
-// "WMaxLimPct_pct" (0–100), "Conn" (0 or 1), "St" (1–8), "ChaSt" (1–7).
+// "WMaxLimPct_pct" (0–100), "Ena" (0 or 1), "Conn" (0 or 1), "St" (1–8), "ChaSt" (1–7).
 func (bs *BatteryServer) Inject(body []byte) error {
 	var fields map[string]float64
 	if err := json.Unmarshal(body, &fields); err != nil {
@@ -249,6 +249,17 @@ func (bs *BatteryServer) Inject(body []byte) error {
 			} else {
 				r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 1)
 			}
+		case "Ena":
+			// Explicit enable override, applied AFTER WMaxLimPct_pct's implicit
+			// Ena handling (send it as a separate POST — map order within one
+			// body is unspecified). {"WMaxLimPct_pct": 0} then {"Ena": 1} is
+			// "hub-controlled idle": the pack holds 0 W instead of reverting to
+			// the free-running demo sinusoid. The QA harness needs that state
+			// between scenarios — its old pct-0-only reset RELEASED the pack,
+			// and at a cycle boundary the hub's deduped idle command left it
+			// free-running (±4 kW sinusoid) for up to 60 s into scenario 1
+			// (QA 2026-07-03 v6: export-cap-full-battery INV-SOC FAIL).
+			r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, uint16(val))
 		case "Conn":
 			r.Set(b.M123Base+sunspec.M123_Conn, uint16(val))
 		case "St":
