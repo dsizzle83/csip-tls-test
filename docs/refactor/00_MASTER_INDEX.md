@@ -48,7 +48,7 @@ line is 09. 07 is the QA-specific slice of the same pipeline.
 
 | Phase | Tasks | Status | Exit campaign | Notes |
 |---|---|---|---|---|
-| P0 Foundations | 001–018 | IN PROGRESS | — | Done: 001, 002, 003, 011, 016 (2026-07-04; details in each task file's status header). Open: branch protection + required checks on both repos (human, needs GitHub credential — see AD-012); TASK-016 bench validation at wave gate. |
+| P0 Foundations | 001–018 | IN PROGRESS | — | Done: 001, 002, 003, 005, 011, 016 (2026-07-04; details in each task file's status header). TASK-005: govulncheck baseline landed both repos, non-blocking — 0 reachable findings (csip-tls-test), 2 reachable findings in lexa-hub (paho GO-2025-4173, x/net GO-2025-3503, both TASK-006 worklist) — see `docs/refactor/VULN_BASELINE_2026-07-04.md`. Open: branch protection + required checks on both repos (human, needs GitHub credential — see AD-012); TASK-016 bench validation at wave gate; TASK-006 (dependency refresh) to clear the vuln baseline and flip `vulncheck` to required. |
 | P1 Shared modules (R2) | 019–024, 082 | NOT STARTED | — | |
 | P2 Device Reconciler (R1) | 025–033 | NOT STARTED | — | Critical path |
 | P3 Time & persistence | 034–043 | NOT STARTED | — | |

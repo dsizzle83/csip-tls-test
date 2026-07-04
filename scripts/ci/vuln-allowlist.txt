@@ -1,0 +1,19 @@
+# govulncheck triage allowlist (TASK-005).
+#
+# One entry per accepted finding, format:
+#   GO-YYYY-NNNN  <one-line reason>  <date>  <owner>
+#
+# Lines starting with '#' and blank lines are ignored. Only reachable
+# findings (finding.trace has a frame with "function") are checked against
+# this file — see scripts/ci/govulncheck.sh for the reachability rule.
+#
+# Do NOT add an entry here just because TASK-006 (dependency refresh) will
+# fix it — that hides the refresh's motivation. This file is for findings
+# that are reachable AND genuinely stuck (no upstream fix, vendored/forked
+# code, accepted risk with sign-off) — see docs/refactor/VULN_BASELINE_*.md.
+#
+# Baseline scan 2026-07-04: 0 reachable findings in this repo. Nothing
+# allowlisted. See docs/refactor/VULN_BASELINE_2026-07-04.md for the full
+# triage (47 module-required-only / non-reachable findings, all clustered in
+# the ancient golang.org/x/crypto, golang.org/x/net, golang.org/x/sys pulled
+# in transitively — TASK-006 worklist, not this file).

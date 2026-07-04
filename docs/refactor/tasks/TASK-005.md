@@ -1,6 +1,20 @@
 # TASK-005 — `govulncheck` + dependency audit in CI
 
-*Status: TODO · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-04, commit sha recorded in follow-up doc commit on
+`task/005-govulncheck`) · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low ·
+Risk: low*
+
+*Implementation note: `scripts/ci/govulncheck.sh` + `scripts/ci/vuln-allowlist.txt`
+added in both repos (identical script content); new `vulncheck` job in both
+`.github/workflows/ci.yml` (`continue-on-error: true`, nightly `cron: '17 4 * * *'`
+added to `on:`, other jobs guarded `if: github.event_name != 'schedule'` so the
+nightly run doesn't duplicate the full build/test matrix). Baseline scan
+(govulncheck v1.5.0, pinned): csip-tls-test 0 reachable / 47 module-required-only
+findings; lexa-hub 2 reachable (`GO-2025-4173` paho, `GO-2025-3503` x/net, both
+via `internal/mqttutil`/`cmd/northbound`) / 42 module-required-only. Neither
+allowlisted — both reachable findings are TASK-006 worklist items (dependency
+refresh clears them); allowlists in both repos are comment-only/empty. Full
+disposition: `docs/refactor/VULN_BASELINE_2026-07-04.md`.*
 
 ## Objective
 Both repos run a pinned `govulncheck` in CI on every PR plus a nightly schedule, with a
