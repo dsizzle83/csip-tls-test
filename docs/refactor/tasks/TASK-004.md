@@ -1,6 +1,20 @@
 # TASK-004 — CI lockstep-divergence gate (shared-package diff)
 
-*Status: TODO · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-04, sha TBD on `task/004-lockstep-gate`) · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+
+**Landing note (2026-07-04):** implemented and self-tested exactly as specified — script,
+allowlist, CI job, both CLAUDE.md lines. Two sub-steps could NOT be completed in this
+execution environment and need a human with GitHub auth (same blocker as AD-012 branch
+protection):
+- Step 4 (create the fine-grained PAT, store as `LEXA_HUB_RO_TOKEN`): no `gh` CLI login or
+  API token is available here (SSH deploy-key auth only, does not cover the REST/GraphQL
+  API) — the workflow job is wired to consume `secrets.LEXA_HUB_RO_TOKEN` and will fail
+  confusingly on the lexa-hub checkout step until the secret exists.
+- Step 6 ("mark the job required on `main`"): branch protection requires the same missing
+  auth. The job is added to the workflow and will run on every PR once the PAT exists;
+  making it a *required* status check needs the human step described in AD-012.
+Everything else (script logic, allowlist content, local self-tests, docs) is done and
+verified; see the Test evidence in the final report for this task.
 
 ## Objective
 A script (`scripts/ci/lockstep-check.sh` in csip-tls-test) diffs the duplicated protocol

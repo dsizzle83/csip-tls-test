@@ -10,8 +10,11 @@ The **test bench** for the LEXA DERMS hub. The product itself lives in
 - CSIP + Modbus conformance suites
 - Web dashboard (`cmd/dashboard`, :8080) — the demo/test UI
 
-**Lockstep rule:** `internal/southbound/sunspec` register maps are duplicated in lexa-hub
-and must change in both repos together (audit MTR-4). Deploy hub + sims in the same session.
+**Lockstep rule:** `internal/southbound/sunspec` register maps and `internal/ocppserver`
+are duplicated in lexa-hub and must change in both repos together (audit MTR-4). Deploy
+hub + sims in the same session. Enforced by `scripts/ci/lockstep-check.sh` in
+csip-tls-test CI (TASK-004) — report-only until Phase 1 replaces the duplication with a
+shared module (AD-003/TASK-024).
 
 ## Stack
 Go 1.21 · wolfSSL cgo (`internal/wolfssl` only) · lorenzodonini/ocpp-go · simonvetter/modbus · grandcat/zeroconf
