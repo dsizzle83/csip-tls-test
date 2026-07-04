@@ -1,6 +1,16 @@
 # TASK-016 — QoS doc/code alignment (D5): per-topic QoS policy
 
-*Status: TODO · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-04, lexa-hub@ac673ac) · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+
+**Completion note:** `bus.PubQoS` + `mqttutil.PublishJSONQoS` landed on
+`lexa-hub` branch `task/016-qos-policy` (commit `ac673ac`); the three
+verified sites (measurement, battery metrics, EVSE state) flipped to QoS 0,
+control plane untouched. `go test -race ./internal/...` green. Per the
+Principal's wave-gate batching instruction, the Mayhem campaign
+(`mqtt-broker-latency,mqtt-broker-restart,stale-meter,ev-meter-freeze`) was
+**not** run in this session — it is batched into the post-merge wave-gate
+campaign; not yet executed as of this note. Not deployed to the bench (code +
+unit tests only this wave).
 
 ## Objective
 Publish QoS is a per-topic policy owned next to the topic constants and matched to the
