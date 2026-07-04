@@ -48,7 +48,7 @@ line is 09. 07 is the QA-specific slice of the same pipeline.
 
 | Phase | Tasks | Status | Exit campaign | Notes |
 |---|---|---|---|---|
-| P0 Foundations | 001–018 | IN PROGRESS | — | TASK-001 DONE 2026-07-04 (both repos clean/pushed, main==lexa-hub in csip-tls-test, AD-012 hosting decision recorded); branch protection on `main` NOT yet enabled in either GitHub repo — `gh`/API auth unavailable in the execution environment, see AD-012 for the exact command a human needs to run. Next: TASK-002/003 (CI, unblocked). |
+| P0 Foundations | 001–018 | IN PROGRESS | — | TASK-001 DONE 2026-07-04 (both repos clean/pushed, main==lexa-hub in csip-tls-test, AD-012 hosting decision recorded); branch protection on `main` NOT yet enabled in either GitHub repo — `gh`/API auth unavailable in the execution environment, see AD-012 for the exact command a human needs to run. TASK-011 DONE 2026-07-04 (`gui/sim_gui.py` + seven root `sim_*.txt` deleted, no facts needed salvaging to BENCH.md — all superseded by BENCH.md/run-demo skill/automation scripts/self-documenting code; two stray `sim_gridsim.txt` references also found and fixed in `scripts/run-conformance.sh`). Next: TASK-002/003 (CI, unblocked). |
 | P1 Shared modules (R2) | 019–024, 082 | NOT STARTED | — | |
 | P2 Device Reconciler (R1) | 025–033 | NOT STARTED | — | Critical path |
 | P3 Time & persistence | 034–043 | NOT STARTED | — | |

@@ -56,7 +56,9 @@ Device roles:
 The hub uses wolfSSL via cgo and **must be built natively on the Pi** (arm64 headers required).
 
 ```bash
-# Install wolfSSL first — see sim_hub.txt STEP 2 for the full build recipe.
+# Install wolfSSL first — the Makefile auto-wires a local sysroot when present
+# (see docs/BENCH.md "wolfSSL sysroots"); build one from source with the
+# `wolfssl-arm64` target in lexa-hub's Makefile if none exists yet.
 
 CGO_ENABLED=1 go build -o bin/hub ./cmd/hub
 ```
@@ -98,7 +100,8 @@ sudo systemctl start hub
 journalctl -u hub -f
 ```
 
-See `sim_hub.txt` for the full systemd unit file.
+Unit files live in `lexa-hub/systemd/`; deploy and enable them with
+`lexa-hub/scripts/deploy-hub-pi.sh`.
 
 ## Certificates
 
@@ -128,15 +131,12 @@ All Pis connect via Ethernet to a dedicated switch on `69.0.0.x/24`. WiFi is a s
 | meter-pi   | 69.0.0.12 | metersim | 5022        |
 | ev-pi      | 69.0.0.14 | evsim    | → hub:8887  |
 
-## Simulator Setup Guides
+## Simulator Setup & Deployment
 
-Each simulator Pi has its own step-by-step deployment guide:
-
-- `sim_hub.txt` — Hub Pi (wolfSSL, certs, hub.json, systemd)
-- `sim_solar.txt` — Solar PV inverter (modsim)
-- `sim_battery.txt` — Battery storage (batsim)
-- `sim_meter.txt` — Bi-directional smart meter (metersim)
-- `sim_ev.txt` — EV charger (evsim, OCPP 2.0.1)
+Live topology, ports, and deploy commands: `docs/BENCH.md`. Bringing the whole
+demo up (or recovering it post-reboot): the `run-demo` skill
+(`.claude/skills/run-demo/SKILL.md`). Pushing hub code: `lexa-hub`'s
+`scripts/deploy-hub-pi.sh`; pushing sim code: `scripts/update-sim-pis.sh`.
 
 ## Development
 
