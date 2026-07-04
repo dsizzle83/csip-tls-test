@@ -1,6 +1,27 @@
 # TASK-002 — CI pipeline: lexa-hub (build, vet, `-race` tests)
 
-*Status: TODO · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: DONE, partial (2026-07-04, 8a183c6 on `task/002-ci-pipeline`) —
+required-checks registration + PR blocked on missing GitHub credential,
+see notes · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+
+**Completion notes (2026-07-04):** `.github/workflows/ci.yml` created
+(3 jobs split on the verified cgo boundary), `make test-nocgo` added,
+CLAUDE.md Build note added. Branch `task/002-ci-pipeline` pushed to
+origin; **not merged** — Principal reviews/merges. Validated live on
+hosted Actions via a temporary `task/**` push trigger (reverted in
+`8a183c6`): run 28722650437 (`8861ec5`) all 3 jobs green cold-cache
+(vet-build-test 57 s, cgo 84 s incl. wolfSSL source build, cross 29 s);
+run 28722700755 (`a231828`, deliberate failing test) red on
+vet-build-test only, as designed; run 28722742942 (`4a185de`, revert)
+all green warm-cache (cgo 38 s — wolfSSL build skipped on cache hit).
+Local regression: `make test`, `make test-nocgo`, `make build`,
+`make build-arm64` all green on the desktop. **Not completed (no
+`gh`/API credential in the execution environment — same wall as
+TASK-001):** opening the first PR (step 6) and marking the three checks
+required in branch protection (step 7, final acceptance criterion).
+Human follow-up: enable branch protection on `main` requiring status
+checks `vet-build-test`, `cgo`, `cross` (names match job ids), then open
+the PR from `task/002-ci-pipeline`.
 
 ## Objective
 Every PR and every push to `main` of `dsizzle83/lexa-hub` runs a GitHub Actions pipeline:
