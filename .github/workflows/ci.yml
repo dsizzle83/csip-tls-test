@@ -30,11 +30,22 @@ name: CI
 #
 # cmd/hub (the obsolete monolith) and its forked orchestrator/bridge were
 # deleted in TASK-010; the hub build lives in ~/projects/lexa-hub.
+#
+# TASK-005: `vulncheck` job runs a pinned govulncheck (scripts/ci/govulncheck.sh)
+# on every PR/push AND nightly (new CVEs land without a code change). It reuses
+# the cgo-fast job's wolfSSL cache/build steps — govulncheck needs the whole
+# module to *build* (cgo packages included) or it silently scans less than you
+# think. Currently `continue-on-error: true` (non-blocking) until TASK-006
+# lands the dependency refresh the first baseline scan calls for; see
+# docs/refactor/VULN_BASELINE_2026-07-04.md and TASK-006's worklist.
+# TODO(TASK-006): once merged, drop continue-on-error and make this required.
 
 on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '17 4 * * *' # nightly vuln scan (UTC); see `vulncheck` job below
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -44,6 +55,7 @@ jobs:
   pure-go:
     name: pure-go
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     env:
       CGO_ENABLED: "0"
     steps:
@@ -79,6 +91,7 @@ jobs:
   cgo-fast:
     name: cgo-fast
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     env:
       WOLFSSL_VERSION: "5.7.6-stable"
       WOLFSSL_SYSROOT: /home/runner/wolfssl-amd64
@@ -132,3 +145,69 @@ jobs:
 
       - name: Build cgo binaries (sim/server, sim/client, sim/conformance)
         run: go build ./sim/server ./sim/client ./sim/conformance
+
+  # TASK-005: pinned govulncheck (scripts/ci/govulncheck.sh) + triage
+  # allowlist (scripts/ci/vuln-allowlist.txt). Reuses the cgo-fast wolfSSL
+  # cache/build steps — govulncheck must build the whole module (cgo
+  # packages included) or it silently scans a shrunken package set. Gates
+  # only on REACHABLE findings (real call path, not merely imported or
+  # transitively required); everything else is informational. Runs on PR,
+  # push:main, and the nightly cron (new CVEs land with no code change).
+  # non-blocking (continue-on-error) until TASK-006's dependency refresh
+  # clears the baseline — see docs/refactor/VULN_BASELINE_2026-07-04.md.
+  vulncheck:
+    name: vulncheck
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      WOLFSSL_VERSION: "5.7.6-stable"
+      WOLFSSL_SYSROOT: /home/runner/wolfssl-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache wolfSSL ${{ env.WOLFSSL_VERSION }} sysroot
+        id: cache-wolfssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WOLFSSL_SYSROOT }}
+          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v1
+
+      - name: Install wolfSSL build toolchain
+        if: steps.cache-wolfssl.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y gcc cmake automake autoconf libtool
+
+      - name: Build + install wolfSSL ${{ env.WOLFSSL_VERSION }} (cache miss only)
+        if: steps.cache-wolfssl.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cd /tmp
+          wget -q "https://github.com/wolfSSL/wolfssl/archive/refs/tags/v${WOLFSSL_VERSION}.tar.gz" \
+            -O wolfssl.tar.gz
+          tar xzf wolfssl.tar.gz
+          cd "wolfssl-${WOLFSSL_VERSION}"
+          autoreconf -i
+          mkdir -p /tmp/wolfssl-build
+          cd /tmp/wolfssl-build
+          "/tmp/wolfssl-${WOLFSSL_VERSION}/configure" \
+            --prefix="$WOLFSSL_SYSROOT" \
+            --enable-tls13 --enable-aesccm --enable-tlsx \
+            --enable-certgen --enable-opensslall \
+            --enable-static --disable-shared \
+            --disable-examples --disable-crypttests
+          make -j"$(nproc)"
+          make install prefix="$WOLFSSL_SYSROOT"
+
+      - name: "Export cgo flags (static libwolfssl.a needs -lm: pow/log in dh.c)"
+        run: |
+          echo "CGO_CFLAGS=-I${WOLFSSL_SYSROOT}/include" >> "$GITHUB_ENV"
+          echo "CGO_LDFLAGS=-L${WOLFSSL_SYSROOT}/lib -lm" >> "$GITHUB_ENV"
+
+      - name: govulncheck (pinned, reachable-findings gate)
+        run: |
+          set -o pipefail
+          bash scripts/ci/govulncheck.sh 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
