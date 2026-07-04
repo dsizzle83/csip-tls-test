@@ -1,6 +1,14 @@
 # TASK-007 — systemd `WatchdogSec` + `sd_notify` for lexa-hub
 
-*Status: TODO · Phase: P0 · Effort: M (≈4–6 h + 48 h soak) · Difficulty: med · Risk: med*
+*Status: DONE, code only (2026-07-04, lexa-hub@1eced54 on `task/007-watchdog-hub`) —
+arm64 build/deploy, the `kill -STOP` wedge test, targeted Mayhem
+(`mqtt-broker-restart,mqtt-broker-latency,hub-restart-mid-cap`), and the 48 h bench
+soak are deferred to the wave-gate deploy agent per this session's launch
+instructions (code + unit files + tests only this wave; no bench deploy, no service
+restart). Acceptance-criteria items 1–4 (`systemctl show`, wedge restart, targeted
+Mayhem, 48 h soak) and the regression-checklist "Mayhem" and "48 h soak" rows are
+therefore NOT YET satisfied — do not merge until the deploy/soak wave closes them.
+· Phase: P0 · Effort: M (≈4–6 h + 48 h soak) · Difficulty: med · Risk: med*
 
 ## Objective
 A live-but-wedged `lexa-hub` (deadlocked tick loop, stalled paho publish, hung state
