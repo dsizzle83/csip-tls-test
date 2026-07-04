@@ -1,6 +1,6 @@
 # TASK-004 — CI lockstep-divergence gate (shared-package diff)
 
-*Status: DONE (2026-07-04, sha TBD on `task/004-lockstep-gate`) · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-04, 679e894 on `task/004-lockstep-gate`) · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
 
 **Landing note (2026-07-04):** implemented and self-tested exactly as specified — script,
 allowlist, CI job, both CLAUDE.md lines. Two sub-steps could NOT be completed in this
