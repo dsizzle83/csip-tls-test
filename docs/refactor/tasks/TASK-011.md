@@ -1,6 +1,6 @@
 # TASK-011 — Delete `gui/sim_gui.py`, root `sim_*.txt`; doc cleanup
 
-*Status: DONE (2026-07-04, pending commit on `task/011-delete-legacy-gui-docs`) · Phase: P0 · Effort: S (≈2 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-04, fb5b767) · Phase: P0 · Effort: S (≈2 h) · Difficulty: low · Risk: low*
 
 ## Objective
 The deprecated Tkinter GUI and the seven legacy per-node setup guides are deleted;
