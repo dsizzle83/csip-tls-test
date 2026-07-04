@@ -1,6 +1,6 @@
 # TASK-003 — CI pipeline: csip-tls-test (build, test-fast, conformance logic)
 
-*Status: DONE (2026-07-04, pending-commit-sha) · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-04, c6c8f49) · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
 
 *Implementation note: `.github/workflows/ci.yml` added (pure-go + cgo-fast jobs).
 Also fixed a pre-existing `.gitignore` bug found while verifying step 6 (git status
