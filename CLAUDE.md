@@ -10,8 +10,6 @@ The **test bench** for the LEXA DERMS hub. The product itself lives in
 - CSIP + Modbus conformance suites
 - Web dashboard (`cmd/dashboard`, :8080) — the demo/test UI
 
-`cmd/hub` is the **obsolete** monolith predecessor of lexa-hub. Reference only — never extend it.
-
 **Lockstep rule:** `internal/southbound/sunspec` register maps are duplicated in lexa-hub
 and must change in both repos together (audit MTR-4). Deploy hub + sims in the same session.
 

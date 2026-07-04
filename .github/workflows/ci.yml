@@ -28,8 +28,8 @@ name: CI
 # (the desktop already carries the wolfSSL sysroot at ~/.local/wolfssl-amd64
 # and LAN access to the Pis) — not a hosted runner.
 #
-# cmd/hub is the obsolete monolith (see CLAUDE.md) and is deliberately not
-# built here; it is slated for deletion in TASK-010.
+# cmd/hub (the obsolete monolith) and its forked orchestrator/bridge were
+# deleted in TASK-010; the hub build lives in ~/projects/lexa-hub.
 
 on:
   pull_request:
@@ -67,8 +67,8 @@ jobs:
             ./cmd/dashboard ./cmd/mqttproxy \
             ./sim/southbound/... ./internal/southbound/...
 
-      - name: Southbound + bridge unit tests
-        run: go test ./internal/southbound/... ./internal/bridge/...
+      - name: Southbound unit tests
+        run: go test ./internal/southbound/...
 
       - name: QA-harness unit gate (scripts/qa-regression.sh)
         run: bash scripts/qa-regression.sh

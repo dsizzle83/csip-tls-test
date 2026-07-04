@@ -1,6 +1,6 @@
-.PHONY: all build build-server build-client build-conformance build-modsim build-hub \
+.PHONY: all build build-server build-client build-conformance build-modsim \
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
-        deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi sync-hub-pi \
+        deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
         test test-fast test-integration test-update-golden test-southbound qa qa-bench \
         modsim-image modsim-run modsim-stop \
@@ -63,12 +63,6 @@ build-httpsim:
 build-dashboard:
 	@mkdir -p bin
 	go build -o bin/dashboard ./cmd/dashboard
-
-# Hub uses wolfSSL (cgo) — must be built natively on Pi.
-# Use sync-hub-pi to sync and build on the Pi in one step.
-build-hub:
-	@mkdir -p bin
-	go build -o bin/hub ./cmd/hub
 
 # Cross-compile the Modbus diagnostic client for the Pi (linux/arm64).
 # No cgo — southbound packages are pure Go.
@@ -168,37 +162,17 @@ sync-pi:
 	    go build -o bin/conformance ./sim/conformance"
 	@echo "Source synced; client and conformance runner built on Pi at $(PI_DIR)/bin/"
 
-# Sync source to Pi and build the hub binary natively (wolfSSL requires native arm64 build).
-# Deprecated in favour of pi-hub (git pull workflow).
-sync-hub-pi:
-	rsync -a --delete \
-	    --exclude=bin/ --exclude='*-key.pem' --exclude='.git/' \
-	    ./ $(PI_HOST):$(PI_DIR)/
-	ssh $(PI_HOST) "mkdir -p $(PI_DIR)/bin && cd $(PI_DIR) && \
-	    go build -o bin/hub ./cmd/hub"
-	@echo "Hub built on Pi at $(PI_DIR)/bin/hub"
-	@echo "Run: $(PI_DIR)/bin/hub -config $(PI_DIR)/hub.json"
-
 # ── Git-based Pi build workflow ─────────────────────────────────────────────
 # Push from WSL with `git push`, then use these targets to pull and build on
 # the Pi over SSH. No rsync needed.
 
-# Pull latest from git and build just the hub binary on the Pi.
-pi-hub:
-	ssh $(PI_HOST) "cd $(PI_DIR) && git pull && mkdir -p bin && go build -o bin/hub ./cmd/hub"
-	@echo "hub built on $(PI_HOST):$(PI_DIR)/bin/hub"
-
-# Pull latest from git and build all Pi binaries (hub + client + conformance).
+# Pull latest from git and build the Pi binaries (client + conformance).
+# The hub binary lives in ~/projects/lexa-hub — see that repo's Makefile.
 pi-build:
 	ssh $(PI_HOST) "cd $(PI_DIR) && git pull && mkdir -p bin && \
-	    go build -o bin/hub ./cmd/hub && \
 	    go build -o bin/client ./sim/client && \
 	    go build -o bin/conformance ./sim/conformance"
 	@echo "All Pi binaries built on $(PI_HOST):$(PI_DIR)/bin/"
-
-# Run the hub on the Pi (assumes bin/hub already built and hub.json present).
-pi-run:
-	ssh -t $(PI_HOST) "cd $(PI_DIR) && ./bin/hub -config hub.json"
 
 # Run the CSIP conformance suite on the Pi against the WSL server.
 # Prerequisites:
@@ -274,7 +248,7 @@ qa-bench:
 # Southbound unit + integration tests (no hardware required; uses in-process Modbus server).
 # Includes the in-process Modbus conformance suite (TestModbusConformance_*).
 test-southbound:
-	go test ./internal/southbound/... ./internal/bridge/...
+	go test ./internal/southbound/...
 	go test ./tests/ -run TestModbusConformance -v
 
 # Full integration tests with real TLS handshakes. Requires fixtures.
@@ -337,11 +311,9 @@ help:
 	@echo "  make build               Build client + server (amd64/WSL)"
 	@echo "  make build-server        Build only the server binary"
 	@echo "  make build-client        Build only the client binary"
-	@echo "  make build-hub           Build hub binary locally (requires wolfSSL)"
-	@echo "  make pi-hub              git pull + build hub on Pi (preferred workflow)"
-	@echo "  make pi-build            git pull + build all Pi binaries on Pi"
-	@echo "  make pi-run              Run hub on Pi via SSH (hub.json must exist)"
+	@echo "  make pi-build            git pull + build client/conformance on Pi"
 	@echo "  make sync-pi             (legacy) rsync source to Pi; build client + conformance"
+	@echo "  (hub binary lives in ~/projects/lexa-hub — see that repo's Makefile)"
 	@echo ""
 	@echo "Test:"
 	@echo "  make test                Run all tests (unit + integration)"

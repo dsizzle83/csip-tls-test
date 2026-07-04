@@ -1,21 +1,26 @@
-# CSIP DER Hub
+# CSIP Simulation & Conformance Harness
 
-A DERMS hub that implements IEEE 2030.5 / CSIP for residential DER management. It connects northbound to a utility grid management server over wolfSSL mTLS and controls DER assets southbound over Modbus/SunSpec and OCPP 2.0.1.
+The **test bench** for the LEXA DERMS hub. The hub product itself — the IEEE 2030.5 /
+CSIP DERMS implementation that connects northbound to a utility grid management server
+over wolfSSL mTLS and controls DER assets southbound over Modbus/SunSpec and OCPP 2.0.1 —
+lives in `~/projects/lexa-hub` (separate repo). This repo provides the CSIP grid server
+simulator, the SunSpec device simulators, the OCPP EV charger simulator, the conformance
+suites, and the web dashboard used to demo and test the hub.
 
-Target hardware: Raspberry Pi 4/5 (development), NXP i.MX 93 (production).
+Target hardware for the hub: Raspberry Pi 4/5 (development), NXP i.MX 93 (production).
 
 ## Architecture
 
 ```
-Utility Grid Server (IEEE 2030.5)
+Utility Grid Server (IEEE 2030.5)          ← this repo: sim/gridsim
         │  wolfSSL mTLS (ECDHE-ECDSA-AES128-CCM-8 / TLS 1.2)
         ▼
-   [ Hub Pi — cmd/hub ]
+   [ Hub Pi — lexa-hub ]                   ← ~/projects/lexa-hub
         │
-        ├── Modbus TCP ──► Solar inverter   (SunSpec M103/121/123)
-        ├── Modbus TCP ──► Battery storage  (SunSpec M103/802)
-        ├── Modbus TCP ──► Smart meter      (SunSpec M201, bi-directional)
-        └── OCPP 2.0.1 ◄── EV charger       (station connects inbound)
+        ├── Modbus TCP ──► Solar inverter   (SunSpec M103/121/123)  ← sim/modsim
+        ├── Modbus TCP ──► Battery storage  (SunSpec M103/802)      ← sim/batsim
+        ├── Modbus TCP ──► Smart meter      (SunSpec M201, bi-directional) ← sim/metersim
+        └── OCPP 2.0.1 ◄── EV charger       (station connects inbound)     ← sim/evsim
 ```
 
 Home load is inferred from the energy balance — no separate load meter needed:
@@ -23,94 +28,21 @@ Home load is inferred from the energy balance — no separate load meter needed:
 load_W = solar_W + battery_W - meter_W
 ```
 
-## Hub Configuration
+## The Hub (product repo)
 
-The hub reads a JSON config file (see `hub-example.json`):
-
-```json
-{
-  "server":      "<grid-server-ip>:11111",
-  "ca_cert":     "certs/ca-cert.pem",
-  "client_cert": "certs/client-cert.pem",
-  "client_key":  "certs/client-key.pem",
-  "ocpp_port":   8887,
-  "devices": [
-    { "name": "solar-1",   "url": "tcp://69.0.0.10:5020", "unit_id": 1, "role": "inverter" },
-    { "name": "battery-1", "url": "tcp://69.0.0.11:5021", "unit_id": 1, "role": "battery"  },
-    { "name": "meter",     "url": "tcp://69.0.0.12:5022", "unit_id": 1, "role": "meter"    }
-  ]
-}
-```
-
-Device roles:
-
-| Role       | Protocol           | SunSpec models   |
-|------------|--------------------|------------------|
-| `inverter` | Modbus TCP         | M103, M121, M123 |
-| `battery`  | Modbus TCP         | M103, M802       |
-| `meter`    | Modbus TCP         | M201             |
-| EV charger | OCPP 2.0.1 inbound | —                |
-
-## Building the Hub
-
-The hub uses wolfSSL via cgo and **must be built natively on the Pi** (arm64 headers required).
-
-```bash
-# Install wolfSSL first — the Makefile auto-wires a local sysroot when present
-# (see docs/BENCH.md "wolfSSL sysroots"); build one from source with the
-# `wolfssl-arm64` target in lexa-hub's Makefile if none exists yet.
-
-CGO_ENABLED=1 go build -o bin/hub ./cmd/hub
-```
-
-To push a code update from your development machine and rebuild on the Pi:
-
-```bash
-# On your dev machine
-git push
-
-# On the hub Pi
-cd ~/csip-tls-test && git pull
-CGO_ENABLED=1 go build -o bin/hub ./cmd/hub
-```
-
-## Running the Hub
-
-```bash
-./bin/hub -config hub.json
-```
-
-Expected startup log:
-
-```
-[wolfssl] init OK
-[hub] loading config: hub.json
-[modbus] connected: solar-1   tcp://69.0.0.10:5020
-[modbus] connected: battery-1 tcp://69.0.0.11:5021
-[modbus] connected: meter     tcp://69.0.0.12:5022
-[ocpp] CSMS listening on :8887/ocpp/{id}
-[csip] walker started → <grid-server-ip>:11111
-```
-
-## Running as a System Service
-
-```bash
-sudo systemctl enable hub
-sudo systemctl start hub
-journalctl -u hub -f
-```
-
-Unit files live in `lexa-hub/systemd/`; deploy and enable them with
-`lexa-hub/scripts/deploy-hub-pi.sh`.
+Hub configuration, build, run, and systemd-service instructions live in
+`~/projects/lexa-hub`'s own README. That repo also owns `hub-example.json`,
+the device-role config schema, and the `onCSIPControl`/orchestrator logic.
+Pushing hub code: `lexa-hub`'s `scripts/deploy-hub-pi.sh` (see below).
 
 ## Certificates
 
-The hub requires three files for mTLS:
+mTLS (grid server ↔ hub, and this repo's conformance clients) requires three files:
 
 | File                    | Purpose                                   |
 |-------------------------|-------------------------------------------|
 | `certs/ca-cert.pem`     | CA that signed the server cert            |
-| `certs/client-cert.pem` | This hub's identity (tracked in git)      |
+| `certs/client-cert.pem` | Client identity (tracked in git)          |
 | `certs/client-key.pem`  | Private key (gitignored — copy manually)  |
 
 Issue a new client certificate:

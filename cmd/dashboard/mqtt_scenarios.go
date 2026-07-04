@@ -87,7 +87,7 @@ func (d *mayhemDriver) mqttScenarios() []*mayScenario {
 			Hypothesis: "A truncated/garbage JSON payload is published RETAINED to lexa/csip/control (a half-written message, a buggy publisher) while a real cap is active.",
 			Expected:   "Stay up and keep the active cap: a malformed bus message must be dropped, never crash the hub or unseat a safe control.",
 			HoldS:      70,
-			Fix:        "Hub MQTT handlers must reject a payload that fails to unmarshal and retain the last-good control (cmd/hub onCSIPControl).",
+			Fix:        "Hub MQTT handlers must reject a payload that fails to unmarshal and retain the last-good control (lexa-hub onCSIPControl).",
 			setup:      func(d *mayhemDriver) (*activeConstraint, error) { return armCap(d, "mayhem: malformed-control cap") },
 			perTick: func(d *mayhemDriver, i int) {
 				d.injectEnv(d.pvHighW, loadLow)
