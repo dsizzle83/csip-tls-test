@@ -72,13 +72,51 @@ packages — split later only if versioning pressure appears.
 
 ## AD-012 ✅ Hosting & CI platform: GitHub (de facto)
 
-Both repos already have GitHub remotes (`dsizzle83/lexa-hub`,
-`dsizzle83/csip-tls-test` — verified 2026-07-04, contra the "no remote"
-assumption). Decision: stay on GitHub; CI = GitHub Actions with a
-self-hosted desktop runner for wolfSSL-cgo jobs; branch protection on
-`main` (TASK-001–003). `lexa-proto` (AD-003) gets a repo in the same
-account; its version-pin mechanism (go.mod version vs committed SHA pin)
-is decided in TASK-019's ADR.
+**Decision.** Both repos stay on private GitHub under the single-maintainer
+account: `dsizzle83/lexa-hub`, `dsizzle83/csip-tls-test` (both remotes
+verified live 2026-07-04 via `git ls-remote`, contra an earlier "no remote"
+assumption). CI = GitHub Actions with a self-hosted desktop runner for
+wolfSSL-cgo jobs (TASK-002/003). Workflow: feature branch → PR → CI green →
+merge; lockstep changes (bench ↔ product, e.g. `internal/southbound/sunspec`
+audit MTR-4) ship as paired PRs that reference each other (05 §11). TASK-001
+is the one intentional exception: it commits/merges directly to `main` in
+both repos to land the pre-existing QA-arc fixes and this doc set, then the
+PR-only discipline starts. `lexa-proto` (AD-003) gets a repo in the same
+account when it's extracted; its version-pin mechanism (go.mod version vs
+committed SHA pin) is decided in TASK-019's ADR.
+
+**Alternatives considered.** Self-hosted Gitea on the desktop — rejected for
+now: no material benefit over GitHub for a single maintainer, adds an
+availability dependency (the desktop is also a bench node), and GitHub
+Actions is needed regardless for TASK-002/003's CI. A new GitHub
+organization — rejected: no team, no billing/seat reason to split from the
+personal account. Revisit either if the air-gap policy ever extends from the
+bench network to source hosting.
+
+**Branch protection — 2026-07-04 status: attempted, blocked, unresolved.**
+TASK-001 tried to enable "require PR before merging" on `main` in both repos
+via `gh api -X PUT repos/dsizzle83/<repo>/branches/main/protection`. Neither
+the `gh` CLI nor any GitHub API token/credential (checked: `~/.netrc`, `gh`
+config, git credential helpers) was available in the execution environment —
+only SSH deploy-key auth for `git push`/`git pull`, which the REST/GraphQL
+API does not accept. Confirmed the API needs auth (unauthenticated
+`GET /branches/main/protection` → 401). **Branch protection is NOT yet
+active on either repo's `main` — this is the one open item TASK-001 could
+not close.** A human with a GitHub PAT or the `gh` CLI logged in must run
+(or click through Settings → Branches):
+```
+gh api -X PUT repos/dsizzle83/lexa-hub/branches/main/protection \
+  -H "Accept: application/vnd.github+json" \
+  -f required_pull_request_reviews.required_approving_review_count=0 \
+  -F required_status_checks=null -F enforce_admins=false \
+  -F restrictions=null -f required_linear_history=false \
+  -f allow_force_pushes=false -f allow_deletions=false
+```
+(and the equivalent for `csip-tls-test`). Enable "require PR before merging"
+now; add "require status checks" once TASK-002/003 land CI. Direct-push
+lockout applies to the human maintainer too — that's the point. Track
+closing this as a fast follow-up before any task after TASK-001 merges its
+PR (the workflow this program adopts assumes protection is live).
 
 ## AD-004 ✅ Time: single `utilitytime` owner (R3)
 

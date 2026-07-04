@@ -1,6 +1,25 @@
 # TASK-001 — Commit residual work; branch/PR workflow; hosting decision
 
-*Status: TODO · Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+*Status: DONE, partial (2026-07-04) — branch protection blocked, see notes ·
+Phase: P0 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+
+**Completion notes (2026-07-04):** All commits landed and pushed —
+lexa-hub `main` at `a468e2a` (two fix commits:
+`6797648` breach-triggered dedupe reset, `a468e2a` scheduler
+clock-regression/default-fallback guard); csip-tls-test `main` and
+`lexa-hub` both at `a2dd027` (two fix commits — `1c6712a` batsim `Ena`
+override, `f0455fe` mayhem idle-capture + clock-jitter rework — plus the
+`a2dd027` docs commit adding `ARCHITECTURE_REVIEW.MD` and `docs/refactor/`).
+`lexa-hub` → `main` was a clean fast-forward (49 commits, no divergence).
+All named test gates green (see Test evidence below). AD-012 amended in
+place with the actual hosting/workflow decision and alternatives.
+**Not completed: branch protection on `main`.** Attempted via `gh api`;
+neither the `gh` CLI nor any GitHub API credential was available in the
+execution environment (only SSH deploy-key auth, which the REST/GraphQL
+API doesn't accept — confirmed unauthenticated call returns 401). This is
+recorded as the one open item in AD-012, with the exact command for a
+human to run. Reporting this task as a partial for that reason only —
+everything else in the acceptance criteria is met.
 
 ## Objective
 Both working trees are clean (`git status` empty), every 2026-07-03 QA-arc fix and the
@@ -144,18 +163,20 @@ changes.
 - Existing git history on both remotes.
 
 ## Acceptance criteria
-- [ ] `git status --short` empty in both repos; `git log origin/main -1` matches local in both.
-- [ ] Four code commits + one docs commit exist with messages naming the QA findings and the trailer.
+- [x] `git status --short` empty in both repos; `git log origin/main -1` matches local in both.
+- [x] Four code commits + one docs commit exist with messages naming the QA findings and the trailer.
 - [ ] Branch protection active on `main` of both GitHub repos (verify: direct push rejected).
-- [ ] Pre-drafted AD-012 in `02_ARCHITECTURE_DECISIONS.md` verified against the actual
+      **BLOCKED**: no `gh`/API credential in the execution environment (SSH-only auth). Command
+      to run recorded in AD-012; needs a human with a GitHub PAT or `gh auth login`.
+- [x] Pre-drafted AD-012 in `02_ARCHITECTURE_DECISIONS.md` verified against the actual
       remote/branch-protection/workflow state and amended if needed (no duplicate entry
       appended); 00 status table updated.
 
 ## Regression checklist
-- [ ] `make test-fast` (csip-tls-test) / `go test -race ./internal/...` (lexa-hub) green
-- [ ] Conformance logic tests: not protocol-adjacent — none
-- [ ] Mayhem: none (no behavior change; code already bench-validated)
-- [ ] `git log --oneline -6` in each repo reads as described above
+- [x] `make test-fast` (csip-tls-test) / `go test -race ./internal/...` (lexa-hub) green
+- [x] Conformance logic tests: not protocol-adjacent — none
+- [x] Mayhem: none (no behavior change; code already bench-validated)
+- [x] `git log --oneline -6` in each repo reads as described above
 
 ## Mayhem scenarios affected
 None (the committed harness changes are already live on the bench dashboard binary —
