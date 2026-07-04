@@ -1,6 +1,6 @@
 # TASK-010 — Delete monolith `cmd/hub` + forked orchestrator/bridge/adapters
 
-*Status: TODO · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-04, 38a6bee) · Phase: P0 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
 
 ## Objective
 The obsolete monolith and its maintained-by-accident forks are gone from csip-tls-test
@@ -140,17 +140,19 @@ the acceptance evidence).
   untouched; TASK-004's gate must stay green (this deletion doesn't touch either tree).
 
 ## Acceptance criteria
-- [ ] `git rm` list matches Background exactly (or deviations justified in PR).
-- [ ] `go build ./...` green; every `make build-*` target green.
-- [ ] All step-7 suites green; greps return empty on live code/config.
-- [ ] Diffstat shows ≈ −5k lines; no non-deletion logic changes.
-- [ ] Dashboard + mayhem `--list` still functional on the bench.
+- [x] `git rm` list matches Background exactly (or deviations justified in PR).
+- [x] `go build ./...` green; every `make build-*` target green.
+- [x] All step-7 suites green; greps return empty on live code/config.
+- [x] Diffstat shows ≈ −5k lines; no non-deletion logic changes.
+- [x] Dashboard + mayhem `--list` still functional on the bench.
 
 ## Regression checklist
-- [ ] `make test-fast` green
-- [ ] Conformance logic tests green (`go test ./tests/`)
-- [ ] Mayhem: none required (no live-path change); `--list` smoke only
-- [ ] TASK-004 lockstep gate still green
+- [x] `make test-fast` green
+- [x] Conformance logic tests green (`go test ./tests/`)
+- [x] Mayhem: none required (no live-path change); `--list` smoke only
+- [x] TASK-004 lockstep gate still green (TASK-004 itself is still TODO — no
+      gate script exists yet to run; the MTR-4 pair `internal/southbound/sunspec`
+      and `internal/ocppserver` are untouched by this deletion, satisfying intent)
 
 ## Mayhem scenarios affected
 None (the engine and sims don't import any deleted package — verified).
@@ -177,6 +179,27 @@ Import audit table included. Risk: build-only. Rollback: single revert.
 
 ## Definition of done
 Acceptance criteria + regression checklist + docs + status headers updated.
+
+## Implementation notes (2026-07-04)
+Deviations from the "Modify" file list, both justified by the acceptance criterion that
+the `--include="*.go"`/doc greps return empty on live code:
+- `.github/workflows/ci.yml` — the southbound test step ran
+  `go test ./internal/southbound/... ./internal/bridge/...`; dropped the bridge half
+  (mirrors the Makefile `test-southbound` fix) so CI doesn't fail on a deleted path.
+  Also trimmed the now-stale "cmd/hub ... slated for deletion in TASK-010" comment.
+- `internal/southbound/CLAUDE.md` — said `Device` interface is "consumed by
+  `internal/bridge/`"; repointed at `internal/southbound/registry/`, the real
+  (non-deleted) consumer, since this doc would otherwise reference dead code.
+- `cmd/dashboard/mqtt_scenarios.go` — one Mayhem scenario's `Fix` description string
+  said "(cmd/hub onCSIPControl)", using this repo's now-deleted path as informal
+  shorthand for the hub's handler; repointed at "lexa-hub onCSIPControl" (string-only
+  change, no scenario logic touched).
+
+Found pre-existing uncommitted changes to `docs/refactor/00_MASTER_INDEX.md`,
+`docs/refactor/02_ARCHITECTURE_DECISIONS.md`, and `docs/refactor/tasks/TASK-017.md` in
+the shared working tree at session start (unrelated TASK-017 bus-envelope work, not
+mine). Left untouched/unstaged so as not to lose or commingle another task's
+in-progress work — Principal Engineer should reconcile.
 
 ## Possible follow-up tasks
 TASK-011 (GUI/docs cleanup), TASK-019–024 (shared modules replace the remaining

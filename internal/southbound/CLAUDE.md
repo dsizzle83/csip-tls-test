@@ -1,6 +1,6 @@
 # Southbound Stack (Modbus / SunSpec)
 
-Pure Go — zero cgo. Implements `Device` interface consumed by `internal/bridge/`.
+Pure Go — zero cgo. Implements `Device` interface consumed by `internal/southbound/registry/`.
 
 ## Package map
 ```
