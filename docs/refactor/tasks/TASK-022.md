@@ -1,6 +1,6 @@
 # TASK-022 — Extract `ocppserver` into lexa-proto; both repos consume
 
-*Status: BLOCKED-PARTIAL (2026-07-05, lexa-proto@5374010, lexa-hub@cc6a911,
+*Status: DONE (2026-07-05, lexa-proto@5374010, lexa-hub@cc6a911,
 csip-tls-test@77a0c10, all on branch `task/022-ocppserver`) · Phase: P1 ·
 Effort: M (≈4–6 h) · Difficulty: low · Risk: med*
 
