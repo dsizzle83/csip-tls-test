@@ -1,6 +1,6 @@
 # TASK-039 — Event journal: schema + append-only writer + flash-aware rotation
 
-*Status: TODO · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-05, lexa-hub 01e7b0b on branch `task/039-journal`) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
 
 ## Objective
 Create `lexa-hub/internal/journal`: an append-only, newline-delimited-JSON
