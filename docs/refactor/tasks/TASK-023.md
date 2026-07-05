@@ -1,6 +1,14 @@
 # TASK-023 — Extract the IEEE 2030.5 CSIP data model into lexa-proto/csipmodel
 
-*Status: TODO · Phase: P1 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+*Status: **DONE (partial)** — csipmodel merged to lexa-proto (product-authoritative
+union, zero unresolved conflicts) and both repos flipped; derbase moved +
+`device.Measurements` resolved via option (a) type-alias (scope addendum).
+Bench-dependent evidence (live gridsim↔hub walk, targeted Mayhem, conformance
+regen — steps 6-8) deferred, no bench deploy this session per launch lane
+(2026-07-05). lexa-proto `e038885`+`658bf8a`+`5062432`; lexa-hub `12d8893`+`4c030a9`;
+csip-tls-test `8ceea12`+`d93174f`; disposition doc
+`docs/refactor/notes/TASK-023-model-disposition.md`.
+Phase: P1 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
 
 ## Objective
 One package of IEEE 2030.5 XML data-model types (`lexa-proto/csipmodel`) is consumed by
