@@ -1,6 +1,18 @@
 # TASK-008 — Watchdogs for the other five services
 
-*Status: TODO · Phase: P0 · Effort: M (≈4–6 h + staged 48 h soaks) · Difficulty: med · Risk: med*
+*Status: DONE, code only (2026-07-04, lexa-hub@8d569eb on
+`task/008-009-watchdogs-journald`) · Phase: P0 · Effort: M (≈4–6 h + staged 48 h soaks) ·
+Difficulty: med · Risk: med — kick wiring + `watchdog.Ready()`/`watchdog.Kick()` landed
+in all five `cmd/*/main.go` and all five unit files (`Type=notify` + per-service
+`WatchdogSec` per the table below); `go build ./...` and `go test -race ./internal/...`
+green; northbound/ocpp/api/modbus smoke-run locally without `NOTIFY_SOCKET` (no-op path
+confirmed, including a live `GET /healthz` 200 against the api probe). The staged
+one-service-per-deploy rollout, the five `kill -STOP` wedge tests, the per-service ≥24 h
+soaks, and the closing full FAST Mayhem campaign are ALL deferred to the P0-exit gate per
+this session's launch instructions (code + unit files + tests only this wave; no bench
+deploy, no service restart). Acceptance-criteria items 1–4 and the regression-checklist
+"Mayhem" and "soak evidence" rows are therefore NOT YET satisfied — do not merge until
+the deploy/wedge/soak wave closes them.
 
 ## Objective
 `lexa-northbound`, `lexa-modbus`, `lexa-telemetry`, `lexa-ocpp`, and `lexa-api` each gain

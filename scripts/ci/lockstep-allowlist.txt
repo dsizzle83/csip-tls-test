@@ -1,0 +1,32 @@
+# Known W3 divergence. Additions FORBIDDEN without a paired-PR justification;
+# the list only shrinks (TASK-020/021) until TASK-024 deletes it.
+#
+# TASK-004: this file pins the byte-level divergence between csip-tls-test's
+# and lexa-hub's copies of internal/southbound/sunspec and internal/ocppserver
+# that already existed (audit W3: "the lockstep duplication has already
+# failed") before scripts/ci/lockstep-check.sh started enforcing anything.
+# Report-only mode: every line below is a KNOWN-DIVERGENCE warning, not a
+# failure. Phase 1 (TASK-019-024) extracts these trees into the shared
+# `lexa-proto` module (AD-003); TASK-021 is expected to shrink this list as
+# the reconciliation lands; TASK-024 deletes this file and this script
+# entirely in favor of shared-module version pinning.
+#
+# Format: one entry per line, exactly matching a line lockstep-check.sh
+# emits: "<pkg>/<relpath> DIFFER|BENCH-ONLY|PRODUCT-ONLY". Re-verified by
+# `diff -rq` against both working trees on 2026-07-04 (this task's landing
+# day) — reviewers: re-run the diff, don't just trust this file.
+
+# internal/southbound/sunspec (5 files differ; 4 exist only in lexa-hub)
+sunspec/der1547.go DIFFER
+sunspec/models.go DIFFER
+sunspec/reader.go DIFFER
+sunspec/reader_test.go DIFFER
+sunspec/scanner.go DIFFER
+sunspec/der1547_roundtrip_test.go PRODUCT-ONLY
+sunspec/derlayout.go PRODUCT-ONLY
+sunspec/derlayout_test.go PRODUCT-ONLY
+sunspec/layout.go PRODUCT-ONLY
+
+# internal/ocppserver (code files identical; only docs/tests differ)
+ocppserver/CLAUDE.md DIFFER
+ocppserver/simulator_test.go DIFFER

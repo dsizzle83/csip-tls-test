@@ -39,6 +39,29 @@ name: CI
 # lands the dependency refresh the first baseline scan calls for; see
 # docs/refactor/VULN_BASELINE_2026-07-04.md and TASK-006's worklist.
 # TODO(TASK-006): once merged, drop continue-on-error and make this required.
+#
+# TASK-004: `lockstep` job (report-only until Phase 1, W3/D4/AD-003) byte-diffs
+# internal/southbound/sunspec and internal/ocppserver against the product repo
+# (dsizzle83/lexa-hub) — MTR-4: these trees must change together or a lone
+# edit misreads real hardware, and the rule already failed once (review W3)
+# while it lived only as a CLAUDE.md sentence. See scripts/ci/lockstep-
+# check.sh and scripts/ci/lockstep-allowlist.txt for the mechanics.
+#
+# The two repos are both private under the same owner, so the default
+# GITHUB_TOKEN cannot read lexa-hub for the second checkout — this job uses
+# a fine-grained PAT stored as repo secret LEXA_HUB_RO_TOKEN:
+#   Scope: read-only, "Contents" permission, restricted to the single repo
+#   dsizzle83/lexa-hub. No other repos, no other permissions.
+#   Expiry: set at creation (GitHub fine-grained PATs require an expiry);
+#   rotate before it lapses or this job starts failing on checkout, not on
+#   an actual divergence — check the failure message before assuming drift.
+#
+# Report-only: unallowlisted (NEW) divergence fails the job; today's known
+# W3 divergence (scripts/ci/lockstep-allowlist.txt) prints a warning but
+# does not fail it. TASK-021 is expected to shrink the allowlist; TASK-024
+# flips this job to --enforce (or retires it) once the shared `lexa-proto`
+# module (AD-003) replaces the duplication with version pinning.
+# TODO(TASK-024): replace this job with shared-module version-pin check.
 
 on:
   pull_request:
@@ -211,3 +234,24 @@ jobs:
         run: |
           set -o pipefail
           bash scripts/ci/govulncheck.sh 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # TASK-004: report-only lockstep-divergence gate (W3/D4/AD-003). See the
+  # header comment above `on:` for the PAT/secret rationale and the
+  # report-only vs --enforce contract.
+  lockstep:
+    name: lockstep
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - name: Checkout csip-tls-test (bench, this repo)
+        uses: actions/checkout@v4
+
+      - name: Checkout lexa-hub (product) read-only
+        uses: actions/checkout@v4
+        with:
+          repository: dsizzle83/lexa-hub
+          token: ${{ secrets.LEXA_HUB_RO_TOKEN }}
+          path: lexa-hub
+
+      - name: Lockstep divergence check (report-only — see scripts/ci/lockstep-allowlist.txt)
+        run: bash scripts/ci/lockstep-check.sh --product lexa-hub
