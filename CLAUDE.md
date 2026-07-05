@@ -10,15 +10,19 @@ The **test bench** for the LEXA DERMS hub. The product itself lives in
 - CSIP + Modbus conformance suites
 - Web dashboard (`cmd/dashboard`, :8080) — the demo/test UI
 
-**Lockstep rule:** `internal/southbound/sunspec` register maps are duplicated in lexa-hub
-and must change in both repos together (audit MTR-4). Deploy hub + sims in the same
-session. Enforced by `scripts/ci/lockstep-check.sh` in csip-tls-test CI (TASK-004) —
-report-only until Phase 1 replaces the duplication with a shared module (AD-003/TASK-024).
-`internal/ocppserver` moved to `lexa-proto/ocppserver` (TASK-022); `sim/server` and
-`sim/evsim`'s tests import the shared copy. The old `internal/ocppserver/` tree is left in
-place unreferenced (not deleted) because hosted CI runs `GOWORK=off` with no sibling
-`lexa-proto` checkout for the `cgo-fast` job's `sim/server` build — deleting the local copy
-wouldn't fix that gap, only hide it. Removal tracked with TASK-024.
+Shared protocol code (`sunspec`, `derbase`, `modbus`, `ocppserver`, `csipmodel` — this
+repo used to duplicate `sunspec` and `ocppserver` in-tree; audit MTR-4) now lives in the
+`lexa-proto` module, imported by both this repo and lexa-hub via a pinned commit SHA
+(`proto.pin` at each repo's root — `lexa-proto` has no hosted remote yet, AD-003(c); a
+committed `vendor/lexa-proto/` tree, AD-003(e), lets both repos build without fetching
+it). **Both repos must pin the identical `lexa-proto` commit — CI enforces it**
+(`scripts/check-proto-pin.sh`, TASK-024, replacing TASK-004's retired raw-diff
+`lockstep-check.sh`). Version bumps ship as paired PRs (both `proto.pin` files + both
+`vendor/lexa-proto/` regenerated in the same session) and deploy hub + sims together —
+the code half of MTR-4 lockstep is now CI-gated; the deploy half remains an operational
+discipline (see `docs/BENCH.md`). A local `go.work` (`go work init . ../lexa-proto`,
+gitignored, never committed) is still the normal way to develop against a live
+`lexa-proto` checkout.
 
 ## Stack
 Go 1.26 · wolfSSL cgo (`internal/wolfssl` only) · lorenzodonini/ocpp-go · simonvetter/modbus · grandcat/zeroconf
@@ -76,9 +80,10 @@ python3 scripts/mayhem.py --dashboard http://localhost:8080   # run the hostile-
 ```
 
 CI: `.github/workflows/ci.yml` — `pure-go` (builds, vet, southbound + QA-harness unit
-gate + `go test ./tests/`, all `CGO_ENABLED=0`) and `cgo-fast` (cached wolfSSL 5.7.6,
-`make test-fast` + cgo binary build) on every PR and push to `main`. Bench-touching
-suites (`make test-integration`, `scripts/run-conformance.sh`, `make qa-bench`, anything
+gate + `go test ./tests/`, all `CGO_ENABLED=0`), `cgo-fast` (cached wolfSSL 5.7.6,
+`make test-fast` + cgo binary build), and `proto-pin` (lexa-proto version-pin gate,
+TASK-024 — see above) on every PR and push to `main`. Bench-touching suites
+(`make test-integration`, `scripts/run-conformance.sh`, `make qa-bench`, anything
 on 69.0.0.x) stay desktop/bench-only, out of hosted CI.
 
 ## Mayhem hostile-QA

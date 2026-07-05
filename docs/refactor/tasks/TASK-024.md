@@ -1,6 +1,32 @@
 # TASK-024 — CI shared-module version-pinning gate; retire the CLAUDE.md lockstep prose
 
-*Status: TODO · Phase: P1 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-05, aabde2b on `task/024-pin-gate`) · Phase: P1 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+
+**Landing note (2026-07-05):** implemented per AD-003(c)/(e)/(f) exactly as decided.
+`scripts/check-proto-pin.sh` (csip-tls-test) is the single implementation; both repos'
+CI now run a `proto-pin` job (replacing TASK-004's `lockstep` job, which only gated
+csip-tls-test — this task fixed that asymmetry, per "Common mistakes to avoid": lexa-hub's
+job checks out csip-tls-test via a **new** `CSIP_TLS_TEST_RO_TOKEN` secret). Both `go.work`
+files deleted from version control + gitignored; fresh-clone builds proven with
+`GOWORK=off` in both repos (no ancestor go.work — see Test evidence). Both `proto.pin`
+seeded at `lexa-proto` `main` HEAD `77e32e447185dedb2adc799b1373894a526b58b5`. Forced pin
+divergence proven to fail the gate (both `proto.pin`-only and the deeper `--verify-vendor`
+regeneration-diff path), then reverted. Two sub-steps could **not** be completed in this
+execution environment, same class of gap as TASK-004/AD-012:
+- `CSIP_TLS_TEST_RO_TOKEN` (new fine-grained PAT for lexa-hub's CI to read csip-tls-test):
+  no `gh` CLI/API credential available here. lexa-hub's `proto-pin` job is wired and will
+  run on every PR once the secret exists; until then it fails at the checkout step, not on
+  an actual pin mismatch.
+- Marking either `proto-pin` job a required status check needs the same branch-protection
+  human step AD-012 already tracks.
+**No bench access for this task** (per its launch lane) — the Regression checklist's
+"full FAST Mayhem campaign" was not re-run here. This task's blast radius is CI/build
+plumbing + docs only (no runtime behavior change — Things that must NOT change §1), and
+TASK-021's already-recorded campaign (FAST 34P/17D/0F/0B; conformance 50/50; CSIP layers
+1-3 3/3, see 00_MASTER_INDEX P1 row) is the most recent evidence against the post-extraction
+`lexa-proto` build this task pins. Flagged for the reviewer to decide whether a fresh
+campaign is still wanted before merge, or whether TASK-021's evidence + this task's static
+proofs (fresh-clone build, forced-divergence gate failure) satisfy the P1 exit criterion.
 
 ## Objective
 CI in both repos fails whenever the two repos do not pin the **identical** `lexa-proto`
@@ -128,21 +154,33 @@ Commands: `bash scripts/check-proto-pin.sh` (both pass and forced-fail runs),
 - No preservation-ledger entries touched.
 
 ## Acceptance criteria
-- [ ] Gate present in both repos' CI; step-5 forced-divergence run shown failing.
-- [ ] Both repos build from a fresh clone (no committed go.work) at the pinned version.
-- [ ] All three prose locations updated; grep for "lockstep" in both repos finds only the
+- [x] Gate present in both repos' CI; step-5 forced-divergence run shown failing
+      (pin-mismatch path AND the `--verify-vendor` deep-diff path both proven locally;
+      lexa-hub side of the CI job pends `CSIP_TLS_TEST_RO_TOKEN`, same class of gap as
+      `LEXA_HUB_RO_TOKEN`).
+- [x] Both repos build from a fresh clone (no committed go.work) at the pinned version
+      (`GOWORK=off` build + test proof in both repos — see Test evidence below).
+- [x] All three prose locations updated; grep for "lockstep" in both repos finds only the
       new pointer text and historical docs.
-- [ ] TASK-004 diff job removed.
+- [x] TASK-004 diff job removed (`scripts/ci/lockstep-check.sh` +
+      `scripts/ci/lockstep-allowlist.txt` deleted; `lockstep` CI job replaced by `proto-pin`
+      in both repos).
 
 ## Regression checklist
-- [ ] `make test-fast` (csip-tls-test) / `go test -race ./internal/...` (lexa-hub) green
-- [ ] Conformance logic tests green (`go test ./tests/`) — unchanged inputs, cheap proof
-- [ ] Mayhem: **full FAST campaign** (Phase 1 exit gate per 03) + conformance evidence
-      regenerated (`scripts/run-conformance.sh`) if not done in TASK-023
-- [ ] Fresh-clone build proof archived
+- [x] `make test-fast` (csip-tls-test) / `go test -race ./internal/...` (lexa-hub) green
+      (`GOWORK=off`, fresh-clone-equivalent — see Test evidence)
+- [x] Conformance logic tests green (`go test ./tests/`) — unchanged inputs, cheap proof
+- [ ] Mayhem: **full FAST campaign** — NOT run this task (no bench access in this task's
+      lane; see Landing note). TASK-021's campaign (FAST 34P/17D/0F/0B; conformance 50/50;
+      CSIP layers 1-3 3/3) is the most recent evidence against this same pinned
+      `lexa-proto` build; reviewer to confirm whether that satisfies the P1 exit gate or a
+      fresh campaign is required before merge.
+- [x] Fresh-clone build proof archived (this file's Test evidence + final report)
 
 ## Mayhem scenarios affected
-None directly; the phase-exit campaign is run under this task as P1 closes.
+None directly (no runtime behavior change — CI/build plumbing + docs only). The
+phase-exit campaign this task's original text expected was not run here (no bench
+access); see Landing note and the Regression checklist Mayhem line above.
 
 ## Conformance implications
 None from the gate itself; the phase-exit conformance evidence regeneration lands here if

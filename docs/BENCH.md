@@ -32,8 +32,12 @@ desktop units do NOT survive reboot — everything else on the bench does.
   (user unit in `~/.config/systemd/user/<sim>.service`, or legacy root unit in
   `/etc/systemd/system/`), installs over the unit's existing ExecStart path, rewrites
   metersim to linked mode + evsim's CSMS URL, restarts, and reports `is-active`.
-- **MTR-4 lockstep**: metersim and lexa-modbus share SunSpec register maps — always deploy
-  hub and sims in the same session, never one side alone.
+- **MTR-4 lockstep (deploy half)**: metersim and lexa-modbus share the `lexa-proto`
+  SunSpec register-map codec — always deploy hub and sims in the same session, never one
+  side alone, whenever the pinned `lexa-proto` version bumps. The *code* half of MTR-4
+  (both repos importing the identical version) is CI-enforced now
+  (`scripts/check-proto-pin.sh`, TASK-024) — this bullet is the operational half that
+  enforcement doesn't cover: a green CI pin check doesn't deploy anything for you.
 
 ### lexa-api bearer-token auth (TASK-014, AD-008)
 

@@ -71,8 +71,10 @@ cadences differ; the review only requires shared *modules*); keep
 duplication + better diff CI (rejected: divergence already happened under
 a documented rule).
 
-**Open questions.** ❓ One module or three? Start with one module, three
-packages — split later only if versioning pressure appears.
+**Open questions — resolved (TASK-019/024).** ~~One module or three?~~ One
+module, five packages (`sunspec`, `derbase`, `modbus`, `ocppserver`,
+`csipmodel` — see (b) below); split later only if versioning pressure
+appears. No open question remains on this decision.
 
 **Extension (TASK-019, 2026-07-05): module path, package layout, pinning
 mechanism, go.work policy — decided, not deferred.**
@@ -154,19 +156,64 @@ No `replace` directives were added to either consumer's `go.mod` — `go.work`
 is the one local-dev mechanism; a `replace` would be redundant under
 `go.work` and would fight the `proto.pin`/pseudo-version gate later.
 
-**(e) Interim vendoring (TASK-021, formalized here).** Hosted CI runs with
-`GOWORK=off` and no sibling `lexa-proto` checkout (per (d)), so as each
-consumer starts actually importing `lexa-proto` packages, `go build`/`go
-test` under `GOWORK=off` need something to resolve against. Both repos
-commit `vendor/lexa-proto/<pkg>/` (via `GOWORK=off go mod vendor`) alongside
-`vendor/modules.txt`, re-run whenever a new `lexa-proto` package is imported
-or an existing one changes. This is a stopgap, not a third pinning
-mechanism: the vendor tree tracks whatever `go.work`'s `../lexa-proto`
-resolves to at vendor-time, `proto.pin` (or its successor, (c)) is still the
-source of truth for *which* version that should be, and TASK-024 is expected
-to keep `vendor/` (a version-pinned build needs *something* concrete to
-build against regardless of hosting) while retiring `go.work` as the
-resolution mechanism that feeds it.
+**(e) Interim vendoring (TASK-021, 2026-07-05): `require` + `replace` +
+committed `vendor/lexa-proto/`, superseding the "no replace" line in (d).**
+Once TASK-020/021 gave `csip-tls-test` real imports of `lexa-proto/sunspec`
+and `lexa-proto/modbus` (and TASK-022/023 added `ocppserver`/`csipmodel`,
+TASK-023 `derbase`), hosted CI needed to actually *build* those imports —
+and hosted runners have no `../lexa-proto` to satisfy a bare `go.work`-only
+setup (see (d)). Both consumers' `go.mod` now carry `require lexa-proto
+v0.0.0` + `replace lexa-proto => ../lexa-proto`, and both commit a
+`vendor/lexa-proto/` tree (`GOWORK=off go mod vendor`) covering every
+package they actually import. Go's default `-mod=vendor` behavior (active
+whenever `vendor/modules.txt` is present and consistent with `go.mod`, which
+is the case whenever there's no `go.work` in effect) means hosted CI builds
+straight from the committed vendor tree — it never needs `../lexa-proto` to
+exist at all, closing the gap `GOWORK=off` alone left open. `replace`'s
+target path is metadata only in vendor mode (Go doesn't resolve it); it
+still matters for local `go.work`/non-vendor dev, where it's superseded by
+the `go.work` module list anyway.
+
+**(f) TASK-024 landing (2026-07-05): pin gate is live; `go.work` retired;
+hosted-flip is a recorded follow-up, not a blocker.** `scripts/check-proto-pin.sh`
+(csip-tls-test) is the gate described in (c), wired into both repos' CI as a
+`proto-pin` job (replacing TASK-004's `lockstep` job, which only ran in
+csip-tls-test — TASK-024 fixed the one-sided gating too: lexa-hub's CI now
+checks out csip-tls-test via a new `CSIP_TLS_TEST_RO_TOKEN` secret, the same
+class of pending-human-PAT item as `LEXA_HUB_RO_TOKEN`/AD-012 branch
+protection). Both repos' `proto.pin` are seeded at the same `lexa-proto`
+commit (`77e32e447185dedb2adc799b1373894a526b58b5`, `main` HEAD as of
+TASK-023's landing). Both `go.work` files are deleted from version control
+and gitignored per (d); the interim vendoring from (e) is what actually lets
+hosted CI build with no `go.work` and no fetchable `lexa-proto` — nothing
+about (e) changes at this task.
+
+The go.mod-pseudo-version mechanism from (c) is still the intended long-run
+replacement for `proto.pin`, still blocked on the same hosting + credential
+gap as AD-012. Recorded as a follow-up (10_BACKLOG.md, "lexa-proto hosted-
+flip") rather than re-litigated here: **hosted-flip checklist**, to run in
+one commit as soon as a `dsizzle83/lexa-proto` GitHub repo + fetch
+credential both exist —
+1. Rename `lexa-proto`'s module path to `github.com/dsizzle83/lexa-proto`
+   (go.mod line + every import statement in both consumers) per the (a)
+   flip rule.
+2. Push `lexa-proto`'s history to the new hosted repo; set up branch
+   protection (AD-012) at the same time as lexa-hub/csip-tls-test's, if
+   still pending.
+3. In both consumers: drop `replace lexa-proto => ../lexa-proto`, change
+   `require lexa-proto v0.0.0` to a real `require
+   github.com/dsizzle83/lexa-proto vX.Y.Z-<timestamp>-<sha>` pseudo-version
+   (or a tagged release once `lexa-proto` starts tagging), delete
+   `vendor/lexa-proto/` (and `vendor/modules.txt`'s entry for it, or the
+   whole `vendor/` tree if nothing else needs vendoring), run `go mod tidy`.
+4. Swap `scripts/check-proto-pin.sh`'s ground truth from `proto.pin` files
+   to the two consumers' `go.mod` `require` lines (mechanism swap per (c),
+   not a new decision) — delete `proto.pin` from both repos once the gate
+   no longer reads it.
+5. Re-run the fresh-clone build proof and the forced-divergence proof
+   (TASK-024 §5-equivalent) against the new mechanism before trusting it.
+6. Retire this checklist from 10_BACKLOG.md once done; record the SHA/tag
+   the flip landed on.
 
 **Extension (TASK-082, 2026-07-05): bench `derbase` fork disposed; bench
 `internal/csip/{discovery,scheduler}` fork kept as a referee, not extracted.**
@@ -174,7 +221,7 @@ resolution mechanism that feeds it.
 TASK-020/021 left two forks alive in `csip-tls-test` pending an explicit
 decision (TASK-010's punt, resolved here):
 
-**(f) Bench `derbase` + driver forks — disposed, not kept.** Unlike the csip
+**(g) Bench `derbase` + driver forks — disposed, not kept.** Unlike the csip
 walker/scheduler (below), the bench's own `internal/southbound/derbase`
 (the trimmed IEEE-1547/legacy mapping layer TASK-021 adapted onto the shared
 `sunspec` codec) had **no referee argument for staying independent**: it
@@ -215,7 +262,7 @@ consumer at all** outside their own test files, now that `cmd/hub` and
 un-consumed-but-passing code that no task assigned as in-scope is scope
 creep, not fork disposal.
 
-**(g) Bench `internal/csip/{discovery,scheduler}` — kept as an independent
+**(h) Bench `internal/csip/{discovery,scheduler}` — kept as an independent
 referee, renamed to `internal/csipref/{discovery,scheduler}`.** This is the
 opposite call from (f), and deliberately so: these packages are this repo's
 own implementation of the CSIP **client-side** walk-and-evaluate logic
@@ -268,7 +315,6 @@ the other side to pin against).
 exception for `internal/csipref` — it is a single-sided reference
 implementation, not a duplicated pair, so there is nothing for `diff -rq` to
 ever find equal or unequal.
-
 ## AD-012 ✅ Hosting & CI platform: GitHub (de facto)
 
 **Decision.** Both repos stay on private GitHub under the single-maintainer
