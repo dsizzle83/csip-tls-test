@@ -42,10 +42,10 @@ regress) is not done, regardless of unit-test status.
 
 | # | Legacy mechanism (file:line @2026-07-05) | Originating QA scenario / finding | Behavior that must survive | Replaced by | Gate scenarios | Status |
 |---|---|---|---|---|---|---|
-| L1 | `applyRestoreRule` per-tick re-command (`optimizer.go:2241–2276`, call site `:365–366` with `solarCapActive` gate) | curtailment-release Mode A/B; solar-reboot-forget (re-assert each cycle); 92-day-replay battery reserve sail-through (in-code comment `:2259–2268`) | Uncommanded connected battery idled to 0 W at ANY SoC (idle enforces the reserve); uncurtailed inverter restored; dark inverter under an active cap KEEPS held curtailment; after release, restore reaches a dark inverter on reconnect | Retained desired doc is the standing intent; reconciler reasserts (T026–T029) | curtailment-release, release-while-rebooting, solar-reboot-forget | legacy-active |
-| L2 | `cmdDeduper` + `reassertEvery=60s` watchdog (`cmd/hub/actuators.go:24` const, `:26–56` deduper+`shouldSend`+`reset`; per-actuator `dedupe` fields `:59–147`) | export-cap-full-battery ghost (watchdog re-assert); lexa-modbus/-ocpp restart resync | A restarted/state-lossy consumer re-converges without waiting on a command *change* (today ≤60 s; retained doc makes it immediate on subscribe) | Broker redelivers retained doc on subscribe; reconciler reassert (T026/T027) | export-cap-full-battery, battery-reboot, mqtt-broker-restart | legacy-active |
-| L3 | Breach-triggered dedupe reset (`cmd/hub/actuators.go:45–56` `reset()`; `cmd/hub/main.go:104–107,130–134` `dedupeResets` in `planObserver`, wired `:218/:222/:230`) | QA 2026-07-03: 0 W ceiling dedupe-suppressed 30 s against an uncurtailed inverter while CannotComply posted (device reverted behind hub's back) | A device that reverts while the commanded value is unchanged gets a corrective write bounded by the poll/readback interval, not by a 60 s watchdog | Reconciler verify-by-readback + write-on-diff (T026) | export-cap-full-battery, curtailment-release, control-churn | legacy-active |
-| L4 | `retryDevice.lastCtrl` + `reassertLocked` (`cmd/modbus/main.go:336–433`; reconnect reconcile in `ReadMeasurements` `:372–384`; desired recorded while disconnected `:421–427`; never-commanded-inverter stale-ceiling clear `:411–414`) | QA 2026-07-02: release-while-rebooting (released cap left inverter clamped at stale ceiling indefinitely) | Reconnected device converges to hub's CURRENT desire before its first measurement is trusted; never-commanded inverter gets a stale-ceiling clear; never-commanded battery gets nothing; meter never written | Reconciler reassert-on-reconnect from retained doc (T026/T027) — `retryDevice` session drop/reopen mechanics stay | release-while-rebooting, solar-reboot-forget, battery-reboot | legacy-active |
+| L1 | `applyRestoreRule` per-tick re-command (`optimizer.go:2241–2276`, call site `:365–366` with `solarCapActive` gate) | curtailment-release Mode A/B; solar-reboot-forget (re-assert each cycle); 92-day-replay battery reserve sail-through (in-code comment `:2259–2268`) | Uncommanded connected battery idled to 0 W at ANY SoC (idle enforces the reserve); uncurtailed inverter restored; dark inverter under an active cap KEEPS held curtailment; after release, restore reaches a dark inverter on reconnect | Retained desired doc is the standing intent; reconciler reasserts (T026–T029) | curtailment-release, release-while-rebooting, solar-reboot-forget | shadow (battery only; solar/EVSE still legacy-active — T029/030) |
+| L2 | `cmdDeduper` + `reassertEvery=60s` watchdog (`cmd/hub/actuators.go:24` const, `:26–56` deduper+`shouldSend`+`reset`; per-actuator `dedupe` fields `:59–147`) | export-cap-full-battery ghost (watchdog re-assert); lexa-modbus/-ocpp restart resync | A restarted/state-lossy consumer re-converges without waiting on a command *change* (today ≤60 s; retained doc makes it immediate on subscribe) | Broker redelivers retained doc on subscribe; reconciler reassert (T026/T027) | export-cap-full-battery, battery-reboot, mqtt-broker-restart | shadow (battery only) |
+| L3 | Breach-triggered dedupe reset (`cmd/hub/actuators.go:45–56` `reset()`; `cmd/hub/main.go:104–107,130–134` `dedupeResets` in `planObserver`, wired `:218/:222/:230`) | QA 2026-07-03: 0 W ceiling dedupe-suppressed 30 s against an uncurtailed inverter while CannotComply posted (device reverted behind hub's back) | A device that reverts while the commanded value is unchanged gets a corrective write bounded by the poll/readback interval, not by a 60 s watchdog | Reconciler verify-by-readback + write-on-diff (T026) | export-cap-full-battery, curtailment-release, control-churn | shadow (battery only) |
+| L4 | `retryDevice.lastCtrl` + `reassertLocked` (`cmd/modbus/main.go:336–433`; reconnect reconcile in `ReadMeasurements` `:372–384`; desired recorded while disconnected `:421–427`; never-commanded-inverter stale-ceiling clear `:411–414`) | QA 2026-07-02: release-while-rebooting (released cap left inverter clamped at stale ceiling indefinitely) | Reconnected device converges to hub's CURRENT desire before its first measurement is trusted; never-commanded inverter gets a stale-ceiling clear; never-commanded battery gets nothing; meter never written | Reconciler reassert-on-reconnect from retained doc (T026/T027) — `retryDevice` session drop/reopen mechanics stay | release-while-rebooting, solar-reboot-forget, battery-reboot | shadow (battery only; reconnect-feed not wired to the shadow yet — see wave-gate notes below) |
 | L5 | `breachAlert` mRID-keyed edge detector + `activeBreachMRID` (`cmd/hub/main.go:103`, `:253–281`); `Plan.Safety` nil-Breach guard (`orchestrator/model.go:311–319`) | reject-write-curtail / enable-gate-curtail flakiness (mRID-agnostic flag latched across episodes); 2026-07-03 safety-plan spurious clear | One alert at onset, one at clear; a NEW mRID breaching mid-episode re-alerts; safety plans (Breach==nil means "not assessed") never emit a clear edge | Named breach-episode component (T031) | reject-write-curtail, enable-gate-curtail, export-cap-full-battery | legacy-active |
 | L6 | `responseTracker` CannotComply episode dedupe (`cmd/northbound/main.go:221–231` alert consumer; `:707–754` `alerted` map / `alertCannotComply` / `clearAlerts`) | CannotComply spam per tick vs one per episode (design; V3 CannotComply timing races) | Exactly one CannotComply POST per breach episode; clear re-arms | Episode-ID-carrying report chain (T031) | battery-soc-refuse, battery-empty-import-cap | legacy-active |
 | L7 | `restoreOnGenLimitClear` + `genCapActive` (`optimizer.go:163–166`, `:1251–1276`) | curtailment-release Mode A (V3 Issue 1: release is a WRITE, not an absence of writes) | Explicit uncurtail emitted on the cap active→clear edge | Desired doc transitions to restore ceiling on release (T029); deletion only if gates stay green | curtailment-release | legacy-active |
@@ -109,6 +109,46 @@ consumer against lexa-modbus's actual (partial) measurement capability:
   decision points will simply never resolve to a verdict at all until a
   Connect readback exists. Worth a line in the TASK-028 write-up so nobody
   reads a quiet `matches` counter as "everything converged."
+
+### Wave-gate soak results (2026-07-05, P2 wave gate — L1–L4 flipped to `shadow`)
+
+Deployed with `"reconciler":{"battery":"shadow"}`; soak = targeted battery-family
+Mayhem run (`export-cap-full-battery, battery-wrong-sign, battery-soc-refuse,
+battery-charge-disabled` → 0P/4D/0F/0B, all DEGRADED `cannot_comply=True`, at
+baseline) + the full 51-scenario FAST campaign
+(`qa-mayhem-20260705-151009.md`: **34P/17D/0F/0B**, within the 32–35P band and
+strictly better than the pre-gate 32P/19D baseline — `export-cap-full-battery`
+and `solar-reboot-forget` flipped D→P, both known boundary-flaky).
+
+- **Blocking bug found + fixed before the soak could mean anything:**
+  `systemd/mosquitto-lexa.acl` had no `lexa/desired/` grant, so with the ACL
+  live the retained doc never reached the broker and the shadow's early
+  `verdict=match` lines were vacuous (`would=none` because `Desired` was
+  never set). Fixed (battery-scoped write grant for lexa-hub, read grant for
+  lexa-modbus), lexa-hub branch `task/027-desired-topic-acl` commit 1a2d777.
+- **Steady-state divergence rate: 0.** `lexa_mb_shadow_divergences_total` = 1
+  for the whole session; the single counted divergence was DURING
+  battery-charge-disabled fault injection (`diverge:write-on-diff`, readback
+  SOC=100%/W=0 against a charge doc — the reconciler noticing, one poll
+  faster than legacy's watchdog window, that a commanded charge wasn't
+  happening). Disposition: expected semantic difference, informative for
+  T028, not a core bug. Zero Observe-driven divergences in clean operation.
+- **Predicted Connect-completeness hold confirmed live:** the battery doc
+  always carries `connect`, lexa-modbus has no Connect readback, so
+  `lexa_mb_shadow_matches_total` froze (206) once the real doc landed — by
+  design. The log line's `verdict=match` text prints for any non-write
+  decision and is NOT the counted-match signal; use the counters.
+- **L4 reconnect-feed caveat stands** (shadow never calls `Reconnected`);
+  `battery-reboot` PASSed with no reconciler-vs-legacy divergence surfacing
+  (the hold-through-outage behavior masks the timing gap in shadow).
+  T028 must wire `Reconnected` before the flip.
+- **AD-013 edge machinery all exercised on real faults:** `StaleDesired` ×3
+  (doc aged past staleness while faults froze commanding), `RejectedDoc
+  reject=SeqRegression` ×1 (mqtt-broker-restart redelivering an older
+  retained doc — correctly rejected), `SeqReset` ×1 (hub-restart-mid-cap:
+  seq back to 0 with newer issued_at — accepted, reported). would_writes
+  ended at 119 (dominated by benign `new-desired` adoptions under command
+  churn) — the write-storm gauge for T028 looks unalarming.
 
 **Incidental fix, filed here for traceability:** `internal/reconcile.matches()`
 (TASK-026, merged) had an order-dependent bug — a doc expressing two fields

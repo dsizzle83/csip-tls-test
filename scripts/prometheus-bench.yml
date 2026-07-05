@@ -1,0 +1,29 @@
+# prometheus-bench.yml — static scrape config for the LEXA bench (TASK-044).
+#
+# Scrapes all six lexa services' /metrics endpoints on the hub Pi (69.0.0.1).
+# Bench configs bind metrics_addr to the LAN IP (AD-008 stance — see
+# TASK-044 and lexa-hub CLAUDE.md); the product default stays 127.0.0.1.
+#
+# Run locally on the desktop against this bench:
+#   podman run --rm -p 9090:9090 \
+#     -v $PWD/scripts/prometheus-bench.yml:/etc/prometheus/prometheus.yml \
+#     docker.io/prom/prometheus
+# (or a native `prometheus` binary: `prometheus --config.file=scripts/prometheus-bench.yml`)
+# Then browse http://localhost:9090/targets — all six should show "UP".
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: lexa-bench
+    static_configs:
+      - targets:
+          - "69.0.0.1:9100" # lexa-api (/metrics route on the existing :9100 listener)
+          - "69.0.0.1:9101" # lexa-hub
+          - "69.0.0.1:9102" # lexa-northbound
+          - "69.0.0.1:9103" # lexa-modbus
+          - "69.0.0.1:9104" # lexa-ocpp
+          - "69.0.0.1:9105" # lexa-telemetry
+        labels:
+          bench: "69.0.0.x"
