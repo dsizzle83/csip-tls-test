@@ -409,6 +409,51 @@ causes protocol noise (duplicate CannotComply begin) or safety regressions.
 dependency; revisit for fleet telemetry), rely on MQTT retention alone
 (rejected: §8.3 rollback risk + no audit record).
 
+**TASK-039 update (2026-07-05): journal half implemented as a pure library,
+schema version 1.** `lexa-hub/internal/journal` (`journal.go`/`schema.go`/
+`reader.go`) lands the writer, schema, and reader — no consumers yet
+(TASK-040 wires the first caller; blocked on TASK-031). Schema v1's Event
+envelope (`v`/`ts`/`srv_t`/`seq`/`type`/`svc`/`data`) wraps nine transition-
+only payload types (`control_adopted`, `control_released`, `dispatch`,
+`breach_begin`/`breach_end` keyed by `episode_id = mrid + "/" + beginTs`,
+`cannot_comply_posted`, `service_start`, `snapshot_written`/
+`snapshot_restored` for TASK-041) — deliberately no per-tick event, matching
+05 §9. Rotation is rename-then-create (`name` → `name.1` → … → `name.MaxFiles`,
+oldest dropped), never copy. Fsync is batched on `FlushEvery` (default 32)
+events OR `FlushInterval` (default 5 s) elapsed, checked lazily on `Append` —
+no goroutines in the library itself, matching 05 §4's ownership rule. The
+reader (`Scan`) tolerates a torn final line from a power cut; `Open` pads a
+newline onto a torn tail before resuming writes, so a subsequent Append
+can't silently concatenate onto garbage.
+
+**Write-budget numbers (package doc comment, `internal/journal/journal.go`,
+cites RSK-14):** representative line sizes measured, not hand-waved —
+control_adopted 229 B, dispatch 124 B, breach_begin/breach_end 252 B (the
+largest type). Pathological FAST ceiling (every tick transitions on every
+axis at once): 201,600 events/day ≈ 52.4 MB/day of input volume. Default
+quota (`MaxBytes` 1 MiB × (`MaxFiles` 4 + 1) = 5 MiB) bounds resident size
+regardless of input rate — a storm just rotates the window faster (≈2.3 h
+retention at the pathological ceiling, self-healing once it clears) rather
+than growing past 5 MiB. `docs/FLASH_BUDGET.md`'s 2026-07-05 P0-exit
+measurement (hub 108 lines/min ≈ 155k lines/day FAST, journald's own
+per-tick log, a different budget) confirms the estimate's order of
+magnitude; the journal's 5 MiB cap is a rounding error against journald's
+200 MB `SystemMaxUse` — it fits *inside* that existing flash budget rather
+than stacking a second one on top, per that doc's "Related budgets" note.
+fsyncs/day bounded at ≈17,280 (one per `FlushInterval` while active) at the
+pathological ceiling's event rate, below the crossover to the count-boundary
+governing instead.
+
+Tests: `go test -race ./internal/journal/`, 95.1% coverage — round-trip +
+Seq-resume-across-reopen, rotation shift-chain + `MaxFiles` honored, torn-tail
+tolerance (both `Scan` and resume), fsync batching at both boundaries
+(`FlushEvery`/`FlushInterval`, observed via on-disk file size), and the
+disk-full/permission-loss error path (a read-only directory forcing a
+rotation failure) proving edge-triggered logging + error return + recovery
+after the directory becomes writable again (AD-011: journal failure must
+never crash a caller). Zero consumers today (`grep -rn "internal/journal"
+~/projects/lexa-hub --include=*.go | grep -v internal/journal` empty).
+
 ## AD-006 🔶 Bus schema: version envelope, reject-and-alarm
 
 **Decision.** Every bus JSON message carries `"v": N`; subscribers reject
