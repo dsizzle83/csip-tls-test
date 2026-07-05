@@ -154,6 +154,121 @@ No `replace` directives were added to either consumer's `go.mod` — `go.work`
 is the one local-dev mechanism; a `replace` would be redundant under
 `go.work` and would fight the `proto.pin`/pseudo-version gate later.
 
+**(e) Interim vendoring (TASK-021, formalized here).** Hosted CI runs with
+`GOWORK=off` and no sibling `lexa-proto` checkout (per (d)), so as each
+consumer starts actually importing `lexa-proto` packages, `go build`/`go
+test` under `GOWORK=off` need something to resolve against. Both repos
+commit `vendor/lexa-proto/<pkg>/` (via `GOWORK=off go mod vendor`) alongside
+`vendor/modules.txt`, re-run whenever a new `lexa-proto` package is imported
+or an existing one changes. This is a stopgap, not a third pinning
+mechanism: the vendor tree tracks whatever `go.work`'s `../lexa-proto`
+resolves to at vendor-time, `proto.pin` (or its successor, (c)) is still the
+source of truth for *which* version that should be, and TASK-024 is expected
+to keep `vendor/` (a version-pinned build needs *something* concrete to
+build against regardless of hosting) while retiring `go.work` as the
+resolution mechanism that feeds it.
+
+**Extension (TASK-082, 2026-07-05): bench `derbase` fork disposed; bench
+`internal/csip/{discovery,scheduler}` fork kept as a referee, not extracted.**
+
+TASK-020/021 left two forks alive in `csip-tls-test` pending an explicit
+decision (TASK-010's punt, resolved here):
+
+**(f) Bench `derbase` + driver forks — disposed, not kept.** Unlike the csip
+walker/scheduler (below), the bench's own `internal/southbound/derbase`
+(the trimmed IEEE-1547/legacy mapping layer TASK-021 adapted onto the shared
+`sunspec` codec) had **no referee argument for staying independent**: it
+doesn't check the hub's behavior against a second reading of the spec, it's
+a debug/validation helper (`sim/modsim-client`, a Pi-side CLI) that drives
+the *same* sims the hub itself talks to. Keeping it forked meant that CLI's
+manual validation could silently drift from what the real hub (via
+`lexa-proto/derbase`) actually does — a liability, not an asset. TASK-020's
+disposition doc (§2c/§2d) had already adjudicated every behavioral
+difference between the two generations product-authoritative with **zero
+bench-side fixes lost** (D1-D3, S1-S8: every row resolved to "product"), so
+there was no unreviewed semantic risk in finishing the merge. Disposition:
+`internal/southbound/battery` and `internal/southbound/inverter` now embed
+`lexa-proto/derbase.Base` directly (same package lexa-hub consumes);
+`internal/southbound/device.Measurements` is a type alias to
+`lexa-proto/derbase.Measurements` (the identical alias trick TASK-023 used
+for lexa-hub's own `device.Measurements`); the bench's `internal/southbound/
+derbase/derbase.go` is deleted outright — `grep -rn "derbase"
+internal/southbound/` now only finds the `lexa-proto/derbase` import lines
+and the local `M701St*` shim constants (three integers per file, the
+spec-value enum the shared codec deliberately leaves unsymbolized — not
+protocol-semantics duplication in the sense this program cares about).
+Consuming the fuller `lexa-proto/derbase.ApplyControl` also means
+battery/inverter pick up capability they didn't have before (`OpModFixedW`,
+`GenLimW`/`LoadLimW` ceilings, reversion timers, the full VoltVar/VoltWatt/
+trip/droop/WattVar curve surface) — this is not treated as an
+out-of-process behavior change requiring escalation, because TASK-020 had
+already ruled every one of those code paths product-superset with nothing
+the bench held that the product lacked; the only paths the bench's own
+tests exercise (legacy M103/121/123/802/201 via `SetConnect`/
+`SetExportLimit`/`SetImportLimit`) are byte-identical between the two
+generations and pass unchanged (`go test ./internal/southbound/...`, cached
+and re-run, all green, zero assertion changes).
+`battery`/`meter`/`registry` (not `inverter`) turned out to have **no
+consumer at all** outside their own test files, now that `cmd/hub` and
+`sim/orchestrator` are deleted (TASK-010) — noted in
+`internal/southbound/CLAUDE.md` for visibility; not deleted, since deleting
+un-consumed-but-passing code that no task assigned as in-scope is scope
+creep, not fork disposal.
+
+**(g) Bench `internal/csip/{discovery,scheduler}` — kept as an independent
+referee, renamed to `internal/csipref/{discovery,scheduler}`.** This is the
+opposite call from (f), and deliberately so: these packages are this repo's
+own implementation of the CSIP **client-side** walk-and-evaluate logic
+(resource discovery from `/dcap`, DER event priority resolution), consumed
+by `sim/conformance`, `sim/client`/`sim/client-http`, and `tests/*` — none of
+which are lexa-hub code. There is no lexa-hub counterpart for this logic to
+diverge FROM in the first place (lexa-hub's own client-facing walker, if it
+has one, was never forked into this repo — TASK-010 already noted `internal/
+csip` is "NOT deletable... the review's phrasing 'csip fork' " is imprecise
+for exactly this reason). The value of keeping it separately maintained is
+the self-confirmation hazard named in architecture review §9: if the
+conformance suite's walker and the hub's own request-handling logic were
+ever unified into one shared implementation, a bug in that shared
+interpretation of the spec would make the hub agree with itself in every
+test — conformance evidence would stop meaning anything. Extraction (option
+b) is rejected for the stated reason it's rejected everywhere else in this
+program: no second consumer needs a shared walker today, and manufacturing
+one to "reduce duplication" would destroy the one property that makes this
+package valuable.
+
+Disposition: `internal/csip/discovery` and `internal/csip/scheduler` moved
+(`git mv`, package names unchanged) to `internal/csipref/discovery` and
+`internal/csipref/scheduler`; six importers repointed (`sim/client`,
+`sim/client-http`, `sim/conformance`, `internal/tlsclient/fetcher_test.go`,
+`tests/integration_test.go`, `tests/csip_conformance_test.go`,
+`tests/wolfssl_integration_test.go`) — mechanical import-path rewrite only,
+zero logic changes, `go test ./...` green throughout. Both packages' doc
+comments now state the referee role and the "must not be synced" rule
+explicitly (the point of maximum leverage — read before anyone is tempted to
+"deduplicate" them against a future shared walker). `internal/csip` itself
+shrinks to `identity` + `dnssd` (LFDI/SFDI derivation, mDNS browse) — neither
+is spec-interpretation logic with a self-confirmation hazard, so neither is
+part of this decision.
+
+**CI divergence gate:** `scripts/ci/lockstep-check.sh`'s `TREES` array only
+ever compared `internal/southbound/sunspec` and `internal/ocppserver` (both
+now retired to `lexa-proto` from both repos — TASK-021/022) — it was never
+wired to scan `internal/csip{,ref}` or `derbase` at all. There is therefore
+**no `lockstep-allowlist.txt` entry to add**: the gate cannot flag a tree it
+doesn't compare, and adding one defensively would be documentation for a
+check that doesn't exist. A comment was added at the `TREES` declaration
+recording this explicitly, so a future reader doesn't go looking for a
+missing allowlist line. TASK-024 (still TODO) should carry this forward when
+it replaces the whole gate with `lexa-proto` version pinning — pinning
+doesn't apply to `internal/csipref` either, for the same reason (nothing on
+the other side to pin against).
+
+**Phase 1 exit criterion updated** (`03_REFACTOR_PHASES.md`): the `diff -rq`
+"no duplicated protocol packages" criterion now carries this one documented
+exception for `internal/csipref` — it is a single-sided reference
+implementation, not a duplicated pair, so there is nothing for `diff -rq` to
+ever find equal or unequal.
+
 ## AD-012 ✅ Hosting & CI platform: GitHub (de facto)
 
 **Decision.** Both repos stay on private GitHub under the single-maintainer

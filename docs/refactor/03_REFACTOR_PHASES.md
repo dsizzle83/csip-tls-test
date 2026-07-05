@@ -93,10 +93,16 @@ each consumer flips in its own commit and can be reverted independently
 while `go.work` keeps old and new importable.
 
 **Exit criteria.** Both repos build from the shared module; `diff -rq`
-between repos finds no duplicated protocol packages; Mayhem full campaign +
-`sim/modsim-conformance` (all three device types) + CSIP conformance logic
-tests green; MTR-4 lockstep note in both CLAUDE.md files replaced by the CI
-rule.
+between repos finds no duplicated protocol packages — with **one documented
+exception** (TASK-082, AD-003(f)): `csip-tls-test/internal/csipref/{discovery,scheduler}`
+is a deliberate, one-repo-only referee implementation of the CSIP client-side
+walk/evaluate logic, kept independent of lexa-hub's own walker/scheduler for
+conformance value (no lexa-hub counterpart exists to diff against — this is
+not a duplicated pair, it's a single-sided reference implementation). Every
+other protocol-semantics fork (SunSpec codec, derbase, OCPP CSMS, 2030.5
+model) has zero duplicates; Mayhem full campaign + `sim/modsim-conformance`
+(all three device types) + CSIP conformance logic tests green; MTR-4
+lockstep note in both CLAUDE.md files replaced by the CI rule.
 
 ---
 

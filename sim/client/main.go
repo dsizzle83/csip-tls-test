@@ -10,9 +10,9 @@ import (
 	"os"
 	"time"
 
-	"csip-tls-test/internal/csip/discovery"
 	"csip-tls-test/internal/csip/dnssd"
 	"csip-tls-test/internal/csip/identity"
+	"csip-tls-test/internal/csipref/discovery"
 	"csip-tls-test/internal/tlsclient"
 	"csip-tls-test/internal/wolfssl"
 )

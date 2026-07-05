@@ -11,6 +11,21 @@
 // The Fetcher interface abstracts the HTTP GET operation so the walker
 // can be tested without a real server. In production, your TLS client
 // implements Fetcher; in tests, a mock does.
+//
+// # Referee independence (internal/csipref, TASK-082 / AD-003(f))
+//
+// This package (and its sibling internal/csipref/scheduler) is this repo's
+// own, deliberately independent implementation of the CSIP client-side
+// walk-and-evaluate logic — it is NOT the lexa-hub product's walker, and it
+// must never be synced or unified with it. Its whole conformance value is
+// that sim/conformance, sim/client(-http), and tests/* exercise the real
+// hub through a second, separately-written reading of the spec: if this
+// walker and the hub's own client-facing logic ever silently agreed on a
+// shared misreading, no test here would catch it (the "self-confirmation"
+// hazard — architecture review §9). Bug-for-bug parity with the product
+// walker is not a goal; spec-for-spec independence is. See
+// docs/refactor/02_ARCHITECTURE_DECISIONS.md AD-003(f) for the full
+// decision record (option: keep-as-referee, chosen over extraction).
 package discovery
 
 import (

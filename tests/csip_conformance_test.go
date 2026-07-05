@@ -23,11 +23,11 @@ import (
 	"testing"
 	"time"
 
-	"csip-tls-test/internal/csip/discovery"
-	model "lexa-proto/csipmodel"
-	"csip-tls-test/internal/csip/scheduler"
-	"csip-tls-test/sim/gridsim"
+	"csip-tls-test/internal/csipref/discovery"
+	"csip-tls-test/internal/csipref/scheduler"
 	"csip-tls-test/internal/httpclient"
+	"csip-tls-test/sim/gridsim"
+	model "lexa-proto/csipmodel"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,35 +1,22 @@
 # CSIP / IEEE 2030.5 Northbound Stack
 
+**TASK-082 (2026-07-05):** the walker (`discovery/`) and scheduler (`scheduler/`) moved out
+of this package to `internal/csipref/{discovery,scheduler}` — they are this repo's own
+deliberately-independent implementation of the CSIP client-side logic (conformance referee
+value; see `internal/csipref`'s own CLAUDE.md and AD-003(f) in
+`docs/refactor/02_ARCHITECTURE_DECISIONS.md`). What remains here is identity + DNS-SD, which
+are not part of that decision — they're the LFDI/SFDI derivation and mDNS browse that any
+CSIP client (referee or product) needs, not spec-interpretation logic with a self-confirmation
+hazard.
+
 ## Packages
 ```
-model/      Go structs with XML tags. Root elements MUST have xmlns="urn:ieee:std:2030.5:ns".
-discovery/  Link walker starting at /dcap. Follows href attributes — never hardcodes URLs past /dcap.
 identity/   LFDI = leftmost 160 bits of SHA-256(cert DER). SFDI = first 36 bits decimal.
-scheduler/  DER event state machine (cancelled, superseded, randomized-start, primacy, default fallback).
 dnssd/      mDNS browse for _ieee2030._tls._tcp. TXT "path=X" overrides /dcap default.
 ```
 
-## Fetcher interface
-`discovery.Fetcher`: `Get(path) ([]byte, error)` only. Keeps discovery decoupled from TLS.
-- `WolfSSLFetcher` (tlsclient/): persistent TLS session, sync.Mutex, auto-redial on error.
-- `httpclient.Fetcher`: net/http, used in gridsim integration tests (`go test ./tests/`).
-
-## Walker traversal order
-`/dcap` → Time (→ ClockOffset) → EndDeviceList (find self by LFDI) → DERList → FSAList → DERPrograms → DERControlList + DefaultDERControl → MUPList
-
-**ClockOffset**: `serverNow = time.Now().Unix() + tree.ClockOffset`. Required — CSIP §5.2.1.3 requires client within 30 s of server. Pass `serverNow` to every `scheduler.Evaluate()` call.
-
-## Scheduler priority rules
-1. `currentStatus=6` (cancelled) → always skip.
-2. `potentiallySuperseded=true` + later event covers same window + later `creationTime` → later wins.
-3. Randomized start: apply rand offset to startTime once per MRID; cache result.
-4. Primacy: lower number wins (program primacy 1 beats 5 beats 10).
-5. Default fallback: no active event in highest-priority program → use `DefaultDERControl`.
-
-## MirrorUsagePoint telemetry flow
-1. `POST /mup` → 201 + Location header (e.g. `/mup/0`). Save location.
-2. `POST /mup/{n}` with `MirrorMeterReading` XML → 204. Post per measurement update.
-MUP XML must include `xmlns="urn:ieee:std:2030.5:ns"` on root element.
+MUP (MirrorUsagePoint) telemetry flow moved to `internal/csipref/CLAUDE.md` along with the
+walker — see there.
 
 ## DNS-SD
 `dnssd.Browse(ctx)` returns `[]Server{Host, Port, DCAPPath}`.

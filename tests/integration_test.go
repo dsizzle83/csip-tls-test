@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"csip-tls-test/internal/csip/discovery"
-	model "lexa-proto/csipmodel"
-	"csip-tls-test/sim/gridsim"
+	"csip-tls-test/internal/csipref/discovery"
 	"csip-tls-test/internal/httpclient"
+	"csip-tls-test/sim/gridsim"
+	model "lexa-proto/csipmodel"
 )
 
 // testLFDI must match what the grid sim uses for the client's EndDevice.

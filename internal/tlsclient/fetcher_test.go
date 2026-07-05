@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"csip-tls-test/internal/csip/discovery"
+	"csip-tls-test/internal/csipref/discovery"
 )
 
 // Compile-time assertion: WolfSSLFetcher must satisfy discovery.Fetcher.
