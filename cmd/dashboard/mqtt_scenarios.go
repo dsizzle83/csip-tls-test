@@ -82,6 +82,20 @@ func (d *mayhemDriver) mqttScenarios() []*mayScenario {
 			teardown: func(d *mayhemDriver) { _ = d.mqttReset() },
 		},
 		{
+			// Payload has no "v" field (lexa-hub TASK-018: bus.Envelope,
+			// AD-006). That is deliberate, not an oversight: this scenario's
+			// point is a malformed/truncated payload, and the hub's bus
+			// envelope policy treats absent-v as legacy v0 — accepted while
+			// bus.LegacyV0Accepted is true (the transition default) — so
+			// version-checking would never be what rejects this payload
+			// anyway; the truncation itself is what the real json.Unmarshal
+			// (unaffected by the version gate, which runs first but defers
+			// malformed-JSON detection to it) must catch. When the
+			// enforcement flip lands (LegacyV0Accepted=false, tracked in
+			// AD-006 as a separate later change), this injected payload
+			// gains "v":1 in that same change, same as every other
+			// harness-injected control payload — not before, since v0 must
+			// stay accepted here until then.
 			ID: "mqtt-malformed-control", Name: "Malformed retained CSIP control on the bus",
 			Category:   "Bus robustness (INV-EXPORT survivability)",
 			Hypothesis: "A truncated/garbage JSON payload is published RETAINED to lexa/csip/control (a half-written message, a buggy publisher) while a real cap is active.",
@@ -99,6 +113,14 @@ func (d *mayhemDriver) mqttScenarios() []*mayScenario {
 			teardown: func(d *mayhemDriver) { _ = d.mqttReset() },
 		},
 		{
+			// Same v0-tolerance note as mqtt-malformed-control above: this
+			// payload has no "v" field on purpose. It is well-formed JSON
+			// (Source="none") and must still be accepted as legacy v0 by the
+			// hub's version gate — the scenario is testing the STALE-VALUE
+			// hazard, not decode rejection, so the envelope policy must stay
+			// out of its way here. Gains "v":1 alongside every other
+			// injected control payload at the future enforcement flip
+			// (AD-006), not independently.
 			ID: "mqtt-stale-retained", Name: "Stale retained 'no control' overwrites an active cap",
 			Category:   "Bus robustness (INV-EXPORT survivability)",
 			Hypothesis: "A stale retained message (Source=none) lands on lexa/csip/control — a leftover from a previous session or a flapping northbound — telling the hub there is no control while a real cap is still in force.",

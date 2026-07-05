@@ -1,6 +1,13 @@
 # TASK-018 — Bus envelope rollout: all publishers/subscribers, reject-and-alarm
 
-*Status: TODO · Phase: P0 · Effort: L (≈6–8 h + campaign) · Difficulty: med · Risk: med*
+*Status: DONE — code+tests (2026-07-04, lexa-hub a2a9cb3, branch task/018-envelope-rollout); bench rolling-upgrade
+validation and the full FAST Mayhem campaign are DEFERRED to the P0-exit gate — this
+session ran under a deploy freeze (TASK-012 unmerged) with bench access authorized
+read-only/verification only, no deploys. `LegacyV0Accepted` stays `true`; `go test -race
+./internal/... ./cmd/...` (lexa-hub) is green; `go test ./tests/` (csip-tls-test)
+unaffected (no csip code changed). See "Deviations" note below on the
+`Measurement.V`/`Envelope.V` field-name collision found and fixed during implementation.
+· Phase: P0 · Effort: L (≈6–8 h + campaign) · Difficulty: med · Risk: med*
 
 ## Objective
 Every lexa bus message is published with `"v":1` and every subscriber version-checks
@@ -209,4 +216,40 @@ updated.
 Backlog: `LegacyV0Accepted=false` enforcement flip (+ harness payload stamping);
 TASK-025 (desired-state schema born at v1); TASK-042 (retained re-request on
 decode/version failure); TASK-044 (scrape reject counters); TASK-055 (NaN-string
-rejection at the same gate).
+rejection at the same gate). Also: run the deferred bench rolling-upgrade validation
+(step 7) and targeted + full FAST campaign (step 8) at the P0-exit gate, then flip
+AD-006's status marker to ✅.
+
+## Implementation notes (2026-07-04)
+
+**Field-name collision found and fixed.** `bus.Measurement` already had a field
+`V *float64 \`json:"v,omitempty"\`` (voltage) before this task. Embedding `bus.Envelope`
+— itself `V int \`json:"v,omitempty"\`` (schema version) — into `Measurement` as written
+in this task's steps would not have failed to compile, but Go's `encoding/json` resolves
+a same-JSON-key conflict between an embedded field and the struct's own field by depth:
+the shallower (`Measurement`'s own) field silently wins and the promoted `Envelope.V` is
+dropped from the wire with **no error at any layer** — `msg.Envelope.V = 1` compiles,
+runs, and the marshaled JSON never contains `"v":1`. Verified with a standalone
+repro before touching the type (see commit). This would have made the acceptance
+criterion "mosquitto_sub spot check on measurements shows `"v":1`" permanently
+unsatisfiable while every other signal (build, non-JSON-round-trip tests, code review of
+the call site) looked fine.
+
+Fix: renamed `Measurement`'s voltage field to `VoltageV` / `"voltage_v"` — matching the
+naming `EVSEState` already uses for the same physical quantity — freeing `"v"` for the
+envelope. Updated every reader/writer of the old field: `lexa-hub` cmd/modbus (publish),
+cmd/hub/state.go, cmd/api/state.go, cmd/telemetry/main.go (subscribe-side field renames).
+No other of the 14 embedded types had a colliding field. Regression test:
+`internal/bus/messages_test.go`'s `TestMeasurementVoltageDoesNotCollideWithEnvelopeV` and
+`TestPublishedTypesLegacyV0GoldenPayload`'s mixed-version-window case (documents that an
+old pre-rename publisher's fractional `"v"`-as-voltage payload fails the real
+`json.Unmarshal` cleanly — dropped by the existing log-and-drop path, not a new failure
+mode). This is a deliberate, one-time wire-shape change to `Measurement.voltage_v`,
+landed in the same commit as the rest of the rollout; not a "must not change" violation
+(that clause is about envelope decode outcomes, not this pre-existing key clash).
+
+**Deferred, not skipped:** bench rolling-restart test (step 7) and the Mayhem campaign
+gates (step 8) did not run this session — deploy freeze in effect (TASK-012 unmerged),
+lane instructions authorized bench access as read-only/verification only. `AD-006`
+stays 🔶 until that validation runs at the P0-exit gate; see its entry for the recorded
+enforcement-flip criteria this task's step 9 asked for.
