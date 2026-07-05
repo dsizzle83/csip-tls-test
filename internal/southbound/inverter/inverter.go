@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"time"
 
-	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/southbound/derbase"
 	"csip-tls-test/internal/southbound/device"
-	"csip-tls-test/internal/southbound/modbus"
-	"csip-tls-test/internal/southbound/sunspec"
+	model "lexa-proto/csipmodel"
+	"lexa-proto/modbus"
+	"lexa-proto/sunspec"
 )
 
 const tag = "inverter"
@@ -77,13 +77,11 @@ func (inv *Inverter) Status() (device.DeviceStatus, error) {
 		return device.DeviceStatus{}, fmt.Errorf("inverter: read status: %w", err)
 	}
 	if inv.MeasModel == sunspec.ModelDERMeasureAC {
-		if len(regs) <= sunspec.M701_ConnSt {
-			return device.DeviceStatus{}, fmt.Errorf("inverter: M701 too short for St/ConnSt")
-		}
-		st := sunspec.M701St(regs[sunspec.M701_St])
+		ac := sunspec.Parse701(regs)
+		st := int(ac.St)
 		return device.DeviceStatus{
-			Connected: regs[sunspec.M701_ConnSt] == 1,
-			Energized: st == sunspec.M701StOn || st == sunspec.M701StThrottled || st == sunspec.M701StStarting,
+			Connected: ac.ConnSt == 1,
+			Energized: st == derbase.M701StOn || st == derbase.M701StThrottled || st == derbase.M701StStarting,
 		}, nil
 	}
 	if len(regs) <= sunspec.M103_St {
@@ -100,68 +98,8 @@ func (inv *Inverter) ApplyControl(ctrl model.DERControlBase) error {
 	return inv.Base.ApplyControl(ctrl, tag)
 }
 
-// ── Delegated IEEE 1547-2018 methods ─────────────────────────────────────────
-
-func (inv *Inverter) SetEnterService(s sunspec.DEREnterServiceSettings) error {
-	return inv.Base.SetEnterService(s, tag)
-}
-func (inv *Inverter) ReadEnterService() (sunspec.DEREnterServiceSettings, error) {
-	return inv.Base.ReadEnterService(tag)
-}
-func (inv *Inverter) SetDERCtlAC(s sunspec.DERCtlACSettings) error {
-	return inv.Base.SetDERCtlAC(s, tag)
-}
-func (inv *Inverter) ReadDERCtlAC() (sunspec.DERCtlACSettings, error) {
-	return inv.Base.ReadDERCtlAC(tag)
-}
-func (inv *Inverter) ReadDERCapacity() (sunspec.DERCapacity, error) {
-	return inv.Base.ReadDERCapacity(tag)
-}
-func (inv *Inverter) ReadVoltVar() (sunspec.VoltVarCurve, error) {
-	return inv.Base.ReadVoltVar(tag)
-}
-func (inv *Inverter) WriteVoltVar(c sunspec.VoltVarCurve) error {
-	return inv.Base.WriteVoltVar(c, tag)
-}
-func (inv *Inverter) ReadVoltWatt() (sunspec.VoltWattCurve, error) {
-	return inv.Base.ReadVoltWatt(tag)
-}
-func (inv *Inverter) WriteVoltWatt(c sunspec.VoltWattCurve) error {
-	return inv.Base.WriteVoltWatt(c, tag)
-}
-func (inv *Inverter) ReadVoltageTripLV() (sunspec.VoltageTripCurve, error) {
-	return inv.Base.ReadVoltageTripLV(tag)
-}
-func (inv *Inverter) WriteVoltageTripLV(c sunspec.VoltageTripCurve) error {
-	return inv.Base.WriteVoltageTripLV(c, tag)
-}
-func (inv *Inverter) ReadVoltageTripHV() (sunspec.VoltageTripCurve, error) {
-	return inv.Base.ReadVoltageTripHV(tag)
-}
-func (inv *Inverter) WriteVoltageTripHV(c sunspec.VoltageTripCurve) error {
-	return inv.Base.WriteVoltageTripHV(c, tag)
-}
-func (inv *Inverter) ReadFreqTripLF() (sunspec.FreqTripCurve, error) {
-	return inv.Base.ReadFreqTripLF(tag)
-}
-func (inv *Inverter) WriteFreqTripLF(c sunspec.FreqTripCurve) error {
-	return inv.Base.WriteFreqTripLF(c, tag)
-}
-func (inv *Inverter) ReadFreqTripHF() (sunspec.FreqTripCurve, error) {
-	return inv.Base.ReadFreqTripHF(tag)
-}
-func (inv *Inverter) WriteFreqTripHF(c sunspec.FreqTripCurve) error {
-	return inv.Base.WriteFreqTripHF(c, tag)
-}
-func (inv *Inverter) ReadFreqDroop() (sunspec.FreqDroopCtl, error) {
-	return inv.Base.ReadFreqDroop(tag)
-}
-func (inv *Inverter) WriteFreqDroop(c sunspec.FreqDroopCtl) error {
-	return inv.Base.WriteFreqDroop(c, tag)
-}
-func (inv *Inverter) ReadWattVar() (sunspec.WattVarCurve, error) {
-	return inv.Base.ReadWattVar(tag)
-}
-func (inv *Inverter) WriteWattVar(c sunspec.WattVarCurve) error {
-	return inv.Base.WriteWattVar(c, tag)
-}
+// Note: the old bench fork also delegated a wider IEEE 1547-2018 read/write
+// surface (M702/705-712) here. Those derbase methods had zero callers beyond
+// this pass-through and zero test coverage; removed along with their derbase
+// counterparts rather than re-implemented against the shared codec's
+// differently-shaped curve-write workflow (TASK-021; disposal is TASK-082).

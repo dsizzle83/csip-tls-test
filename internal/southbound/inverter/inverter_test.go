@@ -6,9 +6,9 @@ import (
 	"time"
 
 	model "lexa-proto/csipmodel"
-	"csip-tls-test/internal/southbound/modbus"
+	"lexa-proto/modbus"
 	"csip-tls-test/sim/southbound"
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // connect creates an Inverter backed by the in-process test server.

@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	model "lexa-proto/csipmodel"
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // ── ReadMeasurements ──────────────────────────────────────────────────────────

@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"time"
 
-	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/southbound/derbase"
 	"csip-tls-test/internal/southbound/device"
-	"csip-tls-test/internal/southbound/modbus"
-	"csip-tls-test/internal/southbound/sunspec"
+	model "lexa-proto/csipmodel"
+	"lexa-proto/modbus"
+	"lexa-proto/sunspec"
 )
 
 const tag = "battery"
@@ -20,7 +20,6 @@ const tag = "battery"
 type Battery struct {
 	derbase.Base
 	transport modbus.Transport
-	has713    bool // DERStorageCapacity present (IEEE 1547-2018)
 }
 
 // New opens a Modbus connection, scans SunSpec models, and returns a Battery.
@@ -56,7 +55,6 @@ func newFromTransport(t modbus.Transport) (*Battery, error) {
 	return &Battery{
 		Base:      base,
 		transport: t,
-		has713:    r.HasModel(sunspec.ModelDERStorageCap),
 	}, nil
 }
 
@@ -83,13 +81,11 @@ func (b *Battery) Status() (device.DeviceStatus, error) {
 		if err != nil {
 			return device.DeviceStatus{}, fmt.Errorf("battery: read M701 status: %w", err)
 		}
-		if len(regs) <= sunspec.M701_ConnSt {
-			return device.DeviceStatus{}, fmt.Errorf("battery: M701 too short for St/ConnSt")
-		}
-		st := sunspec.M701St(regs[sunspec.M701_St])
+		ac := sunspec.Parse701(regs)
+		st := int(ac.St)
 		return device.DeviceStatus{
-			Connected: regs[sunspec.M701_ConnSt] == 1,
-			Energized: st == sunspec.M701StOn || st == sunspec.M701StThrottled || st == sunspec.M701StStarting,
+			Connected: ac.ConnSt == 1,
+			Energized: st == derbase.M701StOn || st == derbase.M701StThrottled || st == derbase.M701StStarting,
 		}, nil
 	}
 
@@ -129,80 +125,11 @@ func (b *Battery) ApplyControl(ctrl model.DERControlBase) error {
 	return b.Base.ApplyControl(ctrl, tag)
 }
 
-// ReadStorageCapacity reads battery storage state from M713.
-func (b *Battery) ReadStorageCapacity() (sunspec.DERStorageCapacity, error) {
-	if !b.has713 {
-		return sunspec.DERStorageCapacity{}, fmt.Errorf("battery: device has no M713 (DERStorageCapacity)")
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERStorageCap)
-	if err != nil {
-		return sunspec.DERStorageCapacity{}, fmt.Errorf("battery: read M713: %w", err)
-	}
-	return sunspec.ParseDERStorageCapacity(regs)
-}
-
-// ── Delegated IEEE 1547-2018 methods ─────────────────────────────────────────
-
-func (b *Battery) SetEnterService(s sunspec.DEREnterServiceSettings) error {
-	return b.Base.SetEnterService(s, tag)
-}
-func (b *Battery) ReadEnterService() (sunspec.DEREnterServiceSettings, error) {
-	return b.Base.ReadEnterService(tag)
-}
-func (b *Battery) SetDERCtlAC(s sunspec.DERCtlACSettings) error {
-	return b.Base.SetDERCtlAC(s, tag)
-}
-func (b *Battery) ReadDERCtlAC() (sunspec.DERCtlACSettings, error) {
-	return b.Base.ReadDERCtlAC(tag)
-}
-func (b *Battery) ReadDERCapacity() (sunspec.DERCapacity, error) {
-	return b.Base.ReadDERCapacity(tag)
-}
-func (b *Battery) ReadVoltVar() (sunspec.VoltVarCurve, error) {
-	return b.Base.ReadVoltVar(tag)
-}
-func (b *Battery) WriteVoltVar(c sunspec.VoltVarCurve) error {
-	return b.Base.WriteVoltVar(c, tag)
-}
-func (b *Battery) ReadVoltWatt() (sunspec.VoltWattCurve, error) {
-	return b.Base.ReadVoltWatt(tag)
-}
-func (b *Battery) WriteVoltWatt(c sunspec.VoltWattCurve) error {
-	return b.Base.WriteVoltWatt(c, tag)
-}
-func (b *Battery) ReadVoltageTripLV() (sunspec.VoltageTripCurve, error) {
-	return b.Base.ReadVoltageTripLV(tag)
-}
-func (b *Battery) WriteVoltageTripLV(c sunspec.VoltageTripCurve) error {
-	return b.Base.WriteVoltageTripLV(c, tag)
-}
-func (b *Battery) ReadVoltageTripHV() (sunspec.VoltageTripCurve, error) {
-	return b.Base.ReadVoltageTripHV(tag)
-}
-func (b *Battery) WriteVoltageTripHV(c sunspec.VoltageTripCurve) error {
-	return b.Base.WriteVoltageTripHV(c, tag)
-}
-func (b *Battery) ReadFreqTripLF() (sunspec.FreqTripCurve, error) {
-	return b.Base.ReadFreqTripLF(tag)
-}
-func (b *Battery) WriteFreqTripLF(c sunspec.FreqTripCurve) error {
-	return b.Base.WriteFreqTripLF(c, tag)
-}
-func (b *Battery) ReadFreqTripHF() (sunspec.FreqTripCurve, error) {
-	return b.Base.ReadFreqTripHF(tag)
-}
-func (b *Battery) WriteFreqTripHF(c sunspec.FreqTripCurve) error {
-	return b.Base.WriteFreqTripHF(c, tag)
-}
-func (b *Battery) ReadFreqDroop() (sunspec.FreqDroopCtl, error) {
-	return b.Base.ReadFreqDroop(tag)
-}
-func (b *Battery) WriteFreqDroop(c sunspec.FreqDroopCtl) error {
-	return b.Base.WriteFreqDroop(c, tag)
-}
-func (b *Battery) ReadWattVar() (sunspec.WattVarCurve, error) {
-	return b.Base.ReadWattVar(tag)
-}
-func (b *Battery) WriteWattVar(c sunspec.WattVarCurve) error {
-	return b.Base.WriteWattVar(c, tag)
-}
+// Note: the old bench fork also exposed ReadStorageCapacity (M713) plus a
+// wider IEEE 1547-2018 read/write surface (M702/705-712) delegated to
+// derbase. All had zero callers beyond their own pass-through/type
+// declaration and zero test coverage; removed along with their derbase
+// counterparts rather than re-implemented against the shared codec's
+// differently-shaped M713 layout (spec Table 16 vs this fork's non-spec
+// layout — disposition doc §2c S5) and curve-write workflow (TASK-021;
+// disposal is TASK-082).

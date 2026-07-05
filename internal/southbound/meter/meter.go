@@ -22,8 +22,8 @@ import (
 
 	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/southbound/device"
-	"csip-tls-test/internal/southbound/modbus"
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/modbus"
+	"lexa-proto/sunspec"
 )
 
 // Meter implements device.Device for a SunSpec AC grid meter over Modbus.
