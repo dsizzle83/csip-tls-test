@@ -32,7 +32,7 @@ import (
 
 	"csip-tls-test/internal/csip/discovery"
 	"csip-tls-test/internal/csip/identity"
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/csip/scheduler"
 	"csip-tls-test/internal/tlsclient"
 	"csip-tls-test/internal/wolfssl"

@@ -1,4 +1,8 @@
-// Package model defines Go structs for IEEE 2030.5 / CSIP resources.
+// Package csipmodel defines Go structs for the IEEE 2030.5 / CSIP XML data
+// model — the wire-format types both lexa-hub (client-side unmarshal) and
+// csip-tls-test's gridsim (server-side marshal) work from (TASK-023). This is
+// the data model only: walkers, schedulers, identity, and DNS-SD stay
+// repo-local forks that merely import this package.
 //
 // Every struct uses XML tags that match the 2030.5 schema exactly,
 // including the mandatory namespace urn:ieee:std:2030.5:ns.
@@ -6,9 +10,18 @@
 // SubscribableResource, etc.) is flattened into Go structs with embedded
 // fields, because Go's encoding/xml handles embedded struct tags correctly.
 //
-// Only the resource types required by a CSIP DER client are defined here.
-// Server-only types (like billing, messaging, prepayment) are omitted.
-package model
+// Only the resource types required by a CSIP DER client (and the gridsim
+// that serves them) are defined here. Prepayment and messaging function
+// sets are out of scope.
+//
+// CRITICAL — silent-failure hazard: a 2030.5 root element unmarshalled
+// without its namespace (urn:ieee:std:2030.5:ns) decodes to a zero-value
+// struct with NO error from encoding/xml. Every root element below carries
+// an explicit `xml:"urn:ieee:std:2030.5:ns <Name>"` XMLName tag for exactly
+// this reason — never add a root element type without one, and never edit
+// an existing tag without re-running the round-trip suite in
+// resources_test.go plus both consumers' conformance suites.
+package csipmodel
 
 import "encoding/xml"
 
@@ -53,9 +66,10 @@ type DeviceCapability struct {
 	PollRate uint32 `xml:"pollRate,attr,omitempty"`
 
 	// Links inherited from FunctionSetAssignmentsBase
-	DERProgramListLink  *ListLink `xml:"DERProgramListLink,omitempty"`
-	TimeLink            *Link     `xml:"TimeLink,omitempty"`
-	ResponseSetListLink *ListLink `xml:"ResponseSetListLink,omitempty"`
+	DERProgramListLink    *ListLink `xml:"DERProgramListLink,omitempty"`
+	TimeLink              *Link     `xml:"TimeLink,omitempty"`
+	ResponseSetListLink   *ListLink `xml:"ResponseSetListLink,omitempty"`
+	TariffProfileListLink *ListLink `xml:"TariffProfileListLink,omitempty"`
 
 	// DeviceCapability-specific links
 	EndDeviceListLink        *ListLink `xml:"EndDeviceListLink,omitempty"`
@@ -117,10 +131,12 @@ type EndDevice struct {
 	Enabled *bool `xml:"enabled,omitempty"`
 
 	// Links to subordinate resources
-	DERListLink                    *ListLink `xml:"DERListLink,omitempty"`
-	FunctionSetAssignmentsListLink *ListLink `xml:"FunctionSetAssignmentsListLink,omitempty"`
-	RegistrationLink               *Link     `xml:"RegistrationLink,omitempty"`
-	LogEventListLink               *ListLink `xml:"LogEventListLink,omitempty"`
+	DERListLink                     *ListLink `xml:"DERListLink,omitempty"`
+	FunctionSetAssignmentsListLink  *ListLink `xml:"FunctionSetAssignmentsListLink,omitempty"`
+	RegistrationLink                *Link     `xml:"RegistrationLink,omitempty"`
+	LogEventListLink                *ListLink `xml:"LogEventListLink,omitempty"`
+	FlowReservationRequestListLink  *ListLink `xml:"FlowReservationRequestListLink,omitempty"`
+	FlowReservationResponseListLink *ListLink `xml:"FlowReservationResponseListLink,omitempty"`
 }
 
 // EndDeviceList is a collection of EndDevice resources.
@@ -160,11 +176,11 @@ type FunctionSetAssignments struct {
 	// Subscribable indicates subscription support.
 	Subscribable uint8 `xml:"subscribable,attr,omitempty"`
 
-	// Links to DER program lists, time, pricing, billing, etc.
+	// Links to assigned function set resource lists.
 	DERProgramListLink      *ListLink `xml:"DERProgramListLink,omitempty"`
+	TimeLink                *Link     `xml:"TimeLink,omitempty"`
 	TariffProfileListLink   *ListLink `xml:"TariffProfileListLink,omitempty"`
 	CustomerAccountListLink *ListLink `xml:"CustomerAccountListLink,omitempty"`
-	TimeLink                *Link     `xml:"TimeLink,omitempty"`
 	MRID                    string    `xml:"mRID,omitempty"`
 	Description             string    `xml:"description,omitempty"`
 	Version                 uint16    `xml:"version,omitempty"`
@@ -382,15 +398,18 @@ type ReadingType struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns ReadingType"`
 	Resource
 
-	AccumulationBehaviour uint8  `xml:"accumulationBehaviour,omitempty"`
-	CommodityType         uint8  `xml:"commodity,omitempty"`
-	DataQualifier         uint8  `xml:"dataQualifier,omitempty"`
-	FlowDirection         uint8  `xml:"flowDirection,omitempty"`
-	IntervalLength        uint32 `xml:"intervalLength,omitempty"`
-	Kind                  uint8  `xml:"kind,omitempty"`
-	Phase                 uint16 `xml:"phase,omitempty"`
-	PowerOfTenMultiplier  int8   `xml:"powerOfTenMultiplier,omitempty"`
-	Uom                   uint8  `xml:"uom,omitempty"`
+	AccumulationBehaviour     uint8  `xml:"accumulationBehaviour,omitempty"`
+	CommodityType             uint8  `xml:"commodity,omitempty"`
+	DataQualifier             uint8  `xml:"dataQualifier,omitempty"`
+	FlowDirection             uint8  `xml:"flowDirection,omitempty"`
+	IntervalLength            uint32 `xml:"intervalLength,omitempty"`
+	Kind                      uint8  `xml:"kind,omitempty"`
+	NumberOfConsumptionBlocks uint8  `xml:"numberOfConsumptionBlocks,omitempty"`
+	NumberOfTouTiers          uint8  `xml:"numberOfTouTiers,omitempty"`
+	Phase                     uint16 `xml:"phase,omitempty"`
+	PowerOfTenMultiplier      int8   `xml:"powerOfTenMultiplier,omitempty"`
+	TieredConsumptionBlocks   *bool  `xml:"tieredConsumptionBlocks,omitempty"`
+	Uom                       uint8  `xml:"uom,omitempty"`
 }
 
 // Reading is a single measured value within a MirrorReadingSet.
@@ -432,11 +451,39 @@ type MirrorMeterReading struct {
 
 // Response status codes (IEEE 2030.5 table 27).
 const (
-	ResponseEventReceived  uint8 = 1 // event text received and understood
-	ResponseEventStarted   uint8 = 2 // event interval began
-	ResponseEventCompleted uint8 = 3 // event interval ended
-	ResponseOptIn          uint8 = 4 // client opted in (for opt-in programs)
-	ResponseOptOut         uint8 = 5 // client opted out
+	ResponseEventReceived   uint8 = 1 // event text received and understood
+	ResponseEventStarted    uint8 = 2 // event interval began
+	ResponseEventCompleted  uint8 = 3 // event interval ended
+	ResponseOptIn           uint8 = 4 // client opted in (for opt-in programs)
+	ResponseOptOut          uint8 = 5 // client opted out
+	ResponseEventCancelled  uint8 = 6 // event cancelled by the server (CORE-022)
+	ResponseEventSuperseded uint8 = 7 // event superseded by an overlapping event (CORE-023)
+
+	// ResponseCannotComply is a LEXA profile extension (NOT an IEEE 2030.5
+	// Table 27 status). It alerts the server that the DER physically cannot meet
+	// an active control limit — e.g. an import cap that would require battery
+	// discharge below its SOC reserve. Chosen in the 0xF0–0xFF manufacturer
+	// range so it never collides with a standard status (1–7); the gridsim
+	// server treats any status ≥ 0xF0 as a resource-limited non-compliance
+	// alert rather than a lifecycle acknowledgement.
+	ResponseCannotComply uint8 = 0xF0 // 240 — LEXA: DER unable to honour the control
+)
+
+// IEEE 2030.5 UomType codes (Table for ReadingType.uom) used by MUP telemetry.
+const (
+	UomWatts uint8 = 38 // real power, W
+	UomVolts uint8 = 29 // voltage, V
+	UomHertz uint8 = 33 // frequency, Hz
+)
+
+// DataQualifier codes (ReadingType.dataQualifier).
+const DataQualifierAverage uint8 = 2
+
+// KindType codes (ReadingType.kind).
+const (
+	KindPower   uint8 = 37 // power (W)
+	KindVoltage uint8 = 12 // voltage
+	KindFreq    uint8 = 38 // frequency
 )
 
 // Response is posted by the client to the server's ResponseSetListLink

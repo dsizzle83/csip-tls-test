@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 )
 
 // AdminHandler returns a plain HTTP handler for the gridsim management API.

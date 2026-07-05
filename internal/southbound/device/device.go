@@ -6,7 +6,7 @@
 // implementations live in sibling packages (inverter, battery).
 package device
 
-import "csip-tls-test/internal/csip/model"
+import model "lexa-proto/csipmodel"
 
 // Device is the southbound abstraction for a single piece of DER hardware.
 // Implementations must be safe for concurrent use.
