@@ -1,6 +1,16 @@
 # TASK-027 — Battery reconciler in lexa-modbus: shadow mode (observe/compare, write nothing)
 
-*Status: TODO · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+*Status: CODE COMPLETE (2026-07-05, lexa-hub 3d52412) — bench soak + Mayhem
+campaign deferred to the wave gate per session scope (see Deviations below) ·
+Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+
+**Session scope note (2026-07-05):** this pass delivered code + unit tests
+only (`go test -race ./internal/... ./cmd/...` green, lexa-hub); no bench
+deploy. Steps 6–9 (deploy, bench verify, targeted + full Mayhem campaign,
+timing re-tune) and the acceptance-criteria items that depend on them are
+**not done** — batched at the wave gate per the launching session's explicit
+instruction. Do not treat this file's "CODE COMPLETE" as "DONE": the
+Definition of Done requires the campaign evidence below to close it out.
 
 ## Objective
 The hub publishes retained battery desired-state documents alongside (not instead of) its
