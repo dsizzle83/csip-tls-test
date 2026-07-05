@@ -395,6 +395,28 @@ helpers `Expired` and `InWindow` matching `scheduler.controlExpired`/
 scheduler/hub/api/optimizer migrations are TASK-035/036 (verbatim-port
 comparison against today's scheduler happens there).
 
+**Migrated (TASK-035, 2026-07-05, branch `task/035-scheduler-time`):**
+consumers 1–3 of 5 — the walker/serverNow and scheduler. `cmd/northbound`
+constructs one `utilitytime.Clock`; `runDiscovery` feeds each successful
+walk's raw `tree.ClockOffset` via `clk.SetOffset` (logging only a real
+`Step` transition) and reads `serverNow` back through `clk.ServerNow()`
+(was `scheduler.ServerNow(tree.ClockOffset)` — byte-identical: local + raw
+offset, still computed once per walk and shared across Evaluate/Build/
+SupersededMRIDs). `responseTracker` holds that shared Clock instead of a
+cached `clockOffset`; Response `CreatedDateTime` arithmetic is unchanged.
+Inside the scheduler, `controlExpired` delegates to `utilitytime.Expired`
+and the `activeEvent`/`SupersededMRIDs` interval checks to
+`utilitytime.InWindow`; **`failClosed`, `stillServed`, `plausibleControl`
+and all guard ordering are untouched** — the two clock-regression guards
+and the 2026-07-03 default-fallback guard keep bit-identical semantics.
+`failclosed_test.go`/`scheduler_test.go` pass with an empty diff; a new
+`utilitytime_equiv_test.go` differential proves `Evaluate` resolves
+identical `*ActiveControl` whether `serverNow` comes from the legacy
+formula or the Clock. `scheduler.ServerNow` retained but deprecated (hub-
+side TASK-036 still uses the formula until it migrates). Deployed
+lexa-northbound only (bench 028-active elsewhere); gate + full FAST
+campaign at the wave gate.
+
 ## AD-005 ✅ Persistence: append-only event journal + guard snapshots, not a database (W5)
 
 **Decision.** Newline-delimited, size-rotated, fsync-batched journal on
