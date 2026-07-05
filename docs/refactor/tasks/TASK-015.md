@@ -1,6 +1,19 @@
 # TASK-015 — Stock-timing Mayhem release gate (campaign wrapper + first STOCK baseline)
 
-*Status: TODO · Phase: P0 · Effort: M (≈4–6 h + overnight run) · Difficulty: low · Risk: low*
+*Status: PARTIAL (2026-07-04) · Phase: P0 · Effort: M (≈4–6 h + overnight run) · Difficulty: low · Risk: low*
+
+**Partial-completion note (2026-07-04):** `scripts/mayhem-campaign.sh` and
+`docs/QA_STOCK_TRIAGE_TEMPLATE.md` are implemented and locally tested (dry-run modes,
+argument parsing, mode-verification mismatch guard, EXIT-trap restore on normal
+completion / exit-1 continue / exit-2 abort / SIGTERM-while-blocked-on-foreground-child
+— see branch `task/015-stock-gate` for the offline test harness notes). The actual
+10-cycle STOCK campaign against the live bench, its triage, and
+`docs/QA_REPORT_STOCK_M0_<date>.md` are **deliberately deferred**: this wave was
+tooling-only by the launching session's explicit instruction — another agent was
+running a FAST campaign on the shared bench concurrently, and the Principal has
+scheduled the actual STOCK baseline run at the P0-exit gate. Re-run
+`scripts/mayhem-campaign.sh --mode stock --cycles 10` (bench healthy, FAST first) at
+that point, triage per the template, write the M0 report, and flip this header to DONE.
 
 ## Objective
 A campaign wrapper script runs N Mayhem cycles in FAST **or** STOCK bench timing with
