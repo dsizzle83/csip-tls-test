@@ -138,6 +138,16 @@ can. When a principle must be broken, say so in the PR description and in
 here are one-per-PR, full-campaign-gated, never batched with unrelated
 work, and never merged the same day they're written.
 
+
+**Deadline amendment (2026-07-05, Principal + project owner):** for the
+duration of the 48-hour delivery push: (a) full Mayhem campaigns are
+required only at reconciler flips, legacy deletions, optimizer-constraint
+migrations, and phase exits — other merges gate on unit suites + batched
+targeted `--only` sets; (b) the same-day-merge cooling-off is suspended —
+gated-green + Principal review replaces the calendar wait. Both revert to
+the standing rules after the push; residual risk is carried by the M2
+10-cycle overnight campaign and the release-gate FAST+STOCK runs.
+
 One narrow exception: **purely additive, provably-unwired code** (a new
 file nothing imports yet, e.g. TASK-057/058 skeletons) may skip the
 campaign — but the PR that first *wires* it pays the full gate, and the
