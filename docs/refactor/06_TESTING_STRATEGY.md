@@ -103,7 +103,8 @@ optimizer tests; no soak, no packet-level chaos, no restart-unclean tests.
    `// QA <scenario/finding>` (existing culture, now enforced in review).
 2. **The preservation ledger** (TASK-025) maps each legacy guard to its
    originating scenario; those scenarios individually gate the guard's
-   replacement — behavior survives even when code doesn't.
+   replacement — behavior survives even when code doesn't. It now exists:
+   `docs/refactor/PRESERVATION_LEDGER.md` (11 rows, AD-013).
 3. **Campaign evidence is versioned:** every campaign report lands in
    `docs/` (existing `qa-mayhem-*`/`QA_REPORT_*` pattern) and phase-exit
    reports are referenced from `00_MASTER_INDEX.md` status.

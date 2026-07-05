@@ -49,10 +49,14 @@ risk (§8.3) → mitigated by mandatory `issuedAt`/`seq` + staleness policy
 Behavior-preservation ledger in TASK-025 maps every deleted guard to the
 Mayhem scenario that created it.
 
-**Open questions.** ❓ Does the Tier-0 interlock read the desired-state doc
-directly (bypassing hub) for its reflexes, or stay measurement-only?
-Default: measurement-only (unchanged) until P5. ❓ Meter gets no desired
-state (read-only device) — confirm no code path assumes otherwise.
+**Open questions — both resolved by AD-013/TASK-025 (2026-07-05).**
+✅ The Tier-0 interlock stays **measurement-only**, above the reconciler: it
+does not read the desired-state doc (would defeat its hub/broker-death
+independence, ADR-0001). Revisit only at P5 if a latency case appears.
+✅ Meter gets **no** desired document — verified no actuator exists for it
+(`cmd/hub/main.go:213–232` registers actuators for battery/inverter/EVSE
+only; `cmd/modbus` `subscribeControls` gates on role battery/inverter,
+`cmd/modbus/main.go:203–241`). See AD-013.
 
 ## AD-003 ✅ Shared protocol code: one module, versioned, CI-pinned (R2)
 
@@ -368,6 +372,124 @@ MQTT handlers do not `recover()`; a panic kills the service; systemd
 restarts (5 s) + retained topics + (post-P3) snapshot restore re-seed
 state. This is the documented intended design (review §10.6) — watchdogs
 (TASK-007/008) extend it to live-but-wedged. Do not add blanket recovers.
+
+## AD-013 ✅ Desired-state document: schema, topic, seq/staleness policy (AD-002's wire contract)
+
+**Problem.** AD-002 decided the optimizer publishes a retained, versioned,
+per-device desired-state document that a co-located reconciler converges the
+hardware to, but left the wire contract unspecified: topic layout, field set +
+per-field absence meaning, and the anti-rollback (seq/staleness) policy a
+*retained* control document needs (§8.3). TASK-026…033 each replace a legacy
+convergence mechanism against this schema; without one fixed contract each
+would re-invent field semantics (RSK-01).
+
+**Decision — topic.** `lexa/desired/{class}/{device}`, `class ∈
+{battery, solar, evse}`, **retained, QoS 1** (control-plane precedent
+`lexa/csip/control`). Retained + QoS 1 gives free crash recovery: a reconciler
+that (re)subscribes — after its own restart, a broker restart, or a device
+reconnect — is redelivered the standing intent immediately, without waiting for
+the publisher to re-emit. For EVSE, `{device}` is the OCPP stationID and the
+connector rides *inside* the document (`connector_id`); one retained doc per
+station, matching `lexa/evse/{station}/command`. Meter has **no** desired topic
+(see resolution below).
+
+**Decision — document fields** (JSON, snake_case wire tags; `*T` = "absent /
+no opinion", the NaN-as-nil bus rule):
+
+| Field | Wire key | Type | Meaning |
+|---|---|---|---|
+| version | `v` | `int` (=`DesiredStateV`=1) | AD-006 envelope; born versioned |
+| class | `device_class` | `string` | `battery`\|`solar`\|`evse` |
+| id | `device_id` | `string` | device name / stationID |
+| ceiling | `ceiling_w` | `*float64` | **solar** generation ceiling (W); restore = an explicit large value (`restoreCeilingW`-style 1e9), **never** "field absent" |
+| setpoint | `setpoint_w` | `*float64` | **battery** setpoint (W): +discharge / −charge |
+| connect | `connect` | `*bool` | **battery** cease/energize |
+| current | `max_current_a` | `*float64` | **EVSE** max current (A); explicit `0` = suspend |
+| connector | `connector_id` | `int` | **EVSE** connector (0 = station default per OCPP) |
+| source | `source` | `string` | `csip-event`\|`csip-default`\|`economic`\|`safety` |
+| mrid | `mrid` | `string` | active CSIP control, for CannotComply attribution (TASK-031) |
+| issued | `issued_at` | `int64` | Unix seconds, publisher wall clock |
+| seq | `seq` | `uint64` | **monotonic per device**, publisher-owned |
+
+**Field-absence semantics (the silent-zero XML lesson applied to the bus).**
+`nil`/omitted ≠ zero. A `nil` typed field is "no opinion — leave that surface
+as the last standing intent set it"; an explicit zero is a *command*:
+`setpoint_w:0` idles the battery (and per ledger L1 is what *enforces* the SOC
+reserve — never confuse it with "no setpoint"), `max_current_a:0` suspends the
+EVSE. Solar restore is likewise an explicit large `ceiling_w`, not an absent
+field — the modbus layer already learned an EMPTY control is a silent no-op
+(`cmd/modbus/main.go:263–277`, `solarCommandToControl`). Per class only its own
+fields carry opinion; the others stay `nil` (a battery doc's `ceiling_w` /
+`max_current_a` are always `nil`, etc.).
+
+**Decision — seq / staleness policy (RSK-17).** A consumer keeps, per device,
+the last-applied `(seq, issued_at)`. On each received document:
+
+1. **Reject as out-of-order / replay** iff `seq <= lastAppliedSeq` **AND**
+   `issued_at <= lastAppliedIssuedAt` — the retained-redelivery / duplicate
+   case. Count it (per-device reject counter) and log rate-limited.
+2. **Accept with a `SeqReset` signal** when `issued_at` is **strictly newer**
+   than `lastAppliedIssuedAt` but `seq` is lower or reset (e.g. back to 0).
+   This is the publisher-restart case: the hub restarts and its per-device
+   `seq` resets to 0, but its wall clock advanced, so fresh intent legitimately
+   carries a *smaller* seq than the pre-restart retained doc. Emit a structured
+   `SeqReset` log + counter (a restart must be observable, not silent) and
+   adopt the new `(seq, issued_at)` as the baseline.
+3. **Reject as stale**, regardless of seq, any document whose `issued_at` is
+   older than the staleness bound (below): an old retained doc carrying a high
+   seq must not win over reality.
+
+The rules compose: (1) is the anti-rollback guard within one publisher epoch,
+(2) tolerates the epoch change a restart creates, (3) bounds trust in the
+retained message's age. `seq` is deliberately **per device**, not per-class or
+global: reconcilers compare monotonicity per device, and a shared counter would
+couple independent devices and cause spurious rejects.
+
+**Absence of fresh documents is NOT a release (fail-closed, 05 §3).** If no
+document arrives the reconciler **holds last-known-good** — silence is never
+"return the device to full output / unsuspend". After a wall-clock staleness
+threshold it emits a *staleness report* (observability only; it does not change
+the held command). **Default threshold: 300 s** — long enough to survive a
+broker blip and a publisher restart + first re-publish (hub systemd restart
+≈5 s + first economic tick), short enough to surface a wedged publisher within
+one CSIP reporting-grace window; being a reported condition and not an
+actuation change, erring long is safe. Full retained-trust hardening (active
+re-request instead of waiting; tuning this bound against measured restart
+timings) is TASK-042; this AD fixes the schema and the *hold-and-report*
+discipline it depends on.
+
+**Alternatives considered.** *Absence = restore* (rejected: reintroduces the
+silent-zero bug class the schema exists to kill — a dropped/late doc would
+silently uncurtail a plant). *Single global / per-class `seq`* (rejected:
+couples independent devices, causes cross-device replay rejects). *Timestamp
+only, no seq* (rejected: two docs within one wall-clock second are unordered).
+*`seq` only, no `issued_at`* (rejected: a restart to `seq=0` could not be
+distinguished from a replay — rule 2 needs the clock).
+
+**Tradeoffs.** Consumers carry two extra scalars per device and one clock
+comparison; in exchange the legacy convergence mechanisms (ledger L1–L7)
+collapse to one reconciler reading one retained doc. The staleness bound is a
+policy knob, not a safety boundary (safety stays fail-closed on the held value
+plus the Tier-0 interlock).
+
+**Migration.** Types land now (`internal/bus/desired.go`, `DesiredStateV`),
+compiled but unused. TASK-026 builds the reconciler that subscribes
+`SubDesired` (`lexa/desired/+/+`) and adds the topic → `DesiredStateV` case to
+`bus.SupportedV`; TASK-027… publish per class (battery → solar → EVSE). Every
+legacy mechanism the doc replaces is tracked to its originating QA scenario in
+`docs/refactor/PRESERVATION_LEDGER.md` (TASK-025) and may not be deleted until
+its gate scenarios pass on the reconciler (05 §11).
+
+**Resolves AD-002's open questions.** ✅ **Meter gets no desired document** —
+no actuator exists for it: `cmd/hub` registers actuators only for
+`battery`/`inverter` roles and EVSE stations (`cmd/hub/main.go:213–232`), and
+`cmd/modbus` `subscribeControls` gates writes on role `battery`/`inverter`
+(`cmd/modbus/main.go:203–241`); the meter is read-only, so no `class` for it
+exists. ✅ **Tier-0 interlock stays measurement-only**, above the reconciler
+(`cmd/modbus/interlock.go`): it does not read the desired doc and never
+reconnects a pack — a local reflex that must survive hub/broker death
+(ADR-0001), so coupling it to a bus document would defeat its purpose. Revisit
+only at P5.
 
 ---
 

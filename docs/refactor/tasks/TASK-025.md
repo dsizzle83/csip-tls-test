@@ -1,6 +1,6 @@
 # TASK-025 — Desired-state document: schema ADR, bus types, and the behavior-preservation ledger
 
-*Status: TODO · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-05, 1c5ae94 docs / lexa-hub 4dbb7b3 code) · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
 
 ## Objective
 Three deliverables, zero runtime change: (1) an ADR (new AD-013 in
