@@ -40,28 +40,39 @@ name: CI
 # informational findings — see docs/refactor/VULN_BASELINE_2026-07-04.md and
 # its TASK-006 addendum.
 #
-# TASK-004: `lockstep` job (report-only until Phase 1, W3/D4/AD-003) byte-diffs
-# internal/southbound/sunspec and internal/ocppserver against the product repo
-# (dsizzle83/lexa-hub) — MTR-4: these trees must change together or a lone
-# edit misreads real hardware, and the rule already failed once (review W3)
-# while it lived only as a CLAUDE.md sentence. See scripts/ci/lockstep-
-# check.sh and scripts/ci/lockstep-allowlist.txt for the mechanics.
+# TASK-024: `proto-pin` job replaces TASK-004's report-only `lockstep` job
+# (byte-diffing internal/southbound/sunspec and internal/ocppserver against
+# lexa-hub). Both trees are now gone from both repos — TASK-020-023 moved
+# them into the shared `lexa-proto` module (sunspec, derbase, modbus,
+# ocppserver, csipmodel; AD-003) — so a tree-diff would compare nothing and
+# be green by vacuity. The real MTR-4 lockstep question now is version skew:
+# do the two consumer repos require the SAME lexa-proto commit? `proto-pin`
+# compares each repo's committed `proto.pin` (the interim pinning mechanism,
+# AD-003(c) — lexa-proto isn't hosted yet, so a go.mod pseudo-version
+# comparison isn't possible) and fails on mismatch. See
+# scripts/check-proto-pin.sh for the full mechanics (including the
+# desktop-only `--verify-vendor` deep check).
 #
 # The two repos are both private under the same owner, so the default
 # GITHUB_TOKEN cannot read lexa-hub for the second checkout — this job uses
-# a fine-grained PAT stored as repo secret LEXA_HUB_RO_TOKEN:
+# a fine-grained PAT stored as repo secret LEXA_HUB_RO_TOKEN (same secret
+# TASK-004's lockstep job used):
 #   Scope: read-only, "Contents" permission, restricted to the single repo
 #   dsizzle83/lexa-hub. No other repos, no other permissions.
 #   Expiry: set at creation (GitHub fine-grained PATs require an expiry);
 #   rotate before it lapses or this job starts failing on checkout, not on
-#   an actual divergence — check the failure message before assuming drift.
+#   an actual pin mismatch — check the failure message before assuming drift.
 #
-# Report-only: unallowlisted (NEW) divergence fails the job; today's known
-# W3 divergence (scripts/ci/lockstep-allowlist.txt) prints a warning but
-# does not fail it. TASK-021 is expected to shrink the allowlist; TASK-024
-# flips this job to --enforce (or retires it) once the shared `lexa-proto`
-# module (AD-003) replaces the duplication with version pinning.
-# TODO(TASK-024): replace this job with shared-module version-pin check.
+# lexa-hub's CI runs the mirror-image job (checks out csip-tls-test via a new
+# CSIP_TLS_TEST_RO_TOKEN secret, invokes the checked-out copy of this same
+# script) — TASK-004's lockstep job was one-sided (only csip-tls-test's CI
+# ran it), which is exactly the "asymmetric bump" gap TASK-024 closes; both
+# repos must gate on the pin now.
+#
+# Enforcing (not report-only): any pin mismatch fails the job. There is no
+# allowlist — a lockstep gate that ships known-differences-forever is the
+# W3 failure mode repeating; the two repos are either pinned identically or
+# the gate is red.
 
 on:
   pull_request:
@@ -74,20 +85,16 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# TASK-019: csip-tls-test committed a go.work (`use (. ../lexa-proto)`) for
-# local development against the in-progress shared module (AD-003). Hosted
-# runners check out only this one repo (the `lockstep` job's second checkout
-# of dsizzle83/lexa-hub is a nested `lexa-hub/` subdirectory, not a sibling
-# `../lexa-proto`), so `../lexa-proto` never exists here — Go's automatic
-# go.work discovery would otherwise fail every job in this file. GOWORK=off
-# makes every `go` invocation below behave exactly as it did before go.work
-# existed (single-module mode); safe because no package here imports
-# lexa-proto yet (the skeleton is unreferenced). Comes out together with
-# go.work at TASK-024 once version pinning (proto.pin or its go.mod-
-# pseudo-version successor) is authoritative.
-env:
-  GOWORK: "off"
-
+# TASK-019 committed a go.work (`use (. ../lexa-proto)`) for local dev against
+# the in-progress shared module, with GOWORK=off set here because hosted
+# runners never have a `../lexa-proto` sibling. TASK-024 removes go.work from
+# version control (AD-003(d)/(e)): the build now goes through the committed
+# `require lexa-proto v0.0.0` + `replace lexa-proto => ../lexa-proto` +
+# vendor/lexa-proto/ in go.mod, which Go auto-selects (`-mod=vendor`) whenever
+# vendor/modules.txt is present and consistent — no GOWORK setting needed for
+# that to work, and none exists to turn off since the file isn't committed.
+# Developers may still keep an untracked local go.work (gitignored) for
+# cross-repo dev against a live ../lexa-proto checkout; it never reaches CI.
 jobs:
   pure-go:
     name: pure-go
@@ -248,11 +255,12 @@ jobs:
           set -o pipefail
           bash scripts/ci/govulncheck.sh 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # TASK-004: report-only lockstep-divergence gate (W3/D4/AD-003). See the
-  # header comment above `on:` for the PAT/secret rationale and the
-  # report-only vs --enforce contract.
-  lockstep:
-    name: lockstep
+  # TASK-024: shared-module version-pin gate (AD-003(c)), replaces TASK-004's
+  # report-only lockstep-divergence job. See the header comment above `on:`
+  # for the PAT/secret rationale and scripts/check-proto-pin.sh for the full
+  # mechanics.
+  proto-pin:
+    name: proto-pin
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
     steps:
@@ -266,5 +274,5 @@ jobs:
           token: ${{ secrets.LEXA_HUB_RO_TOKEN }}
           path: lexa-hub
 
-      - name: Lockstep divergence check (report-only — see scripts/ci/lockstep-allowlist.txt)
-        run: bash scripts/ci/lockstep-check.sh --product lexa-hub
+      - name: proto.pin version-pin check (fails on mismatch — no allowlist)
+        run: bash scripts/check-proto-pin.sh --self . --product lexa-hub --no-proto-check

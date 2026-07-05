@@ -71,8 +71,10 @@ cadences differ; the review only requires shared *modules*); keep
 duplication + better diff CI (rejected: divergence already happened under
 a documented rule).
 
-**Open questions.** ❓ One module or three? Start with one module, three
-packages — split later only if versioning pressure appears.
+**Open questions — resolved (TASK-019/024).** ~~One module or three?~~ One
+module, five packages (`sunspec`, `derbase`, `modbus`, `ocppserver`,
+`csipmodel` — see (b) below); split later only if versioning pressure
+appears. No open question remains on this decision.
 
 **Extension (TASK-019, 2026-07-05): module path, package layout, pinning
 mechanism, go.work policy — decided, not deferred.**
@@ -153,6 +155,65 @@ graph); this line comes out together with the `go.work` files at TASK-024.
 No `replace` directives were added to either consumer's `go.mod` — `go.work`
 is the one local-dev mechanism; a `replace` would be redundant under
 `go.work` and would fight the `proto.pin`/pseudo-version gate later.
+
+**(e) Interim vendoring (TASK-021, 2026-07-05): `require` + `replace` +
+committed `vendor/lexa-proto/`, superseding the "no replace" line in (d).**
+Once TASK-020/021 gave `csip-tls-test` real imports of `lexa-proto/sunspec`
+and `lexa-proto/modbus` (and TASK-022/023 added `ocppserver`/`csipmodel`,
+TASK-023 `derbase`), hosted CI needed to actually *build* those imports —
+and hosted runners have no `../lexa-proto` to satisfy a bare `go.work`-only
+setup (see (d)). Both consumers' `go.mod` now carry `require lexa-proto
+v0.0.0` + `replace lexa-proto => ../lexa-proto`, and both commit a
+`vendor/lexa-proto/` tree (`GOWORK=off go mod vendor`) covering every
+package they actually import. Go's default `-mod=vendor` behavior (active
+whenever `vendor/modules.txt` is present and consistent with `go.mod`, which
+is the case whenever there's no `go.work` in effect) means hosted CI builds
+straight from the committed vendor tree — it never needs `../lexa-proto` to
+exist at all, closing the gap `GOWORK=off` alone left open. `replace`'s
+target path is metadata only in vendor mode (Go doesn't resolve it); it
+still matters for local `go.work`/non-vendor dev, where it's superseded by
+the `go.work` module list anyway.
+
+**(f) TASK-024 landing (2026-07-05): pin gate is live; `go.work` retired;
+hosted-flip is a recorded follow-up, not a blocker.** `scripts/check-proto-pin.sh`
+(csip-tls-test) is the gate described in (c), wired into both repos' CI as a
+`proto-pin` job (replacing TASK-004's `lockstep` job, which only ran in
+csip-tls-test — TASK-024 fixed the one-sided gating too: lexa-hub's CI now
+checks out csip-tls-test via a new `CSIP_TLS_TEST_RO_TOKEN` secret, the same
+class of pending-human-PAT item as `LEXA_HUB_RO_TOKEN`/AD-012 branch
+protection). Both repos' `proto.pin` are seeded at the same `lexa-proto`
+commit (`77e32e447185dedb2adc799b1373894a526b58b5`, `main` HEAD as of
+TASK-023's landing). Both `go.work` files are deleted from version control
+and gitignored per (d); the interim vendoring from (e) is what actually lets
+hosted CI build with no `go.work` and no fetchable `lexa-proto` — nothing
+about (e) changes at this task.
+
+The go.mod-pseudo-version mechanism from (c) is still the intended long-run
+replacement for `proto.pin`, still blocked on the same hosting + credential
+gap as AD-012. Recorded as a follow-up (10_BACKLOG.md, "lexa-proto hosted-
+flip") rather than re-litigated here: **hosted-flip checklist**, to run in
+one commit as soon as a `dsizzle83/lexa-proto` GitHub repo + fetch
+credential both exist —
+1. Rename `lexa-proto`'s module path to `github.com/dsizzle83/lexa-proto`
+   (go.mod line + every import statement in both consumers) per the (a)
+   flip rule.
+2. Push `lexa-proto`'s history to the new hosted repo; set up branch
+   protection (AD-012) at the same time as lexa-hub/csip-tls-test's, if
+   still pending.
+3. In both consumers: drop `replace lexa-proto => ../lexa-proto`, change
+   `require lexa-proto v0.0.0` to a real `require
+   github.com/dsizzle83/lexa-proto vX.Y.Z-<timestamp>-<sha>` pseudo-version
+   (or a tagged release once `lexa-proto` starts tagging), delete
+   `vendor/lexa-proto/` (and `vendor/modules.txt`'s entry for it, or the
+   whole `vendor/` tree if nothing else needs vendoring), run `go mod tidy`.
+4. Swap `scripts/check-proto-pin.sh`'s ground truth from `proto.pin` files
+   to the two consumers' `go.mod` `require` lines (mechanism swap per (c),
+   not a new decision) — delete `proto.pin` from both repos once the gate
+   no longer reads it.
+5. Re-run the fresh-clone build proof and the forced-divergence proof
+   (TASK-024 §5-equivalent) against the new mechanism before trusting it.
+6. Retire this checklist from 10_BACKLOG.md once done; record the SHA/tag
+   the flip landed on.
 
 ## AD-012 ✅ Hosting & CI platform: GitHub (de facto)
 

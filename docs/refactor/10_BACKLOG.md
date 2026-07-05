@@ -54,6 +54,18 @@ promote by giving an item a TASK number and a row in 04.*
   fleet is not).
 - **DevKit return runbook execution** (`lexa-hub/DEVKIT.md`) — repoint
   bench services from hub-Pi 69.0.0.1 back to 69.0.0.2 when hardware returns.
+- **lexa-proto hosted-flip** (AD-003(f) checklist): rename the module path
+  to `github.com/dsizzle83/lexa-proto`, host it under `dsizzle83`, drop the
+  `replace` + `vendor/lexa-proto/` interim vendoring (AD-003(e)) from both
+  consumers, and swap `scripts/check-proto-pin.sh`'s ground truth from
+  `proto.pin` files to `go.mod` `require` lines. **Human-dependency note:**
+  same blocker as `LEXA_HUB_RO_TOKEN`/`CSIP_TLS_TEST_RO_TOKEN` and AD-012
+  branch protection — needs a human to create the `dsizzle83/lexa-proto`
+  GitHub repo and a fetch credential (PAT-based git credential rewrite or
+  SSH deploy-key `insteadOf`) in an environment with `gh`/API auth, which
+  this execution environment does not have. Not on the critical path: the
+  interim vendoring keeps both repos building and CI-gated today; do this
+  when the hosting gap closes, not before.
 
 ## Documentation & product
 - **Utility-facing compliance report generator** from the event journal
