@@ -62,7 +62,8 @@ SSH_USER="dmitri"
 
 usage() {
   cat >&2 <<'EOF'
-Usage: scripts/mayhem-campaign.sh --mode fast|stock [--cycles N] [--dashboard URL] [--only id,id] [--hub-ip IP] [--ssh-user USER]
+Usage: scripts/mayhem-campaign.sh --mode fast|stock [--cycles N] [--single-run] [--dashboard URL] [--only id,id] [--hub-ip IP] [--ssh-user USER]
+  --single-run: one bench pass per cycle (JSON only; txt is a stub) — halves wall time
 EOF
 }
 
@@ -70,6 +71,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)      MODE="${2:-}"; shift 2 ;;
     --cycles)    CYCLES="${2:-}"; shift 2 ;;
+    --single-run) SINGLE_RUN=1; shift ;;
     --dashboard) DASHBOARD="${2:-}"; shift 2 ;;
     --only)      ONLY="${2:-}"; shift 2 ;;
     --hub-ip)    HUB_IP="${2:-}"; shift 2 ;;
@@ -176,9 +178,15 @@ for i in $(seq 1 "$CYCLES"); do
   json_exit=0
   python3 "$MAYHEM_PY" --dashboard "$DASHBOARD" "${ONLY_ARGS[@]}" --json > "$jsonfile" || json_exit=$?
 
-  echo "[cycle $i/$CYCLES] $(date '+%Y-%m-%d %H:%M:%S') mode=$MODE (human) -> $txtfile"
   txt_exit=0
-  python3 "$MAYHEM_PY" --dashboard "$DASHBOARD" "${ONLY_ARGS[@]}" 2>&1 | tee "$txtfile" || txt_exit=$?
+  if [[ "${SINGLE_RUN:-0}" -eq 1 ]]; then
+    # --single-run (P0-exit gate decision 2026-07-04): one bench pass per
+    # cycle; summary + drift tables come from the JSON. Halves wall time.
+    echo "(single-run mode: human-readable pass skipped; verdicts in ${jsonfile##*/})" > "$txtfile"
+  else
+    echo "[cycle $i/$CYCLES] $(date '+%Y-%m-%d %H:%M:%S') mode=$MODE (human) -> $txtfile"
+    python3 "$MAYHEM_PY" --dashboard "$DASHBOARD" "${ONLY_ARGS[@]}" 2>&1 | tee "$txtfile" || txt_exit=$?
+  fi
 
   exit_code="$json_exit"
   if [[ "$txt_exit" -gt "$exit_code" ]]; then exit_code="$txt_exit"; fi
