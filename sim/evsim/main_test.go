@@ -25,7 +25,7 @@ import (
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/transactions"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
 
-	"csip-tls-test/internal/ocppserver"
+	"lexa-proto/ocppserver"
 )
 
 func newStopReq(tx string) *remotecontrol.RequestStopTransactionRequest {
