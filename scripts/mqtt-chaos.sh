@@ -6,11 +6,19 @@
 #           bash scripts/mqtt-chaos.sh restore [hub-ip] [ssh-user]
 #           bash scripts/mqtt-chaos.sh status  [hub-ip] [ssh-user]
 #
-# deploy : cross-builds bin/arm64/mqttproxy, installs it + the systemd unit on the
-#          hub, repoints every /etc/lexa/*.json mqtt_broker to tcp://localhost:1882,
-#          and restarts the lexa services. The proxy starts in transparent PASS
-#          mode, so the bench behaves normally until the mayhem suite injects a
-#          fault via the control API (69.0.0.1:11882).
+# deploy : provisions a qa-inject broker user (mosquitto_passwd against the same
+#          /etc/mosquitto/lexa-passwd lexa-hub's deploy-hub-pi.sh manages —
+#          TASK-013/W7; the ACL grant for qa-inject lives in lexa-hub's
+#          systemd/mosquitto-lexa.acl), cross-builds bin/arm64/mqttproxy,
+#          installs it + the systemd unit (which passes -user qa-inject
+#          -passfile ... so /inject still authenticates once the hub's ACL
+#          requires it) on the hub, repoints every /etc/lexa/*.json mqtt_broker
+#          to tcp://localhost:1882, and restarts the lexa services. The proxy
+#          starts in transparent PASS mode, so the bench behaves normally until
+#          the mayhem suite injects a fault via the control API (69.0.0.1:11882).
+#          Every proxied lexa service still presents its own mqtt_user/
+#          mqtt_pass_file end-to-end through the passthrough — only /inject's
+#          direct publish needs the qa-inject credentials.
 # restore: repoints the services back to :1883, restarts them, stops+disables the
 #          proxy. Run this when QA is done — like bench-up.sh --stock.
 #
@@ -34,6 +42,30 @@ deploy)
   echo "── Installing + repointing services (sudo)"
   ssh "$SSHUSER@$HUB" 'sudo bash -s' <<'REMOTE'
 set -euo pipefail
+# qa-inject broker user (TASK-013 / W7): mqttproxy's /inject endpoint needs
+# its own credentials once the hub's ACL requires them — same passwd file
+# lexa-hub's deploy-hub-pi.sh manages, so both scripts must agree on its
+# path. Idempotent: an existing pass-file's password is reused, so re-runs
+# don't rotate the secret or need a proxy restart to notice a changed one.
+PASSWD_FILE=/etc/mosquitto/lexa-passwd
+PASSFILE=/etc/lexa/mqtt/qa-inject.pass
+install -d -m 750 -o lexa -g lexa /etc/lexa/mqtt 2>/dev/null || install -d -m 750 /etc/lexa/mqtt
+if [[ ! -s "$PASSFILE" ]]; then
+  ( umask 077 && openssl rand -hex 16 > "$PASSFILE" )
+  chown lexa:lexa "$PASSFILE" 2>/dev/null || true
+  chmod 600 "$PASSFILE"
+  echo "  generated $PASSFILE (0600)"
+fi
+QA_PASS="$(cat "$PASSFILE")"
+if [[ -s "$PASSWD_FILE" ]]; then
+  mosquitto_passwd -b "$PASSWD_FILE" qa-inject "$QA_PASS"
+else
+  mosquitto_passwd -b -c "$PASSWD_FILE" qa-inject "$QA_PASS"
+fi
+chown root:mosquitto "$PASSWD_FILE" 2>/dev/null || true
+chmod 640 "$PASSWD_FILE"
+echo "  qa-inject broker user provisioned in $PASSWD_FILE (ACL grant lives in lexa-hub's systemd/mosquitto-lexa.acl)"
+
 install -m 755 /tmp/mqttproxy /usr/local/sbin/mqttproxy
 install -m 644 /tmp/mqttproxy.service /etc/systemd/system/mqttproxy.service
 systemctl daemon-reload

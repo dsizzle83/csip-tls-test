@@ -25,6 +25,52 @@ func TestEncodeRemainingLength(t *testing.T) {
 	}
 }
 
+// TestConnectPacket_Anonymous locks the anonymous CONNECT byte-for-byte so
+// TASK-013's credential support cannot silently change today's PASSTHROUGH
+// behavior (there are no other callers of connectPacket, but the golden
+// bytes are the contract mqttPublish depends on).
+func TestConnectPacket_Anonymous(t *testing.T) {
+	got := connectPacket("test-client", "", "")
+	want := []byte{
+		0x10,                           // CONNECT
+		23,                             // remaining length: 6(MQTT)+1+1+2+13(clientID)
+		0x00, 0x04, 'M', 'Q', 'T', 'T', // protocol name
+		0x04,       // protocol level 4 (3.1.1)
+		0x02,       // connect flags: clean session only
+		0x00, 0x3C, // keepalive 60s
+		0x00, 0x0B, 't', 'e', 's', 't', '-', 'c', 'l', 'i', 'e', 'n', 't', // client ID
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("connectPacket(anonymous) = % x, want % x", got, want)
+	}
+}
+
+// TestConnectPacket_WithCredentials is TASK-013's golden-bytes test: a
+// non-empty user must flip the username (0x80) and password (0x40) connect
+// flags to produce 0xC2 and append User Name then Password after the Client
+// Identifier, per MQTT 3.1.1 §3.1.3's field order — this is exactly what the
+// qa-inject broker user needs once allow_anonymous is off (RSK-09 gate).
+func TestConnectPacket_WithCredentials(t *testing.T) {
+	got := connectPacket("qa-inject-client", "qa-inject", "s3cr3t")
+	want := []byte{
+		0x10,                           // CONNECT
+		47,                             // remaining length: 6(MQTT)+1+1+2+18(clientID)+11(user)+8(pass)
+		0x00, 0x04, 'M', 'Q', 'T', 'T', // protocol name
+		0x04,       // protocol level 4 (3.1.1)
+		0xC2,       // connect flags: clean session | username | password
+		0x00, 0x3C, // keepalive 60s
+		0x00, 0x10, 'q', 'a', '-', 'i', 'n', 'j', 'e', 'c', 't', '-', 'c', 'l', 'i', 'e', 'n', 't', // client ID (16)
+		0x00, 0x09, 'q', 'a', '-', 'i', 'n', 'j', 'e', 'c', 't', // username (9)
+		0x00, 0x06, 's', '3', 'c', 'r', '3', 't', // password (6)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("connectPacket(with creds) = % x, want % x", got, want)
+	}
+	if got[9] != 0xC2 { // byte 9: after CONNECT(1)+remlen(1)+"MQTT" string(6)+level(1)
+		t.Errorf("connect flags byte = %#x, want 0xC2 (username|password|clean-session)", got[9])
+	}
+}
+
 func TestPublishPacket_RetainAndTopic(t *testing.T) {
 	pkt := publishPacket("lexa/csip/control", []byte("xy"), true)
 	if pkt[0] != 0x31 { // PUBLISH (0x30) | retain (0x01)
@@ -119,7 +165,7 @@ func TestMqttPublish_RoundTrip(t *testing.T) {
 	addr, got, stop := fakeBroker(t)
 	defer stop()
 
-	if err := mqttPublish(addr, "test-client", "lexa/csip/control", []byte("{bad json"), true); err != nil {
+	if err := mqttPublish(addr, "test-client", "", "", "lexa/csip/control", []byte("{bad json"), true); err != nil {
 		t.Fatalf("mqttPublish: %v", err)
 	}
 	select {
@@ -135,6 +181,30 @@ func TestMqttPublish_RoundTrip(t *testing.T) {
 		}
 		if !cap.retain {
 			t.Error("retain flag not set")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("broker never received the PUBLISH")
+	}
+}
+
+// TestMqttPublish_RoundTrip_WithCredentials is the same round trip but
+// exercises the credentialed CONNECT path end-to-end (fakeBroker doesn't
+// validate credentials — it just needs the CONNECT+PUBLISH to still decode
+// correctly with the extra username/password fields present).
+func TestMqttPublish_RoundTrip_WithCredentials(t *testing.T) {
+	addr, got, stop := fakeBroker(t)
+	defer stop()
+
+	if err := mqttPublish(addr, "test-client", "qa-inject", "s3cr3t", "lexa/csip/control", []byte("{}"), false); err != nil {
+		t.Fatalf("mqttPublish: %v", err)
+	}
+	select {
+	case cap := <-got:
+		if !cap.ok {
+			t.Fatal("broker did not decode a PUBLISH")
+		}
+		if cap.topic != "lexa/csip/control" {
+			t.Errorf("topic = %q, want lexa/csip/control", cap.topic)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("broker never received the PUBLISH")
