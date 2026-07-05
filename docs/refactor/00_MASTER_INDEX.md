@@ -48,11 +48,7 @@ line is 09. 07 is the QA-specific slice of the same pipeline.
 
 | Phase | Tasks | Status | Exit campaign | Notes |
 |---|---|---|---|---|
-<<<<<<< HEAD
-| P0 Foundations | 001–018 | IN PROGRESS | — | Done: 001, 002, 003, 004, 005, 010, 011, 016, 017 (2026-07-04; details in task headers). Partial: 007 (code merged; bench deploy+wedge test+48h soak at P0 exit). Open: branch protection (human, AD-012); TASK-004's `lockstep` job similarly can't be marked "required" without GitHub auth (same blocker as AD-012) and its LEXA_HUB_RO_TOKEN PAT must be created by a human; 006 worklist = 2 reachable vulns (VULN_BASELINE_2026-07-04.md). |
-=======
-| P0 Foundations | 001–018 | IN PROGRESS | — | Done: 001, 002, 003, 005, 010, 011, 016, 017 (2026-07-04; details in task headers). Partial: 007, 008, 009 (all code+unit-files+tests merged on their branches; bench deploy+wedge test+soak / journald measurement+suppression check all at P0 exit — see task headers). Open: branch protection (human, AD-012); 006 worklist = 2 reachable vulns (VULN_BASELINE_2026-07-04.md). |
->>>>>>> task/008-009-watchdogs-journald
+| P0 Foundations | 001–018 | IN PROGRESS | — | Done: 001, 002, 003, 004, 005, 010, 011, 014, 016, 017 (2026-07-04; details in task headers). Partial: 007/008/009 (code merged; bench deploy + wedge test + soak + journald measurement at P0 exit); 014 (code merged; token flip + QA gate at P0 exit). Open: branch protection + `LEXA_HUB_RO_TOKEN` PAT secret (human, AD-012/TASK-004); 006 worklist = 2 reachable vulns (VULN_BASELINE_2026-07-04.md). Next: 012 (Opus + campaign), 013, 015, 018, 006. |
 | P1 Shared modules (R2) | 019–024, 082 | NOT STARTED | — | |
 | P2 Device Reconciler (R1) | 025–033 | NOT STARTED | — | Critical path |
 | P3 Time & persistence | 034–043 | NOT STARTED | — | |

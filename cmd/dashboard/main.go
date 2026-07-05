@@ -28,7 +28,21 @@ func main() {
 	meter := flag.String("meter", "http://localhost:6022", "meter simapi address")
 	ev := flag.String("ev", "http://localhost:6024", "EV charger simapi address")
 	mqttproxy := flag.String("mqttproxy", "http://69.0.0.1:11882", "MQTT fault-proxy control API (mayhem chaos)")
+	hubTokenFile := flag.String("hub-token-file", "", "path to lexa-api's bearer token (TASK-014, AD-008); empty = no auth presented, today's behavior")
 	flag.Parse()
+
+	// TASK-014: present lexa-api's bearer token, scoped to the "hub" backend
+	// only (setHubAuth in hubauth.go). A missing/empty file is not fatal —
+	// the dashboard must keep serving against a not-yet-token-enabled hub
+	// during the staged rollout (AD-008).
+	if tok, err := loadHubToken(*hubTokenFile); err != nil {
+		log.Printf("dashboard: -hub-token-file %s: %v — continuing without hub auth", *hubTokenFile, err)
+	} else {
+		hubToken = tok
+		if hubToken != "" {
+			log.Printf("dashboard: presenting bearer token to hub backend (%s)", *hub)
+		}
+	}
 
 	mux := http.NewServeMux()
 
@@ -41,7 +55,7 @@ func main() {
 		w.Write(dashboardHTML)
 	})
 
-	mux.Handle("/api/hub/", stripProxy("/api/hub", *hub))
+	mux.Handle("/api/hub/", stripHubAuthProxy("/api/hub", *hub))
 	mux.Handle("/api/gridsim/", stripProxy("/api/gridsim", *gridsim))
 	mux.Handle("/api/solar/", stripProxy("/api/solar", *solar))
 	mux.Handle("/api/battery/", stripProxy("/api/battery", *battery))
@@ -99,5 +113,24 @@ func stripProxy(prefix, target string) http.Handler {
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
 	rp.FlushInterval = -1 // immediate flush; required for SSE pass-through
+	return http.StripPrefix(prefix, rp)
+}
+
+// stripHubAuthProxy is stripProxy for the "hub" mount specifically: its
+// Director additionally sets the bearer-token header (TASK-014). This is
+// the only proxy mount that ever gets the token — simapi/gridsim targets
+// use plain stripProxy and must never see it (AD-008).
+func stripHubAuthProxy(prefix, target string) http.Handler {
+	u, err := url.Parse(target)
+	if err != nil {
+		log.Fatalf("invalid target URL %q: %v", target, err)
+	}
+	rp := httputil.NewSingleHostReverseProxy(u)
+	rp.FlushInterval = -1 // immediate flush; required for SSE pass-through
+	baseDirector := rp.Director
+	rp.Director = func(req *http.Request) {
+		baseDirector(req)
+		setHubAuth(req, "hub")
+	}
 	return http.StripPrefix(prefix, rp)
 }

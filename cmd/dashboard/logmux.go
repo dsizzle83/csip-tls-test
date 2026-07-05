@@ -65,7 +65,14 @@ func (m *logMux) follow(src, url string) {
 // streamOnce connects to one backend /logs SSE stream and publishes every
 // data line until the connection drops.
 func (m *logMux) streamOnce(src, url string) error {
-	resp, err := http.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	// TASK-014: the hub's /logs requires the bearer token once lexa-api has
+	// one configured; setHubAuth is a no-op for every other src.
+	setHubAuth(req, src)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}

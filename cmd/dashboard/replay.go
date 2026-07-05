@@ -600,7 +600,13 @@ func (d *replayDriver) url(name, path string) string { return d.backends[name] +
 
 func (d *replayDriver) post(name, path string, body map[string]any) error {
 	buf, _ := json.Marshal(body)
-	resp, err := d.client.Post(d.url(name, path), "application/json", bytes.NewReader(buf))
+	req, err := http.NewRequest(http.MethodPost, d.url(name, path), bytes.NewReader(buf))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setHubAuth(req, name) // TASK-014: token only for name=="hub"
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -658,7 +664,12 @@ func (d *replayDriver) reportedCannotComply(mrid string) bool {
 }
 
 func (d *replayDriver) getJSON(name, path string, out any) error {
-	resp, err := d.client.Get(d.url(name, path))
+	req, err := http.NewRequest(http.MethodGet, d.url(name, path), nil)
+	if err != nil {
+		return err
+	}
+	setHubAuth(req, name) // TASK-014: token only for name=="hub"
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return err
 	}

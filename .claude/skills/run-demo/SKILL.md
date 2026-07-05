@@ -34,8 +34,16 @@ systemd-run --user --unit=csip-dashboard \
   "$HOME/projects/csip-tls-test/bin/dashboard" -addr :8080 \
   -hub http://69.0.0.1:9100 -gridsim http://localhost:11112 \
   -solar http://69.0.0.10:6020 -battery http://69.0.0.11:6021 \
-  -meter http://69.0.0.12:6022 -ev http://69.0.0.14:6024
+  -meter http://69.0.0.12:6022 -ev http://69.0.0.14:6024 \
+  -hub-token-file "$HOME/.config/lexa/hub-api.token"
 ```
+
+`-hub-token-file` (TASK-014, AD-008): lexa-api may require a bearer token on
+`/status`/`/logs`. The flag is safe to pass even when auth is off — a missing or
+empty file just means no header is sent. `scripts/bench-up.sh` relays the token
+from the hub automatically; if starting the unit by hand and the file doesn't
+exist yet, run `bash scripts/bench-up.sh` once first, or fetch it directly:
+`ssh dmitri@69.0.0.1 sudo cat /etc/lexa/api.token > ~/.config/lexa/hub-api.token`.
 
 If a binary is missing: `go build -o bin/server ./sim/server` (cgo — the Makefile/session
 env wire the wolfSSL sysroot) and `go build -o bin/dashboard ./cmd/dashboard`.
@@ -53,8 +61,11 @@ curl -s --max-time 3 http://69.0.0.10:6020/state >/dev/null && echo solar OK
 curl -s --max-time 3 http://69.0.0.11:6021/state >/dev/null && echo battery OK
 curl -s --max-time 3 http://69.0.0.12:6022/state >/dev/null && echo meter OK
 curl -s --max-time 3 http://69.0.0.14:6024/state >/dev/null && echo ev OK
-curl -s --max-time 3 http://69.0.0.1:9100/status | head -c 300   # hub
+curl -s --max-time 3 http://69.0.0.1:9100/status | head -c 300   # hub (401 if auth is on and you didn't pass a token)
 ```
+If lexa-api auth is on (`docs/BENCH.md`), add
+`-H "Authorization: Bearer $(ssh dmitri@69.0.0.1 sudo cat /etc/lexa/api.token)"` to the
+hub curl above; `/healthz` never needs it.
 - Dead sim: `ssh dmitri@<ip> systemctl --user restart <modsim|batsim|metersim|evsim>`
 - Dead hub service: `ssh dmitri@69.0.0.1 'sudo systemctl restart lexa-<svc>'`
   (order if everything is down: mosquitto → modbus/ocpp/api → northbound/telemetry → hub)

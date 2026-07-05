@@ -1,6 +1,21 @@
 # TASK-014 — lexa-api auth (bearer token) + migrate consumers (dashboard, metersim, QA drivers)
 
-*Status: TODO · Phase: P0 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: CODE COMPLETE, BENCH ROLLOUT + QA GATE PENDING (2026-07-04) · Phase: P0 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+
+**Status notes (2026-07-04):** Server + all five verified consumers implemented and
+unit-tested on branch `task/014-api-auth` in both repos (lockstep, not yet merged).
+NOT done: the bench rollout (deploy-hub-pi.sh, --enable-api-auth flip, dashboard/
+metersim redeploy) and the QA gate (targeted scenarios ×5 + full FAST campaign) —
+out of scope for this pass per explicit instruction (code + tests only, no bench
+deploy/service restarts). **Also flagging:** this task's stated prerequisite,
+TASK-013 (broker creds), is still TODO in 00_MASTER_INDEX/on `main` — not merged.
+The two tasks touch disjoint subsystems (MQTT broker auth vs. lexa-api HTTP auth)
+and TASK-014's own "Detailed steps" are fully self-contained (they don't call any
+TASK-013 code), so the implementation proceeded without waiting; the "depends on
+013" note in 04_DEPENDENCY_GRAPH appears to be about shared *review timing*
+("same security wave") rather than a hard code dependency. Reviewer: please confirm
+that reading before treating this as mergeable, and do not flip `--enable-api-auth`
+on the bench until the QA gate in the Detailed steps §6-7 has actually run.
 
 ## Objective
 `lexa-api` (:9100) requires a bearer token on `/status` and `/logs` (with `/healthz`
