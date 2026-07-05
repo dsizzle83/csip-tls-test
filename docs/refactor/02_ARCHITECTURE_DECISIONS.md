@@ -552,6 +552,10 @@ MQTT handlers do not `recover()`; a panic kills the service; systemd
 restarts (5 s) + retained topics + (post-P3) snapshot restore re-seed
 state. This is the documented intended design (review §10.6) — watchdogs
 (TASK-007/008) extend it to live-but-wedged. Do not add blanket recovers.
+Documented in operator terms (TASK-045): `lexa-hub/docs/OPERATIONS.md` covers
+what each of the six services loses/keeps across a restart, systemd
+Restart/WatchdogSec timing, and what to check afterward (plan heartbeat,
+`/status`, journal, `/metrics`).
 
 ## AD-013 ✅ Desired-state document: schema, topic, seq/staleness policy (AD-002's wire contract)
 
