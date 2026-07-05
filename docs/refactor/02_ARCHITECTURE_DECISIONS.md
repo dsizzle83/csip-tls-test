@@ -169,7 +169,7 @@ new schema born versioned. Pending validation: rolling-upgrade test.
 | `v > supported` or `v < 0` | **Reject + alarm** | `bus.CheckVersion` returns `*bus.VersionError`; caller invokes `bus.RejectAndAlarm` |
 | Same-major, unrecognized fields | Ignored (additive evolution stays cheap) | `encoding/json`'s default unmarshal behavior — no extra code |
 | Malformed JSON / non-numeric `"v"` | Not `CheckVersion`'s concern — surfaces at the real `json.Unmarshal` a line later | Documented on `CheckVersion`, single-responsibility |
-| Rejected message on a **retained control-plane** topic | Hold last-known-good now (existing scheduler fail-closed discipline); active re-request is TASK-042 (P3, not yet built) | Not enforced yet — no subscriber calls `CheckVersion` until TASK-018 |
+| Rejected message on a **retained control-plane** topic | Hold last-known-good now (existing scheduler fail-closed discipline); active re-request is TASK-042 (P3, not yet built) | Enforced (TASK-018): every subscriber calls `CheckVersion` (`mqttutil.Subscribe`'s gate, plus the one raw `mc.Subscribe` in cmd/northbound for FR-request) |
 
 Granularity is per-schema, not global: `bus.MeasurementV`, `bus.BattMetricsV`,
 `bus.ActiveControlV`, `bus.ComplianceAlertV`, `bus.BattCommandV`,
@@ -181,13 +181,39 @@ scraped by TASK-044 once a metrics endpoint exists) and logged rate-limited
 (first occurrence + every 100th per topic) to stay inside the journald
 budget (TASK-009).
 
-TASK-017 is introduce-only: the type, constants, `CheckVersion`, and
-`RejectAndAlarm` exist and are tested, but **nothing is wired** — no
-publisher stamps `v`, no subscriber calls `CheckVersion` yet. That wiring,
-plus the `LegacyV0Accepted → false` flip once every publisher in a family is
-confirmed versioned, is TASK-018. Status stays 🔶 until TASK-018's
-rolling-upgrade test (mixed v0/v1 publishers against a v1 subscriber)
-validates the policy against real traffic.
+TASK-017 was introduce-only (type, constants, `CheckVersion`,
+`RejectAndAlarm` — nothing wired). TASK-018 (2026-07-04) did the wiring:
+every publish site in the inventory grep (`lexa-hub` cmd/modbus, cmd/hub +
+actuators.go, cmd/northbound, cmd/ocpp) stamps its per-schema `V`; every
+subscriber gates on `CheckVersion` before decode. `Measurement`'s voltage
+field moved from `V`/`"v"` to `VoltageV`/`"voltage_v"` in the same change —
+embedding `Envelope` (also field `V`, tag `"v"`) would otherwise have
+silently shadowed the version field on the wire (Go's same-JSON-key
+conflict resolution keeps the shallower, non-embedded field and drops the
+embedded one with no error) rather than a compile-time signal. Code and
+unit tests (`go test -race ./internal/bus/ ./internal/mqttutil/`, full
+`go test -race ./internal/... ./cmd/...`) are green.
+
+**Status stays 🔶, not ✅, deliberately**: this rollout landed during a
+program-wide deploy freeze (TASK-012 unmerged) with bench access authorized
+for read-only/verification only, not deploys. The rolling-upgrade
+validation this AD's "pending validation" line names — mixed v0/v1
+publishers against a v1 subscriber, observed on the real bench mid-restart
+— did **not** run in this session; it is deferred to the P0-exit gate
+alongside TASK-012's merge, per the task's lane instructions. See
+`docs/refactor/tasks/TASK-018.md`'s status header for the explicit
+deferral note.
+
+**Enforcement-flip criteria** (for the later, separate change that sets
+`LegacyV0Accepted = false`): every retained control-plane topic
+(`lexa/csip/control`, pricing, billing, FR status, `lexa/northbound/schedule`,
+`lexa/hub/plan`) must be observed carrying `"v":1` on the live bench — via
+`mosquitto_sub -C 1 -t <topic>` after a fresh publish from each — **and** one
+full FAST Mayhem campaign must run clean after that observation. Only then
+flip the var; in the same change, `csip-tls-test`'s
+`cmd/dashboard/mqtt_scenarios.go` injected payloads for
+`mqtt-malformed-control` and `mqtt-stale-retained` gain `"v":1` (today they
+stay v0-shaped on purpose, since v0 is still tolerated).
 
 ## AD-007 🔶 Optimizer split: constraint controller over economic layer, plant model (R4)
 
