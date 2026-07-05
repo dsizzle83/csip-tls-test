@@ -74,8 +74,18 @@ Adversarial HIL fault-injection driving the real bench through 51 worst-case sce
 diagnosing where the hub's fault handling breaks. Engine: `cmd/dashboard/mayhem.go` +
 `mayhem_world.go` (`/api/qa/*`, dashboard QA tab); headless runner: `scripts/mayhem.py`
 (`--list`, `--only id,id`, `--json`). Verdicts: PASS / DEGRADED / FAIL / BLIND / INCONCLUSIVE.
-**Bench must be in FAST mode** (`bench-up.sh --fast`). Findings + fix log:
-`docs/QA_TRIAGE_20260624.md`, `docs/QA_FINDINGS.md`; blind-spot review: `docs/QA_GAPS_20260701.md`.
+**FAST for development campaigns; STOCK via `scripts/mayhem-campaign.sh` for release
+gates** — scenario `HoldS`/settle margins are calibrated against FAST latencies
+(`bench-up.sh --fast`), so day-to-day campaigns stay in FAST. `scripts/mayhem-campaign.sh
+--mode fast|stock --cycles N` mode-manages the hub timing (verifies the switch took over
+SSH), runs N cycles with per-cycle JSON evidence under `logs/campaign-<mode>-<ts>/` +
+a scenario-drift table, and restores FAST unconditionally on exit (trap, fires even on
+Ctrl-C/error) — FAST is the bench's resting state. STOCK campaigns are release gates
+(first baseline: GAP-15/TASK-015); triage every non-PASS with
+`docs/QA_STOCK_TRIAGE_TEMPLATE.md` — STOCK-only failures are findings, not blockers,
+unless they reveal a safety-invariant regression (INV-SOC/INV-CONNECT/INV-EXPORT/
+INV-EXPIRED). Findings + fix log: `docs/QA_TRIAGE_20260624.md`, `docs/QA_FINDINGS.md`;
+blind-spot review: `docs/QA_GAPS_20260701.md`.
 
 ## Bench replay (hardware-in-the-loop cost sim)
 Dashboard "3-Month Cost Sim" tab: synthetic 92-day sweep (browser worker) plus **Bench
