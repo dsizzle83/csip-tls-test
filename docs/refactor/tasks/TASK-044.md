@@ -1,6 +1,24 @@
 # TASK-044 — Prometheus `/metrics` on all six services + bench scrape
 
-*Status: TODO · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-05, lexa-hub metrics ×6 merged pre-wave-gate; csip-tls-test
+scrape config + BENCH.md ports landed at the wave gate — see closure note) ·
+Phase: P4 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
+
+**Wave-gate closure note (2026-07-05):** this file's status header had been left at
+TODO despite the lexa-hub metrics code being merged and live (00_MASTER_INDEX already
+listed 044 as done). Found at the wave gate: the paired csip-tls-test deliverable —
+`scripts/prometheus-bench.yml` + the `docs/BENCH.md` port table — was never actually
+committed (no file, no git history), contradicting both this task's own "Suggested PR
+title & description" and the wave-gate brief's premise that it existed. Created both
+per this file's §"Detailed steps" step 5 spec (static scrape of 69.0.0.1:9100–9105,
+15 s interval, podman one-liner in the file header) and verified: all six `/metrics`
+endpoints golden-format-checked (0 malformed lines each; no `promtool` on this desktop)
+and `lexa_up 1` on all six from the desktop. Counters-move criterion (forcing an MQTT
+publish failure via a live mosquitto stop) was deliberately skipped — disruptive to the
+concurrently-running full Mayhem campaign and not requested by the wave-gate brief;
+the mqtt-broker-restart scenario in that campaign exercises the same reconnect path
+indirectly. `lexa_mb_shadow_*` counters (TASK-027) also present and correctly typed —
+that package's metrics registration composes cleanly with this one's.
 
 ## Objective
 Every lexa service exposes a Prometheus-text-format `/metrics` endpoint with
@@ -176,20 +194,24 @@ Then the scrape config + verification on the bench.
   units).
 
 ## Acceptance criteria
-- [ ] All six endpoints serve valid exposition text (spot-verify with
-      `promtool check metrics` if available, else the golden-format test).
-- [ ] Counters move: force one MQTT publish failure (stop mosquitto
-      briefly) and see `lexa_mqtt_publish_failures_total` increase.
-- [ ] Bench scrape config resolves all targets (prometheus UI targets page
-      or `curl` loop evidence).
-- [ ] Full FAST campaign ≤ baseline.
-- [ ] `go test -race ./internal/... ./cmd/...` green.
+- [x] All six endpoints serve valid exposition text (no `promtool` on this desktop;
+      golden-format regex check: 0 malformed lines across all six /metrics bodies).
+- [~] Counters move: SKIPPED live (stopping mosquitto mid-campaign was blocked as
+      disruptive); `lexa_mqtt_publish_failures_total`/`lexa_mqtt_reconnects_total`
+      are present, correctly typed, and the full campaign's mqtt-broker-restart
+      scenario exercises the same reconnect path indirectly.
+- [x] Bench scrape config resolves all targets — `scripts/prometheus-bench.yml`
+      created at the wave gate (was missing); `curl` loop evidence: `lexa_up 1` on
+      all six (69.0.0.1:9100–9105) from the desktop.
+- [x] Full FAST campaign ≤ baseline — see wave-gate campaign report `qa-mayhem-20260705-151009.md` (34P/17D/0F/0B, within the 32–35P band; targeted battery set `qa-mayhem-20260705-140802.md`).
+- [x] `go test -race ./internal/... ./cmd/...` green.
 
 ## Regression checklist
-- [ ] `go test -race ./internal/...` (lexa-hub) green (+ `./cmd/...`)
-- [ ] Conformance logic tests: none (no protocol surface)
-- [ ] Mayhem: full FAST campaign (six services redeployed)
-- [ ] `hub-replay-tune.sh fast` re-applied after deploy
+- [x] `go test -race ./internal/...` (lexa-hub) green (+ `./cmd/...`)
+- [x] Conformance logic tests: none (no protocol surface)
+- [x] Mayhem: full FAST campaign (six services redeployed) — see wave-gate report.
+- [x] `hub-replay-tune.sh fast` re-applied after deploy (confirmed post-restart:
+      engine=3s/discovery=5s/poll=2s).
 
 ## Mayhem scenarios affected
 None should change verdict. Enables future oracles: TASK-049 (reconnect

@@ -13,6 +13,14 @@ upstream) — skipped rather than invented ahead of their own tasks;
 `docs/JOURNAL_FORENSICS.md` (TASK-040) also does not exist yet, so nothing to
 refresh there. See the commit message for the full migration/demotion list.
 
+**Wave-gate closure note (2026-07-05):** stop/start proof done live on the bench
+(`systemctl stop lexa-hub`; `plan_heartbeat.state` ok→stalled at age_s≈75 crossing
+the default `plan_stall_after_s`, one edge-triggered `level=WARN msg="lexa-api: plan
+heartbeat stalled"` line, `lexa_api_plan_heartbeat_stalled` 0→1; `systemctl start
+lexa-hub` → state stalled→ok within ~1s, one `level=INFO msg="lexa-api: plan
+heartbeat recovered"` line, metric back to 0). Full FAST campaign run — see wave-gate
+campaign report; `hub-replay-tune.sh fast` re-applied and re-confirmed post-restart.
+
 ## Objective
 Move the six services onto `log/slog` structured logging with
 transition-not-steady-state discipline, and make the existing retained
@@ -185,13 +193,14 @@ small state machine in lexa-api's store. Operator doc last.
       verified via `internal/logutil`'s handler smoke test
       (`TestSetupTextHandlerHasSvcAttr`), not a live bench journal excerpt
       (batched at wave gate).
-- [ ] Stop/start lexa-hub on the bench: api `/status.plan_heartbeat` goes
+- [x] Stop/start lexa-hub on the bench: api `/status.plan_heartbeat` goes
       ok→stalled→ok; metric follows; alarm logs are edge-triggered (exactly
-      one line each way). — **BATCHED AT WAVE GATE.** Unit-proven instead:
-      `cmd/api.TestHeartbeatOkThenStalledThenRecovered` and
-      `TestHeartbeatTickEdgeTriggeredExactlyOnce` (injected clock; asserts
-      exactly one "stalled" line and one "recovered" line across repeated
-      ticks while each state persists, and re-arms on a second episode).
+      one line each way). — **DONE AT WAVE GATE, live on the bench**: stopped
+      lexa-hub, `plan_heartbeat` flipped ok→stalled at age_s≈75 (default
+      `plan_stall_after_s`), `lexa_api_plan_heartbeat_stalled` 0→1, exactly one
+      `level=WARN msg="lexa-api: plan heartbeat stalled"` line; started lexa-hub,
+      state stalled→ok in ~1s, metric back to 0, exactly one `level=INFO
+      msg="lexa-api: plan heartbeat recovered"` line.
 - [x] `never` state verified: `cmd/api.TestHeartbeatNeverBeforeAnyPlanLog`
       (no PlanLog ever ⇒ never, indefinitely, no alarm) — unit-level;
       bench "fresh api with hub stopped and retained topic cleared" variant
@@ -203,17 +212,17 @@ small state machine in lexa-api's store. Operator doc last.
       reviewed and left at Info because they are already bounded to ≥60s by
       an existing dedupe/reassert window (modbus battery/solar "control
       applied").
-- [ ] Full FAST campaign ≤ baseline. — **BATCHED AT WAVE GATE** (no bench
-      access in this lane).
+- [x] Full FAST campaign ≤ baseline. — see wave-gate campaign report `qa-mayhem-20260705-151009.md` (34P/17D/0F/0B, within the 32–35P band; targeted battery set `qa-mayhem-20260705-140802.md`).
 
 ## Regression checklist
 - [x] `go test -race ./internal/... ./cmd/...` (lexa-hub) green
 - [x] Conformance logic tests: none (confirmed — no conformance suite
       touches logging or /status)
-- [ ] Mayhem: `hub-restart-mid-cap` + `export-cap-full-battery` spot runs +
-      full campaign — **BATCHED AT WAVE GATE**
-- [ ] `hub-replay-tune.sh fast` re-applied after deploy — **BATCHED AT WAVE
-      GATE** (no deploy performed in this lane)
+- [x] Mayhem: `hub-restart-mid-cap` (in the full 51-scenario catalog) +
+      `export-cap-full-battery` (targeted battery-family run, 0P/4D/0F/0B,
+      cannot_comply=True) spot runs + full campaign — see wave-gate campaign report `qa-mayhem-20260705-151009.md` (34P/17D/0F/0B, within the 32–35P band; targeted battery set `qa-mayhem-20260705-140802.md`).
+- [x] `hub-replay-tune.sh fast` re-applied after deploy (confirmed post-restart:
+      engine=3s/discovery=5s/poll=2s).
 
 ## Mayhem scenarios affected
 None should change verdict. The heartbeat alarm gives future scenarios a

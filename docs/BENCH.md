@@ -17,6 +17,25 @@ ConnectCore 93 dev kit (69.0.0.2) is **offline/unused**; the hub moved to 69.0.0
 evsim/metersim/dashboard all point at 69.0.0.1 — repoint when the dev kit returns
 (runbook: `lexa-hub/DEVKIT.md`).
 
+### Metrics (TASK-044)
+
+Every lexa service serves Prometheus text exposition; bench configs bind
+`metrics_addr` to the LAN IP (AD-008 — the product default stays 127.0.0.1):
+`lexa-hub 69.0.0.1:9101 · lexa-northbound :9102 · lexa-modbus :9103 ·
+lexa-ocpp :9104 · lexa-telemetry :9105 · lexa-api :9100/metrics` (existing
+`:9100` listener, new route — no separate port). Scrape from the desktop with
+`scripts/prometheus-bench.yml` (see file header for the one-line podman/native
+prometheus run command); quick check: `curl 69.0.0.1:910N/metrics | grep lexa_up`.
+
+**Deploy gotcha (same class as the STOCK-timing reset):** `deploy-hub-pi.sh`
+overwrites `/etc/lexa/*.json` from the repo's `configs/`, which resets three
+Pi-side bench enables — re-apply after every hub deploy:
+`metrics_addr` → LAN IP per service (back to `""` = localhost default),
+`modbus.json` `"reconciler":{"battery":"shadow"}` (back to `"off"`, TASK-027),
+and the mqttproxy repoint (`mqtt_broker` back to `:1883`; re-run
+`scripts/mqtt-chaos.sh deploy` if QA needs the :1882 fault proxy).
+Then restart the edited services and re-run `hub-replay-tune.sh fast`.
+
 ## Demo bring-up / recovery
 
 Exact start commands for the desktop's transient units (`csip-gridsim`, `csip-dashboard`),

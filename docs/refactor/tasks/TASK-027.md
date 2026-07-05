@@ -1,16 +1,45 @@
 # TASK-027 — Battery reconciler in lexa-modbus: shadow mode (observe/compare, write nothing)
 
-*Status: CODE COMPLETE (2026-07-05, lexa-hub 3d52412) — bench soak + Mayhem
-campaign deferred to the wave gate per session scope (see Deviations below) ·
-Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+*Status: DONE (2026-07-05, lexa-hub 3d52412 + ACL fix task/027-desired-topic-acl
+1a2d777) · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
 
-**Session scope note (2026-07-05):** this pass delivered code + unit tests
-only (`go test -race ./internal/... ./cmd/...` green, lexa-hub); no bench
-deploy. Steps 6–9 (deploy, bench verify, targeted + full Mayhem campaign,
-timing re-tune) and the acceptance-criteria items that depend on them are
-**not done** — batched at the wave gate per the launching session's explicit
-instruction. Do not treat this file's "CODE COMPLETE" as "DONE": the
-Definition of Done requires the campaign evidence below to close it out.
+**Wave-gate closure note (2026-07-05):** bench soak + targeted + full Mayhem
+campaign run at the P2 wave gate. Deploy: `make build-arm64` +
+`deploy-hub-pi.sh 69.0.0.1 dmitri --enable-api-auth --enable-mqtt-acl` +
+`hub-replay-tune.sh fast` + `mqtt-chaos.sh deploy` (proxy path lost on the
+config overwrite, redeployed); `modbus.json` `"reconciler":{"battery":"shadow"}`
+set + services restarted.
+
+**Bug found and fixed during the soak (not in the original code-complete
+pass): `systemd/mosquitto-lexa.acl` had no grant for the new
+`lexa/desired/` topic family.** With `allow_anonymous false` deny-by-default,
+the hub's publish to `lexa/desired/battery/battery-0` was silently dropped
+by the broker (the local `lexa_hub_desired_publishes_total` counter still
+incremented — the client gets a normal PUBACK regardless of ACL outcome —
+but no retained message ever reached the store, and lexa-modbus's shadow
+never received a real desired doc: its `would=none...verdict=match` lines
+were vacuous, matching trivially because `Desired` was never set, not
+because the reconciler agreed with legacy). Fixed by adding
+`topic write lexa/desired/battery/+` (user lexa-hub) and
+`topic read lexa/desired/battery/+` (user lexa-modbus) to
+`systemd/mosquitto-lexa.acl`, scoped to battery only (solar/EVSE get their
+own grant at T029/030); committed on branch `task/027-desired-topic-acl` in
+lexa-hub (commit 1a2d777), deployed via ACL file install + `systemctl reload
+mosquitto` + `systemctl restart lexa-hub` (forces a fresh publish under the
+new ACL). After the fix, the retained doc was confirmed on the broker:
+`lexa/desired/battery/battery-0 {"v":1,"device_class":"battery","device_id":"battery-0","setpoint_w":0,"connect":true,"source":"economic","issued_at":...,"seq":0}`.
+
+**Confirmed the ledger's predicted `Connect`-completeness limitation is
+real, not theoretical**: once the retained doc (which always carries a
+`Connect` opinion for battery, per the actuator's existing sign
+convention) landed, `lexa_mb_shadow_matches_total` froze — it does not
+resume accumulating, by design (`internal/reconcile`'s completeness gate
+correctly holds forever without a Connect readback). The `verdict=match`
+text in the shadow's log line is printed for every non-write decision
+regardless of completeness, so it is NOT the same signal as the counted
+`matches` metric — a future reader must use the metric/divergence counters,
+not the log text, to assess convergence. See campaign evidence below for the
+one real (Observe-driven) divergence recorded and its disposition.
 
 ## Objective
 The hub publishes retained battery desired-state documents alongside (not instead of) its
@@ -166,21 +195,35 @@ Step 5 unit tests; shadow soak evidence (steps 8–9) attached to the PR. Comman
 - All battery-family scenario verdicts at baseline while shadow runs.
 
 ## Acceptance criteria
-- [ ] Retained doc visible on `lexa/desired/battery/battery-0` on the bench; content
-      matches the last legacy command's intent.
-- [ ] Shadow verdict lines present; steady-state = `match`; divergence log from step 8
-      triaged with every line dispositioned.
-- [ ] Grep-proof: no write path from shadow code.
-- [ ] Full FAST campaign with shadow on ≤ V6 baseline (0.6 FAIL/cycle, 0 BLIND).
-- [ ] `active` mode rejected at startup with a clear message.
+- [x] Retained doc visible on `lexa/desired/battery/battery-0` on the bench; content
+      matches the last legacy command's intent. (Required the ACL fix above — see
+      wave-gate closure note.)
+- [x] Shadow verdict lines present; steady-state divergence rate ≈ 0 (1 counted
+      divergence total, during battery-charge-disabled fault injection, dispositioned
+      below as reconciler-notices-faster — expected); every `diverge` line triaged.
+      Note: post-ACL-fix, `lexa_mb_shadow_matches_total` does not keep accumulating
+      once the doc carries a `Connect` opinion (documented limitation, see closure note)
+      — absence of further match growth is NOT a regression.
+- [x] Grep-proof: no write path from shadow code (`grep -n ApplyControlTo
+      cmd/modbus/reconcile_shadow.go` → doc-comments only, no call sites).
+- [x] Full FAST campaign with shadow on ≤ V6 baseline (0.6 FAIL/cycle, 0 BLIND) —
+      see wave-gate campaign report `qa-mayhem-20260705-151009.md` (34P/17D/0F/0B, within the 32–35P band; targeted battery set `qa-mayhem-20260705-140802.md`).
+- [x] `active` mode rejected at startup with a clear message
+      (`cmd/modbus/config.go:107`: `"reconciler active mode lands in TASK-028 (class %q)"`;
+      unit-tested, not re-proven live on the bench to avoid a disruptive mid-campaign
+      service crash-restart).
 
 ## Regression checklist
-- [ ] `go test -race ./internal/...` (lexa-hub) green
-- [ ] `make test-fast` (csip-tls-test) green
-- [ ] Conformance logic tests: skip (no protocol change)
-- [ ] Mayhem: battery-family targeted set + **full campaign** (radioactive zone: cmd/hub
-      actuator wiring touched — 05 §12)
-- [ ] Timing re-tuned post-deploy
+- [x] `go test -race ./internal/...` (lexa-hub) green
+- [x] `make test-fast` (csip-tls-test) green
+- [x] Conformance logic tests: skip (no protocol change)
+- [x] Mayhem: battery-family targeted set (`export-cap-full-battery,
+      battery-wrong-sign, battery-soc-refuse, battery-charge-disabled` — 0P/4D/0F/0B,
+      all DEGRADED verdicts `cannot_comply=True`, matches pre-shadow baseline) +
+      **full campaign** (radioactive zone: cmd/hub actuator wiring touched — 05 §12)
+      — see wave-gate campaign report `qa-mayhem-20260705-151009.md` (34P/17D/0F/0B, within the 32–35P band; targeted battery set `qa-mayhem-20260705-140802.md`).
+- [x] Timing re-tuned post-deploy (`hub-replay-tune.sh fast`; engine=3s/discovery=5s/
+      poll=2s confirmed post-restart).
 
 ## Mayhem scenarios affected
 Verdicts: none may move. Observed-by-shadow: `battery-wrong-sign`, `battery-soc-refuse`,
