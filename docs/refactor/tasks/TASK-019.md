@@ -1,6 +1,28 @@
 # TASK-019 — Module-extraction ADR + `lexa-proto` skeleton + `go.work`
 
-*Status: TODO · Phase: P1 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-05, csip-tls-test c5b7122 / lexa-hub c40faa2 /
+lexa-proto 2757709) · Phase: P1 · Effort: M (≈4–6 h) · Difficulty: med ·
+Risk: low*
+
+**Completion notes (2026-07-05):** `~/projects/lexa-proto` created (fresh
+git repo, `main`, skeleton commit `2757709`): `go.mod` (bare module path
+`lexa-proto`, `go 1.26` matching both consumers post-TASK-006), five package
+dirs each with only a `doc.go`, `README.md`, `CLAUDE.md`,
+`scripts/check-cgo-free.sh` (passes). `go.work` committed in both consumer
+repos (`go work init . ../lexa-proto`, own module listed first). AD-003
+extended in `02_ARCHITECTURE_DECISIONS.md` with module path, package layout,
+pinning mechanism (`proto.pin` SHA file today — no fetchable remote exists;
+flips to go.mod pseudo-version once lexa-proto is hosted under `dsizzle83`
+and a fetch credential exists, both human steps), and the go.work
+commit/removal policy. Both repos' `ci.yml` gained a workflow-level
+`GOWORK: "off"` so hosted CI (single-repo checkout, no sibling
+`../lexa-proto`) is unaffected by `go.work`'s presence — verified by running
+every job's exact commands locally with `GOWORK=off` exported (both repos'
+full command sets green). `go build ./...` and the regression checklist
+(lexa-hub `make test` + `go test -race -count=1 ./internal/...`;
+csip-tls-test `make test-fast` + `go test -count=1 ./tests/`) all green with
+`go.work` present (no `go.work.sum` was generated — no `.gitignore` change
+needed). No code moved; zero runtime change.
 
 ## Objective
 A new shared-module repository `~/projects/lexa-proto` exists (git-initialized, empty
@@ -133,18 +155,18 @@ cd ~/projects/csip-tls-test && make test-fast && go test ./tests/
 - No preservation-ledger entries touched (no defensive code involved).
 
 ## Acceptance criteria
-- [ ] `~/projects/lexa-proto` exists, `git log` shows the skeleton commit,
+- [x] `~/projects/lexa-proto` exists, `git log` shows the skeleton commit,
       `bash scripts/check-cgo-free.sh` exits 0.
-- [ ] `go.work` committed in both repos; `go build ./...` green in both.
-- [ ] `make test` (lexa-hub) and `make test-fast` + `go test ./tests/` (csip-tls-test) green.
-- [ ] AD-003 extension answers module path, layout, pinning, and go.work-commit policy
+- [x] `go.work` committed in both repos; `go build ./...` green in both.
+- [x] `make test` (lexa-hub) and `make test-fast` + `go test ./tests/` (csip-tls-test) green.
+- [x] AD-003 extension answers module path, layout, pinning, and go.work-commit policy
       explicitly (no "TBD").
 
 ## Regression checklist
-- [ ] `make test-fast` (csip-tls-test) / `go test -race ./internal/...` (lexa-hub) green
-- [ ] Conformance logic tests: not protocol-adjacent — `go test ./tests/` run anyway (cheap)
-- [ ] Mayhem: none (no runtime change)
-- [ ] Both repos build with `GOWORK=off` (skeleton unreferenced)
+- [x] `make test-fast` (csip-tls-test) / `go test -race ./internal/...` (lexa-hub) green
+- [x] Conformance logic tests: not protocol-adjacent — `go test ./tests/` run anyway (cheap)
+- [x] Mayhem: none (no runtime change)
+- [x] Both repos build with `GOWORK=off` (skeleton unreferenced)
 
 ## Mayhem scenarios affected
 None.
