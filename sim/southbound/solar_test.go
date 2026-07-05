@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // TestSolarStep_PausedAppliesCurtailment guards the bench-replay invariant: a

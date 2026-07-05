@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // TestClampToSoC verifies the battery sim won't report power the pack can't

@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // BatteryBases holds the first data-register address of each model block.

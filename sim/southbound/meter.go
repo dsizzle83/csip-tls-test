@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // meterWSF is the scale factor for the meter's W/VA/VAR registers:
