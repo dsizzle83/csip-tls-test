@@ -1,6 +1,6 @@
 # TASK-024 — CI shared-module version-pinning gate; retire the CLAUDE.md lockstep prose
 
-*Status: DONE (2026-07-05, PENDING-SHA on `task/024-pin-gate`) · Phase: P1 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-05, aabde2b on `task/024-pin-gate`) · Phase: P1 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
 
 **Landing note (2026-07-05):** implemented per AD-003(c)/(e)/(f) exactly as decided.
 `scripts/check-proto-pin.sh` (csip-tls-test) is the single implementation; both repos'
