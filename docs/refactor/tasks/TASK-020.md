@@ -1,6 +1,27 @@
 # TASK-020 — Reconcile the diverged sunspec/derbase forks; extract to lexa-proto; lexa-hub consumes
 
-*Status: TODO · Phase: P1 · Effort: L (≈6–8 h) · Difficulty: high · Risk: **high***
+*Status: **DONE (partial)** — sunspec+modbus extracted to lexa-proto & lexa-hub
+flipped; **derbase deferred to TASK-023** (2026-07-05). lexa-proto `6ab2257`
+(modbus) + `e7a3d61` (sunspec); lexa-hub `2d3b334`; disposition doc
+`docs/refactor/notes/TASK-020-sunspec-disposition.md`. Bench deploy/conformance/
+campaign batched to TASK-021 per PE lane note. · Phase: P1 · Effort: L (≈6–8 h) ·
+Difficulty: high · Risk: **high***
+
+> **Deviations (see disposition doc §4/§5):**
+> 1. **derbase not moved.** Product `derbase` imports `internal/southbound/device`
+>    (which imports `internal/northbound/model`) in addition to the `model`
+>    dependency step 8 anticipated, and returns `device.Measurements`. A clean move
+>    needs both a `csipmodel` slice AND a placement decision for `device.Measurements`
+>    (TASK-023 / TASK-025 territory). derbase stays in lexa-hub with its `sunspec`
+>    import repointed; `derbase_csip_test.go` passes unchanged. **TASK-023 must move
+>    derbase.** Acceptance criterion "derbase deleted" is therefore NOT met.
+> 2. **No `require lexa-proto` line.** The bare module path (AD-003, pre-hosting) is
+>    invalid inside a go.mod `require` ("missing dot in first path element"); the
+>    committed `go.work use ../lexa-proto` resolves it. Flips to a require when the
+>    hosted dotted path lands (TASK-024).
+> 3. **Bench validation batched** to TASK-021 (no bench deploy this task, per PE).
+>    Code-level tests (lexa-proto go test, lexa-hub make test/test-nocgo/build-arm64,
+>    bench test-fast + `go test ./tests/`) all green.
 
 ## Objective
 One authoritative SunSpec codec (`sunspec` + its `modbus` Transport dependency) and one
