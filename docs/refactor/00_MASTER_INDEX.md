@@ -48,7 +48,7 @@ line is 09. 07 is the QA-specific slice of the same pipeline.
 
 | Phase | Tasks | Status | Exit campaign | Notes |
 |---|---|---|---|---|
-| P0 Foundations | 001–018 | IN PROGRESS | — | Done + merged: 001–005, 010–018 except as noted (details in task headers). 012 code validated (lexa-hub 8844f68; campaign 33P/17D/1F/0B, sole FAIL = known-flaky control-churn → TASK-060; merge on 2026-07-05 per 05 §12 cooling-off). Deferred to P0-exit gate: 007/008/009 bench deploy + wedge + soak + journald measurement; 013 ACL flip + RSK-09 campaign; 014 token flip; 015 STOCK baseline; 018 rolling-restart validation. Open: branch protection + `LEXA_HUB_RO_TOKEN` PAT (human, AD-012/TASK-004); 006 = last P0 task (2 reachable vulns, VULN_BASELINE_2026-07-04.md). |
+| P0 Foundations | 001–018 | IN PROGRESS | — | Done + merged: 001–005, 010–018 except as noted (details in task headers). 012 code validated (lexa-hub 8844f68; campaign 33P/17D/1F/0B, sole FAIL = known-flaky control-churn → TASK-060; merge on 2026-07-05 per 05 §12 cooling-off). 015 DONE (2026-07-05): first STOCK-timing Mayhem baseline recorded — 0.8 FAIL/cycle, 0 BLIND, 0 safety-invariant escalations (5 cycles/255 scenario-runs, `docs/QA_REPORT_STOCK_M0_20260705.md`); 2 findings filed (QA-STOCK-001/002), 0 margin edits — STOCK M0 baseline for TASK-081 to defend going forward. Deferred to P0-exit gate: 007/008/009 bench deploy + wedge + soak + journald measurement; 013 ACL flip + RSK-09 campaign; 014 token flip; 018 rolling-restart validation. Open: branch protection + `LEXA_HUB_RO_TOKEN` PAT (human, AD-012/TASK-004); 006 = last P0 task (2 reachable vulns, VULN_BASELINE_2026-07-04.md). |
 | P1 Shared modules (R2) | 019–024, 082 | NOT STARTED | — | |
 | P2 Device Reconciler (R1) | 025–033 | NOT STARTED | — | Critical path |
 | P3 Time & persistence | 034–043 | NOT STARTED | — | |
@@ -63,6 +63,12 @@ M5 = V1.0 (see 01 §9).
 (2026-07-03); accepted DEGRADEDs per `docs/QA_REPORT_V5_20260703.md` + V6
 notes. Next scheduled: V7 10-cycle (expected ~0 FAIL) — becomes the M0
 FAST baseline if clean.
+
+**STOCK M0 baseline (2026-07-05, TASK-015):** 0.8 FAIL/cycle, 0 BLIND, 0
+safety-invariant escalations (5 cycles/255 scenario-runs, first campaign run
+in the product's actual shipping timing regime); see
+`docs/QA_REPORT_STOCK_M0_20260705.md`. Future STOCK release gates (TASK-081)
+compare against this number.
 
 ## Working agreements (short form)
 

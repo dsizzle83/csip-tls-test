@@ -173,3 +173,46 @@ converges), and the structural malforms `malformed-csip` (dup mRID) / `malform-m
   `bash scripts/update-sim-pis.sh 69.0.0.1 dmitri` (needs `bin/arm64/*` prebuilt).
 - Hub in **fast** replay timing. CSIP control back to `default`, gridsim clock offset 0.
 - All work committed + pushed on branch `lexa-hub` (commits `8b477b7`..`a77e27b`).
+
+---
+
+## 6. STOCK M0 baseline findings (2026-07-05, TASK-015)
+
+First campaign run in STOCK bench timing (engine 15 s / discovery 20 s / poll 10 s) —
+see `docs/QA_REPORT_STOCK_M0_20260705.md` for the full triage. 0.8 FAIL/cycle, 0 BLIND,
+0 safety-invariant escalations over 5 cycles / 255 scenario-runs. Two new findings filed
+below; the other two non-PASS singletons (`perfect-storm`, `meter-ct-inverted`) are
+pre-existing documented gaps needing no new entry (see the report's disposition table).
+
+- **`QA-STOCK-001` — `malform-huge-activepower` FAIL recurrence at STOCK cadence
+  (1/5 cycles).** Same fail-open signature as the pre-2026-06-24 bug this scenario's fix
+  closed (northbound walker fails open on the overflow-bait DERControl, dropping the safe
+  export cap; INV-EXPORT breached 46 samples, t=30-76s, cycle 1). 4/5 STOCK cycles were
+  clean and the fix itself (fail-closed to last-known-good) is not supposed to be
+  cadence-dependent, so this is filed as a **hypothesis to confirm**, not a confirmed
+  regression: STOCK's 20 s discovery walk (vs. FAST's 5 s) means less last-known-good
+  history has accumulated by the time the malform lands at its fixed scenario-relative
+  offset, occasionally catching the walker before a fallback control exists to hold.
+  → **Fix/next step:** journal forensics on a reproduction (`--only
+  malform-huge-activepower` under STOCK, repeated) to confirm/refute the discovery-cadence
+  hypothesis; if confirmed, the fail-closed guard needs to seed a synthetic
+  last-known-good (or hold the *previous* program's default) during the walker's initial
+  discovery window, not only after a first successful walk. Evidence:
+  `logs/campaign-stock-20260704T224628/cycle-01.json`.
+  Priority: low (1/5, no safety escalation, product build unchanged from the
+  already-fixed 2026-06/07-01 state) — track, don't block M0.
+
+- **`QA-STOCK-002` — `clock-jitter` convergence margin tight at STOCK cadence (1/5
+  cycles).** The FAST-mode fix (default-fallback clock-regression guard +
+  7 s-jitter-cycle deliberately coprime with FAST's 5 s walk period, `HoldS 35→45`)
+  encodes FAST-cadence timing relationships explicitly. Under STOCK's 20 s discovery
+  walk that coprimality no longer applies, and cycle 2 shows the hub genuinely still
+  converging (43.42 s) inside the 45 s window when the sample was taken, with a 41 s
+  overshoot in the interim and no CannotComply posted while catching up.
+  → **Fix/next step:** recompute the STOCK-cadence-correct `HoldS`/jitter-cycle
+  parameters from tick counts (per 06 §4.5 — no oracle weakening without a physical
+  tick-count justification written into the scenario's `Fix` text); do not touch the
+  margin without that derivation. Evidence:
+  `logs/campaign-stock-20260704T224628/cycle-02.json`.
+  Priority: low (1/5, converges within window most of the time, no safety escalation)
+  — track, don't block M0.
