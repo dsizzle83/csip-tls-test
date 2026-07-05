@@ -1,6 +1,6 @@
 # TASK-036 — Migrate hub `expiryConfirmTicks`, api `csipReportGraceS`, optimizer TOU onto `utilitytime`
 
-*Status: TODO · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-05, lexa-hub `fc00029`, branch `task/036-time-consumers`, unmerged — code+unit-tests only, bench validation batched at next gate) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
 
 ## Objective
 Move the last three utility-time owners onto `internal/utilitytime`:
@@ -157,22 +157,28 @@ Preservation ledger entries touched:
 - FAST-mode wall-clock semantics of the debounce (9 s) — bit-identical.
 
 ## Acceptance criteria
-- [ ] `grep -rn "expiryConfirmTicks\|csipReportGraceS" ~/projects/lexa-hub --include=*.go`
+- [x] `grep -rn "expiryConfirmTicks\|csipReportGraceS" ~/projects/lexa-hub --include=*.go`
       returns only comments/history (constants gone or delegated).
-- [ ] `go test -race ./internal/... && go test -race ./cmd/...` green
+- [x] `go test -race ./internal/... && go test -race ./cmd/...` green
       (note: `make test` covers `./internal/...` only — run `./cmd/...` too;
       cmd packages have tests: state_test.go, stale_test.go, etc.).
-- [ ] FAST debounce = 3 ticks (test-proven); STOCK = 2 ticks (test-proven).
+- [x] FAST debounce = 3 ticks (test-proven); STOCK = 2 ticks (test-proven).
 - [ ] Gate scenarios 10× at baseline; full FAST campaign ≤ 0.6 FAIL/cycle,
-      0 BLIND.
+      0 BLIND. **Deferred to the next batched bench gate** (Principal's
+      launch instructions for this task: code+unit-tests only, no bench
+      access this session; the 05 §12 deadline amendment permits batching
+      unit-gated merges and gating the campaign at the wave/reconciler-flip
+      boundary instead).
 
 ## Regression checklist
-- [ ] `go test -race ./internal/...` (lexa-hub) green, plus `go test -race ./cmd/...`
-- [ ] Conformance logic tests: not needed (no protocol resource changes)
-- [ ] Mayhem: targeted scenarios 10× + full campaign (radioactive-adjacent)
+- [x] `go test -race ./internal/...` (lexa-hub) green, plus `go test -race ./cmd/...`
+- [x] Conformance logic tests: not needed (no protocol resource changes)
+- [ ] Mayhem: targeted scenarios 10× + full campaign (radioactive-adjacent) —
+      **batched at the next wave gate**, not run this session (see above).
 - [ ] STOCK spot-check: one `bench-up.sh --stock` run of `wan-outage-expiry`
       + `clock-jump-forward` to observe the new 30 s release (record verdicts
-      in the PR; STOCK differences are findings, not blockers, per 03 P0)
+      in the PR; STOCK differences are findings, not blockers, per 03 P0) —
+      **pending**, batched with the campaign above.
 
 ## Mayhem scenarios affected
 `wan-outage-expiry`, `clock-jump-forward`, `clock-jitter`, `expired-control`
