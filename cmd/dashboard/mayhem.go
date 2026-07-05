@@ -1885,7 +1885,13 @@ func (d *mayhemDriver) post(name, path string, body map[string]any) error {
 		return fmt.Errorf("unknown backend %q", name)
 	}
 	buf, _ := json.Marshal(body)
-	resp, err := d.client.Post(base+path, "application/json", bytes.NewReader(buf))
+	req, err := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(buf))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setHubAuth(req, name) // TASK-014: token only for name=="hub"
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1901,7 +1907,12 @@ func (d *mayhemDriver) getJSON(name, path string, out any) error {
 	if !ok {
 		return fmt.Errorf("unknown backend %q", name)
 	}
-	resp, err := d.client.Get(base + path)
+	req, err := http.NewRequest(http.MethodGet, base+path, nil)
+	if err != nil {
+		return err
+	}
+	setHubAuth(req, name) // TASK-014: token only for name=="hub"
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return err
 	}

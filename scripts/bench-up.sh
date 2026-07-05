@@ -17,6 +17,13 @@
 #      with the desktop, so they should already be up once the LAN is back.
 #   4. Sets the hub to replay-fast timing.
 #
+# TASK-014 (W7, AD-008): lexa-api may require a bearer token. This script
+# relays ~/.config/lexa/hub-api.token from the hub's /etc/lexa/api.token over
+# SSH on every run (idempotent — empty if the hub hasn't enabled auth yet,
+# which is the staged-rollout default) and points the dashboard at it via
+# -hub-token-file. An empty token file is exactly today's unauthenticated
+# behavior; nothing here can make an already-working bench start failing.
+#
 # The sims/hub run committed code already; nothing is deployed here.
 set -uo pipefail
 
@@ -69,21 +76,47 @@ start_unit(){  # name, cmd...
 }
 [[ -x bin/server    ]] || { echo "  building bin/server…";    make build >/dev/null 2>&1 || bad "make build failed"; }
 [[ -x bin/dashboard ]] || { echo "  building bin/dashboard…"; make build >/dev/null 2>&1 || bad "make build failed"; }
+
+# Relay the hub's bearer token (TASK-014, AD-008) so the dashboard can
+# present it. Best-effort: if the hub is unreachable or hasn't generated a
+# token yet, the file ends up empty and the dashboard runs open (unchanged
+# behavior) — never fatal to bench-up.
+HUB_TOKEN_FILE="$HOME/.config/lexa/hub-api.token"
+mkdir -p "$(dirname "$HUB_TOKEN_FILE")"
+if ( umask 077; ssh -o ConnectTimeout=5 dmitri@$HUB 'sudo cat /etc/lexa/api.token 2>/dev/null || true' > "$HUB_TOKEN_FILE" 2>/dev/null ); then
+  if [[ -s "$HUB_TOKEN_FILE" ]]; then
+    ok "hub API token relayed → $HUB_TOKEN_FILE (dashboard will present it)"
+  else
+    ok "hub API token not yet configured — dashboard runs open (staged rollout)"
+  fi
+else
+  : > "$HUB_TOKEN_FILE"; chmod 600 "$HUB_TOKEN_FILE"
+  bad "couldn't reach hub to fetch its API token — dashboard runs open"
+fi
+
 start_unit csip-gridsim   "$REPO/bin/server" -ca certs/ca-cert.pem -cert certs/server-cert.pem -key certs/vault/server-key.pem
 start_unit csip-dashboard "$REPO/bin/dashboard" -addr :8080 -hub http://$HUB:9100 \
   -gridsim http://localhost:11112 -solar http://$SOLAR:6020 -battery http://$BAT:6021 \
-  -meter http://$MTR:6022 -ev http://$EV:6024
+  -meter http://$MTR:6022 -ev http://$EV:6024 -hub-token-file "$HUB_TOKEN_FILE"
 sleep 3
 
 # ── 3. verify the whole bench ───────────────────────────────────────────────
 hr "Verify bench"
-probe(){ # label url
-  local code; code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$2" 2>/dev/null)
-  [[ "$code" =~ ^[2-4][0-9][0-9]$ ]] && ok "$1 ($2 → $code)" || bad "$1 unreachable ($2)"
+probe(){ # label url [-H "..."]
+  local label="$1" url="$2"; shift 2
+  local code; code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "$@" "$url" 2>/dev/null)
+  [[ "$code" =~ ^[2-4][0-9][0-9]$ ]] && ok "$label ($url → $code)" || bad "$label unreachable ($url)"
 }
 probe "gridsim admin" http://localhost:11112/
 probe "dashboard"     http://localhost:8080/
-probe "hub status"    http://$HUB:9100/status
+# Present the token if we have one — a 401 here would otherwise read as a
+# false "hub down" when auth is actually on and working as intended.
+HUB_TOKEN="$(tr -d '[:space:]' < "$HUB_TOKEN_FILE" 2>/dev/null || true)"
+if [[ -n "$HUB_TOKEN" ]]; then
+  probe "hub status"  http://$HUB:9100/status -H "Authorization: Bearer $HUB_TOKEN"
+else
+  probe "hub status"  http://$HUB:9100/status
+fi
 probe "solar sim"     http://$SOLAR:6020/state
 probe "battery sim"   http://$BAT:6021/state
 probe "meter sim"     http://$MTR:6022/state

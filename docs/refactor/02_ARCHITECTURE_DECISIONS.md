@@ -218,6 +218,22 @@ documented as a bench property, never a product default. Deployed-vs-repo
 mosquitto config differs (the Pi runs a slimmed conf.d drop-in) — ACL work
 must edit both (TASK-013).
 
+**TASK-014 update (2026-07-04): API-token half delivered, TLS half explicitly
+deferred.** Bearer-token auth on lexa-api `/status`/`/logs` landed
+(constant-time compare, `api_token_file` staged rollout — empty ⇒ open,
+today's behavior preserved until the bench explicitly flips it), with every
+verified consumer migrated in the same task: dashboard proxy Director +
+logmux hub stream + Mayhem/replay driver HTTP helpers (scoped to the
+`"hub"` base only — simapi/gridsim stay open), metersim `-hub-token-file`.
+`/healthz` stays unauthenticated (TASK-008 watchdog self-probe).
+**TLS on :9100 is deferred, not delivered**: the bench is air-gapped
+LAN-only (same justification as the admin/simapi surfaces above), and a TLS
+listener is meaningful extra surface (cert provisioning + lockstep client
+changes in the dashboard/metersim/driver HTTP clients) that doesn't reduce
+risk on an already-token-gated, non-routable segment. Backlog: TLS listener
+on :9100 (follow-up, unnumbered) if/when lexa-api leaves the air-gapped
+bench assumption.
+
 ## AD-009 ❓ HTTP client on the northbound boundary (R5/D9)
 
 **Problem.** Hand-rolled HTTP/1.1 parsing over wolfSSL parses hostile

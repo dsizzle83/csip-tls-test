@@ -38,6 +38,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -69,8 +70,23 @@ func main() {
 	batteryAPI := flag.String("battery-api", "", "Battery simapi base URL for linked mode (e.g. http://69.0.0.11:6021)")
 	evAPI := flag.String("ev-api", "", "EV charger simapi base URL for linked mode (e.g. http://69.0.0.14:6024)")
 	hubAPI := flag.String("hub-api", "", "Hub status API for EV power via OCPP (e.g. http://69.0.0.1:9100); preferred over -ev-api")
+	hubTokenFile := flag.String("hub-token-file", "", "path to lexa-api's bearer token (TASK-014, AD-008); empty = no auth presented, today's behavior")
 	initLoad := flag.Float64("load", 3000, "Initial site load in watts (linked mode); injectable via LoadW_W")
 	flag.Parse()
+
+	// TASK-014: lexa-api's /status may require a bearer token once its
+	// api_token_file is configured. Loaded once at startup — a missing or
+	// empty file is not fatal, it just means no header is sent, which is
+	// exactly today's behavior against a hub that isn't requiring auth yet
+	// (staged rollout, AD-008).
+	hubToken := ""
+	if *hubTokenFile != "" {
+		if data, err := os.ReadFile(*hubTokenFile); err != nil {
+			log.Printf("metersim: -hub-token-file %s: %v — continuing without hub auth", *hubTokenFile, err)
+		} else {
+			hubToken = strings.TrimSpace(string(data))
+		}
+	}
 
 	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
 	linked := *solarAPI != "" || *batteryAPI != "" || *evAPI != "" || *hubAPI != ""
@@ -135,7 +151,7 @@ func main() {
 					bW := fetchW(*batteryAPI)
 					var eW float64
 					if *hubAPI != "" {
-						eW = fetchHubEVW(*hubAPI)
+						eW = fetchHubEVW(*hubAPI, hubToken)
 					} else {
 						eW = fetchEVW(*evAPI)
 					}
@@ -281,12 +297,23 @@ func fetchEVW(baseURL string) float64 {
 // /status endpoint.  Uses hub OCPP MeterValues data, which is more reliable
 // than polling the EV Pi's simapi port directly.
 // Returns 0 on any error (fails safe — no phantom load).
-func fetchHubEVW(baseURL string) float64 {
+//
+// token is the bearer token to present (TASK-014); empty sends no
+// Authorization header, matching a hub that isn't requiring auth yet.
+func fetchHubEVW(baseURL, token string) float64 {
 	if baseURL == "" {
 		return 0
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(baseURL + "/status")
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/status", nil)
+	if err != nil {
+		log.Printf("metersim: fetchHubEVW %s: %v", baseURL, err)
+		return 0
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("metersim: fetchHubEVW %s: %v", baseURL, err)
 		return 0
