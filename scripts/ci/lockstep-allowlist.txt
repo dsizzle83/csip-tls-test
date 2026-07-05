@@ -15,18 +15,12 @@
 # emits: "<pkg>/<relpath> DIFFER|BENCH-ONLY|PRODUCT-ONLY". Re-verified by
 # `diff -rq` against both working trees on 2026-07-04 (this task's landing
 # day) — reviewers: re-run the diff, don't just trust this file.
-
-# internal/southbound/sunspec (5 files differ; 4 exist only in lexa-hub)
-sunspec/der1547.go DIFFER
-sunspec/models.go DIFFER
-sunspec/reader.go DIFFER
-sunspec/reader_test.go DIFFER
-sunspec/scanner.go DIFFER
-sunspec/der1547_roundtrip_test.go PRODUCT-ONLY
-sunspec/derlayout.go PRODUCT-ONLY
-sunspec/derlayout_test.go PRODUCT-ONLY
-sunspec/layout.go PRODUCT-ONLY
-
-# internal/ocppserver (code files identical; only docs/tests differ)
-ocppserver/CLAUDE.md DIFFER
-ocppserver/simulator_test.go DIFFER
+#
+# TASK-021 (2026-07-05): internal/southbound/sunspec deleted from csip-tls-test
+# (this task) — it was already gone from lexa-hub (TASK-020). internal/ocppserver
+# was already gone from both repos (TASK-022). Both trees are now retired from
+# both sides (moved to lexa-proto/sunspec, lexa-proto/ocppserver) — 0 divergence
+# entries remain. lockstep-check.sh treats "retired from both repos" as
+# in-lockstep-by-retirement, not drift (see its TREES loop). This file, and the
+# script, are fully retired at TASK-024 in favor of shared-module version
+# pinning.
