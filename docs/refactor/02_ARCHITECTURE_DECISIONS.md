@@ -70,6 +70,86 @@ a documented rule).
 **Open questions.** ❓ One module or three? Start with one module, three
 packages — split later only if versioning pressure appears.
 
+**Extension (TASK-019, 2026-07-05): module path, package layout, pinning
+mechanism, go.work policy — decided, not deferred.**
+
+`~/projects/lexa-proto` now exists (fresh git repo, `main`, skeleton commit)
+with the five packages below, each holding only a `doc.go` naming the
+source package it absorbs and the task that moves it. Neither consumer
+imports it yet.
+
+**(a) Module path.** `go.mod` declares bare `module lexa-proto` — **not**
+`github.com/dsizzle83/lexa-proto` — for now. Per AD-012, `lexa-proto` gets a
+repo under `dsizzle83` "when it's extracted"; that repo does not exist yet
+and repo creation on github.com is a human step (no `gh` CLI / API
+credential is available in this execution environment — the same gap
+AD-012 already recorded for branch protection). Inventing the hosted path
+today would make `go mod tidy` in either consumer try to fetch it and fail.
+**Flip rule:** rename the module to `github.com/dsizzle83/lexa-proto` (one
+commit: the `go.mod` line in lexa-proto + every import statement in both
+consumers that references it) as soon as the hosted repo exists, and no
+later than TASK-024 — if hosting lands before TASK-020 starts moving code,
+do the flip first and TASK-020 imports the hosted path from its first
+commit; if not, TASK-020 proceeds against the bare path and the rename is
+its own follow-up commit before TASK-024's pin gate goes live.
+
+**(b) Package layout** (one module, five packages — the open question above
+resolves to "one module" for V1.0):
+- `sunspec` — SunSpec register codec + layout engine (absorbs product's
+  `layout.go`/`derlayout.go` too).
+- `derbase` — CSIP `DERControlBase` → SunSpec writes; imports `sunspec` and
+  `csipmodel`.
+- `modbus` — `Transport` abstraction; imported by `sunspec` (the dependency
+  that makes `sunspec` and `modbus` move together, TASK-020).
+- `ocppserver` — OCPP 2.0.1 CSMS library; no intra-module dependency
+  (TASK-022).
+- `csipmodel` — IEEE 2030.5 XML model structs; consumed by `derbase`
+  (TASK-023).
+
+**(c) Pinning mechanism for TASK-024 — decided: `proto.pin` today, go.mod
+pseudo-version once hosting + a fetch credential exist.** There is no
+fetchable remote for `lexa-proto` right now (no hosted repo, no GitHub API
+credential in this environment — same constraint as AD-012's branch-
+protection blocker), so the go.mod-pseudo-version mechanism (`require
+lexa-proto vX.Y.Z-<timestamp>-<sha>` compared between the two consumers'
+`go.mod` files) **cannot** be the mechanism until that changes. Effective
+now: each consumer repo commits a `proto.pin` file at its root holding the
+required `lexa-proto` commit SHA (one line, e.g.
+`a1b2c3d4e5f6...`); the TASK-024 gate (a) compares the two consumers'
+`proto.pin` files to each other and fails on mismatch, and (b) where a
+local `../lexa-proto` checkout is available (developer machines, and any
+CI runner that has been given a sibling checkout the way the existing
+`lockstep` job checks out `dsizzle83/lexa-hub` via `LEXA_HUB_RO_TOKEN`),
+verifies that checkout's `HEAD` matches the pinned SHA. This is the same
+shape as the `lockstep` job already running in `csip-tls-test`'s CI
+(TASK-004) — reuse its PAT pattern (a fine-grained, read-only,
+single-repo-scoped token) for `lexa-proto` once it is hosted, rather than
+inventing a second mechanism. **When hosting + a credential land** (repo
+created under `dsizzle83`, either a PAT-based git credential rewrite
+`url."https://x-access-token:${TOKEN}@github.com/".insteadOf
+"https://github.com/"` for `go mod download`, or SSH deploy-key `insteadOf`
+reuse — either makes the module actually fetchable), TASK-024 may switch to
+comparing `go.mod`'s `require lexa-proto vX` line instead of `proto.pin`;
+this is a mechanism swap, not a new decision, and does not block anything
+before it — no code imports `lexa-proto` yet.
+
+**(d) `go.work` is committed in both repos for the migration window.**
+`lexa-hub/go.work` and `csip-tls-test/go.work` (both created via `go work
+init . ../lexa-proto`, own module listed first) are checked in now and
+removed by TASK-024 once `proto.pin` (or its go.mod-pseudo-version
+successor) is authoritative. **Hosted CI cannot see `go.work`'s
+`../lexa-proto`** — GitHub-hosted runners check out exactly one repo, so
+`../lexa-proto` does not exist on the runner and Go's automatic workspace
+discovery would otherwise fail every job. Both repos' `ci.yml` set
+`GOWORK: off` at the workflow level (all jobs) as of this task — safe today
+because the skeleton is unreferenced (`GOWORK=off` is functionally
+identical to no `go.work` file existing, which is exactly today's build
+graph); this line comes out together with the `go.work` files at TASK-024.
+
+No `replace` directives were added to either consumer's `go.mod` — `go.work`
+is the one local-dev mechanism; a `replace` would be redundant under
+`go.work` and would fight the `proto.pin`/pseudo-version gate later.
+
 ## AD-012 ✅ Hosting & CI platform: GitHub (de facto)
 
 **Decision.** Both repos stay on private GitHub under the single-maintainer
