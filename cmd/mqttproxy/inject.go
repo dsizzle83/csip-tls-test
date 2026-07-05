@@ -40,13 +40,30 @@ func encodeString(s string) []byte {
 }
 
 // connectPacket builds a CONNECT with a clean session and the given client ID.
-func connectPacket(clientID string) []byte {
+// When user is non-empty, the username (0x80) and password (0x40) connect
+// flags are set and the credentials are appended after the client ID in the
+// payload order MQTT 3.1.1 §3.1.3 requires (Client Identifier, Will Topic/
+// Message [absent here], User Name, Password) — flags byte 0x02 (clean
+// session only) becomes 0xC2 (TASK-013 / W7: the broker's ACL now requires
+// the qa-inject user for /inject to keep working once anonymous is off).
+// An empty user keeps producing the original anonymous CONNECT byte-for-byte,
+// so PASSTHROUGH callers (none today — mqttPublish is the only caller) are
+// unaffected.
+func connectPacket(clientID, user, pass string) []byte {
 	var vh []byte
 	vh = append(vh, encodeString("MQTT")...) // protocol name
 	vh = append(vh, 0x04)                    // protocol level 4 (3.1.1)
-	vh = append(vh, 0x02)                    // connect flags: clean session
-	vh = append(vh, 0x00, 0x3C)              // keepalive 60s
+	flags := byte(0x02)                      // clean session
+	if user != "" {
+		flags |= 0x80 | 0x40 // username + password present
+	}
+	vh = append(vh, flags)
+	vh = append(vh, 0x00, 0x3C) // keepalive 60s
 	vh = append(vh, encodeString(clientID)...)
+	if user != "" {
+		vh = append(vh, encodeString(user)...)
+		vh = append(vh, encodeString(pass)...)
+	}
 
 	pkt := []byte{0x10} // CONNECT
 	pkt = append(pkt, encodeRemainingLength(len(vh))...)
@@ -72,8 +89,10 @@ func disconnectPacket() []byte { return []byte{0xE0, 0x00} }
 
 // mqttPublish connects to broker (host:port), publishes one retained-or-not
 // message, and disconnects. It reads the CONNACK to confirm the broker accepted
-// the session before publishing.
-func mqttPublish(broker, clientID, topic string, payload []byte, retain bool) error {
+// the session before publishing. user/pass are the qa-inject broker
+// credentials (TASK-013 / W7); empty user sends the same anonymous CONNECT
+// this always sent, for use against a broker that still allows anonymous.
+func mqttPublish(broker, clientID, user, pass, topic string, payload []byte, retain bool) error {
 	conn, err := net.DialTimeout("tcp", broker, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial broker: %w", err)
@@ -81,7 +100,7 @@ func mqttPublish(broker, clientID, topic string, payload []byte, retain bool) er
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	if _, err := conn.Write(connectPacket(clientID)); err != nil {
+	if _, err := conn.Write(connectPacket(clientID, user, pass)); err != nil {
 		return fmt.Errorf("write CONNECT: %w", err)
 	}
 	// CONNACK is a 4-byte packet: 0x20 0x02 <flags> <return code>.

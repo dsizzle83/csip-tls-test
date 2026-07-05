@@ -11,6 +11,15 @@ import (
 type control struct {
 	proxy  *Proxy
 	broker string // upstream broker host:port, for message injection
+
+	// mqttUser/mqttPass authenticate the direct /inject publish against the
+	// real broker (TASK-013 / W7): once the broker's ACL requires
+	// credentials, an anonymous CONNECT here is rejected and every mqtt-*
+	// mayhem scenario that uses /inject (mqtt-malformed-control,
+	// mqtt-stale-retained) goes BLIND. Empty mqttUser keeps sending the
+	// original anonymous CONNECT, for a broker that still allows it.
+	mqttUser string
+	mqttPass string
 }
 
 type faultReq struct {
@@ -73,7 +82,7 @@ func (c *control) handleInject(w http.ResponseWriter, r *http.Request) {
 	// Inject straight onto the real broker, bypassing the proxy's fault layer —
 	// this is a message-content fault, not a transport one.
 	clientID := "mqttproxy-inject-" + time.Now().Format("150405.000")
-	if err := mqttPublish(c.broker, clientID, req.Topic, []byte(req.Payload), req.Retain); err != nil {
+	if err := mqttPublish(c.broker, clientID, c.mqttUser, c.mqttPass, req.Topic, []byte(req.Payload), req.Retain); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}

@@ -1,6 +1,29 @@
 # TASK-013 — Mosquitto per-service credentials + ACLs
 
-*Status: TODO · Phase: P0 · Effort: L (≈6–8 h + campaign) · Difficulty: med · Risk: med*
+*Status: CODE COMPLETE, BENCH ROLLOUT + QA GATE DEFERRED TO P0-EXIT GATE (2026-07-04) · Phase: P0 · Effort: L (≈6–8 h + campaign) · Difficulty: med · Risk: med*
+
+**Status notes (2026-07-04):** Implemented on branch `task/013-broker-acls` in both
+repos (lexa-hub + csip-tls-test, lockstep, not yet merged). Done: `mqttutil.ConnectAuth`
++ `LoadPassword` (unit-tested); `mqtt_user`/`mqtt_pass_file` added to all six service
+configs/config.go/main.go (staged — empty ⇒ anonymous, today's behavior);
+`systemd/mosquitto-lexa.acl` (new file, matrix re-derived from actual Subscribe/Publish
+call sites, matches the task's table exactly, including the two RSK-09 easy-to-miss
+hub↔northbound lines); `systemd/mosquitto-lexa.conf` updated to the flipped target
+state; `deploy-hub-pi.sh` gets a `--enable-mqtt-acl` flag mirroring TASK-014's
+`--enable-api-auth` staging pattern (credentials always generated+patched in; the flip
+itself — `allow_anonymous false` + `password_file`/`acl_file` — gated behind the flag);
+`cmd/mqttproxy`'s `connectPacket`/`mqttPublish` gained `-user`/`-passfile` (golden-bytes
+test for the credentialed CONNECT, 0xC2 flags byte); `sim/mqttproxy.service` passes
+`-user qa-inject -passfile ...`; `mqtt-chaos.sh deploy` provisions the qa-inject broker
+user idempotently. Both repos' `go build ./...` and `go test ./...` (lexa-hub also
+`-race ./internal/...`) are green. **Deferred to the P0-exit gate per explicit launch
+instruction** (deploy freeze ahead of TASK-012 merging): the actual bench rollout
+(steps 6-7 — deploy, verify per-user journal evidence, flip `--enable-mqtt-acl`,
+negative tests) and the QA gate (targeted `mqtt-*` scenarios ×10 + full FAST campaign,
+RSK-09 acceptance row) have NOT run. No service restarts or mosquitto restarts were
+performed. Reviewer: treat the acceptance criteria and regression checklist below as
+NOT satisfied until that gate runs — this entry only covers "code implements the staged
+design correctly and doesn't regress anything build/unit-testable without the bench."
 
 ## Objective
 The hub Pi's broker no longer accepts anonymous clients: each of the six lexa services

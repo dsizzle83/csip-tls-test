@@ -63,6 +63,46 @@ Rollback: on the hub, clear `api_token_file` in `/etc/lexa/api.json` and
 token (they just keep sending the header — lexa-api simply stops checking it),
 so no consumer-side change is needed to roll back.
 
+### MQTT broker credentials + ACL (TASK-013, W7/AD-008)
+
+Mosquitto (`localhost:1883` on the hub) no longer accepts anonymous clients once
+flipped: each of the six lexa services plus the QA `qa-inject` user
+(`cmd/mqttproxy`'s `/inject`) authenticates with its own broker user, and
+`lexa-hub/systemd/mosquitto-lexa.acl` grants each only the topics
+`internal/bus/topics.go` says it owns. Staged rollout, same shape as the
+lexa-api token above:
+
+1. `deploy-hub-pi.sh 69.0.0.1 dmitri` (no flag) — always generates per-service
+   passwords under `/etc/lexa/mqtt/<svc>.pass` (0600 lexa:lexa), installs
+   `/etc/mosquitto/lexa-passwd`/`lexa-acl`, and patches every service's
+   `mqtt_user`/`mqtt_pass_file` — but the broker's conf.d drop-in still says
+   `allow_anonymous true` and doesn't reference `password_file`/`acl_file` yet.
+2. Confirm every service authenticated (harmless while anonymous is still on):
+   `ssh dmitri@69.0.0.1 sudo journalctl -u lexa-modbus -n 20 --no-pager | grep 'broker user='`
+3. `deploy-hub-pi.sh 69.0.0.1 dmitri --enable-mqtt-acl` — flips
+   `allow_anonymous false` and installs `password_file`/`acl_file`; restarts
+   mosquitto and all six services.
+4. Verify:
+   ```
+   ssh dmitri@69.0.0.1 sudo journalctl -u mosquitto -n 50 --no-pager | grep -i 'not authorised'   # want: empty
+   ssh dmitri@69.0.0.1 mosquitto_pub -h localhost -t lexa/control/battery/battery-0 -m '{}'         # want: rejected (no creds)
+   ```
+- **qa-inject**: `scripts/mqtt-chaos.sh deploy` provisions this broker user
+  (idempotent, `openssl rand -hex 16` → `/etc/lexa/mqtt/qa-inject.pass`,
+  registered into the same `/etc/mosquitto/lexa-passwd`) and passes
+  `-user qa-inject -passfile ...` to `sim/mqttproxy.service`'s ExecStart — the
+  ACL grant itself (`lexa/#` readwrite, bench-only) lives in lexa-hub's
+  `mosquitto-lexa.acl`. Every lexa service proxied through mqttproxy during a
+  Mayhem run (`:1882`) still authenticates end-to-end with its own credentials
+  through the transparent PASSTHROUGH; only the direct `/inject` publish needs
+  the qa-inject user.
+- Rollback: revert the hub's conf.d drop-in to `allow_anonymous true` (drop
+  `password_file`/`acl_file`) and `systemctl restart mosquitto`. Services keep
+  working unmodified since their credentials are additive, not required by
+  their own config.
+- Re-run `scripts/hub-replay-tune.sh fast` after any mosquitto restart from
+  this flow (deploy resets hub timing to STOCK).
+
 ## wolfSSL sysroots (desktop)
 
 - amd64: `~/.local/wolfssl-amd64` (persistent). Both repos' Makefiles auto-wire it into
