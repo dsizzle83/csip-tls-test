@@ -1,0 +1,117 @@
+Mayhem started: 7 scenario(s), 1000 ms sampling, via http://localhost:8080
+Following the run (Ctrl-C aborts and restores the bench)…
+
+  [1/7] Zero-export cap, full sun, battery full …
+  [2/7] Battery executes a commanded charge as a discharge …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 3620 W for 9s
+  [3/7] Battery accepts the discharge command but does nothing …
+    →         PASS  battery stayed within its SoC envelope and held the cap despite the direction fault
+  [4/7] Battery refuses to charge away excess solar …
+    →     DEGRADED  importCap ≤ 0 W exceeded by up to 5930 W for 70s
+  [5/7] Battery registers read the SunSpec N/A sentinel (0x8000) …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 4400 W for 10s
+  [6/7] MQTT broker drops out and restarts mid-cap …
+    →         PASS  hub did not act on the garbage battery reading
+  [7/7] The hub process dies and restarts under a cap …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 4400 W for 6s
+    →         PASS  contained the hub restart and held the safe control
+
+==============================================================================
+MAYHEM QA REPORT
+Run complete. Bench restored.
+==============================================================================
+PASS 3   DEGRADED 4   FAIL 0   BLIND 0   INCONCLUSIVE 0
+Worst breach: 5930 W   Total time out of limit: 99 s
+Full markdown report on the dashboard host: qa-mayhem-20260705-155819.md
+
+------------------------------------------------------------------------------
+[DEGRADED] Zero-export cap, full sun, battery full   (Grid compliance (INV-EXPORT) · export-cap-full-battery)
+  exportCap ≤ 0 W exceeded by up to 3620 W for 9s
+  peak 3620 W · out-of-limit 9 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/100
+  represents: Utility commands zero export during a sunny low-load midday while the home battery is already full — the hub's only lever is to curtail PV to ~0.
+  expected:   Hold net export at ~0 W by curtailing solar. If it physically cannot, post CannotComply — never silently export over the cap.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 3620 W, total 9s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=101s the real meter read 1630 W net while the hub believed 1630 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Optimizer must curtail PV when the battery cannot absorb; verify the curtail command reaches the inverter.
+
+------------------------------------------------------------------------------
+[PASS] Battery executes a commanded charge as a discharge   (Resource limits (INV-SOC) · battery-wrong-sign)
+  battery stayed within its SoC envelope and held the cap despite the direction fault
+  peak 0 W · out-of-limit 0 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/90
+  represents: A battery wired or firmware-flipped in the wrong direction: when the hub commands a charge to soak up excess PV, the pack discharges instead, walking an already-low state of charge toward empty.
+  expected:   Detect the pack moving opposite to the command (SoC falling under a charge command) and halt/alarm before it discharges below the reserve floor.
+    • INV-SOC held: no violations across the window.
+    • INV-EXPORT held: no violations across the window.
+    • The pack never left its SoC bounds and the active cap held — the hub kept it safe even though the device was commanded the wrong way.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Verify measured battery direction/SoC trend against the commanded sign in the orchestrator battery adapter. (Demonstrates robustness under SIMULATED abuse; the BatteryW sign convention must be confirmed against the live hub /status before trusting the verdict.)
+
+------------------------------------------------------------------------------
+[DEGRADED] Battery accepts the discharge command but does nothing   (Resource limits (INV-CONVERGE) · battery-soc-refuse)
+  importCap ≤ 0 W exceeded by up to 5930 W for 70s
+  peak 5930 W · out-of-limit 70 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/70
+  represents: Under an import cap the hub commands the battery to discharge and cover the load, but the pack's BMS/contactor refuses — it ACKs the setpoint and produces zero power while it still has charge. A hub that assumes the discharge took effect keeps importing over the cap.
+  expected:   Detect that battery power never moved despite the command and react — fall back to another lever or post CannotComply. Never assume the commanded discharge happened.
+    • Constraint: importCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 5930 W, total 70s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 41 samples (t=30–71s); first: importCap over cap 0 W by 4550 W
+    • At t=71s the real meter read 6080 W net while the hub believed 6080 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Verify measured battery power against the commanded setpoint; on a non-responding pack, escalate / post CannotComply (orchestrator battery adapter). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[DEGRADED] Battery refuses to charge away excess solar   (Resource limits (INV-CONVERGE) · battery-charge-disabled)
+  exportCap ≤ 0 W exceeded by up to 4400 W for 10s
+  peak 4400 W · out-of-limit 10 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/70
+  represents: Under a zero-export cap at full sun the hub commands the battery to CHARGE and soak up the excess PV — but the pack's charge contactor is disabled and it ACKs the setpoint while absorbing nothing. A hub that assumes the battery is absorbing keeps exporting over the cap instead of falling back to curtailing the inverter.
+  expected:   Detect that the battery is not actually charging and fall back to its other lever — curtail the inverter — to hold the export cap (or post CannotComply). Never assume the commanded charge happened.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 4400 W, total 10s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=71s the real meter read 0 W net while the hub believed 0 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Verify measured battery power against the commanded charge; when the pack does not absorb, curtail solar to hold the cap (orchestrator lever fallback). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[PASS] Battery registers read the SunSpec N/A sentinel (0x8000)   (Modbus transport (INV-TRANSPORT) · battery-nan-sentinel)
+  hub did not act on the garbage battery reading
+  peak 0 W · out-of-limit 0 s · adopted=False reacted=True cannot_comply=False blind=False errs=0/35
+  represents: The battery's registers all read 0x8000 — a half-initialised or failed bank. SoC decodes to a wild ~32768% and power to −32768 W. A hub that trusts it optimises against a fabricated SoC and would charge/discharge on garbage; this is the invalid-SoC (255 / NaN-equiv) hazard at the wire.
+  expected:   Treat 0x8000 as N/A, mark the pack unavailable, and never surface an impossible SoC or power.
+    • The hub stayed up and never reported an impossible SoC/power under the transport fault — it recognised the sentinel as N/A and held a safe value.
+    • Final battery reading: SoC 50%, power 0 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Treat 0x8000 (int16) / 0xFFFF (uint16) as not-implemented → N/A in the SunSpec decode and mark the pack down (lexa-modbus / sunspec).
+
+------------------------------------------------------------------------------
+[DEGRADED] MQTT broker drops out and restarts mid-cap   (Bus resilience (INV-EXPORT survivability) · mqtt-broker-restart)
+  exportCap ≤ 0 W exceeded by up to 4400 W for 6s
+  peak 4400 W · out-of-limit 6 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/80
+  represents: mosquitto restarts (or the link blips) while a zero-export cap is active — every service's MQTT session drops and must reconnect and re-subscribe.
+  expected:   Ride out the outage: keep the latched curtailment, recover the retained control on reconnect, and never let export run away during or after the blip.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 4400 W, total 6s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=81s the real meter read 1630 W net while the hub believed 1630 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: mqttutil must reconnect AND replay subscriptions (paho does not resend SUBSCRIBE); CSIP control must be retained so the hub re-reads it on reconnect.
+
+------------------------------------------------------------------------------
+[PASS] The hub process dies and restarts under a cap   (Hub resilience (INV-EXPORT survivability) · hub-restart-mid-cap)
+  contained the hub restart and held the safe control
+  peak 4400 W · out-of-limit 4 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/90
+  represents: The orchestrator itself restarts mid-event — watchdog, OOM, power blip, deploy. Field reality for an always-on controller. State must come back from the retained bus/CSIP walk, not from luck.
+  expected:   Come back enforcing: re-read the retained control, re-adopt within a cycle or two, and never emit an un-commanded restore during shutdown/startup. The cap outage window must be bounded by the restart itself, not by rediscovery drift.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the hub restart — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=91s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Startup must treat the retained CSIP control as live state (not wait for a fresh event); shutdown must not release device setpoints it was commanded to hold.
+

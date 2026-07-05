@@ -1,0 +1,745 @@
+Mayhem started: 51 scenario(s), 1000 ms sampling, via http://localhost:8080
+Following the run (Ctrl-C aborts and restores the bench)…
+
+  [1/51] Zero-export cap, full sun, battery full …
+  [2/51] Inverter ACKs curtailment but lags 45 s …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 4400 W for 5s
+  [3/51] Inverter ACKs the curtailment but ignores it …
+    →     DEGRADED  device did not honour the ACKed write; hub flagged it
+  [4/51] Inverter echoes the limit but never enables it …
+    →     DEGRADED  device did not honour the ACKed write; hub flagged it
+  [5/51] Inverter honours the limit but ramps to it slowly …
+    →     DEGRADED  device did not honour the ACKed write; hub flagged it
+  [6/51] Battery executes a commanded charge as a discharge …
+    →     DEGRADED  device did not honour the ACKed write; hub flagged it
+  [7/51] Battery accepts the discharge command but does nothing …
+    →         PASS  battery stayed within its SoC envelope and held the cap despite the direction fault
+  [8/51] Battery refuses to charge away excess solar …
+    →     DEGRADED  importCap ≤ 0 W exceeded by up to 5930 W for 67s
+  [9/51] Battery drops off the bus mid-control, then reboots …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 50 W for 5s
+  [10/51] Charger rejects the hub's current-limit profile …
+    →         PASS  hub rode out the battery reboot and recovered a live reading
+  [11/51] Charger ACKs the current-limit profile but ignores it …
+    →     DEGRADED  importCap ≤ 0 W exceeded by up to 1430 W for 68s
+  [12/51] Charger cannot throttle below its 6 A minimum …
+    →     DEGRADED  importCap ≤ 0 W exceeded by up to 1430 W for 70s
+  [13/51] Charger keeps charging but stops reporting MeterValues …
+    →     DEGRADED  importCap ≤ 800 W exceeded by up to 630 W for 60s
+  [14/51] Cease-to-energize: grid commands a disconnect …
+    →         PASS  held importCap ≤ 1000 W and flagged the EVSE telemetry stale
+  [15/51] Higher-primacy control must win …
+    →         PASS  all DERs ceased to energize under the disconnect
+  [16/51] Grid server serves a malformed resource …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 4400 W for 4s
+  [17/51] Grid server strips the program list's href …
+    →         PASS  contained the malformed resource and held the safe control
+  [18/51] Grid server serves an empty program list …
+    →         PASS  contained the malformed resource and held the safe control
+  [19/51] Grid server serves an absurd ActivePower limit …
+    →         PASS  contained the malformed resource and held the safe control
+  [20/51] Grid server serves a ~136-year control interval …
+    →         PASS  contained the malformed resource and held the safe control
+  [21/51] Grid server lies about list pagination …
+    →         PASS  contained the malformed resource and held the safe control
+  [22/51] Grid server serves malicious pricing …
+    →         PASS  contained the malformed resource and held the safe control
+  [23/51] Grid server serves an empty DER curve list …
+    →         PASS  contained the malformed resource and held the safe control
+  [24/51] Inverter returns the SunSpec N/A sentinel (0x8000) …
+    →         PASS  contained the malformed resource and held the safe control
+  [25/51] Inverter returns a Modbus exception on every read …
+    →         PASS  hub did not act on the bad Modbus reading
+  [26/51] Inverter responds slowly (800 ms/read) …
+    →         PASS  hub did not act on the bad Modbus reading
+  [27/51] Inverter serves a corrupted power scale factor …
+    →         PASS  hub did not act on the bad Modbus reading
+  [28/51] Inverter reboots mid-curtailment and forgets the limit …
+    →         PASS  hub did not act on the bad Modbus reading
+  [29/51] Hub keeps enforcing a DERControl past its expiry …
+    →         PASS  held exportCap ≤ 0 W after a 9s convergence ramp
+  [30/51] Battery registers read the SunSpec N/A sentinel (0x8000) …
+    →         PASS  hub released the control at expiry
+  [31/51] EVSE connector flaps Occupied/Faulted mid-session …
+    →         PASS  hub did not act on the garbage battery reading
+  [32/51] Charger ACKs the current-limit profile but obeys it late …
+    →         PASS  hub stayed stable through the connector flap
+  [33/51] Charger reports MeterValues current in the wrong units …
+    →     DEGRADED  importCap ≤ 2000 W exceeded by up to 1850 W for 4s
+  [34/51] Grid meter freezes while the world changes …
+    →         PASS  hub rejected the wrong-units reading
+  [35/51] Import cap at peak with an empty battery …
+    →     DEGRADED  meter frozen at ~-1750 W; hub DETECTED it stale and surfaced it
+  [36/51] Generation-limit event ends — solar must recover …
+    →     DEGRADED  importCap ≤ 0 W exceeded by up to 4850 W for 87s
+  [37/51] CSIP clock corrections jitter while a cap is active …
+    →         PASS  solar recovered to full within 24s of the device returning
+  [38/51] Perfect storm — everything at once …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 9400 W for 11s
+  [39/51] MQTT broker drops out and restarts mid-cap …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 4400 W for 59s
+  [40/51] MQTT broker adds 800 ms latency under a cap …
+    →         PASS  held exportCap ≤ 0 W under worst-case conditions
+  [41/51] Malformed retained CSIP control on the bus …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 4400 W for 4s
+  [42/51] Stale retained 'no control' overwrites an active cap …
+    →         PASS  contained the malformed resource and held the safe control
+  [43/51] Utility server dies mid-control …
+    →         PASS  contained the malformed resource and held the safe control
+  [44/51] Control expires while the utility server is dark …
+    →         PASS  contained the WAN outage and held the safe control
+  [45/51] Utility server wedges: accepts, then stalls every request …
+    →         PASS  solar recovered to full within 39s of the device returning
+  [46/51] Grid meter CT clamp installed backwards …
+    →         PASS  contained the wedged head-end and held the safe control
+  [47/51] Server clock steps 2 h forward mid-control …
+    →         PASS  cap held despite the inverted meter
+  [48/51] Utility rewrites the export cap every ~12 s …
+    →         PASS  solar recovered to full within 19s of the device returning
+  [49/51] Cloud-edge PV sawtooth under a zero-export cap …
+    →         PASS  held exportCap ≤ 500 W after a 5s convergence ramp
+  [50/51] Cap released while the inverter is dark …
+    →     DEGRADED  exportCap ≤ 0 W exceeded by up to 780 W for 5s
+  [51/51] The hub process dies and restarts under a cap …
+    →         PASS  solar recovered to full within 47s of the device returning
+    →         PASS  contained the hub restart and held the safe control
+
+==============================================================================
+MAYHEM QA REPORT
+Run complete. Bench restored.
+==============================================================================
+PASS 33   DEGRADED 18   FAIL 0   BLIND 0   INCONCLUSIVE 0
+Worst breach: 9400 W   Total time out of limit: 1059 s
+Full markdown report on the dashboard host: qa-mayhem-20260705-165847.md
+
+------------------------------------------------------------------------------
+[DEGRADED] Zero-export cap, full sun, battery full   (Grid compliance (INV-EXPORT) · export-cap-full-battery)
+  exportCap ≤ 0 W exceeded by up to 4400 W for 5s
+  peak 4400 W · out-of-limit 5 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/100
+  represents: Utility commands zero export during a sunny low-load midday while the home battery is already full — the hub's only lever is to curtail PV to ~0.
+  expected:   Hold net export at ~0 W by curtailing solar. If it physically cannot, post CannotComply — never silently export over the cap.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 4400 W, total 5s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=101s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Optimizer must curtail PV when the battery cannot absorb; verify the curtail command reaches the inverter.
+
+------------------------------------------------------------------------------
+[DEGRADED] Inverter ACKs curtailment but lags 45 s   (Closed-loop actuation (INV-CONVERGE) · ack-before-effect)
+  device did not honour the ACKed write; hub flagged it
+  peak 3650 W · out-of-limit 90 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/90
+  represents: A real inverter accepts the SetPoint over Modbus (ACK) but its output ramps slowly — the hub believes the limit is in force before it is.
+  expected:   Detect that measured output has not reached the commanded limit and react (hold the battery, or post CannotComply) instead of trusting the write ACK.
+    • The device ACKed the curtailment at the Modbus layer but its output never reached the commanded limit (injected fault). The hub reported the shortfall rather than assuming success — correct.
+    • Constraint: genLimit ≤ 1000 W (mRID DERC-SP-AD…). Peak overshoot 3650 W, total 90s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 61 samples (t=30–91s); first: genLimit over cap 1000 W by 3650 W
+    • At t=91s the real meter read -3170 W net while the hub believed -3170 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Add measured-effect verification to derbase.ApplyControl; today it is write-only.
+
+------------------------------------------------------------------------------
+[DEGRADED] Inverter ACKs the curtailment but ignores it   (Closed-loop actuation (INV-CONVERGE) · reject-write-curtail)
+  device did not honour the ACKed write; hub flagged it
+  peak 3650 W · out-of-limit 50 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/50
+  represents: A real inverter accepts the WMaxLimPct write over Modbus (ACK) but silently keeps producing at its old ceiling — accept-but-ignore. The hub believes the limit is in force the moment the write succeeds.
+  expected:   Detect via measurement that output never reached the commanded limit and react (post CannotComply, or use another lever) — never keep reporting compliance it does not have.
+    • The device ACKed the curtailment at the Modbus layer but its output never reached the commanded limit (injected fault). The hub reported the shortfall rather than assuming success — correct.
+    • Constraint: genLimit ≤ 1000 W (mRID DERC-SP-AD…). Peak overshoot 3650 W, total 50s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 21 samples (t=30–51s); first: genLimit over cap 1000 W by 3650 W
+    • At t=51s the real meter read -9550 W net while the hub believed -9550 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Add measured-effect verification to derbase.ApplyControl; today it is write-only. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[DEGRADED] Inverter echoes the limit but never enables it   (Closed-loop actuation (INV-CONVERGE) · enable-gate-curtail)
+  device did not honour the ACKed write; hub flagged it
+  peak 3650 W · out-of-limit 49 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/50
+  represents: An inverter accepts the WMaxLimPct write and echoes the curtailment value on readback, but its enable flag stays off so the limit is never enforced — output holds at full potential. A hub that 'verifies' by reading the register back is fooled into reporting compliance.
+  expected:   Detect via MEASURED output (not register readback) that the limit never took effect and react (post CannotComply, or use another lever) — never trust the echoed value.
+    • The device ACKed the curtailment at the Modbus layer but its output never reached the commanded limit (injected fault). The hub reported the shortfall rather than assuming success — correct.
+    • Constraint: genLimit ≤ 1000 W (mRID DERC-SP-AD…). Peak overshoot 3650 W, total 49s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 21 samples (t=30–50s); first: genLimit over cap 1000 W by 3650 W
+    • At t=50s the real meter read -9550 W net while the hub believed -9550 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Bench shows the hub CATCHES this (it flags the cleared enable flag and posts CannotComply → DEGRADED) but is BLIND to reject-write-curtail under an identical breach (→ FAIL). Verification keys off the enable flag, not the limit value or measured output — complete it so both accept-but-ignore variants are caught. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[DEGRADED] Inverter honours the limit but ramps to it slowly   (Closed-loop actuation (INV-CONVERGE) · ramp-limit-curtail)
+  device did not honour the ACKed write; hub flagged it
+  peak 3650 W · out-of-limit 31 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/100
+  represents: An inverter accepts the curtailment instantly (register set) but slews its physical output toward the new ceiling at a bounded rate, sitting over the limit during the ramp before converging. Unlike an ignored write, it DOES reach the limit — just not immediately.
+  expected:   Tolerate a bounded convergence ramp: the limit is reached within the device's slew time. Flag DEGRADED only if convergence exceeds the compliance deadline; never a silent FAIL, and never a spurious CannotComply while it is still converging.
+    • The device ACKed the curtailment at the Modbus layer but its output never reached the commanded limit (injected fault). The hub reported the shortfall rather than assuming success — correct.
+    • Constraint: genLimit ≤ 1000 W (mRID DERC-SP-AD…). Peak overshoot 3650 W, total 31s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 3 samples (t=30–32s); first: genLimit over cap 1000 W by 256 W
+    • At t=101s the real meter read -4370 W net while the hub believed -4370 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Distinguish 'converging toward the limit' from 'ignoring the limit' via the measured-output trend; allow a bounded settling window before escalating. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[PASS] Battery executes a commanded charge as a discharge   (Resource limits (INV-SOC) · battery-wrong-sign)
+  battery stayed within its SoC envelope and held the cap despite the direction fault
+  peak 4400 W · out-of-limit 9 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/90
+  represents: A battery wired or firmware-flipped in the wrong direction: when the hub commands a charge to soak up excess PV, the pack discharges instead, walking an already-low state of charge toward empty.
+  expected:   Detect the pack moving opposite to the command (SoC falling under a charge command) and halt/alarm before it discharges below the reserve floor.
+    • INV-SOC held: no violations across the window.
+    • INV-EXPORT held: no violations across the window.
+    • The pack never left its SoC bounds and the active cap held — the hub kept it safe even though the device was commanded the wrong way.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Verify measured battery direction/SoC trend against the commanded sign in the orchestrator battery adapter. (Demonstrates robustness under SIMULATED abuse; the BatteryW sign convention must be confirmed against the live hub /status before trusting the verdict.)
+
+------------------------------------------------------------------------------
+[DEGRADED] Battery accepts the discharge command but does nothing   (Resource limits (INV-CONVERGE) · battery-soc-refuse)
+  importCap ≤ 0 W exceeded by up to 5930 W for 67s
+  peak 5930 W · out-of-limit 67 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/70
+  represents: Under an import cap the hub commands the battery to discharge and cover the load, but the pack's BMS/contactor refuses — it ACKs the setpoint and produces zero power while it still has charge. A hub that assumes the discharge took effect keeps importing over the cap.
+  expected:   Detect that battery power never moved despite the command and react — fall back to another lever or post CannotComply. Never assume the commanded discharge happened.
+    • Constraint: importCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 5930 W, total 67s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 41 samples (t=30–71s); first: importCap over cap 0 W by 4550 W
+    • At t=71s the real meter read 6080 W net while the hub believed 6080 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Verify measured battery power against the commanded setpoint; on a non-responding pack, escalate / post CannotComply (orchestrator battery adapter). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[DEGRADED] Battery refuses to charge away excess solar   (Resource limits (INV-CONVERGE) · battery-charge-disabled)
+  exportCap ≤ 0 W exceeded by up to 50 W for 5s
+  peak 50 W · out-of-limit 5 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/70
+  represents: Under a zero-export cap at full sun the hub commands the battery to CHARGE and soak up the excess PV — but the pack's charge contactor is disabled and it ACKs the setpoint while absorbing nothing. A hub that assumes the battery is absorbing keeps exporting over the cap instead of falling back to curtailing the inverter.
+  expected:   Detect that the battery is not actually charging and fall back to its other lever — curtail the inverter — to hold the export cap (or post CannotComply). Never assume the commanded charge happened.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 50 W, total 5s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=71s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Verify measured battery power against the commanded charge; when the pack does not absorb, curtail solar to hold the cap (orchestrator lever fallback). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[PASS] Battery drops off the bus mid-control, then reboots   (Device dropout (INV-TRANSPORT) · battery-reboot)
+  hub rode out the battery reboot and recovered a live reading
+  peak 0 W · out-of-limit 0 s · adopted=False reacted=True cannot_comply=False blind=False errs=0/50
+  represents: The battery stops answering Modbus (a watchdog reboot / lost link) for ~20 s while the hub is leaning on it, then comes back. A hub that hangs on the dead device, crashes, or treats the missing/garbage reads as a real SoC/power, mismanages the whole site; on recovery it must re-establish a sane reading.
+  expected:   Ride out the outage: stay up, mark the pack down/stale, never report an impossible SoC or power, and recover a live reading once it returns.
+    • The hub stayed up through the outage, never reported an impossible SoC/power, and read a live battery again after it returned to the bus.
+    • Final battery reading: SoC 60%, power -300 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Bound battery reads with a timeout, mark the pack down on error and stale-expire its SoC, and re-read cleanly on reconnect (lexa-modbus battery adapter).
+
+------------------------------------------------------------------------------
+[DEGRADED] Charger rejects the hub's current-limit profile   (OCPP smart charging (INV-CONVERGE) · ev-profile-reject)
+  importCap ≤ 0 W exceeded by up to 1430 W for 68s
+  peak 1430 W · out-of-limit 68 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/70
+  represents: Under an import cap with an empty battery (so the EV is the only lever) the hub sends a SetChargingProfile to dial the EV down, but the charger rejects smart charging and keeps drawing at full current. A hub that ignores the Rejected status keeps importing over the cap.
+  expected:   Treat the rejected profile as a failure and react — pause the session, use another lever, or post CannotComply. Never assume the EV load dropped.
+    • Constraint: importCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 1430 W, total 68s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 41 samples (t=30–71s); first: importCap over cap 0 W by 1430 W
+    • At t=71s the real meter read 1580 W net while the hub believed 1580 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: The OCPP bridge returns an error on a rejected/timed-out SetChargingProfile (2026-06 fix); the optimizer must act on it, not just log. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[DEGRADED] Charger ACKs the current-limit profile but ignores it   (OCPP smart charging (INV-CONVERGE) · ev-accept-but-ignore)
+  importCap ≤ 0 W exceeded by up to 1430 W for 70s
+  peak 1430 W · out-of-limit 70 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/70
+  represents: Under an import cap with an empty battery, the hub sends a SetChargingProfile and the charger returns Accepted — but never applies it and keeps drawing full current. This is worse than an outright reject: the OCPP response says success, so a hub that trusts the ACK believes the EV dialled down when it did not, and imports over the cap.
+  expected:   Verify the EV actually curtailed against the measured draw, not the SetChargingProfile response. On a no-effect ACK, react with another lever or post CannotComply. Never treat 'Accepted' as 'applied'.
+    • Constraint: importCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 1430 W, total 70s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 41 samples (t=30–71s); first: importCap over cap 0 W by 1430 W
+    • At t=71s the real meter read 1580 W net while the hub believed 1580 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: The optimizer must confirm the commanded EV current against measured draw/MeterValues, not the charging-profile ACK (lexa-ocpp applyCommand / orchestrator verify). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[DEGRADED] Charger cannot throttle below its 6 A minimum   (OCPP smart charging (INV-CONVERGE) · ev-min-current-floor)
+  importCap ≤ 800 W exceeded by up to 630 W for 60s
+  peak 630 W · out-of-limit 60 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/70
+  represents: A tight import cap needs the EV below its 6 A OCPP minimum, but the charger floors there — modulation alone cannot satisfy the cap. The only way to comply is to PAUSE the session (drop to 0 A). A hub that just keeps lowering the current limit, or trusts the floored draw as compliant, stays over the cap forever.
+  expected:   Recognise that modulation hit the floor and escalate: suspend/stop the transaction to reach 0 A, or post CannotComply. Do not sit at the 6 A floor over the cap.
+    • Constraint: importCap ≤ 800 W (mRID DERC-SP-AD…). Peak overshoot 630 W, total 60s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 41 samples (t=30–71s); first: importCap over cap 800 W by 630 W
+    • At t=71s the real meter read 1580 W net while the hub believed 1580 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: When the commanded EV current is below the charger minimum and the cap is still breached, suspend the transaction (TransactionEvent/RequestStopTransaction) rather than holding the floor (orchestrator EV lever / lexa-ocpp).
+
+------------------------------------------------------------------------------
+[PASS] Charger keeps charging but stops reporting MeterValues   (OCPP observability (INV-EVBLIND) · ev-meter-freeze)
+  held importCap ≤ 1000 W and flagged the EVSE telemetry stale
+  peak 430 W · out-of-limit 0 s · adopted=True reacted=False cannot_comply=False blind=True errs=0/70
+  represents: The charger still obeys SetChargingProfile but stops emitting MeterValues/Updated. Under an import cap the hub curtails the EV — its true draw drops while the hub's OCPP view freezes at the old high value. The hub goes blind to that EVSE: it cannot attribute load, and would miss the car ramping back up.
+  expected:   Hold the cap off the real grid meter (which still works), AND detect that the EVSE telemetry went stale — flag the charger, do not keep trusting a frozen reading.
+    • The hub held the import cap off the real grid meter AND detected the charger's MeterValues went silent (flagged stale on 41 samples) — it is not blindly trusting a frozen per-device reading.
+    • Correct: cap compliance stays on the grid meter, and the stale EVSE telemetry is surfaced rather than trusted as live.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Track MeterValues freshness per EVSE and stale-expire a silent charger; keep cap compliance on the grid meter, not per-device OCPP telemetry (lexa-ocpp / telemetry).
+
+------------------------------------------------------------------------------
+[PASS] Cease-to-energize: grid commands a disconnect   (Grid safety (INV-CONNECT) · grid-disconnect)
+  all DERs ceased to energize under the disconnect
+  peak 0 W · out-of-limit 0 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/45
+  represents: The utility commands an immediate disconnect (opModConnect=false) while the inverter is exporting at full sun and the battery could discharge. Every controllable DER must stop feeding the grid within seconds — back-feeding a line the utility believes is dead is the most dangerous failure there is.
+  expected:   Drive solar output and battery discharge to ~0 within the reaction window and hold there for the whole disconnect. No DER may keep energizing the grid.
+    • INV-CONNECT held: no violations across the window.
+    • After the disconnect took effect, solar output and battery discharge fell to ~0 and held there — the hub stopped back-feeding a line the utility commanded dead.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: On an opModConnect=false control, command all DERs to cease energizing and verify measured output reaches ~0 (orchestrator connect handling).
+
+------------------------------------------------------------------------------
+[DEGRADED] Higher-primacy control must win   (CSIP scheduling (primacy) · conflicting-primacy)
+  exportCap ≤ 0 W exceeded by up to 4400 W for 4s
+  peak 4400 W · out-of-limit 4 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/70
+  represents: Two export-cap controls are active at once — a permissive 5000 W cap at LOW primacy (program 2 = primacy 10) and a strict 0 W cap at HIGH primacy (program 0 = primacy 1). The hub must enforce the higher-primacy 0 W cap, not the permissive one.
+  expected:   Adopt the highest-primacy active control (exportCap 0 W) and hold export there; a lower-primacy permissive cap must never override it.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 4400 W, total 4s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=71s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Scheduler primacy: lower primacy number wins (program 0 beats program 2). Verify adoption picks the highest-priority active control, not the most recent or most permissive.
+
+------------------------------------------------------------------------------
+[PASS] Grid server serves a malformed resource   (CSIP robustness (INV-EXPORT survivability) · malformed-csip)
+  contained the malformed resource and held the safe control
+  peak 0 W · out-of-limit 0 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/75
+  represents: A buggy or hostile 2030.5 server serves a malformed DERControlList (the same control mRID twice) while a safe export cap is active. The hub must contain the parse error — never panic/hang, never drop the safe control for garbage or 'none'.
+  expected:   Stay up (/status keeps answering) and keep enforcing the active export cap. A malformed resource must not take the hub down or unseat a safe control.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=76s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Harden the northbound walker/parser; on a malformed resource fail closed to last-known-good controls.
+
+------------------------------------------------------------------------------
+[PASS] Grid server strips the program list's href   (CSIP robustness (INV-EXPORT survivability) · malform-missing-href)
+  contained the malformed resource and held the safe control
+  peak 4400 W · out-of-limit 5 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/75
+  represents: The 2030.5 server serves a DERProgramList with its own href stripped — an unresolvable resource. A hub that dereferences the missing link can NPE/hang or drop the whole program tree (and the safe control with it).
+  expected:   Stay up (/status keeps answering) and keep enforcing the active export cap. A malformed resource must not take the hub down or unseat a safe control.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=76s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Harden the northbound walker/parser; bound the walk and fail closed to last-known-good controls on a malformed resource.
+
+------------------------------------------------------------------------------
+[PASS] Grid server serves an empty program list   (CSIP robustness (INV-EXPORT survivability) · malform-empty-program)
+  contained the malformed resource and held the safe control
+  peak 0 W · out-of-limit 0 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/75
+  represents: The server suddenly serves a DERProgramList with zero programs (all=0) while a safe export cap is active. A hub that treats 'no programs' as 'cancel everything' silently drops the active cap instead of keeping last-known-good.
+  expected:   Stay up (/status keeps answering) and keep enforcing the active export cap. A malformed resource must not take the hub down or unseat a safe control.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=76s the real meter read 1630 W net while the hub believed 1630 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Harden the northbound walker/parser; bound the walk and fail closed to last-known-good controls on a malformed resource.
+
+------------------------------------------------------------------------------
+[PASS] Grid server serves an absurd ActivePower limit   (CSIP robustness (INV-EXPORT survivability) · malform-huge-activepower)
+  contained the malformed resource and held the safe control
+  peak 4400 W · out-of-limit 5 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/75
+  represents: A DERControl arrives with an export limit of 32767×10^9 W — overflow bait. A hub that scales it into an int register wraps to garbage (audit GS-1/MTR-1) and may command a wild setpoint or drop the safe cap.
+  expected:   Stay up (/status keeps answering) and keep enforcing the active export cap. A malformed resource must not take the hub down or unseat a safe control.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=76s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Harden the northbound walker/parser; bound the walk and fail closed to last-known-good controls on a malformed resource.
+
+------------------------------------------------------------------------------
+[PASS] Grid server serves a ~136-year control interval   (CSIP robustness (INV-EXPORT survivability) · malform-bad-duration)
+  contained the malformed resource and held the safe control
+  peak 4400 W · out-of-limit 5 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/75
+  represents: A DERControl interval is served with a 4294967295 s (~136-year) duration. A hub that trusts it never expires the control, or overflows its expiry math — either pinning a setpoint forever or mis-scheduling the safe cap.
+  expected:   Stay up (/status keeps answering) and keep enforcing the active export cap. A malformed resource must not take the hub down or unseat a safe control.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=76s the real meter read 1630 W net while the hub believed 1630 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Harden the northbound walker/parser; bound the walk and fail closed to last-known-good controls on a malformed resource.
+
+------------------------------------------------------------------------------
+[PASS] Grid server lies about list pagination   (CSIP robustness (INV-EXPORT survivability) · malform-pagination)
+  contained the malformed resource and held the safe control
+  peak 4400 W · out-of-limit 4 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/75
+  represents: The DERProgramList header claims all=999 programs across pages while serving one and advertising no real next page. A pager that trusts all= can loop fetching pages that never come or over-allocate — a discovery DoS that must be bounded.
+  expected:   Stay up (/status keeps answering) and keep enforcing the active export cap. A malformed resource must not take the hub down or unseat a safe control.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=76s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Harden the northbound walker/parser; bound the walk and fail closed to last-known-good controls on a malformed resource.
+
+------------------------------------------------------------------------------
+[PASS] Grid server serves malicious pricing   (CSIP robustness (pricing §10.5) · pricing-attack)
+  contained the malformed resource and held the safe control
+  peak 4400 W · out-of-limit 4 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/75
+  represents: A hostile 2030.5 server serves a malformed tariff (an absurd price multiplier, 10^100) while a safe export cap is active. Pricing must affect optimization only WITHIN safety constraints — a bad tariff must never break DER discovery, unseat the safe control, or produce a NaN command.
+  expected:   Stay up and keep enforcing the active export cap; a bad tariff must not perturb the safety control. NOTE: the hub does not consume CSIP prices today (lexa-northbound discovers tariffs but never walks ConsumptionTariffInterval), so a price attack has no INTENDED behavioural effect — but QA observed the malformed tariff TRANSIENTLY drops the export cap mid-walk (DEGRADED) before the hub re-establishes it.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=76s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Isolate discovery of a malformed leaf resource so it cannot perturb an already-adopted safety control — QA showed a bad tariff briefly unseats the export cap before the hub recovers. Separately, wire lexa-northbound to walk ConsumptionTariffInterval so CSIP prices actually drive dispatch, bounded by the safety constraints.
+
+------------------------------------------------------------------------------
+[PASS] Grid server serves an empty DER curve list   (CSIP robustness (DER curves §) · curve-attack)
+  contained the malformed resource and held the safe control
+  peak 0 W · out-of-limit 0 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/75
+  represents: A program advertises a DERCurveListLink (Volt-VAr) but the server serves an empty curve list while a safe export cap is active. A missing/empty curve must be contained — discovery of optional curves is non-fatal and must never break DER control.
+  expected:   Stay up and keep enforcing the active export cap; an empty curve list must not perturb the safety control. (Like pricing, the hub discovers DER curves but does not yet consume them for control.) QA observed a brief transient cap drop before the hub recovers (DEGRADED).
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=76s the real meter read 1630 W net while the hub believed 1630 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Isolate optional-resource discovery (curves) so a malformed/empty leaf cannot transiently unseat an adopted control. Curves are discovered but not yet applied to inverter control modes — a wiring gap, not a safety one.
+
+------------------------------------------------------------------------------
+[PASS] Inverter returns the SunSpec N/A sentinel (0x8000)   (Modbus transport (INV-TRANSPORT) · nan-sentinel)
+  hub did not act on the bad Modbus reading
+  peak 0 W · out-of-limit 0 s · adopted=False reacted=True cannot_comply=False blind=False errs=0/35
+  represents: The inverter's registers all read the SunSpec 0x8000 'not implemented' sentinel (−32768) — a half-initialised or failed register bank. A hub that treats the sentinel as a real reading sees a wild −32768 W value and optimises against fabricated data.
+  expected:   Recognise 0x8000 as N/A and mark the source unavailable; never report a physically-impossible measurement or act on it.
+    • The hub stayed up and never reported a physically-impossible measurement under the transport fault — it recognised the sentinel/exception as N/A or device-down and held a safe value.
+    • At t=35s the sim's true solar was 0 W; the hub reported 0 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: In the SunSpec decode, treat 0x8000 (int16) / 0xFFFF (uint16) as not-implemented → N/A (lexa-modbus / sunspec).
+
+------------------------------------------------------------------------------
+[PASS] Inverter returns a Modbus exception on every read   (Modbus transport (INV-TRANSPORT) · modbus-exception)
+  hub did not act on the bad Modbus reading
+  peak 0 W · out-of-limit 0 s · adopted=False reacted=False cannot_comply=False blind=False errs=0/35
+  represents: The inverter answers every read with a Modbus exception (server device failure). The hub must treat the error as device-down — never act on a missing reading.
+  expected:   Mark the device down/stale and fail safe; never report a fabricated value or block the control loop.
+    • The hub stayed up and never reported a physically-impossible measurement under the transport fault — it recognised the sentinel/exception as N/A or device-down and held a safe value.
+    • At t=35s the sim's true solar was 4800 W; the hub reported 0 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: On a Modbus exception, mark the device down and stale-expire its reading (lexa-modbus).
+
+------------------------------------------------------------------------------
+[PASS] Inverter responds slowly (800 ms/read)   (Modbus transport (INV-TRANSPORT) · modbus-latency)
+  hub did not act on the bad Modbus reading
+  peak 0 W · out-of-limit 0 s · adopted=False reacted=True cannot_comply=False blind=False errs=0/35
+  represents: The inverter answers every read after an 800 ms delay — a congested or struggling device. An unbounded read blocks the hub's control loop.
+  expected:   Bound the read with a timeout and stale-expire the reading; never let a slow device block the optimizer.
+    • The hub stayed up and never reported a physically-impossible measurement under the transport fault — it recognised the sentinel/exception as N/A or device-down and held a safe value.
+    • At t=35s the sim's true solar was 3375 W; the hub reported 3375 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Bound every Modbus read with a timeout; on timeout mark the device stale (lexa-modbus).
+
+------------------------------------------------------------------------------
+[PASS] Inverter serves a corrupted power scale factor   (Modbus transport (INV-TRANSPORT) · solar-bad-scale)
+  hub did not act on the bad Modbus reading
+  peak 0 W · out-of-limit 0 s · adopted=False reacted=True cannot_comply=False blind=False errs=0/35
+  represents: The inverter's W_SF (SunSpec power scale factor) register reads one power of ten too high while the raw power register is unchanged, so a hub that applies the scale factor computes ~10× the real output (e.g. 48 kW for a 4.8 kW inverter). A hub that trusts it optimises against fabricated generation.
+  expected:   Recognise a physically-impossible scaled reading (well over nameplate) and reject/clamp it; never act on a 10× generation value.
+    • The hub stayed up and never reported a physically-impossible measurement under the transport fault — it recognised the sentinel/exception as N/A or device-down and held a safe value.
+    • At t=35s the sim's true solar was 4275 W; the hub reported 3375 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Sanity-check decoded SunSpec power against the inverter nameplate; treat an out-of-range scaled value as suspect (lexa-modbus / sunspec — audit GS-1/MTR-1).
+
+------------------------------------------------------------------------------
+[PASS] Inverter reboots mid-curtailment and forgets the limit   (Grid compliance (INV-EXPORT) · solar-reboot-forget)
+  held exportCap ≤ 0 W after a 9s convergence ramp
+  peak 5440 W · out-of-limit 7 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/70
+  represents: The hub has curtailed the inverter to hold a zero-export cap, then the inverter reboots and comes back at 100% WMaxLimPct — it forgot the limit and snaps to full output, blowing the cap. A hub that writes the limit once (on adoption) and never re-asserts it leaves the breach standing.
+  expected:   Re-assert the limit after the inverter forgets it: detect the output jump via measurement and re-curtail within a cycle. Periodic idempotent control, not write-once.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 5440 W, total 7s out of limit.
+    • The hub adopted the control and drove the system within the cap 9s in, then held it for the rest of the window (peak transient 5440 W during the ramp).
+    • A bounded settling ramp is expected closed-loop behaviour, not a control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=71s the real meter read 60 W net while the hub believed 60 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Re-send the active DER limit every control cycle (idempotent), not only on change; verify measured output against the commanded limit (orchestrator inverter adapter).
+
+------------------------------------------------------------------------------
+[PASS] Hub keeps enforcing a DERControl past its expiry   (CSIP scheduling (INV-EXPIRED) · expired-control)
+  hub released the control at expiry
+  peak 7600 W · out-of-limit 64 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/90
+  represents: The grid server issues a short export-cap DERControl that expires mid-window. Past validUntil (+grace) the control is dead and the hub must release it. A hub that keeps enforcing an expired control needlessly curtails the inverter forever — lost generation the utility never asked for.
+  expected:   Drop the control at validUntil + grace: stop adopting it and let the inverter recover. Never enforce a DERControl past its expiry.
+    • The hub adopted the export cap while it was valid and dropped it within the grace window after validUntil — it never enforced an expired control.
+    • At t=91s the inverter produced 4800 W of 4800 W possible — free to recover once the cap expired.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Expire a DERControl at validUntil (+grace) and release its setpoint (csip scheduler Evaluate / orchestrator).
+
+------------------------------------------------------------------------------
+[PASS] Battery registers read the SunSpec N/A sentinel (0x8000)   (Modbus transport (INV-TRANSPORT) · battery-nan-sentinel)
+  hub did not act on the garbage battery reading
+  peak 0 W · out-of-limit 0 s · adopted=False reacted=True cannot_comply=False blind=False errs=0/35
+  represents: The battery's registers all read 0x8000 — a half-initialised or failed bank. SoC decodes to a wild ~32768% and power to −32768 W. A hub that trusts it optimises against a fabricated SoC and would charge/discharge on garbage; this is the invalid-SoC (255 / NaN-equiv) hazard at the wire.
+  expected:   Treat 0x8000 as N/A, mark the pack unavailable, and never surface an impossible SoC or power.
+    • The hub stayed up and never reported an impossible SoC/power under the transport fault — it recognised the sentinel as N/A and held a safe value.
+    • Final battery reading: SoC 55%, power -729 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Treat 0x8000 (int16) / 0xFFFF (uint16) as not-implemented → N/A in the SunSpec decode and mark the pack down (lexa-modbus / sunspec).
+
+------------------------------------------------------------------------------
+[PASS] EVSE connector flaps Occupied/Faulted mid-session   (OCPP observability (INV-EVMAX) · ev-connector-flap)
+  hub stayed stable through the connector flap
+  peak 0 W · out-of-limit 0 s · adopted=False reacted=False cannot_comply=False blind=False errs=0/50
+  represents: A flaky connector (bad pilot or contactor) rapidly flaps its status between Occupied and Faulted while a session is up. A hub that re-plans on every StatusNotification can thrash its commands or mis-track the session and command current to a connector it believes is free.
+  expected:   Debounce the flapping status, keep the session bounded, never command EV current over the station max, and stay up.
+    • The hub rode out the flapping connector: it stayed up, never commanded EV current over the station max, and reported no impossible EVSE power.
+    • A flaky connector did not thrash the control loop.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Debounce connector StatusNotification and bound EV current to the station max regardless of flap (lexa-ocpp).
+
+------------------------------------------------------------------------------
+[DEGRADED] Charger ACKs the current-limit profile but obeys it late   (OCPP smart charging (INV-CONVERGE) · ev-delayed-obey)
+  importCap ≤ 2000 W exceeded by up to 1850 W for 4s
+  peak 1850 W · out-of-limit 4 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/80
+  represents: Under an import cap with an empty battery, the hub sends a SetChargingProfile and the charger returns Accepted — but applies the new limit only ~20 s later. The OCPP response says success immediately, so a hub that trusts the ACK believes the EV dialled down while it keeps drawing full for the lag window, importing over the cap.
+  expected:   Verify the EV actually curtailed against the measured draw, not the ACK; tolerate the lag and converge once the limit lands (or admit it). The breach must resolve, not stand.
+    • Constraint: importCap ≤ 2000 W (mRID DERC-SP-AD…). Peak overshoot 1850 W, total 4s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=81s the real meter read 1580 W net while the hub believed 1580 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Confirm the commanded EV current against measured draw/MeterValues over a convergence deadline rather than trusting the SetChargingProfile ACK (lexa-ocpp / orchestrator verify). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)
+
+------------------------------------------------------------------------------
+[PASS] Charger reports MeterValues current in the wrong units   (OCPP observability (INV-EVMAX) · ev-wrong-units)
+  hub rejected the wrong-units reading
+  peak 0 W · out-of-limit 0 s · adopted=False reacted=False cannot_comply=False blind=False errs=0/40
+  represents: The charger reports its current in milliamps under an 'A' label (≈1000× the real value), so a hub that trusts the value+unit reads thousands of amps. A hub that ingests it commands against a fabricated draw, alarms falsely, or computes a wild power — far over any station max.
+  expected:   Sanity-check MeterValues against the station/connector max and reject a physically-impossible current; never surface or optimise against a 1000× reading.
+    • The hub stayed up and never surfaced a physically-impossible EVSE current/power under the wrong-units fault — it validated the MeterValue against the station rating rather than trusting a 1000× draw.
+    • Worst EVSE reading the hub reported: 0 A.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Validate MeterValues against the EVSE's rated max (and unit) before use; clamp/reject implausible readings (lexa-ocpp telemetry).
+
+------------------------------------------------------------------------------
+[DEGRADED] Grid meter freezes while the world changes   (Sensor integrity (INV-STALE) · stale-meter)
+  meter frozen at ~-1750 W; hub DETECTED it stale and surfaced it
+  peak 1600 W · out-of-limit 34 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/35
+  represents: The revenue meter's reading stops updating (frozen TCP session / hung device) while PV climbs — the hub's grid signal goes stale.
+  expected:   Notice the reading stopped changing, mark it stale, fail safe, and raise an alarm — do not keep acting on a dead sensor.
+    • The grid meter held within 0 W for the window, but the hub flagged it as stale (stale_sources) on 11 samples — it is no longer flying blind on a dead sensor.
+    • Detection + surfacing is in place (it cross-checks the frozen reading against a moving inverter). Remaining hardening: have the OPTIMIZER fail safe on the flag (conservative limits) rather than only reporting it.
+    • Last hub plan: [csip/export-limit] export limit 0W (target ≤0W); unconstrained 0W; battery battery-0 absorbs 2400W (next 0W)→battery battery-0 → -2400W | [csip/export-limit] holding generation ≤ 0W to keep export ≤ 0W (measured 0W)→solar inverter-0 0W → 0W | [demand-response] battery battery-0 SOC=12.2% at reserve minimum→skip discharge — protecting reserve
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Add a staleness/heartbeat check per measurement source feeding the optimizer.
+
+------------------------------------------------------------------------------
+[DEGRADED] Import cap at peak with an empty battery   (Resource limits (INV-SOC) · battery-empty-import-cap)
+  importCap ≤ 0 W exceeded by up to 4850 W for 87s
+  peak 4850 W · out-of-limit 87 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/90
+  represents: Utility caps import to 0 W during peak while load exceeds PV and the battery is empty — there is no physical way to avoid importing.
+  expected:   Discharge the battery to the extent possible, then post CannotComply for the unavoidable remainder. The failure must be admitted, not hidden.
+    • Constraint: importCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 4850 W, total 87s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 61 samples (t=30–91s); first: importCap over cap 0 W by 4550 W
+    • At t=91s the real meter read 4700 W net while the hub believed 4700 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Ensure the optimizer emits CannotComply when the reserve floor blocks compliance (battery at SOC min).
+
+------------------------------------------------------------------------------
+[PASS] Generation-limit event ends — solar must recover   (Recovery (INV-RESTORE) · curtailment-release)
+  solar recovered to full within 24s of the device returning
+  peak 3150 W · out-of-limit 39 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/60
+  represents: A generation-limit event curtails the inverter, then expires. The hub must actively release the ceiling — the known stuck-curtailment failure leaves an inverter clamped at its last limit after the event clears.
+  expected:   When the cap lifts, solar climbs back to its full potential within seconds. It must never be left clamped below potential after the event ends.
+    • After the inverter dropped out and returned, output climbed back to its potential and the hub did not leave it stuck curtailed.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Restore must SET the ceiling to full nameplate, not emit an empty no-op (solarCommandToControl restore path). NOTE: a true device dropout (Modbus link loss) needs the sim's service stopped via SSH — out of scope for this in-process injector.
+
+------------------------------------------------------------------------------
+[DEGRADED] CSIP clock corrections jitter while a cap is active   (Time integrity · clock-jitter)
+  exportCap ≤ 0 W exceeded by up to 9400 W for 11s
+  peak 9400 W · out-of-limit 11 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/45
+  represents: NTP corrections step the grid server's clock by up to a minute while an export cap is active — event boundaries shift slightly under the hub.
+  expected:   Keep honouring the active cap across the correction: a modest, spec-legal clock step inside the event window must not flap the control or drop enforcement.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 9400 W, total 11s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=45s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Tolerate a non-monotonic clock-offset step across the event window: scheduler holds a still-served, unexpired, ALREADY-ADOPTED event over both an empty resolution and the program's DefaultDERControl (clock-regression guard, both halves). NOTE: a wildly oscillating server clock (±hours) is OUT OF SCOPE — IEEE 2030.5 requires the client to schedule events in SERVER time, so following a non-conformant server's clock is correct, not a bug.
+
+------------------------------------------------------------------------------
+[DEGRADED] Perfect storm — everything at once   (Combined worst case · perfect-storm)
+  exportCap ≤ 0 W exceeded by up to 4400 W for 59s
+  peak 4400 W · out-of-limit 59 s · adopted=True reacted=False cannot_comply=True blind=False errs=0/60
+  represents: Zero-export cap + full sun + full battery + an inverter that lags its ACK + a frozen meter + an EV demanding charge + a lurching clock — simultaneously. The worst hour this device could ever see.
+  expected:   Stay within export limit using every lever, or admit (CannotComply) that it cannot. Above all: never be silently blind. Recover cleanly when it ends.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 4400 W, total 59s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT violated on 31 samples (t=30–61s); first: exportCap over cap 0 W by 4400 W
+    • At t=61s the real meter read -4550 W net while the hub believed -4550 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Compound failures expose ordering bugs — fix the single-fault findings first, then re-run this.
+
+------------------------------------------------------------------------------
+[PASS] MQTT broker drops out and restarts mid-cap   (Bus resilience (INV-EXPORT survivability) · mqtt-broker-restart)
+  held exportCap ≤ 0 W under worst-case conditions
+  peak 4400 W · out-of-limit 0 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/80
+  represents: mosquitto restarts (or the link blips) while a zero-export cap is active — every service's MQTT session drops and must reconnect and re-subscribe.
+  expected:   Ride out the outage: keep the latched curtailment, recover the retained control on reconnect, and never let export run away during or after the blip.
+    • No breach across 80 samples (81s). Hub adopted=true, commanded a correction=true.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: mqttutil must reconnect AND replay subscriptions (paho does not resend SUBSCRIBE); CSIP control must be retained so the hub re-reads it on reconnect.
+
+------------------------------------------------------------------------------
+[DEGRADED] MQTT broker adds 800 ms latency under a cap   (Bus resilience (INV-EXPORT survivability) · mqtt-broker-latency)
+  exportCap ≤ 0 W exceeded by up to 4400 W for 4s
+  peak 4400 W · out-of-limit 4 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/70
+  represents: The broker (or the bus) slows to ~800 ms per message while a zero-export cap is active — commands and measurements still flow, but late.
+  expected:   Hold the cap despite the lag; a slow bus must degrade timing, not correctness.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 4400 W, total 4s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=71s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Optimizer cadence and the curtail command path must tolerate a slow bus without losing the cap.
+
+------------------------------------------------------------------------------
+[PASS] Malformed retained CSIP control on the bus   (Bus robustness (INV-EXPORT survivability) · mqtt-malformed-control)
+  contained the malformed resource and held the safe control
+  peak 4400 W · out-of-limit 4 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/70
+  represents: A truncated/garbage JSON payload is published RETAINED to lexa/csip/control (a half-written message, a buggy publisher) while a real cap is active.
+  expected:   Stay up and keep the active cap: a malformed bus message must be dropped, never crash the hub or unseat a safe control.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=71s the real meter read 1630 W net while the hub believed 1630 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Hub MQTT handlers must reject a payload that fails to unmarshal and retain the last-good control (lexa-hub onCSIPControl).
+
+------------------------------------------------------------------------------
+[PASS] Stale retained 'no control' overwrites an active cap   (Bus robustness (INV-EXPORT survivability) · mqtt-stale-retained)
+  contained the malformed resource and held the safe control
+  peak 9400 W · out-of-limit 10 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/75
+  represents: A stale retained message (Source=none) lands on lexa/csip/control — a leftover from a previous session or a flapping northbound — telling the hub there is no control while a real cap is still in force.
+  expected:   Do not drop the cap on a spurious 'none': the northbound re-publishes the real control each cycle, so any drop must be a brief transient, not a sustained export.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the malformed resource — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=76s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Treat a 'none' that contradicts an unexpired control conservatively; fail closed to last-known-good until the control actually expires.
+
+------------------------------------------------------------------------------
+[PASS] Utility server dies mid-control   (Northbound resilience (INV-EXPORT survivability) · wan-outage-hold)
+  contained the WAN outage and held the safe control
+  peak 0 W · out-of-limit 0 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/90
+  represents: The WAN to the 2030.5 head-end drops for 45 s while a zero-export cap is active — every CSIP request fails fast with 503. The single most common field event a DERMS sees.
+  expected:   Keep enforcing the last-known-good control through the outage (it is still valid) and re-sync when the server returns. An unreachable server must never mean an unenforced control.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the WAN outage — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=91s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Northbound walker must fail closed to last-known-good on discovery errors; the orchestrator keeps enforcing until ValidUntil regardless of server reachability.
+
+------------------------------------------------------------------------------
+[PASS] Control expires while the utility server is dark   (Northbound resilience (INV-EXPIRED / INV-RESTORE) · wan-outage-expiry)
+  solar recovered to full within 39s of the device returning
+  peak 3650 W · out-of-limit 57 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/90
+  represents: A generation-limit control expires DURING a WAN outage. With the server unreachable there is no walk to 'tell' the hub the control ended — expiry must come from the hub's own clock discipline.
+  expected:   Release the control at ValidUntil using local time + last-known clock offset: uncurtail the inverter and stop claiming the control. Never hold a dead control hostage to a dead WAN.
+    • After the inverter dropped out and returned, output climbed back to its potential and the hub did not leave it stuck curtailed.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Scheduler expiry must be evaluated locally (serverNow = wall + last offset), not only on a successful re-walk; release path must emit the uncurtail (restoreOnGenLimitClear).
+
+------------------------------------------------------------------------------
+[PASS] Utility server wedges: accepts, then stalls every request   (Northbound resilience (INV-EXPORT survivability) · northbound-hang)
+  contained the wedged head-end and held the safe control
+  peak 4400 W · out-of-limit 6 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/80
+  represents: The head-end (or a middlebox) goes half-dead: TLS accepts, requests are read, responses never come inside any sane deadline. A fetcher without its own timeout wedges the whole northbound with it.
+  expected:   The hub's fetcher must enforce its own deadline, contain the stall to the northbound, keep /status responsive, and keep enforcing the still-valid cap. Degrade discovery, not control.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the wedged head-end — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=81s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Per-request deadline on the WolfSSLFetcher (and walk-level bound); a slow server must surface as a discovery error, not a hung goroutine holding the session.
+
+------------------------------------------------------------------------------
+[PASS] Grid meter CT clamp installed backwards   (Sensor integrity (INV-EXPORT ground truth) · meter-ct-inverted)
+  cap held despite the inverted meter
+  peak 4400 W · out-of-limit 5 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/75
+  represents: The revenue meter's CT clamp is on backwards — the classic install error. Every import reads as an export and vice versa. Values are perfectly plausible; only the direction lies. Under a zero-export cap the hub sees a healthy import while the site back-feeds at full PV.
+  expected:   Do not be confidently wrong. Cross-check the meter against device telemetry / actuation response, distrust a meter that moves the wrong way, fail conservative, and raise an alarm. Asserting compliance while exporting is the worst outcome this suite can produce.
+    • The grid meter reported every flow with its sign flipped, and the hub still kept the site inside the cap — its device-side telemetry cross-check did not let the backwards CT drive control.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Actuation-response direction check in the telemetry plausibility engine (see finding).
+
+------------------------------------------------------------------------------
+[PASS] Server clock steps 2 h forward mid-control   (Time integrity (INV-EXPIRED / INV-RESTORE) · clock-jump-forward)
+  solar recovered to full within 19s of the device returning
+  peak 3650 W · out-of-limit 73 s · adopted=True reacted=False cannot_comply=False blind=False errs=0/90
+  represents: The head-end's clock steps two hours forward (NTP step after a long holdover, a DST bug). In server time every active control is instantly long-expired.
+  expected:   Follow server time (CSIP: the server clock is authoritative): treat the control as expired, release it, uncurtail, and re-walk for whatever is now active. No stale enforcement, no crash, no flapping.
+    • After the inverter dropped out and returned, output climbed back to its potential and the hub did not leave it stuck curtailed.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Clock-offset resync on /tm each walk; scheduler expiry honours the new offset within one cycle (expiry confirm ticks bound the release latency).
+
+------------------------------------------------------------------------------
+[PASS] Utility rewrites the export cap every ~12 s   (CSIP scheduling (INV-EXPORT / INV-HUNT) · control-churn)
+  held exportCap ≤ 500 W after a 5s convergence ramp
+  peak 3900 W · out-of-limit 3 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/80
+  represents: During a volatile event the utility supersedes the cap over and over — delete-and-replace every ~12 s, alternating 0 W and 500 W. Every replacement is a new mRID, a new adoption, a new guard session.
+  expected:   Track each replacement within a cycle and enforce whichever cap is current — every phase satisfies the looser 500 W bound, so measured export must never sustain above it, and the loop must not hunt across replacements.
+    • Constraint: exportCap ≤ 500 W (mRID none). Peak overshoot 3900 W, total 3s out of limit.
+    • The hub adopted the control and drove the system within the cap 5s in, then held it for the rest of the window (peak transient 3900 W during the ramp).
+    • A bounded settling ramp is expected closed-loop behaviour, not a control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=80s the real meter read 100 W net while the hub believed -350 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Adoption path must handle rapid mRID turnover without dropping to no-control between replacements (fail-closed hold covers the gap); breach-guard sessions must reset cleanly on genuinely-new caps.
+
+------------------------------------------------------------------------------
+[DEGRADED] Cloud-edge PV sawtooth under a zero-export cap   (Environment dynamics (INV-EXPORT / INV-HUNT) · pv-flicker)
+  exportCap ≤ 0 W exceeded by up to 780 W for 5s
+  peak 780 W · out-of-limit 5 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/80
+  represents: Broken cloud rakes the array: PV swings full-to-40%-to-full every few seconds while a zero-export cap is active. Every other scenario holds the environment still; the field never does.
+  expected:   Hold the cap across the swings without hunting: an absolute curtailment ceiling rides through PV dips (output = min(potential, ceiling)); the loop must not chase the flicker with curtail/release cycles.
+    • Constraint: exportCap ≤ 0 W (mRID DERC-SP-AD…). Peak overshoot 780 W, total 5s out of limit.
+    • The hub posted a CannotComply for this control — it hit a physical limit (battery at its SOC bound, or PV already at zero) and admitted it to the grid server.
+    • This is acceptable behaviour: the breach is a reported resource limit, not a hidden control failure.
+    • INV-EXPORT held: no violations across the window.
+    • At t=81s the real meter read 250 W net while the hub believed 250 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Curtailment must be a held absolute ceiling, not a per-tick recomputation chasing the last meter sample (sticky-guard); INV-HUNT flags chasing.
+
+------------------------------------------------------------------------------
+[PASS] Cap released while the inverter is dark   (Recovery (INV-RESTORE, release-edge) · release-while-rebooting)
+  solar recovered to full within 47s of the device returning
+  peak 3650 W · out-of-limit 52 s · adopted=True reacted=True cannot_comply=True blind=False errs=0/95
+  represents: The generation-limit event ends at the exact moment the inverter is off the bus (reboot, link loss). The hub's release-edge uncurtail cannot reach a dark device; when the inverter returns it still holds the stale ceiling and nobody is left to clear it.
+  expected:   Re-assert or clear device state on reconnect: an inverter that returns with a stale ceiling and no active control must be restored to full output within a cycle — not left clamped indefinitely.
+    • After the inverter dropped out and returned, output climbed back to its potential and the hub did not leave it stuck curtailed.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Southbound re-assert-on-reconnect (Phase 4): on device return, reconcile its registers against the CURRENT control set (none ⇒ restore full output). The optimizer-side release edge (restoreOnGenLimitClear) cannot write a dark device.
+
+------------------------------------------------------------------------------
+[PASS] The hub process dies and restarts under a cap   (Hub resilience (INV-EXPORT survivability) · hub-restart-mid-cap)
+  contained the hub restart and held the safe control
+  peak 8020 W · out-of-limit 5 s · adopted=True reacted=True cannot_comply=False blind=False errs=0/90
+  represents: The orchestrator itself restarts mid-event — watchdog, OOM, power blip, deploy. Field reality for an always-on controller. State must come back from the retained bus/CSIP walk, not from luck.
+  expected:   Come back enforcing: re-read the retained control, re-adopt within a cycle or two, and never emit an un-commanded restore during shutdown/startup. The cap outage window must be bounded by the restart itself, not by rediscovery drift.
+    • The hub stayed up (/status kept answering) and kept enforcing the active export cap despite the hub restart — the discovery error was contained and the safe control was not replaced by garbage or 'none'.
+    • INV-EXPORT held: no violations across the window.
+    • At t=91s the real meter read 0 W net while the hub believed 0 W.
+    • SAFETY AUDIT held: no violations across the window.
+  where to look: Startup must treat the retained CSIP control as live state (not wait for a fresh event); shutdown must not release device setpoints it was commanded to hold.
+

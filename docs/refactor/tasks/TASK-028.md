@@ -1,6 +1,16 @@
 # TASK-028 — Flip battery to the reconciler (active mode); 10-cycle campaign gate
 
-*Status: TODO · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: **high***
+*Status: DONE (2026-07-05, lexa-hub `task/028-battery-flip` f7dcef4) · Phase: P2
+· Effort: L · Difficulty: high · Risk: **high** · merge deferred to post-05 §12
+cooling-off (Principal Engineer)*
+
+> Deployed + gated on the bench (battery active, FAST, mqttproxy :1882 intact).
+> Per the launch instruction the gate was ONE full 51-scenario FAST campaign
+> (33P/18D/0F/0B, within the 34P/17D band) plus the targeted battery set
+> (3P/4D/0F/0B, each PASS or accepted-DEGRADED), not the task's 10-cycle. `Reconnected`
+> wired (P2 carry-forward #1), interlock seniority proven (`battery-wrong-sign`
+> PASS, no INV-HUNT). Evidence: `docs/qa-task028/`. Belt-and-braces legacy topic
+> kept (deletion is TASK-032). Bench left FAST + battery-active; rollback rehearsed.
 
 ## Objective
 `lexa-modbus` with `"reconciler": {"battery": "active"}` gives the battery reconciler

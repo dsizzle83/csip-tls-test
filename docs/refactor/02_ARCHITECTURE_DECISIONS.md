@@ -742,6 +742,15 @@ reconnects a pack — a local reflex that must survive hub/broker death
 (ADR-0001), so coupling it to a bus document would defeat its purpose. Revisit
 only at P5.
 
+**✅ Confirmed in practice at the TASK-028 battery flip (2026-07-05):** with the
+reconciler holding write authority, the interlock stayed measurement-only and
+senior. A read-only `isTripped` accessor (no logic change) lets the active
+reconciler defer to Tier-0: while a pack is force-disconnected the reconciler
+suppresses connect-restoring writes (reports `InterlockHold`) rather than fight
+it. `battery-wrong-sign` PASS with INV-SOC/SAFETY held and no INV-HUNT
+oscillation — the guard-vs-guard interaction the reconciler design set out to
+avoid did not materialise.
+
 ---
 
 ## Superseded / rejected log
