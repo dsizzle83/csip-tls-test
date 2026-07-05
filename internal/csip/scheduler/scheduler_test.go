@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"csip-tls-test/internal/csip/discovery"
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 )
 
 // ───────────────────────────────────────────────────────────────────────

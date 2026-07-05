@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 )
 
 // Fetcher abstracts the HTTP GET + XML parse cycle. The walker calls

@@ -7,7 +7,7 @@ package gridsim
 // containment attacks (a malformed curve/billing resource must not break DER
 // control — pricing/curve/billing discovery is non-fatal in the walker).
 
-import "csip-tls-test/internal/csip/model"
+import model "lexa-proto/csipmodel"
 
 func (s *Server) buildExtended(now int64) {
 	// ── DER curve (Volt-VAr) for program 0 (/derp/0/dc) ──────────

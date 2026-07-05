@@ -34,7 +34,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/csip/identity"
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 	"csip-tls-test/sim/simapi"
 )
 

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 )
 
 // ───────────────────────────────────────────────────────────────────────

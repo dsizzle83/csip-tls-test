@@ -20,7 +20,7 @@ import (
 	"math"
 	"time"
 
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/southbound/device"
 	"csip-tls-test/internal/southbound/modbus"
 	"csip-tls-test/internal/southbound/sunspec"

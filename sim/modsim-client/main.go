@@ -36,7 +36,7 @@ import (
 	"syscall"
 	"time"
 
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/southbound/inverter"
 )
 

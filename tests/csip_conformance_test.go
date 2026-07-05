@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/csip/discovery"
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/csip/scheduler"
 	"csip-tls-test/sim/gridsim"
 	"csip-tls-test/internal/httpclient"

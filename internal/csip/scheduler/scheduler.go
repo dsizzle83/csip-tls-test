@@ -29,7 +29,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/csip/discovery"
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 )
 
 // ActiveControl is what the client should apply right now.

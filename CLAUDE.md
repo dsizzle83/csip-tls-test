@@ -36,7 +36,8 @@ sim/modsim-conformance/ Modbus conformance runner (-device inverter|battery|mete
 cmd/dashboard/          Go proxy + embedded SPA (KPIs, scenarios, logs, register tables);
                         also hosts the Mayhem hostile-QA engine (mayhem.go, /api/qa/*) and
                         the Bench Replay driver (replay.go, /api/replay/*)
-internal/csip/          2030.5 model, walker, scheduler, identity, DNS-SD
+internal/csip/          2030.5 walker, scheduler, identity, DNS-SD
+                        (model types moved to lexa-proto/csipmodel — TASK-023)
 internal/tlsclient/     wolfSSL mTLS client (persistent keep-alive fetcher)
 internal/southbound/    Modbus/SunSpec stack (mirrored in lexa-hub — lockstep!)
 tests/                  Conformance + integration test suites

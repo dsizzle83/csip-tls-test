@@ -20,7 +20,7 @@ import (
 	"net/http"
 	"strings"
 
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 )
 
 // Supported malform kinds.

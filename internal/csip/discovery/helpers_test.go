@@ -3,7 +3,7 @@ package discovery
 import (
 	"testing"
 
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 )
 
 func TestVerifyRegistrationPIN(t *testing.T) {

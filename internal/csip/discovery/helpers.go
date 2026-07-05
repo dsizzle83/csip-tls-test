@@ -3,7 +3,7 @@ package discovery
 import (
 	"fmt"
 
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 )
 
 // VerifyRegistration fetches the Registration resource and validates

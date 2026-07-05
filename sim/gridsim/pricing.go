@@ -6,7 +6,7 @@ package gridsim
 // RateComponent → {Active,}TimeTariffIntervalList → TimeTariffInterval →
 // ConsumptionTariffIntervalList → ConsumptionTariffInterval (the price).
 
-import "csip-tls-test/internal/csip/model"
+import model "lexa-proto/csipmodel"
 
 func (s *Server) buildPricing(now int64) {
 	// One electricity TariffProfile with a forward (consumption) RateComponent.

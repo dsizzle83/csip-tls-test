@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"csip-tls-test/internal/csip/model"
+	model "lexa-proto/csipmodel"
 )
 
 func malformCtrlList(mrid string) *model.DERControlList {
