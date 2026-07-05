@@ -194,3 +194,61 @@ derbase did not move). TASK-023 should move `derbase` together with the
 - `csip-tls-test` (bench untouched): `make test-fast` green, `go test ./tests/` green.
 - **Not run this task (batched to TASK-021 per PE lane note — no bench deploy):**
   hub redeploy, `modsim-conformance ×3`, full Mayhem FAST campaign.
+
+---
+
+## 6. TASK-021 addendum — sim-side identifier mapping (2026-07-05)
+
+TASK-021 repointed every remaining bench importer (`sim/southbound/*`, `sim/modsim-conformance`,
+`tests/modbus_conformance_test.go`, `internal/southbound/{derbase,battery,inverter}`) from the
+now-deleted bench `internal/southbound/{sunspec,modbus}` to `lexa-proto/{sunspec,modbus}`, then
+deleted the fork. Confirms §2a: every legacy-model identifier (`M103_*`, `M120_*`, `M121_*`,
+`M122_*`, `M123_*`, `M802_*`, `M201_*`, `SunSpecBase`, `SunSMagic0/1`, `ApplyScale*`,
+`RawFromScale*`) is byte-identical in the shared codec — the sim world model
+(`sim/southbound/*`) needed only an import-path swap, zero logic/identifier changes, and its
+unit tests (incl. fault-injection) pass unchanged.
+
+The §2b/§2c generation gap (701-712: hand-rolled offsets vs. declarative layout engine) *did*
+surface, exactly as flagged as a possibility — in the conformance runner/tests and in
+`internal/southbound/derbase`, none of which are exercised by the bench's sims today (2a) but
+all of which must still compile once the fork is gone. Disposition per call site:
+
+| Old bench identifier | New call | Notes |
+|---|---|---|
+| `M701_W`, `M701_W_SF`, `M701_VL1`, `M701_LNV`, `M701_V_SF`, `M701_Hz`, `M701_Hz_SF`, `M701_VA`, `M701_VA_SF`, `M701_Var`, `M701_Var_SF`, `M701_PF`, `M701_PF_SF`, `M701_St`, `M701_ConnSt` | `sunspec.Parse701(regs)` → `ACMeasurement{W, VL1, LNV, Hz, VA, Var, PF, St, ConnSt, ...}` | Mechanical: same registers, pre-scaled. `PF` needs **no** `/100` in the new generation (§2c S1); the old `/100.0` after `ApplyScaleSigned` was the legacy-M103 convention leaking into the M701 path — dropped for the M701 branch only, M103 branch keeps its `/100.0`. VL1-then-LNV preference kept (§2c S2, matches product's own preference). |
+| `M702_WMaxRtg`, `M702_W_SF` | `sunspec.Parse702(regs).WMaxRtg` | Mechanical. |
+| `M713_SoC`, `M713_SoC_SF`, `M713_SoH`, `M713_SoH_SF`, `M713_WHRtg`, `M713_WHRtg_SF` | `sunspec.Parse713(regs).{SoC,SoH,WHRtg}` | Mechanical *for the conformance runner/tests* (read-only, values already engineering-scaled). Not mechanical for `battery.ReadStorageCapacity` — see below (§2c S5 applies: bench M713 layout is a different, non-spec field set). |
+| `M704_WMaxLimPct`, `M704_WMaxLimPct_SF`, `M704_WMaxLimPctEna` | `sunspec.L704.Offset("WMaxLimPct")` / `L704.View(regs).Float("WMaxLimPct")` / `.SetFloat(...)` / `.SetBool("WMaxLimPctEna", ...)` | The shared codec has `Parse704` (read-only `ACControls`) but **no `Encode704`** — by design, there is no monolithic-struct M704 writer in this generation. Named-field `View` access is the mechanical equivalent for the specific fields each call site touches (`WMaxLimPct`, `PFWInjEna`/`PFWInj_PF`/`PFWInj_Ext`, `VarSetEna`/`VarSetPri`/`VarSetPct`) — full read-modify-write-whole-model semantics preserved. |
+| `M703_ES` | `sunspec.L703.Offset("ES")` / `L703.View(regs).SetBool("ES", ...)` | Mechanical; single-register enable flag. |
+| `M701St` type + `M701StOff/Sleeping/Starting/On/Throttled/ShuttingDwn/Fault/Standby` | New `derbase.M701StOff/.../M701StStandby` int constants (values unchanged: Off=0…Standby=7) | Constants shim added **inside `internal/southbound/derbase`** (bench side, not lexa-proto) per the "shim lives on the sim side" rule — the shared codec returns `ACMeasurement.St` as a raw `uint16` with no symbolic type. |
+
+**Dead-code removed rather than re-implemented** (zero callers beyond their own
+pass-through wrappers in `battery.go`/`inverter.go`, zero test coverage, verified by
+`grep -rn` before deletion): `derbase.SetEnterService`/`ReadEnterService` (full M703
+struct read/write), `SetDERCtlAC`/`ReadDERCtlAC` (full M704 struct read/write —
+no equivalent exists per above), `ReadDERCapacity` (M702 struct read),
+`Read/WriteVoltVar` (M705), `Read/WriteVoltWatt` (M706), `Read/WriteVoltageTripLV/HV`
+(M707/708), `Read/WriteFreqTripLF/HF` (M709/710), `Read/WriteFreqDroop` (M711),
+`Read/WriteWattVar` (M712), and `battery.ReadStorageCapacity` (M713 full struct read).
+
+These were **not** mechanically portable: the shared codec's curve-adopt write workflow
+for 705-712 is a different protocol handshake from the bench fork's (staged index write +
+`AdptCrvReq=2` + poll `AdptCrvRslt` + `Ena=1`, vs. the fork's single write +
+`AdptCrvReq=1`, no poll/enable — §2c S3), and the bench M713 layout is a structurally
+different, non-spec field set from the product's spec-Table-16 layout (§2c S5: bench has
+`AHRtg/MaxChaSoC/MinChaSoC/MaxChaPct/NCyc`, product has `WHAvail/Sta` — no 1:1 field
+mapping). Reimplementing either against the new generation's protocol/layout would be
+writing new logic to a spec not yet exercised anywhere, not a mechanical port — explicitly
+out of scope per the TASK-021 brief ("do not port logic — their disposal is TASK-082").
+`ApplyControl`'s three *actually-called* M704 write paths (`SetPowerFactor704`,
+`SetConstantVar704`, `SetWMaxLimPct704`) and the M703 `SetEnterServiceBool` path *were*
+kept and adapted (table above) since they're live and each touches only 2-3 named fields
+via `View`, with no protocol-shape ambiguity.
+
+Net effect: zero behavior change on any path the bench sims or conformance suite actually
+exercise today (legacy models only, confirmed byte-identical); the untouched-in-practice
+1547 (701-712) surface either got a straightforward named-field adaptation (measurement
+reads, the three ApplyControl write paths) or was deleted as dead weight whose disposal
+was already assigned to TASK-082. Full test evidence: `make test-fast`,
+`go test ./internal/southbound/... ./sim/southbound/... ./tests/...` all green, no
+assertion changes.

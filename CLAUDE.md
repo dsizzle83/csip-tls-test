@@ -39,7 +39,8 @@ cmd/dashboard/          Go proxy + embedded SPA (KPIs, scenarios, logs, register
 internal/csip/          2030.5 walker, scheduler, identity, DNS-SD
                         (model types moved to lexa-proto/csipmodel — TASK-023)
 internal/tlsclient/     wolfSSL mTLS client (persistent keep-alive fetcher)
-internal/southbound/    Modbus/SunSpec stack (mirrored in lexa-hub — lockstep!)
+internal/southbound/    Modbus/SunSpec device drivers + sim world model; codec (sunspec/modbus)
+                        now imported from lexa-proto — TASK-021
 tests/                  Conformance + integration test suites
 docs/                   HARNESS_REVIEW.md (audit findings), BENCH.md (live bench), pcaps
 ```
