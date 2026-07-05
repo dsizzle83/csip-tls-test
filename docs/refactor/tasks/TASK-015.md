@@ -1,19 +1,21 @@
 # TASK-015 — Stock-timing Mayhem release gate (campaign wrapper + first STOCK baseline)
 
-*Status: PARTIAL (2026-07-04) · Phase: P0 · Effort: M (≈4–6 h + overnight run) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-05, da6e629 on `task/015-stock-report`) · Phase: P0 · Effort: M (≈4–6 h + overnight run) · Difficulty: low · Risk: low*
 
-**Partial-completion note (2026-07-04):** `scripts/mayhem-campaign.sh` and
-`docs/QA_STOCK_TRIAGE_TEMPLATE.md` are implemented and locally tested (dry-run modes,
-argument parsing, mode-verification mismatch guard, EXIT-trap restore on normal
-completion / exit-1 continue / exit-2 abort / SIGTERM-while-blocked-on-foreground-child
-— see branch `task/015-stock-gate` for the offline test harness notes). The actual
-10-cycle STOCK campaign against the live bench, its triage, and
-`docs/QA_REPORT_STOCK_M0_<date>.md` are **deliberately deferred**: this wave was
-tooling-only by the launching session's explicit instruction — another agent was
-running a FAST campaign on the shared bench concurrently, and the Principal has
-scheduled the actual STOCK baseline run at the P0-exit gate. Re-run
-`scripts/mayhem-campaign.sh --mode stock --cycles 10` (bench healthy, FAST first) at
-that point, triage per the template, write the M0 report, and flip this header to DONE.
+**Completion note (2026-07-05):** the P0-exit STOCK baseline is executed. `scripts/mayhem-campaign.sh`
+ran 5 cycles (single-run mode, `c39f820` — the wall-time decision taken at the P0-exit
+gate; see the report footnote) against the M0 shipping hub build:
+`logs/campaign-stock-20260704T224628/` (an earlier same-day attempt,
+`campaign-stock-20260704T214633/`, was killed after cycle 1 and is a footnote only, not
+counted). Result: **0.8 FAIL/cycle, 0 BLIND, 0 safety-invariant escalations** over 255
+scenario-runs — triaged per `docs/QA_STOCK_TRIAGE_TEMPLATE.md` in
+`docs/QA_REPORT_STOCK_M0_20260705.md`. Four singleton FAILs (no repeats): two filed as
+findings (`QA-STOCK-001` malform-huge-activepower, `QA-STOCK-002` clock-jitter, both in
+`docs/QA_FINDINGS.md` §6), two dispositioned as pre-existing documented gaps needing no
+new action (perfect-storm, meter-ct-inverted). Zero scenario-margin edits made. Bench
+verified restored to FAST at campaign end (`campaign.log` closing line). This declares
+the STOCK M0 baseline (0.8 FAIL/cycle) that future STOCK release gates (TASK-081)
+compare against, alongside FAST V6's 0.6 FAIL/cycle.
 
 ## Objective
 A campaign wrapper script runs N Mayhem cycles in FAST **or** STOCK bench timing with
