@@ -1,6 +1,19 @@
 # TASK-012 — Delete `SetCSIPPrograms`/`e.sched` dead dual path
 
-*Status: TODO · Phase: P0 · Effort: M (≈4–5 h + campaign) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-04, lexa-hub 8844f68) · Phase: P0 · Effort: M (≈4–5 h + campaign) · Difficulty: med · Risk: med*
+
+> Done 2026-07-04 on lexa-hub branch `task/012-dead-engine-path` (commit 8844f68, not
+> pushed/merged). Deleted `SetCSIPPrograms`/`hasDisconnectControl`/`csipMu`/`programs`/
+> `clockOffset`/`sched` + the `tick()` dual-source block + the now-unused `FromActiveControl`
+> helper and `scheduler`/`discovery` imports. `Wake()` and the reader-driven CSIP/clock-offset
+> path preserved verbatim; engine tests re-expressed via a reader stub, disconnect-wake kept as
+> a direct `Wake()` test. `go test -race ./internal/...`, `./cmd/...`, and `make test-nocgo`
+> green; `go vet ./internal/orchestrator/` clean. Full FAST Mayhem campaign: 33P/17D/1F/0B
+> (`qa-mayhem-20260704-211243.md`). The single FAIL is `control-churn`, a documented known-flaky
+> HIL scenario (V5 10-cycle tally 3/10 fail, Cluster-2 convergence-verifier flakiness in
+> `optimizer.go` — untouched here); watched scenarios grid-disconnect / clock-jitter /
+> clock-jump-forward all PASS, solar-bad-scale now PASS. Not a regression. Awaiting review/merge
+> (≥1 day per 05 §12).
 
 ## Objective
 The engine's unused second CSIP-resolution path is gone: `SetCSIPPrograms`,
