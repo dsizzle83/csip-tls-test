@@ -355,6 +355,25 @@ functional gap*; still leaning (a). Decision in TASK-069, informed by
 TASK-047 fuzz findings. Until then the parser gets the header cap
 (part of TASK-047).
 
+**TASK-047 findings (2026-07-05):** the parsing core (`readResponse`'s
+header loop + `responseContentLength` + `isChunkedEncoding`) moved into a
+new CGo-free leaf package, `lexa-hub/internal/tlsclient/httpwire`
+(stdlib-only imports), so it fuzzes on any machine without the wolfSSL
+sysroot `internal/tlsclient` itself needs. Added the missing header-block
+cap (`maxResponseHeader = 64 KiB`, unbounded before this task — the body
+cap already existed). Three go-native fuzz targets
+(`FuzzReadHTTPResponse`, `FuzzResponseContentLength`,
+`FuzzIsChunkedEncoding`), seeded with 11 real gridsim-captured responses
+plus structural edge cases (negative/huge/duplicate Content-Length,
+header-only flood, chunked header, split-across-reads), 15 minutes each
+locally (~25–46M execs/target) — **zero crashers**. This narrows option
+(b)'s residual risk (the review's original worry — "parsing bugs = security
+bugs" — has 15 CPU-minutes/target of fuzz coverage behind it now with no
+findings) but doesn't resolve the chunked functional gap that only option
+(a) closes; TASK-069 decision still open. Nightly CI job added
+(`.github/workflows/ci.yml` `fuzz`, schedule-only, no wolfSSL sysroot
+needed) so fuzz coverage keeps accumulating between now and that decision.
+
 ## AD-010 ❓ CSIP curve functions (volt-var / volt-watt)
 
 derbase has write paths; nothing drives them from CSIP. V1.0 must either
