@@ -90,12 +90,38 @@ optimizer tests; no soak, no packet-level chaos, no restart-unclean tests.
 | Threshold dither (SoC@reserve, export@breach) | sweep scenarios | 054 |
 | `"NaN"` string in bus JSON | decoder hardening + test | 055 |
 | Hostile HTTP bytes | fuzz + size caps | 047 |
-| Valid-namespace garbage XML / bus JSON | fuzz + plausibility widening | 048 |
+| Valid-namespace garbage XML / bus JSON | fuzz landed (048, DONE); no gate widening — see finding below | 048 |
 | Disk full | scenario | 050 |
 | Packet loss/reorder (all faults are app-layer today) | netem harness | 052 |
 | Soak / resource trends | 30-day rig | 078 |
 | STOCK timing never validated | release-gate campaign | 015 |
 | Sim/product self-confirmation | golden fixtures + referee | 075 |
+
+**TASK-048 findings (fuzz landed, gates NOT widened — reported per 05 §7/§3
+"do not invent assertions the code doesn't have"):**
+- `Time.CurrentTime` (2030.5 `/tm`) is an unbounded int64 with no
+  plausibility gate anywhere in lexa-hub's walker/scheduler; a
+  namespace-valid-but-garbage value decodes cleanly and feeds
+  `ClockOffset` (and therefore every `scheduler.Evaluate` `serverNow`)
+  ungated. Candidate input to TASK-018/025 gate widening — see
+  `07_QA_GAP_PLAN.md`.
+- csip-tls-test's `internal/csipref/scheduler` (the independent referee,
+  AD-003(f)) has **no** equivalent of lexa-hub's `plausibleControl`/
+  `plausibleLimit`/`maxPlausibleLimitW` at all — an implausible
+  `OpModXxxLimW` that the product would reject decodes and would be applied
+  unfiltered by the referee. This is a real asymmetry between the twins,
+  not fixed here (scheduler is out of scope for a fuzz-only task and adding
+  a gate would blur the referee's deliberate independence) — filed as a W3
+  finding for whoever next touches `internal/csipref/scheduler`.
+- The documented CLAUDE.md/architecture-review §10.3 hazard ("root element
+  missing xmlns unmarshal silently yields zero-value structs") does not
+  currently reproduce as *silent* (no error) for any of today's csipmodel
+  root types: encoding/xml returns a non-nil error whenever a
+  namespace-qualified `XMLName` tag doesn't match, and the affected part of
+  the struct stays zero. The fuzz targets in both repos assert this
+  (`assertRootMatches`) as a regression tripwire against a future csipmodel
+  type omitting its namespace tag — see the fuzz_test.go doc comments in
+  both repos for the empirical detail.
 
 ## 4. Regression strategy going forward
 

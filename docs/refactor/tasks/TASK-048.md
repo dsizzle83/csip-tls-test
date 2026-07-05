@@ -1,6 +1,25 @@
 # TASK-048 — Fuzz XML decode + bus JSON decode (both repos, CI nightly)
 
-*Status: TODO · Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-05, csip-tls-test 84b262d / lexa-hub f3d6797) · Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+
+**Landing note:** model types had moved from per-repo `internal/*/model` to
+shared `lexa-proto/csipmodel` (TASK-023) and csip-tls-test's walker/scheduler
+to `internal/csipref` (TASK-082, AD-003(f), deliberately independent from
+lexa-hub) before this task ran — targets placed per the adapted layout: XML
+targets live with the consumer that owns the plausibility gate they drive
+(lexa-hub `internal/northbound/scheduler`) or, for the bench referee (no gate
+exists there — see finding below), with the client-side decode step
+(csip-tls-test `internal/csipref/discovery`). Findings (not fixed, filed for
+follow-up): `Time.CurrentTime`/`ClockOffset` has no plausibility gate
+anywhere in lexa-hub; `internal/csipref/scheduler` has no
+plausibleControl-equivalent at all. Both fully detailed in
+`06_TESTING_STRATEGY.md`. All 5 fuzz targets ran a clean 5 min locally (0
+unresolved crashers); one real bug was found and fixed in the bus fuzz
+target's own test helper (case-sensitive JSON key check vs encoding/json's
+documented case-insensitive fallback) — see lexa-hub commit message.
+5 min/target used instead of the 15 min this file specifies below, per
+launch instructions (still ≥ the acceptance bar the launcher set); CI's
+nightly jobs run the full 15m/target as this file originally specified.
 
 ## Objective
 Fuzz the two remaining untrusted decode surfaces: IEEE 2030.5 XML
