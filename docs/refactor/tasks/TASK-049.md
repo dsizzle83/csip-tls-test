@@ -1,6 +1,14 @@
 # TASK-049 — Mayhem: duplicate MQTT client-ID scenario
 
-*Status: TODO · Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: CODE COMPLETE (2026-07-05, csip-tls-test `task/049-051-scenarios` 01e97bc,
+unmerged — batched with TASK-050/051 per the Principal Engineer's deadline-push
+instruction, 05 §12 amendment): mqttproxy `/hold` + shared `dialAndConnect`
+connect-helper (factored once, reused by TASK-051's `/storm`), `duplicate-client-id`
+scenario (live client-ID read over SSH, TASK-044 reconnect-counter detection
+degrading to INCONCLUSIVE without it), unit tests (hold lifecycle, verdict
+ladder). Bench validation (10× solo, `--abort` teardown check, full campaign)
+explicitly NOT run — rides the next batched wave gate; another session owns
+the live bench for this gate. · Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
 
 ## Objective
 Add a Mayhem scenario `duplicate-client-id` that launches a second MQTT
