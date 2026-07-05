@@ -65,3 +65,58 @@ desired-while-disconnected 396–406 → 421–427; stale-ceiling clear 385–39
 283–300), **L10** (checkBatterySafety end 1648 → 1641), **L11** (258–314 →
 294–350, 349–368 → 393–416). Unchanged and re-confirmed: **L1, L7, L8**. All 18
 distinct gate-scenario names were confirmed present in the Mayhem catalog.
+
+## Shadow observations (TASK-027, 2026-07-05)
+
+Code landed (lexa-hub `task/027-battery-shadow`): the hub-side battery
+desired-doc publisher (`cmd/hub/desired.go`, additive — legacy actuator
+delegated to first, unchanged) and the lexa-modbus shadow shell
+(`cmd/modbus/reconcile_shadow.go`) driving one `internal/reconcile.Reconciler`
+per battery device off the retained doc, poll readbacks, and observed legacy
+writes, logging `reconciler[shadow] ...` verdict lines — a recorder only, no
+write path. **Status column for L1–L4 intentionally left at `legacy-active`**:
+this session was code + unit tests only (no bench deploy); the bench soak,
+verdict/campaign evidence, and the `shadow` status flip are the wave-gate
+follow-up the task names, not yet done.
+
+Two things to carry into that soak, found while wiring the first real
+consumer against lexa-modbus's actual (partial) measurement capability:
+
+- **Reconnect-on-drop (L4) is deliberately not fed to the shadow.** The
+  task's shadow-feed list is desired docs + poll readbacks + observed legacy
+  writes only; `reconcile.Reconciler.Reconnected` is never called from
+  `reconcile_shadow.go`. A battery that drops mid-poll never reaches
+  `Observe` at all (its poll-error update is skipped upstream before the
+  shadow is invoked), so the shadow's assessment simply holds through the
+  outage and resumes at the next successful poll. Legacy's
+  `retryDevice.lastCtrl` reassert-on-reconnect is unconditional and immediate;
+  the shadow's write-on-diff (were it live) would only fire on the next poll
+  that observes a mismatch. Watch `battery-reboot` specifically for a
+  reconciler-vs-legacy timing gap in the divergence log — expected to be a
+  documented semantic difference (reconciler slower by up to one poll
+  interval), not a bug, but it needs a real disposition from the soak, not an
+  assumption from this desk.
+- **A battery doc expressing both `SetpointW` and `Connect` (the common real
+  shape — e.g. the reserve-idle tick reconnects and idles every cycle) can
+  never be judged "converged" by the shadow**, because lexa-modbus has no
+  register to read Connect state back from. `internal/reconcile`'s
+  completeness gate correctly holds forever in that case (verified
+  deterministic — see the `reconcile.go` fix below), which the shadow reports
+  as a permanent, silent hold rather than a match or a divergence. This is
+  expected and by design (ledger L9's discipline: an unassessable sample
+  proves nothing), but it means the shadow's `match` rate during the soak
+  will be lower than "the reconciler agrees with legacy" — most battery
+  decision points will simply never resolve to a verdict at all until a
+  Connect readback exists. Worth a line in the TASK-028 write-up so nobody
+  reads a quiet `matches` counter as "everything converged."
+
+**Incidental fix, filed here for traceability:** `internal/reconcile.matches()`
+(TASK-026, merged) had an order-dependent bug — a doc expressing two fields
+where only one is ever supplied by the readback could non-deterministically
+report `complete=true` or `complete=false` depending on Go's randomized map
+iteration order, contradicting the package's own "hold on incomplete, never
+write-storm" guarantee. Fixed in the same lexa-hub commit as this task (two-pass
+check: completeness for every key first, then tolerance), with a new
+regression test (`TestPartialReadbackIsCompleteDeterministic`). This is exactly
+the L1–L4/Connect situation above — the bug would otherwise have made the
+shadow's verdict flicker between `match`/`diverge` on identical inputs.

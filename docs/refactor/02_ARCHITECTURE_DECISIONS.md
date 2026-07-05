@@ -653,12 +653,22 @@ policy knob, not a safety boundary (safety stays fail-closed on the held value
 plus the Tier-0 interlock).
 
 **Migration.** Types land now (`internal/bus/desired.go`, `DesiredStateV`),
-compiled but unused. TASK-026 builds the reconciler that subscribes
-`SubDesired` (`lexa/desired/+/+`) and adds the topic → `DesiredStateV` case to
-`bus.SupportedV`; TASK-027… publish per class (battery → solar → EVSE). Every
-legacy mechanism the doc replaces is tracked to its originating QA scenario in
-`docs/refactor/PRESERVATION_LEDGER.md` (TASK-025) and may not be deleted until
-its gate scenarios pass on the reconciler (05 §11).
+compiled but unused. TASK-026 builds the reconciler core, unwired.
+TASK-027 (2026-07-05) is the first thing to ever put a message on this topic
+family: it lands the first publisher (`cmd/hub/desired.go`, additive —
+battery only, wraps the legacy actuator) and the first subscriber
+(`cmd/modbus/reconcile_shadow.go`, shadow mode — a passive recorder, zero
+writes), and — since neither TASK-026 nor anything before it had ever
+subscribed the topic — adds the `lexa/desired/` → `DesiredStateV` case to
+`bus.SupportedV` (`internal/bus/topics.go`) that this paragraph originally
+described as TASK-026's; it was deferred in practice to whichever task wired
+the first real subscriber, cited as such in TASK-027's commit. Solar/EVSE
+publishers (TASK-029/030) follow the same pattern. Every legacy mechanism the
+doc replaces is tracked to its originating QA scenario in
+`docs/refactor/PRESERVATION_LEDGER.md` (TASK-025, shadow-observation notes
+added by TASK-027) and may not be deleted until its gate scenarios pass on the
+reconciler (05 §11) — TASK-027's shadow soak (bench, deferred to the wave
+gate) is that proof for battery; TASK-028 is the flip.
 
 **Resolves AD-002's open questions.** ✅ **Meter gets no desired document** —
 no actuator exists for it: `cmd/hub` registers actuators only for
