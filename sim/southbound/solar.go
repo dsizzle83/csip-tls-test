@@ -28,7 +28,7 @@ import (
 	"math"
 	"time"
 
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // SolarBases holds the first data-register address of each model block

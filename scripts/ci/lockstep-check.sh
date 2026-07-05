@@ -108,12 +108,20 @@ for tree in "${TREES[@]}"; do
   product_dir="$PRODUCT/$tree"
   pkg="$(basename "$tree")"
 
+  # TASK-021/022: both trees are retired from both repos once their shared
+  # lexa-proto module lands (AD-003) — that is the goal state, not a drift.
+  # Only an ASYMMETRIC removal (retired on one side, still present on the
+  # other) is a real divergence worth failing the gate over.
+  if [[ ! -d "$bench_dir" && ! -d "$product_dir" ]]; then
+    echo "lockstep-check: '$tree' retired from both repos (moved to lexa-proto) — nothing to compare."
+    continue
+  fi
   if [[ ! -d "$bench_dir" ]]; then
-    echo "lockstep-check: missing bench tree '$tree' at $bench_dir" >&2
+    echo "lockstep-check: '$tree' retired from bench but still present in product at $product_dir — asymmetric, review needed." >&2
     exit 1
   fi
   if [[ ! -d "$product_dir" ]]; then
-    echo "lockstep-check: missing product tree '$tree' at $product_dir" >&2
+    echo "lockstep-check: '$tree' retired from product but still present in bench at $bench_dir — asymmetric, review needed." >&2
     exit 1
   fi
 

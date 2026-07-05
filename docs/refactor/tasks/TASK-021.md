@@ -1,6 +1,6 @@
 # TASK-021 — Sims consume the shared sunspec codec; delete the bench fork; bench validation
 
-*Status: TODO · Phase: P1 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-05, 2c17cfb) · Phase: P1 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
 
 ## Objective
 `csip-tls-test` no longer contains a SunSpec codec: every bench consumer imports
@@ -144,18 +144,35 @@ No new tests. Existing suites are the oracle: `make test-fast`,
   the codec fault layer.
 
 ## Acceptance criteria
-- [ ] `grep -r "csip-tls-test/internal/southbound/sunspec" --include="*.go" .` → no matches;
-      directory deleted.
-- [ ] `make test-fast`, `go test ./sim/southbound/...`, `go test ./tests/` green.
-- [ ] Conformance ×3 device types PASS against live redeployed sims.
-- [ ] Same-session hub+sims deploy recorded (commit/journal evidence in PR).
-- [ ] Full FAST campaign ≤ 0.6 FAIL/cycle, 0 BLIND.
+- [x] `grep -r "csip-tls-test/internal/southbound/sunspec" --include="*.go" .` → no matches;
+      directory deleted. (Also `internal/southbound/modbus` deleted.)
+- [x] `make test-fast`, `go test ./sim/southbound/...`, `go test ./tests/` green (also verified
+      under `GOWORK=off go test -mod=vendor` — vendor/lexa-proto/{sunspec,modbus} added, AD-003(e)).
+- [x] Conformance ×3 device types PASS against live redeployed sims: inverter 19/19,
+      battery 22/22, meter 9/9 (one transient MTR-006 timing flake on first run,
+      confirmed by immediate re-run — not codec-related, register offsets untouched).
+- [x] Same-session hub+sims deploy recorded: lexa-hub `make build-arm64` +
+      `deploy-hub-pi.sh 69.0.0.1 dmitri --enable-api-auth --enable-mqtt-acl` (all 6 services
+      active) + `hub-replay-tune.sh fast` + `mqtt-chaos.sh deploy` (re-established after the
+      hub deploy reset configs) + `update-sim-pis.sh 69.0.0.1 dmitri` (all 4 sims active), one
+      session, 2026-07-05. Live gridsim->hub discovery walk verified: posted
+      `DERC-SP-ADMIN-1783262982` via gridsim admin, hub adopted it within one discovery tick
+      (journal: `discovery OK ... source=event mrid=DERC-SP-ADMIN...`, `response posted:
+      Received/Started`, orchestrator ticks show `csip=event(...)`); control deleted afterward
+      to restore bench default.
+- [x] Full FAST campaign ≤ 0.6 FAIL/cycle, 0 BLIND: **34 PASS / 17 DEGRADED / 0 FAIL / 0 BLIND
+      / 0 INCONCLUSIVE** (51/51), within the 32-35P/16-19D/0F band. Targeted register-codec
+      set (`solar-bad-scale, battery-wrong-sign, meter-ct-inverted, export-cap-full-battery`)
+      ran first: 3 PASS / 1 DEGRADED (battery-wrong-sign — hub correctly posted CannotComply,
+      expected outcome for a deliberately-injected wrong-sign fault) / 0 FAIL / 0 BLIND.
 
 ## Regression checklist
-- [ ] `make test-fast` (csip-tls-test) / `go test -race ./internal/...` (lexa-hub) green
-- [ ] Conformance logic tests green (`go test ./tests/`) — protocol-adjacent: yes
-- [ ] Mayhem: **full campaign** (register world model touched)
-- [ ] `hub-replay-tune.sh fast` re-run post-deploy
+- [x] `make test-fast` (csip-tls-test) green. (lexa-hub untouched by this task — no product
+      code changed, only its Pi deploy was re-run as the MTR-4 lockstep partner.)
+- [x] Conformance logic tests green (`go test ./tests/`) — protocol-adjacent: yes (23/23,
+      incl. the 701/702/713/704-path adaptations)
+- [x] Mayhem: **full campaign** — 34P/17D/0F/0BLIND (see above)
+- [x] `hub-replay-tune.sh fast` re-run post-deploy
 
 ## Mayhem scenarios affected
 None intended. Watch `solar-bad-scale`, `nan-sentinel`, `battery-nan-sentinel`,
@@ -184,6 +201,60 @@ revert; go.work keeps the module importable, and the fork returns via git revert
 ## Definition of done
 Acceptance criteria + regression checklist; docs updated; status headers (this file +
 00_MASTER_INDEX) updated.
+
+## Implementation notes (2026-07-05)
+
+**Scope reality-check on step 5 (monolith-orbit importers).** The task's Background assumed
+"if TASK-010 is DONE they are gone" for the driver forks (`internal/southbound/{battery,
+inverter,meter,registry,device}` + `derbase`). TASK-010 (DONE) explicitly kept these — its own
+"Keep list" says "`internal/southbound/` everything else" — because `sim/modsim-client/main.go`
+(a live, Makefile-referenced Pi-side Modbus validation CLI) still imports them. So they needed
+real repointing, not just verifying absence.
+
+**Generation-gap fallout (anticipated by the disposition doc, materialized here).** Legacy
+models (103/120/121/122/123/802/201-203) were a pure import-path swap everywhere — zero
+identifier/behavior changes, confirmed by unchanged unit test assertions. The IEEE 1547-2018
+models (701-712) are where the two codec generations structurally diverge (hand-rolled offsets
+vs. declarative layout engine — disposition doc §2b/§2c), and that surfaced in three places
+that had to touch 701-712: `sim/modsim-conformance/main.go`, `tests/modbus_conformance_test.go`,
+and `internal/southbound/derbase`. Disposition:
+- **Read paths** (measurements, nameplate, SoC/SoH/WHRtg): mechanical swap to the shared codec's
+  typed decoders (`sunspec.Parse701/702/713`, `derbase.M701St*` constants shim for the one enum
+  the shared codec doesn't symbolize). Same registers, same values, verified by unchanged
+  conformance-suite pass counts.
+- **The three M704 write paths `ApplyControl` actually calls** (`SetPowerFactor704`,
+  `SetConstantVar704`, `SetWMaxLimPct704`) plus the M703 `SetEnterServiceBool` path: adapted to
+  the shared layout engine's named-field `View` (`L704.View(regs).SetFloat(...)`) since no
+  monolithic-struct M704 encoder exists in this generation (`Parse704` is read-only, by design).
+  Read-modify-write-whole-model semantics preserved exactly.
+- **The wider M702/705-712 read/write surface** (`SetEnterService`/`ReadEnterService` full-struct,
+  `SetDERCtlAC`/`ReadDERCtlAC`, `ReadDERCapacity`, all of `Read/WriteVoltVar/VoltWatt/
+  VoltageTripLV/HV/FreqTripLF/HF/FreqDroop/WattVar`, `battery.ReadStorageCapacity`): had zero
+  callers beyond their own pass-through wrappers and zero test coverage (verified before
+  touching anything). Deleted rather than re-implemented — the shared codec's curve-adopt write
+  handshake is a different protocol (staged index + `AdptCrvReq=2` + poll + `Ena=1`, vs. this
+  fork's single write + `AdptCrvReq=1`) and the bench M713 layout is a structurally different,
+  non-spec field set (disposition doc §2c S3/S5) — reimplementing either would be writing new
+  logic against an unexercised spec, which the brief's "do not port logic" instruction and the
+  disposition doc's own risk posture (RSK-02, defer design calls) both rule out. Full disposal
+  of this fork (design decision on what if anything replaces it) is TASK-082's job, not this
+  task's. See `docs/refactor/notes/TASK-020-sunspec-disposition.md` §6 for the full mapping
+  table and reasoning.
+
+**Lockstep gate (`scripts/ci/lockstep-check.sh`) — fixed beyond the allowlist.** Running the
+gate (as the task requires) revealed it was already broken before this task touched anything:
+lexa-hub deleted its own `internal/southbound/sunspec` in TASK-020 and `internal/ocppserver` in
+TASK-022, but the script hard-errors if either tracked tree is missing on *either* side, with no
+handling for "retired from both repos" (the actual end state AD-003 is driving toward). Patched
+the tree-existence check to treat both-sides-missing as in-lockstep-by-retirement while still
+failing on an asymmetric one-side-only removal (a real bug class). This is a minimal, targeted
+fix, not the full TASK-024 gate retirement — flagged here since the task text only mentioned the
+allowlist, not the script, but the gate cannot "still pass" without it.
+
+**AD-003(e) vendor delta.** New `lexa-proto/sunspec` and `lexa-proto/modbus` imports required
+`GOWORK=off go mod vendor`; `vendor/lexa-proto/{sunspec,modbus}/` and `vendor/modules.txt` are
+part of this change. Verified `GOWORK=off go build -mod=vendor ./...` and the southbound/tests
+suites green in vendor mode too.
 
 ## Possible follow-up tasks
 TASK-024 (pin gate + CLAUDE.md prose swap), TASK-053 (int16/scale generative sweep now

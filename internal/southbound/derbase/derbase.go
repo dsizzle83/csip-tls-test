@@ -9,9 +9,26 @@ import (
 	"fmt"
 	"math"
 
-	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/southbound/device"
-	"csip-tls-test/internal/southbound/sunspec"
+	model "lexa-proto/csipmodel"
+	"lexa-proto/sunspec"
+)
+
+// M701St enumerates the operating state reported by SunSpec Model 701
+// (DERMeasureAC.St). The shared codec's sunspec.Parse701 returns St as a raw
+// uint16 (sunspec.ACMeasurement.St) rather than a symbolic type; these mirror
+// the SunSpec Alliance Model 701 spec values the old bench fork named as
+// M701St/M701StOn/etc. This is a constants shim living on the bench side
+// (never re-added to lexa-proto) per TASK-021 step 2.
+const (
+	M701StOff         = 0
+	M701StSleeping    = 1
+	M701StStarting    = 2
+	M701StOn          = 3
+	M701StThrottled   = 4
+	M701StShuttingDwn = 5
+	M701StFault       = 6
+	M701StStandby     = 7
 )
 
 // Base holds shared SunSpec DER state and methods. Embed in concrete types.
@@ -82,39 +99,22 @@ func Init(r *sunspec.Reader, tag string) (Base, error) {
 
 // ── Measurements ─────────────────────────────────────────────────────────────
 
-// ReadMeasurementsM701 parses M701 (DERMeasureAC) registers.
+// ReadMeasurementsM701 parses M701 (DERMeasureAC) registers via the shared
+// layout-engine codec. VL1 preferred over LNV (disposition doc §2c S2); PF is
+// SF-only in this generation, no legacy ×100 convention (§2c S1).
 func ReadMeasurementsM701(regs []uint16) device.Measurements {
-	get := func(offset int) uint16 {
-		if offset < len(regs) {
-			return regs[offset]
-		}
-		return 0
-	}
-	sf := func(offset int) int16 { return int16(get(offset)) }
-
+	ac := sunspec.Parse701(regs)
 	m := device.Measurements{TmpCab: math.NaN()}
-	if len(regs) > sunspec.M701_W_SF {
-		m.W = sunspec.ApplyScaleSigned(get(sunspec.M701_W), sf(sunspec.M701_W_SF))
+	m.W = ac.W
+	v := ac.VL1
+	if math.IsNaN(v) {
+		v = ac.LNV
 	}
-	if len(regs) > sunspec.M701_V_SF {
-		v := get(sunspec.M701_VL1)
-		if v == 0x8000 {
-			v = get(sunspec.M701_LNV)
-		}
-		m.V = sunspec.ApplyScaleUint(v, sf(sunspec.M701_V_SF))
-	}
-	if len(regs) > sunspec.M701_Hz_SF {
-		m.Hz = sunspec.ApplyScaleUint(get(sunspec.M701_Hz), sf(sunspec.M701_Hz_SF))
-	}
-	if len(regs) > sunspec.M701_VA_SF {
-		m.VA = sunspec.ApplyScaleSigned(get(sunspec.M701_VA), sf(sunspec.M701_VA_SF))
-	}
-	if len(regs) > sunspec.M701_Var_SF {
-		m.Var = sunspec.ApplyScaleSigned(get(sunspec.M701_Var), sf(sunspec.M701_Var_SF))
-	}
-	if len(regs) > sunspec.M701_PF_SF {
-		m.PF = sunspec.ApplyScaleSigned(get(sunspec.M701_PF), sf(sunspec.M701_PF_SF)) / 100.0
-	}
+	m.V = v
+	m.Hz = ac.Hz
+	m.VA = ac.VA
+	m.Var = ac.Var
+	m.PF = ac.PF
 	return m
 }
 
@@ -225,49 +225,36 @@ func (b *Base) ApplyControl(ctrl model.DERControlBase, tag string) error {
 }
 
 // ── M703 enter service ───────────────────────────────────────────────────────
+//
+// Only the ApplyControl-reachable path (SetEnterServiceBool) is kept. The old
+// bench fork also exposed a full-struct SetEnterService/ReadEnterService pair
+// (DEREnterServiceSettings type) with zero callers and zero test coverage;
+// removed rather than re-implemented against the shared codec's differently
+// shaped EnterService/Parse703/Encode703 — leftover-fork disposal is TASK-082.
 
-// SetEnterService writes full M703 settings.
-func (b *Base) SetEnterService(s sunspec.DEREnterServiceSettings, tag string) error {
-	if !b.Has703 {
-		return fmt.Errorf("%s: device has no M703 (DEREnterService)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDEREnterService)
-	if err != nil {
-		return fmt.Errorf("%s: read M703: %w", tag, err)
-	}
-	if err := sunspec.EncodeDEREnterService(regs, s); err != nil {
-		return err
-	}
-	return b.Reader.WriteModel(sunspec.ModelDEREnterService, 0, regs)
-}
-
-// SetEnterServiceBool is the internal path called from ApplyControl.
+// SetEnterServiceBool is the internal path called from ApplyControl. Named-field
+// offset lookup via the shared layout engine (no raw M703_ES constant exists
+// in this generation).
 func (b *Base) SetEnterServiceBool(energize bool, tag string) error {
 	regs, err := b.Reader.ReadModel(sunspec.ModelDEREnterService)
 	if err != nil {
 		return fmt.Errorf("%s: read M703: %w", tag, err)
 	}
-	if energize {
-		regs[sunspec.M703_ES] = 1
-	} else {
-		regs[sunspec.M703_ES] = 0
-	}
-	return b.Reader.WriteModel(sunspec.ModelDEREnterService, 0, regs[:1])
-}
-
-// ReadEnterService reads M703 settings.
-func (b *Base) ReadEnterService(tag string) (sunspec.DEREnterServiceSettings, error) {
-	if !b.Has703 {
-		return sunspec.DEREnterServiceSettings{}, fmt.Errorf("%s: device has no M703", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDEREnterService)
-	if err != nil {
-		return sunspec.DEREnterServiceSettings{}, fmt.Errorf("%s: read M703: %w", tag, err)
-	}
-	return sunspec.ParseDEREnterService(regs)
+	off := sunspec.L703.Offset("ES")
+	sunspec.L703.View(regs).SetBool("ES", energize)
+	return b.Reader.WriteModel(sunspec.ModelDEREnterService, uint16(off), regs[off:off+1])
 }
 
 // ── M704 DERCtlAC helpers ────────────────────────────────────────────────────
+//
+// These three are the only M704 write paths ApplyControl actually reaches;
+// each touches only the named fields it needs via the shared layout engine's
+// View (no DERCtlACSettings/EncodeDERCtlAC equivalent exists for a monolithic
+// M704 struct write in this generation — by design, per Parse704's read-only
+// doc comment). The full-struct SetDERCtlAC/ReadDERCtlAC and ReadDERCapacity
+// helpers the old fork also exposed had zero callers/tests and are removed
+// (TASK-082 disposal) rather than re-implemented against a shape with no
+// equivalent.
 
 // SetPowerFactor704 maps CSIP OpModFixedPF* to M704 PFWInj fields.
 func (b *Base) SetPowerFactor704(ctrl model.DERControlBase, tag string) error {
@@ -275,21 +262,15 @@ func (b *Base) SetPowerFactor704(ctrl model.DERControlBase, tag string) error {
 	if err != nil {
 		return fmt.Errorf("%s: read M704: %w", tag, err)
 	}
-	s, err := sunspec.ParseDERCtlAC(regs)
-	if err != nil {
-		return err
-	}
+	v := sunspec.L704.View(regs)
 	if ctrl.OpModFixedPFInjectW != nil {
-		s.PFWInjEna = true
-		s.PFWInj_PF = math.Abs(float64(ctrl.OpModFixedPFInjectW.Value)) / 10000.0
-		s.PFWInj_Ext = true
+		v.SetBool("PFWInjEna", true)
+		v.SetFloat("PFWInj_PF", math.Abs(float64(ctrl.OpModFixedPFInjectW.Value))/10000.0)
+		v.SetBool("PFWInj_Ext", true)
 	} else if ctrl.OpModFixedPFAbsorbW != nil {
-		s.PFWInjEna = true
-		s.PFWInj_PF = math.Abs(float64(ctrl.OpModFixedPFAbsorbW.Value)) / 10000.0
-		s.PFWInj_Ext = false
-	}
-	if err := sunspec.EncodeDERCtlAC(regs, s); err != nil {
-		return err
+		v.SetBool("PFWInjEna", true)
+		v.SetFloat("PFWInj_PF", math.Abs(float64(ctrl.OpModFixedPFAbsorbW.Value))/10000.0)
+		v.SetBool("PFWInj_Ext", false)
 	}
 	return b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs)
 }
@@ -303,16 +284,10 @@ func (b *Base) SetConstantVar704(fv *model.FixedVar, tag string) error {
 	if err != nil {
 		return fmt.Errorf("%s: read M704 for var: %w", tag, err)
 	}
-	s, err := sunspec.ParseDERCtlAC(regs)
-	if err != nil {
-		return err
-	}
-	s.VarSetEna = true
-	s.VarSetPri = 1
-	s.VarSetPct = float64(fv.Value.Value) / 100.0
-	if err := sunspec.EncodeDERCtlAC(regs, s); err != nil {
-		return err
-	}
+	v := sunspec.L704.View(regs)
+	v.SetBool("VarSetEna", true)
+	v.SetEnum("VarSetPri", 1)
+	v.SetFloat("VarSetPct", float64(fv.Value.Value)/100.0)
 	return b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs)
 }
 
@@ -334,289 +309,24 @@ func (b *Base) SetWMaxLimPct704(ap *model.ActivePower, tag string) error {
 	if err != nil {
 		return fmt.Errorf("%s: read M704 for WMaxLimPct: %w", tag, err)
 	}
-	s, err := sunspec.ParseDERCtlAC(regs)
-	if err != nil {
-		return err
-	}
-	s.WMaxLimPctEna = true
-	s.WMaxLimPct = pct
-	if err := sunspec.EncodeDERCtlAC(regs, s); err != nil {
-		return err
-	}
+	v := sunspec.L704.View(regs)
+	v.SetBool("WMaxLimPctEna", true)
+	v.SetFloat("WMaxLimPct", pct)
 	return b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs)
 }
 
-// SetDERCtlAC writes a complete M704 settings struct.
-func (b *Base) SetDERCtlAC(s sunspec.DERCtlACSettings, tag string) error {
-	if !b.Has704 {
-		return fmt.Errorf("%s: device has no M704 (DERCtlAC)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERCtlAC)
-	if err != nil {
-		return fmt.Errorf("%s: read M704: %w", tag, err)
-	}
-	if err := sunspec.EncodeDERCtlAC(regs, s); err != nil {
-		return err
-	}
-	return b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs)
-}
-
-// ReadDERCtlAC reads M704 settings.
-func (b *Base) ReadDERCtlAC(tag string) (sunspec.DERCtlACSettings, error) {
-	if !b.Has704 {
-		return sunspec.DERCtlACSettings{}, fmt.Errorf("%s: device has no M704", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERCtlAC)
-	if err != nil {
-		return sunspec.DERCtlACSettings{}, fmt.Errorf("%s: read M704: %w", tag, err)
-	}
-	return sunspec.ParseDERCtlAC(regs)
-}
-
-// ReadDERCapacity reads M702 nameplate data.
-func (b *Base) ReadDERCapacity(tag string) (sunspec.DERCapacity, error) {
-	if !b.Has702 {
-		return sunspec.DERCapacity{}, fmt.Errorf("%s: device has no M702 (DERCapacity)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERCapacity)
-	if err != nil {
-		return sunspec.DERCapacity{}, fmt.Errorf("%s: read M702: %w", tag, err)
-	}
-	return sunspec.ParseDERCapacity(regs)
-}
-
-// ── Volt-Var (M705) ──────────────────────────────────────────────────────────
-
-func (b *Base) ReadVoltVar(tag string) (sunspec.VoltVarCurve, error) {
-	if !b.Has705 {
-		return sunspec.VoltVarCurve{}, fmt.Errorf("%s: device has no M705 (DERVoltVar)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERVoltVar)
-	if err != nil {
-		return sunspec.VoltVarCurve{}, fmt.Errorf("%s: read M705: %w", tag, err)
-	}
-	return sunspec.ParseVoltVarCurve(regs, 0)
-}
-
-func (b *Base) WriteVoltVar(c sunspec.VoltVarCurve, tag string) error {
-	if !b.Has705 {
-		return fmt.Errorf("%s: device has no M705 (DERVoltVar)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERVoltVar)
-	if err != nil {
-		return fmt.Errorf("%s: read M705: %w", tag, err)
-	}
-	start, end, err := sunspec.EncodeVoltVarCurve(regs, c)
-	if err != nil {
-		return err
-	}
-	if err := b.Reader.WriteModel(sunspec.ModelDERVoltVar, uint16(start), regs[start:end]); err != nil {
-		return fmt.Errorf("%s: write M705 curve: %w", tag, err)
-	}
-	return b.Reader.WriteModel(sunspec.ModelDERVoltVar, sunspec.M705_AdptCrvReq, []uint16{1})
-}
-
-// ── Volt-Watt (M706) ────────────────────────────────────────────────────────
-
-func (b *Base) ReadVoltWatt(tag string) (sunspec.VoltWattCurve, error) {
-	if !b.Has706 {
-		return sunspec.VoltWattCurve{}, fmt.Errorf("%s: device has no M706 (DERVoltWatt)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERVoltWatt)
-	if err != nil {
-		return sunspec.VoltWattCurve{}, fmt.Errorf("%s: read M706: %w", tag, err)
-	}
-	return sunspec.ParseVoltWattCurve(regs, 0)
-}
-
-func (b *Base) WriteVoltWatt(c sunspec.VoltWattCurve, tag string) error {
-	if !b.Has706 {
-		return fmt.Errorf("%s: device has no M706 (DERVoltWatt)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERVoltWatt)
-	if err != nil {
-		return fmt.Errorf("%s: read M706: %w", tag, err)
-	}
-	start, end, err := sunspec.EncodeVoltWattCurve(regs, c)
-	if err != nil {
-		return err
-	}
-	if err := b.Reader.WriteModel(sunspec.ModelDERVoltWatt, uint16(start), regs[start:end]); err != nil {
-		return fmt.Errorf("%s: write M706 curve: %w", tag, err)
-	}
-	return b.Reader.WriteModel(sunspec.ModelDERVoltWatt, sunspec.M706_AdptCrvReq, []uint16{1})
-}
-
-// ── Voltage trip (M707/M708) ────────────────────────────────────────────────
-
-func (b *Base) ReadVoltageTripLV(tag string) (sunspec.VoltageTripCurve, error) {
-	if !b.Has707 {
-		return sunspec.VoltageTripCurve{}, fmt.Errorf("%s: device has no M707 (DERTripLV)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERTripLV)
-	if err != nil {
-		return sunspec.VoltageTripCurve{}, fmt.Errorf("%s: read M707: %w", tag, err)
-	}
-	return sunspec.ParseVoltageTripCurve(regs, 0, false)
-}
-
-func (b *Base) WriteVoltageTripLV(c sunspec.VoltageTripCurve, tag string) error {
-	if !b.Has707 {
-		return fmt.Errorf("%s: device has no M707 (DERTripLV)", tag)
-	}
-	return b.writeTripCurve707(sunspec.ModelDERTripLV, sunspec.M707_AdptCrvReq, c, tag)
-}
-
-func (b *Base) ReadVoltageTripHV(tag string) (sunspec.VoltageTripCurve, error) {
-	if !b.Has708 {
-		return sunspec.VoltageTripCurve{}, fmt.Errorf("%s: device has no M708 (DERTripHV)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERTripHV)
-	if err != nil {
-		return sunspec.VoltageTripCurve{}, fmt.Errorf("%s: read M708: %w", tag, err)
-	}
-	return sunspec.ParseVoltageTripCurve(regs, 0, false)
-}
-
-func (b *Base) WriteVoltageTripHV(c sunspec.VoltageTripCurve, tag string) error {
-	if !b.Has708 {
-		return fmt.Errorf("%s: device has no M708 (DERTripHV)", tag)
-	}
-	return b.writeTripCurve707(sunspec.ModelDERTripHV, sunspec.M707_AdptCrvReq, c, tag)
-}
-
-func (b *Base) writeTripCurve707(modelID, adptReqOffset uint16, c sunspec.VoltageTripCurve, tag string) error {
-	regs, err := b.Reader.ReadModel(modelID)
-	if err != nil {
-		return fmt.Errorf("%s: read model %d: %w", tag, modelID, err)
-	}
-	start, end, err := sunspec.EncodeVoltageTripCurve(regs, c, false)
-	if err != nil {
-		return err
-	}
-	if err := b.Reader.WriteModel(modelID, uint16(start), regs[start:end]); err != nil {
-		return fmt.Errorf("%s: write model %d: %w", tag, modelID, err)
-	}
-	return b.Reader.WriteModel(modelID, adptReqOffset, []uint16{1})
-}
-
-// ── Frequency trip (M709/M710) ───────────────────────────────────────────────
-
-func (b *Base) ReadFreqTripLF(tag string) (sunspec.FreqTripCurve, error) {
-	if !b.Has709 {
-		return sunspec.FreqTripCurve{}, fmt.Errorf("%s: device has no M709 (DERTripLF)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERTripLF)
-	if err != nil {
-		return sunspec.FreqTripCurve{}, fmt.Errorf("%s: read M709: %w", tag, err)
-	}
-	return sunspec.ParseFreqTripCurve(regs, 0, false)
-}
-
-func (b *Base) WriteFreqTripLF(c sunspec.FreqTripCurve, tag string) error {
-	if !b.Has709 {
-		return fmt.Errorf("%s: device has no M709 (DERTripLF)", tag)
-	}
-	return b.writeTripCurve709(sunspec.ModelDERTripLF, c, tag)
-}
-
-func (b *Base) ReadFreqTripHF(tag string) (sunspec.FreqTripCurve, error) {
-	if !b.Has710 {
-		return sunspec.FreqTripCurve{}, fmt.Errorf("%s: device has no M710 (DERTripHF)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERTripHF)
-	if err != nil {
-		return sunspec.FreqTripCurve{}, fmt.Errorf("%s: read M710: %w", tag, err)
-	}
-	return sunspec.ParseFreqTripCurve(regs, 0, false)
-}
-
-func (b *Base) WriteFreqTripHF(c sunspec.FreqTripCurve, tag string) error {
-	if !b.Has710 {
-		return fmt.Errorf("%s: device has no M710 (DERTripHF)", tag)
-	}
-	return b.writeTripCurve709(sunspec.ModelDERTripHF, c, tag)
-}
-
-func (b *Base) writeTripCurve709(modelID uint16, c sunspec.FreqTripCurve, tag string) error {
-	regs, err := b.Reader.ReadModel(modelID)
-	if err != nil {
-		return fmt.Errorf("%s: read model %d: %w", tag, modelID, err)
-	}
-	start, end, err := sunspec.EncodeFreqTripCurve(regs, c, false)
-	if err != nil {
-		return err
-	}
-	if err := b.Reader.WriteModel(modelID, uint16(start), regs[start:end]); err != nil {
-		return fmt.Errorf("%s: write model %d: %w", tag, modelID, err)
-	}
-	return b.Reader.WriteModel(modelID, sunspec.M709_AdptCrvReq, []uint16{1})
-}
-
-// ── Frequency droop (M711) ───────────────────────────────────────────────────
-
-func (b *Base) ReadFreqDroop(tag string) (sunspec.FreqDroopCtl, error) {
-	if !b.Has711 {
-		return sunspec.FreqDroopCtl{}, fmt.Errorf("%s: device has no M711 (DERFreqDroop)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERFreqDroop)
-	if err != nil {
-		return sunspec.FreqDroopCtl{}, fmt.Errorf("%s: read M711: %w", tag, err)
-	}
-	return sunspec.ParseFreqDroop(regs, 0)
-}
-
-func (b *Base) WriteFreqDroop(c sunspec.FreqDroopCtl, tag string) error {
-	if !b.Has711 {
-		return fmt.Errorf("%s: device has no M711 (DERFreqDroop)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERFreqDroop)
-	if err != nil {
-		return fmt.Errorf("%s: read M711: %w", tag, err)
-	}
-	start, end, err := sunspec.EncodeFreqDroop(regs, c)
-	if err != nil {
-		return err
-	}
-	if err := b.Reader.WriteModel(sunspec.ModelDERFreqDroop, uint16(start), regs[start:end]); err != nil {
-		return fmt.Errorf("%s: write M711: %w", tag, err)
-	}
-	return b.Reader.WriteModel(sunspec.ModelDERFreqDroop, sunspec.M711_AdptCtlReq, []uint16{1})
-}
-
-// ── Watt-Var (M712) ──────────────────────────────────────────────────────────
-
-func (b *Base) ReadWattVar(tag string) (sunspec.WattVarCurve, error) {
-	if !b.Has712 {
-		return sunspec.WattVarCurve{}, fmt.Errorf("%s: device has no M712 (DERWattVar)", tag)
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERWattVar)
-	if err != nil {
-		return sunspec.WattVarCurve{}, fmt.Errorf("%s: read M712: %w", tag, err)
-	}
-	return sunspec.ParseWattVarCurve(regs, 0)
-}
-
-func (b *Base) WriteWattVar(c sunspec.WattVarCurve, tag string) error {
-	if !b.Has712 {
-		return fmt.Errorf("%s: device has no M712 (DERWattVar)", tag)
-	}
-	if len(c.Pts) != 6 {
-		return fmt.Errorf("%s: WattVar curve must have 6 points per IEEE 1547-2018 (got %d)", tag, len(c.Pts))
-	}
-	regs, err := b.Reader.ReadModel(sunspec.ModelDERWattVar)
-	if err != nil {
-		return fmt.Errorf("%s: read M712: %w", tag, err)
-	}
-	start, end, err := sunspec.EncodeWattVarCurve(regs, c)
-	if err != nil {
-		return err
-	}
-	if err := b.Reader.WriteModel(sunspec.ModelDERWattVar, uint16(start), regs[start:end]); err != nil {
-		return fmt.Errorf("%s: write M712: %w", tag, err)
-	}
-	return b.Reader.WriteModel(sunspec.ModelDERWattVar, sunspec.M712_AdptCrvReq, []uint16{1})
-}
+// ── M705-M712 curve models, ReadDERCapacity ─────────────────────────────────
+//
+// The old bench fork exposed Read/Write pairs for M702 (DERCapacity), M705
+// (VoltVar), M706 (VoltWatt), M707/M708 (voltage trip), M709/M710 (freq trip),
+// M711 (freq droop), and M712 (WattVar). None had a caller outside their own
+// pass-through wrappers in battery.go/inverter.go, and none had test coverage.
+// They are removed here rather than re-implemented: the shared codec's curve
+// write workflow is a genuinely different handshake (staged index + write +
+// AdptCrvReq=2 + poll AdptCrvRslt + Ena=1, vs this fork's single write +
+// AdptCrvReq=1, no poll/enable — disposition doc §2c S3), so a faithful port
+// is new protocol logic, not a mechanical rename. Leftover-fork disposal
+// (driver forks, bench derbase) is TASK-082.
 
 // ── Legacy M123 helpers ──────────────────────────────────────────────────────
 
@@ -725,11 +435,7 @@ func ReadWMaxFrom702(r *sunspec.Reader) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(regs) <= sunspec.M702_W_SF {
-		return 0, fmt.Errorf("sunspec: Model 702 too short for W_SF")
-	}
-	sf := int16(regs[sunspec.M702_W_SF])
-	wmax := sunspec.ApplyScaleUint(regs[sunspec.M702_WMaxRtg], sf)
+	wmax := sunspec.Parse702(regs).WMaxRtg
 	if wmax <= 0 || math.IsNaN(wmax) {
 		return 0, fmt.Errorf("sunspec: Model 702 WMaxRtg is %g (invalid)", wmax)
 	}

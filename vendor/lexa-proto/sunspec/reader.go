@@ -3,7 +3,7 @@ package sunspec
 import (
 	"fmt"
 
-	"csip-tls-test/internal/southbound/modbus"
+	"lexa-proto/modbus"
 )
 
 // Reader provides typed access to SunSpec model registers on a device.

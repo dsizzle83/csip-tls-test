@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 	modbuslib "github.com/simonvetter/modbus"
 )
 

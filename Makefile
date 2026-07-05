@@ -230,7 +230,7 @@ test: $(CA_CERT) test-fast test-integration
 # Fast unit tests across both packages — pure-Go logic only.
 # Pulls cgo for compilation but does no TLS handshakes.
 test-fast:
-	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/southbound/sunspec/
+	go test ./sim/tlsserver/ ./internal/tlsclient/
 
 # Hostile-QA deterministic-regression gate (Phase 5): fault-injector + diagnoser
 # unit tests, no bench. Add the live mayhem suite with: make qa-bench.

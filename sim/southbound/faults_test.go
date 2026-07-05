@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/sunspec"
 )
 
 // TestFaultRampLimit_SlewsTowardCommand verifies the effect-time ramp_limit

@@ -3,7 +3,7 @@ package sunspec
 import (
 	"fmt"
 
-	"csip-tls-test/internal/southbound/modbus"
+	"lexa-proto/modbus"
 )
 
 // Block describes a single SunSpec model block discovered on a device.

@@ -31,8 +31,8 @@ import (
 	"strings"
 	"time"
 
-	"csip-tls-test/internal/southbound/modbus"
-	"csip-tls-test/internal/southbound/sunspec"
+	"lexa-proto/modbus"
+	"lexa-proto/sunspec"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -304,17 +304,12 @@ func checkMEAS001(r *Reporter, reader *sunspec.Reader, measModel uint16) float64
 
 	var w float64
 	if measModel == sunspec.ModelDERMeasureAC {
-		if len(regs) <= sunspec.M701_W_SF {
-			r.fail("M701 too short for W")
+		w = sunspec.Parse701(regs).W
+		if math.IsNaN(w) {
+			r.fail("W register is not-implemented (0x8000) or model too short")
 			r.result(false)
 			return math.NaN()
 		}
-		if isNaN(regs[sunspec.M701_W]) {
-			r.fail("W register is not-implemented (0x8000)")
-			r.result(false)
-			return math.NaN()
-		}
-		w = sunspec.ApplyScaleSigned(regs[sunspec.M701_W], int16(regs[sunspec.M701_W_SF]))
 	} else {
 		if len(regs) <= sunspec.M103_W_SF {
 			r.fail("measurement model too short for W")
@@ -353,16 +348,11 @@ func checkMEAS002(r *Reporter, reader *sunspec.Reader, measModel uint16) {
 
 	var v float64
 	if measModel == sunspec.ModelDERMeasureAC {
-		if len(regs) <= sunspec.M701_V_SF {
-			r.fail("M701 too short for V")
-			r.result(false)
-			return
+		m := sunspec.Parse701(regs)
+		v = m.VL1
+		if math.IsNaN(v) {
+			v = m.LNV
 		}
-		vReg := regs[sunspec.M701_VL1]
-		if isNaN(vReg) {
-			vReg = regs[sunspec.M701_LNV]
-		}
-		v = sunspec.ApplyScaleUint(vReg, int16(regs[sunspec.M701_V_SF]))
 	} else {
 		if len(regs) <= sunspec.M103_V_SF {
 			r.fail("model too short for V")
@@ -400,12 +390,7 @@ func checkMEAS003(r *Reporter, reader *sunspec.Reader, measModel uint16) {
 
 	var hz float64
 	if measModel == sunspec.ModelDERMeasureAC {
-		if len(regs) <= sunspec.M701_Hz_SF {
-			r.fail("M701 too short for Hz")
-			r.result(false)
-			return
-		}
-		hz = sunspec.ApplyScaleUint(regs[sunspec.M701_Hz], int16(regs[sunspec.M701_Hz_SF]))
+		hz = sunspec.Parse701(regs).Hz
 	} else {
 		if len(regs) <= sunspec.M103_Hz_SF {
 			r.fail("model too short for Hz")
@@ -443,12 +428,7 @@ func checkMEAS004(r *Reporter, reader *sunspec.Reader, measModel uint16, watt fl
 
 	var va float64
 	if measModel == sunspec.ModelDERMeasureAC {
-		if len(regs) <= sunspec.M701_VA_SF {
-			r.warn("M701 VA registers absent — optional field, skipping")
-			r.result(true)
-			return
-		}
-		va = sunspec.ApplyScaleSigned(regs[sunspec.M701_VA], int16(regs[sunspec.M701_VA_SF]))
+		va = sunspec.Parse701(regs).VA
 	} else {
 		if len(regs) <= sunspec.M103_VA_SF {
 			r.warn("model VA registers absent — optional field, skipping")
@@ -486,12 +466,7 @@ func checkMEAS005(r *Reporter, reader *sunspec.Reader, measModel uint16) {
 
 	var vr float64
 	if measModel == sunspec.ModelDERMeasureAC {
-		if len(regs) <= sunspec.M701_Var_SF {
-			r.warn("M701 VAr absent — optional, skipping")
-			r.result(true)
-			return
-		}
-		vr = sunspec.ApplyScaleSigned(regs[sunspec.M701_Var], int16(regs[sunspec.M701_Var_SF]))
+		vr = sunspec.Parse701(regs).Var
 	} else {
 		if len(regs) <= sunspec.M103_VAr_SF {
 			r.warn("model VAr absent — optional, skipping")
@@ -524,12 +499,9 @@ func checkMEAS006(r *Reporter, reader *sunspec.Reader, measModel uint16) {
 
 	var pf float64
 	if measModel == sunspec.ModelDERMeasureAC {
-		if len(regs) <= sunspec.M701_PF_SF {
-			r.warn("M701 PF absent — optional, skipping")
-			r.result(true)
-			return
-		}
-		pf = sunspec.ApplyScaleSigned(regs[sunspec.M701_PF], int16(regs[sunspec.M701_PF_SF])) / 100.0
+		// M701.PF carries its own PF_SF (no legacy ×100 convention) — see
+		// docs/refactor/notes/TASK-020-sunspec-disposition.md §2c S1.
+		pf = sunspec.Parse701(regs).PF
 	} else {
 		if len(regs) <= sunspec.M103_PF_SF {
 			r.warn("model PF absent — optional, skipping")
@@ -567,12 +539,7 @@ func checkNAME001(r *Reporter, reader *sunspec.Reader, nameplateModel uint16) fl
 
 	var wmax float64
 	if nameplateModel == sunspec.ModelDERCapacity {
-		if len(regs) <= sunspec.M702_W_SF {
-			r.fail("M702 too short for WMaxRtg")
-			r.result(false)
-			return math.NaN()
-		}
-		wmax = sunspec.ApplyScaleUint(regs[sunspec.M702_WMaxRtg], int16(regs[sunspec.M702_W_SF]))
+		wmax = sunspec.Parse702(regs).WMaxRtg
 	} else {
 		if len(regs) <= sunspec.M121_WMax_SF {
 			r.fail("M121 too short for WMax")
@@ -631,52 +598,75 @@ func checkCTRL001(r *Reporter, reader *sunspec.Reader, ctrlModel uint16, wmax fl
 		return
 	}
 
-	var sfOffset uint16
-	var pctOffset uint16
-	if ctrlModel == sunspec.ModelImmediateCtrl {
-		sfOffset = uint16(sunspec.M123_WMaxLimPct_SF)
-		pctOffset = uint16(sunspec.M123_WMaxLimPct)
-	} else {
-		// M704: WMaxLimPct at offset 8, SF at offset 11.
-		sfOffset = uint16(sunspec.M704_WMaxLimPct_SF)
-		pctOffset = uint16(sunspec.M704_WMaxLimPct)
-	}
-
-	if int(sfOffset) >= len(regs) {
-		r.fail("controls model too short for WMaxLimPct_SF")
-		r.result(false)
-		return
-	}
-	sf := int16(regs[sfOffset])
-
-	// Write 50.00 % as a raw value.
 	target := 50.0
-	raw := sunspec.RawFromScaleUint(target, sf)
-	if err := reader.WriteModel(ctrlModel, pctOffset, []uint16{raw}); err != nil {
-		r.fail("write WMaxLimPct = 50%%: %v", err)
-		r.result(false)
-		return
-	}
-	r.detail("wrote raw %d (50%% with sf=%d)", raw, sf)
 
-	// Read back.
-	regs2, err := reader.ReadModel(ctrlModel)
-	if err != nil {
-		r.fail("read-back controls model: %v", err)
-		r.result(false)
-		return
-	}
-	got := sunspec.ApplyScaleUint(regs2[pctOffset], sf)
-	if math.Abs(got-target) > 1.0 {
-		r.fail("read-back WMaxLimPct = %.2f %%, wrote 50.00 %% (delta %.2f > 1.0)", got, math.Abs(got-target))
-		r.result(false)
-		return
-	}
-	r.pass("WMaxLimPct written 50.00%%, read back %.2f%% (delta %.2f)", got, math.Abs(got-target))
+	if ctrlModel == sunspec.ModelImmediateCtrl {
+		// M123 (legacy): raw-offset access — constants byte-identical to the
+		// shared codec (disposition doc §2a).
+		sfOffset := uint16(sunspec.M123_WMaxLimPct_SF)
+		pctOffset := uint16(sunspec.M123_WMaxLimPct)
+		if int(sfOffset) >= len(regs) {
+			r.fail("M123 too short for WMaxLimPct_SF")
+			r.result(false)
+			return
+		}
+		sf := int16(regs[sfOffset])
 
-	// Restore to 100 %.
-	raw100 := sunspec.RawFromScaleUint(100.0, sf)
-	_ = reader.WriteModel(ctrlModel, pctOffset, []uint16{raw100})
+		raw := sunspec.RawFromScaleUint(target, sf)
+		if err := reader.WriteModel(ctrlModel, pctOffset, []uint16{raw}); err != nil {
+			r.fail("write WMaxLimPct = 50%%: %v", err)
+			r.result(false)
+			return
+		}
+		r.detail("wrote raw %d (50%% with sf=%d)", raw, sf)
+
+		regs2, err := reader.ReadModel(ctrlModel)
+		if err != nil {
+			r.fail("read-back controls model: %v", err)
+			r.result(false)
+			return
+		}
+		got := sunspec.ApplyScaleUint(regs2[pctOffset], sf)
+		if math.Abs(got-target) > 1.0 {
+			r.fail("read-back WMaxLimPct = %.2f %%, wrote 50.00 %% (delta %.2f > 1.0)", got, math.Abs(got-target))
+			r.result(false)
+			return
+		}
+		r.pass("WMaxLimPct written 50.00%%, read back %.2f%% (delta %.2f)", got, math.Abs(got-target))
+
+		raw100 := sunspec.RawFromScaleUint(100.0, sf)
+		_ = reader.WriteModel(ctrlModel, pctOffset, []uint16{raw100})
+	} else {
+		// M704 (IEEE 1547-2018): named-field access via the shared layout
+		// engine — no raw offset constants exist in this generation.
+		off := uint16(sunspec.L704.Offset("WMaxLimPct"))
+		v := sunspec.L704.View(regs)
+		v.SetFloat("WMaxLimPct", target)
+		if err := reader.WriteModel(ctrlModel, off, []uint16{regs[off]}); err != nil {
+			r.fail("write WMaxLimPct = 50%%: %v", err)
+			r.result(false)
+			return
+		}
+		r.detail("wrote WMaxLimPct=50%% via M704 layout engine (offset %d)", off)
+
+		regs2, err := reader.ReadModel(ctrlModel)
+		if err != nil {
+			r.fail("read-back controls model: %v", err)
+			r.result(false)
+			return
+		}
+		got := sunspec.L704.View(regs2).Float("WMaxLimPct")
+		if math.IsNaN(got) || math.Abs(got-target) > 1.0 {
+			r.fail("read-back WMaxLimPct = %.2f %%, wrote 50.00 %% (delta %.2f > 1.0)", got, math.Abs(got-target))
+			r.result(false)
+			return
+		}
+		r.pass("WMaxLimPct written 50.00%%, read back %.2f%% (delta %.2f)", got, math.Abs(got-target))
+
+		v2 := sunspec.L704.View(regs2)
+		v2.SetFloat("WMaxLimPct", 100.0)
+		_ = reader.WriteModel(ctrlModel, off, []uint16{regs2[off]})
+	}
 
 	r.result(true)
 }
@@ -696,7 +686,9 @@ func checkCTRL002(r *Reporter, reader *sunspec.Reader, ctrlModel uint16) {
 	if ctrlModel == sunspec.ModelImmediateCtrl {
 		enaOffset = uint16(sunspec.M123_WMaxLimPct_Ena)
 	} else {
-		enaOffset = uint16(sunspec.M704_WMaxLimPctEna)
+		// M704 (IEEE 1547-2018): named-field offset lookup — the enum's raw
+		// register value is the enable flag directly (no scale factor).
+		enaOffset = uint16(sunspec.L704.Offset("WMaxLimPctEna"))
 	}
 
 	// Disable.
@@ -785,12 +777,7 @@ func checkSTAT001(r *Reporter, reader *sunspec.Reader, measModel uint16) {
 	}
 
 	if measModel == sunspec.ModelDERMeasureAC {
-		if len(regs) <= sunspec.M701_St {
-			r.fail("M701 too short for St")
-			r.result(false)
-			return
-		}
-		st := regs[sunspec.M701_St]
+		st := sunspec.Parse701(regs).St
 		if st > 7 {
 			r.fail("M701.St = %d outside range 0–7", st)
 			r.result(false)
@@ -852,12 +839,7 @@ func checkSTAT002(r *Reporter, reader *sunspec.Reader, measModel uint16) {
 			r.result(false)
 			return
 		}
-		if len(regs) <= sunspec.M701_ConnSt {
-			r.fail("M701 too short for ConnSt")
-			r.result(false)
-			return
-		}
-		conn := regs[sunspec.M701_ConnSt]
+		conn := sunspec.Parse701(regs).ConnSt
 		if conn != 1 {
 			r.fail("M701.ConnSt = %d (want 1)", conn)
 			r.result(false)
@@ -886,9 +868,9 @@ func checkBAT001(r *Reporter, reader *sunspec.Reader) {
 			r.result(false)
 			return
 		}
-		if len(regs) > sunspec.M713_SoC {
-			soc := sunspec.ApplyScaleUint(regs[sunspec.M713_SoC], int16(regs[sunspec.M713_SoC_SF]))
-			if soc < 0 || soc > 100 || math.IsNaN(soc) {
+		soc := sunspec.Parse713(regs).SoC
+		if !math.IsNaN(soc) {
+			if soc < 0 || soc > 100 {
 				r.fail("M713.SoC = %.1f %% outside range 0–100", soc)
 				r.result(false)
 				return
@@ -933,18 +915,16 @@ func checkBAT002(r *Reporter, reader *sunspec.Reader) {
 
 	if reader.HasModel(sunspec.ModelDERStorageCap) {
 		regs, _ := reader.ReadModel(sunspec.ModelDERStorageCap)
-		if len(regs) > sunspec.M713_SoH {
-			soh := sunspec.ApplyScaleUint(regs[sunspec.M713_SoH], int16(regs[sunspec.M713_SoH_SF]))
-			if !math.IsNaN(soh) {
-				if soh < 0 || soh > 100 {
-					r.fail("M713.SoH = %.1f %% outside range 0–100", soh)
-					r.result(false)
-					return
-				}
-				r.pass("M713.SoH = %.1f %%", soh)
-				r.result(true)
+		soh := sunspec.Parse713(regs).SoH
+		if !math.IsNaN(soh) {
+			if soh < 0 || soh > 100 {
+				r.fail("M713.SoH = %.1f %% outside range 0–100", soh)
+				r.result(false)
 				return
 			}
+			r.pass("M713.SoH = %.1f %%", soh)
+			r.result(true)
+			return
 		}
 	}
 	if reader.HasModel(sunspec.ModelLithiumBattery) {
@@ -974,13 +954,11 @@ func checkBAT003(r *Reporter, reader *sunspec.Reader) {
 
 	if reader.HasModel(sunspec.ModelDERStorageCap) {
 		regs, _ := reader.ReadModel(sunspec.ModelDERStorageCap)
-		if len(regs) > sunspec.M713_WHRtg {
-			cap := sunspec.ApplyScaleUint(regs[sunspec.M713_WHRtg], int16(regs[sunspec.M713_WHRtg_SF]))
-			if !math.IsNaN(cap) && cap > 0 {
-				r.pass("M713.WHRtg = %.0f Wh", cap)
-				r.result(true)
-				return
-			}
+		cap := sunspec.Parse713(regs).WHRtg
+		if !math.IsNaN(cap) && cap > 0 {
+			r.pass("M713.WHRtg = %.0f Wh", cap)
+			r.result(true)
+			return
 		}
 	}
 	if reader.HasModel(sunspec.ModelLithiumBattery) {

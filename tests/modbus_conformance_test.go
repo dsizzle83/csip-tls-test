@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"csip-tls-test/internal/southbound/modbus"
-	"csip-tls-test/internal/southbound/sunspec"
 	sim "csip-tls-test/sim/southbound"
+	"lexa-proto/modbus"
+	"lexa-proto/sunspec"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,7 +258,7 @@ func TestModbusConformance_MEAS001_ActivePower(t *testing.T) {
 	}
 	var w float64
 	if mID == sunspec.ModelDERMeasureAC {
-		w = sunspec.ApplyScaleSigned(regs[sunspec.M701_W], int16(regs[sunspec.M701_W_SF]))
+		w = sunspec.Parse701(regs).W
 	} else {
 		w = sunspec.ApplyScaleSigned(regs[sunspec.M103_W], int16(regs[sunspec.M103_W_SF]))
 	}
@@ -278,11 +278,11 @@ func TestModbusConformance_MEAS002_Voltage(t *testing.T) {
 
 	var v float64
 	if mID == sunspec.ModelDERMeasureAC {
-		vReg := regs[sunspec.M701_VL1]
-		if vReg == 0x8000 {
-			vReg = regs[sunspec.M701_LNV]
+		m := sunspec.Parse701(regs)
+		v = m.VL1
+		if math.IsNaN(v) {
+			v = m.LNV
 		}
-		v = sunspec.ApplyScaleUint(vReg, int16(regs[sunspec.M701_V_SF]))
 	} else {
 		v = sunspec.ApplyScaleUint(regs[sunspec.M103_PhVphA], int16(regs[sunspec.M103_V_SF]))
 	}
@@ -302,7 +302,7 @@ func TestModbusConformance_MEAS003_Frequency(t *testing.T) {
 
 	var hz float64
 	if mID == sunspec.ModelDERMeasureAC {
-		hz = sunspec.ApplyScaleUint(regs[sunspec.M701_Hz], int16(regs[sunspec.M701_Hz_SF]))
+		hz = sunspec.Parse701(regs).Hz
 	} else {
 		hz = sunspec.ApplyScaleUint(regs[sunspec.M103_Hz], int16(regs[sunspec.M103_Hz_SF]))
 	}
@@ -322,7 +322,7 @@ func TestModbusConformance_MEAS004_ApparentPower(t *testing.T) {
 
 	var va float64
 	if mID == sunspec.ModelDERMeasureAC {
-		va = sunspec.ApplyScaleSigned(regs[sunspec.M701_VA], int16(regs[sunspec.M701_VA_SF]))
+		va = sunspec.Parse701(regs).VA
 	} else {
 		va = sunspec.ApplyScaleSigned(regs[sunspec.M103_VA], int16(regs[sunspec.M103_VA_SF]))
 	}
@@ -342,7 +342,7 @@ func TestModbusConformance_MEAS005_ReactivePower(t *testing.T) {
 
 	var vr float64
 	if mID == sunspec.ModelDERMeasureAC {
-		vr = sunspec.ApplyScaleSigned(regs[sunspec.M701_Var], int16(regs[sunspec.M701_Var_SF]))
+		vr = sunspec.Parse701(regs).Var
 	} else {
 		vr = sunspec.ApplyScaleSigned(regs[sunspec.M103_VAr], int16(regs[sunspec.M103_VAr_SF]))
 	}
@@ -362,7 +362,9 @@ func TestModbusConformance_MEAS006_PowerFactor(t *testing.T) {
 
 	var pf float64
 	if mID == sunspec.ModelDERMeasureAC {
-		pf = sunspec.ApplyScaleSigned(regs[sunspec.M701_PF], int16(regs[sunspec.M701_PF_SF])) / 100.0
+		// M701.PF carries its own PF_SF (no legacy ×100 convention) — see
+		// docs/refactor/notes/TASK-020-sunspec-disposition.md §2c S1.
+		pf = sunspec.Parse701(regs).PF
 	} else {
 		pf = sunspec.ApplyScaleSigned(regs[sunspec.M103_PF], int16(regs[sunspec.M103_PF_SF])) / 100.0
 	}
@@ -388,7 +390,7 @@ func TestModbusConformance_NAME001_WMax(t *testing.T) {
 	var wmax float64
 	if env.reader.HasModel(sunspec.ModelDERCapacity) {
 		regs, _ := env.reader.ReadModel(sunspec.ModelDERCapacity)
-		wmax = sunspec.ApplyScaleUint(regs[sunspec.M702_WMaxRtg], int16(regs[sunspec.M702_W_SF]))
+		wmax = sunspec.Parse702(regs).WMaxRtg
 	} else if env.reader.HasModel(sunspec.ModelBasicSettings) {
 		regs, _ := env.reader.ReadModel(sunspec.ModelBasicSettings)
 		wmax = sunspec.ApplyScaleUint(regs[sunspec.M121_WMax], int16(regs[sunspec.M121_WMax_SF]))
@@ -499,7 +501,7 @@ func TestModbusConformance_STAT001_OperatingState(t *testing.T) {
 	regs, _ := env.reader.ReadModel(mID)
 
 	if mID == sunspec.ModelDERMeasureAC {
-		st := regs[sunspec.M701_St]
+		st := sunspec.Parse701(regs).St
 		if st > 7 {
 			t.Errorf("STAT-001: M701.St = %d outside range 0–7", st)
 			return
@@ -541,7 +543,7 @@ func TestModbusConformance_BAT001_SoC(t *testing.T) {
 	var soc float64
 	if env.reader.HasModel(sunspec.ModelDERStorageCap) {
 		regs, _ := env.reader.ReadModel(sunspec.ModelDERStorageCap)
-		soc = sunspec.ApplyScaleUint(regs[sunspec.M713_SoC], int16(regs[sunspec.M713_SoC_SF]))
+		soc = sunspec.Parse713(regs).SoC
 	} else if env.reader.HasModel(sunspec.ModelLithiumBattery) {
 		regs, _ := env.reader.ReadModel(sunspec.ModelLithiumBattery)
 		soc = sunspec.ApplyScaleUint(regs[sunspec.M802_SoC], int16(regs[sunspec.M802_SoC_SF]))
@@ -564,7 +566,7 @@ func TestModbusConformance_BAT002_SoH(t *testing.T) {
 	found := false
 	if env.reader.HasModel(sunspec.ModelDERStorageCap) {
 		regs, _ := env.reader.ReadModel(sunspec.ModelDERStorageCap)
-		v := sunspec.ApplyScaleUint(regs[sunspec.M713_SoH], int16(regs[sunspec.M713_SoH_SF]))
+		v := sunspec.Parse713(regs).SoH
 		if !math.IsNaN(v) {
 			soh = v
 			found = true
@@ -597,7 +599,7 @@ func TestModbusConformance_BAT003_Capacity(t *testing.T) {
 	found := false
 	if env.reader.HasModel(sunspec.ModelDERStorageCap) {
 		regs, _ := env.reader.ReadModel(sunspec.ModelDERStorageCap)
-		v := sunspec.ApplyScaleUint(regs[sunspec.M713_WHRtg], int16(regs[sunspec.M713_WHRtg_SF]))
+		v := sunspec.Parse713(regs).WHRtg
 		if !math.IsNaN(v) && v > 0 {
 			cap = v
 			found = true
