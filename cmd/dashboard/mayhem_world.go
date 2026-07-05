@@ -26,6 +26,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -102,6 +103,25 @@ func (d *mayhemDriver) hubSSH(command string) error {
 		return fmt.Errorf("ssh %s %q: %v (%s)", target, command, err, out)
 	}
 	return nil
+}
+
+// hubSSHOutput is hubSSH for a caller that needs stdout back (e.g. reading
+// the hub's configured MQTT client ID, TASK-049) rather than only a
+// fire-and-check-exit-status result. Same BatchMode/timeout contract.
+func (d *mayhemDriver) hubSSHOutput(command string) (string, error) {
+	target, err := d.hubSSHTarget()
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.Command("ssh",
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=4",
+		target, command)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("ssh %s %q: %v", target, command, err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // diagnoseSurvival adapts diagnoseMalform's verdict ladder — survive, hold the
@@ -193,6 +213,53 @@ func diagnoseMeterInversion(sc *mayScenario, cons *activeConstraint, s []maySamp
 	}
 	return f
 }
+
+// ── Disk-full ballast (TASK-050) ─────────────────────────────────────────────
+//
+// A fallocate'd file fills the hub Pi's /var/lib partition (mosquitto
+// persistence + journald + the TASK-039/040 event journal typically share the
+// root partition there) to near-full, deterministically and instantly — no
+// dd write churn, which would needlessly wear the SD card (RSK-14) just to
+// test what happens when it fills. The ballast is the single most dangerous
+// artifact in the suite: it is sized with a hard floor so a bad size never
+// bricks the node, and every path (normal finish, abort, a scenario error)
+// must remove it — see disk-full's teardown and the run() always-teardown
+// property this scenario depends on (verified in mayhem.go: teardown runs
+// unconditionally after holdAndSample returns, whether that return was a
+// clean finish or a ctx-cancelled abort).
+const (
+	ballastPath = "/var/lib/mayhem-ballast.bin"
+	ballastDir  = "/var/lib" // partition fillDisk sizes against (mosquitto/journald's typical home there)
+
+	// diskFloorKiB is the minimum free space (1K blocks, df's default unit)
+	// fillDisk requires before it will act at all — a partition already this
+	// tight fails safe to INCONCLUSIVE rather than risk a bricked node.
+	diskFloorKiB = 61440 // 60 MiB
+	// diskReserveKiB is always left free after filling, so sshd/journald/
+	// teardown itself can still run without physical access to the Pi.
+	diskReserveKiB = 20480 // 20 MiB
+)
+
+// fillDiskCommand builds the single SSH command fillDisk runs: read free
+// space, refuse (exit non-zero) if it's below diskFloorKiB, else fallocate
+// everything past diskReserveKiB. Extracted as a pure string builder so the
+// size math and floor guard are unit-testable without SSH.
+func fillDiskCommand() string {
+	return fmt.Sprintf(
+		`set -e; avail=$(df --output=avail %s | tail -1); `+
+			`if [ "$avail" -lt %d ]; then echo "insufficient free space (${avail} KiB, need >= %d KiB)" >&2; exit 1; fi; `+
+			`size=$((avail - %d)); sudo fallocate -l ${size}K %s`,
+		ballastDir, diskFloorKiB, diskFloorKiB, diskReserveKiB, ballastPath)
+}
+
+// fillDisk fills the hub Pi's ballastDir partition to near-full. Safe to call
+// repeatedly (a re-run against an already-full disk just refuses again, since
+// avail will already be under the floor).
+func (d *mayhemDriver) fillDisk() error { return d.hubSSH(fillDiskCommand()) }
+
+// freeDisk removes the ballast file. Idempotent (`rm -f`) — always safe to
+// call, including when no ballast exists.
+func (d *mayhemDriver) freeDisk() error { return d.hubSSH(`sudo rm -f ` + ballastPath) }
 
 // worldScenarios is appended to the curated suite by scenarios().
 func (d *mayhemDriver) worldScenarios() []*mayScenario {
@@ -463,6 +530,64 @@ func (d *mayhemDriver) worldScenarios() []*mayScenario {
 			},
 			evaluate: diagnoseSurvival("the hub restart"), // survivability (bounded /status gap) + the cap must hold
 			teardown: func(d *mayhemDriver) {},
+		},
+		{
+			ID: "disk-full", Name: "Hub Pi's storage partition fills mid-cap",
+			Category:   "Persistence (INV-EXPORT survivability)",
+			Hypothesis: "The hub Pi's storage partition fills — log growth, journal growth, a runaway process — while a zero-export cap is active. mosquitto's autosave can't persist, journald stalls/drops, and the event journal (TASK-039/040) starts hitting ENOSPC on every Append.",
+			Expected:   "Keep enforcing the cap (the control is held in RAM and on an already-connected broker session — persistence failing is not the same as control failing), surface the condition rather than silently ignore it, and recover cleanly with no wedge once space returns.",
+			HoldS:      80,
+			Fix:        "TASK-039/040's ENOSPC handling (edge-logged, counted, returns an error, never panics — AD-011) is the product-side mitigation; a lost cap or a wedge here means some write path downstream of the journal blocks unboundedly on ENOSPC instead of failing fast.",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				// SSH probe first: without bench SSH neither the fill nor the
+				// teardown removal can run, and INCONCLUSIVE beats risking a
+				// ballast nobody can clean up.
+				if err := d.hubSSH("true"); err != nil {
+					return nil, fmt.Errorf("hub SSH unavailable (need key auth to the hub Pi): %w", err)
+				}
+				return armExportCap(d, 80, "mayhem: cap under a full disk")
+			},
+			perTick: func(d *mayhemDriver, i int) {
+				d.injectEnv(d.pvHighW, loadLow)
+				switch i {
+				case 15: // cap adopted and settled; now the partition fills
+					go func() {
+						if err := d.fillDisk(); err != nil {
+							log.Printf("mayhem: disk-full: fillDisk: %v", err)
+						}
+					}()
+				case 45: // ~30s full; space returns, recovery window follows
+					go func() {
+						if err := d.freeDisk(); err != nil {
+							log.Printf("mayhem: disk-full: freeDisk: %v", err)
+						}
+					}()
+				}
+			},
+			// diagnoseSurvival: cap must hold through the fault; a bounded
+			// transient is acceptable, a sustained unseat is not. The hub's own
+			// journald timestamps are not trustworthy here (the point of the
+			// fault is that journald itself may be stalling) — survival is
+			// judged from ground truth (sims) + /status, per diagnoseSurvival's
+			// existing contract.
+			evaluate: diagnoseSurvival("the full disk"),
+			teardown: func(d *mayhemDriver) {
+				// The ballast is the most dangerous artifact in the suite:
+				// teardown ALWAYS removes it, on a clean finish or an abort —
+				// run() calls scenario teardown unconditionally after the hold
+				// phase returns, even when ctx was cancelled mid-hold. The one
+				// gap this cannot cover is the dashboard process itself
+				// crashing mid-run, which skips teardown entirely; recovery
+				// then requires a manual
+				// `ssh dmitri@69.0.0.1 sudo rm -f /var/lib/mayhem-ballast.bin`.
+				if err := d.freeDisk(); err != nil {
+					log.Printf("mayhem: disk-full: teardown freeDisk FAILED — manual cleanup needed (ssh dmitri@69.0.0.1 sudo rm -f %s): %v", ballastPath, err)
+				}
+				// Let the broker/journal settle before the next scenario runs,
+				// so a persistence-family neighbor doesn't inherit a
+				// still-draining store.
+				time.Sleep(2 * time.Second)
+			},
 		},
 	}
 }
