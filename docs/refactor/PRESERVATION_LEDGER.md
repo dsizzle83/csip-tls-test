@@ -195,3 +195,51 @@ PASS or accepted-DEGRADED `cannot_comply=True`); full 51-scenario FAST campaign
 **33P/18D/0F/0B**, within the 34P/17D band (sole P→D drift = the task-pinned
 accepted-DEGRADED `export-cap-full-battery`). SAFETY held everywhere. Bench left
 FAST + battery-active. Rollback rehearsed (config `shadow` + restart).
+
+## TASK-029/030 — solar + EVSE flip to `reconciler-active` (2026-07-05)
+
+L1–L4 **solar-scope** and **L7** flipped `legacy-active → reconciler-active
+(solar)`; **L11** noted **preserved-by-reuse (evse)**; L2 EVSE scope →
+`reconciler-active (evse)`. lexa-hub branch `task/029-030-solar-evse-flip`
+(2cbd894). **Nothing deleted** — legacy solar/EVSE command topics keep publishing
+and being subscribed, ignored on hardware when active (belt and braces; TASK-032
+deletes). ACL extended: hub write + modbus read `lexa/desired/solar/+`, hub write
++ ocpp read `lexa/desired/evse/+` (installed on the Pi + mosquitto reloaded;
+delivery verified by subscription, not publish success).
+
+- **L1/L7 (solar restore is an explicit write).** The hub's
+  `desiredPublishingSolarActuator` maps `SolarCommand.CurtailToW` NaN→
+  `CeilingW=RestoreCeilingW` (never absent); the `solarShell` reconciler writes
+  that ceiling on the cap→clear edge, reproducing `restoreOnGenLimitClear`. The
+  retained, connectivity-independent doc keeps the cap value while the inverter
+  is dark and the reconciler reasserts on reconnect — so the `solarCapActive`
+  dark-inverter gate needs **no publisher equivalent**. Divergence is **one-sided**
+  (over-ceiling only); an inverter under its ceiling at dusk is compliant.
+- **L4 (solar).** `reassertLocked`'s inverter branch is suppressed for an active
+  inverter (`reconciledActive`); the shell's `Reconnected()` reassert plus a
+  restore-ceiling **initial-desired seed** (never-commanded case; seed's startup
+  write dropped — reassertLocked fires on reconnect, not startup) is the SINGLE
+  reasserter. No double-write.
+- **L11 (EVSE) preserved by reuse.** `applyCommand`'s body was refactored into
+  `bridge.Apply(stationID, evseID, limitA)` used byte-identically by the legacy
+  path AND the `evseShell`; rejected-profile-as-error and `implausibleCurrent`
+  gating are unchanged (`meter_validate_test.go` green unmodified). Convergence is
+  judged **one-sided from metered current only** — profile-Accepted is a write
+  success, never convergence. The reconciler adds the reassert-on-reconnect the
+  legacy path lacked (via `SetNewChargingStationHandler`); backoff starts at 15 s
+  (≥ the 10 s per-call bound, no overlapping calls).
+
+**Shadow triage (pre-flip, live):** solar shadow ran clean — 90 under-ceiling
+one-sided `verdict=match`, 13 `diverge:new-desired` all with `would==legacy` on
+each ceiling change (incl. the `CeilingW=1e9` restore edge), 1 `SeqReset` (hub
+restart, AD-013 rule 2), **0 stale-ceiling holds**. EVSE shadow idle until an
+EV session commands current (expected).
+
+**Post-flip gate evidence (solo, 1 cycle):** the two release-edge **oracles**
+PASS — `release-while-rebooting` (solar recovered to full 47 s after the device
+returned) and `curtailment-release` (recovered 24 s after return). No INV-HUNT
+(active applies are backoff-paced, ≤3 identical writes to converge a slow/refusing
+inverter, not a tight loop). Remaining solar-family + 7-EV ×10-solo and the
+10-cycle FAST campaign are the Principal-gated exhaustive validation. Bench left
+FAST + solar-active + evse-active + battery-active. Rollback = config `shadow` +
+restart (rehearsed on the shadow→active transition).

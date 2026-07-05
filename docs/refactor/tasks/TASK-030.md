@@ -1,6 +1,11 @@
 # TASK-030 — Migrate the EVSE to a reconciler in lexa-ocpp (shadow → flip)
 
-*Status: TODO · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: **high***
+*Status: DONE (2026-07-05, lexa-hub 2cbd894) — reconciler built in lexa-ocpp
+(driver reuses applyCommand's L11 rejected-as-error verbatim); shadow-deployed
+then flipped active on the bench. 7-EV-scenario ×10-solo + 10-cycle FAST campaign
+is the remaining Principal-gated exhaustive validation.*
+
+*Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: **high***
 
 ## Objective
 The EVSE runs on the reconciler pattern inside `lexa-ocpp`: the hub publishes retained

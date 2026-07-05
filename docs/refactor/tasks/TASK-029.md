@@ -1,6 +1,12 @@
 # TASK-029 — Migrate solar/inverter to the reconciler (shadow → flip)
 
-*Status: TODO · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: **high***
+*Status: DONE (2026-07-05, lexa-hub 2cbd894) — flipped active on the bench;
+shadow triaged clean (would==legacy on every ceiling change, 90 under-ceiling
+one-sided matches, 0 stale-ceiling holds); both release-edge oracles PASS solo
+post-flip (release-while-rebooting, curtailment-release). Full ×10-solo + 10-cycle
+FAST campaign is the remaining Principal-gated exhaustive validation.*
+
+*Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: **high***
 
 ## Objective
 The inverter class runs on the reconciler: the hub publishes retained
