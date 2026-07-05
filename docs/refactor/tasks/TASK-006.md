@@ -1,6 +1,24 @@
 # TASK-006 — Toolchain/dependency refresh (Go ≥1.22, x/crypto, x/net, paho)
 
-*Status: TODO · Phase: P0 · Effort: L (≈6–8 h focused + campaign wall-clock) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-05, csip-tls-test `c7bd2fc` · lexa-hub `ae4a593`) · Phase: P0 · Effort: L (≈6–8 h focused + campaign wall-clock) · Difficulty: med · Risk: med*
+
+**Completion note (2026-07-05):** Both repos on branch `task/006-dep-refresh`.
+csip-tls-test commits: `34f9cde` (toolchain), `c7bd2fc` (x/*). lexa-hub
+commits: `1983758` (toolchain), `82b387a` (x/*), `7ea23f9` (unrelated
+blocking fix, see below), `ae4a593` (paho). Not pushed/merged — Principal
+Engineer review pending.
+
+**Deviation:** bench validation of commit 2 surfaced a pre-existing bug in
+lexa-hub `scripts/deploy-hub-pi.sh` (from same-day commit `06931cc`,
+unrelated to this task): mosquitto passwd/acl files at `root:root 0600`
+are unreadable by the running `mosquitto:mosquitto`-dropped-privilege
+process on this hub Pi's mosquitto build (2.0.21), verified via `strace`
+(`setgid`/`setuid` happen before the file is ever opened, on every start).
+This broke every `--enable-mqtt-acl` deploy, blocking this task's mandatory
+bench gate. Fixed in lexa-hub `7ea23f9` (reverted to the prior working
+`root:mosquitto 0640`) — out of TASK-006's charter but required to proceed;
+flagged for Principal Engineer review and recommended for cherry-pick to
+main independent of this task's outcome.
 
 ## Objective
 Both repos build on a modern pinned Go toolchain with current `golang.org/x/*` modules;
@@ -133,17 +151,17 @@ mqtt-scenario ×10 solo; two full FAST campaigns (post-commit-2, post-commit-3).
 - wolfSSL version (5.7.6-stable) — out of scope here.
 
 ## Acceptance criteria
-- [ ] Both go.mod: modern `go` directive; x/crypto + x/net at current releases.
-- [ ] lexa-hub paho at target version, in its own commit.
-- [ ] govulncheck: zero non-allowlisted findings; job now required in both repos.
-- [ ] mqtt scenarios ×10 solo: verdicts unchanged. Full FAST campaign ≤ V6 baseline.
-- [ ] `make test-integration` green on the desktop.
+- [x] Both go.mod: modern `go` directive; x/crypto + x/net at current releases.
+- [x] lexa-hub paho at target version, in its own commit.
+- [x] govulncheck: zero non-allowlisted findings; job now required in both repos.
+- [x] mqtt scenarios ×10 solo: verdicts unchanged (0 FAIL/0 BLIND all 10). Full FAST campaign 32P/19D/0F/0B — 0 FAIL/BLIND, within V6/M0 baseline norms.
+- [x] `make test-integration` green on the desktop.
 
 ## Regression checklist
-- [ ] `make test-fast` (csip-tls-test) / `go test -race ./internal/...` (lexa-hub) green
-- [ ] Conformance logic tests green (`go test ./tests/`)
-- [ ] Mayhem: full campaign ×2 (see steps 5, 7) + targeted mqtt set ×10
-- [ ] Bench restored: hub FAST (this is P0 norm), all services `is-active`
+- [x] `make test-fast` (csip-tls-test) / `go test -race ./internal/...` (lexa-hub) green
+- [x] Conformance logic tests green (`go test ./tests/`)
+- [x] Mayhem: full campaign ×2 (see steps 5, 7) + targeted mqtt set ×10
+- [x] Bench restored: hub FAST (this is P0 norm), all services `is-active`
 
 ## Mayhem scenarios affected
 `mqtt-broker-restart`, `mqtt-broker-latency`, `mqtt-stale-retained`,

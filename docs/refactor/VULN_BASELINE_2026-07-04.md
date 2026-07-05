@@ -153,3 +153,82 @@ same paho bump that fixes GO-2025-4173.
   (nothing to disposition), 2 in lexa-hub (both → TASK-006 worklist, not
   allowlisted).
 - [x] This document committed.
+
+---
+
+## Addendum — 2026-07-05 (TASK-006 after-state)
+
+Toolchain/dependency refresh executed as three revertible commits per repo
+(RSK-04 ordering): (1) `go` directive 1.21 → 1.26 in both repos [desktop
+toolchain go1.26.4 bounds it — no bench Pi has a native Go install]; (2)
+`golang.org/x/crypto`/`x/net`/`x/sys`/`x/sync` refresh in both repos
+(x/crypto 2019→v0.53.0, x/net →v0.56.0, x/sys →v0.46.0); (3) lexa-hub-only
+`paho.mqtt.golang` v1.4.3 → v1.5.1, isolated and campaign-gated.
+
+Re-ran `bash scripts/ci/govulncheck.sh` in both repos (same wolfSSL amd64
+sysroot env as the 2026-07-04 baseline and CI):
+
+### csip-tls-test — after commit 2 (x/* refresh)
+
+```
+SBOM module count: 18
+(no reachable findings)
+Informational: 0 additional finding(s)
+```
+
+Called: 0 → 0 (unchanged — nothing was reachable here to begin with).
+Required-only: **47 → 0.** All three modules named in the 2026-07-04
+worklist (x/crypto 25, x/net 21, x/sys 1) are cleared.
+
+### lexa-hub — after commit 2 (x/* refresh, pre-paho)
+
+Re-run confirmed `GO-2025-3503` (x/net, Called-tier) cleared; `GO-2025-4173`
+(paho, Called-tier) still present as expected — commit 3 not yet applied at
+that point.
+
+### lexa-hub — after commit 3 (paho 1.4.3 → 1.5.1)
+
+```
+SBOM module count: 20
+(no reachable findings)
+Informational: 0 additional finding(s)
+```
+
+Called: **2 → 0.** Both `GO-2025-4173` (paho) and `GO-2025-3503` (x/net) are
+cleared. Required-only: **42 → 0** (the same x/crypto/x/net/x/sys/paho
+cluster, all now current).
+
+### Acceptance bar
+
+- [x] Both repos: 0 Called-tier findings (bar met — was 0/2, now 0/0).
+- [x] Both repos: 0 Required-tier findings (bar exceeded — informational
+  tier wasn't a hard gate, but the refresh cleared it to zero anyway).
+- [x] `vulncheck` job flipped from `continue-on-error: true` to required in
+  both `.github/workflows/ci.yml` (the `TODO(TASK-006)` comments removed).
+
+### Mayhem campaign evidence (bench validation, hub FAST, auth ON)
+
+- Post-commit-2 (toolchain + x/*) full FAST campaign: 34P/17D/0F/0B vs the
+  fresh pre-refresh baseline 35P/16D/0F/0B (`qa-mayhem-20260705-053159.md`).
+  0 FAIL, 0 BLIND in both. The 5 scenarios whose PASS/DEGRADED verdict
+  differs (`battery-charge-disabled`, `clock-jitter`, `conflicting-primacy`,
+  `mqtt-broker-latency`, `pv-flicker`) are all documented historically-wobbly
+  scenarios (`docs/QA_REPORT_STOCK_M0_20260705.md` per-cycle tables,
+  `docs/QA_REPORT_20260624.md`, `docs/QA_GAPS_20260701.md`) — report:
+  `qa-mayhem-20260705-071703.md`.
+- MQTT-scenario ×10 solo runs post-paho (`mqtt-broker-restart`,
+  `mqtt-broker-latency`, `mqtt-stale-retained`, `mqtt-malformed-control`):
+  0 FAIL, 0 BLIND across all 10. `mqtt-broker-restart` DEGRADED in every run
+  (always the acceptable CannotComply/physical-limit class, `blind=false`,
+  `sample_errors=0/N` — the paho reconnect+resubscribe path is confirmed
+  working); `mqtt-broker-latency` wobbles PASS/DEGRADED (3/10), matching its
+  pre-existing documented history and also seen wobbling pre-paho.
+- Post-commit-3 (paho) full FAST campaign: 32P/19D/0F/0B, report
+  `qa-mayhem-20260705-091544.md`. 0 FAIL, 0 BLIND. All verdict deltas vs
+  baseline are the same documented-wobbly scenarios plus
+  `mqtt-broker-restart`/`mqtt-broker-latency` (both confirmed
+  acceptable-CannotComply, not a paho regression — `blind=false` and full
+  sample coverage on both).
+
+Gate met: 0 unexplained FAIL across both full campaigns and all 10 solo
+MQTT runs.
