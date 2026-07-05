@@ -17,7 +17,7 @@ csip-tls-test CI (TASK-004) — report-only until Phase 1 replaces the duplicati
 shared module (AD-003/TASK-024).
 
 ## Stack
-Go 1.21 · wolfSSL cgo (`internal/wolfssl` only) · lorenzodonini/ocpp-go · simonvetter/modbus · grandcat/zeroconf
+Go 1.26 · wolfSSL cgo (`internal/wolfssl` only) · lorenzodonini/ocpp-go · simonvetter/modbus · grandcat/zeroconf
 
 ## Directory map
 ```
