@@ -1,6 +1,6 @@
 # TASK-034 — `utilitytime` package core (offset, smoothing, step classification, windows)
 
-*Status: TODO · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-05, lexa-hub 400b152) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
 
 ## Objective
 Create a new pure-Go package `lexa-hub/internal/utilitytime` that is the single

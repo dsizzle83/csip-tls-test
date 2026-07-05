@@ -383,6 +383,18 @@ rewriting freshness code. Accepted behavior change: wall-clock-denominating
 `expiryConfirmTicks` (TASK-036) shifts STOCK control-expiry release from
 45 s to 30 s (FAST unchanged at 9 s) — deliberate per 05 §5; campaign-gated.
 
+**Implemented (TASK-034, 2026-07-05):** core library landed at
+`lexa-hub/internal/utilitytime` — `Clock`/`New`/`SetOffset` (returns
+`StepClass`: `First`/`Wobble`/`Step`, classification never alters the value
+`ServerNow` returns)/`Offset`/`ServerNow`/`ServerNowAt`, plus window/expiry
+helpers `Expired` and `InWindow` matching `scheduler.controlExpired`/
+`activeEvent` boundary semantics exactly. Two composable expiry policies in
+`expiry.go`: `DebouncedExpiry` (generalizes `expiryConfirmTicks`) and
+`ReportGrace` (generalizes `csipReportGraceS`). Zero consumers by design —
+`go test -race ./internal/utilitytime/` 100% statement coverage; walker/
+scheduler/hub/api/optimizer migrations are TASK-035/036 (verbatim-port
+comparison against today's scheduler happens there).
+
 ## AD-005 ✅ Persistence: append-only event journal + guard snapshots, not a database (W5)
 
 **Decision.** Newline-delimited, size-rotated, fsync-batched journal on
