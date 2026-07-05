@@ -1,6 +1,6 @@
 # TASK-021 — Sims consume the shared sunspec codec; delete the bench fork; bench validation
 
-*Status: DONE (2026-07-05, pending-sha — see final addendum commit) · Phase: P1 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-05, 2c17cfb) · Phase: P1 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
 
 ## Objective
 `csip-tls-test` no longer contains a SunSpec codec: every bench consumer imports
