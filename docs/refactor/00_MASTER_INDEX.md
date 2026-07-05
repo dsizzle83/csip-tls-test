@@ -49,7 +49,7 @@ line is 09. 07 is the QA-specific slice of the same pipeline.
 | Phase | Tasks | Status | Exit campaign | Notes |
 |---|---|---|---|---|
 | P0 Foundations | 001–018 | **COMPLETE — M0 (2026-07-05)** | FAST 35P/16D/0F/0B (`qa-mayhem-20260705-053159.md`); post-006 32P/19D/0F/0B (`qa-mayhem-20260705-091544.md`); STOCK M0 baseline 0.8F/cyc 0B (`docs/QA_REPORT_STOCK_M0_20260705.md`) | All 18 tasks done + merged (details in task headers + campaign reports). Watchdogs wedge-proven ×6; journald measured (FLASH_BUDGET updated); broker ACL + API auth LIVE on bench; deps current, govulncheck 0 findings, vulncheck CI required; 2 STOCK findings filed (QA-STOCK-001/002). Open (human): `LEXA_HUB_RO_TOKEN` PAT + required-checks toggle (AD-012/TASK-004); branch protection ON both repos (pushes currently admin-bypass, PR flow needs `gh` auth). |
-| P1 Shared modules (R2) | 019–024, 082 | IN PROGRESS (2026-07-05) | — | Started with TASK-019 (lexa-proto skeleton). |
+| P1 Shared modules (R2) | 019–024, 082 | IN PROGRESS (2026-07-05) | — | TASK-019 DONE: `~/projects/lexa-proto` skeleton (5 empty packages) + `go.work` committed in both consumer repos + CI `GOWORK=off` guard; AD-003 extended with module path (bare `lexa-proto`, flips to hosted path when `dsizzle83/lexa-proto` exists), pinning mechanism (`proto.pin` SHA file until hosting+credential land), package layout, go.work policy. No code moved yet — unblocks TASK-020/022/023. |
 | P2 Device Reconciler (R1) | 025–033 | NOT STARTED | — | Critical path |
 | P3 Time & persistence | 034–043 | NOT STARTED | — | |
 | P4 Observability & QA depth | 044–055 | NOT STARTED | — | Parallel track |
