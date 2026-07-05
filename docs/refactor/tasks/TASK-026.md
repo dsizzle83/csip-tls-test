@@ -1,6 +1,6 @@
 # TASK-026 — Reconciler core library: pure logic + exhaustive table-driven tests
 
-*Status: TODO · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: low*
+*Status: DONE (2026-07-05, lexa-hub aba9988) · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: low*
 
 ## Objective
 A new pure-Go, I/O-free package `lexa-hub/internal/reconcile` implements the per-device
