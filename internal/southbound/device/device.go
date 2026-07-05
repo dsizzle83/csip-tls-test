@@ -6,7 +6,10 @@
 // implementations live in sibling packages (inverter, battery).
 package device
 
-import model "lexa-proto/csipmodel"
+import (
+	model "lexa-proto/csipmodel"
+	"lexa-proto/derbase"
+)
 
 // Device is the southbound abstraction for a single piece of DER hardware.
 // Implementations must be safe for concurrent use.
@@ -29,6 +32,12 @@ type Device interface {
 
 // Measurements holds a snapshot of electrical measurements from a DER device.
 //
+// This is a type alias (not a new type) to lexa-proto/derbase.Measurements —
+// the shared codec is the sole definition of the shape, mirroring the same
+// alias trick lexa-hub uses for its own device.Measurements (TASK-023 §4).
+// Kept under this name/package for compatibility with every existing call
+// site in this repo (battery/inverter/meter/registry) — TASK-082.
+//
 // Sign convention — power fields use the generator/load sign from the device's
 // own perspective (IEC 62053 / SunSpec convention):
 //
@@ -40,23 +49,12 @@ type Device interface {
 //	W > 0  power flowing from grid into site (import)
 //	W < 0  power flowing from site into grid (export)
 //
-// Fields set to math.NaN() are not available from this device.
-type Measurements struct {
-	// AC-side
-	W   float64 // net AC real power (watts)
-	VA  float64 // apparent power (volt-amps)
-	Var float64 // reactive power (vars, positive = capacitive)
-	V   float64 // phase-A-to-neutral voltage (volts)
-	Hz  float64 // AC frequency (Hz)
-	PF  float64 // power factor (−1 to +1)
-
-	// DC-side (inverters only; NaN if not applicable)
-	DCV float64 // DC bus voltage (volts)
-	DCW float64 // DC power (watts)
-
-	// Thermal
-	TmpCab float64 // cabinet temperature (°C); NaN if not reported
-}
+// Fields set to math.NaN() are not available from this device. Note this
+// type carries a SOC field (state of charge, batteries only) that no bench
+// call site populated before TASK-082 — meter/inverter construct it as NaN
+// (not applicable), battery reads it via the shared codec's measurement
+// parsers, which already set it.
+type Measurements = derbase.Measurements
 
 // DeviceStatus describes the current operational state of a DER.
 type DeviceStatus struct {

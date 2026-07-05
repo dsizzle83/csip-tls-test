@@ -10,12 +10,12 @@ import (
 	"path/filepath"
 	"testing"
 
-	"csip-tls-test/internal/csip/discovery"
 	"csip-tls-test/internal/csip/identity"
-	"csip-tls-test/sim/gridsim"
+	"csip-tls-test/internal/csipref/discovery"
 	"csip-tls-test/internal/tlsclient"
-	"csip-tls-test/sim/tlsserver"
 	"csip-tls-test/internal/wolfssl"
+	"csip-tls-test/sim/gridsim"
+	"csip-tls-test/sim/tlsserver"
 )
 
 // TestMain initializes wolfSSL once for the integration build. wolfSSL_Init

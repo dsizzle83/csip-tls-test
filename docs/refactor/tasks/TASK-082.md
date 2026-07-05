@@ -1,6 +1,6 @@
 # TASK-082 — Bench fork endgame: driver forks, bench `derbase`, and the CSIP walker/scheduler fork decision
 
-*Status: TODO · Phase: P1 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-05, fb52b16) · Phase: P1 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
 
 ## Objective
 Finish what R2 started: after the shared `lexa-proto` module exists
@@ -165,11 +165,13 @@ annotation; 03 Phase 1 exit-criterion exception if (a) is chosen.
 - Full FAST Mayhem campaign ≤ baseline (0 BLIND, FAIL rate ≤ current).
 
 ## Regression checklist
-- [ ] `make test-fast` + `go test ./internal/southbound/...` green
-- [ ] modsim-conformance ×3 device types green
-- [ ] Full FAST Mayhem campaign ≤ baseline
-- [ ] Hub + sims deployed same session; FAST re-tuned
-- [ ] CI divergence/pin gate (TASK-024) green with any new allow-list
+- [x] `make test-fast` + `go test ./internal/southbound/...` green
+- [x] modsim-conformance ×3 device types green (inverter 19/19, battery 22/22, meter 9/9 —
+      exact TASK-021 baseline, against the live bench sims, unredeployed)
+- [ ] Full FAST Mayhem campaign — **not run, deliberately** (see Implementation notes)
+- [ ] Hub + sims deployed same session — **not needed** (no sim/hub code touched; see notes)
+- [x] CI divergence/pin gate (TASK-024's predecessor, `scripts/ci/lockstep-check.sh`) green,
+      0 new allow-list entries (none applicable — see AD-003(g) in 02)
 
 ## Mayhem scenarios affected
 None targeted — the campaign is a pure regression gate here; any verdict
@@ -204,3 +206,65 @@ headers (this file + 00_MASTER_INDEX) updated.
 Walker/scheduler extraction (only if AD chose (b)); TASK-075 golden
 fixtures (the referee question feeds it); backlog "second gridsim"
 scenarios.
+
+## Implementation notes (2026-07-05)
+
+**Import audit (step 1) vs. the Background list.** The re-run audit matched the task's
+Background almost exactly, with one addition and one correction:
+- Addition: `internal/tlsclient/fetcher_test.go` also imports `internal/csip/discovery` —
+  not named in Background (which only listed `sim/client(-http)`, `sim/conformance`,
+  `tests/*`). Repointed along with the rest.
+- Correction: of the bench driver forks, only `internal/southbound/inverter` has a live
+  consumer (`sim/modsim-client`). `battery`, `meter`, and `registry` have **zero consumers**
+  outside their own test files — `cmd/hub`/`sim/orchestrator` (their pre-TASK-010
+  consumers) are deleted and nothing replaced them. Left in place (they build, they pass,
+  deleting unreferenced-but-untasked code is scope creep) but flagged in
+  `internal/southbound/CLAUDE.md` and AD-003(f) for visibility.
+
+**Derbase decision: disposed, not kept-as-referee.** The task asked me to decide between
+consuming `lexa-proto/derbase` or staying bench-local-by-design. Chose disposal (delete the
+fork; `battery`/`inverter` now embed `lexa-proto/derbase.Base` directly) because, unlike the
+csip walker/scheduler, there is no referee argument for the bench's own derbase: it's a
+debug CLI helper (`sim/modsim-client`) driving the same sims the hub itself talks to, not an
+independent spec-conformance check. TASK-020's disposition doc had already adjudicated every
+behavioral difference product-authoritative (D1-D3, S1-S8), so re-pointing needed no new
+semantic review — see AD-003(f) for the full reasoning, including the capability
+`battery`/`inverter` gain for free (`OpModFixedW`, `GenLimW`/`LoadLimW`, reversion timers,
+curve surface) and why that isn't an escalation trigger.
+
+**csip discovery/scheduler: kept as referee, renamed to `internal/csipref`, per the task's
+own default recommendation** (option a). See AD-003(g) in
+`docs/refactor/02_ARCHITECTURE_DECISIONS.md` for the full record. The CI divergence gate
+(`scripts/ci/lockstep-check.sh`) never scanned `internal/csip{,ref}` in the first place (its
+`TREES` array only ever compared `internal/southbound/sunspec` and `internal/ocppserver`,
+both already retired to `lexa-proto`) — there was no allow-list entry to add, since the gate
+cannot flag a tree it doesn't compare. Added a comment at the `TREES` declaration recording
+this so a future reader doesn't go hunting for a missing line.
+
+**Reduced regression gate — deviation from the task's stated acceptance criteria, per
+explicit launch-lane instruction.** The task file's acceptance criteria/regression checklist
+call for a full FAST Mayhem campaign and a same-session hub+sim deploy. My launch
+instructions (current as of 2026-07-05, superseding the task file's staler text) state: "if
+your changes are import-repoints/deletions only, run make test-fast + go test ./tests/ + the
+modsim-conformance ×3 locally... your changes don't redeploy sims unless you change sim
+code — avoid that; if you must, MTR-4 lockstep + full campaign applies." No sim code
+(`sim/southbound/*`) and no hub code was touched — `sim/modsim-conformance` itself doesn't
+even import `battery`/`inverter`/`derbase` (confirmed by import audit: it talks
+`lexa-proto/sunspec` directly), so this task's changes have zero exposure on the deployed
+sims or hub. Ran the reduced gate instead: `go build ./...`, `go vet ./...`, `go test ./...`
+(both `GOWORK` on and `GOWORK=off -mod=vendor`), and `modsim-conformance` ×3 against the
+live (unredeployed) bench — all green, matching TASK-021's baseline exactly. No Mayhem
+campaign run this session; flagging for the Principal Engineer to confirm this deviation is
+acceptable, since it departs from the task file's own written acceptance criteria even
+though it follows the more current launch-lane instruction.
+
+**Branch-state note.** This branch's tip at commit time already carried three commits
+(`6385ce7`, `d31c428`, `5ced67d`) from a concurrent TASK-047 session that landed on
+`task/082-fork-endgame` before I committed — a shared-working-directory collision, not
+something I caused or reverted (matches the "recovered from branch collision" pattern
+already visible in this repo's merge history, e.g. TASK-021/025). One of those commits
+(`d31c428`) incidentally already carried my `git mv`/`git rm` staged-index changes (the
+`internal/csip` → `internal/csipref` rename and the `derbase.go` deletion) under an
+unrelated commit message, since they were sitting staged in the shared index at the time.
+Content is correct and verified (build+test green); flagging the collision for the
+Principal Engineer to reconcile/re-message if desired.

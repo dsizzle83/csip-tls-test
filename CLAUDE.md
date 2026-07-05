@@ -36,11 +36,18 @@ sim/modsim-conformance/ Modbus conformance runner (-device inverter|battery|mete
 cmd/dashboard/          Go proxy + embedded SPA (KPIs, scenarios, logs, register tables);
                         also hosts the Mayhem hostile-QA engine (mayhem.go, /api/qa/*) and
                         the Bench Replay driver (replay.go, /api/replay/*)
-internal/csip/          2030.5 walker, scheduler, identity, DNS-SD
-                        (model types moved to lexa-proto/csipmodel — TASK-023)
+internal/csip/          identity (LFDI/SFDI), DNS-SD (model types moved to
+                        lexa-proto/csipmodel — TASK-023; walker/scheduler moved out to
+                        internal/csipref — TASK-082)
+internal/csipref/       2030.5 walker (discovery/) + DER event scheduler (scheduler/) — this
+                        repo's OWN independent client-side implementation, deliberately kept
+                        unsynced with lexa-hub's walker for conformance-referee value
+                        (AD-003(f), TASK-082). Consumed by sim/conformance, sim/client(-http),
+                        tests/*.
 internal/tlsclient/     wolfSSL mTLS client (persistent keep-alive fetcher)
 internal/southbound/    Modbus/SunSpec device drivers + sim world model; codec (sunspec/modbus)
-                        now imported from lexa-proto — TASK-021
+                        and DER control/measurement mapping (derbase) all now imported from
+                        lexa-proto — TASK-021/082. No bench-local codec or derbase fork remains.
 tests/                  Conformance + integration test suites
 docs/                   HARNESS_REVIEW.md (audit findings), BENCH.md (live bench), pcaps
 ```

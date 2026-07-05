@@ -204,3 +204,12 @@ in-progress work — Principal Engineer should reconcile.
 ## Possible follow-up tasks
 TASK-011 (GUI/docs cleanup), TASK-019–024 (shared modules replace the remaining
 duplication), backlog: retire deprecated `sync-pi`-era Makefile targets entirely.
+
+## Keep-list resolution note (TASK-082, 2026-07-05)
+This task's keep-list called `internal/csip/` "NOT deletable... despite the review's
+phrasing 'csip fork'" and kept "`internal/southbound/` everything else" as live sim/
+conformance dependencies. Both punts are now resolved: TASK-082 disposed of the bench
+`derbase` fork (deleted; `battery`/`inverter` now consume `lexa-proto/derbase` directly)
+and recorded an explicit AD for `internal/csip/discovery`+`scheduler` (kept, moved to
+`internal/csipref`, referee role documented — AD-003(g),
+`docs/refactor/02_ARCHITECTURE_DECISIONS.md`). No further "csip fork" ambiguity remains.

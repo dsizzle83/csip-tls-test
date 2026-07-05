@@ -21,6 +21,14 @@
 //	if active != nil {
 //	    applyControl(active.Base)
 //	}
+//
+// # Referee independence (internal/csipref, TASK-082 / AD-003(f))
+//
+// Deliberately independent of the lexa-hub product's own event-evaluation
+// logic — do not sync or unify the two. See the identical note in the
+// sibling internal/csipref/discovery package doc, and
+// docs/refactor/02_ARCHITECTURE_DECISIONS.md AD-003(f), for the full
+// reasoning (self-confirmation hazard, architecture review §9).
 package scheduler
 
 import (
@@ -28,7 +36,7 @@ import (
 	"sync"
 	"time"
 
-	"csip-tls-test/internal/csip/discovery"
+	"csip-tls-test/internal/csipref/discovery"
 	model "lexa-proto/csipmodel"
 )
 

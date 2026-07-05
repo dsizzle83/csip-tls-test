@@ -3,7 +3,7 @@ package scheduler
 import (
 	"testing"
 
-	"csip-tls-test/internal/csip/discovery"
+	"csip-tls-test/internal/csipref/discovery"
 	model "lexa-proto/csipmodel"
 )
 

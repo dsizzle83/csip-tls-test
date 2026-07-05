@@ -20,8 +20,8 @@ import (
 	"math"
 	"time"
 
-	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/southbound/device"
+	model "lexa-proto/csipmodel"
 	"lexa-proto/modbus"
 	"lexa-proto/sunspec"
 )
@@ -137,7 +137,11 @@ func parseMeterModel(regs []uint16, modelID uint16) device.Measurements {
 	}
 	sf := func(offset int) int16 { return int16(get(offset)) }
 
-	meas := device.Measurements{TmpCab: math.NaN()}
+	// SOC (state of charge) is a battery-only field on the shared
+	// device.Measurements type (TASK-082 aliased it to lexa-proto/derbase.
+	// Measurements, which added SOC) — meters have no such concept, so it's
+	// explicitly NaN rather than the zero-value default.
+	meas := device.Measurements{TmpCab: math.NaN(), SOC: math.NaN()}
 
 	// Select per-model register offsets.
 	type offsets struct{ w, wSF, v, vSF, hz, hzSF, va, vaSF, varr, varrSF, pf, pfSF int }

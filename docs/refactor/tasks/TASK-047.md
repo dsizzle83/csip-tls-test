@@ -1,6 +1,14 @@
 # TASK-047 — Fuzz `tlsclient.readResponse` + response size caps
 
-*Status: TODO · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-05, lexa-hub cb4ae45 + 8e477fa + 754857d on `task/047-httpwire`) —
+httpwire leaf package extracted (stdlib-only, CGo-free); 64 KiB header cap added (body cap
+untouched); 3 fuzz targets + 11-file real-gridsim corpus; 15 min/target local runs clean
+(56.7M/82.3M/83.0M execs, zero crashers); nightly CI `fuzz` job on the existing 04:17 UTC
+cron (green-on-first-scheduled-run pending merge). Bench-dependent regression items (live
+conformance smoke, targeted Mayhem spot runs) deferred to the next deploying session per
+lane restrictions — no behavior change expected (seam is byte-identical for valid
+responses; parser-level tests + real-response corpus prove accept/reject parity).
+· Phase: P4 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
 
 ## Objective
 Make the hand-rolled HTTP response parser on the utility-facing boundary

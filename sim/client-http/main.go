@@ -1,7 +1,7 @@
 package main
 
 import (
-	"csip-tls-test/internal/csip/discovery"
+	"csip-tls-test/internal/csipref/discovery"
 	"csip-tls-test/internal/httpclient"
 	"fmt"
 	"log"

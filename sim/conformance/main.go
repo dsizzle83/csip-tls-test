@@ -30,12 +30,12 @@ import (
 	"strings"
 	"time"
 
-	"csip-tls-test/internal/csip/discovery"
 	"csip-tls-test/internal/csip/identity"
-	model "lexa-proto/csipmodel"
-	"csip-tls-test/internal/csip/scheduler"
+	"csip-tls-test/internal/csipref/discovery"
+	"csip-tls-test/internal/csipref/scheduler"
 	"csip-tls-test/internal/tlsclient"
 	"csip-tls-test/internal/wolfssl"
+	model "lexa-proto/csipmodel"
 
 	"crypto/x509"
 	"encoding/pem"
@@ -46,10 +46,10 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Reporter struct {
-	w        io.Writer // writes to both tee targets
-	runCount int       // number of test sections completed (pass + fail)
-	failCount int      // number of test sections that ended with FAIL
-	current  string   // current test ID
+	w         io.Writer // writes to both tee targets
+	runCount  int       // number of test sections completed (pass + fail)
+	failCount int       // number of test sections that ended with FAIL
+	current   string    // current test ID
 }
 
 func newReporter(logPath string) (*Reporter, func()) {

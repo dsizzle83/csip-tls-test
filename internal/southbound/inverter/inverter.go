@@ -7,14 +7,22 @@ import (
 	"fmt"
 	"time"
 
-	"csip-tls-test/internal/southbound/derbase"
 	"csip-tls-test/internal/southbound/device"
 	model "lexa-proto/csipmodel"
+	"lexa-proto/derbase"
 	"lexa-proto/modbus"
 	"lexa-proto/sunspec"
 )
 
 const tag = "inverter"
+
+// M701 operating-state values used by Status() below — see the identical
+// shim comment in internal/southbound/battery/battery.go (TASK-082).
+const (
+	m701StStarting  = 2
+	m701StOn        = 3
+	m701StThrottled = 4
+)
 
 // Inverter implements device.Device for a SunSpec inverter over Modbus.
 type Inverter struct {
@@ -81,7 +89,7 @@ func (inv *Inverter) Status() (device.DeviceStatus, error) {
 		st := int(ac.St)
 		return device.DeviceStatus{
 			Connected: ac.ConnSt == 1,
-			Energized: st == derbase.M701StOn || st == derbase.M701StThrottled || st == derbase.M701StStarting,
+			Energized: st == m701StOn || st == m701StThrottled || st == m701StStarting,
 		}, nil
 	}
 	if len(regs) <= sunspec.M103_St {
@@ -100,6 +108,8 @@ func (inv *Inverter) ApplyControl(ctrl model.DERControlBase) error {
 
 // Note: the old bench fork also delegated a wider IEEE 1547-2018 read/write
 // surface (M702/705-712) here. Those derbase methods had zero callers beyond
-// this pass-through and zero test coverage; removed along with their derbase
-// counterparts rather than re-implemented against the shared codec's
-// differently-shaped curve-write workflow (TASK-021; disposal is TASK-082).
+// this pass-through and zero test coverage; removed in TASK-021 rather than
+// re-implemented against the shared codec's differently-shaped curve-write
+// workflow. TASK-082 completed the disposal — see the equivalent note at the
+// bottom of battery.go for the full reasoning; Inverter now embeds
+// lexa-proto/derbase.Base directly.

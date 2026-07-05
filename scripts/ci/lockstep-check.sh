@@ -100,6 +100,13 @@ TREES=(
   "internal/southbound/sunspec"
   "internal/ocppserver"
 )
+# TASK-082 (2026-07-05): internal/csipref/{discovery,scheduler} (the CSIP client walker +
+# DER scheduler) and lexa-proto/derbase are intentionally NOT in this list. derbase is a
+# shared module both repos import identically (no bench-local fork left to diverge — see
+# internal/southbound/CLAUDE.md). csipref is a deliberate one-repo-only referee
+# implementation with no lexa-hub counterpart to diverge FROM (AD-003(f),
+# docs/refactor/02_ARCHITECTURE_DECISIONS.md) — there is nothing for this gate to compare,
+# so no lockstep-allowlist.txt entry is needed or appropriate for it.
 
 declare -a ALL_LINES=()
 
