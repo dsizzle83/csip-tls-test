@@ -77,3 +77,4 @@ promote by giving an item a TASK number and a row in 04.*
   acquisition-flavored).
 - lexa-hub integration-tagged tlsclient tests (client_test.go/fetcher_test.go) reference helpers that never existed there (startInProcessServer etc.) — never compiled; port csip-tls-test helpers_test.go or delete the tagged files (TASK-047 finding).
 - Ungated Time.CurrentTime + bench csipref scheduler lacks any plausibility gate (TASK-048 findings) — follow-up hardening candidates.
+- Ungated Time.CurrentTime + bench csipref scheduler lacks any plausibility gate (TASK-048 findings) — follow-up hardening candidates.
