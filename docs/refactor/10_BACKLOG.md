@@ -63,3 +63,4 @@ promote by giving an item a TASK number and a row in 04.*
 - **Acquisition data room hygiene:** keep campaign evidence, conformance
   reports, and this doc set export-ready (the review was explicitly
   acquisition-flavored).
+- lexa-hub integration-tagged tlsclient tests (client_test.go/fetcher_test.go) reference helpers that never existed there (startInProcessServer etc.) — never compiled; port csip-tls-test helpers_test.go or delete the tagged files (TASK-047 finding).
