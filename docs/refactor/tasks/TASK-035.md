@@ -1,6 +1,35 @@
 # TASK-035 — Migrate walker + scheduler onto `utilitytime` (guards ported verbatim)
 
-*Status: TODO · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: high · Risk: high*
+*Status: DONE (2026-07-05, lexa-hub `task/035-scheduler-time` 7c1b03f+c612e1e; NOT merged — 05 §12 cooling-off, awaits PE review) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: high · Risk: high*
+
+> **Completion note (2026-07-05).** AD-004 consumers 1–3 migrated onto
+> `internal/utilitytime` in two commits (walker offset acquisition → `Clock`;
+> then serverNow + scheduler expiry/window primitives + responseTracker).
+> Guards ported **verbatim**: `failClosed`, `stillServed`, `plausibleControl`
+> and all guard ordering are byte-unchanged; `controlExpired` → `utilitytime.Expired`,
+> `activeEvent`/`SupersededMRIDs` interval checks → `utilitytime.InWindow`.
+> `failclosed_test.go` and `scheduler_test.go` pass with an **empty diff**;
+> new `utilitytime_equiv_test.go` differential proves legacy-vs-Clock `Evaluate`
+> equivalence. `go test -race ./internal/...` + `./cmd/northbound/...` green
+> (×5 deterministic). Deployed lexa-northbound only (bench 028-active binaries
+> untouched); backup saved on the Pi. Targeted time/fail-closed gate
+> (clock-jitter, clock-jump-forward, wan-outage-hold, wan-outage-expiry,
+> northbound-hang, malform-empty-program) **6/6 PASS**
+> (`qa-mayhem-20260705-173448.md`). Full 51-scenario FAST campaign
+> (`qa-mayhem-20260705-183429.md`): **31P/20D/0F/0B/0I** vs the 34P/17D/0F/0B
+> wave-gate baseline (`qa-mayhem-20260705-151009.md`, pre-028-active). Drifts
+> all dispositioned: `expired-control` + `ev-delayed-obey` P→D flakes (both
+> PASS on solo re-run, `qa-mayhem-20260705-184018.md`; expired-control's
+> oracle confirms expiry/release timing correct in BOTH runs — the D was
+> mid-window hunting under the 028-active battery baseline);
+> `export-cap-full-battery` P→D known accepted oracle-line DEGRADED (V6);
+> `solar-reboot-forget` P→D reproducible under the 028-active battery
+> baseline (CannotComply correctly posted, report calls it acceptable; NOT
+> time-family — belongs to 028's baseline, flagged for its ledger);
+> `conflicting-primacy` D→P improvement. `clock-jitter` DEGRADED at exact
+> parity with the 151009 baseline (identical oracle shape, INV-EXPORT +
+> SAFETY held, no flap) and PASS in the targeted gate. 0 unexplained FAIL,
+> 0 BLIND, no time-family regression.
 
 ## Objective
 Make the northbound discovery walker and the scheduler consume
