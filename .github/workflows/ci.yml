@@ -126,6 +126,19 @@ jobs:
       - name: Southbound unit tests
         run: go test ./internal/southbound/...
 
+      - name: csipref referee unit tests (walker/scheduler + TASK-048 fuzz seeds)
+        # internal/csipref (discovery + scheduler) has never had a direct
+        # `go test` step of its own in this job — go test ./tests/ below
+        # exercises it only indirectly through the conformance suites, so
+        # its own _test.go files (walker_test.go, scheduler_test.go,
+        # helpers_test.go, and now fuzz_test.go's seed-mode cases) were not
+        # actually running in CI. Adding this step closes that gap and is
+        # what makes TASK-048's "PR-lane seed checks add <5s" acceptance
+        # criterion true rather than aspirational (seed-only mode: plain
+        # `go test`, no -fuzz, runs each Fuzz func's f.Add seeds as regular
+        # subtests — verified locally at a few ms, not seconds).
+        run: go test ./internal/csipref/...
+
       - name: QA-harness unit gate (scripts/qa-regression.sh)
         run: bash scripts/qa-regression.sh
 
@@ -276,3 +289,42 @@ jobs:
 
       - name: proto.pin version-pin check (fails on mismatch — no allowlist)
         run: bash scripts/check-proto-pin.sh --self . --product lexa-hub --no-proto-check
+
+  # TASK-048: nightly go-native fuzzing of the client-side IEEE 2030.5 XML
+  # unmarshal entry points in internal/csipref/discovery — this repo's own
+  # (deliberately independent, AD-003(f)) walker's decode step, into the
+  # shared lexa-proto/csipmodel types. Same job shape as lexa-hub's TASK-047
+  # httpwire fuzz job and this repo's own `vulncheck` job above: nightly-only
+  # (`if: github.event_name == 'schedule'`, same cron as vulncheck), no cgo
+  # needed (csipmodel/csipref import nothing beyond encoding/xml + stdlib —
+  # unlike cgo-fast above, this never touches wolfSSL). A crasher found here
+  # writes a regression file under
+  # internal/csipref/discovery/testdata/fuzz/<FuzzName>/, which every
+  # subsequent `go test` (no -fuzz) reruns as a normal test case; the
+  # artifact upload is a convenience for grabbing that file out of a run
+  # nobody was watching live.
+  fuzz:
+    name: fuzz (nightly, 2030.5 XML decode)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: fuzz csipref XML decode (15m/target, no cgo)
+        run: |
+          set -o pipefail
+          go test -fuzz=FuzzUnmarshalDeviceCapability -fuzztime=15m ./internal/csipref/discovery/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -fuzz=FuzzUnmarshalDERControlList   -fuzztime=15m ./internal/csipref/discovery/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: upload crashers (only present on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csipref-fuzz-crashers
+          path: internal/csipref/discovery/testdata/fuzz/*/
+          if-no-files-found: ignore

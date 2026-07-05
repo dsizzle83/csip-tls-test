@@ -2,7 +2,7 @@
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
-        test test-fast test-integration test-update-golden test-southbound qa qa-bench \
+        test test-fast test-integration test-update-golden test-southbound qa qa-bench fuzz \
         modsim-image modsim-run modsim-stop \
         gen-test-certs gen-client-cert smoke-pi clean help
 
@@ -254,6 +254,20 @@ test-southbound:
 # Full integration tests with real TLS handshakes. Requires fixtures.
 test-integration: $(CA_CERT)
 	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/
+
+# TASK-048: 15 minutes per go-native fuzz target against the client-side
+# IEEE 2030.5 XML unmarshal entry points in internal/csipref/discovery
+# (DeviceCapability, DERControlList) — the mirror of lexa-hub's TASK-047
+# fuzz-job shape (pure Go, no wolfSSL sysroot needed; csipmodel/csipref
+# import nothing beyond encoding/xml + stdlib). Seed corpus loaded from
+# testdata/fuzz/shared-2030_5/ (committed identically to lexa-hub in the
+# same TASK-048 session — see that repo's Makefile `fuzz` target). Failures
+# land a crash file under internal/csipref/discovery/testdata/fuzz/<FuzzName>/
+# that plain `go test` (no -fuzz) reruns forever after as a regression case.
+FUZZTIME ?= 15m
+fuzz:
+	go test -fuzz=FuzzUnmarshalDeviceCapability -fuzztime=$(FUZZTIME) ./internal/csipref/discovery/
+	go test -fuzz=FuzzUnmarshalDERControlList   -fuzztime=$(FUZZTIME) ./internal/csipref/discovery/
 
 # Regenerate the DCAP golden file. Run after intentionally changing
 # the DCAP XML format. The -args separator is required because Go's
