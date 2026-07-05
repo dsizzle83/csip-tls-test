@@ -10,10 +10,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"csip-tls-test/sim/gridsim"
-	"csip-tls-test/internal/ocppserver"
-	"csip-tls-test/sim/tlsserver"
 	"csip-tls-test/internal/wolfssl"
+	"csip-tls-test/sim/gridsim"
+	"csip-tls-test/sim/tlsserver"
+	"lexa-proto/ocppserver"
 )
 
 func main() {
@@ -100,4 +100,3 @@ func main() {
 	srv.Close()
 	log.Printf("clean shutdown")
 }
-

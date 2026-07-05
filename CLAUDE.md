@@ -6,15 +6,19 @@ The **test bench** for the LEXA DERMS hub. The product itself lives in
 
 - IEEE 2030.5 / CSIP grid server simulator (wolfSSL mTLS) + admin API
 - SunSpec Modbus device sims: solar, battery, bi-directional meter
-- OCPP 2.0.1 EV charger sim (`evsim`) + CSMS copy for tests
+- OCPP 2.0.1 EV charger sim (`evsim`) + shared CSMS (`lexa-proto/ocppserver`) for tests
 - CSIP + Modbus conformance suites
 - Web dashboard (`cmd/dashboard`, :8080) — the demo/test UI
 
-**Lockstep rule:** `internal/southbound/sunspec` register maps and `internal/ocppserver`
-are duplicated in lexa-hub and must change in both repos together (audit MTR-4). Deploy
-hub + sims in the same session. Enforced by `scripts/ci/lockstep-check.sh` in
-csip-tls-test CI (TASK-004) — report-only until Phase 1 replaces the duplication with a
-shared module (AD-003/TASK-024).
+**Lockstep rule:** `internal/southbound/sunspec` register maps are duplicated in lexa-hub
+and must change in both repos together (audit MTR-4). Deploy hub + sims in the same
+session. Enforced by `scripts/ci/lockstep-check.sh` in csip-tls-test CI (TASK-004) —
+report-only until Phase 1 replaces the duplication with a shared module (AD-003/TASK-024).
+`internal/ocppserver` moved to `lexa-proto/ocppserver` (TASK-022); `sim/server` and
+`sim/evsim`'s tests import the shared copy. The old `internal/ocppserver/` tree is left in
+place unreferenced (not deleted) because hosted CI runs `GOWORK=off` with no sibling
+`lexa-proto` checkout for the `cgo-fast` job's `sim/server` build — deleting the local copy
+wouldn't fix that gap, only hide it. Removal tracked with TASK-024.
 
 ## Stack
 Go 1.26 · wolfSSL cgo (`internal/wolfssl` only) · lorenzodonini/ocpp-go · simonvetter/modbus · grandcat/zeroconf
@@ -35,7 +39,6 @@ cmd/dashboard/          Go proxy + embedded SPA (KPIs, scenarios, logs, register
 internal/csip/          2030.5 model, walker, scheduler, identity, DNS-SD
 internal/tlsclient/     wolfSSL mTLS client (persistent keep-alive fetcher)
 internal/southbound/    Modbus/SunSpec stack (mirrored in lexa-hub — lockstep!)
-internal/ocppserver/    OCPP 2.0.1 CSMS library (pure Go; copy exists in lexa-hub)
 tests/                  Conformance + integration test suites
 docs/                   HARNESS_REVIEW.md (audit findings), BENCH.md (live bench), pcaps
 ```

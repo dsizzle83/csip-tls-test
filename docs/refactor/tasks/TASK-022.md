@@ -1,6 +1,26 @@
 # TASK-022 — Extract `ocppserver` into lexa-proto; both repos consume
 
-*Status: TODO · Phase: P1 · Effort: M (≈4–6 h) · Difficulty: low · Risk: med*
+*Status: BLOCKED-PARTIAL (2026-07-05, lexa-proto@5374010, lexa-hub@cc6a911,
+csip-tls-test@77a0c10, all on branch `task/022-ocppserver`) · Phase: P1 ·
+Effort: M (≈4–6 h) · Difficulty: low · Risk: med*
+
+**2026-07-05 implementer note:** Extraction + both consumer flips are done and
+tested green under `go.work` (see commits above). NOT done: deleting the old
+`internal/ocppserver/` copies in either consumer repo, and the bench/Mayhem
+steps (7–8 below) — out of scope for this session's lane (bench work
+excluded by launch instructions). Deletion is deliberately withheld: it
+surfaced that AD-003(d)'s "no replace directive, go.work is the only
+local-dev mechanism" call means hosted CI's `GOWORK=off` jobs cannot resolve
+`lexa-proto/ocppserver` at all once a consumer imports it — confirmed
+directly (`GOWORK=off go build ./cmd/ocpp` in lexa-hub and `GOWORK=off go
+build ./sim/server` / `go test ./sim/evsim/...` in csip-tls-test all fail
+with "package lexa-proto/ocppserver is not in std"). This is independent of
+whether the old copy is deleted; keeping it only preserves an easy revert.
+See the P1 row in `00_MASTER_INDEX.md` and the two consumer-repo commit
+messages for the full writeup. Needs a Principal decision before this can
+move to DONE: (a) give the relevant CI jobs a sibling `lexa-proto` checkout,
+(b) add a scoped `replace` exception to AD-003, or (c) accept red CI on
+these branches until TASK-024 lands hosting + the pin gate.
 
 ## Objective
 One OCPP 2.0.1 CSMS library lives at `lexa-proto/ocppserver`; `lexa-hub/internal/ocppserver`
