@@ -1,6 +1,6 @@
 # TASK-015 — Stock-timing Mayhem release gate (campaign wrapper + first STOCK baseline)
 
-*Status: DONE (2026-07-05, on `task/015-stock-report`) · Phase: P0 · Effort: M (≈4–6 h + overnight run) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-05, da6e629 on `task/015-stock-report`) · Phase: P0 · Effort: M (≈4–6 h + overnight run) · Difficulty: low · Risk: low*
 
 **Completion note (2026-07-05):** the P0-exit STOCK baseline is executed. `scripts/mayhem-campaign.sh`
 ran 5 cycles (single-run mode, `c39f820` — the wall-time decision taken at the P0-exit
