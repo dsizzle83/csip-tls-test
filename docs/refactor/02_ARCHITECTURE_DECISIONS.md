@@ -461,6 +461,113 @@ inline for MUP reading timestamps — a 6th `serverNow` site AD-004's original
 five-consumer list didn't enumerate. Not touched here (not in TASK-036's
 Files list); flagged for a follow-up task/backlog entry.
 
+**Local (SOM) clock-step policy — TASK-037, GAP-04, 2026-07-05, lexa-hub
+`task/037-local-clock` 8f7e60e (unmerged), csip-tls-test docs
+`task/037-local-clock` (this entry).** Extends AD-004 from hardening the
+*utility server's* clock to hardening the hub's own *local* wall clock (an
+NTP correction at commissioning, an RTC drift fix-up). `go test -race
+./internal/... ./cmd/...` green in lexa-hub; not yet deployed to the bench
+or gated through Mayhem (TASK-038's HIL scenario is the bench proof).
+
+*Verified before implementing (per this decision's 2026-07-04 note above):*
+hub freshness windows (`cmd/hub/state.go`'s `measStaleAfter`/
+`evseStaleAfter`/`meterFrozenAfter`) were **already** monotonic-safe — they
+stamp arrival with `time.Now()` and compare with `now.Sub(s.at)`, and Go's
+`time.Time` carries a monotonic reading from `time.Now()` that `Sub` prefers
+over the wall reading. **Decision recorded: receiver-side arrival stamping
+is THE cross-process freshness mechanism** — not a message's own `Ts` field.
+Every bus message's `Ts` (`bus.Measurement`, `bus.ActiveControl`,
+`bus.DERScheduleMsg`, `bus.PricingUpdate`, `bus.BillingUpdate`,
+`bus.FlowReservationStatusMsg`, journal events, ...) is publisher-side
+observability only; no freshness check anywhere in the codebase reads it,
+and this task did not change that. What genuinely was local-wall-clock-
+sensitive: control expiry (`cmd/hub/state.go`), lexa-api's report grace
+(`cmd/api/handlers.go`), and the optimizer's TOU check — all three compute
+`serverNow = local + offset`, which a local step shifts by the step size
+until the next accepted offset.
+
+**The fix: monotonic anchoring inside `internal/utilitytime`.**
+`Clock.Anchor(serverUnix int64)` records `(serverUnix, cfg.Now())` — the
+`time.Time` value keeps an intact monotonic reading as long as it is never
+round-tripped through `Round(0)`, marshaling, or Unix-second arithmetic.
+Once anchored, `Clock.ServerNow()` returns `anchorServer +
+int64(cfg.Now().Sub(anchorMono).Seconds())` instead of re-deriving from
+`local + offset` — a local wall step after the anchor cannot move it, by the
+same Go-runtime guarantee (`CLOCK_MONOTONIC` immune to `settimeofday`/NTP)
+that already made freshness safe. Every fresh utility-time observation
+re-anchors: `cmd/hub`'s `MQTTSystemReader.onCSIPControl` anchors at
+`msg.Ts+msg.ClockOffset` on every retained-control arrival (same-host
+assumption: lexa-northbound stamps `Ts` with `time.Now().Unix()` at publish
+on the SAME hub Pi/SOM clock, MQTT localhost latency ≪ 1 s — commented at
+the call site; a split-host deployment would have to re-derive); lexa-api's
+`stateStore.onCSIPControl` mirrors it for `/status`'s report grace;
+`cmd/northbound`'s `runDiscovery` re-anchors its shared `Clock` right after
+computing each walk's `serverNow`, so the `responseTracker`'s
+`CreatedDateTime` and every other reader of that Clock get the same
+immunity between walks — including during a WAN-outage holdover, which is
+exactly when a local step would previously have compounded the outage's own
+exposure. `Clock.LocalStep()` (`drift := wallElapsed − monoElapsed since the
+anchor; stepped := |drift| >= StepThresholdS`, default 30 s) is a pure
+detector, decoupled from `ServerNow`, feeding the policy below.
+
+**Local-step policy:** forward steps re-anchor silently (enforcement already
+correct via the anchor; a plain transition log only) — backward steps get
+the identical anchored correctness plus an alarm-level log, since a backward
+RTC/NTP correction is the more operationally surprising direction (log
+wall-times can appear to regress). Either direction logs exactly once per
+transition (edge-triggered, mirroring `noteStaleness`) via a pure decision
+function (`cmd/hub`'s `localStepEdge`) factored out specifically so the
+"exactly once" claim is unit-testable without needing to fake a genuine
+OS-level wall/monotonic desync — which cannot be constructed through Go's
+public `time.Time` API (`Time.Add` shifts wall and monotonic components by
+the identical duration; there is no way to desync them from user code). Test
+suites therefore prove the anchored formula is elapsed-time-based (immune to
+`SetOffset`/wall-`Unix()` reads once anchored) and contrast it against what
+the pre-anchoring raw formula would have produced under a simulated ±1 h
+step, rather than attempting to fake the OS-level desync itself.
+
+**Orchestrator stays I/O-free (05 §1):** rather than touching
+`internal/orchestrator`, both `cmd/hub/state.go`'s `ReadSystemState` and
+`cmd/api/state.go`'s `snapshot()` publish a *derived* offset —
+`r.utclk.ServerNow() − now.Unix()` — into the existing `ClockOffset` field
+the optimizer/report-grace code already consumes via
+`utilitytime.ServerNowAt`. Under a stable local clock this is bit-identical
+to the raw offset (both equal server-minus-local); it only diverges during
+the monotonic holdover between control arrivals under a local step, which is
+exactly the case this task closes. One-line change at each call site;
+`internal/orchestrator` untouched.
+
+**Sweep (TASK-037 step 6, `grep -rn "\.Unix()" cmd internal --include=*.go`,
+excluding tests, run in lexa-hub):** classified every hit. Stamps
+(publisher-side observability, unaffected — `Ts` fields on
+`bus.Measurement`, `bus.ActiveControl`, `bus.DERScheduleMsg`,
+`bus.PricingUpdate`, `bus.BillingUpdate`, `bus.FlowReservationStatusMsg`,
+`bus.PlanLog`, `bus.ComplianceAlert`, journal events,
+`cmd/hub/desired.go`'s `doc.IssuedAt`, `cmd/modbus`'s measurement `Ts`);
+offset acquisition (`internal/northbound/discovery/walker.go`'s
+`tree.ClockOffset = tm.CurrentTime - time.Now().Unix()` — the source of
+truth every anchor ultimately derives from, not itself a comparison);
+local-time bucketing, not utility time (`cmd/hub/main.go`'s pricing-window
+5-min snap; `internal/orchestrator`'s window/EV-departure bucketing —
+unaffected, package untouched per this task's scope); dead code
+(`internal/northbound/scheduler.ServerNow`, deprecated TASK-035, zero live
+callers). Two **known, already-flagged, out-of-scope enforcement gaps**
+remain wall-clock-sensitive and are NOT fixed by this task (neither is in
+TASK-037's Files list; both pre-date it): `cmd/telemetry/main.go`'s
+`postMeasurements` (the "6th serverNow site" this decision already flagged
+after TASK-036, immediately above) still computes `now.Unix() +
+clockOffset` inline; `internal/reconcile/reconcile.go`'s `SetDesired` stale
+gate (`now.Unix()-doc.IssuedAt > staleAfter`) compares raw Unix seconds
+rather than a monotonic `Sub` — both are candidates for a follow-up backlog
+entry (anchor-hardening or receiver-arrival conversion respectively) but sit
+inside `cmd/telemetry`/`internal/reconcile`, which this task's launch
+instructions place out of bounds (owned by concurrent in-flight work on the
+reconciler/actuator path, TASK-031).
+
+**Not this task's job:** the Mayhem HIL proof (forward/backward local-step
+scenarios) is TASK-038; a metric on the local-step alarm is TASK-044; DST/
+timezone TOU edge cases are TASK-079.
+
 ## AD-005 ✅ Persistence: append-only event journal + guard snapshots, not a database (W5)
 
 **Decision.** Newline-delimited, size-rotated, fsync-batched journal on
