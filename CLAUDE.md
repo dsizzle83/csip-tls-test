@@ -87,7 +87,7 @@ TASK-024 — see above) on every PR and push to `main`. Bench-touching suites
 on 69.0.0.x) stay desktop/bench-only, out of hosted CI.
 
 ## Mayhem hostile-QA
-Adversarial HIL fault-injection driving the real bench through 57 worst-case scenarios and
+Adversarial HIL fault-injection driving the real bench through 59 worst-case scenarios and
 diagnosing where the hub's fault handling breaks. Engine: `cmd/dashboard/mayhem.go` +
 `mayhem_world.go` (`/api/qa/*`, dashboard QA tab); headless runner: `scripts/mayhem.py`
 (`--list`, `--only id,id`, `--json`). Verdicts: PASS / DEGRADED / FAIL / BLIND / INCONCLUSIVE.
