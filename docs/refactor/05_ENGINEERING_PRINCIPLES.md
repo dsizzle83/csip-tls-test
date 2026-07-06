@@ -47,7 +47,10 @@ can. When a principle must be broken, say so in the PR description and in
 ## 4. Concurrency
 
 - One writer per state struct; snapshot reads. (Engine mutex consolidation,
-  TASK-067, is the model.)
+  TASK-067, is the model — final shape: `lexa-hub/internal/orchestrator/`
+  `engine_state.go`'s `engineState`, one writer goroutine per field, mutators
+  enqueue on a bounded command channel drained by the control goroutine,
+  `atomic.Pointer` snapshot reads, zero mutexes in `engine.go`.)
 - No state in closures. If it has a name in a bug report, it needs a name
   in the code (`activeBreachMRID` lesson).
 - Every goroutine has an owner, a shutdown path, and a bounded channel
