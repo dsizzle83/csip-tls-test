@@ -759,6 +759,22 @@ Pending validation: shadow-diff results (TASK-059).
 is P6/backlog — configured-only for V1.0. ❓ DP planner stays as-is below
 the constraint layer; revisit only if shadow diffs implicate it.
 
+**Config-location decision (TASK-057, 2026-07-06).** The per-device plant
+model lives in **`hub.json`'s `devices[]`/`stations[]` entries** (optional
+`"plant"` block), NOT `modbus.json`: the **hub** consumes plant physics (the
+optimizer runs in lexa-hub); `lexa-modbus` is a transport that never reads
+ramp/latency/taper. Types: `internal/orchestrator/plantmodel.go`
+(`InverterPlant`/`BatteryPlant`/`MeterPlant`/`EVSEPlant`/`TaperPoint`),
+unit-suffixed and per-wall-clock-second (05 §5/§6); defaults reproduce today's
+optimizer constants exactly (`maxDropW`/`maxRiseW`, `socTaperStart`,
+`battConvergeFrac`, the filterAlpha meter/OCPP lags; `socStepEstimate` stays
+DERIVED from `CapacityKWh`, not a parameter). TASK-057 ships types + config +
+tests only — **unwired** (05 §12 exception); TASK-064 pays the campaign when it
+first reads the model and burns down the globals. `ControlLatencyS`/`MeterLagS`
+are the inputs a future adaptive export-breach detection window would use
+instead of the fixed `exportBreachTicks=3` (~9 s) that races the ~11 s oracle
+boundary on battery-charge-disabled. Discovery stays backlog per above.
+
 ## AD-008 🔶 Security: broker ACLs now, API token+TLS now, OCPP profile 2 at P6
 
 **Decision.** Per-service Mosquitto credentials + topic ACLs (config
