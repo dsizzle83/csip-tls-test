@@ -1,6 +1,14 @@
 # TASK-050 — Mayhem: disk-full scenario
 
-*Status: TODO · Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: CODE COMPLETE (2026-07-05, csip-tls-test `task/049-051-scenarios` 01e97bc,
+unmerged — batched with TASK-049/051 per the Principal Engineer's deadline-push
+instruction, 05 §12 amendment): `disk-full` scenario + size-guarded `fillDisk`/
+`freeDisk` ballast helpers (floor/reserve guard unit-tested as a pure string
+builder), teardown-always-removes-the-ballast with a documented manual-cleanup
+fallback for a dashboard crash mid-run. Bench validation (10× solo, `--abort`
+ballast-removal check, full campaign) explicitly NOT run — rides the next
+batched wave gate; another session owns the live bench for this gate.
+· Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
 
 ## Objective
 Add a Mayhem scenario `disk-full` that fills the partition holding

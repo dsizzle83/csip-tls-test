@@ -1,6 +1,15 @@
 # TASK-051 — Mayhem: MQTT storm / backpressure scenario
 
-*Status: TODO · Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: CODE COMPLETE (2026-07-05, csip-tls-test `task/049-051-scenarios` 01e97bc,
+unmerged — batched with TASK-049/050 per the Principal Engineer's deadline-push
+instruction, 05 §12 amendment): mqttproxy `/storm` (reuses TASK-049's
+`dialAndConnect` helper), `mqtt-storm` scenario (diagnoseConstraint + INV-HUNT +
+TASK-044 overflow-counter check; a cap breach with a flat counter is the named
+"silent wedge" FAIL), unit tests (storm lifecycle, verdict ladder). Bench
+validation (10× solo, abort self-cancel check, full campaign, and the actual
+1000-queue overflow finding) explicitly NOT run — rides the next batched wave
+gate; another session owns the live bench for this gate.
+· Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
 
 ## Objective
 Add a Mayhem scenario `mqtt-storm` that floods the broker with publishes
