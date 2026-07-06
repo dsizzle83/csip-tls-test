@@ -139,6 +139,15 @@ jobs:
         # subtests — verified locally at a few ms, not seconds).
         run: go test ./internal/csipref/...
 
+      # TASK-053: the generative int16/scale-factor boundary sweep (GAP-07)
+      # needs no new step here — it lands as ordinary _test.go files in
+      # packages already exercised above/below: "Southbound unit tests"
+      # (internal/southbound/sunspecsweep runs the shared lexa-proto/sunspec
+      # codec contract against this repo's vendored copy) and this step's
+      # `scripts/qa-regression.sh`, which already globs ./sim/gridsim/...
+      # (apFromWatts' encode-scaling sweep, this repo's product-analogous
+      # watt encoder). Verified locally: both pick up the new tests without
+      # modification.
       - name: QA-harness unit gate (scripts/qa-regression.sh)
         run: bash scripts/qa-regression.sh
 
