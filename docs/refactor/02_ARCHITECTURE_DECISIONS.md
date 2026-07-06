@@ -958,12 +958,130 @@ findings) but doesn't resolve the chunked functional gap that only option
 (`.github/workflows/ci.yml` `fuzz`, schedule-only, no wolfSSL sysroot
 needed) so fuzz coverage keeps accumulating between now and that decision.
 
-## AD-010 ❓ CSIP curve functions (volt-var / volt-watt)
+## AD-010 ✅ CSIP curve functions (volt-var / volt-watt): de-scoped for V1.0
 
-derbase has write paths; nothing drives them from CSIP. V1.0 must either
-implement closed-loop curve dispatch or explicitly de-scope in product
-claims + conformance statement. Decision in TASK-080 after utility/market
-input. De-scope is acceptable for V1.0; silence is not.
+**Problem.** `derbase` has full, tested SunSpec write paths for volt-var
+(M705)/volt-watt (M706)/ride-through trip sets (M707-710), following the
+§3.1.2/§3.3 adopt handshake — but did anything actually DRIVE them from a
+CSIP-resolved control? V1.0 must either implement closed-loop
+CSIP-driven curve dispatch or explicitly de-scope it in the product's
+conformance claims. Silence (shipping without a written answer either way)
+is not acceptable — 09's checklist line is a hard gate on this AD.
+
+**Decision.** De-scope volt-var/volt-watt (and the ride-through
+`CurveLink` modes: FreqWatt, WattPF, HFRT/HVRT/LFRT/LVRT) from V1.0. DER
+devices keep vendor- or commissioning-time default curves satisfying IEEE
+1547-2018's autonomous-operation requirement; the hub continues to fetch,
+resolve, and display curve data for operator visibility (unchanged — see
+survey), but does not enforce it. No product code changes ship with this
+decision; it documents and claims what the code already, honestly does.
+
+**Full survey, evidence table, end-to-end hop estimate, and market-question
+record:** `docs/refactor/adr-inputs/curve-functions-survey.md` (TASK-080).
+Summary of the load-bearing findings:
+
+- The review's `[Likely]` framing ("nothing drives them from CSIP today")
+  is **confirmed true**, with one refinement the survey's §2 trace
+  establishes precisely: the walker fetches the curve-capable
+  `ExtendedDERControlList`/`ExtendedDefaultDERControl` first and resolves
+  every `CurveLink` href against the program's `DERCurveList`
+  (`schedule.Build`/`resolveCurves`,
+  `lexa-hub/internal/northbound/schedule/schedule.go:369-396`) — but that
+  resolved data only feeds the **informational** 24h schedule shown on the
+  dashboard's Schedule tab (`curveSummary`, `cmd/northbound/main.go:753+`).
+  The real-time dispatch path (`Scheduler.resolve`/`activeEvent`,
+  `internal/northbound/scheduler/scheduler.go:158-180,333-378`) reads only
+  the scalar-only `ps.Controls`/`ps.DefaultControl` copies
+  (`extendedListToSimple`/`extendedDefaultToSimple`,
+  `internal/northbound/discovery/walker.go:445-506`), which structurally
+  cannot carry a curve field — `model.DERControlBase`
+  (`lexa-proto/csipmodel/resources.go:269`) has none. `bus.ActiveControl`
+  (`internal/bus/messages.go:46-58`) and `derbase.ApplyControl`
+  (`lexa-proto/derbase/derbase.go:207-262`) inherit the same absence. A
+  curve-bearing control's scalar siblings (e.g. a concurrent `opModExpLimW`)
+  are still applied correctly — nothing crashes or zero-values; the curve
+  intent is fetched, resolved, and displayed, never enforced. This is a
+  true "acknowledged and ignored," verified against the real code path per
+  the task's step-7 requirement, not assumed.
+- The gap between "derbase can write a curve" and "CSIP curve → device" is
+  ten hops (survey §3), tallying 2×S/5×M/3×L — the majority by a wide
+  margin is scheduler curve resolution in the real-time path, a new bus
+  schema (AD-006 discipline, with `Finite()`-style defense-in-depth for
+  point-array data per TASK-055's precedent), reconciler-side adopt
+  orchestration (a sixth convergence axis inside the machinery AD-002/AD-013
+  just finished collapsing from four mechanisms to one — the single
+  highest-risk hop), three device sims gaining SunSpec models 704-710 they
+  do not have today (only legacy 1/120/121/103/123/802 exist on batsim),
+  and new Mayhem scenarios with proper plan/state oracles (not
+  decision-string, per GAP-14). The derbase write paths are the easy ~10%
+  of the bill.
+- **Implement-partial (write once, never re-verify/retry) is explicitly
+  rejected**, not merely deprioritized: an unverified curve write with no
+  ongoing `AdptCrvRslt` poll is the confidently-wrong-dispatch failure mode
+  the review's W2 finding is about, and is strictly worse than today's
+  honest inertness.
+- **Market/certification questions were asked and are unanswered** (survey
+  §4) — no project-owner channel was available in this session. Recorded
+  with an explicit trigger: revisit before signing any pilot/LOI whose
+  contract language references curve-linked DER function sets, or before
+  the certification lab's V1.0 test scope is finalized, whichever comes
+  first. This AD is conditional on those answers, not silent about needing
+  them.
+
+**Alternatives considered.**
+- *Implement closed-loop dispatch now* — rejected for V1.0: cost (survey
+  §3/§5) is disproportionate to any confirmed requirement, and the highest-
+  risk hop (reconciler curve-adopt orchestration) directly works against
+  the program's current stabilization of the device-reconciler convergence
+  surface (AD-002/AD-013, P2 just exited). Revisit once a real pilot/
+  certification answer (§4) requires it — the derbase write paths are
+  proven and waiting.
+- *Implement-partial (pass-through, no verify)* — rejected outright (above).
+
+**Tradeoffs.** V1.0 cannot sell into utility programs that contractually
+mandate live curve dispatch (until answered, unknown whether any target
+program does). In exchange: zero implementation risk, zero delay, and an
+honest, precise conformance claim instead of an accidental silent gap.
+
+**Migration / revisit trigger.** When either market-question (§4) answer
+requires curve dispatch: pull `docs/refactor/10_BACKLOG.md`'s "Volt-var /
+volt-watt closed-loop dispatch" entry, promote it to a TASK-0NN per 04's
+ID-assignment rule, and sequence it using the survey's §3 hop list (the
+reconciler hop should land only once the P5 constraint-controller migration
+sequence, TASK-060+, has stabilized — landing a new convergence axis mid-
+migration compounds exactly the interaction risk P5 exists to reduce).
+
+**Conformance-statement language (for `CONFORMANCE_REPORT.md`, applied at
+its next regeneration, TASK-081):**
+
+> **DER curve functions (volt-var, volt-watt, frequency-watt, watt-PF,
+> voltage/frequency ride-through curves) are out of scope for this
+> conformance cycle.** The client discovers and displays `DERCurve`
+> resources referenced by a program's `DERControlBase` (operator
+> visibility only) but does not resolve them into a dispatched control —
+> the corresponding `DERControlBase` operating-mode fields
+> (`opModVoltVar`, `opModVoltWatt`, `opModFreqWatt`, `opModWattPF`,
+> `opModHFRTMayTrip`/`MustTrip`, `opModHVRTMayTrip`/`MomentaryCessation`/
+> `MustTrip`, `opModLFRTMayTrip`/`MustTrip`, `opModLVRTMayTrip`/
+> `MomentaryCessation`/`MustTrip`) are read but not enforced. DER devices
+> in this deployment model rely on vendor- or commissioning-time default
+> curves meeting IEEE 1547-2018's autonomous-operation requirements
+> independent of the hub. Any scalar `DERControlBase` fields present
+> alongside a curve-linked field in the same control (e.g. a concurrent
+> export limit) are unaffected and fully enforced. `DERCapabilityFull.
+> ModesSupported` is not asserted to claim these modes. Southbound SunSpec
+> write support for these modes (models 705-710, the §3.1.2/§3.3 adopt
+> handshake) exists in the shared `lexa-proto/derbase` module and is unit-
+> tested, but is not wired to any CSIP-resolved control in this release —
+> see AD-010.
+
+**Open questions.** §4's three market/certification questions, unanswered
+— see survey and revisit trigger above. Recommended (not required this
+task; see backlog) follow-up: an S-effort metric/log distinguishing "an
+active/default control we are currently enforcing referenced a curve-linked
+mode we cannot apply" from the existing per-walk `countProgramsWithCurves`
+debug count, so "silently ignored" becomes "flagged and ignored" without
+waiting for the full implementation.
 
 ## AD-011 ✅ Crash-only design is intentional
 
