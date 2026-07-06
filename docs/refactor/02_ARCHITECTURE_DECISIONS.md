@@ -892,6 +892,30 @@ plant grows it). TASK-058 ships the skeleton + arbiter + Stack + table tests
 only — **unwired** (05 §12 exception); TASK-059's shadow harness is the first
 caller and TASK-060 the first real constraint (which pays the campaign).
 
+**First-flip shadow gate (TASK-060, 2026-07-06).** The `ExportConstraint`
+(TierCompliance) ports `applyExportLimitRule`+`expGuard` (ceiling controller) and
+`checkExportLimitConvergence`+`expOverTicks` (measured-effect backstop) into a
+pure `Evaluate` over a typed `ExportSession` — the two reset cadences preserved
+as distinct fields (controller resets on a cap-VALUE change; the compliance
+counter resets ONLY on cap-clear-to-NaN), the exact separation the 2026-07-03
+control-churn fix depends on. **Mutation-verified:** folding the compliance reset
+into the controller cadence makes `TestExportConstraint_ChurnEscalatesCannotComply`
+and `_OverTicksSurvivesCapRewrite` FAIL (recorded run). The export-breach
+detection window is the ADAPTIVE `Plant.ExportDetectionWindowTicks`
+(controlLatency+meterLag over the tick) rather than the fixed `exportBreachTicks`
+— bench FAST defaults yield 3 (parity), a slower plant grows it (the M2 fix).
+Wired into the TASK-059 candidate Stack in shadow only (wrapper still returns the
+legacy plan). **Gate RESULT:** `lexa_constraint_shadow_divergence_total` held at
+**0** across the export family (export-cap-full-battery, battery-charge-disabled,
+control-churn, pv-flicker, solar-bad-scale, meter-ct-inverted) AND a full
+51-scenario FAST campaign — the constraint reproduces the cascade's export axis
+(solar-ceiling / battery-setpoint / breach) within tolerance on every candidate-
+active tick. Flag-on control impact was zero: the same-session full campaign scored
+**34P/17D/0FAIL/0BLIND** (baseline). **Flip to `export: active` DEFERRED** pending
+the longer clean-shadow soak the P5 plan requires. EVSE-current emission is held
+back in shadow (the 058 Stack cannot yet carry an OCPP connector; the EV setpoint
+is still computed for the ceiling feed-forward) — it lands with the active flip.
+
 ## AD-008 🔶 Security: broker ACLs now, API token+TLS now, OCPP profile 2 at P6
 
 **Decision.** Per-service Mosquitto credentials + topic ACLs (config
