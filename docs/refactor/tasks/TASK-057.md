@@ -1,6 +1,6 @@
 # TASK-057 — Plant-model types + per-device config schema (ramp, latency, taper)
 
-*Status: TODO · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-06, task/057-plant-model @ lexa-hub) · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
 
 ## Objective
 A `PlantModel` type set exists in `lexa-hub/internal/orchestrator` with a
