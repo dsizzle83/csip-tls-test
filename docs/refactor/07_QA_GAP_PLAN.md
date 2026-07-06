@@ -106,6 +106,15 @@ log-and-drop (no alarm) and any future lax decoder (`UseNumber`/
 **Work (rescoped):** regression-pinning tests, defense-in-depth finiteness
 check, alarm-routing the drop via the TASK-018 envelope path, and proof a
 NaN control limit never reaches the optimizer.
+**Landed (055, DONE 2026-07-05):** `internal/bus/nan_reject_test.go` pins
+stdlib's existing bare/quoted NaN/Inf rejection; `Finite() error` added to
+every `*float64`-bearing message type and wired into `mqttutil.Subscribe`
+(type-asserted after `Unmarshal`); both a `Finite()` failure and a plain
+`Unmarshal` failure now increment `bus.RecordDecodeFailure` (sibling of
+`RejectAndAlarm`), closing the "silent" half of the gap. Scope grep for lax
+decoders (`UseNumber`/`json.Number`/`map[string]any`/`interface{}`/
+`ParseFloat`) found none on the bus decode path. `ActiveControl` NaN-limit
+safety case covered — see AD-006 note.
 
 ## P2 — Load/duration family
 

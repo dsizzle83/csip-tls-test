@@ -1,6 +1,23 @@
 # TASK-055 — `"NaN"`-string bus JSON robustness + test
 
-*Status: TODO · Phase: P4 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-05, lexa-hub 828f4d6, branch task/055-nan-bus) · Phase: P4 · Effort: S (≈2–3 h) · Difficulty: low · Risk: low*
+
+**Closure note:** scope grep for lax decoders (`UseNumber`/`json.Number`/
+`map[string]any`/`interface{}`/`ParseFloat`) found none on the bus/
+measurement decode path — the task is exactly the pinning tests + defense-
+in-depth described below, no additional lax-path closure needed.
+`internal/bus/nan_reject_test.go` pins stdlib's existing bare/quoted
+NaN/Infinity rejection; `Finite() error` added to every `*float64`-bearing
+message type and wired into `mqttutil.Subscribe`; a `Finite()` failure and
+a plain `Unmarshal` failure both now increment `bus.RecordDecodeFailure`
+(sibling of `RejectAndAlarm`/`VersionRejects`), closing the silent-drop half
+of GAP-09. `ActiveControl` NaN-limit safety case covered:
+`TestActiveControlNaNLimitNeverReachesOptimizer`. `go test -race
+./internal/... ./cmd/...` green in lexa-hub; producer-side `nan_test.go`
+unchanged. Follow-up (noted, not done — outside this task's `internal/bus`
++ `internal/mqttutil` lane): sum `bus.DecodeFailures()` into each service's
+`lexa_bus_decode_failures_total` metric in `cmd/*/main.go` (today only
+`VersionRejects()` feeds it); optional rogue-publisher Mayhem probe.
 
 ## Objective
 Make the bus decode layer explicitly reject `"NaN"`/`"Infinity"`/`"-Infinity"`
@@ -173,24 +190,24 @@ and the full `./internal/... ./cmd/...`.
 - Fail-closed control-plane discipline (a rejected control holds last-good).
 
 ## Acceptance criteria
-- [ ] Scope grep results in the PR; any lax-decode slip path closed or
+- [x] Scope grep results in the PR; any lax-decode slip path closed or
       documented as absent.
-- [ ] `nan_reject_test.go` covers bare + quoted NaN/±Inf across all
+- [x] `nan_reject_test.go` covers bare + quoted NaN/±Inf across all
       `*float64`-bearing message types, plus the `ActiveControl`-NaN-limit
       safety case; green under `-race`.
-- [ ] A non-finite value routed to alarm+drop (counter increments) instead
+- [x] A non-finite value routed to alarm+drop (counter increments) instead
       of silent drop, on an opted-in decode path.
-- [ ] `go test -race ./internal/... ./cmd/...` green; `nan_test.go`
+- [x] `go test -race ./internal/... ./cmd/...` green; `nan_test.go`
       unchanged and passing.
-- [ ] A NaN in an ActiveControl limit provably does NOT reach the
+- [x] A NaN in an ActiveControl limit provably does NOT reach the
       scheduler/optimizer (dropped, last-good held).
 
 ## Regression checklist
-- [ ] `go test -race ./internal/...` (lexa-hub) green (+ `./cmd/...`)
-- [ ] Conformance logic tests: none (bus-internal)
-- [ ] Mayhem: none required (unit-level); optional rogue-publisher probe if
-      built
-- [ ] Producer-side `nan_test.go` untouched and green
+- [x] `go test -race ./internal/...` (lexa-hub) green (+ `./cmd/...`)
+- [x] Conformance logic tests: none (bus-internal)
+- [x] Mayhem: none required (unit-level); optional rogue-publisher probe not
+      built (noted as follow-up)
+- [x] Producer-side `nan_test.go` untouched and green
 
 ## Mayhem scenarios affected
 None required. Optional stretch adds a `bus-nan-injection` probe (via

@@ -562,6 +562,34 @@ embedded one with no error) rather than a compile-time signal. Code and
 unit tests (`go test -race ./internal/bus/ ./internal/mqttutil/`, full
 `go test -race ./internal/... ./cmd/...`) are green.
 
+**Finite-value defense-in-depth (TASK-055, GAP-09, 2026-07-05):** reject-and-
+alarm's scope has been extended from "wrong schema version" to "non-finite
+numeric value slipped past decode." `encoding/json` already refuses a bare
+or quoted `NaN`/`Infinity`/`-Infinity` into a typed `float64`/`*float64`
+field — `lexa-hub/internal/bus/nan_reject_test.go` pins that fact so a
+regression to a laxer decoder would be caught. The residual (a future
+`UseNumber`/`interface{}`/`map[string]any` path, or a non-Go publisher's
+encoder) is closed with a `Finite() error` method on every `*float64`-bearing
+message type (`Measurement`, `BattMetrics`, `ActiveControl`, `ComplianceAlert`,
+`EVSEState`, `DERScheduleSlot`/`DERScheduleMsg`), type-asserted and called by
+`mqttutil.Subscribe` right after a successful `Unmarshal`. A `Finite()`
+failure — and, newly, a plain `Unmarshal` failure too — is now routed through
+`bus.RecordDecodeFailure`, a sibling of `RejectAndAlarm`/`VersionRejects`
+(same rate-limited counter+log shape, exposed via `bus.DecodeFailures()`).
+Before this, a malformed payload on a non-control topic was only
+`log.Printf`'d — invisible to metrics; that silent half of GAP-09 is now
+alarmed like a version reject. The safety-critical case:
+`ActiveControl.Finite()` rejects the whole message on a NaN
+`ExpLimW`/`ImpLimW`/`MaxLimW`/`FixedW`, so a NaN control limit is dropped
+(fail-closed, last-known-good holds), never adopted by the optimizer.
+Scope grep (`UseNumber`/`json.Number`/`map[string]any`/`interface{}`/
+`ParseFloat` across `internal`, `cmd`) found no lax-decode path on the bus/
+measurement boundary today — the `Finite()` methods are pinned defense in
+depth for if one is ever introduced. Summing `bus.DecodeFailures()` into
+each service's `lexa_bus_decode_failures_total` metric (today only
+`VersionRejects()` feeds it — see each `cmd/*/main.go`) is a follow-up
+outside this task's `internal/bus` + `internal/mqttutil` lane.
+
 **Status stays 🔶, not ✅, deliberately**: this rollout landed during a
 program-wide deploy freeze (TASK-012 unmerged) with bench access authorized
 for read-only/verification only, not deploys. The rolling-upgrade

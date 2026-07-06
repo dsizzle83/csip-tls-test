@@ -88,7 +88,7 @@ optimizer tests; no soak, no packet-level chaos, no restart-unclean tests.
 | Duplicate client ID / topology errors | scenario | 049 |
 | int16/scale-factor boundaries | generative sweep vs shared codec | 053 |
 | Threshold dither (SoC@reserve, export@breach) | sweep scenarios | 054 |
-| `"NaN"` string in bus JSON | decoder hardening + test | 055 |
+| `"NaN"` string in bus JSON | decoder hardening + test landed (055, DONE) | 055 |
 | Hostile HTTP bytes | fuzz + size caps | 047 |
 | Valid-namespace garbage XML / bus JSON | fuzz landed (048, DONE); no gate widening — see finding below | 048 |
 | Disk full | scenario | 050 |
