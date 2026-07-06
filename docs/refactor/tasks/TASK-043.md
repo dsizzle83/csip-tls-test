@@ -1,6 +1,19 @@
 # TASK-043 — Mayhem: power-cut retained rollback + corrupted-retained scenarios
 
-*Status: TODO · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: high · Risk: low*
+*Status: CODE COMPLETE, BENCH VALIDATION PENDING (2026-07-06, `task/043-powercut`) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: high · Risk: low*
+
+**2026-07-06 update:** Both scenarios (`power-cut-retained-rollback`,
+`corrupted-retained-control`) plus the broker-store manipulation helpers, the
+retained-payload parser, and the custom `power-cut-retained-rollback` verdict
+ladder are implemented in `cmd/dashboard/mqtt_scenarios.go` on branch
+`task/043-powercut`, with pure-function unit tests in
+`cmd/dashboard/mqtt_scenarios_test.go` (`go test ./cmd/dashboard/...` green;
+`go build -o bin/dashboard ./cmd/dashboard` green). This was a **code-only**
+session per explicit launch instructions — no bench access, no SSH, no
+dashboard restart. The Acceptance criteria below that require the live bench
+(10× solo verdicts, `--abort` self-restore, full campaign) are **not yet
+run** and are deferred to the 081 bench gate. See `docs/QA_FINDINGS.md` §8
+for the implementation writeup and the deferred-validation list.
 
 ## Objective
 Add two Mayhem scenarios that prove (or pin) the retained-message trust
