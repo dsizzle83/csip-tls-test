@@ -5,7 +5,7 @@
         test test-fast test-integration test-update-golden test-southbound qa qa-bench fuzz \
         sweep-sunspec \
         modsim-image modsim-run modsim-stop \
-        gen-test-certs gen-client-cert smoke-pi clean help
+        gen-test-certs gen-client-cert gen-ev-cert smoke-pi clean help
 
 REPO_ROOT     := $(shell pwd)
 SERVER_CERTS  := sim/tlsserver/testdata/certs
@@ -304,6 +304,12 @@ gen-client-cert:
 gen-server-cert:
 	bash scripts/gen-server-cert.sh $(IPS)
 
+# Regenerate the OCPP CSMS TLS cert (Security Profile 2, TASK-074).  Include
+# the hub's LAN IP so evsim's -tls-ca verification succeeds:
+#   make gen-ev-cert IPS=69.0.0.1
+gen-ev-cert:
+	bash scripts/gen-ev-cert.sh $(IPS)
+
 # Auto-generate certs on first test run via dependency tracking.
 $(CA_CERT):
 	@echo "Test certs missing — generating..."
@@ -364,6 +370,9 @@ help:
 	@echo "  make gen-client-cert     Issue a client cert from the production CA"
 	@echo "                           Output: certs/client-staging/ — SCP then delete"
 	@echo "                           Override CN: make gen-client-cert CN=csip-pi-002"
+	@echo "  make gen-ev-cert         Issue the OCPP CSMS cert (Security Profile 2, TASK-074)"
+	@echo "                           Output: certs/ev-server-cert.pem (commit), certs/vault/ev-server-key.pem (gitignored)"
+	@echo "                           Include the hub's LAN IP: make gen-ev-cert IPS=69.0.0.1"
 	@echo ""
 	@echo "Hardware validation:"
 	@echo "  make smoke-pi            Deploy to Pi, run quick smoke test"

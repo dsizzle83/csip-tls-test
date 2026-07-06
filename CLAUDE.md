@@ -73,7 +73,11 @@ make build                        # all binaries → bin/
 scripts/run-conformance.sh        # full CSIP conformance evidence (layers 1-3)
 
 bin/evsim -csms ws://69.0.0.1:8887/ocpp -api-port 6024   # NOTE: flag is -csms, not -hub
+# OCPP Security Profile 2 (TASK-074): ws:// is bench-only; product default is wss://:
+bin/evsim -csms wss://69.0.0.1:8887/ocpp -tls-ca certs/ca-cert.pem \
+          -auth-user evse-bench -auth-pass <secret> -api-port 6024
 make gen-client-cert CN=csip-pi-002
+make gen-ev-cert IPS=69.0.0.1    # issue the OCPP CSMS cert (Security Profile 2, TASK-074)
 scripts/hub-replay-tune.sh fast|stock   # hub engine/discovery timing for bench replay
 bash scripts/bench-up.sh --fast|--stock # bring desktop services up + set hub timing
 python3 scripts/mayhem.py --dashboard http://localhost:8080   # run the hostile-QA suite

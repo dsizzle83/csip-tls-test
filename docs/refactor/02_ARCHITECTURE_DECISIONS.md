@@ -932,6 +932,29 @@ documented as a bench property, never a product default. Deployed-vs-repo
 mosquitto config differs (the Pi runs a slimmed conf.d drop-in) — ACL work
 must edit both (TASK-013).
 
+**TASK-074 update (2026-07-06): code/config/cert-tooling half delivered,
+bench half deferred to 081.** Re-verified the "already implemented" claim
+directly (`grep ws.NewTLSServer`/`SetBasicAuthHandler` — confirmed live in
+`lexa-proto/ocppserver/server.go`, post-022/023 extraction). Delivered on
+`task/074-ocpp-sp2` (both repos, unmerged): CSMS cert issued from the bench
+CA with an IP SAN for the hub (`gen-ev-cert.sh 69.0.0.1`); `deploy-hub-pi.sh
+--enable-ocpp-sp2` (staged cert/key install, idempotent
+`openssl rand -hex 16` Basic Auth secret, `ocpp.json` patch — same
+staged-rollout shape as `--enable-api-auth`); `update-sim-pis.sh
+--enable-ocpp-sp2` (evsim ExecStart rewritten to `wss://` + `-tls-ca`/
+`-auth-user`/`-auth-pass` via an idempotent regex substitution that also
+cleanly rolls back to plain `ws://` when the flag is omitted); a negative-auth
+unit test (`cmd/ocpp` `TestOCPPSecurityProfile2_BasicAuth` — wrong password,
+wrong username, correct credentials, all against the real
+`ocppserver.New`/`SetBasicAuthHandler` code path) since none previously
+existed; product-config policy documented as a Critical Invariant in
+lexa-hub CLAUDE.md (`ws://` bench-only, `wss://` product default). **Not yet
+done, explicitly deferred to TASK-081** (same-session bench access needed):
+the live lockstep restart on the actual hub-pi/ev-pi, the wss handshake +
+negative-auth verification against the real bench, and the 7-scenario ×3 EV
+Mayhem re-run. The 09 checklist box for OCPP SP2 stays unchecked until that
+evidence lands.
+
 **TASK-014 update (2026-07-04): API-token half delivered, TLS half explicitly
 deferred.** Bearer-token auth on lexa-api `/status`/`/logs` landed
 (constant-time compare, `api_token_file` staged rollout — empty ⇒ open,

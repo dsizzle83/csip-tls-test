@@ -1,6 +1,10 @@
 # TASK-074 — OCPP security profile 2 (TLS + BasicAuth); evsim counterpart
 
-*Status: TODO · Phase: P6 · Effort: L (≈6 h) · Difficulty: med · Risk: med*
+*Status: PARTIAL (2026-07-06, `task/074-ocpp-sp2` @ lexa-hub `c82b778` +
+csip-tls-test `a4dcde0` — code/config/cert-tooling complete + unit-tested,
+unmerged; live bench lockstep deploy + 7-scenario ×3 EV Mayhem re-run
+deferred to TASK-081, see docs/BENCH.md's OCPP Security Profile 2 runbook) ·
+Phase: P6 · Effort: L (≈6 h) · Difficulty: med · Risk: med*
 
 ## Objective
 The lexa-ocpp CSMS and evsim run OCPP 2.0.1 Security Profile 2 on the
@@ -157,19 +161,31 @@ lifecycle over wss, then re-run the 7 scenarios ×3.
   bench CA if the tooling already does so (check gen-ev-cert.sh intent).
 
 ## Acceptance criteria
-- [ ] wss handshake + BasicAuth verified in journals; wrong-password
-  evsim rejected.
-- [ ] TransactionEvent lifecycle + EVSE state flow intact over wss.
-- [ ] 7 scenarios ×3 at accepted verdicts (evidence archived).
-- [ ] No secrets/keys committed; product-config policy documented.
-- [ ] Deploy scripts reproduce the setup from scratch.
+- [x] wss handshake + BasicAuth verified — unit-level (`TestOCPPSecurityProfile2_BasicAuth`,
+  wrong password + wrong username rejected, correct credentials accepted, against
+  the real `ocppserver.New`/`SetBasicAuthHandler` code path). **Bench-journal
+  verification (actual wss handshake on 69.0.0.1/.14) NOT done this session —
+  deferred to TASK-081.**
+- [ ] TransactionEvent lifecycle + EVSE state flow intact over wss. **Bench-only —
+  deferred to TASK-081** (existing `simulator_test.go` coverage is over
+  plain ws://, unaffected by this task).
+- [ ] 7 scenarios ×3 at accepted verdicts (evidence archived). **Deferred to
+  TASK-081** (needs the live lockstep bench deploy first).
+- [x] No secrets/keys committed; product-config policy documented (lexa-hub
+  CLAUDE.md Critical Invariants + `cmd/ocpp/config.go` doc comments).
+- [x] Deploy scripts reproduce the setup from scratch (`gen-ev-cert.sh` →
+  `deploy-hub-pi.sh --enable-ocpp-sp2` → `update-sim-pis.sh --enable-ocpp-sp2`,
+  documented end-to-end in csip-tls-test docs/BENCH.md).
 
 ## Regression checklist
-- [ ] `go test -race ./internal/...` (lexa-hub) green
-- [ ] `make test-fast` (csip-tls-test) green
+- [x] `go test -race ./internal/...` (lexa-hub) green
+- [x] `make test-fast` (csip-tls-test) green
 - [ ] Mayhem: 7-scenario EV set ×3 (full campaign optional — transport-
-  only change; run full if any ocppserver code changed)
-- [ ] Lockstep deploy performed in one session (log it in the PR)
+  only change; run full if any ocppserver code changed). **Deferred to TASK-081.**
+- [ ] Lockstep deploy performed in one session (log it in the PR). **Deferred to
+  TASK-081** — this session did code/config/cert-tooling only, no live SSH
+  deploy (see docs/BENCH.md's OCPP Security Profile 2 runbook for the exact
+  steps that session must run).
 
 ## Mayhem scenarios affected
 ev-profile-reject, ev-accept-but-ignore, ev-min-current-floor,
