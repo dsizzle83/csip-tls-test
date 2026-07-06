@@ -235,11 +235,19 @@ each ceiling change (incl. the `CeilingW=1e9` restore edge), 1 `SeqReset` (hub
 restart, AD-013 rule 2), **0 stale-ceiling holds**. EVSE shadow idle until an
 EV session commands current (expected).
 
-**Post-flip gate evidence (solo, 1 cycle):** the two release-edge **oracles**
-PASS — `release-while-rebooting` (solar recovered to full 47 s after the device
-returned) and `curtailment-release` (recovered 24 s after return). No INV-HUNT
-(active applies are backoff-paced, ≤3 identical writes to converge a slow/refusing
-inverter, not a tight loop). Remaining solar-family + 7-EV ×10-solo and the
-10-cycle FAST campaign are the Principal-gated exhaustive validation. Bench left
-FAST + solar-active + evse-active + battery-active. Rollback = config `shadow` +
-restart (rehearsed on the shadow→active transition).
+**Post-flip gate evidence:** the two release-edge **oracles** PASS solo —
+`release-while-rebooting` (solar recovered to full 47 s after the device
+returned) and `curtailment-release` (recovered 24 s after return). Targeted
+15-scenario solar+EV set **6P/9D/0F/0B** — all DEGRADED are the refuse/reject/
+lag/reboot families where the hub correctly flags CannotComply (accepted), and
+every *correctness* scenario PASSes: `ev-meter-freeze` (silence≠convergence: held
++ flagged stale, cap kept), `ev-wrong-units` (implausible rejected, L11),
+`ev-connector-flap` (stable, no over-command), `solar-bad-scale` (plausibleW
+withheld). No INV-HUNT (active applies are backoff-paced, ≤3 identical writes to
+converge a slow/refusing inverter, not a tight loop). **Full 51-scenario FAST
+campaign 33P/18D/0F/0B** (`qa-mayhem-20260705-205515.md`) — EXACTLY the TASK-028
+battery-active baseline, i.e. the solar+EVSE flip added **zero regressions**
+(0 FAIL, 0 BLIND, SAFETY held). `solar-reboot-forget`'s DEGRADED is the known
+028-baseline D. The ×10-solo per scenario and the 10-cycle campaign soak remain
+as deeper Principal-gated validation. Bench left FAST + battery/solar/evse-active.
+Rollback = config `shadow` + restart (rehearsed on the shadow→active transition).
