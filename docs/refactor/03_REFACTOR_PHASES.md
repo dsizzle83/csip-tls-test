@@ -292,8 +292,15 @@ TASK-056 (behavioral tests) blocks all migration tasks.
 - The cascade's *ordering* is semantics: Rules 1→6 + restore + safety
   backstop resolve conflicts implicitly. The constraint controller makes
   priority explicit (safety > compliance > economics); shadow-mode
-  (TASK-059) runs both stacks per tick on live bench input and diffs
-  decisions for ≥1 week of bench time before any flip.
+  (TASK-059, DONE) runs both stacks per tick on live bench input and diffs
+  FINAL per-device outputs (not decision strings) under tolerance bands for
+  ≥1 week of bench time before any flip. The divergence counter is
+  `lexa_constraint_shadow_divergence_total` (metric) and the
+  `shadow_divergences` field on `lexa/hub/plan`; the diff is candidate-scoped
+  (a divergence is any axis/breach the candidate Stack would actuate
+  differently), so an empty Stack reads ~0 and the signal grows as constraints
+  are wired. Harness: `internal/orchestrator/constraint/shadow.go`, behind
+  `hub.json` `constraint_shadow` (default off).
 - Bench-calibrated constants (`socStepEstimate` "20× demo",
   `maxDropW=1500/maxRiseW=500`, `filterAlpha=0.4`) hide the real plant
   model. Converting them to parameters must reproduce identical FAST-bench
