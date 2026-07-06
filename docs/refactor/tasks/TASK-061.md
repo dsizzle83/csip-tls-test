@@ -1,6 +1,21 @@
 # TASK-061 — Migrate import + generation constraints
 
-*Status: TODO · Phase: P5 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
+*Status: SHADOW-VALIDATED (2026-07-06, lexa-hub `9a23b93`, branch `task/061-import-gen`) · Phase: P5 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
+
+> **Shadow gate (2026-07-06):** ImportLimitConstraint + GenLimitConstraint built,
+> mutation-verified (gen meter floor + import NaN-hold both go red when unwired),
+> `go test -race ./internal/... ./cmd/...` green. Deployed to the bench in SHADOW
+> alongside ExportConstraint (all three TierCompliance in the candidate Stack).
+> Gen family (reject-write/enable-gate/ramp-limit/ack-before-effect/curtailment-release)
+> **0 divergence**; import family (battery-soc-refuse/battery-empty-import-cap) +
+> stale-meter/perfect-storm **0 divergence**; full FAST campaign
+> (`qa-mayhem-20260706-171022.md`, 33P/18D/**0F/0B**) recorded exactly **1**
+> shadow divergence — on the BATTERY-SETPOINT axis authored by the EXPORT
+> constraint (candidate −1000 W charge vs legacy 0 W at battery SOC 10.57 % under a
+> gen-cap + TOU-peak-discharge state), NOT on any import or gen axis. Import and gen
+> axes are behaviorally flip-ready pending the ≥1-week soak; the export-axis
+> divergence is a separate finding (see the TASK-061 shadow report / hand back to
+> the export flip). Flips (steps 6-8) NOT executed — legacy remains authoritative.
 
 ## Objective
 The import-limit rule (`applyImportLimitRule` + `impGuard` +
