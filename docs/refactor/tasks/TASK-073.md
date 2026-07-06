@@ -1,6 +1,39 @@
 # TASK-073 — Cert rotation without control interruption + reconnect-churn soak
 
-*Status: TODO · Phase: P6 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
+*Status: PARTIAL (2026-07-06, `lexa-hub` `task/073-cert-rotation` @ `90d5d9a`, unmerged) · Phase: P6 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
+
+**2026-07-06 update:** Rotation mechanism CODE COMPLETE + unit/integration
+tested: `WolfSSLFetcher.Reload` (lexa-hub `internal/tlsclient/fetcher.go`)
+implements the probe-then-commit swap (new session dialed+probed fully
+before the old one is touched; Close→FreeSSL→FreeCtx under the fetcher's
+existing mutex); `cmd/northbound/rotate.go`'s `RotationController` is the
+sentinel-file trigger, rotating all three fetchers (discovery/response/
+flow-reservation) one at a time and refusing an LFDI-mismatched cert
+(re-enrollment guard). `scripts/rotate-cert.sh` (lexa-hub) is the operator
+procedure; `docs/CERT_ROTATION_RUNBOOK.md` (lexa-hub) is the full writeup
+incl. the "re-enrollment vs rotation" LFDI caveat (this codebase's LFDI
+hashes the FULL DER cert, so even a same-CN/same-key reissue changes it —
+`gen-client-cert.sh` also mints a fresh key every call, compounding this;
+documented, not silently papered over). Tests: `go test -race
+./internal/... ./cmd/...` (lexa-hub) green; `go test -race -tags=integration
+./internal/tlsclient/...` (desktop amd64 sysroot) green — 5 back-to-back
+reload rounds + the "right CA, wrong device, 403" probe-rejection case
+against a real, self-contained wolfSSL client+server pair (this package's
+PRE-EXISTING `client_test.go`/`fetcher_test.go` integration tests reference
+undefined helpers and have no private key material for their testdata —
+cannot build/run in a fresh checkout independent of this task; flagged for
+review, not fixed here — out of scope).
+
+**NOT DONE this session (soak-gated, deferred per 00's residual-soak
+convention):** the 24h reconnect-churn soak itself (bench time — needs a
+dedicated day outside any QA campaign window) and its downstream steps: the
+bench single-rotation drill's LIVE meter-continuity evidence (acceptance
+criterion 1 — the mechanism is proven by the integration tests but not yet
+run against real gridsim+meter hardware), the post-soak FAST campaign, and
+RSK-07's final "Mitigated" flip. `csip-tls-test`
+`docs/CERT_ROTATION_SOAK_RUNBOOK.md` + `scripts/cert-churn-soak.sh` are
+ready to run precisely as written. RSK-07 (08_RISK_REGISTER.md) updated to
+"Mitigation implemented, soak pending" this session.
 
 ## Objective
 A staged certificate-rotation procedure exists and is exercised on the
