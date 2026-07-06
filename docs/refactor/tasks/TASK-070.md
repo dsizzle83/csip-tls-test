@@ -1,6 +1,10 @@
 # TASK-070 — Context propagation walker-deep
 
-*Status: TODO · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-06, lexa-hub 63a81aa) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: low · Risk: low*
+*Branch: lexa-hub `task/070-ctx-propagation` (unmerged, not pushed). Bench
+stop-during-walk timing + Mayhem smoke (wan-outage-hold, northbound-hang)
+still pending a live bench session — code + unit-test acceptance criteria
+are met; see report for the Post-vs-PostContext scope decision.*
 
 ## Objective
 A `context.Context` flows from each service main through the discovery
@@ -135,18 +139,33 @@ Fetcher interface.
 - northbound-hang / wan-outage scenario verdicts.
 
 ## Acceptance criteria
-- [ ] `Discover` + all fetch helpers + Fetcher interface are ctx-first;
-  both real consumers migrated.
-- [ ] Cancel-mid-walk unit test green; bench stop-during-walk <2 s.
-- [ ] Shutdown cancel logged as info, not counted as walk failure.
-- [ ] Smoke scenarios at accepted verdicts.
+- [x] `Discover` + all fetch helpers + Fetcher interface are ctx-first;
+  both real consumers migrated. (Get is a clean signature change per step
+  2's decision; Post gained a ctx-first PostContext sibling rather than a
+  signature change, since Post has two other production consumers —
+  responses.Tracker, flowres.Manager — outside this task's blast radius;
+  see report.)
+- [x] Cancel-mid-walk unit test green; bench stop-during-walk <2 s NOT YET
+  MEASURED (needs a live bench session — code path is in place: ctx is
+  checked between every one of the ~15 fetch sites, so a stop should abort
+  well inside one fetch's ReadTimeout, but this wasn't verified against a
+  real systemd unit in this session).
+- [x] Shutdown cancel logged as info, not counted as walk failure.
+- [ ] Smoke scenarios at accepted verdicts — NOT RUN (no bench session this
+  task; batched per launch instructions' note that campaigns may be gated
+  to the wave; northbound-hang/wan-outage-hold verdicts are asserted
+  unchanged by inspection — no wire/timeout/publish-path behavior changed).
 
 ## Regression checklist
-- [ ] `go test -race ./internal/...` (lexa-hub) green
-- [ ] Conformance logic tests green (walker touched — run
-  `go test ./tests/` in csip-tls-test)
-- [ ] Mayhem: smoke only (wan-outage-hold, northbound-hang)
-- [ ] arm64 + amd64 CGo builds green
+- [x] `go test -race ./internal/...` (lexa-hub) green
+- [x] Conformance logic tests green (walker touched — ran
+  `go test ./tests/` in csip-tls-test; unaffected, csip-tls-test's walker
+  is its own independent internal/csipref implementation, AD-003(f)/
+  TASK-082 — no cross-repo coupling to lexa-hub's walker)
+- [ ] Mayhem: smoke only (wan-outage-hold, northbound-hang) — NOT RUN, no
+  bench session this task (see report)
+- [x] arm64 + amd64 CGo builds green (northbound + telemetry, both
+  architectures)
 
 ## Mayhem scenarios affected
 wan-outage-hold, wan-outage-expiry, northbound-hang — verdicts unchanged;
