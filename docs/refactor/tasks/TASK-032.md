@@ -1,6 +1,29 @@
 # TASK-032 — Delete the legacy convergence mechanisms (per-mechanism revertible commits)
 
-*Status: TODO · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: med · Risk: **high***
+*Status: DONE (2026-07-06, lexa-hub 20cc2b2·783a4c5·9fbcaa0·f87136c) · Phase: P2 · Effort: L · Difficulty: med · Risk: **high***
+
+> **Closeout (2026-07-06).** Four per-mechanism deletion commits on lexa-hub
+> `task/032-delete-legacy` (+ CLAUDE.md 2f090fe, config 66cfb11): (A, 20cc2b2)
+> legacy `lexa/control/*` + `lexa/evse/+/command` publish/subscribe surface and
+> the `MQTT*Actuator` publishers — the desired-doc publisher is now the sole
+> actuator; config battery/solar/evse must be reconciler `active` (off/shadow
+> fatal). (B, 783a4c5) `cmdDeduper` + `reassertEvery` watchdog + breach-triggered
+> `dedupeResets`. (C, 9fbcaa0) `retryDevice.lastCtrl` + `reassertLocked` (retry
+> mechanics kept). (D, f87136c) redundant `restoreOnGenLimitClear` (differential-
+> equivalent to `applyRestoreRule`). `applyRestoreRule` (ledger L1) is KEPT — only
+> its downstream publish spam died; comment clarified. `go test -race
+> ./internal/... ./cmd/...` green after every commit; each commit reverts
+> independently. Binary-only deploy to hub-pi (configs/mqttproxy-1882/FAST
+> preserved; backups `.bak-t032-*`); steady-state journal shows reconciler-only
+> actuation (no legacy-ignored spam). Ledger gate (`qa-mayhem-20260706-010740.md`,
+> 5P/5D/0F/0B): release-while-rebooting (L4), curtailment-release (L7),
+> control-churn, ev-connector-flap, battery-reboot **PASS**; the 5 DEGRADED all
+> post CannotComply (accepted resource-limit), no INV-HUNT, SAFETY held. L7
+> deletion held (no revert). Ledger L1–L4, L7 flipped to deleted. Full 51-scenario
+> FAST campaign (`docs/qa-task032/full-campaign-20260706-020958.md`): **35P/16D/
+> 0F/0B** — above the 32–33P/18–19D band, 0 FAIL/0 BLIND, no regression. Deeper
+> 10-cycle soak is Principal-gated. Bench left FAST + reconciler-active, both
+> trees left on main; branches `task/032-delete-legacy` (unpushed, unmerged).
 
 ## Objective
 With all three device classes on active reconcilers and the report chain collapsed, the

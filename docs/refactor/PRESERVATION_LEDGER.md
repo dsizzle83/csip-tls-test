@@ -42,13 +42,13 @@ regress) is not done, regardless of unit-test status.
 
 | # | Legacy mechanism (file:line @2026-07-05) | Originating QA scenario / finding | Behavior that must survive | Replaced by | Gate scenarios | Status |
 |---|---|---|---|---|---|---|
-| L1 | `applyRestoreRule` per-tick re-command (`optimizer.go:2241–2276`, call site `:365–366` with `solarCapActive` gate) | curtailment-release Mode A/B; solar-reboot-forget (re-assert each cycle); 92-day-replay battery reserve sail-through (in-code comment `:2259–2268`) | Uncommanded connected battery idled to 0 W at ANY SoC (idle enforces the reserve); uncurtailed inverter restored; dark inverter under an active cap KEEPS held curtailment; after release, restore reaches a dark inverter on reconnect | Retained desired doc is the standing intent; reconciler reasserts (T026–T029) | curtailment-release, release-while-rebooting, solar-reboot-forget | **reconciler-active (battery)** — T028 gates green; solar/EVSE still legacy-active (T029/030) |
-| L2 | `cmdDeduper` + `reassertEvery=60s` watchdog (`cmd/hub/actuators.go:24` const, `:26–56` deduper+`shouldSend`+`reset`; per-actuator `dedupe` fields `:59–147`) | export-cap-full-battery ghost (watchdog re-assert); lexa-modbus/-ocpp restart resync | A restarted/state-lossy consumer re-converges without waiting on a command *change* (today ≤60 s; retained doc makes it immediate on subscribe) | Broker redelivers retained doc on subscribe; reconciler reassert (T026/T027) | export-cap-full-battery, battery-reboot, mqtt-broker-restart | **reconciler-active (battery)** — T028 gates green (battery only) |
-| L3 | Breach-triggered dedupe reset (`cmd/hub/actuators.go:45–56` `reset()`; `cmd/hub/main.go:104–107,130–134` `dedupeResets` in `planObserver`, wired `:218/:222/:230`) | QA 2026-07-03: 0 W ceiling dedupe-suppressed 30 s against an uncurtailed inverter while CannotComply posted (device reverted behind hub's back) | A device that reverts while the commanded value is unchanged gets a corrective write bounded by the poll/readback interval, not by a 60 s watchdog | Reconciler verify-by-readback + write-on-diff (T026) | export-cap-full-battery, curtailment-release, control-churn | **reconciler-active (battery)** — T028 gates green (battery only) |
-| L4 | `retryDevice.lastCtrl` + `reassertLocked` (`cmd/modbus/main.go:336–433`; reconnect reconcile in `ReadMeasurements` `:372–384`; desired recorded while disconnected `:421–427`; never-commanded-inverter stale-ceiling clear `:411–414`) | QA 2026-07-02: release-while-rebooting (released cap left inverter clamped at stale ceiling indefinitely) | Reconnected device converges to hub's CURRENT desire before its first measurement is trusted; never-commanded inverter gets a stale-ceiling clear; never-commanded battery gets nothing; meter never written | Reconciler reassert-on-reconnect from retained doc (T026/T027) — `retryDevice` session drop/reopen mechanics stay | release-while-rebooting, solar-reboot-forget, battery-reboot | **reconciler-active (battery)** — T028 wired `Reconnected` (the shadow never fed it), verified live + battery-reboot PASS; solar keeps `lastCtrl` |
+| L1 | `applyRestoreRule` per-tick re-command (`optimizer.go:2241–2276`, call site `:365–366` with `solarCapActive` gate) | curtailment-release Mode A/B; solar-reboot-forget (re-assert each cycle); 92-day-replay battery reserve sail-through (in-code comment `:2259–2268`) | Uncommanded connected battery idled to 0 W at ANY SoC (idle enforces the reserve); uncurtailed inverter restored; dark inverter under an active cap KEEPS held curtailment; after release, restore reaches a dark inverter on reconnect | Retained desired doc is the standing intent; reconciler reasserts (T026–T029) | curtailment-release, release-while-rebooting, solar-reboot-forget | **spam-half deleted (T032, commit 20cc2b2)** — the per-tick QoS 1 publish through the legacy actuators is gone; `applyRestoreRule` (the INTENT) is KEPT and now feeds the desired-doc publisher (comment clarified in f87136c). Gate: curtailment-release + release-while-rebooting **PASS**, solar-reboot-forget accepted-DEGRADED (`qa-mayhem-20260706-010740.md`) |
+| L2 | `cmdDeduper` + `reassertEvery=60s` watchdog (`cmd/hub/actuators.go:24` const, `:26–56` deduper+`shouldSend`+`reset`; per-actuator `dedupe` fields `:59–147`) | export-cap-full-battery ghost (watchdog re-assert); lexa-modbus/-ocpp restart resync | A restarted/state-lossy consumer re-converges without waiting on a command *change* (today ≤60 s; retained doc makes it immediate on subscribe) | Broker redelivers retained doc on subscribe; reconciler reassert (T026/T027) | export-cap-full-battery, battery-reboot, mqtt-broker-restart | **deleted (T032, commit 783a4c5)** — `cmdDeduper`+`reassertEvery` watchdog removed after the legacy publishers went (commit A, 20cc2b2). Broker redelivers the retained desired doc on subscribe (immediate, not 60 s-bounded). Gate: battery-reboot **PASS**, export-cap-full-battery + mqtt-broker-restart accepted-DEGRADED/recovered (`qa-mayhem-20260706-010740.md`) |
+| L3 | Breach-triggered dedupe reset (`cmd/hub/actuators.go:45–56` `reset()`; `cmd/hub/main.go:104–107,130–134` `dedupeResets` in `planObserver`, wired `:218/:222/:230`) | QA 2026-07-03: 0 W ceiling dedupe-suppressed 30 s against an uncurtailed inverter while CannotComply posted (device reverted behind hub's back) | A device that reverts while the commanded value is unchanged gets a corrective write bounded by the poll/readback interval, not by a 60 s watchdog | Reconciler verify-by-readback + write-on-diff (T026) | export-cap-full-battery, curtailment-release, control-churn | **deleted (T032, commit 783a4c5)** — breach-triggered `dedupeResets` + observer reset block removed with `cmdDeduper`. A device reverting behind the hub's back is now corrected by reconciler verify-by-readback + write-on-diff (≤ poll/readback), and device non-convergence rides `breachEpisodes` via `lexa/reconcile/+/+/report`. Gate: curtailment-release + control-churn **PASS**, export-cap-full-battery accepted-DEGRADED (`qa-mayhem-20260706-010740.md`) |
+| L4 | `retryDevice.lastCtrl` + `reassertLocked` (`cmd/modbus/main.go:336–433`; reconnect reconcile in `ReadMeasurements` `:372–384`; desired recorded while disconnected `:421–427`; never-commanded-inverter stale-ceiling clear `:411–414`) | QA 2026-07-02: release-while-rebooting (released cap left inverter clamped at stale ceiling indefinitely) | Reconnected device converges to hub's CURRENT desire before its first measurement is trusted; never-commanded inverter gets a stale-ceiling clear; never-commanded battery gets nothing; meter never written | Reconciler reassert-on-reconnect from retained doc (T026/T027) — `retryDevice` session drop/reopen mechanics stay | release-while-rebooting, solar-reboot-forget, battery-reboot | **deleted (T032, commit 9fbcaa0)** — `retryDevice.lastCtrl` + `reassertLocked` (incl. the never-commanded-inverter stale-ceiling clear) removed; reassert-on-reconnect is now solely the reconciler's, via `retryDevice.onReconnect` → shell `Reconnected()` + solar restore-ceiling seed. Retry mechanics (reopen, `dropLocked`, mutex) KEPT. Gate: release-while-rebooting + battery-reboot **PASS**, solar-reboot-forget accepted-DEGRADED (`qa-mayhem-20260706-010740.md`) |
 | L5 | `breachEpisodes` component (`cmd/hub/breach.go`), fed by the plan observer (`cmd/hub/main.go`); `Plan.Safety` nil-Breach guard (`orchestrator/model.go:311–319`) | reject-write-curtail / enable-gate-curtail flakiness (mRID-agnostic flag latched across episodes); 2026-07-03 safety-plan spurious clear | One alert at onset, one at clear; a NEW mRID breaching mid-episode re-alerts; safety plans (Breach==nil means "not assessed") never emit a clear edge | Named breach-episode component (T031) | reject-write-curtail, enable-gate-curtail, export-cap-full-battery | **restructured (T031)** — `breachAlert`/`activeBreachMRID` closure retired into the named `breachEpisodes` struct (merges optimizer + reconciler evidence under one episode ID); ported edge + Safety-guard mutation tests green (`cmd/hub/breach_test.go`) |
 | L6 | `responseTracker` CannotComply episode dedupe (`cmd/northbound/main.go` alert consumer; `alerted` map / `alertCannotComply(mrid,episodeID)` / `clearAlerts`) | CannotComply spam per tick vs one per episode (design; V3 CannotComply timing races) | Exactly one CannotComply POST per breach episode; clear re-arms | Episode-ID-carrying report chain (T031) | battery-soc-refuse, battery-empty-import-cap | **restructured (T031)** — dedupe keys on `EpisodeID` when present, MRID otherwise (mixed-version + hub-restart safety net); `TestResponse_CannotComply*` green |
-| L7 | `restoreOnGenLimitClear` + `genCapActive` (`optimizer.go:163–166`, `:1251–1276`) | curtailment-release Mode A (V3 Issue 1: release is a WRITE, not an absence of writes) | Explicit uncurtail emitted on the cap active→clear edge | Desired doc transitions to restore ceiling on release (T029); deletion only if gates stay green | curtailment-release | legacy-active |
+| L7 | `restoreOnGenLimitClear` + `genCapActive` (`optimizer.go:163–166`, `:1251–1276`) | curtailment-release Mode A (V3 Issue 1: release is a WRITE, not an absence of writes) | Explicit uncurtail emitted on the cap active→clear edge | Desired doc transitions to restore ceiling on release (T029); deletion only if gates stay green | curtailment-release | **deleted (T032, commit f87136c)** — differential-equivalent to `applyRestoreRule` + the retained desired doc (both emit the NaN restore in the same pass). Gate: curtailment-release **PASS** (`qa-mayhem-20260706-010740.md`) → deletion held, no revert |
 | L8 | Tier-0 battery interlock (`cmd/modbus/interlock.go`, whole file) | battery-wrong-sign (ADR-0001 Tier 0: local reflex, survives hub/broker death) | **KEEP — not replaced.** Force-disconnect within one poll of charge-commanded pack discharging near reserve; never reconnects on its own; sits ABOVE the reconciler | n/a (reconciler must defer to it, T027/T028) | battery-wrong-sign | keep |
 | L9 | `plausibleW` nameplate gate (`cmd/modbus/main.go:283–300`, call site `:169`) | solar-bad-scale (GS-1/MTR-1: corrupt scale factor ≈10× truth) | **KEEP.** Implausible W withheld from the bus; pattern reused for reconciler readback plausibility | n/a (T026 borrows the pattern) | solar-bad-scale | keep |
 | L10 | Optimizer convergence guards: `expOverTicks` session scoping (`optimizer.go:132–142`), `checkExportLimitConvergence:1194`, `checkGenLimitConvergence:1344` (meter floor gen ≥ export − battDischarge), `checkImportConvergence:1446`, `battDrainTicks`/`battWrongDirTicks`/`criticalBatteryInversion`/`checkBatterySafety` (`:1493–1641`) | control-churn + clock-jitter (silent breach via counter reset); battery-charge-disabled; battery-soc-refuse; battery-wrong-sign | **KEEP until P5 (R4).** Measured-effect breach detection and safety backstop stay in the optimizer; only their REPORTING path changes (T031) | R4 constraint sessions (T060–062) | control-churn, clock-jitter, battery-charge-disabled, battery-soc-refuse, battery-wrong-sign | keep-until-P5 |
@@ -251,3 +251,62 @@ battery-active baseline, i.e. the solar+EVSE flip added **zero regressions**
 028-baseline D. The ×10-solo per scenario and the 10-cycle campaign soak remain
 as deeper Principal-gated validation. Bench left FAST + battery/solar/evse-active.
 Rollback = config `shadow` + restart (rehearsed on the shadow→active transition).
+
+## TASK-032 — legacy convergence machinery DELETED (2026-07-06)
+
+L1 (spam half), **L2, L3, L4, L7** flipped to `deleted`. Four per-mechanism,
+independently-revertible commits on lexa-hub `task/032-delete-legacy`:
+
+- **A `20cc2b2`** — legacy command paths: the `lexa/control/{battery,solar}` +
+  `lexa/evse/+/command` publish/subscribe surface and the `MQTT*Actuator`
+  publishers. The desired-doc publisher (`cmd/hub/desired.go`) is now the SOLE
+  actuator implementation; a failed retained publish surfaces as the actuator
+  error. Config battery/solar (modbus) + evse (ocpp) must be reconciler `active`
+  when devices of that role exist — off/shadow/absent is now **fatal** (no legacy
+  fallback remains; a pre-032 backup config fails loud instead of running dark).
+  Topic-name constants kept `Deprecated` one release (`internal/bus/topics.go`).
+- **B `783a4c5`** — `cmdDeduper` + `reassertEvery` 60 s watchdog + breach-triggered
+  `dedupeResets` + the observer reset block. `cmd/hub/actuators.go` +
+  `actuators_test.go` deleted entirely.
+- **C `9fbcaa0`** — `retryDevice.lastCtrl` + `reassertLocked` (incl. the
+  never-commanded-inverter stale-ceiling clear) + the `reconciledActive` field.
+  Retry transport mechanics (reopen-on-next-poll, `dropLocked`, mutex,
+  `onReconnect` hook) KEPT. `interlock_test.go` unmodified.
+- **D `f87136c`** — redundant `restoreOnGenLimitClear` + `genCapActive`; also
+  clarified `applyRestoreRule`'s comment (L1 — it is the KEPT standing-intent
+  source that now feeds the desired publisher; only its downstream publish spam
+  died). Differential-equivalent to `applyRestoreRule` + retained desired doc.
+
+`go test -race ./internal/... ./cmd/...` green after every commit; each commit
+`git revert`s independently (verified). Deployed binary-only to hub-pi 69.0.0.1
+(configs / mqttproxy :1882 / FAST all preserved; `.bak-t032-*` backups). Journal
+steady-state shows reconciler-only actuation — no "legacy command ignored" spam,
+`legacy=none` on every verdict line.
+
+**Ledger gate** (`csip-tls-test/qa-mayhem-20260706-010740.md`, 8 gate scenarios +
+2 global watches, **5P/5D/0F/0B**): each deleted mechanism's gate PASS or
+accepted-DEGRADED on the reconciler path —
+- L4: `release-while-rebooting` **PASS** (reconciler reasserts on reconnect; solar
+  recovered to full 48 s after the device returned), `battery-reboot` **PASS**,
+  `solar-reboot-forget` DEGRADED (posts CannotComply, accepted 028-baseline D).
+- L7: `curtailment-release` **PASS** → the conditional `restoreOnGenLimitClear`
+  deletion **held, no revert**.
+- L2/L3: `control-churn` **PASS** (no hunt across mRID turnover),
+  `ev-connector-flap` **PASS**, `export-cap-full-battery` + `mqtt-broker-restart`
+  DEGRADED (CannotComply during the fault, clean recovery after — accepted).
+- Global watches: `clock-jitter` + `perfect-storm` DEGRADED-with-CannotComply
+  (accepted); SAFETY AUDIT held on every scenario; no INV-HUNT anywhere.
+
+**Full 51-scenario FAST campaign** (`docs/qa-task032/full-campaign-20260706-020958.md`):
+**35P/16D/0F/0B/0 inconclusive** — above the 32–33P/18–19D band, strictly ≥ the
+T028/029/030 baseline (33P/18D), **0 FAIL, 0 BLIND**, SAFETY held on every
+scenario, no INV-HUNT. The 16 DEGRADED are the known accepted CannotComply /
+fault-flagging families (refuse/reject/lag/ignore/wrong-sign/wrong-units/reboot/
+storm/broker). No immediate regression from the deletions (this campaign also
+first-validates the batched TASK-037 local-clock anchoring + TASK-055 decode
+hardening on the bench). The deeper 10-cycle overnight soak is Principal-gated.
+Evidence bundle: `docs/qa-task032/` (gate + full-campaign reports). Bench left
+FAST + battery/solar/evse reconciler-active, mqttproxy :1882 intact.
+
+Rollback reality (post-032): `git revert <commit>` + redeploy, per mechanism —
+the config-flip rollback ended with this deletion.
