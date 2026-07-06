@@ -1,6 +1,15 @@
 # TASK-037 — Local (hub-side) clock-step policy + implementation
 
-*Status: TODO · Phase: P3 · Effort: M (≈4–6 h) · Difficulty: high · Risk: med*
+*Status: CODE COMPLETE (2026-07-05, lexa-hub `task/037-local-clock` 8f7e60e,
+unmerged) · Phase: P3 · Effort: M (≈4–6 h) · Difficulty: high · Risk: med*
+
+Unit-scope acceptance criteria and `go test -race ./internal/... ./cmd/...`
+green (see 02 AD-004 extension for detail). Bench gates
+(`clock-jitter`/`clock-jump-forward`/`wan-outage-expiry`/`wan-outage-hold`
+10× + full FAST campaign) deferred to the batched wave gate per this
+session's launch scoping (code + unit tests only, no bench/deploy access
+this pass); TASK-038's Mayhem local-clock-step scenario is the HIL proof
+and is tracked separately.
 
 ## Objective
 Define and implement an explicit policy for steps of the **hub's own wall
