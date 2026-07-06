@@ -1,6 +1,6 @@
 # TASK-058 — Constraint-controller package skeleton (safety > compliance > economics)
 
-*Status: TODO · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: high · Risk: low*
+*Status: DONE (2026-07-06) · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: high · Risk: low*
 
 ## Objective
 A new, fully unit-tested, I/O-free package
