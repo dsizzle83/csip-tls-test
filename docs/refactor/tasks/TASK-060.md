@@ -1,6 +1,6 @@
 # TASK-060 — Migrate the export-limit constraint (+ its convergence session)
 
-*Status: TODO · Phase: P5 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
+*Status: SHADOW-VALIDATED (2026-07-06, lexa-hub task/060-export-constraint d093a28) — export-axis shadow divergence 0 across the export family + a full 51-scenario FAST campaign; active flip DEFERRED per launch plan (needs the longer soak before `export: active`). · Phase: P5 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
 
 ## Objective
 The export-limit behavior — ceiling controller (`applyExportLimitRule` +
