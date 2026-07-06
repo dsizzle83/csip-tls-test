@@ -15,8 +15,72 @@ promote by giving an item a TASK number and a row in 04.*
 ## Control & optimization
 - **Plant-model discovery:** commissioning-time probe (step a setpoint,
   measure ramp/lag/taper) to auto-fill what TASK-057 configures by hand.
-- **Volt-var / volt-watt closed-loop dispatch** if AD-010 de-scopes it for
-  V1.0 (derbase write paths already exist).
+- **Volt-var / volt-watt closed-loop CSIP curve dispatch** — de-scoped for
+  V1.0 by AD-010 (2026-07-06, TASK-080; survey:
+  `docs/refactor/adr-inputs/curve-functions-survey.md`). `derbase` write
+  paths already exist and are tested (M705/706 + §3.1.2 adopt handshake) —
+  that is the easy ~10% of the bill. Promote to a TASK-0NN (04 owns the ID
+  space) only once a market/certification answer requires it (AD-010's
+  revisit trigger: before signing a pilot/LOI referencing curve-linked DER
+  function sets, or before the certification lab's test scope is
+  finalized). Missing-pieces list, with effort estimates, for whoever
+  schedules this:
+  1. **(S)** Curve fetch/cache is mostly built already — `walker.go` step
+     6d already produces `ps.Curves`; make it a first-class dispatch input
+     rather than display-only.
+  2. **(M)** Scheduler curve resolution in the real-time path:
+     `Scheduler.resolve`/`activeEvent` must read `ps.ExtendedControls`/
+     `ps.ExtendedDefault`/`ps.Curves` (today they read only the scalar
+     `ps.Controls`/`ps.DefaultControl`); `failClosed`'s `lastGood`/`Held`
+     copies need to carry curve state through a hold;
+     `plausibleControl()` needs a curve-aware validity check (monotonic
+     X-values, in-bounds, non-degenerate).
+  3. **(M)** Bus schema: a versioned curve payload on `bus.ActiveControl`
+     (or a sibling topic) per AD-006's discipline, with `Finite()`-style
+     defense-in-depth extended to point arrays (TASK-055 precedent) and a
+     size cap (attacker-shaped array data reaching the bus, per
+     TASK-047/048's hostile-boundary posture).
+  4. **(L, highest-risk hop)** lexa-modbus / reconciler-side adopt
+     orchestration: a curve-diff detector (change-detected re-adopt only,
+     mirroring TASK-040's dedupe discipline), a call into `derbase`'s
+     `adoptCurve` workflow, and a new CannotComply hop on
+     `AdptCrvRslt == FAILED` — a sixth axis inside the convergence
+     machinery AD-002/AD-013 just finished collapsing from four
+     mechanisms to one. Sequence after the P5 constraint-controller
+     migration (TASK-060+) has stabilized, not concurrently with it.
+  5. **(M)** Adopt retry/timeout handling distinct from scalar-write
+     retry (`pollAdoptResult`'s existing best-effort timeout path needs a
+     reconciler-level backoff/retry policy on top of it).
+  6. **(S-M)** Readback/verify: wire `ReadVoltVar`/`ReadVoltWatt` into a
+     periodic verify-against-desired loop, accounting for
+     `DefaultRvrtTms` auto-revert on comms loss.
+  7. **(L)** Bench sim support: batsim/modsim/metersim implement none of
+     SunSpec models 704-710 today (only legacy 1/120/121/103/123/802) —
+     needed before closed-loop dispatch can be validated on
+     hardware-in-the-loop at all.
+  8. **(M)** `modsim-conformance` per-device-type adopt-handshake
+     assertions.
+  9. **(L)** New Mayhem scenarios: curve-adopt-under-churn, adopt-reject
+     (`AdptFailed`), curve+cap interaction with the P5 constraint
+     controller — proper plan/state oracles per GAP-14, not
+     decision-string assertions.
+  10. **(M)** Conformance suite: the curve-related ADV test group (CSIP
+      Conformance Test Procedures v1.3) plus actually asserting
+      `DERCapabilityFull.ModesSupported`'s relevant bits at registration
+      (unused today).
+
+  Tally: 2×S, 5×M, 3×L — several engineer-weeks, not a single-task add-on.
+- **Ignored-curve-field alarm (S effort, recommended companion to the
+  de-scope, not required for V1.0):** today a curve-bearing
+  active/default control is silently dropped to its scalar-only
+  representation at `extendedListToSimple`/`extendedDefaultToSimple`
+  (`internal/northbound/discovery/walker.go:445-506`) with no log/metric
+  distinguishing it from the existing per-walk `countProgramsWithCurves`
+  debug count (which only counts programs that merely *have* a curve map,
+  not whether the control currently being enforced referenced one). Add a
+  log line + metric when the winning `ActiveControl`'s source event/default
+  carried a non-empty curve-linked field, so "silently ignored" becomes
+  "flagged and ignored" ahead of full implementation.
 - **Energy-balance estimator** (would make meter magnitude-drift detectable
   — currently deferred as undetectable in principle, QA_GAPS §4).
 - **DP planner revisit:** only if P5 shadow diffs implicate it (AD-007).

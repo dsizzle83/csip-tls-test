@@ -199,6 +199,26 @@ literally untested.
 **Work:** `bench-up.sh --stock` campaign runner + triage doc; STOCK
 campaign at M0 (baseline), M2, M4, V1.0.
 
+### GAP-16 Curve-bearing-control Mayhem scenario → deferred with AD-010 (TASK-080)
+**Why:** the existing `curve-attack` scenario (`cmd/dashboard/mayhem.go:2769`)
+only serves an *empty* DERCurveList — discovery robustness. No scenario
+serves an *active* DERControl/DefaultDERControl carrying a populated
+`opModVoltVar`/etc. and asserts what the hub does with it. TASK-080's
+survey (`docs/refactor/adr-inputs/curve-functions-survey.md` §2) traced
+today's behavior precisely instead: the curve-linked field is silently
+dropped to the scalar-only representation before it ever reaches the
+scheduler (`extendedListToSimple`/`extendedDefaultToSimple`,
+`internal/northbound/discovery/walker.go:445-506`) — nothing crashes,
+nothing zero-values, and any scalar sibling field (e.g. a concurrent
+`opModExpLimW`) is still applied correctly. No live bug found; the gap is
+real but not urgent given AD-010's de-scope.
+**Work (deferred, not scheduled):** a new scenario belongs with the
+closed-loop dispatch implementation itself (10_BACKLOG's "New Mayhem
+scenarios" item under the curve-dispatch backlog entry — curve-adopt-
+under-churn, adopt-reject, curve+cap interaction), not before, since there
+is nothing to enforce yet for a scenario to validate against. Revisit at
+AD-010's trigger.
+
 ---
 
 ## Explicitly deferred (with reasons, inherited from QA_GAPS_20260701 §4)

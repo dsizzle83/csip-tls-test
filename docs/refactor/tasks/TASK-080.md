@@ -1,6 +1,6 @@
 # TASK-080 — CSIP curve-functions scope ADR (volt-var / volt-watt: implement or de-scope)
 
-*Status: TODO · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-06, csip-tls-test `425d6d8`, branch `task/080-curve-adr`, unmerged) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
 
 ## Objective
 AD-010 is resolved with a written, evidence-based decision: either V1.0
@@ -166,21 +166,31 @@ conformance-claims language, 00_MASTER_INDEX status.
   with the decision).
 
 ## Acceptance criteria
-- [ ] Survey doc: complete layer×capability table with refs; end-to-end
+- [x] Survey doc: complete layer×capability table with refs; end-to-end
   hop list with estimates; today's-behavior trace for curve-bearing
-  controls.
-- [ ] Market/certification questions asked and answers (or their
-  absence) recorded.
-- [ ] AD-010 entry merged with decision + revisit trigger.
-- [ ] De-scope statement drafted (or implement breakdown in backlog).
-- [ ] 09 checklist curve line satisfiable by pointing at the AD.
+  controls. (`docs/refactor/adr-inputs/curve-functions-survey.md`)
+- [x] Market/certification questions asked and answers (or their
+  absence) recorded. (survey §4 — recorded unanswered, with a revisit
+  trigger)
+- [x] AD-010 entry merged with decision + revisit trigger.
+  (`docs/refactor/02_ARCHITECTURE_DECISIONS.md`)
+- [x] De-scope statement drafted (or implement breakdown in backlog).
+  (AD-010's conformance-statement block; 10_BACKLOG's ten-hop breakdown)
+- [x] 09 checklist curve line satisfiable by pointing at the AD.
+  (`09_RELEASE_CHECKLIST.md` curve line checked, points at AD-010)
 
 ## Regression checklist
-- [ ] `make test-fast` / `go test -race ./internal/...` untouched-green
-  (no code changed — run once as hygiene)
-- [ ] Conformance logic tests: none
-- [ ] Mayhem: none
-- [ ] Docs build/links check (00_MASTER_INDEX references resolve)
+- [x] `make test-fast` / `go test -race ./internal/...` untouched-green
+  (no code changed — run once as hygiene). Note: `GOWORK=off` was required
+  — an uncommitted local `go.work` at the outer checkout root leaks into
+  this nested worktree via Go's upward workspace discovery; not a defect
+  introduced by this task, worked around for the hygiene run only.
+  `make test-fast` and `go test -race ./internal/...` both green.
+- [x] Conformance logic tests: none (docs-only task, none run)
+- [x] Mayhem: none (docs-only task, none run)
+- [x] Docs build/links check (00_MASTER_INDEX references resolve) — manual
+  review of every cross-reference added in this task (02/07/09/10/00 and
+  the new survey doc)
 
 ## Mayhem scenarios affected
 None now. Survey notes the curve-bearing-control scenario gap for the

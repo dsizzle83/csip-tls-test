@@ -52,7 +52,7 @@ Boxes marked ◆ are hard gates — no waivers without an AD entry in 02.*
 - [ ] ◆ Modbus/SunSpec conformance: all three device types (modsim-conformance)
 - [ ] ◆ Golden vendor fixtures green against shipping `lexa-proto` (075)
 - [ ] Server poll-interval compliance verified against gridsim (071)
-- [ ] Curve-functions scope: implemented **or** de-scoped in writing (080 / AD-010)
+- [x] Curve-functions scope: implemented **or** de-scoped in writing (080 / AD-010) — **de-scoped**, 2026-07-06: AD-010 (`02_ARCHITECTURE_DECISIONS.md`) + `docs/refactor/adr-inputs/curve-functions-survey.md`; conformance-statement language drafted, apply at TASK-081's regeneration
 - [ ] Bus schema versions frozen + documented; mixed-version behavior defined (017, 018)
 
 ## Performance & endurance
