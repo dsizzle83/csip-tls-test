@@ -1,6 +1,33 @@
 # TASK-072 — Cert expiry monitoring + alerting
 
-*Status: TODO · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-06, `lexa-hub` `task/072-cert-expiry` @ `26adab9`, unmerged) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: low · Risk: low*
+
+**Session note (2026-07-06):** Code + unit tests complete and green
+(`go test -race ./internal/... ./cmd/...`). `cmd/northbound/certmon.go`
+(+`certmon_test.go`) implements `inspectCertFile`/`daysUntil`/`classify`/
+`Monitor` (startup + 24h-ticker re-check, own goroutine/ctx shutdown per 05
+§4); `internal/bus` gains `TopicNorthboundCertStatus` (retained, QoS 1) +
+`CertStatus` (`CertStatusV=1`, AD-006 envelope); `cmd/api` subscribes it and
+folds it into `GET /status`'s new `cert_status` field
+(`cmd/api/certstatus_test.go` covers the merge). Config gains
+`cert_expiry_warn_days` (default 30). lexa-telemetry shares the same cert
+files; deliberately does not run a second monitor (noted in both certmon.go's
+doc and lexa-hub `CLAUDE.md`).
+
+Deviation from the task's literal metric name: `internal/metrics` (TASK-044)
+has no label dimension, so `lexa_cert_expiry_seconds{cert="client|ca"}`
+became two flat gauges (`lexa_cert_expiry_client_seconds`/
+`lexa_cert_expiry_ca_seconds`) plus two expiring-flag gauges
+(`lexa_cert_expiring_client`/`lexa_cert_expiring_ca`) — a labeled name would
+render invalid Prometheus exposition text under this repo's hand-rolled
+library (metric names can't contain `{}`/`"`/`=`).
+
+**Not done this session (bench validation, step 6 + acceptance criteria's
+bench-verified bullets):** deploying a deliberately short-lived (1-day) cert
+to the bench, confirming WARN/ERROR fire live and `/status` shows
+`days_left` 0–1, and confirming recovery after restoring the real cert. Out
+of scope per this session's launch instructions (code + unit tests only, no
+bench) — remains before TASK-072's acceptance criteria are fully closed.
 
 ## Objective
 lexa-northbound parses the client certificate and CA `NotAfter` at startup
