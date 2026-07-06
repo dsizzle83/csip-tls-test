@@ -1,6 +1,31 @@
 # TASK-052 — Bench `tc netem` packet-chaos harness + scenarios
 
-*Status: TODO · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
+*Status: CODE COMPLETE (2026-07-05, csip-tls-test `task/052-netem`, unmerged) — bench
+validation deferred to the next batched wave gate (a bench agent had the live bench
+mid-campaign when this was implemented) · Phase: P4 · Effort: L (≈6–8 h) ·
+Difficulty: med · Risk: low*
+
+**What landed this session:** `scripts/netem.sh` (standalone CLI, `apply`/`reset`,
+`--dry-run` verified manually — no SSH attempted), and in `cmd/dashboard/mayhem_world.go`:
+`nodeAddr`/`nodeSSHTarget`/`nodeSSH` (hubSSH generalized to any bench node, with a hard
+desktop-IP refusal), `netemPeerIP`/`netemIfaceDiscoverCmd`/`netemApplyCommand`/
+`netemResetCommand` (pure builders — FIX-H peer-route iface discovery, never the default
+route, never hardcoded `eth0`), `netemApply`/`netemReset`, the ping-RTT self-check
+(`pingRTTMs`/`parsePingAvgMs`/`netemExpectedDelayMs`/`netemSelfCheckPassed`), and
+`netemModifier` (sudo -n probe → apply → self-check → INCONCLUSIVE-on-failure, mirroring
+`suppressDefault`'s arm/restore-closure shape). Three curated scenarios appended to
+`worldScenarios()`: `netem-loss-export-cap`, `netem-reorder-northbound`,
+`netem-jitter-evse`. Evidence: `go build`/`go vet`/`go test ./cmd/dashboard/...` green,
+`bin/dashboard` rebuilt as compile proof, new unit tests in
+`cmd/dashboard/mayhem_world_test.go` covering every pure builder/parser/verdict function
+above plus the desktop-refusal guard.
+
+**Not done this session (explicitly deferred — launch instructions: a bench agent had
+the live bench mid-campaign, no SSH/bench access authorized this session):** live
+SSH/sudo probing, a real `tc netem` apply/reset, the ping-RTT self-check against real
+hardware, the abort/self-heal proof, 10× solo per scenario, and the full campaign. Those
+are the acceptance-criteria boxes still open below — the next session should run them
+against the FAST bench and flip this to DONE.
 
 ## Objective
 Add `scripts/netem.sh` to apply `tc netem` loss/reorder/delay/jitter
@@ -185,23 +210,32 @@ oracles under netem.
   finding — pin it).
 
 ## Acceptance criteria
-- [ ] `scripts/netem.sh <pi> apply "loss 5%" 10 --dry-run` prints correct
-      tc commands incl. the self-heal; live apply+reset verified on one Pi.
+- [x] `scripts/netem.sh <pi> apply "loss 5%" 10 --dry-run` prints correct
+      tc commands incl. the self-heal (`replace` not `add`, `sudo -n`,
+      peer-route iface discovery, scheduled `tc qdisc del`) — verified manually
+      this session (desktop-guard and usage-guard exit paths also checked).
+      **Not yet done:** live apply+reset verified on one Pi (no bench access
+      this session).
 - [ ] `--list` shows the 2–3 netem scenarios; missing SSH/sudo ⇒
-      INCONCLUSIVE.
+      INCONCLUSIVE. (Catalogue registration + uniqueness verified by a unit
+      test this session — all three IDs present in `d.scenarios()`; the
+      missing-SSH⇒INCONCLUSIVE *behavior* needs a live run without bench SSH
+      to confirm end-to-end.)
 - [ ] Self-heal proven: abort mid-run, qdisc clears within autoReset window.
+      (Needs live bench.)
 - [ ] 10× solo stable per scenario; export/gen caps hold under loss/reorder
-      (or a real finding is pinned).
+      (or a real finding is pinned). (Needs live bench.)
 - [ ] No lingering qdisc on any Pi after a full campaign
-      (`tc qdisc show` = default on each target).
-- [ ] Full campaign ≤ baseline.
+      (`tc qdisc show` = default on each target). (Needs live bench.)
+- [ ] Full campaign ≤ baseline. (Needs live bench.)
 
 ## Regression checklist
-- [ ] `make test-fast` + `go test ./cmd/dashboard/` green
-- [ ] Conformance logic tests: none (harness)
-- [ ] Mayhem: 10× solo per new scenario + full campaign
-- [ ] `bin/dashboard` rebuilt + csip-dashboard restarted; qdiscs clean
-      post-run on all targets
+- [x] `make test-fast` + `go test ./cmd/dashboard/` green
+- [x] Conformance logic tests: none (harness)
+- [ ] Mayhem: 10× solo per new scenario + full campaign (needs live bench)
+- [x] `bin/dashboard` rebuilt (compile proof) — **not** restarted on the bench
+      this session (no bench access authorized; a bench agent had it
+      mid-campaign). qdisc-clean verification needs the live bench.
 
 ## Mayhem scenarios affected
 Adds `netem-loss-export-cap`, `netem-reorder-northbound`,

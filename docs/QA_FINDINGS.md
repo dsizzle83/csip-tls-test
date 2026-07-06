@@ -156,9 +156,38 @@ converges), and the structural malforms `malformed-csip` (dup mRID) / `malform-m
 
 ## 4. Out of scope / can't run here
 
-- **`crc_error`, `tcp_drop`** — need wire-level injection (toxiproxy / `tc netem`); not in-sim.
+- ~~**`crc_error`, `tcp_drop`** — need wire-level injection (toxiproxy / `tc netem`); not in-sim.~~
+  **Closed by TASK-052 (GAP-11):** `scripts/netem.sh` + `mayhem_world.go`'s
+  `netemModifier`/`netem-*` scenarios now apply real `tc netem` loss/reorder/delay/jitter
+  to a bench Pi's LAN interface over SSH — see §4a below.
 - **MQTT chaos (Phase 4)** — broker (mosquitto) is bound to localhost on hub-pi, unreachable
   from the desktop. Needs an on-hub injector or a broker rebind.
+
+### 4a. netem packet-chaos (TASK-052 / GAP-11) — code complete, bench validation pending
+
+Three curated scenarios added to `mayhem_world.go` (`worldScenarios()`), the first Mayhem
+faults to touch the actual wire rather than only the application layer:
+
+- **`netem-loss-export-cap`** — 5% loss + 50±10ms delay on the hub's bench-LAN iface
+  (degrades hub↔sims Modbus/OCPP AND hub↔gridsim northbound at once — the hub has one
+  LAN iface). Judges: zero-export cap holds (`diagnoseConstraint`), INV-HUNT clean.
+- **`netem-reorder-northbound`** — 25% reorder + 100ms delay on the hub's iface (utility
+  link chaos) under an active generation limit. Judges survivability
+  (`diagnoseSurvival("packet reorder")`) — the walker/fetcher's SO_RCVTIMEO + fail-closed
+  hold must ride out reordering/latency the same way it does an outright outage.
+- **`netem-jitter-evse`** — delay jitter (80±40ms, normal distribution) on the ev-pi's
+  link during an active EV import cap. Judges the import cap (`diagnoseConstraint`);
+  INV-EVMAX is checked for every scenario by the cross-cutting safety audit regardless.
+
+All three are INCONCLUSIVE without SSH + passwordless sudo on the target node (only the
+hub is guaranteed to have passwordless sudo — see BENCH.md) and self-check that netem
+actually landed on the real bench-LAN iface (ping-RTT delta) before trusting a profile —
+see BENCH.md's "netem packet-chaos harness" section for the dual-homed-Pi / desktop-guard
+detail (FIX-H). Landed as harness code + `go build`/`go vet`/unit-test evidence only
+(qdisc-command builders, iface-discovery parsing, self-check verdict logic, desktop
+refusal, all unit-tested in `cmd/dashboard/mayhem_world_test.go`) — 10× solo per scenario,
+abort/self-heal proof, and a full campaign against the live bench are the next batched
+wave-gate item (a bench agent had the bench mid-campaign when this was authored).
 
 ---
 

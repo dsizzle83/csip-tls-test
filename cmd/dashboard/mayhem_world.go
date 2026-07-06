@@ -23,13 +23,22 @@ package main
 // hub-restart-mid-cap needs SSH to the hub Pi (BatchMode, passwordless sudo per
 // docs/BENCH.md); when SSH is unavailable the scenario reports INCONCLUSIVE at
 // setup rather than a misleading verdict.
+//
+// netem-loss-export-cap, netem-reorder-northbound, netem-jitter-evse
+// (TASK-052 / GAP-11): the first scenarios that fault the actual wire. Every
+// fault above is app-layer (simapi /inject or /fault, gridsim
+// /admin/outage) — real LANs corrupt, reorder, and delay packets, and
+// nothing here reached the wire until now. See the "netem packet-chaos"
+// section below for the harness.
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -122,6 +131,269 @@ func (d *mayhemDriver) hubSSHOutput(command string) (string, error) {
 		return "", fmt.Errorf("ssh %s %q: %v", target, command, err)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// ── netem packet-chaos (TASK-052 / GAP-11) ──────────────────────────────────
+//
+// tc netem faults the actual bench-LAN wire — loss, reorder, delay, jitter —
+// on a bench Pi's real interface over SSH. Cheap and brutal: app-layer
+// injection (simapi /inject, gridsim /admin/outage, mqttproxy) cannot
+// reproduce what a real LAN does daily. scripts/netem.sh is the standalone
+// CLI form of the same primitive (manual use, TASK-078's soak); the helpers
+// below are what the curated netem-* scenarios call directly.
+//
+// netemDesktopIP is the desktop's bench IP (docs/BENCH.md) — gridsim AND
+// this very dashboard process live there. netem must NEVER target it:
+// doing so would sever the dashboard's own network path and the SSH
+// session that would need to undo it. Guarded in nodeSSHTarget; do not
+// remove or bypass this guard.
+const netemDesktopIP = "69.0.0.20"
+
+// netemSelfCheckThresholdMs is the minimum RTT rise (post-apply minus
+// baseline) netemModifier requires before it trusts an apply actually
+// landed. The bench Pis are dual-homed (a WiFi uplink is their default
+// route); if `tc netem` landed there instead of the real bench-LAN iface,
+// every scenario downstream would silently no-op and PASS for the wrong
+// reason — exactly the failure mode GAP-11 exists to catch. Set well under
+// the smallest curated profile's delay term (50ms) so ping/scheduler jitter
+// can't false-trip it, but far enough above zero that a true no-op cannot
+// pass.
+const netemSelfCheckThresholdMs = 15.0
+
+// nodeAddr resolves node's bare host (no scheme/port) from d.backends.
+// node is one of the simapi/backend keys wired in main.go — "hub", "solar",
+// "battery", "meter", "ev" ("gridsim" resolves too, but see nodeSSHTarget's
+// desktop guard: it is never a valid netem target).
+func (d *mayhemDriver) nodeAddr(node string) (string, error) {
+	base, ok := d.backends[node]
+	if !ok {
+		return "", fmt.Errorf("unknown node %q", node)
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Hostname() == "" {
+		return "", fmt.Errorf("cannot derive %s host from %q", node, base)
+	}
+	return u.Hostname(), nil
+}
+
+// nodeSSHTarget derives user@host for an arbitrary bench node — hubSSHTarget
+// generalized to every node the netem scenarios touch (hubSSHTarget itself
+// is untouched; existing callers keep using it). Refuses any node that
+// resolves to the desktop: netem there would cut the dashboard and the SSH
+// session that would need to undo it. This guard is load-bearing.
+func (d *mayhemDriver) nodeSSHTarget(node string) (string, error) {
+	host, err := d.nodeAddr(node)
+	if err != nil {
+		return "", err
+	}
+	if host == netemDesktopIP {
+		return "", fmt.Errorf("refusing node %q: resolves to the desktop (%s) — netem must never target it", node, netemDesktopIP)
+	}
+	user := os.Getenv("LEXA_SSH_USER")
+	if user == "" {
+		user = "dmitri"
+	}
+	return user + "@" + host, nil
+}
+
+// nodeSSH runs command on the given bench node non-interactively (BatchMode:
+// a missing key/agent fails fast instead of prompting inside the dashboard).
+// Generalizes hubSSH to any node.
+func (d *mayhemDriver) nodeSSH(node, command string) error {
+	target, err := d.nodeSSHTarget(node)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command("ssh",
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=4",
+		target, command)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ssh %s %q: %v (%s)", target, command, err, out)
+	}
+	return nil
+}
+
+// netemPeerIP returns the peer IP netem's iface-discovery route lookup
+// should target for node — NEVER node's own default route (the bench Pis
+// are dual-homed via WiFi; their default route goes out the WAN iface, not
+// the 69.0.0.x LAN, so netem there would silently no-op — see
+// scripts/netem.sh's header and TASK-052's FIX-H). The hub's peer is a sim
+// Pi; every sim Pi's peer is the desktop (gridsim).
+func netemPeerIP(node string) string {
+	if node == "hub" {
+		return "69.0.0.10" // solar-pi; any provisioned sim Pi works as the hub's peer
+	}
+	return netemDesktopIP
+}
+
+// netemIfaceDiscoverCmd is the shell fragment every netem remote command
+// starts with: resolve $IFACE via the peer route (never the default route)
+// and refuse (exit 1) rather than guess if that lookup comes back empty.
+// Pulled out as a pure string builder so the logic is unit-testable without
+// SSH — mirrors fillDiskCommand's pattern (TASK-050).
+func netemIfaceDiscoverCmd(peerIP string) string {
+	return fmt.Sprintf(
+		`IFACE=$(ip -o route get %s 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}'); `+
+			`if [ -z "$IFACE" ]; then echo "netem: could not discover iface via ip -o route get %s" >&2; exit 1; fi`,
+		peerIP, peerIP)
+}
+
+// netemApplyCommand builds the full remote command netemApply runs over
+// SSH: discover the real bench-LAN iface, `replace` (not `add` — re-arming
+// must not error on an already-active qdisc) the root qdisc with profile,
+// then schedule a self-healing reset in a detached background subshell so a
+// lost teardown (dashboard crash, hard abort) still clears it after
+// autoResetS seconds. `sudo -n` throughout — a node without passwordless
+// sudo fails fast, never hangs on a password prompt inside the dashboard
+// process. The self-heal deliberately does not use `disown` (not a builtin
+// on a POSIX /bin/sh such as dash) — plain `&` with fds redirected to
+// /dev/null is the portable idiom (mirrors scripts/netem.sh).
+func netemApplyCommand(peerIP, profile string, autoResetS int) string {
+	return fmt.Sprintf(
+		`%s; sudo -n tc qdisc replace dev "$IFACE" root netem %s && sudo -n sh -c '(sleep %d; tc qdisc del dev '"$IFACE"' root) >/dev/null 2>&1 &'`,
+		netemIfaceDiscoverCmd(peerIP), profile, autoResetS)
+}
+
+// netemResetCommand builds the remote command netemReset runs: discover the
+// iface and delete its root qdisc. `|| true` so a missing qdisc (already
+// clean, or the self-heal already fired) is never an error.
+func netemResetCommand(peerIP string) string {
+	return fmt.Sprintf(`%s; sudo -n tc qdisc del dev "$IFACE" root 2>/dev/null || true`,
+		netemIfaceDiscoverCmd(peerIP))
+}
+
+// netemApply arms a tc netem profile (raw `tc ... netem` argument string,
+// e.g. "loss 5% delay 50ms 10ms") on node's bench-LAN interface, with a
+// self-healing scheduled reset after autoResetS seconds regardless of
+// whether netemReset is ever called.
+func (d *mayhemDriver) netemApply(node, profile string, autoResetS int) error {
+	return d.nodeSSH(node, netemApplyCommand(netemPeerIP(node), profile, autoResetS))
+}
+
+// netemReset clears node's netem qdisc immediately — the fast teardown
+// path; the scheduled reset netemApply arms is the safety net if this is
+// never reached.
+func (d *mayhemDriver) netemReset(node string) error {
+	return d.nodeSSH(node, netemResetCommand(netemPeerIP(node)))
+}
+
+// netemExpectedDelayMs extracts the base delay (ms) from a tc netem profile
+// string such as "loss 5% delay 50ms 10ms reorder 25%" — the first numeric
+// token after the "delay" keyword, with a trailing "ms" stripped. Pure so
+// it's unit-testable; used only to size the self-check's expectations.
+func netemExpectedDelayMs(profile string) (ms float64, ok bool) {
+	fields := strings.Fields(profile)
+	for i, f := range fields {
+		if f == "delay" && i+1 < len(fields) {
+			v := strings.TrimSuffix(fields[i+1], "ms")
+			if n, err := strconv.ParseFloat(v, 64); err == nil {
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// netemSelfCheckPassed decides the post-apply RTT self-check from measured
+// before/after averages — pure so it's unit-testable without a real ping. A
+// profile with no delay component cannot be judged by RTT at all (a
+// loss-only profile would need a `tc -s qdisc show` packet-counter check
+// instead); every curated netem-* scenario in this file includes a delay
+// term specifically so this check always applies to them.
+func netemSelfCheckPassed(profile string, beforeMs, afterMs float64) (bool, string) {
+	expected, ok := netemExpectedDelayMs(profile)
+	if !ok {
+		return false, fmt.Sprintf("netem self-check: profile %q has no delay component — RTT delta cannot judge it (needs a tc -s qdisc packet-counter check instead)", profile)
+	}
+	delta := afterMs - beforeMs
+	if delta < netemSelfCheckThresholdMs {
+		return false, fmt.Sprintf("netem self-check FAILED: RTT rose only %.1fms (before %.1fms, after %.1fms) under a %.0fms delay profile — below the %.0fms floor, netem likely landed on the wrong interface (default-route trap)", delta, beforeMs, afterMs, expected, netemSelfCheckThresholdMs)
+	}
+	return true, fmt.Sprintf("netem self-check passed: RTT rose %.1fms (before %.1fms, after %.1fms) under a %.0fms delay profile", delta, beforeMs, afterMs, expected)
+}
+
+// parsePingAvgMs extracts the average RTT from iputils-ping's summary line
+// ("rtt min/avg/max/mdev = 0.123/0.456/0.789/0.012 ms"). Pure so it's
+// unit-testable without actually pinging.
+func parsePingAvgMs(output string) (float64, error) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		idx := strings.LastIndex(line, "= ")
+		if idx < 0 || !strings.Contains(line, "/") {
+			continue
+		}
+		rest := strings.TrimSuffix(strings.TrimSpace(line[idx+2:]), " ms")
+		parts := strings.Split(rest, "/")
+		if len(parts) < 2 {
+			continue
+		}
+		if avg, err := strconv.ParseFloat(parts[1], 64); err == nil {
+			return avg, nil
+		}
+	}
+	return 0, fmt.Errorf("could not parse ping average from output: %q", output)
+}
+
+// pingRTTMs runs a handful of local ICMP echoes to host and returns the
+// average RTT in ms. Only ever called by the netem self-check (a few pings
+// bracketing an apply), never inside the per-tick sampling loop.
+func pingRTTMs(host string) (float64, error) {
+	cmd := exec.Command("ping", "-c", "3", "-W", "2", host)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("ping %s: %w", host, err)
+	}
+	return parsePingAvgMs(string(out))
+}
+
+// netemModifier arms profile on node for the scenario's hold (holdS
+// seconds) and returns a teardown closure — mirrors suppressDefault's
+// modifier-returns-restore-closure shape. Sequence:
+//
+//  1. Probe sudo -n on node: the sim Pis are NOT guaranteed passwordless
+//     sudo (only the hub is, per docs/BENCH.md / TASK-052's prerequisites)
+//     — missing it returns an error here, which the caller's setup
+//     surfaces as INCONCLUSIVE (mayhem.go's run loop treats any setup
+//     error that way), never a hang or a password prompt.
+//  2. Baseline-ping node, apply with a self-healing autoReset of holdS+30s
+//     (30s margin past the scenario's own teardown so the fast path always
+//     wins first), then ping again.
+//  3. Self-check the delta (netemSelfCheckPassed): no measurable RTT rise
+//     means netem silently landed on the wrong interface (the dual-homed
+//     default-route trap) — reset immediately and return an error so the
+//     scenario NEVER runs against a no-op fault (that would be a false
+//     PASS, exactly the failure mode GAP-11 exists to catch).
+func (d *mayhemDriver) netemModifier(node, profile string, holdS int) (func(), error) {
+	if err := d.nodeSSH(node, "sudo -n true"); err != nil {
+		return nil, fmt.Errorf("netem: node %q lacks passwordless sudo (or SSH is unavailable): %w", node, err)
+	}
+	host, err := d.nodeAddr(node)
+	if err != nil {
+		return nil, err
+	}
+	before, err := pingRTTMs(host)
+	if err != nil {
+		return nil, fmt.Errorf("netem: baseline ping to %s (%s) failed: %w", node, host, err)
+	}
+	autoReset := holdS + 30
+	if err := d.netemApply(node, profile, autoReset); err != nil {
+		return nil, fmt.Errorf("netem: apply on %q failed: %w", node, err)
+	}
+	time.Sleep(1 * time.Second) // let the new qdisc take effect before judging it
+	after, err := pingRTTMs(host)
+	if err != nil {
+		_ = d.netemReset(node)
+		return nil, fmt.Errorf("netem: post-apply ping to %s (%s) failed: %w", node, host, err)
+	}
+	ok, msg := netemSelfCheckPassed(profile, before, after)
+	if !ok {
+		_ = d.netemReset(node)
+		return nil, errors.New(msg)
+	}
+	log.Printf("mayhem: netem[%s]: %s", node, msg)
+	return func() { _ = d.netemReset(node) }, nil
 }
 
 // diagnoseSurvival adapts diagnoseMalform's verdict ladder — survive, hold the
@@ -589,5 +861,111 @@ func (d *mayhemDriver) worldScenarios() []*mayScenario {
 				time.Sleep(2 * time.Second)
 			},
 		},
+		func() *mayScenario {
+			// netemModifier-as-modifier: mirrors suppressDefault's
+			// arm-in-setup / restore-in-teardown shape. netemTeardown stays
+			// nil if netemModifier itself failed (missing SSH/sudo, or the
+			// self-check refused a no-op apply) — teardown's nil-check
+			// covers that, and its unconditional deleteControls(0) still
+			// clears the cap this scenario posted before netem was armed.
+			var netemTeardown func()
+			return &mayScenario{
+				ID: "netem-loss-export-cap", Name: "Export cap held under 5% packet loss + jitter on the hub's bench-LAN uplink",
+				Category:   "Transport chaos (INV-EXPORT survivability, GAP-11)",
+				Hypothesis: "Every fault above this one is app-layer (simapi /inject, gridsim /admin/outage) — nothing so far has touched the wire. Real LANs drop and jitter packets daily; this arms actual `tc netem` loss+delay on the hub Pi's real interface, degrading its Modbus polls to the sims AND its northbound link to gridsim at once (the hub has one LAN iface — this models a genuinely bad hub uplink, not a surgically isolated single link).",
+				Expected:   "Hold the zero-export cap through real packet loss and jitter — a dropped or delayed sample is not a lost control, and the loop must not hunt chasing gappy telemetry (INV-HUNT clean).",
+				HoldS:      80,
+				Fix:        "Modbus/telemetry read paths must tolerate bench-LAN loss the same way they already tolerate the app-layer twin (modbus-latency's bounded-read timeout); a FAIL here means real packet loss defeats a protection that so far only ever saw perfect app-layer faults.",
+				setup: func(d *mayhemDriver) (*activeConstraint, error) {
+					cons, err := armExportCap(d, 80, "mayhem: zero-export cap under netem loss+jitter on the hub uplink")
+					if err != nil {
+						return nil, err
+					}
+					reset, err := d.netemModifier("hub", "loss 5% delay 50ms 10ms", 80)
+					if err != nil {
+						return nil, err
+					}
+					netemTeardown = reset
+					return cons, nil
+				},
+				perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+				evaluate: diagnoseConstraint,
+				teardown: func(d *mayhemDriver) {
+					if netemTeardown != nil {
+						netemTeardown()
+					}
+					d.deleteControls(0)
+				},
+			}
+		}(),
+		func() *mayScenario {
+			var netemTeardown func()
+			return &mayScenario{
+				ID: "netem-reorder-northbound", Name: "Generation limit rides out 25% reorder + 100ms delay on the utility link",
+				Category:   "Transport chaos (INV-EXPORT survivability, GAP-11)",
+				Hypothesis: "The utility link (hub↔gridsim — and, since the hub has one LAN iface, incidentally hub↔sims too) reorders a quarter of its packets and adds 100ms of delay while a generation-limit control is active. TCP tolerates reordering, but a walker/fetcher that quietly assumes in-order, low-latency responses can still misbehave under it — double-adoption, a spurious re-walk storm, or a wedge waiting on a response that arrived out of sequence.",
+				Expected:   "The walker/fetcher must ride it out: the same SO_RCVTIMEO-bounded reads and fail-closed hold that northbound-hang and wan-outage-hold probe for an outright-down/wedged server must also cover reordering and added latency — degraded discovery cadence, never a dropped control.",
+				HoldS:      80,
+				Fix:        "Per-request deadline + fail-closed hold (northbound-hang's fix) must cover reordering/delay too, not just an outright-down or wedged server.",
+				setup: func(d *mayhemDriver) (*activeConstraint, error) {
+					_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1})
+					d.injectEnv(d.pvHighW, loadLow)
+					cons, err := d.postCap("genLimit", 1000, 80, "mayhem: gen limit under netem reorder+delay on the utility link")
+					if err != nil {
+						return nil, err
+					}
+					reset, err := d.netemModifier("hub", "reorder 25% delay 100ms", 80)
+					if err != nil {
+						return nil, err
+					}
+					netemTeardown = reset
+					return cons, nil
+				},
+				perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
+				evaluate: diagnoseSurvival("packet reorder"),
+				teardown: func(d *mayhemDriver) {
+					if netemTeardown != nil {
+						netemTeardown()
+					}
+					d.deleteControls(0)
+				},
+			}
+		}(),
+		func() *mayScenario {
+			var netemTeardown func()
+			return &mayScenario{
+				ID: "netem-jitter-evse", Name: "EV import cap holds under delay jitter on the charger's link",
+				Category:   "Transport chaos (INV-EVMAX, GAP-11)",
+				Hypothesis: "The EVSE's OCPP link jitters (variable delay, not loss) while an import cap constrains an active charging session — WebSocket keepalives and SetChargingProfile calls ride a noisy link, not the clean one every other EV scenario assumes.",
+				Expected:   "Never command the EVSE over its station max regardless of link jitter (INV-EVMAX — checked by the cross-cutting safety audit on every scenario's samples, not just this one's own oracle) and keep converging the import cap once profiles land despite the jitter.",
+				HoldS:      70,
+				Fix:        "OCPP call/response handling must tolerate variable RTT without mis-tracking session state or over-committing current (lexa-ocpp).",
+				setup: func(d *mayhemDriver) (*activeConstraint, error) {
+					_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 12, "Conn": 1}) // just above the reserve floor: a near-empty non-lever, no INV-SOC noise
+					_ = d.post("ev", "/inject", map[string]any{"action": "set_soc", "soc_pct": 30})
+					_ = d.post("ev", "/inject", map[string]any{"action": "start_session", "connector_id": 1})
+					d.injectEnv(300, 500)
+					cons, err := d.postCap("importCap", 2000, 70, "mayhem: import cap under netem jitter on the EVSE link")
+					if err != nil {
+						return nil, err
+					}
+					reset, err := d.netemModifier("ev", "delay 80ms 40ms distribution normal", 70)
+					if err != nil {
+						return nil, err
+					}
+					netemTeardown = reset
+					return cons, nil
+				},
+				perTick:  func(d *mayhemDriver, i int) { d.injectEnv(300, 500) },
+				evaluate: diagnoseConstraint,
+				teardown: func(d *mayhemDriver) {
+					if netemTeardown != nil {
+						netemTeardown()
+					}
+					d.deleteControls(0)
+					_ = d.post("ev", "/inject", map[string]any{"action": "stop_session", "connector_id": 1})
+				},
+			}
+		}(),
 	}
 }
