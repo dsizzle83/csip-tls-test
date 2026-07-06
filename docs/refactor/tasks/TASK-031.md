@@ -1,6 +1,6 @@
 # TASK-031 — Collapse the CannotComply chain: reconciler reports → named breach-episode component → northbound
 
-*Status: TODO · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+*Status: DONE (2026-07-05, lexa-hub 3e6c42b) · Phase: P2 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
 
 ## Objective
 CannotComply reporting runs through three owned stages instead of five stateful hops:
