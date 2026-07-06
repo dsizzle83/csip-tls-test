@@ -105,6 +105,14 @@ promote by giving an item a TASK number and a row in 04.*
 ## Test bench & QA
 - **OCPP lifecycle-reorder injector** for evsim (out-of-order
   TransactionEvents, boot-mid-transaction) — next time evsim is opened.
+  TASK-074 touched evsim's CSMS-connection flags (SP2 enablement) but not
+  its TransactionEvent send path, so this is still open; noted here per
+  that task's "revisit when evsim is next touched" trigger.
+- **OCPP Security Profile 3 (mTLS)** for the CSMS/evsim link — AD-008 scopes
+  TASK-074 to "≥2"; profile 3 would add a charger-presented client cert
+  (mutual TLS) on top of the profile-2 TLS+BasicAuth landed there. Evaluate
+  whether the incremental identity assurance is worth a second cert-issuance
+  flow on the EV link once profile 2 has bench mileage.
 - **Matrix/chaos cells for the 2026-07 fault families** (outage, invert,
   netem) once first campaigns show which pairings interact.
 - **Second gridsim instance** → DNS-SD flap / wrong-server scenarios.

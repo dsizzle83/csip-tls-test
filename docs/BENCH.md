@@ -11,7 +11,7 @@ SSH user is **`dmitri@` everywhere** (not `pi@`); key auth from this desktop wor
 | solar-pi | 69.0.0.10 | modsim (Modbus 5020, simapi 6020) | user systemd unit + linger |
 | battery-pi | 69.0.0.11 | batsim (5021/6021) | user systemd unit + linger |
 | meter-pi `pi5-gridsim` | 69.0.0.12 | metersim linked mode, `-hub-api 69.0.0.1:9100` (5022/6022), `-hub-token-file ~/.config/lexa/hub-api.token` | user systemd unit + linger |
-| ev-pi | 69.0.0.14 | evsim `-csms ws://69.0.0.1:8887/ocpp` (simapi 6024) | user systemd unit + linger |
+| ev-pi | 69.0.0.14 | evsim `-csms ws://69.0.0.1:8887/ocpp` (simapi 6024) — `wss://` + Basic Auth once OCPP Security Profile 2 is enabled, see below (TASK-074) | user systemd unit + linger |
 
 ConnectCore 93 dev kit (69.0.0.2) is **offline/unused**; the hub moved to 69.0.0.1.
 evsim/metersim/dashboard all point at 69.0.0.1 — repoint when the dev kit returns
@@ -55,12 +55,15 @@ lexa-ocpp :9104 · lexa-telemetry :9105 · lexa-api :9100/metrics` (existing
 prometheus run command); quick check: `curl 69.0.0.1:910N/metrics | grep lexa_up`.
 
 **Deploy gotcha (same class as the STOCK-timing reset):** `deploy-hub-pi.sh`
-overwrites `/etc/lexa/*.json` from the repo's `configs/`, which resets three
+overwrites `/etc/lexa/*.json` from the repo's `configs/`, which resets four
 Pi-side bench enables — re-apply after every hub deploy:
 `metrics_addr` → LAN IP per service (back to `""` = localhost default),
 `modbus.json` `"reconciler":{"battery":"shadow"}` (back to `"off"`, TASK-027),
-and the mqttproxy repoint (`mqtt_broker` back to `:1883`; re-run
-`scripts/mqtt-chaos.sh deploy` if QA needs the :1882 fault proxy).
+the mqttproxy repoint (`mqtt_broker` back to `:1883`; re-run
+`scripts/mqtt-chaos.sh deploy` if QA needs the :1882 fault proxy), and
+`ocpp.json`'s `cert_path`/`key_path`/`basic_auth_user`/`basic_auth_pass`
+(back to `""` = plain `ws://`, no auth — re-run `deploy-hub-pi.sh
+--enable-ocpp-sp2`, TASK-074).
 Then restart the edited services and re-run `hub-replay-tune.sh fast`.
 
 ## Demo bring-up / recovery
@@ -77,7 +80,10 @@ desktop units do NOT survive reboot — everything else on the bench does.
 - Sims: `bash scripts/update-sim-pis.sh <hub-ip> dmitri` — auto-detects each Pi's layout
   (user unit in `~/.config/systemd/user/<sim>.service`, or legacy root unit in
   `/etc/systemd/system/`), installs over the unit's existing ExecStart path, rewrites
-  metersim to linked mode + evsim's CSMS URL, restarts, and reports `is-active`.
+  metersim to linked mode + evsim's CSMS URL, restarts, and reports `is-active`. Add
+  `--enable-ocpp-sp2` to flip evsim to `wss://` + Basic Auth in lockstep with
+  `deploy-hub-pi.sh --enable-ocpp-sp2` (TASK-074 — see the OCPP Security Profile 2
+  runbook below).
 - **MTR-4 lockstep (deploy half)**: metersim and lexa-modbus share the `lexa-proto`
   SunSpec register-map codec — always deploy hub and sims in the same session, never one
   side alone, whenever the pinned `lexa-proto` version bumps. The *code* half of MTR-4
@@ -112,6 +118,71 @@ Rollback: on the hub, clear `api_token_file` in `/etc/lexa/api.json` and
 `systemctl restart lexa-api`. Every consumer already tolerates an unconfigured
 token (they just keep sending the header — lexa-api simply stops checking it),
 so no consumer-side change is needed to roll back.
+
+### OCPP Security Profile 2 — wss:// + Basic Auth (TASK-074, AD-008, 09 Security hard gate)
+
+The CSMS/evsim link already implements Security Profile 2 on both sides
+(`lexa-proto/ocppserver`'s `ws.NewTLSServer` + constant-time `BasicAuthHandler`;
+evsim's `-tls-ca`/`-auth-user`/`-auth-pass`) — enabling it is cert provisioning
++ staged config, not development. **`ws://` (no auth) is a bench-only
+fallback; `wss://` + Basic Auth is the product default** (lexa-hub CLAUDE.md
+"Critical invariants"). **Lockstep**: flipping the CSMS to require TLS while
+evsim still dials `ws://` instantly rejects it — every EV Mayhem scenario
+goes BLIND until both sides are done in the SAME session (05 §11, same class
+as MTR-4).
+
+1. Issue the CSMS cert from the bench CA, SAN = the hub's LAN IP (IP SAN is
+   required — a hostname-only cert makes evsim's TLS verification refuse the
+   connection):
+   `bash scripts/gen-ev-cert.sh 69.0.0.1` (or `make gen-ev-cert IPS=69.0.0.1`)
+   → `certs/ev-server-cert.pem` (commit), `certs/vault/ev-server-key.pem`
+   (gitignored, stays local).
+2. `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --enable-ocpp-sp2`
+   — stages the cert/key to `/etc/lexa/certs/ocpp-{cert,key}.pem` (0644/0600
+   lexa:lexa), idempotently generates `/etc/lexa/ocpp-auth.pass` (0600
+   lexa:lexa, `openssl rand -hex 16` — never committed, never leaves the hub
+   except via the relay in step 3), and patches `cert_path`/`key_path`/
+   `basic_auth_user` (fixed `evse-bench`)/`basic_auth_pass` into
+   `/etc/lexa/ocpp.json`. Restarts `lexa-ocpp`.
+3. **Same session**: `bash scripts/update-sim-pis.sh 69.0.0.1 dmitri --enable-ocpp-sp2`
+   — relays `certs/ca-cert.pem` (public) and the hub's
+   `/etc/lexa/ocpp-auth.pass` to ev-pi over SSH (no local temp file, same
+   pattern as the lexa-api token relay above) and rewrites evsim's unit to
+   `-csms wss://69.0.0.1:8887/ocpp -tls-ca ~/.config/lexa/ocpp-ca.pem
+   -auth-user evse-bench -auth-pass <relayed secret>`. Restarts evsim.
+4. Verify:
+   ```
+   ssh dmitri@69.0.0.1 sudo journalctl -u lexa-ocpp -n 20 --no-pager | grep 'TLS enabled'   # → 1 line (server.go:59)
+   ssh dmitri@69.0.0.14 journalctl --user -u evsim -n 20 --no-pager | grep 'TLS enabled'     # → 1 line (main.go newWSClient)
+   curl -s http://69.0.0.1:9100/status | python3 -m json.tool | grep -A4 '"cs-001"'          # a TransactionEvent lifecycle still updates lexa/evse/cs-001/state
+   ```
+   Negative-auth check (evsim with the wrong password must be rejected —
+   don't skip this, it's the acceptance criterion): temporarily point a
+   second evsim instance (or `update-sim-pis.sh`'s relayed
+   `~/.config/lexa/ocpp-auth.pass` edited to a wrong value) at the same
+   `wss://` URL and confirm the connection is refused
+   (`journalctl -u lexa-ocpp | grep 'basic-auth rejected'`). The unit-level
+   equivalent that runs in CI is `go test ./cmd/ocpp/... -run
+   TestOCPPSecurityProfile2_BasicAuth` in lexa-hub (wrong password, wrong
+   username, and correct credentials, all against the real
+   `ocppserver.New`/`SetBasicAuthHandler` code path — no bench needed to
+   exercise the auth logic itself).
+5. Re-run the 7 EV Mayhem scenarios at their accepted verdicts (transport
+   change only, same scenario semantics): `python3 scripts/mayhem.py
+   --dashboard http://69.0.0.20:8080 --only
+   ev-profile-reject,ev-accept-but-ignore,ev-min-current-floor,ev-meter-freeze,ev-connector-flap,ev-delayed-obey,ev-wrong-units`
+   ×3.
+
+Rollback: `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.1 dmitri`
+(no `--enable-ocpp-sp2`) resets `ocpp.json`'s cert/auth fields to `""` (see
+the deploy-gotcha note above) and restarts `lexa-ocpp`; **same session**,
+`bash scripts/update-sim-pis.sh 69.0.0.1 dmitri` (no flag) rewrites evsim back
+to plain `-csms ws://69.0.0.1:8887/ocpp` — the ExecStart rewrite is a regex
+substitution that strips the `-tls-ca`/`-auth-user`/`-auth-pass` flags
+cleanly in either direction, so this is a clean revert, not a manual edit.
+
+Backlog: Security Profile 3 (mTLS on the OCPP link) is out of scope — AD-008
+scopes TASK-074 to "≥2"; tracked in `docs/refactor/10_BACKLOG.md`.
 
 ### MQTT broker credentials + ACL (TASK-013, W7/AD-008)
 

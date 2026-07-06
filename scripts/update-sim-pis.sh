@@ -3,8 +3,9 @@
 # restarts their services. Also rewrites the metersim unit to linked mode and
 # points evsim's CSMS at the hub.
 #
-# Usage:   bash scripts/update-sim-pis.sh <hub-ip> [ssh-user]
+# Usage:   bash scripts/update-sim-pis.sh <hub-ip> [ssh-user] [--enable-ocpp-sp2]
 # Example: bash scripts/update-sim-pis.sh 69.0.0.1 dmitri
+#          bash scripts/update-sim-pis.sh 69.0.0.1 dmitri --enable-ocpp-sp2
 #
 # Handles both Pi layouts, auto-detected per node:
 #   user   — unit in ~/.config/systemd/user/<sim>.service, no sudo (current bench)
@@ -23,10 +24,35 @@
 # generated a token yet (auth still off, staged rollout) the fetch yields
 # nothing and the file is left empty — metersim then sends no Authorization
 # header, matching an unauthenticated hub.
+#
+# TASK-074 (AD-008, 09 Security hard gate): --enable-ocpp-sp2 points evsim's
+# CSMS URL at wss:// and adds -tls-ca/-auth-user/-auth-pass, mirroring
+# lexa-hub's `deploy-hub-pi.sh --enable-ocpp-sp2` (which must run in THE SAME
+# SESSION — a CSMS requiring TLS+auth instantly rejects an evsim still
+# dialing ws://, blinding every EV Mayhem scenario). The CA cert
+# (certs/ca-cert.pem, public, already tracked) and the Basic Auth password
+# (generated on the hub at /etc/lexa/ocpp-auth.pass, never committed) are
+# relayed to ev-pi over SSH the same no-local-temp-file way the hub API
+# token is relayed to the meter Pi above. OCPP_AUTH_USER is a fixed constant
+# ("evse-bench") that must match deploy-hub-pi.sh's OCPP_AUTH_USER — it is
+# not a secret, so no relay needed for it. Without the flag, evsim (re)dials
+# plain ws:// with no auth — the bench-only fallback and also the rollback
+# path (re-run without --enable-ocpp-sp2 to revert an evsim unit that
+# previously had the SP2 flags).
 set -euo pipefail
 
-HUB="${1:?usage: update-sim-pis.sh <hub-ip> [ssh-user]}"
-SSHUSER="${2:-dmitri}"
+OCPP_AUTH_USER="evse-bench" # must match lexa-hub scripts/deploy-hub-pi.sh's OCPP_AUTH_USER
+
+HUB="${1:?usage: update-sim-pis.sh <hub-ip> [ssh-user] [--enable-ocpp-sp2]}"
+shift
+SSHUSER="dmitri"
+ENABLE_SP2=0
+for arg in "$@"; do
+  case "$arg" in
+    --enable-ocpp-sp2) ENABLE_SP2=1 ;;
+    *) SSHUSER="$arg" ;;
+  esac
+done
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
 declare -A SIM=( [69.0.0.10]=modsim [69.0.0.11]=batsim [69.0.0.12]=metersim [69.0.0.14]=evsim )
@@ -35,6 +61,9 @@ for ip in "${!SIM[@]}"; do
   s="${SIM[$ip]}"
   [[ -x "$HERE/bin/arm64/$s" ]] || { echo "missing bin/arm64/$s — build with: GOOS=linux GOARCH=arm64 go build -o bin/arm64/$s ./sim/$s"; exit 1; }
 done
+if [[ "$ENABLE_SP2" == "1" ]]; then
+  [[ -f "$HERE/certs/ca-cert.pem" ]] || { echo "missing $HERE/certs/ca-cert.pem"; exit 1; }
+fi
 
 for ip in 69.0.0.10 69.0.0.11 69.0.0.12 69.0.0.14; do
   s="${SIM[$ip]}"
@@ -47,7 +76,15 @@ for ip in 69.0.0.10 69.0.0.11 69.0.0.12 69.0.0.14; do
       ssh "$SSHUSER@$ip" 'mkdir -p ~/.config/lexa && umask 077 && cat > ~/.config/lexa/hub-api.token'
   fi
 
-  ssh "$SSHUSER@$ip" "SIM=$s HUB=$HUB bash -s" <<'REMOTE'
+  if [[ "$s" == evsim && "$ENABLE_SP2" == "1" ]]; then
+    echo "   staging OCPP CA cert + relaying Basic Auth secret to $ip"
+    scp -q "$HERE/certs/ca-cert.pem" "$SSHUSER@$ip:/tmp/ocpp-ca.pem.new"
+    ssh "$SSHUSER@$ip" 'mkdir -p ~/.config/lexa && install -m 644 /tmp/ocpp-ca.pem.new ~/.config/lexa/ocpp-ca.pem && rm /tmp/ocpp-ca.pem.new'
+    ssh "$SSHUSER@$HUB" 'sudo cat /etc/lexa/ocpp-auth.pass 2>/dev/null || true' | \
+      ssh "$SSHUSER@$ip" 'mkdir -p ~/.config/lexa && umask 077 && cat > ~/.config/lexa/ocpp-auth.pass'
+  fi
+
+  ssh "$SSHUSER@$ip" "SIM=$s HUB=$HUB ENABLE_SP2=$ENABLE_SP2 OCPP_AUTH_USER=$OCPP_AUTH_USER bash -s" <<'REMOTE'
 set -euo pipefail
 
 # systemctl --user needs the session bus when invoked over non-interactive SSH
@@ -78,8 +115,37 @@ if [[ "$SIM" == metersim ]]; then
   $AS sed -i "s|^ExecStart=.*|ExecStart=$BIN -port 5022 -api-port 6022 -solar-api http://69.0.0.10:6020 -battery-api http://69.0.0.11:6021 -hub-api http://$HUB:9100 -hub-token-file $HOME/.config/lexa/hub-api.token -load 3000|" "$UNIT"
 fi
 if [[ "$SIM" == evsim ]]; then
-  # Point the charging station at the hub's CSMS.
-  $AS sed -i "s|-csms ws://[0-9.]*:8887/ocpp|-csms ws://$HUB:8887/ocpp|" "$UNIT"
+  # Point the charging station at the hub's CSMS. Rewritten via a regex
+  # substitution (not a plain sed token swap) so this is idempotent in BOTH
+  # directions: re-running with --enable-ocpp-sp2 replaces a prior plain
+  # "-csms ws://..." (or a stale wss:// with old creds) in place, and
+  # re-running WITHOUT it rolls a previously-SP2-enabled unit back to plain
+  # ws:// (the documented rollback path, TASK-074) — never leaves orphaned
+  # -tls-ca/-auth-user/-auth-pass flags behind either way.
+  if [[ "$ENABLE_SP2" == "1" ]]; then
+    CA_PATH="$HOME/.config/lexa/ocpp-ca.pem"
+    AUTH_PASS="$(cat "$HOME/.config/lexa/ocpp-auth.pass" 2>/dev/null || true)"
+    if [[ -z "$AUTH_PASS" ]]; then
+      echo "   ERROR: $HOME/.config/lexa/ocpp-auth.pass is empty — has" >&2
+      echo "   'deploy-hub-pi.sh --enable-ocpp-sp2' run on the hub in this session?" >&2
+      exit 1
+    fi
+    NEW_FLAGS="-csms wss://$HUB:8887/ocpp -tls-ca $CA_PATH -auth-user $OCPP_AUTH_USER -auth-pass $AUTH_PASS"
+  else
+    NEW_FLAGS="-csms ws://$HUB:8887/ocpp"
+  fi
+  $AS python3 - "$UNIT" "$NEW_FLAGS" <<'PY'
+import re, sys
+unit_path, new_flags = sys.argv[1], sys.argv[2]
+with open(unit_path) as f:
+    content = f.read()
+pattern = re.compile(r"-csms (?:ws|wss)://[0-9.]+:8887/ocpp(?: -tls-ca \S+)?(?: -auth-user \S+)?(?: -auth-pass \S+)?")
+new_content, n = pattern.subn(new_flags, content, count=1)
+if n == 0:
+    sys.exit("ERROR: -csms flag not found in " + unit_path)
+with open(unit_path, "w") as f:
+    f.write(new_content)
+PY
 fi
 
 $SC daemon-reload
@@ -92,3 +158,6 @@ done
 echo
 echo "── Done. Spot-check:"
 echo "   curl -s http://69.0.0.12:6022/state | python3 -m json.tool | grep -A6 energy_balance"
+if [[ "$ENABLE_SP2" == "1" ]]; then
+  echo "   ssh $SSHUSER@69.0.0.14 'sudo journalctl -u evsim -n 20 --no-pager 2>/dev/null || journalctl --user -u evsim -n 20 --no-pager' | grep 'TLS enabled'"
+fi
