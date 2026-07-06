@@ -1,6 +1,6 @@
 # TASK-033 — Mayhem reconciler-era review + 10-cycle FAST & STOCK sign-off campaigns
 
-*Status: TODO · Phase: P2 · Effort: M (≈4–6 h + campaign wall-clock) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-06) — M2 sign-off; see docs/QA_REPORT_M2_20260706.md*
 
 ## Objective
 Every Mayhem scenario whose injection choreography, hold times, or diagnosis text assumes
