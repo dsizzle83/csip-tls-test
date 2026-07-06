@@ -32,9 +32,13 @@ optimizer tests; no soak, no packet-level chaos, no restart-unclean tests.
 ### Unit
 - CI on every PR (TASK-002/003), `-race`, plus `govulncheck` (005) and
   nightly fuzz jobs (047/048).
-- Orchestrator tests migrate to **behavioral assertions** (TASK-056):
-  assert published desired state / measured-effect expectations /
-  invariants, not decision strings — precondition for R4.
+- Orchestrator tests migrate to **behavioral assertions** (TASK-056 —
+  DONE): assert published desired state / measured-effect expectations /
+  invariants, not decision strings — precondition for R4. The decision-string
+  oracles (`hasDecisionContaining`, `contains(d.Reason, "cooldown")`) are gone;
+  the battery-stall→solar-curtail, blip-tolerance, and EV import-cooldown tests
+  now assert plan outputs (solar `CurtailToW`, EVSE `MaxCurrentA`) and are
+  mutation-verified.
 - New pure components (reconciler core 026, `utilitytime` 034, constraint
   sessions 062) arrive with exhaustive table-driven tests; time-dependent
   logic takes an injected clock.

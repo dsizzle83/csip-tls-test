@@ -1,6 +1,6 @@
 # TASK-056 — Convert decision-string tests → behavioral/invariant tests
 
-*Status: TODO · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-06, lexa-hub b52b38b) · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: med · Risk: low*
 
 ## Objective
 Every test in `lexa-hub/internal/orchestrator` asserts *behavior* (plan
