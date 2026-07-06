@@ -87,16 +87,20 @@ TASK-024 — see above) on every PR and push to `main`. Bench-touching suites
 on 69.0.0.x) stay desktop/bench-only, out of hosted CI.
 
 ## Mayhem hostile-QA
-Adversarial HIL fault-injection driving the real bench through 57 worst-case scenarios and
+Adversarial HIL fault-injection driving the real bench through 59 worst-case scenarios and
 diagnosing where the hub's fault handling breaks. Engine: `cmd/dashboard/mayhem.go` +
 `mayhem_world.go` (`/api/qa/*`, dashboard QA tab); headless runner: `scripts/mayhem.py`
-(`--list`, `--only id,id`, `--json`). Verdicts: PASS / DEGRADED / FAIL / BLIND / INCONCLUSIVE.
+(`--list`, `--only id,id`, `--json`, `--extended`). Verdicts: PASS / DEGRADED / FAIL / BLIND / INCONCLUSIVE.
 Three scenarios (`netem-loss-export-cap`, `netem-reorder-northbound`, `netem-jitter-evse`,
 TASK-052/GAP-11) are the first to fault the actual wire (`tc netem` loss/reorder/delay/
 jitter on a bench Pi's real interface over SSH, via `scripts/netem.sh` / the
 `netemModifier` helper in `mayhem_world.go`) rather than only the application layer;
 INCONCLUSIVE without SSH + passwordless sudo on the target node (guaranteed only on the
 hub — BENCH.md).
+Two scenarios (`export-dither-at-breach`, `soc-dither-at-reserve`, TASK-054/GAP-08) sit ON
+the optimizer's guard thresholds and oscillate ±ε for ~5 min rather than holding/ramping a
+fault once — long enough (`mayScenario.Extended`) that a default/full run excludes them
+(RSK-12); run them via `--only <id>` or `--extended` in nightly / release-gate campaigns.
 **FAST for development campaigns; STOCK via `scripts/mayhem-campaign.sh` for release
 gates** — scenario `HoldS`/settle margins are calibrated against FAST latencies
 (`bench-up.sh --fast`), so day-to-day campaigns stay in FAST. `scripts/mayhem-campaign.sh

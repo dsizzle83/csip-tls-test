@@ -245,3 +245,45 @@ pre-existing documented gaps needing no new entry (see the report's disposition 
   `logs/campaign-stock-20260704T224628/cycle-02.json`.
   Priority: low (1/5, converges within window most of the time, no safety escalation)
   — track, don't block M0.
+
+---
+
+## 7. Guard-threshold dither sweeps (GAP-08, TASK-054) — code complete, bench validation pending
+
+Added `export-dither-at-breach` (metered export ±ε across `cap+complianceBreachW`,
+~100 W) and `soc-dither-at-reserve` (battery SoC ±1 pt across `SOCReserve`, 20%) —
+`cmd/dashboard/mayhem_world.go` — to sweep the belief that the product's leaky breach
+counters (`expOverTicks`, `genGuard.overCount`) and the reserve guard
+(`dischargingAtReserve`) are hold-biased at the exact decision line, not just under
+sustained excursions. Both are **EXTENDED-SET** (`HoldS ≈ 300 s`, `mayScenario.Extended`)
+and excluded from a default/full run (RSK-12) — run via `--only
+export-dither-at-breach,soc-dither-at-reserve` or `--extended` for nightly / release-gate
+campaigns; `--list` tags them `[extended]`.
+
+New oracle logic: `diagnoseExportDither` (CannotComply must be FALSE for a pure dither
+that never sustains past `exportBreachTicks`; a boundary-dither scenario FAILs on
+INV-HUNT rather than the generic audit's DEGRADED demotion) and `diagnoseSocDither`
+(`socReserveOverDischarge` — a scenario-local 20%-line predicate, deliberately separate
+from `invariants.go`'s `invSOC`/10% harness floor — plus `batteryCommandFlaps` command-
+chatter detection against `expectedDitherTransitions`). All pure-function logic is unit
+tested in `cmd/dashboard/mayhem_dither_test.go` (cadence helper, selection/filtering,
+both diagnosers' verdict ladders) — `go test ./cmd/dashboard/...` green.
+
+**Status: CODE COMPLETE, NOT YET BENCH-VALIDATED.** This was implemented in a code-only
+session (a separate bench-owning session held the live bench mid-task — TASK-032) per
+the task's launch instructions; the following are deferred to a later batched HIL
+session:
+
+- 10× solo runs of each scenario against the live bench (stability check).
+- Empirical tuning of `exportDitherLoadDeltaW` (currently 150 W, a starting point per
+  the task's sizing guidance) against the real curtailment response — confirm the
+  low-load phase's residual export sits just over `cap+complianceBreachW` and the
+  high-load phase comfortably under it, both inside the 300 W INV-HUNT hysteresis.
+- The **control run** proving the CannotComply biconditional's other half: temporarily
+  widen the dither (larger `exportDitherLoadDeltaW`, or hold one phase past
+  `scaleTicks(exportBreachTicks)`) so the over-band phase sustains, run `--only
+  export-dither-at-breach` once, confirm CannotComply DOES post, then revert — not a
+  committed variant.
+- A full extended-set campaign including both scenarios, verdicts recorded here.
+
+Branch: `task/054-dither` (csip-tls-test), not yet merged.

@@ -1,6 +1,15 @@
 # TASK-054 — Guard-threshold dither sweeps (SoC@reserve, export@breach)
 
-*Status: TODO · Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: CODE COMPLETE (2026-07-06, pending commit sha — see 00_MASTER_INDEX), bench
+validation batched · Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+
+**Session note (2026-07-06):** Implemented as a code-only session — a separate bench-owning
+session held the live bench mid-task (TASK-032), so the scenarios, evaluators, and unit
+tests below were written and compiled/tested locally but never run against the live bench.
+Deferred to a later batched HIL session (see docs/QA_FINDINGS.md §7 for the exact list):
+10× solo per scenario, empirical `exportDitherLoadDeltaW` tuning, the step-7 control run
+proving the CannotComply biconditional's "sustained ⇒ fires" half, and an extended-set
+campaign. Branch `task/054-dither`, not yet merged.
 
 ## Objective
 Add Mayhem scenarios that drive measurements in a small ±ε oscillation
@@ -189,16 +198,19 @@ A shared `perTick` dither helper keeps the cadence consistent.
   finding — pin it, e.g. expected-FAIL if it exposes hunting).
 
 ## Acceptance criteria
-- [ ] `--list` shows `export-dither-at-breach`, `soc-dither-at-reserve`
-      (+ optional import).
+- [x] `--list` shows `export-dither-at-breach`, `soc-dither-at-reserve`
+      (+ optional import). (Optional `import-dither-at-breach` NOT added — deferred,
+      lower priority per the task text.)
 - [ ] 10× solo stable; pure-dither runs post NO CannotComply and keep
-      INV-HUNT/INV-SOC clean; breach-seconds bounded.
+      INV-HUNT/INV-SOC clean; breach-seconds bounded. **BENCH-PENDING.**
 - [ ] The CannotComply biconditional verified: the step-7 control run of
       the SAME scenario with a SUSTAINED excursion DOES post
-      CannotComply — proving the oracle isn't just always-false.
+      CannotComply — proving the oracle isn't just always-false. **BENCH-PENDING**
+      (biconditional's other half — "not sustained ⇒ no CannotComply" — IS unit
+      tested: `TestDiagnoseExportDither_CannotComplyFails`).
 - [ ] Extended campaign including the dither scenarios ≤ baseline; any
-      hunting/false-CannotComply exposed is pinned as a finding.
-- [ ] Scenarios marked extended-set (long HoldS) in code + docs.
+      hunting/false-CannotComply exposed is pinned as a finding. **BENCH-PENDING.**
+- [x] Scenarios marked extended-set (long HoldS) in code + docs.
 
 ## Regression checklist
 - [ ] `make test-fast` + `go test ./cmd/dashboard/` green

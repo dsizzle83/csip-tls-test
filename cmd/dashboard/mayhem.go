@@ -195,21 +195,51 @@ type mayScenario struct {
 	HoldS      int
 	Fix        string
 
+	// Extended marks a long-running scenario (HoldS in the minutes, not
+	// seconds — RSK-12) that the default/full run excludes to protect
+	// day-to-day FAST campaign wall-clock time (CLAUDE.md: "FAST for
+	// development campaigns; STOCK via mayhem-campaign.sh for release
+	// gates"). It still runs when explicitly named via --only, or when the
+	// caller opts in via IncludeExtended (nightly / release-gate campaigns).
+	// See filterExtended.
+	Extended bool
+
 	setup    func(d *mayhemDriver) (*activeConstraint, error)
 	perTick  func(d *mayhemDriver, i int)
 	evaluate func(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding
 	teardown func(d *mayhemDriver)
 }
 
+// filterExtended drops Extended scenarios from a default/full run so a long
+// (multi-minute) boundary-dither scenario cannot silently inflate every FAST
+// campaign's wall-clock time (RSK-12). It is a no-op — and never called — when
+// the caller named specific scenarios via --only (Only is always an intentional,
+// explicit selection) or explicitly opted in via includeExtended (nightly /
+// release-gate campaigns). Pure so the selection rule is unit-testable without
+// spinning up a run.
+func filterExtended(scenarios []*mayScenario, includeExtended bool) []*mayScenario {
+	if includeExtended {
+		return scenarios
+	}
+	out := scenarios[:0:0]
+	for _, sc := range scenarios {
+		if !sc.Extended {
+			out = append(out, sc)
+		}
+	}
+	return out
+}
+
 // ── HTTP endpoints ────────────────────────────────────────────────────────────
 
 type mayhemStartReq struct {
-	SampleMs   int      `json:"sample_ms"`
-	Only       []string `json:"only"`       // run only these scenario IDs (empty = all)
-	Matrix     bool     `json:"matrix"`     // run the fault-matrix run mode instead of the curated suite
-	Chaos      bool     `json:"chaos"`      // run a seeded randomized chaos sequence
-	Seed       int64    `json:"seed"`       // chaos seed (0 ⇒ time-derived, reported back for replay)
-	Iterations int      `json:"iterations"` // chaos iteration count (0 ⇒ default)
+	SampleMs        int      `json:"sample_ms"`
+	Only            []string `json:"only"`             // run only these scenario IDs (empty = all)
+	Matrix          bool     `json:"matrix"`           // run the fault-matrix run mode instead of the curated suite
+	Chaos           bool     `json:"chaos"`            // run a seeded randomized chaos sequence
+	Seed            int64    `json:"seed"`             // chaos seed (0 ⇒ time-derived, reported back for replay)
+	Iterations      int      `json:"iterations"`       // chaos iteration count (0 ⇒ default)
+	IncludeExtended bool     `json:"include_extended"` // opt in to Extended (long-running, GAP-08 dither) scenarios in a default/full run
 }
 
 func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
@@ -247,6 +277,12 @@ func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		scenarios = filtered
+	} else {
+		// A default/full run (curated, matrix, or chaos) excludes Extended
+		// (long-running, GAP-08 dither) scenarios unless the caller opts in —
+		// --only above is always an explicit, intentional selection and is
+		// never filtered. See filterExtended.
+		scenarios = filterExtended(scenarios, req.IncludeExtended)
 	}
 	if len(scenarios) == 0 {
 		http.Error(w, "no matching scenarios", http.StatusBadRequest)
@@ -295,6 +331,7 @@ func (d *mayhemDriver) handleScenarios(w http.ResponseWriter, r *http.Request) {
 		Category   string `json:"category"`
 		Hypothesis string `json:"hypothesis"`
 		Expected   string `json:"expected"`
+		Extended   bool   `json:"extended"` // long-running (GAP-08 dither); excluded from a default run unless --only or include_extended
 	}
 	scs := d.scenarios()
 	out := make([]scenarioInfo, 0, len(scs))
@@ -302,6 +339,7 @@ func (d *mayhemDriver) handleScenarios(w http.ResponseWriter, r *http.Request) {
 		out = append(out, scenarioInfo{
 			ID: sc.ID, Name: sc.Name, Category: sc.Category,
 			Hypothesis: sc.Hypothesis, Expected: sc.Expected,
+			Extended: sc.Extended,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
