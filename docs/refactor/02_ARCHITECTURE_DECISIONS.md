@@ -417,6 +417,50 @@ side TASK-036 still uses the formula until it migrates). Deployed
 lexa-northbound only (bench 028-active elsewhere); gate + full FAST
 campaign at the wave gate.
 
+**Migrated (TASK-036, 2026-07-05, branch `task/036-time-consumers`):**
+consumers 4 and 5 of 5 — hub state, lexa-api, and the optimizer TOU check.
+Phase 3 exit criterion met: zero grace/debounce/offset *policy* constants
+remain outside `internal/utilitytime` (remaining offset-plumbing fields —
+`clockOffset` on `MQTTSystemReader`/`snapshot`, `ClockOffset` on bus/journal
+messages — are data, not arithmetic, and are out of scope by design).
+`cmd/hub/state.go`'s `MQTTSystemReader` now holds a `utilitytime.DebouncedExpiry`
+sized at construction from the engine interval via `confirmTicksFor`
+(`expiryConfirmWindowS = 9`, floored at 2 ticks); `ReadSystemState`'s expiry
+check delegates to `utilitytime.ServerNowAt` + `utilitytime.Expired` and
+`expiry.Observe` in place of the bare `csipExpiredTicks` counter — reset-on-
+false / confirm-on-Nth-true semantics unchanged, log line content unchanged.
+**Accepted behavior change realized:** FAST is bit-identical (3 s tick → 3
+ticks → 9 s, matching the removed `expiryConfirmTicks=3` exactly); STOCK now
+floors to 2 ticks = 30 s instead of the legacy tick-counted 3 ticks = 45 s —
+the deliberate wall-clock-denomination correction this decision called out
+in advance. `cmd/api/handlers.go`'s inline `ValidUntil+GraceS` comparison now
+delegates to `utilitytime.ReportGrace{GraceS: csipReportGraceS}.Reportable`
+with `serverNow` from `utilitytime.ServerNowAt`; `csipReportGraceS` stays a
+local `15` constant (kept for `stale_test.go`'s direct reference) but only
+feeds the delegated policy, doing no arithmetic itself — semantics and the
+15 s boundary test are unchanged. `internal/orchestrator/optimizer.go`
+Rule 5's `serverNow` now sources from `utilitytime.ServerNowAt(now,
+state.ClockOffset)` — a pure-function swap only; the package imports no
+`utilitytime.Clock` and gains no wall-clock read, preserving the I/O-free
+property (05 §1). New tests: FAST/STOCK/1s confirm-tick table
+(`TestConfirmTicksFor_ScalesToEngineCadence`), a STOCK-cadence debounce test
+including the transient-excursion-rides-out case
+(`TestReadSystemState_ExpiryDebounce_STOCKCadence`), a `cmd/hub`-level
+differential equivalence test against the removed inline counter
+(`expiry_equiv_test.go`, mirroring `internal/utilitytime/expiry_test.go`'s
+`TransientJumpRidesOut` coverage), and a nonzero-`ClockOffset` Rule 5 test
+(`TestOptimizer_TOU_PeakHour_UsesServerTimeViaClockOffset`).
+`go test -race ./internal/... ./cmd/...` green. Not yet deployed to the hub
+Pi / gated through Mayhem — bench validation rides the next batched gate
+(per the deadline-amendment framing in 05 §12); STOCK spot-check
+(`wan-outage-expiry` + `clock-jump-forward` at 45 s→30 s) still pending.
+
+Found in passing, out of this task's scope: `cmd/telemetry/main.go`'s
+`postMeasurements` still computes `now := time.Now().Unix() + clockOffset`
+inline for MUP reading timestamps — a 6th `serverNow` site AD-004's original
+five-consumer list didn't enumerate. Not touched here (not in TASK-036's
+Files list); flagged for a follow-up task/backlog entry.
+
 ## AD-005 ✅ Persistence: append-only event journal + guard snapshots, not a database (W5)
 
 **Decision.** Newline-delimited, size-rotated, fsync-batched journal on
