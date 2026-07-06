@@ -65,6 +65,36 @@ fleet-wide, twice a year.
 second for TOU window evaluation; fix whatever they find.
 **Scheduling note:** TASK-079 is numbered in P6 but gated only on TASK-036 —
 run it during P3/P4 to honor this P1 priority; do not wait for Phase 6.
+**CLOSED (2026-07-06, lexa-hub `task/079-dst-tou`):** table tests added —
+`internal/orchestrator/costmodel_test.go` (default-schedule edges ×
+normal/DST-forward/DST-back; synthetic 02:00-boundary schedule real-instant
+sweep both transitions; midnight-wrap (22-06) schedule both transitions;
+±1s leap-smear jitter at every edge; UTC-vs-LA divergence hazard pinned)
+and `internal/orchestrator/planner_test.go` (`localHourOf` across both
+transitions; `planStepImportPrice`/`planStepExportPrice` continuity over a
+full 288-step/24h horizon on all three day types). One real bug found + fixed
+inline: `OptimalChargeWindow`'s per-step `time.Date(...,(startHour+h)%24,...)`
+construction collapsed the nonexistent spring-forward-gap hour to the
+previous hour's instant, duplicating its rate and dropping the real next
+hour from any charge-window cost sum straddling the gap — undercounting the
+window's true cost. Fixed by anchoring once per candidate start and
+advancing via `Time.Add` (real elapsed time), proven bit-for-bit identical
+to the old formula on non-transition days
+(`TestTOU_OptimalChargeWindow_NormalDay_AddEquivalence`). `OptimalChargeWindow`
+has no production caller today, so the fix has zero effect on any bench
+replay cost baseline. One structural KNOWN-GAP filed, not fixed inline (see
+`10_BACKLOG.md`): on the 25-hour fall-back day the outer 24-label loop can
+never select the *second* occurrence of the repeated local hour as a
+window's own start (only reachable as an interior hour) — never mispriced
+in any schedule we could construct (same rate both occurrences), so left as
+a documented pinning test. Deployment requirement documented in lexa-hub
+`CLAUDE.md`: the hub SOM's configured timezone must match the tariff's
+zone — `IsPeakHour` reads `t.Hour()` in whatever zone the caller's
+`time.Time` carries, so a UTC-configured SOM serving a Los_Angeles tariff
+silently misprices every evening with no alarm
+(`TestTOU_UTCvsLA_Divergence_DeploymentHazard`). `go test -race
+./internal/...` green under `TZ=UTC`/`TZ=America/New_York`/default runner
+TZ.
 
 ## P1 — Identity/topology family
 

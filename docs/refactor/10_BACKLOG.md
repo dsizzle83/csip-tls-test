@@ -22,6 +22,21 @@ promote by giving an item a TASK number and a row in 04.*
 - **DP planner revisit:** only if P5 shadow diffs implicate it (AD-007).
 - **Multi-site / multi-meter topologies** (second meter appearing is an
   identity-family QA gap; product semantics undefined today).
+- **`OptimalChargeWindow` candidate-start generation on a 25-hour fall-back
+  day (GAP-05, TASK-079 KNOWN-GAP):** the outer loop tries 24 distinct local
+  hour LABELS (0-23) as candidate window starts; on the DST fall-back day
+  the repeated local hour (e.g. 01:00 America/Los_Angeles, occurring PDT
+  then PST) is ambiguous under `time.Date`, which deterministically resolves
+  it to one specific instant — so the *second* occurrence of that hour can
+  never itself be a candidate window START (it's still reachable as an
+  interior hour of a window that starts earlier, and every schedule we
+  could construct prices both occurrences identically since TOU tariffs are
+  hour-of-day keyed, so this has never been observed to misprice anything).
+  A real fix means walking real instants instead of hour labels for
+  candidate generation — bigger than TASK-079's inline-fix blast radius.
+  Pinned as `TestTOU_OptimalChargeWindow_DSTBack_RepeatedHourStartAnchor` in
+  lexa-hub `internal/orchestrator/costmodel_test.go`. Not urgent:
+  `OptimalChargeWindow` has no production caller today.
 
 ## Test bench & QA
 - **OCPP lifecycle-reorder injector** for evsim (out-of-order
