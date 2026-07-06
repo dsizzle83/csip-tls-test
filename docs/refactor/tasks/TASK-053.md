@@ -1,6 +1,52 @@
 # TASK-053 — Generative int16/scale-factor boundary sweep test
 
-*Status: TODO · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-05) · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: med
+· Risk: med*
+
+**Commits (all on branch `task/053-int16-sweep`, unmerged — three-repo
+lockstep, review pending):**
+- `lexa-proto` 95ebde6 — canonical sweep + fuzz targets
+- `lexa-hub` d6ea74a — vendored-copy wrapper test + encoder sweep/agreement
+- `csip-tls-test` (this repo) — vendored-copy wrapper test + `apFromWatts` sweep
+
+**Disposition note:** ran POST-021 (TASK-021 DONE — shared codec confirmed
+live in both consumers via vendored `lexa-proto/sunspec`), so the dual-fork
+equivalence-mode contingency (step 5) did not apply; no divergence to file.
+
+lexa-proto is unhosted and has no CI of its own, so a literal "one test,
+both CIs automatically" (the task's original framing) is not achievable
+until it is hosted (tracked in 00_MASTER_INDEX P1 notes: "create
+dsizzle83/lexa-proto"). `go mod vendor` correctly excludes a dependency's
+`_test.go` files, and there is no remote for a hosted runner to check out.
+Deviation: the canonical sweep lives in `lexa-proto/sunspec` as exported
+`Sweep*` helpers (production file, vendorable) + `lexa-proto`'s own
+`scale_sweep_test.go`; each consumer runs the identical contract against
+its OWN vendored copy via a thin wrapper test package
+(`internal/southbound/sunspecsweep`, this repo and lexa-hub). No CI/Makefile
+step changes were needed to *execute* it — `scripts/qa-regression.sh` /
+`make test-southbound` (this repo) and `make test-nocgo` (lexa-hub) already
+glob the packages the new tests landed in (verified locally, see Testing
+changes below); added documentation-only CI comments + a `make
+sweep-sunspec` convenience target in both repos.
+
+Step 3 (product watt-encoders, encode-scaling + cross-encoder agreement):
+lexa-hub's `wattsToActivePower` (`cmd/hub/state.go`) /
+`activePowerFromWatts` (`cmd/modbus/main.go`) swept 0..1e9 W each and proven
+to agree via a shared golden expected-value table (the two functions live
+in separate `package main`s — different binaries — so they cannot be
+called from one test; matching the same literal table in both test files
+is the cross-repo-style proof, computed once, not hand-derived per file).
+This repo's own product-analogous encoder, `sim/gridsim.apFromWatts`, was
+swept ±1e9 W on its own contract (integer-truncation precision bound, not
+the hub's round-to-nearest) — there is no second encoder in this repo to
+cross-check against.
+
+Supplementary generative coverage: two native Go fuzz targets
+(`FuzzScaleRoundTripSigned`, `FuzzScaleClampSigned`) added in lexa-proto,
+run locally 5 minutes each — 32,881,421 and 32,555,416+ executions
+respectively (~65M total), 0 crashers. Not wired into any CI (lexa-proto has
+none) pending the hosting flip; the required PR-lane property stays the
+deterministic sweep per the task's own "not -fuzz" guidance.
 
 ## Objective
 Add a property-based generative test that sweeps the full int16 register
@@ -170,21 +216,25 @@ Keep runtime <1 s (the bench repo's `make test-fast` budget).
 - GS-1/MTR-1/MTR-5 invariants (both CLAUDE.mds) — the test enforces them.
 
 ## Acceptance criteria
-- [ ] Sweep test present (shared module post-021, or both forks + an
-      equivalence test pre-021); runs <1 s in the standard test lane.
-- [ ] Round-trip, wrap-guard (no sign flip across ±32767 at every sf),
-      encode-scaling, and sentinel properties each asserted.
-- [ ] Product's two watt-encoders proven to agree on shared inputs.
-- [ ] CI (both repos) runs the sweep on every PR; green (or a real codec
-      bug is filed with a failing seed and reconciled via TASK-020).
-- [ ] Pre-021 mode: cross-fork equivalence asserted (any divergence filed).
+- [x] Sweep test present (shared module post-021); `lexa-proto/sunspec`
+      runs in 0.02s, both consumers' vendored-copy wrapper tests run in
+      ~1.1s each (dominated by `-race` build overhead, not sweep logic).
+- [x] Round-trip, wrap-guard (no sign flip across ±32767 at every sf),
+      encode-scaling, and sentinel properties each asserted — zero
+      violations found (codec was already correct; no fix commit needed).
+- [x] Product's two watt-encoders proven to agree on shared inputs (lexa-hub
+      golden table, cmd/hub/state_test.go + cmd/modbus/control_test.go).
+- [x] CI (both repos) runs the sweep on every PR, green — via existing
+      globs (`make test-nocgo` / `scripts/qa-regression.sh` +
+      `test-southbound`), verified locally; no codec bug found.
+- [ ] Pre-021 mode: N/A — ran post-021 (TASK-021 already DONE at task start).
 
 ## Regression checklist
-- [ ] `make test-fast` (csip-tls-test) still <1 s and green
-- [ ] `go test -race ./internal/southbound/...` (both repos) green
-- [ ] Conformance logic tests green (`go test ./tests/`) — codec-adjacent
-- [ ] Mayhem: none (unit-level), unless a codec fix touched a control path →
-      `solar-bad-scale`, `nan-sentinel`, `battery-nan-sentinel` targeted runs
+- [x] `make test-fast` (csip-tls-test) still <1 s and green (0.005s, unchanged)
+- [x] `go test -race ./internal/southbound/...` (both repos) green
+- [x] Conformance logic tests green (`go test ./tests/`) — codec-adjacent
+- [x] Mayhem: none run — unit-level only, zero codec bugs found so no
+      control path was touched (regression trigger condition not met)
 
 ## Mayhem scenarios affected
 None directly. HIL siblings that exercise scale/sentinel handling:

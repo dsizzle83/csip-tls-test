@@ -3,6 +3,7 @@ package gridsim
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -34,6 +35,46 @@ func TestAPFromWatts_ScalesBeyondInt16(t *testing.T) {
 	}
 	if apFromWatts(nil) != nil {
 		t.Error("apFromWatts(nil) should pass nil through")
+	}
+}
+
+// TestAPFromWatts_Sweep0To1e9 is TASK-053's step-3 encode-scaling property
+// applied to this repo's own product-analogous watt encoder (the bench's
+// gridsim admin API mirrors the hub's OpMod*LimW encoding path — GS-1/MTR-1):
+// across a dense log-scale sweep of +-1e9 W, Value must stay in int16 range
+// and Value×10^Multiplier must reconstruct the input within one full scale
+// step (apFromWatts truncates via integer division, unlike the hub's
+// float64+math.Round encoders, so its precision bound is one full step, not
+// half — see the lexa-hub counterpart in cmd/hub/state_test.go /
+// cmd/modbus/control_test.go for the rounding variant).
+func TestAPFromWatts_Sweep0To1e9(t *testing.T) {
+	step := int64(1)
+	for w := int64(-1_000_000_000); w <= 1_000_000_000; w += step {
+		wCopy := w
+		ap := apFromWatts(&wCopy)
+		if ap.Value > math.MaxInt16 || ap.Value < math.MinInt16 {
+			t.Fatalf("apFromWatts(%d) value=%d out of int16 range", w, ap.Value)
+		}
+		decoded := float64(ap.Value) * math.Pow10(int(ap.Multiplier))
+		tol := math.Pow10(int(ap.Multiplier))
+		if math.Abs(decoded-float64(w)) > tol {
+			t.Fatalf("apFromWatts(%d) = {Value:%d Mult:%d} -> %g, want within %g (one scale step)",
+				w, ap.Value, ap.Multiplier, decoded, tol)
+		}
+		if w > 0 && decoded < 0 {
+			t.Fatalf("apFromWatts(%d): sign flip, decoded=%g", w, decoded)
+		}
+		if w < 0 && decoded > 0 {
+			t.Fatalf("apFromWatts(%d): sign flip, decoded=%g", w, decoded)
+		}
+		// Geometric progression: dense near zero, still bounded iteration
+		// count out to +-1e9 (TASK-053: CI-fast, not -fuzz).
+		if w != 0 {
+			step = int64(math.Abs(float64(w)) * 0.001)
+			if step < 1 {
+				step = 1
+			}
+		}
 	}
 }
 

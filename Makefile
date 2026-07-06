@@ -3,6 +3,7 @@
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
         test test-fast test-integration test-update-golden test-southbound qa qa-bench fuzz \
+        sweep-sunspec \
         modsim-image modsim-run modsim-stop \
         gen-test-certs gen-client-cert smoke-pi clean help
 
@@ -250,6 +251,17 @@ qa-bench:
 test-southbound:
 	go test ./internal/southbound/...
 	go test ./tests/ -run TestModbusConformance -v
+
+# TASK-053 (GAP-07): quick local re-run of just the int16/scale-factor
+# boundary sweep — the shared lexa-proto/sunspec codec contract (against
+# this repo's vendored copy, internal/southbound/sunspecsweep) plus the
+# bench's own product-analogous watt encoder (sim/gridsim apFromWatts).
+# Already covered by `test-southbound` / `qa` / CI (go.list globs already
+# include both packages); this target is for a fast local loop while
+# iterating.
+sweep-sunspec:
+	go test -run 'Sweep' ./internal/southbound/sunspecsweep/...
+	go test -run 'APFromWatts' ./sim/gridsim/...
 
 # Full integration tests with real TLS handshakes. Requires fixtures.
 test-integration: $(CA_CERT)

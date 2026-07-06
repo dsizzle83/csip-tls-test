@@ -86,7 +86,7 @@ optimizer tests; no soak, no packet-level chaos, no restart-unclean tests.
 | Local clock step | `utilitytime` policy + scenario | 037, 038 |
 | DST/leap over TOU boundary | timezone table tests | 079 |
 | Duplicate client ID / topology errors | scenario | 049 |
-| int16/scale-factor boundaries | generative sweep vs shared codec | 053 |
+| int16/scale-factor boundaries | generative sweep vs shared codec — landed (053, DONE): round-trip/wrap-guard/sentinel swept in `lexa-proto/sunspec` + both consumers' vendored copies (`internal/southbound/sunspecsweep`), watt-encoder sweep in each product's own tree | 053 |
 | Threshold dither (SoC@reserve, export@breach) | sweep scenarios | 054 |
 | `"NaN"` string in bus JSON | decoder hardening + test | 055 |
 | Hostile HTTP bytes | fuzz + size caps | 047 |

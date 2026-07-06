@@ -119,7 +119,7 @@ bench (clock 0, programs cleared, sims 1×) on finish/abort.
 - **wolfSSL_Init**: process-global C state. Exactly once per process (`TestMain` or `main()`).
 - **XML**: every 2030.5 root element needs `xmlns="urn:ieee:std:2030.5:ns"` or unmarshal silently yields zero-value structs.
 - **Clock**: `serverNow = time.Now().Unix() + tree.ClockOffset` for every `scheduler.Evaluate()`.
-- **Registers**: int16 watt fields wrap at ±32,767 — scale into the SunSpec multiplier, never raw-cast (audit GS-1/MTR-1). When W changes, refresh derived VA/VAR/A registers too (MTR-5).
+- **Registers**: int16 watt fields wrap at ±32,767 — scale into the SunSpec multiplier, never raw-cast (audit GS-1/MTR-1; regression-swept by TASK-053 — `internal/southbound/sunspecsweep` + `sim/gridsim` `apFromWatts` sweep). When W changes, refresh derived VA/VAR/A registers too (MTR-5).
 - **OCPP**: charging sessions are `TransactionEvent` Started/Updated/Ended lifecycles, never bare MeterValues (OCPP-1).
 - **Keys**: private keys gitignored (`*-key.pem`). `certs/client-cert.pem` (public) IS tracked.
 - **Fetcher**: `WolfSSLFetcher` holds one keep-alive TLS session; never `Free()` mid-walk.
