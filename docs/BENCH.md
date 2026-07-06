@@ -17,6 +17,33 @@ ConnectCore 93 dev kit (69.0.0.2) is **offline/unused**; the hub moved to 69.0.0
 evsim/metersim/dashboard all point at 69.0.0.1 — repoint when the dev kit returns
 (runbook: `lexa-hub/DEVKIT.md`).
 
+### netem packet-chaos harness (TASK-052 / GAP-11)
+
+`scripts/netem.sh` and the `mayhem_world.go` `netemModifier`/`netem-*` scenarios apply
+real `tc netem` loss/reorder/delay/jitter to a bench Pi's LAN interface over SSH — the
+first Mayhem faults to touch the actual wire instead of only the application layer.
+
+- **Every bench Pi is dual-homed** (LAN `69.0.0.x` + a WiFi uplink) and **defaults out
+  the WiFi iface, not the LAN one**. The harness therefore never uses the default route
+  to find the interface to fault — it resolves it via `ip -o route get <bench peer IP>`
+  (69.0.0.20 from a sim Pi; 69.0.0.10 from the hub Pi) and uses that route's `dev`. Using
+  the default route here would silently arm netem on the WAN iface and every scenario
+  relying on it would falsely PASS (nothing on the bench LAN would actually degrade).
+- **Never target 69.0.0.20 (the desktop)** — it hosts gridsim AND the dashboard process
+  that runs this harness; netem there would cut the dashboard's own network path and the
+  SSH session needed to undo it. `scripts/netem.sh` and `mayhem_world.go`'s
+  `nodeSSHTarget` both hard-refuse it.
+- **Passwordless sudo is only guaranteed on the hub** (see table above). The sim Pis
+  (`.10`/`.11`/`.12`/`.14`) may NOT have it — `netemModifier` probes `sudo -n true`
+  first and reports the scenario INCONCLUSIVE rather than hang/prompt when it's missing.
+- The harness self-checks that netem actually took effect (ping-RTT delta across the
+  bench LAN before/after apply) before trusting a profile — a ~0ms delta is the exact
+  signature of the wrong-interface trap above, and refuses the scenario rather than run
+  it against a no-op fault.
+- Every apply schedules a self-healing scheduled `tc qdisc del` on the target Pi
+  regardless of whether the fast-path teardown ever runs — a lost teardown (aborted
+  Mayhem run, dashboard crash) still self-clears.
+
 ### Metrics (TASK-044)
 
 Every lexa service serves Prometheus text exposition; bench configs bind
