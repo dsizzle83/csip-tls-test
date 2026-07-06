@@ -794,6 +794,48 @@ flip the var; in the same change, `csip-tls-test`'s
 `mqtt-malformed-control` and `mqtt-stale-retained` gain `"v":1` (today they
 stay v0-shaped on purpose, since v0 is still tolerated).
 
+**Retained control-plane re-request (TASK-042, 2026-07-06, §8.3/GAP-01/GAP-02):**
+the row above ("active re-request is TASK-042, not yet built") is now built.
+Two distinct hazards on the retained `lexa/csip/control` topic both route
+through the same new mechanism, `bus.TopicCSIPRewalk` (hub→northbound, QoS 1,
+NOT retained — a one-shot nudge, not state): (1) **stale resurrection** — an
+unclean mosquitto death (`autosave_interval 60`) can resurrect a control up to
+~60 s stale on the hub's next (re)subscribe; `cmd/hub/state.go`'s
+`onCSIPControl` now checks the message's own `Ts` age **at adoption only**
+(never a periodic re-check against the held control — that would misfire
+through every WAN-outage holdover, since northbound legitimately publishes
+nothing while failing walks) against a configured bound
+(`retained_adoption_max_age_s`, default 300s). A stale-suspect control is
+still **enforced unchanged** — enforce-but-verify, never reject-and-fail-open,
+consistent with this AD's existing "hold last-known-good" posture — but now
+also alarms and publishes a rewalk request. (2) **Corrupted retained
+payload** — `mqttutil.Subscribe`'s existing log-and-drop
+(`bus.RecordDecodeFailure`, TASK-055) previously left a restarting hub with
+*no* control until the next successful northbound walk, which during a WAN
+outage could be never (GAP-02: fail-closed had silently degraded to
+fail-open-by-omission). `mqttutil.SubscribeDecodeErr[T]` adds an opt-in
+decode-error hook (`Subscribe` is now `SubscribeDecodeErr(..., nil)` —
+byte-identical for every other caller); the hub wires it on
+`bus.TopicCSIPControl` only, alarming and publishing the same rewalk request
+with reason `"decode"` instead of `"stale"`. On the northbound side,
+`cmd/northbound/main.go` now keeps a `lastPublishedStore` (the last
+successfully-published `ActiveControl`) and subscribes `TopicCSIPRewalk`:
+on receipt it immediately republishes that cache with `Ts` refreshed to now
+— repairing the retained value even while the WAN is dark, without waiting
+for a walk — then pokes the walk-loop goroutine for an immediate
+out-of-cadence `runDiscovery` (same code path/mutexes as the ticker, so
+single-flight is free). Both directions rate-limit independently at a 10 s
+floor (`cmd/hub/state.go`'s `rewalkRateLimit`, `cmd/northbound/main.go`'s
+`rewalkGate`) since the retained topics redeliver on every broker reconnect
+(`subRegistry.replay`). Preserved unchanged (regression-critical): fail-closed
+WAN-outage holdover, malformed-bus-payload drop-without-unseat (the hub still
+keeps the last-good control either way), and `Source=="none"` is explicitly
+excluded from the stale-adoption check (an aged "no control" sentinel carries
+no compliance risk). Code + unit tests only this session
+(`go test -race ./internal/... ./cmd/...`, `lexa-hub`); TASK-043 adds the
+bench-provable `power-cut-retained-rollback`/`corrupted-retained-control`
+Mayhem scenarios and the live-injection acceptance evidence.
+
 ## AD-007 🔶 Optimizer split: constraint controller over economic layer, plant model (R4)
 
 **Decision.** Priority-ordered constraint controller (safety > compliance >

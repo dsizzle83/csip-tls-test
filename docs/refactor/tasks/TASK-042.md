@@ -1,6 +1,12 @@
 # TASK-042 — Retained-control trust hardening (staleness bound, corrupt→re-request)
 
-*Status: TODO · Phase: P3 · Effort: M (≈4–6 h) · Difficulty: high · Risk: med*
+*Status: PARTIAL (2026-07-06, lexa-hub `task/042-retained-trust` @ `dd62fe8`,
+code complete + unit-tested, unmerged — bench acceptance criteria (live
+truncated-payload injection, mqtt-malformed-control/mqtt-stale-retained/
+wan-outage-*/hub-restart-mid-cap 10× gates, full FAST campaign) explicitly
+out of scope this session per launch instructions — "code + unit tests only,
+no bench (scenarios are 043)" — and deferred to TASK-043) · Phase: P3 ·
+Effort: M (≈4–6 h) · Difficulty: high · Risk: med*
 
 ## Objective
 Stop treating the retained `lexa/csip/control` message as unconditionally
@@ -190,24 +196,38 @@ Preservation ledger entries touched:
 - Local-expiry discipline (`expiryConfirmTicks`/TASK-036 policy) untouched.
 
 ## Acceptance criteria
-- [ ] Unit: stale adoption → enforced + one alarm + one rewalk; fresh → silent.
-- [ ] Unit: decode failure on the control topic → alarm + rewalk; other
-      topics unchanged (plain Subscribe).
-- [ ] Unit: northbound rewalk → immediate republish (cache) + walk trigger,
-      rate-limited.
+- [x] Unit: stale adoption → enforced + one alarm + one rewalk; fresh → silent.
+      (`cmd/hub/rewalk_test.go`: `TestOnCSIPControl_StaleAdoptionAlarmsAndRewalksOnceStillEnforced`,
+      `TestOnCSIPControl_FreshControlNoAlarmNoRewalk`.)
+- [x] Unit: decode failure on the control topic → alarm + rewalk; other
+      topics unchanged (plain Subscribe). (`internal/mqttutil/mqttutil_test.go`:
+      `TestSubscribeDecodeErr_OnErrFiresOnMalformedJSON`,
+      `TestSubscribeDecodeErr_NilOnErrIsIdenticalToSubscribe`;
+      `cmd/hub/rewalk_test.go`: `TestRequestRewalk_DecodeReasonSharesRateLimitWithStaleAdoption`.)
+- [x] Unit: northbound rewalk → immediate republish (cache) + walk trigger,
+      rate-limited. (`cmd/northbound/rewalk_test.go`:
+      `TestHandleRewalkRequest_RepublishesCachedControlWithFreshTsAndPokesWalk`,
+      `TestHandleRewalkRequest_RateLimited`, `TestHandleRewalkRequest_RepeatedPokesCoalesce`.)
 - [ ] Bench: manually inject a truncated retained payload
       (`curl -s -X POST http://69.0.0.1:11882/inject -d '{"topic":"lexa/csip/control","payload":"{\"source\":\"event\",","retain":true}'`
       via mqttproxy), restart lexa-hub, observe: alarm log, rewalk request,
       control restored within one northbound response (attach journal
-      excerpt).
-- [ ] Gate scenarios 10× at baseline; full FAST campaign ≤ baseline.
+      excerpt). **NOT DONE this session** — launch instructions scoped this
+      session to code + unit tests only ("no bench, scenarios are 043");
+      deferred to TASK-043.
+- [ ] Gate scenarios 10× at baseline; full FAST campaign ≤ baseline. **NOT
+      DONE this session** — same deferral as above.
 
 ## Regression checklist
-- [ ] `go test -race ./internal/... ./cmd/...` (lexa-hub) green
-- [ ] Conformance logic tests green (`go test ./tests/`) — walk-trigger path touched
+- [x] `go test -race ./internal/... ./cmd/...` (lexa-hub) green — commit `dd62fe8`.
+- [x] Conformance logic tests green (`go test ./tests/`, csip-tls-test) —
+      unaffected (no csip-tls-test code touched; this is a lexa-hub-only
+      change) but re-run and green.
 - [ ] Mayhem: `mqtt-malformed-control`, `mqtt-stale-retained`,
-      `wan-outage-*`, `hub-restart-mid-cap` 10× + full campaign
-- [ ] `hub-replay-tune.sh fast` after deploy
+      `wan-outage-*`, `hub-restart-mid-cap` 10× + full campaign — **deferred
+      to TASK-043** per launch instructions (batched at the wave gate).
+- [ ] `hub-replay-tune.sh fast` after deploy — not deployed this session
+      (unmerged, no bench work performed).
 
 ## Mayhem scenarios affected
 `mqtt-malformed-control` (recovery now active, not walk-luck),
