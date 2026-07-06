@@ -77,15 +77,34 @@ def fetch_scenarios(base):
     return [(s.get("id", ""), s.get("name", "")) for s in scs]
 
 
+def fetch_scenarios_full(base):
+    """Like fetch_scenarios but keeps the `extended` flag (TASK-054, GAP-08:
+    long-running boundary-dither scenarios excluded from a default run — see
+    filterExtended in cmd/dashboard/mayhem.go). Returns None on the same
+    conditions as fetch_scenarios.
+    """
+    try:
+        data = api(base, "/api/qa/scenarios")
+    except (urllib.error.URLError, ValueError):
+        return None
+    scs = data.get("scenarios")
+    if not isinstance(scs, list):
+        return None
+    return scs
+
+
 def cmd_list(base):
-    scs = fetch_scenarios(base)
+    scs = fetch_scenarios_full(base)
     if scs is None:
         print(f"could not fetch scenarios from {base} — is the dashboard running?",
               file=sys.stderr)
         return 2
     print("Mayhem scenarios:")
-    for sid, name in scs:
-        print(f"  {sid:28s} {name}")
+    for s in scs:
+        tag = "  [extended]" if s.get("extended") else ""
+        print(f"  {s.get('id', ''):28s} {s.get('name', '')}{tag}")
+    print("\n[extended] scenarios are excluded from a default/full run (RSK-12) —")
+    print("run them via --only <id> or --extended (nightly / release-gate campaigns).")
     return 0
 
 
@@ -99,10 +118,12 @@ def cmd_abort(base):
     return 0
 
 
-def run(base, only, sample_ms, as_json, matrix=False, chaos=False, seed=0, iterations=0):
+def run(base, only, sample_ms, as_json, matrix=False, chaos=False, seed=0, iterations=0,
+        extended=False):
     # Kick off the run.
     payload = {"sample_ms": sample_ms, "only": only, "matrix": matrix,
-               "chaos": chaos, "seed": seed, "iterations": iterations}
+               "chaos": chaos, "seed": seed, "iterations": iterations,
+               "include_extended": extended}
     try:
         started = api(base, "/api/qa/start", method="POST", body=payload)
     except urllib.error.HTTPError as e:
@@ -234,6 +255,11 @@ def main():
                     help="run a seeded randomized chaos sequence (replayable via --seed)")
     ap.add_argument("--seed", type=int, default=0, help="chaos seed (0 = time-derived, reported back for replay)")
     ap.add_argument("--iterations", type=int, default=6, help="chaos iteration count (default 6)")
+    ap.add_argument("--extended", action="store_true",
+                    help="include Extended (long-running, GAP-08 guard-threshold dither) scenarios "
+                         "in a default/full run — nightly / release-gate campaigns only (RSK-12); "
+                         "day-to-day FAST campaigns should omit this. Ignored with --only (an explicit "
+                         "--only id already runs regardless of Extended).")
     args = ap.parse_args()
 
     if args.list:
@@ -254,7 +280,7 @@ def main():
                 return 2
 
     return run(args.dashboard, only, args.sample_ms, args.json,
-               args.matrix, args.chaos, args.seed, args.iterations)
+               args.matrix, args.chaos, args.seed, args.iterations, args.extended)
 
 
 if __name__ == "__main__":

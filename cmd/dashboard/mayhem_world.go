@@ -30,6 +30,14 @@ package main
 // /admin/outage) — real LANs corrupt, reorder, and delay packets, and
 // nothing here reached the wire until now. See the "netem packet-chaos"
 // section below for the harness.
+//
+// export-dither-at-breach, soc-dither-at-reserve (TASK-054 / GAP-08): guard-
+// threshold dither sweeps — ±ε square waves sitting ON the optimizer's decision
+// lines (cap+complianceBreachW, SOCReserve) for several minutes, rather than
+// holding or ramping a fault once. EXTENDED-SET (mayScenario.Extended):
+// excluded from a default/full run — RSK-12 — run via --only or
+// --extended/include_extended. See the "Guard-threshold dither sweeps" section
+// below.
 
 import (
 	"errors"
@@ -737,6 +745,49 @@ func (d *mayhemDriver) worldScenarios() []*mayScenario {
 			evaluate: diagnoseConstraint,
 			teardown: func(d *mayhemDriver) {},
 		},
+		{
+			ID: "export-dither-at-breach", Name: "Export dithers ±ε across the compliance-breach band",
+			Category:   "Value-domain (INV-EXPORT/INV-HUNT)",
+			Hypothesis: "Metered export oscillates in a small band straddling cap+complianceBreachW (~100 W) for several minutes — sensor noise, or a flickering load, sitting exactly on the optimizer's leaky-counter decision line. Every other export scenario either holds still or ramps once; this one never leaves the line.",
+			Expected:   "The cap holds with bounded breach-seconds, the loop does not hunt (INV-HUNT clean — 300 W hysteresis), and the hub never posts a CannotComply for a dither that never sustains past the breach-tick window. CannotComply is reserved for a REAL sustained excursion — proven separately by a control run that temporarily widens the dither past exportBreachTicks (see docs/QA_FINDINGS.md; not a committed code path).",
+			HoldS:      ditherHoldS,
+			Extended:   true, // ≥5 min — GAP-08 boundary soak; excluded from a default run (RSK-12), see filterExtended
+			Fix:        "If CannotComply fires or INV-HUNT flags here, the leaky expOverTicks counter is not actually hold-biased at the boundary — tighten its decay/threshold in the optimizer (GAP-08).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				return armExportCap(d, ditherHoldS, "mayhem: zero export cap with export dithering at the compliance-breach band")
+			},
+			perTick: ditherSquareWave(ditherHalfPeriodTicks, func(d *mayhemDriver, over bool) {
+				load := loadLow
+				if !over {
+					load += exportDitherLoadDeltaW
+				}
+				d.injectEnv(d.pvHighW, load)
+			}),
+			evaluate: diagnoseExportDither,
+		},
+		{
+			ID: "soc-dither-at-reserve", Name: "Battery SoC dithers ±ε across the 20% reserve line",
+			Category:   "Value-domain (INV-SOC)",
+			Hypothesis: "A nearly-empty pack under a discharge demand reports SoC oscillating ±1 pt across the 20% SOCReserve line for several minutes — telemetry noise at the exact line the reserve guard (dischargingAtReserve) toggles on. Every other SoC scenario forces a single extreme value and holds it; this one straddles the decision boundary continuously.",
+			Expected:   "No over-discharge past the reserve line on any sample, and the battery's discharge/hold decision tracks the injected dither cadence without extra chatter — a stable guard at the boundary, not a coin-flip.",
+			HoldS:      ditherHoldS,
+			Extended:   true, // ≥5 min — GAP-08 boundary soak; excluded from a default run (RSK-12), see filterExtended
+			Fix:        "If the pack discharges past 20% or the guard chatters faster than the injected cadence, the reserve guard is not actually hold-biased at the boundary — debounce/tighten dischargingAtReserve (GAP-08).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": socDitherHighPct, "Conn": 1})
+				d.injectEnv(300, 5000) // low PV, heavy load ⇒ forced import unless the battery discharges (battery-soc-refuse preamble)
+				return d.postCap("importCap", 0, ditherHoldS, "mayhem: zero import cap driving battery discharge, SoC dithering at the 20% reserve line")
+			},
+			perTick: ditherSquareWave(ditherHalfPeriodTicks, func(d *mayhemDriver, low bool) {
+				soc := socDitherHighPct
+				if low {
+					soc = socDitherLowPct
+				}
+				_ = d.post("battery", "/inject", map[string]any{"SoC_pct": soc}) // re-inject every tick — pendingSoC must be re-asserted to stick (battery.go:49)
+				d.injectEnv(300, 5000)
+			}),
+			evaluate: diagnoseSocDither,
+		},
 		func() *mayScenario {
 			// diagnoseRecovery scenario: the program-0 default must be
 			// suppressed so "release" means "unconstrained" (see suppressDefault).
@@ -968,4 +1019,278 @@ func (d *mayhemDriver) worldScenarios() []*mayScenario {
 			}
 		}(),
 	}
+}
+
+// ── Guard-threshold dither sweeps (GAP-08, TASK-054) ────────────────────────
+//
+// export-dither-at-breach and soc-dither-at-reserve drive a measurement in a
+// small ±ε square wave exactly at the optimizer's decision line — metered
+// export at cap+complianceBreachW (lexa-hub optimizer.go, ~100 W) and battery
+// SoC at SOCReserve (optimizer.go, 20%) — for several minutes. Every other
+// scenario in this suite either holds a fault steady or ramps it once; these
+// are the first to sit ON the line and oscillate, probing the belief that the
+// product's leaky breach counters (expOverTicks, genGuard.overCount) are
+// "hold-biased": a value dithering across the line should decay back down
+// between over-band ticks and never accumulate to a CannotComply, and the
+// reserve guard (dischargingAtReserve) should toggle cleanly rather than
+// chatter.
+//
+// Both are EXTENDED-SET (HoldS ≈ 5 min, an order of magnitude longer than the
+// rest of the suite) and are excluded from a default/full run — see
+// mayScenario.Extended / filterExtended — so they do not inflate every FAST
+// development campaign (RSK-12). Run them explicitly
+// (`mayhem.py --only export-dither-at-breach,soc-dither-at-reserve`) or via
+// `--extended` / include_extended for nightly / release-gate campaigns.
+//
+// The CannotComply biconditional this family exists to prove ("CannotComply
+// fires iff the breach is sustained, never on the dither alone") has two
+// halves: the pure-dither run here proves the "not sustained ⇒ no
+// CannotComply" half. The other half — a SUSTAINED excursion DOES post
+// CannotComply, proving the oracle isn't just trivially always-false — is a
+// one-off CONTROL RUN against the bench, not a committed code path: widen
+// exportDitherLoadDeltaW / hold one phase past scaleTicks(exportBreachTicks),
+// run `--only export-dither-at-breach` once, confirm CannotComply, then
+// revert. Do not commit that widened value.
+
+const (
+	// ditherHoldS is the scenario hold for both guard-threshold dither
+	// sweeps: "≥5 min" per GAP-08, long enough for a real soak rather than a
+	// blip. Both scenarios are marked Extended because of it (RSK-12).
+	ditherHoldS = 300
+
+	// ditherHalfPeriodTicks is the length, in perTick ticks, of each phase of
+	// the dither square wave. At the harness's default 1 sample/tick (1 s,
+	// mayDefaultSampleMs) that is a ~4 s half-cycle — comfortably under
+	// exportBreachTicks(3) * tunedTickInterval(3s) ≈ 9 s FAST
+	// (lexa-hub optimizer.go scaleTicks/exportBreachTicks), so no single
+	// over-band phase can, by itself, sustain long enough to trip the
+	// product's leaky breach counter. A custom --sample-ms changes the
+	// wall-clock length of a "tick" and is not compensated for here — keep
+	// the default cadence for these two scenarios.
+	ditherHalfPeriodTicks = 4
+
+	// exportDitherLoadDeltaW (Δ) is how much the dithered LOAD phase adds to
+	// loadLow: less load ⇒ more residual export past the hub's curtailment.
+	// Starting point only — Δ is the one thing 06 §4.5 permits tuning (never
+	// the oracle margins); verify empirically on the bench that the low-load
+	// phase's residual export sits just over cap+complianceBreachW (~100 W)
+	// and the high-load phase sits comfortably under it, both within the
+	// 300 W INV-HUNT hysteresis so only genuine hunting — never the injected
+	// dither itself — could flag INV-HUNT.
+	exportDitherLoadDeltaW = 150.0
+
+	// socDitherLowPct / socDitherHighPct straddle the product's SOCReserve
+	// (20%, lexa-hub optimizer.go NewDefaultOptimizer) by ±1 point — enough
+	// for pendingSoC (batsim) to visibly cross the reserve guard each
+	// half-cycle without being a real over/under-discharge event on its own.
+	socDitherLowPct  = 19.0
+	socDitherHighPct = 21.0
+
+	// socDitherReserveLine mirrors the product's SOCReserve default. This is
+	// intentionally NOT invariants.go's invSocReserveFloorPct (the harness's
+	// own 10% safety backstop, mirroring batsim's SoCRsvMin) — that
+	// invariant keeps auditing every scenario unchanged (06 §4.5 / TASK-054
+	// "Things that must NOT change"); this scenario's own primary judgment
+	// is against the higher, product-specific reserve line it is actually
+	// probing.
+	socDitherReserveLine = 20.0
+
+	// battFlapSlack is the tolerance (in excess sign transitions over the
+	// dither's own expected cadence) before extra battery charge/discharge
+	// transitions count as command chatter rather than tracking the injected
+	// SoC dither. See batteryCommandFlaps / expectedDitherTransitions.
+	battFlapSlack = 3
+)
+
+// ditherSquareWave returns a perTick func that alternates a two-phase square
+// wave every halfPeriodTicks ticks, calling apply(d, phaseA) on EVERY tick
+// (not just on a flip) so a phase's state is continuously re-asserted —
+// required because some sims override their own animation only for as long
+// as they keep being told to (batsim's pendingSoC, sim/southbound/battery.go
+// ~line 49/138; re-injecting once per phase-flip is not enough). Shared by
+// both dither scenarios so their cadence never drifts apart.
+func ditherSquareWave(halfPeriodTicks int, apply func(d *mayhemDriver, phaseA bool)) func(d *mayhemDriver, i int) {
+	if halfPeriodTicks < 1 {
+		halfPeriodTicks = 1
+	}
+	return func(d *mayhemDriver, i int) {
+		apply(d, (i/halfPeriodTicks)%2 == 0)
+	}
+}
+
+// expectedDitherTransitions is how many charge/discharge sign transitions a
+// battery correctly tracking the injected SoC dither should show over a
+// scenario's hold: at most one per half-cycle. Assumes the default 1
+// sample/tick cadence (see ditherHalfPeriodTicks).
+func expectedDitherTransitions(sc *mayScenario) int {
+	if ditherHalfPeriodTicks <= 0 {
+		return 0
+	}
+	n := sc.HoldS / ditherHalfPeriodTicks
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// batteryCommandFlaps counts BatterySimW sign transitions (charge↔discharge)
+// after the settling window, filtered by invSocActiveW so idle jitter around
+// zero never counts as a transition — the natural ±invSocActiveW dead-band is
+// this check's analogue of invHunt's 300 W hysteresis. A reserve guard
+// correctly tracking a dithering SoC input toggles roughly once per
+// half-cycle; a chattering one re-decides WITHIN a half-cycle on its own,
+// producing far more transitions than the injected dither accounts for
+// (expectedDitherTransitions).
+func batteryCommandFlaps(s []maySample) int {
+	flips := 0
+	sign := 0 // -1 charging, +1 discharging, 0 idle/unknown
+	for _, smp := range s {
+		if smp.T <= mayConvergeDeadlineS || !smp.BatterySimOK {
+			continue
+		}
+		var cur int
+		switch {
+		case smp.BatterySimW > invSocActiveW:
+			cur = 1
+		case smp.BatterySimW < -invSocActiveW:
+			cur = -1
+		default:
+			continue // idle jitter — not a transition either way
+		}
+		if sign != 0 && cur != sign {
+			flips++
+		}
+		sign = cur
+	}
+	return flips
+}
+
+// socReserveOverDischarge flags samples where the battery is DISCHARGING
+// (simulator ground truth) while its forced SoC sits at/below the product's
+// SOCReserve line — the boundary dischargingAtReserve exists to guard.
+// Deliberately separate from invariants.go's invSOC (which guards the
+// harness's own lower 10% safety floor, invSocReserveFloorPct, and must not
+// change per 06 §4.5 / TASK-054 "Things that must NOT change") — this
+// predicate is scenario-local because the line being probed here is higher
+// and product-specific, not the harness's hard backstop.
+func socReserveOverDischarge(s []maySample) []invViolation {
+	var v []invViolation
+	for _, smp := range s {
+		if smp.T <= mayConvergeDeadlineS || !smp.BatterySimOK {
+			continue
+		}
+		if smp.BatterySimW > invSocActiveW && smp.BatSimSOC <= socDitherReserveLine {
+			v = append(v, invViolation{
+				Inv:    "INV-SOC-RESERVE",
+				T:      smp.T,
+				Detail: fmt.Sprintf("discharging %.0f W at SoC %.0f%% (≤ SOCReserve %.0f%%)", smp.BatterySimW, smp.BatSimSOC, socDitherReserveLine),
+			})
+		}
+	}
+	return v
+}
+
+// diagnoseExportDither judges export-dither-at-breach: the CannotComply
+// biconditional's "not sustained ⇒ no CannotComply" half, plus INV-HUNT. A
+// repeating dither is EXPECTED to leave breach-seconds non-zero (each
+// over-band phase is a momentary excursion) — unlike diagnoseConstraint, the
+// bar here is not "breach-seconds == 0" but that no single excursion ever
+// sustains into a CannotComply or a hunting control loop.
+func diagnoseExportDither(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	m := scanSamples(cons, s)
+	f.Metrics = m
+	capStr := fmt.Sprintf("%s ≤ %.0f W", cons.Typ, cons.LimW)
+
+	if m.SampleErrors > len(s)/2 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "meter unreachable for most of the run — cannot judge the dither"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The grid meter failed to read on %d of %d samples.", m.SampleErrors, len(s)),
+		}
+		return f
+	}
+
+	hunt := invHunt(cons, s)
+	end := s[len(s)-1].T
+
+	switch {
+	case m.ReportedCannot:
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("CannotComply posted during a pure ±ε dither at %s — the biconditional is broken", capStr)
+		f.Diagnosis = []string{
+			fmt.Sprintf("Breach-seconds %.0f of %.0fs, peak overshoot %.0f W — this is dither (each over-band phase well under exportBreachTicks' sustained window), yet the hub self-reported CannotComply.", m.BreachSeconds, end, m.PeakBreachW),
+			"The leaky breach counter (expOverTicks / genGuard.overCount) is not actually hold-biased at the boundary: it accumulated across a dither that never sustained past its own decay.",
+			invSummaryLine("INV-HUNT", hunt),
+		}
+		f.Fix = "Tighten the leaky counter's decay/threshold at the boundary (lexa-hub optimizer.go expOverTicks, scaleTicks(exportBreachTicks)) so a dither that never sustains cannot accumulate to CannotComply."
+	case len(hunt) > 0:
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("control loop hunted around %s during the boundary dither (INV-HUNT)", capStr)
+		f.Diagnosis = []string{
+			invSummaryLine("INV-HUNT", hunt),
+			"A boundary-dither scenario exists specifically to probe hunting at the decision line; unlike the generic cross-cutting safety audit (which only demotes a PASS to DEGRADED), sustained oscillation here is the primary finding, not a secondary one.",
+		}
+		f.Fix = "The curtailment ceiling must be a held absolute value (sticky-guard), not re-chased every tick against a dithering measurement."
+	default:
+		f.Verdict = "PASS"
+		f.Headline = fmt.Sprintf("held %s through a %.0fs boundary dither with no CannotComply and no hunting", capStr, end)
+		f.Diagnosis = []string{
+			fmt.Sprintf("Export dithered across the cap+complianceBreachW band for %.0fs (breach-seconds %.0f, peak %.0f W) without a single CannotComply and without INV-HUNT flagging — confirms the leaky counter's hold-bias at the boundary.", end, m.BreachSeconds, m.PeakBreachW),
+		}
+		f.Fix = "No code fix required — this is the confirming result GAP-08 asked for."
+	}
+	f.Diagnosis = append(f.Diagnosis, invSummaryLine("INV-EXPORT", invExport(cons, s)))
+	return f
+}
+
+// diagnoseSocDither judges soc-dither-at-reserve: no over-discharge past the
+// product's SOCReserve line, and no battery command chatter beyond what the
+// injected dither itself explains.
+func diagnoseSocDither(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+	end := s[len(s)-1].T
+
+	reserveViol := socReserveOverDischarge(s)
+	flips := batteryCommandFlaps(s)
+	expected := expectedDitherTransitions(sc)
+	excess := flips - expected
+
+	switch {
+	case len(reserveViol) > 0:
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("battery discharged past SOCReserve on %d samples during the reserve-line dither", len(reserveViol))
+		f.Diagnosis = []string{
+			invSummaryLine("INV-SOC-RESERVE", reserveViol),
+			"SoC dithered ±1 pt across the 20% reserve line; a correct reserve guard (dischargingAtReserve) must stop discharge at/below the line on every sample it sees, not just on average.",
+		}
+		f.Fix = "lexa-hub optimizer.go dischargingAtReserve / SOCReserve guard — verify it re-evaluates every tick against the MEASURED SoC, not a stale or hysteresis-delayed read."
+	case excess > battFlapSlack:
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("battery command chattered %d times (expected ~%d) during the reserve-line dither", flips, expected)
+		f.Diagnosis = []string{
+			fmt.Sprintf("Measured %d charge/discharge sign transitions against an expected ~%d from the injected dither cadence alone — the reserve guard is re-deciding within a single dither phase, not just tracking the injected SoC.", flips, expected),
+			"Command chatter at the reserve line wears the pack's contactor in the field even when no safety envelope is actually breached.",
+		}
+		f.Fix = "Debounce the dischargingAtReserve guard's decision (the same sticky-guard pattern INV-HUNT expects of curtailment) so it does not re-toggle faster than the measurement can physically change."
+	default:
+		f.Verdict = "PASS"
+		f.Headline = fmt.Sprintf("held the SoC-reserve line clean through a %.0fs boundary dither", end)
+		f.Diagnosis = []string{
+			fmt.Sprintf("SoC dithered ±1 pt across SOCReserve(20%%) for %.0fs: no post-settling over-discharge past reserve, and battery command transitions (%d) tracked the injected cadence (expected ~%d) without excess chatter.", end, flips, expected),
+		}
+		f.Fix = "No code fix required — confirms the reserve guard is stable at the boundary."
+	}
+	return f
 }
