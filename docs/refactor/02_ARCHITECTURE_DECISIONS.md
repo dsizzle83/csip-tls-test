@@ -823,6 +823,33 @@ are the inputs a future adaptive export-breach detection window would use
 instead of the fixed `exportBreachTicks=3` (~9 s) that races the ~11 s oracle
 boundary on battery-charge-disabled. Discovery stays backlog per above.
 
+**Controller-skeleton decision (TASK-058, 2026-07-06).** The constraint
+controller lives in **`internal/orchestrator/constraint`** (subpackage), NOT
+`internal/constraint`: it reuses the orchestrator's exported types
+(`SystemState`/`Plan`/`ComplianceBreach`/`*Plant`) with no new export surface,
+inherits the I/O-free rule (05 §1) and the radioactive-zone rule (05 §12
+`internal/orchestrator/*`), and avoids an import cycle — `constraint` imports
+`orchestrator`, never the reverse; the `Stack` implements
+`orchestrator.Optimizer` so wiring happens only in `cmd/hub` (TASK-059).
+**Demand/arbiter model.** Constraints emit `Demand`s modelled as *bounds*
+(`[Min,Max]` per actuator `Axis`: SolarCeilingW / BatterySetpointW / EVSECurrentA
+/ Connect), not commands. `Arbiter.Resolve` groups per (device,axis), sorts
+SAFETY→COMPLIANCE→ECONOMICS then by source (deterministic), and INTERSECTS: a
+lower tier can only narrow, never widen — economics can't relax a compliance
+ceiling, enforced structurally (intersection), not just tested. Empty same-tier
+intersection → most-restrictive wins + a recorded `Conflict` (surfaced as a plan
+Decision — the cascade's silent-overwrite made invisible). Connect: `false`
+(disconnect) always wins. One typed `Session` per constraint instance replaces
+the 9+ scattered guard fields; `Session.ScaleTicks` copies
+`DefaultOptimizer.scaleTicks` (floor-of-2) verbatim for FAST/STOCK parity. A
+compliance constraint derives its per-device detection window from the plant
+model via `DetectionWindowTicks(controlLatencyS+meterLagS, tick)` /
+`Plant.ExportDetectionWindowTicks` — the adaptive replacement for the fixed
+`exportBreachTicks` (bench defaults reproduce today's 3-tick window; a slower
+plant grows it). TASK-058 ships the skeleton + arbiter + Stack + table tests
+only — **unwired** (05 §12 exception); TASK-059's shadow harness is the first
+caller and TASK-060 the first real constraint (which pays the campaign).
+
 ## AD-008 🔶 Security: broker ACLs now, API token+TLS now, OCPP profile 2 at P6
 
 **Decision.** Per-service Mosquitto credentials + topic ACLs (config
