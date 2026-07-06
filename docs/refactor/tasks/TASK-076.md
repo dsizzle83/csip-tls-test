@@ -1,6 +1,44 @@
 # TASK-076 — Mayhem scenarios-as-data: spec schema + engine (R6)
 
-*Status: TODO · Phase: P6 · Effort: L (≈8 h) · Difficulty: high · Risk: low*
+*Status: CODE COMPLETE, BENCH VALIDATION PENDING (2026-07-06, `task/076-scenarios-as-data`) · Phase: P6 · Effort: L (≈8 h) · Difficulty: high · Risk: low*
+
+**2026-07-06 update:** JSON spec schema (`spec_v: 1`) + interpreter
+(`cmd/dashboard/scenariospec.go`) implemented: the full v1 action vocabulary
+(`sim_post`, `gridsim_admin`, `inject_env` incl. the `"high"` pv sentinel,
+`post_cap`/`post_cap_prog`/`post_connect`/`post_control` as constraint-
+producing verbs, `delete_controls`, `suppress_default` with auto-restore-last
+at teardown, `mqtt_fault`/`mqtt_inject`/`mqtt_reset`, `ssh_hub`, `sleep_s`),
+an oracle registry (`diagnoseConstraint`, `diagnoseConverge`, `diagnoseStale`,
+`diagnoseRecovery`, `diagnoseSOC`, `diagnoseDisconnect`, `diagnoseMalform`,
+and the parameterized `diagnoseSurvival` — 077 registers the rest as it
+migrates each family), and load-time validation (unknown verb/target/oracle,
+`at_tick` bounds, phase restrictions, "constraint needed" check) that names
+the file + field per the code-review checklist. `scenarios()` appends
+compiled specs from `-scenario-dir` (default `qa/scenarios`, `main.go`) fresh
+on every `POST /api/qa/start` — never at process start — so a spec add/edit
+needs no rebuild/restart; an ID collision with a Go scenario (or another
+spec) is a logged, per-file load error that never blocks any other scenario
+or takes a run down. `/api/qa/scenarios` and `mayhem.py --list` tag
+`source: go|spec`. The pilot (`qa/scenarios/export-cap-full-battery.json`) is
+a JSON twin of its Go literal; two more twins (`grid-disconnect`,
+`wan-outage-hold`) are proven inline in
+`cmd/dashboard/scenariospec_test.go` rather than shipped as files, since
+their IDs would collide with their own still-present Go twins the same way
+the pilot's does. Unit-level parity is proven for all three (fake-backend
+httptest servers assert the exact bench calls + bodies the compiled setup/
+per_tick/teardown make, matching the Go literal call-for-call) —
+`go test -race ./cmd/dashboard/...`, `make qa`, `make test-fast`, and
+`go test ./tests/` all green; `go build -o bin/dashboard ./cmd/dashboard`
+builds clean.
+This was a **code-only session per explicit launch instructions — no bench
+access, no dashboard restart.** The acceptance criteria below that require
+the live bench — the pilot's **×3 verdict-parity run against the real bench**
+(with the Go twin disabled by a temporary toggle/rename, per step 6), the
+**live no-rebuild demonstration** (edit a spec, re-run, no restart), and the
+**one full FAST campaign green** proving the loader is a no-op for the
+existing Go set on a live dashboard — are **not yet run** and are deferred to
+the 081 bench gate / next deploying session, consistent with 041/042/043/073's
+same-push pattern. See `docs/refactor/00_MASTER_INDEX.md` P6 row.
 
 ## Objective
 A declarative scenario-spec format (JSON, stdlib-decoded) and an

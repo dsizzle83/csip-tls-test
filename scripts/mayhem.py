@@ -101,10 +101,17 @@ def cmd_list(base):
         return 2
     print("Mayhem scenarios:")
     for s in scs:
+        # TASK-076: source tags "go" (hand-written literal) vs "spec" (JSON
+        # file under qa/scenarios/, editable with no dashboard rebuild).
+        # Missing on an older dashboard build ⇒ treat as "go".
+        source = s.get("source") or "go"
         tag = "  [extended]" if s.get("extended") else ""
+        tag += f"  [{source}]"
         print(f"  {s.get('id', ''):28s} {s.get('name', '')}{tag}")
     print("\n[extended] scenarios are excluded from a default/full run (RSK-12) —")
     print("run them via --only <id> or --extended (nightly / release-gate campaigns).")
+    print("[spec] scenarios load from qa/scenarios/*.json — edit/add one with no")
+    print("dashboard rebuild or restart (see qa/scenarios/README.md, TASK-076).")
     return 0
 
 
