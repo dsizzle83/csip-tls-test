@@ -627,6 +627,34 @@ after the directory becomes writable again (AD-011: journal failure must
 never crash a caller). Zero consumers today (`grep -rn "internal/journal"
 ~/projects/lexa-hub --include=*.go | grep -v internal/journal` empty).
 
+**TASK-040 update (2026-07-06): integrated (hub, northbound) — code complete,
+unmerged.** `lexa-hub` `task/040-journal-integration` (`be9701a`, on top of
+031/032) wires the first four callers: `cmd/hub/state.go`'s `onCSIPControl` +
+`ReadSystemState`'s expiry-drop branch (`control_adopted`/`control_released`,
+change-detected against the ~5 s FAST retained republish so an unchanged
+control never re-journals), `cmd/hub/desired.go`'s three
+`desiredPublishing*Actuator`s (`dispatch`, post-content-dedupe only — TASK-032
+deleted the legacy actuators the original task text named, so the desired-doc
+publish success path is the dispatch site now), `cmd/hub/breach.go`'s
+`breachEpisodes` component (`breach_begin`/`breach_end`, sharing the same
+`EpisodeID` TASK-031 already stamps on `bus.ComplianceAlert`, plus a Flush on
+every breach edge), and `cmd/northbound`'s `responseTracker.alertCannotComply`
+(`cannot_comply_posted`, gated on the POST's `err == nil` — `postResponse` now
+returns a success bool solely for this gate, every other call site unchanged).
+Both services gain an optional `"journal"` config block (absent = nil Writer =
+every emit site a no-op); `configs/{hub,northbound}.json` ship it pointed at
+sibling subdirectories under `/var/lib/lexa/journal/` (two `Writer`s must never
+share a `dir`+`name` — each keeps its own in-process rotation/seq state, so two
+processes writing the same file would race independently). New
+`docs/JOURNAL_FORENSICS.md` (jq one-liners, the journalctl correlation recipe —
+the episode ID already appeared on the hub's "COMPLIANCE BREACH" log line
+before this task, no log-line change needed). `go test -race ./internal/...
+./cmd/...` green; bench evidence (the adoption→breach→CannotComply→clear
+chain, the write-volume spot check, the FAST campaign) is deferred to the
+soak — this task's launch instructions were code + unit tests only, no bench
+access this session. TASK-041 (snapshot events) is unblocked by this writer
+plumbing.
+
 ## AD-006 🔶 Bus schema: version envelope, reject-and-alarm
 
 **Decision.** Every bus JSON message carries `"v": N`; subscribers reject
