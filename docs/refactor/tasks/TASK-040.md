@@ -1,6 +1,8 @@
 # TASK-040 — Journal integration: adoptions, dispatches, breaches, CannotComply
 
-*Status: TODO · Phase: P3 · Effort: M (≈4–6 h) · Difficulty: med · Risk: med*
+*Status: CODE COMPLETE (2026-07-06, lexa-hub `be9701a` on `task/040-journal-integration`,
+unmerged) — bench/campaign validation deferred to the soak per this wave's launch
+instructions (no bench access this session). Phase: P3 · Effort: M (≈4–6 h) · Difficulty: med · Risk: med*
 
 ## Objective
 Wire the `internal/journal` library (TASK-039) into the running system so
@@ -185,21 +187,35 @@ bit-identical):
 - Alert remains QoS 1 non-retained via `PublishJSON` (main.go:146).
 
 ## Acceptance criteria
-- [ ] All unit tests green (`go test -race ./internal/... ./cmd/...`).
+- [x] All unit tests green (`go test -race ./internal/... ./cmd/...`).
 - [ ] Bench evidence attached: journal excerpt showing an adoption→breach→
       CannotComply→clear chain with one episode ID, plus the matching
-      journalctl grep.
-- [ ] With no `journal` config block, services behave exactly as before
-      (nil-writer no-op path tested).
-- [ ] Full FAST campaign ≤ V6 baseline (0.6 FAIL/cycle, 0 BLIND).
+      journalctl grep. **Deferred to the soak** (this wave's launch
+      instructions: code + unit tests only, no bench access this session).
+- [x] With no `journal` config block, services behave exactly as before
+      (nil-writer no-op path tested — every pre-existing test already passed
+      `nil`; explicit `TestOnCSIPControl_NilJournalIsNoop` /
+      `TestBreachEpisodes_NilJournalIsNoop` / `TestResponse_NilJournalIsNoop`
+      / `TestLoadConfig_JournalBlockAbsent` added to name it directly).
+- [ ] Full FAST campaign ≤ V6 baseline (0.6 FAIL/cycle, 0 BLIND). **Deferred
+      to the soak** — this is an emit-only change with no new subscribe/
+      publish/actuation-logic path, so no verdict shift is expected, but it
+      is unverified until the soak runs it.
 - [ ] Write-volume spot check: after the 3-scenario run, journal size is
-      KBs, not MBs (change-detection working).
+      KBs, not MBs (change-detection working). **Deferred to the soak**
+      (requires the bench); the change-detection unit tests
+      (`TestOnCSIPControl_JournalsAdoptionOnChangeOnly`,
+      `TestBreachEpisodes_JournalsNothingOnContinuingEpisode`,
+      `TestDesiredPublishingBatteryActuator_JournalsDispatchPostDedupeOnly`)
+      prove the gating logic in isolation but not the real write volume.
 
 ## Regression checklist
-- [ ] `go test -race ./internal/... ./cmd/...` (lexa-hub) green
-- [ ] Conformance logic tests green (`go test ./tests/` in csip-tls-test) — Response path touched
-- [ ] Mayhem: full FAST campaign (radioactive file touched)
-- [ ] `hub-replay-tune.sh fast` re-applied after deploy
+- [x] `go test -race ./internal/... ./cmd/...` (lexa-hub) green
+- [x] Conformance logic tests green (`go test ./tests/` in csip-tls-test) — Response path touched
+- [ ] Mayhem: full FAST campaign (radioactive file touched) — **deferred to
+      the soak**, not run this session (no bench access; see status header).
+- [ ] `hub-replay-tune.sh fast` re-applied after deploy — N/A until the soak
+      deploys this branch.
 
 ## Mayhem scenarios affected
 None should change verdicts. `reject-write-curtail`,
