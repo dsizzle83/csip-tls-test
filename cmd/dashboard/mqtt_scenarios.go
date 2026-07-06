@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"fmt"
 	"log"
+	"math"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -170,6 +172,235 @@ func (d *mayhemDriver) readMetricCounter(name string) (value float64, ok bool) {
 		return v, true
 	}
 	return 0, false
+}
+
+// ── Broker persistence faults (GAP-01/02, TASK-043 — validates TASK-042's
+// retained-control trust hardening: adoption-time staleness bound +
+// lexa/csip/rewalk re-request path) ─────────────────────────────────────────
+//
+// These two scenarios manipulate the real mosquitto store directly over SSH
+// (systemctl/cp/rm — no mqttproxy involved for the store dance itself), plus
+// one direct authenticated mosquitto_sub read-back used as a setup-quality
+// assertion. mqttInject (mqttproxy's /inject) is still used by
+// corrupted-retained-control to forge the truncated payload — see its TASK-013
+// credentials note below.
+
+const (
+	mosquittoStorePath = "/var/lib/mosquitto/mosquitto.db"
+	mayhemStoreTmpPath = "/tmp/mayhem-store.db"
+
+	// qaInjectPassFile is the qa-inject broker user's password file
+	// (scripts/mqtt-chaos.sh deploy provisions it via mosquitto_passwd
+	// against /etc/mosquitto/lexa-passwd, TASK-013/W7). qa-inject holds
+	// `topic readwrite lexa/#` in lexa-hub's systemd/mosquitto-lexa.acl, so
+	// it can both forge (mqttproxy's /inject) and read back the retained
+	// control — the read-back is needed here, direct over SSH, to confirm
+	// which generation of the control the broker is actually serving after
+	// an unclean rollback, independent of mqttproxy.
+	qaInjectPassFile = "/etc/lexa/mqtt/qa-inject.pass"
+)
+
+// brokerSnapshotCommand builds the remote command brokerSnapshot runs: a
+// CLEAN stop (mosquitto's on-shutdown flush persists the current retained
+// set to disk), a copy of the store to a scratch path, then a restart. Pure
+// string builder so the shape is unit-testable without SSH (mirrors
+// fillDiskCommand/netemApplyCommand). The store copy is only trustworthy
+// when taken via a clean stop — never snapshot a live/running store file,
+// since mosquitto may still be writing it.
+func brokerSnapshotCommand() string {
+	return fmt.Sprintf(`sudo systemctl stop mosquitto && sudo cp %s %s && sudo systemctl start mosquitto`,
+		mosquittoStorePath, mayhemStoreTmpPath)
+}
+
+// brokerUncleanRollbackCommand builds the remote command
+// brokerUncleanRollback runs: SIGKILL mosquitto (bypasses the on-shutdown
+// store flush — the software equivalent of a power cut, per docs/BENCH.md's
+// "systemctl kill, never pkill" gotcha applied to the broker itself), restore
+// the earlier clean snapshot over the now-stale live store, then start.
+// `|| true` after the kill keeps this idempotent against a broker that is
+// already down (a retried/aborted run must not fail here).
+func brokerUncleanRollbackCommand() string {
+	return fmt.Sprintf(`sudo systemctl kill -s SIGKILL mosquitto || true; sudo cp %s %s && sudo systemctl start mosquitto`,
+		mayhemStoreTmpPath, mosquittoStorePath)
+}
+
+// brokerCleanupCommand removes the scratch snapshot. `rm -f`: idempotent,
+// safe even when brokerSnapshot was never reached (a setup error before the
+// snapshot step, or an abort mid-setup).
+func brokerCleanupCommand() string {
+	return "sudo rm -f " + mayhemStoreTmpPath
+}
+
+// brokerRetainedControlCommand builds the remote command that reads back the
+// single current retained lexa/csip/control payload, authenticating as the
+// qa-inject broker user — TASK-013 flipped the hub broker's
+// `allow_anonymous` to false, so a plain anonymous mosquitto_sub is refused
+// here exactly the way an anonymous mqttproxy /inject would be. Fails loud
+// (exit 1) when the credential file is missing/empty rather than silently
+// returning nothing, so an un-provisioned bench (scripts/mqtt-chaos.sh
+// deploy never run) surfaces as INCONCLUSIVE, not a false negative read.
+func brokerRetainedControlCommand() string {
+	return fmt.Sprintf(
+		`PASS=$(sudo cat %s 2>/dev/null); if [ -z "$PASS" ]; then echo "qa-inject credentials not provisioned (run scripts/mqtt-chaos.sh deploy)" >&2; exit 1; fi; timeout 5 mosquitto_sub -h localhost -p 1883 -u qa-inject -P "$PASS" -C 1 -t %s`,
+		qaInjectPassFile, topicCSIPControl)
+}
+
+func (d *mayhemDriver) brokerSnapshot() error        { return d.hubSSH(brokerSnapshotCommand()) }
+func (d *mayhemDriver) brokerUncleanRollback() error { return d.hubSSH(brokerUncleanRollbackCommand()) }
+
+// brokerCleanup is best-effort and never blocks teardown on an SSH error —
+// mirrors freeDisk's contract (TASK-050): log and move on so one failed
+// cleanup command never skips clearing the gridsim outage or the controls
+// that follow it in a scenario's teardown.
+func (d *mayhemDriver) brokerCleanup() {
+	if err := d.hubSSH(brokerCleanupCommand()); err != nil {
+		log.Printf("mayhem: brokerCleanup FAILED — manual cleanup needed (ssh dmitri@69.0.0.1 sudo rm -f %s): %v", mayhemStoreTmpPath, err)
+	}
+}
+
+// parseRetainedExpLimW extracts the numeric exp_lim_w/exp_lim_W field from a
+// raw lexa/csip/control retained JSON payload. Pure so it's unit-testable
+// without a live mosquitto_sub (mirrors parseMQTTClientIDLine's pattern) —
+// this is the ONLY way, from outside the hub, to tell which generation of the
+// control the broker is actually serving after an unclean rollback, which is
+// what the power-cut-retained-rollback scenario's setup-quality assertion
+// needs before the hub can be judged.
+func parseRetainedExpLimW(payload string) (float64, bool) {
+	idx := strings.Index(payload, `"exp_lim_w"`)
+	if idx < 0 {
+		idx = strings.Index(payload, `"exp_lim_W"`) // tolerate either case seen in the wild
+	}
+	if idx < 0 {
+		return 0, false
+	}
+	rest := payload[idx:]
+	colon := strings.Index(rest, ":")
+	if colon < 0 {
+		return 0, false
+	}
+	rest = strings.TrimSpace(rest[colon+1:])
+	end := 0
+	for end < len(rest) && (rest[end] == '-' || rest[end] == '.' || (rest[end] >= '0' && rest[end] <= '9')) {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(rest[:end], 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// brokerRetainedExpLimW reads back the retained lexa/csip/control payload
+// over SSH and parses its exp_lim_w. Used as the power-cut-retained-rollback
+// setup-quality assertion after brokerUncleanRollback: the scenario must
+// confirm the bus is actually serving the resurrected STALE value (cap A)
+// before the hub is judged — otherwise a mistimed rollback (a northbound walk
+// landing in the gap between the outage arming and the rollback) republishes
+// cap B over the resurrected A and the scenario would silently no-op-pass.
+func (d *mayhemDriver) brokerRetainedExpLimW() (float64, error) {
+	out, err := d.hubSSHOutput(brokerRetainedControlCommand())
+	if err != nil {
+		return 0, err
+	}
+	v, ok := parseRetainedExpLimW(out)
+	if !ok {
+		return 0, fmt.Errorf("could not parse exp_lim_w from retained payload %q", out)
+	}
+	return v, nil
+}
+
+// waitForAdoptedExportCap polls the hub's /status for up to timeout for it to
+// report an adopted exportCap within 1 W of limW. power-cut-retained-rollback
+// must not snapshot the broker's store until the value it intends to capture
+// has actually landed there — snapshotting too early would capture no
+// control (or the wrong one) and silently invalidate the whole scenario.
+func (d *mayhemDriver) waitForAdoptedExportCap(limW float64, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		st := d.hubState()
+		if st.ok && st.ctrlActive && st.ctrlTyp == "exportCap" && math.Abs(st.ctrlLimW-limW) < 1 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+// diagnosePowerCutRollback is the custom ladder for power-cut-retained-
+// rollback (GAP-01). cons is cap B (0 W, the constraint being judged); the
+// hazard under test is the hub re-adopting the resurrected STALE cap A
+// (5000 W) after the unclean broker rollback + hub restart. Reuses
+// scanSamples/invExport exactly as every other constraint diagnoser does —
+// invExport already excuses the opening settling ramp (mayConvergeDeadlineS),
+// so any breach flagged here is either B's own settling ramp (before the
+// fault) or the aftermath of the rollback (at/after the fault tick), which is
+// exactly what needs judging.
+func diagnosePowerCutRollback(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+	breaches := invExport(cons, s)
+
+	// The strongest FAIL signal: the hub's own /status shows it adopted the
+	// resurrected 5000 W control, not the 0 W cap (B) it should have
+	// rejected (staleness bound) or re-derived (rewalk).
+	enforcingA := false
+	for _, smp := range s {
+		if smp.HubAdopted && smp.AdoptedTyp == "exportCap" && math.Abs(smp.AdoptedLimW-5000) < 1 {
+			enforcingA = true
+			break
+		}
+	}
+
+	switch {
+	case len(breaches) == 0:
+		f.Verdict = "PASS"
+		f.Headline = "cap B held through the unclean broker rollback; the resurrected stale cap A was never enforced"
+		f.Diagnosis = []string{
+			"The broker died uncleanly (SIGKILL) and came back serving the resurrected, superseded cap A (5000 W) — the hub stayed on (or re-adopted) cap B (0 W) with no sustained breach.",
+			hubVsRealLine(s),
+		}
+		return f
+	case enforcingA && !f.Metrics.TailClean:
+		f.Verdict = "FAIL"
+		f.Headline = "hub adopted the resurrected stale cap A (5000 W) and export sustained over cap B with no alarm"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The hub's /status showed the adopted control at ~5000 W — the resurrected, superseded control from before the power cut — for part of the run, and %s", invSummaryLine("INV-EXPORT", breaches)),
+			"TASK-042's staleness bound (adoption-time Ts vs a bound) did not reject the stale retained control on reboot; a power-cut-class broker death can resurrect an arbitrarily-superseded cap and the hub trusts it (GAP-01).",
+			decisionLine(s),
+		}
+		f.Fix = sc.Fix
+		return f
+	case f.Metrics.TailClean && f.Metrics.ConvergedAtS >= 0:
+		f.Verdict = "DEGRADED"
+		f.Headline = "stale enforcement was bounded: the hub recovered onto cap B before the window ended"
+		f.Diagnosis = []string{
+			invSummaryLine("INV-EXPORT", breaches),
+			"The rollback produced a breach, but it was bounded — the hub ended the window back on cap B (or a compliant state) rather than staying wedged on the stale cap A. This ladder is measurement-based and cannot see the alarm counter directly; confirm the post-042 staleness alarm fired via docs/QA_FINDINGS.md/metrics before calling this fully resolved.",
+			hubVsRealLine(s),
+		}
+		return f
+	default:
+		f.Verdict = "FAIL"
+		tail := s[len(s)-1]
+		f.Headline = "export sustained over cap B after the rollback and never recovered by the end of the window"
+		f.Diagnosis = []string{
+			invSummaryLine("INV-EXPORT", breaches),
+			fmt.Sprintf("Tail sample: adopted=%v typ=%s lim=%.0f W (want exportCap 0 W).", tail.HubAdopted, tail.AdoptedTyp, tail.AdoptedLimW),
+			decisionLine(s),
+		}
+		f.Fix = sc.Fix
+		return f
+	}
 }
 
 // diagnoseDuplicateClientID is TASK-049's custom ladder: FAIL on any
@@ -486,6 +717,198 @@ func (d *mayhemDriver) mqttScenarios() []*mayScenario {
 					}
 					_ = d.mqttReset()           // cancels the storm if still active; the bounded duration is the safety net
 					time.Sleep(5 * time.Second) // let the queue drain before the next scenario
+					d.deleteControls(0)
+				},
+			}
+		}(),
+		func() *mayScenario {
+			// Closure state: the setup-quality assertion result from the
+			// rollback goroutine (spawned from perTick, so it races the
+			// ongoing sampling loop — guarded by mu, unlike the
+			// duplicate-client-id/mqtt-storm closures above, whose
+			// before/after counters are only ever written from teardown,
+			// which runs strictly after the hold loop stops).
+			var mu sync.Mutex
+			var rollbackErr error
+			setRollbackErr := func(err error) {
+				mu.Lock()
+				rollbackErr = err
+				mu.Unlock()
+			}
+			getRollbackErr := func() error {
+				mu.Lock()
+				defer mu.Unlock()
+				return rollbackErr
+			}
+			return &mayScenario{
+				ID: "power-cut-retained-rollback", Name: "Unclean broker death resurrects a superseded retained control",
+				Category:   "Bus persistence (INV-EXPORT ground truth)",
+				Hypothesis: "GAP-01: mosquitto's autosave_interval(60) + a power cut can resurrect a control up to 60 s stale on reboot. This models the software-only equivalent — SIGKILL mosquitto (bypassing the on-shutdown store flush) and restore an aged clean-stop snapshot — so the broker comes back serving a SUPERSEDED retained lexa/csip/control (cap A, 5000 W) instead of the real current one (cap B, 0 W), at the same instant a site power-cut would also take the WAN down and restart the hub.",
+				Expected:   "TASK-042's adoption-time staleness bound must reject the resurrected stale control rather than adopting it as authoritative, and a fresh walk (or the rewalk re-request path) must re-establish cap B once the WAN returns — never a sustained export above cap B's limit with no alarm.",
+				HoldS:      110,
+				Fix:        "lexa-hub's retained-control staleness bound (adoption-time Ts vs a bound, TASK-042) must reject a resurrected control whose Ts predates the last-known-good one; on rejection it must alarm and request re-walk (lexa/csip/rewalk) rather than silently trusting whatever the broker happens to be serving on reboot.",
+				setup: func(d *mayhemDriver) (*activeConstraint, error) {
+					// SSH probe first: this scenario cannot manipulate (or
+					// safely restore) the broker's store without it, and
+					// INCONCLUSIVE beats risking a store nobody can clean up.
+					if err := d.hubSSH("true"); err != nil {
+						return nil, fmt.Errorf("hub SSH unavailable (need key auth to the hub Pi): %w", err)
+					}
+					_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1})
+					d.injectEnv(d.pvHighW, 250.0)
+					// Cap A: a real but LOOSE cap (5000 W), distinguishable
+					// from both "no control" and from cap B (0 W) — this is
+					// the value the rollback must resurrect.
+					if _, err := d.postCap("exportCap", 5000, 110, "mayhem: power-cut rollback cap A (5000 W, superseded)"); err != nil {
+						return nil, fmt.Errorf("post cap A: %w", err)
+					}
+					if !d.waitForAdoptedExportCap(5000, 10*time.Second) {
+						log.Printf("mayhem: power-cut-retained-rollback: cap A not observed adopted within 10s of setup; proceeding anyway (snapshot may not capture it)")
+					}
+					// The store now holds retained cap A. Snapshot it via a
+					// CLEAN stop (flush-on-shutdown) — only a clean stop
+					// produces a trustworthy point-in-time copy.
+					if err := d.brokerSnapshot(); err != nil {
+						return nil, fmt.Errorf("broker snapshot (clean stop/cp/start) failed: %w", err)
+					}
+					// Cap B: the constraint this scenario is actually judged
+					// against. A≠B (5000 vs 0) is the assertion that makes a
+					// misordered/no-op rollback detectable below.
+					d.deleteControls(0)
+					cons, err := d.postCap("exportCap", 0, 110, "mayhem: power-cut rollback cap B (0 W, judged)")
+					if err != nil {
+						return nil, fmt.Errorf("post cap B: %w", err)
+					}
+					return cons, nil
+				},
+				perTick: func(d *mayhemDriver, i int) {
+					d.injectEnv(d.pvHighW, 250.0)
+					if i == 30 { // cap B adopted and settled
+						// The outage MUST be armed BEFORE the rollback: if a
+						// northbound walk fires in the gap, cap B is
+						// republished over the resurrected cap A and the
+						// scenario would silently no-op-pass. This call is
+						// synchronous (a single fast HTTP POST) and completes
+						// before the goroutine below even starts running.
+						_ = d.gridsimOutage(gridsimOutageDown, 30, 0) // a site power cut takes the WAN down too — router still booting
+						go func() {
+							if err := d.brokerUncleanRollback(); err != nil {
+								setRollbackErr(fmt.Errorf("unclean broker rollback (SIGKILL+restore+start) failed: %w", err))
+								return
+							}
+							// Give mosquitto a moment to finish coming back
+							// (and every lexa service to reconnect) before
+							// probing it or restarting the hub — SIGKILL
+							// severs every session at once; too tight a gap
+							// here skews the hub's own connect-retry timing
+							// (mqttutil.go, 5 s interval / 30 s timeout).
+							time.Sleep(3 * time.Second)
+							// Setup-quality assertion (error ⇒ INCONCLUSIVE,
+							// not a verdict on the hub): confirm the bus is
+							// actually serving the resurrected stale cap A
+							// before the hub is judged against it.
+							if v, err := d.brokerRetainedExpLimW(); err != nil {
+								setRollbackErr(fmt.Errorf("could not confirm the retained control after rollback: %w", err))
+							} else if math.Abs(v-5000) > 1 {
+								setRollbackErr(fmt.Errorf("expected the resurrected retained control to read cap A (5000 W); observed %.0f W — rollback/misordering was not reproduced as designed", v))
+							}
+							// A power cut restarts the hub too — this is what
+							// makes the hub re-seed its retained-control view
+							// from the (now resurrected, stale) store.
+							if err := d.hubSSH("sudo systemctl restart lexa-hub"); err != nil {
+								log.Printf("mayhem: power-cut-retained-rollback: hub restart: %v", err)
+							}
+						}()
+					}
+				},
+				evaluate: func(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+					if err := getRollbackErr(); err != nil {
+						f := baseFinding(sc)
+						f.Verdict = "INCONCLUSIVE"
+						f.Headline = "setup-quality assertion failed: could not confirm the rollback resurrected cap A before judging the hub"
+						f.Diagnosis = []string{err.Error()}
+						return f
+					}
+					return diagnosePowerCutRollback(sc, cons, s)
+				},
+				teardown: func(d *mayhemDriver) {
+					d.gridsimOutageClear()
+					_ = d.mqttReset()
+					d.brokerCleanup()
+					d.deleteControls(0)
+				},
+			}
+		}(),
+		func() *mayScenario {
+			// diagnoseSurvival/diagnoseRecovery-style suppressDefault
+			// closure: without it, a hub that lost track of cap B after the
+			// corruption+restart could fall back to the program-0
+			// DefaultDERControl (5 kW cap, ≈4.4 kW ceiling) rather than being
+			// truly unconstrained, which would understate the failure this
+			// scenario exists to catch (see suppressDefault's doc comment).
+			var restoreDefault func()
+			return &mayScenario{
+				ID: "corrupted-retained-control", Name: "Rogue publisher writes truncated JSON to the retained CSIP control",
+				Category:   "Bus persistence (fail-closed survivability)",
+				Hypothesis: "GAP-02: Subscribe[T]'s decode-failure path used to log-and-drop a truncated retained lexa/csip/control with no re-request — the hub would run control-less until the next walk happened to republish. This combines that corruption with a WAN outage AND a hub restart: the hub re-seeds its retained-control view from the corrupt payload while there is no live server to walk. mqtt-malformed-control does not cover this — it injects the corruption while the hub is RUNNING and holding last-good in RAM; this scenario injects it across a restart with the WAN dark, the combination TASK-042's rewalk re-request path exists for.",
+				Expected:   "TASK-042: the hub's decode-failure alarm fires and it publishes lexa/csip/rewalk; northbound answers by republishing the cached last-good control with a fresh Ts and walking immediately — restoring the cap within seconds, without waiting on the WAN or the next scheduled walk. Without 042: the hub runs with NO control until the WAN returns and the next walk republishes — sustained uncapped export (GAP-02).",
+				HoldS:      100,
+				Fix:        "TASK-042: on decode failure of a retained control-plane message, alarm + request re-publish (lexa/csip/rewalk) instead of silently running without a control until the next scheduled walk.",
+				setup: func(d *mayhemDriver) (*activeConstraint, error) {
+					if err := d.hubSSH("true"); err != nil {
+						return nil, fmt.Errorf("hub SSH unavailable (need key auth to the hub Pi): %w", err)
+					}
+					// d.mqttReset() doubles as the mqttproxy presence probe:
+					// a missing/undeployed proxy errors here rather than
+					// silently no-opping the /inject call in perTick.
+					if err := d.mqttReset(); err != nil {
+						return nil, fmt.Errorf("mqttproxy unreachable (need scripts/mqtt-chaos.sh deploy): %w", err)
+					}
+					restoreDefault = d.suppressDefault()
+					_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1})
+					d.injectEnv(d.pvHighW, 250.0)
+					cons, err := d.postCap("exportCap", 0, 100, "mayhem: export cap ahead of a corrupted retained control")
+					if err != nil {
+						return nil, err
+					}
+					if !d.waitForAdoptedExportCap(0, 10*time.Second) {
+						log.Printf("mayhem: corrupted-retained-control: cap not observed adopted within 10s of setup; proceeding anyway")
+					}
+					return cons, nil
+				},
+				perTick: func(d *mayhemDriver, i int) {
+					d.injectEnv(d.pvHighW, 250.0)
+					switch i {
+					case 15: // cap adopted and settled; the WAN goes dark — walks fail, northbound must hold fail-closed
+						_ = d.gridsimOutage(gridsimOutageDown, 45, 0)
+					case 18:
+						// TASK-013 note: /inject now authenticates as the
+						// qa-inject broker user (mqttproxy -user/-passfile,
+						// provisioned by scripts/mqtt-chaos.sh deploy) since
+						// the hub broker's ACL requires credentials; an
+						// undeployed/un-provisioned proxy fails this call
+						// and mqttInject's error is logged, never silently
+						// swallowed into a false PASS.
+						if err := d.mqttInject(topicCSIPControl, `{"source":"event","exp_lim_w":`, true); err != nil {
+							log.Printf("mayhem: corrupted-retained-control: mqttInject: %v", err)
+						}
+					case 21:
+						// The hub re-seeds its retained-control view from the
+						// corrupt payload while the WAN is still dark.
+						go func() {
+							if err := d.hubSSH("sudo systemctl restart lexa-hub"); err != nil {
+								log.Printf("mayhem: corrupted-retained-control: hub restart: %v", err)
+							}
+						}()
+					}
+				},
+				evaluate: diagnoseSurvival("the corrupted retained control"),
+				teardown: func(d *mayhemDriver) {
+					d.gridsimOutageClear()
+					_ = d.mqttReset()
+					if restoreDefault != nil {
+						restoreDefault()
+					}
 					d.deleteControls(0)
 				},
 			}

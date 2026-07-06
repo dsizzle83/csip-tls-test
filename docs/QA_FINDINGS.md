@@ -319,4 +319,69 @@ session:
   committed variant.
 - A full extended-set campaign including both scenarios, verdicts recorded here.
 
+---
+
+## 8. Power-cut retained rollback + corrupted-retained control (GAP-01/02, TASK-043) — code complete, bench validation pending
+
+Added `power-cut-retained-rollback` and `corrupted-retained-control` —
+`cmd/dashboard/mqtt_scenarios.go` — the suite's first **unclean-death** coverage of the
+retained CSIP control, validating `lexa-hub` TASK-042 (retained-control staleness bound +
+`lexa/csip/rewalk` re-request path, merged to `main` at `a61da0d`).
+
+`power-cut-retained-rollback` (GAP-01) posts a real cap (A, 5000 W export), snapshots the
+broker store via a **clean** stop (`brokerSnapshot`/`brokerSnapshotCommand`), then posts
+the cap actually judged (B, 0 W). Mid-hold it arms a gridsim WAN outage FIRST (so no
+in-flight northbound walk can republish B over the resurrected A — the "campaign
+poisoning" hazard the task calls out explicitly), then **SIGKILLs** mosquitto and restores
+the clean snapshot (`brokerUncleanRollback`/`brokerUncleanRollbackCommand` — a kill, never a
+clean stop, is what makes this the power-cut analogue) and restarts `lexa-hub` over SSH, so
+the hub re-seeds its retained-control view from a resurrected, superseded control. A
+setup-quality assertion (`brokerRetainedExpLimW` + `parseRetainedExpLimW`, authenticating as
+the `qa-inject` broker user per the TASK-013 note below) confirms the broker is actually
+serving cap A post-rollback before the hub is judged; a failed assertion is INCONCLUSIVE,
+never a verdict on the hub. Custom ladder `diagnosePowerCutRollback`: PASS (cap B held
+throughout), FAIL (hub's `/status` shows it adopted the stale ~5000 W cap and export
+sustained over B with no alarm), DEGRADED (a bounded breach that recovered onto B before
+the window ended), FAIL (a sustained breach that never recovered, regardless of which
+control the hub claimed).
+
+`corrupted-retained-control` (GAP-02) arms a zero-export cap, suppresses the program-0
+default (so a lost cap reads as genuinely unconstrained, not the ~4.4 kW default ceiling —
+see `suppressDefault`'s doc comment), takes the WAN dark, injects a truncated
+`lexa/csip/control` payload via `mqttproxy`'s `/inject`, then restarts `lexa-hub` — the hub
+must re-seed from the corrupt payload with no live server to walk. Without TASK-042: the hub
+runs control-less until the WAN returns and the next scheduled walk republishes (sustained
+uncapped export = FAIL, pinning GAP-02). With it: the decode-failure alarm + rewalk
+re-request restores the cap within seconds. Evaluated with the existing `diagnoseSurvival`
+ladder (reworded for "the corrupted retained control").
+
+**TASK-013 note:** both scenarios' broker access authenticates as the `qa-inject` broker
+user (`readwrite lexa/#` per `lexa-hub`'s `systemd/mosquitto-lexa.acl`) now that
+`allow_anonymous` is `false` on the hub broker — `scripts/mqtt-chaos.sh deploy` provisions
+`qa-inject`'s password file and `mqttproxy`'s `-user`/`-passfile` flags already consume it
+(this was in place before this task; recorded here per the task's documentation checklist,
+not as new work).
+
+New pure-function logic (`brokerSnapshotCommand`, `brokerUncleanRollbackCommand`,
+`brokerCleanupCommand`, `brokerRetainedControlCommand`, `parseRetainedExpLimW`,
+`diagnosePowerCutRollback`) is unit tested in `cmd/dashboard/mqtt_scenarios_test.go` —
+`go test ./cmd/dashboard/...` green, plus catalogue-presence/no-collision tests across the
+full curated suite (`TestScenarios_NoIDCollisionAcrossFullSuite`).
+
+**Status: CODE COMPLETE, NOT YET BENCH-VALIDATED.** Per this task's launch instructions
+(code-only; the live bench is owned by other sessions), the following are deferred to the
+081 bench gate:
+
+- 10× solo runs of each scenario (`python3 scripts/mayhem.py --dashboard
+  http://localhost:8080 --only power-cut-retained-rollback` / `--only
+  corrupted-retained-control`) — verdict stability check.
+- Confirming `--abort` at the worst tick (mid-rollback) self-restores the bench: mosquitto
+  active, `/tmp/mayhem-store.db` gone, a follow-up `export-cap-full-battery` run PASSes.
+- A full campaign including both scenarios.
+- lexa-hub-side confirmation that TASK-042 is deployed (not just merged to `main`) on the
+  bench hub Pi before treating a non-PASS as a genuine regression rather than a stock/deploy
+  gap.
+
+Branch: `task/043-powercut` (csip-tls-test), not yet merged.
+
 Branch: `task/054-dither` (csip-tls-test), not yet merged.
