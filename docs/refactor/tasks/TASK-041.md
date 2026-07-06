@@ -1,6 +1,29 @@
 # TASK-041 — Guard/breach-state snapshot + restore-on-start (flagged)
 
-*Status: TODO · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: PARTIAL (2026-07-06, lexa-hub `task/041-snapshot`, hub side only —
+code complete, unmerged, bench validation pending) · Phase: P3 ·
+Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+
+**2026-07-06 session note:** this session's launch instructions scoped the
+work to the hub-side breach-episode snapshot only (`cmd/hub/{breach.go,
+snapshot.go,config.go,main.go}` + `configs/hub.json`), code + unit tests
+only, no bench access. Delivered: `cmd/hub/snapshot.go` (atomic tmp+rename
+save/load, staleness + version + future-clock-step rejection), wired into
+`breachEpisodes` (write on begin/end + 60 s while-active resave, journal
+`snapshot_written`), restore-on-start behind `hub.json`'s new `snapshot`
+block (`enabled: false` default, both in code and `configs/hub.json`),
+called before the reconciler-report subscription and `eng.Start()`. Unit
+tests cover the restart-mid-breach goal (no duplicate begin), the mRID-switch
+preservation, counter monotonicity across restore, transitions-only writes,
+and snapshot atomicity/staleness/corruption. `go test -race ./internal/...
+./cmd/...` green on `lexa-hub`. NOT done in this session: the
+`cmd/northbound` half (persisting `responseTracker.alerted`/`posted`), all
+bench acceptance criteria (live restart evidence, `hub-restart-mid-cap` 10×,
+flag-on/flag-off campaigns), and the AD-005/JOURNAL_FORENSICS doc updates
+beyond the AD-005 entry added this session. See AD-005's "TASK-041 update"
+in `02_ARCHITECTURE_DECISIONS.md` for the full account. This task remains
+open for: northbound persistence, bench validation, and re-flipping Status
+to DONE once both land.
 
 ## Objective
 Give lexa-hub a small JSON state snapshot (atomic tmp+rename) written on

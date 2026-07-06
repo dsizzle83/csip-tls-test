@@ -655,6 +655,54 @@ soak — this task's launch instructions were code + unit tests only, no bench
 access this session. TASK-041 (snapshot events) is unblocked by this writer
 plumbing.
 
+**TASK-041 update (2026-07-06): snapshot half implemented (hub side) — code
+complete, unmerged, bench validation pending.** `lexa-hub`
+`task/041-snapshot` adds `cmd/hub/snapshot.go` (atomic tmp+rename
+`saveHubSnapshot`/validating `loadHubSnapshot`, kept local to `cmd/hub`
+rather than the originally-sketched shared `internal/snapshot` package — see
+"Deviation" below) and wires it into `breachEpisodes`
+(`cmd/hub/breach.go`): a `hubSnapshot{v, written_at, active_breach:
+{episode_id, mrid, counter}}` is written atomically on every begin/end edge
+(`emit()`'s two transitions) and refreshed every 60 s while an episode stays
+open (`ResaveIfActive`, an independent ticker goroutine in `main.go` — not a
+per-tick hook, RSK-14), each write journaling `snapshot_written` with a
+forced `Flush` (matching `journalBegin`/`journalEnd`'s own stance: rare,
+high-value transitions). Restore (`breachEpisodes.Restore`, seeding
+`activeMRID`/`episodeID`/counter-folded-with-`max()` only — never the
+`planBreach`/`deviceReports` evidence maps, which re-seed live) is gated
+behind `hub.json`'s new `"snapshot": {"enabled": false, "path", "max_age_s":
+300}` block, called in `main.go` before the reconciler-report subscription
+and `eng.Start()`, with no ordering assumption against the retained-control
+MQTT re-seed. `loadHubSnapshot` discards (never trusts) a corrupt file, an
+unrecognized version, or a `written_at` older than `max_age_s` or in the
+future (a local clock step, TASK-037) — §8.3's stale-state-trust framing
+applied to this snapshot, exactly as this AD's original text called for.
+Writing is unconditional on `path` being set (independent of `enabled`), so
+shipping with `enabled: false` (done, both in code's zero value and
+`configs/hub.json`) gives the intended one-campaign write-only soak before
+an ops-only config flip turns restore on.
+
+**Deviation from this AD's original sketch:** the snapshot code lives at
+`cmd/hub/snapshot.go` (package `main`), not a shared `internal/snapshot`
+library reusable by northbound — this session's launch instructions scoped
+the work to the hub-side breach-episode snapshot only (a parallel lane was
+expected to cover northbound's `responseTracker.alerted`/`posted` persistence
+separately; not done in this session). `cmd/northbound` and
+`configs/northbound.json` are therefore untouched: the northbound-side
+duplicate-POST-after-restart half of the §11 finding remains open. Restore-
+before-`eng.Start()` ordering, the mRID-switch re-alert preservation, and the
+"never touch a device command path" invariant were all verified by unit test
+(`cmd/hub/breach_test.go`'s `TestBreachEpisodes_RestartMidBreach_*` /
+`TestBreachEpisodes_Restore_*` / `TestBreachEpisodes_ResaveIfActive_*` /
+`TestBreachEpisodes_JournalsSnapshotWritten`, plus `cmd/hub/snapshot_test.go`
+for tmp+rename atomicity under a concurrent reader, staleness, future-dated
+clock-step rejection, and corrupt/wrong-version rejection). `go test -race
+./internal/... ./cmd/...` green. Bench evidence (the live `systemctl restart
+lexa-hub` mid-breach single-CannotComply check, `hub-restart-mid-cap` 10×,
+the flag-on/flag-off campaigns) was out of scope for this session (code +
+unit tests only) and remains before this AD's snapshot half can be marked
+fully done.
+
 ## AD-006 🔶 Bus schema: version envelope, reject-and-alarm
 
 **Decision.** Every bus JSON message carries `"v": N`; subscribers reject
