@@ -1,6 +1,6 @@
 # TASK-080 — CSIP curve-functions scope ADR (volt-var / volt-watt: implement or de-scope)
 
-*Status: DONE (2026-07-06, csip-tls-test branch `task/080-curve-adr`, unmerged — sha TBD, see status update commit) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: DONE (2026-07-06, csip-tls-test `425d6d8`, branch `task/080-curve-adr`, unmerged) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
 
 ## Objective
 AD-010 is resolved with a written, evidence-based decision: either V1.0
