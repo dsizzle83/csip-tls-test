@@ -1,6 +1,10 @@
 # TASK-038 — Mayhem: local (hub Pi) clock-step scenario
 
-*Status: TODO · Phase: P3 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
+*Status: CODE COMPLETE (2026-07-06, csip-tls-test `task/038-clock-step`, unmerged) —
+bench validation (10× solo per scenario, abort/self-heal proof, campaign inclusion)
+deferred to the next batched wave gate (a soak had the live bench mid-run when this
+was implemented, per the launch instruction) · Phase: P3 · Effort: M (≈4–6 h) ·
+Difficulty: med · Risk: low*
 
 ## Objective
 Add two Mayhem scenarios — `local-clock-step-forward` and
@@ -182,21 +186,41 @@ already applies. Teardown restores unconditionally (idempotent commands).
   invHuntHysteresisW=300) — no tuning to make these pass (06 §4.5).
 
 ## Acceptance criteria
-- [ ] `--list` shows `local-clock-step-forward` and `local-clock-step-back`.
+- [x] `--list` shows `local-clock-step-forward` and `local-clock-step-back`.
+      (Verified without touching the bench: `worldScenarios()` unit-tested
+      for both IDs present exactly once, no ID collisions in the full
+      59-scenario catalogue, every scenario stage wired —
+      `TestWorldScenarios_ClockStepPairPresent`. Not yet verified live via
+      `mayhem.py --list` against a running dashboard — batched.)
 - [ ] Without SSH keys (e.g. `LEXA_SSH_USER=nobody`), both report
-      INCONCLUSIVE with a setup error naming SSH.
+      INCONCLUSIVE with a setup error naming SSH. (Code path is structurally
+      identical to the established `hub-restart-mid-cap`/`disk-full`
+      `d.hubSSH("true")` probe; NOT exercised with a live SSH attempt in this
+      session per the launch instruction — no bench/SSH contact while a soak
+      owns the bench. Batched to the next bench session.)
 - [ ] 10× solo each: stable verdicts; with TASK-037 deployed both PASS (or
       documented DEGRADED with physical justification); pre-037
-      expected-FAIL recorded if applicable.
+      expected-FAIL recorded if applicable. **Batched — needs live bench.**
 - [ ] After a `--abort` mid-step, hub Pi clock within 120 s of desktop and
-      NTP re-enabled (verified via `timedatectl`).
-- [ ] Full campaign including new scenarios ≤ baseline FAIL rate.
+      NTP re-enabled (verified via `timedatectl`). **Batched — needs live
+      bench.** (The teardown drift-check's decision logic — the 120 s
+      tolerance and the ahead/behind symmetry — is unit-tested via
+      `hubClockDriftOK`/`TestHubClockDriftOK`; only the live SSH round-trip
+      is unverified here.)
+- [ ] Full campaign including new scenarios ≤ baseline FAIL rate. **Batched
+      — needs live bench.**
 
 ## Regression checklist
-- [ ] `make test-fast` (csip-tls-test) green
+- [x] `make test-fast` (csip-tls-test) green
 - [ ] Conformance logic tests: not protocol-adjacent — none
-- [ ] Mayhem: 10× solo each new scenario + one full campaign
-- [ ] `bin/dashboard` rebuilt + unit restarted before validation
+- [ ] Mayhem: 10× solo each new scenario + one full campaign — **batched to
+      the next bench session** (`go test ./cmd/dashboard/` green in the
+      meantime: all existing harness tests plus the new command-builder /
+      drift-check / catalogue tests pass)
+- [ ] `bin/dashboard` rebuilt + unit restarted before validation — **batched
+      to the next bench session** (`GOWORK=off go build -o bin/dashboard
+      ./cmd/dashboard` confirmed as compile proof in this worktree; no
+      bench unit restart performed — no SSH this session)
 
 ## Mayhem scenarios affected
 Adds `local-clock-step-forward`, `local-clock-step-back`. Neighbors to

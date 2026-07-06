@@ -256,3 +256,146 @@ func TestNodeSSHTarget_DefaultUser(t *testing.T) {
 		t.Errorf("target = %q, want otheruser@69.0.0.10 (LEXA_SSH_USER override)", target)
 	}
 }
+
+// ── Hub-local clock step (TASK-038 / GAP-04) ────────────────────────────────
+
+// TestHubClockNTPCommand locks the timedatectl toggle shape.
+func TestHubClockNTPCommand(t *testing.T) {
+	if got := hubClockNTPCommand(true); !strings.Contains(got, "timedatectl set-ntp true") {
+		t.Errorf("hubClockNTPCommand(true) = %q, want it to enable NTP", got)
+	}
+	if got := hubClockNTPCommand(false); !strings.Contains(got, "timedatectl set-ntp false") {
+		t.Errorf("hubClockNTPCommand(false) = %q, want it to disable NTP", got)
+	}
+	if !strings.HasPrefix(hubClockNTPCommand(true), "sudo ") || !strings.HasPrefix(hubClockNTPCommand(false), "sudo ") {
+		t.Error("hubClockNTPCommand must use sudo — the hub Pi's passwordless sudo is what makes this scenario possible at all")
+	}
+}
+
+// TestHubClockStepCommand locks the portable relative-step form: `date -s`
+// gets an ABSOLUTE timestamp resolved by `date -d '<N> seconds'`, never a
+// bare relative spec handed straight to -s (not every date -s build accepts
+// one). Must work for both a positive (forward) and negative (backward) delta.
+func TestHubClockStepCommand(t *testing.T) {
+	fwd := hubClockStepCommand(3600)
+	if !strings.Contains(fwd, "date -d '3600 seconds'") {
+		t.Errorf("hubClockStepCommand(3600) = %q, want a date -d '3600 seconds' resolution", fwd)
+	}
+	if !strings.Contains(fwd, `sudo date -s "$(`) {
+		t.Errorf("hubClockStepCommand(3600) = %q, want sudo date -s fed the resolved timestamp via $(...)", fwd)
+	}
+
+	back := hubClockStepCommand(-3600)
+	if !strings.Contains(back, "date -d '-3600 seconds'") {
+		t.Errorf("hubClockStepCommand(-3600) = %q, want a date -d '-3600 seconds' resolution", back)
+	}
+
+	// The two must be exact inverses of each other's delta so a
+	// forward-then-back (or back-then-forward) pair is a true round trip.
+	if !strings.Contains(fwd, "3600") || !strings.Contains(back, "-3600") {
+		t.Errorf("fwd/back commands are not inverse deltas: fwd=%q back=%q", fwd, back)
+	}
+}
+
+// TestHubClockDriftOK locks the teardown drift check's decision logic — the
+// property the acceptance criteria and the task's "abort at any tick" design
+// both depend on: within hubClockDriftToleranceS of a known-good reference is
+// OK regardless of sign, past it is not, and this must hold whether the hub
+// is ahead of or behind the reference.
+func TestHubClockDriftOK(t *testing.T) {
+	const ref = int64(1_800_000_000)
+
+	cases := []struct {
+		name    string
+		hubUnix int64
+		want    bool
+	}{
+		{"exact match", ref, true},
+		{"60s ahead", ref + 60, true},
+		{"60s behind", ref - 60, true},
+		{"exactly at tolerance ahead", ref + hubClockDriftToleranceS, true},
+		{"exactly at tolerance behind", ref - hubClockDriftToleranceS, true},
+		{"1s past tolerance ahead", ref + hubClockDriftToleranceS + 1, false},
+		{"1s past tolerance behind", ref - hubClockDriftToleranceS - 1, false},
+		{"stuck +1h (never restored)", ref + 3600, false},
+		{"stuck -1h (never restored)", ref - 3600, false},
+	}
+	for _, c := range cases {
+		if got := hubClockDriftOK(c.hubUnix, ref); got != c.want {
+			t.Errorf("%s: hubClockDriftOK(%d, %d) = %v, want %v", c.name, c.hubUnix, ref, got, c.want)
+		}
+	}
+}
+
+// TestHubClockAbsoluteCorrectionCommand locks the abort-safe correction path:
+// an ABSOLUTE `date -s @<unix>` set, never another relative step (which would
+// compound rather than correct if a run aborted partway through its own
+// relative steps).
+func TestHubClockAbsoluteCorrectionCommand(t *testing.T) {
+	const ref = int64(1_800_000_000)
+	cmd := hubClockAbsoluteCorrectionCommand(ref)
+	if !strings.Contains(cmd, "sudo date -s @1800000000") {
+		t.Errorf("hubClockAbsoluteCorrectionCommand(%d) = %q, want an absolute sudo date -s @%d", ref, cmd, ref)
+	}
+	if strings.Contains(cmd, "date -d") {
+		t.Errorf("hubClockAbsoluteCorrectionCommand must be a plain absolute set, not another relative resolution: %q", cmd)
+	}
+}
+
+// TestWorldScenarios_ClockStepPairPresent locks the acceptance criterion
+// "--list shows local-clock-step-forward and local-clock-step-back": the
+// catalogue worldScenarios() feeds /api/qa/scenarios (and thus mayhem.py
+// --list) must contain both new IDs, each with a distinct ID (no collision
+// with any existing scenario) and a sane Category/HoldS.
+func TestWorldScenarios_ClockStepPairPresent(t *testing.T) {
+	d := newMayhemDriver(map[string]string{"hub": "http://69.0.0.1:9100"})
+	scs := d.worldScenarios()
+
+	seen := map[string]int{}
+	for _, sc := range scs {
+		seen[sc.ID]++
+	}
+	for _, id := range []string{"local-clock-step-forward", "local-clock-step-back"} {
+		if seen[id] != 1 {
+			t.Errorf("worldScenarios() must contain exactly one %q, got %d", id, seen[id])
+		}
+	}
+	for id, n := range seen {
+		if n > 1 {
+			t.Errorf("duplicate scenario ID %q (%d copies) — every ID in the catalogue must be unique", id, n)
+		}
+	}
+
+	var fwd, back *mayScenario
+	for _, sc := range scs {
+		switch sc.ID {
+		case "local-clock-step-forward":
+			fwd = sc
+		case "local-clock-step-back":
+			back = sc
+		}
+	}
+	if fwd == nil || back == nil {
+		t.Fatal("both clock-step scenarios must be present")
+	}
+	for _, sc := range []*mayScenario{fwd, back} {
+		if sc.HoldS <= 0 {
+			t.Errorf("%s: HoldS = %d, want > 0", sc.ID, sc.HoldS)
+		}
+		if sc.setup == nil || sc.perTick == nil || sc.evaluate == nil || sc.teardown == nil {
+			t.Errorf("%s: every scenario stage (setup/perTick/evaluate/teardown) must be wired", sc.ID)
+		}
+	}
+}
+
+// Note: the INCONCLUSIVE-without-SSH acceptance criterion (both scenarios'
+// setup calls d.hubSSH("true") first, identically to the established
+// hub-restart-mid-cap/disk-full precedent — see worldScenarios()) is
+// deliberately NOT exercised here with a real ssh subprocess: doing so would
+// shell out and attempt a real network connection, which this task's lane
+// forbids while a bench soak is mid-run. That path is structurally identical
+// to the two existing scenarios' setup (same d.hubSSH("true") probe, same
+// %w-wrapped "hub SSH unavailable" error naming SSH), which is unverified by
+// a unit test either — HIL verification (LEXA_SSH_USER=nobody against the
+// real bench) is scoped to the later batched validation session per the
+// launch brief.

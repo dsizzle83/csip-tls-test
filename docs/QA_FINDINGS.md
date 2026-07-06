@@ -189,6 +189,39 @@ refusal, all unit-tested in `cmd/dashboard/mayhem_world_test.go`) — 10× solo 
 abort/self-heal proof, and a full campaign against the live bench are the next batched
 wave-gate item (a bench agent had the bench mid-campaign when this was authored).
 
+### 4b. Hub-local clock step (TASK-038 / GAP-04) — code complete, bench validation pending
+
+Two curated scenarios added to `mayhem_world.go` (`worldScenarios()`): `local-clock-step-forward`
+and `local-clock-step-back`. Every prior clock scenario (`clock-jitter`, `clock-jump-forward`)
+steps the *server's* clock via gridsim `/admin/clock`; these are the first to step the **hub
+Pi's own wall clock** ±1 h mid-control over SSH (`timedatectl set-ntp false` + `date -s
+"$(date -d '<N> seconds')"`), the first thing NTP does to a field unit after commissioning.
+
+They validate TASK-037's monotonic clock anchoring (freshness/expiry anchored at
+`onCSIPControl` arrival, not wall-clock deltas): the hypothesis is that a local step must not
+expire/hold-forever the active control, must not flap enforcement, and must not mass-expire
+device telemetry — judged with `diagnoseSurvival("the local clock step")` (cap held throughout)
+plus the standard cross-cutting `safetyAudit` invariants (INV-EXPIRED is grace-bounded and
+applies automatically). **Against a pre-037 hub this is an expected-FAIL that pins the gap**
+(the `meter-ct-inverted` precedent, 06 §2) — state which case applies in the PR/campaign
+report once run.
+
+Both scenarios probe SSH availability first (`d.hubSSH("true")`, identical to
+`hub-restart-mid-cap`/`disk-full`) — INCONCLUSIVE, never a fake verdict, without key auth.
+Teardown (`hubClockStepTeardown`) is unconditional and abort-safe by design: rather than
+"subtract what the perTick step added" (wrong if a run aborts before or after that step ever
+runs), it re-enables NTP and then reads the hub's *actual* current clock, correcting it
+absolutely (`date -s @<desktop-unix>`) if it drifted more than 120 s from the (untouched)
+desktop clock — correct at every abort point, not just a clean finish.
+
+Landed as harness code + `go build`/`go vet`/unit-test evidence only (NTP-toggle and
+clock-step command builders, the absolute-correction command, and the teardown drift-check's
+decision logic `hubClockDriftOK` are all pure-function unit-tested in
+`cmd/dashboard/mayhem_world_test.go`, plus a scenario-catalogue test locking both IDs present
+and every stage wired) — 10× solo per scenario (stability gate, 06 §2), an abort-mid-step
+clock-restore proof, and the scenarios' first live campaign run are the next batched wave-gate
+item (a soak had the bench mid-run when this was authored).
+
 ---
 
 ## 5. Bench / deploy state (as of 2026-06-24)

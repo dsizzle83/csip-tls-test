@@ -541,6 +541,117 @@ func (d *mayhemDriver) fillDisk() error { return d.hubSSH(fillDiskCommand()) }
 // call, including when no ballast exists.
 func (d *mayhemDriver) freeDisk() error { return d.hubSSH(`sudo rm -f ` + ballastPath) }
 
+// ── Hub-local clock step (TASK-038 / GAP-04) ────────────────────────────────
+//
+// Every clock scenario before this one (clock-jitter, clock-jump-forward)
+// steps the SERVER's clock via gridsim /admin/clock — the hub's own wall
+// clock has zero coverage, and NTP's first sync after commissioning is
+// exactly this: the hub Pi's local clock jumps while the server's does not.
+// TASK-037 anchors freshness/expiry on a monotonic clock at onCSIPControl
+// arrival specifically so a local step cannot expire or flap an active
+// control; this pair of scenarios (local-clock-step-forward/-back) is the
+// validation harness for that anchoring.
+//
+// systemd-timesyncd will immediately correct a manual `date -s` step, so
+// every step disables NTP first (hubClockNTP(false)) and the matching
+// restore re-enables it (hubClockNTP(true)) — mirrored by the teardown drift
+// check below, which is unconditional and abort-safe.
+
+// hubClockNTPCommand builds the timedatectl toggle. Pure string builder
+// (mirrors fillDiskCommand/netemApplyCommand) so its shape is unit-testable
+// without SSH.
+func hubClockNTPCommand(on bool) string {
+	if on {
+		return "sudo timedatectl set-ntp true"
+	}
+	return "sudo timedatectl set-ntp false"
+}
+
+// hubClockNTP enables/disables the hub Pi's NTP client (systemd-timesyncd).
+func (d *mayhemDriver) hubClockNTP(on bool) error {
+	return d.hubSSH(hubClockNTPCommand(on))
+}
+
+// hubClockStepCommand builds the remote command that steps the hub's own
+// wall clock by deltaSec seconds (positive = forward, negative = back).
+// Composed via `date -d '<N> seconds'` (GNU date's relative-spec form,
+// accepting a leading '-') rather than `date -s '+1 hour'` directly — not
+// every date -s accepts a relative spec, but every date -d does, so
+// computing the absolute target with -d and only ever calling -s with that
+// resolved timestamp is the portable form (task mechanics note).
+func hubClockStepCommand(deltaSec int) string {
+	return fmt.Sprintf(`sudo date -s "$(date -d '%d seconds')"`, deltaSec)
+}
+
+// hubClockStep steps the hub Pi's wall clock by deltaSec seconds. Caller is
+// responsible for disabling NTP first (hubClockNTP(false)) or timesyncd will
+// immediately correct it back.
+func (d *mayhemDriver) hubClockStep(deltaSec int) error {
+	return d.hubSSH(hubClockStepCommand(deltaSec))
+}
+
+// hubClockDriftToleranceS is the teardown drift check's threshold (Acceptance
+// criteria: "within 120 s of desktop"). Below this, the hub clock is close
+// enough to the desktop's (untouched) wall clock that no absolute correction
+// is needed — NTP re-enabling (once a source exists) will finish the job.
+const hubClockDriftToleranceS = 120
+
+// hubClockDriftOK decides the teardown drift check: is the hub's reported
+// unix time (hubUnix) within hubClockDriftToleranceS of a known-good
+// reference (desktopUnix, the dashboard host's own untouched clock)? Pure so
+// the decision logic is unit-testable without SSH — this is the function the
+// task's "unit test for the teardown drift check's decision logic" targets.
+// Extracted specifically because "subtract what the perTick step added" is
+// wrong when a run aborts before or after that step ever ran; reading the
+// hub's ACTUAL current clock and comparing it to a reference is correct at
+// every abort point.
+func hubClockDriftOK(hubUnix, desktopUnix int64) bool {
+	delta := hubUnix - desktopUnix
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= hubClockDriftToleranceS
+}
+
+// hubClockAbsoluteCorrectionCommand builds the absolute-correction command
+// the teardown drift check issues when hubClockDriftOK is false: set the
+// hub's clock directly to a known-good unix timestamp (`date -s @<unix>`),
+// rather than another relative step (which would compound rather than
+// correct if the run aborted partway through its own relative steps).
+func hubClockAbsoluteCorrectionCommand(desktopUnix int64) string {
+	return fmt.Sprintf("sudo date -s @%d", desktopUnix)
+}
+
+// hubClockStepTeardown is the shared, unconditional, abort-safe teardown for
+// both local-clock-step scenarios: re-enable NTP, then read the hub's actual
+// current clock and correct it absolutely if it drifted past tolerance. This
+// is correct whether the run finished normally, aborted before the perTick
+// restore step ran, or aborted after it — unlike "subtract what was added",
+// which is only correct on a clean finish.
+func (d *mayhemDriver) hubClockStepTeardown() {
+	if err := d.hubClockNTP(true); err != nil {
+		log.Printf("mayhem: clock-step teardown: hubClockNTP(true) failed: %v", err)
+	}
+	out, err := d.hubSSHOutput("date +%s")
+	if err != nil {
+		log.Printf("mayhem: clock-step teardown: could not read hub clock to verify drift (manual check needed: ssh dmitri@69.0.0.1 timedatectl): %v", err)
+		return
+	}
+	hubUnix, err := strconv.ParseInt(out, 10, 64)
+	if err != nil {
+		log.Printf("mayhem: clock-step teardown: could not parse hub clock output %q: %v", out, err)
+		return
+	}
+	desktopUnix := time.Now().Unix()
+	if hubClockDriftOK(hubUnix, desktopUnix) {
+		return
+	}
+	log.Printf("mayhem: clock-step teardown: hub clock drifted %ds past tolerance — applying absolute correction", hubUnix-desktopUnix)
+	if err := d.hubSSH(hubClockAbsoluteCorrectionCommand(desktopUnix)); err != nil {
+		log.Printf("mayhem: clock-step teardown: absolute correction FAILED — manual cleanup needed (ssh dmitri@69.0.0.1 sudo date -s @%d && sudo timedatectl set-ntp true): %v", desktopUnix, err)
+	}
+}
+
 // worldScenarios is appended to the curated suite by scenarios().
 func (d *mayhemDriver) worldScenarios() []*mayScenario {
 	const loadLow = 250.0
@@ -1018,6 +1129,89 @@ func (d *mayhemDriver) worldScenarios() []*mayScenario {
 				},
 			}
 		}(),
+		{
+			ID: "local-clock-step-forward", Name: "Hub Pi's own wall clock steps +1h mid-control",
+			Category:   "Time integrity (local clock, INV-EXPORT survivability)",
+			Hypothesis: "NTP steps the hub's OWN clock +1 h mid-control (the classic first sync after commissioning, or a holdover recovery). Every wall-clock comparison ON THE HUB moves; the server's clock did not. Journald timestamps on the hub jump during this run — expected, and not evidence of anything (do not oracle on hub log timestamps, only ground-truth sims + /status).",
+			Expected:   "Keep enforcing the cap (it is still valid in SERVER time — TASK-037's monotonic anchoring at onCSIPControl arrival), no enforcement flap, no mass staleness of device telemetry, recover cleanly once the clock is restored.",
+			HoldS:      90,
+			Fix:        "TASK-037: anchor freshness/expiry on a monotonic clock captured at onCSIPControl arrival, not on wall-clock deltas — a local wall-clock step must never read every control as instantly expired (expiryConfirmTicks).",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				// SSH probe first: without bench SSH this scenario cannot step (or
+				// safely restore) the hub's clock, and INCONCLUSIVE beats risking a
+				// clock nobody can clean up.
+				if err := d.hubSSH("true"); err != nil {
+					return nil, fmt.Errorf("hub SSH unavailable (need key auth to the hub Pi): %w", err)
+				}
+				return armExportCap(d, 90, "mayhem: cap through +1h local clock step")
+			},
+			perTick: func(d *mayhemDriver, i int) {
+				d.injectEnv(d.pvHighW, loadLow)
+				switch i {
+				case 15: // cap adopted and settled; now the hub's OWN clock steps forward
+					go func() {
+						if err := d.hubClockNTP(false); err != nil {
+							log.Printf("mayhem: local-clock-step-forward: hubClockNTP(false): %v", err)
+							return
+						}
+						if err := d.hubClockStep(3600); err != nil {
+							log.Printf("mayhem: local-clock-step-forward: hubClockStep(+3600): %v", err)
+						}
+					}()
+				case 55: // restore before the hold ends
+					go func() {
+						if err := d.hubClockStep(-3600); err != nil {
+							log.Printf("mayhem: local-clock-step-forward: hubClockStep(-3600): %v", err)
+						}
+						if err := d.hubClockNTP(true); err != nil {
+							log.Printf("mayhem: local-clock-step-forward: hubClockNTP(true): %v", err)
+						}
+					}()
+				}
+			},
+			evaluate: diagnoseSurvival("the local clock step"),
+			teardown: func(d *mayhemDriver) { d.hubClockStepTeardown() },
+		},
+		{
+			ID: "local-clock-step-back", Name: "Hub Pi's own wall clock steps -1h mid-control",
+			Category:   "Time integrity (local clock, INV-EXPIRED / INV-EXPORT survivability)",
+			Hypothesis: "NTP steps the hub's OWN clock -1 h mid-control (a holdover clock ahead of true time, corrected backward). Every wall-clock comparison ON THE HUB moves backward; the server's clock did not. Journald timestamps on the hub jump backward during this run — expected, not evidence of anything.",
+			Expected:   "Keep enforcing the cap through the backward step (still valid in SERVER time) with no flap; additionally, the control must NOT be held past its genuine server-time expiry once that later arrives — INV-EXPIRED (grace-bounded, invariants.go) is already part of the safetyAudit every scenario's samples get, and a local backward step must never extend a control's real life.",
+			HoldS:      90,
+			Fix:        "Same TASK-037 anchoring as the forward case: expiry compares against the monotonic-anchored deadline, so a local clock running backward can neither expire a live control early nor keep a genuinely-expired one alive.",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				if err := d.hubSSH("true"); err != nil {
+					return nil, fmt.Errorf("hub SSH unavailable (need key auth to the hub Pi): %w", err)
+				}
+				return armExportCap(d, 90, "mayhem: cap through -1h local clock step")
+			},
+			perTick: func(d *mayhemDriver, i int) {
+				d.injectEnv(d.pvHighW, loadLow)
+				switch i {
+				case 15: // cap adopted and settled; now the hub's OWN clock steps backward
+					go func() {
+						if err := d.hubClockNTP(false); err != nil {
+							log.Printf("mayhem: local-clock-step-back: hubClockNTP(false): %v", err)
+							return
+						}
+						if err := d.hubClockStep(-3600); err != nil {
+							log.Printf("mayhem: local-clock-step-back: hubClockStep(-3600): %v", err)
+						}
+					}()
+				case 55: // restore before the hold ends
+					go func() {
+						if err := d.hubClockStep(3600); err != nil {
+							log.Printf("mayhem: local-clock-step-back: hubClockStep(+3600): %v", err)
+						}
+						if err := d.hubClockNTP(true); err != nil {
+							log.Printf("mayhem: local-clock-step-back: hubClockNTP(true): %v", err)
+						}
+					}()
+				}
+			},
+			evaluate: diagnoseSurvival("the local clock step"),
+			teardown: func(d *mayhemDriver) { d.hubClockStepTeardown() },
+		},
 	}
 }
 
