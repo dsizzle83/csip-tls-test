@@ -1,6 +1,20 @@
 # TASK-069 — HTTP client: `net.Conn` shim under `http.Transport` vs hardened parser (ADR + impl)
 
-*Status: TODO · Phase: P6 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
+*Status: DONE (2026-07-06, option (b) — chunked decode in httpwire; net.Conn shim backlogged) · Phase: P6 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
+
+> **Resolution note (2026-07-06).** AD-009 resolved to **option (b)** — keep
+> the TASK-047-hardened, fuzz-clean, capped `httpwire` parser and add chunked
+> Transfer-Encoding *decoding* to it, closing the one real functional gap (a
+> conformant utility that chunks) without reworking the utility-facing
+> transport. The `net.Conn`-shim-under-`http.Transport` path (option (a)) is
+> **deferred to a P6-with-time backlog item** (see AD-009 in 02). Consequence:
+> the option-(a)-specific acceptance/regression items below — the conformance
+> **dual-run**, timeout-parity across two transports, and the single-session
+> Transport test — do **not** apply to what shipped; option (b) changed nothing
+> on the wolfSSL transport, keep-alive lifecycle, timeout semantics, or the
+> non-chunked success bytes (byte-identical), so unit + fuzz coverage of the
+> httpwire leaf is the applicable evidence. Bench conformance regeneration
+> rolls into the 081 gate with the other code-complete-bench-pending work.
 
 ## Objective
 AD-009 is resolved: a written decision (in 02_ARCHITECTURE_DECISIONS.md)

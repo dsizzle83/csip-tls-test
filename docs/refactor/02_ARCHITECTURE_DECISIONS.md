@@ -948,7 +948,62 @@ risk on an already-token-gated, non-routable segment. Backlog: TLS listener
 on :9100 (follow-up, unnumbered) if/when lexa-api leaves the air-gapped
 bench assumption.
 
-## AD-009 ❓ HTTP client on the northbound boundary (R5/D9)
+## AD-009 ✅ HTTP client on the northbound boundary (R5/D9)
+
+**Decision (TASK-069, 2026-07-06).** **Option (b): keep the hardened
+hand-rolled parser and close the one remaining functional gap by adding
+chunked-transfer *decoding* to the CGo-free `httpwire` leaf.** The `net.Conn`
+shim under `http.Transport` (option (a)) is **deferred to a P6-with-time
+follow-up**, not shipped in V1.0; option (c) (leave chunked unsupported) is
+**rejected** because failing the northbound walk closed against a conformant
+utility that chunks is a real interop defect, not a safe no-op.
+
+**Rationale — argued from the TASK-047 evidence, not the review's lean.**
+The review "leaned (a)" on the premise that Go's battle-tested parser removes
+a live security liability. TASK-047 changed the evidence under that premise:
+the parsing core is now a stdlib-only leaf (`httpwire`) with a 64 KiB header
+cap and a 10 MiB body cap, and three go-native fuzz targets found **zero
+crashers** across 222M+ execs plus a nightly CI job that keeps accumulating
+coverage. With the parser fuzz-clean and capped, option (a)'s security payoff
+is largely already banked, while its *cost* is unchanged and high: a
+`net.Conn` adapter over the manual wolfSSL session lifecycle introduces a new
+close/deadline seam on the radioactive utility boundary (deadline semantics
+differ — `SO_RCVTIMEO` is a per-syscall idle timeout, not an absolute Go
+deadline), must not open a second connection (the single-keep-alive-session
+invariant), must not `Free()` mid-walk (RSK-07 segfault class), and requires
+a full conformance dual-run on the desktop wolfSSL sysroot to prove wire-byte
+and timeout parity. That is a P6-with-time reworking of the transport, not a
+V1.0-deadline change. The **only** thing option (a) buys that (b) does not is
+chunked support — and (b) buys that directly, in the fuzzable leaf, without
+touching the transport at all.
+
+**What shipped (option b).** `httpwire.ReadHTTPResponse` no longer rejects
+`Transfer-Encoding: chunked`; it decodes it (`readChunkedBody`, RFC 7230
+§4.1) and returns the header block followed by the reassembled body (no
+synthetic `Content-Length`, so `response.go` re-parses `content-length -1`
+and uses the body bytes directly). The decoder is bounded on every axis a
+hostile server controls: decoded body ≤ `maxBody` (single oversized chunk
+*and* accumulated small chunks both trip it), and no chunk-size/trailer line
+may exceed `maxChunkLineLen` (4 KiB) without its CRLF. It fails closed on bad
+hex sizes, a missing post-chunk CRLF, or a premature close. All three fuzz
+targets were re-run with chunked seeds added (multi-chunk, extensions,
+trailers, truncation, bad hex) — **zero crashers** (~21M additional execs
+this session). **Nothing on the wolfSSL transport, the keep-alive session
+lifecycle, the timeout semantics, or the non-chunked (Content-Length /
+read-until-close) success bytes changed** — those paths are byte-identical to
+pre-TASK-069, so no live-handshake change and no conformance dual-run were
+required for this option (the desktop-sysroot dual-run in the task's step 7
+was scoped to option (a)). The 2030.5 request headers/media types are
+untouched.
+
+**Backlog (option a).** `net.Conn` shim under `http.Transport` remains a
+worthwhile P6-with-time item: it would retire the hand-rolled parser
+entirely and pick up conditional-request / connection-management niceties
+(TASK-071). Prerequisites when it is picked up: `MaxConnsPerHost=1` +
+`DisableCompression=true`, `DialTLSContext` returning the already-established
+session, a deadline-mapping unit suite (idle vs absolute), a "second request
+serializes-or-errors" single-session test, and the full gridsim conformance
+dual-run byte-comparison. Track alongside the TASK-073 reconnect-churn soak.
 
 **Problem.** Hand-rolled HTTP/1.1 parsing over wolfSSL parses hostile
 utility bytes. **Evidence correction (verified 2026-07-04):** the review's
@@ -977,10 +1032,11 @@ header-only flood, chunked header, split-across-reads), 15 minutes each
 locally (~25–46M execs/target) — **zero crashers**. This narrows option
 (b)'s residual risk (the review's original worry — "parsing bugs = security
 bugs" — has 15 CPU-minutes/target of fuzz coverage behind it now with no
-findings) but doesn't resolve the chunked functional gap that only option
-(a) closes; TASK-069 decision still open. Nightly CI job added
+findings) but at the time didn't resolve the chunked functional gap; that
+gap is now closed by TASK-069 option (b) above (chunked *decoding* added to
+the same leaf, re-fuzzed clean). Nightly CI job added
 (`.github/workflows/ci.yml` `fuzz`, schedule-only, no wolfSSL sysroot
-needed) so fuzz coverage keeps accumulating between now and that decision.
+needed) so fuzz coverage keeps accumulating on the now-larger parser.
 
 ## AD-010 ✅ CSIP curve functions (volt-var / volt-watt): de-scoped for V1.0
 
