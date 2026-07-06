@@ -1,6 +1,6 @@
 # TASK-054 — Guard-threshold dither sweeps (SoC@reserve, export@breach)
 
-*Status: CODE COMPLETE (2026-07-06, pending commit sha — see 00_MASTER_INDEX), bench
+*Status: CODE COMPLETE (2026-07-06, 2f644ae), bench
 validation batched · Phase: P4 · Effort: M (≈4–6 h) · Difficulty: med · Risk: low*
 
 **Session note (2026-07-06):** Implemented as a code-only session — a separate bench-owning
