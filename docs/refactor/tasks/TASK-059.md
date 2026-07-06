@@ -1,6 +1,23 @@
 # TASK-059 — Shadow-mode dual-run harness (old cascade vs new stack, decision diff)
 
-*Status: TODO · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+*Status: DONE (2026-07-06, lexa-hub bca51de) · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+
+> Implemented on lexa-hub branch `task/059-shadow-harness`
+> (`internal/orchestrator/constraint/shadow.go` + `shadow_test.go`; cmd/hub
+> wiring behind `constraint_shadow`; `lexa_constraint_shadow_divergence_total`
+> metric + `shadow_divergences` on `lexa/hub/plan`). Docs on
+> `task/059-shadow-docs`. **Deviation:** per the Principal's launch brief and
+> 05 §12 (shadow-only, no live-control change; the flip gate is paid by
+> TASK-060), the flag-on Mayhem campaign is DEFERRED to 060's bench session —
+> this task ships the exhaustively unit-tested harness (diff/tolerance/
+> debounce/rate-limiter/passthrough/safety-delegation), `go test -race
+> ./internal/... ./cmd/...` green. **Design note:** the diff is
+> CANDIDATE-SCOPED (a divergence is any axis/breach the candidate would
+> actuate differently from the legacy authority; axes the candidate has no
+> opinion on are skipped), so the empty Stack reads ~0 and the diff becomes
+> meaningful per-axis as 060+ wire constraints — this is the reconciliation of
+> "≈0 with the empty Stack" with the literal step-2 phrasing; see shadow.go's
+> header comment.
 
 ## Objective
 Behind a `constraint_shadow` config flag, every economic tick runs BOTH the
