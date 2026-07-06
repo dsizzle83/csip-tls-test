@@ -1,6 +1,30 @@
 # TASK-046 — Async actuator publishes; tick time budget + overrun counter
 
-*Status: TODO · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+*Status: CODE COMPLETE, BENCH GATE DEFERRED TO NEXT SESSION (2026-07-06, lexa-hub `task/046-async-publish` 1418cc6, unmerged) · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+
+**Implementation note (2026-07-06):** this repo's `cmd/hub/actuators.go` /
+`cmdDeduper` this task file describes were already deleted by TASK-032 before
+this task landed — the actuators are now `cmd/hub/desired.go`'s
+`desiredPublishing{Battery,Solar,EVSE}Actuator` (retained desired-doc
+publishers). The async-publish / harvest-next-call / tick-budget design below
+was implemented against THAT code instead, 1:1 in spirit: each actuator fires
+via the new `mqttutil.PublishJSON(Retained)Async`, harvests the previous
+publish's outcome (plus one free opportunistic check right after firing) via
+`PendingPub.Harvest`, and rolls its dedupe baseline back on failure/timeout so
+identical content is retried on the next call — reproducing the old
+"cmdDeduper reset on failure" contract in the doc-publisher world. Plan log
+went the same async route; the compliance alert stays synchronous but bounded
+at 1s (new `mqttutil.PublishJSONTimeout`) instead of 5s, per this task's own
+"breach alert keeps a SHORT sync wait" instruction. `lexa_hub_tick_overruns_total`
+(registered zero since TASK-044) now has a real source: `main.go`'s
+planObserver sums its own wall time plus the prior pass's actuator time (a
+shared `tickTiming` accumulator in `desired.go`) against a 50%-of-engine-interval
+budget. `go test -race ./internal/... ./cmd/...` green, mutation-tested by hand
+(commenting out the harvest rollback breaks the new retry tests). Bench gates
+(mqtt-broker-latency/-restart 10×, tick-overrun metric curl, full FAST
+campaign) not run this session — batched per the launch instructions; radioactive-zone
+discipline (one-per-PR, full campaign before merge, not same-day) still applies
+before this branch merges.
 
 ## Objective
 Decouple the hub's actuator MQTT publishes from the engine tick:
@@ -188,21 +212,22 @@ Preservation ledger entries touched:
   lives in cmd/hub).
 
 ## Acceptance criteria
-- [ ] Unit: all step-5 cases green under `-race`; mutation check on
-      harvest-reset documented in the PR.
+- [x] Unit: all step-5 cases green under `-race`; mutation check on
+      harvest-reset documented in the PR (done by hand this session, not
+      committed as a standing test — see final report).
 - [ ] Bench: `lexa_hub_tick_overruns_total` = 0 after a
-      `mqtt-broker-latency` run in FAST mode (metric curl evidence).
-- [ ] Gates 10× at baseline verdicts; full FAST campaign ≤ baseline.
+      `mqtt-broker-latency` run in FAST mode (metric curl evidence). — DEFERRED
+- [ ] Gates 10× at baseline verdicts; full FAST campaign ≤ baseline. — DEFERRED
 - [ ] Worst-case tick fan-out time under injected 800 ms broker latency
       measured < 1 s (was: up to 5 s × N publishes) — journal/metric
-      evidence.
+      evidence. — DEFERRED
 
 ## Regression checklist
-- [ ] `go test -race ./internal/... ./cmd/...` (lexa-hub) green
-- [ ] Conformance logic tests: none
+- [x] `go test -race ./internal/... ./cmd/...` (lexa-hub) green
+- [x] Conformance logic tests: none
 - [ ] Mayhem: targeted mqtt + export scenarios 10× + full campaign
-      (radioactive file)
-- [ ] `hub-replay-tune.sh fast` re-applied after deploy
+      (radioactive file) — DEFERRED to next bench session per launch instructions
+- [ ] `hub-replay-tune.sh fast` re-applied after deploy — N/A this session (no deploy)
 
 ## Mayhem scenarios affected
 `mqtt-broker-latency` (primary — cap must hold AND ticks must not overrun),
