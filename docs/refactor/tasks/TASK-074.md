@@ -1,9 +1,9 @@
 # TASK-074 — OCPP security profile 2 (TLS + BasicAuth); evsim counterpart
 
-*Status: PARTIAL (2026-07-06, `task/074-ocpp-sp2` in both lexa-hub and
-csip-tls-test — code/config/cert-tooling complete + unit-tested, unmerged;
-live bench lockstep deploy + 7-scenario ×3 EV Mayhem re-run deferred to
-TASK-081, see docs/BENCH.md's OCPP Security Profile 2 runbook) ·
+*Status: PARTIAL (2026-07-06, `task/074-ocpp-sp2` @ lexa-hub `c82b778` +
+csip-tls-test `a4dcde0` — code/config/cert-tooling complete + unit-tested,
+unmerged; live bench lockstep deploy + 7-scenario ×3 EV Mayhem re-run
+deferred to TASK-081, see docs/BENCH.md's OCPP Security Profile 2 runbook) ·
 Phase: P6 · Effort: L (≈6 h) · Difficulty: med · Risk: med*
 
 ## Objective
