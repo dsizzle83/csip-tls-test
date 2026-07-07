@@ -1,0 +1,23 @@
+{
+  "spec_v": 1,
+  "id": "battery-nan-sentinel",
+  "name": "Battery registers read the SunSpec N/A sentinel (0x8000)",
+  "category": "Modbus transport (INV-TRANSPORT)",
+  "hypothesis": "The battery's registers all read 0x8000 — a half-initialised or failed bank. SoC decodes to a wild ~32768% and power to −32768 W. A hub that trusts it optimises against a fabricated SoC and would charge/discharge on garbage; this is the invalid-SoC (255 / NaN-equiv) hazard at the wire.",
+  "expected": "Treat 0x8000 as N/A, mark the pack unavailable, and never surface an impossible SoC or power.",
+  "hold_s": 35,
+  "fix": "Treat 0x8000 (int16) / 0xFFFF (uint16) as not-implemented → N/A in the SunSpec decode and mark the pack down (lexa-modbus / sunspec).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID battery-nan-sentinel).",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 55, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "nan_sentinel"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "nan_sentinel", "clear": true}}
+  ],
+  "oracle": {"name": "diagnoseBatteryGarbage"}
+}

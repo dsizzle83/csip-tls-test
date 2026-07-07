@@ -1,0 +1,24 @@
+{
+  "spec_v": 1,
+  "id": "reject-write-curtail",
+  "name": "Inverter ACKs the curtailment but ignores it",
+  "category": "Closed-loop actuation (INV-CONVERGE)",
+  "hypothesis": "A real inverter accepts the WMaxLimPct write over Modbus (ACK) but silently keeps producing at its old ceiling — accept-but-ignore. The hub believes the limit is in force the moment the write succeeds.",
+  "expected": "Detect via measurement that output never reached the commanded limit and react (post CannotComply, or use another lever) — never keep reporting compliance it does not have.",
+  "hold_s": 50,
+  "fix": "Add measured-effect verification to derbase.ApplyControl; today it is write-only. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID reject-write-curtail).",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 100, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "reject_write"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "reject_write", "clear": true}}
+  ],
+  "constraint": {"type": "genLimit", "limit_w": 1000, "hold_s": 50, "desc": "mayhem: gen limit 1 kW vs an inverter that ignores it"},
+  "oracle": {"name": "diagnoseConverge"}
+}

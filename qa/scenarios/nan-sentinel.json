@@ -1,0 +1,22 @@
+{
+  "spec_v": 1,
+  "id": "nan-sentinel",
+  "name": "Inverter returns the SunSpec N/A sentinel (0x8000)",
+  "category": "Modbus transport (INV-TRANSPORT)",
+  "hypothesis": "The inverter's registers all read the SunSpec 0x8000 'not implemented' sentinel (−32768) — a half-initialised or failed register bank. A hub that treats the sentinel as a real reading sees a wild −32768 W value and optimises against fabricated data.",
+  "expected": "Recognise 0x8000 as N/A and mark the source unavailable; never report a physically-impossible measurement or act on it.",
+  "hold_s": 35,
+  "fix": "In the SunSpec decode, treat 0x8000 (int16) / 0xFFFF (uint16) as not-implemented → N/A (lexa-modbus / sunspec).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID nan-sentinel). No constraint posted (Go twin returns activeConstraint{Typ:\"none\"}) — diagnoseTransport reads samples directly, no cap required.",
+  "setup": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "nan_sentinel"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "nan_sentinel", "clear": true}}
+  ],
+  "oracle": {"name": "diagnoseTransport"}
+}

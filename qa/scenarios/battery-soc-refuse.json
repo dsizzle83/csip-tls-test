@@ -1,0 +1,24 @@
+{
+  "spec_v": 1,
+  "id": "battery-soc-refuse",
+  "name": "Battery accepts the discharge command but does nothing",
+  "category": "Resource limits (INV-CONVERGE)",
+  "hypothesis": "Under an import cap the hub commands the battery to discharge and cover the load, but the pack's BMS/contactor refuses — it ACKs the setpoint and produces zero power while it still has charge. A hub that assumes the discharge took effect keeps importing over the cap.",
+  "expected": "Detect that battery power never moved despite the command and react — fall back to another lever or post CannotComply. Never assume the commanded discharge happened.",
+  "hold_s": 70,
+  "fix": "Verify measured battery power against the commanded setpoint; on a non-responding pack, escalate / post CannotComply (orchestrator battery adapter). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID battery-soc-refuse).",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 50, "Conn": 1}},
+    {"action": "inject_env", "pv_w": 300, "load_w": 5000},
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "soc_refuse"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": 300, "load_w": 5000}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "soc_refuse", "clear": true}}
+  ],
+  "constraint": {"type": "importCap", "limit_w": 0, "hold_s": 70, "desc": "mayhem: zero import cap, battery refuses to discharge"},
+  "oracle": {"name": "diagnoseConstraint"}
+}

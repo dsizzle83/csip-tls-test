@@ -1,0 +1,24 @@
+{
+  "spec_v": 1,
+  "id": "ramp-limit-curtail",
+  "name": "Inverter honours the limit but ramps to it slowly",
+  "category": "Closed-loop actuation (INV-CONVERGE)",
+  "hypothesis": "An inverter accepts the curtailment instantly (register set) but slews its physical output toward the new ceiling at a bounded rate, sitting over the limit during the ramp before converging. Unlike an ignored write, it DOES reach the limit — just not immediately.",
+  "expected": "Tolerate a bounded convergence ramp: the limit is reached within the device's slew time. Flag DEGRADED only if convergence exceeds the compliance deadline; never a silent FAIL, and never a spurious CannotComply while it is still converging.",
+  "hold_s": 100,
+  "fix": "Distinguish 'converging toward the limit' from 'ignoring the limit' via the measured-output trend; allow a bounded settling window before escalating. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID ramp-limit-curtail). HoldS 100: hub sticky-guard latency + the device's 120 W/s slew need ~75s; leave a clean tail.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 100, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "ramp_limit", "max_ramp_w_per_s": 120}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "ramp_limit", "clear": true}}
+  ],
+  "constraint": {"type": "genLimit", "limit_w": 1000, "hold_s": 100, "desc": "mayhem: gen limit 1 kW vs an inverter that slews to it"},
+  "oracle": {"name": "diagnoseConverge"}
+}

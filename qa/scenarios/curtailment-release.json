@@ -1,0 +1,24 @@
+{
+  "spec_v": 1,
+  "id": "curtailment-release",
+  "name": "Generation-limit event ends — solar must recover",
+  "category": "Recovery (INV-RESTORE)",
+  "hypothesis": "A generation-limit event curtails the inverter, then expires. The hub must actively release the ceiling — the known stuck-curtailment failure leaves an inverter clamped at its last limit after the event clears.",
+  "expected": "When the cap lifts, solar climbs back to its full potential within seconds. It must never be left clamped below potential after the event ends.",
+  "hold_s": 60,
+  "fix": "Restore must SET the ceiling to full nameplate, not emit an empty no-op (solarCommandToControl restore path). NOTE: a true device dropout (Modbus link loss) needs the sim's service stopped via SSH — out of scope for this in-process injector.",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID curtailment-release). suppress_default clears the program-0 default (5 kW export cap) so 'release' means 'unconstrained' — otherwise the hub's correct fallback to the default holds solar under the diagnoseRecovery >=95% bar and fakes a stuck ceiling (see mayhem_world.go's suppressDefault doc comment; QA v5 artifact). HoldS 60: long tail so a slow ramp can be told apart from a true stuck restore. The constraint's own hold_s (15) is the cap's short duration inside the 60 s observation window, released early at tick 15.",
+  "setup": [
+    {"action": "suppress_default"},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "delete_controls", "at_tick": 15, "program": 0}
+  ],
+  "teardown": [
+    {"action": "delete_controls", "program": 0}
+  ],
+  "constraint": {"type": "genLimit", "limit_w": 1500, "hold_s": 15, "desc": "mayhem: gen limit then release"},
+  "oracle": {"name": "diagnoseRecovery"}
+}

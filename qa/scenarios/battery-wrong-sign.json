@@ -1,0 +1,24 @@
+{
+  "spec_v": 1,
+  "id": "battery-wrong-sign",
+  "name": "Battery executes a commanded charge as a discharge",
+  "category": "Resource limits (INV-SOC)",
+  "hypothesis": "A battery wired or firmware-flipped in the wrong direction: when the hub commands a charge to soak up excess PV, the pack discharges instead, walking an already-low state of charge toward empty.",
+  "expected": "Detect the pack moving opposite to the command (SoC falling under a charge command) and halt/alarm before it discharges below the reserve floor.",
+  "hold_s": 90,
+  "fix": "Verify measured battery direction/SoC trend against the commanded sign in the orchestrator battery adapter. (Demonstrates robustness under SIMULATED abuse; the BatteryW sign convention must be confirmed against the live hub /status before trusting the verdict.)",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID battery-wrong-sign). Starts just above the reserve floor so the flipped (discharge) command drives SoC across it within the window, exercising INV-SOC — and the same discharge blows the export cap, exercising INV-CONVERGE.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 10.5, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "wrong_sign"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "wrong_sign", "clear": true}}
+  ],
+  "constraint": {"type": "exportCap", "limit_w": 0, "hold_s": 90, "desc": "mayhem: zero export cap drives a battery charge (flipped to discharge)"},
+  "oracle": {"name": "diagnoseSOC"}
+}
