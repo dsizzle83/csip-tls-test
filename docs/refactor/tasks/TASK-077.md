@@ -1,6 +1,34 @@
 # TASK-077 — Migrate the curated scenario suite to declarative specs
 
-*Status: TODO · Phase: P6 · Effort: L (≈8 h, mechanical but gated) · Difficulty: med · Risk: med*
+*Status: PARTIAL (2026-07-06, `csip-tls-test` `task/077-scenario-migration`, unmerged) · Phase: P6 · Effort: L (≈8 h, mechanical but gated) · Difficulty: med · Risk: med*
+
+**2026-07-06 session note (deadline addendum — batched QA, bench-free lane):**
+Wave 1 done: 24 of the ~63 total scenario entries migrated to
+`qa/scenarios/*.json` (the whole constraint/converge/SOC/disconnect/recovery
+family from `mayhem.go`'s curated list, plus a 4-oracle wave-B batch —
+transport/battery-garbage/reboot/expiry), their Go twins deleted in
+`cmd/dashboard/mayhem.go`, 4 new oracles registered
+(`diagnoseTransport`/`diagnoseBatteryGarbage`/`diagnoseReboot`/
+`diagnoseExpiry`), parity proven per-scenario via unit tests (
+`cmd/dashboard/scenariospec_migration_test.go` — bench-side ×3 live parity
+NOT run this session, see below), `go test ./cmd/dashboard/... -race` green,
+`bin/dashboard` rebuilt (not deployed/restarted — out of this lane).
+**Not done:** `mayhem_world.go` (17 scenarios) and `mqtt_scenarios.go` (8)
+untouched; 14 scenarios remain in `mayhem.go` itself (8 need a `delay_s`
+setup-action vocabulary extension not implemented this session; 3 need a
+per-tick computed-value extension; `ev-connector-flap`/`ev-meter-freeze`/
+`ev-wrong-units` deferred for session-scope discipline, not a gap — see
+`docs/qa-spec-migration.md` for the full retained list + reasons + a
+prioritized next-wave triage). Acceptance criteria NOT fully met this
+session: full migration table covering all ~63 entries (only the 24-entry
+wave is tabled), `mayhem.go` line count only ~17% down (2683/3216, not
+"well under half" — the bulk of the reduction requires the world/mqtt waves
+this session didn't touch), and the live-bench ×3 parity + full FAST
+campaign per wave (task step 5/6) — this session's lane was explicitly
+bench-free (no bench runs, no `csip-dashboard` restart). Full parity of all
+~60 was explicitly NOT required under the deadline addendum; this PARTIAL
+status reflects "a clean, growing, well-documented migration" handed off
+with a concrete, prioritized next-wave plan, not a defect.
 
 ## Objective
 Every curated Mayhem scenario that the TASK-076 vocabulary can express is

@@ -1,4 +1,4 @@
-# Mayhem scenario specs (TASK-076)
+# Mayhem scenario specs (TASK-076/077)
 
 This directory holds **declarative Mayhem scenarios** — JSON files that the
 dashboard's Mayhem engine (`cmd/dashboard/mayhem.go` + `scenariospec.go`)
@@ -29,8 +29,12 @@ diagnoser is.
 Registered so far (see `oracleRegistry` for the authoritative list):
 `diagnoseConstraint`, `diagnoseConverge`, `diagnoseStale`, `diagnoseRecovery`,
 `diagnoseSOC`, `diagnoseDisconnect`, `diagnoseMalform`, `diagnoseSurvival`
-(parameterized: `{"label": "..."}`). TASK-077 registers the rest as it
-migrates each remaining Go scenario family.
+(parameterized: `{"label": "..."}`), and — added in TASK-077's wave-B
+migration — `diagnoseTransport`, `diagnoseBatteryGarbage`, `diagnoseReboot`,
+`diagnoseExpiry`. Still Go-only (no registry entry yet): `diagnoseEVFreeze`,
+`diagnoseEVFlap`, `diagnoseEVUnits`, and every world/mqtt-scenario oracle — a
+future wave registers them as it migrates their scenarios (see
+`docs/qa-spec-migration.md` for the retained-in-Go list and why).
 
 ## Why JSON, not a scripting language
 
@@ -190,12 +194,14 @@ run-loop path, same as a Go scenario's `setup` returning an error).
 If a spec's `"id"` matches an existing Go scenario's ID (or another spec's),
 `loadSpecScenarios` logs a clear error naming the file and the colliding ID,
 and **excludes that one spec** from the run — every other scenario, Go or
-spec, is unaffected. This is why `export-cap-full-battery.json` in this very
-directory does not appear in a live campaign today: its ID intentionally
-matches the still-present Go literal in `mayhem.go` (kept until TASK-077
-deletes it), so every run logs the collision and the Go original keeps
-running the curated suite unchanged. It becomes the live scenario the moment
-077 removes the Go twin — no file change required.
+spec, is unaffected. `export-cap-full-battery.json` was TASK-076's pilot
+example of this: while its Go twin still existed in `mayhem.go`, the spec
+collided on purpose and never ran live. TASK-077 has since deleted that Go
+twin (and 23 others', see `docs/qa-spec-migration.md`) — the spec files now
+run live with no Go collision left to guard against, for exactly the 24
+migrated IDs. The collision guard itself stays essential for every
+still-Go scenario (a typo'd or copy-pasted ID would otherwise silently
+duplicate/shadow one of the ~35 remaining Go literals).
 
 ## Compile-time validation
 
@@ -219,14 +225,20 @@ table of rejected inputs.
 - `python3 scripts/mayhem.py --list` shows each scenario's source
   (`[go]`/`[spec]`) alongside its `[extended]` tag.
 
-## Worked example
+## Worked examples
 
-`export-cap-full-battery.json` in this directory is a JSON twin of the Go
-literal `scenarios()` builds for ID `export-cap-full-battery`
-(`cmd/dashboard/mayhem.go`) — the pilot proving the schema end-to-end.
-`cmd/dashboard/scenariospec_test.go` also carries two more proofs inline
-(not shipped as files, since their IDs would collide with their own still-
-present Go twins the same way): a `post_connect`/`delete_controls` twin of
-`grid-disconnect`, and a `gridsim_admin`-at-tick / parameterized-oracle twin
-of `wan-outage-hold`. Read those three before writing a new spec — between
-them they exercise every verb this task's pilot needed.
+`export-cap-full-battery.json` was TASK-076's pilot (originally a JSON twin
+of a Go literal, run alongside it to prove the schema end-to-end) and is now,
+post-TASK-077, the live scenario — its Go twin is deleted. The other 23 files
+migrated in TASK-077 (`ack-before-effect.json`, `grid-disconnect.json`,
+`conflicting-primacy.json`, `expired-control.json`, etc. — see
+`docs/qa-spec-migration.md` for the full list) are further worked examples,
+each with a parity unit test in `cmd/dashboard/scenariospec_migration_test.go`
+proving it calls the same bench methods/bodies its deleted Go twin did.
+`cmd/dashboard/scenariospec_test.go` also carries two proofs under
+non-colliding synthetic IDs (`spec-grid-disconnect`, `spec-wan-outage-hold`)
+that predate the real migration and remain useful as minimal, focused verb
+proofs: a `post_connect`/`delete_controls` twin, and a `gridsim_admin`-at-tick
+/ parameterized-oracle twin of the still-Go `wan-outage-hold`
+(`mayhem_world.go`). Read those alongside a migrated file before writing a
+new spec — between them they exercise every verb v1 supports.
