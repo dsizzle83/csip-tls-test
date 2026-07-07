@@ -1,6 +1,17 @@
 # TASK-064 — Bench constants → plant-model parameters (identical-behavior proof)
 
-*Status: TODO · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: high · Risk: high*
+*Status: DONE (2026-07-06, `lexa-hub` `task/064-constants-plant` @ `a6334ae`; Stage A `2e6c573` + Stage B `a6334ae`; unmerged, Principal reviews/merges; bench campaign + STOCK spot-check gated at the P5 wave) · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: high · Risk: high*
+
+> **Completion note (2026-07-06).** Two commits (Stage A wire + prove, Stage B
+> burn). Constant→plant swap map + parameter reference table:
+> `docs/refactor/notes/TASK-064-plant-parameters.md`. evSafeCount folded into one
+> shared `EVImportCooldown` (import writes, economics reads). On-cap residual is the
+> irreducible shared-`surplusW` interleaving, confined to the economics
+> `evse-current`/battery axes (compliance solar ceiling proven bit-faithful); see the
+> notes doc + AD-007. socStep kept as explicit `SOCStepPctPerTickOverride` legacy debt
+> (10_BACKLOG). `go test -race ./internal/... ./cmd/hub/...` green; `plantwiring_test.go`
+> is the equivalence + single-owner + on-cap-parity + residual-characterisation proof.
+> NOT done (gated, not blocked): bench FAST campaign, STOCK spot-check, the flip.
 
 ## Objective
 The bench-calibrated globals in the migrated constraint code —

@@ -969,6 +969,46 @@ an economics-local counter so the `battery-empty-import-cap` suspension is
 preserved (HARD invariant); a single owner is a TASK-064 item. **Bench shadow
 campaign gated at the P5 wave** (Principal-run); no flip this task.
 
+**Constants → plant + shared-state owner (TASK-064, 2026-07-06, `lexa-hub`
+`task/064-constants-plant`, two commits, unmerged).** Behaviour-preserving.
+
+- **Stage A (`2e6c573`) — wire.** The six bench-calibrated globals in the export
+  constraint now read the per-device plant model (TASK-057) instead of constants:
+  `filterAlpha 0.4 → MeterPlant.FilterAlpha` (explicit tuned override; the derived
+  `FilterAlphaON = tick/(lag+tick)` yields 0.375 for the bench, documented but not
+  activated — preserve-first), `socTaperStart 80 → BatteryPlant.SOCTaperStartPct`,
+  `battConvergeFrac 0.5 → BatteryPlant.ConvergeFrac`, `maxDropW 1500/maxRiseW 500 per
+  tick → InverterPlant.MaxRampDown/UpWPerS × TickSeconds`. **socStep decision:** the
+  legacy `socStepEstimate 1.0 %/tick` is a DELIBERATE conservative overestimate (the
+  physically-derived value ≈0.42 %/tick errs the taper handoff LATE). Per the task's
+  common-mistakes rule it is NOT silently "fixed" — it is an explicit
+  `BatteryPlant.SOCStepPctPerTickOverride` (default 1.0, marked legacy debt 05 §6);
+  the derived formula is backlogged (10_BACKLOG). Bench-plant `hub.json` carries the
+  explicit values so behaviour is identical FIRST.
+- **evSafeCount single owner.** The two copies TASK-063 flagged (import-session +
+  economics-local) fold into ONE shared `EVImportCooldown`: the import constraint
+  (compliance tier) is the sole WRITER, economics READS it. Closes the seed/increment
+  edge (legacy seeds-then-increments to seed+1 on a compliant arrival; the shared
+  counter now reproduces that exactly and economics can no longer disagree with it).
+- **Stage B (`a6334ae`) — burn.** The six constants deleted; a field-absent plant
+  falls back to `plantmodel.WithDefaults()` (same numbers), documented so a field
+  unit without a plant block keeps bench behaviour. Breach-tick thresholds stay
+  constants (compliance-latency policy, NOT plant physics — the D6 boundary).
+- **Residual (honest).** The on-cap shared-`surplusW` interleaving is IRREDUCIBLE in
+  a layered design: the cascade absorbs surplus into the battery BETWEEN its economic
+  rules, so a below-compliance economics layer sizing from raw state differs on
+  cap-active ticks. Characterised, not forced to bit-match: proof
+  (`plantwiring_test.go`) shows the compliance **solar ceiling is bit-faithful to the
+  cascade tick-for-tick on-cap**, and the residual is confined to the economics
+  **`evse-current` / battery** axes (EV budget sized from pre-interleave surplus).
+  Closing it fully would require running compliance BETWEEN economics — which defeats
+  the layering — so it is documented rather than contorted; it disappears at the flip
+  when there is no cascade to shadow. STOCK note: the ramp is now per-second physical
+  (bit-identical at the FAST 3 s tick, cadence-correct and thus intentionally
+  different from the legacy per-tick constant at the 15 s STOCK tick) — the §13
+  STOCK spot-check at the wave gate covers it. Bench campaign Principal-run at the
+  P5 wave; no flip, no deploy this task.
+
 ## AD-008 🔶 Security: broker ACLs now, API token+TLS now, OCPP profile 2 at P6
 
 **Decision.** Per-service Mosquitto credentials + topic ACLs (config
