@@ -73,13 +73,28 @@ shadow**; M5 (P6) has most implementables merged. ~70 of 82 tasks done.
 - **076 scenarios-as-data engine: DONE** (spec_v:1 JSON + compiler + oracle
   registry; scenarios addable WITHOUT a Go rebuild — this is your tool for
   adding QA cheaply). 077 migrates the ~60 Go scenarios to specs (next).
-- **063 economic-layer isolation: NOT STARTED** — wire the constraints into
-  the shadow stack, move TOU/self-consumption BELOW constraints, add EV
-  emission + the RecordCommands call site (062's handoff), close the
-  wrong-direction ≤1-tick gap. Follow the 060/061/062 pattern. SHADOW.
-- **064 constants→plant: NOT STARTED** — replace the bench-calibrated
-  optimizer constants with 057's plant-model params; MUST reproduce
-  identical bench behavior first (shadow diff ≈0), THEN the constants die.
+- **063 economic-layer isolation: DONE + MERGED.** Full constraint stack
+  (safety+compliance+economics) now runs in the SHADOW wrapper; economics
+  are PointDemand proposals clamped under compliance by a STRUCTURAL arbiter
+  tier-fold (fixed a real 058 bug: economics could override a compliance cap
+  via global-min). Golden full-stack shadow parity = 0 divergence OFF-CAP.
+  Closed 062's ≤1-tick safety lag (post-arbitration safety). ON-CAP
+  divergence characterized in `docs/refactor/notes/TASK-063-seam-review.md`
+  → owned by 064. SHADOW (legacy cascade still authoritative).
+- **064 constants→plant: DONE + MERGED.** Bench constants → 057 plant-model
+  params (identical bench behavior; `docs/refactor/notes/TASK-064-plant-
+  parameters.md` has the swap map). evSafeCount now has ONE owner
+  (EVImportCooldown). Off-cap 0 divergence, compliance ceiling bit-faithful
+  on-cap; the residual (economics EV-current axis) is irreducible in a
+  layered design and vanishes at the flip. **STOCK caveat:** the inverter
+  ramp is now per-wall-second (bit-identical at FAST 3s, cadence-correct at
+  STOCK 15s) — needs a STOCK spot-check at the flip gate.
+
+**R4 CONSTRAINT CONTROLLER: architecturally COMPLETE in shadow (058–064).**
+Safety+compliance+economics reproduce the live cascade at 0/bit-faithful
+divergence. What remains is ONLY the soak-gated flip + 065 (multi-device)
++ 066 (delete cascade). The god-file (`optimizer.go` ~2289 lines) stays
+LIVE until the flip — that release-checklist box is correctly still OPEN.
 - **065 multi-device: NOT STARTED** — 2nd sim instance (modsim/evsim on a
   free port), breach-list + per-device sessions, nameplate-share split.
 - **077 scenario migration: NOT STARTED** — express the ~60 Go scenarios as
