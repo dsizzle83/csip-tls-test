@@ -15,6 +15,17 @@ promote by giving an item a TASK number and a row in 04.*
 ## Control & optimization
 - **Plant-model discovery:** commissioning-time probe (step a setpoint,
   measure ramp/lag/taper) to auto-fill what TASK-057 configures by hand.
+- **Derived socStep (retire the `SOCStepPctPerTickOverride` legacy debt).**
+  TASK-064 kept the legacy `socStepEstimate = 1.0 %/tick` as an explicit
+  `BatteryPlant.SOCStepPctPerTickOverride` (preserve-first — the derived value
+  ≈0.42 %/tick for the bench pack is a real behaviour change the identical-behaviour
+  task forbade). Physically it is `MaxChargeW × tickSeconds ÷ (CapacityKWh × 36000)`
+  from live `BatteryMetrics` + `BatteryPlant.CapacityKWh` + the engine cadence. After
+  real-pack calibration (or the discovery probe above), compute it from the pack
+  energy and DROP the override so the SOC-taper handoff tracks the real pack instead
+  of the 20×-demo overestimate. Debt marker lives on the field (05 §6); the export
+  constraint reads `bp.SOCStepPctPerTickOverride` — swap that one read for the derived
+  formula and re-run the golden on-cap parity. Behaviour change → needs its own soak.
 - **Volt-var / volt-watt closed-loop CSIP curve dispatch** — de-scoped for
   V1.0 by AD-010 (2026-07-06, TASK-080; survey:
   `docs/refactor/adr-inputs/curve-functions-survey.md`). `derbase` write
