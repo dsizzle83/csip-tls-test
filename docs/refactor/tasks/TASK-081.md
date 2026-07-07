@@ -1,6 +1,6 @@
 # TASK-081 — V1.0 release-gate execution (checklist, conformance evidence, campaigns)
 
-*Status: TODO · Phase: P6 · Effort: L (≈8 h active + multi-day gate wall-clock) · Difficulty: med · Risk: low*
+*Status: RC-GATE WALKED (2026-07-06, `task/081-release-gate`) — checklist filled (27/48 boxes, 13/22 ◆ with live evidence on frozen `lexa-hub@c730302`/`csip-tls-test@695da02`); FAST campaign + OCPP SP2 + conformance + new-scenario triage done (`docs/QA_REPORT_V1RC_20260706.md`). NOT the final tag: 10-cycle FAST/STOCK, 30-day soak, golden fixtures, field pilot, P5 god-file, and FINDINGS A–D remain — Principal reviews/merges/tags. · Phase: P6 · Effort: L · Difficulty: med · Risk: low*
 
 ## Objective
 `09_RELEASE_CHECKLIST.md` is walked box by box on the release-candidate

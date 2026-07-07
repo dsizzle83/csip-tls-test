@@ -32,3 +32,31 @@ today — the column keeps the discipline for when it isn't).*
 - Phase boundary: walk every Open row; close with evidence links; add new.
 - After any SEV-worthy bench incident: add a row + a Mayhem scenario (the
   existing culture, now written down).
+
+### P6 / V1.0-RC boundary walk (2026-07-06, TASK-081)
+
+Frozen build `lexa-hub@c730302` / `csip-tls-test@695da02`. Full walk deferred
+to the tag; status of the rows this gate touched (evidence:
+`docs/QA_REPORT_V1RC_20260706.md`):
+
+- **RSK-01/03** (guard-migration / optimizer-split regression): FAST campaign
+  0 unexplained FAIL, all historically-failing scenarios green, no new DEGRADED
+  signature — control not regressed by the mega-merge. Shadow stays; P5
+  flips + 10-cycle STOCK still gate the close.
+- **RSK-05** (stale retained control after unclean death): `corrupted-retained-control`
+  PASS, but **`power-cut-retained-rollback` FAIL** — the unclean SIGKILL causes a
+  ~40 s export breach on rollback *and* trips `lexa-api`'s start-limit
+  (**FINDING A**, unit-file bug `StartLimitIntervalSec` in `[Service]`). Row
+  stays **Open**; recovery documented; fix + re-run before tag.
+- **RSK-06** (local clock step): `local-clock-step-forward/back` PASS solo —
+  `utilitytime` monotonic anchoring holds on hardware. Mitigation evidenced.
+- **RSK-07** (cert rotation churn): mechanism live (expiry OK, probe-then-commit
+  merged); 24 h churn soak still pending — unchanged "mitigation implemented,
+  soak pending".
+- **RSK-08** (watchdog flaps): live wedge test restarted a service at t≈57 s;
+  no false flaps observed — mitigation evidenced, row stays Open pending soak.
+- **RSK-13** (new-scenario flake): `export-dither-at-breach` (054) FAIL is a real
+  leaky-counter finding (**FINDING B**), not flake — same class as `control-churn`,
+  routed to TASK-064 (not oracle-tuned; 06 §4.5 honored).
+- **RSK-16** (sim self-confirmation): conformance green (CSIP 3/3, Modbus
+  19/22/9) is necessary-not-sufficient — golden fixtures (075) still open.
