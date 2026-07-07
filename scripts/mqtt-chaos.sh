@@ -27,8 +27,9 @@
 set -uo pipefail
 
 CMD="${1:?usage: mqtt-chaos.sh deploy|restore|status [hub-ip] [ssh-user]}"
-HUB="${2:-69.0.0.1}"
-SSHUSER="${3:-dmitri}"
+# ConnectCore 93 dev-kit hub (Yocto, root@) — pass 69.0.0.1 dmitri for the legacy Pi hub.
+HUB="${2:-69.0.0.2}"
+SSHUSER="${3:-root}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICES=(lexa-modbus lexa-ocpp lexa-api lexa-northbound lexa-telemetry lexa-hub)
 
@@ -57,14 +58,21 @@ if [[ ! -s "$PASSFILE" ]]; then
   echo "  generated $PASSFILE (0600)"
 fi
 QA_PASS="$(cat "$PASSFILE")"
-if [[ -s "$PASSWD_FILE" ]]; then
-  mosquitto_passwd -b "$PASSWD_FILE" qa-inject "$QA_PASS"
+# The Yocto dev-kit hub has no mosquitto_passwd and runs the broker with
+# allow_anonymous true (see lexa-hub/DEVKIT.md) — credentials are then
+# accepted without a passwd entry, so skipping this is safe there.
+if command -v mosquitto_passwd >/dev/null 2>&1; then
+  if [[ -s "$PASSWD_FILE" ]]; then
+    mosquitto_passwd -b "$PASSWD_FILE" qa-inject "$QA_PASS"
+  else
+    mosquitto_passwd -b -c "$PASSWD_FILE" qa-inject "$QA_PASS"
+  fi
+  chown root:mosquitto "$PASSWD_FILE" 2>/dev/null || true
+  chmod 640 "$PASSWD_FILE"
+  echo "  qa-inject broker user provisioned in $PASSWD_FILE (ACL grant lives in lexa-hub's systemd/mosquitto-lexa.acl)"
 else
-  mosquitto_passwd -b -c "$PASSWD_FILE" qa-inject "$QA_PASS"
+  echo "  mosquitto_passwd not present (anonymous broker) — skipping qa-inject passwd entry"
 fi
-chown root:mosquitto "$PASSWD_FILE" 2>/dev/null || true
-chmod 640 "$PASSWD_FILE"
-echo "  qa-inject broker user provisioned in $PASSWD_FILE (ACL grant lives in lexa-hub's systemd/mosquitto-lexa.acl)"
 
 install -m 755 /tmp/mqttproxy /usr/local/sbin/mqttproxy
 install -m 644 /tmp/mqttproxy.service /etc/systemd/system/mqttproxy.service

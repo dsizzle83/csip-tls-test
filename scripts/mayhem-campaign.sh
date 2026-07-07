@@ -57,8 +57,9 @@ MODE=""
 CYCLES=10
 DASHBOARD="http://localhost:8080"
 ONLY=""
-HUB_IP="69.0.0.1"
-SSH_USER="dmitri"
+# ConnectCore 93 dev-kit hub (Yocto, root@) — use --hub-ip/--ssh-user for the legacy Pi hub.
+HUB_IP="69.0.0.2"
+SSH_USER="root"
 
 usage() {
   cat >&2 <<'EOF'

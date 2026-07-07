@@ -1,21 +1,36 @@
-# Live demo bench (updated 2026-06-12)
+# Live demo bench (updated 2026-07-07 — hub migrated to the ConnectCore 93 dev kit)
 
 Flat air-gapped LAN `69.0.0.x/24`. Desktop interface `enp1s0` (static 69.0.0.20,
 NM profile "Wired connection 1", never-default); internet stays on WiFi `wlp2s0`.
-SSH user is **`dmitri@` everywhere** (not `pi@`); key auth from this desktop works.
+SSH user is **`dmitri@` on the desktop and sim Pis, `root@` on the dev-kit hub**;
+key auth from this desktop works everywhere.
 
 | Node | IP | Runs | Service model |
 |---|---|---|---|
 | desktop | 69.0.0.20 | gridsim `bin/server` (mTLS :11111, admin :11112), dashboard :8080 | transient user units `csip-gridsim`, `csip-dashboard` (NOT boot-persistent) |
-| hub-pi `dhpi4` | 69.0.0.1 | all six lexa services + distro mosquitto | root systemd units; **passwordless sudo** (only node with it) |
+| **hub dev kit** `ccimx93-dvk` | 69.0.0.2 | all six lexa services + cross-built mosquitto (no-TLS, anonymous) + mqttproxy | root systemd units; login `root@` (Digi Yocto — no sudo binary; a `/usr/bin/sudo` shim strips sudo flags so unmodified bench scripts work) |
+| hub-pi `dhpi4` | 69.0.0.1 | **STANDBY** — lexa services + mqttproxy stopped AND disabled 2026-07-07 (distro mosquitto still runs, harmless). Re-activate: `sudo systemctl enable --now lexa-{hub,modbus,ocpp,api,northbound,telemetry} mqttproxy` | root systemd units; **passwordless sudo** |
 | solar-pi | 69.0.0.10 | modsim (Modbus 5020, simapi 6020) | user systemd unit + linger |
 | battery-pi | 69.0.0.11 | batsim (5021/6021) | user systemd unit + linger |
-| meter-pi `pi5-gridsim` | 69.0.0.12 | metersim linked mode, `-hub-api 69.0.0.1:9100` (5022/6022), `-hub-token-file ~/.config/lexa/hub-api.token` | user systemd unit + linger |
-| ev-pi | 69.0.0.14 | evsim `-csms ws://69.0.0.1:8887/ocpp` (simapi 6024) — `wss://` + Basic Auth once OCPP Security Profile 2 is enabled, see below (TASK-074) | user systemd unit + linger |
+| meter-pi `pi5-gridsim` | 69.0.0.12 | metersim linked mode, `-hub-api 69.0.0.2:9100` (5022/6022), `-hub-token-file ~/.config/lexa/hub-api.token` | user systemd unit + linger |
+| ev-pi | 69.0.0.14 | evsim `-csms ws://69.0.0.2:8887/ocpp` (simapi 6024) — `wss://` + Basic Auth once OCPP Security Profile 2 is enabled, see below (TASK-074) | user systemd unit + linger |
 
-ConnectCore 93 dev kit (69.0.0.2) is **offline/unused**; the hub moved to 69.0.0.1.
-evsim/metersim/dashboard all point at 69.0.0.1 — repoint when the dev kit returns
-(runbook: `lexa-hub/DEVKIT.md`).
+The hub moved from hub-pi (69.0.0.1) to the ConnectCore 93 dev kit (69.0.0.2,
+i.MX 93, Digi Embedded Yocto) on 2026-07-07 — bring-up/deploy runbook:
+`lexa-hub/DEVKIT.md`. evsim/metersim/dashboard and the bench scripts
+(`bench-up.sh`, `update-sim-pis.sh`, `mayhem-campaign.sh`, `mqtt-chaos.sh`,
+`netem.sh`) all default to 69.0.0.2/root now; each takes env/flag overrides
+(`HUB_IP`/`HUB_SSH_USER`, `--hub-ip/--ssh-user`, args) to drive the legacy Pi
+hub. The dashboard is started with `LEXA_SSH_USER=root` (bench-up.sh) so the
+Mayhem engine SSHes to the hub as root.
+
+**Dev-kit hub caveats (vs the Pi):** its DEY kernel has `CONFIG_NET_SCH_NETEM`
+unset and no `tc` binary, so the three `netem-*` Mayhem scenarios report
+INCONCLUSIVE when targeting the hub (kernel rebuild required to fix); the
+broker is a cross-built no-TLS mosquitto with `allow_anonymous true` (no
+mosquitto_passwd on Yocto — services still send their credentials, the broker
+accepts them; the Pi's passwd+ACL hardening does not apply there); `scp` to it
+works (dropbear).
 
 ### netem packet-chaos harness (TASK-052 / GAP-11)
 
@@ -48,11 +63,11 @@ first Mayhem faults to touch the actual wire instead of only the application lay
 
 Every lexa service serves Prometheus text exposition; bench configs bind
 `metrics_addr` to the LAN IP (AD-008 — the product default stays 127.0.0.1):
-`lexa-hub 69.0.0.1:9101 · lexa-northbound :9102 · lexa-modbus :9103 ·
+`lexa-hub 69.0.0.2:9101 · lexa-northbound :9102 · lexa-modbus :9103 ·
 lexa-ocpp :9104 · lexa-telemetry :9105 · lexa-api :9100/metrics` (existing
 `:9100` listener, new route — no separate port). Scrape from the desktop with
 `scripts/prometheus-bench.yml` (see file header for the one-line podman/native
-prometheus run command); quick check: `curl 69.0.0.1:910N/metrics | grep lexa_up`.
+prometheus run command); quick check: `curl 69.0.0.2:910N/metrics | grep lexa_up`.
 
 **Deploy gotcha (same class as the STOCK-timing reset):** `deploy-hub-pi.sh`
 overwrites `/etc/lexa/*.json` from the repo's `configs/`, which resets four
@@ -75,7 +90,13 @@ desktop units do NOT survive reboot — everything else on the bench does.
 
 ## Deploy
 
-- Hub (all six lexa services): `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.1 dmitri`
+- Hub (all six lexa services) on the **dev kit**: manual root@ scp path per
+  `lexa-hub/DEVKIT.md` (`deploy-hub-pi.sh` is Debian/sudo/lexa-user only and does
+  NOT run against Yocto). The 2026-07-07 migration installed the exact binaries
+  the Pi was running (desktop `lexa-hub/bin/arm64/`), the Pi's live `/etc/lexa`
+  configs with `metrics_addr` rewritten to 69.0.0.2, units with `User=lexa`
+  stripped, plus cross-built mosquitto and mqttproxy.
+- Legacy Pi hub: `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.1 dmitri`
   (needs `make build-arm64` in lexa-hub first; stages client certs from this repo's `certs/client-staging/`).
 - Sims: `bash scripts/update-sim-pis.sh <hub-ip> dmitri` — auto-detects each Pi's layout
   (user unit in `~/.config/systemd/user/<sim>.service`, or legacy root unit in

@@ -46,6 +46,10 @@ OCPP_AUTH_USER="evse-bench" # must match lexa-hub scripts/deploy-hub-pi.sh's OCP
 HUB="${1:?usage: update-sim-pis.sh <hub-ip> [ssh-user] [--enable-ocpp-sp2]}"
 shift
 SSHUSER="dmitri"
+# The hub node's SSH user is separate from the sim Pis': the ConnectCore 93
+# dev-kit hub (Yocto) is root@, the sim Pis stay dmitri@. Override with
+# HUB_SSH_USER=dmitri for the legacy Pi hub.
+HUBUSER="${HUB_SSH_USER:-root}"
 ENABLE_SP2=0
 for arg in "$@"; do
   case "$arg" in
@@ -72,7 +76,7 @@ for ip in 69.0.0.10 69.0.0.11 69.0.0.12 69.0.0.14; do
 
   if [[ "$s" == metersim ]]; then
     echo "   relaying hub API token (if any) to $ip:~/.config/lexa/hub-api.token"
-    ssh "$SSHUSER@$HUB" 'sudo cat /etc/lexa/api.token 2>/dev/null || true' | \
+    ssh "$HUBUSER@$HUB" 'sudo cat /etc/lexa/api.token 2>/dev/null || true' | \
       ssh "$SSHUSER@$ip" 'mkdir -p ~/.config/lexa && umask 077 && cat > ~/.config/lexa/hub-api.token'
   fi
 
@@ -80,7 +84,7 @@ for ip in 69.0.0.10 69.0.0.11 69.0.0.12 69.0.0.14; do
     echo "   staging OCPP CA cert + relaying Basic Auth secret to $ip"
     scp -q "$HERE/certs/ca-cert.pem" "$SSHUSER@$ip:/tmp/ocpp-ca.pem.new"
     ssh "$SSHUSER@$ip" 'mkdir -p ~/.config/lexa && install -m 644 /tmp/ocpp-ca.pem.new ~/.config/lexa/ocpp-ca.pem && rm /tmp/ocpp-ca.pem.new'
-    ssh "$SSHUSER@$HUB" 'sudo cat /etc/lexa/ocpp-auth.pass 2>/dev/null || true' | \
+    ssh "$HUBUSER@$HUB" 'sudo cat /etc/lexa/ocpp-auth.pass 2>/dev/null || true' | \
       ssh "$SSHUSER@$ip" 'mkdir -p ~/.config/lexa && umask 077 && cat > ~/.config/lexa/ocpp-auth.pass'
   fi
 

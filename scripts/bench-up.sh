@@ -31,7 +31,10 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 MODE="fast"; [[ "${1:-}" == "--stock" ]] && MODE="stock"
 
-HUB=69.0.0.1; SOLAR=69.0.0.10; BAT=69.0.0.11; MTR=69.0.0.12; EV=69.0.0.14
+# Hub = ConnectCore 93 dev kit (Yocto, root@ — see lexa-hub/DEVKIT.md).
+# Override for the legacy Pi hub with: HUB_IP=69.0.0.1 HUB_SSH_USER=dmitri
+HUB="${HUB_IP:-69.0.0.2}"; HUBUSER="${HUB_SSH_USER:-root}"
+SOLAR=69.0.0.10; BAT=69.0.0.11; MTR=69.0.0.12; EV=69.0.0.14
 ok(){ printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad(){ printf '  \033[31m✗\033[0m %s\n' "$1"; }
 hr(){ printf '\n── %s\n' "$1"; }
@@ -39,7 +42,7 @@ hr(){ printf '\n── %s\n' "$1"; }
 # ── stock-only shortcut ─────────────────────────────────────────────────────
 if [[ "$MODE" == "stock" ]]; then
   echo "Restoring stock hub timing (post-replay)…"
-  bash "$REPO/scripts/hub-replay-tune.sh" stock "$HUB" dmitri
+  bash "$REPO/scripts/hub-replay-tune.sh" stock "$HUB" "$HUBUSER"
   exit $?
 fi
 
@@ -83,7 +86,7 @@ start_unit(){  # name, cmd...
 # behavior) — never fatal to bench-up.
 HUB_TOKEN_FILE="$HOME/.config/lexa/hub-api.token"
 mkdir -p "$(dirname "$HUB_TOKEN_FILE")"
-if ( umask 077; ssh -o ConnectTimeout=5 dmitri@$HUB 'sudo cat /etc/lexa/api.token 2>/dev/null || true' > "$HUB_TOKEN_FILE" 2>/dev/null ); then
+if ( umask 077; ssh -o ConnectTimeout=5 $HUBUSER@$HUB 'sudo cat /etc/lexa/api.token 2>/dev/null || true' > "$HUB_TOKEN_FILE" 2>/dev/null ); then
   if [[ -s "$HUB_TOKEN_FILE" ]]; then
     ok "hub API token relayed → $HUB_TOKEN_FILE (dashboard will present it)"
   else
@@ -95,7 +98,11 @@ else
 fi
 
 start_unit csip-gridsim   "$REPO/bin/server" -ca certs/ca-cert.pem -cert certs/server-cert.pem -key certs/vault/server-key.pem
-start_unit csip-dashboard "$REPO/bin/dashboard" -addr :8080 -hub http://$HUB:9100 \
+# --setenv is consumed by systemd-run (option parsing stops at the binary path):
+# LEXA_SSH_USER tells the mayhem engine how to SSH into the hub node.
+start_unit csip-dashboard --setenv=LEXA_SSH_USER="$HUBUSER" \
+  "$REPO/bin/dashboard" -addr :8080 -hub http://$HUB:9100 \
+  -mqttproxy http://$HUB:11882 \
   -gridsim http://localhost:11112 -solar http://$SOLAR:6020 -battery http://$BAT:6021 \
   -meter http://$MTR:6022 -ev http://$EV:6024 -hub-token-file "$HUB_TOKEN_FILE"
 sleep 3
@@ -124,7 +131,7 @@ probe "ev sim"        http://$EV:6024/state
 
 # ── 4. hub replay-fast timing ───────────────────────────────────────────────
 hr "Hub timing"
-bash "$REPO/scripts/hub-replay-tune.sh" fast "$HUB" dmitri 2>&1 | sed 's/^/  /'
+bash "$REPO/scripts/hub-replay-tune.sh" fast "$HUB" "$HUBUSER" 2>&1 | sed 's/^/  /'
 
 cat <<EOF
 

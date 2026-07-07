@@ -27,7 +27,7 @@ func main() {
 	battery := flag.String("battery", "http://localhost:6021", "battery simapi address")
 	meter := flag.String("meter", "http://localhost:6022", "meter simapi address")
 	ev := flag.String("ev", "http://localhost:6024", "EV charger simapi address")
-	mqttproxy := flag.String("mqttproxy", "http://69.0.0.1:11882", "MQTT fault-proxy control API (mayhem chaos)")
+	mqttproxy := flag.String("mqttproxy", "http://69.0.0.2:11882", "MQTT fault-proxy control API (mayhem chaos)")
 	scenarioDir := flag.String("scenario-dir", "qa/scenarios", "TASK-076: directory of *.json Mayhem scenario specs, re-read on every run (empty = specs disabled)")
 	hubTokenFile := flag.String("hub-token-file", "", "path to lexa-api's bearer token (TASK-014, AD-008); empty = no auth presented, today's behavior")
 	flag.Parse()

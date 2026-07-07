@@ -66,7 +66,7 @@
 set -uo pipefail
 
 DESKTOP_IP="69.0.0.20"
-HUB_IP="69.0.0.1"
+HUB_IP="69.0.0.2"   # ConnectCore 93 dev-kit hub (lexa-hub/DEVKIT.md)
 DEFAULT_SIM_PEER="69.0.0.10" # solar-pi; any provisioned sim Pi works as the hub's peer
 SSHUSER="${NETEM_SSH_USER:-dmitri}"
 

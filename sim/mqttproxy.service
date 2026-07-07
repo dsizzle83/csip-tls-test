@@ -15,7 +15,7 @@ Type=simple
 # broker still allows anonymous (staged rollout); required once the hub's
 # ACL flips allow_anonymous off, or every mqtt-malformed-control/
 # mqtt-stale-retained scenario goes BLIND.
-ExecStart=/usr/local/sbin/mqttproxy -listen 127.0.0.1:1882 -upstream 127.0.0.1:1883 -control 69.0.0.1:11882 -user qa-inject -passfile /etc/lexa/mqtt/qa-inject.pass
+ExecStart=/usr/local/sbin/mqttproxy -listen 127.0.0.1:1882 -upstream 127.0.0.1:1883 -control 69.0.0.2:11882 -user qa-inject -passfile /etc/lexa/mqtt/qa-inject.pass
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
