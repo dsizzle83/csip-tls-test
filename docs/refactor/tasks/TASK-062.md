@@ -1,6 +1,6 @@
 # TASK-062 — Per-constraint session structs: consolidate remaining guard state
 
-*Status: TODO · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: high · Risk: high*
+*Status: DONE (2026-07-06, merged) —*
 
 ## Objective
 Every remaining piece of inter-tick state on `DefaultOptimizer` is either

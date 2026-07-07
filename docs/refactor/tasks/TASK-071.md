@@ -1,6 +1,6 @@
 # TASK-071 — Honor server-advertised poll intervals; conditional walk
 
-*Status: TODO · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-06, merged) —*
 
 ## Objective
 The northbound walker honors the server-advertised `pollRate` attributes
