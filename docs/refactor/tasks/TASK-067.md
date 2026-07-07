@@ -1,6 +1,36 @@
 # TASK-067 — Engine state consolidation: one state struct, single writer (R7 rest)
 
-*Status: TODO · Phase: P5 · Effort: M (≈4–6 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-06, lexa-hub 6317a8d) · Phase: P5 · Effort: M (≈4–6 h) · Difficulty: med · Risk: med*
+
+> Done 2026-07-06 on lexa-hub branch `task/067-engine-consolidation` (commit 6317a8d,
+> not pushed/merged). All four remaining engine mutexes collapsed into one `engineState`
+> struct (`internal/orchestrator/engine_state.go`) with a single designated writer per
+> field + lock-free `atomic.Pointer` snapshot reads; `grep -c "sync.RWMutex\|sync.Mutex"
+> engine.go` = 0 (only `stopOnce sync.Once` remains, unrelated). `csipMu` confirmed
+> already gone (TASK-012). Before→after lock map:
+> - `actuMu` (RWMutex) → DELETED. Actuator registries are plain maps, immutable after
+>   `Start()`; `RegisterBattery/Solar/EVSEActuator` panic if called post-Start (init-time
+>   impossibility, 05 §3), so `executePlan` reads them lock-free.
+> - `planInMu` (RWMutex) → `engineState.planIn atomic.Pointer[plannerInput]`, written only
+>   on the control goroutine via `engineCmd`s drained from a bounded `cmdCh` (cap 16,
+>   drop-and-count). `SetDERConstraints`/`SetPrices` now ENQUEUE (async, ≤1-tick latency,
+>   never block an MQTT callback); read by `replan()` via atomic load.
+> - `dailyPlanMu` (RWMutex) → `engineState.dailyPlan atomic.Pointer[DailyPlan]`; planner
+>   goroutine (`replan`) is sole writer, control goroutine (`tick`) reads (chose option (b),
+>   dedicated atomic pointer — no plan-adoption delay).
+> - `planMu` (RWMutex) → `engineState.lastPlan atomic.Pointer[Plan]`; `LastPlan()` is a
+>   lock-free load.
+> Closure sweep: no remaining closure-held control-path state in engine.go or cmd/hub's
+> tick/observer path (`activeBreachMRID`/`dedupeResets` already promoted to the named
+> `breachEpisodes` component in cmd/hub/breach.go by TASK-031/032; verified by grep).
+> `Wake()`/`urgentWake` and the ADR-0001 Tier-1 fast safety loop (`EvaluateSafety`/
+> `safetyTick`) preserved exactly — safety tick never touches `cmdCh`. `engine_test.go`
+> UNCHANGED (empty diff vs origin/main) and green under `-race` (run ×5); new
+> `engine_concurrency_test.go` adds command-ordering, mid-tick-drain, and race-hammer
+> tests. `make test` (`go test -race ./internal/...`) green; `go test -race ./...`,
+> `go vet ./...`, `go build ./...` all green. Bench/Mayhem campaign BATCHED at the wave
+> gate per the deadline addendum (radioactive zone, code+test only this session). Awaiting
+> review/merge.
 
 ## Objective
 `Engine`'s five mutex-guarded state groups collapse into ONE state struct
