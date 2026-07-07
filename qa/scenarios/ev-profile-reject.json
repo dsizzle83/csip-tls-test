@@ -1,0 +1,27 @@
+{
+  "spec_v": 1,
+  "id": "ev-profile-reject",
+  "name": "Charger rejects the hub's current-limit profile",
+  "category": "OCPP smart charging (INV-CONVERGE)",
+  "hypothesis": "Under an import cap with an empty battery (so the EV is the only lever) the hub sends a SetChargingProfile to dial the EV down, but the charger rejects smart charging and keeps drawing at full current. A hub that ignores the Rejected status keeps importing over the cap.",
+  "expected": "Treat the rejected profile as a failure and react — pause the session, use another lever, or post CannotComply. Never assume the EV load dropped.",
+  "hold_s": 70,
+  "fix": "The OCPP bridge returns an error on a rejected/timed-out SetChargingProfile (2026-06 fix); the optimizer must act on it, not just log. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID ev-profile-reject).",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 5, "Conn": 1}},
+    {"action": "sim_post", "target": "ev", "path": "/inject", "body": {"action": "set_soc", "soc_pct": 30}},
+    {"action": "sim_post", "target": "ev", "path": "/inject", "body": {"action": "start_session", "connector_id": 1}},
+    {"action": "inject_env", "pv_w": 300, "load_w": 500},
+    {"action": "sim_post", "target": "ev", "path": "/fault", "body": {"kind": "profile_reject"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": 300, "load_w": 500}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "ev", "path": "/fault", "body": {"kind": "profile_reject", "clear": true}},
+    {"action": "sim_post", "target": "ev", "path": "/inject", "body": {"action": "stop_session", "connector_id": 1}}
+  ],
+  "constraint": {"type": "importCap", "limit_w": 0, "hold_s": 70, "desc": "mayhem: zero import cap, charger rejects EV curtailment"},
+  "oracle": {"name": "diagnoseConstraint"}
+}

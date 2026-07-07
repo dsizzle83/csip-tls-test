@@ -1,0 +1,24 @@
+{
+  "spec_v": 1,
+  "id": "battery-charge-disabled",
+  "name": "Battery refuses to charge away excess solar",
+  "category": "Resource limits (INV-CONVERGE)",
+  "hypothesis": "Under a zero-export cap at full sun the hub commands the battery to CHARGE and soak up the excess PV — but the pack's charge contactor is disabled and it ACKs the setpoint while absorbing nothing. A hub that assumes the battery is absorbing keeps exporting over the cap instead of falling back to curtailing the inverter.",
+  "expected": "Detect that the battery is not actually charging and fall back to its other lever — curtail the inverter — to hold the export cap (or post CannotComply). Never assume the commanded charge happened.",
+  "hold_s": 70,
+  "fix": "Verify measured battery power against the commanded charge; when the pack does not absorb, curtail solar to hold the cap (orchestrator lever fallback). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID battery-charge-disabled).",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 50, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "charge_disabled"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "charge_disabled", "clear": true}}
+  ],
+  "constraint": {"type": "exportCap", "limit_w": 0, "hold_s": 70, "desc": "mayhem: zero export cap, battery refuses to charge"},
+  "oracle": {"name": "diagnoseConstraint"}
+}

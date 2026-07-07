@@ -1,0 +1,27 @@
+{
+  "spec_v": 1,
+  "id": "ev-delayed-obey",
+  "name": "Charger ACKs the current-limit profile but obeys it late",
+  "category": "OCPP smart charging (INV-CONVERGE)",
+  "hypothesis": "Under an import cap with an empty battery, the hub sends a SetChargingProfile and the charger returns Accepted — but applies the new limit only ~20 s later. The OCPP response says success immediately, so a hub that trusts the ACK believes the EV dialled down while it keeps drawing full for the lag window, importing over the cap.",
+  "expected": "Verify the EV actually curtailed against the measured draw, not the ACK; tolerate the lag and converge once the limit lands (or admit it). The breach must resolve, not stand.",
+  "hold_s": 80,
+  "fix": "Confirm the commanded EV current against measured draw/MeterValues over a convergence deadline rather than trusting the SetChargingProfile ACK (lexa-ocpp / orchestrator verify). (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID ev-delayed-obey). SoC 12%: just above the 10% reserve floor — a near-empty non-lever, but no INV-SOC noise. Cap set ABOVE the EV's 6 A minimum draw (~1.6 kW net) so the hub can actually meet it by dialing the EV down — full EV draw breaches it, and curtailing the EV (once the 20 s-late profile lands) brings import back under, so the breach RESOLVES rather than being a forced CannotComply. Isolates 'tolerate the lag and converge' from the min-current floor. The fault's delay_s:20 is a body param the ev sim interprets itself (device-side apply lag), not a setup-phase delay.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 12, "Conn": 1}},
+    {"action": "sim_post", "target": "ev", "path": "/inject", "body": {"action": "set_soc", "soc_pct": 30}},
+    {"action": "sim_post", "target": "ev", "path": "/inject", "body": {"action": "start_session", "connector_id": 1}},
+    {"action": "inject_env", "pv_w": 300, "load_w": 500},
+    {"action": "sim_post", "target": "ev", "path": "/fault", "body": {"kind": "apply_delayed", "delay_s": 20}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": 300, "load_w": 500}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "ev", "path": "/fault", "body": {"kind": "apply_delayed", "clear": true}},
+    {"action": "sim_post", "target": "ev", "path": "/inject", "body": {"action": "stop_session", "connector_id": 1}}
+  ],
+  "constraint": {"type": "importCap", "limit_w": 2000, "hold_s": 80, "desc": "mayhem: 2000 W import cap, charger obeys the profile 20 s late"},
+  "oracle": {"name": "diagnoseConstraint"}
+}

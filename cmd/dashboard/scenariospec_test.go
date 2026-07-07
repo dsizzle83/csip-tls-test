@@ -720,13 +720,20 @@ func TestScenarios_SpecDirEmpty_GoSetUnaffected(t *testing.T) {
 // TestScenarios_LoadsNonCollidingSpecAndTagsSource proves the plumbing
 // end-to-end: a spec dropped in -scenario-dir with a non-colliding ID shows
 // up in scenarios() (and so in /api/qa/scenarios) tagged source="spec", while
-// the pilot's own ID (which DOES collide with its still-present Go twin)
-// is rejected loudly and excluded — exactly the "specs load per run, colliding
-// spec never shadows silently" behaviour the task requires.
+// a spec deliberately colliding with a still-Go scenario's ID is rejected
+// loudly and excluded — exactly the "specs load per run, colliding spec
+// never shadows silently" behaviour the task requires.
+//
+// "perfect-storm" is the collision fixture: 076 used export-cap-full-battery
+// itself for this demo, but 077 migrated it (deleted its Go twin, per
+// docs/qa-spec-migration.md), so the fixture ID has to be one of the
+// scenarios 077 deliberately left as a Go literal (see the retained list) —
+// perfect-storm's own hypothesis/expected text is irrelevant here; only its
+// ID and its Go-ness matter.
 func TestScenarios_LoadsNonCollidingSpecAndTagsSource(t *testing.T) {
 	dir := t.TempDir()
 	writeSpecFile(t, dir, "colliding-pilot.json", strings.Replace(
-		mustReadPilot(t), `"id": "export-cap-full-battery"`, `"id": "export-cap-full-battery"`, 1)) // same ID as the Go twin, on purpose
+		mustReadPilot(t), `"id": "export-cap-full-battery"`, `"id": "perfect-storm"`, 1)) // same ID as a still-Go scenario, on purpose
 	writeSpecFile(t, dir, "new-one.json", strings.Replace(wanOutageHoldSpecJSON, `"id": "spec-wan-outage-hold"`, `"id": "brand-new-spec-scenario"`, 1))
 
 	d := newMayhemDriver(map[string]string{})
@@ -736,7 +743,7 @@ func TestScenarios_LoadsNonCollidingSpecAndTagsSource(t *testing.T) {
 	var goTwinCount, specCount int
 	var sawNew bool
 	for _, s := range scs {
-		if s.ID == "export-cap-full-battery" {
+		if s.ID == "perfect-storm" {
 			goTwinCount++
 			if s.Source == "spec" {
 				t.Error("the colliding spec must not have won over the Go twin")
@@ -751,7 +758,7 @@ func TestScenarios_LoadsNonCollidingSpecAndTagsSource(t *testing.T) {
 		}
 	}
 	if goTwinCount != 1 {
-		t.Errorf("export-cap-full-battery appeared %d times, want exactly 1 (the Go twin; the colliding spec must be excluded)", goTwinCount)
+		t.Errorf("perfect-storm appeared %d times, want exactly 1 (the Go twin; the colliding spec must be excluded)", goTwinCount)
 	}
 	if !sawNew || specCount != 1 {
 		t.Errorf("expected exactly one brand-new-spec-scenario tagged source=spec, sawNew=%v count=%d", sawNew, specCount)
@@ -792,12 +799,12 @@ func TestHandleScenarios_SourceTag(t *testing.T) {
 		if s.ID == "http-tagged-spec" {
 			sawSpec = s.Source == "spec"
 		}
-		if s.ID == "export-cap-full-battery" {
+		if s.ID == "perfect-storm" { // still a Go literal post-TASK-077 (see qa-spec-migration.md retained list)
 			sawGo = s.Source == "go"
 		}
 	}
 	if !sawGo {
-		t.Error(`expected the Go "export-cap-full-battery" scenario tagged source="go"`)
+		t.Error(`expected the Go "perfect-storm" scenario tagged source="go"`)
 	}
 	if !sawSpec {
 		t.Error(`expected "http-tagged-spec" tagged source="spec"`)

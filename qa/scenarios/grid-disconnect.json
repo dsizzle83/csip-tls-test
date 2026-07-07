@@ -1,0 +1,23 @@
+{
+  "spec_v": 1,
+  "id": "grid-disconnect",
+  "name": "Cease-to-energize: grid commands a disconnect",
+  "category": "Grid safety (INV-CONNECT)",
+  "hypothesis": "The utility commands an immediate disconnect (opModConnect=false) while the inverter is exporting at full sun and the battery could discharge. Every controllable DER must stop feeding the grid within seconds — back-feeding a line the utility believes is dead is the most dangerous failure there is.",
+  "expected": "Drive solar output and battery discharge to ~0 within the reaction window and hold there for the whole disconnect. No DER may keep energizing the grid.",
+  "hold_s": 45,
+  "fix": "On an opModConnect=false control, command all DERs to cease energizing and verify measured output reaches ~0 (orchestrator connect handling).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID grid-disconnect). See scenariospec_test.go's spec-grid-disconnect for the original compiler proof of post_connect/delete_controls (kept as a general verb-coverage test under a distinct ID; this file is the real, live scenario).",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 70, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "delete_controls", "program": 0}
+  ],
+  "constraint": {"type": "connect", "connect": false, "hold_s": 45, "desc": "mayhem: cease-to-energize disconnect"},
+  "oracle": {"name": "diagnoseDisconnect"}
+}

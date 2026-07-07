@@ -1,0 +1,20 @@
+{
+  "spec_v": 1,
+  "id": "battery-empty-import-cap",
+  "name": "Import cap at peak with an empty battery",
+  "category": "Resource limits (INV-SOC)",
+  "hypothesis": "Utility caps import to 0 W during peak while load exceeds PV and the battery is empty — there is no physical way to avoid importing.",
+  "expected": "Discharge the battery to the extent possible, then post CannotComply for the unavoidable remainder. The failure must be admitted, not hidden.",
+  "hold_s": 90,
+  "fix": "Ensure the optimizer emits CannotComply when the reserve floor blocks compliance (battery at SOC min).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID battery-empty-import-cap). No teardown in the Go twin.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 5, "Conn": 1}},
+    {"action": "inject_env", "pv_w": 300, "load_w": 5000}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": 300, "load_w": 5000}
+  ],
+  "constraint": {"type": "importCap", "limit_w": 0, "hold_s": 90, "desc": "mayhem: zero import cap, empty battery"},
+  "oracle": {"name": "diagnoseConstraint"}
+}

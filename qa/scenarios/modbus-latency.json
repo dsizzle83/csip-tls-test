@@ -1,0 +1,22 @@
+{
+  "spec_v": 1,
+  "id": "modbus-latency",
+  "name": "Inverter responds slowly (800 ms/read)",
+  "category": "Modbus transport (INV-TRANSPORT)",
+  "hypothesis": "The inverter answers every read after an 800 ms delay — a congested or struggling device. An unbounded read blocks the hub's control loop.",
+  "expected": "Bound the read with a timeout and stale-expire the reading; never let a slow device block the optimizer.",
+  "hold_s": 35,
+  "fix": "Bound every Modbus read with a timeout; on timeout mark the device stale (lexa-modbus).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID modbus-latency).",
+  "setup": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "latency", "latency_ms": 800}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "latency", "clear": true}}
+  ],
+  "oracle": {"name": "diagnoseTransport"}
+}

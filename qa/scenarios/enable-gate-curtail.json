@@ -1,0 +1,24 @@
+{
+  "spec_v": 1,
+  "id": "enable-gate-curtail",
+  "name": "Inverter echoes the limit but never enables it",
+  "category": "Closed-loop actuation (INV-CONVERGE)",
+  "hypothesis": "An inverter accepts the WMaxLimPct write and echoes the curtailment value on readback, but its enable flag stays off so the limit is never enforced — output holds at full potential. A hub that 'verifies' by reading the register back is fooled into reporting compliance.",
+  "expected": "Detect via MEASURED output (not register readback) that the limit never took effect and react (post CannotComply, or use another lever) — never trust the echoed value.",
+  "hold_s": 50,
+  "fix": "Bench shows the hub CATCHES this (it flags the cleared enable flag and posts CannotComply → DEGRADED) but is BLIND to reject-write-curtail under an identical breach (→ FAIL). Verification keys off the enable flag, not the limit value or measured output — complete it so both accept-but-ignore variants are caught. (Demonstrates robustness under SIMULATED abuse, not field-readiness.)",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID enable-gate-curtail).",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 100, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "enable_gate"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "enable_gate", "clear": true}}
+  ],
+  "constraint": {"type": "genLimit", "limit_w": 1000, "hold_s": 50, "desc": "mayhem: gen limit 1 kW vs an inverter that echoes but never enables it"},
+  "oracle": {"name": "diagnoseConverge"}
+}

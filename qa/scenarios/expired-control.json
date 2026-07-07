@@ -1,0 +1,20 @@
+{
+  "spec_v": 1,
+  "id": "expired-control",
+  "name": "Hub keeps enforcing a DERControl past its expiry",
+  "category": "CSIP scheduling (INV-EXPIRED)",
+  "hypothesis": "The grid server issues a short export-cap DERControl that expires mid-window. Past validUntil (+grace) the control is dead and the hub must release it. A hub that keeps enforcing an expired control needlessly curtails the inverter forever — lost generation the utility never asked for.",
+  "expected": "Drop the control at validUntil + grace: stop adopting it and let the inverter recover. Never enforce a DERControl past its expiry.",
+  "hold_s": 90,
+  "fix": "Expire a DERControl at validUntil (+grace) and release its setpoint (csip scheduler Evaluate / orchestrator).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID expired-control). Short-lived export cap: validUntil ~= +30 s, so it expires ~30 s into the 90 s window and the +grace boundary (~60 s) leaves a clear tail to catch a hub that keeps enforcing it. Uses post_control directly (not the constraint sugar) so the author-declared typ/lim_w land on the resulting activeConstraint exactly as the Go twin's `&activeConstraint{Typ: \"exportCap\", LimW: 0, MRID: mrid}` does.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 55, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "post_control", "typ": "exportCap", "lim_w": 0, "body": {"program": 0, "duration_s": 30, "activate": true, "description": "mayhem: short-lived export cap that must expire", "exp_lim_W": 0}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "oracle": {"name": "diagnoseExpiry"}
+}

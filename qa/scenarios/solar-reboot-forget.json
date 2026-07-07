@@ -1,0 +1,21 @@
+{
+  "spec_v": 1,
+  "id": "solar-reboot-forget",
+  "name": "Inverter reboots mid-curtailment and forgets the limit",
+  "category": "Grid compliance (INV-EXPORT)",
+  "hypothesis": "The hub has curtailed the inverter to hold a zero-export cap, then the inverter reboots and comes back at 100% WMaxLimPct — it forgot the limit and snaps to full output, blowing the cap. A hub that writes the limit once (on adoption) and never re-asserts it leaves the breach standing.",
+  "expected": "Re-assert the limit after the inverter forgets it: detect the output jump via measurement and re-curtail within a cycle. Periodic idempotent control, not write-once.",
+  "hold_s": 70,
+  "fix": "Re-send the active DER limit every control cycle (idempotent), not only on change; verify measured output against the commanded limit (orchestrator inverter adapter).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID solar-reboot-forget). No teardown action: resetForScenario (run-loop machinery) uncurtails the inverter, matching the Go twin's empty teardown closure.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 55, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "solar", "path": "/inject", "at_tick": 25, "body": {"WMaxLimPct_pct": 100}}
+  ],
+  "constraint": {"type": "exportCap", "limit_w": 0, "hold_s": 70, "desc": "mayhem: zero export cap, inverter reboots and forgets curtailment"},
+  "oracle": {"name": "diagnoseConstraint"}
+}

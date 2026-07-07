@@ -1,0 +1,22 @@
+{
+  "spec_v": 1,
+  "id": "modbus-exception",
+  "name": "Inverter returns a Modbus exception on every read",
+  "category": "Modbus transport (INV-TRANSPORT)",
+  "hypothesis": "The inverter answers every read with a Modbus exception (server device failure). The hub must treat the error as device-down — never act on a missing reading.",
+  "expected": "Mark the device down/stale and fail safe; never report a fabricated value or block the control loop.",
+  "hold_s": 35,
+  "fix": "On a Modbus exception, mark the device down and stale-expire its reading (lexa-modbus).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID modbus-exception).",
+  "setup": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "exception_code"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "exception_code", "clear": true}}
+  ],
+  "oracle": {"name": "diagnoseTransport"}
+}

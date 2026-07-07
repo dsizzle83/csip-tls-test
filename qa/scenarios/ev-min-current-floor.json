@@ -1,0 +1,27 @@
+{
+  "spec_v": 1,
+  "id": "ev-min-current-floor",
+  "name": "Charger cannot throttle below its 6 A minimum",
+  "category": "OCPP smart charging (INV-CONVERGE)",
+  "hypothesis": "A tight import cap needs the EV below its 6 A OCPP minimum, but the charger floors there — modulation alone cannot satisfy the cap. The only way to comply is to PAUSE the session (drop to 0 A). A hub that just keeps lowering the current limit, or trusts the floored draw as compliant, stays over the cap forever.",
+  "expected": "Recognise that modulation hit the floor and escalate: suspend/stop the transaction to reach 0 A, or post CannotComply. Do not sit at the 6 A floor over the cap.",
+  "hold_s": 70,
+  "fix": "When the commanded EV current is below the charger minimum and the cap is still breached, suspend the transaction (TransactionEvent/RequestStopTransaction) rather than holding the floor (orchestrator EV lever / lexa-ocpp).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID ev-min-current-floor). 800 W cap: even the 6 A floor (~1.4 kW) plus base load leaves net import over the cap, so the hub must pause the session to comply.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 5, "Conn": 1}},
+    {"action": "sim_post", "target": "ev", "path": "/inject", "body": {"action": "set_soc", "soc_pct": 30}},
+    {"action": "sim_post", "target": "ev", "path": "/inject", "body": {"action": "start_session", "connector_id": 1}},
+    {"action": "inject_env", "pv_w": 300, "load_w": 500},
+    {"action": "sim_post", "target": "ev", "path": "/fault", "body": {"kind": "min_current_floor", "amps_a": 6}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": 300, "load_w": 500}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "ev", "path": "/fault", "body": {"kind": "min_current_floor", "clear": true}},
+    {"action": "sim_post", "target": "ev", "path": "/inject", "body": {"action": "stop_session", "connector_id": 1}}
+  ],
+  "constraint": {"type": "importCap", "limit_w": 800, "hold_s": 70, "desc": "mayhem: 800 W import cap below the charger's 6 A floor"},
+  "oracle": {"name": "diagnoseConstraint"}
+}

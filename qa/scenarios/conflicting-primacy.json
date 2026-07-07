@@ -1,0 +1,25 @@
+{
+  "spec_v": 1,
+  "id": "conflicting-primacy",
+  "name": "Higher-primacy control must win",
+  "category": "CSIP scheduling (primacy)",
+  "hypothesis": "Two export-cap controls are active at once — a permissive 5000 W cap at LOW primacy (program 2 = primacy 10) and a strict 0 W cap at HIGH primacy (program 0 = primacy 1). The hub must enforce the higher-primacy 0 W cap, not the permissive one.",
+  "expected": "Adopt the highest-primacy active control (exportCap 0 W) and hold export there; a lower-primacy permissive cap must never override it.",
+  "hold_s": 70,
+  "fix": "Scheduler primacy: lower primacy number wins (program 0 beats program 2). Verify adoption picks the highest-priority active control, not the most recent or most permissive.",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID conflicting-primacy). Posts TWO constraint-producing actions directly in setup (no top-level 'constraint' sugar) — the low-primacy permissive cap first, then the high-primacy strict cap that must win; the run loop judges against the LAST constraint action's result, exactly mirroring the Go twin's `return d.postCapProg(...)` for program 0.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 100, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "post_cap_prog", "program": 2, "typ": "exportCap", "lim_w": 5000, "hold_s": 70, "desc": "mayhem: low-primacy 5kW export cap"},
+    {"action": "post_cap_prog", "program": 0, "typ": "exportCap", "lim_w": 0, "hold_s": 70, "desc": "mayhem: high-primacy 0W export cap"}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "delete_controls", "program": 0},
+    {"action": "delete_controls", "program": 2}
+  ],
+  "oracle": {"name": "diagnoseConstraint"}
+}

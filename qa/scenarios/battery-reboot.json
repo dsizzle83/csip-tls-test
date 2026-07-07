@@ -1,0 +1,24 @@
+{
+  "spec_v": 1,
+  "id": "battery-reboot",
+  "name": "Battery drops off the bus mid-control, then reboots",
+  "category": "Device dropout (INV-TRANSPORT)",
+  "hypothesis": "The battery stops answering Modbus (a watchdog reboot / lost link) for ~20 s while the hub is leaning on it, then comes back. A hub that hangs on the dead device, crashes, or treats the missing/garbage reads as a real SoC/power, mismanages the whole site; on recovery it must re-establish a sane reading.",
+  "expected": "Ride out the outage: stay up, mark the pack down/stale, never report an impossible SoC or power, and recover a live reading once it returns.",
+  "hold_s": 50,
+  "fix": "Bound battery reads with a timeout, mark the pack down on error and stale-expire its SoC, and re-read cleanly on reconnect (lexa-modbus battery adapter).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID battery-reboot). No constraint (Go twin returns activeConstraint{Typ:\"none\"}). at_tick 20 clears the fault (~20 s in, the pack reboots and answers the bus again); teardown also clears defensively in case the run aborts before tick 20, matching the Go twin's teardown doing the same clear unconditionally.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 60, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "exception_code"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "battery", "path": "/fault", "at_tick": 20, "body": {"kind": "exception_code", "clear": true}}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "battery", "path": "/fault", "body": {"kind": "exception_code", "clear": true}}
+  ],
+  "oracle": {"name": "diagnoseReboot"}
+}

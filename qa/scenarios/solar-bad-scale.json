@@ -1,0 +1,22 @@
+{
+  "spec_v": 1,
+  "id": "solar-bad-scale",
+  "name": "Inverter serves a corrupted power scale factor",
+  "category": "Modbus transport (INV-TRANSPORT)",
+  "hypothesis": "The inverter's W_SF (SunSpec power scale factor) register reads one power of ten too high while the raw power register is unchanged, so a hub that applies the scale factor computes ~10× the real output (e.g. 48 kW for a 4.8 kW inverter). A hub that trusts it optimises against fabricated generation.",
+  "expected": "Recognise a physically-impossible scaled reading (well over nameplate) and reject/clamp it; never act on a 10× generation value.",
+  "hold_s": 35,
+  "fix": "Sanity-check decoded SunSpec power against the inverter nameplate; treat an out-of-range scaled value as suspect (lexa-modbus / sunspec — audit GS-1/MTR-1).",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID solar-bad-scale).",
+  "setup": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "bad_scale"}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "bad_scale", "clear": true}}
+  ],
+  "oracle": {"name": "diagnoseTransport"}
+}

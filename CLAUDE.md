@@ -117,19 +117,29 @@ Ctrl-C/error) — FAST is the bench's resting state. STOCK campaigns are release
 unless they reveal a safety-invariant regression (INV-SOC/INV-CONNECT/INV-EXPORT/
 INV-EXPIRED). Findings + fix log: `docs/QA_TRIAGE_20260624.md`, `docs/QA_FINDINGS.md`;
 blind-spot review: `docs/QA_GAPS_20260701.md`.
-**Scenarios-as-data (TASK-076):** `qa/scenarios/*.json` scenario specs
+**Scenarios-as-data (TASK-076/077):** `qa/scenarios/*.json` scenario specs
 (`cmd/dashboard/scenariospec.go`) compile into the same `mayScenario` the Go
-literals above build, but `-scenario-dir` (default `qa/scenarios`, `main.go`)
-is re-read fresh on **every** `POST /api/qa/start` — add or edit a spec file
-with no `go build`/dashboard restart, closing the trap that produced the
-2026-07-03 stale-`bin/dashboard` incident. Boundary: **oracles are code,
-scenarios are data** — the `diagnose*` funcs stay Go, registered by name in
+literals in `mayhem.go`/`mayhem_world.go`/`mqtt_scenarios.go` build, but
+`-scenario-dir` (default `qa/scenarios`, `main.go`) is re-read fresh on
+**every** `POST /api/qa/start` — add or edit a spec file with no `go
+build`/dashboard restart, closing the trap that produced the 2026-07-03
+stale-`bin/dashboard` incident. Boundary: **oracles are code, scenarios are
+data** — the `diagnose*` funcs stay Go, registered by name in
 `oracleRegistry`; a spec only selects one + params and supplies
 setup/per_tick/teardown steps from a fixed action vocabulary (no
 conditionals/loops — a scenario needing real logic stays a Go literal). A
 spec ID colliding with a Go scenario's is a load-time error, logged and
 skipped, never a silent shadow. `scripts/mayhem.py --list` tags each
-scenario `[go]`/`[spec]`. See `qa/scenarios/README.md` for the schema.
+scenario `[go]`/`[spec]`. TASK-077 migrated the first 24 scenarios (the
+constraint/converge/SOC/disconnect/recovery family plus the transport/
+battery-garbage/reboot/expiry family — all straightforwardly-expressible in
+the v1 vocabulary) to `qa/scenarios/*.json` and deleted their Go twins; ~35
+remain Go literals (malformed-resource delayed-fault family, per-tick
+computed-value scenarios like `clock-jitter`/`stale-meter`/`perfect-storm`,
+`ev-connector-flap`'s alternating status, all of `mayhem_world.go`/
+`mqtt_scenarios.go`, and the `matrix.go` generator) — see
+`docs/qa-spec-migration.md` for the full table + retained-in-Go reasons.
+See `qa/scenarios/README.md` for the schema.
 
 ## Bench replay (hardware-in-the-loop cost sim)
 Dashboard "3-Month Cost Sim" tab: synthetic 92-day sweep (browser worker) plus **Bench

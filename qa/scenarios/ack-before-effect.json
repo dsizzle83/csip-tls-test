@@ -1,0 +1,24 @@
+{
+  "spec_v": 1,
+  "id": "ack-before-effect",
+  "name": "Inverter ACKs curtailment but lags 45 s",
+  "category": "Closed-loop actuation (INV-CONVERGE)",
+  "hypothesis": "A real inverter accepts the SetPoint over Modbus (ACK) but its output ramps slowly — the hub believes the limit is in force before it is.",
+  "expected": "Detect that measured output has not reached the commanded limit and react (hold the battery, or post CannotComply) instead of trusting the write ACK.",
+  "hold_s": 90,
+  "fix": "Add measured-effect verification to derbase.ApplyControl; today it is write-only.",
+  "notes": "TASK-077: migrated from the Go literal in cmd/dashboard/mayhem.go scenarios() (ID ack-before-effect). 90 s, not 50: the fault itself lasts 45 s, and the hub needs discovery latency + genBreachTicks of sustained measurement before it may honestly post CannotComply. At 50 s the verdict was a coin flip on discovery timing (QA 2026-07-01: 3/10 FAILs were the race, not a hub defect); 90 s judges the detection, not the stopwatch.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 100, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250},
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "ack_before_effect", "delay_s": 45}}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "teardown": [
+    {"action": "sim_post", "target": "solar", "path": "/fault", "body": {"kind": "ack_before_effect", "clear": true}}
+  ],
+  "constraint": {"type": "genLimit", "limit_w": 1000, "hold_s": 90, "desc": "mayhem: gen limit 1 kW vs lagging inverter"},
+  "oracle": {"name": "diagnoseConverge"}
+}
