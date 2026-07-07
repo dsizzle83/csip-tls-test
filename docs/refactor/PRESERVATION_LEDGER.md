@@ -310,3 +310,20 @@ FAST + battery/solar/evse reconciler-active, mqttproxy :1882 intact.
 
 Rollback reality (post-032): `git revert <commit>` + redeploy, per mechanism —
 the config-flip rollback ended with this deletion.
+
+## P5 economic-layer ledger (TASK-063)
+
+*The economic rules move to `EconomicsConstraint` (TierEconomics) in SHADOW; the
+legacy cascade stays authoritative. Status `shadow` = economics observing, diffed
+by the TASK-059 Wrapper, not actuated. These preserve the economic behaviours the
+task's "Things that must NOT change" names. Gate = the P5 wave shadow campaign
+(Principal-run) + the unit/mutation tests cited.*
+
+| # | Legacy behaviour (`optimizer.go` @2026-07-06) | Originating scenario / rule | Behaviour that must survive | Reproduced by | Gate | Status |
+|---|---|---|---|---|---|---|
+| E1 | Plan-following suppresses the reactive rules (`planFollowed` gate, `:317`) and is itself suppressed under CSIP `OpModFixedW` (`:292`) | design precedence (Rule 2 > 2.5 > 4/5) | Under a followed plan, self-consumption/TOU/EV-alloc do NOT also fire; under fixed dispatch, plan-following does not fire | `EconomicsConstraint` internal precedence (ecoPlan committed-device tracking) | `TestEconomics_PlanFollowingSetsBatteryAndEVAndSuppressesReactive`, `_FixedDispatchDischargesAndSuppressesPlan` + P5 shadow | **shadow** |
+| E2 | EV import-cooldown suspension (`evImportSuppressed`, `:356`; `evSafeCount`) | `battery-empty-import-cap` | EV stays suspended for N compliant ticks after an import-limit event; seeded satisfied on cap arrival while already compliant | economics-local `evSafeCount` (`EconomicsSession.updateEVCooldown`) — single owner is TASK-064 | `TestEconomics_EVSuppressedDuringImportCooldown` + `battery-empty-import-cap` (P5 wave) | **shadow** |
+| E3 | TOU uses SERVER time via ClockOffset (`serverNow = ServerNowAt(now, ClockOffset)`, `:326`) | `clock-jitter` / `clock-jump-forward` (TOU leg) | TOU peak detection follows server time, not local wall clock; verbatim `ServerNowAt` arithmetic, no clock read | `applyTOU` uses `utilitytime.ServerNowAt(st.Timestamp, st.ClockOffset)` | `TestEconomics_TOUPeakDischarges` / `_TOUOffPeakNoDischarge` + `clock-jitter` (P5 wave) | **shadow** |
+| E4 | TOU discharge capped by export headroom (`dischargeCapW`, `:335-348`) | export-cap overshoot avoidance | A peak discharge never pushes export past an active export cap before the next-tick correction | `applyTOU` ports `dischargeCapW`; arbiter also clamps under the export ceiling | `TestEconomics_TOUDischargeCappedByExportHeadroom`, `_TOUDischargeClampedByImportCapInStack` | **shadow** |
+| E5 | CSIP fixed dispatch is a TARGET (Rule 2, above plan, below disconnect); limit rules still constrain its result (`:284-294` comment) | CSIP §12.3 precedence | Fixed dispatch is economics-tier input clamped by the compliance caps, NOT itself a compliance limit | `EconomicsConstraint` highest internal precedence; arbiter clamps | AD-007 (063 note) argument + `_FixedDispatchDischargesAndSuppressesPlan` | **shadow** |
+| E6 | Cease-to-energize early-return before any economic rule (`:266-268`) | CSIP disconnect > everything | Economics proposes NOTHING under `OpModConnect=false` | `EconomicsConstraint.Evaluate` early-return | `TestEconomics_DisconnectEmitsNoProposals` | **shadow** |
