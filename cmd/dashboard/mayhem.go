@@ -167,6 +167,12 @@ type mayhemDriver struct {
 	// inverter's reported potential unreachable, falsely tripping the
 	// curtailment-detection and recovery oracles.
 	pvHighW float64
+
+	// scenarioDir is where scenarios() looks for *.json scenario specs
+	// (TASK-076, -scenario-dir in main.go). Empty ⇒ specs disabled — the
+	// zero value for every test driver built via newMayhemDriver(backends),
+	// so existing tests are unaffected; main.go sets it explicitly.
+	scenarioDir string
 }
 
 func newMayhemDriver(backends map[string]string) *mayhemDriver {
@@ -194,6 +200,18 @@ type mayScenario struct {
 	Expected   string
 	HoldS      int
 	Fix        string
+
+	// Source tags where the scenario came from — "" (zero value, rendered as
+	// "go") for every hand-written literal below, "spec" for one compiled
+	// from a qa/scenarios/*.json file by scenariospec.go (TASK-076).
+	// handleScenarios/mayhem.py --list surface it so a campaign report shows
+	// which scenarios can be edited without a rebuild.
+	Source string
+
+	// ExpectedVerdicts documents the "expected-FAIL pins the gap" pattern
+	// (06_TESTING_STRATEGY.md §4.5) for a spec-sourced scenario — informational
+	// only, not enforced by the run loop. Always nil for a Go literal.
+	ExpectedVerdicts []string
 
 	// Extended marks a long-running scenario (HoldS in the minutes, not
 	// seconds — RSK-12) that the default/full run excludes to protect
@@ -332,14 +350,19 @@ func (d *mayhemDriver) handleScenarios(w http.ResponseWriter, r *http.Request) {
 		Hypothesis string `json:"hypothesis"`
 		Expected   string `json:"expected"`
 		Extended   bool   `json:"extended"` // long-running (GAP-08 dither); excluded from a default run unless --only or include_extended
+		Source     string `json:"source"`   // "go" or "spec" (TASK-076) — spec scenarios can be added/edited with no dashboard rebuild
 	}
 	scs := d.scenarios()
 	out := make([]scenarioInfo, 0, len(scs))
 	for _, sc := range scs {
+		src := sc.Source
+		if src == "" {
+			src = "go"
+		}
 		out = append(out, scenarioInfo{
 			ID: sc.ID, Name: sc.Name, Category: sc.Category,
 			Hypothesis: sc.Hypothesis, Expected: sc.Expected,
-			Extended: sc.Extended,
+			Extended: sc.Extended, Source: src,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -3168,5 +3191,26 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 	}
 	sc = append(sc, d.mqttScenarios()...)
 	sc = append(sc, d.worldScenarios()...)
+
+	// TASK-076: scenarios-as-data. scenarios() runs fresh on every call —
+	// handleStart calls it at REQUEST time, never once at process start — so
+	// a spec file added or edited under d.scenarioDir takes effect on the
+	// very next run with NO dashboard rebuild and NO csip-dashboard restart.
+	// That is the fix for the 2026-07-03 stale-bin/dashboard incident (D8):
+	// there is nothing left to forget to rebuild for a scenario-only change.
+	//
+	// An ID collision with a Go scenario above (or between two spec files) is
+	// a load error, logged loudly here, and that ONE spec is skipped — it
+	// must never silently shadow the Go twin, and it must never take the rest
+	// of a run down (see loadSpecScenarios).
+	existing := make(map[string]bool, len(sc))
+	for _, s := range sc {
+		existing[s.ID] = true
+	}
+	specs, errs := d.loadSpecScenarios(d.scenarioDir, existing)
+	for _, e := range errs {
+		log.Printf("mayhem: scenario spec load error: %v", e)
+	}
+	sc = append(sc, specs...)
 	return sc
 }

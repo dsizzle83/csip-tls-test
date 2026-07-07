@@ -142,6 +142,17 @@ slew-converging (DEGRADED) / wrong-direction (FAIL) / ceased-to-energize (PASS).
   randomized sequence drawn from the same curated cell templates with random jitter
   and ±25 % hold perturbation. The seed is reported back (and written into the
   report), so any failure is replayable byte-for-byte with `--chaos --seed N`.
+- **Scenarios-as-data (TASK-076)** — the curated suite above is hand-written Go
+  literals (`scenarios()`), which means adding or tweaking one needs a
+  `go build -o bin/dashboard ./cmd/dashboard` + dashboard restart — the trap
+  that burned the 2026-07-03 stale-binary incident. `qa/scenarios/*.json`
+  scenario specs (`cmd/dashboard/scenariospec.go`) compile into the exact same
+  `mayScenario` the run loop executes, but load **fresh on every run** — no
+  rebuild, no restart. Oracles (the `diagnose*` funcs / INV-* invariants
+  above) stay Go, registered by name; only the scenario's setup/perTick/
+  teardown steps and which oracle+params judge it are data. See
+  `qa/scenarios/README.md` for the schema and action vocabulary, and
+  `scripts/mayhem.py --list`, which tags each scenario `[go]` or `[spec]`.
 
 ---
 

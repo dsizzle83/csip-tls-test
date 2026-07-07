@@ -28,6 +28,7 @@ func main() {
 	meter := flag.String("meter", "http://localhost:6022", "meter simapi address")
 	ev := flag.String("ev", "http://localhost:6024", "EV charger simapi address")
 	mqttproxy := flag.String("mqttproxy", "http://69.0.0.1:11882", "MQTT fault-proxy control API (mayhem chaos)")
+	scenarioDir := flag.String("scenario-dir", "qa/scenarios", "TASK-076: directory of *.json Mayhem scenario specs, re-read on every run (empty = specs disabled)")
 	hubTokenFile := flag.String("hub-token-file", "", "path to lexa-api's bearer token (TASK-014, AD-008); empty = no auth presented, today's behavior")
 	flag.Parse()
 
@@ -97,6 +98,9 @@ func main() {
 		"ev":        *ev,
 		"mqttproxy": *mqttproxy,
 	})
+	// TASK-076: specs load fresh on every run (scenarios() reads the dir at
+	// request time, not here) — see scenariospec.go and qa/scenarios/README.md.
+	mayhem.scenarioDir = *scenarioDir
 	mux.HandleFunc("/api/qa/start", mayhem.handleStart)
 	mux.HandleFunc("/api/qa/status", mayhem.handleStatus)
 	mux.HandleFunc("/api/qa/scenarios", mayhem.handleScenarios)

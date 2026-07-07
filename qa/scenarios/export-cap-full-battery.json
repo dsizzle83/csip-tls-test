@@ -1,0 +1,21 @@
+{
+  "spec_v": 1,
+  "id": "export-cap-full-battery",
+  "name": "Zero-export cap, full sun, battery full",
+  "category": "Grid compliance (INV-EXPORT)",
+  "hypothesis": "Utility commands zero export during a sunny low-load midday while the home battery is already full — the hub's only lever is to curtail PV to ~0.",
+  "expected": "Hold net export at ~0 W by curtailing solar. If it physically cannot, post CannotComply — never silently export over the cap.",
+  "hold_s": 100,
+  "fix": "Optimizer must curtail PV when the battery cannot absorb; verify the curtail command reaches the inverter.",
+  "notes": "TASK-076 pilot: a JSON twin of the Go literal in cmd/dashboard/mayhem.go scenarios() (ID export-cap-full-battery, mayhem.go:~2370). The Go original stays authoritative and keeps running the curated FAST/STOCK campaigns until TASK-077 deletes it; this file exists to prove the scenario-spec engine (scenariospec.go) reproduces its behaviour (see cmd/dashboard/scenariospec_test.go, TestCompileSpec_ExportCapFullBattery_MatchesGoTwin). Because its id intentionally collides with the still-present Go scenario, scenarios() logs a load error and excludes THIS file from every real run (see README 'Why this file never runs in a live campaign yet') — that is correct, documented behaviour, not a bug. It becomes the live scenario only when 077 deletes the Go twin.",
+  "setup": [
+    {"action": "sim_post", "target": "battery", "path": "/inject", "body": {"SoC_pct": 100, "Conn": 1}},
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "per_tick": [
+    {"action": "inject_env", "pv_w": "high", "load_w": 250}
+  ],
+  "constraint": {"type": "exportCap", "limit_w": 0, "hold_s": 100, "desc": "mayhem: zero export cap"},
+  "oracle": {"name": "diagnoseConstraint"},
+  "expected_verdicts": ["PASS", "DEGRADED"]
+}
