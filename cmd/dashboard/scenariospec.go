@@ -216,18 +216,24 @@ type oracleEntry struct {
 }
 
 // oracleRegistry seeds the oracles TASK-076's pilot + proof scenarios need.
-// 077 registers the remaining ~20 diagnose* funcs as it migrates each
-// scenario family — this is not meant to be the final/complete set, only an
-// existence proof that named + parameterized oracles both work.
+// TASK-077 (wave 1) adds the four more diagnose* funcs its first migration
+// batch needs (diagnoseTransport/diagnoseBatteryGarbage/diagnoseReboot/
+// diagnoseExpiry) — still not the final/complete set: diagnoseEVFreeze,
+// diagnoseEVFlap, diagnoseEVUnits and the world/mqtt-scenario oracles remain
+// unregistered, retained on their Go literals (see docs/qa-spec-migration.md).
 var oracleRegistry = map[string]oracleEntry{
-	"diagnoseConstraint": {build: noParamOracle(diagnoseConstraint), requiresConstraint: true},
-	"diagnoseConverge":   {build: noParamOracle(diagnoseConverge), requiresConstraint: true},
-	"diagnoseStale":      {build: noParamOracle(diagnoseStale), requiresConstraint: false},
-	"diagnoseRecovery":   {build: noParamOracle(diagnoseRecovery), requiresConstraint: false},
-	"diagnoseSOC":        {build: noParamOracle(diagnoseSOC), requiresConstraint: true},
-	"diagnoseDisconnect": {build: noParamOracle(diagnoseDisconnect), requiresConstraint: true},
-	"diagnoseMalform":    {build: noParamOracle(diagnoseMalform), requiresConstraint: true},
-	"diagnoseSurvival":   {build: buildDiagnoseSurvival, requiresConstraint: true},
+	"diagnoseConstraint":     {build: noParamOracle(diagnoseConstraint), requiresConstraint: true},
+	"diagnoseConverge":       {build: noParamOracle(diagnoseConverge), requiresConstraint: true},
+	"diagnoseStale":          {build: noParamOracle(diagnoseStale), requiresConstraint: false},
+	"diagnoseRecovery":       {build: noParamOracle(diagnoseRecovery), requiresConstraint: false},
+	"diagnoseSOC":            {build: noParamOracle(diagnoseSOC), requiresConstraint: true},
+	"diagnoseDisconnect":     {build: noParamOracle(diagnoseDisconnect), requiresConstraint: true},
+	"diagnoseMalform":        {build: noParamOracle(diagnoseMalform), requiresConstraint: true},
+	"diagnoseSurvival":       {build: buildDiagnoseSurvival, requiresConstraint: true},
+	"diagnoseTransport":      {build: noParamOracle(diagnoseTransport), requiresConstraint: false},
+	"diagnoseBatteryGarbage": {build: noParamOracle(diagnoseBatteryGarbage), requiresConstraint: false},
+	"diagnoseReboot":         {build: noParamOracle(diagnoseReboot), requiresConstraint: false},
+	"diagnoseExpiry":         {build: noParamOracle(diagnoseExpiry), requiresConstraint: true},
 }
 
 // noParamOracle adapts a plain named diagnose* func (the common case) into
