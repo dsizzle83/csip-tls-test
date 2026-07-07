@@ -24,6 +24,22 @@ scripts/devkit-mtls-check.sh          # lexa-northbound ↔ sim/server over mTLS
 Last run: **4/4 layers pass, 42/42 logic tests pass, 0 vet findings; both repos
 green; air-gapped DUT run negotiates CCM-8 and POSTs CORE-022 responses.**
 
+**V1.0-RC regeneration (2026-07-06, TASK-081 gate)** — frozen SHAs
+`csip-tls-test@695da02`, `lexa-hub@c730302`, `lexa-proto@4e8b940`:
+- `scripts/run-conformance.sh` → **RESULT: 3 passed, 0 failed** (Layer 1 logic
+  suite incl. all `TestCSIP_*`; Layer 2 TLS — `CipherIsCSIPCompliant`,
+  `RejectsServerWithWrongCA`, `RejectsWrongCipher`; Layer 3 full-stack wolfSSL
+  discovery walk, cipher `ECDHE-ECDSA-AES128-CCM-8` verified). Layer 4 pcap
+  (`--capture`) not re-run this gate; the wire-cipher claim is carried from the
+  prior capture + the Layer 2 `CipherIsCSIPCompliant` assertion.
+- **Modbus/SunSpec `modsim-conformance` against the live bench sims** (release
+  arm64 sims): inverter (69.0.0.10:5020) **19 PASS / 0 FAIL**, battery
+  (69.0.0.11:5021) **22 PASS / 0 FAIL**, meter (69.0.0.12:5022)
+  **9 PASS / 0 FAIL** — all three device types green.
+- Open pre-lab items carried unchanged: C-5 (COMM-004 3/4-deep MICA fixtures,
+  lab), golden vendor fixtures (RSK-16 / TASK-075, vendor HW). Curve-functions:
+  **de-scoped per AD-010** (see `09` Conformance section).
+
 ### Audit resolution status (2026-06-08)
 
 | # | Finding | Status |
