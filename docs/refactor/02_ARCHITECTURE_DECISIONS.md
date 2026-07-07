@@ -916,6 +916,59 @@ the longer clean-shadow soak the P5 plan requires. EVSE-current emission is held
 back in shadow (the 058 Stack cannot yet carry an OCPP connector; the EV setpoint
 is still computed for the ceiling feed-forward) — it lands with the active flip.
 
+**Economic-layer isolation + full-stack shadow (TASK-063, 2026-07-06).** The
+economic rules — CSIP fixed dispatch, DP plan-following, self-consumption, TOU
+peak discharge, EV allocation — are ported into ONE `EconomicsConstraint` at
+`TierEconomics` that only PROPOSES (every setpoint a `PointDemand`). Three
+decisions land here:
+
+- **Economics propose, constraints dispose is now STRUCTURAL.** The arbiter's
+  `resolveInterval` became a two-level fold: WITHIN a tier the 058 most-restrictive
+  semantics are unchanged (same-tier arbitration is byte-identical); ACROSS tiers
+  it folds SAFETY→COMPLIANCE→ECONOMICS keeping the higher tier's interval and
+  clamping a lower-tier demand INTO it. This closes a real gap in the 058 min-only
+  arbiter: a lower-tier point MORE NEGATIVE than a higher-tier point (an economics
+  charge vs a compliance import-defense discharge) used to win by global-min,
+  silently overriding compliance; the fold now keeps compliance. Mutation-proven:
+  `TestResolve_EconomicsChargeCannotOverrideComplianceDischarge`,
+  `TestEconomics_TOUDischargeClampedByImportCapInStack` (economics proposes the
+  full `MaxDischargeW`; the resolved battery is the import-cap defense value).
+  Compliance-only shadow parity is unaffected (all one tier).
+
+- **CSIP fixed dispatch (OpModFixedW) is classified as an economics-tier TARGET,
+  not a compliance limit** — argued from legacy code: in the cascade it is Rule 2
+  (above plan, below the disconnect early-return) and the limit rules still
+  constrain its result. Reclassifying it as a compliance constraint would invert
+  that relationship. So it lives inside `EconomicsConstraint` (highest internal
+  precedence), and the compliance caps clamp it via the arbiter — mirroring legacy.
+
+- **Battery safety runs POST-arbitration** (`Stack.PostArbitrate`), closing the
+  ≤1-tick wrong-direction lag TASK-062 deferred: it reads THIS tick's RESOLVED
+  battery setpoint for commanded-charge intent (legacy `chargeCommandedFor(plan)`),
+  overrides a tripped pack with a force-disconnect that dominates every tier, and
+  records the final commands for the Tier-1 fast loop (`RecordCommands` call site).
+  Proven: `TestStack_BatterySafetyPostArbitrationClosesLag`,
+  `TestStack_RecordCommandsFeedsFastLoop`.
+
+The Stack now carries the WHOLE controller (safety + export/gen/import + economics)
+in the TASK-059 shadow Wrapper — the diff covers every axis, the real R4 proof.
+EVSE-current emission is wired (the Stack carries the OCPP connector in the demand
+device key, `parseEVSEDevice`). **Expected divergence (characterised, NOT forced to
+bit-match):** off-cap (no active CSIP limit) the compliance rules are no-ops so
+economics is faithful — the golden in-process shadow parity test
+(`TestEconomics_ShadowParityOffCap`) diffs the full stack vs the real cascade at
+**0** divergence across self-consumption / TOU / EV. ON-cap, the cascade interleaves
+the compliance rules BETWEEN the economic rules and mutates the shared
+`surplusW`/battery state the later economic rules read; a below-compliance layer
+cannot see those mutations (it computes `surplusW` from raw state and threads only
+its own prior sub-rule commands), so economics diverges on cap-active ticks. That
+divergence is the **TASK-064 finding** (constants→plant + the shared-state owner),
+not a defect to bit-match here. The one genuinely cross-tier signal — the EV
+import cooldown (`evSafeCount`, import-session-owned after 061) — is reproduced with
+an economics-local counter so the `battery-empty-import-cap` suspension is
+preserved (HARD invariant); a single owner is a TASK-064 item. **Bench shadow
+campaign gated at the P5 wave** (Principal-run); no flip this task.
+
 ## AD-008 🔶 Security: broker ACLs now, API token+TLS now, OCPP profile 2 at P6
 
 **Decision.** Per-service Mosquitto credentials + topic ACLs (config

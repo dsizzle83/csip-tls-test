@@ -1,6 +1,26 @@
 # TASK-063 — Economic layer isolation (TOU / self-consumption / planner below constraints)
 
-*Status: TODO · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: DONE — code-complete, full-stack shadow-wired (2026-07-06, lexa-hub `ad27f1c`) · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+
+> **Completion note (2026-07-06, batched-deadline scope).** SHADOW-ONLY per the
+> Principal's launch: the legacy `Optimize()` cascade is untouched and remains
+> authoritative. Delivered: `EconomicsConstraint` (TierEconomics) porting Rules
+> 2/2.5/4/5/6 as PointDemand proposals; tier-aware arbiter making
+> economics-below-compliance STRUCTURAL; battery safety post-arbitration
+> (wrong-direction lag closed) + `RecordCommands` wiring; EV connector carried
+> through the demand key; full stack (safety+compliance+economics) registered in
+> the TASK-059 shadow Wrapper (`cmd/hub`). Golden in-process shadow parity vs the
+> real cascade at **0 divergence off-cap**; economics-clamped-by-compliance
+> mutation tests green; `go test -race ./internal/orchestrator/...` green.
+> **Deferred to the P5 wave (Principal-gated):** the bench shadow campaign (step
+> 5/7), the ≥3-bench-day soak spanning a TOU peak, and the `economics: active`
+> flip — none doable in the deadline window; the controller is proven, the flip
+> is soak-gated. On-cap shadow divergence is CHARACTERISED (not bit-matched) as
+> the TASK-064 finding — see `docs/refactor/notes/TASK-063-seam-review.md`. The
+> step-6 written review (battery-reserve × 3 tiers, first-active-EVSE) is in that
+> same note. Config `economics: off|shadow|active` mode (step-4 wiring) was NOT
+> added — the shadow uses the existing `ConstraintShadow` flag; the per-constraint
+> mode toggle lands with the flip (TASK-066 territory).
 
 ## Objective
 The economic rules — TOU peak discharge, self-consumption, plan-following
