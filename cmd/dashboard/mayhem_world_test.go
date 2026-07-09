@@ -399,3 +399,185 @@ func TestWorldScenarios_ClockStepPairPresent(t *testing.T) {
 // a unit test either — HIL verification (LEXA_SSH_USER=nobody against the
 // real bench) is scoped to the later batched validation session per the
 // launch brief.
+
+// ── WS-2 consumer-restart-after-quiescence (docs/refactor/HANDOFF.md §8) ────
+
+// TestWorldScenarios_ConsumerRestartAfterQuiescencePresent locks the
+// catalogue-registration shape of the new scenario: present exactly once,
+// every stage wired, Extended (its hold is well past 6 min — RSK-12), and an
+// SSH probe in setup identical in spirit to hub-restart-mid-cap/disk-full's
+// (same INCONCLUSIVE-without-SSH contract, not re-verified here with a real
+// subprocess — see the note above).
+func TestWorldScenarios_ConsumerRestartAfterQuiescencePresent(t *testing.T) {
+	d := newMayhemDriver(map[string]string{"hub": "http://69.0.0.1:9100"})
+	scs := d.worldScenarios()
+
+	var found *mayScenario
+	n := 0
+	for _, sc := range scs {
+		if sc.ID == "consumer-restart-after-quiescence" {
+			found = sc
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf(`worldScenarios() must contain exactly one "consumer-restart-after-quiescence", got %d`, n)
+	}
+	if !found.Extended {
+		t.Error("consumer-restart-after-quiescence must be Extended (RSK-12) — its hold is minutes long")
+	}
+	if found.HoldS <= 360 {
+		t.Errorf("HoldS = %d, want > 360 (must exceed 6 min per the task's own note)", found.HoldS)
+	}
+	if found.HoldS != consumerRestartQuiescenceS+consumerRestartRecoveryWindowS {
+		t.Errorf("HoldS = %d, want quiescence(%d)+recovery(%d)", found.HoldS, consumerRestartQuiescenceS, consumerRestartRecoveryWindowS)
+	}
+	if found.setup == nil || found.perTick == nil || found.evaluate == nil || found.teardown == nil {
+		t.Error("every scenario stage (setup/perTick/evaluate/teardown) must be wired")
+	}
+}
+
+// consumerRestartSamples builds a timeline for
+// diagnoseConsumerRestartAfterQuiescence: n samples at 1 Hz, GridOK/
+// HubReachable true throughout (this scenario's judging signal is the
+// inverter's own ceiling register, not grid/solar telemetry, so those stay
+// healthy by default in every fixture below — the specific field each test
+// cares about is set by mut).
+func consumerRestartSamples(n int, mut func(i int, s *maySample)) []maySample {
+	out := make([]maySample, n)
+	for i := range out {
+		s := maySample{T: float64(i), GridOK: true, SolarOK: true, HubReachable: true}
+		mut(i, &s)
+		out[i] = s
+	}
+	return out
+}
+
+// TestDiagnoseConsumerRestartAfterQuiescence_Pass: the cap holds through
+// quiescence, the restart happens at consumerRestartQuiescenceS, and the
+// standing cap is back (ceiling register never above the restore floor,
+// hub re-adopts exportCap) within a few seconds — a clean recovery.
+func TestDiagnoseConsumerRestartAfterQuiescence_Pass(t *testing.T) {
+	s := consumerRestartSamples(consumerRestartHoldS, func(i int, smp *maySample) {
+		smp.SolarCeilingOK, smp.SolarCeilingEna, smp.SolarCeilingPct = true, true, 0
+		// Adopted throughout except a brief gap right at the restart tick
+		// (lexa-modbus down for a couple of seconds while it restarts).
+		restarting := i >= consumerRestartQuiescenceS && i < consumerRestartQuiescenceS+3
+		smp.HubAdopted, smp.AdoptedTyp = !restarting, "exportCap"
+	})
+	f := diagnoseConsumerRestartAfterQuiescence(scFor("consumer-restart-after-quiescence"), exportCons(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS (%s): %v", f.Verdict, f.Headline, f.Diagnosis)
+	}
+}
+
+// TestDiagnoseConsumerRestartAfterQuiescence_FailOpenReproduced is the core
+// WS-2 regression pin: if the ceiling register EVER reads restore
+// (uncurtailed) after the restart, this must be FAIL regardless of what the
+// hub's own /status claims — ground truth from the device is what convicts
+// the bug.
+func TestDiagnoseConsumerRestartAfterQuiescence_FailOpenReproduced(t *testing.T) {
+	s := consumerRestartSamples(consumerRestartHoldS, func(i int, smp *maySample) {
+		smp.SolarCeilingOK = true
+		if i < consumerRestartQuiescenceS {
+			smp.SolarCeilingEna, smp.SolarCeilingPct = true, 0
+			smp.HubAdopted, smp.AdoptedTyp = true, "exportCap"
+			return
+		}
+		// Post-restart: seedRestoreCeiling's fail-open — the inverter is
+		// reconnected to the fully-open ceiling, and /status confidently
+		// (wrongly) still claims exportCap is adopted.
+		smp.SolarCeilingEna, smp.SolarCeilingPct = true, 100
+		smp.HubAdopted, smp.AdoptedTyp = true, "exportCap"
+	})
+	f := diagnoseConsumerRestartAfterQuiescence(scFor("consumer-restart-after-quiescence"), exportCons(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (%s)", f.Verdict, f.Headline)
+	}
+	assertDiag(t, f, "WS-2")
+}
+
+// TestDiagnoseConsumerRestartAfterQuiescence_FailOpenViaDisabledLimit covers
+// the OTHER possible restore encoding this oracle defends against: the
+// device's WMaxLimPct_Ena bit reporting disabled (limit not enforced at all)
+// rather than pct climbing to ~100 — either one is "uncurtailed".
+func TestDiagnoseConsumerRestartAfterQuiescence_FailOpenViaDisabledLimit(t *testing.T) {
+	s := consumerRestartSamples(consumerRestartHoldS, func(i int, smp *maySample) {
+		smp.SolarCeilingOK = true
+		if i < consumerRestartQuiescenceS {
+			smp.SolarCeilingEna, smp.SolarCeilingPct = true, 0
+		} else {
+			smp.SolarCeilingEna, smp.SolarCeilingPct = false, 0 // limiting disabled == restore
+		}
+		smp.HubAdopted, smp.AdoptedTyp = true, "exportCap"
+	})
+	f := diagnoseConsumerRestartAfterQuiescence(scFor("consumer-restart-after-quiescence"), exportCons(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (%s)", f.Verdict, f.Headline)
+	}
+}
+
+// TestDiagnoseConsumerRestartAfterQuiescence_NeverReAdopted: no fail-open
+// write landed (ceiling register stays low the whole time), but the hub also
+// never shows the cap adopted again after the restart — a different bug
+// (stuck reconciler), still worth a distinct FAIL rather than a false PASS.
+func TestDiagnoseConsumerRestartAfterQuiescence_NeverReAdopted(t *testing.T) {
+	s := consumerRestartSamples(consumerRestartHoldS, func(i int, smp *maySample) {
+		smp.SolarCeilingOK, smp.SolarCeilingEna, smp.SolarCeilingPct = true, true, 0
+		smp.HubAdopted, smp.AdoptedTyp = i < consumerRestartQuiescenceS, "exportCap"
+	})
+	f := diagnoseConsumerRestartAfterQuiescence(scFor("consumer-restart-after-quiescence"), exportCons(), s)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (%s)", f.Verdict, f.Headline)
+	}
+	if !containsFold(f.Headline, "never observably re-adopted") {
+		t.Errorf("headline = %q, want it to name the never-re-adopted failure mode", f.Headline)
+	}
+}
+
+// TestDiagnoseConsumerRestartAfterQuiescence_Degraded: no fail-open write,
+// and the cap DOES come back, but only well past
+// consumerRestartRecoveryWindowS — slow, not broken.
+func TestDiagnoseConsumerRestartAfterQuiescence_Degraded(t *testing.T) {
+	readoptAt := consumerRestartQuiescenceS + consumerRestartRecoveryWindowS + 10
+	n := readoptAt + 5
+	s := consumerRestartSamples(n, func(i int, smp *maySample) {
+		smp.SolarCeilingOK, smp.SolarCeilingEna, smp.SolarCeilingPct = true, true, 0
+		smp.HubAdopted, smp.AdoptedTyp = i < consumerRestartQuiescenceS || i >= readoptAt, "exportCap"
+	})
+	f := diagnoseConsumerRestartAfterQuiescence(scFor("consumer-restart-after-quiescence"), exportCons(), s)
+	if f.Verdict != "DEGRADED" {
+		t.Fatalf("verdict = %s, want DEGRADED (%s)", f.Verdict, f.Headline)
+	}
+}
+
+// TestDiagnoseConsumerRestartAfterQuiescence_BlindOnCeilingProbeGap: an
+// otherwise-clean-looking run (re-adopts fast, no restore observed) whose
+// ceiling register probe was absent for most of the window must not be
+// certified PASS — the WS-3 constraint-aware BLIND floor (mayJudgeAbsentBlindFrac)
+// applies to this scenario's own judging sensor exactly as it does to every
+// other oracle's.
+func TestDiagnoseConsumerRestartAfterQuiescence_BlindOnCeilingProbeGap(t *testing.T) {
+	s := consumerRestartSamples(consumerRestartHoldS, func(i int, smp *maySample) {
+		// The solar sim answered only the first ~5% of ticks — well under the
+		// 80% availability floor (1 - mayJudgeAbsentBlindFrac).
+		smp.SolarCeilingOK = i < consumerRestartHoldS/20
+		smp.SolarCeilingEna, smp.SolarCeilingPct = true, 0
+		smp.HubAdopted, smp.AdoptedTyp = true, "exportCap"
+	})
+	f := diagnoseConsumerRestartAfterQuiescence(scFor("consumer-restart-after-quiescence"), exportCons(), s)
+	if f.Verdict != "BLIND" {
+		t.Fatalf("verdict = %s, want BLIND (probe mostly absent must never certify PASS)", f.Verdict)
+	}
+	assertDiag(t, f, "solar ceiling register")
+}
+
+// TestDiagnoseConsumerRestartAfterQuiescence_NoSamples: the run-integrity
+// contract every diagnoser shares (mayhem_test.go's siblings) — an empty
+// timeline is INCONCLUSIVE, never a verdict this oracle didn't actually judge.
+func TestDiagnoseConsumerRestartAfterQuiescence_NoSamples(t *testing.T) {
+	f := diagnoseConsumerRestartAfterQuiescence(scFor("consumer-restart-after-quiescence"), exportCons(), nil)
+	if f.Verdict != "INCONCLUSIVE" {
+		t.Fatalf("verdict = %s, want INCONCLUSIVE", f.Verdict)
+	}
+}
