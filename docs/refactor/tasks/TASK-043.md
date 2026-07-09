@@ -1,6 +1,6 @@
 # TASK-043 — Mayhem: power-cut retained rollback + corrupted-retained scenarios
 
-*Status: CODE COMPLETE, BENCH VALIDATION PENDING (2026-07-06, `task/043-powercut`) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: high · Risk: low*
+*Status: CODE COMPLETE, BENCH VALIDATION PENDING (2026-07-06, `task/043-powercut`, merged to main @87882d2) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: high · Risk: low*
 
 **2026-07-06 update:** Both scenarios (`power-cut-retained-rollback`,
 `corrupted-retained-control`) plus the broker-store manipulation helpers, the

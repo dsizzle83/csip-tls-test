@@ -1,7 +1,7 @@
 # TASK-070 — Context propagation walker-deep
 
 *Status: DONE (2026-07-06, lexa-hub 63a81aa) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: low · Risk: low*
-*Branch: lexa-hub `task/070-ctx-propagation` (unmerged, not pushed). Bench
+*Branch: lexa-hub `task/070-ctx-propagation` (merged to main @63a81aa). Bench
 stop-during-walk timing + Mayhem smoke (wan-outage-hold, northbound-hang)
 still pending a live bench session — code + unit-test acceptance criteria
 are met; see report for the Post-vs-PostContext scope decision.*

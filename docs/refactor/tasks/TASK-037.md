@@ -1,7 +1,7 @@
 # TASK-037 — Local (hub-side) clock-step policy + implementation
 
 *Status: CODE COMPLETE (2026-07-05, lexa-hub `task/037-local-clock` 8f7e60e,
-unmerged) · Phase: P3 · Effort: M (≈4–6 h) · Difficulty: high · Risk: med*
+merged to main) · Phase: P3 · Effort: M (≈4–6 h) · Difficulty: high · Risk: med*
 
 Unit-scope acceptance criteria and `go test -race ./internal/... ./cmd/...`
 green (see 02 AD-004 extension for detail). Bench gates

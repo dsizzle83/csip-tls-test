@@ -1,6 +1,6 @@
 # TASK-052 — Bench `tc netem` packet-chaos harness + scenarios
 
-*Status: CODE COMPLETE (2026-07-05, csip-tls-test `task/052-netem`, unmerged) — bench
+*Status: CODE COMPLETE (2026-07-05, csip-tls-test `task/052-netem`, merged to main @a34bbc1) — bench
 validation deferred to the next batched wave gate (a bench agent had the live bench
 mid-campaign when this was implemented) · Phase: P4 · Effort: L (≈6–8 h) ·
 Difficulty: med · Risk: low*

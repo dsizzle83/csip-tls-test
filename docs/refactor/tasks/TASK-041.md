@@ -1,7 +1,7 @@
 # TASK-041 — Guard/breach-state snapshot + restore-on-start (flagged)
 
 *Status: PARTIAL (2026-07-06, lexa-hub `task/041-snapshot`, hub side only —
-code complete, unmerged, bench validation pending) · Phase: P3 ·
+code complete, merged to main @7af1ff3, bench validation pending) · Phase: P3 ·
 Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
 
 **2026-07-06 session note:** this session's launch instructions scoped the

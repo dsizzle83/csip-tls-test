@@ -1,7 +1,7 @@
 # TASK-049 — Mayhem: duplicate MQTT client-ID scenario
 
 *Status: CODE COMPLETE (2026-07-05, csip-tls-test `task/049-051-scenarios` 01e97bc,
-unmerged — batched with TASK-050/051 per the Principal Engineer's deadline-push
+merged to main — batched with TASK-050/051 per the Principal Engineer's deadline-push
 instruction, 05 §12 amendment): mqttproxy `/hold` + shared `dialAndConnect`
 connect-helper (factored once, reused by TASK-051's `/storm`), `duplicate-client-id`
 scenario (live client-ID read over SSH, TASK-044 reconnect-counter detection

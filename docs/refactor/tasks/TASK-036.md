@@ -1,6 +1,6 @@
 # TASK-036 — Migrate hub `expiryConfirmTicks`, api `csipReportGraceS`, optimizer TOU onto `utilitytime`
 
-*Status: DONE (2026-07-05, lexa-hub `fc00029`, branch `task/036-time-consumers`, unmerged — code+unit-tests only, bench validation batched at next gate) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-05, lexa-hub `fc00029`, merged to main (from branch `task/036-time-consumers`) — code+unit-tests only, bench validation batched at next gate) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
 
 ## Objective
 Move the last three utility-time owners onto `internal/utilitytime`:

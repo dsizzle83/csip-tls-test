@@ -1,6 +1,6 @@
 # TASK-068 — Northbound decomposition: walk / publishers / responses / flow-reservations packages
 
-*Status: DONE (2026-07-06, `lexa-hub` `task/068-northbound-decomp` @ `d2f135c`, unmerged) · Phase: P6 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-06, `lexa-hub` `task/068-northbound-decomp` @ `d2f135c`, merged to main) · Phase: P6 · Effort: L (≈6–8 h) · Difficulty: med · Risk: med*
 
 **Completion note:** Four bisectable commits (flowres → responses → publish →
 run, each `go build ./...` + `make test` green), plus a docs commit. Actual

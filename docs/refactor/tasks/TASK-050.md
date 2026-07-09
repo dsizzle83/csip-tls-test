@@ -1,7 +1,7 @@
 # TASK-050 — Mayhem: disk-full scenario
 
 *Status: CODE COMPLETE (2026-07-05, csip-tls-test `task/049-051-scenarios` 01e97bc,
-unmerged — batched with TASK-049/051 per the Principal Engineer's deadline-push
+merged to main — batched with TASK-049/051 per the Principal Engineer's deadline-push
 instruction, 05 §12 amendment): `disk-full` scenario + size-guarded `fillDisk`/
 `freeDisk` ballast helpers (floor/reserve guard unit-tested as a pure string
 builder), teardown-always-removes-the-ballast with a documented manual-cleanup

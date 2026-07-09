@@ -462,7 +462,7 @@ five-consumer list didn't enumerate. Not touched here (not in TASK-036's
 Files list); flagged for a follow-up task/backlog entry.
 
 **Local (SOM) clock-step policy — TASK-037, GAP-04, 2026-07-05, lexa-hub
-`task/037-local-clock` 8f7e60e (unmerged), csip-tls-test docs
+`task/037-local-clock` 8f7e60e (merged to main), csip-tls-test docs
 `task/037-local-clock` (this entry).** Extends AD-004 from hardening the
 *utility server's* clock to hardening the hub's own *local* wall clock (an
 NTP correction at commissioning, an RTC drift fix-up). `go test -race
@@ -628,7 +628,7 @@ never crash a caller). Zero consumers today (`grep -rn "internal/journal"
 ~/projects/lexa-hub --include=*.go | grep -v internal/journal` empty).
 
 **TASK-040 update (2026-07-06): integrated (hub, northbound) — code complete,
-unmerged.** `lexa-hub` `task/040-journal-integration` (`be9701a`, on top of
+merged to main.** `lexa-hub` `task/040-journal-integration` (`be9701a`, on top of
 031/032) wires the first four callers: `cmd/hub/state.go`'s `onCSIPControl` +
 `ReadSystemState`'s expiry-drop branch (`control_adopted`/`control_released`,
 change-detected against the ~5 s FAST retained republish so an unchanged
@@ -656,7 +656,7 @@ access this session. TASK-041 (snapshot events) is unblocked by this writer
 plumbing.
 
 **TASK-041 update (2026-07-06): snapshot half implemented (hub side) — code
-complete, unmerged, bench validation pending.** `lexa-hub`
+complete, merged to main @7af1ff3, bench validation pending.** `lexa-hub`
 `task/041-snapshot` adds `cmd/hub/snapshot.go` (atomic tmp+rename
 `saveHubSnapshot`/validating `loadHubSnapshot`, kept local to `cmd/hub`
 rather than the originally-sketched shared `internal/snapshot` package — see
@@ -1426,6 +1426,44 @@ suppresses connect-restoring writes (reports `InterlockHold`) rather than fight
 it. `battery-wrong-sign` PASS with INV-SOC/SAFETY held and no INV-HUNT
 oscillation — the guard-vs-guard interaction the reconciler design set out to
 avoid did not materialise.
+
+## AD-014 ✅ Northbound poll-rate: honor server-advertised pollRate in STOCK, FAST bench keeps override (TASK-071)
+
+**Problem.** The northbound walker re-fetched the entire 2030.5 resource tree
+every `discovery_interval_s`, ignoring each function set's advertised
+`pollRate` — impolite at best; a utility head-end WILL rate-limit or
+blacklist a walker that does this (review §12).
+
+**Decision.** A per-resource-class poll scheduler
+(`internal/northbound/run/pollsched.go`) fetches each class (dcap/time/edev/
+fsa/derp/derc/curves/defaults/mup) only when its own advertised `pollRate` is
+due, clamping absurd/zero rates and holding a hard 15-min ceiling on `/tm`
+resync regardless of the advertised value (clock discipline is
+safety-relevant, 05 §3). Config `poll_rate_mode: "honor" | "override"` —
+**PRODUCT default is `honor`**; the bench stays `override` (fetch-everything,
+today's cadence) because Mayhem scenario timing (`expired-control`,
+`conflicting-primacy`, `clock-jump-forward`) assumes second-scale control
+adoption and gridsim's 60 s DERControlList pollRate would stretch that under
+`honor` (RSK-13 false-regression risk).
+
+**Alternatives considered.** Conditional GET (If-Modified-Since/ETag) is the
+fuller 2030.5-polite answer but gridsim has zero support for it today
+(verified — no `If-Modified`/`ETag`/`304` handling anywhere in
+`sim/gridsim`/`sim/tlsserver`); descoped to `10_BACKLOG.md` pending gridsim
+support. Honoring pollRate on the bench too — rejected, breaks scenario
+timing (above).
+
+**Tradeoffs / backlog refinement.** `honor` mode today fetches every class at
+the single most-conservative pollRate seen across the tree (~900 s against
+reference gridsim) rather than scheduling each class independently at its own
+rate — a control-heavy utility may want DERControlList's faster (60 s) rate
+honored on its own cadence while dcap/edev stay slow. `pollsched.go`'s
+per-class design already supports this; collapsing to one conservative rate
+was the simpler first cut. Backlog refinement, not a V1.0 blocker.
+
+**Migration.** TASK-071 (2026-07-06, merged to main). Targeted scenario set
+(`expired-control`, `conflicting-primacy`, `clock-jump-forward`) re-run ×3 in
+`override` mode confirmed bench timing unchanged.
 
 ---
 

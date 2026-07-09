@@ -1,6 +1,6 @@
 # TASK-064 — Bench constants → plant-model parameters (identical-behavior proof)
 
-*Status: DONE (2026-07-06, `lexa-hub` `task/064-constants-plant` @ `a6334ae`; Stage A `2e6c573` + Stage B `a6334ae`; unmerged, Principal reviews/merges; bench campaign + STOCK spot-check gated at the P5 wave) · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: high · Risk: high*
+*Status: DONE (2026-07-06, `lexa-hub` `task/064-constants-plant` @ `a6334ae`; Stage A `2e6c573` + Stage B `a6334ae`; merged to main @7d6dd93, Principal-reviewed; bench campaign + STOCK spot-check gated at the P5 wave) · Phase: P5 · Effort: L (≈6–8 h) · Difficulty: high · Risk: high*
 
 > **Completion note (2026-07-06).** Two commits (Stage A wire + prove, Stage B
 > burn). Constant→plant swap map + parameter reference table:

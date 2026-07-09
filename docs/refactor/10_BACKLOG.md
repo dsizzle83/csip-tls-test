@@ -175,7 +175,6 @@ promote by giving an item a TASK number and a row in 04.*
   acquisition-flavored).
 - lexa-hub integration-tagged tlsclient tests (client_test.go/fetcher_test.go) reference helpers that never existed there (startInProcessServer etc.) — never compiled; port csip-tls-test helpers_test.go or delete the tagged files (TASK-047 finding).
 - Ungated Time.CurrentTime + bench csipref scheduler lacks any plausibility gate (TASK-048 findings) — follow-up hardening candidates.
-- Ungated Time.CurrentTime + bench csipref scheduler lacks any plausibility gate (TASK-048 findings) — follow-up hardening candidates.
 - cmd/telemetry postMeasurements computes serverNow inline for MUP timestamps (6th site, TASK-036 finding) — migrate to utilitytime when telemetry is next touched.
 - TASK-041 northbound snapshot half: persist responseTracker.alerted/posted so a NB restart mid-episode does not re-post CannotComply begin (hub half done in 041).
 - battery-charge-disabled export-detection latency (~9s vs ~11s window) → adaptive detection window from TASK-057 plant-model controlLatencyS in TASK-064 (R4).

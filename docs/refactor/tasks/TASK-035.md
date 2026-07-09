@@ -1,6 +1,6 @@
 # TASK-035 — Migrate walker + scheduler onto `utilitytime` (guards ported verbatim)
 
-*Status: DONE (2026-07-05, lexa-hub `task/035-scheduler-time` 7c1b03f+c612e1e; NOT merged — 05 §12 cooling-off, awaits PE review) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: high · Risk: high*
+*Status: DONE (2026-07-05, lexa-hub `task/035-scheduler-time` 7c1b03f+c612e1e; merged to main @c612e1e — 05 §12 cooling-off cleared, PE-reviewed) · Phase: P3 · Effort: L (≈6–8 h) · Difficulty: high · Risk: high*
 
 > **Completion note (2026-07-05).** AD-004 consumers 1–3 migrated onto
 > `internal/utilitytime` in two commits (walker offset acquisition → `Clock`;

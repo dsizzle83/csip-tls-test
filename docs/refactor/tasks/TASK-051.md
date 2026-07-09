@@ -1,7 +1,7 @@
 # TASK-051 — Mayhem: MQTT storm / backpressure scenario
 
 *Status: CODE COMPLETE (2026-07-05, csip-tls-test `task/049-051-scenarios` 01e97bc,
-unmerged — batched with TASK-049/050 per the Principal Engineer's deadline-push
+merged to main — batched with TASK-049/050 per the Principal Engineer's deadline-push
 instruction, 05 §12 amendment): mqttproxy `/storm` (reuses TASK-049's
 `dialAndConnect` helper), `mqtt-storm` scenario (diagnoseConstraint + INV-HUNT +
 TASK-044 overflow-counter check; a cap breach with a flat counter is the named
