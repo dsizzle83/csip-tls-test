@@ -82,6 +82,16 @@ type maySample struct {
 	SolarOK        bool    `json:"solar_ok"`
 	HubSolarW      float64 `json:"hub_solar_W"` // the hub's Modbus-derived solar reading — for INV-TRANSPORT
 
+	// SolarCeilingPct/SolarCeilingEna are the inverter's OWN WMaxLimPct
+	// curtailment-ceiling register, read straight from the solar sim /state
+	// (ground truth for what was actually WRITTEN to the device over Modbus,
+	// as distinct from SolarW/SolarPossibleW's power-flow ground truth) — the
+	// WS-2 (HANDOFF.md §8) fail-open detector: a restore write clamps this to
+	// ~100%/disabled regardless of what the hub's own /status claims.
+	SolarCeilingPct float64 `json:"solar_ceiling_pct"`
+	SolarCeilingEna bool    `json:"solar_ceiling_ena"`
+	SolarCeilingOK  bool    `json:"solar_ceiling_ok"`
+
 	BatteryW     float64 `json:"battery_W"` // the hub's view (Modbus-derived) — display/observability
 	BatSOC       float64 `json:"bat_soc"`
 	BatterySimW  float64 `json:"battery_sim_W"`   // pack's TRUE net power from the batsim /state (ground truth) — for INV-SOC
@@ -642,6 +652,9 @@ func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
 	}
 	if aw, pw, ok := d.solarSim(); ok {
 		s.SolarW, s.SolarPossibleW, s.SolarOK = aw, pw, true
+	}
+	if pct, ena, ok := d.solarCeiling(); ok {
+		s.SolarCeilingPct, s.SolarCeilingEna, s.SolarCeilingOK = pct, ena, true
 	}
 	if dw, da, ok := d.evSim(); ok {
 		s.EvSimW, s.EvSimA, s.EvSimOK = dw, da, true
@@ -2309,6 +2322,29 @@ func (d *mayhemDriver) solarSim() (actualW, possibleW float64, ok bool) {
 		return 0, 0, false
 	}
 	return st.Measurements.W_W, st.Measurements.PossibleW, true
+}
+
+// solarCeiling reads the inverter's OWN curtailment-ceiling register straight
+// from the solar sim /state (sim/southbound/solar.go's SolarState.Controls) —
+// ground truth for what lexa-modbus most recently WROTE to the device via
+// Modbus, independent of what the hub's own /status claims it commanded. This
+// is the register consumer-restart-after-quiescence (WS-2, HANDOFF.md §8)
+// watches: a fail-open re-seed writes bus.RestoreCeilingW, which clamps to
+// WMax on the wire — WMaxLimPct_pct reads ~100% (or the limit is reported
+// disabled) — verifiably distinct from a live low-percent enforced cap.
+// pctCeiling is the percent of nameplate currently honoured (0–100); limitEna
+// is the device's own WMaxLimPct_Ena bit.
+func (d *mayhemDriver) solarCeiling() (pctCeiling float64, limitEna bool, ok bool) {
+	var st struct {
+		Controls struct {
+			WMaxLimPctPct float64 `json:"WMaxLimPct_pct"`
+			WMaxLimPctEna int     `json:"WMaxLimPct_Ena"`
+		} `json:"controls"`
+	}
+	if err := d.getJSON("solar", "/state", &st); err != nil {
+		return 0, false, false
+	}
+	return st.Controls.WMaxLimPctPct, st.Controls.WMaxLimPctEna != 0, true
 }
 
 // evSim reads the charger's TRUE draw straight from the ev sim /state — the

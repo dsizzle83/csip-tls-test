@@ -33,10 +33,10 @@ first step for whoever picks up the next wave.
 |---|---|
 | `cmd/dashboard/mayhem.go` direct literals | 9 |
 | `cmd/dashboard/mayhem.go` via `malformScenario(...)` | 5 |
-| `cmd/dashboard/mayhem_world.go` (`worldScenarios()`) | 17 |
+| `cmd/dashboard/mayhem_world.go` (`worldScenarios()`) | 18 |
 | `cmd/dashboard/mqtt_scenarios.go` (`mqttScenarios()`) | 8 |
 | `qa/scenarios/*.json` (migrated specs) | 24 |
-| **Total scenario entries** (excludes `matrix.go`'s programmatic product) | **63** |
+| **Total scenario entries** (excludes `matrix.go`'s programmatic product) | **64** |
 
 Before this session: 33 direct + 5 malform + 17 world + 8 mqtt = 63 Go
 literals, 1 spec file (the colliding, non-live pilot). After: 24 of the 33
@@ -130,7 +130,25 @@ campaign invocation changes.
 | `clock-jitter` | `perTick` computes a clock offset from a formula of the tick index (`off := int64((i%7 - 3) * 20)`) starting at `i>=10` — the same "no expressions" gap. A `"jitter"` action-parameter sentinel could express this specific pattern, but it is narrow (one scenario's exact formula) and not generalizable the way `delay_s` is; left as documented Go. |
 | `perfect-storm` | Combines a goroutine-delayed fault (`ack_before_effect` + a delayed meter-freeze), a per-tick clock-offset formula, and five simultaneous fault domains — the deliberate "kitchen sink" scenario. Even after `delay_s` and a jitter extension land, this one is a poor first migration target: it is the highest-blast-radius scenario in the suite (06 §Mayhem) and its value is in NOT changing while everything else does. Retained as Go by design, not by gap. |
 
-### `cmd/dashboard/mayhem_world.go` (17, untouched this wave)
+### `cmd/dashboard/mayhem_world.go` (18: 17 untouched this wave + 1 added post-hoc)
+
+`consumer-restart-after-quiescence` (WS-2, `docs/refactor/HANDOFF.md` §8,
+added after this session) is Go **by explicit instruction**, not because its
+`setup`/`perTick` shape is vocab-blocked — a static `injectEnv` every tick
+plus one `ssh_hub` restart at a fixed `at_tick` is close to what
+`hub-restart-mid-cap` already proves is expressible. The reasons it stays a
+`mayhem_world.go` literal: (1) it ships a brand-new, scenario-specific oracle
+(`diagnoseConsumerRestartAfterQuiescence`) reading a NEW ground-truth field
+(`SolarCeilingPct`/`SolarCeilingEna`, the inverter's own WMaxLimPct register,
+added to `maySample` alongside it) — "oracles are code, scenarios are data"
+means the oracle had to be Go regardless, and a first-use oracle ships next
+to its one scenario rather than pre-registered speculatively; (2) the task
+that introduced it (WS-2 fix 3) explicitly directed a Go literal in the
+mayhem_world.go family, citing this file's own retained-in-Go convention.
+Once `diagnoseConsumerRestartAfterQuiescence` is registered as a
+`noParamOracle`, migrating the scenario itself to a `.json` spec (mirroring
+`hub-restart-mid-cap`'s vocab-ready triage below) is a small, low-risk
+next-wave candidate — flagged here for whoever picks that up.
 
 Not attempted this session (task's own wave ordering: "constraint family
 first... then world/mqtt... bespoke-oracle scenarios last" — P4/P5's world

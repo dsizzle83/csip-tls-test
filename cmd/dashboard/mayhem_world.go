@@ -19,10 +19,14 @@ package main
 //	pv-flicker               cloud-edge sawtooth under a cap — hold without hunting
 //	release-while-rebooting  cap released while the inverter is dark — no stale latch
 //	hub-restart-mid-cap      the hub process itself dies and restarts — re-adopt
+//	consumer-restart-after-quiescence  lexa-modbus restarts after minutes of an
+//	                         unchanging standing cap — WS-2 (HANDOFF.md §8):
+//	                         no un-commanded restore may land on the inverter
 //
-// hub-restart-mid-cap needs SSH to the hub Pi (BatchMode, passwordless sudo per
-// docs/BENCH.md); when SSH is unavailable the scenario reports INCONCLUSIVE at
-// setup rather than a misleading verdict.
+// hub-restart-mid-cap / disk-full / consumer-restart-after-quiescence need SSH
+// to the hub Pi (BatchMode, passwordless sudo per docs/BENCH.md); when SSH is
+// unavailable each reports INCONCLUSIVE at setup rather than a misleading
+// verdict.
 //
 // netem-loss-export-cap, netem-reorder-northbound, netem-jitter-evse
 // (TASK-052 / GAP-11): the first scenarios that fault the actual wire. Every
@@ -652,6 +656,146 @@ func (d *mayhemDriver) hubClockStepTeardown() {
 	}
 }
 
+// ── WS-2 consumer-restart-after-quiescence (docs/refactor/HANDOFF.md §8) ────
+//
+// The scenario whose ABSENCE hid the WS-2 desired-doc restart/staleness
+// fail-open: every other restart/resilience scenario above (hub-restart-
+// mid-cap, disk-full) restarts the fault within ~15-30 ticks of the cap
+// being posted — the retained desired doc's content is still fresh from that
+// initial publish. WS-2 only bites once the standing cap has gone QUIESCENT
+// (the optimizer converged and stopped re-publishing content, TASK-046's
+// whole point) for longer than the reconciler's staleness reject bound
+// (internal/reconcile.DefaultStaleAfter in lexa-hub, 300 s) — a real-world
+// wall-clock property that FAST/STOCK tick-rate tuning does not shrink. This
+// scenario holds a STATIC export cap (unchanging PV/load injection, so the
+// optimizer's output — and the retained doc's content — never changes once
+// converged) for consumerRestartQuiescenceS (5.5 min, > StaleAfter with
+// margin) before restarting lexa-modbus — the CONSUMER, not the hub itself
+// (hub-restart-mid-cap already covers the hub process dying; this is the
+// other side WS-2 fix 1's heartbeat and fix 2's fail-closed seed compose to
+// close: a live hub re-stamping IssuedAt every ≤StaleAfter/2 keeps the
+// retained doc fresh through the whole quiescence window, so a consumer that
+// restarts and re-subscribes mid-quiescence still adopts a doc well under
+// the staleness bound).
+//
+// Ground truth is the inverter's OWN WMaxLimPct ceiling register
+// (solarCeiling, mayhem.go) — not export power, not the hub's /status — so a
+// fail-open shows up exactly as the bug does on real hardware: an
+// un-commanded, un-adopted RESTORE write landing on the device.
+const (
+	// consumerRestartQuiescenceS: how long the standing cap holds, unchanged,
+	// before lexa-modbus restarts. 330 s (5.5 min) is >300 s
+	// (reconcile.DefaultStaleAfter in lexa-hub) with margin — long enough
+	// that, WITHOUT WS-2 fix 1's heartbeat re-stamp, the retained doc's
+	// IssuedAt would already be past the reconciler's reject bound at the
+	// moment of restart.
+	consumerRestartQuiescenceS = 330
+	// consumerRestartRecoveryWindowS bounds how long after the restart the
+	// standing cap is allowed to take to be observably re-adopted before this
+	// scenario calls it DEGRADED rather than a clean PASS — generous for a
+	// systemctl restart + MQTT resubscribe + retained-message redelivery.
+	consumerRestartRecoveryWindowS = 60
+	// consumerRestartHoldS is this scenario's total HoldS: quiescence +
+	// recovery window. Exceeds 6 min — mark Extended (RSK-12) so a default/
+	// full campaign excludes it; run via --only/--extended, and 10x solo as
+	// this task's own release gate (HANDOFF.md §8 WS-2).
+	consumerRestartHoldS = consumerRestartQuiescenceS + consumerRestartRecoveryWindowS
+
+	// solarRestoreCeilingPctFloor: WMaxLimPct_pct at/above this, OR
+	// WMaxLimPct_Ena reporting disabled, is read as "restore" (uncurtailed) —
+	// the fail-open signature. bus.RestoreCeilingW (lexa-hub) clamps to WMax
+	// on the wire (~100%); this scenario's enforced cap is a hard 0 W export
+	// cap against full PV + a full battery (armExportCap), which curtails to
+	// near 0%, so 90% leaves generous separation between "cap" and "restore"
+	// in both possible encodings.
+	solarRestoreCeilingPctFloor = 90.0
+)
+
+// diagnoseConsumerRestartAfterQuiescence judges consumer-restart-after-
+// quiescence: WS-2's own reproduction scenario. Two ways to fail, worst
+// first:
+//
+//	FAIL (fail-open reproduced) — the inverter's OWN ceiling register read
+//	  restore (uncurtailed) at any point after the restart. This is the bug:
+//	  ground truth from the device itself, immune to a confidently-wrong
+//	  hub /status.
+//	FAIL (never re-adopted) — no fail-open write landed, but the standing cap
+//	  was also never observably re-enforced again — a different bug (stuck
+//	  reconciler), still a WS-2-family finding worth surfacing distinctly.
+//	DEGRADED — re-adopted, but slower than consumerRestartRecoveryWindowS.
+//	PASS — re-adopted within the window, ceiling register never showed
+//	  restore.
+func diagnoseConsumerRestartAfterQuiescence(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+	restartT := float64(consumerRestartQuiescenceS)
+
+	// The WS-2 fail-open signature: the solar sim's own ceiling register
+	// reporting restore (uncurtailed) at any point AFTER the restart was
+	// triggered — ground truth from the device, independent of /status.
+	restoreSeenAtS := -1.0
+	for _, smp := range s {
+		if smp.T < restartT || !smp.SolarCeilingOK {
+			continue
+		}
+		if !smp.SolarCeilingEna || smp.SolarCeilingPct >= solarRestoreCeilingPctFloor {
+			restoreSeenAtS = smp.T
+			break
+		}
+	}
+
+	// Bounded re-adoption: first post-restart sample where the hub is
+	// reachable and enforcing the SAME cap type it held before the restart.
+	reAdoptedAtS := -1.0
+	for _, smp := range s {
+		if smp.T < restartT {
+			continue
+		}
+		if smp.HubReachable && smp.HubAdopted && smp.AdoptedTyp == cons.Typ {
+			reAdoptedAtS = smp.T
+			break
+		}
+	}
+
+	switch {
+	case restoreSeenAtS >= 0:
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("WS-2 fail-open reproduced: inverter ceiling register read RESTORE %.0fs after the lexa-modbus restart", restoreSeenAtS-restartT)
+		f.Diagnosis = []string{
+			fmt.Sprintf("The standing %s (held static for %.0fs before the restart — long enough for the retained desired doc's content to have stopped changing, per TASK-046) was not what lexa-modbus reasserted on restart: the solar sim's own WMaxLimPct register reported an open/uncurtailed ceiling instead of the enforced cap.", cons.Typ, restartT),
+			"This is the WS-2 desired-doc restart/staleness fail-open (docs/refactor/HANDOFF.md §8): either the hub's heartbeat re-stamp did not keep the retained doc fresh across the quiescence window (fix 1, cmd/hub/desired.go desiredHeartbeatInterval), or a stale rejection on resubscribe was not fail-closed to the last-known cap (fix 2, cmd/modbus/reconcile_solar.go seedRestoreCeiling).",
+			decisionLine(s),
+		}
+	case reAdoptedAtS < 0:
+		f.Verdict = "FAIL"
+		f.Headline = "the standing cap was never observably re-adopted after the lexa-modbus restart"
+		f.Diagnosis = []string{
+			fmt.Sprintf("No sample in the post-restart window (t=%.0fs–%.0fs) shows the hub enforcing %s again — no fail-open write landed, but the reconciler never came back to standing intent either.", restartT, s[len(s)-1].T, cons.Typ),
+			decisionLine(s),
+		}
+	case reAdoptedAtS-restartT > consumerRestartRecoveryWindowS:
+		f.Verdict = "DEGRADED"
+		f.Headline = fmt.Sprintf("re-adopted, but %.0fs after the restart — past the %ds bound", reAdoptedAtS-restartT, consumerRestartRecoveryWindowS)
+		f.Diagnosis = []string{
+			"No open-ceiling write reached the inverter (the fail-open did not reproduce), but re-adoption took longer than this scenario's bound for a clean restart-and-resubscribe.",
+		}
+	default:
+		f.Verdict = "PASS"
+		f.Headline = fmt.Sprintf("cap held across the restart — re-adopted %.0fs after, ceiling register never showed restore", reAdoptedAtS-restartT)
+		f.Diagnosis = []string{
+			fmt.Sprintf("The standing %s survived %.0fs of content-unchanged quiescence followed by a lexa-modbus restart: the inverter's ceiling register held the enforced value throughout, and the hub re-adopted it within %.0fs of the restart.", cons.Typ, restartT, reAdoptedAtS-restartT),
+		}
+	}
+	forceBlindOnProbeGap(&f, "solar ceiling register", probeAvailFrac(s, func(smp maySample) bool { return smp.SolarCeilingOK }))
+	forceBlindOnConstraintProbeGap(&f, cons, s)
+	return f
+}
+
 // worldScenarios is appended to the curated suite by scenarios().
 func (d *mayhemDriver) worldScenarios() []*mayScenario {
 	const loadLow = 250.0
@@ -1021,6 +1165,42 @@ func (d *mayhemDriver) worldScenarios() []*mayScenario {
 				// still-draining store.
 				time.Sleep(2 * time.Second)
 			},
+		},
+		{
+			ID: "consumer-restart-after-quiescence", Name: "lexa-modbus restarts after the cap has gone quiet (WS-2)",
+			Category:   "Hub resilience (INV-EXPORT survivability, WS-2)",
+			Hypothesis: "The optimizer converges and stops re-publishing the desired doc's content (TASK-046 — a retained doc is standing intent, not a tick stream). Once that quiescence outlasts the reconciler's staleness reject bound, a lexa-modbus restart's resubscribe either gets a doc too old to adopt, or — for solar specifically — seedRestoreCeiling's blind startup seed stands unopposed. Every OTHER restart scenario in this suite restarts within seconds of the cap being posted, while the doc is still fresh from that very publish; none of them can catch a bug that only bites after minutes of silence.",
+			Expected:   "The hub's heartbeat re-stamp (WS-2 fix 1) keeps the retained doc fresh through the whole quiescence window regardless of content churn, so lexa-modbus's restart adopts a fresh doc and re-enforces the standing cap within a bounded window — and even in the pathological case where that doesn't hold, the fail-closed re-seed (WS-2 fix 2) means the WORST outcome is holding a stale cap, never an un-commanded restore.",
+			HoldS:      consumerRestartHoldS,
+			Extended:   true, // ≥6 min hold (consumerRestartQuiescenceS+consumerRestartRecoveryWindowS) — RSK-12; run via --only/--extended, 10x solo per HANDOFF.md §8 WS-2's gate
+			Fix:        "cmd/hub/desired.go: desiredHeartbeatInterval re-stamp must actually be firing (check lexa_hub_desired_publishes_total climbing during quiescence, not just on content change). cmd/modbus/reconcile_solar.go: seedRestoreCeiling/reseedFromStaleDoc must fail closed to the last-known cap, never restore, when the first doc lexa-modbus sees this restart is stale.",
+			setup: func(d *mayhemDriver) (*activeConstraint, error) {
+				// SSH probe first, same discipline as hub-restart-mid-cap/disk-full:
+				// without bench SSH this scenario cannot restart lexa-modbus, and an
+				// INCONCLUSIVE setup error beats a fake verdict.
+				if err := d.hubSSH("true"); err != nil {
+					return nil, fmt.Errorf("hub SSH unavailable (need key auth to the hub Pi): %w", err)
+				}
+				return armExportCap(d, consumerRestartHoldS, "mayhem: static zero-export cap held through quiescence, then a lexa-modbus restart")
+			},
+			perTick: func(d *mayhemDriver, i int) {
+				// Environment held perfectly static for the ENTIRE scenario —
+				// the point is a standing cap whose desired-doc content never
+				// changes once converged (STOCK-realistic quiescence), not a
+				// fault that itself evolves.
+				d.injectEnv(d.pvHighW, loadLow)
+				if i == consumerRestartQuiescenceS {
+					// consumerRestartQuiescenceS ticks of unchanged content have
+					// now elapsed (default 1 tick/s sampling — mayDefaultSampleMs)
+					// — restart the CONSUMER, not the hub itself (hub-restart-
+					// mid-cap already covers that). Async: a systemctl restart +
+					// service startup takes several seconds and must not stall
+					// this tick's sampling.
+					go func() { _ = d.hubSSH("sudo systemctl restart lexa-modbus") }()
+				}
+			},
+			evaluate: diagnoseConsumerRestartAfterQuiescence,
+			teardown: func(d *mayhemDriver) {},
 		},
 		func() *mayScenario {
 			// netemModifier-as-modifier: mirrors suppressDefault's
