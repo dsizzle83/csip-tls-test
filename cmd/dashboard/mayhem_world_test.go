@@ -581,3 +581,167 @@ func TestDiagnoseConsumerRestartAfterQuiescence_NoSamples(t *testing.T) {
 		t.Fatalf("verdict = %s, want INCONCLUSIVE", f.Verdict)
 	}
 }
+
+// ── WS-4 northbound-restart-mid-breach (docs/refactor/HANDOFF.md §8, AD-016) ─
+
+// nbRestartCons mirrors exportCons()/importCons1000()'s helper shape for this
+// scenario's constraint: an unmeetable 0 W import cap.
+func nbRestartCons() *activeConstraint {
+	return &activeConstraint{Typ: "importCap", LimW: 0, MRID: "M-nbrestart0001"}
+}
+
+// nbRestartSamples builds a timeline for
+// diagnoseNorthboundRestartMidBreach: n samples at 1 Hz, GridOK/HubReachable
+// true throughout by default (mut overrides per test) — this scenario's
+// judging signal is gridsim's own /admin/alerts record
+// (maySample.CannotComplyCount), not grid/solar telemetry, so those stay
+// healthy unless a test is specifically exercising the probe-gap path.
+func nbRestartSamples(n int, mut func(i int, s *maySample)) []maySample {
+	out := make([]maySample, n)
+	for i := range out {
+		s := maySample{T: float64(i), GridOK: true, SolarOK: true, HubReachable: true}
+		mut(i, &s)
+		out[i] = s
+	}
+	return out
+}
+
+// TestWorldScenarios_NorthboundRestartMidBreachPresent locks the
+// catalogue-registration shape: present exactly once, every stage wired,
+// NOT Extended (this is a release-gate scenario per AD-016's own "Gate"
+// note — it belongs in the default campaign, unlike consumer-restart-after-
+// quiescence's multi-minute quiescence wait), and an SSH probe in setup
+// with the same INCONCLUSIVE-without-SSH contract as its siblings (not
+// re-verified here with a real subprocess — same scope note as
+// TestWorldScenarios_ConsumerRestartAfterQuiescencePresent above).
+func TestWorldScenarios_NorthboundRestartMidBreachPresent(t *testing.T) {
+	d := newMayhemDriver(map[string]string{"hub": "http://69.0.0.1:9100"})
+	scs := d.worldScenarios()
+
+	var found *mayScenario
+	n := 0
+	for _, sc := range scs {
+		if sc.ID == "northbound-restart-mid-breach" {
+			found = sc
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf(`worldScenarios() must contain exactly one "northbound-restart-mid-breach", got %d`, n)
+	}
+	if found.Extended {
+		t.Error("northbound-restart-mid-breach must NOT be Extended — it's a release-gate scenario (AD-016), it belongs in the default campaign")
+	}
+	if found.HoldS <= 0 || found.HoldS > 360 {
+		t.Errorf("HoldS = %d, want (0, 360] — a bounded, non-Extended hold", found.HoldS)
+	}
+	if found.setup == nil || found.perTick == nil || found.evaluate == nil || found.teardown == nil {
+		t.Error("every scenario stage (setup/perTick/evaluate/teardown) must be wired")
+	}
+}
+
+// TestDiagnoseNorthboundRestartMidBreach_Pass: gridsim recorded exactly one
+// CannotComply for the episode's mRID across the whole window, including
+// the restart — the AD-016 guarantee holding.
+func TestDiagnoseNorthboundRestartMidBreach_Pass(t *testing.T) {
+	s := nbRestartSamples(nbRestartHoldS, func(i int, smp *maySample) {
+		smp.CannotComplyCount = 0
+		if i >= nbRestartBreachDeadlineS {
+			smp.CannotComplyCount = 1
+		}
+	})
+	f := diagnoseNorthboundRestartMidBreach(scFor("northbound-restart-mid-breach"), nbRestartCons(), s, float64(nbRestartBreachDeadlineS))
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS (%s): %v", f.Verdict, f.Headline, f.Diagnosis)
+	}
+}
+
+// TestDiagnoseNorthboundRestartMidBreach_Duplicate: a second CannotComply
+// lands for the SAME mRID after the restart — the persisted dedupe state
+// did not survive it.
+func TestDiagnoseNorthboundRestartMidBreach_Duplicate(t *testing.T) {
+	s := nbRestartSamples(nbRestartHoldS, func(i int, smp *maySample) {
+		switch {
+		case i < nbRestartBreachDeadlineS:
+			smp.CannotComplyCount = 0
+		case i < nbRestartBreachDeadlineS+30:
+			smp.CannotComplyCount = 1
+		default:
+			smp.CannotComplyCount = 2 // the restart caused a re-post
+		}
+	})
+	f := diagnoseNorthboundRestartMidBreach(scFor("northbound-restart-mid-breach"), nbRestartCons(), s, float64(nbRestartBreachDeadlineS))
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (a duplicate POST must never pass)", f.Verdict)
+	}
+	assertDiag(t, f, "idempotent")
+}
+
+// TestDiagnoseNorthboundRestartMidBreach_NeverPosted: the unmeetable cap
+// never produced a CannotComply anywhere in gridsim's alert record — the
+// lost-compliance-record case AD-016 does not fully close.
+func TestDiagnoseNorthboundRestartMidBreach_NeverPosted(t *testing.T) {
+	s := nbRestartSamples(nbRestartHoldS, func(i int, smp *maySample) {
+		smp.CannotComplyCount = 0
+	})
+	f := diagnoseNorthboundRestartMidBreach(scFor("northbound-restart-mid-breach"), nbRestartCons(), s, float64(nbRestartBreachDeadlineS))
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (an unmeetable cap must eventually admit CannotComply)", f.Verdict)
+	}
+	assertDiag(t, f, "never")
+}
+
+// TestDiagnoseNorthboundRestartMidBreach_SampleErrorsInconclusive: gridsim/
+// meter unreachable for most of the run — an unjudgeable run must not be
+// scored PASS or FAIL, even if the few readings that did land looked clean.
+func TestDiagnoseNorthboundRestartMidBreach_SampleErrorsInconclusive(t *testing.T) {
+	s := nbRestartSamples(20, func(i int, smp *maySample) {
+		smp.GridOK = false // > half unreachable
+		smp.CannotComplyCount = 1
+	})
+	f := diagnoseNorthboundRestartMidBreach(scFor("northbound-restart-mid-breach"), nbRestartCons(), s, 5)
+	if f.Verdict != "INCONCLUSIVE" {
+		t.Fatalf("verdict = %s, want INCONCLUSIVE", f.Verdict)
+	}
+}
+
+// TestDiagnoseNorthboundRestartMidBreach_BlindOnMeterProbeGap: the meter
+// (importCap's judging sensor, judgingProbeOK) answered only 60% of ticks —
+// below the 80% availability floor but not enough to trip the >50%
+// SampleErrors INCONCLUSIVE gate — so a clean PASS reading must be
+// downgraded to BLIND rather than certify compliance the harness was not
+// actually watching for.
+func TestDiagnoseNorthboundRestartMidBreach_BlindOnMeterProbeGap(t *testing.T) {
+	s := nbRestartSamples(nbRestartHoldS, func(i int, smp *maySample) {
+		smp.GridOK = i%5 < 3 // 60% available — under the 80% floor
+		smp.CannotComplyCount = 1
+	})
+	f := diagnoseNorthboundRestartMidBreach(scFor("northbound-restart-mid-breach"), nbRestartCons(), s, float64(nbRestartBreachDeadlineS))
+	if f.Verdict != "BLIND" {
+		t.Fatalf("verdict = %s, want BLIND (probe mostly absent must never certify PASS)", f.Verdict)
+	}
+	assertDiag(t, f, "grid meter")
+}
+
+// TestDiagnoseNorthboundRestartMidBreach_NoSamples: the run-integrity
+// contract every diagnoser shares — an empty timeline is INCONCLUSIVE, never
+// a verdict this oracle didn't actually judge.
+func TestDiagnoseNorthboundRestartMidBreach_NoSamples(t *testing.T) {
+	f := diagnoseNorthboundRestartMidBreach(scFor("northbound-restart-mid-breach"), nbRestartCons(), nil, -1)
+	if f.Verdict != "INCONCLUSIVE" {
+		t.Fatalf("verdict = %s, want INCONCLUSIVE", f.Verdict)
+	}
+}
+
+// TestDiagnoseNorthboundRestartMidBreach_RestartNeverFired: restartAtS=-1
+// with real samples (the defensive "aborted before the trigger" case) must
+// still render a coherent headline/diagnosis, not panic or misreport a
+// restart time that never happened.
+func TestDiagnoseNorthboundRestartMidBreach_RestartNeverFired(t *testing.T) {
+	s := nbRestartSamples(10, func(i int, smp *maySample) { smp.CannotComplyCount = 0 })
+	f := diagnoseNorthboundRestartMidBreach(scFor("northbound-restart-mid-breach"), nbRestartCons(), s, -1)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (no CannotComply recorded)", f.Verdict)
+	}
+	assertDiag(t, f, "never fired")
+}

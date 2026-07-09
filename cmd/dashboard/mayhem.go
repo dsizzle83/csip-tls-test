@@ -115,8 +115,18 @@ type maySample struct {
 	WallUnix         int64   `json:"wall_unix"`   // sampler wall clock (unix) — server time = WallUnix + ClockOffsetS
 	ClockOffsetS     int64   `json:"clock_offset_s"`
 
-	CannotComply bool     `json:"cannot_comply"` // hub posted a CannotComply for the active mRID
-	Decisions    []string `json:"decisions,omitempty"`
+	CannotComply bool `json:"cannot_comply"` // hub posted a CannotComply for the active mRID
+	// CannotComplyCount is how many CannotComply Responses gridsim has
+	// recorded for the active mRID as of this sample (WS-4.5,
+	// docs/refactor/HANDOFF.md §8, csip-tls-test repo) — distinct from
+	// CannotComply's presence-only bool. gridsim's /admin/alerts accumulates
+	// one entry per POST received and never removes one, so this is
+	// monotonically non-decreasing across a scenario's samples; a diagnoser
+	// proving "exactly one, no duplicate re-post" (e.g. across a
+	// mid-episode northbound restart) reads the LAST sample's count rather
+	// than the presence bool.
+	CannotComplyCount int      `json:"cannot_comply_count"`
+	Decisions         []string `json:"decisions,omitempty"`
 
 	MeterStale bool `json:"meter_stale"` // hub flagged the grid meter frozen (detected INV-STALE)
 	EvStale    bool `json:"ev_stale"`    // hub flagged an EVSE's telemetry silent (detected INV-EVBLIND)
@@ -689,7 +699,10 @@ func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
 	}
 	// A CannotComply alert is only meaningful while a real control is in force.
 	if cons != nil && cons.MRID != "" {
-		s.CannotComply = d.reportedCannotComply(cons.MRID)
+		if n := d.cannotComplyCount(cons.MRID); n >= 0 {
+			s.CannotComply = n > 0
+			s.CannotComplyCount = n
+		}
 	}
 	return s
 }
@@ -2282,21 +2295,35 @@ func (d *mayhemDriver) deleteControls(program int) {
 	}
 }
 
-func (d *mayhemDriver) reportedCannotComply(mrid string) bool {
+// cannotComplyCount returns how many CannotComply Response POSTs gridsim has
+// recorded for mrid (WS-4.5, docs/refactor/HANDOFF.md §8) — the ground-truth
+// count backing maySample.CannotComplyCount. Returns -1, not 0, when gridsim
+// is unreachable: a caller distinguishing "confirmed zero" from "unknown"
+// (e.g. a scenario proving no duplicate POST landed) must not treat a probe
+// failure as a clean reading.
+func (d *mayhemDriver) cannotComplyCount(mrid string) int {
 	var out struct {
 		Alerts []struct {
 			Subject string `json:"subject"`
 		} `json:"alerts"`
 	}
 	if err := d.getJSON("gridsim", "/admin/alerts", &out); err != nil {
-		return false
+		return -1
 	}
+	n := 0
 	for _, a := range out.Alerts {
 		if a.Subject == mrid {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
+}
+
+// reportedCannotComply is cannotComplyCount's presence-only view, used by
+// every existing diagnoser that only cares WHETHER a CannotComply was
+// posted, not how many times.
+func (d *mayhemDriver) reportedCannotComply(mrid string) bool {
+	return d.cannotComplyCount(mrid) > 0
 }
 
 func (d *mayhemDriver) meterW() (float64, bool) {
