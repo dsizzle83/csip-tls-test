@@ -22,11 +22,15 @@ package main
 //	consumer-restart-after-quiescence  lexa-modbus restarts after minutes of an
 //	                         unchanging standing cap — WS-2 (HANDOFF.md §8):
 //	                         no un-commanded restore may land on the inverter
+//	northbound-restart-mid-breach  lexa-northbound restarts near the hub's
+//	                         breach edge — WS-4/AD-016 (HANDOFF.md §8):
+//	                         exactly one CannotComply POST per episode, never
+//	                         zero (lost) and never more than one (duplicate)
 //
-// hub-restart-mid-cap / disk-full / consumer-restart-after-quiescence need SSH
-// to the hub Pi (BatchMode, passwordless sudo per docs/BENCH.md); when SSH is
-// unavailable each reports INCONCLUSIVE at setup rather than a misleading
-// verdict.
+// hub-restart-mid-cap / disk-full / consumer-restart-after-quiescence /
+// northbound-restart-mid-breach need SSH to the hub Pi (BatchMode,
+// passwordless sudo per docs/BENCH.md); when SSH is unavailable each reports
+// INCONCLUSIVE at setup rather than a misleading verdict.
 //
 // netem-loss-export-cap, netem-reorder-northbound, netem-jitter-evse
 // (TASK-052 / GAP-11): the first scenarios that fault the actual wire. Every
@@ -796,6 +800,131 @@ func diagnoseConsumerRestartAfterQuiescence(sc *mayScenario, cons *activeConstra
 	return f
 }
 
+// ── WS-4 northbound-restart-mid-breach (docs/refactor/HANDOFF.md §8, AD-016) ─
+//
+// The gate scenario for lexa-hub's WS-4 work (item 3's MRID plumbing so
+// device-level non-convergence can reach CannotComply, and AD-016's
+// northbound responseTracker persistence, WS-4a — already merged in
+// lexa-hub, not touched by this scenario). Arms a genuinely unmeetable
+// import cap (0 W against a 5% SoC battery and a 5 kW load — the identical
+// setup already proven by battery-empty-import-cap to force a real
+// CannotComply with no restart in the mix), waits for the hub's internal
+// breach edge, then restarts lexa-northbound over SSH as close to that edge
+// as this harness can observe it.
+//
+// Edge detection: the hub's compliance-alert publish and northbound's
+// resulting CannotComply POST are synchronous and edge-triggered (no
+// periodic re-alert for a continuing episode — cmd/hub/main.go's
+// emitAlerts only runs on a breach onset/clear/mRID-switch), so the
+// realistic window this scenario can win is "restart northbound within a
+// poll cycle of the edge, before or shortly after its own near-instant
+// POST" — not a multi-second cadence gap. This scenario polls lexa-hub's
+// lexa_hub_breach_active gauge (readMetricCounter, TASK-044) every tick and
+// fires the restart the instant it reads 1, falling back to a fixed
+// deadline tick if the metrics endpoint isn't deployed on this bench
+// (readMetricCounter's own contract: ok=false means unprovable, never "0").
+// In practice the restart will usually land AFTER northbound's own POST
+// already completed — which is still exactly the guarantee worth proving:
+// AD-016's persisted alerted-map dedupe must make that restart a no-op, not
+// a duplicate POST.
+//
+// Verification: gridsim's /admin/alerts is the utility's own observable
+// record (ComplianceAlert, sim/gridsim/server.go) — this scenario counts it
+// directly (maySample.CannotComplyCount) rather than SSH-grepping the
+// northbound journal, since the admin API already exposes exactly what's
+// needed (checked first, per this scenario's own launch brief).
+const (
+	// nbRestartBreachDeadlineS bounds how long perTick waits for
+	// lexa_hub_breach_active==1 before restarting lexa-northbound anyway —
+	// battery-empty-import-cap's own proven 90 s hold comfortably exceeds
+	// the real debounce this cap takes to register as a breach, so 40 s is
+	// generous margin for the edge to have already fired by then.
+	nbRestartBreachDeadlineS = 40
+	// nbRestartSettleS is watched AFTER the restart for a delayed duplicate
+	// CannotComply POST — generous for a systemctl restart + MQTT
+	// reconnect + resubscribe.
+	nbRestartSettleS = 60
+	// nbRestartHoldS: worst-case wait for the edge + restart/reconnect
+	// overhead + the settle tail, with margin. Well under the 6 min
+	// Extended bound (RSK-12) — this is a release-gate scenario (AD-016's
+	// own "Gate" note), it belongs in the default campaign rotation, not
+	// opt-in only.
+	nbRestartHoldS = nbRestartBreachDeadlineS + 20 + nbRestartSettleS
+)
+
+// diagnoseNorthboundRestartMidBreach judges northbound-restart-mid-breach.
+// Ground truth is gridsim's own /admin/alerts record (maySample.
+// CannotComplyCount, monotonic non-decreasing across the run) — not the
+// hub's or northbound's self-reported state. restartAtS is the tick (in
+// scenario-relative seconds) perTick actually fired the SSH restart at,
+// -1 if it never fired (only reachable if the run aborted mid-hold, which
+// run()'s own ctx.Err() handling already forces to INCONCLUSIVE before this
+// function's verdict is used).
+func diagnoseNorthboundRestartMidBreach(sc *mayScenario, cons *activeConstraint, s []maySample, restartAtS float64) mayFinding {
+	f := baseFinding(sc)
+	if len(s) == 0 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "no samples collected (aborted before any reading)"
+		return f
+	}
+	f.Metrics = scanSamples(cons, s)
+
+	if f.Metrics.SampleErrors > len(s)/2 {
+		f.Verdict = "INCONCLUSIVE"
+		f.Headline = "gridsim/meter unreachable for most of the run — cannot judge the CannotComply record"
+		f.Diagnosis = []string{
+			fmt.Sprintf("Sampling failed on %d of %d ticks; an unjudgeable run must not be scored PASS or FAIL.", f.Metrics.SampleErrors, len(s)),
+		}
+		return f
+	}
+
+	// gridsim's alert count is monotonic non-decreasing; the max across all
+	// samples is the definitive count even if one transient probe failure
+	// (count held at its prior value that tick) landed on the very last sample.
+	maxCount := 0
+	for _, smp := range s {
+		if smp.CannotComplyCount > maxCount {
+			maxCount = smp.CannotComplyCount
+		}
+	}
+
+	restartNote := "the restart never fired (scenario aborted before the breach edge)"
+	if restartAtS >= 0 {
+		restartNote = fmt.Sprintf("lexa-northbound was restarted at t=%.0fs", restartAtS)
+	}
+
+	switch {
+	case maxCount == 0:
+		f.Verdict = "FAIL"
+		f.Headline = "no CannotComply was ever posted for an unmeetable import cap"
+		f.Diagnosis = []string{
+			fmt.Sprintf("The cap (%.0f W, battery at SOC reserve) is physically unmeetable — battery-empty-import-cap already proves the hub detects and reports this with no restart in the mix. Here it never reached gridsim's /admin/alerts. %s.", cons.LimW, restartNote),
+			"Either the compliance-alert edge (non-retained MQTT, cmd/hub/main.go's emitAlerts) fired while lexa-northbound was down and nothing recovered it, or the breach itself never formed this run; check the hub's own lexa_hub_breach_active / journal evidence against gridsim's alert log to tell the two apart.",
+			"AD-016 (lexa-hub docs/refactor/02_ARCHITECTURE_DECISIONS.md) persists northbound's posted/alerted dedupe state across a restart, which prevents a DUPLICATE re-post — it does not, by itself, recover a ComplianceAlert message northbound was never connected to receive (that message is not retained and the MQTT session is not persistent). A reproducible zero here is a real gap in the restart-safety guarantee, not an artifact of this harness.",
+		}
+		f.Fix = "internal/northbound/responses/persist.go + tracker.go (lexa-hub): confirm response_state_path is configured (not \"off\") and LoadState actually runs at Tracker construction (cmd/northbound/main.go). If persistence is wired correctly and this still reproduces, the gap is upstream of AD-016's scope — northbound needs a way to reconcile a currently-open breach episode on startup, not only react to the edge-triggered MQTT alert."
+		forceBlindOnConstraintProbeGap(&f, cons, s)
+		return f
+	case maxCount > 1:
+		f.Verdict = "FAIL"
+		f.Headline = fmt.Sprintf("%d CannotComply POSTs recorded for one episode — a duplicate", maxCount)
+		f.Diagnosis = []string{
+			fmt.Sprintf("gridsim's /admin/alerts recorded %d Responses with subject=%s, not 1. %s.", maxCount, shortMRID(cons.MRID), restartNote),
+			"AD-016's northbound responseTracker persistence (posted/alerted NDJSON, internal/northbound/responses/persist.go) exists specifically to make a restart mid-episode idempotent — this is that guarantee failing.",
+		}
+		f.Fix = "internal/northbound/responses/persist.go + tracker.go (lexa-hub): confirm AlertCannotComply's alerted-map entry is actually persisted (Store.Append) AND loaded back via LoadState before the restart landed — a config default of response_state_path=\"off\", or persistence wired but not loaded at startup, reproduces exactly this."
+		return f
+	default: // maxCount == 1
+		f.Verdict = "PASS"
+		f.Headline = fmt.Sprintf("exactly one CannotComply POST survived the restart (%s)", restartNote)
+		f.Diagnosis = []string{
+			fmt.Sprintf("gridsim's /admin/alerts recorded exactly one Response for subject=%s across the whole window, including the lexa-northbound restart. AD-016's persisted dedupe state held.", shortMRID(cons.MRID)),
+		}
+	}
+	forceBlindOnConstraintProbeGap(&f, cons, s)
+	return f
+}
+
 // worldScenarios is appended to the curated suite by scenarios().
 func (d *mayhemDriver) worldScenarios() []*mayScenario {
 	const loadLow = 250.0
@@ -1202,6 +1331,62 @@ func (d *mayhemDriver) worldScenarios() []*mayScenario {
 			evaluate: diagnoseConsumerRestartAfterQuiescence,
 			teardown: func(d *mayhemDriver) {},
 		},
+		func() *mayScenario {
+			// restartAtS is written once by perTick (single-threaded sampling
+			// goroutine — no lock needed) and read by the evaluate closure
+			// below, mirroring the netemTeardown/restoreDefault closure-capture
+			// shape used elsewhere in this file to smuggle scenario-run state
+			// from setup/perTick into evaluate/teardown.
+			restartAtS := -1.0
+			return &mayScenario{
+				ID: "northbound-restart-mid-breach", Name: "lexa-northbound restarts between the breach edge and its CannotComply POST (WS-4)",
+				Category:   "Hub resilience (restart safety, AD-016)",
+				Hypothesis: "The hub's compliance-alert MQTT publish is non-retained and fires exactly once per breach onset (cmd/hub/main.go's emitAlerts). A lexa-northbound restart landing near that edge risks either never seeing the alert (a lost, un-recorded CannotComply the utility was owed) or, on recovery, re-posting a duplicate for an episode it already acknowledged before the restart.",
+				Expected:   "AD-016's persisted responseTracker dedupe state (internal/northbound/responses/persist.go, lexa-hub) makes the restart a no-op from the utility's point of view: gridsim's own Response record (/admin/alerts) shows exactly ONE CannotComply for the episode, never zero and never more than one.",
+				HoldS:      nbRestartHoldS,
+				Fix:        "internal/northbound/responses/tracker.go + persist.go (lexa-hub, AD-016): a duplicate means the persisted alerted-map dedupe isn't surviving the restart (response_state_path misconfigured, or not loaded at Tracker construction); a missing CannotComply means the compliance-alert edge was never recovered — see the diagnoser's own Fix text for the split.",
+				setup: func(d *mayhemDriver) (*activeConstraint, error) {
+					// SSH probe first, same discipline as hub-restart-mid-cap/
+					// disk-full/consumer-restart-after-quiescence: without bench SSH
+					// this scenario cannot restart lexa-northbound, and an
+					// INCONCLUSIVE setup error beats a fake verdict. lexa-northbound
+					// runs on the SAME host as the hub (docs/BENCH.md: all six lexa-*
+					// services share one box) — hubSSH's existing host/user
+					// derivation (backends["hub"] + LEXA_SSH_USER) already targets it
+					// correctly; no separate SSH target is needed.
+					if err := d.hubSSH("true"); err != nil {
+						return nil, fmt.Errorf("hub SSH unavailable (need key auth to the hub/northbound host): %w", err)
+					}
+					// Steal battery-empty-import-cap's exact setup (qa/scenarios/
+					// battery-empty-import-cap.json): a genuinely unmeetable 0 W
+					// import cap against a 5%-SoC battery and a 5 kW load — already
+					// proven to force a real CannotComply with no restart involved.
+					_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 5, "Conn": 1})
+					d.injectEnv(300, 5000)
+					return d.postCap("importCap", 0, nbRestartHoldS, "mayhem: zero import cap with an empty battery, lexa-northbound restarted near the breach edge (WS-4, AD-016)")
+				},
+				perTick: func(d *mayhemDriver, i int) {
+					d.injectEnv(300, 5000)
+					if restartAtS >= 0 {
+						return // already fired
+					}
+					edge := i >= nbRestartBreachDeadlineS // fallback: metrics unavailable, or the edge hasn't shown by the deadline — restart anyway so the scenario still exercises survival
+					if v, ok := d.readMetricCounter("lexa_hub_breach_active"); ok && v >= 0.5 {
+						edge = true
+					}
+					if edge {
+						restartAtS = float64(i)
+						// Async: a systemctl restart + service startup takes several
+						// seconds and must not stall this tick's sampling.
+						go func() { _ = d.hubSSH("sudo systemctl restart lexa-northbound") }()
+					}
+				},
+				evaluate: func(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+					return diagnoseNorthboundRestartMidBreach(sc, cons, s, restartAtS)
+				},
+				teardown: func(d *mayhemDriver) {},
+			}
+		}(),
 		func() *mayScenario {
 			// netemModifier-as-modifier: mirrors suppressDefault's
 			// arm-in-setup / restore-in-teardown shape. netemTeardown stays
