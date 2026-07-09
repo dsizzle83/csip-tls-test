@@ -23,11 +23,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +51,21 @@ const (
 	mayConvergeHoldS     = 10 // the cap must stay within-limit for this many trailing seconds to count as converged
 
 	mayEVLiveDrawW = 500 // an EVSE drawing more than this is "actively charging" — the floor for judging hub-vs-truth EV divergence
+
+	// mayJudgeAbsentBlindFrac is how much of a scenario's hold window an
+	// oracle's JUDGING sensor — the one whose reading breachOver / the
+	// relevant invariant actually checks (solar for genLimit, the grid meter
+	// for export/import, the battery sim for INV-SOC) — may be absent before
+	// a clean read is untrustworthy (WS-3). breachOver and invSOC both treat
+	// an absent judging sensor as "no breach this tick", so a probe that is
+	// dead for most of the window manufactures a PASS out of silence rather
+	// than measured compliance. 20% tolerates a few dropped polls (bench
+	// timing jitter, one slow HTTP round trip) without tripping; a HIL fault
+	// that actually kills the probe for a meaningful slice of the hold
+	// window does. See forceBlindOnProbeGap: it only ever tightens a
+	// would-be PASS to BLIND, never a FAIL/DEGRADED reached from data the
+	// sensor DID deliver.
+	mayJudgeAbsentBlindFrac = 0.20
 )
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -173,6 +191,15 @@ type mayhemDriver struct {
 	// zero value for every test driver built via newMayhemDriver(backends),
 	// so existing tests are unaffected; main.go sets it explicitly.
 	scenarioDir string
+
+	// scenarioCtx is the CURRENT scenario's cancellation context (WS-3
+	// run-integrity hardening), set by run() before calling setup and
+	// canceled the instant the hold ends, before teardown runs. Delayed-fault
+	// goroutines started via afterDelay read it so a fault that hasn't fired
+	// yet when the scenario moves to teardown is dropped instead of landing
+	// after teardown's own cleanup — teardown is always the last writer.
+	// Guarded by mu like every other status field.
+	scenarioCtx context.Context
 }
 
 func newMayhemDriver(backends map[string]string) *mayhemDriver {
@@ -266,7 +293,14 @@ func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req mayhemStartReq
-	_ = json.NewDecoder(r.Body).Decode(&req) // empty body ⇒ defaults
+	// An empty body (io.EOF) keeps the request-level defaults, same as before —
+	// but a NON-empty malformed body (bad JSON, wrong types) must be rejected
+	// rather than silently discarded, which used to launch the full hostile
+	// suite on a typo'd request (WS-3 run-integrity hardening).
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, fmt.Sprintf("malformed request body: %v", err), http.StatusBadRequest)
+		return
+	}
 	if req.SampleMs < 200 {
 		req.SampleMs = mayDefaultSampleMs
 	}
@@ -324,9 +358,32 @@ func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Unlock()
 
-	go d.run(ctx, scenarios, time.Duration(req.SampleMs)*time.Millisecond)
+	go d.runGuarded(ctx, scenarios, time.Duration(req.SampleMs)*time.Millisecond)
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]any{"scenarios": len(scenarios), "sample_ms": req.SampleMs, "chaos_seed": chaosSeed})
+}
+
+// runGuarded wraps run() with a recover() so a bug escaping a diagnoser (a
+// nil-pointer, an index panic, whatever) aborts THIS run and keeps the
+// dashboard process alive for the next one, instead of taking the whole
+// server down mid-campaign (WS-3 run-integrity hardening). run()'s own
+// `defer d.restoreBench()` still fires during the panic's stack unwind
+// before this recovers it, so the bench is restored either way; this only
+// has to fix up d.status, since run()'s normal d.finish path never reached.
+func (d *mayhemDriver) runGuarded(ctx context.Context, scenarios []*mayScenario, sample time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("mayhem: run panicked, aborting run: %v\n%s", r, debug.Stack())
+			d.mu.Lock()
+			d.status.Running = false
+			d.status.Finished = false
+			d.status.Aborted = true
+			d.status.Phase = "done"
+			d.status.LastError = fmt.Sprintf("internal panic: %v", r)
+			d.mu.Unlock()
+		}
+	}()
+	d.run(ctx, scenarios, sample)
 }
 
 func (d *mayhemDriver) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -408,15 +465,31 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		// Isolate each scenario from the previous one's device/fault state.
 		d.resetForScenario()
 
+		// scenCtx bounds THIS scenario's delayed-fault goroutines (d.afterDelay) —
+		// canceled below the instant the hold ends, before teardown runs, so a
+		// fault goroutine still waiting on its timer bails out instead of firing
+		// after teardown already cleaned up (WS-3 run-integrity: teardown is
+		// last-writer-wins). Parented on the run's own ctx so a full-run abort
+		// cancels it too.
+		scenCtx, scenCancel := context.WithCancel(ctx)
+		d.mu.Lock()
+		d.scenarioCtx = scenCtx
+		d.mu.Unlock()
+
 		cons := &activeConstraint{Typ: "none"}
 		if sc.setup != nil {
 			c, err := sc.setup(d)
 			if err != nil {
+				scenCancel() // setup failed — nothing from it should fire later
+				headline := "could not arm the fault"
+				if ctx.Err() != nil {
+					headline += " (run aborted)"
+				}
 				d.appendFinding(mayFinding{
 					ID: sc.ID, Name: sc.Name, Category: sc.Category,
 					Hypothesis: sc.Hypothesis, Expected: sc.Expected,
 					Verdict:   "INCONCLUSIVE",
-					Headline:  "could not arm the fault",
+					Headline:  headline,
 					Diagnosis: []string{fmt.Sprintf("Setup failed: %v. The bench may be down or a sim unreachable — fix connectivity and re-run.", err)},
 					Fix:       sc.Fix,
 				})
@@ -435,7 +508,11 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		samples := d.holdAndSample(ctx, sc, cons, sample)
 
 		// Release the fault and clear any controls before judging recovery.
+		// Cancel the scenario context FIRST: any delayed-fault goroutine still
+		// waiting on its timer must see this before teardown does its own
+		// cleanup, so teardown is always the last writer.
 		d.setPhase(i, sc, "recover")
+		scenCancel()
 		if sc.teardown != nil {
 			sc.teardown(d)
 		}
@@ -446,20 +523,23 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		}
 		f := ev(sc, cons, samples)
 		f.Fix = sc.Fix
-		// Assertion engine: cross-cutting safety audit, independent of this
-		// scenario's own oracle. Surfaced on every finding; a safety violation the
-		// scenario's own oracle would miss (back-feed during a disconnect, a pack
-		// past its reserve, an impossible EV draw, a stale control retained)
-		// escalates the verdict per escalateForAudit so a PASS can never hide one.
-		if audit := safetyAudit(cons, samples); len(audit) > 0 {
-			f.Diagnosis = append(f.Diagnosis, "⚠ "+invSummaryLine("SAFETY AUDIT", audit))
-			if nv, hl := escalateForAudit(f.Verdict, audit); nv != f.Verdict {
-				f.Verdict = nv
-				f.Headline = hl
+		if ctx.Err() != nil {
+			// Run-integrity hardening (WS-3): an abort mid-scenario truncates the
+			// sample window the diagnoser just judged, so whatever verdict it
+			// computed from a partial hold is not a completed judgement. Force
+			// INCONCLUSIVE with a distinct "aborted" marker rather than let a
+			// partial-window PASS/FAIL stand as if the scenario had run to term.
+			elapsed := 0.0
+			if len(samples) > 0 {
+				elapsed = samples[len(samples)-1].T
 			}
-		} else {
-			f.Diagnosis = append(f.Diagnosis, invSummaryLine("SAFETY AUDIT", nil))
+			f.Verdict = "INCONCLUSIVE"
+			f.Headline = fmt.Sprintf("aborted mid-scenario: %s", f.Headline)
+			f.Diagnosis = append([]string{fmt.Sprintf(
+				"The mayhem run was aborted %.0fs into this scenario's %ds hold window (only %d sample(s) collected). Re-run this scenario to completion before trusting any verdict.",
+				elapsed, sc.HoldS, len(samples))}, f.Diagnosis...)
 		}
+		f = applySafetyAudit(f, cons, samples)
 		d.appendFinding(f)
 
 		if ctx.Err() != nil {
@@ -468,6 +548,36 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		}
 	}
 	d.finish(false, "")
+}
+
+// applySafetyAudit runs the cross-cutting safety-audit assertion engine
+// against a scenario's finding — independent of that scenario's own oracle, a
+// safety violation the targeted diagnoser would miss (back-feed during a
+// disconnect, a pack past its reserve, an impossible EV draw, a stale control
+// retained) is still surfaced, and escalates the verdict per escalateForAudit
+// so a PASS can never hide one.
+//
+// WS-3: the audit's own INV-SOC leg (pastSettling(invSOC(s)) inside
+// safetyAudit) is judged from the battery sim exactly like diagnoseSOC's, so
+// it gets the identical probe-availability treatment — if the pack's
+// ground-truth reading was mostly absent for this scenario's window, "the
+// audit found no INV-SOC violation" is not trustworthy silence, and a PASS
+// this cross-cutting check would otherwise wave through is downgraded to
+// BLIND rather than certifying a battery-safety property the audit never
+// actually got to observe. Extracted from the run loop so it is unit-testable
+// without a live bench.
+func applySafetyAudit(f mayFinding, cons *activeConstraint, samples []maySample) mayFinding {
+	if audit := safetyAudit(cons, samples); len(audit) > 0 {
+		f.Diagnosis = append(f.Diagnosis, "⚠ "+invSummaryLine("SAFETY AUDIT", audit))
+		if nv, hl := escalateForAudit(f.Verdict, audit); nv != f.Verdict {
+			f.Verdict = nv
+			f.Headline = hl
+		}
+	} else {
+		f.Diagnosis = append(f.Diagnosis, invSummaryLine("SAFETY AUDIT", nil))
+	}
+	forceBlindOnBatteryProbeGap(&f, samples)
+	return f
 }
 
 // holdAndSample runs the scenario hold, calling perTick before each sample so a
@@ -494,6 +604,32 @@ func (d *mayhemDriver) holdAndSample(ctx context.Context, sc *mayScenario, cons 
 		d.pushLive(s)
 	}
 	return samples
+}
+
+// afterDelay runs fn after delay UNLESS the current scenario has already
+// moved past its hold (its scenarioCtx canceled) — the guard that makes
+// teardown last-writer-wins over an in-flight delayed-fault goroutine (WS-3
+// run-integrity hardening). Scenario setup/perTick funcs call this instead of
+// a bare `go func(){ time.Sleep(d); ... }()` so a slow hold or an abort can
+// never let the fault land after teardown already cleared it — e.g.
+// malformScenario's "let the hub adopt a clean cap, THEN serve garbage after
+// 8s" pattern must not re-arm the malform after the scenario has ended.
+func (d *mayhemDriver) afterDelay(delay time.Duration, fn func()) {
+	d.mu.Lock()
+	ctx := d.scenarioCtx
+	d.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		select {
+		case <-time.After(delay):
+			if ctx.Err() == nil {
+				fn()
+			}
+		case <-ctx.Done():
+		}
+	}()
 }
 
 // ── Sampling ──────────────────────────────────────────────────────────────────
@@ -576,6 +712,107 @@ func breachOver(cons *activeConstraint, s maySample) float64 {
 		return s.SolarW - (cons.LimW + tol)
 	}
 	return -1
+}
+
+// ── Probe availability (WS-3) ───────────────────────────────────────────────
+//
+// The vacuous-PASS gap: breachOver (above) and invSOC (invariants.go) both
+// treat an absent judging sensor as "no breach this tick" — correct for a
+// single dropped poll, but if the sensor is dead for most of the hold window
+// the oracle is reading silence, not compliance. A dead solar probe on a
+// genLimit scenario, or a dead battery sim on an INV-SOC scenario, must not
+// be able to manufacture a PASS. These helpers make probe availability
+// constraint-aware: each oracle is gated by the fraction of the window its
+// OWN judging sensor actually answered, not by an unrelated one.
+
+// probeAvailFrac is the fraction of s for which ok reports the judging sensor
+// produced a coherent reading. An empty timeline reports 0 (unavailable) so a
+// caller never mistakes "no samples" for a healthy probe.
+func probeAvailFrac(s []maySample, ok func(maySample) bool) float64 {
+	if len(s) == 0 {
+		return 0
+	}
+	n := 0
+	for _, smp := range s {
+		if ok(smp) {
+			n++
+		}
+	}
+	return float64(n) / float64(len(s))
+}
+
+// judgingProbeOK returns the availability predicate for the sensor a
+// constraint-cap oracle is actually judged from — mirroring breachOver's own
+// per-Typ switch so the availability tally can never disagree with what the
+// oracle reads. nil for a constraint type breachOver does not judge from a
+// probe at all (connect/fixed/none) — those are not gated here.
+func judgingProbeOK(typ string) func(maySample) bool {
+	switch typ {
+	case "exportCap", "importCap":
+		return func(s maySample) bool { return s.GridOK }
+	case "genLimit":
+		return func(s maySample) bool { return s.SolarOK }
+	default:
+		return nil
+	}
+}
+
+// judgingProbeLabel names the judging sensor for cons.Typ, for diagnosis text.
+func judgingProbeLabel(typ string) string {
+	switch typ {
+	case "exportCap", "importCap":
+		return "grid meter"
+	case "genLimit":
+		return "solar"
+	default:
+		return "probe"
+	}
+}
+
+// forceBlindOnProbeGap closes the WS-3 vacuous-PASS gap: if f is currently
+// PASS and the named judging sensor's availability over the window is below
+// the mayJudgeAbsentBlindFrac floor, this overrides the verdict to BLIND with
+// an explanation — the harness admits it was not watching for part of the
+// window rather than certifying compliance it never measured.
+//
+// A verdict that is already FAIL/DEGRADED/BLIND/INCONCLUSIVE is left
+// untouched: FAIL/DEGRADED were reached from data the sensor DID deliver
+// (breachOver/invSOC only ever count a breach off a coherent reading), and
+// downgrading a real finding to BLIND would hide it rather than fix the
+// blind spot this exists to close.
+func forceBlindOnProbeGap(f *mayFinding, label string, avail float64) {
+	if f.Verdict != "PASS" || avail >= 1-mayJudgeAbsentBlindFrac {
+		return
+	}
+	f.Verdict = "BLIND"
+	f.Metrics.HubBlind = true
+	f.Headline = fmt.Sprintf("%s probe absent for %.0f%% of the window — cannot trust the clean read", label, 100*(1-avail))
+	f.Diagnosis = append(f.Diagnosis, fmt.Sprintf(
+		"The %s judging sensor produced a coherent reading on only %.0f%% of samples (below the %.0f%% availability floor). An absent probe reads as \"no breach\" to the oracle, so this run's clean result is not evidence of compliance — the harness was not watching for part of the window. Fix the probe (or the fault injection wiring) and re-run before trusting this verdict.",
+		label, 100*avail, 100*(1-mayJudgeAbsentBlindFrac)))
+}
+
+// forceBlindOnConstraintProbeGap applies forceBlindOnProbeGap using the
+// judging sensor for cons.Typ — the shared choke point every constraint-cap
+// diagnoser (diagnoseConstraint, diagnoseMalform) calls before returning a
+// PASS built on breachOver(cons, ...).
+func forceBlindOnConstraintProbeGap(f *mayFinding, cons *activeConstraint, s []maySample) {
+	if cons == nil {
+		return
+	}
+	ok := judgingProbeOK(cons.Typ)
+	if ok == nil {
+		return
+	}
+	forceBlindOnProbeGap(f, judgingProbeLabel(cons.Typ), probeAvailFrac(s, ok))
+}
+
+// forceBlindOnBatteryProbeGap applies forceBlindOnProbeGap using the battery
+// sim as the judging sensor — INV-SOC's ground truth (invSOC, invariants.go)
+// and the safety audit's INV-SOC leg (pastSettling(invSOC(s)) inside
+// safetyAudit) both judge BatterySimW/BatSimSOC only when BatterySimOK.
+func forceBlindOnBatteryProbeGap(f *mayFinding, s []maySample) {
+	forceBlindOnProbeGap(f, "battery", probeAvailFrac(s, func(smp maySample) bool { return smp.BatterySimOK }))
 }
 
 // hubReactedSample reports whether the hub took a visible corrective action for
@@ -763,6 +1000,7 @@ func diagnoseConstraint(sc *mayScenario, cons *activeConstraint, s []maySample) 
 		f.Diagnosis = []string{
 			fmt.Sprintf("No breach across %d samples (%.0fs). Hub adopted=%v, commanded a correction=%v.", len(s), s[len(s)-1].T, m.HubAdopted, m.HubReacted),
 		}
+		forceBlindOnConstraintProbeGap(&f, cons, s)
 		return f
 	}
 
@@ -826,6 +1064,10 @@ func diagnoseConstraint(sc *mayScenario, cons *activeConstraint, s []maySample) 
 	}
 	diag = append(diag, invSummaryLine("INV-EXPORT", invExport(cons, s)))
 	f.Diagnosis = append(diag, hubVsRealLine(s))
+	// Covers the m.TailClean/ConvergedAtS<=deadline branch above, the only other
+	// path through this switch that can leave f.Verdict == "PASS" (a no-op for
+	// every DEGRADED/FAIL branch).
+	forceBlindOnConstraintProbeGap(&f, cons, s)
 	return f
 }
 
@@ -836,11 +1078,19 @@ func diagnoseConstraint(sc *mayScenario, cons *activeConstraint, s []maySample) 
 // measurement and reports it rather than trusting the write ACK.
 func diagnoseConverge(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
 	f := diagnoseConstraint(sc, cons, s)
-	// Re-frame: a breach here is expected while the device withholds the effect;
-	// the verdict turns on whether the hub admitted it.
-	if f.Verdict == "PASS" {
+	switch f.Verdict {
+	case "PASS":
+		// Re-frame: a breach here is expected while the device withholds the
+		// effect; the verdict turns on whether the hub admitted it.
 		f.Headline = "hub held the cap despite the device withholding the commanded effect"
 		f.Diagnosis = append(f.Diagnosis, "Output converged within the cap and held — another lever covered the gap, or the effect arrived before the settling deadline.")
+		return f
+	case "INCONCLUSIVE", "BLIND":
+		// The base constraint oracle already could not judge this window (meter
+		// mostly down ⇒ INCONCLUSIVE, or WS-3's probe-availability gate forced
+		// BLIND) — pass that verdict through unchanged. Falling into the
+		// unconditional FAIL at the bottom of this function would mislabel
+		// "couldn't see" as "device never honoured the write".
 		return f
 	}
 	if f.Metrics.ReportedCannot {
@@ -1064,6 +1314,12 @@ func diagnoseSOC(sc *mayScenario, cons *activeConstraint, s []maySample) mayFind
 		invSummaryLine("INV-EXPORT", expViol),
 		"The pack never left its SoC bounds and the active cap held — the hub kept it safe even though the device was commanded the wrong way.",
 	}
+	// WS-3: this PASS rests on two clean reads — invSOC found nothing wrong
+	// (judged from the battery sim) and the cap held (judged from cons.Typ's
+	// meter/solar probe). Either sensor being mostly absent makes "found
+	// nothing" indistinguishable from "wasn't looking".
+	forceBlindOnBatteryProbeGap(&f, s)
+	forceBlindOnConstraintProbeGap(&f, cons, s)
 	return f
 }
 
@@ -1156,10 +1412,9 @@ func malformScenario(id, name, kind, hypothesis string) *mayScenario {
 				return nil, err
 			}
 			// Let the hub adopt the safe cap on a clean walk, THEN serve garbage.
-			go func() {
-				time.Sleep(8 * time.Second)
+			d.afterDelay(8*time.Second, func() {
 				_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": kind})
-			}()
+			})
 			return cons, nil
 		},
 		perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
@@ -1218,6 +1473,7 @@ func diagnoseMalform(sc *mayScenario, cons *activeConstraint, s []maySample) may
 			invSummaryLine("INV-EXPORT", breaches),
 			hubVsRealLine(s),
 		}
+		forceBlindOnConstraintProbeGap(&f, cons, s)
 		return f
 	}
 	// There WAS a post-deadline breach. Distinguish a sustained unseat (the cap
@@ -2431,10 +2687,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 				}
 				// Let the hub adopt the safe cap on a clean walk, THEN start serving
 				// garbage — so there is a safe control for the malform to threaten.
-				go func() {
-					time.Sleep(8 * time.Second)
+				d.afterDelay(8*time.Second, func() {
 					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "dup_mrid"})
-				}()
+				})
 				return cons, nil
 			},
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
@@ -2471,10 +2726,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 					return nil, err
 				}
 				// Let the hub adopt the safe cap, then start serving the bad tariff.
-				go func() {
-					time.Sleep(8 * time.Second)
+				d.afterDelay(8*time.Second, func() {
 					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "bad_price_multiplier"})
-				}()
+				})
 				return cons, nil
 			},
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
@@ -2495,10 +2749,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 				if err != nil {
 					return nil, err
 				}
-				go func() {
-					time.Sleep(8 * time.Second)
+				d.afterDelay(8*time.Second, func() {
 					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "empty_curve_list"})
-				}()
+				})
 				return cons, nil
 			},
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
@@ -2634,10 +2887,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 					return nil, err
 				}
 				// Freeze the meter a few seconds in, after the breach is well underway.
-				go func() {
-					time.Sleep(8 * time.Second)
+				d.afterDelay(8*time.Second, func() {
 					_ = d.post("meter", "/control", map[string]any{"cmd": "pause"})
-				}()
+				})
 				return cons, nil
 			},
 			perTick: func(d *mayhemDriver, i int) {
