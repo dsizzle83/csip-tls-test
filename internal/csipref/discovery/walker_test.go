@@ -461,13 +461,13 @@ func TestDiscover_ResponseSetPath_Populated(t *testing.T) {
 	buildFullResourceTree(m)
 	// dcap points to /rsps (the list), not the POST target directly.
 	m.serve("/dcap", &model.DeviceCapability{
-		Resource:         model.Resource{Href: "/dcap"},
-		PollRate:         300,
-		TimeLink:         &model.Link{Href: "/tm"},
-		EndDeviceListLink: &model.ListLink{Link: model.Link{Href: "/edev"}, All: 3},
+		Resource:                 model.Resource{Href: "/dcap"},
+		PollRate:                 300,
+		TimeLink:                 &model.Link{Href: "/tm"},
+		EndDeviceListLink:        &model.ListLink{Link: model.Link{Href: "/edev"}, All: 3},
 		MirrorUsagePointListLink: &model.ListLink{Link: model.Link{Href: "/mup"}, All: 0},
-		ResponseSetListLink: &model.ListLink{Link: model.Link{Href: "/rsps"}, All: 1},
-		SelfDeviceLink:   &model.Link{Href: "/sdev"},
+		ResponseSetListLink:      &model.ListLink{Link: model.Link{Href: "/rsps"}, All: 1},
+		SelfDeviceLink:           &model.Link{Href: "/sdev"},
 	})
 	// /rsps → ResponseSetList → ResponseSet[0].ResponseList.Href is the POST target.
 	m.serve("/rsps", &model.ResponseSetList{

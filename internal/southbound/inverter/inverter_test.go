@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"csip-tls-test/sim/southbound"
 	model "lexa-proto/csipmodel"
 	"lexa-proto/modbus"
-	"csip-tls-test/sim/southbound"
 	"lexa-proto/sunspec"
 )
 

@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"lexa-proto/sunspec"
 	modbuslib "github.com/simonvetter/modbus"
+	"lexa-proto/sunspec"
 )
 
 // FaultKind enumerates the fault-injection behaviours a sim can be asked to

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/southbound/device"
 	"csip-tls-test/internal/southbound/registry"
+	model "lexa-proto/csipmodel"
 )
 
 // ── Mock device ───────────────────────────────────────────────────────────────

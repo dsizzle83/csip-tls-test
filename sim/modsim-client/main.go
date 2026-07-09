@@ -36,19 +36,19 @@ import (
 	"syscall"
 	"time"
 
-	model "lexa-proto/csipmodel"
 	"csip-tls-test/internal/southbound/inverter"
+	model "lexa-proto/csipmodel"
 )
 
 func main() {
-	url     := flag.String("url",     "", "Modbus server URL, e.g. tcp://192.168.0.50:5020 (required)")
-	unit    := flag.Uint("unit",     1,  "Modbus unit/slave ID (1 for most standalone inverters)")
+	url := flag.String("url", "", "Modbus server URL, e.g. tcp://192.168.0.50:5020 (required)")
+	unit := flag.Uint("unit", 1, "Modbus unit/slave ID (1 for most standalone inverters)")
 	timeout := flag.Duration("timeout", 3*time.Second, "Per-request Modbus timeout")
-	poll    := flag.Duration("poll",    0, "If >0, read measurements repeatedly at this interval until Ctrl-C")
+	poll := flag.Duration("poll", 0, "If >0, read measurements repeatedly at this interval until Ctrl-C")
 
 	// Control flags — applied once before the first measurement read.
-	connectFlag  := flag.String("connect",    "", "Set OpModConnect: true or false")
-	expLimW      := flag.Float64("exp-lim-w", 0, "Set export power limit in watts (0 = no change)")
+	connectFlag := flag.String("connect", "", "Set OpModConnect: true or false")
+	expLimW := flag.Float64("exp-lim-w", 0, "Set export power limit in watts (0 = no change)")
 
 	flag.Parse()
 

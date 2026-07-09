@@ -34,8 +34,8 @@ import (
 	"time"
 
 	"csip-tls-test/internal/csip/identity"
-	model "lexa-proto/csipmodel"
 	"csip-tls-test/sim/simapi"
+	model "lexa-proto/csipmodel"
 )
 
 // ContentType is the IEEE 2030.5 mandated content type (GEN.003).

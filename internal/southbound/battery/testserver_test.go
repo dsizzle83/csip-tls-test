@@ -15,7 +15,7 @@ import (
 const defaultTimeout = 2 * time.Second
 
 const (
-	testWMaxKwh = 10.0  // kWh capacity
+	testWMaxKwh = 10.0   // kWh capacity
 	testWMaxW   = 5000.0 // peak power watts
 )
 

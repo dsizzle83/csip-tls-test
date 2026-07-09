@@ -382,7 +382,7 @@ func TestFaultInvertSign(t *testing.T) {
 	fc.configureInvert(10, 12) // signed registers at addrs 10 and 12
 
 	// Unarmed: pass-through.
-	neg500 := uint16(0xFE0C) // int16(-500)
+	neg500 := uint16(0xFE0C)        // int16(-500)
 	in := []uint16{neg500, 42, 300} // addrs 10,11,12
 	if out, _ := fc.transportRead(10, in); int16(out[0]) != -500 || out[1] != 42 || int16(out[2]) != 300 {
 		t.Fatalf("unarmed passthrough = %v", out)

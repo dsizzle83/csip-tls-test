@@ -15,8 +15,8 @@ import (
 )
 
 func main() {
-	addr  := flag.String("addr", ":11111", "listen address")
-	lfdi  := flag.String("lfdi", "AB12CD34EF56789012345678901234567890ABCD",
+	addr := flag.String("addr", ":11111", "listen address")
+	lfdi := flag.String("lfdi", "AB12CD34EF56789012345678901234567890ABCD",
 		"client LFDI to expect (40 hex chars)")
 	flag.Parse()
 

@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"csip-tls-test/sim/tlsserver"
 	"csip-tls-test/internal/wolfssl"
+	"csip-tls-test/sim/tlsserver"
 )
 
 // TestMain initializes wolfSSL once per test binary. Same rationale as
