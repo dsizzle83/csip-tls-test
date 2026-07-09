@@ -17,7 +17,13 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HERE"
 
 echo "== QA unit regression: fault injectors + diagnosers =="
-go test ./sim/southbound/... ./sim/evsim/... ./sim/gridsim/... ./cmd/dashboard/...
+# -race (WS-7, HANDOFF §8): cmd/dashboard is concurrency-heavy (mayhem engine,
+# SSE /logs, WS handlers) and had no race coverage anywhere in CI. Needs
+# CGO_ENABLED=1 (cgo, not the wolfSSL sysroot); the caller (CI's pure-go job)
+# overrides the job-level CGO_ENABLED=0 for this step. Native local runs
+# default CGO_ENABLED=1 already (no cross-compile), so this is a no-op change
+# for `make qa` on a dev machine.
+go test -race ./sim/southbound/... ./sim/evsim/... ./sim/gridsim/... ./cmd/dashboard/...
 echo "== QA unit regression: PASS =="
 
 if [[ "${1:-}" == "--bench" ]]; then
