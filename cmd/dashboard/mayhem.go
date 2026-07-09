@@ -23,11 +23,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -188,6 +191,15 @@ type mayhemDriver struct {
 	// zero value for every test driver built via newMayhemDriver(backends),
 	// so existing tests are unaffected; main.go sets it explicitly.
 	scenarioDir string
+
+	// scenarioCtx is the CURRENT scenario's cancellation context (WS-3
+	// run-integrity hardening), set by run() before calling setup and
+	// canceled the instant the hold ends, before teardown runs. Delayed-fault
+	// goroutines started via afterDelay read it so a fault that hasn't fired
+	// yet when the scenario moves to teardown is dropped instead of landing
+	// after teardown's own cleanup — teardown is always the last writer.
+	// Guarded by mu like every other status field.
+	scenarioCtx context.Context
 }
 
 func newMayhemDriver(backends map[string]string) *mayhemDriver {
@@ -281,7 +293,14 @@ func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req mayhemStartReq
-	_ = json.NewDecoder(r.Body).Decode(&req) // empty body ⇒ defaults
+	// An empty body (io.EOF) keeps the request-level defaults, same as before —
+	// but a NON-empty malformed body (bad JSON, wrong types) must be rejected
+	// rather than silently discarded, which used to launch the full hostile
+	// suite on a typo'd request (WS-3 run-integrity hardening).
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, fmt.Sprintf("malformed request body: %v", err), http.StatusBadRequest)
+		return
+	}
 	if req.SampleMs < 200 {
 		req.SampleMs = mayDefaultSampleMs
 	}
@@ -339,9 +358,32 @@ func (d *mayhemDriver) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.Unlock()
 
-	go d.run(ctx, scenarios, time.Duration(req.SampleMs)*time.Millisecond)
+	go d.runGuarded(ctx, scenarios, time.Duration(req.SampleMs)*time.Millisecond)
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]any{"scenarios": len(scenarios), "sample_ms": req.SampleMs, "chaos_seed": chaosSeed})
+}
+
+// runGuarded wraps run() with a recover() so a bug escaping a diagnoser (a
+// nil-pointer, an index panic, whatever) aborts THIS run and keeps the
+// dashboard process alive for the next one, instead of taking the whole
+// server down mid-campaign (WS-3 run-integrity hardening). run()'s own
+// `defer d.restoreBench()` still fires during the panic's stack unwind
+// before this recovers it, so the bench is restored either way; this only
+// has to fix up d.status, since run()'s normal d.finish path never reached.
+func (d *mayhemDriver) runGuarded(ctx context.Context, scenarios []*mayScenario, sample time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("mayhem: run panicked, aborting run: %v\n%s", r, debug.Stack())
+			d.mu.Lock()
+			d.status.Running = false
+			d.status.Finished = false
+			d.status.Aborted = true
+			d.status.Phase = "done"
+			d.status.LastError = fmt.Sprintf("internal panic: %v", r)
+			d.mu.Unlock()
+		}
+	}()
+	d.run(ctx, scenarios, sample)
 }
 
 func (d *mayhemDriver) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -423,15 +465,31 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		// Isolate each scenario from the previous one's device/fault state.
 		d.resetForScenario()
 
+		// scenCtx bounds THIS scenario's delayed-fault goroutines (d.afterDelay) —
+		// canceled below the instant the hold ends, before teardown runs, so a
+		// fault goroutine still waiting on its timer bails out instead of firing
+		// after teardown already cleaned up (WS-3 run-integrity: teardown is
+		// last-writer-wins). Parented on the run's own ctx so a full-run abort
+		// cancels it too.
+		scenCtx, scenCancel := context.WithCancel(ctx)
+		d.mu.Lock()
+		d.scenarioCtx = scenCtx
+		d.mu.Unlock()
+
 		cons := &activeConstraint{Typ: "none"}
 		if sc.setup != nil {
 			c, err := sc.setup(d)
 			if err != nil {
+				scenCancel() // setup failed — nothing from it should fire later
+				headline := "could not arm the fault"
+				if ctx.Err() != nil {
+					headline += " (run aborted)"
+				}
 				d.appendFinding(mayFinding{
 					ID: sc.ID, Name: sc.Name, Category: sc.Category,
 					Hypothesis: sc.Hypothesis, Expected: sc.Expected,
 					Verdict:   "INCONCLUSIVE",
-					Headline:  "could not arm the fault",
+					Headline:  headline,
 					Diagnosis: []string{fmt.Sprintf("Setup failed: %v. The bench may be down or a sim unreachable — fix connectivity and re-run.", err)},
 					Fix:       sc.Fix,
 				})
@@ -450,7 +508,11 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		samples := d.holdAndSample(ctx, sc, cons, sample)
 
 		// Release the fault and clear any controls before judging recovery.
+		// Cancel the scenario context FIRST: any delayed-fault goroutine still
+		// waiting on its timer must see this before teardown does its own
+		// cleanup, so teardown is always the last writer.
 		d.setPhase(i, sc, "recover")
+		scenCancel()
 		if sc.teardown != nil {
 			sc.teardown(d)
 		}
@@ -461,6 +523,22 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		}
 		f := ev(sc, cons, samples)
 		f.Fix = sc.Fix
+		if ctx.Err() != nil {
+			// Run-integrity hardening (WS-3): an abort mid-scenario truncates the
+			// sample window the diagnoser just judged, so whatever verdict it
+			// computed from a partial hold is not a completed judgement. Force
+			// INCONCLUSIVE with a distinct "aborted" marker rather than let a
+			// partial-window PASS/FAIL stand as if the scenario had run to term.
+			elapsed := 0.0
+			if len(samples) > 0 {
+				elapsed = samples[len(samples)-1].T
+			}
+			f.Verdict = "INCONCLUSIVE"
+			f.Headline = fmt.Sprintf("aborted mid-scenario: %s", f.Headline)
+			f.Diagnosis = append([]string{fmt.Sprintf(
+				"The mayhem run was aborted %.0fs into this scenario's %ds hold window (only %d sample(s) collected). Re-run this scenario to completion before trusting any verdict.",
+				elapsed, sc.HoldS, len(samples))}, f.Diagnosis...)
+		}
 		f = applySafetyAudit(f, cons, samples)
 		d.appendFinding(f)
 
@@ -526,6 +604,32 @@ func (d *mayhemDriver) holdAndSample(ctx context.Context, sc *mayScenario, cons 
 		d.pushLive(s)
 	}
 	return samples
+}
+
+// afterDelay runs fn after delay UNLESS the current scenario has already
+// moved past its hold (its scenarioCtx canceled) — the guard that makes
+// teardown last-writer-wins over an in-flight delayed-fault goroutine (WS-3
+// run-integrity hardening). Scenario setup/perTick funcs call this instead of
+// a bare `go func(){ time.Sleep(d); ... }()` so a slow hold or an abort can
+// never let the fault land after teardown already cleared it — e.g.
+// malformScenario's "let the hub adopt a clean cap, THEN serve garbage after
+// 8s" pattern must not re-arm the malform after the scenario has ended.
+func (d *mayhemDriver) afterDelay(delay time.Duration, fn func()) {
+	d.mu.Lock()
+	ctx := d.scenarioCtx
+	d.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		select {
+		case <-time.After(delay):
+			if ctx.Err() == nil {
+				fn()
+			}
+		case <-ctx.Done():
+		}
+	}()
 }
 
 // ── Sampling ──────────────────────────────────────────────────────────────────
@@ -1308,10 +1412,9 @@ func malformScenario(id, name, kind, hypothesis string) *mayScenario {
 				return nil, err
 			}
 			// Let the hub adopt the safe cap on a clean walk, THEN serve garbage.
-			go func() {
-				time.Sleep(8 * time.Second)
+			d.afterDelay(8*time.Second, func() {
 				_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": kind})
-			}()
+			})
 			return cons, nil
 		},
 		perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
@@ -2584,10 +2687,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 				}
 				// Let the hub adopt the safe cap on a clean walk, THEN start serving
 				// garbage — so there is a safe control for the malform to threaten.
-				go func() {
-					time.Sleep(8 * time.Second)
+				d.afterDelay(8*time.Second, func() {
 					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "dup_mrid"})
-				}()
+				})
 				return cons, nil
 			},
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
@@ -2624,10 +2726,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 					return nil, err
 				}
 				// Let the hub adopt the safe cap, then start serving the bad tariff.
-				go func() {
-					time.Sleep(8 * time.Second)
+				d.afterDelay(8*time.Second, func() {
 					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "bad_price_multiplier"})
-				}()
+				})
 				return cons, nil
 			},
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
@@ -2648,10 +2749,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 				if err != nil {
 					return nil, err
 				}
-				go func() {
-					time.Sleep(8 * time.Second)
+				d.afterDelay(8*time.Second, func() {
 					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "empty_curve_list"})
-				}()
+				})
 				return cons, nil
 			},
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
@@ -2787,10 +2887,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 					return nil, err
 				}
 				// Freeze the meter a few seconds in, after the breach is well underway.
-				go func() {
-					time.Sleep(8 * time.Second)
+				d.afterDelay(8*time.Second, func() {
 					_ = d.post("meter", "/control", map[string]any{"cmd": "pause"})
-				}()
+				})
 				return cons, nil
 			},
 			perTick: func(d *mayhemDriver, i int) {

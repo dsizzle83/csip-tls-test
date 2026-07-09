@@ -751,10 +751,9 @@ func (d *mayhemDriver) worldScenarios() []*mayScenario {
 				// Let the hub adopt the cap on honest readings first, then flip the
 				// CT: an install error present from boot is indistinguishable from a
 				// swapped source; flipping mid-run also models a meter swap-out.
-				go func() {
-					time.Sleep(8 * time.Second)
+				d.afterDelay(8*time.Second, func() {
 					_ = d.post("meter", "/fault", map[string]any{"kind": "invert_sign"})
-				}()
+				})
 				return cons, nil
 			},
 			perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, loadLow) },
