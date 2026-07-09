@@ -1427,6 +1427,44 @@ it. `battery-wrong-sign` PASS with INV-SOC/SAFETY held and no INV-HUNT
 oscillation — the guard-vs-guard interaction the reconciler design set out to
 avoid did not materialise.
 
+## AD-014 ✅ Northbound poll-rate: honor server-advertised pollRate in STOCK, FAST bench keeps override (TASK-071)
+
+**Problem.** The northbound walker re-fetched the entire 2030.5 resource tree
+every `discovery_interval_s`, ignoring each function set's advertised
+`pollRate` — impolite at best; a utility head-end WILL rate-limit or
+blacklist a walker that does this (review §12).
+
+**Decision.** A per-resource-class poll scheduler
+(`internal/northbound/run/pollsched.go`) fetches each class (dcap/time/edev/
+fsa/derp/derc/curves/defaults/mup) only when its own advertised `pollRate` is
+due, clamping absurd/zero rates and holding a hard 15-min ceiling on `/tm`
+resync regardless of the advertised value (clock discipline is
+safety-relevant, 05 §3). Config `poll_rate_mode: "honor" | "override"` —
+**PRODUCT default is `honor`**; the bench stays `override` (fetch-everything,
+today's cadence) because Mayhem scenario timing (`expired-control`,
+`conflicting-primacy`, `clock-jump-forward`) assumes second-scale control
+adoption and gridsim's 60 s DERControlList pollRate would stretch that under
+`honor` (RSK-13 false-regression risk).
+
+**Alternatives considered.** Conditional GET (If-Modified-Since/ETag) is the
+fuller 2030.5-polite answer but gridsim has zero support for it today
+(verified — no `If-Modified`/`ETag`/`304` handling anywhere in
+`sim/gridsim`/`sim/tlsserver`); descoped to `10_BACKLOG.md` pending gridsim
+support. Honoring pollRate on the bench too — rejected, breaks scenario
+timing (above).
+
+**Tradeoffs / backlog refinement.** `honor` mode today fetches every class at
+the single most-conservative pollRate seen across the tree (~900 s against
+reference gridsim) rather than scheduling each class independently at its own
+rate — a control-heavy utility may want DERControlList's faster (60 s) rate
+honored on its own cadence while dcap/edev stay slow. `pollsched.go`'s
+per-class design already supports this; collapsing to one conservative rate
+was the simpler first cut. Backlog refinement, not a V1.0 blocker.
+
+**Migration.** TASK-071 (2026-07-06, merged to main). Targeted scenario set
+(`expired-control`, `conflicting-primacy`, `clock-jump-forward`) re-run ×3 in
+`override` mode confirmed bench timing unchanged.
+
 ---
 
 ## Superseded / rejected log
