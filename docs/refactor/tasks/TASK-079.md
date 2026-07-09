@@ -1,6 +1,6 @@
 # TASK-079 — DST / timezone / leap-smear TOU boundary tests
 
-*Status: DONE (2026-07-06, lexa-hub `36e55f7`, branch `task/079-dst-tou`, unmerged) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: med · Risk: med*
+*Status: DONE (2026-07-06, lexa-hub `36e55f7`, merged to main (from branch `task/079-dst-tou`)) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: med · Risk: med*
 
 ## Objective
 Table-driven tests with explicit `time.Location` (America/Los_Angeles)

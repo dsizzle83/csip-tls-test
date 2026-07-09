@@ -1,6 +1,6 @@
 # TASK-077 — Migrate the curated scenario suite to declarative specs
 
-*Status: PARTIAL (2026-07-06, `csip-tls-test` `task/077-scenario-migration`, unmerged) · Phase: P6 · Effort: L (≈8 h, mechanical but gated) · Difficulty: med · Risk: med*
+*Status: PARTIAL (2026-07-06, `csip-tls-test` `task/077-scenario-migration`, merged to main @4195d4e) · Phase: P6 · Effort: L (≈8 h, mechanical but gated) · Difficulty: med · Risk: med*
 
 **2026-07-06 session note (deadline addendum — batched QA, bench-free lane):**
 Wave 1 done: 24 of the ~63 total scenario entries migrated to

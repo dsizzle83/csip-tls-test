@@ -1,6 +1,6 @@
 # TASK-046 — Async actuator publishes; tick time budget + overrun counter
 
-*Status: CODE COMPLETE, BENCH GATE DEFERRED TO NEXT SESSION (2026-07-06, lexa-hub `task/046-async-publish` 1418cc6, unmerged) · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
+*Status: CODE COMPLETE, BENCH GATE DEFERRED TO NEXT SESSION (2026-07-06, lexa-hub `task/046-async-publish` 1418cc6, merged to main) · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: high · Risk: med*
 
 **Implementation note (2026-07-06):** this repo's `cmd/hub/actuators.go` /
 `cmdDeduper` this task file describes were already deleted by TASK-032 before

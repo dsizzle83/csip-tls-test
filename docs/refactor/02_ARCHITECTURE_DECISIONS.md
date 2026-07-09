@@ -462,7 +462,7 @@ five-consumer list didn't enumerate. Not touched here (not in TASK-036's
 Files list); flagged for a follow-up task/backlog entry.
 
 **Local (SOM) clock-step policy — TASK-037, GAP-04, 2026-07-05, lexa-hub
-`task/037-local-clock` 8f7e60e (unmerged), csip-tls-test docs
+`task/037-local-clock` 8f7e60e (merged to main), csip-tls-test docs
 `task/037-local-clock` (this entry).** Extends AD-004 from hardening the
 *utility server's* clock to hardening the hub's own *local* wall clock (an
 NTP correction at commissioning, an RTC drift fix-up). `go test -race
@@ -628,7 +628,7 @@ never crash a caller). Zero consumers today (`grep -rn "internal/journal"
 ~/projects/lexa-hub --include=*.go | grep -v internal/journal` empty).
 
 **TASK-040 update (2026-07-06): integrated (hub, northbound) — code complete,
-unmerged.** `lexa-hub` `task/040-journal-integration` (`be9701a`, on top of
+merged to main.** `lexa-hub` `task/040-journal-integration` (`be9701a`, on top of
 031/032) wires the first four callers: `cmd/hub/state.go`'s `onCSIPControl` +
 `ReadSystemState`'s expiry-drop branch (`control_adopted`/`control_released`,
 change-detected against the ~5 s FAST retained republish so an unchanged
@@ -656,7 +656,7 @@ access this session. TASK-041 (snapshot events) is unblocked by this writer
 plumbing.
 
 **TASK-041 update (2026-07-06): snapshot half implemented (hub side) — code
-complete, unmerged, bench validation pending.** `lexa-hub`
+complete, merged to main @7af1ff3, bench validation pending.** `lexa-hub`
 `task/041-snapshot` adds `cmd/hub/snapshot.go` (atomic tmp+rename
 `saveHubSnapshot`/validating `loadHubSnapshot`, kept local to `cmd/hub`
 rather than the originally-sketched shared `internal/snapshot` package — see

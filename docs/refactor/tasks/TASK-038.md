@@ -1,6 +1,6 @@
 # TASK-038 — Mayhem: local (hub Pi) clock-step scenario
 
-*Status: CODE COMPLETE (2026-07-06, csip-tls-test `task/038-clock-step`, unmerged) —
+*Status: CODE COMPLETE (2026-07-06, csip-tls-test `task/038-clock-step`, merged to main @1436c47) —
 bench validation (10× solo per scenario, abort/self-heal proof, campaign inclusion)
 deferred to the next batched wave gate (a soak had the live bench mid-run when this
 was implemented, per the launch instruction) · Phase: P3 · Effort: M (≈4–6 h) ·

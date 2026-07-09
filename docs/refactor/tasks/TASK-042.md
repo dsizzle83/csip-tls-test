@@ -1,7 +1,7 @@
 # TASK-042 — Retained-control trust hardening (staleness bound, corrupt→re-request)
 
 *Status: PARTIAL (2026-07-06, lexa-hub `task/042-retained-trust` @ `dd62fe8`,
-code complete + unit-tested, unmerged — bench acceptance criteria (live
+code complete + unit-tested, merged to main @a61da0d — bench acceptance criteria (live
 truncated-payload injection, mqtt-malformed-control/mqtt-stale-retained/
 wan-outage-*/hub-restart-mid-cap 10× gates, full FAST campaign) explicitly
 out of scope this session per launch instructions — "code + unit tests only,

@@ -1,7 +1,7 @@
 # TASK-040 — Journal integration: adoptions, dispatches, breaches, CannotComply
 
 *Status: CODE COMPLETE (2026-07-06, lexa-hub `be9701a` on `task/040-journal-integration`,
-unmerged) — bench/campaign validation deferred to the soak per this wave's launch
+merged to main) — bench/campaign validation deferred to the soak per this wave's launch
 instructions (no bench access this session). Phase: P3 · Effort: M (≈4–6 h) · Difficulty: med · Risk: med*
 
 ## Objective

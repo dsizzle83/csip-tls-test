@@ -1,6 +1,6 @@
 # TASK-073 — Cert rotation without control interruption + reconnect-churn soak
 
-*Status: PARTIAL (2026-07-06, `lexa-hub` `task/073-cert-rotation` @ `90d5d9a`, unmerged) · Phase: P6 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
+*Status: PARTIAL (2026-07-06, `lexa-hub` `task/073-cert-rotation` @ `90d5d9a`, merged to main) · Phase: P6 · Effort: L (≈8 h) · Difficulty: high · Risk: high*
 
 **2026-07-06 update:** Rotation mechanism CODE COMPLETE + unit/integration
 tested: `WolfSSLFetcher.Reload` (lexa-hub `internal/tlsclient/fetcher.go`)

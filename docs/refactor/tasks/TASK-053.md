@@ -3,11 +3,11 @@
 *Status: DONE (2026-07-05) · Phase: P4 · Effort: L (≈6–8 h) · Difficulty: med
 · Risk: med*
 
-**Commits (all on branch `task/053-int16-sweep`, unmerged — three-repo
-lockstep, review pending):**
-- `lexa-proto` 95ebde6 — canonical sweep + fuzz targets
-- `lexa-hub` d6ea74a — vendored-copy wrapper test + encoder sweep/agreement
-- `csip-tls-test` (this repo) — vendored-copy wrapper test + `apFromWatts` sweep
+**Commits (all originated on branch `task/053-int16-sweep`; merged to main in all
+three repos, three-repo lockstep reviewed):**
+- `lexa-proto` 95ebde6 — canonical sweep + fuzz targets (merged @4e8b940)
+- `lexa-hub` d6ea74a — vendored-copy wrapper test + encoder sweep/agreement (merged @a0d0919)
+- `csip-tls-test` (this repo) — vendored-copy wrapper test + `apFromWatts` sweep (merged @c0467a1)
 
 **Disposition note:** ran POST-021 (TASK-021 DONE — shared codec confirmed
 live in both consumers via vendored `lexa-proto/sunspec`), so the dual-fork

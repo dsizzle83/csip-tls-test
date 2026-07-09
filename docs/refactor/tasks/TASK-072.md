@@ -1,6 +1,6 @@
 # TASK-072 — Cert expiry monitoring + alerting
 
-*Status: DONE (2026-07-06, `lexa-hub` `task/072-cert-expiry` @ `26adab9`, unmerged) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: low · Risk: low*
+*Status: DONE (2026-07-06, `lexa-hub` `task/072-cert-expiry` @ `26adab9`, merged to main) · Phase: P6 · Effort: M (≈4–6 h) · Difficulty: low · Risk: low*
 
 **Session note (2026-07-06):** Code + unit tests complete and green
 (`go test -race ./internal/... ./cmd/...`). `cmd/northbound/certmon.go`
