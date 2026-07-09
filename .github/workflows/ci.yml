@@ -73,6 +73,42 @@ name: CI
 # allowlist — a lockstep gate that ships known-differences-forever is the
 # W3 failure mode repeating; the two repos are either pinned identically or
 # the gate is red.
+#
+# WS-7 (docs/refactor/HANDOFF.md §8): three process gates added on top of the
+# above.
+#   - `pure-go` gains a `gofmt -l` step (tracked, non-vendor .go files must
+#     already be formatted — vendor/ is committed third-party source plus the
+#     AD-003(e) vendor/lexa-proto/ mirror, neither ours to reformat; see that
+#     step for why reformatting vendor/lexa-proto specifically would fight
+#     the new proto-pin --verify-vendor check below) and `-race` on its four
+#     `go test` steps (this job had none; cmd/dashboard is concurrency-heavy
+#     — lexa-hub's `test-nocgo` already runs -race, this repo didn't).
+#     `-race` needs CGO_ENABLED=1 (a plain C compiler, not the wolfSSL
+#     sysroot — ubuntu-latest ships gcc), so those four steps override the
+#     job-level CGO_ENABLED=0 locally; the build/vet steps above them stay
+#     CGO_ENABLED=0 to keep proving the pure-Go build is actually pure.
+#   - `cgo-fast` gains a golangci-lint step (basic/default preset — no
+#     .golangci.yml, so just errcheck/govet/ineffassign/staticcheck/unused —
+#     pinned golangci-lint v2.1.6 via the pinned golangci-lint-action, reusing
+#     this job's already-built wolfSSL sysroot so the whole module lints
+#     cleanly including the cgo packages). `only-new-issues: true`: a
+#     full-repo baseline run today surfaces ~73 pre-existing issues (mostly
+#     errcheck on defer'd Close()/test helpers and a few `unused` test
+#     helpers) that are out of scope for a CI-gates task to silently fix
+#     inline; gating only new issues (GitHub-API PR/push diff) lands the
+#     linter without a giant unrelated cleanup PR. A follow-up WS can burn
+#     down the backlog and flip this to ungated.
+#   - `proto-pin` now passes `--verify-vendor` instead of `--no-proto-check`
+#     to check-proto-pin.sh, so a stale/hand-edited vendor/lexa-proto tree
+#     fails the job, not just a proto.pin SHA mismatch (closes the gap in
+#     that script's own header comment: "(a) can pass with a stale vendor
+#     tree"). It is a no-op today: --verify-vendor needs a local lexa-proto
+#     checkout to regenerate-and-diff against, and lexa-proto has no hosted
+#     remote yet (AD-003(f), open human item, HANDOFF §6) — no hosted runner
+#     can fetch it, so the script's own graceful-degrade path ("no local
+#     lexa-proto checkout -- skipping") is what actually runs. This is wired
+#     and ready: the day lexa-proto gets hosted and a checkout step is added
+#     here, --verify-vendor starts enforcing with no further script changes.
 
 on:
   pull_request:
@@ -110,6 +146,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: gofmt -l (tracked, non-vendor .go files)
+        # vendor/ excluded deliberately -- see the WS-7 note above `on:`.
+        run: |
+          UNFMT="$(git ls-files '*.go' | grep -v '^vendor/' | xargs gofmt -l)"
+          if [[ -n "$UNFMT" ]]; then
+            echo "gofmt -l found unformatted file(s):" >&2
+            echo "$UNFMT" >&2
+            echo >&2
+            echo "Fix locally: gofmt -w \$(git ls-files '*.go' | grep -v '^vendor/')" >&2
+            exit 1
+          fi
+          echo "gofmt: all tracked non-vendor .go files are formatted."
+
       - name: Build sim + dashboard binaries (pure Go)
         run: |
           go build ./sim/modsim ./sim/batsim ./sim/metersim ./sim/evsim \
@@ -124,7 +173,9 @@ jobs:
             ./sim/southbound/... ./internal/southbound/...
 
       - name: Southbound unit tests
-        run: go test ./internal/southbound/...
+        env:
+          CGO_ENABLED: "1" # -race needs cgo (gcc, not wolfSSL) — WS-7, see note above `on:`
+        run: go test -race ./internal/southbound/...
 
       - name: csipref referee unit tests (walker/scheduler + TASK-048 fuzz seeds)
         # internal/csipref (discovery + scheduler) has never had a direct
@@ -137,7 +188,9 @@ jobs:
         # criterion true rather than aspirational (seed-only mode: plain
         # `go test`, no -fuzz, runs each Fuzz func's f.Add seeds as regular
         # subtests — verified locally at a few ms, not seconds).
-        run: go test ./internal/csipref/...
+        env:
+          CGO_ENABLED: "1" # -race needs cgo — WS-7, see note above `on:`
+        run: go test -race ./internal/csipref/...
 
       # TASK-053: the generative int16/scale-factor boundary sweep (GAP-07)
       # needs no new step here — it lands as ordinary _test.go files in
@@ -149,10 +202,14 @@ jobs:
       # watt encoder). Verified locally: both pick up the new tests without
       # modification.
       - name: QA-harness unit gate (scripts/qa-regression.sh)
+        env:
+          CGO_ENABLED: "1" # -race needs cgo — WS-7; the script's own go test now passes -race (cmd/dashboard is concurrency-heavy)
         run: bash scripts/qa-regression.sh
 
       - name: Conformance logic tests (go test ./tests/)
-        run: go test -count=1 ./tests/
+        env:
+          CGO_ENABLED: "1" # -race needs cgo — WS-7, see note above `on:`
+        run: go test -race -count=1 ./tests/
 
   cgo-fast:
     name: cgo-fast
@@ -205,6 +262,12 @@ jobs:
         run: |
           echo "CGO_CFLAGS=-I${WOLFSSL_SYSROOT}/include" >> "$GITHUB_ENV"
           echo "CGO_LDFLAGS=-L${WOLFSSL_SYSROOT}/lib -lm" >> "$GITHUB_ENV"
+
+      - name: golangci-lint (basic preset, new issues only — WS-7, see note above `on:`)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.1.6
+          only-new-issues: true
 
       - name: make test-fast (cgo compiles; TLS-handshake tests inside stay integration-tagged)
         run: make test-fast WOLFSSL_SYSROOT="$WOLFSSL_SYSROOT"
@@ -296,8 +359,12 @@ jobs:
           token: ${{ secrets.LEXA_HUB_RO_TOKEN }}
           path: lexa-hub
 
-      - name: proto.pin version-pin check (fails on mismatch — no allowlist)
-        run: bash scripts/check-proto-pin.sh --self . --product lexa-hub --no-proto-check
+      - name: proto.pin version-pin check + vendor content verify (fails on mismatch — no allowlist)
+        # --verify-vendor (WS-7) replaces --no-proto-check: today it still
+        # degrades to a no-op (no lexa-proto sibling checkout exists on this
+        # runner — see the WS-7 note above `on:`), but the pin-vs-pin compare
+        # (the part that actually enforces today) is unchanged.
+        run: bash scripts/check-proto-pin.sh --self . --product lexa-hub --verify-vendor
 
   # TASK-048: nightly go-native fuzzing of the client-side IEEE 2030.5 XML
   # unmarshal entry points in internal/csipref/discovery — this repo's own
