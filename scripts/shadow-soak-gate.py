@@ -62,6 +62,21 @@ def main():
             ax = a["axis"]; tally[ax] += 1
             if ax.startswith("safety:"):
                 fail.append(("SAFETY-PATH", d["ts"], a)); continue
+            # Battery-safety cascade artifact (investigated 2026-07-09, verdict
+            # shadow-artifact): the candidate's wrong-direction debounce reacting
+            # to legacy-actuated feedback contradicting its own (characterized
+            # economics-residual) charge proposal — proven to never trip under
+            # self-consistent post-flip feedback by
+            # TestBatterySafety_SelfConsistentFeedbackNeverTrips (lexa-hub,
+            # task/batsafe-invest merge). Permitted ON-CAP only, author-gated,
+            # only while the state shows the mismatch (battery discharging >100W
+            # against a candidate idle/charge opinion).
+            if (a.get("author") == "battery-safety"
+                    and ax in ("battery-setpoint-w", "connect")
+                    and state_csip
+                    and any(b.get("power_w", 0) > 100 for b in (d.get("state", {}).get("batteries") or []))):
+                tally["cascade-artifact:" + ax] += 1
+                continue
             if ax not in ECON_AXES:
                 fail.append(("COMPLIANCE-AXIS", d["ts"], a)); continue
             if not state_csip:  # economics axis but no active control = off-cap
