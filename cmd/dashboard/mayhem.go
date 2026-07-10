@@ -693,6 +693,50 @@ func (d *mayhemDriver) armAfterAdoption(pollEvery, maxWait time.Duration, fn fun
 	}()
 }
 
+// armAfterCapAdopted is armAfterAdoption narrowed to a SPECIFIC control: it
+// fires fn only once the hub is enforcing exactly (typ, limW) — not merely
+// "some control is active". This matters whenever the bench default
+// (program-0 DefaultDERControl, a 5 kW export cap) is present: hubState()
+// reports ctrlActive=true for the default from the outset, so a plain
+// armAfterAdoption fires before the scenario's own event cap is adopted. At
+// STOCK (20 s discovery) that window is wide enough that a malform served
+// then is held against the DEFAULT (→ ~4400 W) instead of the intended 0 W
+// event, a false FAIL — the hub is provably correct once the event itself is
+// last-known-good (manual STOCK hold-proof, 2026-07-10). Same maxWait
+// fallback and scenario-context guard as armAfterAdoption.
+func (d *mayhemDriver) armAfterCapAdopted(typ string, limW float64, pollEvery, maxWait time.Duration, fn func()) {
+	d.mu.Lock()
+	ctx := d.scenarioCtx
+	d.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		deadline := time.After(maxWait)
+		tick := time.NewTicker(pollEvery)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-deadline:
+				if ctx.Err() == nil {
+					fn()
+				}
+				return
+			case <-tick.C:
+				h := d.hubState()
+				if h.ctrlActive && h.ctrlTyp == typ && h.ctrlLimW == limW {
+					if ctx.Err() == nil {
+						fn()
+					}
+					return
+				}
+			}
+		}
+	}()
+}
+
 // ── Sampling ──────────────────────────────────────────────────────────────────
 
 func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
@@ -1478,9 +1522,12 @@ func malformScenario(id, name, kind, hypothesis string) *mayScenario {
 			if err != nil {
 				return nil, err
 			}
-			// Let the hub ADOPT the safe cap (confirmed via hubState, not a fixed
-			// delay — STOCK's 20s discovery raced an 8s timer), THEN serve garbage.
-			d.armAfterAdoption(2*time.Second, 60*time.Second, func() {
+			// Serve garbage only after the hub has adopted THIS 0 W event cap
+			// (not merely the ever-present 5 kW bench default — see
+			// armAfterCapAdopted). At STOCK that distinction is the difference
+			// between the hub holding the intended 0 W event under the malform
+			// (PASS) and holding the 5 kW default (false FAIL).
+			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
 				_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": kind})
 			})
 			return cons, nil
@@ -2790,9 +2837,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 				if err != nil {
 					return nil, err
 				}
-				// Let the hub ADOPT the safe cap (confirmed, not a fixed delay — see
-				// armAfterAdoption), THEN serve garbage that threatens it.
-				d.armAfterAdoption(2*time.Second, 60*time.Second, func() {
+				// Serve garbage only after the hub adopts THIS 0 W event cap (not
+				// the bench default — see armAfterCapAdopted).
+				d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
 					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "dup_mrid"})
 				})
 				return cons, nil
