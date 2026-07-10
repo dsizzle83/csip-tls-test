@@ -652,6 +652,47 @@ func (d *mayhemDriver) afterDelay(delay time.Duration, fn func()) {
 	}()
 }
 
+// armAfterAdoption fires fn once the hub reports an ACTIVE CSIP control
+// (polled via hubState every pollEvery), or unconditionally at maxWait as a
+// fallback so a never-adopting hub still gets its fault (and the oracle then
+// reads the un-adopted state honestly). This closes the STOCK-cadence race a
+// fixed afterDelay(8s) had: at STOCK the discovery interval is 20s, so the
+// fault could be served BEFORE the hub's first walk ever adopted the safe cap
+// — the 2026-07-10 STOCK gate false-FAILed malform-huge-activepower exactly
+// this way ("unseated" a cap that was never seated). Same scenario-context
+// guard as afterDelay: teardown stays last-writer-wins.
+func (d *mayhemDriver) armAfterAdoption(pollEvery, maxWait time.Duration, fn func()) {
+	d.mu.Lock()
+	ctx := d.scenarioCtx
+	d.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	go func() {
+		deadline := time.After(maxWait)
+		tick := time.NewTicker(pollEvery)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-deadline:
+				if ctx.Err() == nil {
+					fn()
+				}
+				return
+			case <-tick.C:
+				if d.hubState().ctrlActive {
+					if ctx.Err() == nil {
+						fn()
+					}
+					return
+				}
+			}
+		}
+	}()
+}
+
 // ── Sampling ──────────────────────────────────────────────────────────────────
 
 func (d *mayhemDriver) sample(cons *activeConstraint, t float64) maySample {
@@ -1437,8 +1478,9 @@ func malformScenario(id, name, kind, hypothesis string) *mayScenario {
 			if err != nil {
 				return nil, err
 			}
-			// Let the hub adopt the safe cap on a clean walk, THEN serve garbage.
-			d.afterDelay(8*time.Second, func() {
+			// Let the hub ADOPT the safe cap (confirmed via hubState, not a fixed
+			// delay — STOCK's 20s discovery raced an 8s timer), THEN serve garbage.
+			d.armAfterAdoption(2*time.Second, 60*time.Second, func() {
 				_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": kind})
 			})
 			return cons, nil
@@ -2748,9 +2790,9 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 				if err != nil {
 					return nil, err
 				}
-				// Let the hub adopt the safe cap on a clean walk, THEN start serving
-				// garbage — so there is a safe control for the malform to threaten.
-				d.afterDelay(8*time.Second, func() {
+				// Let the hub ADOPT the safe cap (confirmed, not a fixed delay — see
+				// armAfterAdoption), THEN serve garbage that threatens it.
+				d.armAfterAdoption(2*time.Second, 60*time.Second, func() {
 					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "dup_mrid"})
 				})
 				return cons, nil
