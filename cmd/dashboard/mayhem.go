@@ -3062,6 +3062,7 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 	}
 	sc = append(sc, d.mqttScenarios()...)
 	sc = append(sc, d.worldScenarios()...)
+	sc = append(sc, d.intentScenarios()...)
 
 	// TASK-076: scenarios-as-data. scenarios() runs fresh on every call —
 	// handleStart calls it at REQUEST time, never once at process start — so
