@@ -29,6 +29,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -69,7 +70,7 @@ func main() {
 	solarAPI := flag.String("solar-api", "", "Solar simapi base URL for linked mode (e.g. http://69.0.0.10:6020)")
 	batteryAPI := flag.String("battery-api", "", "Battery simapi base URL for linked mode (e.g. http://69.0.0.11:6021)")
 	evAPI := flag.String("ev-api", "", "EV charger simapi base URL for linked mode (e.g. http://69.0.0.14:6024)")
-	hubAPI := flag.String("hub-api", "", "Hub status API for EV power via OCPP (e.g. http://69.0.0.1:9100); preferred over -ev-api")
+	hubAPI := flag.String("hub-api", "", "Hub status API for EV power via OCPP (e.g. https://69.0.0.1:9100 — lexa-api serves HTTPS self-signed on :9100, WS-B); preferred over -ev-api")
 	hubTokenFile := flag.String("hub-token-file", "", "path to lexa-api's bearer token (TASK-014, AD-008); empty = no auth presented, today's behavior")
 	initLoad := flag.Float64("load", 3000, "Initial site load in watts (linked mode); injectable via LoadW_W")
 	flag.Parse()
@@ -304,7 +305,14 @@ func fetchHubEVW(baseURL, token string) float64 {
 	if baseURL == "" {
 		return 0
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
+	// WS-B: lexa-api serves HTTPS on :9100 with a per-device self-signed leaf.
+	// Skip verification — air-gapped bench, trusted link, no CA to validate
+	// against. The transport handles an https base URL regardless of default
+	// (the flag value is operator-supplied at deploy). Ignored for http://.
+	client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/status", nil)
 	if err != nil {
 		log.Printf("metersim: fetchHubEVW %s: %v", baseURL, err)

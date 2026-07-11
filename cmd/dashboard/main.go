@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	dashboard -addr :8080 -hub http://hub:9100 -gridsim http://hub:11112 \
+//	dashboard -addr :8080 -hub https://hub:9100 -gridsim http://hub:11112 \
 //	          -solar http://solar:6020 -battery http://bat:6021 -meter http://meter:6022
 package main
 
@@ -21,7 +21,7 @@ var dashboardHTML []byte
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
-	hub := flag.String("hub", "http://localhost:9100", "hub metrics/status address")
+	hub := flag.String("hub", "https://localhost:9100", "hub metrics/status address (lexa-api serves HTTPS on :9100, self-signed — WS-B)")
 	gridsim := flag.String("gridsim", "http://localhost:11112", "gridsim admin address")
 	solar := flag.String("solar", "http://localhost:6020", "solar simapi address")
 	battery := flag.String("battery", "http://localhost:6021", "battery simapi address")
@@ -131,6 +131,10 @@ func stripHubAuthProxy(prefix, target string) http.Handler {
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
 	rp.FlushInterval = -1 // immediate flush; required for SSE pass-through
+	// WS-B: lexa-api serves HTTPS on :9100 with a self-signed leaf; skip
+	// verification for the hub mount (see hubtls.go). Harmless if the target
+	// is still plain http (TLS config is ignored for http:// requests).
+	rp.Transport = benchHubTransport()
 	baseDirector := rp.Director
 	rp.Director = func(req *http.Request) {
 		baseDirector(req)

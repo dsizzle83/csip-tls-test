@@ -225,7 +225,10 @@ type mayhemDriver struct {
 func newMayhemDriver(backends map[string]string) *mayhemDriver {
 	return &mayhemDriver{
 		backends: backends,
-		client:   &http.Client{Timeout: 3 * time.Second},
+		// WS-B: hub backend (:9100) is HTTPS self-signed; skip-verify transport
+		// (hubtls.go). Same client reaches the http sims — TLS config is ignored
+		// for http:// so they are unaffected. Bearer auth unchanged.
+		client: &http.Client{Timeout: 3 * time.Second, Transport: benchHubTransport()},
 	}
 }
 

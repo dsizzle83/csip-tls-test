@@ -31,6 +31,12 @@ const (
 	logMuxRetryWait = 5 * time.Second
 )
 
+// logMuxClient follows every backend's /logs SSE stream. The hub's /logs is on
+// lexa-api's HTTPS :9100 (self-signed — WS-B), so this needs the skip-verify
+// transport (hubtls.go); it is harmless for the http sims. No client Timeout —
+// these are long-lived SSE streams (matching the previous http.DefaultClient).
+var logMuxClient = &http.Client{Transport: benchHubTransport()}
+
 type logEvent struct {
 	Src  string    `json:"src"`
 	Line string    `json:"line"`
@@ -72,7 +78,7 @@ func (m *logMux) streamOnce(src, url string) error {
 	// TASK-014: the hub's /logs requires the bearer token once lexa-api has
 	// one configured; setHubAuth is a no-op for every other src.
 	setHubAuth(req, src)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := logMuxClient.Do(req)
 	if err != nil {
 		return err
 	}

@@ -101,7 +101,7 @@ start_unit csip-gridsim   "$REPO/bin/server" -ca certs/ca-cert.pem -cert certs/s
 # --setenv is consumed by systemd-run (option parsing stops at the binary path):
 # LEXA_SSH_USER tells the mayhem engine how to SSH into the hub node.
 start_unit csip-dashboard --setenv=LEXA_SSH_USER="$HUBUSER" \
-  "$REPO/bin/dashboard" -addr :8080 -hub http://$HUB:9100 \
+  "$REPO/bin/dashboard" -addr :8080 -hub https://$HUB:9100 \
   -mqttproxy http://$HUB:11882 \
   -gridsim http://localhost:11112 -solar http://$SOLAR:6020 -battery http://$BAT:6021 \
   -meter http://$MTR:6022 -ev http://$EV:6024 -hub-token-file "$HUB_TOKEN_FILE"
@@ -118,11 +118,13 @@ probe "gridsim admin" http://localhost:11112/
 probe "dashboard"     http://localhost:8080/
 # Present the token if we have one — a 401 here would otherwise read as a
 # false "hub down" when auth is actually on and working as intended.
+# -k: lexa-api serves HTTPS with a per-device self-signed leaf (WS-B); the
+# air-gapped bench has no CA to validate against, so allow the insecure cert.
 HUB_TOKEN="$(tr -d '[:space:]' < "$HUB_TOKEN_FILE" 2>/dev/null || true)"
 if [[ -n "$HUB_TOKEN" ]]; then
-  probe "hub status"  http://$HUB:9100/status -H "Authorization: Bearer $HUB_TOKEN"
+  probe "hub status"  https://$HUB:9100/status -k -H "Authorization: Bearer $HUB_TOKEN"
 else
-  probe "hub status"  http://$HUB:9100/status
+  probe "hub status"  https://$HUB:9100/status -k
 fi
 probe "solar sim"     http://$SOLAR:6020/state
 probe "battery sim"   http://$BAT:6021/state

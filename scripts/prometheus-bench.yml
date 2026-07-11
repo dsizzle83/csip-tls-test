@@ -16,10 +16,22 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
+  # lexa-api (:9100) serves HTTPS with a per-device self-signed leaf (WS-B).
+  # scheme/tls_config are per-job in Prometheus, so this target is its own job;
+  # skip verification — air-gapped bench, no CA to validate against.
+  - job_name: lexa-api
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true
+    static_configs:
+      - targets:
+          - "69.0.0.1:9100" # lexa-api (/metrics route on the existing :9100 HTTPS listener)
+        labels:
+          bench: "69.0.0.x"
+
   - job_name: lexa-bench
     static_configs:
       - targets:
-          - "69.0.0.1:9100" # lexa-api (/metrics route on the existing :9100 listener)
           - "69.0.0.1:9101" # lexa-hub
           - "69.0.0.1:9102" # lexa-northbound
           - "69.0.0.1:9103" # lexa-modbus
