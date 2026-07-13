@@ -1,0 +1,703 @@
+/* /studio Savings Studio — panel styles. Tokens only (DESIGN_BRIEF.md §1); no
+   ad-hoc colors. Loaded by src/views/Studio.tsx. Two-zone layout: 320px scenario
+   builder rail + results main zone. */
+
+.studio {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+@media (max-width: 980px) {
+  .studio {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── shared card chrome ──────────────────────────────────────────────────── */
+.st-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  padding: 18px 20px;
+}
+.st-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.st-card-head .card-title {
+  white-space: nowrap;
+}
+.st-head-meta {
+  font-size: 12px;
+  color: var(--ink-3);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.st-main {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+/* ── left rail: scenario builder ─────────────────────────────────────────── */
+.st-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  position: sticky;
+  top: 0;
+}
+.st-rail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.st-rail-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-2);
+}
+.st-scn-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.st-scn {
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.st-scn:hover {
+  border-color: var(--sage);
+}
+.st-scn.active {
+  border-color: var(--sage);
+  background: var(--sage-soft);
+  box-shadow: inset 3px 0 0 var(--bolt);
+}
+.st-scn-city {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.st-scn-blurb {
+  font-size: 12px;
+  color: var(--ink-2);
+  margin-top: 2px;
+  line-height: 1.35;
+}
+.st-scn-terr {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* tariff chips */
+.st-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.st-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  padding: 7px 9px;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.st-chip:hover {
+  border-color: var(--sage);
+}
+.st-chip.active {
+  border-color: var(--sage);
+  background: var(--sage-soft);
+}
+.st-chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.st-chip-check {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  border: 1.5px solid var(--sage);
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  color: var(--green-ink);
+  font-size: 10px;
+  line-height: 1;
+}
+.st-chip.active .st-chip-check {
+  background: var(--green-ink);
+  border-color: var(--green-ink);
+  color: #fff;
+}
+.st-chip-body {
+  min-width: 0;
+  flex: 1;
+}
+.st-chip-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.st-chip-util {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* confidence badge — color-neutral, letter + tooltip */
+.st-conf {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+  cursor: help;
+  font-variant-numeric: tabular-nums;
+}
+
+/* instrument controls */
+.st-inst {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+.st-ctrl {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.st-ctrl-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.st-ctrl-label {
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.st-ctrl-val {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.st-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--line);
+  outline: none;
+}
+.st-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--green-ink);
+  cursor: pointer;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px var(--sage);
+}
+.st-range::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--green-ink);
+  cursor: pointer;
+  border: 2px solid #fff;
+}
+.st-range:disabled {
+  opacity: 0.4;
+}
+.st-two {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.st-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.st-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.st-switch input {
+  accent-color: var(--green-ink);
+  width: 15px;
+  height: 15px;
+}
+.st-num {
+  font-size: 12px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--ink);
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  width: 100%;
+}
+.st-ev-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 10px;
+  margin-top: 4px;
+}
+.st-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.st-field label {
+  font-size: 10px;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Run button */
+.st-run {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 11px;
+  border-radius: 9px;
+  border: 1px solid var(--green-ink);
+  background: var(--green-ink);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.st-run:hover {
+  background: color-mix(in srgb, var(--green-ink) 88%, black);
+}
+.st-run:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.st-run-bolt {
+  font-size: 15px;
+  line-height: 1;
+}
+.st-dirty {
+  font-size: 11px;
+  color: var(--s-warn);
+  text-align: center;
+  margin-top: 6px;
+}
+
+/* ── hero strip ──────────────────────────────────────────────────────────── */
+.st-hero {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.25fr;
+  gap: 14px;
+}
+@media (max-width: 720px) {
+  .st-hero {
+    grid-template-columns: 1fr;
+  }
+}
+.st-tile {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 16px 18px;
+  background: var(--card);
+}
+.st-tile.lexa {
+  background: var(--sage-soft);
+  border-color: var(--sage);
+}
+.st-tile.saved {
+  background: var(--card);
+}
+.st-tile-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+}
+.st-tile-num {
+  font-size: 34px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+  margin-top: 6px;
+  color: var(--ink);
+}
+.st-tile-num.gray {
+  color: var(--ink-2);
+}
+.st-tile-num.green {
+  color: var(--green-ink);
+}
+.st-tile-num.hero {
+  font-size: 42px;
+  display: inline-block;
+  border-bottom: 4px solid var(--bolt);
+  padding-bottom: 3px;
+}
+.st-tile-sub {
+  font-size: 13px;
+  color: var(--ink-2);
+  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.st-provline {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.st-provline .sep {
+  color: var(--line);
+}
+
+/* ── credits chip ────────────────────────────────────────────────────────── */
+.st-credits {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--sage-soft);
+  border: 1px solid var(--sage);
+  color: var(--green-ink);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+}
+
+/* ── focus pills (which tariff the per-tariff panels show) ───────────────── */
+.st-focus {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.st-focus-lbl {
+  font-size: 11px;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.st-pill {
+  font-size: 12px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.st-pill.active {
+  background: var(--sage-soft);
+  border-color: var(--sage);
+  color: var(--green-ink);
+  font-weight: 600;
+}
+
+/* ── bill breakdown legend + table ───────────────────────────────────────── */
+.st-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 12px;
+}
+.st-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.st-legend-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.st-btn-ghost {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.st-btn-ghost:hover {
+  background: var(--surface);
+}
+.st-btn-ghost.on {
+  background: var(--sage-soft);
+  border-color: var(--sage);
+  color: var(--green-ink);
+}
+
+/* ── tables ──────────────────────────────────────────────────────────────── */
+.st-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.st-table th,
+.st-table td {
+  text-align: right;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
+.st-table th:first-child,
+.st-table td:first-child {
+  text-align: left;
+  font-variant-numeric: normal;
+}
+.st-table thead th {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+}
+.st-table tbody td {
+  color: var(--ink);
+}
+.st-table .muted {
+  color: var(--ink-2);
+}
+.st-table tr.total-row td {
+  font-weight: 700;
+  border-top: 2px solid var(--line);
+  border-bottom: none;
+}
+.st-cell-best {
+  background: var(--sage-soft);
+  border-radius: 6px;
+  color: var(--green-ink) !important;
+  font-weight: 700;
+}
+.st-table-wrap {
+  overflow-x: auto;
+}
+
+/* ── TOU heatmaps (small multiples) ──────────────────────────────────────── */
+.st-heatmaps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+  gap: 16px;
+}
+.st-heat-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.st-heat-sub {
+  font-size: 11px;
+  color: var(--ink-3);
+  margin-top: 1px;
+}
+
+/* ── day detail policy tabs ──────────────────────────────────────────────── */
+.st-tabs {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.st-tab {
+  font-size: 12px;
+  padding: 5px 12px;
+  background: var(--card);
+  color: var(--ink-2);
+  cursor: pointer;
+  border: none;
+  border-right: 1px solid var(--line);
+}
+.st-tab:last-child {
+  border-right: none;
+}
+.st-tab.active {
+  background: var(--sage-soft);
+  color: var(--green-ink);
+  font-weight: 600;
+}
+
+/* ── provenance card ─────────────────────────────────────────────────────── */
+.st-prov {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.st-prov-row {
+  display: grid;
+  grid-template-columns: 128px 1fr;
+  gap: 14px;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+}
+.st-prov-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.st-prov-k {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+}
+.st-prov-v {
+  color: var(--ink-2);
+  line-height: 1.5;
+  min-width: 0;
+}
+.st-prov-v a {
+  word-break: break-all;
+}
+.st-prov-tariff {
+  margin-bottom: 10px;
+}
+.st-prov-tariff:last-child {
+  margin-bottom: 0;
+}
+.st-prov-tariff-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.st-prov-tariff-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.st-prov-notes {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+  margin-top: 2px;
+}
+
+/* ── error / skeleton ────────────────────────────────────────────────────── */
+.st-error {
+  border: 1px solid color-mix(in srgb, var(--s-warn) 40%, white);
+  background: color-mix(in srgb, var(--s-warn) 8%, white);
+  color: var(--s-warn);
+  border-radius: var(--radius-card);
+  padding: 14px 18px;
+  font-size: 13px;
+}
+.st-error strong {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--s-serious);
+}
+.st-skel {
+  border-radius: var(--radius-card);
+  background: linear-gradient(
+    90deg,
+    var(--surface) 0%,
+    var(--sage-soft) 50%,
+    var(--surface) 100%
+  );
+  background-size: 200% 100%;
+  animation: st-shimmer 1.4s ease-in-out infinite;
+  border: 1px solid var(--line);
+}
+@keyframes st-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .st-skel {
+    animation: none;
+  }
+}
+.st-updating {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.st-dim {
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+.st-attrib {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 12px;
+}
+.st-attrib-item {
+  font-size: 12px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.st-attrib-item b {
+  color: var(--ink);
+  font-weight: 600;
+}
