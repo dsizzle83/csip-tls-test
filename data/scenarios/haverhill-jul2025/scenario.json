@@ -1,0 +1,50 @@
+{
+  "id": "haverhill-jul2025",
+  "label": "Haverhill — July 2025",
+  "location": {
+    "city": "Haverhill",
+    "state": "MA",
+    "lat": 42.776,
+    "lon": -71.077,
+    "timezone": "America/New_York",
+    "territory": "haverhill-ma",
+    "blurb": "National Grid (Massachusetts Electric) territory"
+  },
+  "period": {
+    "start": "2025-07-01",
+    "end": "2025-07-31"
+  },
+  "weather": {
+    "source": "open-meteo-era5",
+    "retrieved": "2026-07-13",
+    "source_url": "https://archive-api.open-meteo.com/v1/archive?latitude=42.776&longitude=-71.077&start_date=2025-07-01&end_date=2025-07-31&hourly=temperature_2m%2Cshortwave_radiation&timezone=America%2FNew_York"
+  },
+  "tariff_ids": [],
+  "default_tariff_id": "",
+  "home_defaults": {
+    "profile": "single-family-3br",
+    "base_kw": 0.45,
+    "hvac": {
+      "cool_setpoint_f": 75,
+      "kw_per_degf": 0.16,
+      "max_kw": 4.2
+    }
+  },
+  "instrument_defaults": {
+    "pv_kw": 8.0,
+    "battery": {
+      "kwh": 13.5,
+      "kw": 5.0,
+      "reserve_pct": 10,
+      "round_trip_eff": 0.9
+    },
+    "ev": {
+      "present": true,
+      "battery_kwh": 60,
+      "charger_kw": 7.2,
+      "weekday_kwh": 11,
+      "depart_hour": 8,
+      "return_hour": 17
+    }
+  }
+}

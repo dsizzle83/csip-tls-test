@@ -1,0 +1,50 @@
+{
+  "id": "east-texas-jul2025",
+  "label": "East Texas — July 2025",
+  "location": {
+    "city": "Tyler",
+    "state": "TX",
+    "lat": 32.35,
+    "lon": -95.3,
+    "timezone": "America/Chicago",
+    "territory": "east-texas-tx",
+    "blurb": "Oncor delivery; deregulated ERCOT retail choice"
+  },
+  "period": {
+    "start": "2025-07-01",
+    "end": "2025-07-31"
+  },
+  "weather": {
+    "source": "open-meteo-era5",
+    "retrieved": "2026-07-13",
+    "source_url": "https://archive-api.open-meteo.com/v1/archive?latitude=32.35&longitude=-95.3&start_date=2025-07-01&end_date=2025-07-31&hourly=temperature_2m%2Cshortwave_radiation&timezone=America%2FChicago"
+  },
+  "tariff_ids": [],
+  "default_tariff_id": "",
+  "home_defaults": {
+    "profile": "single-family-3br",
+    "base_kw": 0.45,
+    "hvac": {
+      "cool_setpoint_f": 75,
+      "kw_per_degf": 0.16,
+      "max_kw": 4.2
+    }
+  },
+  "instrument_defaults": {
+    "pv_kw": 8.0,
+    "battery": {
+      "kwh": 13.5,
+      "kw": 5.0,
+      "reserve_pct": 10,
+      "round_trip_eff": 0.9
+    },
+    "ev": {
+      "present": true,
+      "battery_kwh": 60,
+      "charger_kw": 7.2,
+      "weekday_kwh": 11,
+      "depart_hour": 8,
+      "return_hour": 17
+    }
+  }
+}
