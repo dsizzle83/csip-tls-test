@@ -117,7 +117,7 @@ func (b *BillCalc) Add(ts time.Time, importKWh, exportKWh, intervalPeakImportKW 
 	}
 
 	for i := range b.t.Demand {
-		if b.t.Demand[i].covers(local) && intervalPeakImportKW > b.demandPeakKW[i] {
+		if b.t.Demand[i].Covers(local) && intervalPeakImportKW > b.demandPeakKW[i] {
 			b.demandPeakKW[i] = intervalPeakImportKW
 		}
 	}
@@ -199,9 +199,11 @@ func (b *BillCalc) Close() Bill {
 			}
 		}
 		if applied > 0 || b.t.Export.Type != ExportNone {
+			// Rate reflects the APPLIED credit so Qty×Rate == |AmountUSD| even
+			// when the cap clamps it; the earned excess is CreditCarryoverUSD.
 			items = append(items, LineItem{
 				Kind: KindExportCredit, Label: label,
-				Qty: b.exportKWh, QtyUnit: "kWh", Rate: earned / b.exportKWh,
+				Qty: b.exportKWh, QtyUnit: "kWh", Rate: applied / b.exportKWh,
 				AmountUSD: -round2(applied),
 			})
 		}
@@ -242,10 +244,10 @@ func (b *BillCalc) tierLineItems() []LineItem {
 	return out
 }
 
-// covers reports whether a demand charge's month/day/time window contains local
+// Covers reports whether a demand charge's month/day/time window contains local
 // (which must already be in the tariff's timezone). Empty months or days mean
 // "any"; the time window may wrap midnight.
-func (d DemandCharge) covers(local time.Time) bool {
+func (d DemandCharge) Covers(local time.Time) bool {
 	if len(d.Months) > 0 && !containsInt(d.Months, int(local.Month())) {
 		return false
 	}

@@ -92,6 +92,13 @@ func main() {
 	// routes like /ops or /proof on a hard refresh.
 	mux.Handle("/", spaHandler(uiDist))
 
+	// Reserved namespaces must never fall back to the SPA's index.html: an
+	// unknown /api/* route is a 404 (pre-V2 behavior), and /legacy has no
+	// subpaths. Longest-prefix mux routing lets the specific /api/... mounts
+	// above win; these catch what they miss.
+	mux.Handle("/api/", http.NotFoundHandler())
+	mux.Handle("/legacy/", http.NotFoundHandler())
+
 	mux.Handle("/api/hub/", stripHubAuthProxy("/api/hub", *hub))
 	mux.Handle("/api/gridsim/", stripProxy("/api/gridsim", *gridsim))
 	mux.Handle("/api/solar/", stripProxy("/api/solar", *solar))
@@ -158,21 +165,13 @@ func main() {
 // a path that exists as a real file (e.g. /assets/index-xxx.js, /brand/
 // logo.png) is served as that file; everything else — "/" itself, and any
 // client-side route the SPA owns (/studio, /ops, /proof, /logs, /bench) —
-// falls back to index.html. /api/* and /legacy never reach this handler:
-// ServeMux routes those to their own, more specific patterns first.
+// falls back to index.html. Reserved namespaces (/api/*, /legacy/*) are kept
+// out of the fallback by mux registrations in main(), not here — spaHandler
+// stays a namespace-agnostic SPA server.
 func spaHandler(dist fs.FS) http.Handler {
 	fileServer := http.FileServer(http.FS(dist))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clean := path.Clean(r.URL.Path)
-
-		// Any /api/* path that didn't match one of the specific proxy/API
-		// patterns registered above is an unknown API route, not a
-		// client-side SPA route — preserve the pre-V2 404 behavior instead
-		// of handing back index.html.
-		if clean == "/api" || strings.HasPrefix(clean, "/api/") {
-			http.NotFound(w, r)
-			return
-		}
 
 		rel := strings.TrimPrefix(clean, "/")
 		if rel == "" || rel == "." {
@@ -181,6 +180,14 @@ func spaHandler(dist fs.FS) http.Handler {
 
 		if info, err := fs.Stat(dist, rel); err == nil && !info.IsDir() {
 			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		// A missing build asset is a real 404 (stale HTML referencing an old
+		// hashed bundle must fail loudly), never an index.html fallback that
+		// a <script> tag would try to parse as JS.
+		if strings.HasPrefix(rel, "assets/") || strings.HasPrefix(rel, "brand/") {
+			http.NotFound(w, r)
 			return
 		}
 

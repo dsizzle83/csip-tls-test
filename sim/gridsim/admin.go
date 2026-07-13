@@ -184,11 +184,13 @@ func (s *Server) handleAdminClock(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[gridsim] clock skew set: offset=%ds server_time=%d", s.ClockSkew(), s.Now())
-		// A dynamic tariff's window is centered on server time, so re-center it
-		// now that the clock has been warped (no-op on the legacy static tree).
+		// A dynamic tariff's window is centered on server time, so re-check it
+		// now that the clock has been warped (no-op on the legacy static tree,
+		// and a cheap no-op when the warp stays inside the current interval —
+		// replay warps the clock every tick, so the minimal refresh matters).
 		s.mu.Lock()
 		if s.tariff != nil {
-			s.regenPricingLocked(s.Now())
+			s.refreshPricingLocked(s.Now())
 		}
 		s.mu.Unlock()
 	default:

@@ -8,7 +8,6 @@
 package main
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -41,8 +40,7 @@ func handleQAReports(w http.ResponseWriter, r *http.Request) {
 	entries, err := os.ReadDir(mayReportDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode([]qaReportEntry{})
+			writeJSON(w, http.StatusOK, []qaReportEntry{})
 			return
 		}
 		http.Error(w, "qa reports: "+err.Error(), http.StatusInternalServerError)
@@ -64,8 +62,7 @@ func handleQAReports(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].MTime > out[j].MTime })
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(out)
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleQAReportFetch serves one saved report's raw markdown. name is

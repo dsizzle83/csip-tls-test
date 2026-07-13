@@ -30,6 +30,24 @@ export function usePoll<T>(
   const fnRef = useRef(fn);
   fnRef.current = fn;
   const tickRef = useRef(0);
+  const lastJSONRef = useRef<string | undefined>(undefined);
+
+  // Keep the previous object identity when the payload is byte-identical:
+  // most 1s polls of an idle bench return the same JSON, and a fresh object
+  // every tick would re-render every consumer and re-fire every
+  // useMemo/EChart setOption for identical pixels.
+  const setDataIfChanged = (result: T) => {
+    let key: string | undefined;
+    try {
+      key = JSON.stringify(result);
+    } catch {
+      key = undefined; // non-serializable — always treat as changed
+    }
+    if (key === undefined || key !== lastJSONRef.current) {
+      lastJSONRef.current = key;
+      setData(result);
+    }
+  };
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
@@ -42,7 +60,7 @@ export function usePoll<T>(
       try {
         const result = await fnRef.current();
         if (cancelled || myTick !== tickRef.current) return;
-        setData(result);
+        setDataIfChanged(result);
         setError(undefined);
       } catch (err) {
         if (cancelled || myTick !== tickRef.current) return;
@@ -87,7 +105,7 @@ export function usePoll<T>(
     fnRef
       .current()
       .then((result) => {
-        setData(result);
+        setDataIfChanged(result);
         setError(undefined);
       })
       .catch((err) => setError(err))

@@ -243,7 +243,7 @@ func simulate(e *env, t *tariff.Tariff, cfg polConfig) simResult {
 	if demandActive {
 		for i := range e.ticks {
 			for di := range t.Demand {
-				if demandCovers(t.Demand[di], e.ticks[i].t) {
+				if t.Demand[di].Covers(e.ticks[i].t) {
 					inDemand[i] = true
 					break
 				}
@@ -474,100 +474,6 @@ func buildPeakContext(e *env, importRate, evKWh []float64, sqrtEff, reserveFloor
 
 func approxEq(a, b float64) bool { return math.Abs(a-b) < 1e-12 }
 
-// demandCovers reports whether a demand charge's month/day/time window contains
-// local (which is already in the tariff timezone — cross-validation guarantees
-// scenario TZ == tariff TZ). It mirrors tariff.DemandCharge.covers, whose logic
-// is unexported; the tariff's own BillCalc uses that method to bill, so this
-// only decides WHEN the lexa dispatch shaves — the two must agree on windows.
-func demandCovers(d tariff.DemandCharge, local time.Time) bool {
-	if len(d.Months) > 0 {
-		ok := false
-		for _, m := range d.Months {
-			if m == int(local.Month()) {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return false
-		}
-	}
-	if len(d.Days) > 0 && !dayListHasWeekday(d.Days, local.Weekday()) {
-		return false
-	}
-	minute := local.Hour()*60 + local.Minute()
-	return minuteInWindow(minute, hmToMinutes(d.Start), hmToMinutes(d.End))
-}
-
-// dayListHasWeekday reports whether a schema "days" list ("mon".."sun",
-// "weekday", "weekend") covers wd.
-func dayListHasWeekday(days []string, wd time.Weekday) bool {
-	for _, d := range days {
-		switch d {
-		case "weekday":
-			if wd >= time.Monday && wd <= time.Friday {
-				return true
-			}
-		case "weekend":
-			if wd == time.Saturday || wd == time.Sunday {
-				return true
-			}
-		case "sun":
-			if wd == time.Sunday {
-				return true
-			}
-		case "mon":
-			if wd == time.Monday {
-				return true
-			}
-		case "tue":
-			if wd == time.Tuesday {
-				return true
-			}
-		case "wed":
-			if wd == time.Wednesday {
-				return true
-			}
-		case "thu":
-			if wd == time.Thursday {
-				return true
-			}
-		case "fri":
-			if wd == time.Friday {
-				return true
-			}
-		case "sat":
-			if wd == time.Saturday {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// hmToMinutes parses "HH:MM" to minutes-of-day (best-effort; 0 on malformed,
-// which validated tariffs never produce).
-func hmToMinutes(s string) int {
-	var h, m int
-	if len(s) >= 5 && s[2] == ':' {
-		h = int(s[0]-'0')*10 + int(s[1]-'0')
-		m = int(s[3]-'0')*10 + int(s[4]-'0')
-	}
-	return h*60 + m
-}
-
-// minuteInWindow reports whether minute is in [start,end), handling a
-// midnight-wrapping window (start >= end). Zero-length covers nothing.
-func minuteInWindow(minute, start, end int) bool {
-	if start == end {
-		return false
-	}
-	if start < end {
-		return minute >= start && minute < end
-	}
-	return minute >= start || minute < end
-}
-
 // warmStartCeiling estimates a demand-charge import ceiling: the median raw
 // in-window import (kW), a deterministic warm start the ceiling ratchets up
 // from as unavoidable peaks appear.
@@ -732,13 +638,22 @@ func billFor(sim simResult, e *env, t *tariff.Tariff) tariff.Bill {
 // combineBills sums line items (by kind+label, preserving first-seen order)
 // across multiple monthly bills.
 func combineBills(bills []tariff.Bill) tariff.Bill {
-	type key struct{ kind, label string }
+	// Demand lines are NOT merged across months: their Qty is a peak kW, and
+	// summing peaks is physically meaningless (and would break Qty×Rate ==
+	// AmountUSD). Each month's demand line stays its own row, keyed by index.
+	type key struct {
+		kind, label string
+		monthIdx    int // -1 for mergeable kinds; bill index for demand
+	}
 	agg := map[key]*tariff.LineItem{}
 	var order []key
-	var total float64
-	for _, b := range bills {
+	var total, carryover float64
+	for bi, b := range bills {
 		for _, li := range b.LineItems {
-			k := key{li.Kind, li.Label}
+			k := key{li.Kind, li.Label, -1}
+			if li.Kind == tariff.KindDemand {
+				k.monthIdx = bi
+			}
 			if agg[k] == nil {
 				cp := li
 				agg[k] = &cp
@@ -749,8 +664,9 @@ func combineBills(bills []tariff.Bill) tariff.Bill {
 			}
 		}
 		total += b.TotalUSD
+		carryover += b.CreditCarryoverUSD
 	}
-	out := tariff.Bill{TotalUSD: round2(total)}
+	out := tariff.Bill{TotalUSD: round2(total), CreditCarryoverUSD: round2(carryover)}
 	for _, k := range order {
 		out.LineItems = append(out.LineItems, *agg[k])
 	}

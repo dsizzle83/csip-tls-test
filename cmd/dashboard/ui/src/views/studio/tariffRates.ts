@@ -1,3 +1,7 @@
+// Client-side TOU rate lookup for the heatmap. SOURCE OF TRUTH for rate
+// semantics is Go internal/tariff/rate.go (periodAt/RateAt) — any change to
+// period matching or expandDays there must be mirrored here or the heatmap
+// will silently disagree with the server-computed bill.
 // Client-side TOU rate lookup for the heatmap (DESIGN_BRIEF.md §4.4: "compute
 // client-side from the tariff JSON"). Mirrors internal/tariff RateAt semantics:
 // ImportUSDPerKWh = period energy rate + riders, EXCLUDING monthly tier adders

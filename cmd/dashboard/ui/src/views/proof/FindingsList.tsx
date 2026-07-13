@@ -90,7 +90,17 @@ function FindingCard({ f }: { f: MayFinding }) {
 
       {f.violations && f.violations.length > 0 && <ViolationStrip violations={f.violations} color={color} />}
 
-      {(f.diagnosis.length > 0 || f.fix) && (
+      {/* The backend still emits the safety audit as a prose bullet (legacy
+          report compatibility); the ViolationStrip above renders the same
+          data structurally, so drop the redundant bullet here. */}
+      {(() => {
+        const diag =
+          f.violations && f.violations.length > 0
+            ? f.diagnosis.filter((d) => !d.includes('SAFETY AUDIT'))
+            : f.diagnosis;
+        return (
+          <>
+            {(diag.length > 0 || f.fix) && (
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
@@ -100,18 +110,21 @@ function FindingCard({ f }: { f: MayFinding }) {
           {open ? 'Hide diagnosis' : 'Diagnosis & fix'}
         </button>
       )}
-      {open && (
-        <div>
-          {f.diagnosis.length > 0 && (
-            <ul className="pf-diag">
-              {f.diagnosis.map((d, i) => (
-                <li key={i}>{d}</li>
-              ))}
-            </ul>
-          )}
-          {f.fix && <div className="pf-fix">Where to look: {f.fix}</div>}
-        </div>
-      )}
+            {open && (
+              <div>
+                {diag.length > 0 && (
+                  <ul className="pf-diag">
+                    {diag.map((d, i) => (
+                      <li key={i}>{d}</li>
+                    ))}
+                  </ul>
+                )}
+                {f.fix && <div className="pf-fix">Where to look: {f.fix}</div>}
+              </div>
+            )}
+          </>
+        );
+      })()}
     </div>
   );
 }

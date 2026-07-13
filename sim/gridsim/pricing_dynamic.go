@@ -409,8 +409,8 @@ func (s *Server) adminTariffPost(w http.ResponseWriter, r *http.Request) {
 }
 
 // adminTariffDelete drops the loaded tariff and restores the legacy static
-// two-tier pricing tree exactly as buildPricing produces it at startup (wall
-// clock, matching the original semantics). 204 whether or not a tariff was set.
+// two-tier pricing tree exactly as buildPricing produces it at startup,
+// anchored to warped server time. 204 whether or not a tariff was set.
 func (s *Server) adminTariffDelete(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.tariff = nil
@@ -418,7 +418,10 @@ func (s *Server) adminTariffDelete(w http.ResponseWriter, r *http.Request) {
 	s.tariffWinStart, s.tariffWinEnd = 0, 0
 	s.tariffActiveStart, s.tariffActiveEnd = 0, 0
 	s.clearPricingLocked()
-	s.buildPricing(time.Now().Unix())
+	// Warped server time, not wall clock: under an active clock skew the hub
+	// reads /tm = s.Now(), and the restored static intervals must be anchored
+	// to the same timeline or the active interval won't match the hub's view.
+	s.buildPricing(s.Now())
 	s.mu.Unlock()
 	log.Printf("[gridsim] tariff cleared → legacy static pricing tree restored")
 	w.WriteHeader(http.StatusNoContent)

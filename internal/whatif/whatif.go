@@ -404,6 +404,21 @@ func crossValidate(sc *scenariodata.Scenario, t *tariff.Tariff) error {
 				"no season covers month %d that the scenario touches", int(m.Month()))}
 		}
 	}
+	// The engine ticks in fixed 15-min UTC-offset steps (buildEnv), which
+	// drifts one hour against local wall-clock across a DST transition —
+	// TOU-period and weather lookups would be off for the rest of the run.
+	// Reject such periods until the engine iterates civil days natively.
+	if loc, err := time.LoadLocation(sc.Meta.Location.Timezone); err == nil {
+		a := time.Date(start.Year(), start.Month(), start.Day(), 12, 0, 0, 0, loc)
+		b := time.Date(end.Year(), end.Month(), end.Day(), 12, 0, 0, 0, loc).AddDate(0, 0, 1)
+		_, offA := a.Zone()
+		_, offB := b.Zone()
+		if offA != offB {
+			return &InputError{Reason: fmt.Sprintf(
+				"scenario period %s..%s spans a DST transition in %s — not yet supported",
+				sc.Meta.Period.Start, sc.Meta.Period.End, sc.Meta.Location.Timezone)}
+		}
+	}
 	return nil
 }
 
