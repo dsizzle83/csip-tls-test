@@ -1,0 +1,74 @@
+{
+  "id": "la-ladwp-r1b-tou-2025",
+  "name": "LADWP Residential R-1(B) Time-of-Use — Zone 1",
+  "short_name": "R-1(B) TOU",
+  "utility": "Los Angeles Department of Water and Power (municipal)",
+  "territory": "los-angeles-ca",
+  "timezone": "America/Los_Angeles",
+  "currency": "USD",
+  "effective": { "from": "2025-07-01", "to": "2025-09-30" },
+  "provenance": {
+    "source_url": "https://apps.openei.org/IURDB/rate/view/67c0dfb895d465db010bceeb",
+    "retrieved": "2026-07-13",
+    "confidence": "estimated",
+    "notes": "RECONSTRUCTED for the Jul-Sep 2025 factor quarter, High Season. Total per-period rate = base energy charge + adjustment factors $0.15867/kWh (= FILED composite ECAF $0.11212 eff 2025-07-01, LADWP board letter read directly, + other factors ESA+RCA+IRCA $0.04655 derived from USURDB Q1-2025 snapshot minus filed Jan-2025 ECAF $0.10499 - same residual validated against published R-1A totals to ~0.1 c). Base rates (filed vintage via USURDB 2022-23 + 2025 entries, both sourced to LADWP's official rate summary): High Peak $0.15858, Low Peak $0.10018, Base $0.07274 (summer). TOU windows from the USURDB 2022-23 July schedule, corroborated published (tou.tools, solar.com): weekdays High Peak 13:00-16:59, Low Peak 10:00-12:59 and 17:00-19:59, Base 20:00-9:59; weekends all Base. Resulting 31.7/25.9/23.1 c/kWh matches published approximations (~31 / 22-27 / ~23, solar.com + shaffercon.com). Weakest: the summer weekend Base rate (USURDB 2022 entry maps July weekends to the $0.07664 low-season base row - likely curation slip; encoded at the summer base $0.07274, +-0.4 c). $12.00/mo service charge (USURDB + published). No usage tiers on R-1(B). The ordinance's EV discount (-$0.025/kWh on a designated charging block) is NOT encoded. Export: LADWP retail-rate net metering (energysage.com/local-data/net-metering/ladwp/, dsireusa.org program 4855)."
+  },
+  "fixed_monthly_usd": 12.0,
+  "energy": {
+    "seasons": [
+      {
+        "id": "high-season",
+        "months": [7, 8, 9],
+        "day_types": [
+          {
+            "days": ["mon", "tue", "wed", "thu", "fri"],
+            "periods": [
+              {
+                "id": "base-night",
+                "label": "Base",
+                "start": "20:00",
+                "end": "10:00",
+                "rate_usd_per_kwh": 0.23141
+              },
+              {
+                "id": "low-am",
+                "label": "Low Peak",
+                "start": "10:00",
+                "end": "13:00",
+                "rate_usd_per_kwh": 0.25885
+              },
+              {
+                "id": "high",
+                "label": "High Peak",
+                "start": "13:00",
+                "end": "17:00",
+                "rate_usd_per_kwh": 0.31725
+              },
+              {
+                "id": "low-pm",
+                "label": "Low Peak",
+                "start": "17:00",
+                "end": "20:00",
+                "rate_usd_per_kwh": 0.25885
+              }
+            ]
+          },
+          {
+            "days": ["sat", "sun"],
+            "periods": [
+              {
+                "id": "base-weekend",
+                "label": "Base",
+                "start": "00:00",
+                "end": "24:00",
+                "rate_usd_per_kwh": 0.23141
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "riders_usd_per_kwh": 0.0,
+  "export": { "type": "net_metering" }
+}

@@ -1,0 +1,48 @@
+{
+  "id": "tx-txu-free-nights-2025",
+  "name": "TXU Energy Free Nights & Solar Days 12 (8 pm)",
+  "short_name": "Free Nights",
+  "utility": "TXU Energy (REP) · Oncor (TDU)",
+  "territory": "east-texas-tx",
+  "timezone": "America/Chicago",
+  "currency": "USD",
+  "effective": { "from": "2025-06-01", "to": "2025-08-31" },
+  "provenance": {
+    "source_url": "https://bkvenergy.com/wp-content/uploads/2024/06/June-11th-TXU-Energy-Electricity-Facts-Label.pdf",
+    "retrieved": "2026-07-13",
+    "confidence": "estimated",
+    "notes": "Structure and rates from the FILED TXU EFL 'Free Nights & Solar Days 12 (8 pm)', Oncor area, dated 2024-06-11: free Nights 8:00pm-4:59am daily (100% credit on BOTH energy charge AND TDU delivery per the EFL text), Solar Days energy charge 26.30 c/kWh, base charge $9.95/mo, EFL avg 19.5 c/kWh @1000 kWh. Marked estimated because the EFL is Jun-2024-dated; a Jul-2025-dated EFL was not retrievable (generator serves current labels, no archive snapshot). Plan availability and ~19.5-19.8 c/kWh all-in corroborated as of 2025-04-09 by homeenergyclub.com/texas-electricity-companies/txu-energy/free-nights-and-solar-days. Encoding: because nights credit BOTH energy and TDU, Oncor volumetric delivery (5.1248 c/kWh, FILED Jul-2025 Oncor rate sheet) is folded into the day rate (26.30 + 5.1248 = 31.4248 c/kWh) instead of riders_usd_per_kwh, so night imports are genuinely free. fixed_monthly_usd = $9.95 TXU base + $4.23 Oncor fixed ($1.43 customer + $2.80 metering)."
+  },
+  "fixed_monthly_usd": 14.18,
+  "energy": {
+    "seasons": [
+      {
+        "id": "summer",
+        "months": [6, 7, 8],
+        "day_types": [
+          {
+            "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "periods": [
+              {
+                "id": "night",
+                "label": "Free Nights",
+                "start": "20:00",
+                "end": "05:00",
+                "rate_usd_per_kwh": 0.0
+              },
+              {
+                "id": "day",
+                "label": "Solar Days",
+                "start": "05:00",
+                "end": "20:00",
+                "rate_usd_per_kwh": 0.314248
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "riders_usd_per_kwh": 0.0,
+  "export": { "type": "none" }
+}

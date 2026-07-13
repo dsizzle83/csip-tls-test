@@ -1,0 +1,41 @@
+{
+  "id": "ma-haverhill-aggregation-2025",
+  "name": "Haverhill Community Choice (First Point Power) + National Grid delivery",
+  "short_name": "Haverhill CCA",
+  "utility": "First Point Power (aggregation supply) · National Grid (delivery)",
+  "territory": "haverhill-ma",
+  "timezone": "America/New_York",
+  "currency": "USD",
+  "effective": { "from": "2025-07-01", "to": "2025-07-31" },
+  "provenance": {
+    "source_url": "https://colonialpowergroup.com/wp-content/uploads/2023/10/Haverhill-2023.10-Consumer-Notification-NEW-RATETERM.pdf",
+    "retrieved": "2026-07-13",
+    "confidence": "filed",
+    "notes": "City of Haverhill Community Choice Power Supply Program (municipal aggregation, M.G.L. c.164 s.134; consultant Colonial Power Group). Supply: $0.14377/kWh fixed all rate classes, term Nov-2023..Nov-2026 meter reads, per the program's official 2023.10 consumer notification; the 2025.08 change-in-law notice (colonialpowergroup.com/wp-content/uploads/2025/07/Haverhill-2025.08-Public-Notice-CHANGE-IN-LAW.pdf) confirms 0.14377 was still in effect until it rose to 0.15101 with the AUGUST 2025 meter reads — so Jul 2025 = 0.14377. Delivery: identical FILED National Grid Jul-2025 R-1 components as ma-ngrid-r1-basic-2025 (M.D.P.U. 1-25-I): $10.00/mo + 20.257 c/kWh. Same encoding split: period rate 29.078 c/kWh = supply 14.377 + creditable delivery 14.701 (distribution 8.939 + transmission 5.798 - transition credit 0.036); riders 5.556 c/kWh = non-creditable riders (EE 2.879 + renewables 0.050 + NM surcharge 1.724 + SMART 0.729 + EV 0.174). All-in 34.634 c/kWh. Export encoded as net_metering (MA Class I); note supply-portion netting for competitive-supply customers is administratively handled by the supplier — simplified here to full net metering."
+  },
+  "fixed_monthly_usd": 10.0,
+  "energy": {
+    "seasons": [
+      {
+        "id": "july",
+        "months": [7],
+        "day_types": [
+          {
+            "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "periods": [
+              {
+                "id": "all-day",
+                "label": "CCA flat",
+                "start": "00:00",
+                "end": "24:00",
+                "rate_usd_per_kwh": 0.29078
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "riders_usd_per_kwh": 0.05556,
+  "export": { "type": "net_metering" }
+}

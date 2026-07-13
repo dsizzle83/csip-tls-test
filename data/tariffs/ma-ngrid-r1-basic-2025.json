@@ -1,0 +1,41 @@
+{
+  "id": "ma-ngrid-r1-basic-2025",
+  "name": "National Grid MA Residential R-1 — Basic Service",
+  "short_name": "R-1 Basic",
+  "utility": "National Grid (Massachusetts Electric Company)",
+  "territory": "haverhill-ma",
+  "timezone": "America/New_York",
+  "currency": "USD",
+  "effective": { "from": "2025-07-01", "to": "2025-07-31" },
+  "provenance": {
+    "source_url": "https://www.nationalgridus.com/media/pdfs/billing-payments/electric-rates/ma/2025/0725meco.pdf",
+    "retrieved": "2026-07-13",
+    "confidence": "filed",
+    "notes": "All numbers read from National Grid's filed Jul-2025 MA rate summary (M.D.P.U. No. 1-25-I, eff. 2025-07-01) and Basic Service table (nationalgridus.com/media/pdfs/billing-payments/electric-rates/ma/resitable.pdf). Supply: residential Basic Service fixed-price 14.672 c/kWh (block 2025-02-01..2025-07-31; rises to 15.484 on 2025-08-01). Delivery total 20.257 c/kWh + $10.00/mo customer charge: Net Distribution 8.939, Net Transition (0.036) credit, Net Transmission 5.798, Energy Efficiency 2.879, Renewables 0.050, Net Metering Recovery Surcharge 1.724, Distributed Solar (SMART) 0.729, EV Program 0.174. Encoding: period rate 29.373 c/kWh = supply + net-metering-CREDITABLE delivery (distribution + transmission + transition); riders_usd_per_kwh 5.556 c/kWh = non-creditable riders (EE + renewables + NM surcharge + SMART + EV), so schema net_metering semantics credit exports at exactly the real MA Class I rate (~29.4 c/kWh) while import totals the filed 34.929 c/kWh. Effective range limited to Jul 2025 because delivery changes monthly (Jun was 20.267; May had a one-time SQ credit). Net metering: MA Class I, cap raised to 25 kW AC Feb 2025 (mass.gov/info-details/net-metering-guide — published, not tariff-sheet)."
+  },
+  "fixed_monthly_usd": 10.0,
+  "energy": {
+    "seasons": [
+      {
+        "id": "july",
+        "months": [7],
+        "day_types": [
+          {
+            "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "periods": [
+              {
+                "id": "all-day",
+                "label": "R-1 flat",
+                "start": "00:00",
+                "end": "24:00",
+                "rate_usd_per_kwh": 0.29373
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "riders_usd_per_kwh": 0.05556,
+  "export": { "type": "net_metering" }
+}

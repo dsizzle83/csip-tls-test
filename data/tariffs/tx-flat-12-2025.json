@@ -1,0 +1,41 @@
+{
+  "id": "tx-flat-12-2025",
+  "name": "East Texas 12-Month Fixed Rate (composite REP plan)",
+  "short_name": "Flat 12",
+  "utility": "Composite REP (deregulated retail) · Oncor (TDU)",
+  "territory": "east-texas-tx",
+  "timezone": "America/Chicago",
+  "currency": "USD",
+  "effective": { "from": "2025-06-01", "to": "2025-08-31" },
+  "provenance": {
+    "source_url": "https://www.oncor.com/content/dam/oncorwww/documents/partners/rep/Oncor%20Residential%20Rates.pdf.coredownload.pdf",
+    "retrieved": "2026-07-13",
+    "confidence": "estimated",
+    "notes": "COMPOSITE plan, not a specific REP's EFL. Delivery side is FILED: Oncor residential TDU rates, Jul 2025 column of Oncor's official 2025 rate sheet — fixed $4.23/mo ($1.43 customer charge + $2.80 metering) in fixed_monthly_usd, volumetric 5.1248 c/kWh (Distribution 2.5344 + TCRF 1.8796 + Nuclear Decomm 0.0199 + EECRF 0.1137 + DCRF 0.5772) in riders_usd_per_kwh; in effect 2025-05-13..2025-08-31 (stepped to 5.6032 c/kWh 2025-09-01); corroborated by bkvenergy.com/learning-center/historical-tdu-delivery-charges/. Energy charge 10.0 c/kWh is ESTIMATED: reconstructed as published Jul-2025 Oncor-area average all-in retail 15.47 c/kWh (electricchoice.com/electricity-prices-by-state/texas/dallas/; EIA TX Jul-2025 avg ~15.36) minus the filed Oncor delivery (~5.55 c/kWh at 1000 kWh). No clean Jul-2025-dated flat EFL was retrievable in 2026 (REPs overwrite EFLs); real named 2025-era plans (e.g. Reliant Secure Advantage 12, Gexa Eco Saver Plus) had comparable all-in but only 2026 quotes or bill-credit structures. REP base charge assumed $0 (many flat plans); fixed_monthly_usd holds only the Oncor fixed charges."
+  },
+  "fixed_monthly_usd": 4.23,
+  "energy": {
+    "seasons": [
+      {
+        "id": "summer",
+        "months": [6, 7, 8],
+        "day_types": [
+          {
+            "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "periods": [
+              {
+                "id": "all-day",
+                "label": "Fixed rate",
+                "start": "00:00",
+                "end": "24:00",
+                "rate_usd_per_kwh": 0.1
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "riders_usd_per_kwh": 0.051248,
+  "export": { "type": "none" }
+}

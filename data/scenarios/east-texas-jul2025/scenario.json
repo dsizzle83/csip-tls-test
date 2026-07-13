@@ -19,8 +19,11 @@
     "retrieved": "2026-07-13",
     "source_url": "https://archive-api.open-meteo.com/v1/archive?latitude=32.35&longitude=-95.3&start_date=2025-07-01&end_date=2025-07-31&hourly=temperature_2m%2Cshortwave_radiation&timezone=America%2FChicago"
   },
-  "tariff_ids": [],
-  "default_tariff_id": "",
+  "tariff_ids": [
+    "tx-flat-12-2025",
+    "tx-txu-free-nights-2025"
+  ],
+  "default_tariff_id": "tx-flat-12-2025",
   "home_defaults": {
     "profile": "single-family-3br",
     "base_kw": 0.45,

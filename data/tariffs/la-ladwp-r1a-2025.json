@@ -1,0 +1,46 @@
+{
+  "id": "la-ladwp-r1a-2025",
+  "name": "LADWP Residential R-1(A) Standard Service — Zone 1",
+  "short_name": "R-1(A) Tiered",
+  "utility": "Los Angeles Department of Water and Power (municipal)",
+  "territory": "los-angeles-ca",
+  "timezone": "America/Los_Angeles",
+  "currency": "USD",
+  "effective": { "from": "2025-07-01", "to": "2025-09-30" },
+  "provenance": {
+    "source_url": "https://apps.openei.org/IURDB/rate/view/67c0b2c8997764b245041d4f",
+    "retrieved": "2026-07-13",
+    "confidence": "estimated",
+    "notes": "RECONSTRUCTED for the Jul-Sep 2025 factor quarter, Zone 1 High Season (Jun-Sep); tiers are monthly-kWh (LADWP bills bi-monthly at 2x thresholds). Total rate per tier = base energy charge + adjustment factors. Base (filed vintage, unchanged since the 2016 incremental ordinance's final step; confirmed identical in USURDB entries eff 2022-09-01 and 2025-01-01, both sourced to LADWP's official rate summary): Tier1 $0.07142, Tier2 $0.13001, Tier3-summer $0.21702 (from USURDB 631ba5d4757e95617e6d6128; the 2025 USURDB entry miscurates summer T3 as = T2). Factors: composite ECAF $0.11212/kWh eff 2025-07-01 (FILED - LADWP board letter 'Energy Cost Adjustment Expenditures... July 1, 2025', ladwp.com/sites/default/files/2025-07/, read directly) + other factors (ESA+RCA+IRCA) $0.04655 = USURDB Q1-2025 adj snapshot $0.15154 minus filed Jan-2025 ECAF $0.10499 (board letter, read directly). Cross-check: same method with Apr-Jun ECAF $0.10968 reproduces solar.com's published June-2025 totals 22.8/28.6/37.3 c/kWh to the rounding digit (solar.com/learn/understanding-ladwp-electric-rates/). fixed_monthly_usd $7.90 = Power Access Charge for a Tier-2 customer (PAC is usage-tiered: $2.30/$7.90/$22.70 by highest tier reached; $10/mo minimum charge exists; both published + USURDB). Export: LADWP retail-rate net metering, credits roll over, muni exempt from CPUC NEM-3.0 (published: energysage.com/local-data/net-metering/ladwp/, dsireusa.org program 4855)."
+  },
+  "fixed_monthly_usd": 7.9,
+  "energy": {
+    "seasons": [
+      {
+        "id": "high-season",
+        "months": [7, 8, 9],
+        "day_types": [
+          {
+            "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "periods": [
+              {
+                "id": "all-day",
+                "label": "R-1(A) all hours",
+                "start": "00:00",
+                "end": "24:00",
+                "rate_usd_per_kwh": 0.23009
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "tiers": [
+      { "up_to_kwh": 350, "adder_usd_per_kwh": 0.0 },
+      { "up_to_kwh": 1050, "adder_usd_per_kwh": 0.05859 },
+      { "up_to_kwh": null, "adder_usd_per_kwh": 0.1456 }
+    ]
+  },
+  "riders_usd_per_kwh": 0.0,
+  "export": { "type": "net_metering" }
+}

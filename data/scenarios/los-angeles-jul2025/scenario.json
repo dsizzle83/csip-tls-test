@@ -19,8 +19,11 @@
     "retrieved": "2026-07-13",
     "source_url": "https://archive-api.open-meteo.com/v1/archive?latitude=34.05&longitude=-118.24&start_date=2025-07-01&end_date=2025-07-31&hourly=temperature_2m%2Cshortwave_radiation&timezone=America%2FLos_Angeles"
   },
-  "tariff_ids": [],
-  "default_tariff_id": "",
+  "tariff_ids": [
+    "la-ladwp-r1a-2025",
+    "la-ladwp-r1b-tou-2025"
+  ],
+  "default_tariff_id": "la-ladwp-r1a-2025",
   "home_defaults": {
     "profile": "single-family-3br",
     "base_kw": 0.45,

@@ -11,10 +11,10 @@ shared home/instrument defaults) is defined in-script below — this script is
 the source of truth for *which* scenarios exist; scenario.json/weather.json
 are generated, reproducible output, not hand-edited.
 
-`tariff_ids`/`default_tariff_id` are intentionally left empty here — tariffs
-are a parallel workstream (data/tariffs/, internal/tariff) and the whatif
-engine cross-validates scenario<->tariff territory/timezone at run time. Do
-not invent tariff ids in this script.
+`tariff_ids`/`default_tariff_id` in each catalog entry must reference real
+files in data/tariffs/ (internal/tariff validates them; the whatif engine
+cross-validates scenario<->tariff territory/timezone at run time). Never
+list a tariff id that doesn't exist as a committed, sourced tariff file.
 
 Idempotent: re-running for the same scenario id re-fetches the (immutable,
 historical) ERA5 data and rewrites byte-identical files, as long as
@@ -81,6 +81,8 @@ SCENARIOS = {
         "blurb": "Oncor delivery; deregulated ERCOT retail choice",
         "start_date": "2025-07-01",
         "end_date": "2025-07-31",
+        "tariff_ids": ["tx-flat-12-2025", "tx-txu-free-nights-2025"],
+        "default_tariff_id": "tx-flat-12-2025",
     },
     "los-angeles-jul2025": {
         "label": "Los Angeles — July 2025",
@@ -93,6 +95,8 @@ SCENARIOS = {
         "blurb": "LADWP municipal utility territory",
         "start_date": "2025-07-01",
         "end_date": "2025-07-31",
+        "tariff_ids": ["la-ladwp-r1a-2025", "la-ladwp-r1b-tou-2025"],
+        "default_tariff_id": "la-ladwp-r1a-2025",
     },
     "haverhill-jul2025": {
         "label": "Haverhill — July 2025",
@@ -105,6 +109,8 @@ SCENARIOS = {
         "blurb": "National Grid (Massachusetts Electric) territory",
         "start_date": "2025-07-01",
         "end_date": "2025-07-31",
+        "tariff_ids": ["ma-ngrid-r1-basic-2025", "ma-haverhill-aggregation-2025"],
+        "default_tariff_id": "ma-ngrid-r1-basic-2025",
     },
 }
 
@@ -239,8 +245,8 @@ def build_scenario_json(sid, spec):
             "retrieved": spec["retrieved"],
             "source_url": weather_url,
         },
-        "tariff_ids": [],
-        "default_tariff_id": "",
+        "tariff_ids": spec.get("tariff_ids", []),
+        "default_tariff_id": spec.get("default_tariff_id", ""),
         "home_defaults": HOME_DEFAULTS,
         "instrument_defaults": INSTRUMENT_DEFAULTS,
     }, weather_url
