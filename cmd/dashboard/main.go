@@ -139,6 +139,10 @@ func main() {
 	mux.HandleFunc("/api/qa/status", mayhem.handleStatus)
 	mux.HandleFunc("/api/qa/scenarios", mayhem.handleScenarios)
 	mux.HandleFunc("/api/qa/abort", mayhem.handleAbort)
+	// Saved run reports (writeReport in mayhem.go writes to logs/qa/): list +
+	// fetch by name, read-only (see qa_reports.go, CONTRACTS.md §4).
+	mux.HandleFunc("/api/qa/reports", handleQAReports)
+	mux.HandleFunc("/api/qa/reports/{name}", handleQAReportFetch)
 
 	log.Printf("dashboard: serving at http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))

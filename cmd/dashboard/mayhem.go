@@ -30,6 +30,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -160,6 +161,12 @@ type mayFinding struct {
 	Diagnosis  []string   `json:"diagnosis"` // bullet points: exactly what went wrong
 	Fix        string     `json:"fix"`       // where in the product to look
 	Metrics    mayMetrics `json:"metrics"`
+	// Violations is the structured form of the "⚠ SAFETY AUDIT: …" diagnosis
+	// bullet applySafetyAudit appends below — same invViolation slice, single
+	// source of truth (CONTRACTS.md §4). Empty/omitted when the audit found
+	// nothing, exactly when today's prose reads "SAFETY AUDIT held: no
+	// violations across the window."
+	Violations []invViolation `json:"violations,omitempty"`
 }
 
 type maySummary struct {
@@ -590,7 +597,11 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 // actually got to observe. Extracted from the run loop so it is unit-testable
 // without a live bench.
 func applySafetyAudit(f mayFinding, cons *activeConstraint, samples []maySample) mayFinding {
-	if audit := safetyAudit(cons, samples); len(audit) > 0 {
+	audit := safetyAudit(cons, samples)
+	// f.Violations is the single source of truth the prose bullet below is
+	// derived from (CONTRACTS.md §4) — same slice, no separate computation.
+	f.Violations = audit
+	if len(audit) > 0 {
 		f.Diagnosis = append(f.Diagnosis, "⚠ "+invSummaryLine("SAFETY AUDIT", audit))
 		if nv, hl := escalateForAudit(f.Verdict, audit); nv != f.Verdict {
 			f.Verdict = nv
@@ -2271,6 +2282,12 @@ func (d *mayhemDriver) fail(msg string) {
 	d.finish(false, msg)
 }
 
+// mayReportDir is where writeReport saves its markdown run reports —
+// under logs/, never the process CWD directly (CONTRACTS.md §4/§7). The
+// report list/fetch routes (qa_reports.go) read from this same directory,
+// and qaReportNameRe there is the filename scheme writeReport produces.
+const mayReportDir = "logs/qa"
+
 // writeReport renders the findings to a shareable markdown file on the dashboard
 // host and returns its path. Best-effort; a failure here does not affect status.
 func (d *mayhemDriver) writeReport() string {
@@ -2281,7 +2298,11 @@ func (d *mayhemDriver) writeReport() string {
 	if len(findings) == 0 {
 		return ""
 	}
-	path := fmt.Sprintf("qa-mayhem-%s.md", time.Now().Format("20060102-150405"))
+	if err := os.MkdirAll(mayReportDir, 0o755); err != nil {
+		log.Printf("mayhem: could not create report dir %s: %v", mayReportDir, err)
+		return ""
+	}
+	path := filepath.Join(mayReportDir, fmt.Sprintf("qa-mayhem-%s.md", time.Now().Format("20060102-150405")))
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Mayhem QA report\n\n")
 	fmt.Fprintf(&b, "Run started %s. %d pass · %d degraded · **%d fail** · **%d blind** · %d inconclusive.\n",

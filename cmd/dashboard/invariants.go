@@ -36,11 +36,15 @@ const (
 	invEVMaxTolA = 1.0
 )
 
-// invViolation is one timestamped breach of a named invariant.
+// invViolation is one timestamped breach of a named invariant. Exported to
+// the wire (mayFinding.Violations, CONTRACTS.md §4) alongside the prose
+// diagnosis bullet the safety audit derives from the same slice — the JSON
+// tags below are the only new surface; the struct and its producers
+// (invExport/invSOC/… below) are unchanged.
 type invViolation struct {
-	Inv    string  // "INV-EXPORT" | "INV-SOC" | "INV-CONVERGE"
-	T      float64 // seconds since scenario start
-	Detail string
+	Inv    string  `json:"inv"` // "INV-EXPORT" | "INV-SOC" | "INV-CONVERGE" | …
+	T      float64 `json:"t_s"` // seconds since scenario start
+	Detail string  `json:"detail"`
 }
 
 // invExport flags every sample that exceeds the active grid cap *after* the
