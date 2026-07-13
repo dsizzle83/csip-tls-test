@@ -19,6 +19,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/control", cors(s.handleAdminControl))
 	mux.HandleFunc("/admin/default", cors(s.handleAdminDefault))
 	mux.HandleFunc("/admin/clock", cors(s.handleAdminClock))
+	mux.HandleFunc("/admin/tariff", cors(s.handleAdminTariff))
 	mux.HandleFunc("/admin/alerts", cors(s.handleAdminAlerts))
 	mux.HandleFunc("/admin/malform", cors(s.handleAdminMalform))
 	mux.HandleFunc("/admin/outage", cors(s.handleAdminOutage))
@@ -183,6 +184,13 @@ func (s *Server) handleAdminClock(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[gridsim] clock skew set: offset=%ds server_time=%d", s.ClockSkew(), s.Now())
+		// A dynamic tariff's window is centered on server time, so re-center it
+		// now that the clock has been warped (no-op on the legacy static tree).
+		s.mu.Lock()
+		if s.tariff != nil {
+			s.regenPricingLocked(s.Now())
+		}
+		s.mu.Unlock()
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return

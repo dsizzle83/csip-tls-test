@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/csip/identity"
+	"csip-tls-test/internal/tariff"
 	"csip-tls-test/sim/simapi"
 	model "lexa-proto/csipmodel"
 )
@@ -86,6 +87,21 @@ type Server struct {
 	// standard logger into LogWriter() so every request log line streams to
 	// the dashboard's unified Logs tab.
 	logBuf *simapi.LogBuffer
+
+	// Dynamic §10.5 pricing (dashboard V2, POST /admin/tariff). When tariff is
+	// non-nil the pricing tree (/tp…) is generated from it for a rolling 48 h
+	// window centered on s.Now(); nil means the legacy static two-tier tree
+	// (buildPricing). tariffIntervals is the merged, contiguous interval set the
+	// current tree was built from; tariffWin{Start,End} are the generated window
+	// bounds and tariffActive{Start,End} the bounds of the interval currently in
+	// ActiveTimeTariffIntervalList (the fast-path staleness check). All of these
+	// are guarded by mu, exactly like s.resources. See pricing_dynamic.go.
+	tariff            *tariff.Tariff
+	tariffIntervals   []pricingIv
+	tariffWinStart    int64
+	tariffWinEnd      int64
+	tariffActiveStart int64
+	tariffActiveEnd   int64
 }
 
 // NewServer creates a grid sim with a complete CSIP conformance resource tree.
@@ -242,6 +258,14 @@ func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string) {
 			tm.CurrentTime = s.Now()
 		}
 		s.mu.Unlock()
+	}
+
+	// Dynamic pricing (dashboard V2): keep the §10.5 tree centered on server
+	// time. Cheap when no tariff is loaded — the RLock test short-circuits on
+	// tariff==nil and never touches the write lock, so the legacy static tree
+	// serves byte-for-byte as before. Only /tp… reads can go stale.
+	if strings.HasPrefix(path, "/tp") {
+		s.refreshPricingIfStale()
 	}
 
 	s.mu.RLock()
