@@ -55,6 +55,8 @@ func main() {
 	mqttproxy := flag.String("mqttproxy", "http://69.0.0.2:11882", "MQTT fault-proxy control API (mayhem chaos)")
 	scenarioDir := flag.String("scenario-dir", "qa/scenarios", "TASK-076: directory of *.json Mayhem scenario specs, re-read on every run (empty = specs disabled)")
 	hubTokenFile := flag.String("hub-token-file", "", "path to lexa-api's bearer token (TASK-014, AD-008); empty = no auth presented, today's behavior")
+	whatifScenarioDir := flag.String("whatif-scenario-dir", "data/scenarios", "dashboard V2: scenario datasets for the what-if engine")
+	whatifTariffDir := flag.String("whatif-tariff-dir", "data/tariffs", "dashboard V2: sourced tariff files for the what-if engine")
 	flag.Parse()
 
 	// TASK-014: present lexa-api's bearer token, scoped to the "hub" backend
@@ -135,6 +137,10 @@ func main() {
 	// TASK-076: specs load fresh on every run (scenarios() reads the dir at
 	// request time, not here) — see scenariospec.go and qa/scenarios/README.md.
 	mayhem.scenarioDir = *scenarioDir
+	// Dashboard V2 what-if engine: offline cost simulation over the real
+	// scenario datasets + sourced tariffs (see whatif_api.go, CONTRACTS.md §3).
+	registerWhatif(mux, *whatifScenarioDir, *whatifTariffDir)
+
 	mux.HandleFunc("/api/qa/start", mayhem.handleStart)
 	mux.HandleFunc("/api/qa/status", mayhem.handleStatus)
 	mux.HandleFunc("/api/qa/scenarios", mayhem.handleScenarios)
