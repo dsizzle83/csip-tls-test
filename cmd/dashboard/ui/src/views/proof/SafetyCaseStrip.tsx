@@ -100,7 +100,7 @@ export function SafetyCaseStrip({
         </span>
         {findings.length === 0 && lastReport && (
           <span className="pf-provenance">
-            Last campaign{lastReport.startedAt ? ` ${formatDate(lastReport.startedAt)}` : ''}: {lastReport.pass} pass · {lastReport.fail} fail · {lastReport.blind} blind
+            Last campaign{lastReport.startedAt ? ` ${formatDate(lastReport.startedAt)}` : ''}: {lastReport.pass} pass · {lastReport.degraded} degraded · {lastReport.fail} fail · {lastReport.blind} blind{lastReport.inconclusive > 0 ? ` · ${lastReport.inconclusive} inconclusive` : ''}
           </span>
         )}
         {findings.length === 0 && !lastReport && (

@@ -37,7 +37,9 @@ export function CostRace({
     const lexaCum = cumulative(lexa.daily.cost_usd);
     const gap = baseCum.map((b, i) => Math.max(0, b - lexaCum[i]));
 
-    const line = (name: string, color: string, data: number[], dashed = false) => ({
+    // showEnd: DER-only converges with LEXA on flat tariffs, so its end label
+    // is suppressed (the legend still names it) to avoid label collision.
+    const line = (name: string, color: string, data: number[], dashed = false, showEnd = true) => ({
       name,
       type: 'line' as const,
       data,
@@ -47,7 +49,7 @@ export function CostRace({
       itemStyle: { color },
       emphasis: { focus: 'series' as const },
       endLabel: {
-        show: true,
+        show: showEnd,
         formatter: () => name,
         color,
         fontSize: 11,
@@ -95,8 +97,6 @@ export function CostRace({
       },
       yAxis: {
         type: 'value',
-        name: 'Cumulative $',
-        nameTextStyle: { color: token('--ink-3'), fontSize: 11, align: 'left' },
         axisLabel: {
           color: token('--ink-3'),
           fontSize: 11,
@@ -130,7 +130,7 @@ export function CostRace({
           z: 1,
         },
         line(POLICY_LABEL.baseline, POLICY_COLORS.baseline, baseCum),
-        line(POLICY_LABEL.der_dumb, POLICY_COLORS.derNoLexa, dumbCum, true),
+        line(POLICY_LABEL.der_dumb, POLICY_COLORS.derNoLexa, dumbCum, true, false),
         line(POLICY_LABEL.der_lexa, POLICY_COLORS.derLexa, lexaCum),
       ],
     };
