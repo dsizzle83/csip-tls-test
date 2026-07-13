@@ -4,7 +4,7 @@ gridsim-client
 gridsim-server
 /hub
 /orchestrator
-logs/
+/logs/
 run_demo.txt
 demo-pis.txt
 dashboard.log
