@@ -1,0 +1,441 @@
+/* /ops Live Ops — panel styles. Tokens only (DESIGN_BRIEF.md §1); no ad-hoc
+   colors or px soup. Loaded by src/views/Ops.tsx. */
+
+/* ── shared card chrome ──────────────────────────────────────────────────── */
+.ops-card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  padding: 16px 18px;
+}
+.ops-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.ops-card-head .card-title {
+  white-space: nowrap;
+}
+.ops-head-meta {
+  font-size: 12px;
+  color: var(--ink-3);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.ops-empty {
+  color: var(--ink-2);
+  font-size: 13px;
+  padding: 22px 4px;
+  text-align: center;
+}
+
+/* ── two-column region (hub brain | plan vs actual) ──────────────────────── */
+.ops-two-col {
+  display: grid;
+  grid-template-columns: minmax(300px, 1fr) minmax(0, 1.65fr);
+  gap: 16px;
+}
+@media (max-width: 960px) {
+  .ops-two-col { grid-template-columns: 1fr; }
+}
+
+/* ── generic chips / badges ──────────────────────────────────────────────── */
+.ops-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.ops-chip-rule {
+  background: var(--sage-soft);
+  color: var(--green-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 600;
+}
+.ops-chip-mode {
+  background: var(--sage-soft);
+  color: var(--ink-2);
+  border: 1px solid var(--sage);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+.ops-chip-warn {
+  background: color-mix(in srgb, var(--s-warn) 12%, white);
+  color: var(--s-warn);
+  border: 1px solid color-mix(in srgb, var(--s-warn) 35%, white);
+  font-weight: 600;
+}
+.ops-chip-neutral {
+  background: var(--surface);
+  color: var(--ink-2);
+  border: 1px solid var(--line);
+}
+.ops-chip-pass {
+  background: color-mix(in srgb, var(--s-good) 10%, white);
+  color: var(--s-good);
+  border: 1px solid color-mix(in srgb, var(--s-good) 35%, white);
+  font-weight: 600;
+}
+.ops-chip-fail {
+  background: color-mix(in srgb, var(--s-critical) 9%, white);
+  color: var(--s-critical);
+  border: 1px solid color-mix(in srgb, var(--s-critical) 35%, white);
+  font-weight: 600;
+}
+
+/* ── power flow ──────────────────────────────────────────────────────────── */
+.ops-flow-card {
+  padding: 14px 18px 8px;
+}
+.ops-flow-svg {
+  display: block;
+  width: 100%;
+  height: 264px;
+}
+.ops-node-name {
+  fill: var(--ink-2);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ops-node-val {
+  fill: var(--ink);
+  font-size: 18px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.ops-node-sub {
+  fill: var(--ink-3);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.ops-link-label {
+  fill: var(--ink-2);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* dash-flow animation — direction set by class, magnitude by stroke width. */
+@keyframes ops-flow-fwd { to { stroke-dashoffset: -22; } }
+@keyframes ops-flow-rev { to { stroke-dashoffset: 22; } }
+.ops-link-live {
+  animation: ops-flow-fwd 0.9s linear infinite;
+}
+.ops-link-live.rev {
+  animation-name: ops-flow-rev;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ops-link-live { animation: none; }
+}
+
+/* ── hub brain feed ──────────────────────────────────────────────────────── */
+.ops-feed {
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ops-feed-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--line);
+}
+.ops-feed-row:last-child { border-bottom: none; }
+.ops-feed-body {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  min-width: 0;
+}
+.ops-feed-reason { color: var(--ink-2); }
+.ops-feed-impact { color: var(--ink); }
+.ops-feed-arrow { color: var(--ink-3); padding: 0 3px; }
+.ops-feed-time {
+  font-size: 10px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+  margin-top: 3px;
+}
+.ops-brain-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.ops-stale-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+  align-items: center;
+}
+
+/* ── stat row (plan economics) ───────────────────────────────────────────── */
+.ops-stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 26px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.ops-stat-label {
+  font-size: 11px;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.ops-stat-val {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+.ops-stat-val.accent { color: var(--green-ink); }
+
+/* ── CSIP protocol inspector ─────────────────────────────────────────────── */
+.ops-inspector {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+@media (max-width: 1080px) {
+  .ops-inspector { grid-template-columns: 1fr; }
+}
+.ops-col-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-2);
+  margin: 0 0 4px;
+}
+.ops-col-sub {
+  font-size: 11px;
+  color: var(--ink-3);
+  margin: 0 0 10px;
+}
+.ops-col-body {
+  max-height: 360px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ops-prog {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 10px;
+}
+.ops-prog.matched {
+  border-color: var(--sage);
+  background: var(--sage-soft);
+}
+.ops-prog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ops-prog-mrid {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.ops-prog-desc { font-size: 11px; color: var(--ink-3); margin-top: 1px; }
+.ops-badge-primacy {
+  font-size: 10px;
+  color: var(--ink-2);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 7px;
+  white-space: nowrap;
+}
+.ops-ctrl {
+  margin-top: 7px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+.ops-ctrl.is-active { border-color: color-mix(in srgb, var(--c-green) 40%, white); }
+.ops-kv {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 4px;
+}
+.ops-kv > div {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.ops-kv .k { color: var(--ink-3); }
+.ops-kv .v {
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.ops-ctrl-mrid {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--ink-2);
+  word-break: break-all;
+}
+
+/* Adopted (middle) card */
+.ops-adopted {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+.ops-adopted.matched { border-color: var(--sage); background: var(--sage-soft); }
+.ops-adopted.warn { border-color: var(--s-warn); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--s-warn) 45%, white); }
+.ops-countdown {
+  font-size: 24px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  letter-spacing: 0.02em;
+}
+.ops-countdown.soon { color: var(--s-warn); }
+
+/* Measured (right) card */
+.ops-meas-big {
+  font-size: 30px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  line-height: 1.1;
+}
+.ops-meas-dir { font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+.ops-meter-bar {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--line);
+  margin: 12px 0 6px;
+  overflow: hidden;
+}
+.ops-meter-fill { position: absolute; inset: 0 auto 0 0; border-radius: 999px; }
+
+/* ── grid event console ──────────────────────────────────────────────────── */
+.ops-console-top {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: flex-start;
+}
+.ops-presets { display: flex; flex-wrap: wrap; gap: 8px; }
+.ops-preset {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 10px;
+  min-width: 132px;
+  background: var(--card);
+}
+.ops-preset-name { font-size: 12px; font-weight: 600; color: var(--ink); }
+.ops-preset-row { display: flex; gap: 6px; align-items: center; }
+.ops-btn {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 11px;
+  border-radius: 7px;
+  border: 1px solid var(--green-ink);
+  background: var(--green-ink);
+  color: #fff;
+  cursor: pointer;
+}
+.ops-btn:hover { background: color-mix(in srgb, var(--green-ink) 88%, black); }
+.ops-btn:disabled { opacity: 0.5; cursor: default; }
+.ops-btn-ghost {
+  background: var(--card);
+  color: var(--ink-2);
+  border: 1px solid var(--line);
+}
+.ops-btn-ghost:hover { background: var(--surface); }
+.ops-select, .ops-input {
+  font-size: 12px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--ink);
+  font-family: inherit;
+}
+.ops-input { width: 82px; font-variant-numeric: tabular-nums; }
+.ops-custom {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-end;
+  padding-left: 18px;
+  border-left: 1px solid var(--line);
+}
+.ops-field { display: flex; flex-direction: column; gap: 3px; }
+.ops-field label { font-size: 10px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; }
+.ops-console-note { font-size: 11px; color: var(--ink-3); margin-top: 8px; }
+
+/* event timeline list */
+.ops-events { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+.ops-event {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.ops-event-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.ops-event-title { font-size: 13px; font-weight: 600; color: var(--ink); }
+.ops-timeline { display: flex; align-items: stretch; gap: 0; }
+.ops-tl-step {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  position: relative;
+  padding: 0 4px;
+}
+.ops-tl-dotrow { display: flex; align-items: center; }
+.ops-tl-dot {
+  width: 11px; height: 11px; border-radius: 50%;
+  background: var(--line);
+  flex-shrink: 0;
+  z-index: 1;
+}
+.ops-tl-dot.on { background: var(--green-ink); }
+.ops-tl-dot.warn { background: var(--s-warn); }
+.ops-tl-dot.fail { background: var(--s-critical); }
+.ops-tl-line {
+  flex: 1;
+  height: 2px;
+  background: var(--line);
+}
+.ops-tl-line.on { background: var(--green-ink); }
+.ops-tl-label { font-size: 10px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em; }
+.ops-tl-dt { font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.ops-status-line { font-size: 12px; color: var(--s-critical); margin-top: 6px; }
