@@ -1,0 +1,36 @@
+{
+  "id": "test-tou-freenight",
+  "name": "TEST — TOU Free Nights (synthetic fixture)",
+  "short_name": "Free Nights (test)",
+  "utility": "Synthetic Test REP · Synthetic TDU",
+  "territory": "test-territory",
+  "timezone": "America/Chicago",
+  "currency": "USD",
+  "effective": { "from": "2025-06-01", "to": "2025-09-30" },
+  "provenance": {
+    "source_url": "https://example.test/fixtures/tou-freenight",
+    "retrieved": "2026-07-12",
+    "confidence": "estimated",
+    "notes": "Synthetic hand-computed test fixture — NOT a real filed rate. Values chosen for penny-exact bill arithmetic (internal/tariff/bill_test.go, TestBillFixtureA)."
+  },
+  "fixed_monthly_usd": 9.95,
+  "energy": {
+    "seasons": [
+      {
+        "id": "summer",
+        "months": [6, 7, 8, 9],
+        "day_types": [
+          {
+            "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "periods": [
+              { "id": "night", "label": "Free Nights", "start": "21:00", "end": "06:00", "rate_usd_per_kwh": 0.0 },
+              { "id": "day", "label": "Day", "start": "06:00", "end": "21:00", "rate_usd_per_kwh": 0.20 }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "riders_usd_per_kwh": 0.05,
+  "export": { "type": "buyback", "rate_usd_per_kwh": 0.06 }
+}

@@ -1,0 +1,42 @@
+{
+  "id": "test-tiered-demand",
+  "name": "TEST — Tiered Flat + Demand + Net Metering (synthetic fixture)",
+  "short_name": "Tiered/Demand (test)",
+  "utility": "Synthetic Test Muni",
+  "territory": "test-territory",
+  "timezone": "America/Los_Angeles",
+  "currency": "USD",
+  "effective": { "from": "2025-01-01", "to": "2025-12-31" },
+  "provenance": {
+    "source_url": "https://example.test/fixtures/tiered-demand",
+    "retrieved": "2026-07-12",
+    "confidence": "estimated",
+    "notes": "Synthetic hand-computed test fixture — NOT a real filed rate. Tier breakpoint and demand window sized for penny-exact bill arithmetic (internal/tariff/bill_test.go, TestBillFixtureB)."
+  },
+  "fixed_monthly_usd": 0.0,
+  "energy": {
+    "seasons": [
+      {
+        "id": "all-year",
+        "months": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        "day_types": [
+          {
+            "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            "periods": [
+              { "id": "allday", "label": "All-day energy", "start": "00:00", "end": "24:00", "rate_usd_per_kwh": 0.10 }
+            ]
+          }
+        ]
+      }
+    ],
+    "tiers": [
+      { "up_to_kwh": 20, "adder_usd_per_kwh": 0.0 },
+      { "up_to_kwh": null, "adder_usd_per_kwh": 0.06 }
+    ]
+  },
+  "riders_usd_per_kwh": 0.0,
+  "demand": [
+    { "label": "On-peak demand", "usd_per_kw": 10.0, "months": [7], "days": ["weekday"], "start": "16:00", "end": "21:00" }
+  ],
+  "export": { "type": "net_metering", "rate_usd_per_kwh": 0.0 }
+}

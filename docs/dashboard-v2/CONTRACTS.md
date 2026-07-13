@@ -59,8 +59,9 @@ One file = one retail electricity plan a real customer could have been on, with 
       "months": [6,7,8,9], "days": ["weekday"], "start": "16:00", "end": "21:00" }
   ],
   "export": {
-    // "net_metering": export credited at the moment's full import energy rate
-    //                 (period rate + tier adder; riders NOT credited)
+    // "net_metering": export credited at the moment's period energy rate
+    //                 (riders NOT credited; monthly tier adders excluded — a
+    //                 tier position has no well-defined per-instant value)
     // "buyback":      flat rate_usd_per_kwh
     // "none":         export earns nothing
     "type": "buyback",
