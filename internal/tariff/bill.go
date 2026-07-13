@@ -30,6 +30,10 @@ type LineItem struct {
 type Bill struct {
 	LineItems []LineItem `json:"line_items"`
 	TotalUSD  float64    `json:"total_usd"`
+	// CreditCarryoverUSD is export credit earned this month but not applied
+	// because the tariff's monthly cap was reached (net-metering banks it
+	// toward future bills rather than paying cash). Zero when uncapped.
+	CreditCarryoverUSD float64 `json:"credit_carryover_usd,omitempty"`
 }
 
 // BillCalc accumulates one billing month. Feed it 15-minute (or any cadence)
@@ -167,21 +171,38 @@ func (b *BillCalc) Close() Bill {
 		})
 	}
 
-	// 6. Export credit (a negative amount).
+	// 6. Export credit (a negative amount). Under CapEnergyCharges (the
+	// net-metering default), the applied credit cannot exceed the month's
+	// volumetric import charges — energy + tier adders + riders — because
+	// real NEM programs bank the excess toward future months instead of
+	// paying cash. The unapplied remainder is reported as carryover.
+	var carryover float64
 	if b.exportKWh > 0 {
-		switch b.t.Export.Type {
-		case ExportNetMetering:
-			rate := b.exportCreditUSD / b.exportKWh // blended (period-matched) credit rate
+		earned := b.exportCreditUSD
+		label := "Export credit (net metering)"
+		if b.t.Export.Type == ExportBuyback {
+			earned = b.exportKWh * b.t.Export.RateUSDPerKWh
+			label = "Export buyback"
+		}
+		applied := earned
+		if b.t.Export.monthlyCap() == CapEnergyCharges {
+			var volumetric float64
+			for _, li := range items {
+				switch li.Kind {
+				case KindEnergy, KindTierAdder, KindRiders:
+					volumetric += li.AmountUSD
+				}
+			}
+			if applied > volumetric {
+				applied = math.Max(volumetric, 0)
+				carryover = earned - applied
+			}
+		}
+		if applied > 0 || b.t.Export.Type != ExportNone {
 			items = append(items, LineItem{
-				Kind: KindExportCredit, Label: "Export credit (net metering)",
-				Qty: b.exportKWh, QtyUnit: "kWh", Rate: rate,
-				AmountUSD: -round2(b.exportCreditUSD),
-			})
-		case ExportBuyback:
-			items = append(items, LineItem{
-				Kind: KindExportCredit, Label: "Export buyback",
-				Qty: b.exportKWh, QtyUnit: "kWh", Rate: b.t.Export.RateUSDPerKWh,
-				AmountUSD: -round2(b.exportKWh * b.t.Export.RateUSDPerKWh),
+				Kind: KindExportCredit, Label: label,
+				Qty: b.exportKWh, QtyUnit: "kWh", Rate: earned / b.exportKWh,
+				AmountUSD: -round2(applied),
 			})
 		}
 	}
@@ -190,7 +211,7 @@ func (b *BillCalc) Close() Bill {
 	for _, li := range items {
 		total += li.AmountUSD
 	}
-	return Bill{LineItems: items, TotalUSD: round2(total)}
+	return Bill{LineItems: items, TotalUSD: round2(total), CreditCarryoverUSD: round2(carryover)}
 }
 
 // tierLineItems distributes cumulative monthly import across the tier

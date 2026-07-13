@@ -276,6 +276,12 @@ func (t *Tariff) validateDemand() error {
 }
 
 func (t *Tariff) validateExport() error {
+	switch t.Export.MonthlyCap {
+	case "", CapEnergyCharges, CapNone:
+	default:
+		return fmt.Errorf("tariff %q: export.monthly_cap %q not in {energy_charges,none}",
+			t.ID, t.Export.MonthlyCap)
+	}
 	switch t.Export.Type {
 	case ExportNetMetering, ExportNone:
 		// rate is unused for these; sanity-check it only if present.

@@ -65,7 +65,13 @@ One file = one retail electricity plan a real customer could have been on, with 
     // "buyback":      flat rate_usd_per_kwh
     // "none":         export earns nothing
     "type": "buyback",
-    "rate_usd_per_kwh": 0.05
+    "rate_usd_per_kwh": 0.05,
+    // "monthly_cap" (optional): "energy_charges" | "none". Default:
+    // net_metering → energy_charges (credit applied this month is capped at
+    // the month's volumetric import charges — energy + tier adders + riders —
+    // with the excess reported as Bill.credit_carryover_usd, matching how
+    // LADWP NEM / MA Class I bank credits); buyback → none (cash-out).
+    "monthly_cap": "energy_charges"
   }
 }
 ```

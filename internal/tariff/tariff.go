@@ -152,10 +152,38 @@ type DemandCharge struct {
 	End      string   `json:"end"`
 }
 
+// Export monthly-cap enum (Tariff.Export.MonthlyCap). Real net-metering
+// programs (LADWP NEM, MA Class I) bank excess credits toward future months
+// rather than paying cash at retail, so a month's credit cannot push the bill
+// below its fixed charges.
+const (
+	// CapEnergyCharges caps the month's export credit at the month's
+	// volumetric import charges (energy + tier adders + riders); the excess
+	// is reported as Bill.CreditCarryoverUSD. Default for net_metering.
+	CapEnergyCharges = "energy_charges"
+	// CapNone applies the full credit even if the bill goes negative.
+	// Default for buyback (cash-out plans).
+	CapNone = "none"
+)
+
 // Export configures how exported (negative-grid) energy is credited.
 type Export struct {
 	Type          string  `json:"type"` // net_metering | buyback | none
 	RateUSDPerKWh float64 `json:"rate_usd_per_kwh"`
+	// MonthlyCap: "energy_charges" | "none". Empty selects the type's
+	// default: net_metering → energy_charges, buyback → none.
+	MonthlyCap string `json:"monthly_cap,omitempty"`
+}
+
+// monthlyCap resolves the effective cap mode, applying per-type defaults.
+func (e Export) monthlyCap() string {
+	if e.MonthlyCap != "" {
+		return e.MonthlyCap
+	}
+	if e.Type == ExportNetMetering {
+		return CapEnergyCharges
+	}
+	return CapNone
 }
 
 // RateInfo is the stateless answer to "what does a kWh cost/earn at this
