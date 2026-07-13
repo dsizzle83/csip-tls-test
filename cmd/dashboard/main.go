@@ -8,16 +8,41 @@
 package main
 
 import (
-	_ "embed"
+	"embed"
 	"flag"
+	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
+	"strings"
 )
 
 //go:embed dashboard.html
 var dashboardHTML []byte
+
+// Dashboard V2 SPA (Vite + React + TS, cmd/dashboard/ui). ui/dist is
+// committed (see Makefile `ui` target + docs/dashboard-v2/CONTRACTS.md §6)
+// so the pure-go CI build needs no node/npm. Served at "/" with an
+// index.html fallback for client-side routing; the legacy page moves to
+// /legacy until V2 reaches parity.
+//
+//go:embed all:ui/dist
+var uiDistFS embed.FS
+
+// uiDist strips the "ui/dist" prefix baked in by go:embed so paths line up
+// with the SPA's own root-relative asset URLs (e.g. "/assets/index-*.js").
+var uiDist = mustSubFS(uiDistFS, "ui/dist")
+
+func mustSubFS(f embed.FS, dir string) fs.FS {
+	sub, err := fs.Sub(f, dir)
+	if err != nil {
+		log.Fatalf("dashboard: embed ui/dist: %v", err)
+	}
+	return sub
+}
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -47,14 +72,23 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
+	// Legacy monolith page (dashboard.html), kept at /legacy until V2 reaches
+	// parity (CONTRACTS.md §6). Exact-path match: ServeMux prefers this over
+	// the "/" catch-all below for the literal "/legacy" request.
+	mux.HandleFunc("/legacy", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/legacy" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(dashboardHTML)
 	})
+
+	// Dashboard V2 SPA: real files under ui/dist (JS/CSS/brand assets) serve
+	// directly; any other non-/api, non-/legacy path falls back to
+	// index.html so react-router's BrowserRouter can resolve client-side
+	// routes like /ops or /proof on a hard refresh.
+	mux.Handle("/", spaHandler(uiDist))
 
 	mux.Handle("/api/hub/", stripHubAuthProxy("/api/hub", *hub))
 	mux.Handle("/api/gridsim/", stripProxy("/api/gridsim", *gridsim))
@@ -108,6 +142,49 @@ func main() {
 
 	log.Printf("dashboard: serving at http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
+}
+
+// spaHandler serves the embedded Dashboard V2 build (ui/dist): a request for
+// a path that exists as a real file (e.g. /assets/index-xxx.js, /brand/
+// logo.png) is served as that file; everything else — "/" itself, and any
+// client-side route the SPA owns (/studio, /ops, /proof, /logs, /bench) —
+// falls back to index.html. /api/* and /legacy never reach this handler:
+// ServeMux routes those to their own, more specific patterns first.
+func spaHandler(dist fs.FS) http.Handler {
+	fileServer := http.FileServer(http.FS(dist))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clean := path.Clean(r.URL.Path)
+
+		// Any /api/* path that didn't match one of the specific proxy/API
+		// patterns registered above is an unknown API route, not a
+		// client-side SPA route — preserve the pre-V2 404 behavior instead
+		// of handing back index.html.
+		if clean == "/api" || strings.HasPrefix(clean, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
+
+		rel := strings.TrimPrefix(clean, "/")
+		if rel == "" || rel == "." {
+			rel = "index.html"
+		}
+
+		if info, err := fs.Stat(dist, rel); err == nil && !info.IsDir() {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		f, err := dist.Open("index.html")
+		if err != nil {
+			http.Error(w, "dashboard: embedded ui/dist/index.html missing — run `make ui`", http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if _, err := io.Copy(w, f); err != nil {
+			log.Printf("dashboard: spa fallback write: %v", err)
+		}
+	})
 }
 
 func stripProxy(prefix, target string) http.Handler {

@@ -5,7 +5,8 @@
         test test-fast test-integration test-update-golden test-southbound qa qa-bench fuzz \
         sweep-sunspec \
         modsim-image modsim-run modsim-stop \
-        gen-test-certs gen-client-cert gen-ev-cert smoke-pi clean help
+        gen-test-certs gen-client-cert gen-ev-cert smoke-pi clean help \
+        ui
 
 REPO_ROOT     := $(shell pwd)
 SERVER_CERTS  := sim/tlsserver/testdata/certs
@@ -64,6 +65,16 @@ build-httpsim:
 build-dashboard:
 	@mkdir -p bin
 	go build -o bin/dashboard ./cmd/dashboard
+
+# Dashboard V2 UI (cmd/dashboard/ui — Vite + React + TS): rebuild the static
+# bundle that cmd/dashboard/main.go embeds via `//go:embed all:ui/dist`.
+# IMPORTANT: cmd/dashboard/ui/dist IS COMMITTED to the repo (not gitignored)
+# so the pure-go CI gate can `go build ./cmd/dashboard` with no node/npm on
+# the runner — see docs/dashboard-v2/CONTRACTS.md §6. After editing anything
+# under ui/src, run `make ui` and commit the regenerated dist/ alongside
+# your source change.
+ui:
+	cd cmd/dashboard/ui && npm ci && npm run build
 
 # Cross-compile the Modbus diagnostic client for the Pi (linux/arm64).
 # No cgo — southbound packages are pure Go.
@@ -359,6 +370,7 @@ help:
 	@echo "  make modsim-stop         Stop the simulator container"
 	@echo "  make build-modsim        Build the simulator binary locally (bin/modsim)"
 	@echo "  make build-dashboard     Build the dashboard binary locally (bin/dashboard)"
+	@echo "  make ui                  Rebuild cmd/dashboard/ui/dist (Vite); dist/ is committed — run + commit after ui/src changes"
 	@echo "  make build-modsim-client-pi  Cross-compile Modbus client for Pi (arm64)"
 	@echo "  make deploy-modsim-client-pi Deploy the client binary to the Pi"
 	@echo "  make smoke-modbus-pi     Deploy + run one-shot measurement read on Pi"

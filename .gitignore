@@ -67,3 +67,7 @@ __pycache__/
 go.work
 go.work.sum
 .claude/worktrees/
+
+# Dashboard V2 UI: dist/ IS committed (pure-go CI embeds it, see
+# cmd/dashboard/main.go + Makefile `ui` target); node_modules never is.
+cmd/dashboard/ui/node_modules
