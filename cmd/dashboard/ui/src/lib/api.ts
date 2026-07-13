@@ -97,20 +97,20 @@ export function head(path: string, opts?: RequestOpts): Promise<void> {
 /**
  * Probe a health endpoint for the bench-health dot row: resolves true on 2xx,
  * false on anything else (network error, non-2xx, timeout) — never throws.
- * Falls back from HEAD to GET since not every backend implements HEAD.
+ * Plain GET with the body ignored: the simapi backends reject HEAD (405), and
+ * health bodies aren't uniformly JSON (the hub's /healthz is the text "ok").
  */
 export async function probeHealth(path: string, timeoutMs = 2500): Promise<boolean> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    await head(path, { timeoutMs });
-    return true;
+    const res = await fetch(path, { signal: ctrl.signal });
+    // Drain/cancel the body so the connection is reusable.
+    res.body?.cancel();
+    return res.ok;
   } catch {
-    // HEAD may be unsupported by the backend (405) or the request may have
-    // failed outright — retry with GET before declaring the target down.
-    try {
-      await getJSON(path, { timeoutMs });
-      return true;
-    } catch {
-      return false;
-    }
+    return false;
+  } finally {
+    clearTimeout(timer);
   }
 }

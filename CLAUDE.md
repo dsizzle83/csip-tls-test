@@ -37,9 +37,19 @@ sim/southbound/         In-memory Modbus device models (no hardware)
 sim/simapi/             REST + WS + SSE /logs sidecar for every sim
 sim/conformance/        CSIP conformance runner (Pi, cgo)
 sim/modsim-conformance/ Modbus conformance runner (-device inverter|battery|meter)
-cmd/dashboard/          Go proxy + embedded SPA (KPIs, scenarios, logs, register tables);
-                        also hosts the Mayhem hostile-QA engine (mayhem.go, /api/qa/*) and
-                        the Bench Replay driver (replay.go, /api/replay/*)
+cmd/dashboard/          Go proxy + embedded SPA; hosts the Mayhem hostile-QA engine
+                        (mayhem.go, /api/qa/*), the Bench Replay driver (replay.go,
+                        /api/replay/*), and the what-if cost API (whatif_api.go).
+                        V2 UI: cmd/dashboard/ui/ (Vite+React+TS, dist/ committed,
+                        `make ui` rebuilds) served at /; legacy dashboard.html at
+                        /legacy. See docs/DASHBOARD.md + docs/dashboard-v2/.
+internal/tariff/        Real-tariff engine (TOU periods/tiers/demand/export, NEM
+                        monthly credit cap, itemized bills) — CONTRACTS.md §1
+internal/whatif/        Deterministic 15-min what-if cost sim (3 policies) — §3
+internal/scenariodata/  Scenario dataset loader (real ERA5 weather) — §2
+data/tariffs/           Sourced July-2025 tariffs w/ provenance (SOURCES.md; never
+                        invent rates — confidence: filed|published|estimated)
+data/scenarios/         Committed weather datasets (scripts/fetch-scenario-data.py)
 internal/csip/          identity (LFDI/SFDI), DNS-SD (model types moved to
                         lexa-proto/csipmodel — TASK-023; walker/scheduler moved out to
                         internal/csipref — TASK-082)
