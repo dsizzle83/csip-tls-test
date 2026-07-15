@@ -142,6 +142,12 @@ func (ss *SolarServer) interceptWrite(startAddr uint16, vals []uint16) bool {
 // solarFaultKinds; an advanced sim additionally advertises the 7xx kinds
 // (raise_alarm / curve_adopt_lies / pf_ack_ignore).
 func (ss *SolarServer) ApplyFault(body []byte) error {
+	// Server-plumbing kinds (tcp_drop / unit_id_confusion / register_tearing)
+	// are handled first by the shared *Server; everything else is a
+	// register-level fault handled by the faultController.
+	if handled, err := ss.Server.applyServerFault(body); handled {
+		return err
+	}
 	kinds := solarFaultKinds
 	if ss.advanced {
 		kinds = solarAdvFaultKinds

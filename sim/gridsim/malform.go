@@ -25,12 +25,13 @@ import (
 
 // Supported malform kinds.
 const (
-	MalformEmptyProgramList = "empty_program_list" // DERProgramList served with no programs
-	MalformHugeActivePower  = "huge_activepower"   // a control limit set to an absurd watt value (overflow bait)
-	MalformBadDuration      = "bad_duration"       // a control interval with a ~136-year duration
-	MalformDupMRID          = "dup_mrid"           // a DERControlList with the same control (mRID) twice
-	MalformMissingHref      = "missing_href"       // a DERProgramList with its href stripped — unresolvable
-	MalformPagination       = "pagination"         // a DERProgramList whose all= count lies (999 across pages, one served, no next page)
+	MalformEmptyProgramList    = "empty_program_list"   // DERProgramList served with no programs
+	MalformHugeActivePower     = "huge_activepower"     // a control limit set to an absurd watt value (overflow bait)
+	MalformNegativeActivePower = "negative_activepower" // an export limit set NEGATIVE (representable but nonsensical)
+	MalformBadDuration         = "bad_duration"         // a control interval with a ~136-year duration
+	MalformDupMRID             = "dup_mrid"             // a DERControlList with the same control (mRID) twice
+	MalformMissingHref         = "missing_href"         // a DERProgramList with its href stripped — unresolvable
+	MalformPagination          = "pagination"           // a DERProgramList whose all= count lies (999 across pages, one served, no next page)
 
 	// Pricing function set (§10.5) attacks.
 	MalformNegativePrice      = "negative_price"       // ConsumptionTariffInterval price set negative
@@ -42,16 +43,17 @@ const (
 )
 
 var malformKinds = map[string]bool{
-	MalformEmptyProgramList:   true,
-	MalformHugeActivePower:    true,
-	MalformBadDuration:        true,
-	MalformDupMRID:            true,
-	MalformMissingHref:        true,
-	MalformPagination:         true,
-	MalformNegativePrice:      true,
-	MalformHugePrice:          true,
-	MalformBadPriceMultiplier: true,
-	MalformEmptyCurveList:     true,
+	MalformEmptyProgramList:    true,
+	MalformHugeActivePower:     true,
+	MalformNegativeActivePower: true,
+	MalformBadDuration:         true,
+	MalformDupMRID:             true,
+	MalformMissingHref:         true,
+	MalformPagination:          true,
+	MalformNegativePrice:       true,
+	MalformHugePrice:           true,
+	MalformBadPriceMultiplier:  true,
+	MalformEmptyCurveList:      true,
 }
 
 // SetMalform arms (kind != "") or clears (kind == "") the malform mode.
@@ -129,6 +131,21 @@ func (s *Server) malformedXML(resource interface{}) ([]byte, bool) {
 		if cp, ok := copyControlListIfNonEmpty(resource); ok {
 			huge := model.ActivePower{Multiplier: 9, Value: 32767} // 32767e9 W
 			cp.DERControl[0].DERControlBase.OpModExpLimW = &huge
+			return marshalOrNil(cp)
+		}
+
+	case MalformNegativeActivePower:
+		// A NEGATIVE opModExpLimW is representable (ActivePower.Value is a signed
+		// int16) but nonsensical as an export ceiling: "export at most −5000 W"
+		// really demands importing ≥5000 W. The hub's plausibility gate accepts
+		// it (it only rejects NaN/Inf and |w|>1e9 magnitude — a finite negative
+		// passes), so it currently ADOPTS it as a real limit. This serves one so a
+		// scenario can assert the hub's handling is at least SAFE (never drives a
+		// pack past its SoC bounds, never crashes) — clamp/reject/adopt-and-enforce
+		// all acceptable, an unsafe reaction is not (audit P3-1).
+		if cp, ok := copyControlListIfNonEmpty(resource); ok {
+			neg := model.ActivePower{Multiplier: 0, Value: -5000} // −5000 W export "ceiling"
+			cp.DERControl[0].DERControlBase.OpModExpLimW = &neg
 			return marshalOrNil(cp)
 		}
 

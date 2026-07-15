@@ -2691,7 +2691,7 @@ func (d *mayhemDriver) clearAllFaults() {
 	_ = d.post("battery", "/fault", map[string]any{"kind": "soc_refuse", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "charge_disabled", "clear": true})
 	_ = d.post("battery", "/fault", map[string]any{"kind": "discharge_disabled", "clear": true})
-	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues", "apply_delayed", "wrong_units"} {
+	for _, k := range []string{"profile_reject", "apply_next_tx", "min_current_floor", "stop_metervalues", "apply_delayed", "wrong_units", "out_of_order_txevent"} {
 		_ = d.post("ev", "/fault", map[string]any{"kind": k, "clear": true})
 	}
 	for _, dev := range []string{"solar", "battery"} {
@@ -2702,6 +2702,15 @@ func (d *mayhemDriver) clearAllFaults() {
 	_ = d.post("solar", "/fault", map[string]any{"kind": "bad_scale", "clear": true})
 	for _, k := range []string{"invert_sign", "nan_sentinel", "latency", "exception_code"} {
 		_ = d.post("meter", "/fault", map[string]any{"kind": k, "clear": true})
+	}
+	// Server-plumbing faults (Batch 3): unit_id_confusion / register_tearing are
+	// sticky and must be disarmed on every Modbus sim. tcp_drop and boot_mid_tx
+	// are one-shot actions with no sticky state (a clear is a no-op), so they are
+	// not cleared here — posting them would needlessly re-fire the action.
+	for _, dev := range []string{"solar", "battery", "meter"} {
+		for _, k := range []string{"unit_id_confusion", "register_tearing"} {
+			_ = d.post(dev, "/fault", map[string]any{"kind": k, "clear": true})
+		}
 	}
 	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
 	_ = d.post("gridsim", "/admin/gone", map[string]any{"clear": true})
@@ -3099,6 +3108,12 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 	// the wire + 410/event-delay/slow-loris survival (docs/QA_COMPLETENESS_AUDIT.md
 	// Batch 2). Go-literal oracles, see mayhem_csipedge.go's header.
 	sc = append(sc, d.csipEdgeScenarios()...)
+	// Transport / OCPP-lifecycle / rogue-value & boundary seams (F): Modbus
+	// tcp_drop/unit-id/register-tearing, negative served limit, out-of-range
+	// write saturation, boundary SoC, OCPP out-of-order/boot-mid-tx
+	// (docs/QA_COMPLETENESS_AUDIT.md Batch 3 — the "may surface hub bugs" set).
+	// Go-literal oracles, see mayhem_transport.go's header.
+	sc = append(sc, d.transportScenarios()...)
 
 	// TASK-076: scenarios-as-data. scenarios() runs fresh on every call —
 	// handleStart calls it at REQUEST time, never once at process start — so

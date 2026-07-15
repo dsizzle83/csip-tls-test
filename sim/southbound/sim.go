@@ -12,6 +12,7 @@
 package sim
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -167,7 +168,57 @@ const (
 	// soc_refuse for the reactive-power controls: only measured-convergence
 	// verification (not the write ACK) catches it.
 	FaultPFAckIgnore FaultKind = "pf_ack_ignore"
+
+	// ── Server/transport-plumbing faults — act BELOW the register hooks. ──
+	//
+	// Unlike every fault above (which the faultController shapes on the read or
+	// write path), these three model the TCP/MBAP transport itself misbehaving.
+	// They are handled by the sim's *Server / *RegisterMap directly (see
+	// Server.applyServerFault), NOT by faultController, because the effect is at
+	// the connection / request-framing level, not the register value.
+	//
+	// NOTE — there is deliberately NO crc_error kind here. A reader looking for
+	// the RTU-serial CRC16 corruption fault will not find it: modsim speaks
+	// Modbus TCP, whose MBAP header REPLACES the CRC entirely (the checksum is
+	// RTU-serial only). There is nothing on the TCP wire to corrupt, so a
+	// crc_error is infeasible/meaningless here and is intentionally omitted
+	// (docs/QA_COMPLETENESS_AUDIT.md P2-2, docs/QA_FAULT_INJECTION.md roadmap).
+
+	// FaultTCPDrop severs every live Modbus TCP connection the moment it is
+	// armed (a one-shot action, not a sticky state — no "clear" needed): the
+	// sim bounces its listener so the hub's poll loop sees its socket close
+	// mid-transaction and must reconnect. Tests the hub's reconnect path AND
+	// that it holds last-known-good (fails closed) across the connectivity gap
+	// rather than dropping the standing control or acting on a truncated read.
+	FaultTCPDrop FaultKind = "tcp_drop"
+
+	// FaultUnitIDConfusion makes the sim answer the WRONG Modbus slave: while
+	// armed, every read returns a gateway-target-failed exception (0x0B), as if
+	// the device the hub polls has been re-addressed to a different unit id and
+	// no longer responds at the one the hub dials. Distinct from exception_code
+	// (0x04 server-device-failure — the right device, internally broken): this
+	// is a bus-addressing fault. The hub must treat it as device-down (never act
+	// on absent data) and hold last-known-good, not crash or fail open.
+	FaultUnitIDConfusion FaultKind = "unit_id_confusion"
+
+	// FaultRegisterTearing serves an internally-inconsistent (torn) multi-
+	// register read: a value in the middle of the returned block is spliced from
+	// a different sampling instant than its neighbours, modelling a field that
+	// changed mid-block (SunSpec/Modbus gives NO atomicity guarantee across a
+	// register span). A hub that assumes one ReadHolding returns a coherent
+	// snapshot decodes a physically-impossible reading (e.g. a torn 32-bit
+	// accumulator, or power inconsistent with the V/I in the same block); it
+	// must sanity-check rather than act on it. Only multi-register data reads
+	// are torn — small model-id/length probe reads pass through clean so model
+	// discovery still succeeds (see RegisterMap.HandleHoldingRegisters).
+	FaultRegisterTearing FaultKind = "register_tearing"
 )
+
+// tearMinQuantity is the smallest read (in registers) FaultRegisterTearing will
+// corrupt. SunSpec model discovery issues 2-register id/length probes; leaving
+// those clean lets the hub still walk the model map while the bulk DATA read of
+// a model block (≥ this many registers) is torn.
+const tearMinQuantity = 8
 
 // FaultSpec is the parsed body of POST /fault. A sim interprets the fields
 // relevant to Kind; Clear removes a previously-armed fault of that Kind.
@@ -205,6 +256,14 @@ type RegisterMap struct {
 	// make the Modbus layer send an exception. Used by transport-layer fault
 	// injection. Called without the map lock held.
 	OnRead func(startAddr uint16, vals []uint16) ([]uint16, error)
+
+	// Server-plumbing faults (guarded by mu) — see Server.applyServerFault.
+	// These act at the request-framing level, before/around the OnRead hook,
+	// which is why they live on the RegisterMap (the RequestHandler that sees
+	// req.UnitId / req.Quantity) rather than on the faultController.
+	unitIDConfusion bool   // FaultUnitIDConfusion: reads answer wrong-slave (0x0B)
+	tearing         bool   // FaultRegisterTearing: multi-register reads are torn
+	tearCtr         uint64 // rolling counter so a torn value differs read-to-read
 }
 
 // Get returns the value of a holding register (0-based Modbus address).
@@ -265,7 +324,25 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 		result[i] = r.regs[req.Addr+i]
 	}
 	onRead := r.OnRead
+	unitConfusion := r.unitIDConfusion
+	tearing := r.tearing
 	r.mu.RUnlock()
+
+	// unit_id_confusion: the device the hub polls has been re-addressed and no
+	// longer answers this unit id — reply with a gateway-target-failed exception
+	// (0x0B) instead of data. Checked here (not in OnRead) because it is keyed on
+	// the request, and it short-circuits the value path entirely: absent data,
+	// never a value the hub could act on.
+	if unitConfusion {
+		return nil, modbuslib.ErrGWTargetFailedToRespond
+	}
+
+	// register_tearing: splice an inconsistent value into a multi-register data
+	// read so the returned block is not a coherent snapshot (a field changed
+	// mid-block). Small probe reads pass through so model discovery still works.
+	if tearing && req.Quantity >= tearMinQuantity {
+		result = r.tearBlock(result)
+	}
 
 	// Transport-layer fault hook: may sleep (latency), rewrite (nan_sentinel), or
 	// return an error to make the Modbus layer send an exception. Called without
@@ -274,6 +351,31 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 		return onRead(req.Addr, result)
 	}
 	return result, nil
+}
+
+// tearBlock returns result with a deliberately inconsistent value spliced into
+// its middle, modelling FaultRegisterTearing: the returned block mixes two
+// sampling instants, so a multi-register field (e.g. a 32-bit accumulator whose
+// hi/lo words straddle the splice, or power that no longer matches the V/I in
+// the same block) is internally inconsistent. The perturbation rolls with
+// tearCtr so consecutive reads of the same block disagree — a value visibly
+// ticking over mid-read, the exact atomicity assumption a single ReadHolding
+// makes and must not.
+func (r *RegisterMap) tearBlock(result []uint16) []uint16 {
+	if len(result) < 2 {
+		return result
+	}
+	out := append([]uint16(nil), result...)
+	mid := len(out) / 2
+	r.mu.Lock()
+	r.tearCtr++
+	ctr := r.tearCtr
+	r.mu.Unlock()
+	// A large, rolling delta guarantees an observable tear regardless of whether
+	// the animation happened to tick between two reads.
+	delta := int16(2000 + int16((ctr%4)*500))
+	out[mid] = uint16(int16(out[mid]) + delta)
+	return out
 }
 
 // HandleInputRegisters satisfies modbuslib.RequestHandler.
@@ -287,9 +389,11 @@ type Server struct {
 	// simulate changing inverter state or verify that a write landed.
 	Regs *RegisterMap
 
-	srv  *modbuslib.ModbusServer
-	stop chan struct{} // closed by Stop to signal the animation goroutine
-	done chan struct{} // closed by animation goroutine when it exits
+	srvMu     sync.Mutex // guards srv across a tcp_drop bounce vs Stop
+	srv       *modbuslib.ModbusServer
+	listenURL string        // retained so a tcp_drop can rebind the same port
+	stop      chan struct{} // closed by Stop to signal the animation goroutine
+	done      chan struct{} // closed by animation goroutine when it exits
 
 	// Animation control. Safe for concurrent use via atomic / mutex.
 	paused atomic.Bool // when true the animation loop skips register updates
@@ -368,10 +472,11 @@ func startServerRaw(listenURL string, regs *RegisterMap) (*Server, error) {
 	time.Sleep(20 * time.Millisecond)
 
 	return &Server{
-		Regs: regs,
-		srv:  srv,
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
+		Regs:      regs,
+		srv:       srv,
+		listenURL: listenURL,
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}, nil
 }
 
@@ -394,7 +499,70 @@ func startServer(listenURL string, regs *RegisterMap) (*Server, error) {
 func (s *Server) Stop() {
 	close(s.stop)
 	<-s.done
-	s.srv.Stop()
+	s.srvMu.Lock()
+	srv := s.srv
+	s.srvMu.Unlock()
+	srv.Stop()
+}
+
+// applyServerFault handles the server-plumbing fault kinds (tcp_drop,
+// unit_id_confusion, register_tearing) that act below the register hooks. It
+// returns handled=true (with any error) when the body's kind is one of those,
+// and handled=false otherwise so the caller can fall through to the
+// faultController for a register-level fault. Each Modbus sim's ApplyFault
+// consults this first.
+func (s *Server) applyServerFault(body []byte) (handled bool, err error) {
+	var spec FaultSpec
+	if e := json.Unmarshal(body, &spec); e != nil {
+		return false, fmt.Errorf("fault: %w", e)
+	}
+	switch spec.Kind {
+	case FaultTCPDrop:
+		// One-shot: arming drops the live connection(s) now; a clear is a no-op
+		// (there is no sticky state to disarm — clearing must NOT trigger a drop).
+		if spec.Clear {
+			return true, nil
+		}
+		return true, s.dropConnections()
+	case FaultUnitIDConfusion:
+		s.Regs.mu.Lock()
+		s.Regs.unitIDConfusion = !spec.Clear
+		s.Regs.mu.Unlock()
+		return true, nil
+	case FaultRegisterTearing:
+		s.Regs.mu.Lock()
+		s.Regs.tearing = !spec.Clear
+		s.Regs.mu.Unlock()
+		return true, nil
+	}
+	return false, nil
+}
+
+// dropConnections severs every live Modbus TCP connection by bouncing the
+// listener: Stop() closes the server socket AND every active client socket (a
+// real TCP close the hub sees mid-poll), then a fresh server rebinds the same
+// URL. Go sets SO_REUSEADDR on listeners, so the rebind succeeds even with the
+// just-closed client sockets lingering in TIME_WAIT. The RegisterMap (and its
+// armed faults) is reused, so device state and the animation are untouched —
+// only the transport is reset.
+func (s *Server) dropConnections() error {
+	s.srvMu.Lock()
+	defer s.srvMu.Unlock()
+	_ = s.srv.Stop()
+	newSrv, err := modbuslib.NewServer(&modbuslib.ServerConfiguration{
+		URL:        s.listenURL,
+		MaxClients: 8,
+		Timeout:    30 * time.Second,
+	}, s.Regs)
+	if err != nil {
+		return fmt.Errorf("sim: tcp_drop rebind at %s: %w", s.listenURL, err)
+	}
+	if err := newSrv.Start(); err != nil {
+		return fmt.Errorf("sim: tcp_drop restart at %s: %w", s.listenURL, err)
+	}
+	time.Sleep(20 * time.Millisecond) // let the new listener come up
+	s.srv = newSrv
+	return nil
 }
 
 // Populate writes a complete SunSpec inverter profile into regs.

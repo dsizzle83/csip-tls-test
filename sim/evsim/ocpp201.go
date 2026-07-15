@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ocpp2 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1"
@@ -32,7 +33,18 @@ type ocpp201Proto struct {
 	txID          string
 	txSeqNo       int
 	txConnectorID int
+
+	// reorderTx arms the out_of_order_txevent fault: while set, sendEvent emits
+	// TransactionEvents with a non-monotonic seqNo (adjacent pairs swapped) so a
+	// hub that assumes arrival order == event order mis-sequences the session.
+	// Set via SetTxReorder (csHandler.ApplyFault, POST /fault).
+	reorderTx atomic.Bool
 }
+
+// SetTxReorder arms/clears the out_of_order_txevent fault. Called by
+// csHandler.ApplyFault via an optional-interface assertion on h.proto, so
+// 1.6 (which has no TransactionEvent/seqNo) simply does not implement it.
+func (p *ocpp201Proto) SetTxReorder(on bool) { p.reorderTx.Store(on) }
 
 func newOCPP201Proto(cs ocpp2.ChargingStation) *ocpp201Proto {
 	return &ocpp201Proto{cs: cs}
@@ -122,17 +134,27 @@ func (p *ocpp201Proto) sendEvent(event transactions.TransactionEvent, trigger se
 	connID := p.txConnectorID
 	p.mu.Unlock()
 
-	_, err := p.cs.TransactionEvent(event, types.NewDateTime(time.Now()), triggerToOCPP201(trigger), seq, info,
+	// out_of_order_txevent: send a non-monotonic seqNo. XOR-ing the low bit swaps
+	// each adjacent pair (real 0,1,2,3 → sent 1,0,3,2), so the FIRST event (Started,
+	// real seq 0) carries a HIGHER seqNo than the one after it — a clear ordering
+	// violation, while every sent value stays unique. The sim's own bookkeeping is
+	// unaffected (it advances p.txSeqNo above); only the wire value is perturbed.
+	sentSeq := seq
+	if p.reorderTx.Load() {
+		sentSeq = seq ^ 1
+	}
+
+	_, err := p.cs.TransactionEvent(event, types.NewDateTime(time.Now()), triggerToOCPP201(trigger), sentSeq, info,
 		func(req *transactions.TransactionEventRequest) {
 			req.Evse = &types.EVSE{ID: 1, ConnectorID: &connID}
 			req.MeterValue = []types.MeterValue{buildMeterValue201(m)}
 		})
 	if err != nil {
-		log.Printf("evsim: TransactionEvent %s tx=%s seq=%d: %v", event, info.TransactionID, seq, err)
+		log.Printf("evsim: TransactionEvent %s tx=%s seq=%d: %v", event, info.TransactionID, sentSeq, err)
 		return
 	}
 	log.Printf("evsim: TransactionEvent %s tx=%s seq=%d trigger=%s state=%s soc=%.1f%% current=%.1fA",
-		event, info.TransactionID, seq, triggerToOCPP201(trigger), info.ChargingState, m.SOC, m.CurrentA)
+		event, info.TransactionID, sentSeq, triggerToOCPP201(trigger), info.ChargingState, m.SOC, m.CurrentA)
 }
 
 func (p *ocpp201Proto) sendLegacyMeterValues(m meterSample) {

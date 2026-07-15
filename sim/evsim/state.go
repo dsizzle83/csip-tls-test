@@ -300,9 +300,10 @@ type evFaultSpec struct {
 // ApplyFault arms or clears an OCPP-layer fault injector, wired to simapi
 // POST /fault. Supported kinds: profile_reject, apply_next_tx,
 // min_current_floor (amps_a, default 6 A), stop_metervalues, apply_delayed
-// (delay_s, default 25), wrong_units (mult, default 1000). Each ACKs the OCPP
-// message at the protocol level while the charger misbehaves — the hub must not
-// assume success.
+// (delay_s, default 25), wrong_units (mult, default 1000), out_of_order_txevent
+// (2.0.1 lifecycle: non-monotonic seqNo), boot_mid_tx (one-shot: BootNotification
+// during a live transaction). Each ACKs the OCPP message at the protocol level
+// while the charger misbehaves — the hub must not assume success.
 func (h *csHandler) ApplyFault(body []byte) error {
 	var spec evFaultSpec
 	if err := json.Unmarshal(body, &spec); err != nil {
@@ -356,6 +357,38 @@ func (h *csHandler) ApplyFault(body []byte) error {
 		}
 		h.batt.SetMinFloorA(floor)
 		log.Printf("[fault] min_current_floor: floor=%.1fA", floor)
+	case "out_of_order_txevent":
+		// Emit TransactionEvents with a non-monotonic seqNo. Only 2.0.1 has
+		// TransactionEvents; the reorder lives on ocpp201Proto and is reached via
+		// an optional-interface assertion so 1.6 (no seqNo) is a no-op. The hub
+		// must sequence events by seqNo, not arrival order (audit P2-5:
+		// OnTransactionEvent reads SequenceNo but does not validate it today).
+		if p, ok := h.proto.(interface{ SetTxReorder(bool) }); ok {
+			p.SetTxReorder(!spec.Clear)
+			log.Printf("[fault] out_of_order_txevent: armed=%v", !spec.Clear)
+		} else {
+			log.Printf("[fault] out_of_order_txevent: no-op (protocol has no TransactionEvent seqNo)")
+		}
+	case "boot_mid_tx":
+		// One-shot: send a BootNotification while a transaction is open (a real
+		// charger power-cycling or CSMS-reconnecting mid-session). A clear is a
+		// no-op. The hub's OnBootNotification must handle a boot that arrives with
+		// a live session — void/re-sync it or tolerate it — never wedge or go
+		// blind to a still-charging car (audit P2-5: OnBootNotification does not
+		// void an active tx today).
+		if !spec.Clear {
+			if h.sessionActive() {
+				go func() {
+					if _, err := h.proto.Boot(); err != nil {
+						log.Printf("[fault] boot_mid_tx: BootNotification error: %v", err)
+						return
+					}
+					log.Printf("[fault] boot_mid_tx: BootNotification sent during an active transaction")
+				}()
+			} else {
+				log.Printf("[fault] boot_mid_tx: no active session — nothing to boot into")
+			}
+		}
 	default:
 		return fmt.Errorf("fault: unsupported kind %q for evsim", spec.Kind)
 	}

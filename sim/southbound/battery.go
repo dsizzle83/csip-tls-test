@@ -107,8 +107,13 @@ func (bs *BatteryServer) interceptWrite(startAddr uint16, vals []uint16) bool {
 }
 
 // ApplyFault arms or clears a fault for this sim. It is wired to simapi's
-// POST /fault. Supported kinds: "reject_write" and "wrong_sign".
+// POST /fault. Server-plumbing kinds (tcp_drop / unit_id_confusion /
+// register_tearing) are handled first by the shared *Server; everything else
+// is a register-level fault handled by the faultController.
 func (bs *BatteryServer) ApplyFault(body []byte) error {
+	if handled, err := bs.Server.applyServerFault(body); handled {
+		return err
+	}
 	return bs.faults.apply(body, batteryFaultKinds)
 }
 

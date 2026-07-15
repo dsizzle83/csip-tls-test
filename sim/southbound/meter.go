@@ -65,8 +65,14 @@ var meterFaultKinds = map[FaultKind]bool{
 	FaultModbusException: true,
 }
 
-// ApplyFault arms or clears a fault from a POST /fault body. See meterFaultKinds.
+// ApplyFault arms or clears a fault from a POST /fault body. Server-plumbing
+// kinds (tcp_drop / unit_id_confusion / register_tearing) are handled first by
+// the shared *Server; everything else is a register-level fault. See
+// meterFaultKinds.
 func (ms *MeterServer) ApplyFault(body []byte) error {
+	if handled, err := ms.Server.applyServerFault(body); handled {
+		return err
+	}
 	return ms.faults.apply(body, meterFaultKinds)
 }
 
