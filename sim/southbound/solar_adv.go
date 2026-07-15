@@ -173,14 +173,16 @@ func readSlice(r *RegisterMap, base uint16, n int) []uint16 {
 	return regs
 }
 
-// populate701 writes a model 701 block truncated at MnAlrmInfo. The full 701
-// layout is 137 registers, over the 125-register single-read cap; a device may
-// legally report a shorter length (partial model), and stopping just before the
-// optional MnAlrmInfo string keeps every measurement point AND scale factor
-// (through Tmp_SF) while fitting one Modbus read. Measurement values are seeded
-// here and refreshed every tick by advMirror701.
+// populate701 writes the FULL model 701 block — all 137 registers, including the
+// optional MnAlrmInfo string past offset 121. The full model is wider than the
+// 125-register Modbus single-read cap, so serving it here deliberately exercises
+// the hub's chunked SunSpec read (lexa-proto sunspec.Reader.readChunked). A real
+// certified inverter serves the full 701; the sim previously truncated to 121 to
+// dodge the cap, which masked a real product bug (the hub could not read a
+// spec-compliant 701) — do not re-truncate. Measurement values are seeded here
+// and refreshed every tick by advMirror701.
 func populate701(r *RegisterMap, cursor uint16) (base uint16, dataLen int, next uint16) {
-	dataLen = sunspec.L701.Offset("MnAlrmInfo") // 121: everything up to the optional alarm string
+	dataLen = sunspec.L701.Len() // 137: the full model 701 (>125 regs ⇒ forces a chunked read)
 	base, next = writeModelHeader(r, cursor, sunspec.ModelDERMeasureAC, dataLen)
 	regs := make([]uint16, dataLen)
 	v := sunspec.L701.View(regs)
