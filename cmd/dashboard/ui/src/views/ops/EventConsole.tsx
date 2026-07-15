@@ -1,18 +1,17 @@
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { postJSON } from '../../lib/api';
 import type { AdminCtrlReq, DerBase, HubStatus } from './types';
-import { evalLimit, formatDelta, serverNowS } from './util';
+import { KIND_LABEL, useEventTracker, type EventKind, type TrackedEvent } from './useEventTracker';
+import { EventTimeline, verdictChip } from './EventTimeline';
 
 // Grid event console (brief §4.5): fire a utility constraint at the real bench,
-// then watch it land — issued → adopted (hub mRID match) → compliant (meter
-// inside limit+150 W for 3 polls) → released — with measured Δt at each hop and
-// a verdict chip on settle. All controls target program 0 (Service Point,
-// primacy 1), matching the legacy demo. Small controls are safe; Clear reverts.
+// then watch it land via useEventTracker — issued → adopted (hub mRID match) →
+// compliant (meter inside limit+150 W for 3 polls) → released — with measured Δt
+// at each hop and a verdict chip on settle. All controls target program 0
+// (Service Point, primacy 1), matching the legacy demo. Small controls are safe;
+// Clear reverts.
 
-type EventKind = 'export' | 'import' | 'gen' | 'load' | 'fixed' | 'cease';
 const PROGRAM = 0;
-const HOLD_N = 3; // consecutive compliant polls (legacy condMet semantics)
-const ADOPT_TIMEOUT_MS = 20000;
 
 interface Preset {
   id: EventKind;
@@ -31,103 +30,26 @@ const PRESETS: Preset[] = [
 
 const DURATIONS = [60, 120, 300];
 
-interface TrackedEvent {
-  id: number;
-  label: string;
-  kind: EventKind;
-  base: DerBase;
-  mrid?: string;
-  t0: number;
-  adoptedAt?: number;
-  compliantAt?: number;
-  releasedAt?: number;
-  validUntil?: number;
-  holdCount: number;
-  settled: boolean;
-  verdict?: 'pass' | 'released' | 'expired' | 'adopted' | 'never-adopted';
-  error?: string;
-}
-
-const KIND_LABEL: Record<EventKind, string> = {
-  export: 'Export cap', import: 'Import cap', gen: 'Gen limit', load: 'Load limit', fixed: 'Fixed W', cease: 'Cease energize',
-};
-
-function verdictChip(v?: TrackedEvent['verdict']) {
-  if (v === 'pass') return <span className="ops-chip ops-chip-pass">✓ Complied</span>;
-  if (v === 'adopted') return <span className="ops-chip ops-chip-pass">✓ Adopted</span>;
-  if (v === 'released') return <span className="ops-chip ops-chip-neutral">Released — no hold</span>;
-  if (v === 'expired') return <span className="ops-chip ops-chip-warn">⚠ Expired before hold</span>;
-  if (v === 'never-adopted') return <span className="ops-chip ops-chip-fail">✕ Never adopted</span>;
-  return null;
-}
-
 export function EventConsole({ status }: { status?: HubStatus }) {
-  const [events, setEvents] = useState<TrackedEvent[]>([]);
+  const { events, track, attachMrid, settle, settleAll } = useEventTracker(status);
   const [durById, setDurById] = useState<Record<string, number>>({});
   const [note, setNote] = useState<string>('');
   const [custom, setCustom] = useState<{ kind: EventKind; w: number; dur: number }>({ kind: 'export', w: 1000, dur: 120 });
-  const idRef = useRef(0);
-
-  // Lifecycle tracker — driven by the parent's 1 s status poll.
-  useEffect(() => {
-    if (!status) return;
-    setEvents((prev) => {
-      if (!prev.some((e) => !e.settled)) return prev;
-      let changed = false;
-      const nowMs = Date.now();
-      const csip = status.csip_control;
-      const snow = serverNowS(status);
-      const next = prev.map((ev) => {
-        if (ev.settled) return ev;
-        let e = ev;
-        const patch = (p: Partial<TrackedEvent>) => { e = { ...e, ...p }; changed = true; };
-
-        // never adopted → give up after a timeout
-        if (!e.adoptedAt && nowMs - e.t0 > ADOPT_TIMEOUT_MS) {
-          patch({ settled: true, verdict: 'never-adopted', releasedAt: nowMs });
-          return e;
-        }
-        // adoption: hub reports our mRID
-        if (!e.adoptedAt && e.mrid && csip?.mrid === e.mrid) {
-          patch({ adoptedAt: nowMs, validUntil: csip.valid_until, ...(e.kind === 'cease' ? { compliantAt: nowMs } : {}) });
-        }
-        // compliance: meter inside limit+tol for HOLD_N consecutive polls
-        if (e.adoptedAt && !e.compliantAt && e.kind !== 'cease') {
-          const le = evalLimit(e.base, status.power);
-          if (le) {
-            const hc = le.within ? e.holdCount + 1 : 0;
-            if (hc >= HOLD_N) patch({ compliantAt: nowMs, holdCount: hc });
-            else patch({ holdCount: hc });
-          }
-        }
-        // release: hub moved off our control, or the window expired
-        if (e.adoptedAt && csip && csip.mrid !== e.mrid) {
-          patch({ releasedAt: nowMs, settled: true, verdict: e.kind === 'cease' ? 'adopted' : e.compliantAt ? 'pass' : 'released' });
-        } else if (e.adoptedAt && !e.settled && e.validUntil && snow >= e.validUntil) {
-          patch({ releasedAt: nowMs, settled: true, verdict: e.kind === 'cease' ? 'adopted' : e.compliantAt ? 'pass' : 'expired' });
-        }
-        return e;
-      });
-      return changed ? next : prev;
-    });
-  }, [status]);
 
   async function fire(kind: EventKind, watts: number, durationS: number) {
     const preset = PRESETS.find((p) => p.id === kind);
     const bodyExtra = preset ? preset.build(watts) : buildCustom(kind, watts);
     const base = preset ? preset.base(watts) : buildCustom(kind, watts);
     const label = kind === 'cease' ? 'Cease energize' : `${KIND_LABEL[kind]} ${watts} W`;
-    const id = idRef.current++;
-    const t0 = Date.now();
-    setEvents((prev) => [{ id, label, kind, base, t0, holdCount: 0, settled: false }, ...prev].slice(0, 12));
+    const id = track({ label, kind, base });
     setNote('');
     try {
       const req: AdminCtrlReq = { program: PROGRAM, activate: true, duration_s: durationS, description: `Ops V2 · ${label}`, ...bodyExtra };
       const resp = await postJSON<{ mrid: string }>('/api/gridsim/admin/control', req);
-      setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, mrid: resp.mrid } : e)));
+      attachMrid(id, resp.mrid);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      setEvents((prev) => prev.map((e) => (e.id === id ? { ...e, settled: true, verdict: 'never-adopted', error: msg, releasedAt: Date.now() } : e)));
+      settle(id, 'never-adopted', msg);
       setNote(`Failed to issue control: ${msg}`);
     }
   }
@@ -141,8 +63,7 @@ export function EventConsole({ status }: { status?: HubStatus }) {
         body: JSON.stringify({ program: PROGRAM }),
       });
       if (!resp.ok && resp.status !== 204) throw new Error(`HTTP ${resp.status}`);
-      const nowMs = Date.now();
-      setEvents((prev) => prev.map((e) => (e.settled ? e : { ...e, settled: true, releasedAt: nowMs, verdict: e.kind === 'cease' ? 'adopted' : e.compliantAt ? 'pass' : 'released' })));
+      settleAll((e) => (e.kind === 'cease' ? 'adopted' : e.compliantAt ? 'pass' : 'released'));
       setNote(`Cleared controls on program ${PROGRAM}.`);
     } catch (err) {
       setNote(`Clear failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -228,31 +149,13 @@ function buildCustom(kind: EventKind, w: number): DerBase {
 }
 
 function EventRow({ e }: { e: TrackedEvent }) {
-  const dt = (t?: number) => (t ? formatDelta((t - e.t0) / 1000) : '');
-  const steps = [
-    { label: 'Issued', on: true, dt: '' },
-    { label: 'Adopted', on: !!e.adoptedAt, dt: dt(e.adoptedAt) },
-    { label: e.kind === 'cease' ? 'Confirmed' : 'Compliant', on: !!e.compliantAt, dt: dt(e.compliantAt) },
-    { label: 'Released', on: !!e.releasedAt, dt: dt(e.releasedAt) },
-  ];
   return (
     <div className="ops-event">
       <div className="ops-event-head">
         <span className="ops-event-title">{e.label}</span>
         {e.settled ? verdictChip(e.verdict) : <span className="ops-chip ops-chip-neutral">tracking…</span>}
       </div>
-      <div className="ops-timeline">
-        {steps.map((s, i) => (
-          <div className="ops-tl-step" key={s.label}>
-            <div className="ops-tl-dotrow">
-              <span className={`ops-tl-dot${s.on ? (s.label === 'Released' && (e.verdict === 'expired' || e.verdict === 'never-adopted') ? ' warn' : ' on') : ''}`} />
-              {i < steps.length - 1 && <span className={`ops-tl-line${steps[i + 1].on ? ' on' : ''}`} />}
-            </div>
-            <span className="ops-tl-label">{s.label}</span>
-            <span className="ops-tl-dt">{s.dt || (s.on ? '' : '—')}</span>
-          </div>
-        ))}
-      </div>
+      <EventTimeline e={e} />
       {e.error && <div className="ops-status-line">{e.error}</div>}
     </div>
   );

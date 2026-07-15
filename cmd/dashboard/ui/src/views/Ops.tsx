@@ -5,6 +5,7 @@ import { HubBrain } from './ops/HubBrain';
 import { PlanVsActual } from './ops/PlanVsActual';
 import { ProtocolInspector } from './ops/ProtocolInspector';
 import { EventConsole } from './ops/EventConsole';
+import { ScenarioConsole } from './ops/ScenarioConsole';
 import type { HubStatus } from './ops/types';
 import './ops/ops.css';
 
@@ -21,6 +22,8 @@ export default function Ops() {
         <h1 className="page-title">Live Ops</h1>
         {!!error && !status && <span className="ops-chip ops-chip-warn">⚠ hub unreachable — retrying</span>}
       </div>
+
+      <ScenarioConsole status={status} />
 
       <div className="ops-flow-row">
         <PowerFlow status={status} />

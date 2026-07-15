@@ -480,3 +480,164 @@
 .ops-tl-label { font-size: 10px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em; }
 .ops-tl-dt { font-size: 11px; color: var(--ink-2); font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .ops-status-line { font-size: 12px; color: var(--s-critical); margin-top: 6px; }
+
+/* ── Injection Console (demo scenario driver) ────────────────────────────── */
+.ops-card-sub { font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+
+.ops-scenario-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+@media (max-width: 980px) {
+  .ops-scenario-grid { grid-template-columns: 1fr; }
+}
+
+.ops-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 13px 14px;
+  background: var(--card);
+}
+.ops-tile-head { display: flex; align-items: flex-start; gap: 10px; }
+.ops-tile-icon { font-size: 20px; line-height: 1.1; flex-shrink: 0; }
+.ops-tile-title { font-size: 13px; font-weight: 700; color: var(--ink); }
+.ops-tile-sub { font-size: 11px; color: var(--ink-3); margin-top: 1px; }
+
+.ops-slider-row { display: flex; align-items: center; gap: 12px; }
+.ops-slider { flex: 1; height: 4px; cursor: pointer; }
+.ops-slider-val {
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  min-width: 64px;
+  text-align: right;
+}
+.ops-slider-cap {
+  font-size: 11px;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: -4px;
+}
+.ops-slider-ends {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--ink-3);
+  margin-top: -4px;
+}
+
+.ops-tile-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ops-dur-chips { display: inline-flex; gap: 4px; }
+.ops-dur-chip {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.ops-dur-chip:hover { background: var(--surface); }
+.ops-dur-chip.active {
+  background: var(--sage-soft);
+  border-color: var(--sage);
+  color: var(--green-ink);
+  font-weight: 600;
+}
+
+.ops-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--ink-2);
+  cursor: pointer;
+  user-select: none;
+}
+.ops-toggle input { accent-color: var(--green-ink); width: 14px; height: 14px; }
+.ops-toggle-hint { color: var(--ink-3); font-size: 11px; }
+
+.ops-readout {
+  font-size: 12px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.ops-tile-hint { font-size: 12px; color: var(--ink-3); margin: 2px 0 0; line-height: 1.5; }
+.ops-tile-track { display: flex; flex-direction: column; gap: 7px; }
+.ops-tile-track-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ops-tile-track-label { font-size: 12px; font-weight: 600; color: var(--ink); }
+
+/* active-injections banner */
+.ops-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border: 1px solid var(--sage);
+  background: var(--sage-soft);
+  border-radius: 10px;
+}
+.ops-banner-lead {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+}
+.ops-banner-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  font-size: 12px;
+  color: var(--ink);
+}
+.ops-banner-txt { font-variant-numeric: tabular-nums; }
+.ops-banner-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  animation: ops-pulse 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ops-banner-dot { animation: none; }
+}
+@keyframes ops-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.ops-banner-clear {
+  border: none;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 5px;
+  border-radius: 6px;
+}
+.ops-banner-clear:hover { background: var(--surface); color: var(--s-critical); }

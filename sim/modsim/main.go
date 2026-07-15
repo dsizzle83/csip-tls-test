@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	modsim [-port 5020] [-wmax 5000] [-api-port 6020]
+//	modsim [-port 5020] [-wmax 5000] [-api-port 6020] [-cloud-pct 0]
 //
 // Models exposed: 1 (Common), 120 (Nameplate), 121 (Basic Settings),
 // 122 (Extended Status), 103 (Three-Phase Inverter), 123 (Immediate Controls).
@@ -11,7 +11,7 @@
 // API (default :6020):
 //
 //	GET  /state      — JSON snapshot of all decoded measurements + controls
-//	POST /inject     — override fields: {"W_W":4500.0,"Conn":0,...}
+//	POST /inject     — override fields: {"W_W":4500.0,"Conn":0,"Cloud_pct":70,...}
 //	POST /control    — {"cmd":"pause"}, {"cmd":"resume"}, {"speed":10.0}
 //	GET  /registers  — raw Modbus register dump
 //	GET  /ws         — WebSocket; pushes /state every 2 s
@@ -36,6 +36,8 @@ func main() {
 	apiPort := flag.Int("api-port", 6020, "HTTP API port (0 to disable)")
 	advanced := flag.Bool("advanced", false, "serve the IEEE 1547-2018 7xx DER models "+
 		"(701/702/704/705/706/711/712) for advanced-DER QA scenarios")
+	cloudPct := flag.Float64("cloud-pct", 0, "initial cloud cover percent (0=clear sky .. 100=full overcast); "+
+		"deterministically attenuates the running irradiance and is injectable live via POST /inject {\"Cloud_pct\":N}")
 	flag.Parse()
 
 	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
@@ -51,6 +53,13 @@ func main() {
 	}
 	if err != nil {
 		log.Fatalf("modsim: %v", err)
+	}
+
+	// Seed the initial cloud cover (0 = clear = today's byte-identical behavior);
+	// srv.Inject already handles the live "Cloud_pct" key, so no wrapper is needed.
+	srv.SetCloud(*cloudPct / 100)
+	if *cloudPct != 0 {
+		log.Printf("modsim: initial cloud cover %.0f%%", *cloudPct)
 	}
 
 	if *apiPort != 0 {

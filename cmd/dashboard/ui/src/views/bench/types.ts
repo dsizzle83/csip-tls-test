@@ -26,6 +26,10 @@ export interface SolarState {
     TmpCab_C: number;
     St: number;
     St_text: string;
+    /** Cloud cover 0–100 % (populated by the cloud-weather sim backend; absent
+     *  on builds that predate it). Injectable via {Cloud_pct} — read by the
+     *  Injection Console's Cloudy Weather readout. */
+    Cloud_pct?: number;
   };
   controls: { WMaxLimPct_pct: number; WMaxLimPct_Ena: number; Conn: number };
 }

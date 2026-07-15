@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"lexa-proto/sunspec"
@@ -47,6 +48,15 @@ type SolarServer struct {
 	bases  SolarBases
 	wmaxW  float64
 	faults faultController // shared fault-injection state (see faults.go)
+
+	// cloudCover is the current cloud-cover fraction (0=clear .. 1=overcast),
+	// held as math.Float64bits for lock-free concurrent access: the HTTP
+	// goroutine writes it via SetCloud (Inject "Cloud_pct" / modsim -cloud-pct),
+	// the animation goroutine reads it via Cloud() each tick. It scales the
+	// clear-sky irradiance through cloudTransmittance in the RUNNING branch only;
+	// the zero value (clear sky) makes cloudTransmittance return exactly 1.0, so a
+	// sim that is never clouded is byte-identical to the pre-cloud model.
+	cloudCover atomic.Uint64
 
 	// Advanced-DER (7xx) surface — populated only by NewSolarServerAdvanced.
 	// When advanced is false the sim serves the legacy models only and behaves
@@ -82,7 +92,7 @@ func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
 	ss.faults.configureScale(bases.M103Base + sunspec.M103_W_SF)
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
-		animateSolar(s, r, wmaxW, bases, &ss.faults, stop)
+		animateSolar(s, r, wmaxW, bases, ss.Cloud, &ss.faults, stop)
 	})
 	if err != nil {
 		return nil, err
@@ -170,6 +180,7 @@ type SolarState struct {
 	Measurements struct {
 		W_W        float64 `json:"W_W"`
 		Possible_W float64 `json:"possible_W"` // pre-curtailment potential (M122 WAval)
+		Cloud_pct  float64 `json:"Cloud_pct"`  // live cloud cover 0–100% (attenuates Possible_W)
 		V_V        float64 `json:"V_V"`
 		Hz_Hz      float64 `json:"Hz_Hz"`
 		VA_VA      float64 `json:"VA_VA"`
@@ -218,6 +229,9 @@ func (ss *SolarServer) Snapshot() SolarState {
 	// from the same register snapshot as W_W lets a sampler compute curtailment
 	// (possible − actual) coherently, with no chance of actual > possible.
 	m.Possible_W = signed(b.M122Base+sunspec.M122_WAval, b.M122Base+sunspec.M122_WAval_SF)
+	// Cloud cover is server state (not a register): expose it as a percent so the
+	// dashboard can display the live weather the running animation is applying.
+	m.Cloud_pct = ss.Cloud() * 100.0
 	m.V_V = unsigned(b.M103Base+sunspec.M103_PhVphA, b.M103Base+sunspec.M103_V_SF)
 	m.Hz_Hz = unsigned(b.M103Base+sunspec.M103_Hz, b.M103Base+sunspec.M103_Hz_SF)
 	m.VA_VA = signed(b.M103Base+sunspec.M103_VA, b.M103Base+sunspec.M103_VA_SF)
@@ -261,9 +275,32 @@ func (ss *SolarServer) Registers() map[string]uint16 {
 	return out
 }
 
+// SetCloud sets the cloud-cover fraction, clamped to [0,1]: 0 is clear sky
+// (byte-identical to a cloud-free sim), 1 is full overcast. Safe to call from
+// the HTTP goroutine (Inject "Cloud_pct", modsim -cloud-pct) while the animation
+// goroutine reads the value via Cloud().
+func (ss *SolarServer) SetCloud(frac float64) {
+	if frac < 0 || math.IsNaN(frac) {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	ss.cloudCover.Store(math.Float64bits(frac))
+}
+
+// Cloud returns the current cloud-cover fraction (0..1).
+func (ss *SolarServer) Cloud() float64 {
+	return math.Float64frombits(ss.cloudCover.Load())
+}
+
 // Inject overrides one or more measurement or control fields.
 // Accepted JSON keys: "W_W", "V_V", "Hz_Hz", "DCV_V", "TmpCab_C",
-// "WMaxLimPct_pct" (0–100), "Conn" (0 or 1), "St" (1–8).
+// "WMaxLimPct_pct" (0–100), "Conn" (0 or 1), "St" (1–8), "Cloud_pct" (0–100).
+//
+// "Cloud_pct" is not a register — it is an environmental input (like metersim's
+// LoadW_W) that scales the running-animation irradiance via cloudTransmittance;
+// it takes effect on the next animation tick and is unaffected by pause.
 //
 // Calling Inject does not automatically pause the animation; use
 // POST /control {"cmd":"pause"} first if you want values to persist.
@@ -314,6 +351,10 @@ func (ss *SolarServer) Inject(body []byte) error {
 			r.Set(b.M123Base+sunspec.M123_Conn, uint16(val))
 		case "St":
 			r.Set(b.M103Base+sunspec.M103_St, uint16(val))
+		case "Cloud_pct":
+			// Environmental input, not a register: 0..100% → SetCloud [0,1]
+			// (clamped). The running animation reads it via cloudTransmittance.
+			ss.SetCloud(val / 100.0)
 		default:
 			return fmt.Errorf("inject: unknown field %q", key)
 		}
@@ -469,7 +510,7 @@ func populateSolarCore(r *RegisterMap, wmaxW float64) (SolarBases, uint16) {
 
 // ── animation ─────────────────────────────────────────────────────────────────
 
-func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, fc *faultController, stop <-chan struct{}) {
+func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, cloud func() float64, fc *faultController, stop <-chan struct{}) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 
@@ -480,9 +521,48 @@ func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, fc
 		case <-stop:
 			return
 		case <-tick.C:
-			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), fc, &whAcc)
+			// cloud() reads the live cover each tick so an /inject Cloud_pct takes
+			// effect on the next step (paused steps ignore it — see solarStep).
+			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), cloud(), fc, &whAcc)
 		}
 	}
+}
+
+// cloudTransmittance returns the fraction of clear-sky irradiance that reaches
+// the panel under cloud cover (0=clear .. 1=overcast) at simulation time t. It
+// is deterministic and downward-only: the result lies in
+// [Tsus·(1−DIPMAX), Tsus], where Tsus = 1 − cloud·(1−DF) is the sustained
+// overcast attenuation (1.0 at clear sky, DF=0.15 — the diffuse floor a panel
+// still sees under a thick deck — at full overcast).
+//
+// A "broken cloud" weight (4·cloud·(1−cloud), peaking at cloud=0.5) gates
+// occasional deeper transient dips driven by a quasi-random, non-repeating sum
+// of three incommensurate sinusoids, so partly-cloudy skies flicker while clear
+// (cloud=0) and fully-overcast (cloud=1) skies are steady. cloud=0 returns
+// exactly 1.0 for every t — so composing it into the irradiance model is
+// byte-identical to the cloud-free sim — and cloud=1 returns exactly Tsus (=DF)
+// with no transient.
+//
+// t shares the animation's simTime base (Unix seconds × speed), so cloud
+// transients pass ~10× faster at 10× bench speed, matching the irradiance cycle.
+func cloudTransmittance(simTime int64, cloud float64) float64 {
+	if cloud <= 0 {
+		return 1.0 // clear sky: exact 1.0 keeps potW byte-identical to pre-cloud
+	}
+	if cloud > 1 {
+		cloud = 1
+	}
+	const (
+		df     = 0.15 // diffuse floor: fraction still reaching the panel at full overcast
+		dipMax = 0.7  // deepest transient dip, as a fraction of Tsus, under broken cloud
+	)
+	tsus := 1 - cloud*(1-df)          // sustained overcast attenuation
+	broken := 4 * cloud * (1 - cloud) // "broken cloud" weight, peaks at cloud=0.5
+	t := float64(simTime)
+	u := (math.Sin(2*math.Pi*t/23) + math.Sin(2*math.Pi*t/37) + math.Sin(2*math.Pi*t/51)) / 3
+	gust := math.Max(0, u-0.55) / 0.45 // mostly 0; occasional 0..1 spikes
+	dip := dipMax * broken * math.Max(0, math.Min(1, gust))
+	return tsus * (1 - dip)
 }
 
 // solarStep advances the inverter registers by one animation tick.  It is split
@@ -493,7 +573,12 @@ func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, fc
 // time-varying environment, but still applies the hub's WMaxLimPct — the
 // property the bench replay depends on, since the replay pauses this sim and
 // injects PV each tick while expecting curtailment to take effect.
-func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, simTime float64, fc *faultController, whAcc *uint16) {
+//
+// cloud (0..1) attenuates the clear-sky irradiance in the RUNNING branch only,
+// via cloudTransmittance; the paused branch is deliberately untouched so
+// replay/mayhem HOLD-injected potentials stay byte-identical. cloud=0 is a
+// no-op (cloudTransmittance returns exactly 1.0).
+func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, simTime float64, cloud float64, fc *faultController, whAcc *uint16) {
 	m103Base := bases.M103Base
 	m122Base := bases.M122Base
 	m123Base := bases.M123Base
@@ -527,7 +612,11 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 	} else {
 		t := simTime
 		irr := math.Max(0.05, math.Min(0.95, 0.5+0.45*math.Sin(2*math.Pi*t/600)))
-		potW = wmaxW * irr
+		// Cloud cover scales the clear-sky potential (downward-only). cloud=0 ⇒
+		// cloudTransmittance == 1.0, so potW is byte-identical to the pre-cloud
+		// model. WAval/possible_W (below) therefore honestly reflect the
+		// cloud-reduced available power, and WMaxLimPct still clips actual ≤ this.
+		potW = wmaxW * irr * cloudTransmittance(int64(t), cloud)
 		v = 240.0 + 2.0*math.Sin(2*math.Pi*t/73)
 		hz := 60.0 + 0.05*math.Sin(2*math.Pi*t/47)
 		pf = math.Max(0.90, math.Min(0.99, 0.97+0.02*math.Sin(2*math.Pi*t/120)))

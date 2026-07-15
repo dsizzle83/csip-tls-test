@@ -111,7 +111,7 @@ func NewSolarServerAdvanced(listenURL string, wmaxW float64) (*SolarServer, erro
 	ss.faults.configureScale(bases.M103Base + sunspec.M103_W_SF)
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
-		animateSolarAdvanced(s, r, wmaxW, bases, adv, varRating, &ss.faults, stop)
+		animateSolarAdvanced(s, r, wmaxW, bases, adv, varRating, ss.Cloud, &ss.faults, stop)
 	})
 	if err != nil {
 		return nil, err
@@ -369,7 +369,7 @@ func (ss *SolarServer) applyAdopt(cb curveBlock, req uint16) {
 
 // ── Animation: 701 mirror + 704 effect ───────────────────────────────────────
 
-func animateSolarAdvanced(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, adv solarAdvBases, varRating float64, fc *faultController, stop <-chan struct{}) {
+func animateSolarAdvanced(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, adv solarAdvBases, varRating float64, cloud func() float64, fc *faultController, stop <-chan struct{}) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 
@@ -388,7 +388,7 @@ func animateSolarAdvanced(s *Server, r *RegisterMap, wmaxW float64, bases SolarB
 			// Bridge the hub's 704 ceiling into the 123 machinery BEFORE the
 			// physical step, so curtailment (and its effect-time faults) apply.
 			advBridgeCeiling(r, bases, adv)
-			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), fc, &whAcc)
+			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), cloud(), fc, &whAcc)
 			advMirror701(r, bases, adv, wmaxW, varRating, fc)
 		}
 	}
