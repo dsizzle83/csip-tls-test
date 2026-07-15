@@ -228,3 +228,40 @@ non-zero values for them before a customer does.
 - **Third:** CSIP conformance edge cases (pagination, supersession, malformed
   XML) — needed for certification, lower field-safety risk.
 - **Fourth:** soak/endurance with overlaid faults via the warp driver.
+
+## Standards build-out supplemental suite (2026-07)
+
+Scenarios + oracles for the lexa-hub standards build-out (17 WPs). Full matrix,
+invariants, and bench-runnability caveats: **`docs/QA_STANDARDS_BUILDOUT.md`**.
+
+**New invariants**: INV-REPORT (DER* PUT + LogEvent + PIN-freeze egress halt),
+INV-CANNOTCOMPLY-VOCAB (IEEE Table 27 codes vs legacy 0xF0), INV-REDIRECT
+(301/302 follow within `redirect_max`, fail-closed beyond), INV-ADV-READBACK
+(curve/PF/energize adoption trusts measured readback, not the write/adopt
+handshake), INV-AUS (gen/load-limit cascade+shadow), INV-OCPP16, INV-PAIRING,
+INV-V2G-CHARGEONLY, INV-OPENADR.
+
+**New `POST /fault` kinds (target `solar`, requires `modsim -advanced`)**:
+- `raise_alarm {bits:<uint32>}` — set the model-701 Alrm bitfield (drives the
+  hub's LogEvent poster). Hub-mapped bits: 64 manual-shutdown, 256 over-freq,
+  512 under-freq, 1024 AC over-volt, 2048 AC under-volt.
+- `curve_adopt_lies` — AdptCrvRslt reports COMPLETED while curve-1 readback stays
+  stale (the INV-ADV-READBACK trap: the hub must report adopt_state=diverged).
+- `pf_ack_ignore` — 704 PF/var write ACKs but measured PF/var never moves.
+
+**New sim**: `sim/vtnsim` — a minimal OpenADR 3.1 VTN stub (token/programs/events)
+for the lexa-openadr VEN; unit-tested, wired into the OpenADR scenarios' follow-up
+(the shipped scenarios inject `bus.OpenADR*` docs directly to test hub adoption).
+
+**Bench-runnability**: several scenarios need hub feature flags pre-set on the
+deployed hub (`advanced_der`/`reconciler.adv`/`enforce_aus_limits`) or a
+launch-time sim mode (`modsim -advanced`, `evsim -proto 1.6`) that a reactive
+scenario cannot toggle mid-run. Those scenarios probe the precondition over SSH
+and return **INCONCLUSIVE** (never a false PASS) when the feature is off. See the
+matrix for per-scenario preconditions.
+
+**Hub observability gaps found (candidates for follow-up)**: `GET /status`
+surfaces Exp/Max/Imp/Fixed/Connect limits but not GenLimW/LoadLimW;
+`lexa_constraint_shadow_divergence_total` is a single aggregate (no per-constraint
+attribution); `lexa_mb_adv_divergences_total` covers only measured axes
+(curve-axis divergence routes to `lexa_mb_adv_failed_total`).

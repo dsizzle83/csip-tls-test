@@ -1,5 +1,9 @@
 # QA — Standards Build-Out Supplemental Suite (2026-07)
 
+**STATUS: implemented + committed 2026-07-15** — 17 scenarios (tracks B/C/D), sim 7xx surface
+(track A), VTN stub, 94 oracle unit tests; catalog-verified (45→62 scenarios). Bench campaign of
+the flag-dependent scenarios pending (see Validation).
+
 Covers the lexa-hub standards build-out (17 WPs; see `../lexa-hub/docs/standards-buildout/`).
 Extends the Mayhem fault-injection suite (`cmd/dashboard/mayhem.go` scenarios + `qa/scenarios/*.json`,
 oracles in `oracleRegistry`) and the `tests/*.go` conformance suite. Invariants live in
