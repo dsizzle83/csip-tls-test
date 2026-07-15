@@ -89,7 +89,10 @@ export interface HubStatus {
 // ── /api/hub/plan ──────────────────────────────────────────────────────────
 
 export interface SolarForecastPoint { t: string; solar_W: number; }
-export interface BatteryPlanPoint { t: string; setpoint_W: number; soc_pct: number; }
+/** Home consumption forecast (NEW — the hub may emit `load_forecast: []` before
+ *  it has a load model; consumers must render gracefully when it is empty). */
+export interface LoadForecastPoint { t: string; load_W: number; }
+export interface BatteryPlanPoint { t: string; setpoint_W: number; soc_pct: number | null; }
 export interface CostPlanPoint { t: string; grid_W: number; marginal_cost: number; }
 export interface PriceForecastPoint {
   t: string;
@@ -104,7 +107,10 @@ export interface HubPlan {
   slot_minutes: number;
   currency: string;
   total_cost: number;
+  fixed_daily_charge?: number;
   solar_forecast: SolarForecastPoint[];
+  /** Home consumption forecast — may be [] on a hub that predates the field. */
+  load_forecast?: LoadForecastPoint[];
   battery_plan: BatteryPlanPoint[];
   cost_plan: CostPlanPoint[];
   price_forecast: PriceForecastPoint[];

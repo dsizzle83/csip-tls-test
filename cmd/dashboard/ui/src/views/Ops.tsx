@@ -22,12 +22,12 @@ export default function Ops() {
         {!!error && !status && <span className="ops-chip ops-chip-warn">⚠ hub unreachable — retrying</span>}
       </div>
 
-      <PowerFlow status={status} />
-
-      <div className="ops-two-col">
+      <div className="ops-flow-row">
+        <PowerFlow status={status} />
         <HubBrain status={status} />
-        <PlanVsActual status={status} />
       </div>
+
+      <PlanVsActual status={status} />
 
       <ProtocolInspector status={status} />
 

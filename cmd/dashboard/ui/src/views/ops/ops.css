@@ -44,6 +44,47 @@
   .ops-two-col { grid-template-columns: 1fr; }
 }
 
+/* Power flow + hub brain share the top row so Plan vs Actual (the 24 h
+   centerpiece) gets its own full-width row below. PowerFlow keeps the room. */
+.ops-flow-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(300px, 1fr);
+  gap: 16px;
+}
+@media (max-width: 1080px) {
+  .ops-flow-row { grid-template-columns: 1fr; }
+}
+
+/* "Why now" — the live decisions that justify the current dispatch, tying the
+   on-graph markPoints to a readable rule → reason → impact caption. */
+.ops-plan-why {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 7px 14px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+.ops-plan-why-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+}
+.ops-plan-why-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+.ops-plan-why-txt {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
 /* ── generic chips / badges ──────────────────────────────────────────────── */
 .ops-chip {
   display: inline-flex;

@@ -116,7 +116,7 @@ if [[ "$SIM" == metersim ]]; then
   # -hub-token-file: TASK-014 — the token relayed above (empty file if the
   # hub hasn't enabled auth yet; metersim treats that as "no auth", unchanged
   # behavior).
-  $AS sed -i "s|^ExecStart=.*|ExecStart=$BIN -port 5022 -api-port 6022 -solar-api http://69.0.0.10:6020 -battery-api http://69.0.0.11:6021 -hub-api https://$HUB:9100 -hub-token-file $HOME/.config/lexa/hub-api.token -load 3000|" "$UNIT"
+  $AS sed -i "s|^ExecStart=.*|ExecStart=$BIN -port 5022 -api-port 6022 -solar-api http://69.0.0.10:6020 -battery-api http://69.0.0.11:6021 -hub-api https://$HUB:9100 -hub-token-file $HOME/.config/lexa/hub-api.token -load-avg-kw 2.0|" "$UNIT"
 fi
 if [[ "$SIM" == evsim ]]; then
   # Point the charging station at the hub's CSMS. Rewritten via a regex

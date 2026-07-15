@@ -10,10 +10,17 @@
 //
 //		meter_W = load_W + ev_W - solar_W - battery_W
 //
-//	 where load_W is the fixed site load (settable via inject), ev_W is the
-//	 EV charging power (positive = consuming), solar_W is generation
-//	 (positive = exporting), and battery_W is net battery power
-//	 (positive = discharging, negative = charging).
+//	 where load_W is the site load, ev_W is the EV charging power (positive =
+//	 consuming), solar_W is generation (positive = exporting), and battery_W is
+//	 net battery power (positive = discharging, negative = charging).
+//
+//	 By default load_W follows a diurnal residential house-load curve (low
+//	 overnight base, modest morning bump, dominant early-evening peak) scaled to
+//	 -load-avg-kw (default 2 kW). The shape mirrors the hub's diurnalLoadForecast
+//	 (internal/orchestrator/planner.go), evaluated at the same wall-clock local
+//	 hour, so the dashboard's live "actual" load sits on the hub's planned load
+//	 curve. A LoadW_W inject PINS a fixed load (scenario/replay/mayhem flows);
+//	 LoadAvgW_W retargets the curve's mean and resumes it.
 //
 //	 EV power source priority: -hub-api (reads OCPP MeterValues via hub
 //	 /status) beats -ev-api (polls evsim directly).  Use -hub-api when the
@@ -22,7 +29,7 @@
 // API (default :6022):
 //
 //	GET  /state      — JSON snapshot; linked mode adds "energy_balance" section
-//	POST /inject     — override fields: {"LoadW_W":3000,"W_W":100,"V_V":241.5}
+//	POST /inject     — override fields: {"LoadW_W":3000,"LoadAvgW_W":2000,"W_W":100,"V_V":241.5}
 //	POST /control    — {"cmd":"pause"}, {"cmd":"resume"}, {"speed":5.0}
 //	GET  /registers  — raw register dump
 //	GET  /ws         — WebSocket; pushes /state every 2 s
@@ -72,7 +79,8 @@ func main() {
 	evAPI := flag.String("ev-api", "", "EV charger simapi base URL for linked mode (e.g. http://69.0.0.14:6024)")
 	hubAPI := flag.String("hub-api", "", "Hub status API for EV power via OCPP (e.g. https://69.0.0.1:9100 — lexa-api serves HTTPS self-signed on :9100, WS-B); preferred over -ev-api")
 	hubTokenFile := flag.String("hub-token-file", "", "path to lexa-api's bearer token (TASK-014, AD-008); empty = no auth presented, today's behavior")
-	initLoad := flag.Float64("load", 3000, "Initial site load in watts (linked mode); injectable via LoadW_W")
+	initLoad := flag.Float64("load", 3000, "Flat site load in watts, used only when -load-avg-kw<=0 (legacy fixed-load mode)")
+	loadAvgKw := flag.Float64("load-avg-kw", 2.0, "Diurnal residential baseload average in kW (linked mode): the meter presents a low-overnight / evening-peaked house-load curve scaled to this mean, mirroring the hub's diurnalLoadForecast. 0 => flat -load. Injectable: LoadAvgW_W sets the mean (W) and resumes the curve; LoadW_W pins a fixed load.")
 	flag.Parse()
 
 	// TASK-014: lexa-api's /status may require a bearer token once its
@@ -93,8 +101,12 @@ func main() {
 	linked := *solarAPI != "" || *batteryAPI != "" || *evAPI != "" || *hubAPI != ""
 
 	if linked {
-		log.Printf("metersim: linked mode on %s  solar=%s  battery=%s  ev=%s  hub=%s  load=%.0fW",
-			listenURL, *solarAPI, *batteryAPI, *evAPI, *hubAPI, *initLoad)
+		loadDesc := fmt.Sprintf("diurnal avg %.2fkW", *loadAvgKw)
+		if *loadAvgKw <= 0 {
+			loadDesc = fmt.Sprintf("flat %.0fW", *initLoad)
+		}
+		log.Printf("metersim: linked mode on %s  solar=%s  battery=%s  ev=%s  hub=%s  load=%s",
+			listenURL, *solarAPI, *batteryAPI, *evAPI, *hubAPI, loadDesc)
 	} else {
 		log.Printf("metersim: sine mode on %s (peak ±%.0f W)", listenURL, *peak)
 	}
@@ -105,8 +117,20 @@ func main() {
 	}
 
 	// Shared linked-mode state — protected by mu.
+	//
+	// The site load is diurnal by default: currentLoadW evaluates the
+	// residential house-load curve (residentialLoadW, mirroring the hub's
+	// diurnalLoadForecast) at the current wall-clock local hour, scaled to
+	// loadAvgW. A LoadW_W inject PINS a fixed load (pinnedW non-nil), which the
+	// scenario/replay/mayhem flows rely on; LoadAvgW_W changes the mean and
+	// resumes the curve. loadAvgW<=0 selects the legacy flat -load setpoint.
 	var mu sync.Mutex
-	loadW := *initLoad
+	loadAvgW := *loadAvgKw * 1000
+	var pinnedW *float64
+	if loadAvgW <= 0 {
+		v := *initLoad
+		pinnedW = &v
+	}
 	var lastSolarW, lastBattW, lastEVW float64
 
 	// injectFn intercepts LoadW_W (linked-mode load setpoint) and forwards
@@ -122,10 +146,22 @@ func main() {
 				return fmt.Errorf("inject LoadW_W: %w", err)
 			}
 			mu.Lock()
-			loadW = f
+			pinnedW = &f // pin to a fixed load (overrides the diurnal curve)
 			mu.Unlock()
-			log.Printf("metersim: load set to %.0f W", f)
+			log.Printf("metersim: load pinned to %.0f W (diurnal curve overridden)", f)
 			delete(raw, "LoadW_W")
+		}
+		if v, ok := raw["LoadAvgW_W"]; ok {
+			f, err := v.Float64()
+			if err != nil {
+				return fmt.Errorf("inject LoadAvgW_W: %w", err)
+			}
+			mu.Lock()
+			loadAvgW = f
+			pinnedW = nil // resume the diurnal curve at the new mean
+			mu.Unlock()
+			log.Printf("metersim: diurnal load mean set to %.0f W (curve resumed)", f)
+			delete(raw, "LoadAvgW_W")
 		}
 		if len(raw) == 0 {
 			return nil
@@ -157,7 +193,7 @@ func main() {
 						eW = fetchEVW(*evAPI)
 					}
 					mu.Lock()
-					lW := loadW
+					lW := currentLoadW(time.Now(), pinnedW, loadAvgW)
 					lastSolarW = sW
 					lastBattW = bW
 					lastEVW = eW
@@ -198,7 +234,8 @@ func main() {
 					return snap
 				}
 				mu.Lock()
-				lw, sw, bw, ew := loadW, lastSolarW, lastBattW, lastEVW
+				lw := currentLoadW(time.Now(), pinnedW, loadAvgW)
+				sw, bw, ew := lastSolarW, lastBattW, lastEVW
 				mu.Unlock()
 				return linkedState{
 					MeterState: snap,
@@ -342,3 +379,68 @@ func fetchHubEVW(baseURL, token string) float64 {
 	}
 	return total
 }
+
+// ── Diurnal residential baseload ────────────────────────────────────────────
+//
+// The meter presents a realistic house-load curve so the hub's energy-balance
+// inference (load = solar + battery + grid − ev) recovers a non-zero, evening-
+// peaked demand instead of a flat baseline. The shape and mean-normalisation
+// mirror lexa-hub internal/orchestrator/planner.go (residentialLoadShape /
+// diurnalLoadForecast) so the dashboard's live "actual" load sits on the hub's
+// planned load curve: both evaluate avg × shape(localHour) / shapeMean at the
+// same wall-clock local hour.
+
+// currentLoadW resolves the site load (W) at time t: a pinned fixed value when
+// pinnedW is non-nil (LoadW_W inject / legacy flat mode), else the diurnal
+// residential curve scaled to avgW.
+func currentLoadW(t time.Time, pinnedW *float64, avgW float64) float64 {
+	if pinnedW != nil {
+		return *pinnedW
+	}
+	return residentialLoadW(t, avgW)
+}
+
+// residentialLoadW returns the instantaneous residential site load (W) at the
+// local wall-clock hour of t, scaled so its 24 h mean equals avgW. Mirrors the
+// hub's diurnalLoadForecast. Deterministic: a pure function of t and avgW.
+func residentialLoadW(t time.Time, avgW float64) float64 {
+	if avgW <= 0 || residentialShapeMean <= 0 {
+		return 0
+	}
+	lt := t.Local()
+	hour := float64(lt.Hour()) + float64(lt.Minute())/60 + float64(lt.Second())/3600
+	return avgW * residentialLoadShape(hour) / residentialShapeMean
+}
+
+// residentialLoadShape is the UNNORMALISED residential load factor at a local
+// hour-of-day — a low overnight base, a modest morning bump, and a dominant
+// early-evening peak (the demand side of the "duck curve"). Copied verbatim
+// from lexa-hub internal/orchestrator/planner.go so the sim's live load and the
+// hub's plan share one shape; only the shape matters (residentialLoadW scales it
+// to the configured mean).
+func residentialLoadShape(hour float64) float64 {
+	base := 0.5
+	morning := 0.7 * gaussianBump(hour, 7.5, 1.5)
+	midday := 0.25 * gaussianBump(hour, 13.0, 2.5)
+	evening := 1.8 * gaussianBump(hour, 19.5, 2.5)
+	return base + morning + midday + evening
+}
+
+// gaussianBump is an un-normalised Gaussian (peak 1.0 at mu) shaping the load
+// curve's morning/evening humps.
+func gaussianBump(x, mu, sigma float64) float64 {
+	d := (x - mu) / sigma
+	return math.Exp(-0.5 * d * d)
+}
+
+// residentialShapeMean is the 24 h mean of residentialLoadShape, sampled at the
+// hub's 5-min resolution (288 steps) so residentialLoadW's scaling reproduces
+// the hub's diurnalLoadForecast mean exactly.
+var residentialShapeMean = func() float64 {
+	const n = 288
+	sum := 0.0
+	for i := 0; i < n; i++ {
+		sum += residentialLoadShape(24.0 * float64(i) / float64(n))
+	}
+	return sum / float64(n)
+}()
