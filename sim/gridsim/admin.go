@@ -25,6 +25,9 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/malform", cors(s.handleAdminMalform))
 	mux.HandleFunc("/admin/outage", cors(s.handleAdminOutage))
 	mux.HandleFunc("/admin/redirect", cors(s.handleAdminRedirect))
+	mux.HandleFunc("/admin/gone", cors(s.handleAdminGone))
+	mux.HandleFunc("/admin/delay", cors(s.handleAdminDelay))
+	mux.HandleFunc("/admin/responses", cors(s.handleAdminResponses))
 	mux.HandleFunc("/admin/derputs", cors(s.handleAdminDERPuts))
 	mux.HandleFunc("/admin/logevents", cors(s.handleAdminLogEvents))
 	mux.HandleFunc("/admin/logs", cors(s.logBuf.ServeHTTP))
@@ -45,6 +48,40 @@ func (s *Server) handleAdminAlerts(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"alerts":      alerts,
+		"server_time": s.Now(),
+	})
+}
+
+// AdminResponse is one Response POST the hub has sent, surfaced by
+// GET /admin/responses. Unlike /admin/alerts (which records only
+// CannotComply-family statuses) this exposes EVERY Response — including the
+// server-driven lifecycle acks Cancelled(6) and Superseded(7) that
+// classifyResponseStatus deliberately does NOT treat as alerts — so a bench
+// scenario can prove the hub emits 6/7 over the wire (CORE-022/023, audit
+// P1-2). A thin JSON DTO rather than the XML-tagged model.Response so the
+// admin JSON stays stable and label-free.
+type AdminResponse struct {
+	Subject string `json:"subject"` // the DERControl mRID being acknowledged
+	Status  uint8  `json:"status"`  // 2030.5 Response status (1/2/3/6/7/…)
+	LFDI    string `json:"lfdi"`    // responding device
+}
+
+// handleAdminResponses returns every Response the hub has POSTed (all
+// statuses), for scenarios asserting the server-driven Cancelled(6)/
+// Superseded(7) emissions.
+func (s *Server) handleAdminResponses(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	recv := s.ReceivedResponses()
+	out := make([]AdminResponse, 0, len(recv))
+	for _, rp := range recv {
+		out = append(out, AdminResponse{Subject: rp.Subject, Status: rp.Status, LFDI: rp.EndDeviceLFDI})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"responses":   out,
 		"server_time": s.Now(),
 	})
 }
@@ -297,6 +334,34 @@ type adminCtrlReq struct {
 	DurationS   int    `json:"duration_s"`     // default 300
 	Activate    bool   `json:"activate"`       // true = replace active list
 
+	// Event-lifecycle controls (audit P1-2/P1-3 — let a scenario drive the
+	// hub's server-side Cancelled(6)/Superseded(7) emission and its
+	// randomizeDuration consumption over the wire; the hub already does all
+	// three, these seams just make a bench scenario prove it e2e):
+	//
+	//   MRID                  — explicit mRID (default: auto-generated). When a
+	//                           control with this mRID already exists in the
+	//                           program's list, the POST UPDATES it in place
+	//                           rather than adding a new one — the two-step a
+	//                           server-cancel needs (post a control, let the hub
+	//                           receive it, then flip its currentStatus→6; the
+	//                           hub drops events that arrive already-cancelled).
+	//   PotentiallySuperseded — sets EventStatus.potentiallySuperseded on the
+	//                           built event (the loser of an overlapping pair).
+	//   CurrentStatus         — overrides EventStatus.currentStatus (e.g. 6 =
+	//                           Cancelled); nil ⇒ the window-derived 0/1.
+	//   CreationOffsetS        — shifts creationTime by N seconds so an
+	//                           overlapping pair has a DETERMINISTIC winner (the
+	//                           later creationTime supersedes) without relying
+	//                           on wall-clock spacing between two POSTs.
+	//   RandomizeStart/Duration — served straight through to the DERControl.
+	MRID                  string `json:"mrid,omitempty"`
+	PotentiallySuperseded *bool  `json:"potentially_superseded,omitempty"`
+	CurrentStatus         *uint8 `json:"current_status,omitempty"`
+	CreationOffsetS       *int   `json:"creation_offset_s,omitempty"`
+	RandomizeStart        *int32 `json:"randomize_start,omitempty"`
+	RandomizeDuration     *int32 `json:"randomize_duration,omitempty"`
+
 	// DERControlBase fields — only non-nil ones are included in the event.
 	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
 	MaxLimW        *int64 `json:"max_lim_W,omitempty"`
@@ -347,29 +412,47 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	now := s.Now()
 	// Event status follows the IEEE 2030.5 event state machine (finding GS-2:
 	// previously always 1/Active, even for events whose window hadn't opened —
-	// a spec-correct client could have started them early).
+	// a spec-correct client could have started them early). CurrentStatus
+	// overrides it directly (e.g. 6/Cancelled for a server-cancel).
 	activeNow := req.StartOffset <= 0
 	var status uint8
-	if !activeNow {
-		status = 0 // Scheduled
-	} else {
+	if activeNow {
 		status = 1 // Active
+	}
+	if req.CurrentStatus != nil {
+		status = *req.CurrentStatus
+	}
+	mrid := req.MRID
+	if mrid == "" {
+		mrid = fmt.Sprintf("DERC-%s-ADMIN-%d", progPrefixes[req.Program], now)
+	}
+	creationTime := now
+	if req.CreationOffsetS != nil {
+		creationTime = now + int64(*req.CreationOffsetS)
 	}
 	ctrl := model.DERControl{
 		Resource:     model.Resource{Href: fmt.Sprintf("/derp/%d/derc/admin", req.Program)},
-		MRID:         fmt.Sprintf("DERC-%s-ADMIN-%d", progPrefixes[req.Program], now),
+		MRID:         mrid,
 		Description:  req.Description,
-		CreationTime: now,
+		CreationTime: creationTime,
 		EventStatus: &model.EventStatus{
-			CurrentStatus: status,
-			DateTime:      now,
+			CurrentStatus:         status,
+			DateTime:              now,
+			PotentiallySuperseded: req.PotentiallySuperseded != nil && *req.PotentiallySuperseded,
 		},
 		Interval: model.DateTimeInterval{
 			Duration: uint32(req.DurationS),
 			Start:    now + int64(req.StartOffset),
 		},
-		DERControlBase: buildBase(req),
+		RandomizeStart:    req.RandomizeStart,
+		RandomizeDuration: req.RandomizeDuration,
+		DERControlBase:    buildBase(req),
 	}
+
+	// An explicit mRID that already exists is an UPDATE-in-place (the flip a
+	// server-cancel needs), never an add; an absent/auto mRID keeps the
+	// original activate/append semantics exactly.
+	matchMRID := req.MRID != ""
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -382,20 +465,11 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// widen this scalar control into it rather than silently no-op'ing.
 	switch dercList := s.resources[dercPath].(type) {
 	case *model.DERControlList:
-		if req.Activate {
-			dercList.DERControl = []model.DERControl{ctrl}
-		} else {
-			dercList.DERControl = append(dercList.DERControl, ctrl)
-		}
+		dercList.DERControl = upsertScalarControl(dercList.DERControl, ctrl, req.Activate, matchMRID)
 		dercList.All = uint32(len(dercList.DERControl))
 		dercList.Results = dercList.All
 	case *model.ExtendedDERControlList:
-		ext := toExtendedControl(ctrl)
-		if req.Activate {
-			dercList.DERControl = []model.ExtendedDERControl{ext}
-		} else {
-			dercList.DERControl = append(dercList.DERControl, ext)
-		}
+		dercList.DERControl = upsertExtendedControl(dercList.DERControl, ctrl, req.Activate, matchMRID)
 		dercList.All = uint32(len(dercList.DERControl))
 		dercList.Results = dercList.All
 	}
@@ -403,29 +477,39 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// Mirror into actderc (status display) only when the event window is
 	// already open; ActiveDERControlList must contain active events only.
 	// Activate=true keeps its replace semantics: a future event clears the
-	// stale active list rather than joining it.
+	// stale active list rather than joining it. For an in-place UPDATE
+	// (matchMRID) refresh the existing entry only — never add a (possibly
+	// now-cancelled) control to the active list.
 	actPath := fmt.Sprintf("/derp/%d/actderc", req.Program)
 	switch actList := s.resources[actPath].(type) {
 	case *model.DERControlList:
-		switch {
-		case req.Activate && activeNow:
-			actList.DERControl = []model.DERControl{ctrl}
-		case req.Activate:
-			actList.DERControl = nil
-		case activeNow:
-			actList.DERControl = append(actList.DERControl, ctrl)
+		if matchMRID {
+			replaceScalarInPlace(actList.DERControl, ctrl)
+		} else {
+			switch {
+			case req.Activate && activeNow:
+				actList.DERControl = []model.DERControl{ctrl}
+			case req.Activate:
+				actList.DERControl = nil
+			case activeNow:
+				actList.DERControl = append(actList.DERControl, ctrl)
+			}
 		}
 		actList.All = uint32(len(actList.DERControl))
 		actList.Results = actList.All
 	case *model.ExtendedDERControlList:
-		ext := toExtendedControl(ctrl)
-		switch {
-		case req.Activate && activeNow:
-			actList.DERControl = []model.ExtendedDERControl{ext}
-		case req.Activate:
-			actList.DERControl = nil
-		case activeNow:
-			actList.DERControl = append(actList.DERControl, ext)
+		if matchMRID {
+			replaceExtendedInPlace(actList.DERControl, toExtendedControl(ctrl))
+		} else {
+			ext := toExtendedControl(ctrl)
+			switch {
+			case req.Activate && activeNow:
+				actList.DERControl = []model.ExtendedDERControl{ext}
+			case req.Activate:
+				actList.DERControl = nil
+			case activeNow:
+				actList.DERControl = append(actList.DERControl, ext)
+			}
 		}
 		actList.All = uint32(len(actList.DERControl))
 		actList.Results = actList.All
@@ -433,6 +517,64 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]string{"mrid": ctrl.MRID})
+}
+
+// upsertScalarControl adds ctrl to a scalar DERControl list, or — when
+// matchMRID is set and an entry with the same mRID already exists — replaces
+// that entry in place (the server-cancel status flip). With no match it honors
+// the original semantics: activate replaces the whole list, else it appends.
+func upsertScalarControl(list []model.DERControl, ctrl model.DERControl, activate, matchMRID bool) []model.DERControl {
+	if matchMRID {
+		for i := range list {
+			if list[i].MRID == ctrl.MRID {
+				list[i] = ctrl
+				return list
+			}
+		}
+	}
+	if activate {
+		return []model.DERControl{ctrl}
+	}
+	return append(list, ctrl)
+}
+
+// upsertExtendedControl is upsertScalarControl for a curve-bound
+// ExtendedDERControlList (a prior POST /admin/curve widened the list).
+func upsertExtendedControl(list []model.ExtendedDERControl, ctrl model.DERControl, activate, matchMRID bool) []model.ExtendedDERControl {
+	ext := toExtendedControl(ctrl)
+	if matchMRID {
+		for i := range list {
+			if list[i].MRID == ext.MRID {
+				list[i] = ext
+				return list
+			}
+		}
+	}
+	if activate {
+		return []model.ExtendedDERControl{ext}
+	}
+	return append(list, ext)
+}
+
+// replaceScalarInPlace refreshes an existing same-mRID entry (if present) and
+// is a no-op otherwise — used to mirror an in-place update into actderc
+// without ever adding a new active entry.
+func replaceScalarInPlace(list []model.DERControl, ctrl model.DERControl) {
+	for i := range list {
+		if list[i].MRID == ctrl.MRID {
+			list[i] = ctrl
+			return
+		}
+	}
+}
+
+func replaceExtendedInPlace(list []model.ExtendedDERControl, ext model.ExtendedDERControl) {
+	for i := range list {
+		if list[i].MRID == ext.MRID {
+			list[i] = ext
+			return
+		}
+	}
 }
 
 func (s *Server) adminCtrlDelete(w http.ResponseWriter, r *http.Request) {

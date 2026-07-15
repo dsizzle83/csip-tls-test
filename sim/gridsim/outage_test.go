@@ -79,3 +79,28 @@ func TestOutage_UnknownModeRejected(t *testing.T) {
 		t.Error("unknown outage mode accepted")
 	}
 }
+
+func TestOutage_SlowTricklesFullBodyOverBudget(t *testing.T) {
+	s := &Server{}
+	if err := s.SetOutage(OutageSlow, 0, 1); err != nil { // 1s total drip for the test
+		t.Fatalf("arm: %v", err)
+	}
+	w := httptest.NewRecorder() // ResponseRecorder implements http.Flusher
+	start := time.Now()
+	if !s.outageIntercept(w) {
+		t.Fatal("armed 'slow' outage did not intercept the request")
+	}
+	if elapsed := time.Since(start); elapsed < 800*time.Millisecond {
+		t.Errorf("slow drip finished in %v, want ≥ ~1s of trickle", elapsed)
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("mode slow: got %d, want 200", w.Code)
+	}
+	// The complete body must eventually arrive (it was trickled, not truncated).
+	if got := w.Body.Bytes(); string(got) != string(outageSlowBody) {
+		t.Errorf("slow body = %q, want the full trickled payload", got)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != ContentType {
+		t.Errorf("slow Content-Type = %q, want %q", ct, ContentType)
+	}
+}

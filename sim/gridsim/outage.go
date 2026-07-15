@@ -33,18 +33,33 @@ import (
 const (
 	OutageDown = "down" // immediate 503 on every CSIP request
 	OutageHang = "hang" // stall hangS, then 503
+	OutageSlow = "slow" // slow-loris: trickle a 200 body byte-slow over hangS
 )
 
-// outageDefaultHangS is the per-request stall for mode "hang" when the arm
-// request does not specify one. Longer than any sane client deadline, short
-// enough that stalled handler goroutines drain soon after the outage clears.
+// outageDefaultHangS is the per-request stall for mode "hang" (and the total
+// drip budget for mode "slow") when the arm request does not specify one.
+// Longer than any sane client deadline, short enough that stalled handler
+// goroutines drain soon after the outage clears.
 const outageDefaultHangS = 30
+
+// outageSlowChunks is how many pieces mode "slow" splits its trickled body
+// into, sleeping hangS/outageSlowChunks between each. Enough pieces that the
+// inter-write gap is a meaningful fraction of a client's read deadline.
+const outageSlowChunks = 12
+
+// outageSlowBody is the benign sep+xml payload mode "slow" trickles. Its
+// CONTENT is immaterial — the fault is the timing (a client with a per-read
+// deadline shorter than the inter-chunk gap must time out) — but keeping it a
+// well-formed fragment means a client that DOES read to the end gets parseable
+// bytes rather than garbage that might trip an unrelated code path.
+var outageSlowBody = []byte(`<?xml version="1.0" encoding="UTF-8"?>` + "\n" +
+	`<!-- gridsim slow-loris: this response body is being trickled byte-slow to exercise the client read deadline (QA fault mode OutageSlow) -->` + "\n")
 
 // SetOutage arms (mode != "") or clears (mode == "") the northbound outage.
 // durationS > 0 auto-clears after that many seconds; hangS configures the
-// "hang" stall (0 ⇒ outageDefaultHangS).
+// "hang" stall / "slow" drip budget (0 ⇒ outageDefaultHangS).
 func (s *Server) SetOutage(mode string, durationS, hangS int) error {
-	if mode != "" && mode != OutageDown && mode != OutageHang {
+	if mode != "" && mode != OutageDown && mode != OutageHang && mode != OutageSlow {
 		return fmt.Errorf("unknown outage mode %q", mode)
 	}
 	if hangS <= 0 {
@@ -108,6 +123,51 @@ func (s *Server) outageIntercept(w http.ResponseWriter) bool {
 		time.Sleep(time.Duration(hangS) * time.Second)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return true
+	case OutageSlow:
+		s.trickleBody(w, hangS)
+		return true
 	}
 	return false
+}
+
+// trickleBody drip-feeds a 200 response body over totalS seconds — a
+// slow-loris: enough dead air between writes to trip a client read deadline.
+//
+// Over a streaming ResponseWriter (a plain net/http server, e.g. the Go
+// integration tests) this genuinely trickles: each Flush pushes a chunk onto
+// the wire, so a client reading with a per-read deadline shorter than the
+// inter-chunk gap times out mid-body. Over the buffered wolfSSL bridge
+// (sim/tlsserver's bufferedResponseWriter captures the whole response and
+// writes it in one shot after the handler returns, and does not implement
+// http.Flusher) the Flush is a no-op and the trickle degrades to a single
+// write delayed by the full drip budget — which still exercises the client's
+// TOTAL-response deadline, just not the per-read one. Both are honest models
+// of a sick server; the bridge limitation is why this lives here and not in a
+// hijack-the-conn path (outage.go's package doc: no connection hijacking).
+func (s *Server) trickleBody(w http.ResponseWriter, totalS int) {
+	w.Header().Set("Content-Type", ContentType)
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+
+	body := outageSlowBody
+	chunkLen := (len(body) + outageSlowChunks - 1) / outageSlowChunks
+	if chunkLen < 1 {
+		chunkLen = 1
+	}
+	var chunks [][]byte
+	for off := 0; off < len(body); off += chunkLen {
+		end := off + chunkLen
+		if end > len(body) {
+			end = len(body)
+		}
+		chunks = append(chunks, body[off:end])
+	}
+	per := time.Duration(totalS) * time.Second / time.Duration(len(chunks))
+	for _, c := range chunks {
+		_, _ = w.Write(c)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		time.Sleep(per)
+	}
 }

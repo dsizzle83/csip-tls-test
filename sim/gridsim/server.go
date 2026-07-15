@@ -121,6 +121,18 @@ type Server struct {
 	// redirectMu. See redirect.go.
 	redirectMu sync.Mutex
 	redirect   redirectState
+
+	// resource_410 injection (QA, default off): while armed, GETs of a
+	// configured path answer 410 Gone. Guarded by goneMu. See gone.go.
+	goneMu sync.Mutex
+	gone   goneState
+
+	// event_delay injection (QA, default off): while armed, GETs of a
+	// configured path sleep before serving. Guarded by delayMu; delaySeq
+	// invalidates a pending auto-clear. See delay.go.
+	delayMu  sync.Mutex
+	delay    delayState
+	delaySeq uint64
 }
 
 // NewServer creates a grid sim with a complete CSIP conformance resource tree.
@@ -269,6 +281,20 @@ func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string) {
 	if s.redirectIntercept(w, path) {
 		return
 	}
+
+	// resource_410 injection (QA, default off): a chosen served resource
+	// answers 410 Gone so the hub's fail-closed "hold last-known-good on a
+	// gone resource" path is exercised. Above routing, like the redirect
+	// intercept, so it fires before any resource lookup or LFDI gating.
+	if s.goneIntercept(w, path) {
+		return
+	}
+
+	// event_delay injection (QA, default off): stall the configured path
+	// before serving so the hub's discovery timeout/hang tolerance is
+	// exercised without a full outage. Unlike gone/redirect it writes no
+	// response — it sleeps, then normal serving proceeds below.
+	s.delayIntercept(path)
 
 	// LFDI-gated: /edev/0 and /edev/1 are dummy aggregator devices.
 	// A connecting client may only see its own EndDevice sub-resources.

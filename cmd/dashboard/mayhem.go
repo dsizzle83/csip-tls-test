@@ -2704,6 +2704,8 @@ func (d *mayhemDriver) clearAllFaults() {
 		_ = d.post("meter", "/fault", map[string]any{"kind": k, "clear": true})
 	}
 	_ = d.post("gridsim", "/admin/malform", map[string]any{"clear": true})
+	_ = d.post("gridsim", "/admin/gone", map[string]any{"clear": true})
+	_ = d.post("gridsim", "/admin/delay", map[string]any{"clear": true})
 	d.gridsimOutageClear()
 }
 
@@ -3093,6 +3095,10 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 	sc = append(sc, d.reportingScenarios()...)
 	sc = append(sc, d.advScenarios()...)
 	sc = append(sc, d.ocppOpenADRScenarios()...)
+	// CSIP server-edge fault seams (E): supersede/cancel/randomizeDuration on
+	// the wire + 410/event-delay/slow-loris survival (docs/QA_COMPLETENESS_AUDIT.md
+	// Batch 2). Go-literal oracles, see mayhem_csipedge.go's header.
+	sc = append(sc, d.csipEdgeScenarios()...)
 
 	// TASK-076: scenarios-as-data. scenarios() runs fresh on every call —
 	// handleStart calls it at REQUEST time, never once at process start — so
