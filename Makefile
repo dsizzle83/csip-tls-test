@@ -1,4 +1,4 @@
-.PHONY: all build build-server build-client build-conformance build-modsim \
+.PHONY: all build build-server build-client build-conformance build-modsim build-vtnsim \
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
@@ -65,6 +65,13 @@ build-httpsim:
 build-dashboard:
 	@mkdir -p bin
 	go build -o bin/dashboard ./cmd/dashboard
+
+# OpenADR 3.1 VTN stub (sim/vtnsim) — listens :6030 by default. Launched by
+# scripts/bench-up.sh (csip-vtnsim unit) and proxied by the dashboard's
+# /api/vtn mount for the OpenADR demo.
+build-vtnsim:
+	@mkdir -p bin
+	go build -o bin/vtnsim ./sim/vtnsim
 
 # Dashboard V2 UI (cmd/dashboard/ui — Vite + React + TS): rebuild the static
 # bundle that cmd/dashboard/main.go embeds via `//go:embed all:ui/dist`.
@@ -376,6 +383,7 @@ help:
 	@echo "  make modsim-stop         Stop the simulator container"
 	@echo "  make build-modsim        Build the simulator binary locally (bin/modsim)"
 	@echo "  make build-dashboard     Build the dashboard binary locally (bin/dashboard)"
+	@echo "  make build-vtnsim        Build the OpenADR 3.1 VTN stub locally (bin/vtnsim)"
 	@echo "  make ui                  Rebuild cmd/dashboard/ui/dist (Vite); dist/ is committed — run + commit after ui/src changes"
 	@echo "  make build-modsim-client-pi  Cross-compile Modbus client for Pi (arm64)"
 	@echo "  make deploy-modsim-client-pi Deploy the client binary to the Pi"

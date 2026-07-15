@@ -79,6 +79,7 @@ start_unit(){  # name, cmd...
 }
 [[ -x bin/server    ]] || { echo "  building bin/server…";    make build >/dev/null 2>&1 || bad "make build failed"; }
 [[ -x bin/dashboard ]] || { echo "  building bin/dashboard…"; make build >/dev/null 2>&1 || bad "make build failed"; }
+[[ -x bin/vtnsim    ]] || { echo "  building bin/vtnsim…";    make build-vtnsim >/dev/null 2>&1 || bad "make build-vtnsim failed"; }
 
 # Relay the hub's bearer token (TASK-014, AD-008) so the dashboard can
 # present it. Best-effort: if the hub is unreachable or hasn't generated a
@@ -98,13 +99,16 @@ else
 fi
 
 start_unit csip-gridsim   "$REPO/bin/server" -ca certs/ca-cert.pem -cert certs/server-cert.pem -key certs/vault/server-key.pem
+# OpenADR 3.1 VTN stub (WP-15 demo): serves prices/limits the hub's lexa-openadr
+# VEN adopts. -base-url is the address it advertises in GET /auth/server.
+start_unit csip-vtnsim    "$REPO/bin/vtnsim" -addr :6030 -base-url http://69.0.0.20:6030
 # --setenv is consumed by systemd-run (option parsing stops at the binary path):
 # LEXA_SSH_USER tells the mayhem engine how to SSH into the hub node.
 start_unit csip-dashboard --setenv=LEXA_SSH_USER="$HUBUSER" \
   "$REPO/bin/dashboard" -addr :8080 -hub https://$HUB:9100 \
   -mqttproxy http://$HUB:11882 \
   -gridsim http://localhost:11112 -solar http://$SOLAR:6020 -battery http://$BAT:6021 \
-  -meter http://$MTR:6022 -ev http://$EV:6024 -hub-token-file "$HUB_TOKEN_FILE"
+  -meter http://$MTR:6022 -ev http://$EV:6024 -vtn http://localhost:6030 -hub-token-file "$HUB_TOKEN_FILE"
 sleep 3
 
 # ── 3. verify the whole bench ───────────────────────────────────────────────
@@ -115,6 +119,7 @@ probe(){ # label url [-H "..."]
   [[ "$code" =~ ^[2-4][0-9][0-9]$ ]] && ok "$label ($url → $code)" || bad "$label unreachable ($url)"
 }
 probe "gridsim admin" http://localhost:11112/
+probe "vtnsim"        http://localhost:6030/programs
 probe "dashboard"     http://localhost:8080/
 # Present the token if we have one — a 401 here would otherwise read as a
 # false "hub down" when auth is actually on and working as intended.

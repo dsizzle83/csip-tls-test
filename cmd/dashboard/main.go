@@ -48,6 +48,7 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	hub := flag.String("hub", "https://localhost:9100", "hub metrics/status address (lexa-api serves HTTPS on :9100, self-signed — WS-B)")
 	gridsim := flag.String("gridsim", "http://localhost:11112", "gridsim admin address")
+	vtn := flag.String("vtn", "http://localhost:6030", "OpenADR 3.1 VTN stub address (vtnsim; no bearer auth)")
 	solar := flag.String("solar", "http://localhost:6020", "solar simapi address")
 	battery := flag.String("battery", "http://localhost:6021", "battery simapi address")
 	meter := flag.String("meter", "http://localhost:6022", "meter simapi address")
@@ -101,6 +102,8 @@ func main() {
 
 	mux.Handle("/api/hub/", stripHubAuthProxy("/api/hub", *hub))
 	mux.Handle("/api/gridsim/", stripProxy("/api/gridsim", *gridsim))
+	// vtnsim has no bearer auth — plain stripProxy, never stripHubAuthProxy (AD-008).
+	mux.Handle("/api/vtn/", stripProxy("/api/vtn", *vtn))
 	mux.Handle("/api/solar/", stripProxy("/api/solar", *solar))
 	mux.Handle("/api/battery/", stripProxy("/api/battery", *battery))
 	mux.Handle("/api/meter/", stripProxy("/api/meter", *meter))

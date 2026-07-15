@@ -6,6 +6,7 @@ import { PlanVsActual } from './ops/PlanVsActual';
 import { ProtocolInspector } from './ops/ProtocolInspector';
 import { EventConsole } from './ops/EventConsole';
 import { ScenarioConsole } from './ops/ScenarioConsole';
+import { AdvancedConsole } from './ops/AdvancedConsole';
 import type { HubStatus } from './ops/types';
 import './ops/ops.css';
 
@@ -24,6 +25,8 @@ export default function Ops() {
       </div>
 
       <ScenarioConsole status={status} />
+
+      <AdvancedConsole status={status} />
 
       <div className="ops-flow-row">
         <PowerFlow status={status} />

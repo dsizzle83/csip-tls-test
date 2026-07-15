@@ -34,6 +34,51 @@ export interface SolarState {
   controls: { WMaxLimPct_pct: number; WMaxLimPct_Ena: number; Conn: number };
 }
 
+// GET /api/solar/state on the ADVANCED solar sim returns this 7xx ground-truth
+// shape instead of (basic-sim) SolarState — the device-side "adopted + measured"
+// truth for DER function curves (Phase 3). Every field is optional so a basic-sim
+// response (which has none of them) still parses to a harmless empty object and
+// the curve console degrades to its "no adopted curve" empty state.
+export interface Adv701Meas {
+  W_W: number;
+  PF: number;
+  VAr_var: number;
+  Hz_Hz: number;
+  St: number;
+  ConnSt: number;
+}
+
+export interface AdvVarState {
+  ena: boolean;
+  pct: number;
+}
+
+export interface AdvPFState {
+  ena: boolean;
+  pf: number;
+}
+
+export interface AdvCeilState {
+  ena: boolean;
+  pct: number;
+}
+
+export interface AdvCurveState {
+  model: number; // SunSpec model id: 705 volt-var, 706 volt-watt, 711 freq-watt, 712 watt-pf
+  adopt_rslt: number; // AdptCrvRslt: 0 in-progress, 1 COMPLETED
+  read_only?: boolean;
+  points: [number, number][];
+}
+
+export interface SolarAdvancedState {
+  Alrm?: number;
+  meas_701?: Adv701Meas;
+  fixed_pf?: AdvPFState;
+  fixed_var?: AdvVarState;
+  wmaxlimpct_704?: AdvCeilState;
+  curves?: AdvCurveState[];
+}
+
 export interface BatteryState {
   type: string;
   timestamp: string;

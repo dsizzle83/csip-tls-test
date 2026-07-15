@@ -1,6 +1,6 @@
 import { postJSON } from '../../lib/api';
 import { simInject } from '../bench/simApi';
-import type { DerBase } from './types';
+import type { AdminCurveReq, CurveMode, CurvePoint, DerBase } from './types';
 
 // Thin typed helpers over EXISTING bench endpoints for the Injection Console —
 // no new proxy mounts. Grid controls travel the same program-0 /admin/control
@@ -33,6 +33,44 @@ export function fireGridControl(base: DerBase, durationS: number, description = 
 export async function clearGridControl(): Promise<boolean> {
   try {
     const resp = await fetch('/api/gridsim/admin/control', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ program: PROGRAM }),
+    });
+    return resp.ok || resp.status === 204;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Bind + activate a DER function curve (Volt-VAr / Volt-Watt / Freq-Watt /
+ * Watt-PF) on the gridsim advertiser, program 0. gridsim writes the curve into
+ * the advanced solar sim's 7xx models; the hub adopts it (adopt_rslt COMPLETED
+ * on GET /api/solar/state). `vref` is optional (voltage-referenced curves only).
+ * Rides the existing /api/gridsim proxy; the /admin/curve route lands with the
+ * curve backend — until then this resolves against a 404 and the caller notes it.
+ */
+export function fireCurve(
+  mode: CurveMode,
+  points: CurvePoint[],
+  opts: { vref?: number; durationS?: number } = {}
+): Promise<unknown> {
+  const body: AdminCurveReq = {
+    program: PROGRAM,
+    mode,
+    points,
+    duration_s: opts.durationS ?? 300,
+    activate: true,
+  };
+  if (opts.vref != null) body.vref = opts.vref;
+  return postJSON('/api/gridsim/admin/curve', body);
+}
+
+/** Release the active curve on program 0 (revert to no curve). */
+export async function clearCurve(): Promise<boolean> {
+  try {
+    const resp = await fetch('/api/gridsim/admin/curve', {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ program: PROGRAM }),

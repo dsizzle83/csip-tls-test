@@ -46,6 +46,10 @@ export interface DerBase {
   fixed_pf_inject_pct?: number;
   fixed_pf_absorb_pct?: number;
   fixed_var_pct?: number;
+  /** Curve-linked mode when a DER function curve is bound to this control
+   *  (Phase 3 — populated by gridsim once the curve backend lands; absent
+   *  today). Rendered next to var% in the Protocol Inspector. */
+  curve_mode?: CurveMode | string;
 }
 
 export interface CsipControl {
@@ -84,6 +88,54 @@ export interface HubStatus {
   reserve?: { effective_pct: number; floor_pct: number; source: string };
   tariff?: { source: string; updated_at: number };
   fw?: string;
+  /** OpenADR VEN health (Phase 3, WP-15) — added to /status by lexa-api.
+   *  OPTIONAL: the UI renders (with a VTN-unreachable fallback) before this
+   *  field ships, and reads the VTN's own /admin/state as a backstop. */
+  openadr?: OpenADRHealth;
+}
+
+// ── OpenADR VEN health (status.openadr) ─────────────────────────────────────
+
+export interface OpenADRHealth {
+  vtn_ok?: boolean;
+  token_ok?: boolean;
+  last_poll_ts?: number; // epoch seconds of the VEN's last successful VTN poll
+  programs?: number;
+  active_events?: number;
+  last_err?: string;
+}
+
+// ── DER function curves (Phase 3) ───────────────────────────────────────────
+
+/** The four DER autonomous-function curve modes the demo can activate. Maps to
+ *  SunSpec models 705 (Volt-VAr) / 706 (Volt-Watt) / 711 (Freq-Watt) / 712 (Watt-PF). */
+export type CurveMode = 'volt_var' | 'volt_watt' | 'freq_watt' | 'watt_pf';
+
+/** One curve point as the gridsim /admin/curve POST body carries it ({x,y}).
+ *  Note the advanced-solar readback (GET /api/solar/state) uses [x,y] tuples. */
+export interface CurvePoint {
+  x: number;
+  y: number;
+}
+
+/** POST /api/gridsim/admin/curve body (Phase 3 — the curve backend consumes it). */
+export interface AdminCurveReq {
+  program: number;
+  mode: CurveMode;
+  points: CurvePoint[];
+  vref?: number;
+  duration_s?: number;
+  activate?: boolean;
+}
+
+/** A curve as gridsim may advertise it back on /admin/status once bound
+ *  (optional — absent until the backend lands; the console falls back to the
+ *  locally-issued curve). */
+export interface AdvertisedCurve {
+  mode?: CurveMode | string;
+  vref?: number;
+  points?: [number, number][];
+  duration_s?: number;
 }
 
 // ── /api/hub/plan ──────────────────────────────────────────────────────────
@@ -136,6 +188,8 @@ export interface AdminProgram {
   default?: DerBase;
   active: AdminCtrl[] | null;
   scheduled: AdminCtrl[] | null;
+  /** Bound DER function curve, once gridsim advertises it (Phase 3; optional). */
+  curve?: AdvertisedCurve;
 }
 
 export interface AdminStatus {

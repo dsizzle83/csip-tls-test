@@ -17,6 +17,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/status", cors(s.handleAdminStatus))
 	mux.HandleFunc("/admin/control", cors(s.handleAdminControl))
+	mux.HandleFunc("/admin/curve", cors(s.handleAdminCurve))
 	mux.HandleFunc("/admin/default", cors(s.handleAdminDefault))
 	mux.HandleFunc("/admin/clock", cors(s.handleAdminClock))
 	mux.HandleFunc("/admin/tariff", cors(s.handleAdminTariff))
@@ -70,6 +71,9 @@ type adminCtrlInfo struct {
 	DurationS   int           `json:"duration_s"`
 	Status      int           `json:"status"`
 	Base        adminBaseInfo `json:"base"`
+	// Curve names the bound DER curve for a curve-linked (extended) control,
+	// e.g. "volt_var -> /derp/0/dc/0". Empty for scalar controls.
+	Curve string `json:"curve,omitempty"`
 }
 
 // adminBaseInfo mirrors DERControlBase as JSON-friendly nullable fields.
@@ -133,14 +137,27 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 			b := baseToInfo(dderc.DERControlBase)
 			ap.Default = &b
 		}
-		if actList, ok := s.resources[fmt.Sprintf("/derp/%d/actderc", i)].(*model.DERControlList); ok {
-			for _, c := range actList.DERControl {
+		// derc/actderc hold *model.DERControlList normally, or
+		// *model.ExtendedDERControlList once POST /admin/curve has bound a
+		// curve-linked control (curve.go) — surface either.
+		switch v := s.resources[fmt.Sprintf("/derp/%d/actderc", i)].(type) {
+		case *model.DERControlList:
+			for _, c := range v.DERControl {
 				ap.Active = append(ap.Active, ctrlToInfo(c))
 			}
+		case *model.ExtendedDERControlList:
+			for _, c := range v.DERControl {
+				ap.Active = append(ap.Active, extCtrlToInfo(c))
+			}
 		}
-		if schList, ok := s.resources[fmt.Sprintf("/derp/%d/derc", i)].(*model.DERControlList); ok {
-			for _, c := range schList.DERControl {
+		switch v := s.resources[fmt.Sprintf("/derp/%d/derc", i)].(type) {
+		case *model.DERControlList:
+			for _, c := range v.DERControl {
 				ap.Scheduled = append(ap.Scheduled, ctrlToInfo(c))
+			}
+		case *model.ExtendedDERControlList:
+			for _, c := range v.DERControl {
+				ap.Scheduled = append(ap.Scheduled, extCtrlToInfo(c))
 			}
 		}
 		programs = append(programs, ap)
@@ -361,11 +378,23 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// DERControlListLink. The scheduler evaluates the time window and marks it
 	// active when start <= serverNow < start+duration.
 	dercPath := fmt.Sprintf("/derp/%d/derc", req.Program)
-	if dercList, ok := s.resources[dercPath].(*model.DERControlList); ok {
+	// A prior POST /admin/curve may have left an ExtendedDERControlList here;
+	// widen this scalar control into it rather than silently no-op'ing.
+	switch dercList := s.resources[dercPath].(type) {
+	case *model.DERControlList:
 		if req.Activate {
 			dercList.DERControl = []model.DERControl{ctrl}
 		} else {
 			dercList.DERControl = append(dercList.DERControl, ctrl)
+		}
+		dercList.All = uint32(len(dercList.DERControl))
+		dercList.Results = dercList.All
+	case *model.ExtendedDERControlList:
+		ext := toExtendedControl(ctrl)
+		if req.Activate {
+			dercList.DERControl = []model.ExtendedDERControl{ext}
+		} else {
+			dercList.DERControl = append(dercList.DERControl, ext)
 		}
 		dercList.All = uint32(len(dercList.DERControl))
 		dercList.Results = dercList.All
@@ -376,7 +405,8 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// Activate=true keeps its replace semantics: a future event clears the
 	// stale active list rather than joining it.
 	actPath := fmt.Sprintf("/derp/%d/actderc", req.Program)
-	if actList, ok := s.resources[actPath].(*model.DERControlList); ok {
+	switch actList := s.resources[actPath].(type) {
+	case *model.DERControlList:
 		switch {
 		case req.Activate && activeNow:
 			actList.DERControl = []model.DERControl{ctrl}
@@ -384,6 +414,18 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 			actList.DERControl = nil
 		case activeNow:
 			actList.DERControl = append(actList.DERControl, ctrl)
+		}
+		actList.All = uint32(len(actList.DERControl))
+		actList.Results = actList.All
+	case *model.ExtendedDERControlList:
+		ext := toExtendedControl(ctrl)
+		switch {
+		case req.Activate && activeNow:
+			actList.DERControl = []model.ExtendedDERControl{ext}
+		case req.Activate:
+			actList.DERControl = nil
+		case activeNow:
+			actList.DERControl = append(actList.DERControl, ext)
 		}
 		actList.All = uint32(len(actList.DERControl))
 		actList.Results = actList.All
@@ -413,7 +455,14 @@ func (s *Server) adminCtrlDelete(w http.ResponseWriter, r *http.Request) {
 		fmt.Sprintf("/derp/%d/derc", req.Program),
 		fmt.Sprintf("/derp/%d/actderc", req.Program),
 	} {
-		if list, ok := s.resources[path].(*model.DERControlList); ok {
+		// Either a scalar list or a curve-bound extended list (curve.go) can
+		// be sitting at these paths — clear whichever it is.
+		switch list := s.resources[path].(type) {
+		case *model.DERControlList:
+			list.DERControl = nil
+			list.All = 0
+			list.Results = 0
+		case *model.ExtendedDERControlList:
 			list.DERControl = nil
 			list.All = 0
 			list.Results = 0

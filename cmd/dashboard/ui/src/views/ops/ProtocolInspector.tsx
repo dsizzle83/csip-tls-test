@@ -22,8 +22,20 @@ function baseKV(base?: DerBase): [string, string][] {
   if (base.connect != null) out.push(['connect', base.connect ? 'on' : 'off']);
   if (base.energize != null) out.push(['energize', base.energize ? 'on' : 'off']);
   if (base.fixed_var_pct != null) out.push(['var%', String(base.fixed_var_pct)]);
+  // Phase 3: when a DER function curve is bound to this control, name the mode
+  // right beside the reactive-power setting it drives (absent until the curve
+  // backend populates curve_mode).
+  if (base.curve_mode) out.push(['curve', CURVE_MODE_LABEL[base.curve_mode] ?? String(base.curve_mode)]);
   return out;
 }
+
+// SunSpec curve-mode → human label for the Protocol Inspector KV rows.
+const CURVE_MODE_LABEL: Record<string, string> = {
+  volt_var: 'Volt-VAr',
+  volt_watt: 'Volt-Watt',
+  freq_watt: 'Freq-Watt',
+  watt_pf: 'Watt-PF',
+};
 
 function KV({ pairs }: { pairs: [string, string][] }) {
   if (!pairs.length) return <span className="ops-col-sub" style={{ margin: 0 }}>no limits</span>;

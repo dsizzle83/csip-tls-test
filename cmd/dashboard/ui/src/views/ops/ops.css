@@ -641,3 +641,53 @@
   border-radius: 6px;
 }
 .ops-banner-clear:hover { background: var(--surface); color: var(--s-critical); }
+
+/* ── Advanced / Standards consoles (Phase 3) ─────────────────────────────── */
+.ops-adv-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 14px;
+  align-items: flex-end;
+  margin-bottom: 12px;
+}
+.ops-adv-actions { display: inline-flex; gap: 8px; align-items: center; }
+.ops-adv-fixedvar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+/* curve point list — mono, wraps, subtle separators */
+.ops-points {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+/* OpenADR VEN health chip row */
+.ops-health {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+/* armed-event pill row (reuses .ops-banner-pill chrome) */
+.ops-armed {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 10px;
+}
+/* informational chip — an adopted/enforced signal that is NOT a breach (D9) */
+.ops-chip-info {
+  background: color-mix(in srgb, var(--c-blue) 10%, white);
+  color: var(--c-blue);
+  border: 1px solid color-mix(in srgb, var(--c-blue) 32%, white);
+  font-weight: 600;
+}
