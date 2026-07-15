@@ -16,10 +16,12 @@
 //     POST /mup/{n} → 204, GET /mup/{n} → the registered MUP.
 //
 // NOTE: this is a test *fixture* for driving CSIP DER-client (EUT) tests, not a
-// conformant IEEE 2030.5 server. It does not implement list paging query
-// parameters (s/l/a), does not emit a 400 for a missing Host header, and serves
-// a fixed resource tree. Do not present it as a server-under-test; the lab Test
-// Server fills that role.
+// conformant IEEE 2030.5 server. By default it serves each list whole (results
+// == all) — but POST /admin/paginate arms a positive-pagination mode that
+// honors the s/l query parameters and serves a list across multiple pages
+// (paginate.go, audit P1-1). It does not emit a 400 for a missing Host header,
+// and serves an otherwise-fixed resource tree. Do not present it as a
+// server-under-test; the lab Test Server fills that role.
 package gridsim
 
 import (
@@ -28,6 +30,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,6 +136,12 @@ type Server struct {
 	delayMu  sync.Mutex
 	delay    delayState
 	delaySeq uint64
+
+	// positive list pagination (QA, default off): while armed, GETs of a
+	// paginatable list honor s/l and serve one page with honest all/results.
+	// Guarded by paginateMu. See paginate.go.
+	paginateMu sync.Mutex
+	paginate   paginateState
 }
 
 // NewServer creates a grid sim with a complete CSIP conformance resource tree.
@@ -254,7 +263,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		s.handleGET(w, path, peerLFDI)
+		s.handleGET(w, path, peerLFDI, r.URL.Query())
 	case http.MethodPost:
 		s.handlePOST(w, r, path, peerLFDI)
 	case http.MethodPut:
@@ -273,7 +282,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string) {
+func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string, query url.Values) {
 	// ERR-001 redirect injection (QA, default off): while armed, the first N
 	// GETs of the configured path answer 301/302 + Location so the hub's
 	// redirect_max follow path is exercised on the wire. Sits above routing
@@ -339,6 +348,11 @@ func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+	// Positive pagination (QA, default off): when armed, slice a list resource
+	// to the requested s/l page with honest all/results so a client must page
+	// to see every entry (audit P1-1). A no-op — resource unchanged — when
+	// pagination is disarmed or resource is not a paginatable list.
+	resource = s.applyPagination(path, resource, query)
 	s.serveXML(w, resource)
 }
 

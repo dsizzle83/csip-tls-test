@@ -27,6 +27,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/redirect", cors(s.handleAdminRedirect))
 	mux.HandleFunc("/admin/gone", cors(s.handleAdminGone))
 	mux.HandleFunc("/admin/delay", cors(s.handleAdminDelay))
+	mux.HandleFunc("/admin/paginate", cors(s.handleAdminPaginate))
 	mux.HandleFunc("/admin/responses", cors(s.handleAdminResponses))
 	mux.HandleFunc("/admin/derputs", cors(s.handleAdminDERPuts))
 	mux.HandleFunc("/admin/logevents", cors(s.handleAdminLogEvents))
@@ -431,7 +432,11 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		creationTime = now + int64(*req.CreationOffsetS)
 	}
 	ctrl := model.DERControl{
-		Resource:     model.Resource{Href: fmt.Sprintf("/derp/%d/derc/admin", req.Program)},
+		// Href keyed by mRID so distinct admin controls are distinct addressable
+		// resources (a re-post of the same mRID — the server-cancel update — keeps
+		// the same href and upserts). A shared href would collapse two controls
+		// into one for any client that de-duplicates a paged list by href.
+		Resource:     model.Resource{Href: fmt.Sprintf("/derp/%d/derc/%s", req.Program, mrid)},
 		MRID:         mrid,
 		Description:  req.Description,
 		CreationTime: creationTime,

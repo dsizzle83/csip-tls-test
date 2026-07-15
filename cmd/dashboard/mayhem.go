@@ -3114,6 +3114,14 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 	// (docs/QA_COMPLETENESS_AUDIT.md Batch 3 — the "may surface hub bugs" set).
 	// Go-literal oracles, see mayhem_transport.go's header.
 	sc = append(sc, d.transportScenarios()...)
+	// Batch 3b remaining fault seams (docs/QA_COMPLETENESS_AUDIT.md): CSIP list
+	// pagination (P1-1, product paging loop), L3 network partition + DNS blackout
+	// (P2-3), and fail-closed TLS cert-rotation (P2-1). Go-literal oracles; the
+	// netfault/certrot scenarios are SSH-gated (INCONCLUSIVE off-bench). See each
+	// mayhem_{pagination,netfault,certrot}.go header.
+	sc = append(sc, d.paginationScenarios()...)
+	sc = append(sc, d.netFaultScenarios()...)
+	sc = append(sc, d.certRotationScenarios()...)
 
 	// TASK-076: scenarios-as-data. scenarios() runs fresh on every call —
 	// handleStart calls it at REQUEST time, never once at process start — so
