@@ -102,6 +102,25 @@ type Server struct {
 	tariffWinEnd      int64
 	tariffActiveStart int64
 	tariffActiveEnd   int64
+
+	// DER* report PUT store (WP-4 / CORE-009). Last body received per
+	// resource path (dercap/derset/derstat/deravail), surfaced via
+	// GET /admin/derputs and ReceivedDERPuts. Guarded by derPutMu.
+	derPutMu sync.Mutex
+	derPuts  map[string]DERPut
+
+	// LogEvent store (WP-6 / BASIC-027). Time-ordered list the client POSTs
+	// to its LogEventListLink, surfaced via GET /admin/logevents and
+	// ReceivedLogEvents. logEvents/logEventNextID are guarded by logEventMu.
+	logEventMu     sync.Mutex
+	logEvents      []model.LogEvent
+	logEventNextID int32
+
+	// ERR-001 redirect injection (QA, default off): while armed, the first N
+	// GETs of a configured path answer 301/302 + Location. Guarded by
+	// redirectMu. See redirect.go.
+	redirectMu sync.Mutex
+	redirect   redirectState
 }
 
 // NewServer creates a grid sim with a complete CSIP conformance resource tree.
@@ -199,6 +218,10 @@ func (s *Server) rebuildEndDeviceList() {
 					Link: model.Link{Href: "/edev/2/fsa"},
 					All:  1,
 				},
+				LogEventListLink: &model.ListLink{
+					Link: model.Link{Href: "/edev/2/lev"},
+					All:  0,
+				},
 			},
 		},
 	}
@@ -222,10 +245,15 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		s.handleGET(w, path, peerLFDI)
 	case http.MethodPost:
 		s.handlePOST(w, r, path, peerLFDI)
-	case http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodHead, http.MethodOptions:
+	case http.MethodPut:
+		// DER* report PUT (WP-4 / CORE-009): dercap/derset/derstat/deravail
+		// under an EndDevice's DER tree accept the client's self-report.
+		// Any other path falls through to 405.
+		s.handlePUT(w, r, path)
+	case http.MethodDelete, http.MethodPatch, http.MethodHead, http.MethodOptions:
 		// Known HTTP method, not allowed here → 405 with an Allow header
 		// listing valid methods (GEN.045).
-		w.Header().Set("Allow", "GET, POST")
+		w.Header().Set("Allow", "GET, POST, PUT")
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	default:
 		// Unrecognised method token (e.g. FOO) → 501 Not Implemented.
@@ -234,6 +262,14 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string) {
+	// ERR-001 redirect injection (QA, default off): while armed, the first N
+	// GETs of the configured path answer 301/302 + Location so the hub's
+	// redirect_max follow path is exercised on the wire. Sits above routing
+	// and LFDI gating so the redirect fires before any resource lookup.
+	if s.redirectIntercept(w, path) {
+		return
+	}
+
 	// LFDI-gated: /edev/0 and /edev/1 are dummy aggregator devices.
 	// A connecting client may only see its own EndDevice sub-resources.
 	if peerLFDI != "" {
@@ -315,6 +351,8 @@ func (s *Server) handlePOST(w http.ResponseWriter, r *http.Request, path, peerLF
 		s.handleMUPReadings(w, r, path)
 	case strings.HasPrefix(path, "/rsps/") && strings.HasSuffix(path, "/r"):
 		s.handleResponsePost(w, r, path)
+	case isLogEventListPath(path):
+		s.handleLogEventPost(w, r, path, peerLFDI)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -502,6 +540,10 @@ func (s *Server) buildResourceTree() {
 					Link: model.Link{Href: "/edev/2/fsa"},
 					All:  1,
 				},
+				LogEventListLink: &model.ListLink{
+					Link: model.Link{Href: "/edev/2/lev"},
+					All:  0,
+				},
 			},
 		},
 	}
@@ -520,10 +562,11 @@ func (s *Server) buildResourceTree() {
 		Results:  1,
 		DER: []model.DER{
 			{
-				Resource:          model.Resource{Href: "/edev/2/der/0"},
-				DERCapabilityLink: &model.Link{Href: "/edev/2/der/0/dercap"},
-				DERSettingsLink:   &model.Link{Href: "/edev/2/der/0/derset"},
-				DERStatusLink:     &model.Link{Href: "/edev/2/der/0/derstat"},
+				Resource:            model.Resource{Href: "/edev/2/der/0"},
+				DERCapabilityLink:   &model.Link{Href: "/edev/2/der/0/dercap"},
+				DERSettingsLink:     &model.Link{Href: "/edev/2/der/0/derset"},
+				DERStatusLink:       &model.Link{Href: "/edev/2/der/0/derstat"},
+				DERAvailabilityLink: &model.Link{Href: "/edev/2/der/0/deravail"},
 			},
 		},
 	}
@@ -550,6 +593,27 @@ func (s *Server) buildResourceTree() {
 		GenConnectStatus:      &genConnected,
 		OperationalModeStatus: &opMode,
 		ReadingTime:           now,
+	}
+
+	// ── DERAvailability (/edev/2/der/0/deravail) ─────────────
+	// Present so the walker discovers DERAvailabilityLink and so the DER*
+	// report PUT half (WP-4) has a fourth target to write. GET serves this
+	// baseline; a client PUT is stored/inspectable via GET /admin/derputs.
+	availDur := uint32(3600)
+	s.resources["/edev/2/der/0/deravail"] = &model.DERAvailability{
+		Resource:             model.Resource{Href: "/edev/2/der/0/deravail"},
+		ReadingTime:          now,
+		AvailabilityDuration: &availDur,
+	}
+
+	// ── LogEventList (/edev/2/lev) ────────────────────────────
+	// The EndDevice's LogEventListLink target (WP-6 / BASIC-027). A client
+	// POSTs LogEvent resources here; GET returns the accumulated list.
+	s.resources["/edev/2/lev"] = &model.LogEventList{
+		Resource: model.Resource{Href: "/edev/2/lev"},
+		All:      0,
+		Results:  0,
+		PollRate: 300,
 	}
 
 	// ── FunctionSetAssignmentsList (/edev/2/fsa) ──────────────
@@ -933,20 +997,25 @@ func (s *Server) handleResponsePost(w http.ResponseWriter, r *http.Request, path
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	// WP-7 (D5): accept BOTH the legacy LEXA 0xF0 extension AND the IEEE 2030.5
+	// Table 27 CannotComply-family codes the hub now sends by default, and
+	// record which vocabulary arrived so a test can assert the flip.
+	alert, vocab := classifyResponseStatus(resp.Status)
 	s.responseMu.Lock()
 	s.responses = append(s.responses, resp)
-	if resp.Status >= alertStatusFloor {
+	if alert {
 		s.complianceAlerts = append(s.complianceAlerts, ComplianceAlert{
 			Subject:    resp.Subject,
 			Status:     resp.Status,
+			Vocab:      vocab,
 			LFDI:       resp.EndDeviceLFDI,
 			ReceivedAt: s.Now(),
 		})
 	}
 	s.responseMu.Unlock()
-	if resp.Status >= alertStatusFloor {
-		log.Printf("[gridsim] ALERT: client reports CANNOT-COMPLY (status=%d) for subject=%s — DER is resource-limited",
-			resp.Status, resp.Subject)
+	if alert {
+		log.Printf("[gridsim] ALERT: client reports CANNOT-COMPLY (status=%d vocab=%s) for subject=%s — DER is resource-limited",
+			resp.Status, vocab, resp.Subject)
 	} else {
 		log.Printf("[gridsim] POST %s → Response accepted: subject=%s status=%d",
 			path, resp.Subject, resp.Status)
@@ -954,17 +1023,59 @@ func (s *Server) handleResponsePost(w http.ResponseWriter, r *http.Request, path
 	w.WriteHeader(http.StatusCreated)
 }
 
-// alertStatusFloor is the lowest Response status treated as a non-compliance
-// alert rather than a lifecycle acknowledgement. IEEE 2030.5 Table 27 uses
-// 1–7; the LEXA hub reports "cannot comply" in the 0xF0–0xFF manufacturer
-// range (see model.ResponseCannotComply in lexa-hub).
+// CannotComply wire vocabularies (WP-7, D5). Recorded on each ComplianceAlert
+// so tests can assert the hub's default code-flip from the LEXA extension to
+// the IEEE 2030.5 Table 27 codes.
+const (
+	VocabLegacy  = "legacy"  // the LEXA 0xF0–0xFF manufacturer extension
+	VocabTable27 = "table27" // IEEE 2030.5 Table 27 standard status codes
+)
+
+// classifyResponseStatus reports whether a Response status is a
+// CannotComply / non-compliance signal that GET /admin/alerts should surface,
+// and under which wire vocabulary. Before WP-7 the hub reported "cannot
+// comply" exclusively via the LEXA 0xF0 extension; WP-7 flips the default to
+// IEEE 2030.5 Table 27, where the onset signal is 8 (partial opt-out), a
+// receipt rejection is 252/253/254, and an event elapsing with no
+// participation is 10. gridsim now recognises both so the bench keeps
+// observing breaches across the flip.
+//
+// The normal lifecycle acks (1 received / 2 started / 3 completed) and the
+// server-driven event-lifecycle acks (6 cancelled / 7 superseded) are NOT
+// alerts — they are recorded in ReceivedResponses like every other Response,
+// but they do not raise a compliance alert. (In this codebase the hub emits 3
+// at a *clean* end-of-event, so treating 3 as an alert would fire on every
+// normal completion.)
+func classifyResponseStatus(status uint8) (alert bool, vocab string) {
+	// Table 27 codes are checked FIRST: the rejection codes 252/253/254 fall
+	// numerically inside the 0xF0–0xFF (240–255) LEXA range but are standard
+	// IEEE codes, so they must resolve to table27, not legacy.
+	switch status {
+	case model.ResponsePartialOptOut, // 8  — breach onset / degraded execution
+		model.ResponseNoParticipation, // 10 — interval elapsed, no participation
+		model.ResponseRejectedParam,   // 252 — rejected (param not applicable)
+		model.ResponseRejectedInvalid, // 253 — receipt reject (invalid content)
+		model.ResponseRejectedExpired: // 254 — rejected (already expired)
+		return true, VocabTable27
+	}
+	if status >= alertStatusFloor { // 0xF0–0xFF LEXA extension (0xF0 in practice)
+		return true, VocabLegacy
+	}
+	return false, ""
+}
+
+// alertStatusFloor is the lowest Response status in the LEXA 0xF0–0xFF
+// manufacturer range (see model.ResponseCannotComply in lexa-hub). It is the
+// legacy CannotComply floor; classifyResponseStatus additionally recognises
+// the WP-7 IEEE 2030.5 Table 27 codes (8/10/252/253/254) as alerts.
 const alertStatusFloor uint8 = 0xF0
 
 // ComplianceAlert is a CannotComply Response recorded with the server receive
 // time, returned by GET /admin/alerts.
 type ComplianceAlert struct {
 	Subject    string `json:"subject"`     // DERControl mRID the DER cannot meet
-	Status     uint8  `json:"status"`      // 2030.5 Response status (≥ alertStatusFloor)
+	Status     uint8  `json:"status"`      // 2030.5 Response status (the raw wire code)
+	Vocab      string `json:"vocab"`       // "legacy" (0xF0) or "table27" (WP-7 default)
 	LFDI       string `json:"lfdi"`        // responding device
 	ReceivedAt int64  `json:"received_at"` // gridsim server time (Unix seconds)
 }

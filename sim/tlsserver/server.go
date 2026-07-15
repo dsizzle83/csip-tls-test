@@ -64,7 +64,14 @@ func New(cfg Config) (*Server, error) {
 	if err := wolfssl.SetCipherList(ctx, cfg.CipherList); err != nil {
 		return nil, err
 	}
-	if err := wolfssl.UseCertFile(ctx, cfg.ServerCertPath); err != nil {
+	// Chain file (leaf + intermediates) takes precedence when configured, so
+	// the server can present a depth-3/4 chain; otherwise load the single
+	// leaf (default, unchanged).
+	if cfg.ServerCertChainPath != "" {
+		if err := wolfssl.UseCertChainFile(ctx, cfg.ServerCertChainPath); err != nil {
+			return nil, err
+		}
+	} else if err := wolfssl.UseCertFile(ctx, cfg.ServerCertPath); err != nil {
 		return nil, err
 	}
 	if err := wolfssl.UseKeyFile(ctx, cfg.ServerKeyPath); err != nil {

@@ -109,6 +109,25 @@ func UseCertFile(ctx unsafe.Pointer, path string) error {
 	return nil
 }
 
+// UseCertChainFile loads a PEM file containing a full certificate chain —
+// the leaf server (or client) certificate first, followed by the
+// intermediate CA certificate(s) that link it up to (but not including) the
+// trust anchor. This is the multi-certificate loader
+// (wolfSSL_CTX_use_certificate_chain_file), as opposed to UseCertFile's
+// single-leaf wolfSSL_CTX_use_certificate_file: a peer verifying a
+// depth-3/4 chain (SERCA→MICA→leaf, SERCA→MCA→MICA→leaf) needs the
+// intermediates presented in the handshake, which UseCertFile cannot do.
+// Required for the COMM-004 004B/C/D/E/F chain-depth scenarios.
+func UseCertChainFile(ctx unsafe.Pointer, path string) error {
+	c := C.CString(path)
+	defer C.free(unsafe.Pointer(c))
+	if int(C.wolfSSL_CTX_use_certificate_chain_file(
+		(*C.WOLFSSL_CTX)(ctx), c)) != Success {
+		return fmt.Errorf("wolfSSL_CTX_use_certificate_chain_file(%q) failed", path)
+	}
+	return nil
+}
+
 // UseKeyFile loads the PEM-encoded private key matching the cert
 // loaded by UseCertFile.
 func UseKeyFile(ctx unsafe.Pointer, path string) error {

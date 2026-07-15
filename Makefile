@@ -5,7 +5,7 @@
         test test-fast test-integration test-update-golden test-southbound qa qa-bench fuzz \
         sweep-sunspec \
         modsim-image modsim-run modsim-stop \
-        gen-test-certs gen-client-cert gen-ev-cert smoke-pi clean help \
+        gen-test-certs gen-comm004-certs gen-client-cert gen-ev-cert smoke-pi clean help \
         ui
 
 REPO_ROOT     := $(shell pwd)
@@ -303,6 +303,12 @@ test-update-golden:
 # Manual cert regeneration.
 gen-test-certs:
 	bash scripts/gen-test-certs.sh
+
+# Generate the COMM-004 chain-depth fixtures (SERCA root + depth-2/3/4 accept
+# chains + 004D/E/F/G reject material) under certs/comm004/. Idempotent.
+# Override the SAN IP: make gen-comm004-certs IPS=69.0.0.20
+gen-comm004-certs:
+	bash scripts/gen-comm004-certs.sh
 
 # Generate a client cert for a DER device from the existing production CA.
 # Output lands in certs/client-staging/. SCP to device, then delete staging.

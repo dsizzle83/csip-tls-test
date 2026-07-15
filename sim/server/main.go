@@ -18,11 +18,12 @@ import (
 
 func main() {
 	var (
-		listenAddr = flag.String("listen", "0.0.0.0:11111", "address:port to listen on")
-		adminAddr  = flag.String("admin", "0.0.0.0:11112", "plain HTTP admin API address:port (DERControl management)")
-		caCert     = flag.String("ca", "/home/dmitri/csip-tls-test/certs/ca-cert.pem", "CA cert PEM path")
-		serverCert = flag.String("cert", "/home/dmitri/csip-tls-test/certs/server-cert.pem", "server cert PEM path")
-		serverKey  = flag.String("key", "/home/dmitri/csip-tls-test/certs/server-key.pem", "server key PEM path")
+		listenAddr  = flag.String("listen", "0.0.0.0:11111", "address:port to listen on")
+		adminAddr   = flag.String("admin", "0.0.0.0:11112", "plain HTTP admin API address:port (DERControl management)")
+		caCert      = flag.String("ca", "/home/dmitri/csip-tls-test/certs/ca-cert.pem", "CA cert PEM path")
+		serverCert  = flag.String("cert", "/home/dmitri/csip-tls-test/certs/server-cert.pem", "server leaf cert PEM path")
+		serverChain = flag.String("cert-chain", "", "server cert CHAIN PEM path (leaf + intermediates); overrides -cert when set (COMM-004 depth-3/4)")
+		serverKey   = flag.String("key", "/home/dmitri/csip-tls-test/certs/server-key.pem", "server key PEM path")
 
 		// OCPP 2.0.1 CSMS flags (Security Profile 2: TLS + Basic Auth).
 		// TLS is optional; omit -ocpp-cert/-ocpp-key for plain WebSocket (dev only).
@@ -46,9 +47,10 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, sim.LogWriter()))
 
 	srv, err := tlsserver.New(tlsserver.Config{
-		CACertPath:     *caCert,
-		ServerCertPath: *serverCert,
-		ServerKeyPath:  *serverKey,
+		CACertPath:          *caCert,
+		ServerCertPath:      *serverCert,
+		ServerCertChainPath: *serverChain,
+		ServerKeyPath:       *serverKey,
 	})
 	if err != nil {
 		log.Fatalf("server init: %v", err)
