@@ -98,6 +98,39 @@ type faultController struct {
 	// never arms it.
 	invertSign  bool
 	invertAddrs []uint16
+
+	// Advanced-DER (7xx) faults — advanced solar sim only. raiseAlarmBits is the
+	// model 701 Alrm bitfield the animation re-stamps each tick (0 = no alarm).
+	// curveAdoptLies makes the curve-adopt handshake report COMPLETED without
+	// updating the live curve. pfAckIgnore makes 704 PF/var writes ACK without
+	// moving measured PF/var. See raise_alarm / curve_adopt_lies / pf_ack_ignore.
+	raiseAlarmBits uint32
+	curveAdoptLies bool
+	pfAckIgnore    bool
+}
+
+// alarmBits returns the model 701 Alrm bitfield the raise_alarm fault set
+// (0 when cleared/unarmed). Read each animation tick by the advanced solar sim.
+func (fc *faultController) alarmBits() uint32 {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	return fc.raiseAlarmBits
+}
+
+// adoptLies reports whether curve_adopt_lies is armed (the adopt handshake
+// reports COMPLETED while leaving the live curve stale).
+func (fc *faultController) adoptLies() bool {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	return fc.curveAdoptLies
+}
+
+// pfIgnored reports whether pf_ack_ignore is armed (704 PF/var writes ACK but
+// measured PF/var does not move).
+func (fc *faultController) pfIgnored() bool {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	return fc.pfAckIgnore
 }
 
 // transportRead is the RegisterMap.OnRead hook. It applies the armed transport
@@ -432,6 +465,22 @@ func (fc *faultController) apply(body []byte, supported map[FaultKind]bool) erro
 		}
 		fc.invertSign = !spec.Clear
 		log.Printf("[fault] invert_sign: %s armed=%v", fc.label, fc.invertSign)
+
+	case FaultRaiseAlarm:
+		if spec.Clear {
+			fc.raiseAlarmBits = 0
+		} else {
+			fc.raiseAlarmBits = spec.Bits
+		}
+		log.Printf("[fault] raise_alarm: %s bits=%#x", fc.label, fc.raiseAlarmBits)
+
+	case FaultCurveAdoptLies:
+		fc.curveAdoptLies = !spec.Clear
+		log.Printf("[fault] curve_adopt_lies: %s armed=%v", fc.label, fc.curveAdoptLies)
+
+	case FaultPFAckIgnore:
+		fc.pfAckIgnore = !spec.Clear
+		log.Printf("[fault] pf_ack_ignore: %s armed=%v", fc.label, fc.pfAckIgnore)
 	}
 	return nil
 }

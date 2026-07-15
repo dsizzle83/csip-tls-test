@@ -137,6 +137,36 @@ const (
 	// on the battery to offset an import cap must detect the no-op and fall back or
 	// post CannotComply (INV-CONVERGE).
 	FaultDischargeDisabled FaultKind = "discharge_disabled"
+
+	// ── Advanced-DER (7xx) faults — advanced solar sim only. ──
+
+	// FaultRaiseAlarm sets the SunSpec model 701 Alrm bitfield to Bits, so the
+	// inverter reports those alarm bits on every measurement poll and the hub's
+	// LogEvent detector (cmd/hub/logevent.go) fires alarm/RTN pairs. Clear (or
+	// Bits=0) returns the alarm field to 0 (the RTN edge). It is an effect-time
+	// STATE fault: the animation re-stamps the current bits into 701 each tick,
+	// so it survives the 5 s register refresh. The mapped bit vocabulary is the
+	// hub's: 1<<6 manual-shutdown (DEREmergencyLocal), 1<<8/1<<9 over/under-
+	// frequency, 1<<10/1<<11 AC over/under-voltage.
+	FaultRaiseAlarm FaultKind = "raise_alarm"
+
+	// FaultCurveAdoptLies makes the SunSpec §3.1.2 curve-adopt handshake REPORT
+	// success while the read-only live curve stays stale: an AdptCrvReq still
+	// drives AdptCrvRslt to COMPLETED, but the staged curve (index ≥1) is NOT
+	// copied into the live curve (index 0). A hub that trusts the adopt result
+	// believes the curve provisioned; only re-reading the live curve and
+	// comparing its points catches it (adopt_state=diverged — the exact
+	// INV-ADV-READBACK defense WP-10's reconciler must enforce). The reactive
+	// analog of enable_gate for the curve-provisioning path.
+	FaultCurveAdoptLies FaultKind = "curve_adopt_lies"
+
+	// FaultPFAckIgnore makes a model 704 fixed-PF / fixed-var write ACK at the
+	// Modbus layer — the 704 register holds the commanded value, so a register
+	// readback is fooled — while the sim's MEASURED PF/Var (model 701) never
+	// moves off its free-running value. It is the accept-but-ignore analog of
+	// soc_refuse for the reactive-power controls: only measured-convergence
+	// verification (not the write ACK) catches it.
+	FaultPFAckIgnore FaultKind = "pf_ack_ignore"
 )
 
 // FaultSpec is the parsed body of POST /fault. A sim interprets the fields
@@ -146,6 +176,7 @@ type FaultSpec struct {
 	DelayS       float64   `json:"delay_s,omitempty"`          // ack_before_effect: effect delay (seconds)
 	MaxRampWPerS float64   `json:"max_ramp_w_per_s,omitempty"` // ramp_limit: output slew rate (W/s)
 	LatencyMs    int       `json:"latency_ms,omitempty"`       // latency: per-read delay (ms)
+	Bits         uint32    `json:"bits,omitempty"`             // raise_alarm: 701 Alrm bitfield to set
 	Clear        bool      `json:"clear,omitempty"`            // when true, disarm this Kind
 }
 

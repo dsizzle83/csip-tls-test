@@ -47,6 +47,13 @@ type SolarServer struct {
 	bases  SolarBases
 	wmaxW  float64
 	faults faultController // shared fault-injection state (see faults.go)
+
+	// Advanced-DER (7xx) surface — populated only by NewSolarServerAdvanced.
+	// When advanced is false the sim serves the legacy models only and behaves
+	// exactly as today (see solar_adv.go).
+	advanced  bool
+	adv       solarAdvBases
+	varRating float64 // reactive rating (var) — 702 VarMaxInj / fixed-var effect base
 }
 
 // solarFaultKinds is the set of POST /fault kinds the solar sim advertises.
@@ -108,17 +115,28 @@ func solarCeilingW(r *RegisterMap, bases SolarBases, wmaxW float64, fc *faultCon
 
 // interceptWrite is the RegisterMap.OnWriteAttempt hook. It delegates to the
 // shared faultController, which acts on the inverter's WMaxLimPct control
-// register (see faults.go). With no fault armed it is a pass-through.
+// register (see faults.go). With no fault armed it is a pass-through. On an
+// advanced sim it first offers the write to the 7xx curve-adopt handler (a
+// write to a curve model's AdptCrvReq/AdptCtlReq register triggers the SunSpec
+// §3.1.2 adopt, see solar_adv.go).
 func (ss *SolarServer) interceptWrite(startAddr uint16, vals []uint16) bool {
+	if ss.advanced && ss.interceptAdopt(startAddr, vals) {
+		return false // the adopt handler took responsibility for this write
+	}
 	cmdAddr := ss.bases.M123Base + sunspec.M123_WMaxLimPct
 	return ss.faults.intercept(ss.Regs, cmdAddr, startAddr, vals)
 }
 
 // ApplyFault arms or clears a fault for this sim. It is wired to simapi's
-// POST /fault. Body is a FaultSpec JSON object. Supported kinds:
-// "ack_before_effect" (delay_s) and "reject_write".
+// POST /fault. Body is a FaultSpec JSON object. A legacy sim advertises
+// solarFaultKinds; an advanced sim additionally advertises the 7xx kinds
+// (raise_alarm / curve_adopt_lies / pf_ack_ignore).
 func (ss *SolarServer) ApplyFault(body []byte) error {
-	return ss.faults.apply(body, solarFaultKinds)
+	kinds := solarFaultKinds
+	if ss.advanced {
+		kinds = solarAdvFaultKinds
+	}
+	return ss.faults.apply(body, kinds)
 }
 
 // newAnimatedServer launches the Modbus TCP server and a single animation
@@ -168,6 +186,10 @@ type SolarState struct {
 		WMaxLimPctEna  int     `json:"WMaxLimPct_Ena"`
 		Conn           int     `json:"Conn"`
 	} `json:"controls"`
+
+	// Advanced is the 7xx (IEEE 1547-2018) ground truth, present only on an
+	// advanced sim. Nil on a legacy sim, so /state is unchanged there.
+	Advanced *SolarAdvancedState `json:"advanced,omitempty"`
 }
 
 // Snapshot reads the current register state and returns a decoded SolarState.
@@ -212,6 +234,10 @@ func (ss *SolarServer) Snapshot() SolarState {
 	c.WMaxLimPctEna = int(r.Get(b.M123Base + sunspec.M123_WMaxLimPct_Ena))
 	c.Conn = int(r.Get(b.M123Base + sunspec.M123_Conn))
 
+	if ss.advanced {
+		st.Advanced = ss.advSnapshot()
+	}
+
 	return st
 }
 
@@ -220,8 +246,13 @@ func (ss *SolarServer) Snapshot() SolarState {
 func (ss *SolarServer) Registers() map[string]uint16 {
 	out := make(map[string]uint16)
 	base := uint16(sunspec.SunSpecBase)
-	// Cover the entire solar layout: 40000–40254
-	for addr := base; addr <= base+254; addr++ {
+	// Cover the legacy solar layout (40000–40254); on an advanced sim the 7xx
+	// models extend past that, so widen the window to the recorded end.
+	end := base + 254
+	if ss.advanced && ss.adv.End > end {
+		end = ss.adv.End
+	}
+	for addr := base; addr <= end; addr++ {
 		v := ss.Regs.Get(addr)
 		if v != 0 {
 			out[fmt.Sprintf("%d", addr)] = v
@@ -287,6 +318,12 @@ func (ss *SolarServer) Inject(body []byte) error {
 			return fmt.Errorf("inject: unknown field %q", key)
 		}
 	}
+	// Keep the 701 measurement model coherent with the injected 103 state (and
+	// re-apply any active 704 PF/var effect) so a paused, inject-driven advanced
+	// sim reports through 701 what the hub will read.
+	if ss.advanced {
+		ss.advSync()
+	}
 	return nil
 }
 
@@ -315,9 +352,21 @@ func solarStateText(st int) string {
 
 // ── populate ──────────────────────────────────────────────────────────────────
 
-// populateSolar writes the full solar inverter register layout into r and
-// returns the data-start addresses for each model block.
+// populateSolar writes the full legacy solar inverter register layout into r
+// and returns the data-start addresses for each model block.
 func populateSolar(r *RegisterMap, wmaxW float64) SolarBases {
+	bases, cursor := populateSolarCore(r, wmaxW)
+	r.Set(cursor, sunspec.EndMarker)
+	r.Set(cursor+1, 0)
+	return bases
+}
+
+// populateSolarCore writes the legacy solar models (1/120/121/122/103/123) into
+// r and returns the model bases plus the cursor positioned at the end-of-list
+// slot (where either the SunS end marker or the advanced 7xx models follow).
+// Split out of populateSolar so the advanced sim can append 7xx models before
+// the end marker without duplicating the legacy layout.
+func populateSolarCore(r *RegisterMap, wmaxW float64) (SolarBases, uint16) {
 	sfN := func(v int16) uint16 { return uint16(v) }
 	base := sunspec.SunSpecBase
 
@@ -410,15 +459,12 @@ func populateSolar(r *RegisterMap, wmaxW float64) SolarBases {
 	r.Set(m123Base+sunspec.M123_Conn, 1)
 	cursor += 2 + m123Len
 
-	r.Set(cursor, sunspec.EndMarker)
-	r.Set(cursor+1, 0)
-
 	return SolarBases{
 		M121Base: m121Base,
 		M122Base: m122Base,
 		M103Base: m103Base,
 		M123Base: m123Base,
-	}
+	}, cursor
 }
 
 // ── animation ─────────────────────────────────────────────────────────────────

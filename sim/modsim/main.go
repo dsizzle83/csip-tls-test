@@ -34,12 +34,21 @@ func main() {
 	port := flag.Int("port", 5020, "Modbus TCP port")
 	wmax := flag.Float64("wmax", 5000, "Nameplate WMax in watts")
 	apiPort := flag.Int("api-port", 6020, "HTTP API port (0 to disable)")
+	advanced := flag.Bool("advanced", false, "serve the IEEE 1547-2018 7xx DER models "+
+		"(701/702/704/705/706/711/712) for advanced-DER QA scenarios")
 	flag.Parse()
 
 	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
-	log.Printf("modsim: starting animated PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
 
-	srv, err := sim.NewSolarServer(listenURL, *wmax)
+	var srv *sim.SolarServer
+	var err error
+	if *advanced {
+		log.Printf("modsim: starting ADVANCED (7xx) PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
+		srv, err = sim.NewSolarServerAdvanced(listenURL, *wmax)
+	} else {
+		log.Printf("modsim: starting animated PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
+		srv, err = sim.NewSolarServer(listenURL, *wmax)
+	}
 	if err != nil {
 		log.Fatalf("modsim: %v", err)
 	}
