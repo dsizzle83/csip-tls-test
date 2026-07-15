@@ -22,7 +22,6 @@ import (
 	ocpp2 "github.com/lorenzodonini/ocpp-go/ocpp2.0.1"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/provisioning"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/remotecontrol"
-	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/transactions"
 	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
 
 	"lexa-proto/ocppserver"
@@ -68,6 +67,26 @@ func freePort(t *testing.T) int {
 	return port
 }
 
+// newOCPP201Handler builds a wired-up csHandler + ocpp201Handlers pair for
+// the 2.0.1 protocol — the same construction main.go does, factored out since
+// several tests below need it.
+func newOCPP201Handler(cs ocpp2.ChargingStation, stationID, csmsURL string, batt *evBattery, meterInterval, sessionDuration time.Duration) (*csHandler, *ocpp201Handlers) {
+	h := &csHandler{
+		stationID:       stationID,
+		csmsURL:         csmsURL,
+		batt:            batt,
+		meterInterval:   meterInterval,
+		sessionDuration: sessionDuration,
+	}
+	h.proto = newOCPP201Proto(cs)
+	h201 := &ocpp201Handlers{h: h}
+	cs.SetProvisioningHandler(h201)
+	cs.SetAvailabilityHandler(h201)
+	cs.SetRemoteControlHandler(h201)
+	cs.SetSmartChargingHandler(h201)
+	return h, h201
+}
+
 // TestSession_TransactionLifecycle runs a full charging session against an
 // in-process CSMS and verifies the OCPP 2.0.1 transaction sequence — the
 // regression for audit finding OCPP-1 (sessions previously consisted of bare
@@ -94,21 +113,11 @@ func TestSession_TransactionLifecycle(t *testing.T) {
 
 	cs := ocpp2.NewChargingStation("evsim-test", nil, nil)
 	batt := newEVBattery(60000, 20, 230, 32, 60)
-	h := &csHandler{
-		cs:              cs,
-		stationID:       "evsim-test",
-		csmsURL:         fmt.Sprintf("ws://127.0.0.1:%d/ocpp", port),
-		batt:            batt,
-		meterInterval:   500 * time.Millisecond,
-		sessionDuration: time.Minute,
-	}
-	h.setConnector(1, "Available")
-	cs.SetProvisioningHandler(h)
-	cs.SetAvailabilityHandler(h)
-	cs.SetRemoteControlHandler(h)
-	cs.SetSmartChargingHandler(h)
+	csmsURL := fmt.Sprintf("ws://127.0.0.1:%d/ocpp", port)
+	h, _ := newOCPP201Handler(cs, "evsim-test", csmsURL, batt, 500*time.Millisecond, time.Minute)
+	h.setConnector(1, connAvailable)
 
-	if err := cs.Start(h.csmsURL); err != nil {
+	if err := cs.Start(csmsURL); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	defer cs.Stop()
@@ -117,7 +126,7 @@ func TestSession_TransactionLifecycle(t *testing.T) {
 	}
 
 	// Start a session, let at least one periodic Updated go out, then stop.
-	h.startSession(cs, 1, time.Minute, transactions.TriggerReasonCablePluggedIn, nil)
+	h.startSession(1, time.Minute, trigCablePluggedIn, txStartOpts{})
 
 	// Wait for the session to be active and a transaction ID assigned.
 	waitFor(t, time.Second, func() bool {
@@ -131,7 +140,7 @@ func TestSession_TransactionLifecycle(t *testing.T) {
 	}
 
 	time.Sleep(1200 * time.Millisecond) // ≥ 2 meter ticks
-	h.stopSession(transactions.ReasonLocal, transactions.TriggerReasonStopAuthorized)
+	h.stopSession(stopLocal, trigStopAuthorized)
 
 	st = h.Snapshot()
 	if st.Session.Active {
@@ -172,9 +181,10 @@ func TestRemoteStartStop(t *testing.T) {
 		meterInterval:   time.Second,
 		sessionDuration: time.Minute,
 	}
+	o := &ocpp201Handlers{h: h}
 
 	// Stop with no active transaction → Rejected.
-	resp, err := h.OnRequestStopTransaction(newStopReq("no-such-tx"))
+	resp, err := o.OnRequestStopTransaction(newStopReq("no-such-tx"))
 	if err != nil {
 		t.Fatalf("OnRequestStopTransaction: %v", err)
 	}
@@ -183,23 +193,23 @@ func TestRemoteStartStop(t *testing.T) {
 	}
 
 	// Simulate an active transaction; mismatched ID → Rejected, matching → Accepted.
-	h.beginTx(1)
+	h.setTxID("test-tx-id")
 	h.mu.Lock()
 	h.session.Active = true
 	txID := h.txID
 	h.mu.Unlock()
 
-	resp, _ = h.OnRequestStopTransaction(newStopReq("wrong-id"))
+	resp, _ = o.OnRequestStopTransaction(newStopReq("wrong-id"))
 	if string(resp.Status) != "Rejected" {
 		t.Errorf("stop with wrong tx ID = %s, want Rejected", resp.Status)
 	}
-	resp, _ = h.OnRequestStopTransaction(newStopReq(txID))
+	resp, _ = o.OnRequestStopTransaction(newStopReq(txID))
 	if string(resp.Status) != "Accepted" {
 		t.Errorf("stop with matching tx ID = %s, want Accepted", resp.Status)
 	}
 
 	// Start while a session is active → Rejected.
-	startResp, err := h.OnRequestStartTransaction(newStartReq())
+	startResp, err := o.OnRequestStartTransaction(newStartReq())
 	if err != nil {
 		t.Fatalf("OnRequestStartTransaction: %v", err)
 	}

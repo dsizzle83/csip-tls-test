@@ -3,30 +3,16 @@ package main
 import (
 	"testing"
 	"time"
-
-	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/smartcharging"
-	"github.com/lorenzodonini/ocpp-go/ocpp2.0.1/types"
 )
-
-// profileReq builds a minimal SetChargingProfile request carrying a single
-// current limit, enough to exercise OnSetChargingProfile directly (no OCPP
-// validation runs on a direct handler call).
-func profileReq(limitA float64) *smartcharging.SetChargingProfileRequest {
-	return &smartcharging.SetChargingProfileRequest{
-		EvseID: 1,
-		ChargingProfile: &types.ChargingProfile{
-			ID:                     1,
-			ChargingProfilePurpose: types.ChargingProfilePurposeTxProfile,
-			ChargingSchedule: []types.ChargingSchedule{{
-				ChargingSchedulePeriod: []types.ChargingSchedulePeriod{{StartPeriod: 0, Limit: limitA}},
-			}},
-		},
-	}
-}
 
 // TestFaultProfileReject: with profile_reject armed the charger declines the
 // profile (Rejected) and does NOT apply the new limit; clearing restores normal
 // accept-and-apply behaviour.
+//
+// handleSetChargingProfile is the protocol-agnostic core both OCPP 2.0.1's
+// and OCPP 1.6's SetChargingProfile handlers delegate to (ocpp201.go /
+// ocpp16.go) — exercising it directly here tests the fault-injection logic
+// shared by both protocol versions in one place.
 func TestFaultProfileReject(t *testing.T) {
 	batt := newEVBattery(60000, 50, 230, 32, 1)
 	batt.SetCommandedA(16)
@@ -35,12 +21,8 @@ func TestFaultProfileReject(t *testing.T) {
 	if err := h.ApplyFault([]byte(`{"kind":"profile_reject"}`)); err != nil {
 		t.Fatalf("arm profile_reject: %v", err)
 	}
-	resp, err := h.OnSetChargingProfile(profileReq(8))
-	if err != nil {
-		t.Fatalf("OnSetChargingProfile: %v", err)
-	}
-	if resp.Status != smartcharging.ChargingProfileStatusRejected {
-		t.Fatalf("status = %v, want Rejected", resp.Status)
+	if accepted := h.handleSetChargingProfile(chargingLimit{LimitA: 8}); accepted {
+		t.Fatal("accepted = true, want false (Rejected)")
 	}
 	if batt.commandedA != 16 {
 		t.Fatalf("commandedA = %v, want 16 (rejected profile must not apply)", batt.commandedA)
@@ -49,9 +31,8 @@ func TestFaultProfileReject(t *testing.T) {
 	if err := h.ApplyFault([]byte(`{"kind":"profile_reject","clear":true}`)); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
-	resp, _ = h.OnSetChargingProfile(profileReq(8))
-	if resp.Status != smartcharging.ChargingProfileStatusAccepted {
-		t.Fatalf("status after clear = %v, want Accepted", resp.Status)
+	if accepted := h.handleSetChargingProfile(chargingLimit{LimitA: 8}); !accepted {
+		t.Fatal("accepted after clear = false, want true")
 	}
 	if batt.commandedA != 8 {
 		t.Fatalf("commandedA after clear = %v, want 8 (profile applied)", batt.commandedA)
@@ -68,12 +49,8 @@ func TestFaultApplyNextTx(t *testing.T) {
 	if err := h.ApplyFault([]byte(`{"kind":"apply_next_tx"}`)); err != nil {
 		t.Fatalf("arm apply_next_tx: %v", err)
 	}
-	resp, err := h.OnSetChargingProfile(profileReq(8))
-	if err != nil {
-		t.Fatalf("OnSetChargingProfile: %v", err)
-	}
-	if resp.Status != smartcharging.ChargingProfileStatusAccepted {
-		t.Fatalf("status = %v, want Accepted (accept-but-ignore)", resp.Status)
+	if accepted := h.handleSetChargingProfile(chargingLimit{LimitA: 8}); !accepted {
+		t.Fatal("accepted = false, want true (accept-but-ignore)")
 	}
 	if batt.commandedA != 16 {
 		t.Fatalf("commandedA = %v, want 16 (accepted but not applied to live session)", batt.commandedA)
@@ -82,7 +59,7 @@ func TestFaultApplyNextTx(t *testing.T) {
 	if err := h.ApplyFault([]byte(`{"kind":"apply_next_tx","clear":true}`)); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
-	h.OnSetChargingProfile(profileReq(8))
+	h.handleSetChargingProfile(chargingLimit{LimitA: 8})
 	if batt.commandedA != 8 {
 		t.Fatalf("commandedA after clear = %v, want 8 (now applied)", batt.commandedA)
 	}
