@@ -72,3 +72,26 @@ Prefer spec-JSON (`qa/scenarios/*.json`) when an existing oracle fits; Go litera
 Per track: `go build ./...`, oracle unit tests, spec-load tests. Full validation = a bench Mayhem
 campaign of the new IDs against the dev kit (`scripts/mayhem.py --only <ids>`) after merge — restores the
 bench between scenarios, so coordinate with any running soak.
+
+## Bench validation (2026-07-15, dev kit 69.0.0.2)
+
+- Dashboard rebuilt from the QA commits; `mayhem.py --list` = **87 scenarios**, all 17 new IDs present.
+- **Soak-safe subset run live, both PASS**: `der-report-roundtrip` (DERCapability.rtgMaxW=15000,
+  DERStatus SoC=60%, DERAvailability received) and `dcap-redirect` (hub followed the 302, stayed up,
+  kept the export cap). No harness bugs — real-server behavior matched the unit tests.
+- The adv-shadow + AUS-shadow soak (started 2026-07-15T01:14:46Z) was preserved and stayed healthy
+  across the run (zero restarts; tick_overruns/shadow_divergence/mqtt_reconnects all 0; adv would-writes
+  advancing; real HW writes 0).
+
+### Dedicated campaign for the remaining 15 (needs a scratch/non-soak hub session)
+
+Run in a session where the soak can be interrupted:
+1. **Track D (no hub flag flips)** — reconfigure evsim: `-proto 1.6` for ocpp16-smart-charge /
+   clear-profile-release; `pairing_mode:"gated"` + an unconfigured station for pairing-gate-hold;
+   `ev_storage:true` for ev-setpoint-clamp. Stand up `sim/vtnsim` + point lexa-openadr's `vtn_url` at it
+   for the openadr pair (or rely on their bus-inject path, already unit-covered).
+   `mayhem.py --only ocpp16-smart-charge,pairing-gate-hold,clear-profile-release,ev-setpoint-clamp,openadr-limit-adopt,openadr-csip-precedence`
+2. **Tracks B/C (need faults + flag flips)** — redeploy the solar sim as `modsim -advanced`; set
+   `reconciler.adv:"active"` + `der_gen:"7xx"` and `enforce_aus_limits:true` on the hub; then
+   `mayhem.py --only pin-freeze-egress-halt,logevent-alarm-pair,cannotcomply-table27,redirect-storm,adv-shadow-no-writes,curve-adopt-readback-divergence,pf-var-measured-convergence,aus-gen-cap,aus-load-cap`
+   Restore soak config (advanced_der on / reconciler.adv shadow / enforce_aus_limits false) afterward.
