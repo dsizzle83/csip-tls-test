@@ -3087,6 +3087,12 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 	sc = append(sc, d.mqttScenarios()...)
 	sc = append(sc, d.worldScenarios()...)
 	sc = append(sc, d.intentScenarios()...)
+	// Standards build-out supplemental QA (2026-07, docs/QA_STANDARDS_BUILDOUT.md):
+	// reporting (B), advanced-DER+AUS (C), OCPP/V2G/OpenADR (D). Track A is the
+	// modsim 7xx sim surface (no scenarios). All Go-literal, no oracleRegistry entries.
+	sc = append(sc, d.reportingScenarios()...)
+	sc = append(sc, d.advScenarios()...)
+	sc = append(sc, d.ocppOpenADRScenarios()...)
 
 	// TASK-076: scenarios-as-data. scenarios() runs fresh on every call —
 	// handleStart calls it at REQUEST time, never once at process start — so
