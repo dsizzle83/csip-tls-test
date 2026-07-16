@@ -55,6 +55,18 @@ func (b *evBattery) SetCommandedA(a float64) {
 	b.mu.Unlock()
 }
 
+// ResumeNative restores charging to the EVSE's native hardware max after a
+// ClearChargingProfile removes the hub's TxDefaultProfile limit. Clearing a
+// profile releases the charger to its full cable/station rate — it does NOT
+// suspend it (the earlier SetCommandedA(0) bug that left a curtailed 1.6J/2.0.1
+// charger pinned at ~0 A after release — mayhem clear-profile-release /
+// ocpp16-smart-charge). Charging still stops on StopCharging (session end).
+func (b *evBattery) ResumeNative() {
+	b.mu.Lock()
+	b.commandedA = b.MaxCurrentA
+	b.mu.Unlock()
+}
+
 // SetMinFloorA arms/clears the min_current_floor fault: while charging, the
 // charger will not modulate the current below floorA even when commanded lower
 // (a charger that cannot dim past its minimum). floorA <= 0 clears it.

@@ -181,7 +181,9 @@ func (h *csHandler) handleClearChargingProfile() {
 	h.mu.Lock()
 	h.lastProfile = nil
 	h.mu.Unlock()
-	h.batt.SetCommandedA(0)
+	// Release to the native rate, not suspend: clearing the hub's profile lets
+	// the EV charge at its full cable/station current again (see ResumeNative).
+	h.batt.ResumeNative()
 }
 
 // simulateReset stops any running session with an ImmediateReset stop cause,

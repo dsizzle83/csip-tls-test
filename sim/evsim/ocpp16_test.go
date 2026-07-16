@@ -365,8 +365,12 @@ func TestOCPP16_ClearChargingProfileRestoresUnrestricted(t *testing.T) {
 	if resp.Status != smartcharging16.ClearChargingProfileStatusAccepted {
 		t.Fatalf("status = %v, want Accepted", resp.Status)
 	}
-	if batt.commandedA != 0 {
-		t.Fatalf("commandedA after clear = %v, want 0", batt.commandedA)
+	// "Unrestricted" means the EV resumes at its native hardware max, NOT
+	// commandedA=0 — which Tick (battery.go) reads as SUSPEND (the bug this test
+	// used to encode: a cleared charger left pinned near 0 A instead of
+	// recovering to full — mayhem clear-profile-release / ocpp16-smart-charge).
+	if batt.commandedA != batt.MaxCurrentA {
+		t.Fatalf("commandedA after clear = %v, want %v (MaxCurrentA — released to native rate, not 0/suspend)", batt.commandedA, batt.MaxCurrentA)
 	}
 }
 
