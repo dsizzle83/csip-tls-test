@@ -1109,6 +1109,39 @@ func ausGrossLoadW(smp maySample) (float64, bool) {
 	return gross, true
 }
 
+// ausSheddableRemains reports whether, in the convergence-hold tail, the hub
+// still had an un-pulled sheddable LOAD lever while over the cap — the pack
+// actively CHARGING (BatterySimW < 0 draws load the battery-charge-shed lever
+// exists to remove) or the EV still drawing above the "actively charging" floor
+// (the EVSE current-ceiling lever exists to remove). applyAusLoadLimitRule is
+// required to exhaust BOTH before the hub may honestly post CannotComply, so a
+// CannotComply admitted with either lever still holding slack is PREMATURE, not
+// a legitimate irreducible-baseload admission. This is the ground-truth backstop
+// that keeps the legit-CannotComply PASS branch from degenerating into a
+// presence-only pass (fbcaca0 weakening) that never exercises the shed levers.
+func ausSheddableRemains(s []maySample) (bool, string) {
+	if len(s) == 0 {
+		return false, ""
+	}
+	endT := s[len(s)-1].T
+	for _, smp := range s {
+		if smp.T < endT-mayConvergeHoldS {
+			continue
+		}
+		// Pack still charging harder than the reaction floor ⇒ the
+		// battery-charge-shed lever was not pulled.
+		if smp.BatterySimOK && smp.BatterySimW < -mayReactThreshW {
+			return true, fmt.Sprintf("pack still charging at %.0fW", -smp.BatterySimW)
+		}
+		// EV still actively drawing ⇒ the EVSE current ceiling was not pulled
+		// toward its floor/suspend.
+		if smp.EvSimOK && smp.EvSimW > mayEVLiveDrawW {
+			return true, fmt.Sprintf("EV still drawing %.0fW (%.1fA)", smp.EvSimW, smp.EvSimA)
+		}
+	}
+	return false, ""
+}
+
 // diagnoseAusCap is the shared oracle body for aus-gen-cap/aus-load-cap: walk
 // the adoption(decision)→ground-truth-compliance→admission chain, mirroring
 // diagnoseConstraint's shape without touching breachOver/scanSamples (which
@@ -1193,18 +1226,31 @@ func diagnoseAusCap(sc *mayScenario, s []maySample, rule, label string, limW flo
 			reportedCannot = true
 		}
 	}
+	sheddableRemains, sheddableWhy := ausSheddableRemains(s)
 	switch {
 	case sawTail && tailClean:
 		f.Verdict = "PASS"
 		f.Headline = fmt.Sprintf("%s breached briefly (peak +%.0fW) then converged and held under the %.0fW cap", label, peak, limW)
-	case reportedCannot && cannotComplyLegit:
+	case reportedCannot && cannotComplyLegit && !sheddableRemains:
 		// Load cap with irreducible baseload above it: CannotComply IS the
 		// correct outcome (this scenario's Expected + checkAusLoadConvergence's
-		// doc), not a shortfall. The hub pulled its sheddable levers and, unable
-		// to fully comply, admitted it honestly rather than faking compliance.
+		// doc), not a shortfall — BUT ONLY once the hub has exhausted its
+		// sheddable levers. Verified by ausSheddableRemains==false: no un-pulled
+		// lever (pack still charging / EV still drawing) remained in the tail.
+		// The hub pulled everything it could and, unable to fully comply,
+		// admitted it honestly rather than faking compliance.
 		f.Verdict = "PASS"
-		f.Headline = fmt.Sprintf("%s exceeded the %.0fW cap by more than the sheddable levers can remove; hub correctly admitted CannotComply", label, limW)
-		f.Diagnosis = []string{"A load cap can be genuinely unmeetable when irreducible home load alone exceeds it — CannotComply is the standards-correct admission here (the scenario's Expected / checkAusLoadConvergence's doc), NOT a control failure. The hub posted an honest CannotComply for the active mRID rather than silently reporting compliance."}
+		f.Headline = fmt.Sprintf("%s exceeded the %.0fW cap by more than the sheddable levers can remove; hub correctly admitted CannotComply after exhausting them", label, limW)
+		f.Diagnosis = []string{"A load cap can be genuinely unmeetable when irreducible home load alone exceeds it — CannotComply is the standards-correct admission here (the scenario's Expected / checkAusLoadConvergence's doc), NOT a control failure. The hub drove both sheddable levers (battery-charge shed, EVSE current ceiling) to their floor and posted an honest CannotComply for the active mRID rather than silently reporting compliance."}
+	case reportedCannot && cannotComplyLegit:
+		// CannotComply posted while a sheddable lever still held slack — the hub
+		// admitted defeat before exhausting applyAusLoadLimitRule's levers. That
+		// is a PREMATURE admission, not a legitimate irreducible-baseload one:
+		// the very failure the presence-only PASS (fbcaca0) would have masked.
+		f.Verdict = "DEGRADED"
+		f.Headline = fmt.Sprintf("%s stayed over the %.0fW cap; hub posted CannotComply while sheddable load remained (%s) — levers not exhausted", label, limW, sheddableWhy)
+		f.Diagnosis = []string{"CannotComply is only a legitimate load-cap outcome once the sheddable levers are exhausted. Here a lever still held slack in the convergence tail (" + sheddableWhy + "), so the hub gave up early instead of shedding battery-charge / EVSE current further. applyAusLoadLimitRule should have pulled it before admitting non-convergence."}
+		f.Fix = sc.Fix
 	case reportedCannot:
 		f.Verdict = "DEGRADED"
 		f.Headline = fmt.Sprintf("%s did not converge under the %.0fW cap; hub reported CannotComply", label, limW)

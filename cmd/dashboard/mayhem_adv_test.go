@@ -455,6 +455,69 @@ func TestDiagnoseAusLoadCap_Pass_CannotComplyUnmeetable(t *testing.T) {
 	}
 }
 
+// TestDiagnoseAusLoadCap_Degraded_SheddableLoadRemains is the Q4 un-weakening:
+// a CannotComply is only a LEGITIMATE load-cap outcome once the hub has actually
+// exhausted its sheddable levers. Here the pack is still CHARGING (BatterySimW <
+// 0) through the convergence tail while the cap is breached and CannotComply is
+// posted — a sheddable lever (battery-charge shed) the hub never pulled. That is
+// a PREMATURE admission, not an irreducible-baseload one, and must be DEGRADED,
+// not the presence-only PASS fbcaca0 collapsed it to (which gave
+// applyAusLoadLimitRule's shed levers zero coverage).
+func TestDiagnoseAusLoadCap_Degraded_SheddableLoadRemains(t *testing.T) {
+	s := mkSamples(85, func(i int, smp *maySample) {
+		smp.SolarW, smp.SolarPossibleW = 300, 300
+		smp.RealGridW = 6000                            // gross load ~6300W, over the 3000W cap
+		smp.BatterySimOK, smp.BatterySimW = true, -1500 // pack STILL CHARGING: un-shed lever
+		smp.Decisions = []string{"[csip-aus/load-limit] gross load cap 3000W…"}
+		smp.CannotComply = true
+	})
+	f := diagnoseAusLoadCap(scFor("aus-load-cap"), ausConsLoad(), s)
+	if f.Verdict != "DEGRADED" {
+		t.Fatalf("verdict = %s, want DEGRADED — CannotComply posted while the pack was still charging (sheddable lever not exhausted) is a premature admission (%s)", f.Verdict, f.Headline)
+	}
+	if !containsFold(f.Headline, "sheddable load remained") {
+		t.Errorf("headline = %q, want it to call out the remaining sheddable load", f.Headline)
+	}
+}
+
+// TestDiagnoseAusLoadCap_Degraded_EVStillDrawing is the EV-lever half of the
+// same un-weakening: CannotComply while the EV is still actively charging
+// (EvSimW above the live-draw floor) means the EVSE current-ceiling lever was
+// not pulled — premature admission → DEGRADED.
+func TestDiagnoseAusLoadCap_Degraded_EVStillDrawing(t *testing.T) {
+	s := mkSamples(85, func(i int, smp *maySample) {
+		smp.SolarW, smp.SolarPossibleW = 300, 300
+		smp.RealGridW = 6000                                 // gross load over cap
+		smp.BatterySimOK, smp.BatterySimW = true, 0          // battery lever exhausted…
+		smp.EvSimOK, smp.EvSimW, smp.EvSimA = true, 7000, 30 // …but EV still drawing 7kW: un-shed
+		smp.Decisions = []string{"[csip-aus/load-limit] gross load cap 3000W…"}
+		smp.CannotComply = true
+	})
+	f := diagnoseAusLoadCap(scFor("aus-load-cap"), ausConsLoad(), s)
+	if f.Verdict != "DEGRADED" {
+		t.Fatalf("verdict = %s, want DEGRADED — EV still drawing above its floor is an un-pulled lever (%s)", f.Verdict, f.Headline)
+	}
+}
+
+// TestDiagnoseAusLoadCap_Pass_LeversExhausted confirms the un-weakening did NOT
+// break the legitimate case: gross load irreducibly over the cap, CannotComply
+// posted, and BOTH sheddable levers driven to their floor in the tail (pack
+// idle, EV suspended) → the honest admission still PASSes.
+func TestDiagnoseAusLoadCap_Pass_LeversExhausted(t *testing.T) {
+	s := mkSamples(85, func(i int, smp *maySample) {
+		smp.SolarW, smp.SolarPossibleW = 300, 300
+		smp.RealGridW = 6000                             // irreducible baseload over cap
+		smp.BatterySimOK, smp.BatterySimW = true, 0      // charge lever pulled (idle)
+		smp.EvSimOK, smp.EvSimW, smp.EvSimA = true, 0, 0 // EVSE lever pulled (suspended)
+		smp.Decisions = []string{"[csip-aus/load-limit] gross load cap 3000W…"}
+		smp.CannotComply = true
+	})
+	f := diagnoseAusLoadCap(scFor("aus-load-cap"), ausConsLoad(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS — CannotComply after exhausting both levers is the standards-correct admission (%s)", f.Verdict, f.Headline)
+	}
+}
+
 func TestAusGrossGenW_BlindWithoutSolar(t *testing.T) {
 	s := maySample{SolarOK: false}
 	if _, ok := ausGrossGenW(s); ok {
