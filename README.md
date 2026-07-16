@@ -57,7 +57,7 @@ All Pis connect via Ethernet to a dedicated switch on `69.0.0.x/24`. WiFi is a s
 
 | Hostname   | IP        | Binary   | Port        |
 |------------|-----------|----------|-------------|
-| hub-pi     | 69.0.0.1  | hub      | 8887 (OCPP) |
+| ccimx93-dvk | 69.0.0.2 | hub (`root@`) | 8887 (OCPP) |
 | solar-pi   | 69.0.0.10 | modsim   | 5020        |
 | battery-pi | 69.0.0.11 | batsim   | 5021        |
 | meter-pi   | 69.0.0.12 | metersim | 5022        |

@@ -14,7 +14,7 @@ description: Run the right tests for the most recently changed code and report r
    |---|---|
    | `internal/csip/`, `sim/gridsim/` | `go test ./tests/ ./sim/gridsim/...` |
    | `internal/southbound/`, `sim/southbound/` | `go test ./internal/southbound/... ./sim/southbound/...` |
-   | `internal/ocppserver/`, `sim/evsim/` | `go test ./internal/ocppserver/... ./sim/evsim/...` |
+   | `sim/evsim/` | `go test ./sim/evsim/...` (the OCPP server is now shared `lexa-proto/ocppserver`, vendored — test the server itself in the lexa-proto module) |
    | `sim/simapi/` | `go test ./sim/simapi/...` |
    | `internal/tlsclient/`, `sim/tlsserver/` | `make test-integration` (wolfSSL; works on this desktop via the amd64 sysroot) |
    | anything touching goroutines, locks, maps shared across goroutines | add `-race` to the relevant `go test` (the audit found two real races this would have caught) |
@@ -31,4 +31,4 @@ description: Run the right tests for the most recently changed code and report r
 - Re-run a test that just passed to "double-check".
 - Run Pi-only targets (`conformance-pi`, `smoke-pi`, anything `-pi`) unless asked — they SSH to the bench.
 - Suggest adding coverage beyond what was broken.
-- Touch `internal/southbound/sunspec` register constants without also planning the lexa-hub twin change (lockstep rule MTR-4).
+- Touch `lexa-proto/sunspec` register constants without a paired proto bump — they're a single shared source now, not a hub-side twin fork; a change means editing lexa-proto and regenerating both repos' `proto.pin` in the same session (lockstep rule MTR-4, CI-enforced by `check-proto-pin.sh`).

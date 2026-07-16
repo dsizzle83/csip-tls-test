@@ -25,8 +25,12 @@ The 2 remaining BLINDs (`stale-meter`, `ev-meter-freeze`) are diagnoser/environm
    ```bash
    bash scripts/bench-up.sh --fast        # restores LAN IP, starts gridsim+dashboard, sets hub fast timing, verifies all nodes
    ```
-   The Pis (hub .1, sims .10–.14) auto-start via linger and survive a desktop reboot;
+   The sim Pis (.10–.14) auto-start via linger and survive a desktop reboot;
    only gridsim + dashboard (desktop, :11111/11112 + :8080) need restarting.
+   (The hub is no longer a linger Pi — it migrated off hub-pi .1 to the
+   ConnectCore 93 dev kit `ccimx93-dvk` at 69.0.0.2 on 2026-07-07, root@ /
+   root systemd units; hub-pi .1 is STANDBY. See `BENCH.md` for the current
+   topology.)
 2. **Run the full suite** (≈ 35–45 min for all 38; the engine restores the bench on finish/abort):
    ```bash
    python3 scripts/mayhem.py --dashboard http://localhost:8080            # all scenarios
@@ -232,7 +236,7 @@ item (a soak had the bench mid-run when this was authored).
   (new `bad_scale` / `apply_delayed` / `wrong_units` kinds); **batsim/.11** earlier (directional
   + transport faults). Deploy one sim manually by scp-ing `bin/arm64/<sim>` over the unit's
   ExecStart path and `systemctl --user restart <sim>` (see the bench-deploy skill), or all via
-  `bash scripts/update-sim-pis.sh 69.0.0.1 dmitri` (needs `bin/arm64/*` prebuilt).
+  `bash scripts/update-sim-pis.sh 69.0.0.2 dmitri` (hub-ip 69.0.0.2, sim SSH user dmitri; needs `bin/arm64/*` prebuilt).
 - Hub in **fast** replay timing. CSIP control back to `default`, gridsim clock offset 0.
 - All work committed + pushed on branch `lexa-hub` (commits `8b477b7`..`a77e27b`).
 

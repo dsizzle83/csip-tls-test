@@ -6,8 +6,10 @@ description: Cross-compile and deploy simulators/hub to the 69.0.0.x bench Pis, 
 # Bench deploy
 
 **Read `docs/BENCH.md` first** — it is the source of truth for IPs, SSH users, and service
-models, and it changes as the bench evolves. Summary: SSH as `dmitri@`; sims run as *user*
-systemd units (binaries in `~/bin`); only hub-pi (69.0.0.1) has passwordless sudo and root units.
+models, and it changes as the bench evolves. Summary: SSH as `dmitri@` on the desktop and sim
+Pis (sims run as *user* systemd units, binaries in `~/bin`); the hub is the ConnectCore 93 dev
+kit at 69.0.0.2, reached as `root@` with root systemd units (hub-pi 69.0.0.1 is STANDBY). Defer
+to `docs/BENCH.md` for the current hub host.
 
 ## Build
 
@@ -22,7 +24,7 @@ cd ~/projects/lexa-hub && make wolfssl-arm64 && make build-arm64
 
 ## Deploy
 
-1. **Hub**: `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.1 dmitri`
+1. **Hub**: `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.2 root`
 2. **Sims**: `bash scripts/update-sim-pis.sh <hub-ip> dmitri` — auto-detects each Pi's
    layout (user unit in `~/.config/systemd/user` vs legacy root unit), installs over the
    unit's existing ExecStart path, rewrites metersim to linked mode and evsim's CSMS URL,
@@ -31,7 +33,7 @@ cd ~/projects/lexa-hub && make wolfssl-arm64 && make build-arm64
    hub (`lexa-modbus`) and metersim must go out together or one reads garbage.
 4. **Deploy resets hub timing to STOCK** — `deploy-hub-pi.sh` copies `configs/*.json`
    over `/etc/lexa/`, wiping FAST-mode tuning. If a Mayhem/replay session is active,
-   re-run `scripts/hub-replay-tune.sh fast 69.0.0.1 dmitri` after every hub deploy, or
+   re-run `scripts/hub-replay-tune.sh fast 69.0.0.2 root` after every hub deploy, or
    QA verdicts silently degrade (2026-07-02: stock 15 s engine ticks turned scheduler
    fixes into phantom FAILs).
 
@@ -42,8 +44,8 @@ curl -s http://69.0.0.10:6020/state | head -c 200    # solar
 curl -s http://69.0.0.11:6021/state | head -c 200    # battery
 curl -s http://69.0.0.12:6022/state | head -c 200    # meter (linked mode: check W ≈ load+ev−solar−battery)
 curl -s http://69.0.0.14:6024/state | head -c 200    # ev
-curl -s http://69.0.0.1:9100/status                  # hub
-ssh dmitri@69.0.0.1 'sudo systemctl is-active lexa-hub lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-api mosquitto'
+curl -sk https://69.0.0.2:9100/status                # hub (HTTPS, self-signed leaf — WS-B)
+ssh root@69.0.0.2 'sudo systemctl is-active lexa-hub lexa-modbus lexa-northbound lexa-telemetry lexa-ocpp lexa-api mosquitto'
 ```
 Report which checks passed/failed, with the failing unit's last journal lines.
 

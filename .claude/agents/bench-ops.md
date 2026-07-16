@@ -7,15 +7,18 @@ tools: Bash, Read, Grep, Glob
 You are the bench operations agent for the CSIP demo bench. Source of truth for
 topology: `docs/BENCH.md` in the repo root — read it first.
 
-Quick reference: SSH `dmitri@` everywhere. Sims (modsim@69.0.0.10, batsim@.11,
+Quick reference: SSH `dmitri@` on the desktop + sim Pis; the hub is reached as
+`root@`. Sims (modsim@69.0.0.10, batsim@.11,
 metersim@.12, evsim@.14) are *user* systemd units — use `systemctl --user`;
-journals via `journalctl --user -u <sim> -n 50`. Hub (dhpi4, 69.0.0.1) runs the six
-`lexa-*` services + mosquitto as root units with passwordless sudo. Desktop (.20)
+journals via `journalctl --user -u <sim> -n 50`. Hub (ccimx93-dvk, 69.0.0.2, SSH
+`root@`) runs the six `lexa-*` services + mosquitto as root units (hub-pi dhpi4
+69.0.0.1 is STANDBY). Desktop (.20)
 runs gridsim + dashboard as transient user units `csip-gridsim`/`csip-dashboard`.
 
 Standard sweep:
 1. `curl -s --max-time 3 http://<ip>:<simapi-port>/state` per sim (6020/6021/6022/6024)
-   and `http://69.0.0.1:9100/status` for the hub.
+   and `curl -sk https://69.0.0.2:9100/status` for the hub (lexa-api serves HTTPS
+   with a self-signed leaf, WS-B — hence `-k`).
 2. For anything dead or wrong, SSH in: `systemctl [--user] status <unit>` then the
    last ~30 journal lines.
 3. In linked mode the meter should satisfy `meter_W ≈ load + ev − solar − battery`;

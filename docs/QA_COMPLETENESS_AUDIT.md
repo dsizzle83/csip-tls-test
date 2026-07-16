@@ -12,7 +12,12 @@ recon or the lexa-hub planning docs — several of which are stale (see §0).
 
 ## 0. Headline findings (read this first)
 
-1. **One genuine, unfixed PRODUCT BUG surfaced by QA.** The hub cannot read a
+1. **One genuine, unfixed PRODUCT BUG surfaced by QA.** _**RESOLVED 2026-07-16:**
+   fixed on this same branch — `vendor/lexa-proto/sunspec/reader.go` now reads wide
+   models in ≤125-register chunks (`readChunked`, `maxHoldingRead=125`), `proto.pin`
+   is bumped to `85af8d5` in both repos, and the sim serves the full 137-register
+   701 (`populate701`, `sim/southbound/solar_adv.go`). The original 2026-07-15
+   finding is retained below._ The hub cannot read a
    spec-compliant **137-register SunSpec model 701** in one Modbus transaction:
    `vendor/lexa-proto/sunspec/reader.go:46` issues a single
    `ReadHolding(base, Length)` and `simonvetter/modbus` hard-refuses any read
@@ -85,6 +90,14 @@ Priority reflects **field-risk × correctness**, re-scored after verification.
 ### P0 — Real product defect (fix before anything else)
 
 **P0-1 · Model-701 >125-register read is broken (unchunked).**
+
+> **RESOLVED 2026-07-16 — now chunked.** `vendor/lexa-proto/sunspec/reader.go`'s
+> `readChunked` splits reads at `maxHoldingRead=125` and concatenates, so the full
+> 137-register 701 reads across two transactions; `proto.pin` is `85af8d5` in both
+> repos; and the sim serves the full 137-register 701 (`populate701`,
+> `sim/southbound/solar_adv.go` — "writes the FULL model 701 block — all 137
+> registers"). The analysis below is the original 2026-07-15 finding.
+
 - **Severity:** Critical — the hub cannot read a spec-compliant 137-reg model 701;
   a real 1547-2018-certified inverter serving it fails at discovery.
 - **Field failure caught:** "advanced inverter with full 701 measurement block →
@@ -358,7 +371,10 @@ Grouped so each batch is independently delegable. Tag: **[TT]** = csip-tls-test-
 **[HUB]** = needs a lexa-hub (or lexa-proto) change.
 
 ### Batch 1 — The product bug + the free wins (do first)
-1. **[HUB+TT] Fix the 701 chunking bug (P0-1).** In `lexa-proto/modbus/transport.go`
+1. **[HUB+TT] Fix the 701 chunking bug (P0-1).** **[DONE 2026-07-16** — landed in
+   `lexa-proto/sunspec/reader.go` (`readChunked`, `maxHoldingRead=125`), `proto.pin`
+   → `85af8d5` in both repos, sim un-truncated to the full 137-reg 701
+   (`populate701`).**]** In `lexa-proto/modbus/transport.go`
    `ReadHolding` (or `sunspec/reader.go:46` `ReadModel`), split reads into ≤125-reg
    requests and concatenate. Un-truncate the sim to full 137 regs
    (`sim/southbound/solar_adv.go:populate701`). Add a full-701 read+assert test

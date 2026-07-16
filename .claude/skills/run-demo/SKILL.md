@@ -5,7 +5,7 @@ description: Bring up the full CSIP demo end to end — gridsim + dashboard on t
 
 # Run the demo
 
-Full chain: gridsim (desktop) ←mTLS← hub (69.0.0.1) ←Modbus/OCPP→ sims (Pis), all
+Full chain: gridsim (desktop) ←mTLS← hub (69.0.0.2) ←Modbus/OCPP→ sims (Pis), all
 visualized at **http://69.0.0.20:8080**. Topology details: `docs/BENCH.md`.
 
 The only fragile part is the **desktop**: gridsim and the dashboard run as *transient*
@@ -32,7 +32,7 @@ systemd-run --user --unit=csip-gridsim \
 systemd-run --user --unit=csip-dashboard \
   --working-directory="$HOME/projects/csip-tls-test" \
   "$HOME/projects/csip-tls-test/bin/dashboard" -addr :8080 \
-  -hub http://69.0.0.1:9100 -gridsim http://localhost:11112 \
+  -hub https://69.0.0.2:9100 -gridsim http://localhost:11112 \
   -solar http://69.0.0.10:6020 -battery http://69.0.0.11:6021 \
   -meter http://69.0.0.12:6022 -ev http://69.0.0.14:6024 \
   -hub-token-file "$HOME/.config/lexa/hub-api.token"
@@ -43,7 +43,7 @@ systemd-run --user --unit=csip-dashboard \
 empty file just means no header is sent. `scripts/bench-up.sh` relays the token
 from the hub automatically; if starting the unit by hand and the file doesn't
 exist yet, run `bash scripts/bench-up.sh` once first, or fetch it directly:
-`ssh dmitri@69.0.0.1 sudo cat /etc/lexa/api.token > ~/.config/lexa/hub-api.token`.
+`ssh root@69.0.0.2 sudo cat /etc/lexa/api.token > ~/.config/lexa/hub-api.token`.
 
 If a binary is missing: `go build -o bin/server ./sim/server` (cgo — the Makefile/session
 env wire the wolfSSL sysroot) and `go build -o bin/dashboard ./cmd/dashboard`.
@@ -61,20 +61,20 @@ curl -s --max-time 3 http://69.0.0.10:6020/state >/dev/null && echo solar OK
 curl -s --max-time 3 http://69.0.0.11:6021/state >/dev/null && echo battery OK
 curl -s --max-time 3 http://69.0.0.12:6022/state >/dev/null && echo meter OK
 curl -s --max-time 3 http://69.0.0.14:6024/state >/dev/null && echo ev OK
-curl -s --max-time 3 http://69.0.0.1:9100/status | head -c 300   # hub (401 if auth is on and you didn't pass a token)
+curl -sk --max-time 3 https://69.0.0.2:9100/status | head -c 300  # hub (HTTPS self-signed → -k; 401 if auth is on and you didn't pass a token)
 ```
 If lexa-api auth is on (`docs/BENCH.md`), add
-`-H "Authorization: Bearer $(ssh dmitri@69.0.0.1 sudo cat /etc/lexa/api.token)"` to the
+`-H "Authorization: Bearer $(ssh root@69.0.0.2 sudo cat /etc/lexa/api.token)"` to the
 hub curl above; `/healthz` never needs it.
 - Dead sim: `ssh dmitri@<ip> systemctl --user restart <modsim|batsim|metersim|evsim>`
-- Dead hub service: `ssh dmitri@69.0.0.1 'sudo systemctl restart lexa-<svc>'`
+- Dead hub service: `ssh root@69.0.0.2 'sudo systemctl restart lexa-<svc>'`
   (order if everything is down: mosquitto → modbus/ocpp/api → northbound/telemetry → hub)
 
 ## 3. Confirm the chain is closed (in dependency order)
 
 1. Hub is walking gridsim: `journalctl --user -u csip-gridsim -n 5` shows periodic
    `GET ... (peer=<40-char LFDI>)` lines.
-2. Hub sees devices: `curl -s http://69.0.0.1:9100/status` lists solar/battery/meter
+2. Hub sees devices: `curl -sk https://69.0.0.2:9100/status` lists solar/battery/meter
    readings and EV state.
 3. Meter balance closes (linked mode): meter W ≈ load + ev − solar − battery on the
    dashboard's power chart / meter card.

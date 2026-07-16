@@ -118,22 +118,22 @@ desktop units do NOT survive reboot — everything else on the bench does.
 (`/healthz` always stays open). Staged rollout — an unconfigured token is exactly
 today's open behavior, so this never flag-days the bench:
 
-1. `deploy-hub-pi.sh 69.0.0.1 dmitri` (no flag) — deploys the auth-capable code and
+1. `deploy-hub-pi.sh 69.0.0.2 root` (no flag) — deploys the auth-capable code and
    idempotently generates `/etc/lexa/api.token` (0600 lexa:lexa) but leaves
    `api_token_file` unset in `/etc/lexa/api.json` — **auth stays off**.
-2. `scripts/update-sim-pis.sh 69.0.0.1 dmitri` and `scripts/bench-up.sh` relay that
+2. `scripts/update-sim-pis.sh 69.0.0.2 dmitri` and `scripts/bench-up.sh` relay that
    token (over SSH, no local temp file) to the meter Pi
    (`~/.config/lexa/hub-api.token`) and the desktop (same path) and restart
    metersim/the dashboard with `-hub-token-file` pointing at it. Harmless while the
    hub isn't requiring the header yet.
-3. `deploy-hub-pi.sh 69.0.0.1 dmitri --enable-api-auth` — patches `api_token_file`
+3. `deploy-hub-pi.sh 69.0.0.2 root --enable-api-auth` — patches `api_token_file`
    into the installed `api.json` and restarts `lexa-api`. Auth is now enforced.
-4. Verify:
+4. Verify (lexa-api serves HTTPS with a self-signed leaf, WS-B — hence `-k`):
    ```
-   curl -s http://69.0.0.1:9100/status                                              # → 401
-   curl -s -H "Authorization: Bearer $(ssh dmitri@69.0.0.1 sudo cat /etc/lexa/api.token)" \
-        http://69.0.0.1:9100/status | python3 -m json.tool | head                    # → 200
-   curl -s http://69.0.0.1:9100/healthz                                              # → 200, never authenticated
+   curl -sk https://69.0.0.2:9100/status                                            # → 401
+   curl -sk -H "Authorization: Bearer $(ssh root@69.0.0.2 cat /etc/lexa/api.token)" \
+        https://69.0.0.2:9100/status | python3 -m json.tool | head                   # → 200
+   curl -sk https://69.0.0.2:9100/healthz                                           # → 200, never authenticated
    ```
 Rollback: on the hub, clear `api_token_file` in `/etc/lexa/api.json` and
 `systemctl restart lexa-api`. Every consumer already tolerates an unconfigured
@@ -155,27 +155,27 @@ as MTR-4).
 1. Issue the CSMS cert from the bench CA, SAN = the hub's LAN IP (IP SAN is
    required — a hostname-only cert makes evsim's TLS verification refuse the
    connection):
-   `bash scripts/gen-ev-cert.sh 69.0.0.1` (or `make gen-ev-cert IPS=69.0.0.1`)
+   `bash scripts/gen-ev-cert.sh 69.0.0.2` (or `make gen-ev-cert IPS=69.0.0.2`)
    → `certs/ev-server-cert.pem` (commit), `certs/vault/ev-server-key.pem`
    (gitignored, stays local).
-2. `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.1 dmitri --enable-ocpp-sp2`
+2. `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.2 root --enable-ocpp-sp2`
    — stages the cert/key to `/etc/lexa/certs/ocpp-{cert,key}.pem` (0644/0600
    lexa:lexa), idempotently generates `/etc/lexa/ocpp-auth.pass` (0600
    lexa:lexa, `openssl rand -hex 16` — never committed, never leaves the hub
    except via the relay in step 3), and patches `cert_path`/`key_path`/
    `basic_auth_user` (fixed `evse-bench`)/`basic_auth_pass` into
    `/etc/lexa/ocpp.json`. Restarts `lexa-ocpp`.
-3. **Same session**: `bash scripts/update-sim-pis.sh 69.0.0.1 dmitri --enable-ocpp-sp2`
+3. **Same session**: `bash scripts/update-sim-pis.sh 69.0.0.2 dmitri --enable-ocpp-sp2`
    — relays `certs/ca-cert.pem` (public) and the hub's
    `/etc/lexa/ocpp-auth.pass` to ev-pi over SSH (no local temp file, same
    pattern as the lexa-api token relay above) and rewrites evsim's unit to
-   `-csms wss://69.0.0.1:8887/ocpp -tls-ca ~/.config/lexa/ocpp-ca.pem
+   `-csms wss://69.0.0.2:8887/ocpp -tls-ca ~/.config/lexa/ocpp-ca.pem
    -auth-user evse-bench -auth-pass <relayed secret>`. Restarts evsim.
 4. Verify:
    ```
-   ssh dmitri@69.0.0.1 sudo journalctl -u lexa-ocpp -n 20 --no-pager | grep 'TLS enabled'   # → 1 line (server.go:59)
+   ssh root@69.0.0.2 journalctl -u lexa-ocpp -n 20 --no-pager | grep 'TLS enabled'          # → 1 line (server.go:59)
    ssh dmitri@69.0.0.14 journalctl --user -u evsim -n 20 --no-pager | grep 'TLS enabled'     # → 1 line (main.go newWSClient)
-   curl -s http://69.0.0.1:9100/status | python3 -m json.tool | grep -A4 '"cs-001"'          # a TransactionEvent lifecycle still updates lexa/evse/cs-001/state
+   curl -sk https://69.0.0.2:9100/status | python3 -m json.tool | grep -A4 '"cs-001"'         # a TransactionEvent lifecycle still updates lexa/evse/cs-001/state
    ```
    Negative-auth check (evsim with the wrong password must be rejected —
    don't skip this, it's the acceptance criterion): temporarily point a
@@ -194,10 +194,10 @@ as MTR-4).
    ev-profile-reject,ev-accept-but-ignore,ev-min-current-floor,ev-meter-freeze,ev-connector-flap,ev-delayed-obey,ev-wrong-units`
    ×3.
 
-Rollback: `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.1 dmitri`
+Rollback: `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.2 root`
 (no `--enable-ocpp-sp2`) resets `ocpp.json`'s cert/auth fields to `""` (see
 the deploy-gotcha note above) and restarts `lexa-ocpp`; **same session**,
-`bash scripts/update-sim-pis.sh 69.0.0.1 dmitri` (no flag) rewrites evsim back
+`bash scripts/update-sim-pis.sh 69.0.0.2 dmitri` (no flag) rewrites evsim back
 to plain `-csms ws://69.0.0.1:8887/ocpp` — the ExecStart rewrite is a regex
 substitution that strips the `-tls-ca`/`-auth-user`/`-auth-pass` flags
 cleanly in either direction, so this is a clean revert, not a manual edit.
@@ -206,6 +206,16 @@ Backlog: Security Profile 3 (mTLS on the OCPP link) is out of scope — AD-008
 scopes TASK-074 to "≥2"; tracked in `docs/refactor/10_BACKLOG.md`.
 
 ### MQTT broker credentials + ACL (TASK-013, W7/AD-008)
+
+> **Hub-pi (Debian) procedure — does NOT apply to the current Yocto dev-kit hub.**
+> The dev kit at 69.0.0.2 runs a cross-built anonymous-only mosquitto with no
+> `mosquitto_passwd`/ACL support (see the broker note near the top and
+> `lexa-hub/DEVKIT.md`), so this staged rollout does not run there; it is retained for
+> the hub-pi path and a future ACL-capable broker. On that path, **WS-1 made
+> credentials + ACL the DEFAULT** — a plain `deploy-hub-pi.sh` already flips
+> `allow_anonymous false` with `password_file`/`acl_file` installed; `--bench-insecure`
+> opts back out, and the `--enable-mqtt-acl` flag in step 3 below is now a no-op (kept
+> one release). The staged steps below are retained as reference for the hub-pi broker.
 
 Mosquitto (`localhost:1883` on the hub) no longer accepts anonymous clients once
 flipped: each of the six lexa services plus the QA `qa-inject` user
@@ -227,7 +237,7 @@ lexa-api token above:
 4. Verify:
    ```
    ssh dmitri@69.0.0.1 sudo journalctl -u mosquitto -n 50 --no-pager | grep -i 'not authorised'   # want: empty
-   ssh dmitri@69.0.0.1 mosquitto_pub -h localhost -t lexa/control/battery/battery-0 -m '{}'         # want: rejected (no creds)
+   ssh dmitri@69.0.0.1 mosquitto_pub -h localhost -t lexa/desired/battery/battery-0 -m '{}'         # want: rejected (no creds; lexa/control/* was retired in TASK-032)
    ```
 - **qa-inject**: `scripts/mqtt-chaos.sh deploy` provisions this broker user
   (idempotent, `openssl rand -hex 16` → `/etc/lexa/mqtt/qa-inject.pass`,
@@ -261,8 +271,10 @@ lexa-api token above:
 - Admin API (11112), simapi ports, and the dashboard are unauthenticated by design and bind
   0.0.0.0 — fine on this air-gapped LAN, never bridge it. lexa-api (:9100) is the one
   exception: bearer-token auth on `/status`/`/logs` (TASK-014, AD-008) — see the deploy
-  section above; TLS on :9100 is a deferred backlog item, not yet implemented.
+  section above. lexa-api now serves HTTPS on :9100 with a per-device self-signed leaf
+  (WS-B), so probe it with `-k`; a CA-validated / mutual-TLS posture on :9100 is the
+  still-deferred backlog item (there is no CA to validate the leaf against yet).
 - Sanity probes: `curl -s http://<pi>:60xx/state` per sim; dashboard health at
-  `http://69.0.0.20:8080`; hub — `curl -s http://69.0.0.1:9100/status` if auth is off,
-  else add `-H "Authorization: Bearer $(ssh dmitri@69.0.0.1 sudo cat /etc/lexa/api.token)"`;
-  `curl -s http://69.0.0.1:9100/healthz` is always unauthenticated.
+  `http://69.0.0.20:8080`; hub — `curl -sk https://69.0.0.2:9100/status` if auth is off,
+  else add `-H "Authorization: Bearer $(ssh root@69.0.0.2 cat /etc/lexa/api.token)"`;
+  `curl -sk https://69.0.0.2:9100/healthz` is always unauthenticated.
