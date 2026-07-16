@@ -16,7 +16,18 @@ Usage:
     scripts/mayhem.py --list            # show scenario IDs
     scripts/mayhem.py --abort           # stop a run in progress
 
-Exit code: 0 if no FAIL/BLIND, 1 if any FAIL or BLIND, 2 on run/connection error.
+Exit code (audit MAY-1: an unjudged scenario must never look like success):
+    0  run complete, every selected scenario judged, no FAIL/BLIND/INCONCLUSIVE
+    1  any FAIL or BLIND
+    2  run/connection error, incomplete run (finished!=true, aborted, or fewer
+       verdicts than scenarios — e.g. a dashboard restart mid-run), or any
+       INFRA verdict (bench infrastructure broke; results untrustworthy)
+    3  any INCONCLUSIVE (scenario NOT judged — re-run it), unless
+       --allow-inconclusive downgrades that to 0
+
+A SIGTERM (e.g. `timeout`) is handled like Ctrl-C: the run is aborted
+server-side so the bench is restored and the engine is not left stranded
+holding the next run at HTTP 409.
 
 Examples:
     scripts/mayhem.py --dashboard http://69.0.0.20:8080
@@ -25,6 +36,7 @@ Examples:
 """
 import argparse
 import json
+import signal
 import sys
 import time
 import urllib.error
@@ -34,7 +46,7 @@ import urllib.request
 # ANSI colors per verdict (suppressed when stdout is not a TTY).
 COLORS = {
     "PASS": "\033[32m", "DEGRADED": "\033[33m", "FAIL": "\033[31m",
-    "BLIND": "\033[35m", "INCONCLUSIVE": "\033[90m",
+    "BLIND": "\033[35m", "INCONCLUSIVE": "\033[90m", "INFRA": "\033[36m",
 }
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -126,7 +138,7 @@ def cmd_abort(base):
 
 
 def run(base, only, sample_ms, as_json, matrix=False, chaos=False, seed=0, iterations=0,
-        extended=False):
+        extended=False, allow_inconclusive=False):
     # Kick off the run.
     payload = {"sample_ms": sample_ms, "only": only, "matrix": matrix,
                "chaos": chaos, "seed": seed, "iterations": iterations,
@@ -150,13 +162,23 @@ def run(base, only, sample_ms, as_json, matrix=False, chaos=False, seed=0, itera
 
     last_idx = -1
     status = {}
+    poll_failures = 0
     try:
         while True:
             time.sleep(1.5)
             try:
                 status = api(base, "/api/qa/status")
             except urllib.error.URLError:
-                continue  # transient; keep following
+                # Transient blips are normal; a dead dashboard is not — bound
+                # the retry so a killed server can't spin this loop forever.
+                poll_failures += 1
+                if poll_failures >= 40:
+                    print("lost the dashboard for ~60 s — giving up. The run may "
+                          "still be live server-side; clear it with --abort.",
+                          file=sys.stderr)
+                    break
+                continue
+            poll_failures = 0
 
             if not as_json:
                 idx = status.get("idx", 0)
@@ -190,9 +212,41 @@ def run(base, only, sample_ms, as_json, matrix=False, chaos=False, seed=0, itera
     else:
         _print_report(status)
 
+    return _exit_code(status, allow_inconclusive, quiet=as_json)
+
+
+def _exit_code(status, allow_inconclusive, quiet=False):
+    """Map the final status to the exit contract in the module docstring.
+
+    FAIL/BLIND outrank incompleteness (verdicts that DID land are real even in
+    a truncated run — only the scenario↔verdict *pairing* of a truncated live
+    log is unreliable, and this reads the structured findings, not the log).
+    """
     s = status.get("summary") or {}
-    bad = s.get("fail", 0) + s.get("blind", 0)
-    return 1 if bad else 0
+    findings = status.get("findings") or []
+    total = status.get("total", 0)
+
+    if s.get("fail", 0) + s.get("blind", 0):
+        return 1
+
+    # Completeness: the engine sets finished only on a clean, unaborted end
+    # (a restarted dashboard answers the zero value → finished missing), and
+    # every selected scenario must have produced a verdict.
+    complete = status.get("finished") is True and total > 0 and len(findings) >= total
+    if not complete:
+        if not quiet:
+            print(f"\n⚠ RUN DID NOT COMPLETE: finished={status.get('finished')} "
+                  f"verdicts={len(findings)}/{total or '?'} "
+                  f"aborted={status.get('aborted', False)} — nothing above is a "
+                  f"clean-suite signal; re-run.", file=sys.stderr)
+        return 2
+
+    if s.get("infra", 0):
+        return 2
+
+    if s.get("inconclusive", 0) and not allow_inconclusive:
+        return 3
+    return 0
 
 
 _seen_findings = set()
@@ -216,17 +270,30 @@ def _print_report(status):
     state = "aborted" if status.get("aborted") else ("FAILED: " + status["last_error"]) if status.get("last_error") else "complete"
     print(f"Run {state}. Bench restored.")
     print("=" * 78)
-    print(
+    line = (
         f"{c('PASS', COLORS['PASS'])} {s.get('pass',0)}   "
         f"{c('DEGRADED', COLORS['DEGRADED'])} {s.get('degraded',0)}   "
         f"{c('FAIL', COLORS['FAIL'])} {s.get('fail',0)}   "
         f"{c('BLIND', COLORS['BLIND'])} {s.get('blind',0)}   "
         f"{c('INCONCLUSIVE', COLORS['INCONCLUSIVE'])} {s.get('inconclusive',0)}"
     )
+    if s.get("infra"):
+        line += f"   {c('INFRA', COLORS['INFRA'])} {s['infra']}"
+    print(line)
     print(f"Worst breach: {s.get('worst_peak_breach_W',0):.0f} W   "
           f"Total time out of limit: {s.get('total_breach_seconds',0):.0f} s")
     if status.get("report_path"):
         print(f"Full markdown report on the dashboard host: {status['report_path']}")
+
+    # An INCONCLUSIVE scenario was NOT judged — surface that loudly instead of
+    # letting it blend into a green-looking tally (audit MAY-1: this exact
+    # blend-in enabled a false "15/15 PASS" hand-off).
+    not_judged = [f for f in findings
+                  if f.get("verdict") in ("INCONCLUSIVE", "INFRA")]
+    if not_judged:
+        print(f"\n⚠ {len(not_judged)} scenario(s) were NOT judged — re-run these:")
+        for f in not_judged:
+            print(f"    {f.get('id',''):28s} [{f.get('verdict')}] {f.get('headline','')}")
 
     for f in findings:
         m = f.get("metrics", {})
@@ -267,7 +334,17 @@ def main():
                          "in a default/full run — nightly / release-gate campaigns only (RSK-12); "
                          "day-to-day FAST campaigns should omit this. Ignored with --only (an explicit "
                          "--only id already runs regardless of Extended).")
+    ap.add_argument("--allow-inconclusive", action="store_true",
+                    help="exit 0 despite INCONCLUSIVE verdicts (deliberately skipped "
+                         "preconditions only — an INCONCLUSIVE scenario was NOT judged)")
     args = ap.parse_args()
+
+    # `timeout`/systemd send SIGTERM; treat it like Ctrl-C so the server-side
+    # run is aborted and the bench restored (a stranded engine 409s the next
+    # run — audit DASH-3).
+    def _sigterm(_sig, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _sigterm)
 
     if args.list:
         return cmd_list(args.dashboard)
@@ -287,7 +364,8 @@ def main():
                 return 2
 
     return run(args.dashboard, only, args.sample_ms, args.json,
-               args.matrix, args.chaos, args.seed, args.iterations, args.extended)
+               args.matrix, args.chaos, args.seed, args.iterations, args.extended,
+               args.allow_inconclusive)
 
 
 if __name__ == "__main__":
