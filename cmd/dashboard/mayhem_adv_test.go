@@ -323,6 +323,28 @@ func TestDiagnosePFVarMeasuredConvergence_FailOnAdopted(t *testing.T) {
 	}
 }
 
+// TestDiagnosePFVarMeasuredConvergence_EnergizePremiseActionable verifies the
+// axis-mismatch INCONCLUSIVE carries the actionable premise diagnosis when the
+// reconciler is stably adopted on "energize" — the signature of cmd/hub's live
+// WP-9 adv author overwriting the scenario's synthetic fixed_pf injection. The
+// verdict stays INCONCLUSIVE (honest — the fault was never judged), but the run
+// is now actionable (advanced_der="off" bench profile) instead of reading as
+// flakiness.
+func TestDiagnosePFVarMeasuredConvergence_EnergizePremiseActionable(t *testing.T) {
+	s := mkSamples(85, func(i int, smp *maySample) {})
+	rep := advReportMsg{Axis: "energize", AdoptState: "adopted"}
+	f := diagnosePFVarMeasuredConvergence(scFor("pf-var-measured-convergence"), s, 0.9, true, rep, nil, false, 0, 0, false, 0, 0)
+	if f.Verdict != "INCONCLUSIVE" {
+		t.Fatalf("verdict = %s, want INCONCLUSIVE when the reconciler is on the hub-authored energize axis (%s)", f.Verdict, f.Headline)
+	}
+	if len(f.Diagnosis) == 0 || !containsFold(f.Diagnosis[0], "WP-9 adv author") {
+		t.Errorf("diagnosis = %v, want it to name the live WP-9 adv author premise conflict", f.Diagnosis)
+	}
+	if !containsFold(strings.Join(f.Diagnosis, " "), "advanced_der") {
+		t.Errorf("diagnosis = %v, want it to name the advanced_der=off remediation", f.Diagnosis)
+	}
+}
+
 func TestDiagnosePFVarMeasuredConvergence_DegradedOnInconsistentMetric(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
 	rep := advReportMsg{Axis: "fixed_pf", AdoptState: "diverged"}
