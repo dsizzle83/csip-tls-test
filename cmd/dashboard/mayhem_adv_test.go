@@ -434,6 +434,27 @@ func TestDiagnoseAusLoadCap_Fail_SustainedBreach(t *testing.T) {
 	}
 }
 
+// TestDiagnoseAusLoadCap_Pass_CannotComplyUnmeetable: a load cap can be
+// genuinely unmeetable when irreducible home load alone exceeds it (no lever
+// sheds baseload). A correct CannotComply there is the standards-correct outcome
+// — the scenario's Expected says so ("a legitimate, correct outcome... not just
+// an acceptable one") — so it PASSes, unlike the SILENT sustained breach above
+// (FAIL) and unlike a GENERATION cap, where CannotComply IS a shortfall because
+// PV is always curtailable (TestDiagnoseAusGenCap_Degraded_CannotComplyReported).
+func TestDiagnoseAusLoadCap_Pass_CannotComplyUnmeetable(t *testing.T) {
+	s := mkSamples(85, func(i int, smp *maySample) {
+		smp.SolarW, smp.SolarPossibleW = 300, 300
+		smp.RealGridW = 6000 // gross load ~6300W, unmeetable under the 3000W cap
+		smp.BatterySimOK, smp.BatterySimW = true, 0
+		smp.Decisions = []string{"[csip-aus/load-limit] gross load cap 3000W…"}
+		smp.CannotComply = true
+	})
+	f := diagnoseAusLoadCap(scFor("aus-load-cap"), ausConsLoad(), s)
+	if f.Verdict != "PASS" {
+		t.Fatalf("verdict = %s, want PASS when the hub admits a genuinely-unmeetable load cap via CannotComply (%s)", f.Verdict, f.Headline)
+	}
+}
+
 func TestAusGrossGenW_BlindWithoutSolar(t *testing.T) {
 	s := maySample{SolarOK: false}
 	if _, ok := ausGrossGenW(s); ok {

@@ -1115,7 +1115,14 @@ func ausGrossLoadW(smp maySample) (float64, bool) {
 // only know the legacy exportCap/importCap/genLimit vocabulary — see
 // activeConstraint.Typ's doc comment; gen_aus/load_aus are custom cons.Typ
 // values this suite never asks breachOver to interpret).
-func diagnoseAusCap(sc *mayScenario, s []maySample, rule, label string, limW float64, grossOf func(maySample) (float64, bool)) mayFinding {
+// cannotComplyLegit distinguishes the two AUS cap families. A GENERATION cap is
+// always satisfiable by curtailing PV to zero, so a sustained breach the hub can
+// only ADMIT (CannotComply) rather than resolve is a genuine shortfall → DEGRADED.
+// A LOAD cap can be irreducibly unmeetable when home load alone exceeds it (no
+// lever sheds baseload), so a correct CannotComply there is the standards-correct
+// outcome, not a shortfall → PASS (the scenario's own Expected says so). A SILENT
+// breach (no CannotComply) is a FAIL for both — that invariant is unchanged.
+func diagnoseAusCap(sc *mayScenario, s []maySample, rule, label string, limW float64, grossOf func(maySample) (float64, bool), cannotComplyLegit bool) mayFinding {
 	f := baseFinding(sc)
 	if len(s) == 0 {
 		f.Verdict = "INCONCLUSIVE"
@@ -1190,10 +1197,18 @@ func diagnoseAusCap(sc *mayScenario, s []maySample, rule, label string, limW flo
 	case sawTail && tailClean:
 		f.Verdict = "PASS"
 		f.Headline = fmt.Sprintf("%s breached briefly (peak +%.0fW) then converged and held under the %.0fW cap", label, peak, limW)
+	case reportedCannot && cannotComplyLegit:
+		// Load cap with irreducible baseload above it: CannotComply IS the
+		// correct outcome (this scenario's Expected + checkAusLoadConvergence's
+		// doc), not a shortfall. The hub pulled its sheddable levers and, unable
+		// to fully comply, admitted it honestly rather than faking compliance.
+		f.Verdict = "PASS"
+		f.Headline = fmt.Sprintf("%s exceeded the %.0fW cap by more than the sheddable levers can remove; hub correctly admitted CannotComply", label, limW)
+		f.Diagnosis = []string{"A load cap can be genuinely unmeetable when irreducible home load alone exceeds it — CannotComply is the standards-correct admission here (the scenario's Expected / checkAusLoadConvergence's doc), NOT a control failure. The hub posted an honest CannotComply for the active mRID rather than silently reporting compliance."}
 	case reportedCannot:
 		f.Verdict = "DEGRADED"
 		f.Headline = fmt.Sprintf("%s did not converge under the %.0fW cap; hub reported CannotComply", label, limW)
-		f.Diagnosis = []string{"The hub admitted it could not meet the CSIP-AUS limit rather than silently reporting compliance — correct fault-handling posture, but the site did not actually converge within this window."}
+		f.Diagnosis = []string{"The hub admitted it could not meet the CSIP-AUS limit rather than silently reporting compliance — correct fault-handling posture, but a generation cap is always satisfiable by curtailing PV, so a sustained non-convergence here is a real shortfall the hub could only admit, not resolve."}
 	default:
 		f.Verdict = "FAIL"
 		f.Headline = fmt.Sprintf("%s stayed over the %.0fW CSIP-AUS cap (peak +%.0fW) with no CannotComply admission", label, limW, peak)
@@ -1203,11 +1218,11 @@ func diagnoseAusCap(sc *mayScenario, s []maySample, rule, label string, limW flo
 }
 
 func diagnoseAusGenCap(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
-	return diagnoseAusCap(sc, s, "csip-aus/gen-limit", "gross generation (solar + battery discharge)", ausGenCapLimW, ausGrossGenW)
+	return diagnoseAusCap(sc, s, "csip-aus/gen-limit", "gross generation (solar + battery discharge)", ausGenCapLimW, ausGrossGenW, false)
 }
 
 func diagnoseAusLoadCap(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
-	return diagnoseAusCap(sc, s, "csip-aus/load-limit", "gross load (solar + battery discharge + net import)", ausLoadCapLimW, ausGrossLoadW)
+	return diagnoseAusCap(sc, s, "csip-aus/load-limit", "gross load (solar + battery discharge + net import)", ausLoadCapLimW, ausGrossLoadW, true)
 }
 
 func ausLoadCapScenario() *mayScenario {
