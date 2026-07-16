@@ -148,7 +148,7 @@ func netPartitionScenario() *mayScenario {
 			}
 			// Sever only AFTER the cap is adopted (else it never adopts). Self-heal
 			// margin past teardown so the fast path (teardown) always wins first.
-			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
+			d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() {
 				if err := d.partitionApply(netemDesktopIP, gridsimNorthboundPort, holdS); err != nil {
 					log.Printf("mayhem: net-partition-gridsim: partitionApply: %v", err)
 				}
@@ -182,7 +182,7 @@ func netDNSFailScenario() *mayScenario {
 			if err != nil {
 				return nil, err
 			}
-			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
+			d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() {
 				if err := d.dnsFailApply(holdS); err != nil {
 					log.Printf("mayhem: net-dns-fail: dnsFailApply: %v", err)
 				}

@@ -251,6 +251,27 @@ type activeConstraint struct {
 	MRID string
 }
 
+// adoptedMatches reports whether a hub-adopted control (identified by its
+// type + MRID) is THIS scenario's own cap. The rule rejects adoption ONLY when
+// the observed control carries a DIFFERENT, non-empty MRID than this scenario's
+// — the exact signature of cross-run contamination: a leftover same-type cap
+// from a PRIOR scenario, still retained on lexa/csip/control across the run
+// boundary, whose own MRID (always populated for an active control, mayhem.go
+// s.AdoptedMRID = hub.ctrlMRID) proves it is not ours. That is what let
+// csip-event-delay/malform-huge race and cross-contaminate (audit Finding D).
+//
+// When THIS scenario has no MRID (openadr-driven limits, world-scripted caps,
+// connect) OR the observed control reports no MRID (a degenerate/pre-MRID
+// control), there is no identity to distinguish on, so we fall back to the
+// legacy type match. This is deliberately narrow: it never manufactures a
+// false negative from a missing identifier, only from a mismatched one.
+func (c *activeConstraint) adoptedMatches(typ, mrid string) bool {
+	if c.MRID != "" && mrid != "" {
+		return mrid == c.MRID
+	}
+	return typ == c.Typ
+}
+
 // mayScenario is one adversarial test: arm the fault(s), hold while sampling,
 // tear the fault down, then diagnose. perTick (optional) re-applies a fault that
 // must persist or evolve across the hold (injected PV, a lurching clock).
@@ -749,18 +770,27 @@ func (d *mayhemDriver) armAfterAdoption(pollEvery, maxWait time.Duration, fn fun
 	}()
 }
 
-// armAfterCapAdopted is armAfterAdoption narrowed to a SPECIFIC control: it
-// fires fn only once the hub is enforcing exactly (typ, limW) — not merely
-// "some control is active". This matters whenever the bench default
-// (program-0 DefaultDERControl, a 5 kW export cap) is present: hubState()
-// reports ctrlActive=true for the default from the outset, so a plain
-// armAfterAdoption fires before the scenario's own event cap is adopted. At
-// STOCK (20 s discovery) that window is wide enough that a malform served
-// then is held against the DEFAULT (→ ~4400 W) instead of the intended 0 W
-// event, a false FAIL — the hub is provably correct once the event itself is
-// last-known-good (manual STOCK hold-proof, 2026-07-10). Same maxWait
-// fallback and scenario-context guard as armAfterAdoption.
-func (d *mayhemDriver) armAfterCapAdopted(typ string, limW float64, pollEvery, maxWait time.Duration, fn func()) {
+// armAfterCapAdopted is armAfterAdoption narrowed to THIS scenario's SPECIFIC
+// control: it fires fn only once the hub is enforcing the cap identified by
+// cons — matched by MRID when cons carries one (identity-exact, so a leftover
+// same-type cap from a prior scenario cannot satisfy the gate; audit Finding
+// D), else by type. This matters whenever the bench default (program-0
+// DefaultDERControl, a 5 kW export cap) is present: hubState() reports
+// ctrlActive=true for the default from the outset, so a plain armAfterAdoption
+// fires before the scenario's own event cap is adopted. At STOCK (20 s
+// discovery) that window is wide enough that a malform served then is held
+// against the DEFAULT (→ ~4400 W) instead of the intended 0 W event, a false
+// FAIL — the hub is provably correct once the event itself is last-known-good
+// (manual STOCK hold-proof, 2026-07-10).
+//
+// maxWait fallback: if the cap is NEVER adopted within maxWait, fn is NOT
+// fired. Injecting the scenario's fault against a premise that never held
+// (no cap adopted) tests nothing and manufactures a false FAIL — e.g. cutting
+// the network to prove "holds last-known-good" when there is no known-good cap
+// to hold. The scenario instead samples an un-adopted hub, scanSamples reports
+// HubAdopted=false (no MRID match), and the diagnoser's !HubAdopted guard marks
+// it INCONCLUSIVE — the honest verdict when the premise could not be set up.
+func (d *mayhemDriver) armAfterCapAdopted(cons *activeConstraint, pollEvery, maxWait time.Duration, fn func()) {
 	d.mu.Lock()
 	ctx := d.scenarioCtx
 	d.mu.Unlock()
@@ -776,13 +806,13 @@ func (d *mayhemDriver) armAfterCapAdopted(typ string, limW float64, pollEvery, m
 			case <-ctx.Done():
 				return
 			case <-deadline:
-				if ctx.Err() == nil {
-					fn()
-				}
+				// Premise never established — do NOT inject the fault.
+				log.Printf("mayhem: armAfterCapAdopted timed out after %s waiting for cap %s (%s) adoption; skipping fault injection → scenario will read INCONCLUSIVE",
+					maxWait, cons.MRID, cons.Typ)
 				return
 			case <-tick.C:
 				h := d.hubState()
-				if h.ctrlActive && h.ctrlTyp == typ && h.ctrlLimW == limW {
+				if h.ctrlActive && cons.adoptedMatches(h.ctrlTyp, h.ctrlMRID) {
 					if ctx.Err() == nil {
 						fn()
 					}
@@ -1023,7 +1053,7 @@ func scanSamples(cons *activeConstraint, s []maySample) mayMetrics {
 		if !smp.GridOK {
 			m.SampleErrors++
 		}
-		if smp.HubAdopted && smp.AdoptedTyp == cons.Typ {
+		if smp.HubAdopted && cons.adoptedMatches(smp.AdoptedTyp, smp.AdoptedMRID) {
 			adopted++
 		}
 		if smp.CannotComply {
@@ -1583,7 +1613,7 @@ func malformScenario(id, name, kind, hypothesis string) *mayScenario {
 			// armAfterCapAdopted). At STOCK that distinction is the difference
 			// between the hub holding the intended 0 W event under the malform
 			// (PASS) and holding the 5 kW default (false FAIL).
-			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
+			d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() {
 				_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": kind})
 			})
 			return cons, nil
@@ -2974,7 +3004,7 @@ func (d *mayhemDriver) scenarios() []*mayScenario {
 				}
 				// Serve garbage only after the hub adopts THIS 0 W event cap (not
 				// the bench default — see armAfterCapAdopted).
-				d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
+				d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() {
 					_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "dup_mrid"})
 				})
 				return cons, nil

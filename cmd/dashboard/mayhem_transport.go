@@ -83,7 +83,7 @@ func modbusTransportScenario(id, name, hypothesis, expected, faultLabel, fix str
 			if err != nil {
 				return nil, err
 			}
-			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() { arm(d) })
+			d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() { arm(d) })
 			return cons, nil
 		},
 		perTick: func(d *mayhemDriver, i int) {
@@ -239,7 +239,7 @@ func negativeExportLimitScenario() *mayScenario {
 				return nil, err
 			}
 			// Once the CLEAN cap is adopted, mutate the served opModExpLimW negative.
-			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
+			d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() {
 				_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "negative_activepower"})
 			})
 			// Judge safety + survival + document adoption, NOT compliance against a
@@ -343,7 +343,7 @@ func saturatingWriteScenario() *mayScenario {
 			// After the hard 0-cap has driven a low ceiling write, flip the served
 			// limit to the absurd 32767e9 W value — the hub must saturate the write
 			// toward 100%, not wrap the int16.
-			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
+			d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() {
 				_ = d.post("gridsim", "/admin/malform", map[string]any{"kind": "huge_activepower"})
 			})
 			return cons, nil

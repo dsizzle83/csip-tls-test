@@ -756,7 +756,7 @@ func redirectScenario(id, name, hypothesis, expected string, count int) *mayScen
 			if err != nil {
 				return nil, err
 			}
-			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
+			d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() {
 				_ = d.post("gridsim", "/admin/redirect", map[string]any{"path": "/dcap", "code": 302, "count": count})
 			})
 			return cons, nil

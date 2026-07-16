@@ -165,7 +165,7 @@ func certRotationFailClosedScenario() *mayScenario {
 			// Only write the sentinel once the cap is adopted, so any (unexpected)
 			// disruption to control is attributable to the rotation attempt, not to
 			// a not-yet-adopted cap.
-			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() {
+			d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() {
 				if err := d.hubSSH(writeRotationSentinelCommand(certRotateSentinelPath, mayhemStagedBadCert)); err != nil {
 					log.Printf("mayhem: cert-rotation-failclosed: write sentinel: %v", err)
 				}

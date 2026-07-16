@@ -70,6 +70,39 @@ func TestDiagnoseConstraint_AdoptedNoReaction(t *testing.T) {
 	assertDiag(t, f, "no effective correction")
 }
 
+// TestScanSamples_IdentityExactAdoption is the Q2/Finding-D regression: a
+// hub-adopted control of the SAME type but a DIFFERENT non-empty MRID is a
+// leftover cap from a prior scenario, retained across the run boundary — it
+// must NOT be credited as adoption of THIS scenario's cap. An absent sample
+// MRID (synthetic/pre-MRID) falls back to type-match; an equal MRID counts.
+func TestScanSamples_IdentityExactAdoption(t *testing.T) {
+	cons := exportCons() // MRID "M-abc123def456"
+
+	// (a) leftover cap: same type, DIFFERENT non-empty MRID → not our adoption.
+	stale := mkSamples(10, func(i int, s *maySample) {
+		s.HubAdopted, s.AdoptedTyp, s.AdoptedMRID = true, "exportCap", "M-STALE-prior-run"
+	})
+	if m := scanSamples(cons, stale); m.HubAdopted {
+		t.Error("a same-type but different-MRID (leftover) cap was credited as this scenario's adoption — cross-run contamination (Finding D)")
+	}
+
+	// (b) our cap: same type, SAME MRID → adopted.
+	ours := mkSamples(10, func(i int, s *maySample) {
+		s.HubAdopted, s.AdoptedTyp, s.AdoptedMRID = true, "exportCap", cons.MRID
+	})
+	if m := scanSamples(cons, ours); !m.HubAdopted {
+		t.Error("the scenario's own cap (matching MRID) was not credited as adopted")
+	}
+
+	// (c) backward-compat: adoption reported with no MRID → fall back to type.
+	noMRID := mkSamples(10, func(i int, s *maySample) {
+		s.HubAdopted, s.AdoptedTyp = true, "exportCap"
+	})
+	if m := scanSamples(cons, noMRID); !m.HubAdopted {
+		t.Error("an adoption sample with no MRID must fall back to type-match, not manufacture a false negative")
+	}
+}
+
 func TestDiagnoseConstraint_CannotComplyOutranksNoReaction(t *testing.T) {
 	// Battery-empty import cap: no correction is physically possible (reacted
 	// false), but the hub posted CannotComply. Admitting the limit must win over

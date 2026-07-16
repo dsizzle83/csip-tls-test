@@ -466,7 +466,7 @@ func edgeFaultScenario(id, name, hypothesis, expected string, arm, clear func(*m
 			if err != nil {
 				return nil, err
 			}
-			d.armAfterCapAdopted(cons.Typ, cons.LimW, 2*time.Second, 60*time.Second, func() { arm(d) })
+			d.armAfterCapAdopted(cons, 2*time.Second, 60*time.Second, func() { arm(d) })
 			return cons, nil
 		},
 		perTick:  func(d *mayhemDriver, i int) { d.injectEnv(d.pvHighW, 250) },
