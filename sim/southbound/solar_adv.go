@@ -146,6 +146,18 @@ func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (
 		adv.Curves = append(adv.Curves, cb)
 	}
 	adv.End = cursor + 1
+
+	// SF write-protection (protect.go), derived from the layouts themselves so
+	// the set never drifts from the models served. Curve-model SFs live in the
+	// header layouts only. This is what turns the hub's E1 write-back (an
+	// all-0x8000 whole-block 704 RMW under nan_sentinel) from silent permanent
+	// poisoning into an observable divergence.
+	protectLayoutSFs(r, adv.M701, sunspec.L701)
+	protectLayoutSFs(r, adv.M702, sunspec.L702)
+	protectLayoutSFs(r, adv.M704, sunspec.L704)
+	for _, cb := range adv.Curves {
+		protectLayoutSFs(r, cb.base, cb.hdr)
+	}
 	return adv, cursor
 }
 

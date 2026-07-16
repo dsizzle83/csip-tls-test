@@ -264,6 +264,13 @@ type RegisterMap struct {
 	unitIDConfusion bool   // FaultUnitIDConfusion: reads answer wrong-slave (0x0B)
 	tearing         bool   // FaultRegisterTearing: multi-register reads are torn
 	tearCtr         uint64 // rolling counter so a torn value differs read-to-read
+
+	// Write-protection (guarded by mu) — see protect.go. protected registers
+	// (the SunSpec scale-factor cells, read-only on a real device) are masked
+	// out of Modbus WRITES; sim-internal Set is unrestricted. protectedRejects
+	// counts value-changing masked cells (surfaced on /state).
+	protected        map[uint16]bool
+	protectedRejects uint64
 }
 
 // Get returns the value of a holding register (0-based Modbus address).
@@ -299,16 +306,23 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 		cb := r.OnWrite
 		r.mu.Unlock()
 
+		// Mask write-protected cells (scale factors — read-only on a real
+		// device) BEFORE the interceptor sees the write, so the direct-apply
+		// path and every fault interceptor (which applies values itself via
+		// Set) honour the protection uniformly. The rest of the write lands
+		// and the transaction still ACKs. See protect.go.
+		args := r.maskProtected(req.Addr, req.Args)
+
 		// Default path (no interceptor): apply the write verbatim. With an
 		// interceptor, let it decide whether the values land now — but always
 		// return success below, so the client sees a protocol-level ACK.
 		apply := true
 		if intercept != nil {
-			apply = intercept(req.Addr, req.Args)
+			apply = intercept(req.Addr, args)
 		}
 		if apply {
 			r.mu.Lock()
-			for i, v := range req.Args {
+			for i, v := range args {
 				r.regs[req.Addr+uint16(i)] = v
 			}
 			r.mu.Unlock()

@@ -33,8 +33,10 @@ import (
 )
 
 // SolarBases holds the first data-register address of each model block
-// so that Snapshot and Inject can locate registers without re-scanning.
+// so that Snapshot, Inject, and the SF write-protection (protect.go) can
+// locate registers without re-scanning.
 type SolarBases struct {
+	M120Base uint16 // Model 120 (Nameplate) data start
 	M121Base uint16 // Model 121 (Basic Settings) data start
 	M122Base uint16 // Model 122 (Extended Measurements) data start
 	M103Base uint16 // Model 103 (Three-Phase Inverter) data start
@@ -204,6 +206,12 @@ type SolarState struct {
 		Conn           int     `json:"Conn"`
 	} `json:"controls"`
 
+	// SFWriteRejects counts Modbus write cells that tried to CHANGE a
+	// write-protected scale-factor register and were masked (protect.go).
+	// Nonzero means something wrote over SF cells — the observable trace of
+	// the E1 write-back-poisoning vector.
+	SFWriteRejects uint64 `json:"sf_write_rejects"`
+
 	// Advanced is the 7xx (IEEE 1547-2018) ground truth, present only on an
 	// advanced sim. Nil on a legacy sim, so /state is unchanged there.
 	Advanced *SolarAdvancedState `json:"advanced,omitempty"`
@@ -253,6 +261,8 @@ func (ss *SolarServer) Snapshot() SolarState {
 	c.WMaxLimPct_pct = signed(b.M123Base+sunspec.M123_WMaxLimPct, b.M123Base+sunspec.M123_WMaxLimPct_SF) / 100.0
 	c.WMaxLimPctEna = int(r.Get(b.M123Base + sunspec.M123_WMaxLimPct_Ena))
 	c.Conn = int(r.Get(b.M123Base + sunspec.M123_Conn))
+
+	st.SFWriteRejects = r.ProtectedRejects()
 
 	if ss.advanced {
 		st.Advanced = ss.advSnapshot()
@@ -506,12 +516,18 @@ func populateSolarCore(r *RegisterMap, wmaxW float64) (SolarBases, uint16) {
 	r.Set(m123Base+sunspec.M123_Conn, 1)
 	cursor += 2 + m123Len
 
-	return SolarBases{
+	bases := SolarBases{
+		M120Base: m120,
 		M121Base: m121Base,
 		M122Base: m122Base,
 		M103Base: m103Base,
 		M123Base: m123Base,
-	}, cursor
+	}
+	// SF registers are read-only on a real device: mask Modbus writes to them
+	// so a bad hub write-back is an observable divergence, not silent
+	// corruption (audit E1; see protect.go).
+	protectSolarLegacySFs(r, bases)
+	return bases, cursor
 }
 
 // ── animation ─────────────────────────────────────────────────────────────────

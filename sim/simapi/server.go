@@ -247,19 +247,31 @@ func (s *Server) broadcastLoop(interval time.Duration) {
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for range tick.C {
-		b, err := json.Marshal(s.stateFn())
-		if err != nil {
-			continue
-		}
-		s.mu.Lock()
-		for ch := range s.clients {
-			select {
-			case ch <- b:
-			default: // skip slow consumer; it will catch up on the next tick
-			}
-		}
-		s.mu.Unlock()
+		s.broadcastOnce()
 	}
+}
+
+// broadcastOnce encodes the current state and fans it out to the connected
+// WebSocket clients. A marshal failure degrades through the same sanitizing
+// pass as writeJSON — never a silent skip, which left the WS feed permanently
+// mute while the register bank stayed poisoned (audit E1).
+func (s *Server) broadcastOnce() {
+	v := s.stateFn()
+	b, err := json.Marshal(v)
+	if err != nil {
+		logSanitizeOnce("ws broadcast", v, err)
+		if b, err = json.Marshal(SanitizeNonFinite(v)); err != nil {
+			return
+		}
+	}
+	s.mu.Lock()
+	for ch := range s.clients {
+		select {
+		case ch <- b:
+		default: // skip slow consumer; it will catch up on the next tick
+		}
+	}
+	s.mu.Unlock()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -267,8 +279,16 @@ func (s *Server) broadcastLoop(interval time.Duration) {
 func writeJSON(w http.ResponseWriter, v any) {
 	b, err := json.Marshal(v)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		// Degrade, never 500: /state is QA's ground-truth window into a
+		// corrupted simulator (audit E1 — a poisoned register bank decodes to
+		// NaN), so non-finite floats become null fields instead of an error
+		// page. Logged once per payload type; the 500 remains only for the
+		// can't-happen case of the sanitized copy failing too.
+		logSanitizeOnce("writeJSON", v, err)
+		if b, err = json.Marshal(SanitizeNonFinite(v)); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(b)
