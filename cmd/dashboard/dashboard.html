@@ -991,6 +991,7 @@ a { color: #60a5fa; }
           <li><b style="color:#f87171;">FAIL</b> — breached and the hub mishandled it. The diagnosis says which link broke: never adopted the event, adopted but issued no correction, or commanded a correction that silently never took effect (the closed-loop gap).</li>
           <li><b style="color:#e879f9;">BLIND</b> — the most dangerous: the hub's own grid view diverged from the real meter, or its sensor froze, so the breach was <i>invisible to the controller</i>. It can't fix what it can't see.</li>
           <li><b style="color:#94a3b8;">INCONCLUSIVE</b> — couldn't judge (meter unreachable, fault didn't arm). Itself a gap — fix and re-run.</li>
+          <li><b style="color:#38bdf8;">INFRA</b> — the bench itself broke (a sim dead at the health probe). A test-infrastructure fault, never a hub verdict — restore the bench and re-run.</li>
         </ul>
         <p style="margin:4px 0;"><b>Metrics</b> on each finding: <b>peak breach</b> (W past the cap), <b>breach seconds</b> (time out of limit), <b>adopted/reacted/cannot-comply/blind</b> (the chain booleans), and <b>sample errors</b> (reads that failed). The <b>live readout</b> shows the real meter vs. the hub's belief side by side — when they diverge, the hub is flying blind in real time.</p>
         <p style="margin:4px 0;">Triage order: fix <b>BLIND</b> first (safety/observability), then <b>FAIL</b> by category, then re-run the <b>perfect storm</b> — compound failures often hide ordering bugs the single-fault runs miss.</p>
@@ -3209,7 +3210,7 @@ const QA_SCENARIOS = [
   ['clock-jitter', 'CSIP clock corrections jitter while a cap is active', 'Time integrity'],
   ['perfect-storm', 'Perfect storm — everything at once', 'Combined worst case'],
 ];
-const QA_COLORS = { PASS:'#34d399', DEGRADED:'#fbbf24', FAIL:'#f87171', BLIND:'#e879f9', INCONCLUSIVE:'#94a3b8' };
+const QA_COLORS = { PASS:'#34d399', DEGRADED:'#fbbf24', FAIL:'#f87171', BLIND:'#e879f9', INCONCLUSIVE:'#94a3b8', INFRA:'#38bdf8' };
 let qaPoll = null, qaBuilt = false;
 
 function qaInit() {

@@ -170,11 +170,16 @@ type mayFinding struct {
 }
 
 type maySummary struct {
-	Pass         int     `json:"pass"`
-	Degraded     int     `json:"degraded"`
-	Fail         int     `json:"fail"`
-	Blind        int     `json:"blind"`
-	Inconclusive int     `json:"inconclusive"`
+	Pass         int `json:"pass"`
+	Degraded     int `json:"degraded"`
+	Fail         int `json:"fail"`
+	Blind        int `json:"blind"`
+	Inconclusive int `json:"inconclusive"`
+	// Infra counts scenarios whose bench infrastructure (a sim, gridsim) was
+	// dead at the pre-scenario probe or died during the hold — a test-bench
+	// fault, never a hub verdict (audit MAY-6, hardening plan Q8). mayhem.py
+	// exits 2 on any INFRA: the run is untrustworthy, not failing.
+	Infra        int     `json:"infra"`
 	TotalBreachS float64 `json:"total_breach_seconds"`
 	WorstPeakW   float64 `json:"worst_peak_breach_W"`
 }
@@ -495,6 +500,29 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 		// Isolate each scenario from the previous one's device/fault state.
 		d.resetForScenario()
 
+		// A scenario judged against a dead sim produces a spurious hub verdict
+		// in either direction — the modsim HTTP-500 class turned sim deaths
+		// into fake hub FAILs/BLINDs for a whole soak batch (audit MAY-6).
+		// Gate each scenario on a bench health probe and report infrastructure
+		// death as INFRA, a bench fault distinct from every hub verdict. The
+		// probe runs OUTSIDE the fault window (resetForScenario just cleared
+		// faults; the post-hold probe below runs after teardown) so injected
+		// faults cannot trip it.
+		if bad := d.benchUnhealthy(); bad != "" {
+			d.appendFinding(mayFinding{
+				ID: sc.ID, Name: sc.Name, Category: sc.Category,
+				Hypothesis: sc.Hypothesis, Expected: sc.Expected,
+				Verdict:  "INFRA",
+				Headline: "bench infrastructure unhealthy — scenario not run",
+				Diagnosis: []string{
+					"Pre-scenario health probe failed: " + bad + ".",
+					"Test-bench fault, not a hub verdict — restore the sim(s) and re-run.",
+				},
+				Fix: sc.Fix,
+			})
+			continue
+		}
+
 		// scenCtx bounds THIS scenario's delayed-fault goroutines (d.afterDelay) —
 		// canceled below the instant the hold ends, before teardown runs, so a
 		// fault goroutine still waiting on its timer bails out instead of firing
@@ -570,6 +598,20 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 				elapsed, sc.HoldS, len(samples))}, f.Diagnosis...)
 		}
 		f = applySafetyAudit(f, cons, samples)
+		// A sim that died during the hold invalidates the verdict in BOTH
+		// directions: a PASS may mean "there was never anything to curtail"
+		// and a FAIL may be sim-induced. Teardown has already run, so a
+		// still-dead backend here is a genuine mid-scenario death, not an
+		// injected fault (audit MAY-6 / finding E's spurious-FAIL class).
+		if ctx.Err() == nil {
+			if bad := d.benchUnhealthy(); bad != "" {
+				orig := f.Verdict
+				f.Verdict = "INFRA"
+				f.Headline = fmt.Sprintf("bench broke during the scenario — %s verdict untrustworthy: %s", orig, f.Headline)
+				f.Diagnosis = append(f.Diagnosis,
+					"Post-scenario health probe failed: "+bad+". A sim died mid-scenario, so neither a PASS nor a FAIL says anything about the hub — restore the bench and re-run this scenario.")
+			}
+		}
 		d.appendFinding(f)
 
 		if ctx.Err() != nil {
@@ -2233,6 +2275,8 @@ func (d *mayhemDriver) appendFinding(f mayFinding) {
 		d.status.Summary.Fail++
 	case "BLIND":
 		d.status.Summary.Blind++
+	case "INFRA":
+		d.status.Summary.Infra++
 	default:
 		d.status.Summary.Inconclusive++
 	}
@@ -2305,8 +2349,8 @@ func (d *mayhemDriver) writeReport() string {
 	path := filepath.Join(mayReportDir, fmt.Sprintf("qa-mayhem-%s.md", time.Now().Format("20060102-150405")))
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Mayhem QA report\n\n")
-	fmt.Fprintf(&b, "Run started %s. %d pass · %d degraded · **%d fail** · **%d blind** · %d inconclusive.\n",
-		st.StartedAt.Format(time.RFC3339), st.Summary.Pass, st.Summary.Degraded, st.Summary.Fail, st.Summary.Blind, st.Summary.Inconclusive)
+	fmt.Fprintf(&b, "Run started %s. %d pass · %d degraded · **%d fail** · **%d blind** · %d inconclusive · %d infra.\n",
+		st.StartedAt.Format(time.RFC3339), st.Summary.Pass, st.Summary.Degraded, st.Summary.Fail, st.Summary.Blind, st.Summary.Inconclusive, st.Summary.Infra)
 	fmt.Fprintf(&b, "Worst breach: %.0f W. Total time out of limit: %.0fs.\n\n", st.Summary.WorstPeakW, st.Summary.TotalBreachS)
 	if st.ChaosSeed != 0 {
 		fmt.Fprintf(&b, "Chaos run — replay this exact sequence with `--chaos --seed %d`.\n\n", st.ChaosSeed)
@@ -2647,6 +2691,62 @@ func (d *mayhemDriver) hubState() mayHubState {
 // baseline puts the bench into a known controllable state: clock at zero, all
 // controls cleared, solar paused (so injected PV is held and curtailment still
 // applies), meter running and linked, battery at a mid SOC.
+// benchProbes are the test-infrastructure backends every scenario's verdict
+// silently depends on, each with a cheap read-only health path. The hub is
+// deliberately NOT probed: a dead hub is a product signal the oracles must
+// judge (BLIND), never bench infrastructure. mqttproxy is deployed only on
+// chaos benches, so probing it would false-INFRA a normal run.
+var benchProbes = []struct{ name, path string }{
+	{"solar", "/state"},
+	{"battery", "/state"},
+	{"meter", "/state"},
+	{"ev", "/state"},
+	{"gridsim", "/admin/alerts"},
+}
+
+// benchUnhealthy probes every configured bench backend and returns a
+// semicolon-joined description of the dead ones ("" = all healthy). One
+// retry after 2 s rides out a teardown still settling (netem/iptables
+// removal); backends absent from d.backends are skipped so partial test
+// benches keep working (audit MAY-6, hardening plan Q8).
+func (d *mayhemDriver) benchUnhealthy() string {
+	var bad []string
+	for _, p := range benchProbes {
+		if _, ok := d.backends[p.name]; !ok {
+			continue
+		}
+		err := d.probe(p.name, p.path)
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			err = d.probe(p.name, p.path)
+		}
+		if err != nil {
+			bad = append(bad, fmt.Sprintf("%s: %v", p.name, err))
+		}
+	}
+	return strings.Join(bad, "; ")
+}
+
+// probe is a status-only GET against a backend: body drained and discarded,
+// any transport error or HTTP error status is the result.
+func (d *mayhemDriver) probe(name, path string) error {
+	req, err := http.NewRequest(http.MethodGet, d.backends[name]+path, nil)
+	if err != nil {
+		return err
+	}
+	setHubAuth(req, name)
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (d *mayhemDriver) baseline() error {
 	if err := d.post("gridsim", "/admin/clock", map[string]any{"offset_s": 0}); err != nil {
 		return fmt.Errorf("gridsim clock: %w", err)
