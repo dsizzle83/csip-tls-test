@@ -21,6 +21,7 @@ const FALLBACK: Record<string, string> = {
   '--c-teal': '#0E9268',
   '--c-indigo': '#4A3AA7',
   '--c-red': '#E34948',
+  '--c-pink': '#D6408F',
 
   '--s-good': '#15803D',
   '--s-warn': '#B45309',
@@ -63,7 +64,7 @@ export const POWER_COLORS = {
     return token('--c-amber');
   },
   get battery() {
-    return token('--c-green');
+    return token('--c-pink');
   },
   get grid() {
     return token('--c-blue');

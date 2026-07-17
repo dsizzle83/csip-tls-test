@@ -23,6 +23,7 @@
   --c-teal: #0e9268; /* slot 4 */
   --c-indigo: #4a3aa7; /* slot 5 */
   --c-red: #e34948; /* slot 6 — spare; NOT for status */
+  --c-pink: #d6408f; /* slot 7 — battery entity (distinct from slot-4 teal EV) */
 
   /* Status (reserved; always icon + label, never color alone) */
   --s-good: #15803d; /* PASS */
