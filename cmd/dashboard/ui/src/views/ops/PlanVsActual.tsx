@@ -304,6 +304,9 @@ export function PlanVsActual({ status }: { status?: HubStatus }) {
     const xMin = times.length ? Math.min(...times) : nowMs - 3600000;
     const xMax = times.length ? Math.max(...times) : nowMs + 86400000;
 
+    // Plan = a soft ghosted forecast envelope (faint fill, barely-there dashed
+    // outline). Actual = a crisp bold line drawn ON TOP. The two must read as
+    // "shaded region = plan · solid line = live" at a glance.
     const planArea = (name: string, color: string, data: [number, number][]) => ({
       name,
       type: 'line' as const,
@@ -313,20 +316,20 @@ export function PlanVsActual({ status }: { status?: HubStatus }) {
       data,
       showSymbol: false,
       silent: true,
-      lineStyle: { width: 1, color, opacity: 0.5, type: 'dashed' as const },
-      areaStyle: { color, opacity: 0.22 },
+      lineStyle: { width: 1, color, opacity: 0.28, type: 'dashed' as const },
+      areaStyle: { color, opacity: 0.1 },
       itemStyle: { color },
       z: 2,
       sampling: 'lttb' as const,
     });
-    const actualLine = (name: string, color: string, data: [number, number][], z = 5, width = 2) => ({
+    const actualLine = (name: string, color: string, data: [number, number][], z = 5, width = 2.6) => ({
       name,
       type: 'line' as const,
       xAxisIndex: 0,
       yAxisIndex: 0,
       data,
       showSymbol: false,
-      lineStyle: { width, color },
+      lineStyle: { width, color, opacity: 1 },
       itemStyle: { color },
       z,
       sampling: 'lttb' as const,
@@ -486,7 +489,7 @@ export function PlanVsActual({ status }: { status?: HubStatus }) {
           yAxisIndex: 0,
           data: planGrid,
           showSymbol: false,
-          lineStyle: { width: 2, color: cGrid, type: 'dashed' },
+          lineStyle: { width: 1.5, color: cGrid, type: 'dashed', opacity: 0.4 },
           itemStyle: { color: cGrid },
           z: 3,
           sampling: 'lttb',
@@ -566,7 +569,7 @@ export function PlanVsActual({ status }: { status?: HubStatus }) {
     <div className="ops-card">
       <div className="ops-card-head">
         <h2 className="card-title">Plan vs Actual</h2>
-        <div className="ops-head-meta">dashed/area = plan · solid = actual · demand ↑ / supply ↓</div>
+        <div className="ops-head-meta">shaded + dashed = plan (forecast) · <b>bold solid = actual (live)</b> · demand ↑ / supply ↓</div>
       </div>
       {!hasAny ? (
         <p className="ops-empty">No plan yet — the chart draws once the hub publishes a 24 h forecast and the measured trail begins to fill.</p>
