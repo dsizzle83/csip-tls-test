@@ -1,5 +1,5 @@
 .PHONY: all build build-server build-client build-conformance build-modsim build-vtnsim \
-        build-mbapsdev \
+        build-mbapsdev build-aggregator build-ssm-conformance ssm-conformance aggregator-campaigns \
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
@@ -61,6 +61,39 @@ build-metersim:
 build-mbapsdev:
 	@mkdir -p bin
 	go build -o bin/mbapsdev ./sim/mbapsdev
+
+# aggregator emulator: the northbound mbaps CLIENT that plays the utility/VPP,
+# driving the gateway's :802 server (interactive REPL + headless campaigns).
+# cgo (internal/aggregator -> internal/mbtls -> internal/wolfssl), so it carries
+# the wolfSSL sysroot env like build-server/build-mbapsdev. T06.9.
+build-aggregator:
+	@mkdir -p bin
+	go build -o bin/aggregator ./sim/aggregator
+
+# ssm-conformance: the Secure SunSpec Modbus 62-requirement conformance walker
+# (SunSpecTCP-1..62). cgo (drives the bench's own internal/mbtls client), so it
+# needs the wolfSSL sysroot env. T06.10.
+build-ssm-conformance:
+	@mkdir -p bin
+	go build -o bin/ssm-conformance ./sim/ssm-conformance
+
+# Build + run the Secure SunSpec Modbus conformance suite against the in-process
+# loopback authz-enforcing mbaps server (zero bench access): all 62 SunSpecTCP
+# rows, a real PASS/FAIL/SKIP per row. Override for a live gateway:
+#   make ssm-conformance TARGET="-target 69.0.0.2:802 -pki certs/mbaps"
+# Add a device target for the client-direction rows vs mbapsdev:
+#   make ssm-conformance TARGET="-target 69.0.0.2:802 -pki certs/mbaps -device-target 69.0.0.20:8021"
+TARGET ?=
+ssm-conformance: build-ssm-conformance
+	./bin/ssm-conformance $(TARGET)
+
+# Run every committed aggregator campaign headless against a target (default a
+# loopback mbapsdev started by the caller); exits non-zero if any campaign's
+# verdict falls outside its expected set. Override AGG_TARGET/CAMPAIGN_DIR.
+AGG_TARGET     ?= 127.0.0.1:8021
+CAMPAIGN_DIR   ?= qa/aggregator
+aggregator-campaigns: build-aggregator
+	./bin/aggregator -target $(AGG_TARGET) -pki certs/mbaps -campaign-dir $(CAMPAIGN_DIR) -out logs/agg/$(shell date +%Y%m%d-%H%M%S)/
 
 build-evsim:
 	@mkdir -p bin
@@ -256,10 +289,11 @@ test: $(CA_CERT) test-fast test-integration
 
 # Fast unit tests across the cgo packages — pure-Go logic only (suite-order /
 # role-parse tables for mbtls; PKI/manifest, point-encoding, and run-state logic
-# for the aggregator emulator). Pulls cgo for compilation but does no TLS
-# handshakes.
+# for the aggregator emulator; the 62-requirement table, PRF/suite predicates,
+# minted-fixture matrix, and Reporter bookkeeping for ssm-conformance). Pulls cgo
+# for compilation but does no TLS handshakes.
 test-fast:
-	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/
+	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/ssm-conformance/
 
 # Hostile-QA deterministic-regression gate (Phase 5): fault-injector + diagnoser
 # unit tests, no bench. Add the live mayhem suite with: make qa-bench.
@@ -300,9 +334,12 @@ sweep-sunspec:
 # end-to-end over a loopback mbaps session (T06.3). internal/aggregator mints the
 # same way and proves the emulator core (T06.4/T06.5 primitives) — connect as a
 # role, discover via Model 1, poll telemetry, write+readback, denial probe —
-# against a loopback authz-enforcing mbaps server.
+# against a loopback authz-enforcing mbaps server. sim/ssm-conformance mints the
+# same way and runs the full 62-requirement Secure SunSpec Modbus suite end to end
+# against an in-process loopback gateway (all rows addressed, zero FAIL), plus a
+# teeth test proving a non-conformant peer FAILs the denial rows (T06.10).
 test-integration: $(CA_CERT)
-	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/
+	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/ssm-conformance/
 
 # TASK-048: 15 minutes per go-native fuzz target against the client-side
 # IEEE 2030.5 XML unmarshal entry points in internal/csipref/discovery
@@ -409,6 +446,11 @@ help:
 	@echo "  make modsim-run          Start the simulator container (port 5020)"
 	@echo "  make modsim-stop         Stop the simulator container"
 	@echo "  make build-modsim        Build the simulator binary locally (bin/modsim)"
+	@echo "  make build-mbapsdev      Build the secure Modbus (mbaps) device sim (cgo)"
+	@echo "  make build-aggregator    Build the mbaps aggregator emulator (cgo)"
+	@echo "  make build-ssm-conformance  Build the Secure SunSpec Modbus 62-req conformance walker (cgo)"
+	@echo "  make ssm-conformance     Build + run the 62-req suite vs a loopback gateway (zero bench)"
+	@echo "                           Live: make ssm-conformance TARGET=\"-target 69.0.0.2:802 -pki certs/mbaps\""
 	@echo "  make build-dashboard     Build the dashboard binary locally (bin/dashboard)"
 	@echo "  make build-vtnsim        Build the OpenADR 3.1 VTN stub locally (bin/vtnsim)"
 	@echo "  make ui                  Rebuild cmd/dashboard/ui/dist (Vite); dist/ is committed — run + commit after ui/src changes"

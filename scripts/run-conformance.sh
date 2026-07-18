@@ -13,10 +13,16 @@
 #   4. Live capture  — (optional, --capture) boots the real mTLS server, walks
 #                      it with the real client, and verifies the negotiated
 #                      cipher 0xC0AE on the wire with a packet capture.
+#   5. Secure SunSpec Modbus — the mbaps 62-requirement conformance walker
+#                      (sim/ssm-conformance): SunSpecTCP-1..62 against an
+#                      in-process loopback authz-enforcing mbaps server by
+#                      default, or the live lexa-gw :802 when SSM_TARGET is set.
 #
 # Usage:
-#   scripts/run-conformance.sh              # layers 1-3
-#   scripts/run-conformance.sh --capture    # layers 1-4 (needs dumpcap perms)
+#   scripts/run-conformance.sh              # layers 1-3 + 5 (loopback)
+#   scripts/run-conformance.sh --capture    # + layer 4 (needs dumpcap perms)
+#   SSM_TARGET=69.0.0.2:802 scripts/run-conformance.sh   # layer 5 vs the live gateway
+#   SSM_DEVICE_TARGET=69.0.0.20:8021 SSM_TARGET=... scripts/run-conformance.sh  # + client rows vs mbapsdev
 #
 # wolfSSL: set WOLFSSL_PREFIX to your install, or this script auto-detects
 # the common locations. Build it once with the `wolfssl-arm64` Makefile
@@ -104,6 +110,34 @@ PY
     echo "  server-side REST walk:"; grep -E "GET /" /tmp/conf-gridsim.log | sed 's/^/    /'
     rm -f "$PCAP"
   fi
+fi
+
+# ── Layer 5: Secure SunSpec Modbus conformance (SunSpecTCP-1..62) ────────────
+section "Layer 5 — Secure SunSpec Modbus (mbaps) conformance, 62 requirements"
+mkdir -p logs
+SSM_LOG="logs/ssm-conformance-$(date +%Y%m%d-%H%M%S).log"
+if go build -o bin/ssm-conformance ./sim/ssm-conformance; then
+  ssm_args=(-out "$SSM_LOG")
+  if [[ -n "${SSM_TARGET:-}" ]]; then
+    ssm_args+=(-target "$SSM_TARGET" -pki "${SSM_PKI:-certs/mbaps}")
+    [[ -n "${SSM_DEVICE_TARGET:-}" ]] && ssm_args+=(-device-target "$SSM_DEVICE_TARGET")
+    echo "  target: live gateway $SSM_TARGET (pki ${SSM_PKI:-certs/mbaps})"
+  else
+    echo "  target: in-process loopback authz-enforcing mbaps server (no bench access)"
+  fi
+  # The binary prints its own per-requirement PASS/FAIL <SunSpecTCP-N> lines and
+  # exits non-zero if any row FAILs or is unaddressed; run once and fold the
+  # exit status (via PIPESTATUS, since it is piped through grep) into the tally.
+  bin/ssm-conformance "${ssm_args[@]}" | grep -E "SunSpecTCP-|PASS:|FAIL:|SKIP:|WARN:|ALL REQ|NOT ADDR"
+  ssm_rc=${PIPESTATUS[0]}
+  if [[ $ssm_rc -eq 0 ]]; then
+    echo "  ✓ ssm-conformance 62-requirement suite"; PASS=$((PASS+1))
+  else
+    echo "  ✗ ssm-conformance 62-requirement suite (exit $ssm_rc)"; FAIL=$((FAIL+1))
+  fi
+  echo "  full log: $SSM_LOG"
+else
+  echo "  ✗ ssm-conformance build failed"; FAIL=$((FAIL+1))
 fi
 
 section "RESULT: $PASS passed, $FAIL failed"
