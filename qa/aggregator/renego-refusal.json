@@ -1,0 +1,18 @@
+{
+  "camp_v": 1,
+  "id": "renego-refusal",
+  "name": "Client-initiated TLS renegotiation is refused safely (TCP-62)",
+  "role": "GridServiceSunSpec",
+  "target": "device",
+  "hypothesis": "The mbaps profile advertises the RFC 5746 secure-renegotiation indication (SunSpecTCP-62), but a conformant gateway need not honour an actual client-initiated renegotiation — and whichever it does, the session must stay safe: pre-renegotiation state is not corrupted and the client identity is not silently changed.",
+  "expected": "The renegotiation attempt is observed (refused by the peer is the expected policy); the session remains usable afterward (a follow-up read succeeds, transparently redialing if the peer tore the stream down). No wedged or corrupt session.",
+  "fix": "If the session is left unusable, the renegotiation path is unsafe: check the gateway's renegotiation policy (indication-only per design 02 §1, role re-derived on any renegotiation) and mbtls's Renegotiate/liveness recovery.",
+  "notes": "The probe asserts the OBSERVED behaviour + session safety, NOT a specific accept/refuse choice (app-level refusal is optional per the product TCP-62 finding). Loopback-only (desktop, T06.8): the loopback device advertises the indication but declines the renegotiation, the conformant policy.",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "renegotiate", "unit": 2},
+    {"do": "discover", "units": [2]}
+  ],
+  "oracle": {"name": "renegotiationRefusal"},
+  "expected_verdicts": ["PASS"]
+}

@@ -68,17 +68,14 @@ test.
 | `readback` | `unit, model, point, expect, sla_s` (+`tol, phase`) | Poll the echo point until it converges to `expect` within `sla_s`. |
 | `expect_exception` | `unit, model, point, value` (+`expect_code`) | Attempt a write and assert the gateway answers with `expect_code` (default 01). |
 | `disconnect` | — | Close the current session. |
-| `resume` | — | Re-establish the session (reconnect). |
+| `resume` | — | Re-establish the session (reconnect), **resuming the cached TLS session if the peer allows it** (TCP-46). |
+| `renegotiate` | `unit` (optional) | Attempt a client-initiated TLS renegotiation (the refusal probe); when `unit` is set, a follow-up read confirms the session survived. |
 | `sleep_s` | `seconds` | Wait (cancellable) — e.g. a hold window. |
 | `sim_fault` | `target, fault` | Arm/clear a fault on a named sim via its simapi (`{"kind":"drop_session"}`). |
 
 `units` is `"*"` (everything discovered so far this campaign) or an explicit list
 — a small number-or-`"*"` union, never an expression. `readback.phase` (`"hold"`
 / `"revert"`) tags a readback for the `reversionOnExpiry` oracle.
-
-**Reserved for T06.8** (TLS-fault probes): `renegotiate`. It is intentionally NOT
-accepted here yet — a campaign using it fails at load — because its oracle bodies
-(the renegotiation-refusal judge, `resumeAfterDrop`) belong to that task.
 
 ## Oracles
 
@@ -87,6 +84,9 @@ accepted here yet — a campaign using it fails at load — because its oracle b
 | `convergeWithinSLA` | Every `readback` converged to its commanded value within its SLA ⇒ PASS (DEGRADED if any only just made it; FAIL if any never converged; BLIND if a target never returned a value). |
 | `denyExpected` | Every `expect_exception` probe answered with its expected code and nothing was wrongly accepted ⇒ PASS (FAIL on an accepted write or a wrong code; INCONCLUSIVE if a probe hit a transport error). |
 | `reversionOnExpiry` | A `phase:"hold"` readback held the ceiling, then a `phase:"revert"` readback converged to the safe default ⇒ PASS; a revert readback stuck at the commanded value ⇒ FAIL (stuck curtailment — a safety regression). |
+| `resumeAfterDrop` | Every `resume` step RESUMED the prior TLS session (`Resumed=true`) rather than doing a full handshake ⇒ PASS; a full handshake ⇒ FAIL (TCP-46). The judge the mbtls client-session-reuse enhancement makes possible (T06.8). |
+| `sessionSurvival` | After a mid-session disconnect/drop, a later session operation succeeded ⇒ PASS (recovered); no successful op after the last disruption ⇒ FAIL; no disruption at all ⇒ INCONCLUSIVE. |
+| `renegotiationRefusal` | A client-initiated renegotiation left the session SAFE — refused-and-usable or handled-and-usable ⇒ PASS; left unusable ⇒ FAIL. Asserts safety, not a specific accept/refuse choice (TCP-62 is met by the indication; app-level refusal is optional). |
 
 ## Load-time validation
 
@@ -103,14 +103,35 @@ Campaigns load fresh from this directory on every batch run, so adding or editin
 one takes effect with no rebuild (the same stale-binary trap the Mayhem
 scenarios-as-data work closed).
 
+## Running campaigns — the `aggregator` CLI (T06.9)
+
+The `aggregator` binary (`sim/aggregator`) runs these campaigns two ways over the
+same driver:
+
+```bash
+# headless one campaign / a whole dir — writes report.json + summary.md per
+# campaign under -out, and EXITS NON-ZERO on any verdict outside its
+# expected_verdicts (the CI gate):
+aggregator -target 69.0.0.2:802 -pki certs/mbaps -campaign qa/aggregator/curtail-solar-50.json -out logs/agg/<ts>/
+aggregator -target 69.0.0.2:802 -pki certs/mbaps -campaign-dir qa/aggregator -out logs/agg/<ts>/ -json
+# a campaign that uses sim_fault against a live sim needs the sim's simapi base:
+aggregator -target 127.0.0.1:8021 -pki certs/mbaps -campaign qa/aggregator/resumption-after-drop.json -fault-api http://127.0.0.1:6031 -out logs/agg/<ts>/
+
+# interactive REPL — connect/discover/write/readback/probe/disconnect/resume/renegotiate/report:
+aggregator -target 69.0.0.2:802 -pki certs/mbaps -role GridServiceSunSpec -interactive
+```
+
 ## Testing
 
 - `go test ./internal/aggregator/...` — schema decode/reject table, the oracle
-  registry + decision tables, and a **compile-all pass over every file in this
-  directory** (a broken campaign here fails CI, not a live run).
+  registry + decision tables, the CLI batch/gate roll-up + report round-trip, and a
+  **compile-all pass over every file in this directory** (a broken campaign here
+  fails CI, not a live run).
 - `go test -tags integration ./internal/aggregator/...` — the engine runs
-  `curtail-solar-50` (readback-verify) and `role-denial-readonly` end to end
-  against a loopback authz-enforcing mbaps server and asserts the oracle verdicts.
+  `curtail-solar-50` (readback-verify), `role-denial-readonly` (denial matrix), and
+  the three TLS-fault campaigns end to end against a loopback authz-enforcing mbaps
+  server, asserting the oracle verdicts; plus the REPL driving a live session and
+  the headless gate tripping on a forced-fail campaign.
 
 ## Files
 
@@ -118,3 +139,6 @@ scenarios-as-data work closed).
 - `role-denial-readonly.json` — ReadOnly + LexaVolt write denial (`denyExpected`). Runs hermetically + live.
 - `battery-hold-dispatch.json` — GridService battery WSet hold→dispatch (`convergeWithinSLA`). Live/battery; validated at load.
 - `ramp-limit-reversion.json` — GridService reversion-on-expiry (`reversionOnExpiry`). Live-bench; oracle unit-tested on synthetic evidence.
+- `resumption-after-drop.json` — GridService drop→resume, asserts the TLS session RESUMES (`resumeAfterDrop`, TCP-46). Loopback/device (T06.8).
+- `mid-session-drop.json` — GridService drop→transparent recovery (`sessionSurvival`). Loopback/device (T06.8).
+- `renego-refusal.json` — GridService client-initiated renegotiation is refused safely (`renegotiationRefusal`, TCP-62). Loopback/device (T06.8).

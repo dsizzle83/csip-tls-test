@@ -453,3 +453,72 @@ func SetSessionCacheOff(ctx unsafe.Pointer) {
 	C.wolfSSL_CTX_set_session_cache_mode(
 		(*C.WOLFSSL_CTX)(ctx), C.WOLFSSL_SESS_CACHE_OFF)
 }
+
+// --- Client session resumption (T06.8) --------------------------------------
+//
+// These wrap wolfSSL's session get/set/free so the mbaps CLIENT can capture a
+// session after a handshake and replay it on the next Dial to the same peer,
+// making TLS session resumption observable end to end (SunSpecTCP-46). Without
+// them each Dial builds a fresh CTX and never offers a prior session, so
+// Session.Resumed is structurally always false — the gap T06.4 flagged that
+// this task closes. The bench derives this glue from the spec + the wolfSSL API
+// itself, NOT from lexa-platform/securemodbus (referee independence, C9).
+//
+// SECURITY: a WOLFSSL_SESSION embeds the TLS master secret. Never serialize a
+// handle to disk, a log, or a bus message; call FreeSession on every drop path
+// or the secret lingers in the heap. Because the sysroot is built with
+// SESSION_CERTS, the peer leaf DER survives a RESUMED handshake, so
+// PeerCertificateDER (role re-derivation) still works on a resumed Session.
+
+// GetSession returns an opaque, owned *WOLFSSL_SESSION captured from ssl after a
+// successful handshake via wolfSSL_get1_session, or nil if none is available
+// (the peer disabled caching, or — TLS 1.3 — the NewSessionTicket has not been
+// processed yet). The "get1" variant takes a reference the caller OWNS and MUST
+// release with FreeSession. For TLS 1.3, call this only AFTER at least one Read
+// has pumped the post-handshake NewSessionTicket, or the captured session will
+// not resume (wolfSSL ticket timing). The returned pointer is a session handle,
+// never certificate or key bytes.
+func GetSession(ssl unsafe.Pointer) unsafe.Pointer {
+	return unsafe.Pointer(C.wolfSSL_get1_session((*C.WOLFSSL)(ssl)))
+}
+
+// SetSession installs a session previously captured by GetSession onto a fresh
+// ssl BEFORE Connect, so the handshake attempts resumption
+// (wolfSSL_set_session). A nil sess is rejected in Go (nothing to resume).
+// Success means only that the session was accepted for the attempt; whether the
+// peer actually resumed is reported by SessionReused after the handshake.
+func SetSession(ssl unsafe.Pointer, sess unsafe.Pointer) error {
+	if sess == nil {
+		return errors.New("wolfssl: SetSession: nil session")
+	}
+	if int(C.wolfSSL_set_session((*C.WOLFSSL)(ssl), (*C.WOLFSSL_SESSION)(sess))) != Success {
+		return errors.New("wolfSSL_set_session failed")
+	}
+	return nil
+}
+
+// FreeSession releases a session handle captured by GetSession via
+// wolfSSL_SESSION_free. Nil-safe, matching FreeCtx/FreeSSL. Call it on EVERY
+// drop path: the handle embeds the master secret (security note above).
+func FreeSession(sess unsafe.Pointer) {
+	if sess == nil {
+		return
+	}
+	C.wolfSSL_SESSION_free((*C.WOLFSSL_SESSION)(sess))
+}
+
+// UseSecureRenegotiation enables RFC 5746 secure (re)negotiation on a context
+// (wolfSSL_CTX_UseSecureRenegotiation). A client context needs this before a
+// mid-session Rehandshake is even attemptable; without it wolfSSL_Rehandshake
+// fails immediately at the client with SECURE_RENEGOTIATION_E rather than
+// putting a renegotiation ClientHello on the wire. The mbaps CLIENT enables it
+// so the renegotiation-refusal probe (T06.8) can actually initiate a
+// renegotiation and observe the gateway's policy; the profile's baseline
+// renegotiation-indication extension (TCP-62) is separate and rides every
+// ClientHello from the wolfSSL build regardless.
+func UseSecureRenegotiation(ctx unsafe.Pointer) error {
+	if int(C.wolfSSL_CTX_UseSecureRenegotiation((*C.WOLFSSL_CTX)(ctx))) != Success {
+		return errors.New("wolfSSL_CTX_UseSecureRenegotiation failed")
+	}
+	return nil
+}

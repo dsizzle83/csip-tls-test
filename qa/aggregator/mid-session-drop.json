@@ -1,0 +1,20 @@
+{
+  "camp_v": 1,
+  "id": "mid-session-drop",
+  "name": "Emulator recovers transparently from a mid-session drop",
+  "role": "GridServiceSunSpec",
+  "target": "device",
+  "hypothesis": "A connection dropped mid-exchange (relay reset, gateway restart) must not wedge the aggregator: the next operation should transparently re-establish the session and succeed, with no manual reconnect step — late/dropped requests are harmless because the emulator redials and retries.",
+  "expected": "After the session is dropped mid-exchange, the very next data operation transparently re-establishes the session and succeeds — the emulator survives the drop without an explicit resume.",
+  "fix": "If the emulator never recovers, look at Conn.ensureConn/redial (the single immediate redial on a broken session) and the callT exception-vs-transport classification (only a transport break marks the session broken; a protocol exception must NOT).",
+  "notes": "Distinct from resumption-after-drop: this asserts RECOVERY (sessionSurvival), not whether the recovered session resumed. There is deliberately no resume step — the follow-up discover redials transparently. Loopback-only (desktop, T06.8).",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "sim_fault", "target": "device", "fault": {"kind": "drop_session"}},
+    {"do": "write_point", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 40},
+    {"do": "sim_fault", "target": "device", "fault": {"kind": "drop_session", "clear": true}},
+    {"do": "discover", "units": [2]}
+  ],
+  "oracle": {"name": "sessionSurvival"},
+  "expected_verdicts": ["PASS"]
+}

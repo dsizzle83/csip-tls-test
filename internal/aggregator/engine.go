@@ -215,6 +215,8 @@ func (r *campaignRun) dispatch(ctx context.Context, i int, s Step) StepResult {
 		return r.doDisconnect(i, s)
 	case StepResume:
 		return r.doResume(ctx, i, s)
+	case StepRenegotiate:
+		return r.doRenegotiate(i, s)
 	case StepSleep:
 		return r.doSleep(ctx, i, s)
 	case StepSimFault:
@@ -246,7 +248,9 @@ func (r *campaignRun) doConnectAs(i int, s Step) StepResult {
 	}
 	r.conn = conn
 	r.role = s.Role
-	r.rs.SetSession(conn.SessionInfo())
+	si := conn.SessionInfo()
+	r.rs.SetSession(si)
+	res.Session = &si
 	res.OK = true
 	res.Note = fmt.Sprintf("connected as %s", s.Role)
 	return res
@@ -465,12 +469,11 @@ func (r *campaignRun) doDisconnect(i int, s Step) StepResult {
 
 // doResume re-establishes the session as the currently-selected role. If the
 // session is merely broken it redials in place (backoff-bounded by ctx); if it was
-// closed by a prior disconnect it dials afresh.
-//
-// Reviewer note (T06.8): mbtls builds a fresh CTX per Dial, so no TLS session is
-// reused across a reconnect — Resumed is honestly false here until mbtls grows
-// client session reuse. The resumeAfterDrop oracle (which JUDGES resumption) is
-// T06.8's, not this task's.
+// closed by a prior disconnect it dials afresh. Either path goes through
+// mbtls.Dial, which now offers the cached TLS session (T06.8), so a re-establish
+// to the same peer+identity RESUMES when the peer allows it (TCP-46) — the
+// handshake facts, incl. Resumed, are attached to the step for the resumeAfterDrop
+// oracle to judge.
 func (r *campaignRun) doResume(ctx context.Context, i int, s Step) StepResult {
 	res := StepResult{Index: i, Do: StepResume}
 	if r.conn == nil {
@@ -484,9 +487,63 @@ func (r *campaignRun) doResume(ctx context.Context, i int, s Step) StepResult {
 		res.Err = err.Error()
 		return res
 	}
-	r.rs.SetSession(r.conn.SessionInfo())
+	si := r.conn.SessionInfo()
+	r.rs.SetSession(si)
+	res.Session = &si
 	res.OK = true
-	res.Note = fmt.Sprintf("session re-established as %s (resumed=%t)", r.role, r.conn.Resumed())
+	res.Note = fmt.Sprintf("session re-established as %s (resumed=%t)", r.role, si.Resumed)
+	return res
+}
+
+// doRenegotiate drives the renegotiation-refusal probe (T06.8): it attempts a
+// client-initiated TLS renegotiation on the live session and records the
+// OBSERVED policy — refused (the conformant gateway's expected behaviour: it
+// advertises the RFC 5746 indication per TCP-62 but declines an actual
+// renegotiation) or handled — plus whether the session stayed safe afterwards. A
+// renegotiation is never an application error: a refusal is the expected outcome,
+// so it is reported, not returned. When the step names a unit, a follow-up read
+// confirms the session is still usable (or cleanly recovered via redial); the
+// renegotiationRefusal oracle judges safety from this evidence.
+func (r *campaignRun) doRenegotiate(i int, s Step) StepResult {
+	res := StepResult{Index: i, Do: StepRenegotiate}
+	if r.conn == nil {
+		res.Err = "no session (connect first)"
+		return res
+	}
+	rr := &RenegotiationResult{Attempted: true, RoleAsserted: string(r.role)}
+	err := r.conn.Renegotiate()
+	if err != nil {
+		rr.Refused = true
+		rr.Err = err.Error()
+	}
+	// Liveness: a benign read proves the session survived the renegotiation, or —
+	// if the peer tore the stream down on the refused renegotiation — that the
+	// emulator cleanly re-establishes it (both are safe; a wedged/corrupt session
+	// is not). Two attempts: the first uses the existing session, and if that
+	// broke, the second redials transparently. Skipped when the step names no unit.
+	if s.Unit != 0 {
+		var lerr error
+		for attempt := 0; attempt < 2; attempt++ {
+			if lerr = r.conn.Ping(s.Unit); lerr == nil {
+				rr.SessionUsable = true
+				break
+			}
+		}
+		if lerr != nil {
+			rr.Note = appendNote(rr.Note, fmt.Sprintf("post-reneg liveness failed after redial: %v", lerr))
+		}
+	} else {
+		// No liveness unit: treat the client-side session object still being open
+		// as "usable" — a refused renegotiation that left the object intact.
+		rr.SessionUsable = r.conn.Session() != nil
+	}
+	res.Reneg = rr
+	res.OK = rr.SessionUsable
+	if rr.Refused {
+		res.Note = "renegotiation refused by peer policy (TCP-62 indication only)"
+	} else {
+		res.Note = "renegotiation was handled by the peer"
+	}
 	return res
 }
 

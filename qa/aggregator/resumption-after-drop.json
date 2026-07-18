@@ -1,0 +1,21 @@
+{
+  "camp_v": 1,
+  "id": "resumption-after-drop",
+  "name": "TLS session resumes after a mid-session connection drop (TCP-46)",
+  "role": "GridServiceSunSpec",
+  "target": "device",
+  "hypothesis": "A relay or gateway that drops the mbaps connection mid-session should not force a full TLS handshake on reconnect: the prior session is cached and the next Dial RESUMES it (SunSpecTCP-46), so a fleet of aggregators reconnecting after a blip does not stampede the CPU-bound ECDSA handshake.",
+  "expected": "After the session is dropped mid-exchange and re-established, the reconnect RESUMES the cached TLS session (Resumed=true) rather than doing a full handshake, and the resumed session still carries the peer identity for role re-derivation.",
+  "fix": "If the reconnect does a FULL handshake (Resumed=false), client-side session reuse is not working: check internal/mbtls's client session cache (capture-on-close via get1_session, SetSession-before-Connect keyed by target+identity) and that the peer's session cache is on (Profile.SessionCache).",
+  "notes": "Drives the loopback mbapsdev/authz stub (desktop-only, T06.8): the drop is armed via drop_session, an op trips it, the fault is cleared, then resume re-establishes and RESUMES. The drop is on THIS mbaps session (the emulator<->device link), which is the TLS session under test.",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "sim_fault", "target": "device", "fault": {"kind": "drop_session"}},
+    {"do": "write_point", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 50},
+    {"do": "sim_fault", "target": "device", "fault": {"kind": "drop_session", "clear": true}},
+    {"do": "resume"},
+    {"do": "discover", "units": [2]}
+  ],
+  "oracle": {"name": "resumeAfterDrop"},
+  "expected_verdicts": ["PASS"]
+}
