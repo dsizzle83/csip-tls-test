@@ -91,10 +91,13 @@ go test ./tests/                  # 2030.5 discovery + MUP + conformance logic
 go test ./internal/southbound/... # Modbus/SunSpec unit tests
 make test-integration             # wolfSSL mTLS handshake tests (amd64 sysroot on desktop),
                                    # incl. sim/mbapsdev's loopback mbaps device-sim proof
-make build-mbapsdev               # secure Modbus device sim (cgo); needs certs/mbaps/ (T06.1,
-                                   # not yet generated in this tree) to run for real — its own
-                                   # tests mint a throwaway PKI, so `make test-integration`
-                                   # proves it without any cert-gen step
+make gen-mbaps-certs              # bench mbaps PKI (T06.1): certs/mbaps/ — role certs +
+                                   # device cert + negative-fixture matrix (git-tracked
+                                   # public certs, keys gitignored, see certs/mbaps/README.md)
+make build-mbapsdev               # secure Modbus device sim (cgo); real runs need
+                                   # certs/mbaps/ (`make gen-mbaps-certs`, already committed) —
+                                   # its own tests mint a throwaway PKI instead, so
+                                   # `make test-integration` proves it without any cert-gen step
 make build                        # all binaries → bin/
 scripts/run-conformance.sh        # full CSIP conformance evidence (layers 1-3)
 

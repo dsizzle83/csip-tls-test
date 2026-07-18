@@ -6,7 +6,7 @@
         test test-fast test-integration test-update-golden test-southbound qa qa-bench fuzz \
         sweep-sunspec \
         modsim-image modsim-run modsim-stop \
-        gen-test-certs gen-comm004-certs gen-client-cert gen-ev-cert smoke-pi clean help \
+        gen-test-certs gen-comm004-certs gen-client-cert gen-ev-cert gen-mbaps-certs smoke-pi clean help \
         ui
 
 REPO_ROOT     := $(shell pwd)
@@ -349,6 +349,14 @@ gen-server-cert:
 gen-ev-cert:
 	bash scripts/gen-ev-cert.sh $(IPS)
 
+# Generate the bench mbaps PKI (T06.1): certs/mbaps/ — role-bearing client
+# leaves for all 5 mbaps roles, a device server leaf for sim/mbapsdev, and
+# the negative-fixture matrix (no-role/two-role/bad-encoding/empty-role/
+# oversize-role/expired/wrong-ca). Destructive-but-deterministic (regenerates
+# the whole tree with fresh keys each run — see cmd/gen-mbaps-certs doc).
+gen-mbaps-certs:
+	bash scripts/gen-mbaps-certs.sh
+
 # Auto-generate certs on first test run via dependency tracking.
 $(CA_CERT):
 	@echo "Test certs missing — generating..."
@@ -414,6 +422,8 @@ help:
 	@echo "  make gen-ev-cert         Issue the OCPP CSMS cert (Security Profile 2, TASK-074)"
 	@echo "                           Output: certs/ev-server-cert.pem (commit), certs/vault/ev-server-key.pem (gitignored)"
 	@echo "                           Include the hub's LAN IP: make gen-ev-cert IPS=69.0.0.1"
+	@echo "  make gen-mbaps-certs     Regenerate the bench mbaps PKI (T06.1): certs/mbaps/"
+	@echo "                           Role certs + device cert + negative-fixture matrix"
 	@echo ""
 	@echo "Hardware validation:"
 	@echo "  make smoke-pi            Deploy to Pi, run quick smoke test"
