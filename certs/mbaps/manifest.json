@@ -1,0 +1,112 @@
+{
+  "generated_at": "2026-07-18T03:14:12.051711271-04:00",
+  "role_oid": "1.3.6.1.4.1.50316.802.1",
+  "ca": {
+    "root": "ca-cert.pem",
+    "intermediate": "intermediate-cert.pem",
+    "wrong_ca_root": "wrong-ca-cert.pem"
+  },
+  "device": {
+    "ca": "dev-ca.pem",
+    "cert": "dev-server-cert.pem",
+    "key": "dev-server-key.pem"
+  },
+  "clients": [
+    {
+      "name": "GridServiceSunSpec",
+      "cert": "clients/grid-service-cert.pem",
+      "key": "clients/grid-service-key.pem",
+      "expect_role": "GridServiceSunSpec",
+      "chain_valid": true
+    },
+    {
+      "name": "SuperAdministratorSunSpec",
+      "cert": "clients/super-admin-cert.pem",
+      "key": "clients/super-admin-key.pem",
+      "expect_role": "SuperAdministratorSunSpec",
+      "chain_valid": true
+    },
+    {
+      "name": "NetworkAdministratorSunSpec",
+      "cert": "clients/net-admin-cert.pem",
+      "key": "clients/net-admin-key.pem",
+      "expect_role": "NetworkAdministratorSunSpec",
+      "chain_valid": true
+    },
+    {
+      "name": "ReadOnlySunSpec",
+      "cert": "clients/read-only-cert.pem",
+      "key": "clients/read-only-key.pem",
+      "expect_role": "ReadOnlySunSpec",
+      "chain_valid": true
+    },
+    {
+      "name": "LexaVoltReadOnly",
+      "cert": "clients/lexavolt-read-only-cert.pem",
+      "key": "clients/lexavolt-read-only-key.pem",
+      "expect_role": "LexaVoltReadOnly",
+      "chain_valid": true
+    }
+  ],
+  "negatives": [
+    {
+      "name": "no-role",
+      "cert": "negative/no-role-cert.pem",
+      "key": "negative/no-role-key.pem",
+      "expect_role": "",
+      "expect_role_err": "ErrNoRole",
+      "chain_valid": true,
+      "note": "role extension absent entirely"
+    },
+    {
+      "name": "two-role",
+      "cert": "negative/two-role-cert.pem",
+      "key": "negative/two-role-key.pem",
+      "expect_role": "",
+      "expect_role_err": "ErrMultipleRoles",
+      "chain_valid": true,
+      "note": "two role extensions present (GridServiceSunSpec + ReadOnlySunSpec) — spec mandates exactly one"
+    },
+    {
+      "name": "bad-encoding",
+      "cert": "negative/bad-encoding-cert.pem",
+      "key": "negative/bad-encoding-key.pem",
+      "expect_role": "",
+      "expect_role_err": "ErrBadEncoding",
+      "chain_valid": true,
+      "note": "role value is a PrintableString, not the mandated UTF8String (SunSpecTCP-30)"
+    },
+    {
+      "name": "empty-role",
+      "cert": "negative/empty-role-cert.pem",
+      "key": "negative/empty-role-key.pem",
+      "expect_role": "",
+      "chain_valid": true,
+      "note": "structurally valid empty UTF8String — parses with no error; unauthorized at the AuthZ layer, not the parser (design doc 01 §3.1)"
+    },
+    {
+      "name": "oversize-role",
+      "cert": "negative/oversize-role-cert.pem",
+      "key": "negative/oversize-role-key.pem",
+      "expect_role": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "chain_valid": true,
+      "note": "1024-byte UTF8String role value — parses verbatim with no error"
+    },
+    {
+      "name": "expired",
+      "cert": "negative/expired-cert.pem",
+      "key": "negative/expired-key.pem",
+      "expect_role": "GridServiceSunSpec",
+      "chain_valid": false,
+      "note": "notAfter in the past — role parses fine (valid role), TLS/chain validation must reject on expiry"
+    },
+    {
+      "name": "wrong-ca",
+      "cert": "negative/wrong-ca-cert.pem",
+      "key": "negative/wrong-ca-key.pem",
+      "expect_role": "GridServiceSunSpec",
+      "chain_valid": false,
+      "note": "valid role, but issued by an untrusted CA (not certs/mbaps/ca-cert.pem)"
+    }
+  ]
+}
