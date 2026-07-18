@@ -21,8 +21,17 @@ package mbtls
 // CLAUDE.md invariant) with handshake_integration_test.go in this package.
 
 import (
+	"bytes"
+	"crypto/x509"
+	"encoding/asn1"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -32,6 +41,215 @@ func mbapsClientKeyPath(certRelPath string) string {
 	const suffix = "-cert.pem"
 	base := certRelPath[:len(certRelPath)-len(suffix)]
 	return base + "-key.pem"
+}
+
+// ── freshness guard (orphaned committed cert / gitignored key) ─────────────
+//
+// certs/mbaps/*-cert.pem is git-tracked; certs/mbaps/*-key.pem is gitignored
+// (CLAUDE.md "Keys" invariant, repo-wide `*-key.pem` glob, "never commit,
+// ever"). `make gen-mbaps-certs` mints a fresh, self-consistent tree — NEW
+// keys AND new certs every run ("destructive-but-deterministic",
+// certs/mbaps/README.md) — and nothing else does. Two ways the on-disk keys
+// end up orphaned from the on-disk certs:
+//
+//   - a fresh checkout has the committed certs but NO local keys at all
+//     (nobody ever ran `make gen-mbaps-certs` here); or
+//   - this checkout DID run `make gen-mbaps-certs` at some point, and the
+//     committed certs were since reverted/updated (a later commit, a `git
+//     checkout`, a merge) without regenerating — the on-disk keys are now
+//     minted for a DIFFERENT generation than the certs sitting next to them.
+//
+// Either way the committed cert's public key and the on-disk key's public
+// key no longer match. Feed that mismatched pair into a wolfSSL handshake
+// and every case in both TestMbapsFixtures_* tests below fails identically
+// with a bare wolfSSL VERIFY_SIGN_ERROR (-330) — indistinguishable from a
+// real protocol regression unless you already know to suspect the fixtures.
+// This has already bitten once.
+//
+// ensureMbapsFixturesFresh compares every fixture's cert pubkey against its
+// key pubkey BEFORE either test dials anything. On any mismatch/missing key
+// it auto-regenerates the whole tree via the same scripts/gen-mbaps-certs.sh
+// a developer would run by hand — safe, because the tree is DESIGNED to be
+// destructively regenerated and certs/mbaps/README.md already documents
+// local churn from that command as normal and uncommitted. If regeneration
+// itself fails, or the result is somehow still inconsistent, it skips with a
+// precise, actionable message instead of letting the suite run into a
+// cryptic -330.
+//
+// Scope: only this file uses this guard. sim/mbapsdev's, internal/
+// aggregator's, and sim/ssm-conformance's OWN integration tests all mint
+// throwaway runtime PKI instead (see their testpki_test.go/pki_test.go doc
+// comments) specifically to avoid ever depending on committed keys; only
+// the two tests in this file exist to prove the COMMITTED tree itself, so
+// only they need this check. Live consumers of certs/mbaps (sim/
+// ssm-conformance -pki, sim/aggregator, sim/mbapsdev's default flags) are
+// untouched by this guard — it only ever runs inside
+// `go test -tags=integration ./internal/mbtls/...`.
+var (
+	mbapsFreshnessOnce sync.Once
+	mbapsFreshnessSkip string // set once; non-empty => both tests t.Skip with this message
+)
+
+// ensureMbapsFixturesFresh is the guard's entry point — called first thing by
+// both TestMbapsFixtures_* tests. The check (and any regen) runs at most once
+// per test binary; the second caller reuses the cached result.
+func ensureMbapsFixturesFresh(t *testing.T, root string) {
+	t.Helper()
+	mbapsFreshnessOnce.Do(func() {
+		mbapsFreshnessSkip = mbapsHealFixtures(root)
+	})
+	if mbapsFreshnessSkip != "" {
+		t.Skip(mbapsFreshnessSkip)
+	}
+}
+
+// mbapsHealFixtures checks every manifest fixture's cert/key pubkey match and
+// auto-regenerates the tree if any are stale or missing. Returns "" once the
+// tree is fresh, or an actionable skip message if it could not be made so.
+func mbapsHealFixtures(root string) string {
+	m, err := loadMbapsManifestFile(root)
+	if err != nil {
+		return fmt.Sprintf("bench mbaps fixtures: could not read %s/manifest.json: %v — run `make gen-mbaps-certs`", root, err)
+	}
+
+	issues := mbapsStaleFixtures(root, m)
+	if len(issues) == 0 {
+		return ""
+	}
+
+	fmt.Fprintf(os.Stderr, "mbaps_fixtures_integration_test: stale/missing keys detected (%v) — auto-regenerating certs/mbaps/ via scripts/gen-mbaps-certs.sh (local-only churn; certs/mbaps/*-key.pem is gitignored by design, never committed)\n", issues)
+
+	out, err := regenMbapsFixtures(root)
+	if err != nil {
+		return fmt.Sprintf("bench mbaps keys are stale/missing (%v) and auto-regen via scripts/gen-mbaps-certs.sh FAILED: %v\nscript output:\n%s\nFix: run `make gen-mbaps-certs` by hand, then re-run the tests.", issues, err, out)
+	}
+
+	m2, err := loadMbapsManifestFile(root)
+	if err != nil {
+		return fmt.Sprintf("bench mbaps auto-regen ran but manifest.json is unreadable afterwards: %v — run `make gen-mbaps-certs` by hand.", err)
+	}
+	if remaining := mbapsStaleFixtures(root, m2); len(remaining) > 0 {
+		return fmt.Sprintf("bench mbaps keys are STILL stale/missing after auto-regen (%v) — run `make gen-mbaps-certs` by hand and check scripts/gen-mbaps-certs.sh / cmd/gen-mbaps-certs for a real bug.", remaining)
+	}
+
+	fmt.Fprintln(os.Stderr, "mbaps_fixtures_integration_test: certs/mbaps/ regenerated and self-consistent — proceeding")
+	return ""
+}
+
+// mbapsStaleFixtures returns the fixture names whose committed cert's public
+// key does not match its (gitignored, local-only) private key on disk —
+// a missing key counts as stale. Checks the device server leaf plus every
+// client and negative fixture: everything either TestMbapsFixtures_* test
+// dials with.
+func mbapsStaleFixtures(root string, m mbapsManifest) []string {
+	var stale []string
+	check := func(name, certRel, keyRel string) {
+		ok, err := mbapsPubKeysMatch(filepath.Join(root, certRel), filepath.Join(root, keyRel))
+		if err != nil || !ok {
+			stale = append(stale, name)
+		}
+	}
+	check("device", m.Device.Cert, m.Device.Key)
+	for _, c := range m.Clients {
+		check(c.Name, c.Cert, mbapsClientKeyPath(c.Cert))
+	}
+	for _, n := range m.Negatives {
+		check(n.Name, n.Cert, mbapsClientKeyPath(n.Cert))
+	}
+	return stale
+}
+
+// mbapsPubKeysMatch reports whether certPath's leaf public key equals
+// keyPath's public key.
+func mbapsPubKeysMatch(certPath, keyPath string) (bool, error) {
+	certSPKI, err := mbapsCertSPKI(certPath)
+	if err != nil {
+		return false, fmt.Errorf("cert %s: %w", certPath, err)
+	}
+	keySPKI, err := mbapsKeySPKI(keyPath)
+	if err != nil {
+		return false, fmt.Errorf("key %s: %w", keyPath, err)
+	}
+	return bytes.Equal(certSPKI, keySPKI), nil
+}
+
+// mbapsCertSPKI reads a PEM chain file's leaf (first block) and returns the
+// raw DER of its SubjectPublicKeyInfo. It reaches SPKI via the same
+// tolerant, duplicate-extension-safe ASN.1 walk role.go's certExtensions
+// uses (certificateDER/tbsCertificateDER), NOT crypto/x509.ParseCertificate:
+// the standard parser hard-fails on the two-role negative fixture's
+// duplicate role extension before ever reaching the public key (see
+// certExtensions's doc comment in role.go) — this freshness guard checks
+// that fixture too, so it cannot depend on a parser that rejects it outright
+// for an unrelated reason.
+func mbapsCertSPKI(certPath string) ([]byte, error) {
+	b, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block found")
+	}
+	var cert certificateDER
+	if _, err := asn1.Unmarshal(block.Bytes, &cert); err != nil {
+		return nil, fmt.Errorf("parse certificate: %w", err)
+	}
+	return cert.TBS.PublicKey.FullBytes, nil
+}
+
+// mbapsKeySPKI reads an EC private key PEM file (x509.MarshalECPrivateKey /
+// "EC PRIVATE KEY", cmd/gen-mbaps-certs's writeKeyPEM) and returns the DER of
+// its public key in the same SubjectPublicKeyInfo shape mbapsCertSPKI
+// returns, so the two are directly byte-comparable.
+func mbapsKeySPKI(keyPath string) ([]byte, error) {
+	b, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block found")
+	}
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse EC private key: %w", err)
+	}
+	return x509.MarshalPKIXPublicKey(&key.PublicKey)
+}
+
+// regenMbapsFixtures shells out to the same scripts/gen-mbaps-certs.sh a
+// developer would run by hand (`make gen-mbaps-certs`). root is
+// ".../certs/mbaps" relative to this package's directory (go test's CWD is
+// always the package dir); the script resolves its own repo root from its
+// own argv[0], so passing it an absolute path keeps that resolution correct
+// regardless of the caller's CWD.
+func regenMbapsFixtures(root string) (string, error) {
+	repoRoot, err := filepath.Abs(filepath.Join(root, "..", ".."))
+	if err != nil {
+		return "", err
+	}
+	script := filepath.Join(repoRoot, "scripts", "gen-mbaps-certs.sh")
+	cmd := exec.Command("bash", script)
+	cmd.Dir = repoRoot
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// loadMbapsManifestFile is loadMbapsManifest (mbaps_fixtures_test.go) without
+// the *testing.T — the freshness guard runs inside a sync.Once closure that
+// has no test handle to Fatalf on, so read/parse failures must return as
+// plain errors instead.
+func loadMbapsManifestFile(root string) (mbapsManifest, error) {
+	b, err := os.ReadFile(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		return mbapsManifest{}, err
+	}
+	var m mbapsManifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		return mbapsManifest{}, err
+	}
+	return m, nil
 }
 
 // mbapsDeviceListener stands up an mbtls.Listener using the COMMITTED device
@@ -55,6 +273,7 @@ func mbapsDeviceListener(t *testing.T, root string, m mbapsManifest) (addr strin
 // mTLS handshake, not just parsed in isolation.
 func TestMbapsFixtures_DeviceListener_AllRoles(t *testing.T) {
 	root := mbapsFixtureRoot(t)
+	ensureMbapsFixturesFresh(t, root)
 	m := loadMbapsManifest(t, root)
 	addr, results := mbapsDeviceListener(t, root, m)
 
@@ -106,6 +325,7 @@ func TestMbapsFixtures_DeviceListener_AllRoles(t *testing.T) {
 // gap in mbtls's TLS 1.3 enforcement (unchanged from the existing pattern).
 func TestMbapsFixtures_NegativeHandshakes(t *testing.T) {
 	root := mbapsFixtureRoot(t)
+	ensureMbapsFixturesFresh(t, root)
 	m := loadMbapsManifest(t, root)
 
 	for _, f := range m.Negatives {

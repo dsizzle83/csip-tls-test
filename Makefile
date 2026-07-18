@@ -338,6 +338,20 @@ sweep-sunspec:
 # same way and runs the full 62-requirement Secure SunSpec Modbus suite end to end
 # against an in-process loopback gateway (all rows addressed, zero FAIL), plus a
 # teeth test proving a non-conformant peer FAILs the denial rows (T06.10).
+#
+# Exception: internal/mbtls/mbaps_fixtures_integration_test.go deliberately
+# does NOT mint a runtime PKI — its whole point is to prove the COMMITTED
+# certs/mbaps/ tree (T06.1) is handshake-ready. That tree's certs are
+# git-tracked but its *-key.pem files are gitignored (never committed), so a
+# checkout can have keys that are missing or stale (minted for a different
+# cert generation than what's on disk now) — every case in that file then
+# fails identically with a cryptic wolfSSL VERIFY_SIGN_ERROR (-330). Unlike
+# $(CA_CERT) below (which only fires when ca-cert.pem is MISSING), that
+# file's own ensureMbapsFixturesFresh guard compares cert/key pubkeys and
+# auto-regenerates certs/mbaps/ (scripts/gen-mbaps-certs.sh) whenever they
+# mismatch, on every `go test -tags=integration` run — so it needs no
+# separate Makefile prerequisite here; adding a $(CA_CERT)-style one would
+# just duplicate that check with a different (missing-file-only) trigger.
 test-integration: $(CA_CERT)
 	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/ssm-conformance/
 
