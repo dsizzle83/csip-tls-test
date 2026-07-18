@@ -68,6 +68,14 @@ internal/mbtls/         Secure SunSpec Modbus (mbaps) wolfSSL glue: client (Dial
                         (Listen/Accept) profiles, independent role extraction (RoleFromDER).
                         DELIBERATELY not lexa-platform/securemodbus — referee independence
                         (T06 PN-1/C9): shares only lexa-proto/mbap (framing) with the product.
+internal/aggregator/    SunSpec Modbus aggregator emulator CORE (T06.4/T06.5): a northbound
+                        mbaps CLIENT that plays the utility/VPP driving the gateway's :802
+                        server. Role sessions (ConnectAs over internal/mbtls), a
+                        lexa-proto/modbus.Transport adapter over mbap.Client, per-unit
+                        device discovery (SunSpec Model 1), telemetry polling, and the
+                        typed control / readback / role-denial primitives + JSON run state
+                        the scenario engine (T06.6+) composes. Uses the bench's OWN mbtls +
+                        RoleFromDER (C9), shares only lexa-proto/{mbap,modbus,sunspec}. cgo.
 internal/southbound/    Modbus/SunSpec device drivers + sim world model; codec (sunspec/modbus)
                         and DER control/measurement mapping (derbase) all now imported from
                         lexa-proto — TASK-021/082. No bench-local codec or derbase fork remains.

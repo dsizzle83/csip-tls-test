@@ -255,10 +255,11 @@ modbus-conformance-pi:
 test: $(CA_CERT) test-fast test-integration
 
 # Fast unit tests across the cgo packages — pure-Go logic only (suite-order /
-# role-parse tables for mbtls). Pulls cgo for compilation but does no TLS
+# role-parse tables for mbtls; PKI/manifest, point-encoding, and run-state logic
+# for the aggregator emulator). Pulls cgo for compilation but does no TLS
 # handshakes.
 test-fast:
-	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/
+	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/
 
 # Hostile-QA deterministic-regression gate (Phase 5): fault-injector + diagnoser
 # unit tests, no bench. Add the live mayhem suite with: make qa-bench.
@@ -296,9 +297,12 @@ sweep-sunspec:
 # so it needs no gen-test-certs prerequisite; it proves the mbaps profile via a
 # loopback client↔server handshake (T06.2). sim/mbapsdev mints its own
 # throwaway CA + server/client leaves the same way and proves the device sim
-# end-to-end over a loopback mbaps session (T06.3).
+# end-to-end over a loopback mbaps session (T06.3). internal/aggregator mints the
+# same way and proves the emulator core (T06.4/T06.5 primitives) — connect as a
+# role, discover via Model 1, poll telemetry, write+readback, denial probe —
+# against a loopback authz-enforcing mbaps server.
 test-integration: $(CA_CERT)
-	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/
+	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/
 
 # TASK-048: 15 minutes per go-native fuzz target against the client-side
 # IEEE 2030.5 XML unmarshal entry points in internal/csipref/discovery
