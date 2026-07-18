@@ -1,0 +1,22 @@
+{
+  "camp_v": 1,
+  "id": "curtail-solar-50",
+  "name": "Curtail solar to 50%, verify readback, then release",
+  "role": "GridServiceSunSpec",
+  "target": "gateway",
+  "hypothesis": "A grid-service head-end commands an active-power limit and must be able to confirm the DER actually APPLIED it, not merely accepted the write (Modbus success = accepted into the pipeline; application truth is the 704 echo).",
+  "expected": "The gateway echoes the commanded WMaxLimPct back through its 704 projection; the emulator's readback converges to 50% then back to 100% within the SLA.",
+  "fix": "If a readback never converges, the write was accepted but not applied: look at lexa-mode's %->W conversion (nameplate provenance, ruling C15) and the lexa-modbus reconciler.",
+  "notes": "Runs hermetically against the loopback authz server (a solar inverter on unit 2) AND live against lexa-gw :802. The hold is deliberately short for CI/demo; lengthen sleep_s for a real 10-minute soak.",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "poll", "units": "*", "period_s": 1},
+    {"do": "write_point", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 50},
+    {"do": "readback", "unit": 2, "model": 704, "point": "WMaxLimPct", "expect": 50, "sla_s": 10, "tol": 1},
+    {"do": "sleep_s", "seconds": 2},
+    {"do": "write_point", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 100},
+    {"do": "readback", "unit": 2, "model": 704, "point": "WMaxLimPct", "expect": 100, "sla_s": 10, "tol": 1}
+  ],
+  "oracle": {"name": "convergeWithinSLA"},
+  "expected_verdicts": ["PASS"]
+}

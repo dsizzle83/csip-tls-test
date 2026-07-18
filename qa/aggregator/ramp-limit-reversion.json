@@ -1,0 +1,21 @@
+{
+  "camp_v": 1,
+  "id": "ramp-limit-reversion",
+  "name": "Limit with RvrtTms must revert to safe default on expiry",
+  "role": "GridServiceSunSpec",
+  "target": "gateway",
+  "hypothesis": "A curtailment written with a reversion timer must be ACTIVELY reverted to the safe default when the timer expires. A ceiling left dangling after RvrtTms is the stuck-curtailment safety-invariant regression.",
+  "expected": "WMaxLimPct holds at 50% through the window, then the gateway reverts it to 100% after RvrtTms. reversionOnExpiry FAILs if the revert readback stays at 50% (stuck).",
+  "fix": "If the value stays at 50%, look at lexa-mode's reversion-timer ownership (design 04 B.2): the mode service owns RvrtTms expiry and must re-author the safe default, not the device.",
+  "notes": "Live-bench campaign. The hermetic loopback authz server has no reversion-timer logic, so this runs against lexa-gw (or a reverting mbapsdev); the reversionOnExpiry oracle's decision logic is unit-tested against synthetic evidence in campaign_test.go. RvrtTms is short for demo.",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "poll", "units": "*", "period_s": 2},
+    {"do": "write_point", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 50, "win_tms": 30, "rvrt_tms": 20},
+    {"do": "readback", "unit": 2, "model": 704, "point": "WMaxLimPct", "phase": "hold", "expect": 50, "sla_s": 10, "tol": 1},
+    {"do": "sleep_s", "seconds": 25},
+    {"do": "readback", "unit": 2, "model": 704, "point": "WMaxLimPct", "phase": "revert", "expect": 100, "sla_s": 15, "tol": 1}
+  ],
+  "oracle": {"name": "reversionOnExpiry"},
+  "expected_verdicts": ["PASS"]
+}

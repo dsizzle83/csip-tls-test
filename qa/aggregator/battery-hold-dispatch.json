@@ -1,0 +1,23 @@
+{
+  "camp_v": 1,
+  "id": "battery-hold-dispatch",
+  "name": "Battery hold then dispatch (active-power setpoint)",
+  "role": "GridServiceSunSpec",
+  "target": "device",
+  "hypothesis": "A VPP holds a battery at zero, then dispatches a fixed export; each setpoint must read back as APPLIED, not merely accepted.",
+  "expected": "704 WSet reads back 0 during the hold and the dispatched watts after dispatch, within the SLA.",
+  "fix": "If WSet never converges, look at the 704 WSet/WSet_SF projection and the reconciler's setpoint path.",
+  "notes": "Live/battery campaign: a battery mbapsdev (or lexa-gw southbound) on unit 3. Validated at load in every build; executed on the bench. Not run against the solar-only hermetic loopback.",
+  "steps": [
+    {"do": "discover", "units": [3]},
+    {"do": "poll", "units": "*", "period_s": 2},
+    {"do": "write_point", "unit": 3, "model": 704, "point": "WSetEna", "value": 1},
+    {"do": "write_point", "unit": 3, "model": 704, "point": "WSet", "value": 0},
+    {"do": "readback", "unit": 3, "model": 704, "point": "WSet", "expect": 0, "sla_s": 30, "tol": 10},
+    {"do": "sleep_s", "seconds": 5},
+    {"do": "write_point", "unit": 3, "model": 704, "point": "WSet", "value": 2000},
+    {"do": "readback", "unit": 3, "model": 704, "point": "WSet", "expect": 2000, "sla_s": 30, "tol": 50}
+  ],
+  "oracle": {"name": "convergeWithinSLA"},
+  "expected_verdicts": ["PASS"]
+}

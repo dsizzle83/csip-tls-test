@@ -13,6 +13,11 @@ import (
 // (T06.8) tasks compose; the core provides a correct typed write, a typed read,
 // and a denial probe — no oracle/verdict logic (that is the campaign engine's).
 
+// controlModel is the DER AC Controls model (704) whose projection the gateway
+// echoes a commanded value back through — the default model a readback reads and
+// a control write targets when a campaign step omits an explicit model.
+const controlModel = sunspec.ModelDERCtlAC
+
 // fixedLayouts maps the fixed-shape SunSpec DER models (single Layout, no
 // repeating sub-groups) to their layout. Only these are safe for the point-
 // addressed WritePoint/ReadPoint: the curve/port models (705-712, 714) have
