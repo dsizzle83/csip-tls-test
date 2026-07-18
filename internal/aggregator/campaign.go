@@ -36,10 +36,9 @@ const CampaignV = 1
 // (each verb ↔ one mayhemDriver method). The vocabulary can only grow by adding a
 // verb that mirrors a driver primitive, never by adding control flow.
 //
-// Reserved for T06.8 (TLS-fault probes), intentionally NOT accepted here yet so a
-// campaign using them fails loudly at load rather than silently no-op'ing:
-// "renegotiate" (the renegotiation-refusal probe). Its oracle bodies
-// (resumeAfterDrop, renego-refusal) are that task's, not this one's.
+// The TLS-fault verbs (StepResume, StepRenegotiate) drive the transport layer so
+// the T06.8 probes can exercise resumption and renegotiation policy; they map to
+// driver methods exactly like every other verb (no control flow added).
 const (
 	StepConnectAs       = "connect_as"       // switch the session role mid-campaign
 	StepDiscover        = "discover"         // walk the per-device unit map
@@ -49,7 +48,8 @@ const (
 	StepReadback        = "readback"         // poll a status/echo point to convergence
 	StepExpectException = "expect_exception" // assert a write yields a given exception
 	StepDisconnect      = "disconnect"       // close the current session
-	StepResume          = "resume"           // re-establish the session (reconnect)
+	StepResume          = "resume"           // re-establish the session (reconnect, resuming the TLS session if allowed)
+	StepRenegotiate     = "renegotiate"      // attempt a client-initiated TLS renegotiation (refusal probe, T06.8)
 	StepSleep           = "sleep_s"          // wait (ctx-cancellable), e.g. a hold window
 	StepSimFault        = "sim_fault"        // arm/clear a fault on a named sim via its simapi
 )
@@ -60,7 +60,7 @@ var knownVerbs = map[string]bool{
 	StepConnectAs: true, StepDiscover: true, StepPoll: true,
 	StepWritePoint: true, StepWriteMulti: true, StepReadback: true,
 	StepExpectException: true, StepDisconnect: true, StepResume: true,
-	StepSleep: true, StepSimFault: true,
+	StepRenegotiate: true, StepSleep: true, StepSimFault: true,
 }
 
 // Target names a campaign's connection target, resolved to a dial address by the
@@ -309,6 +309,10 @@ func validateStep(i int, s Step) error {
 		}
 	case StepDisconnect, StepResume:
 		// no fields
+	case StepRenegotiate:
+		// unit is OPTIONAL: when >0 the probe does a post-renegotiation liveness
+		// read on that unit to confirm the session survived (or cleanly
+		// recovered); 0 skips the liveness read. No other fields apply.
 	case StepSleep:
 		if s.Seconds <= 0 {
 			return fmt.Errorf("seconds must be > 0")

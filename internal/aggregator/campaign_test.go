@@ -117,6 +117,9 @@ func TestLoadCampaignDir_Seeds(t *testing.T) {
 	want := map[string]bool{
 		"curtail-solar-50": false, "role-denial-readonly": false,
 		"battery-hold-dispatch": false, "ramp-limit-reversion": false,
+		// T06.8 TLS-fault probe campaigns.
+		"resumption-after-drop": false, "mid-session-drop": false,
+		"renego-refusal": false,
 	}
 	for _, c := range camps {
 		if _, ok := want[c.ID]; ok {

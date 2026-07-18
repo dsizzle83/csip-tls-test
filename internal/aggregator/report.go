@@ -52,7 +52,10 @@ type ExceptionCheck struct {
 // StepResult is the per-step outcome the oracle reasons over. OK is the step's
 // mechanical success (the write landed, the readback converged, the exception was
 // observed as expected); Err carries a transport-level failure. Exactly one of
-// Write/Readback/Exception is populated for the verbs that produce that evidence.
+// Write/Readback/Exception/Reneg is populated for the verbs that produce that
+// evidence; Session is attached by the session-establishing verbs (connect_as,
+// resume) so the TLS-fault oracles can read the handshake facts (Resumed) the
+// step produced.
 type StepResult struct {
 	Index     int             `json:"index"`
 	Do        string          `json:"do"`
@@ -63,6 +66,13 @@ type StepResult struct {
 	Write     *WriteRecord    `json:"write,omitempty"`
 	Readback  *ReadbackRecord `json:"readback,omitempty"`
 	Exception *ExceptionCheck `json:"exception,omitempty"`
+	// Session is the handshake-fact snapshot a connect_as/resume step produced —
+	// the evidence the resumeAfterDrop oracle reads (Session.Resumed). nil for
+	// non-session verbs.
+	Session *SessionInfo `json:"session,omitempty"`
+	// Reneg is the renegotiation-probe evidence a renegotiate step produced — the
+	// evidence the renegotiationRefusal oracle judges. nil for other verbs.
+	Reneg *RenegotiationResult `json:"reneg,omitempty"`
 }
 
 // CampaignReport is the versioned, JSON-serializable record of one campaign run.

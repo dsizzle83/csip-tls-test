@@ -9,14 +9,11 @@ package aggregator
 // campaign still ships as data. This keeps a campaign auditable by inspection and
 // keeps the engine from becoming an unreviewed rules engine.
 //
-// Oracle bodies live here (denyExpected) and in readback.go (convergeWithinSLA,
-// reversionOnExpiry). Each is a PURE function of the finished CampaignReport's
-// evidence: it reads Steps/Samples/Denials, returns exactly one Verdict plus
-// human-readable findings, and mutates nothing.
-//
-// Reviewer note (T06.8): the TLS-fault probes add sessionSurvival / resumeAfterDrop
-// (and the renegotiation-refusal judge) to this registry. They are intentionally
-// absent here — this task ships the control/readback/denial oracles only.
+// Oracle bodies live here (denyExpected), in readback.go (convergeWithinSLA,
+// reversionOnExpiry), and in probes.go (resumeAfterDrop, sessionSurvival,
+// renegotiationRefusal — the T06.8 TLS-fault judges). Each is a PURE function of
+// the finished CampaignReport's evidence: it reads Steps/Samples/Denials, returns
+// exactly one Verdict plus human-readable findings, and mutates nothing.
 
 import (
 	"encoding/json"
@@ -51,6 +48,18 @@ var oracleRegistry = map[string]oracleBuilder{
 	// returned to the safe default on RvrtTms expiry ⇒ PASS; a value left stuck
 	// at the commanded limit ⇒ FAIL (the stuck-curtailment safety class). T06.7.
 	"reversionOnExpiry": noParamOracle(reversionOnExpiry),
+	// resumeAfterDrop: every re-established session RESUMED the prior TLS session
+	// rather than doing a full handshake ⇒ PASS; a full handshake ⇒ FAIL. The
+	// TCP-46 judge the mbtls client-session-reuse enhancement makes possible (T06.8).
+	"resumeAfterDrop": noParamOracle(resumeAfterDrop),
+	// sessionSurvival: after a mid-session disconnect/drop the emulator recovered
+	// and carried a later operation ⇒ PASS; never recovered ⇒ FAIL. The
+	// mid-session-disconnect-recovery judge (T06.8).
+	"sessionSurvival": noParamOracle(sessionSurvival),
+	// renegotiationRefusal: a client-initiated renegotiation left the session
+	// SAFE (refused-and-usable, or handled-and-usable) ⇒ PASS; left unusable ⇒
+	// FAIL. The renegotiation-refusal judge (TCP-62 indication-only policy; T06.8).
+	"renegotiationRefusal": noParamOracle(renegotiationRefusal),
 }
 
 // noParamOracle adapts a plain OracleFunc (the common case — no params) into an

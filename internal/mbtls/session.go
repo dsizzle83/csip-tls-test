@@ -37,6 +37,15 @@ type Session struct {
 	raw  net.Conn       // underlying TCP conn (addrs, transport close)
 	file *os.File       // dup'd fd wolfSSL drives; kept alive for the session's lifetime
 
+	// Client session-resumption hooks (nil on the server side). On a client
+	// session that negotiated resumption, Close captures the wolfSSL session into
+	// cache[cacheKey] so the next Dial to the same peer+identity can resume it
+	// (TCP-46, T06.8). Capturing on close (not at handshake) lets the TLS 1.3
+	// NewSessionTicket be pumped by the intervening reads first.
+	cache          *sessionCache
+	cacheKey       string
+	captureOnClose bool
+
 	closeOnce sync.Once
 }
 
@@ -96,6 +105,15 @@ func (s *Session) Role() (string, error) {
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		if s.ssl != nil {
+			// Capture the resumable session BEFORE tearing the handle down, so the
+			// next Dial to this peer+identity can offer it (TCP-46). A nil capture
+			// (peer disabled caching, or the TLS 1.3 ticket never arrived) is a
+			// no-op — put ignores it. Only client sessions set cache/captureOnClose.
+			if s.cache != nil && s.captureOnClose {
+				if sess := wolfssl.GetSession(s.ssl); sess != nil {
+					s.cache.put(s.cacheKey, sess)
+				}
+			}
 			wolfssl.Shutdown(s.ssl)
 			wolfssl.FreeSSL(s.ssl)
 			s.ssl = nil

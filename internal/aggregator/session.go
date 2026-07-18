@@ -161,6 +161,20 @@ func (p PKIRefs) Cred(r Role) (RoleCred, bool) {
 	return c, ok
 }
 
+// Roles returns the roles this PKIRefs actually has credentials for, in the
+// stable Roles() order — the set a CLI role-picker (T06.9) offers and a matrix
+// sweep iterates. It is a subset of the package Roles() (a manifest may omit a
+// role, or a fresh checkout may lack its gitignored key).
+func (p PKIRefs) Roles() []Role {
+	var out []Role
+	for _, r := range Roles() {
+		if _, ok := p.creds[r]; ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // SetCred registers or overrides the credential for role r. Used by tests and by
 // later tasks that mint fixtures programmatically (T06.8 negatives).
 func (p *PKIRefs) SetCred(r Role, cred RoleCred) {
@@ -310,11 +324,11 @@ func (c *Conn) redial() error {
 // (they describe the device, not the connection), so discovery/poll state is not
 // lost.
 //
-// NOTE (reviewer, T06.8): each reconnect is a full handshake — true TLS session
-// resumption across reconnects (TCP-46, Resumed=true) needs an mbtls enhancement
-// to carry a WOLFSSL_SESSION across Dials (mbtls.Dial builds a fresh CTX per
-// call today), so Resumed is reported honestly as the peer negotiates it and is
-// expected false here until that lands.
+// TLS session resumption (T06.8): each reconnect goes through mbtls.Dial, which
+// offers the cached TLS session for this peer+identity, so a reconnect RESUMES
+// (Resumed=true) when the peer allows it (TCP-46) rather than always doing a full
+// handshake — the resumeAfterDrop probe judges exactly this. Resumed is still
+// reported honestly: a peer that declines resumption yields false.
 func (c *Conn) Reconnect(ctx context.Context) error {
 	const (
 		base = 100 * time.Millisecond
@@ -386,7 +400,8 @@ func (c *Conn) Session() *mbtls.Session {
 }
 
 // Resumed reports whether the current handshake resumed a cached TLS session
-// (TCP-46). See the Reconnect note: honest, and expected false after a redial.
+// (TCP-46). True after a reconnect to a peer+identity whose session was cached
+// and the peer accepted resumption (see the Reconnect note); honest either way.
 func (c *Conn) Resumed() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
