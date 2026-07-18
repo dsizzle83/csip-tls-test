@@ -54,6 +54,20 @@ func startBatteryEnv(t *testing.T) *modbusEnv {
 	})
 }
 
+// startSolarEnvWithSerial starts an animated solar sim (the same builder
+// modsim/mbapsdev -model inverter use) with an explicit -serial-equivalent
+// override, for DISC-007's SN-field regression guard.
+func startSolarEnvWithSerial(t *testing.T, serial string) *modbusEnv {
+	t.Helper()
+	return startEnvWith(t, func(url string) (*sim.Server, error) {
+		srv, err := sim.NewSolarServer(url, 5000, serial)
+		if err != nil {
+			return nil, err
+		}
+		return srv.Server, nil
+	})
+}
+
 func startEnvWith(t *testing.T, newSrv func(string) (*sim.Server, error)) *modbusEnv {
 	t.Helper()
 
@@ -157,6 +171,43 @@ func TestModbusConformance_DISC002_Inverter(t *testing.T) {
 		t.Error("DISC-002: Model string is empty")
 	}
 	t.Logf("DISC-002 PASS: Manufacturer=%q Model=%q", mfr, mod)
+}
+
+// TestModbusConformance_DISC007_DistinctSerialAtSNOffset regression-guards a
+// bench finding (T05/T06 bench identity dedup): a sim's -serial override
+// must land in the SunSpec Model 1 SN field (m1+48 — sunspec.ReadCommon's
+// .Serial), NOT Opt (m1+32). Two sims with distinct -serial must parse to
+// distinct .Serial through the gateway's OWN sunspec.ReadCommon, or a
+// downstream gateway that keys device identity on manufacturer|model|serial
+// dedupes them into one nb_unit — exactly what happened on the bench when
+// this landed in Opt instead: Options="BENCH-MODSIM-01" but Serial="" for
+// both sims.
+func TestModbusConformance_DISC007_DistinctSerialAtSNOffset(t *testing.T) {
+	envA := startSolarEnvWithSerial(t, "BENCH-SERIAL-A")
+	defer envA.stop()
+	envB := startSolarEnvWithSerial(t, "BENCH-SERIAL-B")
+	defer envB.stop()
+
+	cA, err := sunspec.ReadCommon(envA.reader)
+	if err != nil {
+		t.Fatalf("DISC-007: ReadCommon A: %v", err)
+	}
+	cB, err := sunspec.ReadCommon(envB.reader)
+	if err != nil {
+		t.Fatalf("DISC-007: ReadCommon B: %v", err)
+	}
+	if cA.Serial != "BENCH-SERIAL-A" {
+		t.Errorf("DISC-007: sim A .Serial = %q, want %q", cA.Serial, "BENCH-SERIAL-A")
+	}
+	if cB.Serial != "BENCH-SERIAL-B" {
+		t.Errorf("DISC-007: sim B .Serial = %q, want %q", cB.Serial, "BENCH-SERIAL-B")
+	}
+	if cA.Serial == cB.Serial {
+		t.Errorf("DISC-007: two sims with distinct -serial parsed to the SAME .Serial %q — "+
+			"the value is landing in the wrong Model 1 field (Opt m1+32 instead of SN m1+48)", cA.Serial)
+	}
+	t.Logf("DISC-007 PASS: distinct -serial -> distinct sunspec.ReadCommon.Serial (A=%q B=%q, Opt A=%q B=%q)",
+		cA.Serial, cB.Serial, cA.Options, cB.Options)
 }
 
 // TestModbusConformance_DISC003_Inverter verifies an AC measurement model is present.

@@ -435,7 +435,11 @@ const defaultSolarSerial = "SN-SOLAR-001"
 // NewSolarServer/NewSolarServerAdvanced (and modsim/mbapsdev's -serial flag)
 // can give two co-located sims distinct SunSpec device identity — a
 // downstream gateway that keys device identity on manufacturer|model|serial
-// otherwise dedupes them into one device.
+// otherwise dedupes them into one device. The result is written to the SN
+// field at m1+48 (see populateSolarCore) — NOT m1+32 (Opt), which lands at
+// the wrong offset per lexa-proto/sunspec/identity.go's Model 1 layout and
+// was the T05/T06 bench finding: two sims with distinct Opt but empty SN
+// still deduped to one nb_unit.
 func solarSerialOrDefault(serial string) string {
 	if serial == "" {
 		return defaultSolarSerial
@@ -464,7 +468,16 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	m1 := cursor + 2
 	setStr16(r, m1+0, "SunSpec Sim")
 	setStr8(r, m1+16, "CSIP-Solar-5000")
-	setStr8(r, m1+32, solarSerialOrDefault(serial))
+	// m1+32 (Opt, 8 regs) is intentionally left blank (zero/NUL) — this sim
+	// advertises no device-options string. The device SERIAL belongs at
+	// m1+48 (SN, 16 regs), NOT m1+32: lexa-proto/sunspec/identity.go's Model 1
+	// layout is Mn(0,16) / Md(16,16) / Opt(32,8) / Vr(40,8) / SN(48,16)
+	// (commonSNReg=48, commonSNEnd=64; m1Len=66 already covers it). A prior
+	// version of this sim wrote the serial into Opt instead — bench finding:
+	// the gateway's ReadCommon parsed Options="BENCH-MODSIM-01"/Serial="" for
+	// two distinct sims, so both empty serials collapsed into one nb_unit on
+	// manufacturer|model|serial.
+	setStr16(r, m1+48, solarSerialOrDefault(serial))
 	cursor += 2 + m1Len
 
 	// Model 120 (Nameplate) — 26 data regs
