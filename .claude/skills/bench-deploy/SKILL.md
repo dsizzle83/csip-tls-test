@@ -22,6 +22,28 @@ cd ~/projects/lexa-hub && make wolfssl-arm64 && make build-arm64
 # (arm64 wolfSSL sysroot lives in /tmp and is wiped on reboot — rebuild it first)
 ```
 
+## Secure Modbus (mbaps) pieces run on the DESKTOP, not the Pis (PN-2)
+
+`sim/mbapsdev` (secure device sim), `sim/aggregator` (the mbaps aggregator emulator),
+and `sim/ssm-conformance` (the 62-requirement conformance walker) are **cgo (wolfSSL)** —
+unlike the plain pure-Go sims, they do NOT cross-compile freely. Default topology keeps
+all three on the desktop (69.0.0.20), built with the amd64 sysroot:
+
+```bash
+make build-mbapsdev build-aggregator build-ssm-conformance   # desktop, amd64 wolfSSL sysroot
+bin/mbapsdev -listen :8021 -model inverter -api-port 6031     # southbound target, desktop-only
+make ssm-conformance                                         # 62-req suite vs a loopback (no bench)
+make ssm-conformance TARGET="-target 69.0.0.2:802 -pki certs/mbaps"   # vs the live gateway on the CC93
+```
+
+The aggregator emulator drives the gateway northbound over the LAN from where it is built
+(the desktop) — **no cross-compile needed**. Deploying `mbapsdev` onto a sim Pi is optional
+and requires an **arm64 wolfSSL sysroot** cross-build (the plain sims never needed one):
+`GOOS=linux GOARCH=arm64` alone will not build it — set the arm64 wolfSSL `CGO_CFLAGS`/
+`CGO_LDFLAGS` first, as the lexa-hub `wolfssl-arm64` recipe does. Live mbaps runs (aggregator
+campaigns, `ssm-conformance -target …`) need `make gen-mbaps-certs` first for the role/device
+keys (gitignored); the loopback self-tests mint their own throwaway PKI and need none.
+
 ## Deploy
 
 1. **Hub**: `bash ~/projects/lexa-hub/scripts/deploy-hub-pi.sh 69.0.0.2 root`
