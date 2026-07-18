@@ -1,0 +1,19 @@
+{
+  "camp_v": 1,
+  "id": "role-denial-readonly",
+  "name": "Read-only roles cannot write controls (exception 01)",
+  "role": "ReadOnlySunSpec",
+  "target": "gateway",
+  "hypothesis": "A read-only owner/vendor session that attempts a control write must be denied at authz with exception 01 and NOTHING else: no partial success, no different code that would hint at the register map.",
+  "expected": "Every control write as ReadOnlySunSpec or LexaVoltReadOnly returns Modbus exception 01 (Wrote=false); reads are unaffected.",
+  "fix": "If a write is accepted or a different code returned, look at lexa-mbaps' RBAC overlay evaluation (bitwise deny, ruling C13) and the role extracted from the client cert (design 01 3.1: role errors collapse to no-role at authz).",
+  "notes": "The full grant/deny matrix across all five roles + the malformed-role certs is T06.8; this campaign proves the two read-only roles' denial path (ReadOnly then, mid-campaign, LexaVolt).",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "expect_exception", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 25, "expect_code": 1},
+    {"do": "connect_as", "role": "LexaVoltReadOnly"},
+    {"do": "expect_exception", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 25, "expect_code": 1}
+  ],
+  "oracle": {"name": "denyExpected"},
+  "expected_verdicts": ["PASS"]
+}
