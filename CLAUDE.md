@@ -34,6 +34,11 @@ sim/tlsserver/          wolfSSL mTLS server library (pins ECDHE-ECDSA-AES128-CCM
 sim/server/             mTLS gridsim binary (desktop, cgo)
 sim/{modsim,batsim,metersim,evsim}/   Device sim binaries
 sim/southbound/         In-memory Modbus device models (no hardware)
+sim/mbapsdev/           Secure Modbus (mbaps) DEVICE sim: internal/mbtls server +
+                        lexa-proto/mbap dispatch over sim/southbound's animated
+                        register world (-model inverter|battery). Southbound TARGET
+                        for the lexa-gw gateway / T06.4 aggregator emulator to poll
+                        over Secure SunSpec Modbus. cgo (see internal/mbtls below).
 sim/simapi/             REST + WS + SSE /logs sidecar for every sim
 sim/conformance/        CSIP conformance runner (Pi, cgo)
 sim/modsim-conformance/ Modbus conformance runner (-device inverter|battery|meter)
@@ -59,6 +64,10 @@ internal/csipref/       2030.5 walker (discovery/) + DER event scheduler (schedu
                         (AD-003(f), TASK-082). Consumed by sim/conformance, sim/client(-http),
                         tests/*.
 internal/tlsclient/     wolfSSL mTLS client (persistent keep-alive fetcher)
+internal/mbtls/         Secure SunSpec Modbus (mbaps) wolfSSL glue: client (Dial) + server
+                        (Listen/Accept) profiles, independent role extraction (RoleFromDER).
+                        DELIBERATELY not lexa-platform/securemodbus — referee independence
+                        (T06 PN-1/C9): shares only lexa-proto/mbap (framing) with the product.
 internal/southbound/    Modbus/SunSpec device drivers + sim world model; codec (sunspec/modbus)
                         and DER control/measurement mapping (derbase) all now imported from
                         lexa-proto — TASK-021/082. No bench-local codec or derbase fork remains.
@@ -70,7 +79,8 @@ docs/                   HARNESS_REVIEW.md (audit findings), BENCH.md (live bench
 Live topology, IPs, SSH users, service models: **read `docs/BENCH.md`** before any deploy/SSH work.
 Quick port map: gridsim 11111/11112 + dashboard 8080 (desktop 69.0.0.20) ·
 modsim 5020/6020 (.10) · batsim 5021/6021 (.11) · metersim 5022/6022 (.12) ·
-evsim simapi 6024 (.14) · hub: lexa-api 9100, OCPP CSMS 8887 (69.0.0.2 — ConnectCore 93
+evsim simapi 6024 (.14) · mbapsdev 8021/6031 (mbaps/TLS + simapi, desktop-only —
+cgo wolfSSL, PN-2) · hub: lexa-api 9100, OCPP CSMS 8887 (69.0.0.2 — ConnectCore 93
 dev kit, `root@`, since 2026-07-07; Pi hub 69.0.0.1 is standby).
 Pattern: Modbus port / simapi port. simapi: `GET /state`, `POST /inject`, `POST /control`, `GET /logs` (SSE).
 
@@ -79,7 +89,12 @@ Pattern: Modbus port / simapi port. simapi: `GET /state`, `POST /inject`, `POST 
 make test-fast                    # unit tests, no network (<1 s) — run after every change
 go test ./tests/                  # 2030.5 discovery + MUP + conformance logic
 go test ./internal/southbound/... # Modbus/SunSpec unit tests
-make test-integration             # wolfSSL mTLS handshake tests (amd64 sysroot on desktop)
+make test-integration             # wolfSSL mTLS handshake tests (amd64 sysroot on desktop),
+                                   # incl. sim/mbapsdev's loopback mbaps device-sim proof
+make build-mbapsdev               # secure Modbus device sim (cgo); needs certs/mbaps/ (T06.1,
+                                   # not yet generated in this tree) to run for real — its own
+                                   # tests mint a throwaway PKI, so `make test-integration`
+                                   # proves it without any cert-gen step
 make build                        # all binaries → bin/
 scripts/run-conformance.sh        # full CSIP conformance evidence (layers 1-3)
 

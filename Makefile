@@ -1,4 +1,5 @@
 .PHONY: all build build-server build-client build-conformance build-modsim build-vtnsim \
+        build-mbapsdev \
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
@@ -53,6 +54,13 @@ build-batsim:
 build-metersim:
 	@mkdir -p bin
 	go build -o bin/metersim ./sim/metersim
+
+# mbapsdev is cgo (imports internal/mbtls -> internal/wolfssl), unlike the
+# plain sims above — needs the wolfSSL sysroot env (see WOLFSSL_SYSROOT at
+# the top of this file), same as build-server. T06.3.
+build-mbapsdev:
+	@mkdir -p bin
+	go build -o bin/mbapsdev ./sim/mbapsdev
 
 build-evsim:
 	@mkdir -p bin
@@ -250,7 +258,7 @@ test: $(CA_CERT) test-fast test-integration
 # role-parse tables for mbtls). Pulls cgo for compilation but does no TLS
 # handshakes.
 test-fast:
-	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/
+	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/
 
 # Hostile-QA deterministic-regression gate (Phase 5): fault-injector + diagnoser
 # unit tests, no bench. Add the live mayhem suite with: make qa-bench.
@@ -269,6 +277,7 @@ qa-bench:
 # Includes the in-process Modbus conformance suite (TestModbusConformance_*).
 test-southbound:
 	go test ./internal/southbound/...
+	go test ./sim/southbound/...
 	go test ./tests/ -run TestModbusConformance -v
 
 # TASK-053 (GAP-07): quick local re-run of just the int16/scale-factor
@@ -285,9 +294,11 @@ sweep-sunspec:
 # Full integration tests with real TLS handshakes. Requires fixtures.
 # internal/mbtls mints its own P-256 role fixtures at runtime (self-contained),
 # so it needs no gen-test-certs prerequisite; it proves the mbaps profile via a
-# loopback client↔server handshake (T06.2).
+# loopback client↔server handshake (T06.2). sim/mbapsdev mints its own
+# throwaway CA + server/client leaves the same way and proves the device sim
+# end-to-end over a loopback mbaps session (T06.3).
 test-integration: $(CA_CERT)
-	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/
+	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/
 
 # TASK-048: 15 minutes per go-native fuzz target against the client-side
 # IEEE 2030.5 XML unmarshal entry points in internal/csipref/discovery
