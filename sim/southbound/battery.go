@@ -48,6 +48,12 @@ type BatteryServer struct {
 	// from whatever the sinusoidal animation last wrote to the register.
 	pendingSoC atomic.Pointer[float64]
 	faults     faultController // shared fault-injection state (see faults.go)
+
+	// Advanced-DER (7xx) surface — populated only by NewBatteryServerAdvanced
+	// (battery_adv.go). When advanced is false the sim serves the legacy
+	// models only and behaves exactly as today.
+	advanced bool
+	adv      batteryAdvBases
 }
 
 // batteryFaultKinds is the set of POST /fault kinds the battery sim advertises.
@@ -313,6 +319,20 @@ func chaStText(st int) string {
 // ── populate ──────────────────────────────────────────────────────────────────
 
 func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) BatteryBases {
+	bases, cursor := populateBatteryCore(r, wmaxKwh, wmaxW)
+	r.Set(cursor, sunspec.EndMarker)
+	r.Set(cursor+1, 0)
+	return bases
+}
+
+// populateBatteryCore writes the legacy battery models (1/120/121/103/123/802)
+// into r and returns the model bases plus the cursor positioned at the
+// end-of-list slot (where either the SunS end marker or the advanced 7xx
+// models follow). Split out of populateBattery so NewBatteryServerAdvanced
+// (battery_adv.go, mbapsdev's T06.3 battery mode) can append 7xx models
+// before the end marker without duplicating the legacy layout — mirrors
+// solar.go's populateSolar/populateSolarCore split exactly.
+func populateBatteryCore(r *RegisterMap, wmaxKwh, wmaxW float64) (BatteryBases, uint16) {
 	sfN := func(v int16) uint16 { return uint16(v) }
 	base := sunspec.SunSpecBase
 
@@ -434,15 +454,12 @@ func populateBattery(r *RegisterMap, wmaxKwh, wmaxW float64) BatteryBases {
 	r.Set(m802Base+uint16(sunspec.M802_State), 2)
 	cursor += 2 + sunspec.M802Len
 
-	r.Set(cursor, sunspec.EndMarker)
-	r.Set(cursor+1, 0)
-
 	return BatteryBases{
 		M121Base: m121Base,
 		M103Base: m103Base,
 		M123Base: m123Base,
 		M802Base: m802Base,
-	}
+	}, cursor
 }
 
 // ── animation ─────────────────────────────────────────────────────────────────

@@ -17,6 +17,7 @@ description: Run the right tests for the most recently changed code and report r
    | `sim/evsim/` | `go test ./sim/evsim/...` (the OCPP server is now shared `lexa-proto/ocppserver`, vendored — test the server itself in the lexa-proto module) |
    | `sim/simapi/` | `go test ./sim/simapi/...` |
    | `internal/tlsclient/`, `sim/tlsserver/` | `make test-integration` (wolfSSL; works on this desktop via the amd64 sysroot) |
+   | `internal/mbtls/`, `sim/mbapsdev/` | `make test-integration` (cgo wolfSSL — mbaps handshake + loopback device-sim tests; `make test-fast` also compiles+runs their non-integration-tagged unit tests) |
    | anything touching goroutines, locks, maps shared across goroutines | add `-race` to the relevant `go test` (the audit found two real races this would have caught) |
    | `cmd/dashboard/` | `go build ./cmd/dashboard` (SPA is embedded HTML — build check only) |
    | `cmd/` otherwise | `go build ./...` |
