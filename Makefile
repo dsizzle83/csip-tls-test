@@ -246,10 +246,11 @@ modbus-conformance-pi:
 # Run everything: unit + integration for both packages.
 test: $(CA_CERT) test-fast test-integration
 
-# Fast unit tests across both packages — pure-Go logic only.
-# Pulls cgo for compilation but does no TLS handshakes.
+# Fast unit tests across the cgo packages — pure-Go logic only (suite-order /
+# role-parse tables for mbtls). Pulls cgo for compilation but does no TLS
+# handshakes.
 test-fast:
-	go test ./sim/tlsserver/ ./internal/tlsclient/
+	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/
 
 # Hostile-QA deterministic-regression gate (Phase 5): fault-injector + diagnoser
 # unit tests, no bench. Add the live mayhem suite with: make qa-bench.
@@ -282,8 +283,11 @@ sweep-sunspec:
 	go test -run 'APFromWatts' ./sim/gridsim/...
 
 # Full integration tests with real TLS handshakes. Requires fixtures.
+# internal/mbtls mints its own P-256 role fixtures at runtime (self-contained),
+# so it needs no gen-test-certs prerequisite; it proves the mbaps profile via a
+# loopback client↔server handshake (T06.2).
 test-integration: $(CA_CERT)
-	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/
+	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/
 
 # TASK-048: 15 minutes per go-native fuzz target against the client-side
 # IEEE 2030.5 XML unmarshal entry points in internal/csipref/discovery

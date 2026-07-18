@@ -290,3 +290,166 @@ func Version(ssl unsafe.Pointer) string {
 	}
 	return C.GoString(c)
 }
+
+// --- Secure SunSpec Modbus TLS profile extensions (T06.2) -------------------
+//
+// The functions below wrap the wolfSSL C API surface the mbaps profile needs
+// beyond CSIP's TLS-1.2-only / CCM-8-only path: a version-negotiable method
+// (TLS 1.2..1.3), min/max version pinning, RFC 6066 Maximum Fragment Length,
+// RFC 4492 supported-curve advertisement, RFC 5746 secure renegotiation, and
+// session-resumption inspection. They are strictly ADDITIVE — every function
+// above is untouched, so the CSIP tlsclient/tlsserver keep their exact
+// behaviour (extend, do not fork — CONTEXT.md).
+//
+// These require the bench's wolfSSL 5.7.6 sysroot to be built with
+// --enable-tls13 / --enable-maxfragment / --enable-secure-renegotiation /
+// --enable-session-ticket (design doc 01 §1.4). The amd64 desktop sysroot
+// already carries them (options.h: WOLFSSL_TLS13, HAVE_MAX_FRAGMENT,
+// HAVE_SECURE_RENEGOTIATION, HAVE_SESSION_TICKET, HAVE_AESGCM/AESCCM/CHACHA);
+// building against a sysroot without them fails at compile/link, not silently.
+
+// TLS wire protocol versions, for SetMinProtoVersion / SetMaxProtoVersion
+// (these take the OpenSSL-compat numeric constants, not the WOLFSSL_TLSV1_*
+// method enum).
+const (
+	TLS12Version = 0x0303 // TLS1_2_VERSION
+	TLS13Version = 0x0304 // TLS1_3_VERSION
+)
+
+// Maximum Fragment Length negotiation codes (RFC 6066). The value is wolfSSL's
+// exponent selector, NOT the byte count. MFL512 (2^9 = 512 bytes) is the mbaps
+// profile default (SunSpecTCP-59/60).
+const (
+	MFLDisabled = 0 // WOLFSSL_MFL_DISABLED
+	MFL512      = 1 // WOLFSSL_MFL_2_9  — 512 bytes
+	MFL1024     = 2 // WOLFSSL_MFL_2_10 — 1024 bytes
+	MFL2048     = 3 // WOLFSSL_MFL_2_11 — 2048 bytes
+	MFL4096     = 4 // WOLFSSL_MFL_2_12 — 4096 bytes
+)
+
+// ECCSecp256r1 is the RFC 4492 supported-groups identifier for NIST P-256, the
+// only curve the mbaps profile's ECDSA-only suites use (SunSpecTCP-42).
+const ECCSecp256r1 = 23 // WOLFSSL_ECC_SECP256R1
+
+// NewServerCtxTLS allocates a version-negotiable server context
+// (wolfTLS_server_method: negotiate the highest mutually-supported version down
+// to the configured floor). Pair with SetMinProtoVersion/SetMaxProtoVersion to
+// bound the range — the mbaps profile requires TLS 1.2 and enables TLS 1.3.
+func NewServerCtxTLS() (unsafe.Pointer, error) {
+	method := C.wolfTLS_server_method()
+	if method == nil {
+		return nil, errors.New("wolfTLS_server_method returned nil")
+	}
+	ctx := C.wolfSSL_CTX_new(method)
+	if ctx == nil {
+		return nil, errors.New("wolfSSL_CTX_new (TLS server) returned nil")
+	}
+	return unsafe.Pointer(ctx), nil
+}
+
+// NewClientCtxTLS allocates a version-negotiable client context
+// (wolfTLS_client_method).
+func NewClientCtxTLS() (unsafe.Pointer, error) {
+	method := C.wolfTLS_client_method()
+	if method == nil {
+		return nil, errors.New("wolfTLS_client_method returned nil")
+	}
+	ctx := C.wolfSSL_CTX_new(method)
+	if ctx == nil {
+		return nil, errors.New("wolfSSL_CTX_new (TLS client) returned nil")
+	}
+	return unsafe.Pointer(ctx), nil
+}
+
+// SetMinProtoVersion pins the lowest TLS version the context will negotiate
+// (use TLS12Version to make TLS 1.2 the mandated floor — SunSpecTCP-4).
+func SetMinProtoVersion(ctx unsafe.Pointer, version int) error {
+	if int(C.wolfSSL_CTX_set_min_proto_version(
+		(*C.WOLFSSL_CTX)(ctx), C.int(version))) != Success {
+		return fmt.Errorf("wolfSSL_CTX_set_min_proto_version(0x%04x) failed", version)
+	}
+	return nil
+}
+
+// SetMaxProtoVersion pins the highest TLS version the context will negotiate
+// (TLS13Version keeps 1.3 available — SunSpecTCP-5; TLS12Version caps at 1.2).
+func SetMaxProtoVersion(ctx unsafe.Pointer, version int) error {
+	if int(C.wolfSSL_CTX_set_max_proto_version(
+		(*C.WOLFSSL_CTX)(ctx), C.int(version))) != Success {
+		return fmt.Errorf("wolfSSL_CTX_set_max_proto_version(0x%04x) failed", version)
+	}
+	return nil
+}
+
+// UseMaxFragment requests RFC 6066 Maximum Fragment Length negotiation on the
+// context. On a client context this makes every ClientHello carry the MFL
+// extension (SunSpecTCP-59/60); a server honours a peer's request
+// automatically, so servers need not call this. code is one of the MFL*
+// constants; MFLDisabled is a no-op selector.
+func UseMaxFragment(ctx unsafe.Pointer, code int) error {
+	if code == MFLDisabled {
+		return nil
+	}
+	if int(C.wolfSSL_CTX_UseMaxFragment(
+		(*C.WOLFSSL_CTX)(ctx), C.uchar(code))) != Success {
+		return fmt.Errorf("wolfSSL_CTX_UseMaxFragment(%d) failed", code)
+	}
+	return nil
+}
+
+// UseSupportedCurve advertises an ECC curve in the ClientHello supported_groups
+// extension (RFC 4492). The mbaps client offers P-256 (ECCSecp256r1) so the
+// ECDSA-only suites can complete (SunSpecTCP-43/44).
+func UseSupportedCurve(ctx unsafe.Pointer, curve int) error {
+	if int(C.wolfSSL_CTX_UseSupportedCurve(
+		(*C.WOLFSSL_CTX)(ctx), C.word16(curve))) != Success {
+		return fmt.Errorf("wolfSSL_CTX_UseSupportedCurve(%d) failed", curve)
+	}
+	return nil
+}
+
+// SessionReused reports whether this handshake resumed a prior session
+// (SunSpecTCP-46). Valid after a successful Connect/Accept.
+func SessionReused(ssl unsafe.Pointer) bool {
+	return int(C.wolfSSL_session_reused((*C.WOLFSSL)(ssl))) == 1
+}
+
+// NegotiatedMaxFragment returns the MFL code agreed for this session (one of
+// the MFL* constants, 0 = none), making the profile's 512-byte cap observable
+// for conformance assertions (SunSpecTCP-59/60). The WOLFSSL_SESSION pointer is
+// wolfSSL-internal (from get_session, not get1_session) and must not be freed.
+//
+// Reliability caveat: the SERVER (the honouring peer) reports the negotiated
+// MFL in every version. The CLIENT reports it under TLS 1.2, but on a fresh
+// TLS 1.3 session wolfSSL's get_session returns 0 for the MFL — the client's
+// resumable session is not finalised with the fragment length until the
+// post-handshake NewSessionTicket. For TLS 1.3, observe MFL from the server
+// side (or from a packet capture — the T06.10 release gate).
+func NegotiatedMaxFragment(ssl unsafe.Pointer) int {
+	sess := C.wolfSSL_get_session((*C.WOLFSSL)(ssl))
+	if sess == nil {
+		return 0
+	}
+	return int(C.wolfSSL_SESSION_get_max_fragment_length(sess))
+}
+
+// Rehandshake drives a client-initiated secure renegotiation (RFC 5746). Used
+// by the renegotiation-refusal probe (T06.8): a conformant mbaps server's
+// policy for a mid-session renegotiation is asserted against the returned
+// error. Requires the peer to have negotiated the renegotiation-info extension.
+func Rehandshake(ssl unsafe.Pointer) error {
+	ret := int(C.wolfSSL_Rehandshake((*C.WOLFSSL)(ssl)))
+	if ret != Success {
+		errCode := int(C.wolfSSL_get_error((*C.WOLFSSL)(ssl), C.int(ret)))
+		return fmt.Errorf("wolfSSL_Rehandshake failed: ret=%d err=%d", ret, errCode)
+	}
+	return nil
+}
+
+// SetSessionCacheOff disables the server-side session cache on a context
+// (WOLFSSL_SESS_CACHE_OFF). The mbaps profile defaults resumption ON
+// (SunSpecTCP-46 SHOULD); this is the explicit opt-out.
+func SetSessionCacheOff(ctx unsafe.Pointer) {
+	C.wolfSSL_CTX_set_session_cache_mode(
+		(*C.WOLFSSL_CTX)(ctx), C.WOLFSSL_SESS_CACHE_OFF)
+}
