@@ -11,7 +11,7 @@
 //
 //	mbapsdev -listen :8021 -model battery|inverter -wmax 5000 -kwh 10 \
 //	         -ca certs/mbaps/dev-ca.pem -cert certs/mbaps/dev-server-cert.pem \
-//	         -key certs/mbaps/dev-server-key.pem -api-port 6031
+//	         -key certs/mbaps/dev-server-key.pem -api-port 6031 -serial SN-...
 //
 // Models exposed: Common Model 1, plus 120/121/(122)/103/123 (legacy) and
 // 701/704 (inverter) or 701/704/713/802 (battery) — see sim/southbound's
@@ -148,11 +148,11 @@ type modelBundle struct {
 // SolarServer/BatteryServer register images" T06.3 asks for: Regs is already
 // an exported field (no new accessor needed) and ApplyFault/Snapshot/Inject/
 // Registers are already public methods.
-func newModel(kind string, wmax, kwh float64) (*modelBundle, error) {
+func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, error) {
 	const loopbackAny = "tcp://127.0.0.1:0"
 	switch kind {
 	case "inverter":
-		srv, err := sim.NewSolarServerAdvanced(loopbackAny, wmax)
+		srv, err := sim.NewSolarServerAdvanced(loopbackAny, wmax, serial)
 		if err != nil {
 			return nil, fmt.Errorf("mbapsdev: new inverter model: %w", err)
 		}
@@ -214,6 +214,11 @@ func main() {
 	certFile := flag.String("cert", "certs/mbaps/dev-server-cert.pem", "device server certificate chain (leaf first, full chain — TCP-51)")
 	keyFile := flag.String("key", "certs/mbaps/dev-server-key.pem", "device server private key")
 	apiPort := flag.Int("api-port", 6031, "HTTP API port (0 to disable)")
+	serial := flag.String("serial", "", "SunSpec Model 1 serial number (SN) override for the inverter "+
+		"model; empty keeps the default \"SN-SOLAR-001\" — set this so two co-located sims (e.g. modsim "+
+		"plus this mbapsdev) present distinct device identity to a downstream gateway that keys identity "+
+		"on manufacturer|model|serial. Ignored for -model battery, which keeps its own default "+
+		"(\"SN-BAT-001\") unchanged.")
 	flag.Parse()
 
 	// wolfSSL_Init: process-global C state, exactly once per process
@@ -221,7 +226,11 @@ func main() {
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
 
-	mb, err := newModel(*model, *wmax, *kwh)
+	if *serial != "" && *model != "inverter" {
+		log.Printf("mbapsdev: -serial is ignored for -model %s (only -model inverter supports the "+
+			"override); keeping the default battery serial", *model)
+	}
+	mb, err := newModel(*model, *wmax, *kwh, *serial)
 	if err != nil {
 		log.Fatalf("mbapsdev: %v", err)
 	}

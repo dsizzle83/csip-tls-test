@@ -35,7 +35,7 @@ func startAdvSolarEnv(t *testing.T) *advEnv {
 	l.Close()
 
 	url := fmt.Sprintf("tcp://127.0.0.1:%d", port)
-	ss, err := sim.NewSolarServerAdvanced(url, 5000)
+	ss, err := sim.NewSolarServerAdvanced(url, 5000, "")
 	if err != nil {
 		t.Fatalf("start advanced sim: %v", err)
 	}

@@ -57,7 +57,7 @@ func startLoopback(ps *pkiSet) (*loopbackServer, func(), error) {
 // non-conformant peer (e.g. one that lets a read-only role write) and prove the
 // §5.3 checks FAIL it.
 func startLoopbackCustom(ps *pkiSet, served []uint8, writeRoles []Role) (*loopbackServer, func(), error) {
-	srv, err := sim.NewSolarServerAdvanced("tcp://127.0.0.1:0", 5000)
+	srv, err := sim.NewSolarServerAdvanced("tcp://127.0.0.1:0", 5000, "")
 	if err != nil {
 		return nil, nil, err
 	}

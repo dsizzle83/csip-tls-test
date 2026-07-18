@@ -81,10 +81,15 @@ var solarFaultKinds = map[FaultKind]bool{
 }
 
 // NewSolarServer creates and starts an animated PV inverter simulator.
-// wmaxW is the nameplate peak power in watts.
-func NewSolarServer(listenURL string, wmaxW float64) (*SolarServer, error) {
+// wmaxW is the nameplate peak power in watts. serial overrides the SunSpec
+// Model 1 serial (SN) register when non-empty; empty keeps the historical
+// "SN-SOLAR-001" default (see solarSerialOrDefault) — lets two co-located
+// sims (e.g. modsim + mbapsdev -model inverter) present distinct device
+// identity to a downstream gateway that keys identity on
+// manufacturer|model|serial.
+func NewSolarServer(listenURL string, wmaxW float64, serial string) (*SolarServer, error) {
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
-	bases := populateSolar(regs, wmaxW)
+	bases := populateSolar(regs, wmaxW, serial)
 
 	// Allocate ss first so the animation closure can shape output through its
 	// faultController (the effect-time ramp_limit fault).
@@ -410,20 +415,41 @@ func solarStateText(st int) string {
 // ── populate ──────────────────────────────────────────────────────────────────
 
 // populateSolar writes the full legacy solar inverter register layout into r
-// and returns the data-start addresses for each model block.
-func populateSolar(r *RegisterMap, wmaxW float64) SolarBases {
-	bases, cursor := populateSolarCore(r, wmaxW)
+// and returns the data-start addresses for each model block. serial overrides
+// the Model 1 SN register when non-empty (empty keeps the historical default
+// — see solarSerialOrDefault).
+func populateSolar(r *RegisterMap, wmaxW float64, serial string) SolarBases {
+	bases, cursor := populateSolarCore(r, wmaxW, serial)
 	r.Set(cursor, sunspec.EndMarker)
 	r.Set(cursor+1, 0)
 	return bases
+}
+
+// defaultSolarSerial is the SunSpec Model 1 serial (SN) a solar sim reports
+// when no override is given — the original hardcoded value, kept as the
+// default so every pre-existing caller/test stays byte-identical.
+const defaultSolarSerial = "SN-SOLAR-001"
+
+// solarSerialOrDefault returns serial if non-empty, else defaultSolarSerial.
+// Threaded through populateSolar/populateSolarCore/populateSolarAdvanced so
+// NewSolarServer/NewSolarServerAdvanced (and modsim/mbapsdev's -serial flag)
+// can give two co-located sims distinct SunSpec device identity — a
+// downstream gateway that keys device identity on manufacturer|model|serial
+// otherwise dedupes them into one device.
+func solarSerialOrDefault(serial string) string {
+	if serial == "" {
+		return defaultSolarSerial
+	}
+	return serial
 }
 
 // populateSolarCore writes the legacy solar models (1/120/121/122/103/123) into
 // r and returns the model bases plus the cursor positioned at the end-of-list
 // slot (where either the SunS end marker or the advanced 7xx models follow).
 // Split out of populateSolar so the advanced sim can append 7xx models before
-// the end marker without duplicating the legacy layout.
-func populateSolarCore(r *RegisterMap, wmaxW float64) (SolarBases, uint16) {
+// the end marker without duplicating the legacy layout. serial overrides the
+// Model 1 SN register when non-empty (see solarSerialOrDefault).
+func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases, uint16) {
 	sfN := func(v int16) uint16 { return uint16(v) }
 	base := sunspec.SunSpecBase
 
@@ -438,7 +464,7 @@ func populateSolarCore(r *RegisterMap, wmaxW float64) (SolarBases, uint16) {
 	m1 := cursor + 2
 	setStr16(r, m1+0, "SunSpec Sim")
 	setStr8(r, m1+16, "CSIP-Solar-5000")
-	setStr8(r, m1+32, "SN-SOLAR-001")
+	setStr8(r, m1+32, solarSerialOrDefault(serial))
 	cursor += 2 + m1Len
 
 	// Model 120 (Nameplate) — 26 data regs

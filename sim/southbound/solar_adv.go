@@ -99,11 +99,13 @@ var solarCurveSpecs = []curveModelSpec{
 
 // NewSolarServerAdvanced creates an animated PV inverter simulator that ALSO
 // serves the IEEE 1547-2018 7xx models (see solar_adv.go). Use it for the
-// advanced-DER QA scenarios; NewSolarServer stays the legacy default.
-func NewSolarServerAdvanced(listenURL string, wmaxW float64) (*SolarServer, error) {
+// advanced-DER QA scenarios; NewSolarServer stays the legacy default. serial
+// overrides the SunSpec Model 1 serial (SN) register when non-empty; empty
+// keeps the historical "SN-SOLAR-001" default (see solarSerialOrDefault).
+func NewSolarServerAdvanced(listenURL string, wmaxW float64, serial string) (*SolarServer, error) {
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	varRating := wmaxW * 0.44
-	bases, adv := populateSolarAdvanced(regs, wmaxW, varRating)
+	bases, adv := populateSolarAdvanced(regs, wmaxW, varRating, serial)
 
 	ss := &SolarServer{bases: bases, wmaxW: wmaxW, advanced: true, adv: adv, varRating: varRating}
 	ss.faults.label = "solar"
@@ -124,8 +126,8 @@ func NewSolarServerAdvanced(listenURL string, wmaxW float64) (*SolarServer, erro
 
 // ── Populate ─────────────────────────────────────────────────────────────────
 
-func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64) (SolarBases, solarAdvBases) {
-	bases, cursor := populateSolarCore(r, wmaxW)
+func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial string) (SolarBases, solarAdvBases) {
+	bases, cursor := populateSolarCore(r, wmaxW, serial)
 	adv, cursor := populateSolar7xx(r, cursor, wmaxW, varRating)
 	r.Set(cursor, sunspec.EndMarker)
 	r.Set(cursor+1, 0)

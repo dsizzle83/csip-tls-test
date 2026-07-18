@@ -17,7 +17,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 	const wmax = 8000.0
 	newRegs := func() (*RegisterMap, SolarBases) {
 		r := &RegisterMap{regs: make(map[uint16]uint16)}
-		return r, populateSolar(r, wmax)
+		return r, populateSolar(r, wmax, "")
 	}
 	// injectPotential mirrors Inject("W_W"): records the panel potential.
 	injectPotential := func(r *RegisterMap, b SolarBases, w float64) {
@@ -127,7 +127,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 func TestSolarServer_AckBeforeEffectFault(t *testing.T) {
 	const wmax = 8000.0
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
-	b := populateSolar(r, wmax)
+	b := populateSolar(r, wmax, "")
 	ss := &SolarServer{Server: &Server{Regs: r}, bases: b, wmaxW: wmax}
 	target := b.M123Base + sunspec.M123_WMaxLimPct
 	readW := func() float64 { return float64(int16(r.Get(b.M103Base + sunspec.M103_W))) }
@@ -284,7 +284,7 @@ func TestSolarStep_CloudRunning(t *testing.T) {
 	}
 	newRegs := func() (*RegisterMap, SolarBases) {
 		r := &RegisterMap{regs: make(map[uint16]uint16)}
-		return r, populateSolar(r, wmax)
+		return r, populateSolar(r, wmax, "")
 	}
 	readReg := func(r *RegisterMap, addr uint16) float64 { return float64(int16(r.Get(addr))) }
 	times := []float64{0, 37, 123, 200, 351, 500}
@@ -349,7 +349,7 @@ func TestSolarStep_CloudRunning(t *testing.T) {
 func TestSolarServer_CloudInject(t *testing.T) {
 	const wmax = 5000.0
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
-	b := populateSolar(r, wmax)
+	b := populateSolar(r, wmax, "")
 	ss := &SolarServer{Server: &Server{Regs: r}, bases: b, wmaxW: wmax}
 
 	if ss.Cloud() != 0 {

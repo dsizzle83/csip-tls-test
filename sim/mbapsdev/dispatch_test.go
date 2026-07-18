@@ -21,7 +21,7 @@ import (
 // and stays in test-fast.
 func newTestDevice(t *testing.T) *Device {
 	t.Helper()
-	mb, err := newModel("inverter", 5000, 10)
+	mb, err := newModel("inverter", 5000, 10, "")
 	if err != nil {
 		t.Fatalf("newModel: %v", err)
 	}

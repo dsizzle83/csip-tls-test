@@ -37,7 +37,7 @@ const testUnit = uint8(1)
 // the mbtls listener are both torn down on test cleanup.
 func startDevice(t *testing.T, pki testPKI, kind string) (addr string, dev *Device) {
 	t.Helper()
-	mb, err := newModel(kind, 5000, 10)
+	mb, err := newModel(kind, 5000, 10, "")
 	if err != nil {
 		t.Fatalf("newModel(%s): %v", kind, err)
 	}
@@ -332,7 +332,7 @@ func TestFaultInjection_RefuseResumeArmDisarm(t *testing.T) {
 // exercises the documented, deterministic case.
 func TestFaultInjection_StallHandshake(t *testing.T) {
 	pki := newTestPKI(t)
-	mb, err := newModel("inverter", 5000, 10)
+	mb, err := newModel("inverter", 5000, 10, "")
 	if err != nil {
 		t.Fatalf("newModel: %v", err)
 	}

@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	modsim [-port 5020] [-wmax 5000] [-api-port 6020] [-cloud-pct 0]
+//	modsim [-port 5020] [-wmax 5000] [-api-port 6020] [-cloud-pct 0] [-serial SN-...]
 //
 // Models exposed: 1 (Common), 120 (Nameplate), 121 (Basic Settings),
 // 122 (Extended Status), 103 (Three-Phase Inverter), 123 (Immediate Controls).
@@ -38,6 +38,10 @@ func main() {
 		"(701/702/704/705/706/711/712) for advanced-DER QA scenarios")
 	cloudPct := flag.Float64("cloud-pct", 0, "initial cloud cover percent (0=clear sky .. 100=full overcast); "+
 		"deterministically attenuates the running irradiance and is injectable live via POST /inject {\"Cloud_pct\":N}")
+	serial := flag.String("serial", "", "SunSpec Model 1 serial number (SN) override; empty keeps the "+
+		"default \"SN-SOLAR-001\" — set this so two co-located sims (e.g. this modsim plus a mbapsdev "+
+		"-model inverter) present distinct device identity to a downstream gateway that keys identity "+
+		"on manufacturer|model|serial")
 	flag.Parse()
 
 	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
@@ -46,10 +50,13 @@ func main() {
 	var err error
 	if *advanced {
 		log.Printf("modsim: starting ADVANCED (7xx) PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
-		srv, err = sim.NewSolarServerAdvanced(listenURL, *wmax)
+		srv, err = sim.NewSolarServerAdvanced(listenURL, *wmax, *serial)
 	} else {
 		log.Printf("modsim: starting animated PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
-		srv, err = sim.NewSolarServer(listenURL, *wmax)
+		srv, err = sim.NewSolarServer(listenURL, *wmax, *serial)
+	}
+	if *serial != "" {
+		log.Printf("modsim: SunSpec Model 1 serial override %q", *serial)
 	}
 	if err != nil {
 		log.Fatalf("modsim: %v", err)

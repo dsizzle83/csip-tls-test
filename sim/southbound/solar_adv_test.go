@@ -19,7 +19,7 @@ func newAdvSolar(t *testing.T, wmax float64) *SolarServer {
 	t.Helper()
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
 	varRating := wmax * 0.44
-	bases, adv := populateSolarAdvanced(r, wmax, varRating)
+	bases, adv := populateSolarAdvanced(r, wmax, varRating, "")
 	ss := &SolarServer{
 		Server: &Server{Regs: r}, bases: bases, wmaxW: wmax,
 		advanced: true, adv: adv, varRating: varRating,
@@ -267,7 +267,7 @@ func TestAdvFaultSet(t *testing.T) {
 	}
 	// A legacy solar sim must NOT advertise the 7xx kinds.
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
-	legacy := &SolarServer{Server: &Server{Regs: r}, bases: populateSolar(r, 5000), wmaxW: 5000}
+	legacy := &SolarServer{Server: &Server{Regs: r}, bases: populateSolar(r, 5000, ""), wmaxW: 5000}
 	for _, k := range []string{"raise_alarm", "curve_adopt_lies", "pf_ack_ignore"} {
 		if err := legacy.ApplyFault([]byte(`{"kind":"` + k + `"}`)); err == nil {
 			t.Errorf("legacy sim accepted advanced kind %q (should reject)", k)

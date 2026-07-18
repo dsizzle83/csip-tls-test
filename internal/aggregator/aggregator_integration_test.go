@@ -62,7 +62,7 @@ type authzServer struct {
 
 func startAuthzServer(t *testing.T, pki testPKI, served []uint8, writeRoles []Role) *authzServer {
 	t.Helper()
-	srv, err := sim.NewSolarServerAdvanced("tcp://127.0.0.1:0", 5000)
+	srv, err := sim.NewSolarServerAdvanced("tcp://127.0.0.1:0", 5000, "")
 	if err != nil {
 		t.Fatalf("new solar model: %v", err)
 	}
