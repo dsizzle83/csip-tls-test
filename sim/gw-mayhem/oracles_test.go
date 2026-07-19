@@ -234,6 +234,50 @@ func TestDiagnosePerfectStorm(t *testing.T) {
 	}
 }
 
+func ptrCLM(o commLossMaskOutcome) *commLossMaskOutcome { return &o }
+
+func TestDiagnoseCommLossMask(t *testing.T) {
+	// The all-invariants-held baseline: real telemetry baselined, a unit masked to the
+	// sentinel, its 704 echo survived, and the DER recovered.
+	held := commLossMaskOutcome{
+		Observed: true, TelemWasReal: true, MaskedUnit: 2, TelemMaskedNaN: true,
+		EchoSurvived: true, CommandedPct: 50, HealthyRealTelem: true, Recovered: true,
+	}
+	// with returns a *commLossMaskOutcome that is `held` mutated by fn — one axis flipped per case.
+	with := func(fn func(*commLossMaskOutcome)) *commLossMaskOutcome {
+		o := held
+		fn(&o)
+		return &o
+	}
+	tests := []struct {
+		name string
+		ev   *gwEvidence
+		want Verdict
+	}{
+		{"nil", &gwEvidence{}, VerdictInconclusive},
+		{"setup-err", &gwEvidence{SetupErr: "bench not wired"}, VerdictInconclusive},
+		{"unobserved", &gwEvidence{CommLossMask: with(func(o *commLossMaskOutcome) { o.Observed = false })}, VerdictInconclusive},
+		{"telem-not-real", &gwEvidence{CommLossMask: with(func(o *commLossMaskOutcome) { o.TelemWasReal = false })}, VerdictInconclusive},
+		{"pass-masked-echo-survived-recovered", &gwEvidence{CommLossMask: with(func(o *commLossMaskOutcome) {})}, VerdictPass},
+		// The gateway never masked the offline DER's telemetry (stale-projection risk).
+		{"fail-no-mask", &gwEvidence{CommLossMask: with(func(o *commLossMaskOutcome) { o.MaskedUnit = 0; o.TelemMaskedNaN = false })}, VerdictFail},
+		// Telemetry masked but the 704 echo was wiped along with it (exemption failed).
+		{"fail-echo-wiped", &gwEvidence{CommLossMask: with(func(o *commLossMaskOutcome) { o.EchoSurvived = false })}, VerdictFail},
+		// The faulted DER never recovered after the fault cleared.
+		{"fail-not-recovered", &gwEvidence{CommLossMask: with(func(o *commLossMaskOutcome) { o.Recovered = false })}, VerdictFail},
+		// A mask with no distinct healthy peer still PASSes (isolation is only asserted when a peer exists).
+		{"pass-no-peer", &gwEvidence{CommLossMask: with(func(o *commLossMaskOutcome) { o.HealthyRealTelem = false })}, VerdictPass},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := diagnoseCommLossMask(tc.ev)
+			if got != tc.want {
+				t.Errorf("verdict = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func rbConv(label string, expect float64) ctlReadback {
 	return ctlReadback{Label: label, Expect: expect, Final: expect, Tol: 1, SLAS: 6, HadRead: true, Converged: true}
 }

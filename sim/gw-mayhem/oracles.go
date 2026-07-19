@@ -30,6 +30,7 @@ var oracleRegistry = map[string]gwOracle{
 	"nbMalform":           diagnoseNBMalform,
 	"sbFault":             diagnoseSBFault,
 	"perfectStorm":        diagnosePerfectStorm,
+	"commLossMask":        diagnoseCommLossMask,
 	"controlLoop":         diagnoseControlLoop,
 	"authorityPKI":        diagnoseAuthorityPKI,
 }
@@ -407,6 +408,66 @@ func diagnosePerfectStorm(ev *gwEvidence) (Verdict, []string) {
 		findings = append(findings, "ok   the gateway RECOVERED the faulted secure DER after both faults cleared (comm-loss healed)")
 	} else {
 		findings = append(findings, "FAIL the gateway never re-established the faulted secure DER after the storm cleared — a permanent wedge")
+		verdict = worse(verdict, VerdictFail)
+	}
+
+	if o.Note != "" {
+		findings = append(findings, "     "+o.Note)
+	}
+	return verdict, findings
+}
+
+// diagnoseCommLossMask judges the comm-loss sentinel-mask + control-echo-survival
+// scenario (gap G5): when a DER goes comm-loss the gateway must MASK that DER's
+// northbound telemetry (701) to the not-implemented SENTINEL (a read returns NaN,
+// never a stale/absurd value) WHILE its commanded control echo (704 WMaxLimPct)
+// SURVIVES (the maskOffline 704 exemption — a commanded setpoint is not wiped by a
+// transient missed poll). The failures, each a separate axis:
+//   - the gateway NEVER masked the offline DER's telemetry (MaskedUnit==0) — it may be
+//     serving a STALE projection for a device it can no longer reach (FAIL);
+//   - the telemetry masked but the 704 echo was WIPED along with it (TelemMaskedNaN &&
+//     !EchoSurvived) — the maskOffline 704 exemption failed, a commanded setpoint was
+//     lost (FAIL);
+//   - the gateway never RECOVERED the faulted DER after the fault cleared — a permanent
+//     wedge, not a comm-loss that healed (FAIL).
+//
+// INCONCLUSIVE (never a false FAIL) when the run could not baseline real telemetry to
+// mask (bench not wired / nothing sampled / no real baseline). PASS when a unit's
+// telemetry masked to the sentinel, its 704 echo survived, and the DER recovered.
+func diagnoseCommLossMask(ev *gwEvidence) (Verdict, []string) {
+	o := ev.CommLossMask
+	if o == nil || !o.Observed || !o.TelemWasReal {
+		return VerdictInconclusive, []string{setupOrEmpty(ev, "no real northbound telemetry was baselined to observe a comm-loss mask")}
+	}
+	findings := []string{fmt.Sprintf("comm-loss sentinel-mask: secure DER dropped; the commanded 704 echo (%s) must survive the 701 telemetry mask", pctStr(o.CommandedPct))}
+	verdict := VerdictPass
+
+	// The offline DER's northbound telemetry must mask to the sentinel — never a stale
+	// or absurd projection for a device the gateway can no longer reach.
+	if o.MaskedUnit == 0 {
+		findings = append(findings, "FAIL the gateway never masked an offline DER's northbound telemetry to the sentinel — a STALE-projection risk (a read may return a stale/absurd value for an unreachable DER)")
+		verdict = worse(verdict, VerdictFail)
+	} else {
+		findings = append(findings, fmt.Sprintf("ok   unit %d's northbound telemetry (701 W) masked to the not-implemented sentinel while the DER was offline", o.MaskedUnit))
+		// The commanded 704 control echo must SURVIVE the mask (the maskOffline 704 exemption).
+		if o.TelemMaskedNaN && !o.EchoSurvived {
+			findings = append(findings, fmt.Sprintf("FAIL unit %d's 704 WMaxLimPct control echo was WIPED along with the masked telemetry — the maskOffline 704 exemption failed (a commanded setpoint was lost)", o.MaskedUnit))
+			verdict = worse(verdict, VerdictFail)
+		} else {
+			findings = append(findings, fmt.Sprintf("ok   unit %d's 704 WMaxLimPct control echo SURVIVED the mask (still ≈ %s) — the maskOffline 704 exemption held", o.MaskedUnit, pctStr(o.CommandedPct)))
+		}
+	}
+
+	// Isolation (only asserted when a distinct control+meas peer kept real telemetry).
+	if o.HealthyRealTelem {
+		findings = append(findings, "ok   a healthy peer unit kept serving REAL telemetry throughout — the mask isolated the offline DER only")
+	}
+
+	// Recovery once the fault clears — a comm-loss that healed, not a permanent wedge.
+	if o.Recovered {
+		findings = append(findings, "ok   the gateway RECOVERED the faulted secure DER after the fault cleared (comm-loss healed)")
+	} else {
+		findings = append(findings, "FAIL the gateway never re-established the faulted secure DER after the fault cleared — a permanent wedge")
 		verdict = worse(verdict, VerdictFail)
 	}
 

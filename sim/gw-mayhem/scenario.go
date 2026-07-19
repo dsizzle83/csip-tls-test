@@ -158,6 +158,13 @@ type gwEvidence struct {
 	// B), and a hostile out-of-range write (the malformed-write family) at ONCE and
 	// asserts the gateway holds fail-closed through all three simultaneously.
 	PerfectStorm *perfectStormOutcome `json:"perfect_storm,omitempty"` // compound simultaneous-fault (G4)
+
+	// Comm-loss sentinel-mask family (gap G5). The comm-loss-sentinel-mask scenario
+	// faults the secure DER and OBSERVES the gateway's northbound :802 view (the only
+	// channel where the mask is visible) to prove the maskOffline invariant: an offline
+	// DER's telemetry (701) masks to the not-implemented sentinel while its commanded
+	// control echo (704) survives, and the DER recovers on clear.
+	CommLossMask *commLossMaskOutcome `json:"comm_loss_mask,omitempty"` // comm-loss sentinel-mask + control-echo-survival (G5)
 }
 
 // perfectStormOutcome is the sampled evidence of the perfect-storm compound-fault
@@ -178,6 +185,30 @@ type perfectStormOutcome struct {
 	Unseated             bool `json:"unseated"`               // the safe baseline cap was dropped to uncapped while the storm held
 	Responsive           bool `json:"responsive"`             // the gateway stayed alive under the compound load (:802 answered / secure poll attempted)
 	Recovered            bool `json:"recovered"`              // the faulted secure DER's poll resumed after both faults cleared
+
+	Note string `json:"note,omitempty"`
+}
+
+// commLossMaskOutcome is the sampled evidence of the comm-loss sentinel-mask +
+// control-echo-survival scenario (gap G5): the secure DER is dropped (comm-loss), and
+// the gateway's NORTHBOUND :802 view is sampled differentially to prove the product's
+// regmap "maskOffline" invariant. The oracle (diagnoseCommLossMask) asserts that when
+// the DER went offline the gateway MASKED that DER's telemetry (701) to the
+// not-implemented SENTINEL — a read returns NaN, NEVER a stale/absurd value — WHILE
+// its commanded control echo (704 WMaxLimPct) SURVIVED (the maskOffline 704 exemption:
+// a commanded setpoint is not wiped by a transient missed poll), and that the DER
+// RECOVERED once the fault cleared. Serial-independent: MaskedUnit is DETECTED (the
+// unit whose real-at-baseline telemetry became the sentinel), never hardcoded.
+type commLossMaskOutcome struct {
+	Observed bool `json:"observed"` // baseline + at least one post-arm :802 sample obtained
+
+	TelemWasReal     bool    `json:"telem_was_real"`     // a control+meas unit served REAL telemetry at baseline (there was something to mask; gates the oracle so "nothing to mask" is INCONCLUSIVE, not a false FAIL)
+	MaskedUnit       int     `json:"masked_unit"`        // the :802 unit whose 701 telemetry masked to the sentinel (0 ⇒ none masked — a stale-projection risk)
+	TelemMaskedNaN   bool    `json:"telem_masked_nan"`   // the masked unit's 701 "W" read as the not-implemented sentinel (NaN)
+	EchoSurvived     bool    `json:"echo_survived"`      // the masked unit's 704 WMaxLimPct control echo still ≈ the commanded cap (the maskOffline 704 exemption held)
+	CommandedPct     float64 `json:"commanded_pct"`      // the 704 WMaxLimPct commanded before the fault (the echo that must survive)
+	HealthyRealTelem bool    `json:"healthy_real_telem"` // a DIFFERENT control+meas unit kept REAL telemetry (isolation — the mask hit only the offline DER)
+	Recovered        bool    `json:"recovered"`          // the faulted secure DER's poll resumed after the fault cleared
 
 	Note string `json:"note,omitempty"`
 }

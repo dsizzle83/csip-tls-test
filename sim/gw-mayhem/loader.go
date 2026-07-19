@@ -40,6 +40,10 @@ func goScenarios() []gwScenario {
 	// Compound-fault family (gap G4) — the perfect storm: a northbound outage, a
 	// southbound comm-loss, and a hostile out-of-range write armed at ONCE.
 	out = append(out, compoundFaultScenarios()...)
+	// Comm-loss sentinel-mask family (gap G5) — fault the secure DER and observe the
+	// northbound :802 view: an offline DER's telemetry (701) must mask to the sentinel
+	// while its commanded 704 control echo survives (the maskOffline invariant).
+	out = append(out, commLossMaskScenarios()...)
 	return out
 }
 
