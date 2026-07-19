@@ -92,7 +92,12 @@ func armSessionFlood(ctx context.Context, w *gwWorld, ev *gwEvidence) error {
 	}
 	conns = conns[:0]
 
-	ctrl, err := w.connectAs(aggregator.RoleGridService)
+	// Recovery probe via connectAsReady: releasing the flood sends 8 FINs the
+	// gateway reaps within milliseconds, but an IMMEDIATE connect races that reap
+	// and can be refused (closed post-handshake) — a legitimate client rides the
+	// brief window out with a backoff-retry, which is exactly the RECOVERY this
+	// scenario means to prove (capacity returns), not contention starvation.
+	ctrl, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		f.LanSurvived = false
 		f.Note = "post-flood control session could not connect: " + err.Error()

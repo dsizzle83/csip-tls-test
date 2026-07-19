@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"csip-tls-test/internal/aggregator"
 	"lexa-proto/sunspec"
@@ -178,6 +179,71 @@ func (w *gwWorld) connectAs(r aggregator.Role) (*aggregator.Conn, error) {
 	return aggregator.ConnectAs(w.target, r, w.refs)
 }
 
+// connectAsReady dials as role and returns a Conn whose session actually
+// round-trips, retrying a TRANSIENT session-cap refusal with bounded backoff.
+// The gateway caps concurrent mbaps sessions (max_sessions, default 8) and
+// refuses an over-cap session by closing it POST-handshake — so ConnectAs
+// succeeds but the first op fails with a transport read error (wolfSSL_read -1,
+// seen as "no SunS header"). A well-behaved client rides this out: the gateway
+// sheds load and reaps the freed slot within milliseconds, so a short
+// backoff-retry connects cleanly. The must-succeed connects (discovery, control
+// writes, the flood's RECOVERY probe) use this so the suite is deterministic
+// even when its own burst — or a standing aggregator sharing the same session
+// budget — momentarily fills the table. A DENIAL is not transient: if the ping
+// read comes back as a protocol EXCEPTION the session is up (the role is simply
+// denied that read) and the Conn is returned as-is — only a TRANSPORT failure
+// retries. The raw connectAs stays for the flood loop, which must OBSERVE
+// refusals rather than ride them out.
+func (w *gwWorld) connectAsReady(ctx context.Context, r aggregator.Role) (*aggregator.Conn, error) {
+	const attempts = 6
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 && !sleepCtx(ctx, connectBackoff(i)) {
+			return nil, ctx.Err()
+		}
+		c, err := w.connectAs(r)
+		if err != nil {
+			lastErr = err // handshake/dial failure — could be transient cap pressure
+			continue
+		}
+		if err := c.Ping(pingUnit); err != nil && !isException(err) {
+			lastErr = err // handshake ok but over-cap: gateway closed it post-handshake
+			_ = c.Close()
+			continue
+		}
+		return c, nil
+	}
+	return nil, lastErr
+}
+
+// connectBackoff is the connect-retry delay for attempt i (1-based after the
+// first): 100,200,400,800,800ms — enough for the gateway to reap a freed slot,
+// bounded so six attempts wait ≈2.3s worst case.
+func connectBackoff(i int) time.Duration {
+	d := (100 * time.Millisecond) << uint(i-1)
+	if d > 800*time.Millisecond {
+		d = 800 * time.Millisecond
+	}
+	return d
+}
+
+// sleepCtx waits d, returning false if ctx is cancelled first (a SIGINT during a
+// backoff stops the retry loop promptly). Mirrors control_loop.go's ctlSleep for
+// the connect path.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 // connectCred dials the target presenting a hostile/negative leaf (NO role
 // self-check), returning the live Conn or the handshake error — the cert-authz
 // adversary's connect.
@@ -211,7 +277,7 @@ func (w *gwWorld) discoverControlUnit(ctx context.Context) (unit uint8, hasMeas 
 
 // discoverOnce performs one GridService discovery walk over units 1..8.
 func (w *gwWorld) discoverOnce(ctx context.Context) (unit uint8, hasMeas bool, ok bool) {
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		return 0, false, false
 	}

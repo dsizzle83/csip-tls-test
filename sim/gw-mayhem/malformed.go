@@ -63,7 +63,7 @@ func armOutOfRange(ctx context.Context, w *gwWorld, ev *gwEvidence) error {
 		ev.SetupErr = "no control unit (704) to write"
 		return nil
 	}
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		ev.SetupErr = "connect GridService: " + err.Error()
 		return nil
@@ -105,10 +105,10 @@ func armMalformedWrites(ctx context.Context, w *gwWorld, ev *gwEvidence) error {
 		ev.SetupErr = "no control unit (704) to probe"
 		return nil
 	}
-	ev.Writes = append(ev.Writes, probeIllegalFC(w, unit))
-	ev.Writes = append(ev.Writes, probeOversizedPDU(w, unit))
-	ev.Writes = append(ev.Writes, probeNonexistentUnit(w))
-	ev.Writes = append(ev.Writes, probeReadOnlyPoint(w, unit))
+	ev.Writes = append(ev.Writes, probeIllegalFC(ctx, w, unit))
+	ev.Writes = append(ev.Writes, probeOversizedPDU(ctx, w, unit))
+	ev.Writes = append(ev.Writes, probeNonexistentUnit(ctx, w))
+	ev.Writes = append(ev.Writes, probeReadOnlyPoint(ctx, w, unit))
 	return nil
 }
 
@@ -116,9 +116,9 @@ func armMalformedWrites(ctx context.Context, w *gwWorld, ev *gwEvidence) error {
 // Encapsulated Interface Transport) as GridService and expects exception 0x01
 // (the gateway's FC map answers every non-03/04/06/16 FC with 0x01, before any
 // role/unit check).
-func probeIllegalFC(w *gwWorld, unit uint8) writeOutcome {
+func probeIllegalFC(ctx context.Context, w *gwWorld, unit uint8) writeOutcome {
 	wo := writeOutcome{Name: "illegal-function-code", ExpectRejectCode: uint8(mbap.ExIllegalFunction)}
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		wo.TransportErr = "connect: " + err.Error()
 		return wo
@@ -143,9 +143,9 @@ func probeIllegalFC(w *gwWorld, unit uint8) writeOutcome {
 // probeOversizedPDU sends a raw MBAP header whose Length field claims a body far
 // past the 253-byte PDU cap. A conformant gateway rejects it as a framing
 // violation and CLOSES the session (never a resync, never an exception PDU).
-func probeOversizedPDU(w *gwWorld, unit uint8) writeOutcome {
+func probeOversizedPDU(ctx context.Context, w *gwWorld, unit uint8) writeOutcome {
 	wo := writeOutcome{Name: "oversized-pdu", ExpectSessionClosed: true}
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		wo.TransportErr = "connect: " + err.Error()
 		return wo
@@ -189,9 +189,9 @@ func probeOversizedPDU(w *gwWorld, unit uint8) writeOutcome {
 // probeNonexistentUnit writes a control to an unmapped unit as GridService. The
 // gateway must reject it (0x01 if the role has no standing for that unit, or 0x0A
 // if authz passes but the unit is unknown) and never apply it.
-func probeNonexistentUnit(w *gwWorld) writeOutcome {
+func probeNonexistentUnit(ctx context.Context, w *gwWorld) writeOutcome {
 	wo := writeOutcome{Name: "write-nonexistent-unit", AnyRejectOK: true, Note: "unit 200 (unmapped)"}
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		wo.TransportErr = "connect: " + err.Error()
 		return wo
@@ -213,9 +213,9 @@ func probeNonexistentUnit(w *gwWorld) writeOutcome {
 // (whose rw* grant passes authz), so only the write decoder's defense-in-depth can
 // refuse it. The security property is non-application (some rejection), not a
 // specific code.
-func probeReadOnlyPoint(w *gwWorld, unit uint8) writeOutcome {
+func probeReadOnlyPoint(ctx context.Context, w *gwWorld, unit uint8) writeOutcome {
 	wo := writeOutcome{Name: "write-read-only-point", AnyRejectOK: true, Note: "SunSpec base marker (read-only)"}
-	conn, err := w.connectAs(aggregator.RoleSuperAdmin)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleSuperAdmin)
 	if err != nil {
 		wo.TransportErr = "connect: " + err.Error()
 		return wo

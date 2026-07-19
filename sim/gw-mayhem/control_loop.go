@@ -99,7 +99,7 @@ func armControlRapidRecurtail(ctx context.Context, w *gwWorld, ev *gwEvidence) e
 		return nil
 	}
 	o := ev.ControlLoop
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		ev.SetupErr = "connect GridService: " + err.Error()
 		return nil
@@ -150,7 +150,7 @@ func armControlReversionTimer(ctx context.Context, w *gwWorld, ev *gwEvidence) e
 		return nil
 	}
 	o := ev.ControlLoop
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		ev.SetupErr = "connect GridService: " + err.Error()
 		return nil
@@ -203,7 +203,7 @@ func armControlConflictingAuthority(ctx context.Context, w *gwWorld, ev *gwEvide
 	}
 	o := ev.ControlLoop
 	o.AuthorityPeer = "the CSIP head-end (northbound)"
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		ev.SetupErr = "connect GridService: " + err.Error()
 		return nil
@@ -272,7 +272,7 @@ func armControlDitherAtBounds(ctx context.Context, w *gwWorld, ev *gwEvidence) e
 		return nil
 	}
 	o := ev.ControlLoop
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		ev.SetupErr = "connect GridService: " + err.Error()
 		return nil
@@ -326,7 +326,7 @@ func releaseControlUnit(ctx context.Context, w *gwWorld) {
 	if !ok {
 		return
 	}
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		return
 	}

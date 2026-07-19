@@ -88,7 +88,7 @@ func armAuthoritySwitch(ctx context.Context, w *gwWorld, ev *gwEvidence) error {
 		o.Note = "no served control unit (704) to probe the mbaps authority against"
 		return nil
 	}
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		o.Note = "connect GridService over mbaps: " + err.Error()
 		return nil
@@ -172,7 +172,7 @@ func armCertRotation(ctx context.Context, w *gwWorld, ev *gwEvidence) error {
 	// A FRESH handshake after rotation must succeed presenting the rotated leaf (still
 	// chain-valid to the trusted CA). Existing-session SURVIVAL is board-observable
 	// (the lexa-mbaps session journal), supplied by the orchestrator.
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		o.Observed, o.EffectOK = true, false
 		o.Effect = "a fresh mbaps handshake FAILED after rotation — the rotated leaf is not chain-valid, or the listener dropped: " + firstLine(err.Error())
@@ -212,7 +212,7 @@ func armTrustStoreTamper(ctx context.Context, w *gwWorld, ev *gwEvidence) error 
 	// certmgr's own API / the journal, not :802. Judge it board-only; the orchestrator
 	// supplies it. The :802 handshake attempt below is supporting evidence only.
 	o.BoardOnly = true
-	if _, err := w.connectAs(aggregator.RoleGridService); err != nil {
+	if _, err := w.connectAsReady(ctx, aggregator.RoleGridService); err != nil {
 		o.Effect = "supporting: an mbaps handshake was REFUSED with the trust store tampered (fail-closed at :802): " + firstLine(err.Error())
 	} else {
 		o.Effect = "supporting: an mbaps handshake SUCCEEDED with the trust store tampered — investigate whether the tamper was caught (certmgr evidence is decisive)"
@@ -244,7 +244,7 @@ func armServiceRestart(ctx context.Context, w *gwWorld, ev *gwEvidence) error {
 		o.Note = "no served control unit (704) to read the post-restart cap from"
 		return nil
 	}
-	conn, err := w.connectAs(aggregator.RoleGridService)
+	conn, err := w.connectAsReady(ctx, aggregator.RoleGridService)
 	if err != nil {
 		o.Observed, o.EffectOK = true, false
 		o.Effect = "the gateway did not accept a session after the restart — a possible WEDGE / failed re-seed: " + firstLine(err.Error())
