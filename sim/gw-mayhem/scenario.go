@@ -152,6 +152,34 @@ type gwEvidence struct {
 	// switch / cert rotation / service restart) the orchestrator arms out of band.
 	ControlLoop *controlLoopOutcome  `json:"control_loop,omitempty"`  // control-loop integrity (family C)
 	AuthPKI     *authorityPKIOutcome `json:"authority_pki,omitempty"` // authority/PKI/infra (family D)
+
+	// Compound-fault family (gap G4). The perfect-storm scenario composes a
+	// northbound head-end outage (family A), a southbound secure comm-loss (family
+	// B), and a hostile out-of-range write (the malformed-write family) at ONCE and
+	// asserts the gateway holds fail-closed through all three simultaneously.
+	PerfectStorm *perfectStormOutcome `json:"perfect_storm,omitempty"` // compound simultaneous-fault (G4)
+}
+
+// perfectStormOutcome is the sampled evidence of the perfect-storm compound-fault
+// scenario (family G4): a NORTHBOUND head-end outage, a SOUTHBOUND secure comm-loss,
+// and a HOSTILE out-of-range write are armed SIMULTANEOUSLY, and the gateway's
+// fail-closed behaviour is sampled across the hold. The oracle
+// (diagnosePerfectStorm) asserts the compound load opened NO hole a single fault
+// does not: the hostile write was rejected and never applied, no absurd setpoint
+// was ever projected onto a DER, the safe baseline cap the gateway adopted still
+// HELD, the gateway stayed responsive (no wedge under the triple load), and it
+// RECOVERED the faulted DER once the storm cleared.
+type perfectStormOutcome struct {
+	Observed bool `json:"observed"` // baseline + at least one post-arm sample obtained
+
+	CapSet               bool `json:"cap_set"`                // the safe baseline cap (WMaxLimPct=50) took (echo converged) before the storm
+	HostileWriteRejected bool `json:"hostile_write_rejected"` // the out-of-range write (WMaxLimPct=150) was rejected, never applied
+	AbsurdProjected      bool `json:"absurd_projected"`       // an out-of-range setpoint appeared on a DER during the storm
+	Unseated             bool `json:"unseated"`               // the safe baseline cap was dropped to uncapped while the storm held
+	Responsive           bool `json:"responsive"`             // the gateway stayed alive under the compound load (:802 answered / secure poll attempted)
+	Recovered            bool `json:"recovered"`              // the faulted secure DER's poll resumed after both faults cleared
+
+	Note string `json:"note,omitempty"`
 }
 
 // controlLoopOutcome is the sampled evidence of a control-loop-integrity scenario

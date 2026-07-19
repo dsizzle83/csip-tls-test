@@ -37,6 +37,9 @@ func goScenarios() []gwScenario {
 	// orchestrator arms out of band (family D, authority/PKI/infra).
 	out = append(out, controlLoopScenarios()...)
 	out = append(out, authorityPKIScenarios()...)
+	// Compound-fault family (gap G4) — the perfect storm: a northbound outage, a
+	// southbound comm-loss, and a hostile out-of-range write armed at ONCE.
+	out = append(out, compoundFaultScenarios()...)
 	return out
 }
 

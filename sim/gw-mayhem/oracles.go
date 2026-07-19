@@ -29,6 +29,7 @@ var oracleRegistry = map[string]gwOracle{
 	"campaignPassthrough": diagnoseCampaign,
 	"nbMalform":           diagnoseNBMalform,
 	"sbFault":             diagnoseSBFault,
+	"perfectStorm":        diagnosePerfectStorm,
 	"controlLoop":         diagnoseControlLoop,
 	"authorityPKI":        diagnoseAuthorityPKI,
 }
@@ -329,6 +330,84 @@ func diagnoseSBFault(ev *gwEvidence) (Verdict, []string) {
 		}
 	} else if o.Expect == sbExpectCommLoss {
 		findings = append(findings, "     the gateway was not observed polling the faulted device at baseline — comm-loss/recovery not asserted this run")
+	}
+
+	if o.Note != "" {
+		findings = append(findings, "     "+o.Note)
+	}
+	return verdict, findings
+}
+
+// diagnosePerfectStorm judges the perfect-storm compound-fault scenario (gap G4):
+// a NORTHBOUND head-end outage, a SOUTHBOUND secure comm-loss, and a HOSTILE
+// out-of-range write are armed SIMULTANEOUSLY, and the gateway must hold
+// FAIL-CLOSED through all three at once. The failures, each a separate axis:
+//   - the hostile out-of-range write was ACCEPTED under the compound load — the
+//     range-check hole the in-range path closes reopened under stress (FAIL);
+//   - an ABSURD setpoint (WMaxLimPct out of [0,100]) was projected onto a DER while
+//     the storm held (FAIL);
+//   - a safe cap the gateway had already adopted was UNSEATED to uncapped while the
+//     storm held — the compound fault dropped a good control (FAIL, only asserted
+//     when a cap actually took);
+//   - the gateway went UNRESPONSIVE — it stopped answering :802 and stopped
+//     attempting its faulted DER, a wedge/crash the triple load triggered (FAIL);
+//   - the gateway never RECOVERED the faulted DER after the storm cleared — a
+//     permanent wedge, not a comm-loss that healed (FAIL).
+//
+// A run that could observe none of this (bench not wired, or nothing sampled) is
+// INCONCLUSIVE, never a false PASS. A PASS means every invariant held under the
+// simultaneous load; when no baseline cap took, the finding says the HOLD
+// sub-invariant was not exercised (only the other four axes were asserted).
+func diagnosePerfectStorm(ev *gwEvidence) (Verdict, []string) {
+	o := ev.PerfectStorm
+	if o == nil || !o.Observed {
+		return VerdictInconclusive, []string{setupOrEmpty(ev, "no compound-fault state was sampled under the perfect storm")}
+	}
+	findings := []string{"perfect storm: northbound head-end outage + southbound secure comm-loss + a hostile out-of-range write, all armed at once"}
+	verdict := VerdictPass
+
+	// The hostile out-of-range write must be rejected and NEVER applied — the
+	// compound load must not open the hole the in-range path closes.
+	if o.HostileWriteRejected {
+		findings = append(findings, "ok   the hostile out-of-range write was rejected (exception, never applied) even under both faults")
+	} else {
+		findings = append(findings, "FAIL the hostile out-of-range write was ACCEPTED under the compound fault — the gateway would apply an out-of-range setpoint")
+		verdict = worse(verdict, VerdictFail)
+	}
+
+	// No absurd projection off any DER's registers while the storm holds.
+	if o.AbsurdProjected {
+		findings = append(findings, "FAIL an ABSURD applied setpoint appeared on a DER during the storm — the compound fault projected garbage")
+		verdict = worse(verdict, VerdictFail)
+	} else {
+		findings = append(findings, "ok   no absurd/out-of-range setpoint was ever projected onto a DER during the storm")
+	}
+
+	// The safe baseline cap must HOLD (only asserted when one actually took).
+	switch {
+	case !o.CapSet:
+		findings = append(findings, "     no safe baseline cap took before the storm — the HOLD sub-invariant was not exercised")
+	case o.Unseated:
+		findings = append(findings, "FAIL the safe baseline cap was UNSEATED to uncapped while the storm held — the compound fault dropped a good control")
+		verdict = worse(verdict, VerdictFail)
+	default:
+		findings = append(findings, "ok   the safe baseline cap held throughout the storm")
+	}
+
+	// The gateway must stay responsive under the triple load (no wedge/crash).
+	if o.Responsive {
+		findings = append(findings, "ok   the gateway stayed responsive under the compound fault (answered :802 / kept attempting its DER — no wedge)")
+	} else {
+		findings = append(findings, "FAIL the gateway went UNRESPONSIVE under the compound fault — it stopped answering :802 and stopped attempting its DER (a wedge)")
+		verdict = worse(verdict, VerdictFail)
+	}
+
+	// Recovery once both faults clear — a comm-loss that healed, not a permanent wedge.
+	if o.Recovered {
+		findings = append(findings, "ok   the gateway RECOVERED the faulted secure DER after both faults cleared (comm-loss healed)")
+	} else {
+		findings = append(findings, "FAIL the gateway never re-established the faulted secure DER after the storm cleared — a permanent wedge")
+		verdict = worse(verdict, VerdictFail)
 	}
 
 	if o.Note != "" {

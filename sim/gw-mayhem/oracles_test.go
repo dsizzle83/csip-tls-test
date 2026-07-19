@@ -192,6 +192,48 @@ func TestDiagnoseSBFault(t *testing.T) {
 func ptrNB(o nbMalformOutcome) *nbMalformOutcome { return &o }
 func ptrSB(o sbFaultOutcome) *sbFaultOutcome     { return &o }
 
+func TestDiagnosePerfectStorm(t *testing.T) {
+	// The all-invariants-held baseline: cap set + held, hostile write rejected, no
+	// absurd projection, responsive, recovered.
+	held := perfectStormOutcome{
+		Observed: true, CapSet: true, HostileWriteRejected: true,
+		AbsurdProjected: false, Unseated: false, Responsive: true, Recovered: true,
+	}
+	// with returns a *perfectStormOutcome that is `held` mutated by fn — one FAIL axis
+	// flipped per case.
+	with := func(fn func(*perfectStormOutcome)) *perfectStormOutcome {
+		o := held
+		fn(&o)
+		return &o
+	}
+	tests := []struct {
+		name string
+		ev   *gwEvidence
+		want Verdict
+	}{
+		{"nil", &gwEvidence{}, VerdictInconclusive},
+		{"unobserved", &gwEvidence{PerfectStorm: &perfectStormOutcome{Observed: false}}, VerdictInconclusive},
+		{"setup-err", &gwEvidence{SetupErr: "bench not wired"}, VerdictInconclusive},
+		{"all-held", &gwEvidence{PerfectStorm: with(func(o *perfectStormOutcome) {})}, VerdictPass},
+		{"hostile-accepted", &gwEvidence{PerfectStorm: with(func(o *perfectStormOutcome) { o.HostileWriteRejected = false })}, VerdictFail},
+		{"absurd-projected", &gwEvidence{PerfectStorm: with(func(o *perfectStormOutcome) { o.AbsurdProjected = true })}, VerdictFail},
+		{"cap-unseated", &gwEvidence{PerfectStorm: with(func(o *perfectStormOutcome) { o.Unseated = true })}, VerdictFail},
+		{"unresponsive", &gwEvidence{PerfectStorm: with(func(o *perfectStormOutcome) { o.Responsive = false })}, VerdictFail},
+		{"not-recovered", &gwEvidence{PerfectStorm: with(func(o *perfectStormOutcome) { o.Recovered = false })}, VerdictFail},
+		// A cap that never took is NOT judged for unseat: Unseated=true but CapSet=false
+		// ⇒ the HOLD sub-invariant was not exercised, so it is not a FAIL on that axis.
+		{"no-cap-unseat-not-judged", &gwEvidence{PerfectStorm: with(func(o *perfectStormOutcome) { o.CapSet = false; o.Unseated = true })}, VerdictPass},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := diagnosePerfectStorm(tc.ev)
+			if got != tc.want {
+				t.Errorf("verdict = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func rbConv(label string, expect float64) ctlReadback {
 	return ctlReadback{Label: label, Expect: expect, Final: expect, Tol: 1, SLAS: 6, HadRead: true, Converged: true}
 }
