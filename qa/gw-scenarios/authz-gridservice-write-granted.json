@@ -1,0 +1,18 @@
+{
+  "camp_v": 1,
+  "id": "authz-gridservice-write-granted",
+  "name": "GridService may write controls (WMaxLimPct accepted and echoed)",
+  "role": "GridServiceSunSpec",
+  "target": "gateway",
+  "hypothesis": "The grant half of the RBAC contract: GridServiceSunSpec holds rw on the commanded control group (704-712), so a WMaxLimPct write must be ACCEPTED and echoed back through the gateway's projection. A grid-service role DENIED a legitimate control write is as much a failure as a read-only role being granted one.",
+  "expected": "The write is accepted and the readback converges to the commanded value within the SLA.",
+  "fix": "If a GridService control write is denied, look at configs/rbac/rules.json (its commanded rw grant on models 704-712) and internal/authz/compile.go (the compiled grant set for the role+unit).",
+  "notes": "Nominal value (100% = no curtailment) so the grant proof never leaves a DER limited. Complements the denial specs and the Go matrix sweep.",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "write_point", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 100},
+    {"do": "readback", "unit": 2, "model": 704, "point": "WMaxLimPct", "expect": 100, "sla_s": 5, "tol": 1}
+  ],
+  "oracle": {"name": "convergeWithinSLA"},
+  "expected_verdicts": ["PASS"]
+}

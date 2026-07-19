@@ -1,0 +1,17 @@
+{
+  "camp_v": 1,
+  "id": "authz-networkadmin-write-denied",
+  "name": "NetworkAdministrator cannot write controls (net-admin group empty in v1)",
+  "role": "NetworkAdministratorSunSpec",
+  "target": "gateway",
+  "hypothesis": "\"Administrator\" does NOT imply \"can write controls\": NetworkAdministratorSunSpec's only write grant is the net-admin point group, which is deliberately empty in v1 (regmap.GroupNetAdmin) and compiles to zero writable registers. A control write must be denied with exception 01, exactly like a read-only role.",
+  "expected": "A WMaxLimPct write as NetworkAdministratorSunSpec returns Modbus exception 01 (Wrote=false); reads are unaffected.",
+  "fix": "If a NetworkAdmin write is accepted, look at configs/rbac/rules.json (its rw grant is scoped to models:[\"net-admin\"]) and internal/regmap/pointgroups.go (GroupNetAdmin must resolve to zero intervals). A non-empty net-admin group would silently grant admin writes.",
+  "notes": "This is the non-obvious cell of the role-denial matrix, pinned here as reviewable data alongside the Go matrix sweep (authz-role-denial-matrix).",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "expect_exception", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 50, "expect_code": 1}
+  ],
+  "oracle": {"name": "denyExpected"},
+  "expected_verdicts": ["PASS"]
+}

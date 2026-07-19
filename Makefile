@@ -70,6 +70,15 @@ build-aggregator:
 	@mkdir -p bin
 	go build -o bin/aggregator ./sim/aggregator
 
+# gw-mayhem: the gateway hostile-QA runner — drives the mbaps-northbound-authz
+# family (+ qa/gw-scenarios specs) against the live :802 or a faithful loopback,
+# folds verdicts into a PASS/FAIL gate. cgo (sim/gw-mayhem -> internal/aggregator
+# -> internal/mbtls), so it carries the wolfSSL sysroot env. Wave 1 of the gateway
+# Mayhem suite.
+build-gw-mayhem:
+	@mkdir -p bin
+	go build -o bin/gw-mayhem ./cmd/gw-mayhem
+
 # ssm-conformance: the Secure SunSpec Modbus 62-requirement conformance walker
 # (SunSpecTCP-1..62). cgo (drives the bench's own internal/mbtls client), so it
 # needs the wolfSSL sysroot env. T06.10.
@@ -293,7 +302,7 @@ test: $(CA_CERT) test-fast test-integration
 # minted-fixture matrix, and Reporter bookkeeping for ssm-conformance). Pulls cgo
 # for compilation but does no TLS handshakes.
 test-fast:
-	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/ssm-conformance/
+	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/gw-mayhem/... ./sim/ssm-conformance/
 
 # Hostile-QA deterministic-regression gate (Phase 5): fault-injector + diagnoser
 # unit tests, no bench. Add the live mayhem suite with: make qa-bench.
@@ -353,7 +362,7 @@ sweep-sunspec:
 # separate Makefile prerequisite here; adding a $(CA_CERT)-style one would
 # just duplicate that check with a different (missing-file-only) trigger.
 test-integration: $(CA_CERT)
-	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/ssm-conformance/
+	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/gw-mayhem/... ./sim/ssm-conformance/
 
 # TASK-048: 15 minutes per go-native fuzz target against the client-side
 # IEEE 2030.5 XML unmarshal entry points in internal/csipref/discovery
