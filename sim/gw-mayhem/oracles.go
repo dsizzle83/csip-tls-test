@@ -29,6 +29,8 @@ var oracleRegistry = map[string]gwOracle{
 	"campaignPassthrough": diagnoseCampaign,
 	"nbMalform":           diagnoseNBMalform,
 	"sbFault":             diagnoseSBFault,
+	"controlLoop":         diagnoseControlLoop,
+	"authorityPKI":        diagnoseAuthorityPKI,
 }
 
 // registeredOracles lists oracle names (sorted) for error messages.
@@ -333,6 +335,127 @@ func diagnoseSBFault(ev *gwEvidence) (Verdict, []string) {
 		findings = append(findings, "     "+o.Note)
 	}
 	return verdict, findings
+}
+
+// diagnoseControlLoop judges a control-loop-integrity scenario (family C): the
+// gateway's write→apply→readback loop must have stayed SOUND under the adversarial
+// drive. It reuses the aggregator's converge/reversion judgment semantics over the
+// pure controlLoopOutcome evidence. The failures, in severity order:
+//   - the loop went DARK — the readback stopped responding across the hold (a crash
+//     / hang / session wedge the write burst triggered) (FAIL);
+//   - the exclusive control authority was VIOLATED — a value the mbaps authority
+//     never commanded appeared on the echo (a cross-interface override) (FAIL);
+//   - a phase="revert" readback did NOT return to the safe default after RvrtTms —
+//     reversion did not fire (stuck curtailment, a safety regression) (FAIL);
+//   - any other readback did NOT converge to its commanded value — a lost/stale echo
+//     or the non-convergence of a legal write (FAIL);
+//   - a readback never returned a value ⇒ BLIND (a coverage gap, not a control fail).
+//
+// A PASS means every legal write converged to the last commanded value, any
+// reversion fired to safe, the authority held, and the loop never oscillated or
+// crashed. No readback + no fault ⇒ INCONCLUSIVE (nothing to judge).
+func diagnoseControlLoop(ev *gwEvidence) (Verdict, []string) {
+	o := ev.ControlLoop
+	if o == nil || !o.Observed {
+		return VerdictInconclusive, []string{setupOrEmpty(ev, "no control readback was sampled")}
+	}
+	findings := []string{fmt.Sprintf("control loop: %s on unit %d (%d command(s), last=%s)", o.Kind, o.Unit, len(o.Commanded), pctStr(o.LastCmd))}
+	verdict := VerdictPass
+	if o.WentDark {
+		findings = append(findings, "FAIL the control loop went DARK — the readback stopped responding across the hold (crash / hang / session wedge)")
+		verdict = worse(verdict, VerdictFail)
+	}
+	if o.OverrideSeen {
+		findings = append(findings, fmt.Sprintf("FAIL exclusive control authority VIOLATED — a value the mbaps authority never commanded (%.1f%%) appeared via %s", o.OverridePct, o.AuthorityPeer))
+		verdict = worse(verdict, VerdictFail)
+	} else if o.AuthorityPeer != "" {
+		findings = append(findings, fmt.Sprintf("ok   exclusive control authority honored — %s never overrode the mbaps setpoint", o.AuthorityPeer))
+	}
+	if len(o.Readbacks) == 0 {
+		if verdict == VerdictPass {
+			return VerdictInconclusive, append(findings, "no readback step ran — nothing to judge")
+		}
+		return verdict, findings
+	}
+	for _, rb := range o.Readbacks {
+		switch {
+		case !rb.HadRead:
+			findings = append(findings, fmt.Sprintf("BLIND %s: readback never returned a value within %.0fs (expect %g)", rb.Label, rb.SLAS, rb.Expect))
+			verdict = worse(verdict, VerdictBlind)
+		case rb.Phase == "revert" && !rb.Converged:
+			findings = append(findings, fmt.Sprintf("FAIL %s: did NOT revert to the safe default %g (stuck at %g) — reversion did not fire (STUCK CURTAILMENT)", rb.Label, rb.Expect, rb.Final))
+			verdict = worse(verdict, VerdictFail)
+		case !rb.Converged:
+			findings = append(findings, fmt.Sprintf("FAIL %s: did NOT converge to %g±%g (final %g) — lost/stale echo or non-convergence of a legal write", rb.Label, rb.Expect, rb.Tol, rb.Final))
+			verdict = worse(verdict, VerdictFail)
+		default:
+			findings = append(findings, fmt.Sprintf("ok   %s: converged to %g (final %g)", rb.Label, rb.Expect, rb.Final))
+		}
+	}
+	if o.Note != "" {
+		findings = append(findings, "     "+o.Note)
+	}
+	return verdict, findings
+}
+
+// diagnoseAuthorityPKI judges a family-D authority/PKI/infra scenario. The mutation
+// is BOARD-MUTATING and armed by the orchestrator out of band; this suite only
+// OBSERVES the effect. The verdict logic:
+//   - board not armed ⇒ INCONCLUSIVE, printing the hook the orchestrator must run
+//     (the default for a QA run — nothing was mutated, so there is no effect to
+//     judge);
+//   - armed but the decisive effect is only board-observable (certmgr 503 / integrity
+//     alarm / journal crash-loop) ⇒ INCONCLUSIVE with a note, the orchestrator
+//     supplies the board evidence;
+//   - armed + observed + the effect matches the design contract ⇒ PASS;
+//   - armed + observed + the effect VIOLATES the contract (the non-authoritative
+//     interface still controlled, the vendor toggle never took, a session dropped on
+//     rotation, the cap wedged) ⇒ FAIL;
+//   - armed but the effect could not be observed at all ⇒ INCONCLUSIVE.
+func diagnoseAuthorityPKI(ev *gwEvidence) (Verdict, []string) {
+	o := ev.AuthPKI
+	if o == nil {
+		return VerdictInconclusive, []string{setupOrEmpty(ev, "no authority/PKI observation was made")}
+	}
+	head := fmt.Sprintf("%s — contract: %s", o.Kind, o.Contract)
+	if !o.BoardArmed {
+		return VerdictInconclusive, []string{head, "board mutation NOT armed — this scenario is board-mutating; the orchestrator arms it out of band, then re-runs with -board-armed " + o.Kind, noteOrDash(o.Note)}
+	}
+	if o.BoardOnly {
+		return VerdictInconclusive, []string{head, "armed, but the decisive effect is only board-observable — orchestrator supplies the board evidence", effectOrDash(o)}
+	}
+	if !o.Observed {
+		return VerdictInconclusive, []string{head, "armed, but the effect could not be observed over :802 / the sims", noteOrDash(o.Note)}
+	}
+	if o.EffectOK {
+		return VerdictPass, []string{head, "ok   observed effect matches the design contract: " + effectText(o)}
+	}
+	return VerdictFail, []string{head, "FAIL observed effect VIOLATES the design contract: " + effectText(o)}
+}
+
+// effectText renders the observed effect (+ any note) for a family-D finding.
+func effectText(o *authorityPKIOutcome) string {
+	if o.Effect == "" {
+		return noteOrDash(o.Note)
+	}
+	if o.Note == "" {
+		return o.Effect
+	}
+	return o.Effect + " — " + o.Note
+}
+
+func effectOrDash(o *authorityPKIOutcome) string {
+	if o.Effect != "" {
+		return o.Effect
+	}
+	return noteOrDash(o.Note)
+}
+
+func noteOrDash(s string) string {
+	if s == "" {
+		return "(no note)"
+	}
+	return s
 }
 
 // diagnoseCampaign is the spec-scenario passthrough: a spec scenario's arm runs

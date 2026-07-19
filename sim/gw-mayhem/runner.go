@@ -36,24 +36,46 @@ func ListScenarios(out io.Writer, scenarios []gwScenario, loadErrs []error) {
 		if sc.Security {
 			sec = "S"
 		}
-		fmt.Fprintf(out, "  [%-4s] %s %-32s %s\n", sc.Source, sec, sc.ID, sc.Desc)
+		fmt.Fprintf(out, "  [%-4s] %s %-32s %-8s %s\n", sc.Source, sec, sc.ID, listTags(sc), sc.Desc)
 	}
 	for _, e := range loadErrs {
 		fmt.Fprintf(out, "  LOAD-ERR %v\n", e)
 	}
 }
 
+// listTags renders the run-mode tags for a scenario in the -list output:
+// [bench] (needs the live bench), [board] (board-mutating), [ext] (Extended).
+func listTags(sc gwScenario) string {
+	var t []string
+	if sc.NeedsBench {
+		t = append(t, "bench")
+	}
+	if sc.NeedsBoard {
+		t = append(t, "board")
+	}
+	if sc.Extended {
+		t = append(t, "ext")
+	}
+	if len(t) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(t, ",") + "]"
+}
+
 // RunSuite runs the (optionally --only-filtered) scenarios against w, writing the
 // per-scenario verdict lines + evidence table to out, and returns the BatchSummary.
-// A spec load error is folded into the gate. jsonOut also dumps the summary as JSON.
-func RunSuite(ctx context.Context, w *gwWorld, scenarios []gwScenario, loadErrs []error, only []string, jsonOut bool, out io.Writer) BatchSummary {
+// A spec load error is folded into the gate. extended opts an Extended (long
+// boundary-dither) scenario into a default/full run; -only always overrides it (an
+// explicit selection runs an Extended scenario regardless). jsonOut also dumps the
+// summary as JSON.
+func RunSuite(ctx context.Context, w *gwWorld, scenarios []gwScenario, loadErrs []error, only []string, extended, jsonOut bool, out io.Writer) BatchSummary {
 	sum := BatchSummary{ByVerdict: map[Verdict]int{}}
 	for _, e := range loadErrs {
 		sum.LoadErrors = append(sum.LoadErrors, e.Error())
 		sum.GateFailures++
 		fmt.Fprintf(out, "LOAD-ERR  %v\n", e)
 	}
-	selected := filterOnly(scenarios, only)
+	selected := selectScenarios(scenarios, only, extended)
 	for i := range selected {
 		if ctx.Err() != nil {
 			break
@@ -83,18 +105,25 @@ func RunSuite(ctx context.Context, w *gwWorld, scenarios []gwScenario, loadErrs 
 // that into INCONCLUSIVE), and a missing oracle is itself INCONCLUSIVE.
 func runScenario(ctx context.Context, w *gwWorld, sc gwScenario) *gwReport {
 	start := time.Now()
-	// A wave-2 (bench-required) scenario with no bench wired is SKIPPED as an
-	// expected INCONCLUSIVE, not a gate failure — a -loopback :802-only run cannot
-	// drive the HTTP sim admin APIs, and its hermetic proof is the bench-stub unit
-	// tests. Live runs pass the sims' admin URLs, so the scenario runs for real.
+	// A bench-required scenario with no bench wired is SKIPPED as an expected
+	// INCONCLUSIVE, not a gate failure — a -loopback :802-only run cannot drive the
+	// HTTP sim admin APIs (wave-2) or exercise the real gateway's reversion /
+	// exclusive-authority engines (wave-3 control-loop), and the hermetic proof is
+	// the pure-oracle unit tests (+ the bench stub for wave-2). A live run wires the
+	// bench, so the scenario runs for real.
 	if sc.NeedsBench && !w.bench.benchReady() {
-		return &gwReport{
-			ID: sc.ID, Desc: sc.Desc, Category: sc.Category, Source: sc.Source,
-			Security: sc.Security, Verdict: VerdictInconclusive, Expected: sc.Expected,
-			VerdictExpected: true,
-			Findings:        []string{"skipped: no bench wired (wave-2 needs -gridsim-admin + the -inv-* DER sims; hermetic coverage is the bench-stub unit tests)"},
-			DurationS:       time.Since(start).Seconds(),
+		return skipReport(sc, start,
+			"skipped: needs the live bench (not wired in this run) — hermetic coverage is the loopback + the pure-oracle unit tests")
+	}
+	// A BOARD-MUTATING scenario (family D) is SKIPPED until the ORCHESTRATOR arms its
+	// mutation out of band and re-runs with -board-armed <id>. This suite never
+	// mutates the board; the skip prints the exact hook to run.
+	if sc.NeedsBoard && !w.isBoardArmed(sc.ID) {
+		msg := "skipped: BOARD-MUTATING — the orchestrator arms it out of band, then re-runs with -board-armed " + sc.ID
+		if sc.Board != nil {
+			msg += " | ARM: " + sc.Board.Arm + " | TEARDOWN: " + sc.Board.Teardown
 		}
+		return skipReport(sc, start, msg)
 	}
 	ev := &gwEvidence{Scenario: sc.ID}
 	if sc.arm != nil {
@@ -136,6 +165,45 @@ func runScenario(ctx context.Context, w *gwWorld, sc gwScenario) *gwReport {
 		rep.Evidence = ev
 	}
 	return rep
+}
+
+// skipReport builds the synthetic expected-INCONCLUSIVE report for a scenario the
+// runner skips (no bench wired, or a board mutation not armed) — never a gate
+// failure, so a default run stays green while the skip explains what to wire/arm.
+func skipReport(sc gwScenario, start time.Time, finding string) *gwReport {
+	return &gwReport{
+		ID: sc.ID, Desc: sc.Desc, Category: sc.Category, Source: sc.Source,
+		Security: sc.Security, Verdict: VerdictInconclusive, Expected: sc.Expected,
+		VerdictExpected: true,
+		Findings:        []string{finding},
+		DurationS:       time.Since(start).Seconds(),
+	}
+}
+
+// selectScenarios applies the -only filter and, absent it, the Extended exclusion.
+// An explicit -only selection always wins (an Extended scenario named in -only
+// runs); otherwise Extended scenarios are dropped unless extended opts them in.
+func selectScenarios(scenarios []gwScenario, only []string, extended bool) []gwScenario {
+	if len(only) > 0 {
+		return filterOnly(scenarios, only)
+	}
+	return filterExtended(scenarios, extended)
+}
+
+// filterExtended drops Extended scenarios from a default/full run so a long
+// boundary-dither walk cannot silently inflate every campaign's wall-clock time
+// (mirrors the Mayhem rule, RSK-12). Pure, so the selection rule is unit-testable.
+func filterExtended(scenarios []gwScenario, includeExtended bool) []gwScenario {
+	if includeExtended {
+		return scenarios
+	}
+	out := make([]gwScenario, 0, len(scenarios))
+	for _, sc := range scenarios {
+		if !sc.Extended {
+			out = append(out, sc)
+		}
+	}
+	return out
 }
 
 // filterOnly returns the scenarios whose IDs are in only (order = suite order); an

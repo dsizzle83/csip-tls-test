@@ -39,6 +39,12 @@ type gwWorld struct {
 	// it — they drive the gateway's :802 server directly.
 	bench BenchConfig
 
+	// boardArmed is the set of family-D (authority/PKI/infra) scenario ids the
+	// ORCHESTRATOR has armed the board mutation for this run (-board-armed). Empty
+	// (the default for a QA run) SKIPS every board-mutating scenario as an expected
+	// INCONCLUSIVE — this suite never mutates the board itself.
+	boardArmed map[string]bool
+
 	// Control-unit discovery is done ONCE per run and cached: every family that
 	// needs a 704 target shares the result, so the suite opens one discovery session
 	// instead of one per scenario (less session churn, no per-scenario flakiness).
@@ -152,6 +158,19 @@ func (w *gwWorld) loadNegatives() error {
 // a hermetic test sets it to httptest bench-stub URLs. Left unset, the wave-2
 // families are INCONCLUSIVE (no bench to drive/observe).
 func (w *gwWorld) SetBench(b BenchConfig) { w.bench = b }
+
+// SetBoardArmed records the family-D scenario ids whose board mutation the
+// ORCHESTRATOR has armed for this run (from -board-armed). A scenario not listed
+// here is SKIPPED as an expected INCONCLUSIVE — this suite never arms the board.
+func (w *gwWorld) SetBoardArmed(ids []string) {
+	w.boardArmed = make(map[string]bool, len(ids))
+	for _, id := range ids {
+		w.boardArmed[id] = true
+	}
+}
+
+// isBoardArmed reports whether the orchestrator armed scenario id's board mutation.
+func (w *gwWorld) isBoardArmed(id string) bool { return w.boardArmed[id] }
 
 // connectAs dials the target presenting role r's certificate (with the aggregator's
 // own role self-check), returning the live Conn.

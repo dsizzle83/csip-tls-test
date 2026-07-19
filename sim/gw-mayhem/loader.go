@@ -32,6 +32,11 @@ func goScenarios() []gwScenario {
 	// while a hostile head-end (family A) or a misbehaving DER (family B) is armed.
 	out = append(out, northboundMalformScenarios()...)
 	out = append(out, southboundFaultScenarios()...)
+	// Wave 3 — drive the gateway's write→apply→readback CONTROL LOOP adversarially
+	// (family C, :802), and judge the observable effect of a BOARD mutation the
+	// orchestrator arms out of band (family D, authority/PKI/infra).
+	out = append(out, controlLoopScenarios()...)
+	out = append(out, authorityPKIScenarios()...)
 	return out
 }
 

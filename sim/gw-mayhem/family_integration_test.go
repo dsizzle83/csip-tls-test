@@ -41,9 +41,13 @@ func TestFamily_AgainstLoopback(t *testing.T) {
 		"authz-out-of-range-setpoint": VerdictFail, // pinned gap — the loopback models it
 		"authz-malformed-writes":      VerdictPass,
 		"transport-session-flood":     VerdictPass,
+		// Wave-3 control-loop (family C) is NeedsBench (live-driven) — skipped here as
+		// expected INCONCLUSIVE; its hermetic teeth are the diagnoseControlLoop unit
+		// table (make test-fast). Wave-3 authority/PKI (family D) is NeedsBoard —
+		// skipped until the orchestrator arms the board.
 	}
 
-	sum := RunSuite(context.Background(), w, scenarios, nil, nil, false, testWriter{t})
+	sum := RunSuite(context.Background(), w, scenarios, nil, nil, false, false, testWriter{t})
 	if sum.GateFailures != 0 {
 		t.Errorf("gate failures = %d, want 0 (every scenario within its expected set)", sum.GateFailures)
 	}

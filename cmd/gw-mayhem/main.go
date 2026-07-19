@@ -51,6 +51,8 @@ func main() {
 		invSecure    = flag.String("inv-secure", "http://127.0.0.1:6031", "secure (mbapsdev) DER sim admin API (simapi)")
 		list         = flag.Bool("list", false, "list the scenario suite and exit")
 		only         = flag.String("only", "", "comma-separated scenario ids to run (default: all)")
+		extended     = flag.Bool("extended", false, "include Extended (long boundary-dither) scenarios in a default/full run")
+		boardArmed   = flag.String("board-armed", "", "comma-separated family-D scenario ids whose BOARD mutation the orchestrator has armed out of band (default: none — all board scenarios skip)")
 		jsonOut      = flag.Bool("json", false, "emit the batch roll-up as JSON to stdout")
 		outFile      = flag.String("out", "", "also write the batch summary JSON to this file")
 	)
@@ -94,11 +96,15 @@ func main() {
 			Secure:       gwmayhem.DERSim{Name: "inv-secure", BaseURL: *invSecure, Secure: true},
 		})
 	}
+	// Family D (authority/PKI/infra) is BOARD-MUTATING: a scenario runs only if the
+	// orchestrator armed its board mutation out of band and named it here; otherwise
+	// it skips as an expected INCONCLUSIVE (this suite never mutates the board).
+	world.SetBoardArmed(splitCSV(*boardArmed))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	sum := gwmayhem.RunSuite(ctx, world, scenarios, loadErrs, splitCSV(*only), *jsonOut, os.Stdout)
+	sum := gwmayhem.RunSuite(ctx, world, scenarios, loadErrs, splitCSV(*only), *extended, *jsonOut, os.Stdout)
 
 	if *outFile != "" {
 		if raw, merr := json.MarshalIndent(sum, "", "  "); merr == nil {

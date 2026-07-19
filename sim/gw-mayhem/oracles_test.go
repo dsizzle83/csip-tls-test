@@ -192,6 +192,79 @@ func TestDiagnoseSBFault(t *testing.T) {
 func ptrNB(o nbMalformOutcome) *nbMalformOutcome { return &o }
 func ptrSB(o sbFaultOutcome) *sbFaultOutcome     { return &o }
 
+func rbConv(label string, expect float64) ctlReadback {
+	return ctlReadback{Label: label, Expect: expect, Final: expect, Tol: 1, SLAS: 6, HadRead: true, Converged: true}
+}
+
+func TestDiagnoseControlLoop(t *testing.T) {
+	// rapid-recurtail: the burst's last value (80) echoed back and stayed.
+	rapidOK := controlLoopOutcome{Kind: "rapid-recurtail", Observed: true, Unit: 2, LastCmd: 80,
+		Readbacks: []ctlReadback{rbConv("settle", 80), rbConv("confirm-1", 80), rbConv("confirm-2", 80)}}
+	// reversion: ceiling held at 40 then reverted to 100.
+	reversionOK := controlLoopOutcome{Kind: "reversion", Observed: true, Unit: 2, LastCmd: 40,
+		Readbacks: []ctlReadback{
+			{Label: "hold", Phase: "hold", Expect: 40, Final: 40, Tol: 1, SLAS: 10, HadRead: true, Converged: true},
+			{Label: "revert", Phase: "revert", Expect: 100, Final: 100, Tol: 1, SLAS: 15, HadRead: true, Converged: true},
+		}}
+	tests := []struct {
+		name string
+		o    *controlLoopOutcome
+		want Verdict
+	}{
+		{"nil", nil, VerdictInconclusive},
+		{"unobserved", &controlLoopOutcome{Observed: false}, VerdictInconclusive},
+		{"rapid-converge-to-last", ptrCL(rapidOK), VerdictPass},
+		{"rapid-stale-echo", ptrCL(controlLoopOutcome{Kind: "rapid-recurtail", Observed: true, LastCmd: 80,
+			Readbacks: []ctlReadback{{Label: "settle", Expect: 80, Final: 30, Tol: 1, SLAS: 6, HadRead: true, Converged: false}}}), VerdictFail},
+		{"went-dark", ptrCL(controlLoopOutcome{Kind: "rapid-recurtail", Observed: true, WentDark: true}), VerdictFail},
+		{"blind-no-read", ptrCL(controlLoopOutcome{Kind: "rapid-recurtail", Observed: true, LastCmd: 80,
+			Readbacks: []ctlReadback{{Label: "settle", Expect: 80, SLAS: 6, HadRead: false}}}), VerdictBlind},
+		{"reversion-fires", ptrCL(reversionOK), VerdictPass},
+		{"reversion-stuck", ptrCL(controlLoopOutcome{Kind: "reversion", Observed: true, LastCmd: 40,
+			Readbacks: []ctlReadback{
+				{Label: "hold", Phase: "hold", Expect: 40, Final: 40, Tol: 1, SLAS: 10, HadRead: true, Converged: true},
+				{Label: "revert", Phase: "revert", Expect: 100, Final: 40, Tol: 1, SLAS: 15, HadRead: true, Converged: false},
+			}}), VerdictFail},
+		{"authority-held", ptrCL(controlLoopOutcome{Kind: "authority", Observed: true, LastCmd: 60, AuthorityPeer: "csip",
+			Readbacks: []ctlReadback{rbConv("authority-set", 60)}}), VerdictPass},
+		{"authority-override", ptrCL(controlLoopOutcome{Kind: "authority", Observed: true, LastCmd: 60, AuthorityPeer: "csip",
+			OverrideSeen: true, OverridePct: 75, Readbacks: []ctlReadback{rbConv("authority-set", 60)}}), VerdictFail},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := diagnoseControlLoop(&gwEvidence{ControlLoop: tc.o})
+			if got != tc.want {
+				t.Errorf("verdict = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func ptrCL(o controlLoopOutcome) *controlLoopOutcome { return &o }
+
+func TestDiagnoseAuthorityPKI(t *testing.T) {
+	tests := []struct {
+		name string
+		o    *authorityPKIOutcome
+		want Verdict
+	}{
+		{"nil", nil, VerdictInconclusive},
+		{"not-armed", &authorityPKIOutcome{Kind: "authority-switch-honors-exclusive", BoardArmed: false}, VerdictInconclusive},
+		{"armed-board-only", &authorityPKIOutcome{Kind: "trust-store-tamper-failclosed", BoardArmed: true, BoardOnly: true}, VerdictInconclusive},
+		{"armed-unobserved", &authorityPKIOutcome{Kind: "privacy-switch-vendor-access", BoardArmed: true, Observed: false}, VerdictInconclusive},
+		{"armed-effect-ok", &authorityPKIOutcome{Kind: "authority-switch-honors-exclusive", BoardArmed: true, Observed: true, EffectOK: true, Effect: "refused"}, VerdictPass},
+		{"armed-effect-violation", &authorityPKIOutcome{Kind: "authority-switch-honors-exclusive", BoardArmed: true, Observed: true, EffectOK: false, Effect: "accepted"}, VerdictFail},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := diagnoseAuthorityPKI(&gwEvidence{AuthPKI: tc.o})
+			if got != tc.want {
+				t.Errorf("verdict = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDiagnoseCampaignPassthrough(t *testing.T) {
 	ev := &gwEvidence{Campaign: &campaignResult{Verdict: VerdictPass, Findings: []string{"ok"}}}
 	if got, _ := diagnoseCampaign(ev); got != VerdictPass {

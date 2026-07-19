@@ -68,17 +68,51 @@ type gwScenario struct {
 	Expected []Verdict
 	// HoldTicks is how many times perTick fires after arm (0 ⇒ perTick unused).
 	HoldTicks int
-	// NeedsBench marks a wave-2 scenario that drives + observes the desktop sims'
-	// admin APIs (family A/B). When no bench is wired (e.g. a -loopback :802-only
+	// NeedsBench marks a scenario that cannot run against the plain hermetic :802
+	// loopback because it needs the LIVE bench/gateway — either the desktop sims'
+	// admin APIs (wave-2 family A/B) or the real gateway's stateful engines the
+	// register-echo loopback does not model (wave-3 control-loop reversion timer /
+	// exclusive-authority engine). When no bench is wired (a -loopback :802-only
 	// run), the runner SKIPS it as an expected INCONCLUSIVE rather than tripping the
-	// gate — its hermetic coverage is the httptest bench-stub unit tests, not the
-	// mbaps loopback.
+	// gate — its hermetic coverage is the pure-oracle unit tests (and, for wave-2,
+	// the httptest bench stub).
 	NeedsBench bool
+	// Extended marks a long-running boundary-dither scenario (wave-3
+	// control-setpoint-dither-at-bounds) that a default/full run EXCLUDES so it
+	// cannot inflate every campaign's wall-clock time (mirrors mayScenario.Extended,
+	// RSK-12). It still runs when named explicitly via -only or opted in via
+	// -extended.
+	Extended bool
+	// NeedsBoard marks a wave-3 BOARD-MUTATING scenario (family D authority/PKI/infra)
+	// whose adversary is a board mode-switch / service restart / cert rotation the
+	// ORCHESTRATOR arms out of band (never this suite). Until the orchestrator arms
+	// it and re-runs with -board-armed <id>, the runner SKIPS it as an expected
+	// INCONCLUSIVE and prints the board hook to run. Its arm only OBSERVES the
+	// gateway's effect (via :802 / the sims' /state); it never mutates the board.
+	NeedsBoard bool
+	// Board carries the documented board-control hook commands a NeedsBoard scenario
+	// hands to the orchestrator (data, never executed here). See qa/gw-scenarios/
+	// board-hooks.md for the full companion.
+	Board *boardHook
 
 	arm      func(ctx context.Context, w *gwWorld, ev *gwEvidence) error
 	perTick  func(ctx context.Context, w *gwWorld, ev *gwEvidence, tick int)
 	teardown func(ctx context.Context, w *gwWorld)
 	oracle   string // key into oracleRegistry
+}
+
+// boardHook is the documented board-control commands a family-D (authority/PKI/
+// infra) scenario hands to the ORCHESTRATOR — the shell steps that put the gateway
+// into the mutated state the scenario judges, and restore it afterwards. It is
+// DATA: this suite never executes it (board mutation is out of scope for the QA
+// run); the orchestrator runs Arm, then re-runs the suite with -board-armed <id> so
+// the scenario's arm OBSERVES the effect, then runs Teardown. Design references the
+// invariant the observed effect is judged against.
+type boardHook struct {
+	Arm      string `json:"arm"`      // orchestrator runs this to arm the board mutation
+	Observe  string `json:"observe"`  // how the effect is sampled (the arm does this in Go over :802/sims)
+	Teardown string `json:"teardown"` // orchestrator runs this to restore the resting state
+	Design   string `json:"design"`   // the design contract the effect is judged against
 }
 
 // gwEvidence is the SAMPLED STATE a scenario's arm/perTick accrue and the oracle
@@ -111,6 +145,80 @@ type gwEvidence struct {
 	// invariant, not an authz decision.
 	NBMalform *nbMalformOutcome `json:"nb_malform,omitempty"` // CSIP-northbound malformation (family A)
 	SBFault   *sbFaultOutcome   `json:"sb_fault,omitempty"`   // southbound fault injection (family B)
+
+	// Wave-3 families. Family C drives the gateway's full write→apply→readback
+	// control loop adversarially over :802 (the aggregator's control/readback
+	// primitives); family D judges the observable effect of a BOARD mutation (mode
+	// switch / cert rotation / service restart) the orchestrator arms out of band.
+	ControlLoop *controlLoopOutcome  `json:"control_loop,omitempty"`  // control-loop integrity (family C)
+	AuthPKI     *authorityPKIOutcome `json:"authority_pki,omitempty"` // authority/PKI/infra (family D)
+}
+
+// controlLoopOutcome is the sampled evidence of a control-loop-integrity scenario
+// (family C): the gateway's write→apply→readback loop is driven adversarially and
+// its 704 control-echo projection (WMaxLimPct echoes the commanded value back) is
+// sampled. The oracle (diagnoseControlLoop) asserts the loop stayed SOUND — a legal
+// write converged to the LAST commanded value (no lost/stale echo), a
+// reversion-timer setpoint reverted to the safe default on expiry, the exclusive
+// control authority was honored (no cross-interface override), and the loop never
+// oscillated or went dark. It reuses the aggregator's converge/reversion judgment
+// semantics (convergeWithinSLA / reversionOnExpiry) over a pure evidence value.
+type controlLoopOutcome struct {
+	Kind     string `json:"kind"` // "rapid-recurtail" | "reversion" | "authority" | "dither"
+	Unit     uint8  `json:"unit"`
+	Observed bool   `json:"observed"` // at least one readback (or a fault) was sampled
+
+	Commanded []float64 `json:"commanded,omitempty"` // the ordered setpoints the arm wrote
+	LastCmd   float64   `json:"last_cmd"`            // the LAST commanded value (converge-to-last target)
+
+	Readbacks []ctlReadback `json:"readbacks,omitempty"` // ordered readback observations the oracle judges
+
+	// Authority (control-conflicting-north-south): the non-authoritative interface
+	// probed and whether a value the exclusive mbaps authority never commanded ever
+	// appeared on the echo (a cross-interface override — an authority violation).
+	AuthorityPeer string  `json:"authority_peer,omitempty"`
+	OverrideSeen  bool    `json:"override_seen,omitempty"`
+	OverridePct   float64 `json:"override_pct,omitempty"`
+
+	// WentDark: the control loop stopped responding across the hold — a crash / hang
+	// / session wedge the adversarial write burst triggered.
+	WentDark bool `json:"went_dark,omitempty"`
+
+	Note string `json:"note,omitempty"`
+}
+
+// ctlReadback is one control-echo readback observation the control-loop oracle
+// judges — the judged fields of the aggregator's ReadbackRecord (converge / hold /
+// revert), carried as a pure evidence value so diagnoseControlLoop is unit-testable
+// from a literal.
+type ctlReadback struct {
+	Label     string  `json:"label"`           // human tag ("settle", "confirm", "hold", "revert", "dither@0" …)
+	Phase     string  `json:"phase,omitempty"` // "" (converge) | "hold" | "revert"
+	Expect    float64 `json:"expect"`
+	Final     float64 `json:"final"`
+	Tol       float64 `json:"tol"`
+	SLAS      float64 `json:"sla_s"`
+	HadRead   bool    `json:"had_read"`  // false ⇒ never got a value ⇒ BLIND, not FAIL
+	Converged bool    `json:"converged"` // reached Expect within Tol
+}
+
+// authorityPKIOutcome is the sampled evidence of a family-D authority/PKI/infra
+// scenario. The mutation (a mode switch / cert rotation / service restart / trust-
+// store tamper) is BOARD-MUTATING and armed by the ORCHESTRATOR out of band; this
+// suite only OBSERVES the effect over :802 / the sims' /state. When the board was
+// not armed for this run (the default for a QA run) the oracle returns INCONCLUSIVE
+// and prints the hook; when armed it judges the observed effect against the design
+// contract; where the effect is only board-observable (certmgr 503 / journal), it
+// stays INCONCLUSIVE with a note and the orchestrator supplies the board evidence.
+type authorityPKIOutcome struct {
+	Kind       string `json:"kind"`
+	Contract   string `json:"contract"`    // the design invariant this scenario asserts
+	BoardArmed bool   `json:"board_armed"` // the orchestrator armed the board mutation (-board-armed)
+	Observed   bool   `json:"observed"`    // a :802/sim effect observation was obtained
+	BoardOnly  bool   `json:"board_only"`  // the decisive effect is only board-observable (not judgeable here)
+	EffectOK   bool   `json:"effect_ok"`   // the observed effect matches the design contract
+	Effect     string `json:"effect,omitempty"`
+	Note       string `json:"note,omitempty"`
 }
 
 // nbMalformOutcome is the sampled evidence of a CSIP-northbound-malformation
