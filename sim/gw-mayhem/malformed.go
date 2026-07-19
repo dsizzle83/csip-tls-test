@@ -5,13 +5,13 @@ package gwmayhem
 // prove the gateway rejects them cleanly and NEVER applies an out-of-range value to
 // a DER. It splits into two scenarios:
 //
-//   - authz-out-of-range-setpoint — a WMaxLimPct > 100 write. The gateway's mbaps
-//     write decoder validates enum/scale/tiling but NOT numeric range (design doc
-//     02 §4.4 claims range validation the code does not implement), so this write
-//     is ACCEPTED today. That is a real gap, so the scenario's verdict is PINNED to
-//     FAIL: the suite stays green while the pin documents the gap, and the day the
-//     gateway starts rejecting it the pin mismatches and the gate trips — forcing
-//     the pin (and the gap) to be closed out.
+//   - authz-out-of-range-setpoint — a WMaxLimPct > 100 write. WMaxLimPct is a
+//     max-power LIMIT as % of WMax, so a value outside [0,100] is semantically
+//     invalid; the gateway's mbaps write decoder now rejects it with exception
+//     0x03 and NEVER applies it (lexa-gw internal/writes checkRange, design doc
+//     02 §4.4). Expected=PASS. This was PINNED to FAIL while the gap was open
+//     (the decoder validated enum/scale/tiling but not numeric range); the fix
+//     landed 2026-07-18 and the pin was flipped to PASS the same day.
 //
 //   - authz-malformed-writes — illegal function code (→ 0x01), oversized PDU (→
 //     session closed, no exception leaked), write to a non-existent unit (→ some
@@ -37,18 +37,19 @@ import (
 // 100% ceiling a WMaxLimPct can logically carry.
 const outOfRangePct = 150
 
-// outOfRangeSetpoint builds the PINNED out-of-range-setpoint gap scenario.
+// outOfRangeSetpoint builds the out-of-range-setpoint scenario: a GridService
+// commanding WMaxLimPct=150 must be rejected (0x03) and never applied.
 func outOfRangeSetpoint() gwScenario {
 	return gwScenario{
 		ID:       "authz-out-of-range-setpoint",
-		Desc:     "GridService writes WMaxLimPct=150 — must be rejected (0x03), NEVER applied [PINNED: gateway gap, no range check]",
+		Desc:     "GridService writes WMaxLimPct=150 — must be rejected (0x03), NEVER applied",
 		Category: "mbaps-northbound-authz",
 		Source:   SourceGo,
 		Security: true,
-		// PINNED FAIL: the gateway accepts out-of-range setpoints today (no mbaps-layer
-		// range check). When that is fixed the verdict flips to PASS, this pin
-		// mismatches, and the gate trips to force the pin's removal.
-		Expected: []Verdict{VerdictFail},
+		// Was PINNED FAIL while the gateway accepted out-of-range setpoints (no
+		// mbaps-layer range check); the fix (internal/writes checkRange) landed
+		// 2026-07-18 and the pin was flipped to PASS.
+		Expected: []Verdict{VerdictPass},
 		arm:      armOutOfRange,
 		oracle:   "malformedWrite",
 	}
