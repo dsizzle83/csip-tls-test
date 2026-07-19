@@ -112,3 +112,49 @@ Bounce `mosquitto` (or `lexa-mbaps`) **under an active cap**; the cap must hold
   releases to 100%) — then confirm the standing aggregator PASSES.
 - **Design:** a service restart under an active cap re-seeds retained state; the cap
   holds or safely reverts; no wedge.
+
+---
+
+## Real-board addendum (verified on the CC93 bench 2026-07-19)
+
+The idealised `jq`/`sponge`/`curl`/paths above do NOT match the live board.
+Verified reality, and the state of each Family-D scenario:
+
+- **Board = busybox + python3** (no jq/sponge/curl; `wget` only). Edit
+  `mode.json` with a python3 one-liner, not jq. Configs live under **`/etc/lexa/`**
+  (NOT `/etc/lexa-gw/`): `mode.json`, `certmgr.json`, `modbus.json`,
+  `secrets/*-mqtt.pass`. Service is **`lexa-certmgr`** (not `certmgr`); also
+  `mosquitto` + `mqttproxy`.
+- **certmgr API** is a UNIX socket **`/run/lexa/certmgr.sock`** (HTTP + SO_PEERCRED,
+  0660 root:lexa-certs), NOT a curl-able TCP port. Routes: `/v1/status`,
+  `/v1/slots`, `/v1/rotate`, `/v1/bundle`, `/v1/chain`, `/v1/enroll`, `/v1/sign`.
+  Drive it with a python3 AF_UNIX HTTP request (wget can't do unix sockets).
+- **Truststore** is at **`/mnt/data/lexa/truststore/`** (`index.hmac`,
+  `index.json`, `blobs/`, `ownerca/`), NOT `/var/lib/lexa-gw/certmgr/...`.
+  Rotation state: `/mnt/data/lexa/rotation-state.json`. **Keystore is ELE**
+  (`certmgr.json` keystore_id 1, nvm_dir `/mnt/data/ele-nvm`).
+
+**Automated (scripts/gw-qa-board.sh) — 3 of 5, all live-verified PASS:**
+`authority-switch-honors-exclusive`, `privacy-switch-vendor-access`,
+`service-restart-mid-cap`. That wrapper pauses the aggregator, arms the mutation,
+observes with `-board-armed`, and ALWAYS restores on a trap.
+
+**DEFERRED to a supervised session — `cert-rotation-mid-session` +
+`trust-store-tamper-failclosed`:** both mutate the **ELE-backed** certmgr, whose
+integrity-alarm / rotation-state latch is persistent and whose reseal path is not
+verifiable remotely. A botched rotation/reseal wedges the ENTIRE mbaps stack
+(northbound :802 + southbound polling) — a large, hard-to-reverse blast radius.
+Do them ONLY under supervision, with a **full backup-restore** recovery prepared
+first, e.g.:
+```
+# BEFORE tampering — snapshot the whole certmgr state:
+ssh cc93 'tar czf /mnt/data/lexa/qa-certmgr-backup.tgz -C /mnt/data/lexa truststore rotation-state.json'
+# ... arm trust-store-tamper (append garbage to /mnt/data/lexa/truststore/index.hmac; restart lexa-certmgr) ...
+# ... observe: lexa-certmgr /v1/status 503 + integrity alarm + NO restart loop (systemctl show -p NRestarts) ...
+# RESTORE:
+ssh cc93 'systemctl stop lexa-certmgr && tar xzf /mnt/data/lexa/qa-certmgr-backup.tgz -C /mnt/data/lexa && systemctl start lexa-certmgr'
+# verify: /v1/status healthy + the standing aggregator PASSES again.
+```
+cert-rotation is forward-only; back up the resting leaf/slot + rotation-state the
+same way before POSTing `/v1/rotate` so a bad leaf can be rolled back. Keep the
+re-bootstrap path (scripts/bench-pki-bootstrap.sh) ready as the last resort.
