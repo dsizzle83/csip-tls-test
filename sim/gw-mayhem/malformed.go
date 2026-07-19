@@ -33,29 +33,46 @@ import (
 	"lexa-proto/sunspec"
 )
 
-// outOfRangePct is the hostile setpoint: 150% active-power limit, well past the
-// 100% ceiling a WMaxLimPct can logically carry.
-const outOfRangePct = 150
+// outOfRangeProbes is the G2 hostile-setpoint matrix: every commanded % setpoint
+// whose valid range is SEMANTIC (the register can hold far more than the value
+// can mean). WMaxLimPct is a [0,100] max-power LIMIT; WSetPct/VarSetPct are the
+// SIGNED active/reactive setpoints [-100,100]. Each must be rejected (0x03) and
+// NEVER applied to a DER (lexa-gw internal/writes checkRange; design 02 §4.4).
+var outOfRangeProbes = []struct {
+	name, point string
+	value       float64
+}{
+	{"out-of-range-wmaxlimpct-150", "WMaxLimPct", 150}, // > [0,100]
+	{"out-of-range-wsetpct-150", "WSetPct", 150},       // > [-100,100]
+	{"out-of-range-wsetpct-neg150", "WSetPct", -150},   // < [-100,100] (signed int16 — a real negative)
+	{"out-of-range-varsetpct-150", "VarSetPct", 150},   // > [-100,100]
+	{"out-of-range-varsetpct-neg150", "VarSetPct", -150}, // < [-100,100]
+}
+// NOTE: no negative-WMaxLimPct probe — WMaxLimPct is an UNSIGNED register (a
+// max-power limit is never negative), so a "-10" never reaches the gateway as a
+// negative (the client encodes it into uint16); the meaningful WMaxLimPct attack
+// is the > 100 upper bound. The signed *SetPct points carry a real low bound.
 
 // outOfRangeSetpoint builds the out-of-range-setpoint scenario: a GridService
-// commanding WMaxLimPct=150 must be rejected (0x03) and never applied.
+// commanding any % setpoint outside its semantic range must be rejected (0x03)
+// and never applied.
 func outOfRangeSetpoint() gwScenario {
 	return gwScenario{
 		ID:       "authz-out-of-range-setpoint",
-		Desc:     "GridService writes WMaxLimPct=150 — must be rejected (0x03), NEVER applied",
+		Desc:     "GridService writes out-of-range % setpoints (WMaxLimPct/WSetPct/VarSetPct, ±) — each must be rejected (0x03), NEVER applied",
 		Category: "mbaps-northbound-authz",
 		Source:   SourceGo,
 		Security: true,
 		// Was PINNED FAIL while the gateway accepted out-of-range setpoints (no
-		// mbaps-layer range check); the fix (internal/writes checkRange) landed
-		// 2026-07-18 and the pin was flipped to PASS.
+		// mbaps-layer range check); WMaxLimPct fix landed 2026-07-18, the signed
+		// WSetPct/VarSetPct bounds (G2) 2026-07-19 — pin is PASS.
 		Expected: []Verdict{VerdictPass},
 		arm:      armOutOfRange,
 		oracle:   "malformedWrite",
 	}
 }
 
-// armOutOfRange writes an out-of-range WMaxLimPct as a role that IS allowed to
+// armOutOfRange writes each out-of-range % setpoint as a role that IS allowed to
 // write controls (GridService), isolating the value check from the authz check.
 func armOutOfRange(ctx context.Context, w *gwWorld, ev *gwEvidence) error {
 	unit, _, ok := w.discoverControlUnit(ctx)
@@ -70,18 +87,20 @@ func armOutOfRange(ctx context.Context, w *gwWorld, ev *gwEvidence) error {
 	}
 	defer conn.Close()
 
-	wo := writeOutcome{Name: "out-of-range-wmaxlimpct-150", ExpectRejectCode: uint8(mbap.ExIllegalValue)}
-	res, perr := conn.ProbeDenied(unit, sunspec.ModelDERCtlAC, matrixCtrlPoint, outOfRangePct)
-	switch {
-	case perr != nil:
-		wo.TransportErr = perr.Error()
-	case res.Wrote:
-		wo.Accepted = true
-		wo.Note = "gateway returned write-success for WMaxLimPct=150 (no range check — design §4.4 gap)"
-	default:
-		wo.ExCode = res.ExceptionCode
+	for _, p := range outOfRangeProbes {
+		wo := writeOutcome{Name: p.name, ExpectRejectCode: uint8(mbap.ExIllegalValue)}
+		res, perr := conn.ProbeDenied(unit, sunspec.ModelDERCtlAC, p.point, p.value)
+		switch {
+		case perr != nil:
+			wo.TransportErr = perr.Error()
+		case res.Wrote:
+			wo.Accepted = true
+			wo.Note = fmt.Sprintf("gateway returned write-success for %s=%g (out-of-range not rejected — design §4.4)", p.point, p.value)
+		default:
+			wo.ExCode = res.ExceptionCode
+		}
+		ev.Writes = append(ev.Writes, wo)
 	}
-	ev.Writes = append(ev.Writes, wo)
 	return nil
 }
 
