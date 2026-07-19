@@ -58,6 +58,14 @@ func main() {
 	hubTokenFile := flag.String("hub-token-file", "", "path to lexa-api's bearer token (TASK-014, AD-008); empty = no auth presented, today's behavior")
 	whatifScenarioDir := flag.String("whatif-scenario-dir", "data/scenarios", "dashboard V2: scenario datasets for the what-if engine")
 	whatifTariffDir := flag.String("whatif-tariff-dir", "data/tariffs", "dashboard V2: sourced tariff files for the what-if engine")
+	// LEXA-GW proof tab (gw.go): the secure DER gateway under test + the desktop
+	// sims whose /state proves it is polling/controlling. gwRepo resolves logs/,
+	// scripts/, bin/ for the verdict board + the live-run wrapper.
+	gwHost := flag.String("gw-host", "69.0.0.2", "lexa-gw gateway host (its northbound mbaps server is :802)")
+	gwRepo := flag.String("gw-repo", ".", "csip-tls-test repo root (logs/gw-mayhem reports + scripts/gw-qa-run.sh)")
+	gwModsim := flag.String("gw-modsim", "http://127.0.0.1:6020", "plain southbound DER sim /state (modsim simapi)")
+	gwMbapsdev := flag.String("gw-mbapsdev", "http://127.0.0.1:6031", "secure southbound DER sim /state (mbapsdev simapi)")
+	gwGridPort := flag.Int("gw-gridport", 11113, "gridsim CSIP listener port (reachability probe)")
 	flag.Parse()
 
 	// TASK-014: present lexa-api's bearer token, scoped to the "hub" backend
@@ -159,6 +167,10 @@ func main() {
 	// fetch by name, read-only (see qa_reports.go, CONTRACTS.md §4).
 	mux.HandleFunc("/api/qa/reports", handleQAReports)
 	mux.HandleFunc("/api/qa/reports/{name}", handleQAReportFetch)
+
+	// LEXA-GW proof endpoints (/api/gw/*): live 4-interface status + the
+	// gw-mayhem adversarial-QA verdict board + a live-run trigger (gw.go).
+	newGWDriver(*gwRepo, *gwHost, *gwModsim, *gwMbapsdev, *gwGridPort).register(mux)
 
 	log.Printf("dashboard: serving at http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))

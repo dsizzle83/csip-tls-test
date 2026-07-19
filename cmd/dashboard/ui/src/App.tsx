@@ -4,6 +4,7 @@ import { LeftNav } from './components/LeftNav';
 import Studio from './views/Studio';
 import Ops from './views/Ops';
 import Proof from './views/Proof';
+import Gateway from './views/Gateway';
 import LogsView from './views/LogsView';
 import Bench from './views/Bench';
 
@@ -27,6 +28,7 @@ export default function App() {
                 <Route path="/studio" element={<Studio />} />
                 <Route path="/ops" element={<Ops />} />
                 <Route path="/proof" element={<Proof />} />
+                <Route path="/gateway" element={<Gateway />} />
                 <Route path="/logs" element={<LogsView />} />
                 <Route path="/bench" element={<Bench />} />
                 <Route path="*" element={<Navigate to="/studio" replace />} />

@@ -13,6 +13,7 @@ const ITEMS: NavItem[] = [
   { to: '/studio', label: 'Studio', icon: '⚡' },
   { to: '/ops', label: 'Live Ops', icon: '📡' },
   { to: '/proof', label: 'Proof', icon: '🛡' },
+  { to: '/gateway', label: 'LEXA-GW', icon: '🔌' },
   { to: '/logs', label: 'Logs', icon: '📜' },
   { to: '/bench', label: 'Bench', icon: '🔧' },
 ];
