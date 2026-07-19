@@ -1,0 +1,19 @@
+{
+  "camp_v": 1,
+  "id": "transport-resume-after-drop",
+  "name": "A re-established northbound :802 session RESUMES the TLS session (TCP-46)",
+  "role": "GridServiceSunSpec",
+  "target": "gateway",
+  "hypothesis": "When a northbound mbaps client re-establishes a dropped session, the gateway should offer TLS session resumption (RFC 5077 tickets / session IDs) so the reconnect skips a full ECDHE handshake — cheaper for a fleet of aggregators reconnecting after a WAN blip, and the mbtls client caches and offers the prior session. Whether the gateway ADVERTISES resumption is a server capability under test.",
+  "expected": "The dropped session re-establishes (recovery) AND the handshake facts report Resumed=true — the gateway offered TLS session resumption so the reconnect skipped a full handshake. Observed live on the CC93 bench 2026-07-19: RESUMED over TLSv1.3/TLS13-AES128-GCM-SHA256.",
+  "fix": "If Resumed=false (full handshake), the gateway stopped issuing/accepting session tickets on :802: check lexa-platform/wolfssl server context (session-cache / ticket support). If the reconnect itself fails, the session reaper is not freeing the dropped slot (max_sessions starvation).",
+  "notes": "G1 (TLS-transport gap). Also subsumes the recovery invariant: the resume + follow-up discover succeed after a drop, so a re-established session both RECOVERS and RESUMES. Northbound (drives the aggregator's own :802 session via disconnect+resume), so it tests the gateway server, not a southbound sim.",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "disconnect"},
+    {"do": "resume"},
+    {"do": "discover", "units": [2]}
+  ],
+  "oracle": {"name": "resumeAfterDrop"},
+  "expected_verdicts": ["PASS"]
+}

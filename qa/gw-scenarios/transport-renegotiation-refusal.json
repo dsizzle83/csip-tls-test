@@ -1,0 +1,18 @@
+{
+  "camp_v": 1,
+  "id": "transport-renegotiation-refusal",
+  "name": "Client-initiated TLS renegotiation on the northbound :802 session is refused safely (TCP-62)",
+  "role": "GridServiceSunSpec",
+  "target": "gateway",
+  "hypothesis": "The gateway's mbaps :802 profile advertises the RFC 5746 secure-renegotiation indication (SunSpecTCP-62), but a conformant server need not honour an ACTUAL client-initiated renegotiation. Whichever it does, the session must stay safe: pre-renegotiation state is not corrupted, the client role is not silently re-derived to something else, and the session is not left wedged. A renegotiation is a classic downgrade / identity-swap vector, so the gateway refusing it (or handling it without losing the authenticated role) is the security property under test.",
+  "expected": "The renegotiation attempt is observed (refused by peer policy is the expected, conformant outcome); the session remains usable afterward — the follow-up discover succeeds, transparently redialing if the peer tore the stream down. No wedged or corrupt session, no silent role change.",
+  "fix": "If the session is left unusable after a renegotiation, the renegotiation path is unsafe: check the gateway's renegotiation policy (design 02 §1 — indication-only, role re-derived on any renegotiation) and lexa-platform/wolfssl's server-side renegotiation handling. If the role silently changes, the RBAC subject binding to the leaf is not re-checked on renegotiation.",
+  "notes": "G1 (TLS-transport gap). Northbound analogue of the loopback qa/aggregator/renego-refusal.json — target=gateway so it drives the real :802 server. Asserts OBSERVED behaviour + session safety, NOT a specific accept/refuse choice (app-level refusal is optional per the product TCP-62 finding).",
+  "steps": [
+    {"do": "discover", "units": [2]},
+    {"do": "renegotiate", "unit": 2},
+    {"do": "discover", "units": [2]}
+  ],
+  "oracle": {"name": "renegotiationRefusal"},
+  "expected_verdicts": ["PASS"]
+}
