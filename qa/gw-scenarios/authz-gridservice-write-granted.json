@@ -7,11 +7,11 @@
   "hypothesis": "The grant half of the RBAC contract: GridServiceSunSpec holds rw on the commanded control group (704-712), so a WMaxLimPct write must be ACCEPTED and echoed back through the gateway's projection. A grid-service role DENIED a legitimate control write is as much a failure as a read-only role being granted one.",
   "expected": "The write is accepted and the readback converges to the commanded value within the SLA.",
   "fix": "If a GridService control write is denied, look at configs/rbac/rules.json (its commanded rw grant on models 704-712) and internal/authz/compile.go (the compiled grant set for the role+unit).",
-  "notes": "Nominal value (100% = no curtailment) so the grant proof never leaves a DER limited. Complements the denial specs and the Go matrix sweep.",
+  "notes": "Nominal value (100% = no curtailment) so the grant proof never leaves a DER limited. Complements the denial specs and the Go matrix sweep. sla_s=15 (not 5): the 704 WMaxLimPct echo is the reconciler's ControlEcho, which refreshes on the southbound reconcile POLL cadence (~5s). In the full suite this scenario runs immediately after comm-loss-sentinel-mask leaves the secure DER (unit 2) fresh out of comm-loss, so the first post-recovery reconcile cycle that applies+echoes the commanded 100 can take up to ~one full cadence — the write IS accepted and applied, the echo just arrives on the next poll. 5s was under one cadence and flaked (observed: converged in 5.0s, DEGRADED at the boundary; occasionally >5s, FAIL); 15s gives ~3 cadences of margin without masking a real regression (a genuinely denied/unapplied write never converges at all).",
   "steps": [
     {"do": "discover", "units": [2]},
     {"do": "write_point", "unit": 2, "model": 704, "point": "WMaxLimPct", "value": 100},
-    {"do": "readback", "unit": 2, "model": 704, "point": "WMaxLimPct", "expect": 100, "sla_s": 5, "tol": 1}
+    {"do": "readback", "unit": 2, "model": 704, "point": "WMaxLimPct", "expect": 100, "sla_s": 15, "tol": 1}
   ],
   "oracle": {"name": "convergeWithinSLA"},
   "expected_verdicts": ["PASS"]
