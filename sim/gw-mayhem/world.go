@@ -33,6 +33,12 @@ type gwWorld struct {
 	eng      *aggregator.Engine
 	neg      map[string]negFixture
 
+	// bench wires the wave-2 families (nb-malform / sb-fault) to the desktop
+	// sims' admin APIs; the zero value disables them (their arms report a setup
+	// error the oracle turns into INCONCLUSIVE). The wave-1 authz families ignore
+	// it — they drive the gateway's :802 server directly.
+	bench BenchConfig
+
 	// Control-unit discovery is done ONCE per run and cached: every family that
 	// needs a 704 target shares the result, so the suite opens one discovery session
 	// instead of one per scenario (less session churn, no per-scenario flakiness).
@@ -140,6 +146,12 @@ func (w *gwWorld) loadNegatives() error {
 	}
 	return nil
 }
+
+// SetBench wires the wave-2 bench driver (the desktop sims' admin APIs) into the
+// world after construction — main sets it from the -gridsim-admin / -inv-* flags;
+// a hermetic test sets it to httptest bench-stub URLs. Left unset, the wave-2
+// families are INCONCLUSIVE (no bench to drive/observe).
+func (w *gwWorld) SetBench(b BenchConfig) { w.bench = b }
 
 // connectAs dials the target presenting role r's certificate (with the aggregator's
 // own role self-check), returning the live Conn.

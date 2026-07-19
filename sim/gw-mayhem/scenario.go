@@ -68,6 +68,12 @@ type gwScenario struct {
 	Expected []Verdict
 	// HoldTicks is how many times perTick fires after arm (0 ⇒ perTick unused).
 	HoldTicks int
+	// NeedsBench marks a wave-2 scenario that drives + observes the desktop sims'
+	// admin APIs (family A/B). When no bench is wired (e.g. a -loopback :802-only
+	// run), the runner SKIPS it as an expected INCONCLUSIVE rather than tripping the
+	// gate — its hermetic coverage is the httptest bench-stub unit tests, not the
+	// mbaps loopback.
+	NeedsBench bool
 
 	arm      func(ctx context.Context, w *gwWorld, ev *gwEvidence) error
 	perTick  func(ctx context.Context, w *gwWorld, ev *gwEvidence, tick int)
@@ -97,6 +103,72 @@ type gwEvidence struct {
 	Writes   []writeOutcome  `json:"writes,omitempty"`   // malformed/abusive writes
 	Flood    *floodOutcome   `json:"flood,omitempty"`    // transport session flood
 	Campaign *campaignResult `json:"campaign,omitempty"` // spec-scenario passthrough
+
+	// Wave-2 families. Where the wave-1 families DRIVE the gateway's northbound
+	// :802 server as a hostile aggregator, these two OBSERVE the gateway's effect
+	// on its DERs (the sim southbound /state) while a HOSTILE HEAD-END (family A)
+	// or a MISBEHAVING DER (family B) is armed against it — the fail-closed
+	// invariant, not an authz decision.
+	NBMalform *nbMalformOutcome `json:"nb_malform,omitempty"` // CSIP-northbound malformation (family A)
+	SBFault   *sbFaultOutcome   `json:"sb_fault,omitempty"`   // southbound fault injection (family B)
+}
+
+// nbMalformOutcome is the sampled evidence of a CSIP-northbound-malformation
+// scenario (family A): a hostile/broken head-end (the gridsim) is armed to serve
+// a malformed resource or to fault the WAN, and the gateway's SOUTHBOUND effect
+// (the DER's applied WMaxLimPct, read from the sim /state) plus its liveness (the
+// secure device's poll-request counter still advancing) are sampled across a
+// hold. The oracle asserts the gateway FAILED CLOSED: never applied an absurd or
+// malformed setpoint to a DER, never unseated a safe cap it had adopted, and
+// never went dark (crash/hang/walker-deadlock).
+type nbMalformOutcome struct {
+	Kind  string `json:"kind"`  // the gridsim malform/outage/clock adversary armed
+	Class string `json:"class"` // "resource" | "pricing" | "curve" | "headend-fault"
+
+	Observed    bool    `json:"observed"`              // at least one post-arm DER state sample was obtained
+	Samples     int     `json:"samples"`               // post-arm DER-state samples taken
+	LiveObs     int     `json:"liveness_observations"` // samples where gateway liveness was observable (secure poll counter present)
+	LiveOK      int     `json:"liveness_ok"`           // of LiveObs, samples where the poll counter had advanced (gateway alive)
+	BaselineCap bool    `json:"baseline_cap"`          // a safe non-uncapped cap (pct < ~99) was applied to a DER BEFORE arming
+	BaselinePct float64 `json:"baseline_pct"`          // the safe baseline applied pct (NaN if none), the value the gateway must HOLD
+
+	AbsurdApplied bool    `json:"absurd_applied"` // an out-of-range setpoint (pct>100, <0, or NaN) was applied to a DER
+	AbsurdPct     float64 `json:"absurd_pct,omitempty"`
+	Unseated      bool    `json:"unseated"` // the safe baseline cap was dropped to uncapped and stayed dropped
+
+	Note string `json:"note,omitempty"`
+}
+
+// sbFaultOutcome is the sampled evidence of a southbound-fault-injection scenario
+// (family B): a MISBEHAVING DER (one sim) is faulted while a HEALTHY DER (the
+// other sim) is left alone, and the gateway's response is sampled from both sims'
+// /state. The oracle asserts the gateway DIGESTED THE FAULT SAFELY: it stayed
+// alive (kept polling the healthy device), ISOLATED the faulted device from the
+// healthy one (a faulted SECURE device never takes the PLAIN device down, and
+// vice-versa), flagged comm-loss where expected, and never applied an absurd
+// projection off garbage registers.
+type sbFaultOutcome struct {
+	Fault  string `json:"fault"`  // the sim fault kind armed
+	Target string `json:"target"` // "secure" (mbapsdev) | "plain" (modsim) — which device was faulted
+	Expect string `json:"expect"` // the invariant probed: "comm-loss" | "isolation" | "digest" | "recover"
+
+	Observed bool `json:"observed"` // baseline + at least one post-arm sample obtained
+
+	// Liveness/isolation (measured on the HEALTHY device, which must keep working):
+	HealthyName    string `json:"healthy_name,omitempty"`
+	HealthyLiveObs int    `json:"healthy_live_obs"` // post-arm samples where the healthy device's liveness was observable
+	HealthyLiveOK  int    `json:"healthy_live_ok"`  // of those, samples where it was still alive (isolation held)
+
+	// The FAULTED device's comm-loss signal (its poll session dropped / stalled):
+	FaultedPollObservable bool `json:"faulted_poll_observable"` // the faulted device exposes a poll counter (secure only)
+	FaultedPolledAtBase   bool `json:"faulted_polled_at_base"`  // the gateway WAS polling the faulted device before the fault
+	CommLossObserved      bool `json:"comm_loss_observed"`      // the faulted device's poll stalled/dropped after the fault
+	Recovered             bool `json:"recovered"`               // the faulted device's poll resumed after the fault cleared
+
+	// Safety of the digest (only checkable when a DER projection is readable):
+	AbsurdProjected bool `json:"absurd_projected"` // a garbage register produced an absurd applied setpoint on the faulted DER
+
+	Note string `json:"note,omitempty"`
 }
 
 // authzCell is one role×op cell of the role-denial matrix: the contract's

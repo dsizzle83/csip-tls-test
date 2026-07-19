@@ -44,10 +44,15 @@ func main() {
 		serverCA = flag.String("server-ca", "", "override the CA that verifies the gateway's server cert (default: manifest device CA)")
 		specDir  = flag.String("scenarios", "qa/gw-scenarios", "dir of qa/gw-scenarios/*.json data specs")
 		loopback = flag.Bool("loopback", false, "run against an in-process faithful loopback gateway (hermetic, no bench)")
-		list     = flag.Bool("list", false, "list the scenario suite and exit")
-		only     = flag.String("only", "", "comma-separated scenario ids to run (default: all)")
-		jsonOut  = flag.Bool("json", false, "emit the batch roll-up as JSON to stdout")
-		outFile  = flag.String("out", "", "also write the batch summary JSON to this file")
+		// Wave-2 bench wiring (family A/B): the desktop sims' admin APIs the
+		// nb-malform / sb-fault scenarios drive + observe. Empty disables that family.
+		gridsimAdmin = flag.String("gridsim-admin", "http://127.0.0.1:11114", "gridsim head-end admin API (family A malform/outage/clock)")
+		invPlain     = flag.String("inv-plain", "http://127.0.0.1:6020", "plain (modsim) DER sim admin API (simapi)")
+		invSecure    = flag.String("inv-secure", "http://127.0.0.1:6031", "secure (mbapsdev) DER sim admin API (simapi)")
+		list         = flag.Bool("list", false, "list the scenario suite and exit")
+		only         = flag.String("only", "", "comma-separated scenario ids to run (default: all)")
+		jsonOut      = flag.Bool("json", false, "emit the batch roll-up as JSON to stdout")
+		outFile      = flag.String("out", "", "also write the batch summary JSON to this file")
 	)
 	flag.Parse()
 
@@ -78,6 +83,16 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gw-mayhem: build world: %v\n", err)
 		os.Exit(2)
+	}
+	// Wire the wave-2 bench driver (the desktop sims' admin APIs). With -loopback
+	// this stays UNSET (the wave-2 families are then INCONCLUSIVE — hermetic runs
+	// use the httptest bench stub in the integration tests, not a live sim).
+	if !*loopback {
+		world.SetBench(gwmayhem.BenchConfig{
+			GridsimAdmin: *gridsimAdmin,
+			Plain:        gwmayhem.DERSim{Name: "inv-plain", BaseURL: *invPlain, Secure: false},
+			Secure:       gwmayhem.DERSim{Name: "inv-secure", BaseURL: *invSecure, Secure: true},
+		})
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

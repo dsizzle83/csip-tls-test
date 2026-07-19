@@ -83,6 +83,19 @@ func RunSuite(ctx context.Context, w *gwWorld, scenarios []gwScenario, loadErrs 
 // that into INCONCLUSIVE), and a missing oracle is itself INCONCLUSIVE.
 func runScenario(ctx context.Context, w *gwWorld, sc gwScenario) *gwReport {
 	start := time.Now()
+	// A wave-2 (bench-required) scenario with no bench wired is SKIPPED as an
+	// expected INCONCLUSIVE, not a gate failure — a -loopback :802-only run cannot
+	// drive the HTTP sim admin APIs, and its hermetic proof is the bench-stub unit
+	// tests. Live runs pass the sims' admin URLs, so the scenario runs for real.
+	if sc.NeedsBench && !w.bench.benchReady() {
+		return &gwReport{
+			ID: sc.ID, Desc: sc.Desc, Category: sc.Category, Source: sc.Source,
+			Security: sc.Security, Verdict: VerdictInconclusive, Expected: sc.Expected,
+			VerdictExpected: true,
+			Findings:        []string{"skipped: no bench wired (wave-2 needs -gridsim-admin + the -inv-* DER sims; hermetic coverage is the bench-stub unit tests)"},
+			DurationS:       time.Since(start).Seconds(),
+		}
+	}
 	ev := &gwEvidence{Scenario: sc.ID}
 	if sc.arm != nil {
 		if err := sc.arm(ctx, w, ev); err != nil {

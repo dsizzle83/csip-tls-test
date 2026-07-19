@@ -128,6 +128,70 @@ func TestDiagnoseSessionFlood(t *testing.T) {
 	}
 }
 
+func TestDiagnoseNBMalform(t *testing.T) {
+	// A liveness-clean, cap-less baseline: gateway stayed up, never applied garbage.
+	stayedUp := func(o nbMalformOutcome) nbMalformOutcome {
+		o.Observed, o.LiveObs, o.LiveOK = true, 3, 3
+		o.BaselinePct = 100
+		return o
+	}
+	tests := []struct {
+		name string
+		o    *nbMalformOutcome
+		want Verdict
+	}{
+		{"nil", nil, VerdictInconclusive},
+		{"unobserved", &nbMalformOutcome{Observed: false}, VerdictInconclusive},
+		{"contained-no-cap", ptrNB(stayedUp(nbMalformOutcome{})), VerdictPass},
+		{"absurd-applied", ptrNB(stayedUp(nbMalformOutcome{AbsurdApplied: true, AbsurdPct: 150})), VerdictFail},
+		{"gateway-dark", ptrNB(nbMalformOutcome{Observed: true, LiveObs: 3, LiveOK: 0, BaselinePct: 100}), VerdictFail},
+		{"cap-held", ptrNB(stayedUp(nbMalformOutcome{BaselineCap: true, BaselinePct: 25})), VerdictPass},
+		{"cap-unseated", ptrNB(stayedUp(nbMalformOutcome{BaselineCap: true, BaselinePct: 25, Unseated: true})), VerdictFail},
+		{"liveness-unobservable-still-pass", ptrNB(nbMalformOutcome{Observed: true, LiveObs: 0, BaselinePct: 100}), VerdictPass},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := diagnoseNBMalform(&gwEvidence{NBMalform: tc.o})
+			if got != tc.want {
+				t.Errorf("verdict = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDiagnoseSBFault(t *testing.T) {
+	// Isolation held: the healthy secure device kept being polled.
+	isolated := sbFaultOutcome{Observed: true, Target: sbTargetPlain, Expect: sbExpectIsolation, HealthyName: "inv-secure", HealthyLiveObs: 3, HealthyLiveOK: 3}
+	// Secure comm-loss that recovered.
+	recovered := sbFaultOutcome{Observed: true, Target: sbTargetSecure, Expect: sbExpectCommLoss, HealthyName: "inv-plain",
+		FaultedPollObservable: true, FaultedPolledAtBase: true, CommLossObserved: true, Recovered: true}
+	tests := []struct {
+		name string
+		o    *sbFaultOutcome
+		want Verdict
+	}{
+		{"nil", nil, VerdictInconclusive},
+		{"unobserved", &sbFaultOutcome{Observed: false}, VerdictInconclusive},
+		{"isolation-held", ptrSB(isolated), VerdictPass},
+		{"no-isolation", ptrSB(sbFaultOutcome{Observed: true, Target: sbTargetPlain, Expect: sbExpectIsolation, HealthyName: "inv-secure", HealthyLiveObs: 3, HealthyLiveOK: 0}), VerdictFail},
+		{"absurd-projection", ptrSB(sbFaultOutcome{Observed: true, Target: sbTargetPlain, Expect: sbExpectDigest, HealthyName: "inv-secure", HealthyLiveObs: 3, HealthyLiveOK: 3, AbsurdProjected: true}), VerdictFail},
+		{"comm-loss-recovered", ptrSB(recovered), VerdictPass},
+		{"comm-loss-stuck", ptrSB(sbFaultOutcome{Observed: true, Target: sbTargetSecure, Expect: sbExpectCommLoss, HealthyName: "inv-plain", FaultedPollObservable: true, FaultedPolledAtBase: true, CommLossObserved: true, Recovered: false}), VerdictFail},
+		{"digest-clean", ptrSB(sbFaultOutcome{Observed: true, Target: sbTargetSecure, Expect: sbExpectDigest, HealthyName: "inv-plain"}), VerdictPass},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := diagnoseSBFault(&gwEvidence{SBFault: tc.o})
+			if got != tc.want {
+				t.Errorf("verdict = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func ptrNB(o nbMalformOutcome) *nbMalformOutcome { return &o }
+func ptrSB(o sbFaultOutcome) *sbFaultOutcome     { return &o }
+
 func TestDiagnoseCampaignPassthrough(t *testing.T) {
 	ev := &gwEvidence{Campaign: &campaignResult{Verdict: VerdictPass, Findings: []string{"ok"}}}
 	if got, _ := diagnoseCampaign(ev); got != VerdictPass {

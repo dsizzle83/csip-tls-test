@@ -19,13 +19,20 @@ import (
 // cannot express (the role×op matrix sweep, the raw hostile-cert / raw-frame
 // probes, the concurrent flood).
 func goScenarios() []gwScenario {
-	return []gwScenario{
+	out := []gwScenario{
+		// Wave 1 — mbaps-northbound-authz + transport abuse (drive the gateway's
+		// :802 server as a hostile aggregator).
 		roleDenialMatrix(),
 		certNegatives(),
 		outOfRangeSetpoint(),
 		malformedWrites(),
 		sessionFlood(),
 	}
+	// Wave 2 — observe the gateway's fail-closed behaviour from the SOUTHBOUND
+	// while a hostile head-end (family A) or a misbehaving DER (family B) is armed.
+	out = append(out, northboundMalformScenarios()...)
+	out = append(out, southboundFaultScenarios()...)
+	return out
 }
 
 // AllScenarios returns the merged Go + spec suite for specDir, plus one error per
