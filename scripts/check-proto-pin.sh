@@ -251,7 +251,17 @@ EOF
       # Full module source tree is needed: `go mod vendor` traces the actual
       # import graph, not just go.mod. vendor/ and .git are excluded (huge,
       # irrelevant, and we're about to regenerate vendor/ from scratch).
-      ( cd "$SELF" && tar -c --exclude=./.git --exclude=./vendor . ) | tar -x -C "$TMP_CONSUMER"
+      # Also excluded: non-content scratch/output dirs that a live bench
+      # session may be writing to concurrently (logs/, cmd/dashboard/logs/)
+      # or that are just build output / fetched deps irrelevant to the go
+      # vendor comparison (bin/, cmd/dashboard/ui/node_modules/). Reading a
+      # file mid-write here makes `tar -c` report "file changed as we read
+      # it" and exit non-zero, failing this check spuriously -- none of
+      # these dirs are part of the vendored proto content being verified.
+      ( cd "$SELF" && tar -c --exclude=./.git --exclude=./vendor \
+          --exclude=./logs --exclude=./cmd/dashboard/logs \
+          --exclude=./bin --exclude=./cmd/dashboard/ui/node_modules \
+          . ) | tar -x -C "$TMP_CONSUMER"
 
       # Point the scratch copy's replace directive at the extracted SHA
       # instead of the developer's real (possibly-ahead-of-pin) ../lexa-proto.
