@@ -78,6 +78,16 @@ fi
 BUILD="$WORK/build"
 rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
 
+# --enable-ticket-nonce-malloc is REQUIRED for interop, not a preference. Without
+# it wolfSSL caps ticket_nonce at TLS13_TICKET_NONCE_STATIC_SZ = 8 bytes
+# (wolfssl/internal.h) and DoTls13NewSessionTicket returns INVALID_PARAMETER ->
+# alert 47 illegal_parameter. RFC 8446 4.6.1 allows ticket_nonce<0..255>, and
+# mbed TLS sends 32 -- so a stock-built referee ABORTS every session with the
+# product the moment the gateway issues a session ticket, which it does by
+# default (mbaps.json session_cache: true). That looked like a gateway defect
+# for several rounds on 2026-07-27; it is a harness build limitation. The stock
+# sysroot needs this flag too.
+#
 # Flags are the stock sysroot's configure_flags (see
 # ~/.local/wolfssl-amd64/wolfssl-sysroot-manifest.txt) PLUS --enable-keylog-export.
 # Keep this list in lockstep with the stock builder: a divergence here means the
@@ -94,6 +104,7 @@ rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
   --enable-cryptocb \
   --enable-sessioncerts \
   --enable-keylog-export \
+  --enable-ticket-nonce-malloc \
   --enable-static \
   --disable-shared \
   --disable-examples \
@@ -108,6 +119,14 @@ make install
 # time when the evidence is already stale.
 if ! grep -q "define HAVE_SECRET_CALLBACK" "$PREFIX/include/wolfssl/options.h"; then
   echo "ERROR: HAVE_SECRET_CALLBACK not defined in the installed options.h" >&2
+  exit 1
+fi
+# Same reasoning, different failure mode: without the nonce-malloc macro the
+# referee cannot talk to the product at all once a ticket is issued, and the
+# symptom (alert 47 mid-session, after a clean handshake) reads as a DUT fault.
+if ! grep -q "define WOLFSSL_TICKET_NONCE_MALLOC" "$PREFIX/include/wolfssl/options.h"; then
+  echo "ERROR: WOLFSSL_TICKET_NONCE_MALLOC not defined — this sysroot would reject" >&2
+  echo "       mbed TLS's 32-byte ticket_nonce with illegal_parameter" >&2
   exit 1
 fi
 
