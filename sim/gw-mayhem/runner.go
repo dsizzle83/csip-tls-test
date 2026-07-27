@@ -263,7 +263,29 @@ func evidenceTable(sum BatchSummary) string {
 	return b.String()
 }
 
-// rollupLine summarises the run: per-verdict tallies + the gate outcome.
+// Asserted counts the scenarios that actually reached a judgement — PASS, FAIL
+// or DEGRADED. BLIND and INCONCLUSIVE are non-assertions: the scenario did not
+// run, or ran without being able to observe what it needed.
+func (s BatchSummary) Asserted() int {
+	return s.ByVerdict[VerdictPass] + s.ByVerdict[VerdictFail] + s.ByVerdict[VerdictDegraded]
+}
+
+// rollupLine summarises the run: per-verdict tallies, how much of the selection
+// actually asserted anything, and the gate outcome.
+//
+// ASSERTION FLOOR. A run in which NOTHING was asserted must not be able to print
+// GATE PASS. Every scenario here can decline to run — a missing bench, an unwired
+// sim admin API, a board mutation the orchestrator did not arm — and each of
+// those lands as INCONCLUSIVE, which does not increment GateFailures. A run whose
+// scenarios all declined therefore used to print the same "GATE PASS" as a run
+// that exercised the whole suite, and the two are not remotely the same claim.
+// That is the failure mode that makes a QA gate worse than no gate: it reports
+// success for work it did not do, and the operator stops reading it.
+//
+// So the assertion count is ALWAYS printed (not just when it is bad), and a zero
+// count is itself a gate failure with the reason spelled out. This is the
+// gw-mayhem half of lexa-gw docs/ADVERSARIAL_QA_STRATEGY.md wave 1, "make the
+// existing harnesses honest".
 func rollupLine(sum BatchSummary) string {
 	var parts []string
 	for _, v := range []Verdict{VerdictPass, VerdictDegraded, VerdictFail, VerdictBlind, VerdictInconclusive} {
@@ -275,11 +297,16 @@ func rollupLine(sum BatchSummary) string {
 	if tally == "" {
 		tally = "no scenarios"
 	}
+	asserted := sum.Asserted()
 	gate := "GATE PASS"
-	if sum.GateFailures > 0 {
+	switch {
+	case sum.GateFailures > 0:
 		gate = fmt.Sprintf("GATE FAIL (%d)", sum.GateFailures)
+	case sum.Total > 0 && asserted == 0:
+		gate = "GATE FAIL (nothing asserted — every scenario declined to run)"
 	}
-	return fmt.Sprintf("Roll-up: %d scenario(s) [%s] | %s | %d load error(s)", sum.Total, tally, gate, len(sum.LoadErrors))
+	return fmt.Sprintf("Roll-up: %d scenario(s) [%s] | asserted %d/%d | %s | %d load error(s)",
+		sum.Total, tally, asserted, sum.Total, gate, len(sum.LoadErrors))
 }
 
 // SortReportsByID sorts a summary's reports by ID (stable evidence ordering for a
