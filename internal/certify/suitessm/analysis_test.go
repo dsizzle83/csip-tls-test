@@ -758,3 +758,39 @@ func TestRoleOIDConstantsAgree(t *testing.T) {
 	}
 	var _ asn1.ObjectIdentifier = roleOIDValue
 }
+
+// TestCurveExclusivityIsWarnNotFail pins the CRYP-004 step 7 deviation.
+//
+// SunSpecTCP-42 requires support for "at least" P-256. A DUT that also supports
+// P-384, and completes ECDHE over it when that is all the client offered, has
+// done more than the requirement asks and exactly what RFC 4492 §5.1 says to
+// do. Run 20260726T225512 reported that as a FAIL against the gateway.
+func TestCurveExclusivityIsWarnNotFail(t *testing.T) {
+	accepted := certify.Fail
+	obs := "the EUT-S ACCEPTED a ClientHello whose supported_groups omitted the mandatory P-256 curve: " +
+		"ServerHello selected 0xC02B TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 over TLS 1.2"
+	v, got := curveExclusivityVerdict(accepted, obs)
+	if v != certify.Warn {
+		t.Fatalf("verdict = %s, want WARN: nothing normative requires refusing a non-mandatory curve", v)
+	}
+	if !strings.Contains(got, "at least") {
+		t.Errorf("observation = %q, want it to carry the SunSpecTCP-42 rationale", got)
+	}
+	if !strings.Contains(got, obs) {
+		t.Error("the original observation must survive; the deviation is about the VERDICT, not about hiding what happened")
+	}
+	// A DUT that really did refuse is still a PASS — refusing is permitted too.
+	if v, _ := curveExclusivityVerdict(certify.Pass, "refused"); v != certify.Pass {
+		t.Errorf("a genuine refusal must stay PASS, got %s", v)
+	}
+	if v, _ := curveExclusivityVerdict(certify.Skip, "unreachable"); v != certify.Skip {
+		t.Errorf("a SKIP must stay SKIP, got %s", v)
+	}
+	// And the rationale must name the requirement it rests on, so a lab reading
+	// the bundle sees the argument rather than an assertion of authority.
+	for _, want := range []string{"SunSpecTCP-42", "AT LEAST", "RFC 4492", "MBR-61"} {
+		if !strings.Contains(curveExclusivityRationale, want) {
+			t.Errorf("the deviation note does not mention %q", want)
+		}
+	}
+}

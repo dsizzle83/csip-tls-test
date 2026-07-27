@@ -392,7 +392,8 @@ func cryp004(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	var t tally
 	v, obs := serverCurveVerdict(positive.ServerKeyExchange(), groupSecp256r1)
 	t.add(v, "%s", obs)
-	v, obs = refused(negative, "a ClientHello whose supported_groups offered only secp384r1, without the mandatory P-256")
+	v, obs = curveExclusivityVerdict(refused(negative,
+		"a ClientHello whose supported_groups offered only secp384r1, without the mandatory P-256"))
 	t.add(v, "negative iteration: %s", obs)
 
 	half := watchClientHalf(ctx, rc)
@@ -439,12 +440,19 @@ func cryp004(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			}
 			out = append(out, a)
 
-			a, err = refusalFact(ev, negative,
-				"CRYP-004 step 7: offered only the non-mandatory secp384r1 curve, the EUT-S did not complete an ECDHE handshake",
-				"a ClientHello whose supported_groups omitted the mandatory P-256 curve")
+			a, err = probeFact(ev, negative,
+				"CRYP-004 step 7 (procedure-defect deviation, see note): offered only the non-mandatory secp384r1 curve, the EUT-S did not complete an ECDHE handshake",
+				"raw ClientHello probe; the DUT's answer read off the socket and re-parsed from the capture",
+				func(v *wireView) (certify.Verdict, string, []int) {
+					tail := fmt.Sprintf("the DUT\u2192bench direction of this conversation holds %d TLS record(s)", recordCount(v))
+					verdict, obs := curveExclusivityVerdict(refusalFromDirection(v.Server,
+						"a ClientHello whose supported_groups omitted the mandatory P-256 curve", tail))
+					return verdict, obs, alertOrAllFrames(v)
+				})
 			if err != nil {
 				return nil, err
 			}
+			a.Note = joinNote(a.Note, curveExclusivityRationale)
 			out = append(out, a)
 
 			a, err = half.fact(ev,

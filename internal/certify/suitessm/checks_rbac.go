@@ -34,6 +34,7 @@ package suitessm
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"fmt"
 	"sort"
@@ -980,22 +981,70 @@ func rbac007(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		return *skip, nil
 	}
 
+	// Both fixtures are minted HERE rather than loaded from certs/mbaps, and
+	// each for its own reason.
+	//
+	// The IA5String one because the committed "bad-encoding" fixture is a
+	// PrintableString (tag 0x13), not the IA5String (tag 0x16) §2.7.7.1 step 2
+	// prescribes. Run 20260726T225512 presented the PrintableString and then
+	// failed the DUT for the bench not having presented what the procedure
+	// asked for — the device's behaviour was correct throughout.
+	//
+	// The two-role one because the committed fixture cannot be LOADED by the
+	// bench: crypto/x509.ParseCertificate rejects a certificate with duplicate
+	// extension OIDs, which is precisely the shape SunSpecTCP-31 exists to test,
+	// and tls.LoadX509KeyPair parses. mintLeaf hands back a tls.Certificate
+	// built from raw DER with a nil Leaf, which crypto/tls presents without
+	// re-parsing. cmd/gen-mbaps-certs documents the same trap for its own
+	// self-check.
+	issuer, issuerKey, caErr := issuingCA(pf.PKI)
+
 	type variant struct {
-		fixture string
-		label   string
-		run     *roleRun
+		label string
+		// mint builds the fixture. A failure here is a BENCH gap: the probe was
+		// never launched, so there is no DUT behaviour to judge.
+		mint func() (tls.Certificate, error)
+		run  *roleRun
+		// benchErr is set when the fixture could not be produced at all.
+		benchErr error
 	}
 	vars := []*variant{
-		{fixture: "bad-encoding", label: "role encoded as IA5String, not UTF8String"},
-		{fixture: "two-role", label: "certificate carrying two role values"},
+		{
+			label: "role encoded as IA5String, not UTF8String",
+			mint: func() (tls.Certificate, error) {
+				return mintLeaf(issuer, issuerKey, mintOpts{
+					CommonName: "ssm-ia5-role-probe",
+					Role:       "GridServiceSunSpec",
+					RoleTag:    tagIA5String,
+				})
+			},
+		},
+		{
+			label: "certificate carrying two role values",
+			mint: func() (tls.Certificate, error) {
+				return mintLeaf(issuer, issuerKey, mintOpts{
+					CommonName: "ssm-two-role-probe",
+					Role:       "GridServiceSunSpec",
+					ExtraExtensions: []pkix.Extension{
+						roleExtension(roleOIDValue, "ReadOnlySunSpec", tagUTF8String),
+					},
+				})
+			},
+		},
 	}
 	for _, v := range vars {
-		cert, err := negativeCert(pf.PKI, v.fixture)
-		if err != nil {
-			v.run = &roleRun{Label: v.label, Err: err}
+		if caErr != nil {
+			v.benchErr = fmt.Errorf("the bench CA that must sign this fixture is unavailable: %w", caErr)
+			v.run = &roleRun{Label: v.label, Err: v.benchErr}
 			continue
 		}
-		v.run = openRoleSession(ctx, rc, pf, v.label, cert)
+		cert, err := v.mint()
+		if err != nil {
+			v.benchErr = fmt.Errorf("the fixture could not be minted: %w", err)
+			v.run = &roleRun{Label: v.label, Err: v.benchErr}
+			continue
+		}
+		v.run = openRoleSession(ctx, rc, pf, v.label, &cert)
 		driveRole(v.run)
 	}
 	defer func() {
@@ -1008,6 +1057,14 @@ func rbac007(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	for _, v := range vars {
 		r := v.run
 		switch {
+		case v.benchErr != nil:
+			// A probe the BENCH could not launch is a bench gap, never a verdict
+			// about the DUT. Run 20260726T225512 turned "suitessm: load fixture
+			// \"two-role\": x509: certificate contains duplicate extension" into
+			// a case-level FAIL against the gateway, for steps 6-9 that were
+			// never exercised at all.
+			t.add(certify.Skip, "%s: NOT EXERCISED — %v. This is a bench gap, not a DUT observation", v.label, v.benchErr)
+			continue
 		case r.Sess == nil || r.Sess.tls == nil:
 			t.add(certify.Fail, "%s: the handshake did NOT complete (%v) — SunSpecTCP-30/31 require the "+
 				"encoding to be judged at the application layer, with the secure channel intact", v.label, r.Err)
@@ -1016,7 +1073,7 @@ func rbac007(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			t.add(certify.Warn, "%s: the session completed but issued no readable request: %v", v.label, r.Read.Err)
 			continue
 		}
-		if v.fixture == "bad-encoding" {
+		if v == vars[0] {
 			vv, obs := exceptionVerdict(r.Read.Response, 1)
 			t.add(vv, "%s: %s", v.label, obs)
 			continue
@@ -1036,18 +1093,34 @@ func rbac007(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			var out []certify.Assertion
 
-			a, err := sessionFact(ev, vars[0].run.Sess,
-				"SunSpecTCP-30: the client certificate carried the role at OID "+roleOID+" with the ASN.1 tag IA5String instead of the required UTF8String",
-				"the bench's Certificate message, parsed from the capture; the extension's DER value quoted verbatim",
-				func(v *wireView) (certify.Verdict, string, []int) {
-					return encodingObservation(v, tagIA5String, "IA5String")
-				})
-			if err != nil {
-				return nil, err
+			// benchGap turns a fixture this bench could not produce into a SKIP
+			// that says so. A probe that was never launched cannot evidence
+			// anything about the DUT, in either direction.
+			benchGap := func(v *variant, claim, method string) (certify.Assertion, bool) {
+				if v.benchErr == nil {
+					return certify.Assertion{}, false
+				}
+				return ev.SkipAssertion(claim, method, fmt.Sprintf(
+					"NOT EXERCISED — the bench could not present this fixture (%v), so the DUT was never asked "+
+						"the question. This is a bench gap, not a DUT observation", v.benchErr)), true
 			}
-			out = append(out, a)
 
-			a, err = modbusDecisionFact(ev, vars[0].run,
+			claimIA5 := "SunSpecTCP-30: the client certificate carried the role at OID " + roleOID + " with the ASN.1 tag IA5String instead of the required UTF8String"
+			const methodIA5 = "the bench's Certificate message, parsed from the capture; the extension's DER value quoted verbatim"
+			if a, gap := benchGap(vars[0], claimIA5, methodIA5); gap {
+				out = append(out, a)
+			} else {
+				a, err := sessionFact(ev, vars[0].run.Sess, claimIA5, methodIA5,
+					func(v *wireView) (certify.Verdict, string, []int) {
+						return encodingObservation(v, tagIA5String, "IA5String")
+					})
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, a)
+			}
+
+			a, err := modbusDecisionFact(ev, vars[0].run,
 				"SunSpecTCP-30: the IA5String-encoded role was rejected at the application layer with Modbus exception code 01",
 				0x03, func(b []byte) (certify.Verdict, string) { return exceptionVerdict(b, 1) })
 			if err != nil {
@@ -1080,9 +1153,13 @@ func rbac007(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			// non-compliant ENCODING does not tear down the secure channel.
 			for _, v := range vars {
 				v := v
-				a, err := sessionFact(ev, v.run.Sess,
-					"SunSpecTCP-30/31: the handshake presenting "+v.label+" completed — the non-compliant role was judged at the application layer, with no TLS alert",
-					"handshake message types and alert scan of this conversation",
+				claim := "SunSpecTCP-30/31: the handshake presenting " + v.label + " completed — the non-compliant role was judged at the application layer, with no TLS alert"
+				const method = "handshake message types and alert scan of this conversation"
+				if a, gap := benchGap(v, claim, method); gap {
+					out = append(out, a)
+					continue
+				}
+				a, err := sessionFact(ev, v.run.Sess, claim, method,
 					func(w *wireView) (certify.Verdict, string, []int) {
 						al, torn, caveat := fatalTeardown(ev, w)
 						if torn {

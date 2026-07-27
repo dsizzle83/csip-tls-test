@@ -1000,3 +1000,38 @@ func verifyChain(leaf *x509.Certificate, intermediates, roots *x509.CertPool) er
 	})
 	return err
 }
+
+// ── CRYP-004 step 7: a procedure defect, recorded as one ────────────────────
+
+// curveExclusivityRationale is why CRYP-004 step 7 cannot produce a FAIL.
+//
+// It is carried on the assertion itself, verbatim, because the point of a
+// documented deviation is that the lab reading the bundle sees the argument
+// without having to be told it.
+const curveExclusivityRationale = "DOCUMENTED DEVIATION — this step is a defect in the test procedure, not a " +
+	"criterion the EUT-S can fail. The only normative requirements §2.5.4 traces to are SunSpecTCP-42/43/44, " +
+	"and TCP-42 reads \"mbaps Devices using ECC technology MUST support AT LEAST P-256 NIST curve\" (MBR-61). " +
+	"\"At least\" explicitly contemplates supporting more, and nothing anywhere in the Secure SunSpec Modbus " +
+	"Specification obliges a server to REFUSE a client that offers a different curve. §2.5.4.1 step 7's " +
+	"\"EUT-S must reject the connection or select a different key exchange method\" also contradicts RFC 4492 " +
+	"§5.1, which runs the other way — a server declines an ECC suite only when it supports NONE of the offered " +
+	"curves — and its \"select a different key exchange method\" alternative would mean falling back to RSA or " +
+	"static DH, strictly worse security required by nothing. A device that completes ECDHE over P-384 has " +
+	"demonstrated MORE than TCP-42 asks, provided P-256 support is proven separately, which the positive " +
+	"iteration of this same case does. Recorded as WARN so the observation survives in the bundle; raise it " +
+	"with SunSpec as a defect in a document still at TEST (draft) status."
+
+// curveExclusivityVerdict caps CRYP-004 step 7 at WARN.
+//
+// It takes the refusal verdict as computed and downgrades a FAIL, rather than
+// suppressing the observation: what the DUT did is still reported in full, and
+// the rationale rides on the assertion. A PASS — a DUT that really did refuse —
+// stays a PASS, because refusing is also permitted; the procedure's error is in
+// REQUIRING it.
+func curveExclusivityVerdict(v certify.Verdict, obs string) (certify.Verdict, string) {
+	if v != certify.Fail {
+		return v, obs
+	}
+	return certify.Warn, obs + " — which SunSpecTCP-42 permits: it requires support for \"at least\" P-256, " +
+		"not the refusal of anything else. See this assertion's note."
+}
