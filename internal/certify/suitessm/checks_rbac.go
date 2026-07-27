@@ -70,6 +70,11 @@ type roleRun struct {
 	Read, Write Exchange
 	// Target describes the register the write went to.
 	Target writeTarget
+	// TargetErr says why no write was performed, when none was. A step the
+	// procedure conditions on "if one exists" and the DUT offers no target for
+	// was NOT PERFORMED — a distinct outcome from a denial, and one a report
+	// must not turn into a verdict about the DUT.
+	TargetErr error
 }
 
 // writeTarget is a register chosen for an authorization probe.
@@ -118,43 +123,153 @@ func openRoleSession(ctx context.Context, rc *certify.RunCtx, pf preflight,
 	return r
 }
 
-// pickWriteTarget chooses a register to write and reads its current value, so
-// the write can be a no-op read-back. Model 704 (DER AC controls) is preferred
-// because it is what the procedures name; anything else in the chain except the
-// Common Model will do, and the reason is recorded either way.
-func pickWriteTarget(s *Session, unit uint8, ch *Chain) (writeTarget, error) {
+// notImplemented16 are the values a 16-bit SunSpec point reads when it is not
+// implemented: 0xFFFF for the unsigned, enumerated and bitfield types, 0x8000
+// for the signed ones (SunSpec Device Information Model Specification §6).
+//
+// A register reading one of these is NOT a legal write value. Writing it back
+// — which is what "read the current value and write it back unchanged" does on
+// an unimplemented point — can only ever be answered with exception 3, because
+// the sentinel is outside every declared enumeration and range. Run
+// 20260726T225512's RBAC-002 wrote 0xFFFF into 704.PFWInjEna for all four roles
+// and then read the resulting exception 3 as a denial: the probe had made the
+// only answer it could get indistinguishable from the answer it was testing for.
+var notImplemented16 = map[uint16]bool{0xFFFF: true, 0x8000: true}
+
+// writeKind names the class of register a procedure step aims its write at.
+//
+// §2.7.2.1 does not say "write somewhere"; it names a different target per
+// role — a control point for GridService, a NETWORK CONFIGURATION point for
+// NetworkAdministrator — and conditions each on "if one exists". Aiming every
+// role at the same DER control model tests something the procedure never asked
+// about, and then reports the expected denial as a defect.
+type writeKind struct {
+	// name is how the class is described in the report.
+	name string
+	// prefer lists model ids to try first, in order.
+	prefer []uint16
+	// accept reports whether a model id belongs to this class at all.
+	accept func(id uint16) bool
+}
+
+// controlPoint is §2.7.2.1 step 2's "control point (e.g., Model 704)". Any
+// non-Common model will do when 704 is absent; the reason is recorded.
+var controlPoint = writeKind{
+	name:   "a control point",
+	prefer: []uint16{704},
+	accept: func(id uint16) bool { return id != 1 },
+}
+
+// networkConfigPoint is §2.7.2.1 step 4's "network configuration point": the
+// SunSpec communication-interface models. 10 Communication Interface Header,
+// 11 Ethernet Link Layer, 12 IPv4, 13 IPv6, 14 Proxy Server, 17 Serial
+// Interface, 18 Cellular Link.
+var networkConfigPoint = writeKind{
+	name:   "a network configuration point",
+	prefer: []uint16{12, 13, 11, 10, 14, 17, 18},
+	accept: func(id uint16) bool {
+		switch id {
+		case 10, 11, 12, 13, 14, 17, 18:
+			return true
+		}
+		return false
+	},
+}
+
+// holdingReader is the only operation the target picker needs of a session. It
+// is an interface so target SELECTION — which is where the not-implemented
+// sentinel defect lived — can be tested without a socket or a gateway.
+type holdingReader interface {
+	ReadHolding(unit uint8, addr, count uint16, label string) Exchange
+}
+
+// pickWriteTarget chooses a control-point register for an authorization probe.
+func pickWriteTarget(s holdingReader, unit uint8, ch *Chain) (writeTarget, error) {
+	return pickWriteTargetOfKind(s, unit, ch, controlPoint)
+}
+
+// pickWriteTargetOfKind chooses a register of the given class and reads its
+// current value, so the write can be a no-op read-back.
+//
+// Two rules, and the second is the one run 20260726T225512 was missing:
+//
+//  1. the register must belong to the class the procedure step names, or the
+//     step tests a different question than the one asked;
+//  2. its current value must not be its type's not-implemented sentinel, or the
+//     read-back write cannot be answered with anything but exception 3 — see
+//     notImplemented16. So the model's block is scanned for the first register
+//     holding a real value, rather than the first register full stop.
+func pickWriteTargetOfKind(s holdingReader, unit uint8, ch *Chain, kind writeKind) (writeTarget, error) {
 	if ch == nil || len(ch.Models) == 0 {
 		return writeTarget{}, fmt.Errorf("suitessm: no SunSpec chain was discovered, so no write target can be chosen")
 	}
-	pick := func(id uint16, why string) (writeTarget, bool) {
+	// A model's block is read whole and scanned, rather than probed register by
+	// register: one round trip instead of dozens against a shared gateway.
+	pick := func(m ModelBlock, why string) (writeTarget, bool) {
+		if m.Length == 0 {
+			return writeTarget{}, false
+		}
+		n := m.Length
+		if n > 64 {
+			n = 64
+		}
+		vals, err := registers(s.ReadHolding(unit, m.First, n, "write-target read-back"))
+		if err != nil {
+			return writeTarget{}, false
+		}
+		for i, v := range vals {
+			if notImplemented16[v] {
+				continue
+			}
+			return writeTarget{
+				Model: m.ID, Addr: m.First + uint16(i), Value: v,
+				Why: why + fmt.Sprintf("; register %d holds 0x%04X, a real value, so writing it back is both "+
+					"legal and a no-op", m.First+uint16(i), v),
+			}, true
+		}
+		return writeTarget{}, false
+	}
+
+	var scanned []uint16
+	try := func(m ModelBlock, why string) (writeTarget, bool) {
+		scanned = append(scanned, m.ID)
+		return pick(m, why)
+	}
+	for _, id := range kind.prefer {
 		m, ok := ch.Model(id)
-		if !ok || m.Length == 0 {
-			return writeTarget{}, false
-		}
-		vals, err := registers(s.ReadHolding(unit, m.First, 1, "write-target read-back"))
-		if err != nil || len(vals) == 0 {
-			return writeTarget{}, false
-		}
-		return writeTarget{Model: id, Addr: m.First, Value: vals[0], Why: why}, true
-	}
-	if t, ok := pick(704, "Model 704 DER AC Controls, the control model the RBAC procedures name"); ok {
-		return t, nil
-	}
-	for _, m := range ch.Models {
-		if m.ID == 1 {
+		if !ok {
 			continue
 		}
-		if t, ok := pick(m.ID, fmt.Sprintf("Model %d, the first non-Common model in the chain (Model 704 is not exposed)", m.ID)); ok {
+		if t, ok := try(m, fmt.Sprintf("Model %d, %s the RBAC procedures name", id, kind.name)); ok {
 			return t, nil
 		}
 	}
+	for _, m := range ch.Models {
+		if !kind.accept(m.ID) {
+			continue
+		}
+		if t, ok := try(m, fmt.Sprintf("Model %d, %s from this DUT's chain", m.ID, kind.name)); ok {
+			return t, nil
+		}
+	}
+	if len(scanned) == 0 {
+		return writeTarget{}, fmt.Errorf(
+			"this DUT's chain on unit %d holds no model that is %s (models %v), so §2.7.2.1's "+
+				"\"if one exists\" condition is not met and the step is not performed", unit, kind.name, ch.IDs())
+	}
 	return writeTarget{}, fmt.Errorf(
-		"suitessm: no register outside the Common Model could be read on unit %d (models %v), so no "+
-			"authorization write target exists", unit, ch.IDs())
+		"every register of %s on unit %d (models %v scanned) reads its type's not-implemented sentinel, so no "+
+			"legal read-back write value exists; writing the sentinel would be refused on its VALUE and could "+
+			"not evidence an authorization decision", kind.name, unit, scanned)
 }
 
-// driveRole performs the read and the read-back write the procedures ask for.
-func driveRole(r *roleRun) {
+// driveRole performs the read and the read-back write the procedures ask for,
+// aiming the write at a control point.
+func driveRole(r *roleRun) { driveRoleKind(r, controlPoint) }
+
+// driveRoleKind is driveRole with the class of point named explicitly, for the
+// procedures that send different roles to different classes.
+func driveRoleKind(r *roleRun, kind writeKind) {
 	if r.Sess == nil || r.Sess.tls == nil {
 		return
 	}
@@ -162,10 +277,14 @@ func driveRole(r *roleRun) {
 		if m1, ok := r.Chain.Model(1); ok {
 			r.Read = r.Sess.ReadHolding(r.Unit, m1.First, m1.Length, "Model 1 read as "+r.Label)
 		}
-		if t, err := pickWriteTarget(r.Sess, r.Unit, r.Chain); err == nil {
+		t, err := pickWriteTargetOfKind(r.Sess, r.Unit, r.Chain, kind)
+		r.TargetErr = err
+		if err == nil {
 			r.Target = t
 			r.Write = r.Sess.WriteMultiple(r.Unit, t.Addr, []uint16{t.Value}, "read-back write as "+r.Label)
 		}
+	} else {
+		r.TargetErr = fmt.Errorf("no SunSpec chain was discovered on this session, so no write target exists")
 	}
 	if len(r.Read.Response) == 0 && r.Read.Err == nil {
 		// A role that could not discover the chain still has to be probed, or
@@ -181,6 +300,63 @@ func closeRuns(runs ...*roleRun) {
 			r.Sess.Close()
 		}
 	}
+}
+
+// authOutcome is what a write response says about the AUTHORIZATION decision —
+// the only decision the RBAC procedures are about.
+type authOutcome int
+
+const (
+	// authIndeterminate: the response is not a well-formed answer.
+	authIndeterminate authOutcome = iota
+	// authDenied: exception 01. SunSpecTCP-40 makes this the authorization
+	// stage's one and only refusal code.
+	authDenied
+	// authCleared: exception 02, 03 or 04. Authorization SUCCEEDED and a LATER
+	// stage refused — the address does not exist, the value is not legal, the
+	// device failed. The role was granted the write.
+	authCleared
+	// authGranted: a normal response. Authorized and performed.
+	authGranted
+)
+
+func (o authOutcome) authorized() bool { return o == authCleared || o == authGranted }
+
+// authorizationVerdict reads a write response for the authorization decision.
+//
+// SunSpecTCP-40: "If the MBAP protocol handler for authorization rejects a
+// request it MUST use the exception code 01." Exception 01 is therefore the
+// ONLY denial. 02 (Illegal Data Address), 03 (Illegal Data Value) and 04
+// (Server Device Failure) are emitted by stages that run AFTER authorization
+// has already succeeded, so reading one of them as a refusal reports a device
+// that granted the write as a device that denied it. That is exactly what run
+// 20260726T225512 did: GridService and SuperAdmin were both authorized, both
+// answered 03 because the probe had sent an illegal value, and the check
+// concluded that no privileged role was granted anything.
+func authorizationVerdict(rspBytes []byte) (authOutcome, string) {
+	v, err := parseMBAP(rspBytes)
+	if err != nil {
+		return authIndeterminate, "the response is not a well-formed MBAP ADU: " + err.Error()
+	}
+	if len(v.PDU) < 1 {
+		return authIndeterminate, "the response PDU is empty: " + v.String()
+	}
+	if v.PDU[0]&0x80 == 0 {
+		return authGranted, "AUTHORIZED and performed — normal (non-exception) response: " + v.String()
+	}
+	if len(v.PDU) < 2 {
+		return authIndeterminate, "the exception response carries no exception code byte: " + v.String()
+	}
+	code := v.PDU[1]
+	if code == 1 {
+		return authDenied, fmt.Sprintf(
+			"DENIED by authorization — exception code 1 (%s), which SunSpecTCP-40 reserves for exactly that: %s",
+			exceptionName(code), v.String())
+	}
+	return authCleared, fmt.Sprintf(
+		"AUTHORIZED — exception code %d (%s) is raised after the authorization stage has already passed the "+
+			"request, so the role WAS granted the write and a later stage refused it: %s",
+		code, exceptionName(code), v.String())
 }
 
 // roleOnWireFact asserts the role a session's client certificate carried,
@@ -287,15 +463,35 @@ func rbac001(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 // The pass criterion is deliberately phrased against what a capture can show:
 // the DUT recognises each mandatory role (the certificate is accepted, the
 // handshake completes, and a role-specific decision follows) AND at least one
-// mandatory role is granted a write that ReadOnlySunSpec is denied. A DUT that
-// denied every write to every role would satisfy neither, and would be
+// mandatory role is AUTHORIZED for a write that ReadOnlySunSpec is denied. A
+// DUT that denied every write to every role would satisfy neither, and would be
 // reported with the whole observed matrix rather than a bare FAIL — the reason
 // might be a deployment-mode overlay rather than a missing role, and a reader
 // needs to be able to tell.
+//
+// Two things this check must get right, both of which run 20260726T225512 got
+// wrong and reported as a DUT defect:
+//
+//   - the target. §2.7.2.1 aims each role at a different class of point and
+//     conditions every one of them on "if one exists". NetworkAdministrator is
+//     sent at a NETWORK CONFIGURATION point, not at Model 704; on a DUT whose
+//     chain holds no communication-interface model that step is not performed
+//     at all. Expecting a network administrator to be granted a write to a DER
+//     control model is an over-read of the procedure in its own right;
+//
+//   - the answer. Exception 01 is the only authorization denial (SunSpecTCP-40);
+//     02/03/04 mean authorization already SUCCEEDED. See authorizationVerdict.
 func rbac002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	pf, skip := prepare(rc, true)
 	if skip != nil {
 		return *skip, nil
+	}
+
+	// The class of point the procedure aims each role's write at.
+	kindFor := map[string]writeKind{
+		"GridServiceSunSpec":          controlPoint,
+		"NetworkAdministratorSunSpec": networkConfigPoint,
+		"SuperAdministratorSunSpec":   controlPoint,
 	}
 
 	var runs []*roleRun
@@ -306,22 +502,23 @@ func rbac002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			continue
 		}
 		r := openRoleSession(ctx, rc, pf, mr.role, cert)
-		driveRole(r)
+		driveRoleKind(r, kindFor[mr.role])
 		runs = append(runs, r)
 	}
 	defer closeRuns(runs...)
 
 	// The contrast: ReadOnlySunSpec must be denied the same write, or "granted"
-	// means nothing.
+	// means nothing. It goes at the control point, which is the one the
+	// privileged roles were actually able to reach.
 	var readOnly *roleRun
 	if cert, err := roleCert(pf.PKI, "read-only"); err == nil {
 		readOnly = openRoleSession(ctx, rc, pf, "ReadOnlySunSpec (contrast)", cert)
-		driveRole(readOnly)
+		driveRoleKind(readOnly, controlPoint)
 		defer closeRuns(readOnly)
 	}
 
 	var t tally
-	granted := 0
+	authorized, exercised := 0, 0
 	for _, r := range runs {
 		switch {
 		case r.Err != nil && r.Sess == nil:
@@ -332,23 +529,34 @@ func rbac002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			continue
 		}
 		if len(r.Write.Response) == 0 {
-			t.add(certify.Warn, "%s: no write was carried out (target %v, err %v)", r.Label, r.Target, r.Write.Err)
+			// "if one exists" — a step with no target is NOT PERFORMED, which
+			// is a skip with the reason, not a denial and not a defect.
+			t.add(certify.Skip, "%s: the write step was not performed — %v", r.Label, r.TargetErr)
 			continue
 		}
-		v, obs := normalResponseVerdict(r.Write.Response)
-		if v == certify.Pass {
-			granted++
-			t.add(certify.Pass, "%s: write to %s answered normally", r.Label, r.Target)
-		} else {
-			t.add(certify.Warn, "%s: write to %s was denied — %s", r.Label, r.Target, obs)
+		exercised++
+		outcome, obs := authorizationVerdict(r.Write.Response)
+		switch {
+		case outcome.authorized():
+			authorized++
+			t.add(certify.Pass, "%s: write to %s — %s", r.Label, r.Target, obs)
+		case outcome == authDenied:
+			t.add(certify.Warn, "%s: write to %s — %s", r.Label, r.Target, obs)
+		default:
+			t.add(certify.Warn, "%s: write to %s — %s", r.Label, r.Target, obs)
 		}
 	}
-	if granted == 0 {
-		t.add(certify.Fail, "none of the three privileged mandatory roles was granted a write; the DUT's "+
-			"role-to-rights configuration or an active deployment-mode overlay is denying all of them")
+	switch {
+	case exercised == 0:
+		t.caveat("none of the three privileged roles had a point of the class §2.7.2.1 sends it to, so no " +
+			"grant could be demonstrated; the roles were still presented and accepted")
+	case authorized == 0:
+		t.add(certify.Fail, "none of the %d privileged mandatory role(s) that could be exercised was AUTHORIZED "+
+			"for its write (every one was refused with exception 01); the DUT's role-to-rights configuration "+
+			"or an active deployment-mode overlay is denying all of them", exercised)
 	}
 
-	rules, rulesErr := readGatewayFile(ctx, rc, "/etc/lexa/configs/rbac/rules.json")
+	rules, rulesPath, rulesErr := readRulesDatabase(ctx, rc)
 
 	return certify.Result{
 		Verdict: t.verdict(),
@@ -356,6 +564,7 @@ func rbac002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			var out []certify.Assertion
 			for _, r := range runs {
+				r := r
 				a, err := roleOnWireFact(ev, r,
 					"SunSpecTCP-22: a client certificate carrying the mandatory role "+r.Label+" was presented and accepted",
 					r.Label)
@@ -364,9 +573,46 @@ func rbac002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 				}
 				out = append(out, a)
 
-				a, err = modbusDecisionFact(ev, r,
-					"SunSpecTCP-22: a Write Multiple Registers request as "+r.Label+" was answered normally — "+r.Target.String(),
-					0x10, normalResponseVerdict)
+				claim := "SunSpecTCP-22/40: the EUT-S AUTHORIZED a Write Multiple Registers request as " +
+					r.Label + " — " + r.Target.String()
+				if r.Target.Addr == 0 {
+					// §2.7.2.1's "if one exists". A step the DUT's chain offers
+					// no target for was never performed, and a verdict about
+					// the DUT cannot be minted from it.
+					out = append(out, ev.SkipAssertion(claim,
+						"TLS decryption of this session's records with the run's key log, then MBAP decoding "+
+							"of the recovered request/response pair",
+						fmt.Sprintf("this step is conditioned on \"if one exists\" and no such point exists on "+
+							"this DUT: %v", r.TargetErr)))
+					continue
+				}
+				a, err = modbusDecisionFact(ev, r, claim, 0x10,
+					func(b []byte) (certify.Verdict, string) {
+						outcome, obs := authorizationVerdict(b)
+						switch outcome {
+						case authGranted, authCleared:
+							return certify.Pass, obs
+						case authDenied:
+							// A POINT-level denial is not automatically a
+							// defect. §2.7.2.2's criterion is "each role is
+							// correctly mapped to its expected permissions per
+							// the VENDOR'S Roles-to-Rights Rules Database", and
+							// this suite deliberately does not re-implement that
+							// database's rules language — its point-group
+							// selectors, its deployment overlays — so it cannot
+							// adjudicate whether this particular register
+							// belongs inside this role's grant. The database is
+							// carried in this case's last assertion for exactly
+							// that cross-reference. What IS a defect, and is
+							// asserted from the tally, is every privileged role
+							// being denied everywhere.
+							return certify.Warn, obs + " — whether this particular register falls inside " +
+								"this role's grant is a question for the vendor's rules database, which is " +
+								"recorded in this case's roles-to-rights assertion"
+						default:
+							return certify.Fail, obs
+						}
+					})
 				if err != nil {
 					return nil, err
 				}
@@ -392,7 +638,7 @@ func rbac002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			} else {
 				a, err := ev.Narrative(claim, method, certify.Pass,
 					summariseRules(rules),
-					"the DUT's own /etc/lexa/configs/rbac/rules.json, read over the read-only gateway client")
+					"the DUT's own "+rulesPath+", read over the read-only gateway client")
 				if err != nil {
 					return nil, err
 				}
@@ -401,6 +647,41 @@ func rbac002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			return out, nil
 		},
 	}, nil
+}
+
+// rulesCandidates are the paths the DUT's roles-to-rights database is looked
+// for at, in order, with the one this product actually uses first.
+//
+// It is a LIST because getting it wrong is silent and expensive: run
+// 20260726T225512 looked only at /etc/lexa/configs/rbac/rules.json, which does
+// not exist, and consequently SKIPped RBAC-002's database assertion and the
+// whole of RBAC-004 — a documentation audit reported as unevidenceable — for a
+// file that was on the device the entire time.
+var rulesCandidates = []string{
+	"/etc/lexa/rbac/rules.json",
+	"/etc/lexa/configs/rbac/rules.json",
+	"/etc/lexa/rbac/rules.json.d/rules.json",
+}
+
+// readRulesDatabase reads the DUT's roles-to-rights database, returning the
+// path it was found at so the assertion can name its source. The error names
+// every path tried, so the next person to move the file can see what to add.
+func readRulesDatabase(ctx context.Context, rc *certify.RunCtx) ([]byte, string, error) {
+	var last error
+	for _, p := range rulesCandidates {
+		b, err := readGatewayFile(ctx, rc, p)
+		if err == nil {
+			return b, p, nil
+		}
+		last = err
+		if rc.Gateway == nil || !rc.Gateway.Available() {
+			// No point trying the other paths: the transport is missing, not
+			// the file.
+			break
+		}
+	}
+	return nil, "", fmt.Errorf("the DUT's roles-to-rights database was not found at any of %v: %w",
+		rulesCandidates, last)
 }
 
 // summariseRules reports which roles the DUT's rules database defines, without
@@ -428,7 +709,7 @@ func summariseRules(rules []byte) string {
 // document (a human must), but it proves the artefact exists on the device and
 // says what is in it.
 func rbac004(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	rules, err := readGatewayFile(ctx, rc, "/etc/lexa/configs/rbac/rules.json")
+	rules, rulesPath, err := readRulesDatabase(ctx, rc)
 	if err != nil {
 		return certify.Skipped(
 			"RBAC-004 is a documentation audit with no wire traffic, and the DUT's roles-to-rights database "+
@@ -457,7 +738,7 @@ func rbac004(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			Method:   "read of the DUT's RBAC rules database over the read-only gateway client",
 			Verdict:  verdict,
 			Observed: notes,
-			Note: "not wire-cited; source: the DUT's own /etc/lexa/configs/rbac/rules.json. Whether the " +
+			Note: "not wire-cited; source: the DUT's own " + rulesPath + ". Whether the " +
 				"mapping is COMPLETE with respect to every implemented SunSpec point is a document review " +
 				"a human performs against the vendor's model documentation; this assertion establishes only " +
 				"that the database exists on the device and which roles it names.",
@@ -1028,7 +1309,7 @@ func rbac009(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 // is CONFIGURATION rather than compiled-in behaviour. The DUT's rules file is
 // read read-only and reported.
 func rbac010(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	rules, rulesErr := readGatewayFile(ctx, rc, "/etc/lexa/configs/rbac/rules.json")
+	rules, rulesPath, rulesErr := readRulesDatabase(ctx, rc)
 
 	var t tally
 	t.caveat("RBAC-010 requires creating a role (SecureSunSpecTestRole), modifying its rights, exercising " +
@@ -1061,7 +1342,7 @@ func rbac010(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			a, err := ev.Narrative(claim, method, certify.Pass,
 				fmt.Sprintf("the roles-to-rights database is a %d-byte file on the device, reloadable without "+
 					"a rebuild: %s", len(rules), summariseRules(rules)),
-				"the DUT's own /etc/lexa/configs/rbac/rules.json, read over the read-only gateway client")
+				"the DUT's own "+rulesPath+", read over the read-only gateway client")
 			if err != nil {
 				return nil, err
 			}
@@ -1215,7 +1496,7 @@ func rbac012(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	defer closeRuns(runs...)
 
 	matrix := renderMatrix(cells)
-	rules, rulesErr := readGatewayFile(ctx, rc, "/etc/lexa/configs/rbac/rules.json")
+	rules, rulesPath, rulesErr := readRulesDatabase(ctx, rc)
 
 	var t tally
 	if len(cells) == 0 {
@@ -1294,7 +1575,7 @@ func rbac012(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 					"language, including its deployment-mode overlays, which this suite does not "+
 					"re-implement; the matrix and the database are both recorded here so a reviewer can "+
 					"perform it.",
-				"the observed sweep above plus the DUT's own /etc/lexa/configs/rbac/rules.json")
+				"the observed sweep above plus the DUT's own "+rulesPath)
 			if err != nil {
 				return nil, err
 			}
