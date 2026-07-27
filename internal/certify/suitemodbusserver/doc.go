@@ -127,6 +127,11 @@
 //	pics.models           comma-separated model ids the PICS declares. DEV-1
 //	                      compares the discovered chain against them; without it
 //	                      DEV-1 says a chain cannot be checked against itself.
+//	pics.reversion-timer  "1" declares that the PICS claims a reversion timer.
+//	                      §2.6 does not perform the reversion tests at all when
+//	                      the functionality is not implemented, so an incomplete
+//	                      reversion group is N/A by default; with this set, the
+//	                      same observation is REV-1 step 1's FAIL.
 //	1547.require-models   comma-separated model ids overriding the IEEE 1547
 //	                      profile's required-model list for MOD-4. Use only to
 //	                      record a PICS-scoped claim, and know that the bundle

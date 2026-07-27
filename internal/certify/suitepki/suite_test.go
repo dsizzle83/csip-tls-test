@@ -111,6 +111,51 @@ var identityRows = []string{UIDIdentitySAN, UIDIdentityUnique, UIDModelOIDPEN, U
 // is shaped like the DUT's — Subject CN, no SAN otherName — must FAIL all four,
 // and each FAIL must carry a citation a third party can re-derive from the
 // capture.
+// TestIdentityRowsAreInapplicableToAnMbapsOnlyRun is the scope guard, and it is
+// the one that matters for a submission bundle.
+//
+// PKI-4/5/6/7 govern the DUT's IEEE 2030.5 device certificate — the SunSpec Test
+// PKI note scopes itself in §1 to "certificates for use with SunSpec CSIP Test
+// Procedures" and §2.2 restates an IEEE 2030.5-2018 requirement. An mbaps
+// certificate is governed by the Secure SunSpec Modbus Specification, which says
+// nothing about the Subject field or a hardwareModuleName SAN and whose own
+// worked example carries a populated Subject DN.
+//
+// Run 20260726T225512 pointed all four at whatever leaf the connection to :802
+// presented — CN=lexa-gw-nb-mbaps-server, minted by the BENCH's own CA — and
+// reported four DUT failures about our provisioning fixture. With no 2030.5
+// identity in reach these rows must be INAPPLICABLE, and the reason must name
+// the scope.
+func TestIdentityRowsAreInapplicableToAnMbapsOnlyRun(t *testing.T) {
+	h := testHierarchy(t)
+	leaf, err := h.Mint(ShapeSERCAMICADevice, dutShapedLeafSpec("dut"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := newRecorder()
+	p := startPeer(t, rec, leaf.TLSCertificate(), h.SERCA.Pool())
+	out := runSuiteNoIdentityTarget(t, p, benchPKIDir(t, h), identityRows)
+
+	for _, uid := range identityRows {
+		c := out.result(t, uid)
+		if c.Verdict == certify.Fail {
+			t.Errorf("%s FAILED the DUT over a certificate this profile does not govern: %s\n%s",
+				uid, c.Notes, describeAssertions(c))
+		}
+		if !strings.Contains(c.Notes, "INAPPLICABLE") {
+			t.Errorf("%s: notes = %q, want them to say the case is inapplicable", uid, c.Notes)
+		}
+		for _, a := range c.Assertions {
+			if a.Verdict == certify.Fail {
+				t.Errorf("%s: assertion %q is a FAIL about the wrong certificate", uid, a.Claim)
+			}
+			if !strings.Contains(a.Note, "SCOPE") {
+				t.Errorf("%s: assertion %q carries no scope note", uid, a.Claim)
+			}
+		}
+	}
+}
+
 func TestIdentityRowsFailAgainstADUTShapedPeer(t *testing.T) {
 	h := testHierarchy(t)
 	leaf, err := h.Mint(ShapeSERCAMICADevice, dutShapedLeafSpec("dut"))

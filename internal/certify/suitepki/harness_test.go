@@ -457,7 +457,20 @@ func runSuite(t *testing.T, p *peer, pkiDir string, uids []string) *runOutcome {
 	return runSuiteWith(t, p, pkiDir, uids, false)
 }
 
+// runSuiteNoIdentityTarget is runSuite WITHOUT pointing the identity rows at a
+// 2030.5 identity, i.e. the shape of a Secure SunSpec Modbus run. It exists to
+// prove those rows go inapplicable rather than judging the mbaps leaf.
+func runSuiteNoIdentityTarget(t *testing.T, p *peer, pkiDir string, uids []string) *runOutcome {
+	t.Helper()
+	return runSuiteOpts(t, p, pkiDir, uids, false, false)
+}
+
 func runSuiteWith(t *testing.T, p *peer, pkiDir string, uids []string, noCapture bool) *runOutcome {
+	t.Helper()
+	return runSuiteOpts(t, p, pkiDir, uids, noCapture, true)
+}
+
+func runSuiteOpts(t *testing.T, p *peer, pkiDir string, uids []string, noCapture, identityTarget bool) *runOutcome {
 	t.Helper()
 	cat, err := certify.LoadDefault()
 	if err != nil {
@@ -470,6 +483,16 @@ func runSuiteWith(t *testing.T, p *peer, pkiDir string, uids []string, noCapture
 	outDir := filepath.Join(t.TempDir(), "bundle")
 	opts := certify.DefaultOptions()
 	opts.Targets = certify.Targets{Gateway: p.addr(), GatewayHost: "127.0.0.1"}
+	// The loopback peer PRESENTS the identity certificate as a server, so the
+	// identity rows are pointed at it explicitly. Without this they are
+	// inapplicable — they must never fall back to judging the mbaps leaf, which
+	// is the defect this parameter exists to make impossible.
+	if opts.Params == nil {
+		opts.Params = map[string]string{}
+	}
+	if identityTarget {
+		opts.Params[paramIdentityTarget] = p.addr()
+	}
 	opts.PKIDir = pkiDir
 	opts.OutDir = outDir
 	opts.UIDs = uids

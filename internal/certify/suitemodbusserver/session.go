@@ -40,6 +40,9 @@ const (
 	paramPICSSN      = "pics.sn"
 	paramPICSModels  = "pics.models"
 	param1547Models  = "1547.require-models"
+	// paramPICSReversion declares that the PICS claims a reversion timer, which
+	// is what turns §2.6's applicability gate off. See revertGateNote.
+	paramPICSReversion = "pics.reversion-timer"
 )
 
 // defaultRole is the PKI role fixture the suite presents. The device-model

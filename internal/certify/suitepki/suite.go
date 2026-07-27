@@ -99,6 +99,12 @@ func dialDUT(ctx context.Context, rc *certify.RunCtx, label string, opt Handshak
 	if target == "" {
 		return nil, fmt.Errorf("no DUT address configured (-gateway)")
 	}
+	return dialTarget(ctx, rc, target, label, opt)
+}
+
+// dialTarget is dialDUT against an explicitly named endpoint, for the checks
+// whose subject is not the mbaps interface.
+func dialTarget(ctx context.Context, rc *certify.RunCtx, target, label string, opt HandshakeOptions) (*session, error) {
 	conn, err := rc.DialTCP(ctx, target, label)
 	if err != nil {
 		return nil, fmt.Errorf("could not reach the DUT at %s: %w", target, err)

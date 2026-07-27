@@ -29,7 +29,26 @@
 // supports. Ten uids are registered here — the 6 applicable ones plus PKI-4,
 // PKI-5, PKI-6 and PKI-7, which are discussed next.
 //
-// # The four rows this suite exists to FAIL
+// # The four rows this suite exists to FAIL — and WHICH certificate they judge
+//
+// The scope came first and it is not negotiable: PKI-4/5/6/7 govern the DUT's
+// IEEE 2030.5 / CSIP DEVICE certificate. The SunSpec Test PKI application note
+// scopes itself in its own §1 Overview to certificates "for use with SunSpec
+// CSIP Test Procedures", and §2.2 restates an IEEE 2030.5-2018 requirement, not
+// a SunSpec one. An MBAPS certificate is governed by the Secure SunSpec Modbus
+// Specification instead, which requires X.509v3/RFC 5280, the full chain and the
+// role extension — and says nothing about the Subject field or a
+// hardwareModuleName SAN; its own worked example carries a fully populated
+// Subject DN. Judging an mbaps leaf against the 2030.5 profile contradicts the
+// specification that governs the interface under test, and run 20260726T225512
+// did exactly that: four FAILs about CN=lexa-gw-nb-mbaps-server, a certificate
+// minted by the BENCH's own CA for the bench's own provisioning fixture.
+//
+// So the certificate under test comes from one of two places, never from the
+// mbaps target: the DUT's own 2030.5 client certificate observed passively on
+// the bench's 2030.5 server (-gridsim), or an endpoint that serves that identity
+// named explicitly with -param pki.identity-target. With neither, the four rows
+// are INAPPLICABLE and say so, carrying the scope argument as their note.
 //
 // PKI-4/5/6/7 are the IEEE 2030.5-2018 device identification profile: the
 // device certificate's Subject MUST be empty and the identity MUST be carried
@@ -43,9 +62,10 @@
 // The catalog therefore marks these rows inapplicable with the reason "the DUT
 // provably fails this check today".
 //
-// This suite registers and executes them anyway, and reports FAIL with wire
-// evidence. That is a deliberate decision, and the reasoning is worth stating
-// because it is the single most valuable output of the whole exercise:
+// This suite registers and executes them anyway, against the RIGHT certificate,
+// and reports FAIL with wire evidence when it can reach one. That is a
+// deliberate decision, and the reasoning is worth stating because it is the
+// single most valuable output of the whole exercise:
 //
 //   - "Inapplicable" in the catalog means "not executable as the SunSpec test
 //     procedure writes it", because that procedure inspects a certificate

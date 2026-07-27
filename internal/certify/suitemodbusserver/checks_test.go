@@ -372,17 +372,46 @@ func TestREV1FailsADeviceWhoseReversionNeverFires(t *testing.T) {
 	}
 }
 
-// TestREV1FailsWhenTheReversionGroupIsIncomplete pins the reading of REV-1
-// step 1: "verify all reversion points are implemented" is a criterion, not a
-// precondition, so a missing remaining-time readback is a FAIL of the procedure
-// and the three timing claims that depend on it become SKIPs.
-func TestREV1FailsWhenTheReversionGroupIsIncomplete(t *testing.T) {
+// TestREV1IsNotPerformedWhenNoReversionTimerIsImplemented pins §2.6's
+// applicability gate, in the section preamble and in full: "Reversion tests
+// verify the reversion timer functionality. IF THIS FUNCTIONALITY IS NOT
+// IMPLEMENTED IN A MODEL, THE TESTS ARE NOT PERFORMED."
+//
+// A device with no remaining-time readback has no implemented reversion timer,
+// so the three procedures are N/A — not FAIL. Run 20260726T225512 reported
+// REV-1/2/3 as three failures on a device where no reversion behaviour had been
+// exercised at all: its own runner logged SKIP, every behavioural assertion was
+// SKIP, and only step 1's citation was emitted as FAIL, which the report's
+// worst-assertion roll-up then took as the case verdict.
+func TestREV1IsNotPerformedWhenNoReversionTimerIsImplemented(t *testing.T) {
 	dev := newDevice(t, deviceOpts{NoReversionReadback: true})
 	o := runCheck(t, "ss-modbus-conf-v1.4::REV-1", checkREV1, dev, nil)
-	o.wantVerdict(t, certify.Fail)
+	o.wantVerdict(t, certify.Skip)
+	a := o.assertion(t, "every reversion point the timer needs is implemented")
+	if a.Verdict == certify.Fail {
+		t.Fatalf("step 1 was emitted as a FAIL against a device §2.6 says not to test: %s", a.Observed)
+	}
+	if !contains(a.Observed, "WMaxLimPctRvrtRem") {
+		t.Errorf("the missing remaining-time point must still be NAMED — the observation is the evidence "+
+			"the gate applies: %s", a.Observed)
+	}
+	if !contains(a.Note, "NOT PERFORMED") {
+		t.Errorf("the assertion must carry §2.6's gate as its note: %q", a.Note)
+	}
+}
+
+// TestREV1FailsWhenThePICSDeclaresATimerThatIsNotThere is the other side of the
+// same gate. §2.6 performs the tests "for each reversion timer that is
+// implemented", and REV-1 step 1 checks the points of "the reversion timer
+// SPECIFIED IN THE PICS". A PICS that declares a timer the device does not
+// implement is a genuine non-conformance.
+func TestREV1FailsWhenThePICSDeclaresATimerThatIsNotThere(t *testing.T) {
+	dev := newDevice(t, deviceOpts{NoReversionReadback: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::REV-1", checkREV1, dev,
+		map[string]string{paramPICSReversion: "1"})
 	a := o.assertion(t, "every reversion point the timer needs is implemented")
 	if a.Verdict != certify.Fail || !contains(a.Observed, "WMaxLimPctRvrtRem") {
-		t.Fatalf("the missing remaining-time point was not named: %s / %s", a.Verdict, a.Observed)
+		t.Fatalf("a PICS-declared reversion timer that is absent must FAIL step 1: %s / %s", a.Verdict, a.Observed)
 	}
 }
 

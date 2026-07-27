@@ -26,12 +26,16 @@ const suiteName = "ssm"
 // procedure names in its reporting requirements.
 const mbapsPort = 802
 
-// defaultClientWait is how long a [C]-half check waits for the gateway's
-// southbound client to dial the bench's device sim of its own accord. The
-// gateway's poll cadence is its own; this suite is forbidden from changing DUT
-// configuration to speed it up, so it waits and reports honestly if nothing
-// arrived.
-const defaultClientWait = 25 * time.Second
+// fallbackClientWait is how long a [C]-half check waits for the gateway's
+// southbound client to dial the bench's device sim when the DUT's own cadence
+// cannot be read.
+//
+// It is a FALLBACK, not the number. The gateway's poll cadence is in its own
+// configuration and the wait is derived from it — see certify.ObservationWait.
+// A constant is wrong in both directions, and run 20260726T225512 shows which:
+// 25 s of waiting recorded "no ClientHello from the gateway" on four [C]-half
+// assertions, which was a fact about the constant, not about the device.
+const fallbackClientWait = 45 * time.Second
 
 // preflight resolves the things nearly every check needs, returning a Result
 // the check can hand straight back when one is missing. A missing bench is a
@@ -258,6 +262,9 @@ type clientHalf struct {
 	GatewayHost netip.Addr
 	// Waited is how long the check actually waited.
 	Waited time.Duration
+	// WaitWhy explains where that number came from: the DUT's own configured
+	// poll cadence, or a fallback, and which.
+	WaitWhy string
 	// Armed is false when the endpoint could not be claimed at all.
 	Armed bool
 	// Why records the reason when it is not armed.
@@ -292,14 +299,22 @@ func watchClientHalf(ctx context.Context, rc *certify.RunCtx) *clientHalf {
 	}
 	c.Armed = true
 
-	wait := defaultClientWait
-	if v, ok := rc.Param("ssm.client_wait"); ok && v != "" {
-		if d, derr := time.ParseDuration(v); derr == nil {
-			wait = d
-		}
-	}
+	wait, why := rc.ObservationWait(ctx, certify.ObservationSpec{
+		What:       "southbound Modbus poll interval",
+		ConfigPath: "/etc/lexa/modbus.json",
+		Field:      "poll_interval_s",
+		Fallback:   fallbackClientWait,
+		Param:      "ssm.client_wait",
+		// Four periods, not two: the southbound client holds a keep-alive
+		// session, so what has to land inside the window is a RECONNECT, not a
+		// poll. The poll interval is the only cadence the DUT publishes and it
+		// bounds the reconnect from below; several of them is the honest
+		// derivation, and the number is reported either way.
+		Periods: 4,
+	})
+	c.WaitWhy = why
 	start := time.Now()
-	rc.Logf("waiting %s for the gateway's southbound client to dial %s", wait, ep)
+	rc.Logf("waiting %s for the gateway's southbound client to dial %s (%s)", wait, ep, why)
 	_ = rc.Sleep(ctx, wait)
 	c.Waited = time.Since(start)
 	return c
@@ -314,7 +329,8 @@ func (c *clientHalf) hello(ev *certify.Evidence) (*tlsdis.ClientHello, *wireView
 	if !ev.HasFrames() {
 		return nil, nil, fmt.Errorf(
 			"no frames were attributed to this test case; the gateway opened no southbound mbaps "+
-				"connection to %s during the %s the check waited", c.Endpoint, c.Waited.Round(time.Second))
+				"connection to %s during the %s the check waited (%s)",
+			c.Endpoint, c.Waited.Round(time.Second), c.WaitWhy)
 	}
 	for _, st := range ev.Streams() {
 		a, b := endpointAddr(st.Key.A), endpointAddr(st.Key.B)
@@ -340,7 +356,8 @@ func (c *clientHalf) hello(ev *certify.Evidence) (*tlsdis.ClientHello, *wireView
 	}
 	return nil, nil, fmt.Errorf(
 		"no ClientHello from the gateway to %s appears in the %d frame(s) attributed to this test case "+
-			"during the %s it waited", c.Endpoint, len(ev.Frames()), c.Waited.Round(time.Second))
+			"during the %s it waited (%s)",
+		c.Endpoint, len(ev.Frames()), c.Waited.Round(time.Second), c.WaitWhy)
 }
 
 // clientHelloFact asserts a claim about the gateway's own ClientHello.

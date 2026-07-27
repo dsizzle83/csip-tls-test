@@ -263,9 +263,30 @@ func cleanupReversion(c *client, st *revSetup, label string) {
 	_ = restore(c, st.Probe, label+" cleanup")
 }
 
+// revGateNote is §2.6's applicability gate, quoted, and why it decides the
+// verdict of an unimplemented reversion group.
+const revGateNote = "SS-MODBUS-CONF-v1.4 §2.6, the section preamble: \"Reversion tests verify the reversion " +
+	"timer functionality. IF THIS FUNCTIONALITY IS NOT IMPLEMENTED IN A MODEL, THE TESTS ARE NOT PERFORMED. " +
+	"The following tests must be performed for each reversion timer that is implemented.\" REV-1 step 1 then " +
+	"scopes itself further — \"all reversion points are implemented for the reversion timer SPECIFIED IN THE " +
+	"PICS\". With no implemented reversion timer and no PICS declaring one, these tests are not applicable: " +
+	"the finding below is recorded as context, not as a conformance result. Supply -param " +
+	paramPICSReversion + "=1 when the PICS DOES declare this timer, and the same observation becomes a FAIL."
+
 // blockedResult is the shared shape of "the reversion procedure could not be
 // exercised", with the reason cited from the wire where there is one.
-func blockedResult(s *session, st *revSetup, claims []string) certify.Result {
+//
+// picsDeclared says the PICS claims a reversion timer. It is what §2.6's gate
+// turns on: absent a declared timer an incomplete reversion group means the
+// tests ARE NOT PERFORMED, and step 1's "verify all reversion points are
+// implemented" has nothing to be verified against. Run 20260726T225512 emitted
+// that step as a FAIL regardless — the runner logged SKIP, the report showed
+// FAIL, and no reversion behaviour had been exercised at all.
+func blockedResult(s *session, st *revSetup, claims []string, picsDeclared bool) certify.Result {
+	stepOneVerdict := certify.Skip
+	if picsDeclared {
+		stepOneVerdict = certify.Fail
+	}
 	return certify.Result{
 		Verdict: certify.Skip,
 		Notes:   st.Blocked,
@@ -279,14 +300,20 @@ func blockedResult(s *session, st *revSetup, claims []string) certify.Result {
 				return nil, err
 			}
 			if len(st.Unimplemented) > 0 {
+				observed := strings.Join(st.Unimplemented, ", ")
+				if !picsDeclared {
+					observed += " — so no reversion timer is implemented in this model and §2.6's gate applies: " +
+						"these tests are NOT PERFORMED"
+				}
 				a, err := c.frames(
 					"every reversion point the timer needs is implemented in the model",
 					"FC 3 read of model 704's register block; each reversion point compared against its type's "+
 						"not-implemented sentinel",
-					certify.Fail, strings.Join(st.Unimplemented, ", "), st.TIDs)
+					stepOneVerdict, observed, st.TIDs)
 				if err != nil {
 					return nil, err
 				}
+				a.Note = joinNote(a.Note, revGateNote)
 				out = append(out, a)
 			}
 			for _, cl := range claims {
@@ -321,7 +348,7 @@ func checkREV1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		return certify.Result{}, err
 	}
 	if st.Blocked != "" {
-		return blockedResult(s, st, claims), nil
+		return blockedResult(s, st, claims, paramBool(rc, paramPICSReversion)), nil
 	}
 	defer cleanupReversion(s.client, st, "REV-1")
 
@@ -449,7 +476,7 @@ func checkREV2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		return certify.Result{}, err
 	}
 	if st.Blocked != "" {
-		return blockedResult(s, st, claims), nil
+		return blockedResult(s, st, claims, paramBool(rc, paramPICSReversion)), nil
 	}
 	defer cleanupReversion(s.client, st, "REV-2")
 
@@ -591,7 +618,7 @@ func checkREV3(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		return certify.Result{}, err
 	}
 	if st.Blocked != "" {
-		return blockedResult(s, st, claims), nil
+		return blockedResult(s, st, claims, paramBool(rc, paramPICSReversion)), nil
 	}
 	defer cleanupReversion(s.client, st, "REV-3")
 
