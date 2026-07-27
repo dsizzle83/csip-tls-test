@@ -27,6 +27,19 @@ package gwloopback
 //   - transport: a small concurrent-session CAP refuses the flood's excess
 //     post-handshake.
 //
+// A role the loopback CANNOT ESTABLISH is not a denial. If a session's peer
+// identity is unavailable (mbtls.ErrPeerIdentityUnavailable — a resumed session
+// whose peer certificate could not be recovered; see internal/mbtls/peerid.go) the
+// loopback REFUSES to serve it: it closes the session and counts the refusal,
+// rather than answering the bare 0x01 that means "authorization denied". Those are
+// different claims, and answering the second for the first is exactly the bug that
+// made this gate ORDER-DEPENDENT — an earlier scenario's cached TLS session cost a
+// later one its role, and the suite recorded a fictional authz denial (4caad35).
+// mbtls now recovers the identity, so this path should never fire; it stays as the
+// backstop, because the failure it guards against is silent by construction. A
+// transport failure, which the oracles score INCONCLUSIVE, is the honest outcome:
+// the harness could not observe the gateway's answer, so it must not report one.
+//
 // The out-of-range behaviour used to be inverted here: this loopback deliberately
 // modelled a live-gateway GAP (no range check) so the pinned out-of-range scenario
 // FAILed in both places. That gap was CLOSED in the product (bounded signed
@@ -39,6 +52,7 @@ package gwloopback
 
 import (
 	"errors"
+	"log"
 	"math"
 	"net"
 	"sync/atomic"
@@ -72,6 +86,11 @@ type LoopbackServer struct {
 	writeRoles map[string]bool
 	cap        int32
 	active     int32
+	// idRefusals counts sessions refused because their peer identity could not be
+	// established (never a denial — see the package comment). It is exported through
+	// IdentityRefusals so a harness can assert the backstop fired, and so a run that
+	// hit it can say so instead of silently reporting authz verdicts it never reached.
+	idRefusals int64
 	lis        *mbtls.Listener
 	srv        *sim.SolarServer
 }
@@ -115,6 +134,12 @@ func StartLoopbackWriteRoles(serverProfile mbtls.Profile, sessionCap int, writeR
 
 // Addr is the loopback's listen address.
 func (s *LoopbackServer) Addr() string { return s.lis.Addr().String() }
+
+// IdentityRefusals is how many sessions this loopback refused because it could not
+// establish the peer's identity. It must be 0 in a healthy run; a non-zero count
+// means some scenario's verdict was reached without the loopback knowing who was
+// asking, and the run's authz evidence is worth nothing until that is explained.
+func (s *LoopbackServer) IdentityRefusals() int64 { return atomic.LoadInt64(&s.idRefusals) }
 
 // Close tears the loopback down.
 func (s *LoopbackServer) Close() {
@@ -173,7 +198,17 @@ func (s *LoopbackServer) acceptLoop() {
 
 func (s *LoopbackServer) serve(sess *mbtls.Session) {
 	defer sess.Close()
-	role, _ := sess.Role() // "" for a role-less cert; authz below collapses it to no-write
+	// "" for a role-less cert — authz below collapses that to no-write, which is a
+	// real verdict about a real certificate. An identity we could not establish is
+	// NOT that: refuse the session rather than dress a harness fault up as a denial.
+	role, roleErr := sess.Role()
+	if errors.Is(roleErr, mbtls.ErrPeerIdentityUnavailable) {
+		atomic.AddInt64(&s.idRefusals, 1)
+		log.Printf("[gwloopback] refusing session from %s: %v (resumed=%t) — "+
+			"a role that cannot be established is not an authorization denial",
+			sess.Conn.RemoteAddr(), roleErr, sess.Resumed)
+		return
+	}
 	for {
 		adu, err := mbap.Decode(sess.Conn)
 		if err != nil {

@@ -19,6 +19,11 @@ type Listener struct {
 	lis net.Listener
 	ctx unsafe.Pointer // shared across all Accepts; freed by Close
 	p   Profile
+	// peers binds TLS session id -> peer leaf so a RESUMED session whose chain
+	// wolfSSL has evicted still knows who it is talking to (peerid.go). Scoped to
+	// this listener: an identity can never cross between servers, and it dies with
+	// Close.
+	peers *peerBinding
 }
 
 // Listen validates the profile, builds a version-negotiable server context that
@@ -56,7 +61,7 @@ func Listen(addr string, p Profile) (*Listener, error) {
 		return nil, err
 	}
 	ok = true
-	return &Listener{lis: lis, ctx: ctx, p: p}, nil
+	return &Listener{lis: lis, ctx: ctx, p: p, peers: newPeerBinding(peerBindingCap)}, nil
 }
 
 // Addr returns the listener's network address (useful with :0 in tests).
@@ -115,7 +120,12 @@ func (l *Listener) Accept() (*Session, error) {
 		return nil, fmt.Errorf("mbtls: server handshake rejected: %w", err)
 	}
 	wolfssl.WriteTLS12Keylog(ssl)
-	return newSession(ssl, nil, conn, file, false), nil
+	sess := newSession(ssl, nil, conn, file, false)
+	// Settle WHO this peer is before handing the session to an authorization
+	// decision. On a full handshake that is bookkeeping; on a resumed one it is the
+	// difference between the real role and a silent collapse to no-role (peerid.go).
+	l.peers.resolve(sess, !l.p.DisablePeerIdentityRecovery)
+	return sess, nil
 }
 
 // Close stops accepting and frees the shared server context. Any Sessions

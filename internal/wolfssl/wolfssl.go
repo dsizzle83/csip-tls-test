@@ -522,3 +522,74 @@ func UseSecureRenegotiation(ctx unsafe.Pointer) error {
 	}
 	return nil
 }
+
+// --- Server-side peer identity across resumption (Wave 1, harness defect H-1) --
+//
+// On a RESUMED handshake the client sends no Certificate message, so
+// wolfSSL_get_peer_certificate has nothing freshly parsed to hand back. A build
+// with SESSION_CERTS is *supposed* to cover that: wolfSSL falls back to the peer
+// chain stored on the session. But with WOLFSSL_TICKET_HAVE_ID (which
+// --enable-sessioncerts turns on) the TLS 1.3 server does not carry the chain in
+// the ticket itself — it carries a session ID and looks the chain up in wolfSSL's
+// own bounded, in-process session store. That store evicts. When the row holding a
+// resumption chain's session is dropped, every descendant session in that chain
+// resumes SUCCESSFULLY with an EMPTY peer chain, and wolfSSL_get_peer_certificate
+// returns NULL — indistinguishable, to a caller, from "the peer presented no
+// certificate at all". For an mbaps server that derives its authorization role
+// from the peer leaf, that is a silent collapse to no-role.
+//
+// These two accessors exist so mbtls can (a) read the chain directly rather than
+// only through the peer-certificate path, and (b) key its own resumption-
+// independent identity binding on the session ID. Neither invents identity: both
+// report what wolfSSL still holds, and mbtls decides what to do when the answer is
+// "nothing".
+
+// PeerChainLeafDER returns the DER of the LEAF certificate in the peer chain
+// wolfSSL retained for this session (SESSION_CERTS), or nil when no chain is
+// held. It is a second, independent read of the same fact PeerCertificateDER
+// reports: PeerCertificateDER re-decodes the chain leaf into an X509 and dups it,
+// while this returns the retained DER bytes directly. On a full handshake both
+// answer; on a resumed handshake whose chain wolfSSL has evicted, both are nil —
+// which is precisely the condition the caller must not mistake for an anonymous
+// peer.
+//
+// The returned slice is a Go copy; the underlying C buffer belongs to wolfSSL and
+// is not referenced after this call.
+func PeerChainLeafDER(ssl unsafe.Pointer) []byte {
+	chain := C.wolfSSL_get_peer_chain((*C.WOLFSSL)(ssl))
+	if chain == nil {
+		return nil
+	}
+	if int(C.wolfSSL_get_chain_count(chain)) <= 0 {
+		return nil
+	}
+	sz := int(C.wolfSSL_get_chain_length(chain, 0))
+	if sz <= 0 {
+		return nil
+	}
+	der := C.wolfSSL_get_chain_cert(chain, 0)
+	if der == nil {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(der), C.int(sz))
+}
+
+// SessionID returns this connection's TLS session identifier, or nil if none is
+// available. It is the key wolfSSL itself uses to find a session in its store, and
+// with WOLFSSL_TICKET_HAVE_ID a TLS 1.3 ticket carries it forward, so it is stable
+// across a resumption chain — which is what makes it usable as the key for an
+// out-of-band identity binding the wolfSSL store's eviction cannot break.
+//
+// The bytes are copied out; the pointer wolfSSL returns is owned by the session.
+func SessionID(ssl unsafe.Pointer) []byte {
+	sess := C.wolfSSL_get_session((*C.WOLFSSL)(ssl))
+	if sess == nil {
+		return nil
+	}
+	var idLen C.uint
+	id := C.wolfSSL_SESSION_get_id(sess, &idLen)
+	if id == nil || idLen == 0 {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(id), C.int(idLen))
+}

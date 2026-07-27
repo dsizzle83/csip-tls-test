@@ -28,7 +28,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func loopbackRunCtx(t *testing.T, served []uint8, writeRoles []Role) *runCtx {
+func loopbackRunCtx(t *testing.T, served []uint8, writeRoles []Role) (*runCtx, *loopbackServer) {
 	t.Helper()
 	mbtls.ClearSessionCache()
 	ps, err := mintLoopbackPKI()
@@ -41,7 +41,7 @@ func loopbackRunCtx(t *testing.T, served []uint8, writeRoles []Role) *runCtx {
 		t.Fatalf("startLoopbackCustom: %v", err)
 	}
 	t.Cleanup(stop)
-	return &runCtx{target: srv.addr(), ps: ps, port: portOf(srv.addr()), isLoopback: true}
+	return &runCtx{target: srv.addr(), ps: ps, port: portOf(srv.addr()), isLoopback: true}, srv
 }
 
 func runAllChecks(rc *runCtx) *Reporter {
@@ -56,8 +56,16 @@ func runAllChecks(rc *runCtx) *Reporter {
 
 // TestFullLoopbackRun asserts a clean run addresses all 62 rows with zero FAILs.
 func TestFullLoopbackRun(t *testing.T) {
-	rc := loopbackRunCtx(t, loopbackUnits, []Role{RoleGridService, RoleSuperAdmin, RoleNetworkAdmin})
+	rc, srv := loopbackRunCtx(t, loopbackUnits, []Role{RoleGridService, RoleSuperAdmin, RoleNetworkAdmin})
 	r := runAllChecks(rc)
+
+	// Every verdict below was reached against a peer the loopback could name. A
+	// non-zero count means some §5.3 denial row was decided against a session whose
+	// identity the harness had lost, which is not evidence of anything.
+	if n := srv.identityRefusals(); n != 0 {
+		t.Errorf("loopback refused %d session(s) whose peer identity it could not establish — "+
+			"the run's authz rows were decided without a role", n)
+	}
 
 	if missing := r.missingRows(); len(missing) != 0 {
 		t.Fatalf("requirements NOT ADDRESSED: %v", missing)
@@ -94,7 +102,7 @@ func TestFullLoopbackRun(t *testing.T) {
 func TestChecksHaveTeeth(t *testing.T) {
 	// Every role write-capable ⇒ ReadOnly/LexaVolt writes are (wrongly) accepted.
 	allRoles := []Role{RoleGridService, RoleSuperAdmin, RoleNetworkAdmin, RoleReadOnly, RoleLexaVolt}
-	rc := loopbackRunCtx(t, loopbackUnits, allRoles)
+	rc, _ := loopbackRunCtx(t, loopbackUnits, allRoles)
 
 	r := &Reporter{w: io.Discard, results: make(map[int]Result), target: rc.target, started: time.Now()}
 	checkAuthz(r, rc)

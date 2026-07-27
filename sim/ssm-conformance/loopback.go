@@ -16,9 +16,20 @@ package main
 // Running the suite against this loopback proves the checks have teeth (a
 // non-conformant peer would FAIL them) with zero bench access; the identical
 // checks then run against the live lexa-gw :802 for the evidence runs.
+//
+// A role it CANNOT ESTABLISH is not a role it DENIED. A session whose peer
+// identity is unavailable (mbtls.ErrPeerIdentityUnavailable — see
+// internal/mbtls/peerid.go, where a resumed session could lose its peer
+// certificate to wolfSSL's bounded session store) is REFUSED and counted, never
+// served as a role-less peer. The distinction matters more here than anywhere
+// else in the tree: this loopback is the peer the §5.3 denial rows are asserted
+// against, so a harness-side identity loss would print PASS on denial rows that
+// were never actually decided. mbtls now keeps the identity, so the refusal is a
+// backstop; it exists because the failure it guards is silent by construction.
 
 import (
 	"errors"
+	"log"
 	"net"
 	"sync/atomic"
 
@@ -38,6 +49,9 @@ type loopbackServer struct {
 	lis        *mbtls.Listener
 	srv        *sim.SolarServer
 	dropNext   atomic.Bool // when set, close the next session mid-exchange (a drop fault)
+	// idRefusals counts sessions refused because their peer identity could not be
+	// established. It must be 0 in any run whose authz verdicts are worth reading.
+	idRefusals atomic.Int64
 }
 
 // loopbackUnits are the units the loopback maps; every other unit answers 0x0A.
@@ -86,6 +100,11 @@ func startLoopbackCustom(ps *pkiSet, served []uint8, writeRoles []Role) (*loopba
 
 func (s *loopbackServer) addr() string { return s.lis.Addr().String() }
 
+// identityRefusals is how many sessions this loopback refused because it could not
+// establish the peer's identity. Non-zero invalidates the run's authz rows: those
+// verdicts were reached without knowing who was asking.
+func (s *loopbackServer) identityRefusals() int64 { return s.idRefusals.Load() }
+
 func boolSet(units []uint8) map[uint8]bool {
 	m := make(map[uint8]bool, len(units))
 	for _, u := range units {
@@ -117,7 +136,18 @@ func (s *loopbackServer) acceptLoop() {
 
 func (s *loopbackServer) serve(sess *mbtls.Session) {
 	defer sess.Close()
-	role, _ := sess.Role() // "" for a role-less cert; authz below collapses that to no-write
+	// "" for a role-less cert — authz below collapses that to no-write, which is a
+	// real verdict about a real certificate. An identity we could not establish is
+	// NOT that: refuse the session rather than decide a denial row against a peer we
+	// cannot name.
+	role, roleErr := sess.Role()
+	if errors.Is(roleErr, mbtls.ErrPeerIdentityUnavailable) {
+		s.idRefusals.Add(1)
+		log.Printf("[ssm-loopback] refusing session from %s: %v (resumed=%t) — "+
+			"a role that cannot be established is not an authorization denial",
+			sess.Conn.RemoteAddr(), roleErr, sess.Resumed)
+		return
+	}
 	for {
 		adu, err := mbap.Decode(sess.Conn)
 		if err != nil {

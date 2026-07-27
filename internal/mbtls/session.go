@@ -23,6 +23,20 @@ type Session struct {
 	PeerDER []byte
 	// Resumed reports whether this handshake resumed a cached session (TCP-46).
 	Resumed bool
+	// IdentityRecovered reports that PeerDER did not come from THIS handshake:
+	// the session RESUMED, wolfSSL no longer held the peer chain, and the leaf
+	// was restored from the Listener's own session-ID binding (peerid.go). The
+	// identity is the one the original handshake of this same TLS session
+	// verified; the flag exists so evidence can say where it came from rather
+	// than quietly presenting it as freshly proven. Server sessions only.
+	IdentityRecovered bool
+	// IdentityLost reports that the handshake completed against a listener that
+	// demands a client certificate, yet no peer leaf could be obtained by any
+	// route — so no role can be derived and no authorization verdict can honestly
+	// be reached on this session. Role() then returns ErrPeerIdentityUnavailable,
+	// and a server is expected to refuse the session LOUDLY rather than answer a
+	// denial it never computed. Server sessions only. See peerid.go.
+	IdentityLost bool
 	// Cipher is the negotiated suite name (e.g. ECDHE-ECDSA-AES128-GCM-SHA256),
 	// for suite-conformance assertions (TCP-17/18).
 	Cipher string
@@ -92,8 +106,18 @@ func (s *Session) Renegotiate() error {
 // Role extracts and returns this session's peer role via the bench's own
 // independent parser (RoleFromDER). Convenience for callers that already hold a
 // Session; equivalent to RoleFromDER(s.PeerDER) with a no-cert guard.
+//
+// Two different no-certificate outcomes are kept apart on purpose. A session
+// whose identity could not be established at all (IdentityLost — see peerid.go)
+// returns ErrPeerIdentityUnavailable, NOT ErrNoRole: the server does not hold a
+// certificate to make a statement about, so it has not reached an authorization
+// verdict and must not report one. Conflating the two is exactly what let a
+// resumption bug in the harness masquerade as an authorization denial.
 func (s *Session) Role() (string, error) {
 	if len(s.PeerDER) == 0 {
+		if s.IdentityLost {
+			return "", ErrPeerIdentityUnavailable
+		}
 		return "", ErrNoRole
 	}
 	return RoleFromDER(s.PeerDER)

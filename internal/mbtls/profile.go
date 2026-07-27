@@ -97,6 +97,17 @@ type Profile struct {
 	CertChainFile  string   // full chain this peer sends, leaf first (TCP-51)
 	KeyFile        string   // private key matching the leaf
 	RoleAsserted   string   // client only: role this identity expects to carry (self-checks)
+
+	// DisablePeerIdentityRecovery turns OFF the server-side recovery of a peer
+	// leaf on a RESUMED session (peerid.go). It is phrased negatively so the safe
+	// behaviour is the zero value: every Profile literal already in the tree, and
+	// every future one, gets recovery without having to know it exists. Setting it
+	// true reproduces wolfSSL's session-store eviction on demand — that is how the
+	// teeth tests stand up a server that genuinely cannot establish a resumed
+	// peer's role and prove the LOUD refusal fires, rather than the silent
+	// authorization denial that made the hermetic gate order-dependent. Server
+	// profiles only; ignored on a client.
+	DisablePeerIdentityRecovery bool
 }
 
 // DefaultClientProfile returns a fully-conformant mbaps client profile: TLS
