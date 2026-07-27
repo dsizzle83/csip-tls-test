@@ -44,6 +44,16 @@ type WriteRecord struct {
 	LatencyMS int64     `json:"latency_ms"`
 	OK        bool      `json:"ok"`
 	Err       string    `json:"err,omitempty"`
+	// ExCode is the Modbus exception the write was REFUSED with, or 0 when the
+	// write succeeded or failed without ever reaching a protocol answer. It is the
+	// machine-readable half of Err, and it is what lets an oracle tell "the device
+	// said no" — a verdict about the device — from "we never heard back", a verdict
+	// about the transport. Err alone cannot make that call: a typed write scans the
+	// block layout before it can address a point, so a refusal often arrives during
+	// the SCAN and reaches the caller wrapped several errors deep inside a message
+	// about scanning. Recording the code here, taken from the whole error chain,
+	// keeps that distinction out of string matching.
+	ExCode uint8 `json:"exception_code,omitempty"`
 }
 
 // NewRunState starts a run record for a target/role.

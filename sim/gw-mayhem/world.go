@@ -46,6 +46,15 @@ type gwWorld struct {
 	// INCONCLUSIVE — this suite never mutates the board itself.
 	boardArmed map[string]bool
 
+	// disableConnectReadiness turns OFF the readiness gate on the SPEC-campaign
+	// connect (connectReadyAt), restoring the raw dial the aggregator engine used
+	// to be wired to. Phrased negatively so the safe behaviour is the zero value.
+	// It exists for one purpose: a teeth test needs the harness in its pre-fix
+	// shape, to prove that a peer momentarily at its session cap then produces an
+	// INCONCLUSIVE verdict about a gateway that did nothing wrong
+	// (speccap_integration_test.go). Never set outside a test.
+	disableConnectReadiness bool
+
 	// Control-unit discovery is done ONCE per run and cached: every family that
 	// needs a 704 target shares the result, so the suite opens one discovery session
 	// instead of one per scenario (less session churn, no per-scenario flakiness).
@@ -106,8 +115,19 @@ func NewWorld(target, pkiDir, serverCAOverride string) (*gwWorld, error) {
 		aggregator.TargetDevice:  target,
 	}
 	w.eng = aggregator.NewEngine(aggregator.RunOptions{
+		// The SAME readiness discipline the Go families get (connectAsReady). The
+		// engine's connect used to be the raw dial, so a spec campaign that happened
+		// to start while the peer's session table was full reported INCONCLUSIVE —
+		// a verdict about the harness wearing the shape of a verdict about the
+		// gateway. The suite creates that condition on itself: transport-session-flood
+		// deliberately fills the table just before the spec scenarios run.
 		ConnectAs: func(addr string, r aggregator.Role) (*aggregator.Conn, error) {
-			return aggregator.ConnectAs(addr, r, refs)
+			if w.disableConnectReadiness {
+				return aggregator.ConnectAs(addr, r, refs)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), connectReadyBudget)
+			defer cancel()
+			return w.connectReadyAt(ctx, addr, r)
 		},
 		Resolve: func(tgt string) (string, error) {
 			if a, ok := addrs[tgt]; ok && a != "" {
@@ -195,13 +215,22 @@ func (w *gwWorld) connectAs(r aggregator.Role) (*aggregator.Conn, error) {
 // retries. The raw connectAs stays for the flood loop, which must OBSERVE
 // refusals rather than ride them out.
 func (w *gwWorld) connectAsReady(ctx context.Context, r aggregator.Role) (*aggregator.Conn, error) {
+	return w.connectReadyAt(ctx, w.target, r)
+}
+
+// connectReadyAt is connectAsReady against an explicit address — the form the
+// aggregator engine needs, since a campaign resolves its own target. Both paths
+// go through here so the spec campaigns and the Go families ride out the same
+// transient by the same rule; a divergence between them is exactly the kind of
+// harness asymmetry that turns into a "flaky scenario".
+func (w *gwWorld) connectReadyAt(ctx context.Context, addr string, r aggregator.Role) (*aggregator.Conn, error) {
 	const attempts = 6
 	var lastErr error
 	for i := 0; i < attempts; i++ {
 		if i > 0 && !sleepCtx(ctx, connectBackoff(i)) {
 			return nil, ctx.Err()
 		}
-		c, err := w.connectAs(r)
+		c, err := aggregator.ConnectAs(addr, r, w.refs)
 		if err != nil {
 			lastErr = err // handshake/dial failure — could be transient cap pressure
 			continue
@@ -215,6 +244,14 @@ func (w *gwWorld) connectAsReady(ctx context.Context, r aggregator.Role) (*aggre
 	}
 	return nil, lastErr
 }
+
+// connectReadyBudget bounds the readiness gate on the spec-campaign connect. The
+// engine's ConnectAs hook carries no context, and a wedged peer must not be able
+// to stall a campaign indefinitely inside a retry ladder that is only ≈2.3s of
+// backoff plus six handshakes. Exceeding it yields the last connect error, which
+// the campaign reports as INCONCLUSIVE — the honest outcome for "the peer never
+// gave us a working session".
+const connectReadyBudget = 30 * time.Second
 
 // connectBackoff is the connect-retry delay for attempt i (1-based after the
 // first): 100,200,400,800,800ms — enough for the gateway to reap a freed slot,

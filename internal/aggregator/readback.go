@@ -114,17 +114,37 @@ func (r *campaignRun) doReadback(ctx context.Context, idx int, s Step) StepResul
 //     accepted but not applied — the class readback verification exists to catch);
 //   - converged, but only past slowFraction of the SLA ⇒ DEGRADED (arrived slow).
 //
-// A control write that failed at the transport layer (not a clean exception)
-// contributes INCONCLUSIVE — the command never left the emulator, so convergence
-// cannot be judged. No readback at all ⇒ INCONCLUSIVE (nothing to judge).
+// A control write the device REFUSED with a Modbus exception is a FAIL: this
+// oracle judges campaigns whose write is supposed to be accepted, so a refusal is
+// the device declining a control it owes — the grant half of an RBAC contract, or
+// a value the device rejected — and it is a statement the device made. A write
+// that failed at the TRANSPORT layer, with no protocol answer at all, contributes
+// INCONCLUSIVE instead: the command never reached the device, so convergence
+// cannot be judged and neither can the device.
+//
+// Those two used to be one branch, keyed on StepResult.Exception — which only the
+// expect_exception verb ever populates, so a write step never had one and EVERY
+// refusal was reported as a transport failure. That mattered most exactly where
+// the oracle matters most: a gateway that denied a legitimate GridService control
+// write produced "cannot observe convergence", not "the write was refused". The
+// key is now StepResult.ExCode, which the engine takes from the whole error chain,
+// so a refusal delivered during the write's block-layout scan is still recognised
+// as a refusal.
+//
+// No readback at all ⇒ INCONCLUSIVE (nothing to judge).
 func convergeWithinSLA(rep *CampaignReport) (Verdict, []string) {
 	var findings []string
 	verdict := Verdict("")
 	readbacks := 0
 	for _, st := range rep.Steps {
 		if (st.Do == StepWritePoint || st.Do == StepWriteMulti) && !st.OK && st.Exception == nil && st.Err != "" {
-			findings = append(findings, fmt.Sprintf("step %d %s: control write failed at transport (%s) — cannot observe convergence", st.Index, st.Do, st.Err))
-			verdict = worse(verdict, VerdictInconclusive)
+			if st.ExCode != 0 {
+				findings = append(findings, fmt.Sprintf("step %d %s: control write REFUSED with exception 0x%02x (%s) — the device declined a control this campaign requires it to accept", st.Index, st.Do, st.ExCode, st.Err))
+				verdict = worse(verdict, VerdictFail)
+			} else {
+				findings = append(findings, fmt.Sprintf("step %d %s: control write failed at transport (%s) — cannot observe convergence", st.Index, st.Do, st.Err))
+				verdict = worse(verdict, VerdictInconclusive)
+			}
 		}
 		if st.Readback == nil {
 			continue

@@ -57,12 +57,23 @@ type ExceptionCheck struct {
 // resume) so the TLS-fault oracles can read the handshake facts (Resumed) the
 // step produced.
 type StepResult struct {
-	Index     int             `json:"index"`
-	Do        string          `json:"do"`
-	OK        bool            `json:"ok"`
-	Err       string          `json:"err,omitempty"`
-	LatencyMS int64           `json:"latency_ms,omitempty"`
-	Note      string          `json:"note,omitempty"`
+	Index     int    `json:"index"`
+	Do        string `json:"do"`
+	OK        bool   `json:"ok"`
+	Err       string `json:"err,omitempty"`
+	LatencyMS int64  `json:"latency_ms,omitempty"`
+	Note      string `json:"note,omitempty"`
+	// ExCode is the Modbus exception a FAILED step was refused with, or 0 when the
+	// step succeeded or failed without ever reaching a protocol answer. It is what
+	// separates "the device said no" — a verdict about the device — from "we never
+	// heard back", a verdict about the transport; an oracle that conflates the two
+	// reports a real refusal as "could not observe". Err cannot carry the
+	// distinction: a typed write scans the block layout before it can address a
+	// point, so a refusal frequently arrives during that SCAN, wrapped several
+	// errors deep inside a message about scanning. Taken from the whole error chain
+	// (AsException), never from the message text. Distinct from Exception, which is
+	// the expect_exception verb's own probe evidence.
+	ExCode    uint8           `json:"exception_code,omitempty"`
 	Write     *WriteRecord    `json:"write,omitempty"`
 	Readback  *ReadbackRecord `json:"readback,omitempty"`
 	Exception *ExceptionCheck `json:"exception,omitempty"`

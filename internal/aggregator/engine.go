@@ -343,6 +343,12 @@ func (r *campaignRun) doWritePoint(i int, s Step) StepResult {
 		wr.Err = err.Error()
 		res.Err = err.Error()
 		if ex, ok := AsException(err); ok {
+			// AsException walks the whole error chain, so this catches a refusal that
+			// arrived during the block-layout SCAN as well as one carried on the write
+			// PDU itself. Recording the CODE, not only the prose note, is what stops an
+			// oracle downstream reading a clean denial as a transport failure.
+			wr.ExCode = uint8(ex.Code)
+			res.ExCode = uint8(ex.Code)
 			res.Note = fmt.Sprintf("write rejected with exception %d", ex.Code)
 		}
 		r.rs.AddWrite(wr)
@@ -412,6 +418,7 @@ func (r *campaignRun) doWriteMulti(i int, s Step) StepResult {
 	if err != nil {
 		res.Err = err.Error()
 		if ex, ok := AsException(err); ok {
+			res.ExCode = uint8(ex.Code)
 			res.Note = fmt.Sprintf("write rejected with exception %d", ex.Code)
 		}
 		return res

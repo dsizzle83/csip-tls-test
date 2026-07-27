@@ -73,6 +73,15 @@ var loopbackUnits = []uint8{1, 2}
 // controls) and SuperAdmin (rw *) only. ReadOnly / LexaVolt / NetworkAdmin are NOT here.
 var loopbackWriteRoles = []aggregator.Role{aggregator.RoleGridService, aggregator.RoleSuperAdmin}
 
+// LoopbackWriteRoles is the faithful write-allow set, for a test that stands up a
+// deliberately non-conformant peer with StartLoopbackWriteRoles and needs to pair
+// it against the honest one. Returns a copy: the shipped set is not a knob.
+func LoopbackWriteRoles() []aggregator.Role {
+	out := make([]aggregator.Role, len(loopbackWriteRoles))
+	copy(out, loopbackWriteRoles)
+	return out
+}
+
 // defaultLoopbackCap is the concurrent-session cap the loopback enforces — the
 // gateway-like MaxSessions=8, below the session-flood's floodN=12 (so the flood
 // always observes refusals) but with headroom for the other families' sequential
