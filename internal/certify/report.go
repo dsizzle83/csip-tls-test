@@ -29,6 +29,9 @@ type Reporter struct {
 	started time.Time
 	counts  map[Verdict]int
 	seen    int
+	// provisional records the verdict each case was PRINTED with during the
+	// live phase, so Reconcile can name the ones the citation phase moved.
+	provisional map[string]Verdict
 }
 
 // NewReporter tees the run log to w.
@@ -111,10 +114,36 @@ func (r *Reporter) PlanListing(plan []Planned) {
 	r.printf("\n")
 }
 
-// Case prints one test case's verdict line and updates the running tally.
+// ExecutionBanner announces the case lines and states plainly that they are
+// PROVISIONAL.
+//
+// They have to be. The line is printed the moment a check returns, which is
+// before the capture has been stopped and long before the citation phase has
+// re-derived each criterion from the pcap — and the citation phase can only
+// make a verdict worse. A console that printed those numbers as final and a
+// summary that printed different ones is a tool disagreeing with itself in
+// front of the person who has to defend the run: 11 FAIL on screen and 17 in
+// the summary, in run 20260726T225512. Reconcile prints the differences once
+// they are known.
+func (r *Reporter) ExecutionBanner() {
+	r.printf("\n%s\n", strings.Repeat("─", rule))
+	r.printf("EXECUTION — the verdict on each line below is PROVISIONAL\n")
+	r.printf("%s\n", strings.Repeat("─", rule))
+	r.printf("  Each line is printed when the check returns, from what its own socket saw. The\n")
+	r.printf("  CITATION phase then re-derives every criterion from the capture, which can only\n")
+	r.printf("  lower a verdict. The reconciliation below the last line, and the summary after\n")
+	r.printf("  it, are the final word.\n")
+}
+
+// Case prints one test case's PROVISIONAL verdict line and updates the running
+// tally. See ExecutionBanner.
 func (r *Reporter) Case(res CaseResult) {
 	r.seen++
 	r.counts[res.Verdict]++
+	if r.provisional == nil {
+		r.provisional = map[string]Verdict{}
+	}
+	r.provisional[res.Case.UID] = res.Verdict
 	pass, fail, skip, warn := r.counts[Pass], r.counts[Fail], r.counts[Skip], r.counts[Warn]
 	detail := res.Notes
 	if detail == "" && len(res.Assertions) > 0 {
@@ -124,8 +153,44 @@ func (r *Reporter) Case(res CaseResult) {
 	if res.FrameSet != nil && len(res.FrameSet.Frames) > 0 {
 		frames = fmt.Sprintf(" frames %s", res.FrameSet.Span())
 	}
-	r.printf("  %s  %-32s %-46s [%d/%d/%d/%d]%s\n",
+	r.printf("  %s~ %-32s %-46s [%d/%d/%d/%d]%s\n",
 		Glyph(res.Verdict), res.Case.UID, trunc(oneLine(detail), 46), pass, fail, skip, warn, frames)
+}
+
+// Reconcile prints every case whose verdict changed between the provisional
+// line and the bundle, and says which one stands.
+//
+// Printing nothing when nothing moved is deliberate: the block is a signal, and
+// a signal that appears on every run is not one.
+func (r *Reporter) Reconcile(rep *RunReport) {
+	type change struct {
+		uid      string
+		from, to Verdict
+		why      string
+	}
+	var changes []change
+	for _, c := range rep.Cases {
+		was, ok := r.provisional[c.Case.UID]
+		if !ok || was == c.Verdict {
+			continue
+		}
+		changes = append(changes, change{uid: c.Case.UID, from: was, to: c.Verdict, why: c.Reconciled})
+	}
+	if len(changes) == 0 {
+		return
+	}
+	r.printf("\n%s\nVERDICT RECONCILIATION — %d case(s) changed after the citation phase\n%s\n",
+		strings.Repeat("─", rule), len(changes), strings.Repeat("─", rule))
+	r.printf("  The provisional line came from what the check's own socket saw. The verdict\n")
+	r.printf("  below came from re-deriving the same criteria out of the capture, which is the\n")
+	r.printf("  only evidence a reader of the bundle has. Where they differ, the capture wins.\n\n")
+	for _, ch := range changes {
+		r.printf("  %-32s %s  →  %s\n", ch.uid, Glyph(ch.from), Glyph(ch.to))
+		if ch.why != "" {
+			r.printf("      %s\n", trunc(oneLine(ch.why), rule-8))
+		}
+	}
+	r.printf("\n")
 }
 
 // Glyph is the house-style marker for a verdict.

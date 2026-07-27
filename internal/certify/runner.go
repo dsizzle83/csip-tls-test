@@ -292,6 +292,21 @@ type CaseResult struct {
 	Frames []int
 	// FrameSet is the full attribution record.
 	FrameSet *FrameSet
+	// LiveVerdict is the verdict the check DECLARED at the end of the live
+	// phase, before the capture was parsed and the citation phase ran.
+	//
+	// It is kept because the two can differ, and when they do the difference is
+	// itself worth reporting: the live phase reasons from bytes read off a
+	// socket, the citation phase from bytes a stranger can re-read out of the
+	// pcap, and those are different evidentiary standards. A console that
+	// printed one and a bundle that recorded the other, with nothing saying so,
+	// is what produced "11 FAIL on screen, 17 in the summary" in run
+	// 20260726T225512 — and three REV cases the runner logged as SKIP and the
+	// report published as FAIL.
+	LiveVerdict Verdict
+	// Reconciled is why the final verdict differs from LiveVerdict, when it
+	// does.
+	Reconciled string
 	// Executed distinguishes "ran and skipped" from "never ran".
 	Executed bool
 	Duration time.Duration
@@ -587,6 +602,7 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 
 	var windows []*Window
 	runErr := error(nil)
+	reporter.ExecutionBanner()
 	for _, p := range rep.Plan {
 		if err := ctx.Err(); err != nil {
 			runErr = err
@@ -659,6 +675,7 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 
 	r.finalise(rep)
 	rep.Finished = time.Now().UTC()
+	reporter.Reconcile(rep)
 
 	if !r.opts.DryRun && r.opts.OutDir != "" {
 		b, dir, err := r.writeBundle(rep, capr)
@@ -797,6 +814,7 @@ func (r *Runner) execute(ctx context.Context, p Planned, rc *RunCtx, win *Window
 		return res
 	}
 	res.Verdict = out.rollUp()
+	res.LiveVerdict = res.Verdict
 	res.Notes = out.Notes
 	res.Assertions = append(res.Assertions, out.Assertions...)
 	res.cite = out.Cite
@@ -923,12 +941,21 @@ func (r *Runner) citeWithoutCapture(rep *RunReport) {
 	}
 }
 
-// finalise applies the uncited-PASS rule and rolls the verdicts up.
+// finalise applies the uncited-PASS rule, rolls the verdicts up, and records
+// every case whose verdict moved away from what the live phase declared.
 func (r *Runner) finalise(rep *RunReport) {
 	for i := range rep.Cases {
 		c := &rep.Cases[i]
 		if worst := worstOf(c.Assertions); worst.Severity() > c.Verdict.Severity() {
 			c.Verdict = worst
+		}
+		if c.Executed && c.LiveVerdict != "" && c.Verdict != c.LiveVerdict {
+			c.Reconciled = fmt.Sprintf(
+				"the live phase declared %s from what the socket saw; the citation phase re-derived the "+
+					"criteria from the capture and the case is %s. The capture-derived verdict is the one "+
+					"that stands: it is the only one a reader of this bundle can repeat.",
+				c.LiveVerdict, c.Verdict)
+			c.Notes = joinNote(c.Notes, "VERDICT RECONCILED — "+c.Reconciled)
 		}
 		if c.Verdict != Pass || !r.opts.RequireCitation {
 			continue
@@ -1035,7 +1062,19 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 func caseNotes(c CaseResult) string {
 	parts := []string{}
 	if c.Notes != "" {
-		parts = append(parts, c.Notes)
+		// LABELLED as the live phase's observation. Printing it bare, directly
+		// under a case heading that carries the capture-derived verdict, is how
+		// a report comes to say "✓ PASS the DUT tore the session down" three
+		// lines above "FAIL — the DUT sent no fatal alert" and leave the reader
+		// to work out which one is the finding. They are two different
+		// instruments looking at the same event, and the report should say so.
+		lead := "Live-phase observation (what the check's own socket saw; the numbered assertions below are " +
+			"re-derived from the capture and are the verdict): "
+		if c.Executed {
+			parts = append(parts, lead+c.Notes)
+		} else {
+			parts = append(parts, c.Notes)
+		}
 	}
 	if c.FrameSet != nil && c.Executed {
 		parts = append(parts, fmt.Sprintf(

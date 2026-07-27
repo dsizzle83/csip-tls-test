@@ -787,3 +787,36 @@ func TestUnknownSuiteIsRefused(t *testing.T) {
 		t.Errorf("the refusal does not name the available suites: %v", err)
 	}
 }
+
+// TestFinaliseRecordsAReconciledVerdict proves the runner keeps the live
+// verdict and says, in the case's own notes, when the capture overrode it.
+// Without this the bundle carries a verdict whose provenance is invisible.
+func TestFinaliseRecordsAReconciledVerdict(t *testing.T) {
+	cat := loadTestCatalog(t)
+	c, _ := cat.ByUID("doc-a::A-001")
+	r := &Runner{opts: DefaultOptions()}
+	rep := &RunReport{Cases: []CaseResult{{
+		Case: c, Suite: "s", Executed: true,
+		Verdict: Skip, LiveVerdict: Skip,
+		Notes: "the reversion group is incomplete",
+		Assertions: []Assertion{
+			{Claim: "step 1", Verdict: Fail, Observed: "WMaxLimPctRvrtRem reads its not-implemented value"},
+		},
+	}}}
+	r.finalise(rep)
+
+	got := rep.Cases[0]
+	if got.Verdict != Fail {
+		t.Fatalf("verdict = %s, want FAIL: the roll-up takes the worst assertion", got.Verdict)
+	}
+	if got.LiveVerdict != Skip {
+		t.Errorf("LiveVerdict = %s, want SKIP preserved", got.LiveVerdict)
+	}
+	if got.Reconciled == "" {
+		t.Fatal("a case whose verdict moved from SKIP to FAIL carries no reconciliation note; that is exactly " +
+			"the runner-logged-SKIP / report-said-FAIL divergence this field exists to surface")
+	}
+	if !strings.Contains(got.Notes, "VERDICT RECONCILED") {
+		t.Errorf("notes = %q, want the reconciliation recorded where the bundle will carry it", got.Notes)
+	}
+}

@@ -161,3 +161,58 @@ func TestTruncPreservesRunes(t *testing.T) {
 		t.Errorf("trunc = %q", got)
 	}
 }
+
+// TestConsoleAndBundleCannotSilentlyDisagree pins the reconciliation.
+//
+// The per-case line is printed the moment a check returns, from what its own
+// socket saw. The citation phase then re-derives every criterion from the
+// capture and can only make a verdict worse. Run 20260726T225512 printed 11 FAIL
+// on screen and 17 in the summary, with nothing on the console explaining the
+// difference — and logged SKIP for three REV cases the bundle published as FAIL.
+func TestConsoleAndBundleCannotSilentlyDisagree(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewReporter(&buf)
+	cat := loadTestCatalog(t)
+	c, _ := cat.ByUID("doc-a::A-001")
+
+	r.ExecutionBanner()
+	if out := buf.String(); !strings.Contains(out, "PROVISIONAL") {
+		t.Errorf("the execution banner must say the case lines are provisional:\n%s", out)
+	}
+
+	// Printed provisionally as PASS...
+	r.Case(CaseResult{Case: c, Verdict: Pass, Notes: "the socket saw a clean exchange"})
+	// ...and the citation phase makes it a FAIL.
+	rep := &RunReport{Cases: []CaseResult{{
+		Case: c, Verdict: Fail, Executed: true, LiveVerdict: Pass,
+		Reconciled: "the live phase declared PASS from what the socket saw; the citation phase re-derived " +
+			"the criteria from the capture and the case is FAIL.",
+	}}}
+	r.Reconcile(rep)
+
+	out := buf.String()
+	if !strings.Contains(out, "VERDICT RECONCILIATION") {
+		t.Fatalf("a verdict that moved after the citation phase was not reported:\n%s", out)
+	}
+	if !strings.Contains(out, "doc-a::A-001") {
+		t.Errorf("the reconciliation does not name the case:\n%s", out)
+	}
+	if !strings.Contains(out, "✓ PASS") || !strings.Contains(out, "✗ FAIL") {
+		t.Errorf("the reconciliation must show BOTH verdicts, or it explains nothing:\n%s", out)
+	}
+}
+
+// TestReconcileIsSilentWhenNothingMoved: the block is a signal, and a signal
+// that appears on every run is not one.
+func TestReconcileIsSilentWhenNothingMoved(t *testing.T) {
+	var buf bytes.Buffer
+	r := NewReporter(&buf)
+	cat := loadTestCatalog(t)
+	c, _ := cat.ByUID("doc-a::A-001")
+	r.Case(CaseResult{Case: c, Verdict: Pass})
+	before := buf.Len()
+	r.Reconcile(&RunReport{Cases: []CaseResult{{Case: c, Verdict: Pass, Executed: true, LiveVerdict: Pass}}})
+	if buf.Len() != before {
+		t.Errorf("Reconcile printed something when no verdict moved:\n%s", buf.String()[before:])
+	}
+}
