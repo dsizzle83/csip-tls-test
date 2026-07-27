@@ -52,6 +52,23 @@ func (b *Bundle) Report() string {
 	row("Key log", b.Files.KeyLog)
 	fmt.Fprintf(&sb, "\n")
 
+	// A bundle carrying a key log carries REAL TLS session secrets. That is
+	// deliberate and necessary — an assessor cannot re-derive an
+	// application-layer citation from an encrypted capture without them, which is
+	// the whole reason the key log is in the manifest. But it also means handing
+	// someone the bundle hands them the ability to decrypt every session in it,
+	// and nothing else in this report said so. State it where it cannot be
+	// missed, rather than leaving it to be inferred from a filename.
+	if b.Files.KeyLog != "" {
+		fmt.Fprintf(&sb, "> **This bundle contains TLS session secrets.** `%s` is an NSS key log for the\n"+
+			"> capture above: anyone holding this directory can decrypt every session it\n"+
+			"> records. It is included on purpose — the application-layer citations below\n"+
+			"> cannot be re-derived without it — and it is covered by the manifest, so it\n"+
+			"> cannot be quietly dropped either. Treat the bundle as sensitive: share it\n"+
+			"> with an assessor, not publicly. The secrets are per-session and grant no\n"+
+			"> lasting access to the device.\n\n", b.Files.KeyLog)
+	}
+
 	if b.Run.Note != "" {
 		fmt.Fprintf(&sb, "> %s\n\n", strings.ReplaceAll(b.Run.Note, "\n", "\n> "))
 	}

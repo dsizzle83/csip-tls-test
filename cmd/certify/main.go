@@ -297,6 +297,10 @@ func (c *cli) runCampaign(stdout, stderr io.Writer) int {
 	// The key log must be opened BEFORE any TLS session, and a -keylog this
 	// binary cannot honour is a hard error: see the package doc.
 	if c.opts.KeyLogPath != "" {
+		if err := keylogOutsideBundle(c.opts.KeyLogPath, c.opts.OutDir); err != nil {
+			fatal(stderr, err)
+			return exitUsage
+		}
 		if err := openKeylog(c.opts.KeyLogPath); err != nil {
 			fatal(stderr, err)
 			return exitUsage
