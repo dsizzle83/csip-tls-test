@@ -6,6 +6,7 @@
         start-server conformance-pi \
         test test-fast test-integration test-update-golden test-southbound test-evidence qa qa-bench fuzz \
         diff test-diff \
+        build-gw-campaign qa-campaign qa-campaign-teeth qa-campaign-bench test-campaign \
         sweep-sunspec \
         modsim-image modsim-run modsim-stop \
         gen-test-certs gen-comm004-certs gen-client-cert gen-ev-cert gen-mbaps-certs gen-mbaps-leaves smoke-pi clean help \
@@ -80,6 +81,86 @@ build-aggregator:
 build-gw-mayhem:
 	@mkdir -p bin
 	go build -o bin/gw-mayhem ./cmd/gw-mayhem
+
+# gw-campaign: THE CONTINUOUS ADVERSARY (lexa-gw docs/ADVERSARIAL_QA_STRATEGY.md
+# §4). It picks fault layers on a seed, applies them CONCURRENTLY on a recorded
+# schedule, checks all ten invariants throughout, shrinks any violation to its
+# minimal reproducer, and writes an evidence bundle. cgo (internal/aggregator ->
+# internal/mbtls, plus the loopback SERVER for -loopback), so it carries the
+# wolfSSL sysroot env like build-gw-mayhem.
+build-gw-campaign:
+	@mkdir -p bin
+	go build -o bin/gw-campaign ./cmd/gw-campaign
+
+# The habitual hermetic campaign: no bench, no network, ~1 minute. Safe to run
+# while the bench is in use by someone else — it stands up its own loopback
+# gateway and its own device in-process and touches nothing outside them.
+#
+# SEED=0 (the default) draws a seed from the clock and PRINTS it, so a failure
+# is reproducible with `make qa-campaign SEED=<the number it printed>`.
+#
+# Shrinking is OFF here and ON in qa-campaign-teeth. A shrink costs one full
+# campaign per attempt, so a clean run should not pay for a mechanism it will
+# not use; the moment a violation appears, re-run with SHRINK=true.
+SEED     ?= 0
+WINDOW   ?= 60s
+CADENCE  ?= 5s
+ACTIONS  ?= 10
+SHRINK   ?= false
+CAMPAIGN_ARGS ?=
+qa-campaign: build-gw-campaign
+	./bin/gw-campaign -loopback -pki certs/mbaps \
+	  -seed $(SEED) -window $(WINDOW) -cadence $(CADENCE) -actions $(ACTIONS) \
+	  -shrink=$(SHRINK) $(CAMPAIGN_ARGS)
+
+# THE TEETH RUN, and the reason the suite is worth anything.
+#
+# It stands up a DELIBERATELY NON-CONFORMANT loopback — one that lets a
+# read-only credential write, which is Secure SunSpec RBAC-009 — and asserts
+# that the campaign CATCHES it. A run that comes back clean here is a GATE
+# FAILURE: it means the harness cannot see the defect it was aimed at, and every
+# green qa-campaign is then worth nothing.
+#
+# It also shrinks, and the shrink is part of the proof: the minimal reproducer
+# must come back as the single read-only write probe. A "minimal" set of eight
+# actions would mean the shrinker is not working even though the detection is.
+#
+# Budget it: each shrink attempt is a full campaign, so the run costs roughly
+# (1 + SHRINK_BUDGET) x WINDOW. The defaults here are sized for a few minutes.
+TEETH_WINDOW ?= 30s
+SHRINK_BUDGET ?= 10
+qa-campaign-teeth: build-gw-campaign
+	./bin/gw-campaign -loopback -teeth -pki certs/mbaps \
+	  -seed $(SEED) -window $(TEETH_WINDOW) -cadence 4s -actions 8 \
+	  -shrink-budget $(SHRINK_BUDGET) $(CAMPAIGN_ARGS)
+
+# The live campaign against the bench gateway. READ-ONLY with respect to the
+# gateway: faults go into the SIMS and the head-end and the network, never into
+# the DUT's configuration or services. It never restarts, reboots or deploys
+# anything.
+#
+# THE BENCH IS SHARED. Keep it bounded and serialize with whoever else is on it.
+# Point GW_SSH at the board only if you want I8's disk arm; without it I8 skips
+# that arm with a reason, which is the honest default.
+BENCH_TARGET   ?= 69.0.0.2:802
+GRIDSIM_ADMIN  ?= http://127.0.0.1:11114
+INV_PLAIN      ?= http://127.0.0.1:6020
+INV_SECURE     ?= http://127.0.0.1:6031
+GW_SSH         ?=
+BENCH_WINDOW   ?= 3m
+qa-campaign-bench: build-gw-campaign
+	./bin/gw-campaign -target $(BENCH_TARGET) -pki certs/mbaps \
+	  -gridsim-admin $(GRIDSIM_ADMIN) -inv-plain $(INV_PLAIN) -inv-secure $(INV_SECURE) \
+	  $(if $(GW_SSH),-gw-ssh $(GW_SSH),) \
+	  -seed $(SEED) -window $(BENCH_WINDOW) -cadence 10s -actions $(ACTIONS) \
+	  -shrink=$(SHRINK) $(CAMPAIGN_ARGS)
+
+# The campaign engine's own regression gate: the scheduler is a pure function of
+# the seed, a subset re-plan preserves timing, the shrinker converges on a
+# two-action interaction, and the honesty floor refuses a run that armed
+# nothing. No bench, no network, no loopback — pure Go, seconds.
+test-campaign:
+	go test -race -count=1 ./internal/campaign/... ./internal/invariant/...
 
 # ssm-conformance: the Secure SunSpec Modbus 62-requirement conformance walker
 # (SunSpecTCP-1..62). cgo (drives the bench's own internal/mbtls client), so it

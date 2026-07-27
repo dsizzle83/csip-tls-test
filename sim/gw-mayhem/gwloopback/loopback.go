@@ -144,6 +144,24 @@ func StartLoopbackWriteRoles(serverProfile mbtls.Profile, sessionCap int, writeR
 // Addr is the loopback's listen address.
 func (s *LoopbackServer) Addr() string { return s.lis.Addr().String() }
 
+// Device is the SunSpec device the loopback serves — its register bank, its
+// fault surface, and its animation control.
+//
+// It is exported for the invariant campaign (internal/campaign), which needs
+// the SAME physical device to be visible through TWO independent channels: the
+// loopback's mbaps projection of it (what the DUT claims) and the device's own
+// register image (ground truth). Handing back the device is what makes a
+// hermetic campaign a coherent world rather than two unrelated ones — a lie
+// armed here intercepts the writes that arrive over :802, because this sim's
+// own OnWriteAttempt hooks sit under the loopback's write path.
+//
+// Nothing in the gw-mayhem SUITE uses it, and nothing should: a scenario that
+// reached past the mbaps wire into the peer's internals would stop being a
+// black-box test. The campaign's use is different in kind — it is STANDING UP
+// the bench, not judging with it. Everything the campaign judges with still
+// arrives over a wire or a sidecar.
+func (s *LoopbackServer) Device() *sim.SolarServer { return s.srv }
+
 // IdentityRefusals is how many sessions this loopback refused because it could not
 // establish the peer's identity. It must be 0 in a healthy run; a non-zero count
 // means some scenario's verdict was reached without the loopback knowing who was
