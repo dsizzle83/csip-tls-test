@@ -7,9 +7,11 @@ package gwmayhem
 // pure function that a unit test can pin exhaustively.
 
 import (
+	"strings"
 	"testing"
 
 	"csip-tls-test/internal/aggregator"
+	"csip-tls-test/internal/invariant"
 )
 
 func cell(role string, op opClass, exp grant, outcome string, code uint8, wrote bool) authzCell {
@@ -358,6 +360,116 @@ func TestDiagnoseCampaignPassthrough(t *testing.T) {
 	}
 	if got, _ := diagnoseCampaign(&gwEvidence{SetupErr: "no connect"}); got != VerdictInconclusive {
 		t.Errorf("verdict = %s, want INCONCLUSIVE", got)
+	}
+}
+
+// lieOut builds a lying-device outcome that is entitled to a verdict — armed,
+// observed, and with the assertion floor satisfied — so each case below varies
+// exactly one thing.
+func lieOut(mut func(o *lyingDEROutcome)) *gwEvidence {
+	o := &lyingDEROutcome{
+		Lie: "ack_no_apply", Target: "plain", FaultedName: "plain-der",
+		Claim: "a write is not a control", InvariantIDs: []string{"I2", "I7"},
+		Armed: true, Observed: true, Ticks: 4,
+		Summary: &invariant.Summary{
+			Ticks: 4, Asserted: 12,
+			PerInvariant: map[string]invariant.Verdict{"I2": invariant.Pass, "I7": invariant.Pass},
+			OK:           true,
+		},
+	}
+	if mut != nil {
+		mut(o)
+	}
+	return &gwEvidence{LyingDER: o}
+}
+
+// TestDiagnoseLyingDER pins the family-L oracle's decision table. The cases that
+// matter most are the two INCONCLUSIVEs: a run that could not arm its adversary
+// and a run whose invariants all skipped are the two ways this family could
+// quietly become a check that always passes, which is the failure mode the whole
+// suite exists to prevent.
+func TestDiagnoseLyingDER(t *testing.T) {
+	tests := []struct {
+		name string
+		ev   *gwEvidence
+		want Verdict
+	}{
+		{"nothing-recorded", &gwEvidence{}, VerdictInconclusive},
+		{"healthy", lieOut(nil), VerdictPass},
+		{"could-not-arm", lieOut(func(o *lyingDEROutcome) {
+			o.Unavailable = "the plain sim refused the kind (the sim predates the lying-device layer)"
+		}), VerdictInconclusive},
+		{"armed-but-never-observed", lieOut(func(o *lyingDEROutcome) { o.Observed, o.Summary = false, nil }), VerdictInconclusive},
+		{"asserted-nothing", lieOut(func(o *lyingDEROutcome) {
+			o.Summary.Asserted = 0
+			o.Summary.PerInvariant = map[string]invariant.Verdict{"I2": invariant.Skip, "I7": invariant.Skip}
+		}), VerdictInconclusive},
+		{"invariant-violated", lieOut(func(o *lyingDEROutcome) {
+			o.Summary.Violations = []invariant.Violation{{
+				ID: "I2", Statement: "the DER converges to the configured state", Verdict: invariant.Fail,
+				Reason: "the commanded 37 % never appeared in the device's own register bank across 4 ticks",
+				Facts:  []invariant.Fact{{Key: "I2.commanded", Value: "37", Unit: "%", Source: "ledger"}},
+			}}
+			o.Summary.OK = false
+		}), VerdictFail},
+		{"warn-is-degraded", lieOut(func(o *lyingDEROutcome) {
+			o.Summary.Violations = []invariant.Violation{{
+				ID: "I7", Statement: "no status claims something that did not happen", Verdict: invariant.Warn,
+				Reason: "the control is staged but not applied",
+			}}
+		}), VerdictDegraded},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, findings := diagnoseLyingDER(tc.ev)
+			if got != tc.want {
+				t.Errorf("verdict = %s, want %s (findings: %v)", got, tc.want, findings)
+			}
+			if len(findings) == 0 {
+				t.Error("an oracle must never return a verdict with no finding explaining it")
+			}
+		})
+	}
+}
+
+// TestDiagnoseLyingDER_NeverPassesOnAnUnarmedAdversary is the teeth: the oracle
+// must be UNABLE to print a pass for a run in which the gateway was never lied
+// to. It is asserted against a summary that is otherwise perfect, because that
+// is exactly the shape a broken arm produces — every invariant looked at a
+// healthy bench and was delighted.
+func TestDiagnoseLyingDER_NeverPassesOnAnUnarmedAdversary(t *testing.T) {
+	for _, broken := range []func(o *lyingDEROutcome){
+		func(o *lyingDEROutcome) { o.Unavailable = "sim without -mangle" },
+		func(o *lyingDEROutcome) { o.Armed = false },
+		func(o *lyingDEROutcome) { o.Summary = nil },
+		func(o *lyingDEROutcome) { o.Ticks, o.Observed = 0, false },
+		func(o *lyingDEROutcome) { o.Summary.Asserted = 0 },
+	} {
+		got, findings := diagnoseLyingDER(lieOut(broken))
+		if got == VerdictPass {
+			t.Errorf("a run that never exercised its adversary was scored PASS: %v", findings)
+		}
+	}
+}
+
+// TestDiagnoseLyingDER_AttributesAPreExistingFailure guards the report against
+// the subtler dishonesty: a violation that was already firing before the lie was
+// armed is still a P1, but it is not evidence about this fault, and the finding
+// has to say so or the fault gets credit for someone else's bug.
+func TestDiagnoseLyingDER_AttributesAPreExistingFailure(t *testing.T) {
+	ev := lieOut(func(o *lyingDEROutcome) {
+		o.BaselineWorst = string(invariant.Fail)
+		o.Summary.Violations = []invariant.Violation{{
+			ID: "I2", Statement: "converges", Verdict: invariant.Fail, Reason: "did not converge",
+		}}
+	})
+	got, findings := diagnoseLyingDER(ev)
+	if got != VerdictFail {
+		t.Fatalf("verdict = %s, want FAIL — a failing safety invariant fails the run whenever it started", got)
+	}
+	joined := strings.Join(findings, "\n")
+	if !strings.Contains(joined, "BEFORE the lie was armed") {
+		t.Errorf("the report does not flag that the violation predates the fault:\n%s", joined)
 	}
 }
 

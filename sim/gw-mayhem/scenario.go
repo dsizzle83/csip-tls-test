@@ -24,6 +24,7 @@ import (
 	"context"
 
 	"csip-tls-test/internal/aggregator"
+	"csip-tls-test/internal/invariant"
 )
 
 // Verdict is the shared five-value verdict vocabulary — re-exported from the
@@ -165,6 +166,57 @@ type gwEvidence struct {
 	// DER's telemetry (701) masks to the not-implemented sentinel while its commanded
 	// control echo (704) survives, and the DER recovers on clear.
 	CommLossMask *commLossMaskOutcome `json:"comm_loss_mask,omitempty"` // comm-loss sentinel-mask + control-echo-survival (G5)
+
+	// Lying-southbound-device family (strategy §L4). Where family B faults a DER
+	// in ways it cannot hide, family L arms a DER that answers promptly, in
+	// range and FALSELY, and hands the verdict to internal/invariant — the
+	// scenario creates the conditions, the invariants decide.
+	LyingDER *lyingDEROutcome `json:"lying_der,omitempty"` // the lying southbound device (family L)
+}
+
+// lyingDEROutcome is the sampled evidence of a lying-southbound-device scenario
+// (family L). Unlike every other outcome in this file it carries almost no
+// judgement of its own: the verdict lives in Summary, the internal/invariant
+// Monitor's finding across the hold. What the struct adds is the CONTEXT a
+// reader needs in order to know whether that summary means anything — whether
+// the lie could be armed at all, whether a control write was actually issued
+// (three invariants judge attempts rather than state, and SKIP without one),
+// and what the world looked like BEFORE the lie, so an invariant that was
+// already failing is not mistaken for this scenario's finding.
+type lyingDEROutcome struct {
+	Lie          string   `json:"lie"`           // the fault kind armed
+	Target       string   `json:"target"`        // "plain" | "secure"
+	Claim        string   `json:"claim"`         // the oracle contract, printed beside the verdict
+	InvariantIDs []string `json:"invariant_ids"` // the internal/invariant checks that judge this scenario
+	Wire         bool     `json:"wire,omitempty"`
+
+	FaultedName string `json:"faulted_name,omitempty"`
+	HealthyName string `json:"healthy_name,omitempty"`
+
+	// Unavailable, when non-empty, names why the adversary could NOT be armed
+	// (a sim predating the lying-device layer, or a framing lie on a sim started
+	// without -mangle). It is always INCONCLUSIVE: a run that never armed its
+	// adversary has shown the gateway nothing, and must never print a pass.
+	Unavailable string `json:"unavailable,omitempty"`
+	Armed       bool   `json:"armed"`
+	Observed    bool   `json:"observed"`
+	Ticks       int    `json:"ticks"`
+
+	// BaselineWorst is the worst verdict any of this scenario's invariants
+	// returned on the tick taken BEFORE the lie was armed.
+	BaselineWorst string `json:"baseline_worst,omitempty"`
+
+	// The control write, when the scenario drives one. I3, I4's shape arm and I5
+	// judge ATTEMPTS, so a scenario that made none gets a SKIP naming that
+	// rather than a free pass.
+	Commanded      bool    `json:"commanded,omitempty"`
+	CommandedPct   float64 `json:"commanded_pct,omitempty"`
+	CommandRefused bool    `json:"command_refused,omitempty"`
+
+	// Summary is the invariant Monitor's finding — the verdict itself.
+	Summary *invariant.Summary `json:"summary,omitempty"`
+
+	Note string `json:"note,omitempty"`
 }
 
 // perfectStormOutcome is the sampled evidence of the perfect-storm compound-fault

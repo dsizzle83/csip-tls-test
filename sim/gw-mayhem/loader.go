@@ -44,6 +44,11 @@ func goScenarios() []gwScenario {
 	// northbound :802 view: an offline DER's telemetry (701) must mask to the sentinel
 	// while its commanded 704 control echo survives (the maskOffline invariant).
 	out = append(out, commLossMaskScenarios()...)
+	// Lying-southbound-device family (strategy §L4) — a DER that answers
+	// promptly, in range and FALSELY. Family B faults a device in ways it cannot
+	// hide; family L is the half that produces SILENT wrong control, and it hands
+	// its verdict to internal/invariant rather than judging for itself.
+	out = append(out, lyingDERScenarios()...)
 	return out
 }
 

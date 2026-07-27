@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"csip-tls-test/internal/invariant"
 )
 
 // gwOracle judges a finished scenario's sampled state.
@@ -33,6 +35,7 @@ var oracleRegistry = map[string]gwOracle{
 	"commLossMask":        diagnoseCommLossMask,
 	"controlLoop":         diagnoseControlLoop,
 	"authorityPKI":        diagnoseAuthorityPKI,
+	"lyingDER":            diagnoseLyingDER,
 }
 
 // registeredOracles lists oracle names (sorted) for error messages.
@@ -607,6 +610,144 @@ func diagnoseCampaign(ev *gwEvidence) (Verdict, []string) {
 		return VerdictInconclusive, []string{setupOrEmpty(ev, "spec campaign produced no report")}
 	}
 	return ev.Campaign.Verdict, ev.Campaign.Findings
+}
+
+// diagnoseLyingDER judges a lying-southbound-device scenario (family L). It is
+// the thinnest oracle in this file on purpose: it does not decide whether the
+// gateway behaved correctly, because internal/invariant already did. What it
+// does is decide whether the run is ENTITLED to a verdict at all, and then
+// translate the invariant Summary into the gw-mayhem vocabulary.
+//
+// That division exists so there is exactly one definition of gateway safety in
+// the suite. A bespoke per-fault assertion here would be a second, weaker set of
+// safety properties maintained alongside the real one, and the first time the
+// two disagreed someone would have to decide which was authoritative. There is
+// one answer and it is internal/invariant.
+//
+// INCONCLUSIVE, never a pass, when:
+//   - the adversary could not be armed (a sim predating the lying-device layer,
+//     or a framing lie on a sim started without -mangle) — a run that never lied
+//     to the gateway has shown the gateway nothing;
+//   - nothing was observed, or the monitor asserted nothing. Summary.Asserted is
+//     the invariant harness's own assertion floor and it is honoured here: a run
+//     whose every check SKIPped has proved no property, and printing PASS for it
+//     would be the precise dishonesty this suite exists to remove.
+//
+// FAIL on any invariant violation, which is always a P1. A violation that was
+// ALREADY present on the baseline tick — taken before the lie was armed — still
+// fails, because a failing safety invariant is a failing safety invariant, but
+// the finding says so, so nobody attributes a pre-existing defect to this fault.
+//
+// DEGRADED on a WARN: the invariant saw something it could not call a violation
+// (a staged-but-unapplied control, a checker that erred). Worth a human, not
+// worth blocking a gate.
+func diagnoseLyingDER(ev *gwEvidence) (Verdict, []string) {
+	o := ev.LyingDER
+	if o == nil {
+		return VerdictInconclusive, []string{setupOrEmpty(ev, "the lying-device scenario recorded no outcome")}
+	}
+	head := fmt.Sprintf("lying southbound device: %s armed on the %s DER (%s); judged by %s",
+		o.Lie, o.Target, orNone(o.FaultedName), strings.Join(o.InvariantIDs, ", "))
+
+	if o.Unavailable != "" {
+		return VerdictInconclusive, []string{head, "INCONCLUSIVE the adversary was never armed: " + o.Unavailable}
+	}
+	if !o.Armed || !o.Observed || o.Summary == nil {
+		return VerdictInconclusive, []string{head, setupOrEmpty(ev, "the lie was armed but the world was never observed")}
+	}
+	sum := *o.Summary
+	if sum.Asserted == 0 {
+		return VerdictInconclusive, []string{head, fmt.Sprintf(
+			"INCONCLUSIVE %d tick(s) ran and NOT ONE sub-claim was evaluated — every invariant skipped, so this run "+
+				"asserted nothing about the gateway (%s)", o.Ticks, orNone(sum.Why))}
+	}
+
+	findings := []string{head, o.Claim}
+	if o.Commanded {
+		what := "accepted"
+		if o.CommandRefused {
+			what = "REFUSED by the gateway"
+		}
+		findings = append(findings, fmt.Sprintf("     drove a distinctive %s curtailment through :802 (%s) — "+
+			"the ledger entry I3/I4 need to judge an attempt rather than a state", pctStr(o.CommandedPct), what))
+	}
+	findings = append(findings, fmt.Sprintf("     %d tick(s), %d sub-claim(s) evaluated across the hold and the recovery",
+		o.Ticks, sum.Asserted))
+
+	verdict := VerdictPass
+	for _, v := range sum.Violations {
+		tag := "FAIL"
+		vv := VerdictFail
+		if v.Verdict == invariant.Warn {
+			tag, vv = "WARN", VerdictDegraded
+		}
+		findings = append(findings, fmt.Sprintf("%s %s %s — %s", tag, v.ID, v.Statement, v.Reason))
+		for _, f := range v.Facts {
+			findings = append(findings, "       "+factLine(f))
+		}
+		if repeats := sum.Repeats[v.Signature()]; repeats > 1 {
+			findings = append(findings, fmt.Sprintf("       recurred on %d ticks — not a one-sample artefact", repeats))
+		}
+		verdict = worse(verdict, vv)
+	}
+
+	// Attribution: a violation already present BEFORE the lie was armed is a real
+	// finding but not this scenario's finding, and the report must not let the
+	// two be confused.
+	if verdict == VerdictFail && (o.BaselineWorst == string(invariant.Fail) || o.BaselineWorst == string(invariant.Warn)) {
+		findings = append(findings, fmt.Sprintf("     NOTE the baseline tick taken BEFORE the lie was armed already read %s — "+
+			"this violation is not necessarily attributable to %s", o.BaselineWorst, o.Lie))
+	}
+
+	// Every invariant this scenario named, including the ones that skipped: a
+	// reader has to be able to see which of the claims actually got exercised.
+	for _, id := range o.InvariantIDs {
+		if v, ok := sum.PerInvariant[id]; ok && (v == invariant.Pass || v == invariant.Skip) {
+			findings = append(findings, fmt.Sprintf("     %s %s%s", id, v, invReason(sum, id)))
+		}
+	}
+	if verdict == VerdictPass {
+		findings = append(findings, "ok   the gateway noticed, refused to report success it could not back, and converged")
+	}
+	if o.Note != "" {
+		findings = append(findings, "     "+o.Note)
+	}
+	return verdict, findings
+}
+
+// factLine renders one invariant Fact for a human-readable finding. The unit is
+// printed whenever there is one, because a bare number is how the defect class
+// I1 exists to catch got into production in the first place.
+func factLine(f invariant.Fact) string {
+	s := f.Key + " = " + f.Value
+	if f.Unit != "" {
+		s += " " + f.Unit
+	}
+	if f.Source != "" {
+		s += "  [" + f.Source + "]"
+	}
+	return s
+}
+
+// invReason finds a one-line reason for a non-failing invariant, so a SKIP in
+// the report always says WHY it skipped. A SKIP with no reason is indistinguish-
+// able from a check that was never wired up.
+func invReason(sum invariant.Summary, id string) string {
+	for _, v := range sum.Violations {
+		if v.ID == id && v.Reason != "" {
+			return " — " + v.Reason
+		}
+	}
+	return ""
+}
+
+// orNone renders an empty string as an explicit "(none)" rather than a blank a
+// reader would mistake for a formatting bug.
+func orNone(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	return s
 }
 
 // setupOrEmpty returns the arm-time setup error if there was one (the real reason
