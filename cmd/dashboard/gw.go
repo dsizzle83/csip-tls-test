@@ -284,14 +284,14 @@ func parseGWBoard(raw []byte) (*gwBoard, error) {
 
 // gwRun is the state of one live gw-mayhem run.
 type gwRun struct {
-	Mode      string     `json:"mode"`  // "quick" | "full"
-	State     string     `json:"state"` // "running" | "done" | "error"
-	StartedAt string     `json:"started_at"`
-	Err       string     `json:"error,omitempty"`
-	Lines     []string   `json:"lines"`             // per-scenario verdict lines, streamed as they land
-	Board     *gwBoard   `json:"board,omitempty"`   // populated on completion
+	Mode      string             `json:"mode"`  // "quick" | "full"
+	State     string             `json:"state"` // "running" | "done" | "error"
+	StartedAt string             `json:"started_at"`
+	Err       string             `json:"error,omitempty"`
+	Lines     []string           `json:"lines"`           // per-scenario verdict lines, streamed as they land
+	Board     *gwBoard           `json:"board,omitempty"` // populated on completion
 	cancel    context.CancelFunc `json:"-"`
-	outPath   string     `json:"-"`
+	outPath   string             `json:"-"`
 }
 
 // quickProofIDs is the curated fast set for the "Run live proof" button: the

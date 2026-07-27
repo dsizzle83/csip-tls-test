@@ -71,6 +71,9 @@ type Violation struct {
 	Faults ManifestSnapshot `json:"faults"`
 	// Assertions are the citable claims for the bundle.
 	Assertions []bundle.Assertion `json:"assertions,omitempty"`
+	// Key is the checker's own identity for the violation, when it supplied one.
+	// See Result.Key and Signature.
+	Key string `json:"key,omitempty"`
 	// Resolved marks a violation produced by Finalize from a claim that was
 	// still Pending when the run ended, and says so.
 	Resolved string `json:"resolved,omitempty"`
@@ -80,9 +83,24 @@ type Violation struct {
 // timestamps and tick numbers. Two runs that hit the same defect produce the
 // same signature, which is what lets a shrinker decide whether a reduced fault
 // set still reproduces the original finding.
+//
+// When the checker supplied a [Result.Key], that IS the identity and nothing
+// else enters the hash. A checker that names its own violation identity is
+// stating something the harness cannot infer: which of the facts are the defect
+// and which are corroboration that a chaos campaign will make come and go.
+//
+// Without a Key the fallback hashes the facts, which is right whenever a
+// violation's facts are a fixed description of one thing (I1's device, point
+// and rating; I6's file and offset) and wrong whenever they are not. The
+// fallback is the default because it is safe in the direction that matters: it
+// over-reports distinct findings rather than merging two real defects into one.
 func (v Violation) Signature() string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s\n", v.ID)
+	if v.Key != "" {
+		fmt.Fprintf(h, "key=%s\n", v.Key)
+		return hex.EncodeToString(h.Sum(nil))[:16]
+	}
 	keys := make([]string, 0, len(v.Facts))
 	byKey := make(map[string]string, len(v.Facts))
 	for _, f := range v.Facts {
@@ -91,7 +109,9 @@ func (v Violation) Signature() string {
 		if strings.HasSuffix(f.Key, "_at") || f.Unit == "s" {
 			continue
 		}
-		keys = append(keys, f.Key)
+		if _, dup := byKey[f.Key]; !dup {
+			keys = append(keys, f.Key)
+		}
 		byKey[f.Key] = f.Value + "\x00" + f.Unit
 	}
 	sort.Strings(keys)
@@ -315,6 +335,7 @@ func (m *Monitor) record(inv Invariant, res Result, tr *TickResult, obs *Observa
 		Tick:       tr.Tick,
 		Reason:     res.Reason,
 		Facts:      res.Facts,
+		Key:        res.Key,
 		Faults:     obs.Faults,
 		Assertions: res.Assertions,
 	}
@@ -423,6 +444,7 @@ func (m *Monitor) Finalize() Summary {
 			Tick:       at.Tick,
 			Reason:     res.Reason,
 			Facts:      res.Facts,
+			Key:        res.Key,
 			Assertions: res.Assertions,
 			Resolved: "the claim was still undecided when the run ended; an outstanding claim that never " +
 				"resolved is a failure, and no promptness threshold had to be invented to say so",

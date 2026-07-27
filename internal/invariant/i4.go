@@ -97,6 +97,14 @@ func (i *i4) Check(ctx context.Context, w *World) (Result, error) {
 			F("i4.accepted.target", "", "ledger", "unit %d model %d point %s", r.Unit, r.Model, r.Point),
 			F("i4.accepted.value", string(r.Value.Unit), "ledger", "%s", trimFloat(r.Value.Val)),
 		)
+		// The identity of this violation is the credential and the register it
+		// was allowed to write — NOT the facts, which grow and shrink as the
+		// campaign perturbs the world. Whether the commanded value is still
+		// visible downstream on any given tick is corroboration; the defect is
+		// the same defect either way. See Result.Key.
+		if res.Key == "" {
+			res.Key = fmt.Sprintf("accepted:%s:%d:%d:%s", r.Credential, r.Unit, r.Model, r.Point)
+		}
 		if res.Reason == "" {
 			res.Reason = fmt.Sprintf("credential %q (role %s) has no write authorization but write#%d was ACCEPTED "+
 				"on unit %d point %s", r.Credential, r.Role, r.Seq, r.Unit, r.Point)
@@ -122,12 +130,21 @@ func (i *i4) Check(ctx context.Context, w *World) (Result, error) {
 				continue
 			}
 			res.Verdict = Fail
+			// The witness is part of the KEY, not just the value. Three
+			// witnesses observing the same leak used to emit three facts under
+			// the same three keys, so two of them were silently discarded when
+			// the signature folded the fact list into a map — and a reader of
+			// the violation could not tell which witness had seen what.
+			w := v.Label
 			res.Facts = append(res.Facts,
-				F("i4.leaked.seq", "", "ledger", "%d", r.Seq),
-				F("i4.leaked.credential", "", "ledger", "%s", r.Credential),
-				F("i4.leaked.witness", "", v.Source, "%s", v.Label),
-				F("i4.leaked.value", string(cmd.Raw.Unit), v.Source, "%s", trimFloat(cmd.Raw.Val)),
+				F("i4.leaked."+w+".seq", "", "ledger", "%d", r.Seq),
+				F("i4.leaked."+w+".credential", "", "ledger", "%s", r.Credential),
+				F("i4.leaked."+w+".witness", "", v.Source, "%s", v.Label),
+				F("i4.leaked."+w+".value", string(cmd.Raw.Unit), v.Source, "%s", trimFloat(cmd.Raw.Val)),
 			)
+			if res.Key == "" {
+				res.Key = fmt.Sprintf("leaked:%s:%s:%s", r.Credential, r.Point, v.Label)
+			}
 			if res.Reason == "" {
 				res.Reason = fmt.Sprintf("credential %q was denied write#%d, but its distinctive value %s "+
 					"is now present at %s — the write happened by some other path",

@@ -145,6 +145,24 @@ type Result struct {
 	// with Checked == 0 asserted nothing and Validate rejects it, for the same
 	// reason gw-mayhem grew an assertion floor in wave 1.
 	Checked int `json:"checked"`
+	// Key is the checker's own statement of WHAT MAKES TWO VIOLATIONS THE SAME
+	// VIOLATION — e.g. "accepted:ReadOnlySunSpec:1:WMaxLimPct". It is optional,
+	// and when it is absent [Violation.Signature] falls back to hashing the
+	// facts.
+	//
+	// It exists because the fallback is not always right, and the first teeth
+	// run demonstrated how. I4 caught one defect — a read-only credential whose
+	// write was accepted — and reported it as TWO distinct findings, because on
+	// the first tick the commanded value was still visible at the DER (adding
+	// four corroborating facts) and on a later tick a reboot_forget fault had
+	// wiped it (removing them). Same defect, same credential, same register;
+	// different fact set, therefore different hash, therefore two signatures —
+	// and the shrinker dutifully spent two full budgets chasing one bug.
+	//
+	// Corroboration that comes and goes as the campaign perturbs the world is
+	// the NORMAL case, not an edge case, so a checker whose violation has a
+	// stable identity should say what it is rather than let the hash guess.
+	Key string `json:"key,omitempty"`
 }
 
 // Validate enforces the honesty rules a Result must satisfy before it may be

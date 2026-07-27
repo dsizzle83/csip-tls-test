@@ -374,6 +374,120 @@ func TestI9_PassesWhenTheChannelCameBack(t *testing.T) {
 	}
 }
 
+// TestI9_UnobservableChannelSkipsRatherThanFails is the counterpart to the
+// pending-resolves-to-FAIL case above, and it exists because the first live
+// campaign found the bug it guards: a DER that publishes no request counter has
+// no witness for its own recovery, and I9 reported that blindness as a P1
+// against the device.
+//
+// The two states are one field apart in the observation and worlds apart in
+// meaning. A counter stuck at 900 says "the DUT stopped talking to me". No
+// counter at all says "I have no way to tell". Only the first is a finding, and
+// an invariant that cannot tell them apart fails an innocent device every time
+// the bench is wired without a sidecar counter — which is precisely how a P1
+// gate comes to be switched off.
+func TestI9_UnobservableChannelSkipsRatherThanFails(t *testing.T) {
+	t.Parallel()
+	faults := NewManifest("teeth", 99)
+	cleared := time.Now().Add(-15 * time.Minute)
+	id := faults.Arm(Fault{Kind: "ack_no_apply", Class: ClassPeerLie, Target: "inv",
+		Armed: time.Now().Add(-20 * time.Minute), Recoverable: true})
+	faults.Clear(id, cleared)
+
+	w := NewWorld(Sources{}, faults, nil, DefaultParams())
+	for i := 0; i < 3; i++ {
+		// Reachable, readable, animating — and NO request counter. Everything
+		// about this device is healthy except our ability to witness its poll
+		// traffic.
+		d := DERView{Name: "inv", Source: "simapi:test", Reachable: true,
+			Unit: unitFixture(1, nil), HasPollCount: false}
+		w.Inject(obsFixture(cleared.Add(time.Duration(i+1)*time.Minute), d))
+	}
+	res, err := NewI9(DefaultParams()).Check(context.Background(), w)
+	if err != nil {
+		t.Fatalf("I9 error: %v", err)
+	}
+	if res.Verdict != Skip {
+		t.Fatalf("I9 = %s (%s), want SKIP: the device publishes no request counter, so its recovery cannot "+
+			"be witnessed — reporting that as a violation blames the device for the harness's blindness",
+			res.Verdict, res.Reason)
+	}
+
+	// And the teeth on the teeth: the SAME shape WITH a counter that never
+	// advances must still be undecided-and-therefore-failing, or this fix would
+	// have quietly disarmed I9 altogether.
+	w2 := NewWorld(Sources{}, faults, nil, DefaultParams())
+	for i := 0; i < 3; i++ {
+		d := DERView{Name: "inv", Source: "simapi:test", Reachable: true,
+			Unit: unitFixture(1, nil), HasPollCount: true, PollRequests: 900}
+		w2.Inject(obsFixture(cleared.Add(time.Duration(i+1)*time.Minute), d))
+	}
+	res2, err := NewI9(DefaultParams()).Check(context.Background(), w2)
+	if err != nil {
+		t.Fatalf("I9 error: %v", err)
+	}
+	if res2.Verdict != Pending {
+		t.Fatalf("I9 = %s (%s), want PENDING: a counter stuck at 900 across the whole post-clear window is a "+
+			"channel that has not recovered, and the run ending in that state is the failure",
+			res2.Verdict, res2.Reason)
+	}
+}
+
+// TestI9_ChannelThatNeverWorkedIsNotAFailureToRecover pins the precondition.
+//
+// A live campaign against the bench produced a confident P1 — "the flood was
+// cleared 45 s ago and the DUT's northbound has not recovered" — from a run
+// whose very first tick, before anything was armed, already could not read the
+// DUT. The gateway had not failed to recover from the flood; it had never been
+// readable by that credential at all. Blaming the adversary for a condition it
+// did not create is exactly the kind of false P1 that gets a gate switched off.
+func TestI9_ChannelThatNeverWorkedIsNotAFailureToRecover(t *testing.T) {
+	t.Parallel()
+	faults := NewManifest("teeth", 99)
+	armed := time.Now().Add(-3 * time.Minute)
+	cleared := time.Now().Add(-1 * time.Minute)
+	id := faults.Arm(Fault{Kind: "session-flood", Class: ClassTransportAbuse, Target: "dut",
+		Armed: armed, Recoverable: true})
+	faults.Clear(id, cleared)
+
+	// The DUT is unreachable at EVERY observation, including the ones before
+	// the fault was armed.
+	blind := NewWorld(Sources{}, faults, nil, DefaultParams())
+	for i := -2; i <= 2; i++ {
+		o := obsFixture(cleared.Add(time.Duration(i)*time.Minute), DERView{Name: "inv", Reachable: false})
+		o.DUT = DUTView{Source: "mbaps:test", Reachable: false, Err: "denied"}
+		blind.Inject(o)
+	}
+	res, err := NewI9(DefaultParams()).Check(context.Background(), blind)
+	if err != nil {
+		t.Fatalf("I9 error: %v", err)
+	}
+	if res.Verdict != Skip {
+		t.Fatalf("I9 = %s (%s), want SKIP: the northbound was never readable in this run, so there is no "+
+			"working state it could have failed to return to", res.Verdict, res.Reason)
+	}
+
+	// The teeth on the teeth: a channel that WAS readable before the fault and
+	// is not after it must still be a violation, or the precondition check has
+	// disarmed the invariant.
+	worked := NewWorld(Sources{}, faults, nil, DefaultParams())
+	for i := -3; i <= 2; i++ {
+		at := cleared.Add(time.Duration(i) * time.Minute)
+		o := obsFixture(at, DERView{Name: "inv", Reachable: false})
+		// Readable before the fault was armed, unreadable ever since.
+		o.DUT = DUTView{Source: "mbaps:test", Reachable: at.Before(armed)}
+		worked.Inject(o)
+	}
+	res2, err := NewI9(DefaultParams()).Check(context.Background(), worked)
+	if err != nil {
+		t.Fatalf("I9 error: %v", err)
+	}
+	if res2.Verdict != Pending {
+		t.Fatalf("I9 = %s (%s), want PENDING: the northbound worked before the fault and has not come back",
+			res2.Verdict, res2.Reason)
+	}
+}
+
 // TestI9_HonoursAnOperatorSuppliedBudget proves that a deadline enters this
 // invariant only when somebody entitled to state one states it.
 func TestI9_HonoursAnOperatorSuppliedBudget(t *testing.T) {

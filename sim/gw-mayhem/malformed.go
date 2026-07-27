@@ -42,12 +42,13 @@ var outOfRangeProbes = []struct {
 	name, point string
 	value       float64
 }{
-	{"out-of-range-wmaxlimpct-150", "WMaxLimPct", 150}, // > [0,100]
-	{"out-of-range-wsetpct-150", "WSetPct", 150},       // > [-100,100]
-	{"out-of-range-wsetpct-neg150", "WSetPct", -150},   // < [-100,100] (signed int16 — a real negative)
-	{"out-of-range-varsetpct-150", "VarSetPct", 150},   // > [-100,100]
+	{"out-of-range-wmaxlimpct-150", "WMaxLimPct", 150},   // > [0,100]
+	{"out-of-range-wsetpct-150", "WSetPct", 150},         // > [-100,100]
+	{"out-of-range-wsetpct-neg150", "WSetPct", -150},     // < [-100,100] (signed int16 — a real negative)
+	{"out-of-range-varsetpct-150", "VarSetPct", 150},     // > [-100,100]
 	{"out-of-range-varsetpct-neg150", "VarSetPct", -150}, // < [-100,100]
 }
+
 // NOTE: no negative-WMaxLimPct probe — WMaxLimPct is an UNSIGNED register (a
 // max-power limit is never negative), so a "-10" never reaches the gateway as a
 // negative (the client encodes it into uint16); the meaningful WMaxLimPct attack
