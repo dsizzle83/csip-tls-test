@@ -187,7 +187,7 @@ func readSlice(r *RegisterMap, base uint16, n int) []uint16 {
 	return regs
 }
 
-// populate701 writes the FULL model 701 block — all 137 registers, including the
+// populate701 writes the FULL model 701 block — all 153 registers, including the
 // optional MnAlrmInfo string past offset 121. The full model is wider than the
 // 125-register Modbus single-read cap, so serving it here deliberately exercises
 // the hub's chunked SunSpec read (lexa-proto sunspec.Reader.readChunked). A real
@@ -196,7 +196,7 @@ func readSlice(r *RegisterMap, base uint16, n int) []uint16 {
 // spec-compliant 701) — do not re-truncate. Measurement values are seeded here
 // and refreshed every tick by advMirror701.
 func populate701(r *RegisterMap, cursor uint16) (base uint16, dataLen int, next uint16) {
-	dataLen = sunspec.L701.Len() // 137: the full model 701 (>125 regs ⇒ forces a chunked read)
+	dataLen = sunspec.L701.Len() // 153: the full model 701 (>125 regs ⇒ forces a chunked read)
 	base, next = writeModelHeader(r, cursor, sunspec.ModelDERMeasureAC, dataLen)
 	regs := make([]uint16, dataLen)
 	v := sunspec.L701.View(regs)

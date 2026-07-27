@@ -321,9 +321,43 @@ func init() {
 	//
 	// Entirely read-only. Mandatory: ID, L, ACType. MnAlrmInfo is a string of
 	// declared size 32, which is what makes L = 153.
+	//
+	// PF/PFL1/PFL2/PFL3 ARE int16 — a DELIBERATE departure from the Source
+	// document named below, and the one place this transcription knowingly
+	// disagrees with a printed spec table.
+	//
+	// DER Information Model Spec v1.2 Table 4 types these four points uint16;
+	// the canonical model definition, model_701.json, types them int16. Device
+	// Information Model Specification v1.4 §5.1 makes the JSON definition the
+	// canonical encoding of a model and the PDF tables a rendering of it, so
+	// the JSON governs the conflict. It is also the only self-consistent
+	// reading: the JSON describes these points as "the sign of power factor
+	// should be the sign of active power", which an unsigned type cannot
+	// express — Table 4 contradicts the text its own model definition ships
+	// with.
+	//
+	// The corroboration is reached WITHOUT consulting derlayout.go, which is
+	// what keeps this a referee rather than an echo: every other power-factor
+	// point transcribed in THIS file is paired with an explicit
+	// over/under-excitation discriminator and is legitimately uint16 — 704's
+	// PFWInj.PF/PFWInj.Ext and its three siblings, and 702's
+	// PFOvrExtRtg/PFUndExtRtg family where the direction is in the name. Model
+	// 701's four have no excitation companion at any offset in this table.
+	// Under Table 4's typing, the family's one AC MEASUREMENT model would be
+	// the only one structurally unable to report direction.
+	//
+	// Consequence for this package's checks: these points' not-implemented
+	// value is 0x8000, not 0xFFFF (PointType.NotImplemented dispatches on the
+	// type recorded here), and a raw word above 0x7FFF is a negative power
+	// factor rather than an out-of-range magnitude. A referee still holding
+	// uint16 here would report a CONFORMING DUT as non-conforming — the
+	// failure mode a referee exists to avoid, in the direction that is hardest
+	// to notice.
 	register(&Model{
 		ID: 701, Name: "DERMeasureAC", L: 153,
-		Source: "SunSpec DER Information Model Specification v1.2 §4 (DERMeasureAC)",
+		Source: "SunSpec DER Information Model Specification v1.2 §4 (DERMeasureAC); " +
+			"PF/PFL1/PFL2/PFL3 per model_701.json, which Device Information Model " +
+			"Specification v1.4 §5.1 makes canonical over Table 4 — see the note above",
 		Points: []Point{
 			mand(r("ID", 0, TypeUint16, "")),
 			mand(r("L", 1, TypeUint16, "")),
@@ -336,7 +370,7 @@ func init() {
 			r("W", 10, TypeInt16, "W_SF"),
 			r("VA", 11, TypeInt16, "VA_SF"),
 			r("Var", 12, TypeInt16, "Var_SF"),
-			r("PF", 13, TypeUint16, "PF_SF"),
+			r("PF", 13, TypeInt16, "PF_SF"),
 			r("A", 14, TypeInt16, "A_SF"),
 			r("LLV", 15, TypeUint16, "V_SF"),
 			r("LNV", 16, TypeUint16, "V_SF"),
@@ -354,7 +388,7 @@ func init() {
 			r("WL1", 41, TypeInt16, "W_SF"),
 			r("VAL1", 42, TypeInt16, "VA_SF"),
 			r("VarL1", 43, TypeInt16, "Var_SF"),
-			r("PFL1", 44, TypeUint16, "PF_SF"),
+			r("PFL1", 44, TypeInt16, "PF_SF"),
 			r("AL1", 45, TypeInt16, "A_SF"),
 			r("VL1L2", 46, TypeUint16, "V_SF"),
 			r("VL1", 47, TypeUint16, "V_SF"),
@@ -365,7 +399,7 @@ func init() {
 			r("WL2", 64, TypeInt16, "W_SF"),
 			r("VAL2", 65, TypeInt16, "VA_SF"),
 			r("VarL2", 66, TypeInt16, "Var_SF"),
-			r("PFL2", 67, TypeUint16, "PF_SF"),
+			r("PFL2", 67, TypeInt16, "PF_SF"),
 			r("AL2", 68, TypeInt16, "A_SF"),
 			r("VL2L3", 69, TypeUint16, "V_SF"),
 			r("VL2", 70, TypeUint16, "V_SF"),
@@ -376,7 +410,7 @@ func init() {
 			r("WL3", 87, TypeInt16, "W_SF"),
 			r("VAL3", 88, TypeInt16, "VA_SF"),
 			r("VarL3", 89, TypeInt16, "Var_SF"),
-			r("PFL3", 90, TypeUint16, "PF_SF"),
+			r("PFL3", 90, TypeInt16, "PF_SF"),
 			r("AL3", 91, TypeInt16, "A_SF"),
 			r("VL3L1", 92, TypeUint16, "V_SF"),
 			r("VL3", 93, TypeUint16, "V_SF"),

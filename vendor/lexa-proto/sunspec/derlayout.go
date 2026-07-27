@@ -24,7 +24,9 @@ var L701 = NewLayout(
 	FS("W", Tint16, "W_SF"),
 	FS("VA", Tint16, "VA_SF"),
 	FS("Var", Tint16, "Var_SF"),
-	FS("PF", Tuint16, "PF_SF"),
+	// PF is int16, NOT uint16 — see the "PF is signed" block below the layout
+	// and TestModel701PowerFactorIsSigned.
+	FS("PF", Tint16, "PF_SF"),
 	FS("A", Tint16, "A_SF"),
 	FS("LLV", Tuint16, "V_SF"),
 	FS("LNV", Tuint16, "V_SF"),
@@ -41,19 +43,19 @@ var L701 = NewLayout(
 	FS("TmpOt", Tint16, "Tmp_SF"),
 	// Phase L1
 	FS("WL1", Tint16, "W_SF"), FS("VAL1", Tint16, "VA_SF"), FS("VarL1", Tint16, "Var_SF"),
-	FS("PFL1", Tuint16, "PF_SF"), FS("AL1", Tint16, "A_SF"),
+	FS("PFL1", Tint16, "PF_SF"), FS("AL1", Tint16, "A_SF"),
 	FS("VL1L2", Tuint16, "V_SF"), FS("VL1", Tuint16, "V_SF"),
 	FS("TotWhInjL1", Tuint64, "TotWh_SF"), FS("TotWhAbsL1", Tuint64, "TotWh_SF"),
 	FS("TotVarhInjL1", Tuint64, "TotVarh_SF"), FS("TotVarhAbsL1", Tuint64, "TotVarh_SF"),
 	// Phase L2
 	FS("WL2", Tint16, "W_SF"), FS("VAL2", Tint16, "VA_SF"), FS("VarL2", Tint16, "Var_SF"),
-	FS("PFL2", Tuint16, "PF_SF"), FS("AL2", Tint16, "A_SF"),
+	FS("PFL2", Tint16, "PF_SF"), FS("AL2", Tint16, "A_SF"),
 	FS("VL2L3", Tuint16, "V_SF"), FS("VL2", Tuint16, "V_SF"),
 	FS("TotWhInjL2", Tuint64, "TotWh_SF"), FS("TotWhAbsL2", Tuint64, "TotWh_SF"),
 	FS("TotVarhInjL2", Tuint64, "TotVarh_SF"), FS("TotVarhAbsL2", Tuint64, "TotVarh_SF"),
 	// Phase L3
 	FS("WL3", Tint16, "W_SF"), FS("VAL3", Tint16, "VA_SF"), FS("VarL3", Tint16, "Var_SF"),
-	FS("PFL3", Tuint16, "PF_SF"), FS("AL3", Tint16, "A_SF"),
+	FS("PFL3", Tint16, "PF_SF"), FS("AL3", Tint16, "A_SF"),
 	FS("VL3L1", Tuint16, "V_SF"), FS("VL3", Tuint16, "V_SF"),
 	FS("TotWhInjL3", Tuint64, "TotWh_SF"), FS("TotWhAbsL3", Tuint64, "TotWh_SF"),
 	FS("TotVarhInjL3", Tuint64, "TotVarh_SF"), FS("TotVarhAbsL3", Tuint64, "TotVarh_SF"),
@@ -74,6 +76,58 @@ var L701 = NewLayout(
 	// TestModel701LengthMatchesSunSpecDefinition for the full derivation.
 	FStr("MnAlrmInfo", 32),
 )
+
+// ── Model 701: PF is SIGNED (int16), and Table 4 is wrong ────────────────────
+//
+// THE CONFLICT. Two normative sources disagree on the type of 701's four power
+// factor points (PF, PFL1, PFL2, PFL3):
+//
+//	SunSpec DER Information Model Spec v1.2, Table 4   ->  uint16
+//	sunspec/models json/model_701.json                 ->  int16
+//
+// WE FOLLOW THE JSON. Device Information Model Specification v1.4 §5.1 makes the
+// JSON model definition the canonical encoding of a model; the PDF tables are a
+// rendering of it. Where the two disagree, the JSON wins by that rule alone.
+//
+// AND THE JSON IS SUBSTANTIVELY RIGHT, on two independent grounds:
+//
+//  1. Its own description of these points — "the sign of power factor should be
+//     the sign of active power" — is only satisfiable by a SIGNED point. A uint16
+//     cannot carry a sign, so Table 4's type contradicts the text that Table 4's
+//     own model definition ships with. That makes Table 4 a documentation bug,
+//     not a genuine second opinion.
+//
+//  2. STRUCTURAL CORROBORATION. Every OTHER power-factor point in the DER model
+//     family is paired with an explicit over/under-excitation discriminator, and
+//     every one of those is legitimately uint16 (a magnitude):
+//
+//     704: PFWInj_PF + PFWInj_Ext, PFWAbs_PF + PFWAbs_Ext, and the two Rvrt pairs
+//     702: PFOvrExtRtg / PFUndExtRtg, PFOvrExt / PFUndExt, WOvrExtRtgPF /
+//     WUndExtRtgPF, WOvrExtPF / WUndExtPF — the direction is in the NAME
+//
+//     Model 701's PF/PFL1/PFL2/PFL3 have NO excitation companion point anywhere in
+//     the model. If they were unsigned, 701 could not express direction at all —
+//     the one measurement model in the family would be the one that loses it. The
+//     sign IS the discriminator here, which is exactly what the JSON description
+//     says. uint16 is not merely a different choice; it is unimplementable.
+//
+// WHAT CHANGES ON THE WIRE. Nothing about LENGTH: int16 and uint16 are both one
+// register, so no offset, no model length, and no downstream model's base address
+// moves. Two things do change:
+//
+//	not-implemented sentinel:  0x8000  (was 0xFFFF)
+//	raw words 0x8001..0xFFFF:  decode negative (was 32769..65535)
+//
+// The sentinel is the hazard: a consumer still testing a 701 PF register against
+// 0xFFFF will read the not-implemented value 0x8000 as the real number -32768,
+// and will treat a genuine -0.01 PF (raw 0xFFFF at SF=-2 ... which is now a
+// LEGAL value) as "not implemented". Both directions are silent. The layout
+// engine itself is already correct once the type is right — View.notImpl,
+// View.Float and View.SetFloat all dispatch on Field.Type — so the audit surface
+// is callers that bypass the engine with their own literal.
+//
+// Regression: TestModel701PowerFactorIsSigned in derlayout_test.go.
+// Position of record: lexa-gw docs/requirements/secure-sunspec-modbus-traceability.md.
 
 // ── Model 702: DER Capacity ──────────────────────────────────────────────────
 // Spec Table 5.
