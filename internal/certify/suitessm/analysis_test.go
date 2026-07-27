@@ -545,29 +545,54 @@ func TestServerFlightVerdictRequiresTheExactOrder(t *testing.T) {
 }
 
 func TestAbbreviatedHandshakeVerdictAcceptsBothDocumentedOutcomes(t *testing.T) {
-	id := []byte{1, 2, 3, 4}
-	first := &ProbeResult{Server: dirWith(
-		serverHelloMsg(&tlsdis.ServerHello{SessionID: id}),
-		tlsdis.HandshakeMessage{Type: tlsdis.HandshakeCertificate},
-	)}
-	resumed := &ProbeResult{Server: dirWith(serverHelloMsg(&tlsdis.ServerHello{SessionID: id}))}
-	if v, obs := abbreviatedHandshakeVerdict(first, resumed); v != certify.Pass {
-		t.Errorf("a correct abbreviated handshake must PASS: %s (%s)", v, obs)
+	// RFC 5077 §3.4, and the shape run 20260726T225512 actually captured: a
+	// ticket-issuing server sends an EMPTY session id on the initial handshake,
+	// the client generates its own for the resumption attempt, and the server
+	// echoes THAT one.
+	offered := []byte{0x5e, 0xef, 0x32, 0x8f}
+	initial := resumptionPair{
+		FirstServerHello: &tlsdis.ServerHello{SessionID: nil},
+		FirstFlight: []tlsdis.HandshakeType{
+			tlsdis.HandshakeServerHello, tlsdis.HandshakeCertificate, tlsdis.HandshakeNewSessionTicket,
+		},
 	}
 
-	full := &ProbeResult{Server: dirWith(
-		serverHelloMsg(&tlsdis.ServerHello{SessionID: []byte{9, 9}}),
-		tlsdis.HandshakeMessage{Type: tlsdis.HandshakeCertificate},
-	)}
-	if v, obs := abbreviatedHandshakeVerdict(first, full); v != certify.Pass {
+	resumed := initial
+	resumed.SecondClientHello = &tlsdis.ClientHello{SessionID: offered}
+	resumed.SecondServerHello = &tlsdis.ServerHello{SessionID: offered}
+	resumed.SecondFlight = []tlsdis.HandshakeType{tlsdis.HandshakeServerHello, tlsdis.HandshakeNewSessionTicket}
+	if v, obs := abbreviatedHandshakeVerdict(resumed); v != certify.Pass {
+		t.Errorf("a correct RFC 5077 ticket resumption must PASS — the echo is against the SECOND "+
+			"ClientHello, not the first ServerHello: %s (%s)", v, obs)
+	}
+
+	full := initial
+	full.SecondClientHello = &tlsdis.ClientHello{SessionID: offered}
+	full.SecondServerHello = &tlsdis.ServerHello{SessionID: []byte{9, 9}}
+	full.SecondFlight = []tlsdis.HandshakeType{
+		tlsdis.HandshakeServerHello, tlsdis.HandshakeCertificate, tlsdis.HandshakeCertificateRequest,
+	}
+	if v, obs := abbreviatedHandshakeVerdict(full); v != certify.Pass {
 		t.Errorf("falling back to a full handshake is also conformant and must PASS: %s (%s)", v, obs)
 	}
 
 	// The one non-conformant shape: skipped the certificate exchange WITHOUT
-	// echoing the session it claims to be resuming.
-	bogus := &ProbeResult{Server: dirWith(serverHelloMsg(&tlsdis.ServerHello{SessionID: []byte{7, 7}}))}
-	if v, obs := abbreviatedHandshakeVerdict(first, bogus); v != certify.Fail {
-		t.Errorf("an abbreviated handshake with a MISMATCHED session id must FAIL: %s (%s)", v, obs)
+	// echoing the session id its peer offered.
+	bogus := initial
+	bogus.SecondClientHello = &tlsdis.ClientHello{SessionID: offered}
+	bogus.SecondServerHello = &tlsdis.ServerHello{SessionID: []byte{7, 7}}
+	bogus.SecondFlight = []tlsdis.HandshakeType{tlsdis.HandshakeServerHello}
+	if v, obs := abbreviatedHandshakeVerdict(bogus); v != certify.Fail {
+		t.Errorf("an abbreviated handshake echoing a session id nobody offered must FAIL: %s (%s)", v, obs)
+	}
+
+	// And the old defect, pinned: an empty initial ServerHello session id is
+	// what a ticket-issuing server is RECOMMENDED to send. It must not, on its
+	// own, make a correct resumption fail.
+	noCH := resumed
+	noCH.SecondClientHello = nil
+	if v, _ := abbreviatedHandshakeVerdict(noCH); v != certify.Skip {
+		t.Errorf("without the resumption ClientHello there is nothing to compare against; want SKIP, got %s", v)
 	}
 }
 

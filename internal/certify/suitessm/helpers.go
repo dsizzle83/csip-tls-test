@@ -422,3 +422,15 @@ func inRelativeOrder(got, want []uint16) bool {
 	}
 	return i == len(want)
 }
+
+// joinNote appends to an assertion's Note without losing what was there.
+func joinNote(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	default:
+		return a + "; " + b
+	}
+}

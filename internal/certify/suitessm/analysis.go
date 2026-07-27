@@ -713,28 +713,57 @@ func serverFlightVerdict(flight []tlsdis.HandshakeType) (certify.Verdict, string
 	return certify.Pass, obs
 }
 
+// resumptionPair is the two handshakes PKI-006 compares, already parsed.
+//
+// It carries the second CLIENTHELLO, which is the field the check was missing:
+// see abbreviatedHandshakeVerdict.
+type resumptionPair struct {
+	FirstServerHello *tlsdis.ServerHello
+	FirstFlight      []tlsdis.HandshakeType
+	// SecondClientHello is the resumption attempt's hello.
+	SecondClientHello *tlsdis.ClientHello
+	SecondServerHello *tlsdis.ServerHello
+	SecondFlight      []tlsdis.HandshakeType
+}
+
 // abbreviatedHandshakeVerdict decides PKI-006 (SunSpecTCP-46/47). The
 // specification accepts BOTH outcomes — resumption or a clean fall back to a
 // full handshake — so the only FAIL here is an abbreviated handshake that is
 // malformed: one that skipped the certificate exchange without echoing the
-// session id it was resuming.
-func abbreviatedHandshakeVerdict(first, second *ProbeResult) (certify.Verdict, string) {
-	sh1, sh2 := first.ServerHello(), second.ServerHello()
+// session id its peer offered.
+//
+// "Its peer offered" is the correction. RFC 5077 §3.4: a client resuming with a
+// TICKET puts a NEW, self-generated session id in its second ClientHello, and
+// the server proves it accepted the ticket by echoing THAT id in the abbreviated
+// ServerHello. The initial handshake's ServerHello session id plays no part —
+// for a ticket-issuing server §3.4 recommends it be EMPTY, and this gateway
+// sends exactly that. Comparing against it, as this check used to, makes a
+// textbook-correct RFC 5077 resumption look like a server resuming a session
+// nobody offered; run 20260726T225512 failed the DUT on precisely that, while
+// the same case's own headline said the resumption was correct.
+func abbreviatedHandshakeVerdict(p resumptionPair) (certify.Verdict, string) {
+	sh1, sh2, ch2 := p.FirstServerHello, p.SecondServerHello, p.SecondClientHello
 	if sh1 == nil || sh2 == nil {
-		return certify.Fail, "one of the two handshakes produced no ServerHello: first = " +
-			first.Summary() + "; second = " + second.Summary()
+		return certify.Fail, fmt.Sprintf(
+			"one of the two handshakes produced no ServerHello (initial %s, resumption attempt %s)",
+			presence(sh1 != nil), presence(sh2 != nil))
 	}
-	full2 := hasType(second.Flight(), tlsdis.HandshakeCertificate)
-	sameID := len(sh1.SessionID) > 0 && string(sh1.SessionID) == string(sh2.SessionID)
+	if ch2 == nil {
+		return certify.Skip, "the capture does not carry the resumption attempt's ClientHello, and RFC 5077 " +
+			"§3.4 defines the echo against THAT hello's session id — there is nothing to compare against"
+	}
+	full2 := hasType(p.SecondFlight, tlsdis.HandshakeCertificate)
+	echoed := len(ch2.SessionID) > 0 && string(ch2.SessionID) == string(sh2.SessionID)
 	obs := fmt.Sprintf(
-		"initial handshake: session_id %d byte(s) (%x), NewSessionTicket %s; second handshake: session_id %d byte(s) (%x), Certificate %s",
-		len(sh1.SessionID), sh1.SessionID, presence(hasType(first.Flight(), tlsdis.HandshakeNewSessionTicket)),
-		len(sh2.SessionID), sh2.SessionID, presence(full2))
+		"initial handshake: ServerHello.session_id %d byte(s) (%x), NewSessionTicket %s; resumption attempt: "+
+			"ClientHello.session_id %d byte(s) (%x), ServerHello.session_id %d byte(s) (%x), Certificate %s",
+		len(sh1.SessionID), sh1.SessionID, presence(hasType(p.FirstFlight, tlsdis.HandshakeNewSessionTicket)),
+		len(ch2.SessionID), ch2.SessionID, len(sh2.SessionID), sh2.SessionID, presence(full2))
 	switch {
-	case !full2 && sameID:
-		return certify.Pass, obs + " — the EUT-S performed an ABBREVIATED handshake: it echoed the session id and re-sent no Certificate or CertificateRequest"
-	case !full2 && !sameID:
-		return certify.Fail, obs + " — the EUT-S skipped the Certificate exchange WITHOUT echoing the offered session id, so the peer's identity was never re-established"
+	case !full2 && echoed:
+		return certify.Pass, obs + " — the EUT-S performed an ABBREVIATED handshake: it echoed the session id offered in the resumption ClientHello (RFC 5077 §3.4) and re-sent no Certificate or CertificateRequest"
+	case !full2 && !echoed:
+		return certify.Fail, obs + " — the EUT-S skipped the Certificate exchange WITHOUT echoing the session id its peer offered, so the peer's identity was never re-established"
 	default:
 		return certify.Pass, obs + " — the EUT-S fell back to a FULL handshake, re-exchanging Certificate and CertificateRequest, which SunSpecTCP-46/47 permits (resumption is a SHOULD/MAY)"
 	}

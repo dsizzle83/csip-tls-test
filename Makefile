@@ -7,7 +7,7 @@
         test test-fast test-integration test-update-golden test-southbound test-evidence qa qa-bench fuzz \
         sweep-sunspec \
         modsim-image modsim-run modsim-stop \
-        gen-test-certs gen-comm004-certs gen-client-cert gen-ev-cert gen-mbaps-certs smoke-pi clean help \
+        gen-test-certs gen-comm004-certs gen-client-cert gen-ev-cert gen-mbaps-certs gen-mbaps-leaves smoke-pi clean help \
         ui
 
 REPO_ROOT     := $(shell pwd)
@@ -512,8 +512,21 @@ gen-ev-cert:
 # the negative-fixture matrix (no-role/two-role/bad-encoding/empty-role/
 # oversize-role/expired/wrong-ca). Destructive-but-deterministic (regenerates
 # the whole tree with fresh keys each run — see cmd/gen-mbaps-certs doc).
+#
+# THIS MINTS A NEW ROOT. The bench root is installed in the live gateway's
+# nb-mbaps-clients trust domain (certmgr `install:nb-mbaps-clients`), so a
+# full regeneration locks the bench out of the DUT until the new root is
+# provisioned there — a DUT configuration change. Use gen-mbaps-leaves
+# unless re-rooting is what you actually want.
 gen-mbaps-certs:
 	bash scripts/gen-mbaps-certs.sh
+
+# Re-mint only the LEAVES, keeping the root, intermediate and wrong-CA key
+# pairs already on disk byte-identical. This is the safe refresh: every peer
+# that trusts the current root goes on trusting it, and the leaf fixtures pick
+# up whatever the generator has since learned to put in them.
+gen-mbaps-leaves:
+	bash scripts/gen-mbaps-certs.sh -reuse-ca
 
 # Auto-generate certs on first test run via dependency tracking.
 $(CA_CERT):
@@ -593,6 +606,8 @@ help:
 	@echo "                           Include the hub's LAN IP: make gen-ev-cert IPS=69.0.0.1"
 	@echo "  make gen-mbaps-certs     Regenerate the bench mbaps PKI (T06.1): certs/mbaps/"
 	@echo "                           Role certs + device cert + negative-fixture matrix"
+	@echo "                           MINTS A NEW ROOT — re-provision the gateway trust domain after"
+	@echo "  make gen-mbaps-leaves    Re-mint only the leaves; the CA identities stay byte-identical"
 	@echo ""
 	@echo "Hardware validation:"
 	@echo "  make smoke-pi            Deploy to Pi, run quick smoke test"

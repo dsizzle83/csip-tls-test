@@ -41,6 +41,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	// SHA-1 here is RFC 5280 §4.2.1.2's key-IDENTIFIER construction, not a
+	// signature and not a digest anything relies on for collision resistance.
+	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	_ "embed"
@@ -106,6 +109,27 @@ func newSerial() (*big.Int, error) {
 	return rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 }
 
+// subjectKeyID computes the RFC 5280 §4.2.1.2 "method 1" key identifier: the
+// 160-bit SHA-1 of the BIT STRING subjectPublicKey, tag, length and
+// unused-bits byte excluded. It is a naming function, not a security
+// primitive — the identifier only has to be unique among the issuer's subjects,
+// and every CA and every verifier in the world computes it this way.
+func subjectKeyID(pub *ecdsa.PublicKey) ([]byte, error) {
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, err
+	}
+	var info struct {
+		Algorithm        pkix.AlgorithmIdentifier
+		SubjectPublicKey asn1.BitString
+	}
+	if _, err := asn1.Unmarshal(spki, &info); err != nil {
+		return nil, err
+	}
+	sum := sha1.Sum(info.SubjectPublicKey.Bytes)
+	return sum[:], nil
+}
+
 // certParams carries everything mintCert needs beyond the signing parent.
 type certParams struct {
 	cn         string
@@ -136,12 +160,24 @@ func mintCert(p certParams, parent *certKey) (certKey, error) {
 	if err != nil {
 		return certKey{}, fmt.Errorf("serial for %q: %w", p.cn, err)
 	}
+	skid, err := subjectKeyID(&key.PublicKey)
+	if err != nil {
+		return certKey{}, fmt.Errorf("subject key identifier for %q: %w", p.cn, err)
+	}
 	tmpl := &x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: p.cn},
-		NotBefore:             p.notBefore,
-		NotAfter:              p.notAfter,
-		KeyUsage:              x509.KeyUsageDigitalSignature,
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: p.cn},
+		NotBefore:    p.notBefore,
+		NotAfter:     p.notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		// RFC 5280 §4.2.1.2 makes subjectKeyIdentifier a SHOULD for END-ENTITY
+		// certificates, not only for CAs — and x509.CreateCertificate derives
+		// one automatically ONLY when the template is a CA. Leaving it unset
+		// therefore produced a whole tree of leaf fixtures with no SKI, which
+		// SSM-CONF-v0.8's own RFC 5280 checks then reported as a
+		// non-conformance. Run 20260726T225512 failed the GATEWAY on PKI-007
+		// and PKI-008 over this: the certificate without the SKI was ours.
+		SubjectKeyId:          skid,
 		BasicConstraintsValid: true,
 		ExtraExtensions:       p.exts,
 	}
@@ -263,22 +299,60 @@ type manifest struct {
 	Negatives []fixture `json:"negatives"`
 }
 
+// loadCertKey reads an already-minted certificate and its private key back off
+// disk, so -reuse-ca can go on signing with a CA that is already installed
+// somewhere.
+func loadCertKey(certPath, keyPath string) (certKey, error) {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return certKey{}, fmt.Errorf("reuse-ca: %w", err)
+	}
+	block, _ := pem.Decode(certPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return certKey{}, fmt.Errorf("reuse-ca: %s holds no CERTIFICATE block", certPath)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return certKey{}, fmt.Errorf("reuse-ca: parse %s: %w", certPath, err)
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return certKey{}, fmt.Errorf("reuse-ca: %w", err)
+	}
+	kb, _ := pem.Decode(keyPEM)
+	if kb == nil {
+		return certKey{}, fmt.Errorf("reuse-ca: %s holds no PEM block", keyPath)
+	}
+	key, err := x509.ParseECPrivateKey(kb.Bytes)
+	if err != nil {
+		return certKey{}, fmt.Errorf("reuse-ca: parse %s: %w", keyPath, err)
+	}
+	return certKey{cert: cert, der: block.Bytes, key: key}, nil
+}
+
 func main() {
 	out := flag.String("out", "certs/mbaps", "output directory for the mbaps PKI tree (relative to CWD — run from the repo root)")
+	reuseCA := flag.Bool("reuse-ca", false,
+		"re-mint only the LEAVES, keeping the root, intermediate and wrong-CA key pairs already in -out. "+
+			"Use this when the existing root is installed in a peer's trust store that this run must not "+
+			"invalidate — the live gateway's nb-mbaps-clients trust domain, for one: re-rooting it is a DUT "+
+			"configuration change, and a bench that mints a new root without one is simply locked out.")
 	flag.Parse()
 
-	if err := run(*out); err != nil {
+	if err := run(*out, *reuseCA); err != nil {
 		fmt.Fprintf(os.Stderr, "gen-mbaps-certs: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(out string) error {
+func run(out string, reuseCA bool) error {
 	if !strings.Contains(out, "mbaps") {
 		return fmt.Errorf("refusing to regenerate %q — path does not look like an mbaps cert dir (safety check before RemoveAll)", out)
 	}
-	if err := os.RemoveAll(out); err != nil {
-		return fmt.Errorf("clean %s: %w", out, err)
+	if !reuseCA {
+		if err := os.RemoveAll(out); err != nil {
+			return fmt.Errorf("clean %s: %w", out, err)
+		}
 	}
 	clientsDir := filepath.Join(out, "clients")
 	negDir := filepath.Join(out, "negative")
@@ -297,15 +371,31 @@ func run(out string) error {
 	leafNotBefore, leafNotAfter := now.Add(-time.Hour), now.Add(3*365*24*time.Hour)
 	expiredNotBefore, expiredNotAfter := now.Add(-48*time.Hour), now.Add(-24*time.Hour)
 
+	// mintOrReuseCA mints a CA, or — under -reuse-ca — loads the one already in
+	// the output tree. A CA that a peer has installed in its trust store cannot
+	// be re-rooted from this side alone.
+	mintOrReuseCA := func(stem string, p certParams, parent *certKey) (certKey, error) {
+		if !reuseCA {
+			return mintCert(p, parent)
+		}
+		ck, err := loadCertKey(filepath.Join(out, stem+"-cert.pem"), filepath.Join(out, stem+"-key.pem"))
+		if err != nil {
+			return certKey{}, fmt.Errorf("-reuse-ca was given but %s could not be reloaded (drop the flag to "+
+				"mint a fresh tree, and remember to re-install the new root wherever the old one is trusted): %w",
+				stem, err)
+		}
+		return ck, nil
+	}
+
 	// === Two-tier CA: root + intermediate ("nb-mbaps-clients" trust domain) ===
-	root, err := mintCert(certParams{
+	root, err := mintOrReuseCA("ca", certParams{
 		cn: "csip-tls-test bench mbaps Root CA", isCA: true,
 		notBefore: rootNotBefore, notAfter: rootNotAfter,
 	}, nil)
 	if err != nil {
 		return err
 	}
-	intermediate, err := mintCert(certParams{
+	intermediate, err := mintOrReuseCA("intermediate", certParams{
 		cn: "csip-tls-test bench mbaps Intermediate CA", isCA: true,
 		notBefore: intNotBefore, notAfter: intNotAfter,
 	}, &root)
@@ -314,7 +404,7 @@ func run(out string) error {
 	}
 	// A second, wholly unrelated root — the trust domain mbapsdev/the gateway
 	// must NOT have loaded, for the wrong-ca negative.
-	wrongCA, err := mintCert(certParams{
+	wrongCA, err := mintOrReuseCA("wrong-ca", certParams{
 		cn: "csip-tls-test bench mbaps WRONG Root CA (untrusted, negative fixture)", isCA: true,
 		notBefore: rootNotBefore, notAfter: rootNotAfter,
 	}, nil)

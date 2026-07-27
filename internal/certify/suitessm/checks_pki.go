@@ -591,14 +591,22 @@ func pki006(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 						return certify.Skip, "the initial conversation is not in this check's attributed frames: " + err.Error(), nil
 					}
 					sh1, _ := v1.ServerHello()
+					ch2, chFrames := v2.ClientHello()
 					sh2, frames := v2.ServerHello()
-					verdict, obs := abbreviatedHandshakeVerdict(
-						&ProbeResult{Server: v1.Server}, &ProbeResult{Server: v2.Server})
-					_ = sh1
+					verdict, obs := abbreviatedHandshakeVerdict(resumptionPair{
+						FirstServerHello:  sh1,
+						FirstFlight:       v1.ServerFlight(),
+						SecondClientHello: ch2,
+						SecondServerHello: sh2,
+						SecondFlight:      v2.ServerFlight(),
+					})
 					if sh2 == nil {
 						return verdict, obs, v2.Frames
 					}
-					return verdict, obs, frames
+					// Both hellos are cited: the criterion is the RELATION
+					// between the offered session id and the echoed one, and a
+					// reader must be able to open both.
+					return verdict, obs, append(append([]int(nil), chFrames...), frames...)
 				})
 			if err != nil {
 				return nil, err
@@ -668,20 +676,42 @@ func pki007(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			}
 			out = append(out, a)
 
+			// The bench's own client certificate, as CONTEXT — never as a
+			// verdict about the DUT.
+			//
+			// §2.6.7.1 step 3 directs the tester at the EUT-S Certificate
+			// message, and §2.6.7.3's criterion is about "all certificates
+			// presented by the EUT-S/EUT-C". When the DUT is the server the
+			// bench is the TEST CLIENT, not an EUT-C: its certificate is a
+			// property of this bench's fixture set and says nothing whatever
+			// about the device under test. Run 20260726T225512 failed the
+			// gateway because certs/mbaps/clients/grid-service-cert.pem had no
+			// SubjectKeyIdentifier — a defect in our own generator, reported as
+			// a DUT non-conformance in an evidence bundle.
 			a, err = sessionFact(ev, sess,
-				"SunSpecTCP-52: the certificate the bench (acting as EUT-C's peer) presented also conforms to the RFC 5280 X.509v3 profile",
-				"each certificate in the bench's Certificate message parsed from the capture and checked against RFC 5280",
+				"bench self-check (NOT a DUT verdict): the Test Client certificate this bench presented also conforms to the RFC 5280 X.509v3 profile",
+				"each certificate in the BENCH's Certificate message parsed from the capture and checked against RFC 5280",
 				func(v *wireView) (certify.Verdict, string, []int) {
 					c, frames := v.ClientCertificate()
-					verdict, obs := certProfileVerdict(c, "bench client")
 					if c == nil {
 						return certify.Skip, "the bench's Certificate message is not in the clear in this conversation", v.Frames
+					}
+					verdict, obs := certProfileVerdict(c, "bench client")
+					if verdict == certify.Fail {
+						// Capped at WARN by construction. A Test Client
+						// certificate can never produce a DUT verdict.
+						verdict = certify.Warn
+						obs += " — this is the BENCH's own fixture, not the EUT-S's certificate, so it is a " +
+							"bench defect to fix (cmd/gen-mbaps-certs) and not a conformance finding against the DUT"
 					}
 					return verdict, obs, frames
 				})
 			if err != nil {
 				return nil, err
 			}
+			a.Note = joinNote(a.Note, "scope: SSM-CONF-v0.8 §2.6.7.1 step 3 inspects the EUT-S Certificate "+
+				"message. With the DUT as the server the bench is the Test Client, so this row is recorded "+
+				"for completeness and is capped at WARN — it cannot be a verdict on the device under test.")
 			return append(out, a), nil
 		},
 	}, nil
@@ -717,16 +747,31 @@ func pki008(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		Notes:   t.notes(),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			var out []certify.Assertion
+			// §2.6.8.1 step 3 inspects the EUT-S Certificate message. The
+			// bench's own certificate is recorded beside it as context and is
+			// capped at WARN: with the DUT as the server the bench is the TEST
+			// CLIENT, and a Test Client's fixture can never be a verdict on the
+			// device under test. See the same note in pki007.
 			for _, side := range []struct {
 				who   string
+				isEUT bool
+				claim string
 				fetch func(*wireView) (*tlsdis.Certificate, []int)
 			}{
-				{"EUT-S", (*wireView).ServerCertificate},
-				{"bench client", (*wireView).ClientCertificate},
+				{
+					who:   "EUT-S",
+					isEUT: true,
+					claim: "SunSpecTCP-7: the EUT-S identified itself with an X.509v3 certificate carrying subjectKeyIdentifier, authorityKeyIdentifier and keyUsage",
+					fetch: (*wireView).ServerCertificate,
+				},
+				{
+					who:   "bench client",
+					claim: "bench self-check (NOT a DUT verdict): the Test Client certificate this bench presented is X.509v3 and carries subjectKeyIdentifier, authorityKeyIdentifier and keyUsage",
+					fetch: (*wireView).ClientCertificate,
+				},
 			} {
 				side := side
-				a, err := sessionFact(ev, sess,
-					"SunSpecTCP-7: the "+side.who+" identified itself with an X.509v3 certificate carrying subjectKeyIdentifier, authorityKeyIdentifier and keyUsage",
+				a, err := sessionFact(ev, sess, side.claim,
 					"the "+side.who+" Certificate message, parsed from the capture",
 					func(v *wireView) (certify.Verdict, string, []int) {
 						c, frames := side.fetch(v)
@@ -739,12 +784,22 @@ func pki008(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 						obs := fmt.Sprintf("v%d leaf, subject %q, sha256 %s; subjectKeyIdentifier %s; authorityKeyIdentifier %s; keyUsage [%s]",
 							ci.Version, ci.Subject, ci.SHA256, presence(ski), presence(aki), strings.Join(ci.KeyUsage, ","))
 						if ci.Version != 3 || !ski || !aki || len(ci.KeyUsage) == 0 {
+							if !side.isEUT {
+								return certify.Warn, obs + " — this is the BENCH's own fixture, not the EUT-S's " +
+									"certificate; it is a bench defect to fix (cmd/gen-mbaps-certs), not a " +
+									"conformance finding against the DUT", frames
+							}
 							return certify.Fail, obs, frames
 						}
 						return certify.Pass, obs, frames
 					})
 				if err != nil {
 					return nil, err
+				}
+				if !side.isEUT {
+					a.Note = joinNote(a.Note, "scope: SSM-CONF-v0.8 §2.6.8.1 step 3 inspects the EUT-S "+
+						"Certificate message. With the DUT as the server the bench is the Test Client, so this "+
+						"row is recorded for completeness and is capped at WARN.")
 				}
 				out = append(out, a)
 			}
