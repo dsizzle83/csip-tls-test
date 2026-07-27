@@ -62,7 +62,7 @@ func TestFaultRampLimit_SlewsTowardCommand(t *testing.T) {
 func TestFaultRejectWrite_DropsControlValue(t *testing.T) {
 	const wmax = 8000.0
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
-	b := populateSolar(r, wmax)
+	b := populateSolar(r, wmax, "")
 	ss := &SolarServer{Server: &Server{Regs: r}, bases: b, wmaxW: wmax}
 	cmd := b.M123Base + sunspec.M123_WMaxLimPct
 	ena := b.M123Base + sunspec.M123_WMaxLimPct_Ena
@@ -106,7 +106,7 @@ func TestFaultRejectWrite_DropsControlValue(t *testing.T) {
 func TestFaultEnableGate_LandsValueButGatesEnable(t *testing.T) {
 	const wmax = 8000.0
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
-	b := populateSolar(r, wmax)
+	b := populateSolar(r, wmax, "")
 	ss := &SolarServer{Server: &Server{Regs: r}, bases: b, wmaxW: wmax}
 	cmd := b.M123Base + sunspec.M123_WMaxLimPct
 	ena := b.M123Base + sunspec.M123_WMaxLimPct_Ena

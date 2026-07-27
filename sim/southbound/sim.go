@@ -250,6 +250,15 @@ type RegisterMap struct {
 	// freely call Get/Set.
 	OnWriteAttempt func(startAddr uint16, vals []uint16) (apply bool)
 
+	// OnWriteError, if non-nil, is consulted AFTER a write has landed. A non-nil
+	// return becomes the Modbus exception the client is told, so the device can
+	// APPLY a write and REFUSE it in the same breath — the one fault shape that
+	// cannot be expressed through OnWriteAttempt, which can only decide whether
+	// the value lands and never what the protocol says about it. See lying.go's
+	// exception_on_applied_write, and I3, whose grounding defects (OBX-01,
+	// TRM-01) are exactly a refusal the device did not honour.
+	OnWriteError func(startAddr uint16, vals []uint16) error
+
 	// OnRead, if non-nil, is consulted on the READ path with the start address and
 	// the values about to be returned. It may sleep (latency), rewrite the values
 	// (nan_sentinel, bad_scale targets a register by address), or return an error to
@@ -304,6 +313,7 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 		r.mu.Lock()
 		intercept := r.OnWriteAttempt
 		cb := r.OnWrite
+		onWriteErr := r.OnWriteError
 		r.mu.Unlock()
 
 		// Mask write-protected cells (scale factors — read-only on a real
@@ -329,6 +339,15 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 		}
 		if cb != nil {
 			cb(req.Addr)
+		}
+		// The write is now settled. Only here may an injector turn it into an
+		// exception, because the fault being modelled is a device that DID the
+		// thing and SAYS it did not — an error raised any earlier would be an
+		// honest refusal, which is a different (and much safer) device.
+		if onWriteErr != nil {
+			if err := onWriteErr(req.Addr, args); err != nil {
+				return nil, err
+			}
 		}
 		return nil, nil
 	}

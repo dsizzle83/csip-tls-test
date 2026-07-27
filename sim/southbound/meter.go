@@ -282,9 +282,17 @@ func populateMeter(r *RegisterMap, netW float64) uint16 {
 	r.Set(cursor, sunspec.ModelCommon)
 	r.Set(cursor+1, m1Len)
 	m1 := cursor + 2
+	// Model 1 field map (lexa-proto/sunspec/identity.go): Mn(0,16) / Md(16,16) /
+	// Opt(32,8) / Vr(40,8) / SN(48,16). See populateBatteryCore for the full
+	// note: the serial used to be written to m1+32 (Opt), so this device
+	// reported Options="SN-MTR-001" and Serial="" — and an empty serial collides
+	// with every other empty-serial sim in a gateway that keys identity on
+	// manufacturer|model|serial. docs/HARNESS_REVIEW.md has always documented
+	// this device as SN="SN-MTR-001"; now the code agrees with the doc.
 	setStr16(r, m1+0, "SunSpec Sim")
-	setStr8(r, m1+16, "CSIP-Meter-1Ph")
-	setStr8(r, m1+32, "SN-MTR-001")
+	setStr16(r, m1+16, "CSIP-Meter-1Ph")
+	setStr8(r, m1+40, "1.1.4")       // Vr — firmware version
+	setStr16(r, m1+48, "SN-MTR-001") // SN
 	cursor += 2 + m1Len
 
 	// Model 201 (Single-Phase AC Meter) — 105 data registers

@@ -42,9 +42,22 @@ func main() {
 		"default \"SN-SOLAR-001\" — set this so two co-located sims (e.g. this modsim plus a mbapsdev "+
 		"-model inverter) present distinct device identity to a downstream gateway that keys identity "+
 		"on manufacturer|model|serial")
+	mangle := flag.Bool("mangle", false, "interpose the MBAP wire mangler (sim/southbound/wire.go): the Modbus "+
+		"server binds loopback and a framing-level relay binds -port instead, enabling the wire-lie fault kinds "+
+		"(truncate_response, mbap_length_lie, wrong_unit_id, txn_id_swap, stack_responses) that cannot be "+
+		"expressed above the framing layer. OFF by default — a shared live bench is never silently reframed")
 	flag.Parse()
 
+	// With -mangle the device binds a loopback port and the mangler takes the
+	// public one, so a client dials exactly the address it always did and the
+	// interposition is invisible until a wire fault is armed. Without it,
+	// nothing about the sim's listening behaviour changes.
 	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
+	upstreamAddr := ""
+	if *mangle {
+		upstreamAddr = fmt.Sprintf("127.0.0.1:%d", *port+10000)
+		listenURL = "tcp://" + upstreamAddr
+	}
 
 	var srv *sim.SolarServer
 	var err error
@@ -60,6 +73,17 @@ func main() {
 	}
 	if err != nil {
 		log.Fatalf("modsim: %v", err)
+	}
+
+	var mangler *sim.Mangler
+	if *mangle {
+		mangler, err = sim.NewMangler(fmt.Sprintf("0.0.0.0:%d", *port), upstreamAddr)
+		if err != nil {
+			log.Fatalf("modsim: %v", err)
+		}
+		defer mangler.Close()
+		log.Printf("modsim: MBAP wire mangler interposed on :%d → %s (framing-level fault kinds enabled)",
+			*port, upstreamAddr)
 	}
 
 	// Seed the initial cloud cover (0 = clear = today's byte-identical behavior);
@@ -95,7 +119,22 @@ func main() {
 			},
 		)
 		// Fault injection: POST /fault {"kind":"ack_before_effect","delay_s":30}.
-		api.SetFaultFn(srv.ApplyFault)
+		// One endpoint, three layers. A wire-level kind is offered to the mangler
+		// first when one is interposed; when one is NOT, it is refused by NAME
+		// rather than falling through to the device controller, which would call
+		// it an unknown kind and hide the real reason (the sim was started
+		// without -mangle). A scenario can then report SKIP-with-reason instead
+		// of mistaking "we never asked" for "the gateway passed".
+		api.SetFaultFn(func(body []byte) error {
+			if mangler != nil {
+				if handled, err := mangler.ApplyFault(body); handled {
+					return err
+				}
+			} else if sim.WireFaultRequested(body) {
+				return sim.ErrNoMangler
+			}
+			return srv.ApplyFault(body)
+		})
 		// Tee logs into the API ring so the dashboard's Logs tab can stream them.
 		log.SetOutput(io.MultiWriter(os.Stderr, api.LogWriter()))
 	}

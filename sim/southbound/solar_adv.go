@@ -121,6 +121,7 @@ func NewSolarServerAdvanced(listenURL string, wmaxW float64, serial string) (*So
 	ss.Server = srv
 	regs.OnWriteAttempt = ss.interceptWrite
 	regs.OnRead = ss.faults.transportRead
+	ss.installLies() // the lying-device layer, in front of the fault hooks (lying.go)
 	return ss, nil
 }
 
@@ -435,11 +436,39 @@ func advBridgeCeiling(r *RegisterMap, bases SolarBases, adv solarAdvBases) {
 // advMirror701 writes the 701 measurement model from the 103 physical state the
 // legacy animation just computed, applying the 704 fixed-PF / fixed-var effect
 // to PF/Var and stamping the current raise_alarm bits into Alrm.
+//
+// THE MIRROR MUST NOT BE LOSSY. This model declares ACType = THREE_PHASE, and
+// the 103 it mirrors from is a genuinely three-phase animation: it writes
+// PhVph{A,B,C} together, derives PPVph{AB,BC,CA} as sqrt(3)x that, and splits
+// current as Aph{A,B,C} = A/3. For a long time this function copied only the
+// phase-A voltage into LNV and VL1 and left the other six voltage points — LLV,
+// VL1L2, VL2, VL2L3, VL3, VL3L1 — plus every per-phase power point unwritten.
+//
+// Unwritten is not harmless here. The register map is zero-initialised, so those
+// points read 0x0000, which in SunSpec is an IMPLEMENTED value of zero, not the
+// 0xFFFF "not implemented" sentinel. The device was therefore asserting 0.0 V
+// line-to-line and 0.0 V on phases B and C while declaring three phases — a
+// physically impossible machine, and one that a conformant gateway is obliged to
+// mirror faithfully onward. It also fails the IEEE 1547-2018 profile §3.3
+// Table 17 rule that "the voltage points that are applicable must be
+// implemented", where applicability is decided by exactly the ACType this
+// function sets (conformance case MOD-4 step 3).
+//
+// Everything below is now derived from the same balanced-three-phase model the
+// 103 animation already uses, and the line-to-line voltages are READ from the
+// 103's own PPVph registers rather than recomputed, so the two models can never
+// again disagree about the same physical quantity.
 func advMirror701(r *RegisterMap, bases SolarBases, adv solarAdvBases, wmaxW, varRating float64, fc *faultController) {
 	m103 := bases.M103Base
 	sfAt := func(a uint16) int16 { return int16(r.Get(a)) }
 	w := sunspec.ApplyScaleSigned(r.Get(m103+sunspec.M103_W), sfAt(m103+sunspec.M103_W_SF))
-	volt := sunspec.ApplyScaleUint(r.Get(m103+sunspec.M103_PhVphA), sfAt(m103+sunspec.M103_V_SF))
+	vSF := sfAt(m103 + sunspec.M103_V_SF)
+	volt := sunspec.ApplyScaleUint(r.Get(m103+sunspec.M103_PhVphA), vSF)
+	voltB := sunspec.ApplyScaleUint(r.Get(m103+sunspec.M103_PhVphB), vSF)
+	voltC := sunspec.ApplyScaleUint(r.Get(m103+sunspec.M103_PhVphC), vSF)
+	vAB := sunspec.ApplyScaleUint(r.Get(m103+sunspec.M103_PPVphAB), vSF)
+	vBC := sunspec.ApplyScaleUint(r.Get(m103+sunspec.M103_PPVphBC), vSF)
+	vCA := sunspec.ApplyScaleUint(r.Get(m103+sunspec.M103_PPVphCA), vSF)
 	hz := sunspec.ApplyScaleUint(r.Get(m103+sunspec.M103_Hz), sfAt(m103+sunspec.M103_Hz_SF))
 	tmp := sunspec.ApplyScaleSigned(r.Get(m103+sunspec.M103_TmpCab), sfAt(m103+sunspec.M103_Tmp_SF))
 	amp := sunspec.ApplyScaleSigned(r.Get(m103+sunspec.M103_A), sfAt(m103+sunspec.M103_A_SF))
@@ -474,11 +503,43 @@ func advMirror701(r *RegisterMap, bases SolarBases, adv solarAdvBases, wmaxW, va
 	v.SetFloat("Var", varPwr)
 	v.SetFloat("PF", pf)
 	v.SetFloat("A", math.Abs(amp))
-	v.SetFloat("LNV", volt)
-	v.SetFloat("VL1", volt)
 	v.SetFloat("Hz", hz)
 	v.SetFloat("TmpCab", tmp)
 	v.SetFloat("ThrotPct", 0)
+
+	// Voltages. LNV is the aggregate line-to-neutral figure and LLV the
+	// aggregate line-to-line one; the six per-phase points carry the same
+	// quantities phase by phase. All of them are mirrored from the 103's own
+	// registers — never recomputed here — so the two models cannot drift apart,
+	// including under an injected V_V (which moves the 103's L-N and L-L
+	// registers together).
+	v.SetFloat("LNV", volt)
+	v.SetFloat("VL1", volt)
+	v.SetFloat("VL2", voltB)
+	v.SetFloat("VL3", voltC)
+	v.SetFloat("LLV", vAB)
+	v.SetFloat("VL1L2", vAB)
+	v.SetFloat("VL2L3", vBC)
+	v.SetFloat("VL3L1", vCA)
+
+	// Per-phase power and current. The animation is a BALANCED machine — the
+	// 103 writes equal phase voltages and equal phase currents (Aph{A,B,C} =
+	// A/3) — so each phase carries one third of the aggregate real, apparent and
+	// reactive power at the common power factor. Leaving these at 0 while W read
+	// several kW made the per-phase and aggregate halves of the same model
+	// contradict each other.
+	third := 1.0 / 3.0
+	for _, p := range []struct{ w, va, vr, pf, a string }{
+		{"WL1", "VAL1", "VarL1", "PFL1", "AL1"},
+		{"WL2", "VAL2", "VarL2", "PFL2", "AL2"},
+		{"WL3", "VAL3", "VarL3", "PFL3", "AL3"},
+	} {
+		v.SetFloat(p.w, w*third)
+		v.SetFloat(p.va, va*third)
+		v.SetFloat(p.vr, varPwr*third)
+		v.SetFloat(p.pf, pf)
+		v.SetFloat(p.a, math.Abs(amp)*third)
+	}
 	writeSlice(r, adv.M701, regs)
 }
 

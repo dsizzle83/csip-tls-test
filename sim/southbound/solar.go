@@ -50,6 +50,7 @@ type SolarServer struct {
 	bases  SolarBases
 	wmaxW  float64
 	faults faultController // shared fault-injection state (see faults.go)
+	lies   lieController   // the LYING-device fault set (see lying.go)
 
 	// cloudCover is the current cloud-cover fraction (0=clear .. 1=overcast),
 	// held as math.Float64bits for lock-free concurrent access: the HTTP
@@ -107,6 +108,7 @@ func NewSolarServer(listenURL string, wmaxW float64, serial string) (*SolarServe
 	ss.Server = srv
 	regs.OnWriteAttempt = ss.interceptWrite
 	regs.OnRead = ss.faults.transportRead
+	ss.installLies() // the lying-device layer, in front of the fault hooks (lying.go)
 	return ss, nil
 }
 
@@ -153,6 +155,12 @@ func (ss *SolarServer) ApplyFault(body []byte) error {
 	// are handled first by the shared *Server; everything else is a
 	// register-level fault handled by the faultController.
 	if handled, err := ss.Server.applyServerFault(body); handled {
+		return err
+	}
+	// LYING-device kinds (lying.go) — a device that answers plausibly and
+	// falsely. Consulted before the faultController so a lie kind never reaches
+	// that controller's supported-set check, which would call it unknown.
+	if handled, err := ss.lies.apply(body); handled {
 		return err
 	}
 	kinds := solarFaultKinds
@@ -352,10 +360,22 @@ func (ss *SolarServer) Inject(body []byte) error {
 			r.Set(b.M103Base+sunspec.M103_W,
 				sunspec.RawFromScaleSigned(w, sf(b.M103Base+sunspec.M103_W_SF)))
 		case "V_V":
+			// All three phase-to-neutral voltages AND all three line-to-line
+			// voltages move together — a balanced three-phase machine cannot
+			// have one without the other. Updating only PhVph{A,B,C} left
+			// PPVph{AB,BC,CA} at whatever the animation last wrote, so an
+			// injected voltage produced a device whose L-N and L-L readings
+			// disagreed by an arbitrary factor until the next animation tick.
+			// The sqrt(3) relation is the same one the animator itself applies
+			// (see the M103_PPVphAB writes in the animation loop).
 			v10 := uint16(math.Round(val * 10))
+			vLL10 := uint16(math.Round(val * 10 * math.Sqrt(3)))
 			r.Set(b.M103Base+sunspec.M103_PhVphA, v10)
 			r.Set(b.M103Base+sunspec.M103_PhVphB, v10)
 			r.Set(b.M103Base+sunspec.M103_PhVphC, v10)
+			r.Set(b.M103Base+sunspec.M103_PPVphAB, vLL10)
+			r.Set(b.M103Base+sunspec.M103_PPVphBC, vLL10)
+			r.Set(b.M103Base+sunspec.M103_PPVphCA, vLL10)
 		case "Hz_Hz":
 			r.Set(b.M103Base+sunspec.M103_Hz,
 				sunspec.RawFromScaleUint(val, sf(b.M103Base+sunspec.M103_Hz_SF)))
@@ -467,7 +487,7 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	r.Set(cursor+1, m1Len)
 	m1 := cursor + 2
 	setStr16(r, m1+0, "SunSpec Sim")
-	setStr8(r, m1+16, "CSIP-Solar-5000")
+	setStr16(r, m1+16, "CSIP-Solar-5000")
 	// m1+32 (Opt, 8 regs) is intentionally left blank (zero/NUL) — this sim
 	// advertises no device-options string. The device SERIAL belongs at
 	// m1+48 (SN, 16 regs), NOT m1+32: lexa-proto/sunspec/identity.go's Model 1
@@ -477,6 +497,15 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	// the gateway's ReadCommon parsed Options="BENCH-MODSIM-01"/Serial="" for
 	// two distinct sims, so both empty serials collapsed into one nb_unit on
 	// manufacturer|model|serial.
+	//
+	// Vr (m1+40, 8 regs) is the DEVICE's firmware version and was never written
+	// at all, so this sim served eight NUL registers there. That is a legal
+	// "not implemented" string, but it is not what a real DER does, and the IEEE
+	// 1547-2018 profile §3.2 Table 16 marks Vr REQUIRED — conformance case MOD-4
+	// step 3 failed on it against this fixture. A gateway mirroring this device
+	// cannot invent the value (a version string is a fact about the DER's
+	// firmware, not about the gateway), so the fix has to be here.
+	setStr8(r, m1+40, "4.2.1") // Vr — firmware version
 	setStr16(r, m1+48, solarSerialOrDefault(serial))
 	cursor += 2 + m1Len
 

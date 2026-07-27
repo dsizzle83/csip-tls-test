@@ -345,9 +345,24 @@ func populateBatteryCore(r *RegisterMap, wmaxKwh, wmaxW float64) (BatteryBases, 
 	r.Set(cursor, sunspec.ModelCommon)
 	r.Set(cursor+1, m1Len)
 	m1 := cursor + 2
+	// Model 1 field map, from lexa-proto/sunspec/identity.go's own constants:
+	// Mn(0,16) / Md(16,16) / Opt(32,8) / Vr(40,8) / SN(48,16). A misplaced write
+	// never fails loudly here — every field is a NUL-padded string, so it simply
+	// lands in a neighbour and leaves the real field empty. Each write below
+	// therefore names the field it targets.
 	setStr16(r, m1+0, "SunSpec Sim")
-	setStr8(r, m1+16, "CSIP-Battery-10kWh")
-	setStr8(r, m1+32, "SN-BAT-001")
+	// Md is SIXTEEN registers, not eight: "CSIP-Battery-10kWh" is 18 characters,
+	// and setStr8 silently truncated it to "CSIP-Battery-10k".
+	setStr16(r, m1+16, "CSIP-Battery-10kWh")
+	// Opt (m1+32) is intentionally blank — this sim advertises no options
+	// string. The SERIAL belongs at m1+48 (SN); it used to be written to m1+32,
+	// so this device reported Options="SN-BAT-001" and Serial="". That is the
+	// same defect populateSolarCore records as a bench finding: a gateway keying
+	// device identity on manufacturer|model|serial saw an EMPTY serial here, so
+	// this sim collided with every other empty-serial sim on one identity key.
+	// The solar sim was fixed then; battery and meter were missed.
+	setStr8(r, m1+40, "2.3.0")       // Vr — firmware version
+	setStr16(r, m1+48, "SN-BAT-001") // SN
 	cursor += 2 + m1Len
 
 	// Model 120 (Nameplate) — 26 data regs
