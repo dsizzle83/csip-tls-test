@@ -38,7 +38,7 @@ func (r *Reader) Blocks() []Block {
 
 // maxHoldingRead is the Modbus spec ceiling on holding registers per single
 // ReadHolding transaction (PI-MBUS-300: 0x7D = 125). A SunSpec model whose data
-// block is wider than this — notably model 701, whose full layout is 137
+// block is wider than this — notably model 701, whose full layout is 153
 // registers — MUST be read in consecutive chunks: a single ReadHolding of >125
 // is refused by the transport, which would otherwise make the whole model
 // (and, since 701 is read during discovery, the whole device) fail to read.

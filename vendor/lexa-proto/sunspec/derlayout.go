@@ -63,7 +63,16 @@ var L701 = NewLayout(
 	F("A_SF", Tsunssf), F("V_SF", Tsunssf), F("Hz_SF", Tsunssf), F("W_SF", Tsunssf),
 	F("PF_SF", Tsunssf), F("VA_SF", Tsunssf), F("Var_SF", Tsunssf),
 	F("TotWh_SF", Tsunssf), F("TotVarh_SF", Tsunssf), F("Tmp_SF", Tsunssf),
-	FStr("MnAlrmInfo", 16),
+	// MnAlrmInfo is 32 registers (64 UTF-8 bytes), NOT 16. Table 4 has no Size
+	// column — Device Information Model spec §6.4.5 puts a string's width in the
+	// model definition, and the authoritative model_701.json declares
+	// "size": 32 with "L": 153. This is 701's last point, so its width is the
+	// model's entire declared length: 121 + 32 = 153. A 16 here yields 137 and
+	// fails SunSpec Modbus Conformance §2.4.1.1 step 2 ("verify model has the
+	// correct length for the contents"), besides shifting every model after 701
+	// in the chain 16 registers low. See derlayout_test.go's
+	// TestModel701LengthMatchesSunSpecDefinition for the full derivation.
+	FStr("MnAlrmInfo", 32),
 )
 
 // ── Model 702: DER Capacity ──────────────────────────────────────────────────

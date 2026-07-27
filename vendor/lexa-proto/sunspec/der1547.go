@@ -84,7 +84,11 @@ func Parse701(regs []uint16) ACMeasurement {
 		TmpCab:     v.Float("TmpCab"),
 		ThrotPct:   v.Float("ThrotPct"),
 		ThrotSrc:   v.Bitfield32("ThrotSrc"),
-		MnAlrmInfo: readString(regs, L701.Offset("MnAlrmInfo"), 16),
+		// 32 registers, matching L701's FStr width (model_701.json "size": 32).
+		// Carrying the width as a SECOND literal is how the decode side stayed
+		// 16 wide after the layout was written; keep the two in step —
+		// derlayout_test.go asserts both.
+		MnAlrmInfo: readString(regs, L701.Offset("MnAlrmInfo"), 32),
 	}
 }
 
