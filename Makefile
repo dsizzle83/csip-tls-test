@@ -1,5 +1,6 @@
 .PHONY: all build build-server build-client build-conformance build-modsim build-vtnsim \
         build-mbapsdev build-aggregator build-ssm-conformance ssm-conformance aggregator-campaigns \
+        build-certify certify-keylog test-certify \
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
@@ -95,6 +96,80 @@ build-ssm-conformance:
 TARGET ?=
 ssm-conformance: build-ssm-conformance
 	./bin/ssm-conformance $(TARGET)
+
+# === certify: the conformance evidence tool ================================
+#
+# cmd/certify drives the published SunSpec/CSIP test procedures from the
+# extracted catalog (testdata/catalog/catalog.json) and emits an evidence
+# bundle a third party verifies without trusting us. It links all six suites
+# under internal/certify (see internal/certify/suites), so a duplicate catalog
+# uid fails at process start rather than at run time.
+#
+# TWO BUILDS, and the difference is not cosmetic:
+#
+#   build-certify    the ORDINARY sysroot (WOLFSSL_SYSROOT, top of this file).
+#                    Runs everything, but exports no TLS session secrets, so a
+#                    capture's encrypted payloads stay opaque and the affected
+#                    checks say so instead of asserting on ciphertext.
+#   certify-keylog   the KEYLOG sysroot + `-tags keylog`. Exports NSS key-log
+#                    lines, so the capture decrypts and the mbaps/HTTPS
+#                    payload claims become re-checkable. This is the build a
+#                    real certification campaign uses.
+#
+# The keylog build deliberately does NOT reuse the exported CGO_* above: it
+# needs the OTHER sysroot (~/.local/wolfssl-amd64-keylog, built by
+# scripts/build-wolfssl-keylog-sysroot.sh), and pointing -tags keylog at a
+# sysroot without HAVE_SECRET_CALLBACK is a COMPILE error by design — a keylog
+# that silently produced nothing would yield undecryptable captures and a
+# bundle that looks fine until someone tries to verify it.
+WOLFSSL_KEYLOG_SYSROOT ?= $(HOME)/.local/wolfssl-amd64-keylog
+
+build-certify:
+	@mkdir -p bin
+	go build -o bin/certify ./cmd/certify
+
+certify-keylog:
+	@mkdir -p bin
+	@test -d "$(WOLFSSL_KEYLOG_SYSROOT)/include" || { \
+	  echo "certify-keylog: no keylog sysroot at $(WOLFSSL_KEYLOG_SYSROOT)"; \
+	  echo "  build it: bash scripts/build-wolfssl-keylog-sysroot.sh"; exit 1; }
+	CGO_CFLAGS="-I$(WOLFSSL_KEYLOG_SYSROOT)/include" \
+	CGO_LDFLAGS="-L$(WOLFSSL_KEYLOG_SYSROOT)/lib -lwolfssl -lm" \
+	go build -tags keylog -o bin/certify-keylog ./cmd/certify
+
+# The certify gate. Four steps, and each one is load-bearing:
+#
+#   1. vet + the framework/suite unit tests under -race. Every check's decision
+#      logic is proven against synthetic inputs, so the suites have teeth with
+#      no bench in sight.
+#   2. the CGO_ENABLED=0 build. certify must stay usable without a TLS stack —
+#      list, dry-run, verify and report all work there — and this is the gate
+#      on that, not a hope.
+#   3. the keylog CONFIGURATION build. Compiling `-tags keylog` against the
+#      keylog sysroot is the only way to catch a break in the key-export path;
+#      it is skipped with a message where that sysroot is absent, because a
+#      developer without it should not see a red build they cannot fix.
+#   4. the loopback acceptance test (internal/certify/suites): a real dumpcap
+#      capture on `lo` against a real SunSpec device, a real bundle, a real
+#      bundle.Verify, and a deliberately non-conformant peer that must FAIL.
+test-certify:
+	go vet ./cmd/certify/... ./internal/certify/...
+	go test -race ./internal/certify/... ./cmd/certify/...
+	CGO_ENABLED=0 go build ./cmd/certify
+	CGO_ENABLED=0 go test -count=1 ./cmd/certify/
+	@if [ -d "$(WOLFSSL_KEYLOG_SYSROOT)/include" ]; then \
+	  echo "==> keylog configuration build"; \
+	  CGO_CFLAGS="-I$(WOLFSSL_KEYLOG_SYSROOT)/include" \
+	  CGO_LDFLAGS="-L$(WOLFSSL_KEYLOG_SYSROOT)/lib -lwolfssl -lm" \
+	  go build -tags keylog -o /dev/null ./cmd/certify && \
+	  CGO_CFLAGS="-I$(WOLFSSL_KEYLOG_SYSROOT)/include" \
+	  CGO_LDFLAGS="-L$(WOLFSSL_KEYLOG_SYSROOT)/lib -lwolfssl -lm" \
+	  go vet -tags keylog ./cmd/certify/... ./internal/certify/...; \
+	else \
+	  echo "==> keylog configuration SKIPPED: no sysroot at $(WOLFSSL_KEYLOG_SYSROOT)"; \
+	  echo "    build it with scripts/build-wolfssl-keylog-sysroot.sh to cover the key-export path"; \
+	fi
+	go test -race -count=1 ./internal/certify/suites/
 
 # Run every committed aggregator campaign headless against a target (default a
 # loopback mbapsdev started by the caller); exits non-zero if any campaign's
@@ -483,6 +558,8 @@ help:
 	@echo "  make test-integration    Full TLS handshake tests"
 	@echo "  make test-southbound     Southbound Modbus/SunSpec tests (in-process server)"
 	@echo "  make test-evidence       PCAP evidence engine (pure Go, no cgo; dumpcap on lo)"
+	@echo "  make test-certify        Conformance tool: vet, -race units, no-cgo + keylog builds,"
+	@echo "                           and the loopback acceptance run (real capture, real bundle)"
 	@echo ""
 	@echo "Simulator:"
 	@echo "  make modsim-image        Build the Docker image for the SunSpec simulator"
@@ -492,6 +569,9 @@ help:
 	@echo "  make build-mbapsdev      Build the secure Modbus (mbaps) device sim (cgo)"
 	@echo "  make build-aggregator    Build the mbaps aggregator emulator (cgo)"
 	@echo "  make build-ssm-conformance  Build the Secure SunSpec Modbus 62-req conformance walker (cgo)"
+	@echo "  make build-certify       Build the conformance evidence tool (bin/certify, cgo)"
+	@echo "  make certify-keylog      Build it with TLS key export (bin/certify-keylog, -tags keylog)"
+	@echo "                           certify -list | -dry-run | -verify <dir> | -report <dir>"
 	@echo "  make ssm-conformance     Build + run the 62-req suite vs a loopback gateway (zero bench)"
 	@echo "                           Live: make ssm-conformance TARGET=\"-target 69.0.0.2:802 -pki certs/mbaps\""
 	@echo "  make build-dashboard     Build the dashboard binary locally (bin/dashboard)"

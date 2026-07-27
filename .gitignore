@@ -80,3 +80,10 @@ cmd/dashboard/ui/node_modules
 # never be committed.
 sslkeylog.log
 *.keylog
+
+# Conformance evidence bundles (certify -out). These contain packet captures AND
+# keys.log — real TLS session secrets exported by the keylog build. Bundles are
+# run artifacts to be archived deliberately, never committed.
+runs/
+# stray root-level build output from `go build ./cmd/certify`
+/certify

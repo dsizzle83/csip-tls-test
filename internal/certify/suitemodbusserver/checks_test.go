@@ -1,0 +1,524 @@
+package suitemodbusserver
+
+// checks_test.go is where the suite's teeth are proven.
+//
+// Every check gets at least two tests: one against a device built to the
+// specification, and one against a device broken in exactly the way that check
+// exists to catch. A check that only ever ran against a good device would be
+// indistinguishable from a function that returns PASS.
+//
+// The write-driven checks get a third: a device that refuses every write with
+// exception 0x01, standing in for the gateway's control-authority overlay. The
+// correct outcome there is SKIP with the refusal cited — not PASS (nothing was
+// demonstrated) and not FAIL (the DUT's exception ladder was never reached).
+// That distinction is the single most load-bearing behaviour in this package
+// and it is tested for every check that writes.
+
+import (
+	"testing"
+
+	"csip-tls-test/internal/certify"
+)
+
+// --- DEV-1 / DEV-2 ---------------------------------------------------------
+
+func TestDEV1PassesAConformantChainAndProducesAVerifiableBundle(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::DEV-1", checkDEV1, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	if !o.cited() {
+		t.Fatalf("DEV-1 passed with no re-checkable citation:\n%s", o.dump())
+	}
+	base := o.assertion(t, "standard start addresses")
+	if base.Verdict != certify.Pass {
+		t.Errorf("base-address assertion = %s: %s", base.Verdict, base.Observed)
+	}
+	if len(base.Frames) == 0 || base.FramesSHA256 == "" {
+		t.Errorf("the base-address assertion carries no frame digest: %+v", base)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestDEV1FailsAChainWhoseEndModelHasALength(t *testing.T) {
+	dev := newDevice(t, deviceOpts{EndModelLen: 3})
+	o := runCheck(t, "ss-modbus-conf-v1.4::DEV-1", checkDEV1, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	end := o.assertion(t, "terminated by the SunSpec end model")
+	if end.Verdict != certify.Fail {
+		t.Fatalf("end-model assertion = %s, want FAIL: %s", end.Verdict, end.Observed)
+	}
+	if !contains(end.Observed, "length 3") {
+		t.Errorf("the failing assertion does not say what was wrong: %q", end.Observed)
+	}
+}
+
+func TestDEV1SaysItCannotCheckAChainAgainstItself(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::DEV-1", checkDEV1, dev, nil)
+	a := o.assertion(t, "device PICS is located by the discovery walk")
+	if a.Verdict != certify.Skip {
+		t.Fatalf("the PICS comparison claims %s without a PICS: %s", a.Verdict, a.Observed)
+	}
+}
+
+func TestDEV1ComparesAgainstAnOperatorSuppliedPICSModelList(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::DEV-1", checkDEV1, dev,
+		map[string]string{paramPICSModels: "1,701,702,704,999"})
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "device PICS is located by the discovery walk")
+	if a.Verdict != certify.Fail || !contains(a.Observed, "999") {
+		t.Fatalf("a PICS model the device does not serve was not reported: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
+func TestDEV2PassesAConformantModel1(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::DEV-2", checkDEV2, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "mandatory (ID, L, Mn, Md, SN)")
+	if a.Verdict != certify.Pass || !contains(a.Observed, "LEXA Bench") {
+		t.Fatalf("model 1 identity not evidenced: %s / %s", a.Verdict, a.Observed)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestDEV2FailsAModel1WithAnUnimplementedMandatoryPoint(t *testing.T) {
+	dev := newDevice(t, deviceOpts{BlankManufacturer: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::DEV-2", checkDEV2, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "mandatory (ID, L, Mn, Md, SN)")
+	if a.Verdict != certify.Fail || !contains(a.Observed, "Mn") {
+		t.Fatalf("an unimplemented mandatory Mn was not caught: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
+func TestDEV2FailsAPICSIdentityMismatch(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::DEV-2", checkDEV2, dev,
+		map[string]string{paramPICSMn: "Someone Else"})
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "matches what the device PICS declares")
+	if a.Verdict != certify.Fail {
+		t.Fatalf("a PICS mismatch was not reported: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
+// --- MOD-1 / MOD-2 ---------------------------------------------------------
+
+func TestMOD1PassesAConformantDeviceAndSkipsUntranscribedModels(t *testing.T) {
+	dev := newDevice(t, deviceOpts{Full1547: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MOD-1", checkMOD1, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	if !o.hasAssertion("MOD-1.701 step 5") {
+		t.Errorf("no per-model single-point assertion for 701:\n%s", o.dump())
+	}
+	// A curve model must be named and skipped, never silently dropped.
+	skipped := o.assertion(t, "MOD-1.705")
+	if skipped.Verdict != certify.Skip || !contains(skipped.Observed, "runtime-geometry") {
+		t.Errorf("model 705 was not explicitly skipped with a reason: %s / %s", skipped.Verdict, skipped.Observed)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestMOD1FailsAnUnimplementedMandatoryPoint(t *testing.T) {
+	dev := newDevice(t, deviceOpts{UnimplementedACType: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MOD-1", checkMOD1, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "MOD-1.701 step 3")
+	if a.Verdict != certify.Fail || !contains(a.Observed, "ACType") {
+		t.Fatalf("the unimplemented mandatory ACType was not caught: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
+func TestMOD2PassesADeviceThatServesWholeModels(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MOD-2", checkMOD2, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	// Model 701 spans 155 registers, past the 125-register ceiling, so it must
+	// have been read in more than one request and that must be recorded.
+	a := o.assertion(t, "MOD-2.701")
+	if !contains(a.Observed, "2 request(s)") {
+		t.Errorf("the >125-register model was not read in several requests: %q", a.Observed)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestMOD2FailsADeviceThatCannotServeAWholeModelInOneRead(t *testing.T) {
+	dev := newDevice(t, deviceOpts{MaxReadQuantity: 60})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MOD-2", checkMOD2, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "MOD-2.704")
+	if a.Verdict != certify.Fail {
+		t.Fatalf("a model 704 read of 67 registers was refused and MOD-2 did not fail: %s", a.Observed)
+	}
+}
+
+// --- MB-2 ------------------------------------------------------------------
+
+func TestMB2PassesSingleRegisterReads(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MB-2", checkMB2, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "three distinct registers")
+	if a.Verdict != certify.Pass || len(a.Frames) == 0 {
+		t.Fatalf("MB-2 produced no cited evidence: %s / %+v", a.Verdict, a)
+	}
+	// The carve-out observation must be present and must not be graded as a
+	// failure whichever way the device answered.
+	c := o.assertion(t, "longer than 16 bits")
+	if c.Verdict == certify.Fail {
+		t.Errorf("the partial-value carve-out was graded as a failure: %s", c.Observed)
+	}
+}
+
+// --- EXC-1 / EXC-2 / EXC-3 -------------------------------------------------
+
+func TestEXC3PassesADeviceThatRejectsAnUndefinedFunctionCode(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::EXC-3", checkEXC3, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "function code 50")
+	if !contains(a.Observed, "0xb2") && !contains(a.Observed, "0xB2") {
+		t.Errorf("the exception response was not read back off the wire: %q", a.Observed)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestEXC3FailsADeviceThatAnswersAnUndefinedFunctionCode(t *testing.T) {
+	dev := newDevice(t, deviceOpts{AnswerUnknownFunction: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::EXC-3", checkEXC3, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+}
+
+func TestEXC2PassesADeviceThatRefusesReadOnlyWrites(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::EXC-2", checkEXC2, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	o.wantVerifiableBundle(t)
+}
+
+func TestEXC2FailsADeviceThatAppliesAReadOnlyWrite(t *testing.T) {
+	dev := newDevice(t, deviceOpts{AcceptReadOnlyWrites: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::EXC-2", checkEXC2, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "read-only register")
+	if !contains(a.Observed, "ACCEPTED") {
+		t.Errorf("the accepted read-only write was not named: %q", a.Observed)
+	}
+}
+
+func TestEXC1PassesADeviceThatRefusesAnInvalidValue(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::EXC-1", checkEXC1, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	o.wantVerifiableBundle(t)
+}
+
+func TestEXC1FailsADeviceThatAppliesAnInvalidValue(t *testing.T) {
+	dev := newDevice(t, deviceOpts{AcceptInvalidValues: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::EXC-1", checkEXC1, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+}
+
+// TestEXC1SkipsWhenEveryWriteIsDenied is the check that keeps this suite
+// honest: a device refusing every write with 0x01 must NOT be reported as
+// failing the exception ladder, because the ladder was never reached.
+func TestEXC1SkipsWhenEveryWriteIsDenied(t *testing.T) {
+	dev := newDevice(t, deviceOpts{DenyWrites: 0x01})
+	o := runCheck(t, "ss-modbus-conf-v1.4::EXC-1", checkEXC1, dev, nil)
+	o.wantVerdict(t, certify.Skip)
+	a := o.assertion(t, "invalid value written to an RW point")
+	if a.Verdict != certify.Skip {
+		t.Fatalf("a blanket write denial produced %s rather than a skip: %s", a.Verdict, a.Observed)
+	}
+	if !contains(o.Case.Notes, "0x01") {
+		t.Errorf("the notes do not name the refusing exception: %q", o.Case.Notes)
+	}
+}
+
+// --- MB-1 / MOD-3 ----------------------------------------------------------
+
+func TestMB1PassesADeviceThatSupportsBothWriteFunctions(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MB-1", checkMB1, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	if !o.hasAssertion("Function Code 16") || !o.hasAssertion("Function Code 6") {
+		t.Fatalf("MB-1 did not assert both write functions:\n%s", o.dump())
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestMB1FailsADeviceWithoutSingleRegisterWrite(t *testing.T) {
+	dev := newDevice(t, deviceOpts{NoSingleWrite: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MB-1", checkMB1, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "Function Code 6")
+	if a.Verdict != certify.Fail {
+		t.Fatalf("an FC 6 refusal was not reported: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
+func TestMB1SkipsWhenWritesAreDenied(t *testing.T) {
+	dev := newDevice(t, deviceOpts{DenyWrites: 0x01})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MB-1", checkMB1, dev, nil)
+	o.wantVerdict(t, certify.Skip)
+}
+
+func TestMOD3PassesAConformantAdjustablePointSweep(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MOD-3", checkMOD3, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "704.WMaxLimPct accepts every value")
+	if a.Verdict != certify.Pass || !contains(a.Observed, "range source") {
+		t.Fatalf("MOD-3 did not record where its value range came from: %s / %s", a.Verdict, a.Observed)
+	}
+	if !o.hasAssertion("written as a group in a single FC 16") {
+		t.Errorf("MOD-3 did not assert the group write:\n%s", o.dump())
+	}
+	o.wantVerifiableBundle(t)
+}
+
+// TestMOD3FailsWhenAReadBackDoesNotReturnTheWrittenValue exercises the branch
+// that separates MOD-3 from "did the write get an acknowledgement": a device
+// that ACKS a write and stores something else. v1.3 removed the 1000 ms
+// read-after-write allowance, so the read-back must be exact and immediate.
+func TestMOD3FailsWhenAReadBackDoesNotReturnTheWrittenValue(t *testing.T) {
+	dev := newDevice(t, deviceOpts{ClampWMaxLimPct: 40})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MOD-3", checkMOD3, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "704.WMaxLimPct accepts every value")
+	if a.Verdict != certify.Fail || !contains(a.Observed, "read back") {
+		t.Fatalf("an acknowledged-but-clamped write was not reported: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
+func TestMOD3SkipsWhenWritesAreDenied(t *testing.T) {
+	dev := newDevice(t, deviceOpts{DenyWrites: 0x02})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MOD-3", checkMOD3, dev, nil)
+	o.wantVerdict(t, certify.Skip)
+	if !contains(o.Case.Notes, "refused every control write") {
+		t.Errorf("MOD-3's notes do not explain the skip: %q", o.Case.Notes)
+	}
+}
+
+func TestMOD3SuppressesTheEnumerationSweepOnRequest(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MOD-3", checkMOD3, dev,
+		map[string]string{paramNoEnumWrite: "1"})
+	a := o.assertion(t, "704.WMaxLimPctEna accepts every supported")
+	if a.Verdict != certify.Skip {
+		t.Fatalf("the enumeration sweep ran despite -param %s: %s", paramNoEnumWrite, a.Verdict)
+	}
+}
+
+// --- TCP-2 / TCP-3 ---------------------------------------------------------
+
+func TestTCP3PassesADeviceThatReassemblesASplitRequest(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-3", checkTCP3, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	// The stimulus assertion is the one that matters: without it the PASS is a
+	// claim about a reassembly that may never have been asked for.
+	a := o.assertion(t, "genuinely arrived at the DUT in more than one piece")
+	if a.Verdict != certify.Pass {
+		t.Fatalf("the split did not survive to the synthetic wire: %s / %s", a.Verdict, a.Observed)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestTCP3FailsADeviceThatDoesNotReassemble(t *testing.T) {
+	dev := newDevice(t, deviceOpts{NoReassembly: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-3", checkTCP3, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+}
+
+func TestTCP2PassesADeviceThatRecoversOnTheSameConnection(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-2", checkTCP2, dev, nil)
+	// The loopback device consumes the truncated frame's promised bytes from
+	// the follow-up request, which is a legitimate MBAP implementation and is
+	// exactly the "no usable response on the same connection" branch. The
+	// procedure's criterion is then met on a fresh connection.
+	if o.Case.Verdict != certify.Pass && o.Case.Verdict != certify.Warn {
+		t.Fatalf("verdict = %s, want PASS or WARN\n%s", o.Case.Verdict, o.dump())
+	}
+	a := o.assertion(t, "incomplete Modbus request really was sent")
+	if a.Verdict != certify.Pass || !contains(a.Observed, "promises") {
+		t.Fatalf("the truncation was not evidenced on the wire: %s / %s", a.Verdict, a.Observed)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+// --- REV-1 / REV-2 / REV-3 -------------------------------------------------
+
+func TestREV1PassesADeviceWhoseReversionTimerFires(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::REV-1", checkREV1, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	if !o.hasAssertion("reversion settings are in effect") {
+		t.Fatalf("REV-1 did not assert the reversion itself:\n%s", o.dump())
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestREV1FailsADeviceWhoseReversionNeverFires(t *testing.T) {
+	dev := newDevice(t, deviceOpts{ReversionNeverFires: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::REV-1", checkREV1, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "reversion settings are in effect")
+	if a.Verdict != certify.Fail {
+		t.Fatalf("a reversion that never fired was not reported: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
+// TestREV1FailsWhenTheReversionGroupIsIncomplete pins the reading of REV-1
+// step 1: "verify all reversion points are implemented" is a criterion, not a
+// precondition, so a missing remaining-time readback is a FAIL of the procedure
+// and the three timing claims that depend on it become SKIPs.
+func TestREV1FailsWhenTheReversionGroupIsIncomplete(t *testing.T) {
+	dev := newDevice(t, deviceOpts{NoReversionReadback: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::REV-1", checkREV1, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "every reversion point the timer needs is implemented")
+	if a.Verdict != certify.Fail || !contains(a.Observed, "WMaxLimPctRvrtRem") {
+		t.Fatalf("the missing remaining-time point was not named: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
+func TestREV2PassesADeviceWhoseTimerCanBeExtended(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::REV-2", checkREV2, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	o.wantVerifiableBundle(t)
+}
+
+func TestREV2FailsADeviceThatIgnoresAMidCountdownRewrite(t *testing.T) {
+	dev := newDevice(t, deviceOpts{ReversionUnextendable: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::REV-2", checkREV2, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+}
+
+func TestREV3PassesADeviceWhoseTimerCanBeCancelled(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::REV-3", checkREV3, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	o.wantVerifiableBundle(t)
+}
+
+func TestREV3FailsADeviceThatIgnoresTheCancel(t *testing.T) {
+	dev := newDevice(t, deviceOpts{ReversionUncancellable: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::REV-3", checkREV3, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+}
+
+// --- MOD-4 and the scale factor test ---------------------------------------
+
+// TestMOD4FailsAChainMissingProfileModels is the expected outcome against the
+// real DUT, and the test asserts the failure is SPECIFIC: it must name the
+// models the IEEE 1547-2018 profile requires and the device does not serve.
+func TestMOD4FailsAChainMissingProfileModels(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
+	if a.Verdict != certify.Fail {
+		t.Fatalf("a chain missing 703 and 705-712 passed MOD-4: %s", a.Observed)
+	}
+	for _, want := range []string{"703", "705", "712"} {
+		if !contains(a.Observed, want) {
+			t.Errorf("the failing assertion does not name model %s: %q", want, a.Observed)
+		}
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestMOD4PassesAChainCarryingTheWholeProfile(t *testing.T) {
+	dev := newDevice(t, deviceOpts{Full1547: true})
+	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
+	if a.Verdict != certify.Pass {
+		t.Fatalf("a complete profile chain did not pass: %s", a.Observed)
+	}
+}
+
+func TestMOD4RecordsAnOperatorScopedRequirementListAsAnOverride(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev,
+		map[string]string{param1547Models: "1,701,702,704"})
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
+	if !contains(a.Note, "OVERRIDDEN") {
+		t.Fatalf("a scoped claim was made without saying so in the bundle: note=%q", a.Note)
+	}
+}
+
+func TestScaleFactorTestPassesConformantScaleFactors(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-1547-test-v1.1::2.4", checkSF, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	if !o.hasAssertion("does not change between two reads") {
+		t.Errorf("the static-value requirement was not asserted:\n%s", o.dump())
+	}
+	// The procedure's real criterion is delegated to IEEE 1547 and the PICS;
+	// the suite must say it did not assert it rather than implying it did.
+	a := o.assertion(t, "acceptable range required to meet the IEEE 1547 requirements")
+	if a.Verdict != certify.Skip {
+		t.Fatalf("the un-sourced 1547 accuracy envelope was claimed as %s", a.Verdict)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+func TestScaleFactorTestFailsAnOutOfRangeScaleFactor(t *testing.T) {
+	dev := newDevice(t, deviceOpts{BadScaleFactor: true})
+	o := runCheck(t, "ss-1547-test-v1.1::2.4", checkSF, dev, nil)
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "inside the sunssf type's range")
+	if a.Verdict != certify.Fail || !contains(a.Observed, "V_SF") {
+		t.Fatalf("an out-of-range scale factor was not caught: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
+// --- the framework's refusal to let an uncited PASS stand ------------------
+
+// TestAnUncitedPassIsRefused proves the two-phase contract end to end: with no
+// capture at all, a check that would otherwise PASS must not be allowed to.
+func TestAnUncitedPassIsRefused(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	cat, err := certify.LoadDefault()
+	if err != nil {
+		t.Skipf("no committed catalog: %v", err)
+	}
+	reg := certify.NewRegistry()
+	reg.Register("ss-modbus-conf-v1.4::DEV-1", SuiteName, checkDEV1)
+
+	opts := certify.DefaultOptions()
+	opts.OutDir = t.TempDir()
+	opts.Out = discard{}
+	opts.Log = certify.DiscardLogger
+	opts.PKIDir = ""
+	opts.NoCapture = true
+	opts.UIDs = []string{"ss-modbus-conf-v1.4::DEV-1"}
+	opts.Targets = certify.Targets{Gateway: dev.Addr(), GatewayHost: "127.0.0.1"}
+	opts.Params = map[string]string{paramTransport: "plain", paramUnit: "1"}
+
+	run, err := certify.New(reg, cat, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := run.Run(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Cases[0].Verdict == certify.Pass {
+		t.Fatalf("a PASS survived a run with no capture behind it: %+v", rep.Cases[0])
+	}
+	if rep.Cases[0].Downgraded == "" {
+		t.Errorf("the downgrade was not recorded")
+	}
+}
+
+type discard struct{}
+
+func (discard) Write(p []byte) (int, error) { return len(p), nil }

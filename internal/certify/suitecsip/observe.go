@@ -1,0 +1,634 @@
+package suitecsip
+
+// observe.go is the live phase: the levers this suite pulls on the bench's
+// 2030.5 server, and the server-side observations it collects while waiting for
+// the DUT to notice.
+//
+// # The shape of every CSIP check
+//
+// The DUT dials out on its own schedule, so a check cannot make it do anything
+// directly. It can only change what the DUT will find, and then wait. Waiting
+// is the expensive part and the part that goes wrong quietly, so the Driver
+// makes three things explicit:
+//
+//	1. WHAT it is waiting for is a predicate over the SERVER's own view, not a
+//	   sleep. "The DUT has POSTed a Response for mRID X" is checkable; "wait 90
+//	   seconds and hope" is not.
+//	2. HOW LONG it waited is returned and printed, so a bundle reader can tell a
+//	   conformant-but-slow DUT from a non-conformant one.
+//	3. WHAT WAS ALREADY THERE is captured first. gridsim accumulates Responses,
+//	   DER PUTs and LogEvents across the whole campaign; a check that counted
+//	   them absolutely would pass on evidence another agent's check produced.
+//	   Every wait is therefore expressed against a BASELINE taken at the start.
+//
+// # The backoff trap
+//
+// The gateway backs off to a 15-minute retry after sustained northbound
+// failure. Any check that arms a fault must bound it (duration_s) or clear it
+// before waiting for recovery, or it is measuring backoff state rather than
+// conformance. Driver.Arm* all take a bounded duration for exactly that reason,
+// and Driver.ClearFaults is safe to call unconditionally.
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"csip-tls-test/internal/certify"
+)
+
+// pollInterval is how often a wait re-reads the server's view. It is short
+// relative to the DUT's poll cycle (minutes) but long enough not to hammer a
+// shared bench.
+const pollInterval = 3 * time.Second
+
+// logTailBudget bounds the SSE read of gridsim's request log. The endpoint
+// replays its backlog immediately and then streams forever, so a reader must
+// take the backlog and let go.
+const logTailBudget = 2 * time.Second
+
+// ServerRequest is one line of gridsim's request log: what the DUT asked for,
+// as the server recorded it.
+type ServerRequest struct {
+	// At is the log line's own timestamp when the line carried one. It is the
+	// SERVER's clock, not the capture's, and is therefore never used for a
+	// timing criterion — only for ordering and for reporting.
+	At     time.Time
+	Method string
+	Path   string
+	Peer   string
+	Raw    string
+}
+
+// AdminResponse mirrors gridsim's GET /admin/responses entry.
+type AdminResponse struct {
+	Subject string `json:"subject"`
+	Status  uint8  `json:"status"`
+	LFDI    string `json:"lfdi"`
+}
+
+// AdminDERPut mirrors gridsim's GET /admin/derputs entry.
+type AdminDERPut struct {
+	Path       string `json:"path"`
+	Resource   string `json:"resource"`
+	Body       string `json:"body"`
+	ReceivedAt int64  `json:"received_at"`
+}
+
+// AdminControl mirrors one control in gridsim's GET /admin/status.
+type AdminControl struct {
+	MRID        string `json:"mrid"`
+	Description string `json:"description"`
+	Start       int64  `json:"start"`
+	DurationS   int    `json:"duration_s"`
+	Status      int    `json:"status"`
+	Curve       string `json:"curve,omitempty"`
+}
+
+// AdminProgram mirrors one program in gridsim's GET /admin/status.
+type AdminProgram struct {
+	ID          int            `json:"id"`
+	MRID        string         `json:"mrid"`
+	Description string         `json:"description"`
+	Primacy     int            `json:"primacy"`
+	Active      []AdminControl `json:"active"`
+	Scheduled   []AdminControl `json:"scheduled"`
+}
+
+// AdminStatus mirrors gridsim's GET /admin/status.
+type AdminStatus struct {
+	Programs   []AdminProgram `json:"programs"`
+	ServerTime int64          `json:"server_time"`
+}
+
+// ServerView is the tier-3 record: everything the bench's 2030.5 server saw.
+//
+// It is a real observation of the DUT — made by its peer — but it is not the
+// wire, so every assertion resting on it is a Narrative naming gridsim as the
+// source. See the package doc's tier discussion.
+type ServerView struct {
+	Available bool
+	BaseURL   string
+
+	Requests  []ServerRequest
+	Responses []AdminResponse
+	DERPuts   []AdminDERPut
+	LogEvents []map[string]any
+	Status    AdminStatus
+
+	// Errors records what could not be collected, so a partial view is never
+	// mistaken for a complete one.
+	Errors []string
+}
+
+// Since returns the view's entries that are new relative to a baseline taken
+// earlier in the same run. Baselines are how a check avoids passing on evidence
+// another agent's test case produced.
+func (v ServerView) Since(base ServerView) ServerView {
+	out := v
+	out.Requests = v.Requests[min(len(base.Requests), len(v.Requests)):]
+	out.Responses = v.Responses[min(len(base.Responses), len(v.Responses)):]
+	out.DERPuts = v.DERPuts[min(len(base.DERPuts), len(v.DERPuts)):]
+	out.LogEvents = v.LogEvents[min(len(base.LogEvents), len(v.LogEvents)):]
+	return out
+}
+
+// ResponsesFor returns the Responses whose subject is the given mRID.
+func (v ServerView) ResponsesFor(mrid string) []AdminResponse {
+	var out []AdminResponse
+	for _, r := range v.Responses {
+		if strings.EqualFold(r.Subject, mrid) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// HasResponse reports whether a Response with the given subject and status was
+// received.
+func (v ServerView) HasResponse(mrid string, status uint8) bool {
+	for _, r := range v.ResponsesFor(mrid) {
+		if r.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+// ResponseStatuses lists the statuses received for an mRID, ascending, for an
+// Observed field.
+func (v ServerView) ResponseStatuses(mrid string) []int {
+	var out []int
+	for _, r := range v.ResponsesFor(mrid) {
+		out = append(out, int(r.Status))
+	}
+	sort.Ints(out)
+	return out
+}
+
+// GETs counts the request-log lines that are a GET of path.
+func (v ServerView) GETs(path string) int {
+	n := 0
+	for _, r := range v.Requests {
+		if r.Method == "GET" && r.Path == path {
+			n++
+		}
+	}
+	return n
+}
+
+// PutsFor returns the DER report PUTs whose recorded root element matches.
+func (v ServerView) PutsFor(resource string) []AdminDERPut {
+	var out []AdminDERPut
+	for _, p := range v.DERPuts {
+		if p.Resource == resource {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// Observation is everything a check's decision logic is handed. Keeping it a
+// value with no bench handles is what makes every evaluator in this suite
+// unit-testable from synthetic input.
+type Observation struct {
+	Case *certify.Case
+
+	// Transcript is the recovered session, or nil when none was; NoSession then
+	// says why.
+	Transcript *Transcript
+	NoSession  string
+
+	// Server is the server-side view, already differenced against the check's
+	// baseline where the check took one.
+	Server ServerView
+
+	// Waited is how long the live phase waited for the DUT, and Satisfied
+	// reports whether the wait's predicate came true. A check whose predicate
+	// never came true must not report a conformance failure on that basis alone
+	// without saying how long it gave the DUT.
+	Waited    time.Duration
+	Satisfied bool
+
+	// Params carries per-check facts the live phase established (an mRID it
+	// posted, a PIN it configured) into the citation phase.
+	Params map[string]string
+
+	notes map[string][]string
+}
+
+// note records why an evaluator could not answer, so the eventual SKIP carries
+// the whole story rather than only the last sentence.
+func (o *Observation) note(claim, reason string) {
+	if o.notes == nil {
+		o.notes = map[string][]string{}
+	}
+	o.notes[claim] = append(o.notes[claim], reason)
+}
+
+func (o *Observation) notesFor(claim string) []string { return o.notes[claim] }
+
+// Param reads a value the live phase stashed.
+func (o *Observation) Param(key string) string {
+	if o.Params == nil {
+		return ""
+	}
+	return o.Params[key]
+}
+
+// Driver is the live-phase handle: gridsim's admin API plus the wait loop.
+type Driver struct {
+	rc    *certify.RunCtx
+	Admin *certify.AdminClient
+
+	// LogReader fetches gridsim's request-log backlog. It is a field so a test
+	// can substitute one without a listener; nil uses the real SSE reader.
+	LogReader func(ctx context.Context, baseURL string) ([]string, error)
+}
+
+// NewDriver builds a driver from the check's run context.
+func NewDriver(rc *certify.RunCtx) *Driver {
+	return &Driver{rc: rc, Admin: rc.GridSim}
+}
+
+// Available reports whether gridsim's admin API was configured for this run.
+func (d *Driver) Available() bool { return d.Admin.Available() }
+
+// Snapshot collects the server-side view.
+//
+// A failure to collect one part is recorded and the rest is still returned: a
+// missing request log must not cost a check the Response record that would have
+// decided it.
+func (d *Driver) Snapshot(ctx context.Context) ServerView {
+	v := ServerView{BaseURL: d.Admin.BaseURL}
+	if !d.Admin.Available() {
+		v.Errors = append(v.Errors, "no gridsim admin URL was configured (-gridsim-admin)")
+		return v
+	}
+	v.Available = true
+
+	var st AdminStatus
+	if err := d.Admin.Status(ctx, &st); err != nil {
+		v.Errors = append(v.Errors, "GET /admin/status: "+err.Error())
+	} else {
+		v.Status = st
+	}
+	var rs struct {
+		Responses []AdminResponse `json:"responses"`
+	}
+	if err := d.Admin.Responses(ctx, &rs); err != nil {
+		v.Errors = append(v.Errors, "GET /admin/responses: "+err.Error())
+	} else {
+		v.Responses = rs.Responses
+	}
+	var dp struct {
+		DERPuts []AdminDERPut `json:"der_puts"`
+	}
+	if err := d.Admin.DERPuts(ctx, &dp); err != nil {
+		v.Errors = append(v.Errors, "GET /admin/derputs: "+err.Error())
+	} else {
+		v.DERPuts = dp.DERPuts
+	}
+	var le struct {
+		LogEvents []map[string]any `json:"log_events"`
+	}
+	if err := d.Admin.LogEvents(ctx, &le); err != nil {
+		v.Errors = append(v.Errors, "GET /admin/logevents: "+err.Error())
+	} else {
+		v.LogEvents = le.LogEvents
+	}
+
+	lines, err := d.readLog(ctx)
+	if err != nil {
+		v.Errors = append(v.Errors, "GET /admin/logs: "+err.Error())
+	} else {
+		v.Requests = parseRequestLog(lines)
+	}
+	return v
+}
+
+func (d *Driver) readLog(ctx context.Context) ([]string, error) {
+	if d.LogReader != nil {
+		return d.LogReader(ctx, d.Admin.BaseURL)
+	}
+	return readSSEBacklog(ctx, d.Admin.BaseURL+"/admin/logs", logTailBudget)
+}
+
+// readSSEBacklog reads the replayed backlog of an SSE endpoint and returns.
+//
+// gridsim's /admin/logs streams forever, so an ordinary GET-and-read-all would
+// block until the client's timeout and then throw the body away. This reads
+// lines until the stream goes quiet for a moment, which is exactly when the
+// backlog has been replayed and the live tail has not yet produced anything.
+func readSSEBacklog(ctx context.Context, url string, budget time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	var out []string
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for sc.Scan() {
+		line := sc.Text()
+		if v, ok := strings.CutPrefix(line, "data: "); ok {
+			out = append(out, v)
+		}
+	}
+	// The deadline firing is the expected way out, not a failure.
+	if err := sc.Err(); err != nil && ctx.Err() == nil {
+		return out, err
+	}
+	return out, nil
+}
+
+// requestLinePrefix is what gridsim's per-request log line looks like after the
+// standard logger's date/time prefix: "[gridsim] GET /dcap (peer=<lfdi>)".
+const requestLinePrefix = "[gridsim] "
+
+// parseRequestLog extracts the DUT's requests from gridsim's log lines.
+func parseRequestLog(lines []string) []ServerRequest {
+	var out []ServerRequest
+	for _, ln := range lines {
+		at, rest := splitLogTimestamp(ln)
+		i := strings.Index(rest, requestLinePrefix)
+		if i < 0 {
+			continue
+		}
+		body := rest[i+len(requestLinePrefix):]
+		fields := strings.Fields(body)
+		if len(fields) < 2 || !isHTTPMethod(fields[0]) || !strings.HasPrefix(fields[1], "/") {
+			continue
+		}
+		r := ServerRequest{At: at, Method: fields[0], Path: fields[1], Raw: ln}
+		if j := strings.Index(body, "(peer="); j >= 0 {
+			if k := strings.IndexByte(body[j:], ')'); k > 0 {
+				r.Peer = body[j+len("(peer=") : j+k]
+			}
+		}
+		if q := strings.IndexByte(r.Path, '?'); q >= 0 {
+			r.Path = r.Path[:q]
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func isHTTPMethod(s string) bool {
+	switch s {
+	case "GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS", "PATCH":
+		return true
+	}
+	return false
+}
+
+// splitLogTimestamp peels the standard logger's "2026/07/26 12:00:00" prefix
+// off a line, returning the parsed time (zero if absent) and the remainder.
+func splitLogTimestamp(ln string) (time.Time, string) {
+	const layout = "2006/01/02 15:04:05"
+	if len(ln) < len(layout) {
+		return time.Time{}, ln
+	}
+	t, err := time.ParseInLocation(layout, ln[:len(layout)], time.Local)
+	if err != nil {
+		return time.Time{}, ln
+	}
+	return t, strings.TrimSpace(ln[len(layout):])
+}
+
+// Await polls the server view until want reports satisfied or the deadline
+// expires. It returns the last view, how long it waited, and whether the
+// predicate came true.
+//
+// It never returns an error for "the DUT did not do it in time": that is a
+// finding for the check to phrase, and one whose right verdict depends on
+// whether the procedure states a deadline.
+func (d *Driver) Await(ctx context.Context, timeout time.Duration, want func(ServerView) bool) (ServerView, time.Duration, bool) {
+	start := time.Now()
+	view := d.Snapshot(ctx)
+	if !view.Available {
+		return view, 0, false
+	}
+	if want(view) {
+		return view, time.Since(start), true
+	}
+	deadline := start.Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := d.rc.Sleep(ctx, pollInterval); err != nil {
+			return view, time.Since(start), false
+		}
+		view = d.Snapshot(ctx)
+		if want(view) {
+			return view, time.Since(start), true
+		}
+	}
+	return view, time.Since(start), false
+}
+
+// AwaitWalk waits for the DUT to complete at least one fresh discovery walk,
+// detected as a new GET of the discovery root in gridsim's request log.
+//
+// The request log is a bounded ring (400 lines) and one walk produces dozens of
+// lines, so on a busy bench the baseline can roll out from under this. That is
+// why the predicate is "strictly more /dcap GETs than the baseline" rather than
+// an exact count: an undercount makes the check wait longer, never pass early.
+func (d *Driver) AwaitWalk(ctx context.Context, base ServerView, timeout time.Duration) (ServerView, time.Duration, bool) {
+	want := base.GETs(DiscoveryRoot) + 1
+	return d.Await(ctx, timeout, func(v ServerView) bool { return v.GETs(DiscoveryRoot) >= want })
+}
+
+// DiscoveryRoot is the only path a 2030.5 client may hard-code; every other URL
+// it uses must come from a link in a resource it fetched.
+const DiscoveryRoot = "/dcap"
+
+// ── levers ───────────────────────────────────────────────────────────────────
+
+// ControlRequest is the body of gridsim's POST /admin/control. Only the fields
+// this suite uses are modelled; gridsim owns the schema and the framework's
+// AdminClient deliberately passes bodies through untyped.
+type ControlRequest struct {
+	Program     int    `json:"program"`
+	Description string `json:"description"`
+	StartOffset int    `json:"start_offset_s"`
+	DurationS   int    `json:"duration_s"`
+	Activate    bool   `json:"activate"`
+
+	MRID                  string `json:"mrid,omitempty"`
+	PotentiallySuperseded *bool  `json:"potentially_superseded,omitempty"`
+	CurrentStatus         *uint8 `json:"current_status,omitempty"`
+	CreationOffsetS       *int   `json:"creation_offset_s,omitempty"`
+	RandomizeStart        *int32 `json:"randomize_start,omitempty"`
+	RandomizeDuration     *int32 `json:"randomize_duration,omitempty"`
+
+	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
+	MaxLimW        *int64 `json:"max_lim_W,omitempty"`
+	ImpLimW        *int64 `json:"imp_lim_W,omitempty"`
+	GenLimW        *int64 `json:"gen_lim_W,omitempty"`
+	LoadLimW       *int64 `json:"load_lim_W,omitempty"`
+	FixedW         *int64 `json:"fixed_W,omitempty"`
+	Connect        *bool  `json:"connect,omitempty"`
+	Energize       *bool  `json:"energize,omitempty"`
+	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
+	FixedPFAbsorbW *int64 `json:"fixed_pf_absorb_pct,omitempty"`
+	FixedVarPct    *int64 `json:"fixed_var_pct,omitempty"`
+}
+
+// PostControl publishes a DERControl and returns the mRID gridsim assigned.
+func (d *Driver) PostControl(ctx context.Context, req ControlRequest) (string, error) {
+	var out struct {
+		MRID string `json:"mrid"`
+	}
+	if err := d.Admin.Control(ctx, req, &out); err != nil {
+		return "", err
+	}
+	if out.MRID == "" {
+		out.MRID = req.MRID
+	}
+	return out.MRID, nil
+}
+
+// CurveRequest is the body of gridsim's POST /admin/curve: a DER curve bound
+// into an active DERControl, which is the only way a curve-based mode
+// (Volt-VAr, Volt-Watt, Freq-Watt, Watt-PF) reaches the DUT.
+type CurveRequest struct {
+	Program     int          `json:"program"`
+	Mode        string       `json:"mode"`
+	Points      []CurvePoint `json:"points"`
+	VRef        int16        `json:"vref,omitempty"`
+	XMult       int8         `json:"x_mult,omitempty"`
+	YMult       int8         `json:"y_mult,omitempty"`
+	XRefType    uint8        `json:"x_ref_type,omitempty"`
+	YRefType    uint8        `json:"y_ref_type,omitempty"`
+	Description string       `json:"description,omitempty"`
+	DurationS   int          `json:"duration_s,omitempty"`
+	StartOffset int          `json:"start_offset_s,omitempty"`
+	Activate    bool         `json:"activate"`
+}
+
+// CurvePoint is one (x, y) breakpoint.
+type CurvePoint struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+// PostCurve publishes a curve-linked control and returns its mRID.
+func (d *Driver) PostCurve(ctx context.Context, req CurveRequest) (string, error) {
+	var out struct {
+		MRID string `json:"mrid"`
+	}
+	if err := d.Admin.Post(ctx, "curve", req, &out); err != nil {
+		return "", err
+	}
+	return out.MRID, nil
+}
+
+// ClearControls removes the admin-posted controls from a program, so a check
+// leaves the bench as it found it.
+func (d *Driver) ClearControls(ctx context.Context, program int) error {
+	_, err := d.Admin.Raw(ctx, http.MethodDelete, "/admin/control?program="+strconv.Itoa(program), nil)
+	return err
+}
+
+// ClearCurves removes admin-posted curve controls from a program.
+func (d *Driver) ClearCurves(ctx context.Context, program int) error {
+	_, err := d.Admin.Raw(ctx, http.MethodDelete, "/admin/curve?program="+strconv.Itoa(program), nil)
+	return err
+}
+
+// ArmRedirect makes the next count GETs of path answer 301/302 with a Location.
+func (d *Driver) ArmRedirect(ctx context.Context, path, location string, code, count int) error {
+	return d.Admin.Post(ctx, "redirect", map[string]any{
+		"path": path, "location": location, "code": code, "count": count,
+	}, nil)
+}
+
+// ClearRedirect disarms redirect injection.
+func (d *Driver) ClearRedirect(ctx context.Context) error {
+	return d.Admin.Post(ctx, "redirect", map[string]any{"clear": true}, nil)
+}
+
+// ArmGone makes GETs of path answer 410. count > 0 heals after that many.
+func (d *Driver) ArmGone(ctx context.Context, path string, count int) error {
+	return d.Admin.Post(ctx, "gone", map[string]any{"path": path, "count": count}, nil)
+}
+
+// ClearGone disarms 410 injection.
+func (d *Driver) ClearGone(ctx context.Context) error {
+	return d.Admin.Post(ctx, "gone", map[string]any{"clear": true}, nil)
+}
+
+// ArmOutage answers every CSIP request 503 for durationS seconds. The duration
+// is mandatory here (unlike gridsim's API, where it is optional) because an
+// unbounded outage on a shared bench pushes the DUT into its 15-minute backoff
+// and poisons every later test case in the campaign.
+func (d *Driver) ArmOutage(ctx context.Context, mode string, durationS int) error {
+	if durationS <= 0 {
+		return fmt.Errorf("suitecsip: an outage must be bounded (durationS > 0): an unbounded northbound " +
+			"failure drives the DUT into its 15-minute retry backoff and invalidates every later test case")
+	}
+	return d.Admin.Post(ctx, "outage", map[string]any{"mode": mode, "duration_s": durationS}, nil)
+}
+
+// ClearOutage clears an armed outage.
+func (d *Driver) ClearOutage(ctx context.Context) error {
+	return d.Admin.Post(ctx, "outage", map[string]any{"clear": true}, nil)
+}
+
+// ArmPaginate makes list resources honour ?s=&l= and serve pageSize entries at
+// a time, with honest all/results — the positive pagination case CORE-004's
+// client-side twin needs.
+func (d *Driver) ArmPaginate(ctx context.Context, pageSize int, path string) error {
+	return d.Admin.Post(ctx, "paginate", map[string]any{"page_size": pageSize, "path": path}, nil)
+}
+
+// ClearPaginate disarms pagination.
+func (d *Driver) ClearPaginate(ctx context.Context) error {
+	return d.Admin.Post(ctx, "paginate", map[string]any{"clear": true}, nil)
+}
+
+// ArmMalform serves a deliberately non-conformant variant of one resource.
+func (d *Driver) ArmMalform(ctx context.Context, kind string) error {
+	return d.Admin.Post(ctx, "malform", map[string]any{"kind": kind}, nil)
+}
+
+// ClearMalform disarms malformed-resource injection.
+func (d *Driver) ClearMalform(ctx context.Context) error {
+	return d.Admin.Post(ctx, "malform", map[string]any{"clear": true}, nil)
+}
+
+// SetClock warps gridsim's 2030.5 clock by an offset in seconds, which is how a
+// check reaches a scheduled event's start without waiting for it.
+func (d *Driver) SetClock(ctx context.Context, offsetS int64) error {
+	return d.Admin.Clock(ctx, map[string]any{"offset_s": offsetS}, nil)
+}
+
+// ClearFaults disarms every fault mode this suite can arm. It is called from a
+// check's cleanup path unconditionally: leaving the shared bench's 2030.5
+// server in an injected-fault state would corrupt every test case that follows,
+// including other agents'.
+func (d *Driver) ClearFaults(ctx context.Context) []error {
+	var errs []error
+	for _, f := range []func(context.Context) error{
+		d.ClearRedirect, d.ClearGone, d.ClearOutage, d.ClearPaginate, d.ClearMalform,
+	} {
+		if err := f(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}

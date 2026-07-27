@@ -238,6 +238,18 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// copyFile copies src to dst, creating dst's directory.
+//
+// The same-file guard is not paranoia; it is the fix for a bug that destroyed
+// evidence. The natural way to invoke a conformance run is `-out runs/<ts>/`,
+// and the runner writes its capture to `<out>/capture/run-<ts>.pcapng` — which
+// is EXACTLY where the bundle then copies it. Without this check os.Create
+// truncates the destination first, the destination IS the source, and the run's
+// entire packet capture becomes a zero-byte file: the console reports the
+// frames it counted before the copy, the bundle looks complete, and every
+// citation in it is unverifiable. Copying a file onto itself has one correct
+// outcome — leave it alone and report success — and getting it wrong is silent
+// right up until somebody tries to verify the bundle.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -246,6 +258,11 @@ func copyFile(src, dst string) error {
 	defer func() { _ = in.Close() }()
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
+	}
+	if si, serr := in.Stat(); serr == nil {
+		if di, derr := os.Stat(dst); derr == nil && os.SameFile(si, di) {
+			return nil
+		}
 	}
 	out, err := os.Create(dst)
 	if err != nil {

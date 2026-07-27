@@ -1,0 +1,478 @@
+# `certify` — the conformance evidence tool
+
+`cmd/certify` drives the LEXA DER gateway through the published SunSpec / CSIP
+conformance test procedures and emits an **evidence bundle**: a packet capture
+plus a machine-checkable mapping from each test case to the exact frames and
+byte ranges that demonstrate its pass criteria. A third party verifies the
+bundle with one command, reading nothing but the directory we hand them.
+
+It is built on the bench's own independent stacks. The referee never uses the
+product's implementations — `internal/mbtls` rather than
+`lexa-platform/securemodbus`, `internal/csipref` rather than the hub's walker —
+so a profile, authorization, or scheduler bug in the device under test cannot
+hide behind a shared implementation (PN-1 / C9 / AD-003(f)). Only
+`lexa-proto/{mbap,modbus,sunspec,csipmodel}` is shared, because the wire format
+is the wire format.
+
+---
+
+## 1. Coverage of the standard
+
+The specification is `testdata/catalog/catalog.json` — 282 test cases extracted
+from eight published documents, committed, and hashed into every bundle so a
+reader can answer "which version of the spec was this measured against?" by
+hashing a file in front of them.
+
+| Document | Selected | Applicable | Implemented | …of which the extraction marks inapplicable | Unimplemented | Not applicable, no check |
+|---|---:|---:|---:|---:|---:|---:|
+| CSIP-CONF-v1.3 | 79 | 51 | 79 | 28 | **0** | 0 |
+| SS-1547-TEST-v1.1 | 2 | 2 | 2 | 0 | **0** | 0 |
+| SS-CSIP-RESULTS-v1.1 | 47 | 45 | 45 | 0 | **0** | 2 |
+| SS-MODBUS-CLIENT-CONF-v1.1 | 16 | 15 | 16 | 1 | **0** | 0 |
+| SS-MODBUS-CONF-v1.4 | 24 | 15 | 15 | 0 | **0** | 9 |
+| SS-MODBUS-RESULTS-v1.2 | 54 | 52 | 52 | 0 | **0** | 2 |
+| SS-TEST-PKI | 21 | 6 | 10 | 4 | **0** | 11 |
+| SSM-CONF-v0.8 | 39 | 37 | 37 | 0 | **0** | 2 |
+| **TOTAL** | **282** | **223** | **256** | **33** | **0** | **26** |
+
+Of the 256 implemented cases, the extraction rates 143 fully automatable, 35
+partially, and 78 manual — a manual case still gets a check, because recording
+an operator's observation inside a timestamped frame window is worth more than
+recording nothing.
+
+Regenerate the table at any time, and gate on it:
+
+```bash
+bin/certify -list                  # the table above, plus every gap by name
+bin/certify -list -details         # every one of the 282 cases, with its status
+bin/certify -list -json            # certify.Coverage, for a pipeline
+```
+
+`-list` exits **1** if any applicable case has no implementation or any
+registration names a uid the catalog does not contain. A coverage regression
+fails a pipeline; it is not a formatting preference.
+
+### The four columns, precisely
+
+* **Implemented** — a suite registered a check for the uid. The check runs.
+* **Unimplemented** — the case is applicable to this product and nobody wrote a
+  check. **This is zero, and the tool refuses to print "ALL TEST CASES
+  ADDRESSED" while it is not.**
+* **Not applicable, no check** — the extraction marked the case inapplicable and
+  no check is registered. These 26 are printed in the coverage report *with the
+  extraction's own reason*, which is why they are deliberately left
+  unregistered: registering a check that could only ever SKIP would file the row
+  under "Implemented" and lose the reason. Examples: `SS-MODBUS-CONF-v1.4`'s
+  TCP-1 (asserts a plaintext Modbus/TCP interface on :502; the DUT's northbound
+  Modbus is mbaps-only on :802, so a PASS would be a claim about a closed port),
+  RTU-1..5 (no northbound serial interface), CRV-1..3 (no model with curves);
+  `SS-TEST-PKI`'s PKI-2, PKI-9..10, PKI-12..18, PKI-21 (requirements on the
+  SunSpec Alliance certificate *package* a lab ships, not on the device).
+* **…of which the extraction marks inapplicable** — 33 cases carry a check even
+  though the extraction rated them inapplicable, because exercising the row is
+  worth more than assuming it. They count as Implemented, not as N/A. The three
+  columns therefore do not sum to the total, and `-list` says so on the totals
+  line rather than leaving a reviewer to reconcile it.
+
+### SKIP is a runtime verdict, not a coverage number
+
+A check that runs and cannot assert its criterion here reports **SKIP with the
+reason**, and that is a property of the *run*, not of the tool. It depends on
+what the DUT serves, which bench pieces are present, and which capabilities the
+invocation has. A real run reads like this (loopback SunSpec device, 24 cases of
+`SS-MODBUS-CONF-v1.4`):
+
+```
+PASS 7 · FAIL 0 · SKIP 16 · WARN 1
+  SKIP  REV-1  the DUT serves no model 704, so it exposes no reversion timer
+  SKIP  EXC-1  the DUT serves no model this suite knows an invalid value for
+  SKIP  TCP-1  not applicable to this product: no plaintext Modbus/TCP interface
+```
+
+Every SKIP names its reason. None is silent, and none is counted as a pass.
+
+---
+
+## 2. Running it
+
+### Build — two configurations, and the difference is not cosmetic
+
+```bash
+make build-certify      # bin/certify        — ordinary wolfSSL sysroot
+make certify-keylog     # bin/certify-keylog — keylog sysroot + -tags keylog
+```
+
+The ordinary build runs everything but exports no TLS session secrets, so a
+capture's encrypted payloads stay opaque and the affected checks say so instead
+of asserting on ciphertext. The keylog build exports NSS key-log lines so the
+capture decrypts and the mbaps / HTTPS payload claims become re-checkable.
+**A certification campaign uses the keylog build.**
+
+Passing `-keylog` to the ordinary build is a hard error naming both the sysroot
+and the tag. It is not a warning: a run that believes its capture is decryptable
+and is not produces a bundle that looks complete until someone tries to verify
+it, days later.
+
+A `CGO_ENABLED=0` build also works and is not a lie — `-list`, `-dry-run`,
+`-verify` and `-report` are fully functional and every plaintext-transport check
+runs; only the mbaps transport is absent, and the checks that need it say so.
+
+### The five modes
+
+```bash
+# What does the tool cover?
+bin/certify -list [-doc SSM-CONF-v0.8] [-details] [-json]
+
+# What would this selection run, and what would it skip, and why?
+bin/certify -doc SSM-CONF-v0.8 -dry-run
+
+# A real run.
+bin/certify-keylog \
+    -target 69.0.0.2:802 -iface enp1s0 \
+    -pki certs/mbaps -gridsim-admin http://69.0.0.20:11114 \
+    -keylog runs/2026-07-26/run.keylog \
+    -out runs/2026-07-26/ \
+    -operator "your name" -dut-name lexa-gw -dut-build <fw version>
+
+# Re-verify a bundle, standalone, trusting nothing.
+bin/certify -verify runs/2026-07-26/
+
+# Turn a bundle into a SunSpec submission.
+bin/certify -report runs/2026-07-26/ -config lab.json
+```
+
+Two more that matter day to day:
+
+```bash
+# Which capability tags does this invocation have, and what do they gate?
+bin/certify -capabilities -target 69.0.0.2:802 -pki certs/mbaps
+
+# Logic-only: no capture, no wire citation. For developing checks.
+bin/certify -no-capture -suite modbus-server -target 127.0.0.1:5020 \
+            -param modbus.transport=plain -out /tmp/dev-run
+```
+
+A `-no-capture` run prints, in as many words, that **the bundle it produced is
+not evidence** and must not be submitted.
+
+### Selection and configuration
+
+| Flag | Purpose |
+|---|---|
+| `-doc` `-uid` `-suite` `-role` | select cases (repeatable, comma-separated). A typo is refused, not silently narrowed to nothing. |
+| `-applicable` `-automatable full\|partial\|manual` | narrow by the extraction's judgement |
+| `-target` / `-gateway` | the DUT's mbaps address. `-target` wins; the bare host is derived from it. |
+| `-pki` | mbaps certificate fixtures (`make gen-mbaps-certs` → `certs/mbaps`) |
+| `-gridsim` `-gridsim-admin` | the 2030.5 server the DUT's CSIP client dials, and its admin API |
+| `-modsim` `-modsim-api` `-mbapsdev` `-mbapsdev-api` | southbound sims and their simapi sidecars |
+| `-iface` `-bpf` | capture interface and filter. **Empty filter is the safe default**: a frame a filter excluded is not recoverable afterwards. |
+| `-keylog` | NSS key-log path (keylog build only) |
+| `-no-capture` | logic-only run; no wire citation is then possible |
+| `-capture-settle` | pause before stopping the capture so it flushes (default 750 ms — see §5) |
+| `-guard` | frame-attribution guard at each end of a check's window |
+| `-param k=v` | procedure parameters, e.g. `-param modbus.transport=plain`, `-param pics.mn="Acme"` |
+| `-cap TAG` | assert a capability the runner cannot detect (e.g. `root`) |
+| `-timeout` | per-check timeout (default 3 m) |
+| `-require-coverage` | fail the run if an applicable case has no implementation |
+| `-operator` `-note` `-dut-*` | recorded in the bundle |
+
+### Exit status
+
+| Code | Meaning |
+|---|---|
+| `0` | clean: every applicable selected case addressed, no FAIL, the bundle verifies |
+| `1` | a negative **result**: a conformance failure, an unaddressed applicable case, a capture-integrity finding, a bundle that does not verify |
+| `2` | the tool could not run: bad flags, no catalog, no capture interface |
+
+The split matters. Exit 1 is a fact about the DUT or the evidence; exit 2 is a
+fact about the invocation. A pipeline that cannot tell them apart will
+eventually report a broken bench as a passing device.
+
+---
+
+## 3. What the evidence bundle contains
+
+```
+runs/2026-07-26/
+├── bundle.json          every test case, verdict, and assertion, with citations
+├── REPORT.md            the human-readable report, frames cited inline
+├── COVERAGE.md          coverage of the catalog for THIS selection, gaps by name
+├── MANIFEST.sha256      sha256 of every file — plain `sha256sum -c` format
+├── catalog.json         the specification the run was measured against
+└── capture/
+    ├── run-<ts>.pcapng  the packet capture
+    └── run-<ts>.keylog  NSS key log (keylog build only)
+```
+
+An **assertion** is one checkable claim. It carries the claim in prose, the
+method, the verdict, what was observed — and a citation:
+
+* **frame citation** — the capture frame numbers, plus a sha256 over those
+  frames' bytes; or
+* **byte-range citation** — a reassembled TCP stream, a half-open byte range,
+  and a sha256 over exactly those bytes.
+
+An assertion with no citation is counted separately everywhere and is never
+described as verified.
+
+### The three ways this tool could lie, and what stops each
+
+1. **A PASS it never asserted.** After the citation phase every PASS is
+   inspected. If nothing behind it carries a digest the verifier can re-derive,
+   the verdict is downgraded to **WARN** and the reason is printed and recorded
+   — unless the check declared the criterion off-wire *with a reason*, which is
+   printed in the bundle so a reader knows the row rests on something other than
+   the pcap.
+2. **A quietly dropped test case.** The catalog is the specification. The runner
+   emits a record for every selected case, implemented or not, and the summary
+   refuses to print "ALL TEST CASES ADDRESSED" while an applicable case has no
+   implementation.
+3. **The wrong frames.** This bench carries continuous background traffic —
+   10-second southbound Modbus polls, a CSIP client walking the server — on the
+   same wire as the test. Attribution is therefore on **two** signals: a frame
+   belongs to a check only if it falls inside that check's time window *and*
+   matches a connection the check explicitly claimed. A frame claimed by two
+   checks is attributed to neither and reported as contested.
+
+---
+
+## 4. How a third party verifies a bundle without trusting us
+
+```bash
+certify -verify runs/2026-07-26/
+```
+
+That reads **only** the directory. No bench, no device, no network, no catalog,
+no state from the run that produced it. It re-derives, from the capture file
+sitting in that directory, that
+
+* every file is byte-for-byte what `MANIFEST.sha256` says (so the capture has
+  not been edited since the report was written),
+* every frame an assertion cites exists in that capture, and
+* the bytes at every cited stream offset hash to the value recorded in the
+  assertion.
+
+Someone who does not want to run our binary at all can do most of it with
+standard tools:
+
+```bash
+cd runs/2026-07-26 && sha256sum -c MANIFEST.sha256   # the manifest is plain sha256sum format
+wireshark capture/run-*.pcapng                        # go to the cited frame numbers
+# For encrypted payloads: Preferences → Protocols → TLS → (Pre)-Master-Secret log
+# and point it at capture/run-*.keylog. The plaintext Wireshark then shows is
+# what the assertions quote.
+```
+
+Or rebuild the verifier from source with nothing but a Go toolchain — the
+evidence engine is pure Go, no cgo, no third-party dependencies:
+
+```bash
+CGO_ENABLED=0 go build ./internal/evidence/...
+```
+
+### What verification deliberately does NOT claim
+
+**The manifest is not signed.** Verification detects corruption and piecemeal
+tampering — change a byte in the capture and the hashes stop agreeing with the
+report — but somebody who rewrites the whole bundle can rewrite the manifest
+too. What it establishes is *internal consistency*: the report's claims and the
+capture in front of you describe the same traffic. Non-repudiation needs a
+signature or a trusted timestamp over the manifest, which is a deployment
+decision this tool cannot fake.
+
+A bundle recording a **FAIL** still verifies, and must. Verification is about
+whether the cited bytes are in the capture, not about whether the device
+behaved. Conflating the two would make a failing run uncitable — precisely when
+the evidence matters most.
+
+---
+
+## 5. Proving the tool without the bench
+
+```bash
+make test-certify
+```
+
+Five steps, each load-bearing:
+
+1. `go vet` over the CLI and the framework.
+2. `go test -race` over the framework, all six suites, and the CLI. Every
+   check's decision logic is proven against synthetic inputs, and each suite
+   also stands up a **deliberately non-conformant** in-process peer and proves
+   the check FAILs it. A check that always returns PASS passes against a good
+   device too.
+3. A `CGO_ENABLED=0` build and test run, so the no-TLS-stack configuration stays
+   usable rather than merely hoped for.
+4. A **keylog-configuration** build and vet, which is the only way to catch a
+   break in the key-export path.
+5. The loopback acceptance run (`internal/certify/suites`): a **real dumpcap
+   capture on `lo`** against a **real SunSpec Modbus device** (`sim/southbound`),
+   driven by the **real runner and the real registry with all six suites
+   linked**, producing a **real bundle**, which is then handed to
+   `bundle.Verify`. It runs the same two checks twice — once against a
+   conformant device (must PASS, with citations) and once against a device whose
+   Common Model manufacturer string reads its not-implemented value (must FAIL,
+   with citations) — and separately proves that flipping one byte of the capture
+   breaks verification.
+
+That last step is what proves the *assembly*, which no per-suite test can reach:
+all six suites link into one binary without a duplicate catalog uid, the catalog
+the binary finds is the one the suites were written against, a real capture on a
+real interface attributes to the right check, and what comes out the far end
+verifies.
+
+### Findings this work produced, recorded because every one of them was silent
+
+**The capture settle.** The runner used to stop the capture the instant the last
+check returned. `dumpcap` reads from a kernel ring and writes in batches, so the
+frames still in that ring were never written. Measured on loopback: a run whose
+whole exchange took 200 ms produced a **400-byte pcapng — the file header and
+nothing else, ten frames lost**. Nothing about it was loud; the bundle was
+written, the citations silently found no frames, and every PASS was downgraded
+to WARN for "want of a citation", which reads like sloppy checks rather than
+discarded evidence. There is now a settle interval (`-capture-settle`, default
+750 ms), and a capture that records zero frames while checks executed is
+recorded as a capture-integrity finding that makes the run unclean.
+
+**The bundle that ate its own capture.** The natural invocation is
+`-out runs/<ts>/`, and the runner writes its capture to
+`<out>/capture/run-<ts>.pcapng` — exactly where the bundle then copies it.
+`os.Create` truncates first, source and destination were the same file, and the
+run's entire capture became zero bytes. `bundle.copyFile` now detects the
+same-file case (`os.SameFile`) and leaves the file alone; a regression test
+fails without the fix.
+
+**The DUT host that was never derived.** `Targets.GatewayHost` — the DUT's
+address without a port — is what `suitessm` compares a frame's source against to
+tell its direction. Nothing on the command line set it, so a run against any
+address but the compiled-in bench default (`-target 127.0.0.1:9502`) left it at
+`69.0.0.2` and every direction test silently compared against a device that was
+not under test. `Targets.Normalise` now derives it from `-target`/`-gateway` in
+the runner's constructor.
+
+**`-suite` that selected nothing and everything.** `-suite` was applied at
+dispatch rather than at selection, so `-suite ssm` selected all 282 cases,
+executed 34, and skipped 248 with "suite csip not selected" — and the
+`COVERAGE.md` sealed into that bundle described the whole catalog instead of the
+campaign that ran. It is now part of the catalog filter, exactly as `-doc` is,
+and a `-suite` name nobody registered is refused by name rather than quietly
+selecting zero cases.
+
+**A sim bug the referee caught.** `sim/southbound.Populate` (the static
+inverter behind `NewServer`) writes the Model 1 serial with
+`setStr8(m1Base+32)`, and offset 32 is `Opt`, not `SN` — the canonical layout is
+Mn(0,16) / Md(16,16) / Opt(32,8) / Vr(40,8) / SN(48,16). That device serves an
+empty serial, a mandatory Common Model point reading its not-implemented value,
+and DEV-2 fails it. `populateSolarCore` was fixed for exactly this bug (its
+comment records the bench finding: two sims collapsing into one `nb_unit`
+because both serials were empty); `Populate` was not. **This is reported, not
+patched** — it is outside this work's package — and the loopback acceptance test
+uses the corrected solar sim, with the reason written down where the choice is
+made.
+
+---
+
+## 6. Producing a SunSpec submission
+
+```bash
+bin/certify -report runs/2026-07-26/ -config lab.json
+```
+
+This is a separate mode on purpose: the evidence is fixed at capture time, the
+covering document is not, so the paperwork can be revised and the report
+regenerated **without re-running the device**. It writes
+
+```
+runs/2026-07-26-submission/          a SIBLING of the bundle, never inside it
+├── public/SUMMARY.csv               the §3.1 Summary Test Results
+├── archive/DETAILED-TEST-LOGS.json  the §4 Detailed Test Logs
+├── SUBMISSION-READINESS.md          per-requirement self-assessment
+└── MANIFEST.sha256
+```
+
+The submission is written **beside** the bundle, not inside it, and a
+`-report-out` pointing inside is refused. A bundle verifies partly by checking
+that every file in the directory is listed in its manifest — that is what stops
+somebody slipping an extra artefact in beside the evidence — so a submission
+written into the bundle would make the evidence itself stop verifying, and the
+failure would surface later, on a `-verify`, looking exactly like tampering.
+
+Three refusals are built in:
+
+* **No invented metadata.** Roughly thirty keys are facts only a SunSpec
+  Authorized Test Laboratory or the submitter can supply — the certificate
+  number, the legal company name, which of the thirteen authorized labs
+  supervised the run. A key nobody supplied is not emitted; it is named as
+  missing, and the CSV is written as `SUMMARY-INCOMPLETE.csv` (a filename nobody
+  forwards to a lab by accident) and only with `-allow-incomplete`.
+* **No manufactured verdicts.** §3.1.1 enumerates exactly PASS, FAIL and NOT
+  SUPPORTED. A bench SKIP is none of them — it means "addressed but not asserted
+  here" — so SKIP and WARN rows are **omitted from the CSV and named in the
+  console output**. Mapping them to PASS would forge a result; mapping them to
+  NOT SUPPORTED would misreport the product's capabilities.
+* **No log that disagrees with the capture.** The §4 detailed logs are *derived
+  from the bundle's own pcap*, not from what a client library believed it sent:
+  each entry is a rendering of captured bytes, so the log and the capture cannot
+  drift. Only cleartext conversations can be rendered; conversations carrying
+  TLS records are counted and reported as not rendered, so a short log is
+  explained rather than mistaken for an idle bench.
+
+The mode also **refuses to build a submission from a bundle that does not
+verify**.
+
+`lab.json` uses the flat key space of `internal/certify/report`'s
+`SubmissionConfig` (unknown keys are an error — a misspelled key would otherwise
+silently omit the value it meant to supply):
+
+```json
+{
+  "certificate_type": "SunSpec Modbus",
+  "company_name": "…", "company_address": "…", "company_city": "…",
+  "company_state": "…", "company_country": "…", "company_postal_code": "…",
+  "test_laboratory": "<one of the thirteen authorized labs>",
+  "supervising_test_engineer": "…",
+  "software_operating_environment": "Hardware Device",
+  "product_manufacturer": ["…"], "product_model": ["…"],
+  "hardware_manufacturer": ["…"], "hardware_model": ["…"],
+  "test_completion_date": "MM/DD/YYYY",
+  "pics_url": "https://…"
+}
+```
+
+---
+
+## 7. Layout
+
+```
+cmd/certify/                  the CLI: modes, flags, exit codes, keylog shims
+internal/certify/             the framework — catalog, registry, runner, frame
+                              attribution, evidence citation, coverage report
+internal/certify/suites/      links all six suites; the loopback acceptance test
+internal/certify/report/      SS-CSIP-RESULTS-v1.1 + SS-MODBUS-RESULTS-v1.2 and
+                              the submission generator
+internal/certify/suitecsip/          CSIP-CONF-v1.3
+internal/certify/suitemodbusclient/  SS-MODBUS-CLIENT-CONF-v1.1
+internal/certify/suitemodbusserver/  SS-MODBUS-CONF-v1.4 + SS-1547-TEST-v1.1
+internal/certify/suitepki/           SS-TEST-PKI
+internal/certify/suitessm/           SSM-CONF-v0.8
+internal/evidence/            the evidence engine: capture, pcapng, dissection,
+                              TLS dissection/decryption, bundles (pure Go)
+testdata/catalog/catalog.json the specification: 282 extracted test cases
+```
+
+A new suite is added by registering its checks against catalog uids from an
+`init`, and adding one blank import to `internal/certify/suites`. The registry
+panics at process start on a duplicate uid, and the runner refuses to run at all
+if any registration names a uid the catalog does not contain — both are
+coordination bugs whose only honest outcome is a loud failure before any
+evidence exists.
+
+---
+
+## 8. Bench discipline
+
+A live campaign holds the whole bench: it drives the gateway, perturbs the sims,
+and captures the wire. **Serialize it.** Two concurrent runs interfere and
+produce evidence that describes neither. Development happens against loopback
+and in-process sims (`-no-capture`, or a private port with `-iface lo`), which
+is what `make test-certify` does and what every suite's own tests do.

@@ -674,3 +674,66 @@ outer:
 	}
 	return -1
 }
+
+// TestWriteDoesNotDestroyACaptureAlreadyInsideTheBundle pins the fix for a bug
+// that silently destroyed a whole run's evidence.
+//
+// The obvious way to invoke a conformance run is `-out runs/<ts>/`, and the
+// runner writes its capture to `<out>/capture/run-<ts>.pcapng` — precisely the
+// path Write copies the capture TO. os.Create truncates first, so with source
+// and destination the same file the capture became zero bytes: the console had
+// already reported the frames it counted, the bundle looked complete, and every
+// citation in it was unverifiable. Nothing about that failure is loud, which is
+// why it gets a test of its own.
+func TestWriteDoesNotDestroyACaptureAlreadyInsideTheBundle(t *testing.T) {
+	dir := t.TempDir()
+	capturePath := filepath.Join(dir, CaptureDir, "run.pcapng")
+	if err := os.MkdirAll(filepath.Dir(capturePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pkts := writeSyntheticCapture(t, capturePath)
+	before, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	syn, err := CiteFrames("The session was opened.", "TCP SYN", Pass,
+		"SYN observed", pkts, []int{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b := NewBuilder(RunMeta{Tool: "same-file-test", ToolVersion: "1"})
+	b.SetCapture(capture.Summary{
+		Tool: "dumpcap", Interface: "lo", Packets: len(pkts), Format: "pcapng",
+	}, capturePath)
+	b.AddCase(TestCaseResult{ID: "X-1", Title: "the capture survives its own bundle",
+		Verdict: Pass, Assertions: []Assertion{syn}})
+
+	// dir is BOTH the bundle directory and the capture's home — the default
+	// shape of a `-out runs/<ts>/` invocation.
+	if _, err := b.Write(dir); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	after, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("the capture is gone after Write: %v", err)
+	}
+	if len(after) == 0 {
+		t.Fatal("Write truncated the capture to zero bytes — the run's evidence was destroyed by its own bundle")
+	}
+	if len(after) != len(before) {
+		t.Errorf("the capture changed during Write: %d bytes before, %d after", len(before), len(after))
+	}
+	rep, err := Verify(dir)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !rep.OK {
+		t.Errorf("a bundle whose capture already lived inside it does not verify:\n%s", rep.String())
+	}
+	if rep.Checked == 0 {
+		t.Error("nothing was re-checked against the capture")
+	}
+}
