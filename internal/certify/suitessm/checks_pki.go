@@ -120,7 +120,7 @@ func pki001(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 				"SunSpecTCP-2: a client certificate chaining to a root the EUT-S does NOT hold was rejected with a TLS alert",
 				"TLS alert scan of the DUT→bench direction of the unknown-root connection",
 				func(v *wireView) (certify.Verdict, string, []int) {
-					return fatalAlertVerdict(v, "a client certificate issued by an untrusted CA")
+					return fatalAlertVerdict(ev, v, "a client certificate issued by an untrusted CA")
 				})
 			if err != nil {
 				return nil, err
@@ -340,7 +340,7 @@ func pki003(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 					if cv, cobs := caSignedVerdict(cc, "bench"); cv == certify.Pass {
 						return certify.Fail, "this run did not present a self-signed certificate at all: " + cobs, ccFrames
 					}
-					verdict, obs, frames := fatalAlertVerdict(v, "a self-signed client certificate")
+					verdict, obs, frames := fatalAlertVerdict(ev, v, "a self-signed client certificate")
 					return verdict, "the bench presented a self-signed leaf and " + obs, frames
 				})
 			if err != nil {

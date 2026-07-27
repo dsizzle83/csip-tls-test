@@ -243,12 +243,21 @@ func refusalFromDirection(d *tlsdis.Direction, what, tail string) (certify.Verdi
 			what, sh.CipherSuite, tlsdis.CipherSuiteName(sh.CipherSuite),
 			tlsdis.VersionName(sh.NegotiatedVersion()))
 	}
-	if len(d.Alerts) > 0 {
-		a := d.Alerts[0]
+	if plain := d.PlainAlerts(); len(plain) > 0 {
+		a := plain[0]
 		return certify.Warn, fmt.Sprintf(
 			"the EUT-S refused %s but the alert was level %d (%s), not fatal: description %d (%s)",
 			what, a.Level, tlsdis.AlertLevelName(a.Level), a.Description,
 			tlsdis.AlertDescriptionName(a.Description))
+	}
+	if enc := d.EncryptedAlerts(); len(enc) > 0 {
+		// The record exists; its content does not, not here. Reading the
+		// ciphertext as a level/description pair — which is what a naive scan
+		// does — either invents an alert or hides one. See tlsdis.Alert.Encrypted.
+		return certify.Skip, fmt.Sprintf(
+			"the EUT-S sent %d alert record(s) after the ChangeCipherSpec, in frame(s) %v; their level and "+
+				"description are ciphertext, so whether %s was refused with a FATAL alert cannot be read from "+
+				"the record layer alone", len(enc), enc[0].Packets, what)
 	}
 	return certify.Pass, fmt.Sprintf(
 		"the EUT-S refused %s with no ServerHello and no alert — it closed the connection. %s", what, tail)

@@ -428,12 +428,22 @@ func (p *ProbeResult) FatalAlert() (tlsdis.Alert, bool) {
 	return p.Server.FatalAlert()
 }
 
-// Alerts returns every alert the server sent, fatal or not.
+// Alerts returns every alert RECORD the server sent, fatal or not — including
+// the ones sent after a ChangeCipherSpec, whose bodies are ciphertext and whose
+// Level and Description are therefore zero. Use PlainAlerts to report codepoints.
 func (p *ProbeResult) Alerts() []tlsdis.Alert {
 	if p.Server == nil {
 		return nil
 	}
 	return p.Server.Alerts
+}
+
+// PlainAlerts returns the alerts whose level and description were readable.
+func (p *ProbeResult) PlainAlerts() []tlsdis.Alert {
+	if p.Server == nil {
+		return nil
+	}
+	return p.Server.PlainAlerts()
 }
 
 func (p *ProbeResult) find(t tlsdis.HandshakeType) (tlsdis.HandshakeMessage, bool) {
@@ -458,10 +468,13 @@ func (p *ProbeResult) Summary() string {
 				tlsdis.AlertDescriptionName(a.Description))
 		}
 		return s
-	case len(p.Alerts()) > 0:
-		a := p.Alerts()[0]
+	case len(p.PlainAlerts()) > 0:
+		a := p.PlainAlerts()[0]
 		return fmt.Sprintf("no ServerHello; alert level %d description %d (%s)",
 			a.Level, a.Description, tlsdis.AlertDescriptionName(a.Description))
+	case len(p.Alerts()) > 0:
+		return fmt.Sprintf("no ServerHello; %d encrypted alert record(s), whose level and description "+
+			"this probe cannot read", len(p.Alerts()))
 	case len(p.Received) == 0:
 		return fmt.Sprintf("the peer sent nothing and the connection ended: %v", p.ReadErr)
 	default:

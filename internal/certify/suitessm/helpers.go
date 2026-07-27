@@ -120,14 +120,46 @@ func serverHelloFact(ev *certify.Evidence, p *ProbeResult, claim, method string,
 	})
 }
 
-// alertOrAllFrames cites the DUT's fatal alert when there is one, and otherwise
-// the whole conversation — which for a probe the DUT answered with a bare TCP
-// close is the only thing there is to point at.
+// alertOrAllFrames cites the DUT's fatal alert when there is one, then any
+// alert record at all (an encrypted one is still the bytes the refusal arrived
+// in, even when its codepoints are unreadable), and otherwise the whole
+// conversation — which for a probe the DUT answered with a bare TCP close is
+// the only thing there is to point at.
 func alertOrAllFrames(v *wireView) []int {
 	if a, ok := v.ServerFatalAlert(); ok && len(a.Packets) > 0 {
 		return a.Packets
 	}
+	if v.Server != nil {
+		for _, a := range v.Server.Alerts {
+			if len(a.Packets) > 0 {
+				return a.Packets
+			}
+		}
+	}
 	return v.Frames
+}
+
+// fatalTeardown answers "did the DUT tear this session down with a fatal
+// alert?" for the RBAC-family claims that require the OPPOSITE — SunSpecTCP-29
+// through -32 all say a non-compliant role must be judged at the application
+// layer, with the secure channel intact.
+//
+// It resolves encrypted alerts with the run's key log, because a fatal alert
+// sent after the handshake is ciphertext and "no fatal alert in the clear" is a
+// weaker claim than "no fatal alert". The third return is a caveat to append to
+// the observation when an alert record could not be resolved either way; it is
+// empty in the normal case.
+func fatalTeardown(ev *certify.Evidence, v *wireView) (tlsdis.Alert, bool, string) {
+	sc := v.serverAlerts(ev)
+	if al, ok := sc.Fatal(); ok {
+		return al, true, ""
+	}
+	if len(sc.Opaque) > 0 {
+		return tlsdis.Alert{}, false, fmt.Sprintf(
+			" (caveat: %d alert record(s), in frame(s) %v, could not be read — %s — so a fatal alert INSIDE "+
+				"the tunnel is not excluded by this observation)", len(sc.Opaque), sc.OpaqueFrames(), sc.Why)
+	}
+	return tlsdis.Alert{}, false, ""
 }
 
 // refusalFact asserts that the DUT refused a provocation, citing whichever

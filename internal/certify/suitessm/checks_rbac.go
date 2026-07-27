@@ -638,14 +638,15 @@ func rbac006(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 				"SunSpecTCP-29: the non-compliant-OID handshake reached Finished — the DUT rejected it at the APPLICATION layer, not with a TLS alert",
 				"handshake message types and alert scan of the non-compliant-OID conversation",
 				func(v *wireView) (certify.Verdict, string, []int) {
-					if al, ok := v.ServerFatalAlert(); ok {
+					al, torn, caveat := fatalTeardown(ev, v)
+					if torn {
 						return certify.Fail, fmt.Sprintf(
 							"the DUT sent a fatal TLS alert (description %d, %s) rather than completing the "+
 								"handshake and denying at the application layer",
 							al.Description, tlsdis.AlertDescriptionName(al.Description)), al.Packets
 					}
 					verdict, obs, frames := mutualFlightVerdict(v)
-					return verdict, obs + " — and no TLS alert was sent", frames
+					return verdict, obs + " — and no fatal TLS alert was sent" + caveat, frames
 				})
 			if err != nil {
 				return nil, err
@@ -802,12 +803,14 @@ func rbac007(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 					"SunSpecTCP-30/31: the handshake presenting "+v.label+" completed — the non-compliant role was judged at the application layer, with no TLS alert",
 					"handshake message types and alert scan of this conversation",
 					func(w *wireView) (certify.Verdict, string, []int) {
-						if al, ok := w.ServerFatalAlert(); ok {
+						al, torn, caveat := fatalTeardown(ev, w)
+						if torn {
 							return certify.Fail, fmt.Sprintf(
 								"the DUT sent a fatal TLS alert (description %d, %s) instead of completing the handshake",
 								al.Description, tlsdis.AlertDescriptionName(al.Description)), al.Packets
 						}
-						return mutualFlightVerdict(w)
+						verdict, obs, frames := mutualFlightVerdict(w)
+						return verdict, obs + caveat, frames
 					})
 				if err != nil {
 					return nil, err
@@ -940,7 +943,8 @@ func rbac008(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 				"SunSpecTCP-32/40: mutual authentication COMPLETED with the role-less certificate — CertificateVerify and Finished were exchanged and no TLS alert was sent",
 				"handshake message types and alert scan of this conversation",
 				func(v *wireView) (certify.Verdict, string, []int) {
-					if al, ok := v.ServerFatalAlert(); ok {
+					al, torn, caveat := fatalTeardown(ev, v)
+					if torn {
 						return certify.Fail, fmt.Sprintf(
 							"the DUT sent a fatal TLS alert (level %d, description %d %s). SunSpecTCP-32/40 "+
 								"require the secure channel to be MAINTAINED and the request denied at the "+
@@ -948,7 +952,8 @@ func rbac008(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 								"procedure exists to catch.",
 							al.Level, al.Description, tlsdis.AlertDescriptionName(al.Description)), al.Packets
 					}
-					return mutualFlightVerdict(v)
+					verdict, obs, frames := mutualFlightVerdict(v)
+					return verdict, obs + caveat, frames
 				})
 			if err != nil {
 				return nil, err

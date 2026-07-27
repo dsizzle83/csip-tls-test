@@ -469,7 +469,7 @@ func tlsf003(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 				}
 				a, err := sessionFact(ev, n.session, claim, method,
 					func(v *wireView) (certify.Verdict, string, []int) {
-						return fatalAlertVerdict(v, n.what)
+						return fatalAlertVerdict(ev, v, n.what)
 					})
 				if err != nil {
 					return nil, err
@@ -582,7 +582,7 @@ func tlsf004(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 				"SunSpecTCP-13/14: the EUT-S terminated the certless handshake with a fatal TLS alert",
 				"TLS alert scan of the DUT→bench direction",
 				func(v *wireView) (certify.Verdict, string, []int) {
-					return fatalAlertVerdict(v, "a client that answered the CertificateRequest with no certificate")
+					return fatalAlertVerdict(ev, v, "a client that answered the CertificateRequest with no certificate")
 				})
 			if err != nil {
 				return nil, err
@@ -679,16 +679,27 @@ func tlsf005(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			var out []certify.Assertion
 			a, err := sessionFact(ev, first,
 				"SunSpecTCP-14 / RFC 5246 §7.2.2: the EUT-S answered a corrupted TLS record with a fatal alert",
-				"TLS alert scan of the DUT→bench direction of the aborted session",
+				"TLS alert scan of the DUT→bench direction of the aborted session, decrypted with the run's key log",
 				func(v *wireView) (certify.Verdict, string, []int) {
-					al, ok := v.ServerFatalAlert()
+					// This alert is necessarily POST-ChangeCipherSpec — the whole
+					// point of the procedure is to corrupt a record of an
+					// established session — so it is ciphertext on the wire and
+					// only the key log can read it. See wireView.serverAlerts.
+					sc := v.serverAlerts(ev)
+					al, ok := sc.Fatal()
 					if !ok {
+						if len(sc.Opaque) > 0 {
+							return certify.Skip, fmt.Sprintf(
+									"the DUT sent %d alert record(s) after the corrupted record, in frame(s) %v, and this "+
+										"bundle could not read them: %s", len(sc.Opaque), sc.OpaqueFrames(), sc.Why),
+								sc.OpaqueFrames()
+						}
 						return certify.Fail, fmt.Sprintf(
-							"the DUT sent no fatal alert after the corrupted record; its direction holds %d record(s)",
+							"the DUT sent no alert record at all after the corrupted record; its direction holds %d record(s)",
 							recordCount(v)), v.Frames
 					}
-					obs := fmt.Sprintf("fatal alert level %d description %d (%s)",
-						al.Level, al.Description, tlsdis.AlertDescriptionName(al.Description))
+					obs := fmt.Sprintf("fatal alert level %d description %d (%s), recovered from the capture "+
+						"with the run's key log", al.Level, al.Description, tlsdis.AlertDescriptionName(al.Description))
 					if al.Description != 20 { // bad_record_mac
 						return certify.Warn, obs + " — RFC 5246 §7.2.2 names bad_record_mac (20) for a record that fails authentication", al.Packets
 					}
@@ -859,21 +870,37 @@ func tlsf006(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 
 // fatalAlertVerdict is the shared negative-test criterion: a fatal alert, and
 // no completed session.
-func fatalAlertVerdict(v *wireView, what string) (certify.Verdict, string, []int) {
-	al, ok := v.ServerFatalAlert()
-	if !ok {
-		sh, _ := v.ServerHello()
-		obs := fmt.Sprintf("the DUT sent no fatal alert; its direction holds %d TLS record(s)", recordCount(v))
-		if sh != nil {
-			obs += fmt.Sprintf(" and a ServerHello selecting 0x%04X %s",
-				sh.CipherSuite, tlsdis.CipherSuiteName(sh.CipherSuite))
+//
+// It takes the Evidence, not just the view, because an alert sent after the
+// ChangeCipherSpec is ciphertext on the wire and only the run's key log can say
+// what it was. Without that resolution the honest verdict for an unresolved
+// alert record is not FAIL — it is "this bundle cannot tell", which is a SKIP
+// carrying the frames of the record it declined to read.
+func fatalAlertVerdict(ev *certify.Evidence, v *wireView, what string) (certify.Verdict, string, []int) {
+	sc := v.serverAlerts(ev)
+	if al, ok := sc.Fatal(); ok {
+		how := ""
+		if sc.Decrypted {
+			how = ", recovered from the capture with the run's key log"
 		}
-		return certify.Fail, obs + " — " + what + " was not refused with a fatal alert", v.Frames
+		return certify.Pass, fmt.Sprintf(
+			"the DUT refused %s with a fatal alert: level %d (%s), description %d (%s)%s",
+			what, al.Level, tlsdis.AlertLevelName(al.Level), al.Description,
+			tlsdis.AlertDescriptionName(al.Description), how), al.Packets
 	}
-	return certify.Pass, fmt.Sprintf(
-		"the DUT refused %s with a fatal alert: level %d (%s), description %d (%s)",
-		what, al.Level, tlsdis.AlertLevelName(al.Level), al.Description,
-		tlsdis.AlertDescriptionName(al.Description)), al.Packets
+	if len(sc.Opaque) > 0 {
+		return certify.Skip, fmt.Sprintf(
+			"the DUT sent %d alert record(s) after the ChangeCipherSpec, in frame(s) %v, and this bundle cannot "+
+				"read them: %s. Whether %s was refused with a FATAL alert is therefore undetermined — it is not "+
+				"an absence", len(sc.Opaque), sc.OpaqueFrames(), sc.Why, what), sc.OpaqueFrames()
+	}
+	sh, _ := v.ServerHello()
+	obs := fmt.Sprintf("the DUT sent no fatal alert; its direction holds %d TLS record(s)", recordCount(v))
+	if sh != nil {
+		obs += fmt.Sprintf(" and a ServerHello selecting 0x%04X %s",
+			sh.CipherSuite, tlsdis.CipherSuiteName(sh.CipherSuite))
+	}
+	return certify.Fail, obs + " — " + what + " was not refused with a fatal alert", v.Frames
 }
 
 // mutualFlightVerdict asserts a completed TLS 1.2 mutual-authentication flight

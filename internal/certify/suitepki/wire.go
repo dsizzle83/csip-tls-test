@@ -274,10 +274,15 @@ type CertMessage struct {
 func (m *CertMessage) HasRange() bool { return m != nil && !m.Encrypted && m.End > m.Start }
 
 // AlertRef is one TLS alert with its provenance.
+//
+// Recovered — rather than "Encrypted" — because the embedded tlsdis.Alert
+// already has an Encrypted field meaning the OPPOSITE thing: an alert whose
+// body is still ciphertext and whose codepoints are therefore unknown. An
+// AlertRef that is Recovered has been decrypted and its codepoints are real.
 type AlertRef struct {
 	tlsdis.Alert
 	FromServer bool
-	Encrypted  bool
+	Recovered  bool
 }
 
 // WireHandshake is one TLS handshake read back out of the capture.
@@ -442,7 +447,7 @@ func (w *WireHandshake) decrypt(kl *keylog.Log) {
 		}
 		for _, al := range tlsdecrypt.Alerts(ps) {
 			w.Alerts = append(w.Alerts, AlertRef{
-				Alert: al, FromServer: side.s == tlsdecrypt.Server, Encrypted: true,
+				Alert: al, FromServer: side.s == tlsdecrypt.Server, Recovered: true,
 			})
 		}
 		hs, herr := sess.Handshake(side.s)
@@ -547,8 +552,12 @@ func AlertText(a AlertRef) string {
 	if a.FromServer {
 		side = "server"
 	}
+	if a.Alert.Encrypted {
+		return fmt.Sprintf("%s sent an alert record in frame(s) %v whose level and description are "+
+			"ciphertext and were not decoded", side, a.Packets)
+	}
 	enc := ""
-	if a.Encrypted {
+	if a.Recovered {
 		enc = " (recovered by decryption)"
 	}
 	return fmt.Sprintf("%s sent %s %s in frame(s) %v%s",

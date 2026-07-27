@@ -751,6 +751,99 @@ func TestLiveBenchCleartextModbus(t *testing.T) {
 	}
 }
 
+// TestLivePostCCSAlertNeedsTheKeyLog is the bundle-driven half of the
+// post-ChangeCipherSpec alert defect.
+//
+// It reads a real conformance run's capture and key log and proves both halves
+// of the rule on the same bytes:
+//
+//   - the record layer ALONE must not produce a level or a description for an
+//     alert sent after the CCS. Those bytes are AEAD output. The bench's own
+//     TLSF-005 run read them and reported "the DUT sent no fatal alert" about a
+//     device that had sent exactly that alert;
+//   - decrypted with the run's key log, the same record comes back as the real
+//     fatal alert.
+//
+// The artefacts are not committed (see TestLiveBenchCapture); point the test at
+// a run's capture/ directory with EVIDENCE_LIVE_PCAP and EVIDENCE_LIVE_KEYLOG.
+func TestLivePostCCSAlertNeedsTheKeyLog(t *testing.T) {
+	pcapPath := envOr("EVIDENCE_LIVE_PCAP", "/tmp/mbaps-live.pcapng")
+	keylogPath := envOr("EVIDENCE_LIVE_KEYLOG", "/tmp/evidence.keylog")
+	if _, err := os.Stat(pcapPath); err != nil {
+		t.Skipf("live bench capture not present at %s (set EVIDENCE_LIVE_PCAP)", pcapPath)
+	}
+	if _, err := os.Stat(keylogPath); err != nil {
+		t.Skipf("live bench key log not present at %s (set EVIDENCE_LIVE_KEYLOG)", keylogPath)
+	}
+	pkts, err := pcapng.ReadFile(pcapPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", pcapPath, err)
+	}
+	asm := netdis.NewAssembler()
+	for _, p := range pkts {
+		if _, err := asm.AddPacket(p); err != nil {
+			t.Fatalf("frame %d: %v", p.Index, err)
+		}
+	}
+	kl, err := keylog.Open(keylogPath)
+	if err != nil {
+		t.Fatalf("key log: %v", err)
+	}
+
+	examined, recovered := 0, 0
+	for _, st := range asm.FindPort(802) {
+		clientDir, serverDir := st.Dirs[0], st.Dirs[1]
+		if clientDir.Flow.Dst.Port != 802 {
+			clientDir, serverDir = serverDir, clientDir
+		}
+		client, _ := tlsdis.ParseDirection(clientDir.Bytes.Bytes(), clientDir.Bytes)
+		server, _ := tlsdis.ParseDirection(serverDir.Bytes.Bytes(), serverDir.Bytes)
+		if client == nil || server == nil {
+			continue
+		}
+		enc := server.EncryptedAlerts()
+		if len(enc) == 0 {
+			continue
+		}
+		examined++
+		for _, a := range enc {
+			if a.Level != 0 || a.Description != 0 {
+				t.Errorf("stream %s frame(s) %v: the record layer produced level %d description %d from "+
+					"ciphertext", st.Key, a.Packets, a.Level, a.Description)
+			}
+		}
+		if _, ok := server.FatalAlert(); ok {
+			t.Errorf("stream %s: FatalAlert() answered from an encrypted record", st.Key)
+		}
+		params, err := tlsdecrypt.ParamsFromHandshake(client, server)
+		if err != nil || !kl.Has(params.ClientRandom) {
+			continue
+		}
+		sess, err := tlsdecrypt.New(params, kl)
+		if err != nil {
+			continue
+		}
+		// The DUT's direction alone: TLSF-005 corrupts a record the BENCH
+		// sends, so the other direction is guaranteed not to decrypt, and
+		// requiring both would throw away the alert that is the evidence.
+		recs, _ := sess.DecryptAll(tlsdecrypt.Server, server.Stream.Records)
+		for _, a := range tlsdecrypt.Alerts(recs) {
+			if a.Fatal() {
+				recovered++
+				t.Logf("stream %s: recovered fatal alert description %d (%s) in frame(s) %v",
+					st.Key, a.Description, tlsdis.AlertDescriptionName(a.Description), a.Packets)
+			}
+		}
+	}
+	if examined == 0 {
+		t.Skip("this capture holds no post-ChangeCipherSpec alert record on port 802")
+	}
+	if recovered == 0 {
+		t.Errorf("%d encrypted alert record(s) were found and none could be recovered with the run's key log; "+
+			"the point of the key log is that a reader of the bundle can repeat the recovery", examined)
+	}
+}
+
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

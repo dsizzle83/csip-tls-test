@@ -184,12 +184,149 @@ func (v *wireView) ClientFlight() []tlsdis.HandshakeType {
 	return v.Client.Handshake.Types()
 }
 
-// ServerFatalAlert returns the DUT's first fatal alert and its frames.
+// ServerFatalAlert returns the DUT's first fatal alert and its frames, read
+// from the PLAINTEXT record layer only.
+//
+// It cannot see an alert sent after the ChangeCipherSpec, because that alert's
+// body is ciphertext. Callers deciding a negative criterion — "the DUT must
+// have sent a fatal alert" — must use serverAlerts instead, which resolves the
+// encrypted ones with the run's key log and says so when it cannot. A false
+// return here on its own means "not visible in the clear", never "not sent".
 func (v *wireView) ServerFatalAlert() (tlsdis.Alert, bool) {
 	if v.Server == nil {
 		return tlsdis.Alert{}, false
 	}
 	return v.Server.FatalAlert()
+}
+
+// alertScan is one direction's alerts after the encrypted ones have been given
+// every chance to be resolved.
+//
+// The distinction it exists to preserve: "the DUT sent no fatal alert" and "the
+// DUT may have sent one, inside the tunnel, and this bundle cannot tell" are
+// different findings. Collapsing the second into the first is how an evidence
+// tool passes a device that failed.
+type alertScan struct {
+	// Alerts are the alerts whose level and description are KNOWN: read in the
+	// clear before the ChangeCipherSpec, or recovered by decryption.
+	Alerts []tlsdis.Alert
+	// Opaque are alert records still unresolved. Their level and description
+	// are ciphertext and are not guessed at.
+	Opaque []tlsdis.Alert
+	// Why explains why Opaque is non-empty — no key log, or the reason the
+	// decryption did not reach those records.
+	Why string
+	// Decrypted reports that at least one alert came back from tlsdecrypt.
+	Decrypted bool
+}
+
+// Fatal returns the first KNOWN fatal alert.
+func (s alertScan) Fatal() (tlsdis.Alert, bool) {
+	for _, a := range s.Alerts {
+		if a.Fatal() {
+			return a, true
+		}
+	}
+	return tlsdis.Alert{}, false
+}
+
+// OpaqueFrames is every frame carrying an unresolved alert record, so a report
+// can point at the bytes it is declining to interpret.
+func (s alertScan) OpaqueFrames() []int {
+	var out []int
+	for _, a := range s.Opaque {
+		out = append(out, a.Packets...)
+	}
+	return out
+}
+
+// Describe renders the alerts for an observation line.
+func (s alertScan) Describe() string {
+	var parts []string
+	for _, a := range s.Alerts {
+		parts = append(parts, fmt.Sprintf("level %d (%s) description %d (%s) in frame(s) %v",
+			a.Level, tlsdis.AlertLevelName(a.Level), a.Description,
+			tlsdis.AlertDescriptionName(a.Description), a.Packets))
+	}
+	for _, a := range s.Opaque {
+		parts = append(parts, fmt.Sprintf("an ENCRYPTED alert record in frame(s) %v, whose level and "+
+			"description this bundle cannot read", a.Packets))
+	}
+	if len(parts) == 0 {
+		return "no alert record at all"
+	}
+	return strings.Join(parts, "; ")
+}
+
+// serverAlerts returns the DUT's alerts, resolving the encrypted ones with the
+// run's key log where that is possible.
+//
+// It decrypts the DUT→bench direction ALONE, deliberately. TLSF-005 corrupts a
+// record the bench sends, so the bench→DUT direction is guaranteed not to
+// decrypt — and the alert that proves the DUT behaved correctly is in the other
+// direction. Requiring both would throw the evidence away to preserve a
+// symmetry nothing needs.
+func (v *wireView) serverAlerts(ev *certify.Evidence) alertScan {
+	var sc alertScan
+	if v.Server == nil {
+		sc.Why = "the DUT→bench direction did not parse as TLS"
+		return sc
+	}
+	split := func(as []tlsdis.Alert, why string) alertScan {
+		var s alertScan
+		for _, a := range as {
+			if a.Encrypted {
+				s.Opaque = append(s.Opaque, a)
+			} else {
+				s.Alerts = append(s.Alerts, a)
+			}
+		}
+		if len(s.Opaque) > 0 {
+			s.Why = why
+		}
+		return s
+	}
+	if len(v.Server.EncryptedAlerts()) == 0 {
+		return split(v.Server.Alerts, "")
+	}
+
+	sess, err := v.session(ev)
+	if err != nil {
+		return split(v.Server.Alerts, err.Error())
+	}
+	// DecryptAll returns what it recovered before any failure, which is exactly
+	// what is wanted: an alert that decrypted stays evidence even if a later
+	// record did not.
+	recs, derr := sess.DecryptAll(tlsdecrypt.Server, v.Server.Stream.Records)
+	why := ""
+	if derr != nil {
+		why = "the DUT→bench direction did not fully decrypt: " + derr.Error()
+	}
+	byRecord := map[int][]tlsdis.Alert{}
+	for _, a := range tlsdecrypt.Alerts(recs) {
+		byRecord[a.Record] = append(byRecord[a.Record], a)
+	}
+	for _, a := range v.Server.Alerts {
+		if got, ok := byRecord[a.Record]; ok {
+			sc.Alerts = append(sc.Alerts, got...)
+			if a.Encrypted {
+				sc.Decrypted = true
+			}
+			continue
+		}
+		if a.Encrypted {
+			sc.Opaque = append(sc.Opaque, a)
+			continue
+		}
+		sc.Alerts = append(sc.Alerts, a)
+	}
+	if len(sc.Opaque) > 0 {
+		sc.Why = why
+		if sc.Why == "" {
+			sc.Why = "the record decrypted but did not come back as an alert"
+		}
+	}
+	return sc
 }
 
 // ServerAppData reports whether the DUT sent any application data, which is the
@@ -257,6 +394,33 @@ func appDataFrames(recs []tlsdecrypt.Plaintext) []int {
 // strength of what the check saw locally, because the point of the key log is
 // that the READER can repeat the recovery.
 func (v *wireView) decrypt(ev *certify.Evidence) (*plaintext, error) {
+	sess, err := v.session(ev)
+	if err != nil {
+		return nil, err
+	}
+	params := sess.Params
+	p := &plaintext{Version: params.Version, Suite: params.CipherSuite}
+	p.ClientRecords, err = sess.DecryptAll(tlsdecrypt.Client, v.Client.Stream.Records)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt the bench→DUT direction: %w", err)
+	}
+	p.ServerRecords, err = sess.DecryptAll(tlsdecrypt.Server, v.Server.Stream.Records)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt the DUT→bench direction: %w", err)
+	}
+	p.FromClient = tlsdecrypt.AppData(p.ClientRecords)
+	p.FromServer = tlsdecrypt.AppData(p.ServerRecords)
+	return p, nil
+}
+
+// session builds the decryption session for this conversation from the run's
+// key log, without decrypting anything yet.
+//
+// It is separate from decrypt because the two callers want different things
+// from it: decrypt wants BOTH directions and treats a failure in either as
+// fatal to the evidence; serverAlerts wants the DUT's direction alone, because
+// the bench's direction may have been corrupted on purpose.
+func (v *wireView) session(ev *certify.Evidence) (*tlsdecrypt.Session, error) {
 	if ev.KeyLog == nil {
 		return nil, fmt.Errorf("the run exported no TLS key log (-keylog), so the encrypted records in this " +
 			"conversation cannot be recovered by anyone reading the bundle")
@@ -283,18 +447,7 @@ func (v *wireView) decrypt(ev *certify.Evidence) (*plaintext, error) {
 			params.CipherSuite, tlsdis.CipherSuiteName(params.CipherSuite),
 			tlsdis.VersionName(params.Version), err)
 	}
-	p := &plaintext{Version: params.Version, Suite: params.CipherSuite}
-	p.ClientRecords, err = sess.DecryptAll(tlsdecrypt.Client, v.Client.Stream.Records)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt the bench→DUT direction: %w", err)
-	}
-	p.ServerRecords, err = sess.DecryptAll(tlsdecrypt.Server, v.Server.Stream.Records)
-	if err != nil {
-		return nil, fmt.Errorf("decrypt the DUT→bench direction: %w", err)
-	}
-	p.FromClient = tlsdecrypt.AppData(p.ClientRecords)
-	p.FromServer = tlsdecrypt.AppData(p.ServerRecords)
-	return p, nil
+	return sess, nil
 }
 
 // findADU locates the first MBAP frame in a decrypted stream whose PDU starts

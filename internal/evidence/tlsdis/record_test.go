@@ -152,18 +152,21 @@ func TestRecordProvenance(t *testing.T) {
 }
 
 func TestDirectionAlertsAndCCS(t *testing.T) {
+	// Both alerts sit BEFORE the ChangeCipherSpec, which is the only place an
+	// alert body is readable — see TestPostCCSAlertIsNotDecoded for the other
+	// side of the boundary.
 	data := join(
 		rec(ContentHandshake, VersionTLS12, hsMsg(HandshakeServerHelloDone, nil)),
-		rec(ContentChangeCipherSpec, VersionTLS12, []byte{1}),
 		rec(ContentAlert, VersionTLS12, []byte{2, 48}), // fatal unknown_ca
 		rec(ContentAlert, VersionTLS12, []byte{1, 0}),  // warning close_notify
+		rec(ContentChangeCipherSpec, VersionTLS12, []byte{1}),
 	)
 	d, err := ParseDirection(data, fakeMapper{segment: 8})
 	if err != nil {
 		t.Fatalf("ParseDirection: %v", err)
 	}
-	if len(d.CCS) != 1 || d.CCS[0] != 1 {
-		t.Errorf("CCS = %v, want [1]", d.CCS)
+	if len(d.CCS) != 1 || d.CCS[0] != 3 {
+		t.Errorf("CCS = %v, want [3]", d.CCS)
 	}
 	if len(d.Alerts) != 2 {
 		t.Fatalf("got %d alerts, want 2", len(d.Alerts))
@@ -187,6 +190,95 @@ func TestDirectionAlertsAndCCS(t *testing.T) {
 	// The handshake parse must stop at the ChangeCipherSpec.
 	if len(d.Handshake.Messages) != 1 {
 		t.Fatalf("got %d handshake messages, want 1 (parsing must stop at CCS)", len(d.Handshake.Messages))
+	}
+}
+
+// TestPostCCSAlertIsNotDecoded is the false-PASS regression.
+//
+// After a ChangeCipherSpec the alert record's body is AEAD output. Reading it
+// as a level/description pair invents alerts that were never sent and hides the
+// ones that were: this fixture's ciphertext happens to begin 0x02 0x28, which a
+// naive parser reports as a FATAL handshake_failure. Nothing of the sort
+// happened — and a conformance tool that says otherwise is fabricating evidence
+// against a device.
+func TestPostCCSAlertIsNotDecoded(t *testing.T) {
+	// 8-byte explicit nonce + ciphertext + 16-byte tag, exactly the shape a
+	// TLS 1.2 AES-GCM alert record has on the wire. The first two body bytes
+	// are 0x02 0x28 = fatal(2) handshake_failure(40) to a parser that decodes
+	// ciphertext.
+	body := join(
+		[]byte{0x02, 0x28, 0x99, 0x11, 0x00, 0x7F, 0xC3, 0x5A}, // "explicit nonce"
+		[]byte{0x02, 0x28},             // "alert"
+		bytes.Repeat([]byte{0xE4}, 16), // "tag"
+	)
+	data := join(
+		rec(ContentHandshake, VersionTLS12, hsMsg(HandshakeServerHelloDone, nil)),
+		rec(ContentChangeCipherSpec, VersionTLS12, []byte{1}),
+		rec(ContentApplicationData, VersionTLS12, bytes.Repeat([]byte{0x5C}, 40)),
+		rec(ContentAlert, VersionTLS12, body),
+	)
+	d, err := ParseDirection(data, fakeMapper{segment: 16})
+	if err != nil {
+		t.Fatalf("ParseDirection: %v", err)
+	}
+	if a, ok := d.FatalAlert(); ok {
+		t.Fatalf("FatalAlert reported %s from ciphertext — this is the false-PASS/false-FAIL defect", a)
+	}
+	if got := len(d.PlainAlerts()); got != 0 {
+		t.Fatalf("PlainAlerts = %d, want 0: nothing in this direction was readable", got)
+	}
+	enc := d.EncryptedAlerts()
+	if len(enc) != 1 {
+		t.Fatalf("EncryptedAlerts = %d, want 1: the record's EXISTENCE is plaintext and must be reported", len(enc))
+	}
+	if enc[0].Level != 0 || enc[0].Description != 0 {
+		t.Errorf("encrypted alert carries level %d description %d — codepoints must never be synthesised from ciphertext",
+			enc[0].Level, enc[0].Description)
+	}
+	if len(enc[0].Packets) == 0 {
+		t.Error("an encrypted alert must still carry its frames: \"encrypted alert at frame N\" is the report")
+	}
+	if s := enc[0].String(); !strings.Contains(s, "encrypted alert record") {
+		t.Errorf("Alert.String() = %q, want it to say the body is ciphertext", s)
+	}
+
+	// The same assertion against the REAL record, lifted verbatim out of the
+	// bench's TLSF-005 run of 2026-07-27 (bundle 20260726T225512, frame 4589,
+	// stream 69.0.0.2:802 <> 69.0.0.20:59588, TLS 1.2 0xC02B). Decrypted with
+	// that run's key log it is level 2 (fatal) description 20 (bad_record_mac)
+	// — the DUT behaving CORRECTLY. The old parser read the first two ciphertext
+	// bytes, 0x50 0xB3, and reported "the DUT sent no fatal alert", failing the
+	// device for something it did. 8-byte explicit nonce, 2 bytes of alert,
+	// 16-byte GCM tag.
+	real4589 := []byte{
+		0x50, 0xb3, 0xb1, 0x5e, 0xde, 0x29, 0x33, 0xb4, 0x01, 0x45, 0xe0, 0xf0, 0x1a,
+		0x25, 0xe3, 0xca, 0x4c, 0x09, 0x92, 0x4b, 0x69, 0xbe, 0x65, 0x69, 0xbd, 0x1a,
+	}
+	live, err := ParseDirection(join(
+		rec(ContentHandshake, VersionTLS12, hsMsg(HandshakeServerHelloDone, nil)),
+		rec(ContentChangeCipherSpec, VersionTLS12, []byte{1}),
+		rec(ContentAlert, VersionTLS12, real4589),
+	), fakeMapper{segment: 16})
+	if err != nil {
+		t.Fatalf("ParseDirection: %v", err)
+	}
+	if len(live.PlainAlerts()) != 0 || len(live.EncryptedAlerts()) != 1 {
+		t.Fatalf("live record: %d plain / %d encrypted, want 0 / 1",
+			len(live.PlainAlerts()), len(live.EncryptedAlerts()))
+	}
+	if a := live.EncryptedAlerts()[0]; a.Level != 0 || a.Description != 0 {
+		t.Errorf("live record decoded as level %d description %d — those are AEAD output, not codepoints",
+			a.Level, a.Description)
+	}
+	// And the honest half: a real fatal alert BEFORE the CCS still decodes.
+	pre, err := ParseDirection(join(
+		rec(ContentAlert, VersionTLS12, []byte{2, 48}),
+	), nil)
+	if err != nil {
+		t.Fatalf("ParseDirection: %v", err)
+	}
+	if a, ok := pre.FatalAlert(); !ok || a.Description != 48 {
+		t.Fatalf("a plaintext fatal alert must still be found: %+v ok=%v", a, ok)
 	}
 }
 
