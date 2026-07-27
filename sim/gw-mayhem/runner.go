@@ -25,6 +25,15 @@ type BatchSummary struct {
 	GateFailures int             `json:"gate_failures"`
 	Reports      []*gwReport     `json:"reports"`
 	LoadErrors   []string        `json:"load_errors,omitempty"`
+
+	// Declined counts the scenarios this MODE could not run at all, and DeclinedBy
+	// groups them by reason (declineBench / declineBoard). They exist so the
+	// roll-up can state the suite's size FOR THIS RUN rather than in the abstract:
+	// a hermetic -loopback run reaches nine of thirty-eight scenarios, and a
+	// denominator of thirty-eight makes that gate look four times larger than it
+	// is. Applicable() is the number actually in play.
+	Declined   int            `json:"declined"`
+	DeclinedBy map[string]int `json:"declined_by,omitempty"`
 }
 
 // ListScenarios prints the suite (id, source, security, description) plus any spec
@@ -41,6 +50,39 @@ func ListScenarios(out io.Writer, scenarios []gwScenario, loadErrs []error) {
 	for _, e := range loadErrs {
 		fmt.Fprintf(out, "  LOAD-ERR %v\n", e)
 	}
+	fmt.Fprint(out, modeCoverage(scenarios))
+}
+
+// modeCoverage states, before anyone runs anything, how much of the suite each
+// run mode can actually reach. It exists because "gw-mayhem: 38 scenario(s)" is
+// the number a reader carries away, and the documented hermetic invocation runs
+// nine of them. A suite that does not say which mode reaches what invites its
+// operators to read a hermetic GATE PASS as a whole-suite result.
+func modeCoverage(scenarios []gwScenario) string {
+	var hermetic, bench, board, ext int
+	for _, sc := range scenarios {
+		switch {
+		case sc.NeedsBoard:
+			board++
+		case sc.NeedsBench:
+			bench++
+		default:
+			hermetic++
+		}
+		if sc.Extended {
+			ext++
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\nreach by run mode (a scenario counts once, in the strongest thing it needs):\n")
+	fmt.Fprintf(&b, "  %2d  -loopback (hermetic, no bench)\n", hermetic)
+	fmt.Fprintf(&b, "  %2d  + the live bench: the sim admin APIs, or engines only the real gateway has [bench]\n", bench)
+	fmt.Fprintf(&b, "  %2d  + a board mutation the orchestrator arms out of band [board]\n", board)
+	if ext > 0 {
+		fmt.Fprintf(&b, "  %2d  of the above are [ext] and are excluded from a default run unless -extended or -only names them\n", ext)
+	}
+	fmt.Fprintf(&b, "  why a [bench] scenario cannot run hermetically, one by one: qa/gw-scenarios/README.md\n")
+	return b.String()
 }
 
 // listTags renders the run-mode tags for a scenario in the -list output:
@@ -83,6 +125,13 @@ func RunSuite(ctx context.Context, w *gwWorld, scenarios []gwScenario, loadErrs 
 		rep := runScenario(ctx, w, selected[i])
 		sum.Total++
 		sum.ByVerdict[rep.Verdict]++
+		if rep.Declined {
+			sum.Declined++
+			if sum.DeclinedBy == nil {
+				sum.DeclinedBy = map[string]int{}
+			}
+			sum.DeclinedBy[rep.DeclineKind]++
+		}
 		sum.Reports = append(sum.Reports, rep)
 		if !rep.VerdictExpected {
 			sum.GateFailures++
@@ -105,25 +154,29 @@ func RunSuite(ctx context.Context, w *gwWorld, scenarios []gwScenario, loadErrs 
 // that into INCONCLUSIVE), and a missing oracle is itself INCONCLUSIVE.
 func runScenario(ctx context.Context, w *gwWorld, sc gwScenario) *gwReport {
 	start := time.Now()
-	// A bench-required scenario with no bench wired is SKIPPED as an expected
-	// INCONCLUSIVE, not a gate failure — a -loopback :802-only run cannot drive the
+	// A bench-required scenario with no bench wired DECLINES — an expected
+	// INCONCLUSIVE, not a gate failure. A -loopback :802-only run cannot drive the
 	// HTTP sim admin APIs (wave-2) or exercise the real gateway's reversion /
-	// exclusive-authority engines (wave-3 control-loop), and the hermetic proof is
-	// the pure-oracle unit tests (+ the bench stub for wave-2). A live run wires the
-	// bench, so the scenario runs for real.
+	// exclusive-authority engines (wave-3 control-loop), and the loopback is a PEER,
+	// not a gateway: it echoes registers, it does not reconcile a head-end control
+	// onto a DER, so there is no honest way for it to stand in. The hermetic proof
+	// is the pure-oracle unit tests (+ the httptest bench stub for wave-2). A live
+	// run wires the bench, so the scenario runs for real.
 	if sc.NeedsBench && !w.bench.benchReady() {
-		return skipReport(sc, start,
-			"skipped: needs the live bench (not wired in this run) — hermetic coverage is the loopback + the pure-oracle unit tests")
+		return skipReport(sc, start, declineBench,
+			"declined: needs the live bench (not wired in this run) — it judges an effect only the real gateway produces, so the "+
+				"register-echo loopback cannot stand in; hermetic coverage is the pure-oracle unit tests (+ the bench stub for wave-2). "+
+				"See qa/gw-scenarios/README.md")
 	}
-	// A BOARD-MUTATING scenario (family D) is SKIPPED until the ORCHESTRATOR arms its
+	// A BOARD-MUTATING scenario (family D) DECLINES until the ORCHESTRATOR arms its
 	// mutation out of band and re-runs with -board-armed <id>. This suite never
-	// mutates the board; the skip prints the exact hook to run.
+	// mutates the board; the decline prints the exact hook to run.
 	if sc.NeedsBoard && !w.isBoardArmed(sc.ID) {
-		msg := "skipped: BOARD-MUTATING — the orchestrator arms it out of band, then re-runs with -board-armed " + sc.ID
+		msg := "declined: BOARD-MUTATING — the orchestrator arms it out of band, then re-runs with -board-armed " + sc.ID
 		if sc.Board != nil {
 			msg += " | ARM: " + sc.Board.Arm + " | TEARDOWN: " + sc.Board.Teardown
 		}
-		return skipReport(sc, start, msg)
+		return skipReport(sc, start, declineBoard, msg)
 	}
 	ev := &gwEvidence{Scenario: sc.ID}
 	if sc.arm != nil {
@@ -168,15 +221,21 @@ func runScenario(ctx context.Context, w *gwWorld, sc gwScenario) *gwReport {
 }
 
 // skipReport builds the synthetic expected-INCONCLUSIVE report for a scenario the
-// runner skips (no bench wired, or a board mutation not armed) — never a gate
-// failure, so a default run stays green while the skip explains what to wire/arm.
-func skipReport(sc gwScenario, start time.Time, finding string) *gwReport {
+// runner DECLINED to run in this mode (no bench wired, or a board mutation not
+// armed) — never a gate failure, so a default run stays green while the decline
+// explains what to wire or arm. kind (declineBench / declineBoard) is what lets
+// the roll-up say how much of the suite this mode could not reach, instead of
+// burying it in the same INCONCLUSIVE tally as a scenario that ran and saw
+// nothing.
+func skipReport(sc gwScenario, start time.Time, kind, finding string) *gwReport {
 	return &gwReport{
 		ID: sc.ID, Desc: sc.Desc, Category: sc.Category, Source: sc.Source,
 		Security: sc.Security, Verdict: VerdictInconclusive, Expected: sc.Expected,
 		VerdictExpected: true,
 		Findings:        []string{finding},
 		DurationS:       time.Since(start).Seconds(),
+		Declined:        true,
+		DeclineKind:     kind,
 	}
 }
 
@@ -238,6 +297,13 @@ func scenarioLine(rep *gwReport) string {
 	if rep.Security {
 		sec = " [sec]"
 	}
+	// A declined scenario says so on its own line. Its verdict column reads
+	// INCONCLUSIVE like any other non-observation, and without this marker the two
+	// are indistinguishable at a glance — which is how 28 never-run scenarios came
+	// to look like 28 attempted ones.
+	if rep.Declined {
+		sec += " [declined:" + rep.DeclineKind + "]"
+	}
 	return fmt.Sprintf("%-12s %-32s %-6s %.2fs  %s%s", rep.Verdict, rep.ID, rep.Source, rep.DurationS, tag, sec)
 }
 
@@ -255,6 +321,9 @@ func evidenceTable(sum BatchSummary) string {
 		if !rep.VerdictExpected {
 			flag = "  <-- OUTSIDE EXPECTED"
 		}
+		if rep.Declined {
+			flag += "  [DECLINED: " + rep.DeclineKind + "]"
+		}
 		fmt.Fprintf(&b, "[%s] %s (%s/%s)%s%s\n", rep.Verdict, rep.ID, rep.Source, rep.Category, pin, flag)
 		for _, f := range rep.Findings {
 			fmt.Fprintf(&b, "    %s\n", f)
@@ -268,6 +337,38 @@ func evidenceTable(sum BatchSummary) string {
 // run, or ran without being able to observe what it needed.
 func (s BatchSummary) Asserted() int {
 	return s.ByVerdict[VerdictPass] + s.ByVerdict[VerdictFail] + s.ByVerdict[VerdictDegraded]
+}
+
+// Applicable counts the scenarios this MODE could actually run — the selection
+// minus the ones it declined. It is the honest denominator for the assertion
+// count: "asserted 9/37" invites the reader to think 28 checks were attempted and
+// came back unreadable, when in fact this mode never had 28 of them to run.
+func (s BatchSummary) Applicable() int { return s.Total - s.Declined }
+
+// declinedDetail renders the decline tally in suite order of severity of
+// surprise: bench first (the large group), then board, then anything added later.
+func declinedDetail(by map[string]int) string {
+	if len(by) == 0 {
+		return ""
+	}
+	label := map[string]string{
+		declineBench: "need the live bench",
+		declineBoard: "need a board mutation",
+	}
+	kinds := make([]string, 0, len(by))
+	for k := range by {
+		kinds = append(kinds, k)
+	}
+	sort.Strings(kinds)
+	parts := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		name := label[k]
+		if name == "" {
+			name = k
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", by[k], name))
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 // rollupLine summarises the run: per-verdict tallies, how much of the selection
@@ -286,6 +387,17 @@ func (s BatchSummary) Asserted() int {
 // count is itself a gate failure with the reason spelled out. This is the
 // gw-mayhem half of lexa-gw docs/ADVERSARIAL_QA_STRATEGY.md wave 1, "make the
 // existing harnesses honest".
+//
+// THE DENOMINATOR. The assertion count used to be printed over the whole
+// selection — "asserted 9/37" for the documented hermetic invocation. That
+// denominator is not a measure of anything: 28 of those 37 are scenarios the
+// hermetic mode never had to run, because they judge an effect only the real
+// gateway produces. Reporting them alongside the nine it did run makes the gate
+// look four times larger than it is, and buries a scenario that RAN and could not
+// observe (a real signal, possibly a finding) in the same tally as 28 that were
+// never applicable. The roll-up therefore states the mode's own size first —
+// applicable, declined, and why — and scores the assertion count against the
+// applicable set.
 func rollupLine(sum BatchSummary) string {
 	var parts []string
 	for _, v := range []Verdict{VerdictPass, VerdictDegraded, VerdictFail, VerdictBlind, VerdictInconclusive} {
@@ -297,16 +409,19 @@ func rollupLine(sum BatchSummary) string {
 	if tally == "" {
 		tally = "no scenarios"
 	}
-	asserted := sum.Asserted()
+	asserted, applicable := sum.Asserted(), sum.Applicable()
 	gate := "GATE PASS"
 	switch {
 	case sum.GateFailures > 0:
 		gate = fmt.Sprintf("GATE FAIL (%d)", sum.GateFailures)
+	case sum.Total > 0 && applicable == 0:
+		gate = "GATE FAIL (no scenario in this run mode was applicable — wire the bench or arm a board mutation)"
 	case sum.Total > 0 && asserted == 0:
-		gate = "GATE FAIL (nothing asserted — every scenario declined to run)"
+		gate = "GATE FAIL (nothing asserted — every applicable scenario declined to reach a judgement)"
 	}
-	return fmt.Sprintf("Roll-up: %d scenario(s) [%s] | asserted %d/%d | %s | %d load error(s)",
-		sum.Total, tally, asserted, sum.Total, gate, len(sum.LoadErrors))
+	return fmt.Sprintf("Roll-up: %d scenario(s) [%s] | applicable %d, declined %d%s | asserted %d/%d applicable | %s | %d load error(s)",
+		sum.Total, tally, applicable, sum.Declined, declinedDetail(sum.DeclinedBy),
+		asserted, applicable, gate, len(sum.LoadErrors))
 }
 
 // SortReportsByID sorts a summary's reports by ID (stable evidence ordering for a

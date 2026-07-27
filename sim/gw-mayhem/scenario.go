@@ -430,7 +430,27 @@ type gwReport struct {
 	DurationS       float64                    `json:"duration_s"`
 	Evidence        *gwEvidence                `json:"evidence,omitempty"`
 	Campaign        *aggregator.CampaignReport `json:"campaign,omitempty"`
+
+	// Declined records that the runner never RAN this scenario in this mode — the
+	// live bench was not wired, or a board mutation was not armed — as opposed to
+	// running it and being unable to observe the answer. Both used to land as a bare
+	// INCONCLUSIVE, which made a roll-up read as though the whole suite had been
+	// attempted and most of it had come back unreadable. They are different facts
+	// and a reader needs them apart: "this mode cannot run that scenario" is a
+	// property of the RUN, while "the scenario ran and saw nothing" is a property of
+	// the gateway's observability and may be a finding. DeclineKind is the one-word
+	// reason the roll-up groups by.
+	Declined    bool   `json:"declined,omitempty"`
+	DeclineKind string `json:"decline_kind,omitempty"`
 }
+
+// The reasons a scenario is declined in a given run mode. They belong to the
+// RUNNER, not to a scenario: the same scenario is declined in a -loopback run and
+// runs for real against the live bench.
+const (
+	declineBench = "bench" // needs the live bench: the sim admin APIs, or engines only the real gateway has
+	declineBoard = "board" // needs a BOARD mutation the orchestrator arms out of band
+)
 
 // verdictIn reports whether v is listed in expected. An empty list means "no
 // expectation declared" ⇒ always true (never trips the gate), matching the
