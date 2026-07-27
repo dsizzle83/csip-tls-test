@@ -5,6 +5,7 @@
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
         test test-fast test-integration test-update-golden test-southbound test-evidence qa qa-bench fuzz \
+        diff test-diff \
         sweep-sunspec \
         modsim-image modsim-run modsim-stop \
         gen-test-certs gen-comm004-certs gen-client-cert gen-ev-cert gen-mbaps-certs gen-mbaps-leaves smoke-pi clean help \
@@ -391,6 +392,25 @@ BENCH ?= http://69.0.0.20:8080
 MODE ?=
 qa-bench:
 	bash scripts/qa-regression.sh --bench $(BENCH) $(MODE)
+
+# Differential layer (internal/diff): the SAME input shown to the product's
+# implementation and to an independently-written referee, with every
+# disagreement reported. Pure Go, in-process register banks — it touches no
+# network and no bench, so it is safe to run while the bench is in use.
+#
+# Exit 1 means a disagreement; exit 2 means the run compared NOTHING, which is
+# a harness failure and deliberately not the same as success. Artifacts land in
+# runs/diff-<timestamp>/ as REPORT.md and report.json.
+DIFF_SEED ?= 1
+DIFF_ARGS ?=
+diff:
+	go run ./cmd/gw-diff -seed $(DIFF_SEED) $(DIFF_ARGS)
+
+# The differential's own regression gate: the control family must agree with
+# the product, the comparators must fail on deliberately wrong pairs, and every
+# confirmed defect class must still reproduce.
+test-diff:
+	go test -race ./internal/diff/...
 
 # PCAP evidence engine (internal/evidence/...): pure Go, stdlib only, no cgo —
 # so it runs with CGO_ENABLED=0 and needs no wolfSSL sysroot. Covers the pcapng
