@@ -21,14 +21,25 @@ package gwloopback
 //     handshake, so an expired / wrong-CA cert simply fails to connect).
 //   - malformed writes: an illegal FC and any denied op answer a bare 0x01; an
 //     oversized frame is a framing violation the shared mbap.Decode rejects, closing
-//     the session; a write to the read-only SunSpec marker answers 0x03; and — to
-//     model the live gateway's GAP — an out-of-range control value is ACCEPTED (no
-//     range check), keeping the pinned out-of-range scenario FAIL both here and live.
+//     the session; a write to the read-only SunSpec marker answers 0x03; and an
+//     out-of-range 704 control value (WMaxLimPct outside [0,100], WSetPct/VarSetPct
+//     outside [-100,100]) is REFUSED with 0x03 and never applied.
 //   - transport: a small concurrent-session CAP refuses the flood's excess
 //     post-handshake.
+//
+// The out-of-range behaviour used to be inverted here: this loopback deliberately
+// modelled a live-gateway GAP (no range check) so the pinned out-of-range scenario
+// FAILed in both places. That gap was CLOSED in the product (bounded signed
+// setpoints; out-of-range WMaxLimPct -> exception 0x03) and the model was never
+// updated, so the hermetic gate FAILed permanently on a case the real gateway
+// passes — verified 2026-07-26 against the live :802, which correctly rejects all
+// five out-of-range probes with 0x03. A gate that fails on known-good behaviour
+// trains its operators to ignore it, which is worse than having no gate, so the
+// model now tracks the shipped behaviour.
 
 import (
 	"errors"
+	"math"
 	"net"
 	"sync/atomic"
 
@@ -220,8 +231,11 @@ func (s *LoopbackServer) handle(req mbap.ADU, role string) mbap.ADU {
 			// for an authz-allowed role (0x03), modelling the gateway's write decoder.
 			return mbap.Exception(req, mbap.ExIllegalValue)
 		}
-		// NOTE: no numeric range check — an out-of-range control value (WMaxLimPct>100)
-		// is ACCEPTED, modelling the live gateway's known gap (design 02 §4.4).
+		// Numeric range check on the 704 control points, mirroring the gateway's write
+		// decoder: an out-of-range setpoint is refused with 0x03 and NEVER applied.
+		if !s.inRange704(wreq.Addr, wreq.Values) {
+			return mbap.Exception(req, mbap.ExIllegalValue)
+		}
 		if _, herr := s.regs.HandleHoldingRegisters(&modbuslib.HoldingRegistersRequest{
 			UnitId: req.UnitID, Addr: wreq.Addr, Quantity: uint16(len(wreq.Values)), IsWrite: true, Args: wreq.Values,
 		}); herr != nil {
@@ -242,6 +256,85 @@ func (s *LoopbackServer) handle(req mbap.ADU, role string) mbap.ADU {
 // (40000: "SunS", 40001) — never a writable control register.
 func readOnlyAddr(addr uint16) bool {
 	return addr == sunspec.SunSpecBase || addr == sunspec.SunSpecBase+1
+}
+
+// ctlRange is one 704 control point's permitted range in ENGINEERING units
+// (percent), as the SunSpec DER AC Controls model defines it.
+type ctlRange struct {
+	point  string
+	sfName string
+	signed bool
+	lo, hi float64
+}
+
+// ctlRanges are the 704 setpoints the gateway's write decoder bounds. WMaxLimPct is
+// an unsigned percent-of-max; WSetPct and VarSetPct are signed (a real negative
+// commands import / absorb), which is why the -150 probes are distinct cases from
+// the +150 ones rather than the same test twice.
+var ctlRanges = []ctlRange{
+	{"WMaxLimPct", "WMaxLimPct_SF", false, 0, 100},
+	{"WSetPct", "WSetPct_SF", true, -100, 100},
+	{"VarSetPct", "VarSetPct_SF", true, -100, 100},
+}
+
+// find704Base walks the SunSpec model chain to the DER AC Controls (704) data block,
+// exactly as a conformant client would: past the "SunS" marker, then header by
+// header until the model id matches or the 0xFFFF end marker is reached. Walking
+// rather than hardcoding an offset keeps this correct if the served model set
+// changes, and it fails closed (ok=false) rather than validating against a
+// misidentified block.
+func (s *LoopbackServer) find704Base() (uint16, bool) {
+	addr := uint16(sunspec.SunSpecBase + 2) // skip the 2-register "SunS" identifier
+	for i := 0; i < 64; i++ {               // bounded: a corrupt map must not spin
+		id := s.regs.Get(addr)
+		if id == 0xFFFF {
+			return 0, false
+		}
+		length := s.regs.Get(addr + 1)
+		if id == uint16(sunspec.ModelDERCtlAC) {
+			return addr + 2, true // data starts after the (id, len) header
+		}
+		if length == 0 {
+			return 0, false // malformed header; stop rather than loop forever
+		}
+		addr += 2 + length
+	}
+	return 0, false
+}
+
+// inRange704 reports whether a write to [addr, addr+len) leaves every 704 control
+// point it touches within range. Values are compared in ENGINEERING units — the raw
+// register is scaled by the model's own scale factor, read live from the map — because
+// that is where the limit is defined and where the real gateway enforces it. A raw
+// comparison would silently pass or fail depending on the SF the device happens to
+// publish.
+//
+// Writes that touch no bounded point are unaffected, so this cannot make an unrelated
+// write fail.
+func (s *LoopbackServer) inRange704(addr uint16, values []uint16) bool {
+	base, ok := s.find704Base()
+	if !ok {
+		return true // no 704 served: nothing to bound
+	}
+	for _, cr := range ctlRanges {
+		pAddr := base + uint16(sunspec.L704.Offset(cr.point))
+		idx := int(pAddr) - int(addr)
+		if idx < 0 || idx >= len(values) {
+			continue // this write does not cover the point
+		}
+		sf := int16(s.regs.Get(base + uint16(sunspec.L704.Offset(cr.sfName))))
+		var eng float64
+		if cr.signed {
+			eng = float64(int16(values[idx]))
+		} else {
+			eng = float64(values[idx])
+		}
+		eng *= math.Pow(10, float64(sf))
+		if eng < cr.lo || eng > cr.hi {
+			return false
+		}
+	}
+	return true
 }
 
 func mapErr(err error) mbap.ExCode {

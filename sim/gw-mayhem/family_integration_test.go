@@ -36,9 +36,22 @@ func TestFamily_AgainstLoopback(t *testing.T) {
 	scenarios := goScenarios()
 
 	want := map[string]Verdict{
-		"authz-role-denial-matrix":    VerdictPass,
-		"authz-cert-negatives":        VerdictPass,
-		"authz-out-of-range-setpoint": VerdictFail, // pinned gap — the loopback models it
+		"authz-role-denial-matrix": VerdictPass,
+		"authz-cert-negatives":     VerdictPass,
+		// LOOPBACK LIMITATION, not a gateway gap. The loopback now enforces the 704
+		// range check (it previously modelled a product gap that was closed), but this
+		// scenario still FAILs hermetically because the loopback SERVER loses the peer
+		// role on a RESUMED session: mbtls.Session.PeerDER comes from
+		// wolfSSL_get_peer_certificate, which yields nothing when the client did not
+		// re-send its certificate, so authz collapses to no-role and answers 0x01
+		// instead of the value rejection 0x03. It only bites in a FULL run, where an
+		// earlier scenario has already cached a GridService session -- run alone, this
+		// scenario PASSes. The REAL gateway is correct here: verified 2026-07-26
+		// against the live :802, role-denial-matrix followed by out-of-range returns
+		// 0x03 for all five probes, so the product preserves the role across
+		// resumption. Flip this to VerdictPass once the loopback can recover the peer
+		// cert from a resumed session.
+		"authz-out-of-range-setpoint": VerdictFail,
 		"authz-malformed-writes":      VerdictPass,
 		"transport-session-flood":     VerdictPass,
 		// Wave-3 control-loop (family C) is NeedsBench (live-driven) — skipped here as
