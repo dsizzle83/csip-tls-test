@@ -72,3 +72,11 @@ go.work.sum
 # cmd/dashboard/main.go + Makefile `ui` target); node_modules never is.
 cmd/dashboard/ui/node_modules
 /vtnsim
+
+# TLS key-log output. wolfSSL built with --enable-keylog-export ALSO writes its
+# own ./sslkeylog.log in the process CWD (WOLFSSL_SSLKEYLOGFILE_OUTPUT is a
+# compile-time constant, not the SSLKEYLOGFILE env var), independent of the
+# bench's own keylog path in internal/wolfssl/keylog.go. Session secrets must
+# never be committed.
+sslkeylog.log
+*.keylog

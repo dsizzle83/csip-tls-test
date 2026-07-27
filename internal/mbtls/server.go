@@ -96,6 +96,14 @@ func (l *Listener) Accept() (*Session, error) {
 		conn.Close()
 		return nil, err
 	}
+	// Arm key-log export before the handshake — see the same call in client.go
+	// for why it must precede it. No-op outside a -tags keylog evidence build.
+	if err := wolfssl.EnableTLS13Keylog(ssl); err != nil {
+		wolfssl.FreeSSL(ssl)
+		file.Close()
+		conn.Close()
+		return nil, fmt.Errorf("mbtls: arm key-log export: %w", err)
+	}
 	if err := wolfssl.Accept(ssl); err != nil {
 		// Rejected handshake (no client cert, wrong CA, no shared suite). Flush
 		// the alert wolfSSL queued, then close gracefully so the peer reads the
@@ -106,6 +114,7 @@ func (l *Listener) Accept() (*Session, error) {
 		conn.Close()
 		return nil, fmt.Errorf("mbtls: server handshake rejected: %w", err)
 	}
+	wolfssl.WriteTLS12Keylog(ssl)
 	return newSession(ssl, nil, conn, file, false), nil
 }
 

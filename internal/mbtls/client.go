@@ -109,6 +109,17 @@ func Dial(addr string, p Profile) (*Session, error) {
 		}
 	}
 
+	// Arm TLS key-log export BEFORE the handshake: the TLS 1.3 secret callback
+	// fires as the key schedule advances, so any secret derived before it is
+	// installed is unrecoverable. No-op unless the binary was built with
+	// -tags keylog AND a key log was opened (internal/wolfssl/keylog.go) — i.e.
+	// only for conformance-evidence runs, whose captures have to be decryptable
+	// to prove anything above the handshake.
+	if err := wolfssl.EnableTLS13Keylog(ssl); err != nil {
+		wolfssl.FreeSSL(ssl)
+		return nil, fmt.Errorf("mbtls: arm key-log export: %w", err)
+	}
+
 	if err := wolfssl.Connect(ssl); err != nil {
 		// A handshake that faulted (including a rejected resume attempt) drops the
 		// cached session for this peer so a poisoned session is never replayed.
@@ -118,6 +129,11 @@ func Dial(addr string, p Profile) (*Session, error) {
 		wolfssl.FreeSSL(ssl)
 		return nil, fmt.Errorf("mbtls: client handshake failed: %w", err)
 	}
+
+	// TLS 1.2 has no secret callback: its master secret only exists on the
+	// session once the handshake completes. No-op for TLS 1.3 (whose secrets
+	// already went through the callback above) and when export is off.
+	wolfssl.WriteTLS12Keylog(ssl)
 
 	// Ownership transfers to the Session from here; disable the unwinders.
 	ok, dialOK, fileOK = true, true, true

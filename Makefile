@@ -3,7 +3,7 @@
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
-        test test-fast test-integration test-update-golden test-southbound qa qa-bench fuzz \
+        test test-fast test-integration test-update-golden test-southbound test-evidence qa qa-bench fuzz \
         sweep-sunspec \
         modsim-image modsim-run modsim-stop \
         gen-test-certs gen-comm004-certs gen-client-cert gen-ev-cert gen-mbaps-certs smoke-pi clean help \
@@ -317,6 +317,25 @@ MODE ?=
 qa-bench:
 	bash scripts/qa-regression.sh --bench $(BENCH) $(MODE)
 
+# PCAP evidence engine (internal/evidence/...): pure Go, stdlib only, no cgo —
+# so it runs with CGO_ENABLED=0 and needs no wolfSSL sysroot. Covers the pcapng
+# and classic-libpcap readers, TCP reassembly, TLS dissection, the CCM /
+# ChaCha20-Poly1305 RFC vectors, TLS 1.2 + 1.3 decryption from an NSS key log,
+# and the bundle writer/verifier. The end-to-end cases drive dumpcap on `lo` and
+# skip, with a reason, wherever capture is not permitted.
+#
+# The live-bench cases (internal/evidence/e2e) read a real gateway capture and
+# key log from OUTSIDE the repo — session secrets are deliberately not committed
+# — and skip when absent. Point them at a run with:
+#   make test-evidence EVIDENCE_LIVE_PCAP=/path/run.pcapng EVIDENCE_LIVE_KEYLOG=/path/run.keylog
+# The CGO_ENABLED=0 build is the gate on the no-cgo rule, not decoration: the
+# whole point is that a third party can rebuild the bundle verifier with nothing
+# but a Go toolchain. -race needs cgo, so it runs as its own step.
+test-evidence:
+	CGO_ENABLED=0 go build ./internal/evidence/...
+	CGO_ENABLED=0 go vet ./internal/evidence/...
+	go test -race ./internal/evidence/...
+
 # Southbound unit + integration tests (no hardware required; uses in-process Modbus server).
 # Includes the in-process Modbus conformance suite (TestModbusConformance_*).
 test-southbound:
@@ -463,6 +482,7 @@ help:
 	@echo "  make test-fast           Unit tests only (sub-second)"
 	@echo "  make test-integration    Full TLS handshake tests"
 	@echo "  make test-southbound     Southbound Modbus/SunSpec tests (in-process server)"
+	@echo "  make test-evidence       PCAP evidence engine (pure Go, no cgo; dumpcap on lo)"
 	@echo ""
 	@echo "Simulator:"
 	@echo "  make modsim-image        Build the Docker image for the SunSpec simulator"

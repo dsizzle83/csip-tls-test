@@ -1,0 +1,286 @@
+package bundle
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os/exec"
+	"sort"
+	"strings"
+	"time"
+
+	"csip-tls-test/internal/evidence/capture"
+	"csip-tls-test/internal/evidence/pcapng"
+)
+
+// SchemaVersion identifies the bundle.json layout. A verifier that does not
+// recognise it must refuse to pass the bundle rather than check what it happens
+// to understand.
+const SchemaVersion = "lexa-evidence-bundle/1"
+
+// File names inside a bundle directory. They are fixed so that "run Verify on
+// this directory" needs no arguments and no explanation.
+const (
+	BundleFile   = "bundle.json"
+	ReportFile   = "REPORT.md"
+	ManifestFile = "MANIFEST.sha256"
+	CaptureDir   = "capture"
+)
+
+// Verdict is a test case's or assertion's outcome, using the same four values
+// as the rest of this bench's conformance reporting (sim/ssm-conformance).
+type Verdict string
+
+// The four verdicts.
+const (
+	// Pass — the criterion was asserted on the wire and held.
+	Pass Verdict = "PASS"
+	// Fail — the criterion was asserted and did not hold.
+	Fail Verdict = "FAIL"
+	// Skip — addressed but not wire-assertable by this run; Observed says why.
+	Skip Verdict = "SKIP"
+	// Warn — asserted with a caveat.
+	Warn Verdict = "WARN"
+)
+
+// Severity orders verdicts so a test case can take the worst of its assertions.
+func (v Verdict) Severity() int {
+	switch v {
+	case Fail:
+		return 3
+	case Warn:
+		return 2
+	case Pass:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// Assertion is one checkable claim about the capture.
+//
+// The Frames / StreamRef / ByteRange / digest fields are what separate an
+// evidence bundle from a test report. Without them a reader has to believe the
+// verdict; with them they can open the pcap, go to the frame, and see the bytes
+// for themselves — and Verify does exactly that mechanically.
+type Assertion struct {
+	// Claim is the sentence being asserted, in the language of the procedure
+	// being certified against.
+	Claim string `json:"claim"`
+	// Method says how it was checked, so a reader can judge whether the check
+	// actually establishes the claim.
+	Method  string  `json:"method"`
+	Verdict Verdict `json:"verdict"`
+	// Observed is what was actually seen, in human-readable form.
+	Observed string `json:"observed"`
+
+	// Frames are 1-based capture frame numbers, matching Wireshark's
+	// frame.number and pcapng.Packet.Index.
+	Frames []int `json:"frames,omitempty"`
+	// FramesSHA256 is the digest of the cited frames' bytes, concatenated in
+	// ascending frame order. Without it Verify can only confirm the frames
+	// exist.
+	FramesSHA256 string `json:"frames_sha256,omitempty"`
+
+	// StreamRef names a reassembled TCP direction as "src > dst", e.g.
+	// "69.0.0.20:51422 > 69.0.0.2:802".
+	StreamRef string `json:"stream_ref,omitempty"`
+	// ByteRange is a half-open [start,end) range of that direction's stream.
+	ByteRange [2]int `json:"byte_range,omitempty"`
+	// BytesSHA256 is the digest of those bytes.
+	BytesSHA256 string `json:"bytes_sha256,omitempty"`
+
+	// Note carries anything a reader needs in order not to over-read the claim.
+	Note string `json:"note,omitempty"`
+}
+
+// Citable reports whether the assertion carries a digest Verify can re-check.
+// An assertion without one is still useful prose, but it is not proof, and the
+// verify report says so.
+func (a Assertion) Citable() bool { return a.BytesSHA256 != "" || a.FramesSHA256 != "" }
+
+// TestCaseResult is one procedure step's outcome.
+type TestCaseResult struct {
+	// ID is the identifier from the procedure document, e.g. "SunSpecTCP-11".
+	ID string `json:"id"`
+	// Doc names the document the ID belongs to.
+	Doc        string      `json:"doc,omitempty"`
+	Title      string      `json:"title"`
+	Verdict    Verdict     `json:"verdict"`
+	Notes      string      `json:"notes,omitempty"`
+	Assertions []Assertion `json:"assertions"`
+}
+
+// RollUp returns the worst verdict among the assertions, which is what
+// TestCaseResult.Verdict should normally be set to.
+func (tc TestCaseResult) RollUp() Verdict {
+	worst := Skip
+	for _, a := range tc.Assertions {
+		if a.Verdict.Severity() > worst.Severity() {
+			worst = a.Verdict
+		}
+	}
+	return worst
+}
+
+// DUT identifies the device under test.
+type DUT struct {
+	Name string `json:"name,omitempty"`
+	// Address is where it was reached, e.g. "69.0.0.2:802".
+	Address string `json:"address,omitempty"`
+	// Identity is the credential it presented — an LFDI, a certificate
+	// fingerprint, a serial number.
+	Identity string `json:"identity,omitempty"`
+	Role     string `json:"role,omitempty"`
+	// Build is the firmware/build version, when the operator can supply it.
+	Build string `json:"build,omitempty"`
+}
+
+// RunMeta is everything about the run itself.
+type RunMeta struct {
+	Tool        string `json:"tool"`
+	ToolVersion string `json:"tool_version,omitempty"`
+	// GitCommit and GitDirty pin the code that produced the bundle. A dirty
+	// tree is recorded rather than hidden: a bundle produced from uncommitted
+	// changes is still evidence, but a reader is entitled to know.
+	GitCommit string    `json:"git_commit,omitempty"`
+	GitDirty  bool      `json:"git_dirty,omitempty"`
+	Host      string    `json:"host,omitempty"`
+	Operator  string    `json:"operator,omitempty"`
+	Note      string    `json:"note,omitempty"`
+	Started   time.Time `json:"started"`
+	Finished  time.Time `json:"finished"`
+	DUT       DUT       `json:"dut"`
+}
+
+// Bundle is the machine-checkable half of an evidence bundle: exactly what
+// bundle.json contains.
+type Bundle struct {
+	Schema  string           `json:"schema"`
+	Run     RunMeta          `json:"run"`
+	Capture capture.Summary  `json:"capture"`
+	Files   BundleFiles      `json:"files"`
+	Cases   []TestCaseResult `json:"cases"`
+}
+
+// BundleFiles records where the artefacts live inside the bundle directory,
+// relative to it.
+type BundleFiles struct {
+	Capture string   `json:"capture,omitempty"`
+	KeyLog  string   `json:"keylog,omitempty"`
+	Extra   []string `json:"extra,omitempty"`
+}
+
+// Counts tallies the test cases by verdict.
+func (b *Bundle) Counts() (pass, fail, skip, warn int) {
+	for _, c := range b.Cases {
+		switch c.Verdict {
+		case Pass:
+			pass++
+		case Fail:
+			fail++
+		case Skip:
+			skip++
+		case Warn:
+			warn++
+		}
+	}
+	return
+}
+
+// OK reports whether the run is a clean pass: at least one case, and no FAIL.
+func (b *Bundle) OK() bool {
+	_, fail, _, _ := b.Counts()
+	return len(b.Cases) > 0 && fail == 0
+}
+
+// ByteSource is the part of a reassembled TCP direction an assertion needs.
+// internal/evidence/netdis.StreamBytes satisfies it; declaring it as an
+// interface keeps the bundle's authoring API independent of the dissector.
+type ByteSource interface {
+	Range(start, end int) ([]byte, error)
+	PacketsFor(start, end int) []int
+}
+
+// CiteBytes builds an assertion that cites a byte range of a reassembled
+// stream, filling in the frames that carried those bytes and their digest.
+//
+// This is the constructor conformance checks should use: it is not possible to
+// cite a byte range through it without also recording something Verify can
+// re-derive from the capture.
+func CiteBytes(claim, method string, v Verdict, observed, streamRef string, src ByteSource, start, end int) (Assertion, error) {
+	data, err := src.Range(start, end)
+	if err != nil {
+		return Assertion{}, fmt.Errorf("bundle: cannot cite %s bytes [%d,%d): %w", streamRef, start, end, err)
+	}
+	sum := sha256.Sum256(data)
+	return Assertion{
+		Claim:       claim,
+		Method:      method,
+		Verdict:     v,
+		Observed:    observed,
+		StreamRef:   streamRef,
+		ByteRange:   [2]int{start, end},
+		BytesSHA256: hex.EncodeToString(sum[:]),
+		Frames:      src.PacketsFor(start, end),
+	}, nil
+}
+
+// CiteFrames builds an assertion that cites whole frames, digesting their
+// captured bytes in ascending frame order.
+func CiteFrames(claim, method string, v Verdict, observed string, pkts []pcapng.Packet, frames []int) (Assertion, error) {
+	sum, err := digestFrames(pkts, frames)
+	if err != nil {
+		return Assertion{}, err
+	}
+	sorted := append([]int(nil), frames...)
+	sort.Ints(sorted)
+	return Assertion{
+		Claim:        claim,
+		Method:       method,
+		Verdict:      v,
+		Observed:     observed,
+		Frames:       sorted,
+		FramesSHA256: sum,
+	}, nil
+}
+
+// digestFrames hashes the cited frames' captured bytes, in ascending order.
+func digestFrames(pkts []pcapng.Packet, frames []int) (string, error) {
+	byIndex := make(map[int]pcapng.Packet, len(pkts))
+	for _, p := range pkts {
+		byIndex[p.Index] = p
+	}
+	sorted := append([]int(nil), frames...)
+	sort.Ints(sorted)
+	h := sha256.New()
+	for _, f := range sorted {
+		p, ok := byIndex[f]
+		if !ok {
+			return "", fmt.Errorf("bundle: cannot cite frame %d: the capture has %d frames", f, len(pkts))
+		}
+		h.Write(p.Data)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// GitCommit reports the HEAD commit of the repository containing dir and
+// whether the working tree was dirty. Both results are best-effort: a bundle
+// built outside a checkout is still a bundle.
+func GitCommit(dir string) (commit string, dirty bool) {
+	run := func(args ...string) (string, bool) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.Output()
+		if err != nil {
+			return "", false
+		}
+		return strings.TrimSpace(string(out)), true
+	}
+	commit, ok := run("rev-parse", "HEAD")
+	if !ok {
+		return "", false
+	}
+	status, ok := run("status", "--porcelain")
+	return commit, ok && status != ""
+}
