@@ -319,7 +319,8 @@ func critServerChainObserved() criterion {
 		How: "the certificate_list of the server's Certificate handshake message, and the completion of " +
 			"the handshake that followed it",
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-			h := &t.Handshake
+			ht, note := handshakeOf(t)
+			h := &ht.Handshake
 			if len(h.ServerChain) == 0 {
 				if h.Resumed {
 					return resumedNoCertificates(h, "the chain the server presented")
@@ -328,18 +329,18 @@ func critServerChainObserved() criterion {
 			}
 			desc := chainDescription(h.ServerChain)
 			if !h.Complete {
-				if a, ok := firstFatalAlert(t); ok {
-					return found(certify.Fail, a.Packets,
+				if a, ok := firstFatalAlert(ht); ok {
+					return annotate(found(certify.Fail, a.Packets,
 						"the DUT REFUSED the %d-certificate chain (%s) with fatal alert %s",
-						len(h.ServerChain), desc, a)
+						len(h.ServerChain), desc, a), note)
 				}
-				return found(certify.Fail, h.ServerCertFrames,
+				return annotate(found(certify.Fail, h.ServerCertFrames,
 					"the handshake did not complete after the server's %d-certificate chain (%s)",
-					len(h.ServerChain), desc)
+					len(h.ServerChain), desc), note)
 			}
-			return found(certify.Pass, h.ServerCertFrames,
+			return annotate(found(certify.Pass, h.ServerCertFrames,
 				"the server presented %d certificate(s) — %s — and the DUT completed the handshake",
-				len(h.ServerChain), desc)
+				len(h.ServerChain), desc), note)
 		},
 	}
 }
@@ -360,7 +361,8 @@ func critDUTChainProfile() criterion {
 		How: "an ASN.1 walk of the leaf certificate from the DUT's Certificate handshake message: key " +
 			"algorithm and curve, SubjectName, critical extensions and notAfter",
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-			h := &t.Handshake
+			ht, note := handshakeOf(t)
+			h := &ht.Handshake
 			if len(h.ClientChain) == 0 {
 				if h.Resumed {
 					return resumedNoCertificates(h, "the DUT's own device certificate")
@@ -369,7 +371,8 @@ func critDUTChainProfile() criterion {
 			}
 			ci, err := tlsdis.ParseCertInfo(h.ClientChain[0])
 			if err != nil {
-				return found(certify.Fail, h.ClientCertFrames, "the DUT's leaf certificate did not parse: %v", err)
+				return annotate(found(certify.Fail, h.ClientCertFrames,
+					"the DUT's leaf certificate did not parse: %v", err), note)
 			}
 			var deviations []string
 			if ci.PublicKeyAlgorithm != "ECDSA" || ci.Curve != "P-256" {
@@ -385,14 +388,14 @@ func critDUTChainProfile() criterion {
 					"256-bit ECC device certificate", ci.NotAfter.Format("2006-01-02")))
 			}
 			if len(deviations) == 0 {
-				return found(certify.Pass, h.ClientCertFrames,
-					"%s; %d extension(s), EC %s", certSummary(h.ClientChain[0]), len(ci.Extensions), ci.Curve)
+				return annotate(found(certify.Pass, h.ClientCertFrames,
+					"%s; %d extension(s), EC %s", certSummary(h.ClientChain[0]), len(ci.Extensions), ci.Curve), note)
 			}
-			return found(certify.Warn, h.ClientCertFrames,
+			return annotate(found(certify.Warn, h.ClientCertFrames,
 				"the certificate the DUT presented deviates from the §6.11 profile in %d respect(s): %s. "+
 					"On this bench the credential is minted by the harness PKI, so a deviation here is a "+
 					"property of the TEST credential and is reported rather than failed",
-				len(deviations), strings.Join(deviations, "; "))
+				len(deviations), strings.Join(deviations, "; ")), note)
 		},
 	}
 }
@@ -474,7 +477,8 @@ func chainDepthCriterion(depth int, shape string) func(*Observation) criterion {
 			How: "the number of certificates in the server's Certificate handshake message, and " +
 				"the completion of the handshake",
 			Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-				h := &t.Handshake
+				ht, note := handshakeOf(t)
+				h := &ht.Handshake
 				if len(h.ServerChain) == 0 {
 					if h.Resumed {
 						return resumedNoCertificates(h, "the length of the chain the server presented")
@@ -488,16 +492,16 @@ func chainDepthCriterion(depth int, shape string) func(*Observation) criterion {
 						len(h.ServerChain), chainDescription(h.ServerChain), depth)
 				}
 				if !h.Complete {
-					if a, ok := firstFatalAlert(t); ok {
-						return found(certify.Fail, a.Packets,
-							"the DUT REFUSED the valid %d-certificate chain with fatal alert %s", depth, a)
+					if a, ok := firstFatalAlert(ht); ok {
+						return annotate(found(certify.Fail, a.Packets,
+							"the DUT REFUSED the valid %d-certificate chain with fatal alert %s", depth, a), note)
 					}
-					return found(certify.Fail, h.ServerCertFrames,
-						"the handshake did not complete against the %d-certificate chain", depth)
+					return annotate(found(certify.Fail, h.ServerCertFrames,
+						"the handshake did not complete against the %d-certificate chain", depth), note)
 				}
-				return found(certify.Pass, h.ServerCertFrames,
+				return annotate(found(certify.Pass, h.ServerCertFrames,
 					"%d certificates presented — %s — handshake completed",
-					depth, chainDescription(h.ServerChain))
+					depth, chainDescription(h.ServerChain)), note)
 			},
 		}
 	}

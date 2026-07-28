@@ -102,34 +102,73 @@ func critMutualAuth() criterion {
 		How: "the presence of the CertificateRequest handshake message in the server direction and of a " +
 			"non-empty Certificate message in the DUT direction",
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-			h := &t.Handshake
-			frames := append(append([]int(nil), h.CertReqFrames...), h.ClientCertFrames...)
-			frames = dedupeInts(frames)
-			switch {
-			case h.CertificateRequest == nil && len(h.ClientChain) == 0:
-				if h.Resumed {
-					return resumedNoCertificates(h, "whether the session is mutually authenticated")
-				}
-				if len(h.ServerHelloFrames) == 0 {
-					return unavailable("the capture holds no handshake for this session")
-				}
-				return found(certify.Fail, h.ServerHelloFrames,
-					"no CertificateRequest from the server and no Certificate from the DUT: "+
-						"the session is server-authenticated only")
-			case h.CertificateRequest == nil:
-				return found(certify.Fail, frames,
-					"the DUT presented %d certificate(s) but the server never sent CertificateRequest",
-					len(h.ClientChain))
-			case len(h.ClientChain) == 0:
-				return found(certify.Fail, frames,
-					"the server sent CertificateRequest and the DUT presented an EMPTY certificate list")
-			default:
-				return found(certify.Pass, frames,
-					"CertificateRequest sent; the DUT presented a %d-certificate chain, leaf %s",
-					len(h.ClientChain), certSummary(h.ClientChain[0]))
-			}
+			ht, note := handshakeOf(t)
+			return annotate(mutualAuthFinding(&ht.Handshake), note)
 		},
 	}
+}
+
+// mutualAuthFinding is critMutualAuth's decision logic over one handshake,
+// factored out so the criterion can be pointed at whichever conversation of the
+// window actually carries the certificate exchange, and so the unit tests
+// exercise the same code the run does.
+func mutualAuthFinding(h *Handshake) Finding {
+	frames := append(append([]int(nil), h.CertReqFrames...), h.ClientCertFrames...)
+	frames = dedupeInts(frames)
+	switch {
+	case h.CertificateRequest == nil && len(h.ClientChain) == 0:
+		if h.Resumed {
+			return resumedNoCertificates(h, "whether the session is mutually authenticated")
+		}
+		if len(h.ServerHelloFrames) == 0 {
+			return unavailable("the capture holds no handshake for this session")
+		}
+		return found(certify.Fail, h.ServerHelloFrames,
+			"no CertificateRequest from the server and no Certificate from the DUT: "+
+				"the session is server-authenticated only")
+	case h.CertificateRequest == nil:
+		return found(certify.Fail, frames,
+			"the DUT presented %d certificate(s) but the server never sent CertificateRequest",
+			len(h.ClientChain))
+	case len(h.ClientChain) == 0:
+		return found(certify.Fail, frames,
+			"the server sent CertificateRequest and the DUT presented an EMPTY certificate list")
+	default:
+		return found(certify.Pass, frames,
+			"CertificateRequest sent; the DUT presented a %d-certificate chain, leaf %s",
+			len(h.ClientChain), certSummary(h.ClientChain[0]))
+	}
+}
+
+// handshakeOf returns the conversation a CERTIFICATE criterion must read, plus
+// the sentence it has to append to its Observed when that is not the
+// conversation the transcript tier selected.
+//
+// See Transcript.HandshakeSession for why the two tiers select differently. The
+// note is not optional politeness: an assertion citing frames from a second
+// conversation of the same window is making a claim about bytes the reader will
+// not find in the session named elsewhere in the row, and a bundle that did not
+// say so would be citing correctly and reading misleadingly.
+func handshakeOf(t *Transcript) (*Transcript, string) {
+	ht := t.HandshakeSession()
+	if ht == nil || ht == t {
+		return t, ""
+	}
+	return ht, fmt.Sprintf(". These bytes are from %s, a SECOND conversation this test case wholly owns: "+
+		"the session recovered for the 2030.5 transcript (%s) is a resumed one and carries no certificates, "+
+		"while this one is the full handshake in the same window",
+		ht.Stream.Key, t.Stream.Key)
+}
+
+// annotate appends a provenance note to a decided finding. An unavailable
+// finding is left alone: it has no Observed to qualify, and its own reason
+// already says what was missing.
+func annotate(f Finding, note string) Finding {
+	if note == "" || f.Unavailable != "" || f.Observed == "" {
+		return f
+	}
+	f.Observed += note
+	return f
 }
 
 // resumedNoCertificates is the shared reason for a certificate criterion that

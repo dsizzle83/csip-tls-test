@@ -248,6 +248,52 @@ type Transcript struct {
 	// Problems collects recovery findings a reader must weigh: a truncated
 	// record layer, a decryption failure, a message the parser could not frame.
 	Problems []string
+
+	// Others are the OTHER conversations this test case WHOLLY OWNS on the same
+	// server endpoint, recovered but not selected as the session. They are kept
+	// because the transcript tier and the handshake tier do not always want the
+	// same conversation — see HandshakeSession — and because a frame in any of
+	// them is a frame this case may legitimately cite.
+	Others []*Transcript
+}
+
+// CarriesCertificates reports whether this handshake actually put the
+// certificate exchange on the wire: a full flight, with the server's chain in
+// it. A resumed session is excluded by construction, and so is a conversation
+// whose capture began after the handshake.
+func (h *Handshake) CarriesCertificates() bool {
+	return h.ServerHello != nil && !h.Resumed && len(h.ServerChain) > 0
+}
+
+// HandshakeSession returns the conversation whose CLEARTEXT HANDSHAKE the
+// certificate criteria must read — which is not always the one the transcript
+// tier selected.
+//
+// The two tiers select on different grounds and there is no reason they should
+// agree. The transcript tier wants the conversation carrying the discovery walk;
+// the handshake tier wants the one carrying the certificate exchange. When a
+// window catches a poll cycle mid-flight it routinely owns both: a full
+// handshake on one connection and a session resumed from its ticket on another.
+// RecoverSession then hands the walk back — correctly — and every certificate
+// criterion used to find itself reading an abbreviated flight with a full one
+// sitting unread in the very same frame set.
+//
+// Citing the other conversation is sound because ownership was already settled:
+// RecoverSession discards every straddling conversation before this point, so
+// each entry in Others is one this test case wholly owns and may cite. A
+// criterion that reads one must SAY it did — see handshakeOf — because "the
+// certificates are in a different conversation of this window" is a fact the
+// reader of a bundle is entitled to.
+func (t *Transcript) HandshakeSession() *Transcript {
+	if t == nil || t.Handshake.CarriesCertificates() {
+		return t
+	}
+	for _, o := range t.Others {
+		if o != nil && o.Handshake.CarriesCertificates() {
+			return o
+		}
+	}
+	return t
 }
 
 // GETs returns the exchanges whose request was a GET of path (exact match on
@@ -477,6 +523,19 @@ func RecoverSession(ev *certify.Evidence, remote netip.AddrPort) (*Transcript, e
 		}
 		return out
 	}
+	// Hand the selected conversation the other wholly-owned ones. See
+	// Transcript.Others and HandshakeSession: the handshake tier may need a
+	// conversation the transcript tier had no reason to choose, and every one of
+	// these is a conversation this test case may cite.
+	attachOthers := func(sel *Transcript) *Transcript {
+		for _, c := range cands {
+			if c.err != nil || c.t == nil || c.t == sel {
+				continue
+			}
+			sel.Others = append(sel.Others, c.t)
+		}
+		return sel
+	}
 
 	switch len(disc) {
 	case 1:
@@ -486,7 +545,7 @@ func RecoverSession(ev *certify.Evidence, remote netip.AddrPort) (*Transcript, e
 				"selected this conversation as the discovery session because it carries GET %s; also "+
 					"attributed to this test case: %s", DiscoveryRoot, strings.Join(others, "; ")))
 		}
-		return t, nil
+		return attachOthers(t), nil
 	case 0:
 		// Nothing carried a discovery root. That is a real fact about the
 		// window, not licence to pick the biggest and hope — so the fallback
@@ -509,7 +568,7 @@ func RecoverSession(ev *certify.Evidence, remote netip.AddrPort) (*Transcript, e
 			"no attributed conversation carried GET %s, so this is NOT confirmed to be the discovery "+
 				"session; it is the busiest of %d candidate(s) (%d client app record(s)). Others: %s",
 			DiscoveryRoot, len(cands), bestRecs, strings.Join(describe(best), "; ")))
-		return t, nil
+		return attachOthers(t), nil
 	default:
 		names := make([]string, 0, len(disc))
 		for _, i := range disc {
