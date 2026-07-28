@@ -43,7 +43,11 @@ package suitessm
 // themselves, with a SKIP assertion naming it — and "gateway" is required only
 // by the rows whose entire evidence is a read of the DUT's own configuration.
 
-import "csip-tls-test/internal/certify"
+import (
+	"strings"
+
+	"csip-tls-test/internal/certify"
+)
 
 func init() { Register(certify.Default()) }
 
@@ -55,58 +59,76 @@ func init() { Register(certify.Default()) }
 // reads like the procedures document rather than like a map iteration. Ties
 // break on uid, so the plan is fully deterministic either way.
 func Register(reg *certify.Registry) {
+	// register binds one row and attaches the pcap file name(s) that row's
+	// Reporting Requirements subsection prescribes.
+	//
+	// The names come from capturenames.go's transcription of the document and
+	// are looked up by the bare test id, which the uid already carries — so no
+	// call site repeats them and no row can be given a name from a different
+	// section by a copy-paste. A row whose Reporting Requirements ask for
+	// documents rather than a capture (RBAC-004, RBAC-005, OPS-001) gets an
+	// empty list, which declares nothing.
+	register := func(uid string, check certify.Check, opts ...certify.Option) {
+		id := uid
+		if _, after, ok := strings.Cut(uid, "::"); ok {
+			id = after
+		}
+		opts = append(opts, certify.WithCaptureArtifacts(CaptureNames(id)...))
+		reg.Register(uid, suiteName, check, opts...)
+	}
+
 	// §2.4 TLS Fundamentals.
-	reg.Register("ssm-conf-v0.8::TLSF-001", suiteName, tlsf001, certify.WithRequires("bench", "pki"), certify.WithOrder(10))
-	reg.Register("ssm-conf-v0.8::TLSF-002", suiteName, tlsf002, certify.WithRequires("bench", "pki"), certify.WithOrder(11))
-	reg.Register("ssm-conf-v0.8::TLSF-003", suiteName, tlsf003, certify.WithRequires("bench", "pki"), certify.WithOrder(12))
-	reg.Register("ssm-conf-v0.8::TLSF-004", suiteName, tlsf004, certify.WithRequires("bench", "pki"), certify.WithOrder(13))
-	reg.Register("ssm-conf-v0.8::TLSF-005", suiteName, tlsf005, certify.WithRequires("bench", "pki"), certify.WithOrder(14))
-	reg.Register("ssm-conf-v0.8::TLSF-006", suiteName, tlsf006, certify.WithRequires("bench", "pki"), certify.WithOrder(15))
+	register("ssm-conf-v0.8::TLSF-001", tlsf001, certify.WithRequires("bench", "pki"), certify.WithOrder(10))
+	register("ssm-conf-v0.8::TLSF-002", tlsf002, certify.WithRequires("bench", "pki"), certify.WithOrder(11))
+	register("ssm-conf-v0.8::TLSF-003", tlsf003, certify.WithRequires("bench", "pki"), certify.WithOrder(12))
+	register("ssm-conf-v0.8::TLSF-004", tlsf004, certify.WithRequires("bench", "pki"), certify.WithOrder(13))
+	register("ssm-conf-v0.8::TLSF-005", tlsf005, certify.WithRequires("bench", "pki"), certify.WithOrder(14))
+	register("ssm-conf-v0.8::TLSF-006", tlsf006, certify.WithRequires("bench", "pki"), certify.WithOrder(15))
 
 	// §2.5 Cryptography.
-	reg.Register("ssm-conf-v0.8::CRYP-001", suiteName, cryp001, certify.WithRequires("bench", "pki"), certify.WithOrder(20))
-	reg.Register("ssm-conf-v0.8::CRYP-002", suiteName, cryp002, certify.WithRequires("bench", "pki"), certify.WithOrder(21))
-	reg.Register("ssm-conf-v0.8::CRYP-003", suiteName, cryp003, certify.WithRequires("bench"), certify.WithOrder(22))
-	reg.Register("ssm-conf-v0.8::CRYP-004", suiteName, cryp004, certify.WithRequires("bench"), certify.WithOrder(23))
-	reg.Register("ssm-conf-v0.8::CRYP-005", suiteName, cryp005, certify.WithRequires("bench"), certify.WithOrder(24))
-	reg.Register("ssm-conf-v0.8::CRYP-006", suiteName, cryp006, certify.WithRequires("bench"), certify.WithOrder(25))
-	reg.Register("ssm-conf-v0.8::CRYP-007", suiteName, cryp007, certify.WithRequires("bench"), certify.WithOrder(26))
+	register("ssm-conf-v0.8::CRYP-001", cryp001, certify.WithRequires("bench", "pki"), certify.WithOrder(20))
+	register("ssm-conf-v0.8::CRYP-002", cryp002, certify.WithRequires("bench", "pki"), certify.WithOrder(21))
+	register("ssm-conf-v0.8::CRYP-003", cryp003, certify.WithRequires("bench"), certify.WithOrder(22))
+	register("ssm-conf-v0.8::CRYP-004", cryp004, certify.WithRequires("bench"), certify.WithOrder(23))
+	register("ssm-conf-v0.8::CRYP-005", cryp005, certify.WithRequires("bench"), certify.WithOrder(24))
+	register("ssm-conf-v0.8::CRYP-006", cryp006, certify.WithRequires("bench"), certify.WithOrder(25))
+	register("ssm-conf-v0.8::CRYP-007", cryp007, certify.WithRequires("bench"), certify.WithOrder(26))
 
 	// §2.6 Public Key Infrastructure. PKI-005 is inapplicable — see above.
-	reg.Register("ssm-conf-v0.8::PKI-001", suiteName, pki001, certify.WithRequires("bench", "pki"), certify.WithOrder(30))
-	reg.Register("ssm-conf-v0.8::PKI-002", suiteName, pki002, certify.WithRequires("bench"), certify.WithOrder(31))
-	reg.Register("ssm-conf-v0.8::PKI-003", suiteName, pki003, certify.WithRequires("bench", "pki"), certify.WithOrder(32))
-	reg.Register("ssm-conf-v0.8::PKI-004", suiteName, pki004, certify.WithRequires("bench", "pki"), certify.WithOrder(33))
-	reg.Register("ssm-conf-v0.8::PKI-006", suiteName, pki006, certify.WithRequires("bench", "pki"), certify.WithOrder(34))
-	reg.Register("ssm-conf-v0.8::PKI-007", suiteName, pki007, certify.WithRequires("bench", "pki"), certify.WithOrder(35))
-	reg.Register("ssm-conf-v0.8::PKI-008", suiteName, pki008, certify.WithRequires("bench", "pki"), certify.WithOrder(36))
+	register("ssm-conf-v0.8::PKI-001", pki001, certify.WithRequires("bench", "pki"), certify.WithOrder(30))
+	register("ssm-conf-v0.8::PKI-002", pki002, certify.WithRequires("bench"), certify.WithOrder(31))
+	register("ssm-conf-v0.8::PKI-003", pki003, certify.WithRequires("bench", "pki"), certify.WithOrder(32))
+	register("ssm-conf-v0.8::PKI-004", pki004, certify.WithRequires("bench", "pki"), certify.WithOrder(33))
+	register("ssm-conf-v0.8::PKI-006", pki006, certify.WithRequires("bench", "pki"), certify.WithOrder(34))
+	register("ssm-conf-v0.8::PKI-007", pki007, certify.WithRequires("bench", "pki"), certify.WithOrder(35))
+	register("ssm-conf-v0.8::PKI-008", pki008, certify.WithRequires("bench", "pki"), certify.WithOrder(36))
 	// PKI-009's only evidence is a read of the DUT's southbound configuration,
 	// so it needs gateway introspection and nothing else.
-	reg.Register("ssm-conf-v0.8::PKI-009", suiteName, pki009, certify.WithRequires("gateway"), certify.WithOrder(37))
+	register("ssm-conf-v0.8::PKI-009", pki009, certify.WithRequires("gateway"), certify.WithOrder(37))
 
 	// §2.7 Protocol.
-	reg.Register("ssm-conf-v0.8::PROT-001", suiteName, prot001, certify.WithRequires("bench", "pki"), certify.WithOrder(40))
-	reg.Register("ssm-conf-v0.8::PROT-002", suiteName, prot002, certify.WithRequires("bench"), certify.WithOrder(41))
-	reg.Register("ssm-conf-v0.8::PROT-003", suiteName, prot003, certify.WithRequires("bench"), certify.WithOrder(42))
-	reg.Register("ssm-conf-v0.8::PROT-004", suiteName, prot004, certify.WithRequires("bench"), certify.WithOrder(43))
+	register("ssm-conf-v0.8::PROT-001", prot001, certify.WithRequires("bench", "pki"), certify.WithOrder(40))
+	register("ssm-conf-v0.8::PROT-002", prot002, certify.WithRequires("bench"), certify.WithOrder(41))
+	register("ssm-conf-v0.8::PROT-003", prot003, certify.WithRequires("bench"), certify.WithOrder(42))
+	register("ssm-conf-v0.8::PROT-004", prot004, certify.WithRequires("bench"), certify.WithOrder(43))
 
 	// §2.8 Role-Based Access Control. RBAC-003 is inapplicable — see above.
-	reg.Register("ssm-conf-v0.8::RBAC-001", suiteName, rbac001, certify.WithRequires("bench", "pki"), certify.WithOrder(50))
-	reg.Register("ssm-conf-v0.8::RBAC-002", suiteName, rbac002, certify.WithRequires("bench", "pki"), certify.WithOrder(51))
+	register("ssm-conf-v0.8::RBAC-001", rbac001, certify.WithRequires("bench", "pki"), certify.WithOrder(50))
+	register("ssm-conf-v0.8::RBAC-002", rbac002, certify.WithRequires("bench", "pki"), certify.WithOrder(51))
 	// RBAC-004 has no wire traffic at all: its evidence is the DUT's own rules
 	// database, read read-only.
-	reg.Register("ssm-conf-v0.8::RBAC-004", suiteName, rbac004, certify.WithRequires("gateway"), certify.WithOrder(52))
-	reg.Register("ssm-conf-v0.8::RBAC-005", suiteName, rbac005, certify.WithRequires("bench", "pki"), certify.WithOrder(53))
-	reg.Register("ssm-conf-v0.8::RBAC-006", suiteName, rbac006, certify.WithRequires("bench", "pki"), certify.WithOrder(54))
-	reg.Register("ssm-conf-v0.8::RBAC-007", suiteName, rbac007, certify.WithRequires("bench", "pki"), certify.WithOrder(55))
-	reg.Register("ssm-conf-v0.8::RBAC-008", suiteName, rbac008, certify.WithRequires("bench", "pki"), certify.WithOrder(56))
-	reg.Register("ssm-conf-v0.8::RBAC-009", suiteName, rbac009, certify.WithRequires("bench", "pki"), certify.WithOrder(57))
-	reg.Register("ssm-conf-v0.8::RBAC-010", suiteName, rbac010, certify.WithRequires("gateway"), certify.WithOrder(58))
-	reg.Register("ssm-conf-v0.8::RBAC-011", suiteName, rbac011, certify.WithRequires("bench"), certify.WithOrder(59))
-	reg.Register("ssm-conf-v0.8::RBAC-012", suiteName, rbac012, certify.WithRequires("bench", "pki"), certify.WithOrder(60))
+	register("ssm-conf-v0.8::RBAC-004", rbac004, certify.WithRequires("gateway"), certify.WithOrder(52))
+	register("ssm-conf-v0.8::RBAC-005", rbac005, certify.WithRequires("bench", "pki"), certify.WithOrder(53))
+	register("ssm-conf-v0.8::RBAC-006", rbac006, certify.WithRequires("bench", "pki"), certify.WithOrder(54))
+	register("ssm-conf-v0.8::RBAC-007", rbac007, certify.WithRequires("bench", "pki"), certify.WithOrder(55))
+	register("ssm-conf-v0.8::RBAC-008", rbac008, certify.WithRequires("bench", "pki"), certify.WithOrder(56))
+	register("ssm-conf-v0.8::RBAC-009", rbac009, certify.WithRequires("bench", "pki"), certify.WithOrder(57))
+	register("ssm-conf-v0.8::RBAC-010", rbac010, certify.WithRequires("gateway"), certify.WithOrder(58))
+	register("ssm-conf-v0.8::RBAC-011", rbac011, certify.WithRequires("bench"), certify.WithOrder(59))
+	register("ssm-conf-v0.8::RBAC-012", rbac012, certify.WithRequires("bench", "pki"), certify.WithOrder(60))
 
 	// §2.9 Operational Security.
-	reg.Register("ssm-conf-v0.8::OPS-001", suiteName, ops001, certify.WithRequires("bench"), certify.WithOrder(70))
+	register("ssm-conf-v0.8::OPS-001", ops001, certify.WithRequires("bench"), certify.WithOrder(70))
 }
 
 // InapplicableUIDs are the SSM-CONF-v0.8 cases this suite deliberately does not

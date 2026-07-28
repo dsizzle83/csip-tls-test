@@ -29,7 +29,6 @@ package report
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -43,60 +42,15 @@ import (
 	"csip-tls-test/internal/evidence/tlsdis"
 )
 
-// pcapMagicMicro is the classic little-endian microsecond magic — what
-// `tcpdump -w` writes and what pcapng.ReadFile accepts.
-const pcapMagicMicro = 0xA1B2C3D4
-
-// pcapSnapLen is recorded in the file header. It is the maximum captured length
-// present, not a truncation this writer applies: nothing here ever shortens a
-// frame, because a trace whose handshake was clipped is worse than no trace.
-func pcapSnapLen(pkts []pcapng.Packet) uint32 {
-	max := uint32(0)
-	for _, p := range pkts {
-		if n := uint32(len(p.Data)); n > max {
-			max = n
-		}
-	}
-	if max == 0 {
-		return 65535
-	}
-	return max
-}
-
 // WritePcap writes packets as a classic libpcap file.
 //
-// Every frame is written whole, with its original wire length preserved in the
-// record header, so a reader can still tell that a frame was truncated by the
-// CAPTURE — a fact that must survive into the trace, since a truncated
-// handshake record cannot prove what a complete one would.
+// The format itself lives in internal/evidence/pcapng, beside the reader that
+// round-trips it, because Chapter 5 is no longer the only specification asking
+// for per-test slices of the run capture: the Secure SunSpec Modbus CTP names a
+// pcap per row in its Reporting Requirements. Two writers of the same format
+// would be two things to get wrong.
 func WritePcap(w io.Writer, linkType uint16, pkts []pcapng.Packet) error {
-	hdr := make([]byte, 24)
-	binary.LittleEndian.PutUint32(hdr[0:4], pcapMagicMicro)
-	binary.LittleEndian.PutUint16(hdr[4:6], 2)
-	binary.LittleEndian.PutUint16(hdr[6:8], 4)
-	binary.LittleEndian.PutUint32(hdr[16:20], pcapSnapLen(pkts))
-	binary.LittleEndian.PutUint32(hdr[20:24], uint32(linkType))
-	if _, err := w.Write(hdr); err != nil {
-		return fmt.Errorf("report: write pcap header: %w", err)
-	}
-	rec := make([]byte, 16)
-	for _, p := range pkts {
-		if p.LinkType != linkType {
-			return fmt.Errorf("report: frame %d has link type %d but the trace declares %d; "+
-				"a single libpcap file cannot mix link types", p.Index, p.LinkType, linkType)
-		}
-		binary.LittleEndian.PutUint32(rec[0:4], uint32(p.Time.Unix()))
-		binary.LittleEndian.PutUint32(rec[4:8], uint32(p.Time.Nanosecond()/1000))
-		binary.LittleEndian.PutUint32(rec[8:12], uint32(len(p.Data)))
-		binary.LittleEndian.PutUint32(rec[12:16], uint32(p.OrigLen))
-		if _, err := w.Write(rec); err != nil {
-			return fmt.Errorf("report: write pcap record header: %w", err)
-		}
-		if _, err := w.Write(p.Data); err != nil {
-			return fmt.Errorf("report: write pcap frame %d: %w", p.Index, err)
-		}
-	}
-	return nil
+	return pcapng.WriteLegacy(w, linkType, pkts)
 }
 
 // TraceTLS is what a trace file actually contains at the TLS layer, recovered

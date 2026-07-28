@@ -24,9 +24,10 @@ type Builder struct {
 	capture capture.Summary
 	cases   []TestCaseResult
 
-	capturePath string
-	keylogPath  string
-	extraPaths  []string
+	capturePath   string
+	keylogPath    string
+	extraPaths    []string
+	captureExtras []string
 }
 
 // NewBuilder starts a bundle.
@@ -59,9 +60,20 @@ func (b *Builder) SetCapture(sum capture.Summary, path string) {
 // is still a secret, and a bundle containing one should be handled as such.
 func (b *Builder) SetKeyLog(path string) { b.keylogPath = path }
 
-// AddFile copies an extra artefact into the bundle and covers it with the
+// AddFile copies an extra artefact into the bundle root and covers it with the
 // manifest — a run log, a configuration dump, a certificate.
 func (b *Builder) AddFile(path string) { b.extraPaths = append(b.extraPaths, path) }
+
+// AddCaptureFile copies a packet-capture artefact into the bundle's capture/
+// directory, under its own basename, and covers it with the manifest.
+//
+// It is separate from AddFile because the basename is load-bearing: these are
+// the per-test captures a governing document names verbatim in its Reporting
+// Requirements (tlsf_001.pcap, prot_004.pcap …), and a reviewer following the
+// document looks for that exact file. Putting them beside the run capture keeps
+// "everything a reader needs a packet tool for" in one place, and keeps the
+// bundle root for the documents.
+func (b *Builder) AddCaptureFile(path string) { b.captureExtras = append(b.captureExtras, path) }
 
 // AddCase appends a test case. If its Verdict is empty it is rolled up from the
 // assertions, so a caller cannot accidentally record a PASS over a failing
@@ -118,6 +130,13 @@ func (b *Builder) Write(dir string) (*Bundle, error) {
 			return nil, fmt.Errorf("bundle: copy key log: %w", err)
 		}
 		out.Files.KeyLog = rel
+	}
+	for _, p := range b.captureExtras {
+		rel := path.Join(CaptureDir, filepath.Base(p))
+		if err := copyFile(p, filepath.Join(dir, rel)); err != nil {
+			return nil, fmt.Errorf("bundle: copy capture artefact %s: %w", p, err)
+		}
+		out.Files.Extra = append(out.Files.Extra, rel)
 	}
 	for _, p := range b.extraPaths {
 		rel := filepath.Base(p)

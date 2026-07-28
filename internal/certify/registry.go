@@ -152,6 +152,23 @@ type Registration struct {
 	// (a provisioning step before the case that depends on it). Lower runs
 	// first; ties break on UID so the run order is fully deterministic.
 	Order int
+	// CaptureArtifacts are the file names a governing specification requires
+	// this case's packet capture to be submitted under, in the order the
+	// document lists them. Empty for a case whose document names none.
+	//
+	// The runner slices this case's attributed frames out of the run capture
+	// and writes them under exactly these names. It exists because a
+	// certification reviewer reads the Reporting Requirements, not this
+	// repository: the Secure SunSpec Modbus CTP §2.4.1.3 says TLSF-001's
+	// evidence is "a packet capture (.pcap) … named tlsf_001.pcap", and a
+	// bundle carrying one run-wide pcapng satisfies the substance while failing
+	// the instruction — which is a submission a lab sends back.
+	//
+	// More than one name means the document asks for the case's connections
+	// separately (TLSF-003's three bad-certificate types, TLSF-005's session
+	// and its resumption attempt). The runner splits on TCP connection in
+	// first-seen order and refuses to guess when the counts disagree.
+	CaptureArtifacts []string
 }
 
 // Option customises a registration.
@@ -164,6 +181,13 @@ func WithRequires(tags ...string) Option {
 
 // WithOrder sets the within-suite ordering key.
 func WithOrder(n int) Option { return func(r *Registration) { r.Order = n } }
+
+// WithCaptureArtifacts declares the file names this case's capture must be
+// submitted under, in the order the governing document lists them. See
+// Registration.CaptureArtifacts.
+func WithCaptureArtifacts(names ...string) Option {
+	return func(r *Registration) { r.CaptureArtifacts = append(r.CaptureArtifacts, names...) }
+}
 
 // Registry maps catalog uids to implementations.
 type Registry struct {

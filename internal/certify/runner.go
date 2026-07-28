@@ -342,6 +342,10 @@ type CaseResult struct {
 	cite          CiteFunc
 	offWire       bool
 	offWireReason string
+	// captureArtifacts are the file names this case's registration declared
+	// (Registration.CaptureArtifacts), carried from the plan so the citation
+	// phase can slice the run capture without re-consulting the registry.
+	captureArtifacts []string
 }
 
 // Citable reports whether any assertion carries a re-checkable digest.
@@ -364,7 +368,12 @@ type RunReport struct {
 	Capture     capture.Summary
 	// CaptureProblems are integrity findings about the capture itself.
 	CaptureProblems []string
-	Bundle          *bundle.Bundle
+	// CaptureArtifacts are the per-test capture files the governing documents
+	// name in their Reporting Requirements, sliced out of the run capture —
+	// including the ones that could NOT be written, with the reason. See
+	// artifacts.go.
+	CaptureArtifacts []CaptureArtifact
+	Bundle           *bundle.Bundle
 	BundleDir       string
 	Started         time.Time
 	Finished        time.Time
@@ -816,6 +825,7 @@ func (r *Runner) execute(ctx context.Context, p Planned, rc *RunCtx, win *Window
 	res := CaseResult{
 		Case: p.Case, Suite: p.Registration.Suite,
 		Started: time.Now().UTC(), Executed: true,
+		captureArtifacts: p.Registration.CaptureArtifacts,
 	}
 	cctx, cancel := context.WithTimeout(ctx, r.opts.CheckTimeout)
 	defer cancel()
@@ -911,6 +921,13 @@ func (r *Runner) cite(ctx context.Context, rep *RunReport, windows []*Window, pa
 		}
 	}
 
+	// The per-test captures the governing documents name go out BEFORE the
+	// citation phase, from the same attribution the assertions use, so that a
+	// check whose citation callback fails still leaves the evidence files a
+	// submission needs. They are slices of the run capture, not new
+	// observations; see artifacts.go.
+	artDir := filepath.Join(r.opts.OutDir, "capture")
+
 	for i := range rep.Cases {
 		c := &rep.Cases[i]
 		if !c.Executed {
@@ -919,6 +936,10 @@ func (r *Runner) cite(ctx context.Context, rep *RunReport, windows []*Window, pa
 		set := att.Set(c.Case.UID)
 		c.FrameSet = set
 		c.Frames = set.Frames
+		if len(c.captureArtifacts) > 0 {
+			rep.CaptureArtifacts = append(rep.CaptureArtifacts,
+				exportCaseCaptures(fi, set, c.Case.UID, c.captureArtifacts, artDir)...)
+		}
 		if c.cite == nil {
 			continue
 		}
@@ -1035,6 +1056,7 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 	if len(rep.CaptureProblems) > 0 {
 		note = joinNote(note, "capture integrity: "+strings.Join(rep.CaptureProblems, "; "))
 	}
+	note = joinNote(note, captureArtifactNote(rep.CaptureArtifacts))
 	// A bypassed preflight travels with the evidence it weakens. RunMeta.Command
 	// already carries the flag; this says what the flag COST, which is the part
 	// a reader of the findings needs.
@@ -1060,6 +1082,13 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 	if r.opts.KeyLogPath != "" {
 		if _, err := os.Stat(r.opts.KeyLogPath); err == nil {
 			b.SetKeyLog(r.opts.KeyLogPath)
+		}
+	}
+	// The per-test captures a governing document names, under exactly those
+	// names, beside the run capture they were cut from.
+	for _, a := range rep.CaptureArtifacts {
+		if a.Path != "" {
+			b.AddCaptureFile(a.Path)
 		}
 	}
 	// The specification the run was measured against ships inside the bundle,
