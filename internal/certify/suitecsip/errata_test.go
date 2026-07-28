@@ -16,10 +16,20 @@ package suitecsip
 // and asserts that both halves are still in the catalog: the correction, and
 // the amended text where the extraction has already applied it.
 //
-// Four of the five rows are NOT APPLICABLE to this DUT today — the §4 profile
-// matrix scopes them to a DER Aggregator Client, and this DUT is a direct DER
-// client. That is exactly why they are pinned NOW. A re-scope makes them live,
-// and the first thing an implementer will read is the unamended step list.
+// # These pins were written a day early, and it paid
+//
+// When this file was written, four of its five rows were NOT APPLICABLE: the §4
+// profile matrix scoped them to a DER Aggregator Client and the DUT was a direct
+// DER client. The stated reason for pinning them anyway was that "a re-scope
+// makes them live, and the first thing an implementer will read is the unamended
+// step list". On 2026-07-28 the owner re-scoped the certification to the DER
+// Aggregator Client profile and every one of those rows went live.
+//
+// The catalog half of each pin is therefore unchanged — that is the point of a
+// pin — and a second half is added below: the same correction asserted against
+// the CODE that now implements the row. A correction that lives only in the
+// catalog is a note; a correction asserted against the implementation is a
+// guarantee. TestLiveErrataAreImplemented is that second half.
 
 import (
 	"strings"
@@ -155,6 +165,12 @@ func TestCore018And019Drop204(t *testing.T) {
 // TestMaint002IsOptional pins Annex A seq 32: "Make the test optional/remove
 // entirely from the spec". Conformance must not be gated on MAINT-002 — and the
 // §4 matrix must not quietly acquire a requirement for it.
+//
+// The 2026-07-28 re-scope is what makes this pin bite. It pulled MAINT-001,
+// MAINT-003, MAINT-004 and MAINT-005 in as required aggregator-client rows, and
+// the obvious mistake would have been to take the whole MAINT block with them.
+// §4 leaves MAINT-002 blank in all three columns and the erratum says why, so it
+// is the one sibling that stays out.
 func TestMaint002IsOptional(t *testing.T) {
 	cat := loadCatalog(t)
 	c, e := erratumFor(t, cat, "MAINT-002", 32)
@@ -204,23 +220,30 @@ func TestComm004RejectionSignalsErratum(t *testing.T) {
 // TestNotApplicableRowsCarryTheirErrataForward proves the breadcrumb reaches
 // the bundle: a row this suite reports NOT APPLICABLE must still print its
 // client-relevant corrections, because the next reader of that row is whoever
-// implements it after the aggregator re-scope.
+// implements it after a re-scope.
+//
+// The list shrank on 2026-07-28. It used to hold AGG-007, AGG-008, ERR-002,
+// CORE-018 and CORE-019; all five went live with the aggregator re-scope and
+// their corrections are now pinned against the implementation instead, in
+// TestLiveErrataAreImplemented. What remains is the rows the re-scope did NOT
+// reach, which are the rows that most need the breadcrumb: nobody is reading
+// their code, because there is none.
 func TestNotApplicableRowsCarryTheirErrataForward(t *testing.T) {
 	cat := loadCatalog(t)
 	for _, want := range []struct {
 		id     string
 		phrase string
 	}{
-		{"AGG-007", "status 14"},
-		{"AGG-008", "status 14"},
-		{"ERR-002", "Remove Step 6"},
-		{"CORE-018", "Remove the acceptance of 204"},
-		{"CORE-019", "Remove steps 10 and 11"},
 		{"MAINT-002", "optional"},
+		{"CORE-001", "405"},
+		{"CORE-004", "with no query string parameter"},
 	} {
 		c, ok := cat.ByID(doc, want.id)
 		if !ok {
 			t.Fatalf("the catalog has no %s %s", doc, want.id)
+		}
+		if c.Applicable {
+			t.Fatalf("%s is applicable; this test is about the rows that are NOT", want.id)
 		}
 		res, err := notApplicable(t.Context(), &certify.RunCtx{Case: c})
 		if err != nil {
@@ -238,16 +261,171 @@ func TestNotApplicableRowsCarryTheirErrataForward(t *testing.T) {
 	}
 
 	// A row with no errata must not grow a stray heading.
-	c, ok := cat.ByID(doc, "MAINT-001")
+	c, ok := cat.ByID(doc, "UTIL-001")
 	if !ok {
-		t.Fatal("the catalog has no MAINT-001")
+		t.Fatal("the catalog has no UTIL-001")
 	}
 	if len(c.Errata) == 0 {
 		res, _ := notApplicable(t.Context(), &certify.RunCtx{Case: c})
 		if strings.Contains(res.Notes, "PUBLISHED ERRATA") {
-			t.Error("MAINT-001 has no errata but the note announces some")
+			t.Error("UTIL-001 has no errata but the note announces some")
 		}
 	}
+}
+
+// TestLiveErrataAreImplemented is the half that only became possible on
+// 2026-07-28: the corrections asserted against the CODE, now that the rows they
+// correct have code.
+//
+// Each assertion below would fail a conformant DUT if the implementation had
+// been written from the printed procedure instead of the amended one. That is
+// the whole test: not "is the erratum recorded" but "does the check do what the
+// erratum says".
+func TestLiveErrataAreImplemented(t *testing.T) {
+	sc := aggScenarios()
+
+	// seq 5 / seq 6 — AGG-007 and AGG-008 expect status 14, not the printed 7.
+	for _, id := range []string{"AGG-007", "AGG-008"} {
+		s, ok := sc[id]
+		if !ok {
+			t.Fatalf("no aggregator scenario for %s", id)
+		}
+		if s.Superseded == "" {
+			t.Errorf("%s pins no superseded control, so its supersession status is unasserted", id)
+			continue
+		}
+		if s.SupersedeStatus != 14 {
+			t.Errorf("%s asserts supersession status %d; Annex A seq 5/6 correct this row to 14 (Event "+
+				"Superseded from another program). Asserting the printed 7 would FAIL a conformant aggregator",
+				id, s.SupersedeStatus)
+		}
+	}
+
+	// The contrast row: AGG-009 keeps 7 because its event had already started.
+	if s := sc["AGG-009"]; s.SupersedeStatus != 7 {
+		t.Errorf("AGG-009 asserts supersession status %d, want 7 — its SY event had already STARTED when "+
+			"the TFA event was discovered, which is exactly why seq 5/6 do not reach it", s.SupersedeStatus)
+	}
+
+	// The independent-control family supersedes nothing at all.
+	for _, id := range []string{"AGG-010", "AGG-011", "AGG-012"} {
+		s := sc[id]
+		if s.Superseded != "" {
+			t.Errorf("%s pins a supersession status; its two controls carry DIFFERENT modes and IEEE 2030.5 "+
+				"independent modes coexist rather than supersede", id)
+		}
+		if len(s.Independent) != 2 {
+			t.Errorf("%s names %d control(s) for the no-supersession criterion, want 2", id, len(s.Independent))
+		}
+		// And the modes really must differ, or the row asserts nothing.
+		if len(s.Controls) == 2 && s.Controls[0].Mode == s.Controls[1].Mode {
+			t.Errorf("%s publishes two controls of the SAME mode (%s); the row's whole subject is that "+
+				"INDEPENDENT modes do not supersede", id, s.Controls[0].Mode.element())
+		}
+	}
+
+	// seq 26 — AGG-006's corrected setup: SY at +4 min, TFA at +2 min, 1 min each.
+	byMRID := map[string]aggControl{}
+	for _, c := range sc["AGG-006"].Controls {
+		byMRID[c.MRID] = c
+	}
+	if c := byMRID["CERT-AGG006SY"]; c.StartOffset != 240 || c.DurationS != 60 {
+		t.Errorf("AGG-006's SY control is start+%d s for %d s; Annex A seq 26's corrected setup step 4 is "+
+			"start+240 s for 60 s", c.StartOffset, c.DurationS)
+	}
+	if c := byMRID["CERT-AGG006TFA"]; c.StartOffset != 120 || c.DurationS != 60 {
+		t.Errorf("AGG-006's TFA control is start+%d s for %d s; the corrected setup step 5 is start+120 s "+
+			"for 60 s", c.StartOffset, c.DurationS)
+	}
+
+	// AGG-009 and AGG-012 are the two rows whose outcome depends on the higher-
+	// priority control being created AFTER the other has started. Publishing
+	// both at setup would silently turn them into AGG-007 and AGG-010.
+	for _, id := range []string{"AGG-009", "AGG-012"} {
+		late := 0
+		for _, c := range sc[id].Controls {
+			if c.LateAfterS > 0 {
+				late++
+			}
+		}
+		if late != 1 {
+			t.Errorf("%s publishes %d control(s) late; its procedure creates the second control only AFTER "+
+				"the first has started, and publishing both at setup makes it a different test", id, late)
+		}
+	}
+
+	// seq 44 — CORE-018 and CORE-019 must NOT accept 204 for a Notification.
+	for _, tc := range []struct {
+		id    string
+		crits []criterion
+	}{
+		{"CORE-018", core018Criteria()},
+		{"CORE-019", core019Criteria()},
+	} {
+		claim, found := notificationClaim(tc.crits)
+		if !found {
+			t.Errorf("%s has no criterion about the DUT's answer to a Notification", tc.id)
+			continue
+		}
+		if strings.Contains(claim, "204") {
+			t.Errorf("%s admits HTTP 204 in %q; Annex A seq 44 removes the acceptance of 204 for this row",
+				tc.id, claim)
+		}
+		if !strings.Contains(claim, "201") {
+			t.Errorf("%s does not require HTTP 201 Created in %q", tc.id, claim)
+		}
+	}
+
+	// ...and the counterweight, which is where a blanket rule would have gone
+	// wrong: ERR-002's printed step 3 still admits BOTH, because seq 44 is
+	// scoped to CORE-018/CORE-019.
+	err002 := err002Criteria()
+	claim, found := notificationClaim(err002)
+	if !found {
+		t.Fatal("ERR-002 has no criterion about the DUT's answer to a Notification")
+	}
+	if !strings.Contains(claim, "201") || !strings.Contains(claim, "204") {
+		t.Errorf("ERR-002's Notification criterion is %q; its printed step 3 admits 201 Created OR 204 No "+
+			"Content, and seq 44's removal of the 204 does not reach this row", claim)
+	}
+
+	// seq 38 — "Remove Step 6". No criterion may DEMAND a re-POSTed Subscription
+	// after a status=1 cancellation. A check that waited for one would hang for
+	// its whole timeout and then fail a conformant client.
+	for i, c := range err002 {
+		text := c.Claim
+		if !strings.Contains(strings.ToLower(text), "cancel") {
+			continue
+		}
+		for _, forbidden := range []string{"re-POST", "re-subscribe", "resubscribe", "posts another subscription"} {
+			if strings.Contains(strings.ToLower(text), strings.ToLower(forbidden)) {
+				t.Errorf("ERR-002 criterion %d demands a %s after cancellation: %q. Annex A seq 38 removes "+
+					"printed step 6 — IEEE 2030.5 requires no such thing", i, forbidden, text)
+			}
+		}
+	}
+
+	// seq 3 — UTIL-002 PUTs the DER FIELD resources, never the DERListLink.
+	// This one is asserted through critDERPut's own claim text, which names the
+	// resource it looks for.
+	for _, resource := range []string{"DERCapability", "DERSettings"} {
+		c := critDERPut(resource)
+		if strings.Contains(c.Claim, "DERListLink") {
+			t.Errorf("critDERPut(%q) claims a PUT to the DERListLink; Annex A seq 3 corrects UTIL-002 to "+
+				"PUT the DER field resources instead: %q", resource, c.Claim)
+		}
+	}
+}
+
+// notificationClaim returns the Claim of the criterion about the DUT's answer to
+// a server-pushed Notification.
+func notificationClaim(crits []criterion) (string, bool) {
+	for _, c := range crits {
+		if strings.Contains(c.Claim, "answers a valid server-pushed Notification") {
+			return c.Claim, true
+		}
+	}
+	return "", false
 }
 
 func mentions(ss []string, sub string) bool {
