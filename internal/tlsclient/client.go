@@ -75,6 +75,18 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("load client key: %w", err)
 	}
 
+	// Register the NSS key-log callback on the CONTEXT, so every session it
+	// creates exports its secrets as the key schedule produces them. A no-op
+	// unless the binary was built with -tags keylog and a key log was opened.
+	//
+	// On the context rather than per-session because the per-session TLS 1.2
+	// path has to go looking for the master secret in a finished session, and
+	// wolfSSL does not always have one to give — which produces a key log that
+	// EXISTS and decrypts nothing. That is the worst possible failure for
+	// conformance evidence: it looks like proof. See internal/wolfssl's
+	// EnableCtxKeylog.
+	wolfssl.EnableCtxKeylog(ctx)
+
 	ok = true
 	return &Client{cfg: cfg, ctx: ctx}, nil
 }
@@ -133,9 +145,29 @@ func (c *Client) Dial() error {
 	if err := wolfssl.SetFD(ssl, int(file.Fd())); err != nil {
 		return err
 	}
+
+	// Arm TLS key-log export BEFORE the handshake: the TLS 1.3 secret callback
+	// fires as the key schedule advances, so any secret derived before it is
+	// installed is unrecoverable. No-op unless the binary was built with
+	// -tags keylog AND a key log was opened (internal/wolfssl/keylog.go) — the
+	// same discipline internal/mbtls and sim/tlsserver already follow.
+	//
+	// It belongs here rather than at the call sites because the decision about
+	// whether a run produces decryptable evidence belongs to the BUILD. This
+	// client is the BENCH's, and every session the bench is an endpoint of has
+	// to be decryptable or the conformance evidence stops at the handshake.
+	// That is what makes the notification leg of an aggregator run citable at
+	// all: on that leg the bench is the TLS client, so these are the secrets.
+	if err := wolfssl.EnableTLS13Keylog(ssl); err != nil {
+		return fmt.Errorf("arm key-log export: %w", err)
+	}
 	if err := wolfssl.Connect(ssl); err != nil {
 		return fmt.Errorf("TLS handshake: %w", err)
 	}
+	// TLS 1.2 has no secret callback: its master secret only exists on the
+	// session once the handshake completes. No-op for TLS 1.3, whose secrets
+	// already went through the callback above, and when export is off.
+	wolfssl.WriteTLS12Keylog(ssl)
 
 	c.ssl = ssl
 	c.conn = conn

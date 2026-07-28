@@ -136,6 +136,23 @@ func (f *WolfSSLFetcher) Post(path string, body []byte, contentType string) ([]b
 	return resp.Body, resp.Location, nil
 }
 
+// PostStatus performs a POST and returns the whole parsed response without
+// enforcing which statuses are acceptable.
+//
+// Post's 201-or-204 rule is right for a 2030.5 CLIENT posting a Response or a
+// Subscription, where any other status is an error to retry. It is wrong for a
+// caller whose job is to REPORT what the peer answered — the notification
+// transport, where the peer's status line is the measurement and a 400 is a
+// finding rather than a failure. Collapsing the two into one method is how a
+// harness ends up unable to tell "the DUT said 400" from "the POST never
+// happened".
+func (f *WolfSSLFetcher) PostStatus(path string, body []byte, contentType string) (*HTTPResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.doPost(path, body, contentType)
+}
+
 // GetStatus performs a GET and returns the raw HTTP status code without
 // enforcing that it must be 200. Used by conformance tests that need to
 // verify the server correctly returns 404, 405, etc.

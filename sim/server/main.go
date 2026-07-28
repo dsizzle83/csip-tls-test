@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"csip-tls-test/internal/csipnotify"
+	"csip-tls-test/internal/tlsclient"
 	"csip-tls-test/internal/wolfssl"
 	"csip-tls-test/sim/gridsim"
 	"csip-tls-test/sim/tlsserver"
@@ -69,6 +71,23 @@ func main() {
 			"FunctionSetAssignmentsList subscribable=1, accept POST/GET/DELETE of Subscriptions, and POST a "+
 			"Notification to a subscriber's notificationURI when the subscribed resource changes")
 
+		// The notification transport. gridsim is pure Go and Go's crypto/tls has
+		// no ECDHE-ECDSA-AES128-CCM-8, so it REFUSES an https:// notificationURI
+		// and records the refusal; this binary has wolfSSL and can install a
+		// Notifier that dials one properly. Without these the refusal stands,
+		// loudly, which is the honest default: a Notification delivered over
+		// some other TLS profile would be evidence about a connection IEEE
+		// 2030.5 does not describe.
+		notifyCert = flag.String("notify-cert", "", "CLIENT certificate PEM this server presents when it "+
+			"dials a subscriber's https:// notificationURI. A Notification travels on a connection the "+
+			"SERVER opens, so on that leg this process is the mTLS client and needs a client identity — not "+
+			"the -cert it serves with. Set it with -notify-key to install the wolfSSL notifier; leave both "+
+			"empty and an https:// notificationURI is refused with the reason recorded in "+
+			"GET /admin/notifications")
+		notifyKey = flag.String("notify-key", "", "private key PEM matching -notify-cert")
+		notifyCA  = flag.String("notify-ca", "", "CA PEM used to verify the SUBSCRIBER's server certificate "+
+			"on the notification leg; empty uses -ca")
+
 		// Bench-only, and only in a -tags keylog build. Point this at the SAME
 		// file certify writes: lexa_keylog_open appends, the NSS format is
 		// line-oriented, and the analyzer does not care which process wrote
@@ -112,6 +131,7 @@ func main() {
 	// same tree; this one does it in a single pass.
 	if *subscription {
 		sim.EnableSubscriptions()
+		installNotifier(sim, *notifyCA, *caCert, *notifyCert, *notifyKey)
 	}
 	if *fleet != 0 {
 		if err := sim.EnableFleet(*fleet); err != nil {
@@ -240,6 +260,43 @@ func main() {
 	}
 	srv.Close()
 	log.Printf("clean shutdown")
+}
+
+// installNotifier gives the Subscription function set a transport that can dial
+// the CSIP-mandatory cipher.
+//
+// It is the second seam of the same shape as chainAdapter below, and for the
+// same reason: sim/gridsim must never import cgo, so the two halves of the
+// simulator are bolted together here. The difference is that this one is
+// OPTIONAL — a bench whose subscribers use an http:// listener needs nothing,
+// and one whose subscriber is a real gateway needs a client identity that only
+// the operator can supply.
+//
+// The absence is logged as loudly as the presence. An operator who started
+// -subscription expecting Notifications and gets refusals in
+// GET /admin/notifications should be able to find the reason in the server's
+// own output rather than in a bundle full of SKIPs three hours later.
+func installNotifier(sim *gridsim.Server, notifyCA, caCert, cert, key string) {
+	if cert == "" || key == "" {
+		log.Printf("[gridsim] NOTE: -subscription is on but no -notify-cert/-notify-key was given, so an " +
+			"https:// notificationURI will be REFUSED and recorded as undeliverable. A Notification travels " +
+			"on a connection this server dials, and IEEE 2030.5 requires it to be mutually authenticated; " +
+			"supply a client identity to deliver one. An http:// bench listener works either way")
+		return
+	}
+	ca := notifyCA
+	if ca == "" {
+		ca = caCert
+	}
+	sim.SetNotifier(csipnotify.New(csipnotify.Config{
+		CACertPath:     ca,
+		ClientCertPath: cert,
+		ClientKeyPath:  key,
+	}))
+	log.Printf("[gridsim] Notification transport: wolfSSL mTLS (cipher %s), client identity %s, "+
+		"subscriber CA %s. Session secrets are exported on this leg too in a -tags keylog build, so a "+
+		"capture of the server-dialled Notification decrypts like every other bench flow",
+		tlsclient.DefaultCipherList, cert, ca)
 }
 
 // chainAdapter presents the TLS server's chain lever as the narrow interface
