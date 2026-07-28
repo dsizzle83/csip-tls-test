@@ -113,10 +113,16 @@ func pemBlocks(der []byte) []byte {
 }
 
 // chunk is one write on the wire, with the direction and the moment it was made.
+//
+// client names the CLIENT end of the connection the write belongs to, so a
+// recording may hold more than one conversation (the resumption fixture records
+// two). The zero value means "the recording's single client", which is what the
+// one-connection fixtures leave it as.
 type chunk struct {
 	fromClient bool
 	data       []byte
 	at         time.Time
+	client     netip.AddrPort
 }
 
 // tap records every byte written through a connection, tagged with a direction.
@@ -125,12 +131,18 @@ type tap struct {
 	fromClient bool
 	mu         *sync.Mutex
 	out        *[]chunk
+	client     netip.AddrPort
 }
 
 func (t *tap) Write(b []byte) (int, error) {
 	n, err := t.Conn.Write(b)
 	t.mu.Lock()
-	*t.out = append(*t.out, chunk{fromClient: t.fromClient, data: append([]byte(nil), b[:n]...), at: time.Now().UTC()})
+	*t.out = append(*t.out, chunk{
+		fromClient: t.fromClient,
+		data:       append([]byte(nil), b[:n]...),
+		at:         time.Now().UTC(),
+		client:     t.client,
+	})
 	t.mu.Unlock()
 	return n, err
 }
@@ -295,12 +307,27 @@ func (w *recordingResponseWriter) writeTo(conn net.Conn, req *http.Request) erro
 // under test.
 func pcapFromRecording(rec recorded) []pcapng.Packet {
 	var pkts []pcapng.Packet
-	seq := map[bool]uint32{true: 1000, false: 5000}
+	// Sequence numbers are per CONVERSATION and per direction: a recording may
+	// hold several, and sharing one counter across them would hand the
+	// reassembler overlapping streams.
+	type seqKey struct {
+		client     netip.AddrPort
+		fromClient bool
+	}
+	seq := map[seqKey]uint32{}
 	idx := 1
 	for _, c := range rec.chunks {
-		src, dst := rec.clientAP, rec.serverAP
+		client := c.client
+		if !client.IsValid() {
+			client = rec.clientAP
+		}
+		src, dst := client, rec.serverAP
 		if !c.fromClient {
-			src, dst = rec.serverAP, rec.clientAP
+			src, dst = rec.serverAP, client
+		}
+		k := seqKey{client: client, fromClient: c.fromClient}
+		if _, ok := seq[k]; !ok {
+			seq[k] = map[bool]uint32{true: 1000, false: 5000}[c.fromClient]
 		}
 		// A single TLS write can exceed a real MTU; split so the fixture
 		// exercises the reassembler rather than sidestepping it.
@@ -309,8 +336,8 @@ func pcapFromRecording(rec recorded) []pcapng.Packet {
 			if end > len(c.data) {
 				end = len(c.data)
 			}
-			data := tcpFrame(src, dst, seq[c.fromClient], c.data[off:end])
-			seq[c.fromClient] += uint32(end - off)
+			data := tcpFrame(src, dst, seq[k], c.data[off:end])
+			seq[k] += uint32(end - off)
 			pkts = append(pkts, pcapng.Packet{
 				Index: idx, Time: c.at, LinkType: netdis.LinkTypeEthernet,
 				OrigLen: len(data), Data: data,

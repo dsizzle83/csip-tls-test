@@ -17,6 +17,11 @@ type testClientConfig struct {
 	ClientCertPath string
 	ClientKeyPath  string
 	CipherList     string // empty → DefaultCipherList
+
+	// Resume, when non-nil, is a session captured from an earlier client with
+	// Session(); it is installed before Connect so the handshake ATTEMPTS
+	// resumption. Whether the server allowed it is Reused(), not this field.
+	Resume unsafe.Pointer
 }
 
 // serverTestClient is a minimal wolfSSL TLS 1.2 client used by the
@@ -91,6 +96,16 @@ func dialServerTestClient(t *testing.T, addr string, cfg testClientConfig) (*ser
 		return nil, err
 	}
 
+	if cfg.Resume != nil {
+		if err := wolfssl.SetSession(ssl, cfg.Resume); err != nil {
+			wolfssl.FreeSSL(ssl)
+			file.Close()
+			conn.Close()
+			wolfssl.FreeCtx(ctx)
+			return nil, err
+		}
+	}
+
 	if err := wolfssl.Connect(ssl); err != nil {
 		wolfssl.FreeSSL(ssl)
 		file.Close()
@@ -120,6 +135,14 @@ func (c *serverTestClient) Close() {
 
 func (c *serverTestClient) Cipher() string  { return wolfssl.CipherName(c.ssl) }
 func (c *serverTestClient) Version() string { return wolfssl.Version(c.ssl) }
+
+// Session captures an owned session handle for a later Resume. The caller must
+// release it with wolfssl.FreeSession — it embeds the master secret.
+func (c *serverTestClient) Session() unsafe.Pointer { return wolfssl.GetSession(c.ssl) }
+
+// Reused reports whether THIS handshake resumed a prior session rather than
+// running a full one.
+func (c *serverTestClient) Reused() bool { return wolfssl.SessionReused(c.ssl) }
 
 func (c *serverTestClient) Request(req string) (string, error) {
 	if _, err := wolfssl.Write(c.ssl, []byte(req)); err != nil {
