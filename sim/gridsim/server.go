@@ -66,6 +66,12 @@ type Server struct {
 	// SetDataPlaneAddr for why a process has to publish which sockets are its.
 	dataPlaneAddr string
 
+	// chain is the runtime certificate-chain lever behind /admin/chain, wired
+	// by the embedding binary via SetChainSwapper. It carries its OWN mutex —
+	// a swap loads files and talks to the TLS server, which has no business
+	// holding the resource lock every CSIP request contends on. See chain.go.
+	chain chainLever
+
 	// MirrorUsagePoint store (Phase 2 POST /mup flow).
 	// mupNextID is protected by mu; do not read/write outside the mu lock.
 	mupNextID int32

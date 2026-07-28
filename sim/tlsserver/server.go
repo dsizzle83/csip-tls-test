@@ -23,7 +23,12 @@ import (
 // Lifecycle: New → Serve → close listener → Close.
 type Server struct {
 	cfg Config
-	ctx unsafe.Pointer
+	// chain holds the credential this server presents and the runtime lever
+	// that changes it. There is deliberately no bare ctx field any more: WHICH
+	// wolfSSL context a connection uses is decided at accept time and
+	// reference-counted, so a chain swap can retire a context without pulling
+	// it out from under a handshake already in flight. See chain.go.
+	chain chainState
 
 	wg sync.WaitGroup
 
@@ -72,69 +77,33 @@ type Server struct {
 }
 
 // New constructs a Server, loading certs and configuring mTLS.
+//
+// The credential itself — cipher list, chain, key, verify locations, the mTLS
+// requirement, the ticket policy and the key-log export — is built by
+// newCredential in chain.go, so that the chain a SwapChain installs at runtime
+// is configured by exactly the same code as the one the process starts with.
+// Two copies of that list is how a swapped-in chain quietly loses, say, key-log
+// export, and leaves a hole in the evidence at the one handshake that mattered.
 func New(cfg Config) (*Server, error) {
 	if cfg.CipherList == "" {
 		cfg.CipherList = DefaultCipherList
 	}
+	s := &Server{cfg: cfg}
 
-	ctx, err := wolfssl.NewServerCtx()
+	// Chain file (leaf + intermediates) takes precedence when configured, so
+	// the server can present a depth-3/4 chain; otherwise the single leaf.
+	certPath, chainLoader := cfg.ServerCertPath, false
+	if cfg.ServerCertChainPath != "" {
+		certPath, chainLoader = cfg.ServerCertChainPath, true
+	}
+	info, err := s.installChain("startup", certPath, cfg.ServerKeyPath, true, chainLoader)
 	if err != nil {
 		return nil, err
 	}
-
-	// Unwind ctx on any error during configuration.
-	ok := false
-	defer func() {
-		if !ok {
-			wolfssl.FreeCtx(ctx)
-		}
-	}()
-
-	if err := wolfssl.SetCipherList(ctx, cfg.CipherList); err != nil {
-		return nil, err
-	}
-	// Chain file (leaf + intermediates) takes precedence when configured, so
-	// the server can present a depth-3/4 chain; otherwise load the single
-	// leaf (default, unchanged).
-	if cfg.ServerCertChainPath != "" {
-		if err := wolfssl.UseCertChainFile(ctx, cfg.ServerCertChainPath); err != nil {
-			return nil, err
-		}
-	} else if err := wolfssl.UseCertFile(ctx, cfg.ServerCertPath); err != nil {
-		return nil, err
-	}
-	if err := wolfssl.UseKeyFile(ctx, cfg.ServerKeyPath); err != nil {
-		return nil, err
-	}
-	if err := wolfssl.LoadVerifyLocations(ctx, cfg.CACertPath); err != nil {
-		return nil, err
-	}
-
-	// THE line that turns one-sided TLS into mTLS.
-	wolfssl.RequireClientCert(ctx)
-
-	// Both levers, or neither: a session ticket hands the session state to the
-	// CLIENT, so a server that stopped caching but kept issuing tickets would
-	// still resume. See Config.NoSessionTickets for why an evidence run asks
-	// for this and why it is not the default.
-	if cfg.NoSessionTickets {
-		if err := wolfssl.SetNoTicketTLS12(ctx); err != nil {
-			return nil, err
-		}
-		wolfssl.SetSessionCacheOff(ctx)
-	}
-
-	// Export this server's TLS secrets so a capture of the DUT->bench direction
-	// is decryptable. Registered on the CTX rather than recovered per-session:
-	// wolfSSL_SESSION_get_master_key hands a SERVER back an all-zero secret for
-	// most sessions, and an all-zero secret written to a key log is worse than
-	// none — it is well-formed, so analysers accept it and then report "AEAD
-	// authentication failed", which reads as a broken capture rather than a
-	// missing key. A no-op outside a -tags keylog build.
-	wolfssl.EnableCtxKeylog(ctx)
-
-	ok = true
-	return &Server{cfg: cfg, ctx: ctx}, nil
+	s.chain.mu.Lock()
+	s.chain.orig, s.chain.origLoader = info, chainLoader
+	s.chain.mu.Unlock()
+	return s, nil
 }
 
 // Serve runs the accept loop until the listener is closed.
@@ -157,14 +126,35 @@ func (s *Server) Serve(lis net.Listener) error {
 
 // Close waits for in-flight handlers and releases the wolfSSL context.
 // Must be called after Serve has returned.
+//
+// Waiting first is what makes the free safe: every connection holds a reference
+// to the credential it handshook with, so by the time Wait returns the only
+// outstanding reference is the installed one, and dropping it here frees the
+// last context. Any credential retired by an earlier swap was already freed by
+// whichever connection closed last.
 func (s *Server) Close() {
 	s.wg.Wait()
-	wolfssl.FreeCtx(s.ctx)
-	s.ctx = nil
+	s.chain.mu.Lock()
+	cur := s.chain.cur
+	s.chain.cur = nil
+	s.chain.mu.Unlock()
+	if cur != nil {
+		cur.release()
+	}
 }
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
+
+	// Pin the credential for this connection's whole life. Everything after
+	// this line is served under the chain that was installed at ACCEPT time,
+	// which is what makes a mid-campaign swap safe: a chain that changes under
+	// an open session would produce a capture nobody can interpret.
+	cred := s.acquireCredential()
+	if cred == nil {
+		return // the server is closing
+	}
+	defer cred.release()
 
 	tcpConn, ok := conn.(*net.TCPConn)
 	if !ok {
@@ -176,7 +166,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	defer file.Close()
 
-	ssl, err := wolfssl.NewSSL(s.ctx)
+	ssl, err := wolfssl.NewSSL(cred.ctx)
 	if err != nil {
 		return
 	}

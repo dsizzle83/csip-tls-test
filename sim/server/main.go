@@ -117,6 +117,17 @@ func main() {
 	}
 	srv.OnClientCert = sim.SetClientCertDER
 
+	// Wire the runtime certificate-chain lever (GET/POST /admin/chain) to the
+	// TLS server. This is what makes COMM-004 D/E/F/G runnable at all: those
+	// rows need the bench to PRESENT a non-conformant chain, and before this
+	// the only way to change the chain was to restart this process — which
+	// invalidates the evidence of every test case already run against it.
+	//
+	// The adapter below exists so gridsim (pure Go, tested with no wolfSSL
+	// sysroot) never imports tlsserver (cgo). It is the entire coupling
+	// between the two.
+	sim.SetChainSwapper(chainAdapter{srv})
+
 	lis, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
@@ -191,4 +202,40 @@ func main() {
 	}
 	srv.Close()
 	log.Printf("clean shutdown")
+}
+
+// chainAdapter presents the TLS server's chain lever as the narrow interface
+// gridsim's admin plane consumes, translating one struct into the other.
+//
+// The translation is the price of keeping gridsim free of cgo, and it is worth
+// paying: gridsim's unit tests run on any machine, and this file — which is
+// already the place where the two halves of the simulator are bolted together —
+// is where the seam belongs.
+type chainAdapter struct{ srv *tlsserver.Server }
+
+func (a chainAdapter) ActiveChain() gridsim.ChainState   { return toChainState(a.srv.ActiveChain()) }
+func (a chainAdapter) OriginalChain() gridsim.ChainState { return toChainState(a.srv.OriginalChain()) }
+
+func (a chainAdapter) SwapChain(label, certPath, keyPath string) (gridsim.ChainState, error) {
+	info, err := a.srv.SwapChain(label, certPath, keyPath)
+	return toChainState(info), err
+}
+
+func (a chainAdapter) RestoreChain() (gridsim.ChainState, error) {
+	info, err := a.srv.RestoreChain()
+	return toChainState(info), err
+}
+
+func toChainState(i tlsserver.ChainInfo) gridsim.ChainState {
+	return gridsim.ChainState{
+		Label:         i.Label,
+		LeafSHA256:    i.LeafSHA256,
+		ChainLen:      i.ChainLen,
+		Subjects:      i.Subjects,
+		Issuers:       i.Issuers,
+		Original:      i.Original,
+		InstalledUnix: i.InstalledUnix,
+		Swaps:         i.Swaps,
+		Warnings:      i.Warnings,
+	}
 }

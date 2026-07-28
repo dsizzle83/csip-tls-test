@@ -32,6 +32,10 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/responses", cors(s.handleAdminResponses))
 	mux.HandleFunc("/admin/derputs", cors(s.handleAdminDERPuts))
 	mux.HandleFunc("/admin/logevents", cors(s.handleAdminLogEvents))
+	// The runtime certificate-chain lever (COMM-004 D/E/F/G). See chain.go for
+	// why it takes PEM text rather than paths, and why a gridsim with no TLS
+	// data plane answers it 501 rather than 404.
+	mux.HandleFunc("/admin/chain", cors(s.handleAdminChain))
 	mux.HandleFunc("/admin/logs", cors(s.logBuf.ServeHTTP))
 	// Cursor-based JSON read of the same ring. The SSE stream above is for the
 	// dashboard; a programmatic reader must use this, because deriving a delta
