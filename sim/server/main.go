@@ -115,6 +115,13 @@ func main() {
 	log.Printf("Server listening on %s (mTLS, cipher=%s)",
 		lis.Addr(), tlsserver.DefaultCipherList)
 
+	// Publish the address the kernel actually handed us, so GET /admin/status
+	// can say which data plane THIS process serves. A harness given -gridsim
+	// and -gridsim-admin has no other way to establish that the two ports
+	// belong to one process — see the admin-bind comment below for what
+	// happened on the day they did not.
+	sim.SetDataPlaneAddr(lis.Addr().String())
+
 	// Start plain HTTP admin API (DERControl management — no mTLS).
 	//
 	// Bind BEFORE serving so a port clash is fatal here rather than a line in

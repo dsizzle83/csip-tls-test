@@ -113,6 +113,14 @@ type Options struct {
 	GatewaySSH string
 	HTTP       HTTPClient
 
+	// SkipPreflight bypasses the bench cross-checks Runner.preflight makes —
+	// principally that -gridsim and -gridsim-admin name one live process. It
+	// exists for topologies preflight cannot reason about (a proxied or
+	// port-forwarded admin API), and its use is recorded in the bundle,
+	// because a run whose pairing was asserted rather than established is
+	// evidence of a slightly different kind.
+	SkipPreflight bool
+
 	// Command is the argument vector that started this process. The runner
 	// records it in the bundle with credential-shaped values replaced (see
 	// bundle.RedactCommand); what is stored HERE is what the caller passed,
@@ -261,6 +269,9 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 	fs.Var(keyValue{&o.Params}, "param", "procedure parameter key=value (repeatable)")
 	fs.BoolVar(&o.RequireCitation, "require-citation", o.RequireCitation, "downgrade a PASS with no re-checkable citation to WARN")
 	fs.BoolVar(&o.RequireCoverage, "require-coverage", o.RequireCoverage, "fail the run if an applicable test case has no implementation")
+	fs.BoolVar(&o.SkipPreflight, "skip-preflight", o.SkipPreflight,
+		"do not verify that -gridsim and -gridsim-admin are one live process (for topologies where they "+
+			"legitimately differ; the bundle records that the check was skipped)")
 }
 
 // Filter builds the catalog filter from the selection options.
@@ -567,6 +578,16 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		reporter.CoverageListing(rep.Coverage)
 		rep.Finished = time.Now().UTC()
 		return rep, nil
+	}
+
+	// Before the capture, before the PKI, before anything that costs a bench:
+	// establish that the topology the flags describe is the topology that
+	// exists. A run that discovers this at the end discovers it as forty
+	// minutes of findings about a device that was behaving perfectly. The dry
+	// run above is exempt because it touches no bench at all.
+	if err := r.preflight(ctx, reporter); err != nil {
+		rep.Finished = time.Now().UTC()
+		return rep, err
 	}
 
 	pki, pkiErr := (*PKI)(nil), error(nil)
@@ -1013,6 +1034,12 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 	}
 	if len(rep.CaptureProblems) > 0 {
 		note = joinNote(note, "capture integrity: "+strings.Join(rep.CaptureProblems, "; "))
+	}
+	// A bypassed preflight travels with the evidence it weakens. RunMeta.Command
+	// already carries the flag; this says what the flag COST, which is the part
+	// a reader of the findings needs.
+	if r.opts.SkipPreflight {
+		note = joinNote(note, SkipPreflightNote)
 	}
 
 	b := bundle.NewBuilder(bundle.RunMeta{

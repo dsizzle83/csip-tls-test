@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	model "lexa-proto/csipmodel"
@@ -365,4 +366,47 @@ func advertisedFromStatus(t *testing.T, s *Server) uint32 {
 		t.Fatal(err)
 	}
 	return got.PollRateS
+}
+
+// TestAdminStatus_IdentifiesItsOwnProcessAndDataPlane: two reachable ports do
+// not prove one process. An orphaned gridsim held the admin port beside a live
+// one holding the data port, and a harness read one server's observations about
+// the other server's traffic — publishing "the DUT never dialled" for hours.
+// The status endpoint answers the question that ends it.
+func TestAdminStatus_IdentifiesItsOwnProcessAndDataPlane(t *testing.T) {
+	s := NewServer("")
+
+	var before struct {
+		PID       int    `json:"pid"`
+		DataPlane string `json:"data_plane"`
+	}
+	rec := httptest.NewRecorder()
+	s.AdminHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/admin/status", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &before); err != nil {
+		t.Fatal(err)
+	}
+	if before.PID != os.Getpid() {
+		t.Errorf("pid = %d, want this process (%d)", before.PID, os.Getpid())
+	}
+	// An embedding binary that never published a listener must not have one
+	// invented for it: "unknown" is a usable answer, a guess is not.
+	if before.DataPlane != "" {
+		t.Errorf("data_plane = %q before any listener was published", before.DataPlane)
+	}
+
+	s.SetDataPlaneAddr("0.0.0.0:11113")
+	if got := s.DataPlaneAddr(); got != "0.0.0.0:11113" {
+		t.Errorf("DataPlaneAddr = %q", got)
+	}
+	var after struct {
+		DataPlane string `json:"data_plane"`
+	}
+	rec = httptest.NewRecorder()
+	s.AdminHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/admin/status", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.DataPlane != "0.0.0.0:11113" {
+		t.Errorf("data_plane = %q, want the published listener address", after.DataPlane)
+	}
 }

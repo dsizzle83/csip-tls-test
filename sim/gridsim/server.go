@@ -61,6 +61,11 @@ type Server struct {
 	// Atomic: read in handlers that hold s.mu in different orders.
 	clockSkew atomic.Int64
 
+	// dataPlaneAddr is the address the 2030.5 (mTLS) listener is serving, as
+	// the embedding binary read it back from the kernel. Guarded by mu. See
+	// SetDataPlaneAddr for why a process has to publish which sockets are its.
+	dataPlaneAddr string
+
 	// MirrorUsagePoint store (Phase 2 POST /mup flow).
 	// mupNextID is protected by mu; do not read/write outside the mu lock.
 	mupNextID int32
@@ -299,6 +304,36 @@ func (s *Server) advertisedPollRateLocked() uint32 {
 		}
 	}
 	return top
+}
+
+// SetDataPlaneAddr records the address the embedding binary's 2030.5 listener
+// actually accepted from the kernel, so GET /admin/status can answer "which
+// data plane does THIS process serve?".
+//
+// The admin API and the 2030.5 listener are two sockets, and nothing outside
+// the process guarantees a client holding one is talking to the process holding
+// the other. On 2026-07-28 an orphaned gridsim survived its own SIGTERM and
+// kept :11114 while its replacement took :11113 and logged "address already in
+// use" for the admin port before carrying on. The DUT then talked to the new
+// process while the conformance harness read its server-side observations from
+// the eight-hour-old orphan, which had of course recorded no DUT traffic. Every
+// case so misread was published as a device that never dialled.
+//
+// Publishing this address, and the pid beside it, is what lets a harness refuse
+// that run in its first second instead of misattributing a whole campaign.
+func (s *Server) SetDataPlaneAddr(addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dataPlaneAddr = addr
+}
+
+// DataPlaneAddr returns the address recorded by SetDataPlaneAddr — empty when
+// the embedding binary never set one, which is an honest "unknown" rather than
+// a guess a caller could mistake for a fact.
+func (s *Server) DataPlaneAddr() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dataPlaneAddr
 }
 
 // rebuildEndDeviceList reconstructs the /edev resource with the current

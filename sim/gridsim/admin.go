@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"time"
 
 	model "lexa-proto/csipmodel"
@@ -154,6 +155,13 @@ type adminStatusResp struct {
 	// observation window from the floor waits for a walk the server itself told
 	// the device not to make. See Server.AdvertisedPollRate.
 	PollRateS uint32 `json:"poll_rate_s"`
+	// PID and DataPlane identify the PROCESS answering this request and the
+	// 2030.5 listener that process serves. Two reachable ports do not prove one
+	// process: an orphan holding the admin port beside a live instance holding
+	// the data port is exactly how a harness came to read one server's
+	// observations about another server's traffic. See Server.SetDataPlaneAddr.
+	PID       int    `json:"pid"`
+	DataPlane string `json:"data_plane,omitempty"`
 }
 
 var progMeta = []struct {
@@ -218,6 +226,8 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 		Programs:   programs,
 		ServerTime: s.Now(),
 		PollRateS:  s.advertisedPollRateLocked(),
+		PID:        os.Getpid(),
+		DataPlane:  s.dataPlaneAddr,
 	})
 }
 
