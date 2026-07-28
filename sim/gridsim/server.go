@@ -200,6 +200,59 @@ func (s *Server) ClockSkew() int64 {
 	return s.clockSkew.Load()
 }
 
+// SetAdvertisedPollRate overrides the pollRate this server advertises on /dcap
+// and /tm. Zero leaves the built-in values (300 and 900) alone.
+//
+// WHY THIS LEVER EXISTS
+//
+// A conformant 2030.5 client in poll_rate_mode=honor paces its whole-tree walk
+// at the SLOWEST advertised class pollRate, so that no resource is fetched more
+// often than the server asked for. Against gridsim's defaults that maximum is
+// /tm's 900 s, and the DUT correctly walks once every 15 minutes.
+//
+// That is right, and it makes the CSIP suite untestable: the [C]-half checks
+// observe a walk the DUT opens on its own schedule, and waiting 15 minutes per
+// case over ~79 cases is not a test run anybody will sit through. On
+// 2026-07-28 a full run SKIPped every CSIP case for exactly this reason, and
+// the mass-skip read as a DUT fault for several rounds before the capture
+// showed one clean walk 12m45s into a 22-minute window — the gateway was
+// behaving perfectly.
+//
+// The fix belongs on the SERVER, not the DUT. pollRate is the server's to
+// choose, so a conformance run advertises a fast one and leaves the device in
+// its shipping configuration. Lowering the DUT's own poll_rate_mode to
+// "override" would also produce frequent walks, but it would certify a mode the
+// product does not ship with.
+func (s *Server) SetAdvertisedPollRate(seconds uint32) {
+	if seconds == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Every resource class the client's pacing looks at, not just /dcap and
+	// /tm: lexa-gw's advertisedPollSeconds takes the MAXIMUM over
+	// DeviceCapability, Time, and EACH DERProgram's DERControlList, so one
+	// missed DERControlList pins the whole walk to its rate. Setting /dcap and
+	// /tm alone moved the observed cadence from 900s to 300s and no further —
+	// a DERControlList was still advertising 300.
+	var n int
+	for _, r := range s.resources {
+		switch v := r.(type) {
+		case *model.DeviceCapability:
+			v.PollRate = seconds
+			n++
+		case *model.Time:
+			v.PollRate = seconds
+			n++
+		case *model.DERControlList:
+			v.PollRate = seconds
+			n++
+		}
+	}
+	log.Printf("[gridsim] advertised pollRate set to %ds on %d resource(s) "+
+		"(DeviceCapability, Time, DERControlList)", seconds, n)
+}
+
 // rebuildEndDeviceList reconstructs the /edev resource with the current
 // ClientLFDI and clientSFDI. Caller must hold s.mu for writing.
 func (s *Server) rebuildEndDeviceList() {

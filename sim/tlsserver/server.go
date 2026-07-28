@@ -3,11 +3,15 @@ package tlsserver
 import (
 	"bytes"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 	"unsafe"
 
 	"csip-tls-test/internal/csip/identity"
@@ -28,6 +32,31 @@ type Server struct {
 	// to assert CSIP cipher compliance from the server side; production
 	// binaries can use it for structured logging.
 	OnHandshake func(version, cipher string)
+
+	// IdleTimeout, when non-zero, closes a connection that has gone this long
+	// without a request. Zero keeps connections open indefinitely.
+	//
+	// WHY: a conformant 2030.5 client keeps ONE TLS session and reuses it for
+	// every poll cycle — measured 2026-07-28, 14 walks over 2 handshakes. The
+	// CSIP suite's [C]-half checks recover the DUT's session by finding its
+	// ClientHello in the capture, so once that single session predates the
+	// capture there is nothing left to observe and every such case SKIPs
+	// forever. That is a limitation of the OBSERVATION, not a DUT fault: the
+	// gateway is doing the better thing by not re-handshaking every cycle.
+	//
+	// The fix goes on the test server, where pollRate's went, leaving the
+	// device in its shipping configuration. Set this BELOW the poll cadence
+	// and ABOVE a single walk's duration (10s against a 60s cadence and ~1s
+	// walks): the connection then dies between walks and each walk opens
+	// exactly one fresh session carrying the whole walk.
+	//
+	// "One session per WALK" is the requirement, not merely "more sessions".
+	// certify.Evidence.StreamOn refuses a test case with more than one
+	// attributed conversation on a port ("cite one explicitly"), and
+	// RecoverSession expects the entire discovery walk inside the session it
+	// recovers. An earlier attempt closed after every RESPONSE, which produced
+	// ~28 single-GET sessions per walk and failed both conditions at once.
+	IdleTimeout time.Duration
 
 	// Handler, if non-nil, is the http.Handler that serves every request.
 	// Set this to sim.Handler() to route requests through gridsim instead
@@ -84,6 +113,15 @@ func New(cfg Config) (*Server, error) {
 	// THE line that turns one-sided TLS into mTLS.
 	wolfssl.RequireClientCert(ctx)
 
+	// Export this server's TLS secrets so a capture of the DUT->bench direction
+	// is decryptable. Registered on the CTX rather than recovered per-session:
+	// wolfSSL_SESSION_get_master_key hands a SERVER back an all-zero secret for
+	// most sessions, and an all-zero secret written to a key log is worse than
+	// none — it is well-formed, so analysers accept it and then report "AEAD
+	// authentication failed", which reads as a broken capture rather than a
+	// missing key. A no-op outside a -tags keylog build.
+	wolfssl.EnableCtxKeylog(ctx)
+
 	ok = true
 	return &Server{cfg: cfg, ctx: ctx}, nil
 }
@@ -137,12 +175,36 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
+	// Arm key-log export before the handshake (TLS 1.3 secrets arrive through a
+	// per-session callback as the key schedule advances, so it cannot be armed
+	// afterwards). A no-op outside a -tags keylog evidence build.
+	//
+	// This is the SERVER half of the bench's evidence story. Every TLS session a
+	// conformance run captures has the bench as one endpoint — the bench is the
+	// mbaps client driving the gateway's :802, and the bench is the 2030.5
+	// server the gateway's CSIP client dials out to. Only the first half was
+	// ever wired up, so gateway->gridsim sessions stayed ciphertext and every
+	// CSIP criterion about a RESPONSE BODY or STATUS LINE reported "the key log
+	// holds no secret for this session's client random". Nothing is extracted
+	// from the DUT: these are the bench's own secrets, for a session the bench
+	// itself terminated.
+	if err := wolfssl.EnableTLS13Keylog(ssl); err != nil {
+		log.Printf("[tlsserver] arm key-log export: %v", err)
+		return
+	}
+
 	if err := wolfssl.Accept(ssl); err != nil {
 		// Failed handshake — could be no client cert, wrong CA, wrong
 		// cipher, etc. Negative tests assert on the client-side error
 		// rather than server logs, so silent rejection is fine.
 		return
 	}
+
+	// TLS 1.2 has no key-schedule callback: its master secret is recoverable
+	// only from the completed session, so it is written here rather than armed
+	// above. The gateway negotiates TLS 1.2 northbound today, which makes this
+	// line — not the one above it — the one that actually decrypts the capture.
+	wolfssl.WriteTLS12Keylog(ssl)
 
 	if s.OnHandshake != nil {
 		s.OnHandshake(wolfssl.Version(ssl), wolfssl.CipherName(ssl))
@@ -159,11 +221,45 @@ func (s *Server) handleConn(conn net.Conn) {
 		peerLFDI = lfdi.String()
 	}
 
-	s.handleRequest(ssl, peerLFDI)
+	// Idle watchdog. It unblocks the read with shutdown(SHUT_RD) rather than
+	// closing a descriptor: wolfSSL reads from the dup returned by
+	// tcpConn.File(), so a deadline on conn would not reach it, and closing
+	// the dup underneath a blocked read races descriptor reuse. SHUT_RD makes
+	// the pending read return EOF and nothing else changes hands.
+	//
+	// SO_RCVTIMEO would be the other way to do this and is deliberately NOT
+	// used: it hands the read an EINTR every time Go's async preemption fires
+	// a SIGURG at it, which is the exact failure that cost hours on 2026-07-27.
+	touch := func() {}
+	if s.IdleTimeout > 0 {
+		var last atomic.Int64
+		last.Store(time.Now().UnixNano())
+		touch = func() { last.Store(time.Now().UnixNano()) }
+		fd := int(file.Fd())
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			tk := time.NewTicker(time.Second)
+			defer tk.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-tk.C:
+					if time.Since(time.Unix(0, last.Load())) >= s.IdleTimeout {
+						_ = syscall.Shutdown(fd, syscall.SHUT_RD)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	s.handleRequest(ssl, peerLFDI, touch)
 	wolfssl.Shutdown(ssl)
 }
 
-func (s *Server) handleRequest(ssl unsafe.Pointer, peerLFDI string) {
+func (s *Server) handleRequest(ssl unsafe.Pointer, peerLFDI string, touch func()) {
 	if s.Handler == nil {
 		// Legacy static router: one request per connection (backward compat).
 		raw := readHTTPMessage(ssl)
@@ -181,6 +277,7 @@ func (s *Server) handleRequest(ssl unsafe.Pointer, peerLFDI string) {
 		if len(raw) == 0 {
 			return // client closed connection
 		}
+		touch()
 		connClose := requestWantsClose(raw)
 		resp := dispatchHTTP(s.Handler, raw, peerLFDI, connClose)
 		if _, err := wolfssl.Write(ssl, resp); err != nil {

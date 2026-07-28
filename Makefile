@@ -210,6 +210,20 @@ build-certify:
 	@mkdir -p bin
 	go build -o bin/certify ./cmd/certify
 
+# server-keylog builds gridsim with TLS secret export, so a capture of the
+# GATEWAY -> gridsim direction can be decrypted too. Without it those sessions
+# stay ciphertext and every CSIP criterion about a response body or status line
+# reports "the key log holds no secret for this session's client random".
+# Same separate sysroot, same reasoning, as certify-keylog.
+server-keylog:
+	@mkdir -p bin
+	@test -d "$(WOLFSSL_KEYLOG_SYSROOT)/include" || { \
+	  echo "server-keylog: no keylog sysroot at $(WOLFSSL_KEYLOG_SYSROOT)"; \
+	  echo "  build it: bash scripts/build-wolfssl-keylog-sysroot.sh"; exit 1; }
+	CGO_CFLAGS="-I$(WOLFSSL_KEYLOG_SYSROOT)/include" \
+	CGO_LDFLAGS="-L$(WOLFSSL_KEYLOG_SYSROOT)/lib -lwolfssl -lm" \
+	go build -tags keylog -o bin/server-keylog ./sim/server
+
 certify-keylog:
 	@mkdir -p bin
 	@test -d "$(WOLFSSL_KEYLOG_SYSROOT)/include" || { \
