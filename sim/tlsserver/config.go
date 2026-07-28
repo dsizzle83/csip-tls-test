@@ -16,8 +16,15 @@ type Config struct {
 	// certificate chain (leaf first, then intermediate CA(s), excluding the
 	// trust anchor). It takes precedence over ServerCertPath and is loaded
 	// via wolfSSL_CTX_use_certificate_chain_file so the server presents the
-	// intermediates a depth-3/4 chain verification needs (COMM-004
-	// 004B/C/D/E/F). Empty ⇒ the single-leaf ServerCertPath path, unchanged.
+	// intermediates a depth-3/4 chain verification needs (COMM-004 A/B/C).
+	// Empty ⇒ the single-leaf ServerCertPath path, unchanged.
+	//
+	// This is the chain the process STARTS with, and the one RestoreChain
+	// returns to. The rejection sub-tests (COMM-004 D/E/F/G) install their own
+	// chain at RUNTIME instead — see chain.go — because a chain chosen here
+	// could only be changed by restarting the process, and a restart
+	// mid-campaign invalidates the evidence of every test case already run
+	// against the running instance.
 	ServerCertChainPath string
 
 	// NoSessionTickets makes every handshake a FULL handshake: no RFC 5077

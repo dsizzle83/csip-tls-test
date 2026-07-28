@@ -11,18 +11,22 @@ package suitecsip
 // the DUT. A reviewer can open the capture at the cited frame and read the
 // cipher_suites vector for themselves.
 //
-// The COMM-004 sub-tests split along a line the bench cannot cross on its own.
+// The COMM-004 sub-tests split along a line the bench once could not cross.
 // A/B/C ask whether the DUT ACCEPTS a valid chain of a given depth: that is
 // observable, because whatever depth the bench server is provisioned with is
 // visible in the Certificate message and the DUT's acceptance is visible in the
 // completed handshake. D/E/F/G ask whether the DUT REJECTS a specific
-// non-conformant chain, and that requires the bench to PRESENT that chain. The
-// bench's 2030.5 server takes its chain from process start-up arguments and
-// exposes no runtime lever to swap it, and restarting it mid-campaign would
-// invalidate every test case already run against the running instance. Those
-// four rows therefore SKIP with that reason — and they SKIP with a detector
-// already in place, so the moment a fixture-serving lever exists they become
-// live without a code change.
+// non-conformant chain, and that requires the bench to PRESENT that chain.
+//
+// It now can. gridsim's POST /admin/chain installs a chain and key for NEW
+// connections and restores the original on demand, so those four rows mint
+// their fixture, install it, give the DUT one connection window and put the
+// bench back — see commChainRejection and chainswap.go. The detector that
+// decides them is the one written while they could only SKIP; going live did
+// not change a line of it, which is the whole return on having written a real
+// check rather than a stub. They still SKIP, with the reason they always
+// carried, against a bench whose gridsim has no such lever — and the check
+// establishes WHICH case it is by probing the endpoint, not by assuming.
 
 import (
 	"context"
@@ -32,6 +36,7 @@ import (
 	"strings"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/certify/suitepki"
 	"csip-tls-test/internal/evidence/netdis"
 	"csip-tls-test/internal/evidence/tlsdis"
 )
@@ -296,8 +301,9 @@ func commAdvancedSecurity(ctx context.Context, rc *certify.RunCtx) (certify.Resu
 	return run(ctx, rc, spec{
 		Notes: func(o *Observation) string {
 			return "certificate-chain handling: the acceptance sub-tests (A/B/C) are asserted from the " +
-				"chain the bench server presents; the rejection sub-tests (D/E/F/G) need a non-conformant " +
-				"chain the bench cannot present at runtime — see COMM-004D..G"
+				"chain the bench server presents; the rejection sub-tests (D/E/F/G) each install their own " +
+				"non-conformant chain through gridsim's runtime chain lever and are decided on their own " +
+				"rows — see COMM-004D..G"
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
@@ -418,12 +424,13 @@ func critRejectionUnexercised() criterion {
 			return unavailable("no non-conformant certificate chain was presented to the DUT in this run")
 		},
 		Skip: "these four sub-tests require the bench's 2030.5 server to PRESENT a non-conformant chain " +
-			"(invalid MICA extendedKeyUsage/name/policyMapping, or a self-signed device certificate). " +
-			"gridsim takes its certificate chain from sim/server's start-up arguments and exposes no admin " +
-			"lever to swap it at runtime, and restarting it mid-campaign would invalidate the evidence of " +
-			"every test case already run against the running instance (the shared-bench constraint). The " +
-			"negative fixtures exist under certs/mbaps/negative; what is missing is a way to serve them " +
-			"on the CSIP leg without a restart",
+			"(invalid MICA extendedKeyUsage/name/policyMapping, or a self-signed device certificate), and " +
+			"they now do exactly that on their OWN rows: COMM-004D, E, F and G each mint their fixture, " +
+			"install it through gridsim's runtime chain lever (POST /admin/chain) and restore the bench " +
+			"afterwards. This PARENT row deliberately does not repeat the experiment — it ran against " +
+			"the bench's normal chain, which is what makes its acceptance half meaningful, and a row that " +
+			"swapped the chain under itself could assert neither half cleanly. Read the four sub-test rows " +
+			"for the rejection verdicts",
 	}
 }
 
@@ -488,8 +495,11 @@ func chainDepthCriterion(depth int, shape string) func(*Observation) criterion {
 				}
 				if len(h.ServerChain) != depth {
 					return unavailable("the bench server presented a %d-certificate chain (%s), not the "+
-						"%d-certificate chain this sub-test is about; the chain is fixed at the bench "+
-						"server's start-up and cannot be changed at runtime",
+						"%d-certificate chain this sub-test is about; start gridsim with a -cert-chain of "+
+						"the depth this row is about. The runtime lever (POST /admin/chain) exists but is "+
+						"not used here: it is reserved for the D/E/F/G rejection fixtures, which restore "+
+						"what they install, and a check that swapped in a chain merely to observe its own "+
+						"depth would be asserting the harness rather than the bench's provisioning",
 						len(h.ServerChain), chainDescription(h.ServerChain), depth)
 				}
 				if !h.Complete {
@@ -510,15 +520,50 @@ func chainDepthCriterion(depth int, shape string) func(*Observation) criterion {
 
 // commChainRejection builds a COMM-004D/E/F/G check.
 //
-// It always runs to a SKIP on this bench, but it is a REAL check, not a stub:
-// the detector below is what decides the row the moment the bench can present
-// the fixture, and it already implements the published erratum's three
-// acceptable rejection signals.
-func commChainRejection(what, fixture string) certify.Check {
+// The shape is: mint the sub-test's non-conformant chain, install it on the
+// bench's 2030.5 server through gridsim's runtime chain lever, give the DUT one
+// connection window to meet it, and RESTORE the bench whatever happens. The
+// detector that decides the row is rejectionFinding, unchanged from when these
+// rows could only SKIP — it already implemented the published erratum's three
+// acceptable rejection signals, and going live did not need it touched.
+//
+// The row still SKIPs, with the reason it always carried, on a bench whose
+// gridsim has no chain lever. That is a fact about the BENCH, established by
+// probing /admin/chain before anything is installed, not about this build.
+//
+// chainswap.go documents the four ways this goes wrong on a shared bench and
+// what is done about each. Two are worth repeating here because they decide
+// whether the row means anything at all: the fixture must be anchored on the
+// root the DUT ALREADY TRUSTS (or the rejection is about the root rather than
+// the defect), and the chain in the capture must be identified BY FINGERPRINT
+// (or a session the DUT opened before the swap gets scored as though it had
+// been shown the fixture).
+func commChainRejection(what string, defect suitepki.MICADefect) certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
+		cs := &chainSwap{defect: defect}
 		return run(ctx, rc, spec{
+			Setup: func(ctx context.Context, d *Driver, _ map[string]string) error {
+				skip, err := cs.arm(ctx, rc, d)
+				cs.skip = skip
+				if skip != "" {
+					rc.Logf("COMM-004 rejection sub-test NOT armed: %s", skip)
+				}
+				return err
+			},
+			// Unconditional, and handed a context detached from the check's own
+			// deadline by run(). A check that left the bench presenting a
+			// deliberately non-conformant chain would invalidate every case
+			// after it — restoreCriterion carries the outcome into this row's
+			// verdict rather than into a log line nobody reads.
+			Cleanup: func(ctx context.Context, d *Driver) { cs.restore(ctx, d) },
 			Notes: func(o *Observation) string {
-				return "rejection sub-test for " + what + ": not exercised on this bench (see the assertion's reason)"
+				if cs.skip != "" {
+					return "rejection sub-test for " + what + ": NOT EXERCISED on this bench — " + cs.skip
+				}
+				return fmt.Sprintf("rejection sub-test for %s: the bench presented %s (leaf %s, %d "+
+					"certificate(s)) to new connections for %s, then restored its original chain",
+					what, cs.fixtureDescription(), shortSHA(cs.installed.LeafSHA256),
+					cs.installed.ChainLen, o.Waited.Round(rounding))
 			},
 			Criteria: func(o *Observation) []criterion {
 				return []criterion{
@@ -528,40 +573,40 @@ func commChainRejection(what, fixture string) certify.Check {
 							"DUT — the three signals the procedure's published erratum (Annex A, seq 7) admits, " +
 							"\"A TCP port disconnect or HTTP 403 shall be an acceptable alternative to a TLS " +
 							"alert for notification of invalid certificates\" — with no DeviceCapability payload " +
-							"on the wire afterwards",
+							"on the wire afterwards. WHICH chain the DUT was shown is settled by the SHA-256 of " +
+							"the leaf in the server's Certificate message, matched against the fingerprint " +
+							"gridsim reported when it installed the fixture",
 						Wire: func(ev *certify.Evidence, t *Transcript) Finding {
-							if !servedFixture(t, fixture) {
-								return unavailable("the bench server presented its normal chain (%s), not %s, so "+
-									"this rejection sub-test was not exercised",
-									chainDescription(t.Handshake.ServerChain), fixture)
+							if cs.skip != "" {
+								return unavailable("%s", cs.skip)
+							}
+							if ok, why := cs.servedTheFixture(t); !ok {
+								return unavailable("%s", why)
 							}
 							return rejectionFinding(ev, t)
 						},
-						Skip: "the bench's 2030.5 server cannot be made to present " + fixture + " at runtime: " +
-							"its chain is fixed at process start-up (sim/server) and restarting it mid-campaign " +
-							"would invalidate the evidence of every test case already run. The check's detector " +
-							"is implemented and will decide this row unchanged once such a lever exists",
+						Skip: cs.skipReason(),
 					},
+					cs.restoreCriterion(),
 				}
 			},
 		})
 	}
 }
 
-// servedFixture reports whether the chain on the wire is the non-conformant one
-// a rejection sub-test is about. Today it can only recognise the self-signed
-// case from the DER; the invalid-MICA cases would need the fixture's own
-// identity to be known, which is why they are gated on the same predicate.
-func servedFixture(t *Transcript, fixture string) bool {
-	chain := t.Handshake.ServerChain
-	if len(chain) == 0 {
-		return false
+// skipReason is the criterion's Skip text: the live probe's finding when there
+// is one, and otherwise the reason a row lands here on a bench that HAS the
+// lever — which is a different failure and deserves a different sentence.
+func (cs *chainSwap) skipReason() string {
+	if cs.skip != "" {
+		return cs.skip
 	}
-	if strings.Contains(fixture, "self-signed") {
-		ci, err := tlsdis.ParseCertInfo(chain[0])
-		return err == nil && len(chain) == 1 && ci.SelfIssued
-	}
-	return false
+	return "the bench's 2030.5 server could not be observed presenting " + cs.fixtureDescription() +
+		" during this check's window. The chain lever itself worked (gridsim POST /admin/chain " +
+		"confirmed leaf " + shortSHA(cs.installed.LeafSHA256) + "), so this is a property of the RUN " +
+		"rather than of the bench: the DUT opened no new connection while the fixture was installed, or " +
+		"the window closed before it did. Start gridsim with -idle-timeout-s below the DUT's poll " +
+		"cadence so each cycle opens a fresh session, and lengthen the window with -param " + waitParam
 }
 
 // rejectionFinding decides a rejection sub-test from the session.

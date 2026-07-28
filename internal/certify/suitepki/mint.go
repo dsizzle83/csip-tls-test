@@ -170,6 +170,19 @@ func (h *Hierarchy) IssuerFor(shape ChainShape) (*CA, error) {
 // BasicConstraints pathLenConstraint, which is what stops a MICA from being
 // used as an MCA.
 func NewCA(name string, parent *CA, pathLen int) (*CA, error) {
+	return NewCAExt(name, parent, pathLen, nil)
+}
+
+// NewCAExt is NewCA with extra extensions emitted verbatim into the CA
+// certificate.
+//
+// It exists for the COMM-004 D/E/F fixtures, whose entire content is an
+// intermediate CA carrying one deliberately non-conformant extension: a
+// critical extendedKeyUsage naming a meaningless purpose, a non-critical
+// nameConstraints, a non-critical policyMappings mapping anyPolicy. See
+// servechain.go, which constructs those and records the clause of RFC 5280
+// that condemns each one.
+func NewCAExt(name string, parent *CA, pathLen int, extra []pkix.Extension) (*CA, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("suitepki: generate %s key: %w", name, err)
@@ -189,6 +202,7 @@ func NewCA(name string, parent *CA, pathLen int) (*CA, error) {
 		IsCA:                  true,
 		MaxPathLen:            pathLen,
 		MaxPathLenZero:        pathLen == 0,
+		ExtraExtensions:       extra,
 	}
 	signer, issuer := key, tmpl
 	if parent != nil {
@@ -200,6 +214,13 @@ func NewCA(name string, parent *CA, pathLen int) (*CA, error) {
 	}
 	cert, err := x509.ParseCertificate(der)
 	if err != nil {
+		// Deliberately strict, even though this constructor now mints
+		// deliberately non-conformant CAs. A CA is used as an ISSUER — the
+		// caller signs a leaf with it, and x509.CreateCertificate needs the
+		// parsed parent to do that — so a CA whose own certificate does not
+		// re-parse cannot be used at all, and saying so here beats a nil
+		// dereference two calls later. The COMM-004 defects are wrong in ways
+		// a parser accepts and a VERIFIER must reject, which is the point.
 		return nil, fmt.Errorf("suitepki: re-parse %s: %w", name, err)
 	}
 	return &CA{Name: name, Cert: cert, DER: der, Key: key, Parent: parent}, nil
@@ -341,6 +362,23 @@ func Mint(issuer *CA, spec LeafSpec) (*Leaf, error) {
 	if issuer == nil {
 		return nil, fmt.Errorf("suitepki: Mint needs an issuing CA")
 	}
+	return mintLeaf(issuer, spec)
+}
+
+// MintSelfSigned issues an END-ENTITY certificate signed by its own key: its
+// issuer is itself, and it chains to nothing.
+//
+// This is not NewCA with IsCA false. A CA certificate self-signs as a matter of
+// course and says so in BasicConstraints; this is the deliberate anomaly of a
+// device certificate that is its own issuer with CA=false, which is exactly
+// what COMM-004 sub-test G means by "a self-signed device certificate with no
+// chain to a trusted SERCA". The resulting Leaf has a nil Issuer, so ChainDER
+// yields the single certificate and nothing else — which is the whole fixture.
+func MintSelfSigned(spec LeafSpec) (*Leaf, error) { return mintLeaf(nil, spec) }
+
+// mintLeaf is the shared body. A nil issuer signs the certificate with its own
+// key, making it self-issued and self-signed.
+func mintLeaf(issuer *CA, spec LeafSpec) (*Leaf, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("suitepki: generate %s key: %w", spec.Name, err)
@@ -407,7 +445,13 @@ func Mint(issuer *CA, spec LeafSpec) (*Leaf, error) {
 	}
 	tmpl.ExtraExtensions = append(tmpl.ExtraExtensions, spec.ExtraExtensions...)
 
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, issuer.Cert, &key.PublicKey, issuer.Key)
+	// A nil issuer means self-signed: the template is its own parent and the
+	// leaf's own key is the signer.
+	issuerCert, signerKey := tmpl, key
+	if issuer != nil {
+		issuerCert, signerKey = issuer.Cert, issuer.Key
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, issuerCert, &key.PublicKey, signerKey)
 	if err != nil {
 		return nil, fmt.Errorf("suitepki: sign leaf %s: %w", spec.Name, err)
 	}

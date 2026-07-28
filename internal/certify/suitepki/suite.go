@@ -292,16 +292,10 @@ func benchIdentities(rc *certify.RunCtx, n int) []*tlsCertificate {
 // something must issue it under this root; a freshly minted hierarchy can only
 // ever demonstrate refusal.
 func benchRoot(rc *certify.RunCtx) (*CA, string) {
-	if rc.PKI == nil || rc.PKI.CA == "" {
+	if rc.PKI == nil {
 		return nil, "no mbaps certificate fixtures are configured (-pki)"
 	}
-	keyPath := strings.TrimSuffix(rc.PKI.CA, "-cert.pem") + "-key.pem"
-	ca, err := AdoptCAFromFiles("bench root CA", rc.PKI.CA, keyPath)
-	if err != nil {
-		return nil, fmt.Sprintf("the bench root CA's private key is not available (%v) — this check can only "+
-			"mint material the DUT is required to REJECT, not material it is required to ACCEPT", err)
-	}
-	return ca, ""
+	return BenchRoot(rc.PKI.CA)
 }
 
 // summarise renders a list of observations as one line for a report.

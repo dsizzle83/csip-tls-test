@@ -197,6 +197,39 @@ func (a *AdminClient) LogEvents(ctx context.Context, out any) error {
 	return a.Get(ctx, "logevents", out)
 }
 
+// Chain reads GET /admin/chain: which certificate chain the bench's 2030.5
+// server is presenting to NEW connections, and which one it started with.
+//
+// A gridsim predating the lever answers 404; one whose binary has no TLS data
+// plane wired to it answers 501. Both arrive here as an error, and a check MUST
+// establish that this call succeeded before running a rejection sub-test:
+// driving COMM-004 D/E/F/G against a bench that never installed the fixture
+// would credit the DUT with a rejection it was never asked to make.
+func (a *AdminClient) Chain(ctx context.Context, out any) error {
+	return a.Get(ctx, "chain", out)
+}
+
+// SwapChain posts a chain to /admin/chain. body carries label, cert_pem and
+// key_pem; gridsim owns that schema, so it is not modelled here.
+//
+// Every caller MUST pair this with a DEFERRED RestoreChain. A bench left
+// presenting a fixture chain fails every conformance case that runs after it,
+// including other agents' — which is a far worse outcome than the single failed
+// case an un-restored bench was ever going to save.
+func (a *AdminClient) SwapChain(ctx context.Context, body, out any) error {
+	return a.Post(ctx, "chain", body, out)
+}
+
+// RestoreChain posts {"restore":true} to /admin/chain, reinstalling the chain
+// the bench's 2030.5 server started with.
+//
+// It deliberately takes no argument beyond the context: it is the call a
+// cleanup path makes, and a cleanup path must not depend on state the check
+// that failed was supposed to have kept.
+func (a *AdminClient) RestoreChain(ctx context.Context, out any) error {
+	return a.Post(ctx, "chain", map[string]any{"restore": true}, out)
+}
+
 // Raw is the escape hatch for admin endpoints this client does not name.
 func (a *AdminClient) Raw(ctx context.Context, method, path string, body any) ([]byte, error) {
 	return a.do(ctx, method, path, body)

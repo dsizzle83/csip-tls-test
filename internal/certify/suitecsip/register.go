@@ -17,7 +17,10 @@ package suitecsip
 // last, because it is the only one that deliberately makes the server misbehave
 // and the only one whose failure mode could perturb what follows.
 
-import "csip-tls-test/internal/certify"
+import (
+	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/certify/suitepki"
+)
 
 // Suite is this suite's short name, used for -suite selection and printed in
 // the report.
@@ -52,21 +55,27 @@ func Register(reg *certify.Registry) {
 		certify.WithRequires(needCapture...), certify.WithOrder(5))
 	reg.Register(uid("COMM-004C"), Suite, commChainDepth(4, "SERCA -> MCA -> MICA -> device certificate"),
 		certify.WithRequires(needCapture...), certify.WithOrder(6))
+	// D/E/F/G present a non-conformant chain through gridsim's runtime chain
+	// lever and restore the bench afterwards; see commChainRejection and
+	// chainswap.go. The second argument selects which fixture suitepki mints,
+	// and the two must agree — a row whose PROSE says extendedKeyUsage while
+	// its fixture carries a policy mapping would report a verdict about the
+	// wrong defect. TestRejectionRowsPresentTheDefectTheyName pins the pairing.
 	reg.Register(uid("COMM-004D"), Suite,
 		commChainRejection("a MICA whose extendedKeyUsage extension is marked critical with an invalid value",
-			"a chain with an invalid critical MICA extendedKeyUsage"),
+			suitepki.MICAEKUCritical),
 		certify.WithRequires(needCapture...), certify.WithOrder(7))
 	reg.Register(uid("COMM-004E"), Suite,
 		commChainRejection("a MICA whose name extension is non-critical with an invalid value",
-			"a chain with an invalid non-critical MICA name extension"),
+			suitepki.MICANameNonCritical),
 		certify.WithRequires(needCapture...), certify.WithOrder(8))
 	reg.Register(uid("COMM-004F"), Suite,
 		commChainRejection("a MICA whose policy-mapping extension is non-critical with an invalid value",
-			"a chain with an invalid non-critical MICA policy mapping"),
+			suitepki.MICAPolicyMapping),
 		certify.WithRequires(needCapture...), certify.WithOrder(9))
 	reg.Register(uid("COMM-004G"), Suite,
 		commChainRejection("a self-signed device certificate with no chain to a trusted SERCA",
-			"a self-signed device certificate"),
+			suitepki.SelfSignedLeaf),
 		certify.WithRequires(needCapture...), certify.WithOrder(10))
 
 	// ── Discovery core (order 20–39) ─────────────────────────────────────
