@@ -253,6 +253,54 @@ func (s *Server) SetAdvertisedPollRate(seconds uint32) {
 		"(DeviceCapability, Time, DERControlList)", seconds, n)
 }
 
+// AdvertisedPollRate returns the pollRate, in seconds, that a client in
+// poll_rate_mode "honor" will pace its whole-tree walk at — 0 when the tree
+// advertises none at all.
+//
+// It is the MAXIMUM over the resource classes such a client's pacing looks at,
+// for the reason SetAdvertisedPollRate gives at length: lexa-gw takes the
+// maximum so that no resource is fetched more often than its server asked for,
+// which means one DERControlList still saying 300 pins the walk to 300 however
+// fast /dcap says to go. The extended (curve-linked) list counts too — POST
+// /admin/curve installs one with a hardcoded 60, so a tree that has been
+// curve-bound may advertise something other than what -poll-rate-s set.
+//
+// This exists so the number is ASKABLE. A conformance harness sizing an
+// observation window around "the DUT's cadence" was reading the DUT's own
+// configured discovery interval, which under poll_rate_mode "honor" is only a
+// floor — the rate the walk actually keeps is this one, and it is the server's
+// to choose. A harness that derives a window from the wrong one waits
+// confidently for a walk that was never going to arrive inside it, and records
+// the silence as a fact about the device.
+func (s *Server) AdvertisedPollRate() uint32 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.advertisedPollRateLocked()
+}
+
+// advertisedPollRateLocked is AdvertisedPollRate for callers already holding
+// s.mu — the admin status handler holds it for the whole response.
+func (s *Server) advertisedPollRateLocked() uint32 {
+	var top uint32
+	for _, r := range s.resources {
+		var pr uint32
+		switch v := r.(type) {
+		case *model.DeviceCapability:
+			pr = v.PollRate
+		case *model.Time:
+			pr = v.PollRate
+		case *model.DERControlList:
+			pr = v.PollRate
+		case *model.ExtendedDERControlList:
+			pr = v.PollRate
+		}
+		if pr > top {
+			top = pr
+		}
+	}
+	return top
+}
+
 // rebuildEndDeviceList reconstructs the /edev resource with the current
 // ClientLFDI and clientSFDI. Caller must hold s.mu for writing.
 func (s *Server) rebuildEndDeviceList() {

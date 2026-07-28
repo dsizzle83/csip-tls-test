@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	model "lexa-proto/csipmodel"
 )
 
 // Regression for audit finding GS-1: watt values above int16 range were
@@ -288,4 +290,79 @@ func TestAdminAlerts_RecordsCannotComply(t *testing.T) {
 	if !bytes.Contains(rec.Body.Bytes(), []byte("EVT-2")) {
 		t.Errorf("/admin/alerts body missing the alert: %s", rec.Body.String())
 	}
+}
+
+// TestAdminStatus_PublishesTheAdvertisedPollRate: the rate a poll_rate_mode
+// "honor" client keeps is the SERVER's, so the server is the only honest place
+// to ask. A conformance harness sizing an observation window used to read the
+// DUT's own configured interval, which is a floor — and waited for a walk the
+// server had told the device not to make.
+func TestAdminStatus_PublishesTheAdvertisedPollRate(t *testing.T) {
+	s := NewServer("")
+
+	// The stock tree already advertises something; whatever it is, the status
+	// endpoint must report the same number the client's pacing would compute.
+	if got, want := advertisedFromStatus(t, s), s.AdvertisedPollRate(); got != want {
+		t.Fatalf("/admin/status poll_rate_s = %d, want %d", got, want)
+	}
+	stock := s.AdvertisedPollRate()
+	if stock == 0 {
+		t.Fatal("the stock tree advertises no pollRate at all, so a client honouring it has nothing to pace to")
+	}
+
+	s.SetAdvertisedPollRate(60)
+	if got := advertisedFromStatus(t, s); got != 60 {
+		t.Errorf("after -poll-rate-s 60 the status reports %d, want 60", got)
+	}
+	if stock <= 60 {
+		t.Fatalf("the stock advertised rate is %d: this test cannot show that the maximum, not the "+
+			"minimum, governs", stock)
+	}
+}
+
+// TestAdvertisedPollRateIsTheSlowestAdvertisement pins the rule the DUT
+// applies: it paces at the MAXIMUM advertised rate, so one resource left at 300
+// holds the whole walk to 300 however fast /dcap says to go. Reading the
+// minimum here would tell a harness to wait a fifth of the time the device
+// takes.
+func TestAdvertisedPollRateIsTheSlowestAdvertisement(t *testing.T) {
+	s := NewServer("")
+	s.SetAdvertisedPollRate(60)
+	if got := s.AdvertisedPollRate(); got != 60 {
+		t.Fatalf("AdvertisedPollRate = %d, want 60", got)
+	}
+
+	// One DERControlList left behind at 300 — exactly the case the fast path
+	// misses — must drag the answer back up to 300.
+	s.mu.Lock()
+	for path, r := range s.resources {
+		if l, ok := r.(*model.DERControlList); ok {
+			l.PollRate = 300
+			t.Logf("left %s advertising 300", path)
+			break
+		}
+	}
+	s.mu.Unlock()
+	if got := s.AdvertisedPollRate(); got != 300 {
+		t.Errorf("AdvertisedPollRate = %d, want 300: the slowest advertisement paces the walk", got)
+	}
+	if got := advertisedFromStatus(t, s); got != 300 {
+		t.Errorf("/admin/status poll_rate_s = %d, want 300", got)
+	}
+}
+
+func advertisedFromStatus(t *testing.T, s *Server) uint32 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.AdminHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/admin/status", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /admin/status = %d", rec.Code)
+	}
+	var got struct {
+		PollRateS uint32 `json:"poll_rate_s"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	return got.PollRateS
 }

@@ -147,6 +147,13 @@ type adminProgInfo struct {
 type adminStatusResp struct {
 	Programs   []adminProgInfo `json:"programs"`
 	ServerTime int64           `json:"server_time"`
+	// PollRateS is the pollRate this server ADVERTISES, which is the cadence a
+	// client in poll_rate_mode "honor" keeps. It is published because this is
+	// the only place the number is authoritative: the client's own configured
+	// discovery interval is a floor, not the rate, and a harness that sizes an
+	// observation window from the floor waits for a walk the server itself told
+	// the device not to make. See Server.AdvertisedPollRate.
+	PollRateS uint32 `json:"poll_rate_s"`
 }
 
 var progMeta = []struct {
@@ -210,6 +217,7 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(adminStatusResp{
 		Programs:   programs,
 		ServerTime: s.Now(),
+		PollRateS:  s.advertisedPollRateLocked(),
 	})
 }
 

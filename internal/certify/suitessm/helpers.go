@@ -311,6 +311,12 @@ func watchClientHalf(ctx context.Context, rc *certify.RunCtx) *clientHalf {
 		// bounds the reconnect from below; several of them is the honest
 		// derivation, and the number is reported either way.
 		Periods: 4,
+		// ServerPollRate stays FALSE, deliberately. This is the gateway's own
+		// southbound poll loop: nothing on the 2030.5 side advertises a rate
+		// for it, and folding a northbound pollRate into this window would be
+		// the same category of error as deriving the northbound window from a
+		// configured floor — a cadence borrowed from the wrong protocol.
+		ServerPollRate: false,
 	})
 	c.WaitWhy = why
 	start := time.Now()

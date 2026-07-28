@@ -573,6 +573,12 @@ func observeIdentity(ctx context.Context, rc *certify.RunCtx, label string) *ide
 		Field:      "discovery_interval_s",
 		Fallback:   90 * time.Second,
 		Param:      "pki.identity_wait",
+		// This is the walk whose rate the SERVER sets: the DUT ships in
+		// poll_rate_mode "honor", so discovery_interval_s bounds the rate from
+		// below and gridsim's advertised pollRate is what the client keeps to.
+		// Derived from the floor alone, this window was only ever long enough
+		// because the bench happens to launch gridsim with -poll-rate-s 60.
+		ServerPollRate: true,
 	})
 	src.WaitWhy = why
 	start := time.Now()
