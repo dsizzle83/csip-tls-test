@@ -4,15 +4,19 @@
 // machine-checkable mapping from each test case to the exact frames and wire
 // facts that demonstrate its pass criteria.
 //
-// # The five things it does
+// # The six things it does
 //
 //	certify -list                                   what the catalog contains, and what is implemented
 //	certify -doc SSM-CONF-v0.8 -dry-run             what a selection would run, and the gaps
 //	certify -target 69.0.0.2:802 -iface enp1s0 -out runs/<ts>/    a real run
 //	certify -verify runs/<ts>/                      re-verify a bundle, standalone
 //	certify -report runs/<ts>/ -config lab.json     emit the SunSpec submission report
+//	certify -trr runs/<ts>/ -trr-out pkg/ -config lab.json
+//	                                                build the whole Test Results Report package:
+//	                                                both Results Reporting specifications, from
+//	                                                one or more bundles
 //
-// The five are mutually exclusive and the parser says so, because "-verify a
+// The six are mutually exclusive and the parser says so, because "-verify a
 // bundle while also running a campaign" has no meaning and guessing which the
 // operator wanted is exactly the sort of helpfulness that produces evidence
 // nobody can explain.
@@ -120,9 +124,12 @@ type cli struct {
 	opts certify.Options
 
 	// Mode selectors.
-	list     bool
-	verify   string
-	report   string
+	list   bool
+	verify string
+	report string
+	// trr names the evidence bundles a Test Results Report package is built
+	// from, each optionally narrowed to some of its documents as `dir=<doc-key>`.
+	trr      []string
 	showCaps bool
 
 	// target is an alias for -gateway, because "the target" is what an operator
@@ -134,6 +141,7 @@ type cli struct {
 	// Report generation.
 	configPath      string
 	reportOut       string
+	trrOut          string
 	certType        string
 	allowIncomplete bool
 	deriveLogs      bool
@@ -197,6 +205,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return c.runVerify(stdout, stderr)
 	case c.report != "":
 		return c.runReport(stdout, stderr)
+	case len(c.trr) > 0:
+		return c.runTRR(stdout, stderr)
 	default:
 		return c.runCampaign(stdout, stderr)
 	}
@@ -206,6 +216,9 @@ func (c *cli) bindFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.list, "list", false, "list the catalog and what this tool implements, then exit")
 	fs.StringVar(&c.verify, "verify", "", "re-verify an evidence bundle directory standalone, then exit")
 	fs.StringVar(&c.report, "report", "", "generate the SunSpec submission report from an evidence bundle directory, then exit")
+	fs.Var(repeatFlag{&c.trr}, "trr",
+		"build a Test Results Report package from an evidence bundle: `dir[=doc-key,…]` (repeat for more bundles)")
+	fs.StringVar(&c.trrOut, "trr-out", "", "where -trr writes the Test Results Report package (required)")
 	fs.BoolVar(&c.showCaps, "capabilities", false, "print the capability tags this invocation has, and which checks they gate")
 
 	fs.StringVar(&c.target, "target", "", "DUT address host:port (alias for -gateway; wins when both are given)")
@@ -251,6 +264,28 @@ func (l listFlag) Set(v string) error {
 	return nil
 }
 
+// repeatFlag is a repeatable string flag that does NOT split on commas.
+//
+// -trr needs it: its value is `dir=<doc-key>,<doc-key>` and a comma-splitting
+// flag would tear the document list off the directory it narrows, leaving the
+// second key parsed as a bundle path. One flag per bundle is also the honest
+// spelling — each occurrence names one campaign.
+type repeatFlag struct{ v *[]string }
+
+func (r repeatFlag) String() string {
+	if r.v == nil {
+		return ""
+	}
+	return strings.Join(*r.v, " ")
+}
+
+func (r repeatFlag) Set(v string) error {
+	if v = strings.TrimSpace(v); v != "" {
+		*r.v = append(*r.v, v)
+	}
+	return nil
+}
+
 // resolve applies the cross-flag rules: mode exclusivity, the -target alias,
 // the output directory, and the DUT record.
 func (c *cli) resolve() error {
@@ -263,6 +298,9 @@ func (c *cli) resolve() error {
 	}
 	if c.report != "" {
 		modes = append(modes, "-report")
+	}
+	if len(c.trr) > 0 {
+		modes = append(modes, "-trr")
 	}
 	if c.showCaps {
 		modes = append(modes, "-capabilities")
@@ -433,6 +471,10 @@ func usage(w io.Writer, fs *flag.FlagSet) {
   certify -verify runs/2026-07-26/               re-verify a bundle from nothing but itself
   certify -report runs/2026-07-26/ -config lab.json
                                                  emit the SunSpec submission report
+  certify -trr runs/csip/=csip-conf-v1.3 -trr runs/full/ -trr-out runs/trr -config lab.json
+                                                 build the Test Results Report package: both
+                                                 Results Reporting specifications, from several
+                                                 bundles, with the verdict mapping stated in it
 
   certify -no-capture -suite modbus-server -target 127.0.0.1:5020 -param modbus.transport=plain
                                                  logic-only run against a loopback sim
