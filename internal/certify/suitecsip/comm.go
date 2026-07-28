@@ -407,7 +407,8 @@ func critRejectionUnexercised() criterion {
 		Claim: "the DUT rejects a peer certificate chain with an invalid MICA extension or a self-signed " +
 			"device certificate (COMM-004 sub-tests D, E, F, G)",
 		How: "a fatal TLS alert, a TCP disconnect, or an HTTP 403 from the DUT in response to a " +
-			"non-conformant chain — the alternatives the published erratum admits alongside the alert",
+			"non-conformant chain — the alternatives the published erratum (Annex A, seq 7) admits " +
+			"alongside the alert",
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 			if a, ok := firstFatalAlert(t); ok {
 				return found(certify.Warn, a.Packets,
@@ -523,9 +524,11 @@ func commChainRejection(what, fixture string) certify.Check {
 				return []criterion{
 					{
 						Claim: "the DUT rejects a peer presenting " + what + " and establishes no 2030.5 session",
-						How: "a fatal TLS alert from the DUT, or a TCP disconnect, or an HTTP 403 — the three " +
-							"signals the procedure's published erratum (seq 7) admits — with no DeviceCapability " +
-							"payload on the wire afterwards",
+						How: "a fatal TLS alert from the DUT, or a TCP disconnect, or an HTTP 403 SENT BY THE " +
+							"DUT — the three signals the procedure's published erratum (Annex A, seq 7) admits, " +
+							"\"A TCP port disconnect or HTTP 403 shall be an acceptable alternative to a TLS " +
+							"alert for notification of invalid certificates\" — with no DeviceCapability payload " +
+							"on the wire afterwards",
 						Wire: func(ev *certify.Evidence, t *Transcript) Finding {
 							if !servedFixture(t, fixture) {
 								return unavailable("the bench server presented its normal chain (%s), not %s, so "+
@@ -563,27 +566,84 @@ func servedFixture(t *Transcript, fixture string) bool {
 
 // rejectionFinding decides a rejection sub-test from the session.
 //
-// It implements the procedure's published erratum (seq 7): a fatal TLS alert is
-// the primary signal, but a TCP disconnect and an HTTP 403 are equally
-// acceptable notifications of an invalid certificate, and a check that failed a
-// DUT for choosing one of the admitted alternatives would be reporting the
-// PROCEDURE's narrowness as the device's non-conformance.
+// It implements the procedure's published erratum (Annex A, seq 7), which adds
+// as COMM-004's new FIRST Pass/Fail bullet:
+//
+//	"A TCP port disconnect or HTTP 403 shall be an acceptable alternative
+//	 to a TLS alert for notification of invalid certificates."
+//
+// All three signals are therefore accepted. A check that failed a DUT for
+// choosing one of the admitted alternatives would be reporting the PROCEDURE's
+// narrowness as the device's non-conformance.
+//
+// # The direction rule on the 403 arm
+//
+// A 403 is a notification sent BY the party that rejected the certificate, so
+// it evidences the DUT's rejection only when the DUT sent it. In this suite the
+// DUT is the 2030.5 CLIENT — it dials out, and RecoverSession therefore parses
+// its direction as REQUESTS and the peer's as RESPONSES — so a 403 recovered
+// here was sent by the BENCH about the DUT's own credential, which is the
+// mirror image of the fact under test. It is reported, because a reviewer
+// needs to see it, and it is NOT accepted as the DUT's rejection: crediting the
+// DUT for the bench's 403 is the looser reading and the erratum does not ask
+// for it. The arm fires as a PASS only for a 403 the DUT itself emitted, which
+// is the [S]/[A] topology of the same row.
 func rejectionFinding(ev *certify.Evidence, t *Transcript) Finding {
 	if a, ok := firstFatalAlert(t); ok {
 		return found(certify.Pass, a.Packets, "the DUT sent a fatal TLS alert: %s", a)
 	}
+	if m, ok := dutForbade(t); ok {
+		// Cited by frame, not by citeMessage: a DUT-SENT response travels on
+		// the DUT's own direction, and citeMessage picks the direction from the
+		// message KIND — which would point a reader at the peer's byte stream.
+		f := found(certify.Pass, m.Frames,
+			"the DUT answered %s, the HTTP 403 the procedure's erratum (seq 7) admits as an acceptable "+
+				"alternative to a TLS alert for notification of an invalid certificate", m.Line())
+		if t.ClientDir != nil && m.CipherEnd > m.CipherStart {
+			f.Dir, f.Start, f.End = t.ClientDir, m.CipherStart, m.CipherEnd
+		}
+		return f
+	}
+	peer403 := ""
+	if m, ok := peerForbade(t); ok {
+		peer403 = fmt.Sprintf("; the PEER answered %s, which is the bench rejecting the DUT's credential "+
+			"rather than the DUT rejecting the bench's and is not this criterion's evidence", m.Line())
+	}
 	if t.Handshake.Complete && (t.ClientAppRecords > 0 || t.ServerAppRecords > 0) {
 		return found(certify.Fail, t.Handshake.ServerCertFrames,
 			"the DUT ACCEPTED the non-conformant chain: the handshake completed and %d/%d application-data "+
-				"records were exchanged", t.ClientAppRecords, t.ServerAppRecords)
+				"records were exchanged%s", t.ClientAppRecords, t.ServerAppRecords, peer403)
 	}
 	if fin := teardownFrames(ev, t); len(fin) > 0 {
 		return found(certify.Pass, fin,
 			"the DUT sent no alert but closed the TCP connection (FIN/RST in frame %v) without completing the "+
-				"handshake, which the procedure's erratum admits as an acceptable rejection signal", fin)
+				"handshake, which the procedure's erratum (seq 7) admits as an acceptable rejection signal%s",
+			fin, peer403)
 	}
 	return found(certify.Fail, t.Handshake.ClientHelloFrames,
-		"the DUT neither completed the handshake nor signalled a rejection; the connection simply stopped")
+		"the DUT neither completed the handshake nor signalled a rejection; the connection simply stopped%s",
+		peer403)
+}
+
+// dutForbade returns the first HTTP 403 the DUT ITSELF sent, if any.
+//
+// The DUT's direction is parsed as requests in the client topology this suite
+// runs, so this is empty there by construction — deliberately, see
+// rejectionFinding's direction rule. It reads t.DUTResponses so that the day a
+// server-role recovery populates them, the erratum's third signal is decided by
+// this function with no further change.
+func dutForbade(t *Transcript) (*Message, bool) { return firstForbidden(t.DUTResponses) }
+
+// peerForbade returns the first HTTP 403 the DUT's PEER sent.
+func peerForbade(t *Transcript) (*Message, bool) { return firstForbidden(t.Responses) }
+
+func firstForbidden(ms []*Message) (*Message, bool) {
+	for _, m := range ms {
+		if m != nil && m.Status == 403 {
+			return m, true
+		}
+	}
+	return nil, false
 }
 
 // teardownFrames returns this check's frames that carry a FIN or RST.

@@ -180,6 +180,15 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 // that reports NOT APPLICABLE and quotes the catalog's own applicability_reason
 // reads as a decision a reviewer can check against the profile matrix — and
 // disagree with, which is the point.
+//
+// It also prints the row's published ERRATA. Most of these rows are excluded
+// only because the DUT is scoped as a direct DER client, and the §4 matrix
+// marks several of them required for a DER AGGREGATOR client. The day that
+// scoping changes, whoever implements the row will read its `steps` and
+// `expected` — which are, correctly, a verbatim extraction of the UNAMENDED
+// printed procedure — and would implement a body Annex A has already
+// corrected. Printing the corrections on the N/A row puts them in front of that
+// reader, and in the bundle, before the row goes live.
 func notApplicable(_ context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	reason := strings.TrimSpace(rc.Case.ApplicabilityReason)
 	if reason == "" {
@@ -187,14 +196,42 @@ func notApplicable(_ context.Context, rc *certify.RunCtx) (certify.Result, error
 	}
 	return certify.Result{
 		Verdict: certify.Skip,
-		Notes: fmt.Sprintf("NOT APPLICABLE to this DUT (%s). %s",
-			roleWord(rc.Case), reason),
+		Notes: fmt.Sprintf("NOT APPLICABLE to this DUT (%s). %s%s",
+			roleWord(rc.Case), reason, errataBreadcrumb(rc)),
 		OffWire: true,
 		OffWireReason: "applicability is a property of the profile matrix in CSIP Conformance Test Procedures " +
 			"V1.3 §4 and of what the DUT implements, not of any exchange on the wire. Asserting it from a " +
 			"capture is not possible and pretending otherwise would be the dishonest option; the catalog's " +
 			"applicability_reason above is the auditable record of the decision",
 	}, nil
+}
+
+// errataBreadcrumb renders the row's client-relevant published corrections, or
+// "" when it has none.
+//
+// A check MUST honour the errata for the case it implements — running the
+// uncorrected step and calling the result a conformance failure would be the
+// harness's bug, not the DUT's — and the rows this suite reports NOT APPLICABLE
+// have no check to honour them yet. This is the record that survives until one
+// exists.
+func errataBreadcrumb(rc *certify.RunCtx) string {
+	er := rc.Errata()
+	if len(er) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, " PUBLISHED ERRATA that a future implementation of this row MUST honour "+
+		"(CSIP Conformance Test Procedures V1.3, Annex A — Errata I, pp. 226-234); the catalog's steps "+
+		"and expected criteria are the UNAMENDED printed text and must be read through these %d "+
+		"correction(s):", len(er))
+	for _, e := range er {
+		fmt.Fprintf(&b, " [seq %d] %s → %s", e.Seq,
+			strings.TrimSpace(e.Description), strings.Join(e.CorrectiveAction, " "))
+		if impact := strings.TrimSpace(e.ObservableImpact); impact != "" {
+			fmt.Fprintf(&b, " (observable impact: %s)", impact)
+		}
+	}
+	return b.String()
 }
 
 func roleWord(c *certify.Case) string {

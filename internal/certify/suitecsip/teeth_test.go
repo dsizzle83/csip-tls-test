@@ -482,6 +482,51 @@ func TestChainRejectionDetectorHasTeeth(t *testing.T) {
 	}
 }
 
+// TestChainRejectionAcceptsTheErratumsThirdSignal exercises the HTTP 403 arm
+// COMM-004's published erratum (Annex A, seq 7) adds beside the TLS alert and
+// the TCP disconnect: "A TCP port disconnect or HTTP 403 shall be an acceptable
+// alternative to a TLS alert for notification of invalid certificates."
+//
+// Both directions are tested, because the direction is the whole point: a 403
+// is a notification sent BY the party that rejected the certificate.
+func TestChainRejectionAcceptsTheErratumsThirdSignal(t *testing.T) {
+	ev := &certify.Evidence{Case: &certify.Case{UID: "x"}, Index: certify.NewFrameIndex(nil),
+		Set: (&certify.Attribution{}).Set("x")}
+	forbidden := func(kind MessageKind, frames []int) *Message {
+		return &Message{Kind: kind, Proto: "HTTP/1.1", Status: 403, Reason: "Forbidden", Frames: frames}
+	}
+
+	// The DUT itself answered 403 without ever completing a handshake it should
+	// have refused — the erratum's third signal, and a PASS.
+	byDUT := &Transcript{DUTResponses: []*Message{forbidden(Response, []int{11})}}
+	f := rejectionFinding(ev, byDUT)
+	if f.Verdict != certify.Pass {
+		t.Errorf("a 403 sent BY THE DUT was not accepted as a rejection: %s %s", f.Verdict, f.Observed)
+	}
+	if len(f.Frames) != 1 || f.Frames[0] != 11 {
+		t.Errorf("the 403's frame was not cited: %v", f.Frames)
+	}
+	if !strings.Contains(f.Observed, "403") {
+		t.Errorf("the finding does not name the status it rests on: %q", f.Observed)
+	}
+
+	// A 403 the PEER sent is the bench refusing the DUT's credential — the
+	// mirror image of the fact under test. It must be reported and must NOT
+	// rescue a DUT that accepted the non-conformant chain.
+	byPeer := &Transcript{
+		Handshake:        Handshake{Complete: true, ServerCertFrames: []int{4}, ServerChain: [][]byte{[]byte("bad")}},
+		ClientAppRecords: 2, ServerAppRecords: 2,
+		Responses:        []*Message{forbidden(Response, []int{7})},
+	}
+	f = rejectionFinding(ev, byPeer)
+	if f.Verdict != certify.Fail {
+		t.Errorf("a peer-sent 403 rescued a DUT that ACCEPTED the chain: %s %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "PEER") {
+		t.Errorf("the peer's 403 is not reported to the reader: %q", f.Observed)
+	}
+}
+
 func TestChainDepthDeclinesOnTheWrongFixture(t *testing.T) {
 	// The check for a 4-deep chain must NOT pass because a 2-deep chain worked.
 	two := handshake(conformantHandshake())

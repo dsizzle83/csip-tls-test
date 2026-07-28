@@ -303,17 +303,53 @@ func registerEventScenarios(reg *certify.Registry) {
 // them applicable shows up as a coverage GAP — a loud, visible one — instead of
 // being silently swallowed by a rule that reads applicability from the same
 // file it is meant to be checked against.
+// BEFORE ANY OF THESE GOES LIVE — read Annex A. Most are excluded only because
+// the DUT is scoped as a direct DER client; the §4 matrix marks several of them
+// required for a DER AGGREGATOR client, and a re-scope makes them real
+// overnight. The catalog's steps/expected for a row are a verbatim extraction
+// of the printed, UNAMENDED procedure, so an implementation written straight
+// from them would implement a body the errata have already corrected. The
+// corrections are attached to each row in the catalog, notApplicable prints
+// them into the bundle (see errataBreadcrumb), and errata_test.go pins the four
+// that change an OBSERVABLE. The ones flagged inline below are those four.
 var inapplicableUIDs = []string{
 	// Aggregator-client rows: the DUT is a direct DER client (CSIP G1 — a DER
 	// client connects in one and only one scenario).
 	"AGG-001", "AGG-002", "AGG-003", "AGG-004", "AGG-005", "AGG-006",
+	// ERRATA (seq 5 / seq 6): AGG-007 and AGG-008 procedure step 6 and their
+	// pass/fail bullets are corrected from Response status 7 (Event Superseded)
+	// to status 14 (Event Superseded from another program) — the superseded
+	// control belongs to a DIFFERENT DERProgram and supersession is known
+	// before start. A check asserting 7 would fail a conformant aggregator.
+	// Contrast AGG-009, which keeps 7 because its event had already started.
 	"AGG-007", "AGG-008", "AGG-009", "AGG-010", "AGG-011", "AGG-012",
 	// 2030.5-SERVER rows: these test the utility server's own HTTP behaviour.
 	"CORE-001", "CORE-002", "CORE-004", "UTIL-001",
 	// Subscription rows: subscription is MAY for a direct DER client
 	// (CSIP Table 7) and this DUT polls.
-	"CORE-018", "CORE-019", "ERR-002",
+	//
+	// ERRATA (seq 44): "The 204 response is not included in the WADL" —
+	// "Remove the acceptance of 204 response in Procedure and Pass/Fail
+	// Criteria". CORE-018/CORE-019 must NOT accept 204 for the notification
+	// exchanges. This is a TIGHTENING, and it is narrowly scoped: erratum
+	// seq 23 ADDS a 204 expectation for CORE-014's PUTs of DERCapability and
+	// DERSettings, which critDERPut (criteria_2030.go) already implements.
+	// CORE-019 also carries seq 42: "Remove steps 10 and 11" — a subordinate
+	// resource's change requires ONE notification, not a second for the parent
+	// EndDevice.
+	"CORE-018", "CORE-019",
+	// ERRATA (seq 38): "Remove Step 6" — the client is NOT required to re-POST
+	// a Subscription after the server cancels it with status 1. ERR-002's
+	// printed step 6 must not be demanded of a DUT.
+	"ERR-002",
 	// Maintenance rows: out-of-band and server-side operations.
+	//
+	// ERRATA (seq 32) on MAINT-002: "Test not required as it is unlikely for
+	// utilities to utilize the tested behavior. Make the test optional/remove
+	// entirely from the spec." It stays registered so the row is visible, but
+	// conformance must never be gated on it — including after the aggregator
+	// re-scope, where the §4 matrix leaves it required for nobody
+	// (der_client, der_aggregator_client and server are all false).
 	"MAINT-001", "MAINT-002", "MAINT-003", "MAINT-004", "MAINT-005",
 	// Utility/aggregator operations.
 	"UTIL-002", "UTIL-003", "UTIL-004",

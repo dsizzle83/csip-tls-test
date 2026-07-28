@@ -238,6 +238,16 @@ type Transcript struct {
 	Responses []*Message
 	Exchanges []Exchange
 
+	// DUTResponses are HTTP responses the DUT ITSELF sent on the connection it
+	// opened. In the ordinary client topology it is empty — the DUT dials out
+	// and only asks — and it is recovered at all because one published
+	// criterion turns on WHO sent a status. COMM-004's erratum (Annex A, seq 7)
+	// admits an HTTP 403 as an alternative to a TLS alert "for notification of
+	// invalid certificates", and a 403 evidences the DUT's rejection only when
+	// the DUT is the party that sent it. Keeping the two directions' responses
+	// apart is what stops a criterion crediting the DUT for the bench's answer.
+	DUTResponses []*Message
+
 	// AppRecords counts application-data records each way, which is the honest
 	// "something was exchanged" statement available without decryption.
 	ClientAppRecords int
@@ -765,6 +775,22 @@ func (t *Transcript) decrypt(ev *certify.Evidence) string {
 	}
 	reqStream := appStream(cp, frameTime)
 	respStream := appStream(sp, frameTime)
+
+	// The DUT direction is parsed as REQUESTS, because in this suite's topology
+	// the DUT dials out and asks. When the very first bytes it sent are a
+	// status line it is answering instead, and that direction is parsed as
+	// responses — see Transcript.DUTResponses for the criterion that turns on
+	// the distinction. The guard is a prefix test, not a fallback: a normal
+	// client stream never enters here, so it costs nothing and cannot pollute
+	// Requests or Problems.
+	if bytes.HasPrefix(reqStream.data, []byte("HTTP/1.")) {
+		dr, derr := parseMessages(Response, reqStream, nil)
+		if derr != nil {
+			t.Problems = append(t.Problems, derr.Error())
+		}
+		t.DUTResponses = dr
+		return ""
+	}
 
 	reqs, rerr := parseMessages(Request, reqStream, nil)
 	if rerr != nil {
