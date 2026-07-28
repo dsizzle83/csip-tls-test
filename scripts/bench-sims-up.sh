@@ -87,6 +87,19 @@ MODSIM3_API="${MODSIM3_API:-6041}"
 # a gridsim on the mbaps PKI (this script's -ca certs/mbaps) on a free port.
 GRIDSIM_PORT="${GRIDSIM_PORT:-11113}"
 GRIDSIM_ADMIN="${GRIDSIM_ADMIN:-11114}"
+# DER_MODELS: which SunSpec DER model set the modsims serve. Empty (default)
+# passes nothing and every modsim starts with -advanced exactly as it always
+# has, so the register image on a running bench does not change under anyone.
+# Set DER_MODELS=full to add the IEEE 1547-2018 trip models 707/708/709/710
+# (DERTripLV/HV/LF/HF, Category III default curves) — the fixture the gateway's
+# Stage-4 northbound 1547 mirror needs something to mirror FROM, and the reason
+# MOD-4 keeps 707-710 in its missing set. Adding them lengthens the SunSpec
+# chain every scenario walks, which is why it is opt-in rather than the default.
+#
+# build_if_missing below will NOT rebuild an existing bin/modsim, so after
+# pulling this change run `rm -f bin/modsim` (or `make build-modsim`) once, or
+# DER_MODELS=full silently starts a binary that does not know the flag.
+DER_MODELS="${DER_MODELS:-}"
 WITH_AGG="${WITH_AGG:-1}"
 AGG_ROLE="${AGG_ROLE:-GridServiceSunSpec}"
 AGG_CAMPAIGN="${AGG_CAMPAIGN:-$HERE/qa/aggregator/curtail-solar-50.json}"
@@ -145,7 +158,7 @@ MBAPS_SERIAL="${MBAPS_SERIAL:-BENCH-MBAPS-01}"
 MODSIM2_SERIAL="${MODSIM2_SERIAL:-BENCH-MODSIM-02}"
 MODSIM3_SERIAL="${MODSIM3_SERIAL:-BENCH-MODSIM-03}"
 echo "Bringing up sims (logs in $LOG, fleet size $SIM_FLEET):"
-start modsim   "$MODSIM_PORT"  ./bin/modsim   -port "$MODSIM_PORT" -advanced -wmax 8000 -serial "$MODSIM_SERIAL"
+start modsim   "$MODSIM_PORT"  ./bin/modsim   -port "$MODSIM_PORT" -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM_SERIAL"
 start mbapsdev "$MBAPS_PORT"   ./bin/mbapsdev -listen ":$MBAPS_PORT" -model inverter -wmax 6000 -serial "$MBAPS_SERIAL" \
                  -ca "$M/dev-ca.pem" -cert "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem"
 
@@ -161,9 +174,9 @@ if [ "$SIM_FLEET" = 4 ]; then
   #   EDA1 = modsim  :5020   EDA2 = modsim2 :5030
   #   EDB1 = modsim3 :5031   EDB2 = mbapsdev :8021
   start modsim2 "$MODSIM2_PORT" ./bin/modsim -port "$MODSIM2_PORT" -api-port "$MODSIM2_API" \
-                 -advanced -wmax 8000 -serial "$MODSIM2_SERIAL"
+                 -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM2_SERIAL"
   start modsim3 "$MODSIM3_PORT" ./bin/modsim -port "$MODSIM3_PORT" -api-port "$MODSIM3_API" \
-                 -advanced -wmax 8000 -serial "$MODSIM3_SERIAL"
+                 -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM3_SERIAL"
 fi
 start gridsim  "$GRIDSIM_PORT" ./bin/server   -listen "0.0.0.0:$GRIDSIM_PORT" -admin "0.0.0.0:$GRIDSIM_ADMIN" \
                  -ca "$M/ca-cert.pem" -cert-chain "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem"

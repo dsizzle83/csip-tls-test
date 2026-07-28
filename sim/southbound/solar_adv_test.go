@@ -17,9 +17,16 @@ import (
 // directly.
 func newAdvSolar(t *testing.T, wmax float64) *SolarServer {
 	t.Helper()
+	return newAdvSolarModels(t, wmax, false)
+}
+
+// newAdvSolarModels is newAdvSolar with the trip-model (707-710) choice made
+// explicit, so a test can build either image without a listener.
+func newAdvSolarModels(t *testing.T, wmax float64, withTrip bool) *SolarServer {
+	t.Helper()
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
 	varRating := wmax * 0.44
-	bases, adv := populateSolarAdvanced(r, wmax, varRating, "")
+	bases, adv := populateSolarAdvanced(r, wmax, varRating, "", withTrip)
 	ss := &SolarServer{
 		Server: &Server{Regs: r}, bases: bases, wmaxW: wmax,
 		advanced: true, adv: adv, varRating: varRating,

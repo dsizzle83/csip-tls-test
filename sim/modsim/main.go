@@ -4,9 +4,19 @@
 // Usage:
 //
 //	modsim [-port 5020] [-wmax 5000] [-api-port 6020] [-cloud-pct 0] [-serial SN-...]
+//	       [-advanced | -der-models legacy|advanced|full]
 //
-// Models exposed: 1 (Common), 120 (Nameplate), 121 (Basic Settings),
-// 122 (Extended Status), 103 (Three-Phase Inverter), 123 (Immediate Controls).
+// Models exposed by the default (legacy) image: 1 (Common), 120 (Nameplate),
+// 121 (Basic Settings), 122 (Extended Status), 103 (Three-Phase Inverter),
+// 123 (Immediate Controls).
+//
+// -advanced (= -der-models advanced) adds the IEEE 1547-2018 DER models
+// 701/702/704 and the curve models 705/706/711/712.
+//
+// -der-models full adds, on top of those, the trip models 707/708/709/710
+// (DERTripLV/HV/LF/HF) carrying Category III default trip curves — see
+// sim/southbound/trip1547.go. It is opt-in because it lengthens the SunSpec
+// model chain every existing scenario walks.
 //
 // API (default :6020):
 //
@@ -36,6 +46,12 @@ func main() {
 	apiPort := flag.Int("api-port", 6020, "HTTP API port (0 to disable)")
 	advanced := flag.Bool("advanced", false, "serve the IEEE 1547-2018 7xx DER models "+
 		"(701/702/704/705/706/711/712) for advanced-DER QA scenarios")
+	derModels := flag.String("der-models", "", "which DER model set to serve, overriding -advanced: "+
+		"\"legacy\" = 1/103/120/121/122/123 only; \"advanced\" = plus 701/702/704/705/706/711/712 "+
+		"(identical to -advanced); \"full\" = plus the IEEE 1547-2018 trip models 707/708/709/710 "+
+		"(DERTripLV/HV/LF/HF) with Category III default trip curves. Empty follows -advanced, which "+
+		"keeps every existing bench invocation serving the register image it has always served — the "+
+		"trip models are OPT-IN because adding them lengthens the SunSpec chain every scenario walks")
 	cloudPct := flag.Float64("cloud-pct", 0, "initial cloud cover percent (0=clear sky .. 100=full overcast); "+
 		"deterministically attenuates the running irradiance and is injectable live via POST /inject {\"Cloud_pct\":N}")
 	serial := flag.String("serial", "", "SunSpec Model 1 serial number (SN) override; empty keeps the "+
@@ -64,12 +80,20 @@ func main() {
 		listenURL = "tcp://" + upstreamAddr
 	}
 
+	models, err := resolveDERModels(*derModels, *advanced)
+	if err != nil {
+		log.Fatalf("modsim: %v", err)
+	}
+
 	var srv *sim.SolarServer
-	var err error
-	if *advanced {
+	switch models {
+	case modelsFull:
+		log.Printf("modsim: starting FULL (7xx + 707-710 trip) PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
+		srv, err = sim.NewSolarServerTrip(listenURL, *wmax, *serial)
+	case modelsAdvanced:
 		log.Printf("modsim: starting ADVANCED (7xx) PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
 		srv, err = sim.NewSolarServerAdvanced(listenURL, *wmax, *serial)
-	} else {
+	default:
 		log.Printf("modsim: starting animated PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
 		srv, err = sim.NewSolarServer(listenURL, *wmax, *serial)
 	}
@@ -157,4 +181,41 @@ func main() {
 
 	log.Printf("modsim: shutting down")
 	srv.Stop()
+}
+
+// derModelSet names the register images modsim can serve.
+type derModelSet int
+
+const (
+	modelsLegacy derModelSet = iota
+	modelsAdvanced
+	modelsFull
+)
+
+// resolveDERModels resolves -der-models against the older -advanced boolean.
+//
+// The two knobs coexist rather than one replacing the other because -advanced
+// is written into bench-sims-up.sh, several Makefile targets and every runbook
+// in docs/. Silently redefining what it serves would have changed the register
+// image on a shared bench without anyone editing a command line, which is
+// exactly the kind of change that gets discovered as a mysterious test failure
+// three days later. An unrecognised -der-models is an error rather than a
+// fall-back to the default, for the same reason: a typo must not quietly serve
+// a different device than the operator asked for.
+func resolveDERModels(flagValue string, advanced bool) (derModelSet, error) {
+	switch flagValue {
+	case "":
+		if advanced {
+			return modelsAdvanced, nil
+		}
+		return modelsLegacy, nil
+	case "legacy":
+		return modelsLegacy, nil
+	case "advanced":
+		return modelsAdvanced, nil
+	case "full":
+		return modelsFull, nil
+	default:
+		return modelsLegacy, fmt.Errorf("-der-models %q is not one of legacy, advanced, full", flagValue)
+	}
 }

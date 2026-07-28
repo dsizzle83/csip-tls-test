@@ -58,7 +58,13 @@ type solarAdvBases struct {
 	M702    uint16
 	M704    uint16
 	Curves  []curveBlock
-	End     uint16 // last register address occupied by the advanced models
+	// Trips holds the 707/708/709/710 IEEE 1547 trip models, and is EMPTY
+	// unless the sim was asked for them (NewSolarServerTrip, modsim
+	// -der-models full). They are appended AFTER every other advanced model
+	// precisely so an image without them is byte-identical to the one this sim
+	// has always served — see populateSolar7xx and trip1547.go.
+	Trips []tripBlock
+	End   uint16 // last register address occupied by the advanced models
 }
 
 // curveBlock describes one curve/control model instance for the adopt handshake.
@@ -103,9 +109,29 @@ var solarCurveSpecs = []curveModelSpec{
 // overrides the SunSpec Model 1 serial (SN) register when non-empty; empty
 // keeps the historical "SN-SOLAR-001" default (see solarSerialOrDefault).
 func NewSolarServerAdvanced(listenURL string, wmaxW float64, serial string) (*SolarServer, error) {
+	return newSolarServerAdvanced(listenURL, wmaxW, serial, false)
+}
+
+// NewSolarServerTrip creates an advanced PV inverter simulator that ALSO serves
+// the IEEE 1547-2018 trip models 707/708/709/710 (DERTripLV/HV/LF/HF) with
+// Category III default trip curves — see trip1547.go.
+//
+// It is a SEPARATE constructor, not a widening of NewSolarServerAdvanced, for
+// one reason: the trip models occupy ~380 registers and would move nothing (the
+// existing blocks keep their addresses) but ADD to the image, which changes
+// every SunSpec chain walk, every model-discovery scan and every register dump
+// the existing QA scenarios record. Those scenarios are the baseline the sim
+// exists to protect, so the extra models are opt-in and the default advanced
+// image is byte-identical to what it has always been —
+// TestTripModelsDoNotDisturbTheDefaultAdvancedImage proves it.
+func NewSolarServerTrip(listenURL string, wmaxW float64, serial string) (*SolarServer, error) {
+	return newSolarServerAdvanced(listenURL, wmaxW, serial, true)
+}
+
+func newSolarServerAdvanced(listenURL string, wmaxW float64, serial string, withTrip bool) (*SolarServer, error) {
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	varRating := wmaxW * 0.44
-	bases, adv := populateSolarAdvanced(regs, wmaxW, varRating, serial)
+	bases, adv := populateSolarAdvanced(regs, wmaxW, varRating, serial, withTrip)
 
 	ss := &SolarServer{bases: bases, wmaxW: wmaxW, advanced: true, adv: adv, varRating: varRating}
 	ss.faults.label = "solar"
@@ -127,9 +153,9 @@ func NewSolarServerAdvanced(listenURL string, wmaxW float64, serial string) (*So
 
 // ── Populate ─────────────────────────────────────────────────────────────────
 
-func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial string) (SolarBases, solarAdvBases) {
+func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial string, withTrip bool) (SolarBases, solarAdvBases) {
 	bases, cursor := populateSolarCore(r, wmaxW, serial)
-	adv, cursor := populateSolar7xx(r, cursor, wmaxW, varRating)
+	adv, cursor := populateSolar7xx(r, cursor, wmaxW, varRating, withTrip)
 	r.Set(cursor, sunspec.EndMarker)
 	r.Set(cursor+1, 0)
 	return bases, adv
@@ -137,7 +163,13 @@ func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial stri
 
 // populateSolar7xx appends the advanced models after the legacy layout (before
 // the end marker) and returns their bases plus the next cursor.
-func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (solarAdvBases, uint16) {
+//
+// withTrip appends models 707/708/709/710 LAST. Appending rather than
+// interleaving is deliberate and load-bearing: every block before them keeps
+// the address it has always had, so a trip-capable sim and a plain advanced sim
+// answer identically for models 1/103/120/121/122/123/701/702/704/705/706/711/
+// 712, and only the end marker moves.
+func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64, withTrip bool) (solarAdvBases, uint16) {
 	var adv solarAdvBases
 
 	adv.M701, adv.M701Len, cursor = populate701(r, cursor)
@@ -147,6 +179,13 @@ func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (
 		var cb curveBlock
 		cb, cursor = populateCurveModel(r, cursor, spec)
 		adv.Curves = append(adv.Curves, cb)
+	}
+	if withTrip {
+		for _, spec := range solarTripSpecs {
+			var tb tripBlock
+			tb, cursor = populateTripModel(r, cursor, spec)
+			adv.Trips = append(adv.Trips, tb)
+		}
 	}
 	adv.End = cursor + 1
 
@@ -160,6 +199,9 @@ func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (
 	protectLayoutSFs(r, adv.M704, sunspec.L704)
 	for _, cb := range adv.Curves {
 		protectLayoutSFs(r, cb.base, cb.hdr)
+	}
+	for _, tb := range adv.Trips {
+		protectLayoutSFs(r, tb.base, tb.hdr)
 	}
 	return adv, cursor
 }
@@ -360,6 +402,19 @@ func (ss *SolarServer) interceptAdopt(startAddr uint16, vals []uint16) bool {
 			return true
 		}
 	}
+	// The trip models (707-710) run the same §3.1.2 handshake over a different
+	// geometry: a curve-SET rather than a curve, whose first register is the
+	// ReadOnly flag (so roOff is 0) and whose stride is the whole three-
+	// sub-curve set. Everything else — the 1-based staging index, the
+	// COMPLETED result, the curve_adopt_lies fault — is shared with the curve
+	// models by construction, because both call adoptInto.
+	for i := range ss.adv.Trips {
+		tb := ss.adv.Trips[i]
+		if startAddr == tb.base+uint16(tb.reqOff) {
+			ss.adoptInto(tb.base, tb.hdrLen, tb.setSize, 0, tb.rsltOff, vals[0])
+			return true
+		}
+	}
 	return false
 }
 
@@ -368,20 +423,34 @@ func (ss *SolarServer) interceptAdopt(startAddr uint16, vals []uint16) bool {
 // UNLESS curve_adopt_lies is armed, in which case it reports COMPLETED without
 // the copy, leaving the live curve stale (the INV-ADV-READBACK divergence).
 func (ss *SolarServer) applyAdopt(cb curveBlock, req uint16) {
+	ss.adoptInto(cb.base, cb.hdrLen, cb.stride, cb.roOff, cb.rsltOff, req)
+}
+
+// adoptInto is the §3.1.2 adoption itself, expressed over the four numbers that
+// are all any of these models differ by: where the block starts, how far past
+// it the first curve (or curve-set) lives, how wide one of them is, and where
+// its read-only flag sits.
+//
+// It is shared between the curve models (705/706/711/712) and the trip models
+// (707-710) so the handshake — and the curve_adopt_lies fault that subverts it
+// — has exactly one implementation. A second copy for the trip geometry would
+// have been a second place for the "live entry is always read-only" rule to be
+// forgotten, which is the rule the whole INV-ADV-READBACK defence rests on.
+func (ss *SolarServer) adoptInto(base uint16, hdrLen, stride, roOff, rsltOff int, req uint16) {
 	if req < 2 {
 		return // §3.1.2 requires the 1-based staging index >1; ignore idle/invalid.
 	}
 	r := ss.Regs
 	if !ss.faults.adoptLies() {
 		stagingIdx := int(req) - 1
-		src := cb.base + uint16(cb.hdrLen+stagingIdx*cb.stride)
-		dst := cb.base + uint16(cb.hdrLen) // live curve is index 0
-		for i := 0; i < cb.stride; i++ {
+		src := base + uint16(hdrLen+stagingIdx*stride)
+		dst := base + uint16(hdrLen) // live curve/curve-set is index 0
+		for i := 0; i < stride; i++ {
 			r.Set(dst+uint16(i), r.Get(src+uint16(i)))
 		}
-		r.Set(dst+uint16(cb.roOff), 1) // the live curve is always read-only
+		r.Set(dst+uint16(roOff), 1) // the live entry is always read-only
 	}
-	r.Set(cb.base+uint16(cb.rsltOff), sunspec.AdptCompleted)
+	r.Set(base+uint16(rsltOff), sunspec.AdptCompleted)
 }
 
 // ── Animation: 701 mirror + 704 effect ───────────────────────────────────────
@@ -604,6 +673,10 @@ type SolarAdvancedState struct {
 	FixedVar   advVarState     `json:"fixed_var"`
 	Ceiling704 advCeilState    `json:"wmaxlimpct_704"`
 	Curves     []advCurveState `json:"curves"`
+	// Trips is the 707-710 ground truth, omitted entirely on a sim that does
+	// not serve them so /state stays byte-identical for every existing
+	// scenario. See trip1547.go.
+	Trips []advTripState `json:"trips,omitempty"`
 }
 
 type adv701Meas struct {
@@ -663,6 +736,7 @@ func (ss *SolarServer) advSnapshot() *SolarAdvancedState {
 		cs.Points = liveCurvePoints(r, cb)
 		out.Curves = append(out.Curves, cs)
 	}
+	out.Trips = ss.tripSnapshot()
 	return out
 }
 
