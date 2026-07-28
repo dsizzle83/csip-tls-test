@@ -27,6 +27,8 @@ package suitecsip
 import (
 	"context"
 	"fmt"
+	"net/netip"
+	"sort"
 	"strings"
 
 	"csip-tls-test/internal/certify"
@@ -109,15 +111,27 @@ func critNoServiceDiscovery() criterion {
 		Claim: "the DUT used the out-of-band configuration rather than service discovery: the capture " +
 			"contains no mDNS/xmDNS or SSDP query from the DUT",
 		How: "a scan of the WHOLE run capture for UDP traffic on the service-discovery ports, since an " +
-			"absence cannot be attributed to a single test case's frames",
-		Wire: func(ev *certify.Evidence, _ *Transcript) Finding {
-			n, desc := scanServiceDiscovery(ev)
+			"absence cannot be attributed to a single test case's frames — counted per SOURCE ADDRESS, " +
+			"because only datagrams the DUT itself sent bear on this claim",
+		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
+			// Attribute by source address. The claim is about what THE DUT sent,
+			// and a bench segment carries plenty of discovery chatter from other
+			// hosts: counting all of it reported "SSDP×4" against a conformant
+			// gateway when every one of those datagrams came from the bench
+			// workstation itself (2026-07-28). A datagram IS attributable —
+			// connectionless or not, it carries a source IP.
+			dut, known := dutAddr(t)
+			n, other, desc := scanServiceDiscovery(ev, dut, known)
 			v := certify.Pass
-			if n > 0 {
-				// Not automatically a failure: another host on the bench segment
-				// may be advertising, and this suite cannot attribute a datagram
-				// on a connectionless protocol to the DUT. It is a WARN with the
-				// count, so a reader knows to look.
+			switch {
+			case n > 0:
+				// The DUT itself queried a discovery protocol, which contradicts
+				// out-of-band configuration. Still WARN rather than FAIL: a
+				// shared segment can echo a datagram back at its sender.
+				v = certify.Warn
+			case !known && other > 0:
+				// Discovery traffic exists but the DUT's address could not be
+				// established here, so it can be neither ruled in nor out.
 				v = certify.Warn
 			}
 			// Deliberately no frame citation: the claim is about what is NOT in
@@ -129,31 +143,88 @@ func critNoServiceDiscovery() criterion {
 	}
 }
 
-// scanServiceDiscovery counts discovery datagrams in the whole capture. It is
-// separate from the criterion so the count can be reported precisely.
-func scanServiceDiscovery(ev *certify.Evidence) (int, string) {
-	counts := map[string]int{}
-	total := 0
+// dutAddr returns the DUT's IP as the capture itself reports it: the source of
+// the direction that sent the ClientHello, since the DUT is the party that
+// dials the 2030.5 server. The bool is false when no session was recovered and
+// the address is therefore unknown.
+func dutAddr(t *Transcript) (netip.Addr, bool) {
+	if t == nil || t.ClientDir == nil {
+		return netip.Addr{}, false
+	}
+	a := t.ClientDir.Flow.Src.Addr.Unmap()
+	return a, a.IsValid()
+}
+
+// scanServiceDiscovery counts discovery datagrams in the whole capture,
+// separating those the DUT sent from everyone else's.
+//
+// The split is the point. A conformance bench is a shared Ethernet segment: the
+// workstation running this harness advertises over SSDP, and so may anything
+// else plugged into the switch. Counting every datagram and reporting the total
+// against the DUT is how a conformant gateway gets a WARN for its neighbours'
+// chatter — which is exactly what happened on 2026-07-28, when all four SSDP
+// datagrams came from the bench workstation.
+//
+// Returns the DUT's own count, everyone else's count, and the description.
+func scanServiceDiscovery(ev *certify.Evidence, dut netip.Addr, dutKnown bool) (int, int, string) {
+	byProto := map[string]int{}
+	bySource := map[string]int{}
+	dutTotal, otherTotal := 0, 0
 	for _, f := range ev.Index.Frames() {
 		if f == nil || f.UDP == nil {
 			continue
 		}
 		for _, p := range []uint16{f.UDP.SrcPort, f.UDP.DstPort} {
-			if name, ok := mdnsPorts[p]; ok {
-				counts[name]++
-				total++
-				break
+			name, ok := mdnsPorts[p]
+			if !ok {
+				continue
 			}
+			src := f.Src.Unmap()
+			if dutKnown && src == dut {
+				dutTotal++
+				byProto[name]++
+			} else {
+				otherTotal++
+				bySource[src.String()]++
+			}
+			break
 		}
 	}
-	if total == 0 {
-		return 0, "no mDNS/xmDNS (UDP 5353) or SSDP (UDP 1900) datagram appears anywhere in the run capture"
+
+	switch {
+	case dutTotal == 0 && otherTotal == 0:
+		return 0, 0, "no mDNS/xmDNS (UDP 5353) or SSDP (UDP 1900) datagram appears anywhere in the run capture"
+	case dutTotal == 0 && dutKnown:
+		return 0, otherTotal, fmt.Sprintf("the DUT (%s) sent no mDNS/xmDNS or SSDP datagram; the capture "+
+			"holds %d from other hosts on the bench segment (%s), which do not bear on this claim",
+			dut, otherTotal, joinCounts(bySource))
+	case dutTotal == 0:
+		return 0, otherTotal, fmt.Sprintf("the capture holds %d service-discovery datagram(s) (%s), but no "+
+			"session was recovered for this test case so the DUT's address is unknown here and they can "+
+			"be neither attributed to it nor ruled out", otherTotal, joinCounts(bySource))
+	default:
+		msg := fmt.Sprintf("the DUT (%s) sent %d service-discovery datagram(s): %s",
+			dut, dutTotal, joinCounts(byProto))
+		if otherTotal > 0 {
+			msg += fmt.Sprintf(" (a further %d came from other hosts: %s)", otherTotal, joinCounts(bySource))
+		}
+		return dutTotal, otherTotal, msg
 	}
-	parts := make([]string, 0, len(counts))
-	for k, v := range counts {
-		parts = append(parts, fmt.Sprintf("%s×%d", k, v))
+}
+
+// joinCounts renders a count map deterministically, so two runs of the same
+// capture produce byte-identical evidence.
+func joinCounts(m map[string]int) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
-	return total, "the run capture contains service-discovery traffic: " + strings.Join(parts, " ")
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s×%d", k, m[k]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // commBasicSecurity implements COMM-003 — Basic Security.
