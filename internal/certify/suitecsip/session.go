@@ -10,7 +10,12 @@ package suitecsip
 // The handshake tier needs nothing but the pcap. Version, offered and
 // negotiated cipher suites, both certificate chains, CertificateRequest and any
 // alert are cleartext in TLS 1.2, which is the version CSIP §5.2.1.1 mandates.
-// That tier is always populated when the session is in the capture at all.
+// That tier is always populated when the session is in the capture at all —
+// with one exception every certificate criterion has to know about: on a
+// session RESUMED from a ticket the certificates are not on the wire, because
+// TLS deliberately does not send them a second time. Handshake.Resumed carries
+// that fact, so a criterion can decline to decide instead of reading the
+// absence as a device fault.
 //
 // The transcript tier needs the session's traffic secrets. gridsim is the
 // server, so the secrets are the bench's own to export — but if the run had no
@@ -31,6 +36,7 @@ package suitecsip
 // digest mechanically.
 
 import (
+	"bytes"
 	"fmt"
 	"net/netip"
 	"sort"
@@ -90,6 +96,29 @@ type Handshake struct {
 	// Complete reports whether both sides reached ChangeCipherSpec, i.e. the
 	// handshake finished rather than being abandoned.
 	Complete bool
+
+	// Resumed reports the ABBREVIATED handshake of RFC 5077 §3.1: this session's
+	// keys came from one established EARLIER, and no certificates were exchanged
+	// on this wire because TLS does not exchange them again. See
+	// (*Handshake).detectResumption for the rule and why it is that rule.
+	Resumed bool
+
+	// OfferedTicket is the session_ticket extension the ClientHello carried:
+	// nil when the extension was absent, empty when it was present and
+	// zero-length (the "I support tickets but hold none" form), and the ticket
+	// itself when the client was resuming.
+	OfferedTicket []byte
+
+	// EchoedSessionID reports that the ServerHello echoed a non-empty
+	// ClientHello.session_id. CORROBORATING ONLY — never required; see the
+	// detector for why demanding it would break on an mbed TLS client.
+	EchoedSessionID bool
+
+	// ServerFlight is the server's handshake message types in wire order, up to
+	// the ChangeCipherSpec after which nothing is readable in the clear. It is
+	// what the resumption rule actually reads, and it is kept so an assertion
+	// can PRINT the evidence its verdict rests on.
+	ServerFlight []tlsdis.HandshakeType
 }
 
 // OffersMandatoryCipher reports whether the ClientHello offered 0xC0AE.
@@ -107,6 +136,76 @@ func (h *Handshake) OfferedSuites() string {
 		parts = append(parts, fmt.Sprintf("0x%04X %s", id, tlsdis.CipherSuiteName(id)))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// detectResumption decides whether this handshake is the ABBREVIATED flight of
+// RFC 5077 §3.1 — a session resumed from a ticket — rather than a full one. It
+// is computed once, when the handshake is read, because every criterion that
+// asks about certificates needs the answer and none of them should re-derive it.
+//
+// The rule is the SERVER FLIGHT's shape, with the client's ticket offer as the
+// precondition that makes reading it that way safe:
+//
+//   - the ClientHello carried a NON-EMPTY session_ticket extension, i.e. it
+//     PRESENTED a ticket rather than merely advertising support for them, and
+//     the ServerHello's own session_ticket extension is empty or absent, which
+//     is all RFC 5077 §3.2 ever permits it to be; AND
+//   - the server flight contains NEITHER ServerKeyExchange NOR ServerHelloDone.
+//
+// The second clause is the one that decides. A full ECDHE handshake cannot omit
+// either message; an abbreviated one sends ServerHello, optionally a fresh
+// NewSessionTicket, then ChangeCipherSpec and Finished, and nothing else. The
+// first clause is what keeps that from misreading a TRUNCATED capture — a
+// server flight cut off after the ServerHello also has no ServerHelloDone, but
+// it has no ticket offer behind it either.
+//
+// The session_id echo is recorded and NOT required. RFC 5077 §3.4 makes the
+// TICKET the thing being resumed, and a client is free to send an empty
+// session_id alongside it; mbed TLS does. Demanding the echo would therefore
+// make this detector stop working on the day the DUT's TLS stack changes — a
+// change already planned for this product — which is the worst possible time
+// for a conformance harness to start reporting resumed sessions as
+// server-authenticated-only.
+//
+// TLS 1.3 is excluded by version. Its resumption is a different mechanism with
+// a different signature (pre_shared_key, and a server that omits
+// ServerKeyExchange and ServerHelloDone on a FULL handshake too), so applying
+// this rule to a 1.3 session would call every one of them resumed.
+func (h *Handshake) detectResumption() {
+	if h.ClientHello == nil || h.ServerHello == nil {
+		return
+	}
+	if h.Version == 0 || h.Version > TLS12 {
+		return
+	}
+	if len(h.OfferedTicket) == 0 {
+		return
+	}
+	if data, ok := h.ServerHello.Extension(tlsdis.ExtSessionTicket); ok && len(data) > 0 {
+		return
+	}
+	for _, typ := range h.ServerFlight {
+		if typ == tlsdis.HandshakeServerKeyExchange || typ == tlsdis.HandshakeServerHelloDone {
+			return
+		}
+	}
+	h.Resumed = true
+}
+
+// ResumptionSummary renders the evidence the Resumed verdict rests on, so an
+// assertion that declines to decide can print WHY rather than assert it.
+func (h *Handshake) ResumptionSummary() string {
+	flight := make([]string, 0, len(h.ServerFlight))
+	for _, typ := range h.ServerFlight {
+		flight = append(flight, tlsdis.HandshakeTypeName(typ))
+	}
+	if len(flight) == 0 {
+		flight = append(flight, "(none in the clear)")
+	}
+	return fmt.Sprintf("the ClientHello presented a %d-byte session_ticket, the server flight is [%s] with "+
+		"no server_key_exchange and no server_hello_done, and the ServerHello %s the client's session_id",
+		len(h.OfferedTicket), strings.Join(flight, ", "),
+		map[bool]string{true: "echoed", false: "did not echo"}[h.EchoedSessionID])
 }
 
 // Transcript is one recovered CSIP session.
@@ -532,6 +631,9 @@ func readHandshake(client, server *tlsdis.Direction) Handshake {
 		if client.Handshake != nil {
 			if m, ok := client.Handshake.Find(tlsdis.HandshakeClientHello); ok {
 				h.ClientHello, h.ClientHelloFrames = m.ClientHello, m.Packets
+				if m.ClientHello != nil {
+					h.OfferedTicket = m.ClientHello.SessionTicket
+				}
 			}
 			if m, ok := client.Handshake.Find(tlsdis.HandshakeCertificate); ok && m.Certificate != nil {
 				h.ClientChain, h.ClientCertFrames = m.Certificate.DERChain(), m.Packets
@@ -541,6 +643,7 @@ func readHandshake(client, server *tlsdis.Direction) Handshake {
 	if server != nil {
 		h.ServerAlerts = server.Alerts
 		if server.Handshake != nil {
+			h.ServerFlight = server.Handshake.Types()
 			if m, ok := server.Handshake.Find(tlsdis.HandshakeServerHello); ok && m.ServerHello != nil {
 				h.ServerHello, h.ServerHelloFrames = m.ServerHello, m.Packets
 				h.Version = m.ServerHello.NegotiatedVersion()
@@ -554,6 +657,10 @@ func readHandshake(client, server *tlsdis.Direction) Handshake {
 			}
 		}
 	}
+	if h.ClientHello != nil && h.ServerHello != nil && len(h.ClientHello.SessionID) > 0 {
+		h.EchoedSessionID = bytes.Equal(h.ClientHello.SessionID, h.ServerHello.SessionID)
+	}
+	h.detectResumption()
 	h.Complete = client != nil && server != nil && len(client.CCS) > 0 && len(server.CCS) > 0
 	return h
 }
