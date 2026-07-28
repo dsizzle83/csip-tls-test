@@ -32,6 +32,11 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/derputs", cors(s.handleAdminDERPuts))
 	mux.HandleFunc("/admin/logevents", cors(s.handleAdminLogEvents))
 	mux.HandleFunc("/admin/logs", cors(s.logBuf.ServeHTTP))
+	// Cursor-based JSON read of the same ring. The SSE stream above is for the
+	// dashboard; a programmatic reader must use this, because deriving a delta
+	// from the SSE replay's length breaks silently once the ring wraps (see
+	// simapi.LogBuffer.firstSeq).
+	mux.HandleFunc("/admin/logs.json", cors(s.logBuf.ServeSince))
 	return mux
 }
 

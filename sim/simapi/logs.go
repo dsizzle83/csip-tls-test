@@ -11,22 +11,105 @@ package simapi
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 )
 
 // maxLogLines bounds the replay backlog kept per simulator.
-const maxLogLines = 400
+//
+// This is a RING: once it is full, old lines are evicted. Any consumer that
+// derives "what happened since I last looked" MUST do so from Seq (below) and
+// MUST check the reported drop count. Deriving it from len() instead is wrong
+// the moment the ring wraps, and wrong in the worst possible direction — see
+// the Seq doc.
+const maxLogLines = 4000
 
 // LogBuffer is a goroutine-safe ring of recent log lines with subscriber
 // fan-out. The zero value is not usable; create with NewLogBuffer.
 type LogBuffer struct {
-	mu      sync.Mutex
-	lines   []string // ring: oldest first, capped at maxLogLines
-	subs    map[chan string]struct{}
-	partial []byte // trailing bytes of an incomplete line from Write
+	mu    sync.Mutex
+	lines []string // ring: oldest first, capped at maxLogLines
+	// firstSeq is the sequence number of lines[0]; it advances as the ring
+	// evicts. total lines ever written == firstSeq + len(lines).
+	//
+	// WHY A SEQUENCE NUMBER EXISTS
+	//
+	// A reader used to compute its delta as "the entries past the length I saw
+	// last time". That is correct only for an unbounded append-only list. On a
+	// bounded ring, len() saturates at maxLogLines and STOPS GROWING while
+	// events keep arriving, so the computed delta becomes permanently empty.
+	//
+	// The conformance harness read this buffer that way. Roughly ten minutes
+	// into a run — one 2030.5 discovery walk is ~28 logged GETs — the ring
+	// wrapped, every subsequent delta came back empty, and 22 test cases
+	// reported "the DUT did nothing in this window" about a gateway that was
+	// polling perfectly on time. An empty delta is indistinguishable from
+	// silence, which is why this failed as false FAILs rather than as an error.
+	//
+	// Sequence numbers make the delta exact, and Since reports what it had to
+	// evict so a truncated view can never be mistaken for a quiet one.
+	firstSeq uint64
+	subs     map[chan string]struct{}
+	partial  []byte // trailing bytes of an incomplete line from Write
+}
+
+// LogSlice is a cursor-based read of the ring.
+type LogSlice struct {
+	// Lines are the entries from the requested cursor onward.
+	Lines []string `json:"lines"`
+	// Next is the cursor to pass on the following call.
+	Next uint64 `json:"next"`
+	// Dropped is how many entries were evicted before the requested cursor —
+	// i.e. how much the reader missed by not reading sooner. It is NOT
+	// advisory: a caller that ignores it is back to mistaking truncation for
+	// silence.
+	Dropped uint64 `json:"dropped"`
+}
+
+// Since returns every line with a sequence number >= cursor, the cursor to use
+// next, and how many lines were evicted before cursor could be served.
+//
+// Pass cursor 0 for "everything currently retained". The returned Next is
+// always safe to pass back, including when Dropped is non-zero.
+func (lb *LogBuffer) Since(cursor uint64) LogSlice {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	end := lb.firstSeq + uint64(len(lb.lines))
+	var dropped uint64
+	if cursor < lb.firstSeq {
+		dropped = lb.firstSeq - cursor
+		cursor = lb.firstSeq
+	}
+	if cursor > end {
+		cursor = end
+	}
+	out := make([]string, end-cursor)
+	copy(out, lb.lines[cursor-lb.firstSeq:])
+	return LogSlice{Lines: out, Next: end, Dropped: dropped}
+}
+
+// ServeSince is the JSON, cursor-based counterpart to ServeHTTP's SSE stream.
+// Programmatic readers use this; the dashboard keeps the stream.
+func (lb *LogBuffer) ServeSince(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var cursor uint64
+	if v := r.URL.Query().Get("since"); v != "" {
+		n, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			http.Error(w, "since must be a non-negative integer", http.StatusBadRequest)
+			return
+		}
+		cursor = n
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(lb.Since(cursor))
 }
 
 // NewLogBuffer creates an empty LogBuffer.
@@ -60,7 +143,9 @@ func (lb *LogBuffer) appendLocked(line string) {
 	}
 	lb.lines = append(lb.lines, line)
 	if len(lb.lines) > maxLogLines {
-		lb.lines = lb.lines[len(lb.lines)-maxLogLines:]
+		drop := len(lb.lines) - maxLogLines
+		lb.lines = lb.lines[drop:]
+		lb.firstSeq += uint64(drop) // keep firstSeq the sequence of lines[0]
 	}
 	for ch := range lb.subs {
 		select {

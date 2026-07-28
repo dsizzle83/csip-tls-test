@@ -124,17 +124,56 @@ type ServerView struct {
 	// Errors records what could not be collected, so a partial view is never
 	// mistaken for a complete one.
 	Errors []string
+
+	// rawLines is the server's request log exactly as read, and rawFirstSeq is
+	// the absolute sequence number of rawLines[0]. Since deltas these, NOT the
+	// parsed Requests slice and NOT by length: the server's log is a bounded
+	// ring, so once it wraps a length-based delta reports nothing happened.
+	rawLines    []string
+	rawFirstSeq uint64
+	// logApproximate marks a view whose log was read without a cursor. Its
+	// deltas can under-report and Since says so instead of guessing.
+	logApproximate bool
 }
 
 // Since returns the view's entries that are new relative to a baseline taken
 // earlier in the same run. Baselines are how a check avoids passing on evidence
 // another agent's test case produced.
+// The Responses/DERPuts/LogEvents endpoints serve unbounded append-only
+// arrays, so a length delta is exact for those. The REQUEST LOG is a bounded
+// ring and is delta'd by absolute sequence instead — see rawFirstSeq.
 func (v ServerView) Since(base ServerView) ServerView {
 	out := v
-	out.Requests = v.Requests[min(len(base.Requests), len(v.Requests)):]
 	out.Responses = v.Responses[min(len(base.Responses), len(v.Responses)):]
 	out.DERPuts = v.DERPuts[min(len(base.DERPuts), len(v.DERPuts)):]
 	out.LogEvents = v.LogEvents[min(len(base.LogEvents), len(v.LogEvents)):]
+
+	switch {
+	case len(v.rawLines) == 0 && len(base.rawLines) == 0:
+		// Neither view came from a log read: Requests were supplied directly
+		// (a synthetic view, or a test fixture). There is no ring involved, so
+		// the slice really is append-only and the length delta is exact.
+		out.Requests = v.Requests[min(len(base.Requests), len(v.Requests)):]
+	case v.logApproximate || base.logApproximate:
+		// No cursor available. Fall back to the old length delta, but say so:
+		// this is the mode that can silently under-report.
+		out.Requests = v.Requests[min(len(base.Requests), len(v.Requests)):]
+		out.Errors = append(out.Errors, "the request-log delta is approximate: the simulator served no "+
+			"cursor endpoint (/admin/logs.json), so entries evicted from its ring are invisible here and "+
+			"this view may under-report what the DUT did")
+	case base.rawFirstSeq+uint64(len(base.rawLines)) < v.rawFirstSeq:
+		// The baseline's position fell out of the ring before we read again.
+		// The window is genuinely unobservable; saying "nothing happened"
+		// would be the false-FAIL bug all over again.
+		lost := v.rawFirstSeq - (base.rawFirstSeq + uint64(len(base.rawLines)))
+		out.Requests = parseRequestLog(v.rawLines)
+		out.Errors = append(out.Errors, fmt.Sprintf("the simulator's request log evicted %d line(s) "+
+			"between the baseline and this read, so this window cannot be reconstructed; treat the "+
+			"request list as incomplete rather than as evidence the DUT was idle", lost))
+	default:
+		baseEnd := base.rawFirstSeq + uint64(len(base.rawLines))
+		out.Requests = parseRequestLog(v.rawLines[baseEnd-v.rawFirstSeq:])
+	}
 	return out
 }
 
@@ -303,20 +342,61 @@ func (d *Driver) Snapshot(ctx context.Context) ServerView {
 		v.LogEvents = le.LogEvents
 	}
 
-	lines, err := d.readLog(ctx)
+	lr, err := d.readLog(ctx)
 	if err != nil {
 		v.Errors = append(v.Errors, "GET /admin/logs: "+err.Error())
 	} else {
-		v.Requests = parseRequestLog(lines)
+		// Keep the RAW lines and their absolute sequence: Since deltas the raw
+		// lines and parses the delta, so the cursor arithmetic never has to
+		// survive parseRequestLog's filtering.
+		v.rawLines, v.rawFirstSeq, v.logApproximate = lr.lines, lr.firstSeq, lr.approximate
+		v.Requests = parseRequestLog(lr.lines)
 	}
 	return v
 }
 
-func (d *Driver) readLog(ctx context.Context) ([]string, error) {
+// logRead is what the server's request log looked like at one instant, with
+// enough information to take an EXACT delta against an earlier read.
+type logRead struct {
+	lines []string
+	// firstSeq is the absolute sequence number of lines[0]. Deltas are taken
+	// against this, never against len(lines): the server's ring evicts, so
+	// len() stops growing while events keep arriving, and a length-based delta
+	// silently collapses to empty. That is what reported a healthy gateway as
+	// having "done nothing in this window" 22 times on 2026-07-28.
+	firstSeq uint64
+	// approximate is set when sequence numbers had to be synthesised because
+	// the server offered no cursor endpoint. A delta from an approximate read
+	// can under-report, and says so rather than being trusted silently.
+	approximate bool
+}
+
+func (d *Driver) readLog(ctx context.Context) (logRead, error) {
 	if d.LogReader != nil {
-		return d.LogReader(ctx, d.Admin.BaseURL)
+		lines, err := d.LogReader(ctx, d.Admin.BaseURL)
+		return logRead{lines: lines, approximate: true}, err
 	}
-	return readSSEBacklog(ctx, d.Admin.BaseURL+"/admin/logs", logTailBudget)
+
+	// Cursor endpoint (preferred). since=0 returns everything the ring still
+	// holds plus the absolute cursor just past it, which is what makes the
+	// delta exact across an eviction.
+	var got struct {
+		Lines   []string `json:"lines"`
+		Next    uint64   `json:"next"`
+		Dropped uint64   `json:"dropped"`
+	}
+	err := d.Admin.Logs(ctx, 0, &got)
+	if err == nil {
+		return logRead{lines: got.Lines, firstSeq: got.Next - uint64(len(got.Lines))}, nil
+	}
+
+	// Older simulator without the cursor endpoint: fall back to the SSE replay,
+	// but mark the read approximate so its delta cannot pass as exact.
+	lines, serr := readSSEBacklog(ctx, d.Admin.BaseURL+"/admin/logs", logTailBudget)
+	if serr != nil {
+		return logRead{}, fmt.Errorf("cursor read failed (%v) and SSE fallback failed: %w", err, serr)
+	}
+	return logRead{lines: lines, approximate: true}, nil
 }
 
 // readSSEBacklog reads the replayed backlog of an SSE endpoint and returns.

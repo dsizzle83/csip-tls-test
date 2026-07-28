@@ -156,6 +156,17 @@ func (a *AdminClient) Post(ctx context.Context, path string, body, out any) erro
 // Status reads /admin/status.
 func (a *AdminClient) Status(ctx context.Context, out any) error { return a.Get(ctx, "status", out) }
 
+// Logs reads /admin/logs.json?since=<cursor>: the simulator's request log as a
+// cursor-based slice.
+//
+// Use this, not the /admin/logs SSE stream, for anything that computes "what
+// happened since I last looked". The log is a bounded ring, so a delta taken
+// from the stream's replay length collapses to empty once it wraps — which
+// reports a busy device as an idle one.
+func (a *AdminClient) Logs(ctx context.Context, cursor uint64, out any) error {
+	return a.Get(ctx, fmt.Sprintf("logs.json?since=%d", cursor), out)
+}
+
 // Control posts a DERControl to /admin/control.
 func (a *AdminClient) Control(ctx context.Context, body, out any) error {
 	return a.Post(ctx, "control", body, out)
