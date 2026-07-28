@@ -198,7 +198,27 @@ if [ "$SIM_FLEET" = 4 ]; then
 fi
 GRIDSIM_ARGS=()
 [ "$GRIDSIM_FLEET" != 0 ] && GRIDSIM_ARGS+=(-fleet "$GRIDSIM_FLEET")
-[ "$GRIDSIM_SUBSCRIPTION" != 0 ] && GRIDSIM_ARGS+=(-subscription)
+if [ "$GRIDSIM_SUBSCRIPTION" != 0 ]; then
+  GRIDSIM_ARGS+=(-subscription)
+  # The notification leg's CLIENT identity. A Notification travels on a
+  # connection gridsim OPENS to the subscriber, so on that leg the simulator is
+  # the mTLS client and needs a client certificate — not the one it serves with.
+  # Without it an https:// notificationURI is refused (Go's crypto/tls has no
+  # ECDHE-ECDSA-AES128-CCM-8) and the conformance suite reports every
+  # notification criterion as unmeasured, naming this flag.
+  #
+  # grid-service is the bench's existing northbound client identity, signed by
+  # the same CA the sims already use. Override with GRIDSIM_NOTIFY_CERT/KEY.
+  GRIDSIM_NOTIFY_CERT="${GRIDSIM_NOTIFY_CERT:-$M/clients/grid-service-cert.pem}"
+  GRIDSIM_NOTIFY_KEY="${GRIDSIM_NOTIFY_KEY:-$M/clients/grid-service-key.pem}"
+  if [ -r "$GRIDSIM_NOTIFY_CERT" ] && [ -r "$GRIDSIM_NOTIFY_KEY" ]; then
+    GRIDSIM_ARGS+=(-notify-cert "$GRIDSIM_NOTIFY_CERT" -notify-key "$GRIDSIM_NOTIFY_KEY")
+  else
+    echo "  ! no notification client identity at $GRIDSIM_NOTIFY_CERT — an https:// notificationURI"
+    echo "    will be REFUSED and every notification criterion will report unmeasured. Set"
+    echo "    GRIDSIM_NOTIFY_CERT/GRIDSIM_NOTIFY_KEY, or use an http:// listener."
+  fi
+fi
 start gridsim  "$GRIDSIM_PORT" ./bin/server   -listen "0.0.0.0:$GRIDSIM_PORT" -admin "0.0.0.0:$GRIDSIM_ADMIN" \
                  -ca "$M/ca-cert.pem" -cert-chain "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem" \
                  ${GRIDSIM_ARGS+"${GRIDSIM_ARGS[@]}"}
@@ -226,6 +246,10 @@ NOTE (SIM_FLEET=4): gridsim now serves the NORTHBOUND half of the CTP Figure-15
 fixture (-fleet $GRIDSIM_FLEET, subscription=$GRIDSIM_SUBSCRIPTION); verify with
   curl -s localhost:$GRIDSIM_ADMIN/admin/status | jq '.fleet, .subscription'
   curl -s localhost:$GRIDSIM_ADMIN/admin/fleet  | jq '.devices'
+Notifications the server pushed, and what came back, are at
+  curl -s localhost:$GRIDSIM_ADMIN/admin/notifications | jq '.notifications'
+An entry with http_status 0 and an "error" naming ECDHE-ECDSA-AES128-CCM-8 means
+the notification CLIENT identity is missing — see GRIDSIM_NOTIFY_CERT above.
 One thing is still needed and this script cannot do it:
   BOARD: /etc/lexa/modbus.json must list all four devices and lexa-modbus must
   be restarted — see the block at the top of this file for the exact JSON. The
