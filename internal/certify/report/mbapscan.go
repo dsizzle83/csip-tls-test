@@ -115,8 +115,6 @@ func ScanModbus(st *netdis.Stream, frames []*netdis.Frame, server netip.AddrPort
 	if st == nil {
 		return nil, fmt.Errorf("report: ScanModbus with no stream")
 	}
-	sc := &ModbusScan{Stream: st, Server: server}
-
 	client, srv := st.Dirs[0], st.Dirs[1]
 	if endpointAddrPort(client.Flow.Dst) != server {
 		client, srv = srv, client
@@ -125,7 +123,28 @@ func ScanModbus(st *netdis.Stream, frames []*netdis.Frame, server netip.AddrPort
 		return nil, fmt.Errorf("report: neither direction of %s is addressed to the Modbus server %s",
 			st.Key, server)
 	}
+	return ScanModbusStreams(st, frames, server,
+		DirectionStream(client, frames), DirectionStream(srv, frames)), nil
+}
 
+// ScanModbusStreams derives §4.1.2 log entries from two PLAINTEXT directions
+// that are not necessarily netdis directions — the decrypted halves of a Secure
+// SunSpec Modbus session, typically.
+//
+// It is the Modbus counterpart of [ScanHTTPStreams], and exists for the same
+// reason: §4 requires the log to carry "all Modbus messages in unencrypted
+// form", and on this bench the Modbus under test rides mbaps. A scanner that
+// could only frame a cleartext conversation would emit an empty log for every
+// session that matters and leave the submission's most important artefact
+// silently short.
+//
+// st and frames are still needed even when the payload came from a decrypted
+// stream: the `conn` and `disc` entries are TCP control events, they are in the
+// clear whatever rode above them, and they are what §4's "connection
+// information … for Modbus TCP implementations" requires.
+func ScanModbusStreams(st *netdis.Stream, frames []*netdis.Frame, server netip.AddrPort,
+	clientToServer, serverToClient ByteStream) *ModbusScan {
+	sc := &ModbusScan{Stream: st, Server: server}
 	synFrame, finFrame := controlFrames(st, frames)
 
 	// §4.1.1's connection entry. It is emitted only when the SYN was actually
@@ -147,8 +166,8 @@ func ScanModbus(st *netdis.Stream, frames []*netdis.Frame, server netip.AddrPort
 				"for this session is missing from the log", st.Key))
 	}
 
-	sc.frame(client, EntryReq, frames)
-	sc.frame(srv, EntryResp, frames)
+	sc.frame(clientToServer, EntryReq)
+	sc.frame(serverToClient, EntryResp)
 
 	if finFrame != nil {
 		sc.Entries = append(sc.Entries, ScannedEntry{
@@ -170,7 +189,7 @@ func ScanModbus(st *netdis.Stream, frames []*netdis.Frame, server netip.AddrPort
 		}
 		return typeRank(a.Entry.Type) < typeRank(b.Entry.Type)
 	})
-	return sc, nil
+	return sc
 }
 
 func typeRank(t string) int {
@@ -193,31 +212,32 @@ func firstFrame(f []int) int {
 	return f[0]
 }
 
-// frame walks one direction's byte stream, emitting one entry per complete MBAP
+// frame walks one plaintext direction, emitting one entry per complete MBAP
 // frame.
-func (s *ModbusScan) frame(d *netdis.Direction, typ string, frames []*netdis.Frame) {
-	if d == nil || d.Bytes == nil || d.Bytes.Len() == 0 {
+func (s *ModbusScan) frame(bs ByteStream, typ string) {
+	if len(bs.Data) == 0 {
 		return
 	}
-	if d.MidStream {
-		s.Problems = append(s.Problems, fmt.Sprintf(
-			"direction %s was captured mid-connection: its first captured byte is not known to be a "+
-				"message boundary, so no `%s` entries were derived from it", d.Flow, typ))
-		return
+	if d := bs.Dir; d != nil {
+		if d.MidStream {
+			s.Problems = append(s.Problems, fmt.Sprintf(
+				"direction %s was captured mid-connection: its first captured byte is not known to be a "+
+					"message boundary, so no `%s` entries were derived from it", bs.Label, typ))
+			return
+		}
+		if !d.Complete() {
+			s.Problems = append(s.Problems, fmt.Sprintf(
+				"direction %s is missing %d byte(s): a segment was never captured, so the messages after the "+
+					"gap cannot be framed from the capture", bs.Label, d.PendingGap()))
+			return
+		}
 	}
-	if !d.Complete() {
-		s.Problems = append(s.Problems, fmt.Sprintf(
-			"direction %s is missing %d byte(s): a segment was never captured, so the messages after the "+
-				"gap cannot be framed from the capture", d.Flow, d.PendingGap()))
-		return
-	}
-	byIndex := frameIndex(frames)
-	data := d.Bytes.Bytes()
+	data := bs.Data
 	for off := 0; off < len(data); {
 		if off+mbapHeaderLen > len(data) {
 			s.Problems = append(s.Problems, fmt.Sprintf(
 				"direction %s ends with %d byte(s) that are shorter than an MBAP header; the log omits an "+
-					"incomplete trailing message rather than emitting a partial one", d.Flow, len(data)-off))
+					"incomplete trailing message rather than emitting a partial one", bs.Label, len(data)-off))
 			return
 		}
 		length := int(be16(data[off+4 : off+6]))
@@ -225,34 +245,36 @@ func (s *ModbusScan) frame(d *netdis.Direction, typ string, frames []*netdis.Fra
 		if length < 2 {
 			s.Problems = append(s.Problems, fmt.Sprintf(
 				"direction %s: MBAP Length at stream offset %d is %d, which cannot cover a unit id and a "+
-					"function code; framing stopped", d.Flow, off, length))
+					"function code; framing stopped", bs.Label, off, length))
 			return
 		}
 		if end > len(data) {
 			s.Problems = append(s.Problems, fmt.Sprintf(
 				"direction %s: the message at stream offset %d claims %d bytes but only %d were captured; "+
-					"the log omits it rather than emitting a truncated `msg`", d.Flow, off, end-off, len(data)-off),
+					"the log omits it rather than emitting a truncated `msg`", bs.Label, off, end-off, len(data)-off),
 			)
 			return
 		}
 		raw := data[off:end]
 		if _, err := DecodeMBAP(raw); err != nil {
-			s.Problems = append(s.Problems, fmt.Sprintf("direction %s offset %d: %v", d.Flow, off, err))
+			s.Problems = append(s.Problems, fmt.Sprintf("direction %s offset %d: %v", bs.Label, off, err))
 			return
 		}
-		pkts := d.Bytes.PacketsFor(off, end)
-		at := d.Bytes.OffsetToPacket(off)
 		entry := ModbusLogEntry{Type: typ, Msg: HexMsg(raw)}
-		if f, ok := byIndex[at]; ok {
-			entry.Time = UnixTime(f.Time)
-		} else {
+		_, at, ok := bs.At(off)
+		if !ok {
 			s.Problems = append(s.Problems, fmt.Sprintf(
 				"direction %s offset %d: no capture frame carries this byte, so the entry would have no "+
-					"`time`; it was not emitted", d.Flow, off))
+					"`time`; it was not emitted", bs.Label, off))
 			return
 		}
+		entry.Time = UnixTime(at)
+		pkts := []int{}
+		if bs.Frames != nil {
+			pkts = bs.Frames(off, end)
+		}
 		s.Entries = append(s.Entries, ScannedEntry{
-			Entry: entry, Dir: d, Start: off, End: end, Frames: pkts,
+			Entry: entry, Dir: bs.Dir, Start: off, End: end, Frames: pkts,
 		})
 		off = end
 	}
