@@ -162,6 +162,17 @@ type Server struct {
 	// Guarded by paginateMu. See paginate.go.
 	paginateMu sync.Mutex
 	paginate   paginateState
+
+	// fleet is the CTP Figure-15 aggregator topology (default off — nil).
+	// Guarded by mu, like every other resource-tree fact. See fleet.go.
+	fleet *fleetState
+
+	// subs is the Subscription/Notification function set (default off — nil).
+	// The POINTER is guarded by mu; the store behind it carries its own mutex,
+	// which sits BELOW mu in the lock order (see subState). Nothing may take
+	// that mutex while holding mu, which is why the SubscriptionList resources
+	// are generated at GET time rather than stored in s.resources.
+	subs *subState
 }
 
 // NewServer creates a grid sim with a complete CSIP conformance resource tree.
@@ -235,7 +246,7 @@ func (s *Server) ClockSkew() int64 {
 // scenario rows post controls as their setup step, so it fires on the cases that
 // need the fast cadence most.
 //
-// WHY THIS LEVER EXISTS
+// # WHY THIS LEVER EXISTS
 //
 // A conformant 2030.5 client in poll_rate_mode=honor paces its whole-tree walk
 // at the SLOWEST advertised class pollRate, so that no resource is fetched more
@@ -391,7 +402,25 @@ func (s *Server) DataPlaneAddr() string {
 
 // rebuildEndDeviceList reconstructs the /edev resource with the current
 // ClientLFDI and clientSFDI. Caller must hold s.mu for writing.
-func (s *Server) rebuildEndDeviceList() {
+func (s *Server) rebuildEndDeviceList() { s.rebuildEndDeviceListLocked() }
+
+// rebuildEndDeviceListLocked is rebuildEndDeviceList's body, named so the
+// Subscription and fleet levers can call it from code that already holds s.mu.
+//
+// The three shapes it can serve are the three configurations gridsim has:
+// the fleet's five-EndDevice Figure-15 list, the default three-EndDevice list
+// widened with SubscriptionListLinks, or — when neither lever is on — exactly
+// the bytes this simulator has always served.
+func (s *Server) rebuildEndDeviceListLocked() {
+	if s.fleet != nil {
+		s.buildFleetLocked()
+		return
+	}
+	if s.subs != nil {
+		s.rebuildSubscribableEndDeviceListLocked()
+		return
+	}
+
 	boolTrue := true
 	now := time.Now().Unix()
 
@@ -452,7 +481,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		s.handleGET(w, path, peerLFDI, r.URL.Query())
+		s.handleGET(w, r, path, peerLFDI, r.URL.Query())
 	case http.MethodPost:
 		s.handlePOST(w, r, path, peerLFDI)
 	case http.MethodPut:
@@ -460,7 +489,17 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		// under an EndDevice's DER tree accept the client's self-report.
 		// Any other path falls through to 405.
 		s.handlePUT(w, r, path)
-	case http.MethodDelete, http.MethodPatch, http.MethodHead, http.MethodOptions:
+	case http.MethodDelete:
+		// A Subscription is the one resource in this tree a client may DELETE
+		// (IEEE 2030.5 §10.1 / CORE-019's cancellation). Every other path keeps
+		// the 405 + Allow answer it has always had, so a run without the
+		// Subscription function set behaves exactly as before.
+		if s.handleSubscriptionRequest(w, r, path) {
+			return
+		}
+		w.Header().Set("Allow", "GET, POST, PUT")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	case http.MethodPatch, http.MethodHead, http.MethodOptions:
 		// Known HTTP method, not allowed here → 405 with an Allow header
 		// listing valid methods (GEN.045).
 		w.Header().Set("Allow", "GET, POST, PUT")
@@ -471,7 +510,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string, query url.Values) {
+func (s *Server) handleGET(w http.ResponseWriter, r *http.Request, path, peerLFDI string, query url.Values) {
 	// ERR-001 redirect injection (QA, default off): while armed, the first N
 	// GETs of the configured path answer 301/302 + Location so the hub's
 	// redirect_max follow path is exercised on the wire. Sits above routing
@@ -502,11 +541,22 @@ func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string, query u
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		// Return a filtered EndDeviceList showing only the connecting device.
+		// Return a filtered EndDeviceList showing only the connecting device —
+		// or, in fleet mode, the aggregator's own EndDevice plus the managed
+		// devices the server has assigned to it (fleet.go).
 		if path == "/edev" {
+			if s.serveFleetEndDeviceList(w, peerLFDI) {
+				return
+			}
 			s.serveFilteredEndDeviceList(w, peerLFDI)
 			return
 		}
+	}
+
+	// The Subscription function set (default off) is served from its own store
+	// rather than from the resource map, so it is routed before the lookup.
+	if s.handleSubscriptionRequest(w, r, path) {
+		return
 	}
 
 	// Keep /tm current: refresh CurrentTime on every GET so the hub's
@@ -547,29 +597,48 @@ func (s *Server) handleGET(w http.ResponseWriter, path, peerLFDI string, query u
 
 // serveFilteredEndDeviceList builds an EndDeviceList containing only the
 // EndDevice whose LFDI matches peerLFDI. Case-insensitive comparison.
+//
+// It handles both list shapes gridsim can hold: the default
+// model.EndDeviceList and the widened fleetEndDeviceList the fleet and
+// Subscription levers install (fleet.go). A stranger reaching this path while
+// the fleet is served gets the same one-device answer it always got — the
+// fleet is disclosed by serveFleetEndDeviceList to the aggregator alone.
 func (s *Server) serveFilteredEndDeviceList(w http.ResponseWriter, peerLFDI string) {
 	s.mu.RLock()
-	edl, ok := s.resources["/edev"].(*model.EndDeviceList)
+	res := s.resources["/edev"]
 	s.mu.RUnlock()
-	if !ok {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
 
-	var filtered []model.EndDevice
-	for _, ed := range edl.EndDevice {
-		if strings.EqualFold(ed.LFDI, peerLFDI) {
-			filtered = append(filtered, ed)
+	switch edl := res.(type) {
+	case *model.EndDeviceList:
+		var filtered []model.EndDevice
+		for _, ed := range edl.EndDevice {
+			if strings.EqualFold(ed.LFDI, peerLFDI) {
+				filtered = append(filtered, ed)
+			}
 		}
+		n := uint32(len(filtered))
+		s.serveXML(w, &model.EndDeviceList{
+			Resource:  model.Resource{Href: "/edev"},
+			All:       n,
+			Results:   n,
+			PollRate:  edl.PollRate,
+			EndDevice: filtered,
+		})
+	case *fleetEndDeviceList:
+		var filtered []fleetEndDevice
+		for _, ed := range edl.EndDevice {
+			if strings.EqualFold(ed.LFDI, peerLFDI) {
+				filtered = append(filtered, ed)
+			}
+		}
+		n := uint32(len(filtered))
+		s.serveXML(w, &fleetEndDeviceList{
+			Href: "/edev", All: n, Results: n,
+			PollRate: edl.PollRate, Subscribable: edl.Subscribable, EndDevice: filtered,
+		})
+	default:
+		w.WriteHeader(http.StatusInternalServerError)
 	}
-	n := uint32(len(filtered))
-	s.serveXML(w, &model.EndDeviceList{
-		Resource:  model.Resource{Href: "/edev"},
-		All:       n,
-		Results:   n,
-		PollRate:  edl.PollRate,
-		EndDevice: filtered,
-	})
 }
 
 func (s *Server) handlePOST(w http.ResponseWriter, r *http.Request, path, peerLFDI string) {
@@ -582,6 +651,9 @@ func (s *Server) handlePOST(w http.ResponseWriter, r *http.Request, path, peerLF
 		s.handleResponsePost(w, r, path)
 	case isLogEventListPath(path):
 		s.handleLogEventPost(w, r, path, peerLFDI)
+	// The client's Subscription POST (default off): 201 Created with a
+	// Location header naming the created subscription. See subscribe.go.
+	case s.handleSubscriptionRequest(w, r, path):
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}

@@ -32,6 +32,17 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/responses", cors(s.handleAdminResponses))
 	mux.HandleFunc("/admin/derputs", cors(s.handleAdminDERPuts))
 	mux.HandleFunc("/admin/logevents", cors(s.handleAdminLogEvents))
+	// The DER AGGREGATOR CLIENT levers (2026-07-28 re-scope). Both are inert
+	// unless the corresponding capability was enabled at startup, and both
+	// report that state so a preflight can PROBE for the fixture rather than
+	// assume it: /admin/fleet lists the CTP Figure-15 EndDevices and adjusts a
+	// per-device pIN or aggregator binding, /admin/subscriptions lists the live
+	// subscriptions WITH the notificationURI the DUT registered (which is the
+	// only place a harness can learn the DUT's inbound listener address), and
+	// /admin/notifications is what the server pushed and what came back.
+	mux.HandleFunc("/admin/fleet", cors(s.handleAdminFleet))
+	mux.HandleFunc("/admin/subscriptions", cors(s.handleAdminSubscriptions))
+	mux.HandleFunc("/admin/notifications", cors(s.handleAdminNotifications))
 	// The runtime certificate-chain lever (COMM-004 D/E/F/G). See chain.go for
 	// why it takes PEM text rather than paths, and why a gridsim with no TLS
 	// data plane answers it 501 rather than 404.
@@ -166,6 +177,46 @@ type adminStatusResp struct {
 	// observations about another server's traffic. See Server.SetDataPlaneAddr.
 	PID       int    `json:"pid"`
 	DataPlane string `json:"data_plane,omitempty"`
+
+	// Fleet and Subscription publish the two DER AGGREGATOR CLIENT capabilities
+	// this simulator can be started with, so a conformance run can PROBE for
+	// them instead of assuming either way.
+	//
+	// Assuming is the failure mode worth naming. A harness that assumed the
+	// fixture was present would report a one-EndDevice bench as a DUT that
+	// ignored four devices; one that assumed it was absent would keep SKIPping
+	// rows the bench had grown the ability to run, and the SKIP would look like
+	// diligence rather than staleness. Both are silent. Publishing the state
+	// makes the question answerable in one GET.
+	Fleet        AdminFleetStatus        `json:"fleet"`
+	Subscription AdminSubscriptionStatus `json:"subscription"`
+}
+
+// AdminFleetStatus is the CTP Figure-15 topology's state, in /admin/status.
+type AdminFleetStatus struct {
+	// Enabled is whether the four managed EndDevices are being served.
+	Enabled bool `json:"enabled"`
+	// Size is the number of MANAGED devices (the served EndDeviceList holds one
+	// more — the aggregator's own).
+	Size int `json:"size"`
+	// Devices names them, in the document's order.
+	Devices []string `json:"devices,omitempty"`
+	// AggregatorHref is the EndDevice the DUT's own certificate LFDI maps to.
+	AggregatorHref string `json:"aggregator_href,omitempty"`
+}
+
+// AdminSubscriptionStatus is the Subscription/Notification function set's
+// state, in /admin/status.
+type AdminSubscriptionStatus struct {
+	// Enabled is whether SubscriptionListLinks are advertised and Notifications
+	// originated.
+	Enabled bool `json:"enabled"`
+	// Subscriptions is how many the DUT currently holds, and Notifications how
+	// many the server has pushed. A check reading zero notifications against a
+	// non-zero subscription count is reading a bench that never changed
+	// anything, not a DUT that ignored one.
+	Subscriptions int `json:"subscriptions"`
+	Notifications int `json:"notifications"`
 }
 
 var progMeta = []struct {
@@ -184,8 +235,26 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Collected BEFORE the read lock below: Subscriptions/SentNotifications
+	// take s.mu themselves, and re-entering a RWMutex read lock deadlocks the
+	// moment a writer is queued between the two acquisitions.
+	subStatus := AdminSubscriptionStatus{
+		Enabled:       s.SubscriptionsEnabled(),
+		Subscriptions: len(s.Subscriptions()),
+		Notifications: len(s.SentNotifications()),
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	fleetStatus := AdminFleetStatus{Enabled: s.fleet != nil}
+	if s.fleet != nil {
+		fleetStatus.Size = len(s.fleet.devices)
+		fleetStatus.AggregatorHref = fmt.Sprintf("/edev/%d", aggregatorEdevIndex)
+		for _, d := range s.fleet.devices {
+			fleetStatus.Devices = append(fleetStatus.Devices, d.Name)
+		}
+	}
 
 	var programs []adminProgInfo
 	for i, pm := range progMeta {
@@ -232,6 +301,9 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 		PollRateS:  s.advertisedPollRateLocked(),
 		PID:        os.Getpid(),
 		DataPlane:  s.dataPlaneAddr,
+
+		Fleet:        fleetStatus,
+		Subscription: subStatus,
 	})
 }
 
@@ -417,6 +489,21 @@ func (s *Server) handleAdminControl(w http.ResponseWriter, r *http.Request) {
 
 var progPrefixes = []string{"SP", "SITE", "SYS"}
 
+// notifyControlChange is the Subscription function set's hook into the control
+// levers: a DERControlList that gained or changed an entry is a change a
+// subscriber asked to be told about.
+//
+// It is called AFTER the resource tree already holds the new list and with no
+// lock held, so a client that GETs the href out of the Notification reads the
+// state the Notification described. The ActiveDERControlList is notified too
+// because it is separately subscribable and separately mutated.
+func (s *Server) notifyControlChange(program int) {
+	s.notifyChanged(
+		fmt.Sprintf("/derp/%d/derc", program),
+		fmt.Sprintf("/derp/%d/actderc", program),
+	)
+}
+
 func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	var req adminCtrlReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -486,8 +573,13 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// original activate/append semantics exactly.
 	matchMRID := req.MRID != ""
 
+	// NOT deferred: the Notification this change owes its subscribers is pushed
+	// after the unlock (notifyControlChange dials out, and holding the resource
+	// lock across a network round-trip to the DUT would stall every CSIP
+	// request the DUT makes in the meantime — including the GET it makes
+	// BECAUSE of the Notification). There is no early return between here and
+	// the unlock below.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Write to derc (scheduled list) — this is what the hub's walker reads via
 	// DERControlListLink. The scheduler evaluates the time window and marks it
@@ -546,6 +638,10 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		actList.All = uint32(len(actList.DERControl))
 		actList.Results = actList.All
 	}
+	s.mu.Unlock()
+
+	s.notifyControlChange(req.Program)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]string{"mrid": ctrl.MRID})
@@ -623,8 +719,6 @@ func (s *Server) adminCtrlDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	for _, path := range []string{
 		fmt.Sprintf("/derp/%d/derc", req.Program),
 		fmt.Sprintf("/derp/%d/actderc", req.Program),
@@ -642,6 +736,13 @@ func (s *Server) adminCtrlDelete(w http.ResponseWriter, r *http.Request) {
 			list.Results = 0
 		}
 	}
+	s.mu.Unlock()
+
+	// Clearing a list is a change to it too. A subscriber that heard about the
+	// control's creation and not about its removal would hold a schedule the
+	// server has stopped serving.
+	s.notifyControlChange(req.Program)
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -740,8 +841,6 @@ func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	path := fmt.Sprintf("/derp/%d/dderc", req.Program)
 	if dderc, ok := s.resources[path].(*model.DefaultDERControl); ok {
 		if req.Clear {
@@ -750,5 +849,9 @@ func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
 			dderc.DERControlBase = buildBase(req.Base)
 		}
 	}
+	s.mu.Unlock()
+
+	s.notifyChanged(path)
+
 	w.WriteHeader(http.StatusNoContent)
 }

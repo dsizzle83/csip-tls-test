@@ -1,0 +1,478 @@
+=== /ca
+<CustomerAccountList xmlns="urn:ieee:std:2030.5:ns" href="/ca" all="1" results="1">
+  <CustomerAccount xmlns="urn:ieee:std:2030.5:ns" href="/ca/0">
+    <mRID>ACCT-001</mRID>
+    <description>Service Point Account</description>
+    <currency>840</currency>
+    <customerAccount>SP-0001</customerAccount>
+    <customerName>QA Bench</customerName>
+    <pricePowerOfTenMultiplier>-3</pricePowerOfTenMultiplier>
+    <CustomerAgreementListLink href="/ca/0/ag" all="1"></CustomerAgreementListLink>
+  </CustomerAccount>
+</CustomerAccountList>
+=== /ca/0/ag
+<CustomerAgreementList xmlns="urn:ieee:std:2030.5:ns" href="/ca/0/ag" all="1" results="1">
+  <CustomerAgreement xmlns="urn:ieee:std:2030.5:ns" href="/ca/0/ag/0">
+    <mRID>AGR-001</mRID>
+    <description>Residential TOU agreement</description>
+    <serviceLocation>Service Point</serviceLocation>
+    <TariffProfileLink href="/tp/0"></TariffProfileLink>
+  </CustomerAgreement>
+</CustomerAgreementList>
+=== /dcap
+<DeviceCapability xmlns="urn:ieee:std:2030.5:ns" href="/dcap" pollRate="300">
+  <TimeLink href="/tm"></TimeLink>
+  <ResponseSetListLink href="/rsps" all="1"></ResponseSetListLink>
+  <EndDeviceListLink href="/edev" all="3"></EndDeviceListLink>
+  <MirrorUsagePointListLink href="/mup"></MirrorUsagePointListLink>
+  <SelfDeviceLink href="/sdev"></SelfDeviceLink>
+</DeviceCapability>
+=== /derp/0/actderc
+<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/actderc" all="1" results="1" pollRate="60">
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/actderc/0">
+    <mRID>DERC-SP-000</mRID>
+    <description>Currently active: export limit 2kW</description>
+    <creationTime>EPOCH</creationTime>
+    <EventStatus>
+      <currentStatus>1</currentStatus>
+      <dateTime>EPOCH</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>600</duration>
+      <start>EPOCH</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>2000</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+</DERControlList>
+=== /derp/0/dc
+<DERCurveList xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/dc" all="1" results="1" pollRate="300">
+  <DERCurve xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/dc/0">
+    <mRID>CURVE-VV-001</mRID>
+    <description>Volt-VAr curve</description>
+    <curveType>0</curveType>
+    <CurveData>
+      <xvalue>92</xvalue>
+      <yvalue>30</yvalue>
+    </CurveData>
+    <CurveData>
+      <xvalue>98</xvalue>
+      <yvalue>0</yvalue>
+    </CurveData>
+    <CurveData>
+      <xvalue>102</xvalue>
+      <yvalue>0</yvalue>
+    </CurveData>
+    <CurveData>
+      <xvalue>108</xvalue>
+      <yvalue>-30</yvalue>
+    </CurveData>
+    <vRef>240</vRef>
+    <xRefType>1</xRefType>
+    <yRefType>4</yRefType>
+  </DERCurve>
+</DERCurveList>
+=== /derp/0/dderc
+<DefaultDERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/dderc">
+  <mRID>DDERC-SP-001</mRID>
+  <description>Default: export limit 5kW, connect and energize</description>
+  <DERControlBase>
+    <opModConnect>true</opModConnect>
+    <opModEnergize>true</opModEnergize>
+    <opModExpLimW>
+      <multiplier>0</multiplier>
+      <value>5000</value>
+    </opModExpLimW>
+  </DERControlBase>
+</DefaultDERControl>
+=== /derp/0/derc
+<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc" all="4" results="4" pollRate="60">
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc/0">
+    <mRID>DERC-SP-001</mRID>
+    <description>Limit export to 3kW (potentially superseded)</description>
+    <creationTime>EPOCH</creationTime>
+    <EventStatus>
+      <currentStatus>0</currentStatus>
+      <dateTime>EPOCH</dateTime>
+      <potentiallySuperseded>true</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>120</duration>
+      <start>EPOCH</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>3000</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc/1">
+    <mRID>DERC-SP-002</mRID>
+    <description>Limit export to 2.5kW (supersedes SP-001)</description>
+    <creationTime>EPOCH</creationTime>
+    <EventStatus>
+      <currentStatus>0</currentStatus>
+      <dateTime>EPOCH</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>300</duration>
+      <start>EPOCH</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>2500</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc/2">
+    <mRID>DERC-SP-003</mRID>
+    <description>Cancelled control (client must ignore)</description>
+    <creationTime>EPOCH</creationTime>
+    <EventStatus>
+      <currentStatus>6</currentStatus>
+      <dateTime>EPOCH</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>120</duration>
+      <start>EPOCH</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>4000</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc/3">
+    <mRID>DERC-SP-004</mRID>
+    <description>Randomized export limit 3.5kW</description>
+    <creationTime>EPOCH</creationTime>
+    <EventStatus>
+      <currentStatus>0</currentStatus>
+      <dateTime>EPOCH</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>180</duration>
+      <start>EPOCH</start>
+    </interval>
+    <DERControlBase>
+      <opModConnect>true</opModConnect>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>3500</value>
+      </opModExpLimW>
+    </DERControlBase>
+    <randomizeStart>30</randomizeStart>
+  </DERControl>
+</DERControlList>
+=== /derp/1/actderc
+<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="/derp/1/actderc" all="0" results="0"></DERControlList>
+=== /derp/1/dderc
+<DefaultDERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/1/dderc">
+  <mRID>DDERC-SITE-001</mRID>
+  <description>Site default: export limit 7kW</description>
+  <DERControlBase>
+    <opModConnect>true</opModConnect>
+    <opModEnergize>true</opModEnergize>
+    <opModExpLimW>
+      <multiplier>0</multiplier>
+      <value>7000</value>
+    </opModExpLimW>
+  </DERControlBase>
+</DefaultDERControl>
+=== /derp/1/derc
+<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="/derp/1/derc" all="2" results="2" pollRate="120">
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/1/derc/0">
+    <mRID>DERC-SITE-001</mRID>
+    <description>Site: limit to 6kW (morning peak)</description>
+    <creationTime>EPOCH</creationTime>
+    <EventStatus>
+      <currentStatus>0</currentStatus>
+      <dateTime>EPOCH</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>3600</duration>
+      <start>EPOCH</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>6000</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/1/derc/1">
+    <mRID>DERC-SITE-002</mRID>
+    <description>Site: limit to 5kW (afternoon peak)</description>
+    <creationTime>EPOCH</creationTime>
+    <EventStatus>
+      <currentStatus>0</currentStatus>
+      <dateTime>EPOCH</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>7200</duration>
+      <start>EPOCH</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>5000</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+</DERControlList>
+=== /derp/2/actderc
+<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="/derp/2/actderc" all="0" results="0"></DERControlList>
+=== /derp/2/dderc
+<DefaultDERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/2/dderc">
+  <mRID>DDERC-SYS-001</mRID>
+  <description>System default: export limit 9kW (utility-wide baseline)</description>
+  <DERControlBase>
+    <opModConnect>true</opModConnect>
+    <opModEnergize>true</opModEnergize>
+    <opModExpLimW>
+      <multiplier>0</multiplier>
+      <value>9000</value>
+    </opModExpLimW>
+  </DERControlBase>
+</DefaultDERControl>
+=== /derp/2/derc
+<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="/derp/2/derc" all="1" results="1" pollRate="300">
+  <DERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/2/derc/0">
+    <mRID>DERC-SYS-001</mRID>
+    <description>System: utility-wide curtailment 8kW</description>
+    <creationTime>EPOCH</creationTime>
+    <EventStatus>
+      <currentStatus>0</currentStatus>
+      <dateTime>EPOCH</dateTime>
+      <potentiallySuperseded>false</potentiallySuperseded>
+    </EventStatus>
+    <interval>
+      <duration>14400</duration>
+      <start>EPOCH</start>
+    </interval>
+    <DERControlBase>
+      <opModExpLimW>
+        <multiplier>0</multiplier>
+        <value>8000</value>
+      </opModExpLimW>
+    </DERControlBase>
+  </DERControl>
+</DERControlList>
+=== /edev
+<EndDeviceList xmlns="urn:ieee:std:2030.5:ns" href="/edev" all="3" results="3" pollRate="300">
+  <EndDevice xmlns="urn:ieee:std:2030.5:ns" href="/edev/0">
+    <lFDI>0000000000000000000000000000000000000001</lFDI>
+    <sFDI>100000001</sFDI>
+    <changedTime>EPOCH</changedTime>
+  </EndDevice>
+  <EndDevice xmlns="urn:ieee:std:2030.5:ns" href="/edev/1">
+    <lFDI>0000000000000000000000000000000000000002</lFDI>
+    <sFDI>100000002</sFDI>
+    <changedTime>EPOCH</changedTime>
+  </EndDevice>
+  <EndDevice xmlns="urn:ieee:std:2030.5:ns" href="/edev/2">
+    <lFDI>ABCDEF0123456789ABCDEF0123456789ABCDEF01</lFDI>
+    <sFDI>123456789</sFDI>
+    <changedTime>EPOCH</changedTime>
+    <enabled>true</enabled>
+    <DERListLink href="/edev/2/der" all="1"></DERListLink>
+    <FunctionSetAssignmentsListLink href="/edev/2/fsa" all="1"></FunctionSetAssignmentsListLink>
+    <RegistrationLink href="/edev/2/reg"></RegistrationLink>
+    <LogEventListLink href="/edev/2/lev"></LogEventListLink>
+  </EndDevice>
+</EndDeviceList>
+=== /edev/2/der
+<DERList xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/der" all="1" results="1">
+  <DER xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/der/0">
+    <DERCapabilityLink href="/edev/2/der/0/dercap"></DERCapabilityLink>
+    <DERSettingsLink href="/edev/2/der/0/derset"></DERSettingsLink>
+    <DERStatusLink href="/edev/2/der/0/derstat"></DERStatusLink>
+    <DERAvailabilityLink href="/edev/2/der/0/deravail"></DERAvailabilityLink>
+  </DER>
+</DERList>
+=== /edev/2/der/0/deravail
+<DERAvailability xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/der/0/deravail">
+  <readingTime>EPOCH</readingTime>
+  <availabilityDuration>3600</availabilityDuration>
+</DERAvailability>
+=== /edev/2/der/0/dercap
+<DERCapability xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/der/0/dercap">
+  <type>80</type>
+  <rtgMaxW>
+    <multiplier>0</multiplier>
+    <value>10000</value>
+  </rtgMaxW>
+</DERCapability>
+=== /edev/2/der/0/derset
+<DERSettings xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/der/0/derset">
+  <setMaxW>
+    <multiplier>0</multiplier>
+    <value>10000</value>
+  </setMaxW>
+  <updatedTime>EPOCH</updatedTime>
+</DERSettings>
+=== /edev/2/der/0/derstat
+<DERStatus xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/der/0/derstat">
+  <genConnectStatus>
+    <value>1</value>
+  </genConnectStatus>
+  <operationalModeStatus>
+    <value>1</value>
+  </operationalModeStatus>
+  <readingTime>EPOCH</readingTime>
+</DERStatus>
+=== /edev/2/fsa
+<FunctionSetAssignmentsList xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/fsa" all="1" results="1" pollRate="300">
+  <FunctionSetAssignments xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/fsa/0">
+    <DERProgramListLink href="/edev/2/fsa/0/derp" all="3"></DERProgramListLink>
+    <TimeLink href="/tm"></TimeLink>
+    <TariffProfileListLink href="/tp" all="1"></TariffProfileListLink>
+    <CustomerAccountListLink href="/ca" all="1"></CustomerAccountListLink>
+    <mRID>FSA-SP-001</mRID>
+    <description>Service Point FSA</description>
+  </FunctionSetAssignments>
+</FunctionSetAssignmentsList>
+=== /edev/2/fsa/0/derp
+<DERProgramList xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/fsa/0/derp" all="3" results="3" pollRate="60">
+  <DERProgram xmlns="urn:ieee:std:2030.5:ns" href="/derp/0">
+    <mRID>DERP-SP-001</mRID>
+    <description>Service Point DER Program</description>
+    <primacy>1</primacy>
+    <DERControlListLink href="/derp/0/derc" all="4"></DERControlListLink>
+    <DERCurveListLink href="/derp/0/dc" all="1"></DERCurveListLink>
+    <DefaultDERControlLink href="/derp/0/dderc"></DefaultDERControlLink>
+    <ActiveDERControlListLink href="/derp/0/actderc" all="1"></ActiveDERControlListLink>
+  </DERProgram>
+  <DERProgram xmlns="urn:ieee:std:2030.5:ns" href="/derp/1">
+    <mRID>DERP-SITE-001</mRID>
+    <description>Site-Level DER Program</description>
+    <primacy>5</primacy>
+    <DERControlListLink href="/derp/1/derc" all="2"></DERControlListLink>
+    <DefaultDERControlLink href="/derp/1/dderc"></DefaultDERControlLink>
+    <ActiveDERControlListLink href="/derp/1/actderc"></ActiveDERControlListLink>
+  </DERProgram>
+  <DERProgram xmlns="urn:ieee:std:2030.5:ns" href="/derp/2">
+    <mRID>DERP-SYS-001</mRID>
+    <description>System-Level DER Program</description>
+    <primacy>10</primacy>
+    <DERControlListLink href="/derp/2/derc" all="1"></DERControlListLink>
+    <DefaultDERControlLink href="/derp/2/dderc"></DefaultDERControlLink>
+    <ActiveDERControlListLink href="/derp/2/actderc"></ActiveDERControlListLink>
+  </DERProgram>
+</DERProgramList>
+=== /edev/2/lev
+<LogEventList xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/lev" all="0" results="0" pollRate="300"></LogEventList>
+=== /edev/2/reg
+<Registration xmlns="urn:ieee:std:2030.5:ns" href="/edev/2/reg">
+  <dateTimeRegistered>EPOCH</dateTimeRegistered>
+  <pIN>111115</pIN>
+</Registration>
+=== /mup
+<MirrorUsagePointList xmlns="urn:ieee:std:2030.5:ns" href="/mup" all="0" results="0"></MirrorUsagePointList>
+=== /rsps
+<ResponseSetList xmlns="urn:ieee:std:2030.5:ns" href="/rsps" all="1" results="1">
+  <ResponseSet xmlns="urn:ieee:std:2030.5:ns" href="/rsps/0">
+    <mRID>RSP-SP-001</mRID>
+    <ResponseListLink href="/rsps/0/r"></ResponseListLink>
+  </ResponseSet>
+</ResponseSetList>
+=== /rsps/0
+<ResponseSet xmlns="urn:ieee:std:2030.5:ns" href="/rsps/0">
+  <mRID>RSP-SP-001</mRID>
+  <ResponseListLink href="/rsps/0/r"></ResponseListLink>
+</ResponseSet>
+=== /tm
+<Time xmlns="urn:ieee:std:2030.5:ns" href="/tm" pollRate="900">
+  <currentTime>EPOCH</currentTime>
+  <dstEndTime>EPOCH</dstEndTime>
+  <dstOffset>3600</dstOffset>
+  <tzOffset>-18000</tzOffset>
+  <quality>7</quality>
+</Time>
+=== /tp
+<TariffProfileList xmlns="urn:ieee:std:2030.5:ns" href="/tp" all="1" results="1" pollRate="300">
+  <TariffProfile xmlns="urn:ieee:std:2030.5:ns" href="/tp/0">
+    <mRID>TP-SP-001</mRID>
+    <description>Service Point TOU Tariff</description>
+    <currency>840</currency>
+    <pricePowerOfTenMultiplier>-3</pricePowerOfTenMultiplier>
+    <primacy>1</primacy>
+    <rateCode>TOU-RES</rateCode>
+    <RateComponentListLink href="/tp/0/rc" all="1"></RateComponentListLink>
+  </TariffProfile>
+</TariffProfileList>
+=== /tp/0/rc
+<RateComponentList xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc" all="1" results="1">
+  <RateComponent xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0">
+    <mRID>RC-FWD-001</mRID>
+    <description>Forward (consumption) rate</description>
+    <roleFlags>4</roleFlags>
+    <TimeTariffIntervalListLink href="/tp/0/rc/0/tti" all="2"></TimeTariffIntervalListLink>
+    <ActiveTimeTariffIntervalListLink href="/tp/0/rc/0/acttti" all="1"></ActiveTimeTariffIntervalListLink>
+  </RateComponent>
+</RateComponentList>
+=== /tp/0/rc/0/acttti
+<TimeTariffIntervalList xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0/acttti" all="1" results="1">
+  <TimeTariffInterval xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0/tti/0">
+    <mRID>TTI-OFFPEAK</mRID>
+    <description>Off-peak</description>
+    <interval>
+      <duration>43200</duration>
+      <start>EPOCH</start>
+    </interval>
+    <touTier>1</touTier>
+    <ConsumptionTariffIntervalListLink href="/tp/0/rc/0/tti/0/cti" all="1"></ConsumptionTariffIntervalListLink>
+  </TimeTariffInterval>
+</TimeTariffIntervalList>
+=== /tp/0/rc/0/tti
+<TimeTariffIntervalList xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0/tti" all="2" results="2">
+  <TimeTariffInterval xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0/tti/0">
+    <mRID>TTI-OFFPEAK</mRID>
+    <description>Off-peak</description>
+    <interval>
+      <duration>43200</duration>
+      <start>EPOCH</start>
+    </interval>
+    <touTier>1</touTier>
+    <ConsumptionTariffIntervalListLink href="/tp/0/rc/0/tti/0/cti" all="1"></ConsumptionTariffIntervalListLink>
+  </TimeTariffInterval>
+  <TimeTariffInterval xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0/tti/1">
+    <mRID>TTI-PEAK</mRID>
+    <description>Peak</description>
+    <interval>
+      <duration>21600</duration>
+      <start>EPOCH</start>
+    </interval>
+    <touTier>2</touTier>
+    <ConsumptionTariffIntervalListLink href="/tp/0/rc/0/tti/1/cti" all="1"></ConsumptionTariffIntervalListLink>
+  </TimeTariffInterval>
+</TimeTariffIntervalList>
+=== /tp/0/rc/0/tti/0/cti
+<ConsumptionTariffIntervalList xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0/tti/0/cti" all="1" results="1">
+  <ConsumptionTariffInterval xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0/tti/0/cti/0">
+    <consumptionBlock>0</consumptionBlock>
+    <price>12000</price>
+    <startValue>0</startValue>
+  </ConsumptionTariffInterval>
+</ConsumptionTariffIntervalList>
+=== /tp/0/rc/0/tti/1/cti
+<ConsumptionTariffIntervalList xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0/tti/1/cti" all="1" results="1">
+  <ConsumptionTariffInterval xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0/tti/1/cti/0">
+    <consumptionBlock>0</consumptionBlock>
+    <price>45000</price>
+    <startValue>0</startValue>
+  </ConsumptionTariffInterval>
+</ConsumptionTariffIntervalList>
