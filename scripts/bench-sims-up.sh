@@ -77,9 +77,15 @@ start(){ # name port cmd...
   fi
 }
 
+# Distinct -serial per sim: the gateway keys device identity on
+# manufacturer|model|serial, so two inverters sharing the hardcoded default
+# serial dedup into ONE northbound unit. Give them distinct serials so they
+# present as two DERs (override via MODSIM_SERIAL/MBAPS_SERIAL).
+MODSIM_SERIAL="${MODSIM_SERIAL:-BENCH-MODSIM-01}"
+MBAPS_SERIAL="${MBAPS_SERIAL:-BENCH-MBAPS-01}"
 echo "Bringing up sims (logs in $LOG):"
-start modsim   "$MODSIM_PORT"  ./bin/modsim   -port "$MODSIM_PORT" -advanced -wmax 8000
-start mbapsdev "$MBAPS_PORT"   ./bin/mbapsdev -listen ":$MBAPS_PORT" -model inverter -wmax 6000 \
+start modsim   "$MODSIM_PORT"  ./bin/modsim   -port "$MODSIM_PORT" -advanced -wmax 8000 -serial "$MODSIM_SERIAL"
+start mbapsdev "$MBAPS_PORT"   ./bin/mbapsdev -listen ":$MBAPS_PORT" -model inverter -wmax 6000 -serial "$MBAPS_SERIAL" \
                  -ca "$M/dev-ca.pem" -cert "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem"
 start gridsim  "$GRIDSIM_PORT" ./bin/server   -listen "0.0.0.0:$GRIDSIM_PORT" -admin "0.0.0.0:$GRIDSIM_ADMIN" \
                  -ca "$M/ca-cert.pem" -cert-chain "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem"
