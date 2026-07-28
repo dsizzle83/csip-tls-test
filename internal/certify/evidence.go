@@ -226,25 +226,49 @@ func (e *Evidence) Stream(remote netip.AddrPort) (*netdis.Stream, error) {
 	}
 }
 
-// StreamOn returns this check's single conversation whose remote port is port,
-// which is what a check that dialled a well-known port actually knows.
-func (e *Evidence) StreamOn(port uint16) (*netdis.Stream, error) {
+// StreamsOn returns every attributed conversation whose remote port is port,
+// in capture order.
+//
+// Prefer this over StreamOn wherever more than one conversation to the same
+// service is ORDINARY rather than exceptional. It is ordinary more often than
+// it looks: a DUT that runs several client roles against one server (a 2030.5
+// gateway walking discovery while its telemetry role POSTs meter readings to
+// the same host:port) opens an independent connection per role, and a server
+// with an idle timeout gives every poll cycle a fresh one. A caller that
+// demands uniqueness in that setting never gets an answer at all.
+//
+// Callers pick the conversation they mean by INSPECTING it, and record why.
+func (e *Evidence) StreamsOn(port uint16) ([]*netdis.Stream, error) {
 	var hits []*netdis.Stream
 	for _, st := range e.Streams() {
 		if st.Key.A.Port == port || st.Key.B.Port == port {
 			hits = append(hits, st)
 		}
 	}
-	switch len(hits) {
-	case 0:
+	if len(hits) == 0 {
 		return nil, fmt.Errorf("certify: %s: no attributed conversation on port %d (attributed streams: %s)",
 			e.Case.UID, port, strings.Join(e.Set.Streams, ", "))
-	case 1:
-		return hits[0], nil
-	default:
+	}
+	return hits, nil
+}
+
+// StreamOn returns this check's single conversation whose remote port is port,
+// which is what a check that dialled a well-known port actually knows.
+//
+// It is deliberately strict: if the check's window caught more than one
+// conversation, the check cannot know which one it meant, and guessing would
+// silently cite someone else's traffic. Use StreamsOn and choose deliberately
+// when several conversations are expected.
+func (e *Evidence) StreamOn(port uint16) (*netdis.Stream, error) {
+	hits, err := e.StreamsOn(port)
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) > 1 {
 		return nil, fmt.Errorf("certify: %s: %d attributed conversations on port %d; "+
 			"cite one explicitly", e.Case.UID, len(hits), port)
 	}
+	return hits[0], nil
 }
 
 func endpointOf(e netdis.Endpoint) netip.AddrPort {

@@ -275,21 +275,177 @@ func (p *plainStream) locate(m *Message) {
 	}
 }
 
-// RecoverSession reconstructs the DUT's CSIP session with the bench's 2030.5
-// server from the frames attributed to this check.
+// RecoverSession reconstructs the DUT's CSIP DISCOVERY session with the bench's
+// 2030.5 server from the frames attributed to this check.
 //
 // remote is the server endpoint (host:port) the DUT dialled. The lookup is by
 // PORT rather than by full endpoint because the DUT's own address is knowable
-// but its ephemeral port is not, and Evidence.StreamOn already refuses to guess
-// when more than one attributed conversation matches.
+// but its ephemeral port is not.
+//
+// A window routinely catches MORE THAN ONE conversation with that server, and
+// demanding exactly one is why this used to recover nothing at all:
+//
+//   - the gateway's telemetry role POSTs MirrorMeterReadings to the same
+//     host:port as the discovery walk, over its own connection;
+//   - a server with an idle timeout gives every poll cycle a fresh connection.
+//
+// So the candidates are enumerated and the discovery session is identified by
+// what it CONTAINS — a GET of the discovery root, the one path a 2030.5 client
+// may hard-code — rather than by being the only one present. Rejected
+// candidates are recorded in Problems, so the choice is auditable instead of a
+// silent heuristic.
 func RecoverSession(ev *certify.Evidence, remote netip.AddrPort) (*Transcript, error) {
 	if !ev.HasFrames() {
 		return nil, fmt.Errorf("no capture frames were attributed to this test case")
 	}
-	st, err := ev.StreamOn(remote.Port())
+	streams, err := ev.StreamsOn(remote.Port())
 	if err != nil {
 		return nil, err
 	}
+
+	// Drop conversations this test case does not wholly own.
+	//
+	// A check may cite only the frames its own connections produced, and the
+	// runner enforces that. A short-lived session opened near a window boundary
+	// gets SPLIT: some of its frames are attributed here, the rest to the
+	// neighbouring case. Recovering a transcript from such a stream produces
+	// citations the runner then rejects — "may not cite frame N: it was
+	// attributed to <other case>" — which fails the case on a bookkeeping
+	// artifact rather than on anything the DUT did.
+	//
+	// So a straddling conversation is not a candidate at all. It is recorded,
+	// because "the session I wanted belonged half to the next test case" is a
+	// real and diagnosable condition, not something to pass over in silence.
+	var straddled []string
+	owned := make([]*netdis.Stream, 0, len(streams))
+	for _, st := range streams {
+		mine, total := ownedFrames(ev, st)
+		switch {
+		case total == 0:
+			continue
+		case mine == total:
+			owned = append(owned, st)
+		default:
+			straddled = append(straddled, fmt.Sprintf("%s (%d of %d frames attributed elsewhere)",
+				st.Key, total-mine, total))
+		}
+	}
+	if len(owned) == 0 {
+		return nil, fmt.Errorf("none of the %d attributed conversation(s) on port %d is wholly owned by "+
+			"this test case, so none can be cited: %s", len(streams), remote.Port(),
+			strings.Join(straddled, "; "))
+	}
+	streams = owned
+
+	type candidate struct {
+		t       *Transcript
+		err     error
+		isDisc  bool
+		appRecs int
+	}
+	cands := make([]candidate, 0, len(streams))
+	for _, st := range streams {
+		t, terr := recoverFrom(ev, st, remote)
+		c := candidate{t: t, err: terr}
+		if t != nil {
+			c.appRecs = t.ClientAppRecords
+			c.isDisc = t.Decrypted && len(t.GETs(DiscoveryRoot)) > 0
+		}
+		cands = append(cands, c)
+	}
+
+	var disc []int
+	for i, c := range cands {
+		if c.isDisc {
+			disc = append(disc, i)
+		}
+	}
+	describe := func(skip int) []string {
+		var out []string
+		for i, c := range cands {
+			if i == skip {
+				continue
+			}
+			switch {
+			case c.err != nil:
+				out = append(out, fmt.Sprintf("%s (not recovered: %v)", streams[i].Key, c.err))
+			case c.t.Decrypted:
+				out = append(out, fmt.Sprintf("%s (%d client app record(s), no %s)",
+					streams[i].Key, c.appRecs, DiscoveryRoot))
+			default:
+				out = append(out, fmt.Sprintf("%s (undecryptable: %s)", streams[i].Key, c.t.Undecryptable))
+			}
+		}
+		return out
+	}
+
+	switch len(disc) {
+	case 1:
+		t := cands[disc[0]].t
+		if others := describe(disc[0]); len(others) > 0 {
+			t.Problems = append(t.Problems, fmt.Sprintf(
+				"selected this conversation as the discovery session because it carries GET %s; also "+
+					"attributed to this test case: %s", DiscoveryRoot, strings.Join(others, "; ")))
+		}
+		return t, nil
+	case 0:
+		// Nothing carried a discovery root. That is a real fact about the
+		// window, not licence to pick the biggest and hope — so the fallback
+		// is taken, but labelled as unconfirmed.
+		if len(cands) == 1 && cands[0].err != nil {
+			return nil, cands[0].err
+		}
+		best, bestRecs := -1, -1
+		for i, c := range cands {
+			if c.t != nil && c.appRecs > bestRecs {
+				best, bestRecs = i, c.appRecs
+			}
+		}
+		if best < 0 {
+			return nil, fmt.Errorf("none of the %d attributed conversation(s) on port %d could be recovered: %s",
+				len(cands), remote.Port(), strings.Join(describe(-1), "; "))
+		}
+		t := cands[best].t
+		t.Problems = append(t.Problems, fmt.Sprintf(
+			"no attributed conversation carried GET %s, so this is NOT confirmed to be the discovery "+
+				"session; it is the busiest of %d candidate(s) (%d client app record(s)). Others: %s",
+			DiscoveryRoot, len(cands), bestRecs, strings.Join(describe(best), "; ")))
+		return t, nil
+	default:
+		names := make([]string, 0, len(disc))
+		for _, i := range disc {
+			names = append(names, streams[i].Key.String())
+		}
+		return nil, fmt.Errorf("%d attributed conversations on port %d each carry GET %s (%s); the "+
+			"discovery session is genuinely ambiguous in this window",
+			len(disc), remote.Port(), DiscoveryRoot, strings.Join(names, ", "))
+	}
+}
+
+// ownedFrames reports how many of a conversation's capture frames this test
+// case owns, and how many it has in total.
+func ownedFrames(ev *certify.Evidence, st *netdis.Stream) (mine, total int) {
+	seen := map[int]bool{}
+	for _, d := range st.Dirs {
+		if d == nil || d.Bytes == nil {
+			continue
+		}
+		for _, f := range d.Bytes.PacketsFor(0, d.Bytes.Len()) {
+			if seen[f] {
+				continue
+			}
+			seen[f] = true
+			total++
+			if ev.Owns(f) {
+				mine++
+			}
+		}
+	}
+	return mine, total
+}
+
+// recoverFrom rebuilds one conversation into a Transcript.
+func recoverFrom(ev *certify.Evidence, st *netdis.Stream, remote netip.AddrPort) (*Transcript, error) {
 	t := &Transcript{Stream: st, Remote: remote}
 
 	// Which direction is the TLS client? The one that sent the ClientHello.
