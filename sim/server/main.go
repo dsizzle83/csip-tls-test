@@ -38,6 +38,13 @@ func main() {
 		// below the poll cadence and above one walk's duration.
 		idleTimeoutS = flag.Uint("idle-timeout-s", 0, "close a connection idle this long, so each poll cycle opens one observable TLS session carrying the whole walk; 0 disables")
 
+		// See tlsserver.Config.NoSessionTickets. A RESUMED session carries no
+		// certificates, so a conformance window that catches one has no
+		// certificate evidence to cite. Conformance runs that must cite the
+		// certificate exchange per window pass this; the default keeps
+		// resumption available, which is what a real 2030.5 client may use.
+		noTickets = flag.Bool("no-tickets", false, "issue no TLS session tickets and keep no session cache, so every gateway dial is a FULL mTLS handshake with the certificates on the wire (conformance evidence runs; default allows resumption)")
+
 		// Bench-only, and only in a -tags keylog build. Point this at the SAME
 		// file certify writes: lexa_keylog_open appends, the NSS format is
 		// line-oriented, and the analyzer does not care which process wrote
@@ -83,9 +90,16 @@ func main() {
 		ServerCertPath:      *serverCert,
 		ServerCertChainPath: *serverChain,
 		ServerKeyPath:       *serverKey,
+		NoSessionTickets:    *noTickets,
 	})
 	if err != nil {
 		log.Fatalf("server init: %v", err)
+	}
+	if *noTickets {
+		// Say it in the log the run archives, not only in the flag list: a
+		// bundle reader asking why every window holds a full handshake should
+		// find the answer in the server's own output.
+		log.Printf("[gridsim] session tickets DISABLED and session cache OFF — every dial is a full mTLS handshake")
 	}
 	srv.Handler = sim.Handler()
 	srv.IdleTimeout = time.Duration(*idleTimeoutS) * time.Second

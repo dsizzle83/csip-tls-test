@@ -605,6 +605,21 @@ func SetSessionCacheOff(ctx unsafe.Pointer) {
 		(*C.WOLFSSL_CTX)(ctx), C.WOLFSSL_SESS_CACHE_OFF)
 }
 
+// SetNoTicketTLS12 stops a server context issuing RFC 5077 session tickets on
+// TLS 1.2 and below (wolfSSL_CTX_NoTicketTLSv12), so no client can ever present
+// one back.
+//
+// Turning the session cache off is not enough on its own: a ticket hands the
+// session state to the CLIENT, so a ticketing server resumes without consulting
+// any cache of its own. A caller that needs every dial to be a full handshake
+// pulls both levers.
+func SetNoTicketTLS12(ctx unsafe.Pointer) error {
+	if int(C.wolfSSL_CTX_NoTicketTLSv12((*C.WOLFSSL_CTX)(ctx))) != Success {
+		return errors.New("wolfSSL_CTX_NoTicketTLSv12 failed")
+	}
+	return nil
+}
+
 // --- Client session resumption (T06.8) --------------------------------------
 //
 // These wrap wolfSSL's session get/set/free so the mbaps CLIENT can capture a

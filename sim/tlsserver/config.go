@@ -19,4 +19,23 @@ type Config struct {
 	// intermediates a depth-3/4 chain verification needs (COMM-004
 	// 004B/C/D/E/F). Empty ⇒ the single-leaf ServerCertPath path, unchanged.
 	ServerCertChainPath string
+
+	// NoSessionTickets makes every handshake a FULL handshake: no RFC 5077
+	// session ticket is issued and the server-side session cache is off, so no
+	// client can resume and no ClientHello can arrive with a ticket in it.
+	//
+	// WHY a bench server needs the option. A resumed session carries no
+	// certificates — that is the point of resumption — so a conformance window
+	// that happens to catch a resumed connection has no certificate evidence to
+	// cite, and every criterion about the certificate exchange must decline to
+	// decide. The CSIP suite copes (it reads the full handshake from another
+	// conversation of the same window when there is one, and says so), but
+	// "when there is one" is luck, and a run whose evidence depends on luck is a
+	// run that will one day produce a bundle with a hole in it.
+	//
+	// Off by default. Resumption is a MAY that a real 2030.5 client is entitled
+	// to use, and a bench that never issued a ticket would stop exercising the
+	// DUT's resumption path — so this is a switch for evidence-gathering runs,
+	// not a new default.
+	NoSessionTickets bool
 }

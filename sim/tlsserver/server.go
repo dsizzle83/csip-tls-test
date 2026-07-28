@@ -113,6 +113,17 @@ func New(cfg Config) (*Server, error) {
 	// THE line that turns one-sided TLS into mTLS.
 	wolfssl.RequireClientCert(ctx)
 
+	// Both levers, or neither: a session ticket hands the session state to the
+	// CLIENT, so a server that stopped caching but kept issuing tickets would
+	// still resume. See Config.NoSessionTickets for why an evidence run asks
+	// for this and why it is not the default.
+	if cfg.NoSessionTickets {
+		if err := wolfssl.SetNoTicketTLS12(ctx); err != nil {
+			return nil, err
+		}
+		wolfssl.SetSessionCacheOff(ctx)
+	}
+
 	// Export this server's TLS secrets so a capture of the DUT->bench direction
 	// is decryptable. Registered on the CTX rather than recovered per-session:
 	// wolfSSL_SESSION_get_master_key hands a SERVER back an all-zero secret for
