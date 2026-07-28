@@ -17,6 +17,73 @@ package wolfssl
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <sys/socket.h>
+
+// EINTR-proof I/O callbacks. See SetFD's Go doc for WHY this exists and the
+// measurement that produced it.
+//
+// wolfSSL's built-in EmbedReceive/EmbedSend classify errno into the
+// WOLFSSL_CBIO_ERR_* set and map anything unrecognised to
+// WOLFSSL_CBIO_ERR_GENERAL, which surfaces to the caller as SOCKET_ERROR_E
+// (-308) — indistinguishable from a genuinely broken socket. In a Go process
+// the runtime preempts goroutines with SIGURG, which lands on the thread
+// blocked in recv() on a socket carrying SO_RCVTIMEO; that interruption is
+// transient and means nothing about the peer, and it must never reach a
+// conformance verdict.
+//
+// These handle the retry HERE, at the syscall, where the whole question is
+// visible: a short/interrupted call is simply re-issued, EAGAIN (the real
+// SO_RCVTIMEO expiry) is reported as WANT_READ/WANT_WRITE so the deadline
+// layer above owns it, and only a genuinely unrecognised errno is GENERAL.
+// They are written in C rather than as exported Go callbacks deliberately —
+// a Go callback would run on a preemptible goroutine and reintroduce the
+// problem it is here to remove.
+static int lexaIORecv(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
+    int sd = *(int*)ctx;
+    (void)ssl;
+    for (;;) {
+        ssize_t n = recv(sd, buf, (size_t)sz, 0);
+        if (n > 0)  return (int)n;
+        if (n == 0) return WOLFSSL_CBIO_ERR_CONN_CLOSE;
+        switch (errno) {
+        case EINTR:        continue;
+        case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+        case EWOULDBLOCK:
+#endif
+            return WOLFSSL_CBIO_ERR_WANT_READ;
+        case ECONNRESET:   return WOLFSSL_CBIO_ERR_CONN_RST;
+        case ECONNABORTED: return WOLFSSL_CBIO_ERR_CONN_CLOSE;
+        default:           return WOLFSSL_CBIO_ERR_GENERAL;
+        }
+    }
+}
+
+static int lexaIOSend(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
+    int sd = *(int*)ctx;
+    (void)ssl;
+    for (;;) {
+        ssize_t n = send(sd, buf, (size_t)sz, 0);
+        if (n >= 0) return (int)n;
+        switch (errno) {
+        case EINTR:        continue;
+        case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+        case EWOULDBLOCK:
+#endif
+            return WOLFSSL_CBIO_ERR_WANT_WRITE;
+        case EPIPE:        return WOLFSSL_CBIO_ERR_CONN_CLOSE;
+        case ECONNRESET:   return WOLFSSL_CBIO_ERR_CONN_RST;
+        default:           return WOLFSSL_CBIO_ERR_GENERAL;
+        }
+    }
+}
+
+static void lexaSetIOCallbacks(WOLFSSL* ssl) {
+    wolfSSL_SSLSetIORecv(ssl, lexaIORecv);
+    wolfSSL_SSLSetIOSend(ssl, lexaIOSend);
+}
 */
 import "C"
 
@@ -186,11 +253,39 @@ func FreeSSL(ssl unsafe.Pointer) {
 	C.wolfSSL_free((*C.WOLFSSL)(ssl))
 }
 
-// SetFD attaches an SSL session to an existing socket file descriptor.
+// SetFD attaches an SSL session to an existing socket file descriptor, and
+// installs this package's EINTR-proof I/O callbacks on it.
+//
+// The callbacks are not an optimisation. Measured against the live gateway on
+// 2026-07-27, 40 discovery walks per arm, one case (DEV-1) per process:
+//
+//	default wolfSSL BIO                     2 / 40 failed, SOCKET_ERROR_E (-308)
+//	default BIO, GODEBUG=asyncpreemptoff=1  0 / 40
+//	default BIO, under strace               0 / 30   (ptrace perturbs signal timing)
+//	lexaIORecv / lexaIOSend                 0 / 60
+//
+// The middle two arms are what identify the cause rather than merely correlate
+// with it: turning the Go runtime's preemption signal off, and perturbing its
+// delivery with ptrace, each make the failure disappear on their own.
+//
+// The Go runtime preempts goroutines by sending SIGURG to their thread. When
+// that thread is blocked in recv() on a socket with SO_RCVTIMEO armed — which
+// is exactly how internal/mbtls implements net.Conn deadlines — the syscall
+// returns early, and wolfSSL's built-in EmbedReceive turns that into
+// SOCKET_ERROR_E, a code the caller cannot distinguish from a dead socket.
+// The run then blamed the DUT: a discovery walk reported "no SunSpec
+// identifier at any standard base address" about a gateway whose correct
+// answer was in the same capture.
+//
+// A conformance referee may not let its own runtime's scheduling decisions
+// become findings about the device.
 func SetFD(ssl unsafe.Pointer, fd int) error {
 	if int(C.wolfSSL_set_fd((*C.WOLFSSL)(ssl), C.int(fd))) != Success {
 		return fmt.Errorf("wolfSSL_set_fd(%d) failed", fd)
 	}
+	// AFTER set_fd: it is set_fd that installs the default callbacks and the
+	// &ssl->rfd/&ssl->wfd contexts these callbacks read.
+	C.lexaSetIOCallbacks((*C.WOLFSSL)(ssl))
 	return nil
 }
 
