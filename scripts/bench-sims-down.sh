@@ -22,4 +22,10 @@ pkill -f "bin/aggregator -target ${GW_HOST}:802" 2>/dev/null && echo "  reaped a
 stop gridsim
 stop mbapsdev
 stop modsim
+# The SIM_FLEET=4 extras. Stopped unconditionally: `stop` prints "no pidfile"
+# and moves on when they were never started, and the alternative — reading
+# SIM_FLEET here — would leave two inverters running whenever an operator
+# brought the fleet up in one shell and tore it down in another.
+stop modsim2
+stop modsim3
 echo "Done."

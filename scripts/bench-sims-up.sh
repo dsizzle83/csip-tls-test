@@ -5,10 +5,52 @@
 #
 # Sims launched (all on the desktop, 69.0.0.20; the gateway at 69.0.0.2 connects
 # to these — except the aggregator, which drives the gateway's :802 server):
-#   modsim    tcp/plain SunSpec inverter   0.0.0.0:5020   (SOUTH plain  <- gw)
-#   mbapsdev  mbaps/mTLS SunSpec inverter  0.0.0.0:8021   (SOUTH secure <- gw)
-#   gridsim   IEEE 2030.5 / CSIP mTLS srv  0.0.0.0:11111  (NORTH CSIP   <- gw)   admin :11112
+#   modsim    tcp/plain SunSpec inverter   0.0.0.0:5020   (SOUTH plain  <- gw)   simapi :6020
+#   mbapsdev  mbaps/mTLS SunSpec inverter  0.0.0.0:8021   (SOUTH secure <- gw)   simapi :6031
+#   gridsim   IEEE 2030.5 / CSIP mTLS srv  0.0.0.0:11111  (NORTH CSIP   <- gw)   admin  :11112
 #   aggregator mbaps/mTLS client (loop)    -> 69.0.0.2:802 (NORTH mbaps -> gw)
+#
+# SIM_FLEET=4 additionally launches two more plain modsims, for the CSIP
+# conformance catalog's DER AGGREGATOR CLIENT rows (owner decision 2026-07-28 —
+# csip-tls-test/docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md). Those
+# rows are written against CTP Figure 15, which needs FOUR managed end devices:
+#   modsim2   tcp/plain SunSpec inverter   0.0.0.0:5030   simapi :6040
+#   modsim3   tcp/plain SunSpec inverter   0.0.0.0:5031   simapi :6041
+#
+# ┌── BOARD CONFIG REQUIRED — the sims alone are NOT enough ──────────────────┐
+# │ The gateway does NOT discover southbound devices by sweeping. Discovery is│
+# │ "configured endpoints only" for mbaps, and configs/modbus.json ships      │
+# │ admission.sweep_enabled=false for plain TCP too, so a sim nobody listed   │
+# │ is a sim the gateway never dials. Adding two inverters therefore needs a  │
+# │ BOARD-SIDE edit that this script cannot and must not make.                │
+# │                                                                           │
+# │ On 69.0.0.2, /etc/lexa/modbus.json — "devices" must list all four:        │
+# │                                                                           │
+# │   "devices": [                                                            │
+# │     { "name": "inv-eda1", "endpoint": "tcp://69.0.0.20:5020",             │
+# │       "unit_id": 1, "role": "inverter", "max_w": 8000, "der_gen": "7xx" },│
+# │     { "name": "inv-eda2", "endpoint": "tcp://69.0.0.20:5030",             │
+# │       "unit_id": 1, "role": "inverter", "max_w": 8000, "der_gen": "7xx" },│
+# │     { "name": "inv-edb1", "endpoint": "tcp://69.0.0.20:5031",             │
+# │       "unit_id": 1, "role": "inverter", "max_w": 8000, "der_gen": "7xx" },│
+# │     { "name": "inv-edb2", "endpoint": "mbaps://69.0.0.20:8021",           │
+# │       "unit_id": 1, "role": "inverter", "max_w": 6000, "der_gen": "7xx" } │
+# │   ]                                                                       │
+# │                                                                           │
+# │ then:  systemctl restart lexa-modbus                                      │
+# │ verify: southbound.device_count == 4 on the dev-API :9100 /status, with   │
+# │         every device connected:true.                                      │
+# │ (No "pin" on inv-edb2 ⇒ CA-mode trust via the sb-mbaps-servers bundle,    │
+# │  exactly as docs/BENCH_SMOKE_TEST.md §4.2 sets up for the two-sim case.)  │
+# │                                                                           │
+# │ THE NORTHBOUND HALF IS STILL MISSING, and four sims do not supply it.     │
+# │ The AGG/MAINT/UTIL rows also need sim/gridsim to SERVE four EndDevices    │
+# │ (CTP Figure 15: an aggregator EndDevice plus EDA1/EDA2 under SPA1/SPA2    │
+# │ and EDB1/EDB2 under SPB1/SPB2, each with a FunctionSetAssignmentsListLink │
+# │ and a DERListLink) and to implement the Subscription/Notification         │
+# │ function set. gridsim does neither today. Until it does, those rows       │
+# │ report SKIP naming the gap — see the PROFILE_SCOPE doc §5.                │
+# └───────────────────────────────────────────────────────────────────────────┘
 #
 # TRUST: every sim uses the csip-tls-test mbaps PKI (single root). The gateway's
 # identity leaves are mbaps-CA-signed by bench-pki-bootstrap.sh, so the sims
@@ -28,6 +70,18 @@ GW_HOST="${GW_HOST:-69.0.0.2}"
 LOG="${BENCH_LOG:-$HERE/logs/bench}"
 MODSIM_PORT="${MODSIM_PORT:-5020}"
 MBAPS_PORT="${MBAPS_PORT:-8021}"
+# SIM_FLEET: 2 (default, the smoke-test pair) or 4 (the CTP Figure-15 fleet the
+# DER Aggregator Client rows need). Anything else is refused rather than
+# silently rounded, because "3" would half-build a fixture and read as success.
+SIM_FLEET="${SIM_FLEET:-2}"
+# The two extra plain inverters. Ports are deliberately AWAY from the Pi sim map
+# (modsim 5020/6020, batsim 5021/6021, metersim 5022/6022 — CLAUDE.md): these
+# run on the desktop and reusing 5021/5022 would make a stray connection to a Pi
+# look like a healthy fleet member.
+MODSIM2_PORT="${MODSIM2_PORT:-5030}"
+MODSIM2_API="${MODSIM2_API:-6040}"
+MODSIM3_PORT="${MODSIM3_PORT:-5031}"
+MODSIM3_API="${MODSIM3_API:-6041}"
 # 11113/11114, not the standard 11111/11112: a Production-PKI demo gridsim
 # holds those; our gateway's CSIP client presents an mbaps-PKI leaf, so it needs
 # a gridsim on the mbaps PKI (this script's -ca certs/mbaps) on a free port.
@@ -37,6 +91,11 @@ WITH_AGG="${WITH_AGG:-1}"
 AGG_ROLE="${AGG_ROLE:-GridServiceSunSpec}"
 AGG_CAMPAIGN="${AGG_CAMPAIGN:-$HERE/qa/aggregator/curtail-solar-50.json}"
 AGG_PERIOD="${AGG_PERIOD:-20}"
+
+case "$SIM_FLEET" in
+  2|4) ;;
+  *) echo "FATAL: SIM_FLEET=$SIM_FLEET — only 2 (smoke-test pair) or 4 (CTP Figure-15 fleet) are defined."; exit 1;;
+esac
 
 M="$HERE/certs/mbaps"
 mkdir -p "$LOG"
@@ -83,10 +142,29 @@ start(){ # name port cmd...
 # present as two DERs (override via MODSIM_SERIAL/MBAPS_SERIAL).
 MODSIM_SERIAL="${MODSIM_SERIAL:-BENCH-MODSIM-01}"
 MBAPS_SERIAL="${MBAPS_SERIAL:-BENCH-MBAPS-01}"
-echo "Bringing up sims (logs in $LOG):"
+MODSIM2_SERIAL="${MODSIM2_SERIAL:-BENCH-MODSIM-02}"
+MODSIM3_SERIAL="${MODSIM3_SERIAL:-BENCH-MODSIM-03}"
+echo "Bringing up sims (logs in $LOG, fleet size $SIM_FLEET):"
 start modsim   "$MODSIM_PORT"  ./bin/modsim   -port "$MODSIM_PORT" -advanced -wmax 8000 -serial "$MODSIM_SERIAL"
 start mbapsdev "$MBAPS_PORT"   ./bin/mbapsdev -listen ":$MBAPS_PORT" -model inverter -wmax 6000 -serial "$MBAPS_SERIAL" \
                  -ca "$M/dev-ca.pem" -cert "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem"
+
+if [ "$SIM_FLEET" = 4 ]; then
+  # The CTP's four managed end devices. Distinct -serial per sim for the same
+  # reason the pair above has them: the gateway keys device identity on
+  # manufacturer|model|serial, and four inverters sharing a serial dedup into
+  # ONE northbound unit — which would present as a passing four-device fleet
+  # while actually being one device. Distinct -api-port too, or the second and
+  # third modsim both grab 6020 and the third exits on a bind error.
+  #
+  # Mapping to the CTP's names (Figure 15), for the operator reading a log:
+  #   EDA1 = modsim  :5020   EDA2 = modsim2 :5030
+  #   EDB1 = modsim3 :5031   EDB2 = mbapsdev :8021
+  start modsim2 "$MODSIM2_PORT" ./bin/modsim -port "$MODSIM2_PORT" -api-port "$MODSIM2_API" \
+                 -advanced -wmax 8000 -serial "$MODSIM2_SERIAL"
+  start modsim3 "$MODSIM3_PORT" ./bin/modsim -port "$MODSIM3_PORT" -api-port "$MODSIM3_API" \
+                 -advanced -wmax 8000 -serial "$MODSIM3_SERIAL"
+fi
 start gridsim  "$GRIDSIM_PORT" ./bin/server   -listen "0.0.0.0:$GRIDSIM_PORT" -admin "0.0.0.0:$GRIDSIM_ADMIN" \
                  -ca "$M/ca-cert.pem" -cert-chain "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem"
 
@@ -107,5 +185,18 @@ if [ "$WITH_AGG" = 1 ]; then
 fi
 
 echo
+if [ "$SIM_FLEET" = 4 ]; then
+  cat <<'EOF'
+NOTE (SIM_FLEET=4): the sims are only the SOUTHBOUND half of the CTP Figure-15
+fixture. Two things are still needed and neither is done by this script:
+  1. BOARD: /etc/lexa/modbus.json must list all four devices and lexa-modbus
+     must be restarted — see the block at the top of this file for the exact
+     JSON. The gateway does not sweep; an unlisted sim is never dialled.
+  2. BENCH: sim/gridsim must serve four EndDevices and a Subscription/
+     Notification function set before the AGG / MAINT / UTIL conformance rows
+     can do more than SKIP. See
+     docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md §5.
+EOF
+fi
 if [ "$FAIL" = 0 ]; then echo "All server sims up. Stop with scripts/bench-sims-down.sh"; else
   echo "One or more sims did NOT start (see above). Stop with scripts/bench-sims-down.sh"; exit 1; fi
