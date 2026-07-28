@@ -169,6 +169,29 @@ static int lexa_enable_tls13_keylog(WOLFSSL* ssl) {
 	return wolfSSL_set_tls13_secret_cb(ssl, lexa_tls13_secret_cb, NULL);
 }
 
+// lexa_keylog_cb is wolfSSL's OpenSSL-compatible key-log callback: wolfSSL
+// hands it an already-formatted NSS line, for BOTH TLS versions and BOTH roles.
+//
+// It exists because the server side cannot reliably recover its own TLS 1.2
+// master secret after the fact — wolfSSL_SESSION_get_master_key returns zeros
+// for most server sessions. The callback is told the secret at the moment the
+// key schedule produces it, so it never has to go looking for it later.
+static void lexa_keylog_cb(const WOLFSSL* ssl, const char* line) {
+	(void)ssl;
+	if (line == NULL) return;
+	pthread_mutex_lock(&lexa_keylog_mu);
+	if (lexa_keylog_fp != NULL) {
+		fputs(line, lexa_keylog_fp);
+		fputc('\n', lexa_keylog_fp);
+		fflush(lexa_keylog_fp);
+	}
+	pthread_mutex_unlock(&lexa_keylog_mu);
+}
+
+static void lexa_set_ctx_keylog(WOLFSSL_CTX* ctx) {
+	if (ctx != NULL) wolfSSL_CTX_set_keylog_callback(ctx, lexa_keylog_cb);
+}
+
 // lexa_write_tls12_keylog recovers the TLS 1.2 master secret from the
 // completed session. Returns 1 on success, 0 if the session has no master
 // secret (TLS 1.3, or a handshake that did not complete).
@@ -183,6 +206,26 @@ static int lexa_write_tls12_keylog(WOLFSSL* ssl) {
 	if (sess == NULL) return 0;
 	mlen = wolfSSL_SESSION_get_master_key(sess, ms, (int)sizeof(ms));
 	if (mlen <= 0) return 0;
+
+	// An ALL-ZERO master secret is not a secret. It is this call reporting
+	// that it had nothing to give while still returning a positive length,
+	// which wolfSSL does on the SERVER side for a session whose secret the
+	// session object does not hold.
+	//
+	// Emitting it anyway is far worse than emitting nothing. The line is
+	// well-formed, so every downstream tool ACCEPTS the key log, matches the
+	// client random, derives garbage keys, and reports "AEAD authentication
+	// failed" — which reads as a corrupt capture or a broken DUT, not as a
+	// missing secret. On 2026-07-28, 79 of 119 exported lines were zeros and
+	// 112 conformance assertions failed to decrypt because of it.
+	//
+	// Refuse, so the caller can report a MISSING secret honestly.
+	{
+		int allzero = 1, k;
+		for (k = 0; k < mlen; k++) { if (ms[k] != 0) { allzero = 0; break; } }
+		if (allzero) return 0;
+	}
+
 	n = wolfSSL_get_client_random(ssl, cr, sizeof(cr));
 	if (n != sizeof(cr)) return 0;
 	lexa_keylog_emit("CLIENT_RANDOM", cr, (int)sizeof(cr), ms, mlen);
@@ -293,4 +336,21 @@ func WriteTLS12Keylog(ssl unsafe.Pointer) bool {
 		return false
 	}
 	return int(C.lexa_write_tls12_keylog((*C.WOLFSSL)(ssl))) == 1
+}
+
+// EnableCtxKeylog registers wolfSSL's OpenSSL-compatible key-log callback on a
+// context, so every session that context creates exports its secrets.
+//
+// Prefer this to WriteTLS12Keylog wherever the context is available, and
+// ESPECIALLY on the server side. WriteTLS12Keylog has to go looking for the
+// master secret in the finished session, and wolfSSL hands a server back zeros
+// for most sessions; this is told the secret as the key schedule produces it.
+//
+// Safe to call on a client context too — the callback covers TLS 1.2 and 1.3
+// and both roles, so it is simply the more reliable path.
+func EnableCtxKeylog(ctx unsafe.Pointer) {
+	if ctx == nil {
+		return
+	}
+	C.lexa_set_ctx_keylog((*C.WOLFSSL_CTX)(ctx))
 }

@@ -40,3 +40,6 @@ func EnableTLS13Keylog(ssl unsafe.Pointer) error { return nil }
 
 // WriteTLS12Keylog is a no-op in this build, always reporting false.
 func WriteTLS12Keylog(ssl unsafe.Pointer) bool { return false }
+
+// EnableCtxKeylog is a no-op without the keylog build tag.
+func EnableCtxKeylog(ctx unsafe.Pointer) {}
