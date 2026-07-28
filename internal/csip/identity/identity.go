@@ -59,6 +59,21 @@ func FromCertificateDER(der []byte) (LFDI, SFDI) {
 	return lfdi, sfdiFromLFDI(lfdi)
 }
 
+// FromSeed derives an LFDI and SFDI from an arbitrary seed instead of from a
+// certificate, applying the identical §6.3 truncation and check-digit rules.
+//
+// It exists for SIMULATED devices that have no certificate — sim/gridsim's CTP
+// Figure-15 fleet, where four managed inverters need stable, distinct, valid
+// identifiers and none of them holds a key. The distinction matters and is
+// stated here rather than left to the caller: an identifier produced by this
+// function is NOT a certificate identity and proves nothing about who is on the
+// other end of a connection. Never use it to authenticate a peer, and never let
+// one reach a device that will present a real certificate later — the two will
+// disagree, and the disagreement will look like a conformance failure.
+func FromSeed(seed []byte) (LFDI, SFDI) {
+	return FromCertificateDER(seed)
+}
+
 // sfdiFromLFDI extracts the leftmost 36 bits of the LFDI, treats them as
 // an unsigned integer, and appends a sum-of-digits checksum digit.
 //
