@@ -359,8 +359,8 @@ func TestLiveErrataAreImplemented(t *testing.T) {
 		id    string
 		crits []criterion
 	}{
-		{"CORE-018", core018Criteria()},
-		{"CORE-019", core019Criteria()},
+		{"CORE-018", core018Criteria(emptyObservation())},
+		{"CORE-019", core019Criteria(emptyObservation())},
 	} {
 		claim, found := notificationClaim(tc.crits)
 		if !found {
@@ -379,7 +379,7 @@ func TestLiveErrataAreImplemented(t *testing.T) {
 	// ...and the counterweight, which is where a blanket rule would have gone
 	// wrong: ERR-002's printed step 3 still admits BOTH, because seq 44 is
 	// scoped to CORE-018/CORE-019.
-	err002 := err002Criteria()
+	err002 := err002Criteria(emptyObservation())
 	claim, found := notificationClaim(err002)
 	if !found {
 		t.Fatal("ERR-002 has no criterion about the DUT's answer to a Notification")

@@ -892,3 +892,116 @@ func (t *Transcript) ResourceNames() []string {
 	}
 	return out
 }
+
+// ── the notification leg ─────────────────────────────────────────────────────
+
+// RecoverNotificationLeg rebuilds the conversations on the DUT's INBOUND
+// Notification listener, which is the one leg of an aggregator run that goes
+// the other way.
+//
+// # Why it is a separate recovery and not a Transcript.Others entry
+//
+// RecoverSession enumerates conversations on the 2030.5 SERVER's port and picks
+// the one carrying GET /dcap. A Notification is dialled BY that server to an
+// address the DUT chose, so it is on neither that port nor that 4-tuple, and no
+// amount of looking at the outbound session finds it. It is a different
+// endpoint, learned at run time from the <notificationURI> the DUT registered
+// and claimed separately (check.go's claimNotificationEndpoints).
+//
+// # Whose secrets decrypt it
+//
+// The bench's, still — but the bench is the CLIENT here rather than the server.
+// gridsim's Notifier exports its own session secrets to the same NSS key log
+// (a -tags keylog build; sim/server installs the wolfSSL-backed one), so a
+// capture of this leg decrypts under exactly the machinery that decrypts the
+// outbound one. Without that build the conversation is in the capture and
+// undecryptable, which is a fact the caller reports rather than works around.
+//
+// # What the return says
+//
+// Every conversation on ep that this test case WHOLLY OWNS, in capture order,
+// plus a reason when there are none or none decrypted. There is no "pick the
+// interesting one" heuristic: a Notification leg carries nothing but
+// Notification POSTs, so every recovered conversation is on topic.
+func RecoverNotificationLeg(ev *certify.Evidence, ep netip.AddrPort) ([]*Transcript, string) {
+	if !ev.HasFrames() {
+		return nil, "no capture frames were attributed to this test case"
+	}
+	streams, err := ev.StreamsOn(ep.Port())
+	if err != nil {
+		return nil, fmt.Sprintf("no conversation on the DUT's notification listener %s could be read from the "+
+			"capture: %v", ep, err)
+	}
+	if len(streams) == 0 {
+		return nil, fmt.Sprintf("the capture holds no TCP conversation on the DUT's notification listener %s "+
+			"during this test case's window, so no Notification was delivered to it", ep)
+	}
+
+	var straddled, undecrypted []string
+	var out []*Transcript
+	for _, st := range streams {
+		mine, total := ownedFrames(ev, st)
+		if total == 0 {
+			continue
+		}
+		if mine != total {
+			// Same rule as the outbound leg: a conversation split across two
+			// windows may not be cited here, and recovering it anyway would
+			// mint citations the runner then rejects.
+			straddled = append(straddled, fmt.Sprintf("%s (%d of %d frames attributed elsewhere)",
+				st.Key, total-mine, total))
+			continue
+		}
+		t, terr := recoverFrom(ev, st, ep)
+		switch {
+		case terr != nil:
+			undecrypted = append(undecrypted, fmt.Sprintf("%s (not recovered: %v)", st.Key, terr))
+		case !t.Decrypted:
+			undecrypted = append(undecrypted, fmt.Sprintf("%s (%s)", st.Key, t.Undecryptable))
+		default:
+			out = append(out, t)
+		}
+	}
+	if len(out) > 0 {
+		return out, ""
+	}
+	var why []string
+	if len(straddled) > 0 {
+		why = append(why, "conversation(s) shared with a neighbouring test case, which this one may not cite: "+
+			strings.Join(straddled, "; "))
+	}
+	if len(undecrypted) > 0 {
+		why = append(why, "conversation(s) present but not readable: "+strings.Join(undecrypted, "; ")+
+			". The notification leg decrypts only when the simulator's Notifier exported its session secrets "+
+			"— a -tags keylog build of sim/server started with -keylog pointing at the run's key log")
+	}
+	if len(why) == 0 {
+		why = append(why, "no conversation on "+ep.String()+" is attributable to this test case")
+	}
+	return nil, "the DUT's notification listener " + ep.String() + " carries no citable exchange: " +
+		strings.Join(why, "; ")
+}
+
+// NotificationPOSTs returns the exchanges of this transcript whose request body
+// is a 2030.5 <Notification>, with the status the DUT answered.
+//
+// On the notification leg the TLS client is the SIMULATOR, so Transcript's
+// "Requests" are the server's pushes and "Responses" are the DUT's answers —
+// the mirror of every other conversation this suite reads. recoverFrom settles
+// the direction from who sent the ClientHello rather than from the addresses,
+// so nothing here has to assume it; this helper exists so a criterion does not
+// have to remember the inversion either.
+func (t *Transcript) NotificationPOSTs() []Exchange {
+	var out []Exchange
+	for _, e := range t.Method("POST") {
+		if e.Req == nil || len(e.Req.Body) == 0 {
+			continue
+		}
+		doc, err := e.Req.SEP()
+		if err != nil || doc.Local() != "Notification" {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}

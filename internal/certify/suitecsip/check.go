@@ -40,6 +40,29 @@ const defaultWait = 90 * time.Second
 // waitParam is the operator override for the poll-cycle wait.
 const waitParam = "csip.wait"
 
+// changeSettle is how long a check keeps observing after it makes the
+// procedure's post-subscription change. A Notification is dispatched
+// synchronously with the mutation, so this is not waiting for the push — it is
+// waiting for the DUT's answer to land in the server's delivery record and for
+// the follow-up GET the procedures ask for.
+const changeSettle = 15 * time.Second
+
+// changeWaitFullCycle is spec.ChangeWait's request for a second FULL poll-cycle
+// wait — the same duration, and the same -param csip.wait override, as the
+// first one.
+//
+// It is a negative sentinel rather than a bool so that ChangeWait's zero value
+// keeps meaning "the short settle", which is what most rows want: a row whose
+// change the client must POLL for and a row whose change it merely ANSWERS are
+// waiting for different things, and giving the second one a poll cycle would
+// multiply every campaign's runtime for nothing.
+const changeWaitFullCycle = -1
+
+// changeFailed is the params key recording that the post-subscription change
+// could not be made, so a criterion depending on it says so rather than
+// reporting the absence of a Notification as a DUT fault.
+const changeFailed = "csip.change_failed"
+
 // endpointClaimReason is the argument, printed in every bundle this suite
 // produces, for why attributing frames by endpoint rather than by connection
 // 4-tuple is sound here.
@@ -64,6 +87,32 @@ type spec struct {
 
 	// Wait overrides the poll-cycle wait for this check.
 	Wait time.Duration
+
+	// Change is the mutation the procedure makes AFTER the client has taken up
+	// what Setup put there, and it exists because half the aggregator rows
+	// cannot be driven without it.
+	//
+	// Every subscription row has the same shape: the client subscribes, and
+	// THEN the server changes the subscribed resource so a Notification is
+	// owed. A mutation performed in Setup happens before the DUT has POSTed
+	// anything, so it matches no subscription and pushes nothing — the row
+	// would report "the server pushed no Notification" forever, on a bench that
+	// works. Change runs after the wait, when the subscription the DUT made
+	// during this window exists to be matched.
+	//
+	// It is given the same params map as Setup and its failure is recorded, not
+	// fatal: a lever that could not be pulled is a bench fact the criteria
+	// should report, not a reason to abandon the evidence already collected.
+	Change func(ctx context.Context, d *Driver, params map[string]string) error
+
+	// ChangeWait is how long to keep observing after Change. Zero uses
+	// changeSettle. It is short by design: a Notification is dispatched
+	// synchronously with the mutation, so what this waits for is the DUT's
+	// ANSWER and its follow-up GET, not the push.
+	//
+	// changeWaitFullCycle asks for a second full poll-cycle wait instead, for
+	// the rows whose change is something the DUT must FETCH.
+	ChangeWait time.Duration
 
 	// Cleanup always runs, including on error and on a cancelled context. It is
 	// given a context that is NOT the check's, so a check killed by its timeout
@@ -155,7 +204,31 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 	obs.Waited, obs.Satisfied = waited, satisfied
 	rc.Logf("waited %s for the DUT's poll cycle (predicate satisfied: %t)", waited.Round(time.Second), satisfied)
 
+	// The endpoint claim goes in BEFORE the change: a Notification the change
+	// causes is dispatched synchronously, so a claim made afterwards would be
+	// opened after the frames it is supposed to attribute had already passed.
 	claimNotificationEndpoints(ctx, rc, d, obs)
+
+	if s.Change != nil && d.Available() {
+		if err := s.Change(ctx, d, obs.Params); err != nil {
+			obs.Params[changeFailed] = err.Error()
+			rc.Logf("the procedure's post-subscription change could not be made: %v", err)
+		}
+		settle := s.ChangeWait
+		switch {
+		case settle == 0:
+			settle = changeSettle
+		case settle < 0:
+			settle = wait
+		}
+		if err := rc.Sleep(ctx, settle); err == nil {
+			after := d.Snapshot(ctx)
+			obs.Server = after.Since(base)
+			obs.Server.Available, obs.Server.BaseURL = after.Available, after.BaseURL
+			obs.Server.Status, obs.Server.Errors = after.Status, after.Errors
+			obs.Waited = waited + settle
+		}
+	}
 
 	notes := ""
 	if s.Notes != nil {
@@ -244,6 +317,7 @@ func claimNotificationEndpoints(ctx context.Context, rc *certify.RunCtx, d *Driv
 			continue
 		}
 		claimed[ep.String()] = true
+		obs.NotifyEndpoints = append(obs.NotifyEndpoints, ep)
 	}
 
 	var parts []string

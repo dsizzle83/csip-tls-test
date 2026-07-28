@@ -34,6 +34,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -141,8 +143,59 @@ type AdminSubscription struct {
 	EndDevice          string `json:"end_device"`
 	SubscribedResource string `json:"subscribed_resource"`
 	NotificationURI    string `json:"notification_uri"`
-	Notifications      int    `json:"notifications"`
+	// Limit is the <limit> the DUT asked for. MAINT-001's pass criterion is
+	// explicit that "the notification resource body for the EndDeviceList was
+	// correctly formed using the limit parameter requested by the Client in the
+	// original subscription request", so the number the client asked for has to
+	// travel with the subscription for that to be checkable at all.
+	Limit         uint32 `json:"limit,omitempty"`
+	Notifications int    `json:"notifications"`
 }
+
+// AdminFleetDevice mirrors one entry of gridsim's GET /admin/fleet.
+//
+// LFDI is why this endpoint is read at all. Every per-EndDevice pass criterion
+// of the CTP's aggregator rows is stated about a device by its CTP NAME ("for
+// EDA1 and EDA2, POSTs response with status 2"), and the only thing that name
+// corresponds to on the wire is the <endDeviceLFDI> of a Response POST. The
+// mapping between the two is a fact the SERVER holds — it derived the four
+// LFDIs when it built the fixture — and nothing in the capture states it. A
+// harness that guessed it from /edev ordering would be asserting a bench
+// convention; this reads it from the party that decided it.
+type AdminFleetDevice struct {
+	Name      string   `json:"name"`
+	Node      string   `json:"node"`
+	Href      string   `json:"href"`
+	LFDI      string   `json:"lfdi"`
+	SFDI      uint64   `json:"sfdi"`
+	PIN       uint32   `json:"pin"`
+	ManagedBy string   `json:"managed_by"`
+	Programs  []string `json:"programs"`
+}
+
+// AdminNotification mirrors one entry of gridsim's GET /admin/notifications:
+// one Notification POST attempt and what came back.
+//
+// HTTPStatus is the DUT's answer, and Error is why there was none. The pair is
+// what separates the three outcomes a notification criterion must never
+// conflate: the DUT answered (a finding about the DUT), the server could not
+// deliver (a finding about the BENCH's transport), and the server pushed
+// nothing at all (a finding about neither).
+type AdminNotification struct {
+	At                 int64  `json:"at"`
+	SubscriptionHref   string `json:"subscription_href"`
+	SubscribedResource string `json:"subscribed_resource"`
+	NotificationURI    string `json:"notification_uri"`
+	Status             uint8  `json:"notification_status"`
+	HTTPStatus         int    `json:"http_status"`
+	Bytes              int    `json:"bytes"`
+	Error              string `json:"error,omitempty"`
+}
+
+// Delivered reports whether the client answered this Notification at all.
+// HTTPStatus 0 means the POST never got an answer — either the transport
+// refused to dial it (Error names the reason) or the connection failed.
+func (n AdminNotification) Delivered() bool { return n.HTTPStatus != 0 }
 
 // ServerView is the tier-3 record: everything the bench's 2030.5 server saw.
 //
@@ -158,6 +211,17 @@ type ServerView struct {
 	DERPuts   []AdminDERPut
 	LogEvents []map[string]any
 	Status    AdminStatus
+
+	// Notifications is the server's own log of what it pushed and what came
+	// back. Like Responses it is append-only, so Since deltas it by length.
+	Notifications []AdminNotification
+
+	// Fleet and Subscriptions are STATE, not logs: the fixture the server is
+	// serving right now and the subscriptions the DUT holds right now. Since
+	// carries them through unchanged, because "the fleet as it was at the
+	// baseline minus the fleet as it is now" is not a meaningful quantity.
+	Fleet         []AdminFleetDevice
+	Subscriptions []AdminSubscription
 
 	// Errors records what could not be collected, so a partial view is never
 	// mistaken for a complete one.
@@ -185,6 +249,7 @@ func (v ServerView) Since(base ServerView) ServerView {
 	out.Responses = v.Responses[min(len(base.Responses), len(v.Responses)):]
 	out.DERPuts = v.DERPuts[min(len(base.DERPuts), len(v.DERPuts)):]
 	out.LogEvents = v.LogEvents[min(len(base.LogEvents), len(v.LogEvents)):]
+	out.Notifications = v.Notifications[min(len(base.Notifications), len(v.Notifications)):]
 
 	switch {
 	case len(v.rawLines) == 0 && len(base.rawLines) == 0:
@@ -259,6 +324,56 @@ func (v ServerView) GETs(path string) int {
 	return n
 }
 
+// ResponsesFrom returns the Responses whose endDeviceLFDI is lfdi, whatever
+// they were about. It is the per-device half of the aggregator rows' pass
+// criteria: ResponsesFor answers "which device", ResponsesFrom answers "which
+// event", and a fan-out criterion needs both at once.
+func (v ServerView) ResponsesFrom(lfdi string) []AdminResponse {
+	var out []AdminResponse
+	for _, r := range v.Responses {
+		if lfdi != "" && strings.EqualFold(r.LFDI, lfdi) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// FleetDeviceNamed returns the managed EndDevice the CTP calls name.
+func (v ServerView) FleetDeviceNamed(name string) (AdminFleetDevice, bool) {
+	for _, d := range v.Fleet {
+		if strings.EqualFold(d.Name, name) {
+			return d, true
+		}
+	}
+	return AdminFleetDevice{}, false
+}
+
+// NotificationsFor returns the Notifications pushed for one subscribed
+// resource href, query string and trailing slash ignored.
+func (v ServerView) NotificationsFor(href string) []AdminNotification {
+	var out []AdminNotification
+	for _, n := range v.Notifications {
+		if trimHref(n.SubscribedResource) == trimHref(href) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// trimHref is the suite's copy of the server's own href normalisation: a
+// subscription posted against "/derp/0/derc?l=10" is about the same resource as
+// a change to "/derp/0/derc", and a criterion that compared them literally
+// would report a server that never notified.
+func trimHref(h string) string {
+	if i := strings.IndexByte(h, '?'); i >= 0 {
+		h = h[:i]
+	}
+	if len(h) > 1 {
+		h = strings.TrimSuffix(h, "/")
+	}
+	return h
+}
+
 // PutsFor returns the DER report PUTs whose recorded root element matches.
 func (v ServerView) PutsFor(resource string) []AdminDERPut {
 	var out []AdminDERPut
@@ -295,6 +410,15 @@ type Observation struct {
 	// Params carries per-check facts the live phase established (an mRID it
 	// posted, a PIN it configured) into the citation phase.
 	Params map[string]string
+
+	// NotifyEndpoints are the DUT's inbound Notification listeners this check
+	// successfully claimed, taken from the <notificationURI> of the
+	// Subscriptions the server recorded. They are carried here because the
+	// citation phase has to recover a SECOND conversation — the one the server
+	// dialled — and the address is not knowable before the live phase ran.
+	// Empty means either no subscription, or none whose listener could be
+	// claimed; obs.Param(notifyClaimParam) says which.
+	NotifyEndpoints []netip.AddrPort
 
 	notes map[string][]string
 }
@@ -378,6 +502,31 @@ func (d *Driver) Snapshot(ctx context.Context) ServerView {
 		v.Errors = append(v.Errors, "GET /admin/logevents: "+err.Error())
 	} else {
 		v.LogEvents = le.LogEvents
+	}
+
+	// The three DER AGGREGATOR CLIENT surfaces. A simulator that serves none of
+	// them is a bench without the fixture, not a broken one, so a missing
+	// endpoint is recorded and the view is still returned — the criteria that
+	// need it will SKIP naming the lever, which is the honest answer, whereas
+	// an Errors entry per check would make an intentional configuration look
+	// like a fault.
+	var fl struct {
+		Devices []AdminFleetDevice `json:"devices"`
+	}
+	if err := d.Admin.Get(ctx, "fleet", &fl); err == nil {
+		v.Fleet = fl.Devices
+	}
+	var nt struct {
+		Notifications []AdminNotification `json:"notifications"`
+	}
+	if err := d.Admin.Get(ctx, "notifications", &nt); err == nil {
+		v.Notifications = nt.Notifications
+	}
+	var sb struct {
+		Subscriptions []AdminSubscription `json:"subscriptions"`
+	}
+	if err := d.Admin.Get(ctx, "subscriptions", &sb); err == nil {
+		v.Subscriptions = sb.Subscriptions
 	}
 
 	lr, err := d.readLog(ctx)
@@ -672,6 +821,47 @@ func (d *Driver) Subscriptions(ctx context.Context) []AdminSubscription {
 		return nil
 	}
 	return out.Subscriptions
+}
+
+// Fleet reads the CTP Figure-15 devices the server is currently serving, with
+// the LFDI it derived for each. An older simulator serves no such endpoint and
+// that is a bench without the fixture, not an error.
+func (d *Driver) Fleet(ctx context.Context) []AdminFleetDevice {
+	if !d.Admin.Available() {
+		return nil
+	}
+	var out struct {
+		Devices []AdminFleetDevice `json:"devices"`
+	}
+	if err := d.Admin.Get(ctx, "fleet", &out); err != nil {
+		return nil
+	}
+	return out.Devices
+}
+
+// RebindDevice changes which aggregator a managed EndDevice belongs to, which
+// is how MAINT-001's out-of-band agreement ("EDA1X is no longer being managed
+// by the aggregator and needs to be deleted from its list") is driven. lfdi ==
+// "-" detaches the device; the server rebuilds the EndDeviceList and pushes a
+// Notification for it.
+//
+// It is a MUTATION of the shared bench and every caller must undo it, which is
+// why the rows that use it do so from a Change hook whose Cleanup restores the
+// binding unconditionally.
+func (d *Driver) RebindDevice(ctx context.Context, device, lfdi string) error {
+	return d.Admin.Post(ctx, "fleet", map[string]any{"device": device, "managed_by": lfdi}, nil)
+}
+
+// CancelSubscription makes the server push the status=1 "Subscription canceled,
+// no additional information" Notification that CORE-019 step 11 and ERR-002
+// step 5 are about, and forget the subscription.
+//
+// The DUT is expected to re-establish its subscription on its next walk; per
+// Annex A seq 38 it is NOT required to re-POST one immediately, and no
+// criterion in this suite waits for it.
+func (d *Driver) CancelSubscription(ctx context.Context, href string) error {
+	_, err := d.Admin.Raw(ctx, http.MethodDelete, "/admin/subscriptions?href="+url.QueryEscape(href), nil)
+	return err
 }
 
 // ClearControls removes the admin-posted controls from a program, so a check

@@ -108,12 +108,22 @@ func TestSubscriptionPostedDistinguishesBenchGapFromDUTFault(t *testing.T) {
 	c := critSubscriptionPosted("EndDeviceList", "the aggregator EndDevice's SubscriptionListLink")
 
 	// The bench never offered subscription: unavailable, naming the gap.
+	//
+	// What the gap IS changed at 4d2d551 and the reason had to change with it.
+	// sim/gridsim implements the function set now, so a SKIP saying it did not
+	// would send a reader off to write code that already exists; what the SKIP
+	// means today is that the SWITCH IS OFF, and it has to name the switch to be
+	// worth printing at all.
 	noOffer := synthTranscript(get("/edev", 200, edevListOneDevice))
 	reason := wantUnavailable(t, "subscription (server offers none)", c, noOffer)
-	for _, want := range []string{"no SubscriptionListLink", "sim/gridsim implements no Subscription"} {
+	for _, want := range []string{"no SubscriptionListLink", "-subscription", "SIM_FLEET=4"} {
 		if !strings.Contains(reason, want) {
-			t.Errorf("the reason does not name the bench gap (%q): %s", want, reason)
+			t.Errorf("the reason does not name the lever that is off (%q): %s", want, reason)
 		}
+	}
+	if strings.Contains(reason, "implements no Subscription") {
+		t.Errorf("the reason still claims gridsim implements no Subscription resource; it has since "+
+			"4d2d551, and a SKIP describing work that is already done is worse than no SKIP: %s", reason)
 	}
 
 	// The bench DID offer it and the DUT ignored it: that is a real finding.
@@ -346,16 +356,20 @@ func TestSubscriptionAdvertisedIsABenchCriterion(t *testing.T) {
 	wantUnavailable(t, "precondition (no EndDeviceList)", c, synthTranscript())
 }
 
-// TestFanOutAndOutOfBandCriteriaNeverProduceAVerdict is the belt-and-braces
-// check on the two criterion families that exist purely to be honest about what
-// was not measured. A declared Skip has no evaluators at all, so it cannot
-// accidentally start passing when somebody adds one.
-func TestFanOutAndOutOfBandCriteriaNeverProduceAVerdict(t *testing.T) {
+// TestDeclaredSkipsNeverProduceAVerdict is the belt-and-braces check on the two
+// criterion families that STILL exist purely to be honest about what was not
+// measured. A declared Skip has no evaluators at all, so it cannot accidentally
+// start passing when somebody adds one.
+//
+// The list is short now, and its shortness is the point of this change: the
+// per-device Response bullets and every notification criterion grew real
+// evaluators. What remains here is what no bench lever can reach — a
+// DefaultDERControl's activation, which IEEE 2030.5 defines no acknowledgment
+// for, and the per-device bullets whose subject is the client's internal state.
+func TestDeclaredSkipsNeverProduceAVerdict(t *testing.T) {
 	for name, c := range map[string]criterion{
-		"fan-out":     critPerDeviceFanOut("something happens", "EDA1 and EDA2"),
+		"fan-out":     critPerDeviceFanOut("something happens", "EDA1 and EDA2", "because of a named reason"),
 		"out-of-band": critDefaultControlOutOfBand("TFA"),
-		"notification": critNotificationAnswered([]int{201},
-			"because the erratum says so"),
 	} {
 		if c.Wire != nil || c.Server != nil {
 			t.Errorf("%s: has an evaluator; it is supposed to be a declared SKIP with a reason", name)
@@ -368,9 +382,23 @@ func TestFanOutAndOutOfBandCriteriaNeverProduceAVerdict(t *testing.T) {
 		}
 	}
 
+	// A per-device SKIP may no longer blame the fleet. The fixture exists, so a
+	// reason that sent a reader to build it would send them after the wrong
+	// thing entirely.
+	if got := critPerDeviceFanOut("x", "EDA1", noWireArtefact).Skip; strings.Contains(got, "-fleet 4") {
+		t.Errorf("a declared per-device SKIP still blames the missing fleet: %q", got)
+	}
+
 	// The notification criterion's claim must carry the accepted statuses, since
 	// that is the whole errata-sensitive part of it.
-	if got := critNotificationAnswered([]int{201, 204}, "why").Claim; !strings.Contains(got, "201 or 204") {
+	if got := critNotificationAnswered(emptyObservation(), []int{201, 204}, "why").Claim; !strings.Contains(got, "201 or 204") {
 		t.Errorf("the notification claim does not carry its accepted statuses: %q", got)
 	}
+}
+
+// emptyObservation is the Observation a criterion constructor is handed when a
+// test cares only about the criterion's SHAPE — its claim, its declared reason —
+// and not about what a run observed.
+func emptyObservation() *Observation {
+	return &Observation{Case: &certify.Case{}, Params: map[string]string{}}
 }

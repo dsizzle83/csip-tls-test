@@ -71,12 +71,33 @@ const (
 // step. That re-tag matters: the uncorrected text demanded the GET of the DUT,
 // so a check written straight from the printed steps would fail a conformant
 // aggregator for not re-fetching information it had just been pushed.
+//
+// The change under test — printed step 3, "Create a new EndDevice instance for
+// EDA1X and assign it to node SPA1" — is driven by the closest lever gridsim
+// has, and the substitution is stated rather than glossed: it REBINDS EDA1 to
+// this aggregator, which rebuilds the EndDeviceList and pushes the Notification
+// for the changed list. What that exercises is the whole observable of the row —
+// the server changes the aggregator's EndDeviceList and the client answers the
+// Notification. What it does NOT exercise is a device that was not in the
+// fixture beforehand, because gridsim's fleet is the figure's four and has no
+// create-EndDevice route.
 func aggSubscription(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	return run(ctx, rc, spec{
+		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
+			agg := aggregatorLFDI(d.Fleet(ctx))
+			if agg == "" {
+				return fmt.Errorf("no managed EndDevice reports an aggregator binding, so there is no " +
+					"EndDeviceList membership to change (is gridsim serving the fleet? -fleet 4)")
+			}
+			params[changedDevice] = "EDA1"
+			return d.RebindDevice(ctx, "EDA1", agg)
+		},
+		Cleanup: func(ctx context.Context, d *Driver) { restoreFleetBinding(ctx, d) },
 		Notes: func(o *Observation) string {
 			return "aggregator subscription (AGG-001), read through Annex A seq 1: the client answers the " +
 				"EndDeviceList Notification 201 Created, and the follow-up GET of the new EDA1X EndDevice is a " +
-				"[CT] test-client step, not a demand on the DUT"
+				"[CT] test-client step, not a demand on the DUT. The membership change is driven by rebinding " +
+				"EDA1 rather than by creating EDA1X, which gridsim's fleet has no route for"
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
@@ -84,19 +105,56 @@ func aggSubscription(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 				critAggregatorFleet(),
 				critSubscriptionPosted("EndDeviceList",
 					"the aggregator EndDevice's SubscriptionListLink"),
-				{
-					Claim: "the server sends a Notification to the client when an EndDevice is added to the " +
-						"aggregator's EndDeviceList",
-					How:  "the server-originated Notification POST carrying the changed EndDeviceList",
-					Skip: notificationGap,
-				},
-				critNotificationAnswered([]int{201},
+				critNotificationPushed(o, "EndDeviceList",
+					"AGG-001's printed step 4: the server notifies the client because there is a change "+
+						"(addition) to the EndDeviceList"),
+				critNotificationAnswered(o, []int{201},
 					"AGG-001's printed step 5, as amended by Annex A seq 1, states 201 Created"),
+				critNotifiedHrefRefetched(o),
 				critPerDeviceFanOut("the newly created EDA1X EndDevice instance is reachable and carries the "+
-					"links the setup requires", "the aggregator's managed fleet"),
+					"links the setup requires", "the aggregator's managed fleet",
+					"the fixture gridsim builds is CTP Figure 15 exactly — EDA1, EDA2, EDB1, EDB2 — and its "+
+						"admin API can rebind or detach one of those but cannot CREATE a fifth. EDA1X is an "+
+						"addition, so what this check drove is a membership change to an existing device and "+
+						"the reachability of a device that was never in the fixture is not evidence this run "+
+						"produced. Closing it needs a create-EndDevice route in sim/gridsim/fleet.go"),
 			}
 		},
 	})
+}
+
+// changedDevice is the params key naming the managed EndDevice a check rebound,
+// so cleanup restores exactly what it changed rather than rebuilding the fleet.
+const changedDevice = "csip.changed_device"
+
+// aggregatorLFDI reads the aggregator every managed device is bound to. It is
+// taken from the fleet rather than configured, for the same reason the fleet's
+// own LFDIs are: gridsim binds them to whatever certificate handshaked, so the
+// bench needs no out-of-band agreement about which aggregator this is.
+func aggregatorLFDI(fleet []AdminFleetDevice) string {
+	for _, d := range fleet {
+		if d.ManagedBy != "" {
+			return d.ManagedBy
+		}
+	}
+	return ""
+}
+
+// restoreFleetBinding puts a rebound device back under the aggregator that owns
+// the rest of the fleet. It runs unconditionally from Cleanup: a device left
+// detached would vanish from the EndDeviceList of every test case that follows,
+// and those cases would report the missing device as a DUT finding.
+func restoreFleetBinding(ctx context.Context, d *Driver) {
+	fleet := d.Fleet(ctx)
+	agg := aggregatorLFDI(fleet)
+	if agg == "" {
+		return
+	}
+	for _, dev := range fleet {
+		if dev.ManagedBy == "" {
+			_ = d.RebindDevice(ctx, dev.Name, agg)
+		}
+	}
 }
 
 // ── AGG-002..012 ─────────────────────────────────────────────────────────────
@@ -151,7 +209,54 @@ func (m aggMode) element() string {
 }
 
 // aggFanOut is one pass criterion the document states per managed EndDevice.
-type aggFanOut struct{ What, Devices string }
+//
+// It carries the artefact as well as the words because the artefact is what
+// decides it. A bullet naming Response statuses for named devices is checkable
+// against <endDeviceLFDI>; a bullet about a setpoint or an internal belief is
+// not, and Unobservable is where that is said in the bullet's own terms rather
+// than by a shared string that would be wrong for it.
+type aggFanOut struct {
+	// What is the pass criterion in the procedure's own words.
+	What string
+	// Devices is how the procedure names the set ("EDA1 and EDA2"); Names is
+	// the same set as the CTP identifiers the fleet is keyed by.
+	Devices string
+	Names   []string
+
+	// MRID is the event the Responses are about, and Statuses the ones each
+	// named device owes for it.
+	MRID     string
+	Statuses []int
+	// Forbidden are statuses no named device may report for the event. It is
+	// how the rows state the NEGATIVE half of a precedence claim without an
+	// out-of-band setpoint read: AGG-007's EDB1/EDB2 are outside the TFA
+	// program, so the SY control "is executed normally" for them — which on the
+	// wire means their Responses are 1/2/3 and never 14.
+	Forbidden []int
+	// Absent inverts the claim into the untagged negative bullet — AGG-003's
+	// "Client fails if EDB1 and/or EDB2 POSTs any responses to the TFA event".
+	Absent bool
+
+	// Unobservable, when non-empty, is why this bullet has no wire artefact
+	// even with the fixture served. It is the declared SKIP's reason and it
+	// must be about THIS bullet: the fleet is no longer what is missing.
+	Unobservable string
+}
+
+// The device sets the CTP's bullets are stated over. EDA1/EDA2 hang off SPA1
+// and SPA2 and inherit TFA; EDB1/EDB2 hang off SPB1/SPB2 and do not.
+var (
+	edaPair = []string{"EDA1", "EDA2"}
+	edbPair = []string{"EDB1", "EDB2"}
+)
+
+// noWireArtefact is the reason for a bullet whose subject is the DUT's own
+// belief rather than a message. It is deliberately NOT fleetGap: the fleet is
+// served, and blaming it would send a reader to fix something that is not broken.
+const noWireArtefact = "this bullet's subject is the client's INTERNAL STATE, not a message. IEEE 2030.5 " +
+	"defines no artefact for it, so no simulator lever can produce one — the absence of further traffic for " +
+	"a device is consistent with the DUT having dropped it and equally consistent with the DUT having " +
+	"nothing to say about it in this window, and reporting the first would be inventing evidence"
 
 // aggScenario is one aggregator event row.
 type aggScenario struct {
@@ -170,9 +275,10 @@ type aggScenario struct {
 	// Independent, when set, names the mRIDs across which NO supersession
 	// Response may appear.
 	Independent []string
-	// Defaults names the DefaultDERControls whose activation the document itself
-	// declares unobservable.
-	Defaults []string
+	// Defaults are the DefaultDERControl bullets. Their ACTIVATION is what the
+	// document itself declares unobservable; the per-device walk that reaches
+	// them is not, so an entry that names devices produces both criteria.
+	Defaults []aggDefault
 	// FanOut are the per-EndDevice pass criteria the one-EndDevice bench cannot
 	// reach.
 	FanOut []aggFanOut
@@ -181,6 +287,19 @@ type aggScenario struct {
 type aggLifecycle struct {
 	MRID, Label string
 	SpanS       int
+}
+
+// aggDefault is one DefaultDERControl bullet: whose default, and — when the row
+// states it per EndDevice — which devices.
+type aggDefault struct {
+	// Which is the DERProgram whose default the bullet is about, in the
+	// procedure's own naming ("TFA", "TFA (before the event)").
+	Which string
+	// Devices and Names are set only where the procedure states the bullet per
+	// EndDevice. Empty leaves the row with the activation criterion alone,
+	// which is what the setup-level entries are.
+	Devices string
+	Names   []string
 }
 
 // aggEvent builds one of AGG-002..AGG-012.
@@ -259,7 +378,10 @@ const lateSkipped = "agg.late_publish_skipped"
 func aggCriteria(sc aggScenario, o *Observation) []criterion {
 	crits := []criterion{critAggregatorFleet(), critProgramList(0)}
 	for _, d := range sc.Defaults {
-		crits = append(crits, critDefaultControlOutOfBand(d))
+		crits = append(crits, critDefaultControlOutOfBand(d.Which))
+		if len(d.Names) > 0 {
+			crits = append(crits, critDefaultControlFetched(o, d.Which, d.Devices, d.Names))
+		}
 	}
 	if len(sc.Controls) > 0 {
 		crits = append(crits, critAggControlsDelivered(sc))
@@ -275,9 +397,26 @@ func aggCriteria(sc aggScenario, o *Observation) []criterion {
 		crits = append(crits, withDeviation(critNoSupersession(sc.Independent), o))
 	}
 	for _, f := range sc.FanOut {
-		crits = append(crits, critPerDeviceFanOut(f.What, f.Devices))
+		crits = append(crits, withDeviation(fanOutCriterion(o, f), o))
 	}
 	return crits
+}
+
+// fanOutCriterion picks the evaluator a per-device bullet's artefact supports.
+//
+// The dispatch is the whole point of aggFanOut carrying more than prose: three
+// kinds of bullet appear in these rows and conflating them is how a harness ends
+// up either failing a conformant DUT for a fixture it was not given, or passing
+// a non-conformant one on a claim nobody checked.
+func fanOutCriterion(o *Observation, f aggFanOut) criterion {
+	switch {
+	case f.Unobservable != "":
+		return critPerDeviceFanOut(f.What, f.Devices, f.Unobservable)
+	case f.Absent:
+		return critNoResponseFanOut(o, f)
+	default:
+		return critResponseFanOut(o, f)
+	}
 }
 
 // withDeviation turns a criterion into a SKIP when the scenario's delayed
@@ -402,35 +541,27 @@ func coreBasicSubscription(ctx context.Context, rc *certify.RunCtx) (certify.Res
 			return "basic subscription (CORE-018), read through Annex A seq 44: HTTP 204 is NOT an acceptable " +
 				"answer to a Notification for this row, so only 201 Created is asserted"
 		},
-		Criteria: func(o *Observation) []criterion { return core018Criteria() },
+		Change: touchSubscribedResources,
+		Criteria: func(o *Observation) []criterion { return core018Criteria(o) },
 	})
 }
 
 // core018Criteria is CORE-018's criteria list, named so errata_test.go can pin
 // the seq-44 tightening against the code that implements it rather than only
 // against the catalog record of it.
-func core018Criteria() []criterion {
+func core018Criteria(o *Observation) []criterion {
 	return []criterion{
 		critDiscoveryRoot(),
 		critSubscriptionAdvertised(),
 		critFSAList(0),
 		critSubscriptionPosted("FunctionSetAssignmentsList", "the DUT's EndDevice SubscriptionListLink"),
-		{
-			Claim: "the server changes an element of the subscribed FunctionSetAssignments and pushes " +
-				"a Notification carrying the updated payload",
-			How:  "the server-originated Notification POST to the DUT's notificationURI",
-			Skip: notificationGap,
-		},
-		critNotificationAnswered([]int{201},
+		critNotificationPushed(o, "FunctionSetAssignments",
+			"CORE-018's setup step 3 and procedure step 6: the server updates an attribute of the Client "+
+				"FSAList and sends the notification carrying the updated payload"),
+		critNotificationAnswered(o, []int{201},
 			"Annex A seq 44 removes the acceptance of 204 for CORE-018, so 201 Created is the only "+
 				"conformant answer"),
-		{
-			Claim: "the DUT GETs the href carried in the Notification and the payload the server " +
-				"returns is identical to the Notification body",
-			How: "a GET of the notified href in the window after the Notification, with its response " +
-				"body compared to the Notification body",
-			Skip: notificationGap,
-		},
+		critNotifiedHrefRefetched(o),
 	}
 }
 
@@ -448,33 +579,32 @@ func coreAdvancedSubscription(ctx context.Context, rc *certify.RunCtx) (certify.
 				"per subordinate-resource change (no second notification for the parent EndDevice), and 204 is " +
 				"not an acceptable answer to it"
 		},
-		Criteria: func(o *Observation) []criterion { return core019Criteria() },
+		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
+			// Steps 8 and 11 in order: change the subscribed resource, then
+			// cancel the subscription with the status=1 Notification. Both need
+			// the DUT to have subscribed already, which is why they are here
+			// and not in Setup.
+			if err := touchSubscribedResources(ctx, d, params); err != nil {
+				return err
+			}
+			return cancelOneSubscription(ctx, d, params)
+		},
+		Criteria: func(o *Observation) []criterion { return core019Criteria(o) },
 	})
 }
 
 // core019Criteria is CORE-019's criteria list. See core018Criteria.
-func core019Criteria() []criterion {
+func core019Criteria(o *Observation) []criterion {
 	return []criterion{
 		critDiscoveryRoot(),
 		critSubscriptionAdvertised(),
 		critSubscriptionPosted("EndDevice", "the DUT's EndDevice SubscriptionListLink"),
 		critSubscriptionPosted("FunctionSetAssignmentsList", "the DUT's EndDevice SubscriptionListLink"),
-		critNotificationAnswered([]int{201},
+		critNotificationAnswered(o, []int{201},
 			"Annex A seq 44 removes the acceptance of 204 for CORE-019, so 201 Created is the only "+
 				"conformant answer"),
-		{
-			Claim: "a change to a subordinate resource produces exactly ONE Notification — not a " +
-				"second one for the parent EndDevice",
-			How: "the count of Notification POSTs the server sends for a single subordinate change, " +
-				"per Annex A seq 42 which removes printed steps 10 and 11",
-			Skip: notificationGap,
-		},
-		{
-			Claim: "the DUT processes a Notification with status=1 (Subscription canceled, no " +
-				"additional information) and answers it",
-			How:  "the DUT's response to the cancellation Notification POST",
-			Skip: notificationGap,
-		},
+		critOneNotificationPerChange(o),
+		critNotificationCancelled(o, []int{201}),
 	}
 }
 
@@ -547,7 +677,13 @@ func errNotification(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 				"not hold the DUT to one. Step 3's '201 Created or 204 No Content' stands — seq 44's removal " +
 				"of 204 is scoped to CORE-018/CORE-019"
 		},
-		Criteria: func(o *Observation) []criterion { return err002Criteria() },
+		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
+			if err := touchSubscribedResources(ctx, d, params); err != nil {
+				return err
+			}
+			return cancelOneSubscription(ctx, d, params)
+		},
+		Criteria: func(o *Observation) []criterion { return err002Criteria(o) },
 	})
 }
 
@@ -555,7 +691,7 @@ func errNotification(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 // errata_test.go: it accepts BOTH 201 and 204 (seq 44's removal of the 204 is
 // scoped to CORE-018/CORE-019), and it contains no criterion demanding a
 // re-POSTed Subscription (seq 38 removes printed step 6).
-func err002Criteria() []criterion {
+func err002Criteria(o *Observation) []criterion {
 	return []criterion{
 		critDiscoveryRoot(),
 		critSubscriptionAdvertised(),
@@ -565,73 +701,163 @@ func err002Criteria() []criterion {
 				"Notification for a post-reset change to the subscribed FunctionSetAssignmentsList",
 			How: "a server restart followed by a Notification POST on the pre-existing subscription, " +
 				"with no re-POST of the Subscription required of the DUT",
-			Skip: "sim/gridsim has no power-reset lever in its admin API and no subscription state to " +
-				"persist across one. " + notificationGap,
+			Skip: "sim/gridsim holds its subscriptions in memory and its admin API has no power-reset " +
+				"lever, so the PERSISTENCE half of this bullet cannot be exercised — restarting the " +
+				"process loses them, which is the opposite of what the row requires. The change-and-notify " +
+				"half IS driven and is asserted in the criteria below; what is missing is the reset " +
+				"between them, and closing it needs subscription persistence in sim/gridsim/subscribe.go " +
+				"plus a restart route",
 		},
-		critNotificationAnswered([]int{201, 204},
+		critNotificationAnswered(o, []int{201, 204},
 			"ERR-002's printed step 3 admits either; Annex A seq 44's removal of the 204 acceptance is "+
 				"scoped to CORE-018 and CORE-019 and does NOT reach this row"),
-		{
-			Claim: "the DUT GETs the href carried in the Notification and the payload is identical to " +
-				"the Notification body",
-			How:  "a GET of the notified href with its response body compared to the Notification body",
-			Skip: notificationGap,
-		},
+		critNotifiedHrefRefetched(o),
+		critNotificationCancelled(o, []int{201, 204}),
 		{
 			Claim: "on a Notification with status=1 (Subscription canceled) the DUT removes that " +
 				"subscription from its own list of outstanding Subscriptions",
 			How: "the absence of further client traffic on the cancelled subscription. Per Annex A " +
 				"seq 38 the DUT is NOT required to re-POST the Subscription, and this criterion does " +
 				"not look for one",
-			Skip: notificationGap,
+			Skip: "the subject of this bullet is the DUT's own list of outstanding Subscriptions, which " +
+				"is internal state. The server-side artefact — the cancellation Notification and the " +
+				"DUT's answer to it — IS asserted above; what no wire shows is what the client then " +
+				"believes, and absence of traffic does not distinguish a client that forgot the " +
+				"subscription from one that simply had nothing to say",
 		},
 		{
 			Claim: "on an INVALID Notification — EndDevice instance information delivered against a " +
 				"FunctionSetAssignmentsList subscription — the DUT responds HTTP 400",
 			How: "the status line of the DUT's response to the malformed Notification POST",
-			Skip: "sim/gridsim's malform injection (POST /admin/malform) rewrites a resource the DUT " +
-				"GETs; it cannot originate a malformed Notification, because it originates no " +
-				"Notification at all. " + notificationGap,
+			Skip: "sim/gridsim now ORIGINATES Notifications, but it builds each body from the resource " +
+				"the subscription actually names, and its malform injection (POST /admin/malform) " +
+				"rewrites a resource the DUT GETs rather than one it is pushed. Deliberately sending the " +
+				"WRONG resource type on a subscription is a lever sim/gridsim/subscribe.go does not " +
+				"have, and this criterion will not manufacture a verdict without it",
 		},
 	}
 }
 
+// touchSubscribedResources makes the change every subscription row's procedure
+// calls for: it mutates something the DUT has actually subscribed to, so a
+// Notification is owed.
+//
+// It reads the subscriptions back rather than assuming which resource to touch,
+// because which one the DUT chose is a fact about the DUT. When the DUT
+// subscribed to an EndDeviceList it rebinds a fleet device; otherwise it
+// re-posts the device's own registration pIN, which is a change to the
+// EndDevice sub-tree and notifies /edev and that device's href.
+//
+// A run in which the DUT has subscribed to nothing returns an error naming that,
+// and the criteria then report "no Notification was owed" rather than "the DUT
+// ignored one".
+func touchSubscribedResources(ctx context.Context, d *Driver, params map[string]string) error {
+	subs := d.Subscriptions(ctx)
+	if len(subs) == 0 {
+		return fmt.Errorf("the DUT holds no Subscription on this server, so there is nothing whose change " +
+			"would be notified. Whether it OUGHT to have subscribed is asserted separately")
+	}
+	fleet := d.Fleet(ctx)
+	agg := aggregatorLFDI(fleet)
+	if agg == "" || len(fleet) == 0 {
+		return fmt.Errorf("gridsim is serving no managed EndDevice, so this check has no resource it can " +
+			"change without disturbing the DUT's own tree (is the fleet on? -fleet 4)")
+	}
+	// Rebinding a managed device to the aggregator it is ALREADY bound to is a
+	// no-op for the fixture and a real change for the EndDeviceList: gridsim
+	// rebuilds it and notifies /edev and the device href. That is the smallest
+	// mutation that produces the row's Notification without leaving the shared
+	// bench in a different state than it was found in.
+	params[changedDevice] = fleet[0].Name
+	return d.RebindDevice(ctx, fleet[0].Name, agg)
+}
+
+// cancelOneSubscription pulls the status=1 lever CORE-019 step 11 and ERR-002
+// step 5 are about, on the LAST subscription the DUT posted.
+//
+// The last rather than the first, deliberately: the rows cancel the subordinate
+// (FSAList) subscription and keep the EndDevice one, and gridsim hands them back
+// in creation order.
+func cancelOneSubscription(ctx context.Context, d *Driver, params map[string]string) error {
+	subs := d.Subscriptions(ctx)
+	if len(subs) == 0 {
+		return fmt.Errorf("the DUT holds no Subscription, so there is none to cancel")
+	}
+	target := subs[len(subs)-1]
+	params[cancelledSub] = target.Href + " (" + target.SubscribedResource + ")"
+	return d.CancelSubscription(ctx, target.Href)
+}
+
+// cancelledSub records which subscription a check cancelled, so the bundle says
+// what the status=1 Notification was about.
+const cancelledSub = "csip.cancelled_subscription"
+
 // ── MAINT-001 / 003 / 004 / 005 ──────────────────────────────────────────────
 
 // maintOOBInverter implements MAINT-001 — Inverter Maintenance (Out-Of-Band).
+//
+// This row now has its lever, and it is the one the procedure describes. Step 3
+// is an OUT-OF-BAND agreement that a device is no longer managed, and step 4 is
+// the server acting on it — which is exactly POST /admin/fleet {managed_by:
+// "-"}: gridsim drops the device from this aggregator's EndDeviceList and
+// pushes the Notification for the changed list. Cleanup rebinds it
+// unconditionally, because a device left detached would be missing from every
+// later test case's EndDeviceList and would be reported there as a DUT finding.
 func maintOOBInverter(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	return run(ctx, rc, spec{
+		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
+			fleet := d.Fleet(ctx)
+			if len(fleet) == 0 {
+				return fmt.Errorf("gridsim is serving no managed EndDevice, so there is none to remove " +
+					"from the aggregator's list (is the fleet on? -fleet 4)")
+			}
+			// The LAST device, so a run that is interrupted before cleanup
+			// leaves EDA1 — the device every other aggregator row names first —
+			// where the next case expects it.
+			dev := fleet[len(fleet)-1]
+			params[changedDevice] = dev.Name
+			params[deletedHref] = dev.Href
+			return d.RebindDevice(ctx, dev.Name, "-")
+		},
+		Cleanup: func(ctx context.Context, d *Driver) { restoreFleetBinding(ctx, d) },
 		Notes: func(o *Observation) string {
-			return "out-of-band inverter maintenance (MAINT-001): the aggregator's fleet shrinks by agreement " +
-				"off-protocol and the server deletes the EndDevice. No client-initiated DELETE belongs on the " +
-				"wire for this row — that is MAINT-002, which §4 requires of nobody"
+			return fmt.Sprintf("out-of-band inverter maintenance (MAINT-001): the aggregator's fleet shrinks by "+
+				"agreement off-protocol and the server drops %s (%s) from its EndDeviceList. No client-initiated "+
+				"DELETE belongs on the wire for this row — that is MAINT-002, which §4 requires of nobody",
+				o.Param(changedDevice), o.Param(deletedHref))
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
 				critDiscoveryRoot(),
 				critAggregatorFleet(),
 				critSubscriptionPosted("EndDeviceList", "the aggregator EndDevice's SubscriptionListLink"),
+				critNotificationPushed(o, "EndDeviceList",
+					"MAINT-001's procedure step 4: the server deletes the EndDevice instance from the "+
+						"aggregator EndDeviceList and notifies the EndDeviceList subscriptions"),
+				critNotificationAnswered(o, []int{201},
+					"MAINT-001's first pass criterion requires an HTTP 201 Created for the subscription and "+
+						"the notifications on it"),
+				critNotificationLimitHonoured(o),
 				{
-					Claim: "the server deletes the EDA1X EndDevice from the aggregator's EndDeviceList and " +
-						"pushes a Notification for the change",
-					How: "the EndDeviceList Notification POST after the server-side deletion, its list length " +
-						"honouring the limit parameter of the original subscription",
-					Skip: "sim/gridsim serves a fixed EndDevice tree and its admin API has no lever to create " +
-						"or delete a server-side EndDevice, so the deletion this row is about cannot be " +
-						"performed. " + notificationGap,
-				},
-				{
-					Claim: "a GET of the deleted EDA1X EndDevice href returns HTTP 404 Not Found",
+					Claim: "a GET of the deleted EndDevice href returns HTTP 404 Not Found",
 					How:   "the status line of a [CT] test-client GET of the deleted EndDevice's href",
-					Skip: "there is no EDA1X to delete on this bench (see the fleet criterion), so there is no " +
-						"href for the 404 to be about. " + fleetGap,
+					Skip: "the removal this row drives is a MEMBERSHIP change — gridsim drops the device from " +
+						"this aggregator's EndDeviceList — and the resource itself remains served, so a GET " +
+						"of its href answers 200 rather than 404. That is a real difference from the printed " +
+						"procedure and it is reported rather than papered over: gridsim's fleet has no " +
+						"delete-EndDevice route, and asserting a 404 against a bench that cannot produce one " +
+						"would fail a conformant client on the harness's shortcoming",
 				},
 				critPerDeviceFanOut("the client's internal state stops managing the deleted device",
-					"the aggregator's managed fleet"),
+					"the aggregator's managed fleet", noWireArtefact),
 			}
 		},
 	})
 }
+
+// deletedHref records the EndDevice href a check removed from the aggregator's
+// list, so the notes name the resource the row is about.
+const deletedHref = "csip.deleted_href"
 
 // maintGroup implements MAINT-003 — Group Maintenance.
 func maintGroup(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
@@ -648,23 +874,39 @@ func maintGroup(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 				critFSAList(0),
 				critSubscriptionPosted("FunctionSetAssignmentsList",
 					"each managed EndDevice's SubscriptionListLink"),
+				critPerDeviceResource(o,
+					"the aggregator GETs that device's FunctionSetAssignments and the DERProgramList beneath "+
+						"it — the row's first two pass criteria, which are stated for every one of the four",
+					"EDA1, EDA2, EDB1 and EDB2", managedDevices, "GET", []string{"/fsa"}),
+				critDefaultControlFetched(o, "TFA", "EDA1 and EDA2", edaPair),
+				critDefaultControlFetched(o, "TFB", "EDB1 and EDB2", edbPair),
 				{
 					Claim: "the server re-parents EDB1 from SPB1 to SPA1 and pushes a Notification that its " +
 						"FunctionSetAssignmentsList changed",
 					How: "the FunctionSetAssignmentsList Notification POST following the topology move",
-					Skip: "sim/gridsim serves one FunctionSetAssignments over a fixed topology and its admin " +
-						"API has no lever to move an EndDevice between nodes, so the regrouping this row is " +
-						"about cannot be performed. " + notificationGap,
+					Skip: "gridsim serves the whole Figure-15 topology now — SPA1/SPA2/SPB1/SPB2, FDA/FDB, " +
+						"TFA/TFB, SGA/SGB and SY — and every managed device carries the DERProgram chain of " +
+						"its parent nodes. What its admin API has no route for is MOVING a device between " +
+						"nodes: POST /admin/fleet adjusts a pIN and an aggregator binding, not an assignment. " +
+						"The regrouping this row is entirely about therefore cannot be performed, and neither " +
+						"the Notification it would cause nor the client's reaction to it is evidence this run " +
+						"produced. Closing it needs a node-reassignment route in sim/gridsim/fleet.go",
 				},
 				{
 					Claim: "on that Notification the aggregator GETs the new FunctionSetAssignmentsList and " +
 						"the DERProgramList it now belongs to",
 					How:  "the GETs following the Notification, compared against the hrefs it carried",
-					Skip: notificationGap,
+					Skip: "the re-parenting that would cause this Notification could not be performed (see " +
+						"above), so a GET of the 'new' FunctionSetAssignmentsList is a GET of the same one " +
+						"the device already had. Reporting the DUT's ordinary walk as a reaction to a " +
+						"topology change it was never told about would be inventing the finding",
 				},
 				critPerDeviceFanOut("the aggregator cancels its subscription to the old "+
 					"FunctionSetAssignmentsList and subscribes to the new one (both 'If needed', so neither is "+
-					"a gate)", "EDB1"),
+					"a gate)", "EDB1",
+					"the procedure marks both steps conditional ('If needed'), so neither is a gate on any "+
+						"verdict, and the topology move that would make them needed could not be performed "+
+						"(see the re-parenting criterion above)"),
 			}
 		},
 	})
@@ -681,7 +923,12 @@ func maintControls(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 	const mrid = "CERT-MAINT004"
 	return run(ctx, rc, spec{
 		RequiresGridSim: true,
-		Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
+		// The control is added in Change, not Setup, and that is the whole point
+		// of the row: procedure step 3 ADDS a DERControl to a list the client is
+		// already subscribed to. Publishing it before the DUT has subscribed
+		// would match no subscription, push no Notification, and leave this row
+		// reporting a bench that works as a server that never notified.
+		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
 			// The document's own numbers: +15 min, 5 min, no randomization.
 			_, err := d.PostControl(ctx, ControlRequest{
 				Program: progTFA, MRID: mrid, Description: "MAINT-004 added control",
@@ -690,27 +937,38 @@ func maintControls(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 			params["mrid"] = mrid
 			return err
 		},
-		Cleanup: func(ctx context.Context, d *Driver) { _ = d.ClearControls(ctx, progTFA) },
+		// A second FULL poll cycle after the change: the DUT has to FETCH the
+		// added control, and a subscribing client is still entitled to take its
+		// poll interval over it. The short settle would measure the harness.
+		ChangeWait: changeWaitFullCycle,
+		Cleanup:    func(ctx context.Context, d *Driver) { _ = d.ClearControls(ctx, progTFA) },
 		Notes: func(o *Observation) string {
-			return fmt.Sprintf("maintenance of controls (MAINT-004): published %s on the TFA DERProgram with "+
-				"the procedure's own interval — start +15 min, duration 5 min, no randomization — and waited "+
-				"%s for the DUT to acquire it", mrid, o.Waited.Round(rounding))
+			return fmt.Sprintf("maintenance of controls (MAINT-004): published %s on the TFA DERProgram AFTER "+
+				"the client's subscription window, with the procedure's own interval — start +15 min, duration "+
+				"5 min, no randomization — and waited %s in all for the DUT to be notified of it and acquire it",
+				mrid, o.Waited.Round(rounding))
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
 				critDiscoveryRoot(),
 				critAggregatorFleet(),
 				critSubscriptionPosted("DERControlList", "each EndDevice FunctionSetAssignments"),
-				{
-					Claim: "the server pushes a Notification for the changed DERControlList after the new " +
-						"DERControl is added to the TFA DERProgram",
-					How:  "the DERControlList Notification POST following the addition",
-					Skip: notificationGap,
-				},
+				critNotificationPushed(o, "DERControlList",
+					"MAINT-004's procedure step 3: the server adds the DERControl to the TFA DERProgram's "+
+						"DERControlList and sends a notification message for the affected list"),
+				critNotificationAnswered(o, []int{201, 204},
+					"MAINT-004 states no status of its own for the Notification answer, so both of IEEE "+
+						"2030.5's are accepted; Annex A seq 44's removal of the 204 is scoped to CORE-018 "+
+						"and CORE-019 and does not reach this row"),
+				critNotifiedHrefRefetched(o),
 				critNewControlAcquired(mrid, 900, 300),
-				critPerDeviceFanOut("the Event Processing rules of IEEE 2030.5 §12.1.3 are applied to every "+
-					"DERControl of every managed EndDevice and a Response POSTed where responseRequired "+
-					"demands one", "each managed EndDevice"),
+				critResponseFanOut(o, aggFanOut{
+					What: "the Event Processing rules of IEEE 2030.5 §12.1.3 are applied to the newly added " +
+						"DERControl and a Response POSTed for it — the procedure's own bullet ends 'if " +
+						"required by the Server', so a window with no Response at all is reported as " +
+						"unmeasured rather than as a fan-out failure",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: mrid, Statuses: []int{1},
+				}),
 			}
 		},
 	})
@@ -794,13 +1052,20 @@ func maintPrograms(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 				critAggregatorFleet(),
 				critProgramList(0),
 				critSubscriptionPosted("DERProgramList", "each EndDevice FunctionSetAssignments"),
+				critPerDeviceResource(o,
+					"the aggregator GETs that device's FunctionSetAssignments and the DERProgramList whose "+
+						"primacy ordering this row is about",
+					"EDA1, EDA2, EDB1 and EDB2", managedDevices, "GET", []string{"/fsa"}),
 				{
 					Claim: "the server swaps the primacy values of the TFA/TFB and SGA/SGB DERPrograms and " +
 						"pushes Notifications for the affected DERProgram and DERProgramList",
 					How: "the DERProgram/DERProgramList Notification POSTs following the primacy swap",
-					Skip: "sim/gridsim's admin API has no lever to change a DERProgram's primacy — its three " +
-						"programs carry fixed primacy 1 / 5 / 10 — so the swap this row is about cannot be " +
-						"performed. " + notificationGap,
+					Skip: "gridsim serves the Figure-15 node programs with the primacy ladder MAINT-005's own " +
+						"setup step 5 states — TFA/TFB at 1 and SGA/SGB at 2 — but its admin API has no lever " +
+						"to CHANGE a primacy once built, so the swap this row is entirely about cannot be " +
+						"performed and neither the Notification it would cause nor the client's " +
+						"re-prioritisation is evidence this run produced. Closing it needs a primacy route in " +
+						"sim/gridsim/fleet.go",
 				},
 				{
 					Claim: "with no DERControl active, the DUT applies the DefaultDERControl of the DERProgram " +
@@ -852,8 +1117,16 @@ func utilCommissioning(ctx context.Context, rc *certify.RunCtx) (certify.Result,
 				critDERPut("DERCapability"),
 				critDERPut("DERSettings"),
 				critAggregatorFleet(),
-				critPerDeviceFanOut("the aggregator follows each managed EndDevice's DERListLink and PUTs its "+
-					"DERCapability / DERSettings / DERStatus / DERAvailability", "EDA1, EDA2, EDB1 and EDB2"),
+				critPerDeviceResource(o,
+					"the aggregator follows that EndDevice's DERListLink and PUTs its DERCapability, "+
+						"DERSettings, DERStatus or DERAvailability — Annex A seq 3 corrects the printed step, "+
+						"which PUT to the DERListLink itself, and a PUT to any one of the four field resources "+
+						"satisfies the procedure's own 'or'",
+					"EDA1, EDA2, EDB1 and EDB2", managedDevices, "PUT", []string{"/der/"}),
+				critPerDeviceResource(o,
+					"the aggregator GETs that EndDevice's DERList before PUTting to it, which is how it finds "+
+						"the four field hrefs at all",
+					"EDA1, EDA2, EDB1 and EDB2", managedDevices, "GET", []string{"/der"}),
 			}
 		},
 	})
@@ -884,8 +1157,15 @@ func utilGroupRetrieval(ctx context.Context, rc *certify.RunCtx) (certify.Result
 					"the aggregator EndDevice's SubscriptionListLink, per Annex A seq 12"),
 				critSubscriptionPosted("DERControlList",
 					"the aggregator EndDevice's SubscriptionListLink"),
-				critPerDeviceFanOut("the aggregator GETs the FunctionSetAssignments and every DERProgram "+
-					"beneath them", "EDA1, EDA2, EDB1 and EDB2"),
+				critPerDeviceResource(o,
+					"the aggregator finds that EndDevice's FunctionSetAssignmentsListLink and GETs all the "+
+						"FunctionSetAssignments — the row's first pass criterion, stated for each "+
+						"non-aggregator EndDevice",
+					"EDA1, EDA2, EDB1 and EDB2", managedDevices, "GET", []string{"/fsa"}),
+				critPerDeviceResource(o,
+					"the aggregator GETs all DERPrograms from the DERProgramListLink in that EndDevice's "+
+						"FunctionSetAssignments — the row's second pass criterion",
+					"EDA1, EDA2, EDB1 and EDB2", managedDevices, "GET", []string{"/fsa/0/derp"}),
 			}
 		},
 	})
@@ -934,16 +1214,19 @@ func utilDERRetrieval(ctx context.Context, rc *certify.RunCtx) (certify.Result, 
 						"EndDevices in that node's scope: SPA1 → EDA1; FDA → EDA1 and EDA2; SY → all four",
 					How: "the LFDIs of the Response POSTs for each of the three published controls, compared " +
 						"against the topology scope of the node each was published at",
-					Skip: "this is the row's whole subject and it needs both the Figure-15 fleet and a " +
-						"simulator that can publish a DERControl at a NAMED topology node. gridsim publishes " +
-						"onto three flat DERPrograms and serves one EndDevice. " + fleetGap,
+					Skip: "this is the row's whole subject and half of what it needs now exists: gridsim " +
+						"serves the Figure-15 fleet and gives every node its own DERProgram (SPA1, FDA, SY " +
+						"and the rest, sim/gridsim/fleet.go). What is still missing is the other half — POST " +
+						"/admin/control addresses a DERProgram by INDEX, so a control can be published onto " +
+						"TFA and SY, which are aliases of programs 0 and 2, and onto no other node. Without " +
+						"a control at SPA1 there is no scope ladder to observe, and the per-device Responses " +
+						"the criteria above DO check would be answering a different question. Closing it " +
+						"needs the admin control route to accept a node NAME",
 				},
-				{
-					Claim: "the server pushes a Notification of the changed DERControlList and the DUT GETs " +
-						"the list and the new DERControl in response to it",
-					How:  "the Notification POST and the GETs that follow it",
-					Skip: notificationGap,
-				},
+				critNotificationPushed(o, "DERControlList",
+					"UTIL-004's procedure step 3: the server notifies the client of the change to the "+
+						"node's DERControlList"),
+				critNotifiedHrefRefetched(o),
 			}
 		},
 	})
@@ -976,10 +1259,9 @@ func aggScenarios() map[string]aggScenario {
 		"AGG-002": {
 			Summary: "2 DERPrograms, 2 DefaultDERControls, 0 DERControls: EDA1/EDA2 follow the TFA default " +
 				"(primacy 5) and EDB1/EDB2 fall back to the SY default (primacy 10)",
-			Defaults: []string{"TFA", "SY"},
-			FanOut: []aggFanOut{
-				{"the TFA DefaultDERControl is applied", "EDA1 and EDA2"},
-				{"the SY DefaultDERControl is applied", "EDB1 and EDB2"},
+			Defaults: []aggDefault{
+				{"TFA", "EDA1 and EDA2", edaPair},
+				{"SY", "EDB1 and EDB2", edbPair},
 			},
 		},
 		"AGG-003": {
@@ -989,9 +1271,12 @@ func aggScenarios() map[string]aggScenario {
 			},
 			Lifecycles: []aggLifecycle{{"CERT-AGG003", "TFA", 180}},
 			FanOut: []aggFanOut{
-				{"Response status 1 → 2 → 3 is POSTed for the TFA event", "EDA1 and EDA2"},
-				{"NO Response is POSTed for the TFA event — the untagged negative pass criterion",
-					"EDB1 and EDB2"},
+				{What: "aggregator POSTs response with status 1 (Event Received), 2 (Event Started) at start " +
+					"time and 3 (Event Completed) after the duration has elapsed, for the TFA event",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG003", Statuses: []int{1, 2, 3}},
+				{What: "NO Response is POSTed for the TFA event — the row's untagged pass criterion, " +
+					"\"Client fails if EDB1 and/or EDB2 POSTs any responses to the TFA event\"",
+					Devices: "EDB1 and EDB2", Names: edbPair, MRID: "CERT-AGG003", Absent: true},
 			},
 		},
 		"AGG-004": {
@@ -1001,10 +1286,16 @@ func aggScenarios() map[string]aggScenario {
 				{MRID: "CERT-AGG004", Program: progTFA, StartOffset: 120, DurationS: 60},
 			},
 			Lifecycles: []aggLifecycle{{"CERT-AGG004", "TFA", 180}},
-			Defaults:   []string{"TFA (before the event)", "TFA (after the event)"},
+			Defaults: []aggDefault{
+				{"TFA (before the event)", "EDA1 and EDA2", edaPair},
+				{"TFA (after the event)", "EDA1 and EDA2", edaPair},
+			},
 			FanOut: []aggFanOut{
-				{"Response status 1 → 2 → 3 is POSTed for the TFA event", "EDA1 and EDA2"},
-				{"NO Response is POSTed for the TFA event", "EDB1 and EDB2"},
+				{What: "aggregator POSTs response with status 1 (Event Received), 2 (Event Started) and " +
+					"3 (Event Completed) for the TFA event",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG004", Statuses: []int{1, 2, 3}},
+				{What: "NO Response is POSTed for the TFA event",
+					Devices: "EDB1 and EDB2", Names: edbPair, MRID: "CERT-AGG004", Absent: true},
 			},
 		},
 		"AGG-005": {
@@ -1018,11 +1309,16 @@ func aggScenarios() map[string]aggScenario {
 				{"CERT-AGG005A", "first TFA", 180},
 				{"CERT-AGG005B", "second TFA", 300},
 			},
-			Defaults: []string{"TFA (between and after the two events)"},
+			Defaults: []aggDefault{{"TFA (between and after the two events)", "EDA1 and EDA2", edaPair}},
 			FanOut: []aggFanOut{
-				{"both events' Response lifecycles are POSTed — 2 events × 2 EndDevices = 12 Response POSTs",
-					"EDA1 and EDA2"},
-				{"NO Response is POSTed for either TFA event", "EDB1 and EDB2"},
+				{What: "the FIRST TFA event's full Response lifecycle is POSTed",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG005A", Statuses: []int{1, 2, 3}},
+				{What: "the SECOND TFA event's full Response lifecycle is POSTed",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG005B", Statuses: []int{1, 2, 3}},
+				{What: "NO Response is POSTed for the first TFA event",
+					Devices: "EDB1 and EDB2", Names: edbPair, MRID: "CERT-AGG005A", Absent: true},
+				{What: "NO Response is POSTed for the second TFA event",
+					Devices: "EDB1 and EDB2", Names: edbPair, MRID: "CERT-AGG005B", Absent: true},
 			},
 		},
 		"AGG-006": {
@@ -1036,11 +1332,16 @@ func aggScenarios() map[string]aggScenario {
 				{"CERT-AGG006TFA", "TFA", 180},
 				{"CERT-AGG006SY", "SY", 300},
 			},
-			Defaults: []string{"TFA", "SY"},
+			Defaults: []aggDefault{
+				{"TFA", "EDA1 and EDA2", edaPair},
+				{"SY", "EDB1 and EDB2", edbPair},
+			},
 			FanOut: []aggFanOut{
-				{"Response status 1 → 2 → 3 is POSTed for the TFA event", "EDA1 and EDA2"},
-				{"Response status 1 → 2 → 3 is POSTed for the SY event (Annex A seq 26 adds EDB1/EDB2 to " +
-					"procedure steps 11-15 and pass/fail bullets 8, 10, 11 and 12)", "EDB1 and EDB2"},
+				{What: "the TFA event's full Response lifecycle is POSTed",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG006TFA", Statuses: []int{1, 2, 3}},
+				{What: "the SY event's full Response lifecycle is POSTed — Annex A seq 26 adds EDB1/EDB2 to " +
+					"procedure steps 11-15 and to pass/fail bullets 8, 10, 11 and 12",
+					Devices: "EDB1 and EDB2", Names: edbPair, MRID: "CERT-AGG006SY", Statuses: []int{1, 2, 3}},
 			},
 		},
 		"AGG-007": {
@@ -1057,12 +1358,24 @@ func aggScenarios() map[string]aggScenario {
 			SupersedeStatus:  14,
 			SupersedeMeaning: superseded14,
 			SupersedeWhy:     why14,
-			Defaults:         []string{"TFA", "SY"},
+			Defaults: []aggDefault{
+				{"TFA", "EDA1 and EDA2", edaPair},
+				{"SY", "EDB1 and EDB2", edbPair},
+			},
 			FanOut: []aggFanOut{
-				{"Response status 14 is POSTed for the SY event and the TFA event is executed instead",
-					"EDA1 and EDA2"},
-				{"the SY DERControl is executed normally — they are outside the TFA program, so nothing " +
-					"supersedes it for them", "EDB1 and EDB2"},
+				{What: "aggregator POSTs response with status 1 (Event Received) for the SY event",
+					Devices: "EDA1, EDA2, EDB1 and EDB2", Names: managedDevices,
+					MRID: "CERT-AGG007SY", Statuses: []int{1}},
+				{What: "aggregator POSTs response with status 14 for the SY event, which the TFA event " +
+					"supersedes for them",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG007SY", Statuses: []int{14}},
+				{What: "the SY DERControl is executed normally — they are outside the TFA program, so nothing " +
+					"supersedes it for them, and their Responses are 2 (Started) and 3 (Completed) with no " +
+					"supersession status at all",
+					Devices: "EDB1 and EDB2", Names: edbPair, MRID: "CERT-AGG007SY",
+					Statuses: []int{2, 3}, Forbidden: []int{7, 14}},
+				{What: "the TFA event's full Response lifecycle is POSTed",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG007TFA", Statuses: []int{1, 2, 3}},
 			},
 		},
 		"AGG-008": {
@@ -1078,12 +1391,28 @@ func aggScenarios() map[string]aggScenario {
 			SupersedeStatus:  14,
 			SupersedeMeaning: superseded14,
 			SupersedeWhy:     why14,
-			Defaults:         []string{"TFA", "SY"},
+			Defaults: []aggDefault{
+				{"TFA", "EDA1 and EDA2", edaPair},
+				{"SY", "EDB1 and EDB2", edbPair},
+			},
 			FanOut: []aggFanOut{
-				{"Response status 14 is POSTed for the SY event, and after the TFA event completes they " +
-					"return to the TFA DefaultDERControl rather than falling through to the still-running " +
-					"SY control", "EDA1 and EDA2"},
-				{"the SY DERControl is executed normally", "EDB1 and EDB2"},
+				{What: "aggregator POSTs response with status 1 (Event Received) for the SY event",
+					Devices: "EDA1, EDA2, EDB1 and EDB2", Names: managedDevices,
+					MRID: "CERT-AGG008SY", Statuses: []int{1}},
+				{What: "aggregator POSTs response with status 14 for the SY event",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG008SY", Statuses: []int{14}},
+				{What: "the SY DERControl is executed normally, with no supersession status",
+					Devices: "EDB1 and EDB2", Names: edbPair, MRID: "CERT-AGG008SY",
+					Statuses: []int{2, 3}, Forbidden: []int{7, 14}},
+				{What: "the TFA event's full Response lifecycle is POSTed",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG008TFA", Statuses: []int{1, 2, 3}},
+				{What: "after the TFA event completes they return to the TFA DefaultDERControl rather than " +
+					"falling through to the still-running SY control",
+					Devices: "EDA1 and EDA2", Unobservable: "which control a device fell back to is a SETPOINT, " +
+						"and the procedure states for every DefaultDERControl bullet that IEEE 2030.5 defines no " +
+						"acknowledgment for activating one. What IS asserted, in the criteria above, is that the " +
+						"status-14 Response for the SY event was POSTed — which is the wire evidence that the " +
+						"device stopped treating it as its control"},
 			},
 		},
 		"AGG-009": {
@@ -1099,11 +1428,23 @@ func aggScenarios() map[string]aggScenario {
 			SupersedeStatus:  7,
 			SupersedeMeaning: superseded7,
 			SupersedeWhy:     why7,
-			Defaults:         []string{"TFA", "SY"},
+			Defaults: []aggDefault{
+				{"TFA", "EDA1 and EDA2", edaPair},
+				{"SY", "EDB1 and EDB2", edbPair},
+			},
 			FanOut: []aggFanOut{
-				{"the SY control runs from +1 to +2 min, then Response status 7 is POSTed for it and the " +
-					"TFA control runs", "EDA1 and EDA2"},
-				{"the SY control runs for its full 4 min", "EDB1 and EDB2"},
+				{What: "aggregator POSTs response with status 1 (Event Received) and 2 (Event Started) for " +
+					"the SY event, which every device is in scope for",
+					Devices: "EDA1, EDA2, EDB1 and EDB2", Names: managedDevices,
+					MRID: "CERT-AGG009SY", Statuses: []int{1, 2}},
+				{What: "the SY control runs from +1 to +2 min and is then superseded: status 7 is POSTed for it",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG009SY", Statuses: []int{7}},
+				{What: "the SY control runs for its full 4 min — status 3 (Event Completed) is POSTed for it " +
+					"and no supersession status ever is",
+					Devices: "EDB1 and EDB2", Names: edbPair, MRID: "CERT-AGG009SY",
+					Statuses: []int{3}, Forbidden: []int{7, 14}},
+				{What: "the TFA event's full Response lifecycle is POSTed",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG009TFA", Statuses: []int{1, 2, 3}},
 			},
 		},
 		"AGG-010": {
@@ -1121,11 +1462,19 @@ func aggScenarios() map[string]aggScenario {
 				{"CERT-AGG010TFA", "TFA", 240},
 			},
 			Independent: []string{"CERT-AGG010SY", "CERT-AGG010TFA"},
-			Defaults:    []string{"TFA", "SY"},
+			Defaults: []aggDefault{
+				{"TFA", "EDA1 and EDA2", edaPair},
+				{"SY", "EDA1, EDA2, EDB1 and EDB2", managedDevices},
+			},
 			FanOut: []aggFanOut{
-				{"both independent controls are applied concurrently during the overlap window",
-					"EDA1 and EDA2"},
-				{"only the SY control is applied", "EDB1 and EDB2"},
+				{What: "the SY event's full Response lifecycle is POSTed — every device is in the SY " +
+					"program's scope",
+					Devices: "EDA1, EDA2, EDB1 and EDB2", Names: managedDevices,
+					MRID: "CERT-AGG010SY", Statuses: []int{1, 2, 3}, Forbidden: []int{7, 14}},
+				{What: "the TFA event's full Response lifecycle is POSTed CONCURRENTLY with the SY event, " +
+					"because the two carry independent control modes",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG010TFA",
+					Statuses: []int{1, 2, 3}, Forbidden: []int{7, 14}},
 			},
 		},
 		"AGG-011": {
@@ -1142,11 +1491,17 @@ func aggScenarios() map[string]aggScenario {
 				{"CERT-AGG011SY", "SY", 300},
 			},
 			Independent: []string{"CERT-AGG011TFA", "CERT-AGG011SY"},
-			Defaults:    []string{"TFA", "SY"},
+			Defaults: []aggDefault{
+				{"TFA", "EDA1 and EDA2", edaPair},
+				{"SY", "EDA1, EDA2, EDB1 and EDB2", managedDevices},
+			},
 			FanOut: []aggFanOut{
-				{"both independent controls are applied concurrently in the +3..+4 min overlap",
-					"EDA1 and EDA2"},
-				{"only the SY control is applied", "EDB1 and EDB2"},
+				{What: "the TFA event's full Response lifecycle is POSTed",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG011TFA",
+					Statuses: []int{1, 2, 3}, Forbidden: []int{7, 14}},
+				{What: "the SY event's full Response lifecycle is POSTed",
+					Devices: "EDA1, EDA2, EDB1 and EDB2", Names: managedDevices,
+					MRID: "CERT-AGG011SY", Statuses: []int{1, 2, 3}, Forbidden: []int{7, 14}},
 			},
 		},
 		"AGG-012": {
@@ -1165,11 +1520,20 @@ func aggScenarios() map[string]aggScenario {
 				{"CERT-AGG012TFA", "TFA", 240},
 			},
 			Independent: []string{"CERT-AGG012SY", "CERT-AGG012TFA"},
-			Defaults:    []string{"TFA", "SY"},
+			Defaults: []aggDefault{
+				{"TFA", "EDA1 and EDA2", edaPair},
+				{"SY", "EDA1, EDA2, EDB1 and EDB2", managedDevices},
+			},
 			FanOut: []aggFanOut{
-				{"the SY control runs for its full 4 min while the TFA control additionally runs from " +
-					"+2 to +4 min", "EDA1 and EDA2"},
-				{"only the SY control is applied", "EDB1 and EDB2"},
+				{What: "the SY event runs for its full 4 min and its full Response lifecycle is POSTed, with " +
+					"no supersession status despite the LATE higher-priority TFA event — that absence is this " +
+					"row's whole discriminator against AGG-009",
+					Devices: "EDA1, EDA2, EDB1 and EDB2", Names: managedDevices,
+					MRID: "CERT-AGG012SY", Statuses: []int{1, 2, 3}, Forbidden: []int{7, 14}},
+				{What: "the TFA event additionally runs from +2 to +4 min and its full Response lifecycle is " +
+					"POSTed",
+					Devices: "EDA1 and EDA2", Names: edaPair, MRID: "CERT-AGG012TFA",
+					Statuses: []int{1, 2, 3}, Forbidden: []int{7, 14}},
 			},
 		},
 	}
