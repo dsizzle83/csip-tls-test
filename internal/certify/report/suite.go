@@ -138,6 +138,108 @@ func (s *Suite) SourceBundle(rc *certify.RunCtx) (*bundle.Bundle, error) {
 	return b, nil
 }
 
+// TRRDir names an ALREADY-EMITTED Test Results Report package the document
+// rows should be asserted against, from -param report.trr.
+//
+// Without it the checks build a summary from the configuration and validate
+// that, which proves the generator agrees with itself. With it they parse the
+// bytes on disk — the file that will actually be sent — and the claim changes
+// from "this package can emit a conformant CSV" to "the CSV in this directory
+// is conformant". That is the difference between a self-test and a check, and
+// it is why the parameter exists.
+func (s *Suite) TRRDir(rc *certify.RunCtx) string {
+	dir, ok := param(rc, "trr")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(dir)
+}
+
+// Subject is the Summary Test Results a document-shape check asserts against.
+type Subject struct {
+	// Parsed is the re-parsed CSV. Every assertion is made against THIS: what
+	// the file says is the only thing a reviewer at SunSpec will ever see.
+	Parsed *ParsedSummary
+	// Summary is the model behind it, when this run built it. Nil for an
+	// on-disk package, which is exactly the point — there is no model to
+	// consult, only the document.
+	Summary *Summary
+	// Source names the artefact, for the assertion's provenance field.
+	Source string
+	// OnDisk is true when the subject is an emitted package rather than a
+	// summary this run generated.
+	OnDisk bool
+	// Supplied is false when there is nothing to assert: no emitted package and
+	// no submission metadata.
+	Supplied bool
+}
+
+// Subject resolves what the document-shape checks assert against.
+func (s *Suite) Subject(rc *certify.RunCtx, certType string, verdicts []TestVerdict) (*Subject, error) {
+	if dir := s.TRRDir(rc); dir != "" {
+		path, data, err := ReadEmittedSummary(dir, certType)
+		if err != nil {
+			return nil, err
+		}
+		p, perr := ParseSummary(data)
+		if perr != nil {
+			return nil, fmt.Errorf("report: %s does not parse as a Summary Test Results CSV: %w", path, perr)
+		}
+		return &Subject{Parsed: p, Source: path, OnDisk: true, Supplied: true}, nil
+	}
+	cfg, supplied, err := s.Config(rc)
+	if err != nil {
+		return nil, err
+	}
+	sum := BuildSummary(cfg, certType, verdicts)
+	data, err := sum.CSV()
+	if err != nil {
+		return nil, err
+	}
+	p, err := ParseSummary(data)
+	if err != nil {
+		return nil, fmt.Errorf("report: the Summary Test Results this run emitted does not re-parse as CSV: %w", err)
+	}
+	return &Subject{
+		Parsed: p, Summary: sum, Supplied: supplied,
+		Source: "the Summary Test Results CSV this run generated",
+	}, nil
+}
+
+// ReadEmittedSummary finds one certificate type's Summary Test Results inside a
+// Test Results Report package.
+//
+// Both file names are tried, because which one a package carries is itself a
+// statement: SUMMARY.csv means every required key had a value, and
+// SUMMARY-INCOMPLETE.csv means some did not. A checker that only looked for the
+// first would report a package as absent when it is merely honest about being
+// short.
+func ReadEmittedSummary(dir, certType string) (string, []byte, error) {
+	base := filepath.Join(dir, certTypeSlug(certType), PublicDir)
+	var tried []string
+	for _, name := range []string{SummaryFile, IncompleteFile} {
+		path := filepath.Join(base, name)
+		tried = append(tried, path)
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return path, data, nil
+		}
+	}
+	return "", nil, fmt.Errorf("report: the Test Results Report package %s carries no Summary Test Results "+
+		"for %s; looked for %s", dir, certType, strings.Join(tried, " and "))
+}
+
+// ReadEmittedLogs reads one certificate type's §4 Detailed Test Logs out of a
+// package, or reports that the archive is absent.
+func ReadEmittedLogs(dir, certType string) (string, []byte, error) {
+	path := filepath.Join(dir, certTypeSlug(certType), ArchiveDir, LogsFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return path, nil, err
+	}
+	return path, data, nil
+}
+
 // OutDir is where the submission is written. -param report.out names it; with
 // no parameter a per-run temporary directory is used and its path is recorded
 // in the case notes, so a run that was not asked to persist a submission still
@@ -162,30 +264,29 @@ func (s *Suite) OutDir(rc *certify.RunCtx) (string, error) {
 
 // Verdicts maps a source bundle's test cases to `Test <Test ID>` rows.
 //
-// The mapping is where an honest tool is separated from a convenient one. The
-// §3.1.1 enumeration has exactly three members — PASS, FAIL, NOT SUPPORTED —
-// and a bench SKIP is none of them: it means "addressed but not asserted here",
-// which is not "the implementation does not support this feature". Mapping it
-// to PASS would manufacture a verdict; mapping it to NOT SUPPORTED would
-// misreport a capability. So SKIP and WARN rows are OMITTED and named, and the
-// caller reports how many were omitted and why.
+// It is [MapVerdict] applied case by case, with no catalog: this entry point
+// takes a bundle and nothing else, and without the catalog the bundle archived
+// there is nothing that licenses a NOT SUPPORTED row, so every SKIP and every
+// WARN is omitted and named. That is the conservative direction — a report that
+// claims less, never more — and it is why the richer path ([Collate], which
+// reads each bundle's own archived catalog) is what the -trr mode uses.
+//
+// The rule itself, and the §3.1.1 text it comes from, is derived once in
+// trr.go's file comment. Nothing here re-decides it.
 func Verdicts(b *bundle.Bundle) (rows []TestVerdict, omitted []string) {
 	if b == nil {
 		return nil, nil
 	}
 	for _, c := range b.Cases {
-		id := c.ID
-		if _, after, ok := strings.Cut(id, "::"); ok {
-			id = after
+		if ReportOnSelf[DocKeyOf(c.ID)] {
+			continue
 		}
-		switch c.Verdict {
-		case bundle.Pass:
-			rows = append(rows, TestVerdict{ID: id, Verdict: "PASS"})
-		case bundle.Fail:
-			rows = append(rows, TestVerdict{ID: id, Verdict: "FAIL"})
-		default:
-			omitted = append(omitted, fmt.Sprintf("%s (%s)", id, c.Verdict))
+		row, gap := MapVerdict(c, nil, "")
+		if gap != nil {
+			omitted = append(omitted, fmt.Sprintf("%s (%s)", gap.ID, gap.BenchVerdict))
+			continue
 		}
+		rows = append(rows, *row)
 	}
 	return rows, omitted
 }

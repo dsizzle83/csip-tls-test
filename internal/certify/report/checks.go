@@ -49,26 +49,18 @@ func (s *Suite) keyCheck(certType, uid string) certify.Check {
 		if len(specs) == 0 {
 			return certify.Result{}, fmt.Errorf("report: no §3.1.1 key is bound to %s", uid)
 		}
-		cfg, supplied, err := s.Config(rc)
-		if err != nil {
-			return certify.Failed("the submission configuration could not be used: %v", err), nil
-		}
 		labels := specLabels(specs)
-		if !supplied {
-			return certify.Skipped("no submission metadata was configured, so nothing was emitted for %s. "+
-				"Supply -param %sconfig=<file> or -param %s<key>=<value>; this tool does not invent "+
-				"lab or submitter values", labels, paramPrefix, paramPrefix), nil
-		}
-
-		sum := BuildSummary(cfg, certType, nil)
-		data, err := sum.CSV()
+		subj, err := s.Subject(rc, certType, nil)
 		if err != nil {
-			return certify.Result{}, err
+			return certify.Failed("%v", err), nil
 		}
-		parsed, err := ParseSummary(data)
-		if err != nil {
-			return certify.Failed("the Summary Test Results this run emitted does not re-parse as CSV: %v", err), nil
+		if !subj.Supplied {
+			return certify.Skipped("no Test Results Report package and no submission metadata were named, so "+
+				"nothing was emitted for %s. Supply -param %strr=<package> to assert against an emitted "+
+				"report, or -param %sconfig=<file>; this tool does not invent lab or submitter values",
+				labels, paramPrefix, paramPrefix), nil
 		}
+		parsed := subj.Parsed
 
 		var as []certify.Assertion
 		verdict := certify.Skip
@@ -100,7 +92,7 @@ func (s *Suite) keyCheck(certType, uid string) certify.Check {
 						"§%s rule (%s)", r.Key, spec.Section, describeRule(spec)),
 					"parse of the emitted Summary Test Results CSV, validated against the §3.1.1 key table",
 					v, observed,
-					"the CSV this run generated. Note this asserts the FORM of the value, never its truth: "+
+					subj.Source+". Note this asserts the FORM of the value, never its truth: "+
 						"whether the value is the submitter's real one is the submitter's attestation"))
 				verdict = worse(verdict, v)
 			}
@@ -119,11 +111,11 @@ func (s *Suite) keyCheck(certType, uid string) certify.Check {
 					spec.EnumUnavailable))
 			}
 		}
-		notes := fmt.Sprintf("%s: %d row(s) emitted", labels, seen)
+		notes := fmt.Sprintf("%s: %d row(s) emitted, read from %s", labels, seen, subj.Source)
 		return certify.Result{
 			Verdict: verdict, Assertions: as, Notes: notes,
 			OffWire: true,
-			OffWireReason: offWire("the Summary Test Results CSV this run generated",
+			OffWireReason: offWire(subj.Source,
 				fmt.Sprintf("§%s specifies the key label %s and the form of its value", specs[0].Section, labels)),
 		}, nil
 	}
@@ -222,22 +214,32 @@ func (s *Suite) verdictCheck(certType, uid string) certify.Check {
 		if err != nil {
 			return certify.Failed("%v", err), nil
 		}
-		if src == nil {
-			return certify.Skipped("no source evidence bundle was supplied (-param %sbundle=<dir>), so this "+
-				"run has no test-procedure verdicts to report. The `Test <Test ID>` rows are the only part "+
-				"of a Summary Test Results that carries a conformance result, and they are not "+
-				"manufacturable", paramPrefix), nil
+		var rows []TestVerdict
+		var omitted []string
+		if src != nil {
+			rows, omitted = Verdicts(src)
 		}
-		rows, omitted := Verdicts(src)
-		cfg, _, _ := s.Config(rc)
-		sum := BuildSummary(cfg, certType, rows)
-		data, err := sum.CSV()
+		subj, err := s.Subject(rc, certType, rows)
 		if err != nil {
-			return certify.Result{}, err
+			return certify.Failed("%v", err), nil
 		}
-		parsed, err := ParseSummary(data)
-		if err != nil {
-			return certify.Failed("the emitted Summary Test Results does not re-parse: %v", err), nil
+		if src == nil && !subj.OnDisk {
+			return certify.Skipped("neither an emitted Test Results Report package (-param %strr=<dir>) nor "+
+				"a source evidence bundle (-param %sbundle=<dir>) was supplied, so this run has no "+
+				"test-procedure verdicts to report. The `Test <Test ID>` rows are the only part of a "+
+				"Summary Test Results that carries a conformance result, and they are not manufacturable",
+				paramPrefix, paramPrefix), nil
+		}
+		parsed := subj.Parsed
+		origin := subj.Source
+		if subj.OnDisk {
+			// The bundle named by -param report.bundle is not necessarily the one
+			// that produced THIS report — a package is routinely built from
+			// several — so its omission list would be describing something else.
+			// The package's own readiness report carries the gaps.
+			omitted = nil
+		} else if src != nil {
+			origin += ", built from " + src.Run.Tool + " bundle " + src.Run.GitCommit
 		}
 
 		var as []certify.Assertion
@@ -259,23 +261,21 @@ func (s *Suite) verdictCheck(certType, uid string) certify.Check {
 			as = append(as, skipAssertion(
 				"the Summary Test Results carries a `Test <Test ID>` row per executed procedure",
 				"parse of the emitted Summary Test Results CSV",
-				fmt.Sprintf("the source bundle %s has %d case(s), none of which produced a PASS or FAIL",
-					src.Run.Tool, len(src.Cases))))
+				fmt.Sprintf("%s carries no `Test <Test ID>` row, so it reports no conformance result", origin)))
 		case len(bad) > 0:
 			verdict = certify.Fail
 			as = append(as, docAssertion(
 				"every `Test <Test ID>` value is PASS, FAIL or NOT SUPPORTED",
 				"parse of the emitted Summary Test Results CSV",
 				certify.Fail, fmt.Sprintf("%d row(s) outside the enumeration: %s", len(bad), strings.Join(bad, ", ")),
-				"the CSV this run generated"))
+				origin))
 		default:
 			verdict = certify.Pass
 			as = append(as, docAssertion(
 				fmt.Sprintf("the Summary Test Results carries %d `Test <Test ID>` row(s), each valued from "+
 					"the PASS | FAIL | NOT SUPPORTED enumeration", n),
-				"parse of the emitted Summary Test Results CSV, cross-checked against the source bundle's cases",
-				certify.Pass, verdictObserved(parsed, table),
-				"the CSV this run generated from "+src.Run.Tool+" bundle "+src.Run.GitCommit))
+				"parse of the emitted Summary Test Results CSV",
+				certify.Pass, verdictObserved(parsed, table), origin))
 		}
 
 		// The omission is the honest part, so it is an assertion of its own
@@ -297,9 +297,9 @@ func (s *Suite) verdictCheck(certType, uid string) certify.Check {
 		}
 		return certify.Result{
 			Verdict: verdict, Assertions: as,
-			Notes:   fmt.Sprintf("%d verdict row(s) emitted, %d case(s) omitted as unmappable", n, len(omitted)),
+			Notes:   fmt.Sprintf("%d verdict row(s) in %s, %d case(s) omitted as unmappable", n, subj.Source, len(omitted)),
 			OffWire: true,
-			OffWireReason: offWire("the Summary Test Results CSV this run generated",
+			OffWireReason: offWire(subj.Source,
 				"the `Test <Test ID>` key is a row of a document, and its values come from a previous "+
 					"campaign's evidence bundle rather than from anything on this run's wire"),
 		}, nil
@@ -334,20 +334,16 @@ func verdictObserved(p *ParsedSummary, table []KeySpec) string {
 // csvFormCheck implements RPT-008 / RPT-TRR-2: §3.1's seven encoding rules.
 func (s *Suite) csvFormCheck(certType, uid string) certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-		cfg, _, err := s.Config(rc)
-		if err != nil {
-			return certify.Failed("the submission configuration could not be used: %v", err), nil
-		}
 		src, _ := s.SourceBundle(rc)
 		rows, _ := Verdicts(src)
-		sum := BuildSummary(cfg, certType, rows)
-		data, err := sum.CSV()
+		subj, err := s.Subject(rc, certType, rows)
+		if err != nil {
+			return certify.Failed("%v", err), nil
+		}
+		parsed := subj.Parsed
+		data, err := reencode(parsed)
 		if err != nil {
 			return certify.Result{}, err
-		}
-		parsed, err := ParseSummary(data)
-		if err != nil {
-			return certify.Failed("the emitted Summary Test Results does not re-parse as CSV: %v", err), nil
 		}
 		findings := parsed.ValidateAgainst(KeyTable(certType))
 
@@ -359,7 +355,7 @@ func (s *Suite) csvFormCheck(certType, uid string) certify.Check {
 			"re-parse of the emitted CSV with encoding/csv, arity checked per record",
 			verdictIf(len(parsed.Rows) == parsed.Lines && parsed.Lines > 0),
 			fmt.Sprintf("%d record(s), every one two fields; no header row", parsed.Lines),
-			"the CSV this run generated"))
+			subj.Source))
 
 		if len(findings) > 0 {
 			verdict = certify.Fail
@@ -370,14 +366,14 @@ func (s *Suite) csvFormCheck(certType, uid string) certify.Check {
 			"validation of the re-parsed CSV against the §3.1.1 key table",
 			verdictIf(len(findings) == 0),
 			findingsObserved(findings, parsed),
-			"the CSV this run generated"))
+			subj.Source))
 
 		quoted := quotedRows(parsed, data)
 		as = append(as, docAssertion(
 			"values containing a comma, a quote or a line break are quoted, and quotes inside them doubled",
 			"byte inspection of the emitted CSV",
 			certify.Pass, quoted,
-			"the CSV this run generated"))
+			subj.Source))
 
 		as = append(as, docAssertion(
 			"the two representation choices §3.1 does not make are recorded rather than left implicit",
@@ -389,13 +385,22 @@ func (s *Suite) csvFormCheck(certType, uid string) certify.Check {
 
 		return certify.Result{
 			Verdict: verdict, Assertions: as,
-			Notes:   fmt.Sprintf("%d row(s), %d finding(s)", parsed.Lines, len(findings)),
+			Notes:   fmt.Sprintf("%d row(s), %d finding(s) in %s", parsed.Lines, len(findings), subj.Source),
 			OffWire: true,
-			OffWireReason: offWire("the Summary Test Results CSV this run generated",
+			OffWireReason: offWire(subj.Source,
 				"§3.1's encoding rules are properties of a document — one CSV, key/value rows, exact key "+
 					"labels, enumerated values, quoting"),
 		}, nil
 	}
+}
+
+// reencode renders a parsed document back to CSV bytes, so the quoting rule can
+// be examined the same way whether the subject came off disk or out of this
+// run's generator. It is the encoder's own output for the parsed values, which
+// is exactly what §3.1's quoting rule is about.
+func reencode(p *ParsedSummary) ([]byte, error) {
+	s := &Summary{Rows: p.Rows}
+	return s.CSV()
 }
 
 func findingsObserved(findings []string, p *ParsedSummary) string {
@@ -423,36 +428,45 @@ func quotedRows(p *ParsedSummary, data []byte) string {
 // reported result.
 func (s *Suite) freezeCheck(certType, uid string) certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-		cfg, supplied, err := s.Config(rc)
+		subj, err := s.Subject(rc, certType, nil)
 		if err != nil {
-			return certify.Failed("the submission configuration could not be used: %v", err), nil
+			return certify.Failed("%v", err), nil
 		}
-		if !supplied || len(cfg.Software) == 0 || cfg.Software[0].Checksum == "" {
-			return certify.Skipped("no `Software Checksum` was supplied, so the report carries no anchor " +
+		// The checksum is read out of the EMITTED DOCUMENT rather than out of the
+		// configuration, because a Test Results Report package may have derived it
+		// from the evidence bundle's own DUT build stamp (see FillChecksums). A
+		// check that consulted only the config file would report the one anchor
+		// this format has for §2.1's equipment freeze as absent whenever it was
+		// derived rather than typed.
+		sums := checksumRows(subj.Parsed)
+		if !subj.Supplied || len(sums) == 0 {
+			return certify.Skipped("no `Software Checksum` was emitted, so the report carries no anchor " +
 				"binding its results to one image. The specification states the freeze as a process " +
 				"constraint on the laboratory and defines no mechanism for evidencing it; the checksum key " +
 				"is the only machine-checkable trace it has"), nil
 		}
-		alg := cfg.ChecksumAlgorithm
-		algNote := certify.Pass
-		algText := alg
-		if alg == "" {
+		comments := ""
+		if r, ok := subj.Parsed.Lookup("Additional Test Comments"); ok {
+			comments = r.Value
+		}
+		algNote, algText := certify.Pass, "stated in Additional Test Comments"
+		if !strings.Contains(comments, "Checksum algorithm") {
 			algNote = certify.Warn
-			algText = "unstated — the format defines no key for the checksum algorithm, and none was " +
-				"supplied for Additional Test Comments to carry"
+			algText = "unstated — the format defines no key for the checksum algorithm, and Additional " +
+				"Test Comments does not name one"
 		}
 		as := []certify.Assertion{
 			docAssertion(
 				"one `Software Checksum` value covers every `Test <Test ID>` row in the report",
 				"inspection of the emitted Summary Test Results",
 				certify.Pass,
-				fmt.Sprintf("%d software record(s); checksum 1 = %s", len(cfg.Software), cfg.Software[0].Checksum),
-				"the submission configuration and the CSV this run generated"),
+				fmt.Sprintf("%d `Software Checksum` row(s): %s", len(sums), strings.Join(sums, ", ")),
+				subj.Source),
 			docAssertion(
 				"the checksum algorithm is stated, since the format has no key for it",
 				"inspection of Additional Test Comments",
 				algNote, algText,
-				"the submission configuration"),
+				subj.Source),
 			skipAssertion(
 				"no software or hardware change occurred during the testing process",
 				"process constraint",
@@ -464,10 +478,21 @@ func (s *Suite) freezeCheck(certType, uid string) certify.Check {
 			Verdict: worse(certify.Pass, algNote), Assertions: as,
 			Notes:   "the checksum anchor is present; the freeze itself is unassertable",
 			OffWire: true,
-			OffWireReason: offWire("the submission configuration and the emitted Summary Test Results",
+			OffWireReason: offWire(subj.Source,
 				"an equipment-version freeze is a property of how a campaign was conducted"),
 		}, nil
 	}
+}
+
+// checksumRows returns the emitted `Software Checksum <n>` values, in order.
+func checksumRows(p *ParsedSummary) []string {
+	var out []string
+	for _, r := range p.Rows {
+		if strings.HasPrefix(r.Key, "Software Checksum") {
+			out = append(out, r.Key+"="+r.Value)
+		}
+	}
+	return out
 }
 
 // notAssessable registers a row this bench cannot decide, as a SKIP whose

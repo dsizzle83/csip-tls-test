@@ -97,25 +97,21 @@ var csipKeyRows = []string{
 // never both, and records the mismatch for the laboratory.
 func (s *Suite) exampleKeysCheck() certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-		cfg, supplied, err := s.Config(rc)
+		cfg, _, err := s.Config(rc)
 		if err != nil {
 			return certify.Failed("the submission configuration could not be used: %v", err), nil
 		}
-		if !supplied {
-			return certify.Skipped("no submission metadata was configured, so neither of the §3.1.2 " +
-				"example's undocumented keys was emitted. Neither has a definition anywhere in the " +
-				"document, so neither can be validated even when supplied — this row asserts only that " +
-				"the generator does not guess at them"), nil
-		}
-		sum := BuildSummary(cfg, CertTypeCSIP, nil)
-		data, err := sum.CSV()
+		subj, err := s.Subject(rc, CertTypeCSIP, nil)
 		if err != nil {
-			return certify.Result{}, err
+			return certify.Failed("%v", err), nil
 		}
-		parsed, err := ParseSummary(data)
-		if err != nil {
-			return certify.Failed("the emitted Summary Test Results does not re-parse: %v", err), nil
+		if !subj.Supplied {
+			return certify.Skipped("no Test Results Report package and no submission metadata were named, " +
+				"so neither of the §3.1.2 example's undocumented keys was emitted. Neither has a " +
+				"definition anywhere in the document, so neither can be validated even when supplied — " +
+				"this row asserts only that the generator does not guess at them"), nil
 		}
+		parsed := subj.Parsed
 		_, hasVersion := parsed.Lookup("Certificate Type Version")
 		_, hasState := parsed.Lookup("Company State")
 		_, hasProvince := parsed.Lookup("Company Province")
@@ -130,7 +126,7 @@ func (s *Suite) exampleKeysCheck() certify.Check {
 					"value 2019 and has no definition, description or value type anywhere in the document, "+
 					"so a generator that emitted a plausible year would be inventing a specification",
 					cfg.CertificateTypeVersion != "", hasVersion),
-				"the CSV this run generated"),
+				subj.Source),
 			docAssertion(
 				"the state and province are emitted in exactly one of the two mutually exclusive forms: "+
 					"§3.1.1's two keys, or the §3.1.2 example's combined key",
@@ -140,7 +136,7 @@ func (s *Suite) exampleKeysCheck() certify.Check {
 					"(combine_state_province = %t). §3.1.1 is the normative table and is the default; "+
 					"the combined key is emitted only on request",
 					hasState, hasProvince, hasCombined, cfg.CombineStateProvince),
-				"the CSV this run generated"),
+				subj.Source),
 			docAssertion(
 				"the §3.1.1 / §3.1.2 mismatch is recorded for the laboratory rather than silently resolved",
 				"transcription of the source document",
@@ -160,7 +156,7 @@ func (s *Suite) exampleKeysCheck() certify.Check {
 			Verdict: certify.Warn, Assertions: as,
 			Notes:   "the example's two undocumented keys are handled explicitly; neither is guessed",
 			OffWire: true,
-			OffWireReason: offWire("the Summary Test Results CSV this run generated",
+			OffWireReason: offWire(subj.Source,
 				"§3.1.2's example emits keys §3.1.1 does not define, and how a generator treats them is a "+
 					"property of the emitted document"),
 		}, nil
