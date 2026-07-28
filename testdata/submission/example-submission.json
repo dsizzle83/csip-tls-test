@@ -1,0 +1,58 @@
+{
+  "_comment": "EXAMPLE ONLY — every value below is a placeholder for the LEXA bench and none of it is a real SunSpec submission. See docs/TRR_SUBMISSION_CONFIG.md. Keys that only SunSpec or an Appendix A1 laboratory can fill are deliberately ABSENT rather than blank: certificate_number, date_issued, certificate_signer_name, test_laboratory, supervising_test_engineer.",
+
+  "company_name": "Lexa Energy Systems, Inc.",
+  "company_address": "1 Example Way, Suite 200",
+  "company_city": "Boulder",
+  "company_state": "CO",
+  "company_country": "USA",
+  "company_postal_code": "80301",
+
+  "software": [
+    {
+      "name": "mbapsd",
+      "version": "0.9.0",
+      "element": "mbaps"
+    },
+    {
+      "name": "lexa-northbound",
+      "version": "0.9.0",
+      "element": "nb"
+    },
+    {
+      "name": "lexa-modbus",
+      "version": "0.9.0",
+      "element": "modbus"
+    }
+  ],
+
+  "operating_systems": [
+    {
+      "name": "Digi Embedded Yocto (Linux)",
+      "version": "5.15"
+    }
+  ],
+
+  "software_operating_environment": "Hardware Device",
+
+  "hardware_manufacturer": ["Digi International"],
+  "hardware_model": ["ConnectCore 6UL SBC Pro"],
+  "product_manufacturer": ["Lexa Energy Systems, Inc."],
+  "product_model": ["LEXA DER Gateway"],
+
+  "pics_url": "https://example.invalid/lexa/pics/placeholder.xlsx",
+  "test_completion_date": "07/28/2026",
+  "test_description": "SunSpec Modbus Conformance Certification",
+
+  "per_certificate_type": {
+    "IEEE 2030.5/CSIP": {
+      "test_description": "IEEE 2030.5 / CSIP conformance, direct DER client profile",
+      "pics_url": "https://example.invalid/lexa/pics/placeholder-csip.xlsx",
+      "context_id": "lexa-csip-example"
+    },
+    "SunSpec Modbus": {
+      "test_description": "SunSpec Modbus Conformance Certification",
+      "pics_url": "https://example.invalid/lexa/pics/placeholder-modbus.xlsx"
+    }
+  }
+}
