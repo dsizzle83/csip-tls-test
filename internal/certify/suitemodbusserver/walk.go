@@ -184,6 +184,19 @@ func findBase(c *client) (chain, error) {
 		regs, err := c.readHolding(base, 2, fmt.Sprintf("DEV-1 base probe at %d", base))
 		p := baseProbe{Base: base, Regs: regs, Err: err}
 		ch.Probes = append(ch.Probes, p)
+		if _, isExc := asException(err); err != nil && !isExc {
+			// A transport failure is not something to iterate through: the
+			// stream is no longer trustworthy, and the bases after this one
+			// were never actually asked. probeUnit below already draws
+			// exactly this line; findBase used to fold the failure into the
+			// summary at the bottom and then state, of a DUT that HAD
+			// answered, that it carried no SunSpec identifier anywhere. That
+			// is a claim about the device manufactured out of a fact about
+			// the socket, and no conformance verdict may rest on it.
+			return ch, fmt.Errorf("suitemodbusserver: base probe at %d failed on the transport, so the "+
+				"remaining base addresses were never asked and this attempt supports no conclusion "+
+				"about the DUT's map: %w", base, err)
+		}
 		if p.Found() && ch.Base == 0 && len(ch.Models) == 0 {
 			ch.Base = base
 			// Keep probing the remaining bases: a device answering the
@@ -199,6 +212,8 @@ func findBase(c *client) (chain, error) {
 		}
 	}
 	if !found {
+		// Reached only when all three bases produced a real Modbus ANSWER and
+		// none carried the identifier — which is a statement about the device.
 		return ch, fmt.Errorf("suitemodbusserver: no SunSpec identifier at any standard base address (%v)", ch.Probes)
 	}
 	return ch, nil

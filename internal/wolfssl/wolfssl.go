@@ -232,8 +232,62 @@ func Connect(ssl unsafe.Pointer) error {
 	return nil
 }
 
-// Read reads from an SSL session. Returns the number of bytes read,
-// or an error if the read fails.
+// wolfSSL_get_error reason codes. wolfSSL gives these the OpenSSL values
+// ("These values match OpenSSL values for corresponding names" —
+// wolfssl/ssl.h), and they are what separates "call me again" from "this
+// stream is finished". They are the whole reason IOError exists.
+const (
+	// ErrWantRead / ErrWantWrite: the call made no progress and MAY simply be
+	// made again. On a blocking socket carrying SO_RCVTIMEO/SO_SNDTIMEO this
+	// is how a socket timeout surfaces, and it is also how a partially
+	// received TLS record surfaces. Neither says anything about the peer.
+	ErrWantRead  = 2
+	ErrWantWrite = 3
+	// ErrSyscall: the transport failed underneath us.
+	ErrSyscall = 5
+	// ErrZeroReturn: the peer sent close_notify. The stream is over, cleanly.
+	ErrZeroReturn = 6
+)
+
+// IOError is a wolfSSL_read/wolfSSL_write failure carrying the library's own
+// reason code.
+//
+// It exists because wolfSSL_read returns -1 for BOTH "retry me" and "this
+// connection is dead", and only wolfSSL_get_error can tell them apart. This
+// package used to return fmt.Errorf("wolfSSL_read returned %d", n) and throw
+// the reason away, which cost a conformance run a real finding: on 2026-07-27
+// a discovery-walk read got -1 with eight seconds of its deadline left, gave
+// up on the session, and reported the DUT as having no SunSpec identifier at
+// any standard base address — while the DUT's correct answer sat in the same
+// capture 422µs later. An error the referee cannot classify is an error the
+// referee will misattribute to the device.
+type IOError struct {
+	Op   string // "read" or "write"
+	Ret  int    // the wolfSSL_read/wolfSSL_write return value
+	Code int    // wolfSSL_get_error reason
+}
+
+func (e *IOError) Error() string {
+	return fmt.Sprintf("wolfSSL_%s returned %d: %s (err=%d)", e.Op, e.Ret, ErrString(e.Code), e.Code)
+}
+
+// Retryable reports whether the call made no progress and may simply be made
+// again. The CALLER'S OWN DEADLINE, not this error, decides when to stop.
+func (e *IOError) Retryable() bool { return e.Code == ErrWantRead || e.Code == ErrWantWrite }
+
+// PeerClosed reports a clean close_notify from the peer.
+func (e *IOError) PeerClosed() bool { return e.Code == ErrZeroReturn }
+
+// ErrString renders a wolfSSL reason code through the library's own table.
+func ErrString(code int) string {
+	var buf [C.WOLFSSL_MAX_ERROR_SZ]C.char
+	C.wolfSSL_ERR_error_string_n(C.ulong(C.uint(code)), &buf[0], C.ulong(len(buf)))
+	return C.GoString(&buf[0])
+}
+
+// Read reads from an SSL session. Returns the number of bytes read, or an
+// *IOError carrying the wolfSSL reason code — callers MUST consult
+// IOError.Retryable before concluding anything about the peer.
 func Read(ssl unsafe.Pointer, buf []byte) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -244,12 +298,13 @@ func Read(ssl unsafe.Pointer, buf []byte) (int, error) {
 		C.int(len(buf)),
 	))
 	if n < 0 {
-		return 0, fmt.Errorf("wolfSSL_read returned %d", n)
+		return 0, &IOError{Op: "read", Ret: n,
+			Code: int(C.wolfSSL_get_error((*C.WOLFSSL)(ssl), C.int(n)))}
 	}
 	return n, nil
 }
 
-// Write writes to an SSL session.
+// Write writes to an SSL session. Same error contract as Read.
 func Write(ssl unsafe.Pointer, buf []byte) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -260,7 +315,8 @@ func Write(ssl unsafe.Pointer, buf []byte) (int, error) {
 		C.int(len(buf)),
 	))
 	if n < 0 {
-		return 0, fmt.Errorf("wolfSSL_write returned %d", n)
+		return 0, &IOError{Op: "write", Ret: n,
+			Code: int(C.wolfSSL_get_error((*C.WOLFSSL)(ssl), C.int(n)))}
 	}
 	return n, nil
 }

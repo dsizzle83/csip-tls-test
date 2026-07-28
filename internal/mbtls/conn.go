@@ -1,6 +1,7 @@
 package mbtls
 
 import (
+	"errors"
 	"net"
 	"sync"
 	"syscall"
@@ -33,31 +34,63 @@ type tlsConn struct {
 func (c *tlsConn) fd() int { return int(c.sess.file.Fd()) }
 
 func (c *tlsConn) Read(b []byte) (int, error) {
-	n, err := wolfssl.Read(c.sess.ssl, b)
-	if err != nil {
-		c.mu.Lock()
-		dl := c.rDL
-		c.mu.Unlock()
-		if !dl.IsZero() && !time.Now().Before(dl) {
-			return n, timeoutError{op: "read"}
-		}
-		return n, err
-	}
-	return n, nil
+	return c.io("read", syscall.SO_RCVTIMEO,
+		func() (int, error) { return wolfssl.Read(c.sess.ssl, b) },
+		func() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.rDL })
 }
 
 func (c *tlsConn) Write(b []byte) (int, error) {
-	n, err := wolfssl.Write(c.sess.ssl, b)
-	if err != nil {
-		c.mu.Lock()
-		dl := c.wDL
-		c.mu.Unlock()
-		if !dl.IsZero() && !time.Now().Before(dl) {
-			return n, timeoutError{op: "write"}
+	return c.io("write", syscall.SO_SNDTIMEO,
+		func() (int, error) { return wolfssl.Write(c.sess.ssl, b) },
+		func() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.wDL })
+}
+
+// io runs one wolfSSL I/O call and honours the deadline this type promises.
+//
+// wolfSSL_read/write return -1 for "no progress, call me again"
+// (WANT_READ/WANT_WRITE) exactly as they do for a dead connection, and on this
+// blocking-socket-plus-SO_RCVTIMEO design a want is the ORDINARY way a socket
+// timeout — or a partially received TLS record — arrives. Handing it to the
+// caller as a failure is what turned a transient into a false statement about
+// the DUT: on 2026-07-27 a discovery-walk read came back in 57µs with eight
+// seconds of its deadline unspent, and the run reported that the gateway had
+// no SunSpec identifier at any standard base address. The gateway's correct
+// answer was already in that same capture, 422µs later.
+//
+// So a retryable code is retried until the caller's deadline genuinely
+// expires, and only then reported as a timeout — which is what the type's doc
+// comment above already promised and did not deliver, having checked the
+// deadline once, after the fact. SO_RCVTIMEO/SO_SNDTIMEO are re-armed to the
+// REMAINING time before each retry, so the loop cannot overshoot a deadline by
+// re-blocking for the full original interval.
+//
+// With no deadline set the socket blocks indefinitely, so a want means a
+// genuine short record; retrying is correct and cannot spin, because the next
+// call blocks.
+func (c *tlsConn) io(op string, sockOpt int, call func() (int, error), deadline func() time.Time) (int, error) {
+	for {
+		n, err := call()
+		if err == nil {
+			return n, nil
+		}
+		dl := deadline()
+		expired := !dl.IsZero() && !time.Now().Before(dl)
+
+		var ioe *wolfssl.IOError
+		if !expired && errors.As(err, &ioe) && ioe.Retryable() {
+			if !dl.IsZero() {
+				// Re-arm to what is LEFT, not to the original interval.
+				if serr := setSockTimeout(c.fd(), sockOpt, dl); serr != nil {
+					return n, serr
+				}
+			}
+			continue
+		}
+		if expired {
+			return n, timeoutError{op: op}
 		}
 		return n, err
 	}
-	return n, nil
 }
 
 func (c *tlsConn) Close() error         { return c.sess.Close() }
