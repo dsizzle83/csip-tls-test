@@ -172,6 +172,66 @@ func certificateBasedSuite(id uint16) (bool, string) {
 	}
 }
 
+// offeredSuiteCensusVerdict decides CRYP-006's client half (SunSpecTCP-15/16):
+// every cipher suite the peer OFFERS is IANA-registered and certificate-based.
+//
+// Two classes of codepoint appear in a cipher_suites vector without being
+// cipher suites, and neither can be classified by key exchange because neither
+// has one:
+//
+//   - RFC 8701 GREASE values, already excluded here since the beginning;
+//   - signalling values (SCSVs). RFC 5746 §3.3: TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+//     "is not a true cipher suite (it does not correspond to any valid set of
+//     algorithms) and cannot be negotiated". RFC 7507 §3 says the same of
+//     TLS_FALLBACK_SCSV.
+//
+// Counting an SCSV as a suite is a category error with a live consequence.
+// RFC 5746 §3.4 lets a client provide the SunSpecTCP-62 renegotiation
+// indication EITHER by the extension OR by the SCSV; wolfSSL sends the
+// extension, mbed TLS signals with the SCSV. This census therefore decided
+// SunSpecTCP-15/16 on which TLS library the DUT happened to be linked against,
+// and would have reported a conformant mbed TLS gateway as offering a suite
+// that "cannot be classified". They are excluded from the census and NAMED in
+// the observation, so a reviewer sees exactly what was set aside and why.
+//
+// The strict mirror of this rule lives on the server side and is unchanged: an
+// SCSV must never be NEGOTIATED, so a ServerHello that selected one still fails
+// through certificateBasedSuite.
+func offeredSuiteCensusVerdict(ch *tlsdis.ClientHello, whose string) (certify.Verdict, string) {
+	if ch == nil {
+		return certify.Fail, "no ClientHello was recovered, so the " + whose +
+			" cipher_suites vector cannot be censused"
+	}
+	var unregistered, notCert, signalling []string
+	for _, id := range ch.CipherSuites {
+		switch {
+		case tlsdis.IsGREASE(id):
+			continue
+		case tlsdis.IsSCSV(id):
+			signalling = append(signalling, fmt.Sprintf("0x%04X %s", id, tlsdis.CipherSuiteName(id)))
+			continue
+		case !tlsdis.KnownCipherSuite(id):
+			unregistered = append(unregistered, fmt.Sprintf("0x%04X", id))
+			continue
+		}
+		if ok, _ := certificateBasedSuite(id); !ok {
+			notCert = append(notCert, fmt.Sprintf("0x%04X %s", id, tlsdis.CipherSuiteName(id)))
+		}
+	}
+	obs := fmt.Sprintf("%s ClientHello offered %d codepoint(s): %s",
+		whose, len(ch.CipherSuites), namedSuites(ch.CipherSuites))
+	if len(signalling) > 0 {
+		obs += fmt.Sprintf("; %d of them are SIGNALLING values, not cipher suites (RFC 5746 §3.3 / "+
+			"RFC 7507 §3), and are excluded from this census: [%s]",
+			len(signalling), strings.Join(signalling, ", "))
+	}
+	if len(unregistered) > 0 || len(notCert) > 0 {
+		return certify.Fail, fmt.Sprintf("%s — unregistered: [%s]; not certificate-based: [%s]",
+			obs, strings.Join(unregistered, ", "), strings.Join(notCert, ", "))
+	}
+	return certify.Pass, obs
+}
+
 // sha256PRFSuite reports whether a negotiated TLS 1.2 suite derives its keys
 // with the SHA-256 PRF, which is what CRYP-005 step 5 infers HMAC-SHA-256 from.
 // The GCM and ChaCha suites carry SHA256 in their names; AES_128_CCM_8 does not
@@ -624,7 +684,18 @@ func fragmentBytesText(n int, known bool) string {
 	return fmt.Sprintf("%d bytes", n)
 }
 
-// renegotiationInfoVerdict decides PROT-004's extension half (SunSpecTCP-62).
+// renegotiationInfoVerdict decides PROT-004's SERVER half (SunSpecTCP-62).
+//
+// The extension is the only conformant answer here, and the asymmetry with the
+// client half below is RFC 5746's, not this bench's. §3.6 gives the server one
+// behaviour on an initial handshake: on receiving EITHER the SCSV or the
+// extension, "the server MUST include an empty 'renegotiation_info' extension
+// in the ServerHello message". The SCSV is a CLIENT signal — §3.3 calls it "not
+// a true cipher suite … cannot be negotiated" — so there is no second wire form
+// for a server to choose, and accepting one would not be leniency toward a
+// conformant peer, it would be accepting a ServerHello no conformant peer can
+// send. See renegotiationIndicationVerdict for the client half, where §3.4 DOES
+// admit two forms.
 func renegotiationInfoVerdict(sh *tlsdis.ServerHello) (certify.Verdict, string) {
 	if sh == nil {
 		return certify.Fail, "the EUT-S sent no ServerHello, so no renegotiation_info can be observed"
@@ -640,6 +711,62 @@ func renegotiationInfoVerdict(sh *tlsdis.ServerHello) (certify.Verdict, string) 
 			len(sh.RenegotiationInfo))
 	}
 	return certify.Pass, "the ServerHello carries the RFC 5746 renegotiation_info extension (type 0xFF01) with an empty renegotiated_connection, as required on an initial handshake"
+}
+
+// renegotiationIndicationVerdict decides PROT-004's CLIENT half
+// (SunSpecTCP-62) from the gateway's own southbound ClientHello.
+//
+// RFC 5746 §3.4 is explicit that there are TWO conformant wire forms, and that
+// the client picks:
+//
+//	"The client MUST include either an empty 'renegotiation_info' extension,
+//	 or the TLS_EMPTY_RENEGOTIATION_INFO_SCSV signaling cipher suite value in
+//	 the ClientHello. Including both is NOT RECOMMENDED."
+//
+// SunSpecTCP-62 requires the device to PROVIDE the RFC 5746 renegotiation
+// indication; it does not — and cannot — prescribe which of the two forms
+// §3.4 leaves to the client. This matters on a live bench: a wolfSSL-linked
+// gateway sends the empty extension, a mbed TLS-linked one signals with the
+// SCSV by default, and the same device fails or passes depending only on which
+// library it was linked against. So the verdict is FAIL when BOTH are absent,
+// and only then.
+//
+// Sending both is accepted with the RFC's own NOT RECOMMENDED recorded: a
+// SHOULD NOT is not a MUST NOT, and the indication SunSpecTCP-62 asks for is
+// unambiguously present.
+func renegotiationIndicationVerdict(ch *tlsdis.ClientHello, whose string) (certify.Verdict, string) {
+	if ch == nil {
+		return certify.Fail, "no ClientHello was recovered, so " + whose +
+			" renegotiation indication cannot be observed"
+	}
+	scsv := false
+	for _, id := range ch.CipherSuites {
+		if id == tlsdis.SCSVEmptyRenegotiationInfo {
+			scsv = true
+			break
+		}
+	}
+	obs := fmt.Sprintf("%s ClientHello: renegotiation_info (0xFF01) %s; TLS_EMPTY_RENEGOTIATION_INFO_SCSV "+
+		"(0x00FF) %s; extensions [%s]", whose, presence(ch.HasRenegotiationInfo), presence(scsv),
+		strings.Join(tlsdis.ExtensionNames(ch.Extensions), ", "))
+	switch {
+	case !ch.HasRenegotiationInfo && !scsv:
+		return certify.Fail, obs + " — neither of the two forms RFC 5746 §3.4 admits is present, so the " +
+			"peer provides no secure-renegotiation indication at all"
+	case ch.HasRenegotiationInfo && scsv:
+		return certify.Pass, obs + " — both forms are present; RFC 5746 §3.4 says including both is " +
+			"NOT RECOMMENDED, but the indication SunSpecTCP-62 requires is unambiguously provided"
+	case scsv:
+		return certify.Pass, obs + " — signalled by the SCSV, the second of the two forms RFC 5746 §3.4 admits"
+	default:
+		if len(ch.RenegotiationInfo) != 0 {
+			return certify.Warn, obs + fmt.Sprintf(" — the extension carries %d byte(s) of "+
+				"renegotiated_connection on what should be an INITIAL handshake; RFC 5746 §3.4 requires it empty",
+				len(ch.RenegotiationInfo))
+		}
+		return certify.Pass, obs + " — signalled by the empty renegotiation_info extension, the first of " +
+			"the two forms RFC 5746 §3.4 admits"
+	}
 }
 
 // certificateRequestVerdict decides TLSF-006 (SunSpecTCP-11).

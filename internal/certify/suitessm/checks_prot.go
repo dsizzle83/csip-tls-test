@@ -14,12 +14,17 @@ package suitessm
 //	          then split into records of at most 512 plaintext bytes — needs a
 //	          TLS client that implements RFC 6066, and Go's crypto/tls does
 //	          not. That sub-criterion is a SKIP naming the reason.
-//	PROT-004  the renegotiation_info extension is asserted from the wire. The
-//	          follow-on criterion — a second handshake inside the session whose
-//	          extension carries the previous Finished verify_data — needs a
-//	          client that can INITIATE renegotiation, which Go's crypto/tls
-//	          cannot (it only accepts server-initiated renegotiation). SKIP,
-//	          with the reason and with the DUT's own documented refusal policy.
+//	PROT-004  the renegotiation INDICATION is asserted from the wire, in the
+//	          form each role is allowed to use: RFC 5746 §3.6 gives the server
+//	          exactly one (the empty renegotiation_info extension in the
+//	          ServerHello), while §3.4 lets the CLIENT choose between that
+//	          extension and TLS_EMPTY_RENEGOTIATION_INFO_SCSV. Both client forms
+//	          pass; only their joint absence fails. The follow-on criterion — a
+//	          second handshake inside the session whose extension carries the
+//	          previous Finished verify_data — needs a client that can INITIATE
+//	          renegotiation, which Go's crypto/tls cannot (it only accepts
+//	          server-initiated renegotiation). SKIP, with the reason and with
+//	          the DUT's own documented refusal policy.
 
 import (
 	"context"
@@ -353,22 +358,12 @@ func prot004(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 					"DUT's TLS 1.2 sessions."))
 
 			a, err = half.fact(ev,
-				"SunSpecTCP-62 [C]: the gateway's own southbound ClientHello carries renegotiation_info (or the TLS_EMPTY_RENEGOTIATION_INFO_SCSV equivalent)",
+				"SunSpecTCP-62 [C]: the gateway's own southbound ClientHello provides the RFC 5746 "+
+					"secure-renegotiation indication in one of the two forms §3.4 admits — the empty "+
+					"renegotiation_info extension, or TLS_EMPTY_RENEGOTIATION_INFO_SCSV in cipher_suites",
 				"ClientHello extension 0xFF01 and cipher_suites of the gateway's hello to the bench device sim",
 				func(ch *tlsdis.ClientHello) (certify.Verdict, string) {
-					scsv := false
-					for _, id := range ch.CipherSuites {
-						if id == 0x00FF { // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
-							scsv = true
-						}
-					}
-					obs := fmt.Sprintf("gateway ClientHello: renegotiation_info %s; TLS_EMPTY_RENEGOTIATION_INFO_SCSV (0x00FF) %s; extensions [%s]",
-						presence(ch.HasRenegotiationInfo), presence(scsv),
-						strings.Join(tlsdis.ExtensionNames(ch.Extensions), ", "))
-					if !ch.HasRenegotiationInfo && !scsv {
-						return certify.Fail, obs + " — neither form of the RFC 5746 indication is present"
-					}
-					return certify.Pass, obs
+					return renegotiationIndicationVerdict(ch, "the gateway's")
 				})
 			if err != nil {
 				return nil, err

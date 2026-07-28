@@ -108,6 +108,31 @@ func TestGREASE(t *testing.T) {
 	}
 }
 
+// TestIsSCSV pins the two signalling values apart from real cipher suites.
+// They ARE in the IANA registry — KnownCipherSuite says so, and that is
+// correct — but RFC 5746 §3.3 and RFC 7507 §3 both say they are not cipher
+// suites and cannot be negotiated, so any census that classifies a codepoint by
+// its key exchange has to know to leave them out.
+func TestIsSCSV(t *testing.T) {
+	if SCSVEmptyRenegotiationInfo != 0x00FF || SCSVFallback != 0x5600 {
+		t.Fatalf("the SCSV codepoints moved: 0x%04X / 0x%04X", SCSVEmptyRenegotiationInfo, SCSVFallback)
+	}
+	for _, v := range []uint16{SCSVEmptyRenegotiationInfo, SCSVFallback} {
+		if !IsSCSV(v) {
+			t.Errorf("IsSCSV(0x%04X) = false", v)
+		}
+		if !KnownCipherSuite(v) {
+			t.Errorf("0x%04X is a registered codepoint and must stay in the transcription", v)
+		}
+	}
+	// Neighbours, real suites and a GREASE value must all be excluded.
+	for _, v := range []uint16{0xC0AE, 0x1301, 0xCCA9, 0x00FE, 0x0100, 0x5601, 0x55FF, 0x0A0A} {
+		if IsSCSV(v) {
+			t.Errorf("IsSCSV(0x%04X) = true", v)
+		}
+	}
+}
+
 func TestVersionAndGroupNames(t *testing.T) {
 	for _, tc := range []struct {
 		v    uint16

@@ -56,6 +56,36 @@ func IsGREASE(v uint16) bool {
 	return v&0x0F0F == 0x0A0A && byte(v>>8) == byte(v)
 }
 
+// Signalling cipher suite values. They occupy codepoints in the IANA TLS Cipher
+// Suite Registry but are not cipher suites.
+const (
+	// SCSVEmptyRenegotiationInfo is RFC 5746's TLS_EMPTY_RENEGOTIATION_INFO_SCSV.
+	// §3.3: "This SCSV is not a true cipher suite (it does not correspond to any
+	// valid set of algorithms) and cannot be negotiated."
+	SCSVEmptyRenegotiationInfo uint16 = 0x00FF
+	// SCSVFallback is RFC 7507's TLS_FALLBACK_SCSV. §3: "This value is not a
+	// true cipher suite and MUST NOT be negotiated."
+	SCSVFallback uint16 = 0x5600
+)
+
+// IsSCSV reports whether a codepoint is a signalling cipher suite value.
+//
+// The distinction matters wherever a check censuses a ClientHello's
+// cipher_suites vector — "every suite offered is certificate-based", "no
+// NULL-encryption suite is offered", "every codepoint offered is registered".
+// An SCSV appears in that vector but carries no key exchange, no cipher and no
+// MAC to classify, so a census that treats it as a suite reports a category
+// error as a conformance failure. RFC 5746 §3.4 makes the renegotiation SCSV
+// one of the two ALLOWED ways a client signals secure renegotiation, so failing
+// a client for sending it would be failing it for being conformant.
+//
+// The mirror rule is the strict one and belongs to the SERVER side: both RFCs
+// forbid an SCSV from ever being NEGOTIATED, so a ServerHello whose selected
+// cipher_suite is one of these is non-conformant, not exempt.
+func IsSCSV(v uint16) bool {
+	return v == SCSVEmptyRenegotiationInfo || v == SCSVFallback
+}
+
 // VersionName renders a ProtocolVersion.
 func VersionName(v uint16) string {
 	switch v {

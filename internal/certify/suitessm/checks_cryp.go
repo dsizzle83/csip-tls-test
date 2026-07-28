@@ -643,26 +643,7 @@ func cryp006(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 				"SunSpecTCP-15/16 [C]: every cipher suite the gateway offers is IANA-registered and certificate-based",
 				"every codepoint in the gateway's ClientHello cipher_suites, cross-referenced against the bench's IANA transcription",
 				func(ch *tlsdis.ClientHello) (certify.Verdict, string) {
-					var unregistered, notCert []string
-					for _, id := range ch.CipherSuites {
-						if tlsdis.IsGREASE(id) {
-							continue
-						}
-						if !tlsdis.KnownCipherSuite(id) {
-							unregistered = append(unregistered, fmt.Sprintf("0x%04X", id))
-							continue
-						}
-						if ok, _ := certificateBasedSuite(id); !ok {
-							notCert = append(notCert, fmt.Sprintf("0x%04X %s", id, tlsdis.CipherSuiteName(id)))
-						}
-					}
-					obs := fmt.Sprintf("gateway ClientHello offered %d suite(s): %s",
-						len(ch.CipherSuites), namedSuites(ch.CipherSuites))
-					if len(unregistered) > 0 || len(notCert) > 0 {
-						return certify.Fail, fmt.Sprintf("%s — unregistered: [%s]; not certificate-based: [%s]",
-							obs, strings.Join(unregistered, ", "), strings.Join(notCert, ", "))
-					}
-					return certify.Pass, obs
+					return offeredSuiteCensusVerdict(ch, "gateway")
 				})
 			if err != nil {
 				return nil, err

@@ -488,6 +488,10 @@ func TestMFLEchoVerdict(t *testing.T) {
 	}
 }
 
+// TestRenegotiationInfoVerdict covers the SERVER half, where RFC 5746 §3.6
+// allows exactly one wire form. The SCSV is a client signal — §3.3 says it
+// "cannot be negotiated" — so there is no second form to admit here, and
+// accepting one would be accepting a ServerHello no conformant server sends.
 func TestRenegotiationInfoVerdict(t *testing.T) {
 	if v, _ := renegotiationInfoVerdict(&tlsdis.ServerHello{HasRenegotiationInfo: true}); v != certify.Pass {
 		t.Error("an empty renegotiation_info on an initial handshake must PASS")
@@ -498,6 +502,101 @@ func TestRenegotiationInfoVerdict(t *testing.T) {
 	nonEmpty := &tlsdis.ServerHello{HasRenegotiationInfo: true, RenegotiationInfo: []byte{1, 2, 3}}
 	if v, _ := renegotiationInfoVerdict(nonEmpty); v != certify.Warn {
 		t.Error("a non-empty renegotiated_connection on an INITIAL handshake violates RFC 5746 §3.6 and must WARN")
+	}
+	// A ServerHello that SELECTED the SCSV is non-conformant, not exempt: both
+	// RFC 5746 §3.3 and RFC 7507 §3 forbid negotiating a signalling value.
+	if ok, _ := certificateBasedSuite(tlsdis.SCSVEmptyRenegotiationInfo); ok {
+		t.Error("a negotiated TLS_EMPTY_RENEGOTIATION_INFO_SCSV must not be classified as a valid " +
+			"certificate-based suite: it cannot be negotiated at all")
+	}
+}
+
+// TestRenegotiationIndicationVerdict covers the CLIENT half, where RFC 5746
+// §3.4 admits TWO wire forms and lets the client choose:
+//
+//	"The client MUST include either an empty 'renegotiation_info' extension,
+//	 or the TLS_EMPTY_RENEGOTIATION_INFO_SCSV signaling cipher suite value in
+//	 the ClientHello. Including both is NOT RECOMMENDED."
+//
+// Both are exercised because the bench has seen both: a wolfSSL-linked gateway
+// sends the extension, a mbed TLS-linked one signals with the SCSV, and a check
+// that knew only the first would report a library migration as a SunSpecTCP-62
+// regression.
+func TestRenegotiationIndicationVerdict(t *testing.T) {
+	// Form 1 — the empty extension (wolfSSL's default).
+	ext := &tlsdis.ClientHello{HasRenegotiationInfo: true, CipherSuites: mandated12}
+	if v, obs := renegotiationIndicationVerdict(ext, "the DUT's"); v != certify.Pass {
+		t.Errorf("the empty renegotiation_info extension must PASS: %s (%s)", v, obs)
+	}
+
+	// Form 2 — the SCSV and NO extension (mbed TLS's default). This is the
+	// regression the migration would have produced.
+	scsv := &tlsdis.ClientHello{
+		CipherSuites: append([]uint16{tlsdis.SCSVEmptyRenegotiationInfo}, mandated12...),
+	}
+	v, obs := renegotiationIndicationVerdict(scsv, "the DUT's")
+	if v != certify.Pass {
+		t.Errorf("TLS_EMPTY_RENEGOTIATION_INFO_SCSV alone must PASS SunSpecTCP-62 — RFC 5746 §3.4 "+
+			"admits it as an alternative to the extension: %s (%s)", v, obs)
+	}
+	if !strings.Contains(obs, "0x00FF") {
+		t.Errorf("the observation does not name the codepoint it rests on: %q", obs)
+	}
+
+	// Both — NOT RECOMMENDED by §3.4, but the indication is unambiguously there.
+	both := &tlsdis.ClientHello{
+		HasRenegotiationInfo: true,
+		CipherSuites:         append([]uint16{tlsdis.SCSVEmptyRenegotiationInfo}, mandated12...),
+	}
+	if v, obs := renegotiationIndicationVerdict(both, "the DUT's"); v != certify.Pass {
+		t.Errorf("both forms present must still PASS: %s (%s)", v, obs)
+	}
+
+	// Neither — the only failing case.
+	none := &tlsdis.ClientHello{CipherSuites: mandated12}
+	if v, obs := renegotiationIndicationVerdict(none, "the DUT's"); v != certify.Fail {
+		t.Errorf("neither form present must FAIL SunSpecTCP-62: %s (%s)", v, obs)
+	}
+	if v, _ := renegotiationIndicationVerdict(nil, "the DUT's"); v != certify.Fail {
+		t.Error("no ClientHello at all must FAIL, not pass by absence")
+	}
+
+	// A non-empty renegotiated_connection on an initial hello is a §3.4
+	// violation of its own, and must not be laundered into a PASS.
+	dirty := &tlsdis.ClientHello{
+		HasRenegotiationInfo: true, RenegotiationInfo: []byte{1, 2, 3}, CipherSuites: mandated12,
+	}
+	if v, obs := renegotiationIndicationVerdict(dirty, "the DUT's"); v != certify.Warn {
+		t.Errorf("a non-empty renegotiated_connection on an initial ClientHello must WARN: %s (%s)", v, obs)
+	}
+}
+
+// TestOfferedSuiteCensusExcludesSignallingValues pins the other half of the
+// SCSV problem. CRYP-006's client census asks "is every offered suite
+// certificate-based?", and an SCSV has no key exchange to answer with — so
+// before this rule a mbed TLS gateway failed SunSpecTCP-15/16 for providing the
+// SunSpecTCP-62 indication in the form RFC 5746 §3.4 allows.
+func TestOfferedSuiteCensusExcludesSignallingValues(t *testing.T) {
+	withSCSV := &tlsdis.ClientHello{
+		CipherSuites: append([]uint16{tlsdis.SCSVEmptyRenegotiationInfo, tlsdis.SCSVFallback}, mandated12...),
+	}
+	v, obs := offeredSuiteCensusVerdict(withSCSV, "gateway")
+	if v != certify.Pass {
+		t.Fatalf("signalling values must not fail the certificate-based census: %s (%s)", v, obs)
+	}
+	if !strings.Contains(obs, "SIGNALLING") {
+		t.Errorf("the excluded codepoints are not reported to the reviewer: %q", obs)
+	}
+
+	// The census must still have teeth: a genuinely anonymous suite fails.
+	anon := &tlsdis.ClientHello{
+		CipherSuites: append([]uint16{tlsdis.SCSVEmptyRenegotiationInfo, 0x0034}, mandated12...),
+	}
+	if v, obs := offeredSuiteCensusVerdict(anon, "gateway"); v != certify.Fail {
+		t.Errorf("TLS_DH_anon_WITH_AES_128_CBC_SHA offered alongside an SCSV must still FAIL: %s (%s)", v, obs)
+	}
+	if v, _ := offeredSuiteCensusVerdict(nil, "gateway"); v != certify.Fail {
+		t.Error("no ClientHello at all must FAIL, not pass by absence")
 	}
 }
 
