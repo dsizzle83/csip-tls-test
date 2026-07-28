@@ -374,10 +374,10 @@ type RunReport struct {
 	// artifacts.go.
 	CaptureArtifacts []CaptureArtifact
 	Bundle           *bundle.Bundle
-	BundleDir       string
-	Started         time.Time
-	Finished        time.Time
-	DryRun          bool
+	BundleDir        string
+	Started          time.Time
+	Finished         time.Time
+	DryRun           bool
 }
 
 // Counts tallies the cases by verdict.

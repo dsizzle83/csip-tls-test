@@ -516,7 +516,7 @@ func TestChainRejectionAcceptsTheErratumsThirdSignal(t *testing.T) {
 	byPeer := &Transcript{
 		Handshake:        Handshake{Complete: true, ServerCertFrames: []int{4}, ServerChain: [][]byte{[]byte("bad")}},
 		ClientAppRecords: 2, ServerAppRecords: 2,
-		Responses:        []*Message{forbidden(Response, []int{7})},
+		Responses: []*Message{forbidden(Response, []int{7})},
 	}
 	f = rejectionFinding(ev, byPeer)
 	if f.Verdict != certify.Fail {
