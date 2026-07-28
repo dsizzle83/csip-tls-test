@@ -396,6 +396,11 @@ type FrameSet struct {
 	// Contested are frames this window matched but had to give up because
 	// another window matched them too.
 	Contested []int `json:"contested,omitempty"`
+	// Consolidated counts frames this check initially won but yielded to
+	// another because they belonged to a TCP conversation that check owned
+	// most of. See consolidateStreams: a split conversation is citable by
+	// nobody, so it is given whole to its majority owner.
+	Consolidated int `json:"consolidated,omitempty"`
 	// Claims is what the check registered, for the record.
 	Claims []string `json:"claims,omitempty"`
 	// EndpointReason is set for PrecisionEndpoint windows.
@@ -515,14 +520,103 @@ func attribute(frames []*netdis.Frame, wins []*Window) *Attribution {
 		att.Contested[f.Index] = uids
 	}
 
+	consolidateStreams(att, streams, frames)
+
 	for uid, fs := range att.Sets {
 		sort.Ints(fs.Frames)
+		fs.Streams = fs.Streams[:0]
 		for s := range streams[uid] {
 			fs.Streams = append(fs.Streams, s)
 		}
 		sort.Strings(fs.Streams)
 	}
 	return att
+}
+
+// consolidateStreams makes attribution STREAM-ATOMIC: every frame of a TCP
+// conversation is attributed to the single check that owns most of it.
+//
+// Frame-level attribution splits a conversation whenever one straddles a window
+// boundary — routine, not exotic: a bench server with an idle timeout opens a
+// fresh connection per poll cycle, and those are short relative to the gap
+// between checks. A split conversation is useless to BOTH checks that share it:
+// neither can cite it, because the runner correctly refuses to let a check cite
+// frames another check owns. The evidence sits in the capture, unusable by
+// anyone, and the checks report it as missing.
+//
+// A TLS session is indivisible evidence — handshake, keys and application
+// records only mean anything together — so the majority owner takes all of it.
+// This pass only ever moves frames of a conversation that is ALREADY split; it
+// never invents an owner for an unattributed one, and never touches a
+// conversation a single check already owns outright.
+func consolidateStreams(att *Attribution, streams map[string]map[string]bool, frames []*netdis.Frame) {
+	type group struct {
+		frames []*netdis.Frame
+		byUID  map[string]int
+	}
+	groups := map[string]*group{}
+	for _, f := range frames {
+		if f == nil {
+			continue
+		}
+		flow, ok := f.Flow()
+		if !ok {
+			continue
+		}
+		key := flow.Stream().String()
+		g := groups[key]
+		if g == nil {
+			g = &group{byUID: map[string]int{}}
+			groups[key] = g
+		}
+		g.frames = append(g.frames, f)
+		for uid, fs := range att.Sets {
+			if fs.owns[f.Index] {
+				g.byUID[uid]++
+				break
+			}
+		}
+	}
+
+	for key, g := range groups {
+		if len(g.byUID) < 2 {
+			continue // wholly owned, or owned by nobody: nothing to consolidate
+		}
+		// Majority owner; ties broken by uid so two runs over one capture
+		// produce identical bundles.
+		winner, best := "", -1
+		for uid, n := range g.byUID {
+			if n > best || (n == best && uid < winner) {
+				winner, best = uid, n
+			}
+		}
+		if winner == "" {
+			continue
+		}
+		for _, f := range g.frames {
+			for uid, fs := range att.Sets {
+				if uid == winner || !fs.owns[f.Index] {
+					continue
+				}
+				delete(fs.owns, f.Index)
+				for i, idx := range fs.Frames {
+					if idx == f.Index {
+						fs.Frames = append(fs.Frames[:i], fs.Frames[i+1:]...)
+						break
+					}
+				}
+				fs.Consolidated++
+			}
+			if w := att.Sets[winner]; !w.owns[f.Index] {
+				w.owns[f.Index] = true
+				w.Frames = append(w.Frames, f.Index)
+			}
+		}
+		for uid := range g.byUID {
+			delete(streams[uid], key)
+		}
+		streams[winner][key] = true
+	}
 }
 
 // narrow breaks a tie between windows that all matched a frame. It first
