@@ -91,6 +91,10 @@ func critTLS12() criterion {
 // would have been willing to present, and this bench has its own precedent for
 // that failure mode (the wolfSSL RequireClientCert invariant in the repository's
 // CLAUDE.md).
+//
+// The one absence that is NOT evidence of that failure is a RESUMED session,
+// where TLS omits the whole certificate exchange by design. That case returns
+// unavailable — see resumedNoCertificates.
 func critMutualAuth() criterion {
 	return criterion{
 		Claim: "the session is mutually authenticated: the server sent CertificateRequest and the DUT " +
@@ -103,7 +107,10 @@ func critMutualAuth() criterion {
 			frames = dedupeInts(frames)
 			switch {
 			case h.CertificateRequest == nil && len(h.ClientChain) == 0:
-				if len(t.Handshake.ServerHelloFrames) == 0 {
+				if h.Resumed {
+					return resumedNoCertificates(h, "whether the session is mutually authenticated")
+				}
+				if len(h.ServerHelloFrames) == 0 {
 					return unavailable("the capture holds no handshake for this session")
 				}
 				return found(certify.Fail, h.ServerHelloFrames,
@@ -123,6 +130,32 @@ func critMutualAuth() criterion {
 			}
 		},
 	}
+}
+
+// resumedNoCertificates is the shared reason for a certificate criterion that
+// finds itself looking at an ABBREVIATED handshake. what names the thing the
+// criterion wanted, so each row still reads as a sentence about ITS claim.
+//
+// This is the same shape — and the same verdict — the sibling certificate
+// criteria already produce for the same missing message: critServerChainObserved,
+// critDUTChainProfile and chainDepthCriterion all return unavailable when the
+// Certificate is not in the capture. critMutualAuth was the one exception, and
+// it turned the absence into a FAIL reading "the session is server-authenticated
+// only" — a claim about the DUT that a resumed handshake supports neither way.
+// The certificates were exchanged; they were exchanged on the FULL handshake
+// that established the session, which is somewhere else in the capture or before
+// it. Cf. internal/mbtls/peerid.go: "on a RESUMED handshake the client sends no
+// Certificate message — that is the whole point of resumption".
+//
+// Note what this does NOT relax. A FULL handshake missing CertificateRequest, or
+// answering one with an empty certificate list, still FAILs: that is a server
+// that did not demand a client certificate, or a client that did not supply one,
+// and both are exactly what CSIP §5.2.1.3 forbids.
+func resumedNoCertificates(h *Handshake, what string) Finding {
+	return unavailable("this window's session is a RESUMED TLS 1.2 session (abbreviated handshake — %s), so "+
+		"%s cannot be read from it: certificates are exchanged only on the FULL handshake that established "+
+		"this session, which lies outside this window's capture",
+		h.ResumptionSummary(), what)
 }
 
 // critHandshakeComplete asserts the RFC 5246 §7.4 flight actually finished.

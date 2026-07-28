@@ -321,6 +321,9 @@ func critServerChainObserved() criterion {
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 			h := &t.Handshake
 			if len(h.ServerChain) == 0 {
+				if h.Resumed {
+					return resumedNoCertificates(h, "the chain the server presented")
+				}
 				return unavailable("the capture holds no server Certificate message for this session")
 			}
 			desc := chainDescription(h.ServerChain)
@@ -359,6 +362,9 @@ func critDUTChainProfile() criterion {
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 			h := &t.Handshake
 			if len(h.ClientChain) == 0 {
+				if h.Resumed {
+					return resumedNoCertificates(h, "the DUT's own device certificate")
+				}
 				return unavailable("the DUT presented no certificate in this session")
 			}
 			ci, err := tlsdis.ParseCertInfo(h.ClientChain[0])
@@ -470,6 +476,9 @@ func chainDepthCriterion(depth int, shape string) func(*Observation) criterion {
 			Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 				h := &t.Handshake
 				if len(h.ServerChain) == 0 {
+					if h.Resumed {
+						return resumedNoCertificates(h, "the length of the chain the server presented")
+					}
 					return unavailable("the capture holds no server Certificate message for this session")
 				}
 				if len(h.ServerChain) != depth {
