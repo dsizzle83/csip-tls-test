@@ -97,6 +97,23 @@ const (
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
+// invocation is the command line this process was started with, for the record
+// the bundle keeps. The binary's own name is read rather than hardcoded because
+// bin/certify and bin/certify-keylog are genuinely different programs — one can
+// export TLS session secrets and one cannot — and a bundle whose invocation
+// line said only "certify" would leave a reader guessing why its capture does
+// or does not decrypt.
+//
+// The values are not redacted here. That happens once, in the runner, on the
+// way into the bundle: see certify.Options.Command.
+func invocation(args []string) []string {
+	name := "certify"
+	if len(os.Args) > 0 && os.Args[0] != "" {
+		name = filepath.Base(os.Args[0])
+	}
+	return append([]string{name}, args...)
+}
+
 // cli is the flag surface: the runner's own options plus the mode selectors and
 // the report-generation inputs the runner has no opinion about.
 type cli struct {
@@ -144,6 +161,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// silently write into each other's bundle. Cleared here so -help shows an
 	// empty default rather than a lie about where evidence will land.
 	c.opts.OutDir = ""
+
+	// Record the invocation before parsing it, so a run whose flags the runner
+	// later reinterprets still carries what was actually typed.
+	c.opts.Command = invocation(args)
 
 	fs := flag.NewFlagSet("certify", flag.ContinueOnError)
 	fs.SetOutput(stderr)

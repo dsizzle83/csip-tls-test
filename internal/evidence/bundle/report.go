@@ -76,6 +76,26 @@ func (b *Bundle) Report() string {
 		fmt.Fprintf(&sb, "Capture tool output:\n\n```\n%s\n```\n\n", b.Capture.Stderr)
 	}
 
+	// Both argv lines, together, deliberately. The bundle has always recorded
+	// how the packets were CAPTURED — dumpcap's whole command line — while
+	// recording nothing about the invocation that chose the interface, the
+	// filter, the selection and the targets. That asymmetry answered the
+	// smaller question and left the larger one to the operator's memory.
+	// Printing them side by side is what makes the run reproducible from the
+	// bundle alone.
+	if len(b.Run.Command) > 0 || len(b.Capture.Command) > 0 {
+		fmt.Fprintf(&sb, "## How this run was invoked\n\n")
+		if len(b.Run.Command) > 0 {
+			fmt.Fprintf(&sb, "```\n%s\n```\n\n", shellLine(b.Run.Command))
+			fmt.Fprintf(&sb, "Credential-shaped flag values are replaced with `%s`; every other argument is "+
+				"verbatim. Defaults the tool resolved for itself are NOT shown here — they are the rest of "+
+				"this table.\n\n", Redacted)
+		}
+		if len(b.Capture.Command) > 0 {
+			fmt.Fprintf(&sb, "The capture itself:\n\n```\n%s\n```\n\n", shellLine(b.Capture.Command))
+		}
+	}
+
 	fmt.Fprintf(&sb, "## Result\n\n")
 	fmt.Fprintf(&sb, "**%d PASS · %d FAIL · %d SKIP · %d WARN** across %d test case(s).\n\n",
 		pass, fail, skip, warn, len(b.Cases))

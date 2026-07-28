@@ -820,3 +820,51 @@ func TestFinaliseRecordsAReconciledVerdict(t *testing.T) {
 		t.Errorf("notes = %q, want the reconciliation recorded where the bundle will carry it", got.Notes)
 	}
 }
+
+// TestBundleCarriesTheRedactedInvocation: the bundle recorded dumpcap's whole
+// command line and nothing about the command that chose the interface, the
+// filter, the selection and the targets. It now records both — with the values
+// of credential-shaped flags withheld, since a bundle is a thing we hand to an
+// assessor.
+func TestBundleCarriesTheRedactedInvocation(t *testing.T) {
+	cat := catalogFile(t)
+	reg := NewRegistry()
+	reg.Register("doc-a::A-001", "x", noopCheck)
+	opts, out := baseOptions(t, nil)
+	opts.Command = []string{
+		"certify", "-doc", "doc-a", "-gateway-ssh", "cc93", "-param", "lab.token=hunter2",
+	}
+	run, err := New(reg, cat, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v\n%s", err, console(opts))
+	}
+
+	b, err := bundle.Load(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(b.Run.Command, " ")
+	if !strings.Contains(got, "-doc doc-a") || !strings.Contains(got, "-gateway-ssh cc93") {
+		t.Errorf("the bundle's invocation lost arguments: %q", got)
+	}
+	if strings.Contains(got, "hunter2") {
+		t.Errorf("the bundle's invocation carries a secret: %q", got)
+	}
+	// The runner must not have edited what the caller handed it: the process
+	// may still be using that slice.
+	if opts.Command[6] != "lab.token=hunter2" {
+		t.Errorf("Run redacted the caller's own argv in place: %v", opts.Command)
+	}
+	// And it reads back in REPORT.md, which is where the asymmetry showed:
+	// dumpcap's argv was already printed there and the run's was not.
+	report, err := os.ReadFile(filepath.Join(out, "REPORT.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "How this run was invoked") {
+		t.Errorf("REPORT.md does not show the invocation:\n%s", report)
+	}
+}

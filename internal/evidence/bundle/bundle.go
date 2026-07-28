@@ -143,14 +143,33 @@ type RunMeta struct {
 	// GitCommit and GitDirty pin the code that produced the bundle. A dirty
 	// tree is recorded rather than hidden: a bundle produced from uncommitted
 	// changes is still evidence, but a reader is entitled to know.
-	GitCommit string    `json:"git_commit,omitempty"`
-	GitDirty  bool      `json:"git_dirty,omitempty"`
-	Host      string    `json:"host,omitempty"`
-	Operator  string    `json:"operator,omitempty"`
-	Note      string    `json:"note,omitempty"`
-	Started   time.Time `json:"started"`
-	Finished  time.Time `json:"finished"`
-	DUT       DUT       `json:"dut"`
+	GitCommit string `json:"git_commit,omitempty"`
+	GitDirty  bool   `json:"git_dirty,omitempty"`
+	// Command is the argument vector that produced this bundle, with the
+	// values of credential-shaped flags replaced. It is optional: a bundle
+	// written before this field existed carries none, and Verify neither needs
+	// it nor is entitled to reject a bundle for lacking it.
+	//
+	// It is here because the bundle already records dumpcap's full argv in
+	// capture.Summary.Command, and recorded NOTHING about the invocation that
+	// chose the interface, the filter, the selection, the targets and the
+	// timeouts. So a reader could re-derive exactly how the packets were
+	// captured and had to guess what was being asked of the device — the
+	// smaller question answered and the larger one left open. Two bundles that
+	// disagree are most often two different command lines, and until now
+	// telling them apart meant finding the operator.
+	//
+	// The values recorded are what the process was given, not what it decided:
+	// the flags, not the resolved defaults. Those are elsewhere in this struct
+	// and in the capture summary, and conflating them would make the line
+	// unusable for the one thing it is for — being pasted back into a shell.
+	Command  []string  `json:"command,omitempty"`
+	Host     string    `json:"host,omitempty"`
+	Operator string    `json:"operator,omitempty"`
+	Note     string    `json:"note,omitempty"`
+	Started  time.Time `json:"started"`
+	Finished time.Time `json:"finished"`
+	DUT      DUT       `json:"dut"`
 }
 
 // Bundle is the machine-checkable half of an evidence bundle: exactly what

@@ -329,3 +329,21 @@ func TestSubmissionIsNeverWrittenInsideTheBundle(t *testing.T) {
 		}
 	}
 }
+
+// TestInvocationIsRecordedForTheBundle: the bundle's account of how a run was
+// made starts here, with the argv this process was handed. The binary's own
+// name is part of it because bin/certify and bin/certify-keylog behave
+// differently — one can export TLS secrets — and a bundle that named neither
+// would leave a reader guessing why its capture does or does not decrypt.
+func TestInvocationIsRecordedForTheBundle(t *testing.T) {
+	got := invocation([]string{"-doc", "SSM-CONF-v0.8", "-gateway-ssh", "cc93"})
+	if len(got) != 5 {
+		t.Fatalf("invocation = %v, want the binary name plus the four arguments", got)
+	}
+	if got[0] == "" || strings.ContainsRune(got[0], '/') {
+		t.Errorf("invocation[0] = %q, want the binary's base name", got[0])
+	}
+	if strings.Join(got[1:], " ") != "-doc SSM-CONF-v0.8 -gateway-ssh cc93" {
+		t.Errorf("invocation dropped or reordered arguments: %v", got)
+	}
+}

@@ -737,3 +737,81 @@ func TestWriteDoesNotDestroyACaptureAlreadyInsideTheBundle(t *testing.T) {
 		t.Error("nothing was re-checked against the capture")
 	}
 }
+
+// TestBundleRecordsItsOwnInvocation: the bundle already recorded dumpcap's
+// whole argv and nothing at all about the command that chose the interface,
+// the filter, the selection and the targets. Two bundles that disagree are most
+// often two different command lines, and telling them apart used to mean
+// finding the operator.
+func TestBundleRecordsItsOwnInvocation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "bundle")
+	b := NewBuilder(RunMeta{
+		Tool: "invocation-test",
+		Command: RedactCommand([]string{
+			"certify", "-doc", "SSM-CONF-v0.8", "-gateway-ssh", "cc93",
+			"-bpf", "tcp port 802", "-param", "lab.token=hunter2",
+		}),
+	})
+	b.AddCase(TestCaseResult{ID: "X-1", Title: "a case", Verdict: Skip,
+		Assertions: []Assertion{{Claim: "narrative", Verdict: Skip, Observed: "off wire"}}})
+	if _, err := b.Write(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Run.Command) == 0 {
+		t.Fatal("bundle.json carries no invocation")
+	}
+	if got := strings.Join(loaded.Run.Command, " "); !strings.Contains(got, "-doc SSM-CONF-v0.8") ||
+		!strings.Contains(got, "-gateway-ssh cc93") || strings.Contains(got, "hunter2") {
+		t.Errorf("recorded invocation = %q", got)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, ReportFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := string(data)
+	for _, want := range []string{"How this run was invoked", "-doc SSM-CONF-v0.8", "'tcp port 802'", Redacted} {
+		if !strings.Contains(report, want) {
+			t.Errorf("REPORT.md does not show %q:\n%s", want, report)
+		}
+	}
+	if strings.Contains(report, "hunter2") {
+		t.Error("REPORT.md prints a secret the bundle redacted")
+	}
+	if strings.Contains(report, "%!") {
+		t.Error("REPORT.md contains a formatting error")
+	}
+}
+
+// TestBundleWithoutAnInvocationStillVerifies: bundles written before the field
+// existed are on disk, and a verifier that rejected them would retroactively
+// invalidate evidence for a metadata gap.
+func TestBundleWithoutAnInvocationStillVerifies(t *testing.T) {
+	dir, _, _ := buildBundle(t)
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Run.Command) != 0 {
+		t.Fatal("this fixture was supposed to carry no invocation")
+	}
+	rep, err := Verify(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK {
+		t.Fatalf("a bundle with no recorded invocation must still verify:\n%s", rep)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ReportFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "How this run was invoked") {
+		t.Error("REPORT.md invents an invocation section for a bundle that has no invocation")
+	}
+}

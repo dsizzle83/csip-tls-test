@@ -113,6 +113,16 @@ type Options struct {
 	GatewaySSH string
 	HTTP       HTTPClient
 
+	// Command is the argument vector that started this process. The runner
+	// records it in the bundle with credential-shaped values replaced (see
+	// bundle.RedactCommand); what is stored HERE is what the caller passed,
+	// unaltered, since the caller may still need it.
+	//
+	// Empty means the entry point supplied none and the bundle carries no
+	// invocation. That is a gap, not a fault: bundles written before the field
+	// existed have none either, and Verify does not ask for it.
+	Command []string
+
 	// Output.
 	OutDir   string
 	Operator string
@@ -1008,6 +1018,11 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 	b := bundle.NewBuilder(bundle.RunMeta{
 		Tool: ToolName, ToolVersion: rep.Catalog.SHA256[:12],
 		GitCommit: commit, GitDirty: dirty,
+		// The redaction happens HERE, at the one door every entry point walks
+		// through to reach a bundle, rather than at each caller — a rule
+		// applied in several places is a rule that will one day be applied in
+		// all but one.
+		Command:  bundle.RedactCommand(r.opts.Command),
 		Operator: r.opts.Operator, Note: note,
 		Started: rep.Started, Finished: time.Now().UTC(),
 		DUT: r.opts.DUT,
