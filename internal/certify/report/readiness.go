@@ -65,6 +65,10 @@ type Readiness struct {
 	// came from flags rather than a file.
 	ConfigSupplied bool          `json:"config_supplied"`
 	Requirements   []Requirement `json:"requirements"`
+	// Gaps are the campaign's cases that carry no `Test <Test ID>` row, with the
+	// bench verdict and the reason. See [Gap] and trr.go's derivation of the
+	// mapping rule.
+	Gaps []Gap `json:"omitted_procedures,omitempty"`
 }
 
 // AssessInput is everything Assess judges.
@@ -80,6 +84,11 @@ type AssessInput struct {
 	Generated   time.Time
 	Tool        string
 	ToolVersion string
+	// Gaps are the campaign cases that produced no verdict row. They are not a
+	// requirement of either document; they are carried because a
+	// self-assessment that did not name them would let a reader mistake a
+	// report covering sixty procedures for a campaign that ran sixty.
+	Gaps []Gap
 }
 
 // Counts tallies the outcomes.
@@ -136,7 +145,7 @@ func Assess(in AssessInput) *Readiness {
 	}
 	r := &Readiness{
 		Doc: in.Doc, CertType: in.CertType, Generated: in.Generated,
-		Tool: in.Tool, ToolVersion: in.ToolVersion,
+		Tool: in.Tool, ToolVersion: in.ToolVersion, Gaps: in.Gaps,
 	}
 	if in.Config != nil {
 		r.ConfigSource = in.Config.Source
@@ -716,6 +725,34 @@ func (r *Readiness) Markdown() string {
 	fmt.Fprintf(&b, "|-------------|--------|-----------|------------------|\n")
 	for _, q := range r.Requirements {
 		fmt.Fprintf(&b, "| `%s` | %s | %s | %s |\n", q.ID, q.Status, mdEscape(q.Statement), mdEscape(q.Detail))
+	}
+	fmt.Fprintf(&b, "\n")
+	b.WriteString(r.gapsMarkdown())
+	return b.String()
+}
+
+// gapsMarkdown names every procedure the campaign ran that carries no verdict
+// row.
+//
+// The section exists because the §3.1.1 verdict enumeration has three members
+// and this bench has four outcomes. A SKIP that is a fact about the RUN, and a
+// WARN, are not expressible: they are omitted from the CSV, and an omission
+// nobody can see is indistinguishable from a procedure that was never
+// attempted. This is where a reviewer sees the difference.
+func (r *Readiness) gapsMarkdown() string {
+	if len(r.Gaps) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "## Procedures the campaign ran that carry NO verdict row\n\n")
+	fmt.Fprintf(&b, "%d procedure(s). The §3.1.1 enumeration is PASS | FAIL | NOT SUPPORTED, and all three\n"+
+		"are claims about the DEVICE. A bench SKIP whose reason is a fact about this run, and a WARN\n"+
+		"(asserted with a caveat), are neither — so they are omitted here rather than mapped to a member\n"+
+		"that would say something the run did not establish. **An omitted row is not a pass.**\n\n", len(r.Gaps))
+	fmt.Fprintf(&b, "| Procedure | Bench verdict | Kind | Reason | Evidence bundle |\n|---|---|---|---|---|\n")
+	for _, g := range r.Gaps {
+		fmt.Fprintf(&b, "| `%s` | %s | %s | %s | `%s` |\n",
+			g.ID, g.BenchVerdict, g.Kind, mdEscape(g.Reason), g.Source)
 	}
 	fmt.Fprintf(&b, "\n")
 	return b.String()

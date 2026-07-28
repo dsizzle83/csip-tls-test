@@ -62,6 +62,11 @@ type GenerateOptions struct {
 	Config *SubmissionConfig
 	// Verdicts are the `Test <Test ID>` rows.
 	Verdicts []TestVerdict
+	// Gaps are the campaign's cases that carry NO verdict row, with the reason.
+	// They are not part of either document — the format has no key for them —
+	// but a report that covers fewer procedures than the campaign ran must say
+	// which and why, so they are carried into the readiness report.
+	Gaps []Gap
 	// ModbusLogs and CSIPLogs are the detailed test logs. Exactly one is
 	// normally set, matching CertType.
 	ModbusLogs *ModbusTestLogs
@@ -190,6 +195,7 @@ func Generate(o GenerateOptions) (*Submission, error) {
 		Doc: o.Doc, CertType: certType, Config: cfg, Summary: sum,
 		ModbusLogs: o.ModbusLogs, CSIPLogs: o.CSIPLogs, Transport: o.Transport,
 		Traces: o.Traces, Generated: o.Now, Tool: o.Tool, ToolVersion: o.ToolVersion,
+		Gaps: o.Gaps,
 	})
 	if err := writeFile(o.Dir, ReadinessFile, []byte(sub.Readiness.Markdown())); err != nil {
 		return sub, err
