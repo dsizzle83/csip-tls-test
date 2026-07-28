@@ -11,6 +11,7 @@ package suitecsip
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"csip-tls-test/internal/certify"
@@ -136,8 +137,123 @@ func TestEveryApplicableRowHasARealCheck(t *testing.T) {
 			t.Errorf("%s: SKIPped without saying why", c.ID)
 		}
 	}
-	if applicable != 51 {
-		t.Errorf("the catalog holds %d applicable %s rows; this suite was written against 51", applicable, doc)
+	// 73 = the 51 rows the DER Client profile required, plus the 22 the DER
+	// AGGREGATOR CLIENT profile adds (owner decision 2026-07-28: AGG-001..012,
+	// CORE-018, CORE-019, ERR-002, MAINT-001/003/004/005, UTIL-002/003/004).
+	// The six that remain N/A are CORE-001/002/004 and UTIL-001 (2030.5-server
+	// rows), MAINT-002 (Annex A seq 32 makes it optional) and COMM-001
+	// (optional for all device types) — all six blank in every §4 column.
+	if applicable != 73 {
+		t.Errorf("the catalog holds %d applicable %s rows; this suite was written against 73", applicable, doc)
+	}
+}
+
+// TestProfileScopeIsTheAggregatorColumn is the guard on the re-scope itself:
+// applicability must track §4's DER AGGREGATOR CLIENT column, not the DER
+// Client column it used to track and not somebody's memory of either.
+//
+// It is stated over profile_conformance — the catalog's machine-readable record
+// of the printed matrix — rather than over a hand-written list, so a
+// re-extraction that changed a matrix row would fail here rather than silently
+// re-scoping the certification.
+func TestProfileScopeIsTheAggregatorColumn(t *testing.T) {
+	cat := loadCatalog(t)
+	// The rows §4 requires of a DER Aggregator Client but NOT of a DER Client:
+	// these are exactly the rows the 2026-07-28 decision pulled in.
+	var pulledIn []string
+	for _, c := range cat.Select(certify.Filter{Docs: []string{doc}}) {
+		pc := c.ProfileConformance
+		if pc == nil || !pc.DERAggregatorClientRequired || pc.DERClientRequired {
+			continue
+		}
+		pulledIn = append(pulledIn, c.ID)
+		if !c.Applicable {
+			t.Errorf("%s is required of a DER Aggregator Client by §4 but the catalog marks it "+
+				"inapplicable; the 2026-07-28 re-scope requires it: %s", c.ID, c.ApplicabilityReason)
+		}
+		if c.DUTRole != certify.RoleCSIPClient {
+			t.Errorf("%s is an applicable aggregator-client row with dut_role %q, want %q — the aggregator "+
+				"IS a 2030.5 client toward the utility server", c.ID, c.DUTRole, certify.RoleCSIPClient)
+		}
+	}
+	if len(pulledIn) != 22 {
+		t.Errorf("§4 requires %d row(s) of a DER Aggregator Client that it does not require of a DER "+
+			"Client (%v); the decision of 2026-07-28 was taken over 22", len(pulledIn), pulledIn)
+	}
+
+	// And the converse: nothing may be applicable that §4 requires of nobody
+	// UNLESS its reason says so in as many words. Three rows are legitimately in
+	// that position — BASIC-013, BASIC-014 and CORE-023 are optional evidence
+	// this bench can produce — and they are the only ones.
+	optional := map[string]bool{"BASIC-013": true, "BASIC-014": true, "CORE-023": true}
+	for _, c := range cat.Select(certify.Filter{Docs: []string{doc}, ApplicableOnly: true}) {
+		pc := c.ProfileConformance
+		required := pc != nil && (pc.DERClientRequired || pc.DERAggregatorClientRequired || pc.ServerRequired)
+		if required {
+			continue
+		}
+		if !optional[c.ID] {
+			t.Errorf("%s is applicable but §4 requires it of no profile, and it is not one of the three "+
+				"rows recorded as optional evidence", c.ID)
+			continue
+		}
+		if !strings.Contains(c.ApplicabilityReason, "OPTIONAL") {
+			t.Errorf("%s is applicable-but-required-of-nobody; its applicability_reason must say OPTIONAL "+
+				"in as many words so a reviewer cannot mistake it for a conformance gate: %s",
+				c.ID, c.ApplicabilityReason)
+		}
+	}
+}
+
+// TestAggregatorRowsSkipRatherThanFailWithoutTheFleet is the guard against the
+// worst failure mode this re-scope could produce: reporting a BENCH gap as a
+// DUT finding.
+//
+// Every aggregator row is written against the Figure-15 four-EndDevice topology
+// and most need the Subscription/Notification function set. sim/gridsim has
+// neither. A check that answered that with FAIL would look like diligence and
+// be a false positive on every run; a check that answered with PASS would be
+// certifying a test that never ran. The contract is SKIP, with the gap named.
+func TestAggregatorRowsSkipRatherThanFailWithoutTheFleet(t *testing.T) {
+	cat := loadCatalog(t)
+	reg := certify.NewRegistry()
+	Register(reg)
+
+	for _, id := range []string{
+		"AGG-001", "AGG-002", "AGG-003", "AGG-007", "AGG-009", "AGG-010", "AGG-012",
+		"CORE-018", "CORE-019", "ERR-002",
+		"MAINT-001", "MAINT-003", "MAINT-004", "MAINT-005",
+		"UTIL-002", "UTIL-003", "UTIL-004",
+	} {
+		c, ok := cat.ByID(doc, id)
+		if !ok {
+			t.Fatalf("the catalog has no %s %s", doc, id)
+		}
+		r, ok := reg.Lookup(c.UID)
+		if !ok {
+			t.Fatalf("%s has no registration", id)
+		}
+		if !c.Applicable {
+			t.Fatalf("%s is not applicable; this test is about the rows the re-scope made real", id)
+		}
+		rc := &certify.RunCtx{
+			Case: c, Suite: Suite, Targets: certify.Targets{},
+			GridSim: certify.NewAdminClient("", nil), Log: certify.DiscardLogger,
+		}
+		res, err := r.Check(context.Background(), rc)
+		if err != nil {
+			t.Errorf("%s: check errored with no bench: %v", id, err)
+			continue
+		}
+		if res.Verdict != certify.Skip {
+			t.Errorf("%s: verdict with no bench = %s, want SKIP — a missing bench is never a DUT finding",
+				id, res.Verdict)
+		}
+		// notApplicable is the OTHER thing that returns SKIP here, and binding an
+		// applicable row to it would report a required test as excluded.
+		if strings.Contains(res.Notes, "NOT APPLICABLE") {
+			t.Errorf("%s is applicable but is bound to the not-applicable stub: %s", id, res.Notes)
+		}
 	}
 }
 

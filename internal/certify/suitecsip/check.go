@@ -181,14 +181,18 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 // reads as a decision a reviewer can check against the profile matrix — and
 // disagree with, which is the point.
 //
-// It also prints the row's published ERRATA. Most of these rows are excluded
-// only because the DUT is scoped as a direct DER client, and the §4 matrix
-// marks several of them required for a DER AGGREGATOR client. The day that
-// scoping changes, whoever implements the row will read its `steps` and
-// `expected` — which are, correctly, a verbatim extraction of the UNAMENDED
-// printed procedure — and would implement a body Annex A has already
-// corrected. Printing the corrections on the N/A row puts them in front of that
-// reader, and in the bundle, before the row goes live.
+// It also prints the row's published ERRATA, and that breadcrumb has already
+// earned its keep once. Until 2026-07-28 twenty-eight rows landed here, and
+// twenty-two of them were excluded for a single reason: the DUT was scoped as a
+// direct DER client while the §4 matrix marked them required for a DER
+// AGGREGATOR client. When the owner re-scoped the certification, whoever
+// implemented those rows had to read `steps` and `expected` — which are,
+// correctly, a verbatim extraction of the UNAMENDED printed procedure — and
+// would otherwise have implemented a body Annex A had already corrected. The
+// corrections were in front of them, in this note, before the rows went live.
+// The six rows still reported here are excluded for reasons no re-scope can
+// change: four are §4 rows required of NO profile, and two are about a 2030.5
+// server this DUT does not implement.
 func notApplicable(_ context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	reason := strings.TrimSpace(rc.Case.ApplicabilityReason)
 	if reason == "" {
