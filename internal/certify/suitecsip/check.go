@@ -16,7 +16,12 @@ package suitecsip
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/netip"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -150,6 +155,8 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 	obs.Waited, obs.Satisfied = waited, satisfied
 	rc.Logf("waited %s for the DUT's poll cycle (predicate satisfied: %t)", waited.Round(time.Second), satisfied)
 
+	claimNotificationEndpoints(ctx, rc, d, obs)
+
 	notes := ""
 	if s.Notes != nil {
 		notes = s.Notes(obs)
@@ -170,6 +177,130 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 			return mint(ev, obs, s.Criteria(obs))
 		},
 	}, nil
+}
+
+// notifyClaimParam records what the notification leg of the capture claim
+// managed to attribute, so the fact ends up in the run log rather than only in
+// the window's claim list.
+const notifyClaimParam = "csip.notification_claim"
+
+// claimNotificationEndpoints adds the SECOND capture claim an aggregator run
+// needs: the DUT's inbound notification listener.
+//
+// # Why one claim is not enough
+//
+// Every other exchange in this suite happens on a connection the DUT DIALS to
+// the bench's 2030.5 server, and run() claims that endpoint at the top. A
+// Notification is the one message that goes the other way: the SERVER dials the
+// client's notificationURI. Those frames carry a different 4-tuple entirely, so
+// under the existing claim they are unattributed background traffic — present
+// in the capture, citable by nobody.
+//
+// # Where the address comes from
+//
+// It cannot be known statically. The DUT chooses its listener and announces it
+// in the <notificationURI> of the Subscription it POSTs, so the only party that
+// knows it before the Notification is sent is the SERVER the subscription was
+// POSTed to. gridsim publishes it at GET /admin/subscriptions and this reads it
+// back — after the wait, because that is when a subscription the DUT made
+// during this window exists to be read.
+//
+// # What it refuses to do
+//
+// A notificationURI whose host is a NAME rather than an address is not
+// resolved here. Resolving it would mean claiming frames on the strength of
+// this machine's DNS agreeing with the DUT's, and a claim is an assertion that
+// specific frames belong to this check. The URI is logged instead, and the
+// notification traffic stays unattributed — visibly, with the reason, rather
+// than silently or wrongly.
+func claimNotificationEndpoints(ctx context.Context, rc *certify.RunCtx, d *Driver, obs *Observation) {
+	subs := d.Subscriptions(ctx)
+	if len(subs) == 0 {
+		return
+	}
+	claimed := map[string]bool{}
+	var unresolved []string
+	for _, s := range subs {
+		if s.NotificationURI == "" {
+			continue
+		}
+		ep, err := notificationEndpoint(s.NotificationURI)
+		if err != nil {
+			unresolved = append(unresolved, fmt.Sprintf("%s (%v)", s.NotificationURI, err))
+			continue
+		}
+		if claimed[ep.String()] {
+			continue
+		}
+		reason := fmt.Sprintf("the DUT's inbound Notification listener, taken from the <notificationURI> of "+
+			"the Subscription it POSTed for %s (gridsim GET /admin/subscriptions reports it as %s). A "+
+			"Notification is dialled BY the server, so its frames carry neither this check's local port nor "+
+			"the 2030.5 server endpoint claimed above, and without this claim they belong to nobody. It is an "+
+			"endpoint claim rather than a connection claim for the same reason as the outbound leg: the "+
+			"dialling side's ephemeral port is not knowable here",
+			s.SubscribedResource, s.NotificationURI)
+		if err := rc.ClaimEndpointDuring("tcp", ep, reason); err != nil {
+			unresolved = append(unresolved, fmt.Sprintf("%s (%v)", s.NotificationURI, err))
+			continue
+		}
+		claimed[ep.String()] = true
+	}
+
+	var parts []string
+	if len(claimed) > 0 {
+		eps := make([]string, 0, len(claimed))
+		for e := range claimed {
+			eps = append(eps, e)
+		}
+		sort.Strings(eps)
+		parts = append(parts, "claimed "+strings.Join(eps, ", "))
+	}
+	if len(unresolved) > 0 {
+		parts = append(parts, "NOT claimed, so any Notification traffic to them is unattributed: "+
+			strings.Join(unresolved, "; "))
+	}
+	if len(parts) == 0 {
+		return
+	}
+	msg := "notification listener(s) from the DUT's subscriptions: " + strings.Join(parts, "; ")
+	obs.Params[notifyClaimParam] = msg
+	rc.Logf("%s", msg)
+}
+
+// notificationEndpoint turns a notificationURI into the ip:port a capture claim
+// can be made against, or an error saying precisely why it cannot.
+func notificationEndpoint(uri string) (netip.AddrPort, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("not a URI: %w", err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return netip.AddrPort{}, errors.New("the URI names no host")
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("host %q is a name, not an address, and this check will not "+
+			"resolve it: a capture claim asserts that particular frames are this test case's evidence, and "+
+			"resolving a name here would rest that assertion on this machine's DNS agreeing with the DUT's",
+			host)
+	}
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		default:
+			return netip.AddrPort{}, fmt.Errorf("the URI names no port and its scheme %q implies none", u.Scheme)
+		}
+	}
+	p, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("port %q: %w", port, err)
+	}
+	return netip.AddrPortFrom(addr.Unmap(), uint16(p)), nil
 }
 
 // notApplicable is the check registered for every catalog row the §4 profile

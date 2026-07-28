@@ -104,6 +104,44 @@ type AdminProgram struct {
 type AdminStatus struct {
 	Programs   []AdminProgram `json:"programs"`
 	ServerTime int64          `json:"server_time"`
+
+	// Fleet and Subscription are the two DER AGGREGATOR CLIENT capabilities the
+	// simulator can be started with. They are read, not assumed, and that is
+	// the whole point of them being on the wire: a run against a bench without
+	// the fixture and a run against a bench with it are different measurements,
+	// and nothing else in the capture distinguishes them.
+	Fleet        AdminFleetStatus        `json:"fleet"`
+	Subscription AdminSubscriptionStatus `json:"subscription"`
+}
+
+// AdminFleetStatus mirrors the fleet block of gridsim's GET /admin/status.
+type AdminFleetStatus struct {
+	Enabled        bool     `json:"enabled"`
+	Size           int      `json:"size"`
+	Devices        []string `json:"devices,omitempty"`
+	AggregatorHref string   `json:"aggregator_href,omitempty"`
+}
+
+// AdminSubscriptionStatus mirrors the subscription block of GET /admin/status.
+type AdminSubscriptionStatus struct {
+	Enabled       bool `json:"enabled"`
+	Subscriptions int  `json:"subscriptions"`
+	Notifications int  `json:"notifications"`
+}
+
+// AdminSubscription mirrors one entry of gridsim's GET /admin/subscriptions.
+//
+// NotificationURI is the field that matters here and it is the reason the
+// endpoint is read at all: a Notification arrives on a connection the SERVER
+// dials to an address only the DUT knows, and this is where the server — which
+// was told — publishes it.
+type AdminSubscription struct {
+	ID                 int    `json:"id"`
+	Href               string `json:"href"`
+	EndDevice          string `json:"end_device"`
+	SubscribedResource string `json:"subscribed_resource"`
+	NotificationURI    string `json:"notification_uri"`
+	Notifications      int    `json:"notifications"`
 }
 
 // ServerView is the tier-3 record: everything the bench's 2030.5 server saw.
@@ -615,6 +653,25 @@ func (d *Driver) PostCurve(ctx context.Context, req CurveRequest) (string, error
 		return "", err
 	}
 	return out.MRID, nil
+}
+
+// Subscriptions reads the subscriptions the DUT currently holds on the bench's
+// 2030.5 server, with the notificationURI it registered for each.
+//
+// It returns an empty slice and no error against a simulator that serves no
+// such endpoint: an older gridsim is a bench without the function set, not a
+// failure, and treating it as one would turn a capability gap into a run error.
+func (d *Driver) Subscriptions(ctx context.Context) []AdminSubscription {
+	if !d.Admin.Available() {
+		return nil
+	}
+	var out struct {
+		Subscriptions []AdminSubscription `json:"subscriptions"`
+	}
+	if err := d.Admin.Get(ctx, "subscriptions", &out); err != nil {
+		return nil
+	}
+	return out.Subscriptions
 }
 
 // ClearControls removes the admin-posted controls from a program, so a check

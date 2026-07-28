@@ -666,7 +666,11 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 			Case: p.Case, Suite: p.Registration.Suite, Registration: p.Registration,
 			Targets: r.opts.Targets, PKI: pki, GridSim: gridsim, Sims: sims,
 			Gateway: gw, Capture: captureRef, Params: r.opts.Params, Log: r.log,
-			win: win,
+		}
+		// Cannot fail on a freshly built context; AttachWindow only refuses a
+		// SECOND window, which is the invariant it exists to hold.
+		if err := rc.AttachWindow(win); err != nil {
+			panic(err)
 		}
 		res := r.execute(ctx, p, rc, win)
 		rep.Cases = append(rep.Cases, res)

@@ -331,6 +331,28 @@ type RunCtx struct {
 // helpers; this is for the cases that need the window itself.
 func (rc *RunCtx) Window() *Window { return rc.win }
 
+// AttachWindow gives a RunCtx its frame window, once.
+//
+// The runner calls it when it builds the context. It is exported so that a
+// suite's own tests can drive a check's CLAIMING path — the part that decides
+// which frames a check is entitled to cite — without standing up a whole run
+// with a capture behind it. That path is worth testing directly: a claim that
+// silently fails to register leaves a check with no citable evidence, which is
+// the failure mode the whole attribution mechanism exists to prevent.
+//
+// It refuses to REPLACE an attached window rather than overwriting one. The
+// reason win is unexported is that a check able to re-point its own window
+// could make its citations mean anything, and an exported setter that
+// overwrote would hand that back.
+func (rc *RunCtx) AttachWindow(w *Window) error {
+	if rc.win != nil {
+		return fmt.Errorf("certify: %s already has a frame window; replacing one would let a check "+
+			"re-point the interval its citations are attributed from", rc.Case.UID)
+	}
+	rc.win = w
+	return nil
+}
+
 // ClaimConn registers a connection this check opened so its frames can be
 // attributed. Call it immediately after the connection is established, for
 // every connection, including ones the check only reads from.
