@@ -46,6 +46,17 @@ type SoftwareRecord struct {
 	// carried separately and stated in Additional Test Comments, which is the
 	// only place the format has for it.
 	Checksum string `json:"checksum"`
+	// Element names which of the DUT's deployed binaries this record describes,
+	// using the key an evidence bundle's DUT build stamp uses ("mbaps", "nb",
+	// "modbus"). It has NO key in either §3.1.1 table and is never emitted; its
+	// only job is to let [FillChecksums] derive Checksum from the digest the
+	// campaign recorded, so the value in the report is the one the evidence was
+	// produced against rather than one somebody re-typed.
+	//
+	// A record with no Element is never autofilled — an operator who computed
+	// the digest another way is stating something this tool has no standing to
+	// correct.
+	Element string `json:"element,omitempty"`
 }
 
 // OSRecord is one `Operating System <n>` / `Operating System Version <n>` pair.
@@ -131,9 +142,86 @@ type SubmissionConfig struct {
 	// for CSIP logs only.
 	ContextID string `json:"context_id"`
 
+	// PerCertificateType overrides the handful of values that legitimately
+	// differ between the two reports of one Test Results Report package, keyed
+	// by certificate type ("IEEE 2030.5/CSIP", "SunSpec Modbus").
+	//
+	// It exists because SunSpec issues ONE CERTIFICATE PER TYPE. A gateway that
+	// is both a SunSpec Modbus device and an IEEE 2030.5 client gets two
+	// certificate numbers, two PICS documents, and two Test Descriptions drawn
+	// from two different (and in the CSIP document's case, absent) enumerations.
+	// One flat configuration would put the Modbus certificate number on the CSIP
+	// report, which is not a formatting mistake but a false statement.
+	PerCertificateType map[string]CertTypeOverride `json:"per_certificate_type,omitempty"`
+
+	// Comment is read and ignored. It exists because the decoder is strict —
+	// an unknown key is an error, since a misspelled one would otherwise
+	// silently omit a value from a certification submission — and the cost of
+	// that strictness is that a configuration file cannot be annotated at all
+	// unless one key is set aside for the purpose. This is that key. Nothing in
+	// it reaches the report; a remark meant for the laboratory belongs in
+	// additional_test_comments, which is emitted.
+	Comment string `json:"_comment,omitempty"`
+
 	// Source records where the configuration was read from, so the readiness
 	// report can say whose numbers these are.
 	Source string `json:"-"`
+}
+
+// CertTypeOverride is the per-certificate-type half of a submission
+// configuration. Every field is optional; an empty one leaves the shared value
+// in place.
+type CertTypeOverride struct {
+	CertificateNumber      string `json:"certificate_number,omitempty"`
+	CertificateTypeVersion string `json:"certificate_type_version,omitempty"`
+	DateIssued             string `json:"date_issued,omitempty"`
+	CertificateSignerName  string `json:"certificate_signer_name,omitempty"`
+	PICSURL                string `json:"pics_url,omitempty"`
+	TestDescription        string `json:"test_description,omitempty"`
+	TestCompletionDate     string `json:"test_completion_date,omitempty"`
+	AdditionalTestComments string `json:"additional_test_comments,omitempty"`
+	ContextID              string `json:"context_id,omitempty"`
+}
+
+// For returns the configuration governing one certificate type: the shared
+// values with that type's overrides applied, and CertificateType pinned to the
+// report being written.
+//
+// Pinning matters. `Certificate Type` is a §3.1.1 key and its value must name
+// the specification the report is filed under; a package that emitted
+// "SunSpec Modbus" on both halves because the operator wrote it once at the top
+// of the file would file the CSIP results under the wrong certificate.
+func (c *SubmissionConfig) For(certType string) *SubmissionConfig {
+	local := &SubmissionConfig{}
+	if c != nil {
+		*local = *c
+		local.Software = append([]SoftwareRecord(nil), c.Software...)
+		local.OS = append([]OSRecord(nil), c.OS...)
+	}
+	local.CertificateType = certType
+	ov, ok := local.PerCertificateType[certType]
+	if !ok {
+		return local
+	}
+	for _, f := range []struct {
+		dst *string
+		src string
+	}{
+		{&local.CertificateNumber, ov.CertificateNumber},
+		{&local.CertificateTypeVersion, ov.CertificateTypeVersion},
+		{&local.DateIssued, ov.DateIssued},
+		{&local.CertificateSignerName, ov.CertificateSignerName},
+		{&local.PICSURL, ov.PICSURL},
+		{&local.TestDescription, ov.TestDescription},
+		{&local.TestCompletionDate, ov.TestCompletionDate},
+		{&local.AdditionalTestComments, ov.AdditionalTestComments},
+		{&local.ContextID, ov.ContextID},
+	} {
+		if strings.TrimSpace(f.src) != "" {
+			*f.dst = f.src
+		}
+	}
+	return local
 }
 
 // Certificate type values, from the §3.1.1 enumeration.
@@ -403,7 +491,10 @@ func (c *SubmissionConfig) ApplyParams(params map[string]string) error {
 // populate the report.
 var reservedParams = map[string]bool{
 	"config": true, "out": true, "bundle": true, "modbus": true,
-	"http": true, "comm004": true, "allow-incomplete": true,
+	"http": true, "http-path": true, "comm004": true, "allow-incomplete": true,
+	// trr names an already-emitted Test Results Report package to assert
+	// against, instead of one this run generates. See Suite.Subject.
+	"trr": true,
 }
 
 // set assigns one flat key. It normalises `-` to `_` so both spellings work.
