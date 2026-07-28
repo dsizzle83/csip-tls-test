@@ -613,13 +613,38 @@ func Populate(r *RegisterMap, wmaxW float64) {
 	cursor := base + 2
 
 	// ── Model 1 (Common) — 66 data registers ─────────────────────────────────
+	//
+	// The layout is Mn(0,16) / Md(16,16) / Opt(32,8) / Vr(40,8) / SN(48,16),
+	// as lexa-proto/sunspec/identity.go reads it. This fixture had three of
+	// those five wrong, in the same way the animated sims did before commit
+	// f87dc06 fixed them there and left this one behind:
+	//
+	//   - Md was written with setStr8, so a model name longer than 16 chars
+	//     was silently truncated where the profile allows 32;
+	//   - the SERIAL was written at offset 32, which is Opt — so ReadCommon
+	//     saw Options="SN-0001" and Serial="", and a gateway keying device
+	//     identity on manufacturer|model|serial got an empty serial;
+	//   - Vr was never written at all, so this fixture served eight NUL
+	//     registers there. The IEEE 1547-2018 profile §3.2 Table 16 marks Vr
+	//     REQUIRED and conformance case MOD-4 reads it as its type's
+	//     not-implemented value, which is a real failure against a real
+	//     requirement — and one no gateway can paper over, because a firmware
+	//     version is a fact about the DER, not about the thing polling it.
+	//
+	// This is the fixture behind sim.NewServer, which tests/modbus_conformance
+	// and internal/southbound/inverter drive, so MOD-4's Model 1 row was
+	// failing on the harness's own device image rather than on any product.
 	const m1Len = 66
 	r.Set(cursor+0, sunspec.ModelCommon)
 	r.Set(cursor+1, m1Len)
 	m1Base := cursor + 2
-	setStr16(r, m1Base+0, "SunSpec Sim")   // Mn (manufacturer, 32 chars = 16 regs)
-	setStr8(r, m1Base+16, "CSIP-Dev-5000") // Md (model, 16 chars = 8 regs)
-	setStr8(r, m1Base+32, "SN-0001")       // SN (serial, 32 chars = 16 regs)
+	setStr16(r, m1Base+0, "SunSpec Sim")    // Mn — manufacturer, 16 regs
+	setStr16(r, m1Base+16, "CSIP-Dev-5000") // Md — model, 16 regs
+	// Opt (m1Base+32, 8 regs) stays NUL: this fixture advertises no
+	// device-options string, which is a legal "not implemented" and is NOT a
+	// place to keep the serial number.
+	setStr8(r, m1Base+40, DefaultFirmwareVersion) // Vr — firmware version, 8 regs
+	setStr16(r, m1Base+48, "SN-0001")             // SN — serial, 16 regs
 	cursor += 2 + m1Len
 
 	// ── Model 121 (Basic Settings) — 30 data registers ───────────────────────
@@ -683,6 +708,53 @@ func Populate(r *RegisterMap, wmaxW float64) {
 	// ── End marker ───────────────────────────────────────────────────────────
 	r.Set(cursor+0, sunspec.EndMarker)
 	r.Set(cursor+1, 0)
+}
+
+// DefaultFirmwareVersion is the Model 1 Vr string a sim serves when nothing
+// overrides it. It is a constant, not a build stamp: every sim in this bench is
+// a deterministic fixture, and a version that moved with the build would make
+// two runs of the same scenario produce two different device identities.
+const DefaultFirmwareVersion = "SIM-1.0.0"
+
+// commonVrReg is Model 1's Vr offset (8 registers, 16 ASCII bytes) within the
+// model's data block, per the profile layout lexa-proto/sunspec reads:
+// Mn(0,16) / Md(16,16) / Opt(32,8) / Vr(40,8) / SN(48,16).
+const commonVrReg = 40
+
+// commonDataBase is where Model 1's data starts in every register image this
+// package builds: SunS magic at SunSpecBase+0..1, the model id/length pair at
+// +2..3, data from +4. Every populate function here lays it out that way, and
+// SetFirmwareVersion verifies the id register before writing rather than
+// trusting the arithmetic.
+const commonDataBase = sunspec.SunSpecBase + 4
+
+// SetFirmwareVersion overwrites Model 1's Vr (firmware version) string.
+//
+// It exists so a bench operator can give co-located sims distinct firmware
+// identity from the command line (modsim / mbapsdev -fw-version), for the same
+// reason -serial exists: a gateway that mirrors a DER northbound passes Vr
+// through VERBATIM — a version string is a fact about the DER's firmware, not
+// about the gateway — so if two sims report the same version, so does
+// everything downstream of them.
+//
+// Vr is static in every sim here (no animation goroutine touches it), so
+// rewriting it after construction is safe and leaves the image deterministic.
+// An empty v is a no-op, which is what lets a flag default to "" and keep the
+// sim's own built-in default.
+//
+// It refuses rather than writes when Model 1 is not where it is expected: a
+// version string written over Model 121's nameplate registers would be a
+// register-level corruption reported as a successful override.
+func (s *Server) SetFirmwareVersion(v string) error {
+	if v == "" {
+		return nil
+	}
+	if got := s.Regs.Get(sunspec.SunSpecBase + 2); got != sunspec.ModelCommon {
+		return fmt.Errorf("sim: refusing to write Vr: register %d holds model id %d, want Model 1 (%d)",
+			sunspec.SunSpecBase+2, got, sunspec.ModelCommon)
+	}
+	setStr8(s.Regs, commonDataBase+commonVrReg, v)
+	return nil
 }
 
 // setStr16 writes a string as up to 16 Modbus registers (32 ASCII bytes,

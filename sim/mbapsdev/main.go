@@ -135,6 +135,10 @@ type modelBundle struct {
 	fault     func([]byte) error
 	control   func(simapi.ControlCmd) error
 	stop      func()
+	// base is the embedded *sim.Server of whichever model was built, so
+	// post-construction identity overrides (SetFirmwareVersion) reach the
+	// register image without newModel growing a parameter per field.
+	base *sim.Server
 }
 
 // newModel builds the animated SunSpec register world for -model, bound to a
@@ -164,6 +168,7 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 			fault:     srv.ApplyFault,
 			control:   controlFunc("inverter", srv.Server),
 			stop:      srv.Stop,
+			base:      srv.Server,
 		}, nil
 	case "battery":
 		srv, err := sim.NewBatteryServerAdvanced(loopbackAny, kwh, wmax)
@@ -178,6 +183,7 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 			fault:     srv.ApplyFault,
 			control:   controlFunc("battery", srv.Server),
 			stop:      srv.Stop,
+			base:      srv.Server,
 		}, nil
 	default:
 		return nil, fmt.Errorf("mbapsdev: unknown -model %q (want inverter|battery)", kind)
@@ -219,6 +225,11 @@ func main() {
 		"plus this mbapsdev) present distinct device identity to a downstream gateway that keys identity "+
 		"on manufacturer|model|serial. Ignored for -model battery, which keeps its own default "+
 		"(\"SN-BAT-001\") unchanged.")
+	fwVersion := flag.String("fw-version", "", "SunSpec Model 1 firmware version (Vr) override for either "+
+		"model; empty keeps the sim's built-in default. Vr is REQUIRED by the IEEE 1547-2018 profile "+
+		"\u00a73.2 Table 16, and a gateway mirroring this device northbound passes it through VERBATIM \u2014 it "+
+		"is a fact about the DER's firmware, not about the gateway \u2014 so set it when two co-located sims "+
+		"must be distinguishable by firmware as well as by serial.")
 	flag.Parse()
 
 	// wolfSSL_Init: process-global C state, exactly once per process
@@ -233,6 +244,12 @@ func main() {
 	mb, err := newModel(*model, *wmax, *kwh, *serial)
 	if err != nil {
 		log.Fatalf("mbapsdev: %v", err)
+	}
+	if err := mb.base.SetFirmwareVersion(*fwVersion); err != nil {
+		log.Fatalf("mbapsdev: %v", err)
+	}
+	if *fwVersion != "" {
+		log.Printf("mbapsdev: SunSpec Model 1 firmware version (Vr) override %q", *fwVersion)
 	}
 
 	// Server certs need no role extension (TCP-28) — mbtls.DefaultServerProfile

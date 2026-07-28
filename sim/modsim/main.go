@@ -42,6 +42,11 @@ func main() {
 		"default \"SN-SOLAR-001\" — set this so two co-located sims (e.g. this modsim plus a mbapsdev "+
 		"-model inverter) present distinct device identity to a downstream gateway that keys identity "+
 		"on manufacturer|model|serial")
+	fwVersion := flag.String("fw-version", "", "SunSpec Model 1 firmware version (Vr) override; empty keeps "+
+		"the sim's built-in default. Vr is REQUIRED by the IEEE 1547-2018 profile \u00a73.2 Table 16, and a "+
+		"gateway mirroring this device northbound passes it through VERBATIM \u2014 it is a fact about the DER's "+
+		"firmware, not about the gateway \u2014 so set it when two co-located sims must be distinguishable by "+
+		"firmware as well as by serial")
 	mangle := flag.Bool("mangle", false, "interpose the MBAP wire mangler (sim/southbound/wire.go): the Modbus "+
 		"server binds loopback and a framing-level relay binds -port instead, enabling the wire-lie fault kinds "+
 		"(truncate_response, mbap_length_lie, wrong_unit_id, txn_id_swap, stack_responses) that cannot be "+
@@ -73,6 +78,12 @@ func main() {
 	}
 	if err != nil {
 		log.Fatalf("modsim: %v", err)
+	}
+	if err := srv.SetFirmwareVersion(*fwVersion); err != nil {
+		log.Fatalf("modsim: %v", err)
+	}
+	if *fwVersion != "" {
+		log.Printf("modsim: SunSpec Model 1 firmware version (Vr) override %q", *fwVersion)
 	}
 
 	var mangler *sim.Mangler

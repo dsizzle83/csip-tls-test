@@ -111,6 +111,17 @@ func TestModel1_EveryDeviceReportsACompleteIdentity(t *testing.T) {
 			wantModel:  "CSIP-Meter-1Ph",
 			wantSerial: "SN-MTR-001",
 		},
+		// The STATIC fixture behind sim.NewServer, which tests/modbus_conformance
+		// and internal/southbound/inverter drive. It was missed when the three
+		// animated sims were corrected: it wrote Md through the 8-register
+		// helper, put the serial at Opt's offset and never wrote Vr at all, so
+		// it served the same sixteen NUL bytes MOD-4 reads as not-implemented.
+		{
+			name:       "static (sim.NewServer)",
+			populate:   func(r *RegisterMap) { Populate(r, 5000) },
+			wantModel:  "CSIP-Dev-5000",
+			wantSerial: "SN-0001",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			regs := model1Of(t, tc.populate)
@@ -184,6 +195,72 @@ func TestModel1_OffsetsMatchTheDecoder(t *testing.T) {
 	}
 	if c.Version == "" {
 		t.Error("ReadCommon sees an empty Vr — the value a gateway actually reads is still unset")
+	}
+}
+
+// TestSetFirmwareVersion covers the -fw-version lever modsim and mbapsdev
+// expose.
+//
+// Two properties, and the second is the one that makes the first safe. A
+// version string is a fact about the DER's firmware and a gateway mirroring
+// this device passes it through VERBATIM, so an operator must be able to give
+// co-located sims distinct versions — and a write that landed anywhere but Vr
+// would corrupt the register image while reporting success.
+func TestSetFirmwareVersion(t *testing.T) {
+	newSrv := func() *Server {
+		r := &RegisterMap{regs: make(map[uint16]uint16)}
+		populateSolar(r, 5000, "SN-FW-1")
+		return &Server{Regs: r}
+	}
+
+	read := func(s *Server) sunspec.Common {
+		t.Helper()
+		reader, err := sunspec.NewReader(&regMapTransport{r: s.Regs})
+		if err != nil {
+			t.Fatalf("NewReader: %v", err)
+		}
+		c, err := sunspec.ReadCommon(reader)
+		if err != nil {
+			t.Fatalf("ReadCommon: %v", err)
+		}
+		return c
+	}
+
+	// The default is deterministic and non-empty before anything overrides it.
+	s := newSrv()
+	before := read(s)
+	if before.Version == "" {
+		t.Fatal("the sim serves an empty Vr before any override")
+	}
+
+	// An empty override is a no-op, which is what lets a flag default to "".
+	if err := s.SetFirmwareVersion(""); err != nil {
+		t.Fatalf("SetFirmwareVersion(\"\"): %v", err)
+	}
+	if got := read(s); got.Version != before.Version {
+		t.Errorf("an empty override changed Vr from %q to %q", before.Version, got.Version)
+	}
+
+	// A real override reaches the field a gateway reads — and touches nothing
+	// else, which is the assertion that catches an off-by-eight.
+	if err := s.SetFirmwareVersion("SIM-9.9.9-rc1"); err != nil {
+		t.Fatalf("SetFirmwareVersion: %v", err)
+	}
+	after := read(s)
+	if after.Version != "SIM-9.9.9-rc1" {
+		t.Errorf("Vr = %q, want the override", after.Version)
+	}
+	if after.Manufacturer != before.Manufacturer || after.Model != before.Model ||
+		after.Serial != before.Serial || after.Options != before.Options {
+		t.Errorf("the override moved a neighbouring field: %+v -> %+v", before, after)
+	}
+
+	// A register image whose Model 1 is not where the constant says must be
+	// refused, not written over: the failure mode is a version string landing
+	// in some other model's data, reported as a successful override.
+	empty := &Server{Regs: &RegisterMap{regs: make(map[uint16]uint16)}}
+	if err := empty.SetFirmwareVersion("SIM-1.2.3"); err == nil {
+		t.Error("SetFirmwareVersion wrote into a register image with no Model 1 at the expected offset")
 	}
 }
 
