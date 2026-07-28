@@ -43,13 +43,18 @@
 # │ (No "pin" on inv-edb2 ⇒ CA-mode trust via the sb-mbaps-servers bundle,    │
 # │  exactly as docs/BENCH_SMOKE_TEST.md §4.2 sets up for the two-sim case.)  │
 # │                                                                           │
-# │ THE NORTHBOUND HALF IS STILL MISSING, and four sims do not supply it.     │
-# │ The AGG/MAINT/UTIL rows also need sim/gridsim to SERVE four EndDevices    │
-# │ (CTP Figure 15: an aggregator EndDevice plus EDA1/EDA2 under SPA1/SPA2    │
-# │ and EDB1/EDB2 under SPB1/SPB2, each with a FunctionSetAssignmentsListLink │
-# │ and a DERListLink) and to implement the Subscription/Notification         │
-# │ function set. gridsim does neither today. Until it does, those rows       │
-# │ report SKIP naming the gap — see the PROFILE_SCOPE doc §5.                │
+# │ THE NORTHBOUND HALF is gridsim's, and SIM_FLEET=4 now turns it on: this   │
+# │ script starts gridsim with -fleet 4 -subscription, so it serves the CTP   │
+# │ Figure-15 EndDeviceList (an aggregator EndDevice plus EDA1/EDA2 under     │
+# │ SPA1/SPA2 and EDB1/EDB2 under SPB1/SPB2, each with a                      │
+# │ FunctionSetAssignmentsListLink, a DERListLink and its parent nodes'       │
+# │ DERPrograms) and the Subscription/Notification function set.              │
+# │                                                                           │
+# │ Override either half with GRIDSIM_FLEET=0 / GRIDSIM_SUBSCRIPTION=0.       │
+# │ At SIM_FLEET=2 both stay OFF and gridsim serves exactly the               │
+# │ single-EndDevice tree it always has — the direct-DER-client rows were     │
+# │ certified against that tree and must not be silently re-measured against  │
+# │ a different one. See the PROFILE_SCOPE doc §5.                            │
 # └───────────────────────────────────────────────────────────────────────────┘
 #
 # TRUST: every sim uses the csip-tls-test mbaps PKI (single root). The gateway's
@@ -87,6 +92,19 @@ MODSIM3_API="${MODSIM3_API:-6041}"
 # a gridsim on the mbaps PKI (this script's -ca certs/mbaps) on a free port.
 GRIDSIM_PORT="${GRIDSIM_PORT:-11113}"
 GRIDSIM_ADMIN="${GRIDSIM_ADMIN:-11114}"
+# The NORTHBOUND half of the CTP Figure-15 fixture. Both default to ON at
+# SIM_FLEET=4 and OFF at SIM_FLEET=2, so the smoke-test pair keeps serving the
+# byte-identical single-EndDevice tree it always has. Set either to 0 to run a
+# four-sim southbound against the old northbound tree (which is what you want if
+# you are bisecting a change to the southbound half and do not want the
+# northbound one moving underneath you).
+if [ "$SIM_FLEET" = 4 ]; then
+  GRIDSIM_FLEET="${GRIDSIM_FLEET:-4}"
+  GRIDSIM_SUBSCRIPTION="${GRIDSIM_SUBSCRIPTION:-1}"
+else
+  GRIDSIM_FLEET="${GRIDSIM_FLEET:-0}"
+  GRIDSIM_SUBSCRIPTION="${GRIDSIM_SUBSCRIPTION:-0}"
+fi
 # DER_MODELS: which SunSpec DER model set the modsims serve. Empty (default)
 # passes nothing and every modsim starts with -advanced exactly as it always
 # has, so the register image on a running bench does not change under anyone.
@@ -178,8 +196,12 @@ if [ "$SIM_FLEET" = 4 ]; then
   start modsim3 "$MODSIM3_PORT" ./bin/modsim -port "$MODSIM3_PORT" -api-port "$MODSIM3_API" \
                  -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM3_SERIAL"
 fi
+GRIDSIM_ARGS=()
+[ "$GRIDSIM_FLEET" != 0 ] && GRIDSIM_ARGS+=(-fleet "$GRIDSIM_FLEET")
+[ "$GRIDSIM_SUBSCRIPTION" != 0 ] && GRIDSIM_ARGS+=(-subscription)
 start gridsim  "$GRIDSIM_PORT" ./bin/server   -listen "0.0.0.0:$GRIDSIM_PORT" -admin "0.0.0.0:$GRIDSIM_ADMIN" \
-                 -ca "$M/ca-cert.pem" -cert-chain "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem"
+                 -ca "$M/ca-cert.pem" -cert-chain "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem" \
+                 ${GRIDSIM_ARGS+"${GRIDSIM_ARGS[@]}"}
 
 if [ "$WITH_AGG" = 1 ]; then
   if [ -f "$LOG/aggregator.pid" ] && kill -0 "$(cat "$LOG/aggregator.pid" 2>/dev/null)" 2>/dev/null; then
@@ -199,16 +221,20 @@ fi
 
 echo
 if [ "$SIM_FLEET" = 4 ]; then
-  cat <<'EOF'
-NOTE (SIM_FLEET=4): the sims are only the SOUTHBOUND half of the CTP Figure-15
-fixture. Two things are still needed and neither is done by this script:
-  1. BOARD: /etc/lexa/modbus.json must list all four devices and lexa-modbus
-     must be restarted — see the block at the top of this file for the exact
-     JSON. The gateway does not sweep; an unlisted sim is never dialled.
-  2. BENCH: sim/gridsim must serve four EndDevices and a Subscription/
-     Notification function set before the AGG / MAINT / UTIL conformance rows
-     can do more than SKIP. See
-     docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md §5.
+  cat <<EOF
+NOTE (SIM_FLEET=4): gridsim now serves the NORTHBOUND half of the CTP Figure-15
+fixture (-fleet $GRIDSIM_FLEET, subscription=$GRIDSIM_SUBSCRIPTION); verify with
+  curl -s localhost:$GRIDSIM_ADMIN/admin/status | jq '.fleet, .subscription'
+  curl -s localhost:$GRIDSIM_ADMIN/admin/fleet  | jq '.devices'
+One thing is still needed and this script cannot do it:
+  BOARD: /etc/lexa/modbus.json must list all four devices and lexa-modbus must
+  be restarted — see the block at the top of this file for the exact JSON. The
+  gateway does not sweep; an unlisted sim is never dialled.
+The aggregator rows' NOTIFICATION-PUSH criteria stay SKIP until the DUT's
+inbound listener is reachable from gridsim: an https:// notificationURI is
+refused by the built-in notifier, because gridsim is pure Go and Go's
+crypto/tls has no ECDHE-ECDSA-AES128-CCM-8. See sim/gridsim/subscribe.go and
+docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md §5.
 EOF
 fi
 if [ "$FAIL" = 0 ]; then echo "All server sims up. Stop with scripts/bench-sims-down.sh"; else

@@ -54,6 +54,21 @@ func main() {
 		// resumption available, which is what a real 2030.5 client may use.
 		noTickets = flag.Bool("no-tickets", false, "issue no TLS session tickets and keep no session cache, so every gateway dial is a FULL mTLS handshake with the certificates on the wire (conformance evidence runs; default allows resumption)")
 
+		// The two DER AGGREGATOR CLIENT capabilities (owner decision 2026-07-28,
+		// docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md §5). Both
+		// default OFF, and with both off this binary serves byte-identical XML
+		// to the one it served before they existed — which is the point: the
+		// direct-DER-client rows were certified against that tree and must not
+		// silently start being measured against a different one.
+		fleet = flag.Int("fleet", 0, "serve the CTP Figure-15 aggregator topology: an aggregator EndDevice "+
+			"plus EDA1/EDA2 under SPA1/SPA2 and EDB1/EDB2 under SPB1/SPB2, each with a "+
+			"FunctionSetAssignmentsListLink, a DERListLink and the node DERPrograms of its parent chain. "+
+			"Only 4 is defined (the figure's size); 0 keeps the single-EndDevice tree")
+		subscription = flag.Bool("subscription", false, "serve the IEEE 2030.5 Subscription/Notification "+
+			"function set: advertise a SubscriptionListLink on every EndDevice, mark the "+
+			"FunctionSetAssignmentsList subscribable=1, accept POST/GET/DELETE of Subscriptions, and POST a "+
+			"Notification to a subscriber's notificationURI when the subscribed resource changes")
+
 		// Bench-only, and only in a -tags keylog build. Point this at the SAME
 		// file certify writes: lexa_keylog_open appends, the NSS format is
 		// line-oriented, and the analyzer does not care which process wrote
@@ -89,6 +104,29 @@ func main() {
 	// during each mTLS handshake (Step A: live derivation, not from a file).
 	sim := gridsim.NewServer("")
 	sim.SetAdvertisedPollRate(uint32(*pollRateS))
+
+	// Order matters and only in one direction: enabling subscriptions first
+	// means the fleet's EndDevices and FunctionSetAssignmentsLists are built
+	// already carrying the SubscriptionListLink and subscribable=1, rather than
+	// being built without them and widened afterwards. Both orders end in the
+	// same tree; this one does it in a single pass.
+	if *subscription {
+		sim.EnableSubscriptions()
+	}
+	if *fleet != 0 {
+		if err := sim.EnableFleet(*fleet); err != nil {
+			log.Fatalf("-fleet %d: %v", *fleet, err)
+		}
+		if !*subscription {
+			// Say it here rather than leaving a conformance operator to
+			// discover it from a bundle full of SKIPs: the aggregator rows need
+			// both halves, and a fleet without the function set closes only the
+			// fan-out half of the gap.
+			log.Printf("[gridsim] NOTE: -fleet is on but -subscription is not. The CTP's aggregator rows " +
+				"that turn on Subscription/Notification (AGG-001, CORE-018/019, ERR-002, MAINT-001/003/004/005, " +
+				"UTIL-003) will still report SKIP naming that gap")
+		}
+	}
 
 	// Tee logs into the admin API ring so GET /admin/logs streams them to
 	// the dashboard's unified Logs tab.
