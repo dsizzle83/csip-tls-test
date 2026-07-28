@@ -30,7 +30,16 @@ func main() {
 		// paces its walk at the slowest advertised rate — /tm's 900s by
 		// default — which makes the CSIP suite's walk-observation cases
 		// unrunnable. Conformance runs pass 60.
-		pollRateS = flag.Uint("poll-rate-s", 0, "advertise this pollRate (seconds) on /dcap and /tm; 0 keeps the built-in 300/900")
+		//
+		// The help text names every class the setter touches, because the
+		// slowest one is what the walk keeps: a reader who believed "on /dcap
+		// and /tm" would set 30, watch the cadence stop at 60, and go looking
+		// for the discrepancy in the DUT.
+		pollRateS = flag.Uint("poll-rate-s", 0, "advertise this pollRate (seconds) on every resource class a "+
+			"poll_rate_mode=honor client paces its walk from — DeviceCapability (/dcap), Time (/tm) and each "+
+			"DERProgram's DERControlList, including the extended (curve-linked) form — and on every control "+
+			"list created afterwards. A client paces at the SLOWEST advertisement, so one list left behind "+
+			"pins the whole walk. 0 keeps the built-in rates (300 /dcap, 900 /tm, 60 control lists)")
 
 		// See tlsserver.Server.IdleTimeout. A client that reuses one TLS
 		// session across every walk gives the capture no ClientHello to

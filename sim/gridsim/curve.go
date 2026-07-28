@@ -201,13 +201,13 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 			Resource:   model.Resource{Href: actPath},
 			All:        1,
 			Results:    1,
-			PollRate:   60,
+			PollRate:   s.controlListPollRateLocked(),
 			DERControl: []model.ExtendedDERControl{ctrl},
 		}
 	case req.Activate:
 		// future event with activate=true clears the stale active list
 		s.resources[actPath] = &model.ExtendedDERControlList{
-			Resource: model.Resource{Href: actPath}, PollRate: 60,
+			Resource: model.Resource{Href: actPath}, PollRate: s.controlListPollRateLocked(),
 		}
 	case activeNow:
 		s.putExtendedControl(actPath, ctrl, false)
@@ -250,7 +250,9 @@ func (s *Server) adminCurveDelete(w http.ResponseWriter, r *http.Request) {
 		fmt.Sprintf("/derp/%d/derc", req.Program),
 		fmt.Sprintf("/derp/%d/actderc", req.Program),
 	} {
-		s.resources[path] = &model.DERControlList{Resource: model.Resource{Href: path}, PollRate: 60}
+		s.resources[path] = &model.DERControlList{
+			Resource: model.Resource{Href: path}, PollRate: s.controlListPollRateLocked(),
+		}
 	}
 
 	// Reset the curve list to the original static fixture.
@@ -273,14 +275,16 @@ func (s *Server) putExtendedControl(path string, ctrl model.ExtendedDERControl, 
 			Resource:   model.Resource{Href: path},
 			All:        1,
 			Results:    1,
-			PollRate:   60,
+			PollRate:   s.controlListPollRateLocked(),
 			DERControl: []model.ExtendedDERControl{ctrl},
 		}
 		return
 	}
 	el, ok := s.resources[path].(*model.ExtendedDERControlList)
 	if !ok {
-		el = &model.ExtendedDERControlList{Resource: model.Resource{Href: path}, PollRate: 60}
+		el = &model.ExtendedDERControlList{
+			Resource: model.Resource{Href: path}, PollRate: s.controlListPollRateLocked(),
+		}
 		s.resources[path] = el
 	}
 	el.DERControl = append(el.DERControl, ctrl)

@@ -352,6 +352,62 @@ func TestAdvertisedPollRateIsTheSlowestAdvertisement(t *testing.T) {
 	}
 }
 
+// TestAdvertisedPollRateSurvivesAControlPost is the trap the flag's old help
+// text hid. -poll-rate-s was applied once, at start-up, to the resources that
+// existed then; every POST /admin/control and /admin/curve installs a FRESH
+// control list, and those were built at the hardcoded 60. Since a conformant
+// client paces at the SLOWEST advertisement, the first control a scenario row
+// posted as its setup step dragged the whole walk from 30 back to 60 — on
+// exactly the cases that need the fast cadence.
+func TestAdvertisedPollRateSurvivesAControlPost(t *testing.T) {
+	s := NewServer("")
+	s.SetAdvertisedPollRate(30)
+	if got := s.AdvertisedPollRate(); got != 30 {
+		t.Fatalf("AdvertisedPollRate = %d immediately after the override, want 30", got)
+	}
+
+	// A scalar control, then a curve-bound one: both replace a control list at
+	// /derp/{p}/derc, and the curve path installs the EXTENDED form.
+	adminPost(t, s, "/admin/control", `{"program":0,"mrid":"PR-POLL-1","start_offset_s":30,`+
+		`"duration_s":120,"max_lim_w":4000}`)
+	if got := s.AdvertisedPollRate(); got != 30 {
+		t.Errorf("after POST /admin/control the tree advertises %d, want 30: a newly created "+
+			"DERControlList must adopt the configured rate, not the built-in 60", got)
+	}
+
+	adminPost(t, s, "/admin/curve", `{"program":1,"mode":"volt_var","activate":true,`+
+		`"points":[{"x":92,"y":60},{"x":98,"y":0},{"x":108,"y":-60}]}`)
+	if got := s.AdvertisedPollRate(); got != 30 {
+		t.Errorf("after POST /admin/curve the tree advertises %d, want 30: the extended "+
+			"(curve-linked) control list must adopt it too", got)
+	}
+	if got := advertisedFromStatus(t, s); got != 30 {
+		t.Errorf("/admin/status poll_rate_s = %d, want 30", got)
+	}
+
+	// And with NO override the built-in cadence is unchanged: an un-overridden
+	// tree must serve exactly what it always did.
+	plain := NewServer("")
+	before := plain.AdvertisedPollRate()
+	adminPost(t, plain, "/admin/control", `{"program":0,"mrid":"PR-POLL-2","start_offset_s":30,`+
+		`"duration_s":120,"max_lim_w":4000}`)
+	if got := plain.AdvertisedPollRate(); got != before {
+		t.Errorf("with no override a control post moved the advertised rate from %d to %d",
+			before, got)
+	}
+}
+
+// adminPost drives an admin endpoint and fails on any non-2xx.
+func adminPost(t *testing.T, s *Server, path, body string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", path, bytes.NewReader([]byte(body)))
+	s.AdminHandler().ServeHTTP(rec, req)
+	if rec.Code < 200 || rec.Code >= 300 {
+		t.Fatalf("POST %s = %d: %s", path, rec.Code, rec.Body.String())
+	}
+}
+
 func advertisedFromStatus(t *testing.T, s *Server) uint32 {
 	t.Helper()
 	rec := httptest.NewRecorder()

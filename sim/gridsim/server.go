@@ -70,6 +70,15 @@ type Server struct {
 	// mupNextID is protected by mu; do not read/write outside the mu lock.
 	mupNextID int32
 
+	// advertisedPollRate is what -poll-rate-s asked for, in seconds, or 0 when
+	// nothing overrode the built-in rates. It is remembered rather than only
+	// applied because control lists are CREATED after start-up: every
+	// POST /admin/control and /admin/curve installs a fresh
+	// DERControlList/ExtendedDERControlList, and one installed at the
+	// hardcoded default silently undoes the override for the whole walk (the
+	// client paces at the SLOWEST advertised rate). Guarded by mu.
+	advertisedPollRate uint32
+
 	// malformKind, when non-empty, makes serveXML emit a deliberately
 	// non-conformant variant of the matching resource (QA fault injection via
 	// POST /admin/malform). Guarded by mu. See malform.go.
@@ -205,8 +214,20 @@ func (s *Server) ClockSkew() int64 {
 	return s.clockSkew.Load()
 }
 
-// SetAdvertisedPollRate overrides the pollRate this server advertises on /dcap
-// and /tm. Zero leaves the built-in values (300 and 900) alone.
+// SetAdvertisedPollRate overrides the pollRate this server advertises on every
+// resource class a poll_rate_mode=honor client paces its walk from:
+// DeviceCapability, Time, and each DERProgram's DERControlList — including the
+// EXTENDED (curve-linked) form of that list. Zero leaves the built-in values
+// alone.
+//
+// The rate is also REMEMBERED, and every control list created afterwards adopts
+// it. Without that the override lasts exactly until the first
+// POST /admin/control or /admin/curve, each of which installs a fresh list at
+// the hardcoded 60 — and since a conformant client paces at the SLOWEST
+// advertised rate, one such list drags the whole walk back to 60 s however fast
+// /dcap says to go. That is a live-bench trap, not a theoretical one: the CSIP
+// scenario rows post controls as their setup step, so it fires on the cases that
+// need the fast cadence most.
 //
 // WHY THIS LEVER EXISTS
 //
@@ -234,6 +255,7 @@ func (s *Server) SetAdvertisedPollRate(seconds uint32) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.advertisedPollRate = seconds
 	// Every resource class the client's pacing looks at, not just /dcap and
 	// /tm: lexa-gw's advertisedPollSeconds takes the MAXIMUM over
 	// DeviceCapability, Time, and EACH DERProgram's DERControlList, so one
@@ -252,11 +274,36 @@ func (s *Server) SetAdvertisedPollRate(seconds uint32) {
 		case *model.DERControlList:
 			v.PollRate = seconds
 			n++
+		case *model.ExtendedDERControlList:
+			// The curve-linked list is the same resource class to a client —
+			// it shares its XMLName with the scalar DERControlList (curve.go)
+			// and AdvertisedPollRate has always counted it. Setting one form
+			// and not the other left the max pinned by whichever the tree
+			// happened to hold.
+			v.PollRate = seconds
+			n++
 		}
 	}
 	log.Printf("[gridsim] advertised pollRate set to %ds on %d resource(s) "+
-		"(DeviceCapability, Time, DERControlList)", seconds, n)
+		"(DeviceCapability, Time, DERControlList incl. the extended form); "+
+		"control lists created from now on adopt it", seconds, n)
 }
+
+// controlListPollRateLocked is the pollRate a newly created DERControlList or
+// ExtendedDERControlList should advertise: whatever -poll-rate-s configured, or
+// the built-in default when nothing did. Caller must hold s.mu.
+func (s *Server) controlListPollRateLocked() uint32 {
+	if s.advertisedPollRate != 0 {
+		return s.advertisedPollRate
+	}
+	return defaultControlListPollRate
+}
+
+// defaultControlListPollRate is the built-in cadence a control list advertises
+// when no override is configured. It is the value every call site here used
+// literally before controlListPollRateLocked existed, so an un-overridden tree
+// serves byte-identical XML.
+const defaultControlListPollRate = 60
 
 // AdvertisedPollRate returns the pollRate, in seconds, that a client in
 // poll_rate_mode "honor" will pace its whole-tree walk at — 0 when the tree
