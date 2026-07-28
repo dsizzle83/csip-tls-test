@@ -135,7 +135,7 @@ A `CGO_ENABLED=0` build also works and is not a lie — `-list`, `-dry-run`,
 `-verify` and `-report` are fully functional and every plaintext-transport check
 runs; only the mbaps transport is absent, and the checks that need it say so.
 
-### The five modes
+### The six modes
 
 ```bash
 # What does the tool cover?
@@ -157,6 +157,12 @@ bin/certify -verify runs/2026-07-26/
 
 # Turn a bundle into a SunSpec submission.
 bin/certify -report runs/2026-07-26/ -config lab.json
+
+# Turn a whole campaign into the Test Results Report package: BOTH Results
+# Reporting specifications, from as many bundles as it took.
+bin/certify -trr runs/csip-2026-07-28=csip-conf-v1.3 \
+            -trr runs/full-2026-07-28 \
+            -trr-out runs/trr-2026-07-28 -config lab.json -allow-incomplete
 ```
 
 Two more that matter day to day:
@@ -437,6 +443,40 @@ Three refusals are built in:
 
 The mode also **refuses to build a submission from a bundle that does not
 verify**.
+
+### The whole package: `-trr`
+
+`-report` covers one bundle and one certificate type. A real campaign covers six
+documents governed by TWO Results Reporting specifications, and often takes more
+than one bench run. `-trr` is that shape:
+
+```bash
+bin/certify -trr runs/csip-2026-07-28=csip-conf-v1.3 \
+            -trr runs/full-2026-07-28 \
+            -trr-out runs/trr-2026-07-28 -config lab.json -allow-incomplete
+```
+
+It routes every case by its document, maps each bench verdict by a rule stated
+in the emitted report, derives BOTH §4 logs from the bundles' captures — the
+mbaps and CSIP sessions included, by decrypting them with the run's own key log —
+and writes one package with a README naming everything it does not carry. The
+`=<doc-key>` suffix narrows a source, which is how two campaigns covering the
+same document are kept from silently overwriting one another; without it, a
+disagreement about one procedure's verdict stops the run.
+
+Beyond `-report`'s three refusals it adds two:
+
+* **`NOT SUPPORTED` needs a catalog behind it.** Only a case the bundle's own
+  archived `catalog.json` marks inapplicable earns that verdict, and the row
+  carries the catalog's reason. Every other SKIP and every WARN is omitted with
+  the gap recorded — in the README, in the readiness report, and counted in
+  Additional Test Comments.
+* **One image behind the whole campaign.** Two bundles whose DUT build stamps
+  disagree are refused: §2.1 requires the software unaltered across the
+  campaign, so no single `Software Checksum` covers two builds.
+
+The full key reference, the verdict-mapping derivation and the self-check
+invocation are in [TRR_SUBMISSION_CONFIG.md](TRR_SUBMISSION_CONFIG.md).
 
 `lab.json` uses the flat key space of `internal/certify/report`'s
 `SubmissionConfig` (unknown keys are an error — a misspelled key would otherwise
