@@ -70,11 +70,18 @@ func names(es []certify.CoverageEntry) []string {
 // ways the hand-written exclusion list can go wrong: claiming a row is
 // inapplicable when the catalog says it applies (which would silently drop a
 // required test) and listing a row the catalog does not have.
+//
+// It no longer requires the converse. Since the profile scope moved back to the
+// DER Client column on 2026-07-28 there are TWO kinds of inapplicable row and
+// they must not be conflated: the six bound to the notApplicable stub, which is
+// what this list is, and the twenty-two aggregator-only rows, which stay bound
+// to their real checks and run as informative evidence. Requiring every
+// inapplicable row to be on this list would have forced those twenty-two back
+// onto the stub — deleting working evaluators to satisfy a bookkeeping rule.
+// TestAggregatorRowsAreInapplicableButStillImplemented is the other half.
 func TestInapplicableRegistrationsMatchTheCatalog(t *testing.T) {
 	cat := loadCatalog(t)
-	listed := map[string]bool{}
 	for _, id := range inapplicableUIDs {
-		listed[id] = true
 		c, ok := cat.ByUID(uid(id))
 		if !ok {
 			t.Errorf("%s is on the inapplicable list but is not in the catalog", id)
@@ -83,12 +90,6 @@ func TestInapplicableRegistrationsMatchTheCatalog(t *testing.T) {
 		if c.Applicable {
 			t.Errorf("%s is registered as NOT APPLICABLE but the catalog marks it applicable to this DUT: %s",
 				id, c.ApplicabilityReason)
-		}
-	}
-	for _, c := range cat.Select(certify.Filter{Docs: []string{doc}}) {
-		if !c.Applicable && !listed[c.ID] {
-			t.Errorf("%s is inapplicable in the catalog but is not on this suite's inapplicable list, so it "+
-				"is bound to a real check that will try to run it", c.ID)
 		}
 	}
 }
@@ -137,83 +138,173 @@ func TestEveryApplicableRowHasARealCheck(t *testing.T) {
 			t.Errorf("%s: SKIPped without saying why", c.ID)
 		}
 	}
-	// 73 = the 51 rows the DER Client profile required, plus the 22 the DER
-	// AGGREGATOR CLIENT profile adds (owner decision 2026-07-28: AGG-001..012,
-	// CORE-018, CORE-019, ERR-002, MAINT-001/003/004/005, UTIL-002/003/004).
-	// The six that remain N/A are CORE-001/002/004 and UTIL-001 (2030.5-server
-	// rows), MAINT-002 (Annex A seq 32 makes it optional) and COMM-001
-	// (optional for all device types) — all six blank in every §4 column.
-	if applicable != 73 {
-		t.Errorf("the catalog holds %d applicable %s rows; this suite was written against 73", applicable, doc)
+	// 51 = the §4 DER Client column. The owner decision of 2026-07-28 certifies
+	// this DUT against that column in the GFEMS posture, superseding an earlier
+	// decision the same day to claim the DER AGGREGATOR CLIENT column; the 22
+	// rows the aggregator column adds (AGG-001..012, CORE-018, CORE-019,
+	// ERR-002, MAINT-001/003/004/005, UTIL-002/003/004) are informative and are
+	// counted below, not here. Six rows are N/A for reasons no profile choice
+	// touches: CORE-001/002/004 and UTIL-001 (2030.5-server rows), MAINT-002
+	// (Annex A seq 32 makes it optional) and COMM-001 (optional for all device
+	// types) — all six blank in every §4 column.
+	if applicable != 51 {
+		t.Errorf("the catalog holds %d applicable %s rows; this suite was written against 51", applicable, doc)
 	}
 }
 
-// TestProfileScopeIsTheAggregatorColumn is the guard on the re-scope itself:
-// applicability must track §4's DER AGGREGATOR CLIENT column, not the DER
-// Client column it used to track and not somebody's memory of either.
+// TestProfileScopeIsTheDERClientColumn is the guard on the scope itself: the
+// applicable set must be §4's DER CLIENT column EXACTLY — not the DER
+// Aggregator Client column it briefly tracked on 2026-07-28, and not somebody's
+// memory of either.
 //
 // It is stated over profile_conformance — the catalog's machine-readable record
 // of the printed matrix — rather than over a hand-written list, so a
 // re-extraction that changed a matrix row would fail here rather than silently
 // re-scoping the certification.
-func TestProfileScopeIsTheAggregatorColumn(t *testing.T) {
+//
+// The equality is two-directional and both directions have teeth. A DER Client
+// row that went inapplicable would drop a REQUIRED test; an aggregator-only row
+// that went applicable would put twenty-two rows the claim does not cover back
+// inside it. The only admitted exception is a row §4 requires of NOBODY, which
+// may be applicable if — and only if — its reason says OPTIONAL in as many
+// words.
+func TestProfileScopeIsTheDERClientColumn(t *testing.T) {
 	cat := loadCatalog(t)
-	// The rows §4 requires of a DER Aggregator Client but NOT of a DER Client:
-	// these are exactly the rows the 2026-07-28 decision pulled in.
-	var pulledIn []string
+	// Three rows are applicable although §4 requires them of no profile:
+	// BASIC-013 and BASIC-014 (blank in all three columns) and CORE-023 (added
+	// by Annex A seq 33 and absent from the printed matrix entirely). They are
+	// optional evidence this bench can produce and conformance is not gated on
+	// them. Their treatment did not change with the profile, which is why they
+	// are named here rather than derived.
+	optional := map[string]bool{"BASIC-013": true, "BASIC-014": true, "CORE-023": true}
+
+	var aggregatorOnly []string
 	for _, c := range cat.Select(certify.Filter{Docs: []string{doc}}) {
 		pc := c.ProfileConformance
-		if pc == nil || !pc.DERAggregatorClientRequired || pc.DERClientRequired {
-			continue
-		}
-		pulledIn = append(pulledIn, c.ID)
-		if !c.Applicable {
-			t.Errorf("%s is required of a DER Aggregator Client by §4 but the catalog marks it "+
-				"inapplicable; the 2026-07-28 re-scope requires it: %s", c.ID, c.ApplicabilityReason)
-		}
-		if c.DUTRole != certify.RoleCSIPClient {
-			t.Errorf("%s is an applicable aggregator-client row with dut_role %q, want %q — the aggregator "+
-				"IS a 2030.5 client toward the utility server", c.ID, c.DUTRole, certify.RoleCSIPClient)
+		switch {
+		case pc != nil && pc.DERClientRequired:
+			// The claimed column. Required of this DUT, so it must apply.
+			if !c.Applicable {
+				t.Errorf("%s carries an X in the §4 DER Client column but the catalog marks it "+
+					"inapplicable; the claimed profile requires it: %s", c.ID, c.ApplicabilityReason)
+			}
+			if c.DUTRole != certify.RoleCSIPClient {
+				t.Errorf("%s is a DER Client row with dut_role %q, want %q", c.ID, c.DUTRole,
+					certify.RoleCSIPClient)
+			}
+		case pc != nil && pc.DERAggregatorClientRequired:
+			// Required of an aggregator and of nobody else: outside the claim.
+			aggregatorOnly = append(aggregatorOnly, c.ID)
+			if c.Applicable {
+				t.Errorf("%s is required only of a DER AGGREGATOR CLIENT and the DUT is certified as a "+
+					"DER Client (GFEMS); marking it applicable puts it back inside the claim: %s",
+					c.ID, c.ApplicabilityReason)
+			}
+			// dut_role stays csip-client: the row is outside the CLAIM, not
+			// outside the client SURFACE, and its check still drives 2030.5 as a
+			// client. Demoting it to not-applicable would say the opposite of
+			// what the registration does.
+			if c.DUTRole != certify.RoleCSIPClient {
+				t.Errorf("%s is an informative aggregator row with dut_role %q, want %q — it is excluded "+
+					"from the claim, not from the client surface, and its check still runs",
+					c.ID, c.DUTRole, certify.RoleCSIPClient)
+			}
+		case c.Applicable:
+			// Required of nobody, yet applicable. Admitted only with the word.
+			if !optional[c.ID] {
+				t.Errorf("%s is applicable but §4 requires it of no profile, and it is not one of the "+
+					"three rows recorded as optional evidence", c.ID)
+				continue
+			}
+			if !strings.Contains(c.ApplicabilityReason, "OPTIONAL") {
+				t.Errorf("%s is applicable-but-required-of-nobody; its applicability_reason must say "+
+					"OPTIONAL in as many words so a reviewer cannot mistake it for a conformance gate: %s",
+					c.ID, c.ApplicabilityReason)
+			}
 		}
 	}
-	if len(pulledIn) != 22 {
+	if len(aggregatorOnly) != 22 {
 		t.Errorf("§4 requires %d row(s) of a DER Aggregator Client that it does not require of a DER "+
-			"Client (%v); the decision of 2026-07-28 was taken over 22", len(pulledIn), pulledIn)
+			"Client (%v); the decision of 2026-07-28 was taken over 22", len(aggregatorOnly), aggregatorOnly)
 	}
 
-	// And the converse: nothing may be applicable that §4 requires of nobody
-	// UNLESS its reason says so in as many words. Three rows are legitimately in
-	// that position — BASIC-013, BASIC-014 and CORE-023 are optional evidence
-	// this bench can produce — and they are the only ones.
-	optional := map[string]bool{"BASIC-013": true, "BASIC-014": true, "CORE-023": true}
-	for _, c := range cat.Select(certify.Filter{Docs: []string{doc}, ApplicableOnly: true}) {
+	// The nesting the claim rests on: no row is required of a DER Client without
+	// also being required of a DER Aggregator Client. If that ever stopped being
+	// true, "the narrower column costs nothing" would stop being true with it.
+	for _, c := range cat.Select(certify.Filter{Docs: []string{doc}}) {
 		pc := c.ProfileConformance
-		required := pc != nil && (pc.DERClientRequired || pc.DERAggregatorClientRequired || pc.ServerRequired)
-		if required {
-			continue
-		}
-		if !optional[c.ID] {
-			t.Errorf("%s is applicable but §4 requires it of no profile, and it is not one of the three "+
-				"rows recorded as optional evidence", c.ID)
-			continue
-		}
-		if !strings.Contains(c.ApplicabilityReason, "OPTIONAL") {
-			t.Errorf("%s is applicable-but-required-of-nobody; its applicability_reason must say OPTIONAL "+
-				"in as many words so a reviewer cannot mistake it for a conformance gate: %s",
-				c.ID, c.ApplicabilityReason)
+		if pc != nil && pc.DERClientRequired && !pc.DERAggregatorClientRequired {
+			t.Errorf("%s is required of a DER Client but NOT of a DER Aggregator Client; the two columns "+
+				"no longer nest, so the claim's superset argument no longer holds", c.ID)
 		}
 	}
 }
 
+// TestAggregatorRowsAreInapplicableButStillImplemented pins the posture the
+// 2026-07-28 DER Client decision chose for the twenty-two rows it dropped:
+// OUTSIDE the claim, INSIDE the run.
+//
+// Deleting them, or rebinding them to the not-applicable stub, would have been
+// the cheap answer and the wrong one. Their criteria are real evaluators
+// (criteria_agg.go), the bench builds the fixtures they were written against
+// (`sim/server -fleet`, `-subscription`), and a check that runs is worth more
+// than a check that was deleted — a negative verdict here is evidence about a
+// capability this product does not claim, which is a thing a reader of a bundle
+// may need and cannot get from an omission.
+func TestAggregatorRowsAreInapplicableButStillImplemented(t *testing.T) {
+	cat := loadCatalog(t)
+	reg := certify.NewRegistry()
+	Register(reg)
+
+	stub := map[string]bool{}
+	for _, id := range inapplicableUIDs {
+		stub[id] = true
+	}
+	n := 0
+	for _, c := range cat.Select(certify.Filter{Docs: []string{doc}}) {
+		pc := c.ProfileConformance
+		if pc == nil || pc.DERClientRequired || !pc.DERAggregatorClientRequired {
+			continue
+		}
+		n++
+		if stub[c.ID] {
+			t.Errorf("%s is on the not-applicable stub list; it has a real check in aggregator.go and "+
+				"dropping it from the claim is not a reason to stop running it", c.ID)
+		}
+		r, ok := reg.Lookup(c.UID)
+		if !ok {
+			t.Errorf("%s has no registration at all — it left the claim and the run together", c.ID)
+			continue
+		}
+		if r.Suite != Suite {
+			t.Errorf("%s is registered by suite %q", c.ID, r.Suite)
+		}
+		// The reason has to say so, because the bundle prints it and a reader
+		// who sees "applicable: false" and nothing else will assume the row was
+		// skipped.
+		if !strings.Contains(c.ApplicabilityReason, "INFORMATIVE") {
+			t.Errorf("%s is inapplicable-but-implemented; its applicability_reason must say so, or a "+
+				"reader of the bundle will read its verdict as a conformance finding: %s",
+				c.ID, c.ApplicabilityReason)
+		}
+	}
+	if n != 22 {
+		t.Errorf("found %d aggregator-only row(s), want 22", n)
+	}
+}
+
 // TestAggregatorRowsSkipRatherThanFailWithoutTheFleet is the guard against the
-// worst failure mode this re-scope could produce: reporting a BENCH gap as a
-// DUT finding.
+// worst failure mode these rows could produce: reporting a BENCH gap as a DUT
+// finding.
 //
 // Every aggregator row is written against the Figure-15 four-EndDevice topology
-// and most need the Subscription/Notification function set. sim/gridsim has
-// neither. A check that answered that with FAIL would look like diligence and
-// be a false positive on every run; a check that answered with PASS would be
-// certifying a test that never ran. The contract is SKIP, with the gap named.
+// and most need the Subscription/Notification function set. The bench can serve
+// both, but only when asked (`sim/server -fleet`, `-subscription`); with neither
+// lever on there is no fixture. A check that answered that with FAIL would look
+// like diligence and be a false positive on every run; a check that answered
+// with PASS would be certifying a test that never ran. The contract is SKIP,
+// with the gap named — and it survives the rows leaving the certification
+// claim, because an informative verdict that is wrong is still wrong.
 func TestAggregatorRowsSkipRatherThanFailWithoutTheFleet(t *testing.T) {
 	cat := loadCatalog(t)
 	reg := certify.NewRegistry()
@@ -233,8 +324,8 @@ func TestAggregatorRowsSkipRatherThanFailWithoutTheFleet(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s has no registration", id)
 		}
-		if !c.Applicable {
-			t.Fatalf("%s is not applicable; this test is about the rows the re-scope made real", id)
+		if c.Applicable {
+			t.Fatalf("%s is applicable; this test is about the rows that run OUTSIDE the claim", id)
 		}
 		rc := &certify.RunCtx{
 			Case: c, Suite: Suite, Targets: certify.Targets{},
@@ -294,9 +385,11 @@ func TestRegistrationOrderIsDeterministic(t *testing.T) {
 	if first[0] != "COMM-002" {
 		t.Errorf("the plan starts with %s; the transport rows should lead", first[0])
 	}
-	// The fault-injecting row must come last among the applicable rows.
-	if got := lastApplicable(first); got != "ERR-001" {
-		t.Errorf("the last applicable row is %s; ERR-001 is the only row that makes the shared server "+
+	// The fault-injecting row must come last among the rows that EXECUTE, which
+	// since 2026-07-28 includes the twenty-two informative aggregator rows: they
+	// left the claim, not the plan, so ERR-001 has to stay behind them too.
+	if got := lastExecuted(first); got != "ERR-001" {
+		t.Errorf("the last executing row is %s; ERR-001 is the only row that makes the shared server "+
 			"misbehave and should run last", got)
 	}
 }
@@ -317,7 +410,9 @@ func planIDs(ps []certify.Planned) []string {
 	return out
 }
 
-func lastApplicable(ids []string) string {
+// lastExecuted is the last id in the plan bound to a real check — every row
+// except the six on the not-applicable stub list.
+func lastExecuted(ids []string) string {
 	skip := map[string]bool{}
 	for _, id := range inapplicableUIDs {
 		skip[id] = true

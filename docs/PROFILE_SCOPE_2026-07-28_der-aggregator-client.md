@@ -1,16 +1,39 @@
-# Profile scope: DER Aggregator Client (owner decision, 2026-07-28)
+# Profile scope: DER Aggregator Client (owner decision, 2026-07-28) — SUPERSEDED
 
-The CSIP conformance catalog's applicability column now tracks §4's **DER
-Aggregator Client** profile. It used to track the **DER Client** profile.
+> **SUPERSEDED the same day** by
+> [`PROFILE_SCOPE_2026-07-28_der-client-gfems.md`](PROFILE_SCOPE_2026-07-28_der-client-gfems.md).
+> The owner revised the choice: the DUT is certified against the §4 **DER
+> Client** column in the Generating Facility EMS (GFEMS) posture — the DERs
+> behind one point of interconnection, presented to the utility as a single
+> 2030.5 client — and **§1 and §2 of this document no longer describe the
+> claim**. The justification is `lexa-gw docs/conformance/PICS_CSIP.md` §1.1.
+>
+> Decisions are superseded, not erased, and this one is kept for two further
+> reasons. **§3 is still current**: it is the row-by-row inventory of what each
+> of the twenty-two rows drives on the bench, and those rows still run — they
+> left the certification claim, not the campaign. **§4 is still current**: it
+> maps every erratum that changes an observable to the code that honours it.
+> §5's bench work was subsequently built (`sim/server -fleet`,
+> `-subscription`), and §6's note on unresolvable citations is unchanged.
+>
+> One thing to carry away rather than infer: the twenty-two rows below are now
+> `applicable: false` in the catalog **and still bound to their real checks**.
+> Their verdicts are informative evidence about a capability the product does
+> not claim. None of them gates conformance.
 
-This document is the citation trail. Every `applicability_reason` in
-`testdata/catalog/catalog.json` for a `CSIP-CONF-v1.3` row points here, and the
-point of pointing here is that a reviewer can disagree with the decision without
-having to reverse-engineer it from a JSON diff.
+The CSIP conformance catalog's applicability column tracked §4's **DER
+Aggregator Client** profile from this decision until it was superseded. It
+tracked, and tracks again, the **DER Client** profile.
+
+This document was the citation trail. The `applicability_reason` strings in
+`testdata/catalog/catalog.json` now point at the successor; the point of
+pointing at a document at all is that a reviewer can disagree with a decision
+without having to reverse-engineer it from a JSON diff, and that argument
+applies to a superseded decision as much as to a live one.
 
 ---
 
-## 1. The decision
+## 1. The decision *(superseded — see the successor document)*
 
 **The DUT is certified as a DER Aggregator Client.** The gateway fans controls
 out to multiple inverters and matches the CTP's aggregator-client EUT
@@ -21,7 +44,7 @@ amount of reading the standard tells you which profile a vendor chooses to
 certify. What the standard tells you is what follows from the choice, and §4 is
 where that is written down.
 
-## 2. What §4 says
+## 2. What §4 says *(the table is current; the conclusion drawn from it is not)*
 
 CSIP Conformance Test Procedures V1.3, §4 *Profile Test Conformance* (pp. 19-20)
 is a three-column table: Server, DER Client, DER Aggregator Client. "Tests marked
@@ -72,14 +95,25 @@ The catalog's `profile_conformance` objects were re-read against the §4 table i
 `SunSpecCSIPConformanceTestProceduresV1.3-1.txt` (pp. 19-20) at the time of the
 change, and the two agreed exactly — no row of the table was missing from the
 catalog and no row of the catalog was absent from the table. `certify`'s own
-guard on this lives in `TestProfileScopeIsTheAggregatorColumn`
+guard on this now lives in `TestProfileScopeIsTheDERClientColumn`
 (`internal/certify/suitecsip/register_test.go`), which fails if applicability
-ever drifts from the aggregator column again.
+ever drifts from the **DER Client** column in either direction. It replaced
+`TestProfileScopeIsTheAggregatorColumn` when this decision was superseded.
 
-## 3. What each new row can demonstrate on today's bench
+## 3. What each row can demonstrate on today's bench *(current)*
 
-Every one of the twenty-two rows was written against a fixture this bench does
-not build:
+> Read this section as the informative-evidence inventory it now is: these
+> twenty-two rows are outside the certification claim and still run every
+> campaign. The "what SKIPs" column below was written when the bench had neither
+> fixture. **Both were subsequently built** — `sim/server -fleet` serves the
+> Figure-15 topology and `-subscription` the Subscription/Notification function
+> set, both off by default (see §5, which is now done rather than planned) — so
+> with the levers on, the per-EndDevice and notification criteria grade for real
+> instead of skipping. What still skips is named per criterion by the check
+> itself, at run time, which is the only place that can be right.
+
+Every one of the twenty-two rows was written against a fixture the bench did not
+build when this table was written:
 
 * **The Figure-15 topology** — an aggregator EndDevice plus EDA1/EDA2 under
   SPA1/SPA2 and EDB1/EDB2 under SPB1/SPB2. `sim/gridsim` serves a fixed tree
@@ -141,7 +175,17 @@ honour them. Both halves are pinned by tests.
 | seq 1 | AGG-001: the follow-up GET is a `[CT]` test-client step, not a DUT demand | `aggSubscription` |
 | seq 33 | CORE-023 added as optional | catalog `applicability_reason` |
 
-## 5. Bench work this decision creates
+## 5. Bench work this decision created *(both delivered)*
+
+> Both capabilities below were built on 2026-07-28 and are served by
+> `sim/server` behind `-fleet` and `-subscription`, off by default so an
+> informative lever cannot re-measure certified evidence (`sim/gridsim/fleet.go`,
+> `sim/gridsim/subscribe.go`; the default tree is pinned byte-identical by
+> `sim/gridsim/golden_default_test.go`). One limit remains and is disclosed:
+> gridsim is pure Go, `crypto/tls` has no `ECDHE-ECDSA-AES128-CCM-8`, and its
+> built-in notifier therefore **refuses** an `https://` `notificationURI` rather
+> than dialling a non-conformant one. Conformant delivery needs an externally
+> installed `Notifier`.
 
 Two capabilities close most of the SKIPs above. Neither is in `csip-tls-test`
 alone — the first needs a southbound fleet as well as a northbound one.

@@ -291,8 +291,10 @@ func TestCheckPipelineProducesAssertions(t *testing.T) {
 	}
 }
 
-// TestNotApplicableIsOffWireWithAReason proves the twenty-eight excluded rows
-// produce an auditable record rather than a silent absence.
+// TestNotApplicableIsOffWireWithAReason proves the rows bound to the stub
+// produce an auditable record rather than a silent absence. (It builds its own
+// case rather than reading one from the catalog, because the property under
+// test is the stub's, not any particular row's.)
 func TestNotApplicableIsOffWireWithAReason(t *testing.T) {
 	rc := &certify.RunCtx{Case: &certify.Case{
 		UID: "csip-conf-v1.3::AGG-001", ID: "AGG-001", DUTRole: certify.RoleNotApplicable,

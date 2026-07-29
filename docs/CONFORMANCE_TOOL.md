@@ -25,7 +25,7 @@ hashing a file in front of them.
 
 | Document | Selected | Applicable | Implemented | …of which the extraction marks inapplicable | Unimplemented | Not applicable, no check |
 |---|---:|---:|---:|---:|---:|---:|
-| CSIP-CONF-v1.3 | 79 | 73 | 79 | 6 | **0** | 0 |
+| CSIP-CONF-v1.3 | 79 | 51 | 79 | 28 | **0** | 0 |
 | SS-1547-TEST-v1.1 | 2 | 2 | 2 | 0 | **0** | 0 |
 | SS-CSIP-RESULTS-v1.1 | 47 | 45 | 45 | 0 | **0** | 2 |
 | SS-MODBUS-CLIENT-CONF-v1.1 | 16 | 15 | 16 | 1 | **0** | 0 |
@@ -33,23 +33,34 @@ hashing a file in front of them.
 | SS-MODBUS-RESULTS-v1.2 | 54 | 52 | 52 | 0 | **0** | 2 |
 | SS-TEST-PKI | 21 | 6 | 10 | 4 | **0** | 11 |
 | SSM-CONF-v0.8 | 39 | 37 | 37 | 0 | **0** | 2 |
-| **TOTAL** | **282** | **245** | **256** | **11** | **0** | **26** |
+| **TOTAL** | **282** | **223** | **256** | **33** | **0** | **26** |
 
 Of the 256 implemented cases, the extraction rates 143 fully automatable, 35
 partially, and 78 manual — a manual case still gets a check, because recording
 an operator's observation inside a timestamped frame window is worth more than
 recording nothing.
 
-**CSIP-CONF-v1.3's applicable count moved from 51 to 73 on 2026-07-28**, when
-the owner re-scoped the certification from the **DER Client** profile to the
-**DER Aggregator Client** profile: the gateway fans controls out to multiple
-inverters and matches the CTP's aggregator-client EUT definition. §4 Profile
-Test Conformance requires twenty-two rows of an aggregator client that it does
-not require of a direct DER client — AGG-001..012, CORE-018, CORE-019, ERR-002,
-MAINT-001/003/004/005 and UTIL-002/003/004 — and all twenty-two are now
-implemented. See `docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md` for
-the decision, the §4 table it rests on, and what each new row can and cannot
-demonstrate on today's bench.
+**CSIP-CONF-v1.3's applicable count moved 51 → 73 → 51 on 2026-07-28.** The
+owner re-scoped the certification from the **DER Client** profile to the **DER
+Aggregator Client** profile that morning and revised it back the same day. The
+column it settled on is **DER Client, in the Generating Facility EMS (GFEMS)
+posture**: the gateway sits at one point of interconnection and presents to the
+utility as a single 2030.5 client — one EndDevice, one LFDI — with the control
+fan-out to the inverters happening *below* the 2030.5 boundary. §4 Profile Test
+Conformance requires twenty-two rows of an aggregator client that it does not
+require of a DER Client (AGG-001..012, CORE-018, CORE-019, ERR-002,
+MAINT-001/003/004/005, UTIL-002/003/004), and the two client columns nest
+strictly — no row is required of a DER Client that an aggregator does not also
+owe — so the narrower claim drops rows without dropping a single check.
+
+**All twenty-two of those rows remain implemented and keep running**, which is
+why CSIP-CONF-v1.3's Implemented column stays at 79 while its Applicable column
+drops to 51. Their verdicts are *informative*: evidence about a capability this
+product does not claim, gating nothing. See
+`docs/PROFILE_SCOPE_2026-07-28_der-client-gfems.md` for the decision and what
+the catalog records about it, and the superseded
+`docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md` §3-§4 for the row-by-row
+inventory of what each one drives and the errata it honours.
 
 Regenerate the table at any time, and gate on it:
 
@@ -79,18 +90,17 @@ fails a pipeline; it is not a formatting preference.
   RTU-1..5 (no northbound serial interface), CRV-1..3 (no model with curves);
   `SS-TEST-PKI`'s PKI-2, PKI-9..10, PKI-12..18, PKI-21 (requirements on the
   SunSpec Alliance certificate *package* a lab ships, not on the device).
-* **…of which the extraction marks inapplicable** — 11 cases carry a check even
-  though the extraction rated them inapplicable, because exercising the row is
+* **…of which the extraction marks inapplicable** — 33 cases carry a check even
+  though the catalog rates them inapplicable, because exercising the row is
   worth more than assuming it. They count as Implemented, not as N/A. The three
   columns therefore do not sum to the total, and `-list` says so on the totals
-  line rather than leaving a reviewer to reconcile it. This number was 33 before
-  the 2026-07-28 aggregator re-scope, and the drop is the whole story of that
-  change: twenty-two rows stopped being "inapplicable but exercised anyway" and
-  became required. The six that remain in CSIP-CONF-v1.3 are excluded for
-  reasons no re-scope can touch — CORE-001/002/004 and UTIL-001 test a 2030.5
-  *server*, MAINT-002 is made optional by Annex A seq 32, and COMM-001 is
+  line rather than leaving a reviewer to reconcile it. Twenty-eight of the 33
+  are in CSIP-CONF-v1.3: **twenty-two** are the aggregator-only rows the DER
+  Client claim excludes and the harness runs anyway, and **six** are excluded
+  for reasons no profile choice can touch — CORE-001/002/004 and UTIL-001 test a
+  2030.5 *server*, MAINT-002 is made optional by Annex A seq 32, and COMM-001 is
   optional for all device types by its own Purpose. All six are blank in every
-  §4 column.
+  §4 column, and those six alone are bound to the not-applicable stub.
 
 ### SKIP is a runtime verdict, not a coverage number
 

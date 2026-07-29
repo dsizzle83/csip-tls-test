@@ -2,13 +2,25 @@ package suitecsip
 
 // register.go binds every CSIP-CONF-v1.3 catalog uid to a check.
 //
-// EVERY uid — all seventy-nine — including the six the §4 profile matrix
-// excludes for this DUT. Registering the inapplicable ones is a deliberate
-// choice: a coverage report that simply lacked those rows would read as "nobody
-// got to them", while a registered row reporting NOT APPLICABLE and quoting the
-// catalog's own applicability_reason reads as a decision a reviewer can audit
-// against the profile matrix — and disagree with, which is the point of writing
-// it down.
+// EVERY uid — all seventy-nine — including the twenty-eight the catalog marks
+// inapplicable, and they are inapplicable for two DIFFERENT reasons that must
+// not be run together.
+//
+// SIX are bound to the notApplicable stub: they are blank in every §4 column
+// and there is nothing to drive. Registering them anyway is a deliberate
+// choice — a coverage report that simply lacked those rows would read as
+// "nobody got to them", while a registered row reporting NOT APPLICABLE and
+// quoting the catalog's own applicability_reason reads as a decision a reviewer
+// can audit against the profile matrix, and disagree with, which is the point
+// of writing it down.
+//
+// TWENTY-TWO are bound to REAL checks and run every campaign. They are the rows
+// §4 requires of a DER Aggregator Client and not of a DER Client, and the owner
+// decision of 2026-07-28 certifies this DUT as a DER Client in the GFEMS
+// posture — so they are outside the CLAIM while staying inside the RUN. Their
+// verdicts, including the negative ones, are informative evidence about a
+// capability the product does not claim; no verdict of theirs gates
+// conformance. See docs/PROFILE_SCOPE_2026-07-28_der-client-gfems.md.
 //
 // The Order values group the run so a live campaign produces a sensible
 // sequence: transport first (if the TLS profile is wrong, nothing after it
@@ -139,8 +151,16 @@ func Register(reg *certify.Registry) {
 }
 
 // registerAggregator binds the twenty-two rows the DER AGGREGATOR CLIENT
-// profile requires and the DER Client profile did not (owner decision
-// 2026-07-28 — see aggregator.go).
+// profile requires and the DER Client profile does not (see aggregator.go).
+//
+// The DUT is certified against the DER CLIENT column (owner decision
+// 2026-07-28, docs/PROFILE_SCOPE_2026-07-28_der-client-gfems.md), so none of
+// these twenty-two is required of it and the catalog marks all twenty-two
+// inapplicable. They stay bound to their real checks anyway. The criteria are
+// evaluators, not placeholders, and the bench builds the fixtures they were
+// written against; a check that runs is worth more than a check that was
+// deleted, and a reader who wants to know how this gateway behaves under a
+// four-EndDevice fan-out has nowhere else to look.
 //
 // They run AFTER every direct-client row and BEFORE ERR-001, for two reasons.
 // The commissioning and subscription rows read the same resting tree the core
@@ -372,26 +392,24 @@ func registerEventScenarios(reg *certify.Registry) {
 	}
 }
 
-// inapplicableUIDs are the CSIP-CONF-v1.3 rows the §4 profile matrix excludes
-// for THIS DUT, which since the owner decision of 2026-07-28 is a DER
-// AGGREGATOR CLIENT (docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md).
+// inapplicableUIDs are the CSIP-CONF-v1.3 rows bound to the notApplicable STUB.
 // They are listed explicitly rather than derived from the catalog at init time
 // so that a future catalog revision that makes one of them applicable shows up
 // as a coverage GAP — a loud, visible one — instead of being silently swallowed
 // by a rule that reads applicability from the same file it is meant to be
 // checked against.
 //
-// The list used to hold twenty-eight rows. Twenty-two of them were excluded for
-// exactly one reason — the DUT was scoped as a DIRECT DER client — and the
-// re-scope made them real overnight, which is what the previous revision of
-// this comment warned would happen. They are now implemented in aggregator.go,
-// with the Annex A corrections applied where they change an observable rather
-// than carried as a breadcrumb.
+// This is NOT the list of inapplicable rows. Twenty-eight rows are inapplicable
+// and only these six are stubbed; the other twenty-two are the aggregator-only
+// rows, which the DER Client claim of 2026-07-28 puts outside the certification
+// while leaving their real checks registered and running (registerAggregator).
+// Adding them here would delete twenty-two working evaluators to satisfy a
+// bookkeeping symmetry, which is the trade this file refuses.
 //
-// SIX remain, and none of them is here because of the DUT's profile scope
-// alone. Four are §4 rows blank in ALL THREE columns — required of Server, DER
-// Client and DER Aggregator Client alike, i.e. of nobody — and two are rows
-// about a 2030.5 SERVER, which this DUT does not implement in any profile.
+// None of the six is here because of the DUT's profile scope. All six are §4
+// rows blank in ALL THREE columns — required of Server, DER Client and DER
+// Aggregator Client alike, i.e. of nobody — and four of them are rows about a
+// 2030.5 SERVER, which this DUT does not implement in any profile.
 var inapplicableUIDs = []string{
 	// 2030.5-SERVER rows: these test the utility server's own HTTP behaviour —
 	// method handling (CORE-001), the non-TLS→TLS redirect of /dcap (CORE-002,

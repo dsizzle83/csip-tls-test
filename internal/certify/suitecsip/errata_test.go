@@ -223,11 +223,13 @@ func TestComm004RejectionSignalsErratum(t *testing.T) {
 // implements it after a re-scope.
 //
 // The list shrank on 2026-07-28. It used to hold AGG-007, AGG-008, ERR-002,
-// CORE-018 and CORE-019; all five went live with the aggregator re-scope and
-// their corrections are now pinned against the implementation instead, in
-// TestLiveErrataAreImplemented. What remains is the rows the re-scope did NOT
-// reach, which are the rows that most need the breadcrumb: nobody is reading
-// their code, because there is none.
+// CORE-018 and CORE-019; all five got implementations that day and their
+// corrections are pinned against the CODE instead, in
+// TestLiveErrataAreImplemented. The DER Client decision later the same day put
+// those five back outside the certification claim without taking their code
+// away, so they stay pinned there and not here. What this test covers is the
+// rows bound to the notApplicable STUB, which are the rows that most need the
+// breadcrumb: nobody is reading their code, because there is none.
 func TestNotApplicableRowsCarryTheirErrataForward(t *testing.T) {
 	cat := loadCatalog(t)
 	for _, want := range []struct {
