@@ -30,6 +30,11 @@ package suitecsip
 // and the only one whose failure mode could perturb what follows.
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"strconv"
+	"time"
+
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/internal/certify/suitepki"
 )
@@ -53,7 +58,14 @@ func init() { Register(certify.Default()) }
 
 // Register binds this suite's checks into a registry. It is exported so a test
 // can bind into a private registry rather than the process-wide one.
+//
+// Each Register call mints ONE run nonce (runNonce) and threads it through the
+// event-precedence scenarios, so the BASIC-017..026 control mRIDs are unique
+// per campaign — the test-isolation fix. A campaign is one process, so a nonce
+// minted here at construction is stable for the whole run and different across
+// runs; see registerEventScenarios and eventScenario.withNonce.
 func Register(reg *certify.Registry) {
+	nonce := runNonce()
 	// ── Transport and security (order 0–19) ──────────────────────────────
 	reg.Register(uid("COMM-002"), Suite, commBasicDiscovery,
 		certify.WithRequires(needCapture...), certify.WithOrder(1))
@@ -129,7 +141,7 @@ func Register(reg *certify.Registry) {
 	registerInverterControls(reg)
 
 	// ── Event precedence scenarios (order 80–99) ─────────────────────────
-	registerEventScenarios(reg)
+	registerEventScenarios(reg, nonce)
 
 	// ── Response lifecycle (order 100–109) ───────────────────────────────
 	reg.Register(uid("CORE-021"), Suite, coreRandomizedEvents,
@@ -294,16 +306,37 @@ func requiresFor(m controlMode) []string {
 // two DERControls in a stated overlap relationship. gridsim's three programs are
 // used as System (index 2, primacy 10), Site (index 1, primacy 5) and Service
 // Point (index 0, primacy 1), which is the priority ordering these rows turn on.
-func registerEventScenarios(reg *certify.Registry) {
+func registerEventScenarios(reg *certify.Registry, nonce string) {
+	for _, r := range eventScenarioRows(nonce) {
+		req := needGridSim
+		if len(r.sc.Controls) == 0 {
+			req = needCapture
+		}
+		reg.Register(uid(r.id), Suite, basicEventScenario(r.sc),
+			certify.WithRequires(req...), certify.WithOrder(r.order))
+	}
+}
+
+// eventRow is one BASIC-016..026 precedence scenario: its catalog id, run order
+// within the suite, and the fixture the check drives.
+type eventRow struct {
+	id    string
+	order int
+	sc    eventScenario
+}
+
+// eventScenarioRows returns the eleven precedence rows with the per-run nonce
+// applied to every scenario (see eventScenario.withNonce). It is separated from
+// registerEventScenarios so a test can assert both halves of the isolation fix
+// directly: that two different nonces produce disjoint mRIDs across runs, and
+// that within one nonce each ExpectWinner still names one of that scenario's own
+// controls, so the within-run lifecycle correlation is preserved.
+func eventScenarioRows(nonce string) []eventRow {
 	const (
 		servicePoint = 0
 		system       = 2
 	)
-	rows := []struct {
-		id    string
-		order int
-		sc    eventScenario
-	}{
+	rows := []eventRow{
 		{"BASIC-016", 80, eventScenario{
 			Summary: "2 DERPrograms, 2 DefaultDERControls, 0 DERControls: the DER must follow the " +
 				"DefaultDERControl of the higher-priority (lower-primacy) program"}},
@@ -382,14 +415,30 @@ func registerEventScenarios(reg *certify.Registry) {
 				{MRID: "CERT-B026SP", Program: servicePoint, StartOffset: 60, DurationS: 120, MaxLimW: 2000},
 			}}},
 	}
-	for _, r := range rows {
-		req := needGridSim
-		if len(r.sc.Controls) == 0 {
-			req = needCapture
-		}
-		reg.Register(uid(r.id), Suite, basicEventScenario(r.sc),
-			certify.WithRequires(req...), certify.WithOrder(r.order))
+	for i := range rows {
+		rows[i].sc = rows[i].sc.withNonce(nonce)
 	}
+	return rows
+}
+
+// runNonce mints the per-run token appended to the event-scenario mRIDs. A
+// campaign is one process, so a nonce minted once at suite construction is
+// stable for the whole run and — being random — differs across runs, which is
+// all the isolation fix needs: the gateway's Response tracker never sees a
+// re-run republish an mRID it has already carried to a terminal state. It
+// mirrors what gridsim already does for curve-driven controls, whose mRIDs it
+// stamps per run; here the harness owns the mRID, so the harness stamps it.
+//
+// Eight hex digits from crypto/rand are plenty to separate the handful of runs
+// a bench ever performs against one long-running gateway; if the reader is
+// somehow unavailable it falls back to the process start time in base-36, which
+// is still distinct across the separate invocations a batch makes.
+func runNonce() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	return strconv.FormatInt(time.Now().UnixNano(), 36)
 }
 
 // inapplicableUIDs are the CSIP-CONF-v1.3 rows bound to the notApplicable STUB.

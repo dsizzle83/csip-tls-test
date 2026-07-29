@@ -425,3 +425,80 @@ func lastExecuted(ids []string) string {
 	}
 	return last
 }
+
+// mridsOf collects every control mRID a scenario publishes.
+func mridsOf(sc eventScenario) []string {
+	out := make([]string, 0, len(sc.Controls))
+	for _, c := range sc.Controls {
+		out = append(out, c.MRID)
+	}
+	return out
+}
+
+// TestEventScenarioMRIDsAreUniquePerRun is the test-isolation fix (task #30,
+// evidence runs/overnight-20260729T045336/): the BASIC-017..026 lifecycle rows
+// PASS against a fresh gateway and FAIL on every re-run because they republished
+// STATIC control mRIDs the gateway's Response tracker had already carried to a
+// terminal state. Two suite constructions with different run nonces must now
+// publish DISJOINT mRIDs, so a re-run is never suppressed as a stale event.
+func TestEventScenarioMRIDsAreUniquePerRun(t *testing.T) {
+	a := eventScenarioRows("aaaaaaaa")
+	b := eventScenarioRows("bbbbbbbb")
+	if len(a) != len(b) {
+		t.Fatalf("row count differs between constructions: %d vs %d", len(a), len(b))
+	}
+
+	seen := map[string]string{} // mRID -> the run id that produced it
+	for i := range a {
+		if a[i].id != b[i].id {
+			t.Fatalf("row %d id differs: %s vs %s", i, a[i].id, b[i].id)
+		}
+		am, bm := mridsOf(a[i].sc), mridsOf(b[i].sc)
+		if len(am) != len(b[i].sc.Controls) {
+			t.Fatalf("%s: control count changed under nonce", a[i].id)
+		}
+		for j := range am {
+			if am[j] == bm[j] {
+				t.Errorf("%s control %d shares mRID %q across two runs — the isolation bug is back",
+					a[i].id, j, am[j])
+			}
+			// A run must also not collide with itself across rows.
+			if prev, ok := seen[am[j]]; ok {
+				t.Errorf("mRID %q appears twice (%s and %s)", am[j], prev, a[i].id)
+			}
+			seen[am[j]] = a[i].id
+			// The nonce is appended; the CERT-B0xx prefix stays for legibility.
+			if !strings.HasPrefix(am[j], "CERT-B") || !strings.HasSuffix(am[j], "-aaaaaaaa") {
+				t.Errorf("%s mRID %q lost its readable prefix or its nonce", a[i].id, am[j])
+			}
+		}
+	}
+}
+
+// TestEventScenarioNonceKeepsWithinRunCorrelation proves the fix does not break
+// the lifecycle correlation the assertions rest on: within a single run, an
+// ExpectWinner must still name one of that scenario's OWN controls (critResponsePosted
+// correlates Received->Started->Completed by that mRID). Both the un-nonced base
+// rows and a nonced construction must hold the invariant, and the winner must
+// carry the same nonce as the control it names.
+func TestEventScenarioNonceKeepsWithinRunCorrelation(t *testing.T) {
+	for _, nonce := range []string{"", "deadbeef"} {
+		for _, r := range eventScenarioRows(nonce) {
+			if r.sc.ExpectWinner == "" {
+				continue // DefaultDERControl-only rows (e.g. BASIC-016) name no winner
+			}
+			mrids := mridsOf(r.sc)
+			found := false
+			for _, m := range mrids {
+				if m == r.sc.ExpectWinner {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("nonce %q: %s ExpectWinner %q is not among its controls %v — the winner would "+
+					"never correlate to a delivered control", nonce, r.id, r.sc.ExpectWinner, mrids)
+			}
+		}
+	}
+}

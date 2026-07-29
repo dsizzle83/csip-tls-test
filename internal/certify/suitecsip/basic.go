@@ -232,6 +232,41 @@ type scenarioControl struct {
 	CreationAge int
 }
 
+// withNonce returns a copy of the scenario whose control mRIDs — and the
+// ExpectWinner that names one of them — all carry the per-run nonce.
+//
+// This is the test-isolation fix for BASIC-017..026. IEEE 2030.5 mRIDs are
+// globally unique and stable, so the gateway's Response tracker correctly
+// refuses to re-acknowledge (re-post Received/Started for) an event mRID it has
+// already run to terminal. A campaign that republishes the same STATIC mRIDs
+// therefore passes only against a fresh gateway and is suppressed on every
+// re-run of the long-running one — critResponsePosted then sees no Response and
+// FAILs. Appending a fresh token per run makes each campaign publish mRIDs the
+// tracker has not yet seen, exactly as the curve-driven controls already get a
+// per-run gridsim-assigned mRID.
+//
+// The SAME nonce is applied to every mRID in the scenario, so the within-run
+// correlation the lifecycle assertions rely on still holds: ExpectWinner keeps
+// naming the winning control (critResponsePosted), and critScenarioControlsDelivered
+// keeps matching the mRIDs it published against the ones the DUT fetched. An
+// empty nonce is the identity, so a bench that does not care about isolation
+// (and every existing test that reasons about the static mRIDs) is unchanged.
+func (sc eventScenario) withNonce(nonce string) eventScenario {
+	if nonce == "" {
+		return sc
+	}
+	out := sc
+	if sc.ExpectWinner != "" {
+		out.ExpectWinner = sc.ExpectWinner + "-" + nonce
+	}
+	out.Controls = make([]scenarioControl, len(sc.Controls))
+	for i, c := range sc.Controls {
+		c.MRID += "-" + nonce
+		out.Controls[i] = c
+	}
+	return out
+}
+
 func basicEventScenario(sc eventScenario) certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		return run(ctx, rc, spec{
