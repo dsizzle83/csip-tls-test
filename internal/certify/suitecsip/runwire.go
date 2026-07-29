@@ -188,6 +188,35 @@ func firstNStrings(v []string, n int) []string {
 	return v[:n]
 }
 
+// whyNotOurs says, precisely, how a run-scoped find relates to this check's
+// frames. It is the difference between "the DUT did it in another case's
+// window" and "the DUT did it on a conversation this window only half owns",
+// and a reader chasing the frame numbers needs to know which. Guessing —
+// printing "outside this test case's window" for both — would be asserting
+// something the criterion never checked.
+func whyNotOurs(ev *certify.Evidence, e Exchange) string {
+	mine, total := 0, 0
+	for _, f := range e.Frames() {
+		total++
+		if ev.Owns(f) {
+			mine++
+		}
+	}
+	switch {
+	case total == 0:
+		return "it carries no attributed frames"
+	case mine == 0:
+		return "none of its frames fall in this check's window"
+	case mine == total:
+		return "its frames are this check's, but the conversation straddles the window boundary and " +
+			"RecoverSession excludes a straddling conversation from the recovered session, because a " +
+			"citation into one is rejected as another case's evidence"
+	default:
+		return fmt.Sprintf("%d of its %d frames fall in this check's window and the rest elsewhere",
+			mine, total)
+	}
+}
+
 // framesOf renders an exchange's frames for a narrative that names bytes it may
 // not cite, so a reader can still open the capture at the right place.
 func framesOf(e Exchange) string {

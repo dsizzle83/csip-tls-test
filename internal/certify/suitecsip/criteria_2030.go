@@ -537,11 +537,13 @@ func critDERPut(resource string) criterion {
 			if foundPut {
 				v, desc := grade(hit)
 				return Finding{Verdict: v, Observed: fmt.Sprintf(
-					"%s — in frame(s) %s, which are OUTSIDE this test case's window and therefore belong to "+
-						"another case. The DUT reports this resource on its own cadence rather than on this "+
-						"case's cue, so the report is a wire fact of the run; it is named here rather than "+
-						"cited because a check may cite only its own frames. Scope: %s",
-					desc, framesOf(hit), rw.Scope())}
+					"%s — on conversation %s, in frame(s) %s. That conversation is not one this test case "+
+						"owns outright (%s), which is why the report is NAMED here and not cited: a check may "+
+						"cite only its own frames, and a citation of someone else's is the one thing this "+
+						"tool refuses. The DUT reports this resource on its own cadence rather than on this "+
+						"case's cue, so the report is a fact of the run's wire rather than of this window. "+
+						"Read from %s",
+					desc, hit.In().Stream.Key, framesOf(hit), whyNotOurs(ev, hit), rw.Scope())}
 			}
 
 			// Rung 3: a negative, which is only a fact about the DUT if the

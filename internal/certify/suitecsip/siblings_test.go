@@ -31,17 +31,26 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/evidence/keylog"
 )
 
 // recordIndependentPair records TWO full, unrelated mTLS conversations to one
 // server: no shared session cache, so neither resumes the other and both carry
 // their own complete walk.
-func recordIndependentPair(t *testing.T, p *testPKI, handler http.Handler, first, second []*http.Request) recorded {
+// gap is the pause between the two dials. It is a parameter because one test
+// needs the conversations far enough apart in time that a window can end
+// between them — the attributor's 250 ms guard bridges anything closer — and
+// the rest should not pay for the wait.
+func recordIndependentPair(t *testing.T, p *testPKI, handler http.Handler, gap time.Duration,
+	first, second []*http.Request) recorded {
 	t.Helper()
 	var mu sync.Mutex
 	var chunks []chunk
@@ -135,6 +144,9 @@ func recordIndependentPair(t *testing.T, p *testPKI, handler http.Handler, first
 	}
 
 	firstAP := dial(first)
+	if gap > 0 {
+		time.Sleep(gap)
+	}
 	dial(second)
 	_ = ln.Close()
 	wg.Wait()
@@ -148,9 +160,9 @@ func recordIndependentPair(t *testing.T, p *testPKI, handler http.Handler, first
 	}
 }
 
-// twoWalks is the fixture: a long discovery walk on one connection and a short
-// one on another, the short one also carrying the DER self-report PUTs.
-func twoWalks(t *testing.T) (*certify.Evidence, netip.AddrPort) {
+// twoWalksRecording is the fixture: a long discovery walk on one connection and
+// a short one on another, the short one also carrying the DER self-report PUTs.
+func twoWalksRecording(t *testing.T, gap time.Duration) recorded {
 	t.Helper()
 	p := newTestPKI(t)
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -187,7 +199,12 @@ func twoWalks(t *testing.T) (*certify.Evidence, netip.AddrPort) {
 		mustPUT(t, "/edev/0/der/0/dercap", `<DERCapability xmlns="urn:ieee:std:2030.5:ns">`+
 			`<rtgMaxW><value>5000</value><multiplier>0</multiplier></rtgMaxW></DERCapability>`),
 	}
-	rec := recordIndependentPair(t, p, h, walk, reports)
+	return recordIndependentPair(t, p, h, gap, walk, reports)
+}
+
+func twoWalks(t *testing.T) (*certify.Evidence, netip.AddrPort) {
+	t.Helper()
+	rec := twoWalksRecording(t, 0)
 	resetRunWireCache()
 	t.Cleanup(resetRunWireCache)
 	return evidenceFrom(t, rec, true)
@@ -305,6 +322,82 @@ func TestSiblingCitationNamesTheSiblingStream(t *testing.T) {
 	}
 	if a.BytesSHA256 == "" {
 		t.Error("the assertion carries no re-derivable digest, which is the whole point")
+	}
+}
+
+// TestReportOutsideTheWindowIsNamedNotCited covers rung 2 of critDERPut's
+// ladder. The DER self-reports are cadence-driven, so the PUT a case is written
+// to observe routinely lands outside that case's window. It is still a wire
+// fact of the run and must be reported as one — but in frames this case does
+// not own, so it is NAMED, never cited.
+func TestReportOutsideTheWindowIsNamedNotCited(t *testing.T) {
+	// The legs are a second apart so a window can genuinely end between them.
+	rec := twoWalksRecording(t, time.Second)
+	resetRunWireCache()
+	defer resetRunWireCache()
+
+	// A window that closes before the report leg opened: the first conversation
+	// is this check's, the second is not.
+	pkts := pcapFromRecording(rec)
+	fi := certify.NewFrameIndex(pkts)
+	var firstClient netip.AddrPort
+	var cut time.Time
+	for _, c := range rec.chunks {
+		if c.fromClient && firstClient == (netip.AddrPort{}) {
+			firstClient = c.client
+		}
+		if c.fromClient && c.client != firstClient {
+			cut = c.at
+			break
+		}
+	}
+	if cut.IsZero() {
+		t.Fatal("the recording holds only one conversation")
+	}
+	w := certify.NewWindow("csip-conf-v1.3::BASIC-028", Suite)
+	w.Open(pkts[0].Time.Add(-time.Second))
+	// Half a second before the report leg dialled: comfortably past the
+	// attributor's 250 ms guard, and comfortably after the first walk finished.
+	w.Close(cut.Add(-500 * time.Millisecond))
+	if err := w.ClaimEndpointDuring("tcp", rec.serverAP, "test fixture"); err != nil {
+		t.Fatal(err)
+	}
+	att := fi.Attribute([]*certify.Window{w})
+	ev := &certify.Evidence{
+		Case:  &certify.Case{UID: "csip-conf-v1.3::BASIC-028", ID: "BASIC-028", Doc: "CSIP-CONF-v1.3"},
+		Set:   att.Set("csip-conf-v1.3::BASIC-028"),
+		Index: fi, Attribution: att,
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.log")
+	if err := os.WriteFile(path, rec.keyLog, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kl, err := keylog.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev.KeyLog = kl
+
+	tr, err := RecoverSession(ev, rec.serverAP)
+	if err != nil {
+		t.Fatalf("the first walk is wholly inside the window and must recover: %v", err)
+	}
+	if len(tr.Method("PUT")) != 0 {
+		t.Fatal("the fixture put a PUT inside the window; rung 2 is then unreachable")
+	}
+	f := critDERPut("DERStatus").Wire(ev, tr)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("the PUT is on the wire elsewhere in the run: verdict = %s (%s / %s)",
+			f.Verdict, f.Observed, f.Unavailable)
+	}
+	if f.Dir != nil || len(f.Frames) > 0 {
+		t.Error("rung 2 must not cite: the frames belong to another test case")
+	}
+	for _, want := range []string{"NAMED here and not cited", "none of its frames fall in this check's window"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the provenance of a run-scoped find must be exact (%q missing): %q", want, f.Observed)
+		}
 	}
 }
 
