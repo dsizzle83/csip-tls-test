@@ -276,6 +276,9 @@ func critGET(path, claim, how string, want func(*Node) (certify.Verdict, string)
 		Server: func(v *ServerView) Finding {
 			n := v.GETs(path)
 			if n == 0 {
+				if !v.SessionEstablished() {
+					return noSessionUnavailable()
+				}
 				return Finding{Verdict: certify.Fail,
 					Observed: fmt.Sprintf("gridsim's request log records no GET %s from the DUT in this window", path)}
 			}
@@ -350,6 +353,9 @@ func critFollowedLink() criterion {
 				}
 			}
 			if n == 0 {
+				if !v.SessionEstablished() {
+					return noSessionUnavailable()
+				}
 				return Finding{Verdict: certify.Fail,
 					Observed: "gridsim's request log records no GET beyond /dcap in this window"}
 			}

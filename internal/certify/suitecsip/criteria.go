@@ -58,6 +58,20 @@ func found(v certify.Verdict, frames []int, format string, a ...any) Finding {
 	return Finding{Verdict: v, Frames: frames, Observed: fmt.Sprintf(format, a...)}
 }
 
+// noSessionUnavailable is the tier-3 finding for a server-log evaluator whose
+// expected request is absent when the DUT completed NO session at all in the
+// window. The emptiness of gridsim's log is then a fact about the handshake, not
+// about whether the DUT would have issued the request — so it is unavailable
+// (→SKIP), never a FAIL of the DUT. Gate on ServerView.SessionEstablished; a
+// window in which a session DID establish but the request is missing keeps its
+// FAIL. runs/shakedown-20260729T003843 turned one bench-side handshake fault
+// into ~51 such false FAILs.
+func noSessionUnavailable() Finding {
+	return unavailable("the DUT completed no TLS session to the 2030.5 server in this window, so gridsim " +
+		"logged nothing from it; the request-log emptiness is a fact about the handshake, not attributable " +
+		"to the DUT, and is reported as unavailable rather than as a failure of the DUT")
+}
+
 // tier names where a criterion's evidence comes from, and is printed in the
 // assertion's Method so a reader can rank it without reading this file.
 type tier string

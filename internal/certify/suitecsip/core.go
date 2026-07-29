@@ -656,6 +656,9 @@ func coreResponses(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 					Server: func(v *ServerView) Finding {
 						got := v.ResponseStatuses(mrid)
 						if len(got) == 0 {
+							if !v.SessionEstablished() {
+								return noSessionUnavailable()
+							}
 							return Finding{Verdict: certify.Fail,
 								Observed: "gridsim received no Response for the control this check published"}
 						}
@@ -721,6 +724,9 @@ func coreSuperseding(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 					Server: func(v *ServerView) Finding {
 						got := v.ResponseStatuses(loser)
 						if len(got) == 0 {
+							if !v.SessionEstablished() {
+								return noSessionUnavailable()
+							}
 							return Finding{Verdict: certify.Fail,
 								Observed: "gridsim received no Response at all for the superseded control " + loser}
 						}

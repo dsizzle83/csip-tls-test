@@ -324,6 +324,28 @@ func (v ServerView) GETs(path string) int {
 	return n
 }
 
+// SessionEstablished reports whether this view holds ANY evidence that the DUT
+// completed a 2030.5 session with the bench server in the window it covers.
+//
+// gridsim writes a request-log line, a Response, a DER PUT, a LogEvent or a
+// Notification exchange only AFTER the mutually-authenticated TLS handshake it
+// requires has completed and the DUT has spoken 2030.5 over it. Any one of them
+// is therefore proof a session established; the total absence of all of them is
+// the only server-side state consistent with a DUT that never completed a
+// handshake. (A conformant 2030.5 client opens its walk with GET /dcap, so a
+// window in which a session established but the request log is empty does not
+// arise from a well-behaved run; the other logs are folded in so the signal
+// survives the request log's bounded ring evicting a window's lines.)
+//
+// It exists so a tier-3 evaluator can tell "the DUT reached the server but did
+// not do the specific thing this row wants" (a real FAIL about the DUT) apart
+// from "the DUT did nothing here at all" (unavailable — the log's emptiness is
+// not attributable to the DUT). See noSessionUnavailable.
+func (v ServerView) SessionEstablished() bool {
+	return len(v.Requests) > 0 || len(v.Responses) > 0 || len(v.DERPuts) > 0 ||
+		len(v.LogEvents) > 0 || len(v.Notifications) > 0
+}
+
 // ResponsesFrom returns the Responses whose endDeviceLFDI is lfdi, whatever
 // they were about. It is the per-device half of the aggregator rows' pass
 // criteria: ResponsesFor answers "which device", ResponsesFrom answers "which

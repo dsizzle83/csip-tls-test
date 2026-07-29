@@ -421,9 +421,89 @@ func TestResponseCriterionHasTeeth(t *testing.T) {
 	if f := critResponsePosted(3, "Event completed", "M1").Server(sv); f.Verdict != certify.Fail {
 		t.Errorf("server-side status 3 = %s: %s", f.Verdict, f.Observed)
 	}
+	// A session established (the DUT walked /dcap) but POSTed no Response: a real
+	// FAIL about the DUT.
+	noResp := &ServerView{Available: true, Requests: []ServerRequest{{Method: "GET", Path: "/dcap"}}}
+	if f := critResponsePosted(1, "Event received", "M1").Server(noResp); f.Verdict != certify.Fail {
+		t.Errorf("session established with no responses = %s: %s", f.Verdict, f.Observed)
+	}
+	// A wholly empty view is NO session at all — undecidable, not a DUT failure.
 	empty := &ServerView{Available: true}
-	if f := critResponsePosted(1, "Event received", "M1").Server(empty); f.Verdict != certify.Fail {
-		t.Errorf("server-side with no responses = %s", f.Verdict)
+	if f := critResponsePosted(1, "Event received", "M1").Server(empty); f.Unavailable == "" {
+		t.Errorf("no session at all returned a verdict (%s) instead of unavailable", f.Verdict)
+	}
+}
+
+// TestServerLogEmptinessIsNotADUTFailureWithoutASession proves the two arms of
+// the fix runs/shakedown-20260729T003843 forced: a tier-3 server-log evaluator
+// must FAIL only when a session established and the DUT still did not do the
+// thing, and must go unavailable (→SKIP) when NO session established at all —
+// the log's emptiness is then a fact about the handshake, not about the DUT. One
+// bench-side handshake fault otherwise turned into ~51 false FAILs.
+func TestServerLogEmptinessIsNotADUTFailureWithoutASession(t *testing.T) {
+	// A ServerView across several evaluators, once with a session (a GET /dcap in
+	// the log proves the handshake completed) and once wholly empty.
+	// Each row's "established" view proves a session with an activity that does
+	// NOT satisfy that particular row, so the expected request is genuinely
+	// absent — a real FAIL about the DUT.
+	crits := []struct {
+		name        string
+		c           criterion
+		established *ServerView
+	}{
+		{"GET /dcap", critDiscoveryRoot(),
+			&ServerView{Available: true, Requests: []ServerRequest{{Method: "GET", Path: "/tm"}}}},
+		{"followed link", critFollowedLink(),
+			&ServerView{Available: true, Requests: []ServerRequest{{Method: "GET", Path: "/dcap"}}}},
+		{"Response POST", critResponsePosted(1, "Event received", "M1"),
+			&ServerView{Available: true, Requests: []ServerRequest{{Method: "GET", Path: "/dcap"}}}},
+		{"DER PUT", critDERPut("DERStatus"),
+			&ServerView{Available: true, Requests: []ServerRequest{{Method: "GET", Path: "/dcap"}}}},
+	}
+
+	// Arm one: a session DID establish but the specific request each row wants is
+	// absent. That is a real FAIL about the DUT, which must NOT be softened.
+	for _, tc := range crits {
+		f := tc.c.Server(tc.established)
+		if f.Unavailable != "" {
+			t.Errorf("%s: a session established but the row was softened to unavailable: %q",
+				tc.name, f.Unavailable)
+		}
+		if f.Verdict != certify.Fail {
+			t.Errorf("%s: session established + expected request absent = %s, want FAIL",
+				tc.name, f.Verdict)
+		}
+	}
+
+	// Arm two: NO session at all — the request log and every other server log are
+	// empty. The emptiness is not attributable to the DUT, so each row must be
+	// unavailable rather than FAIL.
+	noSession := &ServerView{Available: true}
+	for _, tc := range crits {
+		f := tc.c.Server(noSession)
+		if f.Unavailable == "" {
+			t.Errorf("%s: no session established but the row still returned a verdict (%s): %q",
+				tc.name, f.Verdict, f.Observed)
+		}
+		if !strings.Contains(f.Unavailable, "no TLS session") {
+			t.Errorf("%s: the unavailable reason does not name the missing session: %q", tc.name, f.Unavailable)
+		}
+	}
+
+	// The gate itself: any one server-side log line proves a session.
+	if (ServerView{}).SessionEstablished() {
+		t.Error("an empty view reported a session")
+	}
+	for _, v := range []ServerView{
+		{Requests: []ServerRequest{{Method: "GET", Path: "/tm"}}},
+		{Responses: []AdminResponse{{Subject: "M1"}}},
+		{DERPuts: []AdminDERPut{{Resource: "DERStatus"}}},
+		{LogEvents: []map[string]any{{"code": 1}}},
+		{Notifications: []AdminNotification{{HTTPStatus: 200}}},
+	} {
+		if !v.SessionEstablished() {
+			t.Errorf("a view with server-side activity did not report a session: %+v", v)
+		}
 	}
 }
 

@@ -582,6 +582,9 @@ func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result,
 							}
 						}
 						if posts == 0 {
+							if !v.SessionEstablished() {
+								return noSessionUnavailable()
+							}
 							return Finding{Verdict: certify.Fail,
 								Observed: fmt.Sprintf("gridsim's request log records no POST to the "+
 									"MirrorUsagePoint tree during this window (%d GET(s) of /mup)", n)}

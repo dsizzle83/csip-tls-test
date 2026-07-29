@@ -431,6 +431,9 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 		},
 		Server: func(v *ServerView) Finding {
 			if len(v.Responses) == 0 {
+				if !v.SessionEstablished() {
+					return noSessionUnavailable()
+				}
 				return Finding{Verdict: certify.Fail,
 					Observed: "gridsim received no Response POST from the DUT in this window"}
 			}
@@ -497,6 +500,9 @@ func critDERPut(resource string) criterion {
 		Server: func(v *ServerView) Finding {
 			puts := v.PutsFor(resource)
 			if len(puts) == 0 {
+				if !v.SessionEstablished() {
+					return noSessionUnavailable()
+				}
 				var seen []string
 				for _, p := range v.DERPuts {
 					seen = append(seen, p.Resource)
