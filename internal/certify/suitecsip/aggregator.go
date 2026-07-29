@@ -1,14 +1,19 @@
 package suitecsip
 
 // aggregator.go implements the twenty-two rows the DER AGGREGATOR CLIENT profile
-// requires and the DER Client profile did not.
+// requires and the DER Client profile does not: AGG-001..012, CORE-018,
+// CORE-019, ERR-002, MAINT-001/003/004/005 and UTIL-002/003/004.
 //
-// Owner decision 2026-07-28 (docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md):
-// the DUT is certified against §4's DER Aggregator Client column, so AGG-001..012,
-// CORE-018, CORE-019, ERR-002, MAINT-001/003/004/005 and UTIL-002/003/004 stop
-// being N/A rows carrying an errata breadcrumb and become rows that must run.
+// Owner decision 2026-07-28 (docs/PROFILE_SCOPE_2026-07-28_der-client-gfems.md,
+// superseding an aggregator scoping taken earlier the same day): the DUT is
+// certified against §4's DER CLIENT column in the GFEMS posture, so none of
+// these twenty-two is required of it. They run anyway, as INFORMATIVE evidence
+// — the criteria are real evaluators, the bench builds the fixtures they were
+// written against, and a check that runs is worth more than a check that was
+// deleted. No verdict in this file gates conformance, including and especially
+// the negative ones, which is most of them.
 //
-// # What "must run" means here, precisely
+// # What "run" means here, precisely
 //
 // Every one of these rows was written against a fixture this bench does not
 // build: the CTP Figure-15 topology (an aggregator EndDevice plus EDA1/EDA2/EDB1/

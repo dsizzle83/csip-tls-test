@@ -2,9 +2,14 @@ package suitecsip
 
 // criteria_agg.go holds the criteria the DER AGGREGATOR CLIENT profile adds.
 //
-// The 2026-07-28 re-scope (docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md)
-// moved twenty-two rows of CSIP-CONF-v1.3 from "not applicable" to "required",
-// and they turn on two things the direct-DER-client rows never needed:
+// The DUT is certified against the DER CLIENT column
+// (docs/PROFILE_SCOPE_2026-07-28_der-client-gfems.md), so the twenty-two rows of
+// CSIP-CONF-v1.3 these criteria serve are INFORMATIVE: outside the claim, inside
+// the run. That changes what a reader should conclude from a verdict here and
+// changes nothing about how carefully it has to be computed — a wrong
+// informative verdict is still wrong.
+//
+// They turn on two things the direct-DER-client rows never needed:
 //
 //	1. a FLEET. Every AGG / MAINT / UTIL row is written against the Figure-15
 //	   topology — an aggregator EndDevice plus EDA1/EDA2 under SPA1/SPA2 and
