@@ -29,14 +29,14 @@ hashing a file in front of them.
 | SS-1547-TEST-v1.1 | 2 | 2 | 2 | 0 | **0** | 0 |
 | SS-CSIP-RESULTS-v1.1 | 47 | 45 | 45 | 0 | **0** | 2 |
 | SS-MODBUS-CLIENT-CONF-v1.1 | 16 | 15 | 16 | 1 | **0** | 0 |
-| SS-MODBUS-CONF-v1.4 | 24 | 15 | 15 | 0 | **0** | 9 |
+| SS-MODBUS-CONF-v1.4 | 24 | 16 | 16 | 0 | **0** | 8 |
 | SS-MODBUS-RESULTS-v1.2 | 54 | 52 | 52 | 0 | **0** | 2 |
 | SS-TEST-PKI | 21 | 6 | 10 | 4 | **0** | 11 |
 | SSM-CONF-v0.8 | 39 | 37 | 37 | 0 | **0** | 2 |
-| **TOTAL** | **282** | **223** | **256** | **33** | **0** | **26** |
+| **TOTAL** | **282** | **224** | **257** | **33** | **0** | **25** |
 
-Of the 256 implemented cases, the extraction rates 143 fully automatable, 35
-partially, and 78 manual — a manual case still gets a check, because recording
+Of the 257 implemented cases, the extraction rates 143 fully automatable, 35
+partially, and 79 manual — a manual case still gets a check, because recording
 an operator's observation inside a timestamped frame window is worth more than
 recording nothing.
 
@@ -61,6 +61,14 @@ product does not claim, gating nothing. See
 the catalog records about it, and the superseded
 `docs/PROFILE_SCOPE_2026-07-28_der-aggregator-client.md` §3-§4 for the row-by-row
 inventory of what each one drives and the errata it honours.
+
+**`SS-MODBUS-CONF-v1.4`'s CRV-1 became applicable the same day**, for an
+unrelated and duller reason: its exclusion rested on the claim that the
+gateway's chain builder rejects models 705-712 northbound, and that had stopped
+being true. Those models are chained device-conditionally, per unit, and CRV-1
+tests that curve 1 is present and **read-only** — the posture the gateway does
+implement. CRV-2 and CRV-3 stay inapplicable on the narrower, still-true fact
+that neither can run without a *writable* second curve.
 
 Regenerate the table at any time, and gate on it:
 
@@ -87,9 +95,9 @@ fails a pipeline; it is not a formatting preference.
   under "Implemented" and lose the reason. Examples: `SS-MODBUS-CONF-v1.4`'s
   TCP-1 (asserts a plaintext Modbus/TCP interface on :502; the DUT's northbound
   Modbus is mbaps-only on :802, so a PASS would be a claim about a closed port),
-  RTU-1..5 (no northbound serial interface), CRV-1..3 (no model with curves);
-  `SS-TEST-PKI`'s PKI-2, PKI-9..10, PKI-12..18, PKI-21 (requirements on the
-  SunSpec Alliance certificate *package* a lab ships, not on the device).
+  RTU-1..5 (no northbound serial interface), CRV-2..3 (no writable second
+  curve); `SS-TEST-PKI`'s PKI-2, PKI-9..10, PKI-12..18, PKI-21 (requirements on
+  the SunSpec Alliance certificate *package* a lab ships, not on the device).
 * **…of which the extraction marks inapplicable** — 33 cases carry a check even
   though the catalog rates them inapplicable, because exercising the row is
   worth more than assuming it. They count as Implemented, not as N/A. The three

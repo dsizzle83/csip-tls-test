@@ -12,16 +12,22 @@ package suitemodbusserver
 // reversion test that occupies a minute of wall clock should not delay the
 // evidence for everything else.
 //
-// Second, WHAT IS NOT REGISTERED. Nine of this document's twenty-four rows are
-// marked inapplicable by the catalog extraction — TCP-1 and RTU-1..5, because
-// the DUT has neither a plain Modbus/TCP interface nor a serial one, and
-// CRV-1..3, because it serves no model with curves. They are left unregistered
-// on purpose: the framework's coverage report prints an unregistered
-// inapplicable case together with the extraction's own reason, whereas
-// registering one would file it under "implemented" and lose that reason. Every
-// APPLICABLE row of both documents is registered, including the ones that can
-// only report SKIP against this DUT, because a registered SKIP with a reason is
-// an engineering judgement and an unregistered row is an oversight.
+// Second, WHAT IS NOT REGISTERED. Eight of this document's twenty-four rows are
+// marked inapplicable by the catalog — TCP-1 and RTU-1..5, because the DUT has
+// neither a plain Modbus/TCP interface nor a serial one, and CRV-2 and CRV-3,
+// because both need a writable second curve the DUT does not serve. They are
+// left unregistered on purpose: the framework's coverage report prints an
+// unregistered inapplicable case together with the catalog's own reason,
+// whereas registering one would file it under "implemented" and lose that
+// reason. Every APPLICABLE row of both documents is registered, including the
+// ones that can only report SKIP against this DUT, because a registered SKIP
+// with a reason is an engineering judgement and an unregistered row is an
+// oversight.
+//
+// CRV-1 left that list on 2026-07-28. It was excluded on the claim that the
+// gateway's chain builder rejects models 705-712 northbound, which had stopped
+// being true: they are chained device-conditionally, per unit, and CRV-1 tests
+// the read-only posture the gateway does implement. See checks_crv.go.
 
 import "csip-tls-test/internal/certify"
 
@@ -53,6 +59,11 @@ func Register(reg *certify.Registry) {
 	// discovery walk.
 	reg.Register("ss-1547-test-v1.1::MOD-4", SuiteName, checkMOD4, needs, certify.WithOrder(60))
 	reg.Register("ss-1547-test-v1.1::2.4", SuiteName, checkSF, needs, certify.WithOrder(70))
+
+	// CRV-1 reads the same chain and writes nothing, so it belongs here rather
+	// than with its section-mates: CRV-2 and CRV-3 need a writable curve, CRV-1
+	// needs a read-only one. See checks_crv.go.
+	reg.Register("ss-modbus-conf-v1.4::CRV-1", SuiteName, checkCRV1, needs, certify.WithOrder(75))
 
 	// Exception generation: EXC-3 first because it writes nothing.
 	reg.Register("ss-modbus-conf-v1.4::EXC-3", SuiteName, checkEXC3, needs, certify.WithOrder(80))
@@ -91,9 +102,13 @@ var Inapplicable = map[string]string{
 	"ss-modbus-conf-v1.4::RTU-5": "the DUT has no northbound serial interface; Model 1's Device Address " +
 		"point addresses a serial slave, and the gateway allocates its Modbus unit identifiers itself " +
 		"rather than accepting one written by a client.",
-	"ss-modbus-conf-v1.4::CRV-1": "requires a model with curves. The DUT's northbound projection serves " +
-		"none: models 705-712 are implemented southbound only and are rejected by its chain builder as v1 " +
-		"product policy. The absence is asserted — by MOD-4, which fails on it.",
-	"ss-modbus-conf-v1.4::CRV-2": "requires a model with curves; see CRV-1.",
-	"ss-modbus-conf-v1.4::CRV-3": "requires a model with curves; see CRV-1.",
+	"ss-modbus-conf-v1.4::CRV-2": "requires a WRITABLE second curve, and the DUT serves the staging " +
+		"curve wholly not-implemented: every Crv2./Ctl2. field reads the sentinel and every write to one " +
+		"is refused before ACK, so the 1547 profile's item G3 is not met and there is no AdptCrvReq " +
+		"executor for the adopt handshake to run against. The write path is design Stage 5 and is not " +
+		"built. Note that curve models ARE reachable northbound — CRV-1 is registered and tests exactly " +
+		"the read-only posture that kills this row.",
+	"ss-modbus-conf-v1.4::CRV-3": "requires the same writable second curve as CRV-2: an out-of-range " +
+		"adopt request cannot be issued to a device that refuses every write to the staging curve, so " +
+		"there is no error for the procedure to observe being reported.",
 }

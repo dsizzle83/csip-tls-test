@@ -36,9 +36,9 @@
 //
 // # The rows this transport kills, and why they are NOT-APPLICABLE, not PASS
 //
-// Six catalog rows in SS-MODBUS-CONF-v1.4 are dead against this DUT and are
-// left unregistered so the coverage report prints them with the extraction's
-// own reason rather than a verdict this suite invented:
+// Six catalog rows in SS-MODBUS-CONF-v1.4 are dead against this DUT's
+// TRANSPORT and are left unregistered so the coverage report prints them with
+// the catalog's own reason rather than a verdict this suite invented:
 //
 //	TCP-1  "TCP Interface"    — asserts a Modbus/TCP interface on port 502.
 //	                            There is none; :802 is a different, secured
@@ -53,10 +53,21 @@
 //	                            are allocated by the gateway, not written by a
 //	                            client.
 //
-// Three more (CRV-1, CRV-2, CRV-3, the curve tests) are dead for a different
-// reason: they require a model with curves, and the v1 northbound projection
-// serves no curve model at all (705-712 are rejected by the gateway's chain
-// builder). Their absence is itself asserted — by MOD-4, which FAILS on it.
+// Two more (CRV-2, CRV-3) are dead for a different reason: both need a WRITABLE
+// second curve, and the DUT serves the staging curve wholly not-implemented —
+// every Crv2./Ctl2. field reads the sentinel and every write to one is refused
+// before ACK — so the 1547 profile's item G3 is not met and the adopt-curve
+// handshake has nothing to run against. The write path is design Stage 5 in
+// lexa-gw and is not built.
+//
+// CRV-1 is NOT one of them, and the reason it used to be is worth recording.
+// All three were excluded until 2026-07-28 on the claim that the gateway's
+// chain builder rejects models 705-712 northbound. It does not: 703 and 705-712
+// are chained DEVICE-CONDITIONALLY, a unit carrying one if and only if its own
+// DER serves it southbound, so a curve model is reachable and CRV-1 — which
+// tests that curve 1 exists and is READ-ONLY, the posture the gateway does
+// implement — has a subject. checks_crv.go says what it can assert today and
+// what it cannot.
 //
 // # The honest shape of a write test against this DUT
 //
