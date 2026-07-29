@@ -519,9 +519,15 @@ func critDERStatusElements() criterion {
 	return criterion{
 		Claim: "the DERStatus the DUT reports carries the elements BASIC-028 requires of a power-generating " +
 			"DER: genConnectStatus, inverterStatus, operationalModeStatus and readingTime",
-		How:             "the child elements of the DERStatus payload the DUT PUT",
+		How: "the child elements of the DERStatus payload the DUT PUT, located first in the conversations " +
+			"this check owns and then across the run's whole decrypted capture",
 		NeedsTranscript: true,
-		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+		// The same three-rung ladder as critDERPut, and for the same reason: the
+		// DERStatus this row inspects is emitted on the DUT's own cadence, so
+		// the body is routinely in the capture but outside this case's window.
+		// Reading it from the wire there — and saying so — beats reading it from
+		// the copy gridsim stored.
+		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
 			for _, e := range t.Method("PUT") {
 				doc, err := e.Req.SEP()
 				if err != nil || doc.Local() != "DERStatus" {
@@ -530,7 +536,23 @@ func critDERStatusElements() criterion {
 				v, desc := evaluate(doc)
 				return citeMessage(t, e.Req, v, "%s", desc)
 			}
-			return unavailable("the recovered transcript holds no DERStatus PUT")
+			rw := runWireOf(ev, t.Remote)
+			for _, e := range rw.Method("PUT") {
+				doc, err := e.Req.SEP()
+				if err != nil || doc.Local() != "DERStatus" {
+					continue
+				}
+				v, desc := evaluate(doc)
+				return Finding{Verdict: v, Observed: fmt.Sprintf(
+					"%s — read from the DERStatus body in frame(s) %s, which are outside this test case's "+
+						"window and so are named rather than cited. Scope: %s", desc, framesOf(e), rw.Scope())}
+			}
+			if rw.Complete {
+				return unavailable("no DERStatus PUT appears anywhere in the run's capture (%s), so the DUT "+
+					"reported no DERStatus body for this criterion to inspect", rw.Scope())
+			}
+			return unavailable("the recovered transcript holds no DERStatus PUT, and the run's capture "+
+				"cannot settle whether one happened elsewhere: %s", rw.Scope())
 		},
 		Server: func(v *ServerView) Finding {
 			puts := v.PutsForInRun("DERStatus")

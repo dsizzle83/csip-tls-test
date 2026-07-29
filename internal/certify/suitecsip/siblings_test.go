@@ -188,6 +188,8 @@ func twoWalks(t *testing.T) (*certify.Evidence, netip.AddrPort) {
 			`<rtgMaxW><value>5000</value><multiplier>0</multiplier></rtgMaxW></DERCapability>`),
 	}
 	rec := recordIndependentPair(t, p, h, walk, reports)
+	resetRunWireCache()
+	t.Cleanup(resetRunWireCache)
 	return evidenceFrom(t, rec, true)
 }
 
@@ -303,5 +305,49 @@ func TestSiblingCitationNamesTheSiblingStream(t *testing.T) {
 	}
 	if a.BytesSHA256 == "" {
 		t.Error("the assertion carries no re-derivable digest, which is the whole point")
+	}
+}
+
+// TestRunWideAbsenceIsAWireFact covers rung 3 of critDERPut's ladder: when the
+// capture is fully decrypted and holds no PUT at all, the FAIL is the wire's
+// answer, not gridsim's.
+func TestRunWideAbsenceIsAWireFact(t *testing.T) {
+	p := newTestPKI(t)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/sep+xml")
+		_, _ = w.Write([]byte(`<DeviceCapability xmlns="urn:ieee:std:2030.5:ns">` +
+			`<EndDeviceListLink href="/edev"/></DeviceCapability>`))
+	})
+	rec := recordSession(t, p, h, []*http.Request{mustGET(t, "/dcap")})
+	resetRunWireCache()
+	defer resetRunWireCache()
+	ev, server := evidenceFrom(t, rec, true)
+	tr, err := RecoverSession(ev, server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := critDERPut("DERSettings").Wire(ev, tr)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("no PUT anywhere in a fully decrypted capture is a FAIL: got %s (%s / %s)",
+			f.Verdict, f.Observed, f.Unavailable)
+	}
+	if !strings.Contains(f.Observed, "NO PUT of any resource anywhere in the run") {
+		t.Errorf("the FAIL must rest on the capture, not on the admin log: %q", f.Observed)
+	}
+	if !strings.Contains(f.Observed, "independent of gridsim's admin log") {
+		t.Errorf("the source of the finding must be stated: %q", f.Observed)
+	}
+}
+
+// TestRunWideAbsenceStaysUnavailableWithoutTheKeyLog is the guard on rung 3:
+// an undecryptable capture hides application data, so an absence read from it
+// would be reporting a decryption gap as a device fault.
+func TestRunWideAbsenceStaysUnavailableWithoutTheKeyLog(t *testing.T) {
+	rw := &runWire{Complete: false, Opaque: 2, Reason: "no secret in the key log"}
+	if rw.Complete {
+		t.Fatal("fixture")
+	}
+	if !strings.Contains(rw.Scope(), "could not be decrypted") {
+		t.Errorf("an incomplete scan must say so: %q", rw.Scope())
 	}
 }

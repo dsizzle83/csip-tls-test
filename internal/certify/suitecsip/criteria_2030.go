@@ -454,14 +454,53 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 }
 
 // critDERPut asserts one of the DER self-report PUTs.
+//
+// The evidence ladder is three rungs, strongest first, and the criterion says
+// which rung it stood on:
+//
+//  1. a PUT in one of the conversations THIS check owns — cited by byte range,
+//     which is the only form a bundle's verifier can re-derive;
+//  2. a PUT elsewhere in the run's decrypted capture — a real wire fact, but in
+//     frames belonging to another test case, so it is reported as a
+//     capture-derived narrative naming those frames rather than citing them;
+//  3. no PUT of this resource anywhere in a FULLY decrypted capture — a FAIL
+//     drawn from the wire rather than from gridsim's admin log.
+//
+// Rung 2 exists because the DER self-reports are cadence-driven and land in this
+// case's own window only by luck; rung 3 exists because "gridsim recorded no
+// DERCapability PUT (it recorded: )" was being printed as a finding about the
+// DUT when the capture could say the same thing about the wire, checkably. The
+// server tier below remains, and is now reached only when the capture cannot
+// settle the question.
 func critDERPut(resource string) criterion {
+	// grade turns one located PUT into a verdict and its sentence.
+	grade := func(e Exchange) (certify.Verdict, string) {
+		if e.Resp == nil {
+			return certify.Fail, fmt.Sprintf("PUT %s carrying %s was never answered in the capture",
+				e.Req.Target, resource)
+		}
+		v, note := certify.Pass, ""
+		if e.Resp.Status != 204 {
+			// 200 is DISCOURAGED rather than forbidden for a PUT
+			// (2030.5 §5.5.2), so it is a WARN and 4xx/5xx a FAIL.
+			if e.Resp.Status >= 200 && e.Resp.Status < 300 {
+				v, note = certify.Warn, " (2030.5 §5.5.2 discourages a body-bearing 2xx for a PUT; "+
+					"204 No Content is the expected answer)"
+			} else {
+				v = certify.Fail
+			}
+		}
+		return v, fmt.Sprintf("PUT %s carrying %s -> %s%s", e.Req.Target, resource, e.Resp.Line(), note)
+	}
 	return criterion{
 		Claim: fmt.Sprintf("the DUT PUT its %s to the href the server advertised, and the server answered "+
 			"204 No Content", resource),
-		How: fmt.Sprintf("a PUT in the session whose body's root element is %s, and the status line of the "+
-			"response to it", resource),
+		How: fmt.Sprintf("a PUT whose body's root element is %s, and the status line of the response to it, "+
+			"located first in the conversations this check owns and then across the run's whole decrypted "+
+			"capture", resource),
 		NeedsTranscript: true,
-		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
+			// Rung 1: this check's own conversations. Citable.
 			var seen []string
 			for _, e := range t.Method("PUT") {
 				doc, err := e.Req.SEP()
@@ -472,30 +511,60 @@ func critDERPut(resource string) criterion {
 				if doc.Local() != resource {
 					continue
 				}
+				v, desc := grade(e)
 				if e.Resp == nil {
-					return citeMessage(t, e.Req, certify.Fail, "PUT %s was never answered in the capture", e.Req.Target)
+					return citeMessage(t, e.Req, v, "%s", desc)
 				}
-				v := certify.Pass
-				note := ""
-				if e.Resp.Status != 204 {
-					// 200 is DISCOURAGED rather than forbidden for a PUT
-					// (2030.5 §5.5.2), so it is a WARN and 4xx/5xx a FAIL.
-					if e.Resp.Status >= 200 && e.Resp.Status < 300 {
-						v, note = certify.Warn, " (2030.5 §5.5.2 discourages a body-bearing 2xx for a PUT; "+
-							"204 No Content is the expected answer)"
-					} else {
-						v = certify.Fail
-					}
+				return citeExchange(t, e, v, "%s", desc)
+			}
+
+			// Rung 2: the rest of the run's capture. Real, but not this check's
+			// to cite.
+			rw := runWireOf(ev, t.Remote)
+			runPuts := rw.Method("PUT")
+			var runSeen []string
+			hit, foundPut := Exchange{}, false
+			for _, e := range runPuts {
+				doc, err := e.Req.SEP()
+				if err != nil {
+					continue
 				}
-				return citeExchange(t, e, v, "PUT %s carrying %s -> %s%s",
-					e.Req.Target, resource, e.Resp.Line(), note)
+				runSeen = append(runSeen, doc.Local())
+				if doc.Local() == resource && !foundPut {
+					hit, foundPut = e, true
+				}
 			}
-			if len(seen) == 0 {
-				return unavailable("the recovered transcript holds no PUT from the DUT")
+			if foundPut {
+				v, desc := grade(hit)
+				return Finding{Verdict: v, Observed: fmt.Sprintf(
+					"%s — in frame(s) %s, which are OUTSIDE this test case's window and therefore belong to "+
+						"another case. The DUT reports this resource on its own cadence rather than on this "+
+						"case's cue, so the report is a wire fact of the run; it is named here rather than "+
+						"cited because a check may cite only its own frames. Scope: %s",
+					desc, framesOf(hit), rw.Scope())}
 			}
-			return found(certify.Fail, allFrames(t.Method("PUT")),
-				"the DUT PUT %d resource(s) — %s — but no %s",
-				len(seen), strings.Join(dedupeStrings(seen), " "), resource)
+
+			// Rung 3: a negative, which is only a fact about the DUT if the
+			// capture was fully readable.
+			if len(seen) > 0 {
+				return found(certify.Fail, allFrames(t.Method("PUT")),
+					"the DUT PUT %d resource(s) in this window — %s — but no %s",
+					len(seen), strings.Join(dedupeStrings(seen), " "), resource)
+			}
+			if !rw.Complete {
+				return unavailable("no %s PUT appears in this test case's conversations, and the run's "+
+					"capture cannot settle whether one happened elsewhere: %s", resource, rw.Scope())
+			}
+			if len(runSeen) == 0 {
+				return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+					"the DUT sent NO PUT of any resource anywhere in the run: %s were read end to end and "+
+						"carry no PUT request at all, so the %s self-report was never emitted. This is the "+
+						"wire's own answer, independent of gridsim's admin log",
+					rw.Scope(), resource)}
+			}
+			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+				"the DUT PUT %d resource(s) across the whole run — %s — but no %s. Read from %s",
+				len(runSeen), strings.Join(dedupeStrings(runSeen), " "), resource, rw.Scope())}
 		},
 		Server: func(v *ServerView) Finding {
 			if inWindow := v.PutsFor(resource); len(inWindow) > 0 {
