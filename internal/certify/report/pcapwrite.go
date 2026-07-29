@@ -35,6 +35,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"csip-tls-test/internal/evidence/netdis"
@@ -149,6 +150,112 @@ func ExportTrace(path, scenario string, all []pcapng.Packet, frames []int) (Trac
 	}
 	info.TLS = SummariseTLS(back)
 	return info, nil
+}
+
+// LoadTrace re-reads an ALREADY-EXPORTED trace file from disk and reports what
+// it contains, the same way ExportTrace does immediately after writing one.
+//
+// It exists for GenerateTRR: a CSIP evidence bundle's archive/traces/*.pcap
+// files were written by an earlier run of the results-report suite (RPT-060,
+// via ExportTrace) against the run's LIVE capture, which no longer exists by
+// the time a TRR package is assembled from the bundle's own directory.
+// Packaging the traces into a submission therefore re-reads the files
+// themselves — re-dissecting them exactly as ExportTrace's own post-write
+// check does — rather than re-deriving anything from a capture that is gone.
+//
+// The scenario name is recovered from the file's base name, which is how
+// ExportTrace names it (sanitise(name)+".pcap"): sanitise is idempotent on the
+// characters it allows through, so round-tripping a scenario name built from
+// them recovers it exactly.
+func LoadTrace(path string) (TraceInfo, error) {
+	scenario := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	info := TraceInfo{Scenario: scenario, Path: path}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return info, fmt.Errorf("report: read trace %s: %w", path, err)
+	}
+	info.Bytes = int64(len(data))
+	sum := sha256.Sum256(data)
+	info.SHA256 = hex.EncodeToString(sum[:])
+
+	pkts, err := pcapng.ReadFile(path)
+	if err != nil {
+		return info, fmt.Errorf("report: trace %s does not read back as a pcap: %w", path, err)
+	}
+	for _, p := range pkts {
+		info.Frames = append(info.Frames, p.Index)
+	}
+	if len(pkts) > 0 {
+		info.First, info.Last = pkts[0].Time, pkts[len(pkts)-1].Time
+	}
+	info.TLS = SummariseTLS(pkts)
+	return info, nil
+}
+
+// DiscoverTraces globs <dir>/archive/traces/*.pcap for every bundle directory
+// given and loads each, so a TRR package cannot forget Chapter 5's traces by
+// omitting a field: the caller supplies bundle directories it already has
+// (Collated.Sources), and every trace those bundles ever exported comes along
+// automatically. Results are sorted by bundle directory, then by scenario name,
+// so two runs over the same bundles order them identically.
+func DiscoverTraces(dirs []string) ([]TraceInfo, error) {
+	sorted := append([]string(nil), dirs...)
+	sort.Strings(sorted)
+	var out []TraceInfo
+	for _, dir := range sorted {
+		matches, err := filepath.Glob(filepath.Join(dir, ArchiveDir, TraceDir, "*.pcap"))
+		if err != nil {
+			return nil, fmt.Errorf("report: list traces under %s: %w", dir, err)
+		}
+		sort.Strings(matches)
+		for _, m := range matches {
+			info, err := LoadTrace(m)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, info)
+		}
+	}
+	return out, nil
+}
+
+// CopyTraces copies already-discovered traces into destDir's own
+// archive/traces/ directory and returns their TraceInfo with Path updated to
+// the copy, each one re-verified against the digest DiscoverTraces read.
+//
+// It exists because a CSIP TRR part's traces are discovered from a DIFFERENT
+// bundle's directory (Collated.Sources), and generate.go's manifest digests
+// only files that live under the submission's own Dir — a Chapter 5 trace left
+// at its source path would resolve to a path outside Dir (filepath.Rel
+// returning a "../" prefix) and silently drop out of both sub.Files and
+// MANIFEST.sha256. Copying, rather than merely referencing, makes the package
+// self-contained: a reviewer handed the TRR directory alone has the trace, not
+// a path into an evidence bundle they may not have been given.
+func CopyTraces(destDir string, traces []TraceInfo) ([]TraceInfo, error) {
+	out := make([]TraceInfo, 0, len(traces))
+	for _, t := range traces {
+		data, err := os.ReadFile(t.Path)
+		if err != nil {
+			return nil, fmt.Errorf("report: re-read trace %s to copy it into the package: %w", t.Path, err)
+		}
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != t.SHA256 {
+			return nil, fmt.Errorf("report: trace %s changed on disk between discovery and packaging "+
+				"(digest mismatch)", t.Path)
+		}
+		rel := filepath.Join(ArchiveDir, TraceDir, filepath.Base(t.Path))
+		if existing, err := os.ReadFile(filepath.Join(destDir, rel)); err == nil {
+			if es := sha256.Sum256(existing); hex.EncodeToString(es[:]) != t.SHA256 {
+				return nil, fmt.Errorf("report: two different traces both named %s would collide in the "+
+					"package", filepath.Base(t.Path))
+			}
+		} else if err := writeFile(destDir, rel, data); err != nil {
+			return nil, err
+		}
+		t.Path = filepath.Join(destDir, rel)
+		out = append(out, t)
+	}
+	return out, nil
 }
 
 // SummariseTLS dissects a set of packets and reports the TLS handshake they

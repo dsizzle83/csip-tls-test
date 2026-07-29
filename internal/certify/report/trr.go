@@ -724,6 +724,22 @@ func GenerateTRR(o TRROptions) (*TRR, error) {
 			opts.ModbusLogs = o.ModbusLogs
 		} else {
 			opts.CSIPLogs = o.CSIPLogs
+			// RRS v1.1 §5 (Chapter 5, CSIP only): a raw TLS packet trace per
+			// COMM-004 connection scenario. The traces were written by an
+			// earlier live run of the results-report suite (RPT-060) into
+			// each contributing bundle's own archive/traces/ directory —
+			// discovered from col.Sources rather than threaded through as a
+			// caller-supplied option, so a TRR built from a bundle that has
+			// them can never omit them by forgetting to pass a field.
+			traces, err := DiscoverTraces(col.Sources)
+			if err != nil {
+				return nil, err
+			}
+			traces, err = CopyTraces(opts.Dir, traces)
+			if err != nil {
+				return nil, err
+			}
+			opts.Traces = traces
 		}
 		sub, err := Generate(opts)
 		if err != nil {

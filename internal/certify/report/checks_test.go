@@ -500,20 +500,22 @@ func writeSourceBundle(t *testing.T) string {
 	return dir
 }
 
-// TestTraceRowSkipsWithoutAScenario: Chapter 5 applies to COMM-004 alone, and
-// exporting the whole capture under a scenario name would claim a
-// correspondence the run cannot establish.
-func TestTraceRowSkipsWithoutAScenario(t *testing.T) {
+// TestTraceRowFailsWithoutAScenario: RPT-060 is registered only under the
+// CSIP claim, so its running at all means the campaign claims CSIP and RRS
+// v1.1 Chapter 5 makes the trace a submission requirement — a SKIP here used
+// to make a forgotten -param report.comm004 indistinguishable from "not
+// required", which is exactly the silent gap the row must not produce.
+func TestTraceRowFailsWithoutAScenario(t *testing.T) {
 	rep, _, _ := runSuite(t, uidCSIP("RPT-060"), func(o *certify.Options) {
 		o.NoCapture = false
 		o.Capturer = &nullCapture{path: filepath.Join(t.TempDir(), "empty.pcap")}
 	})
 	c := rep.Cases[0]
-	if c.Verdict != certify.Skip {
+	if c.Verdict != certify.Fail {
 		t.Fatalf("verdict %s: %s", c.Verdict, c.Notes)
 	}
-	if !strings.Contains(c.Notes, "COMM-004") {
-		t.Errorf("the SKIP does not explain itself: %q", c.Notes)
+	if !strings.Contains(c.Notes, "COMM-004") || !strings.Contains(c.Notes, "not optional") {
+		t.Errorf("the FAIL does not explain itself: %q", c.Notes)
 	}
 }
 

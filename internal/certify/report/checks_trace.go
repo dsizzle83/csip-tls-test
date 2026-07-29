@@ -34,10 +34,23 @@ func (s *Suite) traceCheck() certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		raw, ok := param(rc, "comm004")
 		if !ok || strings.TrimSpace(raw) == "" {
-			return certify.Skipped("no COMM-004 connection scenario was named (-param %scomm004=<uid>[,<uid>…]), "+
-				"so there is no certificate scenario whose handshake could be traced. Chapter 5 applies to "+
-				"COMM-004 alone, and exporting the whole run capture under a scenario name would claim a "+
-				"correspondence this run cannot establish", paramPrefix), nil
+			// This row is registered ONLY under the CSIP registration
+			// (registerCSIP), so its running at all means CSIP is the
+			// certificate type this campaign claims for this row's document,
+			// and RRS v1.1 Chapter 5 makes the trace a REQUIREMENT of that
+			// submission, not an optional extra a bench happened to skip. A
+			// Skip here used to make the gap silent: the row vanished from
+			// the readiness report exactly like a genuinely inapplicable one
+			// would, leaving a reader no way to tell "not required" from
+			// "operator forgot -param report.comm004". A missing packet
+			// trace on a CSIP claim is a missing submission requirement, so
+			// it FAILs loudly instead.
+			return certify.Failed("Chapter 5 of RRS v1.1 requires a raw TLS packet trace per COMM-004 "+
+				"connection scenario, and this campaign claims the CSIP certificate type (this row is registered "+
+				"only under that claim), but no COMM-004 scenario was named "+
+				"(-param %scomm004=<uid>[,<uid>…]) so none could be traced. This is not optional: supply the "+
+				"COMM-004 scenario uid(s) this campaign exercised, or the submission is missing a Chapter 5 "+
+				"requirement", paramPrefix), nil
 		}
 		var uids []string
 		for _, p := range strings.Split(raw, ",") {

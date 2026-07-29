@@ -13,6 +13,8 @@ package report
 // here rather than left to the readiness report to notice.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -659,6 +661,101 @@ func TestGapsReachTheReadinessReport(t *testing.T) {
 	for _, want := range []string{"NOT SUPPORTED", "MOD-2", "An omitted row is NOT a pass"} {
 		if !strings.Contains(string(readme), want) {
 			t.Errorf("the package README does not carry %q", want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 5 (COMM-004 packet traces)
+// ---------------------------------------------------------------------------
+
+// TestTRRPackagesCOMM004Traces is the direct regression for the missing
+// middle link: RPT-060 already exports a per-scenario trace into a bundle's
+// own archive/traces/ directory, and GenerateTRR now has to discover it from
+// Collated.Sources (the bundle directories that fed the CSIP part), copy it
+// into the CSIP part's own archive/traces/, and carry its digest into both the
+// submission's Traces and the package manifest — without the caller having to
+// pass anything, since TRROptions has no Traces field to forget.
+func TestTRRPackagesCOMM004Traces(t *testing.T) {
+	bundleDir := t.TempDir()
+	pkts := session(ap("69.0.0.20:44100"), ap("69.0.0.2:802"), time.Now().UTC(),
+		[]exchange{{true, tlsClientHello()}, {false, tlsFatalAlert()}}, true)
+	tracePath := filepath.Join(bundleDir, ArchiveDir, TraceDir, "COMM-004-A.pcap")
+	written, err := ExportTrace(tracePath, "COMM-004-A", pkts, frameNumbers(pkts))
+	if err != nil {
+		t.Fatalf("ExportTrace: %v", err)
+	}
+
+	src := synthSource()
+	src.Dir = bundleDir // where DiscoverTraces must look
+
+	out := t.TempDir()
+	trr, err := GenerateTRR(TRROptions{
+		Dir: out, Sources: []Source{src}, Config: operatorConfig(),
+		ModbusLogs: goodModbusLogs(), Now: fixedNow, Tool: Tool, ToolVersion: "test",
+		AllowAuthorityGaps: true,
+	})
+	if err != nil {
+		t.Fatalf("GenerateTRR: %v", err)
+	}
+
+	var csipPart *TRRPart
+	for _, p := range trr.Parts {
+		if p.CertType == CertTypeCSIP {
+			csipPart = p
+		}
+	}
+	if csipPart == nil {
+		t.Fatal("no CSIP part in the package")
+	}
+	if len(csipPart.Submission.Traces) != 1 {
+		t.Fatalf("CSIP submission carries %d trace(s), want 1", len(csipPart.Submission.Traces))
+	}
+	got := csipPart.Submission.Traces[0]
+	if got.Scenario != "COMM-004-A" {
+		t.Errorf("scenario = %q, want COMM-004-A", got.Scenario)
+	}
+	if got.SHA256 == "" || got.SHA256 != written.SHA256 {
+		t.Errorf("digest = %q, want the exported file's own %q", got.SHA256, written.SHA256)
+	}
+
+	// The trace must be a real file INSIDE the package, not a reference
+	// pointing back at the source bundle: a reviewer handed the TRR directory
+	// alone must have the evidence.
+	copied := filepath.Join(out, certTypeSlug(CertTypeCSIP), ArchiveDir, TraceDir, "COMM-004-A.pcap")
+	data, err := os.ReadFile(copied)
+	if err != nil {
+		t.Fatalf("the trace was not copied into the package: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != written.SHA256 {
+		t.Error("the copied trace's content differs from the original")
+	}
+
+	// And its digest is in the package's own manifest.
+	manifest, err := os.ReadFile(filepath.Join(out, ManifestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel := filepath.ToSlash(filepath.Join(certTypeSlug(CertTypeCSIP), ArchiveDir, TraceDir, "COMM-004-A.pcap"))
+	if !strings.Contains(string(manifest), rel) {
+		t.Errorf("MANIFEST.sha256 does not list %s:\n%s", rel, manifest)
+	}
+	if !strings.Contains(string(manifest), written.SHA256) {
+		t.Errorf("MANIFEST.sha256 does not carry the trace's digest:\n%s", manifest)
+	}
+}
+
+// TestTRRTracesAreEmptyWithoutASource proves the absence is as honest as the
+// presence: a source bundle with no archive/traces/ directory (the ordinary
+// synthetic fixture used throughout this file) produces a CSIP submission
+// with zero traces, not an error and not a fabricated one.
+func TestTRRTracesAreEmptyWithoutASource(t *testing.T) {
+	trr := mustTRR(t, t.TempDir())
+	for _, p := range trr.Parts {
+		if p.CertType == CertTypeCSIP && len(p.Submission.Traces) != 0 {
+			t.Errorf("CSIP submission carries %d trace(s) from a source with no archive/traces/ directory",
+				len(p.Submission.Traces))
 		}
 	}
 }
