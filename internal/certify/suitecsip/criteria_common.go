@@ -375,7 +375,16 @@ func collectHrefs(n *Node, into map[string]bool) {
 	}
 }
 
-// firstFatalAlert returns the first fatal alert seen either direction.
+// firstFatalAlert returns the first fatal alert seen in EITHER direction.
+//
+// It is direction-BLIND and so is safe only where the question is merely
+// "did a fatal alert end this handshake?", to which either party's alert is a
+// true answer — critHandshakeComplete is the one such caller. It must NOT be
+// used to decide whether the DUT REJECTED something: a fatal alert the SERVER
+// sent about the DUT's own credential is the mirror image of the DUT rejecting
+// the server's chain, and attributing it to the DUT is exactly the false PASS
+// that runs/shakedown-20260729T003843 turned up on COMM-004D. Use dutFatalAlert
+// for a rejection verdict and fatalAlertWithSender to name the sender.
 func firstFatalAlert(t *Transcript) (tlsdis.Alert, bool) {
 	for _, d := range []*tlsdis.Direction{t.ClientRecords, t.ServerRecords} {
 		if d == nil {
@@ -386,6 +395,43 @@ func firstFatalAlert(t *Transcript) (tlsdis.Alert, bool) {
 		}
 	}
 	return tlsdis.Alert{}, false
+}
+
+// dutFatalAlert returns the first fatal alert the DUT ITSELF sent.
+//
+// The DUT dials the 2030.5 server, so it is the TLS client and its records are
+// ClientRecords — RecoverSession parses that direction as the DUT's. A negative
+// security row (does the DUT REJECT a bad chain?) may credit only an alert the
+// DUT sent; this is the direction guard the 403 arm already applies, lifted onto
+// the TLS-alert arm.
+func dutFatalAlert(t *Transcript) (tlsdis.Alert, bool) {
+	if t == nil || t.ClientRecords == nil {
+		return tlsdis.Alert{}, false
+	}
+	return t.ClientRecords.FatalAlert()
+}
+
+// peerFatalAlert returns the first fatal alert the DUT's PEER (the server) sent.
+// It is reported to the reader but never credited as the DUT's own rejection.
+func peerFatalAlert(t *Transcript) (tlsdis.Alert, bool) {
+	if t == nil || t.ServerRecords == nil {
+		return tlsdis.Alert{}, false
+	}
+	return t.ServerRecords.FatalAlert()
+}
+
+// fatalAlertWithSender returns the first fatal alert that ended the handshake
+// and names who sent it ("DUT" or "server"), preferring the DUT's direction.
+// It exists so an acceptance row can report that a handshake died on an alert
+// WITHOUT miscalling a server-sent alert a DUT refusal.
+func fatalAlertWithSender(t *Transcript) (tlsdis.Alert, string, bool) {
+	if a, ok := dutFatalAlert(t); ok {
+		return a, "DUT", true
+	}
+	if a, ok := peerFatalAlert(t); ok {
+		return a, "server", true
+	}
+	return tlsdis.Alert{}, "", false
 }
 
 // certSummary renders a certificate for an Observed field: subject, issuer and

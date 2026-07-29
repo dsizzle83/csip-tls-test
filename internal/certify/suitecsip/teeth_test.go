@@ -480,6 +480,30 @@ func TestChainRejectionDetectorHasTeeth(t *testing.T) {
 	if len(f.Frames) != 1 || f.Frames[0] != 9 {
 		t.Errorf("the alert's frame was not cited: %v", f.Frames)
 	}
+
+	// The false-PASS runs/shakedown-20260729T003843 turned up: the fatal alert is
+	// on the SERVER's direction — the bench's decrypt_error about the DUT's own
+	// credential — while the DUT sent nothing. Crediting the DUT for the server's
+	// alert is the mirror image of the fact under test and must NOT be a PASS.
+	serverAlerted := &Transcript{
+		ServerRecords: &tlsdis.Direction{Alerts: []tlsdis.Alert{{Level: 2, Description: 51, Packets: []int{9}}}},
+	}
+	f = rejectionFinding(ev, serverAlerted)
+	if f.Verdict == certify.Pass {
+		t.Errorf("a SERVER-sent fatal alert was miscredited as the DUT's rejection: %s %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "PEER") && !strings.Contains(f.Observed, "server") {
+		t.Errorf("the server's alert is not reported to the reader: %q", f.Observed)
+	}
+
+	// Belt and braces: the DUT-only alert helper reads only the client direction,
+	// so a server-only alert is invisible to it.
+	if _, ok := dutFatalAlert(serverAlerted); ok {
+		t.Error("dutFatalAlert credited an alert the DUT never sent")
+	}
+	if _, ok := dutFatalAlert(refused); !ok {
+		t.Error("dutFatalAlert missed the DUT's own alert")
+	}
 }
 
 // TestChainRejectionAcceptsTheErratumsThirdSignal exercises the HTTP 403 arm

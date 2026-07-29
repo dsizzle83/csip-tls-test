@@ -335,10 +335,17 @@ func critServerChainObserved() criterion {
 			}
 			desc := chainDescription(h.ServerChain)
 			if !h.Complete {
-				if a, ok := firstFatalAlert(ht); ok {
-					return annotate(found(certify.Fail, a.Packets,
-						"the DUT REFUSED the %d-certificate chain (%s) with fatal alert %s",
-						len(h.ServerChain), desc, a), note)
+				if a, who, ok := fatalAlertWithSender(ht); ok {
+					var msg string
+					if who == "DUT" {
+						msg = fmt.Sprintf("the DUT REFUSED the %d-certificate chain (%s) with a fatal alert "+
+							"it sent: %s", len(h.ServerChain), desc, a)
+					} else {
+						msg = fmt.Sprintf("the handshake did not complete after the server's %d-certificate "+
+							"chain (%s): the %s sent fatal alert %s, which is the bench refusing the DUT's "+
+							"credential, not the DUT refusing the chain", len(h.ServerChain), desc, who, a)
+					}
+					return annotate(found(certify.Fail, a.Packets, "%s", msg), note)
 				}
 				return annotate(found(certify.Fail, h.ServerCertFrames,
 					"the handshake did not complete after the server's %d-certificate chain (%s)",
@@ -503,9 +510,17 @@ func chainDepthCriterion(depth int, shape string) func(*Observation) criterion {
 						len(h.ServerChain), chainDescription(h.ServerChain), depth)
 				}
 				if !h.Complete {
-					if a, ok := firstFatalAlert(ht); ok {
-						return annotate(found(certify.Fail, a.Packets,
-							"the DUT REFUSED the valid %d-certificate chain with fatal alert %s", depth, a), note)
+					if a, who, ok := fatalAlertWithSender(ht); ok {
+						var msg string
+						if who == "DUT" {
+							msg = fmt.Sprintf("the DUT REFUSED the valid %d-certificate chain with a fatal alert "+
+								"it sent: %s", depth, a)
+						} else {
+							msg = fmt.Sprintf("the handshake against the valid %d-certificate chain did not "+
+								"complete: the %s sent fatal alert %s, which is the bench refusing the DUT's "+
+								"credential, not the DUT refusing the chain", depth, who, a)
+						}
+						return annotate(found(certify.Fail, a.Packets, "%s", msg), note)
 					}
 					return annotate(found(certify.Fail, h.ServerCertFrames,
 						"the handshake did not complete against the %d-certificate chain", depth), note)
@@ -634,7 +649,7 @@ func (cs *chainSwap) skipReason() string {
 // for it. The arm fires as a PASS only for a 403 the DUT itself emitted, which
 // is the [S]/[A] topology of the same row.
 func rejectionFinding(ev *certify.Evidence, t *Transcript) Finding {
-	if a, ok := firstFatalAlert(t); ok {
+	if a, ok := dutFatalAlert(t); ok {
 		return found(certify.Pass, a.Packets, "the DUT sent a fatal TLS alert: %s", a)
 	}
 	if m, ok := dutForbade(t); ok {
@@ -649,25 +664,42 @@ func rejectionFinding(ev *certify.Evidence, t *Transcript) Finding {
 		}
 		return f
 	}
-	peer403 := ""
+	// The peer note gathers everything the SERVER did that a reader must see but
+	// that is NOT the DUT's rejection: a 403 or a fatal alert the bench sent about
+	// the DUT's own credential is the mirror image of the fact under test.
+	peerNote := ""
 	if m, ok := peerForbade(t); ok {
-		peer403 = fmt.Sprintf("; the PEER answered %s, which is the bench rejecting the DUT's credential "+
+		peerNote += fmt.Sprintf("; the PEER answered %s, which is the bench rejecting the DUT's credential "+
 			"rather than the DUT rejecting the bench's and is not this criterion's evidence", m.Line())
+	}
+	peerAlert, peerAlerted := peerFatalAlert(t)
+	if peerAlerted {
+		peerNote += fmt.Sprintf("; the PEER (server) sent fatal alert %s, which is the bench rejecting the "+
+			"DUT's credential rather than the DUT rejecting the bench's chain and is not this criterion's "+
+			"evidence", peerAlert)
 	}
 	if t.Handshake.Complete && (t.ClientAppRecords > 0 || t.ServerAppRecords > 0) {
 		return found(certify.Fail, t.Handshake.ServerCertFrames,
 			"the DUT ACCEPTED the non-conformant chain: the handshake completed and %d/%d application-data "+
-				"records were exchanged%s", t.ClientAppRecords, t.ServerAppRecords, peer403)
+				"records were exchanged%s", t.ClientAppRecords, t.ServerAppRecords, peerNote)
 	}
-	if fin := teardownFrames(ev, t); len(fin) > 0 {
-		return found(certify.Pass, fin,
-			"the DUT sent no alert but closed the TCP connection (FIN/RST in frame %v) without completing the "+
-				"handshake, which the procedure's erratum (seq 7) admits as an acceptable rejection signal%s",
-			fin, peer403)
+	// A TCP teardown only evidences the DUT's rejection when the DUT itself tore
+	// the connection down. And when the SERVER sent a fatal alert, the handshake
+	// died because the bench rejected the DUT's credential — the DUT closing the
+	// socket afterwards is a reaction to that, not the DUT rejecting the bench's
+	// chain, so it is not credited either. Both are the direction discipline the
+	// TLS-alert and 403 arms already apply.
+	if !peerAlerted {
+		if fin := teardownFrames(ev, t); len(fin) > 0 {
+			return found(certify.Pass, fin,
+				"the DUT sent no alert but closed the TCP connection (FIN/RST in frame %v) without completing the "+
+					"handshake, which the procedure's erratum (seq 7) admits as an acceptable rejection signal%s",
+				fin, peerNote)
+		}
 	}
 	return found(certify.Fail, t.Handshake.ClientHelloFrames,
 		"the DUT neither completed the handshake nor signalled a rejection; the connection simply stopped%s",
-		peer403)
+		peerNote)
 }
 
 // dutForbade returns the first HTTP 403 the DUT ITSELF sent, if any.
@@ -691,16 +723,31 @@ func firstForbidden(ms []*Message) (*Message, bool) {
 	return nil, false
 }
 
-// teardownFrames returns this check's frames that carry a FIN or RST.
+// teardownFrames returns this check's frames in which the DUT ITSELF carried a
+// FIN or RST.
 //
 // It reads the dissected frames rather than the reassembled byte stream because
 // a RST carries no payload at all: a connection torn down by a reset leaves
 // nothing in the stream to point at, and pointing at the stream would silently
 // find nothing exactly when the evidence matters most.
+//
+// The frames are attributed to the DUT by SOURCE address, because the erratum's
+// rejection signal is a "TCP port disconnect" BY THE DUT: a FIN/RST the server
+// sent is the bench dropping the DUT, not the DUT rejecting the bench, and
+// crediting it would be the same direction error firstFatalAlert produced. When
+// the DUT's address cannot be established (no session recovered) nothing is
+// attributable and this returns none rather than guessing.
 func teardownFrames(ev *certify.Evidence, t *Transcript) []int {
+	dut, known := dutAddr(t)
+	if !known {
+		return nil
+	}
 	var out []int
 	for _, f := range ev.Index.Frames() {
 		if f == nil || f.TCP == nil || !ev.Owns(f.Index) {
+			continue
+		}
+		if f.Src.Unmap() != dut {
 			continue
 		}
 		if f.TCP.Flags.Has(netdis.RST) || f.TCP.Flags.Has(netdis.FIN) {
