@@ -85,11 +85,13 @@ import (
 //
 // The routing is data because it is a judgement, not a derivation. SSM-CONF
 // (Secure SunSpec Modbus) and SS-TEST-PKI are not the SunSpec Modbus
-// Conformance Test Procedures; they are the TLS and certificate layers a
-// Secure SunSpec Modbus submission rests on, and their verdicts belong with the
-// Modbus report rather than in a third document that has no Results Reporting
-// specification at all. Putting them there is stated here so a reviewer can
-// disagree with one line rather than reverse-engineer it.
+// Conformance Test Procedures; they are TLS and certificate layers other
+// submissions rest on, and this map still buckets their GAPS with the Modbus
+// report — where a reviewer of that submission already looks — rather than in
+// a third document that has no Results Reporting specification at all. It does
+// NOT mean their rows earn a `Test <ID>` row in that report's SUMMARY.csv: see
+// NoCertificationBasis immediately below, which is consulted first and governs
+// whether a row is written at all.
 var DocCertType = map[string]string{
 	"csip-conf-v1.3":             CertTypeCSIP,
 	"ss-modbus-conf-v1.4":        CertTypeModbus,
@@ -97,6 +99,47 @@ var DocCertType = map[string]string{
 	"ss-1547-test-v1.1":          CertTypeModbus,
 	"ssm-conf-v0.8":              CertTypeModbus,
 	"ss-test-pki":                CertTypeModbus,
+}
+
+// NoCertificationBasis names document keys whose rows must never become a
+// `Test <ID>` row in a SUBMITTED SUMMARY.csv, with the reason a reviewer of
+// the readiness report needs. Every case belonging to one of these documents
+// becomes a Gap (kind GapNoCertBasis) regardless of its bench verdict — even a
+// PASS does not earn a row, because the row itself has nowhere valid to go —
+// while staying visible in the readiness report exactly like any other Gap.
+//
+//   - ss-modbus-client-conf-v1.1: SunSpec offers no Modbus CLIENT
+//     certification. The document's 16 CLI-*/READ-*/WR-*/INFO-*/PROT-*/ERR-*
+//     rows have no Test Description token and no Certificate Type in either
+//     §3.1.1 key table to be reported under.
+//   - ssm-conf-v0.8: Secure SunSpec Modbus is a v0.8 TEST-status
+//     specification — SunSpec's own draft marking, not a certification basis
+//     it issues certificates against. Its 39 rows are catalogued and
+//     assessed, but there is no certification for them to be a result OF yet.
+//   - ss-test-pki: not itself one of the two Results Reporting specs'
+//     governed procedure documents, and Certificate Type "SunSpec Modbus"
+//     does not obviously cover it either. This suite's registered rows
+//     (PKI-4/5/6/7) judge the DUT's IEEE 2030.5/CSIP device identity profile
+//     (see internal/certify/suitepki/doc.go: the SunSpec Test PKI
+//     application note scopes itself in its own §1 to certificates "for use
+//     with SunSpec CSIP Test Procedures", not Secure SunSpec Modbus ones).
+//     Filing them under Certificate Type "SunSpec Modbus" — the previous
+//     behaviour, and the one this map corrects — would misattribute a 2030.5
+//     identity-profile finding to a submission that says nothing about it.
+var NoCertificationBasis = map[string]string{
+	"ss-modbus-client-conf-v1.1": "SunSpec offers no Modbus CLIENT certification: this document's rows carry " +
+		"no Test Description token and no Certificate Type in either Results Reporting specification's " +
+		"§3.1.1 key table, so they have no `Test <ID>` row to be in any SUMMARY.csv",
+	"ssm-conf-v0.8": "SSM-CONF-v0.8 (Secure SunSpec Modbus) is a v0.8 TEST-status specification, SunSpec's own " +
+		"draft marking, not a certification basis SunSpec issues certificates against; its rows have no " +
+		"`Test <ID>` home in a submitted Summary Test Results until the specification reaches a certifiable " +
+		"revision",
+	"ss-test-pki": "SS-TEST-PKI is not itself one of the two Results Reporting specifications' governed " +
+		"procedure documents, and Certificate Type \"SunSpec Modbus\" does not cover it: the rows this suite " +
+		"registers (PKI-4/5/6/7) judge the DUT's IEEE 2030.5/CSIP device identity profile, per the SunSpec " +
+		"Test PKI application note's own §1 scope (\"for use with SunSpec CSIP Test Procedures\"), not a " +
+		"Secure SunSpec Modbus one — reporting them under Certificate Type \"SunSpec Modbus\" would " +
+		"misattribute a 2030.5 finding to a submission it says nothing about",
 }
 
 // ReportOnSelf are the two documents whose subject is this tool rather than the
@@ -128,7 +171,7 @@ func TestIDOf(uid string) string {
 // GapKind classifies why a case carries no `Test <Test ID>` row.
 type GapKind string
 
-// The three reasons a bundle case produces no verdict row.
+// The four reasons a bundle case produces no verdict row.
 const (
 	// GapEvidence — the case was SKIPped for a reason that is a fact about this
 	// RUN (no capture, a missing bench capability, an assertion that could not
@@ -140,6 +183,14 @@ const (
 	// GapUnrouted — the case belongs to a document DocCertType does not route,
 	// so no Results Reporting specification governs its verdict.
 	GapUnrouted GapKind = "unrouted-document"
+	// GapNoCertBasis — the case belongs to a document NoCertificationBasis
+	// names: it IS routed to a certificate type's report for the purpose of
+	// grouping its readiness gaps, but the document itself carries no
+	// certification a `Test <ID>` row could be reported AGAINST (no Test
+	// Description token, a TEST-status specification, or — SS-TEST-PKI — a
+	// scope that belongs to a different submission entirely). Applies
+	// regardless of bench verdict: even a PASS earns no row here.
+	GapNoCertBasis GapKind = "no-certification-basis"
 )
 
 // Gap is a bundle case that carries no verdict row, with the reason. Every gap
@@ -223,6 +274,12 @@ func MapVerdict(c bundle.TestCaseResult, na CaseApplicability, source string) (*
 	if _, routed := DocCertType[doc]; !routed {
 		return gap(GapUnrouted, fmt.Sprintf(
 			"no Results Reporting specification governs document %q, so its verdict has no report to go in", doc))
+	}
+	// Checked ahead of the verdict switch, and unconditionally of it: a
+	// document with no certification basis earns no `Test <ID>` row no matter
+	// what the bench observed — a PASS included. See NoCertificationBasis.
+	if reason, excluded := NoCertificationBasis[doc]; excluded {
+		return gap(GapNoCertBasis, reason)
 	}
 	switch c.Verdict {
 	case bundle.Pass:

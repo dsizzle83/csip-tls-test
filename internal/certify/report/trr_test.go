@@ -125,6 +125,21 @@ func TestVerdictMappingCoversEveryBenchOutcome(t *testing.T) {
 			"", GapCaveat, "a caveat",
 		},
 		{
+			"ss-modbus-client-conf-v1.1 has no certification basis, even a PASS",
+			bundle.TestCaseResult{ID: "ss-modbus-client-conf-v1.1::CLI-1", Verdict: bundle.Pass},
+			"", GapNoCertBasis, "no Modbus CLIENT certification",
+		},
+		{
+			"ssm-conf-v0.8 has no certification basis",
+			bundle.TestCaseResult{ID: "ssm-conf-v0.8::SSM-1", Verdict: bundle.Pass},
+			"", GapNoCertBasis, "TEST-status",
+		},
+		{
+			"ss-test-pki has no certification basis in the Modbus report",
+			bundle.TestCaseResult{ID: "ss-test-pki::PKI-4", Verdict: bundle.Fail},
+			"", GapNoCertBasis, "IEEE 2030.5/CSIP",
+		},
+		{
 			"a document no Results Reporting specification governs",
 			bundle.TestCaseResult{ID: "unknown-doc::E", Verdict: bundle.Pass},
 			"", GapUnrouted, "",
@@ -756,6 +771,112 @@ func TestTRRTracesAreEmptyWithoutASource(t *testing.T) {
 		if p.CertType == CertTypeCSIP && len(p.Submission.Traces) != 0 {
 			t.Errorf("CSIP submission carries %d trace(s) from a source with no archive/traces/ directory",
 				len(p.Submission.Traces))
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Documents with no certification basis
+// ---------------------------------------------------------------------------
+
+// noCertBasisSource is synthSource() plus one case from each document
+// NoCertificationBasis names, INCLUDING a PASS — the case the routing must
+// not be fooled by, since a bench PASS is normally the strongest signal a row
+// belongs in the CSV.
+func noCertBasisSource() Source {
+	src := synthSource()
+	b := *src.Bundle
+	b.Cases = append(append([]bundle.TestCaseResult{}, src.Bundle.Cases...),
+		bundle.TestCaseResult{ID: "ss-modbus-client-conf-v1.1::CLI-1", Verdict: bundle.Pass},
+		bundle.TestCaseResult{ID: "ssm-conf-v0.8::SSM-1", Verdict: bundle.Pass},
+		bundle.TestCaseResult{ID: "ss-test-pki::PKI-4", Verdict: bundle.Fail},
+	)
+	src.Bundle = &b
+	return src
+}
+
+// TestNoCertificationBasisDocsNeverReachTheCSV is Collate()'s half of the
+// routing: ss-modbus-client-conf-v1.1, ssm-conf-v0.8 and ss-test-pki cases
+// never produce a `Test <ID>` row — even the PASS — while still landing in
+// the Modbus part's Gaps, tagged GapNoCertBasis, so a reviewer of THAT part's
+// readiness report still finds them.
+func TestNoCertificationBasisDocsNeverReachTheCSV(t *testing.T) {
+	collated, err := Collate([]Source{noCertBasisSource()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod := collated[CertTypeModbus]
+	if mod == nil {
+		t.Fatal("no Modbus part collated")
+	}
+	excluded := []string{"CLI-1", "SSM-1", "PKI-4"}
+	for _, v := range mod.Verdicts {
+		for _, id := range excluded {
+			if v.ID == id {
+				t.Errorf("%s produced a SUMMARY.csv row (%+v); it has no certification basis", id, v)
+			}
+		}
+	}
+	uids := map[string]GapKind{
+		"ss-modbus-client-conf-v1.1::CLI-1": "",
+		"ssm-conf-v0.8::SSM-1":              "",
+		"ss-test-pki::PKI-4":                "",
+	}
+	for _, g := range mod.Gaps {
+		if _, ok := uids[g.UID]; ok {
+			uids[g.UID] = g.Kind
+		}
+	}
+	for uid, kind := range uids {
+		if kind == "" {
+			t.Errorf("%s did not appear in the Modbus part's Gaps at all", uid)
+		} else if kind != GapNoCertBasis {
+			t.Errorf("%s gap kind = %q, want %q", uid, kind, GapNoCertBasis)
+		}
+	}
+}
+
+// TestNoCertificationBasisDocsExcludedFromGeneratedCSV is the end-to-end
+// proof: a real GenerateTRR run over these documents writes no `CLI-1` /
+// `SSM-1` / `PKI-4` row into the Modbus submission's actual SUMMARY.csv (or
+// SUMMARY-INCOMPLETE.csv) file on disk, while the readiness report for that
+// same part names all three with the reason and the gap kind.
+func TestNoCertificationBasisDocsExcludedFromGeneratedCSV(t *testing.T) {
+	out := t.TempDir()
+	trr, err := GenerateTRR(TRROptions{
+		Dir: out, Sources: []Source{noCertBasisSource()}, Config: operatorConfig(),
+		ModbusLogs: goodModbusLogs(), Now: fixedNow, Tool: Tool, ToolVersion: "test",
+		AllowAuthorityGaps: true,
+	})
+	if err != nil {
+		t.Fatalf("GenerateTRR: %v", err)
+	}
+	var mod *TRRPart
+	for _, p := range trr.Parts {
+		if p.CertType == CertTypeModbus {
+			mod = p
+		}
+	}
+	if mod == nil || mod.Submission == nil {
+		t.Fatal("no Modbus submission in the package")
+	}
+	csv, err := os.ReadFile(mod.Submission.SummaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"CLI-1", "SSM-1", "PKI-4"} {
+		if strings.Contains(string(csv), want) {
+			t.Errorf("%s contains %q, which has no certification basis and must never be a row:\n%s",
+				filepath.Base(mod.Submission.SummaryPath), want, csv)
+		}
+	}
+	readiness, err := os.ReadFile(filepath.Join(out, certTypeSlug(CertTypeModbus), ReadinessFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"CLI-1", "SSM-1", "PKI-4", string(GapNoCertBasis)} {
+		if !strings.Contains(string(readiness), want) {
+			t.Errorf("the readiness report does not mention %q:\n%s", want, readiness)
 		}
 	}
 }
