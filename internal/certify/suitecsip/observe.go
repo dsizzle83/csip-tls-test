@@ -39,6 +39,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"csip-tls-test/internal/certify"
@@ -211,6 +212,17 @@ type ServerView struct {
 	DERPuts   []AdminDERPut
 	LogEvents []map[string]any
 	Status    AdminStatus
+
+	// RunDERPuts is the DER self-report PUTs the server recorded since the RUN
+	// began, not just since this check's baseline. It exists because the DER
+	// self-reports (DERStatus, DERCapability, DERSettings) are cadence- and
+	// change-driven: the DUT emits them on its own schedule, so the one a case
+	// is written to observe routinely lands earlier in the run than that case's
+	// narrow window. DERPuts answers "in THIS window"; RunDERPuts answers "in
+	// this run" — which is the observable a "the DUT self-reports X" claim
+	// actually rests on. It is scoped to the run (see the run baseline in
+	// check.go), so it never credits a report a previous campaign's DUT made.
+	RunDERPuts []AdminDERPut
 
 	// Notifications is the server's own log of what it pushed and what came
 	// back. Like Responses it is append-only, so Since deltas it by length.
@@ -396,15 +408,78 @@ func trimHref(h string) string {
 	return h
 }
 
-// PutsFor returns the DER report PUTs whose recorded root element matches.
+// PutsFor returns the DER report PUTs whose recorded root element matches,
+// scoped to this view's window (the check's baseline delta).
 func (v ServerView) PutsFor(resource string) []AdminDERPut {
+	return putsFor(v.DERPuts, resource)
+}
+
+// PutsForInRun returns the DER report PUTs for a resource anywhere in the run,
+// not just this check's window. It falls back to the window when the run-scoped
+// slice is absent (a synthetic view that set only DERPuts), so a caller can ask
+// this question unconditionally.
+func (v ServerView) PutsForInRun(resource string) []AdminDERPut {
+	if v.RunDERPuts == nil {
+		return v.PutsFor(resource)
+	}
+	return putsFor(v.RunDERPuts, resource)
+}
+
+func putsFor(puts []AdminDERPut, resource string) []AdminDERPut {
 	var out []AdminDERPut
-	for _, p := range v.DERPuts {
+	for _, p := range puts {
 		if p.Resource == resource {
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+// The run baseline in the DER self-report log.
+//
+// gridsim's der_puts log is append-only and NOT reset between campaigns, so the
+// whole log is "since gridsim booted", which is broader than "this run". A
+// campaign is one process, so the number of PUTs the log already held when this
+// run first looked is the run's start line: everything after it is this run's.
+// Captured once, on the first snapshot; see markRunBaseline / derPutsInRun.
+var (
+	runDERBaselineMu  sync.Mutex
+	runDERBaselineSet bool
+	runDERBaselineN   int
+)
+
+// markRunBaseline records, once per process, how many DER PUTs the server's log
+// already held — the split between a previous campaign's reports and this run's.
+func markRunBaseline(v ServerView) {
+	runDERBaselineMu.Lock()
+	defer runDERBaselineMu.Unlock()
+	if !runDERBaselineSet && v.Available {
+		runDERBaselineN = len(v.DERPuts)
+		runDERBaselineSet = true
+	}
+}
+
+// derPutsInRun returns the DER PUTs recorded since the run baseline. The log is
+// append-only, so the baseline COUNT is the split point. If the log is somehow
+// shorter than the baseline (gridsim restarted mid-run and its log truncated)
+// the whole current log is returned rather than nothing: under-reporting the
+// run would resurrect the false-FAIL this scoping exists to prevent.
+func derPutsInRun(v ServerView) []AdminDERPut {
+	runDERBaselineMu.Lock()
+	n, set := runDERBaselineN, runDERBaselineSet
+	runDERBaselineMu.Unlock()
+	if !set || n > len(v.DERPuts) {
+		return v.DERPuts
+	}
+	return v.DERPuts[n:]
+}
+
+// resetRunBaseline clears the process-wide run baseline. It exists for tests
+// that exercise the baseline directly; the runner never calls it.
+func resetRunBaseline() {
+	runDERBaselineMu.Lock()
+	runDERBaselineSet, runDERBaselineN = false, 0
+	runDERBaselineMu.Unlock()
 }
 
 // Observation is everything a check's decision logic is handed. Keeping it a

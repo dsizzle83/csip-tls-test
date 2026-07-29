@@ -171,6 +171,9 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 
 	obs := &Observation{Case: rc.Case, Params: map[string]string{}}
 	base := d.Snapshot(ctx)
+	// The first snapshot of the run fixes where this run's DER self-reports
+	// begin in gridsim's append-only, cross-campaign log.
+	markRunBaseline(base)
 	obs.Server = base
 
 	if s.Setup != nil {
@@ -211,6 +214,7 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 		obs.Server.BaseURL = view.BaseURL
 		obs.Server.Status = view.Status
 		obs.Server.Errors = view.Errors
+		obs.Server.RunDERPuts = derPutsInRun(view)
 	} else {
 		// No admin API: nothing to wait for and nothing to observe server-side.
 		// The handshake tier still works, so the check is not pointless — but it
@@ -245,6 +249,7 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 			obs.Server = after.Since(base)
 			obs.Server.Available, obs.Server.BaseURL = after.Available, after.BaseURL
 			obs.Server.Status, obs.Server.Errors = after.Status, after.Errors
+			obs.Server.RunDERPuts = derPutsInRun(after)
 			obs.Waited = waited + settle
 		}
 	}

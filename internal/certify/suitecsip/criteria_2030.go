@@ -498,23 +498,45 @@ func critDERPut(resource string) criterion {
 				len(seen), strings.Join(dedupeStrings(seen), " "), resource)
 		},
 		Server: func(v *ServerView) Finding {
-			puts := v.PutsFor(resource)
-			if len(puts) == 0 {
-				if !v.SessionEstablished() {
-					return noSessionUnavailable()
-				}
-				var seen []string
-				for _, p := range v.DERPuts {
-					seen = append(seen, p.Resource)
-				}
-				return Finding{Verdict: certify.Fail,
-					Observed: fmt.Sprintf("gridsim recorded no %s PUT from the DUT in this window (it recorded: %s)",
-						resource, strings.Join(dedupeStrings(seen), " "))}
+			if inWindow := v.PutsFor(resource); len(inWindow) > 0 {
+				last := inWindow[len(inWindow)-1]
+				return Finding{Verdict: certify.Pass,
+					Observed: fmt.Sprintf("gridsim recorded %d %s PUT(s) from the DUT in this case's window, "+
+						"most recently %d bytes at server time %d to %s", len(inWindow), resource,
+						len(last.Body), last.ReceivedAt, last.Path)}
 			}
-			return Finding{Verdict: certify.Pass,
-				Observed: fmt.Sprintf("gridsim recorded %d %s PUT(s) from the DUT, most recently %d bytes at "+
-					"server time %d to %s", len(puts), resource, len(puts[len(puts)-1].Body),
-					puts[len(puts)-1].ReceivedAt, puts[len(puts)-1].Path)}
+			// The DER self-reports (DERStatus, DERCapability, DERSettings) are
+			// cadence- and change-driven: the DUT emits them on its own schedule,
+			// so the report this case is written to observe routinely lands
+			// earlier in the run than this case's narrow window. The claim is that
+			// the DUT self-reports the resource, and a report anywhere in the run
+			// is the observable that rests on — so fall back to the run-scoped
+			// view before concluding the DUT never sent one.
+			if inRun := v.PutsForInRun(resource); len(inRun) > 0 {
+				last := inRun[len(inRun)-1]
+				return Finding{Verdict: certify.Pass,
+					Observed: fmt.Sprintf("gridsim recorded %d %s PUT(s) from the DUT during the run — none "+
+						"inside this case's own window, because the DUT reports it on its own cadence rather "+
+						"than on this case's cue; most recently %d bytes at server time %d to %s",
+						len(inRun), resource, len(last.Body), last.ReceivedAt, last.Path)}
+			}
+			// A report of ANY DER resource anywhere in the run proves a session
+			// established, so the absence of THIS one is a real DUT fact, not a
+			// handshake artifact — even if this check's own window saw no traffic.
+			if !v.SessionEstablished() && len(v.RunDERPuts) == 0 {
+				return noSessionUnavailable()
+			}
+			reported := v.RunDERPuts
+			if reported == nil {
+				reported = v.DERPuts
+			}
+			var seen []string
+			for _, p := range reported {
+				seen = append(seen, p.Resource)
+			}
+			return Finding{Verdict: certify.Fail,
+				Observed: fmt.Sprintf("gridsim recorded no %s PUT from the DUT anywhere in this run "+
+					"(it recorded: %s)", resource, strings.Join(dedupeStrings(seen), " "))}
 		},
 	}
 }

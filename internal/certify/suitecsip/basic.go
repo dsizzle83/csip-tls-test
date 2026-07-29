@@ -533,7 +533,7 @@ func critDERStatusElements() criterion {
 			return unavailable("the recovered transcript holds no DERStatus PUT")
 		},
 		Server: func(v *ServerView) Finding {
-			puts := v.PutsFor("DERStatus")
+			puts := v.PutsForInRun("DERStatus")
 			if len(puts) == 0 {
 				return unavailable("gridsim recorded no DERStatus PUT to inspect")
 			}
