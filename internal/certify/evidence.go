@@ -37,6 +37,7 @@ type FrameIndex struct {
 	packets []pcapng.Packet
 	frames  []*netdis.Frame
 	byIndex map[int]pcapng.Packet
+	byFrame map[int]*netdis.Frame
 	asm     *netdis.Assembler
 
 	// Undissectable lists frames that could not be dissected. They are reported
@@ -55,6 +56,7 @@ func NewFrameIndex(pkts []pcapng.Packet) *FrameIndex {
 		packets: pkts,
 		frames:  make([]*netdis.Frame, 0, len(pkts)),
 		byIndex: make(map[int]pcapng.Packet, len(pkts)),
+		byFrame: make(map[int]*netdis.Frame, len(pkts)),
 		asm:     netdis.NewAssembler(),
 	}
 	for _, p := range pkts {
@@ -66,6 +68,7 @@ func NewFrameIndex(pkts []pcapng.Packet) *FrameIndex {
 		}
 		fi.asm.AddFrame(f)
 		fi.frames = append(fi.frames, f)
+		fi.byFrame[f.Index] = f
 	}
 	if n := len(fi.Undissectable); n > 0 {
 		fi.Problems = append(fi.Problems, fmt.Sprintf("%d frame(s) did not dissect: %v",
@@ -114,6 +117,12 @@ func (fi *FrameIndex) Len() int { return len(fi.packets) }
 func (fi *FrameIndex) Packet(index int) (pcapng.Packet, bool) {
 	p, ok := fi.byIndex[index]
 	return p, ok
+}
+
+// frame returns one dissected frame by its 1-based index.
+func (fi *FrameIndex) frame(index int) (*netdis.Frame, bool) {
+	f, ok := fi.byFrame[index]
+	return f, ok
 }
 
 // Frames returns every dissected frame.
@@ -173,6 +182,70 @@ func (e *Evidence) Owns(frame int) bool { return e.Set.Owns(frame) }
 // HasFrames reports whether anything at all was attributed. A CiteFunc should
 // check this first and SKIP with a reason rather than assert on nothing.
 func (e *Evidence) HasFrames() bool { return len(e.Set.Frames) > 0 }
+
+// sessionNote is the caveat attached to a citation that rests on the
+// session-indivisible rule rather than a frame attributed to this check's
+// window.
+const sessionNote = "cited as part of a TLS conversation this check owns whose establishing handshake " +
+	"landed just before the window opened (a long-lived connection the DUT kept alive into it); the same " +
+	"\"a TLS session is indivisible evidence\" rule the attributor applies to a split conversation"
+
+// mayCite reports whether this check is entitled to cite a frame, and whether
+// the entitlement comes from the session-indivisible rule rather than direct
+// attribution.
+//
+// A frame the check's window OWNS is always citable — the ordinary case. Beyond
+// that, a frame is citable when it belongs to a TCP conversation this check owns
+// the rest of AND no other check claims it. That is not a loosening: it is the
+// same doctrine consolidateStreams already enforces for a conversation SPLIT
+// across two windows — a TLS session is indivisible evidence, so its handshake,
+// keys and records belong together — extended to the one case consolidation
+// cannot reach, where the establishing handshake fell in a GAP between windows
+// (attributed to no one) while the session's body is squarely this check's.
+// This is what lets an identity check cite the leaf on the very connection it
+// observed when the DUT presented it on a long-lived session established just
+// before the window. It never lets a check reach into another check's frames:
+// a frame owned or contested by anyone else is refused.
+func (e *Evidence) mayCite(frame int) (ok, viaSession bool) {
+	if e.Set.Owns(frame) {
+		return true, false
+	}
+	fr, found := e.Index.frame(frame)
+	if !found {
+		return false, false
+	}
+	flow, hasFlow := fr.Flow()
+	if !hasFlow {
+		return false, false
+	}
+	key := flow.Stream().String()
+	owned := false
+	for _, s := range e.Set.Streams {
+		if s == key {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		return false, false
+	}
+	// The frame must belong to no OTHER check: never steal, never cite a
+	// contested frame.
+	if e.Attribution != nil {
+		for uid, fs := range e.Attribution.Sets {
+			if uid == e.Case.UID {
+				continue
+			}
+			if fs.owns[frame] {
+				return false, false
+			}
+		}
+		if _, contested := e.Attribution.Contested[frame]; contested {
+			return false, false
+		}
+	}
+	return true, true
+}
 
 // Packets returns only the packets attributed to this check.
 func (e *Evidence) Packets() []pcapng.Packet {
@@ -282,21 +355,26 @@ func (e *Evidence) CiteFrames(claim, method string, v Verdict, observed string, 
 		return Assertion{}, fmt.Errorf("certify: %s: CiteFrames with no frames — "+
 			"use Narrative or SkipAssertion for a claim with nothing on the wire behind it", e.Case.UID)
 	}
+	viaSession := false
 	for _, f := range frames {
-		if e.Set.Owns(f) {
-			continue
+		ok, s := e.mayCite(f)
+		if !ok {
+			owner := e.Attribution.owner(f)
+			if owner == "" {
+				owner = "no test case (background traffic or outside every window)"
+			}
+			return Assertion{}, fmt.Errorf("certify: %s may not cite frame %d: it was attributed to %s. "+
+				"A check may cite only the frames its own connections produced",
+				e.Case.UID, f, owner)
 		}
-		owner := e.Attribution.owner(f)
-		if owner == "" {
-			owner = "no test case (background traffic or outside every window)"
-		}
-		return Assertion{}, fmt.Errorf("certify: %s may not cite frame %d: it was attributed to %s. "+
-			"A check may cite only the frames its own connections produced",
-			e.Case.UID, f, owner)
+		viaSession = viaSession || s
 	}
 	a, err := bundle.CiteFrames(claim, method, v, observed, e.Index.Packets(), frames)
 	if err != nil {
 		return Assertion{}, fmt.Errorf("certify: %s: %w", e.Case.UID, err)
+	}
+	if viaSession {
+		a.Note = joinNote(a.Note, sessionNote)
 	}
 	return e.annotate(a), nil
 }
@@ -329,16 +407,25 @@ func (e *Evidence) CiteBytes(claim, method string, v Verdict, observed string,
 	// The frames those bytes arrived in must be ours too. They normally are —
 	// the whole stream is ours — but a connection that outlived the window
 	// (a late FIN, a reused socket) would otherwise let a citation reach past
-	// the window's end.
+	// the window's end. A frame of THIS owned conversation that no other check
+	// claims is still ours by the session-indivisible rule (mayCite), which is
+	// what lets a citation reach the establishing handshake of a long-lived
+	// connection whose start fell in a gap before the window.
+	viaSession := false
 	for _, f := range d.Bytes.PacketsFor(start, end) {
-		if !e.Set.Owns(f) {
+		ok, s := e.mayCite(f)
+		if !ok {
 			return Assertion{}, fmt.Errorf("certify: %s may not cite %s bytes [%d,%d): they arrived in "+
 				"frame %d, which is outside this check's window", e.Case.UID, ref, start, end, f)
 		}
+		viaSession = viaSession || s
 	}
 	a, err := bundle.CiteBytes(claim, method, v, observed, ref, d.Bytes, start, end)
 	if err != nil {
 		return Assertion{}, fmt.Errorf("certify: %s: %w", e.Case.UID, err)
+	}
+	if viaSession {
+		a.Note = joinNote(a.Note, sessionNote)
 	}
 	return e.annotate(a), nil
 }
