@@ -96,20 +96,41 @@ func (b *Bundle) Report() string {
 		}
 	}
 
+	app, inf := b.CountsByClaim()
+	split := inf.Total() > 0
+
 	fmt.Fprintf(&sb, "## Result\n\n")
 	fmt.Fprintf(&sb, "**%d PASS · %d FAIL · %d SKIP · %d WARN** across %d test case(s).\n\n",
 		pass, fail, skip, warn, len(b.Cases))
-	if b.OK() {
+	// Split the headline by whether a row bears on the certification CLAIM. A
+	// row the product does not claim conformance to still runs and its verdict
+	// is still evidence — but folding its FAIL into the same number as a
+	// claim-relevant one overstates the run, which is exactly what
+	// runs/certfix-validate-20260729T192416's "✗ 8 test case(s) FAILED" did with
+	// AGG-009, AGG-012 and UTIL-002. Printed only when informative rows are
+	// present, so a claim-only bundle stays quiet.
+	if split {
+		fmt.Fprintf(&sb, "- **Applicable to the claim:** %d PASS · %d FAIL · %d SKIP · %d WARN "+
+			"(%d case(s))\n", app.Pass, app.Fail, app.Skip, app.Warn, app.Total())
+		fmt.Fprintf(&sb, "- **Informative** — implemented, not claimed, marked `%s` in the table below: "+
+			"%d PASS · %d FAIL · %d SKIP · %d WARN (%d case(s))\n\n",
+			informativeTag, inf.Pass, inf.Fail, inf.Skip, inf.Warn, inf.Total())
+	}
+	switch {
+	case b.OK():
 		fmt.Fprintf(&sb, "✓ No failures.\n\n")
-	} else if fail > 0 {
+	case fail > 0 && split:
+		fmt.Fprintf(&sb, "✗ %d test case(s) FAILED — %d applicable to the claim, %d informative. Only the "+
+			"applicable failures bear on the certification claim.\n\n", fail, app.Fail, inf.Fail)
+	case fail > 0:
 		fmt.Fprintf(&sb, "✗ %d test case(s) FAILED.\n\n", fail)
 	}
 
-	fmt.Fprintf(&sb, "| Case | Title | Verdict | Assertions | Frames |\n")
-	fmt.Fprintf(&sb, "|------|-------|---------|-----------:|--------|\n")
+	fmt.Fprintf(&sb, "| Case | Title | Claim | Verdict | Assertions | Frames |\n")
+	fmt.Fprintf(&sb, "|------|-------|-------|---------|-----------:|--------|\n")
 	for _, c := range b.Cases {
-		fmt.Fprintf(&sb, "| %s | %s | %s | %d | %s |\n",
-			mdEscape(c.ID), mdEscape(c.Title), c.Verdict, len(c.Assertions), frameSpan(c))
+		fmt.Fprintf(&sb, "| %s | %s | %s | %s | %d | %s |\n",
+			mdEscape(c.ID), mdEscape(c.Title), claimTag(c), c.Verdict, len(c.Assertions), frameSpan(c))
 	}
 	fmt.Fprintf(&sb, "\n")
 
@@ -125,6 +146,14 @@ func (b *Bundle) Report() string {
 	fmt.Fprintf(&sb, "## Test cases\n\n")
 	for _, c := range b.Cases {
 		fmt.Fprintf(&sb, "### %s %s — %s\n\n", glyph(c.Verdict), mdEscape(caseTitle(c)), c.Verdict)
+		// An informative row says so on its own heading, not only in a column
+		// forty lines up. A reader who lands here from a search for "FAIL"
+		// must not have to reconstruct whether anyone is certifying against it.
+		if !c.Applicable {
+			fmt.Fprintf(&sb, "**Informative row — NOT applicable to the certification claim.** The catalog "+
+				"marks this case out of scope for the claimed profile; it is run and reported because its "+
+				"verdict is evidence about the implementation, but it does not bear on the claim.\n\n")
+		}
 		if c.Doc != "" {
 			fmt.Fprintf(&sb, "Reference: %s\n\n", mdEscape(c.Doc))
 		}
@@ -164,6 +193,17 @@ func (b *Bundle) Report() string {
 		fmt.Fprintf(&sb, "\n")
 	}
 	return sb.String()
+}
+
+// informativeTag marks a row nobody is certifying against, in the index table.
+const informativeTag = "info"
+
+// claimTag renders one case's bearing on the certification claim.
+func claimTag(c TestCaseResult) string {
+	if c.Applicable {
+		return "yes"
+	}
+	return informativeTag
 }
 
 func caseTitle(c TestCaseResult) string {

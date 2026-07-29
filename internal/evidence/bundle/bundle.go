@@ -215,9 +215,60 @@ func (b *Bundle) Counts() (pass, fail, skip, warn int) {
 }
 
 // OK reports whether the run is a clean pass: at least one case, and no FAIL.
+//
+// It deliberately aggregates EVERY failure, informative rows included. Whether
+// an informative FAIL should stop a run being called clean is a policy call for
+// the owner of the claim; grouping it separately in the report — see
+// CountsByClaim — is a reporting question and is answered there.
 func (b *Bundle) OK() bool {
 	_, fail, _, _ := b.Counts()
 	return len(b.Cases) > 0 && fail == 0
+}
+
+// VerdictCounts is a per-verdict tally of test cases.
+type VerdictCounts struct{ Pass, Fail, Skip, Warn int }
+
+func (v *VerdictCounts) add(k Verdict) {
+	switch k {
+	case Pass:
+		v.Pass++
+	case Fail:
+		v.Fail++
+	case Skip:
+		v.Skip++
+	case Warn:
+		v.Warn++
+	}
+}
+
+// Total is the number of cases in the tally.
+func (v VerdictCounts) Total() int { return v.Pass + v.Fail + v.Skip + v.Warn }
+
+// CountsByClaim splits the tally into the cases that bear on the certification
+// CLAIM (TestCaseResult.Applicable) and the INFORMATIVE ones the suite
+// implements but the product does not claim.
+//
+// The bundle has carried the per-case flag since the console report learned to
+// split its headline, and REPORT.md — the artefact an assessor actually reads —
+// ignored it. So runs/certfix-validate-20260729T192416 announced "✗ 8 test
+// case(s) FAILED" over a table in which AGG-009, AGG-012 and UTIL-002 sat
+// unmarked beside five claim-relevant failures, with no way to tell them apart
+// short of opening bundle.json. Three of those eight are rows nobody is
+// certifying against: the catalog marks all twenty-two aggregator-only rows
+// applicable:false under the DER-Client claim, the runner carried that flag
+// into every per-case record, and the run honoured it everywhere except in what
+// it printed.
+//
+// No verdict changes here. This is the grouping, and only the grouping.
+func (b *Bundle) CountsByClaim() (applicable, informative VerdictCounts) {
+	for _, c := range b.Cases {
+		if c.Applicable {
+			applicable.add(c.Verdict)
+		} else {
+			informative.add(c.Verdict)
+		}
+	}
+	return
 }
 
 // ByteSource is the part of a reassembled TCP direction an assertion needs.

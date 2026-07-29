@@ -821,6 +821,56 @@ func TestFinaliseRecordsAReconciledVerdict(t *testing.T) {
 	}
 }
 
+// TestBundleAndReportBucketAnInapplicableCase closes the loop the bucketing
+// defect ran through: the catalog's `applicable` flag has to reach the per-case
+// bundle record AND the REPORT.md an assessor reads. It reached the record and
+// stopped there, so REPORT.md counted three informative failures in the same
+// headline number as five claim-relevant ones.
+func TestBundleAndReportBucketAnInapplicableCase(t *testing.T) {
+	cat := catalogFile(t)
+	reg := NewRegistry()
+	reg.Register("doc-a::A-001", "applicable row", noopCheck)  // applicable: true
+	reg.Register("doc-a::A-003", "informative row", noopCheck) // applicable: false
+	opts, out := baseOptions(t, nil)
+	run, err := New(reg, cat, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v\n%s", err, console(opts))
+	}
+
+	b, err := bundle.Load(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, c := range b.Cases {
+		got[c.ID] = c.Applicable
+	}
+	if !got["doc-a::A-001"] {
+		t.Error("the bundle lost the catalog's applicable:true")
+	}
+	if got["doc-a::A-003"] {
+		t.Error("the bundle records an inapplicable case as applicable, so its verdict would be " +
+			"counted against the certification claim")
+	}
+	app, inf := b.CountsByClaim()
+	if app.Total() == 0 || inf.Total() == 0 {
+		t.Errorf("CountsByClaim did not split the run: %+v / %+v", app, inf)
+	}
+
+	report, err := os.ReadFile(filepath.Join(out, "REPORT.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Applicable to the claim:", "Informative", "| info |"} {
+		if !strings.Contains(string(report), want) {
+			t.Errorf("REPORT.md does not bucket the informative row (%q missing):\n%s", want, report)
+		}
+	}
+}
+
 // TestBundleCarriesTheRedactedInvocation: the bundle recorded dumpcap's whole
 // command line and nothing about the command that chose the interface, the
 // filter, the selection and the targets. It now records both — with the values

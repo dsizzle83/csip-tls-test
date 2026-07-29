@@ -245,6 +245,64 @@ func TestCommittedCatalogLoads(t *testing.T) {
 	}
 }
 
+// TestAggregatorRowsAreOutsideTheDERClientClaim pins the scoping the whole
+// applicable/informative split rests on.
+//
+// The gateway is certified against the CTP §4 DER CLIENT column in the
+// Generating Facility EMS posture; CSIP's aggregator rows front a fleet ACROSS
+// facilities with per-EndDevice registration and 2030.5-layer fan-out, while
+// this product's fan-out happens below the 2030.5 boundary inside its one
+// EndDevice. The owner's 2026-07-28 decision moved these twenty-two rows out of
+// the claim while keeping them in the run — they are implemented, they execute,
+// and their verdicts are informative evidence, but nobody is certifying against
+// them.
+//
+// A run's reporting can only bucket what the catalog states, so this is the
+// check that the statement is there. If a re-extraction flips one of these rows
+// back to applicable, an AGG-row FAIL silently becomes a certification failure
+// again — the shape of the defect runs/certfix-validate-20260729T192416
+// exhibited.
+func TestAggregatorRowsAreOutsideTheDERClientClaim(t *testing.T) {
+	path, err := DefaultCatalogPath()
+	if err != nil {
+		t.Skipf("no committed catalog reachable from %s: %v", mustGetwd(t), err)
+	}
+	cat, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aggregatorOnly := []string{
+		"AGG-001", "AGG-002", "AGG-003", "AGG-004", "AGG-005", "AGG-006",
+		"AGG-007", "AGG-008", "AGG-009", "AGG-010", "AGG-011", "AGG-012",
+		"CORE-018", "CORE-019", "ERR-002",
+		"MAINT-001", "MAINT-003", "MAINT-004", "MAINT-005",
+		"UTIL-002", "UTIL-003", "UTIL-004",
+	}
+	if len(aggregatorOnly) != 22 {
+		t.Fatalf("the scoping decision covers 22 rows, this test lists %d", len(aggregatorOnly))
+	}
+	byID := map[string]*Case{}
+	for _, c := range cat.All() {
+		if c.Doc == "CSIP-CONF-v1.3" {
+			byID[c.ID] = c
+		}
+	}
+	for _, id := range aggregatorOnly {
+		c, ok := byID[id]
+		if !ok {
+			t.Errorf("%s is not in the committed catalog", id)
+			continue
+		}
+		if c.Applicable {
+			t.Errorf("%s is marked applicable: an aggregator-only row must be informative under the "+
+				"DER-Client claim, or its FAIL reads as a certification failure", id)
+		}
+		if strings.TrimSpace(c.ApplicabilityReason) == "" {
+			t.Errorf("%s is inapplicable with no reason recorded", id)
+		}
+	}
+}
+
 func mustGetwd(t *testing.T) string {
 	t.Helper()
 	d, err := os.Getwd()
