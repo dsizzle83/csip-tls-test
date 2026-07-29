@@ -82,7 +82,7 @@ func coreBasicTime(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 						}
 						href := links[0].Href()
 						for _, ex := range t.GETs(href) {
-							return citeExchange(ex, certify.Pass,
+							return citeExchange(t, ex, certify.Pass,
 								"DeviceCapability advertised TimeLink href=%q and the DUT fetched it: %s",
 								href, ex.String())
 						}
@@ -228,7 +228,7 @@ func coreAdvancedFSA(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 						}
 						for _, ex := range t.Exchanges {
 							if ex.Req != nil && strings.HasPrefix(ex.Req.Path, best) {
-								return citeExchange(ex, certify.Pass,
+								return citeExchange(t, ex, certify.Pass,
 									"the lowest-primacy DERProgram is %s (primacy %d) and the DUT fetched %s",
 									best, bestPrim, ex.Req.Line())
 							}

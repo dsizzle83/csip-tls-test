@@ -597,15 +597,15 @@ func critSubscriptionPosted(resource, why string) criterion {
 					return citeMessage(t, e.Req, certify.Fail,
 						"the Subscription POST to %s was never answered in the capture", e.Req.Target)
 				case e.Resp.Status != 201:
-					return citeExchange(e, certify.Fail,
+					return citeExchange(t, e, certify.Fail,
 						"POST %s carrying a Subscription for %q -> %s; the procedure requires 201 Created",
 						e.Req.Target, sub, e.Resp.Line())
 				case e.Resp.Header.Get("Location") == "":
-					return citeExchange(e, certify.Fail,
+					return citeExchange(t, e, certify.Fail,
 						"POST %s -> 201 Created but with no Location header naming the created subscription",
 						e.Req.Target)
 				default:
-					return citeExchange(e, certify.Pass,
+					return citeExchange(t, e, certify.Pass,
 						"POST %s carrying a Subscription for %q -> 201 Created, Location: %s",
 						e.Req.Target, sub, e.Resp.Header.Get("Location"))
 				}

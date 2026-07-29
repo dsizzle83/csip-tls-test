@@ -93,7 +93,7 @@ func commBasicDiscovery(ctx context.Context, rc *certify.RunCtx) (certify.Result
 							return unavailable("the recovered transcript holds no exchanges")
 						}
 						if len(bad) > 0 {
-							return citeExchange(bad[0], certify.Fail,
+							return citeExchange(t, bad[0], certify.Fail,
 								"%d of %d GETs were not 2xx; first was %s",
 								len(bad), len(t.Exchanges), bad[0].String())
 						}

@@ -80,7 +80,7 @@ func errRedirect(ctx context.Context, rc *certify.RunCtx) (certify.Result, error
 									"%s -> %s with NO Location header; 2030.5 §5.5.2 requires one on a 302",
 									e.Req.Line(), e.Resp.Line())
 							}
-							return citeExchange(e, certify.Pass, "%s -> %s, Location: %s",
+							return citeExchange(t, e, certify.Pass, "%s -> %s, Location: %s",
 								e.Req.Line(), e.Resp.Line(), loc)
 						}
 						return unavailable("no 301 or 302 appears in the recovered transcript; the injection "+
@@ -128,7 +128,7 @@ func errRedirect(ctx context.Context, rc *certify.RunCtx) (certify.Result, error
 						}
 						for _, e := range t.Exchanges[redirectAt+1:] {
 							if e.Req != nil && e.Req.Path == want {
-								return citeExchange(e, certify.Pass,
+								return citeExchange(t, e, certify.Pass,
 									"the DUT re-issued %s inside the same TLS session and the server answered %s",
 									e.Req.Line(), e.Resp.Line())
 							}

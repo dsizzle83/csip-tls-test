@@ -430,15 +430,15 @@ func basicAlarms(ctx context.Context, rc *certify.RunCtx) (certify.Result, error
 								return citeMessage(t, e.Req, certify.Fail,
 									"the LogEvent payload is missing %s", strings.Join(missing, ", "))
 							case e.Resp.Status != 201:
-								return citeExchange(e, certify.Fail,
+								return citeExchange(t, e, certify.Fail,
 									"POST %s carrying LogEvent -> %s; 2030.5 §5.5.2 requires 201 Created",
 									e.Req.Target, e.Resp.Line())
 							case loc == "":
-								return citeExchange(e, certify.Fail,
+								return citeExchange(t, e, certify.Fail,
 									"POST %s -> 201 Created but with no Location header, which 2030.5 requires "+
 										"on a 201", e.Req.Target)
 							default:
-								return citeExchange(e, certify.Pass,
+								return citeExchange(t, e, certify.Pass,
 									"POST %s carrying a complete LogEvent -> 201 Created, Location: %s",
 									e.Req.Target, loc)
 							}
@@ -589,11 +589,11 @@ func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result,
 							loc := e.Resp.Header.Get("Location")
 							switch {
 							case !ok:
-								return citeExchange(e, certify.Fail,
+								return citeExchange(t, e, certify.Fail,
 									"POST %s carrying MirrorUsagePoint -> %s; 2030.5 §10.11.3 requires 201 "+
 										"(new mRID) or 204 (existing)", e.Req.Target, e.Resp.Line())
 							case loc == "":
-								return citeExchange(e, certify.Fail,
+								return citeExchange(t, e, certify.Fail,
 									"POST %s -> %s with no Location header, which §10.11.3 requires on both the "+
 										"201 and the 204", e.Req.Target, e.Resp.Line())
 							case lfdi == "":
@@ -601,7 +601,7 @@ func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result,
 									"the MirrorUsagePoint carries no deviceLFDI, so the server cannot bind the "+
 										"mirror to the reporting device")
 							default:
-								return citeExchange(e, certify.Pass,
+								return citeExchange(t, e, certify.Pass,
 									"POST %s carrying MirrorUsagePoint deviceLFDI=%s with %d ReadingType(s) -> "+
 										"%s, Location: %s", e.Req.Target, lfdi, len(rt), e.Resp.Line(), loc)
 							}

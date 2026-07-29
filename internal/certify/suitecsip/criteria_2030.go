@@ -487,7 +487,7 @@ func critDERPut(resource string) criterion {
 						v = certify.Fail
 					}
 				}
-				return citeExchange(e, v, "PUT %s carrying %s -> %s%s",
+				return citeExchange(t, e, v, "PUT %s carrying %s -> %s%s",
 					e.Req.Target, resource, e.Resp.Line(), note)
 			}
 			if len(seen) == 0 {

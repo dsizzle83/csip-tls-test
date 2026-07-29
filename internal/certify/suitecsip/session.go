@@ -319,25 +319,87 @@ func (t *Transcript) Method(method string) []Exchange {
 	return t.Filter(func(e Exchange) bool { return e.Req != nil && e.Req.Method == method })
 }
 
-// Filter returns the exchanges matching a predicate, in order.
-func (t *Transcript) Filter(pred func(Exchange) bool) []Exchange {
-	var out []Exchange
-	for _, e := range t.Exchanges {
-		if pred(e) {
-			out = append(out, e)
+// Own returns every conversation this test case wholly owns on the 2030.5
+// server endpoint: the one RecoverSession selected, followed by the rest, in
+// capture order.
+//
+// Every entry is one the test case may CITE — RecoverSession discards a
+// straddling conversation before any of them becomes a candidate — which is
+// what makes searching across them sound rather than merely convenient.
+func (t *Transcript) Own() []*Transcript {
+	if t == nil {
+		return nil
+	}
+	out := make([]*Transcript, 0, 1+len(t.Others))
+	out = append(out, t)
+	for _, o := range t.Others {
+		if o != nil && o != t {
+			out = append(out, o)
 		}
 	}
 	return out
 }
 
-// First returns the first exchange matching a predicate.
-func (t *Transcript) First(pred func(Exchange) bool) (Exchange, bool) {
-	for _, e := range t.Exchanges {
-		if pred(e) {
-			return e, true
+// Filter returns the exchanges matching a predicate across every conversation
+// this test case owns, in capture order.
+//
+// # Why it is not just this one conversation
+//
+// A window routinely catches several conversations with the 2030.5 server, and
+// the DUT does not put everything on one of them. Its discovery walk gets a
+// fresh connection per poll cycle; its DERControlResponse POSTs and its DER
+// self-report PUTs ride connections of their own, opened when there is
+// something to say. RecoverSession has to pick ONE of those as "the session" —
+// the discovery walk, because that is the one whose shape identifies it — and
+// for a while every criterion then searched only that pick. The consequence was
+// not a wrong answer but a missing one: the criterion reported "the recovered
+// transcript holds no PUT from the DUT" while the PUT sat, decrypted and
+// citable, in a sibling conversation of the SAME frame set, and the case fell
+// back to gridsim's server-side record, which carries no digest and is
+// therefore downgraded out of PASS.
+//
+// So the lookup is over the conversations this case owns, not over the one it
+// selected. That is the same doctrine HandshakeSession already applies to the
+// certificate tier, generalised: ownership was settled before selection, so
+// selection is a question of which conversation to NAME, never of which
+// evidence exists. Each returned exchange remembers where it came from
+// (Exchange.In), and citeMessage cites that conversation's stream.
+//
+// Exchanges are ordered by the capture frame that carried them, so two runs
+// over the same capture return them in the same order.
+func (t *Transcript) Filter(pred func(Exchange) bool) []Exchange {
+	var out []Exchange
+	for _, s := range t.Own() {
+		for _, e := range s.Exchanges {
+			if pred(e) {
+				out = append(out, e)
+			}
 		}
 	}
-	return Exchange{}, false
+	sort.SliceStable(out, func(i, j int) bool { return firstFrame(out[i]) < firstFrame(out[j]) })
+	return out
+}
+
+// firstFrame is an exchange's earliest capture frame, which is how exchanges
+// drawn from several conversations are put back into capture order.
+func firstFrame(e Exchange) int {
+	lo := 0
+	for _, f := range e.Frames() {
+		if lo == 0 || f < lo {
+			lo = f
+		}
+	}
+	return lo
+}
+
+// First returns the first exchange matching a predicate, across every
+// conversation this test case owns.
+func (t *Transcript) First(pred func(Exchange) bool) (Exchange, bool) {
+	hits := t.Filter(pred)
+	if len(hits) == 0 {
+		return Exchange{}, false
+	}
+	return hits[0], true
 }
 
 // Paths lists the distinct request paths in order of first appearance, which is
@@ -580,14 +642,70 @@ func RecoverSession(ev *certify.Evidence, remote netip.AddrPort) (*Transcript, e
 			DiscoveryRoot, len(cands), bestRecs, strings.Join(describe(best), "; ")))
 		return attachOthers(t), nil
 	default:
+		// SEVERAL wholly-owned conversations each carry a discovery walk. That
+		// is the ORDINARY shape of a window that outlives one poll cycle: a
+		// 2030.5 client re-walks from /dcap on a fresh connection every
+		// pollRate, and a check that publishes a control and waits 90 s for the
+		// DUT to notice routinely spans two complete walks.
+		//
+		// This used to be refused as "genuinely ambiguous", on the reasoning
+		// that picking one of two candidates is how a bundle cites the wrong
+		// handshake. That reasoning does not apply here and the refusal cost
+		// the run its whole tier-1/tier-2 evidence: RecoverSession returned no
+		// transcript at all, so every wire criterion fell through to gridsim's
+		// server-side record, which carries no digest, and every PASS built on
+		// one was downgraded to WARN. Twenty-two rows of
+		// runs/certfix-validate-20260729T192416 are that one refusal.
+		//
+		// Ownership is what makes picking safe, and ownership was settled
+		// above: a straddling conversation was already discarded, so every
+		// candidate here is one this test case wholly owns and may cite. There
+		// is no wrong choice to make — only a choice to DISCLOSE. The pick is
+		// the most complete walk (most exchanges), tie-broken by the earliest
+		// frame so the same capture always yields the same selection, and the
+		// rejected candidates become Others, which every lookup searches
+		// anyway (see Transcript.Filter). The choice and the alternatives are
+		// recorded in Problems, so the report says which conversation it named
+		// and what else was there.
+		best := disc[0]
+		for _, i := range disc[1:] {
+			switch {
+			case len(cands[i].t.Exchanges) > len(cands[best].t.Exchanges):
+				best = i
+			case len(cands[i].t.Exchanges) == len(cands[best].t.Exchanges) &&
+				firstFrameOf(cands[i].t) < firstFrameOf(cands[best].t):
+				best = i
+			}
+		}
 		names := make([]string, 0, len(disc))
 		for _, i := range disc {
-			names = append(names, streams[i].Key.String())
+			if i == best {
+				continue
+			}
+			names = append(names, fmt.Sprintf("%s (%d exchange(s))", streams[i].Key, len(cands[i].t.Exchanges)))
 		}
-		return nil, fmt.Errorf("%d attributed conversations on port %d each carry GET %s (%s); the "+
-			"discovery session is genuinely ambiguous in this window",
-			len(disc), remote.Port(), DiscoveryRoot, strings.Join(names, ", "))
+		t := cands[best].t
+		t.Problems = append(t.Problems, fmt.Sprintf(
+			"%d attributed conversations on port %d each carry GET %s — the DUT re-walks discovery on a "+
+				"fresh connection every poll cycle, and this window spans more than one. Selected %s, the "+
+				"most complete walk (%d exchange(s)); the other(s) are carried as sibling conversations this "+
+				"test case also owns and every resource lookup searches: %s",
+			len(disc), remote.Port(), DiscoveryRoot, streams[best].Key, len(t.Exchanges),
+			strings.Join(names, "; ")))
+		return attachOthers(t), nil
 	}
+}
+
+// firstFrameOf is a conversation's earliest recovered capture frame, used only
+// to break a tie deterministically.
+func firstFrameOf(t *Transcript) int {
+	lo := 0
+	for _, e := range t.Exchanges {
+		if f := firstFrame(e); f != 0 && (lo == 0 || f < lo) {
+			lo = f
+		}
+	}
+	return lo
 }
 
 // ownedFrames reports how many of a conversation's capture frames this test
@@ -815,6 +933,15 @@ func (t *Transcript) decrypt(ev *certify.Evidence) string {
 		t.Problems = append(t.Problems, perr.Error())
 	}
 	t.Requests, t.Responses = reqs, resps
+	// Every recovered message remembers the conversation it travelled on, so a
+	// criterion that finds it through one of the across-conversation lookups can
+	// still cite the stream it was actually on. See Message.In and citeMessage.
+	for _, m := range reqs {
+		m.In = t
+	}
+	for _, m := range resps {
+		m.In = t
+	}
 	for i, r := range reqs {
 		e := Exchange{Req: r}
 		if i < len(resps) {
@@ -885,14 +1012,13 @@ func (t *Transcript) Resource(name string) (Exchange, *Node, bool) {
 
 // ResourceNames lists the distinct root element names the server returned, in
 // order of first appearance — the compact description of what the DUT actually
-// walked, independent of any URI scheme.
+// walked, independent of any URI scheme. Like every other lookup here it spans
+// the conversations this test case owns, so the diagnostic it prints ("resources
+// seen: …") describes the same evidence a criterion searched.
 func (t *Transcript) ResourceNames() []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, e := range t.Exchanges {
-		if e.Resp == nil || len(e.Resp.Body) == 0 {
-			continue
-		}
+	for _, e := range t.Filter(func(e Exchange) bool { return e.Resp != nil && len(e.Resp.Body) > 0 }) {
 		doc, err := e.Resp.SEP()
 		if err != nil || seen[doc.Local()] {
 			continue

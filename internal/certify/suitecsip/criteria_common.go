@@ -260,10 +260,10 @@ func critGET(path, claim, how string, want func(*Node) (certify.Verdict, string)
 				return citeMessage(t, e.Req, certify.Fail, "GET %s was never answered in the capture", path)
 			}
 			if e.Resp.Status != 200 {
-				return citeExchange(e, certify.Fail, "GET %s -> %s", path, e.Resp.Line())
+				return citeExchange(t, e, certify.Fail, "GET %s -> %s", path, e.Resp.Line())
 			}
 			if want == nil {
-				return citeExchange(e, certify.Pass, "GET %s -> 200, %d-byte %s payload",
+				return citeExchange(t, e, certify.Pass, "GET %s -> 200, %d-byte %s payload",
 					path, len(e.Resp.Body), e.Resp.ContentType())
 			}
 			doc, err := e.Resp.SEP()
@@ -326,7 +326,7 @@ func critFollowedLink() criterion {
 					continue
 				}
 				if e.Req.Path != DiscoveryRoot && known[e.Req.Path] {
-					return citeExchange(e, certify.Pass,
+					return citeExchange(t, e, certify.Pass,
 						"%s was fetched from an href the server had already served", e.Req.Line())
 				}
 				if e.Resp == nil || e.Resp.Status != 200 || len(e.Resp.Body) == 0 {

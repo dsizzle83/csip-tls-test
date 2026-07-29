@@ -223,28 +223,58 @@ func (c criterion) skipReason(obs *Observation) string {
 // citeMessage cites the TLS records that carried one recovered HTTP message.
 // This is the standard tier-2 citation and the reason the transcript tracks
 // ciphertext offsets at all.
+// The byte range is taken from the conversation the message actually travelled
+// on (Message.In), not from the one RecoverSession selected. The two differ
+// whenever the fact a criterion wants rode a sibling connection of the same
+// frame set — a DER self-report PUT, a DERControlResponse POST — and citing the
+// selected conversation's directions for a message that was never on them would
+// name a byte range that decrypts to something else entirely. When they differ
+// the Observed field says so: "these bytes are from another conversation of this
+// window" is a fact the reader of a bundle is entitled to.
 func citeMessage(t *Transcript, m *Message, v certify.Verdict, format string, a ...any) Finding {
 	if m == nil {
 		return unavailable("the message this criterion is about is not in the recovered transcript")
 	}
-	dir := t.ClientDir
+	owner := m.In
+	if owner == nil {
+		owner = t
+	}
+	dir := owner.ClientDir
 	if m.Kind == Response {
-		dir = t.ServerDir
+		dir = owner.ServerDir
 	}
 	f := Finding{Verdict: v, Observed: fmt.Sprintf(format, a...), Frames: m.Frames}
 	if dir != nil && m.CipherEnd > m.CipherStart {
 		f.Dir, f.Start, f.End = dir, m.CipherStart, m.CipherEnd
 	}
-	return f
+	return annotate(f, siblingNote(t, owner))
 }
 
 // citeExchange cites the request and response frames of one exchange. It is
 // used where the claim is about the PAIR ("the GET was answered 200"), for
 // which neither single byte range is the whole evidence.
-func citeExchange(e Exchange, v certify.Verdict, format string, a ...any) Finding {
+//
+// t is the conversation recovered as this window's session, and is used only to
+// disclose a citation drawn from a sibling conversation — see siblingNote.
+func citeExchange(t *Transcript, e Exchange, v certify.Verdict, format string, a ...any) Finding {
 	frames := e.Frames()
 	if len(frames) == 0 {
 		return unavailable("the exchange this criterion is about carried no attributed frames")
 	}
-	return Finding{Verdict: v, Observed: fmt.Sprintf(format, a...), Frames: frames}
+	f := Finding{Verdict: v, Observed: fmt.Sprintf(format, a...), Frames: frames}
+	return annotate(f, siblingNote(t, e.In()))
+}
+
+// siblingNote is the provenance sentence for a citation whose bytes are in a
+// conversation OTHER than the one recovered as this window's session. It is the
+// transcript tier's counterpart to handshakeOf's note, and it exists for the
+// same reason: a reader must be able to tell WHICH of the window's
+// conversations a byte range belongs to without re-deriving it.
+func siblingNote(sel, owner *Transcript) string {
+	if sel == nil || owner == nil || owner == sel || owner.Stream == nil || sel.Stream == nil {
+		return ""
+	}
+	return fmt.Sprintf(". These bytes are from %s, a SECOND conversation this test case wholly owns: the "+
+		"DUT opened it alongside the discovery walk recovered as this window's session (%s), and a frame "+
+		"of it is a frame this case may cite", owner.Stream.Key, sel.Stream.Key)
 }

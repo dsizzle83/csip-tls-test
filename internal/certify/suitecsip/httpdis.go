@@ -75,6 +75,18 @@ type Message struct {
 	// Time is the capture timestamp of the first frame carrying the message,
 	// which is the defensible clock for every timing criterion in this suite.
 	Time time.Time
+
+	// In is the conversation this message was recovered from.
+	//
+	// It exists because a test case routinely owns MORE THAN ONE conversation
+	// with the 2030.5 server — the DUT opens a fresh connection per poll cycle,
+	// and runs its report and response legs on their own — so the message a
+	// criterion is looking for is not always in the conversation
+	// RecoverSession selected as the discovery walk. A citation has to name the
+	// byte range of the stream the message actually travelled on, so the
+	// message carries that stream with it rather than letting the caller assume
+	// the selected one. See citeMessage.
+	In *Transcript `json:"-"`
 }
 
 // Line renders the message's start line for an assertion's Observed field.
@@ -126,6 +138,19 @@ func (e Exchange) Frames() []int {
 		out = append(out, e.Resp.Frames...)
 	}
 	return dedupeInts(out)
+}
+
+// In is the conversation this exchange was recovered from, or nil for an
+// exchange built by hand in a test.
+func (e Exchange) In() *Transcript {
+	switch {
+	case e.Req != nil && e.Req.In != nil:
+		return e.Req.In
+	case e.Resp != nil:
+		return e.Resp.In
+	default:
+		return nil
+	}
 }
 
 // String renders "GET /dcap -> 200" for a report line.
