@@ -255,7 +255,7 @@ func critGET(path, claim, how string, want func(*Node) (certify.Verdict, string)
 				return unavailable("no GET %s appears in the recovered transcript (paths seen: %s)",
 					path, strings.Join(t.Paths(), " "))
 			}
-			e := exs[0]
+			e := resourceExchange(exs)
 			if e.Resp == nil {
 				return citeMessage(t, e.Req, certify.Fail, "GET %s was never answered in the capture", path)
 			}
@@ -288,6 +288,48 @@ func critGET(path, claim, how string, want func(*Node) (certify.Verdict, string)
 		},
 		Skip: "asserting the contents of a 2030.5 payload requires the decrypted transcript",
 	}
+}
+
+// resourceExchange picks, from every GET of one path in a window, the
+// exchange that actually carries the resource — as opposed to exs[0], which is
+// merely the FIRST one.
+//
+// A window ordinarily holds exactly one GET of a given path, and for those
+// ~70 rows this returns exs[0] exactly as before: with one element there is
+// nothing else it could return. But ERR-001 arms a single-shot 302
+// self-redirect on /dcap (redirectBudget = 1 in errs.go), so its window
+// legitimately contains TWO exchanges of the same path — the redirect and the
+// followed re-GET that actually got 200 — and taking exs[0] unconditionally
+// picked the redirect every time. Criterion 2 of that row already proves, from
+// the very same capture, that the DUT re-issued the GET and got an answer;
+// critGET (criterion 3, via critDiscoveryRoot) was contradicting its own
+// sibling by grading the 302 as if it were the resource fetch.
+//
+// The resource is in the LAST exchange of the path that is not itself a 3xx.
+// Falling back to the very last exchange when every one of them redirected
+// (a redirect the DUT never resolved) preserves the FAIL that deserves: the
+// selection never manufactures a PASS out of a walk that got stuck.
+//
+// This is fixed here, generically, rather than as an ERR-001-only special
+// case: critGET has exactly one caller path for "which exchange proves the
+// resource was fetched", every other criterion that needs the specific 3xx
+// exchange (ERR-001's criteria 1 and 2) reads t.Exchanges directly and is
+// untouched, and the one-exchange case — the other ~70 rows built on
+// critGET/critDiscoveryRoot — reduces to the prior behaviour byte for byte.
+// A redirect-aware special case living only in errs.go would have left the
+// same bug reachable by the next row that provokes a mid-window 3xx.
+func resourceExchange(exs []Exchange) Exchange {
+	for i := len(exs) - 1; i >= 0; i-- {
+		if !isRedirectExchange(exs[i]) {
+			return exs[i]
+		}
+	}
+	return exs[len(exs)-1]
+}
+
+// isRedirectExchange reports whether an exchange's response is a 3xx.
+func isRedirectExchange(e Exchange) bool {
+	return e.Resp != nil && e.Resp.Status >= 300 && e.Resp.Status < 400
 }
 
 // critDiscoveryRoot is the /dcap criterion nearly every row restates.
