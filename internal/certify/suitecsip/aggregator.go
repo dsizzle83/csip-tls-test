@@ -307,6 +307,23 @@ type aggDefault struct {
 	Names   []string
 }
 
+// aggWant is the wait predicate builder for an aggregator event row: wait for
+// the first lifecycle's Response to arrive. A scenario that names NO lifecycle
+// (AGG-002's shape) has nothing specific to wait on, so it yields a nil
+// predicate — the signal to specWant/check.go that the check should wait for a
+// discovery walk (AwaitWalk) instead. That nil is exactly what panicked AGG-002
+// in runs/shakedown-20260729T003843 when it reached Await unrouted; keeping the
+// builder named lets the test pin the zero-lifecycle case directly.
+func aggWant(sc aggScenario) func(base ServerView) func(ServerView) bool {
+	return func(base ServerView) func(ServerView) bool {
+		if len(sc.Lifecycles) == 0 {
+			return nil
+		}
+		first := sc.Lifecycles[0].MRID
+		return func(v ServerView) bool { return len(v.ResponsesFor(first)) > 0 }
+	}
+}
+
 // aggEvent builds one of AGG-002..AGG-012.
 func aggEvent(sc aggScenario) certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
@@ -347,13 +364,7 @@ func aggEvent(sc aggScenario) certify.Check {
 				}
 				return nil
 			},
-			Want: func(base ServerView) func(ServerView) bool {
-				if len(sc.Lifecycles) == 0 {
-					return nil
-				}
-				first := sc.Lifecycles[0].MRID
-				return func(v ServerView) bool { return len(v.ResponsesFor(first)) > 0 }
-			},
+			Want: aggWant(sc),
 			Cleanup: func(ctx context.Context, d *Driver) {
 				seen := map[int]bool{}
 				for _, c := range sc.Controls {

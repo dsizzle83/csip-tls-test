@@ -708,6 +708,12 @@ func splitLogTimestamp(ln string) (time.Time, string) {
 // finding for the check to phrase, and one whose right verdict depends on
 // whether the procedure states a deadline.
 func (d *Driver) Await(ctx context.Context, timeout time.Duration, want func(ServerView) bool) (ServerView, time.Duration, bool) {
+	// Defensive: a nil predicate has no business reaching here (the caller routes
+	// it to AwaitWalk — see specWant), but treating it as "never satisfied" turns
+	// a would-be panic into a plain window wait, which is the safe degradation.
+	if want == nil {
+		want = func(ServerView) bool { return false }
+	}
 	start := time.Now()
 	view := d.Snapshot(ctx)
 	if !view.Available {

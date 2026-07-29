@@ -748,10 +748,20 @@ func (t *Transcript) decrypt(ev *certify.Evidence) string {
 		return fmt.Sprintf("the session parameters could not be read from the handshake: %v", err)
 	}
 	if !ev.KeyLog.Has(params.ClientRandom) {
-		return fmt.Sprintf("the NSS key log %s holds no secret for this session's client random %x — "+
-			"the bench's 2030.5 server (sim/server over sim/tlsserver) does not export TLS secrets, so the "+
-			"HTTP/2030.5 payload of a gateway↔gridsim session is not recoverable from the capture",
-			ev.KeyLog.Path(), params.ClientRandom[:8])
+		// State the reason this session in particular has no secret, derived from
+		// the session — NOT the stale blanket claim that the bench does not export
+		// secrets, which is false for the keylog build (server-keylog exports).
+		if !t.Handshake.Complete {
+			return fmt.Sprintf("the handshake for this session (client random %x) did not complete, so no "+
+				"application data was exchanged and no session secret was owed to the key log %s: there is "+
+				"nothing to decrypt",
+				params.ClientRandom[:8], ev.KeyLog.Path())
+		}
+		return fmt.Sprintf("the handshake completed but the NSS key log %s holds no secret for this session's "+
+			"client random %x, so its %d/%d DUT/server application-data record(s) cannot be decrypted: the "+
+			"secret for THIS connection was never written to this key log (the 2030.5 server serving it was "+
+			"not the key-exporting build, or the connection predates the log)",
+			ev.KeyLog.Path(), params.ClientRandom[:8], t.ClientAppRecords, t.ServerAppRecords)
 	}
 	sess, err := tlsdecrypt.New(params, ev.KeyLog)
 	if err != nil {

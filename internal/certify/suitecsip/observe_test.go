@@ -96,6 +96,47 @@ func TestServerViewBaselineExcludesPriorEvidence(t *testing.T) {
 	_ = rolled.Since(base)
 }
 
+// TestZeroLifecycleScenarioDoesNotPanic pins Bug #3 from
+// runs/shakedown-20260729T003843: AGG-002 has no lifecycles, so its Want yields
+// a nil predicate, and handing that nil to Await dereferenced it — a panic. The
+// fix routes a nil predicate to AwaitWalk (specWant) and guards Await defensively.
+func TestZeroLifecycleScenarioDoesNotPanic(t *testing.T) {
+	// A zero-lifecycle scenario (AGG-002's shape) produces NO wait predicate.
+	sc := aggScenario{}
+	if want := aggWant(sc)(ServerView{}); want != nil {
+		t.Fatal("a zero-lifecycle scenario produced a non-nil wait predicate")
+	}
+
+	// specWant must collapse that to nil so the caller takes the AwaitWalk path —
+	// for both a Want that returns nil AND a spec with no Want at all.
+	if p := specWant(spec{Want: aggWant(sc)}, ServerView{}); p != nil {
+		t.Error("specWant did not collapse a nil-returning Want to nil")
+	}
+	if p := specWant(spec{}, ServerView{}); p != nil {
+		t.Error("specWant of a Want-less spec was not nil")
+	}
+
+	// A lifecycle-bearing scenario still yields a predicate that fires on the
+	// first lifecycle's Response.
+	sc2 := aggScenario{Lifecycles: []aggLifecycle{{MRID: "M1"}}}
+	p := specWant(spec{Want: aggWant(sc2)}, ServerView{})
+	if p == nil {
+		t.Fatal("a lifecycle-bearing scenario produced no wait predicate")
+	}
+	if !p(ServerView{Responses: []AdminResponse{{Subject: "M1"}}}) {
+		t.Error("the predicate did not fire on the first lifecycle's Response")
+	}
+
+	// The deref site itself is guarded: Await must not panic on a nil predicate,
+	// even though the caller never hands it one. Against a live stub it reaches
+	// the pre-loop want(view) call, which is precisely where it used to panic.
+	srv := gridsimStub(t, newStubState())
+	d := &Driver{rc: &certify.RunCtx{Case: &certify.Case{UID: "x"}}, Admin: certify.NewAdminClient(srv.URL, nil)}
+	if _, _, satisfied := d.Await(context.Background(), time.Millisecond, nil); satisfied {
+		t.Error("a nil predicate reported the wait satisfied")
+	}
+}
+
 // gridsimStub is a minimal stand-in for the admin API, including the SSE log.
 func gridsimStub(t *testing.T, state *stubState) *httptest.Server {
 	t.Helper()

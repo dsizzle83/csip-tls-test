@@ -74,6 +74,17 @@ const endpointClaimReason = "the DUT dials OUT to the bench's 2030.5 server, so 
 	"in this campaign are serialized"
 
 // spec declares one check's live phase and its pass criteria.
+// specWant returns the wait predicate for this run, or nil when the spec has no
+// Want or its Want yields no predicate for this baseline. A nil result means
+// "take the AwaitWalk path"; it must never be handed to Await, which would
+// panic on the first want(view).
+func specWant(s spec, base ServerView) func(ServerView) bool {
+	if s.Want == nil {
+		return nil
+	}
+	return s.Want(base)
+}
+
 type spec struct {
 	// Setup drives the bench into the state the procedure requires. It may
 	// stash facts for the citation phase in params. A returned error means the
@@ -81,8 +92,10 @@ type spec struct {
 	// no conclusion about the DUT can be drawn.
 	Setup func(ctx context.Context, d *Driver, params map[string]string) error
 
-	// Want builds the wait predicate from the baseline. nil waits for one fresh
-	// discovery walk, which is what most rows need.
+	// Want builds the wait predicate from the baseline. A nil Want — OR a Want
+	// that RETURNS a nil predicate for this run, as the aggregator's does when the
+	// scenario has no lifecycles — waits for one fresh discovery walk, which is
+	// what most rows need. specWant collapses the two nils into one.
 	Want func(base ServerView) func(ServerView) bool
 
 	// Wait overrides the poll-cycle wait for this check.
@@ -182,8 +195,14 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 	var waited time.Duration
 	var satisfied bool
 	if d.Available() {
-		if s.Want != nil {
-			view, waited, satisfied = d.Await(ctx, wait, s.Want(base))
+		// A spec may carry a Want that returns a nil predicate for THIS run — the
+		// aggregator's Want yields nil when the scenario has no lifecycles to wait
+		// on. That is not "wait forever on nothing"; it is the AwaitWalk case, the
+		// same fallback taken when a spec carries no Want at all. Deciding it here
+		// keeps a nil predicate from ever reaching Await (where it would panic on
+		// the first want(view) — see runs/shakedown-20260729T003843, AGG-002).
+		if want := specWant(s, base); want != nil {
+			view, waited, satisfied = d.Await(ctx, wait, want)
 		} else {
 			view, waited, satisfied = d.AwaitWalk(ctx, base, wait)
 		}
