@@ -171,7 +171,7 @@ func TestIDOf(uid string) string {
 // GapKind classifies why a case carries no `Test <Test ID>` row.
 type GapKind string
 
-// The four reasons a bundle case produces no verdict row.
+// The five reasons a bundle case produces no verdict row.
 const (
 	// GapEvidence — the case was SKIPped for a reason that is a fact about this
 	// RUN (no capture, a missing bench capability, an assertion that could not
@@ -191,6 +191,12 @@ const (
 	// scope that belongs to a different submission entirely). Applies
 	// regardless of bench verdict: even a PASS earns no row here.
 	GapNoCertBasis GapKind = "no-certification-basis"
+	// GapFoldedDetail — the case is one of COMM-004's eight internal
+	// sub-scenarios (COMM-004, COMM-004A-G). It carries its OWN bench verdict
+	// and reason, kept here for the readiness report, but SS-CSIP-RESULTS-v1.1
+	// has exactly one `Test COMM-004` row, so it never becomes a CSV row of
+	// its own — see rollupCOMM004.
+	GapFoldedDetail GapKind = "folded-into-comm-004"
 )
 
 // Gap is a bundle case that carries no verdict row, with the reason. Every gap
@@ -445,10 +451,129 @@ func Collate(sources []Source) (map[string]*Collated, error) {
 			"resolved by a tool:\n  · %s", strings.Join(conflicts, "\n  · "))
 	}
 	for _, col := range out {
+		rollupCOMM004(col)
 		sort.SliceStable(col.Verdicts, func(i, j int) bool { return col.Verdicts[i].ID < col.Verdicts[j].ID })
 		sort.SliceStable(col.Gaps, func(i, j int) bool { return col.Gaps[i].UID < col.Gaps[j].UID })
 	}
 	return out, nil
+}
+
+// comm004SubIDs are the eight internal test cases CTP Annex A Errata I
+// (p.230) splits COMM-004 into: the base Advanced Security row, three
+// chain-depth variants (A/B/C, each a different certificate chain length) and
+// four certificate-rejection variants (D/E/F/G, each a different rejection
+// reason). Each needs its own fixture, its own evidence and its own
+// PASS/FAIL verdict to be independently checkable — that is the split's whole
+// reason to exist — but SS-CSIP-RESULTS-v1.1's key table has exactly one
+// `Test COMM-004` row, so the split must not leak into the CSV as eight rows
+// of an ID the format does not define seven of.
+var comm004SubIDs = map[string]bool{
+	"COMM-004": true, "COMM-004A": true, "COMM-004B": true, "COMM-004C": true,
+	"COMM-004D": true, "COMM-004E": true, "COMM-004F": true, "COMM-004G": true,
+}
+
+// rollupCOMM004 replaces up to eight individual COMM-004/-A..G rows and gaps
+// in col with ONE `Test COMM-004` row, keeping every sub-scenario's own
+// verdict and reason as an informational gap (GapFoldedDetail) so the
+// readiness report still names each one — only the SUMMARY.csv row count
+// changes, not what a reviewer can see.
+//
+// The rollup rule: FAIL if any sub-scenario failed; NOT SUPPORTED only if
+// EVERY sub-scenario is NOT SUPPORTED (the catalog scoped the entire family
+// out of this product); otherwise PASS, provided at least one sub-scenario
+// actually passed. A family with no FAIL, no PASS and not every member NOT
+// SUPPORTED (every remaining member a Gap — no capture, an unresolved
+// assertion) has nothing to assert either way, so it becomes a Gap itself
+// rather than a manufactured verdict.
+func rollupCOMM004(col *Collated) {
+	if col == nil || col.CertType != CertTypeCSIP {
+		return
+	}
+	type sub struct {
+		id  string
+		row *TestVerdict
+		gap *Gap
+	}
+	var subs []sub
+	var keepVerdicts []TestVerdict
+	for _, v := range col.Verdicts {
+		if comm004SubIDs[v.ID] {
+			vv := v
+			subs = append(subs, sub{id: v.ID, row: &vv})
+			continue
+		}
+		keepVerdicts = append(keepVerdicts, v)
+	}
+	var keepGaps []Gap
+	for _, g := range col.Gaps {
+		if comm004SubIDs[g.ID] {
+			gg := g
+			subs = append(subs, sub{id: g.ID, gap: &gg})
+			continue
+		}
+		keepGaps = append(keepGaps, g)
+	}
+	if len(subs) == 0 {
+		return // no COMM-004 family case contributed to this part
+	}
+	sort.SliceStable(subs, func(i, j int) bool { return subs[i].id < subs[j].id })
+
+	const cite = "CTP Annex A Errata I, p.230"
+	anyFail, anyPass, allNotSupported := false, false, true
+	for _, s := range subs {
+		switch {
+		case s.row != nil && s.row.Verdict == "FAIL":
+			anyFail = true
+			allNotSupported = false
+		case s.row != nil && s.row.Verdict == "PASS":
+			anyPass = true
+			allNotSupported = false
+		case s.row != nil && s.row.Verdict == "NOT SUPPORTED":
+			// leaves allNotSupported standing
+		default:
+			// a Gap (evidence unavailable / asserted with a caveat): not a
+			// NOT SUPPORTED determination, so the family is not uniformly
+			// scoped out either.
+			allNotSupported = false
+		}
+
+		bench, reason := "", ""
+		switch {
+		case s.row != nil:
+			bench = s.row.Verdict
+			reason = fmt.Sprintf("folded into the single `Test COMM-004` row (%s): this sub-scenario's own "+
+				"bench result was %s", cite, s.row.Verdict)
+			if s.row.Note != "" {
+				reason += " (" + s.row.Note + ")"
+			}
+		case s.gap != nil:
+			bench = s.gap.BenchVerdict
+			reason = fmt.Sprintf("folded into the single `Test COMM-004` row (%s): this sub-scenario carries "+
+				"no verdict row of its own (%s): %s", cite, s.gap.Kind, s.gap.Reason)
+		}
+		keepGaps = append(keepGaps, Gap{
+			ID: s.id, UID: "csip-conf-v1.3::" + s.id, DocKey: "csip-conf-v1.3",
+			BenchVerdict: bench, Kind: GapFoldedDetail, Reason: reason,
+		})
+	}
+
+	switch {
+	case anyFail:
+		keepVerdicts = append(keepVerdicts, TestVerdict{ID: "COMM-004", Verdict: "FAIL"})
+	case allNotSupported:
+		keepVerdicts = append(keepVerdicts, TestVerdict{ID: "COMM-004", Verdict: "NOT SUPPORTED",
+			Note: "every COMM-004 sub-scenario (A-G) is scoped out of this product; see the readiness report " +
+				"for each sub-scenario's own reason"})
+	case anyPass:
+		keepVerdicts = append(keepVerdicts, TestVerdict{ID: "COMM-004", Verdict: "PASS"})
+	default:
+		keepGaps = append(keepGaps, Gap{
+			ID: "COMM-004", UID: "csip-conf-v1.3::COMM-004", DocKey: "csip-conf-v1.3", Kind: GapEvidence,
+			Reason: "no COMM-004 sub-scenario produced a PASS, FAIL or NOT SUPPORTED verdict in this " +
+				"campaign; see each sub-scenario's own reason above",
+		})
+	}
+	col.Verdicts, col.Gaps = keepVerdicts, keepGaps
 }
 
 // Counts returns the verdict distribution, for a console line and for the
@@ -935,6 +1060,21 @@ func (t *TRR) Readme(o TRROptions) string {
 		"> reporting them NOT SUPPORTED, while §3.1.1 defines NOT SUPPORTED and never says when to use it.\n"+
 		"> This tool follows the NORMATIVE §3.1.1 enumeration over the non-normative example. A laboratory\n"+
 		"> that knows SunSpec's ingest expects the example's treatment should say so before submission.\n\n")
+	fmt.Fprintf(&b, "> **Procedures the current CTP no longer defines.** SS-CSIP-RESULTS-v1.1's own §3.1.2\n"+
+		"> worked example lists rows for COMM-005, COMM-006, CORE-004, CORE-006, CORE-007, CORE-008,\n"+
+		"> CORE-015, CORE-016, CORE-017 and CORE-020. The Certification Test Procedure has since removed all\n"+
+		"> ten (CTP revision history, p.3, v1.2/v1.3). They are absent from every part below and from this\n"+
+		"> tool's catalog for the same reason the RRS worked example is now stale on this point — not\n"+
+		"> because a case was skipped or scoped out. A reviewer comparing this package against the v1.1\n"+
+		"> worked example should read their absence as the CTP having moved on, not as a gap.\n\n")
+	fmt.Fprintf(&b, "> **COMM-004's internal split.** This tool executes COMM-004 as eight independently\n"+
+		"> checkable internal test cases — the base row plus chain-depth variants A/B/C and\n"+
+		"> certificate-rejection variants D/E/F/G — because CTP Annex A Errata I (p.230) itself splits the\n"+
+		"> procedure that way: each variant exercises its own fixture and needs its own evidence to be\n"+
+		"> verified. The key table still has exactly one `Test COMM-004` row, so the eight are rolled up\n"+
+		"> (FAIL if any failed, NOT SUPPORTED only if every one is) into that single row below; each\n"+
+		"> sub-scenario's own verdict and reason stays visible as an omitted-procedure entry in the CSIP\n"+
+		"> part's `%s`.\n\n", ReadinessFile)
 
 	for _, part := range t.Parts {
 		counts := part.Collated.Counts()
@@ -969,6 +1109,11 @@ func (t *TRR) Readme(o TRROptions) string {
 
 	if t.Fill != nil && (len(t.Fill.Filled) > 0 || len(t.Fill.Unresolved) > 0) {
 		fmt.Fprintf(&b, "## Software Checksum\n\n")
+		fmt.Fprintf(&b, "The product serves no runtime checksum of its own software for a Results Report to "+
+			"read (PICS_SUNSPEC_MODBUS.md §1 records this), so every `Software Checksum <n>` below is derived "+
+			"instead from the DUT build stamp the evidence bundle recorded at capture time — the same "+
+			"`element:digest` tokens ParseBuildStamp reads from `bundle.Run.DUT.Build` — never invented and "+
+			"never read off the device.\n\n")
 		for _, f := range t.Fill.Filled {
 			fmt.Fprintf(&b, "- %s\n", f)
 		}

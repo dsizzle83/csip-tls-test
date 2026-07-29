@@ -880,3 +880,195 @@ func TestNoCertificationBasisDocsExcludedFromGeneratedCSV(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// COMM-004's internal split, rolled up to one row
+// ---------------------------------------------------------------------------
+
+// comm004Cases builds the eight COMM-004-family cases, one per suffix in
+// order, from a map of suffix ("" for the base row, "A".."G") to verdict.
+// Suffixes not present in the map default to PASS, so a test only has to name
+// the ones it cares about.
+func comm004Cases(overrides map[string]bundle.TestCaseResult) []bundle.TestCaseResult {
+	var out []bundle.TestCaseResult
+	for _, suffix := range []string{"", "A", "B", "C", "D", "E", "F", "G"} {
+		id := "csip-conf-v1.3::COMM-004" + suffix
+		if c, ok := overrides[suffix]; ok {
+			c.ID = id
+			out = append(out, c)
+			continue
+		}
+		out = append(out, bundle.TestCaseResult{ID: id, Verdict: bundle.Pass})
+	}
+	return out
+}
+
+func collateCOMM004(t *testing.T, cases []bundle.TestCaseResult, na CaseApplicability) *Collated {
+	t.Helper()
+	src := Source{
+		Dir:           "runs/comm004",
+		Bundle:        &bundle.Bundle{Schema: bundle.SchemaVersion, Cases: cases},
+		Applicability: na,
+	}
+	collated, err := Collate([]Source{src})
+	if err != nil {
+		t.Fatalf("Collate: %v", err)
+	}
+	col := collated[CertTypeCSIP]
+	if col == nil {
+		t.Fatal("no CSIP part collated")
+	}
+	return col
+}
+
+// countFoldedDetail counts the GapFoldedDetail entries — the per-sub-scenario
+// detail the rollup must keep regardless of what the single row says.
+func countFoldedDetail(gaps []Gap) int {
+	n := 0
+	for _, g := range gaps {
+		if g.Kind == GapFoldedDetail {
+			n++
+		}
+	}
+	return n
+}
+
+// TestCOMM004RollsUpToOneRow is the base case: eight PASSing sub-scenarios
+// collapse to exactly one `Test COMM-004` PASS row, with all eight kept as
+// readiness detail.
+func TestCOMM004RollsUpToOneRow(t *testing.T) {
+	col := collateCOMM004(t, comm004Cases(nil), nil)
+	if len(col.Verdicts) != 1 {
+		t.Fatalf("got %d verdict row(s), want exactly 1: %+v", len(col.Verdicts), col.Verdicts)
+	}
+	if col.Verdicts[0].ID != "COMM-004" || col.Verdicts[0].Verdict != "PASS" {
+		t.Errorf("rollup row = %+v, want {COMM-004 PASS}", col.Verdicts[0])
+	}
+	if n := countFoldedDetail(col.Gaps); n != 8 {
+		t.Errorf("%d sub-scenario(s) kept as readiness detail, want 8", n)
+	}
+}
+
+// TestCOMM004RollupFailWins: any sub-scenario FAILing fails the whole row,
+// regardless of how many others passed.
+func TestCOMM004RollupFailWins(t *testing.T) {
+	col := collateCOMM004(t, comm004Cases(map[string]bundle.TestCaseResult{
+		"B": {Verdict: bundle.Fail, Notes: "chain depth 4 was rejected"},
+	}), nil)
+	if len(col.Verdicts) != 1 || col.Verdicts[0].Verdict != "FAIL" {
+		t.Fatalf("rollup = %+v, want a single FAIL row", col.Verdicts)
+	}
+	if n := countFoldedDetail(col.Gaps); n != 8 {
+		t.Errorf("%d sub-scenario(s) kept as detail, want 8", n)
+	}
+}
+
+// TestCOMM004RollupNotSupportedOnlyWhenAllAre: every sub-scenario the catalog
+// marks inapplicable rolls up to NOT SUPPORTED; the same input with even one
+// sub-scenario left out of the applicability map must NOT collapse that way.
+func TestCOMM004RollupNotSupportedOnlyWhenAllAre(t *testing.T) {
+	na := CaseApplicability{}
+	overrides := map[string]bundle.TestCaseResult{}
+	for _, suffix := range []string{"", "A", "B", "C", "D", "E", "F", "G"} {
+		id := "csip-conf-v1.3::COMM-004" + suffix
+		overrides[suffix] = bundle.TestCaseResult{Verdict: bundle.Skip}
+		na[id] = "the DUT is a direct DER client and this sub-scenario applies to aggregators only"
+	}
+	col := collateCOMM004(t, comm004Cases(overrides), na)
+	if len(col.Verdicts) != 1 || col.Verdicts[0].Verdict != "NOT SUPPORTED" {
+		t.Fatalf("rollup = %+v, want a single NOT SUPPORTED row", col.Verdicts)
+	}
+
+	// Now leave exactly one sub-scenario applicable (so it PASSes instead):
+	// the family must NOT collapse to NOT SUPPORTED any more.
+	delete(na, "csip-conf-v1.3::COMM-004G")
+	overrides["G"] = bundle.TestCaseResult{Verdict: bundle.Pass}
+	col2 := collateCOMM004(t, comm004Cases(overrides), na)
+	if len(col2.Verdicts) != 1 || col2.Verdicts[0].Verdict != "PASS" {
+		t.Fatalf("rollup = %+v, want PASS now that one sub-scenario is not scoped out", col2.Verdicts)
+	}
+}
+
+// TestCOMM004RollupPassWhenMixedWithoutFailure: no FAIL, not every
+// sub-scenario NOT SUPPORTED, but at least one PASS — the row PASSes.
+func TestCOMM004RollupPassWhenMixedWithoutFailure(t *testing.T) {
+	na := CaseApplicability{"csip-conf-v1.3::COMM-004G": "aggregator-only sub-scenario"}
+	col := collateCOMM004(t, comm004Cases(map[string]bundle.TestCaseResult{
+		"D": {Verdict: bundle.Skip, Notes: "no capture was taken"}, // -> Gap, not NOT SUPPORTED
+		"G": {Verdict: bundle.Skip},                                // -> NOT SUPPORTED (na above)
+	}), na)
+	if len(col.Verdicts) != 1 || col.Verdicts[0].Verdict != "PASS" {
+		t.Fatalf("rollup = %+v, want a single PASS row", col.Verdicts)
+	}
+	if n := countFoldedDetail(col.Gaps); n != 8 {
+		t.Errorf("%d sub-scenario(s) kept as detail, want 8", n)
+	}
+}
+
+// TestCOMM004RollupBecomesAGapWhenNothingResolves: no FAIL, no PASS, and not
+// every sub-scenario NOT SUPPORTED (they are plain evidence-unavailable
+// Gaps) — there is nothing to assert, so the family itself becomes a Gap
+// rather than a manufactured verdict.
+func TestCOMM004RollupBecomesAGapWhenNothingResolves(t *testing.T) {
+	overrides := map[string]bundle.TestCaseResult{}
+	for _, suffix := range []string{"", "A", "B", "C", "D", "E", "F", "G"} {
+		overrides[suffix] = bundle.TestCaseResult{Verdict: bundle.Skip, Notes: "no capture was taken"}
+	}
+	col := collateCOMM004(t, comm004Cases(overrides), nil)
+	if len(col.Verdicts) != 0 {
+		t.Fatalf("got %d verdict row(s), want 0 (nothing resolved): %+v", len(col.Verdicts), col.Verdicts)
+	}
+	found := false
+	for _, g := range col.Gaps {
+		if g.ID == "COMM-004" && g.Kind == GapEvidence {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no rollup Gap for COMM-004 itself, and no row either — the family vanished silently")
+	}
+	if n := countFoldedDetail(col.Gaps); n != 8 {
+		t.Errorf("%d sub-scenario(s) kept as detail, want 8", n)
+	}
+}
+
+// TestREADMECitesTheCOMM004SplitAndRemovedProcedures checks the two README
+// notes land in the actual generated package output, not just in code
+// comments: the CTP Annex A Errata I citation for the internal eight-way
+// split, and the ten procedures the CTP has since removed from the RRS v1.1
+// worked example.
+func TestREADMECitesTheCOMM004SplitAndRemovedProcedures(t *testing.T) {
+	dir := t.TempDir()
+	mustTRR(t, dir)
+	readme, err := os.ReadFile(filepath.Join(dir, TRRReadmeFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"CTP Annex A Errata I", "p.230",
+		"CTP revision history", "p.3",
+		"COMM-005", "COMM-006", "CORE-004", "CORE-006", "CORE-007", "CORE-008",
+		"CORE-015", "CORE-016", "CORE-017", "CORE-020",
+	} {
+		if !strings.Contains(string(readme), want) {
+			t.Errorf("the package README does not cite %q", want)
+		}
+	}
+}
+
+// TestREADMEExplainsSoftwareChecksumDerivation checks the Software Checksum
+// section explains WHY it is derived (no runtime checksum is served) and
+// cites PICS_SUNSPEC_MODBUS.md §1, not just what value was filled in.
+func TestREADMEExplainsSoftwareChecksumDerivation(t *testing.T) {
+	dir := t.TempDir()
+	mustTRR(t, dir)
+	readme, err := os.ReadFile(filepath.Join(dir, TRRReadmeFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"PICS_SUNSPEC_MODBUS.md", "§1", "no runtime checksum", "build stamp"} {
+		if !strings.Contains(string(readme), want) {
+			t.Errorf("the package README's Software Checksum section does not mention %q", want)
+		}
+	}
+}
