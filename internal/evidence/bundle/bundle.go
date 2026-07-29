@@ -104,9 +104,16 @@ type TestCaseResult struct {
 	// ID is the identifier from the procedure document, e.g. "SunSpecTCP-11".
 	ID string `json:"id"`
 	// Doc names the document the ID belongs to.
-	Doc        string      `json:"doc,omitempty"`
-	Title      string      `json:"title"`
-	Verdict    Verdict     `json:"verdict"`
+	Doc     string  `json:"doc,omitempty"`
+	Title   string  `json:"title"`
+	Verdict Verdict `json:"verdict"`
+	// Applicable records whether this case applies to the certification CLAIM
+	// (catalog `applicable`), as opposed to an INFORMATIVE row the suite
+	// implements but does not claim. It rides in the per-case record so a reader —
+	// and the headline tally — can separate a FAIL that bears on the claim from
+	// one that is merely informative. It is always emitted (no omitempty): a
+	// false is a fact about the row, not an absent one.
+	Applicable bool        `json:"applicable"`
 	Notes      string      `json:"notes,omitempty"`
 	Assertions []Assertion `json:"assertions"`
 }

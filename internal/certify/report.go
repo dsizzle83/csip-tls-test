@@ -242,6 +242,17 @@ func (r *Reporter) Summary(rep *RunReport) bool {
 	r.printf("  FAIL:         %d\n", fail)
 	r.printf("  SKIP:         %d  (addressed, not assertable here — see the reason on each)\n", skip)
 	r.printf("  WARN:         %d\n", warn)
+	// Split the tally by whether a row bears on the CLAIM. An informative FAIL is
+	// a finding about a row the product does not claim conformance to, and folding
+	// it into the same headline number as a claim-relevant FAIL overstates the
+	// run. Shown only when informative rows are present, so a claim-only run stays
+	// quiet. No verdict changes — only the grouping.
+	if app, inf := rep.CountsByClaim(); inf.Total() > 0 {
+		r.printf("     ├─ applicable to the claim:      %d PASS / %d FAIL / %d SKIP / %d WARN\n",
+			app.Pass, app.Fail, app.Skip, app.Warn)
+		r.printf("     └─ informative (implemented, not claimed): %d PASS / %d FAIL / %d SKIP / %d WARN\n",
+			inf.Pass, inf.Fail, inf.Skip, inf.Warn)
+	}
 	if rep.Capture.Packets > 0 {
 		r.printf("  Capture:      %d frames, %d bytes, %s\n",
 			rep.Capture.Packets, rep.Capture.FileBytes, rep.Capture.Format)
@@ -282,7 +293,12 @@ func (r *Reporter) Summary(rep *RunReport) bool {
 	case len(missing) > 0 || len(rep.Coverage.Orphans) > 0:
 		r.printf("\n  ✗ INCOMPLETE — the standard is not fully addressed by this run\n")
 	case fail > 0:
-		r.printf("\n  ✗ %d TEST CASE(S) FAILED — review the bundle for the cited frames\n", fail)
+		if app, inf := rep.CountsByClaim(); inf.Fail > 0 {
+			r.printf("\n  ✗ %d TEST CASE(S) FAILED (%d applicable to the claim, %d informative — implemented, "+
+				"not claimed) — review the bundle for the cited frames\n", fail, app.Fail, inf.Fail)
+		} else {
+			r.printf("\n  ✗ %d TEST CASE(S) FAILED — review the bundle for the cited frames\n", fail)
+		}
 	case len(rep.CaptureProblems) > 0:
 		r.printf("\n  ⚠ ALL TEST CASES ADDRESSED, 0 FAILURES — but the capture has integrity findings\n")
 	default:
@@ -371,8 +387,19 @@ func MarkdownSection(rep *RunReport) string {
 		fmt.Fprintf(&b, "**Bundle:** `%s` (verify with `sha256sum -c MANIFEST.sha256` plus the "+
 			"evidence verifier).\n", rep.BundleDir)
 	}
-	fmt.Fprintf(&b, "\nResult: **%d PASS / %d FAIL / %d SKIP / %d WARN** across %d test case(s).\n\n",
+	fmt.Fprintf(&b, "\nResult: **%d PASS / %d FAIL / %d SKIP / %d WARN** across %d test case(s).\n",
 		pass, fail, skip, warn, len(rep.Cases))
+	// Split the headline by whether a row bears on the certification CLAIM. An
+	// informative FAIL (a row the suite implements but the product does not claim)
+	// must not be read as a claim failure — see RunReport.CountsByClaim. Emitted
+	// only when informative rows are present; no verdict is changed.
+	if app, inf := rep.CountsByClaim(); inf.Total() > 0 {
+		fmt.Fprintf(&b, "\n- Applicable to the claim: **%d PASS / %d FAIL / %d SKIP / %d WARN**\n",
+			app.Pass, app.Fail, app.Skip, app.Warn)
+		fmt.Fprintf(&b, "- Informative (implemented, not claimed): **%d PASS / %d FAIL / %d SKIP / %d WARN**\n",
+			inf.Pass, inf.Fail, inf.Skip, inf.Warn)
+	}
+	b.WriteString("\n")
 
 	byDoc := map[string][]CaseResult{}
 	var order []string

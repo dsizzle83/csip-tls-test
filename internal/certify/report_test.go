@@ -71,6 +71,75 @@ func TestSummaryCleanRun(t *testing.T) {
 	}
 }
 
+// TestHeadlineSplitsApplicableFromInformative pins Bug #5: the headline must not
+// fold an INFORMATIVE FAIL (a row the suite implements but the product does not
+// claim) into the same number as a claim-relevant FAIL. No verdict changes; only
+// the grouping. Both the console summary and the REPORT.md carry the split.
+func TestHeadlineSplitsApplicableFromInformative(t *testing.T) {
+	rep := &RunReport{
+		Started: time.Date(2026, 7, 26, 0, 0, 0, 0, time.UTC),
+		Cases: []CaseResult{
+			{Case: &Case{UID: "a", Doc: "doc-a", Applicable: true}, Verdict: Fail, Executed: true},
+			{Case: &Case{UID: "b", Doc: "doc-a", Applicable: true}, Verdict: Pass, Executed: true},
+			{Case: &Case{UID: "c", Doc: "doc-a", Applicable: false}, Verdict: Fail, Executed: true},
+			{Case: &Case{UID: "d", Doc: "doc-a", Applicable: false}, Verdict: Skip, Executed: true},
+		},
+	}
+
+	app, inf := rep.CountsByClaim()
+	if app.Pass != 1 || app.Fail != 1 {
+		t.Errorf("applicable split = %+v, want 1 PASS 1 FAIL", app)
+	}
+	if inf.Fail != 1 || inf.Skip != 1 {
+		t.Errorf("informative split = %+v, want 1 FAIL 1 SKIP", inf)
+	}
+
+	var buf bytes.Buffer
+	NewReporter(&buf).Summary(rep)
+	out := buf.String()
+	// The aggregate FAIL count stays truthful AND the split is shown.
+	for _, want := range []string{
+		"FAIL:         2",
+		"applicable to the claim",
+		"informative (implemented, not claimed)",
+		"2 TEST CASE(S) FAILED (1 applicable to the claim, 1 informative",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("console summary missing %q:\n%s", want, out)
+		}
+	}
+
+	md := MarkdownSection(rep)
+	for _, want := range []string{
+		"1 PASS / 2 FAIL",
+		"Applicable to the claim: **1 PASS / 1 FAIL",
+		"Informative (implemented, not claimed): **0 PASS / 1 FAIL",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("markdown section missing %q:\n%s", want, md)
+		}
+	}
+}
+
+// A claim-only run (no informative rows) must NOT grow the split lines.
+func TestHeadlineIsQuietWhenEveryRowIsApplicable(t *testing.T) {
+	rep := &RunReport{
+		Started: time.Date(2026, 7, 26, 0, 0, 0, 0, time.UTC),
+		Cases: []CaseResult{
+			{Case: &Case{UID: "a", Doc: "doc-a", Applicable: true}, Verdict: Pass, Executed: true},
+			{Case: &Case{UID: "b", Doc: "doc-a", Applicable: true}, Verdict: Fail, Executed: true},
+		},
+	}
+	var buf bytes.Buffer
+	NewReporter(&buf).Summary(rep)
+	if strings.Contains(buf.String(), "informative") {
+		t.Errorf("the split appeared on a run with no informative rows:\n%s", buf.String())
+	}
+	if strings.Contains(MarkdownSection(rep), "Informative (implemented, not claimed)") {
+		t.Error("the markdown split appeared on a claim-only run")
+	}
+}
+
 func TestSummaryReportsFailuresAndCaptureProblems(t *testing.T) {
 	rep := reportFixture(t,
 		map[string]Verdict{"doc-a::A-001": Fail, "doc-a::A-002": Pass, "doc-a::A-003": Skip, "doc-b::B-001": Pass},

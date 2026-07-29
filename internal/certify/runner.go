@@ -397,6 +397,43 @@ func (r *RunReport) Counts() (pass, fail, skip, warn int) {
 	return
 }
 
+// VerdictCounts is a per-verdict tally.
+type VerdictCounts struct{ Pass, Fail, Skip, Warn int }
+
+func (v *VerdictCounts) add(k Verdict) {
+	switch k {
+	case Pass:
+		v.Pass++
+	case Fail:
+		v.Fail++
+	case Skip:
+		v.Skip++
+	case Warn:
+		v.Warn++
+	}
+}
+
+// Total returns the number of cases in the tally.
+func (v VerdictCounts) Total() int { return v.Pass + v.Fail + v.Skip + v.Warn }
+
+// CountsByClaim splits the verdict tally in two: the cases that bear on the
+// certification CLAIM (catalog `applicable`), and the INFORMATIVE cases the
+// suite implements but does not claim. A FAIL among the informative set is a
+// finding about a row nobody is certifying against; carrying it in the same
+// number as a claim-relevant FAIL is what let one informative FAIL read as a
+// certification failure in the headline. This changes no verdict — only how they
+// are grouped for reporting.
+func (r *RunReport) CountsByClaim() (applicable, informative VerdictCounts) {
+	for _, c := range r.Cases {
+		if c.Case != nil && c.Case.Applicable {
+			applicable.add(c.Verdict)
+		} else {
+			informative.add(c.Verdict)
+		}
+	}
+	return
+}
+
 // Unaddressed returns the selected applicable cases with no implementation.
 func (r *RunReport) Unaddressed() []CoverageEntry {
 	var out []CoverageEntry
@@ -1120,6 +1157,7 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 			Doc:        fmt.Sprintf("%s %s §%s", c.Case.Doc, c.Case.DocVersion, c.Case.Section),
 			Title:      c.Case.Title,
 			Verdict:    c.Verdict,
+			Applicable: c.Case.Applicable,
 			Notes:      caseNotes(c),
 			Assertions: c.Assertions,
 		})
