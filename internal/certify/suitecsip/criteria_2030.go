@@ -657,20 +657,36 @@ func critDERPutAny(resources ...string) criterion {
 			"whole decrypted capture", list),
 		NeedsTranscript: true,
 		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
-			// Rung 1: this check's own conversations. Citable. The LATEST matching
-			// PUT — same convention as critDERPut — so a re-PUT that fixed an
-			// earlier bad response is what gets graded.
+			// Rung 1: this check's own conversations. Citable. The BEST-graded
+			// matching PUT — Pass beats Warn beats Fail, and only ties (same
+			// grade) are broken by latest-wins (the "a re-PUT fixed an earlier
+			// bad response" convention critDERPut itself uses via its own
+			// first-match-wins scan). The row's own criterion is disjunctive —
+			// "at least one" of the four PUTs succeeded — so a LATER attempt at
+			// a DIFFERENT resource that the capture never saw answered (e.g. a
+			// routine re-PUT whose response landed after this window closed)
+			// must not eclipse an EARLIER PUT of another wanted resource that
+			// already satisfied it; grading only the chronologically-last match
+			// regardless of its own outcome (as this loop did before) throws
+			// away a satisfying PASS whenever a worse attempt happens to follow
+			// it in capture order.
 			var seen []string
 			hit, hitResource, foundHit := Exchange{}, "", false
+			hitVerdict := certify.Fail
 			for _, e := range t.Method("PUT") {
 				doc, err := e.Req.SEP()
 				if err != nil {
 					continue
 				}
 				seen = append(seen, doc.Local())
-				if want[doc.Local()] {
-					hit, hitResource, foundHit = e, doc.Local(), true
+				if !want[doc.Local()] {
+					continue
 				}
+				v, _ := gradeDERPutExchange(e, doc.Local())
+				if foundHit && v.Severity() > hitVerdict.Severity() {
+					continue
+				}
+				hit, hitResource, hitVerdict, foundHit = e, doc.Local(), v, true
 			}
 			if foundHit {
 				v, desc := gradeDERPutExchange(hit, hitResource)
@@ -681,19 +697,26 @@ func critDERPutAny(resources ...string) criterion {
 			}
 
 			// Rung 2: the rest of the run's capture. Real, but not this check's to
-			// cite.
+			// cite. Same best-graded-match selection as rung 1, for the same
+			// reason.
 			rw := runWireOf(ev, t.Remote)
 			var runSeen []string
 			runHit, runHitResource, foundRunHit := Exchange{}, "", false
+			runHitVerdict := certify.Fail
 			for _, e := range rw.Method("PUT") {
 				doc, err := e.Req.SEP()
 				if err != nil {
 					continue
 				}
 				runSeen = append(runSeen, doc.Local())
-				if want[doc.Local()] {
-					runHit, runHitResource, foundRunHit = e, doc.Local(), true
+				if !want[doc.Local()] {
+					continue
 				}
+				v, _ := gradeDERPutExchange(e, doc.Local())
+				if foundRunHit && v.Severity() > runHitVerdict.Severity() {
+					continue
+				}
+				runHit, runHitResource, runHitVerdict, foundRunHit = e, doc.Local(), v, true
 			}
 			if foundRunHit {
 				v, desc := gradeDERPutExchange(runHit, runHitResource)

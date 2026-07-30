@@ -91,6 +91,46 @@ func TestCritDERPutAny_RejectedPUTIsAFail(t *testing.T) {
 		critDERPutAny("DERCapability", "DERSettings", "DERStatus", "DERAvailability"), rejected, certify.Fail)
 }
 
+// TestCritDERPutAny_LaterUnansweredPUTDoesNotEclipseAnEarlierPass is the
+// regression this fix locks: CORE-009's live bench capture (2026-07-30) held,
+// in capture order, a DERStatus PUT that succeeded (204), then a re-homed
+// DERCapability PUT that succeeded (204), then a re-homed DERSettings PUT
+// that succeeded (204), then a SECOND DERStatus PUT — the DUT's next ordinary
+// cadence report — whose response fell outside this window and so reads as
+// "never answered in the capture". The row's own criterion is disjunctive
+// ("at least one" of the four), so three satisfying PUTs already earned it a
+// PASS; grading only the chronologically LAST matching PUT (this criterion's
+// original selection rule) threw all three away and FAILed the row on an
+// artifact of when the capture window happened to end, not on anything the
+// DUT did wrong.
+func TestCritDERPutAny_LaterUnansweredPUTDoesNotEclipseAnEarlierPass(t *testing.T) {
+	tr := synthTranscript(
+		Exchange{
+			Req:  msg(Request, "PUT", "/edev/2/der/0/derstat", 0, derStatusBody(t)),
+			Resp: msg(Response, "", "", 204, ""),
+		},
+		Exchange{
+			Req: msg(Request, "PUT", "/edev/2/der/0/g1/dercap", 0,
+				`<DERCapability xmlns="urn:ieee:std:2030.5:ns"><type>80</type></DERCapability>`),
+			Resp: msg(Response, "", "", 204, ""),
+		},
+		Exchange{
+			Req: msg(Request, "PUT", "/edev/2/der/0/g1/derset", 0,
+				`<DERSettings xmlns="urn:ieee:std:2030.5:ns"><updatedTime>1</updatedTime></DERSettings>`),
+			Resp: msg(Response, "", "", 204, ""),
+		},
+		Exchange{
+			Req:  msg(Request, "PUT", "/edev/2/der/0/derstat", 0, derStatusBody(t)),
+			Resp: nil,
+		},
+	)
+	f := wantVerdict(t, "three earlier PASSes must not be eclipsed by a later unanswered PUT",
+		critDERPutAny("DERCapability", "DERSettings", "DERStatus", "DERAvailability"), tr, certify.Pass)
+	if strings.Contains(f.Observed, "never answered") {
+		t.Errorf("the PASS must be graded from a satisfying exchange, not the unanswered one: %q", f.Observed)
+	}
+}
+
 // TestCritDERPutAny_ServerTierHonoursTheSameDisjunction pins the tier-3
 // (gridsim admin log) evaluator to the same rule: a DERStatus-only ServerView
 // passes, and an empty one — with a session established — fails.
