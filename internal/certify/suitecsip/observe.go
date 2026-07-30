@@ -363,6 +363,38 @@ func (v ServerView) ResponsesFor(mrid string) []AdminResponse {
 	return out
 }
 
+// WantNewResponse builds an Await predicate satisfied only by a Response for
+// mrid posted AFTER v (the baseline the Want closure was handed), not one
+// already sitting in gridsim's Responses log from an earlier run that
+// happened to reuse the same — typically hardcoded — mRID.
+//
+// This is the fix for a real false-early-exit bug (audit 2026-07-30,
+// runs/perphase-core022-v3-20260730T223828 and
+// runs/perphase-core023-v3-20260730T223829): several Want closures wrote
+// `return func(v ServerView) bool { return len(v.ResponsesFor(mrid)) > 0 }`,
+// checking the RAW view Await polls with, which is never diffed against the
+// baseline the way obs.Server eventually is (see Since). gridsim's Responses
+// log is unbounded and cross-campaign (deliberately — see ServerView's own
+// doc), so the SECOND time a case with a hardcoded mRID runs against the same
+// long-lived gridsim process — exactly what re-running one case's own focused
+// bundle does — that predicate was ALREADY true on the very first Snapshot,
+// before Setup's fresh control had any chance to reach the DUT: Await
+// returned "satisfied" after waiting ~0s, the capture window closed within a
+// second of opening, and the whole check graded on evidence from a PRIOR
+// run's DUT interaction, not this one's. Both of the runs above finished in
+// about a second, with the capture (perphase-core023-v3-20260730T223829)
+// happening to catch literally zero frames — a `capture integrity: ZERO
+// frames` fault printed alongside the otherwise-unremarkable SKIP that
+// resulted.
+//
+// v's own ResponsesFor(mrid) count becomes the floor a later Snapshot's count
+// must exceed, so a Response already present at baseline time no longer
+// short-circuits the wait — only a genuinely new one satisfies it.
+func (v ServerView) WantNewResponse(mrid string) func(ServerView) bool {
+	baseline := len(v.ResponsesFor(mrid))
+	return func(later ServerView) bool { return len(later.ResponsesFor(mrid)) > baseline }
+}
+
 // HasResponse reports whether a Response with the given subject and status was
 // received.
 func (v ServerView) HasResponse(mrid string, status uint8) bool {

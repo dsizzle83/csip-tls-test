@@ -673,8 +673,12 @@ func coreResponses(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 		Want: func(base ServerView) func(ServerView) bool {
 			// Wait for the DUT to acknowledge receipt, which is the first
 			// Response of the lifecycle and the one that proves the event
-			// reached it at all.
-			return func(v ServerView) bool { return len(v.ResponsesFor(mrid)) > 0 }
+			// reached it at all. WantNewResponse (not a bare
+			// len(v.ResponsesFor(mrid))>0) so a Response left over from an
+			// EARLIER run against this same mRID — the shape of a focused
+			// single-case re-run — cannot satisfy this before the DUT has
+			// even seen the control THIS run just posted.
+			return base.WantNewResponse(mrid)
 		},
 		Cleanup: func(ctx context.Context, d *Driver) { _ = d.ClearControls(ctx, 0) },
 		Notes: func(o *Observation) string {
@@ -781,7 +785,12 @@ func coreSuperseding(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 			return nil
 		},
 		Want: func(base ServerView) func(ServerView) bool {
-			return func(v ServerView) bool { return len(v.ResponsesFor(loser)) > 0 }
+			// See coreResponses' identical comment above (audit 2026-07-30,
+			// runs/perphase-core023-v3-20260730T223829): a bare
+			// len(v.ResponsesFor(loser))>0 is satisfied instantly by a
+			// status=7 this same hardcoded mRID already earned in an
+			// EARLIER run against this gridsim process.
+			return base.WantNewResponse(loser)
 		},
 		Cleanup: func(ctx context.Context, d *Driver) {
 			_ = d.ClearControls(ctx, 0)

@@ -323,6 +323,73 @@ func TestServerView_RegisteredMUP(t *testing.T) {
 	}
 }
 
+// TestServerView_WantNewResponse is the regression lock for the harness bug
+// found while diagnosing runs/perphase-core022-v3-20260730T223828 and
+// runs/perphase-core023-v3-20260730T223829: both focused re-runs finished in
+// about a second (CORE-023's capture caught literally zero frames) because
+// their Want predicates read `len(v.ResponsesFor(mrid)) > 0` against the RAW
+// view Await polls with — never diffed against the baseline the way
+// obs.Server eventually is. gridsim's Responses log is unbounded and
+// cross-campaign by design, so a Response the SAME hardcoded mRID already
+// earned in an EARLIER run against the same long-lived gridsim process made
+// that predicate true on the very first Snapshot, before Setup's freshly
+// posted control had any chance to reach the DUT. WantNewResponse must
+// require a count STRICTLY GREATER than the baseline's own, so a Response
+// already present when the baseline was taken can never satisfy it alone.
+func TestServerView_WantNewResponse(t *testing.T) {
+	// The exact shape of the bug: the baseline ALREADY carries a Response for
+	// this mRID (left over from an earlier run), and the "later" view handed
+	// to the predicate is that SAME baseline — nothing new happened. The old
+	// code (`len(v.ResponsesFor(mrid))>0`) would return true here; this must not.
+	base := ServerView{Responses: []AdminResponse{{Subject: "CERT-CORE023-LOSE", Status: 7}}}
+	want := base.WantNewResponse("CERT-CORE023-LOSE")
+	if want(base) {
+		t.Fatal("a Response already present at baseline time must not satisfy WantNewResponse on its own")
+	}
+
+	// A genuinely NEW Response for the same mRID — one more than the
+	// baseline held — must satisfy it.
+	later := ServerView{Responses: []AdminResponse{
+		{Subject: "CERT-CORE023-LOSE", Status: 7},
+		{Subject: "CERT-CORE023-LOSE", Status: 7},
+	}}
+	if !want(later) {
+		t.Error("a Response count exceeding the baseline's must satisfy WantNewResponse")
+	}
+
+	// An empty baseline (the ordinary, non-stale case) still fires on the
+	// very first matching Response — unchanged behaviour for a fresh mRID.
+	fresh := ServerView{}.WantNewResponse("CERT-CORE022")
+	if fresh(ServerView{Responses: []AdminResponse{{Subject: "CERT-CORE022", Status: 1}}}) == false {
+		t.Error("an empty baseline must still be satisfied by the first matching Response")
+	}
+}
+
+// TestAggWant_IgnoresStaleResponseFromEarlierRun proves the fix at the
+// aggregator Want-builder level: a scenario whose baseline already holds a
+// Response for its first lifecycle's mRID (a focused re-run against a
+// gridsim process that already answered this exact mRID once today) must NOT
+// report satisfied against that same baseline — only a genuinely new
+// Response should.
+func TestAggWant_IgnoresStaleResponseFromEarlierRun(t *testing.T) {
+	sc := aggScenario{Lifecycles: []aggLifecycle{{MRID: "M1"}}}
+	stale := ServerView{Responses: []AdminResponse{{Subject: "M1", Status: 1}}}
+	p := aggWant(sc)(stale)
+	if p == nil {
+		t.Fatal("a lifecycle-bearing scenario must still produce a predicate")
+	}
+	if p(stale) {
+		t.Error("the predicate must not be satisfied by a Response already present at baseline time")
+	}
+	newer := ServerView{Responses: []AdminResponse{
+		{Subject: "M1", Status: 1},
+		{Subject: "M1", Status: 2},
+	}}
+	if !p(newer) {
+		t.Error("the predicate must be satisfied once a Response beyond the baseline's count arrives")
+	}
+}
+
 // TestZeroLifecycleScenarioDoesNotPanic pins Bug #3 from
 // runs/shakedown-20260729T003843: AGG-002 has no lifecycles, so its Want yields
 // a nil predicate, and handing that nil to Await dereferenced it — a panic. The

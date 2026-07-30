@@ -320,7 +320,13 @@ func aggWant(sc aggScenario) func(base ServerView) func(ServerView) bool {
 			return nil
 		}
 		first := sc.Lifecycles[0].MRID
-		return func(v ServerView) bool { return len(v.ResponsesFor(first)) > 0 }
+		// WantNewResponse, not a bare len(v.ResponsesFor(first))>0 — see its
+		// doc (audit 2026-07-30, CORE-022/CORE-023's identical bug): an
+		// AGG-0xx scenario's lifecycle mRID is just as hardcoded as those
+		// two, and a focused re-run of one row must not read "satisfied"
+		// from a Response an EARLIER run against the same gridsim process
+		// already earned for that mRID.
+		return base.WantNewResponse(first)
 	}
 }
 
@@ -1208,7 +1214,12 @@ func utilDERRetrieval(ctx context.Context, rc *certify.RunCtx) (certify.Result, 
 			return err
 		},
 		Want: func(base ServerView) func(ServerView) bool {
-			return func(v ServerView) bool { return len(v.ResponsesFor(mrid)) > 0 }
+			// WantNewResponse, not a bare len(v.ResponsesFor(mrid))>0 — see
+			// its doc (audit 2026-07-30, CORE-022/CORE-023's identical bug):
+			// this hardcoded mRID re-posted by a focused re-run of THIS same
+			// case must not be satisfied by a Response an EARLIER run against
+			// the same gridsim process already earned.
+			return base.WantNewResponse(mrid)
 		},
 		Cleanup: func(ctx context.Context, d *Driver) { _ = d.ClearControls(ctx, progTFA) },
 		Notes: func(o *Observation) string {
