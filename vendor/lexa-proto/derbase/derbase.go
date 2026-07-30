@@ -141,6 +141,14 @@ type Measurements struct {
 	Hz  float64 // AC frequency (Hz)
 	PF  float64 // power factor (−1 to +1)
 
+	// Per-phase / line-to-line voltages (volts), 701 only. Each maps 1:1 to a
+	// single 701 register — no fallback logic, unlike V above. NaN means the
+	// device leaves the point unimplemented; the legacy 10x path (model
+	// 101/102/103) never reports these and always leaves them NaN (see
+	// ReadMeasurementsACModel). LLV/VL1L2/VL2L3/VL3L1 are line-to-line;
+	// VL1/VL2/VL3 are line-to-neutral.
+	LLV, VL1L2, VL1, VL2L3, VL2, VL3L1, VL3 float64
+
 	// DC-side (inverters only; NaN if not applicable)
 	DCV float64 // DC bus voltage (volts)
 	DCW float64 // DC power (watts)
@@ -176,6 +184,9 @@ func ReadMeasurementsM701(regs []uint16) Measurements {
 	}
 	out := Measurements{
 		W: m.W, V: v, Hz: m.Hz, VA: m.VA, Var: m.Var, PF: m.PF, TmpCab: m.TmpCab, SOC: math.NaN(),
+		// Direct 1:1 register mapping — no fallback (V's LNV/VL1 fallback above
+		// does not apply here; each of these is its own 701 point).
+		LLV: m.LLV, VL1L2: m.VL1L2, VL1: m.VL1, VL2L3: m.VL2L3, VL2: m.VL2, VL3L1: m.VL3L1, VL3: m.VL3,
 		WhImpTotal: m.TotWhAbs, WhExpTotal: m.TotWhInj,
 	}
 	// St/InvSt/ConnSt/Alrm ride Parse701 as plain integers, which cannot
@@ -209,7 +220,18 @@ func ReadMeasurementsACModel(regs []uint16) Measurements {
 	// Model 10x has no St/InvSt/ConnSt/Alrm or lifetime-Wh points that map
 	// onto the 701 semantics — the state pointers stay nil and the energy
 	// accumulators stay NaN (absent, per the struct doc).
-	m := Measurements{TmpCab: math.NaN(), SOC: math.NaN(), WhImpTotal: math.NaN(), WhExpTotal: math.NaN()}
+	//
+	// CRITICAL: model 10x also has no per-phase/line-to-line voltage points
+	// (LLV/VL1L2/VL1/VL2L3/VL2/VL3L1/VL3 are 701-only). These MUST be
+	// explicitly NaN'd here, in the initial literal — Go's float64 zero value
+	// is 0.0, and a silent 0.0 reads as "measured zero volts", which every
+	// downstream consumer (NI, alarms, display) treats as a real reading, not
+	// as absence. Leaving any of these off this literal would fabricate a
+	// phantom "0 V" measurement for every legacy-model device.
+	m := Measurements{
+		TmpCab: math.NaN(), SOC: math.NaN(), WhImpTotal: math.NaN(), WhExpTotal: math.NaN(),
+		LLV: math.NaN(), VL1L2: math.NaN(), VL1: math.NaN(), VL2L3: math.NaN(), VL2: math.NaN(), VL3L1: math.NaN(), VL3: math.NaN(),
+	}
 	if len(regs) > sunspec.M103_W_SF {
 		m.W = sunspec.ApplyScaleSigned(get(sunspec.M103_W), sf(sunspec.M103_W_SF))
 	}

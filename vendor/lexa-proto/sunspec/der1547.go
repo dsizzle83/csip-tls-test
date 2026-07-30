@@ -49,6 +49,7 @@ type ACMeasurement struct {
 	DERMode uint32  // operational characteristics bitfield
 	W, VA, Var, PF, A   float64
 	LLV, LNV, VL1, Hz   float64
+	VL2, VL3, VL1L2, VL2L3, VL3L1 float64
 	TotWhInj, TotWhAbs       float64
 	TotVarhInj, TotVarhAbs   float64
 	TmpCab  float64
@@ -76,6 +77,11 @@ func Parse701(regs []uint16) ACMeasurement {
 		LLV:     v.Float("LLV"),
 		LNV:     v.Float("LNV"),
 		VL1:     v.Float("VL1"),
+		VL2:     v.Float("VL2"),
+		VL3:     v.Float("VL3"),
+		VL1L2:   v.Float("VL1L2"),
+		VL2L3:   v.Float("VL2L3"),
+		VL3L1:   v.Float("VL3L1"),
 		Hz:      v.Float("Hz"),
 		TotWhInj:   v.Float("TotWhInj"),
 		TotWhAbs:   v.Float("TotWhAbs"),
