@@ -453,6 +453,30 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 	}
 }
 
+// gradeDERPutExchange grades ONE PUT exchange whose body's root element is
+// resource, into a verdict and its sentence. It is the shared decision behind
+// critDERPut (one resource) and critDERPutAny (any of several) so the two ways
+// of asking "did the DUT PUT this cleanly" cannot drift apart on what
+// "cleanly" means.
+func gradeDERPutExchange(e Exchange, resource string) (certify.Verdict, string) {
+	if e.Resp == nil {
+		return certify.Fail, fmt.Sprintf("PUT %s carrying %s was never answered in the capture",
+			e.Req.Target, resource)
+	}
+	v, note := certify.Pass, ""
+	if e.Resp.Status != 204 {
+		// 200 is DISCOURAGED rather than forbidden for a PUT
+		// (2030.5 §5.5.2), so it is a WARN and 4xx/5xx a FAIL.
+		if e.Resp.Status >= 200 && e.Resp.Status < 300 {
+			v, note = certify.Warn, " (2030.5 §5.5.2 discourages a body-bearing 2xx for a PUT; "+
+				"204 No Content is the expected answer)"
+		} else {
+			v = certify.Fail
+		}
+	}
+	return v, fmt.Sprintf("PUT %s carrying %s -> %s%s", e.Req.Target, resource, e.Resp.Line(), note)
+}
+
 // critDERPut asserts one of the DER self-report PUTs.
 //
 // The evidence ladder is three rungs, strongest first, and the criterion says
@@ -474,24 +498,7 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 // settle the question.
 func critDERPut(resource string) criterion {
 	// grade turns one located PUT into a verdict and its sentence.
-	grade := func(e Exchange) (certify.Verdict, string) {
-		if e.Resp == nil {
-			return certify.Fail, fmt.Sprintf("PUT %s carrying %s was never answered in the capture",
-				e.Req.Target, resource)
-		}
-		v, note := certify.Pass, ""
-		if e.Resp.Status != 204 {
-			// 200 is DISCOURAGED rather than forbidden for a PUT
-			// (2030.5 §5.5.2), so it is a WARN and 4xx/5xx a FAIL.
-			if e.Resp.Status >= 200 && e.Resp.Status < 300 {
-				v, note = certify.Warn, " (2030.5 §5.5.2 discourages a body-bearing 2xx for a PUT; "+
-					"204 No Content is the expected answer)"
-			} else {
-				v = certify.Fail
-			}
-		}
-		return v, fmt.Sprintf("PUT %s carrying %s -> %s%s", e.Req.Target, resource, e.Resp.Line(), note)
-	}
+	grade := func(e Exchange) (certify.Verdict, string) { return gradeDERPutExchange(e, resource) }
 	return criterion{
 		Claim: fmt.Sprintf("the DUT PUT its %s to the href the server advertised, and the server answered "+
 			"204 No Content", resource),
@@ -609,6 +616,192 @@ func critDERPut(resource string) criterion {
 				Observed: fmt.Sprintf("gridsim recorded no %s PUT from the DUT anywhere in this run "+
 					"(it recorded: %s)", resource, strings.Join(dedupeStrings(seen), " "))}
 		},
+	}
+}
+
+// critDERPutAny asserts CORE-009's own printed pass criterion for its DER
+// self-report element, which — unlike critDERPut — is DISJUNCTIVE: CSIP
+// Conformance Test Procedures v1.3 pp.41-42 states the client passes this
+// element if it "did an HTTP PUT [of] DERCapabilities, DERSettings, DERStatus
+// or DERAvailability" — any ONE of the four, not all four. A DUT that only
+// ever PUTs DERStatus — the one report that is cadence-driven and so lands in
+// nearly every window regardless of what the bench does — satisfies the
+// printed text in full, and grading it a FAIL because this window's capture
+// happens not to also show DERCapability/DERSettings would hold the row to a
+// stricter standard than its own text states.
+//
+// The four individual critDERPut(resource) criteria remain in CORE-009 (see
+// core.go) as per-resource observations, wrapped by critDERPutInformational so
+// their absence reads as a WARN rather than a FAIL: a reader still sees
+// exactly which of the four arrived, and no single one of them can fail a row
+// whose own printed criterion is this one.
+//
+// Evidence ladder and rungs are the same three as critDERPut, generalised
+// across the resource set: rung 1 searches this check's own conversations for
+// the LATEST PUT of any wanted resource; rung 2 searches the rest of the run's
+// decrypted capture and reports (never cites) what it finds there; rung 3 is a
+// negative, drawn only when the capture was fully decryptable.
+func critDERPutAny(resources ...string) criterion {
+	want := make(map[string]bool, len(resources))
+	for _, r := range resources {
+		want[r] = true
+	}
+	list := strings.Join(resources, ", ")
+
+	return criterion{
+		Claim: fmt.Sprintf("the DUT PUT at least one of %s to the href the server advertised, and the "+
+			"server answered 204 No Content — CSIP Conformance Test Procedures v1.3 pp.41-42 states this "+
+			"element of CORE-009 disjunctively across the four DER self-reports, not conjunctively", list),
+		How: fmt.Sprintf("a PUT whose body's root element is one of %s, and the status line of the "+
+			"response to it, located first in the conversations this check owns and then across the run's "+
+			"whole decrypted capture", list),
+		NeedsTranscript: true,
+		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
+			// Rung 1: this check's own conversations. Citable. The LATEST matching
+			// PUT — same convention as critDERPut — so a re-PUT that fixed an
+			// earlier bad response is what gets graded.
+			var seen []string
+			hit, hitResource, foundHit := Exchange{}, "", false
+			for _, e := range t.Method("PUT") {
+				doc, err := e.Req.SEP()
+				if err != nil {
+					continue
+				}
+				seen = append(seen, doc.Local())
+				if want[doc.Local()] {
+					hit, hitResource, foundHit = e, doc.Local(), true
+				}
+			}
+			if foundHit {
+				v, desc := gradeDERPutExchange(hit, hitResource)
+				if hit.Resp == nil {
+					return citeMessage(t, hit.Req, v, "%s", desc)
+				}
+				return citeExchange(t, hit, v, "%s", desc)
+			}
+
+			// Rung 2: the rest of the run's capture. Real, but not this check's to
+			// cite.
+			rw := runWireOf(ev, t.Remote)
+			var runSeen []string
+			runHit, runHitResource, foundRunHit := Exchange{}, "", false
+			for _, e := range rw.Method("PUT") {
+				doc, err := e.Req.SEP()
+				if err != nil {
+					continue
+				}
+				runSeen = append(runSeen, doc.Local())
+				if want[doc.Local()] {
+					runHit, runHitResource, foundRunHit = e, doc.Local(), true
+				}
+			}
+			if foundRunHit {
+				v, desc := gradeDERPutExchange(runHit, runHitResource)
+				return Finding{Verdict: v, Observed: fmt.Sprintf(
+					"%s — on conversation %s, in frame(s) %s. That conversation is not one this test case "+
+						"owns outright (%s), which is why the report is NAMED here and not cited: a check may "+
+						"cite only its own frames, and a citation of someone else's is the one thing this "+
+						"tool refuses. The DUT reports its DER self-reports on its own cadence rather than on "+
+						"this case's cue, so the report is a fact of the run's wire rather than of this "+
+						"window. Read from %s",
+					desc, runHit.In().Stream.Key, framesOf(runHit), whyNotOurs(ev, runHit), rw.Scope())}
+			}
+
+			// Rung 3: a negative, only a fact about the DUT if the capture was
+			// fully readable.
+			if len(seen) > 0 {
+				return found(certify.Fail, allFrames(t.Method("PUT")),
+					"the DUT PUT %d resource(s) in this window — %s — but none of %s",
+					len(seen), strings.Join(dedupeStrings(seen), " "), list)
+			}
+			if !rw.Complete {
+				return unavailable("no DER self-report PUT appears in this test case's conversations, and "+
+					"the run's capture cannot settle whether one happened elsewhere: %s", rw.Scope())
+			}
+			if len(runSeen) == 0 {
+				return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+					"the DUT sent NO PUT of any resource anywhere in the run: %s were read end to end and "+
+						"carry no PUT request at all, so none of %s was ever self-reported. This is the "+
+						"wire's own answer, independent of gridsim's admin log",
+					rw.Scope(), list)}
+			}
+			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+				"the DUT PUT %d resource(s) across the whole run — %s — but none of %s. Read from %s",
+				len(runSeen), strings.Join(dedupeStrings(runSeen), " "), list, rw.Scope())}
+		},
+		Server: func(v *ServerView) Finding {
+			for _, r := range resources {
+				if inWindow := v.PutsFor(r); len(inWindow) > 0 {
+					last := inWindow[len(inWindow)-1]
+					return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
+						"gridsim recorded %d %s PUT(s) from the DUT in this case's window, most recently %d "+
+							"bytes at server time %d to %s — which alone satisfies CORE-009's disjunctive PUT "+
+							"criterion", len(inWindow), r, len(last.Body), last.ReceivedAt, last.Path)}
+				}
+			}
+			// Cadence- and change-driven, same as critDERPut: the report this row
+			// is written to observe routinely lands earlier in the run than this
+			// case's narrow window.
+			for _, r := range resources {
+				if inRun := v.PutsForInRun(r); len(inRun) > 0 {
+					last := inRun[len(inRun)-1]
+					return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
+						"gridsim recorded %d %s PUT(s) from the DUT during the run — none inside this case's "+
+							"own window, but the DUT self-reports on its own cadence rather than on this "+
+							"case's cue, and CORE-009's PUT criterion is disjunctive across the four "+
+							"resources; most recently %d bytes at server time %d to %s",
+						len(inRun), r, len(last.Body), last.ReceivedAt, last.Path)}
+				}
+			}
+			if !v.SessionEstablished() && len(v.RunDERPuts) == 0 {
+				return noSessionUnavailable()
+			}
+			reported := v.RunDERPuts
+			if reported == nil {
+				reported = v.DERPuts
+			}
+			var seen []string
+			for _, p := range reported {
+				seen = append(seen, p.Resource)
+			}
+			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+				"gridsim recorded no PUT of any of %s from the DUT anywhere in this run (it recorded: %s)",
+				list, strings.Join(dedupeStrings(seen), " "))}
+		},
+	}
+}
+
+// critDERPutInformational wraps critDERPut(resource) so its per-resource
+// observation cannot fail CORE-009: the row's own printed pass criterion is
+// disjunctive across the four DER self-reports (critDERPutAny), so the
+// absence of any ONE of them is not, by itself, a fact this row fails on. A
+// PUT that WAS observed is still reported as a PASS — full credit — and only
+// a would-be FAIL is demoted, to a WARN that points at the criterion which
+// actually decides the row.
+func critDERPutInformational(resource string) criterion {
+	base := critDERPut(resource)
+	demote := func(f Finding) Finding {
+		if f.Verdict == certify.Fail {
+			f.Verdict = certify.Warn
+			f.Observed += ". This is INFORMATIONAL, not a row failure: CORE-009's own printed pass " +
+				"criterion (CSIP Conformance Test Procedures v1.3 pp.41-42) is disjunctive across " +
+				"DERCapability/DERSettings/DERStatus/DERAvailability — see the row's combined criterion for " +
+				"its actual verdict"
+		}
+		return f
+	}
+	return criterion{
+		Claim: base.Claim + " (informational per-resource note; CORE-009's actual pass/fail is the row's " +
+			"combined disjunctive criterion)",
+		How:             base.How,
+		NeedsTranscript: base.NeedsTranscript,
+		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
+			return demote(base.Wire(ev, t))
+		},
+		Server: func(v *ServerView) Finding {
+			return demote(base.Server(v))
+		},
+		Skip: base.Skip,
 	}
 }
 

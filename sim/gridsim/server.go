@@ -76,6 +76,14 @@ type Server struct {
 	// mupNextID is protected by mu; do not read/write outside the mu lock.
 	mupNextID int32
 
+	// derHomeGen counts how many times RehomeDER has re-homed a DER's
+	// DERCapability/DERSettings hrefs (CSIP IG §6.3.5.2 lever for CORE-009/
+	// CORE-014 — see rehome.go). 0 means every DER still sits at the hrefs
+	// buildResourceTree gave it. Guarded by mu, like every other resource-tree
+	// fact: a re-home IS a resource-tree mutation (new hrefs installed, old ones
+	// removed), so it needs the same lock the request handlers take.
+	derHomeGen int
+
 	// advertisedPollRate is what -poll-rate-s asked for, in seconds, or 0 when
 	// nothing overrode the built-in rates. It is remembered rather than only
 	// applied because control lists are CREATED after start-up: every

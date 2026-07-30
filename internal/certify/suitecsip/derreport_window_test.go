@@ -141,6 +141,55 @@ func TestRunBaselineSurvivesALogTruncation(t *testing.T) {
 	}
 }
 
+// TestSortedDERPutsOrdersByReceivedAtThenPath pins the fix that makes
+// Driver.Snapshot's DER PUT observation reliable against a REAL gridsim:
+// GET /admin/derputs serves a map (see derput.go's handleAdminDERPuts, and
+// the doc comment at sortedDERPuts's call site in Snapshot), and a Go map's
+// iteration order is randomised — decoding it straight into ServerView.DERPuts
+// would hand PutsFor/Since a different, arbitrary order on every read, which
+// is fatal to both "the LAST entry is the most recent" (critDERPut's Server
+// evaluator) and Since's positional delta. sortedDERPuts must always recover
+// a stable, receipt-time order from the map.
+func TestSortedDERPutsOrdersByReceivedAtThenPath(t *testing.T) {
+	m := map[string]AdminDERPut{
+		"/edev/2/der/0/derset":    {Path: "/edev/2/der/0/derset", Resource: "DERSettings", ReceivedAt: 200},
+		"/edev/2/der/0/dercap":    {Path: "/edev/2/der/0/dercap", Resource: "DERCapability", ReceivedAt: 100},
+		"/edev/2/der/0/g1/dercap": {Path: "/edev/2/der/0/g1/dercap", Resource: "DERCapability", ReceivedAt: 300},
+		// Ties on ReceivedAt (same wall-clock second) break on path.
+		"/edev/2/der/0/b": {Path: "/edev/2/der/0/b", Resource: "DERStatus", ReceivedAt: 300},
+	}
+	got := sortedDERPuts(m)
+	if len(got) != 4 {
+		t.Fatalf("sortedDERPuts returned %d entries, want 4: %+v", len(got), got)
+	}
+	wantOrder := []string{
+		"/edev/2/der/0/dercap",    // 100
+		"/edev/2/der/0/derset",    // 200
+		"/edev/2/der/0/b",         // 300, path "b" < "g1/dercap"
+		"/edev/2/der/0/g1/dercap", // 300
+	}
+	for i, path := range wantOrder {
+		if got[i].Path != path {
+			t.Errorf("position %d = %q, want %q (full order: %v)", i, got[i].Path, path, pathsOf(got))
+		}
+	}
+
+	// The empty map is the empty slice, not nil-vs-empty confusion further up
+	// the stack (Since/PutsFor range over it either way, but an explicit check
+	// pins the contract).
+	if got := sortedDERPuts(nil); len(got) != 0 {
+		t.Errorf("sortedDERPuts(nil) = %+v, want empty", got)
+	}
+}
+
+func pathsOf(puts []AdminDERPut) []string {
+	out := make([]string, len(puts))
+	for i, p := range puts {
+		out[i] = p.Path
+	}
+	return out
+}
+
 func TestPutsForInRunFallsBackToWindow(t *testing.T) {
 	// A synthetic view that set only DERPuts (no RunDERPuts) must still answer the
 	// run-scoped question — from the window it has.

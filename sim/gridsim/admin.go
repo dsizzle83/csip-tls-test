@@ -32,6 +32,10 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/responses", cors(s.handleAdminResponses))
 	mux.HandleFunc("/admin/derputs", cors(s.handleAdminDERPuts))
 	mux.HandleFunc("/admin/logevents", cors(s.handleAdminLogEvents))
+	// CORE-009/CORE-014 lever (rehome.go): re-home the DUT's DERCapability/
+	// DERSettings hrefs so its next discovery walk notices the change and
+	// re-PUTs them, per CSIP IG §6.3.5.2. A test-server action, not an EUT one.
+	mux.HandleFunc("/admin/rehome", cors(s.handleAdminRehome))
 	// The DER AGGREGATOR CLIENT levers (2026-07-28 re-scope). Both are inert
 	// unless the corresponding capability was enabled at startup, and both
 	// report that state so a preflight can PROBE for the fixture rather than

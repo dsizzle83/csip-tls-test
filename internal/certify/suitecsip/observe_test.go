@@ -148,7 +148,16 @@ func gridsimStub(t *testing.T, state *stubState) *httptest.Server {
 		state.mu(func() { writeJSON(w, map[string]any{"responses": state.responses}) })
 	})
 	mux.HandleFunc("/admin/derputs", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"der_puts": []AdminDERPut{{Path: "/p", Resource: "DERStatus", Body: "<x/>"}}})
+		// gridsim's real GET /admin/derputs serves a MAP keyed by resource path
+		// (derput.go's handleAdminDERPuts encodes ReceivedDERPuts()'s
+		// map[string]DERPut directly), not a list — this stub used to fake a
+		// list, which meant Snapshot's decode was never actually exercised
+		// against the shape gridsim serves and TestDriverSnapshotCollectsEverything
+		// passed while the real Driver.Snapshot silently failed to decode every
+		// DER PUT gridsim ever reported (see sortedDERPuts in observe.go).
+		writeJSON(w, map[string]any{
+			"der_puts": map[string]AdminDERPut{"/p": {Path: "/p", Resource: "DERStatus", Body: "<x/>"}},
+		})
 	})
 	mux.HandleFunc("/admin/logevents", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"log_events": []map[string]any{{"logEventCode": 1}}})

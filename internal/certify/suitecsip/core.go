@@ -124,12 +124,38 @@ func coreBasicTime(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 }
 
 // coreAdvancedEndDevice implements CORE-009 — Advanced End Device.
+//
+// The row's own printed pass criterion for the DER self-report element is
+// DISJUNCTIVE (CTP v1.3 pp.41-42: "did an HTTP PUT [of] DERCapabilities,
+// DERSettings, DERStatus or DERAvailability") — a lone, cadence-driven
+// DERStatus PUT satisfies it in full, with no lever needed at all. critDERPut
+// per resource would grade that as three FAILs and one PASS, holding the row
+// to a standard stricter than its own text; critDERPutAny is the criterion
+// that actually decides it, and the four critDERPutInformational entries stay
+// only as per-resource notes (WARN, never FAIL) on which of the four arrived.
+//
+// The re-home Change (see rehome.go / coreDERSettings below) is belt and
+// braces here, not a requirement: it gives this row a real shot at the
+// STRONGER evidence — a capability/settings PUT, not just status — within its
+// own window, but the row must PASS without it too, since CORE-009's printed
+// criterion does not require gridsim's admin API at all.
 func coreAdvancedEndDevice(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	pin, _ := rc.Param(pinParam)
 	return run(ctx, rc, spec{
+		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
+			capHref, setHref, err := d.RehomeDER(ctx)
+			if err != nil {
+				return err
+			}
+			params["rehome_cap_href"] = capHref
+			params["rehome_set_href"] = setHref
+			params["rehome_at"] = time.Now().UTC().Format(time.RFC3339)
+			return nil
+		},
+		ChangeWait: changeWaitFullCycle,
 		Notes: func(o *Observation) string {
 			return fmt.Sprintf("EndDevice walk and DER self-report PUTs; %d DER PUT(s) recorded server-side "+
-				"during the window", len(o.Server.DERPuts))
+				"during the window", len(o.Server.DERPuts)) + rehomeNote(o)
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
@@ -139,13 +165,38 @@ func coreAdvancedEndDevice(ctx context.Context, rc *certify.RunCtx) (certify.Res
 				critRegistrationPIN(pin),
 				critResource("DERList", "the DUT fetched the DERList reached from its EndDevice's DERListLink "+
 					"and the server answered 200", nil),
-				critDERPut("DERCapability"),
-				critDERPut("DERSettings"),
-				critDERPut("DERStatus"),
-				critDERPut("DERAvailability"),
+				critDERPutAny("DERCapability", "DERSettings", "DERStatus", "DERAvailability"),
+				critDERPutInformational("DERCapability"),
+				critDERPutInformational("DERSettings"),
+				critDERPutInformational("DERStatus"),
+				critDERPutInformational("DERAvailability"),
 			}
 		},
 	})
+}
+
+// rehomeNote renders the CORE-009/CORE-014 narrative addendum recording that
+// gridsim — the TEST SERVER, not the DUT — performed a scripted re-home
+// (rehome.go), so a reader of the bundle does not mistake the DUT's resulting
+// DERCapability/DERSettings PUTs for a spontaneous event or the DUT for
+// having been perturbed.
+//
+// Empty when the case's Change hook never ran: no gridsim admin API was
+// configured, or the call failed (obs.Params[changeFailed] already carries
+// that reason, logged by the runner separately).
+func rehomeNote(o *Observation) string {
+	at := o.Param("rehome_at")
+	if at == "" {
+		return ""
+	}
+	return fmt.Sprintf(". The bench's 2030.5 TEST SERVER (gridsim) performed a SCRIPTED resource re-home at "+
+		"%s, moving the DUT's DERCapability and DERSettings to fresh hrefs (%s and %s) mid-case — a "+
+		"test-server action, not a DUT perturbation, and the same species of lever the CTP itself scripts on "+
+		"the server side (ERR-002's own scripted server power-reset). CSIP IG §6.3.5.2 requires the client "+
+		"to PUT DERCapability/DERSettings 'at device start-up and on any changes'; the DUT already satisfied "+
+		"that once, at start-up, before this window opened, and had no other reason to repeat it unprompted "+
+		"until the SERVER changed the resource out from under it",
+		at, o.Param("rehome_cap_href"), o.Param("rehome_set_href"))
 }
 
 // coreFSA implements CORE-010 — Function Set Assignments.
@@ -337,12 +388,40 @@ func coreAdvancedDERProgram(ctx context.Context, rc *certify.RunCtx) (certify.Re
 }
 
 // coreDERSettings implements CORE-014 — Basic DER Settings (Power Generating).
+//
+// CORE-014 exists to observe the DUT's DERCapability/DERSettings PUTs, and
+// CSIP IG §6.3.5.2 has the DUT send those only "at device start-up and on any
+// changes" — which, hours into a capture window opened long after boot, have
+// already happened and left no further trace to catch. The Change hook
+// re-homes the DER's DERCapability/DERSettings hrefs (rehome.go) AFTER the
+// initial discovery walk has already been observed at the ORIGINAL hrefs
+// (this spec sets no Setup/Want, so run() takes the default AwaitWalk path
+// first) — giving the DUT's NEXT walk a change to notice and re-announce,
+// which is exactly what CORE-009/CORE-014 are written to catch and what a
+// window opened long after boot otherwise cannot.
 func coreDERSettings(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	return run(ctx, rc, spec{
+		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
+			capHref, setHref, err := d.RehomeDER(ctx)
+			if err != nil {
+				return err
+			}
+			params["rehome_cap_href"] = capHref
+			params["rehome_set_href"] = setHref
+			params["rehome_at"] = time.Now().UTC().Format(time.RFC3339)
+			return nil
+		},
+		// A second FULL poll cycle, not the short settle: the DUT notices the
+		// href change on its NEXT discovery walk, and a client pacing at
+		// poll_rate_mode=honor is entitled to take its whole interval to make it.
+		// The short settle would measure the harness's patience, not the DUT's
+		// conformant cadence. See maintControls (aggregator.go) for the same
+		// sentinel used for the same reason.
+		ChangeWait: changeWaitFullCycle,
 		Notes: func(o *Observation) string {
 			return fmt.Sprintf("DER self-report: %d DERCapability and %d DERSettings PUT(s) recorded "+
 				"server-side during the window",
-				len(o.Server.PutsFor("DERCapability")), len(o.Server.PutsFor("DERSettings")))
+				len(o.Server.PutsFor("DERCapability")), len(o.Server.PutsFor("DERSettings"))) + rehomeNote(o)
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{

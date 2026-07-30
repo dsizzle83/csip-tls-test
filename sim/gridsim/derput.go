@@ -64,12 +64,29 @@ func derPutTarget(path string) (string, bool) {
 
 // handlePUT accepts a DER* self-report PUT. A recognised, well-formed,
 // correctly-namespaced body is stored and answered 204 No Content; a malformed
-// or mis-namespaced body is 400; a PUT to any other path is 405.
+// or mis-namespaced body is 400; a PUT to a path this server no longer serves
+// (RehomeDER vacated it — see rehome.go) is 404, exactly like a GET of the
+// same path; a PUT to any other path is 405.
 func (s *Server) handlePUT(w http.ResponseWriter, r *http.Request, path string) {
 	wantRoot, ok := derPutTarget(path)
 	if !ok {
 		w.Header().Set("Allow", "GET, POST")
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	// The suffix match above says path LOOKS like a DER report target; whether
+	// this server still serves ANYTHING there is a separate question, and after
+	// a re-home the answer for the OLD href is no. Every DER report target this
+	// server ever advertises is also a resource in the tree (buildResourceTree
+	// and fleet.go both install one), so this is a no-op for every href this
+	// server currently advertises and only bites a vacated one.
+	s.mu.RLock()
+	_, live := s.resources[path]
+	s.mu.RUnlock()
+	if !live {
+		log.Printf("[gridsim] PUT %s: 404 (this server no longer serves a resource at this path)", path)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 

@@ -83,6 +83,29 @@ type AdminDERPut struct {
 	ReceivedAt int64  `json:"received_at"`
 }
 
+// sortedDERPuts turns the map GET /admin/derputs serves (keyed by resource
+// path, one entry per path — see the comment at its call site in Snapshot)
+// into the chronologically ordered slice ServerView's Since/PutsFor machinery
+// needs, sorted by ReceivedAt ascending so the LAST element really is the most
+// recent PUT. gridsim's ReceivedAt is second-granularity server time, so two
+// PUTs landing in the same wall-clock second tie; the path is the tiebreak,
+// which is deterministic but not guaranteed to match true arrival order for
+// that rare case — strictly better than a Go map's randomised iteration
+// order, which is what this replaces.
+func sortedDERPuts(m map[string]AdminDERPut) []AdminDERPut {
+	out := make([]AdminDERPut, 0, len(m))
+	for _, p := range m {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ReceivedAt != out[j].ReceivedAt {
+			return out[i].ReceivedAt < out[j].ReceivedAt
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
+}
+
 // AdminControl mirrors one control in gridsim's GET /admin/status.
 type AdminControl struct {
 	MRID        string `json:"mrid"`
@@ -584,13 +607,26 @@ func (d *Driver) Snapshot(ctx context.Context) ServerView {
 	} else {
 		v.Responses = rs.Responses
 	}
+	// gridsim's GET /admin/derputs serves a MAP keyed by resource path — it
+	// keeps only the latest body PER PATH, not an append-only history (see
+	// DERPut.Path / TestDERPut_LastBodyWins in derput_test.go) — so decoding it
+	// straight into a slice here would either fail outright or, decoded into a
+	// map and used unsorted, hand PutsFor/Since a Go map's ITERATION order,
+	// which is randomised per read. Since's positional delta and "the LAST
+	// entry is the most recent" (critDERPut's Server evaluator) both need a
+	// stable arrival order a bare map cannot provide, so this decodes the map
+	// and sorts it (sortedDERPuts) before it becomes ServerView.DERPuts. A
+	// re-home (rehome.go) is exactly the scenario that makes the distinction
+	// matter: the DUT's PUT to its ORIGINAL href and its later PUT to the
+	// RE-HOMED href are two different map keys, and both must survive — in the
+	// order they actually arrived — for a "most recent" read to mean anything.
 	var dp struct {
-		DERPuts []AdminDERPut `json:"der_puts"`
+		DERPuts map[string]AdminDERPut `json:"der_puts"`
 	}
 	if err := d.Admin.DERPuts(ctx, &dp); err != nil {
 		v.Errors = append(v.Errors, "GET /admin/derputs: "+err.Error())
 	} else {
-		v.DERPuts = dp.DERPuts
+		v.DERPuts = sortedDERPuts(dp.DERPuts)
 	}
 	var le struct {
 		LogEvents []map[string]any `json:"log_events"`
@@ -905,6 +941,34 @@ func (d *Driver) PostCurve(ctx context.Context, req CurveRequest) (string, error
 		return "", err
 	}
 	return out.MRID, nil
+}
+
+// RehomeDER re-homes the DUT's DERCapability and DERSettings hrefs via
+// gridsim's admin lever (sim/gridsim/rehome.go), so that a discovery walk
+// AFTER this call finds them at hrefs different from the ones any walk before
+// it saw.
+//
+// This is CORE-009/CORE-014's trigger for the DUT's on-change PUT: CSIP IG
+// §6.3.5.2 has the client PUT DERCapability/DERSettings "at device start-up
+// and on any changes", and lexa-gw's northbound reporter treats a moved
+// CAPABILITY or SETTINGS href as exactly such a change (derreport.go,
+// updateDERsLocked) — it re-PUTs to the new href even though the content
+// itself did not change. Calling this mid-case, after the initial discovery
+// walk has already been observed at the ORIGINAL hrefs, is what lets these
+// checks catch the on-change PUT within their own window instead of relying
+// on a start-up event this run's capture likely missed.
+//
+// It returns the two new hrefs, for the case's narrative and for a citation
+// that wants to name the exact path the PUT is now expected against.
+func (d *Driver) RehomeDER(ctx context.Context) (capHref, setHref string, err error) {
+	var out struct {
+		DERCapabilityHref string `json:"der_capability_href"`
+		DERSettingsHref   string `json:"der_settings_href"`
+	}
+	if err := d.Admin.Post(ctx, "rehome", nil, &out); err != nil {
+		return "", "", err
+	}
+	return out.DERCapabilityHref, out.DERSettingsHref, nil
 }
 
 // Subscriptions reads the subscriptions the DUT currently holds on the bench's
