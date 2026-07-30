@@ -1,6 +1,7 @@
 package sunspec
 
 import (
+	"errors"
 	"fmt"
 
 	"lexa-proto/modbus"
@@ -84,13 +85,66 @@ func ScanAt(t modbus.Transport, base uint16) ([]Block, error) {
 	return scanModels(t, base)
 }
 
+// maxScanModels bounds scanModels' walk. It is far above any real device
+// (SunSpec chains are a handful of models) and matches the independent
+// differential referee's maxChainSteps (csip-tls-test/internal/diff/chain.go)
+// exactly — same constant AND same check placement (once per header read,
+// counting the read that turns out to be the End marker too) — so the
+// product and the referee always agree on where a chain becomes unwalkable,
+// with no boundary case where one accepts what the other refuses.
+//
+// Boundary semantics this implies: a chain of up to maxScanModels-1 (255)
+// model blocks immediately followed by an End marker succeeds (256 header
+// reads total: 255 model headers + 1 End marker). A chain of maxScanModels
+// (256) model blocks trips the cap on the read attempt that would have found
+// the End marker — the 257th read is never attempted, so it does not matter
+// whether that header would have been 0xFFFF or not. This asymmetry is
+// deliberate: mirroring the referee's check bit-for-bit, including where it
+// rounds down, is what keeps the two walkers from ever disagreeing at the
+// edge.
+const maxScanModels = 256
+
+// ErrChainOverrun is returned by scanModels when a model chain cannot be
+// walked safely: either it would run past the 16-bit Modbus address space, or
+// it produced maxScanModels blocks without ever presenting an End marker. Both
+// are signs of a broken or hostile device, never of a legitimate one — see the
+// walk's bounds reasoning below. Callers that treat any scan error as
+// refuse-and-journal keep working unchanged; callers that want to distinguish
+// this specific failure can errors.Is/As against it.
+var ErrChainOverrun = errors.New("sunspec: model chain did not terminate safely")
+
 // scanModels walks the model list that follows a verified SunS header at base.
+//
+// It enforces the bounds a naive walker does not:
+//
+//  1. A model header must lie inside the 16-bit Modbus address space. A
+//     cursor that would advance past 65535 has run off the end of the
+//     device, and the next read wraps to address 0 — a different device's
+//     registers, or the SunS header again, which walks forever.
+//  2. A model's DATA must lie inside the address space too, for the same
+//     reason.
+//  3. The list must terminate within maxScanModels blocks. A walker with no
+//     step limit on a device that answers every read with non-0xFFFF data
+//     (broken or adversarial Modbus peer) reads until something errors, and a
+//     device that answers everything with zeros never errors: model 0,
+//     length 0, repeat, forever.
+//
+// cursor is tracked in uint32 so the address-space checks themselves cannot
+// silently wrap the way a uint16 cursor would.
 func scanModels(t modbus.Transport, base uint16) ([]Block, error) {
 	var blocks []Block
-	cursor := base + 2 // first model ID register
+	cursor := uint32(base) + 2 // first model ID register
 
-	for {
-		meta, err := t.ReadHolding(cursor, 2)
+	for step := 0; ; step++ {
+		if step >= maxScanModels {
+			return nil, fmt.Errorf("sunspec scan: %w: %d models discovered at cursor %d without an End marker (limit %d)",
+				ErrChainOverrun, len(blocks), cursor, maxScanModels)
+		}
+		if cursor+1 > 0xFFFF {
+			return nil, fmt.Errorf("sunspec scan: %w: model header at %d would run past the end of the 16-bit address space (%d models discovered so far)",
+				ErrChainOverrun, cursor, len(blocks))
+		}
+		meta, err := t.ReadHolding(uint16(cursor), 2)
 		if err != nil {
 			return nil, fmt.Errorf("sunspec scan: read model header at %d: %w", cursor, err)
 		}
@@ -100,12 +154,17 @@ func scanModels(t modbus.Transport, base uint16) ([]Block, error) {
 		if modelID == EndMarker {
 			break
 		}
+		dataBase := cursor + 2
+		if dataBase+uint32(length) > 0x10000 {
+			return nil, fmt.Errorf("sunspec scan: %w: model %d at %d declares %d registers, which runs past the end of the address space (%d > 65536, %d models discovered so far)",
+				ErrChainOverrun, modelID, dataBase, length, dataBase+uint32(length), len(blocks))
+		}
 		blocks = append(blocks, Block{
 			ModelID:  modelID,
-			BaseAddr: cursor + 2, // skip past the ID and length registers
+			BaseAddr: uint16(dataBase), // skip past the ID and length registers
 			Length:   length,
 		})
-		cursor += 2 + length
+		cursor = dataBase + uint32(length)
 	}
 	return blocks, nil
 }

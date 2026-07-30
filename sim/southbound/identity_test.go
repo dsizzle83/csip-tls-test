@@ -13,6 +13,7 @@ package sim
 // by NAME rather than by poking a register the writer might also have got wrong.
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -162,9 +163,11 @@ func TestModel1_EveryDeviceReportsACompleteIdentity(t *testing.T) {
 func TestModel1_OffsetsMatchTheDecoder(t *testing.T) {
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
 	// populateSolar, NOT populateSolarCore: the Core variant deliberately leaves
-	// the end marker to its caller, and lexa-proto's model walker does not
-	// terminate on an unterminated chain (see
-	// TestSunSpecScan_WalksAnUnterminatedChainWithoutBound).
+	// the end marker to its caller, and lexa-proto's model walker refuses an
+	// unterminated chain outright (sunspec.ErrChainOverrun — see
+	// TestSunSpecScan_BoundedWalkRefusesAnUnterminatedChainWithTheSentinel), so
+	// NewReader/ReadCommon over an unterminated register image would fail
+	// before there was anything to decode.
 	populateSolar(r, 5000, "SN-XCHECK-9")
 
 	reader, err := sunspec.NewReader(&regMapTransport{r: r})
@@ -264,47 +267,64 @@ func TestSetFirmwareVersion(t *testing.T) {
 	}
 }
 
-// TestSunSpecScan_WalksAnUnterminatedChainWithoutBound PINS A DEFECT IN
-// lexa-proto, found by accident and worth a permanent probe.
+// TestSunSpecScan_BoundedWalkRefusesAnUnterminatedChainWithTheSentinel PINS THE
+// FIX for the defect this test used to pin as
+// TestSunSpecScan_WalksAnUnterminatedChainWithoutBound.
 //
-// lexa-proto/sunspec's scanModels walks the model chain with `for { ... cursor
-// += 2 + length }` and leaves it only on the 0xFFFF end marker or a transport
-// error. There is no iteration cap, no bound on cursor, and no check that the
-// walk is making progress. A device that answers reads but never presents an
-// end marker — because its chain was truncated, because a "firmware update"
-// moved the marker out of the region the walker reaches, or because it simply
-// returns zeros for unmapped registers, which is a perfectly ordinary Modbus
-// implementation — is walked forever. cursor is a uint16, so it wraps at 65536
-// and the walk begins again, issuing two-register reads at the device for as
-// long as the process lives.
+// lexa-proto's scanModels used to walk the model chain with `for { ... cursor
+// += 2 + length }`, leaving only on the 0xFFFF end marker or a transport
+// error. There was no iteration cap, no bound on cursor, and no check that the
+// walk was making progress. A device that answered reads but never presented
+// an end marker — because its chain was truncated, because a "firmware
+// update" moved the marker out of the region the walker reached, or because
+// it simply returned zeros for unmapped registers, which is a perfectly
+// ordinary Modbus implementation — was walked forever. cursor was a uint16,
+// so it wrapped at 65536 and the walk began again, issuing two-register reads
+// at the device for as long as the process lived.
 //
-// This is I8's shape exactly: unbounded work driven entirely by what a peer
-// says, on the FIRST thing that happens to any southbound device. It is
+// That was I8's shape exactly: unbounded work driven entirely by what a peer
+// says, on the FIRST thing that happens to any southbound device. It was
 // reachable from every fault in lying.go that touches the chain, and it was
-// found here because a fixture built without the end marker hung this package's
-// tests for the full 110-second timeout rather than failing.
+// found here because a fixture built without the end marker hung this
+// package's tests for the full 110-second timeout rather than failing.
 //
-// The probe is bounded from the OUTSIDE: the transport itself refuses after
-// scanCapReads, so the test terminates whatever the walker does. The assertion
-// is that the walker went all the way to that cap — i.e. that nothing inside it
-// stopped the walk. WHEN LEXA-PROTO GROWS A BOUND, THIS TEST WILL FAIL, and the
-// correct response is to assert the new bound here rather than to delete it.
-func TestSunSpecScan_WalksAnUnterminatedChainWithoutBound(t *testing.T) {
+// lexa-proto commit 8788796 fixed it: scanModels now tracks cursor as a
+// uint32, checks both the model header and its declared data against the
+// 16-bit Modbus address space, caps the walk at maxScanModels=256 steps, and
+// returns the sentinel error ErrChainOverrun for either bound. This test
+// keeps the same fixture (an unterminated chain) and flips the assertion from
+// "the walk never stops" to "the walk stops ITSELF, wrapping the sentinel,
+// well inside the cap this test used to have to supply from the outside".
+//
+// The outer cappedTransport stays as a hang-guard, not as the thing doing the
+// bounding: if a future lexa-proto change regresses scanModels back to
+// unbounded, this test must FAIL LOUDLY rather than hang for scanCapReads
+// reads, and the assertions below (error wraps ErrChainOverrun, reads stay far
+// below scanCapReads) do exactly that. Re-deleting the bound and deleting this
+// test to get back to green is the wrong fix — see requireClass's rationale
+// in internal/diff/diff_test.go for the general shape of this argument.
+func TestSunSpecScan_BoundedWalkRefusesAnUnterminatedChainWithTheSentinel(t *testing.T) {
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
 	populateSolarCore(r, 5000, "SN-UNTERMINATED") // no end marker, on purpose
 	tr := &cappedTransport{regMapTransport: regMapTransport{r: r}, cap: scanCapReads}
 
 	_, err := sunspec.Scan(tr)
 	if err == nil {
-		t.Fatal("the walk terminated on its own over an UNTERMINATED chain — either lexa-proto grew a " +
-			"bound (good: assert it here) or this fixture now has an end marker (bad: the probe is dead)")
+		t.Fatal("the walk terminated on its own over an UNTERMINATED chain with no error at all — " +
+			"scanModels should refuse via sunspec.ErrChainOverrun, not succeed silently")
 	}
-	if tr.reads < scanCapReads {
-		t.Fatalf("the walker stopped after %d reads, below the transport's cap of %d — it now has a bound "+
-			"of its own; assert THAT bound here instead of this one", tr.reads, scanCapReads)
+	if !errors.Is(err, sunspec.ErrChainOverrun) {
+		t.Fatalf("got error %v, which does not wrap sunspec.ErrChainOverrun — either the bound's sentinel "+
+			"changed (update this test to match) or something else is failing the scan before the bound "+
+			"is even reached", err)
 	}
-	t.Logf("FINDING: lexa-proto/sunspec.scanModels issued %d reads against an unterminated chain and was "+
-		"still walking; only the test's own cap stopped it (uint16 cursor wraps at 65536 → forever)", tr.reads)
+	if tr.reads >= scanCapReads {
+		t.Fatalf("the walker consumed the FULL outer cap (%d reads) before refusing — the bound has "+
+			"regressed back to unbounded (or close enough to it that the outer cappedTransport, not "+
+			"scanModels' own maxScanModels, is what stopped this walk)", tr.reads)
+	}
+	t.Logf("scanModels refused an unterminated chain after %d reads via %v (outer hang-guard cap was %d, "+
+		"never reached)", tr.reads, err, scanCapReads)
 }
 
 // scanCapReads bounds the probe above. It is comfortably past any legitimate

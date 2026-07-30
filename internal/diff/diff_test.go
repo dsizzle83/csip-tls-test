@@ -32,10 +32,12 @@ package diff
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"csip-tls-test/internal/invariant"
+	"lexa-proto/sunspec"
 )
 
 // ── control ──────────────────────────────────────────────────────────────────
@@ -328,13 +330,37 @@ func TestCtlCatalog_ConfirmedDefectClassesStillReproduce(t *testing.T) {
 	}
 }
 
-// TestChainCatalog_UnboundedWalkStillReproduces pins the model-chain findings.
+// TestChainCatalog_BoundedWalkTerminatesWithSentinel pins the FIX for the
+// model-chain findings TestChainCatalog_UnboundedWalkStillReproduces used to
+// pin.
 //
-// lexa-proto/sunspec.scanModels is `for { ... cursor += 2 + length }` with no
-// iteration cap, no check that the declared length fits the address space, and
-// a uint16 cursor that WRAPS. Its only exits are the 0xFFFF end marker and a
-// read error, so a device answering zeros walks it forever.
-func TestChainCatalog_UnboundedWalkStillReproduces(t *testing.T) {
+// lexa-proto/sunspec.scanModels used to be `for { ... cursor += 2 + length }`
+// with no iteration cap, no check that the declared length fits the address
+// space, and a uint16 cursor that WRAPPED. Its only exits were the 0xFFFF end
+// marker and a read error, so a device answering zeros was walked forever.
+//
+// lexa-proto commit 8788796 fixed it: cursor is now a uint32, both a model's
+// header and its declared data are checked against the 16-bit address space,
+// the walk is capped at maxScanModels=256 steps, and either bound now returns
+// the sentinel error sunspec.ErrChainOverrun instead of looping or silently
+// accepting an unwalkable chain. This package's own referee (chain.go's
+// walk()) already enforced the identical bound — maxChainSteps=256, checked
+// in the same place in the loop (once per header read, counting the read
+// that would have found the End marker) — from before this fix landed, so
+// the fix does not change what the REFEREE concludes about these fixtures; it
+// changes what the PRODUCT concludes, from "accepted" or "never stops" to
+// "refuses, agreeing with the referee".
+//
+// The four hostile fixtures that used to produce "non-terminating" (no end
+// marker: DIFF-CHAIN-002) and "accepted-hostile-chain" (a declared length or
+// cursor that runs past the address space: DIFF-CHAIN-004, DIFF-CHAIN-005; a
+// chain long enough to trip the step cap before its own end marker:
+// DIFF-CHAIN-010) now AGREE instead: both walkers refuse, and the product's
+// error wraps sunspec.ErrChainOverrun. A regression back to unbounded
+// scanModels reopens the disagreement — the old finding classes reappear
+// (checked first, below) AND the direct per-fixture ErrChainOverrun checks
+// fail outright, so this cannot regress silently.
+func TestChainCatalog_BoundedWalkTerminatesWithSentinel(t *testing.T) {
 	r := NewReport(1)
 	RunChainCatalog(context.Background(), r)
 	sum := r.Summary()
@@ -343,14 +369,123 @@ func TestChainCatalog_UnboundedWalkStillReproduces(t *testing.T) {
 	}
 	classes := findingClasses(sum)
 
-	requireClass(t, classes, "non-terminating",
-		"scanModels has no iteration bound and a uint16 cursor that wraps; only 0xFFFF or a read "+
-			"error ends the walk")
-	requireClass(t, classes, "accepted-hostile-chain",
-		"a model declaring a length that runs past the end of the address space is recorded as a block")
+	// The old defect classes must NOT reproduce any more. WHEN LEXA-PROTO
+	// REGRESSES scanModels back to unbounded, one or both of these will fire
+	// again — that is the loud failure this test exists to guarantee, not a
+	// reason to delete the check.
+	if n := classes["non-terminating"]; n != 0 {
+		t.Errorf("%d case(s) still report 'non-terminating' — scanModels is supposed to be bounded "+
+			"(maxScanModels=256, sunspec.ErrChainOverrun) as of lexa-proto 8788796; a device with no end "+
+			"marker must now be REFUSED, not walked forever. Check proto.pin and vendor/lexa-proto/sunspec.",
+			n)
+	}
+	if n := classes["accepted-hostile-chain"]; n != 0 {
+		t.Errorf("%d case(s) still report 'accepted-hostile-chain' — scanModels is supposed to check both "+
+			"a model header and its declared data against the 16-bit address space as of lexa-proto "+
+			"8788796; a chain that runs past it must now be REFUSED, matching the referee's pre-existing "+
+			"bounds, not recorded as a block list.", n)
+	}
 
 	if sum.ByVerdict[string(Pass)] == 0 {
 		t.Error("no chain case passed: the referee's bounds are probably wrong, not the product's walker")
+	}
+
+	// Directly confirm each hostile fixture (the fixtures themselves are
+	// untouched — see ChainCatalog() in chain.go): the product now refuses,
+	// wrapping ErrChainOverrun, and the report-level Case for it records
+	// agreement (Pass) rather than the old disagreement.
+	hostile := map[string]string{
+		"DIFF-CHAIN-002": "no end marker at all",
+		"DIFF-CHAIN-004": "a model declaring 65535 registers",
+		"DIFF-CHAIN-005": "runs off the top of the address space",
+		"DIFF-CHAIN-010": "a thousand zero-length models, past the 256-step cap",
+	}
+	found := map[string]bool{}
+	for _, c := range ChainCatalog() {
+		why, want := hostile[c.ID]
+		if !want {
+			continue
+		}
+		found[c.ID] = true
+		dev := &chainDevice{regs: c.Regs, limit: 4096}
+		_, err := sunspec.ScanAt(dev, c.Base)
+		if err == nil {
+			t.Errorf("%s (%s): sunspec.ScanAt accepted a hostile chain with no error", c.ID, why)
+			continue
+		}
+		if !errors.Is(err, sunspec.ErrChainOverrun) {
+			t.Errorf("%s (%s): ScanAt refused with %v, which does not wrap sunspec.ErrChainOverrun",
+				c.ID, why, err)
+		}
+	}
+	for id, why := range hostile {
+		if !found[id] {
+			t.Errorf("%s (%s) is no longer in ChainCatalog() — this test names specific fixture IDs; "+
+				"if the ID changed, update this test rather than letting the check silently stop running",
+				id, why)
+		}
+	}
+
+	for _, c := range r.Cases {
+		if _, want := hostile[c.ID]; !want {
+			continue
+		}
+		if c.Verdict != Pass {
+			t.Errorf("%s: report-level Case.Verdict = %s, want Pass — product and referee are supposed to "+
+				"agree (both refuse) on this fixture now; comparisons: %+v", c.ID, c.Verdict, c.Comparisons)
+		}
+	}
+}
+
+// TestChainWalk_ProductAndRefereeAgreeAtTheBoundary asserts the product's
+// maxScanModels and the referee's maxChainSteps are not merely both 256 by
+// coincidence, but checked in the same PLACE: a chain of exactly
+// maxScanModels-1 (255) models immediately followed by an End marker succeeds
+// on both sides (256 header reads total: 255 model headers + the End
+// marker), while a chain of maxScanModels (256) models trips the cap on the
+// read that would have found the End marker, on both sides — even though
+// that End marker is genuinely present in the register image, it is never
+// reached. Neither maxScanModels (unexported in lexa-proto/sunspec) nor
+// maxChainSteps (unexported here) can be compared by value from outside
+// their packages, so this test proves they agree by BEHAVIOUR at the one
+// input where a one-off difference between them would show up. If the two
+// bounds ever drift apart — a constant changed on only one side, or an
+// off-by-one in where the check is placed — this is the test that catches
+// it; nothing else in this package probes exactly at the edge.
+func TestChainWalk_ProductAndRefereeAgreeAtTheBoundary(t *testing.T) {
+	const base = 40000
+
+	okRegs := manyZeroLengthModels(base, 255)
+	prodBlocks, prodErr := sunspec.ScanAt(&chainDevice{regs: okRegs, limit: 4096}, base)
+	if prodErr != nil {
+		t.Fatalf("product: 255 models + End marker should succeed, got %v", prodErr)
+	}
+	if len(prodBlocks) != 255 {
+		t.Fatalf("product: got %d blocks, want 255", len(prodBlocks))
+	}
+	refBlocks, refErr := walk(&chainDevice{regs: okRegs, limit: 4096}, base)
+	if refErr != nil {
+		t.Fatalf("referee: 255 models + End marker should succeed, got %v", refErr)
+	}
+	if len(refBlocks) != 255 {
+		t.Fatalf("referee: got %d blocks, want 255", len(refBlocks))
+	}
+
+	// 256 models, THEN an End marker: the marker exists in the register image
+	// but is never reached — the cap must trip on the read attempt that would
+	// have found it, on both walkers.
+	capRegs := manyZeroLengthModels(base, 256)
+	_, prodErrAt256 := sunspec.ScanAt(&chainDevice{regs: capRegs, limit: 4096}, base)
+	if prodErrAt256 == nil {
+		t.Fatal("product: 256 models should trip the step cap even though an End marker follows in the " +
+			"register image — the cap must fire on the read that would have reached it")
+	}
+	if !errors.Is(prodErrAt256, sunspec.ErrChainOverrun) {
+		t.Fatalf("product: refused 256 models with %v, which does not wrap sunspec.ErrChainOverrun", prodErrAt256)
+	}
+	if _, refErrAt256 := walk(&chainDevice{regs: capRegs, limit: 4096}, base); refErrAt256 == nil {
+		t.Fatal("referee: 256 models should also trip maxChainSteps — if this now succeeds, the referee's " +
+			"own bound moved and no longer matches the product's")
 	}
 }
 
