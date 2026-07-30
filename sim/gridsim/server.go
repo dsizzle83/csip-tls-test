@@ -25,12 +25,15 @@
 package gridsim
 
 import (
+	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,6 +78,23 @@ type Server struct {
 	// MirrorUsagePoint store (Phase 2 POST /mup flow).
 	// mupNextID is protected by mu; do not read/write outside the mu lock.
 	mupNextID int32
+
+	// mupMu/mups is the durable admin record of every registered
+	// MirrorUsagePoint (BASIC-029's /admin/mups lever, audit 2026-07-30). It is
+	// SEPARATE from s.resources[location] above: model.MirrorUsagePoint has no
+	// field for the ReadingType elements a registration POST carries, so
+	// xml.Unmarshal drops them silently on the way into that struct, and the
+	// 2030.5-shaped resource therefore cannot answer "what ReadingType did the
+	// DUT declare". mups is where the raw-body facts /admin/mups needs to
+	// publish — deviceLFDI, ReadingType uoms, reading count, created-at —
+	// actually survive. It is SERVER STATE, not a log: a restart wipes it
+	// honestly, and unlike the request log it is never evicted, which is the
+	// whole point — see suitecsip.critMUPRegistered's doc for why the request
+	// log alone made BASIC-029 flap. Guarded by its own mutex rather than mu,
+	// like every other admin-observability store in this package (derPutMu,
+	// logEventMu, …).
+	mupMu sync.Mutex
+	mups  []mupRecord
 
 	// derHomeGen counts how many times RehomeDER has re-homed a DER's
 	// DERCapability/DERSettings hrefs (CSIP IG §6.3.5.2 lever for CORE-009/
@@ -706,6 +726,21 @@ func (s *Server) handleMUPCreate(w http.ResponseWriter, r *http.Request, peerLFD
 	}
 	s.mu.Unlock()
 
+	// Durable admin record (see the mups field doc): captures the ReadingType
+	// uoms the model.MirrorUsagePoint unmarshal above silently dropped, keyed
+	// by the href just allocated so a later POST /mup/{n} of readings can find
+	// and extend it. Deliberately a SEPARATE lock from s.mu/s.resources: this
+	// store exists only for GET /admin/mups to read, never for the 2030.5 data
+	// plane, so it has no business contending with every CSIP request.
+	s.mupMu.Lock()
+	s.mups = append(s.mups, mupRecord{
+		Href:         location,
+		LFDI:         mup.DeviceLFDI,
+		ReadingTypes: mupReadingTypeUOMs(body),
+		CreatedAt:    s.Now(),
+	})
+	s.mupMu.Unlock()
+
 	w.Header().Set("Location", location)
 	w.WriteHeader(http.StatusCreated)
 	log.Printf("[gridsim] POST /mup → created %s (postRate=%d)", location, mup.PostRate)
@@ -714,7 +749,7 @@ func (s *Server) handleMUPCreate(w http.ResponseWriter, r *http.Request, peerLFD
 // handleMUPReadings handles POST /mup/{n} to accept periodic meter readings.
 // Returns 204 No Content on success.
 func (s *Server) handleMUPReadings(w http.ResponseWriter, r *http.Request, path string) {
-	_, _ = io.ReadAll(r.Body) // drain body; readings are not persisted in the sim
+	body, _ := io.ReadAll(r.Body) // readings are not persisted whole; only the admin summary below survives
 
 	s.mu.RLock()
 	_, ok := s.resources[path]
@@ -724,8 +759,144 @@ func (s *Server) handleMUPReadings(w http.ResponseWriter, r *http.Request, path 
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+
+	// Roll this reading into the durable admin record: bump the count and fold
+	// in any ReadingType this POST declares for itself (the standard 2030.5
+	// shape — model.MirrorMeterReading.ReadingType — as distinct from one
+	// embedded at registration, which mupReadingTypeUOMs also catches).
+	s.mupMu.Lock()
+	for i := range s.mups {
+		if s.mups[i].Href == path {
+			s.mups[i].Readings++
+			s.mups[i].ReadingTypes = mergeUOMs(s.mups[i].ReadingTypes, mupReadingTypeUOMs(body))
+			break
+		}
+	}
+	s.mupMu.Unlock()
+
 	w.WriteHeader(http.StatusNoContent)
 	log.Printf("[gridsim] POST %s → readings accepted (204)", path)
+}
+
+// mupRecord is the durable, admin-visible record of one registered
+// MirrorUsagePoint. Guarded by mupMu. See AdminMUP / handleAdminMUPs for the
+// JSON shape this is published as, and the mups field doc on Server for why it
+// exists apart from s.resources.
+type mupRecord struct {
+	Href         string
+	LFDI         string
+	ReadingTypes []uint8
+	Readings     int
+	CreatedAt    int64
+}
+
+// mupReadingTypeUOMs scans a MirrorUsagePoint or MirrorMeterReading POST body
+// for every uom value nested anywhere under a ReadingType element (2030.5
+// Table 11: 38=W real power, 63=var reactive, 33=Hz frequency, 29=V voltage).
+// It reads the raw bytes rather than unmarshalling into model.MirrorUsagePoint
+// (which has no ReadingType field at all — xml.Unmarshal drops one silently)
+// or model.MirrorMeterReading (whose ReadingType nests one level differently
+// than the DUT observed on this bench actually sends it, embedding ReadingType
+// straight inside the MirrorUsagePoint registration POST rather than a
+// separate MirrorMeterReading resource). /admin/mups exists to publish what
+// arrived, not what either struct happens to declare, so this walks the token
+// stream directly instead of unmarshalling into either shape.
+func mupReadingTypeUOMs(body []byte) []uint8 {
+	dec := xml.NewDecoder(bytes.NewReader(body))
+	var stack []string
+	var uoms []uint8
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			stack = append(stack, t.Name.Local)
+		case xml.EndElement:
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		case xml.CharData:
+			if len(stack) >= 2 && stack[len(stack)-1] == "uom" && stack[len(stack)-2] == "ReadingType" {
+				if v, perr := strconv.ParseUint(strings.TrimSpace(string(t)), 10, 8); perr == nil {
+					uoms = append(uoms, uint8(v))
+				}
+			}
+		}
+	}
+	return uoms
+}
+
+// mergeUOMs appends the uom values in add that are not already in existing,
+// preserving existing's order (first-seen keeps its position), so /admin/mups
+// reports a stable, deduplicated list across repeated MirrorMeterReading
+// POSTs of the same ReadingType instead of growing without bound.
+func mergeUOMs(existing, add []uint8) []uint8 {
+	seen := make(map[uint8]bool, len(existing))
+	for _, u := range existing {
+		seen[u] = true
+	}
+	out := existing
+	for _, u := range add {
+		if !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// AdminMUP is one registered MirrorUsagePoint, surfaced read-only by GET
+// /admin/mups. It is SERVER STATE, not a log entry — a restart wipes it
+// honestly — and it exists because registration is a ONE-TIME event (the DUT
+// registers once, at its first contact with this MirrorUsagePointList) while
+// gridsim's request log is a bounded ring that a case window opening well
+// after that one-time POST can find has already moved past (audit
+// 2026-07-30, runs/perphase-basic029-v3-20260730T223730). This answers a
+// different question than the log does: not "did the window see a POST" but
+// "does a MirrorUsagePoint bearing this LFDI exist right now" — see
+// suitecsip.critMUPRegistered (internal/certify/suitecsip/basic.go), which
+// consults this endpoint as its second-strongest tier: after an in-window wire
+// citation, before conceding the request log's ring gap.
+type AdminMUP struct {
+	Href         string  `json:"href"`
+	LFDI         string  `json:"lfdi"`
+	ReadingTypes []uint8 `json:"reading_types,omitempty"` // uom values, 2030.5 Table 11 (38 = W, real power)
+	Readings     int     `json:"readings"`                // MirrorMeterReading POSTs accepted since registration
+	CreatedAt    int64   `json:"created_at"`              // gridsim server time (Unix seconds) at POST /mup
+}
+
+// ReceivedMUPs returns a copy of the durable MirrorUsagePoint records, in
+// registration order (oldest first).
+func (s *Server) ReceivedMUPs() []AdminMUP {
+	s.mupMu.Lock()
+	defer s.mupMu.Unlock()
+	out := make([]AdminMUP, 0, len(s.mups))
+	for _, m := range s.mups {
+		out = append(out, AdminMUP{
+			Href:         m.Href,
+			LFDI:         m.LFDI,
+			ReadingTypes: append([]uint8(nil), m.ReadingTypes...),
+			Readings:     m.Readings,
+			CreatedAt:    m.CreatedAt,
+		})
+	}
+	return out
+}
+
+// handleAdminMUPs serves GET /admin/mups — read-only, like every other admin
+// observation surface. See AdminMUP.
+func (s *Server) handleAdminMUPs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"mups":        s.ReceivedMUPs(),
+		"server_time": s.Now(),
+	})
 }
 
 // serveXML marshals resource to IEEE 2030.5 XML and writes it to w.

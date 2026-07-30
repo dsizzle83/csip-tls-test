@@ -197,6 +197,26 @@ type AdminFleetDevice struct {
 	Programs  []string `json:"programs"`
 }
 
+// AdminMUP mirrors one entry of gridsim's GET /admin/mups: the durable record
+// of a MirrorUsagePoint the DUT registered.
+//
+// It is STATE, not a log — like Fleet and Subscriptions, Since carries it
+// through unchanged rather than deltaing it (see ServerView.Since) — and it is
+// read at all because registration is a ONE-TIME event that ordinarily
+// predates a case's own window: BASIC-029 has no Setup that forces a fresh
+// one, so by the time its window opens the request log (a bounded ring) has
+// often already moved past the one POST that mattered. This is gridsim's
+// answer to a question the log cannot: not "did THIS WINDOW see a
+// registration POST" but "does a MirrorUsagePoint bearing the DUT's LFDI
+// exist right now". See critMUPRegistered.
+type AdminMUP struct {
+	Href         string  `json:"href"`
+	LFDI         string  `json:"lfdi"`
+	ReadingTypes []uint8 `json:"reading_types,omitempty"` // uom values, 2030.5 Table 11 (38 = W, real power)
+	Readings     int     `json:"readings"`
+	CreatedAt    int64   `json:"created_at"`
+}
+
 // AdminNotification mirrors one entry of gridsim's GET /admin/notifications:
 // one Notification POST attempt and what came back.
 //
@@ -251,12 +271,16 @@ type ServerView struct {
 	// back. Like Responses it is append-only, so Since deltas it by length.
 	Notifications []AdminNotification
 
-	// Fleet and Subscriptions are STATE, not logs: the fixture the server is
-	// serving right now and the subscriptions the DUT holds right now. Since
-	// carries them through unchanged, because "the fleet as it was at the
-	// baseline minus the fleet as it is now" is not a meaningful quantity.
+	// Fleet, Subscriptions and MUPs are STATE, not logs: the fixture the server
+	// is serving right now, the subscriptions the DUT holds right now, and the
+	// MirrorUsagePoints the DUT has registered so far. Since carries them
+	// through unchanged, because "the fleet (or MUP list) as it was at the
+	// baseline minus as it is now" is not a meaningful quantity — a case whose
+	// window opened long after the DUT's one-time MUP registration needs to see
+	// that registration too, not have it deltaed away. See AdminMUP.
 	Fleet         []AdminFleetDevice
 	Subscriptions []AdminSubscription
+	MUPs          []AdminMUP
 
 	// Errors records what could not be collected, so a partial view is never
 	// mistaken for a complete one.
@@ -416,6 +440,27 @@ func (v ServerView) FleetDeviceNamed(name string) (AdminFleetDevice, bool) {
 		}
 	}
 	return AdminFleetDevice{}, false
+}
+
+// RegisteredMUP returns the durable MirrorUsagePoint state critMUPRegistered's
+// tier-3b needs: a MirrorUsagePoint that carries a deviceLFDI and at least one
+// ReadingType, taken from GET /admin/mups — gridsim's registration STORE,
+// which (unlike its request log) is never evicted. It exists because
+// registration is a ONE-TIME event that ordinarily predates a case's own
+// window, so "no POST in this window" is not evidence of non-registration
+// when the store shows one exists.
+//
+// This bench serializes its live runs and gridsim serves one DUT per run, so
+// the oldest qualifying entry is unambiguously the DUT's — the same
+// single-client assumption this package states everywhere it claims frames by
+// remote endpoint rather than by 4-tuple.
+func (v ServerView) RegisteredMUP() (AdminMUP, bool) {
+	for _, m := range v.MUPs {
+		if m.LFDI != "" && len(m.ReadingTypes) > 0 {
+			return m, true
+		}
+	}
+	return AdminMUP{}, false
 }
 
 // NotificationsFor returns the Notifications pushed for one subscribed
@@ -673,6 +718,19 @@ func (d *Driver) Snapshot(ctx context.Context) ServerView {
 	}
 	if err := d.Admin.Get(ctx, "subscriptions", &sb); err == nil {
 		v.Subscriptions = sb.Subscriptions
+	}
+	// /admin/mups (audit 2026-07-30): the durable MUP registration STATE
+	// critMUPRegistered's tier-3b falls back to. Read the same lenient way as
+	// the three surfaces above — not because it is an optional fixture, but
+	// because a gridsim process that has not yet been restarted onto the build
+	// carrying this endpoint answers 404 for it, and that must degrade to "no
+	// state to fall back on" (the criterion's older, request-log-only
+	// behaviour), not to a bundle-wide Errors entry on every run against it.
+	var mp struct {
+		MUPs []AdminMUP `json:"mups"`
+	}
+	if err := d.Admin.Get(ctx, "mups", &mp); err == nil {
+		v.MUPs = mp.MUPs
 	}
 
 	lr, err := d.readLog(ctx)

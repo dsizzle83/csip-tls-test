@@ -31,6 +31,11 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/admin/paginate", cors(s.handleAdminPaginate))
 	mux.HandleFunc("/admin/responses", cors(s.handleAdminResponses))
 	mux.HandleFunc("/admin/derputs", cors(s.handleAdminDERPuts))
+	// The durable MirrorUsagePoint registration STATE (BASIC-029, audit
+	// 2026-07-30): unlike the request log this survives a window opening after
+	// the DUT's one-time registration POST, at the cost of not surviving a
+	// gridsim restart. See AdminMUP in server.go.
+	mux.HandleFunc("/admin/mups", cors(s.handleAdminMUPs))
 	mux.HandleFunc("/admin/logevents", cors(s.handleAdminLogEvents))
 	// CORE-009/CORE-014 lever (rehome.go): re-home the DUT's DERCapability/
 	// DERSettings hrefs so its next discovery walk notices the change and

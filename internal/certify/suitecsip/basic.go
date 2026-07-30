@@ -33,6 +33,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"csip-tls-test/internal/certify"
 )
@@ -575,16 +576,40 @@ func critDERStatusElements() criterion {
 // MirrorMeterReading/ReadingType, answered 201 Created (or 204 for an
 // existing mRID) with a Location header.
 //
-// The Server tier is the one with a real gap to mind: registration is a
-// ONE-TIME event (the DUT does it once, at first contact with this
-// MirrorUsagePointList, and has no reason to repeat it), and gridsim's
-// request log — unlike Responses/DERPuts, which are unbounded — is a bounded
-// ring (see ServerView.RequestLogGap / Since). A case window opened well
-// after that one-time POST, with enough OTHER traffic between it and the
-// registration to wrap the ring, finds the log simply has no memory of it
-// left; reporting that as "the DUT never registered" is the false-FAIL bug
-// Since's own doc warns about, so RequestLogGap is checked before a FAIL is
-// drawn from an empty count.
+// Three tiers, strongest first:
+//
+//  1. Wire (above): an in-window POST recovered from the decrypted transcript,
+//     cited by frame. This is the strongest evidence and, when the DUT's
+//     registration happens to fall inside the case's own capture window, is
+//     what actually grades the claim.
+//  2. Server / request log: an in-window POST recorded in gridsim's request
+//     log (an EXACT match on the registration path "/mup" — see below for why
+//     that has to be exact, not a prefix).
+//  3. Server / MUP state (ServerView.RegisteredMUP, GET /admin/mups):
+//     registration is a ONE-TIME event — the DUT does it once, at first
+//     contact with this MirrorUsagePointList, and has no reason to repeat it —
+//     and it ordinarily predates a case's own window: BASIC-029 has no Setup
+//     of its own to force a fresh one, so by the time this check's window
+//     opens the registration already happened, often minutes or a whole
+//     campaign earlier. Tiers 1 and 2 can only ever see what fell inside the
+//     window; gridsim's durable MUP store did not stop existing just because
+//     the window opened late, so it is consulted before conceding anything.
+//  4. Server / ring gap (last resort, e186056): if the MUP store ALSO has
+//     nothing (an older gridsim predating the /admin/mups lever, or the
+//     process was restarted since registration and genuinely lost its state),
+//     fall back to RequestLogGap: an empty request-log count from a ring that
+//     itself says it cannot be trusted for this window is unavailable, not a
+//     FAIL. Only once the log is both empty AND trusted is this a real FAIL.
+//
+// Fix note (audit 2026-07-30, runs/stamped-basic029-20260730T073518 assertion
+// 2): the request-log tier used to match any path with the "/mup" PREFIX,
+// which also matches "/mup/{n}" — the READING endpoint. A DUT that never
+// registers but posts readings every 300s would eventually rack up a POST
+// count under the old code and PASS this criterion on evidence that was
+// never a registration at all (that run's own Wire tier found no
+// MirrorUsagePoint POST in the transcript, yet the Server tier reported "36
+// POST(s) to the MirrorUsagePoint tree" and PASSed). The request-log tier now
+// matches the registration path exactly.
 func critMUPRegistered() criterion {
 	return criterion{
 		Claim: "the DUT registered a MirrorUsagePoint carrying its own LFDI and a " +
@@ -632,34 +657,54 @@ func critMUPRegistered() criterion {
 			n := v.GETs("/mup")
 			posts := 0
 			for _, r := range v.Requests {
-				if r.Method == "POST" && strings.HasPrefix(r.Path, "/mup") {
+				// Exact match on the registration endpoint: "/mup/0" (a
+				// reading POST) must never be counted here — see the fix note
+				// above.
+				if r.Method == "POST" && r.Path == "/mup" {
 					posts++
 				}
 			}
-			if posts == 0 {
-				if !v.SessionEstablished() {
-					return noSessionUnavailable()
-				}
-				// The request log is a bounded ring (unlike Responses/DERPuts),
-				// and the registration this criterion is after is a ONE-TIME
-				// event: it happens once, at the DUT's first contact, and
-				// never again unless gridsim's state is wiped. A window opened
-				// long after that (this case has no Setup of its own to force a
-				// fresh one) can find the log has simply moved on — RequestLogGap
-				// is Since's own signal that this is what happened, not that the
-				// DUT never registered.
-				if v.RequestLogGap != "" {
-					return unavailable("gridsim's request log records no POST to the "+
-						"MirrorUsagePoint tree during this window, but %s", v.RequestLogGap)
-				}
-				return Finding{Verdict: certify.Fail,
-					Observed: fmt.Sprintf("gridsim's request log records no POST to the "+
-						"MirrorUsagePoint tree during this window (%d GET(s) of /mup)", n)}
+			if posts > 0 {
+				return Finding{Verdict: certify.Pass,
+					Observed: fmt.Sprintf("gridsim's request log records %d POST(s) to the "+
+						"MirrorUsagePoint registration endpoint (/mup) during this window; the status "+
+						"codes and bodies are not recoverable from the log", posts)}
 			}
-			return Finding{Verdict: certify.Pass,
-				Observed: fmt.Sprintf("gridsim's request log records %d POST(s) to the "+
-					"MirrorUsagePoint tree; the status codes and bodies are not recoverable from "+
-					"the log", posts)}
+			if !v.SessionEstablished() {
+				return noSessionUnavailable()
+			}
+			// Tier 3: the request log found nothing in this window, but
+			// registration is a ONE-TIME event this window had no reason to
+			// see — consult the durable MUP store before conceding anything.
+			if mup, ok := v.RegisteredMUP(); ok {
+				return Finding{Verdict: certify.Pass,
+					Observed: fmt.Sprintf("gridsim's request log records no in-window POST to the "+
+						"MirrorUsagePoint registration endpoint (%d GET(s) of /mup), but its durable MUP "+
+						"state (GET /admin/mups) records %s registered at %s carrying deviceLFDI=%s with "+
+						"%d ReadingType(s) (uom %v); this window opened after the DUT's one-time "+
+						"registration, not before it happened",
+						n, mup.Href, time.Unix(mup.CreatedAt, 0).UTC().Format(time.RFC3339), mup.LFDI,
+						len(mup.ReadingTypes), mup.ReadingTypes)}
+			}
+			// Tier 4 (last resort): the request log is a bounded ring (unlike
+			// Responses/DERPuts), and the registration this criterion is
+			// after is a ONE-TIME event: it happens once, at the DUT's first
+			// contact, and never again unless gridsim's state is wiped. A
+			// window opened long after that (this case has no Setup of its
+			// own to force a fresh one) can find the log has simply moved on
+			// — RequestLogGap is Since's own signal that this is what
+			// happened, not that the DUT never registered.
+			if v.RequestLogGap != "" {
+				return unavailable("gridsim's request log records no POST to the "+
+					"MirrorUsagePoint registration endpoint during this window, its durable MUP state "+
+					"(GET /admin/mups) records nothing bearing a deviceLFDI and a ReadingType either, "+
+					"but %s", v.RequestLogGap)
+			}
+			return Finding{Verdict: certify.Fail,
+				Observed: fmt.Sprintf("gridsim's request log records no POST to the MirrorUsagePoint "+
+					"registration endpoint during this window (%d GET(s) of /mup), and its durable MUP "+
+					"state (GET /admin/mups) records no MirrorUsagePoint carrying a deviceLFDI and a "+
+					"ReadingType either", n)}
 		},
 	}
 }

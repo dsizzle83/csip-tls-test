@@ -186,6 +186,143 @@ func TestCritMUPRegistered_PostsStillPass(t *testing.T) {
 	}
 }
 
+// TestCritMUPRegistered_ReadingPOSTDoesNotMasqueradeAsRegistration is the
+// regression lock for the audit's third finding (2026-07-30,
+// runs/stamped-basic029-20260730T073518 assertion 2): the request-log tier
+// used to match any path with the "/mup" PREFIX, which also matches the
+// READING endpoint "/mup/{n}". A DUT posting readings every 300s but never
+// registering would rack up a POST count under the old code and PASS on
+// evidence that was never a registration — that run's own Wire tier found no
+// MirrorUsagePoint POST in the transcript at all, yet the Server tier
+// reported "36 POST(s) to the MirrorUsagePoint tree" and PASSed. A reading
+// POST alone, with no exact "/mup" POST and no MUP state to fall back on,
+// must FAIL, not PASS.
+func TestCritMUPRegistered_ReadingPOSTDoesNotMasqueradeAsRegistration(t *testing.T) {
+	c := critMUPRegistered()
+	v := &ServerView{Available: true, Requests: []ServerRequest{
+		{Method: "POST", Path: "/mup/0"},
+		{Method: "POST", Path: "/mup/0"},
+	}}
+	f := c.Server(v)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("reading POSTs only, no registration POST, no state: verdict = %s (%s), want FAIL",
+			f.Verdict, f.Observed)
+	}
+	if strings.Contains(f.Observed, "36 POST") || strings.Contains(f.Observed, "registers") {
+		t.Errorf("Observed should not credit reading POSTs as registrations: %q", f.Observed)
+	}
+}
+
+// TestCritMUPRegistered_StateFallsBackWhenWindowMissedRegistration is
+// BASIC-029's tier-3 regression lock (audit 2026-07-30,
+// runs/perphase-basic029-v3-20260730T223730 assertion 2): registration is a
+// ONE-TIME event that ordinarily predates a case's own window, and unlike
+// runs/perphase-basic029-20260730T200339 (the ring-eviction case above) this
+// is NOT a ring gap — Since reconstructed the window correctly and it
+// legitimately holds no registration POST, because the DUT registered before
+// the window opened and gridsim's bounded ring, while intact, simply doesn't
+// reach back that far. The durable /admin/mups STATE is exactly what still
+// remembers a fact that old, and grading against it (rather than FAILing a
+// DUT that in fact registered) is the whole point of the tier.
+func TestCritMUPRegistered_StateFallsBackWhenWindowMissedRegistration(t *testing.T) {
+	c := critMUPRegistered()
+	v := &ServerView{
+		Available: true,
+		// A session existed (a GET), no in-window registration POST, and no
+		// RequestLogGap: the log is trusted for this window and genuinely
+		// has nothing — the old code would FAIL here.
+		Requests: []ServerRequest{{Method: "GET", Path: "/mup"}},
+		MUPs: []AdminMUP{
+			{Href: "/mup/0", LFDI: "8E5E2FEE3190F4058B54692EE57A2D673D347586", ReadingTypes: []uint8{38}, CreatedAt: 1753900000},
+		},
+	}
+	f := c.Server(v)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("registration predates the window but MUP state confirms it: verdict = %s (%s), want PASS",
+			f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "/admin/mups") || !strings.Contains(f.Observed, "/mup/0") {
+		t.Errorf("Observed must cite the admin snapshot and the MUP's href: %q", f.Observed)
+	}
+	if !strings.Contains(f.Observed, "this window opened after") {
+		t.Errorf("Observed must narrate that registration predated the window: %q", f.Observed)
+	}
+}
+
+// TestCritMUPRegistered_StateRequiresLFDIAndReadingType proves the state
+// tier does not credit a MUP entry that is missing either the LFDI binding it
+// to the DUT or a ReadingType — an incomplete registration is not the fact
+// this criterion claims, so it must fall through to the next tier rather than
+// PASS on a partial match.
+func TestCritMUPRegistered_StateRequiresLFDIAndReadingType(t *testing.T) {
+	c := critMUPRegistered()
+	v := &ServerView{
+		Available: true,
+		Requests:  []ServerRequest{{Method: "GET", Path: "/mup"}},
+		MUPs:      []AdminMUP{{Href: "/mup/0", LFDI: "", ReadingTypes: []uint8{38}}},
+	}
+	f := c.Server(v)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("a MUP with no LFDI must not satisfy the state tier: verdict = %s (%s), want FAIL",
+			f.Verdict, f.Observed)
+	}
+
+	v2 := &ServerView{
+		Available: true,
+		Requests:  []ServerRequest{{Method: "GET", Path: "/mup"}},
+		MUPs:      []AdminMUP{{Href: "/mup/0", LFDI: "abc123"}},
+	}
+	f2 := c.Server(v2)
+	if f2.Verdict != certify.Fail {
+		t.Fatalf("a MUP with no ReadingType must not satisfy the state tier: verdict = %s (%s), want FAIL",
+			f2.Verdict, f2.Observed)
+	}
+}
+
+// TestCritMUPRegistered_RingGapIsStillLastResortWhenStateIsAlsoEmpty proves
+// the state tier does not shadow the ring-gap Unavailable (e186056) when the
+// state has nothing either — e.g. an older gridsim predating /admin/mups, or
+// one that was restarted since the DUT registered and honestly lost its
+// state. The evidence chain in that case is: no in-window POST, no state,
+// and the log itself says it cannot be trusted — which is still unavailable,
+// not a FAIL.
+func TestCritMUPRegistered_RingGapIsStillLastResortWhenStateIsAlsoEmpty(t *testing.T) {
+	c := critMUPRegistered()
+	v := &ServerView{
+		Available:     true,
+		Requests:      []ServerRequest{{Method: "GET", Path: "/mup"}},
+		RequestLogGap: "the simulator's request log evicted 4000 line(s) between the baseline and this read",
+	}
+	f := c.Server(v)
+	if f.Unavailable == "" {
+		t.Fatalf("no state and a flagged ring gap must be unavailable, not a verdict: got %s (%q)",
+			f.Verdict, f.Observed)
+	}
+}
+
+// TestServerView_RegisteredMUP covers the helper directly: it must require
+// BOTH a non-empty LFDI and at least one ReadingType, and return the first
+// qualifying entry.
+func TestServerView_RegisteredMUP(t *testing.T) {
+	v := ServerView{MUPs: []AdminMUP{
+		{Href: "/mup/0", LFDI: "", ReadingTypes: []uint8{38}},
+		{Href: "/mup/1", LFDI: "abc123", ReadingTypes: nil},
+		{Href: "/mup/2", LFDI: "abc123", ReadingTypes: []uint8{38, 63}},
+	}}
+	got, ok := v.RegisteredMUP()
+	if !ok {
+		t.Fatal("expected a qualifying MUP")
+	}
+	if got.Href != "/mup/2" {
+		t.Errorf("RegisteredMUP returned %q, want the first entry with BOTH an LFDI and a ReadingType (/mup/2)", got.Href)
+	}
+
+	empty := ServerView{MUPs: []AdminMUP{{Href: "/mup/0", LFDI: "", ReadingTypes: []uint8{38}}}}
+	if _, ok := empty.RegisteredMUP(); ok {
+		t.Error("a MUP list with no entry carrying both an LFDI and a ReadingType must not qualify")
+	}
+}
+
 // TestZeroLifecycleScenarioDoesNotPanic pins Bug #3 from
 // runs/shakedown-20260729T003843: AGG-002 has no lifecycles, so its Want yields
 // a nil predicate, and handing that nil to Await dereferenced it — a panic. The
