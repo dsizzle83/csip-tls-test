@@ -434,6 +434,106 @@ func TestResponseCriterionHasTeeth(t *testing.T) {
 	}
 }
 
+// TestResponseStartedCriterionHasTeeth exercises critResponseStarted, which
+// CORE-022 and CORE-023 both now use for their status=2 (Event started)
+// claim. It must grade Pass/Fail exactly like critResponsePosted(2, ...) when
+// the CAPTURED control's responseRequired actually asked for a specific
+// response (bit 0x02), and must decline — Unavailable, never a FAIL — when
+// it did not: a control that never asked for a status=2 makes one
+// unobservable by construction, not a failure of the DUT. This is the
+// graceful-degradation half of the fix for gridsim's admin-created controls
+// once never setting responseRequired at all (sim/gridsim/admin.go).
+func TestResponseStartedCriterionHasTeeth(t *testing.T) {
+	respBody := func(status int, subject string) string {
+		return `<DERControlResponse xmlns="urn:ieee:std:2030.5:ns"><createdDateTime>1</createdDateTime>` +
+			`<endDeviceLFDI>ab</endDeviceLFDI><status>` + itoa(int64(status)) + `</status>` +
+			`<subject>` + subject + `</subject></DERControlResponse>`
+	}
+	post := func(status int) Exchange {
+		return Exchange{Req: msg(Request, "POST", "/rsps/0/r", 0, respBody(status, "M1")),
+			Resp: msg(Response, "", "", 201, "")}
+	}
+	// dercWithRR builds a minimal DERControlList carrying mRID M1 with the
+	// given responseRequired attribute text ("" omits the attribute
+	// entirely — an absent-on-the-wire control).
+	dercWithRR := func(rr string) string {
+		attr := ""
+		if rr != "" {
+			attr = ` responseRequired="` + rr + `"`
+		}
+		return `<?xml version="1.0" encoding="UTF-8"?>` +
+			`<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc" all="1" results="1">` +
+			`<DERControl href="/derp/0/derc/0"` + attr + `>` +
+			`<mRID>M1</mRID><description>test</description><creationTime>100</creationTime>` +
+			`<EventStatus><currentStatus>1</currentStatus><dateTime>100</dateTime></EventStatus>` +
+			`<interval><duration>120</duration><start>200</start></interval>` +
+			`<DERControlBase><opModExpLimW><multiplier>0</multiplier><value>3000</value></opModExpLimW></DERControlBase>` +
+			`</DERControl></DERControlList>`
+	}
+
+	// Conformant: the control asked for it (bit 0x02) and the DUT posted it.
+	wantVerdict(t, "status=2 (requested, posted)", critResponseStarted("M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercWithRR("03")), post(2)), certify.Pass)
+
+	// The control asked for it, but the DUT never posted a status=2 — a real
+	// FAIL about the DUT, not a degraded case.
+	f := wantVerdict(t, "status=2 (requested, not posted)", critResponseStarted("M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercWithRR("03")), post(1)), certify.Fail)
+	if !strings.Contains(f.Observed, "status=1") {
+		t.Errorf("the failure does not report the statuses that WERE posted: %q", f.Observed)
+	}
+
+	// The control's responseRequired carried ONLY bit 0x01 (message received)
+	// — bit 0x02 was never asked for, so a missing status=2 is unobservable
+	// by construction.
+	reason := wantUnavailable(t, "status=2 (bit 0x02 not requested)", critResponseStarted("M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercWithRR("01"))))
+	if !strings.Contains(reason, "responseRequired=01") || !strings.Contains(reason, "0x02") {
+		t.Errorf("the unavailable reason does not name the captured responseRequired: %q", reason)
+	}
+
+	// The control carried NO responseRequired attribute at all — the same
+	// degraded outcome as an explicit value lacking bit 0x02.
+	wantUnavailable(t, "status=2 (responseRequired absent)", critResponseStarted("M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercWithRR(""))))
+
+	// The control itself was never recovered in this window's transcript.
+	reason = wantUnavailable(t, "status=2 (control not recovered)", critResponseStarted("M1"),
+		synthTranscript(get("/dcap", 200, dcapXML())))
+	if !strings.Contains(reason, "not recovered") {
+		t.Errorf("the unavailable reason does not say the control was never recovered: %q", reason)
+	}
+
+	// Tier 3 (gridsim admin API) has no visibility into a control's own wire
+	// attributes on its own, so with NO prior tier-2 verdict to defer to it
+	// grades exactly like critResponsePosted's Server evaluator — the case a
+	// transcript that exists but never decrypted, or no capture at all,
+	// leaves assert() (criteria.go) to fall straight to tier 3 without ever
+	// calling Wire.
+	sv := &ServerView{Available: true, Responses: []AdminResponse{{Subject: "M1", Status: 2, LFDI: "ab"}}}
+	if f := critResponseStarted("M1").Server(sv); f.Verdict != certify.Pass {
+		t.Errorf("server-side status 2 = %s: %s", f.Verdict, f.Observed)
+	}
+
+	// But when tier 2 DID run and ruled the claim not-requested, tier 3 must
+	// defer to that instead of re-deciding — otherwise a live run with both a
+	// decrypted transcript AND a reachable admin API (assert() always tries
+	// tier 3 once tier 2 answers Unavailable, for ANY reason, including this
+	// one) would let a lenient DUT that posts status=2 regardless turn this
+	// criterion's careful Unavailable right back into the false PASS/FAIL it
+	// exists to prevent. Same criterion INSTANCE for both calls: the gating
+	// is carried in a closure variable Wire sets and Server reads.
+	notReqCrit := critResponseStarted("M1")
+	notReqTr := synthTranscript(get("/derp/0/derc", 200, dercWithRR("01")))
+	if f := notReqCrit.Wire(nil, notReqTr); f.Unavailable == "" {
+		t.Fatalf("setup: Wire did not rule bit 0x02 not-requested: verdict=%s observed=%s", f.Verdict, f.Observed)
+	}
+	if f := notReqCrit.Server(sv); f.Unavailable == "" {
+		t.Errorf("tier 3 re-graded a control tier 2 already ruled not-requested: verdict=%s observed=%s",
+			f.Verdict, f.Observed)
+	}
+}
+
 // TestServerLogEmptinessIsNotADUTFailureWithoutASession proves the two arms of
 // the fix runs/shakedown-20260729T003843 forced: a tier-3 server-log evaluator
 // must FAIL only when a session established and the DUT still did not do the

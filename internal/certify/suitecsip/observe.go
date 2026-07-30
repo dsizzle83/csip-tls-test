@@ -893,6 +893,13 @@ type ControlRequest struct {
 	CreationOffsetS       *int   `json:"creation_offset_s,omitempty"`
 	RandomizeStart        *int32 `json:"randomize_start,omitempty"`
 	RandomizeDuration     *int32 `json:"randomize_duration,omitempty"`
+	// ResponseRequired overrides gridsim's default responseRequired bitmap
+	// for this control (adminDefaultResponseRequired — bit 0x01|0x02, see
+	// sim/gridsim/admin.go). A check that needs to prove graceful
+	// degradation — a status=2 criterion going Unavailable/Skip rather than
+	// FAIL when the control never asked for a specific response — passes 0
+	// here.
+	ResponseRequired *uint8 `json:"response_required,omitempty"`
 
 	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
 	MaxLimW        *int64 `json:"max_lim_W,omitempty"`

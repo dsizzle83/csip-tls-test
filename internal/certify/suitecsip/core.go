@@ -684,7 +684,7 @@ func coreResponses(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
 				critResponsePosted(1, "Event received", mrid),
-				critResponsePosted(2, "Event started", mrid),
+				critResponseStarted(mrid),
 				{
 					Claim: "the DUT POSTs its Responses to the replyTo URI the event carried, not to a " +
 						"hard-coded path",
@@ -795,6 +795,16 @@ func coreSuperseding(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
 				critResponsePosted(1, "Event received", winner),
+				// Matches CORE-022's status=1-then-status=2 shape (core.go's
+				// coreResponses): the winner is a plain, unsuperseded control, so
+				// the DUT reporting it started is exactly critResponseStarted's
+				// claim, graded/degraded the same way — Pass/Fail when the
+				// winner's captured responseRequired asked for a specific
+				// response (which admin-created controls do by default — see
+				// sim/gridsim/admin.go's adminDefaultResponseRequired), else
+				// Unavailable/Skip, never a false FAIL blaming the DUT for a bit
+				// this bench didn't ask for.
+				critResponseStarted(winner),
 				{
 					Claim: "the DUT reports status 7 (Superseded) or 14 (Aborted due to alternate program " +
 						"event) for the losing control of an overlapping pair",

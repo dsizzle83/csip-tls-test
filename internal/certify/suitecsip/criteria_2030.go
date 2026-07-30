@@ -23,6 +23,7 @@ package suitecsip
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -449,6 +450,110 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 			return Finding{Verdict: certify.Fail,
 				Observed: fmt.Sprintf("gridsim received %d Response(s) but none with status=%d: %s",
 					len(v.Responses), status, strings.Join(statuses, ", "))}
+		},
+	}
+}
+
+// respReqSpecificResponse is IEEE 2030.5's responseRequired bit 1 (0x02) —
+// RespReqSpecificResponse in lexa-proto csipmodel/resources.go — the
+// server's request for the specific-outcome Response family (started/
+// completed/superseded/etc.), as distinct from bit 0 (0x01, message
+// received) and bit 2 (0x04, customer response). See
+// sim/gridsim/admin.go's adminDefaultResponseRequired for the bench side of
+// this bit.
+const respReqSpecificResponse = 0x02
+
+// controlResponseRequired reads the responseRequired bitmap recovered for
+// mridKey's DERControl across every DERControlList the DUT fetched in this
+// window. found is false only when the control itself never appeared in the
+// transcript; a control that DID appear but omitted the attribute decodes to
+// rr=0 (IEEE 2030.5: an absent hexBinary8 attribute is "no server
+// instruction", which for this criterion's purposes reads the same as an
+// explicit 00 — neither requests a specific response).
+func controlResponseRequired(t *Transcript, mridKey string) (rr uint8, found bool) {
+	for _, e := range t.ByResource("DERControlList") {
+		doc, err := e.Resp.SEP()
+		if err != nil {
+			continue
+		}
+		for _, c := range doc.Children("DERControl") {
+			m, _ := c.TextOf("mRID")
+			if m != mridKey {
+				continue
+			}
+			found = true
+			if v, ok := c.Attr("responseRequired"); ok {
+				if parsed, perr := strconv.ParseUint(v, 16, 8); perr == nil {
+					rr = uint8(parsed)
+				}
+			}
+		}
+	}
+	return rr, found
+}
+
+// critResponseStarted asserts a DERControlResponse with status=2 (Event
+// started) for the control under test — the same claim critResponsePosted(2,
+// ...) makes, refined to grade against what the control's OWN wire
+// responseRequired attribute actually asked for (IEEE 2030.5 Table 27 /
+// RespondableResource: a client is never told to volunteer a Response nobody
+// requested).
+//
+// A control whose captured responseRequired does not carry bit 0x02
+// (RespReqSpecificResponse) makes status=2 unobservable by construction, not
+// a DUT failure — grading that FAIL would blame the DUT for the control's
+// own omission, exactly the false-FAIL gridsim's PRIOR admin-created
+// controls (which never set responseRequired at all) used to produce here.
+// So: Unavailable/Skip when the wire shows the bit was never asked for
+// (matching the old blanket reason this bench used before it could set the
+// bit at all), Pass/Fail exactly like critResponsePosted when it was.
+//
+// The tier-3 (gridsim admin API) fallback has no visibility into a
+// DERControl's own wire attributes — gridsim's admin API records Responses
+// received, not the control's own responseRequired — so on its own it cannot
+// tell "not requested" from "requested but the DUT failed to answer". Left to
+// delegate blindly to critResponsePosted's Server evaluator, it would
+// re-grade Pass/Fail on bare Response presence and could turn the exact
+// false-FAIL this criterion exists to prevent right back into one, any time
+// gridsim's admin API happens to be reachable alongside a transcript that
+// already ruled the claim not-requested (assert() in criteria.go always
+// tries tier 3 once tier 2 answers Unavailable, for ANY reason). notRequested
+// closes that gap: the Wire evaluator records when IT was the one that ruled
+// the bit not requested, and the Server evaluator honours that verdict
+// instead of re-deciding. A single criterion instance is built fresh per
+// Observation (check.go's s.Criteria(obs)) and asserted exactly once, with
+// Wire always attempted before Server within that one assert() call, so
+// sharing this across the two closures is safe.
+func critResponseStarted(mridKey string) criterion {
+	const status = 2
+	const meaning = "Event started"
+	inner := critResponsePosted(status, meaning, mridKey)
+	var notRequested string
+	return criterion{
+		Claim: fmt.Sprintf("the DUT POSTs a DERControlResponse with status=%d (%s) for the control under "+
+			"test, which its responseRequired asked for", status, meaning),
+		How: "the control's own responseRequired attribute (bit 0x02, specific response) recovered from the " +
+			"transcript, gating whether a status=2 Response POST can be expected at all; when it is, " + inner.How,
+		NeedsTranscript: true,
+		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
+			rr, found := controlResponseRequired(t, mridKey)
+			switch {
+			case !found:
+				return unavailable("the DERControl mRID=%s was not recovered in this window's transcript, so "+
+					"its responseRequired cannot be read", mridKey)
+			case rr&respReqSpecificResponse == 0:
+				notRequested = fmt.Sprintf("the DERControl mRID=%s carried responseRequired=%02X, which does "+
+					"not request a specific (status=2) response (bit 0x02) — a spec-compliant DUT is not "+
+					"obliged to report one", mridKey, rr)
+				return Finding{Unavailable: notRequested}
+			}
+			return inner.Wire(ev, t)
+		},
+		Server: func(v *ServerView) Finding {
+			if notRequested != "" {
+				return Finding{Unavailable: notRequested}
+			}
+			return inner.Server(v)
 		},
 	}
 }

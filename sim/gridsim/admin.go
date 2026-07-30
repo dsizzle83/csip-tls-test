@@ -459,12 +459,21 @@ type adminCtrlReq struct {
 	//                           later creationTime supersedes) without relying
 	//                           on wall-clock spacing between two POSTs.
 	//   RandomizeStart/Duration — served straight through to the DERControl.
+	//   ResponseRequired      — overrides the responseRequired bitmap the
+	//                           control carries (default
+	//                           adminDefaultResponseRequired — see that
+	//                           const's doc for the bit semantics and why an
+	//                           admin control needs it at all). A scenario
+	//                           proving the DUT correctly withholds a
+	//                           Response when none was asked for passes 0
+	//                           here.
 	MRID                  string `json:"mrid,omitempty"`
 	PotentiallySuperseded *bool  `json:"potentially_superseded,omitempty"`
 	CurrentStatus         *uint8 `json:"current_status,omitempty"`
 	CreationOffsetS       *int   `json:"creation_offset_s,omitempty"`
 	RandomizeStart        *int32 `json:"randomize_start,omitempty"`
 	RandomizeDuration     *int32 `json:"randomize_duration,omitempty"`
+	ResponseRequired      *uint8 `json:"response_required,omitempty"`
 
 	// DERControlBase fields — only non-nil ones are included in the event.
 	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
@@ -492,6 +501,49 @@ func (s *Server) handleAdminControl(w http.ResponseWriter, r *http.Request) {
 }
 
 var progPrefixes = []string{"SP", "SITE", "SYS"}
+
+// adminDefaultResponseRequired is the IEEE 2030.5 responseRequired bitmap
+// (hexBinary8, Table 27 / RespondableResource — see lexa-proto
+// csipmodel/resources.go's ResponseRequired doc, which this mirrors) an
+// admin-created event control carries unless a request overrides it:
+//
+//	bit 0 (0x01, RespReqMessageReceived)  — the DUT shall POST a Response
+//	                                        acknowledging the event was
+//	                                        received;
+//	bit 1 (0x02, RespReqSpecificResponse) — the DUT shall ALSO POST the
+//	                                        specific-outcome Response
+//	                                        (started/completed/superseded/
+//	                                        etc.) as the event's lifecycle
+//	                                        proceeds.
+//
+// Both are set. Without bit 1 a spec-compliant client has nothing obliging it
+// to ever report status=2 (Event started) — IEEE 2030.5 does not have a
+// client volunteer a Response nobody asked for — so CORE-022/CORE-023 could
+// never observe the started/completed/superseded lifecycle from any DUT that
+// actually implements that "do not respond unless asked" rule. (lexa-gw's
+// northbound tracker — internal/northbound/responses/tracker.go,
+// postResponseAt — is currently lenient about this: absent responseRequired
+// still gets posted as usual, and bit-level subsetting of WHICH status per
+// bit is a documented future refinement there, so any non-zero value already
+// worked against today's lexa-gw. Bit 0/1 here is chosen to be the
+// spec-honest request regardless of which DUT is on the other end.) Bit 2
+// (0x04, RespReqCustomerResponse) is left unset: nothing in this bench
+// simulates a customer-facing UI to answer it.
+const adminDefaultResponseRequired = model.RespReqMessageReceived | model.RespReqSpecificResponse
+
+// adminResponseReplyTo is the Response POST target an admin-created control's
+// replyTo attribute points at: gridsim's own advertised default ResponseSet
+// (/rsps/0/r — seeded in server.go's buildResourceTree alongside
+// DeviceCapability.ResponseSetListLink, and where handleResponsePost listens;
+// see server.go's "Response log" section). The standing bench controls (the
+// ones server.go seeds directly into /derp/*/derc rather than through this
+// admin API) never set replyTo either, and still arrive here because a
+// consumer with no per-event replyTo falls back to this exact advertised
+// default — so pointing admin-created controls at the same href, rather than
+// leaving it to that fallback, keeps the two paths' wire behavior consistent
+// and gives CORE-022's "POSTs to the control's OWN replyTo" criterion
+// (core.go) something to actually distinguish from the fallback case.
+const adminResponseReplyTo = "/rsps/0/r"
 
 // notifyControlChange is the Subscription function set's hook into the control
 // levers: a DERControlList that gained or changed an entry is a change a
@@ -549,15 +601,28 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	if req.CreationOffsetS != nil {
 		creationTime = now + int64(*req.CreationOffsetS)
 	}
+	// responseRequired defaults ON (adminDefaultResponseRequired — see its doc
+	// for the bit semantics) so the DUT is actually asked for the Response
+	// lifecycle CORE-022/CORE-023 grade; ResponseRequired lets a scenario
+	// override it (e.g. 0, to prove the DUT correctly withholds a Response
+	// nobody asked for).
+	responseRequired := model.ResponseRequired(adminDefaultResponseRequired)
+	if req.ResponseRequired != nil {
+		responseRequired = model.ResponseRequired(*req.ResponseRequired)
+	}
 	ctrl := model.DERControl{
 		// Href keyed by mRID so distinct admin controls are distinct addressable
 		// resources (a re-post of the same mRID — the server-cancel update — keeps
 		// the same href and upserts). A shared href would collapse two controls
 		// into one for any client that de-duplicates a paged list by href.
-		Resource:     model.Resource{Href: fmt.Sprintf("/derp/%d/derc/%s", req.Program, mrid)},
-		MRID:         mrid,
-		Description:  req.Description,
-		CreationTime: creationTime,
+		Resource: model.Resource{Href: fmt.Sprintf("/derp/%d/derc/%s", req.Program, mrid)},
+		// ReplyTo/ResponseRequired: IEEE 2030.5 Event-base (RespondableResource)
+		// attributes — see adminResponseReplyTo/adminDefaultResponseRequired.
+		ReplyTo:          adminResponseReplyTo,
+		ResponseRequired: &responseRequired,
+		MRID:             mrid,
+		Description:      req.Description,
+		CreationTime:     creationTime,
 		EventStatus: &model.EventStatus{
 			CurrentStatus:         status,
 			DateTime:              now,

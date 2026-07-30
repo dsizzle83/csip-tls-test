@@ -107,6 +107,68 @@ func TestAdminControl_RandomizeDurationServed(t *testing.T) {
 	}
 }
 
+// An admin-created control must carry replyTo/responseRequired so the DUT is
+// actually asked for the Response lifecycle CORE-022/CORE-023 grade — before
+// this, admin-created controls carried neither attribute, which made a
+// spec-compliant DUT's status=2 (Event started) unobservable by
+// construction (IEEE 2030.5 never has a client volunteer a Response nobody
+// requested).
+func TestAdminControl_ResponseRequiredDefaultsOn(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-RESPREQ","exp_lim_W":4000,"duration_s":300,"activate":true}`)
+
+	list := derc0(t, s)
+	if len(list.DERControl) != 1 {
+		t.Fatalf("derc has %d controls, want 1", len(list.DERControl))
+	}
+	ctrl := list.DERControl[0]
+	if ctrl.ReplyTo != "/rsps/0/r" {
+		t.Errorf("ReplyTo = %q, want /rsps/0/r (gridsim's own advertised default ResponseSet)", ctrl.ReplyTo)
+	}
+	if ctrl.ResponseRequired == nil {
+		t.Fatal("ResponseRequired is nil, want present by default")
+	}
+	if got := uint8(*ctrl.ResponseRequired); got != uint8(model.RespReqMessageReceived|model.RespReqSpecificResponse) {
+		t.Errorf("ResponseRequired = %#02x, want %#02x (message-received | specific-response)",
+			got, uint8(model.RespReqMessageReceived|model.RespReqSpecificResponse))
+	}
+
+	// It must also reach the wire: GET the list and confirm both attributes serve.
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/derp/0/derc", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `replyTo="/rsps/0/r"`) {
+		t.Errorf("served /derp/0/derc XML has no replyTo attribute:\n%s", body)
+	}
+	if !strings.Contains(body, `responseRequired="03"`) {
+		t.Errorf("served /derp/0/derc XML has no responseRequired=\"03\" attribute:\n%s", body)
+	}
+}
+
+// A scenario proving the DUT correctly WITHHOLDS a Response when none was
+// requested needs a lever to ask gridsim for exactly that — response_required:0
+// overrides the default.
+func TestAdminControl_ResponseRequiredOverride(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-RESPREQ-OFF","exp_lim_W":4000,"duration_s":300,"activate":true,"response_required":0}`)
+
+	list := derc0(t, s)
+	if len(list.DERControl) != 1 {
+		t.Fatalf("derc has %d controls, want 1", len(list.DERControl))
+	}
+	ctrl := list.DERControl[0]
+	if ctrl.ResponseRequired == nil {
+		t.Fatal("ResponseRequired is nil, want present-and-zero (an explicit request for silence), not absent")
+	}
+	if got := uint8(*ctrl.ResponseRequired); got != 0 {
+		t.Errorf("ResponseRequired = %#02x, want 0x00 (override honored)", got)
+	}
+}
+
 // /admin/responses must expose EVERY Response status — including the
 // server-driven Cancelled(6)/Superseded(7) acks that /admin/alerts (which is
 // CannotComply-only) deliberately omits.
