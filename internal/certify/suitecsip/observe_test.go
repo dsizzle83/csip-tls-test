@@ -96,6 +96,96 @@ func TestServerViewBaselineExcludesPriorEvidence(t *testing.T) {
 	_ = rolled.Since(base)
 }
 
+// TestSinceFlagsARequestLogRingEviction pins RequestLogGap: when the
+// baseline's position in gridsim's request-log ring has already fallen out of
+// it by the time a check reads again, Since must say so structurally (not
+// just in free-text Errors a criterion has to grep for), because a criterion
+// that reports "zero matches" from a log the ring has already forgotten is
+// the exact false-FAIL bug this method's own doc warns about.
+func TestSinceFlagsARequestLogRingEviction(t *testing.T) {
+	base := ServerView{rawLines: []string{"line0", "line1"}, rawFirstSeq: 0}
+	later := ServerView{Available: true, rawLines: []string{"line500", "line501"}, rawFirstSeq: 500}
+
+	d := later.Since(base)
+	if d.RequestLogGap == "" {
+		t.Fatal("a ring that wrapped past the baseline must set RequestLogGap")
+	}
+	if !strings.Contains(d.RequestLogGap, "evicted") {
+		t.Errorf("RequestLogGap should name the eviction: %q", d.RequestLogGap)
+	}
+	found := false
+	for _, e := range d.Errors {
+		if e == d.RequestLogGap {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("RequestLogGap must also land in Errors, for callers that still only look there")
+	}
+
+	// The ordinary case — no cursor gap at all — must leave RequestLogGap
+	// empty, or every criterion that checks it would degrade to unavailable
+	// on every run.
+	closeBase := ServerView{rawLines: []string{"a", "b"}, rawFirstSeq: 0}
+	closeNow := ServerView{Available: true, rawLines: []string{"a", "b", "c"}, rawFirstSeq: 0}
+	if g := closeNow.Since(closeBase).RequestLogGap; g != "" {
+		t.Errorf("an ordinary (non-evicting) delta must not set RequestLogGap: %q", g)
+	}
+}
+
+// TestCritMUPRegistered_RequestLogGapIsUnavailableNotFail is BASIC-029's
+// regression lock: runs/perphase-basic029-20260730T200339 FAILed this
+// criterion's Server tier from a window that opened ~98 minutes and a whole
+// campaign's worth of other cases after the DUT's ONE-TIME MirrorUsagePoint
+// registration — long enough for gridsim's bounded request-log ring to have
+// no memory of it left. A count of zero from a log that itself says it
+// cannot be trusted for this window is not evidence the DUT skipped
+// registering; it is evidence the window came too late to see it happen.
+func TestCritMUPRegistered_RequestLogGapIsUnavailableNotFail(t *testing.T) {
+	c := critMUPRegistered()
+	v := &ServerView{
+		Available: true,
+		// A session existed (a GET, so SessionEstablished is true and this
+		// doesn't soften to noSessionUnavailable for the wrong reason), but no
+		// POST to /mup in this window — and the log itself flags why that
+		// can't be trusted.
+		Requests:      []ServerRequest{{Method: "GET", Path: "/mup"}},
+		RequestLogGap: "the simulator's request log evicted 4000 line(s) between the baseline and this read",
+	}
+	f := c.Server(v)
+	if f.Unavailable == "" {
+		t.Fatalf("a flagged request-log gap must be unavailable, not a verdict: got %s (%q)",
+			f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Unavailable, "evicted") {
+		t.Errorf("the unavailable reason should carry the log's own gap explanation: %q", f.Unavailable)
+	}
+}
+
+// TestCritMUPRegistered_NoGapStillFails proves the fix is narrowly targeted:
+// an empty /mup POST count with NO RequestLogGap (the log is trusted for this
+// window) is still a real FAIL, exactly as before.
+func TestCritMUPRegistered_NoGapStillFails(t *testing.T) {
+	c := critMUPRegistered()
+	v := &ServerView{Available: true, Requests: []ServerRequest{{Method: "GET", Path: "/mup"}}}
+	f := c.Server(v)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("no gap, no POST: verdict = %s (%s), want FAIL", f.Verdict, f.Observed)
+	}
+}
+
+// TestCritMUPRegistered_PostsStillPass proves the RequestLogGap check never
+// shadows a genuine PASS: when the log DOES show a /mup POST, that is graded
+// exactly as before regardless of whether RequestLogGap happens to be set.
+func TestCritMUPRegistered_PostsStillPass(t *testing.T) {
+	c := critMUPRegistered()
+	v := &ServerView{Available: true, Requests: []ServerRequest{{Method: "POST", Path: "/mup"}}}
+	f := c.Server(v)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("a recorded /mup POST: verdict = %s (%s), want PASS", f.Verdict, f.Observed)
+	}
+}
+
 // TestZeroLifecycleScenarioDoesNotPanic pins Bug #3 from
 // runs/shakedown-20260729T003843: AGG-002 has no lifecycles, so its Want yields
 // a nil predicate, and handing that nil to Await dereferenced it — a panic. The

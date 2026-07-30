@@ -570,6 +570,100 @@ func critDERStatusElements() criterion {
 	}
 }
 
+// critMUPRegistered asserts the DUT's MirrorUsagePoint registration
+// (BASIC-029's own element): a POST carrying its LFDI and a
+// MirrorMeterReading/ReadingType, answered 201 Created (or 204 for an
+// existing mRID) with a Location header.
+//
+// The Server tier is the one with a real gap to mind: registration is a
+// ONE-TIME event (the DUT does it once, at first contact with this
+// MirrorUsagePointList, and has no reason to repeat it), and gridsim's
+// request log — unlike Responses/DERPuts, which are unbounded — is a bounded
+// ring (see ServerView.RequestLogGap / Since). A case window opened well
+// after that one-time POST, with enough OTHER traffic between it and the
+// registration to wrap the ring, finds the log simply has no memory of it
+// left; reporting that as "the DUT never registered" is the false-FAIL bug
+// Since's own doc warns about, so RequestLogGap is checked before a FAIL is
+// drawn from an empty count.
+func critMUPRegistered() criterion {
+	return criterion{
+		Claim: "the DUT registered a MirrorUsagePoint carrying its own LFDI and a " +
+			"MirrorMeterReading/ReadingType, and the server answered 201 Created with a Location",
+		How: "the sep+xml body of the MirrorUsagePoint POST and the status line and Location " +
+			"header of the response",
+		NeedsTranscript: true,
+		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+			for _, e := range t.Method("POST") {
+				doc, err := e.Req.SEP()
+				if err != nil || doc.Local() != "MirrorUsagePoint" {
+					continue
+				}
+				lfdi, _ := doc.TextOf("deviceLFDI")
+				rt := doc.Descendants("ReadingType")
+				if e.Resp == nil {
+					return citeMessage(t, e.Req, certify.Fail, "the MirrorUsagePoint POST was never answered")
+				}
+				// 2030.5 §10.11.3 rules (f)/(g): 201 for a new mRID,
+				// 204 for an existing one, Location required on both.
+				ok := e.Resp.Status == 201 || e.Resp.Status == 204
+				loc := e.Resp.Header.Get("Location")
+				switch {
+				case !ok:
+					return citeExchange(t, e, certify.Fail,
+						"POST %s carrying MirrorUsagePoint -> %s; 2030.5 §10.11.3 requires 201 "+
+							"(new mRID) or 204 (existing)", e.Req.Target, e.Resp.Line())
+				case loc == "":
+					return citeExchange(t, e, certify.Fail,
+						"POST %s -> %s with no Location header, which §10.11.3 requires on both the "+
+							"201 and the 204", e.Req.Target, e.Resp.Line())
+				case lfdi == "":
+					return citeMessage(t, e.Req, certify.Fail,
+						"the MirrorUsagePoint carries no deviceLFDI, so the server cannot bind the "+
+							"mirror to the reporting device")
+				default:
+					return citeExchange(t, e, certify.Pass,
+						"POST %s carrying MirrorUsagePoint deviceLFDI=%s with %d ReadingType(s) -> "+
+							"%s, Location: %s", e.Req.Target, lfdi, len(rt), e.Resp.Line(), loc)
+				}
+			}
+			return unavailable("the recovered transcript holds no MirrorUsagePoint POST from the DUT")
+		},
+		Server: func(v *ServerView) Finding {
+			n := v.GETs("/mup")
+			posts := 0
+			for _, r := range v.Requests {
+				if r.Method == "POST" && strings.HasPrefix(r.Path, "/mup") {
+					posts++
+				}
+			}
+			if posts == 0 {
+				if !v.SessionEstablished() {
+					return noSessionUnavailable()
+				}
+				// The request log is a bounded ring (unlike Responses/DERPuts),
+				// and the registration this criterion is after is a ONE-TIME
+				// event: it happens once, at the DUT's first contact, and
+				// never again unless gridsim's state is wiped. A window opened
+				// long after that (this case has no Setup of its own to force a
+				// fresh one) can find the log has simply moved on — RequestLogGap
+				// is Since's own signal that this is what happened, not that the
+				// DUT never registered.
+				if v.RequestLogGap != "" {
+					return unavailable("gridsim's request log records no POST to the "+
+						"MirrorUsagePoint tree during this window, but %s", v.RequestLogGap)
+				}
+				return Finding{Verdict: certify.Fail,
+					Observed: fmt.Sprintf("gridsim's request log records no POST to the "+
+						"MirrorUsagePoint tree during this window (%d GET(s) of /mup)", n)}
+			}
+			return Finding{Verdict: certify.Pass,
+				Observed: fmt.Sprintf("gridsim's request log records %d POST(s) to the "+
+					"MirrorUsagePoint tree; the status codes and bodies are not recoverable from "+
+					"the log", posts)}
+		},
+	}
+}
+
 // basicMeterReading implements BASIC-029 — Inverter Meter Reading.
 func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	return run(ctx, rc, spec{
@@ -588,70 +682,7 @@ func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result,
 						}
 						return certify.Pass, "MirrorUsagePointListLink present"
 					}),
-				{
-					Claim: "the DUT registered a MirrorUsagePoint carrying its own LFDI and a " +
-						"MirrorMeterReading/ReadingType, and the server answered 201 Created with a Location",
-					How: "the sep+xml body of the MirrorUsagePoint POST and the status line and Location " +
-						"header of the response",
-					NeedsTranscript: true,
-					Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-						for _, e := range t.Method("POST") {
-							doc, err := e.Req.SEP()
-							if err != nil || doc.Local() != "MirrorUsagePoint" {
-								continue
-							}
-							lfdi, _ := doc.TextOf("deviceLFDI")
-							rt := doc.Descendants("ReadingType")
-							if e.Resp == nil {
-								return citeMessage(t, e.Req, certify.Fail, "the MirrorUsagePoint POST was never answered")
-							}
-							// 2030.5 §10.11.3 rules (f)/(g): 201 for a new mRID,
-							// 204 for an existing one, Location required on both.
-							ok := e.Resp.Status == 201 || e.Resp.Status == 204
-							loc := e.Resp.Header.Get("Location")
-							switch {
-							case !ok:
-								return citeExchange(t, e, certify.Fail,
-									"POST %s carrying MirrorUsagePoint -> %s; 2030.5 §10.11.3 requires 201 "+
-										"(new mRID) or 204 (existing)", e.Req.Target, e.Resp.Line())
-							case loc == "":
-								return citeExchange(t, e, certify.Fail,
-									"POST %s -> %s with no Location header, which §10.11.3 requires on both the "+
-										"201 and the 204", e.Req.Target, e.Resp.Line())
-							case lfdi == "":
-								return citeMessage(t, e.Req, certify.Fail,
-									"the MirrorUsagePoint carries no deviceLFDI, so the server cannot bind the "+
-										"mirror to the reporting device")
-							default:
-								return citeExchange(t, e, certify.Pass,
-									"POST %s carrying MirrorUsagePoint deviceLFDI=%s with %d ReadingType(s) -> "+
-										"%s, Location: %s", e.Req.Target, lfdi, len(rt), e.Resp.Line(), loc)
-							}
-						}
-						return unavailable("the recovered transcript holds no MirrorUsagePoint POST from the DUT")
-					},
-					Server: func(v *ServerView) Finding {
-						n := v.GETs("/mup")
-						posts := 0
-						for _, r := range v.Requests {
-							if r.Method == "POST" && strings.HasPrefix(r.Path, "/mup") {
-								posts++
-							}
-						}
-						if posts == 0 {
-							if !v.SessionEstablished() {
-								return noSessionUnavailable()
-							}
-							return Finding{Verdict: certify.Fail,
-								Observed: fmt.Sprintf("gridsim's request log records no POST to the "+
-									"MirrorUsagePoint tree during this window (%d GET(s) of /mup)", n)}
-						}
-						return Finding{Verdict: certify.Pass,
-							Observed: fmt.Sprintf("gridsim's request log records %d POST(s) to the "+
-								"MirrorUsagePoint tree; the status codes and bodies are not recoverable from "+
-								"the log", posts)}
-					},
-				},
+				critMUPRegistered(),
 				{
 					Claim: "the ReadingType the DUT registered carries the CSIP monitoring encoding for real " +
 						"power: uom=38 (Watts), flowDirection and powerOfTenMultiplier present",

@@ -262,6 +262,17 @@ type ServerView struct {
 	// mistaken for a complete one.
 	Errors []string
 
+	// RequestLogGap is non-empty when Since() could not reconstruct this
+	// window's Requests reliably — the ring wrapped past the baseline, or no
+	// cursor endpoint was available to delta against at all (see Since). A
+	// criterion that grades "zero matches in Requests" as a FAIL about the DUT
+	// without checking this first repeats the exact false-FAIL bug Since's own
+	// doc warns about: gridsim's request log, unlike Responses/DERPuts/
+	// LogEvents/Notifications, is a bounded ring, so an empty count can mean
+	// "the DUT did nothing" or "the log no longer remembers" and only this
+	// field tells the two apart.
+	RequestLogGap string
+
 	// rawLines is the server's request log exactly as read, and rawFirstSeq is
 	// the absolute sequence number of rawLines[0]. Since deltas these, NOT the
 	// parsed Requests slice and NOT by length: the server's log is a bounded
@@ -296,18 +307,20 @@ func (v ServerView) Since(base ServerView) ServerView {
 		// No cursor available. Fall back to the old length delta, but say so:
 		// this is the mode that can silently under-report.
 		out.Requests = v.Requests[min(len(base.Requests), len(v.Requests)):]
-		out.Errors = append(out.Errors, "the request-log delta is approximate: the simulator served no "+
-			"cursor endpoint (/admin/logs.json), so entries evicted from its ring are invisible here and "+
-			"this view may under-report what the DUT did")
+		out.RequestLogGap = "the request-log delta is approximate: the simulator served no cursor endpoint " +
+			"(/admin/logs.json), so entries evicted from its ring are invisible here and this view may " +
+			"under-report what the DUT did"
+		out.Errors = append(out.Errors, out.RequestLogGap)
 	case base.rawFirstSeq+uint64(len(base.rawLines)) < v.rawFirstSeq:
 		// The baseline's position fell out of the ring before we read again.
 		// The window is genuinely unobservable; saying "nothing happened"
 		// would be the false-FAIL bug all over again.
 		lost := v.rawFirstSeq - (base.rawFirstSeq + uint64(len(base.rawLines)))
 		out.Requests = parseRequestLog(v.rawLines)
-		out.Errors = append(out.Errors, fmt.Sprintf("the simulator's request log evicted %d line(s) "+
-			"between the baseline and this read, so this window cannot be reconstructed; treat the "+
-			"request list as incomplete rather than as evidence the DUT was idle", lost))
+		out.RequestLogGap = fmt.Sprintf("the simulator's request log evicted %d line(s) between the "+
+			"baseline and this read, so this window cannot be reconstructed; treat the request list as "+
+			"incomplete rather than as evidence the DUT was idle", lost)
+		out.Errors = append(out.Errors, out.RequestLogGap)
 	default:
 		baseEnd := base.rawFirstSeq + uint64(len(base.rawLines))
 		out.Requests = parseRequestLog(v.rawLines[baseEnd-v.rawFirstSeq:])
