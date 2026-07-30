@@ -147,14 +147,35 @@ func TestResourceExchangePrefersLastNonRedirect(t *testing.T) {
 		t.Errorf("all-redirect case must fall back to the last exchange, got Resp=%v", got.Resp)
 	}
 
-	// An unanswered request is not a redirect either, and must be preferred
-	// over an earlier fully-formed redirect exchange, matching the pre-fix
-	// behaviour for a single unanswered exchange.
-	unanswered := []Exchange{
+	// THE CAMPAIGN REGRESSION (runs/stamped-csip-validate-20260730T041549,
+	// 29 applicable rows): Filter spans sibling conversations, so a window
+	// routinely holds a COMPLETED 200 exchange on the discovery walk plus a
+	// later DANGLING request (Resp == nil) on a sibling whose response landed
+	// after the window closed. The dangling request must NEVER outrank the
+	// answered fetch — the first fix's "last non-3xx" rule selected it and
+	// graded 29 rows as "GET /dcap was never answered".
+	completedThenDangling := []Exchange{
+		{Req: &Message{Kind: Request}, Resp: ok},
+		notAnswered,
+	}
+	if got := resourceExchange(completedThenDangling); got.Resp != ok {
+		t.Errorf("a dangling request must not outrank an answered 200, got Resp=%v", got.Resp)
+	}
+
+	// An answered redirect outranks a dangling request too: grading the
+	// unresolved redirect is the deserved FAIL, and it carries citable
+	// response bytes where the dangling request carries none.
+	redirectThenDangling := []Exchange{
 		{Req: &Message{Kind: Request}, Resp: redirect},
 		notAnswered,
 	}
-	if got := resourceExchange(unanswered); got.Resp != nil {
-		t.Errorf("an unanswered exchange must be selected over an earlier redirect")
+	if got := resourceExchange(redirectThenDangling); got.Resp != redirect {
+		t.Errorf("an answered redirect must outrank a dangling request, got Resp=%v", got.Resp)
+	}
+
+	// Only when NOTHING was answered is the dangling request the truth.
+	onlyDangling := []Exchange{notAnswered}
+	if got := resourceExchange(onlyDangling); got.Resp != nil {
+		t.Errorf("all-unanswered case must return the dangling exchange")
 	}
 }

@@ -305,10 +305,22 @@ func critGET(path, claim, how string, want func(*Node) (certify.Verdict, string)
 // critGET (criterion 3, via critDiscoveryRoot) was contradicting its own
 // sibling by grading the 302 as if it were the resource fetch.
 //
-// The resource is in the LAST exchange of the path that is not itself a 3xx.
-// Falling back to the very last exchange when every one of them redirected
-// (a redirect the DUT never resolved) preserves the FAIL that deserves: the
-// selection never manufactures a PASS out of a walk that got stuck.
+// The resource is in the LAST exchange of the path that was ANSWERED with a
+// non-3xx. Falling back to the very last exchange when every one of them
+// redirected (a redirect the DUT never resolved) preserves the FAIL that
+// deserves: the selection never manufactures a PASS out of a walk that got
+// stuck.
+//
+// "Answered" is load-bearing, learned from a full-campaign regression
+// (runs/stamped-csip-validate-20260730T041549: 29 applicable rows FAILed on
+// "GET /dcap was never answered"). Filter spans every conversation the case
+// owns, and a real window routinely catches a SIBLING conversation whose
+// request was sent in-window but whose response landed after the window
+// closed — an Exchange with Resp == nil. Such a dangling request is not a
+// redirect, so a last-non-3xx rule selected it over the COMPLETED exchange
+// on the discovery walk and graded the row as if the resource were never
+// served. A request the capture never saw answered cannot outrank one it
+// did.
 //
 // This is fixed here, generically, rather than as an ERR-001-only special
 // case: critGET has exactly one caller path for "which exchange proves the
@@ -319,11 +331,20 @@ func critGET(path, claim, how string, want func(*Node) (certify.Verdict, string)
 // A redirect-aware special case living only in errs.go would have left the
 // same bug reachable by the next row that provokes a mid-window 3xx.
 func resourceExchange(exs []Exchange) Exchange {
+	// 1st choice: latest exchange answered with a non-3xx — the resource fetch.
 	for i := len(exs) - 1; i >= 0; i-- {
-		if !isRedirectExchange(exs[i]) {
+		if exs[i].Resp != nil && !isRedirectExchange(exs[i]) {
 			return exs[i]
 		}
 	}
+	// 2nd: latest answered exchange at all (only redirects were answered) —
+	// grade the unresolved redirect, which is the deserved FAIL.
+	for i := len(exs) - 1; i >= 0; i-- {
+		if exs[i].Resp != nil {
+			return exs[i]
+		}
+	}
+	// Last resort: nothing was answered — the dangling request is the truth.
 	return exs[len(exs)-1]
 }
 
