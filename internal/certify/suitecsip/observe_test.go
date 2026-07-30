@@ -279,6 +279,46 @@ func TestCritMUPRegistered_StateRequiresLFDIAndReadingType(t *testing.T) {
 	}
 }
 
+// TestCritMUPRegistered_PendingStateFAILsWithPreciseWording is the regression
+// lock for runs/perphase-basic029-v4-20260730T232105 assertion 2: gridsim's
+// /admin/mups held {href:/mup/0, lfdi:8E5E2FEE…, readings:0} at grade time —
+// the DUT HAD registered, 24s before the run even started, but its
+// registration POST on this bench carries no ReadingType; only its first
+// MirrorMeterReading does, at the 300s postRate gridsim advertised, and the
+// window closed 52s after registration. The old FAIL wording ("records no
+// MirrorUsagePoint carrying a deviceLFDI and a ReadingType either") is
+// technically accurate but, to a bundle reader, indistinguishable from "the
+// DUT never registered". PendingMUP's tier must name the registration it
+// actually found and say plainly that the reading, not the registration, is
+// what's missing — while the verdict itself stays FAIL: the claim's
+// ReadingType genuinely is not in evidence.
+func TestCritMUPRegistered_PendingStateFAILsWithPreciseWording(t *testing.T) {
+	c := critMUPRegistered()
+	v := &ServerView{
+		Available: true,
+		Requests:  []ServerRequest{{Method: "GET", Path: "/mup"}},
+		MUPs: []AdminMUP{{
+			Href: "/mup/0", LFDI: "8E5E2FEE3190F4058B54692EE57A2D673D347586",
+			ReadingTypes: nil, Readings: 0, CreatedAt: 1785453642,
+		}},
+	}
+	f := c.Server(v)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("an LFDI-bound MUP with 0 readings and the window expired: verdict = %s (%s), want FAIL",
+			f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "/mup/0") || !strings.Contains(f.Observed, "8E5E2FEE") {
+		t.Errorf("Observed must cite the specific MUP the durable store found: %q", f.Observed)
+	}
+	if !strings.Contains(f.Observed, "not that it never registered") {
+		t.Errorf("Observed must distinguish 'registered, reading pending' from 'never registered': %q", f.Observed)
+	}
+	if strings.Contains(f.Observed, "carrying a deviceLFDI at all") {
+		t.Errorf("the generic never-registered wording must not be used when a pending registration was found "+
+			"in the store: %q", f.Observed)
+	}
+}
+
 // TestCritMUPRegistered_RingGapIsStillLastResortWhenStateIsAlsoEmpty proves
 // the state tier does not shadow the ring-gap Unavailable (e186056) when the
 // state has nothing either — e.g. an older gridsim predating /admin/mups, or
@@ -320,6 +360,39 @@ func TestServerView_RegisteredMUP(t *testing.T) {
 	empty := ServerView{MUPs: []AdminMUP{{Href: "/mup/0", LFDI: "", ReadingTypes: []uint8{38}}}}
 	if _, ok := empty.RegisteredMUP(); ok {
 		t.Error("a MUP list with no entry carrying both an LFDI and a ReadingType must not qualify")
+	}
+}
+
+// TestServerView_PendingMUP covers the fallback helper directly: unlike
+// RegisteredMUP it requires only the LFDI, because on this bench the
+// registration POST itself carries no ReadingType — only the DUT's first
+// MirrorMeterReading does (see PendingMUP's doc) — so an entry can be
+// genuinely, honestly "registered" long before it qualifies for
+// RegisteredMUP.
+func TestServerView_PendingMUP(t *testing.T) {
+	v := ServerView{MUPs: []AdminMUP{
+		{Href: "/mup/0", LFDI: "", ReadingTypes: nil},
+		{Href: "/mup/1", LFDI: "abc123", ReadingTypes: nil, Readings: 0},
+	}}
+	got, ok := v.PendingMUP()
+	if !ok {
+		t.Fatal("expected a pending (LFDI-bound, no ReadingType yet) MUP")
+	}
+	if got.Href != "/mup/1" {
+		t.Errorf("PendingMUP returned %q, want the first LFDI-bound entry (/mup/1)", got.Href)
+	}
+
+	empty := ServerView{MUPs: []AdminMUP{{Href: "/mup/0", LFDI: ""}}}
+	if _, ok := empty.PendingMUP(); ok {
+		t.Error("a MUP list with no LFDI-bound entry at all must not qualify as pending")
+	}
+
+	// An entry that ALSO qualifies for RegisteredMUP (LFDI + ReadingType)
+	// still satisfies PendingMUP too — callers are expected to try
+	// RegisteredMUP first, as critMUPRegistered's Server tier does.
+	complete := ServerView{MUPs: []AdminMUP{{Href: "/mup/2", LFDI: "abc123", ReadingTypes: []uint8{38}}}}
+	if _, ok := complete.PendingMUP(); !ok {
+		t.Error("PendingMUP should not itself exclude a complete registration; tier ordering is the caller's job")
 	}
 }
 
@@ -387,6 +460,100 @@ func TestAggWant_IgnoresStaleResponseFromEarlierRun(t *testing.T) {
 	}}
 	if !p(newer) {
 		t.Error("the predicate must be satisfied once a Response beyond the baseline's count arrives")
+	}
+}
+
+// TestBasicMUPWant_WaitsForReadingTypeNotJustAPoll is the regression lock for
+// runs/perphase-basic029-v4-20260730T232105: BASIC-029 had no Want of its
+// own, so it fell back to AwaitWalk — satisfied by the DUT's very next /dcap
+// poll, whatever that poll happens to be for. A run with -param csip.wait=12m
+// finished in ~28s because that poll landed 25s into the window purely by
+// coincidence of when the run started relative to the DUT's own 60s-cadence
+// boundary, and grading then found the durable MUP state short of what
+// critMUPRegistered's own tier needs: an LFDI-bound MUP is not enough, it
+// also needs a ReadingType (ServerView.RegisteredMUP) — and on this bench the
+// registration POST itself carries none; only the DUT's first
+// MirrorMeterReading does, ~300s later. basicMUPWant must not be satisfied by
+// a fresh discovery walk alone: that is the exact shape of the old bug for
+// this row.
+func TestBasicMUPWant_WaitsForReadingTypeNotJustAPoll(t *testing.T) {
+	base := ServerView{Requests: []ServerRequest{{Method: "GET", Path: DiscoveryRoot}}}
+	want := basicMUPWant(base)
+
+	// The DUT's next /dcap poll landed — the old AwaitWalk-only behaviour
+	// would call this satisfied — but no MUP registration exists at all yet.
+	walkOnlyNothingRegistered := ServerView{Requests: []ServerRequest{
+		{Method: "GET", Path: DiscoveryRoot}, {Method: "GET", Path: DiscoveryRoot},
+	}}
+	if want(walkOnlyNothingRegistered) {
+		t.Fatal("a fresh discovery walk alone must not satisfy basicMUPWant: it proves nothing about the " +
+			"MirrorUsagePoint registration this check actually grades")
+	}
+
+	// The MUP IS registered but its ReadingType has not landed yet — the
+	// exact {lfdi, readings:0} shape gridsim's /admin/mups held in the
+	// audited run. Must still wait: this is precisely the evidence
+	// critMUPRegistered's own tier 3 requires and does not yet have.
+	walkPlusPendingRegistration := ServerView{
+		Requests: []ServerRequest{{Method: "GET", Path: DiscoveryRoot}, {Method: "GET", Path: DiscoveryRoot}},
+		MUPs: []AdminMUP{{Href: "/mup/0", LFDI: "8E5E2FEE3190F4058B54692EE57A2D673D347586",
+			ReadingTypes: nil, Readings: 0}},
+	}
+	if want(walkPlusPendingRegistration) {
+		t.Fatal("an LFDI-bound MUP with no ReadingType yet (registered, reading pending) must not satisfy " +
+			"basicMUPWant")
+	}
+
+	// Once the ReadingType lands (the first MirrorMeterReading POST merges
+	// it into the durable record), the predicate is satisfied.
+	walkPlusCompleteRegistration := ServerView{
+		Requests: []ServerRequest{{Method: "GET", Path: DiscoveryRoot}, {Method: "GET", Path: DiscoveryRoot}},
+		MUPs: []AdminMUP{{Href: "/mup/0", LFDI: "8E5E2FEE3190F4058B54692EE57A2D673D347586",
+			ReadingTypes: []uint8{38}, Readings: 1}},
+	}
+	if !want(walkPlusCompleteRegistration) {
+		t.Error("a fresh discovery walk plus a ReadingType-bearing MUP registration must satisfy basicMUPWant")
+	}
+}
+
+// TestBasicMUPWant_AlreadyRegisteredStillNeedsItsOwnWalk proves the fix does
+// not regress the ordinary, steady-state case (a DUT whose registration,
+// ReadingType included, completed well before this run started) while also
+// pinning that the fresh-walk requirement is not dropped just because the MUP
+// state already qualifies: the walk is what guarantees the capture window
+// spans at least one /dcap exchange, which the DeviceCapability criterion
+// (assertion 1 of BASIC-029) needs evidence from — the same guarantee
+// AwaitWalk gave every other Setup-less row.
+//
+// This is NOT the WantNewResponse staleness bug (audit 2026-07-30,
+// CORE-022/CORE-023): RegisteredMUP reads durable, one-time STATE, not a
+// per-run delta, so an already-complete registration is supposed to satisfy
+// it — there is nothing here for an earlier run's evidence to spuriously
+// satisfy the wrong way.
+func TestBasicMUPWant_AlreadyRegisteredStillNeedsItsOwnWalk(t *testing.T) {
+	base := ServerView{Requests: []ServerRequest{{Method: "GET", Path: DiscoveryRoot}}}
+	want := basicMUPWant(base)
+
+	// MUP state already qualifies, but no fresh walk has been observed yet
+	// (the view still equals the baseline's own GETs(DiscoveryRoot) count).
+	registeredButNoFreshWalk := ServerView{
+		Requests: []ServerRequest{{Method: "GET", Path: DiscoveryRoot}}, // same count as base
+		MUPs:     []AdminMUP{{Href: "/mup/0", LFDI: "abc123", ReadingTypes: []uint8{38}, Readings: 3}},
+	}
+	if want(registeredButNoFreshWalk) {
+		t.Fatal("basicMUPWant must still wait for its own fresh discovery walk even when the MUP state " +
+			"already qualifies — this guarantees assertion 1's /dcap evidence is captured in-window")
+	}
+
+	// Once that walk is also observed, an already-complete registration is
+	// graded promptly, exactly as tier 3 has always allowed.
+	registeredAndFreshWalk := ServerView{
+		Requests: []ServerRequest{{Method: "GET", Path: DiscoveryRoot}, {Method: "GET", Path: DiscoveryRoot}},
+		MUPs:     []AdminMUP{{Href: "/mup/0", LFDI: "abc123", ReadingTypes: []uint8{38}, Readings: 3}},
+	}
+	if !want(registeredAndFreshWalk) {
+		t.Error("an already-complete registration must satisfy basicMUPWant as soon as the guaranteed fresh " +
+			"discovery walk is also seen")
 	}
 }
 

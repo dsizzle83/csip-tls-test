@@ -576,7 +576,8 @@ func critDERStatusElements() criterion {
 // MirrorMeterReading/ReadingType, answered 201 Created (or 204 for an
 // existing mRID) with a Location header.
 //
-// Three tiers, strongest first:
+// Five tiers, strongest first (four evidence sources, since the fourth
+// grades two distinct states of the same durable store differently):
 //
 //  1. Wire (above): an in-window POST recovered from the decrypted transcript,
 //     cited by frame. This is the strongest evidence and, when the DUT's
@@ -585,21 +586,34 @@ func critDERStatusElements() criterion {
 //  2. Server / request log: an in-window POST recorded in gridsim's request
 //     log (an EXACT match on the registration path "/mup" — see below for why
 //     that has to be exact, not a prefix).
-//  3. Server / MUP state (ServerView.RegisteredMUP, GET /admin/mups):
-//     registration is a ONE-TIME event — the DUT does it once, at first
-//     contact with this MirrorUsagePointList, and has no reason to repeat it —
-//     and it ordinarily predates a case's own window: BASIC-029 has no Setup
-//     of its own to force a fresh one, so by the time this check's window
-//     opens the registration already happened, often minutes or a whole
-//     campaign earlier. Tiers 1 and 2 can only ever see what fell inside the
-//     window; gridsim's durable MUP store did not stop existing just because
-//     the window opened late, so it is consulted before conceding anything.
-//  4. Server / ring gap (last resort, e186056): if the MUP store ALSO has
-//     nothing (an older gridsim predating the /admin/mups lever, or the
-//     process was restarted since registration and genuinely lost its state),
-//     fall back to RequestLogGap: an empty request-log count from a ring that
-//     itself says it cannot be trusted for this window is unavailable, not a
-//     FAIL. Only once the log is both empty AND trusted is this a real FAIL.
+//  3. Server / MUP state, complete (ServerView.RegisteredMUP, GET
+//     /admin/mups): registration is a ONE-TIME event — the DUT does it once,
+//     at first contact with this MirrorUsagePointList, and has no reason to
+//     repeat it — and it ordinarily predates a case's own window: BASIC-029
+//     has no Setup of its own to force a fresh one, so by the time this
+//     check's window opens the registration already happened, often minutes
+//     or a whole campaign earlier. Tiers 1 and 2 can only ever see what fell
+//     inside the window; gridsim's durable MUP store did not stop existing
+//     just because the window opened late, so it is consulted before
+//     conceding anything. This tier requires a ReadingType, because that is
+//     part of the claim above — and on this bench the registration POST
+//     itself carries none; only the DUT's first MirrorMeterReading does (see
+//     basicMeterReading's Want). A window that closes before that first
+//     reading lands must NOT credit this tier; see tier 4.
+//  4. Server / MUP state, pending (ServerView.PendingMUP): the store has an
+//     LFDI-bound MUP but no ReadingType yet — registered, evidence not yet
+//     landed, as opposed to never registered at all. This is a real FAIL
+//     (the claim's ReadingType is genuinely absent from the window's
+//     evidence), but it is graded with its own, more precise wording so a
+//     bundle reader is not misled into reading it as "the DUT never
+//     registered" — see the fix note below.
+//  5. Server / ring gap (last resort, e186056): if the MUP store ALSO has
+//     nothing at all — not even a pending, LFDI-only entry (an older gridsim
+//     predating the /admin/mups lever, or the process was restarted since
+//     registration and genuinely lost its state) — fall back to
+//     RequestLogGap: an empty request-log count from a ring that itself says
+//     it cannot be trusted for this window is unavailable, not a FAIL. Only
+//     once the log is both empty AND trusted is this a real FAIL.
 //
 // Fix note (audit 2026-07-30, runs/stamped-basic029-20260730T073518 assertion
 // 2): the request-log tier used to match any path with the "/mup" PREFIX,
@@ -610,6 +624,31 @@ func critDERStatusElements() criterion {
 // MirrorUsagePoint POST in the transcript, yet the Server tier reported "36
 // POST(s) to the MirrorUsagePoint tree" and PASSed). The request-log tier now
 // matches the registration path exactly.
+//
+// Fix note (audit 2026-07-30, runs/perphase-basic029-v4-20260730T232105
+// assertion 2): a run with `-param csip.wait=12m` finished in ~28s and FAILed
+// this criterion even though the DUT HAD registered, 24s before the run even
+// started, and gridsim's /admin/mups proved it. Two separate bugs, both fixed
+// together because neither alone explains the run:
+//
+//   - basicMeterReading had no Want of its own, so it fell back to
+//     AwaitWalk — satisfied by the DUT's very next /dcap poll, whatever it is
+//     for. That poll landed 25s into the window purely because the run
+//     happened to start 5s before the DUT's routine 60s-cadence boundary; the
+//     operator's 12-minute wait was never honoured. See basicMeterReading's
+//     Want for the fix: it now waits for what THIS check's own criteria need,
+//     not for an unrelated poll.
+//   - Tier 3 correctly requires a ReadingType (it is part of the claim), and
+//     this DUT's registration POST carries none — only its first
+//     MirrorMeterReading does, at the 300s postRate gridsim advertised. Grading
+//     52s after registration (23:20:42Z registered, 23:21:33Z graded) was
+//     always going to see readings:0; that is not a tier bug, it is grading
+//     before the evidence the tier is honestly waiting for could exist. Tier
+//     4 above is the other half of the fix: when that happens anyway (the
+//     wait fix above should prevent it, but a window can still legitimately
+//     expire before a slow DUT's first reading), the FAIL now says exactly
+//     that — registered, reading pending — instead of words indistinguishable
+//     from "never registered".
 func critMUPRegistered() criterion {
 	return criterion{
 		Claim: "the DUT registered a MirrorUsagePoint carrying its own LFDI and a " +
@@ -686,7 +725,26 @@ func critMUPRegistered() criterion {
 						n, mup.Href, time.Unix(mup.CreatedAt, 0).UTC().Format(time.RFC3339), mup.LFDI,
 						len(mup.ReadingTypes), mup.ReadingTypes)}
 			}
-			// Tier 4 (last resort): the request log is a bounded ring (unlike
+			// Tier 4: the store has an LFDI-bound MUP, just not one carrying
+			// a ReadingType yet — registered, evidence pending, not "never
+			// registered". See PendingMUP's doc and the fix note above
+			// (runs/perphase-basic029-v4-20260730T232105): the generic
+			// tier-5/final wording below is technically accurate here too,
+			// but reads exactly like the DUT never registered at all, which
+			// is not what the store shows. Still a FAIL — the claim's
+			// ReadingType genuinely is not in evidence yet — just a more
+			// honest one.
+			if mup, ok := v.PendingMUP(); ok {
+				return Finding{Verdict: certify.Fail,
+					Observed: fmt.Sprintf("gridsim's request log records no in-window POST to the "+
+						"MirrorUsagePoint registration endpoint (%d GET(s) of /mup); its durable MUP state "+
+						"(GET /admin/mups) records %s registered at %s carrying deviceLFDI=%s, but with %d "+
+						"reading(s) posted and no ReadingType yet — the DUT's first MirrorMeterReading had "+
+						"not landed by the time this window closed, not that it never registered",
+						n, mup.Href, time.Unix(mup.CreatedAt, 0).UTC().Format(time.RFC3339), mup.LFDI,
+						mup.Readings)}
+			}
+			// Tier 5 (last resort): the request log is a bounded ring (unlike
 			// Responses/DERPuts), and the registration this criterion is
 			// after is a ONE-TIME event: it happens once, at the DUT's first
 			// contact, and never again unless gridsim's state is wiped. A
@@ -697,23 +755,73 @@ func critMUPRegistered() criterion {
 			if v.RequestLogGap != "" {
 				return unavailable("gridsim's request log records no POST to the "+
 					"MirrorUsagePoint registration endpoint during this window, its durable MUP state "+
-					"(GET /admin/mups) records nothing bearing a deviceLFDI and a ReadingType either, "+
-					"but %s", v.RequestLogGap)
+					"(GET /admin/mups) records nothing bearing a deviceLFDI at all, but %s", v.RequestLogGap)
 			}
 			return Finding{Verdict: certify.Fail,
 				Observed: fmt.Sprintf("gridsim's request log records no POST to the MirrorUsagePoint "+
 					"registration endpoint during this window (%d GET(s) of /mup), and its durable MUP "+
-					"state (GET /admin/mups) records no MirrorUsagePoint carrying a deviceLFDI and a "+
-					"ReadingType either", n)}
+					"state (GET /admin/mups) records no MirrorUsagePoint carrying a deviceLFDI at all", n)}
 		},
+	}
+}
+
+// basicMUPWant is basicMeterReading's Want: it replaces the generic AwaitWalk
+// fallback (satisfied by the DUT's very next /dcap poll, whatever it happens
+// to be for) with a predicate tied to what this check's OWN criteria need.
+//
+// Fix note (audit 2026-07-30, runs/perphase-basic029-v4-20260730T232105
+// assertion 2): BASIC-029 has no Setup and, before this fix, no Want either,
+// so it fell back to AwaitWalk. A run with `-param csip.wait=12m` finished in
+// ~28s because the DUT's routine 60s-cadence poll landed 25s into the
+// window — a coincidence of when the run happened to start relative to the
+// DUT's own poll boundary, with no connection to MUP registration at all.
+// Grading then found critMUPRegistered's tier 3 (ServerView.RegisteredMUP)
+// unsatisfied: the DUT HAD registered, 24s before the run even started, but
+// its registration POST on this bench carries no ReadingType — only its
+// first MirrorMeterReading does, at the 300s postRate gridsim advertised —
+// so the durable state legitimately showed readings:0 at the 28-second mark.
+// The operator's 12-minute wait, meant to span exactly that 300s cadence
+// (see the postRate criterion below), was never honoured.
+//
+// This predicate waits for BOTH things the check's criteria actually use, not
+// either alone:
+//
+//   - a fresh discovery walk (base.GETs(DiscoveryRoot)+1), the same guarantee
+//     AwaitWalk gave every other Setup-less row: it ensures the capture window
+//     always spans at least one /dcap exchange, which the DeviceCapability
+//     criterion above needs evidence from;
+//   - ServerView.RegisteredMUP, the exact state critMUPRegistered's tier 3
+//     grades — an LFDI-bound MUP carrying a ReadingType. Requiring this HERE,
+//     in the wait, rather than only in the grading tier, is what makes the
+//     wait actually wait for the evidence instead of exiting the moment an
+//     unrelated poll lands.
+//
+// A DUT that never registers waits the full configured window and is graded
+// on what is honestly there — the same outcome as before, just no longer
+// arrived at by accident. A DUT whose registration (with a ReadingType) is
+// already complete by the time this run starts is graded promptly, same as
+// tier 3 has always allowed: RegisteredMUP reads durable, one-time STATE, not
+// a per-run delta, so — unlike WantNewResponse's Response-log staleness bug —
+// there is nothing here for an earlier run's evidence to spuriously satisfy.
+func basicMUPWant(base ServerView) func(ServerView) bool {
+	wantWalk := base.GETs(DiscoveryRoot) + 1
+	return func(v ServerView) bool {
+		if v.GETs(DiscoveryRoot) < wantWalk {
+			return false
+		}
+		_, ok := v.RegisteredMUP()
+		return ok
 	}
 }
 
 // basicMeterReading implements BASIC-029 — Inverter Meter Reading.
 func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	return run(ctx, rc, spec{
+		Want: func(base ServerView) func(ServerView) bool { return basicMUPWant(base) },
 		Notes: func(o *Observation) string {
-			return "MirrorUsagePoint registration and MirrorMeterReading posting"
+			return fmt.Sprintf("MirrorUsagePoint registration and MirrorMeterReading posting; waited %s for a "+
+				"fresh discovery walk AND a ReadingType-bearing MUP registration (predicate satisfied: %t)",
+				o.Waited.Round(rounding), o.Satisfied)
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{

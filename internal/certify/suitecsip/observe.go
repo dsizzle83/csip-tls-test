@@ -495,6 +495,36 @@ func (v ServerView) RegisteredMUP() (AdminMUP, bool) {
 	return AdminMUP{}, false
 }
 
+// PendingMUP returns a durable MUP record that carries the DUT's LFDI but no
+// ReadingType yet: registered, but the evidence critMUPRegistered's own claim
+// needs (a MirrorMeterReading/ReadingType) has not arrived. On this bench the
+// registration POST itself carries no ReadingType — only the DUT's first
+// MirrorMeterReading does, at the postRate the registration advertised
+// (bench default 300s, see handleMUPReadings/mergeUOMs in sim/gridsim) — so a
+// window that closes before that first reading lands finds exactly this: an
+// LFDI-bound MUP with Readings == 0 and ReadingTypes empty.
+//
+// It exists so a FAIL grade can say "registered, still waiting on its first
+// reading" instead of the same words a genuine non-registration gets (audit
+// 2026-07-30, runs/perphase-basic029-v4-20260730T232105 assertion 2: the
+// admin snapshot at grade time held exactly this shape —
+// {href:/mup/0, lfdi:8E5E2FEE…, readings:0} — and the old Server tier's FAIL
+// text read "records no MirrorUsagePoint carrying a deviceLFDI and a
+// ReadingType either", which is defensible in isolation but reads, to a
+// bundle reviewer, exactly like "the DUT never registered". It didn't:
+// registration happened 51s before the window closed, which is nowhere near
+// the ~300s a reading needs). Call only after RegisteredMUP has already
+// returned false: PendingMUP does not itself require ReadingTypes to be
+// empty, so an entry satisfying RegisteredMUP would satisfy this too.
+func (v ServerView) PendingMUP() (AdminMUP, bool) {
+	for _, m := range v.MUPs {
+		if m.LFDI != "" {
+			return m, true
+		}
+	}
+	return AdminMUP{}, false
+}
+
 // NotificationsFor returns the Notifications pushed for one subscribed
 // resource href, query string and trailing slash ignored.
 func (v ServerView) NotificationsFor(href string) []AdminNotification {
