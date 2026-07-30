@@ -557,7 +557,7 @@ func coreBasicSubscription(ctx context.Context, rc *certify.RunCtx) (certify.Res
 			return "basic subscription (CORE-018), read through Annex A seq 44: HTTP 204 is NOT an acceptable " +
 				"answer to a Notification for this row, so only 201 Created is asserted"
 		},
-		Change: touchSubscribedResources,
+		Change:   touchSubscribedResources,
 		Criteria: func(o *Observation) []criterion { return core018Criteria(o) },
 	})
 }
@@ -911,7 +911,7 @@ func maintGroup(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 				{
 					Claim: "on that Notification the aggregator GETs the new FunctionSetAssignmentsList and " +
 						"the DERProgramList it now belongs to",
-					How:  "the GETs following the Notification, compared against the hrefs it carried",
+					How: "the GETs following the Notification, compared against the hrefs it carried",
 					Skip: "the re-parenting that would cause this Notification could not be performed (see " +
 						"above), so a GET of the 'new' FunctionSetAssignmentsList is a GET of the same one " +
 						"the device already had. Reporting the DUT's ordinary walk as a reaction to a " +

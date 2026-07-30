@@ -201,7 +201,7 @@ func TestForbiddenStatusIsDecisive(t *testing.T) {
 	edb1, edb2 := lfdiOf(t, o, "EDB1"), lfdiOf(t, o, "EDB2")
 
 	c := critResponseFanOut(o, aggFanOut{
-		What: "the SY DERControl is executed normally, with no supersession status",
+		What:    "the SY DERControl is executed normally, with no supersession status",
 		Devices: "EDB1 and EDB2", Names: edbPair, MRID: "CERT-AGG007SY",
 		Statuses: []int{2, 3}, Forbidden: []int{7, 14},
 	})
