@@ -11,7 +11,7 @@
 // 123 (Immediate Controls).
 //
 // -advanced (= -der-models advanced) adds the IEEE 1547-2018 DER models
-// 701/702/704 and the curve models 705/706/711/712.
+// 701/702/703/704 and the curve models 705/706/711/712.
 //
 // -der-models full adds, on top of those, the trip models 707/708/709/710
 // (DERTripLV/HV/LF/HF) carrying Category III default trip curves — see
@@ -45,9 +45,9 @@ func main() {
 	wmax := flag.Float64("wmax", 5000, "Nameplate WMax in watts")
 	apiPort := flag.Int("api-port", 6020, "HTTP API port (0 to disable)")
 	advanced := flag.Bool("advanced", false, "serve the IEEE 1547-2018 7xx DER models "+
-		"(701/702/704/705/706/711/712) for advanced-DER QA scenarios")
+		"(701/702/703/704/705/706/711/712) for advanced-DER QA scenarios")
 	derModels := flag.String("der-models", "", "which DER model set to serve, overriding -advanced: "+
-		"\"legacy\" = 1/103/120/121/122/123 only; \"advanced\" = plus 701/702/704/705/706/711/712 "+
+		"\"legacy\" = 1/103/120/121/122/123 only; \"advanced\" = plus 701/702/703/704/705/706/711/712 "+
 		"(identical to -advanced); \"full\" = plus the IEEE 1547-2018 trip models 707/708/709/710 "+
 		"(DERTripLV/HV/LF/HF) with Category III default trip curves. Empty follows -advanced, which "+
 		"keeps every existing bench invocation serving the register image it has always served — the "+

@@ -14,7 +14,7 @@
 //	         -key certs/mbaps/dev-server-key.pem -api-port 6031 -serial SN-...
 //
 // Models exposed: Common Model 1, plus 120/121/(122)/103/123 (legacy) and
-// 701/704 (inverter) or 701/704/713/802 (battery) — see sim/southbound's
+// 701/702/703/704 (inverter) or 701/704/713/802 (battery) — see sim/southbound's
 // solar_adv.go / battery_adv.go.
 //
 // API (default :6031, see sim/simapi):

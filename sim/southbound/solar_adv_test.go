@@ -6,6 +6,7 @@ package sim
 // pf_ack_ignore accept-but-ignore), and the raise_alarm bitfield knob.
 
 import (
+	"math"
 	"testing"
 
 	"lexa-proto/sunspec"
@@ -288,4 +289,177 @@ func approx(got, want, tol float64) bool {
 		d = -d
 	}
 	return d <= tol
+}
+
+// TestAdv701VoltagePointsCoherentBeforeFirstTick pins the "Seed 701 before the
+// first tick so an immediately-read advanced sim is coherent" invariant
+// animateSolarAdvanced's doc comment claims (solar_adv.go) — specifically for
+// the line-to-line quartet (LLV/VL1L2/VL2L3/VL3L1). advMirror701 mirrors those
+// from M103's own PPVph{AB,BC,CA} registers, and populateSolarCore did not
+// seed those before the fix this test pins, so a client reading model 701 the
+// instant it connects to a freshly started modsim/mbapsdev — before the first
+// 5s animation tick ever runs solarStep — saw all four read literal 0.0 V: an
+// IMPLEMENTED value, not the SunSpec not-implemented sentinel, on a device
+// declaring ACType=THREE_PHASE. That is a physically impossible machine (see
+// advMirror701's file comment) and the exact shape of the MOD-4 step 3
+// finding this fix closes (runs/stamped-fullsuite-20260730T075718/REPORT.md's
+// MOD-4.701 assertion, though that specific run's NOT-IMPLEMENTED verdict
+// traces to a separate, product-side gap — see internal/regmap/feed.go's "701
+// per-phase voltage" note in lexa-gw).
+//
+// advSync() performs the exact advBridgeCeiling+advMirror701 pair the real
+// animation goroutine's pre-loop seed calls (this bare-struct test harness
+// never starts that goroutine), so this is the immediate, pre-first-tick
+// state a real client sees.
+func TestAdv701VoltagePointsCoherentBeforeFirstTick(t *testing.T) {
+	ss := newAdvSolar(t, 6000)
+	ss.advSync()
+
+	regs := readSlice(ss.Regs, ss.adv.M701, ss.adv.M701Len)
+	m := sunspec.Parse701(regs)
+	if math.IsNaN(m.LLV) {
+		t.Error("701 LLV is not-implemented immediately after construction")
+	}
+	if math.IsNaN(m.LNV) {
+		t.Error("701 LNV is not-implemented immediately after construction")
+	}
+	if math.IsNaN(m.VL1) {
+		t.Error("701 VL1 is not-implemented immediately after construction")
+	}
+
+	// VL2/VL3/VL1L2/VL2L3/VL3L1 are not carried by lexa-proto's ACMeasurement
+	// struct, so read them straight off the layout view.
+	v := sunspec.L701.View(regs)
+	for _, name := range []string{"VL2", "VL3", "VL1L2", "VL2L3", "VL3L1"} {
+		got := v.Float(name)
+		if math.IsNaN(got) {
+			t.Errorf("701 %s is not-implemented immediately after construction", name)
+			continue
+		}
+		if got == 0 {
+			t.Errorf("701 %s = 0 immediately after construction — a three-phase device (ACType=2) "+
+				"asserting 0 V is implemented-but-wrong, the exact defect populateSolarCore's PPVph "+
+				"seed exists to prevent", name)
+		}
+	}
+
+	// Physical coherence: line-to-line = sqrt(3) x line-to-neutral for the
+	// balanced three-phase model this sim runs (the same relation the
+	// animation tick and the Inject "V_V" handler both apply).
+	wantLL := m.LNV * math.Sqrt(3)
+	for _, name := range []string{"LLV", "VL1L2", "VL2L3", "VL3L1"} {
+		if got := v.Float(name); !approx(got, wantLL, 1.0) {
+			t.Errorf("701 %s = %.1f, want ~%.1f (sqrt(3) x LNV=%.1f)", name, got, wantLL, m.LNV)
+		}
+	}
+}
+
+// TestModel703Served pins model 703 (DER Enter Service) into the advanced
+// image's chain, between 702 and 704, and checks that every point
+// profile1547.go's requiredPoints[703] names reads back as real,
+// non-sentinel, IEEE 1547-2018-typical data — the fix for MOD-4's
+// "MISSING [703]" finding (runs/stamped-fullsuite-20260730T075718/REPORT.md:
+// "the DUT serves [1 701 702 704 705 706 707 708 709 710 711 712]; the IEEE
+// 1547-2018 profile requires [... 703 ...]; MISSING [703]"). The profile's
+// §3.5 Required Points table gives 703 no conditionality clause (unlike 713),
+// so it belongs in the unconditional chain, not behind an opt-in flag.
+func TestModel703Served(t *testing.T) {
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	_, adv := populateSolarAdvanced(r, 6000, 6000*0.44, "", false)
+
+	reader, err := sunspec.NewReader(&regMapTransport{r: r})
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	if !reader.HasModel(sunspec.ModelDEREnterService) {
+		t.Fatal("the advanced image does not serve model 703 (DEREnterService)")
+	}
+
+	// Chain order: 701 < 702 < 703 < 704 (address order is discovery order).
+	if !(adv.M701 < adv.M702 && adv.M702 < adv.M703 && adv.M703 < adv.M704) {
+		t.Errorf("703 is not chained between 702 and 704: 701@%d 702@%d 703@%d 704@%d",
+			adv.M701, adv.M702, adv.M703, adv.M704)
+	}
+
+	regs, err := reader.ReadModel(sunspec.ModelDEREnterService)
+	if err != nil {
+		t.Fatalf("ReadModel(703): %v", err)
+	}
+	// Layout width assertion against lexa-proto's own table — the L701 bug
+	// this fixture already guards against (703 registers instead of 137) had
+	// exactly this shape: a length constant drifting from the layout that
+	// derives it.
+	if got, want := len(regs), sunspec.L703.Len(); got != want {
+		t.Errorf("703 data length = %d, want %d (lexa-proto's L703 layout)", got, want)
+	}
+
+	es := sunspec.Parse703(regs)
+	if !es.Enabled {
+		t.Error("703 ES = disabled, want enabled (permit service)")
+	}
+	for _, tc := range []struct {
+		name      string
+		got, want float64
+	}{
+		{"ESVHi", es.VHi, 252.0},
+		{"ESVLo", es.VLo, 220.0},
+		{"ESHzHi", es.HzHi, 60.1},
+		{"ESHzLo", es.HzLo, 59.5},
+	} {
+		if math.IsNaN(tc.got) {
+			t.Errorf("703 %s is not-implemented", tc.name)
+			continue
+		}
+		if !approx(tc.got, tc.want, 0.05) {
+			t.Errorf("703 %s = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+	if es.DelayS != 300 {
+		t.Errorf("703 ESDlyTms = %d, want 300", es.DelayS)
+	}
+	if es.RampS != 300 {
+		t.Errorf("703 ESRmpTms = %d, want 300", es.RampS)
+	}
+
+	v := sunspec.L703.View(regs)
+	if _, ok := v.SF("V_SF"); !ok {
+		t.Error("703 V_SF is not-implemented")
+	}
+	if _, ok := v.SF("Hz_SF"); !ok {
+		t.Error("703 Hz_SF is not-implemented")
+	}
+
+	// The SF write-protection every advanced model gets (protect.go).
+	for _, sf := range []string{"V_SF", "Hz_SF"} {
+		addr := adv.M703 + uint16(sunspec.L703.Offset(sf))
+		if !r.protected[addr] {
+			t.Errorf("703 %s at %d is not write-protected", sf, addr)
+		}
+	}
+}
+
+// TestModel703ServedByBothSimInstances proves inv-plain (modsim, plain TCP)
+// and inv-secure (mbapsdev, mbaps/mTLS) cannot drift on this: both build their
+// SunSpec register world from the SAME sim.NewSolarServerAdvanced constructor
+// (mbapsdev's -model inverter — see sim/mbapsdev/main.go's newModel), so
+// adding 703 to populateSolar7xx serves it identically to both, without
+// either binary's own main.go knowing 703 exists.
+func TestModel703ServedByBothSimInstances(t *testing.T) {
+	plain, err := NewSolarServerAdvanced("tcp://127.0.0.1:0", 6000, "BENCH-MODSIM-01")
+	if err != nil {
+		t.Fatalf("NewSolarServerAdvanced (inv-plain): %v", err)
+	}
+	defer plain.Stop()
+	secure, err := NewSolarServerAdvanced("tcp://127.0.0.1:0", 6000, "BENCH-MBAPS-01")
+	if err != nil {
+		t.Fatalf("NewSolarServerAdvanced (inv-secure): %v", err)
+	}
+	defer secure.Stop()
+
+	if plain.adv.M703 == 0 {
+		t.Error("inv-plain (modsim) does not serve model 703")
+	}
+	if secure.adv.M703 == 0 {
+		t.Error("inv-secure (mbapsdev) does not serve model 703")
+	}
 }

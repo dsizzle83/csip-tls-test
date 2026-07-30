@@ -238,9 +238,11 @@ func TestTripModelsDoNotDisturbTheDefaultAdvancedImage(t *testing.T) {
 	}
 
 	// Every advanced model keeps its base address.
-	if plainAdv.M701 != fullAdv.M701 || plainAdv.M702 != fullAdv.M702 || plainAdv.M704 != fullAdv.M704 {
-		t.Errorf("701/702/704 bases moved: %v/%v/%v -> %v/%v/%v",
-			plainAdv.M701, plainAdv.M702, plainAdv.M704, fullAdv.M701, fullAdv.M702, fullAdv.M704)
+	if plainAdv.M701 != fullAdv.M701 || plainAdv.M702 != fullAdv.M702 || plainAdv.M703 != fullAdv.M703 ||
+		plainAdv.M704 != fullAdv.M704 {
+		t.Errorf("701/702/703/704 bases moved: %v/%v/%v/%v -> %v/%v/%v/%v",
+			plainAdv.M701, plainAdv.M702, plainAdv.M703, plainAdv.M704,
+			fullAdv.M701, fullAdv.M702, fullAdv.M703, fullAdv.M704)
 	}
 	if len(plainAdv.Curves) != len(fullAdv.Curves) {
 		t.Fatalf("curve-model count changed: %d -> %d", len(plainAdv.Curves), len(fullAdv.Curves))

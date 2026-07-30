@@ -11,6 +11,12 @@ package sim
 //	                            the 103 model reports; the hub prefers 701 over
 //	                            103 when present.
 //	702 (DER Capacity)        — WMax + reactive rating (fixed-var convergence base).
+//	703 (DER Enter Service)   — permit-service enable, IEEE 1547-2018-typical
+//	                            enter-service voltage/frequency window and
+//	                            delay/ramp timers. Unconditionally mandatory per
+//	                            the profile's §3.5 Required Points table (unlike
+//	                            713, it carries no conditionality clause) — see
+//	                            populate703.
 //	704 (DER AC Controls)     — WMaxLimPct (bridged to the 123 ceiling machinery),
 //	                            PFWInj/PFWAbs fixed-PF sync groups, VarSet fixed-var,
 //	                            all writable with MEASURED effect on 701 PF/Var.
@@ -56,6 +62,7 @@ type solarAdvBases struct {
 	M701    uint16
 	M701Len int
 	M702    uint16
+	M703    uint16
 	M704    uint16
 	Curves  []curveBlock
 	// Trips holds the 707/708/709/710 IEEE 1547 trip models, and is EMPTY
@@ -155,10 +162,37 @@ func newSolarServerAdvanced(listenURL string, wmaxW float64, serial string, with
 
 func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial string, withTrip bool) (SolarBases, solarAdvBases) {
 	bases, cursor := populateSolarCore(r, wmaxW, serial)
+	seedLineToLineVoltage(r, bases)
 	adv, cursor := populateSolar7xx(r, cursor, wmaxW, varRating, withTrip)
 	r.Set(cursor, sunspec.EndMarker)
 	r.Set(cursor+1, 0)
 	return bases, adv
+}
+
+// seedLineToLineVoltage seeds M103's PPVph{AB,BC,CA} (line-to-line voltage)
+// from the phase-to-neutral voltage populateSolarCore just wrote, applying
+// the SAME sqrt(3) relation the animation loop (solarStep) and the Inject
+// "V_V" handler already use every tick/write.
+//
+// It is called ONLY from the advanced path — never from populateSolarCore
+// itself, which the legacy (non-701) sim also uses and which deliberately
+// keeps serving 0 there until the first tick (see that function's own
+// comment) — because it is specifically the advanced sim's 701 mirror
+// (advMirror701) that reads these M103 registers BEFORE the first animation
+// tick, so an immediately-read advanced sim is coherent
+// (animateSolarAdvanced's "Seed 701 before the first tick" comment).
+//
+// Without this, LLV/VL1L2/VL2L3/VL3L1 read a real, IMPLEMENTED 0.0 V for up
+// to 5 real seconds after every advanced sim start, on a device declaring
+// ACType=THREE_PHASE — a physically impossible machine (see advMirror701's
+// file comment) and the exact shape of defect MOD-4 step 3 checks for.
+// TestAdv701VoltagePointsCoherentBeforeFirstTick pins this.
+func seedLineToLineVoltage(r *RegisterMap, bases SolarBases) {
+	vRaw := r.Get(bases.M103Base + sunspec.M103_PhVphA)
+	vll := uint16(math.Round(float64(vRaw) * math.Sqrt(3)))
+	r.Set(bases.M103Base+sunspec.M103_PPVphAB, vll)
+	r.Set(bases.M103Base+sunspec.M103_PPVphBC, vll)
+	r.Set(bases.M103Base+sunspec.M103_PPVphCA, vll)
 }
 
 // populateSolar7xx appends the advanced models after the legacy layout (before
@@ -167,13 +201,14 @@ func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial stri
 // withTrip appends models 707/708/709/710 LAST. Appending rather than
 // interleaving is deliberate and load-bearing: every block before them keeps
 // the address it has always had, so a trip-capable sim and a plain advanced sim
-// answer identically for models 1/103/120/121/122/123/701/702/704/705/706/711/
-// 712, and only the end marker moves.
+// answer identically for models 1/103/120/121/122/123/701/702/703/704/705/706/
+// 711/712, and only the end marker moves.
 func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64, withTrip bool) (solarAdvBases, uint16) {
 	var adv solarAdvBases
 
 	adv.M701, adv.M701Len, cursor = populate701(r, cursor)
 	adv.M702, cursor = populate702(r, cursor, wmaxW, varRating)
+	adv.M703, cursor = populate703(r, cursor)
 	adv.M704, cursor = populate704(r, cursor)
 	for _, spec := range solarCurveSpecs {
 		var cb curveBlock
@@ -196,6 +231,7 @@ func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64, w
 	// poisoning into an observable divergence.
 	protectLayoutSFs(r, adv.M701, sunspec.L701)
 	protectLayoutSFs(r, adv.M702, sunspec.L702)
+	protectLayoutSFs(r, adv.M703, sunspec.L703)
 	protectLayoutSFs(r, adv.M704, sunspec.L704)
 	for _, cb := range adv.Curves {
 		protectLayoutSFs(r, cb.base, cb.hdr)
@@ -287,6 +323,39 @@ func populate702(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (base,
 	v.SetFloat("VarMaxInj", varRating)
 	v.SetFloat("VarMaxAbs", varRating)
 	v.SetFloat("VNom", 240)
+	writeSlice(r, base, regs)
+	return base, next
+}
+
+// populate703 writes a model 703 (DER Enter Service) with a permit-to-operate
+// enable and IEEE 1547-2018-typical default enter-service limits: voltage
+// 91.7%-105% of the 240 V nominal the rest of this sim assumes (matches
+// populate702's VNomRtg=240), frequency 59.5-60.1 Hz (matches the 60.00 Hz
+// nominal the 103/701 animation runs around), a 300 s enter-service delay
+// with a 300 s ramp, and a nonzero (but already-elapsed) randomized-delay
+// window. The profile makes 703 unconditionally mandatory — unlike 713, its
+// §3.5 Required Points table (Table 20) carries no conditionality clause —
+// so every advanced/full sim serves it, not just the ones a scenario opts
+// into. Every profile-required point (ES/ESVHi/ESVLo/ESHzHi/ESHzLo/
+// ESDlyTms/ESRmpTms/V_SF/Hz_SF, profile1547.go's requiredPoints[703]) plus
+// the two Table 21 optional timers (ESRndTms/ESDlyRemTms) are set explicitly
+// so none reads back as not-implemented.
+func populate703(r *RegisterMap, cursor uint16) (base, next uint16) {
+	dataLen := sunspec.L703.Len()
+	base, next = writeModelHeader(r, cursor, sunspec.ModelDEREnterService, dataLen)
+	regs := make([]uint16, dataLen)
+	setSF(regs, sunspec.L703, "V_SF", -1)
+	setSF(regs, sunspec.L703, "Hz_SF", -2)
+	v := sunspec.L703.View(regs)
+	v.SetBool("ES", true)      // permit service — matches populate701's St=on/ConnSt=connected
+	v.SetFloat("ESVHi", 252.0) // 1.05 x 240V nominal
+	v.SetFloat("ESVLo", 220.0) // 0.917 x 240V nominal
+	v.SetFloat("ESHzHi", 60.1)
+	v.SetFloat("ESHzLo", 59.5)
+	v.SetU32("ESDlyTms", 300)
+	v.SetU32("ESRndTms", 60)
+	v.SetU32("ESRmpTms", 300)
+	v.SetU32("ESDlyRemTms", 0) // already in service: no delay remaining
 	writeSlice(r, base, regs)
 	return base, next
 }

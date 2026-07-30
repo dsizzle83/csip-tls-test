@@ -555,6 +555,15 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	r.Set(m103Base+sunspec.M103_PhVphA, 2400)
 	r.Set(m103Base+sunspec.M103_PhVphB, 2400)
 	r.Set(m103Base+sunspec.M103_PhVphC, 2400)
+	// PPVph{AB,BC,CA} (line-to-line) are deliberately left at 0 here — the
+	// animation loop (line ~717) and the Inject "V_V" handler both seed/update
+	// them from PhVphA with the sqrt(3) relation, and the legacy (non-701)
+	// image has served this exact sequence — 0 until the first tick — since
+	// before this sim had a 701 model to mirror it into. Widening the seed
+	// here would change model 103's register content for every existing
+	// legacy-sim scenario the day this file is rebuilt, not just the
+	// advanced/701 path that actually needs it — see populateSolarAdvanced's
+	// own PPVph seed for the 701-scoped fix and its reasoning.
 	r.Set(m103Base+sunspec.M103_V_SF, sfN(-1))
 	r.Set(m103Base+sunspec.M103_Hz, 6000)
 	r.Set(m103Base+sunspec.M103_Hz_SF, sfN(-2))

@@ -134,7 +134,7 @@ func (d *mayhemDriver) advScenarios() []*mayScenario {
 // was constructed via NewSolarServerAdvanced — i.e. `modsim -advanced`).
 func requireAdvSolarSim(d *mayhemDriver) error {
 	if _, ok := d.solarAdvancedState(); !ok {
-		return fmt.Errorf(`solar sim's GET /state has no "advanced" block — this scenario needs the bench solar simulator launched as "modsim -advanced" (sim/modsim/main.go's -advanced flag, QA track A), which serves the SunSpec 7xx models (701/702/704/705/706/711/712) this scenario drives; a plain modsim serves none of them and this scenario cannot run`)
+		return fmt.Errorf(`solar sim's GET /state has no "advanced" block — this scenario needs the bench solar simulator launched as "modsim -advanced" (sim/modsim/main.go's -advanced flag, QA track A), which serves the SunSpec 7xx models (701/702/703/704/705/706/711/712) this scenario drives; a plain modsim serves none of them and this scenario cannot run`)
 	}
 	return nil
 }
