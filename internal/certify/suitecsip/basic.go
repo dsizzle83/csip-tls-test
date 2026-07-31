@@ -258,11 +258,11 @@ func (sc eventScenario) withNonce(nonce string) eventScenario {
 	}
 	out := sc
 	if sc.ExpectWinner != "" {
-		out.ExpectWinner = sc.ExpectWinner + "-" + nonce
+		out.ExpectWinner = withRunNonce(sc.ExpectWinner, nonce)
 	}
 	out.Controls = make([]scenarioControl, len(sc.Controls))
 	for i, c := range sc.Controls {
-		c.MRID += "-" + nonce
+		c.MRID = withRunNonce(c.MRID, nonce)
 		out.Controls[i] = c
 	}
 	return out

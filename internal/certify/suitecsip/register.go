@@ -146,9 +146,13 @@ func Register(reg *certify.Registry) {
 	// ── Response lifecycle (order 100–109) ───────────────────────────────
 	reg.Register(uid("CORE-021"), Suite, coreRandomizedEvents,
 		certify.WithRequires(needGridSim...), certify.WithOrder(100))
-	reg.Register(uid("CORE-022"), Suite, coreResponses,
+	// coreResponses/coreSuperseding take the SAME per-run nonce as the event
+	// scenarios above, for the same reason (see withRunNonce's doc): CORE-022
+	// and CORE-023 hardcode their control mRIDs just as BASIC-017..026 used
+	// to, and hit the identical Response-tracker dedupe on a long-lived bench.
+	reg.Register(uid("CORE-022"), Suite, coreResponses(nonce),
 		certify.WithRequires(needGridSim...), certify.WithOrder(101))
-	reg.Register(uid("CORE-023"), Suite, coreSuperseding,
+	reg.Register(uid("CORE-023"), Suite, coreSuperseding(nonce),
 		certify.WithRequires(needGridSim...), certify.WithOrder(102))
 
 	// ── Aggregator profile (order 200–299) ───────────────────────────────
@@ -439,6 +443,32 @@ func runNonce() string {
 		return hex.EncodeToString(b[:])
 	}
 	return strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+// withRunNonce appends the per-run token to a bare mRID, or returns it
+// unchanged when nonce is empty (an empty nonce is the identity — see
+// runNonce's callers). It is the one-mRID building block eventScenario.withNonce
+// uses per field; CORE-022 and CORE-023 (core.go's coreResponses and
+// coreSuperseding) call it directly since each mints one or two bare mRIDs
+// rather than a whole scenario struct.
+//
+// The reason CORE-022/023 need this at all is the same one BASIC-017..026's
+// eventScenario.withNonce documents: lexa-gw's Response tracker dedupes
+// Received(1) — and the rest of the lifecycle — on the bare mRID string,
+// retained for the process's whole lifetime AND persisted to disk, so a
+// long-lived bench that re-runs either catalog uid against the SAME hardcoded
+// mRID never re-earns the Responses those uids' own assertions grade. Per-mRID
+// duplicate suppression is a defensible 2030.5 posture — it is what a real ATL
+// run's genuinely fresh events would sidestep too, not a defect a conformance
+// harness should paper over — so presenting a fresh mRID each run is what
+// re-running this suite honestly requires. The separate, still-open product
+// question of whether a same-mRID event with a bumped version should re-earn
+// responses is tracked independently of this harness fix.
+func withRunNonce(mrid, nonce string) string {
+	if nonce == "" {
+		return mrid
+	}
+	return mrid + "-" + nonce
 }
 
 // inapplicableUIDs are the CSIP-CONF-v1.3 rows bound to the notApplicable STUB.

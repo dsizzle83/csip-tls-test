@@ -655,9 +655,38 @@ func coreRandomizedEvents(ctx context.Context, rc *certify.RunCtx) (certify.Resu
 }
 
 // coreResponses implements CORE-022 — Responses.
-func coreResponses(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	const mrid = "CERT-CORE022"
-	return run(ctx, rc, spec{
+//
+// mrid carries the per-run nonce (withRunNonce, register.go) for the same
+// reason BASIC-017..026's event-precedence scenarios do (see
+// eventScenario.withNonce and withRunNonce's doc): lexa-gw's Response tracker
+// dedupes Received(1) — and the rest of the lifecycle — on the bare mRID
+// string, retained for the process's whole lifetime AND persisted to disk. A
+// long-lived bench that re-runs CORE-022 against the SAME hardcoded
+// "CERT-CORE022" therefore never re-earns a status=1 Response, so
+// critResponsePosted (assertion 1) FAILs on every run after the first
+// regardless of what the DUT does today — not because the DUT stopped
+// answering, but because it already answered once, under this exact mRID,
+// and correctly declines to answer twice. Per-mRID duplicate suppression is a
+// defensible 2030.5 posture, and a genuinely fresh event is what a real ATL
+// run would present too, so a re-runnable conformance harness must do the
+// same rather than let a stale artifact of its own bench manufacture a FAIL.
+// This is not masking a defect: the separate, still-open product question —
+// should a same-mRID event carrying a bumped version re-earn responses? — is
+// tracked independently and is untouched by this change.
+func coreResponses(nonce string) certify.Check {
+	s := coreResponsesSpec(nonce)
+	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
+		return run(ctx, rc, s)
+	}
+}
+
+// coreResponsesSpec builds CORE-022's spec for a given per-run nonce. It is
+// factored out of coreResponses so a test can drive its Setup/Want directly
+// against a fake gridsim (see nonce_test.go) without booting the whole check,
+// which needs a live capture window run() cannot fake.
+func coreResponsesSpec(nonce string) spec {
+	mrid := withRunNonce("CERT-CORE022", nonce)
+	return spec{
 		RequiresGridSim: true,
 		Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
 			id, err := d.PostControl(ctx, ControlRequest{
@@ -677,7 +706,10 @@ func coreResponses(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 			// len(v.ResponsesFor(mrid))>0) so a Response left over from an
 			// EARLIER run against this same mRID — the shape of a focused
 			// single-case re-run — cannot satisfy this before the DUT has
-			// even seen the control THIS run just posted.
+			// even seen the control THIS run just posted. Belt-and-braces
+			// with the nonce above: WantNewResponse guards the HARNESS's
+			// read of a stale Response, the nonce guards the DUT ever
+			// having one to read in the first place.
 			return base.WantNewResponse(mrid)
 		},
 		Cleanup: func(ctx context.Context, d *Driver) { _ = d.ClearControls(ctx, 0) },
@@ -754,7 +786,7 @@ func coreResponses(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 				},
 			}
 		},
-	})
+	}
 }
 
 // coreSupersedingWant builds CORE-023's live-phase wait predicate: a
@@ -790,9 +822,37 @@ func coreSupersedingWant(winner, loser string) func(base ServerView) func(Server
 }
 
 // coreSuperseding implements CORE-023 — Superseding Events.
-func coreSuperseding(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	const winner, loser = "CERT-CORE023-WIN", "CERT-CORE023-LOSE"
-	return run(ctx, rc, spec{
+//
+// winner and loser carry the per-run nonce (withRunNonce, register.go) for
+// the same reason coreResponses' mrid does (see its doc): lexa-gw's Response
+// tracker dedupes Received(1) — and the rest of the lifecycle — on the bare
+// mRID string, retained for the process's whole lifetime AND persisted to
+// disk. A long-lived bench that re-runs CORE-023 against the SAME hardcoded
+// "CERT-CORE023-WIN"/"CERT-CORE023-LOSE" pair never re-earns fresh Responses
+// for either one, so assertions 1/2 (critResponsePosted/critResponseStarted,
+// both graded against the winner) FAIL on every run after the first
+// regardless of DUT behavior today. Per-mRID duplicate suppression is a
+// defensible 2030.5 posture — a real ATL run's genuinely fresh events would
+// sidestep it too — so a re-runnable harness must present fresh mRIDs each
+// run rather than let its own bench manufacture a FAIL. This does not mask a
+// defect: the separate, still-open product question of whether a same-mRID
+// event with a bumped version should re-earn responses is tracked
+// independently.
+func coreSuperseding(nonce string) certify.Check {
+	s := coreSupersedingSpec(nonce)
+	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
+		return run(ctx, rc, s)
+	}
+}
+
+// coreSupersedingSpec builds CORE-023's spec for a given per-run nonce. Like
+// coreResponsesSpec, it is factored out of coreSuperseding so a test can drive
+// Setup/Want directly against a fake gridsim (see nonce_test.go) without
+// booting the whole check.
+func coreSupersedingSpec(nonce string) spec {
+	winner := withRunNonce("CERT-CORE023-WIN", nonce)
+	loser := withRunNonce("CERT-CORE023-LOSE", nonce)
+	return spec{
 		RequiresGridSim: true,
 		Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
 			// Two controls with the SAME interval on programs of different
@@ -886,7 +946,7 @@ func coreSuperseding(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 				},
 			}
 		},
-	})
+	}
 }
 
 func ptr[T any](v T) *T { return &v }
