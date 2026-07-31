@@ -438,6 +438,106 @@ func TestServerView_WantNewResponse(t *testing.T) {
 	}
 }
 
+// TestServerView_WantResponseAtLeast pins WantResponseAtLeast's contract: the
+// fix for CORE-022's false-early-exit bug (audit 2026-07-31,
+// runs/final-core022-20260731T232047 — see coreResponsesSpec's Want doc). A
+// bare WantNewResponse is satisfied by the FIRST new Response regardless of
+// status; WantResponseAtLeast must additionally require that status, and must
+// keep WantNewResponse's own staleness guard (only entries beyond the
+// baseline COUNT are ever inspected).
+func TestServerView_WantResponseAtLeast(t *testing.T) {
+	const mrid = "CERT-CORE022"
+
+	// A status=1-only new Response must not satisfy a min=2 predicate.
+	want := ServerView{}.WantResponseAtLeast(mrid, 2)
+	if want(ServerView{Responses: []AdminResponse{{Subject: mrid, Status: 1}}}) {
+		t.Error("a status=1 Response satisfied a min=2 predicate")
+	}
+
+	// A status=2 new Response satisfies it.
+	if !want(ServerView{Responses: []AdminResponse{{Subject: mrid, Status: 2}}}) {
+		t.Error("a status=2 Response did not satisfy a min=2 predicate")
+	}
+
+	// A higher status also satisfies it (the predicate is a floor, not an
+	// exact match) — e.g. a DUT that jumps straight to status=3 (Completed).
+	if !want(ServerView{Responses: []AdminResponse{{Subject: mrid, Status: 3}}}) {
+		t.Error("a status=3 Response did not satisfy a min=2 predicate")
+	}
+
+	// Staleness: a status=2 Response already present at baseline time must
+	// not satisfy a predicate built from that same baseline — mirrors
+	// WantNewResponse's own guard (TestServerView_WantNewResponse above).
+	base := ServerView{Responses: []AdminResponse{{Subject: mrid, Status: 2}}}
+	staleWant := base.WantResponseAtLeast(mrid, 2)
+	if staleWant(base) {
+		t.Error("a Response already present at baseline time satisfied WantResponseAtLeast on its own")
+	}
+	// ...but a genuinely NEW status>=2 Response beyond that same baseline does.
+	later := ServerView{Responses: []AdminResponse{
+		{Subject: mrid, Status: 2},
+		{Subject: mrid, Status: 3},
+	}}
+	if !staleWant(later) {
+		t.Error("a fresh status>=2 Response beyond the baseline did not satisfy WantResponseAtLeast")
+	}
+
+	// A baseline that already holds a status=1 must still be satisfiable by a
+	// NEW status=2 that follows it — the min applies to the new entries, not
+	// to whether the mRID has ever reached that status at all.
+	base1 := ServerView{Responses: []AdminResponse{{Subject: mrid, Status: 1}}}
+	want2 := base1.WantResponseAtLeast(mrid, 2)
+	if !want2(ServerView{Responses: []AdminResponse{
+		{Subject: mrid, Status: 1},
+		{Subject: mrid, Status: 2},
+	}}) {
+		t.Error("a fresh status=2 Response after a baseline status=1 did not satisfy WantResponseAtLeast")
+	}
+}
+
+// TestControlRequest_ResponseRequiredOmittedWhenUnset pins the wire contract
+// audit 2026-07-31 needed proven end-to-end (run evidence
+// runs/final-core022-20260731T232047, mRID CERT-CORE022-038e3a26 carrying
+// responseRequired=00 on the wire): a ControlRequest that does not set
+// ResponseRequired must not put "response_required" on the wire AT ALL. If it
+// did, gridsim's adminCtrlPost (sim/gridsim/admin.go) would read an EXPLICIT
+// zero — "the scenario asked for silence" — rather than "no override", and
+// would honor it verbatim instead of falling back to its own 0x03 default
+// (adminDefaultResponseRequired). The pointer type + `json:",omitempty"` tag
+// on ResponseRequired is what makes "the caller didn't set this" and "the
+// caller asked for literal zero" distinguishable on the wire; this test
+// proves the marshaled bytes actually honor that, not just the struct's
+// declared shape.
+func TestControlRequest_ResponseRequiredOmittedWhenUnset(t *testing.T) {
+	unset, err := json.Marshal(ControlRequest{Program: 0, MRID: "M1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(unset, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := raw["response_required"]; present {
+		t.Errorf("ControlRequest with ResponseRequired unset marshaled with response_required present: %s", unset)
+	}
+
+	explicitZero, err := json.Marshal(ControlRequest{Program: 0, MRID: "M1", ResponseRequired: ptr(uint8(0))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(explicitZero, &raw); err != nil {
+		t.Fatal(err)
+	}
+	v, present := raw["response_required"]
+	if !present {
+		t.Fatalf("ControlRequest with an explicit ResponseRequired=0 must still carry response_required on the "+
+			"wire (present-and-zero means honor it verbatim, not gridsim's default): %s", explicitZero)
+	}
+	if v != float64(0) {
+		t.Errorf("response_required = %v, want 0", v)
+	}
+}
+
 // TestAggWant_IgnoresStaleResponseFromEarlierRun proves the fix at the
 // aggregator Want-builder level: a scenario whose baseline already holds a
 // Response for its first lifecycle's mRID (a focused re-run against a
@@ -495,13 +595,29 @@ func TestCoreSupersedingWant_WaitsForWinnerTooNotJustLoser(t *testing.T) {
 		t.Fatal("the predicate must not be satisfied while the loser has posted no Response of its own")
 	}
 
-	// Both mRIDs have earned a fresh Response beyond the baseline: satisfied.
-	both := ServerView{Responses: []AdminResponse{
+	// Both mRIDs have earned a fresh Response beyond the baseline, but the
+	// winner's is only status=1 (Received): must NOT satisfy (audit
+	// 2026-07-31 — coreSupersedingWant's winner half now needs status>=2,
+	// the same class of false-early-exit bug CORE-022's WantResponseAtLeast
+	// fix closes; see coreSupersedingWant's doc).
+	bothButWinnerNotStarted := ServerView{Responses: []AdminResponse{
 		{Subject: loser, Status: 7},
 		{Subject: winner, Status: 1},
 	}}
+	if p(bothButWinnerNotStarted) {
+		t.Error("the predicate was satisfied by the winner's status=1 (Received) alone — it must wait for the " +
+			"winner's status>=2 (Started) before the observation window is allowed to close")
+	}
+
+	// Both mRIDs have earned a fresh Response beyond the baseline, and the
+	// winner's reaches status=2 (Started): satisfied.
+	both := ServerView{Responses: []AdminResponse{
+		{Subject: loser, Status: 7},
+		{Subject: winner, Status: 2},
+	}}
 	if !p(both) {
-		t.Error("the predicate must be satisfied once BOTH winner and loser have a Response beyond the baseline")
+		t.Error("the predicate must be satisfied once the loser has a fresh Response and the winner has a fresh " +
+			"status>=2 Response, both beyond the baseline")
 	}
 
 	// Staleness guard at the composed level: a baseline that already carries
@@ -511,7 +627,7 @@ func TestCoreSupersedingWant_WaitsForWinnerTooNotJustLoser(t *testing.T) {
 	// "satisfied" against that same baseline.
 	staleBase := ServerView{Responses: []AdminResponse{
 		{Subject: loser, Status: 7},
-		{Subject: winner, Status: 1},
+		{Subject: winner, Status: 2},
 	}}
 	staleP := coreSupersedingWant(winner, loser)(staleBase)
 	if staleP(staleBase) {

@@ -700,17 +700,26 @@ func coreResponsesSpec(nonce string) spec {
 			return nil
 		},
 		Want: func(base ServerView) func(ServerView) bool {
-			// Wait for the DUT to acknowledge receipt, which is the first
-			// Response of the lifecycle and the one that proves the event
-			// reached it at all. WantNewResponse (not a bare
-			// len(v.ResponsesFor(mrid))>0) so a Response left over from an
-			// EARLIER run against this same mRID — the shape of a focused
-			// single-case re-run — cannot satisfy this before the DUT has
-			// even seen the control THIS run just posted. Belt-and-braces
-			// with the nonce above: WantNewResponse guards the HARNESS's
-			// read of a stale Response, the nonce guards the DUT ever
-			// having one to read in the first place.
-			return base.WantNewResponse(mrid)
+			// Wait for status>=2 (Event started), not merely a fresh
+			// Response — WantResponseAtLeast(mrid, 2), not WantNewResponse
+			// alone (audit 2026-07-31). A bare WantNewResponse is satisfied
+			// by the FIRST fresh Response, which is status=1 (Event
+			// received): a spec-compliant DUT may post that the moment it
+			// parses the event, independent of whether the event's own
+			// interval has started. Await would then close the observation
+			// window — and shortly after, the capture — on that first
+			// Response alone, with status=2 never given a chance to arrive:
+			// a focused re-run against a start_offset the DUT's poll cadence
+			// cannot beat ended in ~58s on exactly this shape, well short of
+			// the event even starting, so critResponseStarted (which grades
+			// status=2) had nothing to grade regardless of what the DUT
+			// would have done given the rest of its window. See
+			// WantResponseAtLeast's doc for the full argument. Belt-and-
+			// braces with the nonce above: the Want guards the HARNESS's
+			// read of stale Responses (both status=1 AND status=2 left over
+			// from an earlier run), the nonce guards the DUT ever having one
+			// to read in the first place.
+			return base.WantResponseAtLeast(mrid, 2)
 		},
 		Cleanup: func(ctx context.Context, d *Driver) { _ = d.ClearControls(ctx, 0) },
 		Notes: func(o *Observation) string {
@@ -793,7 +802,8 @@ func coreResponsesSpec(nonce string) spec {
 // genuinely NEW Response (WantNewResponse, so a stale one from an earlier run
 // against this same hardcoded mRID pair does not short-circuit it — see
 // WantNewResponse's doc, audit 2026-07-30) for BOTH winner and loser, not the
-// loser alone.
+// loser alone — and, for the winner specifically, a response whose status is
+// at least 2 (Started), not merely its first.
 //
 // Waiting on the loser alone was the bug (audit 2026-07-30/31,
 // runs/perphase-core023-v4-20260730T235854): gridsim resolves an overlapping
@@ -813,9 +823,18 @@ func coreResponsesSpec(nonce string) spec {
 // never pass them, no matter what the DUT does. Waiting for a fresh Response
 // on BOTH mRIDs gives the winner's own lifecycle at least one chance to reach
 // the wire before the check calls itself done.
+//
+// The winner half is further tightened to WantResponseAtLeast(winner, 2)
+// (audit 2026-07-31, same class of bug as coreResponsesSpec's CORE-022 fix —
+// see WantResponseAtLeast's doc): a bare WantNewResponse(winner) is satisfied
+// by the winner's own status=1 (Event received) alone, which a DUT may post
+// well before its interval starts, and critResponseStarted needs status=2 to
+// grade at all. The loser stays on WantNewResponse: its own criteria (status
+// 7/14, and the mutual-exclusion check) do not require status>=2, so holding
+// it to that bar would wait on a status the loser is never expected to reach.
 func coreSupersedingWant(winner, loser string) func(base ServerView) func(ServerView) bool {
 	return func(base ServerView) func(ServerView) bool {
-		wantWinner := base.WantNewResponse(winner)
+		wantWinner := base.WantResponseAtLeast(winner, 2)
 		wantLoser := base.WantNewResponse(loser)
 		return func(v ServerView) bool { return wantWinner(v) && wantLoser(v) }
 	}

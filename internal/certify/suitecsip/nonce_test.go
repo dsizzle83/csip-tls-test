@@ -29,6 +29,12 @@ package suitecsip
 //     live round trip through gridsim's admin API, not just string
 //     concatenation), and that Setup and Want agree on exactly the mRID(s)
 //     that construction posted, not the other one's.
+//  4. That both Wants (audit 2026-07-31) require status>=2 (Started) for the
+//     mRID(s) they grade the started/completed lifecycle for — CORE-022's
+//     mrid and CORE-023's winner — not merely a fresh Response of any status:
+//     a status=1 (Received)-only Response must NOT satisfy either. See
+//     WantResponseAtLeast's doc (observe.go) for the false-early-exit bug
+//     this closes.
 
 import (
 	"context"
@@ -128,17 +134,24 @@ func TestCoreResponsesSpec_TwoConstructionsPublishDistinctMRIDs(t *testing.T) {
 	}
 
 	// Want must be keyed on the mrid THIS construction just published, not the
-	// other one's: a fresh Response for construction 1's own mrid satisfies
-	// construction 1's Want...
+	// other one's, AND must wait for status>=2 (Started), not merely a fresh
+	// Response (audit 2026-07-31, runs/final-core022-20260731T232047 — see
+	// coreResponsesSpec's Want doc): a fresh status=1-only Response for
+	// construction 1's own mrid must NOT satisfy it on its own...
 	want1 := s1.Want(ServerView{})
-	if !want1(ServerView{Responses: []AdminResponse{{Subject: p1["mrid"], Status: 1}}}) {
-		t.Error("construction 1's Want was not satisfied by a fresh Response for construction 1's own mrid")
+	if want1(ServerView{Responses: []AdminResponse{{Subject: p1["mrid"], Status: 1}}}) {
+		t.Error("construction 1's Want was satisfied by a status=1 (Received)-only Response — it must wait for " +
+			"status>=2 (Started) before the observation window is allowed to close")
 	}
-	// ...but a Response for the OTHER construction's mrid must not satisfy it —
-	// if it did, Setup and Want would have silently drifted onto different
-	// mRIDs, which is exactly the class of bug a single shared local variable
-	// (see coreResponsesSpec) exists to make impossible.
-	if want1(ServerView{Responses: []AdminResponse{{Subject: p2["mrid"], Status: 1}}}) {
+	// ...but a status=2 (Started) Response for the same mrid does.
+	if !want1(ServerView{Responses: []AdminResponse{{Subject: p1["mrid"], Status: 2}}}) {
+		t.Error("construction 1's Want was not satisfied by a fresh status=2 Response for construction 1's own mrid")
+	}
+	// A Response for the OTHER construction's mrid — even status=2 — must not
+	// satisfy it either: if it did, Setup and Want would have silently drifted
+	// onto different mRIDs, which is exactly the class of bug a single shared
+	// local variable (see coreResponsesSpec) exists to make impossible.
+	if want1(ServerView{Responses: []AdminResponse{{Subject: p2["mrid"], Status: 2}}}) {
 		t.Error("construction 1's Want was satisfied by a Response for construction 2's mrid — Setup and Want " +
 			"must agree on exactly one mrid per construction")
 	}
@@ -187,16 +200,27 @@ func TestCoreSupersedingSpec_TwoConstructionsPublishDistinctPairs(t *testing.T) 
 	// Want must be keyed on THIS construction's own winner/loser pair, not the
 	// other construction's — the same drift guard as coreResponsesSpec above,
 	// exercised through coreSupersedingWant's composed (winner AND loser)
-	// predicate.
+	// predicate. The winner half also needs status>=2 (Started), not merely a
+	// fresh Response (audit 2026-07-31, same class of bug as CORE-022's fix —
+	// see coreSupersedingWant's doc); the loser stays satisfied by any fresh
+	// Response, per its own criteria (status 7/14, never status>=2).
 	want1 := s1.Want(ServerView{})
-	own := ServerView{Responses: []AdminResponse{
+	winnerStatus1Only := ServerView{Responses: []AdminResponse{
 		{Subject: p1["winner"], Status: 1}, {Subject: p1["loser"], Status: 7},
 	}}
+	if want1(winnerStatus1Only) {
+		t.Error("construction 1's Want was satisfied by the winner's status=1 (Received) alone — it must wait " +
+			"for the winner's status>=2 (Started) before the observation window is allowed to close")
+	}
+	own := ServerView{Responses: []AdminResponse{
+		{Subject: p1["winner"], Status: 2}, {Subject: p1["loser"], Status: 7},
+	}}
 	if !want1(own) {
-		t.Error("construction 1's Want was not satisfied by fresh Responses for construction 1's own winner/loser")
+		t.Error("construction 1's Want was not satisfied by a fresh status=2 winner Response and a fresh loser " +
+			"Response, both for construction 1's own pair")
 	}
 	crossed := ServerView{Responses: []AdminResponse{
-		{Subject: p2["winner"], Status: 1}, {Subject: p2["loser"], Status: 7},
+		{Subject: p2["winner"], Status: 2}, {Subject: p2["loser"], Status: 7},
 	}}
 	if want1(crossed) {
 		t.Error("construction 1's Want was satisfied by construction 2's winner/loser pair — Setup and Want " +

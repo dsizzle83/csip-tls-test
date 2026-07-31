@@ -395,6 +395,42 @@ func (v ServerView) WantNewResponse(mrid string) func(ServerView) bool {
 	return func(later ServerView) bool { return len(later.ResponsesFor(mrid)) > baseline }
 }
 
+// WantResponseAtLeast builds an Await predicate satisfied only by a NEW
+// Response for mrid (posted after v, the baseline — same staleness guard as
+// WantNewResponse, and for the same reason: only entries beyond the baseline
+// COUNT are ever inspected, never the whole history) whose status is at least
+// min.
+//
+// This is the fix for CORE-022's false-early-exit bug (audit 2026-07-31,
+// runs/final-core022-20260731T232047, mRID CERT-CORE022-038e3a26):
+// coreResponsesSpec's Want used to be base.WantNewResponse(mrid) alone, which
+// is satisfied by the FIRST fresh Response for the mRID — status=1 (Event
+// received), which a DUT may legitimately post the moment it parses the
+// event, independent of whether the event's own interval has started yet.
+// That closed the observation window (and, shortly after, the capture) before
+// the DUT had any chance to reach the event's start time and report status=2
+// (Event started) — the exact half of the lifecycle critResponseStarted
+// (criteria_2030.go) grades. A DUT that would have posted status=2 a few
+// polls later got no chance to: the run's own capture window was already
+// gone. Requiring status>=2 among the NEW Responses gives the DUT that
+// chance; a status=1-only Response is a real observation but not, on its
+// own, enough to call the wait done.
+func (v ServerView) WantResponseAtLeast(mrid string, min uint8) func(ServerView) bool {
+	baseline := len(v.ResponsesFor(mrid))
+	return func(later ServerView) bool {
+		got := later.ResponsesFor(mrid)
+		if len(got) <= baseline {
+			return false
+		}
+		for _, r := range got[baseline:] {
+			if r.Status >= min {
+				return true
+			}
+		}
+		return false
+	}
+}
+
 // HasResponse reports whether a Response with the given subject and status was
 // received.
 func (v ServerView) HasResponse(mrid string, status uint8) bool {

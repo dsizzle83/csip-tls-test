@@ -150,6 +150,14 @@ func TestAdminControl_ResponseRequiredDefaultsOn(t *testing.T) {
 // A scenario proving the DUT correctly WITHHOLDS a Response when none was
 // requested needs a lever to ask gridsim for exactly that — response_required:0
 // overrides the default.
+//
+// This is also the gridsim-side half of the audit 2026-07-31 wire-format
+// regression lock (run evidence runs/final-core022-20260731T232047, mRID
+// CERT-CORE022-038e3a26 carrying responseRequired=00 on the wire): an
+// explicit override must reach the actual served XML as "00", not merely the
+// in-memory model.DERControl, and an ABSENT override (TestAdminControl_
+// ResponseRequiredDefaultsOn, above) must reach it as "03" — the two must be
+// distinguishable end-to-end, not just at the adminCtrlReq struct boundary.
 func TestAdminControl_ResponseRequiredOverride(t *testing.T) {
 	s := NewServer("")
 	h := s.AdminHandler()
@@ -166,6 +174,18 @@ func TestAdminControl_ResponseRequiredOverride(t *testing.T) {
 	}
 	if got := uint8(*ctrl.ResponseRequired); got != 0 {
 		t.Errorf("ResponseRequired = %#02x, want 0x00 (override honored)", got)
+	}
+
+	// It must also reach the wire as an explicit "00", not be silently
+	// dropped (which would read, to a client, as "absent" — a different
+	// wire meaning per the hexBinary8/RespondableResource semantics: absent
+	// is "no server instruction", present-and-zero is "explicitly no
+	// response wanted").
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/derp/0/derc", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `responseRequired="00"`) {
+		t.Errorf("served /derp/0/derc XML has no responseRequired=\"00\" attribute:\n%s", body)
 	}
 }
 
