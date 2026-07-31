@@ -463,6 +463,62 @@ func TestAggWant_IgnoresStaleResponseFromEarlierRun(t *testing.T) {
 	}
 }
 
+// TestCoreSupersedingWant_WaitsForWinnerTooNotJustLoser is the regression lock
+// for runs/perphase-core023-v4-20260730T235854: coreSuperseding's Want used to
+// be base.WantNewResponse(loser) alone. gridsim resolves the loser to
+// Superseded(7) at arbitration time — the first walk after Setup — regardless
+// of either control's own StartOffset, so a loser-only predicate is satisfied
+// (and, with it, the live phase and shortly after the capture window end)
+// long before the winner's own interval has run its course. CORE-023's own
+// assertions 1/2 (critResponsePosted / critResponseStarted) grade the WINNER,
+// so a window that closes on the loser's Response alone can never contain the
+// evidence those assertions need, independent of what the DUT actually does.
+func TestCoreSupersedingWant_WaitsForWinnerTooNotJustLoser(t *testing.T) {
+	const winner, loser = "CERT-CORE023-WIN", "CERT-CORE023-LOSE"
+	base := ServerView{}
+	p := coreSupersedingWant(winner, loser)(base)
+
+	// The old bug's exact shape: the loser earns its Superseded(7) — gridsim's
+	// arbitration-time resolution — but the winner has posted nothing at all
+	// yet. The old predicate (loser alone) would already report satisfied here.
+	loserOnly := ServerView{Responses: []AdminResponse{{Subject: loser, Status: 7}}}
+	if p(loserOnly) {
+		t.Fatal("the predicate must not be satisfied while the winner has posted no Response of its own — " +
+			"this is exactly the shape that let runs/perphase-core023-v4-20260730T235854's capture close " +
+			"before the winner had any chance to be on the wire")
+	}
+
+	// Symmetric sanity: the winner alone, loser still silent, must not
+	// satisfy it either — CORE-023 grades a superseding PAIR.
+	winnerOnly := ServerView{Responses: []AdminResponse{{Subject: winner, Status: 1}}}
+	if p(winnerOnly) {
+		t.Fatal("the predicate must not be satisfied while the loser has posted no Response of its own")
+	}
+
+	// Both mRIDs have earned a fresh Response beyond the baseline: satisfied.
+	both := ServerView{Responses: []AdminResponse{
+		{Subject: loser, Status: 7},
+		{Subject: winner, Status: 1},
+	}}
+	if !p(both) {
+		t.Error("the predicate must be satisfied once BOTH winner and loser have a Response beyond the baseline")
+	}
+
+	// Staleness guard at the composed level: a baseline that already carries
+	// Responses for BOTH mRIDs (a focused re-run against a gridsim process
+	// that already answered this exact pair earlier today — the hardcoded-mRID
+	// staleness class WantNewResponse itself guards against) must not read
+	// "satisfied" against that same baseline.
+	staleBase := ServerView{Responses: []AdminResponse{
+		{Subject: loser, Status: 7},
+		{Subject: winner, Status: 1},
+	}}
+	staleP := coreSupersedingWant(winner, loser)(staleBase)
+	if staleP(staleBase) {
+		t.Error("Responses already present at baseline time must not satisfy the predicate on their own")
+	}
+}
+
 // TestBasicMUPWant_WaitsForReadingTypeNotJustAPoll is the regression lock for
 // runs/perphase-basic029-v4-20260730T232105: BASIC-029 had no Want of its
 // own, so it fell back to AwaitWalk — satisfied by the DUT's very next /dcap

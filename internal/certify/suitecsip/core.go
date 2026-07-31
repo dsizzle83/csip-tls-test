@@ -757,6 +757,38 @@ func coreResponses(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 	})
 }
 
+// coreSupersedingWant builds CORE-023's live-phase wait predicate: a
+// genuinely NEW Response (WantNewResponse, so a stale one from an earlier run
+// against this same hardcoded mRID pair does not short-circuit it — see
+// WantNewResponse's doc, audit 2026-07-30) for BOTH winner and loser, not the
+// loser alone.
+//
+// Waiting on the loser alone was the bug (audit 2026-07-30/31,
+// runs/perphase-core023-v4-20260730T235854): gridsim resolves an overlapping
+// pair's loser to Superseded(7) at ARBITRATION time, which happens the first
+// walk after Setup and is independent of either control's own StartOffset —
+// so the loser typically earns its Response within one poll cycle. The
+// winner's own interval (StartOffset 30s, DurationS 120s here) does not even
+// END until Setup+150s. A Want keyed on the loser alone therefore reports
+// satisfied, and with it ends the live phase — and the capture shortly after
+// — while the winner has posted nothing at all: the cited run's capture
+// closed 61s after Setup, but the winner's own end-of-event Response (a
+// NoParticipation(10), per gridsim's admin log and the DUT's own journal)
+// did not land until roughly two minutes later, entirely outside the window
+// that run ever captured. CORE-023's own assertions 1/2 grade the WINNER
+// (critResponsePosted(1, ..., winner), critResponseStarted(winner)) — a
+// window that structurally cannot contain the winner's Response traffic can
+// never pass them, no matter what the DUT does. Waiting for a fresh Response
+// on BOTH mRIDs gives the winner's own lifecycle at least one chance to reach
+// the wire before the check calls itself done.
+func coreSupersedingWant(winner, loser string) func(base ServerView) func(ServerView) bool {
+	return func(base ServerView) func(ServerView) bool {
+		wantWinner := base.WantNewResponse(winner)
+		wantLoser := base.WantNewResponse(loser)
+		return func(v ServerView) bool { return wantWinner(v) && wantLoser(v) }
+	}
+}
+
 // coreSuperseding implements CORE-023 — Superseding Events.
 func coreSuperseding(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	const winner, loser = "CERT-CORE023-WIN", "CERT-CORE023-LOSE"
@@ -784,14 +816,7 @@ func coreSuperseding(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 			params["winner"], params["loser"] = winner, loser
 			return nil
 		},
-		Want: func(base ServerView) func(ServerView) bool {
-			// See coreResponses' identical comment above (audit 2026-07-30,
-			// runs/perphase-core023-v3-20260730T223829): a bare
-			// len(v.ResponsesFor(loser))>0 is satisfied instantly by a
-			// status=7 this same hardcoded mRID already earned in an
-			// EARLIER run against this gridsim process.
-			return base.WantNewResponse(loser)
-		},
+		Want: coreSupersedingWant(winner, loser),
 		Cleanup: func(ctx context.Context, d *Driver) {
 			_ = d.ClearControls(ctx, 0)
 			_ = d.ClearControls(ctx, 2)
