@@ -390,11 +390,28 @@ func critDERControlCarriesMode(mode, claim string) criterion {
 	}
 }
 
-// critResponsePosted asserts a DERControlResponse the DUT POSTed.
+// critResponsePosted asserts a DERControlResponse the DUT POSTed for mridKey
+// SPECIFICALLY.
 //
 // Tier 2 reads the POST body out of the transcript; tier 3 falls back to
 // gridsim's own record of the Responses it received. The two are ranked, never
 // merged: the server's record is a real observation but it is not the wire.
+//
+// Both evaluators filter on <subject>==mridKey (audit 2026-08-01, CORE-022's
+// two-phase Responses fix): before this they matched the FIRST Response of
+// the right status found — of ANY subject. That was silently correct as long
+// as at most one control's Response traffic was ever in flight at once, which
+// every existing caller (coreResponses' single control, CORE-023's own
+// winner/loser pair sharing one status vocabulary until they diverge, the
+// BASIC-017..026 precedence scenarios) happened to satisfy well enough that
+// the misattribution never flipped a verdict. CORE-022 now runs a SECOND,
+// concurrently-live control alongside the one under test (a server-cancel
+// target — see coreResponsesSpec), and that control earns its own status=1
+// and very likely its own status=2 too, well before its cancellation. Without
+// this filter, a criterion built for mridA's status=1 could cite — and PASS
+// on — mridB's Response instead: a real verdict resting on the wrong
+// control's evidence, exactly the kind of misattribution this suite's
+// citation discipline exists to rule out.
 func critResponsePosted(status uint8, meaning string, mridKey string) criterion {
 	claim := fmt.Sprintf("the DUT POSTed a DERControlResponse with status=%d (%s) for the control under test",
 		status, meaning)
@@ -413,8 +430,11 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 				if err != nil || !strings.HasSuffix(doc.Local(), "Response") {
 					continue
 				}
-				st, _ := doc.UintOf("status")
 				subj, _ := doc.TextOf("subject")
+				if subj != mridKey {
+					continue
+				}
+				st, _ := doc.UintOf("status")
 				seen = append(seen, fmt.Sprintf("%s/status=%d", subj, st))
 				if uint64(status) != st {
 					continue
@@ -424,22 +444,23 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 					e.Req.Target, doc.Local(), subj, st, e.Resp.Line())
 			}
 			if len(seen) == 0 {
-				return unavailable("the recovered transcript holds no Response POST from the DUT")
+				return unavailable("the recovered transcript holds no Response POST for subject %s", mridKey)
 			}
 			return found(certify.Fail, allFrames(t.Method("POST")),
-				"the DUT POSTed %d Response(s) but none with status=%d: %s",
-				len(seen), status, strings.Join(seen, ", "))
+				"the DUT POSTed %d Response(s) for subject %s but none with status=%d: %s",
+				len(seen), mridKey, status, strings.Join(seen, ", "))
 		},
 		Server: func(v *ServerView) Finding {
-			if len(v.Responses) == 0 {
+			got := v.ResponsesFor(mridKey)
+			if len(got) == 0 {
 				if !v.SessionEstablished() {
 					return noSessionUnavailable()
 				}
 				return Finding{Verdict: certify.Fail,
-					Observed: "gridsim received no Response POST from the DUT in this window"}
+					Observed: fmt.Sprintf("gridsim received no Response POST for subject %s in this window", mridKey)}
 			}
 			var statuses []string
-			for _, r := range v.Responses {
+			for _, r := range got {
 				statuses = append(statuses, fmt.Sprintf("%s/status=%d", r.Subject, r.Status))
 				if r.Status == status {
 					return Finding{Verdict: certify.Pass,
@@ -448,8 +469,8 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 				}
 			}
 			return Finding{Verdict: certify.Fail,
-				Observed: fmt.Sprintf("gridsim received %d Response(s) but none with status=%d: %s",
-					len(v.Responses), status, strings.Join(statuses, ", "))}
+				Observed: fmt.Sprintf("gridsim received %d Response(s) for subject %s but none with status=%d: %s",
+					len(got), mridKey, status, strings.Join(statuses, ", "))}
 		},
 	}
 }

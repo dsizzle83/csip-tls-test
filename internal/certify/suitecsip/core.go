@@ -656,23 +656,38 @@ func coreRandomizedEvents(ctx context.Context, rc *certify.RunCtx) (certify.Resu
 
 // coreResponses implements CORE-022 — Responses.
 //
-// mrid carries the per-run nonce (withRunNonce, register.go) for the same
-// reason BASIC-017..026's event-precedence scenarios do (see
+// mrid and cancelMRID carry the per-run nonce (withRunNonce, register.go) for
+// the same reason BASIC-017..026's event-precedence scenarios do (see
 // eventScenario.withNonce and withRunNonce's doc): lexa-gw's Response tracker
 // dedupes Received(1) — and the rest of the lifecycle — on the bare mRID
 // string, retained for the process's whole lifetime AND persisted to disk. A
-// long-lived bench that re-runs CORE-022 against the SAME hardcoded
-// "CERT-CORE022" therefore never re-earns a status=1 Response, so
-// critResponsePosted (assertion 1) FAILs on every run after the first
-// regardless of what the DUT does today — not because the DUT stopped
-// answering, but because it already answered once, under this exact mRID,
-// and correctly declines to answer twice. Per-mRID duplicate suppression is a
-// defensible 2030.5 posture, and a genuinely fresh event is what a real ATL
-// run would present too, so a re-runnable conformance harness must do the
-// same rather than let a stale artifact of its own bench manufacture a FAIL.
-// This is not masking a defect: the separate, still-open product question —
-// should a same-mRID event carrying a bumped version re-earn responses? — is
-// tracked independently and is untouched by this change.
+// long-lived bench that re-runs CORE-022 against the SAME hardcoded mRID(s)
+// therefore never re-earns a status=1 Response, so critResponsePosted
+// (assertion 1) FAILs on every run after the first regardless of what the DUT
+// does today — not because the DUT stopped answering, but because it already
+// answered once, under this exact mRID, and correctly declines to answer
+// twice. Per-mRID duplicate suppression is a defensible 2030.5 posture, and a
+// genuinely fresh event is what a real ATL run would present too, so a
+// re-runnable conformance harness must do the same rather than let a stale
+// artifact of its own bench manufacture a FAIL. This is not masking a defect:
+// the separate, still-open product question — should a same-mRID event
+// carrying a bumped version re-earn responses? — is tracked independently and
+// is untouched by this change.
+//
+// # Two phases, one control each
+//
+// The catalog's own procedure (testdata/catalog/catalog.json, CORE-022 steps
+// 6-9) runs TWO DERControls concurrently and drives them to different ends:
+// one is cancelled server-side before it completes (expecting 1, 2, 6), the
+// other runs its full schedule (expecting 1, 2, 3). Before this fix the check
+// published only the completing control and never scripted a cancel at all,
+// so half of assertion 4's own claim — "...and 6 (cancelled) for an event the
+// server cancels" — was unobservable by construction: the case never gave the
+// DUT a cancelled event to answer. mrid is that completing control; cancelMRID
+// is the one this check cancels mid-flight (Change, below) — not the
+// catalog's full three-program/curve-based fixture (that is beyond what this
+// bench's admin API builds, and is not this fix's job; see the package doc's
+// note on partial-fixture rows).
 func coreResponses(nonce string) certify.Check {
 	s := coreResponsesSpec(nonce)
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
@@ -680,51 +695,152 @@ func coreResponses(nonce string) certify.Check {
 	}
 }
 
+// core022CompletionDurationS is the completing control's own event interval.
+//
+// Arithmetic (audit 2026-08-01, runs/final-core022b-20260731T234358 WARN):
+// gridsim advertises a 60s DERControlList pollRate (defaultControlListPollRate,
+// server.go), and that run saw the DUT POST both status=1 AND status=2 within
+// 1m9s of an immediate (StartOffset=0) control's Setup — one poll cycle plus
+// jitter. Observing status=3 (Completed) additionally needs the interval to
+// CLOSE and then survive one MORE poll cycle for the DUT to notice, so the
+// expected time-to-observe-status=3 is roughly
+// core022CompletionDurationS + one poll cycle (~60s) + latency. The floor
+// (90s) is one poll cycle (60s) plus margin for jitter, so the interval
+// cannot close before the DUT has even had its first chance to notice it
+// opened; the ceiling (150s) keeps the WORST case of that arithmetic
+// (150+60+latency ≈ 220s) plus the fixed post-Change settle a server-cancel
+// needs (ChangeWait: changeWaitFullCycle, i.e. a SECOND full -param
+// csip.wait — up to 480s at the campaign's own -param csip.wait=8m) inside a
+// 12-16m -timeout: 220s + 480s + setup/handshake/capture overhead (~30-40s)
+// ≈ 12.2min, which is why the focused re-run this fix is for uses -timeout
+// 16m rather than the previous 12m. 120s — this row's original,
+// pre-two-phase duration — sits in the middle of the [90,150] band.
+const core022CompletionDurationS = 120
+
+// core022CancelDurationS is the SECOND control's own event interval —
+// deliberately far longer than core022CompletionDurationS (and than the
+// largest wait budget this row's own docs recommend, -param csip.wait=8m =
+// 480s) so it is still genuinely mid-flight — not naturally elapsed — no
+// matter which poll cycle phase 1 (coreResponsesSpec's Want) actually
+// resolves on, including the pathological case where phase 1 never resolves
+// at all and times out at its full budget: Change fires unconditionally
+// either way (run(), check.go). Cancelling a control whose own interval has
+// already elapsed on its own does not exercise "the server cancels a LIVE
+// event" — it exercises nothing gridsim's admin API can tell apart from a
+// control that simply finished, which is why this margin matters.
+const core022CancelDurationS = 600
+
 // coreResponsesSpec builds CORE-022's spec for a given per-run nonce. It is
 // factored out of coreResponses so a test can drive its Setup/Want directly
 // against a fake gridsim (see nonce_test.go) without booting the whole check,
 // which needs a live capture window run() cannot fake.
 func coreResponsesSpec(nonce string) spec {
 	mrid := withRunNonce("CERT-CORE022", nonce)
+	cancelMRID := withRunNonce("CERT-CORE022-CANCEL", nonce)
 	return spec{
 		RequiresGridSim: true,
 		Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
 			id, err := d.PostControl(ctx, ControlRequest{
 				Program: 0, MRID: mrid, Description: "CORE-022 response control",
-				StartOffset: 0, DurationS: 120, MaxLimW: ptr(int64(4000)), Activate: true,
+				StartOffset: 0, DurationS: core022CompletionDurationS, MaxLimW: ptr(int64(4000)), Activate: true,
 			})
 			if err != nil {
 				return err
 			}
 			params["mrid"] = id
+
+			// The second control is posted HERE, not in Change, so it is
+			// already RECEIVED (and very likely Started) well before phase 2
+			// cancels it: gridsim's server-cancel seam is a two-step
+			// update-in-place on the SAME mRID (sim/gridsim/admin.go's
+			// adminCtrlReq doc, sim/gridsim/admin_ctrl_test.go's
+			// TestAdminControl_ExplicitMRIDUpdatesInPlace) — "the hub drops
+			// events that arrive already-cancelled" — so the first POST must
+			// land, and be picked up by the DUT, before the second one flips
+			// currentStatus. It runs on a DIFFERENT program (1, not 0) than
+			// the completing control, the same way CORE-023's winner/loser
+			// pair does (coreSupersedingSpec) — two controls Activate:true on
+			// the SAME program would each replace the other's active-list
+			// entry.
+			cancelID, err := d.PostControl(ctx, ControlRequest{
+				Program: 1, MRID: cancelMRID, Description: "CORE-022 cancellation control",
+				StartOffset: 0, DurationS: core022CancelDurationS, MaxLimW: ptr(int64(3000)), Activate: true,
+			})
+			if err != nil {
+				return err
+			}
+			params["cancelMrid"] = cancelID
 			return nil
 		},
 		Want: func(base ServerView) func(ServerView) bool {
-			// Wait for status>=2 (Event started), not merely a fresh
-			// Response — WantResponseAtLeast(mrid, 2), not WantNewResponse
-			// alone (audit 2026-07-31). A bare WantNewResponse is satisfied
-			// by the FIRST fresh Response, which is status=1 (Event
-			// received): a spec-compliant DUT may post that the moment it
-			// parses the event, independent of whether the event's own
-			// interval has started. Await would then close the observation
-			// window — and shortly after, the capture — on that first
-			// Response alone, with status=2 never given a chance to arrive:
-			// a focused re-run against a start_offset the DUT's poll cadence
-			// cannot beat ended in ~58s on exactly this shape, well short of
-			// the event even starting, so critResponseStarted (which grades
-			// status=2) had nothing to grade regardless of what the DUT
-			// would have done given the rest of its window. See
-			// WantResponseAtLeast's doc for the full argument. Belt-and-
-			// braces with the nonce above: the Want guards the HARNESS's
-			// read of stale Responses (both status=1 AND status=2 left over
-			// from an earlier run), the nonce guards the DUT ever having one
-			// to read in the first place.
-			return base.WantResponseAtLeast(mrid, 2)
+			// Phase 1 ONLY: wait for the completing control's status>=3
+			// (Completed) — extending the WantResponseAtLeast(mrid, 2) shape
+			// the 2026-07-31 audit fixed this row to (see the doc below and
+			// WantResponseAtLeast's own) one step further, so the observation
+			// window does not close until the FULL natural 1/2/3 lifecycle has
+			// had its chance, not merely 1-then-2 (which is exactly how this
+			// row landed as a WARN: runs/final-core022b-20260731T234358 saw
+			// [1 2] and closed before the interval even finished).
+			//
+			// The cancelled control is deliberately NOT part of this
+			// predicate: its lifecycle is driven by Change below, which fires
+			// only once run() (check.go) has finished waiting on THIS
+			// predicate. Gating phase 1 on both controls at once would let
+			// the two phases race each other — e.g. satisfied the instant the
+			// cancelled control (posted well before this point) earns its own
+			// status=2, with the completing control's status=3 still
+			// outstanding — instead of running strictly in sequence, which is
+			// what "cancel mid-flight, AFTER the completing control's own
+			// lifecycle has had its full window" requires.
+			//
+			// A bare WantNewResponse is satisfied by the FIRST fresh
+			// Response, which is status=1 (Event received): a spec-compliant
+			// DUT may post that the moment it parses the event, independent
+			// of whether the event's own interval has started, let alone
+			// finished. Await would then close the observation window on that
+			// first Response alone, with status=2/3 never given a chance to
+			// arrive. See WantResponseAtLeast's doc for the full argument.
+			// Belt-and-braces with the nonce above: the Want guards the
+			// HARNESS's read of stale Responses left over from an earlier
+			// run, the nonce guards the DUT ever having one to read in the
+			// first place.
+			return base.WantResponseAtLeast(mrid, 3)
 		},
-		Cleanup: func(ctx context.Context, d *Driver) { _ = d.ClearControls(ctx, 0) },
+		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
+			// Phase 2 trigger: the server-side cancel, mid-flight, of the
+			// second control — the same update-in-place idiom
+			// coreAdvancedEndDevice/coreDERSettings' RehomeDER Change uses,
+			// this time flipping EventStatus.currentStatus to 6 (Cancelled)
+			// on the SAME mRID rather than moving a resource's href (same
+			// gridsim seam, sim/gridsim/admin.go's adminCtrlReq doc). The
+			// control's own base fields are carried through unchanged so this
+			// really is "the same event, status updated" rather than a
+			// content change riding along with the cancel.
+			_, err := d.PostControl(ctx, ControlRequest{
+				Program: 1, MRID: cancelMRID, Description: "CORE-022 cancellation control",
+				StartOffset: 0, DurationS: core022CancelDurationS, MaxLimW: ptr(int64(3000)),
+				CurrentStatus: ptr(uint8(6)),
+			})
+			return err
+		},
+		// A second full poll cycle, not the short settle: like
+		// coreDERSettings' rehome Change, the DUT only learns of the
+		// cancellation on its NEXT discovery walk (gridsim's cancel is a
+		// server-side state flip, not a push the DUT is guaranteed to
+		// subscribe to), and a client honouring the advertised pollRate is
+		// entitled to take its whole interval to make it. See
+		// changeWaitFullCycle's doc.
+		ChangeWait: changeWaitFullCycle,
+		Cleanup: func(ctx context.Context, d *Driver) {
+			_ = d.ClearControls(ctx, 0)
+			_ = d.ClearControls(ctx, 1)
+		},
 		Notes: func(o *Observation) string {
-			return fmt.Sprintf("published an immediate DERControl (%s) and waited %s; statuses received: %v",
-				mrid, o.Waited.Round(rounding), o.Server.ResponseStatuses(mrid))
+			return fmt.Sprintf("published an immediate DERControl (%s) and waited %s for its natural 1/2/3 "+
+				"lifecycle; statuses received: %v. A second control (%s) was published alongside it on a "+
+				"different program and then CANCELLED server-side mid-flight; statuses received: %v",
+				mrid, o.Waited.Round(rounding), o.Server.ResponseStatuses(mrid),
+				cancelMRID, o.Server.ResponseStatuses(cancelMRID))
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
@@ -776,21 +892,59 @@ func coreResponsesSpec(nonce string) spec {
 				{
 					Claim: "the DUT reports the event lifecycle: statuses 1 (received), 2 (started) and " +
 						"3 (completed), and 6 (cancelled) for an event the server cancels",
-					How: "the set of Response statuses received for the control under test",
+					How: "the set of Response statuses received for a control this check lets run its full " +
+						"natural lifecycle, and separately for a second control this check cancels server-side " +
+						"mid-flight (audit 2026-08-01 — see coreResponsesSpec's doc)",
 					Server: func(v *ServerView) Finding {
-						got := v.ResponseStatuses(mrid)
-						if len(got) == 0 {
+						gotComplete := v.ResponseStatuses(mrid)
+						gotCancel := v.ResponseStatuses(cancelMRID)
+						if len(gotComplete) == 0 && len(gotCancel) == 0 {
 							if !v.SessionEstablished() {
 								return noSessionUnavailable()
 							}
 							return Finding{Verdict: certify.Fail,
-								Observed: "gridsim received no Response for the control this check published"}
+								Observed: "gridsim received no Response at all for either control this check published"}
 						}
+						has := func(got []int, want int) bool {
+							for _, s := range got {
+								if s == want {
+									return true
+								}
+							}
+							return false
+						}
+						var missing []string
+						if !has(gotComplete, 1) {
+							missing = append(missing, "1 (received) for the completing control")
+						}
+						if !has(gotComplete, 2) {
+							missing = append(missing, "2 (started) for the completing control")
+						}
+						if !has(gotComplete, 3) {
+							missing = append(missing, "3 (completed) for the completing control")
+						}
+						if !has(gotCancel, 6) {
+							missing = append(missing, "6 (cancelled) for the server-cancelled control")
+						}
+						observed := fmt.Sprintf("completing control %s: statuses %v; server-cancelled control "+
+							"%s: statuses %v", mrid, gotComplete, cancelMRID, gotCancel)
+						if len(missing) == 0 {
+							return Finding{Verdict: certify.Pass,
+								Observed: observed + " — the full 1/2/3/6 event lifecycle was observed"}
+						}
+						// Graceful degradation (never a false FAIL for a gap
+						// that is a WINDOW-TIMING fact, not necessarily a DUT
+						// fact): SessionEstablished is already known true here
+						// (at least one of the two controls got SOME
+						// Response), so a missing status is reported as
+						// exactly that — a gap this window did not capture —
+						// with the -param that would close it, not as
+						// certainty the DUT never would have sent it.
 						return Finding{Verdict: certify.Warn,
-							Observed: fmt.Sprintf("statuses %v were received within the check's window. The full "+
-								"1/2/3 lifecycle needs the window to span the event's whole 120 s interval and "+
-								"the 6 (cancelled) case needs a server-side cancel; raise -param %s to span it",
-								got, waitParam)}
+							Observed: fmt.Sprintf("%s; missing %s. Raise -param %s to give both phases their "+
+								"full room (the completing control's own %ds interval plus one more poll cycle, "+
+								"then a second full poll cycle after the server-side cancel)",
+								observed, strings.Join(missing, ", "), waitParam, core022CompletionDurationS)}
 					},
 				},
 			}

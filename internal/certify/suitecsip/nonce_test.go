@@ -40,6 +40,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"csip-tls-test/internal/certify"
@@ -106,6 +107,12 @@ func gridsimDriver(t *testing.T) *Driver {
 // really publish two different mRIDs to gridsim (not merely compute two
 // different strings nobody sends), and Setup/Want must agree on exactly the
 // one each construction used.
+//
+// Updated 2026-08-01 for the two-phase (completing + server-cancelled
+// control) fix: coreResponsesSpec now publishes TWO mRIDs per construction
+// (params["mrid"], params["cancelMrid"]), and phase 1's Want now waits for
+// status>=3 (Completed), not merely status>=2 (Started) — see
+// coreResponsesSpec's Want doc for why.
 func TestCoreResponsesSpec_TwoConstructionsPublishDistinctMRIDs(t *testing.T) {
 	d := gridsimDriver(t)
 	ctx := context.Background()
@@ -118,6 +125,13 @@ func TestCoreResponsesSpec_TwoConstructionsPublishDistinctMRIDs(t *testing.T) {
 	if p1["mrid"] != "CERT-CORE022-nonceaaa1" {
 		t.Fatalf("first construction published mrid %q, want %q", p1["mrid"], "CERT-CORE022-nonceaaa1")
 	}
+	if p1["cancelMrid"] != "CERT-CORE022-CANCEL-nonceaaa1" {
+		t.Fatalf("first construction published cancelMrid %q, want %q",
+			p1["cancelMrid"], "CERT-CORE022-CANCEL-nonceaaa1")
+	}
+	if p1["mrid"] == p1["cancelMrid"] {
+		t.Fatal("within one construction, the completing and cancelled controls must not share an mRID")
+	}
 
 	s2 := coreResponsesSpec("nonceaaa2")
 	p2 := map[string]string{}
@@ -127,33 +141,225 @@ func TestCoreResponsesSpec_TwoConstructionsPublishDistinctMRIDs(t *testing.T) {
 	if p2["mrid"] != "CERT-CORE022-nonceaaa2" {
 		t.Fatalf("second construction published mrid %q, want %q", p2["mrid"], "CERT-CORE022-nonceaaa2")
 	}
+	if p2["cancelMrid"] != "CERT-CORE022-CANCEL-nonceaaa2" {
+		t.Fatalf("second construction published cancelMrid %q, want %q",
+			p2["cancelMrid"], "CERT-CORE022-CANCEL-nonceaaa2")
+	}
 
 	if p1["mrid"] == p2["mrid"] {
 		t.Fatal("two consecutive coreResponsesSpec constructions published the SAME mrid — the whole point of " +
 			"the nonce is that they must not")
 	}
+	if p1["cancelMrid"] == p2["cancelMrid"] {
+		t.Fatal("two consecutive coreResponsesSpec constructions published the SAME cancelMrid — the whole " +
+			"point of the nonce is that they must not")
+	}
 
 	// Want must be keyed on the mrid THIS construction just published, not the
-	// other one's, AND must wait for status>=2 (Started), not merely a fresh
-	// Response (audit 2026-07-31, runs/final-core022-20260731T232047 — see
-	// coreResponsesSpec's Want doc): a fresh status=1-only Response for
-	// construction 1's own mrid must NOT satisfy it on its own...
+	// other one's, AND must wait for status>=3 (Completed) — the full natural
+	// 1/2/3 lifecycle, not merely status>=2 (Started) — audit 2026-08-01, see
+	// coreResponsesSpec's Want doc. Neither status=1 alone...
 	want1 := s1.Want(ServerView{})
 	if want1(ServerView{Responses: []AdminResponse{{Subject: p1["mrid"], Status: 1}}}) {
 		t.Error("construction 1's Want was satisfied by a status=1 (Received)-only Response — it must wait for " +
-			"status>=2 (Started) before the observation window is allowed to close")
+			"status>=3 (Completed) before the observation window is allowed to close")
 	}
-	// ...but a status=2 (Started) Response for the same mrid does.
-	if !want1(ServerView{Responses: []AdminResponse{{Subject: p1["mrid"], Status: 2}}}) {
-		t.Error("construction 1's Want was not satisfied by a fresh status=2 Response for construction 1's own mrid")
+	// ...nor status=2 alone (this is the exact regression the 2026-07-31 fix
+	// left behind: it closed the window on status=2, before the interval's
+	// own completion had any chance to be observed)...
+	if want1(ServerView{Responses: []AdminResponse{{Subject: p1["mrid"], Status: 2}}}) {
+		t.Error("construction 1's Want was satisfied by a status<=2 Response — it must wait for status>=3 " +
+			"(Completed) before the observation window is allowed to close")
 	}
-	// A Response for the OTHER construction's mrid — even status=2 — must not
+	// ...but a status=3 (Completed) Response for the same mrid does.
+	if !want1(ServerView{Responses: []AdminResponse{{Subject: p1["mrid"], Status: 3}}}) {
+		t.Error("construction 1's Want was not satisfied by a fresh status=3 Response for construction 1's own mrid")
+	}
+	// A Response for the OTHER construction's mrid — even status=3 — must not
 	// satisfy it either: if it did, Setup and Want would have silently drifted
 	// onto different mRIDs, which is exactly the class of bug a single shared
 	// local variable (see coreResponsesSpec) exists to make impossible.
-	if want1(ServerView{Responses: []AdminResponse{{Subject: p2["mrid"], Status: 2}}}) {
+	if want1(ServerView{Responses: []AdminResponse{{Subject: p2["mrid"], Status: 3}}}) {
 		t.Error("construction 1's Want was satisfied by a Response for construction 2's mrid — Setup and Want " +
 			"must agree on exactly one mrid per construction")
+	}
+	// A status=3 Response for construction 1's OWN cancelMrid must not satisfy
+	// phase 1 either: the cancelled control is driven by Change, which must
+	// not fire until phase 1 is done, so gating phase 1 on it too would let
+	// the two phases race (see the Want doc's "two phases race each other"
+	// paragraph).
+	if want1(ServerView{Responses: []AdminResponse{{Subject: p1["cancelMrid"], Status: 3}}}) {
+		t.Error("construction 1's Want was satisfied by a Response for its OWN cancelMrid — phase 1 must be " +
+			"gated on the completing control alone")
+	}
+}
+
+// TestCoreResponsesSpec_ChangeCancelsTheSecondControlInPlace drives Setup then
+// Change against a REAL in-process gridsim (not a fabricated ServerView) and
+// confirms Change performs the exact two-step update-in-place server-cancel
+// sim/gridsim/admin.go documents (see also
+// TestAdminControl_ExplicitMRIDUpdatesInPlace in
+// sim/gridsim/admin_ctrl_test.go, which pins the seam itself and — like this
+// test — reads it back through the SCHEDULED list, /derp/N/derc, not the
+// active-list mirror: an admin control POST that names an explicit mRID
+// upserts /derc unconditionally, but only mirrors into /actderc when that
+// mRID was ALREADY present there, so a brand-new admin-created control never
+// appears in the active-list mirror at all — a pre-existing gridsim quirk
+// this test works around rather than one this fix needs to touch. The DUT
+// itself is unaffected: it discovers and schedules events from
+// DERControlListLink (/derc), never from the active-list mirror): ONE
+// control, same mRID, whose EventStatus.currentStatus flips to 6 (Cancelled)
+// — not a second control added alongside the first, which would leave the
+// DUT one live (uncancelled) event plus one it never got a chance to receive
+// before it was already cancelled ("the hub drops events that arrive
+// already-cancelled" — admin.go's adminCtrlReq doc).
+func TestCoreResponsesSpec_ChangeCancelsTheSecondControlInPlace(t *testing.T) {
+	d := gridsimDriver(t)
+	ctx := context.Background()
+
+	s := coreResponsesSpec("cancelseam1")
+	params := map[string]string{}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if s.Change == nil {
+		t.Fatal("coreResponsesSpec no longer declares a Change hook")
+	}
+
+	// Before Change: the cancelled-to-be control is freshly posted and
+	// scheduled, not yet cancelled.
+	before := d.Snapshot(ctx)
+	prog := findProgram(t, before, 1)
+	ctrl := findControl(t, prog.Scheduled, params["cancelMrid"])
+	if ctrl.Status == 6 {
+		t.Fatalf("setup: the second control already reports status=6 before Change ran")
+	}
+
+	if err := s.Change(ctx, d, params); err != nil {
+		t.Fatalf("Change: %v", err)
+	}
+
+	after := d.Snapshot(ctx)
+	prog = findProgram(t, after, 1)
+
+	// Exactly one entry for cancelMrid — an in-place flip, not an added
+	// second control.
+	var matches int
+	for _, c := range prog.Scheduled {
+		if c.MRID == params["cancelMrid"] {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("after Change, program 1's scheduled list carries %d entries for %s, want exactly 1 (an "+
+			"in-place update, not an added control)", matches, params["cancelMrid"])
+	}
+	ctrl = findControl(t, prog.Scheduled, params["cancelMrid"])
+	if ctrl.Status != 6 {
+		t.Fatalf("after Change, the second control's currentStatus = %d, want 6 (Cancelled)", ctrl.Status)
+	}
+
+	// The FIRST (completing) control must be untouched by Change: it lives on
+	// a different program and Change only ever names cancelMrid.
+	progA := findProgram(t, after, 0)
+	ctrlA := findControl(t, progA.Scheduled, params["mrid"])
+	if ctrlA.Status == 6 {
+		t.Fatalf("Change cancelled the WRONG control: the completing control (%s, program 0) now reports "+
+			"status=6 too", params["mrid"])
+	}
+}
+
+func findProgram(t *testing.T, v ServerView, id int) AdminProgram {
+	t.Helper()
+	for _, p := range v.Status.Programs {
+		if p.ID == id {
+			return p
+		}
+	}
+	t.Fatalf("no program with id=%d in gridsim's admin status", id)
+	return AdminProgram{}
+}
+
+func findControl(t *testing.T, ctrls []AdminControl, mrid string) AdminControl {
+	t.Helper()
+	for _, c := range ctrls {
+		if c.MRID == mrid {
+			return c
+		}
+	}
+	t.Fatalf("no control with mrid=%s in the given list", mrid)
+	return AdminControl{}
+}
+
+// TestCoreResponsesSpec_CompositeLifecycleCriterion exercises assertion 4's
+// grading directly — the composite "1/2/3 for the completing control, 6 for
+// the server-cancelled one" claim this whole fix exists to make affirmatively
+// gradable (it could only ever WARN before: see the Server evaluator's
+// pre-fix version, which had no cancel phase and no way to observe 6 at all).
+// It must PASS once every phase landed, WARN naming the precise gap when only
+// some of it did, and FAIL only when NEITHER control earned any Response at
+// all (with a session established) — never a false FAIL for a partial
+// capture, which is a window-timing fact, not necessarily a DUT one.
+func TestCoreResponsesSpec_CompositeLifecycleCriterion(t *testing.T) {
+	s := coreResponsesSpec("gradingnonce")
+	mrid, cancelMrid := "CERT-CORE022-gradingnonce", "CERT-CORE022-CANCEL-gradingnonce"
+
+	find := func(o *Observation) criterion {
+		for _, c := range s.Criteria(o) {
+			if strings.Contains(c.Claim, "server cancels") {
+				return c
+			}
+		}
+		t.Fatal("coreResponsesSpec's Criteria no longer carries the event-lifecycle composite criterion")
+		return criterion{}
+	}
+
+	// Full lifecycle observed on both controls: PASS.
+	full := &ServerView{Available: true, Responses: []AdminResponse{
+		{Subject: mrid, Status: 1}, {Subject: mrid, Status: 2}, {Subject: mrid, Status: 3},
+		{Subject: cancelMrid, Status: 1}, {Subject: cancelMrid, Status: 2}, {Subject: cancelMrid, Status: 6},
+	}}
+	if f := find(&Observation{Server: *full}).Server(full); f.Verdict != certify.Pass {
+		t.Errorf("full 1/2/3 + 6 lifecycle = %s, want Pass: %s", f.Verdict, f.Observed)
+	}
+
+	// The cancelled control needs only 6 itself, not its own preceding 1/2 —
+	// the claim is "for an event the server cancels", and a DUT may cancel an
+	// event it never explicitly acknowledged Started for.
+	cancelOnlySix := &ServerView{Available: true, Responses: []AdminResponse{
+		{Subject: mrid, Status: 1}, {Subject: mrid, Status: 2}, {Subject: mrid, Status: 3},
+		{Subject: cancelMrid, Status: 6},
+	}}
+	if f := find(&Observation{Server: *cancelOnlySix}).Server(cancelOnlySix); f.Verdict != certify.Pass {
+		t.Errorf("cancelled control with only status=6 (no preceding 1/2) = %s, want Pass: %s", f.Verdict, f.Observed)
+	}
+
+	// Partial capture — exactly the pre-fix WARN shape (1, 2 only, no 3, no
+	// cancel phase reached at all) — must still WARN, precisely, never FAIL.
+	partial := &ServerView{Available: true, Responses: []AdminResponse{
+		{Subject: mrid, Status: 1}, {Subject: mrid, Status: 2},
+	}}
+	f := find(&Observation{Server: *partial}).Server(partial)
+	if f.Verdict != certify.Warn {
+		t.Fatalf("partial capture (1, 2 only) = %s, want Warn: %s", f.Verdict, f.Observed)
+	}
+	for _, want := range []string{"3 (completed)", "6 (cancelled)"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("Warn observed text %q does not name the missing %s", f.Observed, want)
+		}
+	}
+
+	// Total silence WITH a session established: a real FAIL, unchanged from
+	// before this fix.
+	silent := &ServerView{Available: true, Requests: []ServerRequest{{Method: "GET", Path: "/dcap"}}}
+	if f := find(&Observation{Server: *silent}).Server(silent); f.Verdict != certify.Fail {
+		t.Errorf("session established, zero Responses for either control = %s, want Fail: %s", f.Verdict, f.Observed)
+	}
+
+	// No session at all: unavailable, not a FAIL.
+	empty := &ServerView{Available: true}
+	if f := find(&Observation{Server: *empty}).Server(empty); f.Unavailable == "" {
+		t.Errorf("no session at all returned a verdict (%s) instead of unavailable", f.Verdict)
 	}
 }
 
