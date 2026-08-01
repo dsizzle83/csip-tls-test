@@ -583,8 +583,34 @@ func compressionVerdict(ch *tlsdis.ClientHello, who string) (certify.Verdict, st
 	return certify.Pass, obs
 }
 
+// proposesTLS12OrEarlier reports whether ch could still negotiate down to TLS
+// 1.2, which is the only case RFC 4492 §5.1.2's ec_point_formats requirement
+// actually governs: RFC 4492 is the TLS-<=1.2 ECDHE extensions RFC, and RFC
+// 8446 defines no role for ec_point_formats at all — a TLS 1.3 connection's
+// point format is implicitly uncompressed, unnegotiated. supported_versions
+// (RFC 8446 §4.2.1) is authoritative for what a ClientHello can still
+// negotiate; when it lists only 1.3, TLS 1.2 is off the table for this
+// handshake and the RFC 4492 requirement does not apply. Its total absence
+// means a pre-TLS-1.3 hello bounded by legacy_version, mirroring
+// ClientHello.MaxVersion's own honour-supported_versions-over-legacy rule.
+func proposesTLS12OrEarlier(ch *tlsdis.ClientHello) bool {
+	if len(ch.SupportedVersions) == 0 {
+		return ch.LegacyVersion <= tlsdis.VersionTLS12
+	}
+	for _, v := range ch.SupportedVersions {
+		if tlsdis.IsGREASE(v) {
+			continue
+		}
+		if v <= tlsdis.VersionTLS12 {
+			return true
+		}
+	}
+	return false
+}
+
 // supportedGroupsVerdict decides CRYP-004's "supported_groups contains
-// secp256r1 and ec_point_formats is present" criterion for a ClientHello.
+// secp256r1, plus ec_point_formats when the hello can still negotiate TLS
+// <=1.2" criterion for a ClientHello.
 func supportedGroupsVerdict(ch *tlsdis.ClientHello, who string) (certify.Verdict, string) {
 	if ch == nil {
 		return certify.Skip, "no " + who + " ClientHello was observed"
@@ -606,8 +632,10 @@ func supportedGroupsVerdict(ch *tlsdis.ClientHello, who string) (certify.Verdict
 		return certify.Fail, obs
 	case !hasP256:
 		return certify.Fail, obs + fmt.Sprintf(" — NamedCurve 0x%04X (secp256r1) is absent, and it is the only mandatory curve", groupSecp256r1)
-	case !hasPointFmt:
+	case !hasPointFmt && proposesTLS12OrEarlier(ch):
 		return certify.Fail, obs + " — RFC 4492 §5.1.2 requires the Supported Point Formats extension alongside the curve list"
+	case !hasPointFmt:
+		return certify.Pass, obs + " — ec_point_formats is absent, but supported_versions offers TLS 1.3 only (no TLS <=1.2 entry), where RFC 4492 §5.1.2 does not apply: RFC 8446 negotiates no point format at all (implicitly uncompressed), so this hello cannot trigger the requirement its absence would otherwise violate"
 	default:
 		return certify.Pass, obs
 	}
