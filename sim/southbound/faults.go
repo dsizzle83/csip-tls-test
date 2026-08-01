@@ -100,7 +100,11 @@ type faultController struct {
 	invertAddrs []uint16
 
 	// Advanced-DER (7xx) faults — advanced solar sim only. raiseAlarmBits is the
-	// model 701 Alrm bitfield the animation re-stamps each tick (0 = no alarm).
+	// model 701 Alrm bitfield the animation re-stamps each tick (0 = no alarm);
+	// a bit naming a grid-interface voltage/frequency condition also derates
+	// the 701 LNV/LLV/Hz points that back it (solar_adv.go's advCoupledVoltHz),
+	// so the alarm and the measurement it claims agree — this controller only
+	// ARMS the raw bits, the physical coupling is the mirror's job.
 	// curveAdoptLies makes the curve-adopt handshake report COMPLETED without
 	// updating the live curve. pfAckIgnore makes 704 PF/var writes ACK without
 	// moving measured PF/var. See raise_alarm / curve_adopt_lies / pf_ack_ignore.

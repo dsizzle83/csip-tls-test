@@ -102,6 +102,138 @@ func TestAdvRaiseAlarm(t *testing.T) {
 	}
 }
 
+// TestAdvRaiseAlarmCouplesVoltage pins advCoupledVoltHz's job: a raise_alarm
+// bit naming a grid-interface voltage condition must not be a bare flag —
+// the SAME 701 read has to carry a voltage that actually sits outside the
+// condition's threshold, on every voltage point (LNV, both other phases, and
+// all three line-to-line points, per advMirror701's balanced-three-phase
+// scaling), and clearing it must restore exactly the value the 103 model
+// underneath was reporting all along (never a value this fault remembers).
+func TestAdvRaiseAlarmCouplesVoltage(t *testing.T) {
+	ss := newAdvSolar(t, 5000)
+	r, b := ss.Regs, ss.bases
+	// Known 103 physical state: 241.0 V nominal (V_SF=-1), 60.00 Hz.
+	r.Set(b.M103Base+sunspec.M103_PhVphA, 2410)
+	r.Set(b.M103Base+sunspec.M103_PhVphB, 2410)
+	r.Set(b.M103Base+sunspec.M103_PhVphC, 2410)
+	vll := uint16(math.Round(2410 * math.Sqrt(3)))
+	r.Set(b.M103Base+sunspec.M103_PPVphAB, vll)
+	r.Set(b.M103Base+sunspec.M103_PPVphBC, vll)
+	r.Set(b.M103Base+sunspec.M103_PPVphCA, vll)
+	r.Set(b.M103Base+sunspec.M103_Hz, 6000)
+
+	const underVolt = uint32(1 << 11) // hub-mapped AC_UNDER_VOLT (logevent.go)
+	if err := ss.ApplyFault([]byte(`{"kind":"raise_alarm","bits":2048}`)); err != nil {
+		t.Fatalf("arm raise_alarm: %v", err)
+	}
+	ss.advSync()
+	m := sunspec.Parse701(readSlice(r, ss.adv.M701, ss.adv.M701Len))
+	if m.Alrm != underVolt {
+		t.Fatalf("Alrm = %#x, want %#x", m.Alrm, underVolt)
+	}
+	if m.Hz != 60.0 {
+		t.Errorf("Hz = %v, want 60.00 (frequency is untouched by a voltage-only alarm)", m.Hz)
+	}
+	const wantV = 205.0 // < 211.2 V (0.88 pu of 240 V nominal) — see advCoupledVoltHz
+	for name, got := range map[string]float64{
+		"LNV": m.LNV, "VL1": m.VL1, "VL2": m.VL2, "VL3": m.VL3,
+	} {
+		if !approx(got, wantV, 0.05) {
+			t.Errorf("%s = %v, want ~%v (under the CSIP UNDER_VOLTAGE threshold)", name, got, wantV)
+		}
+	}
+	wantLL := wantV * math.Sqrt(3)
+	for name, got := range map[string]float64{
+		"LLV": m.LLV, "VL1L2": m.VL1L2, "VL2L3": m.VL2L3, "VL3L1": m.VL3L1,
+	} {
+		if !approx(got, wantLL, 0.5) {
+			t.Errorf("%s = %v, want ~%v (sqrt(3) x the derated phase voltage, same relation Inject "+
+				"\"V_V\" applies)", name, got, wantLL)
+		}
+	}
+
+	if err := ss.ApplyFault([]byte(`{"kind":"raise_alarm","clear":true}`)); err != nil {
+		t.Fatalf("clear raise_alarm: %v", err)
+	}
+	ss.advSync()
+	m = sunspec.Parse701(readSlice(r, ss.adv.M701, ss.adv.M701Len))
+	if m.Alrm != 0 {
+		t.Errorf("Alrm after clear = %#x, want 0", m.Alrm)
+	}
+	if !approx(m.LNV, 241.0, 0.05) {
+		t.Errorf("LNV after clear = %v, want ~241.0 (the 103 model's own reading, not a value the "+
+			"fault remembered)", m.LNV)
+	}
+}
+
+// TestAdvRaiseAlarmCouplesFrequency is TestAdvRaiseAlarmCouplesVoltage's
+// frequency counterpart: OVER_FREQUENCY/UNDER_FREQUENCY must derate Hz and
+// leave voltage untouched, independently of the voltage bits.
+func TestAdvRaiseAlarmCouplesFrequency(t *testing.T) {
+	cases := []struct {
+		name   string
+		bits   string
+		alrm   uint32
+		wantHz float64
+	}{
+		{"under", `{"kind":"raise_alarm","bits":512}`, 1 << 9, 58.0}, // < 58.5 Hz
+		{"over", `{"kind":"raise_alarm","bits":256}`, 1 << 8, 61.5},  // > 61.2 Hz
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ss := newAdvSolar(t, 5000)
+			r, b := ss.Regs, ss.bases
+			r.Set(b.M103Base+sunspec.M103_PhVphA, 2400)
+			r.Set(b.M103Base+sunspec.M103_Hz, 6000)
+
+			if err := ss.ApplyFault([]byte(c.bits)); err != nil {
+				t.Fatalf("arm raise_alarm: %v", err)
+			}
+			ss.advSync()
+			m := sunspec.Parse701(readSlice(r, ss.adv.M701, ss.adv.M701Len))
+			if m.Alrm != c.alrm {
+				t.Fatalf("Alrm = %#x, want %#x", m.Alrm, c.alrm)
+			}
+			if !approx(m.Hz, c.wantHz, 0.05) {
+				t.Errorf("Hz = %v, want ~%v", m.Hz, c.wantHz)
+			}
+			if !approx(m.LNV, 240.0, 0.05) {
+				t.Errorf("LNV = %v, want ~240.0 (voltage is untouched by a frequency-only alarm)", m.LNV)
+			}
+		})
+	}
+}
+
+// TestAdvCoupledVoltHzNoFaultByteIdentical pins advCoupledVoltHz's no-op
+// contract directly: with no mapped bit armed — including a manual-shutdown
+// or any other UNmapped Alrm bit, which this function deliberately does not
+// couple to anything — it must return volt/hz exactly unchanged, so the
+// no-fault world (and every armed-but-unmapped-bit world) stays
+// byte-identical to the pre-coupling behaviour.
+func TestAdvCoupledVoltHzNoFaultByteIdentical(t *testing.T) {
+	const (
+		volt = 240.0
+		hz   = 60.0
+	)
+	cases := []struct {
+		name string
+		bits uint32
+	}{
+		{"no alarm", 0},
+		{"manual shutdown only (unmapped by this function)", 1 << 6},
+		{"ground fault only (unmapped)", 1 << 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotV, gotHz := advCoupledVoltHz(c.bits, volt, hz)
+			if gotV != volt || gotHz != hz {
+				t.Errorf("advCoupledVoltHz(%#x, %v, %v) = %v, %v, want unchanged",
+					c.bits, volt, hz, gotV, gotHz)
+			}
+		})
+	}
+}
+
 // stageAndAdopt encodes curve c into the 705 staging slot (index 1) then drives
 // the AdptCrvReq write through interceptAdopt, exactly as the hub's derbase
 // adopt does (write staging, request adopt).

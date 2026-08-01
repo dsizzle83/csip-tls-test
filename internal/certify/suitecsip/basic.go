@@ -386,12 +386,103 @@ func critScenarioControlsDelivered(sc eventScenario) criterion {
 	}
 }
 
+// alarmSimName is the simapi sidecar key for the CSIP leg's southbound DER
+// sim (cmd/certify's -modsim-api registration; see suitemodbusclient's
+// defaultDeviceName="inv-plain" for the same device on the Modbus suite's
+// side — the CSIP leg's posture is 1:1 DUT<->DER, so there is only ever this
+// one southbound sim to drive).
+const alarmSimName = "modsim"
+
+// alarmFaultBits is the model 701 Alrm bit this case arms: AC_UNDER_VOLT
+// (1<<11 = 0x800). It is lexa-gw's DIRECT, unambiguous mapping onto CSIP
+// Table 14 UNDER_VOLTAGE — lexa-hub/cmd/hub/logevent.go's alrm701ToTable14
+// maps alrm701ACUnderVolt straight to bus.LogEventDERUnderVoltage(4) as a
+// "grid-interface voltage" condition, the same footing as the three other
+// bits that repo maps directly (OverFrequency/UnderFrequency/ACOverVolt) —
+// unlike the DC-side/manufacturer/connection-state bits that repo
+// deliberately leaves UNmapped (no defensible CSIP Table 14 code) or the
+// EMERGENCY_LOCAL bit (a locally-initiated stop, a different character of
+// condition). This is the alarm the product's hub-side alarm-edge detector
+// (cmd/hub/logevent.go, watching bus.Measurement.AlarmBits — itself read
+// from THIS register, WP-2) genuinely reacts to.
+//
+// sim/southbound/solar_adv.go's advCoupledVoltHz backs the bit with an
+// actual under-threshold voltage reading (205 V, under the IEEE 1547-2018
+// Category III 0.88 pu / 211.2 V nominal trip point) on every 701 voltage
+// point, not a bare flag with a nominal reading underneath it — see that
+// function's doc for the full reasoning.
+const alarmFaultBits = 1 << 11
+
+// alarmArmedAtParam keys the param this case's Change hook leaves for
+// alarmNote/noAlarmReason, unprefixed like rehome.go's "rehome_at"
+// (CORE-009/CORE-014) rather than "csip."-prefixed like check.go's own
+// params, since it is this ROW's fact, not framework state. A failed Change
+// is already recorded under check.go's own changeFailed key — reused here
+// rather than duplicated.
+const alarmArmedAtParam = "alarm_armed_at"
+
 // basicAlarms implements BASIC-027 — Alarms (LogEvent).
+//
+// The catalog's printed procedure (steps 3-8) has the CLIENT under test
+// prepare and POST a LE_GEN_SOFTWARE general LogEvent (Table 34, functionSet
+// 0) five times and then GET the list with ?l=255 — a generic conformance
+// template for any CSIP client. lexa-gw's northbound LogEvent poster
+// (internal/northbound/logevent/logevent.go HandleLogEvent) does not do
+// that: it refuses anything outside FunctionSet 11 (DER) by construction, and
+// only ever POSTs a DER alarm/RTN pair the hub's alarm-edge detector minted
+// from a real southbound condition (see alarmFaultBits' doc). The three
+// criteria below were written against that real behaviour, not the generic
+// template text, and this case's job is to give them a genuine alarm to
+// grade rather than to force the DER to speak a vocabulary it does not use.
 func basicAlarms(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	return run(ctx, rc, spec{
+		// Change arms the fault AFTER the initial discovery-walk wait, so the
+		// DUT has already found (and cached) its LogEventListLink the way a
+		// real client does, exactly as CORE-009/CORE-014's RehomeDER runs
+		// after the client has "taken up what Setup put there" (see spec.Change's
+		// doc in check.go). ChangeWait: changeWaitFullCycle because — unlike a
+		// Notification, which the server dispatches synchronously with the
+		// mutation — this fault has to cross the DUT's own southbound polling
+		// interval, its hub-side alarm-edge detection, and an MQTT hop before
+		// the northbound poster POSTs anything; that is "something the DUT
+		// must notice and act on", the same class of wait CORE-009/CORE-014
+		// use changeWaitFullCycle for.
+		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
+			sim, err := d.rc.Sim(alarmSimName)
+			if err != nil {
+				return fmt.Errorf("this row needs a fault armed on the DUT's southbound DER sim: %w", err)
+			}
+			body := map[string]any{"kind": "raise_alarm", "bits": alarmFaultBits}
+			if err := sim.Fault(ctx, body, nil); err != nil {
+				return fmt.Errorf("arm raise_alarm bits=%#x on %s: %w", alarmFaultBits, alarmSimName, err)
+			}
+			params[alarmArmedAtParam] = time.Now().UTC().Format(time.RFC3339)
+			d.rc.Logf("BASIC-027: armed raise_alarm bits=%#x on %s — the DUT's southbound 701 Alrm bitfield "+
+				"now reports AC_UNDER_VOLT with a genuinely under-threshold voltage reading behind it",
+				alarmFaultBits, alarmSimName)
+			return nil
+		},
+		ChangeWait: changeWaitFullCycle,
+		// Cleanup always runs (check.go's doc: "whatever happens, or it
+		// corrupts every later test case on a shared bench") — even when
+		// Change never got to arm anything, in which case d.rc.Sim below
+		// fails identically and this is a no-op.
+		Cleanup: func(ctx context.Context, d *Driver) {
+			sim, err := d.rc.Sim(alarmSimName)
+			if err != nil {
+				return
+			}
+			body := map[string]any{"kind": "raise_alarm", "clear": true}
+			if err := sim.Fault(ctx, body, nil); err != nil {
+				d.rc.Logf("BASIC-027: WARNING could not clear raise_alarm on %s: %v — a bench left alarming "+
+					"corrupts every later test case sharing it", alarmSimName, err)
+				return
+			}
+			d.rc.Logf("BASIC-027: cleared raise_alarm on %s (the RTN edge)", alarmSimName)
+		},
 		Notes: func(o *Observation) string {
 			return fmt.Sprintf("LogEvent reporting; gridsim recorded %d LogEvent(s) from the DUT during the "+
-				"window", len(o.Server.LogEvents))
+				"window", len(o.Server.LogEvents)) + alarmNote(o)
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
@@ -446,39 +537,117 @@ func basicAlarms(ctx context.Context, rc *certify.RunCtx) (certify.Result, error
 						}
 						return unavailable("the recovered transcript holds no LogEvent POST from the DUT")
 					},
-					Server: func(v *ServerView) Finding {
-						if len(v.LogEvents) == 0 {
-							return Finding{Verdict: certify.Skip,
-								Observed: "gridsim recorded no LogEvent from the DUT during this window. A DER " +
-									"with nothing to report is not non-conformant, so this is a SKIP: the row " +
-									"needs a fault injected on the DUT's southbound devices to make it alarm, " +
-									"which is outside this suite's read-only reach"}
-						}
-						return Finding{Verdict: certify.Pass,
-							Observed: fmt.Sprintf("gridsim recorded %d LogEvent(s) from the DUT", len(v.LogEvents))}
-					},
+					Server: logEventsPostedFinding(o),
 				},
 				{
 					Claim: "the DUT's LogEvents carry a logEventCode from IEEE 2030.5 Table 34 and are " +
 						"time-ordered",
-					How:  "the logEventCode and createdDateTime elements of the recorded LogEvents",
-					Skip: "no LogEvent was recovered in this window to inspect",
-					Server: func(v *ServerView) Finding {
-						if len(v.LogEvents) == 0 {
-							return unavailable("gridsim recorded no LogEvent to inspect")
-						}
-						var codes []string
-						for _, le := range v.LogEvents {
-							codes = append(codes, fmt.Sprint(le["logEventCode"]))
-						}
-						return Finding{Verdict: certify.Pass,
-							Observed: fmt.Sprintf("%d LogEvent(s), codes %s", len(v.LogEvents),
-								strings.Join(codes, " "))}
-					},
+					How:    "the logEventCode and createdDateTime elements of the recorded LogEvents",
+					Skip:   "no LogEvent was recovered in this window to inspect",
+					Server: logEventCodesFinding,
 				},
 			}
 		},
 	})
+}
+
+// logEventsPostedFinding is criterion 2's Server-tier evaluator (BASIC-027):
+// PASS when gridsim's admin API recorded at least one LogEvent from the DUT
+// in this window, SKIP with noAlarmReason's precise explanation otherwise.
+// It is a named function — closing over o exactly as the inline closure it
+// replaces did — so the flow test can call the SAME evaluator BASIC-027's
+// Criteria list uses against a real ServerView, the same shape
+// TestCORE014Flow_RehomeThenPUTToNewHrefIsObserved uses critDERPut for.
+func logEventsPostedFinding(o *Observation) func(v *ServerView) Finding {
+	return func(v *ServerView) Finding {
+		if len(v.LogEvents) == 0 {
+			return Finding{Verdict: certify.Skip, Observed: fmt.Sprintf(
+				"gridsim recorded no LogEvent from the DUT during this window%s", noAlarmReason(o))}
+		}
+		return Finding{Verdict: certify.Pass,
+			Observed: fmt.Sprintf("gridsim recorded %d LogEvent(s) from the DUT", len(v.LogEvents))}
+	}
+}
+
+// logEventCodesFinding is criterion 3's Server-tier evaluator (BASIC-027):
+// the logEventCode of every LogEvent gridsim recorded in this window, or
+// unavailable when there is nothing to inspect (criterion.Skip then supplies
+// the final reason). Named for the same testability reason as
+// logEventsPostedFinding.
+//
+// Reads the "LogEventCode" key (the Go field name lexa-proto/csipmodel.
+// LogEvent's default JSON marshalling produces — that struct carries only
+// `xml:` tags, no `json:` tags, so encoding/json falls back to the
+// capitalised Go identifier), NOT the lowercase "logEventCode" the wire
+// criterion above checks for in the XML payload — the two are different
+// serializations of the same field and do not share a key spelling. This
+// criterion had never run against a real recorded LogEvent before this row
+// could arm one (see basicAlarms' Change hook), so the lowercase-key
+// version's silent "codes <nil>" was never observed until
+// TestBASIC027Flow_ArmAwaitClearIsObserved posted a real one through it.
+func logEventCodesFinding(v *ServerView) Finding {
+	if len(v.LogEvents) == 0 {
+		return unavailable("gridsim recorded no LogEvent to inspect")
+	}
+	var codes []string
+	for _, le := range v.LogEvents {
+		codes = append(codes, fmt.Sprint(le["LogEventCode"]))
+	}
+	return Finding{Verdict: certify.Pass,
+		Observed: fmt.Sprintf("%d LogEvent(s), codes %s", len(v.LogEvents), strings.Join(codes, " "))}
+}
+
+// noAlarmReason renders why criterion 2's Server tier still found nothing —
+// captured over o from the enclosing Criteria closure so a Server evaluator
+// (which only sees *ServerView) can still explain itself precisely instead
+// of repeating the now-stale "outside this suite's read-only reach": this
+// suite DOES reach the DUT's southbound device now (see alarmNote), so an
+// empty result means either the scripted fault could not be armed (a bench
+// gap, named) or it was armed but the DUT's detection/publish/POST chain had
+// not completed within this row's wait (report, not blame — the wait budget
+// is an operator knob, -param csip.wait).
+func noAlarmReason(o *Observation) string {
+	switch {
+	case o.Param(alarmArmedAtParam) != "":
+		return fmt.Sprintf(". This suite armed a southbound AC_UNDER_VOLT fault at %s and waited, but no "+
+			"LogEvent arrived in that window; a DER with an armed condition that has not yet been detected, "+
+			"published and posted is not non-conformant on THIS evidence alone — see -param csip.wait to "+
+			"widen the window",
+			o.Param(alarmArmedAtParam))
+	case o.Param(changeFailed) != "":
+		return fmt.Sprintf(". This suite could not arm the fault this row needs: %s — a BENCH gap (the "+
+			"southbound sim's fault-injection API), not a DUT finding", o.Param(changeFailed))
+	default:
+		return ". A DER with nothing to report is not non-conformant, so this is a SKIP: the row needs a " +
+			"fault injected on the DUT's southbound devices to make it alarm, which gridsim's admin API was " +
+			"not available to script for this run"
+	}
+}
+
+// alarmNote renders BASIC-027's narrative addendum recording that this
+// suite — not the DUT — scripted a southbound DER fault mid-case, the same
+// convention rehomeNote uses for CORE-009/CORE-014's server-side re-home
+// (core.go): a reader of the bundle must not mistake the DUT's resulting
+// LogEvent POST for a spontaneous event, or mistake "the DUT never alarms"
+// for the DUT's behaviour when actually no DER condition was ever presented
+// to it until this case ran.
+func alarmNote(o *Observation) string {
+	if at := o.Param(alarmArmedAtParam); at != "" {
+		return fmt.Sprintf(". This suite armed a SCRIPTED southbound fault at %s: raise_alarm bits=%#x on "+
+			"the bench's plain-text SunSpec DER sim (%s), setting the model 701 Alrm AC_UNDER_VOLT bit and "+
+			"backing it with an actual under-threshold voltage reading (not a bare flag — sim/southbound/"+
+			"solar_adv.go's advCoupledVoltHz) — a fault-injection action on the TEST FIXTURE's southbound "+
+			"device, not a DUT perturbation. lexa-gw's hub-side alarm-edge detector (cmd/hub/logevent.go) "+
+			"watches exactly this register for the transition and maps it onto CSIP Table 14 UNDER_VOLTAGE; "+
+			"the fault is cleared (the RTN edge) once this case's observation window closes",
+			at, uint32(alarmFaultBits), alarmSimName)
+	}
+	if reason := o.Param(changeFailed); reason != "" {
+		return fmt.Sprintf(". This suite could not arm the southbound fault this row needs to make the DUT "+
+			"alarm: %s. That is a BENCH gap (the southbound sim's fault-injection API was not reachable), "+
+			"not a DUT finding", reason)
+	}
+	return ""
 }
 
 // basicInverterStatus implements BASIC-028 — Inverter Status.

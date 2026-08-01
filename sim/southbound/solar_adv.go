@@ -27,8 +27,11 @@ package sim
 //	                            the live curve reflects the staged points.
 //
 // Three advanced faults ride the same faultController: raise_alarm (701 Alrm
-// bits), curve_adopt_lies (COMPLETED-but-stale — the INV-ADV-READBACK defense),
-// and pf_ack_ignore (704 PF/var write ACKs but measured PF/var never moves).
+// bits — the voltage/frequency alarm bits also derate the LNV/LLV/Hz points
+// that back them, see advCoupledVoltHz, so the alarm and the measurement it
+// names agree), curve_adopt_lies (COMPLETED-but-stale — the INV-ADV-READBACK
+// defense), and pf_ack_ignore (704 PF/var write ACKs but measured PF/var
+// never moves).
 
 import (
 	"math"
@@ -41,6 +44,60 @@ const (
 	advNPt  = 10 // device NPt: curve points per curve (headroom for CSIP curves)
 	advNCrv = 2  // curve index 0 (live, read-only) + index 1 (writable staging)
 )
+
+// Model 701 Alrm bit positions this sim gives a real physical correlate to
+// when raise_alarm arms them (see advCoupledVoltHz) — the standard
+// model_701.json "Alrm" symbol positions, duplicated here rather than
+// imported because lexa-proto/sunspec deliberately carries no bit vocabulary
+// (parse layer, not semantics — see faults.go's raiseAlarmBits doc). These
+// four are the same positions lexa-gw's hub-side alarm detector
+// (lexa-hub/cmd/hub/logevent.go, alrm701ToTable14) maps directly onto CSIP
+// Table 14 OVER_VOLTAGE(2)/UNDER_VOLTAGE(4)/OVER_FREQUENCY(6)/
+// UNDER_FREQUENCY(8) — a "grid-interface measurement" alarm, which is why
+// they are the ones worth backing with an actual out-of-band reading: a
+// downstream client that cross-checks the alarm bit against the measurement
+// it names (rather than trusting the flag blindly) must see them agree.
+const (
+	alrm701OverFrequency  uint32 = 1 << 8
+	alrm701UnderFrequency uint32 = 1 << 9
+	alrm701ACOverVolt     uint32 = 1 << 10
+	alrm701ACUnderVolt    uint32 = 1 << 11
+)
+
+// advCoupledVoltHz returns the line-to-neutral voltage and frequency
+// advMirror701 should report given the armed raise_alarm bits, backing a
+// grid-interface alarm bit with a measurement that actually sits outside the
+// condition's threshold — never just a flag with a nominal reading
+// underneath it, which is a state no real DER reaches (the fault it claims
+// and the measurement it reports would disagree). With no mapped bit armed
+// it returns volt/hz unchanged, so the no-fault path stays byte-identical.
+//
+// Voltage and frequency are decided independently since a device can be
+// simultaneously off-nominal on both; an over+under pair armed together for
+// the same quantity (a fault-injection state no real device reaches) prefers
+// UNDER, so the function always has one deterministic answer.
+//
+// Thresholds are set past the IEEE 1547-2018 Table 12 default Category III
+// trip points so the condition is unambiguous to a client applying the same
+// table: under-voltage trips at 0.88 pu (211.2 V of 240 V nominal) -> this
+// reports 205 V; over-voltage trips at 1.10 pu (264 V) -> 270 V;
+// under-frequency trips at 58.5 Hz -> 58.0 Hz; over-frequency trips at
+// 61.2 Hz -> 61.5 Hz.
+func advCoupledVoltHz(bits uint32, volt, hz float64) (float64, float64) {
+	switch {
+	case bits&alrm701ACUnderVolt != 0:
+		volt = 205.0
+	case bits&alrm701ACOverVolt != 0:
+		volt = 270.0
+	}
+	switch {
+	case bits&alrm701UnderFrequency != 0:
+		hz = 58.0
+	case bits&alrm701OverFrequency != 0:
+		hz = 61.5
+	}
+	return volt, hz
+}
 
 // solarAdvFaultKinds is the advanced solar sim's advertised fault set: every
 // legacy solar kind plus the three 7xx kinds. Built from solarFaultKinds so the
@@ -573,7 +630,10 @@ func advBridgeCeiling(r *RegisterMap, bases SolarBases, adv solarAdvBases) {
 
 // advMirror701 writes the 701 measurement model from the 103 physical state the
 // legacy animation just computed, applying the 704 fixed-PF / fixed-var effect
-// to PF/Var and stamping the current raise_alarm bits into Alrm.
+// to PF/Var and stamping the current raise_alarm bits into Alrm — deriving
+// the voltage/frequency points those bits claim from advCoupledVoltHz first
+// (see its doc), so a voltage or frequency alarm bit is never left backed by
+// a nominal reading.
 //
 // THE MIRROR MUST NOT BE LOSSY. This model declares ACType = THREE_PHASE, and
 // the 103 it mirrors from is a genuinely three-phase animation: it writes
@@ -613,6 +673,25 @@ func advMirror701(r *RegisterMap, bases SolarBases, adv solarAdvBases, wmaxW, va
 	conn := r.Get(bases.M123Base + sunspec.M123_Conn)
 	st103 := r.Get(m103 + sunspec.M103_St)
 
+	// raise_alarm coupling (advCoupledVoltHz): read the armed bits ONCE and
+	// reuse the same snapshot both to derate volt/hz below and to stamp Alrm
+	// further down, so a single fault-controller read decides both
+	// consistently — no window where the bit is set but the derived reading
+	// has not caught up (or vice versa). A balanced three-phase machine
+	// cannot have one phase off-nominal while its neighbours and the
+	// line-to-line points sit at the healthy value, so an armed voltage
+	// condition scales ALL six voltage points by the same ratio — the same
+	// coupling Inject "V_V" already applies for an operator-injected voltage.
+	alrm := fc.alarmBits()
+	if cv, ch := advCoupledVoltHz(alrm, volt, hz); cv != volt || ch != hz {
+		if cv != volt && volt != 0 {
+			ratio := cv / volt
+			volt, voltB, voltC = cv, voltB*ratio, voltC*ratio
+			vAB, vBC, vCA = vAB*ratio, vBC*ratio, vCA*ratio
+		}
+		hz = ch
+	}
+
 	// Free-running PF/var the legacy 103 animation just wrote (the accept-but-
 	// ignore fallback for pf_ack_ignore / no 704 reactive command).
 	freePF := sunspec.ApplyScaleSigned(r.Get(m103+sunspec.M103_PF), sfAt(m103+sunspec.M103_PF_SF)) / 100.0
@@ -635,7 +714,7 @@ func advMirror701(r *RegisterMap, bases SolarBases, adv solarAdvBases, wmaxW, va
 		v.SetEnum("ConnSt", 1)
 	}
 	v.SetEnum("InvSt", uint16(st103))
-	v.SetU32("Alrm", fc.alarmBits())
+	v.SetU32("Alrm", alrm)
 	v.SetFloat("W", w)
 	v.SetFloat("VA", va)
 	v.SetFloat("Var", varPwr)
