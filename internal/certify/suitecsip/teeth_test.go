@@ -232,6 +232,22 @@ func TestRegistrationPINHasTeeth(t *testing.T) {
 		synthTranscript(get("/edev/2/reg", 200,
 			`<Registration xmlns="urn:ieee:std:2030.5:ns"><dateTimeRegistered>1</dateTimeRegistered></Registration>`)),
 		certify.Fail)
+
+	// No Registration resource fetched AT ALL — every run in this campaign's
+	// actual shape (runs/final-csip-20260731T213346, CORE-009 census item #4).
+	// This must NOT be Fail (the wire cannot tell a broken walker from a
+	// registration_pin-disabled one, see critRegistrationPIN's doc) and must
+	// NOT be Pass (the requirement was never exercised) — Unavailable, naming
+	// the actual mechanism, is the only honest verdict.
+	reason := wantUnavailable(t, "pIN (Registration never fetched)", critRegistrationPIN(""),
+		synthTranscript(get("/edev", 200, edevXML(
+			"0000000000000000000000000000000000000002", 123456789))))
+	for _, want := range []string{"registration_pin", "PinVerifier", "operator"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("the Unavailable reason should name %q so a reader knows this is a DUT-config gap, "+
+				"not a bench or wire fault: %q", want, reason)
+		}
+	}
 }
 
 func TestFixtureGapsSkipRatherThanFail(t *testing.T) {

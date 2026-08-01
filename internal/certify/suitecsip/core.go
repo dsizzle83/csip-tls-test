@@ -17,6 +17,7 @@ package suitecsip
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -57,11 +58,24 @@ func corePolling(ctx context.Context, rc *certify.RunCtx) (certify.Result, error
 }
 
 // coreBasicTime implements CORE-005 — Basic Time.
+//
+// Its 4th criterion (critClockAdopted) is the one row in this suite where the
+// pass criterion is explicitly about DUT-internal state — "the Client ...
+// synchronizes the Client time" (CTP steps 5-6) is not something a passive
+// capture can observe directly, only the server's offer and the DUT's
+// subsequent request timestamps. PostWait adds a second, optional tier: when
+// -gateway-ssh is configured, it reads the DUT's own wall clock over the
+// read-only Gateway introspection channel right after the live phase's wait —
+// close in time to the Time-resource fetch the wire criteria assert — so
+// critClockAdopted can report a direct measurement instead of only the
+// wire-timestamp inference. See probeGatewayClock's doc for what it can and
+// cannot conclude.
 func coreBasicTime(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	return run(ctx, rc, spec{
 		Notes: func(o *Observation) string {
 			return "Time function set: discovery of the TimeLink and retrieval of the Time resource"
 		},
+		PostWait: probeGatewayClock,
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
 				critDiscoveryRoot(),
@@ -92,35 +106,125 @@ func coreBasicTime(ctx context.Context, rc *certify.RunCtx) (certify.Result, err
 					},
 				},
 				critTimeResource(),
-				{
-					Claim: "the DUT used the server's time rather than its own: its subsequent requests are " +
-						"consistent with the server-supplied currentTime",
-					How: "comparison of the Time resource's currentTime with the capture timestamp of the " +
-						"request that fetched it",
-					NeedsTranscript: true,
-					Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-						e, doc, ok := t.Resource("Time")
-						if !ok {
-							return unavailable("no Time resource appears in the recovered transcript")
-						}
-						ct, has := doc.IntOf("currentTime")
-						if !has || e.Resp.Time.IsZero() {
-							return unavailable("the Time payload or its capture timestamp is missing")
-						}
-						skew := e.Resp.Time.Sub(time.Unix(ct, 0))
-						return citeMessage(t, e.Resp, certify.Warn,
-							"the server served currentTime=%d and the capture stamped that response at %s, a "+
-								"difference of %s. Whether the DUT then SET ITS CLOCK is a property of the "+
-								"device's internal state, not of the wire; this run reports the skew the DUT "+
-								"was told about rather than asserting an internal effect it cannot observe",
-							ct, e.Resp.Time.UTC().Format(time.RFC3339), skew.Round(time.Millisecond))
-					},
-					Skip: "the client's clock adjustment is internal to the DUT and is not observable from the " +
-						"2030.5 exchange",
-				},
+				critClockAdopted(o),
 			}
 		},
 	})
+}
+
+// gwClockParam/gwClockAtParam/gwClockErrParam are the Params keys
+// probeGatewayClock leaves for critClockAdopted's citation-phase read-back —
+// see check.go's PostWait for why a live-phase probe has to travel through
+// Params rather than being called directly from Wire (Wire only sees the
+// Evidence/Transcript the citation phase recovers, which can run long after
+// the live phase, and has no Driver/RunCtx to reach the gateway with).
+const (
+	gwClockParam    = "csip.gw_clock_unix"
+	gwClockAtParam  = "csip.gw_clock_probed_at"
+	gwClockErrParam = "csip.gw_clock_err"
+)
+
+// probeGatewayClock reads the DUT's own wall clock over the read-only
+// -gateway-ssh introspection channel (certify.Gateway.Run; "date" is on its
+// CheckReadOnly allowlist, clients.go) so CORE-005's clock-adoption criterion
+// has something firmer than wire-timestamp inference to grade.
+//
+// Whether the DUT SET its clock from the server's currentTime is internal
+// state — CORE-005's own catalog text (steps 5-6) requires it ("synchronize
+// ... using the content information") but a passive capture can only show
+// what the server OFFERED and when the DUT's OWN subsequent requests landed,
+// never what the DUT's clock actually reads. `date -u +%s` on the DUT is the
+// one channel that answers the question directly.
+//
+// Entirely optional and never fatal to the check: a bench run without
+// -gateway-ssh (or one where the probe command itself fails) leaves Params
+// unset/carrying only the error, and critClockAdopted falls back to exactly
+// the wire-only skew report this criterion always gave.
+func probeGatewayClock(ctx context.Context, d *Driver, params map[string]string) error {
+	gw := d.rc.Gateway
+	if !gw.Available() {
+		return nil // no -gateway-ssh configured: nothing to probe, nothing to report
+	}
+	out, err := gw.Run(ctx, "date", "-u", "+%s")
+	if err != nil {
+		params[gwClockErrParam] = err.Error()
+		return err
+	}
+	params[gwClockParam] = strings.TrimSpace(string(out))
+	params[gwClockAtParam] = time.Now().UTC().Format(time.RFC3339Nano)
+	return nil
+}
+
+// critClockAdopted is CORE-005's 4th criterion — whether the DUT used the
+// server's time. See coreBasicTime and probeGatewayClock's docs for the two
+// tiers this grades on.
+//
+// The catalog's CORE-005 text (csip-conf-v1.3::CORE-005, steps 5-6) requires
+// the client to "synchronize ... using the content information" but prints NO
+// numeric tolerance for the result — TIME.011 bounds only how a BACKWARD
+// adjustment must be made (never a single step backwards by more than 60s),
+// a different property from "how close must the clocks be". Absent a printed
+// threshold this stays informational even with a real gateway-ssh
+// measurement in hand: it reports the skew, and never manufactures a
+// pass/fail boundary the procedure itself does not state.
+func critClockAdopted(o *Observation) criterion {
+	return criterion{
+		Claim: "the DUT used the server's time rather than its own: its subsequent requests are " +
+			"consistent with the server-supplied currentTime, and — when a gateway-ssh probe is available — " +
+			"the DUT's own clock reads within a reported margin of the server's",
+		How: "comparison of the Time resource's currentTime with the capture timestamp of the request that " +
+			"fetched it; when -gateway-ssh is configured, `date -u +%s` run on the DUT (certify.Gateway, " +
+			"CheckReadOnly-allowlisted) immediately after the live phase's wait, compared against the same " +
+			"server currentTime",
+		NeedsTranscript: true,
+		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+			e, doc, ok := t.Resource("Time")
+			if !ok {
+				return unavailable("no Time resource appears in the recovered transcript")
+			}
+			ct, has := doc.IntOf("currentTime")
+			if !has || e.Resp.Time.IsZero() {
+				return unavailable("the Time payload or its capture timestamp is missing")
+			}
+			wireSkew := e.Resp.Time.Sub(time.Unix(ct, 0))
+
+			gwClock := o.Param(gwClockParam)
+			if gwClock == "" {
+				extra := "; no -gateway-ssh was configured for this run, so the DUT's own clock could not be probed"
+				if gwErr := o.Param(gwClockErrParam); gwErr != "" {
+					extra = fmt.Sprintf("; a gateway-ssh probe was attempted and failed (%s)", gwErr)
+				}
+				return citeMessage(t, e.Resp, certify.Warn,
+					"the server served currentTime=%d and the capture stamped that response at %s, a "+
+						"difference of %s. Whether the DUT then SET ITS CLOCK is a property of the device's "+
+						"internal state, not of the wire; this run reports the skew the DUT was told about "+
+						"rather than asserting an internal effect it cannot observe%s",
+					ct, e.Resp.Time.UTC().Format(time.RFC3339), wireSkew.Round(time.Millisecond), extra)
+			}
+			gwUnix, perr := strconv.ParseInt(gwClock, 10, 64)
+			if perr != nil {
+				return citeMessage(t, e.Resp, certify.Warn,
+					"the server served currentTime=%d (wire-timestamp skew %s); the gateway-ssh probe's "+
+						"output %q did not parse as a unix timestamp (%v), so the DUT's own clock could not be "+
+						"compared directly", ct, wireSkew.Round(time.Millisecond), gwClock, perr)
+			}
+			probeSkew := time.Unix(gwUnix, 0).Sub(time.Unix(ct, 0))
+			abs := probeSkew
+			if abs < 0 {
+				abs = -abs
+			}
+			return citeMessage(t, e.Resp, certify.Warn,
+				"the DUT's own clock (probed over -gateway-ssh, `date -u +%%s` -> %d, at %s) differs from the "+
+					"server's currentTime=%d by %s (the independent wire-timestamp skew was %s). CSIP CORE-005 "+
+					"requires the client to synchronize using the Time resource (steps 5-6) but prints no "+
+					"numeric tolerance for the result (TIME.011 bounds only backward-adjustment STEP SIZE, a "+
+					"different property), so this stays informational rather than graded pass/fail against a "+
+					"threshold the procedure never states",
+				gwUnix, o.Param(gwClockAtParam), ct, abs.Round(time.Second), wireSkew.Round(time.Millisecond))
+		},
+		Skip: "the client's clock adjustment is internal to the DUT and is not observable from the 2030.5 " +
+			"exchange without a gateway-ssh probe",
+	}
 }
 
 // coreAdvancedEndDevice implements CORE-009 — Advanced End Device.

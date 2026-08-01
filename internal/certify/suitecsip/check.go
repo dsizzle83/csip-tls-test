@@ -101,6 +101,19 @@ type spec struct {
 	// Wait overrides the poll-cycle wait for this check.
 	Wait time.Duration
 
+	// PostWait is a read-only observation taken right after the live phase's
+	// wait for the DUT's poll cycle (or Await predicate) is done, and BEFORE
+	// Change. Unlike Change it runs unconditionally — it does not require
+	// gridsim's admin API (d.Available()) — because its lever is typically
+	// something else entirely: rc.Gateway, the read-only -gateway-ssh
+	// introspection channel, for a fact that is internal DUT state and not
+	// wire-observable at all (CORE-005's clock-adoption probe is the first
+	// consumer). A returned error is recorded in Params under whatever key the
+	// caller chose and never fatal: a probe that could not be taken is a bench
+	// fact the criteria should report, not a reason to abandon the evidence
+	// already collected from the wire.
+	PostWait func(ctx context.Context, d *Driver, params map[string]string) error
+
 	// Change is the mutation the procedure makes AFTER the client has taken up
 	// what Setup put there, and it exists because half the aggregator rows
 	// cannot be driven without it.
@@ -226,6 +239,12 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 	}
 	obs.Waited, obs.Satisfied = waited, satisfied
 	rc.Logf("waited %s for the DUT's poll cycle (predicate satisfied: %t)", waited.Round(time.Second), satisfied)
+
+	if s.PostWait != nil {
+		if err := s.PostWait(ctx, d, obs.Params); err != nil {
+			rc.Logf("post-wait observation failed: %v", err)
+		}
+	}
 
 	// The endpoint claim goes in BEFORE the change: a Notification the change
 	// causes is dispatched synchronously, so a claim made afterwards would be

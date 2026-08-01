@@ -173,6 +173,42 @@ func checkDigitVerdict(v uint64) string {
 // operator supplied it with -param csip.pin. Failing a DUT because the bench's
 // PIN differs from the one in the procedure's example would be reporting our
 // configuration as its non-conformance.
+//
+// # Why an absent Registration fetch is graded Unavailable, not Fail — and NOT
+// # "spec-legitimate pre-registration" either
+//
+// Every run in this campaign shows the identical absence (CORE-009 and every
+// other row that carries this criterion), which ruled out a one-off capture
+// gap and raised the question directly: is gridsim's EndDevice tree marking
+// the DUT pre-registered in a way that lets a compliant client legitimately
+// skip the fetch? It is not that. gridsim serves a populated
+// dateTimeRegistered from the very first EndDevice fetch ANY client ever
+// makes (fleet.go/server.go) — CTP v1.3's own precondition ("Pre-register an
+// EndDevice instance ... including ... PIN") describes exactly that fixture
+// setup, and its steps 4-5 still list the Registration GET as part of the
+// scripted client walk regardless. The bench fixture is not the gap.
+//
+// The real mechanism is on the DUT side: lexa-gw's northbound client (design
+// D4, internal/northbound/run.PinVerifier) DOES implement Registration/pIN
+// verification, and re-checks it on EVERY walk (self-healing, not a
+// one-time-at-commissioning check) — but only when the operator-configured
+// registration_pin resolves to a non-zero value. Unresolved (0, the state an
+// unprovisioned or bench-default unit is in), the verifier is never
+// constructed and the fetch never happens at all — by design, with one
+// startup WARN (the WS-8 disabled-default pattern), not a fail-closed error.
+// That construction gates the ENTIRE walk's Registration fetch, which is
+// exactly consistent with what every run in this campaign shows: not one
+// fetch, ever, in any case that carries this criterion.
+//
+// So this is a genuine walk gap relative to CTP steps 4-5, but the lever to
+// close it is NOT in gridsim (which already serves a conformant Registration
+// unconditionally) — it is the DUT's own registration_pin provisioning, an
+// operator action, not a bench fixture change. Reporting Pass here would
+// certify a requirement this run never actually exercised; reporting Fail
+// would blame the DUT for a bench/operator provisioning fact the wire alone
+// cannot confirm one way or the other. Unavailable, with the mechanism named,
+// is the honest middle: see suitepki's identical reasoning for PKI-4..7
+// ("a verdict about the wrong certificate is worse than no verdict").
 func critRegistrationPIN(wantPIN string) criterion {
 	return criterion{
 		Claim: "the DUT fetched the Registration resource and the server answered 200 with a pIN carrying " +
@@ -184,7 +220,16 @@ func critRegistrationPIN(wantPIN string) criterion {
 			e, doc, ok := t.Resource("Registration")
 			if !ok {
 				return unavailable("no Registration resource appears in the recovered transcript "+
-					"(resources seen: %s)", strings.Join(t.ResourceNames(), " "))
+					"(resources seen: %s). Not evidence of a broken walker or a bench fixture gap: gridsim "+
+					"serves a conformant Registration (valid pIN check digit) unconditionally from the DUT's "+
+					"very first EndDevice fetch, so there is no 'not yet registered' state on this bench for a "+
+					"client to react to. This absence is consistent with the product's per-walk Registration/pIN "+
+					"verification (lexa-gw internal/northbound/run.PinVerifier, design D4) being disabled because "+
+					"its registration_pin config resolves to 0 on this DUT — by design (WS-8 disabled-default), "+
+					"the fetch never happens at all when that is so. Re-run needs: provision a non-zero "+
+					"registration_pin on the DUT (matching the server's served pIN) and restart lexa-northbound — "+
+					"an operator action this suite cannot perform or verify from the wire alone",
+					strings.Join(t.ResourceNames(), " "))
 			}
 			pin, has := doc.UintOf("pIN")
 			if !has {

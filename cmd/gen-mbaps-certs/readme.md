@@ -113,3 +113,76 @@ fixtures; not duplicated here since there is no fixture to mint.
   presenting one of `clients/*-cert.pem`.
 - `sim/ssm-conformance` (T06.10, not yet built): the negative matrix here is
   the evidence source for the §5.3/§5.4 role/PKI conformance rows.
+
+## External signer (gateway identity leaves) — and two known defects
+
+This tree's root and intermediate are also the CA an **external, out-of-repo**
+signer uses to issue the gateway's (lexa-gw) own three identity leaves —
+`nb-mbaps-server`, `sb-mbaps-identity`, and `nb-csip-identity` (the SEC-004
+purpose-split successor of the retired `nb-csip` domain, and the ONLY one of
+the three on the IEEE 2030.5 device-certificate profile: empty Subject,
+`hardwareModuleName` SAN). That signer is `lexa-gw/scripts/bench-pki-bootstrap.sh`
++ `lexa-gw/scripts/lib/bench-ca.sh` — a **different repository**, run manually
+on the desktop as: certmgr `stage-csr` on the board -> sign here with
+`intermediate-key.pem` -> certmgr `complete` on the board. Neither script is
+mintable or fixable from `cmd/gen-mbaps-certs`; they only consume this tree's
+root/intermediate as inputs.
+
+Conformance evidence against a live board (`runs/final-csip-20260731T213346`
+COMM-004 item #4; `runs/final-fullsuite-20260731T234821` PKI-19) found two real
+defects in that external signer — **not** in this generator, whose own leaves
+(the table above) do not have either problem, and whose
+`TestGeneratedChainsExcludeTheSelfIssuedRoot` (main_test.go) regression-locks
+the second one so it can never creep in here:
+
+1. **`nb-csip-identity`'s `notAfter` is a finite ~825-day window, not the
+   CSIP §6.11 sentinel.** `bench-pki-bootstrap.sh`'s `LEAF_DAYS` defaults to
+   825 and is passed to EVERY leaf uniformly; §6.11 requires
+   `99991231235959Z` for the 2030.5 device certificate specifically —
+   `nb-csip-identity` alone. `nb-mbaps-server`/`sb-mbaps-identity` are mbaps
+   certs, governed by the Secure SunSpec Modbus spec instead (which says
+   nothing about `notAfter`), so this is NOT a blanket "make every leaf
+   sentinel" fix — only the one domain on the 2030.5 profile needs it. Fix
+   (in `lexa-gw/scripts/lib/bench-ca.sh`'s `bench_ca_sign`): pass a sentinel
+   end date for `nb-csip-identity` instead of `+$days days`, e.g.
+   `ed="99991231235959Z"` gated on `[ "$domain" = "nb-csip-identity" ]`,
+   leaving `nb-mbaps-server`/`sb-mbaps-identity` on their existing
+   `LEAF_DAYS` window.
+2. **The chain handed to certmgr's `complete` step includes the self-issued
+   root in-band**, for all three domains. `bench-pki-bootstrap.sh` line
+   ~128: `cat "$WORK/$domain.leaf" "$INT_CERT" "$ROOT_CERT" >
+   "$WORK/$domain.chain"`. Every chain this generator itself writes is
+   leaf-first, leaf + intermediate ONLY (TCP-51 convention, see the table
+   above and `TestGeneratedChainsExcludeTheSelfIssuedRoot`) — the root is a
+   trust anchor, installed separately (`install_anchor` in the same script),
+   never presented in-band. Fix: drop `"$ROOT_CERT"` from that `cat`, i.e.
+   `cat "$WORK/$domain.leaf" "$INT_CERT" > "$WORK/$domain.chain"`.
+
+**Regeneration runbook** (two SEPARATE paths — read both before running
+either):
+
+- **This tree only** (harness-side; `dev-server-cert.pem` + the 5 role
+  clients + the negative matrix — nothing the live gateway's identity depends
+  on): `make gen-mbaps-leaves` (`-reuse-ca` — root/intermediate/wrong-ca stay
+  byte-identical, only the leaves are re-minted). Safe to run any time;
+  restart `sim/mbapsdev` afterwards to pick up the new device leaf. Does
+  **not** touch the gateway.
+- **The gateway's identity leaves** (after the external-signer fix above
+  lands in lexa-gw): re-run `bench-pki-bootstrap.sh` with
+  `FORCE_REISSUE=nb-csip-identity` (scope it to the one domain that changed;
+  `FORCE_REISSUE=1` re-issues all three). **This is an operator decision, not
+  something to do reflexively**: reissuing `nb-csip-identity` changes the
+  device certificate the LFDI is derived from, so the gateway
+  RE-REGISTERS with gridsim under a new LFDI — every prior conformance
+  bundle's DUT identity record stops matching the live board. Restart order
+  matters (HANDOFF_2026-07-30_conformance.md landmine #3): restart `certmgr`
+  only after `complete` finishes AND certmgr has promoted the new leaf, THEN
+  restart `lexa-northbound` — restarting northbound first serves the OLD
+  cert under the NEW key and every handshake fails with a
+  `CertificateVerify` mismatch.
+
+Neither defect was fixed as part of the fix that added this section: both
+live in `lexa-gw`, a separate repository this tree's tooling does not have
+commit access to from here, and the second bullet's runbook is exactly the
+"operator action, not a reflexive re-run" this file wants a reader to slow
+down for.
