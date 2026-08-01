@@ -13,6 +13,7 @@ package suitemodbusclient
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"csip-tls-test/internal/certify"
 )
@@ -627,7 +628,7 @@ func TestScaleFactorPassesWhenTheReportedValueIsDerivable(t *testing.T) {
 	// client applying the scale factor reports 16.76 → rounded to 16 by an
 	// integer journal. Use an exactly representable case instead: raw 1676 with
 	// scale factor 0 is 1676.
-	f := evalScaleFactor(c, "inv-plain", 1676, true, true)
+	f := evalScaleFactor(c.Registers, "inv-plain", 1676, true, true)
 	if f.Verdict != certify.Pass {
 		t.Fatalf("verdict = %s: %s", f.Verdict, f.Observed)
 	}
@@ -639,7 +640,7 @@ func TestScaleFactorPassesWhenTheReportedValueIsDerivable(t *testing.T) {
 func TestScaleFactorWarnsWhenTheReportedValueIsUnaccountedFor(t *testing.T) {
 	s := newSunSpecServer(40000)
 	c := scriptConversation(t, conformantClientScript(s))
-	f := evalScaleFactor(c, "inv-plain", 999999, true, true)
+	f := evalScaleFactor(c.Registers, "inv-plain", 999999, true, true)
 	if f.Verdict != certify.Warn {
 		t.Errorf("verdict = %s, want WARN: the DUT reported a value its own reads cannot produce",
 			f.Verdict)
@@ -649,8 +650,75 @@ func TestScaleFactorWarnsWhenTheReportedValueIsUnaccountedFor(t *testing.T) {
 func TestScaleFactorSkipsWithoutAReportedValue(t *testing.T) {
 	s := newSunSpecServer(40000)
 	c := scriptConversation(t, conformantClientScript(s))
-	if f := evalScaleFactor(c, "inv-plain", 0, false, true); f.Verdict != certify.Skip {
+	if f := evalScaleFactor(c.Registers, "inv-plain", 0, false, true); f.Verdict != certify.Skip {
 		t.Errorf("verdict = %s, want SKIP", f.Verdict)
+	}
+}
+
+// TestScaleFactorUsesTheFrozenReadNotTheDriftedOne is the regression test for
+// INFO-1#3 (census 20260731T234821): checkINFO1 freezes the sim, reads it, and
+// only then resumes — but resume is a deferred call that fires when the check
+// function returns, while the DUT keeps polling on its own independent ~10s
+// schedule regardless. A poll already in flight when resume lands can have
+// some of its responses timestamped before the boundary and some after, and
+// BOTH are still legitimately owned by this check's window: there is no
+// window-boundary trick that separates them, because it is the same live
+// phase straddling the instant resume actually happened.
+//
+// This reproduces the exact shape the investigation found on the wire: a
+// frozen read of 7374 (correct, verified against the wire at the frozen
+// instant) followed ~10 seconds later, in the same owned conversation, by a
+// post-resume drifted read of 7593 for the identical address.
+func TestScaleFactorUsesTheFrozenReadNotTheDriftedOne(t *testing.T) {
+	sc := &script{stepMs: 5, msgs: []msg{
+		{fromClient: true, payload: readReq(1, 1, 40100, 2)},
+		{payload: readRsp(1, 1, []uint16{7374, 0})}, // frozen: raw 7374, sunssf 0
+		{fromClient: true, payload: readReq(2, 1, 40100, 2), delayMs: 10000},
+		{payload: readRsp(2, 1, []uint16{7593, 0})}, // post-resume drift, same block
+	}}
+	c, at := scriptConversationWithTimes(t, sc)
+
+	// Sanity on the synthetic capture's shape: frame 4 is the frozen response,
+	// frame 6 the drifted one, roughly ten seconds apart, both owned.
+	t4, ok := at(4)
+	if !ok {
+		t.Fatal("setup: no timestamp for frame 4 (the frozen response)")
+	}
+	t6, ok := at(6)
+	if !ok {
+		t.Fatal("setup: no timestamp for frame 6 (the drifted response)")
+	}
+	if t6.Sub(t4) < 5*time.Second {
+		t.Fatalf("setup: frames 4 and 6 are only %s apart, want roughly 10s", t6.Sub(t4))
+	}
+
+	// The bug as it actually manifested: ordinary last-write-wins accumulation
+	// (what every other check in this suite correctly wants) lets the later,
+	// drifted read silently win, and the exact comparison this check makes
+	// then WARNs against a value that was, at the frozen instant, correct.
+	if v, ok := c.Registers.Get(40100); !ok || v != 7593 {
+		t.Fatalf("setup: c.Registers[40100] = %d (ok=%t), want 7593 (last write wins, unscoped)", v, ok)
+	}
+	if f := evalScaleFactor(c.Registers, "inv-plain", 7374, true, true); f.Verdict != certify.Warn {
+		t.Errorf("unscoped verdict = %s, want WARN: this is the shape of the bug this test guards against",
+			f.Verdict)
+	}
+
+	// The fix: cut off at the instant resume was issued (stood in for here by
+	// a cutoff strictly between the two responses), registersAsOf excludes the
+	// drifted read entirely rather than letting it overwrite the frozen one.
+	cutoff := t4.Add(1 * time.Second)
+	frozen := registersAsOf(c.Exchanges, cutoff, at)
+	if v, ok := frozen.Get(40100); !ok || v != 7374 {
+		t.Fatalf("frozen-scoped register = %d (ok=%t), want 7374 (the drifted read must be excluded, not merely superseded)",
+			v, ok)
+	}
+	f := evalScaleFactor(frozen, "inv-plain", 7374, true, true)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("frozen-scoped verdict = %s: %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "7374") {
+		t.Errorf("the assertion did not quote the frozen register value: %s", f.Observed)
 	}
 }
 

@@ -66,7 +66,22 @@ func checkINFO1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	// between the poll and the log line, and a scale-factor comparison would be
 	// comparing two different measurements — which is exactly the kind of
 	// almost-right evidence this tool exists not to produce.
+	//
+	// INFO-1#3 (census 20260731T234821): freezing is not enough by itself.
+	// resumeAt is stamped the instant resume is ISSUED, because the DUT polls
+	// on its own independent ~10-second schedule — it does not know or care
+	// when this check's deferred resume call happens to fire. A poll already
+	// in flight at that moment can have some of its responses timestamped
+	// before resumeAt and some after, and BOTH land inside this check's own
+	// attributed frames: there is no window boundary between them, because it
+	// is the same live phase straddling the instant resume actually happened.
+	// The citation phase (frozenRegisters, below) uses resumeAt to answer
+	// "what did the DUT see while frozen" rather than "what did it see last" —
+	// see registersAsOf's doc in modbuswire.go for why ordinary last-write-wins
+	// accumulation is the wrong tool for that question even though it is
+	// exactly right for every other check in this suite.
 	frozen := false
+	var resumeAt time.Time
 	if o.injectionReason() == "" {
 		if err := o.sim.Control(ctx, map[string]any{"cmd": "pause"}, nil); err != nil {
 			rc.Logf("could not pause the sim animation: %v", err)
@@ -78,6 +93,7 @@ func checkINFO1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 			defer func() {
 				cctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 				defer cancel()
+				resumeAt = time.Now().UTC()
 				if err := o.sim.Control(cctx, map[string]any{"cmd": "resume"}, nil); err != nil {
 					rc.Logf("WARNING: could not resume the sim animation: %v", err)
 					o.injected = append(o.injected, fmt.Sprintf("FAILED to resume the sim animation: %v", err))
@@ -109,7 +125,7 @@ func checkINFO1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 			}
 			fs := []finding{assertAttributionSound(ev, o)}
 			fs = append(fs, evalModelCoverage(c, forced))
-			fs = append(fs, evalScaleFactor(c, device, reported, haveReported, frozen))
+			fs = append(fs, evalScaleFactor(frozenRegisters(c, frozen, resumeAt, ev), device, reported, haveReported, frozen))
 			fs = append(fs, info1RenderingSkips()...)
 			return emit(ev, c, fs), nil
 		},
@@ -145,6 +161,32 @@ func evalModelCoverage(c *Conversation, forced error) finding {
 		base, len(models), read, covered, describeModels(models))
 }
 
+// frozenRegisters returns the register image evalScaleFactor should compare
+// the DUT's reported value against.
+//
+// When the run never froze the server (frozen is false — the sim was already
+// under fault injection from an earlier case, see checkINFO1), or resume was
+// never issued, there is no freeze boundary to respect, so the ordinary,
+// fully-accumulated view every other check in this suite relies on is exactly
+// right. When it DID freeze, the raw registers must be read as of resumeAt —
+// see registersAsOf's doc in modbuswire.go for why: this check's own
+// attributed frames can legitimately straddle the moment resume actually
+// happened, and last-write-wins over the whole window would let a post-resume
+// drifted read silently outvote the frozen one it is supposed to be compared
+// against.
+func frozenRegisters(c *Conversation, frozen bool, resumeAt time.Time, ev *certify.Evidence) *RegisterView {
+	if !frozen || resumeAt.IsZero() {
+		return c.Registers
+	}
+	return registersAsOf(c.Exchanges, resumeAt, func(frame int) (time.Time, bool) {
+		p, ok := ev.Index.Packet(frame)
+		if !ok || p.Time.IsZero() {
+			return time.Time{}, false
+		}
+		return p.Time, true
+	})
+}
+
 // evalScaleFactor is the sharp end of INFO-1: the DUT's reported value must be
 // derivable from the raw registers it read under the SunSpec convention
 // value = raw × 10^sunssf.
@@ -154,7 +196,11 @@ func evalModelCoverage(c *Conversation, forced error) finding {
 // found: one is a demonstration, several is a weaker corroboration, and none is
 // a finding worth raising, because the DUT reported a number its own reads do
 // not account for.
-func evalScaleFactor(c *Conversation, device string, reported int, haveReported, frozen bool) finding {
+//
+// regs is the register image to search — frozenRegisters' choice of "as of the
+// freeze" or "everything owned", not necessarily c.Registers directly; see its
+// doc for why the two differ.
+func evalScaleFactor(regs *RegisterView, device string, reported int, haveReported, frozen bool) finding {
 	claim := "the value the DUT reported for the device is the value its raw register reads decode to " +
 		"under the SunSpec scale-factor convention"
 	method := "search of the register image the DUT was observed to read for a (value, sunssf) pair " +
@@ -176,15 +222,15 @@ func evalScaleFactor(c *Conversation, device string, reported int, haveReported,
 		sf              int
 	}
 	var cands []cand
-	addrs := c.Registers.Addresses()
+	addrs := regs.Addresses()
 	for _, a := range addrs {
-		w, _ := c.Registers.Get(a)
+		w, _ := regs.Get(a)
 		raw := int(int16(w))
 		if raw == 0 {
 			continue // 0 × anything is 0; it would match every zero report
 		}
 		for _, sa := range addrs {
-			sw, _ := c.Registers.Get(sa)
+			sw, _ := regs.Get(sa)
 			sf := int(int16(sw))
 			if sf < -10 || sf > 10 || sa == a {
 				continue
@@ -195,14 +241,15 @@ func evalScaleFactor(c *Conversation, device string, reported int, haveReported,
 		}
 	}
 	if len(cands) == 0 {
-		return framesf(claim, method, certify.Warn, aduFrames(c.Responses...),
-			"the DUT reported %d W for device %q, but no register it was observed to read, scaled by any "+
-				"register in range −10..10, yields that value. Either the DUT reported a value derived "+
-				"from reads outside this test case's frames, or it applied a conversion this comparison "+
-				"does not model. %d register(s) were observed", reported, device, c.Registers.Len())
+		return framesf(claim, method, certify.Warn, regs.Frames(),
+			"the DUT reported %d W for device %q, but no register it was observed to read while the "+
+				"comparison window applies, scaled by any register in range −10..10, yields that value. "+
+				"Either the DUT reported a value derived from reads outside this test case's frames, or it "+
+				"applied a conversion this comparison does not model. %d register(s) were observed",
+			reported, device, regs.Len())
 	}
 	best := cands[0]
-	ref, ok := c.Registers.Ref(best.valAddr)
+	ref, ok := regs.Ref(best.valAddr)
 	if !ok {
 		return skipf(claim, method, "the matching register at %d carries no byte provenance", best.valAddr)
 	}

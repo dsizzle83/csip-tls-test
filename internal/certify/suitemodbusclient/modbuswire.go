@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // MBAP and PDU size constants, from MODBUS Messaging on TCP/IP V1.0b §4.1 and
@@ -625,4 +626,92 @@ func (v *RegisterView) Addresses() []uint16 {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
+}
+
+// Frames returns every capture frame that contributed a register this view
+// holds, deduplicated and ascending. It is what a check cites when it wants
+// to point at "everything this register image was built from" rather than
+// one specific address — the "no candidate found" case in evalScaleFactor
+// (checks_info.go) is the reason this exists: a WARN that a value could not
+// be derived should still cite exactly what was searched, which for a
+// frozen-scoped view (registersAsOf) is a strict subset of the check's full
+// attributed frames.
+func (v *RegisterView) Frames() []int {
+	seen := map[int]bool{}
+	var out []int
+	for _, ref := range v.from {
+		for _, f := range ref.frames {
+			if !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+// registersAsOf reconstructs the register image using only read exchanges
+// whose response arrived AT OR BEFORE cutoff, according to at — a resolver
+// from frame index to capture timestamp. A read is EXCLUDED, not merely
+// superseded, when any frame carrying its response fails the cutoff or has an
+// unresolvable time: an unknown time is not evidence a read happened before
+// whatever boundary cutoff names.
+//
+// # Why this exists beside apply's ordinary last-write-wins
+//
+// buildConversation's loop (conversation.go) applies every owned read in
+// stream order and lets the last one win, which is the right answer for
+// every other check in this suite: a check that provokes a write, or a fault,
+// wants the LATEST value, because that is the one the provocation produced.
+//
+// checkINFO1 (checks_info.go) is different: it freezes the server's animation,
+// reads it, and only THEN resumes — but the resume is a deferred call that
+// fires when the check function returns, while the DUT keeps polling on its
+// own independent ~10-second schedule regardless of what the check is doing.
+// A poll already in flight when resume lands can have some of its responses
+// timestamped before the boundary and some after, and BOTH still land inside
+// the check's own attributed frames — there is no window-boundary trick that
+// separates them, because there is no boundary between them; it is the same
+// window's own live phase straddling the moment resume actually happened.
+// Ordinary apply()'d accumulation would then silently let whichever arrived
+// later win, which is not always the frozen one. registersAsOf answers the
+// question a frozen-instant comparison actually needs: what did the DUT see
+// while frozen, not what did it see last.
+//
+// Everything else this suite's checks read off a Conversation (ModelChain,
+// coverage, per-write assertions) keeps using apply's full, last-write-wins
+// image via Conversation.Registers — this constructor is additive, and
+// touches no other check's evidence.
+func registersAsOf(exchanges []Exchange, cutoff time.Time, at func(frame int) (time.Time, bool)) *RegisterView {
+	v := newRegisterView()
+	for _, ex := range exchanges {
+		start, _, ok := ex.Request.ReadRequest()
+		if !ok || ex.Response == nil {
+			continue
+		}
+		if !framesAtOrBefore(ex.Response.Frames, cutoff, at) {
+			continue
+		}
+		if _, regs, ok := ex.Response.ReadResponse(); ok {
+			v.apply(start, regs, *ex.Response)
+		}
+	}
+	return v
+}
+
+// framesAtOrBefore reports whether every frame in frames has a resolvable
+// timestamp at or before cutoff. An ADU with no frames at all (should not
+// happen — see ownedOnly, which drops those) is conservatively excluded.
+func framesAtOrBefore(frames []int, cutoff time.Time, at func(frame int) (time.Time, bool)) bool {
+	if len(frames) == 0 {
+		return false
+	}
+	for _, f := range frames {
+		t, ok := at(f)
+		if !ok || t.After(cutoff) {
+			return false
+		}
+	}
+	return true
 }
