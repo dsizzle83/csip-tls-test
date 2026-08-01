@@ -174,7 +174,10 @@ func prot002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		"RFC 6066 max_fragment_length, so it cannot establish a session under the negotiated limit. The " +
 		"negotiation itself is asserted from the ServerHello.")
 
-	half := watchClientHalf(ctx, rc)
+	// PROT-002#4 (census 20260731T234821): see watchClientHalfForced's doc
+	// in helpers.go for why a plain wait almost never catches this suite's
+	// own southbound ClientHello by the time PROT-002 runs.
+	half := watchClientHalfForced(ctx, rc)
 
 	return certify.Result{
 		Verdict: t.verdict(),
@@ -332,7 +335,8 @@ func prot004(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		"a server-initiated one. The RFC 5746 indication, which is what SunSpecTCP-62 requires, is asserted " +
 		"from the wire.")
 
-	half := watchClientHalf(ctx, rc)
+	// PROT-004#3 (census 20260731T234821): see watchClientHalfForced's doc.
+	half := watchClientHalfForced(ctx, rc)
 
 	return certify.Result{
 		Verdict: t.verdict(),

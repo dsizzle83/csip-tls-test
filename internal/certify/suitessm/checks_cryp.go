@@ -73,7 +73,10 @@ func cryp001(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		"established on it and none is claimed",
 		suiteECDHE_ECDSA_AES128_CCM_8, tlsdis.CipherSuiteName(suiteECDHE_ECDSA_AES128_CCM_8))
 
-	half := watchClientHalf(ctx, rc)
+	// CRYP-001#7 (census 20260731T234821): forced, not passive — see
+	// watchClientHalfForced's doc for why a plain wait almost never catches
+	// this suite's own southbound ClientHello by the time CRYP-001 runs.
+	half := watchClientHalfForced(ctx, rc)
 
 	return certify.Result{
 		Verdict: t.verdict(),
@@ -174,7 +177,8 @@ func cryp002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		"cipher, so no TLS 1.3 CCM session was established and none is claimed",
 		suiteTLS13_AES128_CCM_SHA256, tlsdis.CipherSuiteName(suiteTLS13_AES128_CCM_SHA256))
 
-	half := watchClientHalf(ctx, rc)
+	// CRYP-002#6 (census 20260731T234821): see watchClientHalfForced's doc.
+	half := watchClientHalfForced(ctx, rc)
 
 	return certify.Result{
 		Verdict: t.verdict(),
@@ -295,8 +299,12 @@ func cryp003(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	cv, cobs := selectedSuite(control, suiteECDHE_ECDSA_AES128_GCM_SHA256)
 	t.add(cv, "control: %s", cobs)
 
-	// The configurability half, off-wire.
-	suiteCfg, cfgErr := readGatewayFile(ctx, rc, "/etc/lexa/configs/mbaps.json")
+	// The configurability half, off-wire. The real path has no /configs/
+	// segment — see the identical fix in checks_pki.go's pki009 and the
+	// established convention in helpers.go/checks_rbac.go. Census
+	// 20260731T234821's CRYP-003#3 was a false read-only-fallback SKIP caused
+	// by this check alone reading the wrong (nonexistent) path.
+	suiteCfg, cfgErr := readGatewayFile(ctx, rc, "/etc/lexa/mbaps.json")
 	if cfgErr != nil {
 		t.caveat("the suite-disable MECHANISM (steps 4 and 9) was not exercised: toggling a cipher suite is a "+
 			"configuration change to a shared DUT, which this bench is forbidden from making, and the DUT's "+
@@ -342,7 +350,7 @@ func cryp003(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			} else {
 				a, err := ev.Narrative(claim, method, certify.Pass,
 					summariseSuiteConfig(suiteCfg),
-					"the DUT's own /etc/lexa/configs/mbaps.json, read over the read-only gateway client; the "+
+					"the DUT's own /etc/lexa/mbaps.json, read over the read-only gateway client; the "+
 						"disable/re-enable steps themselves were NOT performed, because this suite may not "+
 						"reconfigure a shared bench DUT")
 				if err != nil {
@@ -396,7 +404,8 @@ func cryp004(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		"a ClientHello whose supported_groups offered only secp384r1, without the mandatory P-256"))
 	t.add(v, "negative iteration: %s", obs)
 
-	half := watchClientHalf(ctx, rc)
+	// CRYP-004#4 (census 20260731T234821): see watchClientHalfForced's doc.
+	half := watchClientHalfForced(ctx, rc)
 
 	return certify.Result{
 		Verdict: t.verdict(),
@@ -604,7 +613,8 @@ func cryp006(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		"Conformance Statement was supplied to this run, and the suite will not manufacture a " +
 		"cross-reference table from the codepoints it happened to observe")
 
-	half := watchClientHalf(ctx, rc)
+	// CRYP-006#3 (census 20260731T234821): see watchClientHalfForced's doc.
+	half := watchClientHalfForced(ctx, rc)
 
 	return certify.Result{
 		Verdict: t.verdict(),

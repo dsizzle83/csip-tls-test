@@ -1440,7 +1440,11 @@ func rbac010(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 // went on to carry application data, which is visible without decrypting
 // anything.
 func rbac011(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	half := watchClientHalf(ctx, rc)
+	// RBAC-011#1 (census 20260731T234821): forced, not passive. RBAC-011's
+	// whole case rests on this one observation — see watchClientHalfForced's
+	// doc in helpers.go for why a plain wait almost never catches this
+	// suite's own southbound ClientHello by the time RBAC-011 runs.
+	half := watchClientHalfForced(ctx, rc)
 
 	var t tally
 	if !half.Armed {

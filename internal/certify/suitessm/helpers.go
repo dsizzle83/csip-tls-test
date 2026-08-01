@@ -326,6 +326,66 @@ func watchClientHalf(ctx context.Context, rc *certify.RunCtx) *clientHalf {
 	return c
 }
 
+// forcedReconnectFault is the mbaps-native fault kind (sim/mbapsdev/faults.go)
+// that severs the gateway's current southbound session server-side, forcing
+// its next request to reconnect with a fresh ClientHello. It is the mbaps
+// equivalent of suitemodbusclient's tcp_drop (see that suite's
+// observer.forceReconnect in observe.go), which mbapsdev deliberately
+// rejects over its own transport — see faults.go's package doc.
+const forcedReconnectFault = "drop_session"
+
+// watchClientHalfForced is watchClientHalf, except that it arms mbapsdev's
+// drop_session fault before the observation wait begins and clears it
+// (best-effort, logged) once the wait ends.
+//
+// watchClientHalf's passive wait assumes a ClientHello will land inside the
+// window it waits out, but SunSpecTCP-1 keeps an mbaps session open
+// indefinitely once established. By the time most of this suite's test cases
+// run, the gateway's southbound client has long since completed its one and
+// only handshake for the run, so nothing short of severing that session ever
+// produces a NEW ClientHello for a later check to observe — a 45 s passive
+// wait times out every time, not because the gateway is non-conformant but
+// because nothing asked it to reconnect. Run 20260731T234821's census names
+// the whole resulting family of false SKIPs: CRYP-001#7, CRYP-002#6,
+// CRYP-004#4, CRYP-006#3, PROT-002#4, PROT-004#3 and RBAC-011#1 all "fail to
+// observe a fresh gateway ClientHello" for exactly this reason.
+//
+// Severing the session is a WRITE, but to the bench's OWN device sim, not to
+// the DUT — the shared-bench constraint this suite must honour is about not
+// mutating the gateway under test, and provoking the reconnect it already
+// performs on every restart or network blip does not do that.
+//
+// The endpoint/port come from rc.Sim("mbapsdev") — the same simapi
+// configuration surface (rc.Targets.MBAPSDevAPI) watchClientHalf itself is
+// fed the mbaps endpoint from — never a hardcoded host:port.
+func watchClientHalfForced(ctx context.Context, rc *certify.RunCtx) *clientHalf {
+	sim, err := rc.Sim("mbapsdev")
+	if err != nil {
+		// No mbapsdev simapi is configured: fall back to the plain passive
+		// wait. It will very likely SKIP as before, which is an honest report
+		// of what this bench can do here, not a fabricated PASS.
+		rc.Logf("cannot force a fresh gateway reconnect: %v; falling back to a passive wait for the client half", err)
+		return watchClientHalf(ctx, rc)
+	}
+	if ferr := sim.Fault(ctx, map[string]any{"kind": forcedReconnectFault}, nil); ferr != nil {
+		rc.Logf("could not arm %q on mbapsdev to force a fresh gateway ClientHello: %v; falling back to a "+
+			"passive wait for the client half", forcedReconnectFault, ferr)
+		return watchClientHalf(ctx, rc)
+	}
+	rc.Logf("armed on mbapsdev: %q — sever the gateway's long-lived southbound session so its reconnect "+
+		"carries a fresh ClientHello inside this test case's observation window", forcedReconnectFault)
+	defer func() {
+		clearCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if cerr := sim.Fault(clearCtx, map[string]any{"kind": forcedReconnectFault, "clear": true}, nil); cerr != nil {
+			rc.Logf("WARNING: could not clear %q on mbapsdev: %v", forcedReconnectFault, cerr)
+			return
+		}
+		rc.Logf("cleared on mbapsdev: %q", forcedReconnectFault)
+	}()
+	return watchClientHalf(ctx, rc)
+}
+
 // hello finds the gateway's ClientHello among the frames attributed to this
 // check, and the conversation it belongs to.
 func (c *clientHalf) hello(ev *certify.Evidence) (*tlsdis.ClientHello, *wireView, error) {

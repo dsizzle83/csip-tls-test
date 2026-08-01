@@ -840,7 +840,12 @@ func pki008(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 // IS observable is asserted instead: what trust posture the DUT's southbound
 // client is actually configured with, read off the DUT read-only.
 func pki009(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	cfg, cfgErr := readGatewayFile(ctx, rc, "/etc/lexa/configs/modbus.json")
+	// The real path has no /configs/ segment — see helpers.go's
+	// ObservationSpec.ConfigPath and checks_rbac.go's rulesCandidates, both of
+	// which read the DUT's config from /etc/lexa/*.json directly. Census
+	// 20260731T234821's PKI-009#2 was a false read-only-fallback SKIP caused
+	// by this check alone reading the wrong (nonexistent) path.
+	cfg, cfgErr := readGatewayFile(ctx, rc, "/etc/lexa/modbus.json")
 
 	var t tally
 	t.caveat("PKI-009 is an OPTIONAL capability and applies only if the vendor claims self-signed support. " +
@@ -871,7 +876,7 @@ func pki009(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			}
 			a, err := ev.Narrative(postureClaim, postureMethod, certify.Pass,
 				summariseTrustPolicy(cfg),
-				"the DUT's own /etc/lexa/configs/modbus.json, read over the read-only gateway client")
+				"the DUT's own /etc/lexa/modbus.json, read over the read-only gateway client")
 			if err != nil {
 				return nil, err
 			}
