@@ -34,7 +34,7 @@ func HighestPriorityProgram(programs []ProgramState) *ProgramState {
 	for i := 1; i < len(programs); i++ {
 		if programs[i].Program.Primacy < programs[best].Program.Primacy ||
 			(programs[i].Program.Primacy == programs[best].Program.Primacy &&
-				programs[i].Program.MRID < programs[best].Program.MRID) {
+				programs[i].Program.MRID > programs[best].Program.MRID) {
 			best = i
 		}
 	}

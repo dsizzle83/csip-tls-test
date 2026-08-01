@@ -61,8 +61,8 @@ func TestHighestPriorityProgramTieBreaker(t *testing.T) {
 		{Program: model.DERProgram{MRID: "AAA", Primacy: 1}},
 	}
 	hp := HighestPriorityProgram(programs)
-	if hp.Program.MRID != "AAA" {
-		t.Errorf("got %q, want AAA", hp.Program.MRID)
+	if hp.Program.MRID != "BBB" {
+		t.Errorf("got %q, want BBB (Table 50 mRID descending)", hp.Program.MRID)
 	}
 }
 
