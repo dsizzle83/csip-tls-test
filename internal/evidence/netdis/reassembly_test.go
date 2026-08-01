@@ -462,6 +462,95 @@ func TestAssemblerOverCapturedPackets(t *testing.T) {
 	}
 }
 
+// TestAssemblerSplitsReusedPortIntoGenerations reproduces the exact shape of
+// census 20260731T234821's CRYP-001 / PKI-8 collision: two entirely unrelated
+// TCP connections, minutes apart in a real capture but back-to-back here,
+// that the kernel happened to hand the same local port. Before generation
+// splitting, both fed the same *Stream and their bytes concatenated into one
+// (wrong) reassembly; a downstream consumer merging frame ownership by bare
+// StreamKey would then see one shared conversation and could give it away
+// wholesale to whichever side had more frames. This test pins the fix at its
+// source: the Assembler itself must never let the second connection's bytes
+// land in the first connection's Direction.
+func TestAssemblerSplitsReusedPortIntoGenerations(t *testing.T) {
+	a := NewAssembler()
+	for _, s := range []seg{
+		// Connection 1: opens, carries "first-conn", closes cleanly.
+		{pkt: 1, seq: 0x1000_0000, flags: SYN},
+		{pkt: 2, seq: 0x2000_0000, flags: SYN | ACK, rev: true},
+		{pkt: 3, seq: 0x1000_0001, data: "first-conn"},
+		{pkt: 4, seq: 0x1000_000B, flags: FIN | ACK},
+		{pkt: 5, seq: 0x2000_0001, flags: FIN | ACK, rev: true},
+		// Connection 2: a fresh handshake reusing the exact same 4-tuple,
+		// with an unrelated ISN — the only signal a real capture offers.
+		{pkt: 6, seq: 0x5000_0000, flags: SYN},
+		{pkt: 7, seq: 0x6000_0000, flags: SYN | ACK, rev: true},
+		{pkt: 8, seq: 0x5000_0001, data: "second-conn"},
+	} {
+		a.AddFrame(s.frame())
+	}
+	streams := a.Streams()
+	if len(streams) != 2 {
+		t.Fatalf("got %d streams, want 2 (one per connection instance): %v", len(streams), streams)
+	}
+	if streams[0].Gen != 0 || streams[1].Gen != 1 {
+		t.Fatalf("generations = %d, %d, want 0, 1", streams[0].Gen, streams[1].Gen)
+	}
+	if got, want := forward(streams[0]).Bytes.Bytes(), "first-conn"; string(got) != want {
+		t.Errorf("generation 0 bytes = %q, want %q (no contamination from generation 1)", got, want)
+	}
+	if got, want := forward(streams[1]).Bytes.Bytes(), "second-conn"; string(got) != want {
+		t.Errorf("generation 1 bytes = %q, want %q (no contamination from generation 0)", got, want)
+	}
+	if streams[0].Key != streams[1].Key {
+		t.Fatalf("the two generations must share the same endpoint pair, got %v and %v", streams[0].Key, streams[1].Key)
+	}
+	if streams[0].InstanceKey() == streams[1].InstanceKey() {
+		t.Fatalf("InstanceKey must disambiguate the two generations, both rendered %q", streams[0].InstanceKey())
+	}
+	if got := streams[0].InstanceKey(); got != streams[0].Key.String() {
+		t.Errorf("the first generation's InstanceKey = %q, want the plain key %q (unchanged for the ordinary case)",
+			got, streams[0].Key.String())
+	}
+
+	// StreamFor must route every frame to the generation it actually belongs
+	// to, which is what lets the certify layer attribute frames without
+	// re-deriving generations itself.
+	if st := a.StreamFor(3); st != streams[0] {
+		t.Errorf("frame 3 (connection 1 data) routed to generation %d, want 0", st.Gen)
+	}
+	if st := a.StreamFor(8); st != streams[1] {
+		t.Errorf("frame 8 (connection 2 data) routed to generation %d, want 1", st.Gen)
+	}
+
+	// FindPort must surface both generations, not just the latest.
+	if got := a.FindPort(epGateway.Port); len(got) != 2 {
+		t.Fatalf("FindPort returned %d streams, want 2", len(got))
+	}
+}
+
+// TestAssemblerSYNRetransmitStaysOneGeneration guards the boundary the ISN
+// check exists to respect: an ordinary retransmitted SYN (identical sequence
+// number, no intervening close) must never be mistaken for a new connection,
+// or an unreliable link would fragment one legitimate session into several.
+func TestAssemblerSYNRetransmitStaysOneGeneration(t *testing.T) {
+	a := NewAssembler()
+	for _, s := range []seg{
+		{pkt: 1, seq: isn, flags: SYN},
+		{pkt: 2, seq: isn, flags: SYN}, // lost SYN-ACK, client retries
+		{pkt: 3, seq: isn + 1, data: "payload"},
+	} {
+		a.AddFrame(s.frame())
+	}
+	streams := a.Streams()
+	if len(streams) != 1 {
+		t.Fatalf("got %d streams, want 1: a SYN retransmit must not start a new generation", len(streams))
+	}
+	if got, want := forward(streams[0]).Bytes.Bytes(), "payload"; string(got) != want {
+		t.Errorf("bytes = %q, want %q", got, want)
+	}
+}
+
 func TestOverlapString(t *testing.T) {
 	o := Overlap{Offset: 12, Length: 4, Packet: 9, KeptPacket: 7, Conflict: true}
 	if got, want := o.String(), "CONFLICTING overlap at stream offset 12 (4 bytes): frame 9 discarded, frame 7 kept"; got != want {

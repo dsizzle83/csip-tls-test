@@ -946,10 +946,19 @@ func (r *Runner) cite(ctx context.Context, rep *RunReport, windows []*Window, pa
 	rep.CaptureProblems = append(rep.CaptureProblems, fi.Problems...)
 	att := fi.Attribute(windows)
 	rep.Attribution = att
+	// A genuine reuse ambiguity (see window.go's markAmbiguous) is folded into
+	// CaptureProblems, not just left inside the Attribution struct: that is
+	// what makes rep.OK() go false and the ambiguity impossible to miss in the
+	// bundle, rather than something a reader would have to notice went missing
+	// from a frame count.
+	rep.CaptureProblems = append(rep.CaptureProblems, att.Ambiguous...)
 	reporter.Line("attribution: %s", att.Summary())
 	if len(att.Contested) > 0 {
 		reporter.Line("WARNING: %d frame(s) were claimed by more than one test case and attributed to none",
 			len(att.Contested))
+	}
+	for _, msg := range att.Ambiguous {
+		reporter.Line("WARNING: %s", msg)
 	}
 
 	var kl *keylog.Log

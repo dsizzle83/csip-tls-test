@@ -137,6 +137,10 @@ type Direction struct {
 	Flow  FlowKey
 	Bytes *StreamBytes
 
+	// Gen mirrors the owning Stream's Gen: which connection instance over
+	// Flow.Stream()'s pair this direction belongs to. See Stream.InstanceKey.
+	Gen int
+
 	SYNSeen bool
 	FINSeen bool
 	RSTSeen bool
@@ -162,6 +166,12 @@ type Direction struct {
 	maxPendingCap int
 }
 
+// InstanceKey renders the identity of the exact connection this direction
+// belongs to, not just the endpoint pair — see Stream.InstanceKey. Two
+// Directions with the same Flow but different InstanceKey are unrelated
+// connections that happened to reuse a local port.
+func (d *Direction) InstanceKey() string { return instanceKeyString(d.Flow.Stream(), d.Gen) }
+
 // HasConflictingOverlap reports whether any overlap carried different bytes for
 // the same sequence range — the tamper signal described on Overlap.
 func (d *Direction) HasConflictingOverlap() bool {
@@ -183,11 +193,37 @@ func (d *Direction) PendingGap() int { return d.pendingBytes }
 
 // Stream is a full TCP conversation: both directions plus the frames that
 // bracket it.
+//
+// Key alone does not identify a CONNECTION, only an endpoint PAIR: ephemeral
+// ports are reused, sometimes within seconds, so a capture can hold several
+// unrelated Streams that all share one Key. Gen disambiguates them — 0 for
+// the first connection this Assembler saw over that pair, 1 for the next,
+// and so on — and InstanceKey is the identity that actually names one
+// physical connection. See Assembler.AddFrame for how a generation boundary
+// is detected.
 type Stream struct {
 	Key   StreamKey
+	Gen   int
 	Dirs  [2]*Direction
 	First int // first frame index of the conversation
 	Last  int // last frame index seen
+
+	synSeen bool   // a bare (non-ACK) SYN has been seen for this generation
+	synSeq  uint32 // that SYN's sequence number
+}
+
+// InstanceKey renders the identity of this exact connection, not just the
+// endpoint pair it used: two Streams with the same Key can be entirely
+// unrelated connections, but two with the same InstanceKey are always the
+// same one. Plain Key.String() for the (overwhelmingly common) first
+// connection over a pair, so the ordinary case prints exactly as before.
+func (s *Stream) InstanceKey() string { return instanceKeyString(s.Key, s.Gen) }
+
+func instanceKeyString(k StreamKey, gen int) string {
+	if gen == 0 {
+		return k.String()
+	}
+	return fmt.Sprintf("%s (reuse #%d)", k, gen)
 }
 
 // Dir returns the direction whose sender is src.
@@ -204,16 +240,22 @@ func (s *Stream) ByFlow(f FlowKey) *Direction { return s.Dirs[s.Key.DirIndex(f)]
 // Assembler turns a sequence of dissected frames into TCP streams.
 //
 // It is single-threaded by design: packets must be fed in capture order, which
-// is the only order in which "first writer wins" has a defined meaning.
+// is the only order in which "first writer wins" has a defined meaning, and
+// which is what lets AddFrame tell a retransmitted SYN (does not start a new
+// connection) from a fresh one reusing an old local port (does).
 type Assembler struct {
-	streams    map[StreamKey]*Stream
-	order      []StreamKey
-	MaxPending int // per direction; zero means DefaultMaxPending
+	current    map[StreamKey]*Stream // the generation currently receiving frames, by endpoint pair
+	all        []*Stream             // every generation ever seen, in first-seen order
+	frameOwner map[int]*Stream       // frame index -> the Stream it was added to
+	MaxPending int                   // per direction; zero means DefaultMaxPending
 }
 
 // NewAssembler returns an empty Assembler.
 func NewAssembler() *Assembler {
-	return &Assembler{streams: make(map[StreamKey]*Stream)}
+	return &Assembler{
+		current:    make(map[StreamKey]*Stream),
+		frameOwner: make(map[int]*Stream),
+	}
 }
 
 // AddPacket dissects and feeds one captured packet. The dissected Frame is
@@ -230,6 +272,20 @@ func (a *Assembler) AddPacket(p pcapng.Packet) (*Frame, error) {
 
 // AddFrame feeds an already-dissected frame. Non-TCP frames, and TCP frames
 // that were IP fragments, are ignored.
+//
+// # Detecting a reused port
+//
+// A bare SYN (SYN without ACK) can only legitimately open a connection. If one
+// arrives for a pair that already has a generation in progress, two things can
+// have happened: an ordinary retransmission of THAT generation's own opening
+// SYN (the client's stack gave up waiting for a SYN-ACK and resent it
+// byte-for-byte, including its sequence number), or a brand new connection
+// that the kernel handed the exact same local port a prior, already-closed
+// connection used. The two are told apart by sequence number: a genuine
+// retransmit repeats the original ISN exactly, while a fresh connection's ISN
+// is generated independently and — bar the astronomically unlikely case of a
+// collision — differs. A SYN with a different ISN therefore starts a new
+// generation.
 func (a *Assembler) AddFrame(f *Frame) {
 	if f == nil || f.TCP == nil || f.Fragmented {
 		return
@@ -239,20 +295,32 @@ func (a *Assembler) AddFrame(f *Frame) {
 		return
 	}
 	key := flow.Stream()
-	st := a.streams[key]
-	if st == nil {
-		st = &Stream{Key: key, First: f.Index}
+	st := a.current[key]
+	bareSYN := f.TCP.Flags&SYN != 0 && f.TCP.Flags&ACK == 0
+	fresh := st == nil || (bareSYN && st.synSeen && f.TCP.Seq != st.synSeq)
+	if fresh {
+		gen := 0
+		if st != nil {
+			gen = st.Gen + 1
+		}
+		st = &Stream{Key: key, Gen: gen, First: f.Index}
 		for i := 0; i < 2; i++ {
 			st.Dirs[i] = &Direction{
 				Flow:          key.Flow(i),
+				Gen:           gen,
 				Bytes:         &StreamBytes{},
 				maxPendingCap: a.maxPending(),
 			}
 		}
-		a.streams[key] = st
-		a.order = append(a.order, key)
+		a.current[key] = st
+		a.all = append(a.all, st)
+	}
+	if bareSYN && !st.synSeen {
+		st.synSeen = true
+		st.synSeq = f.TCP.Seq
 	}
 	st.Last = f.Index
+	a.frameOwner[f.Index] = st
 	st.Dirs[key.DirIndex(flow)].add(f)
 }
 
@@ -263,26 +331,31 @@ func (a *Assembler) maxPending() int {
 	return DefaultMaxPending
 }
 
-// Streams returns every conversation in first-seen order.
+// Streams returns every conversation in first-seen order — every generation
+// of every endpoint pair, each a distinct physical connection.
 func (a *Assembler) Streams() []*Stream {
-	out := make([]*Stream, 0, len(a.order))
-	for _, k := range a.order {
-		out = append(out, a.streams[k])
-	}
-	return out
+	return append([]*Stream(nil), a.all...)
 }
 
-// Stream looks a conversation up by key.
-func (a *Assembler) Stream(k StreamKey) *Stream { return a.streams[k] }
+// Stream looks up the MOST RECENT generation seen over a pair. A capture with
+// port reuse holds earlier generations too; use Streams and filter by
+// InstanceKey to reach a specific one.
+func (a *Assembler) Stream(k StreamKey) *Stream { return a.current[k] }
 
-// FindPort returns the streams with an endpoint on the given port. Conformance
-// runs address a single well-known port (802 for mbaps), so this is the usual
-// way a test case gets from a capture to its conversation.
+// StreamFor returns the connection instance frame idx was added to, or nil if
+// idx was never fed to this Assembler (a non-TCP or fragmented frame, or an
+// index this Assembler never saw).
+func (a *Assembler) StreamFor(idx int) *Stream { return a.frameOwner[idx] }
+
+// FindPort returns the streams with an endpoint on the given port — every
+// generation, oldest first. Conformance runs address a single well-known port
+// (802 for mbaps), so this is the usual way a test case gets from a capture to
+// its conversation.
 func (a *Assembler) FindPort(port uint16) []*Stream {
 	var out []*Stream
-	for _, k := range a.order {
-		if k.A.Port == port || k.B.Port == port {
-			out = append(out, a.streams[k])
+	for _, st := range a.all {
+		if st.Key.A.Port == port || st.Key.B.Port == port {
+			out = append(out, st)
 		}
 	}
 	return out

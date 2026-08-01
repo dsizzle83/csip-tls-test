@@ -210,15 +210,20 @@ func (e *Evidence) mayCite(frame int) (ok, viaSession bool) {
 	if e.Set.Owns(frame) {
 		return true, false
 	}
-	fr, found := e.Index.frame(frame)
-	if !found {
+	if _, found := e.Index.frame(frame); !found {
 		return false, false
 	}
-	flow, hasFlow := fr.Flow()
-	if !hasFlow {
+	// The frame's connection INSTANCE, not its bare endpoint pair (see
+	// consolidateStreams's doc): two connections that only share a port
+	// because the kernel recycled it must never be treated as "the same
+	// stream" here either, or this would reopen exactly the hole
+	// consolidateStreams closes, just on the citation path instead of the
+	// attribution one.
+	st := e.Index.asm.StreamFor(frame)
+	if st == nil {
 		return false, false
 	}
-	key := flow.Stream().String()
+	key := st.InstanceKey()
 	owned := false
 	for _, s := range e.Set.Streams {
 		if s == key {
@@ -259,6 +264,12 @@ func (e *Evidence) Packets() []pcapng.Packet {
 }
 
 // Streams returns the TCP conversations this check's frames belong to.
+//
+// Matched by InstanceKey, not by the bare endpoint pair: a capture can hold
+// several unrelated connections that share a pair because the kernel reused a
+// local port (see netdis.Stream.InstanceKey), and this check's Streams list
+// names the specific connection ITS window actually attributed, never every
+// connection that ever used that pair.
 func (e *Evidence) Streams() []*netdis.Stream {
 	want := map[string]bool{}
 	for _, s := range e.Set.Streams {
@@ -266,7 +277,7 @@ func (e *Evidence) Streams() []*netdis.Stream {
 	}
 	var out []*netdis.Stream
 	for _, st := range e.Index.Streams() {
-		if want[st.Key.String()] {
+		if want[st.InstanceKey()] {
 			out = append(out, st)
 		}
 	}
@@ -395,7 +406,7 @@ func (e *Evidence) CiteBytes(claim, method string, v Verdict, observed string,
 	ref := bundle.StreamRef(d)
 	owned := false
 	for _, s := range e.Set.Streams {
-		if s == d.Flow.Stream().String() {
+		if s == d.InstanceKey() {
 			owned = true
 			break
 		}

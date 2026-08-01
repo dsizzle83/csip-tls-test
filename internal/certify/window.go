@@ -432,6 +432,19 @@ type Attribution struct {
 	// means two checks' connections were indistinguishable in both time and
 	// 4-tuple, which normally means ephemeral port reuse inside the guard.
 	Contested map[int][]string `json:"contested,omitempty"`
+	// Ambiguous holds one human-readable line per connection INSTANCE (see
+	// netdis.Stream.InstanceKey) that more than one test case owned part of in
+	// a pattern consolidateStreams cannot explain as "one connection straddling
+	// a single window boundary" — ownership that interleaves rather than
+	// splitting once. That shape means two checks' connections were, despite
+	// generation splitting, still indistinguishable, which is a genuine
+	// ambiguity rather than the ordinary long-lived-session split. Every frame
+	// named in it has already been folded into Contested (attributed to
+	// nobody); this field exists so the ambiguity is also visible as PROSE, not
+	// just a frame-number diff, and so it becomes a capture-level problem (see
+	// runner.go's cite) rather than something a reader has to notice on their
+	// own.
+	Ambiguous []string `json:"ambiguous_reuse,omitempty"`
 	// Unattributed is how many capture frames no check claimed — the
 	// background traffic, and the expected majority on this bench.
 	Unattributed int `json:"unattributed"`
@@ -455,7 +468,25 @@ func (a *Attribution) Summary() string {
 
 // attribute applies the two-signal rule across every window in one pass over
 // the dissected frames.
+//
+// It reassembles frames into its own netdis.Assembler rather than accepting
+// one from the caller, purely to keep this function's signature — and every
+// existing direct caller, this package's own window/consolidate tests
+// included — unchanged. That reassembly is deterministic given the same
+// frames in the same order (which is exactly what every real caller, direct
+// or via FrameIndex.Attribute, has), so the generation numbers it produces
+// agree with whatever FrameIndex.asm computed over the identical capture:
+// two independent walks of the same ordered frames always land on the same
+// connection boundaries, because the boundary rule (Assembler.AddFrame) has
+// no hidden state beyond the frames themselves.
 func attribute(frames []*netdis.Frame, wins []*Window) *Attribution {
+	asm := netdis.NewAssembler()
+	for _, f := range frames {
+		if f != nil {
+			asm.AddFrame(f)
+		}
+	}
+
 	att := &Attribution{Sets: make(map[string]*FrameSet, len(wins)), Frames: len(frames)}
 	streams := map[string]map[string]bool{}
 	for _, w := range wins {
@@ -497,7 +528,7 @@ func attribute(frames []*netdis.Frame, wins []*Window) *Attribution {
 			att.Unattributed++
 			continue
 		case 1:
-			assign(att, streams, winners[0].UID, f)
+			assign(att, streams, winners[0].UID, f, asm)
 			continue
 		}
 
@@ -505,7 +536,7 @@ func attribute(frames []*netdis.Frame, wins []*Window) *Attribution {
 		// specific claim. Anything still ambiguous goes to nobody.
 		narrowed := narrow(winners, f, bestSpec)
 		if narrowed != nil {
-			assign(att, streams, narrowed.UID, f)
+			assign(att, streams, narrowed.UID, f, asm)
 			continue
 		}
 		uids := make([]string, 0, len(winners))
@@ -520,7 +551,7 @@ func attribute(frames []*netdis.Frame, wins []*Window) *Attribution {
 		att.Contested[f.Index] = uids
 	}
 
-	consolidateStreams(att, streams, frames)
+	consolidateStreams(att, streams, frames, asm)
 
 	for uid, fs := range att.Sets {
 		sort.Ints(fs.Frames)
@@ -533,41 +564,93 @@ func attribute(frames []*netdis.Frame, wins []*Window) *Attribution {
 	return att
 }
 
-// consolidateStreams makes attribution STREAM-ATOMIC: every frame of a TCP
-// conversation is attributed to the single check that owns most of it.
+// frameGroup is every frame this pass has seen belonging to one connection
+// INSTANCE (see netdis.Stream.InstanceKey), plus how many of them each test
+// case currently owns.
+type frameGroup struct {
+	frames []*netdis.Frame
+	byUID  map[string]int
+}
+
+// consolidateStreams makes attribution CONNECTION-ATOMIC: every frame of one
+// physical TCP connection is attributed to the single check that owns most of
+// it.
 //
-// Frame-level attribution splits a conversation whenever one straddles a window
-// boundary — routine, not exotic: a bench server with an idle timeout opens a
-// fresh connection per poll cycle, and those are short relative to the gap
-// between checks. A split conversation is useless to BOTH checks that share it:
-// neither can cite it, because the runner correctly refuses to let a check cite
-// frames another check owns. The evidence sits in the capture, unusable by
-// anyone, and the checks report it as missing.
+// # Instance, not endpoint pair
 //
-// A TLS session is indivisible evidence — handshake, keys and application
-// records only mean anything together — so the majority owner takes all of it.
-// This pass only ever moves frames of a conversation that is ALREADY split; it
-// never invents an owner for an unattributed one, and never touches a
-// conversation a single check already owns outright.
-func consolidateStreams(att *Attribution, streams map[string]map[string]bool, frames []*netdis.Frame) {
-	type group struct {
-		frames []*netdis.Frame
-		byUID  map[string]int
-	}
-	groups := map[string]*group{}
+// The grouping key is the connection INSTANCE that asm identified — the
+// endpoint pair plus which successive use of it this is — never the bare
+// pair. Grouping by the bare pair was census 20260731T234821's bug: the
+// kernel handed CRYP-001's iteration-1 probe and an entirely unrelated, later
+// PKI-8 connection the identical local port, and majority-vote — sound for
+// its actual job, one connection legitimately split across a window boundary
+// — silently gave PKI-8's larger connection ALL of the frames on that port,
+// including CRYP-001's small, correctly and uniquely attributed handshake.
+// Two connections that share a port only because the OS recycled it are, with
+// instance-keyed grouping, never in the same group to begin with, so there is
+// nothing for majority-vote to consolidate away.
+//
+// # Why a single split is still resolved, and how a fake one is refused
+//
+// Frame-level attribution splits a conversation whenever one straddles a
+// window boundary — routine, not exotic: a bench server with an idle timeout
+// opens a fresh connection per poll cycle, and those are short relative to
+// the gap between checks. A split conversation is useless to BOTH checks that
+// share it: neither can cite it, because the runner correctly refuses to let
+// a check cite frames another check owns. A TLS session is indivisible
+// evidence — handshake, keys and application records only mean anything
+// together — so the majority owner takes all of it, exactly as before.
+//
+// That doctrine only applies to a connection that ACTUALLY crosses one
+// boundary: ownership climbs from one case to the next and stays there.
+// cleanSplit checks that shape before any vote is taken. A connection instance
+// two cases own in an interleaved pattern is not explained by "one boundary
+// crossing" — it is a genuine ambiguity, most likely two windows that
+// remained open at the same time over the same reused port, close enough
+// together that even the SYN-sequence check that separates GENERATIONS could
+// not have told them apart (they are, after all, one real generation).
+// markAmbiguous refuses to guess: every such frame goes to CONTESTED, exactly
+// where an ordinary contested frame goes, and the run is marked with an
+// explicit capture problem (see runner.go's cite) so "0 contested" cannot be
+// silently wrong. This pass otherwise never invents an owner for an
+// unattributed frame, and never touches an instance a single check already
+// owns outright.
+//
+// # What generation splitting does not catch
+//
+// The ISN check in Assembler.AddFrame is not a full defense: two connections
+// whose SYNs happened to carry the identical sequence number would still be
+// merged into one generation upstream, and their frames — if claimed by
+// different, non-overlapping windows — would present to cleanSplit as an
+// ordinary, clean, monotonic split, because that is genuinely the shape a
+// pair of sequential unrelated connections and a pair of split-by-a-window-
+// boundary frames both produce once merged. This pass does not defend against
+// that; the reassembler does, incidentally: two connections' payloads almost
+// never continue each other's sequence-number space by coincidence, so the
+// merge shows up as a conflicting overlap or an unfillable gap in the
+// Direction the frames were merged into, which FrameIndex already turns into
+// a capture Problem (see evidence.go's NewFrameIndex). Between the two, the
+// only case left truly unnoticed is a peer that crafts an identical ISN AND
+// payload bytes offset-compatible with the connection it collides with — a
+// deliberately adversarial capture, not a shape ephemeral-port exhaustion
+// produces.
+func consolidateStreams(att *Attribution, streams map[string]map[string]bool, frames []*netdis.Frame, asm *netdis.Assembler) {
+	groups := map[string]*frameGroup{}
+	var order []string
 	for _, f := range frames {
 		if f == nil {
 			continue
 		}
-		flow, ok := f.Flow()
-		if !ok {
+		st := asm.StreamFor(f.Index)
+		if st == nil {
 			continue
 		}
-		key := flow.Stream().String()
+		key := st.InstanceKey()
 		g := groups[key]
 		if g == nil {
-			g = &group{byUID: map[string]int{}}
+			g = &frameGroup{byUID: map[string]int{}}
 			groups[key] = g
+			order = append(order, key)
 		}
 		g.frames = append(g.frames, f)
 		for uid, fs := range att.Sets {
@@ -578,9 +661,14 @@ func consolidateStreams(att *Attribution, streams map[string]map[string]bool, fr
 		}
 	}
 
-	for key, g := range groups {
+	for _, key := range order {
+		g := groups[key]
 		if len(g.byUID) < 2 {
 			continue // wholly owned, or owned by nobody: nothing to consolidate
+		}
+		if !cleanSplit(att, g.frames) {
+			markAmbiguous(att, streams, key, g)
+			continue
 		}
 		// Majority owner; ties broken by uid so two runs over one capture
 		// produce identical bundles.
@@ -619,6 +707,89 @@ func consolidateStreams(att *Attribution, streams map[string]map[string]bool, fr
 	}
 }
 
+// cleanSplit reports whether ownership of a connection instance's frames — in
+// capture order — forms one contiguous run per owning uid: the shape a single
+// connection straddling exactly one window boundary produces (A, A, A, B, B),
+// never mind any unowned frames interleaved in the gaps (which do not count
+// as a transition — a frame nobody claimed says nothing about whether the two
+// owners' claims are consistent). An owner whose frames are broken into more
+// than one run (A, B, A) is not explained by that doctrine.
+func cleanSplit(att *Attribution, frames []*netdis.Frame) bool {
+	var seq []string
+	for _, f := range frames {
+		for uid, fs := range att.Sets {
+			if fs.owns[f.Index] {
+				seq = append(seq, uid)
+				break
+			}
+		}
+	}
+	if len(seq) == 0 {
+		return true
+	}
+	distinct := map[string]bool{seq[0]: true}
+	transitions := 0
+	for i := 1; i < len(seq); i++ {
+		if seq[i] != seq[i-1] {
+			transitions++
+		}
+		distinct[seq[i]] = true
+	}
+	return transitions == len(distinct)-1
+}
+
+// markAmbiguous records a connection instance more than one test case owns
+// part of, in a pattern cleanSplit refused, as CONTESTED: every frame any of
+// the group's contenders currently owns is stripped from its owner and
+// attributed to nobody, exactly as an ordinary contested frame is. Silently
+// picking a winner here — the majority-vote this replaces — is precisely the
+// failure this mechanism exists to prevent, so this is the one path that adds
+// to Attribution.Ambiguous: a human-readable line that becomes a capture-level
+// problem in the bundle (runner.go's cite folds it into CaptureProblems),
+// which is what makes the ambiguity impossible to miss rather than a frame
+// count a reader would have to notice went missing.
+func markAmbiguous(att *Attribution, streams map[string]map[string]bool, key string, g *frameGroup) {
+	uids := make([]string, 0, len(g.byUID))
+	for uid := range g.byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	if att.Contested == nil {
+		att.Contested = map[int][]string{}
+	}
+	for _, f := range g.frames {
+		var owner string
+		for _, uid := range uids {
+			if att.Sets[uid].owns[f.Index] {
+				owner = uid
+				break
+			}
+		}
+		if owner == "" {
+			continue // never attributed to anyone; not part of the ambiguity
+		}
+		fs := att.Sets[owner]
+		delete(fs.owns, f.Index)
+		for i, idx := range fs.Frames {
+			if idx == f.Index {
+				fs.Frames = append(fs.Frames[:i], fs.Frames[i+1:]...)
+				break
+			}
+		}
+		att.Contested[f.Index] = append([]string(nil), uids...)
+		for _, uid := range uids {
+			att.Sets[uid].Contested = append(att.Sets[uid].Contested, f.Index)
+		}
+	}
+	for _, uid := range uids {
+		delete(streams[uid], key)
+	}
+	att.Ambiguous = append(att.Ambiguous, fmt.Sprintf(
+		"connection %s was claimed piecemeal by %s in a pattern no single window boundary explains "+
+			"(ownership interleaves rather than splitting once); every frame in it is attributed to nobody "+
+			"rather than guessed", key, strings.Join(uids, ", ")))
+}
+
 // narrow breaks a tie between windows that all matched a frame. It first
 // re-tests the time predicate without the guard slack, then prefers the
 // strictly most specific claim. It returns nil when the frame remains
@@ -654,12 +825,16 @@ func narrow(winners []*Window, f *netdis.Frame, bestSpec map[string]int) *Window
 	return nil
 }
 
-func assign(att *Attribution, streams map[string]map[string]bool, uid string, f *netdis.Frame) {
+// assign gives frame f to uid, recording the connection INSTANCE it belongs
+// to (not the bare endpoint pair — see consolidateStreams) in streams[uid],
+// which becomes FrameSet.Streams and is what Evidence.Streams/Stream/StreamOn
+// resolve a citation's bytes through.
+func assign(att *Attribution, streams map[string]map[string]bool, uid string, f *netdis.Frame, asm *netdis.Assembler) {
 	fs := att.Sets[uid]
 	fs.Frames = append(fs.Frames, f.Index)
 	fs.owns[f.Index] = true
-	if flow, ok := f.Flow(); ok {
-		streams[uid][flow.Stream().String()] = true
+	if st := asm.StreamFor(f.Index); st != nil {
+		streams[uid][st.InstanceKey()] = true
 	}
 }
 
