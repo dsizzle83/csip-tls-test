@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	model "lexa-proto/csipmodel"
@@ -223,5 +224,77 @@ func TestAdminControl_ToleratesExtendedList(t *testing.T) {
 	got := st.Programs[0].Active[0].Base.ExpLimW
 	if got == nil || *got != 4200 {
 		t.Fatalf("scalar control after curve: exp_lim_W = %v, want 4200 (control was not dropped)", got)
+	}
+}
+
+// TestAdminControl_ScalarPostOntoExtendedProgramKeepsResponseAttrs is the
+// regression lock for the toExtendedControl bug audit 2026-08-01 found: a
+// scalar /admin/control POST onto a program a PRIOR /admin/curve POST had
+// already widened to Extended served its control with NO replyTo and NO
+// responseRequired at all, because toExtendedControl (curve.go) copied every
+// DERControl field except those two. That is indistinguishable on the wire
+// from the standing, non-admin-seeded bench fixtures that legitimately omit
+// them (buildProgram0's doc), so a conformance criterion reading either
+// attribute for an admin-posted control on a curve-bound program got a false
+// "not requested"/"not recovered" reading regardless of what gridsim was
+// actually told to serve — this is what turned CORE-022's replyTo (assertion
+// 3) and Started (assertion 2) criteria degraded once program 0 happened to
+// be left curve-bound by earlier bench activity (coreResponsesSpec's doc,
+// core.go). TestAdminControl_ToleratesExtendedList above already proves the
+// control survives the widening at all; this test proves it survives with
+// its RespondableResource attributes intact.
+func TestAdminControl_ScalarPostOntoExtendedProgramKeepsResponseAttrs(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	// Curve first (makes program 0's derc/actderc extended) — same precondition
+	// as TestAdminControl_ToleratesExtendedList.
+	post := `{"program":0,"mode":"volt_var","points":[{"x":1,"y":2}],"activate":true}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(post))))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /admin/curve = %d", rec.Code)
+	}
+
+	// A scalar control, explicit mRID, activate=true, no ResponseRequired
+	// override — exactly coreResponsesSpec's Setup shape for CORE-022's
+	// completing control.
+	postControl(t, h, `{"program":0,"mrid":"CERT-CORE022-regress","exp_lim_W":4000,`+
+		`"duration_s":120,"activate":true}`)
+
+	var derc model.ExtendedDERControlList
+	getXML(t, s, "/derp/0/derc", &derc)
+	if len(derc.DERControl) != 1 {
+		t.Fatalf("/derp/0/derc has %d controls, want 1", len(derc.DERControl))
+	}
+	ctrl := derc.DERControl[0]
+	if ctrl.MRID != "CERT-CORE022-regress" {
+		t.Fatalf("served control mRID = %q, want CERT-CORE022-regress", ctrl.MRID)
+	}
+	if ctrl.ReplyTo != adminResponseReplyTo {
+		t.Errorf("ReplyTo = %q, want %q (an admin-posted control on an extended program lost its replyTo)",
+			ctrl.ReplyTo, adminResponseReplyTo)
+	}
+	if ctrl.ResponseRequired == nil {
+		t.Fatal("ResponseRequired is nil, want present by default (an admin-posted control on an extended " +
+			"program lost its responseRequired)")
+	}
+	if got := uint8(*ctrl.ResponseRequired); got != uint8(adminDefaultResponseRequired) {
+		t.Errorf("ResponseRequired = %#02x, want %#02x", got, uint8(adminDefaultResponseRequired))
+	}
+
+	// Also verified on the raw wire bytes, not just the unmarshalled struct:
+	// the attribute must actually be present in the served XML, not merely
+	// zero-valued-but-present in Go (an omitempty pointer would render "00"
+	// if set-but-zero, and would render NOTHING if nil — this is the
+	// distinction the bug actually turned on).
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/derp/0/derc", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `replyTo="`+adminResponseReplyTo+`"`) {
+		t.Errorf("raw /derp/0/derc body carries no replyTo attribute: %s", body)
+	}
+	if !strings.Contains(body, `responseRequired="03"`) {
+		t.Errorf("raw /derp/0/derc body carries no responseRequired attribute: %s", body)
 	}
 }

@@ -953,9 +953,17 @@ func coreResponsesSpec(nonce string) spec {
 				{
 					Claim: "the DUT POSTs its Responses to the replyTo URI the event carried, not to a " +
 						"hard-coded path",
-					How: "the request target of each Response POST compared with the replyTo attribute of the " +
-						"DERControl it acknowledges",
+					How: "the request target of each Response POST FOR THE COMPLETING CONTROL (mrid) compared " +
+						"with the replyTo attribute of the DERControl it acknowledges",
 					NeedsTranscript: true,
+					// Filtered on subj==mrid (audit 2026-08-01, same cross-control leak class
+					// critResponsePosted's fix (criteria_2030.go) closed): before this it graded
+					// whichever Response POST it found FIRST in capture order, of ANY subject. With
+					// only one live control that was harmless; CORE-022 now runs a second, concurrently
+					// live control (the server-cancel target — coreResponsesSpec's doc) whose own
+					// Response traffic interleaves with mrid's on the same window, so an unfiltered scan
+					// could grade — and cite — the wrong control's exchange for this claim, exactly the
+					// misattribution this suite's citation discipline exists to rule out.
 					Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 						replyTo := map[string]string{}
 						for _, e := range t.ByResource("DERControlList") {
@@ -976,6 +984,9 @@ func coreResponsesSpec(nonce string) spec {
 								continue
 							}
 							subj, _ := doc.TextOf("subject")
+							if subj != mrid {
+								continue
+							}
 							want, known := replyTo[subj]
 							if !known {
 								return citeMessage(t, e.Req, certify.Warn,
@@ -990,7 +1001,7 @@ func coreResponsesSpec(nonce string) spec {
 							return citeMessage(t, e.Req, v,
 								"Response for %s POSTed to %s; the event's replyTo is %s", subj, e.Req.Path, want)
 						}
-						return unavailable("the recovered transcript holds no Response POST")
+						return unavailable("the recovered transcript holds no Response POST for subject %s", mrid)
 					},
 				},
 				{

@@ -340,9 +340,31 @@ func pointsToCurveData(pts []curvePoint) []model.DERCurveData {
 // toExtendedControl widens a scalar DERControl into an ExtendedDERControl so a
 // scalar /admin/control post can append to a list a prior curve post made
 // extended, without mixing types.
+//
+// ReplyTo/ResponseRequired must ride along explicitly (audit 2026-08-01):
+// they are adminCtrlPost's own RespondableResource attributes (see
+// adminDefaultResponseRequired/adminResponseReplyTo in admin.go), set fresh on
+// every scalar ctrl it builds, and ExtendedDERControl carries the identical
+// pair of fields for exactly this reason (der.go's ExtendedDERControl doc:
+// "the extended (curve-linked) DERControl carries the same replyTo/
+// responseRequired the plain DERControl does"). Before this fix they were the
+// only two fields this conversion dropped, so a scalar /admin/control POST
+// landing on a program a PRIOR /admin/curve POST had already widened to
+// Extended silently served that control with NO replyTo and NO
+// responseRequired at all — indistinguishable on the wire from one of the
+// standing, non-admin-seeded bench fixtures (buildProgram0's doc) that
+// legitimately omit them to exercise the DUT's fallback-to-advertised-default
+// path. A conformance check reading either attribute for an admin-posted
+// control on a curve-bound program got exactly that false "not requested" /
+// "not recovered" reading regardless of what gridsim was actually told to
+// serve — see CORE-022's coreResponsesSpec doc and
+// TestAdminControl_ScalarPostOntoExtendedProgramKeepsResponseAttrs
+// (curve_test.go) for the reproduction.
 func toExtendedControl(c model.DERControl) model.ExtendedDERControl {
 	return model.ExtendedDERControl{
 		Resource:          c.Resource,
+		ReplyTo:           c.ReplyTo,
+		ResponseRequired:  c.ResponseRequired,
 		MRID:              c.MRID,
 		Description:       c.Description,
 		Version:           c.Version,

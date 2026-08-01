@@ -433,3 +433,208 @@ func TestCoreSupersedingSpec_TwoConstructionsPublishDistinctPairs(t *testing.T) 
 			"must agree on exactly one mRID pair per construction")
 	}
 }
+
+// TestCoreResponsesSpec_ReplyToCriterionGradesControlASpecifically is the
+// regression lock for the OTHER half of the 2026-08-01 audit (see
+// core.go's replyTo criterion, in coreResponsesSpec's Criteria): before the
+// fix, the Wire evaluator graded whichever Response POST it found FIRST in
+// capture order, of ANY subject — harmless with CORE-022's old single-control
+// shape, but with two live controls (the completing control, mrid, and the
+// server-cancelled one, cancelMrid) it could cite the WRONG control's
+// exchange for a claim that is specifically about the control under test.
+//
+// The reproduction: cancelMrid's Response is the one that lands FIRST in
+// capture order and its own DERControl was never recovered in this window (a
+// realistic shape — a control on a different program, GETed on a different
+// poll cycle than the one this synthetic window happens to cover), while
+// mrid's DERControl WAS recovered, correctly carrying replyTo, and mrid's own
+// Response correctly targets it. An evaluator that does not filter by
+// subject grades cancelMrid's exchange and reports WARN ("...was not
+// recovered in this window") — exactly the shape audit 2026-08-01 saw in
+// runs/tail-core022-20260801T202520 (there for an unrelated reason — a
+// gridsim bug that stripped mrid's OWN replyTo — but the missing subject
+// filter here is a second, independent gap this fix also closes). A
+// correctly-filtered evaluator skips cancelMrid's POST and grades mrid's own,
+// which resolves cleanly to Pass.
+func TestCoreResponsesSpec_ReplyToCriterionGradesControlASpecifically(t *testing.T) {
+	s := coreResponsesSpec("replytonc")
+	mrid, cancelMrid := "CERT-CORE022-replytonc", "CERT-CORE022-CANCEL-replytonc"
+
+	find := func(o *Observation) criterion {
+		for _, c := range s.Criteria(o) {
+			if strings.Contains(c.Claim, "replyTo URI") {
+				return c
+			}
+		}
+		t.Fatal("coreResponsesSpec's Criteria no longer carries the replyTo criterion")
+		return criterion{}
+	}
+
+	respBody := func(status int, subject string) string {
+		return `<DERControlResponse xmlns="urn:ieee:std:2030.5:ns"><createdDateTime>1</createdDateTime>` +
+			`<endDeviceLFDI>ab</endDeviceLFDI><status>` + itoa(int64(status)) + `</status>` +
+			`<subject>` + subject + `</subject></DERControlResponse>`
+	}
+	post := func(path string, status int, subject string) Exchange {
+		return Exchange{Req: msg(Request, "POST", path, 0, respBody(status, subject)),
+			Resp: msg(Response, "", "", 201, "")}
+	}
+	derc := func(path, ctrlMRID, replyTo string) string {
+		return `<?xml version="1.0" encoding="UTF-8"?>` +
+			`<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="` + path + `" all="1" results="1">` +
+			`<DERControl href="` + path + `/` + ctrlMRID + `" replyTo="` + replyTo + `">` +
+			`<mRID>` + ctrlMRID + `</mRID><description>t</description><creationTime>1</creationTime>` +
+			`<EventStatus><currentStatus>1</currentStatus><dateTime>1</dateTime></EventStatus>` +
+			`<interval><duration>120</duration><start>1</start></interval>` +
+			`<DERControlBase></DERControlBase></DERControl></DERControlList>`
+	}
+
+	// Capture order: cancelMrid's Response POST first (its own DERControl is
+	// NOT in this transcript at all — "not recovered"), then mrid's
+	// DERControl GET (correctly carrying replyTo) and mrid's own Response,
+	// correctly targeted at it.
+	tr := synthTranscript(
+		post("/rsps/1/r", 1, cancelMrid),
+		get("/derp/0/derc", 200, derc("/derp/0/derc", mrid, "/rsps/0/r")),
+		post("/rsps/0/r", 1, mrid),
+	)
+
+	f := wantVerdict(t, "replyTo grades control A, not the cancelled control", find(&Observation{}), tr,
+		certify.Pass)
+	if !strings.Contains(f.Observed, mrid) {
+		t.Errorf("replyTo criterion's Observed text does not cite control A's own subject %s: %q", mrid, f.Observed)
+	}
+	if strings.Contains(f.Observed, cancelMrid) {
+		t.Errorf("replyTo criterion cited the OTHER (cancelled) control %s instead of control A: %q",
+			cancelMrid, f.Observed)
+	}
+}
+
+// TestCoreResponsesSpec_FullLifecycleAssertionsGradeCorrectly is the
+// end-to-end reproduction the 2026-08-01 audit was for: CORE-022's exact
+// two-phase shape (control A completes 1/2/3 on program 0, control B is
+// cancelled to 6 mid-flight on program 1) driven against a REAL in-process
+// gridsim, with program 0 deliberately left curve-bound BEFORE Setup runs —
+// the precondition runs/tail-core022-20260801T202520 was captured under
+// (some earlier bench activity had bound a curve to program 0 and never
+// cleared it) — to prove the whole pipeline is robust to it now, not merely
+// that toExtendedControl in isolation is.
+//
+// The DERControlList bodies are the REAL bytes gridsim serves (fetched
+// through s.Handler(), the same handler the DUT talks to), not hand-typed
+// fixtures — so a regression in gridsim's own XML rendering would fail this
+// test even if every unit-level one above still passed. Only the DUT's
+// Response POSTs are synthetic: there is no real DUT in this process, and
+// every other Wire-tier test in this package synthesizes them the same way.
+//
+// Assertions 1/2/3 must PASS, all three against control A specifically, and
+// assertion 4 (the composite completion+cancel criterion) must PASS spanning
+// both controls — the state this row regressed FROM (3/4 PASS, pre-rework)
+// plus the coverage the rework ADDED, together, which is the whole point of
+// the fix.
+func TestCoreResponsesSpec_FullLifecycleAssertionsGradeCorrectly(t *testing.T) {
+	s := gridsim.NewServer(benchLFDI)
+	adminSrv := httptest.NewServer(s.AdminHandler())
+	t.Cleanup(adminSrv.Close)
+	rc := &certify.RunCtx{
+		Case:    &certify.Case{UID: "csip-conf-v1.3::CORE-022"},
+		GridSim: certify.NewAdminClient(adminSrv.URL, http.DefaultClient),
+		Targets: certify.Targets{GridSimAdmin: adminSrv.URL},
+	}
+	d := NewDriver(rc)
+	ctx := context.Background()
+
+	// The precondition: program 0 curve-bound before this check ever runs,
+	// exactly as a long-lived bench can leave it from unrelated earlier
+	// activity (curve.go's admin curve endpoint, sim/gridsim).
+	curveBody := `{"program":0,"mode":"volt_var","points":[{"x":1,"y":2}],"activate":true}`
+	curveRec := httptest.NewRecorder()
+	s.AdminHandler().ServeHTTP(curveRec, httptest.NewRequest("POST", "/admin/curve", strings.NewReader(curveBody)))
+	if curveRec.Code != http.StatusCreated {
+		t.Fatalf("setup: POST /admin/curve = %d; body: %s", curveRec.Code, curveRec.Body)
+	}
+
+	spec := coreResponsesSpec("e2enonce")
+	params := map[string]string{}
+	if err := spec.Setup(ctx, d, params); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := spec.Change(ctx, d, params); err != nil {
+		t.Fatalf("Change: %v", err)
+	}
+	mrid, cancelMrid := params["mrid"], params["cancelMrid"]
+
+	// fetchDerc reads the REAL served DERControlList for path (through the
+	// DUT-facing handler, not the admin one) and returns both its raw body
+	// (for the GET exchange) and the replyTo it recovered for ctrlMRID (so
+	// the synthetic Response POSTs below target wherever gridsim ACTUALLY
+	// told the DUT to reply, rather than an assumed constant).
+	fetchDerc := func(path, ctrlMRID string) (body, replyTo string) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d; body: %s", path, rec.Code, rec.Body)
+		}
+		body = rec.Body.String()
+		doc, err := msg(Response, "", "", 200, body).SEP()
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		for _, c := range doc.Children("DERControl") {
+			if m, _ := c.TextOf("mRID"); m != ctrlMRID {
+				continue
+			}
+			rt, ok := c.Attr("replyTo")
+			if !ok {
+				t.Fatalf("%s: DERControl %s carries no replyTo attribute at all (the exact bug this test "+
+					"guards against)", path, ctrlMRID)
+			}
+			replyTo = rt
+		}
+		if replyTo == "" {
+			t.Fatalf("%s: DERControl %s not found or carries an empty replyTo", path, ctrlMRID)
+		}
+		return body, replyTo
+	}
+	dercA, replyToA := fetchDerc("/derp/0/derc", mrid)
+	dercB, replyToB := fetchDerc("/derp/1/derc", cancelMrid)
+
+	respPost := func(replyTo string, status int, subject string) Exchange {
+		body := `<DERControlResponse xmlns="urn:ieee:std:2030.5:ns"><createdDateTime>1</createdDateTime>` +
+			`<endDeviceLFDI>ab</endDeviceLFDI><status>` + itoa(int64(status)) + `</status>` +
+			`<subject>` + subject + `</subject></DERControlResponse>`
+		return Exchange{Req: msg(Request, "POST", replyTo, 0, body), Resp: msg(Response, "", "", 201, "")}
+	}
+
+	tr := synthTranscript(
+		get("/derp/0/derc", 200, dercA),
+		get("/derp/1/derc", 200, dercB),
+		respPost(replyToA, 1, mrid),
+		respPost(replyToA, 2, mrid),
+		respPost(replyToA, 3, mrid),
+		respPost(replyToB, 1, cancelMrid),
+		respPost(replyToB, 2, cancelMrid),
+		respPost(replyToB, 6, cancelMrid),
+	)
+
+	crits := spec.Criteria(&Observation{})
+	if len(crits) != 4 {
+		t.Fatalf("coreResponsesSpec's Criteria returned %d criteria, want 4", len(crits))
+	}
+	names := []string{"1 (Received)", "2 (Started)", "3 (replyTo)", "4 (composite lifecycle)"}
+	for i := 0; i < 3; i++ {
+		if f := crits[i].Wire(nil, tr); f.Verdict != certify.Pass {
+			t.Errorf("assertion %s = %s, want Pass: %s (unavailable: %s)",
+				names[i], f.Verdict, f.Observed, f.Unavailable)
+		}
+	}
+
+	view := &ServerView{Available: true, Responses: []AdminResponse{
+		{Subject: mrid, Status: 1}, {Subject: mrid, Status: 2}, {Subject: mrid, Status: 3},
+		{Subject: cancelMrid, Status: 1}, {Subject: cancelMrid, Status: 2}, {Subject: cancelMrid, Status: 6},
+	}}
+	if f := crits[3].Server(view); f.Verdict != certify.Pass {
+		t.Errorf("assertion %s = %s, want Pass: %s", names[3], f.Verdict, f.Observed)
+	}
+}
