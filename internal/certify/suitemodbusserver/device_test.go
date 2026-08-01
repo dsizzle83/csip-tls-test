@@ -68,6 +68,13 @@ type deviceOpts struct {
 	// acknowledges a write it did not honour, which is exactly what MOD-3's
 	// read-after-write step exists to catch.
 	ClampWMaxLimPct uint16
+	// WMaxLimPctAtCeiling seeds 704.WMaxLimPct at its engineering-range
+	// ceiling under scale factor -2 (raw 10000 = 100.00 %) instead of the
+	// default mid-range seed, reproducing the shape
+	// runs/final-fullsuite-20260731T234821 found: a prior case (EXC-1) can
+	// leave the point sitting at its ceiling, and MB-1's perturbation must
+	// still land on an in-range value rather than incrementing past it.
+	WMaxLimPctAtCeiling bool
 	// NoReassembly closes the connection when a read does not deliver a whole
 	// ADU — the server that assumes one segment is one PDU (TCP-3, TCP-2).
 	NoReassembly bool
@@ -118,7 +125,6 @@ type device struct {
 var deviceEnums = map[string][2]int64{
 	"704.WMaxLimPctEna":     {0, 1},
 	"704.WMaxLimPctEnaRvrt": {0, 1},
-	"704.WMaxLimPct":        {0, 100},
 	"704.WMaxLimPctRvrt":    {0, 100},
 	"704.PFWInjEna":         {0, 1},
 	"704.VarSetEna":         {0, 1},
@@ -252,11 +258,17 @@ func (d *device) seedModel(base uint16, def *Model) {
 	case 702:
 		put(2, 8000) // WMaxRtg
 	case 704:
-		put(14, 0)  // WMaxLimPctEna
-		put(15, 50) // WMaxLimPct
+		put(14, 0) // WMaxLimPctEna
+		if d.opts.WMaxLimPctAtCeiling {
+			var sf int16 = -2
+			put(15, 10000)      // WMaxLimPct: raw ceiling under SF -2
+			put(54, uint16(sf)) // WMaxLimPct_SF: -2
+		} else {
+			put(15, 50) // WMaxLimPct
+			put(54, 0)  // WMaxLimPct_SF: percent carried directly in the register
+		}
 		put(16, 10) // WMaxLimPctRvrt
 		put(20, 0, 0)
-		put(54, 0) // WMaxLimPct_SF: percent carried directly in the register
 	}
 }
 
@@ -492,6 +504,24 @@ func (d *device) applyWrite(addr uint16, vals []uint16) mbap.ExCode {
 		for i := range vals {
 			m, p, ok := d.pointAt(addr + uint16(i))
 			if !ok || p.Name == "" {
+				continue
+			}
+			if m.ID == 704 && p.Name == "WMaxLimPct" {
+				// SF-aware, mirroring both the real DUT's decode.go and this
+				// suite's own writes.go rawBounds: the engineering range is
+				// fixed (0..100 %) but the raw bound depends on the scale
+				// factor the device itself reports, which
+				// WMaxLimPctAtCeiling moves away from 0. A fixed {0,100} raw
+				// bound here would silently stop matching the device once
+				// the scale factor does.
+				sfPt, _ := Models[704].Point("WMaxLimPct_SF")
+				sf := int16(d.regs[m.Addr+uint16(sfPt.Off)])
+				adj, _ := adjustableFor(704, "WMaxLimPct")
+				lo, hi := rawBounds(adj, int(sf))
+				v := int64(vals[i])
+				if v < lo || v > hi {
+					return mbap.ExIllegalValue
+				}
 				continue
 			}
 			bounds, has := deviceEnums[fmt.Sprintf("%d.%s", m.ID, p.Name)]

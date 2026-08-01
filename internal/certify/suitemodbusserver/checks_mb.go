@@ -239,6 +239,32 @@ func checkMB1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	}
 	addr := ref.Addr + uint16(ena.Off)
 
+	// WMaxLimPct's perturbation below must stay inside its engineering range —
+	// declared 0..100 % in writes.go's adjustables table, the same authority
+	// MOD-3 uses — converted through the scale factor the DUT itself reports,
+	// not assumed to be any particular exponent. This read happens before
+	// "before" is captured below, so it is not cited among the write/read-back
+	// exchanges the assertions rest on, the same as the discovery walk above.
+	block, berr := readModelBlock(s.client, ref, "MB-1: model 704 snapshot for the scale factor")
+	if berr != nil {
+		return certify.Result{}, fmt.Errorf("read model 704 for MB-1's scale factor: %w", berr)
+	}
+	adj, okAdj := adjustableFor(704, "WMaxLimPct")
+	if !okAdj {
+		return certify.Skipped("WMaxLimPct is not in this suite's adjustable-point table, so MB-1 has no " +
+			"engineering bounds to perturb it within"), nil
+	}
+	sf := 0
+	if adj.SF != "" {
+		v, okSF := scaleFactor(s.client, ref, block, adj.SF)
+		if !okSF {
+			return certify.Skipped("the scale factor %s is absent or not implemented, so WMaxLimPct's "+
+				"engineering range cannot be converted to register values", adj.SF), nil
+		}
+		sf = v
+	}
+	rawMin, rawMax := rawBounds(adj, sf)
+
 	before := len(s.client.log)
 	orig, rerr := s.client.readHolding(addr, 2, "MB-1: read the two adjustable points")
 	if rerr != nil {
@@ -247,8 +273,15 @@ func checkMB1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 
 	// New values that differ from the current ones so success is observable,
 	// per the procedure's precondition. The percentage moves by one unit inside
-	// its range; the enable is left alone unless enumeration writes are
-	// permitted, because toggling an enable is a real control action.
+	// WMaxLimPct's engineering range: increment, unless that would exceed the
+	// range's ceiling, in which case decrement instead. A prior case (e.g.
+	// EXC-1) can leave the point sitting at its ceiling raw value; incrementing
+	// past it is not a new value "inside the range" but an out-of-range write —
+	// which the DUT's decoder correctly refuses, since its {0,100} enforcement
+	// exists specifically from a prior hostile-QA finding (lexa-gw
+	// internal/writes/decode.go) — and that refusal is not an MB-1 failure to
+	// accept a valid write. The enable is left alone unless enumeration writes
+	// are permitted, because toggling an enable is a real control action.
 	noEnum := paramBool(rc, paramNoEnumWrite)
 	newEna := orig[0]
 	if !noEnum {
@@ -258,10 +291,16 @@ func checkMB1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			newEna = 0
 		}
 	}
-	newPct := orig[1] + 1
-	if newPct == orig[1] || newPct == 0xFFFF {
-		newPct = orig[1] - 1
+	origPct := int64(orig[1])
+	newPct64 := origPct + 1
+	if newPct64 > rawMax {
+		newPct64 = origPct - 1
 	}
+	if newPct64 < rawMin {
+		return certify.Skipped("WMaxLimPct's current value %d leaves no in-range value this suite's "+
+			"perturbation could move it to (engineering range %d..%d raw)", orig[1], rawMin, rawMax), nil
+	}
+	newPct := uint16(newPct64)
 
 	fc16OK, fc6OK := false, false
 	fc16Text, fc6Text := "", ""

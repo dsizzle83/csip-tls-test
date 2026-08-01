@@ -265,6 +265,42 @@ func TestMB1SkipsWhenWritesAreDenied(t *testing.T) {
 	o.wantVerdict(t, certify.Skip)
 }
 
+// TestMB1PerturbsWithinEngineeringBoundsWhenAtTheCeiling pins the fix for the
+// bug runs/final-fullsuite-20260731T234821 found by byte-level evidence: a
+// prior case (e.g. EXC-1) can leave 704.WMaxLimPct sitting at its raw
+// ceiling (100.00 % under scale factor -2, raw 10000). The old perturbation
+// (`orig[1] + 1`) only guarded against 16-bit wraparound, so at the ceiling
+// it wrote 10001 — an out-of-range value the DUT correctly refuses under its
+// {0,100} engineering-range enforcement — and MB-1 wrongly graded that
+// product-correct refusal as a harness failure. The fix must recognise the
+// ceiling and decrement to 9999 instead, so the write is accepted and both
+// write functions get a real, fully-cited PASS rather than a refusal-driven
+// SKIP.
+func TestMB1PerturbsWithinEngineeringBoundsWhenAtTheCeiling(t *testing.T) {
+	dev := newDevice(t, deviceOpts{WMaxLimPctAtCeiling: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MB-1", checkMB1, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	if !o.hasAssertion("Function Code 16") || !o.hasAssertion("Function Code 6") {
+		t.Fatalf("MB-1 did not assert both write functions at the ceiling:\n%s", o.dump())
+	}
+	o.wantVerifiableBundle(t)
+}
+
+// TestMB1PerturbsWithinEngineeringBoundsMidRange pins the increment branch of
+// the same fix: away from the ceiling, the perturbation still moves the
+// point up by one engineering unit, exactly as before the fix — the ceiling
+// case is the exception, not the rule.
+func TestMB1PerturbsWithinEngineeringBoundsMidRange(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::MB-1", checkMB1, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "Function Code 16")
+	if a.Verdict != certify.Pass || !contains(a.Observed, "0x0033") {
+		// orig seed is 50 (0x0032); the increment path writes 51 (0x0033).
+		t.Fatalf("the mid-range perturbation did not increment as expected: %s / %s", a.Verdict, a.Observed)
+	}
+}
+
 func TestMOD3PassesAConformantAdjustablePointSweep(t *testing.T) {
 	dev := newDevice(t, deviceOpts{})
 	o := runCheck(t, "ss-modbus-conf-v1.4::MOD-3", checkMOD3, dev, nil)
