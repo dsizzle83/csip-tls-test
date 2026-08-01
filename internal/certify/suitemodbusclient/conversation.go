@@ -94,7 +94,7 @@ type Conversation struct {
 // to report "the DUT never talked to this server during my window", and they
 // say it with a SKIP assertion carrying the reason, not with a failure.
 func loadConversation(ev *certify.Evidence, remote netip.AddrPort) (*Conversation, error) {
-	st, err := ev.Stream(remote)
+	st, err := resolveStream(ev, remote)
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +113,61 @@ func loadConversation(ev *certify.Evidence, remote netip.AddrPort) (*Conversatio
 	}
 	return buildConversation(reqDir, rspDir, remote,
 		netip.AddrPortFrom(cliEP.Addr, cliEP.Port), ev.Owns), nil
+}
+
+// resolveStream is ev.Stream(remote), except that MORE THAN ONE attributed
+// conversation with remote is not treated as an error to refuse: it is
+// resolved by preferring the most recently OPENED one.
+//
+// ev.Stream's refusal — "cite one explicitly rather than letting the
+// framework guess" — is the right default for a check that took no action of
+// its own: silently picking one of two candidate connections is usually how a
+// bundle ends up citing the wrong handshake (see its own doc comment in
+// evidence.go). It is the wrong default here. This suite's checks routinely
+// provoke the DUT mid-window — observer.fault's tcp_drop, exception_code,
+// unit_id_confusion, latency, nan_sentinel — and then wait out a poll cycle
+// or two, which is long enough for BOTH the tail of the connection the fault
+// disturbed (its FIN/RST landing inside the window) and the DUT's reconnect
+// to be attributed. Census 20260731T234821 names the resulting false SKIPs:
+// ERR-2#1, PROT-1#1 and READ-2#1 all hit ev.Stream's refusal instead of
+// getting evidence at all, each citing the exact same "N attributed
+// conversations; cite one explicitly" message.
+//
+// The reconnect is always the newer of the candidates — nothing a check in
+// this suite does can make the DUT open a connection dated before whatever
+// provoked it — so "the most recently opened attributed stream" IS "the one
+// after my fault injection", with no need to thread an injection timestamp
+// through to find out.
+func resolveStream(ev *certify.Evidence, remote netip.AddrPort) (*netdis.Stream, error) {
+	hits, err := ev.StreamsOn(remote.Port())
+	if err != nil {
+		return nil, fmt.Errorf("no attributed conversation with %s: %w", remote, err)
+	}
+	// StreamsOn matches by PORT alone; narrow to the streams that actually
+	// name remote's address on one side. Every bench server this suite talks
+	// to owns a dedicated port, so in practice this is a no-op filter rather
+	// than one this function relies on.
+	var candidates []*netdis.Stream
+	for _, st := range hits {
+		if endpointIs(st.Key.A, remote) || endpointIs(st.Key.B, remote) {
+			candidates = append(candidates, st)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return nil, fmt.Errorf("suitemodbusclient: no attributed conversation with %s (port %d matched "+
+			"%d stream(s) attributed to a different address)", remote, remote.Port(), len(hits))
+	case 1:
+		return candidates[0], nil
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].First < candidates[j].First })
+	return candidates[len(candidates)-1], nil
+}
+
+// endpointIs reports whether e names remote, independent of IPv4-in-IPv6
+// mapping.
+func endpointIs(e netdis.Endpoint, remote netip.AddrPort) bool {
+	return e.Addr.Unmap() == remote.Addr() && e.Port == remote.Port()
 }
 
 // buildConversation is loadConversation's core, with the ownership predicate

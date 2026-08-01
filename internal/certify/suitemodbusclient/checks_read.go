@@ -241,7 +241,12 @@ func checkREAD1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
-	if err := o.watch(ctx, 2); err != nil {
+	// READ-1#1 (census 20260731T234821): one more full poll interval than the
+	// original 2-cycle wait — this check forces no reconnect of its own, so
+	// it depends entirely on the DUT's steady-state cadence, and a window
+	// sized only for that cadence left it with zero attributed frames when a
+	// preceding test case's fault injection was still settling.
+	if err := o.watch(ctx, 3); err != nil {
 		return certify.Result{}, err
 	}
 	return certify.Result{

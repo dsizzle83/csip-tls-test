@@ -157,7 +157,10 @@ func checkCLI1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		return certify.Result{}, err
 	}
 	forced := o.forceReconnect(ctx)
-	if err := o.watch(ctx, 2); err != nil {
+	// CLI-1#5 (census 20260731T234821): 2 cycles caught the header-only chain
+	// walk but not model 1's separate full-body read that follows it — see
+	// the extended-window note on checkCLI3/checkCLI4 for the same fix.
+	if err := o.watch(ctx, 3); err != nil {
 		return certify.Result{}, err
 	}
 
@@ -309,7 +312,11 @@ func checkCLI3(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		return certify.Result{}, err
 	}
 	forced := o.forceReconnect(ctx)
-	if err := o.watch(ctx, 2); err != nil {
+	// CLI-3#5 (census 20260731T234821): one more full poll interval so the
+	// post-reconnect chain walk's separate full read of model 1's body — not
+	// just its header — lands inside this test case's window. See
+	// evalCommonModel, the assertion this extension is for.
+	if err := o.watch(ctx, 3); err != nil {
 		return certify.Result{}, err
 	}
 	want, haveWant := rc.Param(paramUnitID)
@@ -399,7 +406,8 @@ func checkCLI4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		return certify.Result{}, err
 	}
 	forced := o.forceReconnect(ctx)
-	if err := o.watch(ctx, 2); err != nil {
+	// CLI-4#5 (census 20260731T234821): see the identical note on checkCLI3.
+	if err := o.watch(ctx, 3); err != nil {
 		return certify.Result{}, err
 	}
 

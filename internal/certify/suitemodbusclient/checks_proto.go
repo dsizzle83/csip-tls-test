@@ -285,15 +285,18 @@ func checkPROT2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 				return emit(ev, c, pre), nil
 			}
 			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalPROT2(c)...)
+			fs = append(fs, evalPROT2(c, forced == nil)...)
 			fs = append(fs, evalFraming(c)...)
 			return emit(ev, c, fs), nil
 		},
 	}, nil
 }
 
-// evalPROT2 is PROT-2's decision logic.
-func evalPROT2(c *Conversation) []finding {
+// evalPROT2 is PROT-2's decision logic. selfSevered is true when THIS test
+// case's own o.forceReconnect (tcp_drop) succeeded, so the retry/reset
+// finding below can attribute a TCP reset to a provocation it can positively
+// identify rather than guessing.
+func evalPROT2(c *Conversation, selfSevered bool) []finding {
 	var out []finding
 
 	// (1) The row's literal subject: an ADU spanning segments.
@@ -359,11 +362,23 @@ func evalPROT2(c *Conversation) []finding {
 	switch {
 	case c.ReqDir == nil:
 		out = append(out, skipf(claim, method, "the DUT→server direction was not reassembled"))
+	case c.RSTSeen && selfSevered:
+		// PROT-2#4 (census 20260731T234821): the previous text pointed a
+		// reader at PROT-1 — an unrelated test case — to settle whether a
+		// severance had been injected here, which is not a question PROT-1's
+		// outcome can answer. This check knows its OWN provocation directly
+		// (o.forceReconnect's result, threaded in as selfSevered) and uses
+		// that instead of guessing or deferring to another case's evidence.
+		out = append(out, framesf(claim, method, certify.Skip, aduFrames(c.Requests...),
+			"the conversation carried a TCP reset, but THIS test case itself severed the DUT's preceding "+
+				"southbound connection with tcp_drop to force the reconnect being observed here (see the "+
+				"injection note above) — a self-identified provocation, not an unexplained DUT-originated "+
+				"reset, so it is not graded as a finding about the DUT's retry/reset discipline"))
 	case c.RSTSeen:
 		out = append(out, framesf(claim, method, certify.Warn, aduFrames(c.Requests...),
-			"the conversation carried a TCP reset. On this bench a reset is also how a deliberately "+
-				"severed connection ends, so it is reported rather than failed: see PROT-1 for whether "+
-				"a severance was injected in this run"))
+			"the conversation carried a TCP reset, and this test case injected no severance of its own "+
+				"(forceReconnect did not succeed here) — this bench cannot rule out a DUT-originated reset, "+
+				"so it is reported rather than failed"))
 	case c.TxIDs.Repeats > 0:
 		out = append(out, framesf(claim, method, certify.Warn, aduFrames(c.Requests...),
 			"%d request(s) reused a transaction id that was still outstanding, which is what a retry "+

@@ -504,7 +504,7 @@ func TestPROT2PassesASegmentedResponse(t *testing.T) {
 		{fromClient: true, payload: readReq(2, 1, 40002, 2)},
 		{payload: readRsp(2, 1, s.read(40002, 2))},
 	}}
-	fs := evalPROT2(scriptConversation(t, sc))
+	fs := evalPROT2(scriptConversation(t, sc), false)
 	if v := verdict(t, fs, "delivered across more than one TCP segment"); v != certify.Pass {
 		t.Errorf("segmentation verdict = %s, want PASS", v)
 	}
@@ -518,13 +518,52 @@ func TestPROT2PassesASegmentedResponse(t *testing.T) {
 
 func TestPROT2SkipsWhenNothingWasSegmented(t *testing.T) {
 	s := newSunSpecServer(40000)
-	fs := evalPROT2(scriptConversation(t, conformantClientScript(s)))
+	fs := evalPROT2(scriptConversation(t, conformantClientScript(s)), false)
 	f := only(t, fs, "delivered across more than one TCP segment")
 	if f.Verdict != certify.Skip {
 		t.Fatalf("verdict = %s, want SKIP", f.Verdict)
 	}
 	if !strings.Contains(f.Observed, "segment_response") {
 		t.Errorf("the SKIP did not name the sim verb that would close the gap: %s", f.Observed)
+	}
+}
+
+// TestPROT2DoesNotGradeAResetItInjectedItself is PROT-2#4 (census
+// 20260731T234821): a TCP reset this check identifies as its OWN
+// forceReconnect provocation must not be graded as a finding about the DUT's
+// retry/reset discipline — see the selfSevered branch in evalPROT2.
+func TestPROT2DoesNotGradeAResetItInjectedItself(t *testing.T) {
+	s := newSunSpecServer(40000)
+	sc := &script{stepMs: 5, rst: true, msgs: []msg{
+		{fromClient: true, payload: readReq(1, 1, 40000, 4)},
+		{payload: readRsp(1, 1, s.read(40000, 4))},
+	}}
+	fs := evalPROT2(scriptConversation(t, sc), true)
+	f := only(t, fs, "neither retried nor reset")
+	if f.Verdict != certify.Skip {
+		t.Fatalf("verdict = %s, want SKIP (a self-identified provocation, not a DUT finding)", f.Verdict)
+	}
+	if !strings.Contains(f.Observed, "itself severed") {
+		t.Errorf("the SKIP did not attribute the reset to this check's own severance: %s", f.Observed)
+	}
+}
+
+// TestPROT2WarnsOnAnUnexplainedReset is the contrast: the SAME reset, but this
+// check did NOT inject a severance of its own, so it cannot be explained away
+// and must still be reported.
+func TestPROT2WarnsOnAnUnexplainedReset(t *testing.T) {
+	s := newSunSpecServer(40000)
+	sc := &script{stepMs: 5, rst: true, msgs: []msg{
+		{fromClient: true, payload: readReq(1, 1, 40000, 4)},
+		{payload: readRsp(1, 1, s.read(40000, 4))},
+	}}
+	fs := evalPROT2(scriptConversation(t, sc), false)
+	f := only(t, fs, "neither retried nor reset")
+	if f.Verdict != certify.Warn {
+		t.Fatalf("verdict = %s, want WARN (an unexplained reset)", f.Verdict)
+	}
+	if !strings.Contains(f.Observed, "injected no severance") {
+		t.Errorf("the WARN did not say this check injected nothing: %s", f.Observed)
 	}
 }
 

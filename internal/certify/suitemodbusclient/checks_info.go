@@ -296,7 +296,15 @@ func checkINFO2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	if armed != nil {
 		return certify.Skipped("the not-implemented sentinel could not be armed on the server: %v", armed), nil
 	}
-	watchErr := o.watch(ctx, 2)
+	// INFO-2#1 (census 20260731T234821): hold the sentinel for at least one
+	// full poll interval beyond what a bare 2-cycle wait guarantees before
+	// clearing it. o.watch(2) already blocks for 2 full cycles before
+	// clearFault runs below, but that margin was not enough in the run this
+	// case names — the fault was armed and cleared before the DUT, still
+	// settling from whatever the preceding test case injected, got back to
+	// its next poll at all. One more cycle of margin, consistent with the
+	// fix applied to READ-1/WR-1/WR-2 for the same symptom.
+	watchErr := o.watch(ctx, 3)
 	o.clearFault("nan_sentinel")
 	if watchErr != nil {
 		return certify.Result{}, watchErr

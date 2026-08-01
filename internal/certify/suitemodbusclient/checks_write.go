@@ -96,9 +96,13 @@ func provokeWrites(ctx context.Context, rc *certify.RunCtx, o *observer) (*write
 		}
 	}
 
-	// Two poll cycles for the reconciler to act, plus one for the readback it
-	// performs after writing.
-	if err := o.watch(ctx, 3); err != nil {
+	// Two poll cycles for the reconciler to act, one for the readback it
+	// performs after writing, and one more margin cycle — WR-1#1/WR-2#1
+	// (census 20260731T234821) both landed zero attributed frames at 3
+	// cycles, consistent with the DUT's southbound client still settling
+	// from whatever the preceding test case injected when this check's own
+	// (unforced) window opened.
+	if err := o.watch(ctx, 4); err != nil {
 		return p, err
 	}
 	return p, nil
