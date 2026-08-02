@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -389,6 +390,152 @@ func TestERR2ClearsEveryFaultItArms(t *testing.T) {
 	if cited == 0 {
 		t.Errorf("no cited PASS assertion for the exceptions that were provoked: %+v\n%s",
 			c.Assertions, console)
+	}
+}
+
+// ── wiring: the modsim fault verbs landed in 9e35da6, driven end to end ───────
+
+// recordedBodies snapshots of has posted so far, safe for concurrent use.
+func (f *fakeSim) recordedBodies(of *[]map[string]any) []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any(nil), *of...)
+}
+
+// hasBody reports whether any body in bodies carries every key/value pair in
+// want, comparing values by their JSON-decoded form (float64 for a number)
+// so a caller may write literal ints in want without worrying about it.
+func hasBody(bodies []map[string]any, want map[string]any) bool {
+	for _, b := range bodies {
+		ok := true
+		for k, v := range want {
+			got, present := b[k]
+			if !present || fmt.Sprint(got) != fmt.Sprint(v) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCLI4EndToEndSweepsTheOtherTwoStandardBases(t *testing.T) {
+	const uid = "ss-modbus-client-conf-v1.1::CLI-4"
+	s := newSunSpecServer(40000)
+	sim := newFakeSim(t)
+	_, _, console := runOne(t, uid, conformantClientScript(s), sim)
+
+	faults := sim.recordedBodies(&sim.faults)
+	if !hasBody(faults, map[string]any{"kind": "relocate", "base": 0}) {
+		t.Errorf("no POST /fault {\"kind\":\"relocate\",\"base\":0} was recorded: %+v\n%s", faults, console)
+	}
+	if !hasBody(faults, map[string]any{"kind": "relocate", "base": 50000}) {
+		t.Errorf("no POST /fault {\"kind\":\"relocate\",\"base\":50000} was recorded: %+v\n%s", faults, console)
+	}
+	// The default base must ALWAYS be restored, unconditionally deferred —
+	// a bench left relocated would corrupt every OTHER check's discovery.
+	if !hasBody(faults, map[string]any{"kind": "relocate", "clear": true}) {
+		t.Errorf("the server's default base was never restored: %+v\n%s", faults, console)
+	}
+}
+
+func TestERR3EndToEndSplicesTheModelAndRetractsIt(t *testing.T) {
+	const uid = "ss-modbus-client-conf-v1.1::ERR-3"
+	s := newSunSpecServer(40000)
+	sim := newFakeSim(t)
+	_, _, console := runOne(t, uid, conformantClientScript(s), sim)
+
+	injects := sim.recordedBodies(&sim.injects)
+	spliced := false
+	for _, b := range injects {
+		m, ok := b["insert_model"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if fmt.Sprint(m["id"]) == "65000" && fmt.Sprint(m["len"]) == "4" {
+			spliced = true
+		}
+	}
+	if !spliced {
+		t.Errorf("no POST /inject {\"insert_model\":{\"id\":65000,\"len\":4}} was recorded: %+v\n%s",
+			injects, console)
+	}
+	if !hasBody(injects, map[string]any{"clear_insert_model": true}) {
+		t.Errorf("the spliced model was never retracted: %+v\n%s", injects, console)
+	}
+}
+
+func TestERR2EndToEndTargetsAllThreeRemainingExceptionCodes(t *testing.T) {
+	const uid = "ss-modbus-client-conf-v1.1::ERR-2"
+	s := newSunSpecServer(40000)
+	sc := &script{stepMs: 1, msgs: []msg{
+		{fromClient: true, payload: readReq(1, 1, 40000, 4)},
+		{payload: excRsp(1, 1, FCReadHoldingRegisters, 0x04)},
+		{fromClient: true, payload: readReq(2, 1, 40000, 4)},
+		{payload: excRsp(2, 1, FCReadHoldingRegisters, 0x0B)},
+		{fromClient: true, payload: readReq(3, 1, 40000, 4)},
+		{payload: readRsp(3, 1, s.read(40000, 4))},
+	}}
+	sim := newFakeSim(t)
+	_, _, console := runOne(t, uid, sc, sim)
+
+	faults := sim.recordedBodies(&sim.faults)
+	for _, code := range []int{1, 2, 3} {
+		if !hasBody(faults, map[string]any{"kind": "exception_code", "code": code, "on_fc": FCReadHoldingRegisters}) {
+			t.Errorf("no targeted exception_code fault for code %d, on_fc %d was recorded: %+v\n%s",
+				code, FCReadHoldingRegisters, faults, console)
+		}
+	}
+}
+
+func TestPROT1EndToEndArmsAndClearsShortResponse(t *testing.T) {
+	const uid = "ss-modbus-client-conf-v1.1::PROT-1"
+	s := newSunSpecServer(40000)
+	sim := newFakeSim(t)
+	_, _, console := runOne(t, uid, conformantClientScript(s), sim)
+
+	faults := sim.recordedBodies(&sim.faults)
+	if !hasBody(faults, map[string]any{"kind": "short_response", "truncate_bytes": shortResponseTruncateBytes}) {
+		t.Errorf("no POST /fault {\"kind\":\"short_response\",\"truncate_bytes\":%d} was recorded: %+v\n%s",
+			shortResponseTruncateBytes, faults, console)
+	}
+	if !hasBody(faults, map[string]any{"kind": "short_response", "clear": true}) {
+		t.Errorf("the short_response fault was never cleared: %+v\n%s", faults, console)
+	}
+}
+
+func TestINFO2EndToEndSeedsAndClearsTheTypedSentinel(t *testing.T) {
+	const uid = "ss-modbus-client-conf-v1.1::INFO-2"
+	s := newSunSpecServer(40000)
+	sim := newFakeSim(t)
+	_, _, console := runOne(t, uid, conformantClientScript(s), sim)
+
+	injects := sim.recordedBodies(&sim.injects)
+	seeded := false
+	for _, b := range injects {
+		list, ok := b["unimplemented"].([]any)
+		if !ok {
+			continue
+		}
+		for _, e := range list {
+			m, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			if fmt.Sprint(m["addr"]) == fmt.Sprint(infoSentinelAddr) && m["type"] == infoSentinelType {
+				seeded = true
+			}
+		}
+	}
+	if !seeded {
+		t.Errorf("no POST /inject {\"unimplemented\":[{\"addr\":%d,\"type\":%q}]} was recorded: %+v\n%s",
+			infoSentinelAddr, infoSentinelType, injects, console)
+	}
+	if !hasBody(injects, map[string]any{"clear_unimplemented": true}) {
+		t.Errorf("the typed sentinel was never cleared: %+v\n%s", injects, console)
 	}
 }
 

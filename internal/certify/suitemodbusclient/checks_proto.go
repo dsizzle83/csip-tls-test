@@ -47,6 +47,13 @@ import (
 // block visibly.
 const latencyMs = 9000
 
+// shortResponseTruncateBytes is the number of PDU bytes modsim's
+// short_response fault actually writes (sim/southbound/protorelay.go): the
+// function code and byte count survive, the register data does not, which
+// is the smallest truncation that still leaves the MBAP length field lying
+// about a plausible-looking response.
+const shortResponseTruncateBytes = 2
+
 // ── PROT-1 — Partial Response ─────────────────────────────────────────────────
 
 func checkPROT1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
@@ -90,20 +97,49 @@ func checkPROT1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 		return certify.Result{}, err
 	}
 
+	// Phase (c): the structurally truncated response — PROT-1#5 (census
+	// compliance-fullsuite-2-20260802T020946). Deliberately LAST, and
+	// deliberately on the SAME connection tcp_drop's recovery just
+	// confirmed (no further reconnect is forced here): shortArmedAt is the
+	// cutoff evalPROT1/evalPROT1ShortResponse use to keep this phase's own
+	// unanswered read from being misattributed to phase (a)'s "severed
+	// mid-flight" reading, or vice versa, when both land in the one
+	// conversation citeConversation selects for this test case. Needs
+	// modsim started with -protofault (sim/southbound/protorelay.go); the
+	// sim refuses the fault BY NAME when it was not, so this reports
+	// SKIP-with-reason rather than folding into "cannot be served at all".
+	var shortArmedAt time.Time
+	shortArmed := o.fault(ctx, map[string]any{"kind": "short_response", "truncate_bytes": shortResponseTruncateBytes},
+		fmt.Sprintf("write a response with a well-formed MBAP header promising the full PDU but stop the "+
+			"socket write after %d bytes of it, leaving the connection open — the structurally truncated "+
+			"reading of §2.8.1's undefined 'partial response'", shortResponseTruncateBytes))
+	if shortArmed == nil {
+		shortArmedAt = time.Now().UTC()
+		err := o.watch(ctx, 2)
+		o.clearFault("short_response")
+		if err != nil {
+			return certify.Result{}, err
+		}
+		if err := o.settle(ctx); err != nil {
+			return certify.Result{}, err
+		}
+	}
+
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("two readings of §2.8.1's undefined 'partial response' were driven — a "+
-			"severed transaction and an over-long response delay — and the DUT's recovery observed. "+
-			"The truncated-PDU reading could not be served. %s", o.injectionNote()),
+		Notes: fmt.Sprintf("three readings of §2.8.1's undefined 'partial response' were driven — a "+
+			"severed transaction, an over-long response delay, and (when modsim is started with "+
+			"-protofault) a structurally truncated response — and the DUT's recovery observed. %s",
+			o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT remained functional after a Modbus response failed to complete"
 			c, pre, ok := citeConversation(ev, o, claim)
 			if !ok {
-				return emit(ev, c, append(pre, prot1TruncatedSkip())), nil
+				return emit(ev, c, append(pre, evalPROT1ShortResponse(nil, nil, shortArmed, shortArmedAt))), nil
 			}
 			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalPROT1(c, timeFn(ev), severed == nil, latencyArmed == nil)...)
-			fs = append(fs, prot1TruncatedSkip())
+			fs = append(fs, evalPROT1(c, timeFn(ev), severed == nil, latencyArmed == nil, shortArmedAt)...)
+			fs = append(fs, evalPROT1ShortResponse(c, timeFn(ev), shortArmed, shortArmedAt))
 			return emit(ev, c, fs), nil
 		},
 	}, nil
@@ -121,15 +157,22 @@ func timeFn(ev *certify.Evidence) func(frame int) (time.Time, bool) {
 	}
 }
 
-// evalPROT1 is PROT-1's decision logic.
-func evalPROT1(c *Conversation, at func(int) (time.Time, bool), severed, latency bool) []finding {
+// evalPROT1 is PROT-1's decision logic. shortArmedAt, when non-zero, is the
+// moment phase (c)'s short_response fault was armed — everything this
+// function evaluates about phase (a)'s severed transaction is scoped to
+// BEFORE that instant, so a later, structurally-truncated-but-still-open
+// exchange (evaluated separately by evalPROT1ShortResponse) is never
+// misattributed here as "the server reset/closed the connection", which it
+// did not.
+func evalPROT1(c *Conversation, at func(int) (time.Time, bool), severed, latency bool,
+	shortArmedAt time.Time) []finding {
 	var out []finding
 
 	// (1) The incomplete response itself.
 	claim := "a Modbus response the DUT requested did not complete"
 	method := "a request in the reassembled DUT→server direction with no matching response, in a " +
 		"conversation the server closed"
-	unanswered := unansweredReads(c)
+	unanswered := unansweredReadsBefore(c, at, shortArmedAt)
 	switch {
 	case !severed:
 		out = append(out, skipf(claim, method,
@@ -243,18 +286,93 @@ func evalTimeoutBehaviour(c *Conversation, at func(int) (time.Time, bool), armed
 	}
 }
 
-func prot1TruncatedSkip() finding {
-	return skipf(
-		"the DUT recovered from a response whose MBAP length field promised more bytes than were delivered",
-		"serve a structurally truncated Modbus response — length field or byte count inconsistent with "+
-			"the PDU actually written",
-		"§2.8.1 does not define 'partial response'; this suite drove two of the four possible readings "+
-			"(a severed transaction and an over-long delay) and states which. The structurally truncated "+
-			"reading — an MBAP length field or byte count larger than the bytes delivered — cannot be "+
-			"served by this bench: the server sim builds its responses through a framing layer that "+
-			"cannot be made to lie about its own length. Promoting this row to full requires a raw-write "+
-			"fault verb, e.g. POST /fault {\"kind\":\"short_response\",\"truncate_bytes\":8}, which writes "+
-			"a well-formed MBAP header and then stops short")
+// unansweredReadsBefore returns unansweredReads(c), restricted to requests
+// issued strictly before cutoff. A zero cutoff — no later phase needs
+// excluding — returns every unanswered read, unfiltered (evalPROT1's
+// original, single-phase behaviour). An exchange whose timestamp cannot be
+// resolved is KEPT rather than dropped, so a timestamp gap here never
+// silently hides a real severance.
+func unansweredReadsBefore(c *Conversation, at func(int) (time.Time, bool), cutoff time.Time) []Exchange {
+	all := unansweredReads(c)
+	if cutoff.IsZero() || at == nil {
+		return all
+	}
+	var out []Exchange
+	for _, ex := range all {
+		if len(ex.Request.Frames) == 0 {
+			out = append(out, ex)
+			continue
+		}
+		t, ok := at(ex.Request.Frames[0])
+		if !ok || t.Before(cutoff) {
+			out = append(out, ex)
+		}
+	}
+	return out
+}
+
+// unansweredReadsFrom is unansweredReadsBefore's complement: requests issued
+// at or after cutoff, used to isolate a LATER phase's own provocation
+// (short_response) from an earlier one already accounted for by
+// unansweredReadsBefore (tcp_drop). A zero cutoff or nil at, meaning the
+// later phase never ran, correctly yields nothing.
+func unansweredReadsFrom(c *Conversation, at func(int) (time.Time, bool), cutoff time.Time) []Exchange {
+	if cutoff.IsZero() || at == nil {
+		return nil
+	}
+	var out []Exchange
+	for _, ex := range unansweredReads(c) {
+		if len(ex.Request.Frames) == 0 {
+			continue
+		}
+		t, ok := at(ex.Request.Frames[0])
+		if ok && !t.Before(cutoff) {
+			out = append(out, ex)
+		}
+	}
+	return out
+}
+
+// evalPROT1ShortResponse is PROT-1#5: the structurally truncated reading of
+// §2.8.1's undefined "partial response" — an MBAP length field promising
+// more bytes than the server actually wrote, with the connection left open
+// rather than closed (contrast tcp_drop's severed-mid-flight reading,
+// evalPROT1's phase (a)). Needs modsim started with -protofault
+// (sim/southbound/protorelay.go); without it the sim refuses the fault BY
+// NAME and this SKIPs saying so.
+func evalPROT1ShortResponse(c *Conversation, at func(int) (time.Time, bool), armed error,
+	armedAt time.Time) finding {
+	claim := "the DUT recovered from a response whose MBAP length field promised more bytes than were delivered"
+	method := "serve a structurally truncated Modbus response (a well-formed MBAP length field, fewer PDU " +
+		"bytes actually written, connection left open) via modsim's short_response fault (needs -protofault), " +
+		"then look for a complete, successful exchange afterward"
+	if armed != nil {
+		return skipf(claim, method, "the short_response fault could not be armed on the server: %v", armed)
+	}
+	if c == nil {
+		return skipf(claim, method,
+			"the short_response fault was armed, but no capture frame was attributed to this test case, "+
+				"so the DUT's reaction to it cannot be observed")
+	}
+	unanswered := unansweredReadsFrom(c, at, armedAt)
+	if len(unanswered) == 0 {
+		return skipf(claim, method,
+			"the short_response fault was armed, but no request in this test case's frames was left "+
+				"without a complete response while it was in force — the truncated write may have fallen "+
+				"outside the observed window, or landed on a connection this test case does not cite "+
+				"bytes from (see the note on multiple attributed conversations)")
+	}
+	q := unanswered[len(unanswered)-1].Request
+	if ex, ok := firstSuccessfulReadAfter(c, q.End); ok {
+		return bytesf(claim, method, certify.Pass, fromServer, ex.Response.Start, ex.Response.End,
+			"the DUT issued %s while the server was serving a truncated response (MBAP length promising "+
+				"more PDU bytes than were written, connection left open) and received no complete answer "+
+				"to it; the client recovered — %s issued afterward and answered normally. Recovery "+
+				"response cited in full: [%s]", q.String(), ex.Request.String(), ex.Response.Hex())
+	}
+	return skipf(claim, method,
+		"the short_response fault was armed and left a request unanswered, but no successful read "+
+			"followed within this test case's frames to evidence recovery")
 }
 
 // ── PROT-2 — TCP Segmentation ─────────────────────────────────────────────────

@@ -154,8 +154,13 @@ func (o *observer) injectionReason() string {
 // Modbus listener belonging to this bench, and that conformance runs are
 // serialized, so during this check's interval nothing else is talking to it.
 // The citation phase does not take that on trust: assertAttributionSound
-// re-derives it from the capture by requiring that exactly one conversation
-// with that endpoint was attributed.
+// re-derives it from the capture, accepting any number of conversations with
+// that endpoint as long as none of them overlap in time — which is what a
+// second, unaccounted-for client would look like on a dedicated,
+// single-purpose, serialized listener. Several of this suite's own checks
+// provoke exactly one reconnect (or more, see CLI-4's base-relocation
+// sweep) as part of their own procedure, and every one of those is still
+// legitimately the DUT.
 func (o *observer) claimServer() error {
 	reason := fmt.Sprintf("the DUT is the Modbus CLIENT under test and %s is the bench's plain-text "+
 		"SunSpec Modbus server, so the bench never learns the DUT's ephemeral source port and cannot "+
@@ -228,6 +233,39 @@ func (o *observer) injectValue(ctx context.Context, body map[string]any, why str
 	o.injected = append(o.injected, fmt.Sprintf("POST %s/inject %s (%s)", o.sim.BaseURL, jsonish(body), why))
 	o.rc.Logf("injected on modsim: %s — %s", jsonish(body), why)
 	return nil
+}
+
+// clearInject posts a best-effort /inject cleanup body, mirroring
+// clearFault's contract for the /fault endpoint (best effort; a failure is
+// logged and recorded, never swallowed): a check that armed something
+// through /inject (a spliced model, a typed sentinel) must leave the bench
+// as it found it for whatever runs next.
+func (o *observer) clearInject(body map[string]any, what string) {
+	if !o.simAvailable() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := o.sim.Inject(ctx, body, nil); err != nil {
+		o.injected = append(o.injected, fmt.Sprintf("FAILED to clear %s on modsim: %v", what, err))
+		o.rc.Logf("WARNING: could not clear %s on modsim: %v", what, err)
+		return
+	}
+	o.injected = append(o.injected, fmt.Sprintf("POST %s/inject %s", o.sim.BaseURL, jsonish(body)))
+	o.rc.Logf("cleared on modsim: %s", what)
+}
+
+// relocate arms a runtime SunSpec-map relocation on the server via modsim's
+// relocate fault (sim/southbound/relocate.go, landed 9e35da6) — ALWAYS
+// available, unlike the -protofault-gated kinds; no modsim launch flag is
+// needed. base is the register address to re-home the map to: 0, 40000 and
+// 50000 are the three standard SunSpec bases (CLI-4 §2.4.4 requires
+// discovery to work at all three); any other value deliberately serves a
+// noncompliant map (ERR-1).
+func (o *observer) relocate(ctx context.Context, base uint16) error {
+	return o.fault(ctx, map[string]any{"kind": "relocate", "base": int(base)},
+		fmt.Sprintf("re-home the server's SunSpec map to base %d, so discovery can be observed there too",
+			base))
 }
 
 // forceReconnect severs the DUT's southbound connection so its next poll has to
@@ -303,6 +341,29 @@ func (o *observer) journal(ctx context.Context, lines int) ([]string, error) {
 		return nil, fmt.Errorf("gateway introspection is not configured (-gateway-ssh)")
 	}
 	out, err := o.rc.Gateway.Journal(ctx, "lexa-modbus", lines)
+	if err != nil {
+		return nil, err
+	}
+	var keep []string
+	for _, l := range strings.Split(string(out), "\n") {
+		if s := strings.TrimSpace(l); s != "" {
+			keep = append(keep, s)
+		}
+	}
+	return keep, nil
+}
+
+// admissionJournal reads lexa-modbus's durable admission journal (an ndjson
+// file, not the systemd journal — see checks_error.go's
+// admissionJournalPath) over the read-only gateway client. Introspection of
+// the device under test, so anything built from it is a Narrative, never a
+// citation — the same posture o.journal already takes for the systemd
+// journal.
+func (o *observer) admissionJournal(ctx context.Context) ([]string, error) {
+	if o.rc.Gateway == nil || !o.rc.Gateway.Available() {
+		return nil, fmt.Errorf("gateway introspection is not configured (-gateway-ssh)")
+	}
+	out, err := o.rc.Gateway.ReadFile(ctx, admissionJournalPath)
 	if err != nil {
 		return nil, err
 	}

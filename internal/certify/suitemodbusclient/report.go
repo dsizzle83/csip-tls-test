@@ -66,9 +66,15 @@ var Rows = []Row{
 		Gap:          "two servers with DIFFERENT unit ids — both configured devices declare unit id 1",
 		Capability:   "a second modsim started with a different unit id plus a matching DUT device entry"},
 	{ID: "CLI-4", UID: "ss-modbus-client-conf-v1.1::CLI-4", Depth: DepthPartial,
-		Demonstrated: "the DUT probes only legal base addresses and reads the map from the one that answers",
-		Gap:          "discovery with the map relocated to base 0 and to base 50000",
-		Capability:   "a settable map base on modsim — `modsim -base N`, or POST /control {\"cmd\":\"relocate\",\"base\":N}"},
+		Demonstrated: "the DUT probes only legal base addresses and reads the map from the one that answers, " +
+			"at the default base 40000 and — modsim's relocate verb (sim/southbound/relocate.go) landed and " +
+			"is now driven at runtime, no launch flag needed — after the map is re-homed to base 0 and to " +
+			"base 50000 in turn, each with its own forced reconnect",
+		Gap: "closed in capability terms; what remains is confirmation on a real bench run that the DUT's " +
+			"discovery actually completes at both relocated bases (this suite's own honesty rule: a sim " +
+			"verb existing is not the same claim as a live run having exercised it)",
+		Capability: "none further on the sim side; promoting to full needs a real-bench run whose bundle " +
+			"shows all three bases' discovery complete"},
 	{ID: "CLI-5", UID: "ss-modbus-client-conf-v1.1::CLI-5", Depth: DepthNotApplicable,
 		Demonstrated: "nothing; the row is the optional Modbus RTU baud-rate sweep",
 		Gap:          "there is no RS-485 SunSpec server on the bench and no serial line to capture",
@@ -94,13 +100,25 @@ var Rows = []Row{
 		Gap:          "the per-datatype rendering criteria (a)–(i), which exist only in the client's own log",
 		Capability:   "a point-browser diagnostic on the DUT, and a server whose models span every datatype in §2.3's list — nine of them do not occur in this server's models at all"},
 	{ID: "INFO-2", UID: "ss-modbus-client-conf-v1.1::INFO-2", Depth: DepthPartial,
-		Demonstrated: "the server serving the int16 not-implemented sentinel for every register, and whether the DUT reported it as a measurement",
-		Gap:          "the other per-datatype sentinels; the sim has one sentinel and applies it bank-wide",
-		Capability:   "a per-point sentinel verb, e.g. POST /inject {\"unimplemented\":[{\"addr\":40190,\"type\":\"int16\"}]}"},
+		Demonstrated: "the server serving the int16 not-implemented sentinel for every register and whether " +
+			"the DUT reported it as a measurement; and — modsim's per-point sentinel verb " +
+			"(sim/southbound/sentinel.go) landed — the Common Model's DA field separately seeded with its " +
+			"own uint16 not-implemented sentinel and confirmed read back over the wire",
+		Gap: "every OTHER datatype present in the server's models: this suite deliberately holds no model " +
+			"definition directory (see sunspec.go's doc comment — ERR-3 would be testing the DUT's table " +
+			"against itself if it had one), so only one datatype (uint16, via DA) is demonstrated this way",
+		Capability: "a model definition directory this suite can safely consult for INJECTION addressing " +
+			"without compromising ERR-3's independence, so every other present datatype can be seeded and " +
+			"confirmed the same way the per-point verb now demonstrates for one"},
 	{ID: "PROT-1", UID: "ss-modbus-client-conf-v1.1::PROT-1", Depth: DepthPartial,
-		Demonstrated: "two readings of the document's undefined 'partial response' — a severed transaction and an over-long response delay — and the DUT's recovery to a successful Common Model read",
-		Gap:          "the structurally truncated reading: an MBAP length field promising more bytes than arrive",
-		Capability:   "a raw-write fault verb, e.g. POST /fault {\"kind\":\"short_response\",\"truncate_bytes\":8}"},
+		Demonstrated: "three readings of the document's undefined 'partial response' — a severed " +
+			"transaction, an over-long response delay, and (modsim's protorelay verb, " +
+			"sim/southbound/protorelay.go, landed) a structurally truncated response — and the DUT's " +
+			"recovery after each",
+		Gap: "the structurally truncated reading needs modsim STARTED with -protofault (it interposes a " +
+			"second relay); without that launch flag the sim refuses the fault by name and this row falls " +
+			"back to two readings",
+		Capability: "modsim -protofault at launch; the fault verb itself needs no further sim work"},
 	{ID: "PROT-2", UID: "ss-modbus-client-conf-v1.1::PROT-2", Depth: DepthPartial,
 		Demonstrated: "that the DUT frames its peer's stream by MBAP length with no leftover bytes, and neither retries nor resets; a genuinely segmented ADU is asserted when the capture contains one",
 		Gap:          "segmentation cannot be compelled — the sim writes each response once and every response is well under the path MTU",
@@ -110,13 +128,30 @@ var Rows = []Row{
 		Gap:          "the noncompliant server itself — a SunSpec map at holding register 40001",
 		Capability:   "the same settable map base CLI-4 needs, plus a DUT device entry pointing at that instance"},
 	{ID: "ERR-2", UID: "ss-modbus-client-conf-v1.1::ERR-2", Depth: DepthPartial,
-		Demonstrated: "two exception classes provoked for real (0x04 SERVER DEVICE FAILURE and 0x0B GATEWAY TARGET DEVICE FAILED TO RESPOND), observed on the wire, logged by the DUT, and followed by a successful transaction",
-		Gap:          "exception codes 0x01, 0x02 and 0x03, which the procedure provokes by making the CLIENT emit a bad request",
-		Capability:   "a parameterised server fault, e.g. POST /fault {\"kind\":\"exception_code\",\"code\":1,\"on_fc\":3}"},
+		Demonstrated: "all four exception classes provoked for real and observed on the wire: 0x04 SERVER " +
+			"DEVICE FAILURE and 0x0B GATEWAY TARGET DEVICE FAILED TO RESPOND via the server's blanket " +
+			"read-failure faults, and — modsim's exception_target scoping (sim/southbound/exception_target.go) " +
+			"landed — 0x01 ILLEGAL FUNCTION, 0x02 ILLEGAL DATA ADDRESS and 0x03 ILLEGAL DATA VALUE by " +
+			"targeting the exception at FC 0x03, the function code the DUT already uses for every read, " +
+			"rather than needing the DUT to misbehave into producing them; each followed by a successful " +
+			"transaction",
+		Gap: "none in sim-capability terms; the residual question is whether a read-scoped targeted " +
+			"exception is judged an acceptable stand-in for the procedure's literal client-driven-bad-request " +
+			"reading of 0x01/0x02/0x03, which is a documented-deviation judgement call for a reviewer, not " +
+			"a bench gap",
+		Capability: "none further on the sim side"},
 	{ID: "ERR-3", UID: "ss-modbus-client-conf-v1.1::ERR-3", Depth: DepthPartial,
-		Demonstrated: "the behaviour the criterion turns on — the DUT steps over a model it does not consume using the length header and continues the chain walk",
-		Gap:          "a model with a genuinely unknown ID, and the MUST that it not appear in the client's discovered-model list",
-		Capability:   "a chain-splice verb, e.g. POST /inject {\"insert_model\":{\"id\":65000,\"len\":4,\"after\":1}}, plus a model inventory diagnostic on the DUT"},
+		Demonstrated: "the behaviour the criterion turns on — the DUT steps over a model it does not " +
+			"consume using the length header and continues the chain walk — now demonstrated against a " +
+			"GENUINELY unregistered ID (modsim's insert_model verb, sim/southbound/modelsplice.go, splices " +
+			"one into the chain), plus the DUT's own admission journal read for the MUST that it not appear " +
+			"in the client's discovered-model list",
+		Gap: "lexa-modbus admits a device — and journals its model inventory — once, at first " +
+			"identification; a tcp_drop reconnect resumes polling from the already-known block list without " +
+			"re-scanning or re-journaling, so the journal-based assertion SKIPs unless a fresh admission " +
+			"event happens to be journaled during this test case's window",
+		Capability: "a DUT re-identify diagnostic this suite can trigger without a full device restart, " +
+			"or the splice being in place before the device's very first admission"},
 }
 
 // Counts summarises the self-assessment.

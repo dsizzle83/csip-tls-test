@@ -22,6 +22,7 @@ package suitemodbusclient
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"csip-tls-test/internal/certify"
 )
@@ -397,6 +398,14 @@ func cli3DifferentUnitIDs() finding {
 
 // ── CLI-4 — General Discovery for SunSpec Servers with Different Base Registers ─
 
+// baseSweepAttempt records one relocate+reconnect attempt for a non-default
+// standard base — CLI-4#8's sweep of bases 0 and 50000.
+type baseSweepAttempt struct {
+	base         uint16
+	relocateErr  error
+	reconnectErr error
+}
+
 func checkCLI4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	o, why := newObserver(rc)
 	if o == nil {
@@ -411,25 +420,127 @@ func checkCLI4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		return certify.Result{}, err
 	}
 
+	// CLI-4#8 (census compliance-fullsuite-2-20260802T020946): modsim's
+	// relocate verb (sim/southbound/relocate.go, landed 9e35da6) can now
+	// re-home the server's SunSpec map at runtime — always available, no
+	// modsim launch flag needed. Sweep the two non-default standard bases,
+	// forcing a fresh reconnect (and so a fresh discovery sequence) after
+	// each relocation. The default base is ALWAYS restored afterward,
+	// unconditionally deferred: a bench left relocated would corrupt every
+	// OTHER check's discovery, not just this row's.
+	defer o.clearFault("relocate")
+	var sweep []baseSweepAttempt
+	if o.injectionReason() == "" {
+		for _, b := range []uint16{0, 50000} {
+			att := baseSweepAttempt{base: b}
+			if err := o.relocate(ctx, b); err != nil {
+				att.relocateErr = err
+			} else {
+				att.reconnectErr = o.forceReconnect(ctx)
+				if err := o.watch(ctx, 3); err != nil {
+					return certify.Result{}, err
+				}
+			}
+			sweep = append(sweep, att)
+		}
+	}
+
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("the DUT's base-address probing was observed against a server whose SunSpec "+
-			"map is at 40000; the procedure's other two base addresses could not be provided. %s",
-			o.injectionNote()),
+		Notes: fmt.Sprintf("the DUT's base-address probing was observed against the server's default "+
+			"SunSpec base 40000%s, and a sweep relocating the map to bases 0 and 50000 in turn was "+
+			"attempted. %s", reconnectNote(forced), o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT located the SunSpec map by probing a standard base address"
 			c, pre, ok := citeConversation(ev, o, claim)
 			if !ok {
-				return emit(ev, c, append(pre, cli4OtherBases())), nil
+				return emit(ev, c, append(pre, evalOtherBases(nil, sweep, o.injectionNote()))), nil
 			}
 			fs := []finding{assertAttributionSound(ev, o)}
 			fs = append(fs, evalBaseProbes(c, forced))
 			fs = append(fs, evalDiscovery(c)...)
 			fs = append(fs, evalFraming(c)...)
-			fs = append(fs, cli4OtherBases())
+			// evalOtherBases needs EVERY conversation this check owns with the
+			// server, not just citeConversation's single newest one (which, by
+			// the time the sweep above has run, is whichever relocation
+			// happened last — not necessarily base 0's) — see conversationsWith's
+			// doc for why folding them into one register image would be wrong.
+			cs, csErr := conversationsWith(ev, o.server)
+			if csErr != nil {
+				cs = nil
+			}
+			fs = append(fs, evalOtherBases(cs, sweep, o.injectionNote()))
 			return emit(ev, c, fs), nil
 		},
 	}, nil
+}
+
+// evalOtherBases is CLI-4#8: having relocated the server's SunSpec map to
+// each of the two non-default standard bases in turn, did the DUT complete
+// discovery there too? Each attempted base is matched to its OWN
+// conversation by which base it actually probed (findConversationProbing),
+// never by ordinal position — a position-based guess breaks the moment any
+// one relocation or reconnect in the sweep fails, which is exactly the kind
+// of partial result this row needs to report honestly rather than hide.
+func evalOtherBases(cs []*Conversation, sweep []baseSweepAttempt, injected string) finding {
+	claim := "the DUT completed discovery with the server's SunSpec map relocated to base 0 and to base 50000"
+	method := "repetition of the discovery sequence with the server's map at each of the three standard bases"
+	if len(sweep) == 0 {
+		return skipf(claim, method,
+			"the server's relocate fault could not be attempted for this run (%s), so bases 0 and 50000 "+
+				"could not be presented to the DUT", injected)
+	}
+	var parts []string
+	var frames []int
+	ok := 0
+	for _, att := range sweep {
+		if att.relocateErr != nil {
+			parts = append(parts, fmt.Sprintf("base %d: the server's map could not be relocated: %v",
+				att.base, att.relocateErr))
+			continue
+		}
+		cb := findConversationProbing(cs, att.base)
+		if cb == nil {
+			reason := "no read at that base was observed in this test case's frames"
+			if att.reconnectErr != nil {
+				reason = fmt.Sprintf("the reconnect meant to re-probe it could not be forced: %v",
+					att.reconnectErr)
+			}
+			parts = append(parts, fmt.Sprintf("base %d: %s", att.base, reason))
+			continue
+		}
+		base, models, complete, why := cb.ModelChain()
+		if base != att.base || !complete {
+			parts = append(parts, fmt.Sprintf("base %d: the chain walk did not complete: %s", att.base, why))
+			continue
+		}
+		ok++
+		parts = append(parts, fmt.Sprintf("base %d: %d model(s) read, chain complete", att.base, len(models)))
+		frames = append(frames, aduFrames(cb.Responses...)...)
+	}
+	if len(frames) == 0 {
+		return skipf(claim, method, "%s", strings.Join(parts, "; "))
+	}
+	v := certify.Pass
+	if ok < len(sweep) {
+		v = certify.Warn
+	}
+	return framesf(claim, method, v, frames, "%s", strings.Join(parts, "; "))
+}
+
+// findConversationProbing returns the first conversation in cs (as returned
+// by conversationsWith, oldest first) whose observed reads include a probe
+// at base — i.e. the specific reconnect that followed relocating the
+// server's map to that base.
+func findConversationProbing(cs []*Conversation, base uint16) *Conversation {
+	for _, c := range cs {
+		for _, p := range c.BaseProbes() {
+			if p.Start == base {
+				return c
+			}
+		}
+	}
+	return nil
 }
 
 // evalBaseProbes asserts which of the three standard bases the DUT probed, and
@@ -465,16 +576,6 @@ func evalBaseProbes(c *Conversation, forced error) finding {
 		"the DUT issued %d read(s) at standard base address(es) %v (of the legal set %v) and none at any "+
 			"other candidate base.%s First probe cited in full: [%s]",
 		len(probes), addrs, StandardBases, found, ex.Request.Hex())
-}
-
-func cli4OtherBases() finding {
-	return skipf(
-		"the DUT completed discovery with the server's SunSpec map relocated to base 0 and to base 50000",
-		"repetition of the discovery sequence with the server's map at each of the three standard bases",
-		"the bench's plain-text SunSpec server serves its map at 40000 only; it has no control-plane verb "+
-			"for relocating the map, so bases 0 and 50000 cannot be presented to the DUT. Promoting this "+
-			"row to full requires a `-base` flag on modsim (or POST /control {\"cmd\":\"relocate\",\"base\":N}) "+
-			"and three passes of this check, one per base")
 }
 
 // ── CLI-5 — Different Baud Rates (Optional, serial) ───────────────────────────

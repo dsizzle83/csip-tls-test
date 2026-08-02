@@ -11,11 +11,13 @@ package suitemodbusclient
 // test below, and each must FAIL.
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/evidence/netdis"
 )
 
 // verdict looks up a single finding's verdict by a substring of its claim.
@@ -393,8 +395,7 @@ func TestERR2JournalFailsASilentClient(t *testing.T) {
 
 func TestERR3ObservesTheStepOverByLength(t *testing.T) {
 	s := newSunSpecServer(40000)
-	fs := evalERR3(scriptConversation(t, conformantClientScript(s)), nil)
-	f := only(t, fs, "stepped over a model it did not consume")
+	f := evalERR3StepOver(scriptConversation(t, conformantClientScript(s)), nil)
 	if f.Verdict != certify.Pass {
 		t.Fatalf("verdict = %s: %s", f.Verdict, f.Observed)
 	}
@@ -432,9 +433,9 @@ func TestERR3SkipsWhenEveryModelWasRead(t *testing.T) {
 		}
 		addr = addr + 2 + l
 	}
-	fs := evalERR3(scriptConversation(t, sc), nil)
-	if v := verdict(t, fs, "stepped over a model it did not consume"); v != certify.Skip {
-		t.Errorf("verdict = %s, want SKIP: nothing was stepped over", v)
+	f := evalERR3StepOver(scriptConversation(t, sc), nil)
+	if f.Verdict != certify.Skip {
+		t.Errorf("verdict = %s, want SKIP: nothing was stepped over", f.Verdict)
 	}
 }
 
@@ -450,7 +451,7 @@ func TestPROT1PassesASeveredTransactionFollowedByRecovery(t *testing.T) {
 		{payload: readRsp(3, 1, s.read(40002, 2))},
 	}, fin: true}
 	c := scriptConversation(t, sc)
-	fs := evalPROT1(c, nil, true, false)
+	fs := evalPROT1(c, nil, true, false, time.Time{})
 	if v := verdict(t, fs, "did not complete"); v != certify.Pass {
 		t.Errorf("incomplete-response verdict = %s, want PASS", v)
 	}
@@ -463,7 +464,7 @@ func TestPROT1SkipsRecoveryWhenNothingFollows(t *testing.T) {
 	sc := &script{stepMs: 5, msgs: []msg{
 		{fromClient: true, payload: readReq(1, 1, 40000, 4)},
 	}, rst: true}
-	fs := evalPROT1(scriptConversation(t, sc), nil, true, false)
+	fs := evalPROT1(scriptConversation(t, sc), nil, true, false, time.Time{})
 	if v := verdict(t, fs, "remained functional"); v != certify.Skip {
 		t.Errorf("recovery verdict = %s, want SKIP when no successful read follows", v)
 	}
@@ -799,5 +800,393 @@ func TestConversationDropsADUsWhoseFramesAnotherCaseOwns(t *testing.T) {
 				t.Fatalf("an ADU carrying unowned frame %d survived the filter", f)
 			}
 		}
+	}
+}
+
+// ── attribution: self-induced reconnects on a dedicated single-client endpoint ─
+
+// mkStream builds a hand-rolled *netdis.Stream naming only what
+// evalAttribution reads (Key, First, Last) — no Dirs, no real capture. That
+// is deliberate: it is what lets this decision logic be driven without a
+// pcap in the room, the same split checks_test.go uses everywhere else
+// (evalX takes a *Conversation built from a synthetic script; here it takes
+// streams built by hand instead).
+func mkStream(clientPort uint16, first, last int) *netdis.Stream {
+	return &netdis.Stream{
+		Key: netdis.StreamKey{
+			A: netdis.Endpoint{Addr: benchClient.Addr(), Port: clientPort},
+			B: netdis.Endpoint{Addr: benchServer.Addr(), Port: benchServer.Port()},
+		},
+		First: first,
+		Last:  last,
+	}
+}
+
+func TestEvalAttributionSkipsWithNoConversation(t *testing.T) {
+	f := evalAttribution(nil, benchServer, nil)
+	if f.Verdict != certify.Skip {
+		t.Errorf("verdict = %s, want SKIP", f.Verdict)
+	}
+}
+
+func TestEvalAttributionPassesASingleConversation(t *testing.T) {
+	f := evalAttribution([]*netdis.Stream{mkStream(41234, 10, 20)}, benchServer, []int{10})
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s: %s", f.Verdict, f.Observed)
+	}
+}
+
+// TestEvalAttributionPassesSequentialReconnects is the census
+// compliance-fullsuite-2-20260802T020946 regression: a check's own
+// tcp_drop+reconnect (or the DUT's own resilience reconnect under repeated
+// exceptions, ERR-2) produces more than one TCP conversation to modsim's
+// dedicated, single-client, serialized endpoint. Since no other client can
+// ever dial that endpoint, every one of a SEQUENCE of non-overlapping
+// conversations is still legitimately the DUT's — this must not WARN.
+func TestEvalAttributionPassesSequentialReconnects(t *testing.T) {
+	streams := []*netdis.Stream{
+		mkStream(41826, 1, 100),
+		mkStream(50366, 101, 250), // opens only after 41826 closed
+		mkStream(47452, 260, 400),
+	}
+	f := evalAttribution(streams, benchServer, []int{1})
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s, want PASS for sequential self-induced reconnects: %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "3 conversations") {
+		t.Errorf("the assertion did not report the count: %s", f.Observed)
+	}
+}
+
+// TestEvalAttributionWarnsOnOverlappingConversations is the contrast: two
+// conversations open AT THE SAME TIME are what a genuine second client
+// would look like, and this suite's attribution fix must not paper over
+// that — it narrows the false positive, it does not widen what counts as
+// suspicious.
+func TestEvalAttributionWarnsOnOverlappingConversations(t *testing.T) {
+	streams := []*netdis.Stream{
+		mkStream(41826, 1, 100),
+		mkStream(50366, 50, 200), // opens at frame 50, while 41826 is still open (closes at 100)
+	}
+	f := evalAttribution(streams, benchServer, []int{1})
+	if f.Verdict != certify.Warn {
+		t.Fatalf("verdict = %s, want WARN for overlapping conversations: %s", f.Verdict, f.Observed)
+	}
+}
+
+// ── CLI-4#8: the base-relocation sweep ────────────────────────────────────────
+
+func TestEvalOtherBasesPassesWhenBothRelocatedBasesCompleteDiscovery(t *testing.T) {
+	c0 := scriptConversation(t, conformantClientScript(newSunSpecServer(0)))
+	c50000 := scriptConversation(t, conformantClientScript(newSunSpecServer(50000)))
+	sweep := []baseSweepAttempt{{base: 0}, {base: 50000}}
+	f := evalOtherBases([]*Conversation{c0, c50000}, sweep, "injected: (test)")
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s: %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "base 0") || !strings.Contains(f.Observed, "base 50000") {
+		t.Errorf("the assertion did not name both bases: %s", f.Observed)
+	}
+}
+
+func TestEvalOtherBasesWarnsWhenOneBaseCouldNotBeRelocated(t *testing.T) {
+	c0 := scriptConversation(t, conformantClientScript(newSunSpecServer(0)))
+	sweep := []baseSweepAttempt{
+		{base: 0},
+		{base: 50000, relocateErr: errors.New("modsim: relocate refused")},
+	}
+	f := evalOtherBases([]*Conversation{c0}, sweep, "injected: (test)")
+	if f.Verdict != certify.Warn {
+		t.Fatalf("verdict = %s, want WARN: one base's relocation failed: %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "modsim: relocate refused") {
+		t.Errorf("the assertion did not name the relocation failure: %s", f.Observed)
+	}
+}
+
+func TestEvalOtherBasesSkipsWhenTheSweepNeverRan(t *testing.T) {
+	f := evalOtherBases(nil, nil, "fault injection disabled for this run")
+	if f.Verdict != certify.Skip {
+		t.Errorf("verdict = %s, want SKIP", f.Verdict)
+	}
+	if !strings.Contains(f.Observed, "fault injection disabled") {
+		t.Errorf("the SKIP did not carry the injection-unavailable reason: %s", f.Observed)
+	}
+}
+
+// TestFindConversationProbingIsPositionalIndependent proves the lookup goes
+// by WHICH base a conversation probed, not by its position in the slice —
+// the property evalOtherBases relies on to stay correct when one attempt in
+// the sweep fails and the surviving conversations shift.
+func TestFindConversationProbingIsPositionalIndependent(t *testing.T) {
+	c50000 := scriptConversation(t, conformantClientScript(newSunSpecServer(50000)))
+	c0 := scriptConversation(t, conformantClientScript(newSunSpecServer(0)))
+	cs := []*Conversation{c50000, c0} // deliberately out of base order
+	if got := findConversationProbing(cs, 0); got != c0 {
+		t.Errorf("findConversationProbing(0) did not return the base-0 conversation")
+	}
+	if got := findConversationProbing(cs, 50000); got != c50000 {
+		t.Errorf("findConversationProbing(50000) did not return the base-50000 conversation")
+	}
+	if got := findConversationProbing(cs, 40000); got != nil {
+		t.Errorf("findConversationProbing(40000) = %v, want nil: no conversation probed that base", got)
+	}
+}
+
+// ── ERR-3#4/#3: the spliced unregistered model + admission journal ───────────
+
+// buildERR3SpliceScript walks newSunSpecServer's whole chain plus one extra
+// unregistered model spliced immediately before the end marker (mirroring
+// modsim's insert_model verb, sim/southbound/modelsplice.go). readSplicedBody
+// controls whether the script has the client read into the spliced model's
+// body — the FAIL case evalERR3InsertedModel must catch — or only its
+// header, as an unregistered model can only legitimately be consumed.
+func buildERR3SpliceScript(t *testing.T, readSplicedBody bool) *Conversation {
+	t.Helper()
+	s := newSunSpecServer(40000)
+	end := s.base + 2
+	for {
+		id, ok := s.regs[end]
+		if !ok || id == ModelChainEnd {
+			break
+		}
+		end = end + 2 + s.regs[end+1]
+	}
+	s.regs[end] = unregisteredModelID
+	s.regs[end+1] = unregisteredModelLen
+	newEnd := end + 2 + unregisteredModelLen
+	s.regs[newEnd] = ModelChainEnd
+
+	sc := &script{stepMs: 5}
+	tx := uint16(1)
+	add := func(start, qty uint16) {
+		sc.msgs = append(sc.msgs,
+			msg{fromClient: true, payload: readReq(tx, 1, start, qty)},
+			msg{payload: readRsp(tx, 1, s.read(start, qty))})
+		tx++
+	}
+	add(s.base, 4)
+	addr := s.base + 2
+	for i := 0; i < 8; i++ {
+		id := s.regs[addr]
+		if id == ModelChainEnd {
+			add(addr, 2)
+			break
+		}
+		l := s.regs[addr+1]
+		add(addr, 2)
+		consume := id != 712 && (id != unregisteredModelID || readSplicedBody)
+		if consume {
+			body := addr + 2
+			for off := uint16(0); off < l; off += MaxReadQuantity {
+				q := uint16(MaxReadQuantity)
+				if l-off < q {
+					q = l - off
+				}
+				add(body+off, q)
+			}
+		}
+		addr = addr + 2 + l
+	}
+	return scriptConversation(t, sc)
+}
+
+func TestERR3InsertedModelPassesWhenTheDUTStepsOverIt(t *testing.T) {
+	c := buildERR3SpliceScript(t, false)
+	f := evalERR3InsertedModel(c, true, nil)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s: %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "65000") {
+		t.Errorf("the assertion did not name the spliced model id: %s", f.Observed)
+	}
+}
+
+func TestERR3InsertedModelFailsWhenTheDUTConsumesIt(t *testing.T) {
+	c := buildERR3SpliceScript(t, true)
+	f := evalERR3InsertedModel(c, true, nil)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s, want FAIL: the DUT read into an unregistered model's body: %s",
+			f.Verdict, f.Observed)
+	}
+}
+
+func TestERR3InsertedModelSkipsWhenTheSpliceFailed(t *testing.T) {
+	f := evalERR3InsertedModel(nil, false, errors.New("modsim: insert_model refused"))
+	if f.Verdict != certify.Skip {
+		t.Errorf("verdict = %s, want SKIP", f.Verdict)
+	}
+	if !strings.Contains(f.Observed, "modsim: insert_model refused") {
+		t.Errorf("the SKIP did not name the splice failure: %s", f.Observed)
+	}
+}
+
+func TestParseAdmittedModelsFindsTheMostRecentEventForTheDevice(t *testing.T) {
+	lines := []string{
+		`{"v":1,"type":"admission_admitted","svc":"modbus","data":{"device":"inv-plain","models":[1,120,121]}}`,
+		`{"v":1,"type":"admission_refused","svc":"modbus","data":{"device":"inv-plain","reason":"timeout"}}`,
+		`{"v":1,"type":"admission_admitted","svc":"modbus","data":{"device":"inv-secure","models":[1]}}`,
+		`{"v":1,"type":"admission_admitted","svc":"modbus","data":{"device":"inv-plain","models":[1,120,121,65000]}}`,
+	}
+	models, found := parseAdmittedModels(lines, "inv-plain")
+	if !found {
+		t.Fatal("expected an admission_admitted match for inv-plain")
+	}
+	if !containsModel(models, 65000) {
+		t.Errorf("models = %v, want the MOST RECENT event's list (includes 65000)", models)
+	}
+}
+
+func TestParseAdmittedModelsNotFoundForADeviceNeverAdmitted(t *testing.T) {
+	if _, found := parseAdmittedModels(nil, "inv-plain"); found {
+		t.Error("found a match against an empty journal")
+	}
+}
+
+func TestErr3InventoryFailsWhenTheSplicedModelIsAdmitted(t *testing.T) {
+	after := []string{`{"type":"admission_admitted","data":{"device":"inv-plain","models":[1,65000]}}`}
+	f := err3Inventory(nil, after, nil, nil, "inv-plain")
+	if f.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s, want FAIL: %s", f.Verdict, f.Observed)
+	}
+}
+
+func TestErr3InventoryPassesWhenTheSplicedModelIsAbsent(t *testing.T) {
+	after := []string{`{"type":"admission_admitted","data":{"device":"inv-plain","models":[1,120]}}`}
+	f := err3Inventory(nil, after, nil, nil, "inv-plain")
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s: %s", f.Verdict, f.Observed)
+	}
+}
+
+func TestErr3InventorySkipsWhenNoFreshAdmissionEventAppears(t *testing.T) {
+	before := []string{`{"type":"admission_admitted","data":{"device":"inv-plain","models":[1,120]}}`}
+	f := err3Inventory(before, before, nil, nil, "inv-plain")
+	if f.Verdict != certify.Skip {
+		t.Fatalf("verdict = %s, want SKIP: no admission event was journaled fresh during this window: %s",
+			f.Verdict, f.Observed)
+	}
+}
+
+func TestErr3InventorySkipsWhenTheJournalCannotBeRead(t *testing.T) {
+	f := err3Inventory(nil, nil, errors.New("gateway introspection is not configured"), nil, "inv-plain")
+	if f.Verdict != certify.Skip {
+		t.Errorf("verdict = %s, want SKIP", f.Verdict)
+	}
+}
+
+// ── PROT-1#5: the structurally truncated response ─────────────────────────────
+
+// TestUnansweredReadsBeforeAndFromSplitByCutoff is the regression this
+// suite's PROT-1 rewrite needs: two unanswered reads in one conversation,
+// one from an EARLIER phase (tcp_drop) and one from a LATER one
+// (short_response), must never be attributed to each other's claim.
+func TestUnansweredReadsBeforeAndFromSplitByCutoff(t *testing.T) {
+	sc := &script{stepMs: 5, msgs: []msg{
+		{fromClient: true, payload: readReq(1, 1, 40000, 4)},                // early unanswered
+		{fromClient: true, payload: readReq(2, 1, 40002, 2), delayMs: 5000}, // late unanswered
+	}}
+	c, at := scriptConversationWithTimes(t, sc)
+	t1, ok := at(3)
+	if !ok {
+		t.Fatal("setup: no timestamp for frame 3 (the first request)")
+	}
+	t2, ok := at(4)
+	if !ok {
+		t.Fatal("setup: no timestamp for frame 4 (the second request)")
+	}
+	if !t2.After(t1) {
+		t.Fatalf("setup: frame 4 (%s) is not after frame 3 (%s)", t2, t1)
+	}
+	cutoff := t1.Add(t2.Sub(t1) / 2)
+
+	before := unansweredReadsBefore(c, at, cutoff)
+	if len(before) != 1 || before[0].Request.TxID != 1 {
+		t.Fatalf("unansweredReadsBefore = %+v, want exactly txid=1", before)
+	}
+	from := unansweredReadsFrom(c, at, cutoff)
+	if len(from) != 1 || from[0].Request.TxID != 2 {
+		t.Fatalf("unansweredReadsFrom = %+v, want exactly txid=2", from)
+	}
+}
+
+func TestUnansweredReadsBeforeIsUnfilteredWithAZeroCutoff(t *testing.T) {
+	sc := &script{stepMs: 5, msgs: []msg{
+		{fromClient: true, payload: readReq(1, 1, 40000, 4)},
+	}}
+	c, at := scriptConversationWithTimes(t, sc)
+	got := unansweredReadsBefore(c, at, time.Time{})
+	if len(got) != 1 {
+		t.Fatalf("unansweredReadsBefore with a zero cutoff = %d, want 1 (unfiltered)", len(got))
+	}
+	if got := unansweredReadsFrom(c, at, time.Time{}); len(got) != 0 {
+		t.Errorf("unansweredReadsFrom with a zero cutoff = %d, want 0 (no later phase ran)", len(got))
+	}
+}
+
+func TestEvalPROT1ShortResponsePassesARecoveredTruncation(t *testing.T) {
+	sc := &script{stepMs: 5, msgs: []msg{
+		{fromClient: true, payload: readReq(1, 1, 40000, 4)}, // truncated, never completes
+		{fromClient: true, payload: readReq(2, 1, 40002, 2)},
+		{payload: readRsp(2, 1, []uint16{SunSHigh, SunSLow})},
+	}}
+	c, at := scriptConversationWithTimes(t, sc)
+	t1, ok := at(3) // the truncated request's frame
+	if !ok {
+		t.Fatal("setup: no timestamp for frame 3 (the truncated request)")
+	}
+	armedAt := t1.Add(-time.Second) // armed strictly before the request it truncates
+	f := evalPROT1ShortResponse(c, at, nil, armedAt)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s: %s", f.Verdict, f.Observed)
+	}
+}
+
+func TestEvalPROT1ShortResponseSkipsWhenTheFaultCouldNotBeArmed(t *testing.T) {
+	f := evalPROT1ShortResponse(nil, nil, errors.New("segment/truncate framing faults need an interposed "+
+		"relay: restart the sim with -protofault"), time.Time{})
+	if f.Verdict != certify.Skip {
+		t.Errorf("verdict = %s, want SKIP", f.Verdict)
+	}
+	if !strings.Contains(f.Observed, "-protofault") {
+		t.Errorf("the SKIP did not name the launch flag that would close this row: %s", f.Observed)
+	}
+}
+
+// ── INFO-2#2: the per-point typed sentinel ────────────────────────────────────
+
+func TestEvalINFO2TypedSentinelPassesWhenTheServedValueIsReadBack(t *testing.T) {
+	sc := &script{stepMs: 5, msgs: []msg{
+		{fromClient: true, payload: readReq(1, 1, infoSentinelAddr, 1)},
+		{payload: readRsp(1, 1, []uint16{infoSentinelWant})},
+	}}
+	c := scriptConversation(t, sc)
+	f := evalINFO2TypedSentinel(c, nil)
+	if f.Verdict != certify.Warn {
+		t.Fatalf("verdict = %s, want WARN (real progress, not full per-datatype coverage): %s",
+			f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "now wired") {
+		t.Errorf("the assertion did not report the capability as demonstrated: %s", f.Observed)
+	}
+}
+
+func TestEvalINFO2TypedSentinelSkipsWhenTheFaultCouldNotBeArmed(t *testing.T) {
+	f := evalINFO2TypedSentinel(nil, errors.New("modsim's simapi is not configured"))
+	if f.Verdict != certify.Skip {
+		t.Errorf("verdict = %s, want SKIP", f.Verdict)
+	}
+}
+
+func TestEvalINFO2TypedSentinelSkipsWhenTheRegisterWasNeverObserved(t *testing.T) {
+	sc := &script{stepMs: 5, msgs: []msg{
+		{fromClient: true, payload: readReq(1, 1, 40000, 2)},
+		{payload: readRsp(1, 1, []uint16{SunSHigh, SunSLow})},
+	}}
+	c := scriptConversation(t, sc)
+	f := evalINFO2TypedSentinel(c, nil)
+	if f.Verdict != certify.Skip {
+		t.Fatalf("verdict = %s, want SKIP: the seeded register was never read in this test case's "+
+			"frames: %s", f.Verdict, f.Observed)
 	}
 }

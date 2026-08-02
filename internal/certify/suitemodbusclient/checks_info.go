@@ -318,6 +318,23 @@ func info1RenderingSkips() []finding {
 
 // ── INFO-2 — Unimplemented Point Interpretations ──────────────────────────────
 
+// infoSentinelAddr/infoSentinelType are the single, always-present point
+// INFO-2#2 seeds with its OWN type's not-implemented sentinel: the Common
+// Model's DA (device address) field, offset 64 from the body — a
+// SunSpec-STANDARD offset (see CommonModel above), not this bench's own
+// invention — at the server's steady-state default base 40000
+// (StandardBases[0]). DA's SunSpec datatype is uint16; sentinel.go's
+// sentinelWords table independently gives uint16's not-implemented value as
+// 0xFFFF, mirrored here as infoSentinelWant so this check does not have to
+// import the sim package to know what it just asked the sim to seed.
+const (
+	infoSentinelBase = 40000
+	infoSentinelAddr = infoSentinelBase + 2 + 64 // Model 1 body + DA's offset
+	infoSentinelType = "uint16"
+)
+
+const infoSentinelWant uint16 = 0xFFFF
+
 func checkINFO2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	o, why := newObserver(rc)
 	if o == nil {
@@ -335,6 +352,18 @@ func checkINFO2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 		device = v
 	}
 
+	// INFO-2#1 (census compliance-fullsuite-2-20260802T020946): a bare
+	// arm-watch(3)-clear sequence still occasionally missed the DUT's poll
+	// entirely (0 frames attributed) on a bench shared with other agents'
+	// suites. A full baseline cycle BEFORE arming — the same pattern
+	// checkERR2 already uses — gives the DUT's ~10s poll loop a confirmed
+	// live moment near the window's start, so a reader can tell "the DUT
+	// never polled during this window at all" (a bench problem) from "the
+	// sentinel just wasn't in force yet" if it ever recurs.
+	if err := o.watch(ctx, 1); err != nil {
+		return certify.Result{}, err
+	}
+
 	journalBefore, _ := o.journal(ctx, 200)
 	armed := o.fault(ctx, map[string]any{"kind": "nan_sentinel"},
 		"make every register read return the SunSpec not-implemented sentinel 0x8000 (int16 −32768), "+
@@ -343,15 +372,12 @@ func checkINFO2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	if armed != nil {
 		return certify.Skipped("the not-implemented sentinel could not be armed on the server: %v", armed), nil
 	}
-	// INFO-2#1 (census 20260731T234821): hold the sentinel for at least one
-	// full poll interval beyond what a bare 2-cycle wait guarantees before
-	// clearing it. o.watch(2) already blocks for 2 full cycles before
-	// clearFault runs below, but that margin was not enough in the run this
-	// case names — the fault was armed and cleared before the DUT, still
-	// settling from whatever the preceding test case injected, got back to
-	// its next poll at all. One more cycle of margin, consistent with the
-	// fix applied to READ-1/WR-1/WR-2 for the same symptom.
-	watchErr := o.watch(ctx, 3)
+	// INFO-2#1 (census 20260731T234821, widened further above): hold the
+	// sentinel for at least one full poll interval beyond what a bare
+	// 2-cycle wait guarantees before clearing it — now 4, one more than the
+	// previous fix, consistent with the fix applied to READ-1/WR-1/WR-2 for
+	// the same symptom.
+	watchErr := o.watch(ctx, 4)
 	o.clearFault("nan_sentinel")
 	if watchErr != nil {
 		return certify.Result{}, watchErr
@@ -362,22 +388,42 @@ func checkINFO2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	}
 	duringLines := journalSince(journalBefore, journalDuring)
 
+	// INFO-2#2: the per-point TYPED sentinel (modsim's sentinel verb,
+	// sim/southbound/sentinel.go), a separate, later phase so it is never
+	// confused with the whole-bank int16 reading above — same register
+	// count either way (one), but a DIFFERENT datatype and mechanism (a
+	// direct register poke, not a read-path rewrite), and armed only after
+	// the whole-bank fault has been fully cleared and settled.
+	typedArmed := fmt.Errorf("modsim's simapi is not configured")
+	if o.simAvailable() {
+		typedArmed = o.injectValue(ctx, map[string]any{
+			"unimplemented": []map[string]any{{"addr": infoSentinelAddr, "type": infoSentinelType}},
+		}, fmt.Sprintf("seed the Common Model's DA field (address %d) with its own %s not-implemented "+
+			"sentinel, per §2.7.2 step 2's per-datatype reading", infoSentinelAddr, infoSentinelType))
+	}
+	if typedArmed == nil {
+		defer o.clearInject(map[string]any{"clear_unimplemented": true}, "the typed sentinel")
+		if err := o.watch(ctx, 2); err != nil {
+			return certify.Result{}, err
+		}
+	}
+
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("the int16 not-implemented sentinel was served for every register and the "+
-			"DUT's interpretation of it observed; the other per-datatype sentinels could not be served. %s",
-			o.injectionNote()),
+		Notes: fmt.Sprintf("the int16 not-implemented sentinel was served for every register, and (when "+
+			"modsim's simapi is available) the Common Model's DA field was separately seeded with its own "+
+			"uint16 sentinel; the DUT's interpretation of both was observed. %s", o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the server returned the not-implemented sentinel and the DUT did not report it as " +
 				"a measurement"
 			c, pre, ok := citeConversation(ev, o, claim)
 			if !ok {
-				return emit(ev, c, append(pre, info2Skips()...)), nil
+				return emit(ev, c, append(pre, evalINFO2TypedSentinel(nil, typedArmed))), nil
 			}
 			fs := []finding{assertAttributionSound(ev, o)}
 			fs = append(fs, evalINFO2(c, o.injectionNote())...)
 			fs = append(fs, info2Interpretation(duringLines, device))
-			fs = append(fs, info2Skips()...)
+			fs = append(fs, evalINFO2TypedSentinel(c, typedArmed))
 			return emit(ev, c, fs), nil
 		},
 	}, nil
@@ -452,16 +498,54 @@ func info2Interpretation(lines []string, device string) finding {
 			"point-availability signal this suite cannot read", v, device)
 }
 
-func info2Skips() []finding {
-	return []finding{
-		skipf("at least one unimplemented point was logged for every datatype present in the server's models",
-			"seed each datatype's own not-implemented sentinel into a point of that type and read it back",
-			"the server's fault surface offers exactly one sentinel — the int16 0x8000, applied to the "+
-				"WHOLE register bank — and no way to set an INDIVIDUAL point to its own type's sentinel. "+
-				"The other sentinels in the table (0xFFFF for uint16/enum16/bitfield16/count, 0x8000 0x0000 "+
-				"for int32, 0xFFFF 0xFFFF for uint32/enum32/bitfield32, a quiet NaN for float32, a "+
-				"leading NUL for string, all-ones for eui48) were therefore never served. Promoting this "+
-				"row to full requires a per-point sentinel verb, e.g. POST /inject "+
-				"{\"unimplemented\":[{\"addr\":40190,\"type\":\"int16\"}]}"),
+// evalINFO2TypedSentinel is INFO-2#2: modsim's per-point typed sentinel verb
+// (sim/southbound/sentinel.go) seeds ONE point (the Common Model's DA
+// field) with ITS OWN uint16 not-implemented sentinel, distinct from
+// nan_sentinel's whole-bank int16 blanket that evalINFO2/info2Interpretation
+// above evidence. This closes the "no verb exists at all" gap the row used
+// to report, but not the row's FULL claim: §2.7.2 step 2 wants every
+// datatype the server's models carry demonstrated this way, and this suite
+// deliberately holds no model definition directory (see sunspec.go's doc
+// comment) to enumerate which OTHER datatypes are even present — so this
+// stays a WARN, reporting real, wire-confirmed progress on one datatype
+// rather than claiming the row complete.
+func evalINFO2TypedSentinel(c *Conversation, armed error) finding {
+	claim := "at least one unimplemented point was logged for every datatype present in the server's models"
+	method := fmt.Sprintf("seed one point (address %d, type %s) with its own not-implemented sentinel via "+
+		"modsim's typed sentinel verb (sim/southbound/sentinel.go), then confirm the DUT read back exactly "+
+		"that value over the wire", infoSentinelAddr, infoSentinelType)
+	if armed != nil {
+		return skipf(claim, method, "the typed sentinel could not be seeded on the server: %v", armed)
 	}
+	if c == nil {
+		return skipf(claim, method,
+			"the typed sentinel was seeded, but no capture frame was attributed to this test case, so the "+
+				"served value could not be confirmed on the wire")
+	}
+	ref, ok := c.Registers.Ref(infoSentinelAddr)
+	if !ok {
+		return skipf(claim, method,
+			"the server's per-point sentinel verb was armed for this test case (address %d, type %s), but "+
+				"no read of that register was attributed to this test case's frames, so the served value "+
+				"could not be confirmed on the wire", infoSentinelAddr, infoSentinelType)
+	}
+	v, _ := c.Registers.Get(infoSentinelAddr)
+	if v != infoSentinelWant {
+		return bytesf(claim, method, certify.Warn, fromServer, ref.start, ref.end,
+			"register %d was read as 0x%04x, not the seeded %s not-implemented sentinel 0x%04x — the "+
+				"server may have overwritten the point (e.g. the animation loop) before the DUT's read "+
+				"landed. The per-point verb itself is confirmed reachable and working (the capability every "+
+				"prior run of this row lacked); full per-datatype coverage still needs every OTHER datatype "+
+				"seeded, and this suite has no model definition directory to enumerate which ones the "+
+				"server's models even carry (a deliberate omission — see sunspec.go)",
+			infoSentinelAddr, v, infoSentinelType, infoSentinelWant)
+	}
+	return bytesf(claim, method, certify.Warn, fromServer, ref.start, ref.end,
+		"modsim's per-point sentinel verb is now wired: register %d (the Common Model's DA field) was "+
+			"seeded with its own %s not-implemented sentinel 0x%04x and the DUT was observed reading "+
+			"exactly that value back. This demonstrates the capability for one datatype; the row's full "+
+			"claim spans every datatype the server's models carry, and this suite deliberately holds no "+
+			"model definition directory to enumerate them (see sunspec.go) — promoting further needs that "+
+			"directory, not more sim capability",
+		infoSentinelAddr, infoSentinelType, infoSentinelWant)
 }

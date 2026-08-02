@@ -23,9 +23,11 @@ package suitemodbusclient
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/evidence/netdis"
 )
 
 // citeConversation is the first thing every Cite callback does: it re-derives
@@ -64,30 +66,90 @@ func citeConversation(ev *certify.Evidence, o *observer, claim string) (*Convers
 }
 
 // assertAttributionSound checks the endpoint claim against the capture.
+//
+// More than one attributed conversation with the server does NOT, by
+// itself, break the claim observer.claimServer rests on: the endpoint is a
+// dedicated, single-purpose, SERIALIZED listener, so no other client ever
+// dials it during a test case's interval. What the claim promises is "every
+// conversation with this endpoint during my interval is the DUT's", not
+// "the DUT never reconnects" — and several of this suite's OWN checks
+// provoke exactly that reconnect (tcp_drop, relocate) as part of their own
+// procedure; ERR-2's own repeated-exception provocation has also been
+// observed making the DUT reconnect on its own initiative, with no
+// forceReconnect call in sight. Two, three, or five SEQUENTIAL
+// conversations — each one's tail closing before the next one's SYN — are
+// still all the DUT: there is no second party this bench could attribute
+// them to instead.
+//
+// What WOULD break the claim is two conversations open AT THE SAME TIME:
+// that is what a genuine second client, or a frame mis-attributed from
+// elsewhere, would look like, and it is still reported exactly as it always
+// was — this function narrows the false-positive (self-induced, sequential
+// reconnect), it does not widen what counts as suspicious.
 func assertAttributionSound(ev *certify.Evidence, o *observer) finding {
-	claim := "every frame cited by this test case belongs to a single DUT↔server conversation"
-	method := "count of attributed TCP conversations with the bench's Modbus server endpoint"
 	streams := ev.Streams()
-	var withServer []string
+	var withServer []*netdis.Stream
 	for _, st := range streams {
-		if st.Key.A.Port == o.server.Port() || st.Key.B.Port == o.server.Port() {
-			withServer = append(withServer, st.Key.String())
+		if endpointIs(st.Key.A, o.server) || endpointIs(st.Key.B, o.server) {
+			withServer = append(withServer, st)
 		}
+	}
+	return evalAttribution(withServer, o.server, ev.Frames())
+}
+
+// evalAttribution is assertAttributionSound's pure decision logic, over the
+// set of streams already narrowed to this check's own attributed
+// conversations with the server. Split out so a unit test can drive it with
+// hand-built streams — First/Last frame indices and nothing else — rather
+// than a live capture.
+func evalAttribution(withServer []*netdis.Stream, server fmt.Stringer, frames []int) finding {
+	claim := "every frame cited by this test case belongs to a single DUT↔server conversation"
+	method := "count of attributed TCP conversations with the bench's Modbus server endpoint, checked for " +
+		"concurrent overlap"
+	var cite []int
+	if len(frames) > 0 {
+		cite = frames[:1]
 	}
 	switch len(withServer) {
 	case 0:
-		return skipf(claim, method, "no conversation with %s was attributed to this test case", o.server)
+		return skipf(claim, method, "no conversation with %s was attributed to this test case", server)
 	case 1:
-		return framesf(claim, method, certify.Pass, ev.Frames()[:1],
+		return framesf(claim, method, certify.Pass, cite,
 			"exactly one conversation was attributed: %s. The endpoint claim this suite relies on — "+
 				"'all traffic to %s during my interval is the DUT's' — therefore held for this test case",
-			withServer[0], o.server)
-	default:
-		return framesf(claim, method, certify.Warn, ev.Frames()[:1],
-			"%d conversations with %s were attributed (%s). The endpoint claim assumed one client; with "+
-				"more than one, a citation cannot be attributed to the DUT's poller by endpoint alone",
-			len(withServer), o.server, strings.Join(withServer, ", "))
+			withServer[0].Key.String(), server)
 	}
+
+	sorted := append([]*netdis.Stream(nil), withServer...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].First < sorted[j].First })
+	overlapAt := -1
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i].First <= sorted[i-1].Last {
+			overlapAt = i
+			break
+		}
+	}
+	names := make([]string, len(sorted))
+	for i, st := range sorted {
+		names[i] = st.Key.String()
+	}
+	if overlapAt >= 0 {
+		return framesf(claim, method, certify.Warn, cite,
+			"%d conversations with %s were attributed (%s), and two of them overlapped in time — frame "+
+				"%d of %s was still open when frame %d of %s opened. The endpoint claim assumes a "+
+				"SERIALIZED single client; concurrent conversations are what a genuine second client would "+
+				"look like, so a citation cannot be attributed to the DUT's poller by endpoint alone",
+			len(sorted), server, strings.Join(names, ", "),
+			sorted[overlapAt-1].Last, sorted[overlapAt-1].Key.String(),
+			sorted[overlapAt].First, sorted[overlapAt].Key.String())
+	}
+	return framesf(claim, method, certify.Pass, cite,
+		"%d conversations with %s were attributed (%s), none overlapping in time. %s is a dedicated, "+
+			"single-purpose, serialized listener (see the endpoint claim above), so a sequence of "+
+			"non-overlapping conversations is still only ever the DUT — most commonly this test case's own "+
+			"provoked reconnect, or the DUT's own recovery from a fault this test case armed. The endpoint "+
+			"claim therefore held for every one of them",
+		len(sorted), server, strings.Join(names, ", "), server)
 }
 
 // evalFraming asserts Modbus/TCP framing and transaction discipline over the

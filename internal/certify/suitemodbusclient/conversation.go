@@ -138,7 +138,13 @@ func loadConversation(ev *certify.Evidence, remote netip.AddrPort) (*Conversatio
 // provoked it — so "the most recently opened attributed stream" IS "the one
 // after my fault injection", with no need to thread an injection timestamp
 // through to find out.
-func resolveStream(ev *certify.Evidence, remote netip.AddrPort) (*netdis.Stream, error) {
+// matchingStreams returns every stream this check owns whose endpoint pair
+// includes remote, oldest first. Factored out of resolveStream so a check
+// that needs to examine more than the single newest conversation — CLI-4's
+// base-relocation sweep, which reconnects once PER base and must assess
+// each attempt's own conversation rather than only the last — can reuse the
+// identical candidate set and ordering (see conversationsWith).
+func matchingStreams(ev *certify.Evidence, remote netip.AddrPort) ([]*netdis.Stream, error) {
 	hits, err := ev.StreamsOn(remote.Port())
 	if err != nil {
 		return nil, fmt.Errorf("no attributed conversation with %s: %w", remote, err)
@@ -153,15 +159,59 @@ func resolveStream(ev *certify.Evidence, remote netip.AddrPort) (*netdis.Stream,
 			candidates = append(candidates, st)
 		}
 	}
-	switch len(candidates) {
-	case 0:
+	if len(candidates) == 0 {
 		return nil, fmt.Errorf("suitemodbusclient: no attributed conversation with %s (port %d matched "+
 			"%d stream(s) attributed to a different address)", remote, remote.Port(), len(hits))
-	case 1:
-		return candidates[0], nil
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].First < candidates[j].First })
+	return candidates, nil
+}
+
+func resolveStream(ev *certify.Evidence, remote netip.AddrPort) (*netdis.Stream, error) {
+	candidates, err := matchingStreams(ev, remote)
+	if err != nil {
+		return nil, err
+	}
 	return candidates[len(candidates)-1], nil
+}
+
+// conversationsWith returns every conversation this check owns with remote,
+// oldest first — matchingStreams' candidates, each fully built into a
+// Conversation rather than collapsed to the single newest the way
+// loadConversation/resolveStream deliberately are for every check that
+// provokes at most one reconnect. Use this instead when a check's OWN
+// procedure provokes more than one reconnect inside a single test case's
+// window and each attempt's evidence matters on its own (CLI-4's
+// base-relocation sweep, PROT-1's short_response phase): folding every
+// connection's reads into one register image would let a later read at one
+// base (or under one fault) silently "prove" an earlier, different one.
+//
+// A stream with only one direction reassembled (loadConversation's own
+// "half a conversation" refusal) is skipped rather than failing the whole
+// call — one unusable candidate should not hide the others.
+func conversationsWith(ev *certify.Evidence, remote netip.AddrPort) ([]*Conversation, error) {
+	streams, err := matchingStreams(ev, remote)
+	if err != nil {
+		return nil, err
+	}
+	srvEP := netdis.Endpoint{Addr: remote.Addr(), Port: remote.Port()}
+	out := make([]*Conversation, 0, len(streams))
+	for _, st := range streams {
+		var cliEP netdis.Endpoint
+		if st.Key.A == srvEP {
+			cliEP = st.Key.B
+		} else {
+			cliEP = st.Key.A
+		}
+		reqDir := st.ByFlow(netdis.FlowKey{Src: cliEP, Dst: srvEP})
+		rspDir := st.ByFlow(netdis.FlowKey{Src: srvEP, Dst: cliEP})
+		if reqDir == nil || rspDir == nil {
+			continue
+		}
+		out = append(out, buildConversation(reqDir, rspDir, remote,
+			netip.AddrPortFrom(cliEP.Addr, cliEP.Port), ev.Owns))
+	}
+	return out, nil
 }
 
 // endpointIs reports whether e names remote, independent of IPv4-in-IPv6
