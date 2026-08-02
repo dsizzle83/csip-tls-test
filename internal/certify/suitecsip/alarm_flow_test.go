@@ -241,3 +241,201 @@ func TestBASIC027Flow_AlarmNoteRendersScriptedAction(t *testing.T) {
 		t.Errorf("alarmNote on a failed Change should explain the bench gap: %q", failNote)
 	}
 }
+
+// ── wire tier: the churn-relocated-answer regression (answerTo) ───────────────
+//
+// These are FIXTURE tests: they synthesise a decrypted transcript with the
+// exact shape the false FAIL had — a LogEvent POST on a SECOND conversation the
+// DUT owns, whose 201 the per-conversation index pairing left off the
+// exchange's Resp — and assert BASIC-027's assertion 2 (critLogEventPosted) now
+// PASSes, while a genuinely-unanswered or non-201 POST still FAILs. No bench.
+
+// leWire is the body BASIC-027's LogEvent-POST criterion recognises: a complete
+// DER LogEvent (functionSet 11, logEventCode 4) carrying all six elements the
+// wire criterion requires.
+const leWire = `<LogEvent xmlns="urn:ieee:std:2030.5:ns"><createdDateTime>1700000000</createdDateTime>` +
+	`<functionSet>11</functionSet><logEventCode>4</logEventCode><logEventID>1</logEventID>` +
+	`<logEventPEN>0</logEventPEN><profileID>2</profileID></LogEvent>`
+
+// framed overrides a synthetic message's capture frames — msg() defaults every
+// message to frame 1, and answerTo matches by frame ORDER, so the tests below
+// set frames explicitly and return the message for chaining.
+func framed(m *Message, frames ...int) *Message {
+	m.Frames = frames
+	return m
+}
+
+// discWalk is a minimal selected session (the discovery walk) carrying a /dcap
+// GET and no POST, so the LogEvent POST can only be found on a sibling.
+func discWalk() *Transcript {
+	return synthTranscript(get("/dcap", 200, `<DeviceCapability xmlns="urn:ieee:std:2030.5:ns"/>`))
+}
+
+// siblingPOST builds the second conversation the DUT opened alongside the
+// discovery walk. The POST rides it; resp, when non-nil, is present in the
+// conversation's Responses but is deliberately NOT paired onto the exchange —
+// exactly the index skew answerTo has to see through. Every message remembers
+// its conversation via Message.In, as a recovered one does.
+func siblingPOST(post, resp *Message) *Transcript {
+	conv := &Transcript{Decrypted: true, Exchanges: []Exchange{{Req: post}}}
+	post.In = conv
+	if resp != nil {
+		conv.Responses = []*Message{resp}
+		resp.In = conv
+	}
+	return conv
+}
+
+func TestBASIC027Wire_LogEventAnswerRecoveredFromAChurnedSibling(t *testing.T) {
+	crit := critLogEventPosted(&Observation{Params: map[string]string{}})
+
+	post := framed(msg(Request, "POST", "/edev/2/lev", 0, leWire), 20)
+	created := framed(msg(Response, "", "", 201, "", "Location", "/edev/2/lev/1"), 21)
+
+	disc := discWalk()
+	disc.Others = []*Transcript{siblingPOST(post, created)}
+
+	f := crit.Wire(nil, disc)
+	if f.Unavailable != "" {
+		t.Fatalf("evaluator declined to decide: %s", f.Unavailable)
+	}
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s, want PASS (the 201 IS in the capture on the sibling conversation): %s",
+			f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "201 Created") || !strings.Contains(f.Observed, "/edev/2/lev/1") {
+		t.Errorf("Observed should cite the recovered 201 and its Location: %s", f.Observed)
+	}
+	// Both halves of the recovered exchange must be cited, not just the request.
+	if !containsInt(f.Frames, 20) || !containsInt(f.Frames, 21) {
+		t.Errorf("Frames should cite the POST (20) and its 201 (21): %v", f.Frames)
+	}
+}
+
+// A POST whose answer really is nowhere in the capture must still FAIL: the fix
+// must not turn a genuinely-unanswered POST into a pass.
+func TestBASIC027Wire_UnansweredLogEventStillFails(t *testing.T) {
+	crit := critLogEventPosted(&Observation{Params: map[string]string{}})
+
+	post := framed(msg(Request, "POST", "/edev/2/lev", 0, leWire), 20)
+	disc := discWalk()
+	disc.Others = []*Transcript{siblingPOST(post, nil)}
+
+	f := crit.Wire(nil, disc)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s, want FAIL for a POST with no answer anywhere: %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "never answered") {
+		t.Errorf("Observed should say the POST was never answered: %s", f.Observed)
+	}
+}
+
+// The recovered answer is the ACTUAL response to the POST, not a cherry-picked
+// 201: a non-201 answer must FAIL on the status, proving the assertion keeps
+// its teeth through the order-based matcher.
+func TestBASIC027Wire_Non201AnswerFailsOnStatus(t *testing.T) {
+	crit := critLogEventPosted(&Observation{Params: map[string]string{}})
+
+	post := framed(msg(Request, "POST", "/edev/2/lev", 0, leWire), 20)
+	rejected := framed(msg(Response, "", "", 500, ""), 21)
+
+	disc := discWalk()
+	disc.Others = []*Transcript{siblingPOST(post, rejected)}
+
+	f := crit.Wire(nil, disc)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s, want FAIL for a 500 answer: %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "201 Created") { // the requirement it names
+		t.Errorf("Observed should name the 201-Created requirement: %s", f.Observed)
+	}
+}
+
+// answerTo must never reach across to another TCP connection for an answer: a
+// 201 sitting on the discovery conversation is NOT the answer to a POST on a
+// different conversation, even when it happens to be later in the capture.
+func TestBASIC027Wire_AnswerDoesNotCrossConversations(t *testing.T) {
+	crit := critLogEventPosted(&Observation{Params: map[string]string{}})
+
+	// The POST is on its own sibling, unanswered there. A 201 exists — but on
+	// the discovery walk, a different connection.
+	post := framed(msg(Request, "POST", "/edev/2/lev", 0, leWire), 20)
+	strayCreated := framed(msg(Response, "", "", 201, "", "Location", "/edev/2/lev/9"), 99)
+
+	disc := discWalk()
+	disc.Exchanges = append(disc.Exchanges, Exchange{
+		Req:  framed(msg(Request, "GET", "/edev", 0, ""), 98),
+		Resp: strayCreated,
+	})
+	for i := range disc.Exchanges {
+		disc.Exchanges[i].Req.In = disc
+		if disc.Exchanges[i].Resp != nil {
+			disc.Exchanges[i].Resp.In = disc
+		}
+	}
+	disc.Responses = []*Message{strayCreated}
+	disc.Others = []*Transcript{siblingPOST(post, nil)}
+
+	f := crit.Wire(nil, disc)
+	if f.Verdict != certify.Fail || !strings.Contains(f.Observed, "never answered") {
+		t.Fatalf("verdict = %s (%s), want FAIL never-answered: a 201 on another connection is not this "+
+			"POST's answer", f.Verdict, f.Observed)
+	}
+}
+
+// ── wire tier: assertion 1 (EndDevice) shares the same recovery ──────────────
+
+// The EndDevice fetch, when it IS in-window on a churned sibling whose 200 the
+// index pairing missed, is now recovered too (critAlarmEndDevice via answerTo).
+func TestBASIC027Wire_EndDeviceRecoveredFromUnpairedAnswer(t *testing.T) {
+	crit := critAlarmEndDevice()
+
+	edBody := `<EndDevice xmlns="urn:ieee:std:2030.5:ns"><LogEventListLink href="/edev/2/lev"/></EndDevice>`
+	getReq := framed(msg(Request, "GET", "/edev/2", 0, ""), 10)
+	edResp := framed(msg(Response, "", "", 200, edBody), 11)
+
+	conv := &Transcript{Decrypted: true, Exchanges: []Exchange{{Req: getReq}}}
+	getReq.In, edResp.In = conv, conv
+	conv.Responses = []*Message{edResp}
+
+	disc := discWalk()
+	disc.Others = []*Transcript{conv}
+
+	f := crit.Wire(nil, disc)
+	if f.Unavailable != "" {
+		t.Fatalf("evaluator declined to decide: %s", f.Unavailable)
+	}
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s, want PASS (the EndDevice 200 IS on the sibling): %s", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "LogEventListLink present") {
+		t.Errorf("Observed should confirm the LogEventListLink: %s", f.Observed)
+	}
+}
+
+// When the DUT never re-fetches its EndDevice in-window (the ordinary case: it
+// cached the LogEventListLink before the fault was armed), assertion 1 SKIPs —
+// it does NOT FAIL, so the case is unaffected. This is the observed shape in
+// the passing tail-csip baseline, and the reason answerTo is not enough to make
+// assertion 1 PASS on every run.
+func TestBASIC027Wire_EndDeviceAbsentIsSkipNotFail(t *testing.T) {
+	crit := critAlarmEndDevice()
+
+	f := crit.Wire(nil, discWalk())
+	if f.Unavailable == "" {
+		t.Fatalf("verdict = %s (%s), want a SKIP (unavailable) when no in-window EndDevice fetch exists",
+			f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Unavailable, "no EndDevice") {
+		t.Errorf("SKIP reason should name the missing EndDevice: %s", f.Unavailable)
+	}
+}
+
+func containsInt(v []int, want int) bool {
+	for _, n := range v {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}

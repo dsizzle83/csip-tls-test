@@ -486,59 +486,8 @@ func basicAlarms(ctx context.Context, rc *certify.RunCtx) (certify.Result, error
 		},
 		Criteria: func(o *Observation) []criterion {
 			return []criterion{
-				critResource("EndDevice", "the DUT fetched its EndDevice and the server's payload carries a "+
-					"LogEventListLink", func(doc *Node) (certify.Verdict, string) {
-					if !doc.Has("LogEventListLink") {
-						return certify.Fail, "the EndDevice carries no LogEventListLink, so the alarm function " +
-							"set is unreachable"
-					}
-					return certify.Pass, "LogEventListLink present"
-				}),
-				{
-					Claim: "the DUT POSTs LogEvents to the LogEventListLink href and the server answers 201 " +
-						"Created with a Location header",
-					How: "a POST in the session whose body's root element is LogEvent, and the status line and " +
-						"Location header of the response to it",
-					NeedsTranscript: true,
-					Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-						for _, e := range t.Method("POST") {
-							doc, err := e.Req.SEP()
-							if err != nil || doc.Local() != "LogEvent" {
-								continue
-							}
-							var missing []string
-							for _, want := range []string{"createdDateTime", "functionSet", "logEventCode",
-								"logEventID", "logEventPEN", "profileID"} {
-								if !doc.Has(want) {
-									missing = append(missing, want)
-								}
-							}
-							if e.Resp == nil {
-								return citeMessage(t, e.Req, certify.Fail, "the LogEvent POST was never answered")
-							}
-							loc := e.Resp.Header.Get("Location")
-							switch {
-							case len(missing) > 0:
-								return citeMessage(t, e.Req, certify.Fail,
-									"the LogEvent payload is missing %s", strings.Join(missing, ", "))
-							case e.Resp.Status != 201:
-								return citeExchange(t, e, certify.Fail,
-									"POST %s carrying LogEvent -> %s; 2030.5 §5.5.2 requires 201 Created",
-									e.Req.Target, e.Resp.Line())
-							case loc == "":
-								return citeExchange(t, e, certify.Fail,
-									"POST %s -> 201 Created but with no Location header, which 2030.5 requires "+
-										"on a 201", e.Req.Target)
-							default:
-								return citeExchange(t, e, certify.Pass,
-									"POST %s carrying a complete LogEvent -> 201 Created, Location: %s",
-									e.Req.Target, loc)
-							}
-						}
-						return unavailable("the recovered transcript holds no LogEvent POST from the DUT")
-					},
-					Server: logEventsPostedFinding(o),
-				},
+				critAlarmEndDevice(),
+				critLogEventPosted(o),
 				{
 					Claim: "the DUT's LogEvents carry a logEventCode from IEEE 2030.5 Table 34 and are " +
 						"time-ordered",
@@ -549,6 +498,236 @@ func basicAlarms(ctx context.Context, rc *certify.RunCtx) (certify.Result, error
 			}
 		},
 	})
+}
+
+// critLogEventPosted is BASIC-027's assertion 2: the DUT POSTs a LogEvent to
+// the LogEventListLink href and the server answers 201 Created with a Location.
+//
+// It is a named function — like critMUPRegistered — so its wire evaluator can
+// be graded directly against a synthesised transcript, which is how the
+// churn-relocated-answer regression answerTo closes is pinned (see
+// alarm_flow_test.go). It closes over o only for its Server-tier fallback.
+func critLogEventPosted(o *Observation) criterion {
+	return criterion{
+		Claim: "the DUT POSTs LogEvents to the LogEventListLink href and the server answers 201 " +
+			"Created with a Location header",
+		How: "a POST in the session whose body's root element is LogEvent, and the status line and " +
+			"Location header of the response to it",
+		NeedsTranscript: true,
+		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+			for _, e := range t.Method("POST") {
+				doc, err := e.Req.SEP()
+				if err != nil || doc.Local() != "LogEvent" {
+					continue
+				}
+				var missing []string
+				for _, want := range []string{"createdDateTime", "functionSet", "logEventCode",
+					"logEventID", "logEventPEN", "profileID"} {
+					if !doc.Has(want) {
+						missing = append(missing, want)
+					}
+				}
+				// The answer is not always on Exchange.Resp. RecoverSession
+				// pairs a conversation's recovered requests to its responses by
+				// INDEX (session.go's decrypt: e.Resp = resps[i]), which the
+				// DUT's connection churn can skew so the POST's own 201 —
+				// decrypted and present in this very window — is left unpaired,
+				// and this criterion used to read that as "never answered".
+				// answerTo recovers it by HTTP order across every conversation
+				// this case owns; see its doc for the false FAIL it closes and
+				// the gridsim-admin proof behind it.
+				resp := e.Resp
+				if resp == nil {
+					resp = answerTo(t, e.Req)
+				}
+				if resp == nil {
+					return citeMessage(t, e.Req, certify.Fail, "the LogEvent POST was never answered")
+				}
+				ex := Exchange{Req: e.Req, Resp: resp}
+				loc := resp.Header.Get("Location")
+				switch {
+				case len(missing) > 0:
+					return citeMessage(t, e.Req, certify.Fail,
+						"the LogEvent payload is missing %s", strings.Join(missing, ", "))
+				case resp.Status != 201:
+					return citeExchange(t, ex, certify.Fail,
+						"POST %s carrying LogEvent -> %s; 2030.5 §5.5.2 requires 201 Created",
+						e.Req.Target, resp.Line())
+				case loc == "":
+					return citeExchange(t, ex, certify.Fail,
+						"POST %s -> 201 Created but with no Location header, which 2030.5 requires "+
+							"on a 201", e.Req.Target)
+				default:
+					return citeExchange(t, ex, certify.Pass,
+						"POST %s carrying a complete LogEvent -> 201 Created, Location: %s",
+						e.Req.Target, loc)
+				}
+			}
+			return unavailable("the recovered transcript holds no LogEvent POST from the DUT")
+		},
+		Server: logEventsPostedFinding(o),
+	}
+}
+
+// answerTo recovers the HTTP response that answered req, searching every
+// conversation this test case owns rather than trusting the positional
+// request<->response pairing RecoverSession builds inside one conversation.
+//
+// # The false FAIL this closes
+//
+// RecoverSession pairs a conversation's recovered requests with its responses
+// by INDEX (session.go's decrypt: `e.Resp = resps[i]`). That is correct only
+// when the two lists are the same length and aligned, which a quiet,
+// single-purpose sibling connection — one POST, one 201 — always is. That is
+// exactly why BASIC-027 PASSed in runs/tail-csip-20260801T184232: the DUT put
+// the LogEvent POST on a dedicated two-frame connection (69.0.0.2:42844), whose
+// lone request paired trivially with its lone 201.
+//
+// When the DUT's connection pattern changes (session churn) the POST rides a
+// BUSIER sibling connection, or its 201 lands a frame after the request at the
+// edge of this case's attribution window. The index pairing then leaves the
+// POST's Exchange.Resp nil even though the 201 IS in that conversation's
+// decrypted Responses (decrypt recovers the whole owned stream, not just the
+// paired prefix). The criterion read that nil as "the LogEvent POST was never
+// answered" — a FALSE FAIL: gridsim's admin API (GET /admin/logevents) proves
+// the server received and answered the POST, minting the LogEvent an Href
+// (/edev/2/lev/0, /edev/2/lev/1 — LogEventCode 4), which a 2030.5 server only
+// does on a successful 201 Created. Assertion 3 (LogEvent well-formed) PASSes
+// on that same server record; only the wire tier's pairing missed the answer.
+//
+// # Why order, not index, is the right key
+//
+// An HTTP request and its response share ONE TCP connection, so the answer is
+// on the SAME conversation the request rode (req.In). Within that conversation
+// the answer is the FIRST response whose earliest capture frame is not before
+// the request's: HTTP/1.1 on one connection is strictly ordered — the client
+// does not send its next request until the current one is answered — so every
+// response before the request belongs to an earlier request, and the first one
+// at-or-after the request is this request's own. Keying on capture-frame order
+// is what tolerates a length skew and a 201 that arrives slightly after.
+//
+// This does not weaken the assertion. A POST with genuinely no response after
+// it on its connection still yields nil, and the caller still FAILs it "never
+// answered"; a response that is present but is a 500, or carries no Location, is
+// returned and graded exactly as a positionally-paired one would be. It only
+// stops missing an answer that IS in the capture on a conversation whose index
+// pairing skewed. This is the transcript-tier counterpart of the
+// multi-conversation doctrine Transcript.Filter/Own already apply to REQUEST
+// lookups, and of bundle.Verify's resolveDirection port-reuse fix (2946787):
+// ownership was settled before selection, so a frame in any owned conversation
+// is a frame this case may cite.
+func answerTo(t *Transcript, req *Message) *Message {
+	if t == nil || req == nil {
+		return nil
+	}
+	reqFrame := earliestFrame(req)
+	var best *Message
+	for _, conv := range t.Own() {
+		if conv == nil {
+			continue
+		}
+		// An HTTP answer never crosses to another TCP connection. Every
+		// recovered message carries the conversation it rode (Message.In), so
+		// restrict to it; a hand-built test message with no In falls back to
+		// searching every owned conversation.
+		if req.In != nil && conv != req.In {
+			continue
+		}
+		for _, resp := range conv.Responses {
+			if resp == nil || resp.Kind != Response {
+				continue
+			}
+			if earliestFrame(resp) < reqFrame {
+				continue
+			}
+			if best == nil || earliestFrame(resp) < earliestFrame(best) {
+				best = resp
+			}
+		}
+	}
+	return best
+}
+
+// earliestFrame is a recovered message's first capture frame, or 0 when it
+// carries none (a hand-built test message). Message.Frames is kept sorted
+// ascending by dedupeInts, so the first element is the earliest.
+func earliestFrame(m *Message) int {
+	if m == nil || len(m.Frames) == 0 {
+		return 0
+	}
+	return m.Frames[0]
+}
+
+// alarmEndDevice finds the exchange whose response is the DUT's EndDevice
+// resource, applying the same across-conversation, order-based response
+// recovery as answerTo so a fetch the DUT relocated to a churned sibling
+// connection — whose response the per-conversation index pairing missed — is
+// still matched to its answer. The already-paired path (Transcript.Resource,
+// which already spans every owned conversation) is tried first and is the
+// ordinary case; the fallback only ADDS recall for the unpaired-answer shape
+// answerTo documents. It returns a synthetic Exchange so the criterion can cite
+// both halves.
+//
+// Note this cannot conjure a fetch that is not in the window at all: BASIC-027
+// arms its fault AFTER the discovery-walk wait precisely so the DUT has already
+// cached its LogEventListLink (see basicAlarms' Change doc), so a run in which
+// the DUT does not re-fetch the singular EndDevice in-window still SKIPs here —
+// correctly, and without failing the case, exactly as it did in the passing
+// runs/tail-csip-20260801T184232 baseline.
+func alarmEndDevice(t *Transcript) (Exchange, *Node, bool) {
+	if e, doc, ok := t.Resource("EndDevice"); ok {
+		return e, doc, true
+	}
+	for _, e := range t.Method("GET") {
+		if e.Resp != nil {
+			continue
+		}
+		resp := answerTo(t, e.Req)
+		if resp == nil || resp.Status < 200 || resp.Status >= 300 || len(resp.Body) == 0 {
+			continue
+		}
+		doc, err := resp.SEP()
+		if err != nil || doc.Local() != "EndDevice" {
+			continue
+		}
+		return Exchange{Req: e.Req, Resp: resp}, doc, true
+	}
+	return Exchange{}, nil, false
+}
+
+// critAlarmEndDevice is BASIC-027's assertion 1: the DUT fetched its EndDevice
+// and the server's payload carries a LogEventListLink. It mirrors
+// critResource("EndDevice", ...) but locates the resource through alarmEndDevice
+// so a churn-relocated fetch whose 200 the index pairing missed is still found —
+// the same regression, on the same window, that answerTo closes for the POST.
+func critAlarmEndDevice() criterion {
+	return criterion{
+		Claim: "the DUT fetched its EndDevice and the server's payload carries a LogEventListLink",
+		How: "the first exchange, across every conversation this case owns, whose response body is an " +
+			"EndDevice in the 2030.5 namespace (located by root element, not URI, because 2030.5 URIs are " +
+			"server-defined) — its response recovered by HTTP order rather than by the per-conversation index " +
+			"pairing, so a fetch the DUT relocated to a churned sibling connection is still matched to its answer",
+		NeedsTranscript: true,
+		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+			e, doc, ok := alarmEndDevice(t)
+			if !ok {
+				return unavailable("no EndDevice appears in the recovered transcript (resources seen: %s)",
+					strings.Join(t.ResourceNames(), " "))
+			}
+			if !doc.InNamespace() {
+				return citeMessage(t, e.Resp, certify.Fail,
+					"the EndDevice is in namespace %q, not %s — a 2030.5 payload without the namespace "+
+						"unmarshals to zero values in every conformant parser", doc.Name.Space, Namespace)
+			}
+			if !doc.Has("LogEventListLink") {
+				return citeMessage(t, e.Resp, certify.Fail,
+					"the EndDevice carries no LogEventListLink, so the alarm function set is unreachable")
+			}
+			return citeMessage(t, e.Resp, certify.Pass, "%s -> 200 %s; LogEventListLink present",
+				e.Req.Line(), doc.Summary())
+		},
+		Skip: "locating a resource by its root element requires the decrypted transcript",
+	}
 }
 
 // logEventsPostedFinding is criterion 2's Server-tier evaluator (BASIC-027):
