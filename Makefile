@@ -233,6 +233,22 @@ certify-keylog:
 	CGO_LDFLAGS="-L$(WOLFSSL_KEYLOG_SYSROOT)/lib -lwolfssl -lm" \
 	go build -tags keylog -o bin/certify-keylog ./cmd/certify
 
+# mbapsdev-keylog builds the mbaps device sim with TLS secret export, so a
+# capture of the GATEWAY's southbound mbaps session can be decrypted too —
+# including its TLS 1.3 client Certificate message, the one RBAC-011 reads the
+# SunSpec role extension (OID 1.3.6.1.4.1.50316.802.1) from. Without it that
+# leg stays ciphertext and RBAC-011's role-extension citation falls back to a
+# SKIP, which (with -require-citation) downgrades an otherwise-PASSing row to
+# WARN. Same separate sysroot, same reasoning, as server-keylog/certify-keylog.
+mbapsdev-keylog:
+	@mkdir -p bin
+	@test -d "$(WOLFSSL_KEYLOG_SYSROOT)/include" || { \
+	  echo "mbapsdev-keylog: no keylog sysroot at $(WOLFSSL_KEYLOG_SYSROOT)"; \
+	  echo "  build it: bash scripts/build-wolfssl-keylog-sysroot.sh"; exit 1; }
+	CGO_CFLAGS="-I$(WOLFSSL_KEYLOG_SYSROOT)/include" \
+	CGO_LDFLAGS="-L$(WOLFSSL_KEYLOG_SYSROOT)/lib -lwolfssl -lm" \
+	go build -tags keylog -o bin/mbapsdev-keylog ./sim/mbapsdev
+
 # The certify gate. Four steps, and each one is load-bearing:
 #
 #   1. vet + the framework/suite unit tests under -race. Every check's decision

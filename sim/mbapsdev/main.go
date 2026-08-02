@@ -230,12 +230,47 @@ func main() {
 		"\u00a73.2 Table 16, and a gateway mirroring this device northbound passes it through VERBATIM \u2014 it "+
 		"is a fact about the DER's firmware, not about the gateway \u2014 so set it when two co-located sims "+
 		"must be distinguishable by firmware as well as by serial.")
+
+	// Bench-only, and only in a -tags keylog build. Point this at the SAME
+	// file certify (and, when both are in play, sim/server) writes:
+	// wolfssl.OpenKeylog appends, the NSS format is line-oriented, and the
+	// analyzer does not care which process wrote which line — so one file
+	// ends up holding every captured session's secrets, this device sim's
+	// southbound mbaps leg included.
+	//
+	// The export itself needs no wiring here beyond opening the file:
+	// internal/mbtls.Listener.Accept (server.go) already arms
+	// wolfssl.EnableTLS13Keylog before every handshake and calls
+	// WriteTLS12Keylog after one completes — the same two calls
+	// sim/tlsserver.Server's northbound listener makes. Without OpenKeylog
+	// ever being called those are no-ops (KeylogPath() == ""), which is why
+	// the gateway's southbound TLS 1.3 Certificate message — the one RBAC-011
+	// reads the SunSpec role extension from — stayed undecryptable even
+	// though the export PATH was already there: nothing had ever opened the
+	// file. A TLS 1.3 endpoint derives BOTH directions' traffic secrets as
+	// part of its own key schedule, so exporting THIS process's (the device
+	// sim's) side is sufficient to decrypt the GATEWAY's Certificate message
+	// too — nothing is extracted from the DUT.
+	keylogPath := flag.String("keylog", "", "append this device sim's TLS session secrets to an NSS key "+
+		"log (requires a -tags keylog build; bench evidence only — see internal/wolfssl/keylog.go)")
 	flag.Parse()
 
 	// wolfSSL_Init: process-global C state, exactly once per process
 	// (CLAUDE.md invariant; mirrors sim/server/main.go).
 	wolfssl.Init()
 	defer wolfssl.Cleanup()
+
+	// Fail loudly rather than serving a run whose southbound capture nobody
+	// can decrypt. A silent no-op here is discovered at analysis time — a
+	// WARN on RBAC-011 with no obvious cause — when the run is already stale
+	// and the bench has moved on. Mirrors sim/server/main.go's -keylog gate.
+	if *keylogPath != "" {
+		if err := wolfssl.OpenKeylog(*keylogPath); err != nil {
+			log.Fatalf("-keylog %s: %v (a keylog build is required: make mbapsdev-keylog)", *keylogPath, err)
+		}
+		defer wolfssl.CloseKeylog()
+		log.Printf("mbapsdev: TLS session secrets APPEND to %s — bench evidence build", *keylogPath)
+	}
 
 	if *serial != "" && *model != "inverter" {
 		log.Printf("mbapsdev: -serial is ignored for -model %s (only -model inverter supports the "+

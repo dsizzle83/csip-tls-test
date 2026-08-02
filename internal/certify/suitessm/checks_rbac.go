@@ -41,6 +41,7 @@ import (
 	"strings"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/evidence/tlsdecrypt"
 	"csip-tls-test/internal/evidence/tlsdis"
 )
 
@@ -1467,30 +1468,64 @@ func rbac011(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 				return out, nil
 			}
 			cert, frames := v.ClientCertificate()
-			if cert == nil {
-				out = append(out, ev.SkipAssertion(claim, method,
-					"the gateway's Certificate message is not in the clear in this conversation. Under TLS 1.3 "+
-						"it is encrypted with the DEVICE SIM's handshake keys, and this run exports only the "+
-						"bench conformance client's secrets, not the sim's — so the role string cannot be "+
-						"read from the capture even though the handshake succeeded."))
-			} else {
+			switch {
+			case cert != nil:
 				verdict, obs := roleExtensionVerdict(cert.Leaf().Info, "")
 				a, cerr := ev.CiteFrames(claim, method, verdict, obs, frames)
 				if cerr != nil {
 					return nil, cerr
 				}
 				out = append(out, a)
+			default:
+				// TLS 1.3 encrypts the Certificate message with the DEVICE SIM's
+				// (mbapsdev's) handshake keys, so it is not in the clear here —
+				// but mbapsdev now exports its session secrets in a -tags keylog
+				// evidence build (sim/mbapsdev/main.go's -keylog flag; the actual
+				// export was already wired into internal/mbtls.Listener.Accept,
+				// which arms wolfssl.EnableTLS13Keylog before every handshake and
+				// was a silent no-op until OpenKeylog was ever called). A TLS 1.3
+				// endpoint derives BOTH directions' traffic secrets as part of its
+				// own key schedule, so exporting the SIM's side is sufficient to
+				// decrypt the GATEWAY's Certificate message too — nothing is
+				// extracted from the DUT. Try that recovery before giving up.
+				decMethod := method + "; the message is encrypted (TLS 1.3), so recovered by decrypting the " +
+					"capture with the run's key log — see internal/mbtls's Session.Handshake, which reassembles " +
+					"the post-ServerHello flight from decrypted records the same way the plaintext path " +
+					"reassembles it from records already in the clear"
+				dcert, dframes, derr := decryptedCertificate(ev, v, tlsdecrypt.Client)
+				if derr != nil {
+					out = append(out, ev.SkipAssertion(claim, decMethod,
+						"the gateway's Certificate message is not in the clear in this conversation (TLS 1.3), "+
+							"and it could not be recovered by decrypting the capture either: "+derr.Error()))
+				} else {
+					verdict, obs := roleExtensionVerdict(dcert.Leaf().Info, "")
+					a, cerr := ev.CiteFrames(claim, decMethod, verdict, obs, dframes)
+					if cerr != nil {
+						return nil, cerr
+					}
+					out = append(out, a)
+				}
 			}
 
 			// The second half: the gateway must not demand a role of its peer.
 			srvCert, srvFrames := v.ServerCertificate()
+			method2 := "the device sim's Certificate message plus a record-type scan of the resulting session"
+			if srvCert == nil || srvCert.Leaf() == nil || srvCert.Leaf().Info == nil {
+				// Same TLS 1.3 gap, other direction: try decryption before
+				// reporting the fact as unreadable.
+				if dcert, dframes, derr := decryptedCertificate(ev, v, tlsdecrypt.Server); derr == nil {
+					srvCert, srvFrames = dcert, dframes
+					method2 += "; the message is encrypted (TLS 1.3), so recovered by decrypting the capture " +
+						"with the run's key log"
+				}
+			}
 			claim2 := "SunSpecTCP-27/28: the EUT-C completed the handshake although the SERVER certificate carries no role extension — a role is required of clients, not of servers"
-			const method2 = "the device sim's Certificate message plus a record-type scan of the resulting session"
 			switch {
 			case srvCert == nil || srvCert.Leaf() == nil || srvCert.Leaf().Info == nil:
 				out = append(out, ev.SkipAssertion(claim2, method2,
-					"the device sim's Certificate message is not in the clear in this conversation, so whether "+
-						"it carries a role extension cannot be read from the capture"))
+					"the device sim's Certificate message is not in the clear in this conversation, and TLS 1.3 "+
+						"decryption did not recover it either, so whether it carries a role extension cannot be "+
+						"read from the capture"))
 			default:
 				rf := roleOf(srvCert.Leaf().Info)
 				appData := len(v.Server.AppData) > 0 && len(v.Client.AppData) > 0
@@ -1521,6 +1556,52 @@ func rbac011(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 			return out, nil
 		},
 	}, nil
+}
+
+// decryptedCertificate recovers one side's Certificate message from an
+// encrypted TLS 1.3 handshake using the run's key log, for callers that
+// already tried the cleartext-only wireView accessors (ClientCertificate /
+// ServerCertificate) and came up empty.
+//
+// It reuses wireView.session (wire.go), which builds the tlsdecrypt.Session
+// from the ClientHello/ServerHello randoms and refuses with a clear reason
+// when the key log carries nothing for this session — a missing key log, a
+// TLS 1.2 conversation (session's error names that too, harmlessly), or a
+// participant whose secrets truly were not exported. DecryptAll is fed the
+// WHOLE direction from its first record, same as wireView.decrypt does for
+// application data: a TLS 1.3 direction's records must be decrypted in
+// capture order because the AEAD nonce is an implicit counter, not a wire
+// field, and the Certificate message is early in the post-ServerHello flight
+// — well before a mid-stream failure (a KeyUpdate this suite never triggers,
+// a truncated tail) would ever reach it, so a partial DecryptAll error is not
+// fatal here and is folded into the "no Certificate found" reason only when
+// there is nothing else to report.
+func decryptedCertificate(ev *certify.Evidence, v *wireView, side tlsdecrypt.Side) (*tlsdis.Certificate, []int, error) {
+	sess, err := v.session(ev)
+	if err != nil {
+		return nil, nil, err
+	}
+	recs := v.Client.Stream.Records
+	if side == tlsdecrypt.Server {
+		recs = v.Server.Stream.Records
+	}
+	_, decErr := sess.DecryptAll(side, recs)
+	hs, herr := sess.Handshake(side)
+	switch {
+	case herr != nil:
+		return nil, nil, fmt.Errorf("the decrypted handshake did not reassemble: %w", herr)
+	case hs == nil:
+		return nil, nil, fmt.Errorf("decryption recovered no handshake bytes for this side")
+	}
+	msg, ok := hs.Find(tlsdis.HandshakeCertificate)
+	if !ok || msg.Certificate == nil {
+		if decErr != nil {
+			return nil, nil, fmt.Errorf("the decrypted handshake carries no Certificate message, and "+
+				"decryption of this direction stopped early: %w", decErr)
+		}
+		return nil, nil, fmt.Errorf("the decrypted handshake carries no Certificate message for this side")
+	}
+	return msg.Certificate, msg.Packets, nil
 }
 
 // ── RBAC-012 · Comprehensive Role-to-Rights Consistency Validation ──────────
