@@ -106,11 +106,11 @@ func Verify(dir string) (*VerifyReport, error) {
 	for _, p := range pkts {
 		byIndex[p.Index] = p
 	}
-	streams := reassemble(pkts, rep)
+	asm := reassemble(pkts, rep)
 
 	for _, c := range b.Cases {
 		for _, a := range c.Assertions {
-			chk := checkAssertion(c, a, pkts, byIndex, streams)
+			chk := checkAssertion(c, a, pkts, byIndex, asm)
 			rep.Assertions = append(rep.Assertions, chk)
 			if !chk.Citable {
 				rep.Unverifiable++
@@ -169,11 +169,30 @@ func verifyManifest(dir string, rep *VerifyReport) error {
 	return nil
 }
 
-// reassemble rebuilds every TCP direction so byte-range citations can be
-// resolved. Failures are recorded as problems rather than aborting: a bundle
-// whose assertions are all frame-based is still verifiable from a capture with
-// one undissectable frame in it.
-func reassemble(pkts []pcapng.Packet, rep *VerifyReport) map[string]*netdis.Direction {
+// reassemble rebuilds every TCP connection GENERATION so byte-range citations
+// can be resolved, and returns the netdis.Assembler itself rather than a
+// flattened "src > dst" -> Direction map.
+//
+// A flattened map is exactly the bug this used to have: a.StreamRef
+// (bundle.StreamRef) is deliberately just the bare endpoint pair, stable
+// across connection generations so old bundles keep reading, so a capture
+// with ephemeral-port reuse can hold several unrelated connection instances
+// that all render to the same map key (see netdis.Stream.InstanceKey and
+// e166ec1, which hit the identical ambiguity on the AUTHORING side —
+// window.go's consolidateStreams and evidence.go's mayCite/CiteBytes were
+// fixed there to key by InstanceKey instead of the bare pair). This function
+// used to build exactly that map, last-write-wins across asm.Streams()'s
+// first-seen order, so a citation against an EARLIER generation silently
+// resolved against whichever generation was reassembled last — a byte range
+// valid in the generation that authored it landing "outside" a shorter or
+// differently-shaped later generation's stream, or worse, resolving in-range
+// against the wrong generation's bytes and failing the hash check instead.
+// See resolveDirection for how a citation now finds its own generation.
+//
+// Failures are recorded as problems rather than aborting: a bundle whose
+// assertions are all frame-based is still verifiable from a capture with one
+// undissectable frame in it.
+func reassemble(pkts []pcapng.Packet, rep *VerifyReport) *netdis.Assembler {
 	asm := netdis.NewAssembler()
 	bad := 0
 	for _, p := range pkts {
@@ -187,10 +206,8 @@ func reassemble(pkts []pcapng.Packet, rep *VerifyReport) map[string]*netdis.Dire
 	if bad > 3 {
 		rep.problem(fmt.Sprintf("%d frames in total do not dissect", bad))
 	}
-	out := make(map[string]*netdis.Direction)
 	for _, st := range asm.Streams() {
 		for _, d := range st.Dirs {
-			out[d.Flow.String()] = d
 			if d.HasConflictingOverlap() {
 				// Overlapping segments with different bytes mean two readers of
 				// this capture can disagree about what was said. That is not a
@@ -201,15 +218,81 @@ func reassemble(pkts []pcapng.Packet, rep *VerifyReport) map[string]*netdis.Dire
 			}
 		}
 	}
-	return out
+	return asm
 }
 
 // StreamRef renders the canonical stream reference for a reassembled direction.
 // Authoring code and Verify must agree on this spelling, so both go through it.
 func StreamRef(d *netdis.Direction) string { return d.Flow.String() }
 
+// resolveDirection finds the reassembled Direction a byte-range assertion's
+// StreamRef names.
+//
+// The ordinary case — one connection ever used that endpoint pair — is
+// unambiguous: there is exactly one candidate Direction and this returns it.
+//
+// When ephemeral-port reuse means more than one connection GENERATION shares
+// the pair (netdis.Stream.InstanceKey), a.StreamRef alone cannot say which one
+// the assertion means, because bundle.StreamRef deliberately renders only the
+// bare pair. The disambiguator is the frames the citation itself already
+// names: bundle.CiteBytes always sets Frames = src.PacketsFor(start, end)
+// alongside BytesSHA256, so an assertion built through the normal authoring
+// path (internal/certify/evidence.go's Evidence.CiteBytes) already records
+// which frames carried the cited bytes. asm.StreamFor resolves one of those
+// frames back to the exact connection instance that owns it — the same
+// mechanism e166ec1 added for window.go's consolidateStreams and evidence.go's
+// mayCite/CiteBytes to use on the authoring side — so this picks the
+// generation that actually authored the citation instead of whichever
+// generation reassemble happened to walk last.
+//
+// If the pair is shared and the cited frames do not resolve to any of the
+// candidates (a malformed or hand-edited assertion, not anything the
+// authoring path produces), this refuses to guess and returns an error: the
+// old behavior of silently picking the most-recently-seen generation is
+// exactly the false-negative/false-positive risk this function exists to
+// close, and guessing on the fallback path would just move the bug rather
+// than fix it.
+func resolveDirection(asm *netdis.Assembler, a Assertion) (*netdis.Direction, error) {
+	var candidates []*netdis.Direction
+	for _, st := range asm.Streams() {
+		if d := directionByFlow(st, a.StreamRef); d != nil {
+			candidates = append(candidates, d)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return nil, fmt.Errorf("cites stream %q, which the capture does not contain (streams: %s)",
+			a.StreamRef, strings.Join(streamNames(asm), ", "))
+	case 1:
+		return candidates[0], nil
+	}
+	for _, f := range a.Frames {
+		st := asm.StreamFor(f)
+		if st == nil {
+			continue
+		}
+		if d := directionByFlow(st, a.StreamRef); d != nil {
+			return d, nil
+		}
+	}
+	return nil, fmt.Errorf("cites stream %q; %d connection generations share this endpoint pair "+
+		"(ephemeral port reuse — see netdis.Stream.InstanceKey) and the assertion's cited frames %v "+
+		"do not resolve to any of them, so which generation this citation names cannot be determined",
+		a.StreamRef, len(candidates), a.Frames)
+}
+
+// directionByFlow returns st's Direction whose Flow renders as flow, or nil.
+func directionByFlow(st *netdis.Stream, flow string) *netdis.Direction {
+	for _, d := range st.Dirs {
+		if d.Flow.String() == flow {
+			return d
+		}
+	}
+	return nil
+}
+
 func checkAssertion(c TestCaseResult, a Assertion, pkts []pcapng.Packet,
-	byIndex map[int]pcapng.Packet, streams map[string]*netdis.Direction) AssertionCheck {
+	byIndex map[int]pcapng.Packet, asm *netdis.Assembler) AssertionCheck {
 
 	chk := AssertionCheck{Case: c.ID, Claim: a.Claim, Citable: a.Citable(), OK: true}
 
@@ -238,11 +321,10 @@ func checkAssertion(c TestCaseResult, a Assertion, pkts []pcapng.Packet,
 	}
 
 	if a.BytesSHA256 != "" {
-		d, ok := streams[a.StreamRef]
-		if !ok {
+		d, err := resolveDirection(asm, a)
+		if err != nil {
 			chk.OK = false
-			chk.Detail = fmt.Sprintf("cites stream %q, which the capture does not contain (streams: %s)",
-				a.StreamRef, strings.Join(streamNames(streams), ", "))
+			chk.Detail = err.Error()
 			return chk
 		}
 		data, err := d.Bytes.Range(a.ByteRange[0], a.ByteRange[1])
@@ -276,10 +358,21 @@ func checkAssertion(c TestCaseResult, a Assertion, pkts []pcapng.Packet,
 	return chk
 }
 
-func streamNames(streams map[string]*netdis.Direction) []string {
-	out := make([]string, 0, len(streams))
-	for k := range streams {
-		out = append(out, k)
+// streamNames lists every distinct "src > dst" pair the capture reassembled,
+// across every connection generation, for use in a "no such stream" detail
+// message. A pair that had more than one generation appears once, same as it
+// does in a.StreamRef — generation identity is not part of this spelling.
+func streamNames(asm *netdis.Assembler) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, st := range asm.Streams() {
+		for _, d := range st.Dirs {
+			s := d.Flow.String()
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
 	}
 	sort.Strings(out)
 	return out
