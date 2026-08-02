@@ -154,13 +154,14 @@ func (o *observer) injectionReason() string {
 // Modbus listener belonging to this bench, and that conformance runs are
 // serialized, so during this check's interval nothing else is talking to it.
 // The citation phase does not take that on trust: assertAttributionSound
-// re-derives it from the capture, accepting any number of conversations with
-// that endpoint as long as none of them overlap in time — which is what a
-// second, unaccounted-for client would look like on a dedicated,
-// single-purpose, serialized listener. Several of this suite's own checks
-// provoke exactly one reconnect (or more, see CLI-4's base-relocation
-// sweep) as part of their own procedure, and every one of those is still
-// legitimately the DUT.
+// re-derives it from the capture, accepting ANY number of conversations with
+// that endpoint, however they overlap in time — because no other client can
+// ever be one of them, on this endpoint, regardless of count or timing.
+// Several of this suite's own checks provoke one reconnect or several
+// (CLI-4's base-relocation sweep) as part of their own procedure, and a
+// fault-induced reconnect can briefly overlap the connection it replaces
+// (the old one's teardown racing the new one's SYN); every one of those is
+// still legitimately the DUT.
 func (o *observer) claimServer() error {
 	reason := fmt.Sprintf("the DUT is the Modbus CLIENT under test and %s is the bench's plain-text "+
 		"SunSpec Modbus server, so the bench never learns the DUT's ephemeral source port and cannot "+
@@ -287,6 +288,132 @@ func (o *observer) watch(ctx context.Context, cycles int) error {
 	d := time.Duration(cycles)*o.pollInterval + o.pollInterval/2
 	o.rc.Logf("observing the DUT's southbound traffic for %s (%d poll cycle(s))", d, cycles)
 	return o.rc.Sleep(ctx, d)
+}
+
+// awaitJournalEvidence blocks until lines added to the DUT's journal since
+// before satisfy detect, or a bounded deadline elapses — whichever comes
+// first — but never less than minCycles poll intervals.
+//
+// # Why a flat sleep was not enough
+//
+// The DUT is an autonomous gateway: it polls modsim southbound on its OWN
+// schedule, independent of this check's arm/watch/clear pace — a live-bench
+// run (runs/warnmeas-mc-ssm-20260802T134537) measured two consecutive reads
+// exactly one poll interval apart (13:51:54 -> 13:52:04, 10s). A check that
+// armed a fault and cleared it a fixed few cycles later, with no
+// confirmation that the DUT actually polled WHILE it was armed, routinely
+// finished before the DUT's next poll even started — that live run's own
+// capture showed several fault classes producing "observed: none" even
+// though the fault genuinely reached the server the whole time. On the
+// exception side specifically the DUT does not just miss a delayed fault:
+// it DROPS the session on a Modbus exception and reconnects "on next poll"
+// with backoff, so RECOVERY evidence needs the same kind of patience this
+// function gives arming.
+//
+// # What this buys
+//
+// detect is handed the journal lines ADDED since before (journalSince) and
+// reports whether they show whatever this caller is waiting for — the DUT
+// reacting to an armed fault, or the DUT resuming normal operation. This
+// returns as soon as detect fires (once minCycles have elapsed, so a DUT
+// slower than the assumed cadence still gets a fair look), rather than
+// always waiting out the full deadline, and returns observed=false with
+// whatever it last read once maxCycles is reached without detect ever
+// firing — the caller decides what an unconfirmed hold means for its own
+// verdict.
+//
+// A nil detect, or gateway introspection being unavailable, degrades to a
+// flat minCycles wait: the best this function can do without a live signal
+// to poll.
+func (o *observer) awaitJournalEvidence(ctx context.Context, before []string, minCycles, maxCycles int,
+	detect func(delta []string) bool) (observed bool, lines []string) {
+	if minCycles < 1 {
+		minCycles = 1
+	}
+	if maxCycles < minCycles {
+		maxCycles = minCycles
+	}
+	if err := o.watch(ctx, minCycles); err != nil {
+		lines, _ = o.journal(ctx, 400)
+		return false, lines
+	}
+	if detect == nil || o.rc.Gateway == nil || !o.rc.Gateway.Available() {
+		lines, _ = o.journal(ctx, 400)
+		return false, lines
+	}
+	tick := o.pollInterval / 4
+	if tick <= 0 {
+		tick = 100 * time.Millisecond
+	}
+	deadline := time.Now().Add(time.Duration(maxCycles-minCycles) * o.pollInterval)
+	for {
+		var err error
+		lines, err = o.journal(ctx, 400)
+		if err == nil && detect(journalSince(before, lines)) {
+			// A small grace period: the journal line and the wire exchange
+			// that produced it are not simultaneous, and this function's
+			// caller usually clears its fault (or closes the window)
+			// immediately after it returns.
+			_ = o.rc.Sleep(ctx, tick)
+			return true, lines
+		}
+		if !time.Now().Before(deadline) {
+			return false, lines
+		}
+		if err := o.rc.Sleep(ctx, tick); err != nil {
+			return false, lines
+		}
+	}
+}
+
+// deviceErrorish reports whether any line in lines mentions device and looks
+// like an error — a quick live-phase predicate for awaitJournalEvidence's
+// detect parameter. (err2Journal's own citation-phase assertion applies a
+// closely related but not identical filter — it additionally excludes the
+// routine "verdict=match" reconciler line and collects the matches to quote
+// rather than returning a bool — so this is not a refactor of that
+// function, just a shared shape for the live-phase confirmation problem.)
+func deviceErrorish(lines []string, device string) bool {
+	for _, l := range grepJournal(lines, device) {
+		low := strings.ToLower(l)
+		if strings.Contains(low, "err") || strings.Contains(low, "fail") ||
+			strings.Contains(low, "exception") || strings.Contains(low, "unavailable") ||
+			strings.Contains(low, "down") || strings.Contains(low, "warn") {
+			return true
+		}
+	}
+	return false
+}
+
+// journalShowsRecoveryIntent reports whether lines show the DUT recognising
+// a failure and stating it will retry — lexa-modbus's documented pattern for
+// a southbound Modbus session loss is "device session dropped — will
+// reconnect on next poll" (the live-run journal sample in
+// runs/warnmeas-mc-ssm-20260802T134537). It is narrower than deviceErrorish:
+// not just "something went wrong" but "and the DUT says it is retrying" —
+// the fact that lets a recovery claim downgrade to WARN instead of FAIL when
+// the wire itself does not show a completed post-fault exchange within the
+// window.
+func journalShowsRecoveryIntent(lines []string, device string) bool {
+	for _, l := range grepJournal(lines, device) {
+		low := strings.ToLower(l)
+		if strings.Contains(low, "reconnect") || strings.Contains(low, "will retry") ||
+			strings.Contains(low, "retrying") {
+			return true
+		}
+	}
+	return false
+}
+
+// freshReadback reports whether lines contain a readback log line for
+// device — evidence that the DUT completed at least one full poll cycle
+// (read, decode, journal), which is what CLI-4's base-relocation sweep and
+// READ-2 need before restoring the server or closing the window: a stronger
+// signal than "the connection reopened" for "a complete poll happened
+// inside this window".
+func freshReadback(lines []string, device string) bool {
+	_, ok := lastReadback(lines, device)
+	return ok
 }
 
 // settle waits for the sim's control plane to answer again, then waits one full

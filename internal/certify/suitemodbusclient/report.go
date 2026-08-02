@@ -69,12 +69,18 @@ var Rows = []Row{
 		Demonstrated: "the DUT probes only legal base addresses and reads the map from the one that answers, " +
 			"at the default base 40000 and — modsim's relocate verb (sim/southbound/relocate.go) landed and " +
 			"is now driven at runtime, no launch flag needed — after the map is re-homed to base 0 and to " +
-			"base 50000 in turn, each with its own forced reconnect",
-		Gap: "closed in capability terms; what remains is confirmation on a real bench run that the DUT's " +
-			"discovery actually completes at both relocated bases (this suite's own honesty rule: a sim " +
-			"verb existing is not the same claim as a live run having exercised it)",
+			"base 50000 in turn, each with its own forced reconnect. A live-hardware run confirmed the " +
+			"DUT genuinely rediscovers the map at each relocated base (runs/warnmeas-mc-ssm-20260802T134537); " +
+			"each reconnect is now HELD until the DUT's own journal confirms a complete poll cycle " +
+			"(awaitJournalEvidence), not a fixed cycle count, since the DUT polls on its own independent " +
+			"~10s cadence",
+		Gap: "the SAME live run also showed the Common Model's full-body read specifically (as opposed to " +
+			"the header-only chain walk) can still miss a fixed-length window even when the base-relocation " +
+			"itself succeeds — the hold above is this row's fix for that; full confidence still wants " +
+			"another live run's bundle to confirm the body-coverage assertion PASSes at every base, not " +
+			"just the base-probe one",
 		Capability: "none further on the sim side; promoting to full needs a real-bench run whose bundle " +
-			"shows all three bases' discovery complete"},
+			"shows all three bases' discovery AND full Common Model body coverage complete"},
 	{ID: "CLI-5", UID: "ss-modbus-client-conf-v1.1::CLI-5", Depth: DepthNotApplicable,
 		Demonstrated: "nothing; the row is the optional Modbus RTU baud-rate sweep",
 		Gap:          "there is no RS-485 SunSpec server on the bench and no serial line to capture",
@@ -84,9 +90,13 @@ var Rows = []Row{
 		Gap:          "one FC 0x03 request per point — the DUT reads whole model blocks and exposes no way to request a single point",
 		Capability:   "a diagnostic point-read mode on the DUT's Modbus client. This is a device capability gap, not a bench gap: no sim work promotes it"},
 	{ID: "READ-2", UID: "ss-modbus-client-conf-v1.1::READ-2", Depth: DepthFull,
-		Demonstrated: "the 125-register ceiling on every read, the Common Model body in one request, and a >125-register model read in maximal chunks",
-		Gap:          "the client-side 'log every point as hex strings' criterion",
-		Capability:   "a diagnostic dump mode on the DUT; the bytes themselves are already in the bundle"},
+		Demonstrated: "the 125-register ceiling on every read, the Common Model body in one request, and a " +
+			">125-register model read in maximal chunks — graded against the DUT's FIRST complete sweep " +
+			"of a long model's body (firstSweep) since a window spanning more than one of the DUT's own " +
+			"~10s poll cycles legitimately observes the same maximal-chunk pattern several times over " +
+			"(a live-hardware finding, runs/warnmeas-mc-ssm-20260802T134537)",
+		Gap:        "the client-side 'log every point as hex strings' criterion",
+		Capability: "a diagnostic dump mode on the DUT; the bytes themselves are already in the bundle"},
 	{ID: "WR-1", UID: "ss-modbus-client-conf-v1.1::WR-1", Depth: DepthObservationOnly,
 		Demonstrated: "the framing of any FC 0x06 write the provocation elicits — function code, address, value, and the server's echo",
 		Gap:          "the five-values-per-point sweep, the enumerated-value sweep, and the RTU broadcast step",
@@ -113,8 +123,13 @@ var Rows = []Row{
 	{ID: "PROT-1", UID: "ss-modbus-client-conf-v1.1::PROT-1", Depth: DepthPartial,
 		Demonstrated: "three readings of the document's undefined 'partial response' — a severed " +
 			"transaction, an over-long response delay, and (modsim's protorelay verb, " +
-			"sim/southbound/protorelay.go, landed) a structurally truncated response — and the DUT's " +
-			"recovery after each",
+			"sim/southbound/protorelay.go, landed) a structurally truncated response — each now HELD until " +
+			"the DUT's own journal confirms a reaction (awaitJournalEvidence, not a fixed cycle count, " +
+			"per a live-hardware finding — runs/warnmeas-mc-ssm-20260802T134537 — that a bare 2-cycle hold " +
+			"routinely missed the DUT's ~10s poll), and the DUT's recovery held the same way afterward. " +
+			"Attribution also now accepts conversations that overlap in time, not just sequential ones: " +
+			"modsim's endpoint is dedicated and single-client regardless of how a reconnect's teardown/SYN " +
+			"race falls",
 		Gap: "the structurally truncated reading needs modsim STARTED with -protofault (it interposes a " +
 			"second relay); without that launch flag the sim refuses the fault by name and this row falls " +
 			"back to two readings",
@@ -128,18 +143,24 @@ var Rows = []Row{
 		Gap:          "the noncompliant server itself — a SunSpec map at holding register 40001",
 		Capability:   "the same settable map base CLI-4 needs, plus a DUT device entry pointing at that instance"},
 	{ID: "ERR-2", UID: "ss-modbus-client-conf-v1.1::ERR-2", Depth: DepthPartial,
-		Demonstrated: "all four exception classes provoked for real and observed on the wire: 0x04 SERVER " +
-			"DEVICE FAILURE and 0x0B GATEWAY TARGET DEVICE FAILED TO RESPOND via the server's blanket " +
-			"read-failure faults, and — modsim's exception_target scoping (sim/southbound/exception_target.go) " +
-			"landed — 0x01 ILLEGAL FUNCTION, 0x02 ILLEGAL DATA ADDRESS and 0x03 ILLEGAL DATA VALUE by " +
-			"targeting the exception at FC 0x03, the function code the DUT already uses for every read, " +
-			"rather than needing the DUT to misbehave into producing them; each followed by a successful " +
-			"transaction",
-		Gap: "none in sim-capability terms; the residual question is whether a read-scoped targeted " +
-			"exception is judged an acceptable stand-in for the procedure's literal client-driven-bad-request " +
-			"reading of 0x01/0x02/0x03, which is a documented-deviation judgement call for a reviewer, not " +
-			"a bench gap",
-		Capability: "none further on the sim side"},
+		Demonstrated: "the two exception classes §2.9.2 step 1 itself names — 0x04 SERVER DEVICE FAILURE " +
+			"and 0x0B GATEWAY TARGET DEVICE FAILED TO RESPOND — each HELD until the DUT's own journal " +
+			"confirms it reacted (awaitJournalEvidence, not a fixed cycle count) and observed on the wire, " +
+			"with recovery held the same way through the DUT's reconnect-with-backoff. This is a rework " +
+			"of an earlier version that armed FIVE classes on a fixed schedule: a live-hardware run " +
+			"(runs/warnmeas-mc-ssm-20260802T134537) showed the DUT's own independent ~10s poll cadence — " +
+			"it drops the session on a Modbus exception and reconnects 'on next poll' with backoff — meant " +
+			"a fixed arm/clear pace routinely finished before the DUT ever polled, and the recovery " +
+			"assertion FAILed outright when the window closed before the backoff completed. Reliability for " +
+			"the two REQUIRED classes plus recovery now takes priority over breadth",
+		Gap: "modsim's exception_target scoping (sim/southbound/exception_target.go) CAN target 0x01 " +
+			"ILLEGAL FUNCTION, 0x02 ILLEGAL DATA ADDRESS and 0x03 ILLEGAL DATA VALUE at FC 0x03 — the " +
+			"capability gap that used to block them is closed — but serializing three more held-and-" +
+			"confirmed classes into the same test case as the two REQUIRED ones risks the exact timing " +
+			"regression this rework fixes, for classes the procedure's own criteria do not require",
+		Capability: "either a materially longer per-check budget than CheckTimeout=6m already grants this " +
+			"row, or moving each additional class into its own dedicated test case so a slow DUT poll " +
+			"cannot cascade delay across unrelated classes"},
 	{ID: "ERR-3", UID: "ss-modbus-client-conf-v1.1::ERR-3", Depth: DepthPartial,
 		Demonstrated: "the behaviour the criterion turns on — the DUT steps over a model it does not " +
 			"consume using the length header and continues the chain walk — now demonstrated against a " +

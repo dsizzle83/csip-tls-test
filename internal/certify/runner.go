@@ -868,7 +868,14 @@ func (r *Runner) execute(ctx context.Context, p Planned, rc *RunCtx, win *Window
 		Started: time.Now().UTC(), Executed: true,
 		captureArtifacts: p.Registration.CaptureArtifacts,
 	}
-	cctx, cancel := context.WithTimeout(ctx, r.opts.CheckTimeout)
+	to := r.opts.CheckTimeout
+	if p.Registration.Timeout > 0 {
+		// A per-registration override (Registration.Timeout / WithTimeout) —
+		// a check whose own procedure has to wait out a DUT's independent
+		// cadence, not the run's global -timeout tuned for the common case.
+		to = p.Registration.Timeout
+	}
+	cctx, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
 
 	win.Open(time.Now().UTC())

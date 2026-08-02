@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"csip-tls-test/internal/evidence/bundle"
 )
@@ -152,6 +153,19 @@ type Registration struct {
 	// (a provisioning step before the case that depends on it). Lower runs
 	// first; ties break on UID so the run order is fully deterministic.
 	Order int
+	// Timeout overrides Options.CheckTimeout for this one registration. Zero
+	// (the default for every existing registration) means "use the run's
+	// global -timeout" — this field changes nothing for a suite that never
+	// sets it. It exists for a check whose OWN procedure has to wait out a
+	// DUT's independent cadence (an autonomous poller's own ~10s cycle plus
+	// reconnect backoff, say) for evidence no amount of hurrying produces
+	// faster: a single global -timeout sized for that check would either
+	// leave every faster check's budget alone (fine) or force every check
+	// on the run to accept the slow check's worst case (not fine, on a run
+	// with hundreds of cases). See suitemodbusclient's CLI-4/ERR-2/PROT-1/
+	// READ-2 registrations for the motivating case
+	// (runs/warnmeas-mc-ssm-20260802T134537's live-hardware findings).
+	Timeout time.Duration
 	// CaptureArtifacts are the file names a governing specification requires
 	// this case's packet capture to be submitted under, in the order the
 	// document lists them. Empty for a case whose document names none.
@@ -181,6 +195,12 @@ func WithRequires(tags ...string) Option {
 
 // WithOrder sets the within-suite ordering key.
 func WithOrder(n int) Option { return func(r *Registration) { r.Order = n } }
+
+// WithTimeout overrides Options.CheckTimeout for this one registration. See
+// Registration.Timeout.
+func WithTimeout(d time.Duration) Option {
+	return func(r *Registration) { r.Timeout = d }
+}
 
 // WithCaptureArtifacts declares the file names this case's capture must be
 // submitted under, in the order the governing document lists them. See

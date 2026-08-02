@@ -414,9 +414,27 @@ func checkCLI4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
+	device := defaultDeviceName
+	if v, ok := rc.Param(paramDevice); ok && v != "" {
+		device = v
+	}
+
+	// CLI-4#5 (census 20260731T234821) / assertion 5 (census
+	// compliance-fullsuite-2-20260802T020946 as re-run live,
+	// runs/warnmeas-mc-ssm-20260802T134537): a bare N-cycle wait after
+	// reconnecting caught the (fast) header-only chain walk but missed the
+	// SLOWER, separate full-body read of the Common Model — which only
+	// happens on the DUT's own steady-state poll, not as part of the
+	// initial identify burst, and that poll can itself trail the reconnect
+	// by more than a bare cycle or two once the DUT's reconnect-with-
+	// backoff is in play. Hold until a fresh readback line proves at least
+	// one COMPLETE poll cycle happened post-reconnect, not a fixed guess.
+	journalBeforeInitial, _ := o.journal(ctx, 200)
 	forced := o.forceReconnect(ctx)
-	// CLI-4#5 (census 20260731T234821): see the identical note on checkCLI3.
-	if err := o.watch(ctx, 3); err != nil {
+	if forced == nil {
+		_, _ = o.awaitJournalEvidence(ctx, journalBeforeInitial, 3, 6,
+			func(delta []string) bool { return freshReadback(delta, device) })
+	} else if err := o.watch(ctx, 3); err != nil {
 		return certify.Result{}, err
 	}
 
@@ -425,9 +443,12 @@ func checkCLI4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	// re-home the server's SunSpec map at runtime — always available, no
 	// modsim launch flag needed. Sweep the two non-default standard bases,
 	// forcing a fresh reconnect (and so a fresh discovery sequence) after
-	// each relocation. The default base is ALWAYS restored afterward,
-	// unconditionally deferred: a bench left relocated would corrupt every
-	// OTHER check's discovery, not just this row's.
+	// each relocation, and — same fix as the initial reconnect above —
+	// hold each one until a fresh readback proves a complete poll cycle
+	// happened at the new base, not a fixed guess. The default base is
+	// ALWAYS restored afterward, unconditionally deferred: a bench left
+	// relocated would corrupt every OTHER check's discovery, not just this
+	// row's.
 	defer o.clearFault("relocate")
 	var sweep []baseSweepAttempt
 	if o.injectionReason() == "" {
@@ -436,8 +457,12 @@ func checkCLI4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 			if err := o.relocate(ctx, b); err != nil {
 				att.relocateErr = err
 			} else {
+				journalBeforeBase, _ := o.journal(ctx, 200)
 				att.reconnectErr = o.forceReconnect(ctx)
-				if err := o.watch(ctx, 3); err != nil {
+				if att.reconnectErr == nil {
+					_, _ = o.awaitJournalEvidence(ctx, journalBeforeBase, 3, 6,
+						func(delta []string) bool { return freshReadback(delta, device) })
+				} else if err := o.watch(ctx, 3); err != nil {
 					return certify.Result{}, err
 				}
 			}

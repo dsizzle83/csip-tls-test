@@ -68,22 +68,31 @@ func checkPROT1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 		return certify.Skipped("this procedure requires the server to return an incomplete response, "+
 			"and %s", r), nil
 	}
+	device := defaultDeviceName
+	if v, ok := rc.Param(paramDevice); ok && v != "" {
+		device = v
+	}
 
 	// Baseline, so the capture holds a normal exchange before the provocation.
 	if err := o.watch(ctx, 1); err != nil {
 		return certify.Result{}, err
 	}
 
+	// live-run finding (runs/warnmeas-mc-ssm-20260802T134537, assertions
+	// 2/4/5): a bare 2-cycle hold routinely finished before the DUT's own
+	// ~10s poll ever met the armed fault, and the same for the recovery
+	// wait afterward. Phase (b) below now holds until the DUT's journal
+	// shows it reacted (or 4 cycles elapse), not a fixed guess.
+	journalBeforeLatency, _ := o.journal(ctx, 200)
+
 	// Phase (b): the response that arrives too late.
 	latencyArmed := o.fault(ctx, map[string]any{"kind": "latency", "latency_ms": latencyMs},
 		fmt.Sprintf("delay every register read by %d ms, far beyond any plausible client read timeout, "+
 			"so a client that bounds its reads abandons the transaction", latencyMs))
 	if latencyArmed == nil {
-		err := o.watch(ctx, 2)
+		_, _ = o.awaitJournalEvidence(ctx, journalBeforeLatency, 2, 4,
+			func(delta []string) bool { return deviceErrorish(delta, device) })
 		o.clearFault("latency")
-		if err != nil {
-			return certify.Result{}, err
-		}
 	}
 
 	// Phase (a): the transaction severed mid-flight.
@@ -108,28 +117,35 @@ func checkPROT1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	// modsim started with -protofault (sim/southbound/protorelay.go); the
 	// sim refuses the fault BY NAME when it was not, so this reports
 	// SKIP-with-reason rather than folding into "cannot be served at all".
+	//
+	// Held (arm) and recovered (clear) the same poll-cadence-aware way as
+	// phase (b): the live run showed both the hold AND the post-clear
+	// recovery window closing before the DUT's own ~10s cadence caught up.
 	var shortArmedAt time.Time
+	journalBeforeShort, _ := o.journal(ctx, 200)
 	shortArmed := o.fault(ctx, map[string]any{"kind": "short_response", "truncate_bytes": shortResponseTruncateBytes},
 		fmt.Sprintf("write a response with a well-formed MBAP header promising the full PDU but stop the "+
 			"socket write after %d bytes of it, leaving the connection open — the structurally truncated "+
 			"reading of §2.8.1's undefined 'partial response'", shortResponseTruncateBytes))
 	if shortArmed == nil {
 		shortArmedAt = time.Now().UTC()
-		err := o.watch(ctx, 2)
+		_, _ = o.awaitJournalEvidence(ctx, journalBeforeShort, 2, 4,
+			func(delta []string) bool { return deviceErrorish(delta, device) })
 		o.clearFault("short_response")
-		if err != nil {
-			return certify.Result{}, err
-		}
+		journalBeforeRecovery, _ := o.journal(ctx, 400)
 		if err := o.settle(ctx); err != nil {
 			return certify.Result{}, err
 		}
+		_, _ = o.awaitJournalEvidence(ctx, journalBeforeRecovery, 1, 3,
+			func(delta []string) bool { return freshReadback(delta, device) })
 	}
 
 	return certify.Result{
 		Verdict: certify.Warn,
 		Notes: fmt.Sprintf("three readings of §2.8.1's undefined 'partial response' were driven — a "+
 			"severed transaction, an over-long response delay, and (when modsim is started with "+
-			"-protofault) a structurally truncated response — and the DUT's recovery observed. %s",
+			"-protofault) a structurally truncated response — each held until the DUT's own journal "+
+			"confirmed a reaction (not a fixed guess), and the DUT's recovery observed the same way. %s",
 			o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT remained functional after a Modbus response failed to complete"

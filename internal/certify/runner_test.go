@@ -556,6 +556,53 @@ func TestRunnerHonoursCancellation(t *testing.T) {
 	}
 }
 
+// TestRegistrationTimeoutOverridesTheGlobalOne is Registration.Timeout /
+// WithTimeout's own test: a check whose own procedure has to wait out a
+// DUT's independent cadence (suitemodbusclient's CLI-4/ERR-2/PROT-1/READ-2,
+// after runs/warnmeas-mc-ssm-20260802T134537's live-hardware findings) needs
+// MORE time than the run's global -timeout, without raising that timeout
+// for every OTHER check on the run. A global CheckTimeout far too short for
+// the check below, paired with a per-registration WithTimeout comfortably
+// long enough, must let the check complete on its own terms.
+func TestRegistrationTimeoutOverridesTheGlobalOne(t *testing.T) {
+	cat := catalogFile(t)
+	reg := NewRegistry()
+	reg.Register("doc-a::A-001", "x", func(ctx context.Context, _ *RunCtx) (Result, error) {
+		select {
+		case <-time.After(120 * time.Millisecond):
+			return Skipped("slow but within its own budget"), nil
+		case <-ctx.Done():
+			return Result{}, ctx.Err()
+		}
+	}, WithOrder(0), WithTimeout(2*time.Second))
+
+	opts, _ := baseOptions(t, nil)
+	opts.CheckTimeout = 30 * time.Millisecond // far too short for the check above WITHOUT the override
+	run, err := New(reg, cat, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := run.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *CaseResult
+	for i := range rep.Cases {
+		if rep.Cases[i].Case.UID == "doc-a::A-001" {
+			got = &rep.Cases[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("no result for doc-a::A-001: %+v", rep.Cases)
+	}
+	if got.Err != nil {
+		t.Fatalf("the case errored — the per-registration timeout was not honoured: %v", got.Err)
+	}
+	if got.Verdict != Skip {
+		t.Errorf("verdict = %s, want SKIP (the check's own successful return)", got.Verdict)
+	}
+}
+
 // Missing capabilities produce a named SKIP, never a silent omission.
 func TestMissingCapabilitySkipsWithAReason(t *testing.T) {
 	cat := catalogFile(t)

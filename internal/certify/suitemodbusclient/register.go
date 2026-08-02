@@ -21,7 +21,11 @@ package suitemodbusclient
 // rows run last, because they are the only ones that can reach outside this
 // suite's own surface.
 
-import "csip-tls-test/internal/certify"
+import (
+	"time"
+
+	"csip-tls-test/internal/certify"
+)
 
 func init() { Register(certify.Default()) }
 
@@ -53,22 +57,40 @@ func Register(reg *certify.Registry) {
 	wire := []certify.Option{certify.WithRequires("bench", "capture")}
 
 	// Pass 1 — the DUT observed as it is.
-	reg.Register(rd2, Suite, checkREAD2, append(wire, certify.WithOrder(10))...)
+	//
+	// CLI-4 and READ-2 carry an explicit WithTimeout: a live-hardware run
+	// (runs/warnmeas-mc-ssm-20260802T134537) showed the DUT is an autonomous
+	// gateway on its OWN ~10s poll cadence, and both checks now HOLD a
+	// relocated base / a post-reconnect window until a fresh readback
+	// confirms a complete poll cycle (awaitJournalEvidence, up to several
+	// cycles per hold — CLI-4 holds THREE times, once per base) rather than
+	// guessing a fixed cycle count. That can comfortably exceed
+	// DefaultCheckTimeout (3 minutes) in the worst case; see Registration.
+	// Timeout's own doc for why this is a per-registration override rather
+	// than a bump to the run's global -timeout.
+	reg.Register(rd2, Suite, checkREAD2, append(wire, certify.WithOrder(10), certify.WithTimeout(4*time.Minute))...)
 	reg.Register(rd1, Suite, checkREAD1, append(wire, certify.WithOrder(11))...)
 	reg.Register(cli2, Suite, checkCLI2, append(wire, certify.WithOrder(20))...)
 	reg.Register(cli1, Suite, checkCLI1, append(wire, certify.WithOrder(21))...)
 	reg.Register(cli3, Suite, checkCLI3, append(wire, certify.WithOrder(22))...)
-	reg.Register(cli4, Suite, checkCLI4, append(wire, certify.WithOrder(23))...)
+	reg.Register(cli4, Suite, checkCLI4, append(wire, certify.WithOrder(23), certify.WithTimeout(7*time.Minute))...)
 	reg.Register(pr2, Suite, checkPROT2, append(wire, certify.WithOrder(30))...)
 	reg.Register(er3, Suite, checkERR3, append(wire, certify.WithOrder(31))...)
 	reg.Register(er1, Suite, checkERR1, append(wire, certify.WithOrder(32))...)
 
 	// Pass 2 — the DUT provoked. Each of these arms a fault on the server and
 	// clears it before returning.
+	//
+	// ERR-2 and PROT-1 also carry an explicit WithTimeout, for the same
+	// live-run reason: each fault phase now holds until the DUT's journal
+	// confirms a reaction, and recovery is held the same way through the
+	// DUT's reconnect-with-backoff, rather than a fixed guess that already
+	// produced a FAIL (ERR-2) and several missed-window SKIPs (PROT-1) on
+	// real hardware.
 	reg.Register(in1, Suite, checkINFO1, append(wire, certify.WithOrder(40))...)
-	reg.Register(er2, Suite, checkERR2, append(wire, certify.WithOrder(41))...)
+	reg.Register(er2, Suite, checkERR2, append(wire, certify.WithOrder(41), certify.WithTimeout(6*time.Minute))...)
 	reg.Register(in2, Suite, checkINFO2, append(wire, certify.WithOrder(42))...)
-	reg.Register(pr1, Suite, checkPROT1, append(wire, certify.WithOrder(43))...)
+	reg.Register(pr1, Suite, checkPROT1, append(wire, certify.WithOrder(43), certify.WithTimeout(6*time.Minute))...)
 
 	// Pass 3 — the rows that may reach the northbound surface.
 	reg.Register(wr1, Suite, checkWR1, append(wire, certify.WithOrder(50))...)

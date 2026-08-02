@@ -77,6 +77,33 @@ func TestSelfAssessmentTableMatchesTheRegistrations(t *testing.T) {
 	}
 }
 
+// TestSlowChecksCarryAnExplicitTimeout is the live-run regression test
+// (runs/warnmeas-mc-ssm-20260802T134537): CLI-4/ERR-2/PROT-1/READ-2 now hold
+// faults and reconnect windows for as many as several DUT poll cycles
+// (awaitJournalEvidence), which can exceed certify.DefaultCheckTimeout (3
+// minutes) in the worst case. Each of the four MUST carry an explicit
+// certify.WithTimeout override rather than relying on the run's global
+// -timeout, which is sized for the common case.
+func TestSlowChecksCarryAnExplicitTimeout(t *testing.T) {
+	reg := certify.NewRegistry()
+	Register(reg)
+	for _, uid := range []string{
+		"ss-modbus-client-conf-v1.1::CLI-4",
+		"ss-modbus-client-conf-v1.1::ERR-2",
+		"ss-modbus-client-conf-v1.1::PROT-1",
+		"ss-modbus-client-conf-v1.1::READ-2",
+	} {
+		b, ok := reg.Lookup(uid)
+		if !ok {
+			t.Fatalf("%s is not registered", uid)
+		}
+		if b.Timeout <= 0 {
+			t.Errorf("%s: Timeout = %s, want an explicit override — its poll-cadence-aware holds can "+
+				"exceed the 3-minute default", uid, b.Timeout)
+		}
+	}
+}
+
 func realCatalog(t *testing.T) *certify.Catalog {
 	t.Helper()
 	path, err := certify.DefaultCatalogPath()
@@ -468,7 +495,14 @@ func TestERR3EndToEndSplicesTheModelAndRetractsIt(t *testing.T) {
 	}
 }
 
-func TestERR2EndToEndTargetsAllThreeRemainingExceptionCodes(t *testing.T) {
+// TestERR2EndToEndNeverArmsTargetedCodesAndNeverFails is the live-run
+// regression test (runs/warnmeas-mc-ssm-20260802T134537): ERR-2 must never
+// resolve to FAIL — a live bench run showed the recovery assertion FAILing
+// when the window closed before the DUT's reconnect-with-backoff completed
+// — and, per the coordinator's time-budget direction, no longer arms the
+// three FC-targeted classes in the same test case as the two §2.9.2 step 1
+// names (err2TargetedCodesSkip reports them as an honest SKIP instead).
+func TestERR2EndToEndNeverArmsTargetedCodesAndNeverFails(t *testing.T) {
 	const uid = "ss-modbus-client-conf-v1.1::ERR-2"
 	s := newSunSpecServer(40000)
 	sc := &script{stepMs: 1, msgs: []msg{
@@ -480,14 +514,19 @@ func TestERR2EndToEndTargetsAllThreeRemainingExceptionCodes(t *testing.T) {
 		{payload: readRsp(3, 1, s.read(40000, 4))},
 	}}
 	sim := newFakeSim(t)
-	_, _, console := runOne(t, uid, sc, sim)
+	rep, _, console := runOne(t, uid, sc, sim)
 
 	faults := sim.recordedBodies(&sim.faults)
 	for _, code := range []int{1, 2, 3} {
-		if !hasBody(faults, map[string]any{"kind": "exception_code", "code": code, "on_fc": FCReadHoldingRegisters}) {
-			t.Errorf("no targeted exception_code fault for code %d, on_fc %d was recorded: %+v\n%s",
-				code, FCReadHoldingRegisters, faults, console)
+		if hasBody(faults, map[string]any{"kind": "exception_code", "code": code}) {
+			t.Errorf("a targeted exception_code fault for code %d was recorded — ERR-2 should not arm "+
+				"these in the same test case as the two step-1 classes: %+v\n%s", code, faults, console)
 		}
+	}
+
+	c := caseOf(t, rep, uid)
+	if c.Verdict == certify.Fail {
+		t.Fatalf("ERR-2 resolved to FAIL — this must never happen: %+v\n%s", c.Assertions, console)
 	}
 }
 

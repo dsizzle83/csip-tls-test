@@ -31,17 +31,32 @@ func checkREAD2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
+	device := defaultDeviceName
+	if v, ok := rc.Param(paramDevice); ok && v != "" {
+		device = v
+	}
 	// A steady-state poll is enough for READ-2: the DUT re-reads every model it
 	// consumes on every cycle. Forcing a reconnect additionally brings the
 	// discovery-time reads of models it does NOT consume into the window, which
 	// is what makes the model-by-model coverage assertion complete.
+	//
+	// live-run finding (runs/warnmeas-mc-ssm-20260802T134537, assertion 3): a
+	// bare 2-cycle wait caught model 701's steady-state re-reads but missed
+	// the Common Model's own full-body read, which the DUT does not repeat
+	// every cycle the same way — same root cause and same fix as CLI-4:
+	// hold until a fresh readback proves at least one complete poll cycle
+	// happened post-reconnect, rather than guessing a fixed cycle count.
+	journalBeforeReconnect, _ := o.journal(ctx, 200)
 	forced := o.forceReconnect(ctx)
-	if err := o.watch(ctx, 2); err != nil {
+	if forced == nil {
+		_, _ = o.awaitJournalEvidence(ctx, journalBeforeReconnect, 2, 5,
+			func(delta []string) bool { return freshReadback(delta, device) })
+	} else if err := o.watch(ctx, 2); err != nil {
 		return certify.Result{}, err
 	}
 	return certify.Result{
-		Notes: fmt.Sprintf("the DUT's southbound read pattern was observed over two poll cycles%s. %s",
-			reconnectNote(forced), o.injectionNote()),
+		Notes: fmt.Sprintf("the DUT's southbound read pattern was observed over at least one full poll "+
+			"cycle post-reconnect%s. %s", reconnectNote(forced), o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT read model bodies in whole-block requests bounded by the Modbus 125-register limit"
 			c, pre, ok := citeConversation(ev, o, claim)
@@ -105,6 +120,35 @@ func evalREAD2(c *Conversation) []finding {
 	return out
 }
 
+// firstSweep returns the prefix of reads — in the order the DUT issued them
+// (m.Reads is already chronological; see buildConversation/annotateModels) —
+// that constitutes ONE complete pass over a model's length-register body,
+// stopping as soon as accumulated coverage reaches length.
+//
+// live-run finding (runs/warnmeas-mc-ssm-20260802T134537, READ-2 assertion
+// 4): the DUT re-reads every model it consumes on every ~10s poll cycle, and
+// a window spanning several cycles legitimately observes the SAME
+// start/quantity pair several times over — six repeats of a 125-register
+// chunk, in the run that exposed this. evalLongModelChunking's OWN grading
+// used to sort every observed read by ADDRESS before checking the ceiling,
+// which interleaves every cycle's identical reads into one giant list and
+// makes six repeats of "125 then 28" look like a garbled, non-maximal
+// sweep. Scoping to the first complete pass — before any address sort runs
+// — is what lets a multi-cycle window grade the SAME way a single-cycle one
+// would.
+func firstSweep(reads []ReadSpan, length uint16) []ReadSpan {
+	var covered uint16
+	out := make([]ReadSpan, 0, len(reads))
+	for _, r := range reads {
+		out = append(out, r)
+		covered += r.Quantity
+		if covered >= length {
+			break
+		}
+	}
+	return out
+}
+
 // evalLongModelChunking asserts the "maximize the number of points read in each
 // holding register read operation" criterion for a model longer than 125
 // registers.
@@ -112,7 +156,8 @@ func evalLongModelChunking(c *Conversation, models []Model) finding {
 	claim := "a model longer than 125 registers was read in multiple reads that maximise the registers " +
 		"retrieved per request"
 	method := "the quantity field of each FC 0x03 request covering a model body longer than the " +
-		"125-register Modbus limit"
+		"125-register Modbus limit, scoped to the DUT's first complete sweep of the body when the " +
+		"window spans more than one of its poll cycles"
 	var long []Model
 	for _, m := range models {
 		if m.Length > MaxReadQuantity && m.BodyRead {
@@ -127,7 +172,14 @@ func evalLongModelChunking(c *Conversation, models []Model) finding {
 			MaxReadQuantity, len(models))
 	}
 	m := long[0]
-	spans := append([]ReadSpan(nil), m.Reads...)
+	sweep := firstSweep(m.Reads, m.Length)
+	multiCycle := ""
+	if len(sweep) < len(m.Reads) {
+		multiCycle = fmt.Sprintf(" (this window observed %d read(s) total across more than one DUT poll "+
+			"cycle; graded against the first %d that complete one full sweep of the body)",
+			len(m.Reads), len(sweep))
+	}
+	spans := append([]ReadSpan(nil), sweep...)
 	sort.Slice(spans, func(i, j int) bool { return spans[i].Start < spans[j].Start })
 	// Every read except the last one covering the body must be at the ceiling,
 	// or the client left registers on the table it could have fetched.
@@ -143,16 +195,16 @@ func evalLongModelChunking(c *Conversation, models []Model) finding {
 		s := spans[shortIdx]
 		return bytesf(claim, method, certify.Warn, fromDUT, ex.Request.Start, ex.Request.End,
 			"model %d's %d-register body was read as %s; request %d asked for only %d of the %d "+
-				"registers available. The procedure allows a short read to avoid splitting a "+
+				"registers available.%s The procedure allows a short read to avoid splitting a "+
 				"multi-register point, so this is reported rather than failed: confirming which it is "+
 				"needs the model's point map",
-			m.ID, m.Length, describeSpans(spans), shortIdx+1, s.Quantity, MaxReadQuantity)
+			m.ID, m.Length, describeSpans(spans), shortIdx+1, s.Quantity, MaxReadQuantity, multiCycle)
 	}
 	return bytesf(claim, method, certify.Pass, fromDUT, ex.Request.Start, ex.Request.End,
 		"model %d's %d-register body was read as %s — every request but the last asked for the full "+
-			"%d-register maximum, so the body was retrieved in the fewest reads the limit allows. "+
+			"%d-register maximum, so the body was retrieved in the fewest reads the limit allows.%s "+
 			"First request cited in full: [%s]",
-		m.ID, m.Length, describeSpans(spans), MaxReadQuantity, ex.Request.Hex())
+		m.ID, m.Length, describeSpans(spans), MaxReadQuantity, multiCycle, ex.Request.Hex())
 }
 
 // evalReadGranularity reports the DUT's read-size distribution. It is the same
