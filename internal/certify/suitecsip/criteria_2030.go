@@ -803,9 +803,9 @@ func critDERPut(resource string) criterion {
 //
 // The four individual critDERPut(resource) criteria remain in CORE-009 (see
 // core.go) as per-resource observations, wrapped by critDERPutInformational so
-// their absence reads as a WARN rather than a FAIL: a reader still sees
-// exactly which of the four arrived, and no single one of them can fail a row
-// whose own printed criterion is this one.
+// their absence reads as a SKIP (informational) rather than a FAIL or a WARN:
+// a reader still sees exactly which of the four arrived, and no single one of
+// them can fail OR warn a row whose own printed criterion is this one.
 //
 // Evidence ladder and rungs are the same three as critDERPut, generalised
 // across the resource set: rung 1 searches this check's own conversations for
@@ -966,21 +966,35 @@ func critDERPutAny(resources ...string) criterion {
 }
 
 // critDERPutInformational wraps critDERPut(resource) so its per-resource
-// observation cannot fail CORE-009: the row's own printed pass criterion is
-// disjunctive across the four DER self-reports (critDERPutAny), so the
-// absence of any ONE of them is not, by itself, a fact this row fails on. A
-// PUT that WAS observed is still reported as a PASS — full credit — and only
-// a would-be FAIL is demoted, to a WARN that points at the criterion which
-// actually decides the row.
+// observation cannot grade CORE-009 down: the row's own printed pass
+// criterion is disjunctive across the four DER self-reports (critDERPutAny),
+// so the absence of any ONE of them is not, by itself, a fact this row fails
+// OR warns on. A PUT that WAS observed is still reported as a PASS — full
+// credit — and a would-be FAIL is demoted to a SKIP that names the absence as
+// informational narrative and points at the criterion which actually decides
+// the row.
+//
+// SKIP, not WARN — this used to demote to WARN, and that was CORE-009 #10's
+// bug (census 20260802): certify.Result.rollUp / worstOf (registry.go,
+// runner.go) take the WORST verdict across every assertion a case mints, by
+// Verdict.Severity() (bundle.go: Fail=3, Warn=2, Pass=1, Skip=0). Three of the
+// four resources being PUT already satisfies critDERPutAny's disjunctive
+// criterion — a citable PASS — but WARN's severity (2) is HIGHER than PASS's
+// (1), so the fourth resource's absence (here, DERAvailability) pulled the
+// whole row down to WARN even though its own combined criterion had already
+// passed. SKIP's severity (0) sits BELOW Pass, so an absent resource can
+// inform a reader without ever outranking the row's real verdict — while a
+// genuine FAIL from critDERPutAny itself (severity 3, when NONE of the four
+// were PUT) still dominates every SKIP here and the row correctly fails.
 func critDERPutInformational(resource string) criterion {
 	base := critDERPut(resource)
 	demote := func(f Finding) Finding {
 		if f.Verdict == certify.Fail {
-			f.Verdict = certify.Warn
-			f.Observed += ". This is INFORMATIONAL, not a row failure: CORE-009's own printed pass " +
-				"criterion (CSIP Conformance Test Procedures v1.3 pp.41-42) is disjunctive across " +
-				"DERCapability/DERSettings/DERStatus/DERAvailability — see the row's combined criterion for " +
-				"its actual verdict"
+			f.Verdict = certify.Skip
+			f.Observed += ". This is INFORMATIONAL and does not by itself affect this row's verdict: " +
+				"CORE-009's own printed pass criterion (CSIP Conformance Test Procedures v1.3 pp.41-42) is " +
+				"disjunctive across DERCapability/DERSettings/DERStatus/DERAvailability — see the row's " +
+				"combined criterion for its actual verdict"
 		}
 		return f
 	}

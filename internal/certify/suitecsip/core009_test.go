@@ -12,7 +12,9 @@ package suitecsip
 // pinned shapes below are the regression lock: DERStatus-only must PASS the
 // combined criterion, and PUTting nothing must FAIL it — while the four
 // individual critDERPutInformational notes never turn either shape into a row
-// FAIL by themselves.
+// FAIL, or (CORE-009 #10, census 20260802) a row WARN, by themselves: they
+// demote an absent resource to SKIP, whose severity sits below PASS, so it
+// can never outrank the combined criterion's own verdict.
 
 import (
 	"strings"
@@ -168,25 +170,70 @@ func TestCritDERPutAny_ServerTierHonoursTheSameDisjunction(t *testing.T) {
 	}
 }
 
-// TestCritDERPutInformational_DemotesFailToWarn is the counterweight this
+// TestCritDERPutInformational_DemotesFailToSkip is the counterweight this
 // fix's disjunctive grading needs: the four per-resource critDERPut
-// observations must not be able to FAIL the row on their own once
+// observations must not be able to FAIL — or WARN — the row on their own once
 // critDERPutAny is the criterion that actually decides it.
-func TestCritDERPutInformational_DemotesFailToWarn(t *testing.T) {
+//
+// SKIP, not WARN: Verdict.Severity() ranks WARN (2) above PASS (1), so
+// demoting to WARN (the original fix) still pulled a row critDERPutAny had
+// already PASSed back down to WARN whenever any ONE of the other three
+// resources was absent from this window — CORE-009 #10's census
+// (20260802). SKIP's severity (0) sits below PASS, so the informational note
+// can never outrank the combined criterion's own verdict.
+func TestCritDERPutInformational_DemotesFailToSkip(t *testing.T) {
 	// A window that PUT a DIFFERENT resource (not DERSettings): plain
 	// critDERPut("DERSettings") FAILs this (pinned by
 	// TestDERPutCriterionHasTeeth's "wrong resource" case); wrapped, it must
-	// WARN instead, and the WARN must point at the criterion that actually
+	// SKIP instead, informationally, and point at the criterion that actually
 	// decides the row.
 	other := synthTranscript(Exchange{
 		Req:  msg(Request, "PUT", "/x", 0, `<DERStatus xmlns="urn:ieee:std:2030.5:ns"><readingTime>1</readingTime></DERStatus>`),
 		Resp: msg(Response, "", "", 204, ""),
 	})
 	f := wantVerdict(t, "DERSettings absent, informational", critDERPutInformational("DERSettings"),
-		other, certify.Warn)
+		other, certify.Skip)
 	if !strings.Contains(f.Observed, "INFORMATIONAL") || !strings.Contains(f.Observed, "disjunctive") {
-		t.Errorf("the demoted WARN must say it is informational and point at the disjunctive criterion: %q",
+		t.Errorf("the demoted SKIP must say it is informational and point at the disjunctive criterion: %q",
 			f.Observed)
+	}
+}
+
+// TestCritDERPutInformational_SkipDoesNotOutrankTheRowsOwnPass is CORE-009
+// #10 itself, reproduced directly: three of the four DER self-reports were
+// PUT (so critDERPutAny — the row's real, disjunctive criterion — PASSes),
+// and the fourth (DERAvailability) was not. The informational note about the
+// missing fourth resource must not carry more severity than the row's own
+// combined PASS, or mint()'s per-case rollup (registry.go's Result.rollUp,
+// runner.go's worstOf) drags the whole row down to WARN on a criterion the
+// CTP itself does not require conjunctively.
+func TestCritDERPutInformational_SkipDoesNotOutrankTheRowsOwnPass(t *testing.T) {
+	threeOfFour := synthTranscript(
+		Exchange{
+			Req: msg(Request, "PUT", "/edev/2/der/0/g1/dercap", 0,
+				`<DERCapability xmlns="urn:ieee:std:2030.5:ns"><type>80</type></DERCapability>`),
+			Resp: msg(Response, "", "", 204, ""),
+		},
+		Exchange{
+			Req: msg(Request, "PUT", "/edev/2/der/0/g1/derset", 0,
+				`<DERSettings xmlns="urn:ieee:std:2030.5:ns"><updatedTime>1</updatedTime></DERSettings>`),
+			Resp: msg(Response, "", "", 204, ""),
+		},
+		Exchange{
+			Req:  msg(Request, "PUT", "/edev/2/der/0/derstat", 0, derStatusBody(t)),
+			Resp: msg(Response, "", "", 204, ""),
+		},
+	)
+
+	combined := wantVerdict(t, "3 of 4 DER self-reports PUT",
+		critDERPutAny("DERCapability", "DERSettings", "DERStatus", "DERAvailability"), threeOfFour, certify.Pass)
+	absent := wantVerdict(t, "DERAvailability absent, informational",
+		critDERPutInformational("DERAvailability"), threeOfFour, certify.Skip)
+
+	if combined.Verdict.Severity() < absent.Verdict.Severity() {
+		t.Fatalf("the row's own combined criterion (%s, severity %d) must outrank the informational absence "+
+			"note (%s, severity %d), or CORE-009's rollup regresses to the WARN this fix removed",
+			combined.Verdict, combined.Verdict.Severity(), absent.Verdict, absent.Verdict.Severity())
 	}
 }
 

@@ -236,7 +236,11 @@ func critClockAdopted(o *Observation) criterion {
 // per resource would grade that as three FAILs and one PASS, holding the row
 // to a standard stricter than its own text; critDERPutAny is the criterion
 // that actually decides it, and the four critDERPutInformational entries stay
-// only as per-resource notes (WARN, never FAIL) on which of the four arrived.
+// only as per-resource notes (SKIP, informational — never FAIL, and never a
+// WARN either: Verdict.Severity() ranks WARN above PASS, so a WARN here would
+// silently pull a row critDERPutAny already passed back down — see
+// critDERPutInformational's doc for the CORE-009 #10 census this fixed) on
+// which of the four arrived.
 //
 // The re-home Change (see rehome.go / coreDERSettings below) is belt and
 // braces here, not a requirement: it gives this row a real shot at the
