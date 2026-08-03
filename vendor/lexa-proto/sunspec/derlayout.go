@@ -162,6 +162,26 @@ var L702 = NewLayout(
 	F("V_SF", Tsunssf), F("A_SF", Tsunssf), F("S_SF", Tsunssf),
 )
 
+// Model 702 CtrlModes bitfield32 — "supported control mode functions".
+// Bit values transcribed from the canonical model_702.json symbols array
+// (github.com/sunspec/models); do not renumber.
+const (
+	M702_CtrlMode_MaxW         uint32 = 1 << 0  // MAX_W: limit maximum active power
+	M702_CtrlMode_FixedW       uint32 = 1 << 1  // FIXED_W: set active power
+	M702_CtrlMode_FixedVar     uint32 = 1 << 2  // FIXED_VAR
+	M702_CtrlMode_FixedPF      uint32 = 1 << 3  // FIXED_PF
+	M702_CtrlMode_VoltVar      uint32 = 1 << 4  // VOLT_VAR
+	M702_CtrlMode_FreqWatt     uint32 = 1 << 5  // FREQ_WATT (frequency droop)
+	M702_CtrlMode_DynReactCurr uint32 = 1 << 6  // DYN_REACT_CURR
+	M702_CtrlMode_LVTrip       uint32 = 1 << 7  // LV_TRIP
+	M702_CtrlMode_HVTrip       uint32 = 1 << 8  // HV_TRIP
+	M702_CtrlMode_WattVar      uint32 = 1 << 9  // WATT_VAR
+	M702_CtrlMode_VoltWatt     uint32 = 1 << 10 // VOLT_WATT
+	M702_CtrlMode_Scheduled    uint32 = 1 << 11 // SCHEDULED
+	M702_CtrlMode_LFTrip       uint32 = 1 << 12 // LF_TRIP
+	M702_CtrlMode_HFTrip       uint32 = 1 << 13 // HF_TRIP
+)
+
 // ── Model 703: DER Enter Service ─────────────────────────────────────────────
 // Spec Table 6. NOTE the corrected widths: ESHzHi/Lo and all timers are uint32.
 var L703 = NewLayout(

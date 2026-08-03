@@ -489,12 +489,23 @@ func TestChainWalk_ProductAndRefereeAgreeAtTheBoundary(t *testing.T) {
 	}
 }
 
-// TestSFCatalog_UnboundedScaleFactorStillReproduces pins the scale-factor
-// findings. sunspec.ApplyScaleSigned checks only for the 0x8000
-// not-implemented sentinel and then evaluates math.Pow10(int(sf)) for any
-// int16, so a hostile scale-factor register yields +Inf or a denormal and the
-// value flows downstream looking like a number.
-func TestSFCatalog_UnboundedScaleFactorStillReproduces(t *testing.T) {
+// TestSFCatalog_IllegalScaleFactorsAreRefused is the INVERTED form of the
+// scale-factor lock (LXR-004 / LXR-028).
+//
+// It used to require the "illegal-sf-accepted" class to keep reproducing:
+// sunspec.ApplyScaleSigned checked only the 0x8000 not-implemented sentinel
+// and then evaluated math.Pow10(int(sf)) for any int16, so a hostile
+// scale-factor register yielded +Inf or a denormal and the value flowed
+// downstream looking like a number. requireClass's own instruction on that
+// day was: "Either the product was FIXED — in which case delete this lock and
+// record the fix".
+//
+// The product WAS fixed (lexa-proto 1bda02c): the sunssf domain [-10,+10] is
+// enforced at every codec entry, so the referee and the product now agree to
+// REFUSE. This asserts that agreement, which is the property the differential
+// exists to establish — and it goes red again the moment the product starts
+// producing numbers from illegal scale factors.
+func TestSFCatalog_IllegalScaleFactorsAreRefused(t *testing.T) {
 	r := NewReport(1)
 	RunSFCatalog(context.Background(), r, 0)
 	sum := r.Summary()
@@ -503,11 +514,18 @@ func TestSFCatalog_UnboundedScaleFactorStillReproduces(t *testing.T) {
 	}
 	classes := findingClasses(sum)
 
-	requireClass(t, classes, "illegal-sf-accepted",
-		"ApplyScaleSigned applies math.Pow10 to any int16 outside the sunssf [-10,+10] range")
-	requireClass(t, classes, "silent-saturation",
-		"RawFromScaleSigned clamps an unrepresentable value to the int16 edge with no signal to the caller")
-
+	if n := classes["illegal-sf-accepted"]; n > 0 {
+		t.Errorf("LXR-004 regressed: %d case(s) where the product produced a NUMBER from a scale "+
+			"factor outside the sunssf [-10,+10] range. A corrupt or hostile SF register must "+
+			"decode to NaN, not to a plausible-looking value.", n)
+	}
+	// "silent-saturation" was the OTHER half: the encoder clamped an
+	// unrepresentable value to the int16 edge with no signal to the caller.
+	// EncodeScale* now report the outcome, and derbase's writers refuse a
+	// non-representable command — but the referee's catalogue drives the bare
+	// RawFromScale* round-trip helpers, which by contract still clamp
+	// silently (they exist for sweeps and simulators). So this class MAY
+	// still appear here; what must not appear is the illegal-SF one above.
 	if sum.ByVerdict[string(Pass)] == 0 {
 		t.Error("no sf case passed: the referee's decimal arithmetic disagrees with the product " +
 			"everywhere, which points at the referee")

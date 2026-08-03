@@ -30,6 +30,20 @@ func (r *Reader) HasModel(modelID uint16) bool {
 	return err == nil
 }
 
+// ModelLen returns the device-DECLARED data-block length (in registers) of
+// modelID, and whether the model exists at all. The declared length is what
+// ReadModel will return and what WriteModel bounds writes against — callers
+// that assume a spec-defined layout width (e.g. slicing regs[:L704.Len()])
+// MUST check the declared length first: a malicious or corrupt device can
+// declare any length it likes (LXR-003).
+func (r *Reader) ModelLen(modelID uint16) (uint16, bool) {
+	b, err := FindModel(r.blocks, modelID)
+	if err != nil {
+		return 0, false
+	}
+	return b.Length, true
+}
+
 // Blocks returns the full list of SunSpec blocks found on this device.
 // Useful for logging / diagnostics.
 func (r *Reader) Blocks() []Block {
@@ -91,7 +105,11 @@ func (r *Reader) WriteModel(modelID uint16, offset uint16, values []uint16) erro
 	if err != nil {
 		return err
 	}
-	if uint16(len(values)) > b.Length-offset {
+	// The offset > b.Length check must come first: b.Length-offset is uint16
+	// arithmetic and would otherwise underflow to a huge value, letting a
+	// fixed-layout offset on a device that declared a SHORT model pass the
+	// bound and write into whatever block lies beyond it (LXR-003).
+	if offset > b.Length || uint16(len(values)) > b.Length-offset {
 		return fmt.Errorf("sunspec: write model %d: offset %d + %d values exceeds model length %d",
 			modelID, offset, len(values), b.Length)
 	}

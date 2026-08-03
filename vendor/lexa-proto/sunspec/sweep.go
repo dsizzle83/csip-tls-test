@@ -247,7 +247,13 @@ func SweepWrapGuardUint(sfs []int16) []string {
 // the notImplemented sentinel (int16(-32768)) guards the SCALE-FACTOR
 // argument, not raw register values.
 //   - ApplyScale*(anyRaw, sentinel) == NaN, for every raw value.
-//   - RawFromScale*(v, sentinel) == 0, for every v (including NaN/+-Inf).
+//   - RawFromScale*(v, sentinel) == the reserved NOT_IMPLEMENTED sentinel
+//     (signed 0x8000 / unsigned 0xFFFF), for every v including NaN/±Inf:
+//     with no scale factor there is no representable value, and the wire word
+//     must say so. (LXR-004 contract change: the old contract returned raw 0,
+//     which reads on the wire as a REAL command of zero fabricated from
+//     nothing. Encode* additionally reports EncodeBadSF so callers refuse the
+//     write outright.)
 //   - raw 0x8000 at a NORMAL sf is an ordinary int16 (-32768), decodes to
 //     -32768 (not NaN), and round-trips exactly like any other value.
 //
@@ -272,13 +278,21 @@ func SweepSentinel() []string {
 	sampleValues := []float64{0, 1, -1, 32767, -32768, 65535, 1e9, -1e9,
 		math.NaN(), math.Inf(1), math.Inf(-1)}
 	for _, v := range sampleValues {
-		if got := RawFromScaleSigned(v, notImplemented); got != 0 {
+		if got := RawFromScaleSigned(v, notImplemented); got != sentI16 {
 			violations = appendViolation(violations,
-				"RawFromScaleSigned(%v, sentinel) = 0x%04x, want 0", v, got)
+				"RawFromScaleSigned(%v, sentinel) = 0x%04x, want 0x8000 (no scale factor ⇒ NOT_IMPLEMENTED, never a fabricated data value)", v, got)
 		}
-		if got := RawFromScaleUint(v, notImplemented); got != 0 {
+		if got := RawFromScaleUint(v, notImplemented); got != sentU16 {
 			violations = appendViolation(violations,
-				"RawFromScaleUint(%v, sentinel) = 0x%04x, want 0", v, got)
+				"RawFromScaleUint(%v, sentinel) = 0x%04x, want 0xffff (no scale factor ⇒ NOT_IMPLEMENTED, never a fabricated data value)", v, got)
+		}
+		if raw, outcome := EncodeScaleSigned(v, notImplemented); outcome != EncodeBadSF || raw != sentI16 {
+			violations = appendViolation(violations,
+				"EncodeScaleSigned(%v, sentinel) = (0x%04x, %d), want (0x8000, EncodeBadSF)", v, raw, outcome)
+		}
+		if raw, outcome := EncodeScaleUint(v, notImplemented); outcome != EncodeBadSF || raw != sentU16 {
+			violations = appendViolation(violations,
+				"EncodeScaleUint(%v, sentinel) = (0x%04x, %d), want (0xffff, EncodeBadSF)", v, raw, outcome)
 		}
 	}
 
@@ -306,6 +320,104 @@ func SweepSentinel() []string {
 		}
 	}
 
+	return violations
+}
+
+// SweepIllegalSF pins the LXR-004 scale-factor domain contract: every int16
+// outside the legal sunssf range [-10,+10] — not just the 0x8000 sentinel —
+// must be refused by BOTH directions of the codec:
+//
+//   - ApplyScale*(raw, sf) == NaN for every raw: a hostile scale-factor
+//     register must never be laundered into a plausible engineering value
+//     (the old code fed any non-sentinel int16 to math.Pow10, yielding ±Inf,
+//     denormals, or absurd-but-finite magnitudes).
+//   - EncodeScale*(val, sf) == (reserved sentinel, EncodeBadSF) for every
+//     val: nothing is representable against a scale factor that does not
+//     exist, and the caller gets an explicit refusal signal.
+//
+// The independent referee (csip-tls-test/internal/diff) pins the same bound
+// from exact rational arithmetic; this sweep is the product-side mirror so a
+// regression fails closed in every consumer repo's CI.
+func SweepIllegalSF() []string {
+	var violations []string
+	illegal := []int16{-32768, -32767, -20000, -1000, -300, -11, 11, 300, 1000, 20000, 32767}
+	sampleRaws := []uint16{0, 1, 0x7FFF, 0x8000, 0x8001, 0xFFFE, 0xFFFF}
+	sampleVals := []float64{0, 1, -1, 100, -100, 1e9, math.NaN(), math.Inf(1)}
+	for _, sf := range illegal {
+		if ValidSF(sf) {
+			violations = appendViolation(violations, "ValidSF(%d) = true, want false", sf)
+			continue
+		}
+		for _, raw := range sampleRaws {
+			if got := ApplyScaleSigned(raw, sf); !math.IsNaN(got) {
+				violations = appendViolation(violations,
+					"ApplyScaleSigned(0x%04x, %d) = %v, want NaN (illegal sf must not become arithmetic)", raw, sf, got)
+			}
+			if got := ApplyScaleUint(raw, sf); !math.IsNaN(got) {
+				violations = appendViolation(violations,
+					"ApplyScaleUint(0x%04x, %d) = %v, want NaN (illegal sf must not become arithmetic)", raw, sf, got)
+			}
+		}
+		for _, v := range sampleVals {
+			if raw, outcome := EncodeScaleSigned(v, sf); outcome != EncodeBadSF || raw != sentI16 {
+				violations = appendViolation(violations,
+					"EncodeScaleSigned(%v, %d) = (0x%04x, %d), want (0x8000, EncodeBadSF)", v, sf, raw, outcome)
+			}
+			if raw, outcome := EncodeScaleUint(v, sf); outcome != EncodeBadSF || raw != sentU16 {
+				violations = appendViolation(violations,
+					"EncodeScaleUint(%v, %d) = (0x%04x, %d), want (0xffff, EncodeBadSF)", v, sf, raw, outcome)
+			}
+		}
+	}
+	// The domain edges themselves are legal and must keep working.
+	for _, sf := range []int16{-10, 10} {
+		if !ValidSF(sf) {
+			violations = appendViolation(violations, "ValidSF(%d) = false, want true (domain edge)", sf)
+		}
+		if got := ApplyScaleSigned(1, sf); math.IsNaN(got) {
+			violations = appendViolation(violations,
+				"ApplyScaleSigned(1, %d) = NaN, want a value (legal domain edge)", sf)
+		}
+	}
+	return violations
+}
+
+// SweepEncodeOutcome pins the saturation-visibility contract (LXR-004: the
+// differential referee's "silent-saturation" finding): EncodeScale* must
+// report exactly what it did, so a writer can refuse or report a value the
+// register cannot carry instead of silently applying something else.
+func SweepEncodeOutcome() []string {
+	var violations []string
+	for _, sf := range ScaleFactors {
+		scale := math.Pow10(int(sf))
+		type c struct {
+			val  float64
+			want EncodeOutcome
+		}
+		signedCases := []c{
+			{0, EncodeExact}, {100 * scale, EncodeExact}, {-100 * scale, EncodeExact},
+			{32767 * scale, EncodeExact}, {-32767 * scale, EncodeExact},
+			{40000 * scale, EncodeSaturatedHigh}, {-40000 * scale, EncodeSaturatedLow},
+			{math.NaN(), EncodeNotImplemented}, {math.Inf(1), EncodeNotImplemented},
+		}
+		for _, tc := range signedCases {
+			if _, got := EncodeScaleSigned(tc.val, sf); got != tc.want {
+				violations = appendViolation(violations,
+					"EncodeScaleSigned(%g, %d) outcome = %d, want %d", tc.val, sf, got, tc.want)
+			}
+		}
+		uintCases := []c{
+			{0, EncodeExact}, {100 * scale, EncodeExact}, {65534 * scale, EncodeExact},
+			{70000 * scale, EncodeSaturatedHigh}, {-1 * scale, EncodeSaturatedLow},
+			{math.NaN(), EncodeNotImplemented}, {math.Inf(-1), EncodeNotImplemented},
+		}
+		for _, tc := range uintCases {
+			if _, got := EncodeScaleUint(tc.val, sf); got != tc.want {
+				violations = appendViolation(violations,
+					"EncodeScaleUint(%g, %d) outcome = %d, want %d", tc.val, sf, got, tc.want)
+			}
+		}
+	}
 	return violations
 }
 

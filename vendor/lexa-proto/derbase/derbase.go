@@ -47,8 +47,19 @@ type Base struct {
 	DefaultRvrtTms uint32
 
 	// AdoptPollTimeout bounds how long curve writers wait for AdptCrvRslt to
-	// report COMPLETED before proceeding. Zero uses adoptPollDefault.
+	// report COMPLETED. Zero uses adoptPollDefault. Expiry without a result is
+	// an AdoptTimeoutError, never success (LXR-006).
 	AdoptPollTimeout time.Duration
+
+	// Cap is the validated capability snapshot read from model 702 at Init
+	// (LXR-005). HasCap reports whether the device implements 702 at all;
+	// individual fields are NaN when the device leaves them unimplemented.
+	Cap    sunspec.Capacity
+	HasCap bool
+	// CtrlModes is the raw 702 "supported control mode functions" bitfield.
+	// Zero when unimplemented, sentinel, or genuinely declared empty — see
+	// supportsCtrlMode for how (and how much) it is trusted.
+	CtrlModes uint32
 
 	Has701, Has702, Has703, Has704, Has705, Has706 bool
 	Has707, Has708, Has709, Has710, Has711, Has712 bool
@@ -58,26 +69,72 @@ type Base struct {
 const adoptPollDefault = 3 * time.Second
 const adoptPollInterval = 100 * time.Millisecond
 
-// Init populates model-presence flags, selects the measurement model, and reads
-// WMax. tag is used in error messages (e.g. "inverter", "battery").
+// hasFullModel reports model presence AND that the device-declared length can
+// hold the full fixed spec layout. A model declared SHORTER than its layout is
+// not "a smaller variant" — the fixed DER models have no optional tail — it is
+// a malformed or hostile device, and code that trusts the layout width against
+// the declared width panics on slice bounds (LXR-003).
+func hasFullModel(r *sunspec.Reader, modelID uint16, required int) (present bool, malformed *MalformedDeviceError) {
+	declared, ok := r.ModelLen(modelID)
+	if !ok {
+		return false, nil
+	}
+	if int(declared) < required {
+		return true, &MalformedDeviceError{Model: modelID, Declared: int(declared), Required: required}
+	}
+	return true, nil
+}
+
+// Init populates model-presence flags, validates declared model lengths,
+// snapshots capability (702), selects the measurement model, and reads WMax.
+// tag is used in error messages (e.g. "inverter", "battery").
+//
+// A control-relevant model declared shorter than its spec layout fails Init
+// with a MalformedDeviceError: the device is quarantined at discovery instead
+// of panicking the shared service on first control write (LXR-003). Callers
+// hold one Base per device, so quarantine is naturally per-DER.
 func Init(r *sunspec.Reader, tag string) (Base, error) {
 	b := Base{
 		Reader: r,
 		Wmax:   math.NaN(),
 		Has701: r.HasModel(sunspec.ModelDERMeasureAC),
-		Has702: r.HasModel(sunspec.ModelDERCapacity),
-		Has703: r.HasModel(sunspec.ModelDEREnterService),
-		Has704: r.HasModel(sunspec.ModelDERCtlAC),
-		Has705: r.HasModel(sunspec.ModelDERVoltVar),
-		Has706: r.HasModel(sunspec.ModelDERVoltWatt),
-		Has707: r.HasModel(sunspec.ModelDERTripLV),
-		Has708: r.HasModel(sunspec.ModelDERTripHV),
-		Has709: r.HasModel(sunspec.ModelDERTripLF),
-		Has710: r.HasModel(sunspec.ModelDERTripHF),
-		Has711: r.HasModel(sunspec.ModelDERFreqDroop),
-		Has712: r.HasModel(sunspec.ModelDERWattVar),
 		Has713: r.HasModel(sunspec.ModelDERStorageCap),
 		Has714: r.HasModel(sunspec.ModelDERMeasureDC),
+	}
+
+	// Control-relevant fixed models: require the full spec layout length.
+	fixed := []struct {
+		id       uint16
+		required int
+		has      *bool
+	}{
+		{sunspec.ModelDERCapacity, sunspec.L702.Len(), &b.Has702},
+		{sunspec.ModelDEREnterService, sunspec.L703.Len(), &b.Has703},
+		{sunspec.ModelDERCtlAC, sunspec.L704.Len(), &b.Has704},
+	}
+	// Curve/repeating models: require at least the fixed header; the curve
+	// parse/encode helpers bound-check the repeating blocks against NPt.
+	curved := []struct {
+		id       uint16
+		required int
+		has      *bool
+	}{
+		{sunspec.ModelDERVoltVar, sunspec.L705Hdr.Len(), &b.Has705},
+		{sunspec.ModelDERVoltWatt, sunspec.L706Hdr.Len(), &b.Has706},
+		{sunspec.ModelDERTripLV, sunspec.L707Hdr.Len(), &b.Has707},
+		{sunspec.ModelDERTripHV, sunspec.L707Hdr.Len(), &b.Has708},
+		{sunspec.ModelDERTripLF, sunspec.L709Hdr.Len(), &b.Has709},
+		{sunspec.ModelDERTripHF, sunspec.L709Hdr.Len(), &b.Has710},
+		{sunspec.ModelDERFreqDroop, sunspec.L711Hdr.Len(), &b.Has711},
+		{sunspec.ModelDERWattVar, sunspec.L712Hdr.Len(), &b.Has712},
+	}
+	for _, m := range append(fixed, curved...) {
+		present, malformed := hasFullModel(r, m.id, m.required)
+		if malformed != nil {
+			malformed.Tag = tag
+			return Base{}, malformed
+		}
+		*m.has = present
 	}
 
 	if b.Has701 {
@@ -95,8 +152,15 @@ func Init(r *sunspec.Reader, tag string) (Base, error) {
 	}
 
 	if b.Has702 {
-		if w, err := ReadWMaxFrom702(r); err == nil {
-			b.Wmax = w
+		regs, err := r.ReadModel(sunspec.ModelDERCapacity)
+		if err != nil {
+			return Base{}, fmt.Errorf("%s: read M702 capability snapshot: %w", tag, err)
+		}
+		b.Cap = sunspec.Parse702(regs)
+		b.HasCap = true
+		b.CtrlModes = sunspec.L702.View(regs).Bitfield32("CtrlModes")
+		if b.Cap.WMaxRtg > 0 && !math.IsInf(b.Cap.WMaxRtg, 0) {
+			b.Wmax = b.Cap.WMaxRtg
 		}
 	} else if r.HasModel(sunspec.ModelBasicSettings) {
 		if w, err := ReadWMax(r); err == nil {
@@ -104,6 +168,22 @@ func Init(r *sunspec.Reader, tag string) (Base, error) {
 		}
 	}
 	return b, nil
+}
+
+// supportsCtrlMode reports whether the device's declared 702 CtrlModes
+// bitfield permits the given control-mode bit (sunspec.M702_CtrlMode_*).
+//
+// Trust model (LXR-005): a NONZERO declaration is enforced exactly — a device
+// that says "I support fixed-PF and volt-var" does not get sent fixed-var.
+// A zero or unimplemented CtrlModes carries no information (real firmware,
+// including the bench DER, ships CtrlModes=0 while executing controls), so it
+// falls back to model-presence gating rather than rejecting everything.
+// Garbage is never treated as permission — only an explicit bit is.
+func (b *Base) supportsCtrlMode(bit uint32) bool {
+	if !b.HasCap || b.CtrlModes == 0 {
+		return true
+	}
+	return b.CtrlModes&bit != 0
 }
 
 // ── Measurements ─────────────────────────────────────────────────────────────
@@ -260,68 +340,223 @@ func ReadMeasurementsACModel(regs []uint16) Measurements {
 	return m
 }
 
+// watts converts a CSIP ActivePower to watts. Retained for callers that have
+// already validated the multiplier; new code should use wattsChecked.
 func watts(ap *model.ActivePower) float64 {
 	return float64(ap.Value) * math.Pow10(int(ap.Multiplier))
 }
 
+// wattsChecked converts a CSIP ActivePower to watts, rejecting a hostile or
+// corrupt power-of-ten multiplier (LXR-004 northbound counterpart: an insane
+// multiplier must not become ±Inf and flow into a register encode).
+func wattsChecked(ap *model.ActivePower, axis string) (float64, error) {
+	if ap.Multiplier < -10 || ap.Multiplier > 10 {
+		return 0, &InvalidControlError{Axis: axis,
+			Reason: fmt.Sprintf("power-of-ten multiplier %d outside [-10,10]", ap.Multiplier)}
+	}
+	w := float64(ap.Value) * math.Pow10(int(ap.Multiplier))
+	if math.IsNaN(w) || math.IsInf(w, 0) {
+		return 0, &InvalidControlError{Axis: axis, Reason: "non-finite watt conversion"}
+	}
+	return w, nil
+}
+
 // ── ApplyControl: CSIP DERControlBase → SunSpec ──────────────────────────────
 
+// ApplyControl executes every axis present in ctrl against the device.
+//
+// Contract (LXR-002/-005): an axis that cannot be executed FAILS — with
+// ErrUnsupportedControl when the device lacks the model/capability, or
+// ErrInvalidControl when the request itself is out of domain. The pre-audit
+// behavior of silently skipping an axis (`!= nil && b.Has704`) meant a head
+// end could be told Started for a control the device never saw.
 func (b *Base) ApplyControl(ctrl model.DERControlBase, tag string) error {
-	if ctrl.OpModEnergize != nil && b.Has703 {
+	if ctrl.OpModEnergize != nil {
+		if !b.Has703 {
+			return &UnsupportedControlError{Axis: "opModEnergize", Reason: "device has no M703 (DEREnterService)"}
+		}
 		if err := b.SetEnterServiceEnabled(*ctrl.OpModEnergize, tag); err != nil {
 			return err
 		}
 	}
 	if ctrl.OpModConnect != nil {
 		if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
-			return fmt.Errorf("%s: no M123 for connect control", tag)
+			return &UnsupportedControlError{Axis: "opModConnect", Reason: "device has no M123 (immediate controls)"}
 		}
 		if err := b.SetConnect(*ctrl.OpModConnect, tag); err != nil {
 			return err
 		}
 	}
-	if ctrl.OpModFixedPFInjectW != nil && b.Has704 {
+	if ctrl.OpModFixedPFInjectW != nil {
+		if !b.Has704 {
+			return &UnsupportedControlError{Axis: "opModFixedPFInjectW", Reason: "device has no M704 (DERCtlAC)"}
+		}
+		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedPF) {
+			return &UnsupportedControlError{Axis: "opModFixedPFInjectW", Reason: "device CtrlModes does not declare FIXED_PF"}
+		}
 		pf := math.Abs(float64(ctrl.OpModFixedPFInjectW.Value)) / 10000.0
+		if err := b.validatePF(pf, "opModFixedPFInjectW"); err != nil {
+			return err
+		}
 		if err := b.SetFixedPF(true, pf, ctrl.OpModFixedPFInjectW.Value >= 0, tag); err != nil {
 			return err
 		}
 	}
-	if ctrl.OpModFixedPFAbsorbW != nil && b.Has704 {
+	if ctrl.OpModFixedPFAbsorbW != nil {
+		if !b.Has704 {
+			return &UnsupportedControlError{Axis: "opModFixedPFAbsorbW", Reason: "device has no M704 (DERCtlAC)"}
+		}
+		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedPF) {
+			return &UnsupportedControlError{Axis: "opModFixedPFAbsorbW", Reason: "device CtrlModes does not declare FIXED_PF"}
+		}
 		pf := math.Abs(float64(ctrl.OpModFixedPFAbsorbW.Value)) / 10000.0
+		if err := b.validatePF(pf, "opModFixedPFAbsorbW"); err != nil {
+			return err
+		}
 		if err := b.SetFixedPF(false, pf, ctrl.OpModFixedPFAbsorbW.Value >= 0, tag); err != nil {
 			return err
 		}
 	}
-	if ctrl.OpModFixedVar != nil && b.Has704 {
-		if err := b.SetConstantVar(float64(ctrl.OpModFixedVar.Value.Value)/100.0, tag); err != nil {
+	if ctrl.OpModFixedVar != nil {
+		if !b.Has704 {
+			return &UnsupportedControlError{Axis: "opModFixedVar", Reason: "device has no M704 (DERCtlAC)"}
+		}
+		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedVar) {
+			return &UnsupportedControlError{Axis: "opModFixedVar", Reason: "device CtrlModes does not declare FIXED_VAR"}
+		}
+		pct := float64(ctrl.OpModFixedVar.Value.Value) / 100.0
+		if math.IsNaN(pct) || pct < -100 || pct > 100 {
+			return &InvalidControlError{Axis: "opModFixedVar",
+				Reason: fmt.Sprintf("reactive setpoint %.2f%% outside [-100,100] of VarMax", pct)}
+		}
+		if err := b.SetConstantVar(pct, tag); err != nil {
 			return err
 		}
 	}
-	if ctrl.OpModFixedW != nil && b.Has704 {
-		if err := b.SetActivePowerWatts(watts(ctrl.OpModFixedW), tag); err != nil {
+	if ctrl.OpModFixedW != nil {
+		if !b.Has704 {
+			return &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
+		}
+		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedW) {
+			return &UnsupportedControlError{Axis: "opModFixedW", Reason: "device CtrlModes does not declare FIXED_W"}
+		}
+		w, err := wattsChecked(ctrl.OpModFixedW, "opModFixedW")
+		if err != nil {
+			return err
+		}
+		if err := b.validateSetpointW(w, "opModFixedW"); err != nil {
+			return err
+		}
+		if err := b.SetActivePowerWatts(w, tag); err != nil {
 			return err
 		}
 	}
 
 	// Ceilings → WMaxLimPct (% of WMax). First non-nil wins.
-	if lim := firstNonNil(ctrl.OpModExpLimW, ctrl.OpModMaxLimW, ctrl.OpModGenLimW); lim != nil {
+	if axis, lim := firstNonNilAxis(
+		axisAP{"opModExpLimW", ctrl.OpModExpLimW},
+		axisAP{"opModMaxLimW", ctrl.OpModMaxLimW},
+		axisAP{"opModGenLimW", ctrl.OpModGenLimW}); lim != nil {
+		w, err := wattsChecked(lim, axis)
+		if err != nil {
+			return err
+		}
+		if w < 0 {
+			return &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative ceiling %g W", w)}
+		}
 		if b.Has704 {
-			if err := b.SetWMaxLimPctW(watts(lim), tag); err != nil {
+			if !b.supportsCtrlMode(sunspec.M702_CtrlMode_MaxW) {
+				return &UnsupportedControlError{Axis: axis, Reason: "device CtrlModes does not declare MAX_W"}
+			}
+			if err := b.SetWMaxLimPctW(w, tag); err != nil {
 				return err
 			}
-		} else if err := b.SetExportLimit(lim, tag); err != nil {
-			return err
+		} else {
+			if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
+				return &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for power limiting"}
+			}
+			if err := b.SetExportLimit(lim, tag); err != nil {
+				return err
+			}
 		}
 	}
 
 	// Import / load (charge) → negative Set Active Power, or legacy 123.
-	if imp := firstNonNil(ctrl.OpModImpLimW, ctrl.OpModLoadLimW); imp != nil {
+	if axis, imp := firstNonNilAxis(
+		axisAP{"opModImpLimW", ctrl.OpModImpLimW},
+		axisAP{"opModLoadLimW", ctrl.OpModLoadLimW}); imp != nil {
+		w, err := wattsChecked(imp, axis)
+		if err != nil {
+			return err
+		}
+		if w < 0 {
+			return &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative import limit %g W", w)}
+		}
 		if b.Has704 {
-			if err := b.SetActivePowerWatts(-watts(imp), tag); err != nil {
+			if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedW) {
+				return &UnsupportedControlError{Axis: axis, Reason: "device CtrlModes does not declare FIXED_W (required for charge setpoint)"}
+			}
+			if err := b.validateSetpointW(-w, axis); err != nil {
 				return err
 			}
-		} else if err := b.SetImportLimit(imp, tag); err != nil {
-			return err
+			if err := b.SetActivePowerWatts(-w, tag); err != nil {
+				return err
+			}
+		} else {
+			if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
+				return &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for import limiting"}
+			}
+			if err := b.SetImportLimit(imp, tag); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validatePF rejects a power-factor request outside the physically meaningful
+// [0,1] domain, or below the device's own declared minimum rated PF (702
+// PFOvrExtRtg/PFUndExtRtg) when the device implements those ratings.
+func (b *Base) validatePF(pf float64, axis string) error {
+	if math.IsNaN(pf) || pf < 0 || pf > 1 {
+		return &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("power factor %g outside [0,1]", pf)}
+	}
+	if b.HasCap {
+		// The rated PF is the MINIMUM the device supports (e.g. 0.85); a
+		// request below it is outside declared capability (LXR-005).
+		minRated := math.NaN()
+		switch axis {
+		case "opModFixedPFInjectW":
+			minRated = b.Cap.PFOvrExtRtg
+		case "opModFixedPFAbsorbW":
+			minRated = b.Cap.PFUndExtRtg
+		}
+		if !math.IsNaN(minRated) && minRated > 0 && minRated <= 1 && pf < minRated {
+			return &UnsupportedControlError{Axis: axis,
+				Reason: fmt.Sprintf("requested PF %.4f below device rated minimum %.4f", pf, minRated)}
+		}
+	}
+	return nil
+}
+
+// validateSetpointW rejects an active-power setpoint outside the device's
+// declared charge/discharge rate ratings when those ratings are implemented
+// (LXR-005: charge/discharge capability bounds were previously unenforced).
+// Ratings the device leaves unimplemented (NaN) impose no bound here; the
+// ±WMax clamp in SetActivePowerWatts still applies.
+func (b *Base) validateSetpointW(w float64, axis string) error {
+	if !b.HasCap {
+		return nil
+	}
+	if w < 0 { // charge
+		if r := b.Cap.WChaRteMaxRtg; !math.IsNaN(r) && r > 0 && -w > r {
+			return &UnsupportedControlError{Axis: axis,
+				Reason: fmt.Sprintf("charge setpoint %g W exceeds rated max charge rate %g W", -w, r)}
+		}
+	} else if w > 0 { // discharge/export
+		if r := b.Cap.WDisChaRteMaxRtg; !math.IsNaN(r) && r > 0 && w > r {
+			return &UnsupportedControlError{Axis: axis,
+				Reason: fmt.Sprintf("discharge setpoint %g W exceeds rated max discharge rate %g W", w, r)}
 		}
 	}
 	return nil
@@ -336,6 +571,22 @@ func firstNonNil(aps ...*model.ActivePower) *model.ActivePower {
 	return nil
 }
 
+// axisAP pairs a CSIP axis name with its ActivePower pointer so ceiling /
+// import fan-in keeps the axis name for error attribution.
+type axisAP struct {
+	axis string
+	ap   *model.ActivePower
+}
+
+func firstNonNilAxis(pairs ...axisAP) (string, *model.ActivePower) {
+	for _, p := range pairs {
+		if p.ap != nil {
+			return p.axis, p.ap
+		}
+	}
+	return "", nil
+}
+
 // ── Model 703: Enter Service ─────────────────────────────────────────────────
 
 func (b *Base) SetEnterService(s sunspec.EnterService, tag string) error {
@@ -345,6 +596,10 @@ func (b *Base) SetEnterService(s sunspec.EnterService, tag string) error {
 	regs, err := b.Reader.ReadModel(sunspec.ModelDEREnterService)
 	if err != nil {
 		return fmt.Errorf("%s: read M703: %w", tag, err)
+	}
+	if len(regs) < sunspec.L703.Len() {
+		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelDEREnterService,
+			Declared: len(regs), Required: sunspec.L703.Len(), Detail: "read returned short block"}
 	}
 	// Same corrupt-read guard as write704 (audit E2): never write a
 	// sentinel-corrupt read of the enter-service block back to the device.
@@ -389,11 +644,20 @@ func (b *Base) write704(tag string, fn func(v sunspec.View)) error {
 	if err != nil {
 		return fmt.Errorf("%s: read M704: %w", tag, err)
 	}
+	// Defense in depth for LXR-003: Init refuses a device whose declared 704
+	// is shorter than the layout, but never trust that invariant across a
+	// rescan/replacement — an undersized read here would panic the shared
+	// service on the regs[:Len] slice below.
+	if len(regs) < sunspec.L704.Len() {
+		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelDERCtlAC,
+			Declared: len(regs), Required: sunspec.L704.Len(), Detail: "read returned short block"}
+	}
 	// Refuse to write back a corrupt read (audit E2): this whole-block
 	// read-modify-write would otherwise persist a sentinel-saturated read (a
 	// device rebooting mid-poll, or a fault-injected all-0x8000 read) into the
 	// inverter's control registers — garbage setpoints and spurious sync-group
-	// enables. A healthy 704 always carries valid scale factors.
+	// enables. A healthy 704 always carries valid scale factors (and never an
+	// out-of-domain one — LXR-004).
 	if sunspec.L704.View(regs).ReadLooksCorrupt() {
 		return fmt.Errorf("%s: refusing to write M704 — read block is sentinel-corrupt (partial/failed read); not programming garbage back to the device", tag)
 	}
@@ -503,6 +767,10 @@ func (b *Base) SetCapacityWMax(w float64, tag string) error {
 	if err != nil {
 		return fmt.Errorf("%s: read M702: %w", tag, err)
 	}
+	if len(regs) < sunspec.L702.Len() {
+		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelDERCapacity,
+			Declared: len(regs), Required: sunspec.L702.Len(), Detail: "read returned short block"}
+	}
 	sunspec.L702.View(regs).SetFloat("WMax", w)
 	return b.Reader.WriteModel(sunspec.ModelDERCapacity, 0, regs[:sunspec.L702.Len()])
 }
@@ -513,7 +781,14 @@ func (b *Base) SetCapacityWMax(w float64, tag string) error {
 // model: the staging curve has already been encoded into regs[start:end] at
 // 0-based index 1. It writes that range, requests adoption with the 1-based
 // staging index (=2, which the spec requires to be >1), polls the result point
-// until COMPLETED/FAILED, and finally enables the function (Ena=1).
+// until COMPLETED/FAILED, enables the function (Ena=1), and verifies the
+// enable by positive read-back.
+//
+// Failure semantics (LXR-006): a device that never reports COMPLETED within
+// the poll window is a FAILURE (AdoptTimeoutError) — the pre-audit code
+// proceeded to enable a function whose curve state was unknown, confusing
+// absence of negative evidence with positive adoption. Likewise the final
+// enable is only success once the device reads back Ena=1.
 func (b *Base) adoptCurve(modelID uint16, regs []uint16, start, end int, adptReqField, adptRsltField, enaField string, hdr *sunspec.Layout, tag string) error {
 	if err := b.Reader.WriteModel(modelID, uint16(start), regs[start:end]); err != nil {
 		return fmt.Errorf("%s: write model %d curve: %w", tag, modelID, err)
@@ -527,6 +802,21 @@ func (b *Base) adoptCurve(modelID uint16, regs []uint16, start, end int, adptReq
 	}
 	if err := b.Reader.WriteModel(modelID, uint16(hdr.Offset(enaField)), []uint16{1}); err != nil {
 		return fmt.Errorf("%s: enable model %d: %w", tag, modelID, err)
+	}
+	// Positive read-back of the enable: an accepted write is not an applied
+	// write. A device that silently refuses Ena=1 (or resets it) must not be
+	// reported as running the function.
+	verify, err := b.Reader.ReadModel(modelID)
+	if err != nil {
+		return fmt.Errorf("%s: verify enable on model %d: %w", tag, modelID, err)
+	}
+	enaOff := hdr.Offset(enaField)
+	if enaOff < 0 || enaOff >= len(verify) {
+		return &VerifyError{Tag: tag, Model: modelID, Point: enaField, Detail: "enable point not readable"}
+	}
+	if verify[enaOff] != 1 {
+		return &VerifyError{Tag: tag, Model: modelID, Point: enaField,
+			Detail: fmt.Sprintf("wrote 1, device reads back %d", verify[enaOff])}
 	}
 	return nil
 }
@@ -551,7 +841,9 @@ func (b *Base) pollAdoptResult(modelID uint16, rsltOffset int, tag string) error
 			}
 		}
 		if time.Now().After(deadline) {
-			return nil // best-effort: device may not update the result point
+			// Absence of a result is NOT adoption (LXR-006). The old
+			// best-effort nil here let a silent device pass as adopted.
+			return &AdoptTimeoutError{Tag: tag, Model: modelID, Timeout: timeout}
 		}
 		time.Sleep(adoptPollInterval)
 	}
@@ -812,15 +1104,29 @@ func (b *Base) setLegacyWMaxLimPct(w float64, tag string) error {
 		return fmt.Errorf("%s: read Model 123: %w", tag, err)
 	}
 	if len(regs) <= sunspec.M123_WMaxLimPct_SF {
-		return fmt.Errorf("%s: Model 123 too short", tag)
+		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
+			Declared: len(regs), Required: sunspec.M123_WMaxLimPct_SF + 1, Detail: "too short for WMaxLimPct_SF"}
 	}
 	sf := int16(regs[sunspec.M123_WMaxLimPct_SF])
+	if !sunspec.ValidSF(sf) {
+		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
+			Declared: len(regs), Required: len(regs),
+			Detail: fmt.Sprintf("WMaxLimPct_SF=%d outside legal sunssf domain", sf)}
+	}
 	pct := mag / b.Wmax * 100.0
+	// Checked encode (LXR-004): a limit command that cannot be represented at
+	// the device's scale factor must fail loudly, never be silently written as
+	// a clamped different limit or a fabricated zero.
 	var raw uint16
+	var outcome sunspec.EncodeOutcome
 	if charge {
-		raw = sunspec.RawFromScaleSigned(-pct, sf)
+		raw, outcome = sunspec.EncodeScaleSigned(-pct, sf)
 	} else {
-		raw = sunspec.RawFromScaleUint(pct, sf)
+		raw, outcome = sunspec.EncodeScaleUint(pct, sf)
+	}
+	if !outcome.Representable() {
+		return fmt.Errorf("%s: WMaxLimPct %.2f%% not representable at sf=%d (encode outcome %d): %w",
+			tag, pct, sf, outcome, ErrInvalidControl)
 	}
 	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_WMaxLimPct_RmpTms, []uint16{5}); err != nil {
 		return fmt.Errorf("%s: set ramp time: %w", tag, err)

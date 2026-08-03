@@ -232,10 +232,11 @@ func (v View) notImpl(o int, f Field) bool {
 //
 // Two signals, in priority order:
 //
-//  1. A scale-factor field (Tsunssf) reads the 0x8000 sentinel. Scale factors
-//     are read-only device constants; a healthy SunSpec block ALWAYS carries
-//     valid ones, so a sentinel SF is a low-false-positive corruption signal and
-//     is authoritative when the layout defines any SF fields.
+//  1. A scale-factor field (Tsunssf) reads the 0x8000 sentinel or any value
+//     outside the legal sunssf domain [-10,+10] (LXR-004). Scale factors are
+//     read-only device constants; a healthy SunSpec block ALWAYS carries
+//     valid ones, so an illegal SF is a low-false-positive corruption signal
+//     and is authoritative when the layout defines any SF fields.
 //  2. Only when the layout has NO scale factors to check: the block is
 //     saturated with the int16 not-implemented sentinel (≥ half its registers) —
 //     the all-0x8000 shape of a failed read.
@@ -249,7 +250,7 @@ func (v View) ReadLooksCorrupt() bool {
 			continue
 		}
 		hasSF = true
-		if v.Present(f.Name) && v.reg(v.l.off[f.Name]) == sentI16 {
+		if v.Present(f.Name) && !ValidSF(int16(v.reg(v.l.off[f.Name]))) {
 			return true
 		}
 	}
@@ -310,10 +311,13 @@ func (v View) U64(name string) (uint64, bool) {
 }
 
 // SF returns the int16 scale-factor value of a named sunssf field. ok=false
-// when absent or unimplemented.
+// when absent, unimplemented, or outside the legal sunssf domain [-10,+10]
+// (LXR-004): a hostile or corrupt scale-factor register must never reach
+// math.Pow10 — every scaled read through this View becomes NaN and every
+// scaled write becomes a refusal instead of garbage arithmetic.
 func (v View) SF(name string) (int16, bool) {
 	o, f, ok := v.fieldOff(name)
-	if !ok || !v.Present(name) || f.Type != Tsunssf || v.reg(o) == sentI16 {
+	if !ok || !v.Present(name) || f.Type != Tsunssf || !ValidSF(int16(v.reg(o))) {
 		return 0, false
 	}
 	return int16(v.reg(o)), true
