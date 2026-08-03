@@ -601,16 +601,106 @@ func TestSFCatalog_IllegalScaleFactorsAreRefused(t *testing.T) {
 			"factor outside the sunssf [-10,+10] range. A corrupt or hostile SF register must "+
 			"decode to NaN, not to a plausible-looking value.", n)
 	}
-	// "silent-saturation" was the OTHER half: the encoder clamped an
-	// unrepresentable value to the int16 edge with no signal to the caller.
-	// EncodeScale* now report the outcome, and derbase's writers refuse a
-	// non-representable command — but the referee's catalogue drives the bare
-	// RawFromScale* round-trip helpers, which by contract still clamp
-	// silently (they exist for sweeps and simulators). So this class MAY
-	// still appear here; what must not appear is the illegal-SF one above.
+	// "silent-saturation" was the OTHER half of LXR-004, and it is now pinned in
+	// the same inverted form by TestSFCatalog_SaturationIsReportedToTheCaller.
 	if sum.ByVerdict[string(Pass)] == 0 {
 		t.Error("no sf case passed: the referee's decimal arithmetic disagrees with the product " +
 			"everywhere, which points at the referee")
+	}
+}
+
+// TestSFCatalog_SaturationIsReportedToTheCaller is the INVERTED form of the
+// OTHER half of the scale-factor lock (LXR-004), and the last of the four
+// inversions in this file.
+//
+// The product's encoder used to be `RawFromScaleSigned(float64, int16) uint16`
+// and nothing else. A value that did not fit the register at the chosen scale
+// factor was clamped onto the edge and returned as a bare word, so a caller
+// could not distinguish "applied" from "applied as something else", and this
+// family raised a P2 "silent-saturation" finding on every such value.
+//
+// lexa-proto 1bda02c (LXR-004) fixed it: EncodeScaleSigned/Uint return
+// (uint16, EncodeOutcome); the outcome separates EncodeExact from
+// EncodeSaturatedHigh/Low, EncodeNotImplemented and EncodeBadSF; and derbase's
+// writers act on it. RawFromScale* survives only as an explicitly
+// outcome-discarding round-trip wrapper for sweeps and simulators.
+//
+// csip-tls-test 8f17f1c inverted the illegal-SF half of LXR-004 and left this
+// one standing, reasoning that the catalogue drove the wrapper, "which by
+// contract still clamps silently". That reasoning was correct about the wrapper
+// and is exactly why the finding had stopped being about the product: it
+// reproduced only because the referee kept dialling the deprecated number.
+// compareEncode now puts the question to the command-writer entry point, so what
+// this test asserts is the AGREEMENT the fix produced — and a regression to a
+// signal-less encoder reopens the disagreement, because the finding class
+// reappears (checked first) AND the per-comparison sweep below finds a Fail.
+//
+// The seed and generated count match cmd/gw-diff's defaults, so this test sees
+// the same probes an operator's `make diff` does.
+func TestSFCatalog_SaturationIsReportedToTheCaller(t *testing.T) {
+	r := NewReport(1)
+	RunSFCatalog(context.Background(), r, 64)
+	sum := r.Summary()
+	if sum.Compared == 0 {
+		t.Fatal("the sf catalogue evaluated zero comparisons")
+	}
+
+	if n := findingClasses(sum)["silent-saturation"]; n != 0 {
+		t.Errorf("%d case(s) still report 'silent-saturation' — sunspec.EncodeScale* is supposed to "+
+			"return an EncodeOutcome naming the clamp, as of lexa-proto 1bda02c (LXR-004). A value the "+
+			"register cannot carry must reach the caller as a SIGNAL, not merely as a different number. "+
+			"Check proto.pin and vendor/lexa-proto/sunspec/scale.go.", n)
+	}
+
+	// The per-comparison sweep. The finding count alone is not enough: it would
+	// also read zero if the catalogue stopped encoding unrepresentable values,
+	// which retires the question instead of answering it.
+	var pass, fail, exercised int
+	var failed []string
+	for _, c := range r.Cases {
+		for _, cmp := range c.Comparisons {
+			if cmp.Key != "sf.saturation-visible" {
+				continue
+			}
+			switch cmp.Verdict {
+			case Pass:
+				pass++
+				exercised++
+			case Fail:
+				fail++
+				exercised++
+				failed = append(failed, c.ID+": "+cmp.Reason)
+			}
+		}
+	}
+	if exercised == 0 {
+		t.Fatal("no sf case put an unrepresentable value to the encoder — every value in the catalogue " +
+			"FIT its register, so nothing adjudicated whether a clamp is signalled. That retires the " +
+			"question rather than answering it; the catalogue needs a value the register cannot carry.")
+	}
+	if fail != 0 {
+		t.Errorf("%d of %d clamped encodes reached the caller with no signal:\n  %s",
+			fail, exercised, strings.Join(failed, "\n  "))
+	}
+	if pass == 0 {
+		t.Errorf("saturation was exercised %d time(s) and never passed", exercised)
+	}
+
+	// The converse row, and the reason it is a WARN rather than a finding. The
+	// product answers the unsigned DOMAIN question before rounding, so it reports
+	// a saturation the referee's round-first rule does not see; both sides still
+	// produce the same raw word. That is the product being STRICTER, which is
+	// never a defect in this direction — but it must not silently become a FAIL
+	// either, because a referee that scores conservatism as a defect trains
+	// people to ignore it.
+	for _, c := range r.Cases {
+		for _, cmp := range c.Comparisons {
+			if cmp.Key == "sf.representable" && cmp.Verdict == Fail {
+				t.Errorf("%s: a value the referee found representable was scored FAIL (%s); an "+
+					"over-reported saturation is the safe direction and belongs in a WARN",
+					c.ID, cmp.Reason)
+			}
+		}
 	}
 }
 

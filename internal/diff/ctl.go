@@ -277,16 +277,34 @@ func compareIntent(out *Case, in Intent, held map[string]heldPoint, np invariant
 				invariant.F(key+".kind.got", "", ProductSide.Name, "%s", chosen.kind),
 			},
 		})
+		// The register the product used does not necessarily carry THIS mode's
+		// number. When several modes of one unit land in one register the point
+		// holds whichever of them the product wrote — derbase's import/load
+		// fan-in is `first non-nil wins`, so opModImpLimW and opModLoadLimW both
+		// resolve to WSet and only one is ever written (DIFF-CTL-022) — and a
+		// finding headed "<this mode> applied through WSet" would then assert an
+		// application that never happened. Both sides' numbers print either way;
+		// what changes is the sentence a reader quotes.
+		title := fmt.Sprintf("%s (%s) applied through %s, a %s register",
+			in.Mode, in.Kind, chosen.cmd.Point, chosen.kind)
+		impact := fmt.Sprintf("a device that was under no obligation to %s anything is now commanded "+
+			"to %s %s, because a bound was written into a register that means 'produce this'",
+			flowVerb(unit), flowVerb(unit), chosen.cmd.Physical)
+		if !withinCtlTolerance(chosen.cmd.Physical, in.Want) {
+			title = fmt.Sprintf("%s (%s) is expressed nowhere: the device's only %s control is %s, "+
+				"a %s register holding %s", in.Mode, in.Kind, unit, chosen.cmd.Point, chosen.kind,
+				chosen.cmd.Physical)
+			impact += fmt.Sprintf("; and this document's %s bound of %s is not in force on the device at all",
+				in.Mode, in.Want)
+		}
 		out.Note(Finding{
 			ID:       out.ID + "/kind",
-			Title:    fmt.Sprintf("%s (%s) applied through %s, a %s register", in.Mode, in.Kind, chosen.cmd.Point, chosen.kind),
+			Title:    title,
 			Severity: "P1",
 			Input:    out.Input,
 			Product:  product,
 			Referee:  referee,
-			Impact: fmt.Sprintf("a device that was under no obligation to %s anything is now commanded "+
-				"to %s %s, because a bound was written into a register that means 'produce this'",
-				flowVerb(unit), flowVerb(unit), chosen.cmd.Physical),
+			Impact:   impact,
 			Limitation: "this establishes that the two readings of the mode disagree; which reading the " +
 				"utility intended is a specification question this differential does not settle",
 		})
@@ -381,6 +399,19 @@ func compareIntent(out *Case, in Intent, held map[string]heldPoint, np invariant
 			chosen.cmd.Physical, in.Want, np.Source),
 		Facts: cmp.Facts,
 	})
+}
+
+// withinCtlTolerance reports whether two quantities agree under this family's
+// standing slack. The slack is a fraction of the REFEREE's value, never the
+// product's — the same anchoring CompareQuantity enforces, restated here because
+// this helper is used to CHOOSE WORDS and a reader must be able to see that the
+// choice was not made with a tolerance derived from the number under test.
+func withinCtlTolerance(product, referee invariant.Quantity) bool {
+	if product.Unit != referee.Unit || !product.Known() || !referee.Known() {
+		return false
+	}
+	tol := CtlTolerance()
+	return math.Abs(product.Val-referee.Val) <= math.Max(math.Abs(referee.Val)*tol.Rel, tol.Abs)
 }
 
 func signOfQ(q invariant.Quantity) int {

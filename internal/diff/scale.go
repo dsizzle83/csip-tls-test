@@ -38,6 +38,8 @@ package diff
 //     to clamp silently and return a number the caller will treat as the value
 //     it asked for. The referee's encode reports saturation as a second return
 //     value; the comparison asks whether the product's caller could have known.
+//     See [compareEncode] for which product entry point that question is put to,
+//     and why the answer changed in lexa-proto 1bda02c.
 
 import (
 	"context"
@@ -170,11 +172,12 @@ type SFCase struct {
 // RunSF adjudicates one scale-factor case.
 func RunSF(_ context.Context, c SFCase) Case {
 	out := Case{
-		ID:      c.ID,
-		Family:  "sf",
-		Title:   c.Title,
-		Input:   fmt.Sprintf("raw=0x%04X sf=%d signed=%v", c.Raw, c.SF, c.Signed),
-		Product: Side{Name: "product", Lineage: "lexa-proto/sunspec — ApplyScale*/RawFromScale*, float64 math.Pow10"},
+		ID:     c.ID,
+		Family: "sf",
+		Title:  c.Title,
+		Input:  fmt.Sprintf("raw=0x%04X sf=%d signed=%v", c.Raw, c.SF, c.Signed),
+		Product: Side{Name: "product", Lineage: "lexa-proto/sunspec — ApplyScale*/EncodeScale*, plus the " +
+			"outcome-discarding RawFromScale* wrapper, all on float64 math.Pow10"},
 		Referee: Side{Name: "referee", Lineage: "csip-tls-test/internal/diff — exact math/big.Rat arithmetic"},
 		Limitation: "this family adjudicates the ARITHMETIC of scale factors and the LEGALITY of the " +
 			"scale-factor register; which scale factor a given point uses is a layout question, " +
@@ -270,7 +273,38 @@ func halfLSB(sf int16) invariant.Tolerance {
 }
 
 // compareEncode adjudicates the encode direction, including the question the
-// product's signature cannot answer.
+// product's signature used to have no room to answer.
+//
+// # Which product entry point this asks, and why that changed
+//
+// This function used to drive sunspec.RawFromScale* and raise a standing
+// "silent-saturation" finding on every value that did not fit, on the grounds
+// that "the encoder returns uint16 only". That sentence was true when it was
+// written and is not true now. lexa-proto 1bda02c (LXR-004 — prompted by this
+// very finding) split the codec in two:
+//
+//	EncodeScaleSigned/Uint   (uint16, EncodeOutcome) — the COMMAND-WRITER entry
+//	                         point. The outcome separates EncodeExact from
+//	                         EncodeSaturatedHigh/Low, so a caller CAN tell
+//	                         "applied" from "applied as something else".
+//	RawFromScaleSigned/Uint  uint16 — a round-trip wrapper that DISCARDS the
+//	                         outcome, documented for sweeps and simulators
+//	                         where the caller chose the scale factor itself.
+//
+// Continuing to put the "could the caller have known?" question to the wrapper
+// measures this harness's own choice of entry point, not the product: discarding
+// the answer is the wrapper's whole documented contract, and derbase's writers
+// already call EncodeScale* and act on the outcome (derbase.go's m123LimitPlan
+// compensation path is built on it). A finding that only reproduces because the
+// referee dialled the deprecated number is a stale finding, and a stale finding
+// costs a differential its credibility faster than a missed one.
+//
+// So both halves are now adjudicated against the referee — the reporting
+// encoder's raw word AND its outcome, and separately the wrapper's raw word, so
+// the two product entry points cannot drift apart unnoticed — and the
+// silent-saturation finding is raised only where the product genuinely fails to
+// signal. See TestSFCatalog_SaturationIsReportedToTheCaller for the inverted
+// lock that keeps this honest.
 func compareEncode(out *Case, c SFCase) {
 	lo, hi := int64(-32767), int64(32767)
 	if !c.Signed {
@@ -281,66 +315,165 @@ func compareEncode(out *Case, c SFCase) {
 		out.Compare(SkipComparison("sf.encode", "the referee will not encode against an illegal scale factor"))
 		return
 	}
-	var prodRaw uint16
-	if c.Signed {
-		prodRaw = sunspec.RawFromScaleSigned(ratFloat(c.EncodeValue), c.SF)
-	} else {
-		prodRaw = sunspec.RawFromScaleUint(ratFloat(c.EncodeValue), c.SF)
-	}
-	prodInt := int64(int16(prodRaw))
-	if !c.Signed {
-		prodInt = int64(prodRaw)
-	}
 
+	val := ratFloat(c.EncodeValue)
+	var prodRaw, wrapperRaw uint16
+	var outcome sunspec.EncodeOutcome
+	if c.Signed {
+		prodRaw, outcome = sunspec.EncodeScaleSigned(val, c.SF)
+		wrapperRaw = sunspec.RawFromScaleSigned(val, c.SF)
+	} else {
+		prodRaw, outcome = sunspec.EncodeScaleUint(val, c.SF)
+		wrapperRaw = sunspec.RawFromScaleUint(val, c.SF)
+	}
+	prodInt, wrapperInt := registerInt(prodRaw, c.Signed), registerInt(wrapperRaw, c.Signed)
+
+	refClaim := func(key string) Claim {
+		return Q(RefereeSide.Name, key, invariant.Q(float64(refRaw), invariant.UnitNone)).
+			WithNote("exact encode of %s at sf=%d", c.EncodeValue.FloatString(6), c.SF)
+	}
 	out.Compare(CompareQuantity("sf.encode",
 		Q(ProductSide.Name, "sf.encode", invariant.Q(float64(prodInt), invariant.UnitNone)),
-		Q(RefereeSide.Name, "sf.encode", invariant.Q(float64(refRaw), invariant.UnitNone)).
-			WithNote("exact encode of %s at sf=%d", c.EncodeValue.FloatString(6), c.SF),
+		refClaim("sf.encode"),
 		invariant.Tolerance{Abs: 0.5}))
 
-	if !refSat {
+	// The wrapper is still shipped and still callable, so it is still compared —
+	// against the REFEREE, not against the reporting encoder, because a
+	// product-versus-product check would agree by construction the day somebody
+	// implements one in terms of the other (which is, today, exactly what
+	// RawFromScale* is).
+	out.Compare(CompareQuantity("sf.encode.wrapper",
+		Q(ProductSide.Name, "sf.encode.wrapper", invariant.Q(float64(wrapperInt), invariant.UnitNone)).
+			WithNote("sunspec.RawFromScale%s, the outcome-discarding round-trip wrapper", signedSuffix(c.Signed)),
+		refClaim("sf.encode.wrapper"),
+		invariant.Tolerance{Abs: 0.5}))
+
+	held, _ := refDecode(prodInt, c.SF)
+	told := !outcome.Representable()
+
+	switch {
+	case refSat && told:
+		// The property the family exists to establish, now holding.
 		out.Compare(Comparison{
-			Key:     "sf.saturation-visible",
-			Product: T(ProductSide.Name, "sf.saturation-visible", "no saturation"),
-			Referee: T(RefereeSide.Name, "sf.saturation-visible", "no saturation"),
+			Key: "sf.saturation-visible",
+			Product: T(ProductSide.Name, "sf.saturation-visible", "raw %d (%s), signalled: %s",
+				prodInt, floatOrUnknown(held), outcomeText(outcome)),
+			Referee: T(RefereeSide.Name, "sf.saturation-visible", "saturated at the %d edge; the caller must be told", refRaw),
 			Verdict: Pass,
 		})
-		return
-	}
 
-	// The referee says the value did not fit. The product's encoder returns a
-	// bare uint16 and therefore CANNOT say so: its signature has no room for
-	// the fact. That is the finding, and it is structural rather than a bug in
-	// any one line.
-	held, _ := refDecode(prodInt, c.SF)
-	out.Compare(Comparison{
-		Key:     "sf.saturation-visible",
-		Product: T(ProductSide.Name, "sf.saturation-visible", "raw %d, no signal (the encoder returns uint16 only)", prodInt),
-		Referee: T(RefereeSide.Name, "sf.saturation-visible", "saturated at the %d edge", refRaw),
-		Verdict: Fail,
-		Reason: fmt.Sprintf("the value %s does not fit a %s register at sf=%d. The product clamped it to "+
-			"raw %d — %s in engineering units — and returned no indication that it had done so, so a "+
-			"caller cannot distinguish 'applied' from 'applied as something else'",
-			c.EncodeValue.FloatString(3), signedWord(c.Signed), c.SF, prodInt, floatOrUnknown(held)),
-		Facts: []invariant.Fact{
-			invariant.F("sf.encode.requested", "", RefereeSide.Name, "%s", c.EncodeValue.FloatString(3)),
-			invariant.F("sf.encode.raw", "", ProductSide.Name, "%d", prodInt),
-			invariant.F("sf.encode.effective", "", RefereeSide.Name, "%s", floatOrUnknown(held)),
-		},
-	})
-	out.Note(Finding{
-		ID:       out.ID + "/silent-saturation",
-		Title:    "an unrepresentable value is clamped and the caller is not told",
-		Severity: "P2",
-		Input:    out.Input + fmt.Sprintf(" encode=%s", c.EncodeValue.FloatString(3)),
-		Product:  T(ProductSide.Name, "sf.encode", "raw %d (%s) — silently", prodInt, floatOrUnknown(held)),
-		Referee:  T(RefereeSide.Name, "sf.encode", "%s does not fit; refuse or report", c.EncodeValue.FloatString(3)),
-		Impact: "a control value the gateway believes it wrote is not the value on the device, and no " +
-			"return path carries the difference. The register readback would show it, but the writer " +
-			"never learns",
-		Limitation: "the clamp itself is CORRECT and deliberate (audit SUN-004: clamping to the max-valid " +
-			"edge rather than onto the reserved sentinel). The finding is the absent signal, not the clamp",
-	})
+	case refSat && !told:
+		// The indefensible answer: the register does not carry the requested
+		// value and nothing in the return says so.
+		out.Compare(Comparison{
+			Key: "sf.saturation-visible",
+			Product: T(ProductSide.Name, "sf.saturation-visible", "raw %d, no signal (%s)",
+				prodInt, outcomeText(outcome)),
+			Referee: T(RefereeSide.Name, "sf.saturation-visible", "saturated at the %d edge", refRaw),
+			Verdict: Fail,
+			Reason: fmt.Sprintf("the value %s does not fit a %s register at sf=%d. The product clamped it to "+
+				"raw %d — %s in engineering units — and returned no indication that it had done so, so a "+
+				"caller cannot distinguish 'applied' from 'applied as something else'",
+				c.EncodeValue.FloatString(3), signedWord(c.Signed), c.SF, prodInt, floatOrUnknown(held)),
+			Facts: []invariant.Fact{
+				invariant.F("sf.encode.requested", "", RefereeSide.Name, "%s", c.EncodeValue.FloatString(3)),
+				invariant.F("sf.encode.raw", "", ProductSide.Name, "%d", prodInt),
+				invariant.F("sf.encode.effective", "", RefereeSide.Name, "%s", floatOrUnknown(held)),
+			},
+		})
+		out.Note(Finding{
+			ID:       out.ID + "/silent-saturation",
+			Title:    "an unrepresentable value is clamped and the caller is not told",
+			Severity: "P2",
+			Input:    out.Input + fmt.Sprintf(" encode=%s", c.EncodeValue.FloatString(3)),
+			Product:  T(ProductSide.Name, "sf.encode", "raw %d (%s) — silently", prodInt, floatOrUnknown(held)),
+			Referee:  T(RefereeSide.Name, "sf.encode", "%s does not fit; refuse or report", c.EncodeValue.FloatString(3)),
+			Impact: "a control value the gateway believes it wrote is not the value on the device, and no " +
+				"return path carries the difference. The register readback would show it, but the writer " +
+				"never learns",
+			Limitation: "the clamp itself is CORRECT and deliberate (audit SUN-004: clamping to the max-valid " +
+				"edge rather than onto the reserved sentinel). The finding is the absent signal, not the clamp",
+		})
+
+	case !refSat && told:
+		// BY DESIGN, and a divergence the two readings genuinely have. The
+		// referee asks whether the ROUNDED value fits the register, so a
+		// negative request whose magnitude is under half a least-significant
+		// unit — −16595 W into an UNSIGNED register at sf=10, where one count is
+		// 10 GW — rounds to 0 and "fits" on its terms. The product's
+		// EncodeScaleUint answers the DOMAIN question first (`if val < 0 →
+		// EncodeSaturatedLow`, sunspec/scale.go), because an unsigned register
+		// cannot carry a sign at any resolution.
+		//
+		// Neither reading is wrong and the two agree on the raw word, so this is
+		// not a finding: it is the product being STRICTER than the referee, in
+		// the only direction that is safe to be stricter in. It is recorded as a
+		// WARN rather than swallowed, because a differential that quietly
+		// normalises away a real difference between two readings is no longer
+		// reporting what it saw. The referee is deliberately NOT changed to match
+		// — csipref.go's rule applies here too: a referee reconciled with the
+		// product stops being able to find anything.
+		out.Compare(Comparison{
+			Key: "sf.representable",
+			Product: T(ProductSide.Name, "sf.representable", "raw %d, signalled anyway: %s",
+				prodInt, outcomeText(outcome)),
+			Referee: T(RefereeSide.Name, "sf.representable", "raw %d carries %s to within half a count at sf=%d",
+				refRaw, c.EncodeValue.FloatString(3), c.SF),
+			Verdict: Warn,
+			Reason: fmt.Sprintf("both sides encode raw %d, and they differ only on whether that counts as "+
+				"saturation: the referee rounds first and finds %s representable at sf=%d, the product "+
+				"treats a negative value in a %s register as out of DOMAIN before rounding. The product's "+
+				"reading is the stricter one — it over-reports the loss of a sign, never under-reports it — "+
+				"so no control value is at risk either way",
+				refRaw, c.EncodeValue.FloatString(3), c.SF, signedWord(c.Signed)),
+		})
+
+	default:
+		out.Compare(Comparison{
+			Key:     "sf.representable",
+			Product: T(ProductSide.Name, "sf.representable", "raw %d, %s", prodInt, outcomeText(outcome)),
+			Referee: T(RefereeSide.Name, "sf.representable", "raw %d, no saturation", refRaw),
+			Verdict: Pass,
+		})
+	}
+}
+
+// registerInt reinterprets an encoded register word as the signed or unsigned
+// integer the point's type says it is.
+func registerInt(raw uint16, signed bool) int64 {
+	if signed {
+		return int64(int16(raw))
+	}
+	return int64(raw)
+}
+
+// outcomeText names an EncodeOutcome for the report.
+//
+// It is written here rather than as a String() method on the product's type on
+// purpose: a shared renderer would have the referee describing the product's
+// answer in the product's own words, and the whole value of this side is that it
+// says what it saw independently.
+func outcomeText(o sunspec.EncodeOutcome) string {
+	switch o {
+	case sunspec.EncodeExact:
+		return "EncodeExact — the caller is told the register carries the value it asked for"
+	case sunspec.EncodeSaturatedHigh:
+		return "EncodeSaturatedHigh — the caller is told it was clamped onto the high edge"
+	case sunspec.EncodeSaturatedLow:
+		return "EncodeSaturatedLow — the caller is told it was clamped onto the low edge"
+	case sunspec.EncodeNotImplemented:
+		return "EncodeNotImplemented — the caller is told the reserved sentinel was written"
+	case sunspec.EncodeBadSF:
+		return "EncodeBadSF — the caller is told the scale factor is not usable"
+	}
+	return fmt.Sprintf("outcome %d, which this referee's reading of EncodeOutcome does not define", o)
+}
+
+func signedSuffix(signed bool) string {
+	if signed {
+		return "Signed"
+	}
+	return "Uint"
 }
 
 func describeFloat(f float64) string {
