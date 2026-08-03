@@ -317,8 +317,9 @@ func TestCtlCatalog_ConfirmedDefectClassesStillReproduce(t *testing.T) {
 		"opModImpLimW/opModLoadLimW are ceilings applied through SetActivePowerWatts, a WSet setpoint")
 	requireClass(t, classes, "silent-clamp",
 		"SetActivePowerWatts clamps to +/-WMax and returns nil, so the head-end is told success")
-	requireClass(t, classes, "partial-apply",
-		"ApplyControl applies modes sequentially and returns on first error, leaving earlier writes in force")
+	// NOTE: "partial-apply" used to be locked here. It was FIXED in lexa-proto
+	// b760d5a and is now pinned in the other direction by
+	// TestCtlCatalog_WholeRequestPreflightIsAtomic below.
 	requireClass(t, classes, "uninterpretable-applied",
 		"a percentage is written even when the device publishes no rating to resolve it against")
 
@@ -327,6 +328,87 @@ func TestCtlCatalog_ConfirmedDefectClassesStillReproduce(t *testing.T) {
 	if sum.ByVerdict[string(Pass)] == 0 {
 		t.Error("no ctl case passed: a referee that disagrees with the product everywhere is more " +
 			"likely wrong than the product is")
+	}
+}
+
+// TestCtlCatalog_WholeRequestPreflightIsAtomic pins the FIX for the
+// "partial-apply" finding TestCtlCatalog_ConfirmedDefectClassesStillReproduce
+// used to lock — the same shape as
+// TestChainCatalog_BoundedWalkTerminatesWithSentinel above, and for the same
+// reason: a defect lock that is deleted rather than inverted stops being
+// evidence of anything.
+//
+// derbase.ApplyControl used to validate each control axis AS IT REACHED IT and
+// write as it went. A request whose SECOND axis the device could not execute
+// was therefore rejected as a whole — after the FIRST axis had already been
+// written. The head end is told CannotComply while the device sits holding a
+// fragment of an instruction nobody ever decided was safe, which is exactly
+// what checkAtomicity (ctl.go) adjudicates and what invariant I10 forbids.
+//
+// lexa-proto b760d5a fixed it (LXR-012): ApplyControl now PREFLIGHTS every
+// present axis — model presence, declared capability, value domain, nameplate
+// — and returns before issuing a single write if any of them cannot be
+// executed. It also reordered execution restrictive-first (cease/disconnect →
+// limits and setpoints → connect-on/energize-on), which is a separate
+// improvement this catalogue does not measure: the referee's atomicity
+// question is only about whether registers moved.
+//
+// This package's referee is unchanged — "error ⇒ 0 registers changed" is what
+// checkAtomicity has always asserted — so what moved is the PRODUCT, from
+// "fails having written part of it" to "refuses having written nothing".
+//
+// A regression back to lazy per-axis validation re-opens the disagreement: the
+// finding class reappears (checked first) AND the per-comparison sweep below
+// finds a Fail, so it cannot go quiet.
+func TestCtlCatalog_WholeRequestPreflightIsAtomic(t *testing.T) {
+	r := NewReport(0)
+	if err := RunCtlCatalog(context.Background(), r); err != nil {
+		t.Fatalf("catalogue: %v", err)
+	}
+	sum := r.Summary()
+	if sum.Compared == 0 {
+		t.Fatal("the ctl catalogue evaluated zero comparisons")
+	}
+
+	if n := findingClasses(sum)["partial-apply"]; n != 0 {
+		t.Errorf("%d case(s) still report 'partial-apply' — ApplyControl is supposed to preflight the "+
+			"WHOLE request and write nothing when any axis is unexecutable, as of lexa-proto b760d5a "+
+			"(LXR-012). A control that fails must leave the device untouched. Check proto.pin and "+
+			"vendor/lexa-proto/derbase.", n)
+	}
+
+	// The per-comparison sweep. The finding count alone is not enough: it would
+	// also read zero if the catalogue stopped producing failing applications at
+	// all, which would silently retire the question instead of answering it.
+	var pass, fail, exercised int
+	var failed []string
+	for _, c := range r.Cases {
+		for _, cmp := range c.Comparisons {
+			if cmp.Key != "atomicity" {
+				continue
+			}
+			switch cmp.Verdict {
+			case Pass:
+				pass++
+				exercised++
+			case Fail:
+				fail++
+				exercised++
+				failed = append(failed, c.ID+": "+cmp.Reason)
+			}
+		}
+	}
+	if exercised == 0 {
+		t.Fatal("no ctl case exercised the atomicity question — every application in the catalogue " +
+			"SUCCEEDED, so nothing adjudicated whether a FAILED one leaves registers moved. That retires " +
+			"the question rather than answering it; the catalogue needs a case the device refuses.")
+	}
+	if fail != 0 {
+		t.Errorf("%d of %d failed control applications left registers moved:\n  %s",
+			fail, exercised, strings.Join(failed, "\n  "))
+	}
+	if pass == 0 {
+		t.Errorf("atomicity was exercised %d time(s) but never passed", exercised)
 	}
 }
 

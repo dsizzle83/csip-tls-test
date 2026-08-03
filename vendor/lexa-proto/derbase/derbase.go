@@ -51,6 +51,18 @@ type Base struct {
 	// an AdoptTimeoutError, never success (LXR-006).
 	AdoptPollTimeout time.Duration
 
+	// LegacyRmpTms is the ramp time (seconds) written with every legacy M123
+	// active-power ceiling. Zero uses defaultLegacyRmpTms. See that constant
+	// for why the value is a policy knob and not a magic 5 (adopted D7).
+	LegacyRmpTms uint16
+
+	// noGroupedM123 memoizes that this device refused a grouped (single FC16)
+	// M123 write, so later plans go straight to the element-by-element
+	// sequence instead of paying the refusal every time (adopted D8). Sticky
+	// for the life of the Base, which is per-device — a device that cannot do
+	// a multi-register write to model 123 will not learn to.
+	noGroupedM123 bool
+
 	// Cap is the validated capability snapshot read from model 702 at Init
 	// (LXR-005). HasCap reports whether the device implements 702 at all;
 	// individual fields are NaN when the device leaves them unimplemented.
@@ -370,86 +382,163 @@ func wattsChecked(ap *model.ActivePower, axis string) (float64, error) {
 // ErrInvalidControl when the request itself is out of domain. The pre-audit
 // behavior of silently skipping an axis (`!= nil && b.Has704`) meant a head
 // end could be told Started for a control the device never saw.
+//
+// ApplyControl is a plan of plans, and runs the same two phases every plan in
+// this package runs (see plan.go) — for reasons the audit did not name:
+//
+//  1. PREFLIGHT EVERY PRESENT AXIS BEFORE WRITING ANY. The pre-LXR-012 code
+//     validated each axis only as it reached it, so a request whose SECOND
+//     axis the device cannot execute was rejected as a whole — after the
+//     first axis had already been written. The head end is told CannotComply
+//     while the device sits half-actuated in a state nobody commanded. A
+//     request that cannot be executed in full is not executed in part.
+//
+//  2. RESTRICTIVE-FIRST ORDER, not source order. The pre-LXR-012 code
+//     executed energize → connect → PF → var → W → ceiling, i.e. it put the
+//     device INTO SERVICE at whatever output it liked and applied the curtail
+//     last. A control that both energizes and limits — the ordinary CSIP
+//     shape — therefore had a window, as long as the remaining Modbus writes
+//     take, in which the DER exports at full nameplate under a control that
+//     was supposed to cap it. The order is now: cease/disconnect → limits and
+//     setpoints → connect-on/energize-on, so every intermediate state is at
+//     least as restrictive as both the state before the request and the state
+//     after it.
+//
+// This CHANGES THE ORDER OF WRITES for every existing consumer. That is the
+// intended fix, not a side effect.
 func (b *Base) ApplyControl(ctrl model.DERControlBase, tag string) error {
+	steps, err := b.preflightControl(ctrl, tag)
+	if err != nil {
+		return err // whole-request rejection: nothing has been written
+	}
+	for _, rank := range []int{rankRestrict, rankLimit, rankRelease} {
+		for _, s := range steps {
+			if s.rank != rank {
+				continue
+			}
+			if err := s.run(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// applyStep is one preflighted control axis: fully validated, not yet written.
+type applyStep struct {
+	axis string
+	rank int
+	run  func() error
+}
+
+// Execution ranks, applied in ascending order. A step's rank is decided by
+// what it does to the DER's ability to export, not by which axis it is: the
+// same opModEnergize is a rankRestrict step when it ceases and a rankRelease
+// step when it energizes.
+const (
+	rankRestrict = iota // cease-to-energize, disconnect — always first
+	rankLimit           // ceilings, setpoints, PF/var — the commanded envelope
+	rankRelease         // connect-on, energize-on — only once the envelope is set
+)
+
+// preflightControl validates every present axis and returns the executable
+// steps. It performs NO writes: any error means the whole request is refused
+// with the device untouched.
+//
+// Reads are permitted (capability is already snapshotted; nothing here needs
+// the bus). Device-level failures that only a write can discover — a corrupt
+// read-modify-write block, a model that got shorter since discovery — still
+// surface at execution time on the axis that hits them; restrictive-first
+// ordering is what bounds the damage when they do.
+func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyStep, error) {
+	var steps []applyStep
+	add := func(axis string, rank int, run func() error) {
+		steps = append(steps, applyStep{axis: axis, rank: rank, run: run})
+	}
+	// releaseRank ranks a two-state axis: restricting the DER goes first,
+	// releasing it goes last.
+	releaseRank := func(releasing bool) int {
+		if releasing {
+			return rankRelease
+		}
+		return rankRestrict
+	}
+
 	if ctrl.OpModEnergize != nil {
 		if !b.Has703 {
-			return &UnsupportedControlError{Axis: "opModEnergize", Reason: "device has no M703 (DEREnterService)"}
+			return nil, &UnsupportedControlError{Axis: "opModEnergize", Reason: "device has no M703 (DEREnterService)"}
 		}
-		if err := b.SetEnterServiceEnabled(*ctrl.OpModEnergize, tag); err != nil {
-			return err
-		}
+		energize := *ctrl.OpModEnergize
+		add("opModEnergize", releaseRank(energize), func() error {
+			return b.SetEnterServiceEnabled(energize, tag)
+		})
 	}
 	if ctrl.OpModConnect != nil {
 		if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
-			return &UnsupportedControlError{Axis: "opModConnect", Reason: "device has no M123 (immediate controls)"}
+			return nil, &UnsupportedControlError{Axis: "opModConnect", Reason: "device has no M123 (immediate controls)"}
 		}
-		if err := b.SetConnect(*ctrl.OpModConnect, tag); err != nil {
-			return err
-		}
+		connect := *ctrl.OpModConnect
+		add("opModConnect", releaseRank(connect), func() error {
+			return b.SetConnect(connect, tag)
+		})
 	}
 	if ctrl.OpModFixedPFInjectW != nil {
 		if !b.Has704 {
-			return &UnsupportedControlError{Axis: "opModFixedPFInjectW", Reason: "device has no M704 (DERCtlAC)"}
+			return nil, &UnsupportedControlError{Axis: "opModFixedPFInjectW", Reason: "device has no M704 (DERCtlAC)"}
 		}
 		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedPF) {
-			return &UnsupportedControlError{Axis: "opModFixedPFInjectW", Reason: "device CtrlModes does not declare FIXED_PF"}
+			return nil, &UnsupportedControlError{Axis: "opModFixedPFInjectW", Reason: "device CtrlModes does not declare FIXED_PF"}
 		}
 		pf := math.Abs(float64(ctrl.OpModFixedPFInjectW.Value)) / 10000.0
 		if err := b.validatePF(pf, "opModFixedPFInjectW"); err != nil {
-			return err
+			return nil, err
 		}
-		if err := b.SetFixedPF(true, pf, ctrl.OpModFixedPFInjectW.Value >= 0, tag); err != nil {
-			return err
-		}
+		over := ctrl.OpModFixedPFInjectW.Value >= 0
+		add("opModFixedPFInjectW", rankLimit, func() error { return b.SetFixedPF(true, pf, over, tag) })
 	}
 	if ctrl.OpModFixedPFAbsorbW != nil {
 		if !b.Has704 {
-			return &UnsupportedControlError{Axis: "opModFixedPFAbsorbW", Reason: "device has no M704 (DERCtlAC)"}
+			return nil, &UnsupportedControlError{Axis: "opModFixedPFAbsorbW", Reason: "device has no M704 (DERCtlAC)"}
 		}
 		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedPF) {
-			return &UnsupportedControlError{Axis: "opModFixedPFAbsorbW", Reason: "device CtrlModes does not declare FIXED_PF"}
+			return nil, &UnsupportedControlError{Axis: "opModFixedPFAbsorbW", Reason: "device CtrlModes does not declare FIXED_PF"}
 		}
 		pf := math.Abs(float64(ctrl.OpModFixedPFAbsorbW.Value)) / 10000.0
 		if err := b.validatePF(pf, "opModFixedPFAbsorbW"); err != nil {
-			return err
+			return nil, err
 		}
-		if err := b.SetFixedPF(false, pf, ctrl.OpModFixedPFAbsorbW.Value >= 0, tag); err != nil {
-			return err
-		}
+		over := ctrl.OpModFixedPFAbsorbW.Value >= 0
+		add("opModFixedPFAbsorbW", rankLimit, func() error { return b.SetFixedPF(false, pf, over, tag) })
 	}
 	if ctrl.OpModFixedVar != nil {
 		if !b.Has704 {
-			return &UnsupportedControlError{Axis: "opModFixedVar", Reason: "device has no M704 (DERCtlAC)"}
+			return nil, &UnsupportedControlError{Axis: "opModFixedVar", Reason: "device has no M704 (DERCtlAC)"}
 		}
 		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedVar) {
-			return &UnsupportedControlError{Axis: "opModFixedVar", Reason: "device CtrlModes does not declare FIXED_VAR"}
+			return nil, &UnsupportedControlError{Axis: "opModFixedVar", Reason: "device CtrlModes does not declare FIXED_VAR"}
 		}
 		pct := float64(ctrl.OpModFixedVar.Value.Value) / 100.0
 		if math.IsNaN(pct) || pct < -100 || pct > 100 {
-			return &InvalidControlError{Axis: "opModFixedVar",
+			return nil, &InvalidControlError{Axis: "opModFixedVar",
 				Reason: fmt.Sprintf("reactive setpoint %.2f%% outside [-100,100] of VarMax", pct)}
 		}
-		if err := b.SetConstantVar(pct, tag); err != nil {
-			return err
-		}
+		add("opModFixedVar", rankLimit, func() error { return b.SetConstantVar(pct, tag) })
 	}
 	if ctrl.OpModFixedW != nil {
 		if !b.Has704 {
-			return &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
+			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
 		}
 		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedW) {
-			return &UnsupportedControlError{Axis: "opModFixedW", Reason: "device CtrlModes does not declare FIXED_W"}
+			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device CtrlModes does not declare FIXED_W"}
 		}
 		w, err := wattsChecked(ctrl.OpModFixedW, "opModFixedW")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := b.validateSetpointW(w, "opModFixedW"); err != nil {
-			return err
+			return nil, err
 		}
-		if err := b.SetActivePowerWatts(w, tag); err != nil {
-			return err
-		}
+		add("opModFixedW", rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
 	}
 
 	// Ceilings → WMaxLimPct (% of WMax). First non-nil wins.
@@ -459,25 +548,27 @@ func (b *Base) ApplyControl(ctrl model.DERControlBase, tag string) error {
 		axisAP{"opModGenLimW", ctrl.OpModGenLimW}); lim != nil {
 		w, err := wattsChecked(lim, axis)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if w < 0 {
-			return &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative ceiling %g W", w)}
+			return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative ceiling %g W", w)}
+		}
+		// Both branches convert watts through the nameplate, so an unknown
+		// WMax is a preflight rejection, not a failure discovered after the
+		// other axes have been written.
+		if err := b.requireWmax(tag); err != nil {
+			return nil, err
 		}
 		if b.Has704 {
 			if !b.supportsCtrlMode(sunspec.M702_CtrlMode_MaxW) {
-				return &UnsupportedControlError{Axis: axis, Reason: "device CtrlModes does not declare MAX_W"}
+				return nil, &UnsupportedControlError{Axis: axis, Reason: "device CtrlModes does not declare MAX_W"}
 			}
-			if err := b.SetWMaxLimPctW(w, tag); err != nil {
-				return err
-			}
+			add(axis, rankLimit, func() error { return b.SetWMaxLimPctW(w, tag) })
 		} else {
 			if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
-				return &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for power limiting"}
+				return nil, &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for power limiting"}
 			}
-			if err := b.SetExportLimit(lim, tag); err != nil {
-				return err
-			}
+			add(axis, rankLimit, func() error { return b.SetExportLimit(lim, tag) })
 		}
 	}
 
@@ -487,29 +578,39 @@ func (b *Base) ApplyControl(ctrl model.DERControlBase, tag string) error {
 		axisAP{"opModLoadLimW", ctrl.OpModLoadLimW}); imp != nil {
 		w, err := wattsChecked(imp, axis)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if w < 0 {
-			return &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative import limit %g W", w)}
+			return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative import limit %g W", w)}
 		}
 		if b.Has704 {
 			if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedW) {
-				return &UnsupportedControlError{Axis: axis, Reason: "device CtrlModes does not declare FIXED_W (required for charge setpoint)"}
+				return nil, &UnsupportedControlError{Axis: axis, Reason: "device CtrlModes does not declare FIXED_W (required for charge setpoint)"}
 			}
 			if err := b.validateSetpointW(-w, axis); err != nil {
-				return err
+				return nil, err
 			}
-			if err := b.SetActivePowerWatts(-w, tag); err != nil {
-				return err
-			}
+			add(axis, rankLimit, func() error { return b.SetActivePowerWatts(-w, tag) })
 		} else {
 			if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
-				return &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for import limiting"}
+				return nil, &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for import limiting"}
 			}
-			if err := b.SetImportLimit(imp, tag); err != nil {
-				return err
+			if err := b.requireWmax(tag); err != nil {
+				return nil, err
 			}
+			add(axis, rankLimit, func() error { return b.SetImportLimit(imp, tag) })
 		}
+	}
+	return steps, nil
+}
+
+// requireWmax rejects a percentage-of-nameplate control on a device whose
+// nameplate is unknown. Same message the writers themselves produce, so the
+// only thing that changes is WHEN a caller learns (before any axis is
+// written, instead of after).
+func (b *Base) requireWmax(tag string) error {
+	if math.IsNaN(b.Wmax) || b.Wmax <= 0 {
+		return fmt.Errorf("%s: cannot set power limit: WMax unknown", tag)
 	}
 	return nil
 }
@@ -1069,15 +1170,166 @@ func (b *Base) ReadDCMeasurement(tag string) (sunspec.DCMeasurement, error) {
 
 // ── Legacy M123 / M121 helpers ───────────────────────────────────────────────
 
+// Plan and element names for the two M123 actuation plans. They travel in
+// PlanOutcome, PartialActuationError, and (upstream) in journal entries and
+// metric labels, so they are stable identifiers rather than log prose.
+const (
+	PlanM123Limit   = "m123-limit"
+	PlanM123Connect = "m123-connect"
+
+	ElemM123RmpTms     = "WMaxLimPct_RmpTms"
+	ElemM123WMaxLimPct = "WMaxLimPct"
+	ElemM123Ena        = "WMaxLimPct_Ena"
+	ElemM123Conn       = "Conn"
+)
+
+// Element indexes within m123LimitPlan's PlanOutcome.Elements, in write order.
+const (
+	m123ElemRmp = iota
+	m123ElemVal
+	m123ElemEna
+)
+
+// defaultLegacyRmpTms is the ramp time (seconds) written with a legacy M123
+// active-power ceiling when Base.LegacyRmpTms is left zero (adopted D7 — this
+// was an unexplained literal 5 in the write path).
+//
+// It is a policy value, not a device constant: it is how long the inverter
+// takes to walk from its present output to the commanded ceiling, and a
+// ceiling that is not yet reached is a ceiling that is not protecting
+// anything. 5 s is short enough to land well inside the CSIP
+// actuation-confirm window and long enough not to slam a plant, which is why
+// it is the default — but a site whose ceilings exist to prevent an
+// export-limit breach wants it shorter, and a mechanically fussy plant wants
+// it longer. Hence named, documented, and settable per device.
+const defaultLegacyRmpTms = uint16(5)
+
+func (b *Base) legacyRmpTms() uint16 {
+	if b.LegacyRmpTms != 0 {
+		return b.LegacyRmpTms
+	}
+	return defaultLegacyRmpTms
+}
+
+// readM123Point reads one M123 register. ok=false when the model cannot be
+// read, the block is shorter than the point, or the point carries the uint16
+// not-implemented sentinel — i.e. every case where the device did not tell us
+// what that register holds.
+func (b *Base) readM123Point(off int) (uint16, bool) {
+	regs, err := b.Reader.ReadModel(sunspec.ModelImmediateCtrl)
+	if err != nil || off < 0 || off >= len(regs) || regs[off] == 0xFFFF {
+		return 0, false
+	}
+	return regs[off], true
+}
+
+// ── M123 Conn: the legacy connect plan ───────────────────────────────────────
+
+// m123ConnPlan is connect/disconnect as a degenerate one-element plan:
+// preflight, write, and prove by L1 register echo.
+type m123ConnPlan struct {
+	b      *Base
+	tag    string
+	want   uint16
+	before float64 // measured pre-state (NaN = unknown)
+}
+
+// SetConnect connects (true) or disconnects (false) the DER through M123 Conn
+// and PROVES the result by reading the register back.
+//
+// Before LXR-012-connect this function returned nil on any ACK. A device that
+// accepts the write and does not act on it — the ordinary
+// accepted-and-ignored firmware behaviour — was therefore reported as
+// connected or disconnected on the strength of the ACK alone, which upstream
+// became a Started for a connect that never happened, and (the direction that
+// matters) a satisfied cease for a DER still exporting.
+//
+// The signature is unchanged for existing callers; SetConnectPlan is the same
+// actuation with the measured outcome attached, the way RawFromScaleSigned
+// wraps EncodeScaleSigned in the sunspec codec.
 func (b *Base) SetConnect(connect bool, tag string) error {
-	val := uint16(0)
+	_, err := b.SetConnectPlan(connect, tag)
+	return err
+}
+
+// SetConnectPlan is SetConnect returning the measured PlanOutcome. A nil
+// error means the device MEASURABLY holds the commanded connect state.
+func (b *Base) SetConnectPlan(connect bool, tag string) (PlanOutcome, error) {
+	p, err := b.newM123ConnPlan(connect, tag)
+	if err != nil {
+		return PlanOutcome{Tag: tag, Plan: PlanM123Connect}, err
+	}
+	return p.execute()
+}
+
+func (b *Base) newM123ConnPlan(connect bool, tag string) (*m123ConnPlan, error) {
+	if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
+		return nil, &UnsupportedControlError{Axis: "opModConnect", Reason: "device has no M123 (immediate controls)"}
+	}
+	regs, err := b.Reader.ReadModel(sunspec.ModelImmediateCtrl)
+	if err != nil {
+		return nil, fmt.Errorf("%s: read Model 123: %w", tag, err)
+	}
+	if len(regs) <= sunspec.M123_Conn {
+		return nil, &MalformedDeviceError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
+			Declared: len(regs), Required: sunspec.M123_Conn + 1, Detail: "too short for Conn"}
+	}
+	// A device that leaves Conn unimplemented cannot be connected through
+	// M123 and — more to the point — can never PROVE a connect state, so the
+	// axis is unsupported rather than silently unverifiable (D6: unprovable
+	// axes must reach the head end as CannotComply, not as success).
+	if regs[sunspec.M123_Conn] == 0xFFFF {
+		return nil, &UnsupportedControlError{Axis: "opModConnect",
+			Reason: "device leaves M123 Conn unimplemented (0xFFFF): the connect state can never be proven"}
+	}
+	p := &m123ConnPlan{b: b, tag: tag, want: 0, before: float64(regs[sunspec.M123_Conn])}
 	if connect {
-		val = 1
+		p.want = 1
 	}
-	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_Conn, []uint16{val}); err != nil {
-		return fmt.Errorf("%s: set connect=%v: %w", tag, connect, err)
+	return p, nil
+}
+
+func (p *m123ConnPlan) execute() (PlanOutcome, error) {
+	out := PlanOutcome{Tag: p.tag, Plan: PlanM123Connect, Elements: []ElementOutcome{{
+		Name: ElemM123Conn, Model: sunspec.ModelImmediateCtrl, Before: p.before, After: math.NaN(),
+	}}}
+	var writeErr error
+	if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_Conn, []uint16{p.want}); err != nil {
+		writeErr = fmt.Errorf("%s: set connect=%v: %w", p.tag, p.want == 1, err)
+		out.Elements[0].Err = writeErr
 	}
-	return nil
+
+	// L1 proof: the echo, never the ACK.
+	got, ok := p.b.readM123Point(sunspec.M123_Conn)
+	if !ok {
+		// Post-state unreadable ⇒ Unverified, never Failed. A commanded
+		// disconnect we cannot read back must be assumed not to have landed.
+		out.Elements[0].State = ElementUnverified
+		out.LessRestrictiveThanIntended = p.want == 0
+		if writeErr != nil {
+			return out, writeErr
+		}
+		return out, &VerifyError{Tag: p.tag, Model: sunspec.ModelImmediateCtrl, Point: ElemM123Conn,
+			Detail: "device accepted the write but its post-state could not be read back"}
+	}
+	out.Elements[0].After = float64(got)
+	if got == p.want {
+		// Measured, not inferred: an errored write that nonetheless landed is
+		// an applied element, and re-driving it would be a write the device
+		// does not need.
+		out.Elements[0].State = ElementApplied
+		if writeErr != nil {
+			out.Elements[0].Advisory = "write returned an error but the device measurably holds the commanded state"
+		}
+		return out, nil
+	}
+	out.Elements[0].State = ElementFailed
+	out.LessRestrictiveThanIntended = p.want == 0
+	if writeErr != nil {
+		return out, writeErr
+	}
+	return out, &VerifyError{Tag: p.tag, Model: sunspec.ModelImmediateCtrl, Point: ElemM123Conn,
+		Detail: fmt.Sprintf("wrote Conn=%d, device reads back %d", p.want, got)}
 }
 
 func (b *Base) SetImportLimit(ap *model.ActivePower, tag string) error {
@@ -1128,53 +1380,469 @@ func (b *Base) ReadLegacyWMaxLimPctW(tag string) (float64, bool, error) {
 	return pct / 100.0 * b.Wmax, true, nil
 }
 
-// setLegacyWMaxLimPct writes M123 WMaxLimPct. Negative w commands charge
-// (battery sim convention); positive w limits export.
-func (b *Base) setLegacyWMaxLimPct(w float64, tag string) error {
-	if math.IsNaN(b.Wmax) || b.Wmax <= 0 {
-		return fmt.Errorf("%s: cannot set power limit: WMax unknown", tag)
+// ReadLegacyConnect reads back the ACTIVE M123 connect state — the exact
+// register SetConnect writes — so a legacy (704-less) inverter can prove a
+// commanded connect/disconnect the same way a 701-bearing one proves it
+// through ConnSt (LXR-012-connect positive read-back).
+//
+// It is the exact mirror of ReadLegacyWMaxLimPctW and exists for the same
+// reason: without it every 704-less inverter is permanently UNPROVABLE on
+// Connect. No sample can ever be a match, so the reconciler never converges,
+// no terminal Applied is emitted, and the CSIP actuation-confirm gate
+// escalates on every control — with the safety-relevant direction being a
+// commanded cease that nothing can confirm.
+//
+// ok=false means no connect state is proven: the device has no M123, the
+// block is short, the point is unimplemented, or it carries a value that is
+// neither connected nor disconnected. Never "the device is connected".
+func (b *Base) ReadLegacyConnect(tag string) (bool, bool, error) {
+	if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
+		return false, false, nil
 	}
-	charge := w < 0
+	regs, err := b.Reader.ReadModel(sunspec.ModelImmediateCtrl)
+	if err != nil {
+		return false, false, fmt.Errorf("%s: read Model 123: %w", tag, err)
+	}
+	if len(regs) <= sunspec.M123_Conn {
+		return false, false, &MalformedDeviceError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
+			Declared: len(regs), Required: sunspec.M123_Conn + 1, Detail: "too short for Conn"}
+	}
+	switch regs[sunspec.M123_Conn] {
+	case 0:
+		return false, true, nil
+	case 1:
+		return true, true, nil
+	}
+	// Unimplemented (0xFFFF) or an out-of-domain enum: unprovable, and an
+	// unprovable connect state is never reported as connected.
+	return false, false, nil
+}
+
+// ── M123 WMaxLimPct: the legacy active-power ceiling plan ────────────────────
+
+// m123LimitPlan is the legacy (704-less) active-power ceiling as an actuation
+// plan. Three registers — ramp time, value, enable — are ONE control, and the
+// pre-LXR-012 writer sent all three with no proof that any of them landed: it
+// returned the third write's error, so a device that ACK'd and dropped the
+// enable reported a clean success while running uncurtailed.
+//
+// The plan's shape (see plan.go for the phases and the measured-not-inferred
+// rule):
+//
+//   - preflight validates model, block length, corrupt-read, scale-factor
+//     domain, encode representability and nameplate, and snapshots the
+//     pre-state. The pre-state snapshot is not diagnostics: without it the
+//     enable-refresh case (device already enabled, refresh write failed,
+//     ceiling nonetheless in force) is indistinguishable from a genuine
+//     mixed state, and over-classifying it would fail a control the device
+//     is correctly executing.
+//   - execute prefers ONE grouped FC16 over offsets 0-4, because the five
+//     WMaxLimPct-group points are contiguous and a single transaction has no
+//     partial-state window at all. A device that refuses it falls back to the
+//     element sequence (D8), which doubles as the completion path for a
+//     device that applied only a PREFIX of the grouped write.
+//   - the sequence writes ramp → value → enable, enable LAST, so no
+//     intermediate state is less restrictive than where it started.
+type m123LimitPlan struct {
+	b   *Base
+	tag string
+
+	// preflight products
+	raw    uint16  // encoded WMaxLimPct target word
+	pct    float64 // signed engineering target, % of WMax (negative = charge)
+	charge bool
+	sf     int16
+	rmp    uint16
+
+	grouped     bool
+	win0, rvrt0 uint16 // a grouped write puts these two back AS READ
+
+	// pre-state, measured before the first write
+	val0, ena0, rmp0 uint16
+	pct0             float64
+
+	attempted [3]bool
+}
+
+// SetLegacyWMaxLimPctPlan runs the M123 ceiling plan and returns the measured
+// outcome. A nil error means the commanded ceiling is measurably in force on
+// the device (possibly applied-degraded — see PlanOutcome.Degraded); an
+// ErrPartialActuation means the device was left in a state neither commanded
+// nor pre-existing and must be escalated, not retried blindly.
+func (b *Base) SetLegacyWMaxLimPctPlan(w float64, tag string) (PlanOutcome, error) {
+	p, err := b.newM123LimitPlan(w, tag)
+	if err != nil {
+		return PlanOutcome{Tag: tag, Plan: PlanM123Limit}, err
+	}
+	return p.execute()
+}
+
+// setLegacyWMaxLimPct writes M123 WMaxLimPct. Negative w commands charge
+// (battery sim convention); positive w limits export. It is a thin wrapper
+// over the plan — the RawFromScaleSigned/EncodeScaleSigned convention: the
+// outcome-bearing entry point is the real one, and this signature exists so
+// existing callers keep compiling.
+func (b *Base) setLegacyWMaxLimPct(w float64, tag string) error {
+	_, err := b.SetLegacyWMaxLimPctPlan(w, tag)
+	return err
+}
+
+// m123GroupSentinels counts how many of the five WMaxLimPct-group points read
+// the uint16 not-implemented sentinel.
+func m123GroupSentinels(regs []uint16) int {
+	n := 0
+	for _, off := range []int{sunspec.M123_WMaxLimPct, sunspec.M123_WMaxLimPct_WinTms,
+		sunspec.M123_WMaxLimPct_RvrtTms, sunspec.M123_WMaxLimPct_RmpTms, sunspec.M123_WMaxLimPct_Ena} {
+		if off < len(regs) && regs[off] == 0xFFFF {
+			n++
+		}
+	}
+	return n
+}
+
+// newM123LimitPlan is the plan's preflight: it validates the whole request and
+// snapshots the pre-state, and writes nothing.
+func (b *Base) newM123LimitPlan(w float64, tag string) (*m123LimitPlan, error) {
+	if err := b.requireWmax(tag); err != nil {
+		return nil, err
+	}
+	p := &m123LimitPlan{b: b, tag: tag, charge: w < 0, rmp: b.legacyRmpTms()}
 	mag := math.Abs(w)
 	if mag > b.Wmax {
 		mag = b.Wmax
 	}
 	regs, err := b.Reader.ReadModel(sunspec.ModelImmediateCtrl)
 	if err != nil {
-		return fmt.Errorf("%s: read Model 123: %w", tag, err)
+		return nil, fmt.Errorf("%s: read Model 123: %w", tag, err)
 	}
 	if len(regs) <= sunspec.M123_WMaxLimPct_SF {
-		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
+		return nil, &MalformedDeviceError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
 			Declared: len(regs), Required: sunspec.M123_WMaxLimPct_SF + 1, Detail: "too short for WMaxLimPct_SF"}
 	}
-	sf := int16(regs[sunspec.M123_WMaxLimPct_SF])
-	if !sunspec.ValidSF(sf) {
-		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
+	// M123 corrupt-read gate, the model-123 counterpart of write704's
+	// ReadLooksCorrupt (audit E2). Model 123 has no declarative Layout, so the
+	// two signals are checked by hand, in ReadLooksCorrupt's priority order:
+	//
+	//  1. the scale factor is out of the legal sunssf domain (below) — a
+	//     read-only device constant, so an illegal one is authoritative
+	//     evidence of a bad read;
+	//  2. otherwise, sentinel saturation of the five points this plan writes.
+	//
+	// Saturation is deliberately ALL FIVE, not ReadLooksCorrupt's half-block:
+	// WinTms and RvrtTms unimplemented is the ordinary shape of a real
+	// inverter (it is exactly the D8 grouping-skip trigger below), and
+	// rejecting it as corruption would refuse to curtail perfectly healthy
+	// hardware. All five is the failed-read shape and nothing else.
+	if m123GroupSentinels(regs) == 5 {
+		return nil, fmt.Errorf("%s: refusing to write M123 — the WMaxLimPct group read back all-sentinel "+
+			"(partial/failed read); not programming garbage back to the device", tag)
+	}
+	p.sf = int16(regs[sunspec.M123_WMaxLimPct_SF])
+	if !sunspec.ValidSF(p.sf) {
+		return nil, &MalformedDeviceError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
 			Declared: len(regs), Required: len(regs),
-			Detail: fmt.Sprintf("WMaxLimPct_SF=%d outside legal sunssf domain", sf)}
+			Detail: fmt.Sprintf("WMaxLimPct_SF=%d outside legal sunssf domain", p.sf)}
 	}
 	pct := mag / b.Wmax * 100.0
 	// Checked encode (LXR-004): a limit command that cannot be represented at
 	// the device's scale factor must fail loudly, never be silently written as
 	// a clamped different limit or a fabricated zero.
-	var raw uint16
 	var outcome sunspec.EncodeOutcome
-	if charge {
-		raw, outcome = sunspec.EncodeScaleSigned(-pct, sf)
+	if p.charge {
+		p.pct = -pct
+		p.raw, outcome = sunspec.EncodeScaleSigned(-pct, p.sf)
 	} else {
-		raw, outcome = sunspec.EncodeScaleUint(pct, sf)
+		p.pct = pct
+		p.raw, outcome = sunspec.EncodeScaleUint(pct, p.sf)
 	}
 	if !outcome.Representable() {
-		return fmt.Errorf("%s: WMaxLimPct %.2f%% not representable at sf=%d (encode outcome %d): %w",
-			tag, pct, sf, outcome, ErrInvalidControl)
+		return nil, fmt.Errorf("%s: WMaxLimPct %.2f%% not representable at sf=%d (encode outcome %d): %w",
+			tag, pct, p.sf, outcome, ErrInvalidControl)
 	}
-	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_WMaxLimPct_RmpTms, []uint16{5}); err != nil {
-		return fmt.Errorf("%s: set ramp time: %w", tag, err)
+
+	// Pre-state snapshot (mandatory — see the type doc).
+	p.val0 = regs[sunspec.M123_WMaxLimPct]
+	p.ena0 = regs[sunspec.M123_WMaxLimPct_Ena]
+	p.rmp0 = regs[sunspec.M123_WMaxLimPct_RmpTms]
+	p.win0 = regs[sunspec.M123_WMaxLimPct_WinTms]
+	p.rvrt0 = regs[sunspec.M123_WMaxLimPct_RvrtTms]
+	p.pct0 = p.decode(p.val0)
+
+	// Grouping decision (D8): a grouped write puts WinTms and RvrtTms back
+	// AS READ, so it is only safe when the device implements them — writing a
+	// sentinel into a timer point is exactly the garbage-back-to-the-device
+	// class the corrupt-read gate above exists to prevent. The memo makes a
+	// device that refused a grouped write pay for it once, not every time.
+	p.grouped = !b.noGroupedM123 && m123GroupSentinels(regs) == 0
+	return p, nil
+}
+
+// decode converts a raw WMaxLimPct word to engineering percent in the sign
+// domain of the command being executed. NaN means "not interpretable", which
+// ceilingRestriction scores as no limit in force.
+func (p *m123LimitPlan) decode(raw uint16) float64 {
+	if p.charge {
+		return sunspec.ApplyScaleSigned(raw, p.sf)
 	}
-	if err := b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_WMaxLimPct, []uint16{raw}); err != nil {
-		return fmt.Errorf("%s: write WMaxLimPct: %w", tag, err)
+	if raw == 0xFFFF {
+		return math.NaN() // uint16 not-implemented sentinel
 	}
-	return b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_WMaxLimPct_Ena, []uint16{1})
+	return sunspec.ApplyScaleUint(raw, p.sf)
+}
+
+func (p *m123LimitPlan) write(off uint16, vals ...uint16) error {
+	return p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl, off, vals)
+}
+
+// readGroup re-reads the M123 block for classification. ok=false is the
+// "post-state cannot be read" case the load-bearing rule turns into
+// Unverified.
+func (p *m123LimitPlan) readGroup() ([]uint16, bool) {
+	regs, err := p.b.Reader.ReadModel(sunspec.ModelImmediateCtrl)
+	if err != nil || len(regs) <= sunspec.M123_WMaxLimPct_SF {
+		return nil, false
+	}
+	return regs, true
+}
+
+func (p *m123LimitPlan) execute() (PlanOutcome, error) {
+	out := PlanOutcome{Tag: p.tag, Plan: PlanM123Limit, Elements: []ElementOutcome{
+		{Name: ElemM123RmpTms, Model: sunspec.ModelImmediateCtrl, Before: float64(p.rmp0), After: math.NaN()},
+		{Name: ElemM123WMaxLimPct, Model: sunspec.ModelImmediateCtrl, Before: p.pct0, After: math.NaN()},
+		{Name: ElemM123Ena, Model: sunspec.ModelImmediateCtrl, Before: float64(p.ena0), After: math.NaN()},
+	}}
+
+	if p.grouped {
+		// One FC16 over offsets 0-4: value, WinTms and RvrtTms back as read,
+		// ramp, enable. No partial-state window exists inside a single
+		// transaction — the device either takes it or it does not.
+		p.attempted = [3]bool{true, true, true}
+		err := p.write(sunspec.M123_WMaxLimPct, p.raw, p.win0, p.rvrt0, p.rmp, 1)
+		if err == nil {
+			return p.classify(out)
+		}
+		// D8 attempt-then-fall-back, with the memo so the next plan on this
+		// device goes straight to the sequence. This same path COMPLETES a
+		// grouped write the device applied only a prefix of: the sequence is
+		// idempotent, and completion — every remaining element being neutral
+		// or more restrictive — is itself the compensating action.
+		p.b.noGroupedM123 = true
+		out.Elements[m123ElemVal].Advisory = fmt.Sprintf(
+			"device refused the grouped single-write (%v); completed element by element", err)
+	}
+
+	// 1. Ramp time. It governs how the device walks to the new ceiling, so it
+	//    goes first — and its failure is advisory: a ceiling reached on the
+	//    device's own ramp is still the commanded ceiling (row 4).
+	p.attempted[m123ElemRmp] = true
+	if err := p.write(sunspec.M123_WMaxLimPct_RmpTms, p.rmp); err != nil {
+		out.Elements[m123ElemRmp].Err = fmt.Errorf("%s: set ramp time: %w", p.tag, err)
+	}
+
+	// 2. The ceiling value, still inert while the enable is off.
+	p.attempted[m123ElemVal] = true
+	if err := p.write(sunspec.M123_WMaxLimPct, p.raw); err != nil {
+		out.Elements[m123ElemVal].Err = fmt.Errorf("%s: write WMaxLimPct: %w", p.tag, err)
+	}
+
+	// NEVER ENABLE A VALUE THAT IS NOT MEASURED AT TARGET. This read is the
+	// measured-not-inferred rule applied where it is load-bearing rather than
+	// diagnostic, in both directions: a value write that errored may have
+	// landed (so the plan continues — row 7), and one that was ACK'd may have
+	// been dropped (so the plan stops before latching whatever the device is
+	// actually holding — row 8, the row where enabling would put an
+	// unintended, possibly higher, ceiling into force).
+	if got, ok := p.b.readM123Point(sunspec.M123_WMaxLimPct); !ok || got != p.raw {
+		out.Elements[m123ElemEna].Advisory = "not written: the ceiling value was not proven at target, " +
+			"and enabling an unproven value latches whatever the device is actually holding"
+		return p.classify(out)
+	}
+
+	// 3. The enable — the completing element.
+	p.attempted[m123ElemEna] = true
+	if err := p.write(sunspec.M123_WMaxLimPct_Ena, 1); err != nil {
+		out.Elements[m123ElemEna].Err = fmt.Errorf("%s: enable WMaxLimPct: %w", p.tag, err)
+	}
+	return p.classify(out)
+}
+
+// classify re-reads the device and decides what actually happened. Every
+// verdict below comes from the READING; the recorded write errors only
+// choose which error value is returned.
+func (p *m123LimitPlan) classify(out PlanOutcome) (PlanOutcome, error) {
+	regs, ok := p.readGroup()
+	if !ok {
+		for i := range out.Elements {
+			if p.attempted[i] {
+				out.Elements[i].State = ElementUnverified
+			}
+		}
+		if firstElementErr(out) != nil {
+			// A write errored AND the device will not say where it landed.
+			// The unknown partial is treated as MIXED: with writes in flight
+			// and no post-state, a clean verdict in either direction is the
+			// guess this mechanism exists to refuse (rows 12/13).
+			out.Mixed = true
+			out.LessRestrictiveThanIntended = true
+			return out, &PartialActuationError{Tag: p.tag, Plan: out.Plan, Outcome: out}
+		}
+		return out, &VerifyError{Tag: p.tag, Model: sunspec.ModelImmediateCtrl, Point: ElemM123WMaxLimPct,
+			Detail: "device accepted every write but its post-state could not be read back"}
+	}
+
+	valAfter := regs[sunspec.M123_WMaxLimPct]
+	enaAfter := regs[sunspec.M123_WMaxLimPct_Ena]
+	rmpAfter := regs[sunspec.M123_WMaxLimPct_RmpTms]
+	out.Elements[m123ElemRmp].After = float64(rmpAfter)
+	out.Elements[m123ElemVal].After = p.decode(valAfter)
+	out.Elements[m123ElemEna].After = float64(enaAfter)
+
+	valOK, enaOK := valAfter == p.raw, enaAfter == 1
+	out.Elements[m123ElemRmp].State = p.stateOf(m123ElemRmp, rmpAfter == p.rmp)
+	out.Elements[m123ElemVal].State = p.stateOf(m123ElemVal, valOK)
+	out.Elements[m123ElemEna].State = p.stateOf(m123ElemEna, enaOK)
+	if rmpAfter != p.rmp {
+		out.Elements[m123ElemRmp].Advisory = fmt.Sprintf(
+			"device holds RmpTms=%ds, wrote %ds — this changes how fast the device walks to the ceiling, not the ceiling",
+			rmpAfter, p.rmp)
+	}
+
+	if valOK && enaOK {
+		// The commanded ceiling is MEASURED in force. A failed ramp time
+		// leaves this applied-DEGRADED (D9), not failed — the device is
+		// enforcing exactly what was asked for.
+		return out, nil
+	}
+
+	achieved := ceilingRestriction(p.decode(valAfter), enaOK)
+	intended := ceilingRestriction(p.pct, true)
+	pre := ceilingRestriction(p.pct0, p.ena0 == 1)
+	out.LessRestrictiveThanIntended = achieved > intended
+
+	// Mixed = the device is in NEITHER the state the plan found it in NOR the
+	// one it was commanded into. RmpTms is deliberately not part of this: it
+	// is not a state of the ceiling, and folding it in would classify a
+	// harmless ramp-time difference as a mixed-state escalation.
+	out.Mixed = valAfter != p.val0 || enaAfter != p.ena0
+	if !out.Mixed {
+		// The device is exactly where the plan found it: a clean failure, not
+		// a partial actuation. Nothing to compensate — there is nothing to
+		// compensate FOR — and no reservation is warranted beyond whatever
+		// the pre-state already implied.
+		if err := firstElementErr(out); err != nil {
+			return out, err
+		}
+		point, detail := ElemM123WMaxLimPct, fmt.Sprintf(
+			"wrote raw %d (%.2f%% of WMax), device reads back %d", p.raw, p.pct, valAfter)
+		if valOK {
+			point, detail = ElemM123Ena, fmt.Sprintf(
+				"wrote Ena=1, device reads back %d — the ceiling value is staged but not in force", enaAfter)
+		}
+		return out, &VerifyError{Tag: p.tag, Model: sunspec.ModelImmediateCtrl, Point: point, Detail: detail}
+	}
+	return p.compensate(out, valOK, achieved, pre, intended)
+}
+
+// stateOf turns a measured hit/miss into an ElementState. An element the plan
+// never wrote is NotAttempted even when the device happens to hold the
+// intended value — the plan reports what it did, and the measurement is in
+// Before/After either way.
+func (p *m123LimitPlan) stateOf(i int, hit bool) ElementState {
+	switch {
+	case hit && p.attempted[i]:
+		return ElementApplied
+	case !p.attempted[i]:
+		return ElementNotAttempted
+	default:
+		return ElementFailed
+	}
+}
+
+// compensate implements the §5 rule (adopted D1) for a MEASURED mixed state:
+// one bounded re-attempt of the completing element, or a write of the more
+// restrictive of {pre-state, achieved} — and otherwise freeze the device where
+// it is and declare it. Nothing here ever moves a device toward less
+// restrictive.
+func (p *m123LimitPlan) compensate(out PlanOutcome, valOK bool, achieved, pre, intended float64) (PlanOutcome, error) {
+	// (a) ONE bounded re-attempt of the completing element, and only when the
+	// ceiling VALUE is measured at target. This is not a compensating move at
+	// all — it completes the operator's own command — which is why it is
+	// allowed to end in a state less restrictive than the pre-state if that
+	// is what was commanded.
+	if valOK {
+		if err := p.write(sunspec.M123_WMaxLimPct_Ena, 1); err == nil {
+			if regs, ok := p.readGroup(); ok &&
+				regs[sunspec.M123_WMaxLimPct] == p.raw && regs[sunspec.M123_WMaxLimPct_Ena] == 1 {
+				out.Elements[m123ElemEna].State = ElementApplied
+				out.Elements[m123ElemEna].After = 1
+				out.Elements[m123ElemEna].Advisory = "adopted on the plan's one bounded re-attempt"
+				out.Mixed = false
+				out.LessRestrictiveThanIntended = false
+				return out, nil
+			}
+		}
+	}
+
+	// (b) Write the MORE RESTRICTIVE of {pre-state, achieved}. Strictly more
+	// restrictive only: if the device is already held back at least as much
+	// as it was before the plan, there is nothing to gain and a needless
+	// write to a device in a partial state is its own hazard.
+	//
+	// Reverting the ENABLE is deliberately not among the options: with the
+	// enable off the staged value is inert, so reverting throws away a
+	// more-restrictive staged value and leaves a loose value to latch later.
+	if strictlyMoreRestrictive(pre, achieved) {
+		if val, ena, ok := p.restorePreState(); ok {
+			switch {
+			case val == p.raw && ena == 1:
+				// The restored pre-state IS the commanded state: the plan was
+				// asked for a ceiling the device already had, and a partial
+				// write bounced it away and back. The verdict follows the
+				// measurement here as everywhere else — the device holds the
+				// command, so this is applied, not a partial actuation. A
+				// caller told otherwise would escalate a DER that is doing
+				// exactly what it was told.
+				out.Elements[m123ElemVal].State = ElementApplied
+				out.Elements[m123ElemVal].After = p.pct0
+				out.Elements[m123ElemVal].Advisory = "re-proven at the commanded state after a partial write"
+				out.Elements[m123ElemEna].State = ElementApplied
+				out.Elements[m123ElemEna].After = float64(ena)
+				out.Mixed = false
+				out.LessRestrictiveThanIntended = false
+				return out, nil
+			case val == p.val0 && ena == p.ena0:
+				out.Elements[m123ElemVal].State = ElementCompensated
+				out.Elements[m123ElemVal].After = p.pct0
+				out.Elements[m123ElemEna].State = ElementCompensated
+				out.Elements[m123ElemEna].After = float64(ena)
+				out.LessRestrictiveThanIntended = pre > intended
+				return out, &PartialActuationError{Tag: p.tag, Plan: out.Plan, Outcome: out, Compensated: true}
+			}
+		}
+	}
+
+	// Freeze-and-declare: the device stays where it is, and the caller is
+	// told exactly that, with the per-element evidence.
+	return out, &PartialActuationError{Tag: p.tag, Plan: out.Plan, Outcome: out}
+}
+
+// restorePreState writes the pre-state ceiling back and returns the MEASURED
+// (value, enable) that followed. ok=false when a restoring write errored or
+// its result could not be read: an unproven restoration is not a
+// compensation, it is one more unverified write, and the plan freezes and
+// declares instead of claiming one.
+func (p *m123LimitPlan) restorePreState() (uint16, uint16, bool) {
+	if err := p.write(sunspec.M123_WMaxLimPct, p.val0); err != nil {
+		return 0, 0, false
+	}
+	if err := p.write(sunspec.M123_WMaxLimPct_Ena, p.ena0); err != nil {
+		return 0, 0, false
+	}
+	regs, ok := p.readGroup()
+	if !ok {
+		return 0, 0, false
+	}
+	return regs[sunspec.M123_WMaxLimPct], regs[sunspec.M123_WMaxLimPct_Ena], true
 }
 
 func ReadWMax(r *sunspec.Reader) (float64, error) {

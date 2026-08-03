@@ -25,12 +25,19 @@ import (
 //   - ErrAdoptTimeout / ErrVerifyFailed → the device did not positively
 //     confirm an actuation. Absence of failure evidence is NOT success
 //     (LXR-006); the caller must treat the function as not-adopted.
+//   - ErrPartialActuation → a multi-register actuation stopped part-way and
+//     the device was MEASURED in neither the state it started in nor the one
+//     it was commanded into (LXR-012). Distinct from every class above
+//     because the device is now in a state nobody asked for: the control
+//     cannot be reported as started, retrying is not obviously safe, and the
+//     site must reserve the DER's full nameplate until it is proven again.
 var (
 	ErrUnsupportedControl = errors.New("unsupported control")
 	ErrInvalidControl     = errors.New("invalid control")
 	ErrMalformedDevice    = errors.New("malformed device")
 	ErrAdoptTimeout       = errors.New("curve adoption timed out without confirmation")
 	ErrVerifyFailed       = errors.New("actuation read-back verification failed")
+	ErrPartialActuation   = errors.New("partial actuation: device left in a mixed state")
 )
 
 // UnsupportedControlError reports a requested control axis the device cannot
@@ -108,3 +115,33 @@ func (e *VerifyError) Error() string {
 	return fmt.Sprintf("%s: model %d %s read-back verification failed: %s", e.Tag, e.Model, e.Point, e.Detail)
 }
 func (e *VerifyError) Unwrap() error { return ErrVerifyFailed }
+
+// PartialActuationError reports an actuation plan that left the device in a
+// MEASURED mixed state — neither the pre-state nor the commanded state (see
+// plan.go). Outcome carries the per-element verdict, including which elements
+// are Unverified rather than Failed, so the caller escalates on evidence
+// rather than on a guess.
+//
+// Compensated says whether the plan managed to move the device to a
+// compensating state that is no less restrictive than the one it found
+// (§5(b)). It is NOT a success flag: the commanded control did not happen
+// either way, and both values require the same escalation. It tells the
+// caller whether the device is in a KNOWN state (Compensated: the pre-state,
+// re-proven by read-back) or a frozen partial one (not compensated: declared,
+// deliberately untouched, and unsafe to assume anything about).
+type PartialActuationError struct {
+	Tag         string
+	Plan        string
+	Outcome     PlanOutcome
+	Compensated bool
+}
+
+func (e *PartialActuationError) Error() string {
+	what := "frozen and declared"
+	if e.Compensated {
+		what = "compensated to the more restrictive of {pre-state, achieved}"
+	}
+	return fmt.Sprintf("%s: %s actuation left the device in a mixed state (%s): %s",
+		e.Tag, e.Plan, what, e.Outcome)
+}
+func (e *PartialActuationError) Unwrap() error { return ErrPartialActuation }
