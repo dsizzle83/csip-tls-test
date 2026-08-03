@@ -1088,6 +1088,46 @@ func (b *Base) SetExportLimit(ap *model.ActivePower, tag string) error {
 	return b.setLegacyWMaxLimPct(watts(ap), tag)
 }
 
+// ReadLegacyWMaxLimPctW reads back the ACTIVE M123 active-power limit in
+// watts — the exact register pair setLegacyWMaxLimPct writes, so a legacy
+// (704-less) inverter can prove a commanded ceiling the same way a 700-series
+// one does (LXR-012 positive read-back).
+//
+// It exists because the read-back was originally written against 704 only,
+// which silently made every legacy inverter permanently UNVERIFIABLE: no
+// sample could ever be a match, so the reconciler never converged and the
+// CSIP actuation-confirm gate escalated CannotComply on every control. The
+// asymmetry — writing M123 but reading 704 — is the whole bug.
+//
+// ok=false means no limit is proven in force: the enable bit is off, the
+// scale factor is unusable, or the nameplate needed for % → W is unknown.
+// Never "the limit is applied".
+func (b *Base) ReadLegacyWMaxLimPctW(tag string) (float64, bool, error) {
+	if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
+		return 0, false, nil
+	}
+	regs, err := b.Reader.ReadModel(sunspec.ModelImmediateCtrl)
+	if err != nil {
+		return 0, false, fmt.Errorf("%s: read Model 123: %w", tag, err)
+	}
+	if len(regs) <= sunspec.M123_WMaxLimPct_SF {
+		return 0, false, &MalformedDeviceError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
+			Declared: len(regs), Required: sunspec.M123_WMaxLimPct_SF + 1, Detail: "too short for WMaxLimPct_SF"}
+	}
+	if regs[sunspec.M123_WMaxLimPct_Ena] != 1 {
+		return 0, false, nil // no limit engaged on the device
+	}
+	sf := int16(regs[sunspec.M123_WMaxLimPct_SF])
+	pct := sunspec.ApplyScaleUint(regs[sunspec.M123_WMaxLimPct], sf)
+	if math.IsNaN(pct) || math.IsInf(pct, 0) {
+		return 0, false, nil // unusable scale factor or sentinel
+	}
+	if math.IsNaN(b.Wmax) || b.Wmax <= 0 {
+		return 0, false, nil // cannot convert % → W without a nameplate
+	}
+	return pct / 100.0 * b.Wmax, true, nil
+}
+
 // setLegacyWMaxLimPct writes M123 WMaxLimPct. Negative w commands charge
 // (battery sim convention); positive w limits export.
 func (b *Base) setLegacyWMaxLimPct(w float64, tag string) error {
