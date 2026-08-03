@@ -86,6 +86,31 @@ func (e *MalformedDeviceError) Error() string {
 }
 func (e *MalformedDeviceError) Unwrap() error { return ErrMalformedDevice }
 
+// CorruptReadError reports a block that came back with the shape of a failed
+// or partial read (sentinel saturation, an illegal scale factor) and was
+// therefore NOT written back — the read-modify-write refusals in write704,
+// SetEnterService and the M123 limit plan (audit E2).
+//
+// It is a MalformedDeviceError sibling on purpose: ErrMalformedDevice is
+// already documented as "the device's own SunSpec surface is corrupt or
+// hostile", and a caller classifying device health wants both in that bucket.
+// It has its own type because the refusal carries a fact the length-based
+// MalformedDeviceError does not: NOTHING WAS WRITTEN. The gate fires on the
+// read, ahead of every write, so the device is exactly where it was — which is
+// what lets a plan of plans record the axis as NotAttempted instead of
+// Unverified (see axisElementState).
+type CorruptReadError struct {
+	Tag    string
+	Model  uint16
+	Detail string
+}
+
+func (e *CorruptReadError) Error() string {
+	return fmt.Sprintf("%s: refusing to write M%d — %s; not programming garbage back to the device",
+		e.Tag, e.Model, e.Detail)
+}
+func (e *CorruptReadError) Unwrap() error { return ErrMalformedDevice }
+
 // AdoptTimeoutError reports a curve-adoption handshake in which the device
 // never drove AdptCrvRslt/AdptCtlRslt to COMPLETED within the poll window.
 // This is a FAILURE: the pre-LXR-006 code treated it as best-effort success

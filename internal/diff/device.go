@@ -81,7 +81,35 @@ type DeviceSpec struct {
 	// and the shape in which a percent-of-rated command has no resolvable
 	// base.
 	Omit702 bool
+
+	// CtrlModes is the 702 CtrlModes bitfield the device declares.
+	//
+	// Added for lexa-proto e05dacc (2026-08-03 audit finding 4): ApplyControl
+	// is now deny-by-default — an axis is permitted ONLY by a positive
+	// CtrlModes bit, so the Go zero value here is an explicit "this device
+	// supports nothing" declaration (CapClear on every mode), not a wildcard.
+	// Before e05dacc, a zero/absent CtrlModes fell back to permitting
+	// everything, which is exactly the laundering bug the audit closed — this
+	// package's own ctl catalogue used to reach the product's control-
+	// semantics code on the strength of that bug. Bench702 declares a
+	// realistic bitfield covering every mode the catalogue commands so its
+	// disagreements are still about CONTROL SEMANTICS (the thing this family
+	// exists to probe), not about capability gating, which has its own gate
+	// (Omit702 / NameplateAbsent already covers the CapAbsent probe).
+	CtrlModes uint32
 }
+
+// benchCtrlModes is the CtrlModes bitfield Bench702 (and everything derived
+// from it) declares: every mode this package's ctl catalogue commands, the
+// same shape lexa-proto's own derbase fixtures declare (declare702 in
+// derbase_csip_test.go) for the identical reason — deny-by-default means an
+// undeclared bit is indistinguishable from a device that refuses the mode.
+const benchCtrlModes = sunspec.M702_CtrlMode_MaxW | sunspec.M702_CtrlMode_FixedW |
+	sunspec.M702_CtrlMode_FixedVar | sunspec.M702_CtrlMode_FixedPF |
+	sunspec.M702_CtrlMode_VoltVar | sunspec.M702_CtrlMode_VoltWatt |
+	sunspec.M702_CtrlMode_FreqWatt | sunspec.M702_CtrlMode_WattVar |
+	sunspec.M702_CtrlMode_LVTrip | sunspec.M702_CtrlMode_HVTrip |
+	sunspec.M702_CtrlMode_LFTrip | sunspec.M702_CtrlMode_HFTrip
 
 // Bench702 is an ordinary, reactive-capable inverter: 60 kW active, 26.4 kvar
 // each way, the proportions sim/southbound's advanced solar server serves. It is
@@ -99,6 +127,7 @@ func Bench702() DeviceSpec {
 		VarMaxAbs:    26_400,
 		WSF:          1, VASF: 1, VarSF: 1, PctSF: -2, PFSF: -2, VSF: -1, ASF: -1, SSF: -4,
 		WNow: 42_000, VANow: 42_100, VarNow: 2_000, PFNow: 0.997, HzNow: 60, VNow: 240,
+		CtrlModes: benchCtrlModes,
 	}
 }
 
@@ -255,6 +284,18 @@ func (d *Device) fill702(regs []uint16) {
 	setOrLeave(v, "VarMaxInj", d.Spec.VarMaxInj)
 	setOrLeave(v, "VarMaxAbs", d.Spec.VarMaxAbs)
 	v.SetFloat("VNom", 240)
+	v.SetU32("CtrlModes", d.Spec.CtrlModes)
+	// WChaRteMaxRtg/WDisChaRteMaxRtg are left at the not-implemented sentinel
+	// rather than the Go zero value: this package models no battery
+	// charge/discharge-rate rating at all (no DeviceSpec field feeds them),
+	// and since lexa-proto e05dacc a raw zero there is no longer "no bound" —
+	// it is the device positively declaring a rated maximum of 0 W, which
+	// DENIES opModFixedW outright (maxRatingBound in derbase/capability.go).
+	// Sentinel is the honest "this fixture doesn't model that axis", and it
+	// is what keeps opModFixedW's only bound the ±WMax clamp the ctl
+	// catalogue's DIFF-CTL-040 (200 kW on a 60 kW device) exists to probe.
+	setNotImpl16(regs, sunspec.L702, "WChaRteMaxRtg")
+	setNotImpl16(regs, sunspec.L702, "WDisChaRteMaxRtg")
 }
 
 func (d *Device) fill704(regs []uint16) {
@@ -290,6 +331,15 @@ func setSFRaw(regs []uint16, l *sunspec.Layout, name string, raw uint16) {
 	if o >= 0 && o < len(regs) {
 		regs[o] = raw
 	}
+}
+
+// setNotImpl16 publishes the Tuint16 not-implemented sentinel (0xFFFF) at a
+// point, distinct from leaving it at the Go zero value: a raw 0 is an
+// IMPLEMENTED declaration of literal zero (which e05dacc's maxRatingBound
+// reads as "the device positively cannot do this axis" for a rated maximum),
+// while 0xFFFF is the device saying it does not publish this point at all.
+func setNotImpl16(regs []uint16, l *sunspec.Layout, name string) {
+	setSFRaw(regs, l, name, 0xFFFF)
 }
 
 // RefuseWriteAt makes every write overlapping [lo,hi] answer a Modbus

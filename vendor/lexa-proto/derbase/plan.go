@@ -121,6 +121,13 @@ func (s ElementState) String() string {
 // only landed on the plan's one bounded re-attempt). Err carries the write
 // error, which is diagnostic only: State is measured, so an element can carry
 // a non-nil Err and still be Applied — that is the point.
+//
+// Sub is the element's OWN plan outcome when the element is itself a plan —
+// the case a plan of plans produces (ApplyControlPlan's per-axis elements,
+// where the M123 limit and connect axes each run a full measuring plan). It is
+// nil for a leaf element and for an axis whose writer does not measure, and a
+// consumer must read the nil as "this level holds no measurement", never as
+// "nothing happened".
 type ElementOutcome struct {
 	Name     string
 	Model    uint16
@@ -129,6 +136,7 @@ type ElementOutcome struct {
 	After    float64
 	Advisory string
 	Err      error
+	Sub      *PlanOutcome
 }
 
 // PlanOutcome is the whole-plan verdict.
@@ -211,6 +219,40 @@ func firstElementErr(o PlanOutcome) error {
 		}
 	}
 	return nil
+}
+
+// worstElementState collapses a plan's element states into the single verdict
+// an ENCLOSING plan should record for it (a plan of plans — see
+// ApplyControlPlan). The order is by how much the state constrains what the
+// caller may conclude, worst first: a measured contradiction (Failed) outranks
+// an unreadable post-state (Unverified), which outranks an element the plan
+// never got to (NotAttempted), which outranks a compensated one, which
+// outranks Applied. An empty plan measured nothing, so it reports
+// NotAttempted rather than a vacuous Applied.
+func worstElementState(o PlanOutcome) ElementState {
+	if len(o.Elements) == 0 {
+		return ElementNotAttempted
+	}
+	worst := ElementApplied
+	rank := func(s ElementState) int {
+		switch s {
+		case ElementFailed:
+			return 4
+		case ElementUnverified:
+			return 3
+		case ElementNotAttempted:
+			return 2
+		case ElementCompensated:
+			return 1
+		}
+		return 0 // ElementApplied
+	}
+	for _, e := range o.Elements {
+		if rank(e.State) > rank(worst) {
+			worst = e.State
+		}
+	}
+	return worst
 }
 
 // ── The never-less-restrictive ordering ──────────────────────────────────────

@@ -286,12 +286,35 @@ func (v View) Bool(name string) bool {
 	return ok && val == 1
 }
 
+// Bitfield32 reads a bitfield32 point, collapsing "absent" and "not
+// implemented" onto the EMPTY bitfield.
+//
+// That collapse is correct for a STATUS bitfield — a device that does not
+// implement its alarm word is raising no alarms — and it is a laundering
+// hazard for a CAPABILITY one, because a caller that reads an empty capability
+// word as "the device stated no restrictions" has turned an explicit NOT
+// IMPLEMENTED into permission for everything (2026-08-03 audit finding 4).
+// Any bitfield that GRANTS something must be read through Bitfield32OK, which
+// keeps the three states apart.
 func (v View) Bitfield32(name string) uint32 {
+	val, _ := v.Bitfield32OK(name)
+	return val
+}
+
+// Bitfield32OK reads a bitfield32 point and reports whether the device
+// IMPLEMENTS it: ok=false when the point is absent from the block or carries
+// the bitfield32 not-implemented sentinel (0xFFFFFFFF).
+//
+// This is the deny-by-default reader. It exists so a capability consumer can
+// tell the three states apart — implemented-and-set, implemented-and-clear,
+// and absent/not-implemented — instead of receiving the same zero for the last
+// two and having to guess which one it holds.
+func (v View) Bitfield32OK(name string) (uint32, bool) {
 	o, f, ok := v.fieldOff(name)
 	if !ok || !v.Present(name) || v.notImpl(o, f) {
-		return 0
+		return 0, false
 	}
-	return v.rawU32(o)
+	return v.rawU32(o), true
 }
 
 func (v View) U32(name string) (uint32, bool) {

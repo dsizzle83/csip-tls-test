@@ -27,6 +27,7 @@
 package derbase
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -68,9 +69,13 @@ type Base struct {
 	// individual fields are NaN when the device leaves them unimplemented.
 	Cap    sunspec.Capacity
 	HasCap bool
-	// CtrlModes is the raw 702 "supported control mode functions" bitfield.
-	// Zero when unimplemented, sentinel, or genuinely declared empty — see
-	// supportsCtrlMode for how (and how much) it is trusted.
+	// CtrlModes is the RAW 702 "supported control mode functions" bitfield,
+	// sentinel preserved: CtrlModesNotImplemented when the device leaves the
+	// point unimplemented or truncates the block before it, and the declared
+	// bitfield (possibly empty) otherwise. The sentinel is kept rather than
+	// laundered to zero precisely so "not implemented" and "implemented and
+	// empty" stay distinguishable — see capability.go for the three-state
+	// deny-by-default rule and CtrlModeClaim for the query.
 	CtrlModes uint32
 
 	Has701, Has702, Has703, Has704, Has705, Has706 bool
@@ -170,7 +175,15 @@ func Init(r *sunspec.Reader, tag string) (Base, error) {
 		}
 		b.Cap = sunspec.Parse702(regs)
 		b.HasCap = true
-		b.CtrlModes = sunspec.L702.View(regs).Bitfield32("CtrlModes")
+		// Bitfield32OK, not Bitfield32: the plain reader collapses "device says
+		// NOT IMPLEMENTED" onto the empty bitfield, and the empty bitfield used
+		// to mean "permit everything". Keep the sentinel so the capability gate
+		// can tell the two apart (audit finding 4).
+		if raw, ok := sunspec.L702.View(regs).Bitfield32OK("CtrlModes"); ok {
+			b.CtrlModes = raw
+		} else {
+			b.CtrlModes = CtrlModesNotImplemented
+		}
 		if b.Cap.WMaxRtg > 0 && !math.IsInf(b.Cap.WMaxRtg, 0) {
 			b.Wmax = b.Cap.WMaxRtg
 		}
@@ -180,22 +193,6 @@ func Init(r *sunspec.Reader, tag string) (Base, error) {
 		}
 	}
 	return b, nil
-}
-
-// supportsCtrlMode reports whether the device's declared 702 CtrlModes
-// bitfield permits the given control-mode bit (sunspec.M702_CtrlMode_*).
-//
-// Trust model (LXR-005): a NONZERO declaration is enforced exactly — a device
-// that says "I support fixed-PF and volt-var" does not get sent fixed-var.
-// A zero or unimplemented CtrlModes carries no information (real firmware,
-// including the bench DER, ships CtrlModes=0 while executing controls), so it
-// falls back to model-presence gating rather than rejecting everything.
-// Garbage is never treated as permission — only an explicit bit is.
-func (b *Base) supportsCtrlMode(bit uint32) bool {
-	if !b.HasCap || b.CtrlModes == 0 {
-		return true
-	}
-	return b.CtrlModes&bit != 0
 }
 
 // ── Measurements ─────────────────────────────────────────────────────────────
@@ -383,8 +380,8 @@ func wattsChecked(ap *model.ActivePower, axis string) (float64, error) {
 // behavior of silently skipping an axis (`!= nil && b.Has704`) meant a head
 // end could be told Started for a control the device never saw.
 //
-// ApplyControl is a plan of plans, and runs the same two phases every plan in
-// this package runs (see plan.go) — for reasons the audit did not name:
+// ApplyControl is a plan of plans, and runs the same three phases every plan
+// in this package runs (see plan.go) — for reasons the audit did not name:
 //
 //  1. PREFLIGHT EVERY PRESENT AXIS BEFORE WRITING ANY. The pre-LXR-012 code
 //     validated each axis only as it reached it, so a request whose SECOND
@@ -404,31 +401,221 @@ func wattsChecked(ap *model.ActivePower, axis string) (float64, error) {
 //     least as restrictive as both the state before the request and the state
 //     after it.
 //
+//  3. CLASSIFY THE DOCUMENT, not just the axis that broke. See
+//     ApplyControlPlan.
+//
 // This CHANGES THE ORDER OF WRITES for every existing consumer. That is the
 // intended fix, not a side effect.
+//
+// ApplyControl keeps the error-only signature for callers that have nothing to
+// do with the per-axis detail; ApplyControlPlan is the same actuation with the
+// document-level outcome attached, the same way SetConnect wraps
+// SetConnectPlan.
 func (b *Base) ApplyControl(ctrl model.DERControlBase, tag string) error {
+	_, err := b.ApplyControlPlan(ctrl, tag)
+	return err
+}
+
+// PlanApplyControl names the document-level plan in PlanOutcome,
+// PartialActuationError and (upstream) journal entries and metric labels.
+// Element names are the CSIP DERControlBase axis names.
+const PlanApplyControl = "apply-control"
+
+// ApplyControlPlan executes a CSIP control document and returns the
+// DOCUMENT-LEVEL outcome (2026-08-03 audit finding 3, the proto half).
+//
+// ── What was wrong ───────────────────────────────────────────────────────────
+//
+// The pre-fix loop returned on the first runtime error. A two-axis document
+// whose second axis failed came back as that axis's bare transport error, with
+// the first axis silently applied and nothing in the return value saying so.
+// The caller could not tell "nothing happened" from "half of it happened", and
+// a fixed-PF write landing while the fixed-var write that was supposed to
+// accompany it failed is a device operating under half a command — which
+// upstream is either a false Started or an escalation with no evidence
+// attached.
+//
+// ── The outcome ──────────────────────────────────────────────────────────────
+//
+// One ElementOutcome per axis, in EXECUTION order, each carrying the axis's
+// measured disposition (Applied / Unverified / Failed / NotAttempted) and, for
+// the axes that run a measuring plan of their own, that plan's whole
+// PlanOutcome in Sub. Element Before/After stay NaN at this level: the
+// document does not measure registers, its axes do, and inventing a
+// document-level engineering value would be exactly the kind of fabrication
+// plan.go's load-bearing rule forbids.
+//
+// Mixed is computed ACROSS the document: some axes measured applied and at
+// least one not, i.e. the device is in neither the state the document found it
+// in nor the state it was commanded into. That is the verdict a caller must
+// escalate. A single-axis document that fails is not mixed — nothing else
+// landed — and returns the axis's own error unchanged, so existing callers see
+// no new error class where there was no new situation.
+//
+// LessRestrictiveThanIntended is set when any RESTRICTIVE-side axis (rank
+// restrict or limit — cease, disconnect, ceilings, setpoints) did not reach
+// Applied, plus whatever any sub-plan reported. Release-side axes are
+// deliberately excluded: which brings us to the direction of a partial
+// document.
+//
+// ── Why the tail is the safe half ────────────────────────────────────────────
+//
+// Because execution is restrictive-first, the axes remaining after a
+// mid-document failure are always the LESS restrictive ones. A document that
+// dies half-way therefore leaves the device with the restrictive axes applied
+// and the releasing axes not: cease/disconnect and ceilings landed, connect-on
+// and energize-on did not. The device ends up held back MORE than the control
+// asked for, never less. That is the fail-safe direction, and it is why
+// freezing — declining to execute the tail — is a legitimate compensating
+// action at document level rather than an abdication.
+//
+// ── Compensation (§5, adopted D1, applied to the document) ───────────────────
+//
+//	(a) ONE bounded re-attempt of the failing axis, once per document. Like
+//	    the per-plan rule this COMPLETES the operator's own command and is not
+//	    a compensating move, so it is allowed even on a releasing axis. Once
+//	    per document, not once per axis: a device that needed a retry on axis
+//	    one and then failed on axis two is not a device to keep writing to.
+//	(b) NEVER WRITE TOWARD LESS RESTRICTIVE. At document level the compensating
+//	    action is therefore not a write at all — it is declining to execute the
+//	    releasing tail, which leaves the device on the safe side of the
+//	    command. The untouched axes are reported NotAttempted.
+//	    Otherwise: freeze and declare, with a typed PartialActuationError
+//	    carrying the whole PlanOutcome.
+//
+// Preflight is unchanged: any preflight failure returns before a single
+// register moves, and the returned PlanOutcome carries no elements because
+// there is nothing to report about a document that was never executed.
+func (b *Base) ApplyControlPlan(ctrl model.DERControlBase, tag string) (PlanOutcome, error) {
+	out := PlanOutcome{Tag: tag, Plan: PlanApplyControl}
 	steps, err := b.preflightControl(ctrl, tag)
 	if err != nil {
-		return err // whole-request rejection: nothing has been written
+		return out, err // whole-request rejection: nothing has been written
 	}
+
+	// Materialize the execution order once so the outcome's element order IS
+	// the write order — a reader of the outcome must not have to re-derive it.
+	ordered := make([]applyStep, 0, len(steps))
 	for _, rank := range []int{rankRestrict, rankLimit, rankRelease} {
 		for _, s := range steps {
-			if s.rank != rank {
-				continue
-			}
-			if err := s.run(); err != nil {
-				return err
+			if s.rank == rank {
+				ordered = append(ordered, s)
 			}
 		}
 	}
-	return nil
+	out.Elements = make([]ElementOutcome, len(ordered))
+	for i, s := range ordered {
+		out.Elements[i] = ElementOutcome{Name: s.axis, Model: s.model,
+			State: ElementNotAttempted, Before: math.NaN(), After: math.NaN()}
+	}
+
+	var runErr error
+	retried := false
+	for i, s := range ordered {
+		sub, err := s.run()
+		// §5(a): one bounded re-attempt, per document, and ONLY for an axis
+		// that does not run a measuring plan of its own. An axis that does
+		// (sub != nil) has already spent its one bounded re-attempt inside
+		// that plan, and re-running it would do worse than double the budget:
+		// the plan re-snapshots the pre-state on entry, so a second run would
+		// re-baseline onto the half-actuated state the first run left and
+		// report the mixed state it just measured as a clean failure. The
+		// evidence would be destroyed by the attempt to improve on it.
+		if err != nil && sub == nil && !retried {
+			retried = true
+			sub2, err2 := s.run()
+			sub, err = sub2, err2
+			if err == nil {
+				out.Elements[i].Advisory = "adopted on the document's one bounded re-attempt"
+			} else {
+				out.Elements[i].Advisory = "the document's one bounded re-attempt also failed"
+			}
+		}
+		out.Elements[i].Sub = sub
+		if err == nil {
+			out.Elements[i].State = ElementApplied
+			if sub != nil && sub.Degraded() && out.Elements[i].Advisory == "" {
+				out.Elements[i].Advisory = "axis plan applied-degraded: " + sub.String()
+			}
+			continue
+		}
+		out.Elements[i].State = axisElementState(sub, err)
+		out.Elements[i].Err = err
+		runErr = err
+		break // freeze: every remaining axis stays NotAttempted, which is the
+		// less-restrictive tail, which is the direction we want to skip.
+	}
+
+	applied, unapplied := 0, 0
+	for i, s := range ordered {
+		if out.Elements[i].State == ElementApplied {
+			applied++
+		} else {
+			unapplied++
+			// Restrictive-side axes are the ones whose absence LOOSENS the
+			// device relative to the command. A releasing axis that did not
+			// land leaves it tighter, which is never this flag.
+			if s.rank <= rankLimit {
+				out.LessRestrictiveThanIntended = true
+			}
+		}
+		if sub := out.Elements[i].Sub; sub != nil {
+			out.Mixed = out.Mixed || sub.Mixed
+			out.LessRestrictiveThanIntended = out.LessRestrictiveThanIntended || sub.LessRestrictiveThanIntended
+		}
+	}
+	if runErr == nil {
+		return out, nil
+	}
+	// The document is MIXED only when it actually left the device between two
+	// states. A document whose FIRST axis failed carries the axis's own error
+	// (which may already be a typed PartialActuationError from that axis's own
+	// plan) rather than being re-wrapped into a document-level one.
+	if applied > 0 && unapplied > 0 {
+		out.Mixed = true
+		return out, &PartialActuationError{Tag: tag, Plan: PlanApplyControl, Outcome: out}
+	}
+	return out, runErr
+}
+
+// axisElementState turns one axis's runtime failure into a MEASURED element
+// state, on the same evidence rule as plan.go.
+//
+// An axis that ran a measuring plan carries that plan's own verdict — the
+// document does not second-guess a measurement with an inference. An axis with
+// no plan of its own is read from the error CLASS, and only from the classes
+// that are load-bearing: the deterministic pre-write refusals (missing model,
+// out-of-domain request, short/corrupt block — all of which fire on the READ,
+// before any register moves) are NotAttempted, and everything else is
+// Unverified, never Failed. That last part is the rule doing work: a transport
+// error on a write may still have LANDED, and an axis with no read-back does
+// not know which happened. Unverified is unproven in both directions, which is
+// the truth here; Failed would be a definite verdict the document does not
+// hold.
+func axisElementState(sub *PlanOutcome, err error) ElementState {
+	if err == nil {
+		return ElementApplied
+	}
+	if sub != nil {
+		return worstElementState(*sub)
+	}
+	switch {
+	case errors.Is(err, ErrUnsupportedControl), errors.Is(err, ErrInvalidControl),
+		errors.Is(err, ErrMalformedDevice):
+		return ElementNotAttempted
+	}
+	return ElementUnverified
 }
 
 // applyStep is one preflighted control axis: fully validated, not yet written.
 type applyStep struct {
-	axis string
-	rank int
-	run  func() error
+	axis  string
+	model uint16 // SunSpec model the axis writes, for the outcome's element
+	rank  int
+	// run executes the axis, returning the axis's OWN measuring plan outcome
+	// when it has one (the M123 plans) and nil when it does not. The document
+	// never invents a measured verdict it does not hold.
+	run func() (*PlanOutcome, error)
 }
 
 // Execution ranks, applied in ascending order. A step's rank is decided by
@@ -450,10 +637,24 @@ const (
 // read-modify-write block, a model that got shorter since discovery — still
 // surface at execution time on the axis that hits them; restrictive-first
 // ordering is what bounds the damage when they do.
+//
+// Capability gating here is DENY BY DEFAULT: every 7xx axis needs a positive
+// 702 CtrlModes bit, and the legacy M123 pathway is reached only through the
+// measured legacy shape. capability.go states both rules in full.
 func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyStep, error) {
 	var steps []applyStep
-	add := func(axis string, rank int, run func() error) {
-		steps = append(steps, applyStep{axis: axis, rank: rank, run: run})
+	add := func(axis string, modelID uint16, rank int, run func() error) {
+		steps = append(steps, applyStep{axis: axis, model: modelID, rank: rank,
+			run: func() (*PlanOutcome, error) { return nil, run() }})
+	}
+	// addPlan registers an axis whose writer is a measuring plan, so the
+	// document element can carry that plan's own verdict instead of a guess.
+	addPlan := func(axis string, modelID uint16, rank int, run func() (PlanOutcome, error)) {
+		steps = append(steps, applyStep{axis: axis, model: modelID, rank: rank,
+			run: func() (*PlanOutcome, error) {
+				o, err := run()
+				return &o, err
+			}})
 	}
 	// releaseRank ranks a two-state axis: restricting the DER goes first,
 	// releasing it goes last.
@@ -465,71 +666,77 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 	}
 
 	if ctrl.OpModEnergize != nil {
+		// Model presence only: 702 CtrlModes has no enter-service bit, so
+		// there is no positive claim a device could make (capability.go).
 		if !b.Has703 {
 			return nil, &UnsupportedControlError{Axis: "opModEnergize", Reason: "device has no M703 (DEREnterService)"}
 		}
 		energize := *ctrl.OpModEnergize
-		add("opModEnergize", releaseRank(energize), func() error {
+		add("opModEnergize", sunspec.ModelDEREnterService, releaseRank(energize), func() error {
 			return b.SetEnterServiceEnabled(energize, tag)
 		})
 	}
 	if ctrl.OpModConnect != nil {
+		// Model presence only, for the same reason as opModEnergize: CtrlModes
+		// has no connect bit. This is the legacy allowlist's connect half —
+		// available to a legacy device with no 702 to claim anything with, and
+		// equally available to a modern one, because there is no claim to make.
 		if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
 			return nil, &UnsupportedControlError{Axis: "opModConnect", Reason: "device has no M123 (immediate controls)"}
 		}
 		connect := *ctrl.OpModConnect
-		add("opModConnect", releaseRank(connect), func() error {
-			return b.SetConnect(connect, tag)
+		addPlan("opModConnect", sunspec.ModelImmediateCtrl, releaseRank(connect), func() (PlanOutcome, error) {
+			return b.SetConnectPlan(connect, tag)
 		})
 	}
 	if ctrl.OpModFixedPFInjectW != nil {
 		if !b.Has704 {
 			return nil, &UnsupportedControlError{Axis: "opModFixedPFInjectW", Reason: "device has no M704 (DERCtlAC)"}
 		}
-		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedPF) {
-			return nil, &UnsupportedControlError{Axis: "opModFixedPFInjectW", Reason: "device CtrlModes does not declare FIXED_PF"}
+		if err := b.requireCtrlMode("opModFixedPFInjectW", sunspec.M702_CtrlMode_FixedPF, "FIXED_PF"); err != nil {
+			return nil, err
 		}
 		pf := math.Abs(float64(ctrl.OpModFixedPFInjectW.Value)) / 10000.0
 		if err := b.validatePF(pf, "opModFixedPFInjectW"); err != nil {
 			return nil, err
 		}
 		over := ctrl.OpModFixedPFInjectW.Value >= 0
-		add("opModFixedPFInjectW", rankLimit, func() error { return b.SetFixedPF(true, pf, over, tag) })
+		add("opModFixedPFInjectW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetFixedPF(true, pf, over, tag) })
 	}
 	if ctrl.OpModFixedPFAbsorbW != nil {
 		if !b.Has704 {
 			return nil, &UnsupportedControlError{Axis: "opModFixedPFAbsorbW", Reason: "device has no M704 (DERCtlAC)"}
 		}
-		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedPF) {
-			return nil, &UnsupportedControlError{Axis: "opModFixedPFAbsorbW", Reason: "device CtrlModes does not declare FIXED_PF"}
+		if err := b.requireCtrlMode("opModFixedPFAbsorbW", sunspec.M702_CtrlMode_FixedPF, "FIXED_PF"); err != nil {
+			return nil, err
 		}
 		pf := math.Abs(float64(ctrl.OpModFixedPFAbsorbW.Value)) / 10000.0
 		if err := b.validatePF(pf, "opModFixedPFAbsorbW"); err != nil {
 			return nil, err
 		}
 		over := ctrl.OpModFixedPFAbsorbW.Value >= 0
-		add("opModFixedPFAbsorbW", rankLimit, func() error { return b.SetFixedPF(false, pf, over, tag) })
+		add("opModFixedPFAbsorbW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetFixedPF(false, pf, over, tag) })
 	}
 	if ctrl.OpModFixedVar != nil {
 		if !b.Has704 {
 			return nil, &UnsupportedControlError{Axis: "opModFixedVar", Reason: "device has no M704 (DERCtlAC)"}
 		}
-		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedVar) {
-			return nil, &UnsupportedControlError{Axis: "opModFixedVar", Reason: "device CtrlModes does not declare FIXED_VAR"}
+		if err := b.requireCtrlMode("opModFixedVar", sunspec.M702_CtrlMode_FixedVar, "FIXED_VAR"); err != nil {
+			return nil, err
 		}
 		pct := float64(ctrl.OpModFixedVar.Value.Value) / 100.0
 		if math.IsNaN(pct) || pct < -100 || pct > 100 {
 			return nil, &InvalidControlError{Axis: "opModFixedVar",
 				Reason: fmt.Sprintf("reactive setpoint %.2f%% outside [-100,100] of VarMax", pct)}
 		}
-		add("opModFixedVar", rankLimit, func() error { return b.SetConstantVar(pct, tag) })
+		add("opModFixedVar", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetConstantVar(pct, tag) })
 	}
 	if ctrl.OpModFixedW != nil {
 		if !b.Has704 {
 			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
 		}
-		if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedW) {
-			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device CtrlModes does not declare FIXED_W"}
+		if err := b.requireCtrlMode("opModFixedW", sunspec.M702_CtrlMode_FixedW, "FIXED_W"); err != nil {
+			return nil, err
 		}
 		w, err := wattsChecked(ctrl.OpModFixedW, "opModFixedW")
 		if err != nil {
@@ -538,7 +745,7 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.validateSetpointW(w, "opModFixedW"); err != nil {
 			return nil, err
 		}
-		add("opModFixedW", rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
+		add("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
 	}
 
 	// Ceilings → WMaxLimPct (% of WMax). First non-nil wins.
@@ -559,16 +766,28 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.requireWmax(tag); err != nil {
 			return nil, err
 		}
-		if b.Has704 {
-			if !b.supportsCtrlMode(sunspec.M702_CtrlMode_MaxW) {
-				return nil, &UnsupportedControlError{Axis: axis, Reason: "device CtrlModes does not declare MAX_W"}
+		switch {
+		case b.Has704:
+			if err := b.requireCtrlMode(axis, sunspec.M702_CtrlMode_MaxW, "MAX_W"); err != nil {
+				return nil, err
 			}
-			add(axis, rankLimit, func() error { return b.SetWMaxLimPctW(w, tag) })
-		} else {
-			if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
-				return nil, &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for power limiting"}
+			add(axis, sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetWMaxLimPctW(w, tag) })
+		case b.Reader.HasModel(sunspec.ModelImmediateCtrl):
+			// LEGACY ALLOWLIST (capability.go): the M123 ceiling needs no 702
+			// claim on a device measured to have no 7xx control surface. A
+			// device that DOES publish 702 has reached here without a 704, so
+			// it can make a MAX_W claim and must — the allowlist covers
+			// devices that cannot claim, not devices that did not bother.
+			if !b.LegacyM123Shape() {
+				if err := b.requireCtrlMode(axis, sunspec.M702_CtrlMode_MaxW, "MAX_W"); err != nil {
+					return nil, err
+				}
 			}
-			add(axis, rankLimit, func() error { return b.SetExportLimit(lim, tag) })
+			addPlan(axis, sunspec.ModelImmediateCtrl, rankLimit, func() (PlanOutcome, error) {
+				return b.SetLegacyWMaxLimPctPlan(w, tag)
+			})
+		default:
+			return nil, &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for power limiting"}
 		}
 	}
 
@@ -583,22 +802,30 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if w < 0 {
 			return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative import limit %g W", w)}
 		}
-		if b.Has704 {
-			if !b.supportsCtrlMode(sunspec.M702_CtrlMode_FixedW) {
-				return nil, &UnsupportedControlError{Axis: axis, Reason: "device CtrlModes does not declare FIXED_W (required for charge setpoint)"}
+		switch {
+		case b.Has704:
+			if err := b.requireCtrlMode(axis, sunspec.M702_CtrlMode_FixedW, "FIXED_W (required for charge setpoint)"); err != nil {
+				return nil, err
 			}
 			if err := b.validateSetpointW(-w, axis); err != nil {
 				return nil, err
 			}
-			add(axis, rankLimit, func() error { return b.SetActivePowerWatts(-w, tag) })
-		} else {
-			if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
-				return nil, &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for import limiting"}
+			add(axis, sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(-w, tag) })
+		case b.Reader.HasModel(sunspec.ModelImmediateCtrl):
+			// LEGACY ALLOWLIST, import half — same rule as the ceiling above.
+			if !b.LegacyM123Shape() {
+				if err := b.requireCtrlMode(axis, sunspec.M702_CtrlMode_MaxW, "MAX_W"); err != nil {
+					return nil, err
+				}
 			}
 			if err := b.requireWmax(tag); err != nil {
 				return nil, err
 			}
-			add(axis, rankLimit, func() error { return b.SetImportLimit(imp, tag) })
+			addPlan(axis, sunspec.ModelImmediateCtrl, rankLimit, func() (PlanOutcome, error) {
+				return b.SetLegacyWMaxLimPctPlan(-w, tag)
+			})
+		default:
+			return nil, &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for import limiting"}
 		}
 	}
 	return steps, nil
@@ -618,6 +845,12 @@ func (b *Base) requireWmax(tag string) error {
 // validatePF rejects a power-factor request outside the physically meaningful
 // [0,1] domain, or below the device's own declared minimum rated PF (702
 // PFOvrExtRtg/PFUndExtRtg) when the device implements those ratings.
+//
+// The rated-PF guard used to read `minRated > 0 && minRated <= 1`, which
+// silently DROPPED the bound for every implemented rating outside that
+// window — a device declaring a rated PF of 1.5, or of 0, had its own claim
+// discarded and got commanded to any PF at all. An implemented claim that
+// cannot be true is not a bound to relax; see ratingBound in capability.go.
 func (b *Base) validatePF(pf float64, axis string) error {
 	if math.IsNaN(pf) || pf < 0 || pf > 1 {
 		return &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("power factor %g outside [0,1]", pf)}
@@ -625,16 +858,22 @@ func (b *Base) validatePF(pf float64, axis string) error {
 	if b.HasCap {
 		// The rated PF is the MINIMUM the device supports (e.g. 0.85); a
 		// request below it is outside declared capability (LXR-005).
-		minRated := math.NaN()
+		minRated, point := math.NaN(), ""
 		switch axis {
 		case "opModFixedPFInjectW":
-			minRated = b.Cap.PFOvrExtRtg
+			minRated, point = b.Cap.PFOvrExtRtg, "PFOvrExtRtg"
 		case "opModFixedPFAbsorbW":
-			minRated = b.Cap.PFUndExtRtg
+			minRated, point = b.Cap.PFUndExtRtg, "PFUndExtRtg"
 		}
-		if !math.IsNaN(minRated) && minRated > 0 && minRated <= 1 && pf < minRated {
-			return &UnsupportedControlError{Axis: axis,
-				Reason: fmt.Sprintf("requested PF %.4f below device rated minimum %.4f", pf, minRated)}
+		if point != "" {
+			bound, ok, err := minRatingBound(axis, point, minRated, 1)
+			if err != nil {
+				return err
+			}
+			if ok && pf < bound {
+				return &UnsupportedControlError{Axis: axis,
+					Reason: fmt.Sprintf("requested PF %.4f below device rated minimum %.4f", pf, bound)}
+			}
 		}
 	}
 	return nil
@@ -643,19 +882,35 @@ func (b *Base) validatePF(pf float64, axis string) error {
 // validateSetpointW rejects an active-power setpoint outside the device's
 // declared charge/discharge rate ratings when those ratings are implemented
 // (LXR-005: charge/discharge capability bounds were previously unenforced).
-// Ratings the device leaves unimplemented (NaN) impose no bound here; the
-// ±WMax clamp in SetActivePowerWatts still applies.
+//
+// Ratings the device leaves unimplemented (NaN) impose no bound here — that is
+// honest unknown, and it is no longer load-bearing, because the axis needed a
+// positive CtrlModes bit to reach this function at all. What DID change: the
+// old `r > 0` guard silently dropped the bound for an implemented rating of 0
+// (or any other out-of-domain value), so a device declaring "my maximum charge
+// rate is 0 W" was commanded to charge anyway. An implemented rating of zero
+// is a positive declaration of incapacity, not an absence — see ratingBound.
+//
+// The ±WMax clamp in SetActivePowerWatts still applies on top of this.
 func (b *Base) validateSetpointW(w float64, axis string) error {
 	if !b.HasCap {
 		return nil
 	}
 	if w < 0 { // charge
-		if r := b.Cap.WChaRteMaxRtg; !math.IsNaN(r) && r > 0 && -w > r {
+		r, ok, err := maxRatingBound(axis, "WChaRteMaxRtg", b.Cap.WChaRteMaxRtg)
+		if err != nil {
+			return err
+		}
+		if ok && -w > r {
 			return &UnsupportedControlError{Axis: axis,
 				Reason: fmt.Sprintf("charge setpoint %g W exceeds rated max charge rate %g W", -w, r)}
 		}
 	} else if w > 0 { // discharge/export
-		if r := b.Cap.WDisChaRteMaxRtg; !math.IsNaN(r) && r > 0 && w > r {
+		r, ok, err := maxRatingBound(axis, "WDisChaRteMaxRtg", b.Cap.WDisChaRteMaxRtg)
+		if err != nil {
+			return err
+		}
+		if ok && w > r {
 			return &UnsupportedControlError{Axis: axis,
 				Reason: fmt.Sprintf("discharge setpoint %g W exceeds rated max discharge rate %g W", w, r)}
 		}
@@ -705,7 +960,8 @@ func (b *Base) SetEnterService(s sunspec.EnterService, tag string) error {
 	// Same corrupt-read guard as write704 (audit E2): never write a
 	// sentinel-corrupt read of the enter-service block back to the device.
 	if sunspec.L703.View(regs).ReadLooksCorrupt() {
-		return fmt.Errorf("%s: refusing to write M703 — read block is sentinel-corrupt (partial/failed read)", tag)
+		return &CorruptReadError{Tag: tag, Model: sunspec.ModelDEREnterService,
+			Detail: "read block is sentinel-corrupt (partial/failed read)"}
 	}
 	if err := sunspec.Encode703(regs, s); err != nil {
 		return err
@@ -737,9 +993,21 @@ func (b *Base) ReadEnterService(tag string) (sunspec.EnterService, error) {
 
 // write704 read-modify-writes the whole 704 block after applying fn to its View.
 // Writing the entire model keeps PF sync groups (PF+Ext) atomic per the spec.
+//
+// It is deny-by-default on capability (audit finding 4), for the same reason it
+// re-checks the block length: preflightControl already gates every 7xx axis on
+// a positive 702 claim, but write704 is reachable directly through the exported
+// setters (SetFixedPF, SetConstantVar, SetActivePowerWatts, SetWMaxLimPctW),
+// and a 7xx control register must not be written on a device that never told us
+// it does 7xx controls. The gate here is claim-LEVEL — does the device publish
+// a CtrlModes declaration at all — because this function does not know which
+// axis it is serving; the per-mode bit is preflight's job.
 func (b *Base) write704(tag string, fn func(v sunspec.View)) error {
 	if !b.Has704 {
-		return fmt.Errorf("%s: device has no M704 (DERCtlAC)", tag)
+		return &UnsupportedControlError{Axis: "M704 write", Reason: "device has no M704 (DERCtlAC)"}
+	}
+	if err := b.requireCtrlModesDeclaration("M704 write"); err != nil {
+		return err
 	}
 	regs, err := b.Reader.ReadModel(sunspec.ModelDERCtlAC)
 	if err != nil {
@@ -760,7 +1028,8 @@ func (b *Base) write704(tag string, fn func(v sunspec.View)) error {
 	// enables. A healthy 704 always carries valid scale factors (and never an
 	// out-of-domain one — LXR-004).
 	if sunspec.L704.View(regs).ReadLooksCorrupt() {
-		return fmt.Errorf("%s: refusing to write M704 — read block is sentinel-corrupt (partial/failed read); not programming garbage back to the device", tag)
+		return &CorruptReadError{Tag: tag, Model: sunspec.ModelDERCtlAC,
+			Detail: "read block is sentinel-corrupt (partial/failed read)"}
 	}
 	fn(sunspec.L704.View(regs))
 	return b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs[:sunspec.L704.Len()])
@@ -1534,8 +1803,8 @@ func (b *Base) newM123LimitPlan(w float64, tag string) (*m123LimitPlan, error) {
 	// rejecting it as corruption would refuse to curtail perfectly healthy
 	// hardware. All five is the failed-read shape and nothing else.
 	if m123GroupSentinels(regs) == 5 {
-		return nil, fmt.Errorf("%s: refusing to write M123 — the WMaxLimPct group read back all-sentinel "+
-			"(partial/failed read); not programming garbage back to the device", tag)
+		return nil, &CorruptReadError{Tag: tag, Model: sunspec.ModelImmediateCtrl,
+			Detail: "the WMaxLimPct group read back all-sentinel (partial/failed read)"}
 	}
 	p.sf = int16(regs[sunspec.M123_WMaxLimPct_SF])
 	if !sunspec.ValidSF(p.sf) {
