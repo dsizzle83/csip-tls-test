@@ -765,6 +765,15 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.requireVarBase("opModFixedVar", mod, pct); err != nil {
 			return nil, err
 		}
+		// The base RESOLVES the percentage; it does not make the result a
+		// quantity the machine can produce. %setMaxW takes its percentage of
+		// the ACTIVE nameplate and the result is REACTIVE power, so that second
+		// question is asked separately — and asked HERE, so a var quantity
+		// beyond the reactive rating is a whole-document rejection with zero
+		// writes (LXR-002) rather than a mid-document failure.
+		if err := b.checkVarWithinReactiveCapability("opModFixedVar", mod, pct); err != nil {
+			return nil, err
+		}
 		add("opModFixedVar", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetConstantVar(pct, mod, tag) })
 	}
 	if ctrl.OpModFixedW != nil {
@@ -1255,6 +1264,14 @@ func (b *Base) SetFixedPF(inject bool, pf float64, overExcited bool, tag string)
 // produce them, and accepting an arbitrary enum at an exported boundary is how
 // an unvalidated integer becomes a control mode the device never declared.
 // Requires the device's positive FIXED_VAR claim and a usable base for mod.
+//
+// A resolved var quantity beyond the device's declared REACTIVE capability is
+// refused with a SetpointRangeError, not written and not clamped
+// (checkVarWithinReactiveCapability) — the opModFixedW rule one axis over, and
+// the bound is duplicated in preflightControl for the same reason
+// validateSetpointW duplicates the watt one: checked only here it would be a
+// mid-document failure, checked in both it is a whole-document rejection with
+// zero writes. The two callers share one function so they cannot drift.
 func (b *Base) SetConstantVar(pct float64, mod uint16, tag string) error {
 	switch mod {
 	case sunspec.M704_VarSetMod_WMaxPct, sunspec.M704_VarSetMod_VarMaxPct,
@@ -1266,6 +1283,9 @@ func (b *Base) SetConstantVar(pct float64, mod uint16, tag string) error {
 			sunspec.M704_VarSetMod_VarMaxPct, sunspec.M704_VarSetMod_VarAvailPct)}
 	}
 	if err := b.requireVarBase("SetConstantVar", mod, pct); err != nil {
+		return err
+	}
+	if err := b.checkVarWithinReactiveCapability("SetConstantVar", mod, pct); err != nil {
 		return err
 	}
 	return b.write704(tag, "SetConstantVar", []ctrlMode{modeFixedVar}, func(v sunspec.View) {
