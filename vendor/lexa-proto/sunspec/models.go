@@ -84,7 +84,20 @@ const (
 	M103_VAr_SF  = 19 // reactive power scale factor (int16)
 	M103_PF      = 20 // power factor ×100 (int16, PF_SF)
 	M103_PF_SF   = 21 // power factor scale factor (int16)
-	// WH occupies two registers (uint32) at offsets 22-23
+	// WH is AC lifetime energy production: an acc32 spanning offsets 22-23,
+	// big-endian (high word first), scaled by M103_WH_SF. It is the legacy
+	// model's ONLY accumulator and the only 10x point that can contradict a
+	// frozen power reading (a block claiming 5 kW whose lifetime Wh never
+	// advances is claiming something physically impossible), which is why it is
+	// named here rather than left as the bare "offsets 22-23" comment it was.
+	//
+	// PRESENCE IS DECIDED BY THE SCALE FACTOR, not by the accumulator's own
+	// value. Per the SunSpec type table an acc32 reserves NO not-implemented
+	// sentinel — 0 is a legitimate "has not accumulated anything yet" — so a
+	// device that does not implement WH is recognised by leaving WH_SF at the
+	// int16 sentinel (or outside the legal sunssf domain), exactly the test
+	// View.SF already applies.
+	M103_WH     = 22 // AC lifetime energy production (acc32, regs 22-23, M103_WH_SF) — Wh
 	M103_WH_SF  = 24 // energy scale factor (int16)
 	M103_DCA    = 25 // DC current (int16, DCA_SF)
 	M103_DCA_SF = 26 // DC current scale factor (int16)

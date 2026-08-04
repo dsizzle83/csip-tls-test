@@ -267,7 +267,20 @@ type Measurements struct {
 	// sign convention above): import = energy absorbed (battery charging),
 	// export = energy injected (generating/discharging).
 	WhImpTotal float64 // total energy absorbed (701 TotWhAbs)
-	WhExpTotal float64 // total energy injected (701 TotWhInj)
+	WhExpTotal float64 // total energy injected (701 TotWhInj, or legacy 10x WH)
+
+	// Live is this sample's measurement-liveness digest (liveness.go): a
+	// class-partitioned fingerprint of the raw registers the sample was
+	// decoded from, plus the energy accumulators in the clear.
+	//
+	// It is ADDITIVE and inert on its own. Every existing consumer that
+	// copies, compares or serialises a Measurements keeps working unchanged —
+	// nothing here is a wire value — and a consumer that wants freshness
+	// compares two samples' digests across a window of its own choosing. The
+	// zero value (all digests 0, all *Points 0) is what a Measurements built
+	// by hand carries, and its zero VolatilePoints reads as "no evidence",
+	// which is the correct answer for a synthesised sample.
+	Live Liveness
 }
 
 // ReadMeasurementsM701 parses model 701 into Measurements.
@@ -300,6 +313,7 @@ func ReadMeasurementsM701(regs []uint16) Measurements {
 	if alrm, ok := lv.U32("Alrm"); ok {
 		out.Alrm = &alrm
 	}
+	out.Live = LivenessOfM701(regs)
 	return out
 }
 
@@ -312,9 +326,14 @@ func ReadMeasurementsACModel(regs []uint16) Measurements {
 		return 0
 	}
 	sf := func(off int) int16 { return int16(get(off)) }
-	// Model 10x has no St/InvSt/ConnSt/Alrm or lifetime-Wh points that map
-	// onto the 701 semantics — the state pointers stay nil and the energy
-	// accumulators stay NaN (absent, per the struct doc).
+	// Model 10x has no St/InvSt/ConnSt/Alrm points that map onto the 701
+	// semantics — the state pointers stay nil.
+	//
+	// It DOES have one lifetime energy accumulator (WH, acc32 at offsets
+	// 22-23, scaled by WH_SF at 24), decoded below into WhExpTotal. Only the
+	// EXPORT direction: the legacy model counts AC lifetime production and has
+	// no absorbed-energy counterpart, so WhImpTotal stays NaN — absent, per
+	// the struct doc, never a fabricated zero.
 	//
 	// CRITICAL: model 10x also has no per-phase/line-to-line voltage points
 	// (LLV/VL1L2/VL1/VL2L3/VL2/VL3L1/VL3 are 701-only). These MUST be
@@ -352,6 +371,24 @@ func ReadMeasurementsACModel(regs []uint16) Measurements {
 	if len(regs) > sunspec.M103_Tmp_SF {
 		m.TmpCab = sunspec.ApplyScaleSigned(get(sunspec.M103_TmpCab), sf(sunspec.M103_Tmp_SF))
 	}
+	// ── D-10: the legacy lifetime energy accumulator ─────────────────────────
+	//
+	// WH was the one 10x measurement this decoder threw away, and it is the one
+	// the freshness cross-check most wants: an energy counter is MONOTONE, so
+	// its stillness while the block claims kilowatts is a contradiction rather
+	// than merely an absence of movement (S1). Decoding it here rather than
+	// only inside the digest means the value also reaches the bus, where a
+	// legacy inverter previously published no lifetime energy at all.
+	//
+	// readM103WH decides presence from WH_SF, not from the counter's own
+	// value: an acc32 reserves NO not-implemented sentinel, so a raw 0 is a
+	// legitimate "nothing accumulated yet" and must not be laundered into
+	// absence. A device that does not implement WH leaves WH_SF at the int16
+	// sentinel (or outside the legal sunssf domain), which is what fails here.
+	if wh, ok := readM103WH(regs); ok {
+		m.WhExpTotal = wh
+	}
+	m.Live = LivenessOfACModel(regs)
 	return m
 }
 

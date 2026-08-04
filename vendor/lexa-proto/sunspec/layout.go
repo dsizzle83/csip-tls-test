@@ -346,6 +346,40 @@ func (v View) SF(name string) (int16, bool) {
 	return int16(v.reg(o)), true
 }
 
+// Raw returns a point's RAW register content as an unsigned integer — the bits
+// exactly as they arrived on the wire, with NO scale factor applied and no
+// sign extension — and reports whether the device IMPLEMENTS the point.
+//
+// It exists for consumers that compare a point against ITSELF across reads
+// rather than interpreting its value: derbase's liveness digest asks "did these
+// registers move between two polls", and for that question the engineering
+// value is strictly worse than the raw word. Two different raw words can scale
+// onto the same float64 (rounding), and a scale factor is a device constant
+// that must not participate in the comparison at all — so a digest built from
+// Float() would be both less sensitive and coupled to a register the digest
+// deliberately excludes.
+//
+// ok=false when the point is absent from the layout, beyond the bound register
+// slice, carries its type's not-implemented sentinel, or is a string/pad field
+// (which have no numeric content). Accumulators (Tacc*) have no sentinel — 0 is
+// a valid un-accumulated value — so they read ok=true at zero, exactly as
+// Float does.
+func (v View) Raw(name string) (uint64, bool) {
+	o, f, ok := v.fieldOff(name)
+	if !ok || !v.Present(name) || v.notImpl(o, f) {
+		return 0, false
+	}
+	switch f.Type {
+	case Tuint16, Tint16, Tenum16, Tbitfield16, Tsunssf:
+		return uint64(v.reg(o)), true
+	case Tuint32, Tint32, Tenum32, Tbitfield32, Tacc32:
+		return uint64(v.rawU32(o)), true
+	case Tuint64, Tint64, Tacc64:
+		return v.rawU64(o), true
+	}
+	return 0, false // Tstring / Tpad carry no numeric content
+}
+
 // ── Scaled float getter ──────────────────────────────────────────────────────
 
 // Float reads a numeric point and applies its scale factor, returning the
