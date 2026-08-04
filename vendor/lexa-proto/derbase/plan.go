@@ -139,6 +139,22 @@ type ElementOutcome struct {
 	Sub      *PlanOutcome
 }
 
+// addAdvisory appends one advisory to an element, keeping any already there.
+// Advisories accumulate rather than replace because they are independent facts
+// about one element — "this ceiling min-combined three axes", "it landed on the
+// bounded re-attempt", "its sub-plan is applied-degraded" can all be true at
+// once, and a caller that is shown only the last one is missing evidence.
+func addAdvisory(e *ElementOutcome, s string) {
+	if s == "" {
+		return
+	}
+	if e.Advisory == "" {
+		e.Advisory = s
+		return
+	}
+	e.Advisory += "; " + s
+}
+
 // PlanOutcome is the whole-plan verdict.
 //
 // Mixed means the device was measured in NEITHER the state the plan found it
@@ -272,9 +288,11 @@ func worstElementState(o PlanOutcome) ElementState {
 //     target, so the plan freezes and declares instead of writing back a
 //     value it could not interpret.
 //
-// pct is signed in the sign domain of the command being executed (negative =
-// charge); the magnitude is what bounds the device, and a value that decodes
-// out of that domain lands on NaN/±Inf and scores unrestricted, above.
+// pct is a percent of the nameplate; the magnitude is what bounds the device,
+// and a value that decodes out of that domain lands on NaN/±Inf and scores
+// unrestricted, above. Abs() is kept rather than assuming a non-negative
+// reading: it is the decoded DEVICE state, and a device that hands back a
+// negative word must not score as more restrictive than one holding zero.
 func ceilingRestriction(pct float64, enabled bool) float64 {
 	if !enabled || math.IsNaN(pct) || math.IsInf(pct, 0) {
 		return math.Inf(1)

@@ -311,7 +311,36 @@ type ActivePower struct {
 	Value      int16 `xml:"value"`
 }
 
+// ─── DERUnitRefType: what a percentage is a percentage OF ─────────────────────
+//
+// These match the DERUnitRefType enumeration in the IEEE 2030.5-2018 XSD. The
+// code is NOT decoration: a percentage without its reference is not a
+// quantity, and the three reactive codes name three DIFFERENT physical
+// quantities on the same machine. On a 60 kW / 26.4 kvar DER, "80 %" is
+// 48 000 var under RefTypeSetMaxW and 21 120 var under RefTypeSetMaxVar — a
+// consumer that reads the value and drops the code is wrong for at least two
+// of the three codes it could have been sent.
+//
+// RefTypeNA is the one code that names no reference at all. It is not a
+// default and not "the usual one": it is a document that declined to say what
+// it was commanding, and the only defensible answers to it are to refuse or to
+// leave the device alone (see derbase.varSetModForRefType).
+const (
+	RefTypeNA                   uint8 = 0 // N/A — no rating nominated
+	RefTypeSetMaxW              uint8 = 1 // %setMaxW — percent of the max active-power setting
+	RefTypeSetMaxVar            uint8 = 2 // %setMaxVar — percent of the max reactive-power setting
+	RefTypeStatVarAvail         uint8 = 3 // %statVarAvail — percent of PRESENTLY available reactive power
+	RefTypeSetEffectiveV        uint8 = 4 // %setEffectiveV — percent of the effective voltage setting
+	RefTypeSetMaxChargeRateW    uint8 = 5 // %setMaxChargeRateW
+	RefTypeSetMaxDischargeRateW uint8 = 6 // %setMaxDischargeRateW
+	RefTypeStatWAvail           uint8 = 7 // %statWAvail — percent of presently available active power
+)
+
 // FixedVar represents reactive power setting.
+//
+// RefType names the base Value is a percentage of (see the DERUnitRefType
+// constants above) and MUST be read by any consumer that acts on Value —
+// including RefTypeNA, which must be refused rather than assumed.
 type FixedVar struct {
 	RefType uint8         `xml:"refType"`
 	Value   SignedPerCent `xml:"value"`

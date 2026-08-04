@@ -401,11 +401,47 @@ type Summary struct {
 	Asserted int `json:"asserted"`
 	// Manifest is the campaign's final fault manifest.
 	Manifest ManifestSnapshot `json:"manifest"`
+	// Attacked reports whether the world ledger recorded any attack attempt.
+	// It is the other half of the "this run did something" floor: a campaign
+	// can attack without ARMING a fault, and such a run is not empty.
+	//
+	// A field rather than a live call because FloorHolds must be answerable
+	// from a Summary ALONE — including one decoded from a run's JSON, which
+	// has no Monitor behind it.
+	Attacked bool `json:"attacked"`
 	// OK is the run's bottom line.
 	OK bool `json:"ok"`
 	// Why explains a not-OK run, or explains what a passing run actually
 	// established.
 	Why string `json:"why"`
+}
+
+// FloorHolds reports whether the run's HONESTY FLOORS hold — every reason
+// Finalize can call a run not-OK APART from the invariant violations
+// themselves — and names the first one that does not.
+//
+// The distinction exists because ONE consumer wants violations and the floors
+// separated: a MustViolate ("teeth") campaign is pointed at a deliberately
+// non-conformant peer, so violations are its SUCCESS condition, and reading
+// OK=false would make it fail exactly when it worked. The floors still bind on
+// such a run — a teeth run that never ticked, armed and attacked nothing, or
+// asserted nothing has proved nothing about the harness's eyesight either —
+// so they are asked for separately rather than skipped.
+//
+// Finalize is the only other caller, which keeps ONE definition of the floor:
+// if a clause is added here it binds on every run, teeth included, and cannot
+// be forgotten in the second copy because there is no second copy.
+func (s Summary) FloorHolds() (bool, string) {
+	switch {
+	case s.Ticks == 0:
+		return false, "the monitor never ran a tick, so nothing was checked"
+	case !s.Manifest.AnyArmed() && !s.Attacked:
+		return false, "the campaign armed no fault and attempted no attack, so this run demonstrated only that an " +
+			"unattacked device behaves — that is not a pass"
+	case s.Asserted == 0:
+		return false, "every invariant skipped: nothing was asserted, so nothing was proved"
+	}
+	return true, ""
 }
 
 // Finalize closes the run: it resolves every still-Pending claim into a
@@ -508,19 +544,25 @@ func (m *Monitor) Finalize() Summary {
 			failed++
 		}
 	}
+	// The ledger half of the "this run did something" floor, captured onto the
+	// Summary so FloorHolds can be answered without a Monitor (see its doc).
+	sum.Attacked = !m.world.Ledger().Empty()
+
+	// The floor clauses live in FloorHolds so the campaign's teeth gate reads
+	// the SAME definition rather than a second copy that could drift. The
+	// ORDER here is unchanged from before that extraction: the never-ticked
+	// clause outranks the violations (a run with no ticks has no findings to
+	// report anyway), and the remaining two floors are reported only when
+	// there are no violations to report instead.
+	floorOK, floorWhy := sum.FloorHolds()
 	switch {
-	case len(m.ticks) == 0:
-		sum.OK, sum.Why = false, "the monitor never ran a tick, so nothing was checked"
+	case sum.Ticks == 0:
+		sum.OK, sum.Why = false, floorWhy
 	case failed > 0:
 		sum.OK = false
 		sum.Why = fmt.Sprintf("%d distinct invariant violations (every one a P1)", failed)
-	case !sum.Manifest.AnyArmed() && m.world.Ledger().Empty():
-		sum.OK = false
-		sum.Why = "the campaign armed no fault and attempted no attack, so this run demonstrated only that an " +
-			"unattacked device behaves — that is not a pass"
-	case sum.Asserted == 0:
-		sum.OK = false
-		sum.Why = "every invariant skipped: nothing was asserted, so nothing was proved"
+	case !floorOK:
+		sum.OK, sum.Why = false, floorWhy
 	default:
 		sum.OK = true
 		sum.Why = fmt.Sprintf("%d sub-claims asserted across %d ticks against %d armed faults, with no violation",

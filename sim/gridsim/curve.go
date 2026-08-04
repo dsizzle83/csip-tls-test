@@ -45,7 +45,9 @@ type adminCurveReq struct {
 	StartOffset int          `json:"start_offset_s"` // seconds from now
 	Activate    bool         `json:"activate"`       // true = replace curve + control lists
 	// FixedVarPct, when present, rides along as an opModFixedVar scalar overlay
-	// on the same control (RefType 1 = rated capacity), mirroring adminCtrlReq.
+	// on the same control, mirroring adminCtrlReq. It is emitted with
+	// DERUnitRefType 2 (%setMaxVar) — a percentage of the REACTIVE nameplate;
+	// see the emission site for why it used to say RefType 1.
 	FixedVarPct *float64 `json:"fixed_var_pct,omitempty"`
 }
 
@@ -169,7 +171,22 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	setCurveLink(&base, req.Mode, curveHref)
 	if req.FixedVarPct != nil {
 		base.OpModFixedVar = &model.FixedVar{
-			RefType: 1, // 1 = rated capacity
+			// DERUnitRefType 2 = %setMaxVar: a percentage of the REACTIVE
+			// nameplate, which is what this field has always meant end-to-end
+			// ("fixed_var_pct ... signed % of setMaxVar" on the bus doc both
+			// consumers carry it on).
+			//
+			// It used to emit RefType 1 under the comment "1 = rated
+			// capacity". That is the wrong code for that sentence: 1 is
+			// %setMaxW, a percentage of the ACTIVE-power nameplate. It went
+			// unnoticed while derbase ignored refType entirely and resolved
+			// every code against VarMaxPct — the fixture was wrong and the
+			// product was wrong in the opposite direction, and the two
+			// cancelled. lexa-proto d60e1ca made derbase READ the code, so
+			// they stop cancelling: on the 60 kW / 26.4 kvar bench inverter
+			// this would ask 80 % of 60 kW = 48 kvar from a 26.4 kvar machine
+			// (DIFF-CTL-001), and 24x that on a 2 kvar one (DIFF-CTL-002).
+			RefType: model.RefTypeSetMaxVar,
 			Value:   model.SignedPerCent{Value: int16(math.Round(*req.FixedVarPct))},
 		}
 	}

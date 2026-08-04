@@ -355,8 +355,38 @@ func populate701(r *RegisterMap, cursor uint16) (base uint16, dataLen int, next 
 	return base, dataLen, next
 }
 
+// advSimCtrlModes is the 702 "supported control mode functions" bitfield this
+// simulated DER declares — one bit per control function it actually publishes
+// a model for, and nothing more.
+//
+// It exists because a capability claim stopped being optional. lexa-proto
+// 87e246d (round-2 audit F2) made EVERY exported derbase writer require the
+// positive M702 bit for the mode it is about to write, not just ApplyControl:
+// before that, write704 asked only whether SOME declaration existed and the
+// curve writers asked only for model presence, so a device declaring nothing
+// had a fixed-PF setpoint written to it and a volt-var curve adopted and
+// ENABLED on it.
+//
+// A zero-filled CtrlModes is not "unspecified" under that rule — it is the
+// device positively declaring it performs no control function at all
+// (derbase.CapClear), which denies every axis. A simulator that publishes
+// 704/705/706/707/708/709/710/711/712 while declaring nothing is therefore not
+// modelling a conformant DER; it is modelling one that contradicts itself, and
+// every advanced test against it would quietly become a test of the refusal
+// path instead of the path it was written for.
+//
+// Keep it in step with what this sim publishes: add a model above, add its bit
+// here — the tests below will name whichever one was forgotten.
+const advSimCtrlModes = sunspec.M702_CtrlMode_MaxW | sunspec.M702_CtrlMode_FixedW |
+	sunspec.M702_CtrlMode_FixedVar | sunspec.M702_CtrlMode_FixedPF |
+	sunspec.M702_CtrlMode_VoltVar | sunspec.M702_CtrlMode_VoltWatt |
+	sunspec.M702_CtrlMode_WattVar | sunspec.M702_CtrlMode_FreqWatt |
+	sunspec.M702_CtrlMode_LVTrip | sunspec.M702_CtrlMode_HVTrip |
+	sunspec.M702_CtrlMode_LFTrip | sunspec.M702_CtrlMode_HFTrip
+
 // populate702 writes a minimal model 702: WMax (so derbase reads the nameplate
-// from 702) plus the reactive rating used as the fixed-var convergence base.
+// from 702), the reactive rating used as the fixed-var convergence base, and
+// the CtrlModes capability declaration every 7xx writer now gates on.
 func populate702(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (base, next uint16) {
 	dataLen := sunspec.L702.Len()
 	base, next = writeModelHeader(r, cursor, sunspec.ModelDERCapacity, dataLen)
@@ -380,6 +410,7 @@ func populate702(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (base,
 	v.SetFloat("VarMaxInj", varRating)
 	v.SetFloat("VarMaxAbs", varRating)
 	v.SetFloat("VNom", 240)
+	v.SetU32("CtrlModes", advSimCtrlModes)
 	writeSlice(r, base, regs)
 	return base, next
 }

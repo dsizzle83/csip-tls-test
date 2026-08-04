@@ -67,6 +67,28 @@ import (
 // no "the device is probably fine", and no path by which absence becomes
 // permission.
 //
+// ── The rule holds at EVERY exported writer (round-2 audit F2) ───────────────
+//
+// The rule above says "every 7xx axis requires its positive M702 CtrlModes
+// bit", and for one release it was enforced in preflightControl and NOWHERE
+// ELSE. The exported writers are reachable directly — lexa-hub's reconciler
+// calls SetFixedPF, SetConstantVar, SetWMaxLimPctW and the curve writers
+// without going through ApplyControl — and they checked strictly less:
+//
+//	write704       only that SOME CtrlModes declaration existed, because it
+//	               did not know which axis it was serving. A device declaring
+//	               MAX_W and nothing else therefore accepted a fixed-PF write.
+//	curve writers  only model presence. A device declaring MAX_W and nothing
+//	               else accepted a volt-var curve, adopted it, and ENABLED it.
+//
+// A gate that only one caller passes through is not a gate. Every exported
+// writer now names the mode(s) it is about to write and requires each one's
+// bit: write704 takes the UNION of bits for the fields the write touches (one
+// per control function — a PF write needs FIXED_PF, a var write FIXED_VAR),
+// and each curve writer requires its own function's bit. requireCtrlModes is
+// the single place that decision is made, so a new writer cannot forget it
+// without failing to compile.
+//
 // Two axes are outside this scheme because model 702 has no bit for them:
 // opModEnergize (model 703 enter service) and opModConnect (M123 Conn). The
 // CtrlModes bitfield defines MAX_W, FIXED_W, FIXED_VAR, FIXED_PF, VOLT_VAR,
@@ -175,6 +197,52 @@ func (b *Base) requireCtrlMode(axis string, bit uint32, mode string) error {
 	return &UnsupportedControlError{Axis: axis, Reason: c.reason(mode)}
 }
 
+// ctrlMode pairs one M702 CtrlModes bit with its spec symbol, so a writer
+// names the control FUNCTION it is about to write rather than a bare bit.
+// The symbol is not decoration: it is what the operator reads in the
+// CannotComply, and CapClaim.reason renders it.
+type ctrlMode struct {
+	bit  uint32
+	mode string
+}
+
+// The 7xx control functions this package writes, in CtrlModes bit order. Every
+// exported writer picks its own from here; nothing constructs a ctrlMode
+// inline, so the set of gated functions is enumerable by reading this block.
+var (
+	modeMaxW     = ctrlMode{sunspec.M702_CtrlMode_MaxW, "MAX_W"}
+	modeFixedW   = ctrlMode{sunspec.M702_CtrlMode_FixedW, "FIXED_W"}
+	modeFixedVar = ctrlMode{sunspec.M702_CtrlMode_FixedVar, "FIXED_VAR"}
+	modeFixedPF  = ctrlMode{sunspec.M702_CtrlMode_FixedPF, "FIXED_PF"}
+	modeVoltVar  = ctrlMode{sunspec.M702_CtrlMode_VoltVar, "VOLT_VAR"}
+	modeFreqWatt = ctrlMode{sunspec.M702_CtrlMode_FreqWatt, "FREQ_WATT"}
+	modeLVTrip   = ctrlMode{sunspec.M702_CtrlMode_LVTrip, "LV_TRIP"}
+	modeHVTrip   = ctrlMode{sunspec.M702_CtrlMode_HVTrip, "HV_TRIP"}
+	modeWattVar  = ctrlMode{sunspec.M702_CtrlMode_WattVar, "WATT_VAR"}
+	modeVoltWatt = ctrlMode{sunspec.M702_CtrlMode_VoltWatt, "VOLT_WATT"}
+	modeLFTrip   = ctrlMode{sunspec.M702_CtrlMode_LFTrip, "LF_TRIP"}
+	modeHFTrip   = ctrlMode{sunspec.M702_CtrlMode_HFTrip, "HF_TRIP"}
+)
+
+// requireCtrlModes enforces EVERY bit in a write's mode set — the exported-
+// writer gate (audit F2). A write that touches the fields of two control
+// functions needs both bits: partial permission is not permission for the
+// write, because the device would end up running a function it declared it
+// does not do.
+//
+// It denies on the FIRST unclaimed mode in the caller's order, which is the
+// order the writer's fields appear in, so the error names the mode an operator
+// can act on rather than an arbitrary one. Callers with a single mode get
+// exactly requireCtrlMode's behaviour and message.
+func (b *Base) requireCtrlModes(axis string, modes ...ctrlMode) error {
+	for _, m := range modes {
+		if err := b.requireCtrlMode(axis, m.bit, m.mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DeclaresCtrlModes reports whether the device made a supported-control-modes
 // declaration AT ALL: model 702 present and its CtrlModes point implemented.
 // It says nothing about which modes — that is CtrlModeClaim — only that there
@@ -184,18 +252,15 @@ func (b *Base) DeclaresCtrlModes() bool {
 	return b.HasCap && b.CtrlModes != CtrlModesNotImplemented
 }
 
-// requireCtrlModesDeclaration is the claim-LEVEL gate used where the caller
-// does not know which mode it is serving (write704). It distinguishes the two
-// silent states so the error names WHY, exactly as the per-bit gate does.
-func (b *Base) requireCtrlModesDeclaration(axis string) error {
-	switch {
-	case !b.HasCap:
-		return &UnsupportedControlError{Axis: axis, Reason: CapAbsent.reason("any 7xx control mode")}
-	case b.CtrlModes == CtrlModesNotImplemented:
-		return &UnsupportedControlError{Axis: axis, Reason: CapNotImplemented.reason("any 7xx control mode")}
-	}
-	return nil
-}
+// The claim-LEVEL gate that used to live here (requireCtrlModesDeclaration) is
+// GONE. It answered "does the device publish a CtrlModes declaration at all",
+// which was write704's gate while write704 did not know which axis it served,
+// and it is round-2 audit finding F2: a declaration is not permission for the
+// mode it does not contain. Every writer now names its modes and gets the
+// per-bit gate, so there is no caller for the weaker question and no way to
+// reach for it by accident. DeclaresCtrlModes above remains for REPORTING —
+// telling an operator the device said nothing is useful; deciding a write on
+// it is not.
 
 // LegacyM123Shape reports whether the device presents the LEGACY control shape
 // that the M123 allowlist covers: model 123 (immediate controls) present, and

@@ -279,55 +279,222 @@ func findingClasses(sum Summary) map[string]int {
 	return out
 }
 
-// requireClass asserts a defect class still reproduces, and explains what to do
-// if it does not. The "or the product was fixed" branch is not politeness: a
-// regression lock that fails without saying why sends the next reader hunting
-// for a harness bug that may not exist.
-func requireClass(t *testing.T, classes map[string]int, class, what string) {
+// classesByCase indexes the report's findings as case ID -> class -> count, so
+// an inversion can say "this class is gone FROM THIS CASE" rather than only
+// "gone from the run". The distinction matters once a class has more than one
+// cause: DERBASE-VAR-REFTYPE's "magnitude" is fixed on the cases that pinned
+// it while a DIFFERENT magnitude disagreement survives elsewhere, and a
+// run-wide assertion could not tell those apart.
+func classesByCase(sum Summary) map[string]map[string]int {
+	out := map[string]map[string]int{}
+	for _, f := range sum.Findings {
+		class := f.ID
+		id := f.ID
+		if i := strings.LastIndex(f.ID, "/"); i >= 0 {
+			class, id = f.ID[i+1:], f.ID[:i]
+		}
+		if out[id] == nil {
+			out[id] = map[string]int{}
+		}
+		out[id][class]++
+	}
+	return out
+}
+
+// caseIDs is the set of case IDs the report actually ran.
+func caseIDs(r *Report) map[string]bool {
+	out := map[string]bool{}
+	for _, c := range r.Cases {
+		out[c.ID] = true
+	}
+	return out
+}
+
+// requireClassGone asserts a defect class no longer reproduces on the cases
+// that pinned it, AND that those cases are still in the run.
+//
+// Both halves are the point. A class stops being reported for two reasons —
+// the product was fixed, or this package stopped asking — and only one of them
+// is good news. Asserting the absence alone would turn a deleted probe into a
+// green build, which is the failure mode the locks this replaces existed to
+// prevent, arriving by the opposite route.
+func requireClassGone(t *testing.T, r *Report, byCase map[string]map[string]int, class string, cases []string, fixedBy string) {
 	t.Helper()
-	if classes[class] == 0 {
-		t.Errorf("the %q class no longer reproduces (%s).\n"+
-			"Either the product was FIXED — in which case delete this lock and record the fix — "+
-			"or this package stopped looking, which is a harness defect. Do not simply delete the "+
-			"assertion to get green.", class, what)
+	ran := caseIDs(r)
+	for _, id := range cases {
+		if !ran[id] {
+			t.Errorf("case %s is no longer in the ctl catalogue, so its %q lock proves nothing. "+
+				"An inversion is only evidence while the probe still runs — restore the case, or "+
+				"state here why the question stopped being worth asking.", id, class)
+			continue
+		}
+		if n := byCase[id][class]; n != 0 {
+			t.Errorf("%s still reports %d %q finding(s). This was fixed by %s — either the pin/vendor "+
+				"regressed, or the fix does not cover this case after all. Check proto.pin and "+
+				"vendor/lexa-proto/derbase.", id, n, class, fixedBy)
+		}
 	}
 }
 
-// TestCtlCatalog_ConfirmedDefectClassesStillReproduce pins every control-path
-// disagreement this package confirmed against the shipping product by reading
-// lexa-proto/derbase.ApplyControl.
-func TestCtlCatalog_ConfirmedDefectClassesStillReproduce(t *testing.T) {
+// TestCtlCatalog_ConfirmedDefectClassesAreFixed is the INVERSION of the lock
+// this file used to carry, and it covers all five control-path defect classes
+// this package confirmed against the shipping product.
+//
+// The lock was TestCtlCatalog_ConfirmedDefectClassesStillReproduce, and it was
+// right to exist: each class named a way the CSIP-to-SunSpec translation put a
+// wrong number on a real DER, and pinning them stopped the findings quietly
+// evaporating. lexa-proto 87e246d and d60e1ca fixed all five, so the lock is
+// inverted rather than deleted — a defect lock that is deleted stops being
+// evidence of anything, and the next reader cannot tell "fixed" from "we
+// stopped looking".
+//
+//	class                     fixed by            what the product does now
+//	────────────────────────  ──────────────────  ─────────────────────────────
+//	magnitude                 87e246d             refType selects the base
+//	                          (varsetmod.go)      (1->WMaxPct, 2->VarMaxPct,
+//	                                              3->VarAvailPct)
+//	uninterpretable-applied   87e246d             refType=0 and an undeclared
+//	                                              base are REFUSED, not applied
+//	silent-clamp              87e246d             an over-nameplate setpoint is
+//	                                              a typed SetpointRangeError,
+//	                                              not a different number
+//	                                              applied silently
+//	dropped-limit             d60e1ca             simultaneous ceilings MIN-
+//	                                              combine in watts; every axis
+//	                                              is validated, not just the
+//	                                              winner
+//	kind                      d60e1ca             opModImpLimW/opModLoadLimW
+//	                                              refuse on every device shape
+//	                                              — no register expresses an
+//	                                              import BOUND
+//
+// WHAT IS NOT CLAIMED HERE. "magnitude" is asserted gone on the cases that
+// pinned DERBASE-VAR-REFTYPE, not run-wide, because ONE magnitude disagreement
+// survives on DIFF-CTL-004 with an entirely different cause: both sides now
+// agree the base is VarAvail (the product writes VarSetMod=VarAvailPct, which
+// is the fix working), and they disagree about what VarAvail IS — this
+// package's referee caps it at the reactive nameplate (csipref.capVarAvail)
+// while internal/invariant resolves the wider apparent-power headroom. That is
+// a live finding and is deliberately NOT silenced here; see
+// TestCtlCatalog_RemainingReactiveFindingsAreReported.
+func TestCtlCatalog_ConfirmedDefectClassesAreFixed(t *testing.T) {
 	r := NewReport(0)
 	if err := RunCtlCatalog(context.Background(), r); err != nil {
 		t.Fatalf("catalogue: %v", err)
 	}
 	sum := r.Summary()
 	if sum.Compared == 0 {
-		t.Fatal("the ctl catalogue evaluated zero comparisons")
+		t.Fatal("the ctl catalogue evaluated zero comparisons — an empty catalogue makes every " +
+			"assertion below vacuously true, which is worse than a failing one")
 	}
-	classes := findingClasses(sum)
+	if len(r.Cases) == 0 {
+		t.Fatal("the ctl catalogue ran zero cases")
+	}
+	byCase := classesByCase(sum)
 
-	requireClass(t, classes, "magnitude",
-		"opModFixedVar.RefType is declared at csipmodel/resources.go:316 and read nowhere; "+
-			"SetConstantVar hardcodes VarSetMod=VarMaxPct, so every refType resolves against the same base")
-	requireClass(t, classes, "dropped-limit",
-		"ApplyControl uses firstNonNil(OpModExpLimW, OpModMaxLimW, OpModGenLimW) — 'first non-nil wins' — "+
-			"so a tighter simultaneous limit is discarded")
-	requireClass(t, classes, "kind",
-		"opModImpLimW/opModLoadLimW are ceilings applied through SetActivePowerWatts, a WSet setpoint")
-	requireClass(t, classes, "silent-clamp",
-		"SetActivePowerWatts clamps to +/-WMax and returns nil, so the head-end is told success")
-	// NOTE: "partial-apply" used to be locked here. It was FIXED in lexa-proto
-	// b760d5a and is now pinned in the other direction by
-	// TestCtlCatalog_WholeRequestPreflightIsAtomic below.
-	requireClass(t, classes, "uninterpretable-applied",
-		"a percentage is written even when the device publishes no rating to resolve it against")
+	requireClassGone(t, r, byCase, "magnitude",
+		[]string{"DIFF-CTL-001", "DIFF-CTL-002", "DIFF-CTL-004b", "DIFF-CTL-005"},
+		"lexa-proto 87e246d: SetConstantVar takes the base as a parameter and varSetModForRefType "+
+			"maps refType onto it, instead of hardcoding VarSetMod=VarMaxPct for every refType")
+	requireClassGone(t, r, byCase, "uninterpretable-applied",
+		[]string{"DIFF-CTL-005"},
+		"lexa-proto 87e246d: refType=0 is ErrInvalidControl and a base the device does not publish is "+
+			"ErrUnsupportedControl — a percentage with no rating to resolve it is refused, not written")
+	requireClassGone(t, r, byCase, "silent-clamp",
+		[]string{"DIFF-CTL-040"},
+		"lexa-proto 87e246d: SetActivePowerWatts returns a typed *SetpointRangeError carrying commanded "+
+			"vs achievable instead of clamping to +/-WMax and reporting success")
+	requireClassGone(t, r, byCase, "dropped-limit",
+		[]string{"DIFF-CTL-010", "DIFF-CTL-011", "DIFF-CTL-012"},
+		"lexa-proto d60e1ca: combineCeilingsW reduces every W-ceiling axis to the NARROWEST bound in "+
+			"watts, instead of firstNonNilAxis(Exp, Max, Gen) picking by name")
+	requireClassGone(t, r, byCase, "kind",
+		[]string{"DIFF-CTL-020", "DIFF-CTL-021", "DIFF-CTL-022", "DIFF-CTL-030"},
+		"lexa-proto d60e1ca: opModImpLimW/opModLoadLimW are refused with ErrUnsupportedControl at "+
+			"preflight and write nothing — the register survey found no import BOUND on any device shape")
+
+	// The sweep. A class count of zero would also read zero if the catalogue
+	// stopped producing the comparisons that could expose it, so the questions
+	// themselves are checked to still be asked. Each key below is the
+	// comparison a class was adjudicated through; an absent one means the
+	// probe went quiet rather than the product got better.
+	exercised := map[string]int{}
+	for _, c := range r.Cases {
+		for _, cmp := range c.Comparisons {
+			exercised[cmp.Key]++
+		}
+	}
+	for _, key := range []string{
+		"opModFixedVar", // magnitude, uninterpretable-applied
+		"opModFixedW",   // silent-clamp
+		"opModMaxLimW",  // dropped-limit (the axis that BINDS in DIFF-CTL-010/012)
+		"opModImpLimW",  // kind
+		"atomicity",     // every refusal's "wrote nothing" half
+	} {
+		if exercised[key] == 0 {
+			t.Errorf("no ctl case adjudicated %q any more — the class locks above are then vacuous. "+
+				"A probe removed is not a defect fixed.", key)
+		}
+	}
 
 	// The catalogue must also contain cases that AGREE. A differential in which
 	// everything disagrees is measuring its own referee, not the product.
 	if sum.ByVerdict[string(Pass)] == 0 {
 		t.Error("no ctl case passed: a referee that disagrees with the product everywhere is more " +
 			"likely wrong than the product is")
+	}
+}
+
+// TestCtlCatalog_RemainingReactiveFindingsAreReported states what this run
+// still finds, so the residue is a RECORD rather than an absence.
+//
+// After the five inversions above, the ctl family reports findings only on the
+// reactive percentage cases, and they are NOT the defects that were just
+// fixed. They are reported here rather than silenced because a differential
+// whose remaining disagreements are quietly asserted away has stopped being a
+// differential.
+//
+// Two shapes, both open:
+//
+//   - DIFF-CTL-001/002 (refType=1, %setMaxW) reach invariant I1 with "commanded
+//     beyond its own nameplate". The product faithfully writes
+//     VarSetMod=WMaxPct + VarSetPct=80, which is the refType fix WORKING, and
+//     80 % of a 60 kW active nameplate is 48 kvar — 1.8x the reactive rating on
+//     the balanced device and 24x on the 2 kvar one. derbase's requireVarBase
+//     checks only that WMax EXISTS for %setMaxW; there is no reactive
+//     counterpart to validateSetpointW's range refusal, so an over-nameplate
+//     REACTIVE command is applied where an over-nameplate ACTIVE one is now
+//     refused. Exposed BY the fix: pre-fix every refType resolved against
+//     VarMaxPct, which is bounded by construction, so the gap could not show.
+//
+//   - DIFF-CTL-004 (refType=3, %statVarAvail) additionally disagrees on
+//     magnitude. Both sides agree the BASE is VarAvail; they disagree on its
+//     value, because csipref.capVarAvail narrows it to the reactive nameplate
+//     while internal/invariant uses the wider apparent-power headroom. Note
+//     that DIFF-CTL-004b — the same document on a nearly-loaded device, where
+//     the cap does not bind — PASSES, which is what identifies the cap rather
+//     than the base as the disagreement.
+//
+// This test does not adjudicate either. It asserts they are still VISIBLE, so
+// that closing one is a deliberate act with a commit behind it.
+func TestCtlCatalog_RemainingReactiveFindingsAreReported(t *testing.T) {
+	r := NewReport(0)
+	if err := RunCtlCatalog(context.Background(), r); err != nil {
+		t.Fatalf("catalogue: %v", err)
+	}
+	byCase := classesByCase(r.Summary())
+
+	for _, id := range []string{"DIFF-CTL-001", "DIFF-CTL-002"} {
+		if byCase[id]["I1"] == 0 {
+			t.Errorf("%s no longer reports the over-nameplate reactive command. If derbase gained a "+
+				"reactive range check, this is FIXED — invert this expectation and record the commit. "+
+				"If the case or invariant I1 stopped running, the differential went quiet instead.", id)
+		}
+	}
+	if byCase["DIFF-CTL-004"]["magnitude"] == 0 {
+		t.Error("DIFF-CTL-004 no longer disagrees on the VarAvail magnitude. Either capVarAvail and " +
+			"internal/invariant were reconciled — invert this and say which edge won and why — or the " +
+			"case stopped being adjudicated.")
 	}
 }
 

@@ -391,18 +391,46 @@ func Run(ctx context.Context, cfg Config, envFn EnvFunc, layers []Layer) (Result
 
 // decide is the campaign's bottom line. It defers to the monitor's own floor
 // (which already refuses a run that armed nothing or asserted nothing) and adds
-// the two clauses only the campaign can judge.
+// the clauses only the campaign can judge.
+//
+// ── The teeth gate was dead, and this is where ───────────────────────────────
+//
+// A MustViolate run is pointed at a DELIBERATELY non-conformant peer and passes
+// only by CATCHING the injected defect. But catching it sets
+// invariant.Summary.OK to false — Finalize marks any run with failed violations
+// not-OK — and the old ordering asked `!sum.OK` BEFORE `cfg.MustViolate`. The
+// teeth-confirmed branch was therefore unreachable: the run exited non-zero
+// precisely when it worked, so `make qa-campaign-teeth` could never go green.
+// A gate that fails on success is a gate nobody can leave switched on, and
+// without it every green qa-campaign is worth nothing — which is the one thing
+// the teeth run exists to establish.
+//
+// The fix is not simply to swap the two cases. `!sum.OK` conflates two very
+// different verdicts: "the monitor found violations" and "this run proved
+// nothing" (never ticked, armed and attacked nothing, asserted nothing).
+// Skipping all of `!sum.OK` for a teeth run would skip the FLOORS too, and a
+// teeth run that never ticked has demonstrated nothing about the harness's
+// eyesight — it would report "teeth confirmed" off zero evidence, trading a
+// gate that always fails for one that cannot fail. So the violations and the
+// floors are asked SEPARATELY: invariant.Summary.FloorHolds answers the second
+// from the same clause list Finalize uses, and it still binds here.
 func decide(cfg Config, res Result, sum invariant.Summary) (bool, string) {
 	violated := len(res.Signatures()) > 0
+	floorOK, floorWhy := sum.FloorHolds()
 	switch {
 	case cfg.MustViolate && !violated:
 		return false, "this run was pointed at a deliberately non-conformant peer and found NOTHING — " +
 			"the harness cannot see the defect it was aimed at, which is a failure of the harness, not a pass"
-	case !sum.OK:
-		return false, sum.Why
+	case cfg.MustViolate && !floorOK:
+		// Violations were reported, but the run does not clear the honesty
+		// floor, so they are not evidence the harness can see anything.
+		return false, "this run was pointed at a deliberately non-conformant peer and reported violations, but " +
+			floorWhy
 	case cfg.MustViolate:
 		return true, fmt.Sprintf("teeth confirmed: %d distinct invariant violation(s) against a known-bad peer; %s",
 			len(res.Signatures()), sum.Why)
+	case !sum.OK:
+		return false, sum.Why
 	case res.Armed == 0:
 		return false, "no action armed successfully, so nothing was injected — a run that injected no fault is an " +
 			"error, not a pass (strategy §4.1)"

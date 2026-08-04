@@ -243,6 +243,91 @@ func TestMustViolateFailsARunThatFoundNothing(t *testing.T) {
 	}
 }
 
+// TestMustViolatePassesTheRunThatFoundTheDefect is the direction the teeth gate
+// never had a test for, and the reason it sat DEAD.
+//
+// TestMustViolateFailsARunThatFoundNothing above covers the blind case, and it
+// passed throughout — a broken gate that refuses everything refuses that run
+// too. Nothing asserted the other half: that a MustViolate run which CATCHES
+// the injected defect reports OK. It could not, because decide() asked
+// `!sum.OK` before `cfg.MustViolate`, and catching the defect is exactly what
+// makes sum.OK false (invariant.Finalize marks any run with failed violations
+// not-OK). So `make qa-campaign-teeth` exited non-zero precisely when the
+// harness worked, and the gate could not be left switched on.
+//
+// Pre-fix this test reports:
+//
+//	a teeth run that CAUGHT the injected defect reported a FAILURE:
+//	  1 distinct invariant violations (every one a P1)
+//
+// which is the monitor faithfully describing a successful teeth run and the
+// campaign then reading it as a failure.
+func TestMustViolatePassesTheRunThatFoundTheDefect(t *testing.T) {
+	t.Parallel()
+	cfg := fastConfig("teeth-found", 5)
+	cfg.MustViolate = true
+	cfg.Require = []string{"fake/unauthorized-write"}
+	// No triggers needed: the probe always fires, so the run is guaranteed to
+	// catch the deliberately non-conformant write.
+	layers := []Layer{fakeLayer{id: "fake", n: 3, defect: newDefect()}}
+
+	res, err := Run(context.Background(), cfg, fakeEnv(), layers)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.Signatures()) == 0 {
+		t.Fatalf("precondition: the teeth run found nothing to confirm with: %s", res.Why)
+	}
+	if !res.OK {
+		t.Fatalf("a teeth run that CAUGHT the injected defect reported a FAILURE:\n  %s", res.Why)
+	}
+	if !strings.Contains(res.Why, "teeth confirmed") {
+		t.Errorf("a confirmed teeth run must say so — the operator needs to read that the harness "+
+			"SAW the defect, not just that the run exited 0: %q", res.Why)
+	}
+	// And the underlying summary is still honestly not-OK: the run really did
+	// observe violations. Only the campaign's INTERPRETATION of them differs
+	// when the peer was known-bad on purpose.
+	if res.Summary.OK {
+		t.Error("the monitor must still report the violations it found; MustViolate changes what the " +
+			"campaign concludes from them, never what the monitor observed")
+	}
+}
+
+// TestMustViolateStillHonoursTheFloor pins the half of the fix that is easy to
+// lose: a teeth run must not be able to pass by REPORTING violations off a run
+// that proved nothing. Skipping the whole `!sum.OK` clause for MustViolate
+// would have done exactly that, trading a gate that always fails for one that
+// cannot fail.
+//
+// A zero-tick summary carrying a violation is not reachable from Run (a
+// violation implies a tick), so the clause is exercised at decide() directly —
+// which is also the only way to state the property without inventing a fake
+// monitor that lies about its own history.
+func TestMustViolateStillHonoursTheFloor(t *testing.T) {
+	t.Parallel()
+	res := Result{Violations: []invariant.Violation{{ID: "I4", Verdict: invariant.Fail, Reason: "a fake finding"}}}
+	for _, tc := range []struct {
+		name string
+		sum  invariant.Summary
+		want string
+	}{
+		{"never ticked", invariant.Summary{Ticks: 0, Asserted: 3, Attacked: true}, "never ran a tick"},
+		{"armed and attacked nothing", invariant.Summary{Ticks: 4, Asserted: 3}, "armed no fault"},
+		{"asserted nothing", invariant.Summary{Ticks: 4, Asserted: 0, Attacked: true}, "nothing was asserted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, why := decide(Config{MustViolate: true}, res, tc.sum)
+			if ok {
+				t.Fatalf("a teeth run that %s reported a PASS: %q", tc.name, why)
+			}
+			if !strings.Contains(why, tc.want) {
+				t.Errorf("the refusal does not name the floor it broke (want %q): %q", tc.want, why)
+			}
+		})
+	}
+}
+
 func TestRequirePinsAnActionPastTheBudget(t *testing.T) {
 	t.Parallel()
 	cfg := fastConfig("require", 12345)

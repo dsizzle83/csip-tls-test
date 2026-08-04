@@ -64,6 +64,46 @@ func (e *InvalidControlError) Error() string {
 }
 func (e *InvalidControlError) Unwrap() error { return ErrInvalidControl }
 
+// SetpointRangeError reports a SETPOINT the device cannot achieve, carrying
+// both the commanded magnitude and the achievable one (DERBASE-SILENT-CLAMP).
+//
+// The pre-fix SetActivePowerWatts clamped w to ±WMax and returned nil, so
+// opModFixedW{200 kW} on a 60 kW machine wrote WSet=60000 and reported
+// success. The clamp itself was right — 200 kW must not be written to a 60 kW
+// inverter — but IEEE 2030.5's answer to "I cannot do that" is CannotComply,
+// not a different number applied without comment. Substituting a magnitude
+// leaves the head end's model of the fleet wrong and NOTHING on either side
+// holding the true state, which is the whole-event principle (LXR-002) failing
+// silently rather than loudly.
+//
+// It unwraps to ErrUnsupportedControl because that is what it is: a
+// well-formed request the DEVICE cannot carry out, deterministically, and the
+// gateway's receipt screen must render it CannotComply. Achievable is
+// reported so the head end can re-issue a control the device CAN execute —
+// it is diagnostic, never a value this package writes on the requester's
+// behalf.
+//
+// The distinction that matters is setpoint vs CEILING. A ceiling above the
+// nameplate is clamped to the nameplate and that is not substitution: the
+// device is then bounded at 100 % of what it can physically produce, which
+// satisfies the commanded bound exactly. A setpoint above the nameplate has
+// no such reading — "produce 200 kW" and "produce 60 kW" are different
+// commands — so ceilings clamp and setpoints refuse. See SetWMaxLimPctW.
+type SetpointRangeError struct {
+	Axis       string  // CSIP axis name, or the setter's name on a direct call
+	Point      string  // the SunSpec point the setpoint would be written to
+	Commanded  float64 // what was asked for, in the axis's engineering unit
+	Achievable float64 // the nearest magnitude the device can hold, same unit
+	Bound      string  // what bounds it (e.g. "WMax nameplate")
+}
+
+func (e *SetpointRangeError) Error() string {
+	return fmt.Sprintf("unsupported control %s: setpoint %g exceeds the %s; the device can hold "+
+		"%g at %s — a setpoint the device cannot reach is refused, not silently substituted",
+		e.Axis, e.Commanded, e.Bound, e.Achievable, e.Point)
+}
+func (e *SetpointRangeError) Unwrap() error { return ErrUnsupportedControl }
+
 // MalformedDeviceError reports a device whose declared SunSpec surface is
 // structurally wrong — most importantly a model declared SHORTER than its
 // fixed spec layout, which the pre-LXR-003 code would slice past and panic

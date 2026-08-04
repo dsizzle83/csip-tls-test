@@ -841,7 +841,11 @@ func buildBase(req adminCtrlReq) model.DERControlBase {
 	}
 	if req.FixedVarPct != nil {
 		b.OpModFixedVar = &model.FixedVar{
-			RefType: 1, // 1 = rated capacity
+			// DERUnitRefType 2 = %setMaxVar — see the identical correction in
+			// curve.go for why this was RefType 1 ("rated capacity", which is
+			// not what code 1 means) and why lexa-proto d60e1ca is what makes
+			// the difference observable.
+			RefType: model.RefTypeSetMaxVar,
 			Value:   model.SignedPerCent{Value: int16(*req.FixedVarPct)},
 		}
 	}

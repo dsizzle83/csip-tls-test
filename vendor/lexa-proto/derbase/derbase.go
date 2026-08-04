@@ -15,10 +15,15 @@
 //	opModConnect         → 123 Conn (legacy immediate connect/disconnect)
 //	opModFixedPFInjectW  → 704 PFWInj{PF,Ext}  (constant PF while injecting W)
 //	opModFixedPFAbsorbW  → 704 PFWAbs{PF,Ext}  (constant PF while absorbing W)
-//	opModFixedVar        → 704 VarSet{Mod,Pri,Pct}
-//	opModFixedW          → 704 WSet (Set Active Power, watts) — setpoint
-//	opModMaxLimW/ExpLimW/GenLimW → 704 WMaxLimPct (% of WMax) — ceiling
-//	opModImpLimW/LoadLimW → 704 WSet negative (charge), or legacy 123
+//	opModFixedVar        → 704 VarSet{Mod,Pri,Pct}, VarSetMod chosen by the
+//	                       control's own refType (varsetmod.go); refType=0 and
+//	                       any base 704 cannot express are REFUSED
+//	opModFixedW          → 704 WSet (Set Active Power, watts) — setpoint;
+//	                       beyond the nameplate it REFUSES, never clamps
+//	opModMaxLimW/ExpLimW/GenLimW → 704 WMaxLimPct (% of WMax) — ceiling, and
+//	                       simultaneous ceilings min-combine in watts
+//	opModImpLimW/LoadLimW → REFUSED: no 7xx register expresses an import bound
+//	                       (see importBoundUnsupported for the survey)
 //
 // Curve modes (opModVoltVar / opModVoltWatt / ride-through / freq-droop) are
 // applied through the typed curve writers, which follow the §3.1.2 adopt
@@ -30,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	model "lexa-proto/csipmodel"
@@ -506,7 +512,10 @@ func (b *Base) ApplyControlPlan(ctrl model.DERControlBase, tag string) (PlanOutc
 	out.Elements = make([]ElementOutcome, len(ordered))
 	for i, s := range ordered {
 		out.Elements[i] = ElementOutcome{Name: s.axis, Model: s.model,
-			State: ElementNotAttempted, Before: math.NaN(), After: math.NaN()}
+			State: ElementNotAttempted, Before: math.NaN(), After: math.NaN(),
+			// Seeded before execution: a min-combined ceiling's element must
+			// name the axes it reduced even if the axis is never reached.
+			Advisory: s.advisory}
 	}
 
 	var runErr error
@@ -526,16 +535,16 @@ func (b *Base) ApplyControlPlan(ctrl model.DERControlBase, tag string) (PlanOutc
 			sub2, err2 := s.run()
 			sub, err = sub2, err2
 			if err == nil {
-				out.Elements[i].Advisory = "adopted on the document's one bounded re-attempt"
+				addAdvisory(&out.Elements[i], "adopted on the document's one bounded re-attempt")
 			} else {
-				out.Elements[i].Advisory = "the document's one bounded re-attempt also failed"
+				addAdvisory(&out.Elements[i], "the document's one bounded re-attempt also failed")
 			}
 		}
 		out.Elements[i].Sub = sub
 		if err == nil {
 			out.Elements[i].State = ElementApplied
-			if sub != nil && sub.Degraded() && out.Elements[i].Advisory == "" {
-				out.Elements[i].Advisory = "axis plan applied-degraded: " + sub.String()
+			if sub != nil && sub.Degraded() {
+				addAdvisory(&out.Elements[i], "axis plan applied-degraded: "+sub.String())
 			}
 			continue
 		}
@@ -612,6 +621,12 @@ type applyStep struct {
 	axis  string
 	model uint16 // SunSpec model the axis writes, for the outcome's element
 	rank  int
+	// advisory is seeded onto the step's ElementOutcome before execution, for
+	// facts about the STEP rather than about what the device did with it — at
+	// present, which simultaneously-present axes a min-combined ceiling reduced
+	// (see combineCeilingsW). A document that asked for three ceilings and gets
+	// one element must be able to see the other two in the outcome.
+	advisory string
 	// run executes the axis, returning the axis's OWN measuring plan outcome
 	// when it has one (the M123 plans) and nil when it does not. The document
 	// never invents a measured verdict it does not hold.
@@ -656,6 +671,17 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 				return &o, err
 			}})
 	}
+	// addCombined / addCombinedPlan register the single step a min-combined
+	// ceiling reduces to, named after the BINDING axis and carrying the other
+	// present axes as an advisory.
+	addCombined := func(bind ceilingBind, modelID uint16, rank int, run func() error) {
+		add(bind.axis, modelID, rank, run)
+		steps[len(steps)-1].advisory = bind.advisory()
+	}
+	addCombinedPlan := func(bind ceilingBind, modelID uint16, rank int, run func() (PlanOutcome, error)) {
+		addPlan(bind.axis, modelID, rank, run)
+		steps[len(steps)-1].advisory = bind.advisory()
+	}
 	// releaseRank ranks a two-state axis: restricting the DER goes first,
 	// releasing it goes last.
 	releaseRank := func(releasing bool) int {
@@ -693,7 +719,7 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if !b.Has704 {
 			return nil, &UnsupportedControlError{Axis: "opModFixedPFInjectW", Reason: "device has no M704 (DERCtlAC)"}
 		}
-		if err := b.requireCtrlMode("opModFixedPFInjectW", sunspec.M702_CtrlMode_FixedPF, "FIXED_PF"); err != nil {
+		if err := b.requireCtrlModes("opModFixedPFInjectW", modeFixedPF); err != nil {
 			return nil, err
 		}
 		pf := math.Abs(float64(ctrl.OpModFixedPFInjectW.Value)) / 10000.0
@@ -707,7 +733,7 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if !b.Has704 {
 			return nil, &UnsupportedControlError{Axis: "opModFixedPFAbsorbW", Reason: "device has no M704 (DERCtlAC)"}
 		}
-		if err := b.requireCtrlMode("opModFixedPFAbsorbW", sunspec.M702_CtrlMode_FixedPF, "FIXED_PF"); err != nil {
+		if err := b.requireCtrlModes("opModFixedPFAbsorbW", modeFixedPF); err != nil {
 			return nil, err
 		}
 		pf := math.Abs(float64(ctrl.OpModFixedPFAbsorbW.Value)) / 10000.0
@@ -721,21 +747,31 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if !b.Has704 {
 			return nil, &UnsupportedControlError{Axis: "opModFixedVar", Reason: "device has no M704 (DERCtlAC)"}
 		}
-		if err := b.requireCtrlMode("opModFixedVar", sunspec.M702_CtrlMode_FixedVar, "FIXED_VAR"); err != nil {
+		if err := b.requireCtrlModes("opModFixedVar", modeFixedVar); err != nil {
 			return nil, err
 		}
 		pct := float64(ctrl.OpModFixedVar.Value.Value) / 100.0
 		if math.IsNaN(pct) || pct < -100 || pct > 100 {
 			return nil, &InvalidControlError{Axis: "opModFixedVar",
-				Reason: fmt.Sprintf("reactive setpoint %.2f%% outside [-100,100] of VarMax", pct)}
+				Reason: fmt.Sprintf("reactive setpoint %.2f%% outside [-100,100]", pct)}
 		}
-		add("opModFixedVar", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetConstantVar(pct, tag) })
+		// The percentage's BASE, named by the document's own refType. Resolving
+		// it HERE, not in the writer, keeps a refType this device cannot express
+		// a whole-request rejection with zero writes (varsetmod.go).
+		mod, _, err := varSetModForRefType("opModFixedVar", ctrl.OpModFixedVar.RefType)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.requireVarBase("opModFixedVar", mod, pct); err != nil {
+			return nil, err
+		}
+		add("opModFixedVar", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetConstantVar(pct, mod, tag) })
 	}
 	if ctrl.OpModFixedW != nil {
 		if !b.Has704 {
 			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
 		}
-		if err := b.requireCtrlMode("opModFixedW", sunspec.M702_CtrlMode_FixedW, "FIXED_W"); err != nil {
+		if err := b.requireCtrlModes("opModFixedW", modeFixedW); err != nil {
 			return nil, err
 		}
 		w, err := wattsChecked(ctrl.OpModFixedW, "opModFixedW")
@@ -748,18 +784,11 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		add("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
 	}
 
-	// Ceilings → WMaxLimPct (% of WMax). First non-nil wins.
-	if axis, lim := firstNonNilAxis(
-		axisAP{"opModExpLimW", ctrl.OpModExpLimW},
-		axisAP{"opModMaxLimW", ctrl.OpModMaxLimW},
-		axisAP{"opModGenLimW", ctrl.OpModGenLimW}); lim != nil {
-		w, err := wattsChecked(lim, axis)
-		if err != nil {
-			return nil, err
-		}
-		if w < 0 {
-			return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative ceiling %g W", w)}
-		}
+	// Ceilings → WMaxLimPct (% of WMax). Simultaneous ceilings MIN-COMBINE.
+	if bind, ok, err := combineCeilingsW(ctrl); err != nil {
+		return nil, err
+	} else if ok {
+		w := bind.watts
 		// Both branches convert watts through the nameplate, so an unknown
 		// WMax is a preflight rejection, not a failure discovered after the
 		// other axes have been written.
@@ -768,10 +797,10 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		}
 		switch {
 		case b.Has704:
-			if err := b.requireCtrlMode(axis, sunspec.M702_CtrlMode_MaxW, "MAX_W"); err != nil {
+			if err := b.requireCtrlModes(bind.axis, modeMaxW); err != nil {
 				return nil, err
 			}
-			add(axis, sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetWMaxLimPctW(w, tag) })
+			addCombined(bind, sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetWMaxLimPctW(w, tag) })
 		case b.Reader.HasModel(sunspec.ModelImmediateCtrl):
 			// LEGACY ALLOWLIST (capability.go): the M123 ceiling needs no 702
 			// claim on a device measured to have no 7xx control surface. A
@@ -779,22 +808,25 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 			// it can make a MAX_W claim and must — the allowlist covers
 			// devices that cannot claim, not devices that did not bother.
 			if !b.LegacyM123Shape() {
-				if err := b.requireCtrlMode(axis, sunspec.M702_CtrlMode_MaxW, "MAX_W"); err != nil {
+				if err := b.requireCtrlModes(bind.axis, modeMaxW); err != nil {
 					return nil, err
 				}
 			}
-			addPlan(axis, sunspec.ModelImmediateCtrl, rankLimit, func() (PlanOutcome, error) {
+			addCombinedPlan(bind, sunspec.ModelImmediateCtrl, rankLimit, func() (PlanOutcome, error) {
 				return b.SetLegacyWMaxLimPctPlan(w, tag)
 			})
 		default:
-			return nil, &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for power limiting"}
+			return nil, &UnsupportedControlError{Axis: bind.axis, Reason: "device has neither M704 nor M123 for power limiting"}
 		}
 	}
 
-	// Import / load (charge) → negative Set Active Power, or legacy 123.
+	// Import / load (charge) ceilings: REFUSED on every device shape.
+	// importBoundUnsupported states the register survey; nothing is written.
 	if axis, imp := firstNonNilAxis(
 		axisAP{"opModImpLimW", ctrl.OpModImpLimW},
 		axisAP{"opModLoadLimW", ctrl.OpModLoadLimW}); imp != nil {
+		// Validate the request anyway, so a document that is BOTH malformed and
+		// unsupported is reported as malformed — the head end can fix that one.
 		w, err := wattsChecked(imp, axis)
 		if err != nil {
 			return nil, err
@@ -802,33 +834,77 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if w < 0 {
 			return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative import limit %g W", w)}
 		}
-		switch {
-		case b.Has704:
-			if err := b.requireCtrlMode(axis, sunspec.M702_CtrlMode_FixedW, "FIXED_W (required for charge setpoint)"); err != nil {
-				return nil, err
-			}
-			if err := b.validateSetpointW(-w, axis); err != nil {
-				return nil, err
-			}
-			add(axis, sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(-w, tag) })
-		case b.Reader.HasModel(sunspec.ModelImmediateCtrl):
-			// LEGACY ALLOWLIST, import half — same rule as the ceiling above.
-			if !b.LegacyM123Shape() {
-				if err := b.requireCtrlMode(axis, sunspec.M702_CtrlMode_MaxW, "MAX_W"); err != nil {
-					return nil, err
-				}
-			}
-			if err := b.requireWmax(tag); err != nil {
-				return nil, err
-			}
-			addPlan(axis, sunspec.ModelImmediateCtrl, rankLimit, func() (PlanOutcome, error) {
-				return b.SetLegacyWMaxLimPctPlan(-w, tag)
-			})
-		default:
-			return nil, &UnsupportedControlError{Axis: axis, Reason: "device has neither M704 nor M123 for import limiting"}
-		}
+		return nil, importBoundUnsupported(ctrl)
 	}
 	return steps, nil
+}
+
+// importBoundUnsupported is the typed refusal for opModImpLimW / opModLoadLimW
+// (DERBASE-IMPORT-AS-SETPOINT). It names every import axis the document
+// carried, because a head end that sent two is owed the truth about both.
+//
+// ── The register survey behind this refusal ──────────────────────────
+//
+// The pre-fix code routed both axes to SetActivePowerWatts(-w), which writes
+// 704 WSetEna=1, WSetMod=Watts, WSet=−w. WSet means PRODUCE THIS; the document
+// said DO NOT IMPORT MORE THAN THIS. On an idle 60 kW machine,
+// opModImpLimW{5 kW} therefore COMMANDED a 5 kW import from a DER under no
+// obligation to move any active power (DIFF-CTL-020) — the only defect in the
+// differential run that makes an idle DER move real power it was never told to
+// move. And because opModFixedW lands in the same register at the same rank, a
+// document carrying both had the import axis silently overwrite the discharge
+// setpoint, with no error and no outcome element saying so (DIFF-CTL-030).
+//
+// Every register in the models this package speaks was surveyed for one that
+// expresses an import BOUND, and there is none:
+//
+//	M704 WSet / WSetPct     signed SETPOINTS ("produce this"), not bounds. This
+//	                        is the defect, not the fix.
+//	M704 WMaxLimPct         a bound, but a uint16 percent of WMax on the OUTPUT
+//	                        side. 704 defines no charge-side counterpart and no
+//	                        sign for this point.
+//	M702 WChaRteMax         RW, and it does mean "maximum rate of energy
+//	                        transfer INTO the device" — but it is a SETTING in
+//	                        the nameplate model, not a control: CtrlModes has no
+//	                        bit for it (so deny-by-default has nothing to gate
+//	                        on), it has no reversion timer (so a time-bound CSIP
+//	                        event would derate the device permanently), and it
+//	                        is the very point the device's advertised charge
+//	                        capability is read from, so writing it would edit
+//	                        the capability we report northbound.
+//	M123 WMaxLimPct         a uint16 percent-of-WMax EXPORT ceiling. The
+//	                        pre-fix legacy branch wrote a NEGATIVE percentage
+//	                        into it, which is outside the point's declared type
+//	                        — a bench-sim convention, not a device standard.
+//	M802 WChaRteMax         same objection as M702's: a battery-detail setting,
+//	                        outside the 1547 control surface entirely.
+//
+// So the axis is unsupported on every device shape this package can address,
+// and the honest consequence is that it refuses EVERYWHERE. That is the
+// correct outcome: the gateway's receipt screen renders a CannotComply, the
+// head end learns the bound is not in force, and no DER is commanded to import
+// power in the name of a limit. The day a device declares a real import-limit
+// CONTROL — a capability bit plus a dedicated bounded register — this is where
+// that branch goes, with read-back like every other bound.
+func importBoundUnsupported(ctrl model.DERControlBase) error {
+	axes := ""
+	for _, p := range []axisAP{
+		{"opModImpLimW", ctrl.OpModImpLimW},
+		{"opModLoadLimW", ctrl.OpModLoadLimW},
+	} {
+		if p.ap == nil {
+			continue
+		}
+		if axes != "" {
+			axes += "+"
+		}
+		axes += p.axis
+	}
+	return &UnsupportedControlError{Axis: axes, Reason: "no register in models 702/704/123 " +
+		"expresses an import/charge BOUND: WSet is a setpoint (commanding it would make an idle " +
+		"DER import power it was never told to move), WMaxLimPct is an export-side ceiling, and " +
+		"M702 WChaRteMax is an un-reverting nameplate setting with no CtrlModes bit — so the " +
+		"bound cannot be expressed on this device and is refused rather than misexecuted"}
 }
 
 // requireWmax rejects a percentage-of-nameplate control on a device whose
@@ -879,20 +955,31 @@ func (b *Base) validatePF(pf float64, axis string) error {
 	return nil
 }
 
-// validateSetpointW rejects an active-power setpoint outside the device's
-// declared charge/discharge rate ratings when those ratings are implemented
-// (LXR-005: charge/discharge capability bounds were previously unenforced).
+// validateSetpointW rejects an active-power setpoint the device cannot hold:
+// outside the NAMEPLATE, or outside the device's declared charge/discharge rate
+// ratings when those ratings are implemented (LXR-005: charge/discharge
+// capability bounds were previously unenforced).
 //
 // Ratings the device leaves unimplemented (NaN) impose no bound here — that is
 // honest unknown, and it is no longer load-bearing, because the axis needed a
-// positive CtrlModes bit to reach this function at all. What DID change: the
-// old `r > 0` guard silently dropped the bound for an implemented rating of 0
-// (or any other out-of-domain value), so a device declaring "my maximum charge
-// rate is 0 W" was commanded to charge anyway. An implemented rating of zero
-// is a positive declaration of incapacity, not an absence — see ratingBound.
+// positive CtrlModes bit to reach this function at all. What DID change under
+// LXR-005: the old `r > 0` guard silently dropped the bound for an implemented
+// rating of 0 (or any other out-of-domain value), so a device declaring "my
+// maximum charge rate is 0 W" was commanded to charge anyway. An implemented
+// rating of zero is a positive declaration of incapacity, not an absence — see
+// ratingBound.
 //
-// The ±WMax clamp in SetActivePowerWatts still applies on top of this.
+// The NAMEPLATE bound is checked here as well as in SetActivePowerWatts, and
+// that duplication is the point (DERBASE-SILENT-CLAMP): checking it only in the
+// writer would make a 200 kW setpoint on a 60 kW machine a mid-document
+// failure, after the document's earlier axes had already been written. Checked
+// here it is a whole-request rejection with zero writes, which is the LXR-002
+// precedent — a request that cannot be executed in full is not executed in
+// part. The two checks share checkSetpointWithinNameplate so they cannot drift.
 func (b *Base) validateSetpointW(w float64, axis string) error {
+	if err := b.checkSetpointWithinNameplate(axis, w); err != nil {
+		return err
+	}
 	if !b.HasCap {
 		return nil
 	}
@@ -916,6 +1003,83 @@ func (b *Base) validateSetpointW(w float64, axis string) error {
 		}
 	}
 	return nil
+}
+
+// ceilingBind is the single active-power ceiling a document's ceiling axes
+// reduce to: the binding magnitude in watts, the axis that bound, and every
+// axis that was combined to get there.
+type ceilingBind struct {
+	axis    string   // the axis whose bound is narrowest — what errors are attributed to
+	watts   float64  // that bound, in watts
+	present []string // every ceiling axis the document carried, in canonical order
+}
+
+// advisory renders the combine for the step's ElementOutcome, or "" when only
+// one ceiling was present and there was nothing to combine.
+func (c ceilingBind) advisory() string {
+	if len(c.present) < 2 {
+		return ""
+	}
+	return fmt.Sprintf("ceiling min-combined over %s; %s binds at %g W",
+		strings.Join(c.present, ", "), c.axis, c.watts)
+}
+
+// combineCeilingsW reduces the simultaneously-present active-power ceiling axes
+// to the NARROWEST bound (DERBASE-CEILING-PREFERENCE).
+//
+// ── What was wrong ───────────────────────────────────────────────────────────
+//
+// preflightControl reduced the three axes with firstNonNilAxis(Exp, Max, Gen) —
+// a fixed PREFERENCE order, not a minimum. Limits are conjunctive: each one
+// must hold, so the binding ceiling is the narrowest, and picking by name
+// drops the others. {opModMaxLimW=5 kW, opModExpLimW=30 kW} on a 60 kW device
+// programmed WMaxLimPct=50 % and left the utility's 5 kW ceiling NOWHERE on the
+// device (DIFF-CTL-010), while the head end was told the control was applied —
+// a curtailment instruction silently not in force. It survived three
+// simultaneous ceilings: {Max=20 kW, Exp=40 kW, Gen=2 kW} held 40 kW against a
+// 2 kW ask (DIFF-CTL-012).
+//
+// ── The rule ─────────────────────────────────────────────────────────────────
+//
+// Combine in WATTS, then express. The axes are CSIP ActivePower values, each
+// carrying its OWN power-of-ten multiplier, so {value=5, multiplier=3} and
+// {value=30000, multiplier=0} are not comparable until both are watts — and
+// they are converted through the same checked conversion, so a hostile
+// multiplier on ANY present axis rejects the document rather than being
+// skipped because a different axis won the preference order. This mirrors the
+// authority-side min-combine (lexa-gw 6ad0d59) one layer down: the gateway
+// min-combines competing programs' ceilings, and the device layer must not
+// then throw the narrowest away.
+//
+// Ties keep the canonical Exp→Max→Gen order, so equal bounds are attributed
+// deterministically. ok=false means the document carried no ceiling axis.
+func combineCeilingsW(ctrl model.DERControlBase) (ceilingBind, bool, error) {
+	var out ceilingBind
+	for _, p := range []axisAP{
+		{"opModExpLimW", ctrl.OpModExpLimW},
+		{"opModMaxLimW", ctrl.OpModMaxLimW},
+		{"opModGenLimW", ctrl.OpModGenLimW},
+	} {
+		if p.ap == nil {
+			continue
+		}
+		// EVERY present axis is validated, not just the one that binds: an
+		// unvalidated axis is a limit nobody checked, and it is the one that
+		// would bind the day the numbers change.
+		w, err := wattsChecked(p.ap, p.axis)
+		if err != nil {
+			return ceilingBind{}, false, err
+		}
+		if w < 0 {
+			return ceilingBind{}, false, &InvalidControlError{Axis: p.axis,
+				Reason: fmt.Sprintf("negative ceiling %g W", w)}
+		}
+		out.present = append(out.present, p.axis)
+		if out.axis == "" || w < out.watts {
+			out.axis, out.watts = p.axis, w
+		}
+	}
+	return out, out.axis != "", nil
 }
 
 func firstNonNil(aps ...*model.ActivePower) *model.ActivePower {
@@ -970,7 +1134,17 @@ func (b *Base) SetEnterService(s sunspec.EnterService, tag string) error {
 }
 
 // SetEnterServiceEnabled toggles only the ES permit-service / cease-to-energize bit.
+//
+// Gated on model presence, not on a CtrlModes bit: 702's bitfield defines no
+// enter-service mode, so gating on a claim the spec gives a device no way to
+// make would be denial by construction (capability.go). Model presence IS the
+// positive measured signal here — and it is checked, which the pre-fix code
+// did not do on this path even though preflightControl did.
 func (b *Base) SetEnterServiceEnabled(energize bool, tag string) error {
+	if !b.Has703 {
+		return &UnsupportedControlError{Axis: "SetEnterServiceEnabled",
+			Reason: "device has no M703 (DEREnterService)"}
+	}
 	val := uint16(0)
 	if energize {
 		val = 1
@@ -999,14 +1173,22 @@ func (b *Base) ReadEnterService(tag string) (sunspec.EnterService, error) {
 // a positive 702 claim, but write704 is reachable directly through the exported
 // setters (SetFixedPF, SetConstantVar, SetActivePowerWatts, SetWMaxLimPctW),
 // and a 7xx control register must not be written on a device that never told us
-// it does 7xx controls. The gate here is claim-LEVEL — does the device publish
-// a CtrlModes declaration at all — because this function does not know which
-// axis it is serving; the per-mode bit is preflight's job.
-func (b *Base) write704(tag string, fn func(v sunspec.View)) error {
+// it does 7xx controls.
+//
+// modes is the UNION of CtrlModes bits for the control functions whose fields
+// fn writes, and EVERY one of them must be positively claimed (round-2 audit
+// F2). The pre-fix gate was claim-LEVEL — "does the device publish a CtrlModes
+// declaration at all" — on the argument that this function does not know which
+// axis it is serving. It does now, because its callers pass it: a device
+// declaring MAX_W and nothing else used to accept a fixed-PF write through
+// SetFixedPF, which is the deny-by-default rule holding in ApplyControl and
+// nowhere else. The claim-level check is subsumed — CapAbsent and
+// CapNotImplemented both fail the per-bit test with their own reason strings.
+func (b *Base) write704(tag string, axis string, modes []ctrlMode, fn func(v sunspec.View)) error {
 	if !b.Has704 {
-		return &UnsupportedControlError{Axis: "M704 write", Reason: "device has no M704 (DERCtlAC)"}
+		return &UnsupportedControlError{Axis: axis, Reason: "device has no M704 (DERCtlAC)"}
 	}
-	if err := b.requireCtrlModesDeclaration("M704 write"); err != nil {
+	if err := b.requireCtrlModes(axis, modes...); err != nil {
 		return err
 	}
 	regs, err := b.Reader.ReadModel(sunspec.ModelDERCtlAC)
@@ -1037,8 +1219,11 @@ func (b *Base) write704(tag string, fn func(v sunspec.View)) error {
 
 // SetFixedPF enables constant power factor. inject selects the PFWInj (injecting
 // active power) vs PFWAbs (absorbing) sync group; overExcited sets excitation.
+//
+// Requires the device's positive FIXED_PF claim, on a direct call exactly as
+// through ApplyControl (audit F2).
 func (b *Base) SetFixedPF(inject bool, pf float64, overExcited bool, tag string) error {
-	return b.write704(tag, func(v sunspec.View) {
+	return b.write704(tag, "SetFixedPF", []ctrlMode{modeFixedPF}, func(v sunspec.View) {
 		ext := uint16(sunspec.M704_Ext_OverExcited)
 		if !overExcited {
 			ext = sunspec.M704_Ext_UnderExcited
@@ -1055,28 +1240,61 @@ func (b *Base) SetFixedPF(inject bool, pf float64, overExcited bool, tag string)
 	})
 }
 
-// SetConstantVar enables constant reactive power as a percentage (signed: + inject).
-func (b *Base) SetConstantVar(pct float64, tag string) error {
-	return b.write704(tag, func(v sunspec.View) {
+// SetConstantVar enables constant reactive power as a percentage (signed:
+// + inject) of the base named by mod — a sunspec.M704_VarSetMod_* code.
+//
+// mod is a PARAMETER, not a constant, because a percentage without its base is
+// not a quantity: the pre-fix signature took only pct and wrote
+// VarSetMod=VarMaxPct for every CSIP refType, so %setMaxW and %statVarAvail
+// commanded the wrong physical quantity (varsetmod.go, DERBASE-VAR-REFTYPE).
+// Callers translating a CSIP opModFixedVar get mod from varSetModForRefType;
+// callers with a base of their own name it directly.
+//
+// Only the three codes a CSIP refType can name are accepted. VAMaxPct and Vars
+// are refused here rather than passed through: nothing in this package can
+// produce them, and accepting an arbitrary enum at an exported boundary is how
+// an unvalidated integer becomes a control mode the device never declared.
+// Requires the device's positive FIXED_VAR claim and a usable base for mod.
+func (b *Base) SetConstantVar(pct float64, mod uint16, tag string) error {
+	switch mod {
+	case sunspec.M704_VarSetMod_WMaxPct, sunspec.M704_VarSetMod_VarMaxPct,
+		sunspec.M704_VarSetMod_VarAvailPct:
+	default:
+		return &InvalidControlError{Axis: "SetConstantVar", Reason: fmt.Sprintf(
+			"VarSetMod=%d is not a percentage base this package commands (want WMaxPct=%d, "+
+				"VarMaxPct=%d or VarAvailPct=%d)", mod, sunspec.M704_VarSetMod_WMaxPct,
+			sunspec.M704_VarSetMod_VarMaxPct, sunspec.M704_VarSetMod_VarAvailPct)}
+	}
+	if err := b.requireVarBase("SetConstantVar", mod, pct); err != nil {
+		return err
+	}
+	return b.write704(tag, "SetConstantVar", []ctrlMode{modeFixedVar}, func(v sunspec.View) {
 		v.SetBool("VarSetEna", true)
-		v.SetEnum("VarSetMod", sunspec.M704_VarSetMod_VarMaxPct)
+		v.SetEnum("VarSetMod", mod)
 		v.SetEnum("VarSetPri", sunspec.M704_VarSetPri_Reactive)
 		v.SetFloat("VarSetPct", pct)
 	})
 }
 
 // SetActivePowerWatts sets the absolute active-power setpoint in watts (WSet,
-// signed: + discharge/export, − charge/import). Clamped to ±WMax when known.
+// signed: + discharge/export, − charge/import).
+//
+// A setpoint whose magnitude exceeds the nameplate is REFUSED with a typed
+// SetpointRangeError carrying commanded vs achievable — it is NOT clamped
+// (DERBASE-SILENT-CLAMP). The pre-fix code clamped to ±WMax and returned nil,
+// so 200 kW on a 60 kW machine wrote 60 kW and reported success: the head end
+// held a fleet model that was wrong and nothing on either side held the true
+// state. See SetpointRangeError for why a ceiling may clamp and a setpoint may
+// not, and validateSetpointW for the preflight copy of this bound — which is
+// what makes the refusal a whole-document rejection with zero writes rather
+// than a failure discovered half-way through a document.
+//
+// Requires the device's positive FIXED_W claim.
 func (b *Base) SetActivePowerWatts(w float64, tag string) error {
-	if !math.IsNaN(b.Wmax) && b.Wmax > 0 {
-		if w > b.Wmax {
-			w = b.Wmax
-		}
-		if w < -b.Wmax {
-			w = -b.Wmax
-		}
+	if err := b.checkSetpointWithinNameplate("SetActivePowerWatts", w); err != nil {
+		return err
 	}
-	return b.write704(tag, func(v sunspec.View) {
+	return b.write704(tag, "SetActivePowerWatts", []ctrlMode{modeFixedW}, func(v sunspec.View) {
 		v.SetBool("WSetEna", true)
 		v.SetEnum("WSetMod", sunspec.M704_WSetMod_Watts)
 		v.SetFloat("WSet", w)
@@ -1084,19 +1302,48 @@ func (b *Base) SetActivePowerWatts(w float64, tag string) error {
 	})
 }
 
+// checkSetpointWithinNameplate refuses an active-power SETPOINT the device
+// cannot reach. An unknown nameplate imposes no bound — that is honest unknown,
+// and the declared 702 rate ratings (validateSetpointW) are the other,
+// independent bound.
+func (b *Base) checkSetpointWithinNameplate(axis string, w float64) error {
+	if math.IsNaN(b.Wmax) || b.Wmax <= 0 || math.Abs(w) <= b.Wmax {
+		return nil
+	}
+	achievable := b.Wmax
+	if w < 0 {
+		achievable = -b.Wmax
+	}
+	return &SetpointRangeError{Axis: axis, Point: "M704 WSet", Commanded: w,
+		Achievable: achievable, Bound: "WMax nameplate"}
+}
+
 // SetWMaxLimPctW sets the active-power ceiling as a percentage of WMax.
+//
+// A ceiling ABOVE the nameplate is clamped to 100 %, and that is not the
+// silent substitution SetActivePowerWatts refuses: a device bounded at its own
+// nameplate satisfies "do not exceed 200 kW" exactly, because it cannot exceed
+// 60 kW either way. The commanded bound is in force; no quantity was replaced.
+//
+// A NEGATIVE ceiling is refused rather than clamped to zero. The pre-fix
+// `if w < 0 { w = 0 }` turned a malformed request into a full curtailment —
+// a real command, silently fabricated from a nonsensical one. preflightControl
+// rejects negative ceilings too; this is the same rule at the exported
+// boundary. Requires the device's positive MAX_W claim.
 func (b *Base) SetWMaxLimPctW(w float64, tag string) error {
 	if math.IsNaN(b.Wmax) || b.Wmax <= 0 {
 		return fmt.Errorf("%s: cannot set power limit: WMax unknown", tag)
 	}
-	if w < 0 {
-		w = 0
+	if w < 0 || math.IsNaN(w) {
+		return &InvalidControlError{Axis: "SetWMaxLimPctW", Reason: fmt.Sprintf(
+			"negative or non-finite ceiling %g W; zeroing it would fabricate a full curtailment "+
+				"nobody commanded", w)}
 	}
 	if w > b.Wmax {
 		w = b.Wmax
 	}
 	pct := w / b.Wmax * 100.0
-	return b.write704(tag, func(v sunspec.View) {
+	return b.write704(tag, "SetWMaxLimPctW", []ctrlMode{modeMaxW}, func(v sunspec.View) {
 		v.SetBool("WMaxLimPctEna", true)
 		v.SetFloat("WMaxLimPct", pct)
 		v.SetU32("WMaxLimPctRvrtTms", b.DefaultRvrtTms)
@@ -1232,9 +1479,16 @@ func (b *Base) ReadVoltVar(tag string) (sunspec.VoltVarCurve, error) {
 	return sunspec.Parse705Curve(regs, 0)
 }
 
+// WriteVoltVar adopts and enables a Q(V) curve. Requires the device's positive
+// VOLT_VAR claim: the pre-fix writer checked model presence only, so a device
+// declaring MAX_W and nothing else had a volt-var curve adopted and ENABLED on
+// it (audit F2).
 func (b *Base) WriteVoltVar(c sunspec.VoltVarCurve, tag string) error {
 	if !b.Has705 {
-		return fmt.Errorf("%s: device has no M705 (DERVoltVar)", tag)
+		return &UnsupportedControlError{Axis: "WriteVoltVar", Reason: "device has no M705 (DERVoltVar)"}
+	}
+	if err := b.requireCtrlModes("WriteVoltVar", modeVoltVar); err != nil {
+		return err
 	}
 	regs, err := b.Reader.ReadModel(sunspec.ModelDERVoltVar)
 	if err != nil {
@@ -1260,9 +1514,13 @@ func (b *Base) ReadVoltWatt(tag string) (sunspec.VoltWattCurve, error) {
 	return sunspec.Parse706Curve(regs, 0)
 }
 
+// WriteVoltWatt adopts and enables a P(V) curve. Requires VOLT_WATT (audit F2).
 func (b *Base) WriteVoltWatt(c sunspec.VoltWattCurve, tag string) error {
 	if !b.Has706 {
-		return fmt.Errorf("%s: device has no M706 (DERVoltWatt)", tag)
+		return &UnsupportedControlError{Axis: "WriteVoltWatt", Reason: "device has no M706 (DERVoltWatt)"}
+	}
+	if err := b.requireCtrlModes("WriteVoltWatt", modeVoltWatt); err != nil {
+		return err
 	}
 	regs, err := b.Reader.ReadModel(sunspec.ModelDERVoltWatt)
 	if err != nil {
@@ -1281,13 +1539,13 @@ func (b *Base) ReadVoltageTripLV(tag string) (sunspec.VoltageTripSet, error) {
 	return b.readVoltageTrip(sunspec.ModelDERTripLV, b.Has707, "M707", tag)
 }
 func (b *Base) WriteVoltageTripLV(c sunspec.VoltageTripSet, tag string) error {
-	return b.writeVoltageTrip(sunspec.ModelDERTripLV, b.Has707, "M707", c, tag)
+	return b.writeVoltageTrip(sunspec.ModelDERTripLV, b.Has707, "M707", modeLVTrip, c, tag)
 }
 func (b *Base) ReadVoltageTripHV(tag string) (sunspec.VoltageTripSet, error) {
 	return b.readVoltageTrip(sunspec.ModelDERTripHV, b.Has708, "M708", tag)
 }
 func (b *Base) WriteVoltageTripHV(c sunspec.VoltageTripSet, tag string) error {
-	return b.writeVoltageTrip(sunspec.ModelDERTripHV, b.Has708, "M708", c, tag)
+	return b.writeVoltageTrip(sunspec.ModelDERTripHV, b.Has708, "M708", modeHVTrip, c, tag)
 }
 
 func (b *Base) readVoltageTrip(modelID uint16, has bool, name, tag string) (sunspec.VoltageTripSet, error) {
@@ -1301,9 +1559,15 @@ func (b *Base) readVoltageTrip(modelID uint16, has bool, name, tag string) (suns
 	return sunspec.Parse707Set(regs, 0)
 }
 
-func (b *Base) writeVoltageTrip(modelID uint16, has bool, name string, c sunspec.VoltageTripSet, tag string) error {
+// writeVoltageTrip requires the trip curve's own CtrlModes bit (audit F2): a
+// ride-through curve is a 7xx control function like any other, and adopting one
+// on a device that never declared it is the same defect as a fixed-PF write.
+func (b *Base) writeVoltageTrip(modelID uint16, has bool, name string, mode ctrlMode, c sunspec.VoltageTripSet, tag string) error {
 	if !has {
-		return fmt.Errorf("%s: device has no %s", tag, name)
+		return &UnsupportedControlError{Axis: "write" + name, Reason: "device has no " + name}
+	}
+	if err := b.requireCtrlModes("write"+name, mode); err != nil {
+		return err
 	}
 	regs, err := b.Reader.ReadModel(modelID)
 	if err != nil {
@@ -1322,13 +1586,13 @@ func (b *Base) ReadFreqTripLF(tag string) (sunspec.FreqTripSet, error) {
 	return b.readFreqTrip(sunspec.ModelDERTripLF, b.Has709, "M709", tag)
 }
 func (b *Base) WriteFreqTripLF(c sunspec.FreqTripSet, tag string) error {
-	return b.writeFreqTrip(sunspec.ModelDERTripLF, b.Has709, "M709", c, tag)
+	return b.writeFreqTrip(sunspec.ModelDERTripLF, b.Has709, "M709", modeLFTrip, c, tag)
 }
 func (b *Base) ReadFreqTripHF(tag string) (sunspec.FreqTripSet, error) {
 	return b.readFreqTrip(sunspec.ModelDERTripHF, b.Has710, "M710", tag)
 }
 func (b *Base) WriteFreqTripHF(c sunspec.FreqTripSet, tag string) error {
-	return b.writeFreqTrip(sunspec.ModelDERTripHF, b.Has710, "M710", c, tag)
+	return b.writeFreqTrip(sunspec.ModelDERTripHF, b.Has710, "M710", modeHFTrip, c, tag)
 }
 
 func (b *Base) readFreqTrip(modelID uint16, has bool, name, tag string) (sunspec.FreqTripSet, error) {
@@ -1342,9 +1606,14 @@ func (b *Base) readFreqTrip(modelID uint16, has bool, name, tag string) (sunspec
 	return sunspec.Parse709Set(regs, 0)
 }
 
-func (b *Base) writeFreqTrip(modelID uint16, has bool, name string, c sunspec.FreqTripSet, tag string) error {
+// writeFreqTrip requires the trip curve's own CtrlModes bit — see
+// writeVoltageTrip.
+func (b *Base) writeFreqTrip(modelID uint16, has bool, name string, mode ctrlMode, c sunspec.FreqTripSet, tag string) error {
 	if !has {
-		return fmt.Errorf("%s: device has no %s", tag, name)
+		return &UnsupportedControlError{Axis: "write" + name, Reason: "device has no " + name}
+	}
+	if err := b.requireCtrlModes("write"+name, mode); err != nil {
+		return err
 	}
 	regs, err := b.Reader.ReadModel(modelID)
 	if err != nil {
@@ -1370,9 +1639,14 @@ func (b *Base) ReadFreqDroop(tag string) (sunspec.FreqDroopCtl, error) {
 	return sunspec.Parse711Ctl(regs, 0)
 }
 
+// WriteFreqDroop adopts and enables a P(f) droop control. Requires FREQ_WATT —
+// the CtrlModes symbol for frequency-droop active power (audit F2).
 func (b *Base) WriteFreqDroop(c sunspec.FreqDroopCtl, tag string) error {
 	if !b.Has711 {
-		return fmt.Errorf("%s: device has no M711 (DERFreqDroop)", tag)
+		return &UnsupportedControlError{Axis: "WriteFreqDroop", Reason: "device has no M711 (DERFreqDroop)"}
+	}
+	if err := b.requireCtrlModes("WriteFreqDroop", modeFreqWatt); err != nil {
+		return err
 	}
 	regs, err := b.Reader.ReadModel(sunspec.ModelDERFreqDroop)
 	if err != nil {
@@ -1398,9 +1672,13 @@ func (b *Base) ReadWattVar(tag string) (sunspec.WattVarCurve, error) {
 	return sunspec.Parse712Curve(regs, 0)
 }
 
+// WriteWattVar adopts and enables a Q(P) curve. Requires WATT_VAR (audit F2).
 func (b *Base) WriteWattVar(c sunspec.WattVarCurve, tag string) error {
 	if !b.Has712 {
-		return fmt.Errorf("%s: device has no M712 (DERWattVar)", tag)
+		return &UnsupportedControlError{Axis: "WriteWattVar", Reason: "device has no M712 (DERWattVar)"}
+	}
+	if err := b.requireCtrlModes("WriteWattVar", modeWattVar); err != nil {
+		return err
 	}
 	regs, err := b.Reader.ReadModel(sunspec.ModelDERWattVar)
 	if err != nil {
@@ -1601,10 +1879,22 @@ func (p *m123ConnPlan) execute() (PlanOutcome, error) {
 		Detail: fmt.Sprintf("wrote Conn=%d, device reads back %d", p.want, got)}
 }
 
+// SetImportLimit is REFUSED on every device shape (DERBASE-IMPORT-AS-SETPOINT).
+//
+// It used to write −watts(ap) into M123 WMaxLimPct — a uint16 percent-of-WMax
+// EXPORT ceiling — as a negative percentage, which is outside the point's
+// declared type and expresses nothing a conformant device reads as an import
+// bound. It is kept as a refusal rather than deleted so a caller learns WHY
+// instead of losing the symbol: see importBoundUnsupported for the full
+// register survey, and note that ApplyControl refuses opModImpLimW /
+// opModLoadLimW for exactly the same reason.
 func (b *Base) SetImportLimit(ap *model.ActivePower, tag string) error {
-	return b.setLegacyWMaxLimPct(-watts(ap), tag)
+	return importBoundUnsupported(model.DERControlBase{OpModImpLimW: ap})
 }
 
+// SetExportLimit writes an active-power EXPORT ceiling through the M123 plan.
+// Export is the direction model 123 can express, so this half is unaffected by
+// the import-bound refusal above.
 func (b *Base) SetExportLimit(ap *model.ActivePower, tag string) error {
 	return b.setLegacyWMaxLimPct(watts(ap), tag)
 }
@@ -1717,11 +2007,10 @@ type m123LimitPlan struct {
 	tag string
 
 	// preflight products
-	raw    uint16  // encoded WMaxLimPct target word
-	pct    float64 // signed engineering target, % of WMax (negative = charge)
-	charge bool
-	sf     int16
-	rmp    uint16
+	raw uint16  // encoded WMaxLimPct target word
+	pct float64 // engineering target, % of WMax
+	sf  int16
+	rmp uint16
 
 	grouped     bool
 	win0, rvrt0 uint16 // a grouped write puts these two back AS READ
@@ -1746,10 +2035,9 @@ func (b *Base) SetLegacyWMaxLimPctPlan(w float64, tag string) (PlanOutcome, erro
 	return p.execute()
 }
 
-// setLegacyWMaxLimPct writes M123 WMaxLimPct. Negative w commands charge
-// (battery sim convention); positive w limits export. It is a thin wrapper
-// over the plan — the RawFromScaleSigned/EncodeScaleSigned convention: the
-// outcome-bearing entry point is the real one, and this signature exists so
+// setLegacyWMaxLimPct writes the M123 WMaxLimPct EXPORT ceiling. It is a thin
+// wrapper over the plan — the RawFromScaleSigned/EncodeScaleSigned convention:
+// the outcome-bearing entry point is the real one, and this signature exists so
 // existing callers keep compiling.
 func (b *Base) setLegacyWMaxLimPct(w float64, tag string) error {
 	_, err := b.SetLegacyWMaxLimPctPlan(w, tag)
@@ -1775,8 +2063,25 @@ func (b *Base) newM123LimitPlan(w float64, tag string) (*m123LimitPlan, error) {
 	if err := b.requireWmax(tag); err != nil {
 		return nil, err
 	}
-	p := &m123LimitPlan{b: b, tag: tag, charge: w < 0, rmp: b.legacyRmpTms()}
-	mag := math.Abs(w)
+	// M123 WMaxLimPct is a uint16 percent of WMax on the OUTPUT side. The
+	// pre-fix plan accepted a negative w and encoded a SIGNED percentage into
+	// it as a "battery sim convention" — a value outside the point's declared
+	// type that no conformant device reads as an import bound. The axis that
+	// wanted it (opModImpLimW/opModLoadLimW) is now refused outright, so this
+	// is the same refusal at the plan's own boundary rather than dead code
+	// waiting for a caller (DERBASE-IMPORT-AS-SETPOINT; see
+	// importBoundUnsupported for the register survey).
+	if w < 0 || math.IsNaN(w) {
+		return nil, &UnsupportedControlError{Axis: "M123 WMaxLimPct", Reason: fmt.Sprintf(
+			"cannot express %g W: M123 WMaxLimPct is an unsigned percent-of-WMax export ceiling "+
+				"and carries no import/charge direction", w)}
+	}
+	p := &m123LimitPlan{b: b, tag: tag, rmp: b.legacyRmpTms()}
+	// A ceiling ABOVE the nameplate clamps to 100 %, and that is not a silent
+	// substitution: a device bounded at its own nameplate satisfies the wider
+	// bound exactly, because it cannot exceed it either way. Contrast
+	// SetActivePowerWatts, where an out-of-range SETPOINT is refused.
+	mag := w
 	if mag > b.Wmax {
 		mag = b.Wmax
 	}
@@ -1816,14 +2121,9 @@ func (b *Base) newM123LimitPlan(w float64, tag string) (*m123LimitPlan, error) {
 	// Checked encode (LXR-004): a limit command that cannot be represented at
 	// the device's scale factor must fail loudly, never be silently written as
 	// a clamped different limit or a fabricated zero.
-	var outcome sunspec.EncodeOutcome
-	if p.charge {
-		p.pct = -pct
-		p.raw, outcome = sunspec.EncodeScaleSigned(-pct, p.sf)
-	} else {
-		p.pct = pct
-		p.raw, outcome = sunspec.EncodeScaleUint(pct, p.sf)
-	}
+	p.pct = pct
+	raw, outcome := sunspec.EncodeScaleUint(pct, p.sf)
+	p.raw = raw
 	if !outcome.Representable() {
 		return nil, fmt.Errorf("%s: WMaxLimPct %.2f%% not representable at sf=%d (encode outcome %d): %w",
 			tag, pct, p.sf, outcome, ErrInvalidControl)
@@ -1846,13 +2146,9 @@ func (b *Base) newM123LimitPlan(w float64, tag string) (*m123LimitPlan, error) {
 	return p, nil
 }
 
-// decode converts a raw WMaxLimPct word to engineering percent in the sign
-// domain of the command being executed. NaN means "not interpretable", which
-// ceilingRestriction scores as no limit in force.
+// decode converts a raw WMaxLimPct word to engineering percent. NaN means "not
+// interpretable", which ceilingRestriction scores as no limit in force.
 func (p *m123LimitPlan) decode(raw uint16) float64 {
-	if p.charge {
-		return sunspec.ApplyScaleSigned(raw, p.sf)
-	}
 	if raw == 0xFFFF {
 		return math.NaN() // uint16 not-implemented sentinel
 	}
