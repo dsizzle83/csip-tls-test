@@ -627,6 +627,101 @@ func TestAckNoApply_RefusesWhenItHasNothingToTarget(t *testing.T) {
 	}
 }
 
+// ── ack_no_apply on 704 control registers ───────────────────────────────────
+
+// newLyingSolarAdvanced builds an ADVANCED solar sim (701/702/703/704) wired
+// through the REAL installLies() — not newLyingSolar's hand-rolled fields map
+// above, which only ever modeled the legacy (non-advanced) shape — so a test
+// here exercises the exact field set a real NewSolarServerAdvanced sim gets,
+// including the 704 CONTROL points installLies now names.
+func newLyingSolarAdvanced(t *testing.T, wmax float64) *SolarServer {
+	t.Helper()
+	regs := &RegisterMap{regs: make(map[uint16]uint16)}
+	varRating := wmax * 0.44
+	bases, adv := populateSolarAdvanced(regs, wmax, varRating, "", false)
+	ss := &SolarServer{
+		Server: &Server{Regs: regs}, bases: bases, wmaxW: wmax,
+		advanced: true, adv: adv, varRating: varRating,
+	}
+	ss.faults.label = "solar"
+	ss.faults.configureGate(bases.M123Base + sunspec.M123_WMaxLimPct_Ena)
+	ss.faults.configureScale(bases.M103Base + sunspec.M103_W_SF)
+	regs.OnWriteAttempt = ss.interceptWrite
+	regs.OnRead = ss.faults.transportRead
+	ss.installLies()
+	return ss
+}
+
+// TestAckNoApply_TargetsA704ControlRegister is the teeth for extending the
+// injectable field set to the 704 control points. Before it, `fields` was
+// measurement-only, so the lying-CONTROL path — an ACK'd write to a control
+// register that never latches, FI-04's false-Applied probe — could only be
+// targeted with a raw, undocumented address, or fell back to ack_no_apply's
+// bare default (the WMaxLimPct VALUE register alone, never its Ena bit and
+// never WSet at all).
+//
+// WMaxLimPctEna is the sharpest case to pin: it is the bit that turns
+// WMaxLimPct's percentage from an inert setting into an ENFORCED ceiling, so
+// a hub that enables curtailment, receives an ordinary ACK, and does not
+// re-read the enable bit would believe the DER is capped when nothing
+// changed — silent wrong control, the whole reason this file exists.
+func TestAckNoApply_TargetsA704ControlRegister(t *testing.T) {
+	ss := newLyingSolarAdvanced(t, 8000)
+	ena := ss.adv.M704 + uint16(sunspec.L704.Offset("WMaxLimPctEna"))
+
+	// The named field must resolve to the real register — a wiring slip here
+	// would arm the fault against the wrong address rather than erroring.
+	if got := ss.lies.fields["WMaxLimPctEna"]; got != ena {
+		t.Fatalf(`fields["WMaxLimPctEna"] = %d, want %d (704 WMaxLimPctEna)`, got, ena)
+	}
+	if prior := ss.Regs.Get(ena); prior != 0 {
+		t.Fatalf("fixture assumption: WMaxLimPctEna starts disabled, got %d", prior)
+	}
+
+	arm(t, ss, `{"kind":"ack_no_apply","fields":["WMaxLimPctEna"]}`)
+	if err := modbusWrite(t, ss, ena, 1); err != nil {
+		t.Fatalf("ack_no_apply must ACK the write, not refuse it: %v", err)
+	}
+	if v := ss.Regs.Get(ena); v != 0 {
+		t.Fatalf("WMaxLimPctEna = %d after an ACKed write, want 0 (ack_no_apply must store NOTHING) — "+
+			"a hub trusting the ACK now believes curtailment is enforced when it is not", v)
+	}
+	if n := ss.lies.Stats().Fired["ack_no_apply"]; n != 1 {
+		t.Fatalf("ack_no_apply fired %d times, want 1", n)
+	}
+
+	// The other 704 control points the fix names — "at minimum" per the task
+	// — must also resolve to real addresses inside the 704 block, so a
+	// partial fix (only the Ena bit wired) is caught here.
+	for _, name := range []string{"WMaxLimPct", "WSet", "WSetEna"} {
+		addr, ok := ss.lies.fields[name]
+		if !ok {
+			t.Errorf("fields[%q] missing — 704 control points must be targetable by name", name)
+			continue
+		}
+		if addr < ss.adv.M704 {
+			t.Errorf("fields[%q] = %d, want an address inside the 704 block (>= %d)", name, addr, ss.adv.M704)
+		}
+	}
+}
+
+// TestAckNoApply_WSetControlRegisterReadbackStillLies is the same false-
+// Applied probe against WSet (the fixed active-power setpoint), the other
+// point the fix names — a second lying-CONTROL register, not just the
+// ceiling, so a future bench pass can drive either axis.
+func TestAckNoApply_WSetControlRegisterReadbackStillLies(t *testing.T) {
+	ss := newLyingSolarAdvanced(t, 8000)
+	wsetEna := ss.adv.M704 + uint16(sunspec.L704.Offset("WSetEna"))
+
+	arm(t, ss, `{"kind":"ack_no_apply","fields":["WSetEna"]}`)
+	if err := modbusWrite(t, ss, wsetEna, 1); err != nil {
+		t.Fatalf("ack_no_apply must ACK the write: %v", err)
+	}
+	if v := ss.Regs.Get(wsetEna); v != 0 {
+		t.Fatalf("WSetEna = %d after an ACKed write, want 0 (never latched)", v)
+	}
+}
+
 // ── routing ──────────────────────────────────────────────────────────────────
 
 // TestLieKindsDoNotCollideWithFaultKinds guards the one structural hazard of

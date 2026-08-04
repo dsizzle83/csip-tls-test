@@ -384,9 +384,53 @@ const advSimCtrlModes = sunspec.M702_CtrlMode_MaxW | sunspec.M702_CtrlMode_Fixed
 	sunspec.M702_CtrlMode_LVTrip | sunspec.M702_CtrlMode_HVTrip |
 	sunspec.M702_CtrlMode_LFTrip | sunspec.M702_CtrlMode_HFTrip
 
+// setNotImpl16 writes the SunSpec not-implemented sentinel (0xFFFF) directly
+// into a Tuint16 field's register, bypassing View.SetFloat — which, by design
+// (audit SUN-004), will NEVER encode a value onto the reserved sentinel, so it
+// is the wrong tool for deliberately declaring a point absent. This is the one
+// place that IS the right tool for it.
+//
+// Mirrors the same-named helper in internal/diff/device.go, which encodes the
+// identical fact ("this profile does not model that axis") for its own 702
+// reference fixture — see that function's comment for the derbase mechanics
+// this exists to satisfy (maxRatingBound, lexa-proto derbase/capability.go).
+func setNotImpl16(regs []uint16, l *sunspec.Layout, name string) {
+	off := l.Offset(name)
+	if off >= 0 && off < len(regs) {
+		regs[off] = 0xFFFF
+	}
+}
+
 // populate702 writes a minimal model 702: WMax (so derbase reads the nameplate
 // from 702), the reactive rating used as the fixed-var convergence base, and
 // the CtrlModes capability declaration every 7xx writer now gates on.
+//
+// WChaRteMaxRtg/WDisChaRteMaxRtg (and the WChaRteMax/WDisChaRteMax settings
+// alongside them) are deliberately left at the not-implemented sentinel below
+// rather than at the Go zero value every other field starts from. A Tuint16
+// zero is IMPLEMENTED data, not absence: under derbase's maxRatingBound, an
+// implemented rated maximum of 0 W is the device POSITIVELY declaring it
+// cannot charge/discharge at all, which — since LXR-005 closed the old `r > 0`
+// guard that silently dropped an implemented-zero bound — denies every
+// nonzero active-power setpoint on BOTH axes outright. That is exactly the gap
+// tonight's hardware battery hit: this profile models a plain PV/solar
+// inverter with no battery behind it, so it never had a charge/discharge-rate
+// RATING to declare in the first place, and the honest encoding of "I don't
+// model that axis" is the sentinel — the same choice
+// internal/diff/device.go's fill702 already makes for its own reference
+// fixture, and the one maxRatingBound's own doc names as "the conformant fix
+// on the device side" (lexa-proto derbase/capability.go).
+//
+// A profile that DOES model storage (battery-ish: it can genuinely charge as
+// well as discharge) should NOT reach for this sentinel — it should write a
+// real rating here, symmetric between the two directions unless the device
+// truly is asymmetric, so the rating bound itself becomes exercisable rather
+// than merely absent. No such profile exists in this sim yet; when one does,
+// wire it to populate a real WChaRteMaxRtg/WDisChaRteMaxRtg pair instead of
+// calling setNotImpl16, the same fork this comment describes.
+//
+// See TestPopulate702RateRatingsNotImplemented for the sentinel-vs-implemented
+// contrast this fixes.
 func populate702(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (base, next uint16) {
 	dataLen := sunspec.L702.Len()
 	base, next = writeModelHeader(r, cursor, sunspec.ModelDERCapacity, dataLen)
@@ -411,6 +455,10 @@ func populate702(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (base,
 	v.SetFloat("VarMaxAbs", varRating)
 	v.SetFloat("VNom", 240)
 	v.SetU32("CtrlModes", advSimCtrlModes)
+	setNotImpl16(regs, sunspec.L702, "WChaRteMaxRtg")
+	setNotImpl16(regs, sunspec.L702, "WDisChaRteMaxRtg")
+	setNotImpl16(regs, sunspec.L702, "WChaRteMax")
+	setNotImpl16(regs, sunspec.L702, "WDisChaRteMax")
 	writeSlice(r, base, regs)
 	return base, next
 }

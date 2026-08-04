@@ -595,3 +595,57 @@ func TestModel703ServedByBothSimInstances(t *testing.T) {
 		t.Error("inv-secure (mbapsdev) does not serve model 703")
 	}
 }
+
+// TestPopulate702RateRatingsNotImplemented pins the sentinel-vs-implemented
+// distinction the bench battery's finding turned on: a Tuint16 zero and the
+// SunSpec not-implemented sentinel (0xFFFF) are NOT the same claim, and
+// derbase's maxRatingBound (lexa-proto derbase/capability.go) treats them
+// oppositely — an implemented zero DENIES the axis outright, while the
+// sentinel imposes no bound at all. Before this fix, populate702 left
+// WChaRteMaxRtg/WDisChaRteMaxRtg (and the WChaRteMax/WDisChaRteMax settings
+// beside them) at the Go zero value, which read back as four IMPLEMENTED
+// zero ratings and denied every nonzero active-power setpoint the sim was
+// asked to hold — the exact shape that blocked setpoint-axis bench testing.
+//
+// This profile models a plain PV/solar inverter with no battery behind it, so
+// the honest fix is the sentinel for all four charge/discharge rate points —
+// NOT a real rating, which would be dishonest for a device that never had a
+// charge axis to rate in the first place. The contrast against WMaxRtg (a
+// point this profile DOES implement, and must keep reading as real data) is
+// what makes this a sentinel-vs-implemented test rather than a "reads NaN"
+// test.
+func TestPopulate702RateRatingsNotImplemented(t *testing.T) {
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	_, adv := populateSolarAdvanced(r, 6000, 6000*0.44, "", false)
+
+	regs := readSlice(r, adv.M702, sunspec.L702.Len())
+	v := sunspec.L702.View(regs)
+
+	for _, name := range []string{"WChaRteMaxRtg", "WDisChaRteMaxRtg", "WChaRteMax", "WDisChaRteMax"} {
+		got := v.Float(name)
+		if !math.IsNaN(got) {
+			t.Errorf("702 %s = %v, want NaN (not-implemented sentinel) — an implemented rating here "+
+				"(even 0) denies every nonzero setpoint under maxRatingBound", name, got)
+		}
+	}
+
+	// The contrast: this profile DOES implement WMaxRtg, and it must keep
+	// reading as real, non-sentinel data — a regression that sentineled the
+	// whole 702 block (rather than just the charge/discharge rate points)
+	// would pass the loop above and be caught here instead.
+	if got := v.Float("WMaxRtg"); math.IsNaN(got) || got != 6000 {
+		t.Errorf("702 WMaxRtg = %v, want 6000 (implemented) — this profile DOES declare a real-power rating", got)
+	}
+
+	// Raw-wire assertion: the not-implemented sentinel for a Tuint16 point is
+	// the literal register value 0xFFFF, not merely "whatever View.Float
+	// happens to decode as NaN" — pin the wire encoding itself so a future
+	// change to notImpl detection can't quietly stop writing the sentinel
+	// while still passing the Float-based checks above.
+	for _, name := range []string{"WChaRteMaxRtg", "WDisChaRteMaxRtg", "WChaRteMax", "WDisChaRteMax"} {
+		off := sunspec.L702.Offset(name)
+		if got := regs[off]; got != 0xFFFF {
+			t.Errorf("702 %s raw register = 0x%04x, want 0xFFFF (the SunSpec not-implemented sentinel)", name, got)
+		}
+	}
+}

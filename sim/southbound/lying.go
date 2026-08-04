@@ -65,6 +65,29 @@ package sim
 // not decoration: gw-mayhem's lying-DER family arms these and hands the verdict
 // to internal/invariant, which is the pass/fail authority. This layer only
 // creates the conditions.
+//
+// # Known gap: C4 — mixed-state / lying-export
+//
+// None of the eight lies above can put the sim into a genuine MIXED STATE (a
+// multi-register control write left partially applied, so some engaged axes
+// latched and others did not) or make it answer Modbus with a CLAIM that
+// contradicts its own measurement across models — e.g. M123 Conn/WMaxLimPct
+// reporting curtailed/disconnected while 701/103 keep reporting real,
+// uncontained export. ack_no_apply and sentinel_field both come close but
+// stay inside one register's read/write pair; this gap is specifically a
+// device whose WRITE-PATH claim and MEASUREMENT-PATH claim disagree with
+// each other, not with the truth of a single point.
+//
+// This is intentionally NOT implemented tonight — it is a bigger design (it
+// needs a model of "which axes of a multi-register write actually landed"
+// that the register map does not have yet) — and is tracked, not silently
+// dropped: lexa-gw's docs/design/ACTUATION_PLAN_2026-08-03.md §5/§7 names
+// the same gap ("That gap belongs to C4 (modsim fault modes), and is
+// recorded rather than papered over" / "the sims cannot currently produce a
+// mixed state at all"), and lexa-gw's docs/known_issues.json BENCH-000 entry
+// lists it among the still-open hardware items. Until C4 lands, every mixed-
+// state and ExportContained code path is proven in Go (lexa-proto's
+// plan_test.go / lexa-gw's mixed_state_test.go) and none of it on the bench.
 
 import (
 	"encoding/json"
@@ -477,6 +500,24 @@ func (ss *SolarServer) installLies() {
 			"W_701": "W", "VAr_701": "Var", "VA_701": "VA", "PF_701": "PF", "Hz_701": "Hz",
 		} {
 			fields[name] = ss.adv.M701 + uint16(sunspec.L701.Offset(off))
+		}
+		// 704 CONTROL points, named so ack_no_apply (and sentinel_field) can be
+		// armed against a register the hub WRITES, not just the ones it reads.
+		// Before this, every named field above was measurement-only, which
+		// meant the lying-CONTROL path — an ACK'd ceiling or setpoint write
+		// that never latches, FI-04's false-Applied probe — could only be
+		// targeted with an undocumented raw address, or fell back to
+		// ack_no_apply's default (cmdAddr alone, i.e. WMaxLimPct's VALUE
+		// register only — never its Ena bit, and never WSet at all). At
+		// minimum the ceiling pair and the fixed-setpoint pair: a hub that
+		// enables a ceiling or a setpoint and reads back "Applied" must be
+		// caught when the enable bit or the value itself never stored. See
+		// TestAckNoApply_TargetsA704ControlRegister.
+		for name, off := range map[string]string{
+			"WMaxLimPct": "WMaxLimPct", "WMaxLimPctEna": "WMaxLimPctEna",
+			"WSet": "WSet", "WSetEna": "WSetEna",
+		} {
+			fields[name] = ss.adv.M704 + uint16(sunspec.L704.Offset(off))
 		}
 	}
 
