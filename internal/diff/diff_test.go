@@ -368,15 +368,12 @@ func requireClassGone(t *testing.T, r *Report, byCase map[string]map[string]int,
 //	                                              — no register expresses an
 //	                                              import BOUND
 //
-// WHAT IS NOT CLAIMED HERE. "magnitude" is asserted gone on the cases that
-// pinned DERBASE-VAR-REFTYPE, not run-wide, because ONE magnitude disagreement
-// survives on DIFF-CTL-004 with an entirely different cause: both sides now
-// agree the base is VarAvail (the product writes VarSetMod=VarAvailPct, which
-// is the fix working), and they disagree about what VarAvail IS — this
-// package's referee caps it at the reactive nameplate (csipref.capVarAvail)
-// while internal/invariant resolves the wider apparent-power headroom. That is
-// a live finding and is deliberately NOT silenced here; see
-// TestCtlCatalog_RemainingReactiveFindingsAreReported.
+// WHAT IS NOT CLAIMED HERE. "magnitude" is asserted gone on the cases named
+// below, not run-wide. It used to survive on DIFF-CTL-004 with an entirely
+// different cause — the two halves of THIS repository disagreeing about what
+// VarAvail is — which was never a statement about the product and is now
+// closed at its source; see
+// TestCtlCatalog_ReactiveFindingsFromTheEarlierRunAreClosed.
 func TestCtlCatalog_ConfirmedDefectClassesAreFixed(t *testing.T) {
 	r := NewReport(0)
 	if err := RunCtlCatalog(context.Background(), r); err != nil {
@@ -445,38 +442,42 @@ func TestCtlCatalog_ConfirmedDefectClassesAreFixed(t *testing.T) {
 	}
 }
 
-// TestCtlCatalog_RemainingReactiveFindingsAreReported states what this run
-// still finds, so the residue is a RECORD rather than an absence.
+// TestCtlCatalog_ReactiveFindingsFromTheEarlierRunAreClosed is the fully
+// inverted TestCtlCatalog_RemainingReactiveFindingsAreReported. That test
+// recorded the two reactive shapes the 2026-08-03 run still found and
+// instructed whoever closed each one to invert it and name the commit. Both
+// are now closed, by two different KINDS of work, and keeping the distinction
+// visible is why this is two blocks rather than one loop:
 //
-// It used to record TWO open shapes. One is closed by this commit's pin bump
-// and is inverted below; the other is not a product question at all and is
-// still open.
-//
-//   - CLOSED — DIFF-CTL-001/002 (refType=1, %setMaxW) raised invariant I1 with
+//   - DIFF-CTL-001/002 (refType=1, %setMaxW) raised invariant I1 with
 //     "commanded beyond its own nameplate", and that was a REAL PRODUCT DEFECT.
-//     The product faithfully wrote VarSetMod=WMaxPct + VarSetPct=80 — the
-//     refType fix working — and 80 % of a 60 kW ACTIVE nameplate is 48 kvar,
-//     1.8x the reactive rating on the balanced device and 24x on the 2 kvar
-//     one. It was exposed BY that earlier fix: pre-fix every refType resolved
-//     against VarMaxPct, which is bounded by construction, so the gap could not
-//     show. Fixed in lexa-proto e2d9a37 (DERBASE-VAR-OVERRATED,
-//     checkVarWithinReactiveCapability): the resolved var quantity is checked
-//     against the declared reactive capability on the commanded side and
-//     refused with a typed SetpointRangeError — the rule opModFixedW has
-//     carried since 87e246d. Both cases now reach I1 with nothing applied,
-//     because the document is refused whole at preflight.
+//     80 % of a 60 kW ACTIVE nameplate is 48 kvar of REACTIVE power — 1.8x the
+//     reactive rating on the balanced device, 24x on the 2 kvar one. Fixed in
+//     lexa-proto e2d9a37 (DERBASE-VAR-OVERRATED,
+//     checkVarWithinReactiveCapability); inverted here by the pin bump in
+//     b8a4fe0, and re-asserted below so this test carries the whole reactive
+//     residue in one place.
 //
-//   - STILL OPEN — DIFF-CTL-004 (refType=3, %statVarAvail) disagrees on
-//     magnitude, and it is NOT a statement about the product: both sides agree
-//     the BASE is VarAvail, and this repository disagrees with ITSELF about
-//     what VarAvail is. csipref.capVarAvail narrows it to the reactive
-//     nameplate while internal/invariant uses the wider apparent-power
-//     headroom. DIFF-CTL-004b — the same document on a nearly-loaded device,
-//     where the cap does not bind — PASSES, which is what identifies the cap
-//     rather than the base as the disagreement. Left standing deliberately: it
-//     needs one definition picked against cited reference material, which is a
-//     different piece of work from a vendor bump and belongs in its own commit.
-func TestCtlCatalog_RemainingReactiveFindingsAreReported(t *testing.T) {
+//   - DIFF-CTL-004 (refType=3, %statVarAvail) was NOT a statement about the
+//     product. It was this repository disagreeing with ITSELF: csipref's
+//     capVarAvail narrowed the base to the reactive nameplate while
+//     invariant.Nameplate.Base returned the uncapped apparent-power headroom,
+//     1.8x apart on an idle inverter, and the differential scored its own
+//     internal split against the product. DIFF-CTL-004b — the same document on
+//     a nearly-loaded device, where the cap does not bind — always PASSED,
+//     which is what identified the cap rather than the base as the
+//     disagreement. Reconciled in favour of the CAPPED reading and moved into
+//     invariant.Nameplate.Base, which now carries the definition and its
+//     citations (IEEE 1547 Table 28's separate apparent-power and reactive
+//     ratings; 2030.5's directional, injection-side statVarAvail); the
+//     referee's private copy is deleted. The uncapped reading additionally
+//     manufactured an I1 violation against a conformant product, so this closed
+//     a false positive as well as a disagreement.
+//
+// The sweep half matters as much as the assertions: a finding count of zero
+// reads the same whether the defect was fixed or the probe went quiet, so the
+// cases and the comparisons that adjudicated them are checked to still run.
+func TestCtlCatalog_ReactiveFindingsFromTheEarlierRunAreClosed(t *testing.T) {
 	r := NewReport(0)
 	if err := RunCtlCatalog(context.Background(), r); err != nil {
 		t.Fatalf("catalogue: %v", err)
@@ -496,16 +497,24 @@ func TestCtlCatalog_RemainingReactiveFindingsAreReported(t *testing.T) {
 				id, n)
 		}
 	}
-	if byCase["DIFF-CTL-004"]["magnitude"] == 0 {
-		t.Error("DIFF-CTL-004 no longer disagrees on the VarAvail magnitude. Either capVarAvail and " +
-			"internal/invariant were reconciled — invert this and say which edge won and why — or the " +
-			"case stopped being adjudicated.")
+	if !ran["DIFF-CTL-004"] {
+		t.Error("case DIFF-CTL-004 left the catalogue; the VarAvail reconciliation is then unpinned")
+	}
+	for _, class := range []string{"magnitude", "I1"} {
+		if n := byCase["DIFF-CTL-004"][class]; n != 0 {
+			t.Errorf("DIFF-CTL-004 reports %d %q finding(s) again. If invariant.Nameplate.Base stopped "+
+				"capping VarAvail at the reactive nameplate, the two halves of this repo have "+
+				"re-diverged — read that function's doc comment before changing either side.",
+				n, class)
+		}
 	}
 
-	// The probes must still be asked, or the inversion above passes vacuously.
+	// The probes themselves must still be asked. Both reactive shapes were
+	// adjudicated through the opModFixedVar comparison; if it stops being
+	// produced, everything above passes vacuously.
 	exercised := 0
 	for _, c := range r.Cases {
-		if c.ID != "DIFF-CTL-001" && c.ID != "DIFF-CTL-002" {
+		if c.ID != "DIFF-CTL-001" && c.ID != "DIFF-CTL-002" && c.ID != "DIFF-CTL-004" {
 			continue
 		}
 		for _, cmp := range c.Comparisons {
@@ -515,8 +524,8 @@ func TestCtlCatalog_RemainingReactiveFindingsAreReported(t *testing.T) {
 		}
 	}
 	if exercised == 0 {
-		t.Fatal("no opModFixedVar or invariant.I1 comparison was produced for DIFF-CTL-001/002 — the " +
-			"assertions above are vacuous. A probe removed is not a defect fixed.")
+		t.Fatal("no opModFixedVar or invariant.I1 comparison was produced for DIFF-CTL-001/002/004 — " +
+			"the assertions above are vacuous. A probe removed is not a defect fixed.")
 	}
 }
 

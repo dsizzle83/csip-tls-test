@@ -112,8 +112,13 @@ const (
 	RefWMax      RefBase = "WMax"      // maximum active power setting
 	RefVarMaxInj RefBase = "VarMaxInj" // maximum injected reactive power
 	RefVarMaxAbs RefBase = "VarMaxAbs" // maximum absorbed reactive power
-	RefVarAvail  RefBase = "VarAvail"  // reactive power headroom at the present W
-	RefVAMax     RefBase = "VAMax"     // maximum apparent power
+	// RefVarAvail is IEEE 2030.5's %statVarAvail base: the reactive power the
+	// DER can produce AT THIS INSTANT, bounded by BOTH the converter's
+	// apparent-power headroom and its reactive nameplate. Nameplate.Base
+	// carries the definition and its citations; this is the one place in the
+	// repo it is defined, and internal/diff's referee reads it from here.
+	RefVarAvail RefBase = "VarAvail"
+	RefVAMax    RefBase = "VAMax" // maximum apparent power
 )
 
 // Nameplate is a DER's own ratings and settings, decoded from ITS OWN model 702
@@ -186,12 +191,68 @@ func (n Nameplate) Limit(u Unit, sign int) (LimitRef, bool) {
 
 // Base resolves a reference base into a physical quantity. meas supplies the
 // live measurement RefVarAvail needs; pass a zero Measurement when none is
-// available and RefVarAvail will report why it could not be resolved.
+// available and RefVarAvail will report why it could not be resolved. sign is
+// +1 injecting/exporting and -1 absorbing/importing; only RefVarAvail reads it,
+// because only that base is BOUNDED by a two-sided rating (see below) — the
+// others name a specific side already.
 //
 // The error is deliberately not swallowed into a zero value: a percentage whose
 // base is unknown cannot be converted, and inventing a base is precisely the
 // class of mistake this package exists to catch.
-func (n Nameplate) Base(r RefBase, meas Measurement) (LimitRef, error) {
+//
+// ── %statVarAvail: ONE definition, and where it comes from (DIFF-CTL-004) ────
+//
+// This function is the repository's single definition of available reactive
+// power. internal/diff's referee used to hold a second one — csipref.capVarAvail
+// narrowed this base to the reactive nameplate while this function returned the
+// uncapped apparent-power headroom — and the two disagreed by 1.8x on an
+// ordinary idle inverter. That split is closed HERE rather than there, because
+// the narrower reading is the correct one and a referee is not entitled to a
+// private physics.
+//
+// Available reactive power at an instant is bounded by TWO independent things,
+// and the available figure is the SMALLER:
+//
+//	(1) the converter's apparent-power headroom, sqrt(VAMax^2 - W^2): vars the
+//	    machine has no thermal/current envelope left to carry;
+//	(2) its REACTIVE nameplate on the side being commanded, VarMaxInj injecting
+//	    or VarMaxAbs absorbing: vars the machine is not built to make at all.
+//
+// A 60 kW / 63 kVA inverter idling at 42 kW has 47 kvar of apparent-power
+// headroom and a 26.4 kvar reactive rating. It has 26.4 kvar available, not 47.
+// Term (1) alone answers "what is left of the envelope", which is a different
+// question from "how much reactive power can this machine produce now".
+//
+// The citations, all in-tree. No repo here quotes 2030.5's DERUnitRefType table
+// verbatim, so the reading is built from the reference material that exists:
+//
+//   - lexa-proto csipmodel/resources.go, RefTypeStatVarAvail: "%statVarAvail —
+//     percent of PRESENTLY available reactive power". The commanded quantity is
+//     REACTIVE power, not apparent power, so an apparent-power rating cannot be
+//     the whole bound on it.
+//   - lexa-hub docs/standards-buildout/digests/ieee-1547.md, §10.3 Table 28
+//     minimum point list: the nameplate carries "apparent power max rating"
+//     AND "reactive power injected max; reactive power absorbed max" as
+//     SEPARATE mandatory points. Two independently declared ratings bound the
+//     same machine; a quantity described as available reactive power cannot
+//     exceed either of them.
+//   - the same digest, §4.7.5 + 5.2 reactive-priority note: "DER may curtail
+//     active power to honor reactive demands within its kVA envelope ('reactive
+//     power priority'); an apparent-power-based export limit can starve
+//     reactive capability". The kVA envelope and the reactive capability are
+//     stated as distinct constraints, neither subsuming the other — which is
+//     exactly the min() above.
+//   - lexa-hub docs/standards-buildout/digests/ieee-2030.5-2023-delta.md item
+//     9: 2018's DERAvailability carries the INJECTION-side statVarAvail only;
+//     statVarAbsorbAvail was added in 2023. The quantity is DIRECTIONAL.
+//     sqrt(VAMax^2 - W^2) is sign-symmetric and therefore cannot be the whole
+//     definition; the directional term is the reactive nameplate side, which is
+//     why this function needs the sign.
+//
+// lexa-proto derbase e2d9a37 (commandedVar) reaches the same reading from the
+// product side — it resolves refType=3 against the reactive nameplate as an
+// upper bound on VarAval — so the two repos now agree on what the base IS.
+func (n Nameplate) Base(r RefBase, sign int, meas Measurement) (LimitRef, error) {
 	pick := func(rtg, set Quantity, rtgName, setName string) (LimitRef, error) {
 		// The SETTING governs a percentage: "80% of WMax" means 80% of what
 		// the device is configured to do, not of what it could do. Fall back
@@ -229,7 +290,17 @@ func (n Nameplate) Base(r RefBase, meas Measurement) (LimitRef, error) {
 		if hdr <= 0 {
 			return LimitRef{Q: Q(0, UnitVar), Name: "VarAvail(" + va.Name + ")"}, nil
 		}
-		return LimitRef{Q: Q(math.Sqrt(hdr), UnitVar), Name: "VarAvail(" + va.Name + ")"}, nil
+		avail := LimitRef{Q: Q(math.Sqrt(hdr), UnitVar), Name: "VarAvail(" + va.Name + ")"}
+		// Term (2). Limit gives the NARROWEST of the rating and the setting on
+		// the commanded side, which is the right edge for a capability bound: a
+		// machine configured below its hardware rating cannot produce the
+		// hardware rating. A device that publishes no reactive rating at all
+		// leaves term (1) standing alone — honest unknown, not a licence to
+		// assume a wider machine.
+		if lim, ok := n.Limit(UnitVar, sign); ok && lim.Q.Known() && lim.Q.Val < avail.Q.Val {
+			return LimitRef{Q: lim.Q, Name: "VarAvail capped by " + lim.Name}, nil
+		}
+		return avail, nil
 	}
 	return LimitRef{}, fmt.Errorf("no reference base declared")
 }
@@ -543,7 +614,7 @@ func ResolveCommand(c Command, n Nameplate, meas Measurement) Command {
 		c.Unresolved = "the device serves no M702, so a percentage has no resolvable base"
 		return c
 	}
-	base, err := n.Base(c.Ref, meas)
+	base, err := n.Base(c.Ref, c.Sign, meas)
 	if err != nil {
 		c.Unresolved = fmt.Sprintf("cannot resolve %s (declared by %s=%d): %v", c.Ref, c.ModePoint, c.ModeVal, err)
 		return c

@@ -231,6 +231,32 @@ func ceilingIntents(unit invariant.Unit, sign float64, ps []namedPower) []Intent
 // fixedVarIntent resolves opModFixedVar into vars against the base its refType
 // names. This is the referee's most consequential function and the one the ctl
 // family's headline finding comes out of.
+//
+// ── %statVarAvail is defined ONCE, and not here (DIFF-CTL-004) ──────────────
+//
+// This function used to post-process invariant.Nameplate.Base's answer for
+// refType=3 through a local helper, capVarAvail, which narrowed the base to the
+// reactive nameplate because internal/invariant returned the uncapped
+// apparent-power headroom sqrt(VAMax^2 - W^2). Two definitions of the same
+// quantity, 1.8x apart on an ordinary idle inverter, and the differential duly
+// reported the gap between its own two halves as a finding against the product.
+//
+// The reconciliation kept the narrower reading and moved it into
+// invariant.Nameplate.Base, whose doc comment now carries the definition and
+// its citations: available reactive power is the SMALLER of the apparent-power
+// headroom and the REACTIVE nameplate on the commanded side, because IEEE 1547
+// Table 28 declares those as two separate mandatory ratings and 2030.5's
+// statVarAvail is a directional (injection-side, in 2018) quantity that a
+// sign-symmetric sqrt cannot express. The old helper's stated reason for the
+// split — that I1 wants the wider figure because "it fails fewer things" — was
+// backwards on inspection: a wider VarAvail base makes the resolved command
+// LARGER, so I1 compares a bigger number against the same nameplate and fails
+// MORE. It was manufacturing an over-nameplate violation against a device
+// commanded to 100 % of a headroom it does not have.
+//
+// The rule this leaves: the referee is entitled to its own INTERPRETATION of a
+// document, which is what everything below is. It is not entitled to a private
+// physics for a quantity the checker it feeds also has to resolve.
 func fixedVarIntent(fv model.FixedVar, n invariant.Nameplate, meas invariant.Measurement) Intent {
 	// SignedPerCent is hundredths of a percent (5000 = 50.00 %).
 	pct := float64(fv.Value.Value) / 100.0
@@ -272,13 +298,17 @@ func fixedVarIntent(fv model.FixedVar, n invariant.Nameplate, meas invariant.Mea
 		in.Unresolved = "the device serves no M702, so " + string(ref) + " has no value on it"
 		return in
 	}
-	base, err := n.Base(ref, meas)
+	// The sign selects the side of every two-sided rating, %statVarAvail's
+	// included — see the note above this function on where that definition
+	// lives now.
+	sign := 1
+	if pct < 0 {
+		sign = -1
+	}
+	base, err := n.Base(ref, sign, meas)
 	if err != nil {
 		in.Unresolved = fmt.Sprintf("cannot resolve %s on this device: %v", ref, err)
 		return in
-	}
-	if ref == invariant.RefVarAvail {
-		base = capVarAvail(base, n, pct)
 	}
 	in.BaseUsed = base.Name
 	// The RESULT is reactive power regardless of which rating the percentage
@@ -286,40 +316,6 @@ func fixedVarIntent(fv model.FixedVar, n invariant.Nameplate, meas invariant.Mea
 	// same way internal/invariant's ResolveCommand handles it.
 	in.Want = invariant.Q(pct/100*base.Q.Val, invariant.UnitVar)
 	return in
-}
-
-// capVarAvail narrows the available-reactive-power base to what the device can
-// actually do.
-//
-// internal/invariant computes VarAvail as the apparent-power headroom
-// sqrt(VAMax² − W²), which is the right first term and the one an inverter's
-// thermal envelope imposes. It is not the whole answer: a machine whose
-// converter is happy to supply 47 kvar of apparent-power headroom but whose
-// reactive rating is 26.4 kvar has 26.4 kvar available, not 47. The available
-// figure is the SMALLER of the two, and using the uncapped one would have this
-// referee assert an intent no device could satisfy — which would then be scored
-// against the product as a disagreement the product is not responsible for.
-//
-// This is deliberately fixed HERE, in the referee, and not in
-// internal/invariant: that package's Base is used by I1 to bound what a device
-// was COMMANDED, where the wider figure is the conservative choice (it fails
-// fewer things), while this package uses it to state what the head-end ASKED
-// for, where the narrower figure is the honest one. The two callers want
-// different edges of the same quantity, and a shared helper that picked one
-// would be wrong for the other.
-func capVarAvail(base invariant.LimitRef, n invariant.Nameplate, pct float64) invariant.LimitRef {
-	sign := 1
-	if pct < 0 {
-		sign = -1
-	}
-	lim, ok := n.Limit(invariant.UnitVar, sign)
-	if !ok || !lim.Q.Known() {
-		return base
-	}
-	if lim.Q.Val < base.Q.Val {
-		return invariant.LimitRef{Q: lim.Q, Name: "VarAvail capped by " + lim.Name}
-	}
-	return base
 }
 
 func pfIntent(mode string, spc *model.SignedPerCent) Intent {

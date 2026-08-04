@@ -109,18 +109,82 @@ func TestNameplate_LimitPicksTheSignedRating(t *testing.T) {
 func TestNameplate_VarAvailNeedsALiveMeasurement(t *testing.T) {
 	t.Parallel()
 	np := DecodeNameplate("test", nameplateRegs(t, 100_000, 44_000, 44_000, 110_000))
-	if _, err := np.Base(RefVarAvail, Measurement{}); err == nil {
+	if _, err := np.Base(RefVarAvail, 1, Measurement{}); err == nil {
 		t.Fatal("VarAvail resolved with no live measurement — the zero Measurement's W of 0 must not be " +
 			"mistaken for a reading")
 	}
-	meas := DecodeMeasurement("test", measurementRegs(t, 60_000, 1))
-	got, err := np.Base(RefVarAvail, meas)
+	// 105 kW of a 110 kVA converter leaves sqrt(110k^2 - 105k^2) = 32.8 kvar of
+	// headroom, INSIDE the 44 kvar reactive rating — so the apparent-power term
+	// is the binding one here and the answer is the headroom itself. The other
+	// term is exercised by TestNameplate_VarAvailIsCappedByTheReactiveNameplate.
+	meas := DecodeMeasurement("test", measurementRegs(t, 105_000, 1))
+	got, err := np.Base(RefVarAvail, 1, meas)
 	if err != nil {
 		t.Fatalf("VarAvail did not resolve with a live measurement: %v", err)
 	}
-	want := math.Sqrt(110_000*110_000 - 60_000*60_000)
+	want := math.Sqrt(110_000*110_000 - 105_000*105_000)
 	if math.Abs(got.Q.Val-want) > 500 {
 		t.Fatalf("VarAvail = %s, want ≈%.0f var", got.Q, want)
+	}
+	if got.Name != "VarAvail(VAMax)" {
+		t.Errorf("BaseUsed = %q, want VarAvail(VAMax) — the evidence has to name which term bound it", got.Name)
+	}
+}
+
+// TestNameplate_VarAvailIsCappedByTheReactiveNameplate is the DIFF-CTL-004
+// reconciliation. See Nameplate.Base for the definition and its citations.
+//
+// This test's predecessor asserted VarAvail == sqrt(VAMax^2 - W^2) flat, on a
+// machine at 60 kW of a 110 kVA converter — 92 kvar of "available reactive
+// power" on a 44 kvar machine — and so PINNED half a definition. Apparent-power
+// headroom is one of the two terms, not the answer: what is left of the
+// envelope and what the machine can produce as vars are different questions,
+// and the available figure is the smaller.
+func TestNameplate_VarAvailIsCappedByTheReactiveNameplate(t *testing.T) {
+	t.Parallel()
+	// Asymmetric on purpose: 44 kvar injecting, 10 kvar absorbing. A sign-blind
+	// cap would be wrong on one side of this machine, and 2030.5 treats
+	// available reactive power as directional — 2018's DERAvailability carries
+	// the injection-side statVarAvail only.
+	np := DecodeNameplate("test", nameplateRegs(t, 100_000, 44_000, 10_000, 110_000))
+	meas := DecodeMeasurement("test", measurementRegs(t, 60_000, 1))
+	headroom := math.Sqrt(110_000*110_000 - 60_000*60_000) // ≈ 92 195 var
+
+	for _, tc := range []struct {
+		name string
+		sign int
+		want float64
+		base string
+	}{
+		{"injecting: capped by the injection rating", 1, 44_000, "VarAvail capped by VarMaxInjRtg"},
+		{"absorbing: capped by the SMALLER absorb rating", -1, 10_000, "VarAvail capped by VarMaxAbsRtg"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := np.Base(RefVarAvail, tc.sign, meas)
+			if err != nil {
+				t.Fatalf("VarAvail did not resolve: %v", err)
+			}
+			if math.Abs(got.Q.Val-tc.want) > 1 {
+				t.Errorf("VarAvail = %s, want %.0f var. The uncapped apparent-power headroom is "+
+					"%.0f var, which this machine cannot produce as reactive power at any "+
+					"operating point.", got.Q, tc.want, headroom)
+			}
+			if got.Name != tc.base {
+				t.Errorf("BaseUsed = %q, want %q — a violation record has to say which of the two "+
+					"terms bound the answer", got.Name, tc.base)
+			}
+		})
+	}
+
+	// A device that publishes no reactive rating leaves the apparent-power term
+	// standing alone. Honest unknown: nothing was declared, so nothing caps it.
+	npNoVar := DecodeNameplate("test", nameplateRegs(t, 100_000, 0, 0, 110_000))
+	got, err := npNoVar.Base(RefVarAvail, 1, meas)
+	if err != nil {
+		t.Fatalf("VarAvail did not resolve without a reactive rating: %v", err)
+	}
+	if math.Abs(got.Q.Val-headroom) > 500 {
+		t.Errorf("VarAvail = %s, want ≈%.0f var — an undeclared rating is not a bound", got.Q, headroom)
 	}
 }
 

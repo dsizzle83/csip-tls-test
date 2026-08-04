@@ -223,7 +223,7 @@ func (i *i6) legitimateValues(w *World, obs *Observation, since time.Time) map[s
 	ders := derViews(obs)
 	if len(ders) == 1 {
 		np := ders[0].Unit.Nameplate(ders[0].Source)
-		if base, err := np.Base(RefWMax, ders[0].Unit.Measurement(ders[0].Source)); err == nil && base.Q.Val > 0 {
+		if base, err := np.Base(RefWMax, 1, ders[0].Unit.Measurement(ders[0].Source)); err == nil && base.Q.Val > 0 {
 			for _, p := range obs.HeadEnd.Programs {
 				for _, c := range append(append([]Ctrl{}, p.Active...), p.Scheduled...) {
 					for _, ax := range c.Base.Axes() {
