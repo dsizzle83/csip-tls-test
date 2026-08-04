@@ -1,6 +1,18 @@
 #!/bin/bash
 # TASK-024: CI shared-module version-pinning gate (AD-003(c)).
 #
+# NOTE 2026-08-03: lexa-hub is ABANDONED (product decision: single-product
+# focus on lexa-gw; checkout archived off-disk, see ~/projects/archives/).
+# Everything below through roughly line 60 documents the original two-
+# consumer (csip-tls-test/lexa-hub) design and its CI wiring as history — it
+# is left as written, not rewritten, so the design record stays intact. What
+# actually changed: the peer set is now csip-tls-test + lexa-gw, the
+# --product default below points at ../lexa-gw, and a missing --product peer
+# is now an informational skip rather than a hard failure (a machine that
+# only has this one checkout is a legitimate configuration, same reasoning
+# lexa-gw's own scripts/check-proto-pin.sh already applies to its --peer
+# array).
+#
 # Replaces TASK-004's raw-diff lockstep gate (scripts/ci/lockstep-check.sh,
 # now deleted): that script byte-diffed internal/southbound/sunspec and
 # internal/ocppserver between this repo and lexa-hub while both trees still
@@ -67,11 +79,14 @@
 #   --self <path>      Path to "this side" of the pin comparison. Default:
 #                       this script's own repo root (works out of the box
 #                       when run in csip-tls-test).
-#   --product <path>   Path to the peer consumer repo. Default: `../lexa-hub`
-#                       if --self's basename isn't "lexa-hub", else
+#   --product <path>   Path to the peer consumer repo. Default: `../lexa-gw`
+#                       if --self's basename isn't "lexa-gw", else
 #                       `../csip-tls-test` — i.e. "the other one" under the
-#                       normal sibling-checkout layout. CI always passes this
-#                       explicitly (the checked-out subdirectory).
+#                       normal sibling-checkout layout (lexa-hub, the
+#                       original other peer, was abandoned 2026-08-03 — see
+#                       the note atop this file). CI always passes this
+#                       explicitly (the checked-out subdirectory). A missing
+#                       peer is an informational skip, not a failure.
 #   --proto <path>     Path to a local lexa-proto checkout, for the (b)/(c)
 #                       checks. Default: ../lexa-proto relative to --self.
 #   --no-proto-check   Skip (b)/(c) entirely even if --proto exists (fast
@@ -80,9 +95,11 @@
 #                       `go` toolchain and a real --proto checkout. Slow;
 #                       intended for desktop/local runs, not every CI job.
 #
-# Exit codes: 0 = pins match (and, unless skipped/unavailable, (b) and any
-# requested (c) check pass too). 1 = pin mismatch, missing/malformed proto.pin,
-# missing --product repo, (b) mismatch, or (c) diff found. 2 = usage error.
+# Exit codes: 0 = pins match, or no peer was found to compare against (an
+# informational skip, 2026-08-03 -- see the note atop this file), and, unless
+# skipped/unavailable, (b) and any requested (c) check pass too. 1 = pin
+# mismatch, malformed proto.pin (self or a found peer), (b) mismatch, or (c)
+# diff found. 2 = usage error.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -122,31 +139,25 @@ done
 SELF="$(cd "$SELF" && pwd)"
 
 if [[ -z "$PRODUCT" ]]; then
-  if [[ "$(basename "$SELF")" == "lexa-hub" ]]; then
+  if [[ "$(basename "$SELF")" == "lexa-gw" ]]; then
     PRODUCT="$SELF/../csip-tls-test"
   else
-    PRODUCT="$SELF/../lexa-hub"
+    PRODUCT="$SELF/../lexa-gw"
   fi
 fi
 
+# A missing peer is an INFORMATIONAL skip, not a failure (2026-08-03): with
+# lexa-hub abandoned and archived off-disk, a checkout that only has this one
+# repo is a normal, legitimate configuration -- not evidence of drift. Same
+# reasoning lexa-gw's own scripts/check-proto-pin.sh already applies to an
+# empty --peer set. SELF's own proto.pin is still read and validated below
+# either way.
+PRODUCT_FOUND=1
 if [[ ! -d "$PRODUCT" ]]; then
-  cat >&2 <<EOF
-check-proto-pin: peer consumer repo not found at '$PRODUCT'.
-
-If this is CI: the default GITHUB_TOKEN cannot read a second private repo.
-csip-tls-test's 'proto-pin' job checks out dsizzle83/lexa-hub using the
-LEXA_HUB_RO_TOKEN secret; lexa-hub's 'proto-pin' job checks out
-dsizzle83/csip-tls-test using CSIP_TLS_TEST_RO_TOKEN. If one of those
-secrets doesn't exist yet, the checkout step fails before this script even
-runs -- that is a pending human PAT-creation step (same class of gap as
-AD-012 branch protection / TASK-004's LEXA_HUB_RO_TOKEN), NOT a pin mismatch.
-
-If this is local dev: pass --product <path-to-peer-repo>, or check out the
-peer repo as a sibling (../lexa-hub or ../csip-tls-test).
-EOF
-  exit 1
+  PRODUCT_FOUND=0
+else
+  PRODUCT="$(cd "$PRODUCT" && pwd)"
 fi
-PRODUCT="$(cd "$PRODUCT" && pwd)"
 
 if [[ -z "$PROTO" ]]; then
   PROTO="$SELF/../lexa-proto"
@@ -179,15 +190,30 @@ read_pin() {
 }
 
 SELF_SHA="$(read_pin "$SELF" "self: $(basename "$SELF")")"
-PRODUCT_SHA="$(read_pin "$PRODUCT" "product: $(basename "$PRODUCT")")"
-
-echo "check-proto-pin: $(basename "$SELF")/proto.pin    = $SELF_SHA"
-echo "check-proto-pin: $(basename "$PRODUCT")/proto.pin = $PRODUCT_SHA"
 
 FAIL=0
 
-if [[ "$SELF_SHA" != "$PRODUCT_SHA" ]]; then
-  cat >&2 <<EOF
+if [[ "$PRODUCT_FOUND" -eq 0 ]]; then
+  echo "check-proto-pin: $(basename "$SELF")/proto.pin = $SELF_SHA"
+  cat <<EOF
+check-proto-pin: no peer consumer repo found at '$PRODUCT' -- skipping the
+peer pin comparison (informational only, not a failure).
+
+lexa-hub, the original second peer, was abandoned 2026-08-03 and its
+checkout archived off-disk; the remaining peer is lexa-gw. If this is CI:
+pass --product explicitly with the checked-out peer path (as the proto-pin
+job does). If this is local dev: check out lexa-gw as a sibling (../lexa-gw),
+or pass --product <path-to-peer-repo>. $(basename "$SELF")'s own proto.pin
+is well-formed regardless of whether a peer was found.
+EOF
+else
+  PRODUCT_SHA="$(read_pin "$PRODUCT" "product: $(basename "$PRODUCT")")"
+
+  echo "check-proto-pin: $(basename "$SELF")/proto.pin    = $SELF_SHA"
+  echo "check-proto-pin: $(basename "$PRODUCT")/proto.pin = $PRODUCT_SHA"
+
+  if [[ "$SELF_SHA" != "$PRODUCT_SHA" ]]; then
+    cat >&2 <<EOF
 
 PIN MISMATCH: $(basename "$SELF") pins lexa-proto @ $SELF_SHA
               $(basename "$PRODUCT") pins lexa-proto @ $PRODUCT_SHA
@@ -197,9 +223,10 @@ Version bumps ship as paired PRs (05 §11) -- bump both proto.pin files (and
 regenerate + commit vendor/lexa-proto/ in both, AD-003(e)) in the same
 session, never one side alone.
 EOF
-  FAIL=1
-else
-  echo "check-proto-pin: pins match (lexa-proto @ $SELF_SHA)."
+    FAIL=1
+  else
+    echo "check-proto-pin: pins match (lexa-proto @ $SELF_SHA)."
+  fi
 fi
 
 # (b)/(c): only meaningful with a local lexa-proto checkout, which no hosted

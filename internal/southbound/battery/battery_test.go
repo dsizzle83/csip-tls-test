@@ -1,10 +1,13 @@
 package battery
 
 import (
+	"errors"
 	"math"
+	"strings"
 	"testing"
 
 	model "lexa-proto/csipmodel"
+	"lexa-proto/derbase"
 	"lexa-proto/sunspec"
 )
 
@@ -249,28 +252,54 @@ func TestBattery_ApplyControl_MaxLimW_FallsBackToExpLimW(t *testing.T) {
 	}
 }
 
+// TestBattery_ApplyControl_ImportLimit is IW3-4 (round-3 audit, wave 3):
+// this test used to pin the retired unsafe encoding, asserting that
+// opModImpLimW{2500 W} landed as a negative two's-complement percentage in
+// the unsigned M123 WMaxLimPct register (raw 60536) — a bench-sim convention
+// with no basis in the SunSpec point's declared type, and a battery-only
+// special case that masked the real defect: M123 WMaxLimPct is an EXPORT
+// ceiling, so writing it (signed or not) to express an import BOUND makes an
+// idle machine appear commanded rather than merely capped (DIFF-CTL-020).
+//
+// lexa-proto derbase now refuses opModImpLimW/opModLoadLimW on every device
+// shape it can address — no register in models 702/704/123 expresses an
+// import/charge bound (see derbase.importBoundUnsupported) — so the battery
+// driver, which delegates straight to derbase.Base.ApplyControl, refuses too.
+// Inverted per the repo's discipline: assert the typed refusal and zero
+// writes, not the old encoded value.
 func TestBattery_ApplyControl_ImportLimit(t *testing.T) {
 	b, regs, stop := connectBattery(t)
 	defer stop()
 
-	// 2500 W / 5000 W nameplate = 50% charge; sf=-2 → signed raw = -5000 (charge direction).
-	// OpModImpLimW now writes a negative WMaxLimPct so the battery sim charges in the right direction.
-	ap := model.ActivePower{Value: 2500, Multiplier: 0}
-	if err := b.ApplyControl(model.DERControlBase{OpModImpLimW: &ap}); err != nil {
-		t.Fatalf("ApplyControl import limit: %v", err)
-	}
-
 	m123Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
 	enaAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct_Ena
+	rawBefore := regs.Get(rawAddr)
+	enaBefore := regs.Get(enaAddr)
 
-	// -50% × 10^2 = -5000; as uint16 two's-complement = 60536.
-	const wantRaw = uint16(60536)
-	if got := regs.Get(rawAddr); got != wantRaw {
-		t.Errorf("WMaxLimPct raw = %d, want %d (−50%% charge direction, sf=−2)", got, wantRaw)
+	ap := model.ActivePower{Value: 2500, Multiplier: 0}
+	err := b.ApplyControl(model.DERControlBase{OpModImpLimW: &ap})
+
+	// Reason: an import/charge BOUND has no honest register on this device —
+	// M123 WMaxLimPct is an export-side ceiling, not a charge bound, and
+	// signing it was a bench-only convention, not a device standard. The
+	// axis must refuse rather than misexecute (importBoundUnsupported).
+	if !errors.Is(err, derbase.ErrUnsupportedControl) {
+		t.Fatalf("ApplyControl import limit: got %v, want ErrUnsupportedControl (the import axis "+
+			"refuses on every device shape — no register expresses an import bound)", err)
 	}
-	if regs.Get(enaAddr) != 1 {
-		t.Error("WMaxLimPct_Ena should be 1 after setting import limit")
+	if !strings.Contains(err.Error(), "opModImpLimW") {
+		t.Errorf("refusal %q must name opModImpLimW", err)
+	}
+
+	// A preflight refusal writes nothing: the document is rejected whole, not
+	// partially actuated (see derbase.Base.ApplyControl's "preflight every
+	// present axis before writing any").
+	if got := regs.Get(rawAddr); got != rawBefore {
+		t.Errorf("WMaxLimPct raw changed %d→%d; a refused import limit must not write the export ceiling", rawBefore, got)
+	}
+	if got := regs.Get(enaAddr); got != enaBefore {
+		t.Errorf("WMaxLimPct_Ena changed %d→%d; a refused import limit must not enable the export ceiling", enaBefore, got)
 	}
 }
 
