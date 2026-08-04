@@ -43,9 +43,11 @@ func newLyingSolar(t *testing.T, wmax float64) *SolarServer {
 	// here, so the re-announce is a no-op the tests do not exercise.
 	ss.lies.configure("solar", regs, bases.M123Base+sunspec.M123_WMaxLimPct,
 		bases.M103Base, 50, map[string]uint16{
-			"W":   bases.M103Base + sunspec.M103_W,
-			"VAr": bases.M103Base + sunspec.M103_VAr,
+			"W":      bases.M103Base + sunspec.M103_W,
+			"VAr":    bases.M103Base + sunspec.M103_VAr,
+			"TmpCab": bases.M103Base + sunspec.M103_TmpCab,
 		}, ss.powerOnReset, nil)
+	ss.lies.registerWindow("103", bases.M103Base, 50) // what a real installLies() also registers
 	ss.lies.wrap(regs)
 	return ss
 }
@@ -201,6 +203,211 @@ func TestFreezeBlock_LeavesRegistersOutsideTheWindowLive(t *testing.T) {
 	}
 	if got[0] != 4200 {
 		t.Fatalf("control register read = %d, want the live 4200 — the freeze window leaked past model 103", got[0])
+	}
+}
+
+// TestFreezeBlock_ModelsFreezesMultipleWindowsAtOnce is bench row #1 — the
+// WHOLE-DEVICE freeze. internal/derbase's cross-model liveness probe (S3)
+// exists precisely because freezing one model (say 701) leaves a hub a second,
+// unfrozen source of truth (103) to catch the fault with in one extra read.
+// Naming BOTH models in one freeze_block body is what makes that probe find
+// nothing: this test is the row proving the gateway must not falsely confirm
+// health just because SOME register on the device moved.
+func TestFreezeBlock_ModelsFreezesMultipleWindowsAtOnce(t *testing.T) {
+	ss := newLyingSolarAdvanced(t, 8000)
+	w701 := ss.adv.M701 + uint16(sunspec.L701.Offset("W"))
+	w103 := ss.bases.M103Base + sunspec.M103_W
+
+	ss.Regs.Set(w701, 111)
+	ss.Regs.Set(w103, 222)
+	arm(t, ss, `{"kind":"freeze_block","models":["701","103"]}`)
+
+	// The world moves on in BOTH models — the animation would do this.
+	ss.Regs.Set(w701, 999)
+	ss.Regs.Set(w103, 888)
+
+	got701, err := modbusRead(t, ss, w701, 1)
+	if err != nil {
+		t.Fatalf("read 701: %v", err)
+	}
+	if got701[0] != 111 {
+		t.Fatalf("701 W = %d, want the frozen 111", got701[0])
+	}
+	got103, err := modbusRead(t, ss, w103, 1)
+	if err != nil {
+		t.Fatalf("read 103: %v", err)
+	}
+	if got103[0] != 222 {
+		t.Fatalf(`103 W = %d, want the frozen 222 — naming "103" alongside "701" must freeze it too, `+
+			"or the cross-model probe (S3) is never actually defeated", got103[0])
+	}
+
+	// Ground truth must still be honest in BOTH models — the freeze is a
+	// read-path lie, not a corruption of the sim's own account of itself.
+	if v := ss.Regs.Get(w701); v != 999 {
+		t.Fatalf("701 ground truth = %d, want 999", v)
+	}
+	if v := ss.Regs.Get(w103); v != 888 {
+		t.Fatalf("103 ground truth = %d, want 888", v)
+	}
+}
+
+// TestFreezeBlock_SingleModelLeavesTheOtherModelLive is the control for the
+// test above: bench row #2, "701-frozen-103-live". Without this, a
+// multi-window bug that froze every registered model regardless of what was
+// named would still pass the whole-device test — this pins that naming ONE
+// model leaves every OTHER one live, which is exactly the gap the S3
+// cross-model probe is built to exploit against a naive single-window freeze.
+func TestFreezeBlock_SingleModelLeavesTheOtherModelLive(t *testing.T) {
+	ss := newLyingSolarAdvanced(t, 8000)
+	w701 := ss.adv.M701 + uint16(sunspec.L701.Offset("W"))
+	w103 := ss.bases.M103Base + sunspec.M103_W
+
+	ss.Regs.Set(w701, 111)
+	ss.Regs.Set(w103, 222)
+	arm(t, ss, `{"kind":"freeze_block","models":["701"]}`)
+
+	ss.Regs.Set(w701, 999)
+	ss.Regs.Set(w103, 888)
+
+	got701, err := modbusRead(t, ss, w701, 1)
+	if err != nil {
+		t.Fatalf("read 701: %v", err)
+	}
+	if got701[0] != 111 {
+		t.Fatalf("701 W = %d, want the frozen 111", got701[0])
+	}
+	got103, err := modbusRead(t, ss, w103, 1)
+	if err != nil {
+		t.Fatalf("read 103: %v", err)
+	}
+	if got103[0] != 888 {
+		t.Fatalf(`103 W = %d, want the LIVE 888 — freezing only "701" must leave 103 unfrozen, `+
+			"which is exactly what the S3 cross-model probe is supposed to catch", got103[0])
+	}
+}
+
+// TestFreezeBlock_ExceptLeavesNamedPointsLive is bench row #3, "partial
+// freeze" — the realistic cached-struct firmware fault: a device that freezes
+// its telemetry block yet still refreshes one or two fields (a frequency
+// counter, a temperature) from a live, independent path. It defeats a naive
+// whole-block digest (the block's bytes keep changing, so "did the hash move"
+// says fresh) and is the row that proves a hub needs a PER-CLASS digest to
+// still catch the frozen majority.
+func TestFreezeBlock_ExceptLeavesNamedPointsLive(t *testing.T) {
+	ss := newLyingSolarAdvanced(t, 8000)
+	b := ss.bases
+	hz := b.M103Base + sunspec.M103_Hz
+	tmp := b.M103Base + sunspec.M103_TmpCab
+	w := b.M103Base + sunspec.M103_W
+
+	ss.Regs.Set(hz, 6000)
+	ss.Regs.Set(tmp, 400)
+	ss.Regs.Set(w, 3000)
+	// This sim is ADVANCED, so the unnamed default window is 701 — name "103"
+	// explicitly to freeze the block these addresses actually live in.
+	arm(t, ss, `{"kind":"freeze_block","models":["103"],"except":["Hz","TmpCab"]}`)
+
+	ss.Regs.Set(hz, 6005)
+	ss.Regs.Set(tmp, 405)
+	ss.Regs.Set(w, 7000)
+
+	gotHz, err := modbusRead(t, ss, hz, 1)
+	if err != nil {
+		t.Fatalf("read Hz: %v", err)
+	}
+	if gotHz[0] != 6005 {
+		t.Fatalf("Hz = %d, want the LIVE 6005 — Hz was named in \"except\"", gotHz[0])
+	}
+	gotTmp, err := modbusRead(t, ss, tmp, 1)
+	if err != nil {
+		t.Fatalf("read TmpCab: %v", err)
+	}
+	if gotTmp[0] != 405 {
+		t.Fatalf("TmpCab = %d, want the LIVE 405 — TmpCab was named in \"except\"", gotTmp[0])
+	}
+	gotW, err := modbusRead(t, ss, w, 1)
+	if err != nil {
+		t.Fatalf("read W: %v", err)
+	}
+	if gotW[0] != 3000 {
+		t.Fatalf("W = %d, want the FROZEN 3000 — W was never excepted, so a naive whole-block digest "+
+			"must still be defeated by it", gotW[0])
+	}
+}
+
+// TestFreezeBlock_ExceptAppliesAcrossEveryFrozenModel proves except resolves
+// by CANONICAL name, not by the raw field key: "Hz" has to mean "Hz, in every
+// model this freeze covers" for a whole-device freeze plus except to be
+// coherent — otherwise the untouched copy in whichever model didn't match the
+// literal key would give away that the device is frozen, defeating the point
+// of naming it at all.
+func TestFreezeBlock_ExceptAppliesAcrossEveryFrozenModel(t *testing.T) {
+	ss := newLyingSolarAdvanced(t, 8000)
+	hz103 := ss.bases.M103Base + sunspec.M103_Hz
+	hz701 := ss.adv.M701 + uint16(sunspec.L701.Offset("Hz"))
+
+	ss.Regs.Set(hz103, 6000)
+	ss.Regs.Set(hz701, 60000)
+	arm(t, ss, `{"kind":"freeze_block","models":["701","103"],"except":["Hz"]}`)
+
+	ss.Regs.Set(hz103, 6005)
+	ss.Regs.Set(hz701, 60005)
+
+	got103, err := modbusRead(t, ss, hz103, 1)
+	if err != nil {
+		t.Fatalf("read 103 Hz: %v", err)
+	}
+	if got103[0] != 6005 {
+		t.Fatalf("103 Hz = %d, want the LIVE 6005", got103[0])
+	}
+	got701, err := modbusRead(t, ss, hz701, 1)
+	if err != nil {
+		t.Fatalf("read 701 Hz: %v", err)
+	}
+	if got701[0] != 60005 {
+		t.Fatalf("701 Hz = %d, want the LIVE 60005 — except must exclude Hz in EVERY frozen model, "+
+			"not just the one registered under the bare name", got701[0])
+	}
+}
+
+// TestFreezeBlock_UnknownModelIsAnError is the anti-vacuous-fault check for
+// "models": naming a model this sim never registered must be an error, not a
+// freeze that silently covers nothing.
+func TestFreezeBlock_UnknownModelIsAnError(t *testing.T) {
+	ss := newLyingSolar(t, 8000) // legacy sim: no "701" window registered
+	if err := ss.ApplyFault([]byte(`{"kind":"freeze_block","models":["701"]}`)); err == nil {
+		t.Fatal(`naming a model this sim has not registered must be an error, not a silent no-op`)
+	}
+}
+
+// TestFreezeBlock_UnknownExceptFieldIsAnError is the same anti-vacuous check
+// for "except": a typo must be reported against the known field names, not
+// silently ignored (which would arm a scenario that believes a point is live
+// when it is actually still frozen).
+func TestFreezeBlock_UnknownExceptFieldIsAnError(t *testing.T) {
+	ss := newLyingSolar(t, 8000)
+	if err := ss.ApplyFault([]byte(`{"kind":"freeze_block","except":["Nonesuch"]}`)); err == nil {
+		t.Fatal("an unknown except field name must be an error naming the known ones")
+	}
+}
+
+// TestFreezeBlock_WindowsFreezesAnExplicitRawRange is the "(or windows)" form
+// named alongside "models": an explicit addr/count pair for a range this sim
+// has no name for, additive with everything else the body names.
+func TestFreezeBlock_WindowsFreezesAnExplicitRawRange(t *testing.T) {
+	ss := newLyingSolar(t, 8000)
+	cmd := ss.bases.M123Base + sunspec.M123_WMaxLimPct
+	ss.Regs.Set(cmd, 1234)
+	arm(t, ss, fmt.Sprintf(`{"kind":"freeze_block","windows":[{"addr":%d,"count":1}]}`, cmd))
+	ss.Regs.Set(cmd, 5678)
+
+	got, err := modbusRead(t, ss, cmd, 1)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got[0] != 1234 {
+		t.Fatalf(`"windows" = %d, want the frozen 1234`, got[0])
 	}
 }
 

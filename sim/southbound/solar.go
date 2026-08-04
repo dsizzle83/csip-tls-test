@@ -21,6 +21,13 @@ package sim
 //	TmpCab = 35  + 20·(W/WMax)              35–55 °C
 //	DCV    = 380 + 30·sin(2π·t/600)         350–410 V DC
 //	DCW    = W × 1.06                        conversion loss overhead
+//
+// The NIGHT/becalm control (SetBecalmed, Inject "Night") replaces the
+// irradiance term with a genuine 0 rather than attenuating it — W/VA/VAr/DCW/
+// WAval all collapse to 0 and the Wh accumulator stops climbing, while V and
+// Hz keep their jitter unchanged and TmpCab gets a small ambient-jitter term
+// in its place (±0.3 degC, 360 s period) so the slow-class point stays visibly
+// alive too. See solarStep's night parameter.
 
 import (
 	"encoding/json"
@@ -61,6 +68,19 @@ type SolarServer struct {
 	// sim that is never clouded is byte-identical to the pre-cloud model.
 	cloudCover atomic.Uint64
 
+	// becalmed is the NIGHT/becalm control (see SetBecalmed): NOT a fault —
+	// an honest environmental state, orthogonal to cloudCover, that drives the
+	// panel's available potential to zero (irradiance is genuinely zero at
+	// night, not merely attenuated) while the animation KEEPS running, so the
+	// points that do not depend on irradiance — line voltage, frequency, and
+	// the small ambient thermal jitter it adds to TmpCab — keep moving. It
+	// exists to give the measurement-freshness false-positive row somewhere
+	// real to run: a device with nothing to report is not the same claim as a
+	// device that has stopped reporting, and only a sim that can go dark on
+	// cue over real Modbus can put a gateway through both and show it tells
+	// them apart. The zero value (false) is the byte-identical default.
+	becalmed atomic.Bool
+
 	// Advanced-DER (7xx) surface — populated only by NewSolarServerAdvanced.
 	// When advanced is false the sim serves the legacy models only and behaves
 	// exactly as today (see solar_adv.go).
@@ -100,7 +120,7 @@ func NewSolarServer(listenURL string, wmaxW float64, serial string) (*SolarServe
 	ss.faults.configureScale(bases.M103Base + sunspec.M103_W_SF)
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
-		animateSolar(s, r, wmaxW, bases, ss.Cloud, &ss.faults, stop)
+		animateSolar(s, r, wmaxW, bases, ss.Cloud, ss.Becalmed, &ss.faults, stop)
 	})
 	if err != nil {
 		return nil, err
@@ -202,6 +222,7 @@ type SolarState struct {
 		W_W        float64 `json:"W_W"`
 		Possible_W float64 `json:"possible_W"` // pre-curtailment potential (M122 WAval)
 		Cloud_pct  float64 `json:"Cloud_pct"`  // live cloud cover 0–100% (attenuates Possible_W)
+		Night      bool    `json:"night"`      // becalm control armed (SetBecalmed) — Possible_W forced to 0
 		V_V        float64 `json:"V_V"`
 		Hz_Hz      float64 `json:"Hz_Hz"`
 		VA_VA      float64 `json:"VA_VA"`
@@ -259,6 +280,8 @@ func (ss *SolarServer) Snapshot() SolarState {
 	// Cloud cover is server state (not a register): expose it as a percent so the
 	// dashboard can display the live weather the running animation is applying.
 	m.Cloud_pct = ss.Cloud() * 100.0
+	// Night is likewise server state, not a register (see SetBecalmed).
+	m.Night = ss.Becalmed()
 	m.V_V = unsigned(b.M103Base+sunspec.M103_PhVphA, b.M103Base+sunspec.M103_V_SF)
 	m.Hz_Hz = unsigned(b.M103Base+sunspec.M103_Hz, b.M103Base+sunspec.M103_Hz_SF)
 	m.VA_VA = signed(b.M103Base+sunspec.M103_VA, b.M103Base+sunspec.M103_VA_SF)
@@ -323,13 +346,33 @@ func (ss *SolarServer) Cloud() float64 {
 	return math.Float64frombits(ss.cloudCover.Load())
 }
 
+// SetBecalmed arms or clears the NIGHT/becalm control (see the becalmed field
+// doc). Safe to call from the HTTP goroutine (Inject "Night") while the
+// animation goroutine reads it via Becalmed() each tick.
+func (ss *SolarServer) SetBecalmed(on bool) {
+	ss.becalmed.Store(on)
+}
+
+// Becalmed reports whether the NIGHT/becalm control is armed.
+func (ss *SolarServer) Becalmed() bool {
+	return ss.becalmed.Load()
+}
+
 // Inject overrides one or more measurement or control fields.
 // Accepted JSON keys: "W_W", "V_V", "Hz_Hz", "DCV_V", "TmpCab_C",
-// "WMaxLimPct_pct" (0–100), "Conn" (0 or 1), "St" (1–8), "Cloud_pct" (0–100).
+// "WMaxLimPct_pct" (0–100), "Conn" (0 or 1), "St" (1–8), "Cloud_pct" (0–100),
+// "Night" (0 or nonzero).
 //
 // "Cloud_pct" is not a register — it is an environmental input (like metersim's
 // LoadW_W) that scales the running-animation irradiance via cloudTransmittance;
 // it takes effect on the next animation tick and is unaffected by pause.
+//
+// "Night" is likewise not a register — the becalm control (SetBecalmed): it
+// takes effect on the next RUNNING animation tick (paused steps ignore it,
+// same as Cloud_pct) and is a distinct axis from Cloud_pct, not an alias for
+// "very cloudy" — cloud cover attenuates daytime irradiance but never reaches
+// true zero (a diffuse floor remains under any deck), where night genuinely
+// is zero.
 //
 // Calling Inject does not automatically pause the animation; use
 // POST /control {"cmd":"pause"} first if you want values to persist.
@@ -396,6 +439,10 @@ func (ss *SolarServer) Inject(body []byte) error {
 			// Environmental input, not a register: 0..100% → SetCloud [0,1]
 			// (clamped). The running animation reads it via cloudTransmittance.
 			ss.SetCloud(val / 100.0)
+		case "Night":
+			// Environmental input, not a register (like Cloud_pct): the NIGHT/
+			// becalm control (see SetBecalmed). Nonzero arms it, zero clears it.
+			ss.SetBecalmed(val != 0)
 		default:
 			return fmt.Errorf("inject: unknown field %q", key)
 		}
@@ -609,7 +656,7 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 
 // ── animation ─────────────────────────────────────────────────────────────────
 
-func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, cloud func() float64, fc *faultController, stop <-chan struct{}) {
+func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, cloud func() float64, night func() bool, fc *faultController, stop <-chan struct{}) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 
@@ -620,9 +667,10 @@ func animateSolar(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, cl
 		case <-stop:
 			return
 		case <-tick.C:
-			// cloud() reads the live cover each tick so an /inject Cloud_pct takes
-			// effect on the next step (paused steps ignore it — see solarStep).
-			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), cloud(), fc, &whAcc)
+			// cloud()/night() read the live environment each tick so an /inject
+			// Cloud_pct or Night takes effect on the next step (paused steps
+			// ignore both — see solarStep).
+			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), cloud(), night(), fc, &whAcc)
 		}
 	}
 }
@@ -677,7 +725,20 @@ func cloudTransmittance(simTime int64, cloud float64) float64 {
 // via cloudTransmittance; the paused branch is deliberately untouched so
 // replay/mayhem HOLD-injected potentials stay byte-identical. cloud=0 is a
 // no-op (cloudTransmittance returns exactly 1.0).
-func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, simTime float64, cloud float64, fc *faultController, whAcc *uint16) {
+//
+// night, likewise RUNNING-branch-only, is the becalm control (SetBecalmed):
+// unlike cloud it does not attenuate the irradiance model, it REPLACES it —
+// potW is forced to exactly 0, the honest "irradiance is genuinely zero"
+// claim a cloud deck (whose diffuse floor never reaches zero) cannot make.
+// Every downstream computation is unchanged, so the existing formulas do the
+// rest for free: W/VA/VAr/DCW/WAval collapse to 0, the accumulator gains
+// nothing this tick (it FLATTENS rather than resets), and the potW<6% branch
+// below reports St=2 (sleeping) — exactly the state a real inverter reports
+// overnight. V and Hz are untouched by potW already, so they keep their
+// existing jitter with no change here; TmpCab's ambient-jitter override below
+// is the one addition night needs to keep its slow-class point visibly alive
+// too, rather than pinned at exactly 35.0 forever.
+func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, simTime float64, cloud float64, night bool, fc *faultController, whAcc *uint16) {
 	m103Base := bases.M103Base
 	m122Base := bases.M122Base
 	m123Base := bases.M123Base
@@ -710,12 +771,20 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 		pf = float64(int16(r.Get(m103Base+sunspec.M103_PF))) / 10000.0
 	} else {
 		t := simTime
-		irr := math.Max(0.05, math.Min(0.95, 0.5+0.45*math.Sin(2*math.Pi*t/600)))
-		// Cloud cover scales the clear-sky potential (downward-only). cloud=0 ⇒
-		// cloudTransmittance == 1.0, so potW is byte-identical to the pre-cloud
-		// model. WAval/possible_W (below) therefore honestly reflect the
-		// cloud-reduced available power, and WMaxLimPct still clips actual ≤ this.
-		potW = wmaxW * irr * cloudTransmittance(int64(t), cloud)
+		if night {
+			// Night: irradiance is genuinely zero, not merely attenuated — see
+			// the becalmed field doc and this function's own doc for why this
+			// is a replacement of the irradiance model, not another multiplier
+			// alongside cloudTransmittance.
+			potW = 0
+		} else {
+			irr := math.Max(0.05, math.Min(0.95, 0.5+0.45*math.Sin(2*math.Pi*t/600)))
+			// Cloud cover scales the clear-sky potential (downward-only). cloud=0 ⇒
+			// cloudTransmittance == 1.0, so potW is byte-identical to the pre-cloud
+			// model. WAval/possible_W (below) therefore honestly reflect the
+			// cloud-reduced available power, and WMaxLimPct still clips actual ≤ this.
+			potW = wmaxW * irr * cloudTransmittance(int64(t), cloud)
+		}
 		v = 240.0 + 2.0*math.Sin(2*math.Pi*t/73)
 		hz := 60.0 + 0.05*math.Sin(2*math.Pi*t/47)
 		pf = math.Max(0.90, math.Min(0.99, 0.97+0.02*math.Sin(2*math.Pi*t/120)))
@@ -749,6 +818,19 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 	va := w / pf
 	varPwr := va * math.Sin(math.Acos(pf))
 	tmp := 35.0 + 20.0*(w/wmaxW)
+	if night {
+		// With w forced to 0 the formula above pins tmp at exactly 35.0 forever
+		// — flat, not merely quiet, which would make the becalm row prove the
+		// wrong thing (a device with nothing to report would look identical to
+		// one that stopped reporting). A real cabinet still tracks a slowly
+		// swinging ambient temperature at night: small (±0.3 degC) and slow (a
+		// 360 s period), in the neighbourhood of the "0.1 degC/6min" slowest-
+		// genuine-signal figure the measurement-freshness design rests on, so
+		// TmpCab stays visibly ALIVE on its own slow-class point even though W
+		// has collapsed to zero. Gated on night so every non-becalmed scenario
+		// (the overwhelming majority) is byte-identical to before this file.
+		tmp = 35.0 + 0.3*math.Sin(2*math.Pi*simTime/360)
+	}
 	dcw := w * 1.06
 	iph := w / (v * 3)
 

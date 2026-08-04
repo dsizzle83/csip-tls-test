@@ -40,7 +40,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 		injectPotential(r, b, 6000)
 		curtailTo(r, b, 2000) // hub caps generation at 2000W
 		var wh uint16
-		solarStep(r, wmax, b, true /*paused*/, 0, 0 /*cloud*/, nil, &wh)
+		solarStep(r, wmax, b, true /*paused*/, 0, 0 /*cloud*/, false /*night*/, nil, &wh)
 		if got := readW(r, b); got != 2000 {
 			t.Errorf("paused output = %.0fW, want 2000W (curtailed)", got)
 		}
@@ -52,7 +52,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 		// WMaxLimPct disabled (Ena=0) → no clip.
 		r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 0)
 		var wh uint16
-		solarStep(r, wmax, b, true, 0, 0, nil, &wh)
+		solarStep(r, wmax, b, true, 0, 0, false /*night*/, nil, &wh)
 		if got := readW(r, b); got != 6000 {
 			t.Errorf("paused output = %.0fW, want 6000W (uncurtailed)", got)
 		}
@@ -63,7 +63,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 		injectPotential(r, b, 3000)
 		curtailTo(r, b, 5000) // ceiling above potential
 		var wh uint16
-		solarStep(r, wmax, b, true, 0, 0, nil, &wh)
+		solarStep(r, wmax, b, true, 0, 0, false /*night*/, nil, &wh)
 		if got := readW(r, b); got != 3000 {
 			t.Errorf("paused output = %.0fW, want 3000W (potential, ceiling higher)", got)
 		}
@@ -112,7 +112,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 		injectPotential(r, b, 6000)
 		r.Set(b.M123Base+sunspec.M123_Conn, 0)
 		var wh uint16
-		solarStep(r, wmax, b, true, 0, 0, nil, &wh)
+		solarStep(r, wmax, b, true, 0, 0, false /*night*/, nil, &wh)
 		if got := readW(r, b); got != 0 {
 			t.Errorf("disconnected output = %.0fW, want 0W", got)
 		}
@@ -149,7 +149,7 @@ func TestSolarServer_AckBeforeEffectFault(t *testing.T) {
 	// During the delay the inverter still produces at the OLD (100%) ceiling.
 	r.Set(b.M122Base+sunspec.M122_WAval, uint16(int16(6000)))
 	var wh uint16
-	solarStep(r, wmax, b, true, 0, 0, nil, &wh)
+	solarStep(r, wmax, b, true, 0, 0, false /*night*/, nil, &wh)
 	if got := readW(); got != 6000 {
 		t.Fatalf("output during delay = %.0fW, want 6000W (curtailment not yet in effect)", got)
 	}
@@ -162,7 +162,7 @@ func TestSolarServer_AckBeforeEffectFault(t *testing.T) {
 	if got := r.Get(target); got != curtailRaw {
 		t.Fatalf("WMaxLimPct after delay = %d, want %d (effect applied)", got, curtailRaw)
 	}
-	solarStep(r, wmax, b, true, 0, 0, nil, &wh)
+	solarStep(r, wmax, b, true, 0, 0, false /*night*/, nil, &wh)
 	if got := readW(); got != 2000 {
 		t.Fatalf("output after delay = %.0fW, want 2000W (curtailed)", got)
 	}
@@ -293,7 +293,7 @@ func TestSolarStep_CloudRunning(t *testing.T) {
 		for _, st := range times {
 			r, b := newRegs()
 			var wh uint16
-			solarStep(r, wmax, b, false /*running*/, st, 0 /*cloud*/, nil, &wh)
+			solarStep(r, wmax, b, false /*running*/, st, 0 /*cloud*/, false /*night*/, nil, &wh)
 			want := math.Round(wmax * irrClear(st))
 			if got := readReg(r, b.M122Base+sunspec.M122_WAval); got != want {
 				t.Errorf("t=%.0f cloud=0 WAval=%.0f, want %.0f (clear-sky potW)", st, got, want)
@@ -306,7 +306,7 @@ func TestSolarStep_CloudRunning(t *testing.T) {
 			for _, st := range times {
 				r, b := newRegs()
 				var wh uint16
-				solarStep(r, wmax, b, false, st, cloud, nil, &wh)
+				solarStep(r, wmax, b, false, st, cloud, false /*night*/, nil, &wh)
 				wantPot := math.Round(wmax * irrClear(st) * cloudTransmittance(int64(st), cloud))
 				wav := readReg(r, b.M122Base+sunspec.M122_WAval)
 				if wav != wantPot {
@@ -332,7 +332,7 @@ func TestSolarStep_CloudRunning(t *testing.T) {
 		r.Set(b.M123Base+sunspec.M123_WMaxLimPct, sunspec.RawFromScaleSigned(pct, -2))
 		r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 1)
 		var wh uint16
-		solarStep(r, wmax, b, false, 0, 1.0, nil, &wh)
+		solarStep(r, wmax, b, false, 0, 1.0, false /*night*/, nil, &wh)
 		wav := readReg(r, b.M122Base+sunspec.M122_WAval)
 		act := readReg(r, b.M103Base+sunspec.M103_W)
 		if act != 300 {
@@ -387,5 +387,109 @@ func TestSolarServer_CloudInject(t *testing.T) {
 	}
 	if ss.Cloud() != 1 {
 		t.Errorf("inject 150%% → Cloud()=%v, want 1 (clamped)", ss.Cloud())
+	}
+}
+
+// TestSolarServer_NightInject exercises the Night inject key, the
+// SetBecalmed/Becalmed control, and the Snapshot Night surface — the wiring
+// bench row #4 (becalmed-but-live) drives through /inject on a real sim.
+func TestSolarServer_NightInject(t *testing.T) {
+	const wmax = 5000.0
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	b := populateSolar(r, wmax, "")
+	ss := &SolarServer{Server: &Server{Regs: r}, bases: b, wmaxW: wmax}
+
+	if ss.Becalmed() {
+		t.Fatal("fresh Becalmed()=true, want false (default — byte-identical to before this control existed)")
+	}
+	if st := ss.Snapshot(); st.Measurements.Night {
+		t.Error("fresh snapshot Measurements.Night=true, want false")
+	}
+
+	if err := ss.Inject([]byte(`{"Night":1}`)); err != nil {
+		t.Fatalf("inject Night: %v", err)
+	}
+	if !ss.Becalmed() {
+		t.Error("after inject Night:1, Becalmed()=false, want true")
+	}
+	if st := ss.Snapshot(); !st.Measurements.Night {
+		t.Error("snapshot Measurements.Night=false after Night:1, want true")
+	}
+
+	if err := ss.Inject([]byte(`{"Night":0}`)); err != nil {
+		t.Fatalf("inject Night: %v", err)
+	}
+	if ss.Becalmed() {
+		t.Error("after inject Night:0, Becalmed()=true, want false — Night must clear like Cloud_pct does")
+	}
+}
+
+// TestSolarStep_NightCollapsesWWithAnimationStillAlive is bench row #4, the
+// FALSE-POSITIVE control — it is NOT a fault. A gateway that treats "output
+// is zero" the same as "the device stopped answering" would flag a becalmed
+// inverter as suspect every night. This pins the sim capability that row
+// runs over real Modbus: W/VA/WAval collapse to a genuine 0 (not merely
+// attenuated, the way Cloud_pct works) and the Wh accumulator stops
+// climbing, while V, Hz and (via night's added ambient-jitter term) TmpCab
+// keep moving tick to tick — a live, quiescent device, not a stuck one.
+func TestSolarStep_NightCollapsesWWithAnimationStillAlive(t *testing.T) {
+	const wmax = 8000.0
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	b := populateSolar(r, wmax, "")
+	var wh uint16
+
+	// Daytime tick first, so the fixture demonstrably HAD live output and an
+	// advancing accumulator before night fell.
+	solarStep(r, wmax, b, false, 0, 0, false, nil, &wh)
+	if w := int16(r.Get(b.M103Base + sunspec.M103_W)); w <= 0 {
+		t.Fatalf("fixture bug: daytime W = %d, want > 0", w)
+	}
+	dayWh := wh
+	if dayWh == 0 {
+		t.Fatal("fixture bug: the Wh accumulator never advanced during the daytime tick")
+	}
+
+	// Night falls, across several ticks at different simTimes.
+	var v, hz, tmp []float64
+	for i, st := range []float64{100, 200, 300} {
+		solarStep(r, wmax, b, false, st, 0, true /*night*/, nil, &wh)
+		if w := int16(r.Get(b.M103Base + sunspec.M103_W)); w != 0 {
+			t.Errorf("tick %d: night W = %d, want 0", i, w)
+		}
+		if va := int16(r.Get(b.M103Base + sunspec.M103_VA)); va != 0 {
+			t.Errorf("tick %d: night VA = %d, want 0", i, va)
+		}
+		if wav := int16(r.Get(b.M122Base + sunspec.M122_WAval)); wav != 0 {
+			t.Errorf("tick %d: night WAval (possible_W) = %d, want 0 — irradiance is genuinely zero at "+
+				"night, unlike Cloud_pct's attenuation which never reaches zero", i, wav)
+		}
+		if wh != dayWh {
+			t.Errorf("tick %d: Wh accumulator moved from %d to %d overnight — it must FLATTEN, not advance", i, dayWh, wh)
+		}
+		if got := r.Get(b.M103Base + sunspec.M103_St); got != 2 {
+			t.Errorf("tick %d: St = %d, want 2 (sleeping)", i, got)
+		}
+		v = append(v, float64(r.Get(b.M103Base+sunspec.M103_PhVphA))/10.0)
+		hz = append(hz, float64(r.Get(b.M103Base+sunspec.M103_Hz))/100.0)
+		tmp = append(tmp, float64(int16(r.Get(b.M103Base+sunspec.M103_TmpCab)))/10.0)
+	}
+
+	allSame := func(xs []float64) bool {
+		for _, x := range xs[1:] {
+			if x != xs[0] {
+				return false
+			}
+		}
+		return true
+	}
+	if allSame(v) {
+		t.Error("V did not move across becalmed ticks — the animation must stay alive at night")
+	}
+	if allSame(hz) {
+		t.Error("Hz did not move across becalmed ticks — the animation must stay alive at night")
+	}
+	if allSame(tmp) {
+		t.Error("TmpCab did not move across becalmed ticks — a flatlined slow-class point would be " +
+			"indistinguishable from freeze_block, defeating the whole point of the false-positive row")
 	}
 }

@@ -265,3 +265,56 @@ surfaces Exp/Max/Imp/Fixed/Connect limits but not GenLimW/LoadLimW;
 `lexa_constraint_shadow_divergence_total` is a single aggregate (no per-constraint
 attribution); `lexa_mb_adv_divergences_total` covers only measured axes
 (curve-axis divergence routes to `lexa_mb_adv_failed_total`).
+
+---
+
+## Measurement-freshness bench rows (2026-08-04)
+
+`sim/southbound/lying.go` is a separate fault family from everything above: the
+LYING SOUTHBOUND DEVICE layer, eight `POST /fault` kinds (`revert_after`,
+`freeze_block`, `sentinel_field`, `reboot_forget`, `layout_shift`,
+`exception_on_applied_write`, `slow_poll`, `ack_no_apply`) that answer
+plausibly and FALSELY rather than erroring — see that file's own doc for the
+full rationale. `freeze_block` gained a multi-window/except form, and the solar
+sim gained a new non-fault `Night` environmental control, purpose-built to
+exercise the hub-side MEAS-FRESHNESS per-class liveness/staleness detector
+against a real Modbus sim rather than only unit tests. Four rows, each
+runnable against `modsim -advanced` (or any `sim/mbapsdev` advanced instance):
+
+| Row | `POST /fault` (or `/inject`) body | What it proves |
+|---|---|---|
+| **whole-device freeze** | `{"kind":"freeze_block","models":["701","103"]}` | Naming every model a hub might cross-check in ONE freeze defeats the S3 cross-model liveness probe — the row proving the gateway does not falsely confirm health just because some OTHER register on the device moved. |
+| **701-frozen-103-live** | `{"kind":"freeze_block","models":["701"]}` | The control: freezing only 701 leaves 103 live, exactly what the S3 probe is built to catch — a naive single-window freeze IS detectable in one extra read. |
+| **partial freeze** | `{"kind":"freeze_block","except":["Hz","TmpCab"]}` | The realistic cached-struct fault: most of the block is frozen, but a firmware quirk still refreshes a couple of fields (a frequency counter, a temperature) from a live path. Defeats a naive whole-block digest (the bytes keep changing, so "did the hash move" says fresh) — the row proving a hub needs a PER-CLASS digest (volatile / slow / accumulator) to still catch the frozen majority. |
+| **becalmed-but-live** | `POST /inject {"Night":1}` — **not a fault** | Drives the sim to night: W/VA/VAr/WAval collapse to a genuine 0 (unlike `Cloud_pct`, which attenuates but never reaches zero) and the Wh accumulator (`M122 ActWh` / 701 `TotWhInj`) stops climbing, while V, Hz and TmpCab's added ambient jitter keep moving. The false-positive control — a gateway must not treat "nothing to report" the same as "stopped answering." |
+
+`freeze_block` also accepts a raw `"windows":[{"addr":...,"count":...}]` list
+for a range this sim has no name for, additive with `"models"` and the
+original `addr`/`count` — naming none of the three keeps the original
+single-default-window behaviour byte-identical. `except` resolves by
+CANONICAL field name (`"Hz_701"` and `"Hz"` are the same point for this
+purpose), so one exception list applies across every frozen model in a
+whole-device freeze, not just whichever one happened to own the literal key.
+
+Separately, `advMirror701` (the 701 mirror `NewSolarServerAdvanced` runs every
+animation tick) now mirrors `TotWhInj`/`TotWhAbs` from the same `ActWh`
+accumulator the legacy sim has always animated (`TotWhAbs` stays a truthful 0
+— a PV inverter only injects). Before this fix, 701's accumulators were never
+written at all: the register slice starts zero-initialised, and 0 is NOT the
+Tuint64 not-implemented sentinel, so 701 read them as an IMPLEMENTED
+accumulator that never moved — indistinguishable over Modbus from
+`freeze_block`, and it left S1 (Δaccumulator vs ∫W dt) unexercisable on the
+bench.
+
+Unit tests, image-level per the existing sim test idiom (through the real
+Modbus server handler and/or `advMirror701`/`solarStep` directly):
+`sim/southbound/lying_test.go` (`TestFreezeBlock_ModelsFreezesMultipleWindowsAtOnce`,
+`TestFreezeBlock_SingleModelLeavesTheOtherModelLive`,
+`TestFreezeBlock_ExceptLeavesNamedPointsLive`,
+`TestFreezeBlock_ExceptAppliesAcrossEveryFrozenModel`,
+`TestFreezeBlock_UnknownModelIsAnError`, `TestFreezeBlock_UnknownExceptFieldIsAnError`,
+`TestFreezeBlock_WindowsFreezesAnExplicitRawRange`) and
+`sim/southbound/solar_adv_test.go` / `sim/southbound/solar_test.go`
+(`TestAdv701AccumulatorsMirrorTheAnimatedWh`,
+`TestAdv701BecalmedButLiveIsNotIndistinguishableFromFrozen`,
+`TestSolarServer_NightInject`, `TestSolarStep_NightCollapsesWWithAnimationStillAlive`).

@@ -78,6 +78,101 @@ func TestAdv701RoundTrip(t *testing.T) {
 	}
 }
 
+// TestAdv701AccumulatorsMirrorTheAnimatedWh pins the fix for the gap the
+// measurement-freshness design named: advMirror701 never wrote TotWhInj/
+// TotWhAbs at all, so 701 always read them as an IMPLEMENTED accumulator
+// (Tuint64's not-implemented sentinel is all-ones, not zero) that never moved
+// — indistinguishable, over Modbus, from a device with freeze_block armed. S1
+// (a hub comparing ΔTotWhInj against ∫W dt) had nothing real to check on the
+// bench without this. TotWhInj must mirror the SAME Wh accumulator the legacy
+// sim has always animated (M122's ActWh, advanced every running solarStep
+// tick), and TotWhAbs must stay a truthful 0 — a PV inverter only injects.
+func TestAdv701AccumulatorsMirrorTheAnimatedWh(t *testing.T) {
+	ss := newAdvSolar(t, 6000)
+	r, b, adv := ss.Regs, ss.bases, ss.adv
+
+	var whAcc uint16
+	for i := 0; i < 3; i++ {
+		solarStep(r, ss.wmaxW, b, false /*running*/, 0 /*simTime*/, 0 /*cloud*/, false /*night*/, &ss.faults, &whAcc)
+		advMirror701(r, b, adv, ss.wmaxW, ss.varRating, &ss.faults)
+	}
+
+	wantWh := float64(whAcc)
+	if wantWh == 0 {
+		t.Fatal("fixture bug: the Wh accumulator never advanced — the test proves nothing")
+	}
+	m701 := sunspec.Parse701(readSlice(r, adv.M701, adv.M701Len))
+	if m701.TotWhInj != wantWh {
+		t.Errorf("701 TotWhInj = %v, want %v (mirrored from the M122 ActWh accumulator solarStep just advanced)",
+			m701.TotWhInj, wantWh)
+	}
+	if m701.TotWhAbs != 0 {
+		t.Errorf("701 TotWhAbs = %v, want 0 — a PV inverter only injects", m701.TotWhAbs)
+	}
+
+	// A second wave of ticks must move it FURTHER still — pinning "mirrors the
+	// LIVE accumulator" against a fix that only seeded it once at startup and
+	// then left it as stale as the bug it replaces.
+	prev := m701.TotWhInj
+	for i := 0; i < 3; i++ {
+		solarStep(r, ss.wmaxW, b, false, 0, 0, false, &ss.faults, &whAcc)
+		advMirror701(r, b, adv, ss.wmaxW, ss.varRating, &ss.faults)
+	}
+	m701 = sunspec.Parse701(readSlice(r, adv.M701, adv.M701Len))
+	if m701.TotWhInj <= prev {
+		t.Errorf("701 TotWhInj did not advance on a second wave of ticks: %v -> %v", prev, m701.TotWhInj)
+	}
+}
+
+// TestAdv701BecalmedButLiveIsNotIndistinguishableFromFrozen is bench row #4,
+// "becalmed-but-live", read through 701 — the model a freshness-aware hub
+// actually prefers. Night is NOT a fault: it collapses W/VA/VAr to a genuine
+// 0 and halts TotWhInj exactly as freeze_block would, but St/InvSt honestly
+// report the device as connected-and-sleeping (not off, not frozen) and Hz
+// keeps moving tick to tick. That distinction — a quiescent-but-live device
+// vs. a stuck one — is the entire content of the false-positive row; a
+// gateway that cannot tell them apart flags every nightfall as suspect.
+func TestAdv701BecalmedButLiveIsNotIndistinguishableFromFrozen(t *testing.T) {
+	ss := newAdvSolar(t, 8000)
+	r, b, adv := ss.Regs, ss.bases, ss.adv
+
+	var whAcc uint16
+	solarStep(r, ss.wmaxW, b, false, 0, 0, false, &ss.faults, &whAcc)
+	advMirror701(r, b, adv, ss.wmaxW, ss.varRating, &ss.faults)
+	m701 := sunspec.Parse701(readSlice(r, adv.M701, adv.M701Len))
+	if m701.W <= 0 {
+		t.Fatalf("fixture bug: daytime 701 W = %v, want > 0", m701.W)
+	}
+	dayTotWhInj := m701.TotWhInj
+
+	var hz []float64
+	for i, st := range []float64{100, 200, 300} {
+		solarStep(r, ss.wmaxW, b, false, st, 0, true /*night*/, &ss.faults, &whAcc)
+		advMirror701(r, b, adv, ss.wmaxW, ss.varRating, &ss.faults)
+		m701 = sunspec.Parse701(readSlice(r, adv.M701, adv.M701Len))
+		if m701.W != 0 {
+			t.Errorf("tick %d: 701 W = %v, want 0", i, m701.W)
+		}
+		if m701.TotWhInj != dayTotWhInj {
+			t.Errorf("tick %d: 701 TotWhInj moved from %v to %v overnight — it must FLATTEN, not advance",
+				i, dayTotWhInj, m701.TotWhInj)
+		}
+		if m701.InvSt != 2 {
+			t.Errorf("tick %d: 701 InvSt = %d, want 2 (sleeping) — the device must report its own state "+
+				"honestly, not merely go quiet", i, m701.InvSt)
+		}
+		if m701.St != 1 || m701.ConnSt != 1 {
+			t.Errorf("tick %d: 701 St=%d ConnSt=%d, want 1/1 — a becalmed device is still ON and CONNECTED, "+
+				"which is what tells a hub apart from an actually disconnected one", i, m701.St, m701.ConnSt)
+		}
+		hz = append(hz, m701.Hz)
+	}
+	if hz[0] == hz[1] && hz[1] == hz[2] {
+		t.Error("701 Hz did not move across becalmed ticks — a live-but-quiescent device must still look " +
+			"alive on its volatile-class points, or it is indistinguishable from freeze_block")
+	}
+}
+
 // TestAdvRaiseAlarm verifies the raise_alarm fault sets the 701 Alrm bitfield
 // that the animation re-stamps each tick, and clearing returns it to 0 (the RTN
 // edge).

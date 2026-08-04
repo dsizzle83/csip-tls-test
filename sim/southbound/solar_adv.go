@@ -203,7 +203,7 @@ func newSolarServerAdvanced(listenURL string, wmaxW float64, serial string, with
 	ss.faults.configureScale(bases.M103Base + sunspec.M103_W_SF)
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
-		animateSolarAdvanced(s, r, wmaxW, bases, adv, varRating, ss.Cloud, &ss.faults, stop)
+		animateSolarAdvanced(s, r, wmaxW, bases, adv, varRating, ss.Cloud, ss.Becalmed, &ss.faults, stop)
 	})
 	if err != nil {
 		return nil, err
@@ -591,6 +591,38 @@ func setSF(regs []uint16, l *sunspec.Layout, name string, sf int16) {
 	}
 }
 
+// setScaledU64 writes an engineering-unit accumulator into a Tuint64 point at
+// layout offset o, applying an already-resolved scale factor sf (as returned
+// by View.SF). lexa-proto/sunspec's View has no SetScaledU64At counterpart to
+// its 16/32-bit setters — TotWhInj/TotWhAbs (701's only Tuint64 points this
+// sim writes) are the first 64-bit accumulator this sim has needed to SET
+// rather than leave at its zero default — so this composes the write from the
+// four exported SetU16At calls a 64-bit point occupies, big-endian, the same
+// layout View.U64At assembles for reading. Negative and NaN values write 0;
+// the reserved all-ones not-implemented sentinel is never encoded for real
+// data (audit SUN-004) — a value large enough to collide with it clamps one
+// below.
+func setScaledU64(v sunspec.View, o int, val float64, sf int16) {
+	if o < 0 || math.IsNaN(val) {
+		return
+	}
+	scaled := math.Round(val / math.Pow10(int(sf)))
+	if scaled < 0 {
+		scaled = 0
+	}
+	if scaled > math.MaxUint64 {
+		scaled = math.MaxUint64
+	}
+	raw := uint64(scaled)
+	if raw == math.MaxUint64 {
+		raw-- // never the reserved not-implemented sentinel
+	}
+	v.SetU16At(o, uint16(raw>>48))
+	v.SetU16At(o+1, uint16(raw>>32))
+	v.SetU16At(o+2, uint16(raw>>16))
+	v.SetU16At(o+3, uint16(raw))
+}
+
 // ── Adopt handshake ──────────────────────────────────────────────────────────
 
 // interceptAdopt handles a write to a curve model's AdptCrvReq/AdptCtlReq
@@ -660,7 +692,7 @@ func (ss *SolarServer) adoptInto(base uint16, hdrLen, stride, roOff, rsltOff int
 
 // ── Animation: 701 mirror + 704 effect ───────────────────────────────────────
 
-func animateSolarAdvanced(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, adv solarAdvBases, varRating float64, cloud func() float64, fc *faultController, stop <-chan struct{}) {
+func animateSolarAdvanced(s *Server, r *RegisterMap, wmaxW float64, bases SolarBases, adv solarAdvBases, varRating float64, cloud func() float64, night func() bool, fc *faultController, stop <-chan struct{}) {
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 
@@ -679,7 +711,7 @@ func animateSolarAdvanced(s *Server, r *RegisterMap, wmaxW float64, bases SolarB
 			// Bridge the hub's 704 ceiling into the 123 machinery BEFORE the
 			// physical step, so curtailment (and its effect-time faults) apply.
 			advBridgeCeiling(r, bases, adv)
-			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), cloud(), fc, &whAcc)
+			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), cloud(), night(), fc, &whAcc)
 			advMirror701(r, bases, adv, wmaxW, varRating, fc)
 		}
 	}
@@ -737,6 +769,7 @@ func advBridgeCeiling(r *RegisterMap, bases SolarBases, adv solarAdvBases) {
 // again disagree about the same physical quantity.
 func advMirror701(r *RegisterMap, bases SolarBases, adv solarAdvBases, wmaxW, varRating float64, fc *faultController) {
 	m103 := bases.M103Base
+	m122 := bases.M122Base
 	sfAt := func(a uint16) int16 { return int16(r.Get(a)) }
 	w := sunspec.ApplyScaleSigned(r.Get(m103+sunspec.M103_W), sfAt(m103+sunspec.M103_W_SF))
 	vSF := sfAt(m103 + sunspec.M103_V_SF)
@@ -835,6 +868,24 @@ func advMirror701(r *RegisterMap, bases SolarBases, adv solarAdvBases, wmaxW, va
 		v.SetFloat(p.vr, varPwr*third)
 		v.SetFloat(p.pf, pf)
 		v.SetFloat(p.a, math.Abs(amp)*third)
+	}
+
+	// Accumulators. TotWhInj mirrors the ONLY Wh accumulator this sim
+	// animates — M122's ActWh, incremented every running tick by solarStep's
+	// whAcc — so S1 (a hub comparing ΔTotWhInj against ∫W dt) has something
+	// real to check on the bench. Before this, TotWhInj/TotWhAbs were never
+	// written at all: the model's register slice starts zero-initialised, 0 is
+	// NOT the Tuint64 not-implemented sentinel (all-ones), so 701 read them as
+	// an IMPLEMENTED accumulator that never moved — indistinguishable, over
+	// Modbus, from a genuinely frozen one (freeze_block). TotWhAbs stays at a
+	// truthful 0, not a sentinel: a PV inverter only ever injects.
+	if sf, ok := v.SF("TotWh_SF"); ok {
+		totWh := uint64(r.Get(m122+sunspec.M122_ActWh))<<48 |
+			uint64(r.Get(m122+sunspec.M122_ActWh+1))<<32 |
+			uint64(r.Get(m122+sunspec.M122_ActWh+2))<<16 |
+			uint64(r.Get(m122+sunspec.M122_ActWh+3))
+		setScaledU64(v, sunspec.L701.Offset("TotWhInj"), float64(totWh), sf)
+		setScaledU64(v, sunspec.L701.Offset("TotWhAbs"), 0, sf)
 	}
 	writeSlice(r, adv.M701, regs)
 }

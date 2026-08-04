@@ -135,6 +135,21 @@ const (
 	// to diverge from. Freezing only the READ PATH is what makes staleness an
 	// externally checkable claim rather than an assumption.
 	//
+	// The window is not limited to one contiguous block or one model. "models"
+	// names any number of this sim's registered windows (e.g. ["701","103"]) to
+	// freeze together — the WHOLE-DEVICE freeze that also stops a cross-model
+	// liveness probe (a hub reading 103 to corroborate a suspect 701, or vice
+	// versa) from finding a second, live source of truth. "windows" gives the
+	// same thing in raw addr/count pairs for a window this sim has no name for.
+	// "except" then names points to leave OUT of whatever got frozen — the
+	// realistic firmware that caches most of a block but still refreshes one or
+	// two fields (a line frequency counter on its own interrupt, a temperature
+	// on a separate ADC poll) from live hardware. That is what actually defeats
+	// a naive whole-block digest: the block's bytes keep changing, so "did the
+	// hash move" says fresh, and only a digest that groups points by class
+	// (volatile vs slow vs accumulator) and checks each separately still catches
+	// the frozen majority.
+	//
 	// Invariant: I7 (a status derived from a stale reading is a claim about the
 	// present that did not happen) and I1 (a control computed from a frozen
 	// measurement can exceed the device's real capability).
@@ -289,6 +304,15 @@ type lieSpec struct {
 	Addr  uint16 `json:"addr,omitempty"`  // freeze_block: window start (0 → the configured measurement block)
 	Count uint16 `json:"count,omitempty"` // freeze_block: window length in registers
 
+	// Models, Windows and Except are freeze_block's multi-window form. Addr/
+	// Count, Models and Windows are ADDITIVE — a spec may combine them, though
+	// naming Models alone is the documented whole-device idiom — and with none
+	// of the three given, freeze_block falls back to the sim's single default
+	// window exactly as before. See armFreeze.
+	Models  []string           `json:"models,omitempty"`  // named windows this sim declared (e.g. "701", "103")
+	Windows []freezeWindowSpec `json:"windows,omitempty"` // explicit windows for a model this sim has no name for
+	Except  []string           `json:"except,omitempty"`  // named points to leave LIVE inside the frozen window(s)
+
 	// Addrs/Fields address a set of registers. sentinel_field blanks them;
 	// ack_no_apply refuses to store them (empty → the control register).
 	Addrs  []uint16 `json:"addrs,omitempty"`  // explicit register addresses
@@ -318,6 +342,20 @@ const defaultFillerModel uint16 = 65533
 // signed 16-bit point (−32768).
 const sunSpecNA uint16 = 0x8000
 
+// freezeWindow is one contiguous register range freeze_block snapshots.
+type freezeWindow struct {
+	start uint16
+	count uint16
+}
+
+// freezeWindowSpec is one raw {addr,count} entry in a freeze_block body's
+// "windows" list — the explicit-address escape hatch behind the "models"
+// convenience (see lieSpec.Windows).
+type freezeWindowSpec struct {
+	Addr  uint16 `json:"addr"`
+	Count uint16 `json:"count"`
+}
+
 // lieController holds the armed lies for one sim. All fields are guarded by mu.
 // The zero value is a valid, unarmed controller: every hook is a pass-through,
 // so a sim that never installs one behaves exactly as it did before this file
@@ -337,11 +375,20 @@ type lieController struct {
 	revertBase    uint16
 	revertBaseSet bool
 
-	// freeze_block: frozen is the snapshot served for [freezeStart, +freezeCount).
-	freeze      bool
-	freezeStart uint16
-	freezeCount uint16
-	frozen      map[uint16]uint16
+	// freeze_block: frozen is the snapshot served for every address that falls
+	// inside freezeWindows AND was not named in "except" (see armFreeze).
+	// Multiple simultaneous windows are what make a WHOLE-DEVICE freeze
+	// expressible: freezing 701 alone leaves 103 live for a cross-model
+	// liveness probe to catch in one extra read; freezing 701 AND 103 together
+	// defeats that probe, which is the row proving the gateway has no second,
+	// unfrozen source of truth to fall back on. namedWindows is the set of
+	// windows this sim's constructor registered by model name (installLies) —
+	// naming one this sim never registered is an arm-time error, not a silent
+	// no-op.
+	freeze        bool
+	freezeWindows []freezeWindow
+	frozen        map[uint16]uint16
+	namedWindows  map[string]freezeWindow
 
 	// sentinel_field: addresses to blank, and the sentinel value to blank with.
 	sentinel map[uint16]bool
@@ -420,6 +467,20 @@ func (lc *lieController) configure(label string, regs *RegisterMap, cmdAddr, mea
 	lc.fired = make(map[FaultKind]uint64)
 }
 
+// registerWindow makes a named model window available to freeze_block's
+// "models" list (see armFreeze). installLies calls this once per model the
+// sim actually serves — "103" always, "701" only on an advanced sim — so
+// naming an absent model is a clear arm-time error rather than a freeze that
+// silently covers nothing.
+func (lc *lieController) registerWindow(name string, start, count uint16) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	if lc.namedWindows == nil {
+		lc.namedWindows = make(map[string]freezeWindow)
+	}
+	lc.namedWindows[name] = freezeWindow{start, count}
+}
+
 // wrap installs the controller's hooks in front of whatever the sim already had
 // on regs. Read order is upstream-then-lies (a lie overrides a fault's rewrite,
 // because the lie is the more specific claim); write order is lies-first, since
@@ -486,18 +547,20 @@ func (ss *SolarServer) installLies() {
 	cmdAddr := b.M123Base + sunspec.M123_WMaxLimPct
 	measStart, measCount := b.M103Base, uint16(50)
 	fields := map[string]uint16{
-		"W":   b.M103Base + sunspec.M103_W,
-		"VAr": b.M103Base + sunspec.M103_VAr,
-		"VA":  b.M103Base + sunspec.M103_VA,
-		"PF":  b.M103Base + sunspec.M103_PF,
-		"Hz":  b.M103Base + sunspec.M103_Hz,
-		"A":   b.M103Base + sunspec.M103_A,
+		"W":      b.M103Base + sunspec.M103_W,
+		"VAr":    b.M103Base + sunspec.M103_VAr,
+		"VA":     b.M103Base + sunspec.M103_VA,
+		"PF":     b.M103Base + sunspec.M103_PF,
+		"Hz":     b.M103Base + sunspec.M103_Hz,
+		"A":      b.M103Base + sunspec.M103_A,
+		"TmpCab": b.M103Base + sunspec.M103_TmpCab,
 	}
 	if ss.advanced {
 		cmdAddr = ss.adv.M704 + uint16(sunspec.L704.Offset("WMaxLimPct"))
 		measStart, measCount = ss.adv.M701, uint16(ss.adv.M701Len)
 		for name, off := range map[string]string{
 			"W_701": "W", "VAr_701": "Var", "VA_701": "VA", "PF_701": "PF", "Hz_701": "Hz",
+			"TmpCab_701": "TmpCab",
 		} {
 			fields[name] = ss.adv.M701 + uint16(sunspec.L701.Offset(off))
 		}
@@ -523,6 +586,16 @@ func (ss *SolarServer) installLies() {
 
 	ss.lies.configure("solar", ss.Regs, cmdAddr, measStart, measCount, fields,
 		func() { ss.powerOnReset() }, ss.Server.dropConnections)
+	// Named windows for freeze_block's "models" list (see armFreeze) — "103" is
+	// always served; "701" only exists on an advanced sim. Registering both by
+	// name (rather than leaving 701 reachable only as the unnamed default
+	// window) is what makes a WHOLE-DEVICE freeze
+	// ({"models":["701","103"]}) expressible without the caller needing to know
+	// either model's raw base address.
+	ss.lies.registerWindow("103", b.M103Base, 50)
+	if ss.advanced {
+		ss.lies.registerWindow("701", ss.adv.M701, uint16(ss.adv.M701Len))
+	}
 	ss.lies.wrap(ss.Regs)
 }
 
@@ -556,7 +629,7 @@ func (lc *lieController) lieRead(start uint16, vals []uint16) ([]uint16, error) 
 	lc.mu.Lock()
 	hold := lc.holdMs
 	shift, shiftAt, shiftDelta, shiftModel := lc.shift, lc.shiftAt, lc.shiftDelta, lc.shiftModel
-	freeze, fStart, fCount := lc.freeze, lc.freezeStart, lc.freezeCount
+	freeze := lc.freeze
 	na := lc.naValue
 	hasSentinel := len(lc.sentinel) > 0
 	hasPhantom := lc.ackEcho && len(lc.ackPhantom) > 0
@@ -588,7 +661,7 @@ func (lc *lieController) lieRead(start uint16, vals []uint16) ([]uint16, error) 
 	}
 	for i := range out {
 		addr := start + uint16(i)
-		if freeze && addr >= fStart && addr < fStart+fCount {
+		if freeze {
 			lc.mu.Lock()
 			v, ok := lc.frozen[addr]
 			if ok {
@@ -944,36 +1017,162 @@ func (lc *lieController) armRevert(spec lieSpec) error {
 
 func (lc *lieController) armFreeze(spec lieSpec) error {
 	lc.mu.Lock()
-	start, count := spec.Addr, spec.Count
-	if start == 0 && count == 0 {
-		start, count = lc.measStart, lc.measCount
-	}
-	if count == 0 {
-		lc.mu.Unlock()
-		return fmt.Errorf("fault %q: needs addr+count (this sim declared no default measurement block to freeze)", spec.Kind)
-	}
 	if spec.Clear {
-		lc.freeze, lc.frozen = false, nil
+		lc.freeze, lc.frozen, lc.freezeWindows = false, nil, nil
 		lc.mu.Unlock()
 		log.Printf("[lie] freeze_block: %s cleared — reads track the live bank again", lc.label)
 		return nil
 	}
-	lc.freeze, lc.freezeStart, lc.freezeCount = true, start, count
+
+	windows, err := lc.resolveFreezeWindowsLocked(spec)
+	if err != nil {
+		lc.mu.Unlock()
+		return err
+	}
+	except, err := lc.resolveExceptLocked(spec.Except)
+	if err != nil {
+		lc.mu.Unlock()
+		return err
+	}
+	lc.freeze, lc.freezeWindows = true, windows
 	lc.mu.Unlock()
 
 	// Snapshot outside the lock: regs.Get takes the map's own lock, and the
 	// two are unrelated. A read racing this arm sees either the live bank or
 	// the frozen one — both are answers a real device could give.
-	snap := make(map[uint16]uint16, count)
-	for i := uint16(0); i < count; i++ {
-		snap[start+i] = lc.regs.Get(start + i)
+	total := 0
+	for _, w := range windows {
+		total += int(w.count)
+	}
+	snap := make(map[uint16]uint16, total)
+	for _, w := range windows {
+		for i := uint16(0); i < w.count; i++ {
+			addr := w.start + i
+			if except[addr] {
+				continue
+			}
+			snap[addr] = lc.regs.Get(addr)
+		}
 	}
 	lc.mu.Lock()
 	lc.frozen = snap
 	lc.mu.Unlock()
-	log.Printf("[lie] freeze_block: %s froze [%d..%d] on the READ path — the bank keeps moving, so /registers stays honest",
-		lc.label, start, int(start)+int(count)-1)
+
+	ranges := make([]string, len(windows))
+	for i, w := range windows {
+		ranges[i] = fmt.Sprintf("[%d..%d]", w.start, int(w.start)+int(w.count)-1)
+	}
+	log.Printf("[lie] freeze_block: %s froze %d register(s) across %s on the READ path (%d excepted) — "+
+		"the bank keeps moving, so /registers stays honest",
+		lc.label, len(snap), strings.Join(ranges, ", "), len(except))
 	return nil
+}
+
+// resolveFreezeWindowsLocked turns a freeze_block body into the concrete
+// windows to snapshot. Windows, Models and Addr/Count are ADDITIVE, so a spec
+// may combine them — though naming Models alone (e.g. ["701","103"]) is the
+// documented WHOLE-DEVICE idiom: it is what makes a freeze cover every model a
+// cross-model liveness probe might cross-check in one arm, rather than
+// requiring the caller to know each model's raw base address. No selector at
+// all falls back to this sim's single default measurement window, unchanged
+// from before multi-window support existed. Caller holds lc.mu.
+func (lc *lieController) resolveFreezeWindowsLocked(spec lieSpec) ([]freezeWindow, error) {
+	var windows []freezeWindow
+	for _, w := range spec.Windows {
+		if w.Count == 0 {
+			return nil, fmt.Errorf("fault %q: window at %d needs count > 0", FaultFreezeBlock, w.Addr)
+		}
+		windows = append(windows, freezeWindow{w.Addr, w.Count})
+	}
+	for _, name := range spec.Models {
+		fw, ok := lc.namedWindows[name]
+		if !ok {
+			return nil, fmt.Errorf("fault %q: %s has no model %q to freeze (known: %s)",
+				FaultFreezeBlock, lc.label, name, knownWindowNames(lc.namedWindows))
+		}
+		windows = append(windows, fw)
+	}
+	if spec.Addr != 0 || spec.Count != 0 {
+		if spec.Count == 0 {
+			return nil, fmt.Errorf("fault %q: addr %d needs count > 0", FaultFreezeBlock, spec.Addr)
+		}
+		windows = append(windows, freezeWindow{spec.Addr, spec.Count})
+	}
+	if len(windows) == 0 {
+		if lc.measCount == 0 {
+			return nil, fmt.Errorf("fault %q: needs addr+count, models, or windows (this sim declared no default measurement block to freeze)", FaultFreezeBlock)
+		}
+		windows = append(windows, freezeWindow{lc.measStart, lc.measCount})
+	}
+	return windows, nil
+}
+
+// resolveExceptLocked resolves freeze_block's "except" list of point NAMES to
+// the addresses to leave OUT of the frozen snapshot — live inside an otherwise
+// frozen window. Names are matched against lc.fields by CANONICAL name (see
+// canonicalFieldName), so one name excludes the point wherever it is
+// registered: the bare 103 address on a legacy sim, and BOTH the 103 and 701
+// addresses on an advanced sim mid whole-device freeze. That is the point of
+// resolving by canonical name rather than by the raw field key — "except":
+// ["Hz"] has to mean "Hz, in every model this freeze covers", not "Hz, in
+// whichever one address happened to be registered under that exact string",
+// or a whole-device freeze plus except would still let the untouched copy give
+// away that the device is frozen. Caller holds lc.mu.
+func (lc *lieController) resolveExceptLocked(names []string) (map[uint16]bool, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	matched := make(map[string]bool, len(names))
+	out := make(map[uint16]bool, len(names))
+	for fname, addr := range lc.fields {
+		if canon := canonicalFieldName(fname); want[canon] {
+			out[addr] = true
+			matched[canon] = true
+		}
+	}
+	for _, n := range names {
+		if !matched[n] {
+			return nil, fmt.Errorf("fault %q: unknown except field %q for %s (known: %s)",
+				FaultFreezeBlock, n, lc.label, knownFields(lc.fields))
+		}
+	}
+	return out, nil
+}
+
+// canonicalFieldName strips a trailing "_<model>" suffix (e.g. "Hz_701" ->
+// "Hz") so an except name matches a point regardless of which model
+// installLies registered it under — the bare name for 103, a model-number
+// suffixed alias for 701 (and any later model that needs its own alias for a
+// name 103 already claimed).
+func canonicalFieldName(name string) string {
+	i := strings.LastIndex(name, "_")
+	if i <= 0 || i == len(name)-1 {
+		return name
+	}
+	for _, c := range name[i+1:] {
+		if c < '0' || c > '9' {
+			return name
+		}
+	}
+	return name[:i]
+}
+
+// knownWindowNames renders the registered freeze_block window names for an
+// error message.
+func knownWindowNames(m map[string]freezeWindow) string {
+	if len(m) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func (lc *lieController) armSentinel(spec lieSpec) error {
