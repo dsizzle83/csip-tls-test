@@ -31,6 +31,7 @@ import (
 
 // BatteryBases holds the first data-register address of each model block.
 type BatteryBases struct {
+	M120Base uint16 // Model 120 (Nameplate)
 	M121Base uint16 // Model 121 (Basic Settings)
 	M103Base uint16 // Model 103 (Three-Phase Inverter/Converter AC)
 	M123Base uint16 // Model 123 (Immediate Controls)
@@ -50,10 +51,24 @@ type BatteryServer struct {
 	faults     faultController // shared fault-injection state (see faults.go)
 
 	// Advanced-DER (7xx) surface — populated only by NewBatteryServerAdvanced
-	// (battery_adv.go). When advanced is false the sim serves the legacy
-	// models only and behaves exactly as today.
+	// (battery_adv.go) and by the PACK constructors (battery_pack.go). When
+	// advanced is false the sim serves the legacy models only and behaves
+	// exactly as today.
 	advanced bool
 	adv      batteryAdvBases
+
+	// pack is the bench BATTERY-PACK profile (battery_pack.go) and is nil on
+	// every historical image — batsim's default and mbapsdev's battery mode.
+	// Nil is what keeps this file's behaviour byte-identical for them: every
+	// pack-only branch below is guarded on it.
+	pack *packProfile
+	// regEnd is the last register the served image occupies (0 = the legacy
+	// base+236). See Registers.
+	regEnd uint16
+	// lies is the LYING-DEVICE layer (lying.go), installed by the pack
+	// constructors only. Nil on the historical images, which advertise the
+	// faults.go vocabulary alone exactly as they always have.
+	lies *lieController
 }
 
 // batteryFaultKinds is the set of POST /fault kinds the battery sim advertises.
@@ -120,6 +135,17 @@ func (bs *BatteryServer) ApplyFault(body []byte) error {
 	if handled, err := bs.Server.applyServerFault(body); handled {
 		return err
 	}
+	// LYING-device kinds (lying.go) — a pack that answers plausibly and
+	// falsely. Consulted before the faultController so a lie kind never
+	// reaches that controller's supported-set check, which would call it
+	// unknown. Only a PACK profile installs the layer; on the historical
+	// battery images lies is nil and this is not reached at all, so their
+	// advertised fault set is unchanged.
+	if bs.lies != nil {
+		if handled, err := bs.lies.apply(body); handled {
+			return err
+		}
+	}
 	return bs.faults.apply(body, batteryFaultKinds)
 }
 
@@ -156,6 +182,10 @@ type BatteryState struct {
 		WMaxLimPct_pct float64 `json:"WMaxLimPct_pct"`
 		Conn           int     `json:"Conn"`
 	} `json:"controls"`
+	// Pack is the BATTERY-PACK ground truth (battery_pack.go) and is omitted
+	// entirely on the historical images, so their GET /state document is
+	// byte-identical to what it has always been.
+	Pack *BatteryPackState `json:"pack,omitempty"`
 }
 
 // Snapshot reads current register state and returns a decoded BatteryState.
@@ -198,14 +228,25 @@ func (bs *BatteryServer) Snapshot() BatteryState {
 	c.WMaxLimPct_pct = signed(b.M123Base+sunspec.M123_WMaxLimPct, b.M123Base+sunspec.M123_WMaxLimPct_SF) / 100.0
 	c.Conn = int(r.Get(b.M123Base + sunspec.M123_Conn))
 
+	st.Pack = bs.packSnapshot()
+
 	return st
 }
 
 // Registers returns a sparse map of non-zero register values for debugging.
+//
+// The legacy image ends at base+236; a PACK profile that appends the 7xx
+// models is longer and records its own end (regEnd) so the dump does not stop
+// half-way through model 701 — a truncated /registers is how a "the 704 never
+// stored" diagnosis gets made against a sim that stored it fine.
 func (bs *BatteryServer) Registers() map[string]uint16 {
 	out := make(map[string]uint16)
 	base := uint16(sunspec.SunSpecBase)
-	for addr := base; addr <= base+236; addr++ {
+	end := base + 236
+	if bs.regEnd > end {
+		end = bs.regEnd
+	}
+	for addr := base; addr <= end; addr++ {
 		v := bs.Regs.Get(addr)
 		if v != 0 {
 			out[fmt.Sprintf("%d", addr)] = v
@@ -218,6 +259,12 @@ func (bs *BatteryServer) Registers() map[string]uint16 {
 // Accepted keys: "W_W", "V_V", "Hz_Hz", "TmpCab_C",
 // "SoC_pct" (0–100), "SoH_pct" (0–100),
 // "WMaxLimPct_pct" (0–100), "Ena" (0 or 1), "Conn" (0 or 1), "St" (1–8), "ChaSt" (1–7).
+//
+// A PACK profile (battery_pack.go) additionally accepts "CommandedW_W" (signed
+// watts through whichever active-power axis the shape has — the lever a bench
+// recipe should reach for, and see injectPackDispatch for the pre-existing
+// defect in "WMaxLimPct_pct" that is the reason it exists) and, on the
+// setpoint shape only, "WSet_W" / "WSetEna".
 func (bs *BatteryServer) Inject(body []byte) error {
 	var fields map[string]float64
 	if err := json.Unmarshal(body, &fields); err != nil {
@@ -273,6 +320,20 @@ func (bs *BatteryServer) Inject(body []byte) error {
 			r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, uint16(val))
 		case "Conn":
 			r.Set(b.M123Base+sunspec.M123_Conn, uint16(val))
+		case "CommandedW_W":
+			// The shape-agnostic "make this pack produce X watts" lever — see
+			// injectPackDispatch for why it exists alongside WMaxLimPct_pct.
+			if err := bs.injectPackDispatch(val); err != nil {
+				return err
+			}
+		case "WSet_W", "WSetEna":
+			// The 704 setpoint axis, for driving a pack without a gateway.
+			// Refused by name on a shape that has no 704 rather than silently
+			// accepted: "I set WSet and nothing happened" is exactly the
+			// diagnosis this whole simulator exists to make impossible.
+			if err := bs.injectPackSetpoint(key, val); err != nil {
+				return err
+			}
 		case "St":
 			r.Set(b.M103Base+sunspec.M103_St, uint16(val))
 		case "ChaSt":
@@ -281,6 +342,10 @@ func (bs *BatteryServer) Inject(body []byte) error {
 			return fmt.Errorf("inject: unknown field %q", key)
 		}
 	}
+	// A PACK re-derives its commanded power and its 701/713 mirror straight
+	// away, so a PAUSED pack (or one nobody has ticked yet) still answers
+	// coherently — mirrors SolarServer.advSync's role on the inverter side.
+	bs.packSync()
 	return nil
 }
 
@@ -470,6 +535,7 @@ func populateBatteryCore(r *RegisterMap, wmaxKwh, wmaxW float64) (BatteryBases, 
 	cursor += 2 + sunspec.M802Len
 
 	return BatteryBases{
+		M120Base: m120,
 		M121Base: m121Base,
 		M103Base: m103Base,
 		M123Base: m123Base,
@@ -624,62 +690,81 @@ func animateBattery(s *Server, r *RegisterMap, wmaxW, wmaxKwh float64, bases Bat
 				socMu.Unlock()
 			}
 
-			v := 240.0 + 1.5*math.Sin(2*math.Pi*t/89)
-			hz := 60.0 + 0.03*math.Sin(2*math.Pi*t/67)
-			absW := math.Abs(w)
-			tmp := 25.0 + 15.0*(absW/wmaxW)
-
-			pf := math.Max(0.95, math.Min(0.9999, 0.98+0.015*math.Cos(phase)))
-			va := absW / pf
-			varPwr := va * math.Sin(math.Acos(pf))
-			if w < 0 {
-				varPwr = -varPwr
-			}
-
-			dcv := 44.0 + 6.0*(soc/100.0)
-			dcw := absW * 1.03
-			iph := absW / (v * 3)
-			if w < 0 {
-				iph = -iph
-			}
-
-			r.Set(m103Base+sunspec.M103_A, uint16(int16(math.Round(iph*3))))
-			r.Set(m103Base+sunspec.M103_AphA, uint16(int16(math.Round(iph))))
-			r.Set(m103Base+sunspec.M103_AphB, uint16(int16(math.Round(iph))))
-			r.Set(m103Base+sunspec.M103_AphC, uint16(int16(math.Round(iph))))
-			r.Set(m103Base+sunspec.M103_PhVphA, uint16(math.Round(v*10)))
-			r.Set(m103Base+sunspec.M103_PhVphB, uint16(math.Round(v*10)))
-			r.Set(m103Base+sunspec.M103_PhVphC, uint16(math.Round(v*10)))
-			r.Set(m103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
-			r.Set(m103Base+sunspec.M103_Hz, uint16(math.Round(hz*100)))
-			r.Set(m103Base+sunspec.M103_VA, uint16(int16(math.Round(va))))
-			r.Set(m103Base+sunspec.M103_VAr, uint16(int16(math.Round(varPwr))))
-			r.Set(m103Base+sunspec.M103_PF, uint16(int16(math.Round(pf*10000))))
-			r.Set(m103Base+sunspec.M103_DCV, uint16(math.Round(dcv*10)))
-			r.Set(m103Base+sunspec.M103_DCW, uint16(int16(math.Round(dcw))))
-			r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10))))
-
-			if absW < wmaxW*0.02 {
-				r.Set(m103Base+sunspec.M103_St, 8)
-			} else {
-				r.Set(m103Base+sunspec.M103_St, 4)
-			}
-
-			r.Set(m802Base+uint16(sunspec.M802_SoC), uint16(math.Round(soc*100)))
-			dod := 100.0 - soc
-			r.Set(m802Base+uint16(sunspec.M802_DoD), uint16(math.Round(dod*100)))
-
-			var chaSt uint16
-			switch {
-			case w > wmaxW*0.02:
-				chaSt = 3
-			case w < -wmaxW*0.02:
-				chaSt = 4
-			default:
-				chaSt = 6
-			}
-			r.Set(m802Base+uint16(sunspec.M802_ChaSt), chaSt)
-			r.Set(m802Base+uint16(sunspec.M802_State), 2)
+			writeBatteryPhysical(r, bases, wmaxW, w, soc, t)
 		}
 	}
+}
+
+// writeBatteryPhysical writes ONE tick's physical state — real power w
+// (signed: + discharge, − charge) at state-of-charge soc %, at simulation time
+// t — into the 103 and 802 register images. Everything else about the tick
+// (voltage/frequency wander, temperature, power factor, DC-side figures) is
+// derived from those three numbers here, so there is exactly ONE place the
+// battery's electrical image is computed.
+//
+// Extracted verbatim from animateBattery's tail so the PACK profile
+// (battery_pack.go), whose per-tick step is a different function with a
+// different power derivation, cannot drift from the demo animation about what
+// a given (w, soc) LOOKS like on the wire. Its output is byte-identical to
+// what animateBattery has always written.
+func writeBatteryPhysical(r *RegisterMap, bases BatteryBases, wmaxW, w, soc, t float64) {
+	m103Base, m802Base := bases.M103Base, bases.M802Base
+	phase := 2 * math.Pi * t / 1200
+
+	v := 240.0 + 1.5*math.Sin(2*math.Pi*t/89)
+	hz := 60.0 + 0.03*math.Sin(2*math.Pi*t/67)
+	absW := math.Abs(w)
+	tmp := 25.0 + 15.0*(absW/wmaxW)
+
+	pf := math.Max(0.95, math.Min(0.9999, 0.98+0.015*math.Cos(phase)))
+	va := absW / pf
+	varPwr := va * math.Sin(math.Acos(pf))
+	if w < 0 {
+		varPwr = -varPwr
+	}
+
+	dcv := 44.0 + 6.0*(soc/100.0)
+	dcw := absW * 1.03
+	iph := absW / (v * 3)
+	if w < 0 {
+		iph = -iph
+	}
+
+	r.Set(m103Base+sunspec.M103_A, uint16(int16(math.Round(iph*3))))
+	r.Set(m103Base+sunspec.M103_AphA, uint16(int16(math.Round(iph))))
+	r.Set(m103Base+sunspec.M103_AphB, uint16(int16(math.Round(iph))))
+	r.Set(m103Base+sunspec.M103_AphC, uint16(int16(math.Round(iph))))
+	r.Set(m103Base+sunspec.M103_PhVphA, uint16(math.Round(v*10)))
+	r.Set(m103Base+sunspec.M103_PhVphB, uint16(math.Round(v*10)))
+	r.Set(m103Base+sunspec.M103_PhVphC, uint16(math.Round(v*10)))
+	r.Set(m103Base+sunspec.M103_W, uint16(int16(math.Round(w))))
+	r.Set(m103Base+sunspec.M103_Hz, uint16(math.Round(hz*100)))
+	r.Set(m103Base+sunspec.M103_VA, uint16(int16(math.Round(va))))
+	r.Set(m103Base+sunspec.M103_VAr, uint16(int16(math.Round(varPwr))))
+	r.Set(m103Base+sunspec.M103_PF, uint16(int16(math.Round(pf*10000))))
+	r.Set(m103Base+sunspec.M103_DCV, uint16(math.Round(dcv*10)))
+	r.Set(m103Base+sunspec.M103_DCW, uint16(int16(math.Round(dcw))))
+	r.Set(m103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10))))
+
+	if absW < wmaxW*0.02 {
+		r.Set(m103Base+sunspec.M103_St, 8)
+	} else {
+		r.Set(m103Base+sunspec.M103_St, 4)
+	}
+
+	r.Set(m802Base+uint16(sunspec.M802_SoC), uint16(math.Round(soc*100)))
+	dod := 100.0 - soc
+	r.Set(m802Base+uint16(sunspec.M802_DoD), uint16(math.Round(dod*100)))
+
+	var chaSt uint16
+	switch {
+	case w > wmaxW*0.02:
+		chaSt = 3
+	case w < -wmaxW*0.02:
+		chaSt = 4
+	default:
+		chaSt = 6
+	}
+	r.Set(m802Base+uint16(sunspec.M802_ChaSt), chaSt)
+	r.Set(m802Base+uint16(sunspec.M802_State), 2)
 }

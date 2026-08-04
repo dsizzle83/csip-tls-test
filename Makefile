@@ -1,4 +1,4 @@
-.PHONY: all build build-server build-client build-conformance build-modsim build-vtnsim \
+.PHONY: all build build-server build-client build-conformance build-modsim build-batsim build-vtnsim \
         build-mbapsdev build-aggregator build-ssm-conformance ssm-conformance aggregator-campaigns \
         build-certify certify-keylog test-certify \
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \

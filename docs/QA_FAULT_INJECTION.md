@@ -349,3 +349,192 @@ BOTH registers of 701's `Hz`, pinning DEF-5's fix),
 `TestAdvSolarM103WHAlsoAnimates`, `TestSolarStep_103WHAccumulatorTracksIntegratedEnergy`,
 `TestAdv701BecalmedButLiveIsNotIndistinguishableFromFrozen`,
 `TestSolarServer_NightInject`, `TestSolarStep_NightCollapsesWWithAnimationStillAlive`).
+
+---
+
+## The battery pack (2026-08-04) — closing the bench's oldest gap
+
+`sim/southbound/battery_pack.go` adds the BATTERY-SHAPED SIMULATOR that
+lexa-gw's `docs/known_issues.json` BENCH-000 has recorded as the blocking bench
+gap since IW3 and now repeats three times. Both 7xx bench devices are
+inverters, and the 704-less shape exists there only as an inverter
+(`modsim -der-models legacy`, registered as `inv-legacy`, `der_gen "12x"`), so
+until now **nothing on the bench answered as role `battery` at all** — which
+left RMD-025 (the shape-aware fail-safe) and RMD-028 (durable cease ownership)
+Go-proven and bench-unproven, with six named rows queued behind the gap.
+
+The two modes are named for the fail-safe posture a gateway will independently
+MEASURE the shape to have — lexa-gw `internal/topics`'
+`FailsafePostureSetpointZero` / `FailsafePostureCease`, the value that rides on
+`InventoryRecord.FailsafePosture` — because the shape IS the posture.
+
+| Mode | Model chain | Containment it can execute |
+|---|---|---|
+| `batsim -pack setpoint-zero` | 1 / 120 / 121 / 103 / 123 / 802 / **701 / 702 / 703 / 704 / 713** | **704 `WSet` = 0** — idle at zero, never leaving service |
+| `batsim -pack cease` | 1 / 120 / 121 / 103 / 123 / 802 | **M123 `Conn` = 0** — a physical cease |
+| `batsim` (no `-pack`) | unchanged historical demo battery | — |
+
+### Launch lines
+
+```bash
+# The 704-CAPABLE pack (setpoint convergence, BENCH-000 rows (h) and
+# "setpoint convergence (battery sim mode w/ 704 WSet bridge)").
+./bin/batsim -pack setpoint-zero -port 5023 -api-port 6023 -kwh 20 -wmax 5000
+
+# The 704-LESS pack (cease posture, BENCH-000 rows (e)/(f)/(g)/(k)).
+./bin/batsim -pack cease -port 5024 -api-port 6024 -kwh 20 -wmax 5000
+
+# The pre-disconnected pack (BENCH-000 row (j)): open at the cabinet BEFORE the
+# gateway can dial, so a gateway holding no ownership record must leave it alone.
+./bin/batsim -pack cease -port 5024 -api-port 6024 -kwh 20 -wmax 5000 -start-disconnected
+```
+
+The board-side half is `/etc/lexa/modbus.json` — the gateway does not sweep, so
+an unlisted sim is never dialled. See `scripts/bench/battery-pack-sim.md` for
+the device entries, the per-row recipes and the verification commands.
+
+### The WSet bridge
+
+`packBridgeSetpoint` is the exact mirror of `advBridgeCeiling` one axis over:
+an **enabled** 704 setpoint is copied into the legacy 123 signed-`WMaxLimPct`
+convention the pack's physics already runs on (`hubBatteryW`: negative =
+charge, positive = discharge), so the same animation, the same SoC integration
+(`animateBattery`/`clampToSoC`) and the same effect-time faults apply to a 704
+setpoint as to a legacy dispatch. Bridging rather than re-deriving is what
+keeps ONE physics — two derivations would be two chances for `/state` and the
+wire to disagree, which is the divergence this simulator exists to make
+visible, not to contain.
+
+This is the piece `NewBatteryServerAdvanced` deliberately lacks, and its own
+file comment says so: its 704 "is NOT wired to physical effect … a 704 write
+still round-trips correctly, it just does not additionally command the pack."
+A device that ACKs a setpoint, echoes it back and never moves is not a battery
+— it is `ack_no_apply` with no way to turn it off, and every convergence row
+run against it would have measured the gateway's handling of a lying device
+while believing it measured convergence.
+
+Three deliberate differences from the ceiling bridge, each of them the
+battery's nature:
+
+- **Signed.** A ceiling is a magnitude; a setpoint has a direction, and the
+  direction is the whole difference between charging and discharging.
+- **Honours `WSetMod`.** Watts or percent-of-max both land in the same physical
+  quantity; a device understanding one spelling would mis-scale the other by
+  `WMax/100` and report a plausible, wrong number.
+- **The pack RAMPS** (`packRampFrac`, 34 % of nameplate per 5 s tick).
+  A device that jumps is a device that is ALWAYS already converged, and a bench
+  made of such devices can never exercise the gateway's
+  pending/converged/diverged machinery. **A CONTACTOR IS NOT A RAMP**, though:
+  `Conn=0` collapses measured power in the same tick, and on the write itself,
+  so a *paused* pack still ceases and a correct cease never looks like a slow
+  one inside the gateway's settle window.
+
+### Ratings are real, and the pack honours them
+
+`populate702Pack` writes the storage fork `solar_adv.go`'s `populate702` doc
+explicitly defers to a profile like this one: `WChaRteMaxRtg` /
+`WDisChaRteMaxRtg` real, **symmetric**, and **strictly below the nameplate**
+(`packRateRatingFrac`, 90 %). Below matters — `checkSetpointWithinNameplate`
+runs first, so ratings equal to the nameplate would make the rating bound
+unreachable and it would ship untested. The pack also CLAMPS its own physical
+output to them, so the M702 numbers are a fact about the device rather than a
+claim in a register, and every model that carries the rate (M120
+`MaxChaRte`/`MaxDisChaRte`, M802 `WChaRteMax`/`WDisChaRteMax`, M702) says the
+same number. The APPARENT-power rate ratings stay at the not-implemented
+sentinel, honestly: a `Tuint16` zero would be a positive declaration that the
+pack cannot charge or discharge at all.
+
+### Fault rows the pack makes expressible
+
+Both shapes carry the LYING-DEVICE layer (`sim/southbound/lying.go`) that until
+now only the solar sims had, with the CONTROL registers named so the write path
+is targetable.
+
+| Row | `POST /fault` body | What it proves |
+|---|---|---|
+| **ACKed setpoint that never latched** | `{"kind":"ack_no_apply","fields":["WSet","WSetEna"]}` | The false-Applied shape on the setpoint axis: the write ACKs, the pack keeps doing exactly what it was doing, and only a gateway that reads back and COMPARES catches it. `setpoint-zero` only. |
+| **ACKed cease that never opened** | `{"kind":"ack_no_apply","fields":["Conn"]}` | The same lie on the connect axis, and the direction that matters — a satisfied cease on a DER measurably past the cessation band. Both shapes. |
+| **Conn unimplemented** | `{"kind":"sentinel_field","fields":["Conn"],"value":65535}` | BENCH-000 row (g) without a third register image: over Modbus the pack leaves `Conn` at `0xFFFF`, so its connect state can never be proven and admission must refuse it with the typed error. |
+| **Stale pack measurement** | `{"kind":"freeze_block","models":["701","103"]}` (or `["103"]`, `["802"]`, `["123"]`, `["704"]`, `["713"]`) | Whole-device freeze on a battery. Every model each shape serves is registered by name, so naming one it does not serve is an arm-time error rather than a freeze covering nothing. |
+| **Pack reboot-to-defaults** | `{"kind":"reboot_forget"}` | RMD-025's DER-reboot row: the pack comes back with the contactor CLOSED and no standing dispatch. A gateway treating "the pack is back" as "the pack is still ceased" is running an uncontained battery. |
+| **Setpoint silently released** | `{"kind":"revert_after","delay_s":40}` | Acts on 704 `WSetEna` (not `WSet`): the ENABLE is the single register whose silent loss is exactly "the setpoint is no longer in force", and `WSet` is a `Tint32` whose high word alone is a value nobody wrote. |
+
+The effect-time battery faults (`soc_refuse`, `charge_disabled`,
+`discharge_disabled`) reach a power commanded through 704 as well, because the
+bridge puts both command routes through one `shapeBatteryW`.
+
+**Idle-at-zero needs no fault at all**, deliberately: a pack at 100 % SoC
+commanded to charge (or 0 % commanded to discharge) holds a genuine 0 W through
+`clampToSoC` and reports `ChaSt` FULL/EMPTY rather than HOLDING — which is how
+a hub tells "this pack is refusing" from "this pack is uncommanded".
+`becalm`/`Night` is a solar concept (a dark inverter) with no battery analogue
+and is deliberately not offered here.
+
+### DEF-5's rule reached one fault further (fixed)
+
+The pack found a real defect in the lying layer. `freeze_block`'s `except`
+resolved a named point to its FULL register width (DEF-5); `sentinel_field` and
+`ack_no_apply` resolved it to the ONE address `lc.fields` records. That was
+invisible while every named point was 16 bits wide and became load-bearing the
+moment a device named 704's `WSet`, a `Tint32`: `ack_no_apply` against it
+dropped the HIGH word only, so a 4000 W setpoint (high word 0, low word 4000)
+**landed in full** — the fault "succeeded" at refusing to change a register
+that already held the value being written, the log line announced a swallowed
+write, and the device that was supposed to be lying obeyed. `sentinel_field`
+carried the mirror-image bug: half-blanking a 32-bit point serves neither the
+real value nor the sentinel, but a number no device would ever produce. Both
+now share `resolveTargetsLocked`. A RAW `addrs` entry still means exactly one
+register — someone who writes an address down said precisely what they meant,
+and that is the only way to express "only the low word went bad".
+
+Pinned by `sim/southbound/lying_test.go`
+(`TestAckNoApply_DropsEveryRegisterOfAMultiWordPoint`,
+`TestSentinelField_BlanksEveryRegisterOfAMultiWordPoint`).
+
+### A pre-existing defect the live smoke found (recorded, NOT fixed)
+
+`POST /inject {"WMaxLimPct_pct": N}` — the historical spelling on BOTH the
+battery sim and the solar one — encodes `RawFromScaleSigned(N*100, SF)` against
+a scale factor of −2, which is `N x 10000`. The register therefore **saturates
+at 32767 for any N above ~3.27**: an injected 80 does not command 80 %, it
+commands the saturated word, which `hubBatteryW` reads back as 327.67 % of
+nameplate and `GET /state` reports (dividing by 100 again, matching the same
+mistaken convention) as `3.28`. Observed live on a 5 kW `-pack cease` sim:
+`{"WMaxLimPct_pct":80,"Ena":1}` produced `M123[0] = 32767` and a measured power
+pinned at the pack's declared 4500 W discharge rate rating — correct behaviour
+by the pack, in response to a command nobody meant.
+
+It is deliberately left alone under a battery change, because the mistake is
+load-bearing elsewhere and correcting it silently changes what those call sites
+do: `cmd/dashboard/mayhem.go` uses `{"WMaxLimPct_pct":100}` to UNCURTAIL a
+solar sim and gets the effect it wants *from* the saturation (327 % of
+nameplate is not a ceiling), and
+`internal/certify/suitemodbusclient/checks_write.go` uses
+`{"WMaxLimPct_pct":50}` as a 50 % curtail that has never curtailed. Both
+deserve their own change with their own evidence. `{"WMaxLimPct_pct":0}` — the
+QA harness's inter-scenario reset — is unaffected: zero encodes to zero either
+way, which is why this has survived this long.
+
+A pack therefore offers `{"CommandedW_W": <signed watts>}`, which writes 704
+`WSet` on the setpoint shape and the correctly-encoded M123 dispatch on the
+cease shape. Pinned, including the saturation contrast, by
+`TestPackCommandedWInjectWorksOnBothShapes`.
+
+### Ground truth
+
+`GET /state` grows a `"pack"` object on a `-pack` sim (omitted entirely
+otherwise, so the historical document is byte-identical): shape, the posture
+the gateway should measure, `connected`, `commanded_W` vs `measured_W` with the
+`ramp_W_per_tick` bound between them, the declared rate ratings, the raw 704
+setpoint, the 701 mirror, and the lie counters. `POST /inject` additionally
+accepts `{"CommandedW_W":-3000}` on either shape and `{"WSet_W":-3000}` /
+`{"WSetEna":0}` on the setpoint shape, each refused BY NAME on a shape that
+cannot express it.
+
+Unit tests: `sim/southbound/battery_pack_test.go` — the model chains and the
+admission facts each one presents, WSet convergence in both signs with SoC
+integrating the right way, `WSetMod` honoured, the idle-pack-commanded-discharge
+row that diverges until the animation moves, the rate-rating clamp,
+cease/reconnect physical effect on both shapes (including the 701 `St`/`ConnSt`
+half of the two-sided proof), full/empty idle, the fault rows above, and a pin
+that the historical battery images grew no pack surface.

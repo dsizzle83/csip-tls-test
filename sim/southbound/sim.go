@@ -581,6 +581,14 @@ func (s *Server) applyServerFault(body []byte) (handled bool, err error) {
 func (s *Server) dropConnections() error {
 	s.srvMu.Lock()
 	defer s.srvMu.Unlock()
+	if s.srv == nil {
+		// No listener to bounce: a unit-test rig driving the register bank
+		// directly, or the window between startServerRaw and a constructor
+		// assigning the Server. "Sever every live connection" is satisfied
+		// vacuously when there are none — and a reboot_forget must still
+		// perform the STATE half rather than panicking half-way through it.
+		return nil
+	}
 	_ = s.srv.Stop()
 	newSrv, err := modbuslib.NewServer(&modbuslib.ServerConfiguration{
 		URL:        s.listenURL,

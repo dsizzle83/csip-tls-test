@@ -391,6 +391,82 @@ func TestFreezeBlock_ExceptAppliesAcrossEveryFrozenModel(t *testing.T) {
 	}
 }
 
+// TestAckNoApply_DropsEveryRegisterOfAMultiWordPoint is DEF-5's rule applied
+// to the fault it had NOT been applied to. freeze_block's "except" resolved a
+// named point to its full register width; sentinel_field and ack_no_apply
+// resolved it to the ONE address lc.fields records. That was invisible while
+// every named point was 16 bits wide, and became load-bearing the moment a
+// device named 704's WSet — a Tint32.
+//
+// The failure is worse than a partial fault: ack_no_apply against WSet dropped
+// the HIGH word only, so a 4000 W setpoint (high word 0, low word 4000) landed
+// IN FULL. The fault "succeeded" at refusing to change a register that was
+// already the value being written, the log line announced a swallowed write,
+// and the device that was supposed to be lying obeyed. A scenario built on
+// that reads as "the gateway caught nothing", which is indistinguishable from
+// the gateway having no check at all.
+//
+// Found by the battery-pack sim (battery_pack.go): WSet is the first control
+// point in this simulator that a hub WRITES and that is wider than one
+// register.
+func TestAckNoApply_DropsEveryRegisterOfAMultiWordPoint(t *testing.T) {
+	ss := newLyingSolarAdvanced(t, 8000)
+	wset := ss.adv.M704 + uint16(sunspec.L704.Offset("WSet")) // Tint32
+
+	// A whole-block read-modify-write, exactly as derbase writes a 704 control.
+	block, err := modbusRead(t, ss, ss.adv.M704, uint16(sunspec.L704.Len()))
+	if err != nil {
+		t.Fatalf("read 704: %v", err)
+	}
+	v := sunspec.L704.View(block)
+	v.SetBool("WSetEna", true)
+	v.SetFloat("WSet", 4000)
+
+	arm(t, ss, `{"kind":"ack_no_apply","fields":["WSet"]}`)
+	if err := modbusWrite(t, ss, ss.adv.M704, block...); err != nil {
+		t.Fatalf("write 704: %v — ack_no_apply must ACK at the protocol level", err)
+	}
+
+	if hi, lo := ss.Regs.Get(wset), ss.Regs.Get(wset+1); hi != 0 || lo != 0 {
+		t.Fatalf("704 WSet = [%d %d] in the bank, want [0 0] — ack_no_apply must store NO register of "+
+			"a multi-word point, or the low word carries the whole commanded value and the fault is a "+
+			"no-op that logs like a lie", hi, lo)
+	}
+	// The contrast half: clear the lie and the same write lands.
+	arm(t, ss, `{"kind":"ack_no_apply","clear":true}`)
+	if err := modbusWrite(t, ss, ss.adv.M704, block...); err != nil {
+		t.Fatalf("write 704 after clear: %v", err)
+	}
+	if got := sunspec.L704.View(readSlice(ss.Regs, ss.adv.M704, sunspec.L704.Len())).Float("WSet"); got != 4000 {
+		t.Fatalf("704 WSet = %v after clearing the lie, want 4000 — a cleared fault must stop lying", got)
+	}
+}
+
+// TestSentinelField_BlanksEveryRegisterOfAMultiWordPoint is the mirror image
+// on the read path. Half-blanking a 32-bit point serves neither the real value
+// nor the not-implemented sentinel — it serves a number no device would ever
+// produce, which is a DIFFERENT fault from the one that was armed, and one a
+// consumer may well decode as a plausible reading.
+func TestSentinelField_BlanksEveryRegisterOfAMultiWordPoint(t *testing.T) {
+	ss := newLyingSolarAdvanced(t, 8000)
+	hz701 := ss.adv.M701 + uint16(sunspec.L701.Offset("Hz")) // Tuint32
+	ss.Regs.Set(hz701, 0)
+	ss.Regs.Set(hz701+1, 6000)
+
+	arm(t, ss, `{"kind":"sentinel_field","fields":["Hz_701"],"value":65535}`)
+	got, err := modbusRead(t, ss, hz701, 2)
+	if err != nil {
+		t.Fatalf("read 701 Hz: %v", err)
+	}
+	if got[0] != 0xFFFF || got[1] != 0xFFFF {
+		t.Fatalf("701 Hz = [%#04x %#04x], want both registers at the sentinel — a Tuint32 with only "+
+			"its high word blanked reads as a real, wrong number", got[0], got[1])
+	}
+	if bank := ss.Regs.Get(hz701 + 1); bank != 6000 {
+		t.Errorf("register bank low word = %d, want the honest 6000", bank)
+	}
+}
+
 // TestFreezeBlock_UnknownModelIsAnError is the anti-vacuous-fault check for
 // "models": naming a model this sim never registered must be an error, not a
 // freeze that silently covers nothing.

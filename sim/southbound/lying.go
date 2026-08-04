@@ -1262,6 +1262,48 @@ func knownWindowNames(m map[string]freezeWindow) string {
 	return strings.Join(names, ", ")
 }
 
+// resolveTargetsLocked turns a spec's Addrs/Fields into the register set a
+// POINT-ADDRESSED fault (sentinel_field, ack_no_apply) acts on.
+//
+// A NAMED field expands to EVERY register of the point — DEF-5's rule, which
+// freeze_block's "except" already applied (resolveExceptLocked) and these two
+// did not. The gap was invisible for as long as every named point was 16 bits
+// wide, and became load-bearing the moment a battery pack named 704's WSet, a
+// Tint32: ack_no_apply against it dropped only the HIGH word, so a setpoint of
+// 4000 W landed in full — its high word is 0, which the fault was
+// "successfully" refusing to change — and the device that was supposed to be
+// lying was quietly obeying, with the log line claiming otherwise.
+// sentinel_field carried the mirror-image bug: half-blanking a 32-bit point
+// serves neither the real value nor the not-implemented sentinel, i.e. a
+// number no device would ever produce, which is a different fault from the one
+// that was armed.
+//
+// A RAW address stays exactly one register. Someone who wrote an address down
+// said precisely what they meant, and widening it would take away the one way
+// to express "only the low word went bad", which is itself a realistic
+// firmware fault.
+func (lc *lieController) resolveTargetsLocked(spec lieSpec) (map[uint16]bool, error) {
+	set := make(map[uint16]bool, len(spec.Addrs)+len(spec.Fields))
+	for _, a := range spec.Addrs {
+		set[a] = true
+	}
+	for _, f := range spec.Fields {
+		addr, ok := lc.fields[f]
+		if !ok {
+			return nil, fmt.Errorf("fault %q: unknown field %q for %s (known: %s)",
+				spec.Kind, f, lc.label, knownFields(lc.fields))
+		}
+		width := lc.fieldWidths[f]
+		if width == 0 {
+			width = 1
+		}
+		for i := uint16(0); i < width; i++ {
+			set[addr+i] = true
+		}
+	}
+	return set, nil
+}
+
 func (lc *lieController) armSentinel(spec lieSpec) error {
 	lc.mu.Lock()
 	defer lc.mu.Unlock()
@@ -1270,16 +1312,9 @@ func (lc *lieController) armSentinel(spec lieSpec) error {
 		log.Printf("[lie] sentinel_field: %s cleared", lc.label)
 		return nil
 	}
-	set := make(map[uint16]bool, len(spec.Addrs)+len(spec.Fields))
-	for _, a := range spec.Addrs {
-		set[a] = true
-	}
-	for _, f := range spec.Fields {
-		addr, ok := lc.fields[f]
-		if !ok {
-			return fmt.Errorf("fault %q: unknown field %q for %s (known: %s)", spec.Kind, f, lc.label, knownFields(lc.fields))
-		}
-		set[addr] = true
+	set, err := lc.resolveTargetsLocked(spec)
+	if err != nil {
+		return err
 	}
 	if len(set) == 0 {
 		return fmt.Errorf("fault %q: needs addrs or fields — blanking nothing is not a fault", spec.Kind)
@@ -1311,16 +1346,9 @@ func (lc *lieController) armAckNoApply(spec lieSpec) error {
 		log.Printf("[lie] ack_no_apply: %s cleared — writes land again and the phantom readback is gone", lc.label)
 		return nil
 	}
-	set := make(map[uint16]bool, len(spec.Addrs)+len(spec.Fields)+1)
-	for _, a := range spec.Addrs {
-		set[a] = true
-	}
-	for _, f := range spec.Fields {
-		addr, ok := lc.fields[f]
-		if !ok {
-			return fmt.Errorf("fault %q: unknown field %q for %s (known: %s)", spec.Kind, f, lc.label, knownFields(lc.fields))
-		}
-		set[addr] = true
+	set, err := lc.resolveTargetsLocked(spec)
+	if err != nil {
+		return err
 	}
 	if len(set) == 0 {
 		if lc.cmdAddr == 0 {
