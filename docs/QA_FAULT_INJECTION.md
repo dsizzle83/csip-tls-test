@@ -285,7 +285,7 @@ runnable against `modsim -advanced` (or any `sim/mbapsdev` advanced instance):
 |---|---|---|
 | **whole-device freeze** | `{"kind":"freeze_block","models":["701","103"]}` | Naming every model a hub might cross-check in ONE freeze defeats the S3 cross-model liveness probe — the row proving the gateway does not falsely confirm health just because some OTHER register on the device moved. |
 | **701-frozen-103-live** | `{"kind":"freeze_block","models":["701"]}` | The control: freezing only 701 leaves 103 live, exactly what the S3 probe is built to catch — a naive single-window freeze IS detectable in one extra read. |
-| **partial freeze** | `{"kind":"freeze_block","except":["Hz","TmpCab"]}` | The realistic cached-struct fault: most of the block is frozen, but a firmware quirk still refreshes a couple of fields (a frequency counter, a temperature) from a live path. Defeats a naive whole-block digest (the bytes keep changing, so "did the hash move" says fresh) — the row proving a hub needs a PER-CLASS digest (volatile / slow / accumulator) to still catch the frozen majority. |
+| **partial freeze** | `{"kind":"freeze_block","except":["Hz","TmpCab"]}` (or `except:["Hz"]` alone against a whole-device freeze) | The realistic cached-struct fault: most of the block is frozen, but a firmware quirk still refreshes a couple of fields (a frequency counter, a temperature) from a live path. Defeats a naive whole-block digest (the bytes keep changing, so "did the hash move" says fresh) — the row proving a hub needs a PER-CLASS digest (volatile / slow / accumulator) to still catch the frozen majority. Now genuinely executable end to end (DEF-5, see below) — before the fix, `except:["Hz"]` alone against 701 left the low half of the value indistinguishable from a plain freeze. |
 | **becalmed-but-live** | `POST /inject {"Night":1}` — **not a fault** | Drives the sim to night: W/VA/VAr/WAval collapse to a genuine 0 (unlike `Cloud_pct`, which attenuates but never reaches zero) and the Wh accumulator (`M122 ActWh` / 701 `TotWhInj`) stops climbing, while V, Hz and TmpCab's added ambient jitter keep moving. The false-positive control — a gateway must not treat "nothing to report" the same as "stopped answering." |
 
 `freeze_block` also accepts a raw `"windows":[{"addr":...,"count":...}]` list
@@ -295,6 +295,23 @@ single-default-window behaviour byte-identical. `except` resolves by
 CANONICAL field name (`"Hz_701"` and `"Hz"` are the same point for this
 purpose), so one exception list applies across every frozen model in a
 whole-device freeze, not just whichever one happened to own the literal key.
+
+**DEF-5 (fixed)**: `except` was address-granular — a fields entry names only
+ONE register, so a multi-register point had every register past the first
+stay in the frozen snapshot. 701's `Hz` is a `Tuint32` (two registers); arming
+`except:["Hz"]` freed only the high word, and the low word stayed frozen —
+indistinguishable, on the wire, from a plain whole-block freeze with no
+`except` at all. Bench-diagnosed on board cc93 (register offset 34, `Hz`'s low
+word, moved 475→461 with the fault armed and `except` given). The fix resolves
+each matched point's width from its SunSpec type (`sim/southbound/lying.go`'s
+`layoutFieldWidth`, reading `lexa-proto/sunspec`'s Layout tables — 32-bit types
+are 2 registers, 64-bit are 4) and frees every register of the point, keyed by
+the SAME raw fields-entry name used to resolve the address, so two models
+naming the same canonical point at different widths (M103's `Hz` is one
+register; 701's is two) each free the right count. `TmpCab` and the other
+previously-exempted points were never affected — they are all single-register
+— which is why the bug went unnoticed until a multi-register point was tried
+against real hardware.
 
 Separately, `advMirror701` (the 701 mirror `NewSolarServerAdvanced` runs every
 animation tick) now mirrors `TotWhInj`/`TotWhAbs` from the same `ActWh`
@@ -306,15 +323,29 @@ accumulator that never moved — indistinguishable over Modbus from
 `freeze_block`, and it left S1 (Δaccumulator vs ∫W dt) unexercisable on the
 bench.
 
+**Bench gap 4 (fixed)**: the SAME class of gap existed one model over. Model
+103's OWN `WH` accumulator (offsets 22-23, an acc32 distinct from `M122`'s
+`ActWh` that feeds the 701 mirror above) was never written by either solar
+sim — `WH_SF`'s zero-initialised value is a legal, in-domain scale factor
+(0), not a sentinel, so a consumer gating presence on "is the SF valid" saw
+an IMPLEMENTED accumulator frozen at 0 forever, which left S1 unexercisable
+on the legacy 10x leg specifically (the 701 leg already had a real
+accumulator via the fix above). `solarStep` — the animation step shared by
+both the plain solar sim and the advanced sim's own M103 block — now mirrors
+the same integrated Wh total into 103's `WH`, so the legacy-leg S1 row is now
+expressible too, on either sim.
+
 Unit tests, image-level per the existing sim test idiom (through the real
 Modbus server handler and/or `advMirror701`/`solarStep` directly):
 `sim/southbound/lying_test.go` (`TestFreezeBlock_ModelsFreezesMultipleWindowsAtOnce`,
 `TestFreezeBlock_SingleModelLeavesTheOtherModelLive`,
 `TestFreezeBlock_ExceptLeavesNamedPointsLive`,
-`TestFreezeBlock_ExceptAppliesAcrossEveryFrozenModel`,
+`TestFreezeBlock_ExceptAppliesAcrossEveryFrozenModel` (now mutates and reads
+BOTH registers of 701's `Hz`, pinning DEF-5's fix),
 `TestFreezeBlock_UnknownModelIsAnError`, `TestFreezeBlock_UnknownExceptFieldIsAnError`,
 `TestFreezeBlock_WindowsFreezesAnExplicitRawRange`) and
 `sim/southbound/solar_adv_test.go` / `sim/southbound/solar_test.go`
 (`TestAdv701AccumulatorsMirrorTheAnimatedWh`,
+`TestAdvSolarM103WHAlsoAnimates`, `TestSolarStep_103WHAccumulatorTracksIntegratedEnergy`,
 `TestAdv701BecalmedButLiveIsNotIndistinguishableFromFrozen`,
 `TestSolarServer_NightInject`, `TestSolarStep_NightCollapsesWWithAnimationStillAlive`).

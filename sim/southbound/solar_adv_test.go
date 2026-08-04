@@ -124,6 +124,41 @@ func TestAdv701AccumulatorsMirrorTheAnimatedWh(t *testing.T) {
 	}
 }
 
+// TestAdvSolarM103WHAlsoAnimates is the advanced-sim half of bench gap 4's
+// fix (see TestSolarStep_103WHAccumulatorTracksIntegratedEnergy for the plain
+// leg): solarStep is the SAME shared function both solar constructors
+// animate through, so the advanced sim's own M103 block — its legacy 10x
+// mirror, served alongside 701 — must also get a genuinely moving WH
+// accumulator, not just the plain (non-advanced) sim. Before the fix neither
+// leg wrote it; this pins that the advanced sim isn't a second, separately-
+// broken copy of the same gap.
+func TestAdvSolarM103WHAlsoAnimates(t *testing.T) {
+	ss := newAdvSolar(t, 6000)
+	r, b := ss.Regs, ss.bases
+	whAddr := b.M103Base + sunspec.M103_WH
+	sfAddr := b.M103Base + sunspec.M103_WH_SF
+
+	readWh := func() float64 {
+		raw := uint32(r.Get(whAddr))<<16 | uint32(r.Get(whAddr+1))
+		return float64(raw) * math.Pow10(int(int16(r.Get(sfAddr))))
+	}
+	if wh := readWh(); wh != 0 {
+		t.Fatalf("fixture assumption: 103 WH starts at 0, got %v", wh)
+	}
+
+	var whAcc uint16
+	for i := 0; i < 3; i++ {
+		solarStep(r, ss.wmaxW, b, false, 0, 0, false, &ss.faults, &whAcc)
+	}
+	if whAcc == 0 {
+		t.Fatal("fixture bug: the Wh accumulator never advanced — the test proves nothing")
+	}
+	if got, want := readWh(), float64(whAcc); got != want {
+		t.Errorf("advanced sim's 103 WH = %v, want %v — it must animate on THIS leg too, not just the "+
+			"non-advanced sim", got, want)
+	}
+}
+
 // TestAdv701BecalmedButLiveIsNotIndistinguishableFromFrozen is bench row #4,
 // "becalmed-but-live", read through 701 — the model a freshness-aware hub
 // actually prefers. Night is NOT a fault: it collapses W/VA/VAr to a genuine

@@ -493,3 +493,70 @@ func TestSolarStep_NightCollapsesWWithAnimationStillAlive(t *testing.T) {
 			"indistinguishable from freeze_block, defeating the whole point of the false-positive row")
 	}
 }
+
+// TestSolarStep_103WHAccumulatorTracksIntegratedEnergy pins the fix for bench
+// gap 4: Model 103's OWN acc32 accumulator (WH at offsets 22-23, WH_SF at 24)
+// was never written by solarStep — the shared animation step BOTH the plain
+// solar sim and the advanced sim's legacy M103 mirror use. The register bank
+// starts zero-initialised and a zero-initialised WH_SF is a LEGAL, in-domain
+// scale factor (0), not the int16 not-implemented sentinel, so a consumer
+// that gates a point's presence on "is its SF valid" saw an IMPLEMENTED
+// accumulator frozen at 0 forever — indistinguishable, over Modbus, from
+// freeze_block, and it left S1 (Δaccumulator vs ∫W dt) unexercisable on the
+// legacy 10x leg. This is a DIFFERENT point from M122's ActWh (which 701's
+// TotWhInj already mirrors per 807f549's advMirror701 fix) — 103's WH had no
+// fix at all before this one. The fix mirrors the SAME running Wh total
+// solarStep already integrates into ActWh, so a hub reading 103 directly has
+// a genuinely moving accumulator to check against ∫W dt at the sim's own 5 s
+// step cadence.
+func TestSolarStep_103WHAccumulatorTracksIntegratedEnergy(t *testing.T) {
+	const wmax = 8000.0
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	b := populateSolar(r, wmax, "")
+
+	whAddr := b.M103Base + sunspec.M103_WH
+	sfAddr := b.M103Base + sunspec.M103_WH_SF
+	readWh := func() float64 {
+		raw := uint32(r.Get(whAddr))<<16 | uint32(r.Get(whAddr+1))
+		return float64(raw) * math.Pow10(int(int16(r.Get(sfAddr))))
+	}
+	readActWh := func() uint64 {
+		return uint64(r.Get(b.M122Base+sunspec.M122_ActWh))<<48 |
+			uint64(r.Get(b.M122Base+sunspec.M122_ActWh+1))<<32 |
+			uint64(r.Get(b.M122Base+sunspec.M122_ActWh+2))<<16 |
+			uint64(r.Get(b.M122Base+sunspec.M122_ActWh+3))
+	}
+
+	if sf := int16(r.Get(sfAddr)); sf != 0 {
+		t.Fatalf("fixture assumption: M103_WH_SF starts at 0 (raw Wh), got %d", sf)
+	}
+	if wh := readWh(); wh != 0 {
+		t.Fatalf("fixture assumption: M103_WH starts at 0 — has not accumulated anything yet, got %v", wh)
+	}
+
+	var whAcc uint16
+	for i := 0; i < 3; i++ {
+		solarStep(r, wmax, b, false /*running*/, 0 /*simTime*/, 0 /*cloud*/, false /*night*/, nil, &whAcc)
+	}
+	if whAcc == 0 {
+		t.Fatal("fixture bug: the Wh accumulator never advanced — the test proves nothing")
+	}
+	if got, want := readWh(), float64(whAcc); got != want {
+		t.Errorf("103 WH = %v, want %v (∫W dt over 3 ticks, the same total solarStep integrates into M122's ActWh)",
+			got, want)
+	}
+	if got, want := readWh(), float64(readActWh()); got != want {
+		t.Errorf("103 WH = %v, M122 ActWh = %v — both must mirror the SAME integrated energy", got, want)
+	}
+
+	// A second wave of ticks must move it FURTHER still — pinning "mirrors the
+	// LIVE accumulator" against a fix that only seeded it once and then left it
+	// as stale as the bug it replaces.
+	prev := readWh()
+	for i := 0; i < 3; i++ {
+		solarStep(r, wmax, b, false, 0, 0, false, nil, &whAcc)
+	}
+	if got := readWh(); got <= prev {
+		t.Errorf("103 WH did not advance on a second wave of ticks: %v -> %v", prev, got)
+	}
+}

@@ -342,17 +342,33 @@ func TestFreezeBlock_ExceptLeavesNamedPointsLive(t *testing.T) {
 // coherent — otherwise the untouched copy in whichever model didn't match the
 // literal key would give away that the device is frozen, defeating the point
 // of naming it at all.
+//
+// It also has to free EVERY register of the point, not just the ONE address
+// lc.fields names (DEF-5, bench-diagnosed on board cc93). 701's Hz is a
+// Tuint32 — two registers, hz701 (high word) and hz701+1 (low word) — while
+// M103's Hz is a single Tuint16 register. A hz701 low word that starts life
+// away from 0 (11111, not the value it becomes after arming) is what makes a
+// still-frozen low word OBSERVABLE at all: reading only the point's base
+// address, as this test did before the fix, cannot tell "except freed both
+// registers" apart from "except freed only the one it was asked to free",
+// because both looked identical from that single register. On the bench the
+// low word (register offset 34 in the 701 block) moved 475->461 with
+// except:["Hz"] armed and the OLD address-granular resolution — i.e. it never
+// stopped being frozen, and except:["Hz"] was indistinguishable from a plain
+// freeze on the wire.
 func TestFreezeBlock_ExceptAppliesAcrossEveryFrozenModel(t *testing.T) {
 	ss := newLyingSolarAdvanced(t, 8000)
 	hz103 := ss.bases.M103Base + sunspec.M103_Hz
-	hz701 := ss.adv.M701 + uint16(sunspec.L701.Offset("Hz"))
+	hz701 := ss.adv.M701 + uint16(sunspec.L701.Offset("Hz")) // Tuint32: hz701=high word, hz701+1=low word
 
 	ss.Regs.Set(hz103, 6000)
-	ss.Regs.Set(hz701, 60000)
+	ss.Regs.Set(hz701, 0)
+	ss.Regs.Set(hz701+1, 11111)
 	arm(t, ss, `{"kind":"freeze_block","models":["701","103"],"except":["Hz"]}`)
 
 	ss.Regs.Set(hz103, 6005)
-	ss.Regs.Set(hz701, 60005)
+	ss.Regs.Set(hz701, 1)
+	ss.Regs.Set(hz701+1, 22222)
 
 	got103, err := modbusRead(t, ss, hz103, 1)
 	if err != nil {
@@ -361,13 +377,17 @@ func TestFreezeBlock_ExceptAppliesAcrossEveryFrozenModel(t *testing.T) {
 	if got103[0] != 6005 {
 		t.Fatalf("103 Hz = %d, want the LIVE 6005", got103[0])
 	}
-	got701, err := modbusRead(t, ss, hz701, 1)
+
+	// Mutate-and-read BOTH words of the 701 point — the low word is exactly
+	// where the address-granular bug hid.
+	got701, err := modbusRead(t, ss, hz701, 2)
 	if err != nil {
 		t.Fatalf("read 701 Hz: %v", err)
 	}
-	if got701[0] != 60005 {
-		t.Fatalf("701 Hz = %d, want the LIVE 60005 — except must exclude Hz in EVERY frozen model, "+
-			"not just the one registered under the bare name", got701[0])
+	if got701[0] != 1 || got701[1] != 22222 {
+		t.Fatalf("701 Hz = [%d %d], want the LIVE [1 22222] — except must free EVERY register of a "+
+			"multi-word point, not just the one lc.fields happens to name, or the low word stays frozen "+
+			`and except:["Hz"] is indistinguishable from a plain freeze on the wire`, got701[0], got701[1])
 	}
 }
 

@@ -620,6 +620,14 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	r.Set(m103Base+sunspec.M103_VAr_SF, 0)
 	r.Set(m103Base+sunspec.M103_PF, uint16(int16(9677)))
 	r.Set(m103Base+sunspec.M103_PF_SF, sfN(-2))
+	// WH (offsets 22-23) starts at 0 — "has not accumulated anything yet" is a
+	// legitimate acc32 value, not a sentinel — and solarStep advances it every
+	// running tick (see there). WH_SF is set explicitly, even though 0 is also
+	// the register's zero-initialised default, because leaving it implicit is
+	// exactly what made this point invisible before: a reader has no way to
+	// tell "the sim deliberately declares raw Wh" from "nobody ever touched
+	// this register" (bench gap 4).
+	r.Set(m103Base+sunspec.M103_WH_SF, 0)
 	r.Set(m103Base+sunspec.M103_DCV, 3800)
 	r.Set(m103Base+sunspec.M103_DCV_SF, sfN(-1))
 	r.Set(m103Base+sunspec.M103_DCW, uint16(int16(3180)))
@@ -859,5 +867,18 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 	if !paused {
 		*whAcc += uint16(math.Round(w * 5 / 3600))
 		r.Set(m122Base+sunspec.M122_ActWh+3, *whAcc)
+		// Model 103's OWN acc32 (WH at offsets 22-23) mirrors the SAME
+		// integrated energy — a DIFFERENT point from M122's ActWh above, and
+		// one 701's TotWhInj mirror (advMirror701) never touches. Before this
+		// it was never written at all: the register starts zero-initialised
+		// and WH_SF (offset 24) is a legal, in-domain scale factor at its own
+		// zero-initialised default, so a consumer gating a point's presence on
+		// "is its SF valid" saw an IMPLEMENTED accumulator frozen at 0
+		// forever — indistinguishable, over Modbus, from freeze_block, and it
+		// left S1 (Δaccumulator vs ∫W dt) unexercisable on the legacy 10x leg
+		// (bench gap 4). The high word (offset 22) stays 0, exactly like
+		// M122's ActWh above, because *whAcc is itself only a uint16 running
+		// total (a bench simplification, not a full 32/64-bit accumulator).
+		r.Set(m103Base+sunspec.M103_WH+1, *whAcc)
 	}
 }

@@ -394,6 +394,15 @@ type lieController struct {
 	sentinel map[uint16]bool
 	naValue  uint16
 
+	// freeze_block except-resolution: register widths for fields entries wider
+	// than one register (a name absent here is width 1). Keyed by the SAME raw
+	// key as fields — e.g. "Hz" (M103, 1 register) and "Hz_701" (L701, 2
+	// registers) get independent entries, which is what lets one canonical
+	// except name ("Hz") free the RIGHT number of registers in each model of a
+	// whole-device freeze rather than assuming every model's point of that name
+	// is the same width. See layoutFieldWidth and DEF-5.
+	fieldWidths map[string]uint16
+
 	// exception_on_applied_write
 	excApplied bool
 	excCode    uint8
@@ -481,6 +490,64 @@ func (lc *lieController) registerWindow(name string, start, count uint16) {
 	lc.namedWindows[name] = freezeWindow{start, count}
 }
 
+// declareFieldWidths records the register width of fields entries that occupy
+// MORE than one register (see layoutFieldWidth). A name with no entry here
+// defaults to width 1 in resolveExceptLocked, which is correct for every
+// legacy M103 point this controller exposes (M103's own points are all
+// single-register except its WH accumulator, which is never offered to
+// except) and for every 16-bit 7xx point. Only widths > 1 are stored, so the
+// map stays a short list of exceptions rather than a full mirror of fields.
+func (lc *lieController) declareFieldWidths(widths map[string]uint16) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	if lc.fieldWidths == nil {
+		lc.fieldWidths = make(map[string]uint16, len(widths))
+	}
+	for k, w := range widths {
+		if w > 1 {
+			lc.fieldWidths[k] = w
+		}
+	}
+}
+
+// layoutFieldWidth returns the register width of a named point within a
+// SunSpec model Layout: 1 for every 16-bit type, 2 for the four 32-bit types
+// (uint32/int32/enum32/bitfield32/acc32), 4 for the three 64-bit types, and
+// the field's declared length for a string/pad. It exists so a fields entry
+// built from Layout.Offset (installLies' 701/704 points) can carry its TRUE
+// width instead of the implicit 1 every fields entry used to assume.
+//
+// DEF-5, bench-diagnosed on board cc93: freeze_block's "except" only ever
+// freed the ONE address a fields entry names, so a multi-register point left
+// at the assumed width of 1 had every register past the first stay in the
+// frozen snapshot — register offset 34 (701 Hz's low word) moved 475->461
+// with except:["Hz"] armed, indistinguishable on the wire from a plain
+// whole-block freeze. Hz is Tuint32 (2 registers); TmpCab and the other
+// previously-exempted points are all Tint16 (1 register), which is exactly
+// why they "worked" — nothing ever exercised a width past 1.
+//
+// This duplicates FieldType's own (unexported) register-count logic rather
+// than reaching into the vendored sunspec package for it: Layout exposes
+// Fields/Type/Len on the public API, not the width method itself, so this
+// reads the same type information through that exported surface.
+func layoutFieldWidth(l *sunspec.Layout, name string) uint16 {
+	for _, f := range l.Fields {
+		if f.Name != name {
+			continue
+		}
+		switch f.Type {
+		case sunspec.Tuint32, sunspec.Tint32, sunspec.Tenum32, sunspec.Tbitfield32, sunspec.Tacc32:
+			return 2
+		case sunspec.Tuint64, sunspec.Tint64, sunspec.Tacc64:
+			return 4
+		case sunspec.Tstring, sunspec.Tpad:
+			return uint16(f.Len)
+		}
+		return 1
+	}
+	return 1
+}
+
 // wrap installs the controller's hooks in front of whatever the sim already had
 // on regs. Read order is upstream-then-lies (a lie overrides a fault's rewrite,
 // because the lie is the more specific claim); write order is lies-first, since
@@ -555,6 +622,7 @@ func (ss *SolarServer) installLies() {
 		"A":      b.M103Base + sunspec.M103_A,
 		"TmpCab": b.M103Base + sunspec.M103_TmpCab,
 	}
+	widths := map[string]uint16{} // fields entries wider than 1 register — see declareFieldWidths
 	if ss.advanced {
 		cmdAddr = ss.adv.M704 + uint16(sunspec.L704.Offset("WMaxLimPct"))
 		measStart, measCount = ss.adv.M701, uint16(ss.adv.M701Len)
@@ -563,6 +631,7 @@ func (ss *SolarServer) installLies() {
 			"TmpCab_701": "TmpCab",
 		} {
 			fields[name] = ss.adv.M701 + uint16(sunspec.L701.Offset(off))
+			widths[name] = layoutFieldWidth(sunspec.L701, off)
 		}
 		// 704 CONTROL points, named so ack_no_apply (and sentinel_field) can be
 		// armed against a register the hub WRITES, not just the ones it reads.
@@ -581,11 +650,13 @@ func (ss *SolarServer) installLies() {
 			"WSet": "WSet", "WSetEna": "WSetEna",
 		} {
 			fields[name] = ss.adv.M704 + uint16(sunspec.L704.Offset(off))
+			widths[name] = layoutFieldWidth(sunspec.L704, off)
 		}
 	}
 
 	ss.lies.configure("solar", ss.Regs, cmdAddr, measStart, measCount, fields,
 		func() { ss.powerOnReset() }, ss.Server.dropConnections)
+	ss.lies.declareFieldWidths(widths)
 	// Named windows for freeze_block's "models" list (see armFreeze) — "103" is
 	// always served; "701" only exists on an advanced sim. Registering both by
 	// name (rather than leaving 701 reachable only as the unnamed default
@@ -1117,7 +1188,15 @@ func (lc *lieController) resolveFreezeWindowsLocked(spec lieSpec) ([]freezeWindo
 // ["Hz"] has to mean "Hz, in every model this freeze covers", not "Hz, in
 // whichever one address happened to be registered under that exact string",
 // or a whole-device freeze plus except would still let the untouched copy give
-// away that the device is frozen. Caller holds lc.mu.
+// away that the device is frozen.
+//
+// Each match frees EVERY register of the point, not just the one address
+// lc.fields names (DEF-5): the width comes from lc.fieldWidths, looked up by
+// the matched entry's OWN raw key — not the canonical name — because two
+// models can give the same canonical point different widths (M103's Hz is one
+// register; 701's Hz is a Tuint32 spanning two), and freeing the wrong count
+// for either would either leave a register frozen or free one that was never
+// part of the point. Caller holds lc.mu.
 func (lc *lieController) resolveExceptLocked(names []string) (map[uint16]bool, error) {
 	if len(names) == 0 {
 		return nil, nil
@@ -1129,10 +1208,18 @@ func (lc *lieController) resolveExceptLocked(names []string) (map[uint16]bool, e
 	matched := make(map[string]bool, len(names))
 	out := make(map[uint16]bool, len(names))
 	for fname, addr := range lc.fields {
-		if canon := canonicalFieldName(fname); want[canon] {
-			out[addr] = true
-			matched[canon] = true
+		canon := canonicalFieldName(fname)
+		if !want[canon] {
+			continue
 		}
+		width := lc.fieldWidths[fname]
+		if width == 0 {
+			width = 1
+		}
+		for i := uint16(0); i < width; i++ {
+			out[addr+i] = true
+		}
+		matched[canon] = true
 	}
 	for _, n := range names {
 		if !matched[n] {
