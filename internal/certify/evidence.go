@@ -171,7 +171,44 @@ type Evidence struct {
 	Capture capture.Summary
 	// Attribution is the whole run's attribution, for diagnostics.
 	Attribution *Attribution
+
+	// offWire / offWireReason are set by DeclareOffWire. They are the citation
+	// phase's equivalent of Result.OffWire: the runner reads them back after the
+	// CiteFunc returns and treats the case the same way it treats a Result that
+	// declared itself off-wire — the "uncited PASS -> WARN" downgrade is
+	// suppressed and the reason is printed in the bundle. See DeclareOffWire.
+	offWire       bool
+	offWireReason string
 }
+
+// DeclareOffWire records — from inside a CiteFunc, after the capture has been
+// read — that this row's PASS rests on something the pcap cannot show for a
+// stated NON-product reason, so the "uncited PASS was downgraded to WARN" rule
+// must not fire against it.
+//
+// Result.OffWire says the same thing, but it is declared up front, before the
+// capture exists. Some obstacles are only knowable once the capture is in hand:
+// the canonical one is TLS 1.3 SESSION RESUMPTION. A resumed handshake carries
+// no Certificate message at all (RFC 8446 §2.2 — a resumed session continues
+// the ORIGINAL handshake's authentication), so a run that captured only resumed
+// sessions has no client-certificate frame to cite for RBAC-011 even though the
+// gateway behaved correctly. That is a property of TLS, not a product failure,
+// and it must not read as a product WARN. A CiteFunc that hits it calls this
+// with a reason naming the limitation and the remedy (drive a full handshake,
+// e.g. mbapsdev -no-tickets); the last non-empty reason wins.
+//
+// It does NOT invent evidence or upgrade a verdict: a failing assertion still
+// fails, and a check that simply forgot to cite must not call this to quiet the
+// warning. It only stops an honest citation limitation from being mislabelled.
+func (e *Evidence) DeclareOffWire(reason string) {
+	e.offWire = true
+	if reason != "" {
+		e.offWireReason = reason
+	}
+}
+
+// OffWire reports what a CiteFunc declared via DeclareOffWire, for the runner.
+func (e *Evidence) OffWire() (bool, string) { return e.offWire, e.offWireReason }
 
 // Frames returns the frame numbers attributed to this check.
 func (e *Evidence) Frames() []int { return append([]int(nil), e.Set.Frames...) }

@@ -112,6 +112,60 @@ func TestSessionResumption_ClearForcesFullHandshake(t *testing.T) {
 	}
 }
 
+// TestSessionResumption_NoTicketsServerForcesFullHandshake proves the mbapsdev
+// -no-tickets guarantee (Profile.SessionCache=false): a server that issues no
+// tickets and holds no cache hands the client nothing to resume with, so even a
+// client that WOULD resume does a FULL handshake on every dial — which is what a
+// conformance capture needs to see the client Certificate and its role (RBAC-011).
+func TestSessionResumption_NoTicketsServerForcesFullHandshake(t *testing.T) {
+	ClearSessionCache()
+	p := newPKI(t)
+	sp := p.serverProfile()
+	sp.SessionCache = false // the -no-tickets posture: cache off + no TLS 1.2/1.3 tickets
+	addr, results := startServer(t, sp)
+
+	// Dial #1: full handshake, and the client tries to capture a session on Close
+	// exactly as it always does — but the server issued no ticket, so there is
+	// nothing resumable to capture.
+	c1, err := Dial(addr, p.clientProfile(happyRole))
+	if err != nil {
+		t.Fatalf("Dial #1: %v", err)
+	}
+	s1, err := waitAccept(t, results)
+	if err != nil {
+		t.Fatalf("server Accept #1: %v", err)
+	}
+	if c1.Resumed {
+		t.Errorf("Dial #1 resumed on a cold cache")
+	}
+	assertRoundTrip(t, c1, s1)
+	c1.Close()
+	s1.Close()
+
+	// Dial #2: same address + identity. With a ticketing server this RESUMES
+	// (TestSessionResumption_AcrossDials); with -no-tickets it must NOT.
+	c2, err := Dial(addr, p.clientProfile(happyRole))
+	if err != nil {
+		t.Fatalf("Dial #2: %v", err)
+	}
+	defer c2.Close()
+	s2, err := waitAccept(t, results)
+	if err != nil {
+		t.Fatalf("server Accept #2: %v", err)
+	}
+	defer s2.Close()
+
+	if c2.Resumed || s2.Resumed {
+		t.Fatalf("Dial #2 RESUMED against a -no-tickets server (client=%v server=%v) — a full handshake was "+
+			"expected, so RBAC-011 would have no client Certificate to cite", c2.Resumed, s2.Resumed)
+	}
+	// The full handshake put the client leaf on the wire, so the role is derivable.
+	if role, rerr := s2.Role(); rerr != nil || role != happyRole {
+		t.Errorf("full-handshake role = %q, err=%v; want %q", role, rerr, happyRole)
+	}
+	assertRoundTrip(t, c2, s2)
+}
+
 // TestRenegotiate_ServerPolicyObserved drives a client-initiated renegotiation
 // against a server that advertises the indication but does NOT enable secure
 // renegotiation (the product's conformant policy: indicate per TCP-62, refuse to

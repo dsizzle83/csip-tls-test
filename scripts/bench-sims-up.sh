@@ -177,8 +177,17 @@ MODSIM2_SERIAL="${MODSIM2_SERIAL:-BENCH-MODSIM-02}"
 MODSIM3_SERIAL="${MODSIM3_SERIAL:-BENCH-MODSIM-03}"
 echo "Bringing up sims (logs in $LOG, fleet size $SIM_FLEET):"
 start modsim   "$MODSIM_PORT"  ./bin/modsim   -port "$MODSIM_PORT" -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM_SERIAL"
+# MBAPS_NO_TICKETS=1 forces every gateway southbound dial to be a FULL mTLS
+# handshake (mbapsdev -no-tickets). Leave it OFF for resumption-behaviour runs
+# (TCP-46); turn it ON for a conformance capture, so the gateway's client
+# certificate — and the SunSpec role extension RBAC-011 reads from it — is on the
+# wire on every poll cycle instead of only after the first handshake. Without it,
+# steady-state sessions RESUME and RBAC-011 has no client Certificate to cite.
+MBAPS_ARGS=()
+[ -n "${MBAPS_NO_TICKETS:-}" ] && [ "${MBAPS_NO_TICKETS}" != "0" ] && MBAPS_ARGS+=(-no-tickets)
 start mbapsdev "$MBAPS_PORT"   ./bin/mbapsdev -listen ":$MBAPS_PORT" -model inverter -wmax 6000 -serial "$MBAPS_SERIAL" \
-                 -ca "$M/dev-ca.pem" -cert "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem"
+                 -ca "$M/dev-ca.pem" -cert "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem" \
+                 ${MBAPS_ARGS+"${MBAPS_ARGS[@]}"}
 
 if [ "$SIM_FLEET" = 4 ]; then
   # The CTP's four managed end devices. Distinct -serial per sim for the same

@@ -1025,6 +1025,16 @@ func (r *Runner) cite(ctx context.Context, rep *RunReport, windows []*Window, pa
 		if worst := worstOf(as); worst.Severity() > c.Verdict.Severity() {
 			c.Verdict = worst
 		}
+		// A CiteFunc may only discover once the capture is in hand that this
+		// row's criterion cannot be cut from it for a stated non-product reason
+		// (TLS resumption is the canonical one — see DeclareOffWire). Carry that
+		// into the same off-wire bookkeeping a Result.OffWire feeds, so finalise
+		// suppresses the misleading "uncited PASS -> WARN" downgrade. A live-phase
+		// off-wire declaration already set is never un-set.
+		if ow, reason := ev.OffWire(); ow && !c.offWire {
+			c.offWire = true
+			c.offWireReason = reason
+		}
 	}
 	return nil
 }

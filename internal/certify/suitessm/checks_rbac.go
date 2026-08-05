@@ -36,7 +36,9 @@ import (
 	"crypto/tls"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -1458,104 +1460,111 @@ func rbac011(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		Verdict: t.verdict(),
 		Notes:   t.notes(),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
-			var out []certify.Assertion
-
-			claim := "SunSpecTCP-27/28: the EUT-C's client certificate carries a role at OID " + roleOID
-			const method = "the gateway's Certificate message to the bench device sim, parsed from the capture"
-			_, v, err := half.hello(ev)
-			if err != nil {
-				out = append(out, ev.SkipAssertion(claim, method, err.Error()))
-				return out, nil
-			}
-			cert, frames := v.ClientCertificate()
-			switch {
-			case cert != nil:
-				verdict, obs := roleExtensionVerdict(cert.Leaf().Info, "")
-				a, cerr := ev.CiteFrames(claim, method, verdict, obs, frames)
-				if cerr != nil {
-					return nil, cerr
-				}
-				out = append(out, a)
-			default:
-				// TLS 1.3 encrypts the Certificate message with the DEVICE SIM's
-				// (mbapsdev's) handshake keys, so it is not in the clear here —
-				// but mbapsdev now exports its session secrets in a -tags keylog
-				// evidence build (sim/mbapsdev/main.go's -keylog flag; the actual
-				// export was already wired into internal/mbtls.Listener.Accept,
-				// which arms wolfssl.EnableTLS13Keylog before every handshake and
-				// was a silent no-op until OpenKeylog was ever called). A TLS 1.3
-				// endpoint derives BOTH directions' traffic secrets as part of its
-				// own key schedule, so exporting the SIM's side is sufficient to
-				// decrypt the GATEWAY's Certificate message too — nothing is
-				// extracted from the DUT. Try that recovery before giving up.
-				decMethod := method + "; the message is encrypted (TLS 1.3), so recovered by decrypting the " +
-					"capture with the run's key log — see internal/mbtls's Session.Handshake, which reassembles " +
-					"the post-ServerHello flight from decrypted records the same way the plaintext path " +
-					"reassembles it from records already in the clear"
-				dcert, dframes, derr := decryptedCertificate(ev, v, tlsdecrypt.Client)
-				if derr != nil {
-					out = append(out, ev.SkipAssertion(claim, decMethod,
-						"the gateway's Certificate message is not in the clear in this conversation (TLS 1.3), "+
-							"and it could not be recovered by decrypting the capture either: "+derr.Error()))
-				} else {
-					verdict, obs := roleExtensionVerdict(dcert.Leaf().Info, "")
-					a, cerr := ev.CiteFrames(claim, decMethod, verdict, obs, dframes)
-					if cerr != nil {
-						return nil, cerr
-					}
-					out = append(out, a)
-				}
-			}
-
-			// The second half: the gateway must not demand a role of its peer.
-			srvCert, srvFrames := v.ServerCertificate()
-			method2 := "the device sim's Certificate message plus a record-type scan of the resulting session"
-			if srvCert == nil || srvCert.Leaf() == nil || srvCert.Leaf().Info == nil {
-				// Same TLS 1.3 gap, other direction: try decryption before
-				// reporting the fact as unreadable.
-				if dcert, dframes, derr := decryptedCertificate(ev, v, tlsdecrypt.Server); derr == nil {
-					srvCert, srvFrames = dcert, dframes
-					method2 += "; the message is encrypted (TLS 1.3), so recovered by decrypting the capture " +
-						"with the run's key log"
-				}
-			}
-			claim2 := "SunSpecTCP-27/28: the EUT-C completed the handshake although the SERVER certificate carries no role extension — a role is required of clients, not of servers"
-			switch {
-			case srvCert == nil || srvCert.Leaf() == nil || srvCert.Leaf().Info == nil:
-				out = append(out, ev.SkipAssertion(claim2, method2,
-					"the device sim's Certificate message is not in the clear in this conversation, and TLS 1.3 "+
-						"decryption did not recover it either, so whether it carries a role extension cannot be "+
-						"read from the capture"))
-			default:
-				rf := roleOf(srvCert.Leaf().Info)
-				appData := len(v.Server.AppData) > 0 && len(v.Client.AppData) > 0
-				_, alerted := v.ServerFatalAlert()
-				obs := fmt.Sprintf("the device sim's server leaf %s an extension at %s; the gateway %s a fatal alert; "+
-					"the session carried %d/%d application_data record(s) (bench-sim/gateway directions)",
-					map[bool]string{true: "carries", false: "does NOT carry"}[rf.Present], roleOID,
-					map[bool]string{true: "received", false: "received no"}[alerted],
-					len(v.Server.AppData), len(v.Client.AppData))
-				verdict := certify.Pass
-				switch {
-				case rf.Present:
-					verdict = certify.Skip
-					obs += " — the sim's certificate DOES carry a role, so this run cannot demonstrate tolerance of one that does not"
-				case alerted:
-					verdict = certify.Fail
-					obs += " — the handshake was torn down"
-				case !appData:
-					verdict = certify.Warn
-					obs += " — the handshake was not torn down, but no application data followed either, so completion is not demonstrated"
-				}
-				a, cerr := ev.CiteFrames(claim2, method2, verdict, obs, srvFrames)
-				if cerr != nil {
-					return nil, cerr
-				}
-				out = append(out, a)
-			}
-			return out, nil
+			return citeRBAC011(ev, half)
 		},
 	}, nil
+}
+
+// citeRBAC011 mints RBAC-011's two assertions from the capture: the gateway's
+// client certificate carries the role at roleOID, and the gateway did NOT demand
+// a role of the server. Both live on a FULL mTLS handshake — a resumed session
+// carries neither certificate — so it selects the full-handshake conversation
+// among every conversation attributed to the device-sim endpoint (clientCertView),
+// rather than the first one with a ClientHello, which in steady state resumes.
+func citeRBAC011(ev *certify.Evidence, half *clientHalf) ([]certify.Assertion, error) {
+	var out []certify.Assertion
+
+	claim := "SunSpecTCP-27/28: the EUT-C's client certificate carries a role at OID " + roleOID
+	method := "the gateway's Certificate message to the bench device sim, selected from the FULL handshake " +
+		"among the conversations attributed to the sim endpoint (a resumed TLS 1.3 session carries no " +
+		"Certificate — RFC 8446 §2.2), and decrypted with the run's key log when TLS 1.3 encrypted it"
+	claim2 := "SunSpecTCP-27/28: the EUT-C completed the handshake although the SERVER certificate carries no " +
+		"role extension — a role is required of clients, not of servers"
+	method2 := "the device sim's Certificate message on that same full handshake, plus a record-type scan of the session"
+
+	v, cert, frames, res, reason := half.clientCertView(ev)
+	switch res {
+	case certNoClientHello:
+		msg := "no ClientHello from the gateway to " + half.Endpoint.String() +
+			" appears in the frames attributed to this test case during the window the check waited"
+		if reason != "" {
+			msg = reason
+		}
+		out = append(out, ev.SkipAssertion(claim, method, msg))
+		out = append(out, ev.SkipAssertion(claim2, method2, msg))
+		return out, nil
+	case certObstacle:
+		msg := "the gateway's Certificate message is not in the clear in any observed conversation (TLS 1.3), " +
+			"and it could not be recovered by decrypting the capture: " + reason
+		out = append(out, ev.SkipAssertion(claim, method, msg))
+		out = append(out, ev.SkipAssertion(claim2, method2, msg))
+		return out, nil
+	case certAllResumed:
+		// Every observed session RESUMED, so no Certificate is on the wire — a
+		// property of TLS 1.3 (RFC 8446 §2.2), NOT a product failure. Declare the
+		// row off-wire with the remedy so it is not mislabelled as a product WARN
+		// (citation-requires-full-handshake), and record the honest reason.
+		off := "citation-requires-full-handshake: every mbaps session the gateway opened to " +
+			half.Endpoint.String() + " in this window RESUMED, and a resumed TLS 1.3 handshake carries no " +
+			"Certificate message at all (RFC 8446 §2.2 — a resumed session continues the ORIGINAL handshake's " +
+			"authentication). The gateway's client certificate and its SunSpec role extension are therefore " +
+			"not on the wire in this capture. This is a TLS-resumption property, not a product finding; run " +
+			"mbapsdev with -no-tickets to force a full handshake and make the role citable by construction."
+		ev.DeclareOffWire(off)
+		out = append(out, ev.SkipAssertion(claim, method, off))
+		out = append(out, ev.SkipAssertion(claim2, method2, off))
+		return out, nil
+	}
+
+	// certFound: a full handshake carried the gateway's client Certificate.
+	verdict, obs := roleExtensionVerdict(cert.Leaf().Info, "")
+	a, cerr := ev.CiteFrames(claim, method, verdict, obs, frames)
+	if cerr != nil {
+		return nil, cerr
+	}
+	out = append(out, a)
+
+	// The second half: the gateway must not demand a role of its peer. The
+	// server certificate rides the SAME full handshake — cleartext in TLS 1.2,
+	// decrypted in TLS 1.3.
+	srvCert, srvFrames := v.ServerCertificate()
+	if srvCert == nil || srvCert.Leaf() == nil || srvCert.Leaf().Info == nil {
+		if dcert, dframes, derr := decryptedCertificate(ev, v, tlsdecrypt.Server); derr == nil {
+			srvCert, srvFrames = dcert, dframes
+		}
+	}
+	if srvCert == nil || srvCert.Leaf() == nil || srvCert.Leaf().Info == nil {
+		out = append(out, ev.SkipAssertion(claim2, method2,
+			"the device sim's Certificate message could not be read from this conversation, so whether it "+
+				"carries a role extension cannot be judged from the capture"))
+		return out, nil
+	}
+	rf := roleOf(srvCert.Leaf().Info)
+	appData := len(v.Server.AppData) > 0 && len(v.Client.AppData) > 0
+	_, alerted := v.ServerFatalAlert()
+	obs2 := fmt.Sprintf("the device sim's server leaf %s an extension at %s; the gateway %s a fatal alert; "+
+		"the session carried %d/%d application_data record(s) (bench-sim/gateway directions)",
+		map[bool]string{true: "carries", false: "does NOT carry"}[rf.Present], roleOID,
+		map[bool]string{true: "received", false: "received no"}[alerted],
+		len(v.Server.AppData), len(v.Client.AppData))
+	verdict2 := certify.Pass
+	switch {
+	case rf.Present:
+		verdict2 = certify.Skip
+		obs2 += " — the sim's certificate DOES carry a role, so this run cannot demonstrate tolerance of one that does not"
+	case alerted:
+		verdict2 = certify.Fail
+		obs2 += " — the handshake was torn down"
+	case !appData:
+		verdict2 = certify.Warn
+		obs2 += " — the handshake was not torn down, but no application data followed either, so completion is not demonstrated"
+	}
+	a2, cerr := ev.CiteFrames(claim2, method2, verdict2, obs2, srvFrames)
+	if cerr != nil {
+		return nil, cerr
+	}
+	out = append(out, a2)
+	return out, nil
 }
 
 // decryptedCertificate recovers one side's Certificate message from an
@@ -1599,9 +1608,139 @@ func decryptedCertificate(ev *certify.Evidence, v *wireView, side tlsdecrypt.Sid
 			return nil, nil, fmt.Errorf("the decrypted handshake carries no Certificate message, and "+
 				"decryption of this direction stopped early: %w", decErr)
 		}
-		return nil, nil, fmt.Errorf("the decrypted handshake carries no Certificate message for this side")
+		// Decryption succeeded and there is simply no Certificate message: this
+		// side RESUMED (RFC 8446 §2.2 — a resumed TLS 1.3 handshake sends none).
+		// The sentinel lets a caller tell that apart from a decryption obstacle,
+		// because they call for opposite responses: resumption is a property of
+		// TLS (try another conversation, or force a full handshake), a decryption
+		// obstacle is a broken bundle.
+		return nil, nil, fmt.Errorf("the decrypted handshake carries no Certificate message for this side: %w",
+			errNoCertificateInFlight)
 	}
 	return msg.Certificate, msg.Packets, nil
+}
+
+// errNoCertificateInFlight marks the one decryptedCertificate outcome that is
+// NOT an obstacle: the flight decrypted cleanly and simply contained no
+// Certificate message, which for TLS 1.3 means the handshake RESUMED. Callers
+// that scan several conversations use errors.Is to skip a resumed one and keep
+// looking for the full handshake that carries the leaf.
+var errNoCertificateInFlight = errors.New("resumed handshake: no Certificate message on the wire")
+
+// clientCertResolution is why clientCertView returned (or did not return) a
+// conversation carrying the gateway's client Certificate.
+type clientCertResolution int
+
+const (
+	// certFound: a full-handshake conversation was located and its client
+	// Certificate recovered (cleartext in TLS 1.2, decrypted in TLS 1.3).
+	certFound clientCertResolution = iota
+	// certAllResumed: conversations to the device sim WERE observed, every one
+	// carried a ClientHello, and none put a Certificate on the wire — they all
+	// RESUMED. Not a product fault; the remedy is a full handshake (-no-tickets).
+	certAllResumed
+	// certNoClientHello: no attributed conversation to the device sim carried a
+	// ClientHello at all — the gateway did not dial in-window.
+	certNoClientHello
+	// certObstacle: a conversation carried a ClientHello and a full handshake,
+	// but its Certificate could not be recovered — no key log, unparseable
+	// hello, a decryption failure. Reason names it.
+	certObstacle
+)
+
+// clientCertView finds, among the conversations this [C]-half check attributed
+// to the device-sim endpoint, the one that actually put the gateway's client
+// Certificate on the wire — a FULL mTLS handshake — and recovers it, decrypting
+// when TLS 1.3 encrypted it under the client handshake traffic secret.
+//
+// It exists because binding to the FIRST conversation with a ClientHello (what
+// clientHalf.hello does, correctly, for checks that assert on the hello itself)
+// is wrong for a certificate criterion: the mbaps profile keeps resumption on
+// (TCP-46), so in steady state the first — and usually every — conversation in
+// a window is a RESUMED session, and a resumed TLS 1.3 handshake carries no
+// Certificate message at all (RFC 8446 §2.2). The gateway's leaf, and the
+// SunSpec role extension RBAC-011 reads from it, appear ONLY on a full
+// handshake. This is the miss behind CONFORMANCE-LEGB-EVIDENCE-GAPS: the forced
+// reconnect DID put a full handshake in the capture, but the citation looked at
+// a resumed conversation instead and reported "no Certificate message".
+//
+// The resolution distinguishes "every conversation resumed" (a TLS property,
+// cited off-wire) from "the gateway never dialled" and from a real decryption
+// obstacle, because the three call for different, honest verdicts.
+func (c *clientHalf) clientCertView(ev *certify.Evidence) (v *wireView, cert *tlsdis.Certificate, frames []int, res clientCertResolution, reason string) {
+	views := c.simViews(ev)
+	return pickClientCertView(ev, views)
+}
+
+// simViews returns every conversation to the device-sim endpoint attributed to
+// this check, parsed as TLS, in capture order — the same endpoint/gateway-host
+// filter clientHalf.hello applies, without stopping at the first ClientHello.
+func (c *clientHalf) simViews(ev *certify.Evidence) []*wireView {
+	var out []*wireView
+	if !c.Armed || ev == nil || !ev.HasFrames() {
+		return out
+	}
+	for _, st := range ev.Streams() {
+		a, b := endpointAddr(st.Key.A), endpointAddr(st.Key.B)
+		var local netip.AddrPort
+		switch {
+		case b == c.Endpoint:
+			local = a
+		case a == c.Endpoint:
+			local = b
+		default:
+			continue
+		}
+		if c.GatewayHost.IsValid() && local.Addr() != c.GatewayHost {
+			continue
+		}
+		v, err := parseView(st, local, c.Endpoint)
+		if err != nil {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// pickClientCertView chooses, from the device-sim conversations, the one that
+// presented the gateway's client Certificate, recovering it. See clientCertView
+// for why the first ClientHello is the wrong pick.
+func pickClientCertView(ev *certify.Evidence, views []*wireView) (v *wireView, cert *tlsdis.Certificate, frames []int, res clientCertResolution, reason string) {
+	sawHello := false
+	obstacle := ""
+	for _, w := range views {
+		if ch, _ := w.ClientHello(); ch == nil {
+			continue
+		}
+		sawHello = true
+		// TLS 1.2 puts the client Certificate on the wire in the clear.
+		if cc, cf := w.ClientCertificate(); cc != nil && cc.Leaf() != nil && cc.Leaf().Info != nil {
+			return w, cc, cf, certFound, ""
+		}
+		// TLS 1.3 encrypts it; recover with the run's key log.
+		dc, df, derr := decryptedCertificate(ev, w, tlsdecrypt.Client)
+		switch {
+		case derr == nil && dc != nil && dc.Leaf() != nil && dc.Leaf().Info != nil:
+			return w, dc, df, certFound, ""
+		case derr != nil && errors.Is(derr, errNoCertificateInFlight):
+			// Resumed conversation: no Certificate on the wire, by design. Keep
+			// looking for a full handshake in another conversation.
+			continue
+		case derr != nil:
+			// A real obstacle (no key log, decryption failure). Remember it, but
+			// keep scanning — a later conversation may be recoverable.
+			obstacle = derr.Error()
+		}
+	}
+	switch {
+	case !sawHello:
+		return nil, nil, nil, certNoClientHello, ""
+	case obstacle != "":
+		return nil, nil, nil, certObstacle, obstacle
+	default:
+		return nil, nil, nil, certAllResumed, ""
+	}
 }
 
 // ── RBAC-012 · Comprehensive Role-to-Rights Consistency Validation ──────────

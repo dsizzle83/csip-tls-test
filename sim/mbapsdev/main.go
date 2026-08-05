@@ -253,6 +253,20 @@ func main() {
 	// too — nothing is extracted from the DUT.
 	keylogPath := flag.String("keylog", "", "append this device sim's TLS session secrets to an NSS key "+
 		"log (requires a -tags keylog build; bench evidence only — see internal/wolfssl/keylog.go)")
+	// Bench evidence only. The mbaps profile defaults resumption ON (SunSpecTCP-46
+	// SHOULD), so once a gateway has completed its one full handshake for the run,
+	// every later southbound session RESUMES — and a resumed TLS 1.3 handshake
+	// carries NO Certificate message (RFC 8446 §2.2), so the gateway's client
+	// certificate and its SunSpec role extension never reappear on the wire.
+	// RBAC-011 reads that extension from the capture and cannot cite it against a
+	// resumed session. This flag makes every dial a FULL mTLS handshake — the
+	// mbaps equivalent of gridsim's -no-tickets — so the role is on the wire on
+	// every poll cycle, not only after a manual bounce. Leave it OFF for
+	// resumption-behaviour testing (TCP-46); turn it ON for the conformance
+	// campaign so RBAC-011 is citable by construction.
+	noTickets := flag.Bool("no-tickets", false, "issue no TLS session tickets and keep no session cache, so "+
+		"every gateway dial is a FULL mTLS handshake with the client certificate (and its SunSpec role "+
+		"extension) on the wire — conformance evidence runs; default allows resumption (TCP-46)")
 	flag.Parse()
 
 	// wolfSSL_Init: process-global C state, exactly once per process
@@ -293,9 +307,18 @@ func main() {
 	// dispatch.go's doc comment); mbtls.Listen still unconditionally demands
 	// SOME client certificate (RequireClientCert — TCP-11/13/48).
 	profile := mbtls.DefaultServerProfile(*caFile, *certFile, *keyFile)
+	if *noTickets {
+		// See mbtls.Listen: SessionCache=false pulls every resumption lever, so
+		// every dial is a full mTLS handshake.
+		profile.SessionCache = false
+	}
 	lis, err := mbtls.Listen(*listen, profile)
 	if err != nil {
 		log.Fatalf("mbapsdev: mbtls.Listen(%s): %v", *listen, err)
+	}
+	if *noTickets {
+		log.Printf("mbapsdev: -no-tickets — resumption disabled; every gateway dial is a FULL mTLS handshake " +
+			"(client certificate on the wire for RBAC-011)")
 	}
 	log.Printf("mbapsdev: %s device serving mbaps on %s (wmax=%.0fW)", *model, *listen, *wmax)
 

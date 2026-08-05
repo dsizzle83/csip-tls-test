@@ -53,7 +53,22 @@ func Listen(addr string, p Profile) (*Listener, error) {
 	// SunSpecTCP-11/13/48).
 	wolfssl.RequireClientCert(ctx)
 	if !p.SessionCache {
+		// SessionCache=false means "resumption OFF" (the explicit opt-out from
+		// the TCP-46 SHOULD). Turning the cache off alone does NOT deliver that:
+		// a session ticket hands the session state to the CLIENT, so a ticketing
+		// server resumes without ever consulting its own cache — and the mbaps
+		// bench is TLS 1.3, whose tickets are self-contained. So pull every
+		// lever: cache off, no TLS 1.2 tickets, no TLS 1.3 tickets. The result is
+		// a FULL mTLS handshake on every dial, which is what a conformance
+		// capture needs to see the client Certificate and its SunSpec role
+		// extension (RBAC-011) rather than the empty resumed flight.
 		wolfssl.SetSessionCacheOff(ctx)
+		if err := wolfssl.SetNoTicketTLS12(ctx); err != nil {
+			return nil, err
+		}
+		if err := wolfssl.SetNoTicketTLS13(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	lis, err := net.Listen("tcp", addr)

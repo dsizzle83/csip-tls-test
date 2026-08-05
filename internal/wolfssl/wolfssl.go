@@ -620,6 +620,30 @@ func SetNoTicketTLS12(ctx unsafe.Pointer) error {
 	return nil
 }
 
+// SetNoTicketTLS13 stops a server context issuing RFC 8446 NewSessionTicket
+// messages on TLS 1.3 (wolfSSL_CTX_no_ticket_TLSv13), so a client is never
+// handed a PSK to resume with and every dial is a FULL handshake.
+//
+// This is the TLS 1.3 companion to SetNoTicketTLS12, and it is the lever that
+// actually matters on the mbaps bench, whose steady-state sessions are TLS 1.3:
+// turning the session cache off is not enough, because a TLS 1.3 ticket is
+// self-contained and resumes without the server consulting any cache of its
+// own. A caller that needs a full mTLS handshake on the wire every time — so a
+// conformance capture can see the client Certificate and its role extension
+// (RBAC-011) — pulls this lever together with SetSessionCacheOff and
+// SetNoTicketTLS12.
+func SetNoTicketTLS13(ctx unsafe.Pointer) error {
+	// Return-value convention differs from its TLS 1.2 sibling: wolfSSL's
+	// wolfSSL_CTX_no_ticket_TLSv13 returns 0 (WC_SUCCESS) on success and a
+	// NEGATIVE error code (e.g. BAD_FUNC_ARG) on failure — NOT WOLFSSL_SUCCESS
+	// (1). Accept either non-negative success sentinel and treat only a negative
+	// code as a real failure, so this does not misread a clean 0 as an error.
+	if ret := int(C.wolfSSL_CTX_no_ticket_TLSv13((*C.WOLFSSL_CTX)(ctx))); ret != 0 && ret != Success {
+		return fmt.Errorf("wolfSSL_CTX_no_ticket_TLSv13 failed: ret=%d", ret)
+	}
+	return nil
+}
+
 // --- Client session resumption (T06.8) --------------------------------------
 //
 // These wrap wolfSSL's session get/set/free so the mbaps CLIENT can capture a

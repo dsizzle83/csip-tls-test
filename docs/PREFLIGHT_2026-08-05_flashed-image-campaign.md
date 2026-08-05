@@ -77,6 +77,17 @@ fixture for the DER-Aggregator-Client rows and is **not** this campaign's shape.
    asks the new process what the DUT did, and gets an honest "nothing".
 3. **`-no-tickets` on gridsim** or the gateway holds one persistent session and
    almost never re-handshakes, and every CSIP wire citation becomes unavailable.
+   **The SAME applies to the mbaps leg: `-no-tickets` on mbapsdev**
+   (`MBAPS_NO_TICKETS=1 scripts/bench-sims-up.sh`, or add `-no-tickets` to the
+   `mbapsdev-keylog` launch). Without it every steady-state southbound session
+   RESUMES, and a resumed TLS 1.3 handshake carries **no Certificate message**
+   (RFC 8446 §2.2) — so RBAC-011 has no client certificate to cite and the
+   role-extension row cannot be proved from the capture. With it, every gateway
+   dial is a full mTLS handshake and RBAC-011 is citable **by construction**, on
+   every poll cycle rather than only after a manual bounce. (The citation now
+   also scans EVERY conversation to the sim endpoint for the full handshake
+   rather than binding to the first ClientHello, so a single full handshake
+   anywhere in the window is enough; `-no-tickets` guarantees one.)
 4. **After any deploy, re-set `actuation_confirm_window_s=180`** in
    `/etc/lexa/northbound.json`. It is not in the deploy's preserved-keys
    allowlist and reverts to 60 s.
@@ -180,7 +191,31 @@ re-assert. `-param modbus-client.dercontrol=on` is the lever that moves the
 register the DUT actually owns; it posts a bounded, self-expiring 4000 W /120 s
 DERControl and is off by default because it makes the DUT do something.
 
-### 4.3 Everything else — unchanged
+### 4.3 RBAC-011 — client-certificate role — **verdict improves (WARN → PASS), with `-no-tickets`**
+
+On 2026-08-05 RBAC-011 read **WARN** because it could not cite the gateway's
+client-certificate role from the capture. Two things were wrong and both are
+fixed in the harness (csip-tls-test):
+
+- The citation bound to the FIRST conversation with a ClientHello, which in
+  steady state is a **resumed** session — and a resumed TLS 1.3 handshake carries
+  no Certificate message (RFC 8446 §2.2). It now scans **every** conversation to
+  the sim endpoint and cites the **full handshake** that actually put the leaf on
+  the wire. On the 2026-08-05 capture this recovers the role
+  `SuperAdministratorSunSpec` from the forced-reconnect handshake — the decryption
+  was never the miss, the conversation choice was.
+- If the window happens to hold **only** resumed sessions, the row no longer reads
+  as a product WARN: it is declared **off-wire** with the reason
+  `citation-requires-full-handshake` (a TLS-resumption property, not a product
+  fault), so an operator sees an honest limitation, not a phantom failure.
+
+**To get a real citation (PASS) by construction, run mbapsdev with `-no-tickets`**
+(see §2 rule 3): every dial is then a full handshake and the role is on the wire
+every poll cycle. Do NOT read a WARN here as a product defect — the product is
+correct (mbapsdev logs `role="SuperAdministratorSunSpec"` device-side); the only
+question is whether the capture caught a full handshake.
+
+### 4.4 Everything else — unchanged
 
 No case is added to or removed from either leg. Counts are the same 79 / 81 as
 the 2026-08-01 run. The catalog is unchanged (sha256 `aeebe841e894…`, 282 cases).
