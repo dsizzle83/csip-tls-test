@@ -4,7 +4,7 @@
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
-        test test-fast test-integration test-update-golden test-southbound test-evidence qa qa-bench fuzz \
+        test test-fast test-hermetic test-integration test-update-golden test-southbound test-evidence qa qa-bench fuzz \
         diff test-diff \
         build-gw-campaign qa-campaign qa-campaign-teeth qa-campaign-bench test-campaign \
         sweep-sunspec \
@@ -490,6 +490,31 @@ test: $(CA_CERT) test-fast test-integration
 # for compilation but does no TLS handshakes.
 test-fast:
 	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/gw-mayhem/... ./sim/ssm-conformance/
+
+# THE HERMETICITY GATE (audit IW8-005): the whole unit suite, run with no route
+# off this machine.
+#
+# `go test ./...` on the desktop cannot answer "does this suite need the lab?",
+# because on the desktop the lab answers. Two suitessm tests were green here and
+# red everywhere else for months for exactly that reason: they inherited
+# certify.DefaultTargets' 69.0.0.20 addresses and the runner's preflight dialled
+# them before the first check ran. This target compiles normally and runs each
+# test binary inside an unprivileged network namespace with loopback up and
+# nothing else (scripts/netns-exec.sh, via `go test -exec`), so 69.0.0.0/24 is
+# not firewalled — it is unrouteable, and a test that reaches for it fails in
+# its first millisecond with ENETUNREACH wherever it lives.
+#
+# Loopback stays UP on purpose: hermetic here means "mints its own fixtures",
+# and nearly every suite in this repo stands up a listener on 127.0.0.1.
+#
+# Note the LDFLAGS order: -lm must follow -lwolfssl for the static
+# libwolfssl.a's dh.c (pow/log). The script does that itself, which is why this
+# target covers packages a bare `go test ./...` fails to LINK.
+#
+# Exit 2 means the gate could not be run (no unshare, or unprivileged user
+# namespaces disabled) — deliberately not the same as a pass.
+test-hermetic:
+	bash scripts/test-hermetic.sh $(PKGS)
 
 # Hostile-QA deterministic-regression gate (Phase 5): fault-injector + diagnoser
 # unit tests, no bench. Add the live mayhem suite with: make qa-bench.

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -89,8 +90,31 @@ func TestWatchClientHalfForcedArmsAndClearsDropSession(t *testing.T) {
 	// keeps the test fast without changing what is being proven — that the
 	// arm/clear calls happen, not that a ClientHello is caught.
 	opts.Params = map[string]string{"ssm.client_wait": "10ms"}
-	opts.Targets.MBAPSDev = "127.0.0.1:1"
-	opts.Targets.MBAPSDevAPI = srv.URL
+	// REPLACE the topology, never patch fields into it (audit IW8-005). The
+	// two tests in this file were the only ones in the tree that set
+	// Targets.<field> = on top of DefaultOptions instead of assigning a whole
+	// Targets, and everything they did not name stayed at DefaultTargets' LIVE
+	// BENCH addresses — including GridSim/GridSimAdmin, which the runner's
+	// preflight dials before the first check runs. On a machine with the bench
+	// up they passed; on a machine without one they failed with a connection
+	// refused to 69.0.0.20:11114, so this file's green was a fact about the
+	// lab, not about the code. Whole-struct assignment is what every other
+	// runner-driving test in this repo does, and it is the only form in which
+	// "no address here reaches off this machine" is visible at the call site.
+	//
+	// Gateway is set because caps["bench"] is `Targets.Gateway != ""` and
+	// RBAC-011 is gated on it: leave it empty and the case SKIPs "missing
+	// capability: bench" before watchClientHalfForced is ever entered, which
+	// would make this test green while proving nothing. Nothing dials it —
+	// RBAC-011's client half is a PASSIVE observation of the gateway's
+	// southbound leg — so a loopback address that answers nothing is exactly
+	// as much DUT as this test needs.
+	opts.Targets = certify.Targets{
+		Gateway:     "127.0.0.1:802",
+		GatewayHost: "127.0.0.1",
+		MBAPSDev:    "127.0.0.1:1",
+		MBAPSDevAPI: srv.URL,
+	}
 
 	run, err := certify.New(registry(t), loadCatalog(t), opts)
 	if err != nil {
@@ -142,8 +166,13 @@ func TestWatchClientHalfForcedFallsBackWithoutMBAPSDevAPI(t *testing.T) {
 	opts.Params = map[string]string{"ssm.client_wait": "10ms"}
 	// MBAPSDevAPI deliberately left empty: rc.Sim("mbapsdev") must fail, and
 	// watchClientHalfForced must fall back to watchClientHalf rather than
-	// treating that as a run-ending error.
-	opts.Targets.MBAPSDev = "127.0.0.1:1"
+	// treating that as a run-ending error. Whole-struct, and Gateway set to
+	// keep caps["bench"] on, for IW8-005's reason — see the sibling test above.
+	opts.Targets = certify.Targets{
+		Gateway:     "127.0.0.1:802",
+		GatewayHost: "127.0.0.1",
+		MBAPSDev:    "127.0.0.1:1",
+	}
 
 	run, err := certify.New(registry(t), loadCatalog(t), opts)
 	if err != nil {
@@ -157,6 +186,15 @@ func TestWatchClientHalfForcedFallsBackWithoutMBAPSDevAPI(t *testing.T) {
 		if c.Case.UID == uid {
 			if c.Verdict == certify.Fail {
 				t.Fatalf("a missing mbapsdev simapi should SKIP or WARN, not FAIL: %s\n%s", c.Notes, console.String())
+			}
+			// And it must degrade INSIDE the helper, not be gated out before
+			// reaching it: a case skipped for a missing capability would
+			// satisfy the verdict test above while proving nothing about the
+			// fallback. The passive wait's own note is the proof it ran.
+			if !strings.Contains(c.Notes, opts.Targets.MBAPSDev) {
+				t.Fatalf("RBAC-011 did not reach the passive wait for %s — the notes read %q, which is a "+
+					"case that never entered watchClientHalfForced\n%s",
+					opts.Targets.MBAPSDev, c.Notes, console.String())
 			}
 			return
 		}
