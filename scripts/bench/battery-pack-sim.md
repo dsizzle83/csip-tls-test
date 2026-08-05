@@ -115,8 +115,16 @@ which is a different (and also interesting) row. Use the table in §0.
 Verify the gateway measured what you launched, before running any row:
 
 ```bash
-# On the board: the admission verdict, per device.
-mosquitto_sub -C 2 -t 'lexa/inventory/+' | jq '{device, role, der_gen, failsafe_posture, models}'
+# On the board: the admission verdict, per device. ONE retained census document
+# on ONE topic — there is no lexa/inventory/* family, and a subscriber to a
+# topic this product does not publish gets silence that is indistinguishable
+# from a missing ACL grant (Wave-H finding (n)). -C 1 because the document is
+# retained: the first delivery is the current census.
+mosquitto_sub -C 1 -t 'lexa/southbound/inventory' |
+  jq '.records[] | {device, role, failsafe_posture, models, inactive}'
+# der_gen is NOT in the census: it is a CONFIG declaration, and this document
+# reports what the model walk MEASURED. Asking for it here prints null, which
+# reads like a gateway that lost the field rather than a field that is not there.
 ```
 
 `bat-704` must report `failsafe_posture: "setpoint-zero"` and `bat-legacy`
