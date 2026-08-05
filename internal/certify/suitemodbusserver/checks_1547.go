@@ -114,7 +114,7 @@ func checkMOD4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		block := blocks[id]
 		var bad, excused []string
 		for _, name := range reqNames {
-			need, excuse := pointRequired(id, name, acType, acTypeKnown)
+			need, excuse := pointRequired(id, name, acType, acTypeKnown, present[storageModel])
 			if !need {
 				excused = append(excused, fmt.Sprintf("%s (%s)", name, excuse))
 				continue

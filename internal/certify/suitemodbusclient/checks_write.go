@@ -49,6 +49,56 @@ const derControlWatts = 4000
 // this check is killed mid-run.
 const derControlSeconds = 120
 
+// divergePct and restorePct are the two ceilings the divergence lever writes,
+// and they are 0.5 and 1 rather than 50 and 100 BECAUSE OF A RECORDED SIM
+// DEFECT, not a unit slip.
+//
+// `POST /inject {"WMaxLimPct_pct": N}` on both the solar and battery sims
+// encodes `RawFromScaleSigned(N*100, SF)` against SF = −2 — that is N × 10000 —
+// so the M123 register SATURATES at 32767 for any N above ~3.27. The 50 and
+// 100 this file used to pass therefore encoded the SAME saturated word: the
+// "50 % curtail" was a 327.67 % ceiling, and the restore that followed it wrote
+// the identical value, so the teardown restored nothing and the SECOND write
+// row's divergence — WR-2, running after WR-1 has already left the register at
+// 32767 — moved the register by zero. Two rows whose whole provocation is
+// divergence were provoking with a no-op, and both SKIPped for want of a write
+// in every campaign to date.
+//
+// The defect is DELIBERATELY unfixed in the sims (sim/southbound/battery_pack.go's
+// injectPackDispatch documents why: `cmd/dashboard`'s mayhem scenarios depend
+// on the saturation to uncurtail, so correcting the encoding is a separate
+// change with its own evidence). Until it is, the honest way to command a
+// ceiling of X % from here is to pass X/100, and the numbers below are written
+// with the arithmetic beside them so nobody "fixes" them back.
+//
+// 1 is the sim's own power-on ceiling: SolarServer.powerOnReset writes raw
+// 10000 to that register and calls it "100.00 %".
+const (
+	divergePct = 0.5 // → raw 5000  = 50.00 %
+	restorePct = 1.0 // → raw 10000 = 100.00 %
+)
+
+// bridgedMirrorCaveat is the second half of what an operator needs to read a
+// SKIP from these two rows correctly.
+//
+// On an ADVANCED sim the M123 ceiling this lever writes is a DERIVED MIRROR:
+// the sim's own bridge copies an enabled 704 WMaxLimPct into the legacy 123
+// convention on its animation tick (sim/southbound advBridgeCeiling, and see
+// installLies' comment, which makes the same point about revert_after — "the
+// next animation tick would put it straight back, so the lie would be
+// invisible"). The DUT reads and writes 704. So on the bench's advanced
+// inverters this lever can be restored under itself before the DUT ever sees
+// it, and a SKIP from these rows must not be read as "the DUT declined to
+// re-assert" when it may be "the DUT was never shown a divergence". The sims
+// expose no /inject key for 704's ceiling, so this cannot be provoked from
+// here today; the northbound lever (-param modbus-client.dercontrol=on) is the
+// one that reaches the register the DUT actually writes.
+const bridgedMirrorCaveat = "NOTE: on an advanced sim the M123 ceiling this lever writes is a mirror the " +
+	"sim's own bridge re-derives from 704 on its next animation tick, and the DUT writes 704, not the " +
+	"mirror — so an absent write here may mean the divergence never reached the DUT rather than that the " +
+	"DUT declined to re-assert. The simapi exposes no 704-ceiling inject; -param " + paramDERControl +
+	"=on is the lever that moves the register the DUT owns"
+
 // writeProvocation records what was done to try to make the DUT write.
 type writeProvocation struct {
 	Divergence   string
@@ -67,10 +117,11 @@ func provokeWrites(ctx context.Context, rc *certify.RunCtx, o *observer) (*write
 	}
 
 	// Lever 1: divergence on the sim's control register.
-	body := map[string]any{"WMaxLimPct_pct": 50}
+	body := map[string]any{"WMaxLimPct_pct": divergePct}
 	if err := o.injectValue(ctx, body,
-		"move the server's WMaxLimPct control register away from the value the DUT last wrote, so an "+
-			"active reconciler that holds a standing setpoint re-asserts it with a register write"); err != nil {
+		"move the server's WMaxLimPct control register to 50.00 % — away from the value the DUT last "+
+			"wrote — so an active reconciler that holds a standing setpoint re-asserts it with a register "+
+			"write. "+bridgedMirrorCaveat); err != nil {
 		p.DivergeErr = err
 	} else {
 		p.Divergence = jsonish(body)
@@ -112,7 +163,8 @@ func provokeWrites(ctx context.Context, rc *certify.RunCtx, o *observer) (*write
 func (p *writeProvocation) reason() string {
 	var parts []string
 	if p.Divergence != "" {
-		parts = append(parts, "the server's control register was moved out from under the DUT ("+p.Divergence+")")
+		parts = append(parts, "the server's control register was moved out from under the DUT ("+
+			p.Divergence+" = a 50.00 % ceiling; "+bridgedMirrorCaveat+")")
 	} else if p.DivergeErr != nil {
 		parts = append(parts, fmt.Sprintf("the control register could not be diverged (%v)", p.DivergeErr))
 	}
@@ -163,8 +215,8 @@ func writeCheck(ctx context.Context, rc *certify.RunCtx, fc uint8) (certify.Resu
 	// Put the server's control register back where the DUT expects it, whatever
 	// happened, so the next test case starts from a coherent device.
 	if prov.Divergence != "" {
-		_ = o.injectValue(ctx, map[string]any{"WMaxLimPct_pct": 100},
-			"restore the server's control register after the divergence probe")
+		_ = o.injectValue(ctx, map[string]any{"WMaxLimPct_pct": restorePct},
+			"restore the server's control register to 100.00 % after the divergence probe")
 	}
 	if err := o.settle(ctx); err != nil {
 		return certify.Result{}, err

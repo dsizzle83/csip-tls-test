@@ -103,6 +103,61 @@ var phaseConditional = map[string]map[uint16]bool{
 	"VL3L1": {2: true},
 }
 
+// storageConditional names the model 702 points that rate a CHARGE axis, which
+// a DER with no storage behind it does not have.
+//
+// ── THIS ENTRY IS AN INTERPRETATION, NOT A TRANSCRIPTION ────────────────────
+//
+// Everything else in this file is copied from the profile's Section 3 tables.
+// This is not: Table 18 lists WChaRteMaxRtg and VAChaRteMaxRtg among model
+// 702's required points with no qualifier printed beside them. The
+// interpretation applied here is that the profile's OWN storage conditionality
+// — "if the implementation does not support storage, the DERStorageCapacity
+// model and the SoC point are optional", already transcribed into
+// ProfileModelConditional above — governs the charge-RATE ratings for the same
+// reason it governs model 713: they are ratings of an axis a non-storage DER
+// does not possess. It is labelled here, and named in the excuse text every
+// excused assertion carries, so a reviewer reads an interpretation rather than
+// mistaking it for the document. It is the same move phaseConditional makes
+// one qualifier over, and for the same purpose: a naive presence sweep must
+// not fail a conformant DUT.
+//
+// ── WHY IT IS NEEDED NOW ────────────────────────────────────────────────────
+//
+// It changes no verdict that was previously correct; it prevents one that
+// would newly be wrong. Until harness commit 07178d1 the bench's advanced
+// solar sim left WChaRteMaxRtg/WDisChaRteMaxRtg at the Go ZERO value, and a
+// Tuint16 zero is IMPLEMENTED data — so MOD-4.702 read "all 19 required points
+// implemented" and PASSed (run tail-fullsuite-20260801T173831). That pass was
+// manufactured: an implemented rated charge maximum of 0 W is the device
+// positively declaring it cannot charge at all, which under lexa-proto
+// derbase's maxRatingBound denies every nonzero active-power setpoint outright.
+// 07178d1 replaced the zeros with the SunSpec not-implemented sentinel, the
+// honest encoding of "this profile models a PV inverter with no battery behind
+// it" — and the gateway mirrors it faithfully (lexa-gw's admission readRatings
+// OMITS a not-implemented point rather than zero-filling it, so the northbound
+// 702 serves 0xFFFF too). Without this qualifier the next campaign turns that
+// honest declaration into a DUT conformance FAILURE.
+//
+// ── WHAT SWITCHES IT OFF ────────────────────────────────────────────────────
+//
+// The DUT serving model 713. That is the profile's own marker for "this
+// implementation supports storage", and it is read from the same discovery
+// walk MOD-4 already performs, so nothing is assumed: a DUT that declares
+// storage is held to the charge ratings in full. The bench's battery packs
+// (`batsim -pack …`) serve 713 and declare real, symmetric
+// WChaRteMaxRtg/WDisChaRteMaxRtg strictly below nameplate — which is exactly
+// the behaviour this qualifier stops excusing the moment one is admitted.
+// Their APPARENT-power rate ratings are still the sentinel, so a pack on the
+// bench will produce a VAChaRteMaxRtg finding: see the pre-flight note.
+var storageConditional = map[string]bool{
+	"WChaRteMaxRtg":  true,
+	"VAChaRteMaxRtg": true,
+}
+
+// storageModel is the profile model whose presence declares storage support.
+const storageModel uint16 = 713
+
 // requiredScaleFactors is the profile's Section 3 per-model `_SF` requirement
 // (fact sheet §2.8). Models 1, 701, 702 and 713 list none of their own: their
 // scale factors are inherited from the base model definition and are therefore
@@ -121,9 +176,11 @@ var requiredScaleFactors = map[uint16][]string{
 }
 
 // pointRequired reports whether the profile requires the named point of the
-// model, given the DUT's own ACType (which only matters for model 701). The
-// second result carries the applicability qualifier when the point is excused.
-func pointRequired(model uint16, name string, acType uint16, acTypeKnown bool) (bool, string) {
+// model, given the DUT's own ACType (which only matters for model 701) and
+// whether the DUT declares storage by serving model 713 (which only matters
+// for model 702's charge-rate ratings). The second result carries the
+// applicability qualifier when the point is excused.
+func pointRequired(model uint16, name string, acType uint16, acTypeKnown, servesStorage bool) (bool, string) {
 	req, ok := requiredPoints[model]
 	if !ok {
 		return false, ""
@@ -137,6 +194,14 @@ func pointRequired(model uint16, name string, acType uint16, acTypeKnown bool) (
 	}
 	if !found {
 		return false, ""
+	}
+	if model == 702 && storageConditional[name] && !servesStorage {
+		return false, "INTERPRETATION (profile1547.go's storageConditional, NOT a qualifier printed in " +
+			"Table 18): this point rates a charge axis, and the DUT serves no model 713 — the profile's " +
+			"own marker for storage support, which it already makes conditional on exactly that. A DER " +
+			"with no storage behind it has no charge-rate rating to declare, and the not-implemented " +
+			"sentinel is the honest encoding of that; a zero here would be the device positively " +
+			"declaring a rated charge maximum of 0 W"
 	}
 	if model != 701 {
 		return true, ""

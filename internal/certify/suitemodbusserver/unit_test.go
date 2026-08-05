@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"csip-tls-test/internal/certify"
@@ -249,7 +250,7 @@ func TestMissingModelsSeparatesRequiredFromConditional(t *testing.T) {
 func TestModel701VoltagePointsAreJudgedAgainstTheDevicesACType(t *testing.T) {
 	// A single-phase device legitimately implements neither VL2 nor VL3.
 	for _, name := range []string{"VL2", "VL3", "VL2L3", "VL3L1"} {
-		need, excuse := pointRequired(701, name, 0, true)
+		need, excuse := pointRequired(701, name, 0, true, false)
 		if need {
 			t.Errorf("%s required of a single-phase device", name)
 		}
@@ -259,17 +260,70 @@ func TestModel701VoltagePointsAreJudgedAgainstTheDevicesACType(t *testing.T) {
 	}
 	// A three-phase device must implement all of them.
 	for _, name := range []string{"VL1", "VL2", "VL3", "VL1L2", "VL2L3", "VL3L1"} {
-		if need, _ := pointRequired(701, name, 2, true); !need {
+		if need, _ := pointRequired(701, name, 2, true, false); !need {
 			t.Errorf("%s not required of a three-phase device", name)
 		}
 	}
 	// When the topology is unknown the strict reading applies.
-	if need, _ := pointRequired(701, "VL3", 0, false); !need {
+	if need, _ := pointRequired(701, "VL3", 0, false, false); !need {
 		t.Error("a voltage point was excused on an unknown topology")
 	}
 	// Points outside the profile's list are not required at all.
-	if need, _ := pointRequired(701, "TmpCab", 2, true); need {
+	if need, _ := pointRequired(701, "TmpCab", 2, true, false); need {
 		t.Error("a point the profile does not list was required")
+	}
+}
+
+// TestModel702ChargeRatingsAreJudgedAgainstDeclaredStorage pins the
+// storageConditional interpretation in BOTH directions, because only the pair
+// is worth anything: a qualifier that excuses a point unconditionally is
+// indistinguishable from deleting the row.
+//
+// The reason this exists at all is a real, dated verdict flip. The bench's
+// advanced solar sim used to leave WChaRteMaxRtg at the Go zero value, MOD-4
+// read it as implemented, and 702 passed; harness 07178d1 replaced the zeros
+// with the SunSpec not-implemented sentinel — the correct declaration for a PV
+// inverter with no battery — and without this qualifier the same conformant
+// bench would newly FAIL. See storageConditional's comment.
+func TestModel702ChargeRatingsAreJudgedAgainstDeclaredStorage(t *testing.T) {
+	charge := []string{"WChaRteMaxRtg", "VAChaRteMaxRtg"}
+
+	// No model 713: the DUT declares no storage, so a charge-rate rating is a
+	// rating of an axis it does not have.
+	for _, name := range charge {
+		need, excuse := pointRequired(702, name, 0, true, false)
+		if need {
+			t.Errorf("%s was required of a DUT that serves no model 713; a PV inverter honestly "+
+				"declaring it does not implement a charge-rate rating would FAIL MOD-4", name)
+		}
+		if !strings.Contains(excuse, "INTERPRETATION") {
+			t.Errorf("%s was excused by reason %q, which does not tell the reader that the qualifier "+
+				"is this harness's reading rather than the profile's printed text", name, excuse)
+		}
+		if !strings.Contains(excuse, "713") {
+			t.Errorf("%s's excuse %q does not name the condition that would revoke it", name, excuse)
+		}
+	}
+
+	// Model 713 present: the DUT declares storage and is held to the ratings in
+	// full. This is the half that keeps the qualifier from being a hole — the
+	// bench's battery packs serve 713 and declare real charge ratings.
+	for _, name := range charge {
+		if need, excuse := pointRequired(702, name, 0, true, true); !need {
+			t.Errorf("%s was excused for a DUT that DOES serve model 713 (%q); a device declaring "+
+				"storage must declare what it can charge at", name, excuse)
+		}
+	}
+
+	// Nothing else in 702 moves with storage. WMaxRtg in particular is a
+	// discharge/generation rating every DER has.
+	for _, name := range []string{"WMaxRtg", "VAMaxRtg", "CtrlModes", "VNomRtg"} {
+		for _, storage := range []bool{false, true} {
+			if need, _ := pointRequired(702, name, 0, true, storage); !need {
+				t.Errorf("%s stopped being required at servesStorage=%v; the qualifier reached a "+
+					"point that has nothing to do with a charge axis", name, storage)
+			}
+		}
 	}
 }
 

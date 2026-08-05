@@ -120,9 +120,27 @@ var lieCatalog = []struct {
 	// is right to. W and VAr are named because they are the two points a
 	// gateway most readily mistakes for a measurement — 0x8000 read as a signed
 	// int16 is -32768 W, a plausible-looking import that never happened.
+	//
+	// TWO ENTRIES, ONE FAULT KIND, because the bare names are MODEL-SPECIFIC
+	// and the bench's inverters serve both models. sim/southbound's installLies
+	// maps "W"/"VAr" to model 103 and registers the model 701 points under the
+	// SUFFIXED names "W_701"/"VAr_701". A gateway that prefers 701 — which the
+	// sim's own comment says it does, and which is why installLies moves the
+	// default freeze window to 701 on an advanced sim — never reads the block
+	// the first entry blanks, so against the bench's advanced inverters that
+	// entry arms a probe the DUT cannot see. That is not a reason to replace
+	// it: a legacy 103-only device has no "_701" names at all, and the sim
+	// refuses an unknown field BY NAME (resolveTargetsLocked), which the
+	// campaign records as an ARM-ERR against that one action and carries on.
+	// So both spellings are offered and whichever the device actually has is
+	// the one that arms.
 	{"sentinel_field", map[string]any{"fields": []string{"W", "VAr"}},
-		"the device serves the SunSpec not-implemented sentinel where a real measurement belongs; a " +
-			"gateway that treats 0x8000 as -32768 will report a plausible, wrong number"},
+		"the device serves the SunSpec not-implemented sentinel where a real measurement belongs (model " +
+			"103's W/VAr); a gateway that treats 0x8000 as -32768 will report a plausible, wrong number"},
+	{"sentinel_field", map[string]any{"fields": []string{"W_701", "VAr_701"}},
+		"the same sentinel, in model 701 — the measurement block a 7xx-capable gateway actually reads, " +
+			"so this is the entry that reaches a DUT polling the advanced models. It arms only on a sim " +
+			"that serves 701; elsewhere it is an honest ARM-ERR naming the field that is missing"},
 	{"exception_on_applied_write", map[string]any{"ex_code": 4, "every": 1},
 		"the device REFUSES a write it has already applied — I3's exact shape: a refusal that must " +
 			"leave no durable state claiming it applied, and must not be re-actuated later"},
