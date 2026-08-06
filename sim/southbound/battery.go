@@ -225,7 +225,11 @@ func (bs *BatteryServer) Snapshot() BatteryState {
 	bat.ChaStText = chaStText(bat.ChaSt)
 
 	c := &st.Controls
-	c.WMaxLimPct_pct = signed(b.M123Base+sunspec.M123_WMaxLimPct, b.M123Base+sunspec.M123_WMaxLimPct_SF) / 100.0
+	// signed() already returns the register's engineering value (raw × 10^SF);
+	// at SF −2 that IS the percent (raw 5000 → 50.0), so no further division
+	// belongs here. RMD-046: this used to divide by 100 again to match Inject's
+	// now-removed val*100 double-scale — see Inject's "WMaxLimPct_pct" case.
+	c.WMaxLimPct_pct = signed(b.M123Base+sunspec.M123_WMaxLimPct, b.M123Base+sunspec.M123_WMaxLimPct_SF)
 	c.Conn = int(r.Get(b.M123Base + sunspec.M123_Conn))
 
 	st.Pack = bs.packSnapshot()
@@ -258,13 +262,14 @@ func (bs *BatteryServer) Registers() map[string]uint16 {
 // Inject overrides one or more fields.
 // Accepted keys: "W_W", "V_V", "Hz_Hz", "TmpCab_C",
 // "SoC_pct" (0–100), "SoH_pct" (0–100),
-// "WMaxLimPct_pct" (0–100), "Ena" (0 or 1), "Conn" (0 or 1), "St" (1–8), "ChaSt" (1–7).
+// "WMaxLimPct_pct" (0–100, clamped), "Ena" (0 or 1), "Conn" (0 or 1), "St" (1–8),
+// "ChaSt" (1–7).
 //
 // A PACK profile (battery_pack.go) additionally accepts "CommandedW_W" (signed
 // watts through whichever active-power axis the shape has — the lever a bench
-// recipe should reach for, and see injectPackDispatch for the pre-existing
-// defect in "WMaxLimPct_pct" that is the reason it exists) and, on the
-// setpoint shape only, "WSet_W" / "WSetEna".
+// recipe should reach for; see injectPackDispatch's doc for why it exists
+// alongside "WMaxLimPct_pct", which is unsigned-only and cannot express a
+// charge direction) and, on the setpoint shape only, "WSet_W" / "WSetEna".
 func (bs *BatteryServer) Inject(body []byte) error {
 	var fields map[string]float64
 	if err := json.Unmarshal(body, &fields); err != nil {
@@ -299,8 +304,17 @@ func (bs *BatteryServer) Inject(body []byte) error {
 			r.Set(b.M802Base+uint16(sunspec.M802_SoH),
 				sunspec.RawFromScaleUint(val, int16(r.Get(b.M802Base+uint16(sunspec.M802_SoH_SF)))))
 		case "WMaxLimPct_pct":
+			// RMD-046: this used to encode RawFromScaleSigned(val*100, SF) against
+			// SF=-2, i.e. val×10000 — a double scale that saturated the int16
+			// register for any val above ~3.27 (an injected 80 landed as 327.67%).
+			// The correct encoding is val itself: at SF=-2 the raw register is in
+			// units of 0.01%, so 50 → raw 5000 (50.00%). WMaxLimPct is 0–100 per
+			// the DER model (SunSpec M123/M704); clamp rather than let an
+			// out-of-range percent encode into a representable-but-meaningless
+			// raw word.
+			pct := math.Max(0, math.Min(100, val))
 			r.Set(b.M123Base+sunspec.M123_WMaxLimPct,
-				sunspec.RawFromScaleSigned(val*100, sf(b.M123Base+sunspec.M123_WMaxLimPct_SF)))
+				sunspec.RawFromScaleSigned(pct, sf(b.M123Base+sunspec.M123_WMaxLimPct_SF)))
 			// val=0 means "release hub control"; clear Ena so animation runs free.
 			if val == 0 {
 				r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 0)

@@ -491,34 +491,66 @@ Pinned by `sim/southbound/lying_test.go`
 (`TestAckNoApply_DropsEveryRegisterOfAMultiWordPoint`,
 `TestSentinelField_BlanksEveryRegisterOfAMultiWordPoint`).
 
-### A pre-existing defect the live smoke found (recorded, NOT fixed)
+### A pre-existing defect the live smoke found (FIXED — RMD-046, 2026-08-05)
 
 `POST /inject {"WMaxLimPct_pct": N}` — the historical spelling on BOTH the
-battery sim and the solar one — encodes `RawFromScaleSigned(N*100, SF)` against
-a scale factor of −2, which is `N x 10000`. The register therefore **saturates
-at 32767 for any N above ~3.27**: an injected 80 does not command 80 %, it
-commands the saturated word, which `hubBatteryW` reads back as 327.67 % of
-nameplate and `GET /state` reports (dividing by 100 again, matching the same
-mistaken convention) as `3.28`. Observed live on a 5 kW `-pack cease` sim:
-`{"WMaxLimPct_pct":80,"Ena":1}` produced `M123[0] = 32767` and a measured power
-pinned at the pack's declared 4500 W discharge rate rating — correct behaviour
-by the pack, in response to a command nobody meant.
+battery sim and the solar one — used to encode `RawFromScaleSigned(N*100, SF)`
+against a scale factor of −2, which is `N x 10000`. The register therefore
+**saturated at 32767 for any N above ~3.27**: an injected 80 did not command
+80 %, it commanded the saturated word, which `hubBatteryW` read back as
+327.67 % of nameplate and `GET /state` reported (dividing by 100 again,
+matching the same mistaken convention) as `3.28`. Observed live on a 5 kW
+`-pack cease` sim: `{"WMaxLimPct_pct":80,"Ena":1}` produced `M123[0] = 32767`
+and a measured power pinned at the pack's declared rate rating — correct
+behaviour by the pack, in response to a command nobody meant.
 
-It is deliberately left alone under a battery change, because the mistake is
-load-bearing elsewhere and correcting it silently changes what those call sites
-do: `cmd/dashboard/mayhem.go` uses `{"WMaxLimPct_pct":100}` to UNCURTAIL a
-solar sim and gets the effect it wants *from* the saturation (327 % of
-nameplate is not a ceiling), and
-`internal/certify/suitemodbusclient/checks_write.go` uses
-`{"WMaxLimPct_pct":50}` as a 50 % curtail that has never curtailed. Both
-deserve their own change with their own evidence. `{"WMaxLimPct_pct":0}` — the
-QA harness's inter-scenario reset — is unaffected: zero encodes to zero either
-way, which is why this has survived this long.
+It was left deliberately unfixed for a time because the mistake was
+load-bearing elsewhere: `cmd/dashboard/mayhem.go` used
+`{"WMaxLimPct_pct":100}` to UNCURTAIL a solar sim and got the effect it wanted
+*from* the saturation (327 % of nameplate is not a ceiling), and
+`internal/certify/suitemodbusclient/checks_write.go` used
+`{"WMaxLimPct_pct":50}` as a workaround-scaled `0.5` — a "50 % curtail" that
+had never actually curtailed. `{"WMaxLimPct_pct":0}` (the QA harness's
+inter-scenario reset) was unaffected either way: zero encodes to zero
+regardless of the multiplier, which is why this survived as long as it did.
 
-A pack therefore offers `{"CommandedW_W": <signed watts>}`, which writes 704
-`WSet` on the setpoint shape and the correctly-encoded M123 dispatch on the
-cease shape. Pinned, including the saturation contrast, by
-`TestPackCommandedWInjectWorksOnBothShapes`.
+**RMD-046 fixed the encoding atomically, everywhere at once**, rather than
+compensating for it in callers:
+
+- `sim/southbound/battery.go` and `solar.go`'s `Inject`, case
+  `"WMaxLimPct_pct"`, now encode `RawFromScaleSigned(val, SF)` directly — no
+  `*100` — and CLAMP `val` to `[0,100]` (the domain the DER model defines for
+  WMaxLimPct) rather than let an out-of-range percent encode into a
+  representable-but-meaningless raw word. `Snapshot`'s `Controls.WMaxLimPct_pct`
+  no longer divides by 100 a second time to compensate.
+- `cmd/dashboard/mayhem.go`'s `{"WMaxLimPct_pct":100}` uncurtail calls are
+  unaffected in EFFECT (100 now means a true 100.00 % ceiling — genuinely
+  uncurtailed at nameplate — rather than an accidental 327.67 %; for a solar
+  panel whose available power never exceeds nameplate, "ceiling at or above
+  nameplate" behaves identically either way).
+- `internal/certify/suitemodbusclient/checks_write.go`'s `divergePct`/
+  `restorePct` are back to plain `50`/`100` (see that file's comment and
+  `internal/certify/suitemodbusclient/writelever_test.go`, which pins both the
+  fixed encoding and the historical saturated one as a regression guard).
+- `qa/scenarios/solar-reboot-forget.json`'s tick-25 `{"WMaxLimPct_pct":100}`
+  needed NO numeric change: its hypothesis was always "the inverter reboots
+  and comes back at 100 % WMaxLimPct" — a literal 100 now delivers exactly
+  that (true, uncurtailed 100 % of nameplate) instead of accidentally
+  delivering 327.67 %, and the scenario's export-cap breach still triggers
+  identically. Its stale `ENCODING CAVEAT` note has been removed.
+
+A pack additionally offers `{"CommandedW_W": <signed watts>}`, which writes
+704 `WSet` on the setpoint shape and the correctly-encoded M123 dispatch on
+the cease shape — this remains the right lever for a SIGNED (charge/discharge)
+dispatch, since `WMaxLimPct_pct` is clamped unsigned `[0,100]` and cannot
+express a charge direction. Pinned, including the (now-fixed) encoding and the
+clamp, by `TestPackCommandedWInjectWorksOnBothShapes` in
+`sim/southbound/battery_pack_test.go`.
+
+New API-level round-trip regression tests (`sim/southbound/battery_test.go`,
+`solar_test.go`): `50 → raw 5000 → Snapshot 50.00%`, `100 → raw 10000 →
+Snapshot 100.00%`, and an out-of-range guard (`150 → raw 10000 (clamped)`,
+`-40 → raw 0 (clamped)`).
 
 ### Ground truth
 

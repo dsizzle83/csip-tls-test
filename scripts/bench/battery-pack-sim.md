@@ -140,7 +140,8 @@ All `POST /fault` and `POST /inject` bodies go to the sim's own API port
 ```bash
 # Get the pack running first — the state RMD-025's pre-fix capture was taken in.
 # CommandedW_W is the shape-agnostic lever: signed watts through whichever
-# active-power axis the shape has. Do NOT reach for "WMaxLimPct_pct" — see §4.
+# active-power axis the shape has. "WMaxLimPct_pct" is unsigned/clamped
+# [0,100] and cannot express a charge direction — see §4.
 curl -sX POST localhost:6024/inject -d '{"CommandedW_W":4000}'
 sleep 20 && curl -s localhost:6024/state | jq '.pack.measured_W'   # ~ +4000
 ```
@@ -245,37 +246,38 @@ sleep 20 && curl -s localhost:6023/state | jq '.battery.ChaSt_text'   # -> "full
 `ChaSt` FULL/EMPTY rather than HOLDING is how a hub tells "this pack is
 refusing" from "this pack is uncommanded".
 
-## 4. Do NOT use `WMaxLimPct_pct` — a pre-existing sim defect
+## 4. `WMaxLimPct_pct` is unsigned/clamped — use `CommandedW_W` for a signed dispatch
 
-Found by the live smoke of this work, on 2026-08-04, and **not fixed** here.
+Found by the live smoke of this work, on 2026-08-04, **fixed as RMD-046**
+(2026-08-05).
 
 `POST /inject {"WMaxLimPct_pct": N}` — the historical spelling on BOTH this
-battery sim and the solar one — encodes `RawFromScaleSigned(N*100, SF)` against
-a scale factor of −2, which is `N x 10000`. The register therefore **saturates
-at 32767 for any N above ~3.27**. Injecting 80 does not command 80 %; it
-commands the saturated word, which `hubBatteryW` reads back as **327.67 % of
-nameplate** and `GET /state` reports (dividing by 100 again, matching the same
-mistaken convention) as `"WMaxLimPct_pct": 3.28`.
+battery sim and the solar one — used to encode `RawFromScaleSigned(N*100, SF)`
+against a scale factor of −2, which is `N x 10000`. The register therefore
+**saturated at 32767 for any N above ~3.27**. Injecting 80 did not command
+80 %; it commanded the saturated word, which `hubBatteryW` read back as
+**327.67 % of nameplate** and `GET /state` reported (dividing by 100 again,
+matching the same mistaken convention) as `"WMaxLimPct_pct": 3.28`.
 
 Observed live: `{"WMaxLimPct_pct":80,"Ena":1}` on a 5 kW `-pack cease` sim
 produced `M123[0] = 32767` and a measured power pinned at the pack's declared
-4500 W discharge rate rating — correct behaviour by the pack, in response to a
-command nobody meant.
+rate rating — correct behaviour by the pack, in response to a command nobody
+meant.
 
-It is left alone because the mistake is load-bearing elsewhere and correcting
-it would silently change what those call sites do:
+That double scale is now fixed everywhere at once: `battery.go` and
+`solar.go`'s `Inject` encode `val` directly (no `*100`), and CLAMP it to
+`[0,100]` — the domain WMaxLimPct is defined over — rather than let an
+out-of-range value encode into a representable-but-meaningless raw word.
+`{"WMaxLimPct_pct":80,"Ena":1}` now produces `M123[0] = 8000` (80.00 %), and
+`GET /state` reports `"WMaxLimPct_pct": 80` to match.
 
-- `cmd/dashboard/mayhem.go` uses `{"WMaxLimPct_pct":100}` to UNCURTAIL a solar
-  sim, and gets the effect it wants *from* the saturation (327 % of nameplate
-  is not a ceiling).
-- `internal/certify/suitemodbusclient/checks_write.go` uses
-  `{"WMaxLimPct_pct":50}` as a 50 % curtail that has never curtailed.
-
-Both deserve their own change with their own evidence. **On a pack, use
-`{"CommandedW_W": <signed watts>}`**, which writes 704 `WSet` on the setpoint
-shape and the correctly-encoded M123 dispatch on the cease shape.
-`{"WMaxLimPct_pct":0}` (the QA harness's inter-scenario reset) is unaffected —
-zero encodes to zero either way.
+`WMaxLimPct_pct` remains the WRONG lever for a pack, though — not because it
+is broken, but because it is unsigned: it cannot express a charge direction.
+**On a pack, use `{"CommandedW_W": <signed watts>}`**, which writes 704
+`WSet` on the setpoint shape and the correctly-encoded, signed M123 dispatch
+on the cease shape. `{"WMaxLimPct_pct":0}` (the QA harness's inter-scenario
+reset) behaves the same as before the fix — zero encodes to zero regardless
+of the multiplier.
 
 ## 5. Before every hand deploy
 

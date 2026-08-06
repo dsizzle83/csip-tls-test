@@ -452,12 +452,15 @@ func jsonNum(f float64) string {
 // TestPackCommandedWInjectWorksOnBothShapes pins the shape-agnostic bench
 // lever, and its contrast with the historical "WMaxLimPct_pct" spelling.
 //
-// The contrast half is the finding: WMaxLimPct_pct encodes val*100 at SF −2 —
-// val×10000 — so an injected 80 SATURATES the register at 32767 and commands
-// 327.67 % of nameplate rather than 80 %. That defect is pre-existing on both
-// this sim and the solar one and is deliberately NOT fixed here (see
-// injectPackDispatch for the call sites that ride on it); this test is what
-// stops the pack's own recipes from being written against it.
+// The contrast half used to be a defect finding: before RMD-046,
+// WMaxLimPct_pct encoded val*100 at SF −2 — val×10000 — so an injected 80
+// SATURATED the register at 32767 and commanded 327.67 % of nameplate rather
+// than 80 %. That has been fixed (sim/southbound/battery.go and solar.go's
+// Inject, case "WMaxLimPct_pct", now encode val directly and clamp to
+// [0,100]); this test now pins the FIXED encoding instead, and still exists
+// to stop the pack's own recipes from reaching for the unsigned, clamped
+// "WMaxLimPct_pct" key when they need a signed charge/discharge lever — see
+// injectPackDispatch's doc for why CommandedW_W is that lever.
 func TestPackCommandedWInjectWorksOnBothShapes(t *testing.T) {
 	for _, shape := range []BatteryPackShape{PackShapeCease, PackShapeSetpoint} {
 		t.Run(string(shape), func(t *testing.T) {
@@ -481,7 +484,7 @@ func TestPackCommandedWInjectWorksOnBothShapes(t *testing.T) {
 		})
 	}
 
-	t.Run("the historical WMaxLimPct_pct spelling saturates", func(t *testing.T) {
+	t.Run("the historical WMaxLimPct_pct spelling now encodes correctly (RMD-046)", func(t *testing.T) {
 		bs := newTestPack(t, PackShapeCease)
 		if err := bs.Inject([]byte(`{"WMaxLimPct_pct":80}`)); err != nil {
 			t.Fatalf("inject: %v", err)
@@ -490,16 +493,38 @@ func TestPackCommandedWInjectWorksOnBothShapes(t *testing.T) {
 			t.Fatalf("inject: %v", err)
 		}
 		raw := bs.Regs.Get(bs.bases.M123Base + sunspec.M123_WMaxLimPct)
-		if raw != 32767 {
-			t.Fatalf("M123 WMaxLimPct = %d for an injected 80%%, want the saturated 32767 — if this "+
-				"now encodes 8000, the pre-existing repo-wide WMaxLimPct_pct defect has been fixed and "+
-				"this test (plus injectPackDispatch's doc, docs/QA_FAULT_INJECTION.md and "+
-				"scripts/bench/battery-pack-sim.md) should be updated to match", raw)
+		if raw != 8000 {
+			t.Fatalf("M123 WMaxLimPct = %d for an injected 80%%, want 8000 (= 80.00%% at SF -2) — if "+
+				"this is back to the saturated 32767, the RMD-046 fix (removing Inject's val*100 double "+
+				"scale) has regressed", raw)
 		}
-		// 32767 at SF −2 reads as 327.67 % of nameplate, i.e. 3.2767x it.
-		if got := hubBatteryW(bs.Regs, bs.bases.M123Base, bs.wmaxW); got < 3*bs.wmaxW {
-			t.Errorf("hubBatteryW = %.0f from the saturated register, want a wildly over-nameplate "+
-				"command — that is the whole shape of the defect", got)
+		// 8000 at SF −2 reads as 80.00 % of nameplate — the pack cannot reach it
+		// on a 5 kW rig with an 80 % ceiling above its own rate rating, so this
+		// pins "correctly-scaled ceiling", not "hits exactly 80 %".
+		if got := hubBatteryW(bs.Regs, bs.bases.M123Base, bs.wmaxW); got > bs.wmaxW {
+			t.Errorf("hubBatteryW = %.0f from an 80%% ceiling, want at or under nameplate (%.0f) — an "+
+				"in-range percent must never command a wildly over-nameplate power; that was the whole "+
+				"shape of the pre-RMD-046 defect", got, bs.wmaxW)
+		} else if want := 0.8 * bs.wmaxW; math.Abs(got-want) > 1.0 {
+			t.Errorf("hubBatteryW = %.0f, want %.0f (80%% of nameplate %.0f)", got, want, bs.wmaxW)
+		}
+	})
+
+	t.Run("WMaxLimPct_pct clamps out-of-range percentages to [0,100]", func(t *testing.T) {
+		bs := newTestPack(t, PackShapeCease)
+		if err := bs.Inject([]byte(`{"WMaxLimPct_pct":150}`)); err != nil {
+			t.Fatalf("inject: %v", err)
+		}
+		if raw := bs.Regs.Get(bs.bases.M123Base + sunspec.M123_WMaxLimPct); raw != 10000 {
+			t.Errorf("M123 WMaxLimPct = %d for an injected 150%%, want 10000 (clamped to 100.00%%) — "+
+				"WMaxLimPct is 0-100%% per the DER model", raw)
+		}
+		if err := bs.Inject([]byte(`{"WMaxLimPct_pct":-40}`)); err != nil {
+			t.Fatalf("inject: %v", err)
+		}
+		if raw := bs.Regs.Get(bs.bases.M123Base + sunspec.M123_WMaxLimPct); raw != 0 {
+			t.Errorf("M123 WMaxLimPct = %d for an injected -40%%, want 0 (clamped to 0.00%%) — "+
+				"WMaxLimPct_pct is unsigned; a signed dispatch belongs on CommandedW_W instead", raw)
 		}
 	})
 }

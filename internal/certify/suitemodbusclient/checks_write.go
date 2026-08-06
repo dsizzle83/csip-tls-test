@@ -49,33 +49,26 @@ const derControlWatts = 4000
 // this check is killed mid-run.
 const derControlSeconds = 120
 
-// divergePct and restorePct are the two ceilings the divergence lever writes,
-// and they are 0.5 and 1 rather than 50 and 100 BECAUSE OF A RECORDED SIM
-// DEFECT, not a unit slip.
+// divergePct and restorePct are the two ceilings the divergence lever writes.
 //
-// `POST /inject {"WMaxLimPct_pct": N}` on both the solar and battery sims
-// encodes `RawFromScaleSigned(N*100, SF)` against SF = −2 — that is N × 10000 —
-// so the M123 register SATURATES at 32767 for any N above ~3.27. The 50 and
-// 100 this file used to pass therefore encoded the SAME saturated word: the
-// "50 % curtail" was a 327.67 % ceiling, and the restore that followed it wrote
-// the identical value, so the teardown restored nothing and the SECOND write
-// row's divergence — WR-2, running after WR-1 has already left the register at
-// 32767 — moved the register by zero. Two rows whose whole provocation is
-// divergence were provoking with a no-op, and both SKIPped for want of a write
-// in every campaign to date.
+// RMD-046 (fixed): `POST /inject {"WMaxLimPct_pct": N}` on both the solar and
+// battery sims used to encode `RawFromScaleSigned(N*100, SF)` against SF = −2
+// — that is N × 10000 — so the M123 register SATURATED at 32767 for any N
+// above ~3.27. The 50 and 100 this file wants to pass therefore used to encode
+// the SAME saturated word: the "50 % curtail" was actually a 327.67 % ceiling,
+// and the restore that followed it wrote the identical value, so the teardown
+// restored nothing and the SECOND write row's divergence — WR-2, running
+// after WR-1 has already left the register at 32767 — moved the register by
+// zero. Two rows whose whole provocation is divergence were provoking with a
+// no-op, and both SKIPped for want of a write in every campaign to date. The
+// workaround (passing X/100 so the double-scale cancelled itself out) is gone
+// now that the sims encode N directly: 50 means 50 %.
 //
-// The defect is DELIBERATELY unfixed in the sims (sim/southbound/battery_pack.go's
-// injectPackDispatch documents why: `cmd/dashboard`'s mayhem scenarios depend
-// on the saturation to uncurtail, so correcting the encoding is a separate
-// change with its own evidence). Until it is, the honest way to command a
-// ceiling of X % from here is to pass X/100, and the numbers below are written
-// with the arithmetic beside them so nobody "fixes" them back.
-//
-// 1 is the sim's own power-on ceiling: SolarServer.powerOnReset writes raw
-// 10000 to that register and calls it "100.00 %".
+// 100 is also the sim's own power-on ceiling: SolarServer.powerOnReset writes
+// raw 10000 to that register and calls it "100.00 %".
 const (
-	divergePct = 0.5 // → raw 5000  = 50.00 %
-	restorePct = 1.0 // → raw 10000 = 100.00 %
+	divergePct = 50  // → raw 5000  = 50.00 %
+	restorePct = 100 // → raw 10000 = 100.00 %
 )
 
 // bridgedMirrorCaveat is the second half of what an operator needs to read a

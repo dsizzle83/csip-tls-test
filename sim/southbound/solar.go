@@ -294,7 +294,11 @@ func (ss *SolarServer) Snapshot() SolarState {
 	m.StText = solarStateText(m.St)
 
 	c := &st.Controls
-	c.WMaxLimPct_pct = signed(b.M123Base+sunspec.M123_WMaxLimPct, b.M123Base+sunspec.M123_WMaxLimPct_SF) / 100.0
+	// signed() already returns the register's engineering value (raw × 10^SF);
+	// at SF −2 that IS the percent (raw 5000 → 50.0), so no further division
+	// belongs here. RMD-046: this used to divide by 100 again to match Inject's
+	// now-removed val*100 double-scale — see Inject's "WMaxLimPct_pct" case.
+	c.WMaxLimPct_pct = signed(b.M123Base+sunspec.M123_WMaxLimPct, b.M123Base+sunspec.M123_WMaxLimPct_SF)
 	c.WMaxLimPctEna = int(r.Get(b.M123Base + sunspec.M123_WMaxLimPct_Ena))
 	c.Conn = int(r.Get(b.M123Base + sunspec.M123_Conn))
 
@@ -360,8 +364,8 @@ func (ss *SolarServer) Becalmed() bool {
 
 // Inject overrides one or more measurement or control fields.
 // Accepted JSON keys: "W_W", "V_V", "Hz_Hz", "DCV_V", "TmpCab_C",
-// "WMaxLimPct_pct" (0–100), "Conn" (0 or 1), "St" (1–8), "Cloud_pct" (0–100),
-// "Night" (0 or nonzero).
+// "WMaxLimPct_pct" (0–100, clamped), "Conn" (0 or 1), "St" (1–8),
+// "Cloud_pct" (0–100), "Night" (0 or nonzero).
 //
 // "Cloud_pct" is not a register — it is an environmental input (like metersim's
 // LoadW_W) that scales the running-animation irradiance via cloudTransmittance;
@@ -429,8 +433,17 @@ func (ss *SolarServer) Inject(body []byte) error {
 			r.Set(b.M103Base+sunspec.M103_TmpCab,
 				sunspec.RawFromScaleSigned(val, sf(b.M103Base+sunspec.M103_Tmp_SF)))
 		case "WMaxLimPct_pct":
+			// RMD-046: this used to encode RawFromScaleSigned(val*100, SF) against
+			// SF=-2, i.e. val×10000 — a double scale that saturated the int16
+			// register for any val above ~3.27 (an injected 80 landed as 327.67%).
+			// The correct encoding is val itself: at SF=-2 the raw register is in
+			// units of 0.01%, so 100 → raw 10000 (100.00%). WMaxLimPct is 0–100
+			// per the DER model (SunSpec M123/M704); clamp rather than let an
+			// out-of-range percent encode into a representable-but-meaningless
+			// raw word.
+			pct := math.Max(0, math.Min(100, val))
 			r.Set(b.M123Base+sunspec.M123_WMaxLimPct,
-				sunspec.RawFromScaleSigned(val*100, sf(b.M123Base+sunspec.M123_WMaxLimPct_SF)))
+				sunspec.RawFromScaleSigned(pct, sf(b.M123Base+sunspec.M123_WMaxLimPct_SF)))
 		case "Conn":
 			r.Set(b.M123Base+sunspec.M123_Conn, uint16(val))
 		case "St":

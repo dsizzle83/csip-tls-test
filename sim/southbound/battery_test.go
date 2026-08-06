@@ -79,3 +79,48 @@ func TestInject_EnaOverride(t *testing.T) {
 		t.Fatalf("after Ena override, hubBatteryW = %v, want held 0 W", w)
 	}
 }
+
+// TestInject_WMaxLimPct_pct_RoundTrip is the RMD-046 API-level regression: the
+// "WMaxLimPct_pct" Inject key must round-trip through the raw register and
+// GET /state (Snapshot) at TRUE 0-100 percent units, not the old
+// double-scaled convention (val*100 in, /100 out) that saturated the int16
+// register for any injected value above ~3.27 and silently redefined the
+// documented "(0-100)" domain as a 0-1 fraction. It also pins the explicit
+// [0,100] clamp: WMaxLimPct is 0-100 per the DER model (SunSpec M123/M704),
+// so an out-of-range percent is clamped rather than encoded into a
+// representable-but-meaningless raw word.
+func TestInject_WMaxLimPct_pct_RoundTrip(t *testing.T) {
+	const wmaxKwh, wmaxW = 10.0, 5000.0
+
+	tests := []struct {
+		name    string
+		inject  float64
+		wantRaw uint16
+		wantPct float64
+	}{
+		{"50 -> raw 5000 -> Snapshot 50.00%", 50, 5000, 50.0},
+		{"100 -> raw 10000 -> Snapshot 100.00%", 100, 10000, 100.0},
+		{"0 -> raw 0 -> Snapshot 0.00%", 0, 0, 0.0},
+		{"out-of-range guard: 150 clamps to 100.00%", 150, 10000, 100.0},
+		{"out-of-range guard: -40 clamps to 0.00%", -40, 0, 0.0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &RegisterMap{regs: make(map[uint16]uint16)}
+			b := populateBattery(r, wmaxKwh, wmaxW)
+			bs := &BatteryServer{Server: &Server{Regs: r}, bases: b, wmaxW: wmaxW, wmaxKwh: wmaxKwh}
+			r.Set(b.M123Base+sunspec.M123_Conn, 1)
+
+			if err := bs.Inject([]byte(`{"WMaxLimPct_pct":` + jsonNum(tc.inject) + `}`)); err != nil {
+				t.Fatalf("inject: %v", err)
+			}
+			if raw := r.Get(b.M123Base + sunspec.M123_WMaxLimPct); raw != tc.wantRaw {
+				t.Errorf("raw M123 WMaxLimPct = %d, want %d", raw, tc.wantRaw)
+			}
+			st := bs.Snapshot()
+			if got := st.Controls.WMaxLimPct_pct; math.Abs(got-tc.wantPct) > 1e-9 {
+				t.Errorf("Snapshot Controls.WMaxLimPct_pct = %v, want %v", got, tc.wantPct)
+			}
+		})
+	}
+}

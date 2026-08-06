@@ -743,27 +743,17 @@ func packCurrentSoC(r *RegisterMap, bases BatteryBases) float64 {
 // shape's answer cannot be silently overwritten by the bridge on the next tick
 // (which is what would happen if this wrote 123 on a pack whose WSetEna is on).
 //
-// IT EXISTS BECAUSE "WMaxLimPct_pct" DOES NOT DO WHAT ITS NAME SAYS, and that
-// is a PRE-EXISTING defect of both this sim and the solar one, deliberately
-// left alone here rather than fixed under a battery change. Both spell the
-// encoding `RawFromScaleSigned(val*100, SF)` against a scale factor of −2,
-// which is val×10000 — so the register SATURATES at 32767 for any injected
-// percent above ~3.27. An injected 80 does not command 80 %: it commands the
-// saturated word, which reads back through hubBatteryW as 327.67 % of
-// nameplate, and through Snapshot (which divides by 100 again, matching the
-// same mistaken convention) as "3.28". Observed live on this pack:
-// {"WMaxLimPct_pct":80,"Ena":1} on a 5 kW pack produced M123[0]=32767 and a
-// measured power pinned at the pack's declared 4500 W discharge rate rating —
-// correct behaviour by the pack, in response to a command nobody meant.
-//
-// Not fixed here because the mistake is load-bearing elsewhere: cmd/dashboard's
-// mayhem scenarios use {"WMaxLimPct_pct":100} to UNCURTAIL a solar sim and get
-// the effect they want precisely from the saturation (327 % of nameplate is not
-// a ceiling), and internal/certify/suitemodbusclient/checks_write.go's
-// {"WMaxLimPct_pct":50} is a 50 % curtail that has never actually curtailed.
-// Correcting the encoding would silently change what those call sites do, which
-// is a separate change with its own evidence. Recorded in
-// docs/QA_FAULT_INJECTION.md rather than papered over.
+// IT EXISTS BECAUSE "WMaxLimPct_pct" CANNOT EXPRESS A CHARGE DIRECTION. Until
+// RMD-046, "WMaxLimPct_pct" also had an encoding defect of both this sim and
+// the solar one — `RawFromScaleSigned(val*100, SF)` against SF=−2, i.e.
+// val×10000, which SATURATED the register at 32767 for any injected percent
+// above ~3.27 — but that has been fixed (see Inject's "WMaxLimPct_pct" case):
+// the key now correctly encodes val directly and is CLAMPED to [0,100], the
+// domain the DER model defines for it. Clamped-unsigned is exactly why it
+// still cannot drive a pack's charge direction (negative watts) on its own —
+// this lever exists for that, not to route around a saturation bug that no
+// longer exists. See docs/QA_FAULT_INJECTION.md for the historical defect and
+// its fix.
 func (bs *BatteryServer) injectPackDispatch(w float64) error {
 	if bs.pack == nil {
 		return fmt.Errorf("inject: %q needs a battery PACK profile (batsim -pack …); "+
