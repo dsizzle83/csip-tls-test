@@ -383,6 +383,77 @@ func TestBASIC027Wire_AnswerDoesNotCrossConversations(t *testing.T) {
 	}
 }
 
+// ── wire tier: the second-instance churn regression (BASIC-027-triage.md) ────
+//
+// runs/soak-20260806T041607-leg1/csip/BASIC-027-triage.md caught the shape
+// none of the fixtures above cover: TWO genuine LogEvent-bodied POSTs, both
+// on connections this case owns, because the DUT itself retried — it picked
+// a pooled connection gridsim had already idle-closed, got an immediate RST,
+// and opened a fresh connection for the same LogEvent 28ms later, which WAS
+// answered 201. The old evaluator committed to the first candidate's lack of
+// an answer and FAILed without ever looking at the second.
+
+// A DUT that finds its pooled connection dead and retries on a fresh one —
+// ordinary HTTP/1.1 client behavior, not a defect — must still PASS this
+// case: the second attempt's 201 is graded and cited, and the first attempt's
+// dead connection is named as observed retry behavior, not as the verdict.
+func TestBASIC027Wire_SecondAttemptAnsweredAfterFirstWasRSTd(t *testing.T) {
+	crit := critLogEventPosted(&Observation{Params: map[string]string{}})
+
+	deadPost := framed(msg(Request, "POST", "/edev/2/lev", 0, leWire), 20)
+	retryPost := framed(msg(Request, "POST", "/edev/2/lev", 0, leWire), 30)
+	created := framed(msg(Response, "", "", 201, "", "Location", "/edev/2/lev/1"), 31)
+
+	disc := discWalk()
+	disc.Others = []*Transcript{siblingPOST(deadPost, nil), siblingPOST(retryPost, created)}
+
+	f := crit.Wire(nil, disc)
+	if f.Unavailable != "" {
+		t.Fatalf("evaluator declined to decide: %s", f.Unavailable)
+	}
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s, want PASS (the retry on the second connection WAS answered): %s",
+			f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "201 Created") || !strings.Contains(f.Observed, "/edev/2/lev/1") {
+		t.Errorf("Observed should cite the answered retry's 201 and its Location: %s", f.Observed)
+	}
+	if !containsInt(f.Frames, 30) || !containsInt(f.Frames, 31) {
+		t.Errorf("Frames should cite the answered retry's POST (30) and its 201 (31): %v", f.Frames)
+	}
+	if containsInt(f.Frames, 20) {
+		t.Errorf("Frames should NOT cite the dead first attempt (20) — it never got an answer: %v", f.Frames)
+	}
+	if !strings.Contains(f.Observed, "unanswered") {
+		t.Errorf("Observed should name the earlier unanswered attempt as observed retry behavior, not a "+
+			"defect: %s", f.Observed)
+	}
+}
+
+// When NEITHER of a case's two owned LogEvent POST attempts ever gets an
+// answer, the fix must not paper over a genuine gap: the case still FAILs.
+func TestBASIC027Wire_BothAttemptsUnansweredStillFails(t *testing.T) {
+	crit := critLogEventPosted(&Observation{Params: map[string]string{}})
+
+	firstPost := framed(msg(Request, "POST", "/edev/2/lev", 0, leWire), 20)
+	secondPost := framed(msg(Request, "POST", "/edev/2/lev", 0, leWire), 30)
+
+	disc := discWalk()
+	disc.Others = []*Transcript{siblingPOST(firstPost, nil), siblingPOST(secondPost, nil)}
+
+	f := crit.Wire(nil, disc)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s, want FAIL when NEITHER LogEvent attempt got an answer: %s",
+			f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Observed, "never answered") {
+		t.Errorf("Observed should say the POST was never answered: %s", f.Observed)
+	}
+	if !containsInt(f.Frames, 20) {
+		t.Errorf("Frames should cite the first unanswered attempt (20): %v", f.Frames)
+	}
+}
+
 // ── wire tier: assertion 1 (EndDevice) shares the same recovery ──────────────
 
 // The EndDevice fetch, when it IS in-window on a churned sibling whose 200 the

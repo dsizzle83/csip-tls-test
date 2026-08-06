@@ -515,17 +515,24 @@ func critLogEventPosted(o *Observation) criterion {
 			"Location header of the response to it",
 		NeedsTranscript: true,
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+			// A case can own MORE THAN ONE LogEvent-bodied POST: a DUT that
+			// picks a pooled HTTP/1.1 connection gridsim has already
+			// idle-closed gets an immediate RST on that attempt and, per
+			// ordinary HTTP/1.1 client practice, retries the identical POST
+			// on a fresh connection — a second candidate this case owns
+			// exactly as much as the first. Bailing out on the first
+			// candidate that lacks an answer used to read that dead attempt
+			// as the whole story and FAIL a case whose retry, seconds later
+			// on a sibling connection, was answered 201 inside this same
+			// window. So every LogEvent-bodied POST this case owns is
+			// scanned, in capture order, and the first one that actually HAS
+			// an answer is the one graded and cited; "never answered" is
+			// reserved for the case where none of them ever got one.
+			var unanswered []*Message
 			for _, e := range t.Method("POST") {
 				doc, err := e.Req.SEP()
 				if err != nil || doc.Local() != "LogEvent" {
 					continue
-				}
-				var missing []string
-				for _, want := range []string{"createdDateTime", "functionSet", "logEventCode",
-					"logEventID", "logEventPEN", "profileID"} {
-					if !doc.Has(want) {
-						missing = append(missing, want)
-					}
 				}
 				// The answer is not always on Exchange.Resp. RecoverSession
 				// pairs a conversation's recovered requests to its responses by
@@ -541,32 +548,72 @@ func critLogEventPosted(o *Observation) criterion {
 					resp = answerTo(t, e.Req)
 				}
 				if resp == nil {
-					return citeMessage(t, e.Req, certify.Fail, "the LogEvent POST was never answered")
+					// Genuinely nothing rode this candidate's own connection
+					// in reply — keep it in case NONE of this case's
+					// LogEvent POSTs ever gets answered, but don't stop
+					// here: a sibling attempt, still inside this case's
+					// window, may be the one gridsim actually answered.
+					unanswered = append(unanswered, e.Req)
+					continue
+				}
+				var missing []string
+				for _, want := range []string{"createdDateTime", "functionSet", "logEventCode",
+					"logEventID", "logEventPEN", "profileID"} {
+					if !doc.Has(want) {
+						missing = append(missing, want)
+					}
 				}
 				ex := Exchange{Req: e.Req, Resp: resp}
 				loc := resp.Header.Get("Location")
+				retry := retriedAfterNote(unanswered)
 				switch {
 				case len(missing) > 0:
-					return citeMessage(t, e.Req, certify.Fail,
-						"the LogEvent payload is missing %s", strings.Join(missing, ", "))
+					return annotate(citeMessage(t, e.Req, certify.Fail,
+						"the LogEvent payload is missing %s", strings.Join(missing, ", ")), retry)
 				case resp.Status != 201:
-					return citeExchange(t, ex, certify.Fail,
+					return annotate(citeExchange(t, ex, certify.Fail,
 						"POST %s carrying LogEvent -> %s; 2030.5 §5.5.2 requires 201 Created",
-						e.Req.Target, resp.Line())
+						e.Req.Target, resp.Line()), retry)
 				case loc == "":
-					return citeExchange(t, ex, certify.Fail,
+					return annotate(citeExchange(t, ex, certify.Fail,
 						"POST %s -> 201 Created but with no Location header, which 2030.5 requires "+
-							"on a 201", e.Req.Target)
+							"on a 201", e.Req.Target), retry)
 				default:
-					return citeExchange(t, ex, certify.Pass,
+					return annotate(citeExchange(t, ex, certify.Pass,
 						"POST %s carrying a complete LogEvent -> 201 Created, Location: %s",
-						e.Req.Target, loc)
+						e.Req.Target, loc), retry)
 				}
+			}
+			if len(unanswered) > 0 {
+				return citeMessage(t, unanswered[0], certify.Fail, "the LogEvent POST was never answered")
 			}
 			return unavailable("the recovered transcript holds no LogEvent POST from the DUT")
 		},
 		Server: logEventsPostedFinding(o),
 	}
+}
+
+// retriedAfterNote is critLogEventPosted's citation-detail sentence for the
+// dead attempt(s) that preceded the LogEvent POST actually being graded. A
+// pooled HTTP/1.1 connection idle-closed by gridsim, reused by the DUT
+// anyway, and answered with an immediate RST is not a defect — reusing a
+// connection, hitting that race, and retrying on a fresh one is exactly what
+// a mainstream HTTP/1.1 client (Go's net/http.Transport among them) does —
+// so it is recorded here as observed retry behavior, not folded into the
+// verdict of the attempt that DID get answered. Empty when nothing was ever
+// left unanswered before the cited attempt.
+func retriedAfterNote(unanswered []*Message) string {
+	if len(unanswered) == 0 {
+		return ""
+	}
+	plural := ""
+	if len(unanswered) > 1 {
+		plural = "s"
+	}
+	return fmt.Sprintf(". Before this, %d earlier LogEvent POST attempt%s on a separate connection this "+
+		"case owns went unanswered — a pooled connection gridsim had already idle-closed, answered with an "+
+		"immediate RST, which the DUT retried on a fresh connection: ordinary HTTP/1.1 client behavior after "+
+		"an idle-close race, not a defect", len(unanswered), plural)
 }
 
 // answerTo recovers the HTTP response that answered req, searching every
