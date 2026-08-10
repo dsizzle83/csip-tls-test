@@ -28,17 +28,75 @@ import (
 	"csip-tls-test/internal/certify"
 )
 
-// defaultWait is how long a check waits for the DUT's next poll cycle by
-// default. IEEE 2030.5 §10.2.3 lets a non-subscribing client poll as slowly as
-// every 15 minutes, so this default is NOT enough for a DUT at the slow end —
-// it is chosen to fit inside the runner's default 3-minute per-check timeout so
-// that a misconfigured run fails fast and visibly instead of hanging.
+// defaultWait is the FLOOR of the poll-cycle wait, and the fallback when the
+// cadence the DUT actually keeps cannot be read at all.
 //
-// A real campaign raises both: `-timeout 20m -param csip.wait=16m`.
+// It used to be the wait, flat, for every row in this suite — and a constant is
+// the wrong shape for this number twice over. IEEE 2030.5 §10.2.3 lets a
+// non-subscribing client poll as slowly as every 15 minutes, so 90 s is nowhere
+// near enough for a DUT at the slow end; and against the bench's own 60 s
+// advertisement it is 1.5 periods, which is not margin, it is a coin toss. The
+// 2026-08-07 WAN/LAN split soak is the record of what that costs: nine cycles,
+// 0-3 FAILs each, flapping across a different handful of BASIC event rows every
+// cycle, every one of them "gridsim's request log records no GET /dcap from the
+// DUT in this window". None of those was a fact about the DUT.
+//
+// So the default is now DERIVED from the cadence (see fetchWait) and this is
+// only its floor: a wait shorter than 90 s buys nothing and a run whose cadence
+// cannot be read at all still fails fast and visibly rather than hanging.
 const defaultWait = 90 * time.Second
 
-// waitParam is the operator override for the poll-cycle wait.
+// waitParam is the operator override for the poll-cycle wait. It outranks the
+// derivation entirely — see fetchWait.
 const waitParam = "csip.wait"
+
+// waitPeriods, waitSlack and waitCap shape the derived default.
+//
+// TWO periods, not one, is the whole point: a period that has just elapsed when
+// the window opens leaves a whole one inside it, so the wait no longer depends
+// on where the run happens to start relative to the DUT's own poll boundary.
+// The slack on top absorbs walk duration and RTT jitter (8-40 ms on the bench's
+// WiFi leg, and a walk is dozens of round trips).
+//
+// waitCap exists because the derivation must not be allowed to run away. A
+// 2030.5 server may advertise the §10.2.3 maximum of 900 s, and 2x900+30 is
+// half an hour PER ROW — a suite run that would never finish. Past the cap the
+// honest answer is not a longer default but an operator who has decided to
+// spend the time, which is what -param csip.wait is for; the explanation says
+// so in as many words when the cap bites.
+const (
+	waitPeriods = 2
+	waitSlack   = 30 * time.Second
+	waitCap     = 5 * time.Minute
+)
+
+// dutNorthboundConfig and dutDiscoveryField are where the DUT records the FLOOR
+// beneath the advertised rate.
+//
+// The DUT ships in poll_rate_mode "honor": it paces its walk at whatever
+// pollRate the server advertises but never polls faster than its own configured
+// interval, so the cadence a window has to span is max(advertised, this) — the
+// two rules in the order the DUT applies them. Deriving from either alone is a
+// way to wait the wrong amount of time, and the bench has been bitten by both
+// directions (see certify.ObservationWait's doc).
+const (
+	dutNorthboundConfig = "/etc/lexa/northbound.json"
+	dutDiscoveryField   = "discovery_interval_s"
+)
+
+// waitBudgetReserve is what fetchWait keeps back from the check's own -timeout
+// for everything in the live phase that is not a poll-cycle wait: the baseline
+// and post-wait snapshots, the subscription read the notification claim needs,
+// the PostWait probe, and the admin round-trips Setup and Change make.
+//
+// Without it, widening the default would trade one bench artefact for another:
+// a check killed by -timeout produces no criteria at all, which is a worse
+// bundle than a check whose window was slightly too short.
+const waitBudgetReserve = 45 * time.Second
+
+// waitWhyParam records the derivation in the observation's params, so the
+// number travels with the evidence and not only with the run log.
+const waitWhyParam = "csip.wait_derivation"
 
 // changeSettle is how long a check keeps observing after it makes the
 // procedure's post-subscription change. A Notification is dispatched
@@ -72,6 +130,141 @@ const endpointClaimReason = "the DUT dials OUT to the bench's 2030.5 server, so 
 	"the endpoint is the gridsim simulator and the gateway under test is its only client; it would NOT be " +
 	"sound if a second conformance run were driving the same simulator concurrently, which is why live runs " +
 	"in this campaign are serialized"
+
+// fetchWait decides how long this check's live phase gives the DUT to poll, and
+// returns the sentence that tells a bundle reader why the window was that wide.
+//
+// The precedence, and why the order is not arbitrary:
+//
+//  1. `-param csip.wait` is used EXACTLY as given — not floored, not capped,
+//     not trimmed to fit -timeout. An operator who passes it has decided what
+//     their bench needs, and the long-window rows (BASIC-029, CORE-022,
+//     CORE-023) are run as separate invocations precisely so they can. A
+//     harness that "helpfully" shortened an 8-minute window an operator asked
+//     for would silently invalidate the run they were paying for.
+//  2. A spec that names its own Wait keeps it, for the same reason.
+//  3. Otherwise the wait is derived from the cadence the DUT actually keeps —
+//     max(the pollRate gridsim advertises, the DUT's own configured floor),
+//     which is what a poll_rate_mode "honor" client does — as
+//     waitPeriods x cadence + waitSlack, floored at defaultWait and capped at
+//     waitCap. certify.ObservationWait is the shared implementation of that
+//     rule and of the sentence naming which source won; this suite supplies
+//     the shape (2 periods, 30 s, [90 s, 5 m]) and the config location.
+//  4. A DERIVED wait is then trimmed, if it must be, to fit the check's own
+//     -timeout — but never below defaultWait, so this can never produce a
+//     window narrower than the fixed 90 s it replaced.
+func fetchWait(ctx context.Context, rc *certify.RunCtx, s spec) (time.Duration, string) {
+	if v, ok := rc.Param(waitParam); ok {
+		d, err := time.ParseDuration(v)
+		switch {
+		case err != nil:
+			rc.Logf("ignoring -param %s=%q: %v", waitParam, v, err)
+		case d <= 0:
+			rc.Logf("ignoring -param %s=%q: %s is not a positive duration", waitParam, v, d)
+		default:
+			return d, fmt.Sprintf("%s, set explicitly with -param %s=%s. An operator's own value is used "+
+				"verbatim: it is neither raised to the %s floor, nor capped at %s, nor trimmed to fit the "+
+				"check's -timeout", d, waitParam, v, defaultWait, waitCap)
+		}
+	}
+	if s.Wait > 0 {
+		return s.Wait, fmt.Sprintf("%s, fixed by this test case's own spec rather than derived from the "+
+			"cadence", s.Wait)
+	}
+
+	wait, why := rc.ObservationWait(ctx, certify.ObservationSpec{
+		What:       "IEEE 2030.5 discovery interval",
+		ConfigPath: dutNorthboundConfig,
+		Field:      dutDiscoveryField,
+		// This is the northbound walk, whose rate the SERVER sets. Leaving this
+		// false would derive every window in this suite from a FLOOR the DUT is
+		// entitled to poll more slowly than.
+		ServerPollRate: true,
+		Fallback:       defaultWait,
+		Periods:        waitPeriods,
+		Slack:          waitSlack,
+		Min:            defaultWait,
+		Max:            waitCap,
+		// Param is deliberately empty: the operator override is handled above,
+		// so that it can bypass the deadline trim below. Passing it here would
+		// return the operator's value through the clamping path instead.
+		Param: "",
+	})
+
+	fitted, trim := fitWaitToBudget(wait, deadlineRemaining(ctx), liveOverhead(s), waitSlots(s))
+	if trim != "" {
+		why += " — " + trim
+	}
+	return fitted, why
+}
+
+// waitSlots reports how many FULL poll-cycle waits this spec's live phase
+// performs. Most rows wait once, for the DUT to fetch what Setup published; the
+// rows whose post-subscription change is something the DUT must FETCH rather
+// than merely ANSWER ask for a second full cycle (changeWaitFullCycle), and
+// those two waits share one -timeout.
+func waitSlots(s spec) int {
+	if s.Change != nil && s.ChangeWait == changeWaitFullCycle {
+		return 2
+	}
+	return 1
+}
+
+// liveOverhead estimates everything in the live phase that is not a full
+// poll-cycle wait, so the budget arithmetic is about the time actually left.
+func liveOverhead(s spec) time.Duration {
+	over := waitBudgetReserve
+	if s.Change != nil && s.ChangeWait >= 0 {
+		if s.ChangeWait > 0 {
+			over += s.ChangeWait
+		} else {
+			over += changeSettle
+		}
+	}
+	return over
+}
+
+// deadlineRemaining is how much of the check's own -timeout is left, or 0 when
+// the check is running without one (a unit test, or a runner with no timeout),
+// in which case there is no budget to fit into.
+func deadlineRemaining(ctx context.Context) time.Duration {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	if left := time.Until(dl); left > 0 {
+		return left
+	}
+	return 0
+}
+
+// fitWaitToBudget trims a DERIVED wait so that the slots that have to share the
+// check's remaining -timeout still fit inside it, and returns the sentence
+// saying so — or "" when the derivation was affordable as it stood.
+//
+// It never trims below defaultWait. That floor is what makes this change
+// strictly safe: whatever the budget says, the window is at least the fixed
+// 90 s it replaced, so a check that fits today still fits. A spec whose two
+// full cycles cannot fit even at the floor is a run whose -timeout was already
+// too small for it before this derivation existed.
+func fitWaitToBudget(wait, remaining, overhead time.Duration, slots int) (time.Duration, string) {
+	if remaining <= 0 || slots <= 0 {
+		return wait, ""
+	}
+	perSlot := (remaining - overhead) / time.Duration(slots)
+	if perSlot < defaultWait {
+		perSlot = defaultWait
+	}
+	if perSlot >= wait {
+		return wait, ""
+	}
+	return perSlot, fmt.Sprintf("the derivation asked for %s, and this check has %s of its -timeout left to "+
+		"spend across %d full poll-cycle wait(s) plus about %s of other live-phase work, so the wait is the "+
+		"%s that fits and NOT the %d periods the cadence asks for. A window this check chose for its own "+
+		"deadline rather than for the DUT's cadence is weaker evidence: raise -timeout, or set -param %s "+
+		"explicitly, to get the derived window", wait, remaining.Round(time.Second), slots,
+		overhead.Round(time.Second), perSlot.Round(time.Second), waitPeriods, waitParam)
+}
 
 // spec declares one check's live phase and its pass criteria.
 // specWant returns the wait predicate for this run, or nil when the spec has no
@@ -195,17 +388,12 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 		}
 	}
 
-	wait := s.Wait
-	if wait == 0 {
-		wait = defaultWait
-	}
-	if v, ok := rc.Param(waitParam); ok {
-		if parsed, perr := time.ParseDuration(v); perr == nil {
-			wait = parsed
-		} else {
-			rc.Logf("ignoring -param %s=%q: %v", waitParam, v, perr)
-		}
-	}
+	// The wait is decided AFTER Setup, deliberately: Setup is what publishes the
+	// thing the DUT has to fetch, so the window that matters starts here, and
+	// the -timeout budget the derivation fits into is what Setup left behind.
+	wait, waitWhy := fetchWait(ctx, rc, s)
+	obs.Params[waitWhyParam] = waitWhy
+	rc.Logf("poll-cycle window for this check: %s", waitWhy)
 
 	var view ServerView
 	var waited time.Duration
@@ -276,6 +464,16 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 	notes := ""
 	if s.Notes != nil {
 		notes = s.Notes(obs)
+	}
+	// Every row's prose already says how long it waited; this says why that was
+	// the number. The pair is what makes an empty window interpretable — "no
+	// GET /dcap in 1m30s" is only a finding about the DUT if the reader can see
+	// that 1m30s was more than the cadence, and until 2026-08-07 it was not.
+	if waitWhy != "" {
+		if notes != "" {
+			notes += "; "
+		}
+		notes += "poll-cycle window: " + waitWhy
 	}
 
 	return certify.Result{

@@ -1181,10 +1181,11 @@ func critMUPRegistered() criterion {
 // This predicate waits for BOTH things the check's criteria actually use, not
 // either alone:
 //
-//   - a fresh discovery walk (base.GETs(DiscoveryRoot)+1), the same guarantee
-//     AwaitWalk gave every other Setup-less row: it ensures the capture window
-//     always spans at least one /dcap exchange, which the DeviceCapability
-//     criterion above needs evidence from;
+//   - a fresh discovery walk (one /dcap GET beyond the baseline's SEQUENCE
+//     POSITION, not beyond its total — see ServerView.GETsSince), the same
+//     guarantee AwaitWalk gives every other Setup-less row: it ensures the
+//     capture window always spans at least one /dcap exchange, which the
+//     DeviceCapability criterion above needs evidence from;
 //   - ServerView.RegisteredMUP, the exact state critMUPRegistered's tier 3
 //     grades — an LFDI-bound MUP carrying a ReadingType. Requiring this HERE,
 //     in the wait, rather than only in the grading tier, is what makes the
@@ -1199,9 +1200,8 @@ func critMUPRegistered() criterion {
 // a per-run delta, so — unlike WantNewResponse's Response-log staleness bug —
 // there is nothing here for an earlier run's evidence to spuriously satisfy.
 func basicMUPWant(base ServerView) func(ServerView) bool {
-	wantWalk := base.GETs(DiscoveryRoot) + 1
 	return func(v ServerView) bool {
-		if v.GETs(DiscoveryRoot) < wantWalk {
+		if !v.PolledSince(base, DiscoveryRoot, 1) {
 			return false
 		}
 		_, ok := v.RegisteredMUP()

@@ -131,6 +131,16 @@ type AdminStatus struct {
 	Programs   []AdminProgram `json:"programs"`
 	ServerTime int64          `json:"server_time"`
 
+	// PID is the simulator process serving this view, and it is read for one
+	// reason: the request log's sequence numbers are only comparable WITHIN a
+	// process. A gridsim that restarted between a check's baseline and its next
+	// read starts counting from zero again, and arithmetic that assumed one
+	// monotonic sequence then compares two different number lines — which is
+	// how a restart became an out-of-range slice panic (see ringDelta). A
+	// gridsim predating this field reports 0, which reads as "unknown" and
+	// falls back to detecting the reset from the sequence itself.
+	PID int `json:"pid"`
+
 	// Fleet and Subscription are the two DER AGGREGATOR CLIENT capabilities the
 	// simulator can be started with. They are read, not assumed, and that is
 	// the whole point of them being on the wire: a run against a bench without
@@ -321,35 +331,179 @@ func (v ServerView) Since(base ServerView) ServerView {
 	out.LogEvents = v.LogEvents[min(len(base.LogEvents), len(v.LogEvents)):]
 	out.Notifications = v.Notifications[min(len(base.Notifications), len(v.Notifications)):]
 
+	reqs, _, gap := v.requestsSince(base)
+	out.Requests = reqs
+	if gap != "" {
+		out.RequestLogGap = gap
+		out.Errors = append(out.Errors, gap)
+	}
+	return out
+}
+
+// logReach says how far a request-log delta can be trusted. It exists because
+// "how many /dcap GETs arrived since the baseline" has three possible honest
+// answers and only one of them is a number.
+type logReach int
+
+const (
+	// logExact: every line written after the baseline is present. A count is
+	// the count.
+	logExact logReach = iota
+	// logPartial: lines were evicted, but everything still retained is strictly
+	// NEWER than the baseline. A count is therefore a LOWER BOUND — enough to
+	// prove the DUT did something, never enough to prove it did nothing.
+	logPartial
+	// logIncomparable: the sequence space changed under the check (the
+	// simulator restarted, or the admin API is answered by a different process
+	// than the one that served the baseline). The two reads are not positions
+	// on one number line, so no count relates them and none may be reported as
+	// though it did.
+	logIncomparable
+)
+
+// logPos is where one view's request-log read sits in the simulator's absolute,
+// append-only sequence — and which process's sequence it is.
+type logPos struct {
+	firstSeq uint64 // absolute sequence number of rawLines[0]
+	n        int    // how many lines were retained
+	pid      int    // the process that served them; 0 when it did not say
+}
+
+func (v ServerView) logPos() logPos {
+	return logPos{firstSeq: v.rawFirstSeq, n: len(v.rawLines), pid: v.Status.PID}
+}
+
+// ringDelta answers "which of cur's retained log lines arrived after base was
+// read", as an index into cur's lines, plus how far the answer can be trusted.
+//
+// All of the difficulty is that the simulator's log is a BOUNDED RING
+// (sim/simapi/logs.go, 4000 lines) read whole on every poll. The absolute
+// sequence numbers are what make the question answerable at all, and there are
+// exactly three positions the two reads can be in:
+//
+//  1. The ordinary one: the baseline's end is still inside cur's retained
+//     window, so the new lines are the ones past it. Note this holds whether or
+//     not the ring was ALREADY FULL when the baseline was taken — saturation
+//     moves firstSeq, and the arithmetic is in absolute sequence, so it simply
+//     does not care. That is the whole point of doing it this way, and the
+//     reason the old absolute-COUNT predicates broke: a saturated ring retains
+//     a constant number of /dcap lines forever, so "more /dcap than the
+//     baseline had" stops being reachable while the DUT polls perfectly.
+//  2. The ring wrapped past the baseline DURING the wait. Every line still
+//     retained is newer than the baseline — eviction only happens on append —
+//     so counting all of them is sound, but some new lines are gone, so the
+//     count under-reports: logPartial.
+//  3. The sequence went BACKWARDS, which cannot happen within one process.
+//     Either gridsim restarted or the admin API is being answered by a
+//     different process than the one that served the baseline (the
+//     orphan-and-replacement shape certify's preflight warns about). Its log
+//     may hold traffic that predates this check entirely, so counting it would
+//     manufacture evidence: logIncomparable.
+//
+// A declared PID that CHANGED is case 3 on its own authority, without waiting
+// for the sequence to betray it — a replacement process that had already logged
+// more lines than the original would otherwise look like ordinary progress.
+func ringDelta(base, cur logPos) (int, logReach, string) {
+	baseEnd := base.firstSeq + uint64(base.n)
+	curEnd := cur.firstSeq + uint64(cur.n)
+
+	if base.pid != 0 && cur.pid != 0 && base.pid != cur.pid {
+		return 0, logIncomparable, fmt.Sprintf("the 2030.5 simulator serving this check changed process "+
+			"between the baseline and this read (pid %d, was pid %d): its request log is a different "+
+			"sequence entirely, so nothing in it can be dated relative to this check's baseline and it is "+
+			"not evidence about this window either way", cur.pid, base.pid)
+	}
+	if curEnd < baseEnd {
+		return 0, logIncomparable, fmt.Sprintf("the 2030.5 simulator's request log went BACKWARDS between "+
+			"the baseline and this read (its sequence ended at %d, having reached %d), which one process "+
+			"cannot do: it restarted, or a different process is answering. Its log cannot be dated relative "+
+			"to this check's baseline", curEnd, baseEnd)
+	}
+	if cur.firstSeq > baseEnd {
+		return 0, logPartial, fmt.Sprintf("the simulator's request log evicted %d line(s) between the "+
+			"baseline and this read, so this window cannot be fully reconstructed; what remains is all "+
+			"newer than the baseline, so treat the request list as INCOMPLETE rather than as evidence the "+
+			"DUT was idle", cur.firstSeq-baseEnd)
+	}
+	// base.firstSeq <= baseEnd <= curEnd and cur.firstSeq <= baseEnd, so the
+	// offset is inside [0, cur.n] and the slice below cannot go out of range.
+	// The old code computed this same offset without the two guards above and
+	// panicked outright on a restart.
+	return int(baseEnd - cur.firstSeq), logExact, ""
+}
+
+// requestsSince returns the request-log entries v recorded after base was read,
+// how far that answer can be trusted, and the sentence explaining any shortfall.
+//
+// It is the ONE implementation of the delta: ServerView.Since renders it into a
+// window's Requests, and GETsSince counts it for the wait predicates. They used
+// to disagree — Since was sequence-aware from the day the ring bug was found,
+// while the predicates went on comparing absolute counts — and that disagreement
+// is exactly the defect this closes.
+func (v ServerView) requestsSince(base ServerView) ([]ServerRequest, logReach, string) {
 	switch {
 	case len(v.rawLines) == 0 && len(base.rawLines) == 0:
 		// Neither view came from a log read: Requests were supplied directly
 		// (a synthetic view, or a test fixture). There is no ring involved, so
 		// the slice really is append-only and the length delta is exact.
-		out.Requests = v.Requests[min(len(base.Requests), len(v.Requests)):]
+		return v.Requests[min(len(base.Requests), len(v.Requests)):], logExact, ""
 	case v.logApproximate || base.logApproximate:
 		// No cursor available. Fall back to the old length delta, but say so:
 		// this is the mode that can silently under-report.
-		out.Requests = v.Requests[min(len(base.Requests), len(v.Requests)):]
-		out.RequestLogGap = "the request-log delta is approximate: the simulator served no cursor endpoint " +
-			"(/admin/logs.json), so entries evicted from its ring are invisible here and this view may " +
-			"under-report what the DUT did"
-		out.Errors = append(out.Errors, out.RequestLogGap)
-	case base.rawFirstSeq+uint64(len(base.rawLines)) < v.rawFirstSeq:
-		// The baseline's position fell out of the ring before we read again.
-		// The window is genuinely unobservable; saying "nothing happened"
-		// would be the false-FAIL bug all over again.
-		lost := v.rawFirstSeq - (base.rawFirstSeq + uint64(len(base.rawLines)))
-		out.Requests = parseRequestLog(v.rawLines)
-		out.RequestLogGap = fmt.Sprintf("the simulator's request log evicted %d line(s) between the "+
-			"baseline and this read, so this window cannot be reconstructed; treat the request list as "+
-			"incomplete rather than as evidence the DUT was idle", lost)
-		out.Errors = append(out.Errors, out.RequestLogGap)
-	default:
-		baseEnd := base.rawFirstSeq + uint64(len(base.rawLines))
-		out.Requests = parseRequestLog(v.rawLines[baseEnd-v.rawFirstSeq:])
+		return v.Requests[min(len(base.Requests), len(v.Requests)):], logPartial,
+			"the request-log delta is approximate: the simulator served no cursor endpoint " +
+				"(/admin/logs.json), so entries evicted from its ring are invisible here and this view may " +
+				"under-report what the DUT did"
 	}
-	return out
+	lo, reach, gap := ringDelta(base.logPos(), v.logPos())
+	if reach == logIncomparable {
+		// Not "no requests" — requests that cannot be dated. Handing back the
+		// unrelated process's lines as though they were this window's is the
+		// one answer that would be worse than none.
+		return nil, reach, gap
+	}
+	return parseRequestLog(v.rawLines[lo:]), reach, gap
+}
+
+// GETsSince counts the GETs of path the simulator logged AFTER base was read,
+// and reports how far that count can be trusted.
+//
+// Use this, NOT GETs against a baseline count, for anything that decides
+// "has the DUT polled yet". GETs counts the whole retained ring, and on a ring
+// that has saturated — which gridsim's does within about two hours of walk
+// traffic, and it is not restarted between soak cycles — that total stops
+// growing while the DUT keeps polling perfectly. Every predicate written as
+// "v.GETs(p) >= base.GETs(p)+1" therefore becomes permanently unsatisfiable,
+// and the check burns its whole window and reports the DUT did nothing. That is
+// the 2026-08-07 soak's "gridsim's request log records no GET /dcap from the DUT
+// in this window", on rows whose DUT was polling on time throughout.
+func (v ServerView) GETsSince(base ServerView, path string) (int, logReach) {
+	reqs, reach, _ := v.requestsSince(base)
+	if reach == logIncomparable {
+		return 0, reach
+	}
+	n := 0
+	for _, r := range reqs {
+		if r.Method == "GET" && r.Path == path {
+			n++
+		}
+	}
+	return n, reach
+}
+
+// PolledSince reports whether the DUT made at least want GETs of path after
+// base was read — the shared spelling of "the DUT polled again", and the only
+// one the wait predicates should use.
+//
+// A count that cannot be dated to this check's baseline (logIncomparable) is
+// never "satisfied": a restarted simulator has lost whatever the check's Setup
+// published, so a predicate that closed the window on its traffic would be
+// reporting a poll for a change that no longer exists. The window stays open,
+// the run log carries the reason, and the criteria grade what is honestly
+// there — with RequestLogGap saying why it is thin.
+func (v ServerView) PolledSince(base ServerView, path string, want int) bool {
+	n, reach := v.GETsSince(base, path)
+	return reach != logIncomparable && n >= want
 }
 
 // ResponsesFor returns the Responses whose subject is the given mRID.
@@ -1018,13 +1172,19 @@ func (d *Driver) Await(ctx context.Context, timeout time.Duration, want func(Ser
 // AwaitWalk waits for the DUT to complete at least one fresh discovery walk,
 // detected as a new GET of the discovery root in gridsim's request log.
 //
-// The request log is a bounded ring (400 lines) and one walk produces dozens of
-// lines, so on a busy bench the baseline can roll out from under this. That is
-// why the predicate is "strictly more /dcap GETs than the baseline" rather than
-// an exact count: an undercount makes the check wait longer, never pass early.
+// "New" is decided by SEQUENCE POSITION, not by comparing totals. gridsim's
+// request log is a bounded ring (sim/simapi/logs.go, 4000 lines) read whole on
+// every poll, and one walk is dozens of lines, so on a bench that has been
+// running for a couple of hours the ring is permanently saturated: the number
+// of /dcap lines it retains stops growing no matter how faithfully the DUT
+// polls. This predicate used to read "strictly more /dcap GETs than the
+// baseline had", which on a saturated ring is a condition that can never come
+// true again — every row using it then waited out its entire window and
+// reported that the DUT had not polled. See GETsSince.
 func (d *Driver) AwaitWalk(ctx context.Context, base ServerView, timeout time.Duration) (ServerView, time.Duration, bool) {
-	want := base.GETs(DiscoveryRoot) + 1
-	return d.Await(ctx, timeout, func(v ServerView) bool { return v.GETs(DiscoveryRoot) >= want })
+	return d.Await(ctx, timeout, func(v ServerView) bool {
+		return v.PolledSince(base, DiscoveryRoot, 1)
+	})
 }
 
 // DiscoveryRoot is the only path a 2030.5 client may hard-code; every other URL

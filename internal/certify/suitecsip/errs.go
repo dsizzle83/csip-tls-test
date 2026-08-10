@@ -49,10 +49,12 @@ func errRedirect(ctx context.Context, rc *certify.RunCtx) (certify.Result, error
 		},
 		Cleanup: func(ctx context.Context, d *Driver) { _ = d.ClearRedirect(ctx) },
 		Want: func(base ServerView) func(ServerView) bool {
-			// Two more GETs of the root than the baseline: the one that gets
-			// redirected, and the follow.
-			want := base.GETs(DiscoveryRoot) + 2
-			return func(v ServerView) bool { return v.GETs(DiscoveryRoot) >= want }
+			// Two GETs of the root beyond the baseline: the one that gets
+			// redirected, and the follow. Counted by sequence position rather
+			// than against the baseline's total, or a saturated request ring
+			// makes this unsatisfiable while the DUT does exactly the right
+			// thing — see ServerView.GETsSince.
+			return func(v ServerView) bool { return v.PolledSince(base, DiscoveryRoot, 2) }
 		},
 		Notes: func(o *Observation) string {
 			return fmt.Sprintf("armed a single 302 on %s with Location pointing back at it, over TLS per the "+
