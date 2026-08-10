@@ -26,6 +26,27 @@
 // capture handle is open. A short settle delay follows for good measure. If
 // that never happens, Start fails loudly rather than letting a test run against
 // a capture that is not running.
+//
+// # More than one interface
+//
+// A split bench puts the northbound conversation on one NIC and the southbound
+// one on another, and a run that captures only the WAN side cannot cite a
+// single southbound frame — the rows that rest on southbound observables become
+// unmeasurable rather than failing, which is the worst of the three outcomes.
+// The interface argument therefore accepts a comma-separated list
+// ("wlp2s0,enp1s0"), which becomes a repeated -i on the dumpcap command line
+// and ONE pcapng carrying an Interface Description Block per NIC. Frames keep
+// their interface id and their own link type, so the reader and the frame
+// dissector need no special case (pcapng.Packet.Interface / .LinkType), and
+// frame numbering — the citation key for the whole engine — stays a single
+// sequence over the single file, exactly as Wireshark numbers it.
+//
+// tcpdump cannot do this: it takes one -i, and given two it silently uses the
+// last, which would produce a capture that looks complete and is missing half
+// the evidence. The comma form is refused outright when tcpdump is the detected
+// tool. The obvious workaround — capture 'any' — is worse than refusing: the
+// Linux cooked link type it yields discards the Ethernet header the dissector
+// needs, so it would trade missing frames for undissectable ones.
 package capture
 
 import (
@@ -97,9 +118,14 @@ func toolVersion(name, path string) string {
 // Summary is the capture metadata an evidence bundle records. Every field is
 // something a reader of the bundle would otherwise have to take on trust.
 type Summary struct {
-	Tool        string    `json:"tool"`
-	ToolVersion string    `json:"tool_version"`
-	Command     []string  `json:"command"`
+	Tool        string   `json:"tool"`
+	ToolVersion string   `json:"tool_version"`
+	Command     []string `json:"command"`
+	// Interface is what was captured. A multi-interface capture records the
+	// comma-separated list it was given ("wlp2s0,enp1s0") rather than gaining a
+	// second field, so a bundle written before the split bench existed and a
+	// bundle written after it parse under the same schema, and SplitInterfaces
+	// recovers the names. Command is the ground truth either way.
 	Interface   string    `json:"interface"`
 	Filter      string    `json:"filter"`
 	Path        string    `json:"path"`
@@ -135,8 +161,10 @@ type Capture struct {
 	// bundle could be handed over.
 	Promiscuous bool
 
-	tool    Tool
-	iface   string
+	tool Tool
+	// ifaces is the interface list in the order it was given; length 1 is the
+	// ordinary case and produces exactly the command line it always did.
+	ifaces  []string
 	filter  string
 	outPath string
 
@@ -149,17 +177,83 @@ type Capture struct {
 	done    bool
 }
 
+// SplitInterfaces splits the comma-separated interface form into names,
+// ignoring surrounding whitespace and empty entries. It is the lenient reader
+// used to DESCRIBE a capture — a report line, a recorded Summary — where a
+// malformed spec should still print something rather than abort. New validates.
+func SplitInterfaces(spec string) []string {
+	var out []string
+	for _, f := range strings.Split(spec, ",") {
+		if name := strings.TrimSpace(f); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// parseInterfaces is the strict reader New uses.
+//
+// A duplicate is refused rather than deduplicated. dumpcap accepts the same
+// interface twice and dutifully records every frame twice, under two interface
+// ids; the reassembler would then see each segment as its own retransmission
+// and every "the alert is frame N" citation would have a twin. Silently
+// dropping the duplicate would be just as wrong: the operator asked for
+// something that cannot be honoured and should hear so.
+func parseInterfaces(spec string) ([]string, error) {
+	if strings.TrimSpace(spec) == "" {
+		return nil, errors.New("capture: no interface given")
+	}
+	var out []string
+	seen := make(map[string]bool)
+	for _, f := range strings.Split(spec, ",") {
+		name := strings.TrimSpace(f)
+		if name == "" {
+			return nil, fmt.Errorf("capture: interface list %q has an empty entry", spec)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("capture: interface %q appears twice in %q; capturing one "+
+				"interface twice records every frame twice, under two interface ids, and every "+
+				"frame citation in the bundle would then have an ambiguous twin", name, spec)
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+// checkToolInterfaces refuses a combination the tool cannot honour truthfully.
+// See the package doc: tcpdump given two -i flags uses the last one and says
+// nothing, which is a capture that looks whole and is half missing.
+func checkToolInterfaces(toolName string, ifaces []string) error {
+	if len(ifaces) < 2 || toolName == "dumpcap" {
+		return nil
+	}
+	return fmt.Errorf("capture: capturing %s at once requires dumpcap, but the tool found here is "+
+		"%s, which takes ONE interface and would silently record only the last of them. Install "+
+		"wireshark-common (dumpcap carries cap_net_raw), or run one leg per interface. Capturing "+
+		"'any' instead is not a substitute: its Linux cooked link type drops the Ethernet header "+
+		"the frame dissector needs", strings.Join(ifaces, " and "), toolName)
+}
+
 // New prepares a capture of iface, with an optional BPF filter, writing to
 // outPath. Nothing is executed until Start.
+//
+// iface is one interface name, or several separated by commas
+// ("wlp2s0,enp1s0") for a split bench whose northbound and southbound traffic
+// do not share a NIC. The multi-interface form needs dumpcap.
 func New(iface, bpfFilter, outPath string) (*Capture, error) {
-	if iface == "" {
-		return nil, errors.New("capture: no interface given")
+	ifaces, err := parseInterfaces(iface)
+	if err != nil {
+		return nil, err
 	}
 	if outPath == "" {
 		return nil, errors.New("capture: no output path given")
 	}
 	tool, err := Detect()
 	if err != nil {
+		return nil, err
+	}
+	if err := checkToolInterfaces(tool.Name, ifaces); err != nil {
 		return nil, err
 	}
 	if dir := filepath.Dir(outPath); dir != "" {
@@ -172,7 +266,7 @@ func New(iface, bpfFilter, outPath string) (*Capture, error) {
 		SettleDelay:  150 * time.Millisecond,
 		StopTimeout:  10 * time.Second,
 		tool:         tool,
-		iface:        iface,
+		ifaces:       ifaces,
 		filter:       bpfFilter,
 		outPath:      outPath,
 	}, nil
@@ -184,12 +278,29 @@ func (c *Capture) Tool() Tool { return c.tool }
 // Path returns the output file path.
 func (c *Capture) Path() string { return c.outPath }
 
+// Interfaces reports the interfaces this capture covers, in the order given.
+func (c *Capture) Interfaces() []string { return append([]string(nil), c.ifaces...) }
+
+// Interface is the recorded interface string: one name, or the comma-separated
+// list for a multi-interface capture. A single-interface capture returns
+// exactly the name it was given.
+func (c *Capture) Interface() string { return strings.Join(c.ifaces, ",") }
+
 // Args returns the argument vector, without executing anything. It is exported
 // so a bundle can record the exact command and a test can assert it.
+//
+// One -i per interface. With a single interface — every capture before the
+// split bench, and every ordinary one after it — the vector is character for
+// character what it always was, which matters because the recorded command line
+// is part of the bundle a reviewer diffs.
 func (c *Capture) Args() []string {
+	ifaceArgs := make([]string, 0, 2*len(c.ifaces))
+	for _, name := range c.ifaces {
+		ifaceArgs = append(ifaceArgs, "-i", name)
+	}
 	switch c.tool.Name {
 	case "dumpcap":
-		args := []string{"-i", c.iface, "-w", c.outPath, "-q"}
+		args := append(ifaceArgs, "-w", c.outPath, "-q")
 		if !c.Promiscuous {
 			args = append(args, "-p")
 		}
@@ -201,9 +312,12 @@ func (c *Capture) Args() []string {
 		}
 		return args
 	default: // tcpdump
+		// Multiple -i is rendered rather than hidden, so the recorded command
+		// matches the request; Start refuses to RUN it. See checkToolInterfaces.
+		//
 		// -U is packet-buffered output: without it tcpdump holds packets in a
 		// stdio buffer and a short capture can end up empty.
-		args := []string{"-i", c.iface, "-w", c.outPath, "-U", "-n"}
+		args := append(ifaceArgs, "-w", c.outPath, "-U", "-n")
 		if !c.Promiscuous {
 			args = append(args, "-p")
 		}
@@ -222,6 +336,12 @@ func (c *Capture) Command() []string { return append([]string{c.tool.Path}, c.Ar
 func (c *Capture) Start(ctx context.Context) error {
 	if c.running {
 		return errors.New("capture: already started")
+	}
+	// New refuses this combination, but a Capture can be built directly, and
+	// the one thing that must never happen is running it: tcpdump would exit 0
+	// having captured one of the two interfaces.
+	if err := checkToolInterfaces(c.tool.Name, c.ifaces); err != nil {
+		return err
 	}
 	// A stale file from a previous run would make the readiness check pass
 	// instantly and the capture would appear live before it was.
@@ -319,7 +439,7 @@ func (c *Capture) Stop() (Summary, error) {
 		Tool:        c.tool.Name,
 		ToolVersion: c.tool.Version,
 		Command:     c.Command(),
-		Interface:   c.iface,
+		Interface:   c.Interface(),
 		Filter:      c.filter,
 		Path:        c.outPath,
 		Started:     c.started,

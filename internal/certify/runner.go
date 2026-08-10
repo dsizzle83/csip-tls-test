@@ -43,6 +43,7 @@ import (
 	"csip-tls-test/internal/evidence/bundle"
 	"csip-tls-test/internal/evidence/capture"
 	"csip-tls-test/internal/evidence/keylog"
+	"csip-tls-test/internal/evidence/pcapng"
 )
 
 // ToolName identifies this runner in the bundle.
@@ -74,6 +75,15 @@ type Options struct {
 	DryRun bool
 
 	// Capture.
+	//
+	// Iface is the capture interface, or several separated by commas
+	// ("wlp2s0,enp1s0") when the bench is split — northbound on one NIC,
+	// southbound on another. One capture still covers the whole run and frame
+	// numbering stays a single sequence, so citations are unaffected; what
+	// changes is that a row resting on a southbound observable can be cited at
+	// all. Capturing only one side of a split bench does not make those rows
+	// FAIL, it makes them unmeasurable, which is harder to notice and worse.
+	// The multi-interface form needs dumpcap (see the capture package).
 	Iface string
 	// BPF is the capture filter. Empty captures everything on the interface,
 	// which is the safe default: a filter that excludes a frame the run needed
@@ -246,7 +256,9 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 		return nil
 	})
 	fs.BoolVar(&o.DryRun, "dry-run", o.DryRun, "list the cases that would run, and the coverage gaps, then exit")
-	fs.StringVar(&o.Iface, "iface", o.Iface, "capture interface")
+	fs.StringVar(&o.Iface, "iface", o.Iface,
+		"capture interface, or a comma-separated list for a split bench (wlp2s0,enp1s0); "+
+			"more than one needs dumpcap")
 	fs.StringVar(&o.BPF, "bpf", o.BPF, "capture filter (empty captures everything)")
 	fs.BoolVar(&o.NoCapture, "no-capture", o.NoCapture, "run without a packet capture (no wire citations are then possible)")
 	fs.StringVar(&o.KeyLogPath, "keylog", o.KeyLogPath, "NSS key log the suites export TLS secrets to")
@@ -660,7 +672,7 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 			Active: true, Path: capr.Path(), Interface: r.opts.Iface,
 			Filter: r.opts.BPF, Started: time.Now().UTC(), KeyLogPath: r.opts.KeyLogPath,
 		}
-		reporter.Line("capture live: %s -> %s", r.opts.Iface, capr.Path())
+		reporter.Line("capture live: %s -> %s", ifaceLabel(r.opts.Iface), capr.Path())
 	} else {
 		reporter.Line("capture DISABLED (-no-capture): no wire citation is possible in this run")
 	}
@@ -740,7 +752,7 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 				"the capture on %s recorded ZERO frames although %d check(s) executed and drove the wire; "+
 					"no citation in this bundle can be re-derived. Check the interface and the BPF filter (%s), "+
 					"and that the capture tool has permission to see the traffic",
-				r.opts.Iface, executedCount(rep), orNoFilter(r.opts.BPF)))
+				ifaceLabel(r.opts.Iface), executedCount(rep), orNoFilter(r.opts.BPF)))
 			reporter.Line("CAPTURE INTEGRITY: zero frames recorded while %d check(s) ran", executedCount(rep))
 		}
 	}
@@ -842,6 +854,73 @@ func entryUIDs(es []CoverageEntry) []string {
 		out[i] = e.UID
 	}
 	return out
+}
+
+// ifaceLabel renders the capture interface for a human.
+//
+// A single interface renders as itself — every report line and every bundle
+// string a reviewer may be diffing against an earlier run is unchanged. Only
+// the split-bench form gains words, because "wlp2s0,enp1s0" in a sentence about
+// "the capture interface" reads like one oddly-named NIC.
+func ifaceLabel(spec string) string {
+	names := capture.SplitInterfaces(spec)
+	if len(names) <= 1 {
+		return spec
+	}
+	return fmt.Sprintf("%s (%d interfaces, one capture)", strings.Join(names, " + "), len(names))
+}
+
+// interfaceCoverage reports a leg of a split capture that recorded nothing.
+//
+// This is the split-bench evidence gap in its new disguise. A run that captures
+// only one side does not FAIL: the rows resting on the other side's frames
+// simply find none and are downgraded for want of a citation, which reads like
+// sloppy checks and sends the reader to the wrong place entirely. So a silent
+// leg is named here, once, as a capture problem.
+//
+// The id-to-name mapping is dumpcap's: it writes one Interface Description
+// Block per -i, in the order given, so pcapng interface id N is the Nth name.
+// Where the file disagrees with that (fewer described interfaces than names
+// asked for) the message says so rather than guessing.
+func interfaceCoverage(spec string, pkts []pcapng.Packet) string {
+	names := capture.SplitInterfaces(spec)
+	if len(names) < 2 || len(pkts) == 0 {
+		// One interface has no coverage question to answer, and a capture with
+		// no frames at all is already reported, loudly, by the caller.
+		return ""
+	}
+	counts := make([]int, len(names))
+	beyond := 0
+	for _, p := range pkts {
+		if p.Interface >= 0 && p.Interface < len(counts) {
+			counts[p.Interface]++
+			continue
+		}
+		beyond++
+	}
+	var silent []string
+	for i, n := range counts {
+		if n == 0 {
+			silent = append(silent, names[i])
+		}
+	}
+	if len(silent) == 0 {
+		return ""
+	}
+	per := make([]string, len(names))
+	for i, n := range counts {
+		per[i] = fmt.Sprintf("%s=%d", names[i], n)
+	}
+	msg := fmt.Sprintf("the capture covered %s but recorded ZERO frames on %s (frames per interface: %s). "+
+		"Every citation that rests on that leg's traffic is unavailable, and the cases resting on it will "+
+		"read as uncited rather than failed. Check that the interface is up and carrying the leg's traffic, "+
+		"and that the BPF filter can match on it",
+		strings.Join(names, " + "), strings.Join(silent, " and "), strings.Join(per, ", "))
+	if beyond > 0 {
+		msg += fmt.Sprintf(". %d frame(s) name an interface id beyond the %d requested, so the "+
+			"id-to-name mapping above may not be the capture's", beyond, len(names))
+	}
+	return msg
 }
 
 // newCapturer builds the real capture, or returns the injected one.
@@ -951,6 +1030,10 @@ func (r *Runner) cite(ctx context.Context, rep *RunReport, windows []*Window, pa
 		return err
 	}
 	rep.CaptureProblems = append(rep.CaptureProblems, fi.Problems...)
+	if msg := interfaceCoverage(r.opts.Iface, fi.Packets()); msg != "" {
+		rep.CaptureProblems = append(rep.CaptureProblems, msg)
+		reporter.Line("CAPTURE INTEGRITY: %s", msg)
+	}
 	att := fi.Attribute(windows)
 	rep.Attribution = att
 	// A genuine reuse ambiguity (see window.go's markAmbiguous) is folded into

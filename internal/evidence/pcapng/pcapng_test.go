@@ -58,9 +58,17 @@ func (b *ngBuilder) shb() {
 	b.block(blockSectionHeader, body)
 }
 
-// idb writes an Interface Description Block. tsresol < 0 omits the option, so
-// the reader must fall back to the microsecond default.
+// idb writes an Interface Description Block for "lo". tsresol < 0 omits the
+// option, so the reader must fall back to the microsecond default.
 func (b *ngBuilder) idb(linkType uint16, snaplen uint32, tsresol int) {
+	b.idbNamed(linkType, snaplen, tsresol, "lo")
+}
+
+// idbNamed writes an Interface Description Block carrying an if_name. A pcapng
+// may describe SEVERAL interfaces, each with its own link type and timestamp
+// resolution, and every packet names the one it arrived on — which is what
+// `dumpcap -i A -i B` produces for a split bench.
+func (b *ngBuilder) idbNamed(linkType uint16, snaplen uint32, tsresol int, name string) {
 	body := append([]byte(nil), b.u16(linkType)...)
 	body = append(body, b.u16(0)...) // reserved
 	body = append(body, b.u32(snaplen)...)
@@ -70,8 +78,11 @@ func (b *ngBuilder) idb(linkType uint16, snaplen uint32, tsresol int) {
 		body = append(body, byte(tsresol), 0, 0, 0)
 	}
 	body = append(body, b.u16(optIfName)...)
-	body = append(body, b.u16(2)...)
-	body = append(body, 'l', 'o', 0, 0)
+	body = append(body, b.u16(uint16(len(name)))...)
+	body = append(body, name...)
+	for len(body)%4 != 0 {
+		body = append(body, 0)
+	}
 	body = append(body, b.u16(optEndOfOpt)...)
 	body = append(body, b.u16(0)...)
 	b.block(blockInterfaceDesc, body)
@@ -258,6 +269,75 @@ func TestPcapngMultipleSections(t *testing.T) {
 	}
 	if pkts[1].Index != 2 {
 		t.Errorf("second section's packet has Index %d, want 2 (numbering is per file, not per section)", pkts[1].Index)
+	}
+}
+
+// TestPcapngMultipleInterfaces is the split-bench capture in miniature: one
+// section, one packet sequence, TWO Interface Description Blocks, with frames
+// interleaved between them.
+//
+// A reader that latched onto the FIRST interface — a plausible shortcut, since
+// every capture before the split bench had exactly one — would dissect the
+// second NIC's frames under the first NIC's link type and scale their
+// timestamps by the first NIC's resolution. Both failures are silent: the
+// frames still parse, they are simply wrong. So the fixture makes the two
+// interfaces disagree on both axes, and asserts each frame got its own.
+func TestPcapngMultipleInterfaces(t *testing.T) {
+	for _, bo := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		b := newNG(bo)
+		b.shb()
+		// 0: the northbound NIC — Ethernet, microsecond ticks.
+		b.idbNamed(1 /* Ethernet */, 262144, 6, "wlp2s0")
+		// 1: the southbound NIC — a different link type and nanosecond ticks.
+		b.idbNamed(113 /* Linux SLL */, 262144, 9, "enp1s0")
+		b.epb(0, 1_700_000_000_000_000, []byte("north-one"), 9)
+		b.epb(1, 1_700_000_000_000_000_000, []byte("south-one"), 9)
+		b.epb(0, 1_700_000_000_250_000, []byte("north-two"), 9)
+		b.epb(1, 1_700_000_000_500_000_000, []byte("south-two"), 9)
+
+		pkts, err := readAllBytes(t, b.bytes())
+		if err != nil {
+			t.Fatalf("%v: ReadAll: %v", bo, err)
+		}
+		if len(pkts) != 4 {
+			t.Fatalf("%v: got %d packets, want 4", bo, len(pkts))
+		}
+
+		for i, want := range []struct {
+			iface    int
+			linkType uint16
+			data     string
+			ts       time.Time
+		}{
+			{0, 1, "north-one", time.Unix(1_700_000_000, 0).UTC()},
+			{1, 113, "south-one", time.Unix(1_700_000_000, 0).UTC()},
+			{0, 1, "north-two", time.Unix(1_700_000_000, 250_000_000).UTC()},
+			{1, 113, "south-two", time.Unix(1_700_000_000, 500_000_000).UTC()},
+		} {
+			p := pkts[i]
+			if p.Interface != want.iface {
+				t.Errorf("%v: frame %d Interface = %d, want %d", bo, p.Index, p.Interface, want.iface)
+			}
+			if p.LinkType != want.linkType {
+				t.Errorf("%v: frame %d LinkType = %d, want %d — the frame was dissected as the "+
+					"WRONG interface's link type", bo, p.Index, p.LinkType, want.linkType)
+			}
+			if string(p.Data) != want.data {
+				t.Errorf("%v: frame %d data = %q, want %q", bo, p.Index, p.Data, want.data)
+			}
+			// The resolutions differ by a thousand: reading the ticks of one
+			// interface at the other's if_tsresol is off by 1000x, not subtly.
+			if !p.Time.Equal(want.ts) {
+				t.Errorf("%v: frame %d Time = %v, want %v — the timestamp was scaled by the "+
+					"wrong interface's if_tsresol", bo, p.Index, p.Time, want.ts)
+			}
+			// Frame numbering stays ONE sequence over the file, whatever the
+			// interface: it is the citation key the whole bundle rests on, and
+			// Wireshark numbers the same way.
+			if p.Index != i+1 {
+				t.Errorf("%v: frame %d has Index %d, want %d", bo, i, p.Index, i+1)
+			}
+		}
 	}
 }
 

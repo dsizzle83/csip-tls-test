@@ -65,7 +65,7 @@ func (r *Reporter) Header(run *Runner, rep *RunReport) {
 	if run != nil {
 		r.printf("DUT:          %s\n", orNone(run.opts.Targets.Gateway))
 		if !run.opts.NoCapture {
-			r.printf("Capture:      %s%s\n", run.opts.Iface, filterSuffix(run.opts.BPF))
+			r.printf("Capture:      %s%s\n", ifaceLabel(run.opts.Iface), filterSuffix(run.opts.BPF))
 		}
 		if run.opts.KeyLogPath != "" {
 			r.printf("Key log:      %s\n", run.opts.KeyLogPath)
@@ -380,8 +380,11 @@ func MarkdownSection(rep *RunReport) string {
 	fmt.Fprintf(&b, "**Catalog:** `%s`, sha256 `%s`, %d extracted test cases.\n",
 		rep.Catalog.Source, rep.Catalog.SHA256, rep.Catalog.Cases)
 	if rep.Capture.Path != "" {
+		// From the SUMMARY's interface, not the run's option: this is what the
+		// capture tool was actually invoked with, which is the fact a reader of
+		// the submitted section can check against the recorded command line.
 		fmt.Fprintf(&b, "**Capture:** `%s` — %d frames on %s.\n",
-			rep.Capture.Path, rep.Capture.Packets, rep.Capture.Interface)
+			rep.Capture.Path, rep.Capture.Packets, ifaceLabel(rep.Capture.Interface))
 	}
 	if rep.BundleDir != "" {
 		fmt.Fprintf(&b, "**Bundle:** `%s` (verify with `sha256sum -c MANIFEST.sha256` plus the "+

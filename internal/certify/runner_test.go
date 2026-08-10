@@ -965,3 +965,74 @@ func TestBundleCarriesTheRedactedInvocation(t *testing.T) {
 		t.Errorf("REPORT.md does not show the invocation:\n%s", report)
 	}
 }
+
+// TestIfaceLabel pins the rendering of the capture interface. A single
+// interface must render as itself, character for character: that string appears
+// in the run banner and in the markdown section, both of which are compared
+// against earlier runs.
+func TestIfaceLabel(t *testing.T) {
+	for _, tc := range []struct {
+		spec string
+		want string
+	}{
+		{"enp1s0", "enp1s0"},
+		{"lo", "lo"},
+		{"", ""},
+		{"wlp2s0,enp1s0", "wlp2s0 + enp1s0 (2 interfaces, one capture)"},
+		{" wlp2s0 , enp1s0 ", "wlp2s0 + enp1s0 (2 interfaces, one capture)"},
+	} {
+		if got := ifaceLabel(tc.spec); got != tc.want {
+			t.Errorf("ifaceLabel(%q) = %q, want %q", tc.spec, got, tc.want)
+		}
+	}
+}
+
+// TestInterfaceCoverage covers the split-bench evidence gap: a capture that
+// asked for two interfaces and heard from one. That is not a FAIL anywhere —
+// the rows resting on the silent leg simply find no frames — so it has to be
+// said out loud or it is invisible.
+func TestInterfaceCoverage(t *testing.T) {
+	on := func(ids ...int) []pcapng.Packet {
+		var out []pcapng.Packet
+		for i, id := range ids {
+			out = append(out, pcapng.Packet{Index: i + 1, Interface: id, LinkType: 1})
+		}
+		return out
+	}
+
+	// Both legs heard from: nothing to report.
+	if msg := interfaceCoverage("wlp2s0,enp1s0", on(0, 1, 0, 1)); msg != "" {
+		t.Errorf("a covered split capture reported a problem: %s", msg)
+	}
+	// A single-interface run has no coverage question to answer.
+	if msg := interfaceCoverage("enp1s0", on(0, 0)); msg != "" {
+		t.Errorf("a single-interface capture reported a problem: %s", msg)
+	}
+	// An empty capture is the caller's zero-frame case, reported there.
+	if msg := interfaceCoverage("wlp2s0,enp1s0", nil); msg != "" {
+		t.Errorf("an empty capture reported an interface problem: %s", msg)
+	}
+
+	// The southbound leg is silent — F5 exactly.
+	msg := interfaceCoverage("wlp2s0,enp1s0", on(0, 0, 0))
+	if msg == "" {
+		t.Fatal("a silent capture leg must be reported")
+	}
+	for _, want := range []string{"enp1s0", "ZERO", "wlp2s0=3", "enp1s0=0"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q does not mention %q", msg, want)
+		}
+	}
+	// It must not accuse the checks: the frames are missing, not the criteria.
+	if strings.Contains(msg, "FAIL") {
+		t.Errorf("the message reads as a verdict rather than a capture problem: %s", msg)
+	}
+
+	// A frame naming an interface beyond the ones asked for means the
+	// id-to-name mapping is not this capture's, and the message must hedge
+	// rather than name the wrong NIC with confidence.
+	msg = interfaceCoverage("wlp2s0,enp1s0", on(0, 0, 7))
+	if !strings.Contains(msg, "beyond the 2 requested") {
+		t.Errorf("message %q does not flag the unexpected interface id", msg)
+	}
+}
