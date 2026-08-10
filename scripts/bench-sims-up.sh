@@ -92,6 +92,34 @@ MODSIM3_API="${MODSIM3_API:-6041}"
 # a gridsim on the mbaps PKI (this script's -ca certs/mbaps) on a free port.
 GRIDSIM_PORT="${GRIDSIM_PORT:-11113}"
 GRIDSIM_ADMIN="${GRIDSIM_ADMIN:-11114}"
+# Bind hosts for the WAN/LAN split bench (2026-08-07): gridsim (northbound) can
+# be pinned to the desktop's WiFi address and mbapsdev (southbound) to the
+# ethernet address, so each protocol is reachable on exactly one segment.
+# MODSIM_BIND (also southbound) pins modsim/modsim2/modsim3 the same way as
+# mbapsdev — they share one var since all three plain inverters sit on the
+# same segment. Defaults preserve the historical wildcard binds.
+GRIDSIM_BIND="${GRIDSIM_BIND:-0.0.0.0}"
+MBAPS_BIND="${MBAPS_BIND:-}"
+MODSIM_BIND="${MODSIM_BIND:-}"
+# Conformance-evidence launches (2026-08-07): the keylog BUILDS of gridsim and
+# mbapsdev plus full-handshake posture. Without these a conformance leg runs
+# but every decryption/citation-dependent case collapses to SKIP/FAIL
+# (PREFLIGHT_2026-08-05 §2 rule 3; the 2026-08-07 cycle-01 lesson).
+#   GRIDSIM_BIN/MBAPS_BIN     e.g. ./bin/server-keylog / ./bin/mbapsdev-keylog
+#   SIMS_KEYLOG=<path>        append both sims' TLS secrets there (keylog builds only)
+#   GRIDSIM_NO_TICKETS=1      full mTLS handshake on every gateway dial
+#   GRIDSIM_IDLE_S=<s>        close idle CSIP sessions => one observable session per walk
+GRIDSIM_BIN="${GRIDSIM_BIN:-./bin/server}"
+MBAPS_BIN="${MBAPS_BIN:-./bin/mbapsdev}"
+SIMS_KEYLOG="${SIMS_KEYLOG:-}"
+GRIDSIM_NO_TICKETS="${GRIDSIM_NO_TICKETS:-}"
+GRIDSIM_IDLE_S="${GRIDSIM_IDLE_S:-}"
+#   GRIDSIM_POLL_S=<s>        advertise a uniform pollRate. WITHOUT this the
+#     built-ins apply (300 /dcap, 900 /tm, 60 control lists) and a
+#     poll_rate_mode=honor DUT paces its WHOLE walk at the slowest one (900 s),
+#     so every wait-for-fetch conformance case times out (2026-08-08 lesson:
+#     64/79 CSIP verdicts collapsed). Campaign posture: 60.
+GRIDSIM_POLL_S="${GRIDSIM_POLL_S:-}"
 # The NORTHBOUND half of the CTP Figure-15 fixture. Both default to ON at
 # SIM_FLEET=4 and OFF at SIM_FLEET=2, so the smoke-test pair keeps serving the
 # byte-identical single-EndDevice tree it always has. Set either to 0 to run a
@@ -144,17 +172,55 @@ for f in "$M/ca-cert.pem" "$M/dev-ca.pem" "$M/dev-server-cert.pem" "$M/dev-serve
   [ -r "$f" ] || { echo "FATAL: missing $f — run: make gen-mbaps-certs (ONCE)"; exit 1; }
 done
 
-port_pid(){ ss -ltnpH "sport = :$1" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2; }
+# port_holder PORT BIND — prints "PID ADDR" for a listener on PORT that would
+# actually conflict with a sim about to bind BIND, else prints nothing.
+#
+# A wildcard/unset BIND (empty, 0.0.0.0, *, ::, [::]) keeps the historical
+# behavior: ANY existing listener on PORT is a conflict, regardless of its
+# address (we're about to claim the whole port ourselves).
+#
+# A specific BIND (e.g. 192.168.0.188) only conflicts with a listener on that
+# SAME address or on a wildcard address — two sims bound to different
+# addresses of the same port coexist fine (the WAN/LAN split bench relies on
+# exactly this: a detector canary on 69.0.0.20:11113 must not block gridsim
+# from starting on 192.168.0.188:11113). Uses `ss -tlnpH` because, unlike a
+# port-only check, its Local-Address:Port column tells them apart.
+port_holder(){
+  local port="$1" bind="${2:-}" ss_out line addr pid
+  case "$bind" in
+    ""|0.0.0.0|"*"|"::"|"[::]") bind="";;
+  esac
+  ss_out="$(ss -tlnpH "sport = :$port" 2>/dev/null)" || true
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    addr="$(printf '%s\n' "$line" | awk '{print $4}')"
+    addr="${addr%:*}"; addr="${addr#\[}"; addr="${addr%\]}"
+    pid="$(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+    [ -n "$pid" ] || continue
+    if [ -z "$bind" ]; then
+      printf '%s %s\n' "$pid" "$addr"; return 0
+    fi
+    case "$addr" in
+      "$bind"|0.0.0.0|"*"|"::")
+        printf '%s %s\n' "$pid" "$addr"; return 0;;
+    esac
+  done <<EOF
+$ss_out
+EOF
+  return 0
+}
 
-start(){ # name port cmd...
-  local name="$1" port="$2"; shift 2
-  local pf="$LOG/$name.pid" holder
-  holder="$(port_pid "$port" || true)"
+start(){ # name port bind cmd...
+  local name="$1" port="$2" bind="$3"; shift 3
+  local pf="$LOG/$name.pid" holder holder_addr
+  holder="$(port_holder "$port" "$bind" || true)"
+  holder_addr="${holder#* }"
+  holder="${holder%% *}"
   if [ -n "$holder" ]; then
     if [ -f "$pf" ] && [ "$holder" = "$(cat "$pf" 2>/dev/null)" ]; then
       echo "  = $name already running (pid $holder, :$port)"; return
     fi
-    echo "  !! $name NOT started — :$port held by foreign pid $holder ($(ps -o args= -p "$holder" 2>/dev/null | cut -c1-60)). Free it (bench-sims-down.sh / stop the csip demo) or override the port."
+    echo "  !! $name NOT started — :$port held by foreign pid $holder on $holder_addr ($(ps -o args= -p "$holder" 2>/dev/null | cut -c1-60)). Free it (bench-sims-down.sh / stop the csip demo) or override the port."
     FAIL=1; return
   fi
   "$@" >"$LOG/$name.log" 2>&1 &
@@ -176,7 +242,10 @@ MBAPS_SERIAL="${MBAPS_SERIAL:-BENCH-MBAPS-01}"
 MODSIM2_SERIAL="${MODSIM2_SERIAL:-BENCH-MODSIM-02}"
 MODSIM3_SERIAL="${MODSIM3_SERIAL:-BENCH-MODSIM-03}"
 echo "Bringing up sims (logs in $LOG, fleet size $SIM_FLEET):"
-start modsim   "$MODSIM_PORT"  ./bin/modsim   -port "$MODSIM_PORT" -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM_SERIAL"
+MODSIM_ARGS=()
+[ -n "$MODSIM_BIND" ] && MODSIM_ARGS+=(-bind "$MODSIM_BIND")
+start modsim   "$MODSIM_PORT"  "$MODSIM_BIND" ./bin/modsim   -port "$MODSIM_PORT" -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM_SERIAL" \
+                 ${MODSIM_ARGS+"${MODSIM_ARGS[@]}"}
 # MBAPS_NO_TICKETS=1 forces every gateway southbound dial to be a FULL mTLS
 # handshake (mbapsdev -no-tickets). Leave it OFF for resumption-behaviour runs
 # (TCP-46); turn it ON for a conformance capture, so the gateway's client
@@ -185,7 +254,8 @@ start modsim   "$MODSIM_PORT"  ./bin/modsim   -port "$MODSIM_PORT" -advanced ${D
 # steady-state sessions RESUME and RBAC-011 has no client Certificate to cite.
 MBAPS_ARGS=()
 [ -n "${MBAPS_NO_TICKETS:-}" ] && [ "${MBAPS_NO_TICKETS}" != "0" ] && MBAPS_ARGS+=(-no-tickets)
-start mbapsdev "$MBAPS_PORT"   ./bin/mbapsdev -listen ":$MBAPS_PORT" -model inverter -wmax 6000 -serial "$MBAPS_SERIAL" \
+[ -n "$SIMS_KEYLOG" ] && MBAPS_ARGS+=(-keylog "$SIMS_KEYLOG")
+start mbapsdev "$MBAPS_PORT"   "$MBAPS_BIND" "$MBAPS_BIN" -listen "$MBAPS_BIND:$MBAPS_PORT" -model inverter -wmax 6000 -serial "$MBAPS_SERIAL" \
                  -ca "$M/dev-ca.pem" -cert "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem" \
                  ${MBAPS_ARGS+"${MBAPS_ARGS[@]}"}
 
@@ -200,10 +270,12 @@ if [ "$SIM_FLEET" = 4 ]; then
   # Mapping to the CTP's names (Figure 15), for the operator reading a log:
   #   EDA1 = modsim  :5020   EDA2 = modsim2 :5030
   #   EDB1 = modsim3 :5031   EDB2 = mbapsdev :8021
-  start modsim2 "$MODSIM2_PORT" ./bin/modsim -port "$MODSIM2_PORT" -api-port "$MODSIM2_API" \
-                 -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM2_SERIAL"
-  start modsim3 "$MODSIM3_PORT" ./bin/modsim -port "$MODSIM3_PORT" -api-port "$MODSIM3_API" \
-                 -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM3_SERIAL"
+  start modsim2 "$MODSIM2_PORT" "$MODSIM_BIND" ./bin/modsim -port "$MODSIM2_PORT" -api-port "$MODSIM2_API" \
+                 -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM2_SERIAL" \
+                 ${MODSIM_ARGS+"${MODSIM_ARGS[@]}"}
+  start modsim3 "$MODSIM3_PORT" "$MODSIM_BIND" ./bin/modsim -port "$MODSIM3_PORT" -api-port "$MODSIM3_API" \
+                 -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM3_SERIAL" \
+                 ${MODSIM_ARGS+"${MODSIM_ARGS[@]}"}
 fi
 GRIDSIM_ARGS=()
 [ "$GRIDSIM_FLEET" != 0 ] && GRIDSIM_ARGS+=(-fleet "$GRIDSIM_FLEET")
@@ -228,7 +300,11 @@ if [ "$GRIDSIM_SUBSCRIPTION" != 0 ]; then
     echo "    GRIDSIM_NOTIFY_CERT/GRIDSIM_NOTIFY_KEY, or use an http:// listener."
   fi
 fi
-start gridsim  "$GRIDSIM_PORT" ./bin/server   -listen "0.0.0.0:$GRIDSIM_PORT" -admin "0.0.0.0:$GRIDSIM_ADMIN" \
+[ -n "$SIMS_KEYLOG" ] && GRIDSIM_ARGS+=(-keylog "$SIMS_KEYLOG")
+[ -n "$GRIDSIM_NO_TICKETS" ] && [ "$GRIDSIM_NO_TICKETS" != 0 ] && GRIDSIM_ARGS+=(-no-tickets)
+[ -n "$GRIDSIM_IDLE_S" ] && GRIDSIM_ARGS+=(-idle-timeout-s "$GRIDSIM_IDLE_S")
+[ -n "$GRIDSIM_POLL_S" ] && GRIDSIM_ARGS+=(-poll-rate-s "$GRIDSIM_POLL_S")
+start gridsim  "$GRIDSIM_PORT" "$GRIDSIM_BIND" "$GRIDSIM_BIN" -listen "$GRIDSIM_BIND:$GRIDSIM_PORT" -admin "$GRIDSIM_BIND:$GRIDSIM_ADMIN" \
                  -ca "$M/ca-cert.pem" -cert-chain "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem" \
                  ${GRIDSIM_ARGS+"${GRIDSIM_ARGS[@]}"}
 

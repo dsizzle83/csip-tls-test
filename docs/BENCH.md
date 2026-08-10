@@ -278,3 +278,83 @@ lexa-api token above:
   `http://69.0.0.20:8080`; hub — `curl -sk https://69.0.0.2:9100/status` if auth is off,
   else add `-H "Authorization: Bearer $(ssh root@69.0.0.2 cat /etc/lexa/api.token)"`;
   `curl -sk https://69.0.0.2:9100/healthz` is always unauthenticated.
+
+---
+
+## WAN/LAN split bench — conformance-evidence posture (2026-08-07)
+
+> **This section is an overlay, not a rewrite of the flat bench above.** It
+> documents `csip-tls-test`'s own conformance-evidence rig
+> (`scripts/bench-sims-up.sh` + `bin/certify`) — different sims (gridsim
+> `:11113`/`:11114` on the mbaps PKI, mbapsdev, modsim), different ports, and
+> a different purpose from the lexa-hub demo bench documented above. Full
+> separation proof + 24 h soak this posture was proven under:
+> `~/projects/lexa-gw/docs/BENCH_WANLAN_SPLIT_SOAK_2026-08-10.md`. Evidence
+> root: **`runs/ethsplit-20260807/`** (§d below).
+
+### a. Split topology
+
+The gateway board and this desktop are now dual-homed, one segment per
+role — matching the field role model (PIVOT P2) for the first time on real
+hardware:
+
+| Role | Segment | Device | Desktop |
+|---|---|---|---|
+| **Northbound / WAN** — CSIP head-end (gridsim), mbaps server `:802`, telemetry | WiFi | `wlan0` **192.168.0.69** | `wlp2s0` **192.168.0.188** |
+| **Southbound / LAN + mgmt** — SSH, DER sims (modsim `:5020`, mbapsdev `:8021`) | Ethernet | `wan0` **69.0.0.2** | `enp1s0` **69.0.0.20** |
+
+Enforcement is bind + routing only (the bench kernel ships no netfilter):
+gridsim binds `192.168.0.188` only (`GRIDSIM_BIND`), mbapsdev binds
+`69.0.0.20` only (`MBAPS_BIND`) — see `scripts/bench-sims-up.sh`'s
+`GRIDSIM_BIND`/`MBAPS_BIND`/`MODSIM_BIND` block. The board's
+`mbaps.json`/`northbound.json`/`telemetry.json` mirror the split on its side
+(`listen=192.168.0.69:802` + `bind_interface=wlan0`; northbound/telemetry
+`server=192.168.0.188:11113`).
+
+### b. Evidence-grade sims launch
+
+Bringing up the sims for a citable capture is a specific env posture, not
+just `scripts/bench-sims-up.sh` with no arguments. One line, copy-pasteable:
+
+```bash
+GRIDSIM_BIN=./bin/server-keylog MBAPS_BIN=./bin/mbapsdev-keylog SIMS_KEYLOG=/tmp/bench-shared.keylog \
+GRIDSIM_NO_TICKETS=1 GRIDSIM_IDLE_S=30 GRIDSIM_POLL_S=60 MBAPS_NO_TICKETS=1 \
+GW_HOST=192.168.0.69 GRIDSIM_BIND=192.168.0.188 MBAPS_BIND=69.0.0.20 \
+scripts/bench-sims-up.sh
+```
+
+Every knob below is required — dropping any one doesn't fail loudly, it
+silently degrades some fraction of verdicts to SKIP/FAIL:
+
+| Knob | Why |
+|---|---|
+| `GRIDSIM_BIN=./bin/server-keylog`<br>`MBAPS_BIN=./bin/mbapsdev-keylog` | the **keylog builds**. Without them there is no `-keylog` flag to export TLS secrets, so captured traffic is undecryptable and every citation-dependent case has no transcript to cite from. |
+| `SIMS_KEYLOG=/tmp/bench-shared.keylog` | both sims append their TLS secrets to one file, so a single capture on either interface decrypts against it. |
+| `GRIDSIM_NO_TICKETS=1`<br>`MBAPS_NO_TICKETS=1` | forces a **full mTLS handshake on every gateway dial**. A resumed TLS 1.3 handshake carries no Certificate message (RFC 8446 §2.2) — without this, RBAC-011 and every other client-certificate citation is unavailable (`docs/PREFLIGHT_2026-08-05_flashed-image-campaign.md` §2 rule 3). |
+| `GRIDSIM_IDLE_S=30` | closes idle CSIP sessions, so each poll produces its own individually observable session instead of one long-lived session spanning the whole capture. |
+| `GRIDSIM_POLL_S=60` | advertises a **uniform pollRate**. Without it the built-ins apply (300 `/dcap`, 900 `/tm`, 60 control lists) and a `poll_rate_mode=honor` DUT paces its *whole* walk at the slowest one (900 s), so every wait-for-fetch case times out — 64/79 CSIP verdicts collapsed the one time this was skipped (`~/projects/lexa-gw/docs/BENCH_WANLAN_SPLIT_SOAK_2026-08-10.md` §4 item 1). |
+| `GW_HOST=192.168.0.69` | the aggregator loop's target — the gateway's mbaps listener is now on the WiFi WAN address, not the ethernet one. |
+| `GRIDSIM_BIND=192.168.0.188` | pins gridsim (northbound) to the desktop's WiFi address, matching the device's WAN segment. |
+| `MBAPS_BIND=69.0.0.20` | pins mbapsdev (southbound) to the desktop's ethernet address, matching the device's LAN segment. |
+
+### c. Leg flag deltas (`bin/certify`)
+
+Flat-bench legs dial the ethernet addresses; split-bench legs dial the WiFi
+ones instead and capture on the WiFi interface. (Southbound-citing rows —
+the CRYP-001 class — are invisible to a WiFi-only capture; those need a
+second, ethernet-interface capture, see the soak report §5 F5.)
+
+| Flag | Flat bench | Split bench |
+|---|---|---|
+| `-target` | `69.0.0.2:802` | `192.168.0.69:802` |
+| `-gridsim` | `69.0.0.20:11113` | `192.168.0.188:11113` |
+| `-gridsim-admin` | `http://69.0.0.20:11114` | `http://192.168.0.188:11114` |
+| `-iface` | `enp1s0` | `wlp2s0` |
+
+### d. Evidence root
+
+**`runs/ethsplit-20260807/`** — point-in-time proof batteries (`proof/`,
+`proof-final/`), continuous separation detectors, the 9-cycle 24 h soak
+(`soak/cycle01`–`cycle09`), and `ANNOTATIONS.md`. The indexed walkthrough and
+full results tables live in
+`~/projects/lexa-gw/docs/BENCH_WANLAN_SPLIT_SOAK_2026-08-10.md`.

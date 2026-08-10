@@ -3,7 +3,7 @@
 //
 // Usage:
 //
-//	modsim [-port 5020] [-wmax 5000] [-api-port 6020] [-cloud-pct 0] [-serial SN-...]
+//	modsim [-port 5020] [-bind ""] [-wmax 5000] [-api-port 6020] [-cloud-pct 0] [-serial SN-...]
 //	       [-advanced | -der-models legacy|advanced|full] [-base 40000] [-mangle] [-protofault]
 //
 // Models exposed by the default (legacy) image: 1 (Common), 120 (Nameplate),
@@ -52,6 +52,9 @@ import (
 
 func main() {
 	port := flag.Int("port", 5020, "Modbus TCP port")
+	bind := flag.String("bind", "", "listener bind address (empty = 0.0.0.0, all interfaces); set to pin "+
+		"the Modbus/TCP listener to one network segment, e.g. -bind 192.168.0.188 on a split WAN/LAN bench "+
+		"— mirrors mbapsdev's -listen, but as a bare host since -port is already separate here")
 	wmax := flag.Float64("wmax", 5000, "Nameplate WMax in watts")
 	apiPort := flag.Int("api-port", 6020, "HTTP API port (0 to disable)")
 	advanced := flag.Bool("advanced", false, "serve the IEEE 1547-2018 7xx DER models "+
@@ -96,7 +99,7 @@ func main() {
 	// relay takes the public one, so a client dials exactly the address it
 	// always did and the interposition is invisible until a fault is armed.
 	// With NEITHER, nothing about the sim's listening behaviour changes.
-	listenURL := fmt.Sprintf("tcp://0.0.0.0:%d", *port)
+	listenURL := "tcp://" + listenAddr(*bind, *port)
 	upstreamAddr := ""
 	if *mangle || *protofault {
 		upstreamAddr = fmt.Sprintf("127.0.0.1:%d", *port+10000)
@@ -156,7 +159,7 @@ func main() {
 
 	var mangler *sim.Mangler
 	if *mangle {
-		mangler, err = sim.NewMangler(fmt.Sprintf("0.0.0.0:%d", *port), upstreamAddr)
+		mangler, err = sim.NewMangler(listenAddr(*bind, *port), upstreamAddr)
 		if err != nil {
 			log.Fatalf("modsim: %v", err)
 		}
@@ -167,7 +170,7 @@ func main() {
 
 	var protoRelay *sim.ProtoRelay
 	if *protofault {
-		protoRelay, err = sim.NewProtoRelay(fmt.Sprintf("0.0.0.0:%d", *port), upstreamAddr)
+		protoRelay, err = sim.NewProtoRelay(listenAddr(*bind, *port), upstreamAddr)
 		if err != nil {
 			log.Fatalf("modsim: %v", err)
 		}
@@ -282,6 +285,19 @@ const (
 	modelsAdvanced
 	modelsFull
 )
+
+// listenAddr forms the "host:port" pair modsim's Modbus/TCP listener (and,
+// when -mangle/-protofault is set, the public-facing relay) binds to.
+// bind=="" is -bind's default and preserves the historical wildcard
+// behavior — the sim serves 0.0.0.0, all interfaces. A non-empty bind pins
+// the listener to one address, e.g. for the WAN/LAN split bench where a
+// southbound sim must be reachable on exactly one network segment.
+func listenAddr(bind string, port int) string {
+	if bind == "" {
+		bind = "0.0.0.0"
+	}
+	return fmt.Sprintf("%s:%d", bind, port)
+}
 
 // resolveDERModels resolves -der-models against the older -advanced boolean.
 //

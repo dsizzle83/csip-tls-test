@@ -468,7 +468,7 @@ func run(out string, reuseCA bool) error {
 	// === Device server leaf (sim/mbapsdev) — no role extension (TCP-28) =====
 	devServer, err := mintCert(certParams{
 		cn:        "mbapsdev bench device",
-		sans:      []string{"127.0.0.1", "localhost", "69.0.0.20"},
+		sans:      []string{"127.0.0.1", "localhost", "69.0.0.20", "192.168.0.188"},
 		notBefore: leafNotBefore, notAfter: leafNotAfter,
 	}, &intermediate)
 	if err != nil {
