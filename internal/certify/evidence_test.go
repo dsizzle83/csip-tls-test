@@ -233,3 +233,46 @@ func TestStreamLookupRefusesToGuess(t *testing.T) {
 		t.Error("a lookup of the background sim's endpoint succeeded")
 	}
 }
+
+// TestFrameIndexAttributeReusesItsOwnAssembler guards the 2026-08-11 OOM fix:
+// FrameIndex.Attribute must produce EXACTLY the same result as calling
+// attribute() standalone (which reassembles from scratch), because it now
+// reuses fi.asm — the Assembler NewFrameIndex already built — instead of
+// paying for a second full TCP reassembly of the capture (see attribute's and
+// FrameIndex.Attribute's doc comments in window.go/evidence.go). On the
+// 2026-08-11 CSIP-leg capture that second reassembly held 1.34M background
+// frames' worth of bytes twice for nothing; this test is the behavioural
+// promise that skipping it changes nothing about what a check may cite.
+func TestFrameIndexAttributeReusesItsOwnAssembler(t *testing.T) {
+	pkts := synthPackets(interleavedCapture())
+	frames := dissect(t, pkts)
+
+	w := NewWindow("doc::TLS-001", "tls")
+	w.Open(t0().Add(90 * time.Millisecond))
+	w.ClaimAddrs("tcp", benchToGateway, gatewayMBAPS, "mbaps session")
+	w.Close(t0().Add(200 * time.Millisecond))
+
+	want := attribute(frames, []*Window{w})
+
+	fi := NewFrameIndex(pkts)
+	got := fi.Attribute([]*Window{w})
+
+	wantSet, gotSet := want.Set("doc::TLS-001"), got.Set("doc::TLS-001")
+	if !equalInts(gotSet.Frames, wantSet.Frames) {
+		t.Errorf("FrameIndex.Attribute frames = %v, want %v (attribute() standalone)", gotSet.Frames, wantSet.Frames)
+	}
+	if gotSet.Precision != wantSet.Precision {
+		t.Errorf("precision = %s, want %s", gotSet.Precision, wantSet.Precision)
+	}
+	if got.Unattributed != want.Unattributed {
+		t.Errorf("unattributed = %d, want %d", got.Unattributed, want.Unattributed)
+	}
+	if len(got.Contested) != len(want.Contested) {
+		t.Errorf("contested = %v, want %v", got.Contested, want.Contested)
+	}
+	// The point of the fix: FrameIndex built exactly one Assembler's worth of
+	// reassembled streams, and Attribute did not build a second.
+	if got := len(fi.Streams()); got == 0 {
+		t.Fatal("fi.asm was never populated — NewFrameIndex should have reassembled the capture")
+	}
+}

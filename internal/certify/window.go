@@ -479,6 +479,18 @@ func (a *Attribution) Summary() string {
 // two independent walks of the same ordered frames always land on the same
 // connection boundaries, because the boundary rule (Assembler.AddFrame) has
 // no hidden state beyond the frames themselves.
+//
+// That determinism is also why FrameIndex.Attribute does NOT go through this
+// wrapper: it already has an Assembler — fi.asm, built once by NewFrameIndex
+// — fully reassembled, and calls attributeStreams directly with it instead of
+// paying for a second complete TCP reassembly of the whole capture. On an
+// unfiltered, background-heavy capture that second reassembly is not a
+// rounding error: the 2026-08-11 CSIP-leg OOM captured 1,358,542 frames of
+// which 1,337,090 (98.4%) were unattributed background (an aggregator loop
+// hammering mbaps :802 on the same interface), and every one of those bytes
+// was being held twice — once in fi.asm, once in this function's throwaway
+// asm — for zero additional information, since the two are guaranteed
+// identical. See evidence.go's NewFrameIndex for where fi.asm is built.
 func attribute(frames []*netdis.Frame, wins []*Window) *Attribution {
 	asm := netdis.NewAssembler()
 	for _, f := range frames {
@@ -486,7 +498,13 @@ func attribute(frames []*netdis.Frame, wins []*Window) *Attribution {
 			asm.AddFrame(f)
 		}
 	}
+	return attributeStreams(frames, wins, asm)
+}
 
+// attributeStreams is attribute's implementation, taking an already-built
+// Assembler so a caller that reassembled the capture once (FrameIndex) never
+// pays for it twice. See attribute's doc comment.
+func attributeStreams(frames []*netdis.Frame, wins []*Window, asm *netdis.Assembler) *Attribution {
 	att := &Attribution{Sets: make(map[string]*FrameSet, len(wins)), Frames: len(frames)}
 	streams := map[string]map[string]bool{}
 	for _, w := range wins {

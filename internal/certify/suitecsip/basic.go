@@ -270,61 +270,109 @@ func (sc eventScenario) withNonce(nonce string) eventScenario {
 
 func basicEventScenario(sc eventScenario) certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-		return run(ctx, rc, spec{
-			RequiresGridSim: len(sc.Controls) > 0,
-			Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
-				for _, c := range sc.Controls {
-					req := ControlRequest{
-						Program: c.Program, MRID: c.MRID, Description: "certify " + rc.Case.ID,
-						StartOffset: c.StartOffset, DurationS: c.DurationS, MaxLimW: ptr(c.MaxLimW),
-					}
-					if c.Superseded {
-						req.PotentiallySuperseded = ptr(true)
-					}
-					if c.CreationAge != 0 {
-						age := c.CreationAge
-						req.CreationOffsetS = &age
-					}
-					if _, err := d.PostControl(ctx, req); err != nil {
-						return err
-					}
+		return run(ctx, rc, eventScenarioSpec(sc, rc))
+	}
+}
+
+// eventScenarioSpec builds basicEventScenario's spec. Factored out — the same
+// shape as coreResponsesSpec — so a test can drive its Want directly against a
+// fake ServerView without booting the whole check, which needs a live capture
+// window run() cannot fake.
+func eventScenarioSpec(sc eventScenario, rc *certify.RunCtx) spec {
+	return spec{
+		RequiresGridSim: len(sc.Controls) > 0,
+		Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
+			for _, c := range sc.Controls {
+				req := ControlRequest{
+					Program: c.Program, MRID: c.MRID, Description: "certify " + rc.Case.ID,
+					StartOffset: c.StartOffset, DurationS: c.DurationS, MaxLimW: ptr(c.MaxLimW),
 				}
+				if c.Superseded {
+					req.PotentiallySuperseded = ptr(true)
+				}
+				if c.CreationAge != 0 {
+					age := c.CreationAge
+					req.CreationOffsetS = &age
+				}
+				if _, err := d.PostControl(ctx, req); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+		// Want: wait for the WINNING control's own Response, not merely for A
+		// walk to happen. Without this, a scenario with ExpectWinner set falls
+		// through to run()'s AwaitWalk default, whose predicate — "the DUT GET
+		// /dcap'd at least once since base" — is satisfied the instant the
+		// FIRST fresh walk is seen, closing the observation window right then.
+		// A walk and the Response it produces are two separate round trips
+		// (the DUT fetches DERControlList, decides, THEN POSTs the Response),
+		// so on a bench where the walk itself resolves quickly the window can
+		// close a hair before the Response lands — csip.wait never gets a
+		// chance to govern the wait at all, because Await/AwaitWalk returned
+		// long before its budget was spent.
+		//
+		// 2026-08-11 standalone BASIC-020 (runs/wave11-qa-20260811/
+		// rerun-BASIC-020): exactly this race — the response-assertion window
+		// closed ~62s in, the same second the DUT's status=1 landed, and
+		// gridsim's admin API reported "no Response POST in this window" even
+		// though the board's own journal proved both controls ran their full
+		// [1 2 3] lifecycles moments later. -param csip.wait=8m was in effect
+		// and never got to matter, because AwaitWalk had already declared the
+		// window done.
+		//
+		// WantNewResponse (observe.go) is the same idiom coreResponsesSpec uses
+		// for CORE-022's own false-early-exit fix (see its doc): it makes Await
+		// keep polling — for up to the FULL csip.wait-derived window, not a
+		// fraction of it — until a Response actually exists for the mRID the
+		// criteria below grade, rather than for the walk that merely precedes
+		// it. Full-suite behavior is unaffected or improved, never narrowed: a
+		// run where AwaitWalk already happened to leave enough margin for the
+		// Response keeps working exactly as before (this predicate is satisfied
+		// at the same point the DUT's actual Response lands, whichever the wire
+		// shows), and a run where it did not now gets the rest of its own
+		// window instead of none of it. Rows with no ExpectWinner (BASIC-016)
+		// have nothing to wait for a Response TO, so they return nil and keep
+		// the AwaitWalk fallback unchanged.
+		Want: func(base ServerView) func(ServerView) bool {
+			if sc.ExpectWinner == "" {
 				return nil
-			},
-			Cleanup: func(ctx context.Context, d *Driver) {
-				seen := map[int]bool{}
-				for _, c := range sc.Controls {
-					if !seen[c.Program] {
-						seen[c.Program] = true
-						_ = d.ClearControls(ctx, c.Program)
-					}
+			}
+			return base.WantNewResponse(sc.ExpectWinner)
+		},
+		Cleanup: func(ctx context.Context, d *Driver) {
+			seen := map[int]bool{}
+			for _, c := range sc.Controls {
+				if !seen[c.Program] {
+					seen[c.Program] = true
+					_ = d.ClearControls(ctx, c.Program)
 				}
-			},
-			Notes: func(o *Observation) string {
-				return sc.Summary + fmt.Sprintf("; waited %s", o.Waited.Round(rounding))
-			},
-			Criteria: func(o *Observation) []criterion {
-				crits := []criterion{
-					critProgramList(0),
-					critDefaultDERControl(),
-				}
-				if len(sc.Controls) > 0 {
-					crits = append(crits, critScenarioControlsDelivered(sc))
-				}
-				if sc.ExpectWinner != "" {
-					crits = append(crits, critResponsePosted(1, "Event received", sc.ExpectWinner))
-				}
-				crits = append(crits, criterion{
-					Claim: "the DER followed the control the procedure's precedence rules select (" +
-						sc.Summary + ")",
-					How: "measurement of the DER's electrical behaviour across the scenario's event windows",
-					Skip: "which control is IN EFFECT is a property of the inverter, not of the 2030.5 " +
-						"exchange, and is not observable on the CSIP leg. The wire half — which controls " +
-						"reached the DUT, and which it acknowledged — is asserted above",
-				})
-				return crits
-			},
-		})
+			}
+		},
+		Notes: func(o *Observation) string {
+			return sc.Summary + fmt.Sprintf("; waited %s", o.Waited.Round(rounding))
+		},
+		Criteria: func(o *Observation) []criterion {
+			crits := []criterion{
+				critProgramList(0),
+				critDefaultDERControl(),
+			}
+			if len(sc.Controls) > 0 {
+				crits = append(crits, critScenarioControlsDelivered(sc))
+			}
+			if sc.ExpectWinner != "" {
+				crits = append(crits, critResponsePosted(1, "Event received", sc.ExpectWinner))
+			}
+			crits = append(crits, criterion{
+				Claim: "the DER followed the control the procedure's precedence rules select (" +
+					sc.Summary + ")",
+				How: "measurement of the DER's electrical behaviour across the scenario's event windows",
+				Skip: "which control is IN EFFECT is a property of the inverter, not of the 2030.5 " +
+					"exchange, and is not observable on the CSIP leg. The wire half — which controls " +
+					"reached the DUT, and which it acknowledged — is asserted above",
+			})
+			return crits
+		},
 	}
 }
 

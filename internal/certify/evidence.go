@@ -33,6 +33,30 @@ import (
 // Once, not per check: dissecting a 200 MB capture per test case would dominate
 // the run, and — more importantly — every check must see the SAME reassembly,
 // or two checks could disagree about what byte 120 of a stream is.
+//
+// "Once" still means the WHOLE capture, unconditionally, before attribution
+// exists to say which of it any check will ever want: fi.asm's reassembly
+// (below) walks every packet — including background traffic no test case
+// claims — and netdis.Direction keeps every contiguous delivered byte for the
+// life of the run (its out-of-order buffer is capped at DefaultMaxPending,
+// but the DELIVERED stream is not — see reassembly.go's StreamBytes). On an
+// unfiltered capture with a long-lived, high-volume background connection
+// (the 2026-08-11 CSIP-leg OOM: an aggregator loop hammering mbaps :802 on
+// the same interface for the leg's whole 1h47m, 98.4% of the capture's
+// frames) that is where the memory goes: one persistent Direction's byte
+// stream, held in full, for a conversation no check ever cites. This index
+// used to pay for that reassembly TWICE (attribute() rebuilt its own
+// Assembler from the same frames — see attribute's doc comment in window.go);
+// Attribute now reuses fi.asm instead, which halves the cost but does not
+// bound it — the real fix for an unfiltered capture is not indexing the
+// background traffic into the pcap in the first place (see the -bpf comments
+// in runs/wave11-qa-20260811/qa-cycle.sh and
+// runs/ethsplit-20260807/soak-attempt6-partial/soak-driver.sh). A genuine
+// bound here (e.g. a byte cap per Direction, or deferring reassembly until
+// attribution has picked which streams matter) was left undone: attribution
+// itself is computed FROM the dissected frames this same pass produces, so
+// bounding reassembly by attribution needs a second pass over the capture —
+// not a rounding-error change, and not one to make blind the night of an OOM.
 type FrameIndex struct {
 	packets []pcapng.Packet
 	frames  []*netdis.Frame
@@ -132,7 +156,15 @@ func (fi *FrameIndex) Frames() []*netdis.Frame { return fi.frames }
 func (fi *FrameIndex) Streams() []*netdis.Stream { return fi.asm.Streams() }
 
 // Attribute applies the two-signal rule to the run's windows.
-func (fi *FrameIndex) Attribute(wins []*Window) *Attribution { return attribute(fi.frames, wins) }
+//
+// Calls attributeStreams directly with fi.asm — the Assembler NewFrameIndex
+// already built — rather than going through attribute(), which would
+// reassemble the whole capture a second time. See attribute's doc comment in
+// window.go for why that second pass is pure waste on a background-heavy
+// capture (the 2026-08-11 CSIP-leg OOM).
+func (fi *FrameIndex) Attribute(wins []*Window) *Attribution {
+	return attributeStreams(fi.frames, wins, fi.asm)
+}
 
 // owner returns the uid that owns a frame, for a better error message when a
 // check cites someone else's traffic.
