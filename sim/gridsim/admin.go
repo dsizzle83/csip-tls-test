@@ -145,13 +145,26 @@ type adminCtrlInfo struct {
 }
 
 // adminBaseInfo mirrors DERControlBase as JSON-friendly nullable fields.
+//
+// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md): MaxLimW and
+// FixedW carry HUNDREDTHS OF A PERCENT now (opModMaxLimW/opModFixedW's real
+// wire unit — SignedPerCent/PerCent), NOT watts, even though the field/JSON
+// names are kept unchanged to avoid rippling the admin API surface for a
+// units-only fix — the design's own BASIC-013/014 harness changes construct
+// these fields with catalog-stated hundredths values directly (e.g.
+// FixedW=6000 meaning 60.00%), not watts. ExpLimW/ImpLimW/GenLimW/LoadLimW
+// are unaffected (§1.2 — still genuine watts, ActivePower).
 type adminBaseInfo struct {
-	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
-	MaxLimW        *int64 `json:"max_lim_W,omitempty"`
-	ImpLimW        *int64 `json:"imp_lim_W,omitempty"`
-	GenLimW        *int64 `json:"gen_lim_W,omitempty"`
-	LoadLimW       *int64 `json:"load_lim_W,omitempty"`
-	FixedW         *int64 `json:"fixed_W,omitempty"`
+	ExpLimW  *int64 `json:"exp_lim_W,omitempty"`
+	MaxLimW  *int64 `json:"max_lim_W,omitempty"` // hundredths of a percent (IW13-001) — see type doc
+	ImpLimW  *int64 `json:"imp_lim_W,omitempty"`
+	GenLimW  *int64 `json:"gen_lim_W,omitempty"`
+	LoadLimW *int64 `json:"load_lim_W,omitempty"`
+	FixedW   *int64 `json:"fixed_W,omitempty"` // hundredths of a percent, signed (IW13-001) — see type doc
+	// TargetW is opModTargetW (genuine watts, ActivePower — §1.1) — only ever
+	// set on an ExtendedDERControlBase (extBaseToInfo, curve.go); baseToInfo's
+	// scalar DERControlBase has no such field to read at all.
+	TargetW        *int64 `json:"target_W,omitempty"`
 	Connect        *bool  `json:"connect,omitempty"`
 	Energize       *bool  `json:"energize,omitempty"`
 	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
@@ -394,7 +407,12 @@ func baseToInfo(b model.DERControlBase) adminBaseInfo {
 		info.ExpLimW = &v
 	}
 	if b.OpModMaxLimW != nil {
-		v := apW(b.OpModMaxLimW)
+		// IW13-001: PerCent, not ActivePower — the raw hundredths value IS
+		// the wire unit, no multiplier to decode (docs/design/
+		// IW13_ACTIVE_POWER_UNITS_2026-08-12.md §4.2). info.MaxLimW keeps its
+		// name (matching adminCtrlReq's own field below) but now carries
+		// hundredths-of-a-percent, not watts.
+		v := int64(b.OpModMaxLimW.Value)
 		info.MaxLimW = &v
 	}
 	if b.OpModImpLimW != nil {
@@ -410,7 +428,8 @@ func baseToInfo(b model.DERControlBase) adminBaseInfo {
 		info.LoadLimW = &v
 	}
 	if b.OpModFixedW != nil {
-		v := apW(b.OpModFixedW)
+		// IW13-001: SignedPerCent, not ActivePower — same as MaxLimW above.
+		v := int64(b.OpModFixedW.Value)
 		info.FixedW = &v
 	}
 	if b.OpModFixedPFInjectW != nil {
@@ -481,12 +500,28 @@ type adminCtrlReq struct {
 	ResponseRequired      *uint8 `json:"response_required,omitempty"`
 
 	// DERControlBase fields — only non-nil ones are included in the event.
-	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
-	MaxLimW        *int64 `json:"max_lim_W,omitempty"`
-	ImpLimW        *int64 `json:"imp_lim_W,omitempty"`
-	GenLimW        *int64 `json:"gen_lim_W,omitempty"`
-	LoadLimW       *int64 `json:"load_lim_W,omitempty"`
-	FixedW         *int64 `json:"fixed_W,omitempty"`
+	//
+	// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §4.2):
+	// MaxLimW/FixedW are HUNDREDTHS OF A PERCENT (opModMaxLimW/opModFixedW's
+	// real wire unit), not watts — buildBase wraps them directly into
+	// PerCent/SignedPerCent with no multiplier scaling, unlike
+	// ExpLimW/ImpLimW/GenLimW/LoadLimW (still genuine watts, §1.2, still
+	// scaled through apFromWatts's ActivePower encoder). The field/JSON names
+	// are unchanged from their pre-fix (watts) meaning deliberately, to avoid
+	// rippling the admin API surface for a units-only fix — every caller is
+	// this repo's own harness code, not an external consumer.
+	ExpLimW  *int64 `json:"exp_lim_W,omitempty"`
+	MaxLimW  *int64 `json:"max_lim_W,omitempty"` // hundredths of a percent (IW13-001)
+	ImpLimW  *int64 `json:"imp_lim_W,omitempty"`
+	GenLimW  *int64 `json:"gen_lim_W,omitempty"`
+	LoadLimW *int64 `json:"load_lim_W,omitempty"`
+	FixedW   *int64 `json:"fixed_W,omitempty"` // hundredths of a percent, signed (IW13-001)
+	// TargetW is opModTargetW (genuine nested ActivePower, watts — §1.1,
+	// already correct, untouched by IW13-001) on the EXTENDED control base.
+	// Added by §4.2 specifically for BASIC-014, which previously had no
+	// request-surface lever for this axis at all and rode the wrong FixedW
+	// field instead; mirrors ExpLimW's own watts shape.
+	TargetW        *int64 `json:"target_W,omitempty"`
 	Connect        *bool  `json:"connect,omitempty"`
 	Energize       *bool  `json:"energize,omitempty"`
 	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
@@ -642,6 +677,19 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		DERControlBase:    buildBase(req),
 	}
 
+	// IW13-001 §4.2: opModTargetW only exists on the EXTENDED control base —
+	// buildBase's narrow DERControlBase (ctrl.DERControlBase above) cannot
+	// carry it at all. When req.TargetW is set, pre-build the ExtendedDERControl
+	// this control is stored as, TargetW included, and route BOTH list writes
+	// below through the extended path unconditionally — the same widen-in-place
+	// pattern POST /admin/curve already established for curve-linked controls.
+	var extCtrl *model.ExtendedDERControl
+	if req.TargetW != nil {
+		e := toExtendedControl(ctrl)
+		e.DERControlBase.OpModTargetW = apFromWatts(req.TargetW)
+		extCtrl = &e
+	}
+
 	// An explicit mRID that already exists is an UPDATE-in-place (the flip a
 	// server-cancel needs), never an add; an absent/auto mRID keeps the
 	// original activate/append semantics exactly.
@@ -659,17 +707,34 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// DERControlListLink. The scheduler evaluates the time window and marks it
 	// active when start <= serverNow < start+duration.
 	dercPath := fmt.Sprintf("/derp/%d/derc", req.Program)
-	// A prior POST /admin/curve may have left an ExtendedDERControlList here;
-	// widen this scalar control into it rather than silently no-op'ing.
-	switch dercList := s.resources[dercPath].(type) {
-	case *model.DERControlList:
-		dercList.DERControl = upsertScalarControl(dercList.DERControl, ctrl, req.Activate, matchMRID)
+	if extCtrl != nil {
+		// TargetW forces extended storage — widen a still-scalar list in
+		// place first, then store the PRE-BUILT extended control directly
+		// (upsertExtendedControl's usual re-derive via toExtendedControl(ctrl)
+		// would drop OpModTargetW, which only exists on extCtrl, never on
+		// ctrl.DERControlBase — see upsertExtendedControlDirect).
+		if _, ok := s.resources[dercPath].(*model.ExtendedDERControlList); !ok {
+			s.resources[dercPath] = &model.ExtendedDERControlList{
+				Resource: model.Resource{Href: dercPath}, PollRate: s.controlListPollRateLocked(),
+			}
+		}
+		dercList := s.resources[dercPath].(*model.ExtendedDERControlList)
+		dercList.DERControl = upsertExtendedControlDirect(dercList.DERControl, *extCtrl, req.Activate, matchMRID)
 		dercList.All = uint32(len(dercList.DERControl))
 		dercList.Results = dercList.All
-	case *model.ExtendedDERControlList:
-		dercList.DERControl = upsertExtendedControl(dercList.DERControl, ctrl, req.Activate, matchMRID)
-		dercList.All = uint32(len(dercList.DERControl))
-		dercList.Results = dercList.All
+	} else {
+		// A prior POST /admin/curve may have left an ExtendedDERControlList
+		// here; widen this scalar control into it rather than silently no-op'ing.
+		switch dercList := s.resources[dercPath].(type) {
+		case *model.DERControlList:
+			dercList.DERControl = upsertScalarControl(dercList.DERControl, ctrl, req.Activate, matchMRID)
+			dercList.All = uint32(len(dercList.DERControl))
+			dercList.Results = dercList.All
+		case *model.ExtendedDERControlList:
+			dercList.DERControl = upsertExtendedControl(dercList.DERControl, ctrl, req.Activate, matchMRID)
+			dercList.All = uint32(len(dercList.DERControl))
+			dercList.Results = dercList.All
+		}
 	}
 
 	// Mirror into actderc (status display) only when the event window is
@@ -679,38 +744,61 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// (matchMRID) refresh the existing entry only — never add a (possibly
 	// now-cancelled) control to the active list.
 	actPath := fmt.Sprintf("/derp/%d/actderc", req.Program)
-	switch actList := s.resources[actPath].(type) {
-	case *model.DERControlList:
+	if extCtrl != nil {
+		if _, ok := s.resources[actPath].(*model.ExtendedDERControlList); !ok {
+			s.resources[actPath] = &model.ExtendedDERControlList{
+				Resource: model.Resource{Href: actPath}, PollRate: s.controlListPollRateLocked(),
+			}
+		}
+		actList := s.resources[actPath].(*model.ExtendedDERControlList)
 		if matchMRID {
-			replaceScalarInPlace(actList.DERControl, ctrl)
+			replaceExtendedInPlace(actList.DERControl, *extCtrl)
 		} else {
 			switch {
 			case req.Activate && activeNow:
-				actList.DERControl = []model.DERControl{ctrl}
+				actList.DERControl = []model.ExtendedDERControl{*extCtrl}
 			case req.Activate:
 				actList.DERControl = nil
 			case activeNow:
-				actList.DERControl = append(actList.DERControl, ctrl)
+				actList.DERControl = append(actList.DERControl, *extCtrl)
 			}
 		}
 		actList.All = uint32(len(actList.DERControl))
 		actList.Results = actList.All
-	case *model.ExtendedDERControlList:
-		if matchMRID {
-			replaceExtendedInPlace(actList.DERControl, toExtendedControl(ctrl))
-		} else {
-			ext := toExtendedControl(ctrl)
-			switch {
-			case req.Activate && activeNow:
-				actList.DERControl = []model.ExtendedDERControl{ext}
-			case req.Activate:
-				actList.DERControl = nil
-			case activeNow:
-				actList.DERControl = append(actList.DERControl, ext)
+	} else {
+		switch actList := s.resources[actPath].(type) {
+		case *model.DERControlList:
+			if matchMRID {
+				replaceScalarInPlace(actList.DERControl, ctrl)
+			} else {
+				switch {
+				case req.Activate && activeNow:
+					actList.DERControl = []model.DERControl{ctrl}
+				case req.Activate:
+					actList.DERControl = nil
+				case activeNow:
+					actList.DERControl = append(actList.DERControl, ctrl)
+				}
 			}
+			actList.All = uint32(len(actList.DERControl))
+			actList.Results = actList.All
+		case *model.ExtendedDERControlList:
+			if matchMRID {
+				replaceExtendedInPlace(actList.DERControl, toExtendedControl(ctrl))
+			} else {
+				ext := toExtendedControl(ctrl)
+				switch {
+				case req.Activate && activeNow:
+					actList.DERControl = []model.ExtendedDERControl{ext}
+				case req.Activate:
+					actList.DERControl = nil
+				case activeNow:
+					actList.DERControl = append(actList.DERControl, ext)
+				}
+			}
+			actList.All = uint32(len(actList.DERControl))
+			actList.Results = actList.All
 		}
-		actList.All = uint32(len(actList.DERControl))
-		actList.Results = actList.All
 	}
 	s.mu.Unlock()
 
@@ -744,6 +832,27 @@ func upsertScalarControl(list []model.DERControl, ctrl model.DERControl, activat
 // ExtendedDERControlList (a prior POST /admin/curve widened the list).
 func upsertExtendedControl(list []model.ExtendedDERControl, ctrl model.DERControl, activate, matchMRID bool) []model.ExtendedDERControl {
 	ext := toExtendedControl(ctrl)
+	if matchMRID {
+		for i := range list {
+			if list[i].MRID == ext.MRID {
+				list[i] = ext
+				return list
+			}
+		}
+	}
+	if activate {
+		return []model.ExtendedDERControl{ext}
+	}
+	return append(list, ext)
+}
+
+// upsertExtendedControlDirect is upsertExtendedControl for a caller that
+// already holds the built ExtendedDERControl (IW13-001 §4.2's TargetW path,
+// which sets OpModTargetW on the widened base BEFORE storage — re-deriving
+// via toExtendedControl(ctrl) the way upsertExtendedControl does would drop
+// that field, since it only exists on the extended struct, never on the
+// narrow ctrl.DERControlBase toExtendedControl reads from).
+func upsertExtendedControlDirect(list []model.ExtendedDERControl, ext model.ExtendedDERControl, activate, matchMRID bool) []model.ExtendedDERControl {
 	if matchMRID {
 		for i := range list {
 			if list[i].MRID == ext.MRID {
@@ -828,11 +937,16 @@ func buildBase(req adminCtrlReq) model.DERControlBase {
 		OpModEnergize: req.Energize,
 	}
 	b.OpModExpLimW = apFromWatts(req.ExpLimW)
-	b.OpModMaxLimW = apFromWatts(req.MaxLimW)
+	// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §4.2):
+	// opModMaxLimW/opModFixedW are PerCent/SignedPerCent, not ActivePower —
+	// req.MaxLimW/FixedW already carry the wire's own hundredths-of-a-percent
+	// unit directly (see adminCtrlReq's doc comment), so no apFromWatts
+	// multiplier scaling applies; a bare int16 wrap is the whole conversion.
+	b.OpModMaxLimW = percentFromHundredths(req.MaxLimW)
 	b.OpModImpLimW = apFromWatts(req.ImpLimW)
 	b.OpModGenLimW = apFromWatts(req.GenLimW)
 	b.OpModLoadLimW = apFromWatts(req.LoadLimW)
-	b.OpModFixedW = apFromWatts(req.FixedW)
+	b.OpModFixedW = signedPercentFromHundredths(req.FixedW)
 	if req.FixedPFInjectW != nil {
 		b.OpModFixedPFInjectW = &model.SignedPerCent{Value: int16(*req.FixedPFInjectW)}
 	}
@@ -855,6 +969,11 @@ func buildBase(req adminCtrlReq) model.DERControlBase {
 // apFromWatts converts a watt value into an ActivePower, scaling into the
 // power-of-ten multiplier when the magnitude exceeds the int16 value range
 // (e.g. 40000 W → value=4000, multiplier=1). nil passes through.
+//
+// Still correct for opModExpLimW/opModImpLimW/opModGenLimW/opModLoadLimW
+// (§1.2, unaffected by IW13-001) and for opModTargetW (§1.1, already
+// correct). NOT used for opModMaxLimW/opModFixedW any more — see
+// percentFromHundredths/signedPercentFromHundredths below.
 func apFromWatts(w *int64) *model.ActivePower {
 	if w == nil {
 		return nil
@@ -866,6 +985,26 @@ func apFromWatts(w *int64) *model.ActivePower {
 		mult++
 	}
 	return &model.ActivePower{Value: int16(v), Multiplier: mult}
+}
+
+// percentFromHundredths wraps a raw hundredths-of-a-percent value directly
+// into a PerCent (opModMaxLimW's real wire type, IW13-001) — no multiplier
+// scaling: PerCent carries none at all, unlike ActivePower. nil passes
+// through.
+func percentFromHundredths(v *int64) *model.PerCent {
+	if v == nil {
+		return nil
+	}
+	return &model.PerCent{Value: int16(*v)}
+}
+
+// signedPercentFromHundredths is percentFromHundredths's signed sibling
+// (opModFixedW's real wire type, SignedPerCent).
+func signedPercentFromHundredths(v *int64) *model.SignedPerCent {
+	if v == nil {
+		return nil
+	}
+	return &model.SignedPerCent{Value: int16(*v)}
 }
 
 // ── DefaultDERControl GET/POST ────────────────────────────────────────────────

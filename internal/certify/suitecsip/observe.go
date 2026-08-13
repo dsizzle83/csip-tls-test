@@ -1217,12 +1217,22 @@ type ControlRequest struct {
 	// here.
 	ResponseRequired *uint8 `json:"response_required,omitempty"`
 
-	ExpLimW        *int64 `json:"exp_lim_W,omitempty"`
-	MaxLimW        *int64 `json:"max_lim_W,omitempty"`
-	ImpLimW        *int64 `json:"imp_lim_W,omitempty"`
-	GenLimW        *int64 `json:"gen_lim_W,omitempty"`
-	LoadLimW       *int64 `json:"load_lim_W,omitempty"`
-	FixedW         *int64 `json:"fixed_W,omitempty"`
+	// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §4.2):
+	// MaxLimW/FixedW carry HUNDREDTHS OF A PERCENT (opModMaxLimW/opModFixedW's
+	// real wire unit), not watts — matches sim/gridsim/admin.go's
+	// adminCtrlReq, whose JSON shape this struct mirrors exactly (POSTed
+	// straight through). ExpLimW/ImpLimW/GenLimW/LoadLimW are unaffected
+	// (§1.2 — still genuine watts).
+	ExpLimW  *int64 `json:"exp_lim_W,omitempty"`
+	MaxLimW  *int64 `json:"max_lim_W,omitempty"` // hundredths of a percent (IW13-001)
+	ImpLimW  *int64 `json:"imp_lim_W,omitempty"`
+	GenLimW  *int64 `json:"gen_lim_W,omitempty"`
+	LoadLimW *int64 `json:"load_lim_W,omitempty"`
+	FixedW   *int64 `json:"fixed_W,omitempty"` // hundredths of a percent, signed (IW13-001)
+	// TargetW is opModTargetW (genuine watts, ActivePower — §1.1, already
+	// correct) on the EXTENDED control base — added by §4.2 for BASIC-014,
+	// which has no other request-surface lever for this axis.
+	TargetW        *int64 `json:"target_W,omitempty"`
 	Connect        *bool  `json:"connect,omitempty"`
 	Energize       *bool  `json:"energize,omitempty"`
 	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`

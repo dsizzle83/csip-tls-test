@@ -25,12 +25,20 @@ import (
 )
 
 // ap builds an ActivePower from a multiplier and a value, the way a head-end
-// carries watts on the wire.
+// carries watts on the wire. Still correct for opModExpLimW/opModImpLimW/
+// opModGenLimW/opModLoadLimW (§1.2, unaffected by IW13-001) — NOT for
+// opModFixedW/opModMaxLimW any more, see pct/spc below.
 func ap(mult int8, val int16) *model.ActivePower {
 	return &model.ActivePower{Multiplier: mult, Value: val}
 }
 
+// spc builds a SignedPerCent from a raw hundredths-of-a-percent value —
+// opModFixedW's real wire type (IW13-001). v=6000 means 60.00%.
 func spc(v int16) *model.SignedPerCent { return &model.SignedPerCent{Value: v} }
+
+// pct builds a PerCent from a raw hundredths-of-a-percent value — opModMaxLimW's
+// real wire type (IW13-001). v=6000 means 60.00%.
+func pct(v int16) *model.PerCent { return &model.PerCent{Value: v} }
 
 func fixedVar(refType uint8, hundredthsPct int16) *model.FixedVar {
 	return &model.FixedVar{RefType: refType, Value: model.SignedPerCent{Value: hundredthsPct}}
@@ -86,13 +94,20 @@ func CtlCatalog() []CtlCase {
 		},
 
 		// ── Several conjunctive limits in one document ────────────────────
+		//
+		// IW13-001: opModMaxLimW is PerCent of THIS device's own setMaxW, not
+		// site-level watts — Bench702() is a 60 kW device (WMaxRtg=WMax=
+		// 60,000 W), so the percentages below are chosen to reproduce the
+		// SAME comparative ordering (which axis binds) these cases pinned
+		// before the retype, at clean round percentages rather than forcing
+		// the old watts numbers through a non-round conversion.
 		{
 			ID:    "DIFF-CTL-010",
 			Title: "two active-power ceilings, the tighter one second in the document",
 			Spec:  Bench702(),
 			Ctrl: model.DERControlBase{
 				OpModExpLimW: ap(3, 30), // 30 kW
-				OpModMaxLimW: ap(3, 5),  // 5 kW — binds
+				OpModMaxLimW: pct(1000), // 10% of 60 kW = 6 kW — binds
 			},
 		},
 		{
@@ -100,8 +115,8 @@ func CtlCatalog() []CtlCase {
 			Title: "two active-power ceilings, the tighter one first in the document",
 			Spec:  Bench702(),
 			Ctrl: model.DERControlBase{
-				OpModExpLimW: ap(3, 5), // 5 kW — binds
-				OpModMaxLimW: ap(3, 30),
+				OpModExpLimW: ap(3, 5),  // 5 kW — binds
+				OpModMaxLimW: pct(5000), // 50% of 60 kW = 30 kW
 			},
 		},
 		{
@@ -110,8 +125,8 @@ func CtlCatalog() []CtlCase {
 			Spec:  Bench702(),
 			Ctrl: model.DERControlBase{
 				OpModExpLimW: ap(3, 40),
-				OpModMaxLimW: ap(3, 20),
-				OpModGenLimW: ap(3, 2),
+				OpModMaxLimW: pct(2500), // 25% of 60 kW = 15 kW
+				OpModGenLimW: ap(3, 2),  // 2 kW — binds
 			},
 		},
 
@@ -144,17 +159,26 @@ func CtlCatalog() []CtlCase {
 			Title: "opModFixedW and opModImpLimW in one document — both want WSet",
 			Spec:  Bench702(),
 			Ctrl: model.DERControlBase{
-				OpModFixedW:  ap(3, 20),
+				OpModFixedW:  spc(3000), // 30% of 60 kW = 18 kW
 				OpModImpLimW: ap(3, 5),
 			},
 		},
 
 		// ── Instructions the device cannot carry out ──────────────────────
+		//
+		// IW13-001: opModFixedW is now bounded to [-100%,100%] by its own
+		// SignedPerCent domain (§2.4), so "far beyond the nameplate" can no
+		// longer be expressed as an oversized watts figure — 100% of a
+		// device's own rating IS its rating, never beyond it. The equivalent
+		// "does an extreme value get silently accepted, silently clamped, or
+		// honestly refused?" question is now asked at the DOMAIN boundary
+		// instead: a value outside the wire type's own [-10000,10000]
+		// hundredths range.
 		{
 			ID:    "DIFF-CTL-040",
-			Title: "opModFixedW far beyond the nameplate — accepted, clamped, or refused?",
+			Title: "opModFixedW out of the SignedPerCent domain (>100%) — accepted, clamped, or refused?",
 			Spec:  Bench702(),
-			Ctrl:  model.DERControlBase{OpModFixedW: ap(3, 200)}, // 200 kW on a 60 kW device
+			Ctrl:  model.DERControlBase{OpModFixedW: spc(15000)}, // 150% — out of [-10000,10000]
 		},
 		{
 			ID:    "DIFF-CTL-041",

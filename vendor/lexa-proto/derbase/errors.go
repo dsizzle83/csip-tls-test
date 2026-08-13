@@ -31,6 +31,15 @@ import (
 //     because the device is now in a state nobody asked for: the control
 //     cannot be reported as started, retrying is not obviously safe, and the
 //     site must reserve the DER's full nameplate until it is proven again.
+//   - ErrRampNotApplied → the LOAD-BEARING setpoint/ceiling landed, but the
+//     704 standing ramp-rate policy (WRmp/VarRmp) bundled with it was
+//     isolated and dropped by write704Rmp's own WRmp-rejection retry
+//     (IW13-003, docs/design/IW13_CONTROL_EXECUTION_COMPLETENESS_2026-08-12.md
+//     §1). NOT the same category as ErrPartialActuation: the device is in a
+//     KNOWN state (the commanded value is in force), only the transition
+//     PROFILE it used to get there is not the one that was asked for. CSIP
+//     response: CannotComply — the control did not begin executing exactly
+//     as specified, even though the target value is correct.
 var (
 	ErrUnsupportedControl = errors.New("unsupported control")
 	ErrInvalidControl     = errors.New("invalid control")
@@ -38,6 +47,7 @@ var (
 	ErrAdoptTimeout       = errors.New("curve adoption timed out without confirmation")
 	ErrVerifyFailed       = errors.New("actuation read-back verification failed")
 	ErrPartialActuation   = errors.New("partial actuation: device left in a mixed state")
+	ErrRampNotApplied     = errors.New("ramp rate not applied: setpoint landed without the commanded transition rate")
 )
 
 // UnsupportedControlError reports a requested control axis the device cannot
@@ -210,3 +220,44 @@ func (e *PartialActuationError) Error() string {
 		e.Tag, e.Plan, what, e.Outcome)
 }
 func (e *PartialActuationError) Unwrap() error { return ErrPartialActuation }
+
+// RampNotAppliedError reports that a 704 axis's setpoint/ceiling/var value
+// LANDED but the ramp-rate policy write (WRmp/VarRmp) bundled with it in the
+// same whole-block write was ISOLATED and dropped by write704Rmp's own
+// WRmp-rejection retry (IW13-003, docs/design/
+// IW13_CONTROL_EXECUTION_COMPLETENESS_2026-08-12.md §1). The device did not
+// begin executing the control AS SPECIFIED — its transition profile is now
+// whatever rate its firmware defaults to, unknown to the gateway — even
+// though the target value itself is correct and in force.
+//
+// Deliberately NOT a PartialActuationError/ErrPartialActuation: the device is
+// in a KNOWN, MEASURED state (the load-bearing element is Applied), not an
+// unknown mixed one. Sub carries the axis's own resolved PlanOutcome — at
+// minimum the primary element (WSet/WMaxLimPct/VarSet) Applied plus the ramp
+// element (WRmp/VarRmp) Failed with an Advisory explaining why — so a caller
+// can inspect exactly what landed and what did not, the same shape
+// SetpointRangeError/UnsupportedControlError already establish for this
+// package's other typed refusals.
+//
+// Axis is the CSIP DERControlBase axis name ("opModFixedW"/"opModMaxLimW"/
+// "opModFixedVar") when this surfaces through ApplyControlPlan/
+// ApplyActuationWatts, or the setter's own name ("SetActivePowerWatts"/
+// "SetWMaxLimPctW"/"SetConstantVar") on a direct call — the same convention
+// SetpointRangeError's own Axis field documents.
+//
+// registry.WattsApplier/HintedWattsApplier (lexa-gw's southbound registry,
+// not this package) keep their bare error-only signature unchanged: this
+// error crosses that boundary intact as the plain `error` return already
+// carries, and a caller there classifies it with `errors.As` exactly like
+// this package's own SetpointRangeError/UnsupportedControlError today.
+type RampNotAppliedError struct {
+	Axis string
+	Sub  PlanOutcome
+}
+
+func (e *RampNotAppliedError) Error() string {
+	return fmt.Sprintf("%s: setpoint applied but the commanded ramp rate was not — the device refused "+
+		"the WRmp/VarRmp register range and write704Rmp's isolating retry landed the setpoint without it: %s",
+		e.Axis, e.Sub)
+}
+func (e *RampNotAppliedError) Unwrap() error { return ErrRampNotApplied }

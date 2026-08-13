@@ -311,6 +311,18 @@ type ActivePower struct {
 	Value      int16 `xml:"value"`
 }
 
+// PerCent represents an unsigned percentage × 100 (hundredths), used where
+// the 2030.5 XSD's PerCent simple type applies (opModMaxLimW). The XSD
+// restricts PerCent to xs:short (int16) with no numeric facet — the
+// non-negative, ≤100.00% convention is prose/table-defined (CSIP IG 2.1
+// Table 9), not schema-enforced, so this type keeps int16 (matching
+// SignedPerCent's own representation) and the [0,10000] bound is enforced at
+// the decode/conversion boundary, not in this struct.
+// See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.
+type PerCent struct {
+	Value int16 `xml:",chardata"`
+}
+
 // ─── DERUnitRefType: what a percentage is a percentage OF ─────────────────────
 //
 // These match the DERUnitRefType enumeration in the IEEE 2030.5-2018 XSD. The
@@ -357,13 +369,17 @@ type DERControlBase struct {
 	OpModFixedPFAbsorbW *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
 	OpModFixedPFInjectW *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
 	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"`
-	OpModFixedW         *ActivePower   `xml:"opModFixedW,omitempty"`
-	OpModMaxLimW        *ActivePower   `xml:"opModMaxLimW,omitempty"`
-	OpModExpLimW        *ActivePower   `xml:"opModExpLimW,omitempty"`
-	OpModGenLimW        *ActivePower   `xml:"opModGenLimW,omitempty"`
-	OpModImpLimW        *ActivePower   `xml:"opModImpLimW,omitempty"`
-	OpModLoadLimW       *ActivePower   `xml:"opModLoadLimW,omitempty"`
-	RampTms             *uint16        `xml:"rampTms,omitempty"`
+	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`  // SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
+	OpModMaxLimW        *PerCent       `xml:"opModMaxLimW,omitempty"` // PerCent of setMaxW, not watts — IW13-001.
+	// UNVERIFIED against XSD — believed watts; confirm before any conformance
+	// claim (IW13-001 Phase-0). See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
+	OpModExpLimW *ActivePower `xml:"opModExpLimW,omitempty"`
+	// UNVERIFIED against XSD — believed watts; confirm before any conformance
+	// claim (IW13-001 Phase-0). See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
+	OpModGenLimW  *ActivePower `xml:"opModGenLimW,omitempty"`
+	OpModImpLimW  *ActivePower `xml:"opModImpLimW,omitempty"`
+	OpModLoadLimW *ActivePower `xml:"opModLoadLimW,omitempty"`
+	RampTms       *uint16      `xml:"rampTms,omitempty"`
 }
 
 // EventStatus describes the current state of an event.

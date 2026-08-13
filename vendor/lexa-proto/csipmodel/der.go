@@ -223,15 +223,19 @@ type ExtendedDERControlBase struct {
 	OpModFixedPFAbsorbW *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
 	OpModFixedPFInjectW *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
 	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"`
-	OpModFixedW         *ActivePower   `xml:"opModFixedW,omitempty"`
-	OpModMaxLimW        *ActivePower   `xml:"opModMaxLimW,omitempty"`
-	OpModExpLimW        *ActivePower   `xml:"opModExpLimW,omitempty"`
-	OpModGenLimW        *ActivePower   `xml:"opModGenLimW,omitempty"`
-	OpModImpLimW        *ActivePower   `xml:"opModImpLimW,omitempty"`
-	OpModLoadLimW       *ActivePower   `xml:"opModLoadLimW,omitempty"`
-	OpModTargetW        *ActivePower   `xml:"opModTargetW,omitempty"`
-	OpModTargetVar      *ReactivePower `xml:"opModTargetVar,omitempty"`
-	RampTms             *uint16        `xml:"rampTms,omitempty"`
+	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`  // SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
+	OpModMaxLimW        *PerCent       `xml:"opModMaxLimW,omitempty"` // PerCent of setMaxW, not watts — IW13-001.
+	// UNVERIFIED against XSD — believed watts; confirm before any conformance
+	// claim (IW13-001 Phase-0). See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
+	OpModExpLimW *ActivePower `xml:"opModExpLimW,omitempty"`
+	// UNVERIFIED against XSD — believed watts; confirm before any conformance
+	// claim (IW13-001 Phase-0). See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
+	OpModGenLimW   *ActivePower   `xml:"opModGenLimW,omitempty"`
+	OpModImpLimW   *ActivePower   `xml:"opModImpLimW,omitempty"`
+	OpModLoadLimW  *ActivePower   `xml:"opModLoadLimW,omitempty"`
+	OpModTargetW   *ActivePower   `xml:"opModTargetW,omitempty"` // already correct — nested ActivePower, watts (§1.1)
+	OpModTargetVar *ReactivePower `xml:"opModTargetVar,omitempty"`
+	RampTms        *uint16        `xml:"rampTms,omitempty"`
 
 	// ── Curve-linked modes — each holds an href to a DERCurve ────────────────
 	// Dynamic Volt-VAr — anti-islanding baseline mode (§10.10.4.2).

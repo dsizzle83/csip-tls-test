@@ -32,10 +32,12 @@ package suitecsip
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/invariant"
 )
 
 // basicIdentification implements BASIC-001 — DER Identification.
@@ -110,7 +112,35 @@ type controlMode struct {
 	Unreachable string
 	// Program is the gridsim DERProgram index to publish on.
 	Program int
+	// Oracle, when set, replaces critDEREffectUnobservable's hard SKIP for
+	// THIS row with a REAL independent register assertion (IW13-001 §4.3:
+	// docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md). It reads the DER's
+	// OWN southbound registers through internal/invariant — which shares
+	// only the SunSpec register-offset tables with the product and none of
+	// the CSIP/derbase interpretation (that package's own doc) — and reports
+	// whether the DER's own account matches what THIS row commanded. Called
+	// during Setup (the one phase with live network access); criterion.Wire
+	// evaluators run later against the recovered pcap transcript and have no
+	// live context of their own, so the Finding is computed here and carried
+	// into the citation phase via Observation.Params, the same mechanism an
+	// mRID or other live-phase fact already uses.
+	//
+	// Populated only for BASIC-010/opModMaxLimW, BASIC-013/opModFixedW, and
+	// BASIC-014/opModTargetW — the three rows §4.3 specifically names. Every
+	// other BASIC-004..015 row is unaffected: its "the DER's output followed
+	// the control" criterion stays the honest SKIP it always was, because
+	// nothing wires a southbound read for it.
+	Oracle func(ctx context.Context, rc *certify.RunCtx) Finding
 }
+
+// oracleVerdictParam/oracleObservedParam/oracleUnavailableParam are the
+// Observation.Params keys a controlMode.Oracle result is carried through —
+// Setup (live) to Criteria (post-hoc), see controlMode.Oracle's doc.
+const (
+	oracleVerdictParam     = "iw13.oracle_verdict"
+	oracleObservedParam    = "iw13.oracle_observed"
+	oracleUnavailableParam = "iw13.oracle_unavailable"
+)
 
 // scalarMode builds a controlMode driven by gridsim's scalar control API.
 func scalarMode(element string, apply func(*ControlRequest)) controlMode {
@@ -148,48 +178,121 @@ func unreachableMode(element, why string) controlMode {
 	return controlMode{Element: element, Unreachable: why}
 }
 
+// withOracle attaches an independent southbound register Oracle (IW13-001
+// §4.3) to an already-built controlMode — the combinator BASIC-010/013/014's
+// rows use so scalarMode's own construction stays untouched for every other
+// row.
+func withOracle(m controlMode, oracle func(ctx context.Context, rc *certify.RunCtx) Finding) controlMode {
+	m.Oracle = oracle
+	return m
+}
+
 // basicInverterControl builds one of the BASIC-004..015 rows.
 func basicInverterControl(m controlMode, subject string) certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		mrid := "CERT-" + strings.ToUpper(rc.Case.ID)
-		s := spec{
-			Notes: func(o *Observation) string {
-				if m.Unreachable != "" {
-					return "the control mode this row is about cannot be published by this bench: " + m.Unreachable
-				}
-				return fmt.Sprintf("published a DERControl (%s) carrying %s and waited %s for the DUT to "+
-					"fetch it", mrid, m.Element, o.Waited.Round(rounding))
-			},
-			Criteria: func(o *Observation) []criterion {
-				crits := []criterion{critDiscoveryRoot(), critProgramList(0)}
-				if m.Unreachable != "" {
-					crits = append(crits, criterion{
-						Claim: "the DUT received and applied a DERControl carrying " + subject,
-						How: "the presence of a <" + m.Element + "> element inside a DERControlBase the DUT " +
-							"fetched",
-						Skip: m.Unreachable,
-					})
-				} else {
-					crits = append(crits, critDERControlCarriesMode(m.Element,
-						"the DUT fetched a DERControl carrying "+subject))
-				}
-				crits = append(crits, critDefaultDERControl(), critDEREffectUnobservable(subject))
-				return crits
-			},
-		}
-		if m.Publish != nil {
-			s.RequiresGridSim = true
-			s.Setup = func(ctx context.Context, d *Driver, params map[string]string) error {
-				params["mrid"] = mrid
-				return m.Publish(ctx, d, mrid)
-			}
-			s.Cleanup = func(ctx context.Context, d *Driver) {
-				_ = d.ClearControls(ctx, m.Program)
-				_ = d.ClearCurves(ctx, m.Program)
-			}
-		}
-		return run(ctx, rc, s)
+		return run(ctx, rc, inverterControlSpec(m, subject, mrid))
 	}
+}
+
+// inverterControlSpec builds the spec basicInverterControl runs. Factored out
+// — the same shape as eventScenarioSpec/coreResponsesSpec — so a test can
+// drive its Setup and PostWait directly against a real Driver (nonce_test.go's
+// gridsimDriver pattern) without booting the whole certify.Check machinery,
+// which needs a live capture window run() cannot fake.
+func inverterControlSpec(m controlMode, subject, mrid string) spec {
+	s := spec{
+		Notes: func(o *Observation) string {
+			if m.Unreachable != "" {
+				return "the control mode this row is about cannot be published by this bench: " + m.Unreachable
+			}
+			return fmt.Sprintf("published a DERControl (%s) carrying %s and waited %s for the DUT to "+
+				"fetch it", mrid, m.Element, o.Waited.Round(rounding))
+		},
+		Criteria: func(o *Observation) []criterion {
+			crits := []criterion{critDiscoveryRoot(), critProgramList(0)}
+			if m.Unreachable != "" {
+				crits = append(crits, criterion{
+					Claim: "the DUT received and applied a DERControl carrying " + subject,
+					How: "the presence of a <" + m.Element + "> element inside a DERControlBase the DUT " +
+						"fetched",
+					Skip: m.Unreachable,
+				})
+			} else {
+				crits = append(crits, critDERControlCarriesMode(m.Element,
+					"the DUT fetched a DERControl carrying "+subject))
+			}
+			crits = append(crits, critDefaultDERControl())
+			if m.Oracle != nil {
+				crits = append(crits, critDEREffectViaSouthboundOracle(subject, o))
+			} else {
+				crits = append(crits, critDEREffectUnobservable(subject))
+			}
+			return crits
+		},
+	}
+	if m.Publish != nil {
+		s.RequiresGridSim = true
+		s.Setup = func(ctx context.Context, d *Driver, params map[string]string) error {
+			params["mrid"] = mrid
+			return m.Publish(ctx, d, mrid)
+		}
+		// PostWait, NOT Setup, is where the independent southbound oracle
+		// (IW13-005) fires. check.go's run() orders the live phase Setup ->
+		// [wait for the DUT's poll cycle] -> PostWait -> Change, and Setup is
+		// the ONLY phase that runs before that wait — a control published
+		// with StartOffset:30/DurationS:120 (scalarMode) cannot possibly have
+		// been fetched or applied by the DUT yet. An oracle fired from Setup
+		// therefore always read an empty register, always came back
+		// Unavailable, and always degraded this criterion to the same hard
+		// SKIP IW13-005 exists to eliminate — silently, since the criterion
+		// still "ran" and just found nothing. PostWait runs after that wait
+		// is over (spec.PostWait's own doc: "a read-only observation taken
+		// right after the live phase's wait ... is done, and BEFORE Change"),
+		// the same slot CORE-005's clock probe (probeGatewayClock) uses for
+		// its own DUT-state read.
+		if m.Oracle != nil {
+			s.PostWait = func(ctx context.Context, d *Driver, params map[string]string) error {
+				f := m.Oracle(ctx, d.rc)
+				switch {
+				case f.Unavailable != "":
+					params[oracleUnavailableParam] = f.Unavailable
+				default:
+					params[oracleVerdictParam] = string(f.Verdict)
+					params[oracleObservedParam] = f.Observed
+				}
+				// The oracle already encodes "could not decide" as its own
+				// Unavailable outcome above; nothing here is fatal to the
+				// check (check.go's PostWait contract: a returned error is
+				// logged and the run continues, exactly like Setup/Change
+				// already treat their own bench-lever failures as evidence
+				// rather than grounds to abandon the run).
+				return nil
+			}
+		}
+		s.Cleanup = func(ctx context.Context, d *Driver) {
+			_ = d.ClearControls(ctx, m.Program)
+			_ = d.ClearCurves(ctx, m.Program)
+			// This clears the CSIP-side control/curve, not the DER's own
+			// southbound registers — this bench exposes no lever to reset
+			// those (modsim's /control "reset" only resumes its animation,
+			// sim/modsim/main.go; there is no register-clear endpoint), and
+			// IW13-001 §4.3 does not ask for one. The risk this leaves is
+			// bounded, not ignored: PostWait's oracle compares the DER's
+			// registers against THIS row's own commanded value, so a stale
+			// register left over from an earlier row reads as a MISMATCH —
+			// a FAIL, not a false PASS — unless the stale value happens to
+			// equal what THIS row is about to command. BASIC-010
+			// (WMaxLimPct) and BASIC-013 (WSet/WSetPct) are the only two
+			// oracled rows and command different registers, so neither can
+			// leave the other a false PASS; the remaining exposure is a row
+			// false-passing against its OWN prior run's identical value on a
+			// re-run that never actually re-applied the control, which a
+			// register-clear lever would close but which this design does
+			// not add (a heavier reset path than IW13-001 §4.3 specifies).
+		}
+	}
+	return s
 }
 
 // critDEREffectUnobservable is the honest record of the half of every inverter
@@ -202,6 +305,187 @@ func critDEREffectUnobservable(subject string) criterion {
 			"On this bench it would appear on the gateway's SOUTHBOUND Modbus leg (a different capture and a " +
 			"different suite) or, for the ride-through modes, on no wire at all. This suite certifies the " +
 			"protocol half: that the control reached the DUT inside a conformant DERControl",
+	}
+}
+
+// critDEREffectViaSouthboundOracle is critDEREffectUnobservable's replacement
+// for BASIC-010/013/014 (IW13-001 §4.3): the Finding was already computed
+// live, during Setup, by controlMode.Oracle — reading the DER's own raw
+// 704 register image through internal/invariant, independently of anything
+// csipmodel/derbase decoded. This criterion's Wire evaluator does not touch
+// the recovered pcap transcript at all; it reports the pre-computed verdict
+// carried through Observation.Params. Unlike critDEREffectUnobservable, this
+// criterion is a REAL PASS/FAIL: a units bug in the shared decode path can no
+// longer self-certify by having the only check that would catch it always
+// SKIP.
+func critDEREffectViaSouthboundOracle(subject string, o *Observation) criterion {
+	claim := "the DER's own southbound registers hold the value " + subject + " commanded"
+	how := "an independent read of the DER's raw SunSpec 704 image (internal/invariant, which shares only " +
+		"the register-offset tables with the product and none of its CSIP/derbase interpretation), compared " +
+		"against the value this row itself commanded — not against what the DUT reports the DER received"
+	if reason, ok := o.Params[oracleUnavailableParam]; ok && reason != "" {
+		return criterion{Claim: claim, How: how, Skip: "the independent southbound oracle could not reach a " +
+			"verdict: " + reason}
+	}
+	verdict := certify.Verdict(o.Params[oracleVerdictParam])
+	observed := o.Params[oracleObservedParam]
+	return criterion{
+		Claim: claim,
+		How:   how,
+		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
+			return Finding{Verdict: verdict, Observed: observed}
+		},
+	}
+}
+
+// oracleSimName is the certify.RunCtx sim slot the DER under BASIC-010/013/014
+// is reachable through — the same slot basicAlarms already drives southbound
+// (alarmSimName), the bench's one managed inverter for this suite's scalar
+// control rows.
+const oracleSimName = alarmSimName
+
+// oracleTolerance is the slack the independent oracle allows a resolved
+// value: 1% of the commanded value plus a small absolute floor, so the last
+// register count (a hundredths-of-a-percent or watts rounding step) does not
+// fail a row that is otherwise exactly right. Mirrors CtlTolerance's shape
+// (internal/diff/ctl.go) for the same reason stated there — a constant of the
+// family, not derived from the value under test.
+func oracleTolerance(want float64, absFloor float64) float64 {
+	return math.Abs(want)*0.01 + absFloor
+}
+
+// oracleUnitView connects to the DER's own simapi sidecar and reads its raw
+// register image — the SAME internal/invariant.SimAPIDER source
+// cmd/gw-campaign and sim/gw-mayhem already use in production campaign code,
+// never a shortcut invented for this suite.
+func oracleUnitView(ctx context.Context, rc *certify.RunCtx, simName string) (invariant.UnitView, error) {
+	sim, err := rc.Sim(simName)
+	if err != nil {
+		return invariant.UnitView{}, err
+	}
+	der := invariant.NewSimAPIDER(simName, sim, 1)
+	view, err := der.Observe(ctx)
+	if err != nil {
+		return invariant.UnitView{}, fmt.Errorf("read %s's own registers: %w", simName, err)
+	}
+	if !view.Reachable {
+		return invariant.UnitView{}, fmt.Errorf("%s's own register image was not reachable: %s", simName, view.Err)
+	}
+	return view.Unit, nil
+}
+
+// oracleMaxLimW builds a BASIC-010 (opModMaxLimW) Oracle: a direct
+// percent-to-percent comparison against the DER's own enabled WMaxLimPct —
+// both sides already express %setMaxW, so no nameplate/watts resolution is
+// needed at all (IW13-001 §1/§4.3).
+func oracleMaxLimW(wantHundredths int64) func(ctx context.Context, rc *certify.RunCtx) Finding {
+	return func(ctx context.Context, rc *certify.RunCtx) Finding {
+		uv, err := oracleUnitView(ctx, rc, oracleSimName)
+		if err != nil {
+			return unavailable("%v", err)
+		}
+		want := float64(wantHundredths) / 100.0
+		for _, c := range uv.Commands(oracleSimName) {
+			if c.Point != "WMaxLimPct" || !c.Enabled || !c.Raw.Known() {
+				continue
+			}
+			got := c.Raw.Val
+			observed := fmt.Sprintf("the DER's own WMaxLimPct register reads %.2f%% (commanded %.2f%%)", got, want)
+			if math.Abs(got-want) <= oracleTolerance(want, 0.5) {
+				return Finding{Verdict: certify.Pass, Observed: observed}
+			}
+			return Finding{Verdict: certify.Fail, Observed: observed}
+		}
+		return unavailable("the DER reports no enabled WMaxLimPct in its own 704 image")
+	}
+}
+
+// oracleFixedW builds a BASIC-013 (opModFixedW) Oracle: the DER's own
+// resolved WSet/WSetPct watts value, compared against the commanded percent
+// resolved against THIS SAME DER's own WMax (§2.1 Phase 1, symmetric both
+// signs — mirroring csipin.go's fixedWReference/derbase's identical judgment
+// call: this package's Nameplate type has no distinct charge/discharge
+// rating to prefer instead).
+func oracleFixedW(wantHundredths int64) func(ctx context.Context, rc *certify.RunCtx) Finding {
+	return func(ctx context.Context, rc *certify.RunCtx) Finding {
+		uv, err := oracleUnitView(ctx, rc, oracleSimName)
+		if err != nil {
+			return unavailable("%v", err)
+		}
+		np := uv.Nameplate(oracleSimName)
+		if !np.Present {
+			return unavailable("the DER serves no M702, so its own WMax has no value to resolve the " +
+				"commanded percent against")
+		}
+		meas := uv.Measurement(oracleSimName)
+		base, err := np.Base(invariant.RefWMax, 1, meas)
+		if err != nil {
+			return unavailable("cannot resolve the DER's own WMax: %v", err)
+		}
+		wantPct := float64(wantHundredths) / 100.0
+		wantW := wantPct / 100 * base.Q.Val
+		for _, c := range uv.Commands(oracleSimName) {
+			if (c.Point != "WSet" && c.Point != "WSetPct") || !c.Enabled {
+				continue
+			}
+			r := invariant.ResolveCommand(c, np, meas)
+			if !r.Physical.Known() || r.Physical.Unit != invariant.UnitWatt {
+				continue
+			}
+			gotW := r.Physical.Val
+			observed := fmt.Sprintf("the DER's own %s resolves to %.1f W (commanded %.2f%% of its own %.1f W = %.1f W)",
+				c.Point, gotW, wantPct, base.Q.Val, wantW)
+			if math.Abs(gotW-wantW) <= oracleTolerance(wantW, 1) {
+				return Finding{Verdict: certify.Pass, Observed: observed}
+			}
+			return Finding{Verdict: certify.Fail, Observed: observed}
+		}
+		return unavailable("the DER reports no enabled WSet/WSetPct in its own 704 image")
+	}
+}
+
+// oracleTargetW builds an opModTargetW Oracle: genuinely independent
+// watts-to-watts, no percent conversion on this axis at all (§1.1 —
+// opModTargetW was already correct, ActivePower/watts) — the DER's own
+// resolved WSet (watts mode) compared directly against the commanded
+// value×10^multiplier.
+//
+// DELIBERATELY NOT WIRED to BASIC-014 (see register.go's own comment on that
+// row, and this design's STOP condition — docs/design/
+// IW13_ACTIVE_POWER_UNITS_2026-08-12.md §3.4/§4.3 does not resolve this):
+// opModTargetW stays CannotComply (supported.go's ScalarSupportedAxes,
+// unchanged), so a correctly-behaving DUT NEVER writes the commanded value
+// southbound at all — this function's "the DER holds the commanded value"
+// assertion would FAIL every conformant DUT, exactly backwards from BASIC-010/
+// 013's oracles, which test axes the product genuinely executes. Kept,
+// unwired, as the groundwork for a future "the refusal left no southbound
+// trace" oracle (the opposite assertion), which is a materially different
+// check this design does not specify.
+func oracleTargetW(wantWatts int64) func(ctx context.Context, rc *certify.RunCtx) Finding {
+	return func(ctx context.Context, rc *certify.RunCtx) Finding {
+		uv, err := oracleUnitView(ctx, rc, oracleSimName)
+		if err != nil {
+			return unavailable("%v", err)
+		}
+		np := uv.Nameplate(oracleSimName)
+		meas := uv.Measurement(oracleSimName)
+		want := float64(wantWatts)
+		for _, c := range uv.Commands(oracleSimName) {
+			if c.Point != "WSet" || !c.Enabled {
+				continue
+			}
+			r := invariant.ResolveCommand(c, np, meas)
+			if !r.Physical.Known() || r.Physical.Unit != invariant.UnitWatt {
+				continue
+			}
+			gotW := r.Physical.Val
+			observed := fmt.Sprintf("the DER's own WSet resolves to %.1f W (commanded %.1f W)", gotW, want)
+			if math.Abs(gotW-want) <= oracleTolerance(want, 1) {
+				return Finding{Verdict: certify.Pass, Observed: observed}
+			}
+			return Finding{Verdict: certify.Fail, Observed: observed}
+		}
+		return unavailable("the DER reports no enabled watts-mode WSet in its own 704 image")
 	}
 }
 

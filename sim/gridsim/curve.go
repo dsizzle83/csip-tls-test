@@ -458,7 +458,9 @@ func extBaseToInfo(b model.ExtendedDERControlBase) adminBaseInfo {
 		info.ExpLimW = &v
 	}
 	if b.OpModMaxLimW != nil {
-		v := apW(b.OpModMaxLimW)
+		// IW13-001: PerCent, not ActivePower — see baseToInfo's identical
+		// correction in admin.go.
+		v := int64(b.OpModMaxLimW.Value)
 		info.MaxLimW = &v
 	}
 	if b.OpModImpLimW != nil {
@@ -474,8 +476,13 @@ func extBaseToInfo(b model.ExtendedDERControlBase) adminBaseInfo {
 		info.LoadLimW = &v
 	}
 	if b.OpModFixedW != nil {
-		v := apW(b.OpModFixedW)
+		// IW13-001: SignedPerCent, not ActivePower.
+		v := int64(b.OpModFixedW.Value)
 		info.FixedW = &v
+	}
+	if b.OpModTargetW != nil {
+		v := apW(b.OpModTargetW)
+		info.TargetW = &v
 	}
 	if b.OpModFixedPFInjectW != nil {
 		v := int64(b.OpModFixedPFInjectW.Value)

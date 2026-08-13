@@ -161,19 +161,37 @@ func Intents(ctrl model.DERControlBase, n invariant.Nameplate, meas invariant.Me
 	if ctrl.OpModFixedW != nil {
 		// opModFixedW is a SETPOINT: the device is told to produce this much
 		// active power, not merely permitted to.
-		w := activePowerWatts(ctrl.OpModFixedW)
-		out = append(out, Intent{Mode: "opModFixedW", Kind: KindSetpoint, Binding: true,
-			Raw: w, Want: w})
+		//
+		// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1/§2.1):
+		// SignedPerCent, not ActivePower — a percentage of the device's OWN
+		// setMaxW/setMaxDischargeRateW (positive) or setMaxChargeRateW
+		// (negative), resolved against THIS device's own nameplate (n), never
+		// the DUT's report of it (referee independence, package doc). Phase 1
+		// (this design's own judgment call, mirrored here rather than
+		// reinvented): no distinct charge/discharge rating exists in this
+		// package's Nameplate type either, so both signs resolve against
+		// RefWMax symmetrically — the identical posture csipin.go's
+		// fixedWReference takes.
+		out = append(out, fixedWIntent(*ctrl.OpModFixedW, n, meas))
 	}
 
 	// Export / generation / maximum ceilings. Each is an independent upper
 	// bound on active power, so all of them hold at once and the binding one is
 	// the smallest. Reducing them here — rather than picking one — is the
 	// referee's whole disagreement with a first-non-nil reader.
+	//
+	// opModMaxLimW joins this same combine as a WATTS quantity resolved from
+	// its own PerCent against n (IW13-001 §1/§3.3) — ExpLimW/GenLimW are
+	// unaffected (§1.2, still genuine ActivePower/watts). This referee already
+	// evaluates one device at a time (n/meas are THIS device's own), so there
+	// is no site-level/per-device split to model here the way csipin.go's
+	// two-tier combine has to: from this referee's vantage every one of these
+	// three axes is already a per-device watts ceiling by the time it reaches
+	// the combine.
 	out = append(out, ceilingIntents(invariant.UnitWatt, 1, []namedPower{
-		{"opModExpLimW", ctrl.OpModExpLimW},
-		{"opModMaxLimW", ctrl.OpModMaxLimW},
-		{"opModGenLimW", ctrl.OpModGenLimW},
+		{"opModExpLimW", apQty(ctrl.OpModExpLimW)},
+		{"opModMaxLimW", maxLimWQty(ctrl.OpModMaxLimW, n)},
+		{"opModGenLimW", apQty(ctrl.OpModGenLimW)},
 	})...)
 
 	// Import / load ceilings. Same conjunctive reduction; the sign convention
@@ -181,16 +199,77 @@ func Intents(ctrl model.DERControlBase, n invariant.Nameplate, meas invariant.Me
 	// an import ceiling is a bound on the MAGNITUDE of a negative flow and is
 	// carried as a negative quantity.
 	out = append(out, ceilingIntents(invariant.UnitWatt, -1, []namedPower{
-		{"opModImpLimW", ctrl.OpModImpLimW},
-		{"opModLoadLimW", ctrl.OpModLoadLimW},
+		{"opModImpLimW", apQty(ctrl.OpModImpLimW)},
+		{"opModLoadLimW", apQty(ctrl.OpModLoadLimW)},
 	})...)
 
 	return out
 }
 
+// namedPower pairs a CSIP axis name with its already-resolved watts quantity
+// (nil = axis absent). Resolved BEFORE reaching ceilingIntents so the combine
+// itself stays unit-agnostic — opModMaxLimW's PerCent-via-nameplate resolution
+// (maxLimWQty) and opModExpLimW/opModGenLimW's/opModImpLimW's/opModLoadLimW's
+// plain ActivePower decode (apQty) produce the identical shape by the time
+// they get here (IW13-001 §3.3).
 type namedPower struct {
 	mode string
-	ap   *model.ActivePower
+	q    *invariant.Quantity
+}
+
+// apQty decodes an ActivePower axis to a watts Quantity pointer, nil when the
+// axis is absent — ExpLimW/GenLimW/ImpLimW/LoadLimW's unchanged path (§1.2).
+func apQty(ap *model.ActivePower) *invariant.Quantity {
+	if ap == nil {
+		return nil
+	}
+	q := activePowerWatts(ap)
+	return &q
+}
+
+// maxLimWQty resolves opModMaxLimW's PerCent against n's own WMax (IW13-001
+// §1/§3.3) — nil when the axis is absent OR when n cannot resolve WMax
+// (device serves no M702 / declares neither WMaxRtg nor WMax), the same
+// honest-unknown-nameplate refusal fixedWIntent and csipin.go's own
+// fixedWReference take: this axis needs THIS device's own rating to mean
+// anything, so there is no watts-safe fallback to guess.
+func maxLimWQty(pc *model.PerCent, n invariant.Nameplate) *invariant.Quantity {
+	if pc == nil || !n.Present {
+		return nil
+	}
+	base, err := n.Base(invariant.RefWMax, 1, invariant.Measurement{})
+	if err != nil {
+		return nil
+	}
+	pct := float64(pc.Value) / 100.0
+	q := invariant.Q(pct/100*base.Q.Val, invariant.UnitWatt)
+	return &q
+}
+
+// fixedWIntent resolves opModFixedW's SignedPerCent into watts against n's own
+// WMax (IW13-001 §1/§2.1, Phase 1 — symmetric both signs, see the call site's
+// comment). Unresolved (not a guess) when n cannot supply WMax at all.
+func fixedWIntent(spc model.SignedPerCent, n invariant.Nameplate, meas invariant.Measurement) Intent {
+	pct := float64(spc.Value) / 100.0
+	in := Intent{
+		Mode:    "opModFixedW",
+		Kind:    KindSetpoint,
+		Raw:     invariant.Q(pct, invariant.UnitPercent),
+		Ref:     invariant.RefWMax,
+		Binding: true,
+	}
+	if !n.Present {
+		in.Unresolved = "the device serves no M702, so WMax has no value on it"
+		return in
+	}
+	base, err := n.Base(invariant.RefWMax, 1, meas)
+	if err != nil {
+		in.Unresolved = fmt.Sprintf("cannot resolve WMax on this device: %v", err)
+		return in
+	}
+	in.BaseUsed = base.Name
+	in.Want = invariant.Q(pct/100*base.Q.Val, invariant.UnitWatt)
+	return in
 }
 
 // ceilingIntents reduces a set of simultaneously-commanded ceilings to their
@@ -200,10 +279,10 @@ type namedPower struct {
 func ceilingIntents(unit invariant.Unit, sign float64, ps []namedPower) []Intent {
 	var present []Intent
 	for _, p := range ps {
-		if p.ap == nil {
+		if p.q == nil {
 			continue
 		}
-		q := activePowerWatts(p.ap)
+		q := *p.q
 		q.Val = math.Abs(q.Val) * sign
 		present = append(present, Intent{Mode: p.mode, Kind: KindCeiling, Raw: q, Want: q})
 	}

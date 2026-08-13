@@ -222,7 +222,10 @@ func appliedAxes(c Ctrl, ders []devView, tol Tolerance) (applied, unjudgeable in
 
 	for _, ax := range c.Base.Axes() {
 		switch ax.Name {
-		case "opModExpLimW", "opModMaxLimW", "opModGenLimW", "opModImpLimW", "opModLoadLimW":
+		case "opModExpLimW", "opModGenLimW", "opModImpLimW", "opModLoadLimW":
+			// Still genuine site-level watts (§1.2, unaffected by IW13-001) —
+			// opModMaxLimW moved to its own case below, since a per-device
+			// percent axis has no site total to judge.
 			if !siteWOK {
 				unjudgeable++
 				parts = append(parts, ax.Name+"=unjudgeable(no DER resolves an active-power setpoint)")
@@ -235,12 +238,47 @@ func appliedAxes(c Ctrl, ders []devView, tol Tolerance) (applied, unjudgeable in
 			} else {
 				parts = append(parts, fmt.Sprintf("%s=NOT applied(site %s W > %s W)", ax.Name, trimFloat(siteW), trimFloat(ax.Value)))
 			}
-		case "opModFixedW":
-			if anyEnabled(ders, "WSet", "WSetPct") {
+		case "opModMaxLimW":
+			// IW13-001 §1/§3.3: PerCent of EACH DEVICE'S OWN setMaxW, not a
+			// site-level watts figure — the "judge by the site total because
+			// the per-device allocation is internal policy and is not
+			// externally derivable" reasoning (this file's own package doc)
+			// no longer applies: a per-device percent has no allocation to
+			// guess at all, every admitted DER independently applies the
+			// SAME commanded percent to ITS OWN rating. Applied when EVERY
+			// DER that reports an enabled WMaxLimPct holds it at or below
+			// the commanded percent — direct percent-to-percent (both sides
+			// already express %setMaxW), no nameplate/watts resolution
+			// needed for this comparison at all.
+			judged, allSatisfy, judgedDetail := maxLimWAppliedPerDevice(ders, ax.Value, tol)
+			if !judged {
+				unjudgeable++
+				parts = append(parts, ax.Name+"=unjudgeable(no DER reports an enabled WMaxLimPct)")
+			} else if allSatisfy {
 				applied++
-				parts = append(parts, ax.Name+"=applied(WSet/WSetPct enabled)")
+				parts = append(parts, fmt.Sprintf("%s=applied(%s, commanded %s%%)", ax.Name, judgedDetail, trimFloat(ax.Value)))
 			} else {
-				parts = append(parts, ax.Name+"=NOT applied(no WSet/WSetPct enabled)")
+				parts = append(parts, fmt.Sprintf("%s=NOT applied(%s, commanded %s%%)", ax.Name, judgedDetail, trimFloat(ax.Value)))
+			}
+		case "opModFixedW":
+			// IW13-001: a real MAGNITUDE check now, not just the enable bit —
+			// the sibling ceiling branches above always checked magnitude;
+			// this axis only checked the enable bit before the retype
+			// (i10.go's own pre-fix gap the design names explicitly). §2.1
+			// Phase 1 (mirroring csipin.go's fixedWReference/derbase's own
+			// judgment call): resolved against each DER's own WMax
+			// symmetrically for both signs, since this package's Nameplate
+			// type (like csipin.go's) has no distinct charge/discharge
+			// rating to prefer instead.
+			judged, allSatisfy, judgedDetail := fixedWAppliedPerDevice(ders, ax.Value, tol)
+			if !judged {
+				unjudgeable++
+				parts = append(parts, ax.Name+"=unjudgeable(no DER resolves an enabled WSet/WSetPct against its own nameplate)")
+			} else if allSatisfy {
+				applied++
+				parts = append(parts, fmt.Sprintf("%s=applied(%s, commanded %s%%)", ax.Name, judgedDetail, trimFloat(ax.Value)))
+			} else {
+				parts = append(parts, fmt.Sprintf("%s=NOT applied(%s, commanded %s%%)", ax.Name, judgedDetail, trimFloat(ax.Value)))
 			}
 		case "opModFixedVar":
 			if anyEnabled(ders, "VarSet", "VarSetPct") {
@@ -303,6 +341,74 @@ func siteCommandedWatts(ders []devView) (float64, bool) {
 		}
 	}
 	return total, counted > 0
+}
+
+// maxLimWAppliedPerDevice checks opModMaxLimW per device (IW13-001 §1/§3.3):
+// each DER's own enabled WMaxLimPct register is compared DIRECTLY against the
+// commanded percent — both sides already express %setMaxW, so no nameplate or
+// watts resolution is needed at all, unlike the site-level ceiling axes above.
+// A CEILING comparison (one-sided: at or below), matching WMaxLimPct's own
+// KindCeiling semantics (ctl.go's resolveHeld). judged=false when no DER
+// reports an enabled WMaxLimPct at all.
+func maxLimWAppliedPerDevice(ders []devView, commandedPct float64, tol Tolerance) (judged, allSatisfy bool, detail string) {
+	allSatisfy = true
+	var details []string
+	for _, v := range ders {
+		for _, c := range enabledCommands(v.Unit.Commands(v.Source)) {
+			if c.Point != "WMaxLimPct" || !c.Raw.Known() || c.Raw.Unit != UnitPercent {
+				continue
+			}
+			judged = true
+			got := c.Raw.Val
+			details = append(details, fmt.Sprintf("%s WMaxLimPct=%s%%", v.Label, trimFloat(got)))
+			if got > commandedPct*(1+tol.Rel) {
+				allSatisfy = false
+			}
+		}
+	}
+	return judged, allSatisfy, joinComma(details)
+}
+
+// fixedWAppliedPerDevice checks opModFixedW per device (IW13-001 §1/§2.1
+// Phase 1): each DER's own resolved WSet/WSetPct watts value is compared
+// against the SAME commanded percent resolved against THAT DER's own WMax —
+// symmetric for both signs (Phase 1, mirroring csipin.go's fixedWReference
+// and derbase's own identical judgment call: this package's Nameplate type
+// has no distinct charge/discharge rating to prefer instead). A SETPOINT
+// comparison (two-sided: must match, not merely not-exceed), matching
+// WSet/WSetPct's own KindSetpoint semantics. judged=false when no DER
+// resolves both an enabled setpoint AND its own WMax.
+func fixedWAppliedPerDevice(ders []devView, commandedPct float64, tol Tolerance) (judged, allSatisfy bool, detail string) {
+	allSatisfy = true
+	var details []string
+	for _, v := range ders {
+		np := v.Unit.Nameplate(v.Source)
+		meas := v.Unit.Measurement(v.Source)
+		if !np.Present {
+			continue
+		}
+		base, err := np.Base(RefWMax, 1, meas)
+		if err != nil {
+			continue
+		}
+		wantW := commandedPct / 100 * base.Q.Val
+		for _, c := range enabledCommands(v.Unit.Commands(v.Source)) {
+			if c.Point != "WSet" && c.Point != "WSetPct" {
+				continue
+			}
+			r := ResolveCommand(c, np, meas)
+			if !r.Physical.Known() || r.Physical.Unit != UnitWatt {
+				continue
+			}
+			judged = true
+			gotW := r.Physical.Val
+			details = append(details, fmt.Sprintf("%s want %s W got %s W", v.Label, trimFloat(wantW), trimFloat(gotW)))
+			if math.Abs(gotW-wantW) > math.Abs(wantW)*tol.Rel+tol.Abs {
+				allSatisfy = false
+			}
+		}
+	}
+	return judged, allSatisfy, joinComma(details)
 }
 
 // anyEnabled reports whether any DER has one of the named 704 points enabled.

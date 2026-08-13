@@ -244,13 +244,25 @@ func (c Ctrl) Covers(t time.Time) bool {
 // CtrlBase is a DERControlBase in CSIP's own units — watts and percent, as the
 // head-end published them. Converting these into a DER's units is I1's job and
 // requires that DER's nameplate; nothing here does it implicitly.
+//
+// MaxLimW/FixedW are decoded from gridsim's /admin/status JSON
+// (sim/gridsim/admin.go's adminBaseInfo), whose max_lim_W/fixed_W keys carry
+// RAW HUNDREDTHS OF A PERCENT (IW13-001; docs/design/
+// IW13_ACTIVE_POWER_UNITS_2026-08-12.md §4.1/§4.2) — opModMaxLimW/opModFixedW's
+// real wire unit, not watts, even though the JSON key names were deliberately
+// left unchanged (admin.go's own doc comment explains why). Axes() divides by
+// 100 before labeling them UnitPercent, below, so a genuine percent (e.g.
+// 60.0, not 6000) reaches every consumer — matching this package's own
+// UnitPercent convention (units.go's WMaxLimPct/WSetPct/VarSetPct raw decodes,
+// csipref.go's identical /100 step) rather than repeating the field name's
+// pre-fix (watts) meaning under a corrected label.
 type CtrlBase struct {
 	ExpLimW     *float64 `json:"exp_lim_W,omitempty"`
-	MaxLimW     *float64 `json:"max_lim_W,omitempty"`
+	MaxLimW     *float64 `json:"max_lim_W,omitempty"` // hundredths of a percent (IW13-001) — see type doc
 	ImpLimW     *float64 `json:"imp_lim_W,omitempty"`
 	GenLimW     *float64 `json:"gen_lim_W,omitempty"`
 	LoadLimW    *float64 `json:"load_lim_W,omitempty"`
-	FixedW      *float64 `json:"fixed_W,omitempty"`
+	FixedW      *float64 `json:"fixed_W,omitempty"` // hundredths of a percent, signed (IW13-001) — see type doc
 	FixedVarPct *float64 `json:"fixed_var_pct,omitempty"`
 	PFInjectPct *float64 `json:"fixed_pf_inject_pct,omitempty"`
 	PFAbsorbPct *float64 `json:"fixed_pf_absorb_pct,omitempty"`
@@ -276,12 +288,20 @@ func (b CtrlBase) Axes() []struct {
 			out = append(out, axis{name, *p, u})
 		}
 	}
+	// addPct is add's IW13-001 sibling for the two hundredths-of-a-percent
+	// fields (MaxLimW/FixedW) — divides by 100 so the axis carries a genuine
+	// percent, per the type doc above.
+	addPct := func(name string, p *float64) {
+		if p != nil {
+			out = append(out, axis{name, *p / 100.0, UnitPercent})
+		}
+	}
 	add("opModExpLimW", b.ExpLimW, UnitWatt)
-	add("opModMaxLimW", b.MaxLimW, UnitWatt)
+	addPct("opModMaxLimW", b.MaxLimW)
 	add("opModImpLimW", b.ImpLimW, UnitWatt)
 	add("opModGenLimW", b.GenLimW, UnitWatt)
 	add("opModLoadLimW", b.LoadLimW, UnitWatt)
-	add("opModFixedW", b.FixedW, UnitPercent)
+	addPct("opModFixedW", b.FixedW)
 	add("opModFixedVar", b.FixedVarPct, UnitPercent)
 	add("opModFixedPFInjectW", b.PFInjectPct, UnitPF)
 	add("opModFixedPFAbsorbW", b.PFAbsorbPct, UnitPF)

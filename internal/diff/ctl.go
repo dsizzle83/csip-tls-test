@@ -733,12 +733,19 @@ func RenderControl(c model.DERControlBase) string {
 	if c.OpModFixedVar != nil {
 		add("opModFixedVar{refType=%d,value=%d}", c.OpModFixedVar.RefType, c.OpModFixedVar.Value.Value)
 	}
+	// IW13-001: opModFixedW/opModMaxLimW are SignedPerCent/PerCent — bare
+	// chardata, no multiplier — rendered separately from the still-ActivePower
+	// axes below (§1.2, unaffected).
+	if c.OpModFixedW != nil {
+		add("opModFixedW{pct_hundredths=%d}", c.OpModFixedW.Value)
+	}
+	if c.OpModMaxLimW != nil {
+		add("opModMaxLimW{pct_hundredths=%d}", c.OpModMaxLimW.Value)
+	}
 	for _, p := range []struct {
 		name string
 		ap   *model.ActivePower
 	}{
-		{"opModFixedW", c.OpModFixedW},
-		{"opModMaxLimW", c.OpModMaxLimW},
 		{"opModExpLimW", c.OpModExpLimW},
 		{"opModGenLimW", c.OpModGenLimW},
 		{"opModImpLimW", c.OpModImpLimW},

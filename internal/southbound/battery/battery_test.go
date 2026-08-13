@@ -234,19 +234,25 @@ func TestBattery_ApplyControl_ExportLimitClamped(t *testing.T) {
 	}
 }
 
+// TestBattery_ApplyControl_MaxLimW_FallsBackToExpLimW pins opModMaxLimW
+// reaching WMaxLimPct when ExpLimW is nil. IW13-001
+// (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md): opModMaxLimW is
+// PerCent, not ActivePower — the command IS the percent directly (20.00%),
+// with no nameplate-derived watts step to compute it from any more (the
+// pre-fix fixture commanded 1000 W on a 5000 W device to reach the same 20%
+// — that division is gone; the percent is now the wire's own unit).
 func TestBattery_ApplyControl_MaxLimW_FallsBackToExpLimW(t *testing.T) {
 	b, regs, stop := connectBattery(t)
 	defer stop()
 
-	// MaxLimW should also map to WMaxLimPct when ExpLimW is nil.
-	ap := model.ActivePower{Value: 1000, Multiplier: 0}
-	if err := b.ApplyControl(model.DERControlBase{OpModMaxLimW: &ap}); err != nil {
+	pc := model.PerCent{Value: 2000} // 20.00%
+	if err := b.ApplyControl(model.DERControlBase{OpModMaxLimW: &pc}); err != nil {
 		t.Fatalf("ApplyControl MaxLimW: %v", err)
 	}
 
 	m123Block, _ := sunspec.FindModel(b.Reader.Blocks(), sunspec.ModelImmediateCtrl)
 	rawAddr := m123Block.BaseAddr + sunspec.M123_WMaxLimPct
-	// 1000/5000 = 20%; sf=-2 → raw = 2000
+	// 20.00%; sf=-2 → raw = 2000
 	if got := regs.Get(rawAddr); got != 2000 {
 		t.Errorf("WMaxLimPct raw = %d via MaxLimW, want 2000 (20%% with sf=-2)", got)
 	}

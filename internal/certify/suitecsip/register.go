@@ -273,18 +273,48 @@ func registerInverterControls(reg *certify.Registry) {
 			r.Connect = ptr(false)
 			r.Energize = ptr(false)
 		}), "a connect/disconnect command"},
-		{"BASIC-010", 56, scalarMode("opModMaxLimW", func(r *ControlRequest) {
+		{"BASIC-010", 56, withOracle(scalarMode("opModMaxLimW", func(r *ControlRequest) {
 			r.MaxLimW = ptr(int64(6000))
-		}), "a maximum active power limit"},
+		}), oracleMaxLimW(6000)), "a maximum active power limit"},
 		{"BASIC-011", 57, curveMode("opModVoltWatt", "volt_watt",
 			[]CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}}, 3), "a Volt-Watt curve"},
 		{"BASIC-012", 58, curveMode("opModFreqWatt", "freq_watt",
 			[]CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}}, 3), "a frequency-droop / frequency-watt curve"},
-		{"BASIC-013", 59, scalarMode("opModFixedW", func(r *ControlRequest) {
-			r.FixedW = ptr(int64(50))
-		}), "a set-active-power command expressed as a percentage of maximum"},
-		{"BASIC-014", 60, scalarMode("opModFixedW", func(r *ControlRequest) {
-			r.FixedW = ptr(int64(4000))
+		// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §4.2):
+		// BASIC-013's opModFixedW is SignedPerCent, hundredths of a percent —
+		// FixedW=6000 means 60.00%, matching the catalog's own stated value
+		// verbatim (testdata/catalog/catalog.json: "opModFixedW is scaled in
+		// hundredths of a percent (5000 = 50%), so the test value 6000 = 60%
+		// of max power"). The pre-fix FixedW=50 sent a value two orders of
+		// magnitude off the catalog's own stated test value.
+		{"BASIC-013", 59, withOracle(scalarMode("opModFixedW", func(r *ControlRequest) {
+			r.FixedW = ptr(int64(6000))
+		}), oracleFixedW(6000)), "a set-active-power command expressed as a percentage of maximum"},
+		// BASIC-014 is opModTargetW (genuine nested ActivePower, watts — §1.1,
+		// already correct) — NOT opModFixedW, which the pre-fix row rode
+		// because ControlRequest/adminCtrlReq had no TargetW lever at all
+		// (§4.2: "BASIC-014 cannot even in principle be sent correctly with
+		// the harness's current request surface, independent of the units
+		// bug"). TargetW=3000 matches the catalog's own stated value
+		// ("opModTargetW | 2000 (value 2000, multiplier 0) | 3000 (0
+		// multiplier)").
+		//
+		// NOT wired to oracleTargetW (STOP, flagged rather than guessed —
+		// docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §3.4/§4.3 does
+		// not resolve this): opModTargetW stays CannotComply (supported.go's
+		// ScalarSupportedAxes, unchanged) — the product REFUSES this axis and
+		// never writes it southbound at all. An oracle built the same way as
+		// BASIC-010/013's (asserting the DER's own register HOLDS the
+		// commanded value) would FAIL every correctly-refusing DUT, which
+		// would be exactly backwards. Asserting the opposite (the DER shows
+		// NO trace of the refused command, proving the refusal was honest and
+		// not a silent partial write) is a materially different check the
+		// design doesn't specify, so this row keeps critDEREffectUnobservable's
+		// honest SKIP — only its request-surface fix (the TargetW field
+		// itself, closing "cannot even in principle be sent correctly") lands
+		// here.
+		{"BASIC-014", 60, scalarMode("opModTargetW", func(r *ControlRequest) {
+			r.TargetW = ptr(int64(3000))
 		}), "a set-active-power command expressed in watts"},
 		{"BASIC-015", 61, curveMode("opModWattPF", "watt_pf",
 			[]CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}}, 3),

@@ -71,10 +71,7 @@
     <DERControlBase>
       <opModConnect>true</opModConnect>
       <opModEnergize>true</opModEnergize>
-      <opModFixedW>
-        <multiplier>0</multiplier>
-        <value>-1500</value>
-      </opModFixedW>
+      <opModFixedW>-1500</opModFixedW>
     </DERControlBase>
     <randomizeStart>30</randomizeStart>
   </DERControl>

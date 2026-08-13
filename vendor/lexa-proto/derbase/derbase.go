@@ -53,6 +53,63 @@ type Base struct {
 	// orchestrator may set this from the active control's remaining duration.
 	DefaultRvrtTms uint32
 
+	// DefaultWRmpPct / DefaultVarRmpPct (CSIP_CONTROL_EXECUTION_2026-08-12.md
+	// §3.2/§7.1), when non-nil, are written to 704's WRmp / VarRmp as a
+	// standing device ramp-rate POLICY (percent of the reference named by
+	// DefaultWRmpRefIsAMax, per second — unscaled, matching WRmp/VarRmp's own
+	// register convention). Unlike DefaultRvrtTms, these are STICKY/GLOBAL
+	// (§1.2): one write governs every subsequent WSet/WMaxLimPct/VarSet
+	// transition until next changed, not a value scoped to one control. nil
+	// (the zero value) leaves WRmp/VarRmp untouched — byte-identical to
+	// today's behavior for every caller that does not opt in.
+	DefaultWRmpPct       *float64
+	DefaultVarRmpPct     *float64
+	DefaultWRmpRefIsAMax bool
+
+	// DefaultWSetRvrt / DefaultWSetEnaRvrt (IW13-004a — docs/design/
+	// IW13_CONTROL_EXECUTION_COMPLETENESS_2026-08-12.md §2a) are the missing
+	// reversion-alternate half of WSetRvrtTms: the countdown DefaultRvrtTms
+	// already arms has never had a defined destination, so expiry today lands
+	// the device on whatever WSetRvrt/WSetEnaRvrt already hold — the factory
+	// default or a stale prior session, never a value this gateway chose.
+	// DefaultWSetRvrt is WATTS, the same domain as SetActivePowerWatts' own w
+	// parameter (WSet/WSetRvrt share one WSet_SF scale factor, no per-write
+	// conversion) and is validated against the nameplate exactly like the
+	// primary setpoint (checkSetpointWithinNameplate) — a reversion
+	// destination the device cannot hold is refused, not silently written.
+	// DefaultWSetEnaRvrt is the arming bit. The two are consumed together:
+	// EnaRvrt=true with no value is refused (see rvrtAlternateWriter) rather
+	// than silently armed against the register's current, unknown contents —
+	// that is the exact hazard this finding exists to close. nil
+	// DefaultWSetEnaRvrt (the zero value) leaves both registers untouched —
+	// byte-identical to today for every caller that does not opt in; the gw
+	// caller populates both from its own resolved default/DefaultFallback
+	// (stage 2, not implemented here).
+	DefaultWSetRvrt    *float64
+	DefaultWSetEnaRvrt *bool
+
+	// DefaultWMaxLimPctRvrt / DefaultWMaxLimPctEnaRvrt is DefaultWSetRvrt's
+	// sibling for the WMaxLimPct ceiling axis (WMaxLimPctRvrtTms's own missing
+	// destination). DefaultWMaxLimPctRvrt is WATTS — matching
+	// SetWMaxLimPctW's own w parameter, NOT the WMaxLimPctRvrt register's raw
+	// percent-of-WMax domain — and is converted to percent at write time
+	// exactly as the primary WMaxLimPct value already is (negative refused,
+	// above-nameplate clamped to 100%, the same rule SetWMaxLimPctW applies to
+	// its own w). A ceiling reversion value is a bound like the primary
+	// ceiling, so it clamps rather than refuses at the top of its range;
+	// DefaultWSetRvrt above is a setpoint's alternate and refuses instead, for
+	// the identical reason SetActivePowerWatts refuses rather than clamps.
+	DefaultWMaxLimPctRvrt    *float64
+	DefaultWMaxLimPctEnaRvrt *bool
+
+	// CSIPRampTmsSeconds, when non-nil, is a CSIP-resolved per-axis ramp time
+	// (seconds) for the legacy M123 active-power ceiling that legacyRmpTms()
+	// prefers over LegacyRmpTms's fixed policy default (§3.3, closes Gap D) —
+	// additive precedence, not a replacement: LegacyRmpTms/defaultLegacyRmpTms
+	// still governs whenever this is nil (an mbaps-authority write, or a CSIP
+	// control that named no ramp for this axis).
+	CSIPRampTmsSeconds *uint16
+
 	// AdoptPollTimeout bounds how long curve writers wait for AdptCrvRslt to
 	// report COMPLETED. Zero uses adoptPollDefault. Expiry without a result is
 	// an AdoptTimeoutError, never success (LXR-006).
@@ -413,6 +470,23 @@ func wattsChecked(ap *model.ActivePower, axis string) (float64, error) {
 	return w, nil
 }
 
+// pctChecked converts a CSIP SignedPerCent/PerCent hundredths value to a
+// percent float, range-checked per the XSD's xs:short domain
+// (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §2.4): signed axes
+// (opModFixedW) to [-10000,10000] hundredths, unsigned axes (opModMaxLimW)
+// to [0,10000]. IW13-001 — opModFixedW/opModMaxLimW are percent, not watts.
+func pctChecked(hundredths int16, axis string, signed bool) (float64, error) {
+	var lo int16
+	if signed {
+		lo = -10000
+	}
+	if hundredths < lo || hundredths > 10000 {
+		return 0, &InvalidControlError{Axis: axis,
+			Reason: fmt.Sprintf("percent %d hundredths outside [%d,10000]", hundredths, lo)}
+	}
+	return float64(hundredths) / 100.0, nil
+}
+
 // ── ApplyControl: CSIP DERControlBase → SunSpec ──────────────────────────────
 
 // ApplyControl executes every axis present in ctrl against the device.
@@ -535,7 +609,51 @@ func (b *Base) ApplyControlPlan(ctrl model.DERControlBase, tag string) (PlanOutc
 	if err != nil {
 		return out, err // whole-request rejection: nothing has been written
 	}
+	return b.runControlSteps(tag, steps)
+}
 
+// ApplyActuationWatts is ApplyControlPlan's watts-native sibling (IW13-001 §5.2;
+// docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md), for callers that already
+// hold a resolved watts value for FixedW/MaxLimW and a plain connect opinion —
+// cmd/modbus's southbound reconcile shells, specifically, which never decode a
+// real CSIP document at all (bus.DesiredState.SetpointW/CeilingW arrive
+// already resolved to watts, the OUTPUT of the gateway's own per-DER percent
+// conversion). The pre-fix code re-wrapped that watts value into a synthetic
+// ActivePower purely to reuse ApplyControlPlan's ordering/preflight/
+// classification machinery; once OpModFixedW/OpModMaxLimW retype to percent
+// (§1), doing that again would mean encoding an already-correct watts value
+// as a FAKE percent just so this function could convert it back to watts one
+// call later — exactly the type-says-one-thing-code-means-another bug this
+// whole design exists to eliminate. No ActivePower/SignedPerCent/PerCent
+// construction happens anywhere in this call.
+//
+// Same three-phase contract as ApplyControlPlan (preflight-all-then-execute,
+// restrictive-first order, one bounded re-attempt, document-level Mixed/
+// LessRestrictiveThanIntended classification) — see ApplyControlPlan's doc
+// comment for the full reasoning, shared unchanged via runControlSteps.
+//
+// Restricted to the three axes the southbound reconcile shells actually
+// drive (Connect, FixedW, MaxLimW). PF/var/curve/energize axes are the
+// advanced-DER shell's own surface (cmd/modbus/reconcile_adv.go), reached
+// through ApplyControlPlan directly with a real DERControlBase, never
+// through this entry point.
+func (b *Base) ApplyActuationWatts(fixedW, maxLimW *float64, connect *bool, tag string) (PlanOutcome, error) {
+	out := PlanOutcome{Tag: tag, Plan: PlanApplyControl}
+	steps, err := b.preflightActuationWatts(fixedW, maxLimW, connect, tag)
+	if err != nil {
+		return out, err
+	}
+	return b.runControlSteps(tag, steps)
+}
+
+// runControlSteps executes a preflighted step list and builds the document-
+// level PlanOutcome — the shared engine both ApplyControlPlan and
+// ApplyActuationWatts drive. Factored out of ApplyControlPlan verbatim
+// (IW13-001 §5.2) so the two preflighters (CSIP-typed and watts-native) can
+// share one execution/classification engine; this function's BEHAVIOR is
+// unchanged from before the split.
+func (b *Base) runControlSteps(tag string, steps []applyStep) (PlanOutcome, error) {
+	out := PlanOutcome{Tag: tag, Plan: PlanApplyControl}
 	// Materialize the execution order once so the outcome's element order IS
 	// the write order — a reader of the outcome must not have to re-derive it.
 	ordered := make([]applyStep, 0, len(steps))
@@ -611,6 +729,17 @@ func (b *Base) ApplyControlPlan(ctrl model.DERControlBase, tag string) (PlanOutc
 		}
 	}
 	if runErr == nil {
+		// IW13-003 §1.3 item 3: a fully-successful document (every axis
+		// Applied) can still carry a WRmp/VarRmp axis whose Sub shows the ramp
+		// component was dropped by write704Rmp's isolating retry (§1.3 item
+		// 2's addPlan registration is what puts that Sub here at all). Promote
+		// it to the document's own returned error INSTEAD of nil — the one
+		// place ApplyControlPlan/ApplyActuationWatts's shared engine can make
+		// that promotion without either of those two functions needing a
+		// change of their own (they already return (PlanOutcome, error)).
+		if rerr := firstRampNotApplied(out); rerr != nil {
+			return out, rerr
+		}
 		return out, nil
 	}
 	// The document is MIXED only when it actually left the device between two
@@ -811,7 +940,19 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.checkVarWithinReactiveCapability("opModFixedVar", mod, pct); err != nil {
 			return nil, err
 		}
-		add("opModFixedVar", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetConstantVar(pct, mod, tag) })
+		// IW13-003 §1.3 item 2: addPlan (not add) whenever a VarRmp payload is
+		// actually in play, so a dropped ramp becomes a measured Sub element
+		// instead of the bare-error path's silence. Registration STAYS add()
+		// when no ramp was requested — byte-identical to today for the common
+		// case (TestSetActivePowerWatts_NoWRmpPayload_RejectingDeviceStillErrors's
+		// VarSet analogue: nothing to isolate, nothing to report).
+		if b.DefaultVarRmpPct != nil {
+			addPlan("opModFixedVar", sunspec.ModelDERCtlAC, rankLimit, func() (PlanOutcome, error) {
+				return b.SetConstantVarPlan(pct, mod, tag)
+			})
+		} else {
+			add("opModFixedVar", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetConstantVar(pct, mod, tag) })
+		}
 	}
 	if ctrl.OpModFixedW != nil {
 		if !b.Has704 {
@@ -820,18 +961,39 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.requireCtrlModes("opModFixedW", modeFixedW); err != nil {
 			return nil, err
 		}
-		w, err := wattsChecked(ctrl.OpModFixedW, "opModFixedW")
+		// IW13-001: opModFixedW is SignedPerCent, not ActivePower. Decode the
+		// percent, then resolve it against this device's own reference
+		// (§2.1 — WDisChaRteMaxRtg/WChaRteMaxRtg when declared, else WMax
+		// symmetrically) BEFORE the existing watts-domain checks, which are
+		// unchanged from here on.
+		pct, err := pctChecked(ctrl.OpModFixedW.Value, "opModFixedW", true)
 		if err != nil {
 			return nil, err
 		}
+		ref, ok, err := b.fixedWReference(ctrl.OpModFixedW.Value < 0)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "cannot set percent-of-nameplate control: WMax unknown"}
+		}
+		w := pct / 100.0 * ref
 		if err := b.validateSetpointW(w, "opModFixedW"); err != nil {
 			return nil, err
 		}
-		add("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
+		// IW13-003 §1.3 item 2: see the opModFixedVar registration above for
+		// the identical addPlan/add split and reasoning.
+		if b.DefaultWRmpPct != nil {
+			addPlan("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() (PlanOutcome, error) {
+				return b.SetActivePowerWattsPlan(w, tag)
+			})
+		} else {
+			add("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
+		}
 	}
 
 	// Ceilings → WMaxLimPct (% of WMax). Simultaneous ceilings MIN-COMBINE.
-	if bind, ok, err := combineCeilingsW(ctrl); err != nil {
+	if bind, ok, err := b.combineCeilingsW(ctrl, tag); err != nil {
 		return nil, err
 	} else if ok {
 		w := bind.watts
@@ -846,7 +1008,16 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 			if err := b.requireCtrlModes(bind.axis, modeMaxW); err != nil {
 				return nil, err
 			}
-			addCombined(bind, sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetWMaxLimPctW(w, tag) })
+			// IW13-003 §1.3 item 2: same addPlan/add split as opModFixedW/
+			// opModFixedVar above, via the combined-ceiling registrar so the
+			// min-combine advisory is still seeded on the step either way.
+			if b.DefaultWRmpPct != nil {
+				addCombinedPlan(bind, sunspec.ModelDERCtlAC, rankLimit, func() (PlanOutcome, error) {
+					return b.SetWMaxLimPctWPlan(w, tag)
+				})
+			} else {
+				addCombined(bind, sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetWMaxLimPctW(w, tag) })
+			}
 		case b.Reader.HasModel(sunspec.ModelImmediateCtrl):
 			// LEGACY ALLOWLIST (capability.go): the M123 ceiling needs no 702
 			// claim on a device measured to have no 7xx control surface. A
@@ -881,6 +1052,113 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 			return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative import limit %g W", w)}
 		}
 		return nil, importBoundUnsupported(ctrl)
+	}
+	return steps, nil
+}
+
+// preflightActuationWatts is ApplyActuationWatts's step-builder — the watts-
+// native sibling of preflightControl, restricted to the three axes the
+// southbound reconcile shells actually drive (Connect, FixedW, MaxLimW). It
+// performs the SAME preflight checks preflightControl performs for these
+// axes (capability gating, CtrlModes, nameplate/rating bounds via
+// validateSetpointW/requireWmax), only with no percent/ActivePower decode
+// anywhere: fixedW/maxLimW arrive already resolved to watts.
+func (b *Base) preflightActuationWatts(fixedW, maxLimW *float64, connect *bool, tag string) ([]applyStep, error) {
+	var steps []applyStep
+	add := func(axis string, modelID uint16, rank int, run func() error) {
+		steps = append(steps, applyStep{axis: axis, model: modelID, rank: rank,
+			run: func() (*PlanOutcome, error) { return nil, run() }})
+	}
+	addPlan := func(axis string, modelID uint16, rank int, run func() (PlanOutcome, error)) {
+		steps = append(steps, applyStep{axis: axis, model: modelID, rank: rank,
+			run: func() (*PlanOutcome, error) {
+				o, err := run()
+				return &o, err
+			}})
+	}
+	releaseRank := func(releasing bool) int {
+		if releasing {
+			return rankRelease
+		}
+		return rankRestrict
+	}
+
+	if connect != nil {
+		if !b.Reader.HasModel(sunspec.ModelImmediateCtrl) {
+			return nil, &UnsupportedControlError{Axis: "opModConnect", Reason: "device has no M123 (immediate controls)"}
+		}
+		c := *connect
+		addPlan("opModConnect", sunspec.ModelImmediateCtrl, releaseRank(c), func() (PlanOutcome, error) {
+			return b.SetConnectPlan(c, tag)
+		})
+	}
+	if fixedW != nil {
+		if !b.Has704 {
+			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
+		}
+		if err := b.requireCtrlModes("opModFixedW", modeFixedW); err != nil {
+			return nil, err
+		}
+		w := *fixedW
+		if math.IsNaN(w) || math.IsInf(w, 0) {
+			return nil, &InvalidControlError{Axis: "opModFixedW", Reason: "non-finite watt setpoint"}
+		}
+		if err := b.validateSetpointW(w, "opModFixedW"); err != nil {
+			return nil, err
+		}
+		// IW13-003 §1.3 item 2: addPlan/add split, identical reasoning to
+		// preflightControl's opModFixedW registration.
+		if b.DefaultWRmpPct != nil {
+			addPlan("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() (PlanOutcome, error) {
+				return b.SetActivePowerWattsPlan(w, tag)
+			})
+		} else {
+			add("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
+		}
+	}
+	if maxLimW != nil {
+		w := *maxLimW
+		if math.IsNaN(w) || math.IsInf(w, 0) {
+			return nil, &InvalidControlError{Axis: "opModMaxLimW", Reason: "non-finite watt ceiling"}
+		}
+		if w < 0 {
+			return nil, &InvalidControlError{Axis: "opModMaxLimW", Reason: fmt.Sprintf("negative ceiling %g W", w)}
+		}
+		// Both branches convert watts through the nameplate, so an unknown
+		// WMax is a preflight rejection, not a failure discovered after the
+		// other axes have been written — mirrors preflightControl's identical
+		// combined-ceiling check.
+		if err := b.requireWmax(tag); err != nil {
+			return nil, err
+		}
+		switch {
+		case b.Has704:
+			if err := b.requireCtrlModes("opModMaxLimW", modeMaxW); err != nil {
+				return nil, err
+			}
+			// IW13-003 §1.3 item 2: addPlan/add split, identical reasoning to
+			// preflightControl's combined-ceiling registration.
+			if b.DefaultWRmpPct != nil {
+				addPlan("opModMaxLimW", sunspec.ModelDERCtlAC, rankLimit, func() (PlanOutcome, error) {
+					return b.SetWMaxLimPctWPlan(w, tag)
+				})
+			} else {
+				add("opModMaxLimW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetWMaxLimPctW(w, tag) })
+			}
+		case b.Reader.HasModel(sunspec.ModelImmediateCtrl):
+			// LEGACY ALLOWLIST (capability.go) — same reasoning as
+			// preflightControl's identical branch.
+			if !b.LegacyM123Shape() {
+				if err := b.requireCtrlModes("opModMaxLimW", modeMaxW); err != nil {
+					return nil, err
+				}
+			}
+			addPlan("opModMaxLimW", sunspec.ModelImmediateCtrl, rankLimit, func() (PlanOutcome, error) {
+				return b.SetLegacyWMaxLimPctPlan(w, tag)
+			})
+		default:
+			return nil, &UnsupportedControlError{Axis: "opModMaxLimW", Reason: "device has neither M704 nor M123 for power limiting"}
+		}
 	}
 	return steps, nil
 }
@@ -962,6 +1240,37 @@ func (b *Base) requireWmax(tag string) error {
 		return fmt.Errorf("%s: cannot set power limit: WMax unknown", tag)
 	}
 	return nil
+}
+
+// fixedWReference resolves the watts base opModFixedW's SignedPerCent
+// applies against (IW13-001; docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md
+// §2.1): positive (discharge/export) prefers this device's own declared
+// WDisChaRteMaxRtg; negative (charge) prefers WChaRteMaxRtg. Both directions
+// fall back to WMax symmetrically when the device declares no distinct
+// charge/discharge rating — the same Phase-1 judgment call the design
+// documents for the gateway's own per-device fan-out (csipin.go), available
+// here immediately rather than deferred, because b.Cap already reads these
+// 702 points at Init (unlike the gateway's InventoryRecord today).
+//
+// An implemented-but-out-of-domain or implemented-zero rating (maxRatingBound
+// error) is a positive claim about the device and is propagated rather than
+// silently overridden by falling back to WMax — the same "claim is garbage,
+// DENY" / "zero means incapacity" rule capability.go already states for
+// every other rating bound in this file.
+func (b *Base) fixedWReference(negative bool) (float64, bool, error) {
+	point, v := "WDisChaRteMaxRtg", b.Cap.WDisChaRteMaxRtg
+	if negative {
+		point, v = "WChaRteMaxRtg", b.Cap.WChaRteMaxRtg
+	}
+	if r, ok, err := maxRatingBound("opModFixedW", point, v); err != nil {
+		return 0, false, err
+	} else if ok {
+		return r, true, nil
+	}
+	if !math.IsNaN(b.Wmax) && b.Wmax > 0 {
+		return b.Wmax, true, nil
+	}
+	return 0, false, nil
 }
 
 // validatePF rejects a power-factor request outside the physically meaningful
@@ -1099,30 +1408,64 @@ func (c ceilingBind) advisory() string {
 //
 // Ties keep the canonical Exp→Max→Gen order, so equal bounds are attributed
 // deterministically. ok=false means the document carried no ceiling axis.
-func combineCeilingsW(ctrl model.DERControlBase) (ceilingBind, bool, error) {
+//
+// opModMaxLimW is PerCent, not ActivePower (IW13-001) — it is converted to
+// watts against THIS device's own WMax before entering the same min-combine
+// as opModExpLimW/opModGenLimW, which remain genuine ActivePower/watts axes
+// and are unaffected (§1.2). This is now a method (was a free function) only
+// because the MaxLimW conversion needs b.Wmax/b.requireWmax to do that
+// conversion honestly — refusing the document, not guessing, when WMax is
+// unknown — rather than being silently dropped from the combine.
+func (b *Base) combineCeilingsW(ctrl model.DERControlBase, tag string) (ceilingBind, bool, error) {
 	var out ceilingBind
-	for _, p := range []axisAP{
-		{"opModExpLimW", ctrl.OpModExpLimW},
-		{"opModMaxLimW", ctrl.OpModMaxLimW},
-		{"opModGenLimW", ctrl.OpModGenLimW},
-	} {
-		if p.ap == nil {
-			continue
+	consider := func(axis string, w float64) error {
+		if w < 0 {
+			return &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("negative ceiling %g W", w)}
 		}
-		// EVERY present axis is validated, not just the one that binds: an
-		// unvalidated axis is a limit nobody checked, and it is the one that
-		// would bind the day the numbers change.
-		w, err := wattsChecked(p.ap, p.axis)
+		out.present = append(out.present, axis)
+		if out.axis == "" || w < out.watts {
+			out.axis, out.watts = axis, w
+		}
+		return nil
+	}
+	// EVERY present axis is validated, not just the one that binds: an
+	// unvalidated axis is a limit nobody checked, and it is the one that
+	// would bind the day the numbers change.
+	if ctrl.OpModExpLimW != nil {
+		w, err := wattsChecked(ctrl.OpModExpLimW, "opModExpLimW")
 		if err != nil {
 			return ceilingBind{}, false, err
 		}
-		if w < 0 {
-			return ceilingBind{}, false, &InvalidControlError{Axis: p.axis,
-				Reason: fmt.Sprintf("negative ceiling %g W", w)}
+		if err := consider("opModExpLimW", w); err != nil {
+			return ceilingBind{}, false, err
 		}
-		out.present = append(out.present, p.axis)
-		if out.axis == "" || w < out.watts {
-			out.axis, out.watts = p.axis, w
+	}
+	if ctrl.OpModMaxLimW != nil {
+		pct, err := pctChecked(ctrl.OpModMaxLimW.Value, "opModMaxLimW", false)
+		if err != nil {
+			return ceilingBind{}, false, err
+		}
+		// Resolved eagerly, here, rather than deferred to the caller's later
+		// requireWmax(tag) check: a deferred check would let an unconverted
+		// MaxLimW silently fall out of the min-combine (out.axis staying ""
+		// while out.present still names it) if it happened to be the only
+		// ceiling axis present — exactly the silent-drop this design exists
+		// to eliminate.
+		if err := b.requireWmax(tag); err != nil {
+			return ceilingBind{}, false, err
+		}
+		w := pct / 100.0 * b.Wmax
+		if err := consider("opModMaxLimW", w); err != nil {
+			return ceilingBind{}, false, err
+		}
+	}
+	if ctrl.OpModGenLimW != nil {
+		w, err := wattsChecked(ctrl.OpModGenLimW, "opModGenLimW")
+		if err != nil {
+			return ceilingBind{}, false, err
+		}
+		if err := consider("opModGenLimW", w); err != nil {
+			return ceilingBind{}, false, err
 		}
 	}
 	return out, out.axis != "", nil
@@ -1231,22 +1574,126 @@ func (b *Base) ReadEnterService(tag string) (sunspec.EnterService, error) {
 // nowhere else. The claim-level check is subsumed — CapAbsent and
 // CapNotImplemented both fail the per-bit test with their own reason strings.
 func (b *Base) write704(tag string, axis string, modes []ctrlMode, fn func(v sunspec.View)) error {
+	_, err := b.write704Rmp(tag, axis, modes, fn, nil)
+	return err
+}
+
+// write704Rmp is write704 plus an OPTIONAL second closure, rmpFn, that applies
+// ONLY the §3.2 WRmp/VarRmp standing-rate write (writeWRmp/writeVarRmp) on top
+// of whatever fn already set. Every 704 caller that has no ramp-rate write of
+// its own (SetFixedPF — 704 has no PF ramp register at all) goes through
+// write704's nil-rmpFn form and is byte-identical to before this split
+// existed; SetActivePowerWatts/SetWMaxLimPctW/SetConstantVar pass a non-nil
+// rmpFn (Defect 2, 2026-08 adversarial review).
+//
+// The split exists because 704 has no CtrlModes capability bit for WRmp/
+// VarRmp at all (§1.2 Gap E: zero executor, hence zero capability signal,
+// anywhere in this codebase before this design) — write704 cannot know
+// BEFORE attempting the write whether a device honors the register, the way
+// requireCtrlModes lets it refuse a PF/var/W axis it already knows is
+// unclaimed. A validating DER firmware that rejects an unimplemented (or,
+// pre-clamp, out-of-range — see resolveRampWPct's own fix) WRmp value NAKs
+// the WHOLE FC16 block this write bundles it into, which would otherwise take
+// the commanded SETPOINT down with it — an emergency-cut silently dropped
+// because of a disagreement over a DIFFERENT register entirely. That is
+// unacceptable: a real setpoint the caller commanded must never become
+// collateral damage of a ramp-rate policy write's rejection.
+//
+// On a first-attempt failure, WHEN rmpFn was supplied, this retries EXACTLY
+// ONCE against a FRESH read (never the stale, already-mutated regs — the
+// first WriteModel's actual effect on the device is unknown, so re-reading
+// is the same LXR-003/E2 caution this function already applies to its
+// primary read) with a NARROWER write that STRUCTURALLY EXCLUDES the WRmp/
+// WRmpRef/VarRmp register range (wrmpSpan below) rather than merely
+// re-sending the same whole-block range with those three registers reset to
+// their read-back values. That distinction matters: a real Modbus FC16
+// request is accepted or refused as one indivisible unit by ADDRESS RANGE —
+// a device that refuses to accept ANY write touching an unimplemented
+// register rejects the whole request regardless of what value that register
+// carries in it, so a retry that still ADDRESSES WRmp (even with an
+// unchanged value) would fail identically. Only a write whose address range
+// never mentions WRmp/WRmpRef/VarRmp at all can succeed on such a device.
+// fn never writes into that range (SetActivePowerWatts/SetWMaxLimPctW/
+// SetConstantVar's own closures only touch fields the layout places BEFORE
+// it — verified by the layout's own field order in sunspec/derlayout.go's
+// L704), so the exclusion loses no content fn cares about; it only forgoes
+// re-sending the (unchanged-either-way) AntiIslEna/scale-factor/PF-sync-group
+// tail this write cycle, which is a plain round-trip of already-current
+// device state, not new commanded content — the very next 704 write (the
+// following poll/reconcile cycle) sends the whole block again regardless.
+//
+// If the narrowed retry succeeds, the setpoint is confirmed landed and this
+// reports success, PLUS isolated=true (IW13-003): the caller's own ramp
+// payload never reached the device, and — unlike before this finding was
+// closed — that is now a fact this function hands back rather than a silence
+// the caller cannot distinguish from "no ramp was ever requested." WRmp/
+// VarRmp simply keep whatever value the device already held (no different
+// from an ordinary write cycle where the caller supplied no ramp — §3.2's own
+// "re-derived fresh on every write" discipline means the very next write
+// cycle tries the ramp-rate write again). If even the narrowed retry fails,
+// the ORIGINAL error is returned — a device/comms problem unrelated to WRmp,
+// which excluding WRmp correctly does nothing to fix.
+//
+// isolated is meaningful ONLY when err == nil; it is always false on any
+// error return (including when rmpFn was nil to begin with — there was
+// nothing to isolate). SetActivePowerWatts/SetWMaxLimPctW/SetConstantVar's
+// own Plan-returning engines (SetActivePowerWattsPlan et al.) are what turn
+// isolated==true into a measured PlanOutcome element instead of the bare
+// `return nil` this function used to produce (IW13-003 §1.3) — this function
+// itself still never fails a write that a WRmp/VarRmp rejection alone would
+// not have failed, which remains the load-bearing fail-safe property (§1.4).
+func (b *Base) write704Rmp(tag, axis string, modes []ctrlMode, fn func(v sunspec.View), rmpFn func(v sunspec.View)) (isolated bool, err error) {
 	if !b.Has704 {
-		return &UnsupportedControlError{Axis: axis, Reason: "device has no M704 (DERCtlAC)"}
+		return false, &UnsupportedControlError{Axis: axis, Reason: "device has no M704 (DERCtlAC)"}
 	}
 	if err := b.requireCtrlModes(axis, modes...); err != nil {
-		return err
+		return false, err
 	}
+	regs, err := b.read704Checked(tag)
+	if err != nil {
+		return false, err
+	}
+	v := sunspec.L704.View(regs)
+	fn(v)
+	if rmpFn != nil {
+		rmpFn(v)
+	}
+	writeErr := b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs[:sunspec.L704.Len()])
+	if writeErr == nil || rmpFn == nil {
+		return false, writeErr
+	}
+	// Isolate: fresh read, fn only (no rmpFn), written NARROWLY so the WRmp/
+	// WRmpRef/VarRmp address range is never part of this request at all.
+	regs2, rerr := b.read704Checked(tag)
+	if rerr != nil {
+		return false, writeErr // cannot safely isolate — report the ORIGINAL failure
+	}
+	fn(sunspec.L704.View(regs2))
+	wrmpOffset := sunspec.L704.Offset("WRmp")
+	if wrmpOffset < 0 || wrmpOffset > sunspec.L704.Len() {
+		return false, writeErr // layout invariant broken — no safe narrower range to isolate
+	}
+	if err2 := b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs2[:wrmpOffset]); err2 != nil {
+		return false, writeErr // still fails without touching WRmp's address range at all: not a WRmp problem
+	}
+	return true, nil
+}
+
+// read704Checked reads the 704 block and applies write704Rmp's two read-side
+// guards (LXR-003 short-block defense, audit E2 corrupt-read refusal) —
+// factored out so write704Rmp's isolating retry runs the IDENTICAL checks
+// against its fresh read that the primary attempt ran against its own.
+func (b *Base) read704Checked(tag string) ([]uint16, error) {
 	regs, err := b.Reader.ReadModel(sunspec.ModelDERCtlAC)
 	if err != nil {
-		return fmt.Errorf("%s: read M704: %w", tag, err)
+		return nil, fmt.Errorf("%s: read M704: %w", tag, err)
 	}
 	// Defense in depth for LXR-003: Init refuses a device whose declared 704
 	// is shorter than the layout, but never trust that invariant across a
 	// rescan/replacement — an undersized read here would panic the shared
 	// service on the regs[:Len] slice below.
 	if len(regs) < sunspec.L704.Len() {
-		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelDERCtlAC,
+		return nil, &MalformedDeviceError{Tag: tag, Model: sunspec.ModelDERCtlAC,
 			Declared: len(regs), Required: sunspec.L704.Len(), Detail: "read returned short block"}
 	}
 	// Refuse to write back a corrupt read (audit E2): this whole-block
@@ -1256,11 +1703,96 @@ func (b *Base) write704(tag string, axis string, modes []ctrlMode, fn func(v sun
 	// enables. A healthy 704 always carries valid scale factors (and never an
 	// out-of-domain one — LXR-004).
 	if sunspec.L704.View(regs).ReadLooksCorrupt() {
-		return &CorruptReadError{Tag: tag, Model: sunspec.ModelDERCtlAC,
+		return nil, &CorruptReadError{Tag: tag, Model: sunspec.ModelDERCtlAC,
 			Detail: "read block is sentinel-corrupt (partial/failed read)"}
 	}
-	fn(sunspec.L704.View(regs))
-	return b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs[:sunspec.L704.Len()])
+	return regs, nil
+}
+
+// rvrtAlternateWriter validates a Default*Rvrt/Default*EnaRvrt pair
+// (IW13-004a §2a.3) and returns a closure that writes them into the given
+// View's value/enable fields, or an error refusing an unsafe combination.
+//
+// val/ena are consumed together, not independently:
+//
+//   - ena == nil: nothing was commanded. The returned closure is a no-op —
+//     byte-identical to today, matching DefaultWSetRvrt/DefaultWMaxLimPctRvrt's
+//     own "nil leaves the registers untouched" contract.
+//   - *ena == true, val == nil: REFUSED. Arming reversion with no destination
+//     value would revert the device to whatever the shadow register already
+//     holds — the factory default or a stale prior session — which is the
+//     exact hazard this finding exists to close (§2a.2's "reversion to a
+//     stale, vendor-default or unconstrained condition"). A caller that wants
+//     the device to keep reverting to its own unknown resting value should
+//     leave ena nil (no opinion), not assert true with nothing behind it.
+//   - *ena == true, val != nil: writes both — the ordinary arm-with-a-value case.
+//   - *ena == false: writes the disable, and the value alongside it when
+//     supplied (harmless: an inert, disabled alternate is never applied —
+//     §2a.4's "sits armed and inert" concern only bites when enabled).
+func rvrtAlternateWriter(axis, valueField, enaField string, val *float64, ena *bool) (func(v sunspec.View), error) {
+	if ena == nil {
+		return func(sunspec.View) {}, nil
+	}
+	if *ena && val == nil {
+		return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf(
+			"%s=true requires a %s alternate value; arming reversion with no destination would revert "+
+				"the device to whatever the shadow register already holds (stale/unwritten) — refused "+
+				"rather than silently armed (IW13-004a)", enaField, valueField)}
+	}
+	return func(v sunspec.View) {
+		if val != nil {
+			v.SetFloat(valueField, *val)
+		}
+		v.SetBool(enaField, *ena)
+	}, nil
+}
+
+// rampNotApplied inspects one axis's Sub PlanOutcome for IW13-003's exact
+// trigger shape — a WRmp/VarRmp element State==ElementFailed alongside its
+// primary setpoint/ceiling element State==ElementApplied — and returns the
+// typed RampNotAppliedError, or nil when that shape is not present (no ramp
+// was requested, the ramp landed cleanly, or the primary element itself did
+// not land — the last of which is a different, already-reported failure, not
+// this one). axis is attached to the error for the caller's own reporting;
+// it is NOT read from sub.
+func rampNotApplied(axis string, sub PlanOutcome) error {
+	rampName := ""
+	for _, e := range sub.Elements {
+		if e.Name != "WRmp" && e.Name != "VarRmp" {
+			continue
+		}
+		if e.State != ElementFailed {
+			return nil // ramp element present but not the dropped shape (or none at all)
+		}
+		rampName = e.Name
+	}
+	if rampName == "" {
+		return nil
+	}
+	for _, e := range sub.Elements {
+		if e.Name != rampName && e.State == ElementApplied {
+			return &RampNotAppliedError{Axis: axis, Sub: sub}
+		}
+	}
+	return nil // ramp dropped AND the primary element did not land — not this axis's story to tell
+}
+
+// firstRampNotApplied scans a DOCUMENT-level PlanOutcome's elements (the ones
+// runControlSteps builds — Name is the CSIP axis name, e.g. "opModFixedW")
+// for the first one whose Sub carries rampNotApplied's trigger shape. Used by
+// runControlSteps itself so ApplyControlPlan/ApplyActuationWatts (which share
+// that engine) both surface RampNotAppliedError through their existing
+// (PlanOutcome, error) return with no changes of their own (§1.3 item 3).
+func firstRampNotApplied(out PlanOutcome) error {
+	for _, e := range out.Elements {
+		if e.Sub == nil {
+			continue
+		}
+		if rerr := rampNotApplied(e.Name, *e.Sub); rerr != nil {
+			return rerr
+		}
+	}
+	return nil
 }
 
 // SetFixedPF enables constant power factor. inject selects the PFWInj (injecting
@@ -1278,11 +1810,18 @@ func (b *Base) SetFixedPF(inject bool, pf float64, overExcited bool, tag string)
 			v.SetBool("PFWInjEna", true)
 			v.SetFloat("PFWInj_PF", pf) // engineering value = power factor
 			v.SetEnum("PFWInj_Ext", ext)
+			// §2.4 closes Gap A: the PFWInj write previously ignored
+			// DefaultRvrtTms entirely even though cmd/modbus's advanced shell
+			// (withRvrtTms) already threaded a value in for this call to drop.
+			v.SetU32("PFWInjRvrtTms", b.DefaultRvrtTms)
 		} else {
 			v.SetBool("PFWAbsEna", true)
 			v.SetFloat("PFWAbs_PF", pf)
 			v.SetEnum("PFWAbs_Ext", ext)
+			v.SetU32("PFWAbsRvrtTms", b.DefaultRvrtTms)
 		}
+		// 704 has no PF ramp register of any kind (§1.2/§3.4's gap table) — no
+		// writeWRmp/writeVarRmp call here, deliberately.
 	})
 }
 
@@ -1310,27 +1849,75 @@ func (b *Base) SetFixedPF(inject bool, pf float64, overExcited bool, tag string)
 // mid-document failure, checked in both it is a whole-document rejection with
 // zero writes. The two callers share one function so they cannot drift.
 func (b *Base) SetConstantVar(pct float64, mod uint16, tag string) error {
+	out, err := b.SetConstantVarPlan(pct, mod, tag)
+	if err != nil {
+		return err
+	}
+	return rampNotApplied("SetConstantVar", out)
+}
+
+// SetConstantVarPlan is SetConstantVar's PlanOutcome-returning engine
+// (IW13-003 §1.3): the single implementation SetConstantVar (above) and
+// preflightControl's addPlan registration (used only when DefaultVarRmpPct is
+// actually in play) both call. See SetActivePowerWattsPlan's doc comment for
+// the full reasoning shared by all three 704 axis engines — this function's
+// own returned error is non-nil ONLY when VarSet itself did not land; a
+// dropped VarRmp is reported through the returned PlanOutcome, never through
+// this function's error, so an addPlan-driven document does not freeze or
+// waste a re-attempt on an already-known deterministic device incapability.
+func (b *Base) SetConstantVarPlan(pct float64, mod uint16, tag string) (PlanOutcome, error) {
+	out := PlanOutcome{Tag: tag, Plan: "SetConstantVar"}
 	switch mod {
 	case sunspec.M704_VarSetMod_WMaxPct, sunspec.M704_VarSetMod_VarMaxPct,
 		sunspec.M704_VarSetMod_VarAvailPct:
 	default:
-		return &InvalidControlError{Axis: "SetConstantVar", Reason: fmt.Sprintf(
+		return out, &InvalidControlError{Axis: "SetConstantVar", Reason: fmt.Sprintf(
 			"VarSetMod=%d is not a percentage base this package commands (want WMaxPct=%d, "+
 				"VarMaxPct=%d or VarAvailPct=%d)", mod, sunspec.M704_VarSetMod_WMaxPct,
 			sunspec.M704_VarSetMod_VarMaxPct, sunspec.M704_VarSetMod_VarAvailPct)}
 	}
 	if err := b.requireVarBase("SetConstantVar", mod, pct); err != nil {
-		return err
+		return out, err
 	}
 	if err := b.checkVarWithinReactiveCapability("SetConstantVar", mod, pct); err != nil {
-		return err
+		return out, err
 	}
-	return b.write704(tag, "SetConstantVar", []ctrlMode{modeFixedVar}, func(v sunspec.View) {
+	// Defect 2: rmpFn is passed ONLY when there is an actual VarRmp value to
+	// isolate (b.DefaultVarRmpPct != nil) — NOT unconditionally as
+	// b.writeVarRmp (whose OWN nil-check would make it a no-op VALUE-wise but
+	// still a non-nil FUNCTION, and write704Rmp keys its isolating retry off
+	// rmpFn being non-nil, not off what it would write). Passing it
+	// unconditionally was tried and reverted during this fix's development:
+	// it made write704Rmp silently retry-and-swallow ANY transient 704 write
+	// failure, even ones with no VarRmp in play at all, which corrupted
+	// ApplyControlPlan's OWN document-level bounded-re-attempt budget
+	// accounting (TestApplyControlPlan_ReAttemptIsBoundedPerDocument
+	// started failing — a real regression, not a test-only concern). Nil
+	// here is exactly today's behavior: one write, one failure, surfaced
+	// immediately — byte-identical for the overwhelming common no-ramp case.
+	var rmpFn func(v sunspec.View)
+	if b.DefaultVarRmpPct != nil {
+		rmpFn = b.writeVarRmp
+	}
+	isolated, werr := b.write704Rmp(tag, "SetConstantVar", []ctrlMode{modeFixedVar}, func(v sunspec.View) {
 		v.SetBool("VarSetEna", true)
 		v.SetEnum("VarSetMod", mod)
 		v.SetEnum("VarSetPri", sunspec.M704_VarSetPri_Reactive)
 		v.SetFloat("VarSetPct", pct)
-	})
+		// §2.4 closes Gap A (the other half — SetFixedPF above is the first):
+		// VarSet previously ignored DefaultRvrtTms entirely.
+		v.SetU32("VarSetRvrtTms", b.DefaultRvrtTms)
+	}, rmpFn)
+	if werr != nil {
+		return out, werr
+	}
+	out.Elements = append(out.Elements, ElementOutcome{Name: "VarSet", Model: sunspec.ModelDERCtlAC, State: ElementApplied})
+	if isolated {
+		out.Elements = append(out.Elements, ElementOutcome{Name: "VarRmp", Model: sunspec.ModelDERCtlAC,
+			State: ElementFailed, Advisory: "ramp rejected by device at the address-range level; " +
+				"setpoint applied without the commanded ramp rate"})
+	}
+	return out, nil
 }
 
 // SetActivePowerWatts sets the absolute active-power setpoint in watts (WSet,
@@ -1348,15 +1935,70 @@ func (b *Base) SetConstantVar(pct float64, mod uint16, tag string) error {
 //
 // Requires the device's positive FIXED_W claim.
 func (b *Base) SetActivePowerWatts(w float64, tag string) error {
-	if err := b.checkSetpointWithinNameplate("SetActivePowerWatts", w); err != nil {
+	out, err := b.SetActivePowerWattsPlan(w, tag)
+	if err != nil {
 		return err
 	}
-	return b.write704(tag, "SetActivePowerWatts", []ctrlMode{modeFixedW}, func(v sunspec.View) {
+	return rampNotApplied("SetActivePowerWatts", out)
+}
+
+// SetActivePowerWattsPlan is SetActivePowerWatts's PlanOutcome-returning
+// engine (IW13-003 §1.3) — the single implementation SetActivePowerWatts
+// (above) and preflightControl/preflightActuationWatts's addPlan
+// registration (used only when DefaultWRmpPct is actually in play at
+// registration time) both call. Its own returned error is non-nil ONLY when
+// the setpoint itself did not land — a WRmp-only drop (write704Rmp's
+// isolating retry succeeding) is reported through the returned PlanOutcome's
+// elements, never through this function's error, so a document built with
+// addPlan sees err==nil for this axis: it must not freeze the rest of the
+// document or spend its one bounded re-attempt on an already-known,
+// deterministic device incapability (§1.4). ApplyControlPlan/
+// ApplyActuationWatts (via runControlSteps/firstRampNotApplied) are what
+// promote a dropped ramp into a RampNotAppliedError at the DOCUMENT level.
+func (b *Base) SetActivePowerWattsPlan(w float64, tag string) (PlanOutcome, error) {
+	out := PlanOutcome{Tag: tag, Plan: "SetActivePowerWatts"}
+	if err := b.checkSetpointWithinNameplate("SetActivePowerWatts", w); err != nil {
+		return out, err
+	}
+	// Defect 2: rmpFn passed only when a WRmp value is actually in play — see
+	// SetConstantVarPlan's identical comment for why unconditional b.writeWRmp
+	// was reverted (it corrupted ApplyControlPlan's document-level re-attempt
+	// budget accounting for every 704 write, not just WRmp-bearing ones).
+	var rmpFn func(v sunspec.View)
+	if b.DefaultWRmpPct != nil {
+		rmpFn = b.writeWRmp
+	}
+	// IW13-004a: the reversion-alternate pair for THIS axis (WSetRvrt/
+	// WSetEnaRvrt) — validated against the same nameplate bound as the
+	// primary setpoint, since WSetRvrt is also a setpoint the device may be
+	// told to hold. A caller that supplied no alternate (DefaultWSetEnaRvrt
+	// nil) gets a pure no-op closure — byte-identical to today.
+	if b.DefaultWSetRvrt != nil {
+		if err := b.checkSetpointWithinNameplate("SetActivePowerWatts.WSetRvrt", *b.DefaultWSetRvrt); err != nil {
+			return out, err
+		}
+	}
+	rvrtFn, err := rvrtAlternateWriter("SetActivePowerWatts", "WSetRvrt", "WSetEnaRvrt", b.DefaultWSetRvrt, b.DefaultWSetEnaRvrt)
+	if err != nil {
+		return out, err
+	}
+	isolated, werr := b.write704Rmp(tag, "SetActivePowerWatts", []ctrlMode{modeFixedW}, func(v sunspec.View) {
 		v.SetBool("WSetEna", true)
 		v.SetEnum("WSetMod", sunspec.M704_WSetMod_Watts)
 		v.SetFloat("WSet", w)
 		v.SetU32("WSetRvrtTms", b.DefaultRvrtTms)
-	})
+		rvrtFn(v)
+	}, rmpFn)
+	if werr != nil {
+		return out, werr
+	}
+	out.Elements = append(out.Elements, ElementOutcome{Name: "WSet", Model: sunspec.ModelDERCtlAC, State: ElementApplied})
+	if isolated {
+		out.Elements = append(out.Elements, ElementOutcome{Name: "WRmp", Model: sunspec.ModelDERCtlAC,
+			State: ElementFailed, Advisory: "ramp rejected by device at the address-range level; " +
+				"setpoint applied without the commanded ramp rate"})
+	}
+	return out, nil
 }
 
 // checkSetpointWithinNameplate refuses an active-power SETPOINT the device
@@ -1388,11 +2030,25 @@ func (b *Base) checkSetpointWithinNameplate(axis string, w float64) error {
 // rejects negative ceilings too; this is the same rule at the exported
 // boundary. Requires the device's positive MAX_W claim.
 func (b *Base) SetWMaxLimPctW(w float64, tag string) error {
+	out, err := b.SetWMaxLimPctWPlan(w, tag)
+	if err != nil {
+		return err
+	}
+	return rampNotApplied("SetWMaxLimPctW", out)
+}
+
+// SetWMaxLimPctWPlan is SetWMaxLimPctW's PlanOutcome-returning engine
+// (IW13-003 §1.3) — see SetActivePowerWattsPlan's doc comment for the shared
+// reasoning behind the split (SetWMaxLimPctW below and preflightControl/
+// preflightActuationWatts's addPlan registration, used only when
+// DefaultWRmpPct is in play, both call this).
+func (b *Base) SetWMaxLimPctWPlan(w float64, tag string) (PlanOutcome, error) {
+	out := PlanOutcome{Tag: tag, Plan: "SetWMaxLimPctW"}
 	if math.IsNaN(b.Wmax) || b.Wmax <= 0 {
-		return fmt.Errorf("%s: cannot set power limit: WMax unknown", tag)
+		return out, fmt.Errorf("%s: cannot set power limit: WMax unknown", tag)
 	}
 	if w < 0 || math.IsNaN(w) {
-		return &InvalidControlError{Axis: "SetWMaxLimPctW", Reason: fmt.Sprintf(
+		return out, &InvalidControlError{Axis: "SetWMaxLimPctW", Reason: fmt.Sprintf(
 			"negative or non-finite ceiling %g W; zeroing it would fabricate a full curtailment "+
 				"nobody commanded", w)}
 	}
@@ -1400,11 +2056,87 @@ func (b *Base) SetWMaxLimPctW(w float64, tag string) error {
 		w = b.Wmax
 	}
 	pct := w / b.Wmax * 100.0
-	return b.write704(tag, "SetWMaxLimPctW", []ctrlMode{modeMaxW}, func(v sunspec.View) {
+	// Defect 2: see SetActivePowerWattsPlan's identical comment — rmpFn only
+	// when a WRmp value is actually in play.
+	var rmpFn func(v sunspec.View)
+	if b.DefaultWRmpPct != nil {
+		rmpFn = b.writeWRmp
+	}
+	// IW13-004a: WMaxLimPctRvrt/WMaxLimPctEnaRvrt — DefaultWMaxLimPctRvrt is
+	// WATTS (matching this function's own w), converted to percent here with
+	// the SAME clamp-not-refuse rule the primary ceiling applies to w above:
+	// a ceiling's alternate is still a ceiling, so it clamps at the top of its
+	// range rather than refusing (unlike WSetRvrt, a setpoint's alternate,
+	// which refuses — see SetActivePowerWattsPlan).
+	var rvrtPct *float64
+	if b.DefaultWMaxLimPctRvrt != nil {
+		rv := *b.DefaultWMaxLimPctRvrt
+		if math.IsNaN(rv) || rv < 0 {
+			return out, &InvalidControlError{Axis: "SetWMaxLimPctW.WMaxLimPctRvrt", Reason: fmt.Sprintf(
+				"negative or non-finite reversion-ceiling alternate %g W", rv)}
+		}
+		if rv > b.Wmax {
+			rv = b.Wmax
+		}
+		p := rv / b.Wmax * 100.0
+		rvrtPct = &p
+	}
+	rvrtFn, err := rvrtAlternateWriter("SetWMaxLimPctW", "WMaxLimPctRvrt", "WMaxLimPctEnaRvrt", rvrtPct, b.DefaultWMaxLimPctEnaRvrt)
+	if err != nil {
+		return out, err
+	}
+	isolated, werr := b.write704Rmp(tag, "SetWMaxLimPctW", []ctrlMode{modeMaxW}, func(v sunspec.View) {
 		v.SetBool("WMaxLimPctEna", true)
 		v.SetFloat("WMaxLimPct", pct)
 		v.SetU32("WMaxLimPctRvrtTms", b.DefaultRvrtTms)
-	})
+		rvrtFn(v)
+	}, rmpFn)
+	if werr != nil {
+		return out, werr
+	}
+	out.Elements = append(out.Elements, ElementOutcome{Name: "WMaxLimPct", Model: sunspec.ModelDERCtlAC, State: ElementApplied})
+	if isolated {
+		out.Elements = append(out.Elements, ElementOutcome{Name: "WRmp", Model: sunspec.ModelDERCtlAC,
+			State: ElementFailed, Advisory: "ramp rejected by device at the address-range level; " +
+				"ceiling applied without the commanded ramp rate"})
+	}
+	return out, nil
+}
+
+// wRmpRefEnum resolves the shared WRmpRef selector (§1.2: 704 carries exactly
+// ONE reference register for both WRmp and VarRmp) from DefaultWRmpRefIsAMax.
+func (b *Base) wRmpRefEnum() uint16 {
+	if b.DefaultWRmpRefIsAMax {
+		return sunspec.M704_WRmpRef_AMax
+	}
+	return sunspec.M704_WRmpRef_WMax
+}
+
+// writeWRmp applies §3's standing WRmp ramp-rate policy write to a 704 View,
+// when the caller has supplied DefaultWRmpPct. WRmp is a STICKY, GLOBAL
+// register (§1.2): one setting governs every subsequent WSet/WMaxLimPct
+// transition until next changed, not a value that auto-scopes to one
+// control — so this is included in the SAME whole-block write as the axis
+// value whenever the caller has a rate to assert (§3.2's "written every
+// write cycle" discipline, cheap because write704 is already a whole-block
+// RMW), and a complete no-op — byte-identical to today — when it does not.
+func (b *Base) writeWRmp(v sunspec.View) {
+	if b.DefaultWRmpPct == nil {
+		return
+	}
+	v.SetEnum("WRmpRef", b.wRmpRefEnum())
+	v.SetFloat("WRmp", *b.DefaultWRmpPct)
+}
+
+// writeVarRmp is writeWRmp's VarSet-axis sibling (DefaultVarRmpPct → VarRmp).
+// Shares WRmpRef with writeWRmp since 704 carries only the one reference
+// register for both rate points.
+func (b *Base) writeVarRmp(v sunspec.View) {
+	if b.DefaultVarRmpPct == nil {
+		return
+	}
+	v.SetEnum("WRmpRef", b.wRmpRefEnum())
+	v.SetFloat("VarRmp", *b.DefaultVarRmpPct)
 }
 
 func (b *Base) ReadDERCtlAC(tag string) (sunspec.ACControls, error) {
@@ -1809,6 +2541,12 @@ const (
 const defaultLegacyRmpTms = uint16(5)
 
 func (b *Base) legacyRmpTms() uint16 {
+	// §3.3: a CSIP-resolved per-axis ramp takes precedence over the fixed
+	// policy default — additive, not a removal: LegacyRmpTms/
+	// defaultLegacyRmpTms still governs whenever no CSIP value is supplied.
+	if b.CSIPRampTmsSeconds != nil {
+		return *b.CSIPRampTmsSeconds
+	}
 	if b.LegacyRmpTms != 0 {
 		return b.LegacyRmpTms
 	}
