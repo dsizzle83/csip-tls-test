@@ -31,12 +31,54 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/internal/diff"
 	"csip-tls-test/sim/gridsim"
 	model "lexa-proto/csipmodel"
 )
+
+// TestOracledScalarWindow_ContainsEveryPostWaitRead is the IW13-005 window
+// regression guard. The PostWait oracle can read the DER anywhere from when
+// AwaitWalk returns out to ~fetchWait, which itself ranges over [defaultWait,
+// waitCap] (check.go). An oracled scalar control (scalarModeOracled ->
+// oracleWindow) must stay active across that ENTIRE range, or a read at a
+// slower cadence overruns the control's release edge. (The read-too-EARLY edge
+// of the same race — the DER read before the board applies the fetched control
+// — is the settle poll's job, guarded by the TestSettleOracle_* tests; this
+// one guards the late edge.) The default (fetch-only) scalarWindow deliberately
+// does NOT contain the range — nothing reads the DER during it — and the test
+// pins that asymmetry too, so a future edit that points an oracled row back at
+// the short window fails here.
+func TestOracledScalarWindow_ContainsEveryPostWaitRead(t *testing.T) {
+	winOpen := time.Duration(oracleWindow.startOffsetS) * time.Second
+	winClose := time.Duration(oracleWindow.startOffsetS+oracleWindow.durationS) * time.Second
+
+	// The earliest possible read (defaultWait) must land strictly AFTER the
+	// control becomes active, with margin.
+	if winOpen >= defaultWait {
+		t.Fatalf("oracled control opens at +%s, but the earliest PostWait read is +%s (defaultWait) — "+
+			"the oracle can read the DER before its control is active", winOpen, defaultWait)
+	}
+	// The latest possible read (waitCap) must land strictly BEFORE the control
+	// releases, with margin — the boundary the pre-fix +150s window sat on.
+	if winClose <= waitCap {
+		t.Fatalf("oracled control closes at +%s, but the latest PostWait read is +%s (waitCap) — "+
+			"the oracle can read the DER at/after its control's release boundary (the IW13-005 false FAIL)",
+			winClose, waitCap)
+	}
+
+	// The default fetch-only window is NOT expected to contain the read range;
+	// pinning it guards against silently widening every scalar row (and against
+	// an oracled row being pointed back at it).
+	defClose := time.Duration(scalarWindow.startOffsetS+scalarWindow.durationS) * time.Second
+	if defClose > waitCap {
+		t.Fatalf("the default (fetch-only) scalar window now closes at +%s, past waitCap (+%s) — either the "+
+			"window widened for every row (unintended) or waitCap shrank; the oracled rows carry the wide "+
+			"window on purpose, the rest should not", defClose, waitCap)
+	}
+}
 
 // inverterControlLifecycleRunCtx wires ONE *certify.RunCtx to two in-process
 // fixtures: a real gridsim admin API (so Setup's m.Publish — a live
@@ -82,6 +124,70 @@ func inverterControlLifecycleRunCtx(t *testing.T, dev *diff.Device) (*certify.Ru
 	return rc, NewDriver(rc)
 }
 
+// TestSettleOracle_RetriesUntilTheEffectLands is the IW13-005 propagation-race
+// guard. AwaitWalk returns at the START of the DUT's walk, so the first oracle
+// read can land while the fetched control is still traveling the
+// northbound->MQTT->reconciler->Modbus pipeline to the DER's registers (the
+// live bench read the program default ~1s before "applied CeilingW=4800"). The
+// PostWait oracle must POLL through that beat, not sample once. Here eval FAILs
+// the first two reads (DER still mid-propagation) then PASSes — settleOracle
+// must return Pass and must actually have re-read.
+func TestSettleOracle_RetriesUntilTheEffectLands(t *testing.T) {
+	calls := 0
+	f := settleOracleWindow(context.Background(), 2*time.Second, time.Millisecond, func() Finding {
+		calls++
+		if calls < 3 {
+			return Finding{Verdict: certify.Fail, Observed: "not applied yet"}
+		}
+		return Finding{Verdict: certify.Pass, Observed: "applied"}
+	})
+	if f.Verdict != certify.Pass {
+		t.Fatalf("settleOracle after a Fail->Fail->Pass sequence = %+v, want Pass", f)
+	}
+	if calls != 3 {
+		t.Fatalf("settleOracle made %d reads, want 3 — it must re-read across the propagation beat, not sample once", calls)
+	}
+}
+
+// TestSettleOracle_FailsAtDeadlineOnPersistentMismatch proves the settle never
+// masks a real defect: a DER that never reaches the commanded value (wrong
+// register, wrong value) FAILs at the deadline with the value it read, it does
+// not hang or silently pass.
+func TestSettleOracle_FailsAtDeadlineOnPersistentMismatch(t *testing.T) {
+	calls := 0
+	f := settleOracleWindow(context.Background(), 50*time.Millisecond, time.Millisecond, func() Finding {
+		calls++
+		return Finding{Verdict: certify.Fail, Observed: "wrong value on the wire"}
+	})
+	if f.Verdict != certify.Fail {
+		t.Fatalf("settleOracle on a persistent mismatch = %+v, want Fail at the deadline", f)
+	}
+	if calls < 2 {
+		t.Fatalf("settleOracle made %d reads, want >=2 — it must keep polling until the deadline before conceding FAIL", calls)
+	}
+}
+
+// TestSettleOracle_ReturnsPassAndUnavailableAtOnce pins the two verdicts that
+// are NOT a propagation delay and so must not burn the settle window: a Pass
+// (already settled) and an Unavailable (the DER is unreachable, which more
+// polling cannot fix).
+func TestSettleOracle_ReturnsPassAndUnavailableAtOnce(t *testing.T) {
+	passCalls := 0
+	if f := settleOracleWindow(context.Background(), time.Hour, time.Second, func() Finding {
+		passCalls++
+		return Finding{Verdict: certify.Pass}
+	}); f.Verdict != certify.Pass || passCalls != 1 {
+		t.Fatalf("settleOracle on an immediate Pass = %+v after %d call(s), want Pass after exactly 1", f, passCalls)
+	}
+	unavailCalls := 0
+	if f := settleOracleWindow(context.Background(), time.Hour, time.Second, func() Finding {
+		unavailCalls++
+		return unavailable("DER unreachable")
+	}); f.Unavailable == "" || unavailCalls != 1 {
+		t.Fatalf("settleOracle on an Unavailable = %+v after %d call(s), want Unavailable after exactly 1", f, unavailCalls)
+	}
+}
+
 // TestInverterControlSpec_OracleFiresPostWaitNotSetup is the lifecycle proof
 // the review asked for: it drives inverterControlSpec's Setup and PostWait
 // directly, in that order, against a register view that is EMPTY at Setup
@@ -92,7 +198,7 @@ func TestInverterControlSpec_OracleFiresPostWaitNotSetup(t *testing.T) {
 	rc, d := inverterControlLifecycleRunCtx(t, dev)
 	ctx := context.Background()
 
-	m := withOracle(scalarMode("opModMaxLimW", func(r *ControlRequest) {
+	m := withOracle(scalarModeOracled("opModMaxLimW", func(r *ControlRequest) {
 		r.MaxLimW = ptr(int64(6000))
 	}), oracleMaxLimW(6000))
 	subject := "a maximum active power limit"

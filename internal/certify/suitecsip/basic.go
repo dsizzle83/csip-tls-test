@@ -142,14 +142,56 @@ const (
 	oracleUnavailableParam = "iw13.oracle_unavailable"
 )
 
-// scalarMode builds a controlMode driven by gridsim's scalar control API.
+// scalarControlWindow is the [StartOffset, StartOffset+DurationS] window (in
+// seconds) a scalar control is published with.
+type scalarControlWindow struct {
+	startOffsetS int
+	durationS    int
+}
+
+// scalarWindow is the default scalar control window: a control the DUT only has
+// to FETCH, so a short window is enough and nothing reads the DER during it.
+var scalarWindow = scalarControlWindow{startOffsetS: 30, durationS: 120}
+
+// oracleWindow widens the window for the ORACLED scalar rows (BASIC-010/013) so
+// the control stays active across the ENTIRE span in which the PostWait oracle
+// can read the DER (IW13-005). That read can land anywhere from the moment
+// AwaitWalk returns (the DUT's first GET /dcap after Setup, plus the settle
+// poll below) out to ~fetchWait — waitPeriods*cadence + waitSlack, capped at
+// waitCap (5m) (check.go) — when the DUT is slow to poll and AwaitWalk waits
+// the full window. The default [+30s, +150s] window ended at +150s, which the
+// bench's 60s cadence read (2*60+30 = 150s) sits right on and a slower cadence
+// overruns entirely; [+30s, +360s] keeps the DER under the commanded cap past
+// waitCap for every cadence the derivation can pick, and comfortably through
+// the settle poll. The harness never waits DurationS (it waits fetchWait), so
+// the longer window costs no runtime — Cleanup clears the control when the row
+// is done. The observed compliance FAIL was NOT this window expiring under the
+// read; it was the read landing too EARLY (see oracleSettleWindow) — this
+// widening is the belt to that fix's braces.
+var oracleWindow = scalarControlWindow{startOffsetS: 30, durationS: 330}
+
+// scalarMode builds a controlMode driven by gridsim's scalar control API, with
+// the default (fetch-only) window.
 func scalarMode(element string, apply func(*ControlRequest)) controlMode {
+	return scalarModeWindow(element, scalarWindow, apply)
+}
+
+// scalarModeOracled builds a scalar controlMode for a row whose DER register an
+// independent oracle READS during PostWait (BASIC-010/013) — so its control
+// must stay active across the oracle read (oracleWindow).
+func scalarModeOracled(element string, apply func(*ControlRequest)) controlMode {
+	return scalarModeWindow(element, oracleWindow, apply)
+}
+
+// scalarModeWindow is the shared body of scalarMode/scalarModeOracled: the only
+// thing that varies between a fetch-only row and an oracled row is the window.
+func scalarModeWindow(element string, win scalarControlWindow, apply func(*ControlRequest)) controlMode {
 	return controlMode{
 		Element: element,
 		Publish: func(ctx context.Context, d *Driver, mrid string) error {
 			req := ControlRequest{
 				Program: 0, MRID: mrid, Description: "certify " + element,
-				StartOffset: 30, DurationS: 120,
+				StartOffset: win.startOffsetS, DurationS: win.durationS,
 			}
 			apply(&req)
 			_, err := d.PostControl(ctx, req)
@@ -253,7 +295,13 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 		// its own DUT-state read.
 		if m.Oracle != nil {
 			s.PostWait = func(ctx context.Context, d *Driver, params map[string]string) error {
-				f := m.Oracle(ctx, d.rc)
+				// settleOracle, not a bare m.Oracle call: AwaitWalk returns at
+				// the START of the DUT's walk, so the control the DUT is
+				// fetching may not have reached the DER's own registers yet
+				// (IW13-005 — see oracleSettleWindow). Poll until it has, or
+				// until the settle deadline turns a persistent mismatch into
+				// the FAIL it deserves.
+				f := settleOracle(ctx, func() Finding { return m.Oracle(ctx, d.rc) })
 				switch {
 				case f.Unavailable != "":
 					params[oracleUnavailableParam] = f.Unavailable
@@ -374,24 +422,112 @@ func oracleUnitView(ctx context.Context, rc *certify.RunCtx, simName string) (in
 	return view.Unit, nil
 }
 
-// oracleMaxLimW builds a BASIC-010 (opModMaxLimW) Oracle: a direct
-// percent-to-percent comparison against the DER's own enabled WMaxLimPct —
-// both sides already express %setMaxW, so no nameplate/watts resolution is
-// needed at all (IW13-001 §1/§4.3).
+// oracleSettleWindow/oracleSettleStep bound the re-read the PostWait oracle
+// does after the DUT's northbound walk is observed (IW13-005, refined live
+// 2026-08-13).
+//
+// AwaitWalk (check.go run() -> observe.go) returns the instant the DUT issues
+// its FIRST GET /dcap after Setup — the START of its poll-cycle walk, not the
+// end. The control the DUT then fetches travels northbound-service -> MQTT ->
+// modbus reconciler -> a southbound Modbus write before it reaches the DER's
+// own registers, and that pipeline lands a beat AFTER the /dcap that satisfied
+// AwaitWalk: on the bench the reconciler logged "applied CeilingW=4800
+// (reason=new-desired)" ~1s after the DUT's walk began. A single oracle read
+// fired the moment AwaitWalk returns therefore samples the DER MID-PROPAGATION
+// and sees the pre-control value (the program default), a false FAIL of a DER
+// that applies the commanded ceiling correctly a second later.
+//
+// So the PostWait oracle POLLS: it re-reads the DER until the effect matches
+// (Pass) or the settle window elapses, returning the last decided verdict at
+// the deadline. A genuine, persistent mismatch (wrong register, wrong value)
+// never reaches Pass and still FAILs at the deadline with the value it read;
+// the oracled control's active window (oracleWindow) is far longer than this
+// settle, so nothing the poll observes is the control expiring. Only a decided
+// FAIL is retried — a Pass is returned at once, and an Unavailable (the DER
+// could not be reached at all) is not a propagation delay, so it returns at
+// once too rather than burning the window.
+const (
+	oracleSettleWindow = 15 * time.Second
+	oracleSettleStep   = 1 * time.Second
+)
+
+// settleOracle re-evaluates eval until it PASSES or the settle window elapses.
+// See oracleSettleWindow for why the oracled rows read through it.
+func settleOracle(ctx context.Context, eval func() Finding) Finding {
+	return settleOracleWindow(ctx, oracleSettleWindow, oracleSettleStep, eval)
+}
+
+// settleOracleWindow is settleOracle's parameterized core, split out so a test
+// can drive the deadline path in milliseconds instead of the production window.
+func settleOracleWindow(ctx context.Context, window, step time.Duration, eval func() Finding) Finding {
+	deadline := time.Now().Add(window)
+	for {
+		f := eval()
+		if f.Verdict == certify.Pass || f.Unavailable != "" || !time.Now().Before(deadline) {
+			return f
+		}
+		select {
+		case <-ctx.Done():
+			return f
+		case <-time.After(step):
+		}
+	}
+}
+
+// oracleMaxLimW builds a BASIC-010 (opModMaxLimW) Oracle: the DER's own
+// RESOLVED active-power ceiling in WATTS, compared against the commanded
+// percent resolved against THIS SAME DER's own WMax — the effect-based shape
+// oracleFixedW already uses, not the raw WMaxLimPct percent register the
+// pre-fix oracle read (IW13-005, diagnosed live 2026-08-13).
+//
+// WHY effect-based, not percent-to-percent: the board actuates a max-limit by
+// writing the DER's WMaxLimPct register as a percent of the DER's nameplate —
+// percent = applied ceiling W / nameplate W * 100 (lexa-gw
+// cmd/modbus/reconcile_solar.go's "704 WMaxLimPct echo"). Judging the RESOLVED
+// watts (WMaxLimPct % * WMax) rather than the bare percent makes the oracle a
+// statement about the physical cap the DER will enforce — robust to any bench
+// where the board's nameplate denominator and the DER's own WMax are not the
+// identical number — and symmetric with oracleFixedW, so the two oracled rows
+// judge the same physical quantity the same way. On the bench the two are
+// numerically equal (both an 8000 W WMax), so this does not change a correct
+// verdict; it changes what the verdict MEANS and what the bundle reports (a
+// watts ceiling, not a percent). The FAIL the compliance run actually hit was
+// a read-TOO-EARLY timing race (the oracle read the DER before the board's
+// northbound->southbound pipeline applied the ceiling), fixed separately by
+// the PostWait settle poll (settleOracle / oracleSettleWindow) with the wider
+// active window (oracleWindow) as insurance — NOT a defect in which register
+// the board writes: live 2026-08-13 the board wrote WMaxLimPct correctly, as
+// a percent of nameplate, and held the commanded 4800 W cap for the window.
 func oracleMaxLimW(wantHundredths int64) func(ctx context.Context, rc *certify.RunCtx) Finding {
 	return func(ctx context.Context, rc *certify.RunCtx) Finding {
 		uv, err := oracleUnitView(ctx, rc, oracleSimName)
 		if err != nil {
 			return unavailable("%v", err)
 		}
-		want := float64(wantHundredths) / 100.0
+		np := uv.Nameplate(oracleSimName)
+		if !np.Present {
+			return unavailable("the DER serves no M702, so its own WMax has no value to resolve the " +
+				"commanded ceiling against")
+		}
+		meas := uv.Measurement(oracleSimName)
+		base, err := np.Base(invariant.RefWMax, 1, meas)
+		if err != nil {
+			return unavailable("cannot resolve the DER's own WMax: %v", err)
+		}
+		wantPct := float64(wantHundredths) / 100.0
+		wantW := wantPct / 100 * base.Q.Val
 		for _, c := range uv.Commands(oracleSimName) {
-			if c.Point != "WMaxLimPct" || !c.Enabled || !c.Raw.Known() {
+			if c.Point != "WMaxLimPct" || !c.Enabled {
 				continue
 			}
-			got := c.Raw.Val
-			observed := fmt.Sprintf("the DER's own WMaxLimPct register reads %.2f%% (commanded %.2f%%)", got, want)
-			if math.Abs(got-want) <= oracleTolerance(want, 0.5) {
+			r := invariant.ResolveCommand(c, np, meas)
+			if !r.Physical.Known() || r.Physical.Unit != invariant.UnitWatt {
+				continue
+			}
+			gotW := r.Physical.Val
+			observed := fmt.Sprintf("the DER's own WMaxLimPct resolves to a %.1f W active-power ceiling "+
+				"(commanded %.2f%% of its own %.1f W WMax = %.1f W)", gotW, wantPct, base.Q.Val, wantW)
+			if math.Abs(gotW-wantW) <= oracleTolerance(wantW, 1) {
 				return Finding{Verdict: certify.Pass, Observed: observed}
 			}
 			return Finding{Verdict: certify.Fail, Observed: observed}

@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"csip-tls-test/internal/certify"
@@ -132,6 +133,53 @@ func TestOracleMaxLimW_UnavailableWhenSimUnreachable(t *testing.T) {
 	}
 	if f.Verdict == certify.Pass || f.Verdict == certify.Fail {
 		t.Fatalf("an unreachable oracle must never carry a decided Verdict, got %+v", f)
+	}
+}
+
+// TestOracleMaxLimW_EffectBasedResolvesToWatts pins the IW13-005 shape change:
+// the oracle now judges the DER's RESOLVED active-power ceiling in WATTS (like
+// oracleFixedW), not the raw WMaxLimPct percent register the pre-fix oracle
+// read. A conformant 60% ceiling on the 60 kW Bench702 fixture must resolve to
+// a 36,000 W ceiling and PASS, and the Observed string must REPORT that
+// resolved-watts ceiling — the visible signature that the comparison is
+// effect-based (watts against the DER's own WMax), not percent-to-percent.
+func TestOracleMaxLimW_EffectBasedResolvesToWatts(t *testing.T) {
+	dev, base := oracleFixture(t)
+	pc := model.PerCent{Value: 6000} // 60.00%
+	if err := base.ApplyControl(model.DERControlBase{OpModMaxLimW: &pc}, "oracle-test"); err != nil {
+		t.Fatalf("ApplyControl(opModMaxLimW=6000): %v", err)
+	}
+	rc := oracleTestRunCtx(t, dev)
+	f := oracleMaxLimW(6000)(context.Background(), rc)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("oracleMaxLimW(6000) after ApplyControl(60%%) = %+v, want Pass", f)
+	}
+	// 60% of the Bench702 fixture's 60 kW WMax = 36,000 W. The message must name
+	// the resolved watts ceiling, or the judgment is not the effect-based one.
+	if !strings.Contains(f.Observed, "36000") {
+		t.Fatalf("oracleMaxLimW Observed = %q, want it to report the resolved 36000 W ceiling — proof the "+
+			"judgment resolves WMaxLimPct against the DER's own WMax (watts), not the bare percent", f.Observed)
+	}
+	if !strings.Contains(f.Observed, "W") || strings.Contains(f.Observed, "register reads") {
+		t.Fatalf("oracleMaxLimW Observed = %q, want a watts-ceiling message, not the pre-fix "+
+			"percent-register-read message", f.Observed)
+	}
+}
+
+// TestOracleMaxLimW_FailOnCeilingWattsMismatch is the effect-based twin of the
+// discrimination proof: the DER's WMaxLimPct genuinely holds 60% (36,000 W on
+// this 60 kW fixture), the row claims 30% (18,000 W) was commanded, and the
+// oracle must FAIL on the resolved-watts gap, never silently agree.
+func TestOracleMaxLimW_FailOnCeilingWattsMismatch(t *testing.T) {
+	dev, base := oracleFixture(t)
+	pc := model.PerCent{Value: 6000} // device holds a 60% / 36,000 W ceiling
+	if err := base.ApplyControl(model.DERControlBase{OpModMaxLimW: &pc}, "oracle-test"); err != nil {
+		t.Fatalf("ApplyControl(opModMaxLimW=6000): %v", err)
+	}
+	rc := oracleTestRunCtx(t, dev)
+	f := oracleMaxLimW(3000)(context.Background(), rc) // row claims 30% / 18,000 W
+	if f.Verdict != certify.Fail {
+		t.Fatalf("oracleMaxLimW(3000) against a device holding a 60%% ceiling = %+v, want Fail", f)
 	}
 }
 

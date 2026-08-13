@@ -273,7 +273,7 @@ func registerInverterControls(reg *certify.Registry) {
 			r.Connect = ptr(false)
 			r.Energize = ptr(false)
 		}), "a connect/disconnect command"},
-		{"BASIC-010", 56, withOracle(scalarMode("opModMaxLimW", func(r *ControlRequest) {
+		{"BASIC-010", 56, withOracle(scalarModeOracled("opModMaxLimW", func(r *ControlRequest) {
 			r.MaxLimW = ptr(int64(6000))
 		}), oracleMaxLimW(6000)), "a maximum active power limit"},
 		{"BASIC-011", 57, curveMode("opModVoltWatt", "volt_watt",
@@ -287,7 +287,7 @@ func registerInverterControls(reg *certify.Registry) {
 		// hundredths of a percent (5000 = 50%), so the test value 6000 = 60%
 		// of max power"). The pre-fix FixedW=50 sent a value two orders of
 		// magnitude off the catalog's own stated test value.
-		{"BASIC-013", 59, withOracle(scalarMode("opModFixedW", func(r *ControlRequest) {
+		{"BASIC-013", 59, withOracle(scalarModeOracled("opModFixedW", func(r *ControlRequest) {
 			r.FixedW = ptr(int64(6000))
 		}), oracleFixedW(6000)), "a set-active-power command expressed as a percentage of maximum"},
 		// BASIC-014 is opModTargetW (genuine nested ActivePower, watts — §1.1,
