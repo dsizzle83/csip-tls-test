@@ -373,6 +373,13 @@ func TestOracleFixedW_CatchesTheNameplateFallbackWriter(t *testing.T) {
 // all. Reported as Unavailable it became a criterion SKIP that could not dent a
 // verdict, AND it was excluded from the settle poll's retry, so the one reading
 // that most needs the propagation window was the one reading that never got it.
+//
+// This is also IW14-004's case (e): nothing enabled anywhere is the exact 704
+// image the ece6499 bench serves BEFORE a board's write lands, so it must stay
+// a decided FAIL — the ceiling rung widened what COUNTS as an actuation, not
+// what counts as none — and the registers it lists must be the ones it read
+// (see TestCommandSummary_PrintsTheRegistersItRead for the zero-print defect
+// that line carried).
 func TestOracleFixedW_NoEnabledAxisIsAFail(t *testing.T) {
 	dev, _ := oracleFixture(t) // nothing applied: no enabled setpoint on any axis
 	rc := oracleTestRunCtx(t, dev)
@@ -384,7 +391,13 @@ func TestOracleFixedW_NoEnabledAxisIsAFail(t *testing.T) {
 	if f.Verdict != certify.Fail {
 		t.Fatalf("oracleFixedW against a DER with no enabled setpoint = %+v, want Fail", f)
 	}
-	for _, want := range []string{"NO enabled", "WSet/WSetPct", "60.00%"} {
+	t.Logf("the FAIL this row would report: %s", f.Observed)
+	for _, want := range []string{"NO enabled", "WSet/WSetPct", "60.00%",
+		// Both accepted actuations are named, so the FAIL says what it
+		// looked for rather than only the half the pre-IW14-004 oracle knew.
+		"WMaxLimPct generation ceiling",
+		// And what it actually read, per point, in the register's own unit.
+		"WMaxLimPct=0 % = 0 W (disabled)"} {
 		if !strings.Contains(f.Observed, want) {
 			t.Errorf("the FAIL does not mention %q, so a reader cannot tell what was looked for and what "+
 				"was found: %q", want, f.Observed)
@@ -393,6 +406,204 @@ func TestOracleFixedW_NoEnabledAxisIsAFail(t *testing.T) {
 	// The same terminal on the ceiling axis, so neither oracle can drift back.
 	if g := oracleMaxLimW(6000)(context.Background(), rc); g.Verdict != certify.Fail || g.Unavailable != "" {
 		t.Fatalf("oracleMaxLimW against a DER with no enabled WMaxLimPct = %+v, want a decided Fail", g)
+	}
+}
+
+// ── IW14-004: the solar ceiling fold ────────────────────────────────────────
+//
+// The five cases below are the acceptance set for oracleFixedW's second rung.
+// They exist because the 2026-08-14 ece6499 bench run FAILed BASIC-013 against
+// a gateway that had executed the control correctly: the board folded a
+// non-negative opModFixedW into the DER's generation ceiling (its
+// PICS-documented solar behaviour — lexa-gw internal/authority/csipin.go), the
+// oracle knew only the battery setpoint actuation, and the row was reported as
+// "the DER reports NO enabled WSet/WSetPct".
+
+// solarCeiling puts an ENABLED WMaxLimPct at pctHundredths on the PV fixture,
+// through the product's own writer, and leaves WSet/WSetPct untouched and
+// disabled — the exact register shape the bench board produces when it folds a
+// non-negative opModFixedW into the solar ceiling.
+func solarCeiling(t *testing.T, pctHundredths uint16) *diff.Device {
+	t.Helper()
+	dev, base := oracleFixture(t)
+	pc := model.PerCent{Value: pctHundredths}
+	if err := base.ApplyControl(model.DERControlBase{OpModMaxLimW: &pc}, "oracle-test"); err != nil {
+		t.Fatalf("ApplyControl(opModMaxLimW=%d): %v", pctHundredths, err)
+	}
+	return dev
+}
+
+// TestOracleFixedW_PassOnSolarCeilingFold is case (a): the DER executed the
+// commanded 60.00% as a maximum-generation limit, and that is a PASS whose
+// finding NAMES the actuation and the register it read.
+//
+// The naming is not decoration. A bundle that reported only "PASS" would leave
+// a reader unable to tell the ceiling fold from the setpoint actuation, and
+// those are different physical instructions on any device that can absorb.
+func TestOracleFixedW_PassOnSolarCeilingFold(t *testing.T) {
+	dev := solarCeiling(t, 6000) // 60.00% of the fixture's 60 kW WMax = 36,000 W
+	f := oracleFixedW(6000)(context.Background(), oracleTestRunCtx(t, dev))
+	if f.Unavailable != "" {
+		t.Fatalf("oracleFixedW against a DER holding the commanded ceiling = Unavailable(%q)", f.Unavailable)
+	}
+	if f.Verdict != certify.Pass {
+		t.Fatalf("oracleFixedW(6000) against a DER holding a 60%% GENERATION CEILING = %+v, want Pass: a "+
+			"non-negative opModFixedW is a percent of maximum active power, and a PV DER's actuation of it "+
+			"is a maximum-generation limit", f)
+	}
+	t.Logf("the PASS this row would report: %s", f.Observed)
+	for _, want := range []string{"GENERATION CEILING", "WMaxLimPct", "60.00%", "36000"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the PASS does not name %q, so the bundle cannot say WHICH actuation was observed or "+
+				"on which register: %s", want, f.Observed)
+		}
+	}
+	if strings.Contains(f.Observed, "SETPOINT") {
+		t.Errorf("the PASS reports a setpoint actuation for a ceiling register: %s", f.Observed)
+	}
+}
+
+// TestOracleFixedW_FailOnCeilingAtTheWrongPercent is case (b): the ceiling rung
+// has teeth. A DER holding an ENABLED ceiling at a percent that is NOT the one
+// commanded is a decided FAIL naming both numbers — otherwise the fold would
+// degrade into "any enabled ceiling passes", which would certify a gateway that
+// wrote the wrong number just as readily as one that wrote the right one.
+func TestOracleFixedW_FailOnCeilingAtTheWrongPercent(t *testing.T) {
+	dev := solarCeiling(t, 4000) // the DER holds 40.00%, the row commanded 60.00%
+	f := oracleFixedW(6000)(context.Background(), oracleTestRunCtx(t, dev))
+	if f.Unavailable != "" {
+		t.Fatalf("a wrong ceiling percent is a finding about the DER, got Unavailable(%q)", f.Unavailable)
+	}
+	if f.Verdict != certify.Fail {
+		t.Fatalf("oracleFixedW(6000) against a DER holding a 40%% ceiling = %+v, want Fail", f)
+	}
+	t.Logf("the FAIL this row would report: %s", f.Observed)
+	for _, want := range []string{"40.00%", "60.00%", "WMaxLimPct"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the FAIL does not name %q — a wrong percent is only diagnosable when the report "+
+				"carries both the value read and the value commanded: %s", want, f.Observed)
+		}
+	}
+}
+
+// TestOracleFixedW_SetpointActuationUnchangedByTheFold is case (c): the battery
+// semantics IW14-001/F5 established are untouched. A −60.00% command against
+// the asymmetric pack's 2000 W CHARGE rating is −1200 W on WSet, and that still
+// PASSes — reported as a SETPOINT actuation, never as a ceiling.
+func TestOracleFixedW_SetpointActuationUnchangedByTheFold(t *testing.T) {
+	dev, base := packOracleFixture(t)
+	spc := model.SignedPerCent{Value: -6000}
+	if err := base.ApplyControl(model.DERControlBase{OpModFixedW: &spc}, "oracle-test"); err != nil {
+		t.Fatalf("ApplyControl(opModFixedW=-6000): %v", err)
+	}
+	if got := packWSet(t, dev); math.Abs(got-(-1200)) > 1 {
+		t.Fatalf("the product wrote WSet=%g W, want -1200 W — the fixture is not exercising the per-sign "+
+			"reference this case is about", got)
+	}
+	f := oracleFixedW(-6000)(context.Background(), oracleTestRunCtx(t, dev))
+	if f.Verdict != certify.Pass {
+		t.Fatalf("oracleFixedW(-6000) against a pack holding the correct -1200 W = %+v, want Pass — the "+
+			"ceiling rung must not have disturbed the setpoint rung", f)
+	}
+	t.Logf("the PASS this row would report: %s", f.Observed)
+	for _, want := range []string{"SETPOINT", "WSet", "WChaRteMaxRtg", "-1200"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the PASS does not name %q: %s", want, f.Observed)
+		}
+	}
+	if strings.Contains(f.Observed, "CEILING") {
+		t.Errorf("a setpoint actuation is being reported as a ceiling: %s", f.Observed)
+	}
+}
+
+// TestOracleFixedW_CeilingIsNotAChargeActuation is case (d), and it is the one
+// that keeps the fold honest: a NEGATIVE opModFixedW commands the DER to
+// ABSORB, and a maximum-GENERATION limit says nothing whatever about charging.
+// A DER holding an enabled 60% ceiling and no charge setpoint has NOT executed
+// a −60.00% command, and accepting it would let a gateway that silently dropped
+// the charge half of the axis pass on a register it never wrote.
+func TestOracleFixedW_CeilingIsNotAChargeActuation(t *testing.T) {
+	dev := solarCeiling(t, 6000) // an enabled 60% GENERATION ceiling, nothing else
+	f := oracleFixedW(-6000)(context.Background(), oracleTestRunCtx(t, dev))
+	if f.Unavailable != "" {
+		t.Fatalf("a missing charge actuation is a finding about the DER, got Unavailable(%q)", f.Unavailable)
+	}
+	if f.Verdict != certify.Fail {
+		t.Fatalf("oracleFixedW(-6000) against a DER whose only enabled point is a 60%% GENERATION ceiling "+
+			"= %+v, want Fail: a ceiling cannot express a charge setpoint", f)
+	}
+	t.Logf("the FAIL this row would report: %s", f.Observed)
+	for _, want := range []string{"NO enabled", "WSet/WSetPct", "NOT considered an acceptable actuation"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the FAIL does not say %q, so a reader cannot tell why the enabled ceiling was "+
+				"refused: %s", want, f.Observed)
+		}
+	}
+	// And the refusal must not be a silent one: the reading it declined to
+	// accept has to appear in the register listing.
+	if !strings.Contains(f.Observed, "WMaxLimPct=60 %") {
+		t.Errorf("the FAIL does not list the enabled ceiling it read: %s", f.Observed)
+	}
+}
+
+// TestCommandSummary_PrintsTheRegistersItRead is the direct regression guard on
+// the zero-printing defect, stated as the bundle would have shown it: a DER
+// holding an ENABLED 60% ceiling must be REPORTED as holding 60%.
+//
+// The pre-fix listing read "WMaxLimPct=0 (enabled)" on hardware whose ceiling
+// was 60.00% and whose measured output had converged on the 4800 W that percent
+// implies (runs/verify-ece6499-20260814T063817Z). That line invented a second
+// defect for every reader of the bundle.
+func TestCommandSummary_PrintsTheRegistersItRead(t *testing.T) {
+	dev := solarCeiling(t, 6000)
+	uv, err := oracleUnitView(context.Background(), oracleTestRunCtx(t, dev), oracleSimName)
+	if err != nil {
+		t.Fatalf("read the fixture's own register image: %v", err)
+	}
+	got := commandSummary(uv)
+	if !strings.Contains(got, "WMaxLimPct=60 % = 36000 W (enabled)") {
+		t.Errorf("commandSummary = %q, want it to report the enabled 60%% ceiling the DER actually holds", got)
+	}
+	if !strings.Contains(got, "WSet=0 W (disabled)") {
+		t.Errorf("commandSummary = %q, want the disabled points reported in their own registers' units "+
+			"too, so a reader can see the whole axis and not just the one point that was enabled", got)
+	}
+	if strings.Contains(got, "WMaxLimPct=0 ") {
+		t.Fatalf("commandSummary still prints the zero-value Physical for a register holding 60%%: %q", got)
+	}
+}
+
+// TestOracleFixedW_LadderSeesTheCeilingActuation proves the fold reaches the
+// part of the row that decides what to COMMAND, not only the part that judges.
+//
+// oracleBinding.alternate asks this row's own Judge whether the DER already
+// holds a candidate value (basic.go). With the ceiling actuation accepted, a
+// DER already parked at the commanded 60% — exactly what BASIC-010's own row
+// leaves behind on the shared bench inverter — is now correctly seen as
+// "already holds it", so BASIC-013 departs to a ladder alternate the DER
+// provably does not hold and its post-read has somewhere to MOVE to. Without
+// this, the pre-read would have said "does not hold it", the row would have
+// commanded 60% into a register already at 60%, and the transition binding
+// would have been satisfied by a DER that never moved.
+func TestOracleFixedW_LadderSeesTheCeilingActuation(t *testing.T) {
+	dev := solarCeiling(t, 6000)
+	rc := oracleTestRunCtx(t, dev)
+	b := &oracleBinding{Commanded: 6000, Ladder: oracleValueLadder, Judge: oracleFixedW}
+
+	if pre := b.Judge(b.Commanded)(context.Background(), rc); pre.Verdict != certify.Pass {
+		t.Fatalf("the pre-read of a DER already holding the commanded 60%% ceiling = %+v, want Pass — "+
+			"Setup would otherwise never know it has to depart from the catalog's value", pre)
+	}
+	alt, altPre, ok := b.alternate(context.Background(), rc, b.Commanded)
+	if !ok {
+		t.Fatal("no ladder alternate was available on a DER holding only a 60% ceiling")
+	}
+	if alt != 4000 {
+		t.Errorf("the ladder chose %d, want the first entry the DER provably does not hold (4000)", alt)
+	}
+	if altPre.Verdict != certify.Fail {
+		t.Errorf("the alternate's baseline = %+v, want the decided Fail that PROVES the DER does not hold "+
+			"it", altPre)
 	}
 }
 

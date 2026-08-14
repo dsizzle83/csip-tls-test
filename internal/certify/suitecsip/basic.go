@@ -889,36 +889,78 @@ func noEnabledAxis(axis string, wantPct float64, baseName string, baseW, wantW f
 // commandSummary renders what the DER's own 704 image actually held, so a FAIL
 // on a missing axis names the registers it read instead of only the one it
 // wanted.
+//
+// It prints the RAW register value first and always (IW14-004). The pre-fix
+// version branched on c.Physical.Known() — but invariant.UnitView.Commands
+// returns DECODED commands, never resolved ones, so Physical was the zero
+// Quantity on every point; Known() is true for a zero (only NaN/Inf are
+// unknown), and the branch therefore printed a bare "0" for the whole image.
+// The 2026-08-14 ece6499 bundle carries the damage verbatim — "WMaxLimPct=0
+// (enabled)" for a register that was holding 60.00%, a 4800 W cap the DER's own
+// measured output had converged on. A FAIL whose "here is what I read" line
+// reads zero for every point is worse than one that omits it, because it
+// invents a second, false defect for whoever reads the bundle. Resolution is
+// done HERE, against the DER's own nameplate, and the physical value is shown
+// beside the raw one when the two are in different units.
 func commandSummary(uv invariant.UnitView) string {
 	cmds := uv.Commands(oracleSimName)
 	if len(cmds) == 0 {
 		return "no commanded setpoints at all"
 	}
+	np := uv.Nameplate(oracleSimName)
+	meas := uv.Measurement(oracleSimName)
 	parts := make([]string, 0, len(cmds))
 	for _, c := range cmds {
 		state := "disabled"
 		if c.Enabled {
 			state = "enabled"
 		}
+		r := invariant.ResolveCommand(c, np, meas)
 		switch {
-		case c.Physical.Known():
-			parts = append(parts, fmt.Sprintf("%s=%s (%s)", c.Point, c.Physical, state))
-		case c.Unresolved != "":
-			parts = append(parts, fmt.Sprintf("%s=%s raw, unresolved: %s (%s)", c.Point, c.Raw, c.Unresolved, state))
+		case r.Unresolved != "":
+			parts = append(parts, fmt.Sprintf("%s=%s raw, unresolved: %s (%s)", c.Point, c.Raw, r.Unresolved, state))
+		case r.Physical.Known() && r.Physical.Unit != c.Raw.Unit:
+			parts = append(parts, fmt.Sprintf("%s=%s = %s (%s)", c.Point, c.Raw, r.Physical, state))
 		default:
-			parts = append(parts, fmt.Sprintf("%s=%s raw (%s)", c.Point, c.Raw, state))
+			parts = append(parts, fmt.Sprintf("%s=%s (%s)", c.Point, c.Raw, state))
 		}
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ", ")
 }
 
-// oracleFixedW builds a BASIC-013 (opModFixedW) Oracle: the DER's own
-// resolved WSet/WSetPct watts value, compared against the commanded percent
-// resolved against THIS SAME DER's own PER-SIGN active-power rate reference
-// (invariant.RefWRteMax — WChaRteMaxRtg when the command is negative,
-// WDisChaRteMaxRtg when it is positive, the nameplate when the device leaves
-// that direction's rating unimplemented).
+// oracleFixedW builds a BASIC-013 (opModFixedW) Oracle. It accepts EITHER of
+// the two standards-faithful actuations of an opModFixedW, and nothing else:
+//
+//  1. a SETPOINT — an enabled WSet/WSetPct holding the commanded percent of
+//     THIS SAME DER's own PER-SIGN active-power rate reference
+//     (invariant.RefWRteMax — WChaRteMaxRtg when the command is negative,
+//     WDisChaRteMaxRtg when it is positive, the nameplate when the device
+//     leaves that direction's rating unimplemented); or
+//  2. for a NON-NEGATIVE command only, a generation CEILING — an enabled
+//     WMaxLimPct holding the commanded percent itself (fixedWCeilingFold).
+//
+// Rung 2 is IW14-004, diagnosed off the ece6499 bench run of 2026-08-14 in
+// which a CORRECT gateway was reported FAIL. IEEE 2030.5's opModFixedW is a
+// percent of maximum active power; on a PV DER with no discharge rating and no
+// ability to absorb, "produce 60% of maximum" and "do not exceed 60% of
+// maximum" are the same physical instruction, and the product folds a
+// non-negative FixedW into the solar ceiling by owner-approved, PICS-documented
+// design (lexa-gw internal/authority/csipin.go's solar branch;
+// docs/conformance/PICS_CSIP.md and RELEASE_SCOPE). The pre-fix oracle knew
+// only the battery actuation, so it read the ceiling the board had just written
+// (journal: "applied CeilingW=4800 (reason=hints-changed)", 60% of the DER's
+// 8000 W WMax, its measured output converging on 4800 W) and reported "the DER
+// reports NO enabled WSet/WSetPct" — a defect in the ORACLE's semantics, not in
+// the product.
+//
+// The teeth are unchanged in every other direction: a WMaxLimPct enabled at a
+// DIFFERENT percent is a decided FAIL naming both numbers, an empty axis is the
+// decided FAIL noEnabledAxis already reported, and the ceiling rung is refused
+// outright for a NEGATIVE command, because a maximum-GENERATION limit cannot
+// express a charge setpoint — accepting it there would let a gateway that
+// silently dropped a charge command pass on a register that says nothing about
+// charging at all.
 //
 // It resolved BOTH signs against WMax until IW14-001/F5. That was not a
 // simplification, it was a defect with two heads on any device whose charge
@@ -961,15 +1003,106 @@ func oracleFixedW(wantHundredths int64) func(ctx context.Context, rc *certify.Ru
 				continue
 			}
 			gotW := r.Physical.Val
-			observed := fmt.Sprintf("the DER's own %s resolves to %.1f W (commanded %.2f%% of its own %s = "+
-				"%.1f W, so %.1f W)", c.Point, gotW, wantPct, base.Name, base.Q.Val, wantW)
+			observed := fmt.Sprintf("the DER actuated this command as a SETPOINT: its own %s resolves to "+
+				"%.1f W (commanded %.2f%% of its own %s = %.1f W, so %.1f W)",
+				c.Point, gotW, wantPct, base.Name, base.Q.Val, wantW)
 			if math.Abs(gotW-wantW) <= oracleTolerance(wantW, 1) {
 				return Finding{Verdict: certify.Pass, Observed: observed}
 			}
 			return Finding{Verdict: certify.Fail, Observed: observed + alt}
 		}
-		return noEnabledAxis("WSet/WSetPct", wantPct, base.Name, base.Q.Val, wantW, uv)
+		// No setpoint actuation. A non-negative command may instead have been
+		// folded into the generation ceiling, which is the other actuation this
+		// row accepts; a negative one may not (see this function's doc).
+		if f, ok := fixedWCeilingFold(uv, np, meas, wantPct); ok {
+			return f
+		}
+		f := noEnabledAxis(fixedWAxisLabel(wantPct), wantPct, base.Name, base.Q.Val, wantW, uv)
+		if wantPct < 0 {
+			f.Observed += ". The WMaxLimPct generation ceiling was NOT considered an acceptable actuation " +
+				"here: this row commanded a NEGATIVE (charging) percent, and a maximum-generation limit " +
+				"cannot express a charge setpoint"
+		}
+		return f
 	}
+}
+
+// fixedWAxisLabel names the actuations a FixedW row accepts, for the FAIL that
+// found none of them enabled. The ceiling half appears only where it is
+// genuinely accepted, so the report never offers a reader an actuation that
+// would not have been believed anyway.
+func fixedWAxisLabel(wantPct float64) string {
+	if wantPct < 0 {
+		return "WSet/WSetPct setpoint"
+	}
+	return "WSet/WSetPct setpoint or WMaxLimPct generation ceiling"
+}
+
+// oracleCeilingPctFloor is the absolute floor oracleTolerance takes when the
+// comparison is percent-to-percent (the ceiling fold) rather than
+// watts-to-watts: one hundredth of a percent, which is BOTH the wire's own
+// SignedPerCent step (opModFixedW is in hundredths of a percent) and the
+// resolution of a 704 WMaxLimPct at the SF=-2 every device on this bench
+// publishes. Anything smaller would fail a row on a rounding step; anything
+// larger would start hiding real percent errors.
+const oracleCeilingPctFloor = 0.01
+
+// fixedWCeilingFold judges the SOLAR actuation of a non-negative opModFixedW:
+// the DER's own WMaxLimPct, ENABLED and holding the commanded PERCENT itself.
+//
+// It compares percent to percent, not resolved watts, and the difference is
+// deliberate. WMaxLimPct is by SunSpec's own definition a percentage of the
+// DER's WMax, while the percent this row commanded is resolved against the
+// per-sign RATE reference (IW14-001/F5) — the same number on a PV device that
+// implements no rate rating, a different one on anything that does. Judging the
+// bare percent asserts exactly what the fold claims ("the commanded percent
+// became the ceiling percent") and cannot be right for the wrong reason on a
+// device whose two references disagree. The resolved watts are still REPORTED,
+// because a reader wants the physical cap, but they are not what decides.
+//
+// ok is false when the DER carries no enabled, readable WMaxLimPct at all, so
+// the caller falls through to its own decided FAIL rather than this one.
+func fixedWCeilingFold(uv invariant.UnitView, np invariant.Nameplate, meas invariant.Measurement,
+	wantPct float64) (Finding, bool) {
+	if wantPct < 0 {
+		return Finding{}, false
+	}
+	for _, c := range uv.Commands(oracleSimName) {
+		if c.Point != "WMaxLimPct" || !c.Enabled {
+			continue
+		}
+		if !c.Raw.Known() || c.Raw.Unit != invariant.UnitPercent {
+			continue
+		}
+		gotPct := c.Raw.Val
+		observed := fmt.Sprintf("the DER actuated this command as a GENERATION CEILING: its own WMaxLimPct "+
+			"register is ENABLED at %.2f%%%s (commanded %.2f%%)", gotPct, ceilingWatts(c, np, meas), wantPct)
+		if math.Abs(gotPct-wantPct) <= oracleTolerance(wantPct, oracleCeilingPctFloor) {
+			return Finding{Verdict: certify.Pass, Observed: observed + ". A non-negative opModFixedW is a " +
+				"percent of maximum active power, and this DER's actuation of it IS a maximum-generation " +
+				"limit — the product's PICS-documented solar fold"}, true
+		}
+		return Finding{Verdict: certify.Fail, Observed: observed + ", which is NOT the commanded percent: " +
+			"neither actuation this row accepts — an enabled WSet/WSetPct setpoint, or the WMaxLimPct " +
+			"generation ceiling holding the commanded percent — carries what was commanded"}, true
+	}
+	return Finding{}, false
+}
+
+// ceilingWatts renders the physical cap an enabled WMaxLimPct imposes, as a
+// trailing clause for the ceiling finding — empty when the DER's own nameplate
+// cannot resolve it, so the finding never invents a watts figure it could not
+// derive.
+func ceilingWatts(c invariant.Command, np invariant.Nameplate, meas invariant.Measurement) string {
+	r := invariant.ResolveCommand(c, np, meas)
+	if !r.Physical.Known() || r.Physical.Unit != invariant.UnitWatt {
+		return ""
+	}
+	nameplate, err := np.Base(invariant.RefWMax, 1, meas)
+	if err != nil {
+		return fmt.Sprintf(", a %.1f W cap", r.Physical.Val)
+	}
+	return fmt.Sprintf(", a %.1f W cap on its own %.1f W %s", r.Physical.Val, nameplate.Q.Val, nameplate.Name)
 }
 
 // signOfPct is the direction a signed percent commands: −1 charge/import,
