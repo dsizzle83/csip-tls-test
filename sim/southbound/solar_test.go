@@ -604,3 +604,102 @@ func TestSolarStep_103WHAccumulatorTracksIntegratedEnergy(t *testing.T) {
 		t.Errorf("103 WH did not advance on a second wave of ticks: %v -> %v", prev, got)
 	}
 }
+
+// ── IW15-002a: the LEGACY rating/setting split ───────────────────────────────
+
+// TestSolarLegacyM121WMaxIsTheSettingTheCeilingResolvesAgainst is the fixture
+// that exposes the non-cancelling legacy over-limit.
+//
+// populateSolarCore seeds M120 WRtg and M121 WMax at the same number, and until
+// IW15-002 the physics read NEITHER — it used a Go float captured at
+// construction, so the two registers were decoration and no fixture could ever
+// drive them apart. They are two different facts: WRtg is what the machine CAN
+// do, WMax is what it is CONFIGURED to do, and the SETTING is what a
+// percent-of-max ceiling is a percentage of.
+//
+// The failure this pins is not hypothetical arithmetic: a gateway that computes
+// WMaxLimPct = target/RATING while the device applies pct × SETTING lands
+// target × setting/rating watts on the wire. At 4000/8000 that is half the
+// commanded power, and nothing downstream cancels it.
+func TestSolarLegacyM121WMaxIsTheSettingTheCeilingResolvesAgainst(t *testing.T) {
+	const wmax = 8000.0
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	ss := &SolarServer{Server: &Server{Regs: r}, bases: populateSolar(r, wmax, ""), wmaxW: wmax}
+	b := ss.bases
+
+	// Stock fixture: rating and setting agree, so every pre-existing scenario
+	// is unchanged by the split.
+	if got := solarWMaxRefW(r, b, wmax); got != wmax {
+		t.Fatalf("stock reference = %v, want %v (rating and setting are seeded equal)", got, wmax)
+	}
+
+	if err := ss.Inject([]byte(`{"M121_WMax_W":4000}`)); err != nil {
+		t.Fatalf("inject M121_WMax_W: %v", err)
+	}
+
+	if got := float64(r.Get(b.M120Base + sunspec.M120_WRtg)); got != wmax {
+		t.Errorf("M120 WRtg = %v after a SETTING inject, want %v — the rating is immutable", got, wmax)
+	}
+	if got := float64(r.Get(b.M121Base + sunspec.M121_WMax)); got != 4000 {
+		t.Errorf("M121 WMax = %v, want 4000", got)
+	}
+	if got := solarWMaxRefW(r, b, wmax); got != 4000 {
+		t.Fatalf("reference = %v, want 4000: the legacy ceiling physics must resolve against the "+
+			"SETTING, or a written WMax is cosmetic", got)
+	}
+
+	// A 50 % ceiling now means 2000 W, not 4000 W.
+	r.Set(b.M123Base+sunspec.M123_WMaxLimPct, sunspec.RawFromScaleSigned(50, -2))
+	r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 1)
+	if got := solarCeilingW(r, b, wmax, nil); math.Abs(got-2000) > 0.5 {
+		t.Fatalf("50 %% ceiling = %.0f W, want 2000 W (50 %% of the 4000 W setting). 4000 W would mean "+
+			"the device resolved the percent against its 8000 W RATING", got)
+	}
+
+	// And the physics follows, not just the arithmetic.
+	r.Set(b.M122Base+sunspec.M122_WAval, uint16(int16(6000)))
+	var wh uint16
+	solarStep(r, wmax, b, true /*paused*/, 0, 0, false, nil, &wh)
+	if got := float64(int16(r.Get(b.M103Base + sunspec.M103_W))); math.Abs(got-2000) > 1 {
+		t.Fatalf("measured = %.0f W, want 2000 W", got)
+	}
+
+	// /state carries all four numbers, so an oracle sees the divergence without
+	// a Modbus client.
+	np := ss.Snapshot().Nameplate
+	if np.WMaxW != wmax || np.WRtgW != wmax || np.M121WMaxW != 4000 || np.PctReferenceW != 4000 {
+		t.Errorf("/state nameplate = %+v, want wmax_W=%v m120_WRtg_W=%v m121_WMax_W=4000 pct_reference_W=4000",
+			np, wmax, wmax)
+	}
+}
+
+// TestSolarCapacityInjectKeysMatchTheModelsServed: a 702-only key must be
+// REFUSED BY NAME on a legacy sim rather than silently accepted. "I set
+// WChaRteMax and nothing happened" is precisely the diagnosis this simulator
+// exists to make impossible.
+func TestSolarCapacityInjectKeysMatchTheModelsServed(t *testing.T) {
+	const wmax = 5000.0
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	ss := &SolarServer{Server: &Server{Regs: r}, bases: populateSolar(r, wmax, ""), wmaxW: wmax}
+
+	for _, key := range []string{"WChaRteMax_W", "WChaRteMaxRtg_W", "WDisChaRteMax_W", "WDisChaRteMaxRtg_W"} {
+		if err := ss.Inject([]byte(`{"` + key + `":1000}`)); err == nil {
+			t.Errorf("legacy sim accepted %q, which it serves no model for", key)
+		}
+	}
+	// The keys the legacy models DO carry work, and land where they belong.
+	if err := ss.Inject([]byte(`{"WMax_W":3000,"WMaxRtg_W":4000}`)); err != nil {
+		t.Fatalf("inject legacy capacity keys: %v", err)
+	}
+	b := ss.bases
+	if got := float64(r.Get(b.M121Base + sunspec.M121_WMax)); got != 3000 {
+		t.Errorf("M121 WMax = %v, want 3000 (WMax_W is the setting)", got)
+	}
+	if got := float64(r.Get(b.M120Base + sunspec.M120_WRtg)); got != 4000 {
+		t.Errorf("M120 WRtg = %v, want 4000 (WMaxRtg_W is the rating)", got)
+	}
+	// A negative capacity is refused rather than wrapped into an unsigned register.
+	if err := ss.Inject([]byte(`{"WMax_W":-1}`)); err == nil {
+		t.Error("negative WMax_W accepted; SunSpec capacity points are unsigned")
+	}
+}

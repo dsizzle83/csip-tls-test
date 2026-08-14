@@ -10,11 +10,13 @@ package sim
 //	                             already computes (see solar_adv.go's
 //	                             populate701 — reused verbatim here).
 //	704 (DER AC Controls)      — WMaxLimPct, reused verbatim from
-//	                             solar_adv.go's populate704. Unlike the
-//	                             inverter's 704 (bridged into the legacy 123
-//	                             curtailment ceiling by advBridgeCeiling), a
+//	                             solar_adv.go's populate704. Unlike BOTH sims
+//	                             that wire 704 to physical effect — the
+//	                             inverter (ceiling via advBridgeCeiling AND
+//	                             setpoint via solarSetpointW, since IW15-001)
+//	                             and the bench PACK (packBridgeSetpoint) — a
 //	                             704 write here is NOT wired to physical
-//	                             effect: this bench's battery dispatch
+//	                             effect: this image's battery dispatch
 //	                             convention (a SIGNED legacy 123 WMaxLimPct —
 //	                             see interceptWrite/hubBatteryW) predates 704
 //	                             and is not re-derived from it. A 704 write
@@ -25,6 +27,14 @@ package sim
 //	                             echo"), it just does not additionally command
 //	                             the pack. See T06.4/T06.10 reviewer note in
 //	                             the task report.
+//
+//	                             THIS IS THE ack_no_apply SHAPE, and it is now
+//	                             the ONLY sim image that still has it on the
+//	                             active-power axis. It stays only because
+//	                             mbapsdev's T06.3 echo acceptance is written
+//	                             against this exact register world; a
+//	                             convergence or setpoint row must use
+//	                             NewBatteryPack (battery_pack.go), never this.
 //	713 (DER Storage Capacity) — WHRtg/WHAvail/SoC/SoH mirrored every tick
 //	                             from the same 802 state the legacy animation
 //	                             maintains, so /state (802) and 713 never

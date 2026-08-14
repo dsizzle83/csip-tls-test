@@ -584,3 +584,102 @@ row that diverges until the animation moves, the rate-rating clamp,
 cease/reconnect physical effect on both shapes (including the 701 `St`/`ConnSt`
 half of the two-sided proof), full/empty idle, the fault rows above, and a pin
 that the historical battery images grew no pack surface.
+
+## IW15-001 / IW15-002 — the solar setpoint, and settings vs ratings (2026-08-14)
+
+Two defects the sims used to make untestable, closed together on the southbound
+side.
+
+### IW15-001 — the solar 704 `WSet` reached nothing
+
+`advBridgeCeiling` mirrored the **ceiling** (`WMaxLimPct`) into the legacy 123
+curtailment machinery and nothing anywhere read `WSet`. The register bank
+accepted, stored and echoed a solar setpoint write perfectly — and the machine
+ignored it. That is the `ack_no_apply` fault, permanently armed, with no way to
+disarm it, on the axis every `opModFixedW` row is written against.
+
+Closed by making the setpoint a **third, independent term** of the physical
+step:
+
+```
+output = min(available, ceiling, setpoint)          # solar.go, solarStep
+```
+
+It is deliberately **not folded** into the M123 ceiling cell the way the battery
+pack's `packBridgeSetpoint` folds (a pack's one physics *is* the signed-percent
+dispatch, so the fold is lossless there). Folding here would erase the only
+evidence a *"a limit is not a setpoint"* negative row has: `/state`'s
+`WMaxLimPct_pct` and the 123/704 register dump. `advBridgeSetpoint` makes the
+effect prompt (a downward clip of M103 `W` on the write itself, via the new
+`OnWrite` hook and `advSync`), and `powerOnReset` now clears `WSetEna`/`WSet`/
+`WSetPct` so `reboot_forget` cannot leave a live setpoint standing.
+
+**`WSetMod`'s default is `MaxPct` (raw 0).** A head end that writes `WSet`
+(watts) without also writing `WSetMod` has therefore commanded a **percent** —
+of a `WSetPct` register it never wrote, i.e. zero output. The sim reads the wire
+honestly and does not guess, so an oracle cannot be fooled by a fixture that is
+kinder than a real device (`TestSolarSetpointWSetModDefaultIsPercent`).
+
+### IW15-002 — ratings were settings
+
+Every physics path read a Go float captured at construction, so a `WMax` or
+`WChaRteMax` written over Modbus was **cosmetic**. Both sims now resolve their
+percent-of-max reference live:
+
+```
+702 WMax  →  121 WMax  →  the construction nameplate      (solarWMaxRefW)
+702 WChaRteMax / WDisChaRteMax  →  the construction floats (packProfile.rateLimits)
+```
+
+A not-implemented point (0xFFFF) falls through to the next source; an
+implemented **zero** is honoured, because "this pack may not charge" is a thing
+a configured device says. Ratings (120 `WRtg`, 702 `WMaxRtg`, 702 `…Rtg`) are
+**declarations** and no physics reads them — which is what makes a
+rating/setting divergence stageable at all.
+
+### Inject keys (bench runbook)
+
+Solar (`modsim`), on top of the existing keys:
+
+| Key | Model(s) written | Effect |
+|---|---|---|
+| `WMax_W` | 121 `WMax` **+** 702 `WMax` (advanced) | **physics** — the reference every percent resolves against |
+| `M121_WMax_W` | 121 `WMax` only | the cross-model divergence lever; on a legacy sim, the only `WMax` there is |
+| `WMaxRtg_W` | 120 `WRtg` **+** 702 `WMaxRtg` (advanced) | declaration only (the panel is fixed at `-wmax`) |
+| `WChaRteMax_W`, `WDisChaRteMax_W` | 702 settings | declaration only **on solar** (PV models no rate physics) |
+| `WChaRteMaxRtg_W`, `WDisChaRteMaxRtg_W` | 702 ratings | declaration only |
+
+Battery pack (`batsim -pack setpoint`), on top of the existing keys:
+
+| Key | Model(s) written | Effect |
+|---|---|---|
+| `WChaRteMax_W`, `WDisChaRteMax_W` | 702 settings | **physics** — `clampToRateRating` reads them live |
+| `WChaRteMaxRtg_W`, `WDisChaRteMaxRtg_W` | 702 ratings **+** the 120 `MaxChaRte`/`MaxDisChaRte` mirror | declaration only |
+| `WMax_W`, `WMaxRtg_W` | 702 | declaration only |
+
+Model 802's `WChaRteMax`/`WDisChaRteMax` pair stays where `populateBatteryPack`
+seeded it, deliberately: freezing it makes *"the 702 setting moved and the
+storage model did not"* an injectable cross-model divergence with a name rather
+than an invisible coupling.
+
+Every 702-only key is **refused by name** on a sim that serves no 702 (a legacy
+inverter, the cease-shape pack). `modsim -wmax-setting N` stages the divergence
+**before the gateway's first read** — same effect as `{"WMax_W":N}`, but in
+place at adoption.
+
+### Ground truth for both
+
+`GET /state` (solar) grows `nameplate.m120_WRtg_W`, `nameplate.m121_WMax_W` and
+`nameplate.pct_reference_W` (the number the device's own percents resolve
+against — the referee), plus `advanced.wset_704` (`ena`, `wset_mod`, `wset_W`,
+`wset_pct`, `effective_W`) and `advanced.capacity_702`. The pack's `"pack"`
+object grows `w_cha_rte_max_rtg_W` / `w_discha_rte_max_rtg_W` beside the
+existing `w_cha_rte_max_W` / `w_discha_rte_max_W`, which now report the setting
+being **honoured** rather than the construction float.
+
+Unit tests: `sim/southbound/solar_adv_test.go` (three-way min incl. the
+anti-fold pin, `WSetMod` default, write-time coherence, power-on reset, the
+702 setting moving real watts, sentinel fallback), `solar_test.go` (the legacy
+120/121 split — a 50 % ceiling against a 4000 W setting on an 8000 W panel is
+2000 W, and the key-vs-model refusals), `battery_pack_test.go` (the live rate
+setting, the rating mirror, sentinel fallback, refusal without a 702).

@@ -18,8 +18,11 @@ package sim
 //	                            713, it carries no conditionality clause) — see
 //	                            populate703.
 //	704 (DER AC Controls)     — WMaxLimPct (bridged to the 123 ceiling machinery),
+//	                            WSet/WSetPct active-power SETPOINT (its own term
+//	                            in solarStep's three-way min — NOT folded into
+//	                            the ceiling; see solarSetpointW/advBridgeSetpoint),
 //	                            PFWInj/PFWAbs fixed-PF sync groups, VarSet fixed-var,
-//	                            all writable with MEASURED effect on 701 PF/Var.
+//	                            all writable with MEASURED effect on 701 W/PF/Var.
 //	705/706/711/712           — Volt-Var / Volt-Watt / Freq-Droop / Watt-Var, each
 //	                            with the §3.1.2 adopt handshake: a read-only live
 //	                            curve (index 0), a writable staging curve (index 1),
@@ -210,6 +213,7 @@ func newSolarServerAdvanced(listenURL string, wmaxW float64, serial string, with
 	}
 	ss.Server = srv
 	regs.OnWriteAttempt = ss.interceptWrite
+	regs.OnWrite = ss.solarOnWrite // 704 write-time coherence (see solarOnWrite)
 	regs.OnRead = ss.faults.transportRead
 	ss.installLies() // the lying-device layer, in front of the fault hooks (lying.go)
 	return ss, nil
@@ -221,6 +225,12 @@ func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial stri
 	bases, cursor := populateSolarCore(r, wmaxW, serial)
 	seedLineToLineVoltage(r, bases)
 	adv, cursor := populateSolar7xx(r, cursor, wmaxW, varRating, withTrip)
+	// The ONE physics has to see the two advanced blocks that BIND OUTPUT: 702
+	// carries the WMax setting every percent resolves against, 704 the WSet
+	// setpoint. Copied from adv (single source) into SolarBases, which is what
+	// solarStep/solarCeilingW/solarSetpointW already receive — see SolarBases'
+	// own doc for why the plumbing goes this way instead of widening signatures.
+	bases.M702Base, bases.M704Base = adv.M702, adv.M704
 	r.Set(cursor, sunspec.EndMarker)
 	r.Set(cursor+1, 0)
 	return bases, adv
@@ -701,6 +711,7 @@ func animateSolarAdvanced(s *Server, r *RegisterMap, wmaxW float64, bases SolarB
 	// Seed 701 before the first tick so an immediately-read advanced sim is
 	// coherent.
 	advBridgeCeiling(r, bases, adv)
+	advBridgeSetpoint(r, bases, wmaxW)
 	advMirror701(r, bases, adv, wmaxW, varRating, fc)
 
 	for {
@@ -710,18 +721,48 @@ func animateSolarAdvanced(s *Server, r *RegisterMap, wmaxW float64, bases SolarB
 		case <-tick.C:
 			// Bridge the hub's 704 ceiling into the 123 machinery BEFORE the
 			// physical step, so curtailment (and its effect-time faults) apply.
+			// The setpoint needs no such transcoding — solarStep reads it as its
+			// own term — but the prompt clip runs on the same schedule so the
+			// two axes reach the step through the same door.
 			advBridgeCeiling(r, bases, adv)
+			advBridgeSetpoint(r, bases, wmaxW)
 			solarStep(r, wmaxW, bases, s.IsPaused(), s.simTime(), cloud(), night(), fc, &whAcc)
 			advMirror701(r, bases, adv, wmaxW, varRating, fc)
 		}
 	}
 }
 
-// advSync bridges the 704 ceiling and refreshes 701 outside the animation loop
-// (used by the inject path so a paused advanced sim stays coherent).
+// advSync bridges the 704 ceiling and setpoint and refreshes 701 outside the
+// animation loop (used by the inject path so a paused advanced sim stays
+// coherent).
 func (ss *SolarServer) advSync() {
 	advBridgeCeiling(ss.Regs, ss.bases, ss.adv)
+	advBridgeSetpoint(ss.Regs, ss.bases, ss.wmaxW)
 	advMirror701(ss.Regs, ss.bases, ss.adv, ss.wmaxW, ss.varRating, &ss.faults)
+}
+
+// solarOnWrite is the RegisterMap.OnWrite hook on an ADVANCED sim: it runs
+// after a write has landed and gives a 704 write its immediate physical
+// consequence, so /registers, a 701 read and the next tick all agree about what
+// was commanded the instant the write lands. It is packOnWrite's counterpart
+// (battery_pack.go) and, like it, sets the command rather than the whole
+// physical image — see advBridgeSetpoint.
+//
+// Gated on the 704 block: every other write reaches the physics through the
+// animation tick exactly as before, so this hook cannot change the behaviour of
+// any scenario that never writes 704.
+func (ss *SolarServer) solarOnWrite(startAddr uint16) {
+	if !ss.advanced || ss.adv.M704 == 0 {
+		return
+	}
+	if startAddr < ss.adv.M704 || startAddr >= ss.adv.M704+uint16(sunspec.L704.Len()) {
+		return
+	}
+	// advSync, not a hand-rolled subset: the write path and the /inject path
+	// must land in the SAME state, and the 701 mirror has to move with them or
+	// a client reading the model this device PREFERS still sees the pre-write
+	// value while 103 has already moved.
+	ss.advSync()
 }
 
 // advBridgeCeiling mirrors an enabled 704 WMaxLimPct (the hub's advanced-path
@@ -737,6 +778,88 @@ func advBridgeCeiling(r *RegisterMap, bases SolarBases, adv solarAdvBases) {
 	pctRaw := r.Get(adv.M704 + uint16(sunspec.L704.Offset("WMaxLimPct")))
 	r.Set(bases.M123Base+sunspec.M123_WMaxLimPct, pctRaw)
 	r.Set(bases.M123Base+sunspec.M123_WMaxLimPct_Ena, 1)
+}
+
+// solarSetpointW resolves the inverter's ENABLED 704 active-power setpoint to
+// watts, or reports ok=false when no setpoint is in force (no 704 at all, the
+// legacy sim, WSetEna off, or an undecodable value).
+//
+// IW15-001: BEFORE this, a solar WSet write was ACK'd by the Modbus server,
+// stored verbatim, read back correctly — and PHYSICALLY IGNORED. Nothing in
+// solar.go or solar_adv.go read WSet; advBridgeCeiling mirrored the CEILING
+// only. That is the ack_no_apply fault, permanently armed and with no way to
+// disarm it, on the axis a gateway's opModFixedW rows are written against.
+//
+// Three decisions live here:
+//
+//   - WSetMod is honoured through the package-scope packCommandedWatts
+//     (battery_pack.go), the SAME decoder the pack uses, so the two axes cannot
+//     drift on what a percent means. Its default matters: WSetMod's populate
+//     value is raw 0 = MaxPct, so a head end that writes WSet (watts) WITHOUT
+//     also writing WSetMod has commanded a PERCENT — and the percent field it
+//     never wrote is 0, i.e. zero output. That is the honest reading of the
+//     wire, it is what a conformant device does, and it must stay that way so
+//     an oracle cannot be fooled by a fixture that quietly guesses "they
+//     probably meant watts" (see TestSolarSetpoint_WSetModDefaultIsPercent).
+//   - The reference is the live WMax SETTING (solarWMaxRefW), not the
+//     construction float — the IW15-002 half of the same defect.
+//   - Clamped to [0, ref]: A PV INVERTER CANNOT ABSORB. A negative setpoint is
+//     not an error, it is a command to import that this machine answers with
+//     zero output, which is the physically honest response and keeps the
+//     three-way min in solarStep total.
+func solarSetpointW(r *RegisterMap, bases SolarBases, wmaxW float64) (float64, bool) {
+	if bases.M704Base == 0 {
+		return 0, false // legacy sim: no 704, no setpoint axis
+	}
+	v := sunspec.L704.View(readSlice(r, bases.M704Base, sunspec.L704.Len()))
+	if !v.Bool("WSetEna") {
+		return 0, false
+	}
+	ref := solarWMaxRefW(r, bases, wmaxW)
+	w := packCommandedWatts(v, ref)
+	if math.IsNaN(w) {
+		return 0, false
+	}
+	return math.Max(0, math.Min(ref, w)), true
+}
+
+// advBridgeSetpoint gives a 704 WSet write its IMMEDIATE physical consequence,
+// outside the animation tick: it clips the reported output down to the
+// setpoint. It is advBridgeCeiling's counterpart on the setpoint axis, and it
+// is deliberately NOT the same shape as it.
+//
+// IT DOES NOT WRITE THE M123 CEILING CELL. Folding a setpoint into the ceiling
+// register would be the smaller diff — the pack does exactly that
+// (packBridgeSetpoint), because a battery's ONE physics is the signed-percent
+// dispatch and the fold is lossless there. Here it would destroy the referee:
+// /state's WMaxLimPct_pct and the 123/704 register dump are precisely the
+// evidence a "a limit is not a setpoint" negative row reads, and a fold makes
+// the two commands indistinguishable after the fact. The setpoint is therefore
+// carried as its own term in solarStep's three-way min, and this function only
+// makes the effect PROMPT.
+//
+// DOWNWARD ONLY, and only M103 W. The full derived image (VA/VAr/DCW/A/St)
+// follows on the next animation tick, exactly as the Inject "W_W" path has
+// always behaved — re-deriving it here would be a SECOND power derivation, and
+// two derivations are two chances for /state and the wire to disagree about
+// what the device is doing. Raising output is likewise not this function's to
+// do: available power is the animation's business.
+//
+// What it buys is write-time coherence: a register dump, a 701 read, or a
+// /state fetch taken immediately after the gateway's 704 write already agrees
+// with the command, instead of showing a pre-write value for up to one tick —
+// which a settle-deadline oracle would otherwise score as a device that
+// ignored the write.
+func advBridgeSetpoint(r *RegisterMap, bases SolarBases, wmaxW float64) {
+	sp, ok := solarSetpointW(r, bases, wmaxW)
+	if !ok {
+		return
+	}
+	m103 := bases.M103Base
+	sf := int16(r.Get(m103 + sunspec.M103_W_SF))
+	if w := sunspec.ApplyScaleSigned(r.Get(m103+sunspec.M103_W), sf); w > sp {
+		r.Set(m103+sunspec.M103_W, sunspec.RawFromScaleSigned(sp, sf))
+	}
 }
 
 // advMirror701 writes the 701 measurement model from the 103 physical state the
@@ -945,12 +1068,25 @@ func pfVar(w, pf float64, underExcited bool) float64 {
 // only), so QA oracles can read the sim's real 701 measurement, 704 command
 // readback, and live curve points without a Modbus client.
 type SolarAdvancedState struct {
-	Alrm       uint32          `json:"Alrm"`
-	Meas701    adv701Meas      `json:"meas_701"`
-	FixedPF    advPFState      `json:"fixed_pf"`
-	FixedVar   advVarState     `json:"fixed_var"`
-	Ceiling704 advCeilState    `json:"wmaxlimpct_704"`
-	Curves     []advCurveState `json:"curves"`
+	Alrm     uint32      `json:"Alrm"`
+	Meas701  adv701Meas  `json:"meas_701"`
+	FixedPF  advPFState  `json:"fixed_pf"`
+	FixedVar advVarState `json:"fixed_var"`
+	// Ceiling704 and Setpoint704 are the TWO active-power axes, reported
+	// separately because they ARE separate (IW15-001): a ceiling is a
+	// magnitude the device may not exceed, a setpoint is a value it is told to
+	// produce, and the physics applies both as independent terms of a
+	// three-way min against available power (solarStep). An oracle that has to
+	// prove a gateway did not substitute one for the other reads these two
+	// fields; before this, the setpoint had nowhere to be reported because the
+	// device ignored it.
+	Ceiling704  advCeilState     `json:"wmaxlimpct_704"`
+	Setpoint704 advSetpointState `json:"wset_704"`
+	// Capacity702 is the rating/setting split (IW15-002) as model 702 really
+	// holds it — see SolarState.Nameplate for the legacy (120/121) pair and the
+	// resolved reference the physics uses.
+	Capacity702 advCapacityState `json:"capacity_702"`
+	Curves      []advCurveState  `json:"curves"`
 	// Trips is the 707-710 ground truth, omitted entirely on a sim that does
 	// not serve them so /state stays byte-identical for every existing
 	// scenario. See trip1547.go.
@@ -981,6 +1117,65 @@ type advCeilState struct {
 	Pct float64 `json:"pct"`
 }
 
+// advSetpointState is the 704 active-power SETPOINT axis, modelled on the
+// pack's packSetpointState so a row reading either sim finds the same shape.
+// WSetMod is reported RAW (0 = MaxPct, 1 = Watts) because which mode the head
+// end left it in is the whole content of the "a watts write against the default
+// percent mode commands zero" trap — see solarSetpointW.
+type advSetpointState struct {
+	// Ena is "a setpoint is IN FORCE", which is the enable bit AND a value the
+	// device can decode — not the raw register. Under a sentinel_field fault an
+	// enabled-but-undecodable setpoint bounds nothing (solarSetpointW returns
+	// ok=false and solarStep's min never sees it), and reporting ena=true with
+	// effective_W=0 there would tell an oracle the device is holding zero when
+	// it is in fact running unbounded. The raw registers are still in
+	// /registers for anyone who needs to see the enable bit by itself.
+	Ena     bool    `json:"ena"`
+	Mod     int     `json:"wset_mod"`
+	WSet_W  float64 `json:"wset_W"`
+	WSetPct float64 `json:"wset_pct"`
+	// EffectiveW is WSet/WSetPct resolved through WSetMod against the LIVE WMax
+	// setting and clamped to [0, WMax] — the watts this device is actually
+	// holding itself to. 0 with Ena=true is a real command (produce nothing),
+	// which is why Ena is reported beside it rather than folded into it.
+	EffectiveW float64 `json:"effective_W"`
+}
+
+// advCapacityState is model 702's rating/setting pair. The rate fields are
+// POINTERS so a not-implemented point (this PV profile leaves all four at the
+// 0xFFFF sentinel) reports as JSON null — an honest "absent", not a 0 that an
+// oracle would read as a declared incapacity. They also cannot be plain floats:
+// View.Float returns NaN for a sentinel and encoding/json refuses to marshal
+// NaN, which would take GET /state down with it.
+type advCapacityState struct {
+	WMaxRtgW          float64  `json:"WMaxRtg_W"`
+	WMaxW             float64  `json:"WMax_W"`
+	WChaRteMaxRtgW    *float64 `json:"WChaRteMaxRtg_W"`
+	WChaRteMaxW       *float64 `json:"WChaRteMax_W"`
+	WDisChaRteMaxRtgW *float64 `json:"WDisChaRteMaxRtg_W"`
+	WDisChaRteMaxW    *float64 `json:"WDisChaRteMax_W"`
+}
+
+// finiteOr0 keeps a NaN/Inf out of a JSON float field (encoding/json refuses
+// both). Used where the value is a real number by construction and a NaN could
+// only arrive through a fault-injected sentinel — reporting 0 there is honest
+// enough, and a live /state beats a 500.
+func finiteOr0(x float64) float64 {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return 0
+	}
+	return x
+}
+
+// finitePtr returns a pointer to x, or nil when x is not a real number — the
+// shape a not-implemented SunSpec point should take in JSON.
+func finitePtr(x float64) *float64 {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return nil
+	}
+	return &x
+}
+
 type advCurveState struct {
 	Model     uint16       `json:"model"`
 	AdoptRslt int          `json:"adopt_rslt"`
@@ -1000,10 +1195,35 @@ func (ss *SolarServer) advSnapshot() *SolarAdvancedState {
 		St: int(m701.St), ConnSt: int(m701.ConnSt),
 	}
 
-	c704 := sunspec.Parse704(readSlice(r, ss.adv.M704, sunspec.L704.Len()))
+	regs704 := readSlice(r, ss.adv.M704, sunspec.L704.Len())
+	c704 := sunspec.Parse704(regs704)
 	out.FixedPF = advPFState{Ena: c704.PFWInjEna, PF: c704.PFWInjPF}
 	out.FixedVar = advVarState{Ena: c704.VarSetEna, Pct: c704.VarSetPct}
 	out.Ceiling704 = advCeilState{Ena: c704.WMaxLimPctEna, Pct: c704.WMaxLimPct}
+
+	// The setpoint axis is read through L704.View rather than Parse704, which
+	// surfaces the ceiling and the reactive controls but not WSet/WSetPct/
+	// WSetMod — the same reason packSnapshot uses a View.
+	v704 := sunspec.L704.View(regs704)
+	mod, _ := v704.Enum("WSetMod")
+	eff, ena := solarSetpointW(r, ss.bases, ss.wmaxW)
+	out.Setpoint704 = advSetpointState{
+		Ena:        ena,
+		Mod:        int(mod),
+		WSet_W:     finiteOr0(v704.Float("WSet")),
+		WSetPct:    finiteOr0(v704.Float("WSetPct")),
+		EffectiveW: eff,
+	}
+
+	v702 := sunspec.L702.View(readSlice(r, ss.adv.M702, sunspec.L702.Len()))
+	out.Capacity702 = advCapacityState{
+		WMaxRtgW:          finiteOr0(v702.Float("WMaxRtg")),
+		WMaxW:             finiteOr0(v702.Float("WMax")),
+		WChaRteMaxRtgW:    finitePtr(v702.Float("WChaRteMaxRtg")),
+		WChaRteMaxW:       finitePtr(v702.Float("WChaRteMax")),
+		WDisChaRteMaxRtgW: finitePtr(v702.Float("WDisChaRteMaxRtg")),
+		WDisChaRteMaxW:    finitePtr(v702.Float("WDisChaRteMax")),
+	}
 
 	for _, cb := range ss.adv.Curves {
 		cs := advCurveState{

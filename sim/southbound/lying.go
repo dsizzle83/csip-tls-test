@@ -681,10 +681,34 @@ func (ss *SolarServer) powerOnReset() {
 	ss.Regs.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 0)
 	ss.Regs.Set(b.M123Base+sunspec.M123_Conn, 1)
 	if ss.advanced {
+		// The whole 704 command surface goes, not just the ceiling. Before
+		// IW15-001 the setpoint fields were skipped here — harmlessly, because
+		// nothing read them — and leaving them now would let a LIVE SETPOINT
+		// SURVIVE A SIMULATED REBOOT: reboot_forget would report a device that
+		// forgot its ceiling while still holding the watts it was told to
+		// produce, which is not a state any real power cycle reaches and would
+		// let a gateway that never re-asserts its setpoint pass the row.
+		// packPowerOnReset (battery_pack.go) clears the same pair one axis over.
+		//
+		// Written through the L704 view, not raw Set: WSet is a Tint32 (TWO
+		// registers), so clearing it by hand is one high word away from
+		// restoring a value nobody wrote. WSetPct is cleared too, and WSetMod
+		// returned to its populate default (raw 0 = MaxPct), because with that
+		// default it is WSetPct — not WSet — that a re-enable would command
+		// from (see solarSetpointW).
+		//
 		// 704 WMaxLimPct_SF is seeded at −2 by populate704, so 100.00 % is
 		// raw 10000 — the same encoding the legacy 123 point uses.
-		ss.Regs.Set(ss.adv.M704+uint16(sunspec.L704.Offset("WMaxLimPct")), 10000)
-		ss.Regs.Set(ss.adv.M704+uint16(sunspec.L704.Offset("WMaxLimPctEna")), 0)
+		m704 := ss.adv.M704
+		regs := readSlice(ss.Regs, m704, sunspec.L704.Len())
+		v := sunspec.L704.View(regs)
+		v.SetBool("WMaxLimPctEna", false)
+		v.SetFloat("WMaxLimPct", 100)
+		v.SetBool("WSetEna", false)
+		v.SetEnum("WSetMod", sunspec.M704_WSetMod_MaxPct)
+		v.SetFloat("WSet", 0)
+		v.SetFloat("WSetPct", 0)
+		writeSlice(ss.Regs, m704, regs)
 	}
 }
 

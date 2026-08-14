@@ -3,12 +3,16 @@ package sim
 // solar_adv_test.go — unit tests for the advanced-DER (7xx) solar surface:
 // model 701 encoding, the 705/706/711/712 curve-adopt handshake (success AND
 // the curve_adopt_lies divergence), the 704 fixed-PF measured effect (and its
-// pf_ack_ignore accept-but-ignore), and the raise_alarm bitfield knob.
+// pf_ack_ignore accept-but-ignore), the raise_alarm bitfield knob, and — since
+// IW15-001/002 — the 704 active-power SETPOINT and the 702 rating/setting split.
 
 import (
+	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 
+	modbuslib "github.com/simonvetter/modbus"
 	"lexa-proto/sunspec"
 )
 
@@ -776,6 +780,456 @@ func TestPopulate702RateRatingsNotImplemented(t *testing.T) {
 		off := sunspec.L702.Offset(name)
 		if got := regs[off]; got != 0xFFFF {
 			t.Errorf("702 %s raw register = 0x%04x, want 0xFFFF (the SunSpec not-implemented sentinel)", name, got)
+		}
+	}
+}
+
+// ── IW15-001: the solar active-power SETPOINT ────────────────────────────────
+//
+// Before this block existed, a 704 WSet write to the inverter was ACK'd,
+// stored, echoed back — and physically ignored (advBridgeCeiling mirrored the
+// CEILING and nothing read WSet at all). These tests pin the closure: the
+// setpoint is a real, independent bound on output, it is NOT folded into the
+// ceiling register, and its default decoding cannot be fooled.
+
+// setSolarPotential seeds the panel's available power (M122 WAval), which a
+// PAUSED solarStep holds as potW — the "available" term of the three-way min.
+func setSolarPotential(ss *SolarServer, w float64) {
+	ss.Regs.Set(ss.bases.M122Base+sunspec.M122_WAval, uint16(int16(w)))
+}
+
+// armSolar704Setpoint writes an ENABLED 704 setpoint in the given WSetMod.
+// val is watts for M704_WSetMod_Watts and percent-of-WMax for MaxPct.
+func armSolar704Setpoint(ss *SolarServer, mod uint16, val float64) {
+	regs := readSlice(ss.Regs, ss.adv.M704, sunspec.L704.Len())
+	v := sunspec.L704.View(regs)
+	v.SetBool("WSetEna", true)
+	v.SetEnum("WSetMod", mod)
+	if mod == sunspec.M704_WSetMod_Watts {
+		v.SetFloat("WSet", val)
+	} else {
+		v.SetFloat("WSetPct", val)
+	}
+	writeSlice(ss.Regs, ss.adv.M704, regs)
+}
+
+// setSolar704Ceiling writes an ENABLED 704 WMaxLimPct (percent of WMax).
+func setSolar704Ceiling(ss *SolarServer, pct float64) {
+	regs := readSlice(ss.Regs, ss.adv.M704, sunspec.L704.Len())
+	v := sunspec.L704.View(regs)
+	v.SetBool("WMaxLimPctEna", true)
+	v.SetFloat("WMaxLimPct", pct)
+	writeSlice(ss.Regs, ss.adv.M704, regs)
+}
+
+// stepSolarHeld runs ONE animation tick the way animateSolarAdvanced does —
+// bridges, physical step, 701 mirror — with the animation PAUSED, so the
+// injected potential is held and the environment does not move underneath the
+// assertion.
+func stepSolarHeld(ss *SolarServer) {
+	var wh uint16
+	advBridgeCeiling(ss.Regs, ss.bases, ss.adv)
+	advBridgeSetpoint(ss.Regs, ss.bases, ss.wmaxW)
+	solarStep(ss.Regs, ss.wmaxW, ss.bases, true /*paused*/, 0, 0, false, &ss.faults, &wh)
+	advMirror701(ss.Regs, ss.bases, ss.adv, ss.wmaxW, ss.varRating, &ss.faults)
+}
+
+// solarMeasuredW reads the inverter's measured active power off M103.
+func solarMeasuredW(ss *SolarServer) float64 {
+	return sunspec.ApplyScaleSigned(ss.Regs.Get(ss.bases.M103Base+sunspec.M103_W),
+		int16(ss.Regs.Get(ss.bases.M103Base+sunspec.M103_W_SF)))
+}
+
+// TestSolarSetpointThreeWayMin is THE IW15-001 row: output is
+// min(available, ceiling, setpoint), with each term keeping its own meaning and
+// its own evidence. A setpoint above what the panel can make is not a failure
+// to converge; a ceiling below the setpoint still wins; and — the anti-fold pin
+// — commanding a setpoint must never rewrite the M123/704 ceiling registers,
+// because those are what a "a limit is not a setpoint" negative row reads back.
+func TestSolarSetpointThreeWayMin(t *testing.T) {
+	const wmax = 8000.0
+
+	t.Run("setpoint below available binds", func(t *testing.T) {
+		ss := newAdvSolar(t, wmax)
+		setSolarPotential(ss, 6000)
+		armSolar704Setpoint(ss, sunspec.M704_WSetMod_Watts, 2000)
+		stepSolarHeld(ss)
+		if got := solarMeasuredW(ss); math.Abs(got-2000) > 1 {
+			t.Fatalf("measured = %.0f W, want 2000 W (the setpoint): a 704 WSet write that does not "+
+				"move the machine is the ack_no_apply fault, permanently armed", got)
+		}
+	})
+
+	t.Run("setpoint above available: output at available", func(t *testing.T) {
+		ss := newAdvSolar(t, wmax)
+		setSolarPotential(ss, 3000)
+		armSolar704Setpoint(ss, sunspec.M704_WSetMod_Watts, 5000)
+		stepSolarHeld(ss)
+		if got := solarMeasuredW(ss); math.Abs(got-3000) > 1 {
+			t.Fatalf("measured = %.0f W, want 3000 W (available): a setpoint cannot conjure irradiance", got)
+		}
+	})
+
+	t.Run("ceiling below setpoint binds, and both stay visible", func(t *testing.T) {
+		ss := newAdvSolar(t, wmax)
+		setSolarPotential(ss, 6000)
+		setSolar704Ceiling(ss, 25)                                // 2000 W
+		armSolar704Setpoint(ss, sunspec.M704_WSetMod_Watts, 4000) // above the ceiling
+		stepSolarHeld(ss)
+		if got := solarMeasuredW(ss); math.Abs(got-2000) > 1 {
+			t.Fatalf("measured = %.0f W, want 2000 W (the ceiling binds independently of the setpoint)", got)
+		}
+		st := ss.Snapshot()
+		if !st.Advanced.Ceiling704.Ena || math.Abs(st.Advanced.Ceiling704.Pct-25) > 0.01 {
+			t.Errorf("704 ceiling reported as ena=%v pct=%v, want ena=true pct=25 — the ceiling must survive "+
+				"a setpoint command intact", st.Advanced.Ceiling704.Ena, st.Advanced.Ceiling704.Pct)
+		}
+		if !st.Advanced.Setpoint704.Ena || math.Abs(st.Advanced.Setpoint704.EffectiveW-4000) > 1 {
+			t.Errorf("704 setpoint reported as ena=%v effective=%v, want ena=true effective=4000 — the "+
+				"setpoint is still in force at 4000 W, it is simply not the binding term",
+				st.Advanced.Setpoint704.Ena, st.Advanced.Setpoint704.EffectiveW)
+		}
+	})
+
+	t.Run("setpoint below ceiling binds WITHOUT rewriting the ceiling", func(t *testing.T) {
+		ss := newAdvSolar(t, wmax)
+		b := ss.bases
+		setSolarPotential(ss, 6000)
+		setSolar704Ceiling(ss, 75) // 6000 W
+		armSolar704Setpoint(ss, sunspec.M704_WSetMod_Watts, 1500)
+		stepSolarHeld(ss)
+		if got := solarMeasuredW(ss); math.Abs(got-1500) > 1 {
+			t.Fatalf("measured = %.0f W, want 1500 W (the setpoint binds below the ceiling)", got)
+		}
+		// THE ANTI-FOLD PIN. A fold would have transcoded 1500 W into the M123
+		// signed-percent cell (18.75 %) and destroyed the evidence that the
+		// commanded LIMIT was 75 %.
+		wantPct := 75.0
+		gotPct := sunspec.ApplyScaleSigned(ss.Regs.Get(b.M123Base+sunspec.M123_WMaxLimPct),
+			int16(ss.Regs.Get(b.M123Base+sunspec.M123_WMaxLimPct_SF)))
+		if math.Abs(gotPct-wantPct) > 0.01 {
+			t.Fatalf("M123 WMaxLimPct = %v %%, want %v %% — the setpoint was folded into the ceiling cell, "+
+				"which erases the difference between a limit and a setpoint after the fact", gotPct, wantPct)
+		}
+		if st := ss.Snapshot(); math.Abs(st.Controls.WMaxLimPct_pct-wantPct) > 0.01 {
+			t.Errorf("/state WMaxLimPct_pct = %v, want %v (same referee, through the snapshot)",
+				st.Controls.WMaxLimPct_pct, wantPct)
+		}
+	})
+
+	t.Run("WSetEna=0 leaves the setpoint out of the min", func(t *testing.T) {
+		ss := newAdvSolar(t, wmax)
+		setSolarPotential(ss, 6000)
+		armSolar704Setpoint(ss, sunspec.M704_WSetMod_Watts, 1500)
+		regs := readSlice(ss.Regs, ss.adv.M704, sunspec.L704.Len())
+		sunspec.L704.View(regs).SetBool("WSetEna", false)
+		writeSlice(ss.Regs, ss.adv.M704, regs)
+		stepSolarHeld(ss)
+		if got := solarMeasuredW(ss); math.Abs(got-6000) > 1 {
+			t.Fatalf("measured = %.0f W, want 6000 W: a setpoint nobody enabled commands nothing", got)
+		}
+	})
+
+	t.Run("a negative setpoint is answered with zero, not with import", func(t *testing.T) {
+		ss := newAdvSolar(t, wmax)
+		setSolarPotential(ss, 6000)
+		armSolar704Setpoint(ss, sunspec.M704_WSetMod_Watts, -2000)
+		stepSolarHeld(ss)
+		if got := solarMeasuredW(ss); got != 0 {
+			t.Fatalf("measured = %.0f W, want 0 W: a PV inverter cannot absorb", got)
+		}
+	})
+}
+
+// TestSolarSetpointWSetModDefaultIsPercent pins the honest default. WSetMod's
+// populate value is raw 0 = MaxPct (derlayout.go), so a head end that writes
+// WSet (WATTS) without also writing WSetMod has commanded a PERCENT — and the
+// percent register it never wrote is 0, i.e. produce nothing. A sim that
+// "helpfully" guessed watts here would let a gateway that forgot WSetMod pass a
+// conformance row it should fail.
+func TestSolarSetpointWSetModDefaultIsPercent(t *testing.T) {
+	const wmax = 8000.0
+	ss := newAdvSolar(t, wmax)
+	setSolarPotential(ss, 6000)
+
+	// The fixture must actually START at the default, or this test proves nothing.
+	v0 := sunspec.L704.View(readSlice(ss.Regs, ss.adv.M704, sunspec.L704.Len()))
+	if mod, ok := v0.Enum("WSetMod"); !ok || mod != sunspec.M704_WSetMod_MaxPct {
+		t.Fatalf("fixture WSetMod = %d (ok=%v), want %d (MaxPct) — populate704's default is the whole "+
+			"premise of this row", mod, ok, sunspec.M704_WSetMod_MaxPct)
+	}
+
+	// A WATTS-shaped write against the untouched (percent) mode.
+	regs := readSlice(ss.Regs, ss.adv.M704, sunspec.L704.Len())
+	v := sunspec.L704.View(regs)
+	v.SetBool("WSetEna", true)
+	v.SetFloat("WSet", 3000) // watts — but WSetMod still says percent
+	writeSlice(ss.Regs, ss.adv.M704, regs)
+	stepSolarHeld(ss)
+
+	if got := solarMeasuredW(ss); got != 0 {
+		t.Fatalf("measured = %.0f W, want 0 W: WSetMod=MaxPct means WSetPct (untouched, 0 %%) is the "+
+			"command, and WSet=3000 is not read at all", got)
+	}
+	st := ss.Snapshot().Advanced.Setpoint704
+	if st.Mod != sunspec.M704_WSetMod_MaxPct || math.Abs(st.WSet_W-3000) > 1 || st.EffectiveW != 0 {
+		t.Errorf("/state wset_704 = %+v, want mod=0, wset_W=3000 (stored and echoed), effective_W=0 "+
+			"(what the device is actually holding itself to)", st)
+	}
+
+	// The percent the mode actually names does command.
+	armSolar704Setpoint(ss, sunspec.M704_WSetMod_MaxPct, 50)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-4000) > 1 {
+		t.Fatalf("measured = %.0f W, want 4000 W (50 %% of the 8000 W WMax setting)", got)
+	}
+
+	// Switching the mode makes the watts field the command.
+	armSolar704Setpoint(ss, sunspec.M704_WSetMod_Watts, 3000)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-3000) > 1 {
+		t.Fatalf("measured = %.0f W, want 3000 W (WSetMod=Watts now names WSet)", got)
+	}
+}
+
+// TestSolarSetpointTakesEffectAtWriteTime pins the OnWrite coherence: the
+// instant a 704 WSet write lands over Modbus — with no animation tick in
+// between — the 103 register, the 701 mirror the gateway prefers, and /state
+// all already agree with the command. Without it a dump taken right after the
+// write shows a pre-write value for up to a full tick, which a settle-deadline
+// oracle scores as a device that ignored the write.
+func TestSolarSetpointTakesEffectAtWriteTime(t *testing.T) {
+	const wmax = 8000.0
+	ss := newAdvSolar(t, wmax)
+	ss.Regs.OnWrite = ss.solarOnWrite // wired by newSolarServerAdvanced in production
+
+	setSolarPotential(ss, 6000)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-6000) > 1 {
+		t.Fatalf("pre-write measured = %.0f W, want 6000 W", got)
+	}
+
+	// The whole-block RMW a gateway performs (derbase writes 704 as one block).
+	regs := readSlice(ss.Regs, ss.adv.M704, sunspec.L704.Len())
+	v := sunspec.L704.View(regs)
+	v.SetBool("WSetEna", true)
+	v.SetEnum("WSetMod", sunspec.M704_WSetMod_Watts)
+	v.SetFloat("WSet", 2500)
+	if _, err := ss.Regs.HandleHoldingRegisters(&modbuslib.HoldingRegistersRequest{
+		UnitId: 1, Addr: ss.adv.M704, Quantity: uint16(len(regs)), IsWrite: true, Args: regs,
+	}); err != nil {
+		t.Fatalf("modbus 704 block write: %v", err)
+	}
+
+	if got := solarMeasuredW(ss); math.Abs(got-2500) > 1 {
+		t.Fatalf("measured right after the write = %.0f W, want 2500 W (no tick in between)", got)
+	}
+	m701 := sunspec.Parse701(readSlice(ss.Regs, ss.adv.M701, ss.adv.M701Len))
+	if math.Abs(m701.W-2500) > 1 {
+		t.Errorf("701 W right after the write = %v, want 2500 — the model the gateway prefers must not "+
+			"lag the one it does not", m701.W)
+	}
+	st := ss.Snapshot()
+	if math.Abs(st.Advanced.Setpoint704.EffectiveW-2500) > 1 || math.Abs(st.Measurements.W_W-2500) > 1 {
+		t.Errorf("/state effective_W=%v W_W=%v, want both 2500",
+			st.Advanced.Setpoint704.EffectiveW, st.Measurements.W_W)
+	}
+	// The potential is untouched: the device is CURTAILED, not dark.
+	if math.Abs(st.Measurements.Possible_W-6000) > 1 {
+		t.Errorf("possible_W = %v, want 6000 (the setpoint bounds output, not irradiance)", st.Measurements.Possible_W)
+	}
+
+	// The /inject path lands in the same place. This is the bench-replay shape
+	// — the animation paused, PV injected each tick — and Inject's own clip
+	// knows only about the ceiling, so it is advSync's setpoint bridge that
+	// keeps the held value from standing above the setpoint for a whole tick.
+	if err := ss.Inject([]byte(`{"W_W":6000}`)); err != nil {
+		t.Fatalf("inject W_W: %v", err)
+	}
+	if got := solarMeasuredW(ss); math.Abs(got-2500) > 1 {
+		t.Fatalf("measured after an injected 6000 W potential = %.0f W, want 2500 W (the standing setpoint)", got)
+	}
+	if av := ss.Snapshot().Measurements.Possible_W; math.Abs(av-6000) > 1 {
+		t.Errorf("possible_W = %v after the inject, want 6000 (the potential is recorded in full)", av)
+	}
+}
+
+// TestSolarPowerOnResetClearsTheSetpoint: reboot_forget must forget the
+// SETPOINT too. Before IW15-001 powerOnReset touched only the ceiling pair — a
+// live WSet survived a simulated power cycle, so a gateway that never
+// re-asserted its setpoint would have passed the row while the device it was
+// steering had, in reality, come back holding a value nobody re-sent.
+func TestSolarPowerOnResetClearsTheSetpoint(t *testing.T) {
+	ss := newAdvSolar(t, 8000)
+	setSolarPotential(ss, 6000)
+	armSolar704Setpoint(ss, sunspec.M704_WSetMod_Watts, 1200)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-1200) > 1 {
+		t.Fatalf("pre-reset measured = %.0f W, want 1200 W", got)
+	}
+
+	ss.powerOnReset()
+
+	v := sunspec.L704.View(readSlice(ss.Regs, ss.adv.M704, sunspec.L704.Len()))
+	if v.Bool("WSetEna") {
+		t.Error("WSetEna survived the power cycle")
+	}
+	if w := v.Float("WSet"); w != 0 {
+		t.Errorf("WSet = %v after the power cycle, want 0 (both registers of the Tint32, not just the low word)", w)
+	}
+	if p := v.Float("WSetPct"); p != 0 {
+		t.Errorf("WSetPct = %v after the power cycle, want 0 — with WSetMod back at its MaxPct default it is "+
+			"WSetPct that a re-enable would command from", p)
+	}
+	if _, ok := solarSetpointW(ss.Regs, ss.bases, ss.wmaxW); ok {
+		t.Error("a setpoint is still in force after a power cycle")
+	}
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-6000) > 1 {
+		t.Errorf("post-reset measured = %.0f W, want 6000 W (uncommanded, at available)", got)
+	}
+}
+
+// ── IW15-002: settings vs ratings on the advanced sim ────────────────────────
+
+// TestSolarWMaxSettingMovesThePhysics is the IW15-002 row for the 7xx surface:
+// the WMax SETTING is what percent-of-max controls resolve against, it is
+// separately settable from the RATING, and moving it moves real watts. Before
+// this, every physics path read a Go float captured at construction, so a
+// written WMax was cosmetic and a gateway resolving percents against the rating
+// was never contradicted by the device.
+func TestSolarWMaxSettingMovesThePhysics(t *testing.T) {
+	const wmax = 8000.0
+	ss := newAdvSolar(t, wmax)
+	if err := ss.Inject([]byte(`{"WMax_W":4000}`)); err != nil {
+		t.Fatalf("inject WMax_W: %v", err)
+	}
+
+	// The setting moved in every model that carries it; the rating did not move
+	// at all.
+	v702 := sunspec.L702.View(readSlice(ss.Regs, ss.adv.M702, sunspec.L702.Len()))
+	if got := v702.Float("WMax"); got != 4000 {
+		t.Errorf("702 WMax = %v, want 4000", got)
+	}
+	if got := v702.Float("WMaxRtg"); got != wmax {
+		t.Errorf("702 WMaxRtg = %v, want %v — a SETTING inject must not touch the RATING", got, wmax)
+	}
+	m121 := sunspec.ApplyScaleUint(ss.Regs.Get(ss.bases.M121Base+sunspec.M121_WMax),
+		int16(ss.Regs.Get(ss.bases.M121Base+sunspec.M121_WMax_SF)))
+	if m121 != 4000 {
+		t.Errorf("121 WMax = %v, want 4000 — one physical setting, so every model that carries it moves together", m121)
+	}
+	if got := float64(ss.Regs.Get(ss.bases.M120Base + sunspec.M120_WRtg)); got != wmax {
+		t.Errorf("120 WRtg = %v, want %v (the immutable rating)", got, wmax)
+	}
+
+	st := ss.Snapshot()
+	if st.Nameplate.PctReferenceW != 4000 || st.Nameplate.WRtgW != wmax || st.Nameplate.WMaxW != wmax {
+		t.Errorf("/state nameplate = %+v, want pct_reference_W=4000, m120_WRtg_W=%v, wmax_W=%v",
+			st.Nameplate, wmax, wmax)
+	}
+
+	// The ceiling percent now resolves against 4000, not 8000. THIS is the
+	// divergence a gateway that used the rating would land on the wire.
+	setSolarPotential(ss, 6000)
+	setSolar704Ceiling(ss, 50)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-2000) > 1 {
+		t.Fatalf("50 %% ceiling produced %.0f W, want 2000 W (50 %% of the 4000 W SETTING). "+
+			"4000 W would mean the device resolved the percent against its rating", got)
+	}
+	// And so does the setpoint percent.
+	armSolar704Setpoint(ss, sunspec.M704_WSetMod_MaxPct, 25)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-1000) > 1 {
+		t.Fatalf("25 %% setpoint produced %.0f W, want 1000 W (25 %% of the 4000 W SETTING)", got)
+	}
+}
+
+// TestSolarCapacityRatingsAreDeclarationOnly: the rate SETTING/RATING pair must
+// be independently settable on the solar 702 (a gateway's reference-resolution
+// rule has to be testable against a fixture where they differ), and a rating
+// inject must not silently rebuild the machine — the panel's physical
+// capability is fixed at construction.
+func TestSolarCapacityRatingsAreDeclarationOnly(t *testing.T) {
+	const wmax = 8000.0
+	ss := newAdvSolar(t, wmax)
+
+	// The stock PV profile declares no rate limits at all (the sentinel), which
+	// /state must report as JSON null rather than a fabricated 0.
+	if st := ss.Snapshot().Advanced.Capacity702; st.WChaRteMaxW != nil || st.WChaRteMaxRtgW != nil {
+		t.Errorf("stock rate points reported as %v/%v, want null: an implemented 0 is a positive "+
+			"declaration of incapacity, which is a different claim from 'absent'",
+			st.WChaRteMaxW, st.WChaRteMaxRtgW)
+	}
+
+	if err := ss.Inject([]byte(`{"WDisChaRteMax_W":3000,"WDisChaRteMaxRtg_W":7000}`)); err != nil {
+		t.Fatalf("inject rate pair: %v", err)
+	}
+	v := sunspec.L702.View(readSlice(ss.Regs, ss.adv.M702, sunspec.L702.Len()))
+	if got := v.Float("WDisChaRteMax"); got != 3000 {
+		t.Errorf("702 WDisChaRteMax = %v, want 3000", got)
+	}
+	if got := v.Float("WDisChaRteMaxRtg"); got != 7000 {
+		t.Errorf("702 WDisChaRteMaxRtg = %v, want 7000 — setting and rating must be settable apart", got)
+	}
+
+	// A rating inject moves the DECLARATION; possible_W still comes from the
+	// physical panel the sim was constructed with.
+	if err := ss.Inject([]byte(`{"WMaxRtg_W":3000}`)); err != nil {
+		t.Fatalf("inject WMaxRtg_W: %v", err)
+	}
+	if got := ss.Snapshot().Nameplate.WMaxW; got != wmax {
+		t.Errorf("wmax_W = %v after a rating inject, want %v: the declaration moved, the machine did not", got, wmax)
+	}
+}
+
+// TestSolarWMaxSentinelFallsBackHonestly walks the whole reference-resolution
+// chain down: 702 WMax → 121 WMax → the construction float. A sentinel is
+// "not implemented", never "zero", and a device whose models say nothing usable
+// must fall back to what it physically is rather than to 0 W.
+func TestSolarWMaxSentinelFallsBackHonestly(t *testing.T) {
+	const wmax = 8000.0
+	ss := newAdvSolar(t, wmax)
+	r, b := ss.Regs, ss.bases
+
+	if err := ss.Inject([]byte(`{"M121_WMax_W":5000}`)); err != nil {
+		t.Fatalf("inject M121_WMax_W: %v", err)
+	}
+	if got := solarWMaxRefW(r, b, wmax); got != wmax {
+		t.Fatalf("reference = %v with 702 present, want %v: 702 WMax outranks the legacy 121 point", got, wmax)
+	}
+	// 702 unimplemented → the legacy setting answers.
+	r.Set(b.M702Base+uint16(sunspec.L702.Offset("WMax")), 0xFFFF)
+	if got := solarWMaxRefW(r, b, wmax); got != 5000 {
+		t.Fatalf("reference = %v with 702 WMax at the sentinel, want 5000 (121 WMax)", got)
+	}
+	// Both unimplemented → the machine itself.
+	r.Set(b.M121Base+sunspec.M121_WMax, 0xFFFF)
+	if got := solarWMaxRefW(r, b, wmax); got != wmax {
+		t.Fatalf("reference = %v with both models unimplemented, want the construction nameplate %v", got, wmax)
+	}
+}
+
+// TestSolarStateMarshalsWithUnimplementedCapacityPoints guards GET /state
+// against a 500. View.Float reports a not-implemented SunSpec point as NaN, and
+// encoding/json REFUSES to marshal NaN — so reporting the 702 rate points (all
+// four of which this PV profile leaves at the sentinel) as plain floats would
+// have taken the whole state document down the first time a QA oracle fetched
+// it. They are pointers, and null is also the honest answer.
+func TestSolarStateMarshalsWithUnimplementedCapacityPoints(t *testing.T) {
+	ss := newAdvSolar(t, 8000)
+	// Blank a control point too, the shape a nan_sentinel fault or a garbage
+	// whole-block write-back leaves behind.
+	ss.Regs.Set(ss.adv.M704+uint16(sunspec.L704.Offset("WSetPct")), 0x8000)
+
+	b, err := json.Marshal(ss.Snapshot())
+	if err != nil {
+		t.Fatalf("GET /state would 500: %v", err)
+	}
+	for _, want := range []string{`"pct_reference_W"`, `"wset_704"`, `"capacity_702"`, `"WChaRteMax_W":null`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("/state JSON is missing %s", want)
 		}
 	}
 }

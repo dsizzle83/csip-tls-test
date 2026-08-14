@@ -56,6 +56,12 @@ func main() {
 		"the Modbus/TCP listener to one network segment, e.g. -bind 192.168.0.188 on a split WAN/LAN bench "+
 		"— mirrors mbapsdev's -listen, but as a bare host since -port is already separate here")
 	wmax := flag.Float64("wmax", 5000, "Nameplate WMax in watts")
+	wmaxSetting := flag.Float64("wmax-setting", 0, "WMax SETTING in watts (121 WMax, and 702 WMax on an "+
+		"advanced sim) for a device CONFIGURED below what it is RATED for. 0 (the default) means \"same as "+
+		"-wmax\", which is byte-identical to every fixture before IW15-002. Set it lower to stage the "+
+		"rating-vs-setting divergence BEFORE the gateway's first read: the RATINGS (120 WRtg / 702 WMaxRtg) "+
+		"stay at -wmax while every percent-of-max control the device honours — WMaxLimPct, WSetPct — "+
+		"resolves against this number. Same effect as POST /inject {\"WMax_W\":N}, but in place at adoption")
 	apiPort := flag.Int("api-port", 6020, "HTTP API port (0 to disable)")
 	advanced := flag.Bool("advanced", false, "serve the IEEE 1547-2018 7xx DER models "+
 		"(701/702/703/704/705/706/711/712) for advanced-DER QA scenarios")
@@ -134,6 +140,16 @@ func main() {
 	}
 	if *fwVersion != "" {
 		log.Printf("modsim: SunSpec Model 1 firmware version (Vr) override %q", *fwVersion)
+	}
+	if *wmaxSetting > 0 && *wmaxSetting != *wmax {
+		// Through the same Inject key a bench operator would use, so the flag
+		// and the runtime lever cannot drift apart. Refused rather than
+		// silently ignored if it is impossible.
+		if err := srv.Inject([]byte(fmt.Sprintf(`{"WMax_W":%g}`, *wmaxSetting))); err != nil {
+			log.Fatalf("modsim: -wmax-setting: %v", err)
+		}
+		log.Printf("modsim: WMax SETTING %.0f W below the %.0f W RATING — percent-of-max controls "+
+			"(WMaxLimPct, WSetPct) resolve against %.0f W", *wmaxSetting, *wmax, *wmaxSetting)
 	}
 
 	// ── Protocol-fault verbs (sim/southbound: relocate.go, exception_target.go,

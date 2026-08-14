@@ -868,3 +868,122 @@ func TestHistoricalBatteryImagesCarryNoPackSurface(t *testing.T) {
 			"chain every mbapsdev T06.3 scenario walks", got, want)
 	}
 }
+
+// ── IW15-002: the rate SETTINGS are physics, the RATINGS are declarations ────
+
+// TestPackRateSettingIsHonouredLive is the pack half of IW15-002. The pack has
+// always CLAMPED to its rate limits — but to Go floats captured at
+// construction, so the M702 WChaRteMax/WDisChaRteMax SETTINGS were a claim in a
+// register that nothing read. Writing one had no consequence, which is the
+// ack_no_apply shape wearing a capacity block's clothes.
+//
+// After IW15-002 the clamp reads the live setting, the RATING stays where it
+// was, and /state reports both so a row can prove which one a gateway resolved
+// its reference against.
+func TestPackRateSettingIsHonouredLive(t *testing.T) {
+	bs := newTestPack(t, PackShapeSetpoint)
+	st := newPackAnim()
+	ratingCha := bs.pack.chaRteMaxW // 2000 W at the 5 kW fixture
+
+	// A configured charge limit BELOW the declared rating.
+	if err := bs.Inject([]byte(`{"WChaRteMax_W":800}`)); err != nil {
+		t.Fatalf("inject WChaRteMax_W: %v", err)
+	}
+	if got := bs.pack.clampToRateRating(bs.Regs, -testPackWmax); math.Abs(got+800) > 0.5 {
+		t.Fatalf("clamp of a full-nameplate charge = %.1f W, want -800 W (the live SETTING). "+
+			"%.0f W would mean the physics is still reading the construction float", got, -ratingCha)
+	}
+
+	// And the machine really does it, through the real bridge and the real step.
+	writeWSet(t, bs, -testPackWmax)
+	packTicks(bs, st, 12)
+	if got := packMeasuredW(bs); math.Abs(got+800) > packWTol {
+		t.Fatalf("measured = %.1f W after a full-nameplate charge command, want -800 W (the configured limit)", got)
+	}
+
+	// /state shows the setting the pack is HONOURING beside the rating it
+	// DECLARES — the divergence, without a Modbus client.
+	pk := bs.Snapshot().Pack
+	if math.Abs(pk.WChaRteMaxW-800) > 0.5 {
+		t.Errorf("/state w_cha_rte_max_W = %v, want 800 (the honoured setting)", pk.WChaRteMaxW)
+	}
+	if math.Abs(pk.WChaRteMaxRtgW-ratingCha) > 0.5 {
+		t.Errorf("/state w_cha_rte_max_rtg_W = %v, want %v (the declared rating, untouched by a SETTING inject)",
+			pk.WChaRteMaxRtgW, ratingCha)
+	}
+	// The nameplate model carries the RATING, so a setting inject leaves it alone.
+	if got := float64(bs.Regs.Get(bs.bases.M120Base + sunspec.M120_MaxChaRte)); math.Abs(got-ratingCha) > 0.5 {
+		t.Errorf("M120 MaxChaRte = %v after a setting inject, want %v (the rating)", got, ratingCha)
+	}
+	// The discharge direction was never commanded and must not have moved.
+	if math.Abs(pk.WDisChaRteMaxW-bs.pack.disChaRteMaxW) > 0.5 {
+		t.Errorf("/state w_discha_rte_max_W = %v, want %v — the two directions are separately settable",
+			pk.WDisChaRteMaxW, bs.pack.disChaRteMaxW)
+	}
+}
+
+// TestPackRateRatingInjectMirrorsTheNameplateModel: a RATING is one fact, so
+// every model that carries it says the same number (populateBatteryPack's rule
+// — a device contradicting itself across models is a fault to inject
+// deliberately, never to ship). A rating inject must not, however, change what
+// the pack HONOURS: that is the setting's job.
+func TestPackRateRatingInjectMirrorsTheNameplateModel(t *testing.T) {
+	bs := newTestPack(t, PackShapeSetpoint)
+	settingBefore, _ := bs.pack.rateLimits(bs.Regs)
+
+	if err := bs.Inject([]byte(`{"WChaRteMaxRtg_W":1234}`)); err != nil {
+		t.Fatalf("inject WChaRteMaxRtg_W: %v", err)
+	}
+	v := sunspec.L702.View(readSlice(bs.Regs, bs.pack.m702, sunspec.L702.Len()))
+	if got := v.Float("WChaRteMaxRtg"); got != 1234 {
+		t.Errorf("702 WChaRteMaxRtg = %v, want 1234", got)
+	}
+	if got := float64(bs.Regs.Get(bs.bases.M120Base + sunspec.M120_MaxChaRte)); got != 1234 {
+		t.Errorf("M120 MaxChaRte = %v, want 1234 — the nameplate mirror of the same rating fact", got)
+	}
+	if got := v.Float("WChaRteMax"); got != settingBefore {
+		t.Errorf("702 WChaRteMax = %v after a RATING inject, want %v: the setting is a separate number",
+			got, settingBefore)
+	}
+	if got, _ := bs.pack.rateLimits(bs.Regs); got != settingBefore {
+		t.Errorf("honoured charge limit = %v after a RATING inject, want %v", got, settingBefore)
+	}
+}
+
+// TestPackRateSettingSentinelFallsBackToTheConstructionFloat: a
+// not-implemented point is "absent", never "zero". A pack whose 702 has been
+// blanked (the nan_sentinel shape, or a whole-block write-back of garbage) must
+// fall back to what it physically is rather than clamp every command to 0 W.
+func TestPackRateSettingSentinelFallsBackToTheConstructionFloat(t *testing.T) {
+	bs := newTestPack(t, PackShapeSetpoint)
+	bs.Regs.Set(bs.pack.m702+uint16(sunspec.L702.Offset("WChaRteMax")), 0xFFFF)
+	bs.Regs.Set(bs.pack.m702+uint16(sunspec.L702.Offset("WDisChaRteMax")), 0xFFFF)
+
+	cha, discha := bs.pack.rateLimits(bs.Regs)
+	if cha != bs.pack.chaRteMaxW || discha != bs.pack.disChaRteMaxW {
+		t.Fatalf("limits under the sentinel = %v/%v, want the construction floats %v/%v",
+			cha, discha, bs.pack.chaRteMaxW, bs.pack.disChaRteMaxW)
+	}
+
+	// An explicit ZERO is a different claim and IS honoured: "this pack may not
+	// charge" is a thing a configured device says.
+	if err := bs.Inject([]byte(`{"WChaRteMax_W":0}`)); err != nil {
+		t.Fatalf("inject WChaRteMax_W 0: %v", err)
+	}
+	if got := bs.pack.clampToRateRating(bs.Regs, -1000); got != 0 {
+		t.Fatalf("clamp with a zero charge setting = %v, want 0 — an implemented zero is a positive "+
+			"declaration of incapacity, not an absence", got)
+	}
+}
+
+// TestPackCapacityInjectRefusedWithoutA702: the cease shape serves no DER
+// capacity model, so the key is refused BY NAME instead of quietly storing
+// nothing.
+func TestPackCapacityInjectRefusedWithoutA702(t *testing.T) {
+	bs := newTestPack(t, PackShapeCease)
+	for _, key := range []string{"WMax_W", "WChaRteMax_W", "WDisChaRteMaxRtg_W"} {
+		if err := bs.Inject([]byte(`{"` + key + `":1000}`)); err == nil {
+			t.Errorf("cease shape accepted %q, but it serves no M702", key)
+		}
+	}
+}

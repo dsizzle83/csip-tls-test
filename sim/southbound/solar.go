@@ -48,6 +48,24 @@ type SolarBases struct {
 	M122Base uint16 // Model 122 (Extended Measurements) data start
 	M103Base uint16 // Model 103 (Three-Phase Inverter) data start
 	M123Base uint16 // Model 123 (Immediate Controls) data start
+
+	// M702Base and M704Base are the ADVANCED (7xx) blocks, ZERO on a legacy
+	// sim. They ride here — rather than only on solarAdvBases — because the ONE
+	// physics (solarStep, solarCeilingW) has to see them:
+	//
+	//   - 702 carries the WMax SETTING every percent-of-max control resolves
+	//     against (solarWMaxRefW). Before IW15-002 the physics read a Go float
+	//     captured at construction, so a written WMax was cosmetic.
+	//   - 704 carries the WSet active-power SETPOINT (solarSetpointW), which is
+	//     a THIRD independent bound on output alongside the potential and the
+	//     ceiling — not a second field on the ceiling (solarStep's three-way
+	//     min, and see advBridgeSetpoint for why it is not folded into 123).
+	//
+	// Keeping them here rather than widening solarStep's signature is what lets
+	// every existing caller (and every existing test) stay byte-identical: a
+	// legacy sim leaves both zero and every new branch is skipped.
+	M702Base uint16 // Model 702 (DER Capacity)   data start — 0 on a legacy sim
+	M704Base uint16 // Model 704 (DER AC Controls) data start — 0 on a legacy sim
 }
 
 // SolarServer is an animated PV inverter simulator with a built-in API.
@@ -132,19 +150,68 @@ func NewSolarServer(listenURL string, wmaxW float64, serial string) (*SolarServe
 	return ss, nil
 }
 
+// solarWMaxRefW resolves the WMax SETTING this device applies its
+// percent-of-max controls against — the number a WMaxLimPct ceiling and a
+// WSetPct setpoint are percentages OF — in the order a gateway itself resolves
+// it:
+//
+//	702 WMax (the advanced setting)  →  121 WMax (the legacy setting)  →  fallback
+//
+// fallback is the Go float captured at construction (ss.wmaxW), used only when
+// no model carries a usable setting.
+//
+// IW15-002: BEFORE this, every physics path read the construction float and
+// nothing else, so a WMax written over Modbus (or seeded differently per model)
+// was COSMETIC — the register moved, the device did not. A gateway that
+// resolves its percent against WMax and a device that resolves it against a
+// hidden rating disagree by exactly wmaxRating/wmaxSetting, and the error does
+// NOT cancel: it lands as real watts on the wire.
+//
+// THE RATING IS NOT IN THIS CHAIN, deliberately. 120 WRtg / 702 WMaxRtg are
+// what the machine CAN do; the setting is what it is configured to do. The two
+// are seeded equal (populateSolarCore/populate702) so every pre-existing
+// scenario is byte-identical, and they are separately injectable so a bench row
+// can drive them apart — which is the whole IW15-002a fixture (see Inject's
+// "WMax_W" / "M121_WMax_W" / "WMaxRtg_W" keys).
+func solarWMaxRefW(r *RegisterMap, bases SolarBases, fallback float64) float64 {
+	if bases.M702Base != 0 {
+		v := sunspec.L702.View(readSlice(r, bases.M702Base, sunspec.L702.Len()))
+		if w := v.Float("WMax"); !math.IsNaN(w) && w > 0 {
+			return w
+		}
+	}
+	if bases.M121Base != 0 {
+		raw := r.Get(bases.M121Base + sunspec.M121_WMax)
+		if raw != 0xFFFF { // not-implemented sentinel
+			w := sunspec.ApplyScaleUint(raw, int16(r.Get(bases.M121Base+sunspec.M121_WMax_SF)))
+			if w > 0 {
+				return w
+			}
+		}
+	}
+	return fallback
+}
+
 // solarCeilingW is the single source of truth for the output ceiling (W) the
 // inverter honours this update: the hub's WMaxLimPct limit when enabled (else
-// full nameplate), shaped by any effect-time fault. fc may be nil (no effect
-// faults). Both Inject and solarStep use it so the commanded limit, the device's
-// physical response, and the meter-visible output never diverge.
+// the full WMax setting), shaped by any effect-time fault. fc may be nil (no
+// effect faults). Both Inject and solarStep use it so the commanded limit, the
+// device's physical response, and the meter-visible output never diverge.
+//
+// The percent resolves against solarWMaxRefW — the live WMax SETTING — not
+// against wmaxW, which is now only the fallback for a device whose models carry
+// no usable setting. With Ena=0 the ceiling is that same setting: a WMax
+// setting below the rating bounds output on its own, because that is what
+// configuring a maximum active power output means.
 func solarCeilingW(r *RegisterMap, bases SolarBases, wmaxW float64, fc *faultController) float64 {
-	limW := wmaxW
+	ref := solarWMaxRefW(r, bases, wmaxW)
+	limW := ref
 	if r.Get(bases.M123Base+sunspec.M123_WMaxLimPct_Ena) != 0 {
 		limPct := sunspec.ApplyScaleSigned(
 			r.Get(bases.M123Base+sunspec.M123_WMaxLimPct),
 			int16(r.Get(bases.M123Base+sunspec.M123_WMaxLimPct_SF)),
 		)
-		limW = wmaxW * math.Max(0, limPct) / 100.0
+		limW = ref * math.Max(0, limPct) / 100.0
 	}
 	if fc != nil {
 		limW = fc.effectiveCeilW(limW)
@@ -215,8 +282,25 @@ type SolarState struct {
 		Paused bool    `json:"paused"`
 		Speed  float64 `json:"speed"`
 	} `json:"animation"`
+	// Nameplate reports the capacity numbers SEPARATELY (IW15-002), so an
+	// oracle can see a rating/setting divergence without a Modbus client:
+	//
+	//	wmax_W          the PHYSICAL panel, fixed at construction (-wmax). What
+	//	                the irradiance model computes possible_W from.
+	//	m120_WRtg_W     the DECLARED rating (model 120).
+	//	m121_WMax_W     the legacy SETTING (model 121).
+	//	pct_reference_W the number the device's own percent-of-max controls
+	//	                resolve against RIGHT NOW (solarWMaxRefW: 702 WMax →
+	//	                121 WMax → wmax_W). This is the referee: a gateway that
+	//	                computed its WMaxLimPct/WSetPct against anything else
+	//	                is off by exactly the ratio, in watts.
+	//
+	// All four are equal on a stock fixture; they are separately injectable.
 	Nameplate struct {
-		WMaxW float64 `json:"wmax_W"`
+		WMaxW         float64 `json:"wmax_W"`
+		WRtgW         float64 `json:"m120_WRtg_W"`
+		M121WMaxW     float64 `json:"m121_WMax_W"`
+		PctReferenceW float64 `json:"pct_reference_W"`
 	} `json:"nameplate"`
 	Measurements struct {
 		W_W        float64 `json:"W_W"`
@@ -270,6 +354,9 @@ func (ss *SolarServer) Snapshot() SolarState {
 	st.Animation.Paused = ss.IsPaused()
 	st.Animation.Speed = ss.Speed()
 	st.Nameplate.WMaxW = ss.wmaxW
+	st.Nameplate.WRtgW = unsigned(b.M120Base+sunspec.M120_WRtg, b.M120Base+sunspec.M120_W_SF)
+	st.Nameplate.M121WMaxW = unsigned(b.M121Base+sunspec.M121_WMax, b.M121Base+sunspec.M121_WMax_SF)
+	st.Nameplate.PctReferenceW = solarWMaxRefW(r, b, ss.wmaxW)
 
 	m := &st.Measurements
 	m.W_W = signed(b.M103Base+sunspec.M103_W, b.M103Base+sunspec.M103_W_SF)
@@ -365,7 +452,9 @@ func (ss *SolarServer) Becalmed() bool {
 // Inject overrides one or more measurement or control fields.
 // Accepted JSON keys: "W_W", "V_V", "Hz_Hz", "DCV_V", "TmpCab_C",
 // "WMaxLimPct_pct" (0–100, clamped), "Conn" (0 or 1), "St" (1–8),
-// "Cloud_pct" (0–100), "Night" (0 or nonzero).
+// "Cloud_pct" (0–100), "Night" (0 or nonzero), and the capacity keys
+// "WMax_W", "M121_WMax_W", "WMaxRtg_W", "WChaRteMax_W", "WChaRteMaxRtg_W",
+// "WDisChaRteMax_W", "WDisChaRteMaxRtg_W" (see injectSolarCapacity).
 //
 // "Cloud_pct" is not a register — it is an environmental input (like metersim's
 // LoadW_W) that scales the running-animation irradiance via cloudTransmittance;
@@ -456,6 +545,13 @@ func (ss *SolarServer) Inject(body []byte) error {
 			// Environmental input, not a register (like Cloud_pct): the NIGHT/
 			// becalm control (see SetBecalmed). Nonzero arms it, zero clears it.
 			ss.SetBecalmed(val != 0)
+		case "WMax_W", "WMaxRtg_W", "M121_WMax_W",
+			"WChaRteMax_W", "WChaRteMaxRtg_W", "WDisChaRteMax_W", "WDisChaRteMaxRtg_W":
+			// The IW15-002 capacity axis: SETTINGS and RATINGS, independently
+			// settable. See injectSolarCapacity.
+			if err := ss.injectSolarCapacity(key, val); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("inject: unknown field %q", key)
 		}
@@ -465,6 +561,95 @@ func (ss *SolarServer) Inject(body []byte) error {
 	// sim reports through 701 what the hub will read.
 	if ss.advanced {
 		ss.advSync()
+	}
+	return nil
+}
+
+// injectSolarCapacity handles the POST /inject capacity keys — the IW15-002
+// axis. A DER's capacity block carries TWO kinds of number and the whole defect
+// is that this sim used to hold them as ONE:
+//
+//	RATINGS  (read-only facts about the machine)   120 WRtg,  702 WMaxRtg,
+//	                                               702 W{,Dis}ChaRteMaxRtg
+//	SETTINGS (read-write configuration)            121 WMax,  702 WMax,
+//	                                               702 W{,Dis}ChaRteMax
+//
+// Keys, and exactly what each one moves:
+//
+//	"WMax_W"            the WMax SETTING, in EVERY model that carries it —
+//	                    121 WMax and (advanced only) 702 WMax. One physical
+//	                    setting, so the two models are written together; a
+//	                    device that contradicts itself across models is a
+//	                    defect this sim injects deliberately, never by accident.
+//	                    THE PHYSICS OBEYS THIS: solarWMaxRefW resolves it and
+//	                    both the ceiling and the setpoint percent-of-max
+//	                    reference it from the next step onward.
+//	"M121_WMax_W"       121 WMax ALONE — the deliberate cross-model divergence
+//	                    lever, and on a LEGACY sim the only WMax there is.
+//	                    On an advanced sim 702 wins the resolution, so this key
+//	                    changes what a 121-reading client sees without changing
+//	                    the physics: that asymmetry is the point (it is how a
+//	                    "the two models disagree" row is staged), and it is why
+//	                    the key is named after its model.
+//	"WMaxRtg_W"         the RATING, in every model that carries it — 120 WRtg
+//	                    and (advanced only) 702 WMaxRtg. DECLARATION ONLY: the
+//	                    panel's physical capability is fixed at construction
+//	                    (modsim -wmax) and is what potW is computed from, so
+//	                    this key stages "the device declares a rating it does
+//	                    not have" rather than rebuilding the machine.
+//	"WChaRteMax_W" / "WDisChaRteMax_W" and their "…Rtg_W" pair
+//	                    702 only, and DECLARATION ONLY on solar: a PV profile
+//	                    models no charge/discharge rate physics (the pack does
+//	                    — see injectPackCapacity, where the setting pair is
+//	                    honoured by clampToRateRating). They exist here so a row
+//	                    can build a solar fixture whose rate SETTING and rate
+//	                    RATING differ, which is what a gateway's
+//	                    reference-resolution rule has to be tested against.
+//
+// Every 702-only key is REFUSED BY NAME on a legacy sim rather than silently
+// accepted: "I set WChaRteMax and nothing happened" is the diagnosis this
+// simulator exists to make impossible (injectPackSetpoint's rule).
+func (ss *SolarServer) injectSolarCapacity(key string, val float64) error {
+	if val < 0 {
+		return fmt.Errorf("inject: %q must be >= 0 (got %v): SunSpec capacity points are unsigned", key, val)
+	}
+	r, b := ss.Regs, ss.bases
+
+	setLegacy := func(base, off, sfOff uint16) {
+		r.Set(base+off, sunspec.RawFromScaleUint(val, int16(r.Get(base+sfOff))))
+	}
+	set702 := func(field string) error {
+		if b.M702Base == 0 {
+			return fmt.Errorf("inject: %q needs an advanced sim serving M702 (modsim -der-models advanced|full); "+
+				"this sim serves the legacy models only", key)
+		}
+		regs := readSlice(r, b.M702Base, sunspec.L702.Len())
+		sunspec.L702.View(regs).SetFloat(field, val)
+		writeSlice(r, b.M702Base, regs)
+		return nil
+	}
+
+	switch key {
+	case "WMax_W":
+		setLegacy(b.M121Base, sunspec.M121_WMax, sunspec.M121_WMax_SF)
+		if b.M702Base != 0 {
+			return set702("WMax")
+		}
+	case "M121_WMax_W":
+		setLegacy(b.M121Base, sunspec.M121_WMax, sunspec.M121_WMax_SF)
+	case "WMaxRtg_W":
+		setLegacy(b.M120Base, sunspec.M120_WRtg, sunspec.M120_W_SF)
+		if b.M702Base != 0 {
+			return set702("WMaxRtg")
+		}
+	case "WChaRteMax_W":
+		return set702("WChaRteMax")
+	case "WChaRteMaxRtg_W":
+		return set702("WChaRteMaxRtg")
+	case "WDisChaRteMax_W":
+		return set702("WDisChaRteMax")
+	case "WDisChaRteMaxRtg_W":
+		return set702("WDisChaRteMaxRtg")
 	}
 	return nil
 }
@@ -574,6 +759,15 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	r.Set(cursor+1, sunspec.M120Len)
 	m120 := cursor + 2
 	r.Set(m120+sunspec.M120_DERTyp, 4) // PV
+	// WRtg is the RATING — what this machine can physically do, immutable
+	// (IW15-002). It is seeded at the same number as the 121 WMax SETTING
+	// below, which is what a factory-configured device looks like and what
+	// keeps every pre-existing scenario byte-identical, but the two are NOT the
+	// same fact and are separately injectable ("WMaxRtg_W" vs "WMax_W" /
+	// "M121_WMax_W"). Splitting them is what makes the legacy over-limit
+	// exercisable: a gateway that computes a WMaxLimPct percent against the
+	// RATING while the device applies it against a LOWER SETTING lands real
+	// watts off target, and the error does not cancel anywhere.
 	r.Set(m120+sunspec.M120_WRtg, uint16(wmaxW))
 	r.Set(m120+sunspec.M120_VARtg, uint16(wmaxW*1.05))
 	r.Set(m120+sunspec.M120_VArRtgQ1, uint16(int16(wmaxW*0.44)))
@@ -591,6 +785,10 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	r.Set(cursor, sunspec.ModelBasicSettings)
 	r.Set(cursor+1, m121Len)
 	m121Base := cursor + 2
+	// WMax is the SETTING — read-write, and the reference the legacy ceiling
+	// physics actually resolves against (solarWMaxRefW → solarCeilingW). See
+	// the M120 WRtg seed above for the rating/setting split this is one half
+	// of, and Inject's "M121_WMax_W" for the lever that moves it alone.
 	r.Set(m121Base+sunspec.M121_WMax, uint16(wmaxW))
 	r.Set(m121Base+sunspec.M121_WMax_SF, 0)
 	cursor += 2 + m121Len
@@ -833,7 +1031,25 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 	// enabled) shaped by any effect-time fault (ramp_limit) — in both running and
 	// paused modes, so the hub can curtail a held value and a slewing device
 	// ramps toward it.
+	//
+	// THREE-WAY MIN, not two (IW15-001). An enabled 704 WSet setpoint is a
+	// THIRD, INDEPENDENT bound: output = min(available, ceiling, setpoint).
+	// Each term keeps its own meaning —
+	//
+	//	setpoint ABOVE available ⇒ output at available (a setpoint cannot
+	//	    conjure irradiance; the device is not "diverged", it is limited)
+	//	setpoint BELOW available ⇒ output at the setpoint
+	//	ceiling binds independently ⇒ a ceiling below the setpoint still wins,
+	//	    and /state's WMaxLimPct_pct plus the 123/704 register dump still
+	//	    show WHICH of the two is holding the device down
+	//
+	// — which is exactly what a limit-is-not-a-setpoint negative test needs, and
+	// what folding WSet into the M123 ceiling cell would have destroyed (see
+	// advBridgeSetpoint's doc). Skipped entirely on a legacy sim (M704Base==0).
 	w := math.Min(potW, solarCeilingW(r, bases, wmaxW, fc))
+	if sp, ok := solarSetpointW(r, bases, wmaxW); ok {
+		w = math.Min(w, sp)
+	}
 
 	// Power-derived registers (depend on the curtailed w).
 	va := w / pf
@@ -871,7 +1087,12 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 	case potW < wmaxW*0.06:
 		r.Set(m103Base+sunspec.M103_St, 2) // sleeping
 	case w < potW*0.98:
-		r.Set(m103Base+sunspec.M103_St, 5) // throttled by WMaxLimPct
+		// Throttled — by the WMaxLimPct ceiling, by an enabled 704 WSet
+		// setpoint, or by a WMax setting below the panel's rating. The state
+		// says "I am producing less than I could"; WHICH bound is holding it
+		// there is read from /state (Controls + advanced.wset_704) or the
+		// registers, not guessed from St.
+		r.Set(m103Base+sunspec.M103_St, 5)
 	default:
 		r.Set(m103Base+sunspec.M103_St, 4) // MPPT
 	}

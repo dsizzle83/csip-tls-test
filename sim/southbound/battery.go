@@ -269,7 +269,10 @@ func (bs *BatteryServer) Registers() map[string]uint16 {
 // watts through whichever active-power axis the shape has — the lever a bench
 // recipe should reach for; see injectPackDispatch's doc for why it exists
 // alongside "WMaxLimPct_pct", which is unsigned-only and cannot express a
-// charge direction) and, on the setpoint shape only, "WSet_W" / "WSetEna".
+// charge direction) and, on the setpoint shape only, "WSet_W" / "WSetEna" plus
+// the M702 capacity keys "WMax_W", "WMaxRtg_W", "WChaRteMax_W",
+// "WChaRteMaxRtg_W", "WDisChaRteMax_W", "WDisChaRteMaxRtg_W"
+// (see injectPackCapacity).
 func (bs *BatteryServer) Inject(body []byte) error {
 	var fields map[string]float64
 	if err := json.Unmarshal(body, &fields); err != nil {
@@ -352,6 +355,14 @@ func (bs *BatteryServer) Inject(body []byte) error {
 			r.Set(b.M103Base+sunspec.M103_St, uint16(val))
 		case "ChaSt":
 			r.Set(b.M802Base+uint16(sunspec.M802_ChaSt), uint16(val))
+		case "WMax_W", "WMaxRtg_W",
+			"WChaRteMax_W", "WChaRteMaxRtg_W", "WDisChaRteMax_W", "WDisChaRteMaxRtg_W":
+			// The IW15-002 capacity axis: 702 SETTINGS and RATINGS, separately
+			// settable, with the rate settings honoured by the physics. Refused
+			// by name on a shape with no 702 — see injectPackCapacity.
+			if err := bs.injectPackCapacity(key, val); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("inject: unknown field %q", key)
 		}

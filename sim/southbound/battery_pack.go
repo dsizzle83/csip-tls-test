@@ -54,8 +54,8 @@ package sim
 //
 // # The WSet bridge — the piece the advanced battery lacks
 //
-// packBridgeSetpoint is the exact mirror of solar_adv.go's advBridgeCeiling,
-// one axis over: an ENABLED 704 control is copied into the legacy 123
+// packBridgeSetpoint is the mirror of solar_adv.go's advBridgeCeiling, one axis
+// over: an ENABLED 704 control is copied into the legacy 123
 // machinery the pack's physics already runs on (hubBatteryW's signed
 // WMaxLimPct convention: negative = charge, positive = discharge), so the
 // SAME animation, the SAME SoC integration and the SAME effect-time faults
@@ -85,6 +85,15 @@ package sim
 // same tick — and on the write itself, so a paused pack still ceases. A cease
 // that took 15 seconds to slew would put the sim inside the gateway's own
 // settle window and make a correct cease look like a slow one.
+//
+// SOLAR HAS ITS OWN SETPOINT AXIS NOW (IW15-001), and it deliberately does NOT
+// copy the fold above: an inverter's WSet is a THIRD term in solarStep's
+// min(available, ceiling, setpoint) rather than a value transcoded into the
+// M123 ceiling cell. The fold is right here — a pack's one physics IS the
+// signed-percent dispatch, and the setpoint is the only thing driving it — and
+// wrong there, where the ceiling register is the evidence a "a limit is not a
+// setpoint" row reads back. Same defect closed on both sims, two different
+// shapes, for reasons that are about the devices. See solarSetpointW.
 //
 // # What the ratings say, and why they are real
 //
@@ -476,15 +485,65 @@ func packCommandedWatts(v sunspec.View, wmaxW float64) float64 {
 	return v.Float("WSet")
 }
 
-// clampToRateRating limits a commanded power to the rate rating the pack
-// DECLARED for that direction, so the M702 numbers are a fact about the device
-// rather than a claim in a register. Signed: + discharge, − charge.
-func (pk *packProfile) clampToRateRating(w float64) float64 {
+// rateLimits returns the charge and discharge rate limits (both positive
+// magnitudes) this pack is honouring RIGHT NOW: the LIVE M702 WChaRteMax /
+// WDisChaRteMax SETTINGS, falling back to the Go floats captured at
+// construction when the pack serves no 702 (the cease shape) or the point reads
+// the not-implemented sentinel.
+//
+// IW15-002: before this, the settings were captured once at construction and
+// every physics path read the captured float, so a WChaRteMax written over
+// Modbus — or injected — was COSMETIC. The register moved and the device did
+// not, which is the ack_no_apply fault wearing a capacity block's clothes.
+//
+// A setting of EXACTLY ZERO is honoured, not treated as absent: "this pack may
+// not charge" is a thing a configured device says, and the sentinel (0xFFFF,
+// which View.Float reports as NaN) is the only way to say "not implemented".
+//
+// The RATINGS (WChaRteMaxRtg/WDisChaRteMaxRtg) are deliberately not consulted
+// here. What a pack MAY do is its setting; what it COULD do is its rating, and
+// the gap between the two is exactly what IW15-002 exists to make measurable.
+func (pk *packProfile) rateLimits(r *RegisterMap) (cha, discha float64) {
+	return pk.ratePair(r, "WChaRteMax", "WDisChaRteMax")
+}
+
+// ratePair reads one charge/discharge pair out of M702 with the construction
+// floats as the fallback, so the SETTING pair and the RATING pair resolve
+// through exactly one piece of code and cannot drift on what "absent" means.
+func (pk *packProfile) ratePair(r *RegisterMap, chaField, disChaField string) (cha, discha float64) {
+	cha, discha = pk.chaRteMaxW, pk.disChaRteMaxW
+	if r == nil || pk.m702 == 0 {
+		return cha, discha
+	}
+	v := sunspec.L702.View(readSlice(r, pk.m702, sunspec.L702.Len()))
+	if x := v.Float(chaField); !math.IsNaN(x) && x >= 0 {
+		cha = x
+	}
+	if x := v.Float(disChaField); !math.IsNaN(x) && x >= 0 {
+		discha = x
+	}
+	return cha, discha
+}
+
+// rateRatings is rateLimits for the read-only RATINGS (WChaRteMaxRtg /
+// WDisChaRteMaxRtg) — what the pack declares it COULD do, as against what it is
+// configured to do. Reported on /state beside the settings so a divergence is
+// visible without Modbus; no physics reads it, by design (see rateLimits).
+func (pk *packProfile) rateRatings(r *RegisterMap) (cha, discha float64) {
+	return pk.ratePair(r, "WChaRteMaxRtg", "WDisChaRteMaxRtg")
+}
+
+// clampToRateRating limits a commanded power to the rate limit the pack is
+// CONFIGURED to honour in that direction, so the M702 numbers are a fact about
+// the device rather than a claim in a register. Signed: + discharge, − charge.
+// r supplies the live settings (see rateLimits) and may be nil.
+func (pk *packProfile) clampToRateRating(r *RegisterMap, w float64) float64 {
+	cha, discha := pk.rateLimits(r)
 	switch {
-	case w > pk.disChaRteMaxW:
-		return pk.disChaRteMaxW
-	case w < -pk.chaRteMaxW:
-		return -pk.chaRteMaxW
+	case w > discha:
+		return discha
+	case w < -cha:
+		return -cha
 	}
 	return w
 }
@@ -596,7 +655,7 @@ func batteryPackStep(r *RegisterMap, bases BatteryBases, pk *packProfile, wmaxW,
 			st.socPct, st.seeded = soc, false
 		}
 	default:
-		target := pk.clampToRateRating(hw)
+		target := pk.clampToRateRating(r, hw)
 		prev := sunspec.ApplyScaleSigned(r.Get(bases.M103Base+sunspec.M103_W),
 			int16(r.Get(bases.M103Base+sunspec.M103_W_SF)))
 		w = packSlew(prev, target, pk.rampW)
@@ -810,6 +869,78 @@ func (bs *BatteryServer) injectPackSetpoint(key string, val float64) error {
 	return nil
 }
 
+// injectPackCapacity handles the POST /inject capacity keys — the pack's half
+// of the IW15-002 axis (solar's is injectSolarCapacity, and the key names are
+// deliberately identical so a bench recipe reads the same against either sim).
+//
+//	"WMax_W" / "WMaxRtg_W"                          702 WMax / WMaxRtg
+//	"WChaRteMax_W" / "WDisChaRteMax_W"              702 rate SETTINGS
+//	"WChaRteMaxRtg_W" / "WDisChaRteMaxRtg_W"        702 rate RATINGS
+//
+// THE RATE SETTINGS ARE PHYSICS. clampToRateRating reads them live, so an
+// injected WChaRteMax below the rating is a pack that really will not charge
+// past it — the property that makes "the device honours its configured limit"
+// checkable rather than assertable.
+//
+// The RATINGS are declaration-only, and they carry a MIRROR: model 120's
+// MaxChaRte/MaxDisChaRte hold the same nameplate fact, seeded from the same
+// numbers by populateBatteryPack, and a device that contradicts itself across
+// two models is a defect this sim injects deliberately (see that seed's
+// comment), never by accident — so a rating inject writes both.
+//
+// MODEL 802's WChaRteMax/WDisChaRteMax PAIR IS LEFT ALONE, deliberately. It is
+// seeded once from the pack's construction ratings and stays there: 802 is the
+// storage model's own account of the cell stack, and freezing it makes
+// "the 702 setting moved but the storage model did not" an injectable
+// cross-model divergence with a name, instead of an invisible coupling. A row
+// that wants the two coherent injects the rating key, which does not move 702's
+// setting either.
+//
+// "WMax_W" on a pack is declaration-only as well: the pack's own nameplate
+// bound lives in packBridgeSetpoint's ±wmaxW clamp (the construction float),
+// because that clamp is also what keeps the 123 signed-percent mirror
+// REPRESENTABLE. Moving it with a register would let an injected WMax wrap the
+// int16 mirror, which is a fixture bug, not a device behaviour.
+func (bs *BatteryServer) injectPackCapacity(key string, val float64) error {
+	pk := bs.pack
+	if pk == nil || pk.m702 == 0 {
+		return fmt.Errorf("inject: %q needs a battery PACK serving M702 (batsim -pack setpoint); "+
+			"this sim serves no DER capacity model", key)
+	}
+	if val < 0 {
+		return fmt.Errorf("inject: %q must be >= 0 (got %v): SunSpec capacity points are unsigned", key, val)
+	}
+	field := map[string]string{
+		"WMax_W":             "WMax",
+		"WMaxRtg_W":          "WMaxRtg",
+		"WChaRteMax_W":       "WChaRteMax",
+		"WChaRteMaxRtg_W":    "WChaRteMaxRtg",
+		"WDisChaRteMax_W":    "WDisChaRteMax",
+		"WDisChaRteMaxRtg_W": "WDisChaRteMaxRtg",
+	}[key]
+	if field == "" {
+		return fmt.Errorf("inject: unknown field %q", key)
+	}
+	regs := readSlice(bs.Regs, pk.m702, sunspec.L702.Len())
+	sunspec.L702.View(regs).SetFloat(field, val)
+	writeSlice(bs.Regs, pk.m702, regs)
+
+	// The M120 nameplate mirror of the same RATING fact (see this function's
+	// doc). Settings have no home in model 120, so they move nothing here.
+	switch key {
+	case "WChaRteMaxRtg_W":
+		bs.Regs.Set(bs.bases.M120Base+sunspec.M120_MaxChaRte,
+			sunspec.RawFromScaleUint(val, int16(bs.Regs.Get(bs.bases.M120Base+sunspec.M120_MaxChaRte_SF))))
+	case "WDisChaRteMaxRtg_W":
+		bs.Regs.Set(bs.bases.M120Base+sunspec.M120_MaxDisChaRte,
+			sunspec.RawFromScaleUint(val, int16(bs.Regs.Get(bs.bases.M120Base+sunspec.M120_MaxDisChaRte_SF))))
+	case "WMaxRtg_W":
+		bs.Regs.Set(bs.bases.M120Base+sunspec.M120_WRtg,
+			sunspec.RawFromScaleUint(val, int16(bs.Regs.Get(bs.bases.M120Base+sunspec.M120_W_SF))))
+	}
+	return nil
+}
+
 // ── The lying layer ──────────────────────────────────────────────────────────
 
 // installBatteryLies configures and wires the lying-device controller onto a
@@ -951,9 +1082,17 @@ type BatteryPackState struct {
 	MeasuredW  float64  `json:"measured_W"`
 	// RampWPerTick is the slew bound between the two above, so an oracle can
 	// tell "not yet converged" from "will never converge" without a stopwatch.
-	RampWPerTick   float64 `json:"ramp_W_per_tick"`
-	WChaRteMaxW    float64 `json:"w_cha_rte_max_W"`
-	WDisChaRteMaxW float64 `json:"w_discha_rte_max_W"`
+	RampWPerTick float64 `json:"ramp_W_per_tick"`
+	// WChaRteMaxW/WDisChaRteMaxW are the rate SETTINGS the pack is HONOURING
+	// this instant — read live from 702 (rateLimits), which is the same number
+	// clampToRateRating just applied. WChaRteMaxRtgW/WDisChaRteMaxRtgW are the
+	// RATINGS it DECLARES. IW15-002 split them: they are equal on a stock
+	// fixture and separately injectable, so a row can prove a gateway resolved
+	// its reference against the right one without opening a Modbus client.
+	WChaRteMaxW       float64 `json:"w_cha_rte_max_W"`
+	WDisChaRteMaxW    float64 `json:"w_discha_rte_max_W"`
+	WChaRteMaxRtgW    float64 `json:"w_cha_rte_max_rtg_W"`
+	WDisChaRteMaxRtgW float64 `json:"w_discha_rte_max_rtg_W"`
 
 	// Setpoint704 is the 704 axis as the register bank really holds it,
 	// omitted on the cease shape.
@@ -984,18 +1123,22 @@ func (bs *BatteryServer) packSnapshot() *BatteryPackState {
 		return nil
 	}
 	r, b := bs.Regs, bs.bases
+	chaW, disChaW := pk.rateLimits(r)
+	chaRtgW, disChaRtgW := pk.rateRatings(r)
 	out := &BatteryPackState{
 		Shape:           string(pk.shape),
 		FailsafePosture: string(pk.shape),
 		Connected:       r.Get(b.M123Base+sunspec.M123_Conn) != 0,
 		MeasuredW: sunspec.ApplyScaleSigned(r.Get(b.M103Base+sunspec.M103_W),
 			int16(r.Get(b.M103Base+sunspec.M103_W_SF))),
-		RampWPerTick:   pk.rampW,
-		WChaRteMaxW:    pk.chaRteMaxW,
-		WDisChaRteMaxW: pk.disChaRteMaxW,
+		RampWPerTick:      pk.rampW,
+		WChaRteMaxW:       chaW,
+		WDisChaRteMaxW:    disChaW,
+		WChaRteMaxRtgW:    chaRtgW,
+		WDisChaRteMaxRtgW: disChaRtgW,
 	}
 	if cmd := hubBatteryW(r, b.M123Base, bs.wmaxW); !math.IsNaN(cmd) {
-		c := pk.clampToRateRating(cmd)
+		c := pk.clampToRateRating(r, cmd)
 		out.CommandedW = &c
 	}
 	if pk.has704 {
