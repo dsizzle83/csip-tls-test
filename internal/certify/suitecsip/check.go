@@ -98,6 +98,20 @@ const waitBudgetReserve = 45 * time.Second
 // number travels with the evidence and not only with the run log.
 const waitWhyParam = "csip.wait_derivation"
 
+// pollWindowParam carries the poll-cycle window ITSELF — the duration
+// waitWhyParam explains in prose — into the live phase's later hooks.
+//
+// It exists for the settle poll (IW14-005). PostWait runs after the wait, has
+// no way back to the value run() derived, and the oracled rows need exactly
+// that value: the DUT's fetch is only the first half of the pipeline this suite
+// is judging, and the southbound half (northbound-service -> MQTT -> reconciler
+// -> Modbus write) runs on the reconciler's OWN tick, not on the fetch. A
+// deadline shorter than the window the row already decided the DUT deserves is
+// a deadline picked for no stated reason at all. Written as a duration string
+// (time.ParseDuration round-trips it), the same way every other live-phase fact
+// travels to a later phase in this suite.
+const pollWindowParam = "csip.poll_window"
+
 // changeSettle is how long a check keeps observing after it makes the
 // procedure's post-subscription change. A Notification is dispatched
 // synchronously with the mutation, so this is not waiting for the push — it is
@@ -203,11 +217,21 @@ func fetchWait(ctx context.Context, rc *certify.RunCtx, s spec) (time.Duration, 
 // rows whose post-subscription change is something the DUT must FETCH rather
 // than merely ANSWER ask for a second full cycle (changeWaitFullCycle), and
 // those two waits share one -timeout.
+//
+// A SettlePoll row spends a second window too (IW14-005): its PostWait polls the
+// DER for up to the same poll-cycle window while the southbound half of the
+// pipeline lands. Counting it here is what keeps the widened settle from turning
+// a slow bench into a check killed by -timeout — which produces no criteria at
+// all, the worse bundle waitBudgetReserve's doc already argues against.
 func waitSlots(s spec) int {
+	slots := 1
 	if s.Change != nil && s.ChangeWait == changeWaitFullCycle {
-		return 2
+		slots++
 	}
-	return 1
+	if s.SettlePoll {
+		slots++
+	}
+	return slots
 }
 
 // liveOverhead estimates everything in the live phase that is not a full
@@ -306,6 +330,16 @@ type spec struct {
 	// fact the criteria should report, not a reason to abandon the evidence
 	// already collected from the wire.
 	PostWait func(ctx context.Context, d *Driver, params map[string]string) error
+
+	// SettlePoll declares that this spec's PostWait POLLS for up to a full
+	// poll-cycle window rather than taking one reading (IW14-005 — the oracled
+	// BASIC-010/013 rows, whose PostWait waits out the DUT's southbound write).
+	//
+	// It is a budget declaration, not a behaviour switch: PostWait decides its
+	// own deadline from pollWindowParam. Its only job is to let waitSlots count
+	// the second window, so fetchWait trims the FIRST one to leave room for it
+	// instead of letting -timeout kill the check between them.
+	SettlePoll bool
 
 	// Change is the mutation the procedure makes AFTER the client has taken up
 	// what Setup put there, and it exists because half the aggregator rows
@@ -412,6 +446,7 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 	// the -timeout budget the derivation fits into is what Setup left behind.
 	wait, waitWhy := fetchWait(ctx, rc, s)
 	obs.Params[waitWhyParam] = waitWhy
+	obs.Params[pollWindowParam] = wait.String()
 	rc.Logf("poll-cycle window for this check: %s", waitWhy)
 
 	var view ServerView

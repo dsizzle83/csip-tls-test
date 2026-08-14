@@ -240,14 +240,21 @@ var scalarWindow = scalarControlWindow{startOffsetS: 30, durationS: 120}
 // waitCap (5m) (check.go) — when the DUT is slow to poll and AwaitWalk waits
 // the full window. The default [+30s, +150s] window ended at +150s, which the
 // bench's 60s cadence read (2*60+30 = 150s) sits right on and a slower cadence
-// overruns entirely; [+30s, +360s] keeps the DER under the commanded cap past
-// waitCap for every cadence the derivation can pick, and comfortably through
-// the settle poll. The harness never waits DurationS (it waits fetchWait), so
-// the longer window costs no runtime — Cleanup clears the control when the row
-// is done. The observed compliance FAIL was NOT this window expiring under the
+// overruns entirely. The harness never waits DurationS (it waits fetchWait), so
+// a longer window costs no runtime — Cleanup clears the control when the row is
+// done. The observed compliance FAIL was NOT this window expiring under the
 // read; it was the read landing too EARLY (see oracleSettleWindow) — this
 // widening is the belt to that fix's braces.
-var oracleWindow = scalarControlWindow{startOffsetS: 30, durationS: 330}
+//
+// The span it has to cover GREW with IW14-005: the settle poll now runs for up
+// to the row's own poll-cycle window AFTER the wait, so the last read can land
+// as late as wait + settle ≈ 2 x waitCap = 10m after Setup. A control that
+// released at +360s would have expired under exactly the slow-bench read this
+// widening exists to protect, converting the settle fix into a new false FAIL
+// at the other edge. [+30s, +720s] contains the whole span with margin;
+// TestOracledScalarWindow_ContainsEveryPostWaitRead pins the arithmetic against
+// waitCap so a later change to either bound fails there rather than on a board.
+var oracleWindow = scalarControlWindow{startOffsetS: 30, durationS: 690}
 
 // scalarMode builds a controlMode driven by gridsim's scalar control API, with
 // the default (fetch-only) window.
@@ -420,6 +427,10 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 		// the same slot CORE-005's clock probe (probeGatewayClock) uses for
 		// its own DUT-state read.
 		if m.Oracle != nil {
+			// The settle poll spends a second poll-cycle window on a row that
+			// is not satisfied at once, so the budget arithmetic has to know
+			// (IW14-005 — spec.SettlePoll, waitSlots).
+			s.SettlePoll = true
 			s.PostWait = func(ctx context.Context, d *Driver, params map[string]string) error {
 				// settleOracle, not a bare judge call: AwaitWalk returns at
 				// the START of the DUT's walk, so the control the DUT is
@@ -428,11 +439,19 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				// until the settle deadline turns a persistent mismatch into
 				// the FAIL it deserves.
 				//
+				// The deadline is the row's OWN poll-cycle window, not a fixed
+				// 15s: the southbound write follows the modbus reconciler's
+				// tick rather than the DUT's fetch, and a window sized for the
+				// fetch alone decides rows on where that tick happened to fall
+				// (IW14-005 — oracleSettleDeadline, and the three measured
+				// latencies in oracleSettleWindow's doc).
+				//
 				// The value judged is the one Setup actually COMMANDED, read
 				// back from params — not the catalog's, which Setup may have
 				// departed from when the DER already held it (IW14-003).
 				judge := m.Oracle.Judge(commandedValue(params, m.Oracle))
-				f := settleOracle(ctx, func() Finding { return judge(ctx, d.rc) })
+				f := settleOracle(ctx, oracleSettleDeadline(params),
+					func() Finding { return judge(ctx, d.rc) })
 				switch {
 				case f.Unavailable != "":
 					params[oracleUnavailableParam] = f.Unavailable
@@ -766,18 +785,54 @@ func oracleUnitView(ctx context.Context, rc *certify.RunCtx, simName string) (in
 // shape — precisely the mid-propagation state this poll exists to wait out — and
 // returning it at once meant the one shape most in need of the window was the
 // one shape that never got it. A transport-level Unavailable (the sidecar is
-// down) now costs the full window before it is reported, which is 15s per
-// oracled row on a bench that is already broken, and buys correctness on the
-// bench that is merely slow.
+// down) now costs the full window before it is reported, and buys correctness on
+// the bench that is merely slow.
+//
+// HOW LONG the poll runs is no longer this constant (IW14-005). The 15s fixed
+// window was sized against ONE observation — a write that landed ~1s after the
+// walk began — and the bench then produced the other end of the distribution
+// twice in one night, because the southbound write does not follow the DUT's
+// fetch, it follows the modbus reconciler's OWN ~10s tick:
+//
+//	06:38:35.8 walk -> 06:38:49.0 applied (13.2s: PASS with 1.8s to spare)
+//	07:04:15.1 walk -> 07:04:35.5 applied (20.3s: FAIL, 5.3s past the deadline)
+//	07:05:15.7 walk -> 07:05:16.2 applied ( 0.5s: PASS immediately)
+//
+// Same board, same build, same control value, three different latencies: where
+// the DUT's fetch happens to fall inside the reconciler's tick decides the row.
+// A 15s deadline was therefore a coin toss dressed as a measurement — the exact
+// mistake defaultWait's own doc records for the poll-cycle wait (check.go).
+//
+// So the deadline is now the row's OWN poll-cycle window (oracleSettleDeadline
+// -> pollWindowParam), the value run() already derived from the DUT's cadence
+// and already prints in every bundle. That is a stated reason rather than a
+// guess, and it costs nothing on a healthy bench: a Pass still returns on the
+// first read that matches. Only a row that is genuinely failing, or a bench that
+// is genuinely broken, burns the window — and both of those are worth the wait,
+// because the alternative is reporting a verdict about the DUT that is really a
+// verdict about a tick boundary. This constant survives as the FALLBACK for a
+// PostWait driven without run()'s params (a unit test), where a multi-minute
+// deadline would be nothing but a slow test.
 const (
 	oracleSettleWindow = 15 * time.Second
 	oracleSettleStep   = 1 * time.Second
 )
 
+// oracleSettleDeadline is how long the PostWait oracle polls the DER: the row's
+// own poll-cycle window, recovered from the params run() filled, falling back to
+// oracleSettleWindow when there is none to recover (see that constant's doc).
+func oracleSettleDeadline(params map[string]string) time.Duration {
+	if d, err := time.ParseDuration(params[pollWindowParam]); err == nil && d > 0 {
+		return d
+	}
+	return oracleSettleWindow
+}
+
 // settleOracle re-evaluates eval until it PASSES or the settle window elapses.
-// See oracleSettleWindow for why the oracled rows read through it.
-func settleOracle(ctx context.Context, eval func() Finding) Finding {
-	return settleOracleWindow(ctx, oracleSettleWindow, oracleSettleStep, eval)
+// See oracleSettleWindow for why the oracled rows read through it, and
+// oracleSettleDeadline for where window comes from.
+func settleOracle(ctx context.Context, window time.Duration, eval func() Finding) Finding {
+	return settleOracleWindow(ctx, window, oracleSettleStep, eval)
 }
 
 // settleOracleWindow is settleOracle's parameterized core, split out so a test

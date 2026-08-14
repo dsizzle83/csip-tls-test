@@ -332,6 +332,12 @@ func TestWaitSlotsCountsTheSecondFullCycle(t *testing.T) {
 		{"a row with an explicit post-change settle", spec{Change: change, ChangeWait: 20 * time.Second}, 1},
 		{"a row asking for a second full cycle", spec{Change: change, ChangeWait: changeWaitFullCycle}, 2},
 		{"the sentinel without a Change to trigger it", spec{ChangeWait: changeWaitFullCycle}, 1},
+		// IW14-005: an oracled row's PostWait polls the DER for up to a second
+		// full poll-cycle window while the southbound write lands, so it is a
+		// slot on exactly the same footing as a second fetch cycle.
+		{"an oracled row whose PostWait settles", spec{SettlePoll: true}, 2},
+		{"a settling row that also re-fetches", spec{Change: change, ChangeWait: changeWaitFullCycle,
+			SettlePoll: true}, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := waitSlots(tc.s); got != tc.want {

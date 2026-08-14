@@ -43,10 +43,11 @@ import (
 
 // TestOracledScalarWindow_ContainsEveryPostWaitRead is the IW13-005 window
 // regression guard. The PostWait oracle can read the DER anywhere from when
-// AwaitWalk returns out to ~fetchWait, which itself ranges over [defaultWait,
-// waitCap] (check.go). An oracled scalar control (scalarModeOracled ->
-// oracleWindow) must stay active across that ENTIRE range, or a read at a
-// slower cadence overruns the control's release edge. (The read-too-EARLY edge
+// AwaitWalk returns (~fetchWait, itself ranging over [defaultWait, waitCap] —
+// check.go) out to a whole settle poll beyond that, since IW14-005 gave the
+// poll the row's own poll-cycle window. An oracled scalar control
+// (scalarModeOracled -> oracleWindow) must stay active across that ENTIRE
+// range, or a read at a slower cadence overruns the control's release edge. (The read-too-EARLY edge
 // of the same race — the DER read before the board applies the fetched control
 // — is the settle poll's job, guarded by the TestSettleOracle_* tests; this
 // one guards the late edge.) The default (fetch-only) scalarWindow deliberately
@@ -63,12 +64,17 @@ func TestOracledScalarWindow_ContainsEveryPostWaitRead(t *testing.T) {
 		t.Fatalf("oracled control opens at +%s, but the earliest PostWait read is +%s (defaultWait) — "+
 			"the oracle can read the DER before its control is active", winOpen, defaultWait)
 	}
-	// The latest possible read (waitCap) must land strictly BEFORE the control
-	// releases, with margin — the boundary the pre-fix +150s window sat on.
-	if winClose <= waitCap {
-		t.Fatalf("oracled control closes at +%s, but the latest PostWait read is +%s (waitCap) — "+
-			"the oracle can read the DER at/after its control's release boundary (the IW13-005 false FAIL)",
-			winClose, waitCap)
+	// The LATEST possible read is now two windows out, not one (IW14-005): the
+	// wait itself can run to waitCap, and the settle poll that follows it runs
+	// for up to the SAME derived poll-cycle window, which is itself capped at
+	// waitCap. A control sized for the wait alone would release under precisely
+	// the slow-bench read the settle widening exists to protect — trading the
+	// read-too-early false FAIL for a read-too-late one.
+	latestRead := waitCap + waitCap
+	if winClose <= latestRead {
+		t.Fatalf("oracled control closes at +%s, but the latest PostWait read is +%s (waitCap for the wait "+
+			"+ waitCap for the settle poll) — the oracle can read the DER at/after its control's release "+
+			"boundary (the IW13-005 false FAIL, at the far edge)", winClose, latestRead)
 	}
 
 	// The default fetch-only window is NOT expected to contain the read range;
@@ -227,6 +233,108 @@ func TestSettleOracle_RetriesTheNotYetEnabledShape(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("settleOracle made %d read(s), want 3 — it must re-read through the not-yet-enabled beat", calls)
+	}
+}
+
+// TestOracleSettleDeadline_ComesFromTheRowsPollWindow is IW14-005's unit guard
+// on WHERE the settle deadline comes from.
+//
+// The fixed 15s window decided rows on a coin toss: the southbound write follows
+// the modbus reconciler's own ~10s tick, not the DUT's fetch, so the same board
+// applying the same value took 0.5s, 13.2s and 20.3s on three consecutive
+// bench rows (oracleSettleWindow's doc records all three, with the FAIL). The
+// deadline is now the poll-cycle window run() already derived from the DUT's
+// cadence and already prints in the bundle — a stated reason instead of a guess
+// — recovered from the params the live phase carries between its phases.
+func TestOracleSettleDeadline_ComesFromTheRowsPollWindow(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		params map[string]string
+		want   time.Duration
+	}{
+		{"the row's own derived window", map[string]string{pollWindowParam: "2m30s"}, 150 * time.Second},
+		{"an operator's longer window", map[string]string{pollWindowParam: "8m"}, 8 * time.Minute},
+		{"no params at all (a unit test's PostWait)", map[string]string{}, oracleSettleWindow},
+		{"an unparseable value", map[string]string{pollWindowParam: "soon"}, oracleSettleWindow},
+		{"a non-positive value", map[string]string{pollWindowParam: "0s"}, oracleSettleWindow},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := oracleSettleDeadline(c.params); got != c.want {
+				t.Fatalf("oracleSettleDeadline(%v) = %s, want %s", c.params, got, c.want)
+			}
+		})
+	}
+	// The fallback must never be the thing production uses: a run whose params
+	// carry the window has to poll for the window, and 15s is not it.
+	if oracleSettleDeadline(map[string]string{pollWindowParam: "2m30s"}) == oracleSettleWindow {
+		t.Fatal("the derived window resolved to the 15s fallback — the IW14-005 regression, verbatim")
+	}
+}
+
+// TestInverterControlSpec_SettlePollRunsForThePollWindow proves the deadline
+// reaches the REAL PostWait, not just the helper: it drives an oracled row's
+// PostWait against a DER that never applies anything (a persistent FAIL, so the
+// poll can never short-circuit) and measures how long it polls for.
+//
+// Wall-clock in a test earns its keep here. The defect being guarded is a
+// duration, the pass-through is otherwise invisible from outside, and the bench
+// evidence for it cost two live runs; the bounds below are wide enough that only
+// a genuinely wrong deadline can trip them.
+func TestInverterControlSpec_SettlePollRunsForThePollWindow(t *testing.T) {
+	dev, _ := oracleFixture(t) // nothing applied, ever: every read is a decided FAIL
+	_, d := inverterControlLifecycleRunCtx(t, dev)
+	s := inverterControlSpec(basic010Mode(), "a maximum active power limit", "CERT-SETTLE-WINDOW")
+
+	elapsed := func(window string) time.Duration {
+		params := map[string]string{pollWindowParam: window}
+		start := time.Now()
+		if err := s.PostWait(context.Background(), d, params); err != nil {
+			t.Fatalf("PostWait: %v", err)
+		}
+		took := time.Since(start)
+		if params[oracleVerdictParam] != string(certify.Fail) {
+			t.Fatalf("PostWait recorded %s=%q, want the decided Fail a DER holding nothing must produce — "+
+				"the timing below means nothing if the poll short-circuited on a Pass",
+				oracleVerdictParam, params[oracleVerdictParam])
+		}
+		return took
+	}
+
+	short, long := elapsed("1s"), elapsed("4s")
+	if short > 3*time.Second {
+		t.Fatalf("a 1s poll window took %s — the row is not reading its deadline from %s (the pre-fix %s "+
+			"constant, or something else entirely)", short, pollWindowParam, oracleSettleWindow)
+	}
+	if long < 3500*time.Millisecond {
+		t.Fatalf("a 4s poll window conceded after %s — the settle poll is not honouring the window the row "+
+			"derived, which is the IW14-005 false FAIL (the bench's write landed 20.3s after the walk, "+
+			"5.3s past the old 15s deadline)", long)
+	}
+	if long <= short {
+		t.Fatalf("a 4s window (%s) did not outlast a 1s window (%s): the deadline is not coming from the "+
+			"params at all", long, short)
+	}
+	t.Logf("settle poll honoured its window: 1s -> %s, 4s -> %s", short.Round(time.Millisecond),
+		long.Round(time.Millisecond))
+}
+
+// TestInverterControlSpec_DeclaresSettlePollOnlyWhenOracled pins the budget
+// half of IW14-005 at its source. A row whose PostWait can spend a second full
+// poll-cycle window must declare it (waitSlots counts the declaration —
+// wait_test.go owns that arithmetic), or fetchWait sizes the FIRST window as if
+// it owned the whole -timeout and the check is killed between the two, which
+// yields no criteria at all: the worse bundle waitBudgetReserve's doc argues
+// against. A row with no oracle must NOT declare it, or its window is halved to
+// pay for a poll it never makes.
+func TestInverterControlSpec_DeclaresSettlePollOnlyWhenOracled(t *testing.T) {
+	if s := inverterControlSpec(basic010Mode(), "a maximum active power limit", "CERT-SLOTS"); !s.SettlePoll {
+		t.Error("an ORACLED row does not declare SettlePoll, so its second window is invisible to the budget")
+	}
+	plain := inverterControlSpec(scalarMode("opModConnect", func(r *ControlRequest) { r.Connect = ptr(false) }),
+		"a connect/disconnect command", "CERT-SLOTS-PLAIN")
+	if plain.SettlePoll {
+		t.Error("a row with no Oracle declares SettlePoll — it has no settle poll to pay for, and the " +
+			"declaration would halve its poll-cycle window for nothing")
 	}
 }
 
