@@ -129,11 +129,47 @@ type controlMode struct {
 	// other live-phase fact already uses.
 	//
 	// Populated only for BASIC-010/opModMaxLimW and BASIC-013/opModFixedW —
-	// the rows §4.3 names whose axis the product genuinely executes. Every
-	// other BASIC-004..015 row is unaffected: its "the DER's output followed
-	// the control" criterion stays the honest SKIP it always was, because
-	// nothing wires a southbound read for it.
+	// the rows §4.3 names whose axis the product genuinely executes as a
+	// SCALAR. The curve-linked and refused-axis rows carry their own
+	// apparatus below; only the fetch-only rows (BASIC-008/009) are left with
+	// critDEREffectUnobservable's SKIP.
 	Oracle *oracleBinding
+
+	// Curve, when set, is a CURVE-linked row's apparatus (IW15-008, curve.go):
+	// the breakpoints the row publishes and the SunSpec curve model those
+	// breakpoints must be found adopted and enabled in. It replaces Publish
+	// entirely — the publisher lives on the binding, because it and the oracle
+	// must read the same points.
+	Curve *curveBinding
+
+	// Refusal, when set, is a REFUSED-axis row's apparatus (IW15-008,
+	// curve.go): the axis the control names, the 704 points a write of it
+	// would land on, and the control that names it. Its assertions are the
+	// opposite of an execution oracle's — the DUT answered cannot-comply, and
+	// the DER shows no trace — which is why it is a separate field and not an
+	// Oracle with a negated judge.
+	Refusal *refusalBinding
+}
+
+// measured reports whether this row has a southbound apparatus at all — the
+// three shapes that read the DER's own registers and carry a live verdict
+// (spec.Verdict) rather than resting on the capture.
+func (m controlMode) measured() bool {
+	return m.Oracle != nil || m.Curve != nil || m.Refusal != nil
+}
+
+// outcome is the ONE definition of a measured row's verdict, dispatched by
+// which apparatus the row carries. Notes, the criterion and spec.Verdict all
+// read it, so a bundle can never show the three disagreeing.
+func (m controlMode) outcome(o *Observation) Finding {
+	switch {
+	case m.Refusal != nil:
+		return refusalOutcome(o)
+	case m.Curve != nil:
+		return curveOutcome(o)
+	default:
+		return oracleOutcome(o)
+	}
 }
 
 // oracleBinding is the apparatus an ORACLED inverter-control row carries beyond
@@ -220,8 +256,9 @@ func (b *oracleBinding) alternate(ctx context.Context, rc *certify.RunCtx, avoid
 }
 
 // publishable reports whether this bench can put the row's mode on the wire at
-// all — through the plain publisher or, for an oracled row, the value-taking one.
-func (m controlMode) publishable() bool { return m.Publish != nil || m.Oracle != nil }
+// all — through the plain publisher, the oracled value-taking one, or the
+// curve/refusal bindings' own.
+func (m controlMode) publishable() bool { return m.Publish != nil || m.measured() }
 
 // oracleVerdictParam/oracleObservedParam/oracleUnavailableParam are the
 // Observation.Params keys the POST-publication controlMode.Oracle result is
@@ -402,16 +439,65 @@ func scalarControlRequest(element, mrid string, win scalarControlWindow) Control
 }
 
 // curveMode builds a controlMode driven by gridsim's curve API, which is the
-// only way a curve-linked mode reaches the DUT.
-func curveMode(element, mode string, points []CurvePoint, yRef uint8) controlMode {
+// only way a curve-linked mode reaches the DUT — with the independent
+// southbound curve oracle (IW15-008, curve.go) attached.
+//
+// The oracle is not optional on these rows and there is no un-oracled variant
+// left. Before IW15-008 a curve row published a curve, watched an
+// <opModVoltVar> element appear in something the DUT fetched, and reported
+// PASS: the DER's own registers were never read, and the row certified a
+// product that refuses the axis outright. The binding below is what makes the
+// row's second half a measurement — see curve.go's file doc for what that
+// measurement can and cannot establish on a sim with no curve physics.
+//
+// model is the SunSpec curve model this mode's content must land in, and
+// mapping states where that correspondence comes from, because a FAIL that
+// names a register bank has to be checkable by whoever reads it.
+func curveMode(element, mode string, points []CurvePoint, yRef uint8, model uint16, mapping string) controlMode {
 	return controlMode{
 		Element: element,
-		Publish: func(ctx context.Context, d *Driver, mrid string) error {
-			_, err := d.PostCurve(ctx, CurveRequest{
-				Program: 0, Mode: mode, Points: points, YRefType: yRef,
-				Description: "certify " + element, DurationS: 180, StartOffset: 30, Activate: true,
-			})
-			return err
+		Curve: &curveBinding{
+			Mode: mode, Points: points, YRefType: yRef, Model: model, Mapping: mapping,
+		},
+	}
+}
+
+// curveModeNoRegisterHome builds a curve row whose mode this DER has no
+// breakpoint-carrying register for at all: the control CAN be authored
+// northbound, so the CSIP half of the row is real evidence, but nothing
+// southbound can hold its content and the row says so in a decided FAIL.
+//
+// The alternative — asserting something weaker on a neighbouring model and
+// calling it a PASS — is the defect this whole change is about, one register
+// bank along.
+func curveModeNoRegisterHome(element, mode string, points []CurvePoint, yRef uint8, nearest uint16,
+	why string) controlMode {
+	m := curveMode(element, mode, points, yRef, nearest, "")
+	m.Curve.NoRegisterHome = why
+	return m
+}
+
+// scalarModeRefused builds a row whose axis this product DELIBERATELY refuses
+// (IW15-008): the control goes out under the row's own mRID, and the row then
+// asserts the refusal was HONEST — a cannot-comply Response to the head end,
+// and not one register of the axis moved on the DER.
+//
+// It carries the oracled window rather than the fetch-only one for the same
+// reason the executing oracled rows do: the row reads the DER after the DUT's
+// poll cycle and a control that released before that read would make the
+// absence it observes meaningless.
+func scalarModeRefused(element, axis, commanded, why string, points []string,
+	apply func(*ControlRequest)) controlMode {
+	return controlMode{
+		Element: element,
+		Refusal: &refusalBinding{
+			Axis: axis, Points: points, Commanded: commanded, Why: why,
+			Publish: func(ctx context.Context, d *Driver, mrid string) error {
+				req := scalarControlRequest(element, mrid, oracleWindow)
+				apply(&req)
+				_, err := d.PostControl(ctx, req)
+				return err
+			},
 		},
 	}
 }
@@ -468,20 +554,18 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			// session mints a SkipAssertion for every criterion, this row's
 			// included, and a FAIL whose only explanation lived in that
 			// assertion would read as unexplained (IW14-003).
-			if m.Oracle != nil {
-				notes += "; " + oracleNotes(o)
+			if m.measured() {
+				notes += "; " + oracleNotes(m, o)
 			}
 			return notes
 		},
 		Criteria: func(o *Observation) []criterion {
 			crits := []criterion{critDiscoveryRoot(), critProgramList(0)}
 			if m.Unreachable != "" {
-				crits = append(crits, criterion{
-					Claim: "the DUT received and applied a DERControl carrying " + subject,
-					How: "the presence of a <" + m.Element + "> element inside a DERControlBase the DUT " +
-						"fetched",
-					Skip: m.Unreachable,
-				})
+				// IW15-008: a decided FAIL, not the Skip this used to be. See
+				// critModeUnauthorable for why an untested row must not roll up
+				// as a passing one.
+				crits = append(crits, critModeUnauthorable(subject, m.Element, m.Unreachable))
 			} else {
 				// Bound to THIS row's own mRID, and — where the row knows the
 				// scalar it commanded — to that exact value and sign
@@ -493,22 +577,48 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 					"the DUT fetched a DERControl carrying "+subject, o.Param("mrid"), commandedOnWire(m, o)))
 			}
 			crits = append(crits, critDefaultDERControl())
-			if m.Oracle != nil {
+			switch {
+			case m.Unreachable != "":
+				crits = append(crits, critEffectBlockedByAuthoringGap(subject, m.Element))
+			case m.Refusal != nil:
+				// Two assertions, because a refusal has two halves and either
+				// alone lets the other's defect through: what the DUT told the
+				// head end, and what it did to the device.
+				crits = append(crits, critRefusalAnswered(o.Param("mrid")),
+					critRefusedAxisNoSouthboundTrace(m.Refusal, o))
+			case m.Curve != nil:
+				crits = append(crits, critDERCurveResolvable(curveHrefOf(o)),
+					critDEREffectViaCurveOracle(subject, m.Curve, o))
+			case m.Oracle != nil:
 				crits = append(crits, critDEREffectViaSouthboundOracle(subject, o))
-			} else {
+			default:
 				crits = append(crits, critDEREffectUnobservable(subject))
 			}
 			return crits
 		},
 	}
+	if m.Unreachable != "" {
+		// The authoring gap decides this row whether or not the capture yielded
+		// a session — the same reason spec.Verdict exists for the oracled rows.
+		// A criterion cannot carry a verdict past a run with no transcript
+		// (criterion.assert reaches Wire only when one was recovered), and this
+		// row's whole finding is that nothing was tested.
+		s.Verdict = func(*Observation) certify.Verdict { return certify.Fail }
+	}
 	if m.publishable() {
 		s.RequiresGridSim = true
 		s.Setup = func(ctx context.Context, d *Driver, params map[string]string) error {
 			params["mrid"] = mrid
-			if m.Oracle == nil {
+			switch {
+			case m.Curve != nil:
+				return curveSetup(ctx, d, params, m.Curve, mrid)
+			case m.Refusal != nil:
+				return refusalSetup(ctx, d, params, m.Refusal, mrid)
+			case m.Oracle != nil:
+				return oracledSetup(ctx, d, params, m.Oracle, mrid)
+			default:
 				return m.Publish(ctx, d, mrid)
 			}
-			return oracledSetup(ctx, d, params, m.Oracle, mrid)
 		}
 		// PostWait, NOT Setup, is where the independent southbound oracle
 		// (IW13-005) fires. check.go's run() orders the live phase Setup ->
@@ -524,7 +634,7 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 		// right after the live phase's wait ... is done, and BEFORE Change"),
 		// the same slot CORE-005's clock probe (probeGatewayClock) uses for
 		// its own DUT-state read.
-		if m.Oracle != nil {
+		if m.measured() {
 			// The settle poll spends a second poll-cycle window on a row that
 			// is not satisfied at once, so the budget arithmetic has to know
 			// (IW14-005 — spec.SettlePoll, waitSlots).
@@ -547,9 +657,26 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				// The value judged is the one Setup actually COMMANDED, read
 				// back from params — not the catalog's, which Setup may have
 				// departed from when the DER already held it (IW14-003).
-				judge := m.Oracle.Judge(commandedValue(params, m.Oracle))
-				f := settleOracle(ctx, oracleSettleDeadline(params),
-					func() Finding { return judge(ctx, d.rc) })
+				//
+				// A REFUSAL row settles the other way round (settleRefusal):
+				// an absence observed early is worth nothing, so it polls the
+				// whole window and returns early only on a landing caught in
+				// the act.
+				var f Finding
+				switch {
+				case m.Refusal != nil:
+					judge := oracleRefusal(m.Refusal, params[refusalBaselineParam])
+					f = settleRefusal(ctx, oracleSettleDeadline(params), oracleSettleStep,
+						func() Finding { return judge(ctx, d.rc) })
+				case m.Curve != nil:
+					judge := oracleCurve(m.Curve)
+					f = settleOracle(ctx, oracleSettleDeadline(params),
+						func() Finding { return judge(ctx, d.rc) })
+				default:
+					judge := m.Oracle.Judge(commandedValue(params, m.Oracle))
+					f = settleOracle(ctx, oracleSettleDeadline(params),
+						func() Finding { return judge(ctx, d.rc) })
+				}
 				switch {
 				case f.Unavailable != "":
 					params[oracleUnavailableParam] = f.Unavailable
@@ -566,12 +693,12 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				// including this Unavailable — into a decided verdict.
 				return nil
 			}
-			// An oracled row's verdict does not depend on the capture
-			// (IW14-003 — see spec.Verdict). Declared for oracled rows ONLY;
+			// A MEASURED row's verdict does not depend on the capture
+			// (IW14-003 — see spec.Verdict). Declared for measured rows ONLY;
 			// every other row leaves s.Verdict nil and is byte-identical to
 			// what it was.
 			s.Verdict = func(o *Observation) certify.Verdict {
-				if f := oracleOutcome(o); f.Verdict != certify.Pass {
+				if f := m.outcome(o); f.Verdict != certify.Pass {
 					return f.Verdict
 				}
 				// A satisfied oracle declares nothing: the wire criteria decide
@@ -931,20 +1058,59 @@ func orText(s, fallback string) string {
 	return s
 }
 
-// oracleNotes renders the oracled row's southbound half for the bundle's own
+// oracleNotes renders a MEASURED row's southbound half for the bundle's own
 // prose line, so the reason for its verdict is printed on the case whether or
 // not the citation phase recovered a session to hang an assertion on.
-func oracleNotes(o *Observation) string {
-	f := oracleOutcome(o)
+func oracleNotes(m controlMode, o *Observation) string {
+	f := m.outcome(o)
 	notes := "independent southbound oracle: " + string(f.Verdict) + " — " + f.Observed
-	if n := o.Params[oracleNoteParam]; n != "" {
-		notes += "; " + n
+	for _, n := range []string{o.Params[oracleNoteParam], o.Params[curveMRIDNoteParam]} {
+		if n != "" {
+			notes += "; " + n
+		}
 	}
 	return notes
 }
 
-// critDEREffectUnobservable is the honest record of the half of every inverter
-// control row this suite cannot reach.
+// curveHrefOf is the DERCurve resource path a curve row's control links, for
+// the criterion that asks whether the DUT could actually fetch it.
+//
+// gridsim mints the href itself (sim/gridsim/curve.go: /derp/{program}/dc/{i},
+// and Activate:true — which every curve row here sends — replaces the list so
+// the new curve is always index 0). The path is derived rather than plumbed
+// back through the admin response because the criterion needs a SUFFIX to match
+// a fetched target against, not an identity: a DUT fetching it will have
+// resolved it against the server's own base.
+func curveHrefOf(o *Observation) string {
+	if h := o.Param(curveHrefParam); h != "" {
+		return h
+	}
+	return "/derp/0/dc/0"
+}
+
+// critDEREffectUnobservable is the SKIP the inverter-control rows used to carry
+// for their southbound half, and after IW15-008 only TWO rows still reach it:
+//
+//	BASIC-008 (opModFixedPFInjectW) — an axis this product refuses with the
+//	advanced overlay dark (ModeFixedPFInjectW is in AdvancedSupportedAxes only),
+//	so it is the same shape BASIC-014 now measures with a refusal oracle; and
+//
+//	BASIC-009 (opModConnect) — an axis this product genuinely EXECUTES, whose
+//	southbound landing (the device's connect/enter-service state) this suite
+//	reads no register for.
+//
+// Both are therefore rows that can still roll up PASS without measuring
+// anything, by the mechanism this file's other criteria were rewritten to
+// close: Skip is severity 0 and every roll-up raises only. They are named here
+// rather than quietly left, because the next person to read this function
+// should be able to see the remaining hole without re-deriving it — and closing
+// them is a fixed amount of work each (a refusal binding for BASIC-008, a
+// connect-state oracle for BASIC-009), not a redesign.
+//
+// It is left as a Skip for now for one reason: this criterion is also the honest
+// answer wherever the DER's ELECTRICAL response really is the subject, and
+// turning it into a blanket FAIL would make that claim dishonest in the other
+// direction. The rows above need oracles, not a severity change.
 func critDEREffectUnobservable(subject string) criterion {
 	return criterion{
 		Claim: "the DER's output followed " + subject + " for the duration of the event",
@@ -1460,17 +1626,23 @@ func fixedWAltReference(np invariant.Nameplate, base invariant.LimitRef, wantPct
 // resolved WSet (watts mode) compared directly against the commanded
 // value×10^multiplier.
 //
-// DELIBERATELY NOT WIRED to BASIC-014 (see register.go's own comment on that
-// row, and this design's STOP condition — docs/design/
-// IW13_ACTIVE_POWER_UNITS_2026-08-12.md §3.4/§4.3 does not resolve this):
-// opModTargetW stays CannotComply (supported.go's ScalarSupportedAxes,
-// unchanged), so a correctly-behaving DUT NEVER writes the commanded value
-// southbound at all — this function's "the DER holds the commanded value"
-// assertion would FAIL every conformant DUT, exactly backwards from BASIC-010/
-// 013's oracles, which test axes the product genuinely executes. Kept,
-// unwired, as the groundwork for a future "the refusal left no southbound
-// trace" oracle (the opposite assertion), which is a materially different
-// check this design does not specify.
+// STILL DELIBERATELY NOT WIRED to BASIC-014, and IW15-008 settled what that row
+// carries instead. opModTargetW is REFUSED by this product (supported.go's
+// ScalarSupportedAxes has no ModeTargetW), so a correctly-behaving DUT never
+// writes the commanded value southbound at all: this function's "the DER holds
+// the commanded value" assertion would FAIL every conformant DUT, exactly
+// backwards from BASIC-010/013's oracles, which test axes the product genuinely
+// executes. IW13 left it here as "groundwork for a future 'the refusal left no
+// southbound trace' oracle"; that oracle now exists (curve.go's refusalBinding
+// and oracleRefusal), and it is NOT this function inverted — it fingerprints the
+// whole axis and compares two readings for ANY movement, which catches the
+// half-executions a single "does it hold the commanded number" comparison
+// cannot see.
+//
+// What keeps this function alive is the case IW13 built it for and this product
+// is not: a DUT that DOES execute opModTargetW. Grading that DUT needs exactly
+// this comparison, and rebuilding it later from an empty file would repeat the
+// units reasoning §1.1 already settled once.
 func oracleTargetW(wantWatts int64) func(ctx context.Context, rc *certify.RunCtx) Finding {
 	return func(ctx context.Context, rc *certify.RunCtx) Finding {
 		uv, err := oracleUnitView(ctx, rc, oracleSimName)

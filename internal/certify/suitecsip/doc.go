@@ -73,6 +73,37 @@
 // assertion itself, which tier that was. A criterion that reached no tier is a
 // SKIP carrying the reason — never a PASS.
 //
+// # Where a SKIP is not honest: the release-enforcing criteria
+//
+// That rule holds for criteria about the WIRE, where "the capture could not
+// show me this" is a fact about the run. It does NOT hold for the criteria that
+// carry a row's whole subject, and the difference is verdict arithmetic: Skip is
+// severity 0 in the roll-up (bundle.Verdict.Severity) while every roll-up in the
+// runner raises only, so a Skip cannot dent a case verdict and cannot hold a
+// release. A row whose only "did the DUT actually do it" criterion skips reports
+// the SAME verdict as a row that tested everything and passed — absence of
+// measurement reading as success.
+//
+// Three families of criterion are therefore written with NO Skip path at all,
+// and every shape their live phase can leave behind — including an unreachable
+// bench — comes back as a decided verdict:
+//
+//   - the SCALAR southbound oracle (IW13-001/IW14-003 —
+//     critDEREffectViaSouthboundOracle, BASIC-010/013): the DER's own register
+//     holds the value this row commanded;
+//   - the CURVE southbound oracle and the REFUSED-axis oracle (IW15-008 —
+//     curve.go, BASIC-006/011/012/015 and BASIC-014): the DER's own curve model
+//     adopted and enabled this row's breakpoints, or — for an axis the product
+//     refuses — the DUT answered cannot-comply and nothing of that axis moved;
+//   - the AUTHORING-GAP criteria (IW15-008 — critModeUnauthorable,
+//     BASIC-004/005/007): this bench has no lever for the mode, so the row was
+//     not tested, and an untested row must not roll up as a passing one.
+//
+// The last of those is a BENCH gap rather than a DUT defect, and its Observed
+// text says so in its first sentence; it is still a FAIL, because the
+// consequence — a conformance bundle claiming a row was exercised when it was
+// not — is the same either way.
+//
 // # The key-log prerequisite (read this before running the suite live)
 //
 // As of this writing the bench's CSIP server (sim/server over sim/tlsserver

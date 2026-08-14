@@ -37,6 +37,50 @@ import (
 
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/internal/certify/suitepki"
+	"lexa-proto/sunspec"
+)
+
+// The curve rows' mode→model mapping provenance (IW15-008). Each says WHERE the
+// correspondence comes from, because a southbound FAIL that names a register
+// bank is only checkable if a reader can verify the bank was the right one.
+//
+// They are stated in terms of the STANDARDS' own carriage, not of any one
+// gateway's source, so a different DUT graded by this suite is graded against
+// the same mapping. Where this product's own reconciler agrees, it is cited as
+// corroboration rather than as the authority.
+const (
+	mappingVoltVar = "IEEE 2030.5's opModVoltVar is the Q(V) function, whose SunSpec/IEEE-1547 carriage is " +
+		"model 705 (DER Volt-Var) — the same correspondence this product's southbound reconciler uses " +
+		"(lexa-gw cmd/modbus/reconcile_adv.go maps its volt-var axis onto sunspec.ModelDERVoltVar)"
+
+	mappingVoltWatt = "IEEE 2030.5's opModVoltWatt is the P(V) function, whose SunSpec/IEEE-1547 carriage is " +
+		"model 706 (DER Volt-Watt) — the same correspondence this product's southbound reconciler uses " +
+		"(lexa-gw cmd/modbus/reconcile_adv.go maps its volt-watt axis onto sunspec.ModelDERVoltWatt)"
+
+	// The watt-PF row lands on 712 and the reason is worth stating, because the
+	// names do not match: SunSpec's watt-shaped reactive model is Watt-VAr, and
+	// IEEE 2030.5's carriage for that same axis is opModWattPF. Nothing in the
+	// 7xx set is named Watt-PF.
+	mappingWattPF = "IEEE 2030.5 carries the watt-shaped REACTIVE axis as opModWattPF; the SunSpec/IEEE-1547 " +
+		"carriage of that axis is model 712 (DER Watt-Var), there being no Watt-PF model in the 7xx set — " +
+		"the same correspondence this product's southbound reconciler uses (lexa-gw " +
+		"cmd/modbus/reconcile_adv.go's advCurveMode maps its watt-var axis to the mode name \"watt_pf\" " +
+		"precisely because 2030.5's carriage for it is opModWattPF). The breakpoints are compared as the " +
+		"RAW values the control published; this referee performs no axis re-interpretation of its own"
+
+	// BASIC-012 is the row with no southbound home at all, and saying so is
+	// the whole of its southbound evidence.
+	noFreqWattRegister = "IEEE 2030.5's opModFreqWatt is a BREAKPOINT curve (frequency → watts), and the " +
+		"SunSpec/IEEE-1547 7xx set has no model that stores frequency-watt breakpoints: frequency response " +
+		"is expressed as model 711 (DER Frequency Droop), a PARAMETRIC control — deadbands DbOf/DbUf, gains " +
+		"KOf/KUf, a response time — with no point table a published curve could be written into. This " +
+		"product's own reconciler records the same conclusion for the same reason (lexa-gw " +
+		"cmd/modbus/reconcile_adv.go, on releasing its freq-watt axis: \"No SunSpec model executes " +
+		"freq-watt ... nothing to disable on release either\"), and its advAxisModel table has no model for " +
+		"the axis at all. So this row can author its control northbound — that half is real evidence — and " +
+		"NOTHING southbound can hold the curve's content. Closing it needs either a device profile that " +
+		"stores frequency-watt breakpoints or a decision to re-scope the row; it cannot be closed by " +
+		"asserting something weaker against 711, which is a different function"
 )
 
 // Suite is this suite's short name, used for -suite selection and printed in
@@ -293,34 +337,60 @@ func aggRows(nonce string) []aggRow {
 	return rows
 }
 
+// inverterControlRow is one BASIC-004..015 control-mode row: its catalog id, run
+// order within the suite, the mode it drives and the subject its criteria are
+// phrased about.
+type inverterControlRow struct {
+	id      string
+	order   int
+	mode    controlMode
+	subject string
+}
+
 // registerInverterControls binds BASIC-004..015, the twelve control-mode rows.
 func registerInverterControls(reg *certify.Registry) {
+	for _, r := range inverterControlRows() {
+		reg.Register(uid(r.id), Suite, basicInverterControl(r.mode, r.subject),
+			certify.WithRequires(requiresFor(r.mode)...), certify.WithOrder(r.order))
+	}
+}
+
+// inverterControlRows is the twelve rows' one definition, factored out of the
+// registration so a test can drive the SHIPPING row — its real mode, its real
+// published curve, its real oracle — rather than a copy of its literals that
+// can silently drift from it (IW15-008).
+func inverterControlRows() []inverterControlRow {
 	const noRideThrough = "IEEE 2030.5's ride-through modes (opModLVRTMustTrip / opModLVRTMayTrip / " +
 		"opModLVRTMomentaryCessation and their HVRT / LFRT / HFRT counterparts) are curve-valued DERControl " +
 		"modes that the bench's 2030.5 server cannot publish: gridsim's admin control API " +
 		"(sim/gridsim/admin.go adminCtrlReq) exposes only the scalar modes, and its curve API " +
 		"(sim/gridsim/curve.go) binds only Volt-VAr, Volt-Watt, Freq-Watt and Watt-PF. With no way to put " +
-		"the mode on the wire there is nothing to observe, and reporting anything but a SKIP would be " +
-		"certifying a test that was never run. Closing this needs a ride-through curve mode in gridsim"
+		"the mode on the wire there is nothing to observe, so nothing about this row has been tested. " +
+		"Closing this needs a ride-through curve mode in gridsim"
 
 	const noRampRate = "IEEE 2030.5 places the ramp rates setGradW and setSoftGradW ONLY in " +
 		"DefaultDERControl — CSIP §5.2.4 is explicit that they cannot be scheduled — and gridsim's " +
 		"POST /admin/default carries the same DERControlBase field set as its control API, which has no " +
 		"gradient fields. The mode therefore cannot be placed on the wire from this bench"
 
-	rows := []struct {
-		id      string
-		order   int
-		mode    controlMode
-		subject string
-	}{
+	return []inverterControlRow{
+		// IW15-008: an unreachable mode is a row that was NOT TESTED, and it now
+		// says so in a decided FAIL (critModeUnauthorable) instead of the SKIP
+		// that let it roll up as a passing row. Nothing about the bench changed
+		// here; what changed is that the gap is visible in the verdict rather
+		// than only in the prose nobody reads on a green row.
 		{"BASIC-004", 50, unreachableMode("opModLVRTMustTrip", noRideThrough),
 			"the low/high voltage ride-through settings"},
 		{"BASIC-005", 51, unreachableMode("opModLFRTMustTrip", noRideThrough),
 			"the low/high frequency ride-through settings"},
+		// The curve rows carry the IW15-008 southbound curve oracle: the
+		// breakpoints they publish must be found ADOPTED and ENABLED in the
+		// DER's own curve model, point for point and in order. The mode→model
+		// mapping is stated on each row because a FAIL that names a register
+		// bank has to be checkable by whoever reads the bundle.
 		{"BASIC-006", 52, curveMode("opModVoltVar", "volt_var",
-			[]CurvePoint{{X: 92, Y: 60}, {X: 98, Y: 0}, {X: 102, Y: 0}, {X: 108, Y: -60}}, 3),
-			"a Volt-VAr curve"},
+			[]CurvePoint{{X: 92, Y: 60}, {X: 98, Y: 0}, {X: 102, Y: 0}, {X: 108, Y: -60}}, 3,
+			sunspec.ModelDERVoltVar, mappingVoltVar), "a Volt-VAr curve"},
 		{"BASIC-007", 53, unreachableMode("setGradW", noRampRate), "the ramp-rate settings"},
 		{"BASIC-008", 54, scalarMode("opModFixedPFInjectW", func(r *ControlRequest) {
 			r.FixedPFInjectW = ptr(int64(95))
@@ -339,9 +409,11 @@ func registerInverterControls(reg *certify.Registry) {
 				r.MaxLimW = ptr(hundredths)
 			}), oracleMaxLimW), "a maximum active power limit"},
 		{"BASIC-011", 57, curveMode("opModVoltWatt", "volt_watt",
-			[]CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}}, 3), "a Volt-Watt curve"},
-		{"BASIC-012", 58, curveMode("opModFreqWatt", "freq_watt",
-			[]CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}}, 3), "a frequency-droop / frequency-watt curve"},
+			[]CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}}, 3,
+			sunspec.ModelDERVoltWatt, mappingVoltWatt), "a Volt-Watt curve"},
+		{"BASIC-012", 58, curveModeNoRegisterHome("opModFreqWatt", "freq_watt",
+			[]CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}}, 3,
+			sunspec.ModelDERFreqDroop, noFreqWattRegister), "a frequency-droop / frequency-watt curve"},
 		// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §4.2):
 		// BASIC-013's opModFixedW is SignedPerCent, hundredths of a percent —
 		// FixedW=6000 means 60.00%, matching the catalog's own stated value
@@ -373,30 +445,32 @@ func registerInverterControls(reg *certify.Registry) {
 		// ("opModTargetW | 2000 (value 2000, multiplier 0) | 3000 (0
 		// multiplier)").
 		//
-		// NOT wired to oracleTargetW (STOP, flagged rather than guessed —
-		// docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §3.4/§4.3 does
-		// not resolve this): opModTargetW stays CannotComply (supported.go's
-		// ScalarSupportedAxes, unchanged) — the product REFUSES this axis and
-		// never writes it southbound at all. An oracle built the same way as
-		// BASIC-010/013's (asserting the DER's own register HOLDS the
-		// commanded value) would FAIL every correctly-refusing DUT, which
-		// would be exactly backwards. Asserting the opposite (the DER shows
-		// NO trace of the refused command, proving the refusal was honest and
-		// not a silent partial write) is a materially different check the
-		// design doesn't specify, so this row keeps critDEREffectUnobservable's
-		// honest SKIP — only its request-surface fix (the TargetW field
-		// itself, closing "cannot even in principle be sent correctly") lands
-		// here.
-		{"BASIC-014", 60, scalarMode("opModTargetW", func(r *ControlRequest) {
-			r.TargetW = ptr(int64(3000))
-		}), "a set-active-power command expressed in watts"},
+		// It is deliberately NOT wired to oracleTargetW, and IW15-008 is what
+		// finally settles what it IS wired to. opModTargetW is REFUSED by this
+		// product (supported.go's ScalarSupportedAxes carries no ModeTargetW —
+		// "enforcement TBD"), so an oracle asserting the DER HOLDS the
+		// commanded value would FAIL every correctly-refusing DUT, exactly
+		// backwards. IW13 flagged the opposite assertion as "a materially
+		// different check the design doesn't specify" and left the row on
+		// critDEREffectUnobservable's SKIP — which is how a refusal nobody had
+		// ever verified rolled up as a PASS. That check is now specified and
+		// built (curve.go's refusalBinding): the DUT must ANSWER the head end
+		// cannot-comply, and NOT ONE REGISTER of the setpoint axis may move on
+		// the DER while the refused control is live. A silent partial write, or
+		// a Started for an axis nothing executed (the LXR-002 shape verbatim),
+		// now FAILs here instead of passing unmeasured.
+		{"BASIC-014", 60, scalarModeRefused("opModTargetW",
+			"the 704 active-power SETPOINT axis (WSet / WSetPct, and the WSetMod enum that selects between "+
+				"them)",
+			"opModTargetW = 3000 W (value 3000, multiplier 0), the catalog's own stated test value",
+			"opModTargetW is an axis this product does not execute end to end, so it is refused at receipt "+
+				"rather than partially or silently complied with",
+			[]string{"WSet", "WSetPct"},
+			func(r *ControlRequest) { r.TargetW = ptr(int64(3000)) }),
+			"a set-active-power command expressed in watts"},
 		{"BASIC-015", 61, curveMode("opModWattPF", "watt_pf",
-			[]CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}}, 3),
-			"an advanced (curve-based) inverter control"},
-	}
-	for _, r := range rows {
-		reg.Register(uid(r.id), Suite, basicInverterControl(r.mode, r.subject),
-			certify.WithRequires(requiresFor(r.mode)...), certify.WithOrder(r.order))
+			[]CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}}, 3,
+			sunspec.ModelDERWattVar, mappingWattPF), "an advanced (curve-based) inverter control"},
 	}
 }
 

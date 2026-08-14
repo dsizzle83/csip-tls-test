@@ -764,10 +764,15 @@ func TestInverterControlSpec_NonOracleRowUnaffected(t *testing.T) {
 	}
 }
 
-// TestInverterControlSpec_UnreachableRowUnaffected pins the Publish==nil shape
-// (the six ride-through/ramp-rate rows): no Setup, no PostWait, no Cleanup —
-// unchanged by this fix, which only touches the m.Publish != nil branch.
-func TestInverterControlSpec_UnreachableRowUnaffected(t *testing.T) {
+// TestInverterControlSpec_UnreachableRowDrivesNothing pins the Publish==nil
+// shape (the ride-through / ramp-rate rows): no Setup, no PostWait, no Cleanup,
+// because there is nothing this bench can put on the wire for them.
+//
+// Their VERDICT is a different matter and changed with IW15-008: a row that
+// drives nothing has tested nothing, and now says so in a decided FAIL — see
+// TestUnauthorableRow_IsAFailNotASkip in curve_oracle_test.go. What is pinned
+// here is only that such a row still arms no bench lever.
+func TestInverterControlSpec_UnreachableRowDrivesNothing(t *testing.T) {
 	m := unreachableMode("opModLVRTMustTrip", "no lever on this bench")
 	s := inverterControlSpec(m, "the low/high voltage ride-through settings", "CERT-LIFECYCLE-BASIC004")
 	if s.Setup != nil {

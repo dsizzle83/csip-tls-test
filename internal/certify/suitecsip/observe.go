@@ -1357,15 +1357,44 @@ type CurvePoint struct {
 	Y float64 `json:"y"`
 }
 
+// CurvePublication is what the server minted for a POST /admin/curve: the
+// control's mRID, the DERCurve resource's own mRID, and the href the control
+// LINKS the curve at.
+//
+// All three matter to a curve row (IW15-008). The control mRID is the one every
+// wire criterion binds to (critDERControlCarriesModeFrom) — and it is the
+// SERVER's, not the caller's: gridsim mints "DERC-SP-CURVE-<epoch>" and ignores
+// any mRID the request carried, so a row that assumed its own synthetic mRID
+// was binding to a string that never existed on any wire. The href is what the
+// DUT has to resolve before any curve content can reach it at all, which is a
+// separate thing to be able to say about a failing row.
+type CurvePublication struct {
+	MRID      string `json:"mrid"`
+	CurveMRID string `json:"curve_mrid"`
+	CurveHref string `json:"curve_href"`
+}
+
 // PostCurve publishes a curve-linked control and returns its mRID.
 func (d *Driver) PostCurve(ctx context.Context, req CurveRequest) (string, error) {
-	var out struct {
-		MRID string `json:"mrid"`
-	}
+	pub, err := d.PostCurveDetail(ctx, req)
+	return pub.MRID, err
+}
+
+// PostCurveDetail is PostCurve with everything the server minted.
+func (d *Driver) PostCurveDetail(ctx context.Context, req CurveRequest) (CurvePublication, error) {
+	var out CurvePublication
 	if err := d.Admin.Post(ctx, "curve", req, &out); err != nil {
-		return "", err
+		return CurvePublication{}, err
 	}
-	return out.MRID, nil
+	if out.MRID != "" {
+		if d.published == nil {
+			d.published = map[string]time.Time{}
+		}
+		if _, seen := d.published[out.MRID]; !seen {
+			d.published[out.MRID] = time.Now().UTC()
+		}
+	}
+	return out, nil
 }
 
 // RehomeDER re-homes the DUT's DERCapability and DERSettings hrefs via

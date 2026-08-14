@@ -1,0 +1,863 @@
+package suitecsip
+
+// curve_oracle_test.go is IW15-008's teeth: the curve rows' southbound oracle
+// and the refused-axis rows' refusal oracle, each exercised against input that
+// satisfies it AND against every input that must not.
+//
+// The fixture is a REAL advanced DER simulator (sim/southbound's
+// NewSolarServerAdvanced — models 701/702/703/704 plus the 705/706/711/712
+// curve models with the §3.1.2 adopt handshake) driven through the REAL
+// lexa-proto derbase writer the product's own reconciler uses. Nothing here
+// hand-crafts a register map: a hand-built image can be made to agree with a
+// hand-built oracle while both disagree with what a device actually holds, and
+// that is precisely the class of error this file exists to catch.
+//
+// The RED case comes first and is the important one. A DER whose curve models
+// were never written is EXACTLY the southbound state the current product leaves
+// behind for these rows — it refuses the curve axes at receipt
+// (lexa-gw internal/northbound/scheduler/supported.go: ScalarSupportedAxes
+// carries no curve mode, and the advanced set is gated behind
+// advanced_axes_enabled) — and before this change every one of those rows
+// reported applicable-PASS against it.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"csip-tls-test/internal/certify"
+	"csip-tls-test/sim/gridsim"
+	sim "csip-tls-test/sim/southbound"
+	"lexa-proto/derbase"
+	"lexa-proto/modbus"
+	"lexa-proto/sunspec"
+)
+
+// curveFixture is a live advanced DER sim, a real derbase writer onto it, and a
+// RunCtx whose oracle sim slot serves that same device's register image through
+// a simapi-shaped /registers — the shape internal/invariant.SimAPIDER reads in
+// production, gw-campaign and gw-mayhem.
+type curveFixture struct {
+	ss   *sim.SolarServer
+	base *derbase.Base
+	rc   *certify.RunCtx
+}
+
+func newCurveFixture(t *testing.T) *curveFixture {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("find a free port: %v", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+
+	url := fmt.Sprintf("tcp://127.0.0.1:%d", port)
+	ss, err := sim.NewSolarServerAdvanced(url, 5000, "SN-CURVE-ORACLE")
+	if err != nil {
+		t.Fatalf("start the advanced DER sim: %v", err)
+	}
+	t.Cleanup(ss.Stop)
+
+	trans, err := modbus.NewTransport(url, 2*time.Second)
+	if err != nil {
+		t.Fatalf("new transport: %v", err)
+	}
+	if err := trans.Open(); err != nil {
+		t.Fatalf("open transport: %v", err)
+	}
+	t.Cleanup(func() { _ = trans.Close() })
+	if err := trans.SetUnitID(1); err != nil {
+		t.Fatalf("set unit id: %v", err)
+	}
+	reader, err := sunspec.NewReader(trans)
+	if err != nil {
+		t.Fatalf("sunspec reader: %v", err)
+	}
+	b, err := derbase.Init(reader, "curve-oracle-test")
+	if err != nil {
+		t.Fatalf("derbase init: %v", err)
+	}
+	b.AdoptPollTimeout = 500 * time.Millisecond
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/registers", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ss.Registers())
+	})
+	mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"paused": false, "sessions": []any{}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	return &curveFixture{ss: ss, base: &b, rc: &certify.RunCtx{
+		Case: &certify.Case{UID: "csip-conf-v1.3::BASIC-006", ID: "BASIC-006"},
+		Sims: map[string]*certify.SimClient{
+			oracleSimName: certify.NewSimClient(oracleSimName, srv.URL, http.DefaultClient),
+		},
+	}}
+}
+
+// setHeaderReg writes one header register of a curve model directly into the
+// device's bank. It is used ONLY to manufacture states a correct writer never
+// produces (an adopted curve in a switched-off function), which is the whole
+// point of an inverted test case; every state a correct writer DOES produce is
+// produced here by the real writer.
+func (f *curveFixture) setHeaderReg(t *testing.T, model uint16, field string, val uint16) {
+	t.Helper()
+	blk, err := sunspec.FindModel(f.base.Reader.Blocks(), model)
+	if err != nil {
+		t.Fatalf("find model %d in the sim's chain: %v", model, err)
+	}
+	hdr, _, _, _ := curveHeaderForTest(model)
+	off := hdr.Offset(field)
+	if off < 0 {
+		t.Fatalf("model %d header has no %s", model, field)
+	}
+	f.ss.Regs.Set(blk.BaseAddr+uint16(off), val)
+}
+
+// curveHeaderForTest mirrors invariant's own header table so a test can address
+// a header register by name without exporting that table.
+func curveHeaderForTest(model uint16) (*sunspec.Layout, string, string, string) {
+	switch model {
+	case sunspec.ModelDERVoltVar:
+		return sunspec.L705Hdr, "AdptCrvReq", "AdptCrvRslt", "NPt"
+	case sunspec.ModelDERVoltWatt:
+		return sunspec.L706Hdr, "AdptCrvReq", "AdptCrvRslt", "NPt"
+	case sunspec.ModelDERWattVar:
+		return sunspec.L712Hdr, "AdptCrvReq", "AdptCrvRslt", "NPt"
+	default:
+		return sunspec.L711Hdr, "AdptCtlReq", "AdptCtlRslt", "NCtl"
+	}
+}
+
+// basic006Binding is the BASIC-006 row's own binding, built from the identical
+// literals register.go registers it with — so what this file proves is a
+// property of the SHIPPING row, not of a curve invented for a test.
+func basic006Binding() *curveBinding {
+	return &curveBinding{
+		Mode:   "volt_var",
+		Points: []CurvePoint{{X: 92, Y: 60}, {X: 98, Y: 0}, {X: 102, Y: 0}, {X: 108, Y: -60}},
+		Model:  sunspec.ModelDERVoltVar, YRefType: 3, Mapping: mappingVoltVar,
+	}
+}
+
+// adoptBasic006Curve drives the REAL derbase adopt handshake with exactly the
+// breakpoints BASIC-006 publishes — the write a gateway that EXECUTED this row's
+// control would make.
+func (f *curveFixture) adoptBasic006Curve(t *testing.T) {
+	t.Helper()
+	f.adoptVoltVar(t, []sunspec.VVPoint{{V: 92, Var: 60}, {V: 98, Var: 0}, {V: 102, Var: 0}, {V: 108, Var: -60}})
+}
+
+func (f *curveFixture) adoptVoltVar(t *testing.T, pts []sunspec.VVPoint) {
+	t.Helper()
+	if err := f.base.WriteVoltVar(sunspec.VoltVarCurve{DeptRef: 1, Pri: 1, Points: pts},
+		"curve-oracle-test"); err != nil {
+		t.Fatalf("derbase WriteVoltVar (the real adopt handshake): %v", err)
+	}
+}
+
+// ── The RED case: the product's actual posture ──────────────────────────────
+
+// TestOracleCurve_UnadoptedDERIsAFail is the finding, reproduced.
+//
+// The device is exactly as the current product leaves it for BASIC-006: it
+// SERVES model 705, and nothing was ever adopted into it, because the gateway
+// refuses the volt-var axis at receipt with the advanced overlay dark. Before
+// IW15-008 this row's southbound criterion was a SKIP and the row reported
+// applicable-PASS on the strength of an <opModVoltVar> element appearing in
+// something the DUT fetched. It must now FAIL, and the FAIL must name what the
+// DER actually holds so a reader can tell "never adopted" from "adopted the
+// wrong thing".
+func TestOracleCurve_UnadoptedDERIsAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("an unadopted DER = %s (%s), want FAIL — a row that measured nothing must not pass",
+			got.Verdict, got.Observed)
+	}
+	for _, want := range []string{"never COMPLETED", "M705 Volt-Var", "(92, 60)"} {
+		if !strings.Contains(got.Observed, want) {
+			t.Errorf("the FAIL does not say %q; it said: %s", want, got.Observed)
+		}
+	}
+}
+
+// TestOracleCurve_AdoptedRowsOwnCurveIsAPass is the green half: a gateway that
+// really did adopt this row's breakpoints, through the real derbase writer, is
+// reported as such — so the FAIL above is a discrimination and not a constant.
+func TestOracleCurve_AdoptedRowsOwnCurveIsAPass(t *testing.T) {
+	f := newCurveFixture(t)
+	f.adoptBasic006Curve(t)
+	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
+	if got.Verdict != certify.Pass {
+		t.Fatalf("the row's own curve, adopted through the real derbase handshake = %s (%s), want PASS",
+			got.Verdict, got.Observed)
+	}
+	if !strings.Contains(got.Observed, "COMPLETED") || !strings.Contains(got.Observed, "ENABLED") {
+		t.Errorf("the PASS does not state the adopt/enable state it rests on: %s", got.Observed)
+	}
+}
+
+// TestOracleCurve_ADifferentCurveIsStillAFail: the device adopted A curve, just
+// not this row's. "Some curve is present" is the weaker claim the pre-fix row
+// could not even make; it must not be mistaken for this one.
+func TestOracleCurve_ADifferentCurveIsStillAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	f.adoptVoltVar(t, []sunspec.VVPoint{{V: 230, Var: 30}, {V: 240, Var: 0}, {V: 250, Var: -30}})
+	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("an unrelated adopted curve = %s (%s), want FAIL", got.Verdict, got.Observed)
+	}
+	if !strings.Contains(got.Observed, "(230, 30)") || !strings.Contains(got.Observed, "(92, 60)") {
+		t.Errorf("the FAIL must show BOTH curves so a reader can see the difference; it said: %s",
+			got.Observed)
+	}
+}
+
+// TestOracleCurve_ReorderedCurveIsStillAFail: the same four breakpoints in a
+// different order describe a DIFFERENT piecewise function. A comparison that
+// treated a curve as a set rather than a sequence would pass this.
+func TestOracleCurve_ReorderedCurveIsStillAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	f.adoptVoltVar(t, []sunspec.VVPoint{{V: 108, Var: -60}, {V: 102, Var: 0}, {V: 98, Var: 0}, {V: 92, Var: 60}})
+	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("the row's breakpoints in reverse order = %s (%s), want FAIL — a curve is a sequence",
+			got.Verdict, got.Observed)
+	}
+}
+
+// TestOracleCurve_ExtraBreakpointIsStillAFail: a fifth segment nobody commanded
+// is content the head end did not send.
+func TestOracleCurve_ExtraBreakpointIsStillAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	f.adoptVoltVar(t, []sunspec.VVPoint{
+		{V: 92, Var: 60}, {V: 98, Var: 0}, {V: 102, Var: 0}, {V: 108, Var: -60}, {V: 112, Var: -80}})
+	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("an extra breakpoint = %s (%s), want FAIL", got.Verdict, got.Observed)
+	}
+}
+
+// TestOracleCurve_AdoptedButDisabledIsStillAFail: the content is right and the
+// function is switched off, so it commands nothing. A register-content check
+// that ignored Ena would call this execution.
+func TestOracleCurve_AdoptedButDisabledIsStillAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	f.adoptBasic006Curve(t)
+	f.setHeaderReg(t, sunspec.ModelDERVoltVar, "Ena", 0)
+	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("the right curve in a DISABLED function = %s (%s), want FAIL", got.Verdict, got.Observed)
+	}
+	if !strings.Contains(got.Observed, "DISABLED") {
+		t.Errorf("the FAIL does not name the disable it turned on: %s", got.Observed)
+	}
+}
+
+// TestOracleCurve_LyingAdoptIsStillAFail is the INV-ADV-READBACK shape: the
+// device answers the handshake COMPLETED and never moves its live curve. An
+// oracle that read the handshake register and stopped there would certify a
+// device that adopted nothing — and it is a real device behaviour, which is why
+// the sims model it.
+func TestOracleCurve_LyingAdoptIsStillAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	if err := f.ss.ApplyFault([]byte(`{"kind":"curve_adopt_lies"}`)); err != nil {
+		t.Fatalf("arm curve_adopt_lies: %v", err)
+	}
+	f.adoptBasic006Curve(t)
+	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("a device that only SAID it adopted = %s (%s), want FAIL", got.Verdict, got.Observed)
+	}
+}
+
+// TestOracleCurve_UnreachableDERIsUnavailableNotAPass: an oracle that cannot
+// read the DER must decline to decide, so the caller's Unavailable→FAIL path
+// (curveOutcome) takes it rather than a silent pass.
+func TestOracleCurve_UnreachableDERIsUnavailableNotAPass(t *testing.T) {
+	rc := &certify.RunCtx{Case: &certify.Case{UID: "test::curve"}, Sims: map[string]*certify.SimClient{}}
+	got := oracleCurve(basic006Binding())(context.Background(), rc)
+	if got.Unavailable == "" {
+		t.Fatalf("an unreachable DER returned a verdict (%s: %s) instead of declining", got.Verdict, got.Observed)
+	}
+}
+
+// TestOracleCurve_ModelAbsentIsAFail: the DER serves no 712 at all, so the
+// watt-PF row's content has nowhere to be. "The device cannot carry this
+// function" is a real answer to a conformance question and it is not a pass.
+func TestOracleCurve_ModelAbsentIsAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	b := &curveBinding{
+		Mode: "volt_watt", Points: []CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}},
+		// 707 (DERTripLV) is not served by the default advanced sim — the trip
+		// models are opt-in (NewSolarServerTrip) — and is not a model this
+		// referee decodes either, so it stands in for "no register home found".
+		Model: 707, YRefType: 3, Mapping: "a mapping onto a model this device does not serve",
+	}
+	got := oracleCurve(b)(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("a curve mapped onto an absent model = %s (%s), want FAIL", got.Verdict, got.Observed)
+	}
+	if !strings.Contains(got.Observed, "models the DER does serve") {
+		t.Errorf("the FAIL does not name the models that ARE served: %s", got.Observed)
+	}
+}
+
+// TestOracleCurve_FreqWattHasNoRegisterHomeAndSaysSoAsAFail pins BASIC-012's
+// shape. opModFreqWatt is a breakpoint curve and the 7xx set stores frequency
+// response as the parametric 711 droop, so there is nothing southbound that can
+// hold the row's content. That is a gap in the EVIDENCE, and a gap in the
+// evidence is a row that was not tested — it must FAIL with the reason, not
+// skip, and not pass by asserting something weaker against 711.
+func TestOracleCurve_FreqWattHasNoRegisterHomeAndSaysSoAsAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	m := curveModeNoRegisterHome("opModFreqWatt", "freq_watt",
+		[]CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}}, 3, sunspec.ModelDERFreqDroop, noFreqWattRegister)
+	got := oracleCurve(m.Curve)(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("a mode with no southbound register home = %s (%s), want FAIL", got.Verdict, got.Observed)
+	}
+	if !strings.Contains(got.Observed, "no breakpoint table") {
+		t.Errorf("the FAIL does not describe what the DER's nearest model actually is: %s", got.Observed)
+	}
+	if !strings.Contains(got.Observed, "NO southbound register home") {
+		t.Errorf("the FAIL does not name the gap as the reason: %s", got.Observed)
+	}
+}
+
+// TestCurveBinding_MultipliersAreAppliedExactlyOnce: the wire carries raw
+// breakpoints plus a power-of-ten multiplier per axis, and the value the oracle
+// expects is the product of the two. Applying it twice (or not at all) would
+// judge a device against a number nobody sent.
+func TestCurveBinding_MultipliersAreAppliedExactlyOnce(t *testing.T) {
+	b := &curveBinding{Points: []CurvePoint{{X: 92, Y: 60}}, XMult: 1, YMult: -1}
+	got := b.wantPoints()
+	if len(got) != 1 || got[0].X != 920 || got[0].Y != 6 {
+		t.Fatalf("wantPoints with x10^1 / y10^-1 = %+v, want (920, 6)", got)
+	}
+	plain := (&curveBinding{Points: []CurvePoint{{X: 92, Y: 60}}}).wantPoints()
+	if plain[0].X != 92 || plain[0].Y != 60 {
+		t.Fatalf("wantPoints with no multipliers = %+v, want the published values unchanged", plain)
+	}
+}
+
+// ── curveOutcome: the transition, not the snapshot ──────────────────────────
+
+func curveObs(params map[string]string) *Observation { return &Observation{Params: params} }
+
+// TestCurveOutcome_RequiresTheReadingToHaveMoved is the same discipline the
+// scalar oracle carries: a DER that ALREADY held this row's curve before the
+// row published anything proves nothing, because a rerun that never re-applied
+// the control reads identically to one that did.
+func TestCurveOutcome_RequiresTheReadingToHaveMoved(t *testing.T) {
+	moved := curveOutcome(curveObs(map[string]string{
+		oraclePreVerdictParam:  string(certify.Fail),
+		oraclePreObservedParam: "the DER held its factory curve",
+		oracleVerdictParam:     string(certify.Pass),
+		oracleObservedParam:    "the DER holds the published curve",
+		curvePublishedParam:    "4 breakpoints",
+	}))
+	if moved.Verdict != certify.Pass {
+		t.Fatalf("a curve that moved from absent to present = %s (%s), want PASS", moved.Verdict, moved.Observed)
+	}
+
+	stale := curveOutcome(curveObs(map[string]string{
+		oraclePreVerdictParam:  string(certify.Pass),
+		oraclePreObservedParam: "the DER already held the published curve",
+		oracleVerdictParam:     string(certify.Pass),
+		oracleObservedParam:    "the DER holds the published curve",
+	}))
+	if stale.Verdict != certify.Fail {
+		t.Fatalf("a curve that was ALREADY adopted before the row published = %s (%s), want FAIL",
+			stale.Verdict, stale.Observed)
+	}
+}
+
+// TestCurveOutcome_UnavailableIsAFailNotASkip: an oracle that could not read the
+// DER must FAIL the row. A Skip is severity 0 in the roll-up and cannot hold a
+// release, which is how a misconfigured bench used to certify a product.
+func TestCurveOutcome_UnavailableIsAFailNotASkip(t *testing.T) {
+	f := curveOutcome(curveObs(map[string]string{
+		oracleUnavailableParam: "no simapi sidecar is configured for modsim",
+	}))
+	if f.Verdict != certify.Fail {
+		t.Fatalf("an unreachable curve oracle = %s (%s), want FAIL", f.Verdict, f.Observed)
+	}
+}
+
+// TestCurveOutcome_NoRecordAtAllIsAFail: a params map with neither a verdict nor
+// a reason means the oracle never ran or its result was lost. An unrecorded
+// criterion is not a satisfied one.
+func TestCurveOutcome_NoRecordAtAllIsAFail(t *testing.T) {
+	if f := curveOutcome(curveObs(map[string]string{})); f.Verdict != certify.Fail {
+		t.Fatalf("an empty live-phase record = %s (%s), want FAIL", f.Verdict, f.Observed)
+	}
+}
+
+// TestCritDEREffectViaCurveOracle_CarriesNoSkipPath: the criterion must always
+// decide. A Skip here would be exactly the hole IW15-008 closes.
+func TestCritDEREffectViaCurveOracle_CarriesNoSkipPath(t *testing.T) {
+	c := critDEREffectViaCurveOracle("a Volt-VAr curve", basic006Binding(), curveObs(map[string]string{}))
+	if c.Skip != "" {
+		t.Fatalf("the curve criterion carries a Skip path (%q) — a criterion that can skip cannot hold a "+
+			"release, which is the defect this change is about", c.Skip)
+	}
+	if c.Tier != tierOracle {
+		t.Errorf("the curve criterion is stamped %q; it reads the DER's registers, not the capture", c.Tier)
+	}
+	if f := c.Wire(nil, nil); f.Verdict != certify.Fail {
+		t.Fatalf("the criterion with no live record = %s, want FAIL", f.Verdict)
+	}
+}
+
+// ── The refusal oracle ──────────────────────────────────────────────────────
+
+func basic014Binding() *refusalBinding {
+	return &refusalBinding{
+		Axis:      "the 704 active-power SETPOINT axis (WSet / WSetPct)",
+		Points:    []string{"WSet", "WSetPct"},
+		Commanded: "opModTargetW = 3000 W",
+		Why:       "opModTargetW is an axis this product does not execute end to end",
+	}
+}
+
+func (f *curveFixture) fingerprint(t *testing.T) string {
+	t.Helper()
+	uv, err := oracleUnitView(context.Background(), f.rc, oracleSimName)
+	if err != nil {
+		t.Fatalf("read the DER's own registers: %v", err)
+	}
+	fp, ok := refusalFingerprint(uv, basic014Binding().Points)
+	if !ok {
+		t.Fatal("the DER's 704 image carries neither WSet nor WSetPct — the fixture is wrong")
+	}
+	return fp
+}
+
+// TestOracleRefusal_NothingMovedIsAPass: the honest refusal — the DUT wrote
+// nothing to the axis it said it could not perform.
+func TestOracleRefusal_NothingMovedIsAPass(t *testing.T) {
+	f := newCurveFixture(t)
+	baseline := f.fingerprint(t)
+	got := oracleRefusal(basic014Binding(), baseline)(context.Background(), f.rc)
+	if got.Verdict != certify.Pass {
+		t.Fatalf("an untouched setpoint axis = %s (%s), want PASS", got.Verdict, got.Observed)
+	}
+	if !strings.Contains(got.Observed, "no southbound trace") {
+		t.Errorf("the PASS does not say what it is a pass OF: %s", got.Observed)
+	}
+}
+
+// TestOracleRefusal_ASouthboundWriteIsStillAFail is the refusal row's teeth: a
+// gateway that answers the head end "cannot comply" and then writes the axis
+// anyway has told the head end one thing and the device another. The write here
+// goes through the sim's own register bank exactly as a landed Modbus write
+// leaves it.
+func TestOracleRefusal_ASouthboundWriteIsStillAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	baseline := f.fingerprint(t)
+
+	blk, err := sunspec.FindModel(f.base.Reader.Blocks(), sunspec.ModelDERCtlAC)
+	if err != nil {
+		t.Fatalf("find M704: %v", err)
+	}
+	f.ss.Regs.Set(blk.BaseAddr+uint16(sunspec.L704.Offset("WSet")), 3000)
+	f.ss.Regs.Set(blk.BaseAddr+uint16(sunspec.L704.Offset("WSetEna")), 1)
+	f.ss.Regs.Set(blk.BaseAddr+uint16(sunspec.L704.Offset("WSetMod")), sunspec.M704_WSetMod_Watts)
+
+	got := oracleRefusal(basic014Binding(), baseline)(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("a landed write on a REFUSED axis = %s (%s), want FAIL", got.Verdict, got.Observed)
+	}
+	for _, want := range []string{"LANDED", "before this row published", "opModTargetW = 3000 W"} {
+		if !strings.Contains(got.Observed, want) {
+			t.Errorf("the FAIL does not say %q; it said: %s", want, got.Observed)
+		}
+	}
+}
+
+// TestOracleRefusal_NoBaselineIsAFail: an absence asserted without a starting
+// state is not an observation. It must not read as a clean refusal.
+func TestOracleRefusal_NoBaselineIsAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	got := oracleRefusal(basic014Binding(), "")(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("a refusal judged with no baseline = %s (%s), want FAIL", got.Verdict, got.Observed)
+	}
+}
+
+// TestOracleRefusal_UnreachableDERIsUnavailableNotAPass: "we could not look"
+// must never read as "nothing was there".
+func TestOracleRefusal_UnreachableDERIsUnavailableNotAPass(t *testing.T) {
+	rc := &certify.RunCtx{Case: &certify.Case{UID: "test::refusal"}, Sims: map[string]*certify.SimClient{}}
+	got := oracleRefusal(basic014Binding(), "WSet=0 W disabled(WSetMod=0)")(context.Background(), rc)
+	if got.Unavailable == "" {
+		t.Fatalf("an unreachable DER returned a verdict (%s: %s) instead of declining", got.Verdict, got.Observed)
+	}
+}
+
+// TestRefusalOutcome_UnavailableIsAFailNotASkip mirrors the curve/scalar rule.
+func TestRefusalOutcome_UnavailableIsAFailNotASkip(t *testing.T) {
+	f := refusalOutcome(curveObs(map[string]string{oracleUnavailableParam: "the sidecar is down"}))
+	if f.Verdict != certify.Fail {
+		t.Fatalf("an unreachable refusal oracle = %s (%s), want FAIL", f.Verdict, f.Observed)
+	}
+	if e := refusalOutcome(curveObs(map[string]string{})); e.Verdict != certify.Fail {
+		t.Fatalf("an empty refusal record = %s (%s), want FAIL", e.Verdict, e.Observed)
+	}
+}
+
+// TestSettleRefusal_DoesNotShortCircuitOnAnEarlyAbsence is why a refusal cannot
+// reuse settleOracle. settleOracle returns the instant it sees a Pass, which for
+// an ABSENCE would mean concluding "nothing landed" from the first read — before
+// the reconciler tick on which a southbound write actually arrives. A landing
+// that happens late in the window must still be caught.
+func TestSettleRefusal_DoesNotShortCircuitOnAnEarlyAbsence(t *testing.T) {
+	calls := 0
+	f := settleRefusal(context.Background(), 2*time.Second, time.Millisecond, func() Finding {
+		calls++
+		if calls < 4 {
+			return Finding{Verdict: certify.Pass, Observed: "nothing has landed yet"}
+		}
+		return Finding{Verdict: certify.Fail, Observed: "a write landed on the refused axis"}
+	})
+	if f.Verdict != certify.Fail {
+		t.Fatalf("settleRefusal returned %s (%s) — a late landing must still be caught", f.Verdict, f.Observed)
+	}
+	if calls < 4 {
+		t.Fatalf("settleRefusal read %d times and stopped; it must poll the whole window for an absence", calls)
+	}
+}
+
+// TestSettleRefusal_ReturnsTheAbsenceAtTheDeadline: a window in which nothing
+// ever lands ends in the Pass it observed, not in a hang or a false FAIL.
+func TestSettleRefusal_ReturnsTheAbsenceAtTheDeadline(t *testing.T) {
+	calls := 0
+	f := settleRefusal(context.Background(), 30*time.Millisecond, time.Millisecond, func() Finding {
+		calls++
+		return Finding{Verdict: certify.Pass, Observed: "nothing landed"}
+	})
+	if f.Verdict != certify.Pass {
+		t.Fatalf("a window with no landing = %s (%s), want PASS at the deadline", f.Verdict, f.Observed)
+	}
+	if calls < 2 {
+		t.Fatalf("settleRefusal read %d time(s); it must keep watching until the deadline", calls)
+	}
+}
+
+// ── The refusal's northbound half ───────────────────────────────────────────
+
+func responseExchange(status int, subject string) Exchange {
+	body := `<DERControlResponse xmlns="urn:ieee:std:2030.5:ns"><createdDateTime>1</createdDateTime>` +
+		`<endDeviceLFDI>ab</endDeviceLFDI><status>` + itoa(int64(status)) + `</status>` +
+		`<subject>` + subject + `</subject></DERControlResponse>`
+	return Exchange{Req: msg(Request, "POST", "/rsps/0/r", 0, body), Resp: msg(Response, "", "", 201, "")}
+}
+
+// TestCritRefusalAnswered_HasTeeth walks every answer a DUT can give a control
+// whose axis it cannot execute.
+func TestCritRefusalAnswered_HasTeeth(t *testing.T) {
+	const row = "CERT-BASIC-014"
+
+	// The honest refusal: received, then the partial-opt-out code this product
+	// posts at receipt for an unsupported axis.
+	wantVerdict(t, "received + partial-opt-out", critRefusalAnswered(row),
+		synthTranscript(responseExchange(1, row), responseExchange(8, row)), certify.Pass)
+
+	// The LEXA legacy code means the same thing on the wire and must not be
+	// graded as a missing refusal.
+	wantVerdict(t, "received + LEXA 0xF0", critRefusalAnswered(row),
+		synthTranscript(responseExchange(1, row), responseExchange(0xF0, row)), certify.Pass)
+
+	// THE defect: an execution signal for an axis nothing executed. This is
+	// LXR-002 verbatim, and it must fail even when the refusal was also sent —
+	// a DUT that says both has still told the head end the control ran.
+	f := wantVerdict(t, "started for a refused axis", critRefusalAnswered(row),
+		synthTranscript(responseExchange(1, row), responseExchange(2, row)), certify.Fail)
+	if !strings.Contains(f.Observed, "Event started") {
+		t.Errorf("the FAIL does not name the forbidden status: %s", f.Observed)
+	}
+	wantVerdict(t, "started AND refused", critRefusalAnswered(row),
+		synthTranscript(responseExchange(8, row), responseExchange(2, row)), certify.Fail)
+	wantVerdict(t, "completed for a refused axis", critRefusalAnswered(row),
+		synthTranscript(responseExchange(3, row)), certify.Fail)
+
+	// An acknowledgement alone is not a refusal: the head end is left believing
+	// the control was accepted.
+	wantVerdict(t, "received only", critRefusalAnswered(row),
+		synthTranscript(responseExchange(1, row)), certify.Fail)
+
+	// Another control's refusal says nothing about this row.
+	wantUnavailable(t, "another control's refusal", critRefusalAnswered(row),
+		synthTranscript(responseExchange(8, "SOMEBODY-ELSE")))
+}
+
+// TestCritRefusalAnswered_ServerTierAgrees: the tier-3 fallback must reach the
+// same decisions, or a run whose capture could not be decrypted would grade the
+// same DUT differently.
+func TestCritRefusalAnswered_ServerTierAgrees(t *testing.T) {
+	const row = "CERT-BASIC-014"
+	c := critRefusalAnswered(row)
+	ok := &ServerView{Available: true, Responses: []AdminResponse{
+		{Subject: row, Status: 1}, {Subject: row, Status: 8}}}
+	if f := c.Server(ok); f.Verdict != certify.Pass {
+		t.Errorf("server-side honest refusal = %s: %s", f.Verdict, f.Observed)
+	}
+	started := &ServerView{Available: true, Responses: []AdminResponse{
+		{Subject: row, Status: 1}, {Subject: row, Status: 2}}}
+	if f := c.Server(started); f.Verdict != certify.Fail {
+		t.Errorf("server-side Started for a refused axis = %s: %s", f.Verdict, f.Observed)
+	}
+	ackOnly := &ServerView{Available: true, Responses: []AdminResponse{{Subject: row, Status: 1}}}
+	if f := c.Server(ackOnly); f.Verdict != certify.Fail {
+		t.Errorf("server-side acknowledgement-only = %s: %s", f.Verdict, f.Observed)
+	}
+	none := &ServerView{Available: true, Requests: []ServerRequest{{Method: "GET", Path: "/dcap"}}}
+	if f := c.Server(none); f.Verdict != certify.Fail {
+		t.Errorf("server-side no Response at all = %s: %s", f.Verdict, f.Observed)
+	}
+}
+
+// ── The authoring gaps ──────────────────────────────────────────────────────
+
+// TestUnauthorableRow_IsAFailNotASkip pins BASIC-004/005/007's new shape. The
+// bench cannot put these modes on the wire, so the rows were never tested — and
+// an untested row must not roll up as a passing one.
+func TestUnauthorableRow_IsAFailNotASkip(t *testing.T) {
+	m := unreachableMode("opModLVRTMustTrip", "gridsim has no ride-through curve mode")
+	s := inverterControlSpec(m, "the low/high voltage ride-through settings", "CERT-BASIC-004")
+
+	if s.Verdict == nil {
+		t.Fatal("an unauthorable row declares no live verdict, so a run with no capture would report it as " +
+			"a pass on an untested row")
+	}
+	if got := s.Verdict(&Observation{Params: map[string]string{}}); got != certify.Fail {
+		t.Fatalf("an unauthorable row's declared verdict = %q, want FAIL", got)
+	}
+	for _, c := range s.Criteria(&Observation{Params: map[string]string{}}) {
+		if c.Skip == "" {
+			continue
+		}
+		if strings.Contains(c.Claim, "ride-through") {
+			t.Fatalf("the unauthorable row still carries a Skip on its own claim (%q): %s", c.Claim, c.Skip)
+		}
+	}
+	crit := critModeUnauthorable("the ride-through settings", "opModLVRTMustTrip", "no lever exists")
+	f := crit.Wire(nil, nil)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("critModeUnauthorable = %s, want FAIL", f.Verdict)
+	}
+	// It must be unmistakably a BENCH gap, or somebody files it against the
+	// product and the real gap goes unfixed.
+	if !strings.Contains(f.Observed, "BENCH capability gap") || !strings.Contains(f.Observed, "NOT tested") {
+		t.Errorf("the FAIL does not identify itself as an untested row / bench gap: %s", f.Observed)
+	}
+}
+
+// ── The whole row, end to end ───────────────────────────────────────────────
+
+// rowByID returns the SHIPPING definition of one BASIC row, so the end-to-end
+// tests below drive what a campaign drives.
+func rowByID(t *testing.T, id string) inverterControlRow {
+	t.Helper()
+	for _, r := range inverterControlRows() {
+		if r.id == id {
+			return r
+		}
+	}
+	t.Fatalf("no inverter-control row is registered for %s", id)
+	return inverterControlRow{}
+}
+
+// withGridSim gives the fixture a real gridsim admin API on the same RunCtx, so
+// a row's Setup can actually publish and its PostWait can actually read — the
+// pattern inverterControlLifecycleRunCtx established for the scalar rows.
+func (f *curveFixture) withGridSim(t *testing.T) *Driver {
+	t.Helper()
+	gs := gridsim.NewServer(benchLFDI)
+	gsSrv := httptest.NewServer(gs.AdminHandler())
+	t.Cleanup(gsSrv.Close)
+	f.rc.GridSim = certify.NewAdminClient(gsSrv.URL, http.DefaultClient)
+	f.rc.Targets = certify.Targets{GridSimAdmin: gsSrv.URL}
+	return NewDriver(f.rc)
+}
+
+// TestBasic006Row_IsRedAgainstAProductThatRefusesTheCurveAxis is the finding
+// closed, at the level a campaign runs it.
+//
+// It drives the SHIPPING BASIC-006 row — its real controlMode, its real
+// published breakpoints, its real oracle — through the same live-phase sequence
+// check.go's run() uses (Setup, then the DUT's poll cycle, then PostWait), with
+// the DER left in exactly the state the current product leaves it in for this
+// row: nothing adopted, because the gateway refuses the volt-var axis at
+// receipt with the advanced overlay dark. The row must come out RED, and its
+// declared verdict must be RED independently of the capture, because the
+// capture would have shown a perfectly good <opModVoltVar> element and that is
+// what used to carry the row to PASS.
+func TestBasic006Row_IsRedAgainstAProductThatRefusesTheCurveAxis(t *testing.T) {
+	f := newCurveFixture(t)
+	d := f.withGridSim(t)
+	row := rowByID(t, "BASIC-006")
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-006")
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-006 Setup: %v", err)
+	}
+	// The DUT's poll cycle happens here. This product's does nothing southbound
+	// for a refused axis, which is the whole point.
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-006 PostWait: %v", err)
+	}
+
+	obs := &Observation{Params: params}
+	if got := s.Verdict(obs); got != certify.Fail {
+		t.Fatalf("BASIC-006's declared live verdict against a product that never adopted the curve = %q, "+
+			"want FAIL — this is the row that used to report applicable-PASS on element presence alone",
+			got)
+	}
+	notes := s.Notes(obs)
+	if !strings.Contains(notes, "independent southbound oracle: FAIL") {
+		t.Errorf("the row's own notes do not carry the oracle's reason, so a run with no recovered session "+
+			"would report an unexplained FAIL: %s", notes)
+	}
+	t.Logf("BASIC-006 verdict: FAIL\nnotes: %s", notes)
+
+	// The row must have bound the mRID the SERVER minted, not its own synthetic
+	// one: gridsim ignores any mRID a POST /admin/curve carries.
+	if params["mrid"] == "CERT-BASIC-006" || !strings.HasPrefix(params["mrid"], "DERC-") {
+		t.Errorf("the curve row's wire criteria are bound to %q, which is not the mRID gridsim minted",
+			params["mrid"])
+	}
+	if params[curveHrefParam] == "" {
+		t.Error("the row did not record the DERCurve href its control links, so the 404 case cannot be told " +
+			"apart from a DUT that refused the axis")
+	}
+}
+
+// TestBasic006Row_GoesGreenWhenTheDERActuallyAdoptsTheCurve is the other half of
+// the proof: the same shipping row, the same sequence, with the southbound write
+// a gateway that EXECUTED the control would have made — through the real derbase
+// adopt handshake. If this did not pass, the RED above would be a constant
+// rather than a measurement.
+func TestBasic006Row_GoesGreenWhenTheDERActuallyAdoptsTheCurve(t *testing.T) {
+	f := newCurveFixture(t)
+	d := f.withGridSim(t)
+	row := rowByID(t, "BASIC-006")
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-006")
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-006 Setup: %v", err)
+	}
+	// Stand in for the DUT's poll cycle: fetch the control, resolve the curve,
+	// adopt it southbound. Exactly the breakpoints the row published.
+	f.adoptBasic006Curve(t)
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-006 PostWait: %v", err)
+	}
+
+	obs := &Observation{Params: params}
+	if got := s.Verdict(obs); got != "" {
+		t.Fatalf("BASIC-006's declared verdict on a DER that adopted the row's own curve = %q, want \"\" "+
+			"(a satisfied oracle declares nothing and leaves the row to its wire criteria): %s",
+			got, s.Notes(obs))
+	}
+	if f := curveOutcome(obs); f.Verdict != certify.Pass {
+		t.Fatalf("the curve outcome on an adopting DER = %s: %s", f.Verdict, f.Observed)
+	}
+}
+
+// TestBasic014Row_RefusalIsMeasuredEndToEnd drives the shipping BASIC-014 row.
+// The product refuses opModTargetW, so the row's southbound half must come out
+// PASS on an untouched axis — and it must be a MEASURED pass, recorded by the
+// live phase, not the unmeasured SKIP the row used to carry.
+func TestBasic014Row_RefusalIsMeasuredEndToEnd(t *testing.T) {
+	f := newCurveFixture(t)
+	d := f.withGridSim(t)
+	row := rowByID(t, "BASIC-014")
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-014")
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-014 Setup: %v", err)
+	}
+	if params[refusalBaselineParam] == "" {
+		t.Fatal("BASIC-014's Setup recorded no pre-publication baseline of the refused axis, so its PostWait " +
+			"cannot assert an absence against anything")
+	}
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-014 PostWait: %v", err)
+	}
+	obs := &Observation{Params: params}
+	if got := s.Verdict(obs); got != "" {
+		t.Fatalf("BASIC-014's declared verdict on a DUT that wrote nothing = %q, want \"\": %s",
+			got, s.Notes(obs))
+	}
+	if f := refusalOutcome(obs); f.Verdict != certify.Pass {
+		t.Fatalf("the refusal outcome on an untouched axis = %s: %s", f.Verdict, f.Observed)
+	}
+	t.Logf("BASIC-014 notes: %s", s.Notes(obs))
+}
+
+// TestBasic014Row_IsRedWhenTheRefusedAxisIsWritten is the same row against a
+// gateway that answered cannot-comply and wrote the setpoint anyway.
+func TestBasic014Row_IsRedWhenTheRefusedAxisIsWritten(t *testing.T) {
+	f := newCurveFixture(t)
+	d := f.withGridSim(t)
+	row := rowByID(t, "BASIC-014")
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-014")
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-014 Setup: %v", err)
+	}
+	blk, err := sunspec.FindModel(f.base.Reader.Blocks(), sunspec.ModelDERCtlAC)
+	if err != nil {
+		t.Fatalf("find M704: %v", err)
+	}
+	f.ss.Regs.Set(blk.BaseAddr+uint16(sunspec.L704.Offset("WSet")), 3000)
+	f.ss.Regs.Set(blk.BaseAddr+uint16(sunspec.L704.Offset("WSetEna")), 1)
+
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-014 PostWait: %v", err)
+	}
+	obs := &Observation{Params: params}
+	if got := s.Verdict(obs); got != certify.Fail {
+		t.Fatalf("BASIC-014's declared verdict on a landed write to the REFUSED axis = %q, want FAIL: %s",
+			got, s.Notes(obs))
+	}
+}
+
+// TestCritDERCurveResolvable_HasTeeth: a curve href the server answers 404 is a
+// BENCH gap that makes any southbound silence unattributable, and the row has to
+// be able to say which of the two it is looking at.
+func TestCritDERCurveResolvable_HasTeeth(t *testing.T) {
+	const href = "/derp/0/dc/0"
+	wantVerdict(t, "curve resolves", critDERCurveResolvable(href),
+		synthTranscript(get(href, 200, `<DERCurve xmlns="urn:ieee:std:2030.5:ns"/>`)), certify.Pass)
+	f := wantVerdict(t, "curve 404s", critDERCurveResolvable(href),
+		synthTranscript(get(href, 404, "")), certify.Fail)
+	if !strings.Contains(f.Observed, "BENCH authoring gap") {
+		t.Errorf("the 404 FAIL does not name it as a bench gap: %s", f.Observed)
+	}
+	wantUnavailable(t, "curve never fetched", critDERCurveResolvable(href),
+		synthTranscript(get("/dcap", 200, dcapXML())))
+}

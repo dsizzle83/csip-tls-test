@@ -36,8 +36,16 @@ import (
 
 // modelsOfInterest are the SunSpec models every register-image source reads.
 // 701 is the measurement I7 and I10 corroborate against, 702 the nameplate I1
-// bounds by, 703 the enter-service settings, 704 the commanded setpoints.
-var modelsOfInterest = []uint16{701, 702, 703, 704}
+// bounds by, 703 the enter-service settings, 704 the commanded setpoints, and
+// the curve models (705/706/711/712, CurveModels) the CURVE-linked control
+// modes' own southbound landing sites — the registers a volt-var / volt-watt /
+// watt-var curve or a frequency droop is adopted into (curves.go).
+//
+// A model absent from the device is skipped by readUnit, so adding the curve
+// models costs a device that serves none of them nothing at all, and gives one
+// that serves them the only independent account of what a curve control
+// actually did.
+var modelsOfInterest = append([]uint16{701, 702, 703, 704}, CurveModels()...)
 
 // readUnit reads the models of interest for one unit through a Transport,
 // returning a UnitView. A per-model read failure is recorded on the view rather
