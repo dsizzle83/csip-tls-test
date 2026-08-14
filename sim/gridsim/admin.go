@@ -610,6 +610,10 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "program must be 0, 1, or 2", http.StatusBadRequest)
 		return
 	}
+	if err := percentDomainErr(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if req.DurationS <= 0 {
 		req.DurationS = 300
 	}
@@ -987,15 +991,33 @@ func apFromWatts(w *int64) *model.ActivePower {
 	return &model.ActivePower{Value: int16(v), Multiplier: mult}
 }
 
+// percentDomainErr rejects admin percent inputs outside their wire type's
+// representable domain BEFORE buildBase wraps them: PerCent is a uint16
+// (0..65535) and SignedPerCent an int16 (-32768..32767), so an out-of-domain
+// int64 would otherwise wrap silently into a plausible-looking control the
+// operator never authored (e.g. max_lim_W:-100 → 65436 on the wire, and the
+// pcap then records a control nobody asked for). Domain check only — the
+// product-range [0,10000] screen is the DUT's job, and sending
+// in-domain-but-over-range values is a legitimate test input.
+func percentDomainErr(req adminCtrlReq) error {
+	if req.MaxLimW != nil && (*req.MaxLimW < 0 || *req.MaxLimW > 65535) {
+		return fmt.Errorf("max_lim_W %d outside PerCent's uint16 wire domain [0,65535]", *req.MaxLimW)
+	}
+	if req.FixedW != nil && (*req.FixedW < -32768 || *req.FixedW > 32767) {
+		return fmt.Errorf("fixed_W %d outside SignedPerCent's int16 wire domain [-32768,32767]", *req.FixedW)
+	}
+	return nil
+}
+
 // percentFromHundredths wraps a raw hundredths-of-a-percent value directly
 // into a PerCent (opModMaxLimW's real wire type, IW13-001) — no multiplier
 // scaling: PerCent carries none at all, unlike ActivePower. nil passes
-// through.
+// through. Domain is enforced by percentDomainErr at the handler boundary.
 func percentFromHundredths(v *int64) *model.PerCent {
 	if v == nil {
 		return nil
 	}
-	return &model.PerCent{Value: int16(*v)}
+	return &model.PerCent{Value: uint16(*v)}
 }
 
 // signedPercentFromHundredths is percentFromHundredths's signed sibling
@@ -1054,6 +1076,10 @@ func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Program < 0 || req.Program > 2 {
 		http.Error(w, "program must be 0, 1, or 2", http.StatusBadRequest)
+		return
+	}
+	if err := percentDomainErr(req.Base); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 

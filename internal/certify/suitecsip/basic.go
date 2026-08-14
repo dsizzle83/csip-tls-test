@@ -33,6 +33,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -118,28 +120,105 @@ type controlMode struct {
 	// OWN southbound registers through internal/invariant — which shares
 	// only the SunSpec register-offset tables with the product and none of
 	// the CSIP/derbase interpretation (that package's own doc) — and reports
-	// whether the DER's own account matches what THIS row commanded. Called
-	// during Setup (the one phase with live network access); criterion.Wire
-	// evaluators run later against the recovered pcap transcript and have no
-	// live context of their own, so the Finding is computed here and carried
-	// into the citation phase via Observation.Params, the same mechanism an
-	// mRID or other live-phase fact already uses.
+	// whether the DER's own account matches what THIS row commanded. Read
+	// twice from the live phase (Setup, before the control is published, and
+	// PostWait, after the DUT's poll cycle); criterion.Wire evaluators run
+	// later against the recovered pcap transcript and have no live context of
+	// their own, so the Findings are computed live and carried into the
+	// citation phase via Observation.Params, the same mechanism an mRID or
+	// other live-phase fact already uses.
 	//
-	// Populated only for BASIC-010/opModMaxLimW, BASIC-013/opModFixedW, and
-	// BASIC-014/opModTargetW — the three rows §4.3 specifically names. Every
+	// Populated only for BASIC-010/opModMaxLimW and BASIC-013/opModFixedW —
+	// the rows §4.3 names whose axis the product genuinely executes. Every
 	// other BASIC-004..015 row is unaffected: its "the DER's output followed
 	// the control" criterion stays the honest SKIP it always was, because
 	// nothing wires a southbound read for it.
-	Oracle func(ctx context.Context, rc *certify.RunCtx) Finding
+	Oracle *oracleBinding
 }
 
+// oracleBinding is the apparatus an ORACLED inverter-control row carries beyond
+// a plain one: the value it commands, the publisher that takes that value, and
+// the oracle builder that judges that same value.
+//
+// The value is a field rather than a number written twice (IW14-003) for two
+// reasons. The first is that the published control and the oracle that judges it
+// must not be able to disagree about what was commanded — the pre-fix rows wrote
+// 6000 into the ControlRequest and 6000 again into oracleMaxLimW(6000), two
+// literals one edit apart from certifying a value nobody sent. The second is
+// that an oracled row may have to DEPART from the catalog's value at run time:
+// when the DER's registers already hold what the row is about to command, the
+// post-publication comparison proves nothing (a rerun that never re-applied the
+// control reads identical to one that did), so Setup commands a ladder
+// alternate instead — and only a row that carries its value can change it.
+type oracleBinding struct {
+	// Commanded is the catalog's own value for this row, in hundredths of a
+	// percent (6000 = 60.00%).
+	Commanded int64
+	// Ladder is the fixed set of alternates Setup may command instead of
+	// Commanded when the DER already holds Commanded. Deterministic and
+	// ordered: the first entry the DER provably does NOT already hold wins.
+	Ladder []int64
+	// Publish puts this row's DERControl on the wire carrying `hundredths`.
+	Publish func(ctx context.Context, d *Driver, mrid string, hundredths int64) error
+	// Judge builds the oracle that reads the DER's own registers and decides
+	// whether they hold `hundredths`.
+	Judge func(hundredths int64) func(ctx context.Context, rc *certify.RunCtx) Finding
+}
+
+// oracleValueLadder is oracleBinding.Ladder's one definition: 40%, 45%, 50%,
+// 55%, 60% of the DER's own WMax, in the hundredths-of-a-percent unit the wire
+// uses. Every entry is separated from every other by far more than
+// oracleTolerance on any nameplate this bench runs, and the list ENDS on the
+// catalog's own 6000 so a row that needs no alternate and a row that exhausts
+// the ladder both come to rest on the value the catalog states.
+var oracleValueLadder = []int64{4000, 4500, 5000, 5500, 6000}
+
+// alternate picks the first ladder value the DER provably does not already
+// hold, judged by this row's OWN oracle so the comparison is the same one the
+// post-publication read will make (oracleTolerance and all). A decided FAIL from
+// the judge means "the DER does not hold this value by more than the tolerance
+// the post-read will apply" — precisely the property an alternate needs. It
+// returns that finding too, so the caller records the baseline it just proved
+// instead of paying for a second read of the same registers. ok is false when no
+// entry qualifies, which Setup reports rather than papering over.
+func (b *oracleBinding) alternate(ctx context.Context, rc *certify.RunCtx, avoid int64) (int64, Finding, bool) {
+	for _, v := range b.Ladder {
+		if v == avoid {
+			continue
+		}
+		if f := b.Judge(v)(ctx, rc); f.Verdict == certify.Fail {
+			return v, f, true
+		}
+	}
+	return 0, Finding{}, false
+}
+
+// publishable reports whether this bench can put the row's mode on the wire at
+// all — through the plain publisher or, for an oracled row, the value-taking one.
+func (m controlMode) publishable() bool { return m.Publish != nil || m.Oracle != nil }
+
 // oracleVerdictParam/oracleObservedParam/oracleUnavailableParam are the
-// Observation.Params keys a controlMode.Oracle result is carried through —
-// Setup (live) to Criteria (post-hoc), see controlMode.Oracle's doc.
+// Observation.Params keys the POST-publication controlMode.Oracle result is
+// carried through — PostWait (live) to Criteria (post-hoc), see
+// controlMode.Oracle's doc.
+//
+// The oraclePre*/oracleCommanded/oracleNote keys carry what IW14-003 added: the
+// reading taken BEFORE the control was published (without which a post-read that
+// matches is not evidence that anything changed), the value this run actually
+// commanded (which is the catalog's unless the pre-read forced a ladder
+// alternate), and the prose explaining any departure. They are a distinct set of
+// keys, never the post ones reused, so "the oracle must not fire in Setup"
+// (TestInverterControlSpec_OracleFiresPostWaitNotSetup) stays a meaningful
+// assertion about the POST read.
 const (
 	oracleVerdictParam     = "iw13.oracle_verdict"
 	oracleObservedParam    = "iw13.oracle_observed"
 	oracleUnavailableParam = "iw13.oracle_unavailable"
+
+	oraclePreVerdictParam  = "iw14.oracle_pre_verdict"
+	oraclePreObservedParam = "iw14.oracle_pre_observed"
+	oracleCommandedParam   = "iw14.oracle_commanded"
+	oracleNoteParam        = "iw14.oracle_note"
 )
 
 // scalarControlWindow is the [StartOffset, StartOffset+DurationS] window (in
@@ -179,24 +258,47 @@ func scalarMode(element string, apply func(*ControlRequest)) controlMode {
 // scalarModeOracled builds a scalar controlMode for a row whose DER register an
 // independent oracle READS during PostWait (BASIC-010/013) — so its control
 // must stay active across the oracle read (oracleWindow).
-func scalarModeOracled(element string, apply func(*ControlRequest)) controlMode {
-	return scalarModeWindow(element, oracleWindow, apply)
+//
+// Its apply takes the value the row is actually commanding, rather than closing
+// over a literal: the commanded value is decided at run time (see
+// oracleBinding), and the publisher must carry whatever Setup selected.
+func scalarModeOracled(element string, commanded int64, apply func(*ControlRequest, int64)) controlMode {
+	return controlMode{
+		Element: element,
+		Oracle: &oracleBinding{
+			Commanded: commanded,
+			Ladder:    oracleValueLadder,
+			Publish: func(ctx context.Context, d *Driver, mrid string, hundredths int64) error {
+				req := scalarControlRequest(element, mrid, oracleWindow)
+				apply(&req, hundredths)
+				_, err := d.PostControl(ctx, req)
+				return err
+			},
+		},
+	}
 }
 
-// scalarModeWindow is the shared body of scalarMode/scalarModeOracled: the only
-// thing that varies between a fetch-only row and an oracled row is the window.
+// scalarModeWindow is the body of scalarMode: a fetch-only scalar row, whose
+// only variable is the window it publishes with.
 func scalarModeWindow(element string, win scalarControlWindow, apply func(*ControlRequest)) controlMode {
 	return controlMode{
 		Element: element,
 		Publish: func(ctx context.Context, d *Driver, mrid string) error {
-			req := ControlRequest{
-				Program: 0, MRID: mrid, Description: "certify " + element,
-				StartOffset: win.startOffsetS, DurationS: win.durationS,
-			}
+			req := scalarControlRequest(element, mrid, win)
 			apply(&req)
 			_, err := d.PostControl(ctx, req)
 			return err
 		},
+	}
+}
+
+// scalarControlRequest is the one definition of what a scalar inverter-control
+// row publishes, shared by the fetch-only rows and the oracled ones so the two
+// cannot drift apart in anything but the value and the window.
+func scalarControlRequest(element, mrid string, win scalarControlWindow) ControlRequest {
+	return ControlRequest{
+		Program: 0, MRID: mrid, Description: "certify " + element,
+		StartOffset: win.startOffsetS, DurationS: win.durationS,
 	}
 }
 
@@ -221,11 +323,22 @@ func unreachableMode(element, why string) controlMode {
 }
 
 // withOracle attaches an independent southbound register Oracle (IW13-001
-// §4.3) to an already-built controlMode — the combinator BASIC-010/013/014's
+// §4.3) to an already-built oracled controlMode — the combinator BASIC-010/013's
 // rows use so scalarMode's own construction stays untouched for every other
 // row.
-func withOracle(m controlMode, oracle func(ctx context.Context, rc *certify.RunCtx) Finding) controlMode {
-	m.Oracle = oracle
+//
+// It takes the oracle BUILDER, not a built oracle: the value under test is the
+// binding's (see oracleBinding), and an oracle built here against a literal
+// could judge a value the row never published. It panics on a mode that carries
+// no binding, which is a construction error a row cannot recover from and must
+// never reach a campaign — the same posture registerAggregator already takes for
+// a missing scenario.
+func withOracle(m controlMode, judge func(hundredths int64) func(ctx context.Context, rc *certify.RunCtx) Finding) controlMode {
+	if m.Oracle == nil {
+		panic("suitecsip: withOracle on a mode built without scalarModeOracled — there is no commanded " +
+			"value for the oracle to judge")
+	}
+	m.Oracle.Judge = judge
 	return m
 }
 
@@ -248,8 +361,18 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			if m.Unreachable != "" {
 				return "the control mode this row is about cannot be published by this bench: " + m.Unreachable
 			}
-			return fmt.Sprintf("published a DERControl (%s) carrying %s and waited %s for the DUT to "+
+			notes := fmt.Sprintf("published a DERControl (%s) carrying %s and waited %s for the DUT to "+
 				"fetch it", mrid, m.Element, o.Waited.Round(rounding))
+			// An oracled row's verdict can now come from the live phase alone
+			// (spec.Verdict), so its REASON has to be printed somewhere the
+			// citation phase cannot swallow. A run whose capture yielded no
+			// session mints a SkipAssertion for every criterion, this row's
+			// included, and a FAIL whose only explanation lived in that
+			// assertion would read as unexplained (IW14-003).
+			if m.Oracle != nil {
+				notes += "; " + oracleNotes(o)
+			}
+			return notes
 		},
 		Criteria: func(o *Observation) []criterion {
 			crits := []criterion{critDiscoveryRoot(), critProgramList(0)}
@@ -273,11 +396,14 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			return crits
 		},
 	}
-	if m.Publish != nil {
+	if m.publishable() {
 		s.RequiresGridSim = true
 		s.Setup = func(ctx context.Context, d *Driver, params map[string]string) error {
 			params["mrid"] = mrid
-			return m.Publish(ctx, d, mrid)
+			if m.Oracle == nil {
+				return m.Publish(ctx, d, mrid)
+			}
+			return oracledSetup(ctx, d, params, m.Oracle, mrid)
 		}
 		// PostWait, NOT Setup, is where the independent southbound oracle
 		// (IW13-005) fires. check.go's run() orders the live phase Setup ->
@@ -295,13 +421,18 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 		// its own DUT-state read.
 		if m.Oracle != nil {
 			s.PostWait = func(ctx context.Context, d *Driver, params map[string]string) error {
-				// settleOracle, not a bare m.Oracle call: AwaitWalk returns at
+				// settleOracle, not a bare judge call: AwaitWalk returns at
 				// the START of the DUT's walk, so the control the DUT is
 				// fetching may not have reached the DER's own registers yet
 				// (IW13-005 — see oracleSettleWindow). Poll until it has, or
 				// until the settle deadline turns a persistent mismatch into
 				// the FAIL it deserves.
-				f := settleOracle(ctx, func() Finding { return m.Oracle(ctx, d.rc) })
+				//
+				// The value judged is the one Setup actually COMMANDED, read
+				// back from params — not the catalog's, which Setup may have
+				// departed from when the DER already held it (IW14-003).
+				judge := m.Oracle.Judge(commandedValue(params, m.Oracle))
+				f := settleOracle(ctx, func() Finding { return judge(ctx, d.rc) })
 				switch {
 				case f.Unavailable != "":
 					params[oracleUnavailableParam] = f.Unavailable
@@ -309,38 +440,218 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 					params[oracleVerdictParam] = string(f.Verdict)
 					params[oracleObservedParam] = f.Observed
 				}
-				// The oracle already encodes "could not decide" as its own
-				// Unavailable outcome above; nothing here is fatal to the
-				// check (check.go's PostWait contract: a returned error is
-				// logged and the run continues, exactly like Setup/Change
-				// already treat their own bench-lever failures as evidence
-				// rather than grounds to abandon the run).
+				// Nothing here is fatal to the check (check.go's PostWait
+				// contract: a returned error is logged and the run continues,
+				// exactly like Setup/Change already treat their own bench-lever
+				// failures as evidence rather than grounds to abandon the run).
+				// An oracle that could not decide is no longer waved through
+				// either: oracleOutcome turns every shape it can leave behind —
+				// including this Unavailable — into a decided verdict.
 				return nil
+			}
+			// An oracled row's verdict does not depend on the capture
+			// (IW14-003 — see spec.Verdict). Declared for oracled rows ONLY;
+			// every other row leaves s.Verdict nil and is byte-identical to
+			// what it was.
+			s.Verdict = func(o *Observation) certify.Verdict {
+				if f := oracleOutcome(o); f.Verdict != certify.Pass {
+					return f.Verdict
+				}
+				// A satisfied oracle declares nothing: the wire criteria decide
+				// this row, exactly as they did before. Declaring PASS here
+				// would let a row with NO recovered session pass on the
+				// southbound read alone, which is the opposite mistake.
+				return ""
 			}
 		}
 		s.Cleanup = func(ctx context.Context, d *Driver) {
 			_ = d.ClearControls(ctx, m.Program)
 			_ = d.ClearCurves(ctx, m.Program)
 			// This clears the CSIP-side control/curve, not the DER's own
-			// southbound registers — this bench exposes no lever to reset
-			// those (modsim's /control "reset" only resumes its animation,
-			// sim/modsim/main.go; there is no register-clear endpoint), and
-			// IW13-001 §4.3 does not ask for one. The risk this leaves is
-			// bounded, not ignored: PostWait's oracle compares the DER's
-			// registers against THIS row's own commanded value, so a stale
-			// register left over from an earlier row reads as a MISMATCH —
-			// a FAIL, not a false PASS — unless the stale value happens to
-			// equal what THIS row is about to command. BASIC-010
-			// (WMaxLimPct) and BASIC-013 (WSet/WSetPct) are the only two
-			// oracled rows and command different registers, so neither can
-			// leave the other a false PASS; the remaining exposure is a row
-			// false-passing against its OWN prior run's identical value on a
-			// re-run that never actually re-applied the control, which a
-			// register-clear lever would close but which this design does
-			// not add (a heavier reset path than IW13-001 §4.3 specifies).
+			// southbound registers — this bench still exposes no lever to
+			// reset those (modsim's /control takes pause/resume/reset, and
+			// its "reset" only resumes the animation, sim/modsim/main.go;
+			// /registers is GET-only; /inject writes the M123 WMaxLimPct the
+			// oracle does not read). The old note here called the residual
+			// risk "bounded, not ignored" and left it there: a row could
+			// false-PASS against its OWN prior run's identical value on a
+			// rerun that never re-applied the control. That reasoning is
+			// retired (IW14-003). A stale register is no longer waved through
+			// with prose, because the row no longer depends on Cleanup to
+			// have cleared anything:
+			//
+			//   - Setup READS the DER before it publishes (oracledSetup) and
+			//     records that reading. The post-publication read is evidence
+			//     only against that baseline — a TRANSITION — never on its own.
+			//   - When the baseline already satisfies the value this row was
+			//     about to command, the row commands a ladder alternate the
+			//     DER provably does not hold (oracleBinding.alternate), so the
+			//     post-read has something to move TO.
+			//   - When neither holds — no baseline, or no alternate available
+			//     — oracleOutcome says so in a decided verdict naming both
+			//     readings, rather than reporting a PASS it cannot support.
+			//
+			// A register-clear lever would still be the cleaner instrument and
+			// is still not in this suite's gift to add; what changed is that
+			// its absence can no longer manufacture a PASS.
 		}
 	}
 	return s
+}
+
+// oracledSetup is the ORACLED rows' Setup (BASIC-010/013): read the DER's own
+// registers BEFORE publishing anything, decide which value this run can actually
+// prove something with, then publish THAT value.
+//
+// The pre-read is what makes the post-read evidence (IW14-003). "The DER holds
+// 60% of its WMax after the control was published" is a fact about the DER, not
+// about the DUT, until it is paired with "and it did not hold 60% before": a
+// rerun against registers a previous run left behind reads exactly like a run in
+// which the DUT genuinely fetched and applied the control, and this bench has no
+// register-clear lever to tell the two apart (see the Cleanup note above). So
+// the row establishes its own baseline, and where the baseline would make the
+// comparison vacuous it commands something else.
+func oracledSetup(ctx context.Context, d *Driver, params map[string]string, b *oracleBinding, mrid string) error {
+	want := b.Commanded
+	pre := b.Judge(want)(ctx, d.rc)
+	if pre.Verdict == certify.Pass {
+		// The DER ALREADY holds what the catalog asks this row to command, so
+		// a post-publication match would be satisfied by the DUT doing nothing
+		// at all. Command a value it demonstrably does not hold instead.
+		if alt, altPre, ok := b.alternate(ctx, d.rc, want); ok {
+			params[oracleNoteParam] = fmt.Sprintf("the DER's own registers ALREADY held the catalog's "+
+				"commanded %s before this row published anything, which would have made the "+
+				"post-publication reading no evidence at all; this row therefore commanded %s instead "+
+				"— the first ladder alternate the DER provably did not hold — and judges THAT value. "+
+				"The departure from the catalog's stated value is deliberate: it is what makes this "+
+				"row's PASS mean 'the DUT moved the DER', not 'the DER was already there'",
+				pctString(want), pctString(alt))
+			want, pre = alt, altPre
+		} else {
+			params[oracleNoteParam] = fmt.Sprintf("the DER already held the catalog's commanded %s AND "+
+				"every alternate on the ladder (%s) was either unreadable or already held, so no value "+
+				"exists this run could have commanded and then observed the DER MOVE to. The row "+
+				"published the catalog's value anyway (the wire criteria are still worth collecting), "+
+				"but its southbound reading cannot be evidence of anything and is reported as such",
+				pctString(want), pctList(b.Ladder))
+		}
+	}
+	params[oracleCommandedParam] = strconv.FormatInt(want, 10)
+	params[oraclePreVerdictParam] = string(pre.Verdict)
+	params[oraclePreObservedParam] = findingObserved(pre)
+	return b.Publish(ctx, d, mrid, want)
+}
+
+// commandedValue reads back the value Setup actually commanded, falling back to
+// the catalog's when the param is absent or unparseable — the value the binding
+// would have published if nothing intervened, so a lost param degrades to the
+// pre-IW14-003 behaviour rather than to a judgment of a value nobody sent.
+func commandedValue(params map[string]string, b *oracleBinding) int64 {
+	if v, err := strconv.ParseInt(params[oracleCommandedParam], 10, 64); err == nil {
+		return v
+	}
+	return b.Commanded
+}
+
+// findingObserved renders what a finding SAW, for either shape it can carry.
+func findingObserved(f Finding) string {
+	if f.Unavailable != "" {
+		return "the reading could not be taken: " + f.Unavailable
+	}
+	return f.Observed
+}
+
+// pctString renders a hundredths-of-a-percent wire value the way the rows talk
+// about it; pctList does the same for the ladder.
+func pctString(hundredths int64) string { return fmt.Sprintf("%.2f%%", float64(hundredths)/100) }
+
+func pctList(hundredths []int64) string {
+	parts := make([]string, 0, len(hundredths))
+	for _, v := range hundredths {
+		parts = append(parts, pctString(v))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// oracleOutcome collapses everything the live phase recorded about an oracled
+// row into ONE decided verdict. It is the single definition both the criterion
+// (critDEREffectViaSouthboundOracle) and the case verdict (spec.Verdict) read,
+// so a bundle can never show the two disagreeing.
+//
+// Every branch decides. Before IW14-003 two of them did not: an oracle that
+// could not reach the DER became the criterion's Skip, and a params map with
+// neither key set produced Finding{Verdict: ""}. Both were structurally
+// incapable of denting the case verdict — Skip is the LOWEST severity there is
+// (bundle.Verdict.Severity) and every roll-up in the runner raises only — so the
+// only check that can catch a southbound units or actuation bug could be
+// silenced by the bench being misconfigured, which is exactly the failure mode
+// the a78887f campaign's two-hour run hit. "We could not test it" must never
+// read like "it passed": unavailability is a bench fact to FIX, not a criterion
+// a release is allowed to skip past.
+func oracleOutcome(o *Observation) Finding {
+	post := o.Params[oracleObservedParam]
+	pre := o.Params[oraclePreObservedParam]
+	preVerdict := certify.Verdict(o.Params[oraclePreVerdictParam])
+
+	if reason := o.Params[oracleUnavailableParam]; reason != "" {
+		return Finding{Verdict: certify.Fail, Observed: "the independent southbound oracle could not read " +
+			"the DER at all: " + reason + " — and an oracle that cannot read the DER cannot certify that " +
+			"the commanded control took effect. This row FAILs on that unavailability rather than skipping " +
+			"past it: the southbound read is the ONLY check in this suite that can catch a units or " +
+			"actuation defect the DUT's own self-report would repeat back to us"}
+	}
+	switch verdict := certify.Verdict(o.Params[oracleVerdictParam]); {
+	case verdict == "":
+		return Finding{Verdict: certify.Fail, Observed: "the live phase left no southbound oracle result " +
+			"behind at all — neither a verdict (" + oracleVerdictParam + ") nor a reason it could not " +
+			"reach one (" + oracleUnavailableParam + ") is recorded, so the oracle either never ran or " +
+			"its result was lost. An unrecorded criterion is not a satisfied one"}
+	case verdict != certify.Pass:
+		if post == "" {
+			post = "the oracle recorded no observation with its " + string(verdict)
+		}
+		return Finding{Verdict: verdict, Observed: post}
+	}
+	// The post-publication read matched. On its own that is a fact about the
+	// DER; it becomes a fact about the DUT only against the baseline Setup took.
+	switch preVerdict {
+	case certify.Fail:
+		return Finding{Verdict: certify.Pass, Observed: "the DER did NOT hold the commanded value before " +
+			"this row published its control (" + pre + ") and DOES hold it after the DUT's poll cycle (" +
+			post + ") — the reading MOVED, so the match is evidence this control was applied, not a " +
+			"register an earlier run left behind"}
+	case certify.Pass:
+		return Finding{Verdict: certify.Fail, Observed: "the DER holds the commanded value (" + post +
+			") but ALREADY held it before this row published anything (" + pre + "), and no ladder " +
+			"alternate it did not already hold was available to command instead. Nothing in this reading " +
+			"distinguishes a control the DUT fetched and applied from a stale register left over from an " +
+			"earlier run, so it is not reported as a PASS"}
+	default:
+		return Finding{Verdict: certify.Warn, Observed: "the DER holds the commanded value (" + post +
+			"), but the pre-publication baseline was not recovered (" + orText(pre, "no reading was "+
+			"recorded") + "), so this run cannot show that the reading MOVED. The value is right; that " +
+			"it was THIS row's control that put it there is not established"}
+	}
+}
+
+// orText is the fallback for a prose field the live phase may not have filled.
+func orText(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
+}
+
+// oracleNotes renders the oracled row's southbound half for the bundle's own
+// prose line, so the reason for its verdict is printed on the case whether or
+// not the citation phase recovered a session to hang an assertion on.
+func oracleNotes(o *Observation) string {
+	f := oracleOutcome(o)
+	notes := "independent southbound oracle: " + string(f.Verdict) + " — " + f.Observed
+	if n := o.Params[oracleNoteParam]; n != "" {
+		notes += "; " + n
+	}
+	return notes
 }
 
 // critDEREffectUnobservable is the honest record of the half of every inverter
@@ -357,31 +668,36 @@ func critDEREffectUnobservable(subject string) criterion {
 }
 
 // critDEREffectViaSouthboundOracle is critDEREffectUnobservable's replacement
-// for BASIC-010/013/014 (IW13-001 §4.3): the Finding was already computed
-// live, during Setup, by controlMode.Oracle — reading the DER's own raw
-// 704 register image through internal/invariant, independently of anything
-// csipmodel/derbase decoded. This criterion's Wire evaluator does not touch
-// the recovered pcap transcript at all; it reports the pre-computed verdict
-// carried through Observation.Params. Unlike critDEREffectUnobservable, this
-// criterion is a REAL PASS/FAIL: a units bug in the shared decode path can no
-// longer self-certify by having the only check that would catch it always
-// SKIP.
+// for BASIC-010/013 (IW13-001 §4.3): the Findings were already computed live —
+// once before the control was published and once after the DUT's poll cycle —
+// by controlMode.Oracle, reading the DER's own raw 704 register image through
+// internal/invariant, independently of anything csipmodel/derbase decoded. This
+// criterion's Wire evaluator does not touch the recovered pcap transcript at
+// all; it reports the verdict oracleOutcome derives from what those reads left
+// in Observation.Params. Unlike critDEREffectUnobservable, this criterion is a
+// REAL PASS/FAIL: a units bug in the shared decode path can no longer
+// self-certify by having the only check that would catch it always SKIP.
+//
+// It carries NO Skip path (IW14-003). Every shape the live phase can leave
+// behind — an unreachable oracle, an empty params map, a post-read that matches
+// a register that already matched — comes back from oracleOutcome as a decided
+// verdict, because a Skip here cannot dent the case verdict and so cannot hold a
+// release. Its Tier says where the answer came from: the DER's own registers,
+// read live, NOT the "cleartext TLS handshake in the capture" every other Wire
+// criterion is stamped with and this one was mislabelled as.
 func critDEREffectViaSouthboundOracle(subject string, o *Observation) criterion {
 	claim := "the DER's own southbound registers hold the value " + subject + " commanded"
 	how := "an independent read of the DER's raw SunSpec 704 image (internal/invariant, which shares only " +
-		"the register-offset tables with the product and none of its CSIP/derbase interpretation), compared " +
-		"against the value this row itself commanded — not against what the DUT reports the DER received"
-	if reason, ok := o.Params[oracleUnavailableParam]; ok && reason != "" {
-		return criterion{Claim: claim, How: how, Skip: "the independent southbound oracle could not reach a " +
-			"verdict: " + reason}
-	}
-	verdict := certify.Verdict(o.Params[oracleVerdictParam])
-	observed := o.Params[oracleObservedParam]
+		"the register-offset tables with the product and none of its CSIP/derbase interpretation), taken " +
+		"BEFORE this row published its control and again after the DUT's poll cycle, and compared against " +
+		"the value this row itself commanded — not against what the DUT reports the DER received"
+	f := oracleOutcome(o)
 	return criterion{
 		Claim: claim,
 		How:   how,
+		Tier:  tierOracle,
 		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
-			return Finding{Verdict: verdict, Observed: observed}
+			return f
 		},
 	}
 }
@@ -438,14 +754,21 @@ func oracleUnitView(ctx context.Context, rc *certify.RunCtx, simName string) (in
 // that applies the commanded ceiling correctly a second later.
 //
 // So the PostWait oracle POLLS: it re-reads the DER until the effect matches
-// (Pass) or the settle window elapses, returning the last decided verdict at
-// the deadline. A genuine, persistent mismatch (wrong register, wrong value)
-// never reaches Pass and still FAILs at the deadline with the value it read;
-// the oracled control's active window (oracleWindow) is far longer than this
-// settle, so nothing the poll observes is the control expiring. Only a decided
-// FAIL is retried — a Pass is returned at once, and an Unavailable (the DER
-// could not be reached at all) is not a propagation delay, so it returns at
-// once too rather than burning the window.
+// (Pass) or the settle window elapses, returning the LAST finding at the
+// deadline. A genuine, persistent mismatch (wrong register, wrong value) never
+// reaches Pass and still FAILs at the deadline with the value it read; the
+// oracled control's active window (oracleWindow) is far longer than this settle,
+// so nothing the poll observes is the control expiring.
+//
+// Only a Pass short-circuits. Everything else is retried, INCLUDING an
+// Unavailable (IW14-003): "the DER reports no enabled WSet/WSetPct in its own
+// 704 image" is not a fact about reachability at all, it is the not-yet-enabled
+// shape — precisely the mid-propagation state this poll exists to wait out — and
+// returning it at once meant the one shape most in need of the window was the
+// one shape that never got it. A transport-level Unavailable (the sidecar is
+// down) now costs the full window before it is reported, which is 15s per
+// oracled row on a bench that is already broken, and buys correctness on the
+// bench that is merely slow.
 const (
 	oracleSettleWindow = 15 * time.Second
 	oracleSettleStep   = 1 * time.Second
@@ -459,11 +782,14 @@ func settleOracle(ctx context.Context, eval func() Finding) Finding {
 
 // settleOracleWindow is settleOracle's parameterized core, split out so a test
 // can drive the deadline path in milliseconds instead of the production window.
+// A Pass returns at once; every other outcome — a decided Fail and an
+// Unavailable alike — is retried until the deadline, which then returns the last
+// finding taken (see oracleSettleWindow for why Unavailable belongs in that set).
 func settleOracleWindow(ctx context.Context, window, step time.Duration, eval func() Finding) Finding {
 	deadline := time.Now().Add(window)
 	for {
 		f := eval()
-		if f.Verdict == certify.Pass || f.Unavailable != "" || !time.Now().Before(deadline) {
+		if f.Verdict == certify.Pass || !time.Now().Before(deadline) {
 			return f
 		}
 		select {
@@ -532,8 +858,54 @@ func oracleMaxLimW(wantHundredths int64) func(ctx context.Context, rc *certify.R
 			}
 			return Finding{Verdict: certify.Fail, Observed: observed}
 		}
-		return unavailable("the DER reports no enabled WMaxLimPct in its own 704 image")
+		return noEnabledAxis("WMaxLimPct", wantPct, base.Q.Val, wantW, uv)
 	}
+}
+
+// noEnabledAxis is the terminal both effect-based oracles reach when the DER's
+// own 704 image carries no ENABLED command on the axis the row commanded.
+//
+// It is a decided FAIL, not an Unavailable (IW14-003). "No enabled WMaxLimPct"
+// is a statement about what the DER holds — the same class of statement as "it
+// holds the wrong value" — and the row's whole claim is that the commanded
+// control reached the DER's registers. Reporting it as Unavailable made the
+// commonest real failure (the DUT never actuated the axis at all) indistinguish-
+// able from the bench being unplugged, and routed it into a criterion Skip that
+// could not affect the verdict. Because it is now a decided non-Pass, the settle
+// poll also RETRIES it, which is what the not-yet-enabled shape needed all along:
+// a DER mid-propagation reports exactly this until the write lands.
+func noEnabledAxis(axis string, wantPct, wmax, wantW float64, uv invariant.UnitView) Finding {
+	return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+		"the DER reports NO enabled %s in its own 704 image, so nothing there holds the commanded "+
+			"%.2f%% of its own %.1f W WMax (= %.1f W); its 704 setpoints read: %s",
+		axis, wantPct, wmax, wantW, commandSummary(uv))}
+}
+
+// commandSummary renders what the DER's own 704 image actually held, so a FAIL
+// on a missing axis names the registers it read instead of only the one it
+// wanted.
+func commandSummary(uv invariant.UnitView) string {
+	cmds := uv.Commands(oracleSimName)
+	if len(cmds) == 0 {
+		return "no commanded setpoints at all"
+	}
+	parts := make([]string, 0, len(cmds))
+	for _, c := range cmds {
+		state := "disabled"
+		if c.Enabled {
+			state = "enabled"
+		}
+		switch {
+		case c.Physical.Known():
+			parts = append(parts, fmt.Sprintf("%s=%s (%s)", c.Point, c.Physical, state))
+		case c.Unresolved != "":
+			parts = append(parts, fmt.Sprintf("%s=%s raw, unresolved: %s (%s)", c.Point, c.Raw, c.Unresolved, state))
+		default:
+			parts = append(parts, fmt.Sprintf("%s=%s raw (%s)", c.Point, c.Raw, state))
+		}
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ", ")
 }
 
 // oracleFixedW builds a BASIC-013 (opModFixedW) Oracle: the DER's own
@@ -576,7 +948,7 @@ func oracleFixedW(wantHundredths int64) func(ctx context.Context, rc *certify.Ru
 			}
 			return Finding{Verdict: certify.Fail, Observed: observed}
 		}
-		return unavailable("the DER reports no enabled WSet/WSetPct in its own 704 image")
+		return noEnabledAxis("WSet/WSetPct", wantPct, base.Q.Val, wantW, uv)
 	}
 }
 

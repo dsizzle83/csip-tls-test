@@ -273,9 +273,15 @@ func registerInverterControls(reg *certify.Registry) {
 			r.Connect = ptr(false)
 			r.Energize = ptr(false)
 		}), "a connect/disconnect command"},
-		{"BASIC-010", 56, withOracle(scalarModeOracled("opModMaxLimW", func(r *ControlRequest) {
-			r.MaxLimW = ptr(int64(6000))
-		}), oracleMaxLimW(6000)), "a maximum active power limit"},
+		// The commanded value is written ONCE, in scalarModeOracled, and the
+		// oracle builder is handed to withOracle unapplied (IW14-003): the
+		// published control and the oracle that judges it read the same number,
+		// and the row can depart from it at run time when the DER already holds
+		// it (see oracleBinding).
+		{"BASIC-010", 56, withOracle(scalarModeOracled("opModMaxLimW", 6000,
+			func(r *ControlRequest, hundredths int64) {
+				r.MaxLimW = ptr(hundredths)
+			}), oracleMaxLimW), "a maximum active power limit"},
 		{"BASIC-011", 57, curveMode("opModVoltWatt", "volt_watt",
 			[]CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}}, 3), "a Volt-Watt curve"},
 		{"BASIC-012", 58, curveMode("opModFreqWatt", "freq_watt",
@@ -287,9 +293,10 @@ func registerInverterControls(reg *certify.Registry) {
 		// hundredths of a percent (5000 = 50%), so the test value 6000 = 60%
 		// of max power"). The pre-fix FixedW=50 sent a value two orders of
 		// magnitude off the catalog's own stated test value.
-		{"BASIC-013", 59, withOracle(scalarModeOracled("opModFixedW", func(r *ControlRequest) {
-			r.FixedW = ptr(int64(6000))
-		}), oracleFixedW(6000)), "a set-active-power command expressed as a percentage of maximum"},
+		{"BASIC-013", 59, withOracle(scalarModeOracled("opModFixedW", 6000,
+			func(r *ControlRequest, hundredths int64) {
+				r.FixedW = ptr(hundredths)
+			}), oracleFixedW), "a set-active-power command expressed as a percentage of maximum"},
 		// BASIC-014 is opModTargetW (genuine nested ActivePower, watts — §1.1,
 		// already correct) — NOT opModFixedW, which the pre-fix row rode
 		// because ControlRequest/adminCtrlReq had no TargetW lever at all
@@ -327,7 +334,7 @@ func registerInverterControls(reg *certify.Registry) {
 }
 
 func requiresFor(m controlMode) []string {
-	if m.Publish == nil {
+	if !m.publishable() {
 		return needCapture
 	}
 	return needGridSim

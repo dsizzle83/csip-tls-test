@@ -218,6 +218,39 @@ func TestOracleFixedW_SignedNegativeChargePassOnConformantRegister(t *testing.T)
 	}
 }
 
+// TestOracleFixedW_NoEnabledAxisIsAFail pins IW14-003's re-classification of the
+// oracles' last terminal: a DER whose own 704 image carries NO enabled setpoint
+// on the commanded axis is a decided FAIL, not an Unavailable.
+//
+// The distinction is the whole finding. "No enabled WSet/WSetPct" is a statement
+// about what the DER holds — the same class as "it holds the wrong value" — and
+// it is the commonest real failure there is: the DUT never actuated the axis at
+// all. Reported as Unavailable it became a criterion SKIP that could not dent a
+// verdict, AND it was excluded from the settle poll's retry, so the one reading
+// that most needs the propagation window was the one reading that never got it.
+func TestOracleFixedW_NoEnabledAxisIsAFail(t *testing.T) {
+	dev, _ := oracleFixture(t) // nothing applied: no enabled setpoint on any axis
+	rc := oracleTestRunCtx(t, dev)
+	f := oracleFixedW(6000)(context.Background(), rc)
+	if f.Unavailable != "" {
+		t.Fatalf("oracleFixedW against a DER with no enabled setpoint = Unavailable(%q); an empty axis is a "+
+			"finding about the DER, not an unavailability of the bench", f.Unavailable)
+	}
+	if f.Verdict != certify.Fail {
+		t.Fatalf("oracleFixedW against a DER with no enabled setpoint = %+v, want Fail", f)
+	}
+	for _, want := range []string{"NO enabled", "WSet/WSetPct", "60.00%"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the FAIL does not mention %q, so a reader cannot tell what was looked for and what "+
+				"was found: %q", want, f.Observed)
+		}
+	}
+	// The same terminal on the ceiling axis, so neither oracle can drift back.
+	if g := oracleMaxLimW(6000)(context.Background(), rc); g.Verdict != certify.Fail || g.Unavailable != "" {
+		t.Fatalf("oracleMaxLimW against a DER with no enabled WMaxLimPct = %+v, want a decided Fail", g)
+	}
+}
+
 // TestOracleFixedW_FailOnMismatchedCommand is oracleMaxLimW's discrimination
 // proof, mirrored for the setpoint axis.
 func TestOracleFixedW_FailOnMismatchedCommand(t *testing.T) {

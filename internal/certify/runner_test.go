@@ -868,6 +868,51 @@ func TestFinaliseRecordsAReconciledVerdict(t *testing.T) {
 	}
 }
 
+// TestDeclaredLiveFailSurvivesACitationPhaseOfPasses pins the guarantee the CSIP
+// suite's southbound oracle now rests on (IW14-003, suitecsip spec.Verdict): a
+// verdict a check DECLARES from the live phase is stricter-only. The citation
+// phase can raise it and can never lower it, however many PASSes it mints.
+//
+// Without that, a check whose evidence is not in the capture at all — a read of
+// the DER's own registers, taken live — has no way to hold a release: its
+// criterion becomes a SkipAssertion whenever no session is recovered, and SKIP
+// is severity 0 against every roll-up in this file.
+func TestDeclaredLiveFailSurvivesACitationPhaseOfPasses(t *testing.T) {
+	out := Result{
+		Verdict: Fail,
+		Notes:   "the independent southbound oracle could not read the DER at all",
+		Assertions: []Assertion{
+			{Claim: "the DUT fetched the DERControl", Verdict: Pass, Observed: "GET /derp/0/derc"},
+		},
+	}
+	if got := out.rollUp(); got != Fail {
+		t.Fatalf("rollUp of a declared FAIL alongside a PASS assertion = %s, want FAIL", got)
+	}
+
+	cat := loadTestCatalog(t)
+	c, _ := cat.ByUID("doc-a::A-001")
+	r := &Runner{opts: DefaultOptions()}
+	rep := &RunReport{Cases: []CaseResult{{
+		Case: c, Suite: "s", Executed: true,
+		Verdict: out.rollUp(), LiveVerdict: out.rollUp(), Notes: out.Notes,
+		Assertions: []Assertion{
+			{Claim: "the DUT fetched the DERControl", Verdict: Pass, Observed: "GET /derp/0/derc"},
+			{Claim: "the discovery root is conformant", Verdict: Pass, Observed: "GET /dcap"},
+			{Claim: "the DER's own registers hold the commanded value", Verdict: Skip,
+				Observed: "no session was recovered from this capture"},
+		},
+	}}}
+	r.finalise(rep)
+
+	if got := rep.Cases[0].Verdict; got != Fail {
+		t.Fatalf("after a citation phase of PASSes and one SKIP, verdict = %s, want the declared FAIL to "+
+			"stand: a live finding the capture cannot re-derive is still a finding", got)
+	}
+	if rep.Cases[0].Reconciled != "" {
+		t.Errorf("a verdict that never moved carries a reconciliation note: %q", rep.Cases[0].Reconciled)
+	}
+}
+
 // TestBundleAndReportBucketAnInapplicableCase closes the loop the bucketing
 // defect ran through: the catalog's `applicable` flag has to reach the per-case
 // bundle record AND the REPORT.md an assessor reads. It reached the record and

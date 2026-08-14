@@ -236,3 +236,43 @@ func TestAdminResponses_ExposesAllLifecycleAcks(t *testing.T) {
 		t.Errorf("/admin/alerts = %+v, want only the CannotComply", alerts)
 	}
 }
+
+// IW14 adversarial finding 4: an out-of-domain admin percent must be a 400,
+// never a silent uint16/int16 wraparound onto the wire (max_lim_W:-100 would
+// otherwise become 65436 — a control the operator never authored, recorded in
+// the pcap as if they had). In-domain-but-over-product-range values remain
+// accepted: sending 20000 (200%) to a DUT is a legitimate rejection test.
+func TestAdminControl_PercentDomainRejected(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	post := func(path, body string) int {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", path, bytes.NewReader([]byte(body))))
+		return rec.Code
+	}
+
+	seeded := len(derc0(t, s).DERControl) // NewServer pre-seeds baseline controls
+
+	for _, tc := range []struct {
+		name, path, body string
+		want             int
+	}{
+		{"negative max_lim_W wraps — reject", "/admin/control", `{"program":0,"max_lim_W":-100,"duration_s":60}`, http.StatusBadRequest},
+		{"max_lim_W above uint16 wraps — reject", "/admin/control", `{"program":0,"max_lim_W":100000,"duration_s":60}`, http.StatusBadRequest},
+		{"fixed_W below int16 wraps — reject", "/admin/control", `{"program":0,"fixed_W":-40000,"duration_s":60}`, http.StatusBadRequest},
+		{"fixed_W above int16 wraps — reject", "/admin/control", `{"program":0,"fixed_W":40000,"duration_s":60}`, http.StatusBadRequest},
+		{"in-domain over product range — accepted", "/admin/control", `{"program":0,"max_lim_W":20000,"duration_s":60}`, http.StatusCreated},
+		{"default control gets the same screen", "/admin/default", `{"program":0,"base":{"max_lim_W":-1}}`, http.StatusBadRequest},
+	} {
+		if got := post(tc.path, tc.body); got != tc.want {
+			t.Fatalf("%s: POST %s %s = %d, want %d", tc.name, tc.path, tc.body, got, tc.want)
+		}
+	}
+
+	// The rejected controls must not have landed: exactly one added.
+	if list := derc0(t, s); len(list.DERControl) != seeded+1 {
+		t.Fatalf("derc grew from %d to %d controls, want exactly the one accepted (20000)", seeded, len(list.DERControl))
+	}
+}

@@ -80,7 +80,9 @@ const (
 	tierHandshake  tier = "cleartext TLS handshake in the capture"
 	tierTranscript tier = "decrypted HTTP/2030.5 transcript from the capture (NSS key log)"
 	tierServer     tier = "gridsim server-side observation (admin API)"
-	tierNone       tier = "not observed"
+	tierOracle     tier = "independent live read of the DER's own SunSpec registers (simapi sidecar), " +
+		"taken during the run and carried into this phase"
+	tierNone tier = "not observed"
 )
 
 // criterion is one pass criterion of a catalog row.
@@ -106,6 +108,19 @@ type criterion struct {
 	// payload, so it is skipped with the decryption reason rather than being
 	// called against a Transcript that has no exchanges.
 	NeedsTranscript bool
+
+	// Tier overrides the evidence tier stamped on this criterion's Method when
+	// its Wire evaluator decides. The default (empty) keeps the existing
+	// derivation — tierHandshake, or tierTranscript when NeedsTranscript — which
+	// is right for every criterion that genuinely reads the capture.
+	//
+	// It exists because ONE criterion does not: critDEREffectViaSouthboundOracle
+	// reports a verdict computed LIVE from the DER's own registers and carried
+	// here through Observation.Params, touching no frame at all. Printing
+	// "cleartext TLS handshake in the capture" over that verdict told a bundle
+	// reader the capture backed a fact the capture never saw (IW14-003). A
+	// criterion that says where its answer came from must be able to say it.
+	Tier tier
 
 	// Server is the tier-3 evaluator, called when Wire was unavailable.
 	Server func(v *ServerView) Finding
@@ -141,6 +156,9 @@ func (c criterion) assert(ev *certify.Evidence, obs *Observation) (certify.Asser
 				t := tierHandshake
 				if c.NeedsTranscript {
 					t = tierTranscript
+				}
+				if c.Tier != "" {
+					t = c.Tier
 				}
 				return c.cite(ev, t, f)
 			}

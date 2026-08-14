@@ -38,7 +38,7 @@ func spc(v int16) *model.SignedPerCent { return &model.SignedPerCent{Value: v} }
 
 // pct builds a PerCent from a raw hundredths-of-a-percent value — opModMaxLimW's
 // real wire type (IW13-001). v=6000 means 60.00%.
-func pct(v int16) *model.PerCent { return &model.PerCent{Value: v} }
+func pct(v uint16) *model.PerCent { return &model.PerCent{Value: v} }
 
 func fixedVar(refType uint8, hundredthsPct int16) *model.FixedVar {
 	return &model.FixedVar{RefType: refType, Value: model.SignedPerCent{Value: hundredthsPct}}

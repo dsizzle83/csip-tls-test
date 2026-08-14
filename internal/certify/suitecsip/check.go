@@ -341,6 +341,24 @@ type spec struct {
 	// Criteria are the pass criteria, evaluated in the citation phase.
 	Criteria func(o *Observation) []criterion
 
+	// Verdict, when non-nil, declares the case's LIVE verdict from the
+	// observation the live phase built, independently of anything the citation
+	// phase can recover from the capture. An empty return declares nothing and
+	// leaves the verdict entirely to the criteria, which is what every spec
+	// without one already does.
+	//
+	// It exists because a criterion is not a verdict route (IW14-003). The
+	// citation phase can only assert what it can hang on a recovered session:
+	// criterion.assert reaches its Wire evaluator only when RecoverSession
+	// produced a Transcript, so a criterion carrying a DECIDED live finding —
+	// the southbound oracle's FAIL — silently became a SkipAssertion in any run
+	// whose capture yielded no session, and a SKIP cannot dent a case verdict
+	// (Result.rollUp and worstOf are raise-only). The one thing that survives a
+	// missing capture is the declared Result.Verdict, which registry.go
+	// documents as stricter-only, so a live FAIL declared here can be raised by
+	// the citation phase and never lowered by it.
+	Verdict func(o *Observation) certify.Verdict
+
 	// Notes renders the test case's prose line in the bundle.
 	Notes func(o *Observation) string
 
@@ -476,8 +494,18 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 		notes += "poll-cycle window: " + waitWhy
 	}
 
+	// A spec that can decide something from the live phase alone says so here,
+	// before the capture is ever opened — see spec.Verdict. A nil Verdict (every
+	// spec but the oracled inverter-control rows) leaves this empty, which is
+	// exactly what this function returned before.
+	var declared certify.Verdict
+	if s.Verdict != nil {
+		declared = s.Verdict(obs)
+	}
+
 	return certify.Result{
-		Notes: notes,
+		Verdict: declared,
+		Notes:   notes,
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			t, rerr := RecoverSession(ev, target)
 			if rerr != nil {

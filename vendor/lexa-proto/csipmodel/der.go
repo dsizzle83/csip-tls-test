@@ -225,11 +225,14 @@ type ExtendedDERControlBase struct {
 	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"`
 	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`  // SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
 	OpModMaxLimW        *PerCent       `xml:"opModMaxLimW,omitempty"` // PerCent of setMaxW, not watts — IW13-001.
-	// UNVERIFIED against XSD — believed watts; confirm before any conformance
-	// claim (IW13-001 Phase-0). See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
-	OpModExpLimW *ActivePower `xml:"opModExpLimW,omitempty"`
-	// UNVERIFIED against XSD — believed watts; confirm before any conformance
-	// claim (IW13-001 Phase-0). See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
+	// ExpLimW/GenLimW/ImpLimW/LoadLimW are NOT IEEE 2030.5 core elements:
+	// verified ABSENT from sep.xsd 2.0.4 on 2026-08-13 (IW14 review — this
+	// supersedes the earlier "no XSD on this machine" caveat). They match the
+	// CSIP-Aus dynamic-operating-envelope extension quartet, which types them
+	// ActivePower (watts) as here. The governing extension schema is not in
+	// the local standards corpus — confirm against it before any conformance
+	// claim on these axes. See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
+	OpModExpLimW   *ActivePower   `xml:"opModExpLimW,omitempty"`
 	OpModGenLimW   *ActivePower   `xml:"opModGenLimW,omitempty"`
 	OpModImpLimW   *ActivePower   `xml:"opModImpLimW,omitempty"`
 	OpModLoadLimW  *ActivePower   `xml:"opModLoadLimW,omitempty"`

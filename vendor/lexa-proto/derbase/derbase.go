@@ -471,12 +471,16 @@ func wattsChecked(ap *model.ActivePower, axis string) (float64, error) {
 }
 
 // pctChecked converts a CSIP SignedPerCent/PerCent hundredths value to a
-// percent float, range-checked per the XSD's xs:short domain
+// percent float, range-checked against the product's ≤100.00% rule
 // (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §2.4): signed axes
-// (opModFixedW) to [-10000,10000] hundredths, unsigned axes (opModMaxLimW)
-// to [0,10000]. IW13-001 — opModFixedW/opModMaxLimW are percent, not watts.
-func pctChecked(hundredths int16, axis string, signed bool) (float64, error) {
-	var lo int16
+// (opModFixedW, XSD Int16) to [-10000,10000] hundredths, unsigned axes
+// (opModMaxLimW, XSD UInt16) to [0,10000]. The parameter is int32 so BOTH
+// wire domains widen into it losslessly — narrowing a uint16 to int16 here
+// would silently wrap 32768..65535 into negatives and turn an out-of-range
+// value into an in-range one. IW13-001 — opModFixedW/opModMaxLimW are
+// percent, not watts.
+func pctChecked(hundredths int32, axis string, signed bool) (float64, error) {
+	var lo int32
 	if signed {
 		lo = -10000
 	}
@@ -966,7 +970,7 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		// (§2.1 — WDisChaRteMaxRtg/WChaRteMaxRtg when declared, else WMax
 		// symmetrically) BEFORE the existing watts-domain checks, which are
 		// unchanged from here on.
-		pct, err := pctChecked(ctrl.OpModFixedW.Value, "opModFixedW", true)
+		pct, err := pctChecked(int32(ctrl.OpModFixedW.Value), "opModFixedW", true)
 		if err != nil {
 			return nil, err
 		}
@@ -1441,7 +1445,7 @@ func (b *Base) combineCeilingsW(ctrl model.DERControlBase, tag string) (ceilingB
 		}
 	}
 	if ctrl.OpModMaxLimW != nil {
-		pct, err := pctChecked(ctrl.OpModMaxLimW.Value, "opModMaxLimW", false)
+		pct, err := pctChecked(int32(ctrl.OpModMaxLimW.Value), "opModMaxLimW", false)
 		if err != nil {
 			return ceilingBind{}, false, err
 		}
