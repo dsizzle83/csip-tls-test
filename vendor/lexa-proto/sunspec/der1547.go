@@ -201,6 +201,19 @@ type ACControls struct {
 	WSetMod    uint16
 	WSet       float64 // watts
 	WSetPct    float64 // % of max
+	// WSetStepW is the device's OWN quantization of WSet in watts (10^WSet_SF)
+	// — the smallest change that register can express, which is a fact about
+	// the machine rather than a tolerance anybody chose. 0 means the device
+	// published no usable WSet_SF, which is "the granularity is unknown to the
+	// gateway", never "the granularity is zero".
+	//
+	// It is decoded here because a consumer comparing a COMMANDED setpoint
+	// against this read-back otherwise cannot tell a device that DISAGREES from
+	// one that merely ROUNDED: with WSet_SF=1 (tens of watts, entirely legal) a
+	// commanded 6033.7 W reads back 6030 W forever, and any comparison
+	// tolerance tighter than one step turns that arithmetic into a permanent
+	// divergence and a corrective re-write on every poll.
+	WSetStepW float64
 	VarSetEna  bool
 	VarSetMod  uint16
 	VarSetPri  uint16
@@ -220,10 +233,24 @@ func Parse704(regs []uint16) ACControls {
 		PFWAbsEna: v.Bool("PFWAbsEna"), PFWAbsPF: v.Float("PFWAbs_PF"), PFWAbsExt: e("PFWAbs_Ext"),
 		WMaxLimPctEna: v.Bool("WMaxLimPctEna"), WMaxLimPct: v.Float("WMaxLimPct"),
 		WSetEna: v.Bool("WSetEna"), WSetMod: e("WSetMod"), WSet: v.Float("WSet"), WSetPct: v.Float("WSetPct"),
+		WSetStepW: wsetStepW(v),
 		VarSetEna: v.Bool("VarSetEna"), VarSetMod: e("VarSetMod"), VarSetPri: e("VarSetPri"),
 		VarSet: v.Float("VarSet"), VarSetPct: v.Float("VarSetPct"),
 		WRmp: e("WRmp"), VarRmp: e("VarRmp"), WRmpRef: e("WRmpRef"), AntiIslEna: v.Bool("AntiIslEna"),
 	}
+}
+
+// wsetStepW resolves ACControls.WSetStepW from the block's own WSet_SF. It
+// returns 0 — UNKNOWN — for a device that does not implement the scale factor
+// or publishes one outside the legal sunssf domain, because View.SF already
+// refuses a hostile value (LXR-004) and inventing a step for it would be the
+// same fabrication the NaN guards in this file exist to prevent.
+func wsetStepW(v View) float64 {
+	sf, ok := v.SF("WSet_SF")
+	if !ok {
+		return 0
+	}
+	return math.Pow10(int(sf))
 }
 
 // ── Curve helpers shared by 705/706/712 ──────────────────────────────────────

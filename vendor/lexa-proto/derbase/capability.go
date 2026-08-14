@@ -353,3 +353,77 @@ func outOfDomainRating(axis, point string, v float64) error {
 		"device declares an out-of-domain %s rating (%g); a capability claim that cannot be true "+
 			"is not a bound to relax", point, v)}
 }
+
+// settingOrRatingBound resolves the quantity a percentage-of-capacity control is
+// answered against when 702 publishes BOTH a mutable SETTING and an immutable
+// RATING for the same axis (IW15-002). It is maxRatingBound's settings-aware
+// sibling and delegates to it for the rating half, so the two can never drift.
+//
+// THE SETTING WINS OVER THE RATING when both are published. That is not a
+// preference, it is what the documents say: IEEE 2030.5-2018's DERSettings
+// setMaxW/setMaxChargeRateW/setMaxDischargeRateW each "default to" their rtg*
+// counterpart (sep.xsd 2.0.4, elements 3457/3429/3439), which makes the rating
+// the FALLBACK for an absent setting rather than the reference; and
+// DERControlBase.opModMaxLimW is "a percentage of set capacity (%setMaxW)".
+// A control is answered by the machine AS CONFIGURED — a device an installer
+// derated to 6 kW answers "60 %" with 3.6 kW, not 6 kW. derbase already
+// reasoned exactly this way on the reactive axis (reactiveCapability,
+// varsetmod.go); this is the active-power copy of that rule, and the same
+// second reason applies with more force: this must be the SAME quantity the
+// GATEWAY resolves its percent against (lexa-gw internal/derref implements this
+// identical rule), or a 60 % ceiling computed against one point and written as
+// a percent of another lands as some other number entirely.
+//
+// The four states, in the order they are tested:
+//
+//	setting > 0, <= rating   the setting, named by setPoint. The ordinary path.
+//	setting > 0, > rating    a LIMIT cannot exceed the CAPABILITY it limits: the
+//	                         device is malformed. The rating is used (the
+//	                         fail-safe direction — a smaller reference commands
+//	                         fewer watts) and defect=true says so, for a caller
+//	                         that can journal it.
+//	setting == 0             INCAPACITY, never overridden by the rating. An
+//	                         operator who configured a rate of zero has SAID
+//	                         something; falling back to the rating would overrule
+//	                         a live configuration with a physical capability the
+//	                         machine has been told not to use. Same rule
+//	                         maxRatingBound already applies to a rated zero.
+//	setting absent/garbage   the rating, through maxRatingBound — the sep.xsd
+//	                         default. "Absent" is the not-implemented sentinel
+//	                         (NaN); "garbage" is a non-finite or negative value,
+//	                         which is IGNORED here rather than denied, because
+//	                         unlike a rating a setting has a defined fallback the
+//	                         standard itself names. defect=true reports it.
+//
+// point names whichever input the bound came from, for evidence. ok=false with
+// a nil error is honest unknown (neither published) — no bound, exactly as
+// maxRatingBound's own NaN case.
+func settingOrRatingBound(axis, setPoint string, setting float64, rtgPoint string, rating float64) (w float64, point string, ok bool, defect bool, err error) {
+	switch {
+	case math.IsNaN(setting):
+		// Absent / not implemented / unusable scale factor — fall through to
+		// the rating, which is what sep.xsd says an absent setting defaults to.
+	case math.IsInf(setting, 0) || setting < 0:
+		// An implemented setting that cannot be true. Unlike a garbage RATING
+		// (which denies — see outOfDomainRating), a garbage SETTING has a
+		// standards-named fallback, so it is discarded in favour of the rating
+		// and reported rather than turned into a refusal.
+		defect = true
+	case setting == 0:
+		return 0, setPoint, false, false, &UnsupportedControlError{Axis: axis, Reason: fmt.Sprintf(
+			"device declares the %s SETTING = 0 W: it is configured to perform none of this axis, "+
+				"so its %s rating is not a reference to fall back to", setPoint, rtgPoint)}
+	default:
+		if r, rok, rerr := maxRatingBound(axis, rtgPoint, rating); rerr == nil && rok && setting > r {
+			// A setting above its own rating is a malformed device. Use the
+			// rating (smaller, fail-safe) and say so.
+			return r, rtgPoint, true, true, nil
+		}
+		return setting, setPoint, true, defect, nil
+	}
+	r, rok, rerr := maxRatingBound(axis, rtgPoint, rating)
+	if rerr != nil {
+		return 0, rtgPoint, false, defect, rerr
+	}
+	return r, rtgPoint, rok, defect, nil
+}

@@ -44,9 +44,22 @@ import (
 
 // Base holds shared SunSpec DER state and methods. Embed in concrete types.
 type Base struct {
-	Reader    *sunspec.Reader
-	Wmax      float64 // nameplate WMax in watts; NaN if unavailable
-	MeasModel uint16  // measurement model: 701, 103, 102, or 101
+	Reader *sunspec.Reader
+	// Wmax is the active-power capacity every percent-of-capacity control on
+	// this device resolves against, in watts; NaN if unavailable.
+	//
+	// IW15-002: it is the SETTING (702 WMax, or legacy M121 WMax) when the
+	// device publishes one, and only otherwise the RATING (702 WMaxRtg) — see
+	// settingOrRatingBound for the full argument and Init for where it is
+	// resolved. The name is kept because every writer/reader in this file
+	// already speaks it, and because "setMaxW" is what 2030.5 calls this exact
+	// quantity; WmaxPoint records WHICH point it came from.
+	Wmax float64
+	// WmaxPoint names the 702/12x point Wmax was resolved from ("WMax",
+	// "WMaxRtg", "M121.WMax"), for evidence bundles and operator diagnosis. ""
+	// when Wmax is unknown.
+	WmaxPoint string
+	MeasModel uint16 // measurement model: 701, 103, 102, or 101
 
 	// DefaultRvrtTms, when non-zero, is written as the reversion timeout (seconds)
 	// on 704 control writes so the DER auto-reverts if communication is lost. The
@@ -236,26 +249,107 @@ func Init(r *sunspec.Reader, tag string) (Base, error) {
 		if err != nil {
 			return Base{}, fmt.Errorf("%s: read M702 capability snapshot: %w", tag, err)
 		}
-		b.Cap = sunspec.Parse702(regs)
-		b.HasCap = true
-		// Bitfield32OK, not Bitfield32: the plain reader collapses "device says
-		// NOT IMPLEMENTED" onto the empty bitfield, and the empty bitfield used
-		// to mean "permit everything". Keep the sentinel so the capability gate
-		// can tell the two apart (audit finding 4).
-		if raw, ok := sunspec.L702.View(regs).Bitfield32OK("CtrlModes"); ok {
-			b.CtrlModes = raw
-		} else {
-			b.CtrlModes = CtrlModesNotImplemented
-		}
-		if b.Cap.WMaxRtg > 0 && !math.IsInf(b.Cap.WMaxRtg, 0) {
-			b.Wmax = b.Cap.WMaxRtg
-		}
+		b.adoptCapacity702(regs)
 	} else if r.HasModel(sunspec.ModelBasicSettings) {
 		if w, err := ReadWMax(r); err == nil {
-			b.Wmax = w
+			b.Wmax, b.WmaxPoint = w, "M121.WMax"
 		}
 	}
 	return b, nil
+}
+
+// adoptCapacity702 installs a freshly read M702 block as this session's
+// capability snapshot and re-resolves the active-power reference from it.
+// Shared by Init and RefreshSettings so a re-read cannot end up meaning
+// something different from the first read.
+//
+// IW15-002: SETTINGS-FIRST. b.Wmax is the quantity every percent-of-capacity
+// control on this device converts against, so it must be the one the STANDARD
+// names — 2030.5's setMaxW, i.e. 702's mutable WMax setting, with WMaxRtg as
+// the fallback sep.xsd itself defines for an absent setting ("Defaults to
+// rtgW"). Before this, the 7xx path read WMaxRtg unconditionally while the
+// legacy path read M121's WMax — the mutable SETTING — so the two device
+// families disagreed about what a percent meant, and the 7xx one disagreed
+// with what the gateway advertises northbound as setMaxW.
+//
+// A DECLARED-ZERO setting, or a rating that cannot be true, leaves Wmax
+// UNKNOWN (NaN) rather than falling back to a number the device disowned:
+// requireWmax then refuses percent-of-capacity controls outright, which is the
+// fail-closed direction and the same answer settingOrRatingBound's error gives
+// every other axis. Wmax is cleared FIRST for the refresh case — a device that
+// stops declaring a usable reference must not keep converting against the one
+// it declared an hour ago.
+func (b *Base) adoptCapacity702(regs []uint16) {
+	b.Cap = sunspec.Parse702(regs)
+	b.HasCap = true
+	// Bitfield32OK, not Bitfield32: the plain reader collapses "device says
+	// NOT IMPLEMENTED" onto the empty bitfield, and the empty bitfield used
+	// to mean "permit everything". Keep the sentinel so the capability gate
+	// can tell the two apart (audit finding 4).
+	if raw, ok := sunspec.L702.View(regs).Bitfield32OK("CtrlModes"); ok {
+		b.CtrlModes = raw
+	} else {
+		b.CtrlModes = CtrlModesNotImplemented
+	}
+	b.Wmax, b.WmaxPoint = math.NaN(), ""
+	if w, point, ok, _, err := settingOrRatingBound("WMax", "WMax", b.Cap.WMax, "WMaxRtg", b.Cap.WMaxRtg); err == nil && ok {
+		b.Wmax, b.WmaxPoint = w, point
+	}
+}
+
+// RefreshSettings re-reads this device's MUTABLE active-power settings on a
+// LIVE session and adopts them — 702's settings block where the device has
+// one, legacy M121's WMax where it does not — returning the raw register
+// blocks it read so the caller can publish exactly the bytes the register
+// layer just started acting on.
+//
+// WHY THE REGISTER LAYER MUST BE THE ONE TO ADOPT THEM (IW15-002). The
+// gateway's authority resolves a commanded percent against setMaxW and this
+// package divides by b.Wmax to produce the percent it actually writes. If a
+// device is derated while the gateway is running and only ONE of those two
+// numbers moves, every command in flight lands as a different quantity than
+// the one commanded — silently, because both ends still look internally
+// consistent. So the refresh that updates the published snapshot and the
+// refresh that updates this session's divisor are the SAME call.
+//
+// A read error leaves the previous snapshot untouched: a transient Modbus
+// failure is not evidence that a device changed its configuration, and
+// clearing the reference on one bad read would fail-closed a healthy fleet.
+//
+// Caller must hold whatever lock guards this Base's session (cmd/modbus calls
+// it from inside its poll session, under the per-device mutex).
+func (b *Base) RefreshSettings(tag string) (regs702, regs121 []uint16, err error) {
+	if b.Has702 {
+		regs, err := b.Reader.ReadModel(sunspec.ModelDERCapacity)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%s: refresh M702 settings: %w", tag, err)
+		}
+		b.adoptCapacity702(regs)
+		return regs, nil, nil
+	}
+	if b.Reader.HasModel(sunspec.ModelBasicSettings) {
+		regs, err := b.Reader.ReadModel(sunspec.ModelBasicSettings)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%s: refresh M121 settings: %w", tag, err)
+		}
+		if len(regs) > sunspec.M121_WMax_SF {
+			w := sunspec.ApplyScaleUint(regs[sunspec.M121_WMax], int16(regs[sunspec.M121_WMax_SF]))
+			// Same three-state rule adoptCapacity702 applies to 702's WMax: a
+			// usable value is the reference, anything else (sentinel, zero,
+			// non-finite) leaves it UNKNOWN rather than silently keeping a
+			// stale one. ReadWMax's own "invalid" verdict is the same test.
+			if usableBase(w) {
+				b.Wmax, b.WmaxPoint = w, "M121.WMax"
+			} else {
+				b.Wmax, b.WmaxPoint = math.NaN(), ""
+			}
+		}
+		return nil, regs, nil
+	}
+	// Neither family: nothing to refresh, and that is not an error — a device
+	// with no settings block simply has none, which is exactly what the
+	// resolver's rating-default branch is for.
+	return nil, nil, nil
 }
 
 // ── Measurements ─────────────────────────────────────────────────────────────
@@ -958,44 +1052,6 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 			add("opModFixedVar", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetConstantVar(pct, mod, tag) })
 		}
 	}
-	if ctrl.OpModFixedW != nil {
-		if !b.Has704 {
-			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
-		}
-		if err := b.requireCtrlModes("opModFixedW", modeFixedW); err != nil {
-			return nil, err
-		}
-		// IW13-001: opModFixedW is SignedPerCent, not ActivePower. Decode the
-		// percent, then resolve it against this device's own reference
-		// (§2.1 — WDisChaRteMaxRtg/WChaRteMaxRtg when declared, else WMax
-		// symmetrically) BEFORE the existing watts-domain checks, which are
-		// unchanged from here on.
-		pct, err := pctChecked(int32(ctrl.OpModFixedW.Value), "opModFixedW", true)
-		if err != nil {
-			return nil, err
-		}
-		ref, ok, err := b.fixedWReference(ctrl.OpModFixedW.Value < 0)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "cannot set percent-of-nameplate control: WMax unknown"}
-		}
-		w := pct / 100.0 * ref
-		if err := b.validateSetpointW(w, "opModFixedW"); err != nil {
-			return nil, err
-		}
-		// IW13-003 §1.3 item 2: see the opModFixedVar registration above for
-		// the identical addPlan/add split and reasoning.
-		if b.DefaultWRmpPct != nil {
-			addPlan("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() (PlanOutcome, error) {
-				return b.SetActivePowerWattsPlan(w, tag)
-			})
-		} else {
-			add("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
-		}
-	}
-
 	// Ceilings → WMaxLimPct (% of WMax). Simultaneous ceilings MIN-COMBINE.
 	if bind, ok, err := b.combineCeilingsW(ctrl, tag); err != nil {
 		return nil, err
@@ -1038,6 +1094,66 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 			})
 		default:
 			return nil, &UnsupportedControlError{Axis: bind.axis, Reason: "device has neither M704 nor M123 for power limiting"}
+		}
+	}
+
+	// RESTRICTIVE-FIRST WITHIN rankLimit (IW15-001 §2.3), and this is the path
+	// a real DERControlBase carrying BOTH axes takes — a 2030.5 event naming
+	// opModMaxLimW and opModFixedW together, including every one the
+	// conformance harness sends. opModFixedW is registered AFTER the ceiling
+	// combine above because runControlSteps materialises rank order preserving
+	// REGISTRATION order: writing a 60 % setpoint before lowering the ceiling to
+	// 40 % leaves the DER standing commanded above its own limit for the width
+	// of one Modbus write, on a machine that has every reason to obey it.
+	//
+	// preflightActuationWatts (the watts-native sibling this gateway's reconcile
+	// shells drive) was given the same order when the solar setpoint axis
+	// landed; this path was not, and the two must not disagree about which
+	// register moves first — the whole of the parity argument
+	// iw13_percent_test.go's byte-comparison rests on. With only one of the two
+	// axes present (every document before IW15-001 step C) the order is
+	// behaviour-neutral: one step is one step in any order.
+	//
+	// VALIDATION order moves with it, deliberately: a document that is invalid
+	// on both axes is now reported against the CEILING first. That is the same
+	// direction — the bound is the axis whose refusal is the safe one to learn
+	// about first — and no caller distinguishes them beyond the named axis,
+	// since either way the whole document is refused with zero writes.
+	if ctrl.OpModFixedW != nil {
+		if !b.Has704 {
+			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
+		}
+		if err := b.requireCtrlModes("opModFixedW", modeFixedW); err != nil {
+			return nil, err
+		}
+		// IW13-001: opModFixedW is SignedPerCent, not ActivePower. Decode the
+		// percent, then resolve it against this device's own reference
+		// (§2.1 — WDisChaRteMaxRtg/WChaRteMaxRtg when declared, else WMax
+		// symmetrically) BEFORE the existing watts-domain checks, which are
+		// unchanged from here on.
+		pct, err := pctChecked(int32(ctrl.OpModFixedW.Value), "opModFixedW", true)
+		if err != nil {
+			return nil, err
+		}
+		ref, ok, err := b.fixedWReference(ctrl.OpModFixedW.Value < 0)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "cannot set percent-of-nameplate control: WMax unknown"}
+		}
+		w := pct / 100.0 * ref
+		if err := b.validateSetpointW(w, "opModFixedW"); err != nil {
+			return nil, err
+		}
+		// IW13-003 §1.3 item 2: see the opModFixedVar registration above for
+		// the identical addPlan/add split and reasoning.
+		if b.DefaultWRmpPct != nil {
+			addPlan("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() (PlanOutcome, error) {
+				return b.SetActivePowerWattsPlan(w, tag)
+			})
+		} else {
+			add("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
 		}
 	}
 
@@ -1096,30 +1212,15 @@ func (b *Base) preflightActuationWatts(fixedW, maxLimW *float64, connect *bool, 
 			return b.SetConnectPlan(c, tag)
 		})
 	}
-	if fixedW != nil {
-		if !b.Has704 {
-			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
-		}
-		if err := b.requireCtrlModes("opModFixedW", modeFixedW); err != nil {
-			return nil, err
-		}
-		w := *fixedW
-		if math.IsNaN(w) || math.IsInf(w, 0) {
-			return nil, &InvalidControlError{Axis: "opModFixedW", Reason: "non-finite watt setpoint"}
-		}
-		if err := b.validateSetpointW(w, "opModFixedW"); err != nil {
-			return nil, err
-		}
-		// IW13-003 §1.3 item 2: addPlan/add split, identical reasoning to
-		// preflightControl's opModFixedW registration.
-		if b.DefaultWRmpPct != nil {
-			addPlan("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() (PlanOutcome, error) {
-				return b.SetActivePowerWattsPlan(w, tag)
-			})
-		} else {
-			add("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
-		}
-	}
+	// RESTRICTIVE-FIRST WITHIN rankLimit (IW15-001 §2.3). opModMaxLimW is
+	// registered BEFORE opModFixedW, and the order is load-bearing the day a
+	// document carries both: runControlSteps materialises rank order preserving
+	// REGISTRATION order, so writing a 60 % setpoint before lowering the ceiling
+	// to 40 % would open a window in which the DER stands commanded above its
+	// own limit. Lower the bound, then command inside it — the same house rule
+	// the reconcile shells already follow for every other paired write. With
+	// only one of the two axes engaged (every document this gateway authors
+	// today) the swap is behaviour-neutral: one step is one step in any order.
 	if maxLimW != nil {
 		w := *maxLimW
 		if math.IsNaN(w) || math.IsInf(w, 0) {
@@ -1162,6 +1263,30 @@ func (b *Base) preflightActuationWatts(fixedW, maxLimW *float64, connect *bool, 
 			})
 		default:
 			return nil, &UnsupportedControlError{Axis: "opModMaxLimW", Reason: "device has neither M704 nor M123 for power limiting"}
+		}
+	}
+	if fixedW != nil {
+		if !b.Has704 {
+			return nil, &UnsupportedControlError{Axis: "opModFixedW", Reason: "device has no M704 (DERCtlAC)"}
+		}
+		if err := b.requireCtrlModes("opModFixedW", modeFixedW); err != nil {
+			return nil, err
+		}
+		w := *fixedW
+		if math.IsNaN(w) || math.IsInf(w, 0) {
+			return nil, &InvalidControlError{Axis: "opModFixedW", Reason: "non-finite watt setpoint"}
+		}
+		if err := b.validateSetpointW(w, "opModFixedW"); err != nil {
+			return nil, err
+		}
+		// IW13-003 §1.3 item 2: addPlan/add split, identical reasoning to
+		// preflightControl's opModFixedW registration.
+		if b.DefaultWRmpPct != nil {
+			addPlan("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() (PlanOutcome, error) {
+				return b.SetActivePowerWattsPlan(w, tag)
+			})
+		} else {
+			add("opModFixedW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetActivePowerWatts(w, tag) })
 		}
 	}
 	return steps, nil
@@ -1262,11 +1387,15 @@ func (b *Base) requireWmax(tag string) error {
 // DENY" / "zero means incapacity" rule capability.go already states for
 // every other rating bound in this file.
 func (b *Base) fixedWReference(negative bool) (float64, bool, error) {
-	point, v := "WDisChaRteMaxRtg", b.Cap.WDisChaRteMaxRtg
+	set, rtg, setV, rtgV := "WDisChaRteMax", "WDisChaRteMaxRtg", b.Cap.WDisChaRteMax, b.Cap.WDisChaRteMaxRtg
 	if negative {
-		point, v = "WChaRteMaxRtg", b.Cap.WChaRteMaxRtg
+		set, rtg, setV, rtgV = "WChaRteMax", "WChaRteMaxRtg", b.Cap.WChaRteMax, b.Cap.WChaRteMaxRtg
 	}
-	if r, ok, err := maxRatingBound("opModFixedW", point, v); err != nil {
+	// IW15-002: the SETTING (setMaxChargeRateW / setMaxDischargeRateW) before
+	// the rating, per settingOrRatingBound — the same rule Init resolves
+	// b.Wmax with and the same one the gateway's own fan-out uses, so a
+	// percent means one thing end to end.
+	if r, _, ok, _, err := settingOrRatingBound("opModFixedW", set, setV, rtg, rtgV); err != nil {
 		return 0, false, err
 	} else if ok {
 		return r, true, nil
@@ -1342,23 +1471,30 @@ func (b *Base) validateSetpointW(w float64, axis string) error {
 	if !b.HasCap {
 		return nil
 	}
+	// IW15-002: bound against the SAME quantity fixedWReference resolves the
+	// percent against (settingOrRatingBound — setting first, rating as the
+	// sep.xsd default), naming whichever point bound it. The two must move
+	// together: a percent resolved against the setting and then validated
+	// against the rating would refuse nothing it should, but the reverse —
+	// which is what this file did before IW15-002 — refuses a command the
+	// device could execute, and kills the whole document with it.
 	if w < 0 { // charge
-		r, ok, err := maxRatingBound(axis, "WChaRteMaxRtg", b.Cap.WChaRteMaxRtg)
+		r, point, ok, _, err := settingOrRatingBound(axis, "WChaRteMax", b.Cap.WChaRteMax, "WChaRteMaxRtg", b.Cap.WChaRteMaxRtg)
 		if err != nil {
 			return err
 		}
 		if ok && -w > r {
 			return &UnsupportedControlError{Axis: axis,
-				Reason: fmt.Sprintf("charge setpoint %g W exceeds rated max charge rate %g W", -w, r)}
+				Reason: fmt.Sprintf("charge setpoint %g W exceeds max charge rate %g W (%s)", -w, r, point)}
 		}
 	} else if w > 0 { // discharge/export
-		r, ok, err := maxRatingBound(axis, "WDisChaRteMaxRtg", b.Cap.WDisChaRteMaxRtg)
+		r, point, ok, _, err := settingOrRatingBound(axis, "WDisChaRteMax", b.Cap.WDisChaRteMax, "WDisChaRteMaxRtg", b.Cap.WDisChaRteMaxRtg)
 		if err != nil {
 			return err
 		}
 		if ok && w > r {
 			return &UnsupportedControlError{Axis: axis,
-				Reason: fmt.Sprintf("discharge setpoint %g W exceeds rated max discharge rate %g W", w, r)}
+				Reason: fmt.Sprintf("discharge setpoint %g W exceeds max discharge rate %g W (%s)", w, r, point)}
 		}
 	}
 	return nil
@@ -1944,6 +2080,48 @@ func (b *Base) SetActivePowerWatts(w float64, tag string) error {
 		return err
 	}
 	return rampNotApplied("SetActivePowerWatts", out)
+}
+
+// ReleaseActivePowerSetpoint clears the device's active-power SETPOINT
+// function — 704 WSetEna=0 — leaving WSet itself and every other point in the
+// block untouched. It is SetActivePowerWatts's exact inverse and the register
+// half of a withdrawn dispatch (IW15-001 step C).
+//
+// # Why a withdrawal has to be a WRITE
+//
+// There is no such thing as an absent setpoint on a DER. Once WSetEna is on,
+// the machine holds the last WSet it was given until something tells it
+// otherwise: a gateway that expresses "no dispatch any more" by simply
+// ceasing to command one leaves a utility's superseded 20 % dispatch standing
+// on the plant forever, invisibly, while every layer above believes the axis
+// is uncommanded. The reversion timer is not an answer either — it is the
+// device's own countdown for the case where the GATEWAY disappears, not the
+// case where the gateway is present and has changed its mind.
+//
+// # What it deliberately does NOT do
+//
+//   - It does not zero WSet. A commanded zero and a disabled function are
+//     opposite facts (one says "produce nothing", the other "I am not telling
+//     you what to produce"), and writing 0 W on the way out would curtail a
+//     plant to zero at the exact moment the dispatch was withdrawn.
+//   - It does not touch WSetRvrtTms or the alternate pair. A disarm rides its
+//     own hint (rvrtAlternateWriter) precisely so it can be expressed
+//     independently, and a release that silently cancelled an armed reversion
+//     would be doing a second thing nobody asked for.
+//   - It does not touch the ceiling. Releasing a dispatch returns the DER to
+//     "generate up to your limit", which is the whole point: the limit is
+//     still in force and is still this axis's business alone.
+//
+// Requires the device's positive FIXED_W claim, exactly as the write does: the
+// release is the same function on the same register, and a device that never
+// admitted to the function cannot have been given a setpoint to release.
+// Callers that reach here on a device with no M704 get the same typed
+// UnsupportedControlError the write would have produced, with zero registers
+// touched.
+func (b *Base) ReleaseActivePowerSetpoint(tag string) error {
+	return b.write704(tag, "opModFixedW", []ctrlMode{modeFixedW}, func(v sunspec.View) {
+		v.SetBool("WSetEna", false)
+	})
 }
 
 // SetActivePowerWattsPlan is SetActivePowerWatts's PlanOutcome-returning
