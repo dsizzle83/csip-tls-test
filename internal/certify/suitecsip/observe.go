@@ -37,7 +37,6 @@ import (
 	"net/netip"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -915,6 +914,23 @@ type Driver struct {
 	// The map is written only from PostControl, which the live phase calls
 	// from one goroutine, and read only after the live phase has finished.
 	published map[string]time.Time
+
+	// cleanupErrs records every teardown call that did NOT do what it said.
+	//
+	// A discarded cleanup error is invisible evidence contamination: the caller
+	// writes `_ = d.ClearControls(...)` in a deferred Cleanup, the request
+	// fails, the control stays live on a shared bench, and the NEXT row grades
+	// a DUT that is still executing this row's event. That was not hypothetical
+	// — DELETE /admin/control and DELETE /admin/curve both sent a nil body
+	// while gridsim reads {"program":N} from the request BODY, so every clear
+	// this suite issued was answered 400 before touching anything, and every
+	// control and curve row leaked into the rest of the run.
+	//
+	// Written only from the teardown helpers below (one goroutine, after the
+	// live phase) and read by run()'s deferred Cleanup, which appends it to the
+	// row's notes — so a failed teardown lands in the bundle instead of in a
+	// discarded return value.
+	cleanupErrs []string
 }
 
 // Published returns a copy of when this check published each control.
@@ -1443,15 +1459,46 @@ func (d *Driver) CancelSubscription(ctx context.Context, href string) error {
 // ClearControls removes the admin-posted controls from a program, so a check
 // leaves the bench as it found it.
 func (d *Driver) ClearControls(ctx context.Context, program int) error {
-	_, err := d.Admin.Raw(ctx, http.MethodDelete, "/admin/control?program="+strconv.Itoa(program), nil)
-	return err
+	return d.adminClear(ctx, "/admin/control", "the admin-posted DERControls", program)
 }
 
 // ClearCurves removes admin-posted curve controls from a program.
 func (d *Driver) ClearCurves(ctx context.Context, program int) error {
-	_, err := d.Admin.Raw(ctx, http.MethodDelete, "/admin/curve?program="+strconv.Itoa(program), nil)
+	return d.adminClear(ctx, "/admin/curve", "the admin-posted curve controls", program)
+}
+
+// adminClear is the one definition of a teardown DELETE, and it exists because
+// the two above were silently broken in the same way.
+//
+// The program travels in the JSON BODY, not in a query string. gridsim's
+// adminCtrlDelete (sim/gridsim/admin.go) and adminCurveDelete (curve.go) both
+// begin with json.NewDecoder(r.Body).Decode(&struct{Program int}) and answer
+// 400 on the io.EOF a nil body produces — before touching a single resource.
+// Both clears therefore did nothing at all, on every row, for as long as they
+// have existed, and the callers' `_ = d.ClearX(...)` hid it. gridsim's own
+// curve_test.go sends the body; this now matches it.
+//
+// The failure is RECORDED as well as returned (see Driver.cleanupErrs): a
+// teardown that failed leaves the next row grading a bench this row is still
+// driving, which is the kind of contamination that must appear in the bundle.
+// Nothing is recorded when there is no admin API at all — a run with no gridsim
+// never armed anything, so there is nothing to have leaked and the "no base URL
+// configured" error is a statement about the bench, not about this row.
+func (d *Driver) adminClear(ctx context.Context, path, what string, program int) error {
+	if !d.Available() {
+		return nil
+	}
+	_, err := d.Admin.Raw(ctx, http.MethodDelete, path, map[string]any{"program": program})
+	if err != nil {
+		d.cleanupErrs = append(d.cleanupErrs,
+			fmt.Sprintf("could not clear %s on program %d (DELETE %s): %v", what, program, path, err))
+	}
 	return err
 }
+
+// CleanupErrors returns what teardown could not undo, for the row's notes. It
+// is read after the deferred Cleanup has run.
+func (d *Driver) CleanupErrors() []string { return d.cleanupErrs }
 
 // ArmRedirect makes the next count GETs of path answer 301/302 with a Location.
 func (d *Driver) ArmRedirect(ctx context.Context, path, location string, code, count int) error {

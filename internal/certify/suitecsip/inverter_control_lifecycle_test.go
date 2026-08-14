@@ -86,6 +86,22 @@ func TestOracledScalarWindow_ContainsEveryPostWaitRead(t *testing.T) {
 			"window widened for every row (unintended) or waitCap shrank; the oracled rows carry the wide "+
 			"window on purpose, the rest should not", defClose, waitCap)
 	}
+
+	// The PRESCRIBED default (IW15-004) sits UNDERNEATH the row's own control
+	// and must outlive it, the way a DefaultDERControl would: it opens
+	// immediately (Setup blocks until it lands, so a start offset is pure
+	// latency on the row's critical path) and closes after the event above it.
+	defaultOpen := time.Duration(oracleDefaultWindow.startOffsetS) * time.Second
+	defaultClose := time.Duration(oracleDefaultWindow.startOffsetS+oracleDefaultWindow.durationS) * time.Second
+	if defaultOpen != 0 {
+		t.Errorf("the prescribed default opens at +%s; Setup WAITS for it to land, so every second of "+
+			"offset is a second added to the row before it can command anything", defaultOpen)
+	}
+	if defaultClose <= winClose {
+		t.Errorf("the prescribed default closes at +%s, at or before the row's own control (+%s) — the "+
+			"default is the state the procedure prescribes for this DER and must still be standing when "+
+			"the event that supersedes it ends", defaultClose, winClose)
+	}
 }
 
 // inverterControlLifecycleRunCtx wires ONE *certify.RunCtx to two in-process
@@ -475,6 +491,247 @@ func basic010Mode() controlMode {
 	return withOracle(scalarModeOracled("opModMaxLimW", 6000, func(r *ControlRequest, hundredths int64) {
 		r.MaxLimW = ptr(hundredths)
 	}), oracleMaxLimW)
+}
+
+// basic013Mode builds the BASIC-013 controlMode exactly as register.go binds it
+// after IW15-004: the procedure's own 50% default, the procedure's own 60% test
+// value, and no ladder.
+func basic013Mode() controlMode {
+	return withOracle(scalarModeOracledDefaultFirst("opModFixedW", 5000, 6000,
+		func(r *ControlRequest, hundredths int64) {
+			r.FixedW = ptr(hundredths)
+		}), oracleFixedW)
+}
+
+// TestOracledRow_PrescribedRowCarriesNoLadder is IW15-004's construction-level
+// guarantee: a row whose procedure states its values must have no mechanism for
+// substituting one.
+//
+// The two are mutually exclusive by design rather than by discipline. A ladder
+// on a prescribed row would let Setup depart from the catalog's value at run
+// time — which is exactly what produced a BASIC-013 report claiming conformance
+// for a 40% command the procedure never asked for — and no amount of care at
+// the call site is worth as much as the departure being unrepresentable.
+func TestOracledRow_PrescribedRowCarriesNoLadder(t *testing.T) {
+	b := basic013Mode().Oracle
+	if b.Prescribed != 5000 {
+		t.Errorf("BASIC-013's prescribed default = %d, want the catalog's 5000 (50.00%%) — CSIP CTP v1.3 "+
+			"Figure 13 states it", b.Prescribed)
+	}
+	if b.Commanded != 6000 {
+		t.Errorf("BASIC-013's commanded value = %d, want the catalog's 6000 (60.00%%)", b.Commanded)
+	}
+	if len(b.Ladder) != 0 {
+		t.Errorf("BASIC-013 carries a %d-entry ladder (%s): a row whose procedure states its values may "+
+			"not substitute another one, and the stale-register case the ladder existed for is what the "+
+			"prescribed default now handles", len(b.Ladder), pctList(b.Ladder))
+	}
+	if b.PublishDefault == nil {
+		t.Error("BASIC-013 prescribes a default and carries no publisher for it, so Setup cannot put the " +
+			"DER into the state the procedure requires")
+	}
+	// The converse, so the two shapes cannot converge: a laddered row must not
+	// acquire a prescribed default it would then have two ways to depart from.
+	if l := basic010Mode().Oracle; l.Prescribed != 0 || len(l.Ladder) == 0 {
+		t.Errorf("BASIC-010's binding = prescribed %d / %d ladder entries, want the ladder shape it has "+
+			"always had (its procedure states no default to reset through)", l.Prescribed, len(l.Ladder))
+	}
+}
+
+// TestPrescribedSetup_DrivesTheDefaultThenCommandsTheCatalogValue is the
+// IW15-004 sequence end to end, against a real gridsim and a real DER register
+// image: publish the prescribed 50% default under its OWN mRID, wait for it to
+// land, then publish exactly the catalog's 60% under the row's mRID.
+//
+// The DER is moved by the test between the two phases, standing in for the DUT
+// fetching and applying — the same substitution
+// TestInverterControlSpec_OracleFiresPostWaitNotSetup makes, for the same
+// reason: what is under test is the row's sequencing, not the DUT.
+func TestPrescribedSetup_DrivesTheDefaultThenCommandsTheCatalogValue(t *testing.T) {
+	dev, base := oracleFixture(t)
+	_, d := inverterControlLifecycleRunCtx(t, dev)
+	ctx := context.Background()
+
+	m := basic013Mode()
+	s := inverterControlSpec(m, "a set-active-power command", "CERT-BASIC-013")
+
+	// The DUT applies the 50% default one beat after it is published. A
+	// goroutine, because Setup BLOCKS on the default landing — which is the
+	// property under test.
+	applied := make(chan struct{})
+	go func() {
+		defer close(applied)
+		time.Sleep(20 * time.Millisecond)
+		spc := model.SignedPerCent{Value: 5000} // 50.00%, the prescribed default
+		if err := base.ApplyControl(model.DERControlBase{OpModFixedW: &spc}, "prescribed-default"); err != nil {
+			t.Errorf("ApplyControl(opModFixedW=5000): %v", err)
+		}
+	}()
+
+	// A short window: this test is about the sequence, not the duration, and
+	// the deadline honours the params (prescribedDefaultDeadline).
+	params := map[string]string{pollWindowParam: "5s"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	<-applied
+
+	if got := params[oracleDefaultCommandedParam]; got != "5000" {
+		t.Fatalf("%s = %q, want the procedure's own 5000", oracleDefaultCommandedParam, got)
+	}
+	if got := params[oracleDefaultMRIDParam]; got != "CERT-BASIC-013"+defaultControlMRIDSuffix {
+		t.Fatalf("%s = %q, want the default published under its OWN mRID — sharing the row's would make "+
+			"gridsim update the control in place and would satisfy the row's own wire criterion",
+			oracleDefaultMRIDParam, got)
+	}
+	if got := params[oracleDefaultVerdictParam]; got != string(certify.Pass) {
+		t.Fatalf("%s = %q (%s), want PASS: the row must WAIT for the prescribed default to reach the DER's "+
+			"own registers, not merely publish it", oracleDefaultVerdictParam, got,
+			params[oracleDefaultObservedParam])
+	}
+	// The catalog's value, exactly, with no substitution available.
+	if got := params[oracleCommandedParam]; got != "6000" {
+		t.Fatalf("%s = %q, want exactly the catalog's 6000 — a prescribed row has no ladder to depart to",
+			oracleCommandedParam, got)
+	}
+	// And the baseline for THAT value was taken from the prescribed state: the
+	// DER holds 50%, so it does NOT hold 60%, which is what makes the post-read
+	// a transition.
+	if got := params[oraclePreVerdictParam]; got != string(certify.Fail) {
+		t.Fatalf("%s = %q, want the decided FAIL that proves the DER did not already hold the commanded "+
+			"value when the row published it", oraclePreVerdictParam, got)
+	}
+	if !strings.Contains(params[oracleNoteParam], "stated sequence") {
+		t.Errorf("%s = %q, want the bundle to carry the sequence this row followed", oracleNoteParam,
+			params[oracleNoteParam])
+	}
+
+	// Both controls are on the wire, under different mRIDs, with the row's own
+	// created later so it supersedes the default it sits on.
+	pub := d.Published()
+	for _, want := range []string{"CERT-BASIC-013", "CERT-BASIC-013" + defaultControlMRIDSuffix} {
+		if _, ok := pub[want]; !ok {
+			t.Errorf("no control was published under mRID %q (published: %v)", want, pub)
+		}
+	}
+	if !pub["CERT-BASIC-013"].After(pub["CERT-BASIC-013"+defaultControlMRIDSuffix]) {
+		t.Error("the row's own control was not created AFTER the default it supersedes; at equal primacy " +
+			"2030.5 resolves an overlap by creationTime, so the default would win")
+	}
+}
+
+// TestPrescribedSetup_StaleRegisterIsResetThroughTheDefault is the review's
+// "stale 60% must be reset through the 50% default and then transition",
+// stated as the run that used to produce a false PASS.
+//
+// A previous run left the DER at exactly the value this row is about to
+// command. The pre-IW15-004 row saw that, departed to a ladder alternate and
+// certified a value the procedure never states. This row instead drives the DER
+// to the prescribed 50%, which makes the stale 60% disappear, and then commands
+// the catalog's 60% — so the transition it certifies is both real AND the one
+// the procedure describes.
+func TestPrescribedSetup_StaleRegisterIsResetThroughTheDefault(t *testing.T) {
+	dev, base := oracleFixture(t)
+	stale := model.SignedPerCent{Value: 6000} // the previous run's setpoint, still there
+	if err := base.ApplyControl(model.DERControlBase{OpModFixedW: &stale}, "previous-run"); err != nil {
+		t.Fatalf("ApplyControl(the previous run's opModFixedW=6000): %v", err)
+	}
+	_, d := inverterControlLifecycleRunCtx(t, dev)
+	ctx := context.Background()
+
+	m := basic013Mode()
+	subject := "a set-active-power command"
+	s := inverterControlSpec(m, subject, "CERT-BASIC-013")
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		def := model.SignedPerCent{Value: 5000}
+		if err := base.ApplyControl(model.DERControlBase{OpModFixedW: &def}, "prescribed-default"); err != nil {
+			t.Errorf("ApplyControl(opModFixedW=5000): %v", err)
+		}
+	}()
+
+	params := map[string]string{pollWindowParam: "5s"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if got := params[oracleCommandedParam]; got != "6000" {
+		t.Fatalf("%s = %q against a DER that ALREADY held 6000; want 6000 anyway — the reset is what "+
+			"makes the value re-commandable, and substituting one is what IW15-004 forbids",
+			oracleCommandedParam, got)
+	}
+	if got := params[oraclePreVerdictParam]; got != string(certify.Fail) {
+		t.Fatalf("%s = %q, want FAIL: after the reset the DER holds 50%%, so it does not hold the "+
+			"commanded 60%% and the post-read has somewhere to move from", oraclePreVerdictParam, got)
+	}
+	if n, ok := params[oracleNoteParam]; ok && strings.Contains(n, "ALREADY held") {
+		t.Errorf("the row recorded a ladder departure: %q", n)
+	}
+
+	// The DUT now fetches and applies the row's own control. The full PostWait
+	// path must reach a Pass, and the criterion must rest on the transition.
+	applied := model.SignedPerCent{Value: 6000}
+	if err := base.ApplyControl(model.DERControlBase{OpModFixedW: &applied}, "lifecycle-test"); err != nil {
+		t.Fatalf("ApplyControl(opModFixedW=6000): %v", err)
+	}
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("PostWait: %v", err)
+	}
+	obs := &Observation{Params: params}
+	f := wantVerdict(t, "prescribed transition", critDEREffectViaSouthboundOracle(subject, obs), nil,
+		certify.Pass)
+	if !strings.Contains(f.Observed, "MOVED") {
+		t.Errorf("the PASS does not rest on the transition it observed: %q", f.Observed)
+	}
+	if !strings.Contains(f.Observed, "prescribed") {
+		t.Errorf("the PASS does not say the starting state was the procedure's own, which is the whole "+
+			"difference between this row and the one the review rejected: %q", f.Observed)
+	}
+}
+
+// TestPrescribedDefaultShortfall_FailsEvenWhenThePostReadMatches is the teeth on
+// the default step. A DUT that never applies the prescribed default leaves the
+// row unable to say what the DER was doing beforehand — and a post-read that
+// matches is then satisfied just as well by a register nobody moved.
+//
+// The verdict must be FAIL, not WARN: this is the exact shape the 2026-08-14
+// report presented as a PASS, and a WARN would leave it presentable.
+func TestPrescribedDefaultShortfall_FailsEvenWhenThePostReadMatches(t *testing.T) {
+	obs := &Observation{Params: map[string]string{
+		oracleDefaultCommandedParam: "5000",
+		oracleDefaultMRIDParam:      "CERT-BASIC-013-DEFAULT",
+		oracleDefaultWindowParam:    "2m30s",
+		oracleDefaultVerdictParam:   string(certify.Fail),
+		oracleDefaultObservedParam:  "the DER reports NO enabled WSet/WSetPct setpoint in its own 704 image",
+		// Everything else about the run looks perfect.
+		oracleVerdictParam:     string(certify.Pass),
+		oracleObservedParam:    "the DER actuated this command as a SETPOINT: its own WSet resolves to 4800.0 W",
+		oraclePreVerdictParam:  string(certify.Fail),
+		oraclePreObservedParam: "the DER reports NO enabled WSet/WSetPct",
+	}}
+	f := wantVerdict(t, "prescribed default never landed",
+		critDEREffectViaSouthboundOracle("a set-active-power command", obs), nil, certify.Fail)
+	for _, want := range []string{"50.00%", "CERT-BASIC-013-DEFAULT", "2m30s"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the FAIL does not name %q, so a reader cannot tell WHICH step of the prescribed "+
+				"sequence was not completed: %s", want, f.Observed)
+		}
+	}
+	// The case verdict route carries it too, so a run with no recovered capture
+	// still fails.
+	s := inverterControlSpec(basic013Mode(), "a set-active-power command", "CERT-BASIC-013")
+	if v := s.Verdict(obs); v != certify.Fail {
+		t.Fatalf("spec.Verdict with an unestablished prescribed default = %q, want FAIL", v)
+	}
+	// A row that prescribes nothing is untouched by any of this.
+	plain := &Observation{Params: map[string]string{
+		oracleVerdictParam:    string(certify.Pass),
+		oracleObservedParam:   "the DER's own WMaxLimPct resolves to a 36000.0 W ceiling",
+		oraclePreVerdictParam: string(certify.Fail),
+	}}
+	if _, ok := prescribedDefaultShortfall(plain); ok {
+		t.Error("a row with no prescribed default was graded against one")
+	}
 }
 
 // TestInverterControlSpec_NonOracleRowUnaffected is the behavior-preservation

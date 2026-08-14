@@ -393,15 +393,20 @@ func TestOracleFixedW_NoEnabledAxisIsAFail(t *testing.T) {
 	}
 	t.Logf("the FAIL this row would report: %s", f.Observed)
 	for _, want := range []string{"NO enabled", "WSet/WSetPct", "60.00%",
-		// Both accepted actuations are named, so the FAIL says what it
-		// looked for rather than only the half the pre-IW14-004 oracle knew.
-		"WMaxLimPct generation ceiling",
-		// And what it actually read, per point, in the register's own unit.
+		// What it actually read, per point, in the register's own unit.
 		"WMaxLimPct=0 % = 0 W (disabled)"} {
 		if !strings.Contains(f.Observed, want) {
 			t.Errorf("the FAIL does not mention %q, so a reader cannot tell what was looked for and what "+
 				"was found: %q", want, f.Observed)
 		}
+	}
+	// The axis this row looks for is the SETPOINT register and nothing else
+	// (IW15-001). The FAIL text used to offer "WSet/WSetPct setpoint or
+	// WMaxLimPct generation ceiling", which told a reader the row might have
+	// been satisfied by the ceiling — the acceptance that has been deleted.
+	if strings.Contains(f.Observed, "WMaxLimPct generation ceiling") {
+		t.Errorf("the FAIL still offers the generation ceiling as an actuation this row would have "+
+			"accepted: %q", f.Observed)
 	}
 	// The same terminal on the ceiling axis, so neither oracle can drift back.
 	if g := oracleMaxLimW(6000)(context.Background(), rc); g.Verdict != certify.Fail || g.Unavailable != "" {
@@ -409,15 +414,23 @@ func TestOracleFixedW_NoEnabledAxisIsAFail(t *testing.T) {
 	}
 }
 
-// ── IW14-004: the solar ceiling fold ────────────────────────────────────────
+// ── IW15-001: the solar ceiling fold, DELETED ───────────────────────────────
 //
-// The five cases below are the acceptance set for oracleFixedW's second rung.
-// They exist because the 2026-08-14 ece6499 bench run FAILed BASIC-013 against
-// a gateway that had executed the control correctly: the board folded a
-// non-negative opModFixedW into the DER's generation ceiling (its
-// PICS-documented solar behaviour — lexa-gw internal/authority/csipin.go), the
-// oracle knew only the battery setpoint actuation, and the row was reported as
-// "the DER reports NO enabled WSet/WSetPct".
+// The cases below were the acceptance set for a second rung of oracleFixedW:
+// for a non-negative command, an enabled WMaxLimPct holding the commanded
+// percent was accepted as an actuation of opModFixedW, on the argument that a
+// PV inverter cannot absorb and so "produce 60% of maximum" and "do not exceed
+// 60% of maximum" are the same instruction.
+//
+// That argument is wrong and the rung is gone. opModFixedW is a SETPOINT and
+// opModMaxLimW is a MAXIMUM; a ceiling permits every output at or below itself,
+// so it carries no commanded value and cannot evidence one. Accepting it let
+// BASIC-013 PASS on a register the gateway wrote for a DIFFERENT function while
+// nothing at all reached WSet — which is what the release-lock review found in
+// the row's own report (IW15-004's "semantic self-approval").
+//
+// Each test below is INVERTED rather than deleted: the same fixture, the
+// opposite verdict, so the acceptance can never quietly return.
 
 // solarCeiling puts an ENABLED WMaxLimPct at pctHundredths on the PV fixture,
 // through the product's own writer, and leaves WSet/WSetPct untouched and
@@ -433,42 +446,62 @@ func solarCeiling(t *testing.T, pctHundredths uint16) *diff.Device {
 	return dev
 }
 
-// TestOracleFixedW_PassOnSolarCeilingFold is case (a): the DER executed the
-// commanded 60.00% as a maximum-generation limit, and that is a PASS whose
-// finding NAMES the actuation and the register it read.
+// TestOracleFixedW_CeilingAtTheCommandedPercentIsStillAFail is the inversion of
+// the old case (a), and it is the negative test the release-lock review
+// requires by name: an enabled WMaxLimPct at EXACTLY the commanded percent,
+// with no enabled WSet anywhere, must be a decided FAIL that names BOTH
+// registers.
 //
-// The naming is not decoration. A bundle that reported only "PASS" would leave
-// a reader unable to tell the ceiling fold from the setpoint actuation, and
-// those are different physical instructions on any device that can absorb.
-func TestOracleFixedW_PassOnSolarCeilingFold(t *testing.T) {
+// This is the strongest form of the claim, deliberately. The DER holds the
+// right number, on the wrong register, for the wrong function — the most
+// favourable reading a folding gateway could ask for — and it still is not
+// evidence that the commanded SETPOINT was executed. A ceiling permits any
+// output at or below itself, including zero; a setpoint does not. The FAIL has
+// to name both registers or a reader cannot tell "the gateway wrote nothing"
+// from "the gateway wrote the other function", which are different defects with
+// different fixes.
+func TestOracleFixedW_CeilingAtTheCommandedPercentIsStillAFail(t *testing.T) {
 	dev := solarCeiling(t, 6000) // 60.00% of the fixture's 60 kW WMax = 36,000 W
 	f := oracleFixedW(6000)(context.Background(), oracleTestRunCtx(t, dev))
 	if f.Unavailable != "" {
-		t.Fatalf("oracleFixedW against a DER holding the commanded ceiling = Unavailable(%q)", f.Unavailable)
+		t.Fatalf("a ceiling-only DER is a finding ABOUT the DER, got Unavailable(%q)", f.Unavailable)
 	}
-	if f.Verdict != certify.Pass {
-		t.Fatalf("oracleFixedW(6000) against a DER holding a 60%% GENERATION CEILING = %+v, want Pass: a "+
-			"non-negative opModFixedW is a percent of maximum active power, and a PV DER's actuation of it "+
-			"is a maximum-generation limit", f)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("oracleFixedW(6000) against a DER whose only enabled point is a 60%% GENERATION CEILING = "+
+			"%+v, want Fail: opModFixedW is a setpoint, WMaxLimPct is opModMaxLimW's maximum, and a maximum "+
+			"carries no commanded value (IW15-001)", f)
 	}
-	t.Logf("the PASS this row would report: %s", f.Observed)
-	for _, want := range []string{"GENERATION CEILING", "WMaxLimPct", "60.00%", "36000"} {
+	t.Logf("the FAIL this row would report: %s", f.Observed)
+	// Both registers, by name, and both numbers.
+	for _, want := range []string{"WSet/WSetPct", "WMaxLimPct", "60.00%", "36000"} {
 		if !strings.Contains(f.Observed, want) {
-			t.Errorf("the PASS does not name %q, so the bundle cannot say WHICH actuation was observed or "+
-				"on which register: %s", want, f.Observed)
+			t.Errorf("the FAIL does not name %q — it must say what was looked for (the setpoint register), "+
+				"what was found instead (the ceiling register) and at what value, or the finding is not "+
+				"actionable: %s", want, f.Observed)
 		}
 	}
-	if strings.Contains(f.Observed, "SETPOINT") {
-		t.Errorf("the PASS reports a setpoint actuation for a ceiling register: %s", f.Observed)
+	// And it must say WHY, in the standards' own terms, rather than merely
+	// reporting an absence.
+	for _, want := range []string{"MAXIMUM GENERATION LIMIT", "SETPOINT"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the FAIL does not distinguish the two FUNCTIONS (%q missing): %s", want, f.Observed)
+		}
+	}
+	if strings.Contains(f.Observed, "PICS-documented solar fold") {
+		t.Errorf("the deleted fold's acceptance prose is back in a finding: %s", f.Observed)
 	}
 }
 
-// TestOracleFixedW_FailOnCeilingAtTheWrongPercent is case (b): the ceiling rung
-// has teeth. A DER holding an ENABLED ceiling at a percent that is NOT the one
-// commanded is a decided FAIL naming both numbers — otherwise the fold would
-// degrade into "any enabled ceiling passes", which would certify a gateway that
-// wrote the wrong number just as readily as one that wrote the right one.
-func TestOracleFixedW_FailOnCeilingAtTheWrongPercent(t *testing.T) {
+// TestOracleFixedW_CeilingAtAnyPercentIsAFail is the old case (b), kept because
+// the shape is still worth pinning even though the verdict no longer depends on
+// the percent: a ceiling at 40% and a ceiling at the commanded 60% are BOTH
+// FAILs now (the sibling test above owns the 60% one), and the finding must
+// still carry both numbers so a reader sees what the DER held against what was
+// asked.
+//
+// Its old name promised the opposite — that the ceiling at the RIGHT percent
+// would have passed — which is the acceptance IW15-001 deleted.
+func TestOracleFixedW_CeilingAtAnyPercentIsAFail(t *testing.T) {
 	dev := solarCeiling(t, 4000) // the DER holds 40.00%, the row commanded 60.00%
 	f := oracleFixedW(6000)(context.Background(), oracleTestRunCtx(t, dev))
 	if f.Unavailable != "" {
@@ -516,12 +549,16 @@ func TestOracleFixedW_SetpointActuationUnchangedByTheFold(t *testing.T) {
 	}
 }
 
-// TestOracleFixedW_CeilingIsNotAChargeActuation is case (d), and it is the one
-// that keeps the fold honest: a NEGATIVE opModFixedW commands the DER to
-// ABSORB, and a maximum-GENERATION limit says nothing whatever about charging.
-// A DER holding an enabled 60% ceiling and no charge setpoint has NOT executed
-// a −60.00% command, and accepting it would let a gateway that silently dropped
-// the charge half of the axis pass on a register it never wrote.
+// TestOracleFixedW_CeilingIsNotAChargeActuation was case (d) — the one case the
+// fold always refused — and it survives unchanged in verdict while its status
+// changes completely: it is no longer the exception that keeps an acceptance
+// honest, it is one instance of the general rule (IW15-001). A NEGATIVE
+// opModFixedW commands the DER to ABSORB and a maximum-GENERATION limit says
+// nothing whatever about charging; that it also says nothing about a commanded
+// generation SETPOINT is the sibling test above.
+//
+// Keeping it proves the refusal did not become sign-dependent in the other
+// direction when the fold was removed.
 func TestOracleFixedW_CeilingIsNotAChargeActuation(t *testing.T) {
 	dev := solarCeiling(t, 6000) // an enabled 60% GENERATION ceiling, nothing else
 	f := oracleFixedW(-6000)(context.Background(), oracleTestRunCtx(t, dev))
@@ -573,37 +610,136 @@ func TestCommandSummary_PrintsTheRegistersItRead(t *testing.T) {
 	}
 }
 
-// TestOracleFixedW_LadderSeesTheCeilingActuation proves the fold reaches the
-// part of the row that decides what to COMMAND, not only the part that judges.
+// TestOracleFixedW_CeilingNeverSatisfiesThePreRead replaces
+// TestOracleFixedW_LadderSeesTheCeilingActuation, which pinned the fold in the
+// part of the row that decides what to COMMAND rather than what to judge: it
+// asserted that a DER parked at a 60% ceiling reads as "already holds the
+// commanded value", so BASIC-013 would depart to a ladder alternate.
 //
-// oracleBinding.alternate asks this row's own Judge whether the DER already
-// holds a candidate value (basic.go). With the ceiling actuation accepted, a
-// DER already parked at the commanded 60% — exactly what BASIC-010's own row
-// leaves behind on the shared bench inverter — is now correctly seen as
-// "already holds it", so BASIC-013 departs to a ladder alternate the DER
-// provably does not hold and its post-read has somewhere to MOVE to. Without
-// this, the pre-read would have said "does not hold it", the row would have
-// commanded 60% into a register already at 60%, and the transition binding
-// would have been satisfied by a DER that never moved.
-func TestOracleFixedW_LadderSeesTheCeilingActuation(t *testing.T) {
+// Both halves of that are now wrong, and deliberately so. The ceiling is not an
+// actuation, so the pre-read of a ceiling-only DER is a decided FAIL — the
+// baseline a transition needs — and BASIC-013 carries no ladder at all, because
+// its procedure states its values (IW15-004; see
+// TestOracledRow_PrescribedRowCarriesNoLadder).
+func TestOracleFixedW_CeilingNeverSatisfiesThePreRead(t *testing.T) {
 	dev := solarCeiling(t, 6000)
 	rc := oracleTestRunCtx(t, dev)
-	b := &oracleBinding{Commanded: 6000, Ladder: oracleValueLadder, Judge: oracleFixedW}
 
-	if pre := b.Judge(b.Commanded)(context.Background(), rc); pre.Verdict != certify.Pass {
-		t.Fatalf("the pre-read of a DER already holding the commanded 60%% ceiling = %+v, want Pass — "+
-			"Setup would otherwise never know it has to depart from the catalog's value", pre)
+	pre := oracleFixedW(6000)(context.Background(), rc)
+	if pre.Verdict != certify.Fail {
+		t.Fatalf("the pre-read of a DER holding only a 60%% CEILING = %+v, want the decided Fail that says "+
+			"the setpoint register holds nothing — a Pass here would let Setup conclude the DER 'already "+
+			"holds' a value nothing on it holds", pre)
 	}
-	alt, altPre, ok := b.alternate(context.Background(), rc, b.Commanded)
-	if !ok {
-		t.Fatal("no ladder alternate was available on a DER holding only a 60% ceiling")
+	if !strings.Contains(pre.Observed, "WMaxLimPct") {
+		t.Errorf("the baseline does not report the ceiling it read, so a bundle cannot show what the DER "+
+			"was holding before the control: %s", pre.Observed)
 	}
-	if alt != 4000 {
-		t.Errorf("the ladder chose %d, want the first entry the DER provably does not hold (4000)", alt)
+}
+
+// TestOracleFixedW_SolarReferenceIsTheSetting is IW15-002 at the row that uses
+// it: BASIC-013 against a PV inverter resolves the commanded percent against
+// %setMaxW — the device's CONFIGURED maximum — not against its hardware rating.
+//
+// The PV fixture implements neither rate rating nor rate setting, so
+// RefWRteMax falls through to the nameplate, and the nameplate reference has
+// always been settings-first (Nameplate.Base's pick). What IW15-002 changes is
+// that the whole chain now says so consistently, and this test states the
+// consequence in watts on a machine where the two numbers differ: a 60 kW
+// inverter derated by its installer to 40 kW answers "60%" with 24 kW, and a
+// gateway that wrote 36 kW — 60% of the hardware — has over-commanded a machine
+// that told it what it was configured to do.
+//
+// It is a DELIBERATE red against the current product until the settings-first
+// reference lands there too: the harness is the independent referee, and the
+// two are not required to agree while one of them is wrong.
+func TestOracleFixedW_SolarReferenceIsTheSetting(t *testing.T) {
+	spec := diff.Bench702()
+	spec.WMaxW = 40_000 // configured below the 60 kW rating, as commissioning would
+	dev := diff.NewDevice(spec)
+	rdr, err := sunspec.NewReader(dev)
+	if err != nil {
+		t.Fatalf("sunspec.NewReader: %v", err)
 	}
-	if altPre.Verdict != certify.Fail {
-		t.Errorf("the alternate's baseline = %+v, want the decided Fail that PROVES the DER does not hold "+
-			"it", altPre)
+	base, err := derbase.Init(rdr, "oracle-test")
+	if err != nil {
+		t.Fatalf("derbase.Init: %v", err)
+	}
+	spc := model.SignedPerCent{Value: 6000}
+	if err := base.ApplyControl(model.DERControlBase{OpModFixedW: &spc}, "oracle-test"); err != nil {
+		t.Fatalf("ApplyControl(opModFixedW=6000): %v", err)
+	}
+	wrote := packWSet(t, dev)
+	t.Logf("the product wrote WSet=%g W for 60.00%% on a 60 kW machine configured to 40 kW", wrote)
+
+	f := oracleFixedW(6000)(context.Background(), oracleTestRunCtx(t, dev))
+	switch {
+	case math.Abs(wrote-24_000) <= 100:
+		// A settings-first writer: 60% of the CONFIGURED 40 kW.
+		if f.Verdict != certify.Pass {
+			t.Fatalf("oracleFixedW(6000) against a DER holding the settings-resolved 24000 W = %+v, want "+
+				"Pass", f)
+		}
+	case math.Abs(wrote-36_000) <= 100:
+		// A ratings-first writer: 60% of the 60 kW RATING, into a machine
+		// configured to 40 kW. The referee must call this what it is.
+		if f.Verdict != certify.Fail {
+			t.Fatalf("oracleFixedW(6000) against a DER holding 36000 W — 60%% of the RATING on a machine "+
+				"configured to 40 kW — = %+v, want Fail (IW15-002)", f)
+		}
+		t.Logf("DELIBERATE RED against the current product: %s", f.Observed)
+	default:
+		t.Fatalf("the product wrote WSet=%g W, which is neither 60%% of the 40 kW setting (24000 W) nor "+
+			"60%% of the 60 kW rating (36000 W) — this fixture no longer states the question", wrote)
+	}
+	// Whatever the verdict, the finding must name the reference it used, and it
+	// must be the SETTING: a report that named WMaxRtg here would be unreadable
+	// next to a device that publishes both.
+	if !strings.Contains(f.Observed, "WMax") {
+		t.Errorf("the finding does not name the reference it resolved against: %s", f.Observed)
+	}
+	if strings.Contains(f.Observed, "WMaxRtg") {
+		t.Errorf("the finding resolved the commanded percent against the RATING (WMaxRtg) on a device that "+
+			"publishes a lower configured WMax — the IW15-002 defect, in the referee: %s", f.Observed)
+	}
+}
+
+// TestOracleFixedW_RegisterTruthDecidesNotMeasuredPower is the low-availability
+// case (the design's §9.5 row): a PV DER commanded 60% at night, or under
+// cloud, holds the commanded SETPOINT in its own register while producing far
+// less. The row must still PASS.
+//
+// The distinction is the difference between certifying the DUT and certifying
+// the weather. What BASIC-013 asserts is that the commanded setpoint reached
+// the DER's set-active-power register; what the machine then manages to produce
+// against it is the inverter's business and the irradiance's. An oracle that
+// required measured power to equal the setpoint would fail every honest run
+// taken on a cloudy afternoon — and, worse, would PASS a gateway that wrote
+// nothing at all on a day when available power happened to match.
+func TestOracleFixedW_RegisterTruthDecidesNotMeasuredPower(t *testing.T) {
+	spec := diff.Bench702()
+	spec.WNow = 1_200 // heavy cloud: ~2% of nameplate, far below the 36 kW setpoint
+	dev := diff.NewDevice(spec)
+	rdr, err := sunspec.NewReader(dev)
+	if err != nil {
+		t.Fatalf("sunspec.NewReader: %v", err)
+	}
+	base, err := derbase.Init(rdr, "oracle-test")
+	if err != nil {
+		t.Fatalf("derbase.Init: %v", err)
+	}
+	spc := model.SignedPerCent{Value: 6000}
+	if err := base.ApplyControl(model.DERControlBase{OpModFixedW: &spc}, "oracle-test"); err != nil {
+		t.Fatalf("ApplyControl(opModFixedW=6000): %v", err)
+	}
+	f := oracleFixedW(6000)(context.Background(), oracleTestRunCtx(t, dev))
+	if f.Verdict != certify.Pass {
+		t.Fatalf("oracleFixedW(6000) against a DER holding the commanded setpoint while PRODUCING 1200 W = "+
+			"%+v, want Pass: the register is what this row certifies, and available power is not the DUT's "+
+			"to command", f)
+	}
+	if !strings.Contains(f.Observed, "SETPOINT") {
+		t.Errorf("the PASS does not name the actuation it read: %s", f.Observed)
 	}
 }
 

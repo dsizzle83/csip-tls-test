@@ -75,6 +75,22 @@ type DeviceSpec struct {
 	WChaRteMaxRtgW    float64
 	WDisChaRteMaxRtgW float64
 
+	// Rate SETTINGS (702 RW, storage): the settable counterparts of the two
+	// ratings above, and what a signed percent is a percentage of on a device
+	// that publishes them (IEEE 2030.5 DERSettings setMaxChargeRateW /
+	// setMaxDischargeRateW, each of which "Defaults to" its rating;
+	// invariant.Nameplate.wRteMax, IW15-002). Zero means "leave
+	// not-implemented", written as the SENTINEL rather than a raw zero for the
+	// reason setNotImpl16 states: a Tuint16 zero here is the device declaring a
+	// CONFIGURED maximum of 0 W for that direction, which denies it outright,
+	// and every fixture in this file predates the two points.
+	//
+	// A value BELOW its rating is the derated-machine shape the settings-first
+	// rule exists for; a value ABOVE it is the device defect that rule refuses
+	// to command against.
+	WChaRteMaxW    float64
+	WDisChaRteMaxW float64
+
 	// Scale factors the device publishes. These are the device's own choice
 	// in SunSpec and a client must honour them; picking awkward ones on
 	// purpose is how a scale-handling bug is provoked.
@@ -347,6 +363,16 @@ func (d *Device) fill702(regs []uint16) {
 	}
 	rateRtg("WChaRteMaxRtg", d.Spec.WChaRteMaxRtgW)
 	rateRtg("WDisChaRteMaxRtg", d.Spec.WDisChaRteMaxRtgW)
+	// The two rate SETTINGS take the identical treatment, and for a sharper
+	// version of the same reason (IW15-002): they are what a signed percent is
+	// resolved against when the device publishes them, so a raw zero left here
+	// by a fixture that simply predates the points would read as "configured to
+	// a maximum of 0 W" and deny the axis on every device in this file. The
+	// sentinel is the honest "this fixture does not configure that axis", and
+	// it is what BOTH sim profiles already write (sim/southbound
+	// solar_adv.go populate702, battery_pack.go).
+	rateRtg("WChaRteMax", d.Spec.WChaRteMaxW)
+	rateRtg("WDisChaRteMax", d.Spec.WDisChaRteMaxW)
 }
 
 func (d *Device) fill704(regs []uint16) {

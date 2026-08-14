@@ -267,6 +267,14 @@ func packRegs(t *testing.T, wMaxW, chaW, disW float64) []uint16 {
 		regs[sunspec.L702.Offset("WMaxRtg")] = 0xFFFF
 		regs[sunspec.L702.Offset("WMax")] = 0xFFFF
 	}
+	// The two rate SETTINGS default to the not-implemented sentinel, and the
+	// distinction is the same one the ratings turn on: a fixture that simply
+	// left them at the Go zero value would be declaring a device CONFIGURED to
+	// a maximum of 0 W in both directions, which denies the axis outright
+	// (IW15-002 — Nameplate.wRteMax). rateNameplate overwrites them for the
+	// tests that are about the settings.
+	regs[sunspec.L702.Offset("WChaRteMax")] = 0xFFFF
+	regs[sunspec.L702.Offset("WDisChaRteMax")] = 0xFFFF
 	for name, val := range map[string]float64{"WChaRteMaxRtg": chaW, "WDisChaRteMaxRtg": disW} {
 		if math.IsNaN(val) {
 			regs[sunspec.L702.Offset(name)] = 0xFFFF // not implemented
@@ -275,6 +283,263 @@ func packRegs(t *testing.T, wMaxW, chaW, disW float64) []uint16 {
 		v.SetFloat(name, val)
 	}
 	return regs
+}
+
+// rateNameplate builds a 702 image carrying a nameplate and BOTH per-direction
+// rate points — the read-only *Rtg rating and its settable counterpart — so a
+// test can state the rating and the setting independently. NaN publishes the
+// SunSpec not-implemented sentinel (0xFFFF); any other value, zero included, is
+// written as implemented data, because "absent" and "configured to zero" are
+// different declarations and wRteMax's whole contract is telling them apart.
+func rateNameplate(t *testing.T, wMaxW, chaRtg, chaSet, disRtg, disSet float64) Nameplate {
+	t.Helper()
+	regs := packRegs(t, wMaxW, chaRtg, disRtg)
+	v := sunspec.L702.View(regs)
+	for name, val := range map[string]float64{"WChaRteMax": chaSet, "WDisChaRteMax": disSet} {
+		if math.IsNaN(val) {
+			regs[sunspec.L702.Offset(name)] = 0xFFFF
+			continue
+		}
+		v.SetFloat(name, val)
+	}
+	return DecodeNameplate("test", regs)
+}
+
+// TestNameplate_RateReferenceIsSettingsFirst is IW15-002's contract for the
+// harness's own referee, stated as a table over the whole rule.
+//
+// A signed percent-of-active-power setpoint is a percentage of what the device
+// is CONFIGURED to do, not of what its hardware could do — the same reading
+// Nameplate.Base has always applied to WMax and the reactive points, and the
+// one IEEE 2030.5 states outright for this axis (DERSettings setMaxChargeRateW
+// "Defaults to rtgMaxChargeRateW"). Until IW15-002 this one function read the
+// *Rtg ratings and nothing else, so a machine derated by its installer had
+// every percent resolved against a number it would never reach.
+//
+// Each row states the rating, the setting, and the reference a commanded
+// percent must be taken against. The rows are not variations on a theme: five
+// of them are the cases the shorthand "use the setting if it is > 0" gets
+// wrong, and each is a different way to over- or under-command a real device.
+func TestNameplate_RateReferenceIsSettingsFirst(t *testing.T) {
+	t.Parallel()
+	const nan = 0 // placeholder; the real NaN is built below
+	_ = nan
+	for _, c := range []struct {
+		name     string
+		rating   float64 // NaN = the not-implemented sentinel
+		setting  float64 // NaN = the not-implemented sentinel
+		wantW    float64
+		wantName string // substring the resolved reference must name
+		wantErr  string // substring; non-empty means the reference must REFUSE
+	}{
+		{
+			name:   "setting below rating: the derated machine, and the whole point of the rule",
+			rating: 10_000, setting: 2_000,
+			wantW: 2_000, wantName: "WChaRteMax",
+		},
+		{
+			name:   "setting equals rating: the setting still governs, and is named as the setting",
+			rating: 10_000, setting: 10_000,
+			wantW: 10_000, wantName: "WChaRteMax",
+		},
+		{
+			name:   "setting absent: the rating is the standards-prescribed default, and says so",
+			rating: 10_000, setting: math.NaN(),
+			wantW: 10_000, wantName: "rating-default",
+		},
+		{
+			name:   "setting present and ZERO: configured incapacity, never overruled by the rating",
+			rating: 10_000, setting: 0,
+			wantErr: "WChaRteMax",
+		},
+		{
+			name:   "rating present and ZERO: declared incapacity for the direction, whatever is configured",
+			rating: 0, setting: 2_000,
+			wantErr: "WChaRteMaxRtg",
+		},
+		{
+			name:   "setting ABOVE its own rating: a configured limit cannot exceed what it limits",
+			rating: 10_000, setting: 12_000,
+			wantW: 10_000, wantName: "above its own rating",
+		},
+		{
+			name:   "both absent: the nameplate is the honest stand-in, and the finding says so",
+			rating: math.NaN(), setting: math.NaN(),
+			wantW: 5_000, wantName: "implements no WChaRteMaxRtg",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			np := rateNameplate(t, 5_000, c.rating, c.setting, math.NaN(), math.NaN())
+			base, err := np.Base(RefWRteMax, -1, Measurement{})
+			if c.wantErr != "" {
+				if err == nil {
+					t.Fatalf("Base(RefWRteMax, charge) resolved %s where the device declares an incapacity; "+
+						"a referee that quietly resolves a base here grades a command the product refuses",
+						base.Q)
+				}
+				if !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("the refusal does not name %q: %v", c.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Base(RefWRteMax, charge) = %v, want %g W", err, c.wantW)
+			}
+			if math.Abs(base.Q.Val-c.wantW) > 1 {
+				t.Fatalf("reference = %s (%s), want %g W", base.Q, base.Name, c.wantW)
+			}
+			if !strings.Contains(base.Name, c.wantName) {
+				t.Fatalf("reference name = %q, want it to contain %q — a report that does not say WHICH "+
+					"point produced the number cannot be checked by anyone", base.Name, c.wantName)
+			}
+		})
+	}
+}
+
+// TestNameplate_RateReferenceIsAsymmetricAcrossSettings is the per-sign half of
+// the same rule: each direction answers from ITS OWN pair, so a pack derated on
+// one side only is commanded correctly on both.
+//
+// The numbers are chosen so every candidate reference is a different number:
+// resolving the wrong side, or the rating instead of the setting, produces a
+// different watts figure in each of the four combinations.
+func TestNameplate_RateReferenceIsAsymmetricAcrossSettings(t *testing.T) {
+	t.Parallel()
+	// Charge: rated 2000 W, configured down to 1500 W. Discharge: rated 4500 W,
+	// configured at its rating.
+	np := rateNameplate(t, 5_000, 2_000, 1_500, 4_500, 4_500)
+
+	cha, err := np.Base(RefWRteMax, -1, Measurement{})
+	if err != nil || math.Abs(cha.Q.Val-1_500) > 1 || !strings.Contains(cha.Name, "WChaRteMax") {
+		t.Fatalf("charge reference = %v (%v), want the CONFIGURED 1500 W WChaRteMax", cha, err)
+	}
+	if strings.Contains(cha.Name, "WChaRteMaxRtg") {
+		t.Fatalf("the charge reference named the RATING (%q) on a device configured below it — the IW15-002 "+
+			"defect verbatim: −60%% would be −1200 W of hardware instead of −900 W of configuration", cha.Name)
+	}
+	dis, err := np.Base(RefWRteMax, +1, Measurement{})
+	if err != nil || math.Abs(dis.Q.Val-4_500) > 1 {
+		t.Fatalf("discharge reference = %v (%v), want 4500 W", dis, err)
+	}
+	// The arithmetic the references exist for, stated in watts.
+	if got := -60.0 / 100 * cha.Q.Val; math.Abs(got-(-900)) > 1 {
+		t.Fatalf("−60.00%% of the configured charge maximum = %g W, want −900 W", got)
+	}
+	if got := 60.0 / 100 * dis.Q.Val; math.Abs(got-2_700) > 1 {
+		t.Fatalf("+60.00%% of the discharge maximum = %g W, want 2700 W", got)
+	}
+	// One side's configured incapacity is not the other's.
+	half := rateNameplate(t, 5_000, 2_000, 0, 4_500, 4_500)
+	if _, err := half.Base(RefWRteMax, -1, Measurement{}); err == nil {
+		t.Fatal("a device configured to a 0 W charge maximum resolved a charge reference")
+	}
+	if d, err := half.Base(RefWRteMax, +1, Measurement{}); err != nil || math.Abs(d.Q.Val-4_500) > 1 {
+		t.Fatalf("discharge reference = %v (%v) on a device whose CHARGE side is configured to zero; a "+
+			"claim about one direction says nothing about the other", d, err)
+	}
+}
+
+// TestNameplate_RateReferenceIgnoresAnOutOfDomainSetting covers the row a
+// register image cannot express: a Tuint16 point cannot hold ±Inf or a negative
+// number, so this shape can only arrive from a decoder or a transport that
+// produced one, and the Nameplate is therefore built directly.
+//
+// It is not a device claim in the sense a zero is — it is data that cannot be
+// true — so the rating stands in and the finding carries what was read, rather
+// than the reference being refused (which would deny a device its whole axis on
+// the strength of a corrupt word) or the value being used (which would resolve
+// a percentage against infinity).
+func TestNameplate_RateReferenceIgnoresAnOutOfDomainSetting(t *testing.T) {
+	t.Parallel()
+	np := Nameplate{
+		Present:       true,
+		WMaxRtg:       Q(5_000, UnitWatt),
+		WMax:          Q(5_000, UnitWatt),
+		WChaRteMaxRtg: Q(2_000, UnitWatt),
+		WChaRteMax:    Q(math.Inf(1), UnitWatt),
+		// The discharge side stays absent, so this test says nothing about it.
+		WDisChaRteMaxRtg: Q(math.NaN(), UnitWatt),
+		WDisChaRteMax:    Q(math.NaN(), UnitWatt),
+	}
+	base, err := np.Base(RefWRteMax, -1, Measurement{})
+	if err != nil {
+		t.Fatalf("Base(RefWRteMax, charge) = %v, want the 2000 W rating standing in", err)
+	}
+	if math.Abs(base.Q.Val-2_000) > 1 {
+		t.Fatalf("reference = %s, want the 2000 W rating", base.Q)
+	}
+	if !strings.Contains(base.Name, "out-of-domain") || !strings.Contains(base.Name, "WChaRteMax") {
+		t.Fatalf("reference name = %q, want it to report that the SETTING was out of domain and the rating "+
+			"stood in — a silent substitution here is indistinguishable from a device with no setting at all",
+			base.Name)
+	}
+}
+
+// TestNameplate_LimitStaysNarrowest is the guard on the boundary the two rules
+// share (IW15-002): Limit answers "what could this machine possibly be doing"
+// and takes the NARROWEST of rating and setting, while Base/wRteMax answer
+// "what is a commanded percent a percent of" and take the SETTING first. A
+// change that unified them would break one question to serve the other, so both
+// answers are pinned here, side by side, on the same device.
+func TestNameplate_LimitStaysNarrowest(t *testing.T) {
+	t.Parallel()
+	// A machine whose CONFIGURED nameplate is below its rating.
+	regs := packRegs(t, 5_000, math.NaN(), math.NaN())
+	sunspec.L702.View(regs).SetFloat("WMax", 3_000)
+	np := DecodeNameplate("test", regs)
+
+	lim, ok := np.Limit(UnitWatt, +1)
+	if !ok || math.Abs(lim.Q.Val-3_000) > 1 || lim.Name != "WMax" {
+		t.Fatalf("Limit(W) = %v (ok=%t), want the narrowest 3000 W WMax", lim, ok)
+	}
+	base, err := np.Base(RefWMax, +1, Measurement{})
+	if err != nil || math.Abs(base.Q.Val-3_000) > 1 || base.Name != "WMax" {
+		t.Fatalf("Base(RefWMax) = %v (%v), want the configured 3000 W WMax", base, err)
+	}
+	// Now the shape where the two rules genuinely differ: a setting ABOVE the
+	// rating. The plausibility bound must stay at the rating; the reference must
+	// too, but for its own stated reason (the device defect), and neither may
+	// resolve to the 8000 W nobody can reach.
+	regs = packRegs(t, 5_000, math.NaN(), math.NaN())
+	sunspec.L702.View(regs).SetFloat("WMax", 8_000)
+	np = DecodeNameplate("test", regs)
+	lim, ok = np.Limit(UnitWatt, +1)
+	if !ok || math.Abs(lim.Q.Val-5_000) > 1 || lim.Name != "WMaxRtg" {
+		t.Fatalf("Limit(W) = %v (ok=%t), want the 5000 W hardware rating as the narrowest bound", lim, ok)
+	}
+}
+
+// TestNameplate_FactsCarryBothTheRatingAndTheSetting pins what a violation
+// record shows (IW15-002). A finding that printed only "WChaRteMaxRtg 2000 W"
+// on a device configured to 1500 W would leave a reader unable to check the
+// arithmetic the reference performed — the number in the report and the number
+// in the device would simply differ, with nothing to explain it.
+func TestNameplate_FactsCarryBothTheRatingAndTheSetting(t *testing.T) {
+	t.Parallel()
+	np := rateNameplate(t, 5_000, 2_000, 1_500, 4_500, 4_000)
+	got := map[string]string{}
+	for _, f := range np.Facts("der") {
+		got[f.Key] = f.Value
+	}
+	for name, want := range map[string]string{
+		"der.nameplate.WChaRteMaxRtg":    "2000",
+		"der.nameplate.WChaRteMax":       "1500",
+		"der.nameplate.WDisChaRteMaxRtg": "4500",
+		"der.nameplate.WDisChaRteMax":    "4000",
+	} {
+		if got[name] != want {
+			t.Errorf("Facts()[%s] = %q, want %q — both numbers must appear or a reader cannot see WHY a "+
+				"reference resolved the way it did", name, got[name], want)
+		}
+	}
+	// A device that publishes no setting must not have one invented for it.
+	bare := rateNameplate(t, 5_000, 2_000, math.NaN(), math.NaN(), math.NaN())
+	for _, f := range bare.Facts("der") {
+		if f.Key == "der.nameplate.WChaRteMax" {
+			t.Errorf("Facts() reports a WChaRteMax setting (%q) for a device that publishes the "+
+				"not-implemented sentinel", f.Value)
+		}
+	}
 }
 
 // TestNameplate_FixedWReferenceIsPerSign is IW14-001/F5's headline proof, in
@@ -308,7 +573,13 @@ func TestNameplate_FixedWReferenceIsPerSign(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: Base(RefWRteMax, %d) = %v", c.name, c.sign, err)
 		}
-		if base.Name != c.wantName || math.Abs(base.Q.Val-c.wantBase) > 1 {
+		// The name is matched as a SUBSTRING because it now carries a
+		// provenance clause as well as the point: a device publishing no
+		// setting for this direction resolves to "<point> (rating-default: no
+		// <setting> published)", which is the disclosure IW15-002 requires and
+		// which an equality assertion would forbid. What must not change is
+		// WHICH point produced the number.
+		if !strings.Contains(base.Name, c.wantName) || math.Abs(base.Q.Val-c.wantBase) > 1 {
 			t.Fatalf("%s: reference = %s (%s), want %g W (%s)", c.name, base.Q, base.Name, c.wantBase, c.wantName)
 		}
 		if got := c.pct / 100 * base.Q.Val; math.Abs(got-c.wantW) > 1 {
@@ -343,8 +614,15 @@ func TestNameplate_FixedWReferenceFallsBackToTheNameplate(t *testing.T) {
 	// One side declared, the other not: each side answers for itself.
 	np = DecodeNameplate("test", packRegs(t, 5000, 2000, math.NaN()))
 	cha, err := np.Base(RefWRteMax, -1, Measurement{})
-	if err != nil || cha.Name != "WChaRteMaxRtg" || math.Abs(cha.Q.Val-2000) > 1 {
+	if err != nil || !strings.Contains(cha.Name, "WChaRteMaxRtg") || math.Abs(cha.Q.Val-2000) > 1 {
 		t.Fatalf("charge reference = %v (%v), want the declared 2000 W WChaRteMaxRtg", cha, err)
+	}
+	// This device publishes the rating and no setting, so the reference must
+	// say it is the standards-prescribed DEFAULT rather than a configured value
+	// (IW15-002): the two are different claims about the same number.
+	if !strings.Contains(cha.Name, "rating-default") {
+		t.Errorf("charge reference name = %q, want it to disclose that the rating stood in for an "+
+			"unpublished WChaRteMax setting", cha.Name)
 	}
 	dis, err := np.Base(RefWRteMax, +1, Measurement{})
 	if err != nil || math.Abs(dis.Q.Val-5000) > 1 {

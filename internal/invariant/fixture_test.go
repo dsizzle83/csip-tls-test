@@ -40,6 +40,16 @@ func nameplateRegs(t *testing.T, wMaxW, varInjW, varAbsW, vaMaxW float64) []uint
 	v.SetFloat("VarMaxAbs", varAbsW)
 	v.SetFloat("VAMaxRtg", vaMaxW)
 	v.SetFloat("VAMax", vaMaxW)
+	// This fixture models a plain inverter: no charge/discharge-rate axis at
+	// all, neither ratings nor settings. All four points therefore carry the
+	// SunSpec not-implemented sentinel rather than the Go zero value — a raw
+	// zero is the device declaring a rated (or CONFIGURED) maximum of 0 W,
+	// which denies that direction outright instead of leaving it unmodelled
+	// (IW15-002 — Nameplate.wRteMax; the same choice sim/southbound's own
+	// populate702 makes for its PV profile).
+	for _, p := range []string{"WChaRteMaxRtg", "WDisChaRteMaxRtg", "WChaRteMax", "WDisChaRteMax"} {
+		regs[sunspec.L702.Offset(p)] = 0xFFFF
+	}
 	return regs
 }
 

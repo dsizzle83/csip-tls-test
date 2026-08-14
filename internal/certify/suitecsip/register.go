@@ -349,7 +349,18 @@ func registerInverterControls(reg *certify.Registry) {
 		// hundredths of a percent (5000 = 50%), so the test value 6000 = 60%
 		// of max power"). The pre-fix FixedW=50 sent a value two orders of
 		// magnitude off the catalog's own stated test value.
-		{"BASIC-013", 59, withOracle(scalarModeOracled("opModFixedW", 6000,
+		//
+		// IW15-004: this row publishes the procedure's OWN two values and
+		// nothing else. CSIP CTP v1.3 BASIC-013 Figure 13 prescribes a 5000
+		// (50.00%) DEFAULT and a 6000 (60.00%) test value, so the row drives
+		// the DER into 50%, waits for that to reach the DER's own registers,
+		// and then commands exactly 60% — and it carries NO ladder, because a
+		// row whose procedure states its values may not substitute one. The
+		// 2026-08-14 report sent 40% instead of 60% and reported the result as
+		// BASIC-013 conformance evidence; the stale-register problem the ladder
+		// existed for is now solved by the 50% reset, which is what the
+		// procedure prescribes for it in the first place.
+		{"BASIC-013", 59, withOracle(scalarModeOracledDefaultFirst("opModFixedW", 5000, 6000,
 			func(r *ControlRequest, hundredths int64) {
 				r.FixedW = ptr(hundredths)
 			}), oracleFixedW), "a set-active-power command expressed as a percentage of maximum"},

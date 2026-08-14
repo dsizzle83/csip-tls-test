@@ -186,7 +186,25 @@ func fetchWait(ctx context.Context, rc *certify.RunCtx, s spec) (time.Duration, 
 			"cadence", s.Wait)
 	}
 
-	wait, why := rc.ObservationWait(ctx, certify.ObservationSpec{
+	wait, why := pollCycleWait(ctx, rc)
+
+	fitted, trim := fitWaitToBudget(wait, deadlineRemaining(ctx), liveOverhead(s), waitSlots(s))
+	if trim != "" {
+		why += " — " + trim
+	}
+	return fitted, why
+}
+
+// pollCycleWait derives the DUT's poll-cycle window from the cadence it
+// actually keeps — the UNTRIMMED value, before any -timeout budget fitting.
+//
+// It is split out of fetchWait because a second caller needs the same number
+// for a stated reason: prescribedSetup (basic.go) waits for a control it
+// publishes DURING Setup to reach the DER, which is the same journey — a DUT
+// fetch plus its southbound write — and a deadline picked independently would
+// be a second, unexplained number for the same thing.
+func pollCycleWait(ctx context.Context, rc *certify.RunCtx) (time.Duration, string) {
+	return rc.ObservationWait(ctx, certify.ObservationSpec{
 		What:       "IEEE 2030.5 discovery interval",
 		ConfigPath: dutNorthboundConfig,
 		Field:      dutDiscoveryField,
@@ -199,17 +217,40 @@ func fetchWait(ctx context.Context, rc *certify.RunCtx, s spec) (time.Duration, 
 		Slack:          waitSlack,
 		Min:            defaultWait,
 		Max:            waitCap,
-		// Param is deliberately empty: the operator override is handled above,
-		// so that it can bypass the deadline trim below. Passing it here would
-		// return the operator's value through the clamping path instead.
+		// Param is deliberately empty: the operator override is handled by
+		// fetchWait, so that it can bypass the deadline trim. Passing it here
+		// would return the operator's value through the clamping path instead.
 		Param: "",
 	})
+}
 
-	fitted, trim := fitWaitToBudget(wait, deadlineRemaining(ctx), liveOverhead(s), waitSlots(s))
-	if trim != "" {
-		why += " — " + trim
+// cleanupNote renders what this row's teardown could not undo, for the row's
+// own notes. Empty when everything came down cleanly, which is the ordinary
+// case and must stay silent.
+//
+// It is prose rather than a params key because it is not evidence ABOUT the
+// DUT: it is a disclosure that the bench this row (and the next one) ran on is
+// not in the state the row believed it left behind.
+func cleanupNote(d *Driver) string {
+	errs := d.CleanupErrors()
+	if len(errs) == 0 {
+		return ""
 	}
-	return fitted, why
+	return "TEARDOWN INCOMPLETE — this row could not restore the bench, so whatever it armed is still live " +
+		"for the rows that follow and their evidence must be read with that in mind: " + strings.Join(errs, "; ")
+}
+
+// joinNotes appends a sentence to a notes string, keeping the suite's "; "
+// separator and never leaving a leading separator on an empty one.
+func joinNotes(notes, add string) string {
+	switch {
+	case add == "":
+		return notes
+	case notes == "":
+		return add
+	default:
+		return notes + "; " + add
+	}
 }
 
 // waitSlots reports how many FULL poll-cycle waits this spec's live phase
@@ -402,7 +443,12 @@ type spec struct {
 }
 
 // run executes a spec as a certify.Check.
-func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error) {
+//
+// The result is a NAMED return so the deferred Cleanup can still speak into it:
+// a teardown that failed is a fact about this row's evidence (the bench is not
+// as this row left it, and the next row inherits whatever stayed armed), and
+// until it was appended to the notes here it was discarded at every call site.
+func run(ctx context.Context, rc *certify.RunCtx, s spec) (res certify.Result, rerr error) {
 	target, err := certify.AddrPort(rc.Targets.GridSim)
 	if err != nil {
 		return certify.Skipped("the bench's 2030.5 server address %q is not an ip:port: %v",
@@ -424,6 +470,10 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			defer cancel()
 			s.Cleanup(cctx, d)
+			if note := cleanupNote(d); note != "" {
+				rc.Logf("%s", note)
+				res.Notes = joinNotes(res.Notes, note)
+			}
 		}()
 	}
 

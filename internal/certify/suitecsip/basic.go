@@ -145,21 +145,47 @@ type controlMode struct {
 // must not be able to disagree about what was commanded — the pre-fix rows wrote
 // 6000 into the ControlRequest and 6000 again into oracleMaxLimW(6000), two
 // literals one edit apart from certifying a value nobody sent. The second is
-// that an oracled row may have to DEPART from the catalog's value at run time:
-// when the DER's registers already hold what the row is about to command, the
-// post-publication comparison proves nothing (a rerun that never re-applied the
-// control reads identical to one that did), so Setup commands a ladder
-// alternate instead — and only a row that carries its value can change it.
+// that an oracled row may have to establish a pre-state before it commands
+// anything: a post-publication comparison against registers that already held
+// the commanded value proves nothing (a rerun that never re-applied the control
+// reads identical to one that did), and there are two different ways to fix
+// that — see Prescribed and Ladder, which are alternatives and never both.
 type oracleBinding struct {
 	// Commanded is the catalog's own value for this row, in hundredths of a
 	// percent (6000 = 60.00%).
 	Commanded int64
+
+	// Prescribed is the procedure's own DEFAULT value, which this row drives
+	// the DER into — and VERIFIES in effect — before it commands Commanded.
+	// Zero means the row prescribes no default.
+	//
+	// It exists because the ladder below is not admissible evidence for a row
+	// whose procedure states its values (IW15-004). CSIP CTP v1.3 BASIC-013
+	// Figure 13 prescribes a 50 % default and a 60 % test value; a run that
+	// commanded 40 % instead — as the ladder let it — certified a transition
+	// the procedure never asked for, and said so in its own report. With a
+	// prescribed default the stale-register problem the ladder solved is
+	// solved WITHOUT substituting values: the DER is put into the default the
+	// procedure names, that landing is confirmed by this row's own oracle, and
+	// the commanded value is then always exactly the catalog's.
+	Prescribed int64
+
 	// Ladder is the fixed set of alternates Setup may command instead of
 	// Commanded when the DER already holds Commanded. Deterministic and
 	// ordered: the first entry the DER provably does NOT already hold wins.
+	//
+	// It is for rows that do NOT prescribe a default. A row carrying both would
+	// be able to depart from a procedure that told it what to send, so the two
+	// are mutually exclusive by construction (scalarModeOracledDefaultFirst
+	// leaves this nil) and by test.
 	Ladder []int64
+
 	// Publish puts this row's DERControl on the wire carrying `hundredths`.
 	Publish func(ctx context.Context, d *Driver, mrid string, hundredths int64) error
+	// PublishDefault puts the PRESCRIBED default on the wire, under its own
+	// mRID and in a window that opens immediately and outlives the row's own
+	// control (oracleDefaultWindow). Nil on a row with no prescribed default.
+	PublishDefault func(ctx context.Context, d *Driver, mrid string, hundredths int64) error
 	// Judge builds the oracle that reads the DER's own registers and decides
 	// whether they hold `hundredths`.
 	Judge func(hundredths int64) func(ctx context.Context, rc *certify.RunCtx) Finding
@@ -219,7 +245,29 @@ const (
 	oraclePreObservedParam = "iw14.oracle_pre_observed"
 	oracleCommandedParam   = "iw14.oracle_commanded"
 	oracleNoteParam        = "iw14.oracle_note"
+
+	// The PRESCRIBED-default step's own record (IW15-004): the value, the mRID
+	// it was published under, how long the row waited for it to land, and what
+	// the oracle saw when the wait ended. They are separate keys from the pre-
+	// and post-read sets because they are a separate claim — "the DER was in
+	// the procedure's stated default before the test value was commanded" —
+	// and a bundle that could not distinguish it from the baseline read could
+	// not show that the prescribed sequence was followed at all.
+	oracleDefaultCommandedParam = "iw15.oracle_default_commanded"
+	oracleDefaultMRIDParam      = "iw15.oracle_default_mrid"
+	oracleDefaultWindowParam    = "iw15.oracle_default_window"
+	oracleDefaultVerdictParam   = "iw15.oracle_default_verdict"
+	oracleDefaultObservedParam  = "iw15.oracle_default_observed"
 )
+
+// defaultControlMRIDSuffix distinguishes the prescribed default's control from
+// the row's own. The two must be separately addressable: gridsim treats a
+// re-post of an existing mRID as an update-in-place, so publishing both under
+// one mRID would REPLACE the default with the test value rather than layer the
+// event over it — and, more to the point, every criterion in the row binds to
+// the row's own mRID exactly (IW15-004), which the default must therefore not
+// share.
+const defaultControlMRIDSuffix = "-DEFAULT"
 
 // scalarControlWindow is the [StartOffset, StartOffset+DurationS] window (in
 // seconds) a scalar control is published with.
@@ -256,6 +304,18 @@ var scalarWindow = scalarControlWindow{startOffsetS: 30, durationS: 120}
 // waitCap so a later change to either bound fails there rather than on a board.
 var oracleWindow = scalarControlWindow{startOffsetS: 30, durationS: 690}
 
+// oracleDefaultWindow is the window the PRESCRIBED default is published in
+// (IW15-004 — oracleBinding.Prescribed).
+//
+// It opens at +0s, not +30s: Setup WAITS for this control to reach the DER's
+// own registers before it publishes the row's real control, so every second of
+// start offset is a second added to the row's critical path for nothing. It
+// runs longer than the row's own control (oracleWindow closes at +720s) so the
+// default is still standing when the event above it ends — the shape a
+// DefaultDERControl would have, which is what CTP Figure 13 actually
+// prescribes and what this bench's admin surface has no lever for.
+var oracleDefaultWindow = scalarControlWindow{startOffsetS: 0, durationS: 900}
+
 // scalarMode builds a controlMode driven by gridsim's scalar control API, with
 // the default (fetch-only) window.
 func scalarMode(element string, apply func(*ControlRequest)) controlMode {
@@ -269,20 +329,52 @@ func scalarMode(element string, apply func(*ControlRequest)) controlMode {
 // Its apply takes the value the row is actually commanding, rather than closing
 // over a literal: the commanded value is decided at run time (see
 // oracleBinding), and the publisher must carry whatever Setup selected.
+//
+// This is the LADDER shape, for a row whose procedure does not prescribe a
+// default to reset through. A row that does prescribe one takes
+// scalarModeOracledDefaultFirst instead and carries no ladder at all.
 func scalarModeOracled(element string, commanded int64, apply func(*ControlRequest, int64)) controlMode {
-	return controlMode{
-		Element: element,
-		Oracle: &oracleBinding{
-			Commanded: commanded,
-			Ladder:    oracleValueLadder,
-			Publish: func(ctx context.Context, d *Driver, mrid string, hundredths int64) error {
-				req := scalarControlRequest(element, mrid, oracleWindow)
-				apply(&req, hundredths)
-				_, err := d.PostControl(ctx, req)
-				return err
-			},
-		},
+	// prescribed = 0, so the constructor leaves PublishDefault nil and the
+	// ladder is this row's only way to avoid a vacuous comparison.
+	m := scalarModeOracledDefaultFirst(element, 0, commanded, apply)
+	m.Oracle.Ladder = oracleValueLadder
+	return m
+}
+
+// scalarModeOracledDefaultFirst builds the oracled scalar row whose procedure
+// states BOTH values: a default the DER must be driven into first, and the test
+// value it is then commanded (CSIP CTP v1.3 BASIC-013 Figure 13 — default 5000,
+// test value 6000).
+//
+// The two publishers differ only in the window. The default goes out under its
+// own mRID in a window that opens IMMEDIATELY (the row has to wait for it to
+// land, so thirty seconds of start offset is thirty seconds of nothing) and
+// outlives the row's own control, so it sits underneath as the fallback the
+// event supersedes — which is what a DefaultDERControl would do if this bench's
+// admin surface exposed one. The row's own control is published second, so its
+// creationTime is later and it takes precedence at equal primacy.
+//
+// prescribed == 0 means the row prescribes nothing, which is how scalarModeOracled
+// reuses this constructor.
+func scalarModeOracledDefaultFirst(element string, prescribed, commanded int64,
+	apply func(*ControlRequest, int64)) controlMode {
+	publishIn := func(win scalarControlWindow) func(context.Context, *Driver, string, int64) error {
+		return func(ctx context.Context, d *Driver, mrid string, hundredths int64) error {
+			req := scalarControlRequest(element, mrid, win)
+			apply(&req, hundredths)
+			_, err := d.PostControl(ctx, req)
+			return err
+		}
 	}
+	b := &oracleBinding{
+		Commanded:  commanded,
+		Prescribed: prescribed,
+		Publish:    publishIn(oracleWindow),
+	}
+	if prescribed != 0 {
+		b.PublishDefault = publishIn(oracleDefaultWindow)
+	}
+	return controlMode{Element: element, Oracle: b}
 }
 
 // scalarModeWindow is the body of scalarMode: a fetch-only scalar row, whose
@@ -391,8 +483,14 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 					Skip: m.Unreachable,
 				})
 			} else {
-				crits = append(crits, critDERControlCarriesMode(m.Element,
-					"the DUT fetched a DERControl carrying "+subject))
+				// Bound to THIS row's own mRID, and — where the row knows the
+				// scalar it commanded — to that exact value and sign
+				// (IW15-004). An unrelated control carrying the same mode, from
+				// another row or another session's smoke test, must not satisfy
+				// anything here; see critDERControlCarriesModeFrom for the
+				// assertion that did.
+				crits = append(crits, critDERControlCarriesModeFrom(m.Element,
+					"the DUT fetched a DERControl carrying "+subject, o.Param("mrid"), commandedOnWire(m, o)))
 			}
 			crits = append(crits, critDefaultDERControl())
 			if m.Oracle != nil {
@@ -518,6 +616,24 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 	return s
 }
 
+// commandedOnWire is the exact value this row's control must be seen carrying,
+// or nil when the row cannot state one as a single integer (IW15-004).
+//
+// Only the ORACLED rows can: their value is the one thing the row already
+// carries as a number (oracleBinding), and it is read back from the params
+// Setup wrote rather than from the binding, so a run that departed from the
+// catalog's value is graded against what it actually sent. Every other
+// inverter-control row publishes a structure — a boolean connect, a nested
+// power factor, a scaled ActivePower — that no single integer describes, so it
+// binds its mRID and stops there.
+func commandedOnWire(m controlMode, o *Observation) *int64 {
+	if m.Oracle == nil {
+		return nil
+	}
+	v := commandedValue(o.Params, m.Oracle)
+	return &v
+}
+
 // oracledSetup is the ORACLED rows' Setup (BASIC-010/013): read the DER's own
 // registers BEFORE publishing anything, decide which value this run can actually
 // prove something with, then publish THAT value.
@@ -531,6 +647,9 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 // the row establishes its own baseline, and where the baseline would make the
 // comparison vacuous it commands something else.
 func oracledSetup(ctx context.Context, d *Driver, params map[string]string, b *oracleBinding, mrid string) error {
+	if b.Prescribed != 0 {
+		return prescribedSetup(ctx, d, params, b, mrid)
+	}
 	want := b.Commanded
 	pre := b.Judge(want)(ctx, d.rc)
 	if pre.Verdict == certify.Pass {
@@ -559,6 +678,93 @@ func oracledSetup(ctx context.Context, d *Driver, params map[string]string, b *o
 	params[oraclePreVerdictParam] = string(pre.Verdict)
 	params[oraclePreObservedParam] = findingObserved(pre)
 	return b.Publish(ctx, d, mrid, want)
+}
+
+// prescribedSetup is the Setup of a row whose procedure states its values
+// (IW15-004 — BASIC-013): drive the DER into the PRESCRIBED default, wait until
+// this row's own oracle confirms the default LANDED, then publish exactly the
+// catalog's test value. No substitution, ever.
+//
+// Why this replaces the ladder for such a row. The ladder existed to stop a
+// stale register from manufacturing a PASS: if the DER already held what the row
+// was about to command, the row commanded something else instead so the
+// post-read had somewhere to move to. That solved the evidence problem by
+// breaking the procedure — the 2026-08-14 report says in as many words that it
+// sent 40 % where the catalog states 60 %, which is a conformance claim about a
+// test that was not run. The prescribed default solves the SAME problem the way
+// the procedure intends: a stale 60 % is reset THROUGH the 50 % default, so the
+// commanded value never has to move.
+//
+// The default's landing is verified, not assumed. An unverified default would
+// leave the row's baseline unknown — exactly the hole the pre-read closed — and
+// a run whose default never landed would silently degrade into "the DER held 60 %
+// afterwards", which is the reading that started all of this. The verdict of
+// that wait is recorded and oracleOutcome FAILS the row on it (see
+// prescribedDefaultShortfall): a prescribed sequence that was not followed
+// cannot certify the transition it is about.
+func prescribedSetup(ctx context.Context, d *Driver, params map[string]string, b *oracleBinding,
+	mrid string) error {
+	def, defMRID := b.Prescribed, mrid+defaultControlMRIDSuffix
+	params[oracleDefaultCommandedParam] = strconv.FormatInt(def, 10)
+	params[oracleDefaultMRIDParam] = defMRID
+
+	if b.PublishDefault == nil {
+		return fmt.Errorf("suitecsip: %s prescribes a %s default but carries no publisher for it", mrid,
+			pctString(def))
+	}
+	if err := b.PublishDefault(ctx, d, defMRID, def); err != nil {
+		return fmt.Errorf("publish the prescribed %s default as %s: %w", pctString(def), defMRID, err)
+	}
+
+	window := prescribedDefaultDeadline(ctx, d.rc, params)
+	params[oracleDefaultWindowParam] = window.String()
+	landed := settleOracle(ctx, window, func() Finding { return b.Judge(def)(ctx, d.rc) })
+	params[oracleDefaultVerdictParam] = string(landed.Verdict)
+	params[oracleDefaultObservedParam] = findingObserved(landed)
+
+	// The baseline for the row's OWN value is taken AFTER the default landed,
+	// so "the DER did not hold 60% before" is a statement about the DER in the
+	// procedure's stated starting state rather than in whatever state the
+	// previous row left it.
+	want := b.Commanded
+	pre := b.Judge(want)(ctx, d.rc)
+	params[oracleCommandedParam] = strconv.FormatInt(want, 10)
+	params[oraclePreVerdictParam] = string(pre.Verdict)
+	params[oraclePreObservedParam] = findingObserved(pre)
+	params[oracleNoteParam] = fmt.Sprintf("this row followed the procedure's stated sequence: it published a "+
+		"%s DEFAULT under its own mRID (%s), waited up to %s for that default to reach the DER's own "+
+		"registers (%s: %s), and then commanded EXACTLY the catalog's %s under this row's mRID (%s). No "+
+		"ladder alternate is available to it and none was used — a row whose procedure states its values "+
+		"certifies those values or nothing",
+		pctString(def), defMRID, window, landed.Verdict, findingObserved(landed), pctString(want), mrid)
+	return b.Publish(ctx, d, mrid, want)
+}
+
+// prescribedDefaultDeadline is how long prescribedSetup waits for the default
+// to reach the DER's registers: the same poll-cycle window this row will give
+// the DUT to fetch its real control, because it is the same journey — a fetch
+// plus the DUT's southbound write.
+//
+// params is consulted first. run() does not fill pollWindowParam until AFTER
+// Setup, so in a campaign this is always the derived value; a caller that
+// already has a window (a test, or a later phase driving Setup directly) can
+// supply one and keep a unit test from spending a real poll cycle.
+//
+// The derivation is capped at half of whatever is left of the check's own
+// -timeout, so a bench whose default never lands cannot consume the budget the
+// row needs for the control it is actually about.
+func prescribedDefaultDeadline(ctx context.Context, rc *certify.RunCtx, params map[string]string) time.Duration {
+	if d, err := time.ParseDuration(params[pollWindowParam]); err == nil && d > 0 {
+		return d
+	}
+	wait, _ := pollCycleWait(ctx, rc)
+	if left := deadlineRemaining(ctx); left > 0 && wait > left/2 {
+		wait = left / 2
+	}
+	if wait <= 0 {
+		wait = oracleSettleWindow
+	}
+	return wait
 }
 
 // commandedValue reads back the value Setup actually commanded, falling back to
@@ -632,13 +838,18 @@ func oracleOutcome(o *Observation) Finding {
 		return Finding{Verdict: verdict, Observed: post}
 	}
 	// The post-publication read matched. On its own that is a fact about the
-	// DER; it becomes a fact about the DUT only against the baseline Setup took.
+	// DER; it becomes a fact about the DUT only against the baseline Setup took
+	// — and, on a row whose procedure prescribes a starting state, only if the
+	// DER was actually IN that state first.
+	if f, ok := prescribedDefaultShortfall(o); ok {
+		return f
+	}
 	switch preVerdict {
 	case certify.Fail:
 		return Finding{Verdict: certify.Pass, Observed: "the DER did NOT hold the commanded value before " +
 			"this row published its control (" + pre + ") and DOES hold it after the DUT's poll cycle (" +
 			post + ") — the reading MOVED, so the match is evidence this control was applied, not a " +
-			"register an earlier run left behind"}
+			"register an earlier run left behind" + prescribedDefaultCredit(o)}
 	case certify.Pass:
 		return Finding{Verdict: certify.Fail, Observed: "the DER holds the commanded value (" + post +
 			") but ALREADY held it before this row published anything (" + pre + "), and no ladder " +
@@ -651,6 +862,65 @@ func oracleOutcome(o *Observation) Finding {
 			"recorded") + "), so this run cannot show that the reading MOVED. The value is right; that " +
 			"it was THIS row's control that put it there is not established"}
 	}
+}
+
+// prescribedDefaultShortfall is the verdict of the PRESCRIBED-default step, for
+// a row that has one, and it is a decided FAIL whenever that step did not
+// finish (IW15-004).
+//
+// ok is false for every row that prescribes no default — i.e. every row but
+// BASIC-013 — so nothing else in the suite changes shape.
+//
+// Why a post-read that MATCHES can still fail here: this row's claim is not
+// "the DER holds 60 %", it is "the DUT moved this DER from the procedure's
+// prescribed 50 % default to the commanded 60 %". If the default never landed,
+// the starting state is unknown, and a DER that was ALREADY at 60 % (the
+// previous run's register, an unrelated control, a local default) reads exactly
+// the same as one the DUT just moved. That is the reading the 2026-08-14 report
+// presented as a PASS. Reporting the shortfall as anything softer than a FAIL
+// would leave the row certifying a transition nobody observed.
+func prescribedDefaultShortfall(o *Observation) (Finding, bool) {
+	want := o.Params[oracleDefaultCommandedParam]
+	if want == "" {
+		return Finding{}, false
+	}
+	if certify.Verdict(o.Params[oracleDefaultVerdictParam]) == certify.Pass {
+		return Finding{}, false
+	}
+	observed := orText(o.Params[oracleDefaultObservedParam], "no reading was recorded")
+	return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+		"this row's procedure prescribes that the DER be put into a %s DEFAULT before the test value is "+
+			"commanded, and that default was NOT confirmed to reach the DER's own registers within %s "+
+			"(published as %s; the oracle's last reading was %s). The DER may hold the commanded value now, "+
+			"but with the prescribed starting state unestablished nothing distinguishes a DER the DUT MOVED "+
+			"from one that was already there — which is exactly the reading this row must not certify",
+		pctFromParam(want), orText(o.Params[oracleDefaultWindowParam], "the settle window"),
+		orText(o.Params[oracleDefaultMRIDParam], "a separate mRID"), observed)}, true
+}
+
+// prescribedDefaultCredit is the sentence a PASS on such a row adds: the
+// transition it certifies is the one the procedure states, from the value the
+// procedure states. Empty for a row with no prescribed default.
+func prescribedDefaultCredit(o *Observation) string {
+	want := o.Params[oracleDefaultCommandedParam]
+	if want == "" || certify.Verdict(o.Params[oracleDefaultVerdictParam]) != certify.Pass {
+		return ""
+	}
+	return fmt.Sprintf(". The starting state was the procedure's own: the DER was first driven into its "+
+		"prescribed %s default and that default was CONFIRMED in the DER's own registers (%s) before the "+
+		"commanded value was published, so the transition this row certifies is the one the procedure "+
+		"prescribes", pctFromParam(want), o.Params[oracleDefaultObservedParam])
+}
+
+// pctFromParam renders a hundredths-of-a-percent value carried in params, and
+// falls back to the raw string rather than inventing a number when it cannot be
+// parsed — a prose field must never quietly print a different value from the
+// one the live phase recorded.
+func pctFromParam(v string) string {
+	if h, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return pctString(h)
+	}
+	return v
 }
 
 // orText is the fallback for a prose field the live phase may not have filled.
@@ -984,38 +1254,46 @@ func commandSummary(uv invariant.UnitView) string {
 	return strings.Join(parts, ", ")
 }
 
-// oracleFixedW builds a BASIC-013 (opModFixedW) Oracle. It accepts EITHER of
-// the two standards-faithful actuations of an opModFixedW, and nothing else:
+// oracleFixedW builds a BASIC-013 (opModFixedW) Oracle. It accepts exactly ONE
+// actuation and nothing else: a SETPOINT — an enabled WSet/WSetPct holding the
+// commanded percent of THIS SAME DER's own PER-SIGN active-power rate reference
+// (invariant.RefWRteMax — the charge points when the command is negative, the
+// discharge points when it is positive, each resolved SETTING-FIRST, with the
+// nameplate standing in where the device declares neither).
 //
-//  1. a SETPOINT — an enabled WSet/WSetPct holding the commanded percent of
-//     THIS SAME DER's own PER-SIGN active-power rate reference
-//     (invariant.RefWRteMax — WChaRteMaxRtg when the command is negative,
-//     WDisChaRteMaxRtg when it is positive, the nameplate when the device
-//     leaves that direction's rating unimplemented); or
-//  2. for a NON-NEGATIVE command only, a generation CEILING — an enabled
-//     WMaxLimPct holding the commanded percent itself (fixedWCeilingFold).
+// ── opModFixedW is a SETPOINT; WMaxLimPct can never satisfy it (IW15-001) ───
 //
-// Rung 2 is IW14-004, diagnosed off the ece6499 bench run of 2026-08-14 in
-// which a CORRECT gateway was reported FAIL. IEEE 2030.5's opModFixedW is a
-// percent of maximum active power; on a PV DER with no discharge rating and no
-// ability to absorb, "produce 60% of maximum" and "do not exceed 60% of
-// maximum" are the same physical instruction, and the product folds a
-// non-negative FixedW into the solar ceiling by owner-approved, PICS-documented
-// design (lexa-gw internal/authority/csipin.go's solar branch;
-// docs/conformance/PICS_CSIP.md and RELEASE_SCOPE). The pre-fix oracle knew
-// only the battery actuation, so it read the ceiling the board had just written
-// (journal: "applied CeilingW=4800 (reason=hints-changed)", 60% of the DER's
-// 8000 W WMax, its measured output converging on 4800 W) and reported "the DER
-// reports NO enabled WSet/WSetPct" — a defect in the ORACLE's semantics, not in
-// the product.
+// This function briefly accepted a second "actuation": for a non-negative
+// command, an enabled WMaxLimPct holding the commanded percent — the product's
+// solar fold, admitted here as PICS-documented behaviour. That acceptance was
+// MINE and it was wrong, and it is deleted rather than narrowed.
 //
-// The teeth are unchanged in every other direction: a WMaxLimPct enabled at a
-// DIFFERENT percent is a decided FAIL naming both numbers, an empty axis is the
-// decided FAIL noEnabledAxis already reported, and the ceiling rung is refused
-// outright for a NEGATIVE command, because a maximum-GENERATION limit cannot
-// express a charge setpoint — accepting it there would let a gateway that
-// silently dropped a charge command pass on a register that says nothing about
-// charging at all.
+// The two are different IEEE 2030.5 functions with different registers and
+// different meanings, and the schema says so in its own words
+// (sep-2.0.4.xsd): opModFixedW "specifies a requested charge or discharge mode
+// SETPOINT", while opModMaxLimW "sets the MAXIMUM active power GENERATION
+// LEVEL". A setpoint says produce this; a ceiling says do not exceed this. They
+// coincide only in the single case where the device happens to be able to
+// produce its ceiling and chooses to — under any cloud, at night, on a
+// curtailing inverter, or on any device that can absorb, a ceiling permits
+// every output at or below itself, including zero, and therefore carries no
+// commanded value at all. An oracle that accepts the ceiling cannot tell a
+// gateway that EXECUTED the setpoint from one that silently substituted a
+// different function for it, which is precisely the substitution the review
+// found: BASIC-013's own PASS rested on WMaxLimPct while nothing whatever had
+// been written to the set-active-power register.
+//
+// The register layer already refuses honestly — derbase.preflightActuationWatts
+// requires M704 and a FIXED_W CtrlModes claim before it will write a setpoint,
+// and answers CannotComply otherwise — so a DER that genuinely cannot take a
+// setpoint produces an honest refusal upstream, not a ceiling that has to be
+// re-read as one down here. A referee's job is to say what the device holds,
+// and the answer to "does the DER hold the commanded setpoint?" on a device
+// carrying only a ceiling is NO.
+//
+// So an enabled WMaxLimPct is now REPORTED (fixedWCeilingRefusal) and never
+// accepted: the FAIL names both registers, and both numbers, so a reader can
+// see exactly what the gateway did instead of what was asked.
 //
 // It resolved BOTH signs against WMax until IW14-001/F5. That was not a
 // simplification, it was a defect with two heads on any device whose charge
@@ -1024,11 +1302,12 @@ func commandSummary(uv invariant.UnitView) string {
 // dis 4500 W): a CORRECT gateway commanded −60.00% writes −1200 W and was
 // reported "not applied" against a wanted −3000 W, while a gateway that
 // resolved the percent against the nameplate really did write −3000 W and
-// read as applied. The oracle now mirrors what derbase's fixedWReference
-// actually does (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §2.1),
-// which is what "mirrors the product's own reference" was always supposed to
-// mean; invariant.Nameplate.wRteMax carries the rule and its three-way
-// unimplemented / positive / declared-incapable outcome.
+// read as applied. The oracle mirrors what derbase's fixedWReference actually
+// does (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §2.1), which is what
+// "mirrors the product's own reference" was always supposed to mean;
+// invariant.Nameplate.wRteMax carries the rule, its settings-first resolution
+// (IW15-002) and its three-way unimplemented / positive / declared-incapable
+// outcome.
 func oracleFixedW(wantHundredths int64) func(ctx context.Context, rc *certify.RunCtx) Finding {
 	return func(ctx context.Context, rc *certify.RunCtx) Finding {
 		uv, err := oracleUnitView(ctx, rc, oracleSimName)
@@ -1066,62 +1345,38 @@ func oracleFixedW(wantHundredths int64) func(ctx context.Context, rc *certify.Ru
 			}
 			return Finding{Verdict: certify.Fail, Observed: observed + alt}
 		}
-		// No setpoint actuation. A non-negative command may instead have been
-		// folded into the generation ceiling, which is the other actuation this
-		// row accepts; a negative one may not (see this function's doc).
-		if f, ok := fixedWCeilingFold(uv, np, meas, wantPct); ok {
-			return f
-		}
-		f := noEnabledAxis(fixedWAxisLabel(wantPct), wantPct, base.Name, base.Q.Val, wantW, uv)
-		if wantPct < 0 {
-			f.Observed += ". The WMaxLimPct generation ceiling was NOT considered an acceptable actuation " +
-				"here: this row commanded a NEGATIVE (charging) percent, and a maximum-generation limit " +
-				"cannot express a charge setpoint"
-		}
+		// No setpoint actuation anywhere in the DER's own 704 image. That is the
+		// whole answer to this row's question, whatever else the device may be
+		// holding — but WHAT else it holds is worth printing, because the
+		// commonest wrong implementation writes the ceiling instead (IW15-001).
+		f := noEnabledAxis(fixedWAxisLabel(), wantPct, base.Name, base.Q.Val, wantW, uv)
+		f.Observed += fixedWCeilingRefusal(uv, np, meas, wantPct)
 		return f
 	}
 }
 
-// fixedWAxisLabel names the actuations a FixedW row accepts, for the FAIL that
-// found none of them enabled. The ceiling half appears only where it is
-// genuinely accepted, so the report never offers a reader an actuation that
-// would not have been believed anyway.
-func fixedWAxisLabel(wantPct float64) string {
-	if wantPct < 0 {
-		return "WSet/WSetPct setpoint"
-	}
-	return "WSet/WSetPct setpoint or WMaxLimPct generation ceiling"
-}
+// fixedWAxisLabel names the ONE actuation a FixedW row accepts, for the FAIL
+// that found it absent. It takes no sign: after IW15-001 the answer is the same
+// on both — a maximum-generation limit is not an actuation of a setpoint in
+// either direction, and offering it as one in the FAIL text would tell a reader
+// this row might have been satisfied some other way.
+func fixedWAxisLabel() string { return "WSet/WSetPct setpoint" }
 
-// oracleCeilingPctFloor is the absolute floor oracleTolerance takes when the
-// comparison is percent-to-percent (the ceiling fold) rather than
-// watts-to-watts: one hundredth of a percent, which is BOTH the wire's own
-// SignedPerCent step (opModFixedW is in hundredths of a percent) and the
-// resolution of a 704 WMaxLimPct at the SF=-2 every device on this bench
-// publishes. Anything smaller would fail a row on a rounding step; anything
-// larger would start hiding real percent errors.
-const oracleCeilingPctFloor = 0.01
-
-// fixedWCeilingFold judges the SOLAR actuation of a non-negative opModFixedW:
-// the DER's own WMaxLimPct, ENABLED and holding the commanded PERCENT itself.
+// fixedWCeilingRefusal is the diagnostic clause a FixedW FAIL carries when the
+// DER's own WMaxLimPct IS enabled: it names both registers, and both numbers,
+// and says why the ceiling did not and cannot satisfy this row.
 //
-// It compares percent to percent, not resolved watts, and the difference is
-// deliberate. WMaxLimPct is by SunSpec's own definition a percentage of the
-// DER's WMax, while the percent this row commanded is resolved against the
-// per-sign RATE reference (IW14-001/F5) — the same number on a PV device that
-// implements no rate rating, a different one on anything that does. Judging the
-// bare percent asserts exactly what the fold claims ("the commanded percent
-// became the ceiling percent") and cannot be right for the wrong reason on a
-// device whose two references disagree. The resolved watts are still REPORTED,
-// because a reader wants the physical cap, but they are not what decides.
+// Empty when no enabled, readable ceiling is present, so the FAIL never
+// mentions a register the DER was not holding.
 //
-// ok is false when the DER carries no enabled, readable WMaxLimPct at all, so
-// the caller falls through to its own decided FAIL rather than this one.
-func fixedWCeilingFold(uv invariant.UnitView, np invariant.Nameplate, meas invariant.Measurement,
-	wantPct float64) (Finding, bool) {
-	if wantPct < 0 {
-		return Finding{}, false
-	}
+// This is the diagnostic half of deleting the fold. The gateway shape it
+// describes is real and was observed on the bench: the board wrote an enabled
+// WMaxLimPct at exactly the commanded percent and nothing at all to WSet. A
+// bare "no enabled WSet/WSetPct" would send a reader looking for a write that
+// never happened; naming the ceiling says what the gateway did INSTEAD, which
+// is the actionable finding.
+func fixedWCeilingRefusal(uv invariant.UnitView, np invariant.Nameplate, meas invariant.Measurement,
+	wantPct float64) string {
 	for _, c := range uv.Commands(oracleSimName) {
 		if c.Point != "WMaxLimPct" || !c.Enabled {
 			continue
@@ -1129,25 +1384,30 @@ func fixedWCeilingFold(uv invariant.UnitView, np invariant.Nameplate, meas invar
 		if !c.Raw.Known() || c.Raw.Unit != invariant.UnitPercent {
 			continue
 		}
-		gotPct := c.Raw.Val
-		observed := fmt.Sprintf("the DER actuated this command as a GENERATION CEILING: its own WMaxLimPct "+
-			"register is ENABLED at %.2f%%%s (commanded %.2f%%)", gotPct, ceilingWatts(c, np, meas), wantPct)
-		if math.Abs(gotPct-wantPct) <= oracleTolerance(wantPct, oracleCeilingPctFloor) {
-			return Finding{Verdict: certify.Pass, Observed: observed + ". A non-negative opModFixedW is a " +
-				"percent of maximum active power, and this DER's actuation of it IS a maximum-generation " +
-				"limit — the product's PICS-documented solar fold"}, true
+		clause := fmt.Sprintf(". The DER's own WMaxLimPct IS enabled, at %.2f%%%s, and it was NOT considered "+
+			"an acceptable actuation of this command: WMaxLimPct is opModMaxLimW's register — a MAXIMUM "+
+			"GENERATION LIMIT — while opModFixedW is a SETPOINT and is actuated on WSet/WSetPct. A ceiling "+
+			"permits every output at or below itself, zero included, so it carries no commanded value: it "+
+			"cannot express the %.2f%% this row commanded (IW15-001)", c.Raw.Val,
+			ceilingWatts(c, np, meas), wantPct)
+		if wantPct < 0 {
+			clause += ", and less still on a NEGATIVE (charging) command, where a maximum-GENERATION limit " +
+				"says nothing whatever about charging"
 		}
-		return Finding{Verdict: certify.Fail, Observed: observed + ", which is NOT the commanded percent: " +
-			"neither actuation this row accepts — an enabled WSet/WSetPct setpoint, or the WMaxLimPct " +
-			"generation ceiling holding the commanded percent — carries what was commanded"}, true
+		return clause
 	}
-	return Finding{}, false
+	return ""
 }
 
 // ceilingWatts renders the physical cap an enabled WMaxLimPct imposes, as a
-// trailing clause for the ceiling finding — empty when the DER's own nameplate
-// cannot resolve it, so the finding never invents a watts figure it could not
-// derive.
+// trailing clause for a finding that mentions one — empty when the DER's own
+// nameplate cannot resolve it, so the finding never invents a watts figure it
+// could not derive.
+//
+// Its callers are the ceiling ORACLE (where the cap is the subject) and
+// fixedWCeilingRefusal (where it is the evidence that the gateway wrote the
+// wrong function's register); in neither case does printing the cap imply the
+// row accepted it.
 func ceilingWatts(c invariant.Command, np invariant.Nameplate, meas invariant.Measurement) string {
 	r := invariant.ResolveCommand(c, np, meas)
 	if !r.Physical.Known() || r.Physical.Unit != invariant.UnitWatt {

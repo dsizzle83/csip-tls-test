@@ -393,11 +393,76 @@ func critDefaultDERControl() criterion {
 // something: the row is about a specific opMod* mode, and the wire evidence
 // that the mode reached the DUT is that element appearing inside the
 // DERControlBase of a DERControl the DUT fetched.
+//
+// It matches ANY control carrying the mode and is therefore correct only where
+// no other control could be. Rows that publish their own control take
+// critDERControlCarriesModeFrom, which binds to the row's own mRID and — for a
+// row that also knows its commanded value — to that exact value and sign. See
+// that function for what went wrong without the binding.
 func critDERControlCarriesMode(mode, claim string) criterion {
+	return critDERControlCarriesModeFrom(mode, claim, "", nil)
+}
+
+// critDERControlCarriesModeFrom is critDERControlCarriesMode bound to ONE
+// control: the row's own mRID, and optionally the exact value that row
+// commanded (IW15-004).
+//
+// ── Why an unbound match was not good enough ────────────────────────────────
+//
+// The 2026-08-14 BASIC-013 report cited, as its wire evidence that the DUT had
+// received the row's set-active-power command, a DERControl with
+// mRID=IW14-BAT-SMOKE-1 carrying <opModFixedW>-6000</opModFixedW> — a leftover
+// smoke-test control, on the other sign, from another session. The row had
+// published CERT-BASIC-013 with +6000. Every fact in that assertion was true
+// and none of it was about this row. A criterion that accepts "some control in
+// the window carried this mode" cannot tell a DUT that fetched THIS event from
+// one that fetched somebody else's, and on a shared bench there is always
+// somebody else's.
+//
+// mrid == "" keeps the unbound behaviour, for the callers whose control the
+// bench did not mint (see critDERControlCarriesMode).
+//
+// want == nil binds the mRID only, which is right for a row whose mode carries
+// a structure rather than a scalar (opModConnect's boolean, the nested
+// power-factor and target-power elements): the row still proves it was ITS
+// control the DUT fetched, and the value half is left to the rows that can
+// state it in one integer.
+//
+// The verdicts are graded so a reader can act on them:
+//
+//   - the row's own control, carrying the mode at exactly the commanded value
+//     and sign: PASS, citing the message;
+//   - the row's own control, carrying the mode at a DIFFERENT value: FAIL —
+//     the DUT received something, and what it received is not what this row
+//     sent, which is a finding about the bench-to-DUT path, not an absence;
+//   - the mode present but only under OTHER mRIDs: FAIL naming them, because
+//     the bench lever demonstrably worked and this row's control is missing
+//     from what the DUT fetched — and because accepting them is the defect
+//     above;
+//   - the mode absent entirely: unavailable, unchanged — that is the bench
+//     having no lever for the mode, which is not the DUT's failure.
+func critDERControlCarriesModeFrom(mode, claim, mrid string, want *int64) criterion {
+	how := fmt.Sprintf("the presence of a <%s> element inside the DERControlBase of a DERControl in a "+
+		"DERControlList the DUT fetched during the session", mode)
+	switch {
+	case mrid != "" && want != nil:
+		how = fmt.Sprintf("a <%s> element carrying exactly %d, inside the DERControlBase of the DERControl "+
+			"with THIS ROW's own mRID (%s), in a DERControlList the DUT fetched during the session — no "+
+			"other control's %s satisfies this row, whatever it carries", mode, *want, mrid, mode)
+	case mrid != "":
+		how = fmt.Sprintf("a <%s> element inside the DERControlBase of the DERControl with THIS ROW's own "+
+			"mRID (%s), in a DERControlList the DUT fetched during the session", mode, mrid)
+	case want != nil:
+		// A row that knows its value but not its mRID — the live phase did not
+		// record one. The value binding still holds and the How must say so
+		// rather than describe the looser check it is not making.
+		how = fmt.Sprintf("a <%s> element carrying exactly %d inside the DERControlBase of a DERControl in "+
+			"a DERControlList the DUT fetched during the session (this row recorded no mRID of its own to "+
+			"bind to, so the value is the only correlation available)", mode, *want)
+	}
 	return criterion{
-		Claim: claim,
-		How: fmt.Sprintf("the presence of a <%s> element inside the DERControlBase of a DERControl in a "+
-			"DERControlList the DUT fetched during the session", mode),
+		Claim:           claim,
+		How:             how,
 		NeedsTranscript: true,
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 			lists := t.ByResource("DERControlList")
@@ -405,7 +470,7 @@ func critDERControlCarriesMode(mode, claim string) criterion {
 				return unavailable("no DERControlList appears in the recovered transcript (resources seen: %s)",
 					strings.Join(t.ResourceNames(), " "))
 			}
-			var seenModes []string
+			var seenModes, otherCarriers []string
 			for _, e := range lists {
 				doc, err := e.Resp.SEP()
 				if err != nil {
@@ -419,13 +484,51 @@ func critDERControlCarriesMode(mode, claim string) criterion {
 					for _, k := range base.Kids {
 						seenModes = append(seenModes, k.Local())
 					}
-					if base.Child(mode) != nil {
-						mrid, _ := ctrl.TextOf("mRID")
+					el := base.Child(mode)
+					if el == nil {
+						continue
+					}
+					got, _ := ctrl.TextOf("mRID")
+					if mrid != "" && got != mrid {
+						otherCarriers = append(otherCarriers,
+							fmt.Sprintf("mRID=%s <%s>%s</%s>", got, mode, el.Text, mode))
+						continue
+					}
+					if want == nil {
 						return citeMessage(t, e.Resp, certify.Pass,
-							"DERControl mRID=%s carries <%s>%s</%s>",
-							mrid, mode, base.Child(mode).Text, mode)
+							"DERControl mRID=%s carries <%s>%s</%s>", got, mode, el.Text, mode)
+					}
+					// Exact value AND sign. Compared as integers rather than as
+					// text so "+6000" and "6000" are the same value and "-6000"
+					// is emphatically not — a sign error on a signed percent is
+					// a charge command answered as a discharge one.
+					v, ok := base.IntOf(mode)
+					switch {
+					case !ok:
+						return citeMessage(t, e.Resp, certify.Fail,
+							"this row's own DERControl (mRID=%s) carries <%s>%s</%s>, which is not an "+
+								"integer this criterion can compare against the %d it commanded",
+							got, mode, el.Text, mode, *want)
+					case v != *want:
+						return citeMessage(t, e.Resp, certify.Fail,
+							"this row's own DERControl (mRID=%s) reached the DUT carrying <%s>%d</%s>, "+
+								"but this row commanded %d — the value on the wire is not the value under "+
+								"test, so nothing downstream of it can certify this row",
+							got, mode, v, mode, *want)
+					default:
+						return citeMessage(t, e.Resp, certify.Pass,
+							"DERControl mRID=%s — THIS row's own — carries <%s>%d</%s>, exactly the value "+
+								"and sign it commanded", got, mode, v, mode)
 					}
 				}
+			}
+			if len(otherCarriers) > 0 {
+				return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+					"no DERControl with THIS row's mRID (%s) carrying a <%s> appears in what the DUT "+
+						"fetched. The mode IS present in the window, under %d other control(s) — %s — and "+
+						"none of them is this row's: an unrelated control carrying the same mode says "+
+						"nothing about whether the command under test reached the DUT (IW15-004)",
+					mrid, mode, len(otherCarriers), strings.Join(otherCarriers, "; "))}
 			}
 			return unavailable("no DERControl the DUT fetched carries a <%s>; the modes seen were: %s. "+
 				"gridsim's admin control API has no lever for this mode, so it could not be placed on the wire",

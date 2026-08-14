@@ -162,7 +162,16 @@ type Nameplate struct {
 	// percentage of on a device that declares them (RefWRteMax), and a checker
 	// that resolves both signs against WMax instead reports a correct gateway
 	// as broken on any pack whose charge rating differs from its nameplate.
-	WChaRteMaxRtg, WDisChaRteMaxRtg Quantity `json:"-"`
+	//
+	// WChaRteMax / WDisChaRteMax are their SETTABLE counterparts — what the
+	// operator has configured the device to do, which is what a percentage is a
+	// percentage OF (IW15-002; sep-2.0.4.xsd: DERSettings setMaxChargeRateW
+	// "Defaults to rtgMaxChargeRateW", setMaxDischargeRateW "Defaults to
+	// rtgMaxDischargeRateW"). Without these fields the rate axis was the ONE
+	// place in this struct where a rating stood in for a setting, and
+	// [Nameplate.wRteMax] could only ever answer with the hardware number.
+	WChaRteMaxRtg, WChaRteMax       Quantity `json:"-"`
+	WDisChaRteMaxRtg, WDisChaRteMax Quantity `json:"-"`
 }
 
 // LimitRef is a resolved limit together with the name of the rating that
@@ -177,6 +186,29 @@ type LimitRef struct {
 // (+1 injecting/exporting, -1 absorbing/importing). ok is false when the
 // device published neither the rating nor the setting, in which case the
 // caller must SKIP rather than compare against zero.
+//
+// ── Two rules, two questions: do NOT unify this with [Nameplate.Base] ───────
+//
+// This function takes the NARROWEST of the rating and the setting; Base's pick
+// (and [Nameplate.wRteMax]) take the SETTING FIRST and fall back to the rating.
+// That is not an inconsistency to be tidied away — the two answer different
+// questions, and each answer is wrong for the other question:
+//
+//   - Limit answers "what could this machine POSSIBLY be doing right now" — a
+//     plausibility bound on an observation. Neither declaration may be
+//     exceeded, so the smaller one governs, and an observation above it is a
+//     finding whichever number produced it.
+//   - Base answers "what is a commanded PERCENTAGE a percentage OF" — a
+//     reference for arithmetic. "80% of WMax" means 80% of what the device is
+//     CONFIGURED to do; the machine answers a control as configured, and the
+//     harness must resolve the percent against the same quantity the device's
+//     own register layer does or a 100% request could be judged against a
+//     bound read off a different point.
+//
+// Collapsing them would break one of the two: a min() reference would silently
+// re-scale every commanded percent on a device whose setting exceeds its
+// rating, and a settings-first plausibility bound would wave through an
+// observation above the hardware rating.
 func (n Nameplate) Limit(u Unit, sign int) (LimitRef, bool) {
 	narrowest := func(pairs ...LimitRef) (LimitRef, bool) {
 		var best LimitRef
@@ -326,8 +358,9 @@ func (n Nameplate) Base(r RefBase, sign int, meas Measurement) (LimitRef, error)
 	return LimitRef{}, fmt.Errorf("no reference base declared")
 }
 
-// wRteMax resolves RefWRteMax: the rate rating for the side being commanded,
-// or the nameplate when the device does not declare that side.
+// wRteMax resolves RefWRteMax: the rate reference for the side being commanded
+// — the device's own SETTING where it publishes one, its rating where it does
+// not, and the nameplate when it declares neither.
 //
 // ── Why this is not "both signs against WMax" (IW14-001 / adversarial F5) ────
 //
@@ -349,42 +382,125 @@ func (n Nameplate) Base(r RefBase, sign int, meas Measurement) (LimitRef, error)
 // The three-way outcome mirrors derbase.maxRatingBound exactly, including the
 // case the shorthand "use the rating if it is > 0, else WMax" gets wrong:
 //
-//   - the rating is unimplemented (the SunSpec sentinel, decoded to NaN) —
+//   - the reference is unimplemented (the SunSpec sentinel, decoded to NaN) —
 //     honest absence, fall back to WMax;
-//   - the rating is implemented and positive — that is the base;
-//   - the rating is implemented and zero, negative or infinite — the device
+//   - the reference is implemented and positive — that is the base;
+//   - the reference is implemented and zero, negative or infinite — the device
 //     positively declares it cannot perform this direction (or declares
 //     something that cannot be true). That is a CLAIM, not an absence, and
 //     falling back to WMax would silently overrule it, so it is returned as an
 //     error naming the point. derbase refuses the control outright in the same
 //     situation, so a referee that quietly resolved a base here would be
 //     grading a command the product would never have sent.
+//
+// ── Settings first, and the three cases that decides (IW15-002) ─────────────
+//
+// This used to read the *Rtg RATINGS and nothing else, which made the rate axis
+// the one place in this file where the hardware number stood in for the
+// configured one. Everywhere else — Base's own pick — already resolves a
+// percentage against the SETTING ("80% of WMax means 80% of what the device is
+// configured to do"), and IEEE 2030.5 says the same thing about this very axis:
+// sep-2.0.4.xsd defines DERSettings setMaxChargeRateW/setMaxDischargeRateW as
+// the commanded quantity's reference and says each "Defaults to" its rating.
+// The chain below is that rule, and it mirrors what the product's own register
+// layer must do (lexa-proto derbase settingOrRatingBound), so referee and
+// product cannot disagree about what a commanded percent is a percent of:
+//
+//	setting present and LOWER than the rating   -> the setting (a lower
+//	    configured maximum is the whole point of having settings; using the
+//	    rating here silently over-commands a device the operator derated)
+//	setting present and EQUAL                   -> the setting, named as such
+//	setting ABSENT (SunSpec sentinel -> NaN)    -> the rating, named
+//	    "rating-default", which is what the XSD prescribes — this is the ONE
+//	    permitted rating fallback, and it is recorded rather than assumed
+//	setting present and ZERO                    -> declared incapacity, never
+//	    overruled by the rating: an operator who configured a zero charge rate
+//	    has SAID something, and derbase.maxRatingBound already refuses the axis
+//	    for exactly this shape on the rating
+//	setting ABOVE its own rating                -> the RATING, named as a
+//	    device defect: a configured limit cannot exceed the capability it
+//	    limits, and the fail-safe direction is the smaller reference
+//	setting out of domain (±Inf, negative)      -> ignored, the rating stands
+//	    in, and the finding says the setting was out of domain
+//	rating present and ZERO                     -> declared incapacity for the
+//	    whole direction, whatever the setting says: the hardware claim bounds
+//	    the configured one, never the other way round
+//
+// Staleness — the third forbidden case in the product-side rule — has no analogue
+// here and needs none: this Nameplate is decoded from a register image the
+// harness has just read from the device itself, so there is no cached settings
+// snapshot that could silently age into a wrong reference.
 func (n Nameplate) wRteMax(sign int) (LimitRef, error) {
-	point, v := "WDisChaRteMaxRtg", n.WDisChaRteMaxRtg
+	ratingPoint, rating := "WDisChaRteMaxRtg", n.WDisChaRteMaxRtg
+	settingPoint, setting := "WDisChaRteMax", n.WDisChaRteMax
 	side := "discharge/export"
 	if sign < 0 {
-		point, v, side = "WChaRteMaxRtg", n.WChaRteMaxRtg, "charge/import"
+		ratingPoint, rating = "WChaRteMaxRtg", n.WChaRteMaxRtg
+		settingPoint, setting = "WChaRteMax", n.WChaRteMax
+		side = "charge/import"
 	}
+
+	// The RATING's own claims are read first, because they bound the whole
+	// direction: an implemented zero or an impossible value is a statement
+	// about the machine that no configured value can relax.
 	switch {
-	case math.IsNaN(v.Val):
-		// Not implemented: the nameplate is the honest stand-in, and naming
-		// the reason in the LimitRef keeps a finding from reading as though
-		// the device had declared a rate rating equal to its nameplate.
-		base, err := n.Base(RefWMax, sign, Measurement{})
-		if err != nil {
-			return LimitRef{}, fmt.Errorf("the device declares no %s and no nameplate to fall back on: %w", point, err)
-		}
-		base.Name = base.Name + " (this device implements no " + point + ")"
-		return base, nil
-	case math.IsInf(v.Val, 0) || v.Val < 0:
+	case math.IsInf(rating.Val, 0) || rating.Val < 0:
 		return LimitRef{}, fmt.Errorf("the device declares an out-of-domain %s (%s); a capability claim that "+
-			"cannot be true is not a bound to relax", point, v)
-	case v.Val == 0:
+			"cannot be true is not a bound to relax", ratingPoint, rating)
+	case rating.Val == 0:
 		return LimitRef{}, fmt.Errorf("the device declares %s = 0 W: its rated maximum for %s is zero, so it "+
 			"positively declares it cannot perform that direction and no percentage of it is commandable",
-			point, side)
+			ratingPoint, side)
 	}
-	return LimitRef{Q: v, Name: point}, nil
+
+	// Then the SETTING, which governs whenever it is usable.
+	switch {
+	case setting.Val == 0:
+		return LimitRef{}, fmt.Errorf("the device declares %s = 0 W: it is CONFIGURED to a maximum of zero "+
+			"for %s, so it declares it cannot perform that direction as configured and no percentage of it "+
+			"is commandable (its %s rating is %s, which does not overrule a configured zero)",
+			settingPoint, side, ratingPoint, rating)
+	case setting.Known() && setting.Val > 0:
+		switch {
+		case !rating.Known():
+			return LimitRef{Q: setting, Name: settingPoint}, nil
+		case setting.Val <= rating.Val:
+			return LimitRef{Q: setting, Name: settingPoint}, nil
+		default:
+			// A configured maximum ABOVE the hardware rating cannot be true.
+			// Use the rating and say so, rather than commanding a percentage of
+			// a number the machine cannot reach.
+			return LimitRef{Q: rating, Name: fmt.Sprintf(
+				"%s (this device declares a %s SETTING of %s, above its own rating)",
+				ratingPoint, settingPoint, setting)}, nil
+		}
+	case !math.IsNaN(setting.Val):
+		// Implemented, positive-domain-violating (±Inf or negative): not a
+		// usable reference and not a capability claim either. The rating stands
+		// in, and the finding carries what was read.
+		if rating.Known() {
+			return LimitRef{Q: rating, Name: fmt.Sprintf(
+				"%s (this device declares an out-of-domain %s SETTING of %s)",
+				ratingPoint, settingPoint, setting)}, nil
+		}
+	}
+
+	// No usable setting. The rating is the standards-prescribed default.
+	if rating.Known() {
+		return LimitRef{Q: rating, Name: ratingPoint + " (rating-default: no " + settingPoint +
+			" setting published)"}, nil
+	}
+
+	// Neither: the nameplate is the honest stand-in, and naming the reason in
+	// the LimitRef keeps a finding from reading as though the device had
+	// declared a rate reference equal to its nameplate.
+	base, err := n.Base(RefWMax, sign, Measurement{})
+	if err != nil {
+		return LimitRef{}, fmt.Errorf("the device declares no %s and no nameplate to fall back on: %w",
+			ratingPoint, err)
+	}
+	base.Name = base.Name + " (this device implements no " + ratingPoint + ")"
+	return base, nil
 }
 
 // Facts renders the nameplate for a violation record.
@@ -409,9 +525,15 @@ func (n Nameplate) Facts(prefix string) []Fact {
 	out = add(out, "VAMax", n.VAMax)
 	// The per-sign rate ratings are reported for the same reason as the rest:
 	// a finding about a signed active-power setpoint is unreadable without the
-	// rating its percentage was taken against (RefWRteMax).
+	// rating its percentage was taken against (RefWRteMax) — and, since
+	// IW15-002, without the SETTING that governs it where the device publishes
+	// one. Both numbers appear so a reader can see WHY a reference resolved the
+	// way it did (a derated machine, a rating-default, or a setting above its
+	// own rating) instead of having to trust the name alone.
 	out = add(out, "WChaRteMaxRtg", n.WChaRteMaxRtg)
+	out = add(out, "WChaRteMax", n.WChaRteMax)
 	out = add(out, "WDisChaRteMaxRtg", n.WDisChaRteMaxRtg)
+	out = add(out, "WDisChaRteMax", n.WDisChaRteMax)
 	return out
 }
 
@@ -496,9 +618,14 @@ func DecodeNameplate(source string, regs []uint16) Nameplate {
 	n.VMinRtg = Q(v.Float("VMinRtg"), UnitVolt)
 	// The per-sign rate ratings come off the SAME register image as everything
 	// above — the DER's own 702 — so RefWRteMax never needs a second read or a
-	// second source to resolve a signed setpoint's base.
+	// second source to resolve a signed setpoint's base. Their SETTABLE
+	// counterparts come off the same image too (IW15-002): the settings-first
+	// rule wRteMax now applies costs no extra read, because the point the
+	// operator configured sits four registers from the rating it derates.
 	n.WChaRteMaxRtg = Q(v.Float("WChaRteMaxRtg"), UnitWatt)
 	n.WDisChaRteMaxRtg = Q(v.Float("WDisChaRteMaxRtg"), UnitWatt)
+	n.WChaRteMax = Q(v.Float("WChaRteMax"), UnitWatt)
+	n.WDisChaRteMax = Q(v.Float("WDisChaRteMax"), UnitWatt)
 	return n
 }
 
