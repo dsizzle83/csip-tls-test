@@ -218,13 +218,16 @@ func TestPackCeaseShapeIsGenuinely704Less(t *testing.T) {
 	}
 }
 
-// TestPackRateRatingsAreRealSymmetricAndBelowNameplate is the storage fork
+// TestPackRateRatingsAreRealAsymmetricAndBelowNameplate is the storage fork
 // solar_adv.go's populate702 doc defers to a profile like this one. Real
-// (never the sentinel), symmetric, and STRICTLY below the nameplate — the last
-// part being what makes the rating bound reachable at all, since
+// (never the sentinel), ASYMMETRIC (charge strictly below discharge — since
+// IW14-001 the gateway resolves each opModFixedW sign against its own rating,
+// and only asymmetry makes the per-sign references distinguishable from each
+// other and from the nameplate), and both STRICTLY below the nameplate — the
+// last part being what makes the rating bound reachable at all, since
 // checkSetpointWithinNameplate runs first and would otherwise always be the
 // refusal that fires.
-func TestPackRateRatingsAreRealSymmetricAndBelowNameplate(t *testing.T) {
+func TestPackRateRatingsAreRealAsymmetricAndBelowNameplate(t *testing.T) {
 	bs := newTestPack(t, PackShapeSetpoint)
 	c := sunspec.Parse702(readSlice(bs.Regs, bs.pack.m702, sunspec.L702.Len()))
 
@@ -232,32 +235,36 @@ func TestPackRateRatingsAreRealSymmetricAndBelowNameplate(t *testing.T) {
 		t.Fatalf("rate ratings unimplemented (cha=%v discha=%v) — a storage profile must declare them",
 			c.WChaRteMaxRtg, c.WDisChaRteMaxRtg)
 	}
-	if c.WChaRteMaxRtg != c.WDisChaRteMaxRtg {
-		t.Errorf("rate ratings asymmetric: cha=%v discha=%v; this pack is symmetric", c.WChaRteMaxRtg, c.WDisChaRteMaxRtg)
+	if c.WChaRteMaxRtg >= c.WDisChaRteMaxRtg {
+		t.Errorf("rate ratings not asymmetric: cha=%v discha=%v; charge must be strictly below discharge "+
+			"so the per-sign FixedW references are mutually distinguishable", c.WChaRteMaxRtg, c.WDisChaRteMaxRtg)
 	}
-	if c.WChaRteMaxRtg <= 0 || c.WChaRteMaxRtg >= testPackWmax {
-		t.Errorf("charge rate rating %v is not strictly inside (0, nameplate=%v) — the rating bound "+
-			"is then unreachable behind the nameplate bound and ships untested", c.WChaRteMaxRtg, testPackWmax)
+	for name, v := range map[string]float64{"charge": c.WChaRteMaxRtg, "discharge": c.WDisChaRteMaxRtg} {
+		if v <= 0 || v >= testPackWmax {
+			t.Errorf("%s rate rating %v is not strictly inside (0, nameplate=%v) — the rating bound "+
+				"is then unreachable behind the nameplate bound and ships untested", name, v, testPackWmax)
+		}
 	}
 	// The APPARENT-power rate ratings stay honestly absent.
 	if !math.IsNaN(c.VAChaRteMaxRtg) || !math.IsNaN(c.VADisChaRteMaxRtg) {
 		t.Errorf("VA rate ratings = %v/%v, want the not-implemented sentinel: an implemented zero is a "+
 			"positive declaration that this pack cannot charge/discharge at all", c.VAChaRteMaxRtg, c.VADisChaRteMaxRtg)
 	}
-	// Every model that carries the rate agrees about it.
+	// Every model that carries the rate agrees about it — per direction.
 	b := bs.bases
 	for _, e := range []struct {
 		name string
 		got  uint16
+		want float64
 	}{
-		{"M120 MaxChaRte", bs.Regs.Get(b.M120Base + sunspec.M120_MaxChaRte)},
-		{"M120 MaxDisChaRte", bs.Regs.Get(b.M120Base + sunspec.M120_MaxDisChaRte)},
-		{"M802 WChaRteMax", bs.Regs.Get(b.M802Base + uint16(sunspec.M802_WChaRteMax))},
-		{"M802 WDisChaRteMax", bs.Regs.Get(b.M802Base + uint16(sunspec.M802_WDisChaRteMax))},
+		{"M120 MaxChaRte", bs.Regs.Get(b.M120Base + sunspec.M120_MaxChaRte), c.WChaRteMaxRtg},
+		{"M120 MaxDisChaRte", bs.Regs.Get(b.M120Base + sunspec.M120_MaxDisChaRte), c.WDisChaRteMaxRtg},
+		{"M802 WChaRteMax", bs.Regs.Get(b.M802Base + uint16(sunspec.M802_WChaRteMax)), c.WChaRteMaxRtg},
+		{"M802 WDisChaRteMax", bs.Regs.Get(b.M802Base + uint16(sunspec.M802_WDisChaRteMax)), c.WDisChaRteMaxRtg},
 	} {
-		if float64(e.got) != c.WChaRteMaxRtg {
+		if float64(e.got) != e.want {
 			t.Errorf("%s = %d, want %v — a device contradicting itself across models is a fault to "+
-				"inject deliberately, never to ship", e.name, e.got, c.WChaRteMaxRtg)
+				"inject deliberately, never to ship", e.name, e.got, e.want)
 		}
 	}
 }
@@ -279,7 +286,10 @@ func TestPackWSetReachesPhysicalEffectInBothDirections(t *testing.T) {
 		w    float64
 	}{
 		{"discharge", +3000},
-		{"charge", -2500},
+		// Charge magnitude kept inside the (asymmetric, 2000 W) charge rating —
+		// clamping AT the rating is TestPackHonoursItsDeclaredRateRatings' row,
+		// not this one's.
+		{"charge", -1500},
 		{"discharge again, across zero", +1500},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -388,15 +398,14 @@ func TestPackIdleCommandedDischargeDivergesUntilTheAnimationMoves(t *testing.T) 
 func TestPackHonoursItsDeclaredRateRatings(t *testing.T) {
 	bs := newTestPack(t, PackShapeSetpoint)
 	st := newPackAnim()
-	rate := bs.pack.disChaRteMaxW
 
 	for _, tc := range []struct {
 		name       string
 		commanded  float64
 		wantSigned float64
 	}{
-		{"discharge past the rating", testPackWmax, rate},
-		{"charge past the rating", -testPackWmax, -rate},
+		{"discharge past the rating", testPackWmax, bs.pack.disChaRteMaxW},
+		{"charge past the rating", -testPackWmax, -bs.pack.chaRteMaxW},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			writeWSet(t, bs, tc.commanded)
@@ -473,13 +482,14 @@ func TestPackCommandedWInjectWorksOnBothShapes(t *testing.T) {
 			if got := packMeasuredW(bs); math.Abs(got-4000) > packWTol {
 				t.Fatalf("measured W = %.1f, want 4000", got)
 			}
-			// And the reverse direction, through the same key.
-			if err := bs.Inject([]byte(`{"CommandedW_W":-3000}`)); err != nil {
+			// And the reverse direction, through the same key. Magnitude inside
+			// the asymmetric 2000 W charge rating — the clamp has its own test.
+			if err := bs.Inject([]byte(`{"CommandedW_W":-1500}`)); err != nil {
 				t.Fatalf("inject CommandedW_W: %v", err)
 			}
 			packTicks(bs, st, 12)
-			if got := packMeasuredW(bs); math.Abs(got+3000) > packWTol {
-				t.Fatalf("measured W = %.1f, want -3000", got)
+			if got := packMeasuredW(bs); math.Abs(got+1500) > packWTol {
+				t.Fatalf("measured W = %.1f, want -1500", got)
 			}
 		})
 	}

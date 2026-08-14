@@ -294,6 +294,70 @@ type aggLifecycle struct {
 	SpanS       int
 }
 
+// withNonce returns a copy of the scenario with the per-run token appended to
+// EVERY mRID it carries — the controls it publishes and the four kinds of
+// criterion that name one back (Lifecycles, Superseded, Independent, FanOut).
+//
+// It is eventScenario.withNonce (basic.go) for the aggregator table, minted for
+// the same reason and one more. The first reason is the DUT's: lexa-gw's
+// Response tracker dedupes the whole DERControl Response lifecycle on the bare
+// mRID string and persists it, so a suite re-publishing static mRIDs against a
+// long-lived gateway stops earning the Responses its own criteria grade. The
+// second is this harness's own: critEventLifecycle asks whether a MISSING
+// status 1 (Event Received) is the DUT's behaviour, and on an mRID the DUT
+// acknowledged in some earlier campaign that question has no honest answer —
+// gridsim's log is append-only and cross-campaign, so the acknowledgment sits
+// there forever, excusing a DUT that has since regressed to never posting one
+// (F3, hardware evidence in runs/compliance-a78887f-20260813b). A fresh mRID
+// per run makes the event younger than the window that grades it, which is
+// what turns that criterion's FAIL back into something a real defect can reach.
+//
+// The SAME token goes on every mRID in the scenario, so every within-run
+// correlation survives untouched: critAggControlsDelivered still matches the
+// controls it published, the supersession and independence criteria still name
+// those same controls, and each FanOut bullet still points at the event it is
+// about. An empty nonce is the identity, so the table's own tests (and any
+// bench that does not want isolation) read the static mRIDs unchanged.
+func (sc aggScenario) withNonce(nonce string) aggScenario {
+	if nonce == "" {
+		return sc
+	}
+	// An ABSENT mRID stays absent. Two fields are legitimately empty — a
+	// scenario with no supersession claim, and a FanOut bullet the procedure
+	// states about a setpoint rather than an event (Unobservable) — and
+	// withRunNonce's identity is an empty NONCE, not an empty mRID, so
+	// stamping those would invent the string "-<nonce>" and make an absent
+	// claim look like a claim about a control nobody published.
+	tag := func(mrid string) string {
+		if mrid == "" {
+			return ""
+		}
+		return withRunNonce(mrid, nonce)
+	}
+	out := sc
+	out.Controls = make([]aggControl, len(sc.Controls))
+	for i, c := range sc.Controls {
+		c.MRID = tag(c.MRID)
+		out.Controls[i] = c
+	}
+	out.Lifecycles = make([]aggLifecycle, len(sc.Lifecycles))
+	for i, l := range sc.Lifecycles {
+		l.MRID = tag(l.MRID)
+		out.Lifecycles[i] = l
+	}
+	out.Superseded = tag(sc.Superseded)
+	out.Independent = make([]string, len(sc.Independent))
+	for i, m := range sc.Independent {
+		out.Independent[i] = tag(m)
+	}
+	out.FanOut = make([]aggFanOut, len(sc.FanOut))
+	for i, f := range sc.FanOut {
+		f.MRID = tag(f.MRID)
+		out.FanOut[i] = f
+	}
+	return out
+}
+
 // aggDefault is one DefaultDERControl bullet: whose default, and — when the row
 // states it per EndDevice — which devices.
 type aggDefault struct {
@@ -321,11 +385,11 @@ func aggWant(sc aggScenario) func(base ServerView) func(ServerView) bool {
 		}
 		first := sc.Lifecycles[0].MRID
 		// WantNewResponse, not a bare len(v.ResponsesFor(first))>0 — see its
-		// doc (audit 2026-07-30, CORE-022/CORE-023's identical bug): an
-		// AGG-0xx scenario's lifecycle mRID is just as hardcoded as those
-		// two, and a focused re-run of one row must not read "satisfied"
-		// from a Response an EARLIER run against the same gridsim process
-		// already earned for that mRID.
+		// doc (audit 2026-07-30, CORE-022/CORE-023's identical bug). Since
+		// aggScenario.withNonce these mRIDs are per-run, so a Response from an
+		// earlier CAMPAIGN can no longer be mistaken for this one's; what the
+		// predicate still guards is a re-run inside the SAME process, whose
+		// nonce is by construction the same one.
 		return base.WantNewResponse(first)
 	}
 }
@@ -409,7 +473,7 @@ func aggCriteria(sc aggScenario, o *Observation) []criterion {
 		crits = append(crits, critAggControlsDelivered(sc))
 	}
 	for _, l := range sc.Lifecycles {
-		crits = append(crits, critEventLifecycle(l.MRID, l.Label, l.SpanS))
+		crits = append(crits, critEventLifecycle(o, l.MRID, l.Label, l.SpanS))
 	}
 	if sc.Superseded != "" {
 		c := critSupersessionStatus(sc.Superseded, sc.SupersedeStatus, sc.SupersedeMeaning, sc.SupersedeWhy)
@@ -1201,9 +1265,24 @@ func utilGroupRetrieval(ctx context.Context, rc *certify.RunCtx) (certify.Result
 // loop read back off the wire. What the bench cannot reproduce is the row's
 // point — the SCOPE FAN-OUT, where a control at SPA1 yields Responses for EDA1
 // alone, one at FDA for EDA1 and EDA2, and one at SY for all four.
-func utilDERRetrieval(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	const mrid = "CERT-UTIL004"
-	return run(ctx, rc, spec{
+//
+// It takes the suite's per-run nonce for the reason registerAggregator's doc
+// gives in full: this row's control mRID was static, so every campaign after
+// the first re-published an mRID the DUT had already run to terminal, and its
+// lifecycle criterion could no longer tell a DUT that never acknowledged the
+// event from one that acknowledged it in some earlier campaign.
+func utilDERRetrieval(nonce string) certify.Check {
+	mrid := withRunNonce("CERT-UTIL004", nonce)
+	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
+		return run(ctx, rc, utilDERRetrievalSpec(mrid))
+	}
+}
+
+// utilDERRetrievalSpec is UTIL-004's spec, factored out so a test can assert
+// that Setup publishes the mRID this construction owns — the same seam
+// coreResponsesSpec/coreSupersedingSpec expose for CORE-022/023.
+func utilDERRetrievalSpec(mrid string) spec {
+	return spec{
 		RequiresGridSim: true,
 		Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
 			_, err := d.PostControl(ctx, ControlRequest{
@@ -1215,10 +1294,11 @@ func utilDERRetrieval(ctx context.Context, rc *certify.RunCtx) (certify.Result, 
 		},
 		Want: func(base ServerView) func(ServerView) bool {
 			// WantNewResponse, not a bare len(v.ResponsesFor(mrid))>0 — see
-			// its doc (audit 2026-07-30, CORE-022/CORE-023's identical bug):
-			// this hardcoded mRID re-posted by a focused re-run of THIS same
-			// case must not be satisfied by a Response an EARLIER run against
-			// the same gridsim process already earned.
+			// its doc (audit 2026-07-30, CORE-022/CORE-023's identical bug).
+			// The per-run nonce already makes a cross-campaign collision
+			// impossible; this keeps the predicate honest for the one case the
+			// nonce cannot cover, a re-run inside the SAME process, where
+			// Setup and Want share one construction's mRID.
 			return base.WantNewResponse(mrid)
 		},
 		Cleanup: func(ctx context.Context, d *Driver) { _ = d.ClearControls(ctx, progTFA) },
@@ -1235,7 +1315,7 @@ func utilDERRetrieval(ctx context.Context, rc *certify.RunCtx) (certify.Result, 
 					"DERControl", nil),
 				critDERControlCarriesMode("opModFixedPFInjectW",
 					"the DUT fetched the new DERControl carrying the procedure's example control"),
-				critEventLifecycle(mrid, "scoped DERControl", 240),
+				critEventLifecycle(o, mrid, "scoped DERControl", 240),
 				{
 					Claim: "a DERControl published at a topology node produces Responses from exactly the " +
 						"EndDevices in that node's scope: SPA1 → EDA1; FDA → EDA1 and EDA2; SY → all four",
@@ -1256,7 +1336,7 @@ func utilDERRetrieval(ctx context.Context, rc *certify.RunCtx) (certify.Result, 
 				critNotifiedHrefRefetched(o),
 			}
 		},
-	})
+	}
 }
 
 // ── scenario table ───────────────────────────────────────────────────────────

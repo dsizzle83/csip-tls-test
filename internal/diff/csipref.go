@@ -165,13 +165,15 @@ func Intents(ctrl model.DERControlBase, n invariant.Nameplate, meas invariant.Me
 		// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1/§2.1):
 		// SignedPerCent, not ActivePower — a percentage of the device's OWN
 		// setMaxW/setMaxDischargeRateW (positive) or setMaxChargeRateW
-		// (negative), resolved against THIS device's own nameplate (n), never
-		// the DUT's report of it (referee independence, package doc). Phase 1
-		// (this design's own judgment call, mirrored here rather than
-		// reinvented): no distinct charge/discharge rating exists in this
-		// package's Nameplate type either, so both signs resolve against
-		// RefWMax symmetrically — the identical posture csipin.go's
-		// fixedWReference takes.
+		// (negative), resolved against THIS device's own 702 (n), never the
+		// DUT's report of it (referee independence, package doc). The sign
+		// picks the reference: invariant.RefWRteMax reads WChaRteMaxRtg for a
+		// negative percent and WDisChaRteMaxRtg for a positive one, falling
+		// back to the nameplate only where the device implements neither —
+		// which is what derbase's fixedWReference does on the product side.
+		// This referee resolved both signs against RefWMax until IW14-001/F5,
+		// which made it disagree with a CORRECT product by the ratio of the
+		// nameplate to the rate rating on any asymmetric pack.
 		out = append(out, fixedWIntent(*ctrl.OpModFixedW, n, meas))
 	}
 
@@ -246,25 +248,34 @@ func maxLimWQty(pc *model.PerCent, n invariant.Nameplate) *invariant.Quantity {
 	return &q
 }
 
-// fixedWIntent resolves opModFixedW's SignedPerCent into watts against n's own
-// WMax (IW13-001 §1/§2.1, Phase 1 — symmetric both signs, see the call site's
-// comment). Unresolved (not a guess) when n cannot supply WMax at all.
+// fixedWIntent resolves opModFixedW's SignedPerCent into watts against the
+// reference its OWN SIGN selects on this device (IW13-001 §1/§2.1 via
+// invariant.RefWRteMax — see the call site's comment). Unresolved (not a
+// guess) when n supplies no reference at all, and equally unresolved when the
+// device DECLARES it cannot move in the commanded direction: a rated maximum
+// of zero is a claim, and quietly resolving the percent against the nameplate
+// instead would grade a command the product itself refuses to send.
 func fixedWIntent(spc model.SignedPerCent, n invariant.Nameplate, meas invariant.Measurement) Intent {
 	pct := float64(spc.Value) / 100.0
+	sign := 1
+	if pct < 0 {
+		sign = -1
+	}
 	in := Intent{
 		Mode:    "opModFixedW",
 		Kind:    KindSetpoint,
 		Raw:     invariant.Q(pct, invariant.UnitPercent),
-		Ref:     invariant.RefWMax,
+		Ref:     invariant.RefWRteMax,
 		Binding: true,
 	}
 	if !n.Present {
-		in.Unresolved = "the device serves no M702, so WMax has no value on it"
+		in.Unresolved = "the device serves no M702, so neither a rate rating nor a WMax has a value on it"
 		return in
 	}
-	base, err := n.Base(invariant.RefWMax, 1, meas)
+	base, err := n.Base(invariant.RefWRteMax, sign, meas)
 	if err != nil {
-		in.Unresolved = fmt.Sprintf("cannot resolve WMax on this device: %v", err)
+		in.Unresolved = fmt.Sprintf("cannot resolve what the commanded %.2f%% is a percentage of on this "+
+			"device: %v", pct, err)
 		return in
 	}
 	in.BaseUsed = base.Name

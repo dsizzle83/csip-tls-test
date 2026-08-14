@@ -62,6 +62,19 @@ type DeviceSpec struct {
 	VarMaxInj float64
 	VarMaxAbs float64
 
+	// Rate ratings (702 read-only, storage). Zero means "leave
+	// not-implemented" — the shape every fixture in this file had before
+	// storage was modelled at all, and the one in which a SIGNED
+	// percent-of-active-power setpoint falls back to the nameplate. Non-zero
+	// makes the device declare a rated maximum for that DIRECTION, which is
+	// what opModFixedW's SignedPerCent is a percentage of (derbase's
+	// fixedWReference; invariant.RefWRteMax). They are separately settable
+	// and ASYMMETRY is the point: on a device whose charge and discharge
+	// ratings are equal — or equal to the nameplate — a reference confusion
+	// produces the identical watts and is invisible.
+	WChaRteMaxRtgW    float64
+	WDisChaRteMaxRtgW float64
+
 	// Scale factors the device publishes. These are the device's own choice
 	// in SunSpec and a client must honour them; picking awkward ones on
 	// purpose is how a scale-handling bug is provoked.
@@ -161,6 +174,36 @@ func NearlyLoaded() DeviceSpec {
 	s := Bench702()
 	s.Name = "loaded-60kW-at-62kVA"
 	s.WNow, s.VANow, s.VarNow = 62_000, 62_000, 500
+	return s
+}
+
+// AsymmetricPack is the STORAGE shape: a 5 kW battery pack that can absorb far
+// less than it can deliver — 2 kW charging against 4.5 kW discharging, both
+// strictly below its 5 kW nameplate. It mirrors sim/southbound's own pack
+// (packChaRteRatingFrac 0.40 / packDisChaRteRatingFrac 0.90 of a 5 kW
+// nameplate), so the fixture and the live bench agree on the numbers.
+//
+// It exists because a SIGNED percent-of-active-power setpoint (opModFixedW)
+// has THREE candidate references — the charge rating, the discharge rating and
+// the nameplate — and every other fixture in this file makes at least two of
+// them the same number, which is exactly the configuration in which resolving
+// the wrong one is invisible. Here −60.00 % is −1200 W, +60.00 % is +2700 W,
+// and the nameplate fallback a reference-confusing implementation produces is
+// ±3000 W: three distinguishable values, so a checker's arithmetic can be
+// tested rather than merely exercised.
+func AsymmetricPack() DeviceSpec {
+	s := Bench702()
+	s.Name = "asymmetric-pack-5kW"
+	s.WMaxRtgW, s.WMaxW = 5_000, 5_000
+	s.VAMaxRtgVA, s.VAMaxVA = 5_250, 5_250
+	s.VarMaxInjRtg, s.VarMaxInj = 2_000, 2_000
+	s.VarMaxAbsRtg, s.VarMaxAbs = 2_000, 2_000
+	s.WChaRteMaxRtgW, s.WDisChaRteMaxRtgW = 2_000, 4_500
+	// Unity scale factors on the power points: the reference question is
+	// about WHICH rating a percentage is taken against, and a scale factor in
+	// the middle of it would make a failure ambiguous between the two.
+	s.WSF, s.VASF, s.VarSF = 0, 0, 0
+	s.WNow, s.VANow, s.VarNow = 0, 0, 0
 	return s
 }
 
@@ -286,16 +329,24 @@ func (d *Device) fill702(regs []uint16) {
 	v.SetFloat("VNom", 240)
 	v.SetU32("CtrlModes", d.Spec.CtrlModes)
 	// WChaRteMaxRtg/WDisChaRteMaxRtg are left at the not-implemented sentinel
-	// rather than the Go zero value: this package models no battery
-	// charge/discharge-rate rating at all (no DeviceSpec field feeds them),
-	// and since lexa-proto e05dacc a raw zero there is no longer "no bound" —
-	// it is the device positively declaring a rated maximum of 0 W, which
-	// DENIES opModFixedW outright (maxRatingBound in derbase/capability.go).
-	// Sentinel is the honest "this fixture doesn't model that axis", and it
-	// is what keeps opModFixedW's only bound the ±WMax clamp the ctl
+	// rather than the Go zero value UNLESS the spec declares them: a raw zero
+	// there is not "no bound", it is the device positively declaring a rated
+	// maximum of 0 W, which DENIES opModFixedW outright (maxRatingBound in
+	// derbase/capability.go, lexa-proto e05dacc). Sentinel is the honest
+	// "this fixture doesn't model that axis", and on a fixture that does not
+	// it is what keeps opModFixedW's only bound the ±WMax clamp the ctl
 	// catalogue's DIFF-CTL-040 (200 kW on a 60 kW device) exists to probe.
-	setNotImpl16(regs, sunspec.L702, "WChaRteMaxRtg")
-	setNotImpl16(regs, sunspec.L702, "WDisChaRteMaxRtg")
+	// A fixture that DOES declare them (AsymmetricPack) is the storage shape
+	// in which the per-sign reference is distinguishable from the nameplate.
+	rateRtg := func(name string, val float64) {
+		if val <= 0 {
+			setNotImpl16(regs, sunspec.L702, name)
+			return
+		}
+		v.SetFloat(name, val)
+	}
+	rateRtg("WChaRteMaxRtg", d.Spec.WChaRteMaxRtgW)
+	rateRtg("WDisChaRteMaxRtg", d.Spec.WDisChaRteMaxRtgW)
 }
 
 func (d *Device) fill704(regs []uint16) {

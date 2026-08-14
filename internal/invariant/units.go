@@ -119,6 +119,16 @@ const (
 	// repo it is defined, and internal/diff's referee reads it from here.
 	RefVarAvail RefBase = "VarAvail"
 	RefVAMax    RefBase = "VAMax" // maximum apparent power
+	// RefWRteMax is the DIRECTIONAL active-power rate maximum: the base
+	// IEEE 2030.5's opModFixedW SignedPerCent applies against. It is the one
+	// base in this list that is not a single 702 point, because the quantity
+	// it names is not: a NEGATIVE (charge/import) percent is a percent of
+	// WChaRteMaxRtg and a POSITIVE (discharge/export) one is a percent of
+	// WDisChaRteMaxRtg, with WMax standing in for whichever direction the
+	// device leaves unimplemented. See Nameplate.Base for the resolution and
+	// for why resolving both signs against WMax is a defect rather than a
+	// simplification.
+	RefWRteMax RefBase = "WRteMax"
 )
 
 // Nameplate is a DER's own ratings and settings, decoded from ITS OWN model 702
@@ -145,6 +155,14 @@ type Nameplate struct {
 	VAMaxRtg, VAMax           Quantity `json:"-"`
 	AMaxRtg, AMax             Quantity `json:"-"`
 	VNomRtg, VMaxRtg, VMinRtg Quantity `json:"-"`
+
+	// WChaRteMaxRtg / WDisChaRteMaxRtg are the device's own rated maximum
+	// charge and discharge rates. They are NOT a decorative addition to the
+	// list above: they are what a signed percent-of-active-power setpoint is a
+	// percentage of on a device that declares them (RefWRteMax), and a checker
+	// that resolves both signs against WMax instead reports a correct gateway
+	// as broken on any pack whose charge rating differs from its nameplate.
+	WChaRteMaxRtg, WDisChaRteMaxRtg Quantity `json:"-"`
 }
 
 // LimitRef is a resolved limit together with the name of the rating that
@@ -192,9 +210,10 @@ func (n Nameplate) Limit(u Unit, sign int) (LimitRef, bool) {
 // Base resolves a reference base into a physical quantity. meas supplies the
 // live measurement RefVarAvail needs; pass a zero Measurement when none is
 // available and RefVarAvail will report why it could not be resolved. sign is
-// +1 injecting/exporting and -1 absorbing/importing; only RefVarAvail reads it,
-// because only that base is BOUNDED by a two-sided rating (see below) — the
-// others name a specific side already.
+// +1 injecting/exporting/discharging and -1 absorbing/importing/charging;
+// RefVarAvail and RefWRteMax read it, because those are the two bases whose
+// value depends on WHICH SIDE is being commanded — the others name a specific
+// side already.
 //
 // The error is deliberately not swallowed into a zero value: a percentage whose
 // base is unknown cannot be converted, and inventing a base is precisely the
@@ -274,6 +293,8 @@ func (n Nameplate) Base(r RefBase, sign int, meas Measurement) (LimitRef, error)
 		return pick(n.VarMaxAbsRtg, n.VarMaxAbs, "VarMaxAbsRtg", "VarMaxAbs")
 	case RefVAMax:
 		return pick(n.VAMaxRtg, n.VAMax, "VAMaxRtg", "VAMax")
+	case RefWRteMax:
+		return n.wRteMax(sign)
 	case RefVarAvail:
 		va, err := pick(n.VAMaxRtg, n.VAMax, "VAMaxRtg", "VAMax")
 		if err != nil {
@@ -305,6 +326,67 @@ func (n Nameplate) Base(r RefBase, sign int, meas Measurement) (LimitRef, error)
 	return LimitRef{}, fmt.Errorf("no reference base declared")
 }
 
+// wRteMax resolves RefWRteMax: the rate rating for the side being commanded,
+// or the nameplate when the device does not declare that side.
+//
+// ── Why this is not "both signs against WMax" (IW14-001 / adversarial F5) ────
+//
+// A signed percent-of-active-power setpoint (IEEE 2030.5 opModFixedW, carried
+// as SignedPerCent) is a percentage of the device's rated ability IN THE
+// DIRECTION COMMANDED. lexa-proto derbase — the code that actually writes the
+// register on the product side — resolves it that way (derbase.go
+// fixedWReference: WChaRteMaxRtg for a negative value, WDisChaRteMaxRtg for a
+// positive one, WMax when the device leaves that rating unimplemented), and a
+// referee that resolved both signs against WMax would not be independent, it
+// would simply be WRONG about the physics on any device whose charge and
+// discharge ratings differ. Concretely, on the bench's own asymmetric pack
+// (WMax 5000 W, WChaRteMaxRtg 2000 W, WDisChaRteMaxRtg 4500 W) a CORRECT
+// gateway commanded −60.00% writes −1200 W; a checker expecting −3000 W calls
+// that "not applied" and, worse, passes the broken nameplate-fallback
+// implementation that really did write −3000 W. Both errors are decided here,
+// once, for every caller.
+//
+// The three-way outcome mirrors derbase.maxRatingBound exactly, including the
+// case the shorthand "use the rating if it is > 0, else WMax" gets wrong:
+//
+//   - the rating is unimplemented (the SunSpec sentinel, decoded to NaN) —
+//     honest absence, fall back to WMax;
+//   - the rating is implemented and positive — that is the base;
+//   - the rating is implemented and zero, negative or infinite — the device
+//     positively declares it cannot perform this direction (or declares
+//     something that cannot be true). That is a CLAIM, not an absence, and
+//     falling back to WMax would silently overrule it, so it is returned as an
+//     error naming the point. derbase refuses the control outright in the same
+//     situation, so a referee that quietly resolved a base here would be
+//     grading a command the product would never have sent.
+func (n Nameplate) wRteMax(sign int) (LimitRef, error) {
+	point, v := "WDisChaRteMaxRtg", n.WDisChaRteMaxRtg
+	side := "discharge/export"
+	if sign < 0 {
+		point, v, side = "WChaRteMaxRtg", n.WChaRteMaxRtg, "charge/import"
+	}
+	switch {
+	case math.IsNaN(v.Val):
+		// Not implemented: the nameplate is the honest stand-in, and naming
+		// the reason in the LimitRef keeps a finding from reading as though
+		// the device had declared a rate rating equal to its nameplate.
+		base, err := n.Base(RefWMax, sign, Measurement{})
+		if err != nil {
+			return LimitRef{}, fmt.Errorf("the device declares no %s and no nameplate to fall back on: %w", point, err)
+		}
+		base.Name = base.Name + " (this device implements no " + point + ")"
+		return base, nil
+	case math.IsInf(v.Val, 0) || v.Val < 0:
+		return LimitRef{}, fmt.Errorf("the device declares an out-of-domain %s (%s); a capability claim that "+
+			"cannot be true is not a bound to relax", point, v)
+	case v.Val == 0:
+		return LimitRef{}, fmt.Errorf("the device declares %s = 0 W: its rated maximum for %s is zero, so it "+
+			"positively declares it cannot perform that direction and no percentage of it is commandable",
+			point, side)
+	}
+	return LimitRef{Q: v, Name: point}, nil
+}
+
 // Facts renders the nameplate for a violation record.
 func (n Nameplate) Facts(prefix string) []Fact {
 	if !n.Present {
@@ -325,6 +407,11 @@ func (n Nameplate) Facts(prefix string) []Fact {
 	out = add(out, "VarMaxAbs", n.VarMaxAbs)
 	out = add(out, "VAMaxRtg", n.VAMaxRtg)
 	out = add(out, "VAMax", n.VAMax)
+	// The per-sign rate ratings are reported for the same reason as the rest:
+	// a finding about a signed active-power setpoint is unreadable without the
+	// rating its percentage was taken against (RefWRteMax).
+	out = add(out, "WChaRteMaxRtg", n.WChaRteMaxRtg)
+	out = add(out, "WDisChaRteMaxRtg", n.WDisChaRteMaxRtg)
 	return out
 }
 
@@ -407,6 +494,11 @@ func DecodeNameplate(source string, regs []uint16) Nameplate {
 	n.VNomRtg = Q(v.Float("VNomRtg"), UnitVolt)
 	n.VMaxRtg = Q(v.Float("VMaxRtg"), UnitVolt)
 	n.VMinRtg = Q(v.Float("VMinRtg"), UnitVolt)
+	// The per-sign rate ratings come off the SAME register image as everything
+	// above — the DER's own 702 — so RefWRteMax never needs a second read or a
+	// second source to resolve a signed setpoint's base.
+	n.WChaRteMaxRtg = Q(v.Float("WChaRteMaxRtg"), UnitWatt)
+	n.WDisChaRteMaxRtg = Q(v.Float("WDisChaRteMaxRtg"), UnitWatt)
 	return n
 }
 

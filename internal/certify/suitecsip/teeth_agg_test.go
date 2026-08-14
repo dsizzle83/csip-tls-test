@@ -221,32 +221,221 @@ func TestNoSupersessionCriterionRequiresEvidenceOfAbsence(t *testing.T) {
 	}
 }
 
+// ── event lifecycle ──────────────────────────────────────────────────────────
+
+// lifecycleMRID is the mRID every lifecycle test below publishes. It carries a
+// run nonce because the suite's own rows now do (aggScenario.withNonce): the
+// hardware AGG-011 FAIL these tests were written from turned on a STATIC mRID
+// that earlier campaigns had already acknowledged, and a fixture that kept
+// using the static string would be testing a shape the harness can no longer
+// produce.
+var lifecycleMRID = withRunNonce("CERT-AGG011TFA", "5eeded01")
+
+// lifecycleObs builds the two facts a lifecycle criterion weighs its window
+// against: when this check took its baseline, and when it created the event.
+//
+// spanningObs is the ordinary shape, and since the nonce it is the ONLY shape a
+// live aggregator row produces — the check opens its window, then publishes an
+// mRID nothing has ever seen, so the event cannot predate the window. The tests
+// that want the other shape say so explicitly, because "the window opened after
+// the DUT could first have seen this event" is exactly the fact the grade turns
+// on and it must never be arrived at by accident.
+func lifecycleObs(published time.Time) *Observation {
+	base := time.Date(2026, 8, 13, 11, 20, 0, 0, time.UTC)
+	return &Observation{BaselineAt: base,
+		Published: map[string]time.Time{lifecycleMRID: published}}
+}
+
+func spanningObs() *Observation {
+	return lifecycleObs(time.Date(2026, 8, 13, 11, 20, 1, 0, time.UTC))
+}
+
+// lifecycleEvidence is a capture window whose attributed frames begin at t.
+func lifecycleEvidence(t time.Time) *certify.Evidence {
+	return &certify.Evidence{Set: &certify.FrameSet{Start: t}}
+}
+
+// spanningWindow is the frame floor that matches spanningObs: open before the
+// event existed.
+func spanningWindow() *certify.Evidence {
+	return lifecycleEvidence(time.Date(2026, 8, 13, 11, 20, 0, 0, time.UTC))
+}
+
+// wireVerdict is wantVerdict with the evidence handed in, because the lifecycle
+// criterion reads the window's floor off it.
+func wireVerdict(t *testing.T, name string, c criterion, ev *certify.Evidence,
+	tr *Transcript, want certify.Verdict) Finding {
+	t.Helper()
+	f := c.Wire(ev, tr)
+	if f.Unavailable != "" {
+		t.Fatalf("%s: evaluator could not decide: %s", name, f.Unavailable)
+	}
+	if f.Verdict != want {
+		t.Fatalf("%s: verdict = %s, want %s (observed: %s)", name, f.Verdict, want, f.Observed)
+	}
+	return f
+}
+
 // TestEventLifecycleReportsAShortWindowAsAMeasurement pins the distinction a
 // timing criterion has to make: a DUT that never acknowledged the event at all
 // FAILs, but a DUT that got as far as the harness's window allowed is a short
 // MEASUREMENT, not a finding.
 func TestEventLifecycleReportsAShortWindowAsAMeasurement(t *testing.T) {
-	const mrid = "CERT-AGG003"
-	c := critEventLifecycle(mrid, "TFA", 180)
+	mrid := lifecycleMRID
+	c := critEventLifecycle(spanningObs(), mrid, "TFA", 180)
+	ev := spanningWindow()
 
 	full := synthTranscript(responsePOST(mrid, 1), responsePOST(mrid, 2), responsePOST(mrid, 3))
-	wantVerdict(t, "lifecycle (complete)", c, full, certify.Pass)
+	wireVerdict(t, "lifecycle (complete)", c, ev, full, certify.Pass)
 
 	partial := synthTranscript(responsePOST(mrid, 1), responsePOST(mrid, 2))
-	f := wantVerdict(t, "lifecycle (window shorter than the interval)", c, partial, certify.Warn)
+	f := wireVerdict(t, "lifecycle (window shorter than the interval)", c, ev, partial, certify.Warn)
 	if !strings.Contains(f.Observed, waitParam) {
 		t.Errorf("the WARN does not tell the operator how to close it out: %s", f.Observed)
 	}
 
-	// Statuses but never a 1: the procedure requires status 1 on discovery, so
-	// this one really is a finding.
+	// Statuses but never a 1, in a window that was open before the event
+	// existed: the procedure requires status 1 on discovery, the window can
+	// carry the finding, so this one really is a finding.
 	noReceived := synthTranscript(responsePOST(mrid, 2), responsePOST(mrid, 3))
-	f = wantVerdict(t, "lifecycle (no Event Received)", c, noReceived, certify.Fail)
+	f = wireVerdict(t, "lifecycle (no Event Received)", c, ev, noReceived, certify.Fail)
 	if !strings.Contains(f.Observed, "status 1") {
 		t.Errorf("the FAIL does not name the missing status: %s", f.Observed)
 	}
+	if !strings.Contains(f.Observed, "whole opportunity") {
+		t.Errorf("the FAIL does not justify that its window could carry the finding: %s", f.Observed)
+	}
 
 	wantUnavailable(t, "lifecycle (no Responses)", c, synthTranscript())
+}
+
+// TestEventLifecycleWindowPlacementIsNotADUTFailure is the AGG-011 regression
+// (lexa-gw known_issues AGG-011-received-ordering), re-derived for per-run
+// mRIDs.
+//
+// The hardware shape: csip-conf-v1.3::AGG-011 in
+// runs/compliance-a78887f-20260813b caught ONE Response in its frame window —
+// status 2 (Started) for the then-STATIC CERT-AGG011TFA — and graded the absent
+// status 1 as "the DUT … never POSTed status 1 (Event Received)". gridsim's own
+// log (runs/gridsim-iw13-20260813T113648Z.log) holds that event's status 1
+// twice, at 09:26:28 and 09:34:26, from the earlier runs that re-published the
+// same mRID — two hours before this case's window opened. The DUT had
+// acknowledged the event; the harness had graded its own window placement.
+//
+// The mRID is per-run now, so the FIXTURE half of that shape is gone: an event
+// minted this run cannot have been acknowledged two hours ago. What is tested
+// here is the reasoning that remains, stated in the only terms this check can
+// verify for itself — WHEN it created the event, against WHERE its own window
+// opened. Nothing below consults gridsim's cross-campaign log, and that is the
+// point: an undated, LFDI-blind match on <subject> could excuse a DUT with a
+// Response from a different identity in a different campaign, and once it had,
+// the FAIL was unreachable for that mRID forever (F3/F4).
+func TestEventLifecycleWindowPlacementIsNotADUTFailure(t *testing.T) {
+	mrid := lifecycleMRID
+	started := synthTranscript(responsePOST(mrid, 2))
+
+	// (a) THE TEETH, and the case a live aggregator row now always produces: a
+	// fresh mRID, published after this window opened, and a DUT that POSTed a
+	// Started without ever POSTing a Received. Nothing can excuse that, and it
+	// is exactly the regression the pre-2026-08-14 code could not report.
+	c := critEventLifecycle(spanningObs(), mrid, "TFA", 240)
+	f := wireVerdict(t, "lifecycle (regressed DUT, fresh mRID, spanning window)", c,
+		spanningWindow(), started, certify.Fail)
+	if !strings.Contains(f.Observed, "never status 1") {
+		t.Errorf("the FAIL does not name the missing status: %s", f.Observed)
+	}
+	if !strings.Contains(f.Observed, "whole opportunity") || !strings.Contains(f.Observed, mrid) {
+		t.Errorf("the FAIL does not justify that its window could carry the finding: %s", f.Observed)
+	}
+
+	// The same shape at the SERVER tier, whose floor is the baseline snapshot
+	// rather than the capture window: same verdict, for the same reason.
+	sf := c.Server(&ServerView{Available: true, Responses: []AdminResponse{{Subject: mrid, Status: 2}}})
+	if sf.Verdict != certify.Fail {
+		t.Fatalf("server tier: verdict = %s, want FAIL (observed: %s)", sf.Verdict, sf.Observed)
+	}
+
+	// (b) the surviving backstop: a window that opened AFTER this check created
+	// the event cannot convict, because the status 1 may have been POSTed below
+	// its own floor. This is the [2]-only shape that used to be excused by
+	// gridsim's log; it is excused here by a dated fact this check recorded
+	// itself, and the finding says which.
+	late := lifecycleEvidence(time.Date(2026, 8, 13, 11, 22, 0, 0, time.UTC))
+	f = wireVerdict(t, "lifecycle (window opened after the event existed)", c, late, started, certify.Warn)
+	for _, want := range []string{"[2]", "NOT adjudicable", "below this window's floor", mrid} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the WARN does not name %q: %s", want, f.Observed)
+		}
+	}
+
+	// (c) an event this check never created is the other unadjudicable shape —
+	// it may have existed, and been acknowledged, before the window opened.
+	orphan := critEventLifecycle(&Observation{BaselineAt: spanningObs().BaselineAt}, mrid, "TFA", 240)
+	f = wireVerdict(t, "lifecycle (this check did not publish the event)", orphan,
+		spanningWindow(), started, certify.Warn)
+	if !strings.Contains(f.Observed, "did not record creating") {
+		t.Errorf("the WARN does not name why the window cannot adjudicate: %s", f.Observed)
+	}
+
+	// (d) an INVERSION — a Received that follows the event's start — is the
+	// DUT's behaviour ONLY where the window saw the whole of its opportunity to
+	// acknowledge. With a spanning window it is a FAIL...
+	inverted := synthTranscript(responsePOST(mrid, 2), responsePOST(mrid, 1))
+	f = wireVerdict(t, "lifecycle (2 then 1, spanning window)", c, spanningWindow(), inverted, certify.Fail)
+	if !strings.Contains(f.Observed, "only AFTER status 2") {
+		t.Errorf("the FAIL does not name the inversion: %s", f.Observed)
+	}
+
+	// ...and with a LATE window it must not be, because the identical statuses
+	// are what a DUT that acknowledged below the floor and then RE-POSTed its
+	// Received on retry leaves in the window. Convicting there would be the
+	// window-placement grading this whole criterion exists to stop, aimed at
+	// the one shape it was introduced to excuse.
+	f = wireVerdict(t, "lifecycle (2 then 1, late window)", c, late, inverted, certify.Warn)
+	if strings.Contains(f.Observed, "only AFTER") {
+		t.Errorf("a window that opened after the event existed convicted the DUT of an inversion it "+
+			"cannot distinguish from a retried Received: %s", f.Observed)
+	}
+
+	// A DUT that RE-POSTs its Received after the start is not an inversion even
+	// with a spanning window: the acknowledgment still came first.
+	retry := synthTranscript(responsePOST(mrid, 1), responsePOST(mrid, 2), responsePOST(mrid, 1))
+	f = wireVerdict(t, "lifecycle (1, 2, 1 retry)", c, spanningWindow(), retry, certify.Warn)
+	if strings.Contains(f.Observed, "only AFTER") {
+		t.Errorf("a re-POSTed Received was graded as an inversion: %s", f.Observed)
+	}
+
+	// (e) the full lifecycle is unchanged by any of this.
+	full := synthTranscript(responsePOST(mrid, 1), responsePOST(mrid, 2), responsePOST(mrid, 3))
+	wireVerdict(t, "lifecycle (complete, late window)", c, late, full, certify.Pass)
+	wireVerdict(t, "lifecycle (complete, spanning window)", c, spanningWindow(), full, certify.Pass)
+}
+
+// TestEventLifecycleDefersToTheServerWhenTheFramesMissedTheReceived pins the
+// other half of window-awareness: gridsim recorded the status 1 INSIDE this
+// check's window and no frame carrying it was attributed to the case. The
+// capture cannot decide that, so the wire tier steps aside (mint then asks the
+// server) rather than reporting a frame-attribution gap as a DUT failure.
+func TestEventLifecycleDefersToTheServerWhenTheFramesMissedTheReceived(t *testing.T) {
+	mrid := lifecycleMRID
+	obs := spanningObs()
+	obs.Server = ServerView{Available: true,
+		Responses: []AdminResponse{{Subject: mrid, Status: 1}, {Subject: mrid, Status: 2}}}
+	c := critEventLifecycle(obs, mrid, "TFA", 240)
+
+	f := c.Wire(spanningWindow(), synthTranscript(responsePOST(mrid, 2)))
+	if f.Unavailable == "" {
+		t.Fatalf("verdict = %s (%s), want the wire tier to step aside", f.Verdict, f.Observed)
+	}
+	if !strings.Contains(f.Unavailable, "no frame carrying that POST was attributed") {
+		t.Errorf("the reason does not name the attribution gap: %s", f.Unavailable)
+	}
+	// The server's own record then decides, and it has the whole lifecycle
+	// prefix: a WARN about the window's length, not a FAIL about the DUT.
+	sf := c.Server(&obs.Server)
+	if sf.Verdict != certify.Warn {
+		t.Fatalf("server tier: verdict = %s, want WARN (observed: %s)", sf.Verdict, sf.Observed)
+	}
 }
 
 // TestControlDeliveryCatchesTheWrongMode guards the property AGG-010, AGG-011

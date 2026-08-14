@@ -145,9 +145,15 @@ var phaseConditional = map[string]map[uint16]bool{
 // implementation supports storage", and it is read from the same discovery
 // walk MOD-4 already performs, so nothing is assumed: a DUT that declares
 // storage is held to the charge ratings in full. The bench's battery packs
-// (`batsim -pack …`) serve 713 and declare real, symmetric
-// WChaRteMaxRtg/WDisChaRteMaxRtg strictly below nameplate — which is exactly
+// (`batsim -pack …`) serve 713 and declare real WChaRteMaxRtg/WDisChaRteMaxRtg,
+// both strictly below nameplate and ASYMMETRIC to each other since IW14-001
+// (2 000 W charging against 4 500 W discharging on a 5 kW pack, so a signed
+// opModFixedW's per-direction reference is distinguishable) — which is exactly
 // the behaviour this qualifier stops excusing the moment one is admitted.
+// Nothing in this file turns on the two ratings being EQUAL: the qualifier is
+// about PRESENCE, and it names WChaRteMaxRtg alone (storageConditional below,
+// with VAChaRteMaxRtg) because that is the point Table 18 requires and a
+// non-storage DUT honestly leaves at the sentinel.
 // Their APPARENT-power rate ratings are still the sentinel, so a pack on the
 // bench will produce a VAChaRteMaxRtg finding: see the pre-flight note.
 var storageConditional = map[string]bool{

@@ -502,11 +502,6 @@ func TestBASIC027Wire_EndDeviceAbsentIsSkipNotFail(t *testing.T) {
 	}
 }
 
-func containsInt(v []int, want int) bool {
-	for _, n := range v {
-		if n == want {
-			return true
-		}
-	}
-	return false
-}
+// containsInt used to live here; it is criteria_agg.go's now (the lifecycle
+// criterion needs the same membership test in the product path), and a second
+// copy in the test build would not compile.

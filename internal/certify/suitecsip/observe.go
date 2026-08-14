@@ -850,7 +850,36 @@ type Observation struct {
 	// claimed; obs.Param(notifyClaimParam) says which.
 	NotifyEndpoints []netip.AddrPort
 
+	// BaselineAt is when this check took its server-side baseline — the floor
+	// of everything ServerView reports, because Since() deltas against the
+	// snapshot taken at that instant. It is recorded so a criterion that
+	// reasons about WHERE ITS WINDOW SITS can state that floor rather than
+	// assume it.
+	BaselineAt time.Time
+
+	// Published is when this check's own live phase created each DERControl,
+	// keyed by the mRID gridsim assigned (Driver.PostControl records it). It
+	// is what lets a criterion say that an event did not EXIST when the
+	// window opened, which is the only honest ground for reading a missing
+	// discovery-time Response as the DUT's behaviour rather than the window's
+	// placement.
+	Published map[string]time.Time
+
 	notes map[string][]string
+}
+
+// PublishedAt reports when this check published the control with this mRID,
+// and whether it published one at all.
+func (o *Observation) PublishedAt(mrid string) (time.Time, bool) {
+	if o == nil || o.Published == nil {
+		return time.Time{}, false
+	}
+	for m, at := range o.Published {
+		if strings.EqualFold(m, mrid) {
+			return at, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // note records why an evaluator could not answer, so the eventual SKIP carries
@@ -880,6 +909,24 @@ type Driver struct {
 	// LogReader fetches gridsim's request-log backlog. It is a field so a test
 	// can substitute one without a listener; nil uses the real SSE reader.
 	LogReader func(ctx context.Context, baseURL string) ([]string, error)
+
+	// published records when each DERControl this driver created was accepted
+	// by the server, keyed by mRID. run() carries it into the Observation.
+	// The map is written only from PostControl, which the live phase calls
+	// from one goroutine, and read only after the live phase has finished.
+	published map[string]time.Time
+}
+
+// Published returns a copy of when this check published each control.
+func (d *Driver) Published() map[string]time.Time {
+	if len(d.published) == 0 {
+		return nil
+	}
+	out := make(map[string]time.Time, len(d.published))
+	for m, at := range d.published {
+		out[m] = at
+	}
+	return out
 }
 
 // NewDriver builds a driver from the check's run context.
@@ -1241,6 +1288,12 @@ type ControlRequest struct {
 }
 
 // PostControl publishes a DERControl and returns the mRID gridsim assigned.
+//
+// It records WHEN the server accepted the control, because that instant is the
+// earliest the DUT could possibly have discovered the event: a criterion about
+// a discovery-time Response can only read its absence as the DUT's behaviour
+// if its own window opened before this moment. See Observation.Published and
+// lifecycleReach.
 func (d *Driver) PostControl(ctx context.Context, req ControlRequest) (string, error) {
 	var out struct {
 		MRID string `json:"mrid"`
@@ -1250,6 +1303,16 @@ func (d *Driver) PostControl(ctx context.Context, req ControlRequest) (string, e
 	}
 	if out.MRID == "" {
 		out.MRID = req.MRID
+	}
+	if out.MRID != "" {
+		if d.published == nil {
+			d.published = map[string]time.Time{}
+		}
+		// First publication wins: a case that re-posts the same mRID has not
+		// moved the instant the DUT could first have seen that event.
+		if _, seen := d.published[out.MRID]; !seen {
+			d.published[out.MRID] = time.Now().UTC()
+		}
 	}
 	return out.MRID, nil
 }

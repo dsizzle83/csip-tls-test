@@ -217,7 +217,7 @@ func TestSettleOracle_RetriesTheNotYetEnabledShape(t *testing.T) {
 		if calls < 3 {
 			// Exactly what oracleFixedW/oracleMaxLimW return while the DER's
 			// register still holds nothing enabled on the commanded axis.
-			return noEnabledAxis("WSet/WSetPct", 60, 8000, 4800, uv)
+			return noEnabledAxis("WSet/WSetPct", 60, "WDisChaRteMaxRtg", 8000, 4800, uv)
 		}
 		return Finding{Verdict: certify.Pass, Observed: "the DER's own WSet resolves to 4800.0 W"}
 	})

@@ -56,6 +56,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"csip-tls-test/internal/certify"
 )
@@ -865,43 +866,223 @@ func critDefaultControlFetched(o *Observation, which, devices string, names []st
 // event's whole interval can honestly report only how far the DUT got. Saying
 // "statuses 1,2 received in a 90 s window over a 180 s event" is a fact; calling
 // it a failure would be reporting the harness's wait as the DUT's behaviour.
-func critEventLifecycle(mrid, label string, spanS int) criterion {
+//
+// That sentence used to hold for the TAIL of the lifecycle only. A window that
+// stopped before the event's end reported 2-without-3 as a measurement, but a
+// window that opened after the DUT had already acknowledged the event reported
+// 2-without-1 as a FAILURE — the same fact about window placement, graded two
+// different ways. It produced exactly one FAIL on hardware, csip-conf-v1.3::
+// AGG-011 in runs/compliance-a78887f-20260813b ("the DUT POSTed status(es) [2]
+// … but never status 1"), where gridsim's own log holds that event's status 1
+// from 09:26:28 and 09:34:26 — two hours before that case's window opened, from
+// the earlier runs whose hardcoded mRID this one re-published.
+//
+// The ROOT of that hardware FAIL is fixed elsewhere and better: since
+// aggScenario.withNonce / registerAggregator every event these rows publish
+// carries a per-run mRID, so it does not exist until this check creates it,
+// inside its own window, and its discovery Response cannot predate the window
+// that grades it. What survives here is the honest residue — a window is
+// allowed to convict a DUT of never acknowledging an event only when it was
+// open before that event existed, and lifecycleReach is where that is
+// established and, when it cannot be, printed as a limitation instead of a
+// verdict.
+func critEventLifecycle(o *Observation, mrid, label string, spanS int) criterion {
 	return criterion{
 		Claim: fmt.Sprintf("the DUT reports the %s event's lifecycle to the server: Response status 1 "+
 			"(Event Received) on discovery, 2 (Event Started) at the interval start and 3 (Event Completed) "+
 			"after the duration elapses", label),
 		How: "the <status> elements of the Response POSTs whose <subject> is the event's mRID, in the order " +
-			"the capture carries them",
+			"the capture carries them, weighed against where this check's own observation window sits " +
+			"relative to the moment the event was created",
 		NeedsTranscript: true,
-		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-			got, frames := responseStatusesFor(t, mrid)
-			return lifecycleFinding(got, frames, mrid, label, spanS, "the capture")
+		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
+			got, frames := lifecycleStatuses(t, mrid)
+			// The one absence the capture must not adjudicate at all: gridsim
+			// recorded a status 1 for this event INSIDE this check's window and
+			// no frame carrying it was attributed to this case. That is a fact
+			// about frame attribution, so the wire tier steps aside and lets
+			// the server's own record answer (mint's tier fallback).
+			if !containsInt(got, 1) && containsInt(o.windowResponseStatuses(mrid), 1) {
+				return unavailable("gridsim recorded a status 1 (Event Received) for the %s event %s inside "+
+					"this check's own window, but no frame carrying that POST was attributed to this case, so "+
+					"the capture cannot decide the lifecycle's first step and the server's record answers "+
+					"instead", label, mrid)
+			}
+			return lifecycleFinding(got, frames, mrid, label, spanS, "the capture",
+				o.lifecycleReach(frameFloor(ev), "this case's capture window opened", mrid))
 		},
 		Server: func(v *ServerView) Finding {
-			got := v.ResponseStatuses(mrid)
-			f := lifecycleFinding(got, nil, mrid, label, spanS, "gridsim's Response log")
+			got := statusesOf(v.ResponsesFor(mrid))
+			f := lifecycleFinding(got, nil, mrid, label, spanS, "gridsim's Response log",
+				o.lifecycleReach(o.baselineAt(), "this check took its server-side baseline", mrid))
 			f.Frames = nil
 			return f
 		},
 	}
 }
 
-func lifecycleFinding(got, frames []int, mrid, label string, spanS int, src string) Finding {
+// lifecycleReach is what an observation window can honestly say about the FIRST
+// step of an event's lifecycle — the status 1 (Event Received) the procedure
+// puts "on discovery".
+//
+// A window can convict a DUT of never reporting discovery only if it was
+// already open when the event came into existence: otherwise the Response it is
+// looking for may have been POSTed below its own floor, and reporting that
+// absence as a failure reports the harness's window placement as the DUT's
+// behaviour. Every other step is different in kind — a 2 or a 3 has a scheduled
+// time the window can be measured against, which is what the short-window WARN
+// below has always done.
+type lifecycleReach struct {
+	// spans is true when the window opened before the DUT could first have
+	// seen the event, so a missing status 1 is the DUT's behaviour.
+	spans bool
+	// because justifies spans: the fact that makes the window authoritative.
+	because string
+	// limit says why the window CANNOT adjudicate a missing status 1, and is
+	// printed in the finding so the reader sees the limitation named rather
+	// than a verdict resting on it.
+	limit string
+}
+
+// lifecycleReach decides that question for one event against one window floor.
+//
+// floorWhat names the floor in the tier's own terms ("this case's capture
+// window opened"), because the wire tier and the server tier have different
+// floors and a finding that hid which one it used would be unreadable.
+//
+// ── What is NOT consulted here, and why (F3/F4, 2026-08-14) ─────────────────
+//
+// An earlier version of this function first asked whether gridsim's
+// append-only log ALREADY held a status 1 for this mRID before the window, and
+// declined to convict when it did. That test had to go, and deleting it is the
+// smaller fix rather than the braver one:
+//
+//   - It could not be made honest. An AdminResponse carries no timestamp and
+//     the log is cross-campaign, so a match said only "some client, at some
+//     point in the life of this server, acknowledged something with this
+//     subject". Matching on <subject> alone, a status 1 posted weeks ago by a
+//     PRE-ROTATION identity excused today's DUT, permanently.
+//   - Once ANY campaign acknowledged an mRID, the FAIL below became
+//     unreachable for that mRID forever — which is precisely backwards: the
+//     DUT it protected was the one that had REGRESSED to never posting a
+//     Received.
+//   - With per-run mRIDs (aggScenario.withNonce, registerAggregator) the
+//     branch is also unreachable in the shape it was written for: the event is
+//     minted by this process and published inside this window, so gridsim
+//     cannot hold an earlier Response for it. The only ways one could appear
+//     are a nonce COLLISION or a re-run of the same case inside one process —
+//     and in both of those the credited acknowledgment belongs to a different
+//     event or a different run, which is exactly the crediting this deletion
+//     refuses.
+//
+// The two checks that remain rest on facts this check recorded ITSELF —
+// whether it created the event, and when, against its own window's floor — so
+// what they decline to adjudicate they decline for a reason the report can
+// print and a reader can check. The precondition that makes that sufficient —
+// every aggregator row publishing a per-run mRID — is pinned by
+// TestAggregatorRowsPublishNoncedMRIDs and
+// TestUtilDERRetrievalSpecPublishesItsOwnNoncedMRID rather than assumed.
+func (o *Observation) lifecycleReach(floor time.Time, floorWhat, mrid string) lifecycleReach {
+	if o == nil {
+		return lifecycleReach{limit: "this criterion was evaluated without the check's live-phase " +
+			"observation, so where this window sits relative to the event's creation is not knowable here"}
+	}
+	at, ok := o.PublishedAt(mrid)
+	if !ok {
+		return lifecycleReach{limit: fmt.Sprintf("this check did not record creating %s, so the event may "+
+			"have existed — and been discovered, and acknowledged — before %s", mrid, floorWhat)}
+	}
+	if floor.IsZero() {
+		return lifecycleReach{limit: fmt.Sprintf("this window's own floor is not recorded, so whether it "+
+			"opened before %s was created (%s) cannot be established here",
+			mrid, at.Format(time.RFC3339))}
+	}
+	if at.Before(floor) {
+		return lifecycleReach{limit: fmt.Sprintf("%s was created at %s, BEFORE %s (%s): the DUT could have "+
+			"discovered it — and POSTed its status 1 — below this window's floor",
+			mrid, at.Format(time.RFC3339), floorWhat, floor.Format(time.RFC3339))}
+	}
+	return lifecycleReach{spans: true, because: fmt.Sprintf("this check created %s at %s, after %s (%s), so "+
+		"the event did not exist before this window and the window covers the DUT's whole opportunity to "+
+		"report discovery", mrid, at.Format(time.RFC3339), floorWhat, floor.Format(time.RFC3339))}
+}
+
+// baselineAt is the floor of everything ServerView reports for this check.
+func (o *Observation) baselineAt() time.Time {
+	if o == nil {
+		return time.Time{}
+	}
+	return o.BaselineAt
+}
+
+// windowResponseStatuses is the server's record of what the DUT POSTed for one
+// mRID INSIDE this check's window, for a wire evaluator cross-checking its own
+// frame set against it.
+func (o *Observation) windowResponseStatuses(mrid string) []int {
+	if o == nil {
+		return nil
+	}
+	return o.Server.ResponseStatuses(mrid)
+}
+
+// frameFloor is the instant this case's capture window opened — FrameSet.Start,
+// which is the window's own open time less its attribution guard
+// (certify.Window.interval). It is the earliest moment a frame could have been
+// attributed to this case at all, and it is deliberately the EARLIER of the two
+// readings available: a floor that claimed to be the first attributed frame's
+// timestamp would move later on a quiet case and make the window look narrower
+// than it was, which on this criterion is the direction that manufactures
+// findings.
+func frameFloor(ev *certify.Evidence) time.Time {
+	if ev == nil || ev.Set == nil {
+		return time.Time{}
+	}
+	return ev.Set.Start
+}
+
+func lifecycleFinding(got, frames []int, mrid, label string, spanS int, src string, reach lifecycleReach) Finding {
 	if len(got) == 0 {
 		return unavailable("%s holds no Response POST for the %s event %s", src, label, mrid)
 	}
-	has := func(s int) bool {
-		for _, g := range got {
-			if g == s {
-				return true
-			}
-		}
-		return false
+	has := func(s int) bool { return containsInt(got, s) }
+	// ORDER, and only where the window can carry a claim about order.
+	//
+	// A Received that arrives only after the event has started or completed is
+	// a real finding — discovery cannot follow the start — but ONLY if this
+	// window saw the whole of the DUT's opportunity to acknowledge. Where it
+	// did not, the very shape this criterion exists to excuse (a status 1
+	// POSTed below the floor, then a 2, then a RETRIED 1 inside the window)
+	// reaches here as [2,1] and is indistinguishable from the inversion. So
+	// this test runs BELOW the reach computation and behind the same gate as
+	// the missing-1 FAIL: with reach.spans there was no earlier 1 to miss, and
+	// the order the capture carries is the order the DUT produced.
+	//
+	// Where the gate is shut the claim is simply not made, and the sequence
+	// falls through to the grading below with its 1 counted — deliberately.
+	// [2,3,1] on a window that opened late is a DUT whose whole lifecycle is
+	// present plus a retried acknowledgment, and reporting that as anything
+	// but a Pass would be a second way of grading window placement.
+	if after, ok := receivedAfterStart(got); ok && reach.spans {
+		return found(certify.Fail, frames,
+			"the DUT POSTed status 1 (Event Received) for the %s event %s only AFTER status %d, in the order "+
+				"%s carries them (%v). Event Received acknowledges DISCOVERY, so it cannot follow the event's "+
+				"start or completion — and %s, so this order is the DUT's and not this window's",
+			label, mrid, after, src, got, reach.because)
 	}
 	if !has(1) {
+		if !reach.spans {
+			return found(certify.Warn, frames,
+				"the DUT POSTed status(es) %v for the %s event %s and no status 1 (Event Received) inside this "+
+					"window. That absence is NOT adjudicable here: %s. What the window does show is consistent "+
+					"with a status 1 POSTed below its floor — the statuses that did appear are in lifecycle "+
+					"order and none of them follows a 1 — so this is reported as a window limitation rather "+
+					"than as a finding about the DUT. Close it out by re-running the case with a window that "+
+					"spans the event's discovery, against a fresh mRID",
+				got, label, mrid, reach.limit)
+		}
 		return found(certify.Fail, frames,
 			"the DUT POSTed status(es) %v for the %s event %s but never status 1 (Event Received), which the "+
-				"procedure requires on discovery", got, label, mrid)
+				"procedure requires on discovery — and %s", got, label, mrid, reach.because)
 	}
 	if has(2) && has(3) {
 		return found(certify.Pass, frames,
@@ -912,6 +1093,81 @@ func lifecycleFinding(got, frames []int, mrid, label string, spanS int, src stri
 			"shorter than that cannot contain 2 (Started) and 3 (Completed); raise -param %s past the "+
 			"interval to close this out, and read this as an incomplete measurement rather than a finding "+
 			"about the DUT", got, label, mrid, spanS, waitParam)
+}
+
+// receivedAfterStart reports an inverted lifecycle: a status 1 that appears
+// only after a 2 (Started) or 3 (Completed) for the same event, with no 1
+// before them. The "no 1 before them" half is what keeps a DUT that RE-POSTs
+// its Received — a retry, a duplicate — out of the FAIL: that sequence is
+// 1,2,1, whose first status is still the acknowledgment the procedure asks for.
+//
+// It reads only the statuses IN SCOPE, so it can only ever answer "in the
+// frames this case owns"; whether that is the same as "in what the DUT did" is
+// the caller's question, not this one's, and lifecycleFinding consults it only
+// where the window's reach makes the two the same.
+func receivedAfterStart(got []int) (int, bool) {
+	seen := 0
+	for _, s := range got {
+		switch {
+		case s == 1 && seen != 0:
+			return seen, true
+		case s == 1:
+			return 0, false
+		case s == 2 || s == 3:
+			if seen == 0 {
+				seen = s
+			}
+		}
+	}
+	return 0, false
+}
+
+// lifecycleStatuses reads the statuses the DUT POSTed for one mRID out of the
+// transcript IN CAPTURE ORDER, with the frames that carried them.
+//
+// responseStatusesFor sorts, which is right for the set-shaped criteria that
+// use it (critNoSupersession asks whether a 7 or a 14 is present) and wrong
+// here: this criterion is about a SEQUENCE, and its own How promises the order
+// the capture carries.
+func lifecycleStatuses(t *Transcript, mrid string) ([]int, []int) {
+	var got, frames []int
+	for _, e := range t.Method("POST") {
+		if e.Req == nil || len(e.Req.Body) == 0 {
+			continue
+		}
+		doc, err := e.Req.SEP()
+		if err != nil || !strings.HasSuffix(doc.Local(), "Response") {
+			continue
+		}
+		subj, _ := doc.TextOf("subject")
+		if !strings.EqualFold(subj, mrid) {
+			continue
+		}
+		st, _ := doc.UintOf("status")
+		got = append(got, int(st))
+		frames = append(frames, e.Frames()...)
+	}
+	return got, dedupeInts(frames)
+}
+
+// statusesOf reduces gridsim's own Response records to their statuses, keeping
+// the server's arrival order (ServerView.ResponseStatuses sorts, for the same
+// set-shaped callers responseStatusesFor serves).
+func statusesOf(recs []AdminResponse) []int {
+	out := make([]int, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, int(r.Status))
+	}
+	return out
+}
+
+func containsInt(xs []int, want int) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ── subscription / notification ──────────────────────────────────────────────

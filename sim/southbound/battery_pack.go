@@ -95,9 +95,11 @@ package sim
 // rating bound itself becomes exercisable rather than merely absent. No such
 // profile exists in this sim yet; when one does, wire it to populate a real
 // WChaRteMaxRtg/WDisChaRteMaxRtg pair instead of calling setNotImpl16." This
-// is that profile. The pair is symmetric and STRICTLY BELOW the nameplate
-// (packRateRatingFrac), which is what makes the two bounds independently
-// exercisable: a setpoint past the nameplate is refused by
+// is that profile. The pair is ASYMMETRIC (charge rating well below the
+// discharge rating — packChaRteRatingFrac/packDisChaRteRatingFrac, since
+// IW14-001 made the gateway resolve each opModFixedW sign against its own
+// rating) and both STRICTLY BELOW the nameplate, which is what makes the
+// bounds independently exercisable: a setpoint past the nameplate is refused by
 // checkSetpointWithinNameplate, a setpoint between the rating and the
 // nameplate is refused by validateSetpointW's rating bound, and the two
 // refusals name different points. Equal ratings would make the second
@@ -169,11 +171,19 @@ const (
 	// wait a minute for it.
 	packRampFrac = 0.34
 
-	// packRateRatingFrac sets the pack's declared (and honoured) charge and
-	// discharge rate ratings as a fraction of nameplate. STRICTLY BELOW 1 so
-	// the M702 rating bound is exercisable independently of the nameplate
-	// bound — see this file's header.
-	packRateRatingFrac = 0.90
+	// packChaRteRatingFrac / packDisChaRteRatingFrac set the pack's declared
+	// (and honoured) charge and discharge rate ratings as fractions of
+	// nameplate. Both STRICTLY BELOW 1 so the M702 rating bound is exercisable
+	// independently of the nameplate bound — see this file's header. They are
+	// deliberately ASYMMETRIC (charge well below discharge) since IW14-001:
+	// the gateway resolves a negative opModFixedW against WChaRteMaxRtg and a
+	// positive one against WDisChaRteMaxRtg, and only asymmetric ratings make
+	// the three possible references (charge rating, discharge rating,
+	// nameplate) produce mutually distinguishable watts on the wire — with the
+	// 5000 W default nameplate: −60% → −1200 W (charge rating 2000), +60% →
+	// +2700 W (discharge rating 4500), vs ±3000 W on a nameplate fallback.
+	packChaRteRatingFrac    = 0.40
+	packDisChaRteRatingFrac = 0.90
 
 	// packTickSeconds is the animation period, matching every other sim here.
 	packTickSeconds = 5.0
@@ -291,8 +301,8 @@ func populateBatteryPack(r *RegisterMap, wmaxKwh, wmaxW float64, shape BatteryPa
 		shape:         shape,
 		has704:        shape == PackShapeSetpoint,
 		rampW:         packRampFrac * wmaxW,
-		chaRteMaxW:    packRateRatingFrac * wmaxW,
-		disChaRteMaxW: packRateRatingFrac * wmaxW,
+		chaRteMaxW:    packChaRteRatingFrac * wmaxW,
+		disChaRteMaxW: packDisChaRteRatingFrac * wmaxW,
 	}
 
 	// The rate ratings are a fact about the pack, so every model that carries
@@ -364,7 +374,12 @@ const packCtrlModes = sunspec.M702_CtrlMode_MaxW | sunspec.M702_CtrlMode_FixedW 
 // populate702Pack writes the pack's model 702: the nameplate derbase reads,
 // the reactive rating, the CtrlModes capability declaration, and — the part
 // solar's populate702 explicitly defers to a storage profile — a REAL,
-// symmetric charge/discharge rate rating pair.
+// ASYMMETRIC charge/discharge rate rating pair (2 000 W in, 4 500 W out on the
+// default 5 kW nameplate). The asymmetry is load-bearing rather than colour: a
+// signed opModFixedW resolves against the rating for the direction commanded,
+// so equal ratings would make every candidate reference produce the same watts
+// and hide a reference confusion in the product AND in the referee. See this
+// file's header and packChaRteRatingFrac/packDisChaRteRatingFrac.
 func populate702Pack(r *RegisterMap, cursor uint16, wmaxW, varRating float64, pk *packProfile) (base, next uint16) {
 	dataLen := sunspec.L702.Len()
 	base, next = writeModelHeader(r, cursor, sunspec.ModelDERCapacity, dataLen)
@@ -390,7 +405,8 @@ func populate702Pack(r *RegisterMap, cursor uint16, wmaxW, varRating float64, pk
 	v.SetFloat("VNom", 240)
 	v.SetU32("CtrlModes", packCtrlModes)
 
-	// THE STORAGE FORK solar_adv.go's populate702 names. Real, symmetric, and
+	// THE STORAGE FORK solar_adv.go's populate702 names. Real, asymmetric
+	// (charge below discharge, per-sign references distinguishable), and both
 	// below the nameplate so the bound is reachable — see this file's header.
 	// The RW settings carry the same numbers as the read-only ratings: this
 	// pack is configured at its full declared capability, so a head end that

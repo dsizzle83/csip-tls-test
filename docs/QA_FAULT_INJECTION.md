@@ -433,16 +433,30 @@ battery's nature:
 
 `populate702Pack` writes the storage fork `solar_adv.go`'s `populate702` doc
 explicitly defers to a profile like this one: `WChaRteMaxRtg` /
-`WDisChaRteMaxRtg` real, **symmetric**, and **strictly below the nameplate**
-(`packRateRatingFrac`, 90 %). Below matters — `checkSetpointWithinNameplate`
-runs first, so ratings equal to the nameplate would make the rating bound
-unreachable and it would ship untested. The pack also CLAMPS its own physical
-output to them, so the M702 numbers are a fact about the device rather than a
-claim in a register, and every model that carries the rate (M120
+`WDisChaRteMaxRtg` real, **asymmetric**, and **both strictly below the
+nameplate** — `packChaRteRatingFrac` 40 % and `packDisChaRteRatingFrac` 90 %,
+so on the 5 kW default nameplate the pack is rated **2 000 W charging** and
+**4 500 W discharging**.
+
+Below the nameplate matters because `checkSetpointWithinNameplate` runs first:
+ratings equal to the nameplate would make the rating bound unreachable and it
+would ship untested. ASYMMETRY matters for a second reason, added with IW14-001:
+`opModFixedW` is a SIGNED percent, and both the gateway and the referee resolve
+it against the rating for the direction commanded (`derbase.fixedWReference` /
+`invariant.RefWRteMax` — `WChaRteMaxRtg` negative, `WDisChaRteMaxRtg` positive,
+the nameplate only where the device declares neither). With equal ratings every
+candidate reference produces the same watts and a reference confusion is
+invisible; with these numbers the three are distinguishable — **−60 % → −1 200
+W**, **+60 % → +2 700 W**, against the ±3 000 W a nameplate fallback gives.
+
+The pack also CLAMPS its own physical output to those ratings, PER DIRECTION, so
+the M702 numbers are a fact about the device rather than a claim in a register:
+a commanded discharge past 4 500 W settles at +4 500 W and a commanded charge
+past 2 000 W settles at −2 000 W. Every model that carries the rate (M120
 `MaxChaRte`/`MaxDisChaRte`, M802 `WChaRteMax`/`WDisChaRteMax`, M702) says the
-same number. The APPARENT-power rate ratings stay at the not-implemented
-sentinel, honestly: a `Tuint16` zero would be a positive declaration that the
-pack cannot charge or discharge at all.
+same number **for its own direction**. The APPARENT-power rate ratings stay at
+the not-implemented sentinel, honestly: a `Tuint16` zero would be a positive
+declaration that the pack cannot charge or discharge at all.
 
 ### Fault rows the pack makes expressible
 

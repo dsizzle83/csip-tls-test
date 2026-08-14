@@ -369,25 +369,34 @@ func maxLimWAppliedPerDevice(ders []devView, commandedPct float64, tol Tolerance
 	return judged, allSatisfy, joinComma(details)
 }
 
-// fixedWAppliedPerDevice checks opModFixedW per device (IW13-001 §1/§2.1
-// Phase 1): each DER's own resolved WSet/WSetPct watts value is compared
-// against the SAME commanded percent resolved against THAT DER's own WMax —
-// symmetric for both signs (Phase 1, mirroring csipin.go's fixedWReference
-// and derbase's own identical judgment call: this package's Nameplate type
-// has no distinct charge/discharge rating to prefer instead). A SETPOINT
-// comparison (two-sided: must match, not merely not-exceed), matching
-// WSet/WSetPct's own KindSetpoint semantics. judged=false when no DER
-// resolves both an enabled setpoint AND its own WMax.
+// fixedWAppliedPerDevice checks opModFixedW per device (IW13-001 §1/§2.1):
+// each DER's own resolved WSet/WSetPct watts value is compared against the
+// SAME commanded percent resolved against THAT DER's own PER-SIGN rate
+// reference (RefWRteMax — WChaRteMaxRtg charging, WDisChaRteMaxRtg
+// discharging, the nameplate where the device implements neither), which is
+// the reference derbase's fixedWReference writes against on the product side.
+// A SETPOINT comparison (two-sided: must match, not merely not-exceed),
+// matching WSet/WSetPct's own KindSetpoint semantics. judged=false when no DER
+// resolves both an enabled setpoint AND that reference.
+//
+// It resolved BOTH signs against WMax until IW14-001/F5. See Nameplate.wRteMax
+// for why that reported a correct gateway as NOT applied — and passed a
+// nameplate-fallback one — on every device whose charge and discharge ratings
+// differ.
 func fixedWAppliedPerDevice(ders []devView, commandedPct float64, tol Tolerance) (judged, allSatisfy bool, detail string) {
 	allSatisfy = true
 	var details []string
+	sign := 1
+	if commandedPct < 0 {
+		sign = -1
+	}
 	for _, v := range ders {
 		np := v.Unit.Nameplate(v.Source)
 		meas := v.Unit.Measurement(v.Source)
 		if !np.Present {
 			continue
 		}
-		base, err := np.Base(RefWMax, 1, meas)
+		base, err := np.Base(RefWRteMax, sign, meas)
 		if err != nil {
 			continue
 		}
@@ -402,7 +411,9 @@ func fixedWAppliedPerDevice(ders []devView, commandedPct float64, tol Tolerance)
 			}
 			judged = true
 			gotW := r.Physical.Val
-			details = append(details, fmt.Sprintf("%s want %s W got %s W", v.Label, trimFloat(wantW), trimFloat(gotW)))
+			details = append(details, fmt.Sprintf("%s want %s W (%s%% of %s = %s W) got %s W",
+				v.Label, trimFloat(wantW), trimFloat(commandedPct), base.Name,
+				trimFloat(base.Q.Val), trimFloat(gotW)))
 			if math.Abs(gotW-wantW) > math.Abs(wantW)*tol.Rel+tol.Abs {
 				allSatisfy = false
 			}

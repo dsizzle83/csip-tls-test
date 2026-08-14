@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -184,10 +185,16 @@ func TestOracleMaxLimW_FailOnCeilingWattsMismatch(t *testing.T) {
 }
 
 // TestOracleFixedW_PassOnConformantRegister mirrors TestOracleMaxLimW's proof
-// for the signed, nameplate-resolved axis: opModFixedW=6000 (60%) on a 60 kW
-// device resolves to 36,000 W (Phase 1: symmetric WMax reference), and the
-// independent oracle confirms it from the DER's own WSet register — computed
-// via internal/invariant, never lexa-proto/csipmodel or derbase.
+// for the signed axis: opModFixedW=6000 (60%) on a 60 kW device resolves to
+// 36,000 W, and the independent oracle confirms it from the DER's own WSet
+// register — computed via internal/invariant, never lexa-proto/csipmodel or
+// derbase.
+//
+// The reference here is the NAMEPLATE, and for a stated reason rather than by
+// default: diff.Bench702 is a PV inverter publishing the not-implemented
+// sentinel for both rate ratings, which is exactly the shape in which a signed
+// percent has nothing directional to be a percentage of (IW14-001/F5). The
+// per-sign case is TestOracleFixedW_PerSignReferenceOnAnAsymmetricPack.
 func TestOracleFixedW_PassOnConformantRegister(t *testing.T) {
 	dev, base := oracleFixture(t)
 	spc := model.SignedPerCent{Value: 6000} // 60.00% discharge
@@ -202,9 +209,15 @@ func TestOracleFixedW_PassOnConformantRegister(t *testing.T) {
 }
 
 // TestOracleFixedW_SignedNegativeChargePassOnConformantRegister proves the
-// oracle's sign handling: a negative opModFixedW (charge) resolves through
-// the SAME symmetric-WMax reference (Phase 1) and must independently confirm
-// against the DER's own negative WSet.
+// oracle's sign handling on a device that declares NO rate rating for either
+// direction: a negative opModFixedW (charge) then falls back to the nameplate
+// — derbase's own rule for the unimplemented sentinel — and must independently
+// confirm against the DER's own negative WSet.
+//
+// It also pins that the fallback is NAMED. A finding that printed a bare
+// expected watts figure would leave a reader unable to tell a nameplate
+// fallback from a rate rating that happened to equal the nameplate, which is
+// the ambiguity IW14-001/F5 was hiding in.
 func TestOracleFixedW_SignedNegativeChargePassOnConformantRegister(t *testing.T) {
 	dev, base := oracleFixture(t)
 	spc := model.SignedPerCent{Value: -3000} // 30.00% charge
@@ -215,6 +228,138 @@ func TestOracleFixedW_SignedNegativeChargePassOnConformantRegister(t *testing.T)
 	f := oracleFixedW(-3000)(context.Background(), rc)
 	if f.Verdict != certify.Pass {
 		t.Fatalf("oracleFixedW(-3000) after ApplyControl(30%% charge) = %+v, want Pass", f)
+	}
+	if !strings.Contains(f.Observed, "WMax") || !strings.Contains(f.Observed, "implements no WChaRteMaxRtg") {
+		t.Errorf("the PASS does not name the reference it used or say why: %s", f.Observed)
+	}
+}
+
+// packOracleFixture is oracleFixture on the STORAGE shape: diff.AsymmetricPack,
+// a 5 kW pack rated 2 kW charging and 4.5 kW discharging, mirroring the bench's
+// own sim/southbound pack. Its three candidate references (charge rating,
+// discharge rating, nameplate) are three different numbers, which is what makes
+// the oracle's arithmetic testable rather than merely exercised.
+func packOracleFixture(t *testing.T) (*diff.Device, *derbase.Base) {
+	t.Helper()
+	dev := diff.NewDevice(diff.AsymmetricPack())
+	rdr, err := sunspec.NewReader(dev)
+	if err != nil {
+		t.Fatalf("sunspec.NewReader on the AsymmetricPack fixture: %v", err)
+	}
+	base, err := derbase.Init(rdr, "oracle-test")
+	if err != nil {
+		t.Fatalf("derbase.Init on the AsymmetricPack fixture: %v", err)
+	}
+	return dev, &base
+}
+
+// packWSet reads the pack's own WSet register back in watts, so a test can say
+// what the DER actually holds instead of only what the oracle concluded.
+func packWSet(t *testing.T, dev *diff.Device) float64 {
+	t.Helper()
+	regs, ok := dev.Model(704)
+	if !ok {
+		t.Fatal("the fixture serves no model 704")
+	}
+	return sunspec.L704.View(regs).Float("WSet")
+}
+
+// writeWSetWatts overwrites the pack's WSet register directly, leaving every
+// other 704 point (WSetEna, WSetMod) exactly as the last real control left it.
+// It is how a test models a WRITER that resolved the commanded percent against
+// the wrong reference: same axis, same enables, one wrong number.
+func writeWSetWatts(t *testing.T, dev *diff.Device, w float64) {
+	t.Helper()
+	regs, ok := dev.Model(704)
+	if !ok {
+		t.Fatal("the fixture serves no model 704")
+	}
+	sunspec.L704.View(regs).SetFloat("WSet", w)
+	off := sunspec.L704.Offset("WSet")
+	if off < 0 || off+1 >= len(regs) {
+		t.Fatal("the 704 layout has no WSet point")
+	}
+	// WSet is Tint32: BOTH registers, or the write silently lands on the high
+	// word alone and leaves the value it meant to replace in place.
+	if err := dev.WriteHolding(dev.Bases[704]+uint16(off), []uint16{regs[off], regs[off+1]}); err != nil {
+		t.Fatalf("write WSet=%g: %v", w, err)
+	}
+}
+
+// TestOracleFixedW_PerSignReferenceOnAnAsymmetricPack is IW14-001/F5's
+// end-to-end proof, driven through the PRODUCT's own writer.
+//
+// derbase resolves opModFixedW against the rating for the direction commanded
+// (fixedWReference), so on this pack −60.00 % is −1200 W and +60.00 % is
+// +2700 W. The oracle used to resolve BOTH signs against WMax and want ±3000 W,
+// which had two heads: it reported this correct write as "not applied", and it
+// would have PASSED a writer that resolved the percent against the nameplate.
+// The test therefore asserts the register the product wrote as well as the
+// verdict — a matching pair of wrong numbers would otherwise agree.
+func TestOracleFixedW_PerSignReferenceOnAnAsymmetricPack(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		hundredths int64
+		wantW      float64
+		wantRef    string
+	}{
+		{"charge: 60% of the 2000 W charge rating", -6000, -1200, "WChaRteMaxRtg"},
+		{"discharge: 60% of the 4500 W discharge rating", +6000, +2700, "WDisChaRteMaxRtg"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			dev, base := packOracleFixture(t)
+			spc := model.SignedPerCent{Value: int16(c.hundredths)}
+			if err := base.ApplyControl(model.DERControlBase{OpModFixedW: &spc}, "oracle-test"); err != nil {
+				t.Fatalf("ApplyControl(opModFixedW=%d): %v", c.hundredths, err)
+			}
+			if got := packWSet(t, dev); math.Abs(got-c.wantW) > 1 {
+				t.Fatalf("the product wrote WSet=%g W, want %g W — the fixture is not exercising the "+
+					"per-sign reference this test is about", got, c.wantW)
+			}
+			f := oracleFixedW(c.hundredths)(context.Background(), oracleTestRunCtx(t, dev))
+			if f.Verdict != certify.Pass {
+				t.Fatalf("oracleFixedW(%d) against a DER holding the CORRECT %g W = %+v, want Pass",
+					c.hundredths, c.wantW, f)
+			}
+			if !strings.Contains(f.Observed, c.wantRef) {
+				t.Errorf("the finding does not name the reference it resolved against (%s): %s", c.wantRef, f.Observed)
+			}
+			if strings.Contains(f.Observed, "3000") {
+				t.Errorf("the finding still quotes the nameplate-resolved ±3000 W: %s", f.Observed)
+			}
+		})
+	}
+}
+
+// TestOracleFixedW_CatchesTheNameplateFallbackWriter is the other head of the
+// same defect: a gateway that resolves −60.00 % against the 5000 W NAMEPLATE
+// writes −3000 W, and the pre-fix oracle — wanting exactly that — called it
+// applied. It must now be a decided FAIL that names BOTH references, because
+// "the DER holds −3000 W" is only diagnosable next to "the nameplate is 5000 W
+// and 60 % of it is −3000 W".
+func TestOracleFixedW_CatchesTheNameplateFallbackWriter(t *testing.T) {
+	dev, base := packOracleFixture(t)
+	spc := model.SignedPerCent{Value: -6000}
+	if err := base.ApplyControl(model.DERControlBase{OpModFixedW: &spc}, "oracle-test"); err != nil {
+		t.Fatalf("ApplyControl(opModFixedW=-6000): %v", err)
+	}
+	writeWSetWatts(t, dev, -3000) // the reference-confusing writer's number
+
+	f := oracleFixedW(-6000)(context.Background(), oracleTestRunCtx(t, dev))
+	t.Logf("the FAIL this row would report: %s", f.Observed)
+	if f.Unavailable != "" {
+		t.Fatalf("oracleFixedW against a DER holding the wrong value = Unavailable(%q); a wrong number is a "+
+			"finding about the DER", f.Unavailable)
+	}
+	if f.Verdict != certify.Fail {
+		t.Fatalf("oracleFixedW(-6000) against a DER holding -3000 W = %+v, want Fail: -3000 W is 60%% of the "+
+			"NAMEPLATE, not of this device's 2000 W charge rating", f)
+	}
+	for _, want := range []string{"WChaRteMaxRtg", "-1200", "-3000", "WMax", "5000"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the FAIL does not name %q — a reference confusion is only diagnosable when the report "+
+				"carries both references and both numbers: %s", want, f.Observed)
+		}
 	}
 }
 

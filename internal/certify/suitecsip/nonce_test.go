@@ -638,3 +638,138 @@ func TestCoreResponsesSpec_FullLifecycleAssertionsGradeCorrectly(t *testing.T) {
 		t.Errorf("assertion %s = %s, want Pass: %s", names[3], f.Verdict, f.Observed)
 	}
 }
+
+// TestAggregatorRowsPublishNoncedMRIDs is the aggregator half of the same
+// isolation fix, and the precondition criteria_agg.go's lifecycleReach now
+// relies on instead of a cross-campaign log lookup (F3/F4, 2026-08-14).
+//
+// Every row registerAggregator binds goes through aggRows, and every mRID it
+// carries — the controls it publishes and the four kinds of criterion that name
+// one back — must carry this run's token. Two properties matter and both are
+// asserted here, because either alone is useless:
+//
+//	(1) the mRIDs really are fresh per run, so gridsim's append-only Response
+//	    log cannot already hold an acknowledgment for one and the lifecycle
+//	    criterion's FAIL stays reachable for a DUT that has regressed;
+//	(2) within ONE run the cross-references still point at that row's own
+//	    controls, so the supersession, independence and per-device criteria are
+//	    still about the events the row published rather than about nothing.
+func TestAggregatorRowsPublishNoncedMRIDs(t *testing.T) {
+	const nonceA, nonceB = "aggnonce1", "aggnonce2"
+
+	// The table itself stays static — an empty nonce is the identity, which is
+	// what every scenario-table test reads.
+	if got := aggScenarios()["AGG-011"].Lifecycles[0].MRID; got != "CERT-AGG011TFA" {
+		t.Fatalf("the scenario table's own mRID = %q, want the static CERT-AGG011TFA: the nonce belongs to "+
+			"registration, not to the transcription of the document", got)
+	}
+
+	owner := map[string]string{} // mRID -> the row that published it
+	for _, r := range aggRows(nonceA) {
+		controls := map[string]bool{}
+		for _, c := range r.sc.Controls {
+			if !strings.HasSuffix(c.MRID, "-"+nonceA) {
+				t.Errorf("%s publishes control %q with no run nonce — a re-run would re-publish an mRID the "+
+					"DUT has already run to terminal, and its lifecycle criterion could no longer tell a DUT "+
+					"that never acknowledged the event from one that acknowledged it last campaign", r.id, c.MRID)
+			}
+			if prev, dup := owner[c.MRID]; dup {
+				t.Errorf("%s and %s both publish %q — one run's rows must not collide with each other either",
+					prev, r.id, c.MRID)
+			}
+			owner[c.MRID] = r.id
+			controls[c.MRID] = true
+		}
+		for _, l := range r.sc.Lifecycles {
+			checkAggRef(t, r.id, "lifecycle", l.MRID, nonceA, controls)
+		}
+		checkAggRef(t, r.id, "supersession", r.sc.Superseded, nonceA, controls)
+		for _, m := range r.sc.Independent {
+			checkAggRef(t, r.id, "independence", m, nonceA, controls)
+		}
+		for _, f := range r.sc.FanOut {
+			checkAggRef(t, r.id, "fan-out", f.MRID, nonceA, controls)
+			if f.Unobservable != "" && f.MRID != "" {
+				t.Errorf("%s: a fan-out bullet with no wire artefact names mRID %q", r.id, f.MRID)
+			}
+		}
+	}
+
+	// Two constructions — two campaigns, or the same campaign re-run — must
+	// share no mRID at all.
+	second := map[string]bool{}
+	for _, r := range aggRows(nonceB) {
+		for _, c := range r.sc.Controls {
+			second[c.MRID] = true
+		}
+	}
+	for mrid, id := range owner {
+		if second[mrid] {
+			t.Errorf("%s published %q under BOTH nonces — the whole point of the token is that two runs "+
+				"present mRIDs the DUT's Response tracker has never seen", id, mrid)
+		}
+	}
+	if len(second) != len(owner) || len(owner) == 0 {
+		t.Fatalf("the two constructions published %d and %d controls; they must publish the same (non-zero) "+
+			"set of rows", len(owner), len(second))
+	}
+}
+
+// checkAggRef asserts one criterion's back-reference: it carries the run's
+// token and names a control THIS row published. An empty reference is a row
+// that makes no such claim (a scenario with no supersession, a fan-out bullet
+// about a setpoint) and must stay empty rather than becoming "-<nonce>".
+func checkAggRef(t *testing.T, id, kind, mrid, nonce string, controls map[string]bool) {
+	t.Helper()
+	if mrid == "" {
+		return
+	}
+	if !strings.HasSuffix(mrid, "-"+nonce) {
+		t.Errorf("%s's %s criterion names %q, which carries no run nonce: it would grade the Responses of an "+
+			"event this run never published", id, kind, mrid)
+		return
+	}
+	if !controls[mrid] {
+		t.Errorf("%s's %s criterion names %q, which is not one of the controls this row publishes — the "+
+			"within-run correlation the nonce must preserve is broken", id, kind, mrid)
+	}
+}
+
+// TestUtilDERRetrievalSpecPublishesItsOwnNoncedMRID is UTIL-004's half: the one
+// aggregator row outside the scenario table, with the same static-mRID history
+// and the same lifecycle criterion reading it. Driven through a REAL in-process
+// gridsim, because "Setup computed a string" and "Setup published that control"
+// are different claims and only the second one matters.
+func TestUtilDERRetrievalSpecPublishesItsOwnNoncedMRID(t *testing.T) {
+	d := gridsimDriver(t)
+	ctx := context.Background()
+
+	s1 := utilDERRetrievalSpec(withRunNonce("CERT-UTIL004", "utilnonce1"))
+	p1 := map[string]string{}
+	if err := s1.Setup(ctx, d, p1); err != nil {
+		t.Fatalf("first construction's Setup: %v", err)
+	}
+	if p1["mrid"] != "CERT-UTIL004-utilnonce1" {
+		t.Fatalf("UTIL-004 published mrid %q, want %q", p1["mrid"], "CERT-UTIL004-utilnonce1")
+	}
+
+	s2 := utilDERRetrievalSpec(withRunNonce("CERT-UTIL004", "utilnonce2"))
+	p2 := map[string]string{}
+	if err := s2.Setup(ctx, d, p2); err != nil {
+		t.Fatalf("second construction's Setup: %v", err)
+	}
+	if p1["mrid"] == p2["mrid"] {
+		t.Fatal("two UTIL-004 constructions published the SAME mrid — the second campaign would re-publish " +
+			"an event the DUT had already acknowledged, which is what left its lifecycle criterion unable " +
+			"to convict a regressed DUT")
+	}
+
+	// Setup and Want must agree on this construction's own mRID, not the other's.
+	want1 := s1.Want(ServerView{})
+	if !want1(ServerView{Responses: []AdminResponse{{Subject: p1["mrid"], Status: 1}}}) {
+		t.Error("UTIL-004's Want was not satisfied by a fresh Response for the mrid its own Setup published")
+	}
+	if want1(ServerView{Responses: []AdminResponse{{Subject: p2["mrid"], Status: 1}}}) {
+		t.Error("UTIL-004's Want was satisfied by a Response for the OTHER construction's mrid")
+	}
+}

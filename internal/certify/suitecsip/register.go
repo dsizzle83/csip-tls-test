@@ -156,7 +156,12 @@ func Register(reg *certify.Registry) {
 		certify.WithRequires(needGridSim...), certify.WithOrder(102))
 
 	// ── Aggregator profile (order 200–299) ───────────────────────────────
-	registerAggregator(reg)
+	// The SAME per-run nonce again: UTIL-004 and every AGG-0xx scenario
+	// hardcode their control mRIDs exactly as BASIC-017..026 and CORE-022/023
+	// used to, and their lifecycle criteria grade the Responses those mRIDs
+	// earn. See registerAggregator's own doc for what re-publishing an
+	// already-acknowledged mRID did to those criteria.
+	registerAggregator(reg, nonce)
 
 	// ── Error handling, last: it is the only row that deliberately makes
 	//    the shared server misbehave. ──────────────────────────────────────
@@ -184,7 +189,32 @@ func Register(reg *certify.Registry) {
 // DERControls on two programs at once and two of them (AGG-009, AGG-012) sleep
 // inside their own setup waiting for an event to start, so a campaign that has
 // to be cut short loses these rather than the profile's foundations.
-func registerAggregator(reg *certify.Registry) {
+//
+// ── Why these rows take the run nonce too (F3/F4, 2026-08-14) ────────────────
+//
+// Every mRID below was a STATIC string, re-published verbatim by every campaign
+// against the same long-lived gridsim — and gridsim's Response log is
+// append-only and cross-campaign. Two things followed, and both were observed
+// on hardware (csip-conf-v1.3::AGG-011 in runs/compliance-a78887f-20260813b).
+//
+// The DUT's own Response tracker dedupes on the bare mRID, so the second and
+// every later run earned no fresh status 1 (Event Received) at all — the same
+// suppression eventScenario.withNonce was minted for. And critEventLifecycle,
+// which grades that status 1, then had to decide whether a missing Received was
+// the DUT's behaviour or the harness's fixture; on a re-published mRID it can
+// never be sure, so its FAIL was unreachable for exactly the DUT that had
+// REGRESSED to never acknowledging events.
+//
+// A fresh mRID per run removes the question at the root rather than answering
+// it: the event does not exist until this check publishes it, inside its own
+// window, so an absent status 1 is a fact about the DUT again. The lifecycle
+// criterion still checks its window's placement — that is what makes the FAIL
+// honest — but on these rows the check now passes rather than excuses.
+// TestAggregatorRowsPublishNoncedMRIDs (the scenario table, via aggRows) and
+// TestUtilDERRetrievalSpecPublishesItsOwnNoncedMRID (the one row outside it)
+// together pin that no mRID this function registers reaches a campaign
+// un-nonced.
+func registerAggregator(reg *certify.Registry, nonce string) {
 	// Utility/aggregator commissioning: the resting-tree rows first, because
 	// they arm nothing and a failure in them explains every row after.
 	reg.Register(uid("UTIL-002"), Suite, utilCommissioning,
@@ -214,27 +244,53 @@ func registerAggregator(reg *certify.Registry) {
 		certify.WithRequires(needCapture...), certify.WithOrder(223))
 
 	// UTIL-004 publishes a control, so it sits with the event rows.
-	reg.Register(uid("UTIL-004"), Suite, utilDERRetrieval,
+	reg.Register(uid("UTIL-004"), Suite, utilDERRetrieval(nonce),
 		certify.WithRequires(needGridSim...), certify.WithOrder(230))
 
-	// The aggregator event rows, in document order. AGG-002 publishes nothing
-	// (it is the two-DefaultDERControl row), so it does not need gridsim.
+	for _, r := range aggRows(nonce) {
+		req := needGridSim
+		if len(r.sc.Controls) == 0 {
+			req = needCapture
+		}
+		reg.Register(uid(r.id), Suite, aggEvent(r.sc),
+			certify.WithRequires(req...), certify.WithOrder(r.order))
+	}
+}
+
+// aggRow is one AGG-002..AGG-012 row: its catalog id, run order within the
+// suite, and the scenario the check drives.
+type aggRow struct {
+	id    string
+	order int
+	sc    aggScenario
+}
+
+// aggRows returns the eleven aggregator event rows in document order with the
+// per-run nonce applied to every scenario.
+//
+// It exists for the same reason eventScenarioRows does: the nonce is applied
+// HERE, in one place every registered row goes through, so a row cannot be
+// added later that quietly publishes a static mRID — and a test can assert
+// that directly (TestAggregatorRowsPublishNoncedMRIDs) instead of trying to
+// recover an mRID from a registered closure it cannot see inside.
+//
+// AGG-002 publishes nothing (it is the two-DefaultDERControl row), so the
+// caller gives it the no-gridsim requirement set.
+func aggRows(nonce string) []aggRow {
 	scenarios := aggScenarios()
-	for i, id := range []string{
+	ids := []string{
 		"AGG-002", "AGG-003", "AGG-004", "AGG-005", "AGG-006",
 		"AGG-007", "AGG-008", "AGG-009", "AGG-010", "AGG-011", "AGG-012",
-	} {
+	}
+	rows := make([]aggRow, 0, len(ids))
+	for i, id := range ids {
 		sc, ok := scenarios[id]
 		if !ok {
 			panic("suitecsip: no aggregator scenario for " + id)
 		}
-		req := needGridSim
-		if len(sc.Controls) == 0 {
-			req = needCapture
-		}
-		reg.Register(uid(id), Suite, aggEvent(sc),
-			certify.WithRequires(req...), certify.WithOrder(240+i))
+		rows = append(rows, aggRow{id: id, order: 240 + i, sc: sc.withNonce(nonce)})
 	}
+	return rows
 }
 
 // registerInverterControls binds BASIC-004..015, the twelve control-mode rows.

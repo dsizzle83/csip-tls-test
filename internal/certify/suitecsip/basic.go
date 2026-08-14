@@ -858,7 +858,7 @@ func oracleMaxLimW(wantHundredths int64) func(ctx context.Context, rc *certify.R
 			}
 			return Finding{Verdict: certify.Fail, Observed: observed}
 		}
-		return noEnabledAxis("WMaxLimPct", wantPct, base.Q.Val, wantW, uv)
+		return noEnabledAxis("WMaxLimPct", wantPct, base.Name, base.Q.Val, wantW, uv)
 	}
 }
 
@@ -874,11 +874,16 @@ func oracleMaxLimW(wantHundredths int64) func(ctx context.Context, rc *certify.R
 // could not affect the verdict. Because it is now a decided non-Pass, the settle
 // poll also RETRIES it, which is what the not-yet-enabled shape needed all along:
 // a DER mid-propagation reports exactly this until the write lands.
-func noEnabledAxis(axis string, wantPct, wmax, wantW float64, uv invariant.UnitView) Finding {
+// baseName names the rating the percent was resolved against — "WMax" for the
+// ceiling axis, the direction's own rate rating for the signed setpoint axis
+// (IW14-001/F5) — because the two are no longer the same number and a message
+// that hardcoded "WMax" would misreport which reference the row applied.
+func noEnabledAxis(axis string, wantPct float64, baseName string, baseW, wantW float64,
+	uv invariant.UnitView) Finding {
 	return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
 		"the DER reports NO enabled %s in its own 704 image, so nothing there holds the commanded "+
-			"%.2f%% of its own %.1f W WMax (= %.1f W); its 704 setpoints read: %s",
-		axis, wantPct, wmax, wantW, commandSummary(uv))}
+			"%.2f%% of its own %.1f W %s (= %.1f W); its 704 setpoints read: %s",
+		axis, wantPct, baseW, baseName, wantW, commandSummary(uv))}
 }
 
 // commandSummary renders what the DER's own 704 image actually held, so a FAIL
@@ -910,10 +915,23 @@ func commandSummary(uv invariant.UnitView) string {
 
 // oracleFixedW builds a BASIC-013 (opModFixedW) Oracle: the DER's own
 // resolved WSet/WSetPct watts value, compared against the commanded percent
-// resolved against THIS SAME DER's own WMax (§2.1 Phase 1, symmetric both
-// signs — mirroring csipin.go's fixedWReference/derbase's identical judgment
-// call: this package's Nameplate type has no distinct charge/discharge
-// rating to prefer instead).
+// resolved against THIS SAME DER's own PER-SIGN active-power rate reference
+// (invariant.RefWRteMax — WChaRteMaxRtg when the command is negative,
+// WDisChaRteMaxRtg when it is positive, the nameplate when the device leaves
+// that direction's rating unimplemented).
+//
+// It resolved BOTH signs against WMax until IW14-001/F5. That was not a
+// simplification, it was a defect with two heads on any device whose charge
+// and discharge ratings differ — which is every storage device the bench
+// serves since the pack's ratings became asymmetric (WMax 5000 W, cha 2000 W,
+// dis 4500 W): a CORRECT gateway commanded −60.00% writes −1200 W and was
+// reported "not applied" against a wanted −3000 W, while a gateway that
+// resolved the percent against the nameplate really did write −3000 W and
+// read as applied. The oracle now mirrors what derbase's fixedWReference
+// actually does (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §2.1),
+// which is what "mirrors the product's own reference" was always supposed to
+// mean; invariant.Nameplate.wRteMax carries the rule and its three-way
+// unimplemented / positive / declared-incapable outcome.
 func oracleFixedW(wantHundredths int64) func(ctx context.Context, rc *certify.RunCtx) Finding {
 	return func(ctx context.Context, rc *certify.RunCtx) Finding {
 		uv, err := oracleUnitView(ctx, rc, oracleSimName)
@@ -922,16 +940,18 @@ func oracleFixedW(wantHundredths int64) func(ctx context.Context, rc *certify.Ru
 		}
 		np := uv.Nameplate(oracleSimName)
 		if !np.Present {
-			return unavailable("the DER serves no M702, so its own WMax has no value to resolve the " +
-				"commanded percent against")
+			return unavailable("the DER serves no M702, so it declares neither a rate rating nor a WMax to " +
+				"resolve the commanded percent against")
 		}
 		meas := uv.Measurement(oracleSimName)
-		base, err := np.Base(invariant.RefWMax, 1, meas)
-		if err != nil {
-			return unavailable("cannot resolve the DER's own WMax: %v", err)
-		}
 		wantPct := float64(wantHundredths) / 100.0
+		base, err := np.Base(invariant.RefWRteMax, signOfPct(wantPct), meas)
+		if err != nil {
+			return unavailable("cannot resolve the reference the commanded %.2f%% is a percentage of: %v",
+				wantPct, err)
+		}
 		wantW := wantPct / 100 * base.Q.Val
+		alt := fixedWAltReference(np, base, wantPct)
 		for _, c := range uv.Commands(oracleSimName) {
 			if (c.Point != "WSet" && c.Point != "WSetPct") || !c.Enabled {
 				continue
@@ -941,15 +961,49 @@ func oracleFixedW(wantHundredths int64) func(ctx context.Context, rc *certify.Ru
 				continue
 			}
 			gotW := r.Physical.Val
-			observed := fmt.Sprintf("the DER's own %s resolves to %.1f W (commanded %.2f%% of its own %.1f W = %.1f W)",
-				c.Point, gotW, wantPct, base.Q.Val, wantW)
+			observed := fmt.Sprintf("the DER's own %s resolves to %.1f W (commanded %.2f%% of its own %s = "+
+				"%.1f W, so %.1f W)", c.Point, gotW, wantPct, base.Name, base.Q.Val, wantW)
 			if math.Abs(gotW-wantW) <= oracleTolerance(wantW, 1) {
 				return Finding{Verdict: certify.Pass, Observed: observed}
 			}
-			return Finding{Verdict: certify.Fail, Observed: observed}
+			return Finding{Verdict: certify.Fail, Observed: observed + alt}
 		}
-		return noEnabledAxis("WSet/WSetPct", wantPct, base.Q.Val, wantW, uv)
+		return noEnabledAxis("WSet/WSetPct", wantPct, base.Name, base.Q.Val, wantW, uv)
 	}
+}
+
+// signOfPct is the direction a signed percent commands: −1 charge/import,
+// +1 discharge/export. Zero counts as positive, matching derbase's own
+// `ctrl.OpModFixedW.Value < 0` test — a zero setpoint resolves to zero watts
+// against either reference, so the choice cannot change a verdict.
+func signOfPct(pct float64) int {
+	if pct < 0 {
+		return -1
+	}
+	return 1
+}
+
+// fixedWAltReference is the diagnostic half of a FixedW FAIL: when the base
+// the percent was resolved against is NOT the nameplate, it names the
+// nameplate and the watts the same percent would have produced there.
+//
+// That sentence is what makes the FAIL actionable rather than merely negative.
+// The commonest wrong implementation of a signed percent setpoint is to
+// resolve it against WMax for both signs, and its signature is precisely "the
+// DER holds the number this line quotes" — so the report names both references
+// and lets the reader see which one the writer used, instead of printing one
+// expected number and leaving the diagnosis to whoever opens the register map.
+func fixedWAltReference(np invariant.Nameplate, base invariant.LimitRef, wantPct float64) string {
+	if strings.HasPrefix(base.Name, "WMax") {
+		return ""
+	}
+	nameplate, err := np.Base(invariant.RefWMax, 1, invariant.Measurement{})
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf(". Its nameplate %s is %.1f W, against which the same %.2f%% would be %.1f W: a DER "+
+		"holding THAT value would mean the commanded percent was resolved against the nameplate instead of "+
+		"the direction's own rate rating", nameplate.Name, nameplate.Q.Val, wantPct, wantPct/100*nameplate.Q.Val)
 }
 
 // oracleTargetW builds an opModTargetW Oracle: genuinely independent

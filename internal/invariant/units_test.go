@@ -10,6 +10,7 @@ package invariant
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"lexa-proto/sunspec"
@@ -239,5 +240,145 @@ func TestParseDERStatus(t *testing.T) {
 	}
 	if _, ok := parseDERStatus("not xml at all <<<"); ok {
 		t.Fatal("garbage was accepted as a DERStatus")
+	}
+}
+
+// packRegs builds a STORAGE 702 image: a nameplate plus the two per-direction
+// rate ratings, at unity scale so the numbers in the assertions are the numbers
+// in the registers. A rating passed as <= 0 is published as the SunSpec
+// not-implemented sentinel rather than a raw zero, because those are two
+// DIFFERENT declarations — absence versus "my rated maximum in this direction
+// is zero" — and RefWRteMax has to tell them apart.
+func packRegs(t *testing.T, wMaxW, chaW, disW float64) []uint16 {
+	t.Helper()
+	regs := make([]uint16, sunspec.L702.Len())
+	v := sunspec.L702.View(regs)
+	v.SetEnum("W_SF", 0)
+	v.SetEnum("Var_SF", 0)
+	v.SetEnum("VA_SF", 0)
+	v.SetEnum("PF_SF", sfReg(-3))
+	v.SetEnum("V_SF", 0)
+	v.SetEnum("A_SF", 0)
+	v.SetEnum("S_SF", 0)
+	if wMaxW > 0 {
+		v.SetFloat("WMaxRtg", wMaxW)
+		v.SetFloat("WMax", wMaxW)
+	} else {
+		regs[sunspec.L702.Offset("WMaxRtg")] = 0xFFFF
+		regs[sunspec.L702.Offset("WMax")] = 0xFFFF
+	}
+	for name, val := range map[string]float64{"WChaRteMaxRtg": chaW, "WDisChaRteMaxRtg": disW} {
+		if math.IsNaN(val) {
+			regs[sunspec.L702.Offset(name)] = 0xFFFF // not implemented
+			continue
+		}
+		v.SetFloat(name, val)
+	}
+	return regs
+}
+
+// TestNameplate_FixedWReferenceIsPerSign is IW14-001/F5's headline proof, in
+// the layer that owns the arithmetic.
+//
+// A signed percent-of-active-power setpoint is a percentage of the device's
+// rated ability IN THE DIRECTION COMMANDED. On the bench's own asymmetric pack
+// (nameplate 5000 W, charge 2000 W, discharge 4500 W) the three candidate
+// references produce three different numbers, so this test can state the
+// difference rather than merely exercise the code: −60.00 % is −1200 W and
+// +60.00 % is +2700 W, and the ±3000 W a checker resolving both signs against
+// the nameplate would want is the WRONG answer in both directions — it reports
+// a correct gateway as not-applied and passes one that mis-resolved the
+// reference.
+func TestNameplate_FixedWReferenceIsPerSign(t *testing.T) {
+	t.Parallel()
+	np := DecodeNameplate("test", packRegs(t, 5000, 2000, 4500))
+
+	for _, c := range []struct {
+		name     string
+		pct      float64
+		sign     int
+		wantBase float64
+		wantName string
+		wantW    float64
+	}{
+		{"charge", -60, -1, 2000, "WChaRteMaxRtg", -1200},
+		{"discharge", +60, +1, 4500, "WDisChaRteMaxRtg", +2700},
+	} {
+		base, err := np.Base(RefWRteMax, c.sign, Measurement{})
+		if err != nil {
+			t.Fatalf("%s: Base(RefWRteMax, %d) = %v", c.name, c.sign, err)
+		}
+		if base.Name != c.wantName || math.Abs(base.Q.Val-c.wantBase) > 1 {
+			t.Fatalf("%s: reference = %s (%s), want %g W (%s)", c.name, base.Q, base.Name, c.wantBase, c.wantName)
+		}
+		if got := c.pct / 100 * base.Q.Val; math.Abs(got-c.wantW) > 1 {
+			t.Fatalf("%s: %g%% of this device's own %s resolves to %g W, want %g W (the nameplate would "+
+				"have given %g W, which is the defect this test exists to catch)",
+				c.name, c.pct, base.Name, got, c.wantW, c.pct/100*5000)
+		}
+	}
+}
+
+// TestNameplate_FixedWReferenceFallsBackToTheNameplate pins the OTHER half of
+// derbase's rule: a device that does not publish a rate rating for the
+// commanded direction has only its nameplate to offer, and that is the honest
+// stand-in — the pre-storage shape every PV inverter on the bench serves.
+func TestNameplate_FixedWReferenceFallsBackToTheNameplate(t *testing.T) {
+	t.Parallel()
+	np := DecodeNameplate("test", packRegs(t, 5000, math.NaN(), math.NaN()))
+	for _, sign := range []int{-1, +1} {
+		base, err := np.Base(RefWRteMax, sign, Measurement{})
+		if err != nil {
+			t.Fatalf("sign %d: Base(RefWRteMax) = %v, want the nameplate fallback", sign, err)
+		}
+		if math.Abs(base.Q.Val-5000) > 1 {
+			t.Fatalf("sign %d: reference = %s, want the 5000 W nameplate", sign, base.Q)
+		}
+		if !strings.Contains(base.Name, "WMax") || !strings.Contains(base.Name, "implements no") {
+			t.Fatalf("sign %d: reference name = %q — a fallback must say BOTH which rating it used and "+
+				"that the device declared no rate rating, or a report reads as though it had", sign, base.Name)
+		}
+	}
+
+	// One side declared, the other not: each side answers for itself.
+	np = DecodeNameplate("test", packRegs(t, 5000, 2000, math.NaN()))
+	cha, err := np.Base(RefWRteMax, -1, Measurement{})
+	if err != nil || cha.Name != "WChaRteMaxRtg" || math.Abs(cha.Q.Val-2000) > 1 {
+		t.Fatalf("charge reference = %v (%v), want the declared 2000 W WChaRteMaxRtg", cha, err)
+	}
+	dis, err := np.Base(RefWRteMax, +1, Measurement{})
+	if err != nil || math.Abs(dis.Q.Val-5000) > 1 {
+		t.Fatalf("discharge reference = %v (%v), want the 5000 W nameplate fallback", dis, err)
+	}
+}
+
+// TestNameplate_FixedWReferenceRefusesADeclaredIncapacity is the case the
+// shorthand "use the rating if it is positive, else the nameplate" gets wrong,
+// and it is not a corner: an implemented rated maximum of ZERO is the device
+// declaring it cannot move in that direction at all, which is why derbase
+// (maxRatingBound) REFUSES the control rather than writing a percentage of
+// something else. A referee that quietly fell back to the nameplate here would
+// be grading a command the product never sends.
+func TestNameplate_FixedWReferenceRefusesADeclaredIncapacity(t *testing.T) {
+	t.Parallel()
+	np := DecodeNameplate("test", packRegs(t, 5000, 0, 4500))
+
+	_, err := np.Base(RefWRteMax, -1, Measurement{})
+	if err == nil {
+		t.Fatal("a declared WChaRteMaxRtg of 0 W resolved to a reference — an implemented zero is a positive " +
+			"declaration of incapacity, not an absence to fall back from")
+	}
+	if !strings.Contains(err.Error(), "WChaRteMaxRtg") {
+		t.Fatalf("the refusal does not name the point that produced it: %v", err)
+	}
+	// The other direction is untouched by its neighbour's claim.
+	if base, err := np.Base(RefWRteMax, +1, Measurement{}); err != nil || math.Abs(base.Q.Val-4500) > 1 {
+		t.Fatalf("discharge reference = %v (%v), want the declared 4500 W", base, err)
+	}
+	// And a device with neither a rate rating nor a nameplate resolves
+	// nothing at all, rather than inventing a base.
+	bare := DecodeNameplate("test", packRegs(t, 0, math.NaN(), math.NaN()))
+	if _, err := bare.Base(RefWRteMax, -1, Measurement{}); err == nil {
+		t.Fatal("a device publishing neither a rate rating nor a WMax resolved a reference")
 	}
 }

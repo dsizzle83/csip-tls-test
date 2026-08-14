@@ -394,6 +394,7 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 	}
 
 	obs := &Observation{Case: rc.Case, Params: map[string]string{}}
+	obs.BaselineAt = time.Now().UTC()
 	base := d.Snapshot(ctx)
 	// The first snapshot of the run fixes where this run's DER self-reports
 	// begin in gridsim's append-only, cross-campaign log.
@@ -478,6 +479,11 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (certify.Result, error
 			obs.Waited = waited + settle
 		}
 	}
+
+	// When the live phase created the events it is about to grade. Carried
+	// after every phase that can publish one (Setup, PostWait, Change) so a
+	// criterion can compare an event's creation against its own window's floor.
+	obs.Published = d.Published()
 
 	notes := ""
 	if s.Notes != nil {
