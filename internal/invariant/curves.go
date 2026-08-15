@@ -29,6 +29,37 @@ package invariant
 // staging curves; content sitting in staging is a curve the device was OFFERED,
 // not one it adopted, and grading a staged curve as an adopted one would accept
 // exactly the half-completed write the adopt handshake exists to distinguish.
+//
+// TWO GENERATIONS, ONE REFEREE
+//
+// This file now decodes BOTH SunSpec curve idioms, and they do not agree about
+// what "the live curve" means. That single sentence is the whole of the
+// extension and every other difference falls out of it:
+//
+//	7xx     nested Crv[NCrv]{Pt[NPt]}; the live curve is index 0 and is
+//	        read-only; 1..NCrv-1 are writable STAGING slots; an
+//	        AdptCrvReq/AdptCrvRslt handshake promotes one into the other, so
+//	        "adopted" is a register the device SETS.
+//
+//	legacy  flat curve[NCrv], banks numbered from 1, twenty inlined point
+//	        slots each; NO staging slot and NO handshake. ActCrv SELECTS which
+//	        bank is live and ModEna bit 0 switches the function on, so
+//	        "adopted" is not a register at all — it is the statement "ActCrv
+//	        names the bank whose content this is", and this referee derives it
+//	        rather than reading it.
+//
+// Three consequences a reader must hold on to:
+//
+//	1. On legacy, Index 0 means "whatever bank ActCrv names", not "bank 0".
+//	   Decoding bank 1 unconditionally would grade a curve the device is not
+//	   running, which is the same error as grading a 7xx staging slot.
+//	2. A live legacy bank may LEGITIMATELY be READWRITE. On 7xx a writable live
+//	   curve is suspicious (it suggests the index-0 convention does not hold on
+//	   that device); on legacy it is the normal state of every bank, and the
+//	   caller must suppress that warning for FamilyLegacy or it fires on every
+//	   legacy row.
+//	3. DeptRef is 1-BASED on legacy against the 7xx enum's 0-based one. The two
+//	   are a translation in both directions and never a copy — see DeptRefName.
 
 import (
 	"fmt"
@@ -54,6 +85,12 @@ func (p CurvePoint) String() string { return fmt.Sprintf("(%s, %s)", trimFloat(p
 // (106 V, 100 W)" tells a reader something "(106, 100)" does not.
 type CurveAxis struct {
 	Model uint16
+	// Family says which SunSpec curve IDIOM this model belongs to, and it is
+	// load-bearing rather than decorative: it decides what "the live curve"
+	// means (index 0 vs the bank ActCrv names), whether an adopt handshake
+	// exists to read, whether DeptRef is 0-based or 1-based, and whether a
+	// writable live curve is suspicious or ordinary. See the file doc.
+	Family CurveFamily
 	// Name is the human label, e.g. "M705 Volt-Var".
 	Name string
 	// XName/YName name the physical quantity on each axis.
@@ -65,14 +102,60 @@ type CurveAxis struct {
 	Pointless bool
 }
 
+// CurveFamily is which SunSpec curve idiom a model belongs to.
+type CurveFamily string
+
+const (
+	// Family7xx is the IEEE 1547-2018 / SunSpec 7xx set: nested curves, a
+	// read-only live curve at index 0, writable staging slots, and the §3.1.2
+	// AdptCrvReq/AdptCrvRslt handshake.
+	Family7xx CurveFamily = "7xx"
+	// FamilyLegacy is the legacy 12x set: flat fixed-size banks numbered from
+	// 1, no staging slot, no handshake, ActCrv selecting the live bank and
+	// ModEna bit 0 switching the function on.
+	FamilyLegacy CurveFamily = "12x"
+)
+
 // curveAxes is the one table of curve models this package decodes. A model
 // absent from it is a model this package will not pretend to understand.
+//
+// The legacy rows carry their axis names in the LEGACY block's own order, which
+// is not always the northbound one: 129/130 store (duration, voltage) with the
+// TIME FIRST while IEEE 2030.5's opModLVRTMustTrip curve is (x = duration,
+// y = voltage). They agree by accident of naming and not by convention, so the
+// names here describe the REGISTERS, which is what this referee reads.
 var curveAxes = []CurveAxis{
-	{Model: sunspec.ModelDERVoltVar, Name: "M705 Volt-Var", XName: "V", YName: "var"},
-	{Model: sunspec.ModelDERVoltWatt, Name: "M706 Volt-Watt", XName: "V", YName: "W"},
-	{Model: sunspec.ModelDERFreqDroop, Name: "M711 Frequency Droop", XName: "Hz", YName: "W",
+	{Model: sunspec.ModelDERVoltVar, Family: Family7xx, Name: "M705 Volt-Var", XName: "V", YName: "var"},
+	{Model: sunspec.ModelDERVoltWatt, Family: Family7xx, Name: "M706 Volt-Watt", XName: "V", YName: "W"},
+	{Model: sunspec.ModelDERFreqDroop, Family: Family7xx, Name: "M711 Frequency Droop", XName: "Hz", YName: "W",
 		Pointless: true},
-	{Model: sunspec.ModelDERWattVar, Name: "M712 Watt-Var", XName: "W", YName: "var"},
+	{Model: sunspec.ModelDERWattVar, Family: Family7xx, Name: "M712 Watt-Var", XName: "W", YName: "var"},
+
+	{Model: sunspec.ModelVoltVarLegacy, Family: FamilyLegacy, Name: "M126 Static Volt-VAR",
+		XName: "%VRef", YName: "%DeptRef"},
+	{Model: sunspec.ModelLVRTLegacy, Family: FamilyLegacy, Name: "M129 LVRT Must-Disconnect",
+		XName: "s", YName: "%VRef"},
+	{Model: sunspec.ModelHVRTLegacy, Family: FamilyLegacy, Name: "M130 HVRT Must-Disconnect",
+		XName: "s", YName: "%VRef"},
+	{Model: sunspec.ModelWattPFLegacy, Family: FamilyLegacy, Name: "M131 Watt-PF",
+		XName: "%WMax", YName: "PF"},
+	{Model: sunspec.ModelVoltWattLegacy, Family: FamilyLegacy, Name: "M132 Volt-Watt",
+		XName: "%VRef", YName: "%DeptRef"},
+	{Model: sunspec.ModelFreqWattLegacy, Family: FamilyLegacy, Name: "M134 Freq-Watt Curve",
+		XName: "Hz", YName: "%WRef"},
+}
+
+// LegacyCurveModels are the 12x curve models this referee decodes, ascending.
+// Exported so a caller that must decide which GENERATION a device belongs to
+// asks this package rather than keeping a second list.
+func LegacyCurveModels() []uint16 {
+	out := make([]uint16, 0, len(curveAxes))
+	for _, a := range curveAxes {
+		if a.Family == FamilyLegacy {
+			out = append(out, a.Model)
+		}
+	}
+	return out
 }
 
 // CurveModels are the models a register-image source reads for curve evidence,
@@ -161,6 +244,19 @@ type CurveView struct {
 	// NPt / NCrv are the device's own declared geometry.
 	NPt, NCrv int
 
+	// ── LEGACY (12x) only ──
+	//
+	// ActCrv is the header's own curve-SELECTION register: which 1-based bank
+	// the device is running, 0 for none. It is the legacy generation's whole
+	// commit mechanism and has no 7xx counterpart (there, promotion is the
+	// adopt handshake), so it is reported separately rather than folded into
+	// AdoptReq — a reader must be able to see WHICH bank is live, not merely
+	// that something was requested.
+	ActCrv int
+	// Bank is the 1-based bank this view decoded. On a legacy Index-0 view it
+	// is whatever ActCrv named; on Index i>0 it is i. Zero on 7xx.
+	Bank int
+
 	// Points is the live curve's breakpoints, device engineering units. Always
 	// empty for a Pointless axis.
 	Points []CurvePoint
@@ -175,11 +271,21 @@ type CurveView struct {
 // is not available (and must not report a verdict as though it were).
 func (c CurveView) Pointless() bool { return c.Axis.Pointless }
 
+// Legacy reports whether this reading came from the legacy 12x idiom, which a
+// caller needs in order to know that a writable live bank is ordinary here and
+// that there is no adopt result to interpret.
+func (c CurveView) Legacy() bool { return c.Axis.Family == FamilyLegacy }
+
 // Describe renders what the device holds, for a finding that must say what it
 // read rather than only what it wanted.
 func (c CurveView) Describe() string {
 	name := c.Axis.Name
-	if c.Index > 0 {
+	switch {
+	case c.Axis.Family == FamilyLegacy && c.Index > 0:
+		// "staging curve" is a 7xx word and there is no such thing here: every
+		// legacy bank is an ordinary bank and exactly one of them is selected.
+		name = fmt.Sprintf("%s bank %d", c.Axis.Name, c.Index)
+	case c.Index > 0:
 		name = fmt.Sprintf("%s staging curve %d", c.Axis.Name, c.Index)
 	}
 	if !c.Present {
@@ -195,21 +301,38 @@ func (c CurveView) Describe() string {
 	// adopt state, which is exactly the confusion the live/staging distinction
 	// exists to prevent.
 	var parts []string
-	if c.Index == 0 {
+	switch {
+	case c.Legacy():
+		// The legacy header's own vocabulary. There is no adopt result to
+		// print and printing one would invent a device state: what stands in
+		// its place is the SELECTION, which is why ActCrv is rendered on every
+		// line rather than only on the live one — on this generation "which
+		// bank is live" is the fact a bank reading is meaningless without.
+		parts = append(parts,
+			fmt.Sprintf("ModEna=%#04x (%s, bitfield bit 0)", c.EnaRaw, enabledWord(c.Enabled)),
+			fmt.Sprintf("adopt handshake n/a (ActCrv=%d selects; this reading is bank %d)",
+				c.ActCrv, c.Bank),
+			fmt.Sprintf("NPt=%d NCrv=%d", c.NPt, c.NCrv),
+			fmt.Sprintf("bank read-only=%t", c.ReadOnly),
+		)
+	case c.Index == 0:
 		parts = append(parts,
 			fmt.Sprintf("Ena=%d (%s)", c.EnaRaw, enabledWord(c.Enabled)),
 			fmt.Sprintf("adopt req=%d rslt=%d (%s)", c.AdoptReq, c.AdoptResult, adoptWord(c.Adopted)),
 			fmt.Sprintf("NPt=%d NCrv=%d", c.NPt, c.NCrv),
 			fmt.Sprintf("live curve read-only=%t", c.ReadOnly),
 		)
-	} else {
+	default:
 		parts = append(parts, fmt.Sprintf("read-only=%t", c.ReadOnly))
 	}
 	if c.HasDeptRef {
 		parts = append(parts, fmt.Sprintf("DeptRef=%d (%s)", c.DeptRef, DeptRefName(c.Axis.Model, c.DeptRef)))
 	}
 	which := "live curve"
-	if c.Index > 0 {
+	switch {
+	case c.Legacy() && c.Index == 0:
+		which = fmt.Sprintf("live bank %d", c.Bank)
+	case c.Index > 0:
 		which = "this curve"
 	}
 	switch {
@@ -261,6 +384,30 @@ func DeptRefName(model uint16, v uint16) string {
 		case 1:
 			return "W_AVAL_PCT"
 		}
+
+	// THE LEGACY ENUM IS 1-BASED. It is not the 7xx enum with different names:
+	// %WMax is 1 here and 0 there, so a referee that shared one table between
+	// the generations would report every legacy DeptRef one place along — and
+	// would do it silently, because both tables have a valid symbol at every
+	// code it would land on. Transcribed from the vendored model_126.json /
+	// model_132.json enum blocks, the same provenance rule the 7xx half above
+	// states, and never derived from the 7xx codes by adding one.
+	case sunspec.ModelVoltVarLegacy:
+		switch v {
+		case 1:
+			return "%WMax"
+		case 2:
+			return "%VArMax"
+		case 3:
+			return "%VArAval"
+		}
+	case sunspec.ModelVoltWattLegacy:
+		switch v {
+		case 1:
+			return "%WMax"
+		case 2:
+			return "%WAvail"
+		}
 	}
 	return "unknown for this model"
 }
@@ -291,8 +438,12 @@ func (u UnitView) Curve(source string, model uint16) CurveView {
 	return DecodeCurve(fmt.Sprintf("%s unit %d", source, u.Unit), model, u.Regs[model])
 }
 
-// CurveAt is Curve for one specific curve of the bank — 0 for the live curve,
-// 1..NCrv-1 for the writable staging slots.
+// CurveAt is Curve for one specific curve of the bank.
+//
+// The index means different things per generation, which is the whole content
+// of the two idioms' difference: on 7xx, 0 is the live curve and 1..NCrv-1 are
+// the writable staging slots; on legacy, 0 is "whatever bank ActCrv names" and
+// 1..NCrv address the banks directly.
 func (u UnitView) CurveAt(source string, model uint16, idx int) CurveView {
 	return DecodeCurveAt(fmt.Sprintf("%s unit %d", source, u.Unit), model, u.Regs[model], idx)
 }
@@ -332,6 +483,9 @@ func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveVie
 	v := CurveView{Source: source, Axis: axis, Index: idx}
 	if len(regs) == 0 {
 		return v
+	}
+	if axis.Family == FamilyLegacy {
+		return decodeLegacyCurveAt(v, model, regs, idx)
 	}
 
 	hdr, reqField, rsltField, nField := curveHeaderOf(model)
@@ -400,6 +554,148 @@ func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveVie
 	}
 	v.Present = true
 	return v
+}
+
+// decodeLegacyCurveAt is DecodeCurveAt's legacy (12x) half.
+//
+// THE ONE LINE THAT MATTERS is the bank selection. On this generation the
+// device runs the bank ActCrv names, and there is no register anywhere that
+// says "a curve was adopted" — so a referee that read bank 1 unconditionally
+// would report content the device is not running, which is the identical error
+// to grading a 7xx staging slot as executed. Index 0 therefore resolves through
+// ActCrv, and only an explicit 1..NCrv addresses a bank directly.
+//
+// Everything runs through lexa-proto's own accessors, which apply the
+// fail-closed GEOMETRY GATE before computing any offset: a device whose
+// declared L, NCrv and spec block length disagree has an unknown register map,
+// and this referee reports that as a decode failure rather than reading twenty
+// point slots out of a block that may only have ten. A bounds check would not
+// catch it — every spec offset is inside such a device's block, and every one
+// of them is the wrong register.
+func decodeLegacyCurveAt(v CurveView, model uint16, regs []uint16, idx int) CurveView {
+	hdr, err := sunspec.ParseLegacyCurveHeader(model, regs)
+	if err != nil {
+		v.Err = err.Error()
+		return v
+	}
+	// ModEna is a bitfield16 and its raw word is kept: a device that sets a
+	// reserved bit alongside bit 0 is ENABLED, and a finding has to be able to
+	// quote the word it read rather than a boolean derived from it.
+	v.EnaRaw, v.Enabled = hdr.ModEnaRaw, hdr.ModEna
+	v.NCrv, v.NPt = hdr.NCrv, hdr.NPt
+	v.ActCrv = hdr.ActCrv
+
+	bank := idx
+	if idx == 0 {
+		bank = hdr.ActCrv
+		if bank == 0 {
+			// A model that is present, decodes, and is running NO curve. That
+			// is a different fact from "does not serve the model" and from
+			// "runs the wrong one", and collapsing any two of the three would
+			// send the finding to the wrong owner. Present, not adopted.
+			v.Present = true
+			return v
+		}
+	}
+	v.Bank = bank
+
+	geom, gerr := sunspec.LegacyCurveGeometryOf(model, len(regs), regs)
+	if gerr != nil {
+		v.Err = gerr.Error()
+		return v
+	}
+	if _, ok := geom.BankOffset(bank); !ok {
+		v.Err = fmt.Sprintf("bank %d is not addressable: this device declares NCrv=%d (banks are 1-based)",
+			bank, geom.NCrv)
+		return v
+	}
+
+	switch model {
+	case sunspec.ModelVoltVarLegacy:
+		c, err := sunspec.ParseLegacy126Curve(regs, bank)
+		if err != nil {
+			v.Err = err.Error()
+			return v
+		}
+		v.ReadOnly = c.ReadOnly
+		v.DeptRef, v.HasDeptRef = c.DeptRef, true
+		v.Points = legacyPoints(c.Pts)
+	case sunspec.ModelVoltWattLegacy:
+		c, err := sunspec.ParseLegacy132Curve(regs, bank)
+		if err != nil {
+			v.Err = err.Error()
+			return v
+		}
+		v.ReadOnly = c.ReadOnly
+		v.DeptRef, v.HasDeptRef = c.DeptRef, true
+		v.Points = legacyPoints(c.Pts)
+	case sunspec.ModelWattPFLegacy:
+		c, err := sunspec.ParseLegacy131Curve(regs, bank)
+		if err != nil {
+			v.Err = err.Error()
+			return v
+		}
+		// 131 carries NO DeptRef: the spec fixes its x axis at %WMax and its y
+		// axis is a power factor, which is not a percentage OF anything, so
+		// HasDeptRef stays false rather than reporting a zero.
+		v.ReadOnly = c.ReadOnly
+		v.Points = legacyPoints(c.Pts)
+	case sunspec.ModelFreqWattLegacy:
+		c, err := sunspec.ParseLegacy134Curve(regs, bank)
+		if err != nil {
+			v.Err = err.Error()
+			return v
+		}
+		v.ReadOnly = c.ReadOnly
+		v.Points = legacyPoints(c.Pts)
+		// 134's y values are % WRef, not % WMax, and a CSIP opModFreqWatt
+		// curve's y is %setMaxW. Those are equal only when WRef == setMaxW, so
+		// the reference the device is actually answering percentages against —
+		// and whether snapshot mode has replaced it with the instantaneous
+		// output at trigger time — is rendered on every reading rather than
+		// assumed. A curve whose base is unstated is a curve nobody can name.
+		v.Params = fmt.Sprintf("WRef=%s W SnptW=%t (snapshot mode %s) WRefStrHz=%s WRefStopHz=%s",
+			trimFloat(c.WRefW), c.SnptW, enabledWord(c.SnptW),
+			trimFloat(c.WRefStrHz), trimFloat(c.WRefStopHz))
+	case sunspec.ModelLVRTLegacy:
+		c, err := sunspec.ParseLegacy129Curve(regs, bank)
+		if err != nil {
+			v.Err = err.Error()
+			return v
+		}
+		v.ReadOnly = c.ReadOnly
+		v.Points = legacyPoints(c.Pts)
+	case sunspec.ModelHVRTLegacy:
+		c, err := sunspec.ParseLegacy130Curve(regs, bank)
+		if err != nil {
+			v.Err = err.Error()
+			return v
+		}
+		v.ReadOnly = c.ReadOnly
+		v.Points = legacyPoints(c.Pts)
+	default:
+		v.Err = fmt.Sprintf("model %d is in the legacy curve family table but has no decode here", model)
+		return v
+	}
+
+	// "Adopted" on legacy is DERIVED, never read: the device is running this
+	// bank exactly when ActCrv names it. There is no AdptCrvRslt to consult and
+	// inventing one would report a device claim that was never made.
+	v.Adopted = hdr.ActCrv != 0 && bank == hdr.ActCrv
+	v.Present = true
+	return v
+}
+
+// legacyPoints converts lexa-proto's legacy breakpoints into this package's.
+func legacyPoints(pts []sunspec.LegacyCurvePoint) []CurvePoint {
+	if len(pts) == 0 {
+		return nil
+	}
+	out := make([]CurvePoint, 0, len(pts))
+	for _, p := range pts {
+		out = append(out, CurvePoint{X: p.X, Y: p.Y})
+	}
+	return out
 }
 
 // curveHeaderOf returns a curve model's header layout and the names of its
