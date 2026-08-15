@@ -156,6 +156,12 @@ func TestAdminCurve_ModeToLinkAndType(t *testing.T) {
 		{"volt_watt", model.CurveTypeVoltWatt, func(b model.ExtendedDERControlBase) *model.CurveLink { return b.OpModVoltWatt }},
 		{"freq_watt", model.CurveTypeFreqWatt, func(b model.ExtendedDERControlBase) *model.CurveLink { return b.OpModFreqWatt }},
 		{"watt_pf", model.CurveTypeWattPF, func(b model.ExtendedDERControlBase) *model.CurveLink { return b.OpModWattPF }},
+		// watt_var is the FIFTH mode, and its absence was a bench gap rather
+		// than a scope decision: opModWattVar is the axis SunSpec model 712
+		// actually implements, and nothing here could put an <opModWattVar>
+		// DERCurveLink on the wire at all — which is how opModWattPF came to be
+		// graded against 712 in its place.
+		{"watt_var", model.CurveTypeWattVar, func(b model.ExtendedDERControlBase) *model.CurveLink { return b.OpModWattVar }},
 	}
 	for _, c := range cases {
 		t.Run(c.mode, func(t *testing.T) {
@@ -331,5 +337,112 @@ func TestAdminControl_ScalarPostOntoExtendedProgramKeepsResponseAttrs(t *testing
 	}
 	if !strings.Contains(body, `responseRequired="03"`) {
 		t.Errorf("raw /derp/0/derc body carries no responseRequired attribute: %s", body)
+	}
+}
+
+// TestAdminCurve_IndividualHrefResolves is the lever every curve row's
+// attribution depends on.
+//
+// A curve-linked DERControl carries an HREF, not content. This server minted
+// that href and stored only the LIST, so every individual /derp/{p}/dc/{i}
+// answered 404: a DUT that followed the link received a link and no curve, and
+// the resulting southbound silence was unattributable — "the DUT refused the
+// axis" and "the bench served the curve nowhere" look identical from outside.
+// critDERCurveResolvable exists to tell those apart and could not, because the
+// bench always 404'd.
+func TestAdminCurve_IndividualHrefResolves(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	// The static fixture's own href resolves before any admin lever runs: the
+	// default tree advertised a curve at /derp/0/dc/0 and did not serve it.
+	var fixture model.DERCurve
+	getXML(t, s, "/derp/0/dc/0", &fixture)
+	if fixture.MRID != "CURVE-VV-001" {
+		t.Errorf("the static fixture curve at /derp/0/dc/0 has mRID %q, want CURVE-VV-001", fixture.MRID)
+	}
+
+	body := `{"program":1,"mode":"volt_watt","points":[{"x":106,"y":100},{"x":110,"y":20}],` +
+		`"y_ref_type":1,"activate":true}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(body))))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /admin/curve = %d; body: %s", rec.Code, rec.Body)
+	}
+	var minted struct {
+		CurveHref string `json:"curve_href"`
+		CurveMRID string `json:"curve_mrid"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &minted); err != nil {
+		t.Fatalf("decode the POST response: %v", err)
+	}
+
+	var got model.DERCurve
+	getXML(t, s, minted.CurveHref, &got)
+	if got.MRID != minted.CurveMRID {
+		t.Errorf("GET %s served mRID %q, want the minted %q", minted.CurveHref, got.MRID, minted.CurveMRID)
+	}
+	if len(got.CurveData) != 2 || got.CurveData[0].XValue != 106 || got.CurveData[1].YValue != 20 {
+		t.Errorf("GET %s served %+v, want the two breakpoints that were posted",
+			minted.CurveHref, got.CurveData)
+	}
+	if got.YRefType != 1 {
+		t.Errorf("GET %s served yRefType=%d, want the posted 1", minted.CurveHref, got.YRefType)
+	}
+
+	// And the teardown removes it, or the next row grades a bench this one is
+	// still driving. Program 1 has no static fixture, so the path goes away
+	// entirely; program 0's reverts to the fixture instead (see
+	// TestAdminCurve_DeleteRestoresStatic).
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("DELETE", "/admin/curve", bytes.NewReader([]byte(`{"program":1}`))))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /admin/curve = %d, want 204; body: %s", rec.Code, rec.Body)
+	}
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", minted.CurveHref, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET %s after the teardown = %d, want 404 — the curve this run published is still "+
+			"fetchable", minted.CurveHref, rec.Code)
+	}
+}
+
+// TestAdminCurve_DeleteReplacesProgramZeroCurveContent pins the OTHER half of
+// the teardown, which is not "the path 404s": program 0's static fixture
+// legitimately owns /derp/0/dc/0, so a clear must put the FIXTURE back there
+// rather than leave the admin-posted curve fetchable at an href the control
+// list no longer mentions.
+func TestAdminCurve_DeleteReplacesProgramZeroCurveContent(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	body := `{"program":0,"mode":"volt_var","points":[{"x":92,"y":60}],"y_ref_type":3,"activate":true}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(body))))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /admin/curve = %d; body: %s", rec.Code, rec.Body)
+	}
+	var minted struct {
+		CurveMRID string `json:"curve_mrid"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &minted); err != nil {
+		t.Fatalf("decode the POST response: %v", err)
+	}
+	var live model.DERCurve
+	getXML(t, s, "/derp/0/dc/0", &live)
+	if live.MRID != minted.CurveMRID {
+		t.Fatalf("/derp/0/dc/0 serves %q, want the posted curve %q", live.MRID, minted.CurveMRID)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("DELETE", "/admin/curve", bytes.NewReader([]byte(`{"program":0}`))))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /admin/curve = %d, want 204", rec.Code)
+	}
+	var after model.DERCurve
+	getXML(t, s, "/derp/0/dc/0", &after)
+	if after.MRID != "CURVE-VV-001" {
+		t.Errorf("/derp/0/dc/0 serves %q after the teardown, want the static fixture CURVE-VV-001 — the "+
+			"posted curve is still fetchable at an href nothing links", after.MRID)
 	}
 }

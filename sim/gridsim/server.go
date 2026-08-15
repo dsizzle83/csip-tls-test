@@ -50,8 +50,14 @@ const ContentType = "application/sep+xml"
 
 // Server holds the resource tree and serves it over HTTP.
 type Server struct {
-	mu         sync.RWMutex
-	resources  map[string]interface{} // path → resource struct
+	mu        sync.RWMutex
+	resources map[string]interface{} // path → resource struct
+	// curveHrefs is the set of INDIVIDUALLY-addressable DERCurve paths this
+	// server has minted (curve.go's publishCurveResourcesLocked). It is kept
+	// beside resources rather than derived from it by prefix-matching, so a
+	// teardown removes exactly what a curve POST added and can never delete a
+	// resource some other lever put at a /derp/{p}/dc/... path.
+	curveHrefs map[string]bool
 	mux        *http.ServeMux
 	ClientLFDI string // The LFDI of the client we expect to connect
 	clientSFDI uint64 // derived from ClientLFDI; updated by SetClientCertDER
@@ -208,11 +214,21 @@ type Server struct {
 func NewServer(clientLFDI string) *Server {
 	s := &Server{
 		resources:  make(map[string]interface{}),
+		curveHrefs: make(map[string]bool),
 		mux:        http.NewServeMux(),
 		ClientLFDI: clientLFDI,
 		logBuf:     simapi.NewLogBuffer(),
 	}
 	s.buildResourceTree()
+	// The static tree's own DERCurve entries get individual hrefs too. Before
+	// this, /derp/0/dc/0 — the href the fixture curve carries in its own
+	// Resource — answered 404 on a bench where no admin lever had run, so the
+	// default tree advertised a curve it did not serve.
+	for p := 0; p <= 2; p++ {
+		if cl, ok := s.resources[fmt.Sprintf("/derp/%d/dc", p)].(*model.DERCurveList); ok {
+			s.publishCurveResourcesLocked(p, cl)
+		}
+	}
 	s.mux.HandleFunc("/", s.handleRequest)
 	return s
 }

@@ -76,6 +76,30 @@
     <yRefType>3</yRefType>
   </DERCurve>
 </DERCurveList>
+=== /derp/0/dc/0
+<DERCurve xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/dc/0">
+  <mRID>CURVE-VV-001</mRID>
+  <description>Volt-VAr curve</description>
+  <curveType>0</curveType>
+  <CurveData>
+    <xvalue>92</xvalue>
+    <yvalue>30</yvalue>
+  </CurveData>
+  <CurveData>
+    <xvalue>98</xvalue>
+    <yvalue>0</yvalue>
+  </CurveData>
+  <CurveData>
+    <xvalue>102</xvalue>
+    <yvalue>0</yvalue>
+  </CurveData>
+  <CurveData>
+    <xvalue>108</xvalue>
+    <yvalue>-30</yvalue>
+  </CurveData>
+  <vRef>240</vRef>
+  <yRefType>3</yRefType>
+</DERCurve>
 === /derp/0/dderc
 <DefaultDERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/dderc">
   <mRID>DDERC-SP-001</mRID>

@@ -32,12 +32,12 @@ type curvePoint struct {
 
 // adminCurveReq is the JSON body for POST /admin/curve.
 type adminCurveReq struct {
-	Program     int          `json:"program"`
-	Mode        string       `json:"mode"` // volt_var|volt_watt|freq_watt|watt_pf
-	Points      []curvePoint `json:"points"`
-	VRef        int16        `json:"vref"`       // nominal AC voltage (V) for volt curves; 0 = omit
-	XMult       int8         `json:"x_mult"`     // 10^n multiplier on x values
-	YMult       int8         `json:"y_mult"`     // 10^n multiplier on y values
+	Program int          `json:"program"`
+	Mode    string       `json:"mode"` // volt_var|volt_watt|freq_watt|watt_pf|watt_var
+	Points  []curvePoint `json:"points"`
+	VRef    int16        `json:"vref"`   // nominal AC voltage (V) for volt curves; 0 = omit
+	XMult   int8         `json:"x_mult"` // 10^n multiplier on x values
+	YMult   int8         `json:"y_mult"` // 10^n multiplier on y values
 	// x_ref_type is GONE (2026-08-14), and a request still carrying it is
 	// REJECTED (400) rather than silently ignored — see XRefTypeGone below.
 	// sep 2.0.4 declares NO xRefType element — `grep -c xRefType
@@ -54,10 +54,10 @@ type adminCurveReq struct {
 	// request whose x_ref_type the server no longer honours would leave the
 	// caller believing it had set something.
 	XRefTypeGone *uint8 `json:"x_ref_type,omitempty"`
-	Description string       `json:"description"`
-	DurationS   int          `json:"duration_s"`     // default 300
-	StartOffset int          `json:"start_offset_s"` // seconds from now
-	Activate    bool         `json:"activate"`       // true = replace curve + control lists
+	Description  string `json:"description"`
+	DurationS    int    `json:"duration_s"`     // default 300
+	StartOffset  int    `json:"start_offset_s"` // seconds from now
+	Activate     bool   `json:"activate"`       // true = replace curve + control lists
 	// FixedVarPct, when present, rides along as an opModFixedVar scalar overlay
 	// on the same control, mirroring adminCtrlReq. It is emitted with
 	// DERUnitRefType 2 (%setMaxVar) — a percentage of the REACTIVE nameplate;
@@ -77,6 +77,15 @@ func curveTypeForMode(mode string) (uint16, bool) {
 		return model.CurveTypeWattPF, true // 2
 	case "volt_watt":
 		return model.CurveTypeVoltWatt, true // 3
+	case "watt_var":
+		// opModWattVar, DERCurveType 10. It is the axis SunSpec model 712
+		// actually implements, and until now there was no lever that could put
+		// an <opModWattVar> DERCurveLink on the wire at all — so the strongest
+		// curve axis the 7xx product has was the one nothing exercised, and
+		// BASIC-015's opModWattPF was graded against 712 in its place. Both
+		// halves of that substitution are now expressible separately, which is
+		// the only way a row can show they are different commands.
+		return model.CurveTypeWattVar, true // 10
 	default:
 		return 0, false
 	}
@@ -95,6 +104,8 @@ func setCurveLink(b *model.ExtendedDERControlBase, mode, href string) {
 		b.OpModFreqWatt = link
 	case "watt_pf":
 		b.OpModWattPF = link
+	case "watt_var":
+		b.OpModWattVar = link
 	}
 }
 
@@ -127,7 +138,8 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	}
 	curveType, ok := curveTypeForMode(req.Mode)
 	if !ok {
-		http.Error(w, "mode must be one of volt_var|volt_watt|freq_watt|watt_pf", http.StatusBadRequest)
+		http.Error(w, "mode must be one of volt_var|volt_watt|freq_watt|watt_pf|watt_var",
+			http.StatusBadRequest)
 		return
 	}
 	if req.DurationS <= 0 {
@@ -165,8 +177,8 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		YMultiplier:  req.YMult,
 		// No XRefType: see adminCurveReq. The csipmodel field stays zero and
 		// its `omitempty` keeps the element off the wire entirely.
-		YRefType: req.YRefType,
-		CurveData:    pointsToCurveData(req.Points),
+		YRefType:  req.YRefType,
+		CurveData: pointsToCurveData(req.Points),
 	}
 	if req.VRef != 0 {
 		v := req.VRef
@@ -175,6 +187,17 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	cl.DERCurve = append(cl.DERCurve, curve)
 	cl.All = uint32(len(cl.DERCurve))
 	cl.Results = cl.All
+
+	// A curve-linked DERControl carries an HREF, not content. Until now the
+	// server MINTED that href and stored only the list, so every individual
+	// /derp/{p}/dc/{i} answered 404 and a DUT that followed the link received a
+	// link and no curve. That made every curve row's southbound silence
+	// unattributable: "the DUT refused the axis" and "the bench served the
+	// curve nowhere" look identical from outside, which is exactly the
+	// ambiguity critDERCurveResolvable was written to disambiguate and could
+	// not, because the bench always 404'd. Publish the individual resources so
+	// the link a control carries actually resolves.
+	s.publishCurveResourcesLocked(req.Program, cl)
 
 	// Ensure the program advertises its DERCurveList so the walker discovers
 	// the curve (program 0 already links it; 1/2 get the link on first use).
@@ -293,10 +316,16 @@ func (s *Server) adminCurveDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Reset the curve list to the original static fixture.
+	// Reset the curve list to the original static fixture — and with it the
+	// INDIVIDUAL curve resources, or a cleared program would go on serving the
+	// previous run's curve at an href its control list no longer mentions. A
+	// teardown that leaves a fetchable curve behind is the contamination the
+	// clear exists to remove.
 	dcPath := fmt.Sprintf("/derp/%d/dc", req.Program)
+	s.clearCurveResourcesLocked(req.Program)
 	reset := staticCurveList(req.Program)
 	s.resources[dcPath] = reset
+	s.publishCurveResourcesLocked(req.Program, reset)
 	s.ensureCurveListLinkLocked(req.Program, dcPath, reset.All)
 
 	w.WriteHeader(http.StatusNoContent)
@@ -328,6 +357,41 @@ func (s *Server) putExtendedControl(path string, ctrl model.ExtendedDERControl, 
 	el.DERControl = append(el.DERControl, ctrl)
 	el.All = uint32(len(el.DERControl))
 	el.Results = el.All
+}
+
+// publishCurveResourcesLocked serves every DERCurve of a program's list at its
+// OWN href, so a DERControl's curve link resolves for a DUT that follows it.
+//
+// Each entry is stored as a COPY rather than as a pointer into the list's
+// backing array: appending to cl.DERCurve reallocates, and a stored pointer
+// into the old array would go on serving a curve the list no longer holds.
+// Caller must hold s.mu.
+func (s *Server) publishCurveResourcesLocked(program int, cl *model.DERCurveList) {
+	if cl == nil {
+		return
+	}
+	for i := range cl.DERCurve {
+		c := cl.DERCurve[i]
+		href := c.Href
+		if href == "" {
+			href = fmt.Sprintf("/derp/%d/dc/%d", program, i)
+			c.Href = href
+		}
+		s.resources[href] = &c
+		s.curveHrefs[href] = true
+	}
+}
+
+// clearCurveResourcesLocked removes the individually-addressable curve
+// resources this server minted for a program. Caller must hold s.mu.
+func (s *Server) clearCurveResourcesLocked(program int) {
+	prefix := fmt.Sprintf("/derp/%d/dc/", program)
+	for href := range s.curveHrefs {
+		if strings.HasPrefix(href, prefix) {
+			delete(s.resources, href)
+			delete(s.curveHrefs, href)
+		}
+	}
 }
 
 // ensureCurveListLinkLocked wires (or refreshes) the DERProgram's
