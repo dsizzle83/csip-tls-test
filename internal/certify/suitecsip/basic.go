@@ -502,6 +502,39 @@ func scalarModeRefused(element, axis, commanded, why string, points []string,
 	}
 }
 
+// curveModeRefused builds a CURVE row whose axis this product DELIBERATELY
+// refuses: the curve goes out exactly as an executing curve row's would, and
+// the row then asserts the refusal was HONEST — a cannot-comply Response to the
+// head end, and NOT ONE REGISTER of the mode's curve bank moved on the DER.
+//
+// It is curveMode's mirror, not a negation of it, for the reason
+// scalarModeRefused's doc gives: a curve oracle asks "did the DER adopt what
+// this row published?", and pointed at an axis the product correctly refuses it
+// would FAIL every conformant DUT. The questions a refusal asks are different
+// ones, and both must hold — a gateway that answers cannot-comply and adopts
+// the curve anyway is lying to the head end; one that adopts nothing but
+// reports Started is lying about execution.
+//
+// The published curve is REAL and well-formed on purpose. A malformed curve, or
+// one whose href does not resolve, would also draw a refusal, and from outside
+// the DUT the two look identical — so the row must publish a control that a DUT
+// supporting the axis would have executed, through the same publisher the
+// execution rows use. critDERCurveResolvable stays on the row for the same
+// reason: it is what separates "refused the axis" from "never got the curve".
+func curveModeRefused(element, mode string, points []CurvePoint, yRef uint8, model uint16,
+	axis, why string) controlMode {
+	return controlMode{
+		Element: element,
+		Refusal: &refusalBinding{
+			Axis: axis, Why: why,
+			Commanded: fmt.Sprintf("a %s curve of %d breakpoint(s) linked from <%s>", mode, len(points), element),
+			Curve: &curveBinding{
+				Mode: mode, Points: points, YRefType: yRef, Model: model,
+			},
+		},
+	}
+}
+
 // unreachableMode builds a controlMode for a mode this bench cannot publish.
 func unreachableMode(element, why string) controlMode {
 	return controlMode{Element: element, Unreachable: why}
@@ -581,6 +614,14 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			case m.Unreachable != "":
 				crits = append(crits, critEffectBlockedByAuthoringGap(subject, m.Element))
 			case m.Refusal != nil:
+				// A CURVE refusal keeps the resolvability check an execution
+				// curve row carries. Without it a bench-side 404 on the curve
+				// href would produce the same southbound silence a genuine
+				// refusal does, and the row would certify the DUT for something
+				// the bench caused (see critDERCurveResolvable).
+				if m.Refusal.Curve != nil {
+					crits = append(crits, critDERCurveResolvable(curveHrefOf(o)))
+				}
 				// Two assertions, because a refusal has two halves and either
 				// alone lets the other's defect through: what the DUT told the
 				// head end, and what it did to the device.

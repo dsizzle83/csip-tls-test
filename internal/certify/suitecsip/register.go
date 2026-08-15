@@ -57,16 +57,27 @@ const (
 		"model 706 (DER Volt-Watt) — the same correspondence this product's southbound reconciler uses " +
 		"(lexa-gw cmd/modbus/reconcile_adv.go maps its volt-watt axis onto sunspec.ModelDERVoltWatt)"
 
-	// The watt-PF row lands on 712 and the reason is worth stating, because the
-	// names do not match: SunSpec's watt-shaped reactive model is Watt-VAr, and
-	// IEEE 2030.5's carriage for that same axis is opModWattPF. Nothing in the
-	// 7xx set is named Watt-PF.
-	mappingWattPF = "IEEE 2030.5 carries the watt-shaped REACTIVE axis as opModWattPF; the SunSpec/IEEE-1547 " +
-		"carriage of that axis is model 712 (DER Watt-Var), there being no Watt-PF model in the 7xx set — " +
-		"the same correspondence this product's southbound reconciler uses (lexa-gw " +
-		"cmd/modbus/reconcile_adv.go's advCurveMode maps its watt-var axis to the mode name \"watt_pf\" " +
-		"precisely because 2030.5's carriage for it is opModWattPF). The breakpoints are compared as the " +
-		"RAW values the control published; this referee performs no axis re-interpretation of its own"
+	// BASIC-015 used to grade opModWattPF as an EXECUTION row against model 712,
+	// on a mapping that said "there being no Watt-PF model in the 7xx set". That
+	// mapping was the DEFECT, written down: 712 is DER Watt-VAr, a different
+	// function whose y axis is a signed percentage of a VAR reference, and
+	// opModWattPF's y axis is a signed power-factor displacement under the EEI
+	// convention. Grading a PF curve against a var register bank certified a
+	// substitution — and the product performed the same substitution, which is
+	// why the row passed.
+	//
+	// The product ended it (lexa-gw curve P1, 2026-08-14): watt_var is now its
+	// own axis and is the only thing written to 712, and opModWattPF is REFUSED
+	// at receipt on a 7xx DER. So this is now the row's refusal reason.
+	refusalWattPF = "opModWattPF's only exact register home is LEGACY SunSpec model 131 (Watt-PF). The 7xx " +
+		"set has no watt-PF model at all: model 712 is DER Watt-Var, whose y axis means a signed " +
+		"percentage of a var reference (its DeptRef names %VArMax or %VArAval) rather than a signed " +
+		"power-factor displacement under the EEI convention, so writing a PF curve into it commands a " +
+		"different function. sep 2.0.4 says the same thing from the other side: opModWattVar and " +
+		"opModWattPF are separate DERControlBase elements with separate DERCurveType codes (10 and 2). " +
+		"This DUT serves a 7xx DER and its legacy curve shell does not exist yet, so on both generations " +
+		"the honest answer is cannot-comply at receipt — which is what this row now measures, instead of " +
+		"grading a PF curve against a var bank and calling the substitution a PASS"
 
 	// BASIC-012 is the row with no southbound home at all, and saying so is
 	// the whole of its southbound evidence.
@@ -408,11 +419,38 @@ func inverterControlRows() []inverterControlRow {
 			func(r *ControlRequest, hundredths int64) {
 				r.MaxLimW = ptr(hundredths)
 			}), oracleMaxLimW), "a maximum active power limit"},
+		// yRefType 1 (%setMaxW), NOT the 3 (%statVarAvail) this row published
+		// until 2026-08-14. Three independent anchors say 1 and nothing says 3:
+		// sep 2.0.4's own opModVoltWatt documentation ("The y value specifies an
+		// active power output in %setMaxW"), the catalog's own prescribed value
+		// for this row (Figure 11 Volt-Watt Settings — DERCurve.yRefType:
+		// Default 1; Test Values 1), and the physics — a volt-WATT curve's y
+		// axis is active power, and %statVarAvail is a REACTIVE reference.
+		//
+		// It became load-bearing rather than merely wrong when the product
+		// started translating yRefType into the curve bank's DeptRef and
+		// REFUSING what it cannot translate (lexa-gw cmd/modbus's curveDeptRef):
+		// %setMaxW is the only y reference sep 2.0.4 gives volt-watt, so 706
+		// accepts only DeptRef=W_MAX_PCT and a curve naming %statVarAvail is now
+		// answered cannot-comply. This row would have FAILED a correct DUT for a
+		// defect in its own fixture.
 		{"BASIC-011", 57, curveMode("opModVoltWatt", "volt_watt",
-			[]CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}}, 3,
+			[]CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}}, derUnitRefSetMaxW,
 			sunspec.ModelDERVoltWatt, mappingVoltWatt), "a Volt-Watt curve"},
+		// yRefType 1 (%setMaxW) for the same reasons as BASIC-011: sep 2.0.4's
+		// opModFreqWatt documentation ("The y value specifies a corresponding
+		// active power output in %setMaxW") and the catalog's own prescribed
+		// value (Figure 12 Frequency-Watt Settings — DERCurve.yRefType: Test
+		// Values 1). Freq-watt's y axis is active power; the 3 this row carried
+		// was a reactive reference on an active-power curve.
+		//
+		// It changes no verdict here — the row's southbound half is a decided
+		// FAIL either way (noFreqWattRegister), and the axis is refused at
+		// receipt besides — but the NORTHBOUND half of this row is real evidence
+		// about what the DUT was offered, and evidence has to be conformant to
+		// be evidence.
 		{"BASIC-012", 58, curveModeNoRegisterHome("opModFreqWatt", "freq_watt",
-			[]CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}}, 3,
+			[]CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}}, derUnitRefSetMaxW,
 			sunspec.ModelDERFreqDroop, noFreqWattRegister), "a frequency-droop / frequency-watt curve"},
 		// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §4.2):
 		// BASIC-013's opModFixedW is SignedPerCent, hundredths of a percent —
@@ -468,9 +506,67 @@ func inverterControlRows() []inverterControlRow {
 			[]string{"WSet", "WSetPct"},
 			func(r *ControlRequest) { r.TargetW = ptr(int64(3000)) }),
 			"a set-active-power command expressed in watts"},
-		{"BASIC-015", 61, curveMode("opModWattPF", "watt_pf",
-			[]CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}}, 3,
-			sunspec.ModelDERWattVar, mappingWattPF), "an advanced (curve-based) inverter control"},
+		// BASIC-015 is now a REFUSAL row, and the flip is a product truth
+		// change, not a harness re-scope. See refusalWattPF for the substance;
+		// the shape is BASIC-014's, in two halves that must BOTH hold: the DUT
+		// answered the head end cannot-comply (and never Started/Completed), and
+		// not one register of model 712 moved while the refused control was
+		// live. Either half alone lets the other's defect through.
+		//
+		// The curve it publishes is REAL and well-formed — same publisher, same
+		// window, same resolvability check as an execution curve row — because a
+		// malformed or unfetchable curve draws the same refusal from outside,
+		// and the row must be able to tell the two apart.
+		//
+		// yRefType stays 3 (%statVarAvail) and is NOT load-bearing here, which
+		// is worth stating because every other curve row's just became so. sep
+		// 2.0.4 gives Watt-PF's y as a signed power-factor displacement under
+		// the EEI convention and defines NO DERUnitRefType for a power factor —
+		// none of the eight codes names one — while DERCurve declares yRefType
+		// minOccurs=1, so SOME code must be sent and every choice is wrong in
+		// the same way. It cannot be the cause of the refusal in any case: the
+		// DUT refuses this axis at receipt, by element name, before any curve
+		// content is read (lexa-gw scheduler's AdvancedSupportedAxes).
+		//
+		// WHAT FLIPS IT BACK. The legacy-curve staging Stage that lands the
+		// model-131 (Watt-PF) writer — lexa-gw docs/design/
+		// LEGACY_CURVES_RC0_2026-08-14.md §4.3, the same commit that adds
+		// opModWattPF's internal/advaxis DerGen12x row and its fanOutClasses
+		// row. Note that even then the admission is PER-DEVICE (§7.1): a 7xx DER
+		// must go on refusing it, so this row does not simply revert — it
+		// becomes an execution row against model 131 on a 12x DER and stays a
+		// refusal row on a 7xx one, and the bench will need a 12x DER profile
+		// before it can grade the execution half at all.
+		{"BASIC-015", 61, curveModeRefused("opModWattPF", "watt_pf",
+			[]CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}}, derUnitRefStatVarAvail,
+			sunspec.ModelDERWattVar,
+			"the SunSpec model 712 (DER Watt-Var) curve bank — the bank this product used to write "+
+				"opModWattPF's content into, and therefore the one a regression would land in",
+			refusalWattPF), "an advanced (curve-based) inverter control"},
+
+		// TODO(curve plan #32): there is NO opModWattVar row here, and its
+		// absence is a BENCH gap rather than a scope decision.
+		//
+		// opModWattVar is the axis model 712 actually implements, and as of
+		// lexa-proto 8a65431 + lexa-gw's curve P1 wave the product decodes it,
+		// screens it, arbitrates it inside the reactive group and writes it to
+		// 712 with read-back verification. It is the strongest curve axis this
+		// DUT has and nothing here exercises it.
+		//
+		// THE BLOCKER IS GRIDSIM, precisely: sim/gridsim/curve.go's
+		// curveTypeForMode and setCurveLink know four modes (volt_var,
+		// volt_watt, freq_watt, watt_pf) and there is no lever that emits an
+		// <opModWattVar> DERCurveLink at all, so the control cannot be placed on
+		// the wire. Adding one is curve plan #32's work: a "watt_var" mode
+		// mapping to csipmodel.CurveTypeWattVar (10) and
+		// ExtendedDERControlBase.OpModWattVar, both of which the pinned
+		// lexa-proto now provides.
+		//
+		// It is recorded here rather than registered as an unreachableMode row
+		// because the catalog has no uid for it — CSIP-CONF-v1.3's BASIC family
+		// stops at BASIC-015 — and inventing a uid would put a row in the
+		// bundle that no document asks for. When #32 lands, the axis belongs on
+		// BASIC-015's sibling coverage or on an aggregate row, not here.
 	}
 }
 

@@ -155,14 +155,34 @@ func basic006Binding() *curveBinding {
 // adoptBasic006Curve drives the REAL derbase adopt handshake with exactly the
 // breakpoints BASIC-006 publishes — the write a gateway that EXECUTED this row's
 // control would make.
+//
+// DeptRef comes from the row's OWN yRefType through the same translation the
+// oracle expects, not from a literal. It was a hardcoded 1 (VAR_MAX_PCT) while
+// the row published yRefType=3 (%statVarAvail, which is DeptRef 2), so this
+// fixture modelled a gateway that wrote the points under a reference nobody
+// commanded — the exact defect lexa-gw's curveDeptRef landed to end, reproduced
+// inside the test that was supposed to certify the fix.
 func (f *curveFixture) adoptBasic006Curve(t *testing.T) {
 	t.Helper()
-	f.adoptVoltVar(t, []sunspec.VVPoint{{V: 92, Var: 60}, {V: 98, Var: 0}, {V: 102, Var: 0}, {V: 108, Var: -60}})
+	f.adoptVoltVar(t, basic006DeptRef(t),
+		[]sunspec.VVPoint{{V: 92, Var: 60}, {V: 98, Var: 0}, {V: 102, Var: 0}, {V: 108, Var: -60}})
 }
 
-func (f *curveFixture) adoptVoltVar(t *testing.T, pts []sunspec.VVPoint) {
+// basic006DeptRef is the DeptRef a gateway executing BASIC-006 must write,
+// derived from the SHIPPING row's yRefType rather than restated.
+func basic006DeptRef(t *testing.T) uint16 {
 	t.Helper()
-	if err := f.base.WriteVoltVar(sunspec.VoltVarCurve{DeptRef: 1, Pri: 1, Points: pts},
+	want, ok := basic006Binding().wantDeptRef()
+	if !ok {
+		t.Fatalf("BASIC-006's yRefType has no DeptRef translation — the row publishes a curve a " +
+			"conformant DUT must refuse, which is not what this fixture is for")
+	}
+	return want
+}
+
+func (f *curveFixture) adoptVoltVar(t *testing.T, deptRef uint16, pts []sunspec.VVPoint) {
+	t.Helper()
+	if err := f.base.WriteVoltVar(sunspec.VoltVarCurve{DeptRef: deptRef, Pri: 1, Points: pts},
 		"curve-oracle-test"); err != nil {
 		t.Fatalf("derbase WriteVoltVar (the real adopt handshake): %v", err)
 	}
@@ -215,7 +235,7 @@ func TestOracleCurve_AdoptedRowsOwnCurveIsAPass(t *testing.T) {
 // could not even make; it must not be mistaken for this one.
 func TestOracleCurve_ADifferentCurveIsStillAFail(t *testing.T) {
 	f := newCurveFixture(t)
-	f.adoptVoltVar(t, []sunspec.VVPoint{{V: 230, Var: 30}, {V: 240, Var: 0}, {V: 250, Var: -30}})
+	f.adoptVoltVar(t, basic006DeptRef(t), []sunspec.VVPoint{{V: 230, Var: 30}, {V: 240, Var: 0}, {V: 250, Var: -30}})
 	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
 	if got.Verdict != certify.Fail {
 		t.Fatalf("an unrelated adopted curve = %s (%s), want FAIL", got.Verdict, got.Observed)
@@ -231,7 +251,7 @@ func TestOracleCurve_ADifferentCurveIsStillAFail(t *testing.T) {
 // treated a curve as a set rather than a sequence would pass this.
 func TestOracleCurve_ReorderedCurveIsStillAFail(t *testing.T) {
 	f := newCurveFixture(t)
-	f.adoptVoltVar(t, []sunspec.VVPoint{{V: 108, Var: -60}, {V: 102, Var: 0}, {V: 98, Var: 0}, {V: 92, Var: 60}})
+	f.adoptVoltVar(t, basic006DeptRef(t), []sunspec.VVPoint{{V: 108, Var: -60}, {V: 102, Var: 0}, {V: 98, Var: 0}, {V: 92, Var: 60}})
 	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
 	if got.Verdict != certify.Fail {
 		t.Fatalf("the row's breakpoints in reverse order = %s (%s), want FAIL — a curve is a sequence",
@@ -243,11 +263,44 @@ func TestOracleCurve_ReorderedCurveIsStillAFail(t *testing.T) {
 // is content the head end did not send.
 func TestOracleCurve_ExtraBreakpointIsStillAFail(t *testing.T) {
 	f := newCurveFixture(t)
-	f.adoptVoltVar(t, []sunspec.VVPoint{
+	f.adoptVoltVar(t, basic006DeptRef(t), []sunspec.VVPoint{
 		{V: 92, Var: 60}, {V: 98, Var: 0}, {V: 102, Var: 0}, {V: 108, Var: -60}, {V: 112, Var: -80}})
 	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
 	if got.Verdict != certify.Fail {
 		t.Fatalf("an extra breakpoint = %s (%s), want FAIL", got.Verdict, got.Observed)
+	}
+}
+
+// TestOracleCurve_RightPointsWrongDeptRefIsAFail is the D2 §6.4 shape, and the
+// one defect in this family that EVERY other check in the suite is blind to.
+//
+// The device adopts exactly the breakpoints the row published, into the right
+// model, with the handshake COMPLETED and the function ENABLED — and records
+// that its y values are a percentage of the wrong rating. "-60" against
+// VAR_MAX_PCT and "-60" against VAR_AVAL_PCT are different commands: on a
+// 26.4 kvar DER at half its available reactive headroom they differ by 2x, and
+// nothing about the points, the adopt state or the enable distinguishes them.
+//
+// The product's own read-back hash cannot catch it either, and that is why the
+// referee has to: the hash carries the DOCUMENT's yRefType at both ends, so it
+// can only ever confirm that the points round-tripped. Until 2026-08-14 the
+// gateway copied whatever DeptRef the device's template already held and wrote
+// the commanded points underneath it, which is exactly what this test now
+// simulates.
+func TestOracleCurve_RightPointsWrongDeptRefIsAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	want := basic006DeptRef(t)
+	f.adoptVoltVar(t, want+1, // any OTHER reference; the points below are the row's own
+		[]sunspec.VVPoint{{V: 92, Var: 60}, {V: 98, Var: 0}, {V: 102, Var: 0}, {V: 108, Var: -60}})
+	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("the row's exact breakpoints under the WRONG y-axis reference = %s (%s), want FAIL — "+
+			"the same numbers against a different base are a different command", got.Verdict, got.Observed)
+	}
+	for _, wantText := range []string{"DeptRef", "yRefType", "%statVarAvail"} {
+		if !strings.Contains(got.Observed, wantText) {
+			t.Errorf("the FAIL does not say %q; it said: %s", wantText, got.Observed)
+		}
 	}
 }
 
@@ -843,6 +896,105 @@ func TestBasic014Row_IsRedWhenTheRefusedAxisIsWritten(t *testing.T) {
 	if got := s.Verdict(obs); got != certify.Fail {
 		t.Fatalf("BASIC-014's declared verdict on a landed write to the REFUSED axis = %q, want FAIL: %s",
 			got, s.Notes(obs))
+	}
+}
+
+// TestBasic015Row_IsARefusalRowAndItsCurveBankStaysUntouched drives the
+// shipping BASIC-015 row after its 2026-08-14 flip from an execution row to a
+// refusal one.
+//
+// The row used to publish an opModWattPF curve and grade it against model 712,
+// on a mapping that said "there being no Watt-PF model in the 7xx set" — which
+// is exactly why the row was wrong: 712 is DER Watt-VAr, a different function.
+// It passed because the product performed the same substitution. The product
+// ended it (lexa-gw curve P1: watt_var is its own axis and is the only thing
+// written to 712; opModWattPF is refused at receipt on a 7xx DER), so the row's
+// evidence is now that the refusal was honest — nothing of 712 moved.
+func TestBasic015Row_IsARefusalRowAndItsCurveBankStaysUntouched(t *testing.T) {
+	f := newCurveFixture(t)
+	d := f.withGridSim(t)
+	row := rowByID(t, "BASIC-015")
+	if row.mode.Refusal == nil {
+		t.Fatal("BASIC-015 is not a refusal row. It publishes opModWattPF, whose only exact register " +
+			"home is legacy model 131; grading it against model 712 (DER Watt-Var) certifies the very " +
+			"substitution the product stopped performing")
+	}
+	if row.mode.Refusal.Curve == nil || row.mode.Refusal.Curve.Model != sunspec.ModelDERWattVar {
+		t.Fatalf("BASIC-015's refusal must be measured over model 712 — the bank the product used to "+
+			"write opModWattPF into, and therefore the one a regression would land in: %+v",
+			row.mode.Refusal.Curve)
+	}
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-015")
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 Setup: %v", err)
+	}
+	if params[refusalBaselineParam] == "" {
+		t.Fatal("BASIC-015's Setup recorded no pre-publication baseline of the 712 curve bank, so its " +
+			"PostWait cannot assert an absence against anything")
+	}
+	// The curve really was published — a refusal row whose control never
+	// reached the wire would assert an absence nobody was offered a chance to
+	// violate. gridsim mints the control's mRID, so Setup must have adopted it.
+	if params[curveHrefParam] == "" {
+		t.Error("BASIC-015 published no curve href: the row must put a REAL, resolvable curve on the " +
+			"wire, or its refusal is not attributable to the axis")
+	}
+	if params["mrid"] == "CERT-BASIC-015" {
+		t.Error("BASIC-015 kept its synthetic mRID: gridsim mints one for POST /admin/curve, and every " +
+			"wire criterion on this row binds the minted one")
+	}
+
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 PostWait: %v", err)
+	}
+	obs := &Observation{Params: params}
+	if got := s.Verdict(obs); got != "" {
+		t.Fatalf("BASIC-015's declared verdict on a DUT that adopted nothing into 712 = %q, want \"\": %s",
+			got, s.Notes(obs))
+	}
+	if f := refusalOutcome(obs); f.Verdict != certify.Pass {
+		t.Fatalf("the refusal outcome on an untouched 712 = %s: %s", f.Verdict, f.Observed)
+	}
+	t.Logf("BASIC-015 notes: %s", s.Notes(obs))
+}
+
+// TestBasic015Row_IsRedWhenTheWattPFCurveLandsIn712 is the same row against the
+// gateway this product USED to be: it answers the head end and writes the
+// power-factor curve into the Watt-VAr bank anyway.
+//
+// This is the discrimination that makes the PASS above worth anything. It is
+// also the exact historical regression — the substitution was live in shipped
+// code until curve P1 — so the row must be able to catch its return.
+func TestBasic015Row_IsRedWhenTheWattPFCurveLandsIn712(t *testing.T) {
+	f := newCurveFixture(t)
+	d := f.withGridSim(t)
+	row := rowByID(t, "BASIC-015")
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-015")
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 Setup: %v", err)
+	}
+	// The substitution, performed through the REAL derbase writer: the row's
+	// own published breakpoints adopted into model 712.
+	if err := f.base.WriteWattVar(sunspec.WattVarCurve{
+		DeptRef: 2, Pri: 1,
+		Points:  []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
+	}, "basic015-regression-test"); err != nil {
+		t.Fatalf("derbase WriteWattVar (the substitution this row must catch): %v", err)
+	}
+
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 PostWait: %v", err)
+	}
+	obs := &Observation{Params: params}
+	if got := s.Verdict(obs); got != certify.Fail {
+		t.Fatalf("BASIC-015's declared verdict on a DUT that adopted the refused watt-PF curve into "+
+			"model 712 = %q, want FAIL: %s", got, s.Notes(obs))
 	}
 }
 

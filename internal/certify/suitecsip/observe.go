@@ -1343,8 +1343,10 @@ type CurveRequest struct {
 	VRef        int16        `json:"vref,omitempty"`
 	XMult       int8         `json:"x_mult,omitempty"`
 	YMult       int8         `json:"y_mult,omitempty"`
-	XRefType    uint8        `json:"x_ref_type,omitempty"`
-	YRefType    uint8        `json:"y_ref_type,omitempty"`
+	// No XRefType: sep 2.0.4 declares no xRefType element on DERCurve, so
+	// gridsim no longer accepts or serves one (it answers 400 to a request that
+	// carries the field). See sim/gridsim/curve.go's adminCurveReq.
+	YRefType uint8 `json:"y_ref_type,omitempty"`
 	Description string       `json:"description,omitempty"`
 	DurationS   int          `json:"duration_s,omitempty"`
 	StartOffset int          `json:"start_offset_s,omitempty"`

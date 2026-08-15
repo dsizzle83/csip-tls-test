@@ -53,6 +53,7 @@ import (
 
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/internal/invariant"
+	"lexa-proto/sunspec"
 )
 
 // The Observation.Params keys the curve and refusal rows add to the oracled
@@ -123,6 +124,66 @@ func (b *curveBinding) wantPoints() []invariant.CurvePoint {
 	return out
 }
 
+// wantDeptRef translates the yRefType this row PUBLISHES into the SunSpec
+// DeptRef the DER must be found holding, or returns ok=false for a mode whose
+// curve bank carries no such register.
+//
+// It is a translation this referee performs INDEPENDENTLY, from the standards
+// text rather than from the product's table, which is the whole point of the
+// check. A curve's y values are a percentage and a percentage is not a quantity
+// without its base: IEEE 2030.5 names that base on every DERCurve (yRefType,
+// minOccurs=1) and SunSpec names it per bank (DeptRef). Until 2026-08-14 the
+// product never translated one into the other — it copied whatever DeptRef the
+// device's template already held and wrote the commanded points underneath it —
+// and the read-back hash could not see it, because the hash carries the doc's
+// OWN yRefType at both ends and so can only ever confirm that the POINTS round
+// tripped. This oracle reads the register.
+//
+// The mapping, from sep 2.0.4's own element documentation:
+//
+//	opModVoltVar / opModWattVar   y is "one of %setMaxW, %setMaxVar, or
+//	                              %statVarAvail" -> W_MAX_PCT / VAR_MAX_PCT /
+//	                              VAR_AVAL_PCT
+//	opModVoltWatt                 y is "an active power output in %setMaxW"
+//	                              and nothing else -> W_MAX_PCT
+//
+// ok=false is returned for any other model, and for a yRefType outside the set
+// its mode allows — those are curves a conformant DUT REFUSES, so this row has
+// no register expectation to assert and says so instead of inventing one.
+func (b *curveBinding) wantDeptRef() (uint16, bool) {
+	switch b.Model {
+	case sunspec.ModelDERVoltVar, sunspec.ModelDERWattVar:
+		switch b.YRefType {
+		case derUnitRefSetMaxW:
+			return deptRefWMaxPct, true
+		case derUnitRefSetMaxVar:
+			return deptRefVarMaxPct, true
+		case derUnitRefStatVarAvail:
+			return deptRefVarAvalPct, true
+		}
+	case sunspec.ModelDERVoltWatt:
+		if b.YRefType == derUnitRefSetMaxW {
+			return deptRefWMaxPct, true
+		}
+	}
+	return 0, false
+}
+
+// DERUnitRefType codes (sep 2.0.4, "Specifies context for interpreting percent
+// values") and the SunSpec DeptRef codes they translate to. Named here so the
+// rows and the oracle read one vocabulary; see wantDeptRef for the provenance
+// of the translation and invariant.DeptRefName for the DeptRef enums'.
+const (
+	derUnitRefNA           uint8 = 0
+	derUnitRefSetMaxW      uint8 = 1
+	derUnitRefSetMaxVar    uint8 = 2
+	derUnitRefStatVarAvail uint8 = 3
+
+	deptRefWMaxPct    uint16 = 0 // 705/706/712
+	deptRefVarMaxPct  uint16 = 1 // 705/712 only
+	deptRefVarAvalPct uint16 = 2 // 705/712 only
+)
+
 // applyMult applies a 2030.5 power-of-ten axis multiplier.
 func applyMult(v float64, mult int8) float64 {
 	switch {
@@ -155,6 +216,30 @@ func (b *curveBinding) describePublished() string {
 }
 
 func trimNum(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
+
+// derUnitRefName spells a DERUnitRefType out in a finding, so a reader sees
+// what the row published rather than a code.
+func derUnitRefName(v uint8) string {
+	switch v {
+	case 0:
+		return "N/A — no reference named"
+	case 1:
+		return "%setMaxW"
+	case 2:
+		return "%setMaxVar"
+	case 3:
+		return "%statVarAvail"
+	case 4:
+		return "%setEffectiveV"
+	case 5:
+		return "%setMaxChargeRateW"
+	case 6:
+		return "%setMaxDischargeRateW"
+	case 7:
+		return "%statWAvail"
+	}
+	return "reserved/unknown"
+}
 
 // curvePointTolerance is the slack the curve oracle allows one breakpoint
 // value: 1 % of the value plus half a unit, the same shape (and for the same
@@ -216,6 +301,35 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 				"the DER's %s reports an adopted curve whose CONTENT is not the one this row published: %s. "+
 					"This row published %s. Full register state: %s",
 				cv.Axis.Name, match.Reason, published, cv.Describe())}
+		}
+		// The y-axis REFERENCE, checked separately from the points and after
+		// them, because the two are different defects with different owners and
+		// the second is invisible to the first. Identical breakpoints under the
+		// wrong DeptRef are a different command: "-30" against VAR_MAX_PCT and
+		// "-30" against W_MAX_PCT are a 2.3x difference on a 60 kW / 26.4 kvar
+		// DER and a 30x one on a 2 kvar machine, in the wrong direction, with
+		// every point matching. A referee that stopped at the points would
+		// certify that.
+		if want, ok := b.wantDeptRef(); ok {
+			if !cv.HasDeptRef {
+				return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+					"the DER's %s holds this row's breakpoints but its curve bank reports no DeptRef at "+
+						"all, so what its y values are a percentage OF cannot be read. This row published "+
+						"yRefType=%d (%s). Full register state: %s",
+					cv.Axis.Name, b.YRefType, derUnitRefName(b.YRefType), cv.Describe())}
+			}
+			if cv.DeptRef != want {
+				return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+					"the DER's %s holds exactly the breakpoints this row published, under the WRONG y-axis "+
+						"reference: DeptRef=%d (%s), where this row's yRefType=%d (%s) requires DeptRef=%d "+
+						"(%s). The points matching proves nothing here — the same numbers against a "+
+						"different base are a different command, and a read-back hash cannot see it "+
+						"because it carries the document's own yRefType at both ends. Full register "+
+						"state: %s",
+					cv.Axis.Name, cv.DeptRef, invariant.DeptRefName(b.Model, cv.DeptRef),
+					b.YRefType, derUnitRefName(b.YRefType), want, invariant.DeptRefName(b.Model, want),
+					cv.Describe())}
+			}
 		}
 		if !cv.Enabled {
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
@@ -279,6 +393,19 @@ func curveSetup(ctx context.Context, d *Driver, params map[string]string, b *cur
 	params[curvePublishedParam] = b.describePublished()
 	params[curveModelParam] = strconv.FormatUint(uint64(b.Model), 10)
 
+	return publishCurveControl(ctx, d, params, b, mrid)
+}
+
+// publishCurveControl puts one row's curve on the wire through gridsim's curve
+// API and records what the server minted for it.
+//
+// It is shared by curveSetup and refusalSetup rather than written twice, and
+// that sharing is load-bearing rather than tidiness: a REFUSAL row's evidence
+// is only about the AXIS if the control it published is identical in kind to
+// the one an execution row publishes. Two publishers one edit apart could drift
+// into "the DUT refused it because the bench sent it differently", which is the
+// one conclusion this row must never support.
+func publishCurveControl(ctx context.Context, d *Driver, params map[string]string, b *curveBinding, mrid string) error {
 	pub, err := d.PostCurveDetail(ctx, CurveRequest{
 		Program: 0, Mode: b.Mode, Points: b.Points, YRefType: b.YRefType,
 		XMult: b.XMult, YMult: b.YMult,
@@ -471,7 +598,53 @@ type refusalBinding struct {
 	// what it is a PASS of.
 	Why string
 	// Publish puts the refused control on the wire under this row's mRID.
+	// nil exactly when Curve is set — a curve-axis refusal publishes through
+	// publishCurveControl instead, so that it and an EXECUTION curve row put
+	// materially identical controls on the wire.
 	Publish func(ctx context.Context, d *Driver, mrid string) error
+
+	// Curve, when set, makes this a CURVE-axis refusal instead of a scalar one,
+	// and changes what "nothing moved" is measured over: a refused curve axis
+	// would land in a curve MODEL (its adopt handshake, its enable and its live
+	// breakpoints), not on a 704 setpoint register, so Points above is empty and
+	// the fingerprint is the curve bank's whole state.
+	//
+	// WHY A REFUSAL ROW PUBLISHES A REAL, WELL-FORMED CURVE. The row's claim is
+	// that the DUT refuses this AXIS. A malformed or unresolvable curve would
+	// also draw a refusal, and the two are indistinguishable from the outside —
+	// so the control has to be one that a DUT which supported the axis would
+	// have executed. That is why the publisher is shared with the execution
+	// rows and why critDERCurveResolvable still runs on this row: it separates
+	// "refused the axis" from "could not fetch the curve".
+	Curve *curveBinding
+}
+
+// fingerprint renders the state a write of this refused axis would have moved,
+// so two readings taken minutes apart can be compared for ANY movement.
+//
+// The two shapes measure different register banks because a refused axis lands
+// in different places depending on what kind of axis it is, and measuring the
+// wrong bank would report an absence that was never in question.
+func (b *refusalBinding) fingerprint(uv invariant.UnitView) (string, bool) {
+	if b.Curve == nil {
+		return refusalFingerprint(uv, b.Points)
+	}
+	cv := uv.Curve(oracleSimName, b.Curve.Model)
+	if !cv.Present {
+		// Same posture as the scalar shape's empty-points case: a bank we
+		// cannot read cannot tell a refused axis from an unreadable one.
+		return "", false
+	}
+	return cv.Describe(), true
+}
+
+// describeAxisRegisters names what the fingerprint above covers, for the
+// criterion's How and for an unavailability message.
+func (b *refusalBinding) describeAxisRegisters() string {
+	if b.Curve == nil {
+		return strings.Join(b.Points, ", ")
+	}
+	return curveModelLabel(b.Curve) + " (adopt handshake, function enable, DeptRef and live breakpoints)"
 }
 
 // refusalFingerprint renders the exact state of the axis's registers — raw
@@ -525,11 +698,11 @@ func oracleRefusal(b *refusalBinding, baseline string) func(ctx context.Context,
 		if err != nil {
 			return unavailable("%v", err)
 		}
-		got, ok := refusalFingerprint(uv, b.Points)
+		got, ok := b.fingerprint(uv)
 		if !ok {
-			return unavailable("the DER's own 704 image carries none of the points a write of %s would land "+
-				"on (%s), so this row cannot tell a refused axis from an unreadable one",
-				b.Axis, strings.Join(b.Points, ", "))
+			return unavailable("the DER's own register image carries nothing a write of %s would land on "+
+				"(%s), so this row cannot tell a refused axis from an unreadable one",
+				b.Axis, b.describeAxisRegisters())
 		}
 		if baseline == "" {
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
@@ -581,11 +754,11 @@ func critRefusedAxisNoSouthboundTrace(b *refusalBinding, o *Observation) criteri
 	f := refusalOutcome(o)
 	return criterion{
 		Claim: "no southbound write of " + b.Axis + " reached the DER while this row's refused control was live",
-		How: "an independent read of the DER's raw SunSpec 704 image (internal/invariant, which shares only " +
+		How: "an independent read of the DER's own raw SunSpec image (internal/invariant, which shares only " +
 			"the register-offset tables with the product and none of its CSIP/derbase interpretation), " +
-			"taken BEFORE this row published its control and again after the DUT's poll cycle: the raw " +
-			"value, the enable and the selecting mode enum of " + strings.Join(b.Points, "/") + " are " +
-			"fingerprinted and compared for ANY movement, not only for movement towards the commanded value",
+			"taken BEFORE this row published its control and again after the DUT's poll cycle: " +
+			b.describeAxisRegisters() + " is fingerprinted and compared for ANY movement, not only for " +
+			"movement towards the commanded value",
 		Tier: tierOracle,
 		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
 			return f
@@ -723,15 +896,20 @@ func critRefusalAnswered(mridKey string) criterion {
 func refusalSetup(ctx context.Context, d *Driver, params map[string]string, b *refusalBinding, mrid string) error {
 	params[refusalAxisParam] = b.Axis
 	if uv, err := oracleUnitView(ctx, d.rc, oracleSimName); err == nil {
-		if fp, ok := refusalFingerprint(uv, b.Points); ok {
+		if fp, ok := b.fingerprint(uv); ok {
 			params[refusalBaselineParam] = fp
 			params[oraclePreObservedParam] = fp
 		} else {
-			params[oraclePreObservedParam] = "the DER's own 704 image carries none of " +
-				strings.Join(b.Points, "/")
+			params[oraclePreObservedParam] = "the DER's own register image carries nothing of " +
+				b.describeAxisRegisters()
 		}
 	} else {
 		params[oraclePreObservedParam] = "the baseline reading could not be taken: " + err.Error()
+	}
+	if b.Curve != nil {
+		params[curvePublishedParam] = b.Curve.describePublished()
+		params[curveModelParam] = strconv.FormatUint(uint64(b.Curve.Model), 10)
+		return publishCurveControl(ctx, d, params, b.Curve, mrid)
 	}
 	return b.Publish(ctx, d, mrid)
 }
