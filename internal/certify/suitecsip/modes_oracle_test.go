@@ -1478,11 +1478,13 @@ func TestModesSupportedOracle_ModesTheBitmapCannotExpressAreDisclosedNotGraded(t
 			f.Verdict, f.Observed)
 	}
 	for _, want := range []string{
-		"CANNOT express", "<opModExpLimW>", "<opModGenLimW>", "assigns it\nno bit", "PICS",
+		"CANNOT express", "<opModExpLimW>", "<opModGenLimW>", "assigns it no bit", "PICS",
+		// The CITE, not only the conclusion: this disclosure is the one place
+		// the oracle asserts a NEGATIVE about the standard, and a reader has to
+		// be able to go and check it.
+		"p.251-252",
 	} {
-		// The finding wraps; compare on the unwrapped text.
-		if !strings.Contains(strings.ReplaceAll(f.Observed, "\n", " "),
-			strings.ReplaceAll(want, "\n", " ")) {
+		if !strings.Contains(f.Observed, want) {
 			t.Errorf("the unadvertisable-mode disclosure omits %q:\n%s", want, f.Observed)
 		}
 	}
