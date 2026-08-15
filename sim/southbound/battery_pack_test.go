@@ -51,6 +51,12 @@ func newTestPack(t *testing.T, shape BatteryPackShape) *BatteryServer {
 	r.OnWrite = bs.packOnWrite
 	r.OnWriteAttempt = bs.interceptWrite
 	r.OnRead = bs.faults.transportRead
+	// The 704 reversion engine + its OnWriteSpan observer, through the SAME
+	// initialiser newBatteryPack calls — a rig that wired the timer differently
+	// from the constructor would be proving a device the bench never runs. It
+	// starts on the WALL clock here exactly as it does in production;
+	// reversion704_test.go installs a test timebase where it wants one.
+	bs.initPackReversion(r)
 	bs.installBatteryLies()
 	return bs
 }

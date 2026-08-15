@@ -282,6 +282,20 @@ type RegisterMap struct {
 	// address (used by the GUI/log tee to notice control writes).
 	OnWrite func(startAddr uint16)
 
+	// OnWriteSpan, if non-nil, is called after each write with the FULL EXTENT
+	// of the transaction — first address and register count — immediately after
+	// OnWrite.
+	//
+	// It exists because OnWrite's single-address signature cannot say WHICH
+	// registers a multi-register FC16 covered, and at least one device
+	// behaviour turns on exactly that: model 704's reversion timers
+	// (reversion704.go) must re-arm when a write LANDS ON their RvrtTms
+	// registers and must not when the same block write lands only elsewhere. A
+	// second hook rather than a widened OnWrite because OnWrite has six call
+	// sites across the solar, battery and pack images and none of the other
+	// five needs the span; see observeWrite for what the width buys.
+	OnWriteSpan func(startAddr uint16, n int)
+
 	// OnWriteAttempt, if non-nil, is consulted BEFORE a write lands. Returning
 	// false tells the map not to apply the values itself — the interceptor has
 	// taken responsibility for them. This is the hook fault injection uses to
@@ -354,6 +368,7 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 		r.mu.Lock()
 		intercept := r.OnWriteAttempt
 		cb := r.OnWrite
+		cbSpan := r.OnWriteSpan
 		onWriteErr := r.OnWriteError
 		r.mu.Unlock()
 
@@ -380,6 +395,13 @@ func (r *RegisterMap) HandleHoldingRegisters(req *modbuslib.HoldingRegistersRequ
 		}
 		if cb != nil {
 			cb(req.Addr)
+		}
+		if cbSpan != nil {
+			// The span is the MASKED args, not req.Args: a write whose cells
+			// were all masked back still covered those addresses, and a hook
+			// that reasons about extent must see the extent the device
+			// actually processed.
+			cbSpan(req.Addr, len(args))
 		}
 		// The write is now settled. Only here may an injector turn it into an
 		// exception, because the fault being modelled is a device that DID the

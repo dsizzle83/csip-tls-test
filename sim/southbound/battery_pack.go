@@ -146,6 +146,7 @@ package sim
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"sync/atomic"
 	"time"
@@ -275,6 +276,7 @@ func newBatteryPack(listenURL string, wmaxKwh, wmaxW float64, shape BatteryPackS
 	regs.OnWrite = bs.packOnWrite
 	regs.OnWriteAttempt = bs.interceptWrite
 	regs.OnRead = bs.faults.transportRead
+	bs.initPackReversion(regs)
 
 	srv, err := newAnimatedServer(listenURL, regs, func(s *Server, r *RegisterMap, stop <-chan struct{}) {
 		animateBatteryPack(s, r, wmaxW, wmaxKwh, bases, pk, &bs.pendingSoC, &bs.faults, stop)
@@ -284,6 +286,17 @@ func newBatteryPack(listenURL string, wmaxKwh, wmaxW float64, shape BatteryPackS
 	}
 	bs.Server = srv
 	bs.installBatteryLies() // the lying-device layer, in front of the fault hooks
+	if bs.rvrt != nil {
+		// The reversion timer gets its OWN goroutine — it is not part of the
+		// physics tick and must not inherit its 5 s granularity (see
+		// packReversionLoop) — and it is started LAST, deliberately. The
+		// animation goroutine is running before bs.Server is assigned and
+		// before the lying layer is wrapped around the hooks; a loop started in
+		// there would reach bs.Regs (a promoted field of a not-yet-assigned
+		// *Server) and race installBatteryLies' hook swap. Its lifetime is
+		// still the server's, through the same stop channel Stop closes.
+		go bs.packReversionLoop(srv.stop)
+	}
 	return bs, nil
 }
 
@@ -354,6 +367,7 @@ func populateBatteryPack7xx(r *RegisterMap, cursor uint16, wmaxKwh, wmaxW float6
 	m703, cursor = populate703(r, cursor)
 	adv.M704, cursor = populate704(r, cursor)
 	adv.M713, cursor = populate713(r, cursor, wmaxKwh)
+	seedPackReversionDestinations(r, adv.M704)
 
 	// SF write-protection (protect.go), derived from the layouts themselves —
 	// see solar_adv.go's populateSolar7xx for the rationale.
@@ -436,6 +450,155 @@ func populate702Pack(r *RegisterMap, cursor uint16, wmaxW, varRating float64, pk
 
 	writeSlice(r, base, regs)
 	return base, next
+}
+
+// ── The reversion timer ──────────────────────────────────────────────────────
+
+// packReversionTickInterval is how often the pack LOOKS at its reversion
+// timers. It is deliberately far finer than the 5 s animation tick: the
+// remaining-time readback is polled by SS-MODBUS-CONF v1.4 §2.6 with a ±2 s
+// tolerance, and a countdown republished only every 5 s would spend most of its
+// life reporting a value up to five seconds stale — a fixture failing a
+// conforming procedure for reasons that are the fixture's.
+//
+// It is REAL time, always, and it does not scale with the timebase. The
+// timebase changes what the engine believes has ELAPSED; this interval changes
+// only how often it looks. Under an accelerated timebase the countdown
+// therefore moves in coarse jumps, which is exactly why the hermetic proofs
+// drive packReversionStep directly instead of waiting on this ticker.
+const packReversionTickInterval = 200 * time.Millisecond
+
+// initPackReversion installs the 704 reversion engine and its write observer.
+// Called by newBatteryPack and by the unit-test rig, so a test and a live pack
+// cannot end up wired differently — the trap battery_pack_test.go's newTestPack
+// exists to avoid on every other hook.
+//
+// The observer is wired unconditionally (it is a no-op with no engine) so that
+// the cease shape, which serves no 704, does not carry a nil-check at the call
+// site instead of here.
+func (bs *BatteryServer) initPackReversion(r *RegisterMap) {
+	if bs.pack != nil && bs.pack.has704 {
+		bs.rvrt = newRvrt704Engine(bs.pack.adv.M704)
+	}
+	// The hook closes over r rather than reaching through bs.Regs: the Modbus
+	// listener accepts clients from inside newAnimatedServer, which is BEFORE
+	// bs.Server is assigned, so a hook that dereferenced the promoted field
+	// would have a window in which a first write panicked. (packOnWrite's own
+	// exposure to that window is why packSimTime exists.)
+	r.OnWriteSpan = func(start uint16, n int) { bs.rvrt.observeWrite(r, start, n) }
+}
+
+// SetReversionTimebase installs the clock this pack's model 704 reversion
+// timers count down against, and is THE ONLY WAY to accelerate them.
+//
+// The default is the wall clock; nothing else in this repo calls this — not
+// batsim, not mbapsdev, not simapi, not a flag, not an environment variable —
+// so no production or bench path can run accelerated by configuration, only by
+// a test saying so in Go source. Read reversion704.go's header before using it:
+// an accelerated proof establishes this harness's own expiry semantics and
+// says NOTHING about a real device's timing.
+//
+// Passing nil restores the wall clock. Every armed countdown is dropped by the
+// swap, because a deadline computed against one clock is meaningless against
+// another.
+func (bs *BatteryServer) SetReversionTimebase(tb ReversionTimebase) error {
+	if bs.rvrt == nil {
+		return fmt.Errorf("SetReversionTimebase: this image serves no model 704, so it has no reversion " +
+			"timers to accelerate (batsim -pack setpoint-zero does)")
+	}
+	bs.rvrt.setTimebase(tb, bs.Regs)
+	return nil
+}
+
+// packReversionLoop runs the reversion engine for the life of the animation.
+//
+// It DELIBERATELY IGNORES Pause, for the same reason packOnWrite ceases a
+// paused pack on a Conn write: a reversion timer is the device's dead-man
+// switch, not part of the animation, and a bench operator who paused the
+// animation to read a steady register bank has not thereby made the pack
+// unable to protect itself. A pack whose timers stopped while paused would also
+// make "paused" a way to hold a curtailment past its lease, which is precisely
+// the failure the timer exists to prevent.
+func (bs *BatteryServer) packReversionLoop(stop <-chan struct{}) {
+	tick := time.NewTicker(packReversionTickInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+			bs.packReversionStep()
+		}
+	}
+}
+
+// packReversionStep runs ONE pass of the reversion engine and gives any expiry
+// its physical consequence. It returns the groups that expired on this call.
+//
+// Split out of the loop so a test can drive expiry without a ticker and without
+// a sleep — the same split batteryPackStep already uses for the physics, and
+// the half of the accelerated-proof story that the timebase alone does not
+// provide.
+//
+// packSync rather than a physics step: the revert changes what the pack is
+// COMMANDED to do, and measured power still has to slew there over the
+// animation's own ticks. A revert that snapped the measured watts would make
+// every "did it converge, and how fast" row unable to see the ramp it is there
+// to measure.
+func (bs *BatteryServer) packReversionStep() []string {
+	if bs.rvrt == nil {
+		return nil
+	}
+	expired := bs.rvrt.step(bs.Regs)
+	if len(expired) == 0 {
+		return nil
+	}
+	bs.packSync()
+	log.Printf("[sim] battery-%s: model 704 reversion timer expired for %v — the control(s) took their "+
+		"*Rvrt value and *EnaRvrt enable (timebase: %s)",
+		bs.pack.shape, expired, bs.rvrt.timebaseLabel())
+	return expired
+}
+
+// seedPackReversionDestinations gives this pack an EXPLICIT reversion
+// destination on the two axes it actually controls, instead of the accidental
+// zeros populate704 leaves behind.
+//
+// lexa-proto derbase records the product-side half of this as IW13-004a: "the
+// countdown DefaultRvrtTms already arms has never had a defined destination, so
+// expiry today lands the device on whatever WSetRvrt/WSetEnaRvrt already hold —
+// the factory default or a stale prior session, never a value this gateway
+// chose." A real device HAS a factory default; a fixture whose default is an
+// unstated zero would let an expiry row pass while proving nothing, because
+// "reverted to zero" and "was never written" would be the same register value.
+//
+//   - WSet reverts to 0 W with WSetEnaRvrt = 1 — ENABLED at zero, not disabled.
+//     That is this shape's declared fail-safe posture stated as device state
+//     (PackShapeSetpoint = lexa-gw's FailsafePostureSetpointZero, "idle at zero
+//     without leaving service"). Disabling instead would be the subtly wrong
+//     answer and the interesting one: packBridgeSetpoint leaves the legacy 123
+//     command ALONE when WSetEna is off, so a pack that reverted by disabling
+//     would keep producing the last dispatched watts forever — an expiry that
+//     looks correct on the 704 registers and is uncontained in the physics.
+//   - WMaxLimPct reverts to 100 % with WMaxLimPctEnaRvrt = 0 — the uncurtailed
+//     ceiling, limit off, matching populate704's own "100% until the hub
+//     curtails" resting value. A ceiling's safe default is the ABSENCE of a
+//     ceiling: a curtailment is a temporary instruction, and a device that
+//     reverted a lapsed curtailment to some lower number would be enforcing an
+//     instruction whose authority had expired.
+//
+// The PF and VarSet groups are left at their populated zeros. This profile
+// models a real-power pack and states no reactive reversion destination, and
+// inventing one would be a claim about a device that does not make it.
+func seedPackReversionDestinations(r *RegisterMap, m704 uint16) {
+	regs := readSlice(r, m704, sunspec.L704.Len())
+	v := sunspec.L704.View(regs)
+	v.SetFloat("WSetRvrt", 0)
+	v.SetFloat("WSetPctRvrt", 0)
+	v.SetEnum("WSetEnaRvrt", 1)
+	v.SetFloat("WMaxLimPctRvrt", 100)
+	v.SetEnum("WMaxLimPctEnaRvrt", 0)
+	writeSlice(r, m704, regs)
 }
 
 // ── The WSet bridge ──────────────────────────────────────────────────────────
@@ -1057,6 +1220,11 @@ func (bs *BatteryServer) packPowerOnReset() {
 		v.SetBool("WMaxLimPctEna", false)
 		v.SetFloat("WMaxLimPct", 100)
 		writeSlice(r, m704, regs)
+		// Every reversion countdown dies with the rail. A pack that came back
+		// from a power cycle still counting down a timer a controller armed
+		// before the drop would be honouring an instruction it has no other
+		// memory of — and this reset has just erased the instruction itself.
+		bs.rvrt.disarmAll(r)
 	}
 }
 
@@ -1104,6 +1272,36 @@ type BatteryPackState struct {
 	// Lies is the lying-device layer's counter set — what actually fired,
 	// rather than what a sleep suggests fired.
 	Lies *LieStats `json:"lies,omitempty"`
+	// Reversion is the 704 reversion-timer engine's own account of itself,
+	// omitted on the cease shape. It is on /state chiefly so the TIMEBASE is,
+	// which is what makes an accelerated run self-declaring in its evidence.
+	Reversion *PackReversionState `json:"reversion,omitempty"`
+}
+
+// PackReversionState is the pack's model 704 reversion engine on GET /state.
+type PackReversionState struct {
+	// Timebase names the clock the timers counted down against. It reads
+	// "wall" on every production and bench path. ANYTHING ELSE means the run
+	// was ACCELERATED and its timings are evidence about this harness's state
+	// machine only — never about a real device. It is published rather than
+	// merely documented so an evidence bundle cannot be misread later.
+	Timebase string `json:"timebase"`
+	// Groups lists every reversion timer that is configured (RvrtTms non-zero)
+	// or running. A group that is neither is omitted rather than reported as a
+	// row of zeros, so what is present on /state is what a reader must account
+	// for.
+	Groups []PackReversionGroupState `json:"groups,omitempty"`
+}
+
+// PackReversionGroupState is one reversion timer: what it was programmed for,
+// whether the engine is counting it, and what the register bank is telling a
+// Modbus client is left. Armed and RemS come from the two different places on
+// purpose — the engine and the wire — so a row can prove they agree.
+type PackReversionGroupState struct {
+	Name  string `json:"name"`
+	Armed bool   `json:"armed"`
+	TmsS  uint32 `json:"tms_s"`
+	RemS  uint32 `json:"rem_s"`
 }
 
 type packSetpointState struct {
@@ -1154,6 +1352,12 @@ func (bs *BatteryServer) packSnapshot() *BatteryPackState {
 		out.Meas701 = &adv701Meas{
 			W_W: m701.W, PF: m701.PF, VAr_var: m701.Var, Hz_Hz: m701.Hz,
 			St: int(m701.St), ConnSt: int(m701.ConnSt),
+		}
+		if bs.rvrt != nil {
+			out.Reversion = &PackReversionState{
+				Timebase: bs.rvrt.timebaseLabel(),
+				Groups:   bs.rvrt.armedGroups(r),
+			}
 		}
 	}
 	if bs.lies != nil {

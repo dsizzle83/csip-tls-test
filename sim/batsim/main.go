@@ -23,7 +23,15 @@
 //	                      M704 WSet BRIDGED TO PHYSICAL EFFECT — a setpoint
 //	                      write commands the pack, the animation ramps measured
 //	                      power toward it in both directions, and SoC
-//	                      integrates against it.
+//	                      integrates against it. Its 704 REVERSION TIMERS are
+//	                      LIVE (sim/southbound/reversion704.go): a control
+//	                      written with a *RvrtTms counts down in whole seconds
+//	                      on the WALL CLOCK, publishes *RvrtRem while it runs,
+//	                      and on expiry takes its *Rvrt value and *EnaRvrt
+//	                      enable — WSet reverting to an ENABLED 0 W, which is
+//	                      this shape's fail-safe posture expressed as device
+//	                      state. Nothing on this command line can accelerate
+//	                      that; only a Go test can, deliberately.
 //	-pack cease           the 704-LESS pack: the legacy models only, with M123
 //	                      Conn implemented and DRIVEN — a Conn write opens the
 //	                      contactor, measured power collapses in the same tick,
@@ -43,7 +51,10 @@
 //
 //	GET  /state      — JSON snapshot: measurements + battery SoC/SoH/ChaSt + controls
 //	                   (+ a "pack" object with commanded/measured power, the 704
-//	                   setpoint, the 701 mirror and the lie counters, on a -pack sim)
+//	                   setpoint, the 701 mirror, the lie counters and — on the
+//	                   704-capable shape — a "reversion" object naming the
+//	                   TIMEBASE the reversion timers counted on and every armed
+//	                   countdown, on a -pack sim)
 //	POST /inject     — override fields: {"SoC_pct":85.0,"W_W":-3000.0,"Conn":0,...}
 //	                   -pack setpoint-zero also accepts {"WSet_W":-3000} / {"WSetEna":0}
 //	POST /control    — {"cmd":"pause"}, {"cmd":"resume"}, {"speed":10.0}
