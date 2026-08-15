@@ -613,7 +613,7 @@ func TestMUPOracle_ProtoFixAloneCuresExactlyOneOfTheThree(t *testing.T) {
 // code.
 func TestBasic029_CarriesTheMUPContentOracle(t *testing.T) {
 	var found bool
-	for _, c := range basicMeterReadingCriteria(&Observation{Params: map[string]string{}}) {
+	for _, c := range basicMeterReadingCriteria(&Observation{Params: map[string]string{}}, "") {
 		if !strings.Contains(c.Claim, "roleFlags") {
 			continue
 		}
@@ -633,5 +633,40 @@ func TestBasic029_CarriesTheMUPContentOracle(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("BASIC-029 mints no MirrorUsagePoint content criterion")
+	}
+
+	// THE PICS MUST ACTUALLY REACH THE CRITERION, and this assertion exists
+	// because it did not on the way in.
+	//
+	// The first version of this row read the declaration from
+	// o.Params[mupRoleFlagsPICSParam] inside the criteria builder.
+	// Observation.Params starts EMPTY and is filled by the run's own phases
+	// (check.go); it is NOT the operator's -param map, which lives on the
+	// RunCtx. So the lever compiled, ran, and silently graded every campaign as
+	// though no declaration had ever been supplied — a whole feature that could
+	// only be caught by asking whether the value arrives, which is what this
+	// does. CORE-014's coreDERSettings carries a comment warning about exactly
+	// this and it was not enough on its own.
+	//
+	// The probe: isDC is a SITE-FACT bit, which is disclosed without a PICS and
+	// FAILS when a PICS omits it. Same fixture, two declarations, two verdicts —
+	// so a criterion that never received the string cannot pass this.
+	dc := synthTranscript(derCapPUT(), mupPOST(mupXML(
+		`<roleFlags>0069</roleFlags><serviceCategoryKind>0</serviceCategoryKind><status>1</status>`)))
+	verdictWith := func(pics string) certify.Verdict {
+		for _, c := range basicMeterReadingCriteria(&Observation{Params: map[string]string{}}, pics) {
+			if strings.Contains(c.Claim, "roleFlags") {
+				return c.Wire(nil, dc).Verdict
+			}
+		}
+		t.Fatal("the row stopped minting the MirrorUsagePoint content criterion")
+		return ""
+	}
+	if got := verdictWith(""); got != certify.Pass {
+		t.Errorf("with no PICS the site-fact bit must be disclosed, not graded; verdict = %s", got)
+	}
+	if got := verdictWith("isMirror,isDER,isSubmeter"); got != certify.Fail {
+		t.Errorf("with a PICS that omits isDC the bit must be graded; verdict = %s. If this is PASS, "+
+			"the operator's declaration is not reaching the criterion at all", got)
 	}
 }

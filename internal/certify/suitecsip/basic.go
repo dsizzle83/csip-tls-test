@@ -2845,6 +2845,15 @@ func basicMUPWant(base ServerView) func(ServerView) bool {
 
 // basicMeterReading implements BASIC-029 — Inverter Meter Reading.
 func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
+	// The operator's roleFlags PICS declaration, when there is one. Read HERE,
+	// from the RunCtx, and not inside the criteria — for the reason CORE-014's
+	// coreDERSettings states about its own PICS param, and which cost this
+	// criterion a silent defect on the way in: Observation.Params starts EMPTY
+	// and is filled by the run's own phases (check.go's `obs := &Observation{...
+	// Params: map[string]string{}}`). It is NOT the operator's -param map. A
+	// criterion reading o.Params[...] for a flag the operator typed gets "",
+	// always, and quietly grades as though no declaration had been supplied.
+	pics, _ := rc.Param(mupRoleFlagsPICSParam)
 	return run(ctx, rc, spec{
 		Want: func(base ServerView) func(ServerView) bool { return basicMUPWant(base) },
 		Notes: func(o *Observation) string {
@@ -2852,7 +2861,7 @@ func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result,
 				"fresh discovery walk AND a ReadingType-bearing MUP registration (predicate satisfied: %t)",
 				o.Waited.Round(rounding), o.Satisfied)
 		},
-		Criteria: basicMeterReadingCriteria,
+		Criteria: func(o *Observation) []criterion { return basicMeterReadingCriteria(o, pics) },
 	})
 }
 
@@ -2860,7 +2869,7 @@ func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result,
 // written inline so a test can mint it and assert on what it contains — the same
 // shape core014Criteria has. A criterion nobody can enumerate is a criterion
 // whose placement nothing pins, and this row has just gained one (IW15-028).
-func basicMeterReadingCriteria(o *Observation) []criterion {
+func basicMeterReadingCriteria(o *Observation, picsRoleFlags string) []criterion {
 	return []criterion{
 		critGET(DiscoveryRoot,
 			"the DeviceCapability the server returned carries a MirrorUsagePointListLink",
@@ -2879,7 +2888,7 @@ func basicMeterReadingCriteria(o *Observation) []criterion {
 		// there — so a resource missing a MANDATORY element, or claiming
 		// roles its own definition contradicts, passed that check and
 		// every other one of the 282. See mup_oracle.go.
-		critMUPElementsAndRoleFlags(o.Params[mupRoleFlagsPICSParam]),
+		critMUPElementsAndRoleFlags(picsRoleFlags),
 		{
 			Claim: "the ReadingType the DUT registered carries the CSIP monitoring encoding for real " +
 				"power: uom=38 (Watts), flowDirection and powerOfTenMultiplier present",
