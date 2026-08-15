@@ -169,6 +169,47 @@ const (
 	// verification (not the write ACK) catches it.
 	FaultPFAckIgnore FaultKind = "pf_ack_ignore"
 
+	// ── LEGACY curve family (12x) faults — see curve12x.go. ──
+	//
+	// The legacy generation has NO adopt handshake, so curve_adopt_lies has no
+	// analogue here and the four kinds below act on the things that replaced it:
+	// the ActCrv selection register, the ModEna bitfield, the per-bank ReadOnly
+	// declaration, and model 134's SnptW. Each exists to make one product-side
+	// check falsifiable — a check nothing can break is a check nobody has
+	// tested.
+
+	// FaultLegacyActCrvIgnored makes a write to a legacy curve model's ActCrv
+	// register ACK at the Modbus layer while the register does not move. On
+	// this generation ActCrv IS the commit — there is no AdptCrvRslt to report
+	// failure — so a gateway that trusts its own write instead of verifying the
+	// read-back believes it switched the device onto a freshly written bank and
+	// has in fact left the OLD curve live.
+	FaultLegacyActCrvIgnored FaultKind = "legacy_actcrv_ignored"
+
+	// FaultLegacyModEnaSticky makes ModEna bit 0 impossible to CLEAR: the
+	// function cannot be switched off. It blocks two things the product must be
+	// able to do — release an axis, and abort a single-bank (Case B) rewrite,
+	// which has to disable the function before it overwrites the live bank —
+	// and a gateway that reports either as done without reading ModEna back is
+	// reporting a state the device is not in.
+	FaultLegacyModEnaSticky FaultKind = "legacy_modena_sticky"
+
+	// FaultLegacyReadOnlyIgnored makes a bank the device declares READONLY
+	// silently ACCEPT writes instead of answering a Modbus exception. It is the
+	// inverse of a fault in the usual sense: the device becomes MORE permissive.
+	// A gateway that relies on the device to refuse — rather than on its own
+	// per-bank ReadOnly preflight — overwrites a bank it was told not to touch
+	// and never learns that it did.
+	FaultLegacyReadOnlyIgnored FaultKind = "legacy_read_only_ignored"
+
+	// FaultLegacySnptWStuck makes model 134's SnptW read back 1 however it is
+	// written. With snapshot mode on, the freq-watt curve's power base is the
+	// instantaneous output at the moment WRefStrHz was crossed rather than the
+	// fixed WRef — so a CSIP opModFreqWatt curve, which is defined against
+	// %setMaxW, delivers a shape that depends on irradiance at trigger time. A
+	// writer that does not write SnptW=0 AND read it back cannot tell.
+	FaultLegacySnptWStuck FaultKind = "legacy_snptw_stuck"
+
 	// ── Server/transport-plumbing faults — act BELOW the register hooks. ──
 	//
 	// Unlike every fault above (which the faultController shapes on the read or

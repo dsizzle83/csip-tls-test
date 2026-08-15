@@ -70,7 +70,19 @@ func main() {
 		"(identical to -advanced); \"full\" = plus the IEEE 1547-2018 trip models 707/708/709/710 "+
 		"(DERTripLV/HV/LF/HF) with Category III default trip curves. Empty follows -advanced, which "+
 		"keeps every existing bench invocation serving the register image it has always served — the "+
-		"trip models are OPT-IN because adding them lengthens the SunSpec chain every scenario walks")
+		"trip models are OPT-IN because adding them lengthens the SunSpec chain every scenario walks; "+
+		"\"legacy-curves\" = the OTHER generation entirely — 1/103/120/121/122/123 plus the legacy curve "+
+		"family 126/127/128/129/130/131/132/134 and the 160 MPPT extension, and NO 7xx model at all")
+	legacyNCrv := flag.Int("der-legacy-ncrv", 0, "banks (NCrv) each legacy curve model declares under "+
+		"-der-models legacy-curves; 0 = the default 2. TWO is Case A — a gateway can write an idle bank "+
+		"and switch ActCrv atomically. ONE is Case B, the field-common and genuinely harder shape: there "+
+		"is no spare bank, so the live bank must be disabled, rewritten in place and re-enabled, and the "+
+		"ride-through models 129/130 must REFUSE that rewrite rather than momentarily delete a trip boundary")
+	legacyShortBlock := flag.Int("der-legacy-shortblock", 0, "lay THIS legacy curve model's banks out at a "+
+		"block length sized to its own NPt instead of the SunSpec fixed twenty point slots (e.g. 126). The "+
+		"served device is internally coherent — header, declared L and stride all agree — and its geometry "+
+		"is WRONG in exactly the one way L arithmetic can catch: (L-10)/NCrv is a whole number and is not "+
+		"the model's spec block length. It is the fail-closed geometry gate's test target; 0 = off")
 	cloudPct := flag.Float64("cloud-pct", 0, "initial cloud cover percent (0=clear sky .. 100=full overcast); "+
 		"deterministically attenuates the running irradiance and is injectable live via POST /inject {\"Cloud_pct\":N}")
 	serial := flag.String("serial", "", "SunSpec Model 1 serial number (SN) override; empty keeps the "+
@@ -119,6 +131,13 @@ func main() {
 
 	var srv *sim.SolarServer
 	switch models {
+	case modelsLegacyCurves:
+		log.Printf("modsim: starting LEGACY-CURVE (12x: 126/127/128/129/130/131/132/134/160) PV inverter "+
+			"on %s (WMax=%.0f W, NCrv=%d)", listenURL, *wmax, sim.LegacyCurveOptions{NCrv: *legacyNCrv}.NCrvOrDefault())
+		srv, err = sim.NewSolarServerLegacyCurves(listenURL, *wmax, *serial, sim.LegacyCurveOptions{
+			NCrv:            *legacyNCrv,
+			ShortBlockModel: uint16(*legacyShortBlock),
+		})
 	case modelsFull:
 		log.Printf("modsim: starting FULL (7xx + 707-710 trip) PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
 		srv, err = sim.NewSolarServerTrip(listenURL, *wmax, *serial)
@@ -300,6 +319,13 @@ const (
 	modelsLegacy derModelSet = iota
 	modelsAdvanced
 	modelsFull
+	// modelsLegacyCurves is the OTHER generation, not a superset of any of the
+	// three above: it serves the legacy 12x curve family and NO 7xx model. It is
+	// deliberately absent from "full" — a device serving 705 AND 126 is not a
+	// machine anyone ships, and on one every per-generation conformance binding
+	// (which resolves its southbound target from the DER's own model chain)
+	// would be ambiguous. See sim/southbound/curve12x.go.
+	modelsLegacyCurves
 )
 
 // listenAddr forms the "host:port" pair modsim's Modbus/TCP listener (and,
@@ -338,7 +364,10 @@ func resolveDERModels(flagValue string, advanced bool) (derModelSet, error) {
 		return modelsAdvanced, nil
 	case "full":
 		return modelsFull, nil
+	case "legacy-curves":
+		return modelsLegacyCurves, nil
 	default:
-		return modelsLegacy, fmt.Errorf("-der-models %q is not one of legacy, advanced, full", flagValue)
+		return modelsLegacy, fmt.Errorf("-der-models %q is not one of legacy, advanced, full, legacy-curves",
+			flagValue)
 	}
 }

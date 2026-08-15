@@ -105,6 +105,14 @@ type SolarServer struct {
 	advanced  bool
 	adv       solarAdvBases
 	varRating float64 // reactive rating (var) — 702 VarMaxInj / fixed-var effect base
+
+	// LEGACY curve family (12x) — populated only by NewSolarServerLegacyCurves
+	// and nil everywhere else, so no existing profile can change behaviour
+	// through it. It is the OTHER generation from adv above and never coexists
+	// with it: a device serving both 705 and 126 is not a machine anyone ships,
+	// and on one every per-generation conformance binding would be ambiguous.
+	// See curve12x.go.
+	legacy *legacyCurveLayer
 }
 
 // solarFaultKinds is the set of POST /fault kinds the solar sim advertises.
@@ -229,6 +237,16 @@ func (ss *SolarServer) interceptWrite(startAddr uint16, vals []uint16) bool {
 	if ss.advanced && ss.interceptAdopt(startAddr, vals) {
 		return false // the adopt handler took responsibility for this write
 	}
+	// The LEGACY curve family has no adopt handshake to intercept; what it has
+	// instead is per-bank write protection and an ActCrv/ModEna selection pair
+	// whose faults act on the write path (curve12x.go). It takes responsibility
+	// for any write that lands inside one of its models and returns handled=false
+	// for every other address, so no other profile's write path changes.
+	if ss.legacy != nil {
+		if apply, handled := ss.legacy.interceptWrite(ss.Regs, startAddr, vals); handled {
+			return apply
+		}
+	}
 	cmdAddr := ss.bases.M123Base + sunspec.M123_WMaxLimPct
 	return ss.faults.intercept(ss.Regs, cmdAddr, startAddr, vals)
 }
@@ -250,9 +268,20 @@ func (ss *SolarServer) ApplyFault(body []byte) error {
 	if handled, err := ss.lies.apply(body); handled {
 		return err
 	}
+	// LEGACY curve kinds (curve12x.go) — consulted before the faultController
+	// for the same reason the lying kinds are: a kind that controller does not
+	// know would be reported as unknown rather than handled.
+	if ss.legacy != nil {
+		if handled, err := ss.legacy.faults.apply(body); handled {
+			return err
+		}
+	}
 	kinds := solarFaultKinds
-	if ss.advanced {
+	switch {
+	case ss.advanced:
 		kinds = solarAdvFaultKinds
+	case ss.legacy != nil:
+		kinds = solarLegacyCurveFaultKinds
 	}
 	return ss.faults.apply(body, kinds)
 }
@@ -333,6 +362,11 @@ type SolarState struct {
 	// Advanced is the 7xx (IEEE 1547-2018) ground truth, present only on an
 	// advanced sim. Nil on a legacy sim, so /state is unchanged there.
 	Advanced *SolarAdvancedState `json:"advanced,omitempty"`
+
+	// LegacyCurves is the 12x family's ground truth, omitted entirely on a sim
+	// that does not serve it so /state stays byte-identical for every existing
+	// scenario. See curve12x.go.
+	LegacyCurves *SolarLegacyCurveState `json:"legacy_curves,omitempty"`
 }
 
 // Snapshot reads the current register state and returns a decoded SolarState.
@@ -394,6 +428,7 @@ func (ss *SolarServer) Snapshot() SolarState {
 	if ss.advanced {
 		st.Advanced = ss.advSnapshot()
 	}
+	st.LegacyCurves = ss.legacySnapshot()
 
 	return st
 }
@@ -408,6 +443,9 @@ func (ss *SolarServer) Registers() map[string]uint16 {
 	end := base + 254
 	if ss.advanced && ss.adv.End > end {
 		end = ss.adv.End
+	}
+	if ss.legacy != nil && ss.legacy.end > end {
+		end = ss.legacy.end
 	}
 	for addr := base; addr <= end; addr++ {
 		v := ss.Regs.Get(addr)

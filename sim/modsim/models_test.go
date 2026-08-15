@@ -19,6 +19,12 @@ func TestResolveDERModels(t *testing.T) {
 		{"advanced", false, modelsAdvanced, false},
 		{"full", false, modelsFull, false},
 		{"full", true, modelsFull, false},
+		{"legacy-curves", false, modelsLegacyCurves, false},
+		// The legacy-curve profile is NOT reachable through -advanced and is
+		// not folded into "full": it is the OTHER generation, serving no 7xx
+		// model at all, so an operator has to ask for it by name.
+		{"legacy-curves", true, modelsLegacyCurves, false},
+		{"legacy_curves", false, modelsLegacy, true}, // underscore is not the spelling
 		{"7xx", true, modelsLegacy, true},
 		{"FULL", false, modelsLegacy, true}, // case-sensitive on purpose
 	} {
