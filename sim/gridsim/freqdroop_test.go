@@ -46,7 +46,8 @@ const figure12Droop = `"freq_droop":{"dbof":60030,"dbuf":59970,"kof":40,"kuf":40
 // decoded a conformant opModFreqDroop into four zeros with no error raised —
 // a droop with no dead band and no gain, which is a real and aggressive machine
 // rather than an absent setting — because the struct declared four element
-// names sep 2.0.4 does not contain. Encoding and decoding through the corrected
+// names no revision of IEEE 2030.5 contains. Encoding and decoding through the
+// corrected
 // model, and checking the ORDER of the elements on the wire, is what shows this
 // lever is not emitting the same class of defect from the other side.
 func TestFreqDroop_GoldenRoundTripThroughTheSchemasOwnDecode(t *testing.T) {
@@ -93,7 +94,10 @@ func TestFreqDroop_GoldenRoundTripThroughTheSchemasOwnDecode(t *testing.T) {
 	if end := strings.Index(inner, "</opModFreqDroop>"); end >= 0 {
 		inner = inner[:end]
 	}
-	// sep-2.0.4.xsd FreqDroopType: dBOF, dBUF, kOF, kUF, openLoopTms.
+	// FreqDroopType's sequence: dBOF, dBUF, kOF, kUF, openLoopTms. IEEE Std
+	// 2030.5-2018 p.242 and Figure B.37 p.240, which the draft schema and
+	// 2030.5-2023 p.269-270 agree with element for element (NORMATIVE_ANCHOR.md
+	// §3.5) — one of the places all three documents say the same thing.
 	last := -1
 	for _, child := range []string{"<dBOF>", "<dBUF>", "<kOF>", "<kUF>", "<openLoopTms>"} {
 		at := strings.Index(inner, child)
@@ -323,8 +327,9 @@ func TestFreqDroop_TeardownRemovesIt(t *testing.T) {
 // TestOpenLoopTms_IsServedOnTheCurveAndClearedByTeardown is the other #32
 // lever, end to end.
 //
-// It belongs on the DERCurve rather than on the control — sep 2.0.4 declares it
-// a child of DERCurve, and Figure 6 names it "opModVoltVar.DERCurve.openLoopTms"
+// It belongs on the DERCurve rather than on the control — IEEE Std 2030.5-2018
+// p.253 declares it an attribute of DERCurve, and CSIP CTP v1.3's Figure 6 names
+// it "opModVoltVar.DERCurve.openLoopTms"
 // for that reason — so a lever that put it on the control would be sending a
 // different document.
 func TestOpenLoopTms_IsServedOnTheCurveAndClearedByTeardown(t *testing.T) {

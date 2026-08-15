@@ -88,11 +88,12 @@ func staticVoltVarCurve0(now int64) *model.DERCurveList {
 			// constant corrected the fixture (IW15-027).
 			CurveType: model.CurveTypeVoltVar,
 			// yRefType 3 = %statVarAvail. It was 4, under a comment that said
-			// "VAr as % of VArMax" — and BOTH halves were wrong. sep 2.0.4's
-			// DERUnitRefType makes 4 "%setEffectiveV", a VOLTAGE reference on
-			// the VAr axis of a volt-var curve; %setMaxVar (the thing the
-			// comment described) is 2, not 4. The schema is explicit about the
-			// admissible set for this element: opModVoltVar's own documentation
+			// "VAr as % of VArMax" — and BOTH halves were wrong. IEEE Std
+			// 2030.5-2018 p.256's DERUnitRefType makes 4 "%setEffectiveV", a
+			// VOLTAGE reference on the VAr axis of a volt-var curve; %setMaxVar
+			// (the thing the comment described) is 2, not 4. The standard is
+			// explicit about the admissible set for this element: opModVoltVar's
+			// own prose (p.250)
 			// says "the meaning of the y value is determined by yRefType and
 			// must be one of %setMaxW, %setMaxVar, or %statVarAvail", so 4 is
 			// not merely unusual here, it is not a legal value for this curve.

@@ -133,7 +133,11 @@ type curveBinding struct {
 	// engineering value the oracle expects (wantPoints), so they must travel
 	// with the points rather than being assumed zero at one end.
 	XMult, YMult int8
-	// YRefType is the Table-19 code the published curve's y axis carries.
+	// YRefType is the DERUnitRefType code the published curve's y axis carries
+	// (IEEE Std 2030.5-2018 p.256). It said "the Table-19 code" until
+	// IW15-027 — "Table 19" is a table of the pre-publication ZigBee SEP 2.0.4
+	// draft, and naming it sent a reader to the document this whole wave exists
+	// to stop citing.
 	YRefType uint8
 
 	// OpenLoopTms is the DERCurve's own openLoopTms element this row authors —

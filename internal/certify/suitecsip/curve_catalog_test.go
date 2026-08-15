@@ -369,9 +369,11 @@ func TestCurveRows_RecordWhereEachAuthoredElementCanBeReadBack(t *testing.T) {
 // Figure 12 prints dBOF/dBUF as Default 36 / Test 60030, and the catalog's own
 // note records that the two columns cannot both be dead bands in one unit: 36
 // reads as hundredths of Hz while 60030/59970 read as absolute frequencies in
-// millihertz, and the document does not reconcile them. sep 2.0.4 fixes the
-// element's unit at thousandths of Hz, so what this row puts on the wire is
-// 60.030 Hz and 59.970 Hz.
+// millihertz, and the document does not reconcile them. IEEE Std 2030.5-2018
+// p.242 fixes the element's unit at thousandths of Hz — and the draft schema
+// and 2030.5-2023 p.269-270 agree with it, FreqDroopType being one of the
+// places all three documents say the same thing (NORMATIVE_ANCHOR.md §3.5) —
+// so what this row puts on the wire is 60.030 Hz and 59.970 Hz.
 //
 // A future reader who "corrected" the row to 30/30 — a ±0.030 Hz dead band,
 // which is what the Test Values probably MEAN — would be certifying a control

@@ -832,7 +832,7 @@ func inverterControlRows() []inverterControlRow {
 			// 60030, and the catalog's own note says so: 36 reads as a dead band
 			// of hundredths of Hz while 60030/59970 read as absolute frequencies
 			// in millihertz, and the document does not reconcile the two.
-			// sep 2.0.4 fixes the unit — thousandths of Hz — so what goes on the
+			// IEEE 2030.5-2018 p.242 fixes the unit — thousandths of Hz — so what goes on the
 			// wire is 60.030 Hz and 59.970 Hz, which is what the Test Values
 			// column says under the schema's own unit. A bench that "corrected"
 			// the procedure's numbers would be certifying a control the
@@ -1046,7 +1046,9 @@ func inverterControlRows() []inverterControlRow {
 		// volt_watt, freq_watt, watt_pf) and there is no lever that emits an
 		// <opModWattVar> DERCurveLink at all, so the control cannot be placed on
 		// the wire. Adding one is curve plan #32's work: a "watt_var" mode
-		// mapping to csipmodel.CurveTypeWattVar (10) and
+		// mapping to csipmodel.CurveTypeWattVar (14 under IEEE 2030.5-2018
+		// p.254; this comment said 10 until IW15-027, which was the draft
+		// schema's code and is opModLVRTMustTrip under the standard) and
 		// ExtendedDERControlBase.OpModWattVar, both of which the pinned
 		// lexa-proto now provides.
 		//

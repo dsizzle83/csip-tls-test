@@ -31,21 +31,35 @@ package gridsim
 //     independent corrections landed on the same element.
 //
 //     THE TEXT changed because lexa-proto 72d91be stopped writing hexBinary
-//     ELEMENTS in decimal. sep 2.0.4 types roleFlags as RoleFlagsType
-//     (xsd:2291 -> xsd:5826), base HexBinary16, and csipmodel had been
+//     ELEMENTS in decimal. roleFlags is a RoleFlagsType, base HexBinary16 —
+//     IEEE Std 2030.5-2018 p.169, which the draft schema (xsd:2291 ->
+//     xsd:5826) and 2030.5-2023 p.179 agree with bit for bit
+//     (NORMATIVE_ANCHOR.md §3.9); the citation here was the draft's until
+//     IW15-027 made it under-cited rather than wrong. csipmodel had been
 //     emitting a Go integer — so a value this bench meant as N went onto the
 //     wire as a string a conformant reader parsed as 0xN. The new encoding is
 //     uppercase and zero-padded to the type's width. This alone would have
 //     turned "4" into "0004" with no change of meaning.
 //
 //     THE VALUE changed because 0x0004 was never right. RoleFlagsType bit 2 is
-//     isPEV (xsd:5831) and this is a residential time-of-use tariff; the
+//     isPEV (2018 p.169) and this is a residential time-of-use tariff; the
 //     "isPrimary (forward)" the old comment claimed is not a role the type
 //     defines at all, and the forward/reverse distinction it was reaching for
 //     lives in ReadingType.flowDirection. The rate describes a premises point
-//     of delivery, which is bit 1, isPremisesAggregationPoint (xsd:5830) — the
-//     same role the DUT's own site-meter MirrorUsagePoint declares. Full
-//     adjudication in pricing.go.
+//     of delivery, which is bit 1, isPremisesAggregationPoint (2018 p.169).
+//     Full adjudication in pricing.go.
+//
+//     ONE CLAUSE OF THIS ENTRY IS WITHDRAWN (IW15-028). It used to end "— the
+//     same role the DUT's own site-meter MirrorUsagePoint declares", offered as
+//     corroboration for the value chosen here. The DUT's MirrorUsagePoint does
+//     declare 0x0002, and that is a DEFECT of the product rather than a
+//     precedent: on a MirrorUsagePoint, bit 0 isMirror is an unconditional
+//     SHALL (2018 p.169 — the server is by definition not the measurement
+//     device) and this product leaves it clear. See suitecsip's
+//     critMUPElementsAndRoleFlags, which red-proves it. A tariff fixture and a
+//     mirror registration are different resources under different rules, and
+//     citing one to justify the other was reasoning from a bug. The VALUE here
+//     is still right, on its own merits, stated above.
 //
 //     WHY THIS IS SAFE FOR PUBLISHED EVIDENCE. Nothing in this tree reads
 //     RateComponent.RoleFlags, and no CSIP-CONF-v1.3 row this bench runs

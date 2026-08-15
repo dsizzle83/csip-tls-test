@@ -36,13 +36,20 @@ func (s *Server) buildPricing(now int64) {
 			// ROLEFLAGS ADJUDICATION — the canonical one for RateComponent; see
 			// pricing_dynamic.go for the second site.
 			//
-			// This was 0x0004 with the comment "isPrimary (forward)". sep 2.0.4
-			// gives RateComponent.roleFlags the type RoleFlagsType (xsd:2291 ->
-			// xsd:5826), the SAME type UsagePointBase uses, and RoleFlagsType
-			// has no isPrimary and no isReverse. Its bit 2 is isPEV — xsd:5831,
-			// "SHALL be set if the usage applies to an electric vehicle" — so
-			// this bench was serving a residential time-of-use tariff that
-			// declared itself an EV rate.
+			// This was 0x0004 with the comment "isPrimary (forward)". IEEE Std
+			// 2030.5-2018 p.220 gives RateComponent.roleFlags the type
+			// RoleFlagsType, the SAME type UsagePointBase uses, and
+			// RoleFlagsType (p.169) has no isPrimary and no isReverse. Its bit 2
+			// is isPEV — "SHALL be set if the usage applies to an electric
+			// vehicle" — so this bench was serving a residential time-of-use
+			// tariff that declared itself an EV rate.
+			//
+			// The citation was the draft schema's (xsd:2291 -> xsd:5826) until
+			// IW15-027. RoleFlagsType is one of the places all three documents
+			// agree bit for bit (2023 p.179 too, NORMATIVE_ANCHOR.md §3.9), so
+			// the adjudication STANDS unchanged and only its provenance moves —
+			// which is the ordinary case for this element and worth saying,
+			// since so much of that wave was about places where they do not.
 			//
 			// The encoding sweep (lexa-proto 72d91be) is what made anyone look:
 			// the VALUE survives it unaltered — 4 reads as 4 under either

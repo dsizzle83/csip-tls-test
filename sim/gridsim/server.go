@@ -948,11 +948,21 @@ func (s *Server) serveXML(w http.ResponseWriter, resource interface{}) {
 	data, malformed := s.malformedXML(resource)
 	if !malformed {
 		var err error
-		// DERCurve and DERCurveList marshal through a schema-shaped local type
-		// (curvexml.go): the vendored struct drops three minOccurs="1"
-		// elements, orders curveType before CurveData against the XSD's own
-		// sequence, and carries two elements sep 2.0.4 does not declare.
-		// Everything else marshals exactly as it always did.
+		// DERCurve and DERCurveList marshal through a standard-shaped local
+		// type (curvexml.go), which emits IEEE 2030.5-2018's element set in the
+		// standard's own sequence with every [1] element present, zeros
+		// included.
+		//
+		// THE DEFECTS IT WAS BUILT AGAINST ARE FIXED UPSTREAM. This comment used
+		// to read "the vendored struct drops three minOccurs=1 elements, orders
+		// curveType before CurveData against the XSD's own sequence, and carries
+		// two elements sep 2.0.4 does not declare" — and none of the three is
+		// true of the pinned csipmodel any more (lexa-proto 9856710 and
+		// 13e9106). The shape stays because the guarantee is worth having
+		// LOCALLY: this is the one place that decides what a DERCurve looks like
+		// on the wire, and a bench whose document validity depends on a
+		// dependency's struct tags is one re-vendor away from serving invalid
+		// evidence again. Everything else marshals exactly as it always did.
 		out, _ := curveForWire(resource)
 		data, err = xml.MarshalIndent(out, "", "  ")
 		if err != nil {

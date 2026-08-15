@@ -16,7 +16,8 @@ package gridsim
 //
 // ── The element is authored WHOLE or not at all ─────────────────────────────
 //
-// All five children of sep 2.0.4's FreqDroopType are minOccurs="1". A request
+// All five children of FreqDroopType are [1] — IEEE Std 2030.5-2018 p.242 and
+// Figure B.37 p.240, which show all five without a cardinality marker. A request
 // carrying four of them is REJECTED (400) rather than completed with zeros,
 // and the difference is not pedantry: dBOF=0/dBUF=0 is a droop with NO dead
 // band and kOF=0/kUF=0 is one with infinite gain — a real and aggressive
@@ -28,9 +29,13 @@ package gridsim
 // zero-dead-band machine with no error raised. The correction is what this
 // lever emits against.)
 //
-// ── Units are the schema's own, carried verbatim ────────────────────────────
+// ── Units are the standard's own, carried verbatim ─────────────────────────
 //
-// Per sep-2.0.4.xsd's FreqDroopType documentation:
+// Per IEEE Std 2030.5-2018 p.242 (and identically in 2030.5-2023 p.269-270 and
+// in the vendored draft schema — FreqDroopType is one of the places all three
+// documents AGREE element-for-element, type-for-type and unit-for-unit; see
+// lexa-proto docs/schema/NORMATIVE_ANCHOR.md §3.5. The citations here were the
+// draft's until IW15-027, which made them under-cited rather than wrong):
 //
 //	dBOF, dBUF     frequency droop dead band, over/under, in THOUSANDTHS of Hz
 //	kOF, kUF       per-unit frequency change corresponding to a 1 per-unit
@@ -50,13 +55,19 @@ package gridsim
 // name, type, cardinality and internal order.
 //
 // Its POSITION inside DERControlBase is not, and that is a PRE-EXISTING
-// upstream divergence rather than anything added here. sep 2.0.4 declares
-// DERControlBase's children in one alphabetical sequence (opModConnect,
-// opModEnergize, opModFixedPF, opModFixedVar, opModFixedW, opModFreqDroop,
-// opModFreqWatt, ... opModWattVar, rampTms); csipmodel's struct orders them
-// differently throughout — rampTms sits in the middle, the curve links follow
-// it, and OpModFreqDroop is declared last. Every element of every control this
-// server has ever emitted is affected identically. It is recorded here because
+// upstream divergence rather than anything added here. IEEE 2030.5-2018
+// declares DERControlBase's twenty-six children in one case-insensitively
+// alphabetical sequence (p.248-251: opModConnect, opModEnergize,
+// opModFixedPFAbsorbW, opModFixedPFInjectW, opModFixedVar, opModFixedW,
+// opModFreqDroop, opModFreqWatt, ... opModWattVar, rampTms).
+//
+// THE DIVERGENCE THIS PARAGRAPH DESCRIBED IS CLOSED. csipmodel put its struct
+// into the standard's sequence (lexa-proto 9856710, re-derived against the
+// published document at 13e9106), so OpModFreqDroop now sits between
+// OpModFixedW and OpModFreqWatt where "freqd" < "freqw" puts it, rather than
+// last. The note survives because a reader of an OLDER pcap from this bench
+// will see the old order and should know it was upstream and general. It is
+// recorded here because
 // a reader of a pcap should know it is upstream and general, and NOT read it
 // as a property of the droop lever; fixing it belongs in lexa-proto, in one
 // change that reorders the whole struct.
@@ -116,8 +127,9 @@ func (r *freqDroopReq) toModel() (*model.FreqDroop, error) {
 		}
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("%s is missing %v: all five children of sep 2.0.4's FreqDroopType are "+
-			"minOccurs=1, and this server will not complete the element with zeros — a zero dead band and "+
+		return nil, fmt.Errorf("%s is missing %v: all five children of FreqDroopType are [1] (IEEE Std "+
+			"2030.5-2018 p.242), and this server will not complete the element with zeros — a zero dead "+
+			"band and "+
 			"a zero gain are a real machine, not an absent setting, so a partial request would put a "+
 			"control on the wire commanding something the caller never asked for",
 			freqDroopElement, missing)
@@ -151,8 +163,8 @@ func (r *freqDroopReq) toModel() (*model.FreqDroop, error) {
 // and the pcap would then record it as though it had been asked for.
 func droopU32(field string, v int64) (uint32, error) {
 	if v < 0 || v > 4294967295 {
-		return 0, fmt.Errorf("%s.%s %d is outside UInt32's wire domain [0,4294967295] (sep 2.0.4 "+
-			"FreqDroopType; the unit is thousandths of Hz)", freqDroopElement, field, v)
+		return 0, fmt.Errorf("%s.%s %d is outside UInt32's wire domain [0,4294967295] (IEEE Std "+
+			"2030.5-2018 p.242, FreqDroopType; the unit is thousandths of Hz)", freqDroopElement, field, v)
 	}
 	return uint32(v), nil
 }
@@ -160,8 +172,8 @@ func droopU32(field string, v int64) (uint32, error) {
 // droopU16 is droopU32 for the three UInt16 children.
 func droopU16(field string, v int64) (uint16, error) {
 	if v < 0 || v > 65535 {
-		return 0, fmt.Errorf("%s.%s %d is outside UInt16's wire domain [0,65535] (sep 2.0.4 "+
-			"FreqDroopType)", freqDroopElement, field, v)
+		return 0, fmt.Errorf("%s.%s %d is outside UInt16's wire domain [0,65535] (IEEE Std 2030.5-2018 "+
+			"p.242, FreqDroopType)", freqDroopElement, field, v)
 	}
 	return uint16(v), nil
 }

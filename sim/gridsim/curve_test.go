@@ -46,17 +46,20 @@ func rawGET(t *testing.T, s *Server, path string) string {
 // A curve POST must make the served /derp/0/derc carry an ExtendedDERControl
 // whose DERControlBase links the curve (opModVoltVar → the curve href), and
 // must upsert that curve into the served /derp/0/dc with the correct
-// Table-19 CurveType. This is the whole point of the endpoint: the hub
+// DERCurveType code (IEEE Std 2030.5-2018 p.254 — this comment said "Table-19"
+// until IW15-027, naming a table of the pre-publication draft). This is the
+// whole point of the endpoint: the hub
 // discovers the bound control on its normal walk and resolves the curve link.
 func TestAdminCurve_BindsVoltVarIntoServedControl(t *testing.T) {
 	s := NewServer("")
 	h := s.AdminHandler()
 
-	// y_ref_type 3 (%statVarAvail), not the 4 this body used to send: sep 2.0.4
-	// makes 4 "%setEffectiveV", a VOLTAGE reference on the VAr axis of a
-	// volt-var curve, and opModVoltVar's own documentation restricts the element
-	// to {%setMaxW, %setMaxVar, %statVarAvail}. x_ref_type is gone from the API
-	// entirely — the schema declares no such element; see TestAdminCurve_XRefTypeIsRejected.
+	// y_ref_type 3 (%statVarAvail), not the 4 this body used to send: IEEE Std
+	// 2030.5-2018 p.256 makes DERUnitRefType 4 "%setEffectiveV", a VOLTAGE
+	// reference on the VAr axis of a volt-var curve, and opModVoltVar's own
+	// prose (p.250) restricts the element to {%setMaxW, %setMaxVar,
+	// %statVarAvail}. x_ref_type is gone from the API entirely — NO revision
+	// declares such an element; see TestAdminCurve_XRefTypeIsRejected.
 	body := `{
 		"program": 0,
 		"mode": "volt_var",
@@ -172,8 +175,12 @@ func TestAdminCurve_BindsVoltVarIntoServedControl(t *testing.T) {
 // TestAdminCurve_XRefTypeIsRejected: the removed field is refused loudly, not
 // dropped quietly.
 //
-// sep 2.0.4 declares NO xRefType element on DERCurve, so this server cannot
-// serve one and used to serve one anyway. Silently ignoring a request that
+// NO revision of IEEE 2030.5 declares an xRefType element on DERCurve — not
+// 2018 (p.252-253), not 2023 (p.265-266), and not the vendored draft — so this
+// server cannot serve one and used to serve one anyway. It is the ONE of the
+// four elements refused in 2026-08-15's phantom sweep that survived IW15-027's
+// anchor correction; the other three are real and are served again (see
+// TestAdminCurve_VRefFamilyIsServedOnVoltVar). Silently ignoring a request that
 // still sets it would leave the caller believing the bench had configured
 // something, which on a conformance bench is the same class of defect as
 // serving the element in the first place.
@@ -227,26 +234,13 @@ func TestAdminCurve_VRefFamilyIsServedOnVoltVar(t *testing.T) {
 			t.Errorf("the served curve does not carry %s:\n%s", want, raw)
 		}
 	}
-	// THE SEQUENCE, 2018 p.252-253 (case-insensitively alphabetical over the
-	// standard's attribute names). Order is load-bearing: DERCurve is an
-	// xs:sequence, so a validating peer rejects a document whose elements are
-	// all legal and out of order — the exact defect this wire shape exists to
-	// prevent, and one no Go-side round-trip can see.
-	wantOrder := []string{
-		"<autonomousVRefEnable>", "<autonomousVRefTimeConstant>", "<creationTime>",
-		"<CurveData>", "<curveType>", "<vRef>", "<xMultiplier>", "<yMultiplier>", "<yRefType>",
-	}
-	at := -1
-	for _, el := range wantOrder {
-		i := strings.Index(raw, el)
-		if i < 0 {
-			t.Fatalf("the served curve is missing %s entirely:\n%s", el, raw)
-		}
-		if i < at {
-			t.Errorf("%s is out of the 2018 sequence (p.252-253) in the served document:\n%s", el, raw)
-		}
-		at = i
-	}
+	// THE SEQUENCE, through the package's ONE shared checker rather than a
+	// list written here. Order is load-bearing — DERCurve is an xs:sequence, so
+	// a validating peer rejects a document whose elements are all legal and out
+	// of order — and a second copy of the sequence is how this package came to
+	// hold two assertions that disagreed about whether vRef was legal at all
+	// (see curvexml_test.go's file doc). One table, one checker, both files.
+	assertCurveDocument(t, raw)
 	// The STATIC fixture — the one a DELETE restores — carries no vRef, and that
 	// is now a statement about the VALUE rather than about the element. It used
 	// to serve <vRef>240</vRef>: a volts reading in a PerCent element (2018
@@ -353,7 +347,7 @@ func TestAdminCurve_VRefFamilyDomainsAreTheStandardsOwn(t *testing.T) {
 }
 
 // The four modes must each bind the matching DERControlBase link field with
-// the Table-19 curve type the hub expects.
+// the IEEE 2030.5-2018 curve type (p.254) the hub expects.
 func TestAdminCurve_ModeToLinkAndType(t *testing.T) {
 	cases := []struct {
 		mode      string
