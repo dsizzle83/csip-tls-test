@@ -643,10 +643,32 @@ func inverterControlRows() []inverterControlRow {
 	// and are NOT in the slice below: their apparatus is a list of curves, which
 	// controlMode has no field for. See registerInverterControls.
 
+	// noRampRate is BASIC-007's gap, and it is the LAST decided-FAIL authoring
+	// gap in this family — BASIC-004/005's was closed on 2026-08-15.
+	//
+	// Its reason is CORRECTED here rather than merely inherited. It used to stop
+	// at "gridsim's POST /admin/default has no gradient fields", which is true
+	// and is the shallower of two blockers: the shared model has no such element
+	// EITHER. `grep -rn Grad vendor/lexa-proto/csipmodel/` returns nothing, so
+	// there is no setGradW to serve, no field on DefaultDERControl to put one
+	// in, and no way for gridsim to grow a lever for an element the marshaller
+	// cannot express. Closing this row is a TWO-REPO wave (lexa-proto gains the
+	// elements, gridsim gains the lever, the row gains a southbound arm), which
+	// is a materially different piece of work from the one the old sentence
+	// implied, and a reader planning it deserves to know that before starting.
+	//
+	// Everything else the row needs is already here: the catalog carries Figure
+	// 7's own Test Values (setGradW 9000 against a default of 10000,
+	// setSoftGradW 400 against 200) and states the control type as Default-Only,
+	// which is the on-machine anchor for the "cannot be scheduled" half.
 	const noRampRate = "IEEE 2030.5 places the ramp rates setGradW and setSoftGradW ONLY in " +
-		"DefaultDERControl — CSIP §5.2.4 is explicit that they cannot be scheduled — and gridsim's " +
-		"POST /admin/default carries the same DERControlBase field set as its control API, which has no " +
-		"gradient fields. The mode therefore cannot be placed on the wire from this bench"
+		"DefaultDERControl — this catalog's own row states the control type as Default-Only — and this " +
+		"bench cannot serve either element, at two levels. The SHARED MODEL declares neither: " +
+		"lexa-proto/csipmodel carries no gradient field on DefaultDERControl or DERControlBase at all " +
+		"(the nearest element is rampTms, which is a mode-transition time and a different quantity), so " +
+		"there is nothing for a server to marshal. And gridsim's POST /admin/default carries the same " +
+		"DERControlBase field set as its control API, so there is no lever either. Closing this needs " +
+		"the elements in lexa-proto FIRST and then a bench lever — a two-repo change, not a gridsim one"
 
 	return []inverterControlRow{
 		// BASIC-004 (order 50) and BASIC-005 (order 51) USED TO SIT HERE as
