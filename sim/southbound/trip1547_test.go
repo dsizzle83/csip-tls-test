@@ -16,6 +16,7 @@ package sim
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"testing"
 
@@ -319,16 +320,131 @@ func TestTripSnapshotOmittedWithoutTripModels(t *testing.T) {
 	}
 }
 
-// TestTripBlocksFitOneModbusRead records the sizing decision advTripNPt = 4 was
-// made for: every trip block stays inside the 125-register single-read cap, so
-// a gateway reads each of these models in one transaction rather than through
-// the chunked path model 701 exists to exercise.
-func TestTripBlocksFitOneModbusRead(t *testing.T) {
+// TestTripBlocksSpanTheChunkedRead replaces TestTripBlocksFitOneModbusRead,
+// and the replacement IS the finding rather than an accommodation of it.
+//
+// The old test asserted that every trip block stayed inside the 125-register
+// Modbus single-read cap, which was the stated rationale for advTripNPt = 4.
+// That rationale is superseded: CSIP CTP v1.3's BASIC-004 Figure 4 prescribes a
+// SEVEN-point opModLVRTMustTrip curve and Encode707Set refuses more points than
+// the device's declared NPt, so at four this bench could not hold the
+// certification procedure's own curve. NPt is 8 now and both families are past
+// the cap.
+//
+// So the assertion INVERTS rather than disappearing. The sizes are pinned
+// exactly — a silent change to either would move every register after these
+// models — and the blocks are then read back through the real chunking reader,
+// which is what makes "the chunked path handles it" a measurement instead of a
+// claim in a comment. Writes are checked too, against FC16's own ceiling, since
+// Reader.WriteModel does not chunk and an adopt writes a whole staging set.
+func TestTripBlocksSpanTheChunkedRead(t *testing.T) {
+	// The arithmetic from trip1547.go's advTripNPt comment, stated
+	// independently of the size helpers so the two can disagree.
+	//
+	//	707/708  7 (L707Hdr) + 2 × (1 + 3×(1 + 8×3)) = 7 + 2×76  = 159
+	//	709/710  7 (L709Hdr) + 2 × (1 + 3×(1 + 8×4)) = 7 + 2×100 = 207
+	wantLen := map[uint16]int{
+		sunspec.ModelDERTripLV: 159, sunspec.ModelDERTripHV: 159,
+		sunspec.ModelDERTripLF: 207, sunspec.ModelDERTripHF: 207,
+	}
+	// The two Modbus ceilings, which are different numbers and are easy to
+	// conflate: FC3 reads at most 125 registers (PI-MBUS-300 0x7D) and FC16
+	// writes at most 123.
+	const maxRead, maxWrite = 125, 123
+
 	ss := newAdvSolarModels(t, 6000, true)
+	if len(ss.adv.Trips) != len(wantLen) {
+		t.Fatalf("the sim serves %d trip models, want %d", len(ss.adv.Trips), len(wantLen))
+	}
 	for _, tb := range ss.adv.Trips {
-		if tb.dataLen > 125 {
-			t.Errorf("model %d data block is %d registers, past the 125-register Modbus single-read cap",
-				tb.id, tb.dataLen)
+		want, ok := wantLen[tb.id]
+		if !ok {
+			t.Errorf("model %d is served but this test states no expected block length for it", tb.id)
+			continue
+		}
+		if tb.dataLen != want {
+			t.Errorf("model %d data block is %d registers, want %d — every register after this model "+
+				"moves when this number does, so a change here is a change to the whole image",
+				tb.id, tb.dataLen, want)
+		}
+		if tb.dataLen <= maxRead {
+			t.Errorf("model %d is %d registers, inside the %d-register single-read cap: this test is "+
+				"asserting the CHUNKED path and would no longer exercise it",
+				tb.id, tb.dataLen, maxRead)
+		}
+		// One staging set is what derbase's adoptCurve writes in a single
+		// unchunked WriteHolding, so it — not the whole block — is what has to
+		// stay under the write ceiling.
+		if tb.setSize > maxWrite {
+			t.Errorf("model %d's curve-set is %d registers, past FC16's %d-register write ceiling: "+
+				"Reader.WriteModel does not chunk, so every adopt of this model would be refused by "+
+				"the transport", tb.id, tb.setSize, maxWrite)
 		}
 	}
+
+	// And the blocks actually read back, through the same chunking reader a
+	// gateway uses, over a transport that REFUSES an over-cap read the way a
+	// real one does. A size assertion alone would pass on a sim serving 159
+	// registers no client can read, and so would a read over the permissive
+	// test transport the other cases here use — which answers any quantity and
+	// would therefore prove nothing about chunking at all.
+	reader, err := sunspec.NewReader(&cappedReadTransport{r: ss.Regs, cap: maxRead})
+	if err != nil {
+		t.Fatalf("open a SunSpec reader over a cap-enforcing transport: %v", err)
+	}
+	for _, tb := range ss.adv.Trips {
+		regs, err := reader.ReadModel(tb.id)
+		if err != nil {
+			t.Fatalf("model %d did not read back through the chunking reader: %v", tb.id, err)
+		}
+		if len(regs) != tb.dataLen {
+			t.Errorf("model %d read back %d registers, want its whole %d-register block — a short read "+
+				"here is the chunked path dropping a chunk", tb.id, len(regs), tb.dataLen)
+		}
+		var perr error
+		if tb.volt {
+			_, perr = sunspec.Parse707Set(regs, 0)
+		} else {
+			_, perr = sunspec.Parse709Set(regs, 0)
+		}
+		if perr != nil {
+			t.Errorf("model %d's chunk-read image does not parse: %v", tb.id, perr)
+		}
+	}
+}
+
+// cappedReadTransport is a register-map transport that REFUSES a read wider
+// than the Modbus ceiling, exactly as a real one does.
+//
+// The permissive regMapTransport every other case here uses answers any
+// quantity, so a "read the whole block" assertion taken over it proves nothing
+// about chunking: it would pass identically on a reader that had never split
+// the request. This one fails the read instead, which is what makes
+// TestTripBlocksSpanTheChunkedRead a statement about Reader.readChunked rather
+// than about the fixture.
+type cappedReadTransport struct {
+	r   *RegisterMap
+	cap uint16
+}
+
+func (t *cappedReadTransport) Open() error           { return nil }
+func (t *cappedReadTransport) Close() error          { return nil }
+func (t *cappedReadTransport) SetUnitID(uint8) error { return nil }
+
+func (t *cappedReadTransport) ReadHolding(addr, qty uint16) ([]uint16, error) {
+	if qty > t.cap {
+		return nil, fmt.Errorf("modbus: read of %d registers at %d exceeds the %d-register ceiling",
+			qty, addr, t.cap)
+	}
+	out := make([]uint16, qty)
+	for i := uint16(0); i < qty; i++ {
+		out[i] = t.r.Get(addr + i)
+	}
+	return out, nil
+}
+
+func (t *cappedReadTransport) WriteHolding(uint16, []uint16) error { return nil }
+
+func (t *cappedReadTransport) ReadInput(addr, qty uint16) ([]uint16, error) {
+	return t.ReadHolding(addr, qty)
 }
