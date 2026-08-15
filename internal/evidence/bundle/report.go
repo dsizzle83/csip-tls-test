@@ -140,8 +140,16 @@ func (b *Bundle) Report() string {
 	fmt.Fprintf(&sb, "2. The evidence verifier re-reads `%s` and confirms that every cited frame\n", b.Files.Capture)
 	fmt.Fprintf(&sb, "   exists and carries the exact bytes each assertion claims. It reads only this\n")
 	fmt.Fprintf(&sb, "   directory and needs nothing from the bench that produced it.\n\n")
+	if len(b.Metrics) > 0 {
+		fmt.Fprintf(&sb, "3. The DUT metrics scrapes below are re-derived from the raw exposition bodies in\n")
+		fmt.Fprintf(&sb, "   `%s/`: every value, delta and outcome must follow from the bytes shipped with\n", MetricsDir)
+		fmt.Fprintf(&sb, "   them. That proves the readings were recorded faithfully — not that the device\n")
+		fmt.Fprintf(&sb, "   was telling the truth about itself.\n\n")
+	}
 	fmt.Fprintf(&sb, "Assertions marked *(no digest)* below carry no re-checkable citation: they are\n")
 	fmt.Fprintf(&sb, "narrative, not proof.\n\n")
+
+	b.metricsReport(&sb)
 
 	fmt.Fprintf(&sb, "## Test cases\n\n")
 	for _, c := range b.Cases {

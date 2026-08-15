@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/evidence/capture"
+	"csip-tls-test/internal/evidence/metricscrape"
 )
 
 // Builder accumulates a run's results and writes the bundle directory.
@@ -23,6 +24,7 @@ type Builder struct {
 	run     RunMeta
 	capture capture.Summary
 	cases   []TestCaseResult
+	metrics []metricscrape.Record
 
 	capturePath   string
 	keylogPath    string
@@ -145,6 +147,16 @@ func (b *Builder) Write(dir string) (*Bundle, error) {
 		}
 		out.Files.Extra = append(out.Files.Extra, rel)
 	}
+	// The scrape channel's raw exposition bodies, before bundle.json, because
+	// writing them is what fills in the BodyFile each record points at. They
+	// are NOT added to Files.Extra: the records already name their own
+	// artefacts, and a second listing that could disagree with the first is a
+	// second thing to keep true.
+	metrics, err := writeMetrics(dir, b.metrics)
+	if err != nil {
+		return nil, err
+	}
+	out.Metrics = metrics
 
 	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {

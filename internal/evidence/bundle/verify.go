@@ -43,6 +43,13 @@ type VerifyReport struct {
 	Packets      int              `json:"packets"`
 	Checked      int              `json:"checked"`
 	Unverifiable int              `json:"unverifiable"`
+	// MetricsWindows and MetricsSeries count the DUT metrics scrape channel's
+	// re-checks: how many measurement windows the bundle carries, and how many
+	// individual counter readings were re-derived from the exposition bodies
+	// shipped with them (metrics.go). Zero for every bundle that took no
+	// scrapes, which is every bundle written before the channel existed.
+	MetricsWindows int `json:"metrics_windows,omitempty"`
+	MetricsSeries  int `json:"metrics_series,omitempty"`
 }
 
 // Verify re-checks a bundle directory from nothing but its own contents.
@@ -84,6 +91,13 @@ func Verify(dir string) (*VerifyReport, error) {
 	if err := verifyManifest(dir, rep); err != nil {
 		return rep, err
 	}
+
+	// The metrics scrape channel is re-derived BEFORE the capture is opened,
+	// and deliberately not behind the "no capture, nothing to check" exit
+	// below: a scrape record's evidence is the exposition bodies in this
+	// directory, and it is re-checkable whether or not there is a pcap beside
+	// it.
+	verifyMetrics(dir, b, rep)
 
 	if b.Files.Capture == "" {
 		rep.problem("bundle declares no capture file; no assertion can be re-checked against the wire")
@@ -406,6 +420,10 @@ func (r *VerifyReport) String() string {
 		}
 	}
 	fmt.Fprintf(&sb, "  Assertions: %d re-checked against the capture, %d bad\n", r.Checked, badAssert)
+	if r.MetricsWindows > 0 {
+		fmt.Fprintf(&sb, "  Metrics:    %d reading(s) re-derived from the exposition bodies of %d "+
+			"scrape window(s)\n", r.MetricsSeries, r.MetricsWindows)
+	}
 	if r.Unverifiable > 0 {
 		fmt.Fprintf(&sb, "  Narrative:  %d assertion(s) carry no digest and were not re-checked\n", r.Unverifiable)
 	}
