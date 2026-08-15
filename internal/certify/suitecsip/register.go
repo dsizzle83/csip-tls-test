@@ -540,8 +540,12 @@ func inverterControlRows() []inverterControlRow {
 		{"BASIC-015", 61, curveModeRefused("opModWattPF", "watt_pf",
 			[]CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}}, derUnitRefStatVarAvail,
 			sunspec.ModelDERWattVar,
-			"the SunSpec model 712 (DER Watt-Var) curve bank — the bank this product used to write "+
-				"opModWattPF's content into, and therefore the one a regression would land in",
+			// Kept short: it is read inside sentences like "nothing of X moved
+			// in the DER's own registers". Why this bank is the right one to
+			// watch — it is where the product used to write opModWattPF's
+			// content, and so where a regression would land — is refusalWattPF's
+			// job, and it is printed alongside this on every verdict.
+			"the SunSpec model 712 (DER Watt-Var) curve bank",
 			refusalWattPF), "an advanced (curve-based) inverter control"},
 
 		// TODO(curve plan #32): there is NO opModWattVar row here, and its

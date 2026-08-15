@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/invariant"
 	"csip-tls-test/sim/gridsim"
 	sim "csip-tls-test/sim/southbound"
 	"lexa-proto/derbase"
@@ -124,6 +125,17 @@ func (f *curveFixture) setHeaderReg(t *testing.T, model uint16, field string, va
 		t.Fatalf("model %d header has no %s", model, field)
 	}
 	f.ss.Regs.Set(blk.BaseAddr+uint16(off), val)
+}
+
+// rcCurveView reads one curve model back through the same referee path the
+// oracle uses, so a test can assert on what the fingerprint will see.
+func (f *curveFixture) rcCurveView(t *testing.T, model uint16) invariant.CurveView {
+	t.Helper()
+	uv, err := oracleUnitView(context.Background(), f.rc, oracleSimName)
+	if err != nil {
+		t.Fatalf("read the DER through the referee: %v", err)
+	}
+	return uv.Curve(oracleSimName, model)
 }
 
 // curveHeaderForTest mirrors invariant's own header table so a test can address
@@ -564,11 +576,11 @@ func TestOracleRefusal_UnreachableDERIsUnavailableNotAPass(t *testing.T) {
 
 // TestRefusalOutcome_UnavailableIsAFailNotASkip mirrors the curve/scalar rule.
 func TestRefusalOutcome_UnavailableIsAFailNotASkip(t *testing.T) {
-	f := refusalOutcome(curveObs(map[string]string{oracleUnavailableParam: "the sidecar is down"}))
+	f := refusalOutcome(basic014Binding(), curveObs(map[string]string{oracleUnavailableParam: "the sidecar is down"}))
 	if f.Verdict != certify.Fail {
 		t.Fatalf("an unreachable refusal oracle = %s (%s), want FAIL", f.Verdict, f.Observed)
 	}
-	if e := refusalOutcome(curveObs(map[string]string{})); e.Verdict != certify.Fail {
+	if e := refusalOutcome(basic014Binding(), curveObs(map[string]string{})); e.Verdict != certify.Fail {
 		t.Fatalf("an empty refusal record = %s (%s), want FAIL", e.Verdict, e.Observed)
 	}
 }
@@ -863,7 +875,7 @@ func TestBasic014Row_RefusalIsMeasuredEndToEnd(t *testing.T) {
 		t.Fatalf("BASIC-014's declared verdict on a DUT that wrote nothing = %q, want \"\": %s",
 			got, s.Notes(obs))
 	}
-	if f := refusalOutcome(obs); f.Verdict != certify.Pass {
+	if f := refusalOutcome(row.mode.Refusal, obs); f.Verdict != certify.Pass {
 		t.Fatalf("the refusal outcome on an untouched axis = %s: %s", f.Verdict, f.Observed)
 	}
 	t.Logf("BASIC-014 notes: %s", s.Notes(obs))
@@ -955,7 +967,7 @@ func TestBasic015Row_IsARefusalRowAndItsCurveBankStaysUntouched(t *testing.T) {
 		t.Fatalf("BASIC-015's declared verdict on a DUT that adopted nothing into 712 = %q, want \"\": %s",
 			got, s.Notes(obs))
 	}
-	if f := refusalOutcome(obs); f.Verdict != certify.Pass {
+	if f := refusalOutcome(row.mode.Refusal, obs); f.Verdict != certify.Pass {
 		t.Fatalf("the refusal outcome on an untouched 712 = %s: %s", f.Verdict, f.Observed)
 	}
 	t.Logf("BASIC-015 notes: %s", s.Notes(obs))
@@ -995,6 +1007,183 @@ func TestBasic015Row_IsRedWhenTheWattPFCurveLandsIn712(t *testing.T) {
 	if got := s.Verdict(obs); got != certify.Fail {
 		t.Fatalf("BASIC-015's declared verdict on a DUT that adopted the refused watt-PF curve into "+
 			"model 712 = %q, want FAIL: %s", got, s.Notes(obs))
+	}
+}
+
+// TestBasic015Row_IsRedWhenTheBaselineAlreadyHeldTheRefusedCurve is the
+// CONTAMINATED-BASELINE shape, and it is the one a refusal row fails at
+// silently rather than loudly.
+//
+// The DER is already holding the row's own watt-PF content in model 712 when
+// the row starts — the state a regression from a PREVIOUS run leaves behind, or
+// a leak from a preceding row. Nothing then moves during the window, because
+// there is nothing left to move, and a refusal row that only compares
+// fingerprints reads that as the cleanest possible refusal. The worse the
+// contamination, the more reliably the row passed.
+//
+// That is exactly backwards, and it is what makes this different from
+// TestBasic015Row_IsRedWhenTheWattPFCurveLandsIn712: there the write lands
+// DURING the window and the fingerprint moves, so the row already caught it.
+// Here the fingerprint is stable and correct, and the window is simply
+// uninformative — which is not the same thing as an observed absence.
+func TestBasic015Row_IsRedWhenTheBaselineAlreadyHeldTheRefusedCurve(t *testing.T) {
+	f := newCurveFixture(t)
+	d := f.withGridSim(t)
+	row := rowByID(t, "BASIC-015")
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-015")
+
+	// The contamination, landed BEFORE the row runs, through the real derbase
+	// writer — the same call TestBasic015Row_IsRedWhenTheWattPFCurveLandsIn712
+	// makes, only earlier, which is the whole distinction being drawn.
+	if err := f.base.WriteWattVar(sunspec.WattVarCurve{
+		DeptRef: 2, Pri: 1,
+		Points:  []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
+	}, "basic015-contaminated-baseline-test"); err != nil {
+		t.Fatalf("derbase WriteWattVar (seeding the contaminated baseline): %v", err)
+	}
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 Setup: %v", err)
+	}
+	if got := certify.Verdict(params[oraclePreVerdictParam]); got != certify.Pass {
+		t.Fatalf("Setup recorded pre-verdict %q for a DER that ALREADY holds the row's curve, want PASS "+
+			"(oracleCurve's own answer to \"does it hold this content?\") — without it refusalOutcome has "+
+			"nothing to detect the contamination with", got)
+	}
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 PostWait: %v", err)
+	}
+	obs := &Observation{Params: params}
+
+	// The fingerprint really is unchanged: this is NOT the landed-write case
+	// wearing a different hat, and the row must fail for the other reason.
+	if params[oracleVerdictParam] != string(certify.Pass) {
+		t.Fatalf("the fingerprint MOVED during the window (%s: %s) — this test is about a window in which "+
+			"nothing moves because the refused content was already there",
+			params[oracleVerdictParam], params[oracleObservedParam])
+	}
+	if got := s.Verdict(obs); got != certify.Fail {
+		t.Fatalf("BASIC-015's declared verdict against a CONTAMINATED baseline = %q, want FAIL. Nothing "+
+			"moved, and nothing could have: the DER was already executing the control this row is "+
+			"supposed to prove it refused. Notes: %s", got, s.Notes(obs))
+	}
+	got := refusalOutcome(row.mode.Refusal, obs)
+	for _, want := range []string{"CONTAMINATED", "ALREADY held", "REMEDY"} {
+		if !strings.Contains(got.Observed, want) {
+			t.Errorf("the FAIL does not say %q — a contaminated bench must be told how to clean itself, "+
+				"or the next run reproduces it: %s", want, got.Observed)
+		}
+	}
+}
+
+// TestBasic015Row_IsRedWhenTheRefusedCurveOnlyReachesStaging is the
+// STAGE-AND-STOP shape: the gateway writes the refused watt-PF breakpoints into
+// the bank's writable staging slot and never triggers the adopt handshake.
+//
+// Nothing about the LIVE curve changes, and the handshake registers do not move
+// either — they move when the gateway ASKS the device to adopt, so they catch
+// stage-then-adopt and are blind to this. A fingerprint over index 0 alone
+// reports an untouched device.
+//
+// It is still a write that landed on an axis the DUT told the head end it could
+// not perform, which is precisely what this row claims did not happen. Note the
+// deliberate asymmetry with the EXECUTION curve oracle, which reads index 0 and
+// only index 0: content in staging is a curve the device was offered, not one
+// it adopted, so it must never count as execution — and must always count as a
+// write.
+func TestBasic015Row_IsRedWhenTheRefusedCurveOnlyReachesStaging(t *testing.T) {
+	f := newCurveFixture(t)
+	d := f.withGridSim(t)
+	row := rowByID(t, "BASIC-015")
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-015")
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 Setup: %v", err)
+	}
+	baseline := params[refusalBaselineParam]
+	if baseline == "" {
+		t.Fatal("no baseline recorded")
+	}
+
+	// Stage the refused curve at index 1 WITHOUT touching the handshake: the
+	// raw register write a gateway's curve writer makes before it would ask the
+	// device to adopt.
+	blk, err := sunspec.FindModel(f.base.Reader.Blocks(), sunspec.ModelDERWattVar)
+	if err != nil {
+		t.Fatalf("find M712: %v", err)
+	}
+	regs, err := f.base.Reader.ReadModel(sunspec.ModelDERWattVar)
+	if err != nil {
+		t.Fatalf("read M712: %v", err)
+	}
+	staged := append([]uint16(nil), regs...)
+	if _, _, err := sunspec.Encode712Curve(staged, 1, sunspec.WattVarCurve{
+		DeptRef: 2, Pri: 1,
+		Points:  []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
+	}); err != nil {
+		t.Fatalf("encode the staged watt-PF curve: %v", err)
+	}
+	for i, v := range staged {
+		if v != regs[i] {
+			f.ss.Regs.Set(blk.BaseAddr+uint16(i), v)
+		}
+	}
+
+	// The handshake really did not move — otherwise this test is just the
+	// landed-write case again and proves nothing about staging.
+	after := f.rcCurveView(t, sunspec.ModelDERWattVar)
+	if after.AdoptReq != 0 || after.Adopted {
+		t.Fatalf("the staging write moved the adopt handshake (req=%d rslt=%d) — this test is about a "+
+			"write the handshake registers cannot see", after.AdoptReq, after.AdoptResult)
+	}
+
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 PostWait: %v", err)
+	}
+	obs := &Observation{Params: params}
+	if got := s.Verdict(obs); got != certify.Fail {
+		t.Fatalf("BASIC-015's declared verdict on a refused curve written into the STAGING slot = %q, "+
+			"want FAIL: a staged write is still a write to an axis the DUT said it could not perform. "+
+			"Notes: %s", got, s.Notes(obs))
+	}
+}
+
+// TestRefusalOutcome_ScalarShapeHasNoContaminationGuardAndSaysSo pins the
+// BOUND of the guard above, so the gap is a recorded decision rather than a
+// second silent hole.
+//
+// A scalar refusal row cannot compute "the baseline already held the commanded
+// value": refusalBinding.Commanded is prose, not a value. The obvious proxy —
+// "the axis is already ENABLED" — is wrong here specifically, and provably so:
+// BASIC-013 runs immediately before BASIC-014, commands opModFixedW, and
+// legitimately leaves WSet/WSetPct enabled on the very points BASIC-014
+// fingerprints (oracleFixedW reads the same two). A guard built on that proxy
+// would fail BASIC-014 in every campaign that runs the rows in order.
+func TestRefusalOutcome_ScalarShapeHasNoContaminationGuardAndSaysSo(t *testing.T) {
+	b := basic014Binding()
+	if b.Curve != nil {
+		t.Fatal("BASIC-014 is a scalar refusal; this test is about the shape that cannot compute contamination")
+	}
+	// A satisfied scalar refusal passes even with a pre-verdict recorded — the
+	// guard must not fire on a row whose binding cannot support it.
+	obs := curveObs(map[string]string{
+		oracleVerdictParam:    string(certify.Pass),
+		oracleObservedParam:   "nothing of the setpoint axis moved",
+		oraclePreVerdictParam: string(certify.Pass), // would trip the curve guard
+	})
+	if f := refusalOutcome(b, obs); f.Verdict != certify.Pass {
+		t.Fatalf("a scalar refusal = %s (%s), want PASS: the curve guard must key on the BINDING, not on "+
+			"whether a param happens to be present", f.Verdict, f.Observed)
+	}
+	// And the curve shape with the identical params does trip it, so the
+	// difference above is the binding and nothing else.
+	cb := &refusalBinding{Axis: "M712", Curve: &curveBinding{Mode: "watt_pf", Model: sunspec.ModelDERWattVar}}
+	if f := refusalOutcome(cb, obs); f.Verdict != certify.Fail {
+		t.Fatalf("a curve refusal with a PASSing pre-verdict = %s (%s), want FAIL", f.Verdict, f.Observed)
 	}
 }
 

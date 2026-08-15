@@ -109,6 +109,17 @@ type CurveView struct {
 	Source string
 	Axis   CurveAxis
 
+	// Index is which curve of the bank this reading is. 0 is the LIVE curve —
+	// the one the device is actually running — and 1..NCrv-1 are the writable
+	// STAGING slots a gateway writes before it triggers the adopt handshake.
+	// The distinction is load-bearing in both directions: content sitting in
+	// staging is a curve the device was OFFERED and not one it adopted, so
+	// grading a staged curve as an executed one would accept exactly the
+	// half-completed write the handshake exists to distinguish — and yet a
+	// staged write is still a WRITE, which is what a refusal row has to be able
+	// to see (see the refusal fingerprint in suitecsip).
+	Index int
+
 	// Present is true when the device served the model and it decoded.
 	Present bool
 	// Err records why a served model did not decode. Present is false then.
@@ -167,11 +178,15 @@ func (c CurveView) Pointless() bool { return c.Axis.Pointless }
 // Describe renders what the device holds, for a finding that must say what it
 // read rather than only what it wanted.
 func (c CurveView) Describe() string {
+	name := c.Axis.Name
+	if c.Index > 0 {
+		name = fmt.Sprintf("%s staging curve %d", c.Axis.Name, c.Index)
+	}
 	if !c.Present {
 		if c.Err != "" {
-			return fmt.Sprintf("%s did not decode: %s", c.Axis.Name, c.Err)
+			return fmt.Sprintf("%s did not decode: %s", name, c.Err)
 		}
-		return fmt.Sprintf("%s is not served by this device", c.Axis.Name)
+		return fmt.Sprintf("%s is not served by this device", name)
 	}
 	parts := []string{
 		fmt.Sprintf("Ena=%d (%s)", c.EnaRaw, enabledWord(c.Enabled)),
@@ -195,7 +210,7 @@ func (c CurveView) Describe() string {
 		parts = append(parts, fmt.Sprintf("live curve %s/%s points: %s", c.Axis.XName, c.Axis.YName,
 			strings.Join(pts, " ")))
 	}
-	return c.Axis.Name + " — " + strings.Join(parts, ", ")
+	return name + " — " + strings.Join(parts, ", ")
 }
 
 // DeptRefName spells a DeptRef code out for a finding, per model, so a reader
@@ -261,6 +276,12 @@ func (u UnitView) Curve(source string, model uint16) CurveView {
 	return DecodeCurve(fmt.Sprintf("%s unit %d", source, u.Unit), model, u.Regs[model])
 }
 
+// CurveAt is Curve for one specific curve of the bank — 0 for the live curve,
+// 1..NCrv-1 for the writable staging slots.
+func (u UnitView) CurveAt(source string, model uint16, idx int) CurveView {
+	return DecodeCurveAt(fmt.Sprintf("%s unit %d", source, u.Unit), model, u.Regs[model], idx)
+}
+
 // DecodeCurve reads a curve model's header and its LIVE (index 0) curve out of
 // that model's data registers.
 //
@@ -269,13 +290,24 @@ func (u UnitView) Curve(source string, model uint16) CurveView {
 // as absent, never as an empty curve, because "adopted nothing" and "cannot
 // carry this function at all" are different answers to a conformance question.
 func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
+	return DecodeCurveAt(source, model, regs, 0)
+}
+
+// DecodeCurveAt is DecodeCurve for one specific curve of the bank. idx 0 is the
+// LIVE curve; 1..NCrv-1 are the writable staging slots.
+//
+// The header fields (Ena, the adopt handshake, NPt/NCrv) belong to the MODEL and
+// are the same whatever idx is; only ReadOnly, DeptRef and the points come from
+// the indexed curve. 711 carries controls rather than curves and has no point
+// table, so a non-zero idx there decodes the same parametric control as idx 0.
+func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveView {
 	axis, known := CurveAxisOf(model)
 	if !known {
 		return CurveView{Source: source, Axis: CurveAxis{Model: model,
 			Name: fmt.Sprintf("M%d", model), XName: "x", YName: "y"},
 			Err: fmt.Sprintf("model %d is not a curve model this referee decodes", model)}
 	}
-	v := CurveView{Source: source, Axis: axis}
+	v := CurveView{Source: source, Axis: axis, Index: idx}
 	if len(regs) == 0 {
 		return v
 	}
@@ -301,7 +333,7 @@ func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
 
 	switch model {
 	case sunspec.ModelDERVoltVar:
-		c, err := sunspec.Parse705Curve(regs, 0)
+		c, err := sunspec.Parse705Curve(regs, idx)
 		if err != nil {
 			v.Err = err.Error()
 			return v
@@ -312,7 +344,7 @@ func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
 			v.Points = append(v.Points, CurvePoint{X: p.V, Y: p.Var})
 		}
 	case sunspec.ModelDERVoltWatt:
-		c, err := sunspec.Parse706Curve(regs, 0)
+		c, err := sunspec.Parse706Curve(regs, idx)
 		if err != nil {
 			v.Err = err.Error()
 			return v
@@ -323,7 +355,7 @@ func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
 			v.Points = append(v.Points, CurvePoint{X: p.V, Y: p.W})
 		}
 	case sunspec.ModelDERWattVar:
-		c, err := sunspec.Parse712Curve(regs, 0)
+		c, err := sunspec.Parse712Curve(regs, idx)
 		if err != nil {
 			v.Err = err.Error()
 			return v
@@ -334,7 +366,7 @@ func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
 			v.Points = append(v.Points, CurvePoint{X: p.W, Y: p.Var})
 		}
 	case sunspec.ModelDERFreqDroop:
-		c, err := sunspec.Parse711Ctl(regs, 0)
+		c, err := sunspec.Parse711Ctl(regs, idx)
 		if err != nil {
 			v.Err = err.Error()
 			return v

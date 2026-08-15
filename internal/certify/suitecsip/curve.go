@@ -635,8 +635,38 @@ func (b *refusalBinding) fingerprint(uv invariant.UnitView) (string, bool) {
 		// cannot read cannot tell a refused axis from an unreadable one.
 		return "", false
 	}
-	return cv.Describe(), true
+	// The LIVE curve is not the whole bank, and a refusal row is the one caller
+	// for which that matters. An execution oracle reads index 0 alone on
+	// purpose — content in staging is a curve the device was OFFERED, not one it
+	// adopted, and grading it as executed would accept the half-completed write
+	// the adopt handshake exists to distinguish. But this row asserts that NO
+	// WRITE LANDED, and a gateway that stages a refused curve and never triggers
+	// the handshake has still written to an axis it told the head end it could
+	// not perform. Reading only index 0 would report that as an untouched
+	// device.
+	//
+	// The handshake registers alone do not cover it: they move when the gateway
+	// ASKS the device to adopt, so they catch stage-then-adopt and are blind to
+	// stage-and-stop.
+	parts := []string{cv.Describe()}
+	for i := 1; i < cv.NCrv && i <= maxStagingCurvesFingerprinted; i++ {
+		parts = append(parts, uv.CurveAt(oracleSimName, b.Curve.Model, i).Describe())
+	}
+	if cv.NCrv > maxStagingCurvesFingerprinted+1 {
+		parts = append(parts, fmt.Sprintf("(%d further staging curve(s) not fingerprinted)",
+			cv.NCrv-maxStagingCurvesFingerprinted-1))
+	}
+	return strings.Join(parts, " | "), true
 }
+
+// maxStagingCurvesFingerprinted bounds how much of a curve bank the refusal
+// fingerprint renders. A device declares its own NCrv and nothing stops it
+// declaring a large one; the fingerprint is a STRING that lands in a bundle, so
+// it needs a bound that does not depend on the device's honesty. Devices this
+// bench grades declare NCrv=2 (one live, one staging), so the practical cost of
+// the bound is nil — and when it does bite, the fingerprint says so rather than
+// silently truncating.
+const maxStagingCurvesFingerprinted = 4
 
 // describeAxisRegisters names what the fingerprint above covers, for the
 // criterion's How and for an unavailability message.
@@ -644,7 +674,8 @@ func (b *refusalBinding) describeAxisRegisters() string {
 	if b.Curve == nil {
 		return strings.Join(b.Points, ", ")
 	}
-	return curveModelLabel(b.Curve) + " (adopt handshake, function enable, DeptRef and live breakpoints)"
+	return curveModelLabel(b.Curve) + " (adopt handshake, function enable, DeptRef, and the breakpoints " +
+		"of BOTH the live curve and the writable staging curves)"
 }
 
 // refusalFingerprint renders the exact state of the axis's registers — raw
@@ -690,8 +721,27 @@ func enabledLabel(on bool) string {
 //
 // A Fail here means a write landed on an axis the DUT was supposed to refuse.
 // Everything else is Pass — with one exception the caller decides, not this
-// closure: a baseline that ALREADY held the commanded value makes the whole
+// closure: a baseline that ALREADY held the commanded content makes the whole
 // window uninformative, which refusalOutcome reports rather than passing.
+//
+// THAT EXCEPTION WAS A CLAIM THIS FILE MADE AND DID NOT KEEP until 2026-08-15.
+// refusalOutcome had no such guard, so a DUT that had landed the refused
+// content BEFORE the row's window — a regression left by an earlier run, or a
+// leak from a preceding row — fingerprinted as "nothing moved" and certified as
+// a clean refusal on every rerun. The failure mode is the nastier direction: the
+// worse the contamination, the more reliably the row passed.
+//
+// It is now kept for the CURVE shape, where "already holds this row's content"
+// is precisely computable — oracleCurve answers exactly that question about
+// exactly these breakpoints. It is NOT kept for the scalar shape, and that is a
+// bounded gap rather than an oversight: refusalBinding.Commanded is prose, not a
+// value, so there is nothing to compare a baseline against, and the obvious
+// proxy — "the axis is already ENABLED" — would fail BASIC-014 in every
+// campaign, because BASIC-013 runs immediately before it, commands opModFixedW,
+// and legitimately leaves WSet/WSetPct enabled on the very points BASIC-014
+// fingerprints (oracleFixedW reads the same two). Closing it needs a commanded
+// VALUE on the scalar binding, which is oracleBinding's shape and a separate
+// change.
 func oracleRefusal(b *refusalBinding, baseline string) func(ctx context.Context, rc *certify.RunCtx) Finding {
 	return func(ctx context.Context, rc *certify.RunCtx) Finding {
 		uv, err := oracleUnitView(ctx, rc, oracleSimName)
@@ -727,7 +777,13 @@ func oracleRefusal(b *refusalBinding, baseline string) func(ctx context.Context,
 
 // refusalOutcome collapses a refusal row's live-phase record into one decided
 // verdict, the way oracleOutcome and curveOutcome do for the execution rows.
-func refusalOutcome(o *Observation) Finding {
+//
+// It takes the BINDING as well as the observation, which curveOutcome does not
+// need to, because whether the baseline-contamination guard applies is a
+// property of the ROW (a curve refusal can compute it; a scalar one cannot —
+// see oracleRefusal) and not of whether some param happens to be present. An
+// absent param must not be the thing that decides whether a check runs.
+func refusalOutcome(b *refusalBinding, o *Observation) Finding {
 	if reason := o.Params[oracleUnavailableParam]; reason != "" {
 		return Finding{Verdict: certify.Fail, Observed: "the independent southbound oracle could not read the " +
 			"DER at all: " + reason + " — and an oracle that cannot read the DER cannot certify that a " +
@@ -745,13 +801,46 @@ func refusalOutcome(o *Observation) Finding {
 			Observed: orText(o.Params[oracleObservedParam], "the oracle recorded no observation with its "+
 				string(verdict))}
 	}
+	// Nothing MOVED. That is only evidence of a refusal if the thing this row
+	// refuses was not already there when the row started — see oracleRefusal's
+	// doc for why this guard exists and why it is curve-only.
+	if b != nil && b.Curve != nil {
+		post := o.Params[oracleObservedParam]
+		pre := orText(o.Params[oraclePreObservedParam], "no pre-publication reading was recorded")
+		switch certify.Verdict(o.Params[oraclePreVerdictParam]) {
+		case certify.Pass:
+			return Finding{Verdict: certify.Fail, Observed: "THE BASELINE WAS CONTAMINATED: the DER " +
+				"ALREADY held this row's own " + b.Curve.Mode + " content, adopted and enabled, BEFORE " +
+				"this row published anything (" + pre + "). Nothing moved during the window (" + post +
+				") — and nothing could have, because the refused content was already there. This row " +
+				"cannot prove a refusal against a device that is executing the very thing it is supposed " +
+				"to have refused: an unchanged reading distinguishes a DUT that refused the control from " +
+				"one that landed it on an earlier run only if the starting state was clean. REMEDY: clear " +
+				"the DER's curve bank before the row runs — DELETE /admin/curve (Driver.ClearCurves) " +
+				"clears only the CSIP-side control and curve, not the device's registers, so this needs a " +
+				"fresh sim (the modsim /control reset resumes the animation and does not reset the " +
+				"register image) or a bench lever that resets model " +
+				strconv.FormatUint(uint64(b.Curve.Model), 10) + ". Until then this is reported as a FAIL " +
+				"rather than a PASS, because an uninformative window is not an observed absence"}
+		case certify.Fail:
+			// The clean case: the DER did NOT hold this row's content before the
+			// window, and still does not. The absence means something.
+		default:
+			return Finding{Verdict: certify.Fail, Observed: "the pre-publication reading of the " +
+				b.Curve.Mode + " bank was not recovered (" + pre + "), so this run cannot show that the " +
+				"baseline was clean. Nothing moved during the window (" + post + "), but an unchanged " +
+				"reading is only evidence of a refusal against a starting state that was established — " +
+				"an unestablished one cannot certify an absence, the same posture this row already takes " +
+				"for a missing fingerprint baseline"}
+		}
+	}
 	return Finding{Verdict: certify.Pass, Observed: o.Params[oracleObservedParam]}
 }
 
 // critRefusedAxisNoSouthboundTrace is the refusal row's southbound criterion:
 // the DER shows no trace of the axis the DUT refused.
 func critRefusedAxisNoSouthboundTrace(b *refusalBinding, o *Observation) criterion {
-	f := refusalOutcome(o)
+	f := refusalOutcome(b, o)
 	return criterion{
 		Claim: "no southbound write of " + b.Axis + " reached the DER while this row's refused control was live",
 		How: "an independent read of the DER's own raw SunSpec image (internal/invariant, which shares only " +
@@ -909,6 +998,16 @@ func refusalSetup(ctx context.Context, d *Driver, params map[string]string, b *r
 	if b.Curve != nil {
 		params[curvePublishedParam] = b.Curve.describePublished()
 		params[curveModelParam] = strconv.FormatUint(uint64(b.Curve.Model), 10)
+		// The CONTAMINATION read, and it is a different question from the
+		// fingerprint above. The fingerprint asks "what does this bank hold?",
+		// so it can detect MOVEMENT; this asks "does it already hold the
+		// content this row is about?", which is the only thing that can tell a
+		// refusal from a device that was already executing the refused control
+		// when the row started. Recorded under the same key curveSetup uses, and
+		// read by refusalOutcome exactly as curveOutcome reads it.
+		pre := oracleCurve(b.Curve)(ctx, d.rc)
+		params[oraclePreVerdictParam] = string(pre.Verdict)
+		params[oraclePreObservedParam] = findingObserved(pre)
 		return publishCurveControl(ctx, d, params, b.Curve, mrid)
 	}
 	return b.Publish(ctx, d, mrid)

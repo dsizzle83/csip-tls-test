@@ -164,7 +164,7 @@ func (m controlMode) measured() bool {
 func (m controlMode) outcome(o *Observation) Finding {
 	switch {
 	case m.Refusal != nil:
-		return refusalOutcome(o)
+		return refusalOutcome(m.Refusal, o)
 	case m.Curve != nil:
 		return curveOutcome(o)
 	default:
