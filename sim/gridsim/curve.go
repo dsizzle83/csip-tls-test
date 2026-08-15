@@ -63,6 +63,30 @@ type adminCurveReq struct {
 	// DERUnitRefType 2 (%setMaxVar) — a percentage of the REACTIVE nameplate;
 	// see the emission site for why it used to say RefType 1.
 	FixedVarPct *float64 `json:"fixed_var_pct,omitempty"`
+	// OpenLoopTms is the DERCurve's own openLoopTms element: the time to reach
+	// 90 % of the commanded output after a step change, in HUNDREDTHS of a
+	// second, 0 meaning "no limit" (sep-2.0.4.xsd DERCurve, minOccurs=0).
+	//
+	// It is here because a certification Figure prescribes it and this server
+	// could not send it: CSIP CTP v1.3's Figure 6 prints openLoopTms Default 10
+	// against Test Values 5, so a BASIC-006 run without this field never offered
+	// the DUT the condition the row exists to create, and the row held itself at
+	// FAIL saying exactly that. It is the ONLY DERCurve scalar any Figure in the
+	// catalog prescribes beyond CurveData, the two multipliers, curveType and
+	// yRefType — rampDecTms/rampIncTms/rampPT1Tms/vRef appear in no Figure, so no
+	// lever is offered for them and none is claimed.
+	//
+	// A pointer: 0 is "no limit", a real value a Figure could prescribe, so
+	// "absent" and "sent as 0" must stay distinguishable.
+	OpenLoopTms *uint16 `json:"open_loop_tms,omitempty"`
+	// FreqDroop rides along as an INLINE opModFreqDroop element on the same
+	// control that carries the curve link, which is the shape CSIP CTP v1.3's
+	// Figure 12 prescribes for BASIC-012: ONE DERControl carrying both the
+	// frequency-WATT curve (opModFreqWatt, a curve link) and the immediate
+	// frequency-DROOP control (opModFreqDroop, inline parameters). See
+	// freqdroop.go for the units, the whole-or-nothing rule and the element
+	// ordering note.
+	FreqDroop *freqDroopReq `json:"freq_droop,omitempty"`
 }
 
 // curveTypeForMode maps the request's mode to the Table-19 DERCurveType code
@@ -142,6 +166,15 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 			http.StatusBadRequest)
 		return
 	}
+	// The droop is validated BEFORE anything is stored: a request whose
+	// opModFreqDroop cannot be authored must publish no curve either, or a
+	// caller that asked for both halves of Figure 12 would get one half plus a
+	// 400 and could not tell which state the bench was left in.
+	droop, err := req.FreqDroop.toModel()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if req.DurationS <= 0 {
 		req.DurationS = 300
 	}
@@ -179,6 +212,12 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		// its `omitempty` keeps the element off the wire entirely.
 		YRefType:  req.YRefType,
 		CurveData: pointsToCurveData(req.Points),
+		// openLoopTms rides on the DERCurve, not on the control: sep 2.0.4
+		// declares it a child of DERCurve, and the Figure that prescribes it
+		// (Figure 6) names it "opModVoltVar.DERCurve.openLoopTms" for that
+		// reason. A copy, so a later mutation of the request cannot reach a
+		// curve this server has already published.
+		OpenLoopTms: copyU16(req.OpenLoopTms),
 	}
 	if req.VRef != 0 {
 		v := req.VRef
@@ -219,6 +258,11 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	}
 	base := model.ExtendedDERControlBase{}
 	setCurveLink(&base, req.Mode, curveHref)
+	// The inline droop, on the SAME control as the curve link. Figure 12
+	// prescribes exactly that pairing for BASIC-012 — opModFreqWatt (Curve) and
+	// opModFreqDroop (Immediate) on one DERControl — and publishing them as two
+	// controls would have made the row's own procedure unfollowable.
+	base.OpModFreqDroop = droop
 	if req.FixedVarPct != nil {
 		base.OpModFixedVar = &model.FixedVar{
 			// DERUnitRefType 2 = %setMaxVar: a percentage of the REACTIVE
@@ -587,5 +631,16 @@ func extBaseToInfo(b model.ExtendedDERControlBase) adminBaseInfo {
 		v := int64(b.OpModFixedVar.Value.Value)
 		info.FixedVarPct = &v
 	}
+	info.FreqDroop = freqDroopToInfo(b.OpModFreqDroop)
 	return info
+}
+
+// copyU16 returns a fresh pointer to the same value, so a stored resource never
+// aliases a request struct the caller still owns.
+func copyU16(v *uint16) *uint16 {
+	if v == nil {
+		return nil
+	}
+	n := *v
+	return &n
 }

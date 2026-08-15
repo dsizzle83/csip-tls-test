@@ -170,6 +170,11 @@ type adminBaseInfo struct {
 	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
 	FixedPFAbsorbW *int64 `json:"fixed_pf_absorb_pct,omitempty"`
 	FixedVarPct    *int64 `json:"fixed_var_pct,omitempty"`
+	// FreqDroop is opModFreqDroop's five inline parameters (freqdroop.go).
+	// Like TargetW it exists only on an ExtendedDERControlBase, so only
+	// extBaseToInfo and the extended DefaultDERControl ever set it; the scalar
+	// DERControlBase that baseToInfo reads has no such field at all.
+	FreqDroop *adminFreqDroopInfo `json:"freq_droop,omitempty"`
 }
 
 type adminProgInfo struct {
@@ -286,8 +291,10 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 			Description: pm.Description,
 			Primacy:     pm.Primacy,
 		}
-		if dderc, ok := s.resources[fmt.Sprintf("/derp/%d/dderc", i)].(*model.DefaultDERControl); ok {
-			b := baseToInfo(dderc.DERControlBase)
+		// Either shape: a default carrying opModFreqDroop is stored extended
+		// (putDefaultBaseLocked), and a status that silently omitted it would
+		// report "this program has no default" about a program that has one.
+		if b, ok := s.defaultBaseInfoLocked(fmt.Sprintf("/derp/%d/dderc", i)); ok {
 			ap.Default = &b
 		}
 		// derc/actderc hold *model.DERControlList normally, or
@@ -527,6 +534,12 @@ type adminCtrlReq struct {
 	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
 	FixedPFAbsorbW *int64 `json:"fixed_pf_absorb_pct,omitempty"`
 	FixedVarPct    *int64 `json:"fixed_var_pct,omitempty"`
+	// FreqDroop is opModFreqDroop's five inline parameters (curve plan #32 —
+	// freqdroop.go for units, the whole-or-nothing rule and the ordering note).
+	// Like TargetW it exists ONLY on the extended control base, so a request
+	// carrying it forces this control into extended storage exactly as TargetW
+	// already does; buildBase's narrow DERControlBase cannot hold it at all.
+	FreqDroop *freqDroopReq `json:"freq_droop,omitempty"`
 }
 
 func (s *Server) handleAdminControl(w http.ResponseWriter, r *http.Request) {
@@ -614,6 +627,13 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Validated before anything is stored, for the reason adminCurvePost gives:
+	// a control that cannot be authored whole must not be half-published.
+	droop, err := req.FreqDroop.toModel()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if req.DurationS <= 0 {
 		req.DurationS = 300
 	}
@@ -687,10 +707,18 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// this control is stored as, TargetW included, and route BOTH list writes
 	// below through the extended path unconditionally — the same widen-in-place
 	// pattern POST /admin/curve already established for curve-linked controls.
+	//
+	// opModFreqDroop (curve plan #32) joins it on the identical footing and
+	// through the identical path: an extended-only element, forcing extended
+	// storage, pre-built here so the direct store below cannot drop it. Both
+	// may ride the SAME control — a request carrying TargetW and FreqDroop
+	// produces one control carrying both, which is what a caller who asked for
+	// both would expect and what a second `if` would have quietly broken.
 	var extCtrl *model.ExtendedDERControl
-	if req.TargetW != nil {
+	if req.TargetW != nil || droop != nil {
 		e := toExtendedControl(ctrl)
 		e.DERControlBase.OpModTargetW = apFromWatts(req.TargetW)
+		e.DERControlBase.OpModFreqDroop = droop
 		extCtrl = &e
 	}
 
@@ -1059,13 +1087,28 @@ func (s *Server) adminDefaultGet(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.RUnlock()
 
 	path := fmt.Sprintf("/derp/%d/dderc", prog)
-	if dderc, ok := s.resources[path].(*model.DefaultDERControl); ok {
-		b := baseToInfo(dderc.DERControlBase)
+	// BOTH shapes, because a droop-carrying default is stored as the EXTENDED
+	// type (see adminDefaultPost). Reading only the narrow one would answer 404
+	// for a default this same endpoint had just accepted, which is the shape of
+	// bug the derc/actderc widening already had to be taught out of.
+	if b, ok := s.defaultBaseInfoLocked(path); ok {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(b)
 		return
 	}
 	w.WriteHeader(http.StatusNotFound)
+}
+
+// defaultBaseInfoLocked renders whichever DefaultDERControl shape is stored at
+// path. Caller must hold s.mu (read or write).
+func (s *Server) defaultBaseInfoLocked(path string) (adminBaseInfo, bool) {
+	switch d := s.resources[path].(type) {
+	case *model.DefaultDERControl:
+		return baseToInfo(d.DERControlBase), true
+	case *model.ExtendedDefaultDERControl:
+		return extBaseToInfo(d.DERControlBase), true
+	}
+	return adminBaseInfo{}, false
 }
 
 func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
@@ -1082,19 +1125,66 @@ func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	droop, err := req.Base.FreqDroop.toModel()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	s.mu.Lock()
 	path := fmt.Sprintf("/derp/%d/dderc", req.Program)
-	if dderc, ok := s.resources[path].(*model.DefaultDERControl); ok {
-		if req.Clear {
-			dderc.DERControlBase = model.DERControlBase{}
-		} else {
-			dderc.DERControlBase = buildBase(req.Base)
-		}
-	}
+	s.putDefaultBaseLocked(path, req, droop)
 	s.mu.Unlock()
 
 	s.notifyChanged(path)
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// putDefaultBaseLocked writes a program's DefaultDERControl base, choosing the
+// resource SHAPE from what the request actually asks for. Caller must hold s.mu.
+//
+// opModFreqDroop exists only on the extended base (csipmodel's
+// ExtendedDefaultDERControl), so a default that carries one has to be stored as
+// that type — the same widen-in-place the derc/actderc paths already do for a
+// curve-linked or TargetW-carrying control. Both types marshal under the same
+// XMLName ("DefaultDERControl"), so the WIRE is unchanged and only this
+// server's own Go type moves.
+//
+// CLEAR NARROWS IT BACK, deliberately. A teardown's job is to leave the tree as
+// it found it, and a program left holding an extended resource with an empty
+// base is not the tree the golden pins — nor is it what the next reader of
+// s.resources[path] would expect to type-assert. The identifying fields are
+// carried across both ways so the resource keeps its href, mRID and version:
+// re-minting them would change what the DUT sees at a stable path.
+func (s *Server) putDefaultBaseLocked(path string, req adminDefaultReq, droop *model.FreqDroop) {
+	var res model.Resource
+	var mrid, desc string
+	var version uint16
+	switch d := s.resources[path].(type) {
+	case *model.DefaultDERControl:
+		res, mrid, desc, version = d.Resource, d.MRID, d.Description, d.Version
+	case *model.ExtendedDefaultDERControl:
+		res, mrid, desc, version = d.Resource, d.MRID, d.Description, d.Version
+	default:
+		return // this program serves no DefaultDERControl; nothing to write
+	}
+	if req.Clear || droop == nil {
+		// The narrow shape covers every base this server can author WITHOUT a
+		// droop, so a droopless POST keeps the tree in its original type rather
+		// than widening it for nothing.
+		narrow := &model.DefaultDERControl{
+			Resource: res, MRID: mrid, Description: desc, Version: version,
+		}
+		if !req.Clear {
+			narrow.DERControlBase = buildBase(req.Base)
+		}
+		s.resources[path] = narrow
+		return
+	}
+	base := scalarBaseToExtended(buildBase(req.Base))
+	base.OpModFreqDroop = droop
+	s.resources[path] = &model.ExtendedDefaultDERControl{
+		Resource: res, MRID: mrid, Description: desc, Version: version, DERControlBase: base,
+	}
 }

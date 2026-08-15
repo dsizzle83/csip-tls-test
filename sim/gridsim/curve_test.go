@@ -487,10 +487,16 @@ func TestAdminCurve_ActivatingPostDropsTheCurvesItTruncated(t *testing.T) {
 	// Program 1 has no static fixture, so every curve at /derp/1/dc/{i} got
 	// there through this endpoint and nothing else can be blamed for it.
 	// APPEND three, so the list holds indices 0, 1 and 2.
+	//
+	// They carry an openLoopTms (curve plan #32), because an element a lever
+	// ADDS to a curve resource is exactly what a stale index-0 republication
+	// would carry forward: the breakpoints are replaced wholesale and would look
+	// right, while the timing element of a finished run went on being served
+	// under the new curve's mRID.
 	var minted []map[string]string
 	for _, mode := range []string{"volt_var", "volt_watt", "watt_pf"} {
 		minted = append(minted, post(`{"program":1,"mode":"`+mode+
-			`","points":[{"x":1,"y":2}],"activate":false}`))
+			`","points":[{"x":1,"y":2}],"open_loop_tms":5,"activate":false}`))
 	}
 	for i, m := range minted {
 		if got := status(m["curve_href"]); got != http.StatusOK {
@@ -532,5 +538,11 @@ func TestAdminCurve_ActivatingPostDropsTheCurvesItTruncated(t *testing.T) {
 	if live.CurveType != model.CurveTypeFreqWatt {
 		t.Errorf("/derp/1/dc/0 serves curveType %d, want the freq_watt POST's %d",
 			live.CurveType, model.CurveTypeFreqWatt)
+	}
+	// Including the elements the truncated curves carried and this one did not.
+	if live.OpenLoopTms != nil {
+		t.Errorf("/derp/1/dc/0 still serves openLoopTms=%d, which belonged to a curve the activating POST "+
+			"truncated away — the republished resource is carrying a finished run's timing element",
+			*live.OpenLoopTms)
 	}
 }
