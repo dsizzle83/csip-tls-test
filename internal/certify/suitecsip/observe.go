@@ -1301,6 +1301,10 @@ type ControlRequest struct {
 	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
 	FixedPFAbsorbW *int64 `json:"fixed_pf_absorb_pct,omitempty"`
 	FixedVarPct    *int64 `json:"fixed_var_pct,omitempty"`
+	// FreqDroop is the inline opModFreqDroop element (curve plan #32). Like
+	// TargetW it lives only on the extended control base, and gridsim widens
+	// this control's storage to carry it.
+	FreqDroop *FreqDroopSettings `json:"freq_droop,omitempty"`
 }
 
 // PostControl publishes a DERControl and returns the mRID gridsim assigned.
@@ -1337,20 +1341,47 @@ func (d *Driver) PostControl(ctx context.Context, req ControlRequest) (string, e
 // into an active DERControl, which is the only way a curve-based mode
 // (Volt-VAr, Volt-Watt, Freq-Watt, Watt-PF) reaches the DUT.
 type CurveRequest struct {
-	Program     int          `json:"program"`
-	Mode        string       `json:"mode"`
-	Points      []CurvePoint `json:"points"`
-	VRef        int16        `json:"vref,omitempty"`
-	XMult       int8         `json:"x_mult,omitempty"`
-	YMult       int8         `json:"y_mult,omitempty"`
+	Program int          `json:"program"`
+	Mode    string       `json:"mode"`
+	Points  []CurvePoint `json:"points"`
+	VRef    int16        `json:"vref,omitempty"`
+	XMult   int8         `json:"x_mult,omitempty"`
+	YMult   int8         `json:"y_mult,omitempty"`
 	// No XRefType: sep 2.0.4 declares no xRefType element on DERCurve, so
 	// gridsim no longer accepts or serves one (it answers 400 to a request that
 	// carries the field). See sim/gridsim/curve.go's adminCurveReq.
 	YRefType uint8 `json:"y_ref_type,omitempty"`
-	Description string       `json:"description,omitempty"`
-	DurationS   int          `json:"duration_s,omitempty"`
-	StartOffset int          `json:"start_offset_s,omitempty"`
-	Activate    bool         `json:"activate"`
+	// OpenLoopTms is the DERCurve's own openLoopTms (hundredths of a second,
+	// 0 = "no limit"). A pointer because 0 is a real value a Figure could
+	// prescribe; nil omits the element. See sim/gridsim/curve.go for why this is
+	// the only DERCurve scalar with a lever.
+	OpenLoopTms *uint16 `json:"open_loop_tms,omitempty"`
+	// FreqDroop rides along as an inline opModFreqDroop on the SAME control that
+	// carries the curve link — the shape Figure 12 prescribes for BASIC-012.
+	FreqDroop   *FreqDroopSettings `json:"freq_droop,omitempty"`
+	Description string             `json:"description,omitempty"`
+	DurationS   int                `json:"duration_s,omitempty"`
+	StartOffset int                `json:"start_offset_s,omitempty"`
+	Activate    bool               `json:"activate"`
+}
+
+// FreqDroopSettings is sep 2.0.4's FreqDroopType as gridsim's admin API takes
+// it: all five children, in the schema's own units, every one required.
+//
+// The five are VALUES, not pointers, and the JSON tags carry no omitempty —
+// which is the opposite of every other optional field on these requests and is
+// deliberate. FreqDroopType declares all five minOccurs="1", gridsim answers a
+// partial element 400 rather than completing it with zeros (sim/gridsim/
+// freqdroop.go), and 0 is a meaningful value for each of them; a struct that
+// could omit one would let a caller construct exactly the half-authored control
+// the server exists to refuse. Presence of the ELEMENT is carried by the
+// pointer to this struct, not by its fields.
+type FreqDroopSettings struct {
+	DBOF        uint32 `json:"dbof"`          // dead band, over-frequency, thousandths of Hz
+	DBUF        uint32 `json:"dbuf"`          // dead band, under-frequency, thousandths of Hz
+	KOF         uint16 `json:"kof"`           // over-frequency droop gain, thousandths, unitless
+	KUF         uint16 `json:"kuf"`           // under-frequency droop gain, thousandths, unitless
+	OpenLoopTms uint16 `json:"open_loop_tms"` // open-loop response time, hundredths of a second
 }
 
 // CurvePoint is one (x, y) breakpoint.

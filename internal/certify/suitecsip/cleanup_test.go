@@ -31,13 +31,24 @@ import (
 // what the client believes it sent.
 func cleanupDriver(t *testing.T) *Driver {
 	t.Helper()
-	srv := httptest.NewServer(gridsim.NewServer(benchLFDI).AdminHandler())
+	d, _ := cleanupDriverServer(t)
+	return d
+}
+
+// cleanupDriverServer is cleanupDriver keeping the SERVER, so a teardown
+// assertion can be made against the DATA PLANE — what a DUT walking the tree
+// after the teardown would receive — rather than against the admin status
+// summary, which reports that controls exist and not which elements they carry.
+func cleanupDriverServer(t *testing.T) (*Driver, *gridsim.Server) {
+	t.Helper()
+	gs := gridsim.NewServer(benchLFDI)
+	srv := httptest.NewServer(gs.AdminHandler())
 	t.Cleanup(srv.Close)
 	return NewDriver(&certify.RunCtx{
 		Case:    &certify.Case{UID: "test::cleanup"},
 		GridSim: certify.NewAdminClient(srv.URL, http.DefaultClient),
 		Targets: certify.Targets{GridSimAdmin: srv.URL},
-	})
+	}), gs
 }
 
 // programControls reports what gridsim itself says is on program p, active and
@@ -124,6 +135,66 @@ func TestClearCurves_ActuallyRemovesTheCurveControl(t *testing.T) {
 	if got := programControls(t, d, 0); len(got) != 0 {
 		t.Fatalf("gridsim still holds %d control(s) after ClearCurves: %+v", len(got), got)
 	}
+}
+
+// TestClearCurves_RemovesTheFigureElementsTheLeversAdd extends the teardown
+// proof to curve plan #32's new content.
+//
+// A teardown that removes the CONTROL but leaves its authored elements
+// reachable is the contamination this file exists to end, one level down: the
+// next row's capture would carry an opModFreqDroop nobody in that row published
+// and a DERCurve with a timing element from a run that had finished. Both new
+// levers put content in places the pre-#32 teardown never had to reach — one on
+// the served DERCurve resource, one inline on the control — so both are checked
+// on the DATA PLANE, after the teardown, at the hrefs a DUT would follow.
+func TestClearCurves_RemovesTheFigureElementsTheLeversAdd(t *testing.T) {
+	d, gs := cleanupDriverServer(t)
+	ctx := context.Background()
+
+	if _, err := d.PostCurve(ctx, CurveRequest{
+		Program: 0, Mode: "freq_watt", Description: "cleanup fixture",
+		Points:      []CurvePoint{{X: 5900, Y: 100}, {X: 6200, Y: 0}},
+		YRefType:    1,
+		XMult:       -2,
+		OpenLoopTms: ptr(uint16(5)),
+		FreqDroop: &FreqDroopSettings{
+			DBOF: 60030, DBUF: 59970, KOF: 40, KUF: 40, OpenLoopTms: 600,
+		},
+		DurationS: 600, Activate: true,
+	}); err != nil {
+		t.Fatalf("PostCurve: %v", err)
+	}
+	// The fixture has to have ARMED, or the teardown assertion below would pass
+	// against a bench where nothing was ever published.
+	if raw := servedTree(t, gs, "/derp/0/derc"); !strings.Contains(raw, "opModFreqDroop") {
+		t.Fatalf("the fixture published no opModFreqDroop, so this teardown proves nothing:\n%s", raw)
+	}
+	if raw := servedTree(t, gs, "/derp/0/dc/0"); !strings.Contains(raw, "openLoopTms") {
+		t.Fatalf("the fixture published no openLoopTms, so this teardown proves nothing:\n%s", raw)
+	}
+
+	if err := d.ClearCurves(ctx, 0); err != nil {
+		t.Fatalf("ClearCurves: %v", err)
+	}
+	if raw := servedTree(t, gs, "/derp/0/derc"); strings.Contains(raw, "opModFreqDroop") {
+		t.Errorf("the authored opModFreqDroop is STILL served after teardown; the next row's capture would "+
+			"carry a droop nobody in it published:\n%s", raw)
+	}
+	if raw := servedTree(t, gs, "/derp/0/dc/0"); strings.Contains(raw, "openLoopTms") {
+		t.Errorf("the authored openLoopTms is STILL served after teardown at the href the row's control "+
+			"linked:\n%s", raw)
+	}
+}
+
+// servedTree fetches a resource from gridsim's DATA plane as text.
+func servedTree(t *testing.T, gs *gridsim.Server, path string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	gs.Handler().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s from gridsim = %d; body: %s", path, rec.Code, rec.Body)
+	}
+	return rec.Body.String()
 }
 
 // recordingRT captures the requests a client makes, so a test can assert on

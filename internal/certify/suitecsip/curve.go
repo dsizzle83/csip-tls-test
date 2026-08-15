@@ -47,6 +47,7 @@ package suitecsip
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -135,6 +136,38 @@ type curveBinding struct {
 	// YRefType is the Table-19 code the published curve's y axis carries.
 	YRefType uint8
 
+	// OpenLoopTms is the DERCurve's own openLoopTms element this row authors —
+	// hundredths of a second, 0 meaning "no limit" — or nil to omit it.
+	//
+	// It is the only DERCurve scalar any Figure in this catalog prescribes
+	// beyond CurveData, the multipliers, curveType and yRefType, and until the
+	// #32 lever landed this bench could not send it at all: BASIC-006's Figure 6
+	// prints openLoopTms Default 10 / Test Values 5, so every run of that row
+	// left the DUT in the procedure's DEFAULT timing while the report claimed
+	// the test condition, and the row held itself at FAIL saying exactly that.
+	//
+	// It has NO register home on either SunSpec curve generation (see
+	// noOpenLoopTmsRegister). That does not make it droppable — the procedure
+	// prescribes it and the DUT must be OFFERED it — so it is authored
+	// northbound and declared, through authored() below, as an element this
+	// referee asserts nothing about southbound.
+	OpenLoopTms *uint16
+
+	// Droop, when set, is an INLINE opModFreqDroop element this row authors on
+	// the SAME control that carries the curve link, and the register home its
+	// five parameters must be found in per generation.
+	//
+	// It is a separate structure from the breakpoints because it is a separate
+	// KIND of content — sep 2.0.4's one DERControlBase mode that carries its
+	// parameters inline rather than behind a DERCurve link — and because its
+	// register home and the curve's are on OPPOSITE generations: a 7xx DER
+	// stores frequency response parametrically in model 711 and has no
+	// freq-watt breakpoint table anywhere, while the legacy 12x set stores the
+	// breakpoints in model 134 and has no home for the droop parameters at all.
+	// One row, both halves authored, and each half measured on the generation
+	// that can hold it. See droopBinding.
+	Droop *droopBinding
+
 	// ── The southbound target, PER GENERATION ──
 	//
 	// A row's northbound half is one control and does not change; its
@@ -206,6 +239,274 @@ type curveGap struct {
 	// the default, or a transcription divergence this bench deliberately does
 	// not follow) is still named, and does not hold the row.
 	Material bool
+}
+
+// droopBinding is the inline opModFreqDroop half of a row: the five sep 2.0.4
+// FreqDroopType values it authors, and the register home those values must be
+// found in on each SunSpec generation.
+//
+// THE FIVE VALUES ARE THE PROCEDURE'S, in the wire's own units, and nothing in
+// this bench rescales them on the way out — the pcap has to carry the numbers
+// the Figure prints or the evidence is about a different control. The
+// translation into a device's engineering units happens ONCE, in want711, on
+// the reading side, where a reader can check it against the two standards'
+// own sentences.
+type droopBinding struct {
+	// Settings are the five values, exactly as the request carries them:
+	// dBOF/dBUF in thousandths of Hz, kOF/kUF in thousandths (unitless),
+	// openLoopTms in hundredths of a second.
+	Settings FreqDroopSettings
+
+	// Model7xx is the 7xx-family model whose registers hold this content, or 0
+	// with NoRegisterHome7xx set. Mapping7xx records where the correspondence
+	// comes from, on the same rule the curve arms follow: a FAIL that names a
+	// register bank must be checkable by whoever reads the bundle.
+	Model7xx             uint16
+	Mapping7xx           string
+	NoRegisterHome7xx    string
+	ModelLegacy          uint16
+	MappingLegacy        string
+	NoRegisterHomeLegacy string
+}
+
+// droopTarget is the droop half's resolved home on THIS DER's generation.
+type droopTarget struct {
+	Model          uint16
+	Mapping        string
+	NoRegisterHome string
+}
+
+// resolveDroop picks the droop half's register home from the generation the DER
+// turned out to be, mirroring resolveTarget for the breakpoint half.
+//
+// A generation this row declares NEITHER a model NOR a stated absence for
+// resolves to "no home, and this row does not say why" — reported as an absence
+// rather than silently skipped, because a row that authored an element and then
+// asserted nothing about it, without saying so, is the overclaim this whole
+// mechanism exists to prevent.
+func (d *droopBinding) resolve(gen curveGeneration) droopTarget {
+	switch gen {
+	case genLegacy:
+		return droopTarget{Model: d.ModelLegacy, Mapping: d.MappingLegacy,
+			NoRegisterHome: d.NoRegisterHomeLegacy}
+	case gen7xx:
+		return droopTarget{Model: d.Model7xx, Mapping: d.Mapping7xx,
+			NoRegisterHome: d.NoRegisterHome7xx}
+	}
+	return droopTarget{NoRegisterHome: "this DER's SunSpec curve generation could not be determined, so " +
+		"which register bank (if any) would hold an authored opModFreqDroop on it has no answer here"}
+}
+
+// droopSettings hands the publisher the five values, or nil for a row that
+// authors no droop. The row states them once, on the binding, and the publisher
+// and the oracle both read that one statement — the same rule the breakpoints
+// follow, and for the same reason: the published control and the oracle that
+// judges it must not be able to disagree about what was commanded.
+func droopSettings(d *droopBinding) *FreqDroopSettings {
+	if d == nil {
+		return nil
+	}
+	s := d.Settings
+	return &s
+}
+
+// describe names the element and renders its five authored values, for a
+// verdict sentence that has to say what was published.
+func (d *droopBinding) describe() string { return droopElement + " " + d.describeValues() }
+
+// describeValues is describe WITHOUT the element name, for a record that
+// already carries the name in its own column — printing it twice reads as two
+// different things having been sent.
+func (d *droopBinding) describeValues() string {
+	s := d.Settings
+	return fmt.Sprintf("dBOF=%d dBUF=%d (thousandths of Hz) kOF=%d kUF=%d (thousandths, unitless) "+
+		"openLoopTms=%d (hundredths of a second)", s.DBOF, s.DBUF, s.KOF, s.KUF, s.OpenLoopTms)
+}
+
+// droopElement is the procedure's own name for the inline element, written once
+// so the binding, the authored-element record and every verdict spell it alike.
+const droopElement = "opModFreqDroop"
+
+// want711 translates the authored FreqDroopType into the model-711 engineering
+// values the DER must be found holding.
+//
+// It is a translation this referee performs INDEPENDENTLY, from the two
+// standards' own unit statements rather than from the product's table — the
+// same rule wantDeptRef follows and for the same reason. Both sentences are
+// quoted here so a reader can check the arithmetic without either codebase:
+//
+//	sep-2.0.4.xsd FreqDroopType   SunSpec model 711 Ctl      conversion
+//	──────────────────────────    ─────────────────────      ──────────
+//	dBOF "in thousandths of Hz"   DbOf, scaled by Db_SF      / 1000 -> Hz
+//	dBUF "in thousandths of Hz"   DbUf, scaled by Db_SF      / 1000 -> Hz
+//	kOF  "in thousandths,         KOf,  scaled by K_SF       / 1000 -> unitless
+//	      unitless"
+//	kUF  same                     KUf,  scaled by K_SF       / 1000 -> unitless
+//	openLoopTms "in hundredths    RspTms, scaled by          / 100  -> seconds
+//	      of a second"            RspTms_SF
+//
+// NO NOMINAL FREQUENCY ENTERS, and that is the property that makes the mapping
+// exact rather than interpretive: kOF/kUF are already per-unit frequency change
+// per per-unit power change, and sep 2.0.4 and the 711 spec state that in
+// verbatim identical words, so nothing here needs to know whether the grid is
+// 50 or 60 Hz. A referee that had to assume one would be grading its own
+// assumption.
+func (d *droopBinding) want711() invariant.DroopReading {
+	s := d.Settings
+	return invariant.DroopReading{
+		DbOfHz:  float64(s.DBOF) / 1000,
+		DbUfHz:  float64(s.DBUF) / 1000,
+		KOf:     float64(s.KOF) / 1000,
+		KUf:     float64(s.KUF) / 1000,
+		RspTmsS: float64(s.OpenLoopTms) / 100,
+	}
+}
+
+// The droop comparison's tolerances: HALF the last digit the WIRE itself can
+// carry, per quantity, and nothing more.
+//
+// They are absolute, where every other tolerance in this suite is relative plus
+// a floor (oracleTolerance), and the departure is deliberate. A droop dead band
+// is printed by the procedure as an ABSOLUTE frequency — Figure 12's dBOF is
+// 60030 thousandths, i.e. 60.030 Hz — so 1 % of it is 0.6 Hz, which is twenty
+// times the whole 0.030 Hz offset the row is about: a relative tolerance would
+// accept a device that had ignored the setting entirely. Half of the wire's own
+// last digit is the tightest comparison that cannot fail an exact device, and
+// anything coarser than that in the DEVICE (a scale factor with less resolution
+// than the wire) is a real finding about that device — it cannot represent what
+// it was commanded — and is reported rather than absorbed.
+const (
+	droopDeadbandToleranceHz = 0.0005 // wire step: thousandths of Hz
+	droopGainTolerance       = 0.0005 // wire step: thousandths, unitless
+	droopResponseToleranceS  = 0.005  // wire step: hundredths of a second
+)
+
+// authoredElement is one element this row places on the wire BEYOND the
+// breakpoints and the axis multipliers, with the register home — if any — it
+// can be read back at on each generation.
+//
+// It exists so that "authored northbound" and "measurable southbound" stay
+// SEPARATE facts about the same element. An element with no register home is
+// not a gap (the bench sent exactly what the procedure prescribes) and it is
+// not evidence of execution either (nothing on the device can show it landed),
+// and a bundle that collapsed the two would either hold a row for a bench
+// capability it has, or claim a measurement it never made.
+type authoredElement struct {
+	// Element is the procedure's own name for it.
+	Element string
+	// Value is what this row authored, in the wire's units.
+	Value string
+	// Home7xx / HomeLegacy name the register home per generation, empty for a
+	// generation that has none.
+	Home7xx, HomeLegacy string
+	// Why explains the absence, for whichever generation lacks a home. Read
+	// only when one of the two homes is empty.
+	Why string
+}
+
+// homeOn returns this element's register home on a family, and whether it has
+// one there.
+func (a authoredElement) homeOn(fam invariant.CurveFamily) (string, bool) {
+	home := a.Home7xx
+	if fam == invariant.FamilyLegacy {
+		home = a.HomeLegacy
+	}
+	return home, home != ""
+}
+
+// authored is the list of elements this row places on the wire beyond the
+// breakpoints and multipliers — the positive half of the record whose negative
+// half is Gaps.
+func (b *curveBinding) authored() []authoredElement {
+	var out []authoredElement
+	if b.OpenLoopTms != nil {
+		out = append(out, authoredElement{
+			Element: "DERCurve.openLoopTms",
+			Value:   fmt.Sprintf("%d (hundredths of a second)", *b.OpenLoopTms),
+			Why:     noOpenLoopTmsRegister,
+		})
+	}
+	if b.Droop != nil {
+		home7xx, homeLegacy := "", ""
+		if b.Droop.Model7xx != 0 {
+			home7xx = fmt.Sprintf("M%d (%s)", b.Droop.Model7xx, droopRegisterNames)
+		}
+		if b.Droop.ModelLegacy != 0 {
+			homeLegacy = fmt.Sprintf("M%d (%s)", b.Droop.ModelLegacy, droopRegisterNames)
+		}
+		why := b.Droop.NoRegisterHomeLegacy
+		if home7xx == "" {
+			why = b.Droop.NoRegisterHome7xx
+		}
+		out = append(out, authoredElement{
+			Element:    droopElement,
+			Value:      b.Droop.describeValues(),
+			Home7xx:    home7xx,
+			HomeLegacy: homeLegacy,
+			Why:        why,
+		})
+	}
+	return out
+}
+
+// describeAuthored renders every authored element with its per-generation
+// register home, for the criterion that has to say what went on the wire and
+// what can be read back.
+func describeAuthored(els []authoredElement) string {
+	if len(els) == 0 {
+		return "none beyond the breakpoints and axis multipliers"
+	}
+	parts := make([]string, 0, len(els))
+	for _, a := range els {
+		home := func(gen, h string) string {
+			if h == "" {
+				return "no register home on " + gen
+			}
+			return gen + ": " + h
+		}
+		// The REASON is printed only where there is an absence to explain. An
+		// element with a home on both generations has nothing to account for,
+		// and a trailing "this row records no reason" beside it would read as a
+		// defect in the row rather than as the ordinary case.
+		why := ""
+		if a.Home7xx == "" || a.HomeLegacy == "" {
+			why = " — " + orText(a.Why, "this row records no reason for the absence")
+		}
+		parts = append(parts, fmt.Sprintf("%s = %s [%s; %s%s]", a.Element, a.Value,
+			home("a 7xx DER", a.Home7xx), home("a legacy 12x DER", a.HomeLegacy), why))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// unmappableOn are the elements this row authored that have NO register home on
+// a generation — served northbound, and asserted about by nothing southbound.
+func (b *curveBinding) unmappableOn(fam invariant.CurveFamily) []authoredElement {
+	var out []authoredElement
+	for _, a := range b.authored() {
+		if _, ok := a.homeOn(fam); !ok {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// describeUnmappable is the sentence an oracle verdict carries so that an
+// authored element with no device home is NAMED where the measurement is
+// reported, and never silently dropped between the two.
+func describeUnmappable(els []authoredElement) string {
+	if len(els) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(els))
+	for _, a := range els {
+		parts = append(parts, fmt.Sprintf("%s = %s (%s)", a.Element, a.Value,
+			orText(a.Why, "this row records no reason")))
+	}
+	return " AUTHORED BUT NOT DEVICE-MAPPABLE: this row also placed " + strings.Join(parts, "; ") +
+		" on the wire, and this generation stores it in no register — so it was SERVED to the DUT and " +
+		"this referee asserts nothing about it southbound. That is a property of the device model, not a " +
+		"gap in the bench, and it is stated here rather than left out so no reader can mistake this " +
+		"verdict for a measurement of it."
 }
 
 // materialGaps are the gaps that mean this row was not run to its procedure.
@@ -602,6 +903,23 @@ func curvePointTolerance(want float64) float64 { return oracleTolerance(want, 0.
 // adopted-and-enabled-with-the-wrong-content — because those are four different
 // defects with four different owners, and a bundle that collapsed them into
 // "the curve did not land" would send every one of them to the wrong person.
+//
+// ── A ROW CAN CARRY TWO KINDS OF CONTENT, AND THEY LIVE ON DIFFERENT
+//
+//	GENERATIONS (curve plan #32) ────────────────────────────────────────────
+//
+// BASIC-012's Figure 12 prescribes a frequency-WATT curve and an immediate
+// frequency-DROOP control on one DERControl, and the two have opposite
+// register fates: the 7xx set stores frequency response PARAMETRICALLY in model
+// 711 and has no breakpoint table for the curve anywhere, while the legacy 12x
+// set stores the breakpoints in model 134 and has no home for the droop
+// parameters at all. So this oracle measures WHATEVER THIS DER CAN HOLD of what
+// the row authored, and states plainly which authored content it did not
+// assert — rather than reporting a decided FAIL because one half of a row has
+// no home on the bench that is running.
+//
+// Both halves, where both have homes, must hold. A device that adopted the
+// curve and ignored the droop has not executed this control.
 func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) Finding {
 	return func(ctx context.Context, rc *certify.RunCtx) Finding {
 		uv, err := oracleUnitView(ctx, rc, oracleSimName)
@@ -637,118 +955,294 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 		}
 		cv := uv.Curve(oracleSimName, target.Model)
 
+		// The DROOP half, resolved on the SAME generation the breakpoint half
+		// was. nil for every row that authors no opModFreqDroop, so nothing
+		// that does not carry one pays for this.
+		var droop *droopTarget
+		if b.Droop != nil {
+			d := b.Droop.resolve(curveGenerationOf(uv))
+			droop = &d
+		}
+		// Whatever this row authored that THIS generation stores in no register.
+		// It rides on every verdict below rather than on one of them: an
+		// element served northbound and asserted about by nothing must be named
+		// wherever the measurement is reported, or a reader takes the verdict
+		// for a statement about it.
+		unmapped := describeUnmappable(b.unmappableOn(target.Family))
+
 		if target.NoRegisterHome != "" {
-			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			// The BREAKPOINTS have no home here. Before this was the end of the
+			// row: a decided FAIL, because there was nothing else the row
+			// carried. A row that ALSO authored a droop with a real home on
+			// this generation is a different case — there IS something to
+			// measure, and refusing to measure it would be the mirror of the
+			// substitution this suite exists to refuse (asserting nothing where
+			// an exact assertion exists).
+			if droop != nil && droop.NoRegisterHome == "" {
+				return withNote(b.droopOutcome(uv, *droop, target, published), unmapped)
+			}
+			return withNote(Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
 				"this row published %s northbound, and there is NO southbound register home on this DER for "+
 					"that content: %s. The row's southbound half therefore cannot be measured at all, which "+
 					"is reported as a FAIL rather than skipped — an unmeasured criterion is not a satisfied "+
 					"one. What the DER does hold on the nearest model: %s",
-				published, target.NoRegisterHome, cv.Describe())}
+				published, target.NoRegisterHome, cv.Describe())}, unmapped)
 		}
-		if !cv.Present {
-			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-				"this row published %s northbound and the DER's own register image carries NOTHING for it: "+
-					"%s. %s The models the DER does serve are %s",
-				published, cv.Describe(), target.Mapping, modelList(uv))}
+		f := curveContentOutcome(b, uv, target, cv, published)
+		if droop == nil || droop.NoRegisterHome != "" {
+			return withNote(f, unmapped)
 		}
-		if !cv.Adopted {
-			// The two generations reach "not adopted" by different routes and a
-			// finding that named the wrong one would send a reader to a
-			// register that does not exist: on 7xx the adopt HANDSHAKE never
-			// COMPLETED; on legacy there is no handshake at all and the fact is
-			// that ActCrv does not select the bank this content would be in.
-			how := "adopt handshake never COMPLETED, so no curve was taken up"
-			if cv.Legacy() {
-				how = fmt.Sprintf("ActCrv selects no bank holding this row's content (ActCrv=%d) — on this "+
-					"generation there is no adopt handshake, so the SELECTION is the whole of the commit "+
-					"and a bank nobody selected commands nothing", cv.ActCrv)
-			}
-			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-				"this row published %s northbound and the DER's %s %s: %s. %s",
-				published, cv.Axis.Name, how, cv.Describe(), target.Mapping)}
+		// BOTH halves have a home, so BOTH are measured and the WORSE answer
+		// decides. A device that adopted the curve and ignored the droop has
+		// executed half of this control, and half is not execution.
+		//
+		// The droop is judged even when the curve half did not PASS, and the
+		// comparison is by SEVERITY rather than by "the curve failed, stop".
+		// Returning the curve's answer whenever it was not a PASS would let a
+		// WARN (an index-0 curve reporting ReadOnly=false, severity 2) stand in
+		// front of a droop FAIL (severity 3) and report the row two grades
+		// better than the DER deserves — the same absence-reads-as-success
+		// shape this file exists to remove, one composition level up.
+		d := b.droopOutcome(uv, *droop, target, published)
+		if d.Verdict.Severity() > f.Verdict.Severity() {
+			return withNote(d, unmapped)
 		}
-		match := invariant.MatchPoints(cv.Points, b.wantPoints(), curvePointTolerance)
-		if !match.Matched {
-			// "an adopted curve" is the 7xx wording and it would be misleading
-			// here: on legacy nothing was adopted, a bank was SELECTED, and the
-			// reading is of whatever that bank happens to hold — very often the
-			// device's own factory curve, which is exactly the state a DUT that
-			// never wrote anything leaves behind.
-			held := "reports an adopted curve whose CONTENT is not the one this row published"
-			if cv.Legacy() {
-				held = fmt.Sprintf("is running the bank ActCrv selects (bank %d), and its CONTENT is not "+
-					"the curve this row published", cv.Bank)
-			}
-			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-				"the DER's %s %s: %s. This row published %s. Full register state: %s. The models the DER "+
-					"serves are %s",
-				cv.Axis.Name, held, match.Reason, published, cv.Describe(), modelList(uv))}
+		if f.Verdict == certify.Pass && d.Verdict == certify.Pass {
+			f.Observed += " AND " + d.Observed
 		}
-		// The y-axis REFERENCE, checked separately from the points and after
-		// them, because the two are different defects with different owners and
-		// the second is invisible to the first. Identical breakpoints under the
-		// wrong DeptRef are a different command: "-30" against VAR_MAX_PCT and
-		// "-30" against W_MAX_PCT are a 2.3x difference on a 60 kW / 26.4 kvar
-		// DER and a 30x one on a 2 kvar machine, in the wrong direction, with
-		// every point matching. A referee that stopped at the points would
-		// certify that.
-		if want, ok := b.wantDeptRef(target.Model); ok {
-			if !cv.HasDeptRef {
-				return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-					"the DER's %s holds this row's breakpoints but its curve bank reports no DeptRef at "+
-						"all, so what its y values are a percentage OF cannot be read. This row published "+
-						"yRefType=%d (%s). Full register state: %s",
-					cv.Axis.Name, b.YRefType, derUnitRefName(b.YRefType), cv.Describe())}
-			}
-			if cv.DeptRef != want {
-				return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-					"the DER's %s holds exactly the breakpoints this row published, under the WRONG y-axis "+
-						"reference: DeptRef=%d (%s), where this row's yRefType=%d (%s) requires DeptRef=%d "+
-						"(%s). The points matching proves nothing here — the same numbers against a "+
-						"different base are a different command, and a read-back hash cannot see it "+
-						"because it carries the document's own yRefType at both ends. Full register "+
-						"state: %s",
-					cv.Axis.Name, cv.DeptRef, invariant.DeptRefName(target.Model, cv.DeptRef),
-					b.YRefType, derUnitRefName(b.YRefType), want, invariant.DeptRefName(target.Model, want),
-					cv.Describe())}
-			}
-		}
-		if !cv.Enabled {
-			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-				"the DER's %s holds exactly the breakpoints this row published, but the function itself is "+
-					"DISABLED (Ena=%d): a curve adopted into a switched-off function commands nothing, so "+
-					"this is not execution of the control. %s",
-				cv.Axis.Name, cv.EnaRaw, cv.Describe())}
-		}
-		// The read-only warning is 7xx-ONLY, and suppressing it on legacy is a
-		// correctness rule rather than noise reduction. On 7xx the live curve is
-		// index 0 and a conformant device keeps it read-only, so a writable one
-		// means the index-0 convention does not hold and this reading may be of
-		// a staged curve. On legacy EVERY bank is ordinarily writable — that is
-		// how a gateway installs a curve at all, there being no staging slot —
-		// so the same warning would fire on every correct legacy device and
-		// would be telling a reader something false about it.
-		if !cv.ReadOnly && !cv.Legacy() {
-			return Finding{Verdict: certify.Warn, Observed: fmt.Sprintf(
-				"the DER's %s holds exactly the breakpoints this row published and is enabled, but its "+
-					"index-0 curve reports ReadOnly=false — on a conformant device the ACTIVE curve is "+
-					"read-only and the writable ones are the staging indices, so this reading may be of a "+
-					"staged curve rather than the governing one. %s",
-				cv.Axis.Name, cv.Describe())}
-		}
-		// The PASS says HOW the curve became live, per generation, because that
-		// is the fact a reader checks the bundle for: on 7xx the adopt
-		// handshake COMPLETED, on legacy ActCrv selects the bank the content is
-		// in. Printing "adopt handshake COMPLETED" against a device with no
-		// such register would describe evidence that does not exist.
-		became := "its adopt handshake COMPLETED and the function is enabled"
-		if cv.Legacy() {
-			became = fmt.Sprintf("ActCrv selects that bank (bank %d) and ModEna bit 0 is set", cv.Bank)
-		}
-		return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
-			"the DER's own %s live curve holds exactly the breakpoints this row published, %s: %s. %s",
-			cv.Axis.Name, became, match.Reason, cv.Describe())}
+		return withNote(f, unmapped)
 	}
+}
+
+// withNote appends a note to a finding's observation, leaving the verdict
+// alone. An empty note is a no-op, so a row with nothing to disclose reads
+// exactly as it did before.
+func withNote(f Finding, note string) Finding {
+	if note == "" {
+		return f
+	}
+	f.Observed += note
+	return f
+}
+
+// droopOutcome measures the authored opModFreqDroop against the DER's own
+// parametric droop control, and is the reason a Pointless model is not an
+// unmeasurable one.
+//
+// The order of the checks mirrors the breakpoint oracle's for the same reason:
+// model absent, present-but-never-adopted, adopted-but-disabled, and
+// adopted-and-enabled-with-the-wrong-parameters are four different defects with
+// four different owners.
+//
+// It states, on EVERY terminal, that the row's breakpoint half is not asserted
+// here when that is the case. A verdict reading "the DER holds the droop this
+// row commanded" against a row whose Figure also prescribes a curve would
+// otherwise be read as covering both.
+func (b *curveBinding) droopOutcome(uv invariant.UnitView, target droopTarget, curve curveTarget,
+	published string) Finding {
+	preface := ""
+	if curve.NoRegisterHome != "" {
+		preface = fmt.Sprintf("this row also published %s northbound, and this DER's generation stores "+
+			"frequency-watt BREAKPOINTS in no register at all (%s) — so the curve half is served and "+
+			"NOT asserted here, and what follows is about the parametric droop only. ",
+			published, curve.NoRegisterHome)
+	}
+	cv := uv.Curve(oracleSimName, target.Model)
+	authored := b.Droop.describe()
+	if !cv.Present {
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"%sthis row published %s and the DER's own register image carries NOTHING for it: %s. %s The "+
+				"models the DER does serve are %s",
+			preface, authored, cv.Describe(), target.Mapping, modelList(uv))}
+	}
+	if cv.Droop == nil {
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"%sthis row published %s and the DER serves %s but its droop control did not decode, so there "+
+				"is nothing to compare: %s. %s",
+			preface, authored, cv.Axis.Name, cv.Describe(), target.Mapping)}
+	}
+	if !cv.Adopted {
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"%sthis row published %s and the DER's %s adopt handshake never COMPLETED, so no droop was "+
+				"taken up: %s. %s",
+			preface, authored, cv.Axis.Name, cv.Describe(), target.Mapping)}
+	}
+	if diff := droopMismatch(b.Droop.want711(), *cv.Droop); diff != "" {
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"%sthe DER's %s holds a droop control that is NOT the one this row published: %s. This row "+
+				"published %s, which is %s on this device. Full register state: %s",
+			preface, cv.Axis.Name, diff, authored, describeWant711(b.Droop.want711()), cv.Describe())}
+	}
+	if !cv.Enabled {
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"%sthe DER's %s holds exactly the droop parameters this row published, but the function itself "+
+				"is DISABLED (Ena=%d): a control adopted into a switched-off function commands nothing, so "+
+				"this is not execution. %s",
+			preface, cv.Axis.Name, cv.EnaRaw, cv.Describe())}
+	}
+	if !cv.ReadOnly {
+		return Finding{Verdict: certify.Warn, Observed: fmt.Sprintf(
+			"%sthe DER's %s holds exactly the droop parameters this row published and is enabled, but its "+
+				"index-0 control reports ReadOnly=false — on a conformant device the ACTIVE control is "+
+				"read-only and the writable ones are the staging indices, so this reading may be of a "+
+				"staged control rather than the governing one. %s",
+			preface, cv.Axis.Name, cv.Describe())}
+	}
+	return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
+		"%sthe DER's own %s live control holds exactly the droop parameters this row published (%s, which "+
+			"is %s on this device), its adopt handshake COMPLETED and the function is enabled: %s",
+		preface, cv.Axis.Name, authored, describeWant711(b.Droop.want711()), cv.Describe())}
+}
+
+// droopMismatch compares the five commanded parameters against the DER's own,
+// and returns the FIRST disagreement in full — or "" when every one matches
+// within the wire's own last digit.
+//
+// Every parameter is named with both numbers and the tolerance applied, because
+// a droop that missed by one register count and one that ignored the command
+// entirely must not read the same in a bundle.
+func droopMismatch(want, got invariant.DroopReading) string {
+	for _, c := range []struct {
+		name      string
+		want, got float64
+		tol       float64
+		unit      string
+	}{
+		{"DbOf (over-frequency dead band)", want.DbOfHz, got.DbOfHz, droopDeadbandToleranceHz, "Hz"},
+		{"DbUf (under-frequency dead band)", want.DbUfHz, got.DbUfHz, droopDeadbandToleranceHz, "Hz"},
+		{"KOf (over-frequency droop gain)", want.KOf, got.KOf, droopGainTolerance, ""},
+		{"KUf (under-frequency droop gain)", want.KUf, got.KUf, droopGainTolerance, ""},
+		{"RspTms (open-loop response time)", want.RspTmsS, got.RspTmsS, droopResponseToleranceS, "s"},
+	} {
+		if math.Abs(c.got-c.want) > c.tol {
+			unit := c.unit
+			if unit != "" {
+				unit = " " + unit
+			}
+			return fmt.Sprintf("%s is %s%s where this row commanded %s%s (tolerance %s%s, half the last "+
+				"digit the wire itself can carry)", c.name, trimNum(c.got), unit, trimNum(c.want), unit,
+				trimNum(c.tol), unit)
+		}
+	}
+	return ""
+}
+
+// describeWant711 renders the commanded droop in the DEVICE's units, so a
+// verdict shows both sides of the translation rather than asking a reader to
+// perform it.
+func describeWant711(w invariant.DroopReading) string {
+	return fmt.Sprintf("DbOf=%s Hz DbUf=%s Hz KOf=%s KUf=%s RspTms=%s s in model 711's own units",
+		trimNum(w.DbOfHz), trimNum(w.DbUfHz), trimNum(w.KOf), trimNum(w.KUf), trimNum(w.RspTmsS))
+}
+
+// curveContentOutcome is the BREAKPOINT half of a curve row's southbound
+// assertion — everything oracleCurve did before a row could also carry a droop.
+// Unchanged in substance; extracted so the two halves can be composed.
+func curveContentOutcome(b *curveBinding, uv invariant.UnitView, target curveTarget,
+	cv invariant.CurveView, published string) Finding {
+	if !cv.Present {
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"this row published %s northbound and the DER's own register image carries NOTHING for it: "+
+				"%s. %s The models the DER does serve are %s",
+			published, cv.Describe(), target.Mapping, modelList(uv))}
+	}
+	if !cv.Adopted {
+		// The two generations reach "not adopted" by different routes and a
+		// finding that named the wrong one would send a reader to a
+		// register that does not exist: on 7xx the adopt HANDSHAKE never
+		// COMPLETED; on legacy there is no handshake at all and the fact is
+		// that ActCrv does not select the bank this content would be in.
+		how := "adopt handshake never COMPLETED, so no curve was taken up"
+		if cv.Legacy() {
+			how = fmt.Sprintf("ActCrv selects no bank holding this row's content (ActCrv=%d) — on this "+
+				"generation there is no adopt handshake, so the SELECTION is the whole of the commit "+
+				"and a bank nobody selected commands nothing", cv.ActCrv)
+		}
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"this row published %s northbound and the DER's %s %s: %s. %s",
+			published, cv.Axis.Name, how, cv.Describe(), target.Mapping)}
+	}
+	match := invariant.MatchPoints(cv.Points, b.wantPoints(), curvePointTolerance)
+	if !match.Matched {
+		// "an adopted curve" is the 7xx wording and it would be misleading
+		// here: on legacy nothing was adopted, a bank was SELECTED, and the
+		// reading is of whatever that bank happens to hold — very often the
+		// device's own factory curve, which is exactly the state a DUT that
+		// never wrote anything leaves behind.
+		held := "reports an adopted curve whose CONTENT is not the one this row published"
+		if cv.Legacy() {
+			held = fmt.Sprintf("is running the bank ActCrv selects (bank %d), and its CONTENT is not "+
+				"the curve this row published", cv.Bank)
+		}
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"the DER's %s %s: %s. This row published %s. Full register state: %s. The models the DER "+
+				"serves are %s",
+			cv.Axis.Name, held, match.Reason, published, cv.Describe(), modelList(uv))}
+	}
+	// The y-axis REFERENCE, checked separately from the points and after
+	// them, because the two are different defects with different owners and
+	// the second is invisible to the first. Identical breakpoints under the
+	// wrong DeptRef are a different command: "-30" against VAR_MAX_PCT and
+	// "-30" against W_MAX_PCT are a 2.3x difference on a 60 kW / 26.4 kvar
+	// DER and a 30x one on a 2 kvar machine, in the wrong direction, with
+	// every point matching. A referee that stopped at the points would
+	// certify that.
+	if want, ok := b.wantDeptRef(target.Model); ok {
+		if !cv.HasDeptRef {
+			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+				"the DER's %s holds this row's breakpoints but its curve bank reports no DeptRef at "+
+					"all, so what its y values are a percentage OF cannot be read. This row published "+
+					"yRefType=%d (%s). Full register state: %s",
+				cv.Axis.Name, b.YRefType, derUnitRefName(b.YRefType), cv.Describe())}
+		}
+		if cv.DeptRef != want {
+			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+				"the DER's %s holds exactly the breakpoints this row published, under the WRONG y-axis "+
+					"reference: DeptRef=%d (%s), where this row's yRefType=%d (%s) requires DeptRef=%d "+
+					"(%s). The points matching proves nothing here — the same numbers against a "+
+					"different base are a different command, and a read-back hash cannot see it "+
+					"because it carries the document's own yRefType at both ends. Full register "+
+					"state: %s",
+				cv.Axis.Name, cv.DeptRef, invariant.DeptRefName(target.Model, cv.DeptRef),
+				b.YRefType, derUnitRefName(b.YRefType), want, invariant.DeptRefName(target.Model, want),
+				cv.Describe())}
+		}
+	}
+	if !cv.Enabled {
+		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+			"the DER's %s holds exactly the breakpoints this row published, but the function itself is "+
+				"DISABLED (Ena=%d): a curve adopted into a switched-off function commands nothing, so "+
+				"this is not execution of the control. %s",
+			cv.Axis.Name, cv.EnaRaw, cv.Describe())}
+	}
+	// The read-only warning is 7xx-ONLY, and suppressing it on legacy is a
+	// correctness rule rather than noise reduction. On 7xx the live curve is
+	// index 0 and a conformant device keeps it read-only, so a writable one
+	// means the index-0 convention does not hold and this reading may be of
+	// a staged curve. On legacy EVERY bank is ordinarily writable — that is
+	// how a gateway installs a curve at all, there being no staging slot —
+	// so the same warning would fire on every correct legacy device and
+	// would be telling a reader something false about it.
+	if !cv.ReadOnly && !cv.Legacy() {
+		return Finding{Verdict: certify.Warn, Observed: fmt.Sprintf(
+			"the DER's %s holds exactly the breakpoints this row published and is enabled, but its "+
+				"index-0 curve reports ReadOnly=false — on a conformant device the ACTIVE curve is "+
+				"read-only and the writable ones are the staging indices, so this reading may be of a "+
+				"staged curve rather than the governing one. %s",
+			cv.Axis.Name, cv.Describe())}
+	}
+	// The PASS says HOW the curve became live, per generation, because that
+	// is the fact a reader checks the bundle for: on 7xx the adopt
+	// handshake COMPLETED, on legacy ActCrv selects the bank the content is
+	// in. Printing "adopt handshake COMPLETED" against a device with no
+	// such register would describe evidence that does not exist.
+	became := "its adopt handshake COMPLETED and the function is enabled"
+	if cv.Legacy() {
+		became = fmt.Sprintf("ActCrv selects that bank (bank %d) and ModEna bit 0 is set", cv.Bank)
+	}
+	return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
+		"the DER's own %s live curve holds exactly the breakpoints this row published, %s: %s. %s",
+		cv.Axis.Name, became, match.Reason, cv.Describe())}
 }
 
 // modelList renders the SunSpec models the DER actually served, so a FAIL about
@@ -963,6 +1457,14 @@ func publishCurveControl(ctx context.Context, d *Driver, params map[string]strin
 	pub, err := d.PostCurveDetail(ctx, CurveRequest{
 		Program: 0, Mode: b.Mode, Points: b.Points, YRefType: b.YRefType,
 		XMult: b.XMult, YMult: b.YMult,
+		// Everything else the row's Figure prescribes rides the SAME request,
+		// because it rides the same control on the wire: openLoopTms on the
+		// DERCurve, opModFreqDroop inline on the DERControlBase beside the curve
+		// link. Publishing them separately would produce two controls where the
+		// procedure prescribes one, and the row would then be unable to say the
+		// DUT was ever offered the combination.
+		OpenLoopTms: b.OpenLoopTms,
+		FreqDroop:   droopSettings(b.Droop),
 		Description: "certify " + b.Mode,
 		// The oracled window, not curveMode's old 180 s: the PostWait oracle
 		// can read the DER anywhere out to wait+settle (see oracleWindow), and
@@ -1152,6 +1654,12 @@ func critDERCurveResolvable(href string) criterion {
 func critCurvePublishedTheProcedureValues(subject string, b *curveBinding) criterion {
 	material := b.materialGaps()
 	prescribed := orText(b.Prescribed, "this row's binding records no provenance for its published values")
+	// What this row places on the wire BEYOND the breakpoints and multipliers,
+	// with the register home each has per generation. It is stated here, in the
+	// construction claim, because that is where a reader learns what the row
+	// sent; whether any of it could then be MEASURED is the southbound
+	// criterion's business, and the two are deliberately separate sentences.
+	authored := describeAuthored(b.authored())
 	return criterion{
 		Claim: "the control this row published carries the values the certification procedure prescribes " +
 			"for " + subject,
@@ -1172,14 +1680,16 @@ func critCurvePublishedTheProcedureValues(subject string, b *curveBinding) crite
 					"DIFFERS from the procedure's own default, so the DUT was never offered the condition " +
 					"this row exists to create. This is a BENCH capability gap, not a defect of the device " +
 					"under test — and it is reported as a FAIL rather than skipped, because a row that was " +
-					"not run to its procedure must not roll up as one that was. Elements omitted with no " +
-					"material effect (test value equal to the default, or a transcription divergence this " +
-					"bench deliberately does not follow): " + describeGaps(immaterialGaps(b))}
+					"not run to its procedure must not roll up as one that was. Elements the row DOES " +
+					"author beyond the breakpoints and multipliers: " + authored + ". Elements omitted " +
+					"with no material effect (test value equal to the default, or a transcription " +
+					"divergence this bench deliberately does not follow): " + describeGaps(immaterialGaps(b))}
 			}
 			return Finding{Verdict: certify.Pass, Observed: "this row published " + prescribed +
-				". Elements omitted with no material effect (test value equal to the default, or a " +
-				"transcription divergence this bench deliberately does not follow): " +
-				describeGaps(immaterialGaps(b))}
+				". Elements the row authors beyond the breakpoints and multipliers, with the register " +
+				"home each has per generation: " + authored + ". Elements omitted with no material " +
+				"effect (test value equal to the default, or a transcription divergence this bench " +
+				"deliberately does not follow): " + describeGaps(immaterialGaps(b))}
 		},
 	}
 }

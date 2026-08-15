@@ -29,6 +29,7 @@ import (
 	"testing"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/invariant"
 )
 
 // figurePoint matches one "(x, y)" pair as the catalog prints it, with or
@@ -133,16 +134,44 @@ func renderPts(pts []CurvePoint) string {
 // binding publishes are the ones the catalog's own Figure prescribes — read
 // from the catalog at run time, never restated here.
 func TestCurveRows_PublishTheCatalogPrescribedValues(t *testing.T) {
+	// The non-breakpoint Figure rows, per row. openLoopTms and the five
+	// opModFreqDroop children joined this table when curve plan #32 built their
+	// levers; before that they were the rows' MATERIAL GAPS, and the rows held
+	// themselves at FAIL rather than claiming to have sent them.
+	openLoopTms := figureScalar{"opModVoltVar.DERCurve.openLoopTms",
+		func(b *curveBinding) (int, bool) {
+			if b.OpenLoopTms == nil {
+				return 0, false
+			}
+			return int(*b.OpenLoopTms), true
+		}}
+	droop := func(name string, read func(FreqDroopSettings) int) figureScalar {
+		return figureScalar{"opModFreqDroop." + name, func(b *curveBinding) (int, bool) {
+			if b.Droop == nil {
+				return 0, false
+			}
+			return read(b.Droop.Settings), true
+		}}
+	}
 	for _, tc := range []struct {
 		id string
 		// yRefTypeInFigure is false for a Figure that prescribes no y
 		// reference (BASIC-006's Figure 6 lists none), where the row's choice
 		// is its own and is asserted separately below.
 		yRefTypeInFigure bool
+		// authored are the Figure's non-breakpoint scalar rows this bench can
+		// now place on the wire, checked against the catalog's own columns.
+		authored []figureScalar
 	}{
-		{"BASIC-006", false},
-		{"BASIC-011", true},
-		{"BASIC-012", true},
+		{"BASIC-006", false, []figureScalar{openLoopTms}},
+		{"BASIC-011", true, nil},
+		{"BASIC-012", true, []figureScalar{
+			droop("dBOF", func(s FreqDroopSettings) int { return int(s.DBOF) }),
+			droop("dBUF", func(s FreqDroopSettings) int { return int(s.DBUF) }),
+			droop("kOF", func(s FreqDroopSettings) int { return int(s.KOF) }),
+			droop("kUF", func(s FreqDroopSettings) int { return int(s.KUF) }),
+			droop("openLoopTms", func(s FreqDroopSettings) int { return int(s.OpenLoopTms) }),
+		}},
 	} {
 		t.Run(tc.id, func(t *testing.T) {
 			c := catalogCase(t, "csip-conf-v1.3::"+tc.id)
@@ -173,7 +202,143 @@ func TestCurveRows_PublishTheCatalogPrescribedValues(t *testing.T) {
 				t.Errorf("%s records no provenance for its published values, so a bundle cannot show "+
 					"where they came from", tc.id)
 			}
+			// The rest of the row's Figure — the scalars and the inline element
+			// beside the breakpoints. Both were unsendable until curve plan #32
+			// built their levers, and both rows held themselves at FAIL saying
+			// so; with the levers built, an omission would no longer announce
+			// itself and only this assertion would catch it.
+			for _, el := range tc.authored {
+				got, ok := el.read(b)
+				if !ok {
+					t.Errorf("%s authors no %s; the catalog prescribes it and the lever to send it exists, "+
+						"so leaving it off means the DUT is never offered the condition the row is about",
+						tc.id, el.element)
+					continue
+				}
+				if want := catalogInt(t, c, el.element); got != want {
+					t.Errorf("%s authors %s=%d, want the catalog's Test Value %d", tc.id, el.element, got, want)
+				}
+			}
 		})
+	}
+}
+
+// figureScalar is one non-breakpoint Figure row: the element name as the
+// catalog prints it, and how to read what the binding authored for it.
+type figureScalar struct {
+	element string
+	read    func(*curveBinding) (int, bool)
+}
+
+// TestCurveRows_RecordWhereEachAuthoredElementCanBeReadBack is the second half
+// of the #32 construction guarantee, and it is about a distinction the suite
+// did not previously have to make.
+//
+// An element the bench CAN now send is not thereby an element the DER can be
+// read for. openLoopTms has no register in any SunSpec curve bank on either
+// generation; opModFreqDroop has an exact home on 7xx (model 711) and none at
+// all on legacy. "Authored northbound" and "measurable southbound" are separate
+// facts about the same element, and a row that recorded only the first would
+// let a southbound PASS be read as covering content nothing ever looked at.
+func TestCurveRows_RecordWhereEachAuthoredElementCanBeReadBack(t *testing.T) {
+	for _, tc := range []struct {
+		id      string
+		element string
+		// home7xx/homeLegacy: whether the element has a register home there.
+		home7xx, homeLegacy bool
+	}{
+		{"BASIC-006", "DERCurve.openLoopTms", false, false},
+		{"BASIC-012", "opModFreqDroop", true, false},
+	} {
+		t.Run(tc.id+" "+tc.element, func(t *testing.T) {
+			b := rowByID(t, tc.id).mode.Curve
+			var found bool
+			for _, a := range b.authored() {
+				if a.Element != tc.element {
+					continue
+				}
+				found = true
+				if _, ok := a.homeOn(invariant.Family7xx); ok != tc.home7xx {
+					t.Errorf("%s's %s reports a 7xx register home = %t (%q), want %t",
+						tc.id, tc.element, ok, a.Home7xx, tc.home7xx)
+				}
+				if _, ok := a.homeOn(invariant.FamilyLegacy); ok != tc.homeLegacy {
+					t.Errorf("%s's %s reports a legacy register home = %t (%q), want %t",
+						tc.id, tc.element, ok, a.HomeLegacy, tc.homeLegacy)
+				}
+				if (!tc.home7xx || !tc.homeLegacy) && a.Why == "" {
+					t.Errorf("%s's %s has no register home on one generation and records no reason, so "+
+						"the absence has no owner", tc.id, tc.element)
+				}
+				if a.Value == "" {
+					t.Errorf("%s's %s records no authored VALUE, so a bundle cannot show what was served",
+						tc.id, tc.element)
+				}
+			}
+			if !found {
+				t.Fatalf("%s's authored-element record does not name %s at all, so nothing in the bundle "+
+					"says it was served and not measured", tc.id, tc.element)
+			}
+			// And the sentence a verdict carries must actually name it on the
+			// generation where it cannot be read.
+			for fam, want := range map[invariant.CurveFamily]bool{
+				invariant.Family7xx: !tc.home7xx, invariant.FamilyLegacy: !tc.homeLegacy,
+			} {
+				note := describeUnmappable(b.unmappableOn(fam))
+				if got := strings.Contains(note, tc.element); got != want {
+					t.Errorf("%s: the %s verdict note %s %s; want it %s", tc.id, fam,
+						map[bool]string{true: "names", false: "does not name"}[got], tc.element,
+						map[bool]string{true: "named", false: "unnamed"}[want])
+				}
+			}
+		})
+	}
+}
+
+// TestBASIC012_PublishesTheFigureUnitsVerbatimAndDoesNotCorrectThem pins a
+// transcription decision that is easy to "fix" wrongly.
+//
+// Figure 12 prints dBOF/dBUF as Default 36 / Test 60030, and the catalog's own
+// note records that the two columns cannot both be dead bands in one unit: 36
+// reads as hundredths of Hz while 60030/59970 read as absolute frequencies in
+// millihertz, and the document does not reconcile them. sep 2.0.4 fixes the
+// element's unit at thousandths of Hz, so what this row puts on the wire is
+// 60.030 Hz and 59.970 Hz.
+//
+// A future reader who "corrected" the row to 30/30 — a ±0.030 Hz dead band,
+// which is what the Test Values probably MEAN — would be certifying a control
+// the procedure never printed. The transcription question belongs to whoever
+// owns the document; this keeps the bench sending what it says, and keeps the
+// referee's own translation of it honest.
+func TestBASIC012_PublishesTheFigureUnitsVerbatimAndDoesNotCorrectThem(t *testing.T) {
+	c := catalogCase(t, "csip-conf-v1.3::BASIC-012")
+	b := rowByID(t, "BASIC-012").mode.Curve
+	if b.Droop == nil {
+		t.Fatal("BASIC-012 authors no opModFreqDroop")
+	}
+	for _, tc := range []struct {
+		element string
+		got     uint32
+	}{
+		{"opModFreqDroop.dBOF", b.Droop.Settings.DBOF},
+		{"opModFreqDroop.dBUF", b.Droop.Settings.DBUF},
+	} {
+		line := figureLine(t, c, tc.element)
+		if !strings.Contains(testValues(t, line), strconv.Itoa(int(tc.got))) {
+			t.Errorf("BASIC-012 sends %s=%d, which is not the value the Figure prints:\n%s",
+				tc.element, tc.got, line)
+		}
+	}
+	// The referee's own translation, which is what a verdict compares against:
+	// thousandths of Hz -> Hz and hundredths of a second -> s, per the schema's
+	// own sentences.
+	if got := b.Droop.want711().DbOfHz; got != 60.03 {
+		t.Errorf("the referee translates dBOF=%d to %v Hz on model 711, want 60.03",
+			b.Droop.Settings.DBOF, got)
+	}
+	if got := b.Droop.want711().RspTmsS; got != 6 {
+		t.Errorf("the referee translates openLoopTms=%d to %v s, want 6",
+			b.Droop.Settings.OpenLoopTms, got)
 	}
 }
 
@@ -241,17 +406,22 @@ func TestCurveRows_NameEveryPrescribedElementTheyCannotAuthor(t *testing.T) {
 		id           string
 		wantMaterial []string
 	}{
-		// Figure 6 prescribes openLoopTms 5 against its own default of 10, so
-		// the DUT is never offered the condition the row exists to create.
-		{"BASIC-006", []string{"opModVoltVar.DERCurve.openLoopTms"}},
-		// Figure 11 prescribes nothing this bench cannot author.
+		// NONE of the three rows has a material gap left, and that is curve
+		// plan #32's whole deliverable.
+		//
+		// BASIC-006 held on openLoopTms (Figure 6: test 5 against default 10)
+		// and BASIC-012 on all five opModFreqDroop children, because gridsim
+		// could author neither. Both levers now exist, both rows author the
+		// Figure's own values, and both rows hold only if the SERVE fails.
+		//
+		// What remains on each is immaterial and stays named: the
+		// autonomous-Vref pair (which sep 2.0.4 declares nowhere, so no
+		// conformant server can send it, and whose columns agree anyway) and
+		// the curveType divergence (the catalog's own numbering, which the
+		// schema does not define for the element).
+		{"BASIC-006", nil},
 		{"BASIC-011", nil},
-		// Figure 12 prescribes an immediate opModFreqDroop control alongside
-		// the curve, and gridsim has no lever for it at all.
-		{"BASIC-012", []string{
-			"opModFreqDroop.dBOF", "opModFreqDroop.dBUF", "opModFreqDroop.kOF",
-			"opModFreqDroop.kUF", "opModFreqDroop.openLoopTms",
-		}},
+		{"BASIC-012", nil},
 	} {
 		t.Run(tc.id, func(t *testing.T) {
 			b := rowByID(t, tc.id).mode.Curve
@@ -342,12 +512,15 @@ func TestCurvePrescribedValuesCriterion_HoldsWithoutACapture(t *testing.T) {
 		id   string
 		want certify.Verdict
 	}{
-		// BASIC-006 holds: Figure 6 prescribes openLoopTms 5 against its own
-		// default of 10 and this bench cannot send it.
-		{"BASIC-006", certify.Fail},
-		// BASIC-011 prescribes nothing this bench cannot author.
+		// All three PASS now. BASIC-006 and BASIC-012 used to hold here — on
+		// openLoopTms and on the five opModFreqDroop children respectively —
+		// and curve plan #32 built both levers, so the rows author their
+		// Figures whole and this construction claim is satisfied. The
+		// criterion's teeth are unchanged and still tested: reintroduce a
+		// material gap and it FAILs again, with or without a capture.
+		{"BASIC-006", certify.Pass},
 		{"BASIC-011", certify.Pass},
-		{"BASIC-012", certify.Fail},
+		{"BASIC-012", certify.Pass},
 	} {
 		t.Run(tc.id, func(t *testing.T) {
 			crit := critCurvePublishedTheProcedureValues("the subject", rowByID(t, tc.id).mode.Curve)
@@ -373,6 +546,37 @@ func TestCurvePrescribedValuesCriterion_HoldsWithoutACapture(t *testing.T) {
 			}
 		})
 	}
+
+	// THE TEETH, kept exercised now that no shipping row has a material gap.
+	//
+	// Curve plan #32 closed both of the rows that used to hold here, so the
+	// FAIL branch above no longer runs against anything real — and a hold that
+	// nothing exercises is a hold that can rot out. A synthetic binding stands
+	// in for the next Figure element this bench cannot send: the criterion must
+	// still FAIL on it, name it, and do both with and without a capture.
+	t.Run("a material gap still holds the row", func(t *testing.T) {
+		gapped := &curveBinding{
+			Mode:       "volt_var",
+			Points:     []CurvePoint{{X: 9100, Y: 4000}},
+			Prescribed: "a synthetic binding, for this test only",
+			Gaps: []curveGap{{Element: "opModVoltVar.DERCurve.rampPT1Tms", Prescribed: "300",
+				Default: "0", Why: noPrescribedCurveRampLever, Material: true}},
+		}
+		crit := critCurvePublishedTheProcedureValues("the subject", gapped)
+		for _, obs := range []*Observation{
+			{Case: &certify.Case{UID: "csip-conf-v1.3::synthetic", ID: "synthetic"}},
+			{Case: &certify.Case{UID: "csip-conf-v1.3::synthetic", ID: "synthetic"},
+				Transcript: &Transcript{Decrypted: true}},
+		} {
+			if got := assertVerdictOf(t, crit, obs); got != certify.Fail {
+				t.Errorf("a binding with a MATERIAL authoring gap scored %s, want FAIL — the hold that "+
+					"BASIC-006 and BASIC-012 used to rest on must survive their closure", got)
+			}
+		}
+		if f := crit.Construction(); !strings.Contains(f.Observed, "rampPT1Tms") {
+			t.Errorf("the holding criterion does not name the element it holds on:\n%s", f.Observed)
+		}
+	})
 }
 
 // assertVerdictOf mints one criterion through the real assert path and returns

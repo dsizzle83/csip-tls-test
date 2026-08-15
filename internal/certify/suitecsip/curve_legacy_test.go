@@ -183,20 +183,37 @@ func TestLegacyCurveRowsAreRedAgainstTheShippingProduct(t *testing.T) {
 	}
 }
 
-// TestBASIC012ResolvesTo134OnLegacyAndStaysADecidedFailOn7xx is D2's acceptance
-// criterion as a test, and it is a statement about BOTH benches.
+// TestBASIC012MeasuresTheCurveOnLegacyAndTheDroopOn7xx is D2's acceptance
+// criterion plus curve plan #32's re-adjudication of the other bench, and it is
+// one statement about BOTH.
 //
-// On 7xx the row must go on refusing to measure: the set has no model that
-// stores frequency-watt breakpoints, 711 is a parametric droop, and asserting
-// something weaker against it is the substitution this suite exists to refuse.
-// On legacy the same catalog row must become a real measurement against 134.
-// One row, two benches, and it says which one it was on.
-func TestBASIC012ResolvesTo134OnLegacyAndStaysADecidedFailOn7xx(t *testing.T) {
+// Figure 12 prescribes two things — a frequency-WATT curve and an immediate
+// frequency-DROOP control — and their register fates are exactly opposite:
+//
+//	7xx     no model stores frequency-watt breakpoints (711 is parametric), and
+//	        711 IS the exact home of the droop's five parameters
+//	legacy  M134 stores the breakpoints, and nothing stores the droop
+//
+// So the row measures whichever half the DER in front of it can hold, and says
+// on every verdict which half it did not assert. Before #32 the 7xx arm was a
+// DECIDED FAIL that no product behaviour could ever move, because the bench
+// could not author the only content that generation can store; that is the
+// thing this test now pins as closed.
+//
+// BOTH arms are RED here, against the SHIPPING product, and for two different
+// honest reasons — the legacy banks are unwritten, and 711 holds its factory
+// droop and never adopted. Neither is "no measurement was possible".
+func TestBASIC012MeasuresTheCurveOnLegacyAndTheDroopOn7xx(t *testing.T) {
 	b := rowByID(t, "BASIC-012").mode.Curve
 	if b == nil {
 		t.Fatal("BASIC-012 carries no curve binding")
 	}
+	if b.Droop == nil {
+		t.Fatal("BASIC-012 authors no opModFreqDroop, so its 7xx arm has nothing to measure and Figure " +
+			"12's other half is not on the wire at all")
+	}
 
+	// ── LEGACY: the breakpoints are measured, the droop is named ──
 	legacy := newLegacyFixture(t, sim.LegacyCurveOptions{})
 	target, how := b.resolveTarget(legacy.unitView(t))
 	if how != curveResolved {
@@ -215,7 +232,17 @@ func TestBASIC012ResolvesTo134OnLegacyAndStaysADecidedFailOn7xx(t *testing.T) {
 	if strings.Contains(got.Observed, "NO southbound register home") {
 		t.Errorf("BASIC-012 on a legacy bench still reports the 7xx no-home refusal:\n%s", got.Observed)
 	}
+	// The droop was SERVED to this DUT and no legacy register can hold it. A
+	// verdict that did not say so would let a reader take the M134 reading for
+	// a statement about the whole of Figure 12.
+	if !strings.Contains(got.Observed, "AUTHORED BUT NOT DEVICE-MAPPABLE") ||
+		!strings.Contains(got.Observed, "opModFreqDroop") {
+		t.Errorf("BASIC-012's legacy verdict does not disclose that the droop it authored has no register "+
+			"home on this generation:\n%s", got.Observed)
+	}
+	t.Logf("BASIC-012 RED on legacy (M134 unwritten), droop named as unmappable:\n  %s", got.Observed)
 
+	// ── 7xx: the DROOP is measured, the breakpoints are named ──
 	sevenXx := newCurveFixture(t)
 	uv7, err := oracleUnitView(context.Background(), sevenXx.rc, oracleSimName)
 	if err != nil {
@@ -225,16 +252,128 @@ func TestBASIC012ResolvesTo134OnLegacyAndStaysADecidedFailOn7xx(t *testing.T) {
 	if how7 != curveResolved {
 		t.Fatal("BASIC-012 resolved no southbound target on a 7xx bench")
 	}
+	// The BREAKPOINT arm is unchanged and must stay unchanged: 711 is named as
+	// the nearest model and the refusal to grade points against it stands.
 	if target7.Model != sunspec.ModelDERFreqDroop || target7.NoRegisterHome == "" {
 		t.Errorf("BASIC-012 on a 7xx bench resolved to M%d with no-home=%q, want M711 with the "+
-			"no-register-home refusal intact", target7.Model, target7.NoRegisterHome)
+			"no-register-home refusal for the BREAKPOINTS intact", target7.Model, target7.NoRegisterHome)
+	}
+	if dt := b.Droop.resolve(gen7xx); dt.Model != sunspec.ModelDERFreqDroop || dt.NoRegisterHome != "" {
+		t.Errorf("BASIC-012's droop resolved to M%d with no-home=%q on 7xx, want M711 with a real home",
+			dt.Model, dt.NoRegisterHome)
 	}
 	got7 := oracleCurve(b)(context.Background(), sevenXx.rc)
-	if got7.Verdict != certify.Fail || !strings.Contains(got7.Observed, "NO southbound register home") {
-		t.Errorf("BASIC-012 on a 7xx bench = %s, want the decided no-register-home FAIL:\n%s",
+	if got7.Verdict != certify.Fail {
+		t.Fatalf("BASIC-012 on a 7xx bench with an unwritten 711 = %s, want FAIL:\n%s",
 			got7.Verdict, got7.Observed)
 	}
-	t.Logf("BASIC-012 on 7xx (unchanged):\n  %s", got7.Observed)
+	// It must be the DROOP's FAIL, not the old "nothing could be measured" one.
+	if !strings.Contains(got7.Observed, "M711") || !strings.Contains(got7.Observed, "opModFreqDroop") {
+		t.Errorf("BASIC-012's 7xx verdict does not report a measurement of the droop against M711:\n%s",
+			got7.Observed)
+	}
+	if !strings.Contains(got7.Observed, "NOT asserted here") {
+		t.Errorf("BASIC-012's 7xx verdict does not disclose that the frequency-watt BREAKPOINTS it also "+
+			"published are served and unasserted on this generation:\n%s", got7.Observed)
+	}
+	t.Logf("BASIC-012 RED on 7xx (M711 holds its factory droop and never adopted):\n  %s", got7.Observed)
+}
+
+// TestBASIC012DroopTurnsGreenWhenTheRealWriterRuns is the discrimination proof
+// for the arm curve plan #32 opened, and it is the half that says the 7xx
+// verdict above is a MEASUREMENT rather than a row that is simply always red.
+//
+// The writer is lexa-proto's own derbase.WriteFreqDroop — the one the product's
+// reconciler calls (cmd/modbus's executeDroopLocked) — driven against the same
+// device the referee reads, with the values translated out of the row's own
+// authored FreqDroopType. Nothing here hand-writes a register.
+//
+// The PMin read-modify-write is the product's, not an invention of this test:
+// model 711's PMin has no 2030.5 source, so a writer preserves whatever the
+// device holds. Writing 0 would tell the device it may curtail to zero, which
+// is a different machine.
+func TestBASIC012DroopTurnsGreenWhenTheRealWriterRuns(t *testing.T) {
+	f := newCurveFixture(t)
+	b := rowByID(t, "BASIC-012").mode.Curve
+
+	before := oracleCurve(b)(context.Background(), f.rc)
+	if before.Verdict != certify.Fail {
+		t.Fatalf("BASIC-012 started %s on a 7xx DER whose 711 nobody wrote, so a later PASS would prove "+
+			"nothing:\n%s", before.Verdict, before.Observed)
+	}
+
+	live, err := f.base.ReadFreqDroop("basic012-droop-test")
+	if err != nil {
+		t.Fatalf("read the DER's own droop control: %v", err)
+	}
+	want := b.Droop.want711()
+	if err := f.base.WriteFreqDroop(sunspec.FreqDroopCtl{
+		DbOf: want.DbOfHz, DbUf: want.DbUfHz, KOf: want.KOf, KUf: want.KUf, RspTms: want.RspTmsS,
+		PMin: live.PMin, // read-modify-write, exactly as the product does
+	}, "basic012-droop-test"); err != nil {
+		t.Fatalf("the REAL derbase writer refused this row's own droop: %v", err)
+	}
+
+	after := oracleCurve(b)(context.Background(), f.rc)
+	if after.Verdict != certify.Pass {
+		t.Fatalf("BASIC-012 after derbase.WriteFreqDroop installed its droop into M711 = %s, want PASS:\n%s",
+			after.Verdict, after.Observed)
+	}
+	// Green on the droop must NOT read as green on the whole Figure.
+	if !strings.Contains(after.Observed, "NOT asserted here") {
+		t.Errorf("the PASS does not say that the frequency-watt breakpoints were served and not "+
+			"asserted on this generation:\n%s", after.Observed)
+	}
+	t.Logf("BASIC-012 GREEN on 7xx after derbase.WriteFreqDroop:\n  %s", after.Observed)
+}
+
+// TestBASIC012DroopMismatchIsAFail is the teeth of the droop oracle: a device
+// holding a droop that is NOT the commanded one must fail, per parameter, and
+// say which one and by how much.
+//
+// The tolerance is half the last digit the WIRE can carry, so a device off by
+// one thousandth of a Hz on the dead band fails — which is the point. A
+// relative tolerance of the kind the breakpoint oracle uses would be 0.6 Hz on
+// a 60.03 Hz dead band, twenty times the whole offset the Figure is about, and
+// would accept a device that had ignored the setting entirely.
+func TestBASIC012DroopMismatchIsAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	b := rowByID(t, "BASIC-012").mode.Curve
+	want := b.Droop.want711()
+	live, err := f.base.ReadFreqDroop("basic012-droop-mismatch")
+	if err != nil {
+		t.Fatalf("read the DER's own droop control: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		ctl   sunspec.FreqDroopCtl
+		names string
+	}{
+		{"dead band off by one wire digit", sunspec.FreqDroopCtl{
+			DbOf: want.DbOfHz + 0.001, DbUf: want.DbUfHz, KOf: want.KOf, KUf: want.KUf,
+			RspTms: want.RspTmsS, PMin: live.PMin}, "DbOf"},
+		{"gain ignored", sunspec.FreqDroopCtl{
+			DbOf: want.DbOfHz, DbUf: want.DbUfHz, KOf: 0.02, KUf: want.KUf,
+			RspTms: want.RspTmsS, PMin: live.PMin}, "KOf"},
+		{"response time from a different control", sunspec.FreqDroopCtl{
+			DbOf: want.DbOfHz, DbUf: want.DbUfHz, KOf: want.KOf, KUf: want.KUf,
+			RspTms: 5, PMin: live.PMin}, "RspTms"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := f.base.WriteFreqDroop(tc.ctl, "basic012-droop-mismatch"); err != nil {
+				t.Fatalf("write the near-miss droop: %v", err)
+			}
+			got := oracleCurve(b)(context.Background(), f.rc)
+			if got.Verdict != certify.Fail {
+				t.Fatalf("a DER holding a droop that differs in %s scored %s, want FAIL:\n%s",
+					tc.names, got.Verdict, got.Observed)
+			}
+			if !strings.Contains(got.Observed, tc.names) {
+				t.Errorf("the FAIL does not name the parameter that differs (%s):\n%s", tc.names, got.Observed)
+			}
+		})
+	}
 }
 
 // TestBASIC015FlipsApparatusByGeneration pins the per-generation split, which
@@ -401,19 +540,31 @@ func TestLegacyCurveRowsTurnGreenWhenTheRealLegacyWriterRuns(t *testing.T) {
 		model   uint16
 		axis    string
 		deptRef uint16 // 0 = this model carries no DeptRef register
+		// unmappable is the element the row also AUTHORS and that this
+		// generation stores in no register. The green verdict must name it, or
+		// a reader would take the PASS for a statement about the whole Figure.
+		// Empty for a row whose Figure asks for nothing beyond the curve.
+		unmappable string
 	}{
 		// 126 declares {1 %WMax, 2 %VArMax, 3 %VArAval}; BASIC-006 publishes
 		// yRefType 3 (%statVarAvail), which is %VArAval = 3 in that enum.
-		{"BASIC-006", sunspec.ModelVoltVarLegacy, "opModVoltVar", 3},
+		//
+		// Its openLoopTms goes on the wire (curve plan #32) and lands in no
+		// legacy register — 126 carries ActCrv, ModEna, DeptRef and points and
+		// no timing register at all — so the PASS has to say so.
+		{"BASIC-006", sunspec.ModelVoltVarLegacy, "opModVoltVar", 3, "DERCurve.openLoopTms"},
 		// 132 declares {1 %WMax, 2 %WAvail}; BASIC-011 publishes yRefType 1
-		// (%setMaxW), which is %WMax = 1.
-		{"BASIC-011", sunspec.ModelVoltWattLegacy, "opModVoltWatt", 1},
+		// (%setMaxW), which is %WMax = 1. Figure 11 prescribes nothing beyond
+		// the curve, so this row's verdict must carry NO unmappable clause.
+		{"BASIC-011", sunspec.ModelVoltWattLegacy, "opModVoltWatt", 1, ""},
 		// 134 carries no DeptRef: its y values are % WRef, a register in the
-		// same block rather than an enum code.
-		{"BASIC-012", sunspec.ModelFreqWattLegacy, "opModFreqWatt", 0},
+		// same block rather than an enum code. Its opModFreqDroop has no legacy
+		// home either — M127 is a different function — so the same disclosure
+		// applies, one element up.
+		{"BASIC-012", sunspec.ModelFreqWattLegacy, "opModFreqWatt", 0, "opModFreqDroop"},
 		// 131 carries no DeptRef: the spec fixes x at %WMax and y is a power
 		// factor, which is not a percentage OF anything.
-		{"BASIC-015", sunspec.ModelWattPFLegacy, "opModWattPF", 0},
+		{"BASIC-015", sunspec.ModelWattPFLegacy, "opModWattPF", 0, ""},
 	} {
 		t.Run(tc.id, func(t *testing.T) {
 			f := newLegacyFixture(t, sim.LegacyCurveOptions{})
@@ -436,6 +587,21 @@ func TestLegacyCurveRowsTurnGreenWhenTheRealLegacyWriterRuns(t *testing.T) {
 			if after.Verdict != certify.Pass {
 				t.Fatalf("%s after the real writer installed its curve into M%d bank %d = %s, want PASS.\n%s",
 					tc.id, tc.model, out.Bank, after.Verdict, after.Observed)
+			}
+			// A GREEN row must not be read as green on content nothing looked
+			// at. The elements curve plan #32 put on the wire have no legacy
+			// register home, and the PASS says which — or says nothing at all,
+			// for a row that authored nothing beyond its curve.
+			named := strings.Contains(after.Observed, "AUTHORED BUT NOT DEVICE-MAPPABLE")
+			if tc.unmappable == "" {
+				if named {
+					t.Errorf("%s's PASS discloses an unmappable element, but this row's Figure prescribes "+
+						"nothing beyond the curve:\n%s", tc.id, after.Observed)
+				}
+			} else if !named || !strings.Contains(after.Observed, tc.unmappable) {
+				t.Errorf("%s's PASS does not disclose that it also served %s, which no legacy register can "+
+					"hold — so the verdict reads as covering the whole of the row's Figure:\n%s",
+					tc.id, tc.unmappable, after.Observed)
 			}
 			t.Logf("%s GREEN after derbase.WriteLegacyCurve (bank %d, caseB=%t):\n  %s",
 				tc.id, out.Bank, out.CaseB, after.Observed)

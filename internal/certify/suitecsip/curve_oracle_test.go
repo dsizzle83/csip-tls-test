@@ -225,6 +225,88 @@ func (f *curveFixture) adoptVoltVar(t *testing.T, deptRef uint16, pts []sunspec.
 	}
 }
 
+// TestOracleCurve_BothHalvesMustHoldAndTheWorseOneDecides pins the composition
+// rule for a row whose Figure prescribes breakpoints AND an inline droop on a
+// generation that stores BOTH.
+//
+// No shipping row reaches this today — BASIC-012's two halves land on opposite
+// generations, so each bench measures one — and that is exactly why it is
+// tested here rather than left to be discovered by the first row that does. The
+// binding is synthetic and its two homes are real: model 705 for the volt-var
+// breakpoints, model 711 for the droop, both on the same 7xx device.
+//
+// The rule has two parts and the second is the one that would rot silently:
+// both halves must hold for a PASS, and the WORSE answer decides. If the
+// composition returned the curve's answer whenever it was not a PASS, a curve
+// WARN (severity 2) would stand in front of a droop FAIL (severity 3) and the
+// row would report two grades better than the DER deserves.
+func TestOracleCurve_BothHalvesMustHoldAndTheWorseOneDecides(t *testing.T) {
+	f := newCurveFixture(t)
+	b := &curveBinding{
+		Mode:       "volt_var",
+		Points:     []CurvePoint{{X: 9100, Y: 4000}, {X: 10600, Y: -4000}},
+		XMult:      -2,
+		YMult:      -2,
+		YRefType:   derUnitRefStatVarAvail,
+		Prescribed: "a synthetic binding, for this test only",
+		Model7xx:   sunspec.ModelDERVoltVar,
+		Mapping7xx: "a synthetic binding, for this test only",
+		Droop: &droopBinding{
+			Settings:             FreqDroopSettings{DBOF: 60030, DBUF: 59970, KOF: 40, KUF: 40, OpenLoopTms: 600},
+			Model7xx:             sunspec.ModelDERFreqDroop,
+			Mapping7xx:           "a synthetic binding, for this test only",
+			NoRegisterHomeLegacy: "a synthetic binding, for this test only",
+		},
+	}
+
+	// Nothing written: the curve half fails, and that is what is reported.
+	if got := oracleCurve(b)(context.Background(), f.rc); got.Verdict != certify.Fail {
+		t.Fatalf("an unwritten DER scored %s, want FAIL:\n%s", got.Verdict, got.Observed)
+	}
+
+	// The CURVE lands and the droop does not: the row must still FAIL, on the
+	// droop, naming M711 — not pass on the half that worked.
+	pts := make([]sunspec.VVPoint, 0, len(b.Points))
+	for _, p := range b.wantPoints() {
+		pts = append(pts, sunspec.VVPoint{V: p.X, Var: p.Y})
+	}
+	deptRef, ok := b.wantDeptRef(sunspec.ModelDERVoltVar)
+	if !ok {
+		t.Fatal("the synthetic binding's yRefType has no DeptRef translation")
+	}
+	f.adoptVoltVar(t, deptRef, pts)
+	half := oracleCurve(b)(context.Background(), f.rc)
+	if half.Verdict != certify.Fail {
+		t.Fatalf("a DER that adopted the CURVE and ignored the droop scored %s, want FAIL — half a "+
+			"control is not execution:\n%s", half.Verdict, half.Observed)
+	}
+	if !strings.Contains(half.Observed, "M711") {
+		t.Errorf("the FAIL does not name the droop bank it read:\n%s", half.Observed)
+	}
+
+	// Both land: one PASS carrying both halves' evidence.
+	live, err := f.base.ReadFreqDroop("both-halves-test")
+	if err != nil {
+		t.Fatalf("read the DER's own droop control: %v", err)
+	}
+	want := b.Droop.want711()
+	if err := f.base.WriteFreqDroop(sunspec.FreqDroopCtl{
+		DbOf: want.DbOfHz, DbUf: want.DbUfHz, KOf: want.KOf, KUf: want.KUf, RspTms: want.RspTmsS,
+		PMin: live.PMin,
+	}, "both-halves-test"); err != nil {
+		t.Fatalf("the real derbase writer refused the synthetic droop: %v", err)
+	}
+	both := oracleCurve(b)(context.Background(), f.rc)
+	if both.Verdict != certify.Pass {
+		t.Fatalf("a DER holding BOTH halves scored %s, want PASS:\n%s", both.Verdict, both.Observed)
+	}
+	for _, want := range []string{"M705 Volt-Var", "M711 Frequency Droop", " AND "} {
+		if !strings.Contains(both.Observed, want) {
+			t.Errorf("the PASS does not carry both halves' evidence (missing %q):\n%s", want, both.Observed)
+		}
+	}
+}
+
 // ── The RED case: the product's actual posture ──────────────────────────────
 
 // TestOracleCurve_UnadoptedDERIsAFail is the finding, reproduced.
@@ -792,12 +874,97 @@ func rowByID(t *testing.T, id string) inverterControlRow {
 // pattern inverterControlLifecycleRunCtx established for the scalar rows.
 func (f *curveFixture) withGridSim(t *testing.T) *Driver {
 	t.Helper()
+	d, _ := f.withGridSimServer(t)
+	return d
+}
+
+// withGridSimServer is withGridSim keeping the SERVER as well, so a test can
+// fetch what a row actually SERVED rather than only what it believes it sent.
+//
+// The distinction is the whole of curve plan #32's construction risk: a binding
+// can name an element the publisher drops, or that the server stores and never
+// serves, and every one of those reads from inside the harness as a row that
+// authored it. Only the served document settles it.
+func (f *curveFixture) withGridSimServer(t *testing.T) (*Driver, *gridsim.Server) {
+	t.Helper()
 	gs := gridsim.NewServer(benchLFDI)
 	gsSrv := httptest.NewServer(gs.AdminHandler())
 	t.Cleanup(gsSrv.Close)
 	f.rc.GridSim = certify.NewAdminClient(gsSrv.URL, http.DefaultClient)
 	f.rc.Targets = certify.Targets{GridSimAdmin: gsSrv.URL}
-	return NewDriver(f.rc)
+	return NewDriver(f.rc), gs
+}
+
+// servedByGridSim fetches a resource from the simulator's own data plane as
+// text — the document a DUT would receive.
+func servedByGridSim(t *testing.T, gs *gridsim.Server, path string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	gs.Handler().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s from gridsim = %d; body: %s", path, rec.Code, rec.Body)
+	}
+	return rec.Body.String()
+}
+
+// TestCurveRows_ServeTheFigureElementsTheirBindingsAuthor closes the loop
+// between the binding and the wire for the two elements curve plan #32 built
+// levers for.
+//
+// Both rows used to HOLD THEMSELVES AT FAIL over these elements — BASIC-006 on
+// openLoopTms, BASIC-012 on all five opModFreqDroop children — because the
+// bench could not send them. With the levers built that hold is gone, and the
+// only thing left between the row and an overclaim is that the element really
+// does reach the DUT. So the SHIPPING rows are driven through their own Setup
+// against a real gridsim, and the assertions are made on the document the
+// server serves back.
+//
+// A row that quietly stopped authoring one of these would pass every other test
+// in this package: it still publishes a valid curve, its oracle still measures,
+// its construction claim still reads well. This is the test that would fail.
+func TestCurveRows_ServeTheFigureElementsTheirBindingsAuthor(t *testing.T) {
+	t.Run("BASIC-006 serves Figure 6's openLoopTms", func(t *testing.T) {
+		f := newCurveFixture(t)
+		d, gs := f.withGridSimServer(t)
+		row := rowByID(t, "BASIC-006")
+		s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-006")
+		if err := s.Setup(context.Background(), d, map[string]string{pollWindowParam: "20ms"}); err != nil {
+			t.Fatalf("BASIC-006 Setup: %v", err)
+		}
+		raw := servedByGridSim(t, gs, "/derp/0/dc/0")
+		if !strings.Contains(raw, "<openLoopTms>5</openLoopTms>") {
+			t.Errorf("the DERCurve BASIC-006 published carries no openLoopTms=5; Figure 6 prescribes 5 "+
+				"against its own default of 10, so a DUT receiving no element was offered the DEFAULT "+
+				"condition and the row would be reporting a run it did not make:\n%s", raw)
+		}
+	})
+
+	t.Run("BASIC-012 serves Figure 12's opModFreqDroop", func(t *testing.T) {
+		f := newCurveFixture(t)
+		d, gs := f.withGridSimServer(t)
+		row := rowByID(t, "BASIC-012")
+		s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-012")
+		if err := s.Setup(context.Background(), d, map[string]string{pollWindowParam: "20ms"}); err != nil {
+			t.Fatalf("BASIC-012 Setup: %v", err)
+		}
+		raw := servedByGridSim(t, gs, "/derp/0/derc")
+		for _, want := range []string{
+			"<dBOF>60030</dBOF>", "<dBUF>59970</dBUF>", "<kOF>40</kOF>", "<kUF>40</kUF>",
+			"<openLoopTms>600</openLoopTms>",
+		} {
+			if !strings.Contains(raw, want) {
+				t.Errorf("the control BASIC-012 published does not carry %s:\n%s", want, raw)
+			}
+		}
+		// On ONE control, beside the curve link, which is what Figure 12
+		// prescribes ("Frequency-Watt -> opModFreqWatt (Curve); Frequency-Droop
+		// -> opModFreqDroop (Immediate)") and what makes the pair testable at
+		// all: two controls would be two events, and the DUT's arbitration
+		// between them would become part of what this row measured.
+		if !strings.Contains(raw, "opModFreqWatt") {
+			t.Errorf("the droop did not ride the same control as the curve link:\n%s", raw)
+		}
+	})
 }
 
 // TestBasic006Row_IsRedAgainstAProductThatRefusesTheCurveAxis is the finding

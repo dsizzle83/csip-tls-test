@@ -94,7 +94,13 @@
 //   - the CURVE southbound oracle and the REFUSED-axis oracle (IW15-008 —
 //     curve.go, BASIC-006/011/012/015 and BASIC-014): the DER's own curve model
 //     adopted and enabled this row's breakpoints, or — for an axis the product
-//     refuses — the DUT answered cannot-comply and nothing of that axis moved;
+//     refuses — the DUT answered cannot-comply and nothing of that axis moved.
+//     A row whose Figure prescribes more than breakpoints (curve plan #32:
+//     BASIC-006's openLoopTms, BASIC-012's inline opModFreqDroop) measures
+//     every part of it the DER's generation stores in a register — BOTH halves
+//     must hold — and NAMES, on every verdict, the authored content that
+//     generation stores nowhere, so a PASS is never read as covering something
+//     nothing looked at;
 //   - the AUTHORING-GAP criteria (IW15-008 — critModeUnauthorable,
 //     BASIC-004/005/007): this bench has no lever for the mode, so the row was
 //     not tested, and an untested row must not roll up as a passing one.

@@ -99,16 +99,68 @@ const (
 
 	// The bench levers that do not exist, named once so a row can cite them the
 	// way noRideThrough/noRampRate are cited.
-	noCurveTimingLever = "gridsim's POST /admin/curve (sim/gridsim/curve.go adminCurveReq) carries points, " +
-		"multipliers and a yRefType and NOTHING else: DERCurve's timing and reference-tracking elements " +
-		"(openLoopTms, rampDecTms, rampIncTms, rampPT1Tms, autonomousVrefEnable, autonomousVrefTimeConstant) " +
-		"have no field on the request and no emission site, so this bench cannot put them on the wire at all"
+	//
+	// openLoopTms USED TO BE HERE and is not any more (curve plan #32): gridsim's
+	// POST /admin/curve now carries it (sim/gridsim/curve.go adminCurveReq's
+	// OpenLoopTms) and emits it on the served DERCurve, so BASIC-006 publishes
+	// Figure 6's own test value and the row no longer holds itself for the
+	// omission. The remaining members of the Figure-6 timing family are a
+	// DIFFERENT KIND of gap and now say so.
+	noVrefElementInSchema = "sep 2.0.4 declares NO such element on DERCurve. The schema's DERCurve sequence " +
+		"is creationTime, CurveData, curveType, openLoopTms, rampDecTms, rampIncTms, rampPT1Tms, " +
+		"xMultiplier, yMultiplier, yRefType and nothing else — `grep -c autonomousVRef " +
+		"docs/schema/sep-2.0.4.xsd` in lexa-proto is 0 — so this element cannot be placed on the wire by " +
+		"any conformant server, and a bench that emitted it would be putting an undefined element into " +
+		"documents used to certify conformance against that schema. It is the same class as the xRefType " +
+		"this server already refuses to serve (sim/gridsim/curve.go's XRefTypeGone), and the same class of " +
+		"upstream defect: csipmodel.DERCurve carries fields that decode these non-existent elements. This " +
+		"is therefore NOT a missing bench lever — there is nothing to build — and it is immaterial besides " +
+		"(Figure 6 prints the same value in both its Default and Test Values columns)"
 
-	noFreqDroopLever = "opModFreqDroop is an INLINE struct on DERControlBase, not a curve link, and gridsim " +
-		"has no lever for it anywhere — neither adminCtrlReq nor adminCurveReq carries dBOF/dBUF/kOF/kUF/" +
-		"openLoopTms, and csipmodel's ExtendedDERControlBase is not populated with one. So the " +
-		"frequency-DROOP half of this row's Figure cannot be placed on the wire from this bench, and only " +
-		"its frequency-WATT curve half is exercised"
+	// The DERCurve timing elements no Figure prescribes. Named for completeness
+	// where a row lists what it can and cannot author, and deliberately not
+	// built: a lever nothing asks for is a lever nothing tests.
+	noPrescribedCurveRampLever = "no Figure in this catalog prescribes it, so this bench offers no lever " +
+		"for it and claims none. DERCurve's rampDecTms/rampIncTms/rampPT1Tms are real sep 2.0.4 elements " +
+		"and could be added the same way openLoopTms was (curve plan #32) the moment a procedure asks for one"
+
+	// The 711 register names the droop's five parameters land on, written once
+	// so a row and a verdict cannot disagree about which registers were read.
+	droopRegisterNames = "DbOf/DbUf dead bands, KOf/KUf gains and RspTms response time"
+
+	// openLoopTms is AUTHORED and has no southbound register home anywhere, on
+	// either generation, and those are two separate facts about it.
+	noOpenLoopTmsRegister = "openLoopTms is a CURVE-LEVEL timing element with no register home in either " +
+		"SunSpec curve generation: the 7xx curve models (705/706/712) carry an adopt handshake, a DeptRef " +
+		"and a point table and no open-loop response register at all, and the legacy 12x banks " +
+		"(126/132/134) carry ActCrv, ModEna, DeptRef and points and no timing register either. (Model 711 " +
+		"does have RspTms — but that is opModFreqDroop's OWN openLoopTms, a different element of a " +
+		"different mode, and reading a volt-var curve's timing out of a frequency-droop control would be " +
+		"the substitution this suite exists to refuse.) So this element is SERVED northbound exactly as " +
+		"the procedure prescribes — that half is real evidence about what the DUT was offered — and no " +
+		"southbound read can show what the DUT did with it. It is named on every verdict rather than " +
+		"dropped, because an element nothing asserts about must not be mistaken for one that was measured"
+
+	// The droop's own homes and absences.
+	mappingFreqDroop7xx = "IEEE 2030.5's opModFreqDroop is a PARAMETRIC frequency-droop control — two dead " +
+		"bands, two per-unit gains and an open-loop response time — and its exact register home is SunSpec " +
+		"model 711 (DER Frequency Droop), whose Ctl block carries precisely those five quantities: " +
+		"DbOf/DbUf (scaled by Db_SF), KOf/KUf (scaled by K_SF) and RspTms (scaled by RspTms_SF). The " +
+		"correspondence is EXACT and needs no interpretation: sep 2.0.4 states dBOF/dBUF in thousandths of " +
+		"Hz and kOF/kUF in thousandths unitless as 'per-unit frequency change ... corresponding to 1 " +
+		"per-unit power output change', and model 711's own documentation states the same quantity in the " +
+		"same words, so the translation is five fixed decimal shifts and no nominal-frequency assumption " +
+		"enters anywhere (see curveBinding.want711, which performs it independently from the standards' " +
+		"text rather than from the product's table)"
+
+	noFreqDroopRegisterLegacy = "the legacy 12x set has NO home for a frequency-droop control: the nearest " +
+		"model, 127 (Freq-Watt parameterized), is a snapshot-referenced over-frequency curtailment with a " +
+		"single hysteresis dead band and a single gain, so three of FreqDroopType's five mandatory elements " +
+		"have no register to land in and the other two mean something different. Grading the droop against " +
+		"it would be the substitution this suite refuses; the honest answer is that the element is SERVED " +
+		"northbound on this bench and that nothing on this generation's device can show what became of it. " +
+		"This product reaches the same conclusion from its own side: internal/advaxis has an ExecDroop row " +
+		"for DerGen7xx and deliberately none for DerGen12x"
 
 	// The catalog's DERCurve.curveType values are CSIP-CONF v1.3's own
 	// numbering and do not agree with sep 2.0.4's DERCurveType, nor with each
@@ -170,8 +222,9 @@ const (
 		"does have the axis; see mappingWattPFLegacy. The two halves are different KINDS of assertion, not " +
 		"one assertion against two banks, and which applies is decided by the device the bench is running"
 
-	// BASIC-012 is the row with no southbound home at all, and saying so is
-	// the whole of its southbound evidence.
+	// BASIC-012's frequency-WATT BREAKPOINTS have no 7xx home, and that has not
+	// changed. What changed is that they are no longer the whole of the row's
+	// southbound evidence there — see the adjudication note below.
 	noFreqWattRegister = "IEEE 2030.5's opModFreqWatt is a BREAKPOINT curve (frequency → watts), and the " +
 		"SunSpec/IEEE-1547 7xx set has no model that stores frequency-watt breakpoints: frequency response " +
 		"is expressed as model 711 (DER Frequency Droop), a PARAMETRIC control — deadbands DbOf/DbUf, gains " +
@@ -179,13 +232,11 @@ const (
 		"product's own reconciler records the same conclusion for the same reason (lexa-gw " +
 		"cmd/modbus/reconcile_adv.go, on releasing its freq-watt axis: \"No SunSpec model executes " +
 		"freq-watt ... nothing to disable on release either\"), and its advAxisModel table has no model for " +
-		"the axis at all. So this row can author its control northbound — that half is real evidence — and " +
-		"NOTHING southbound can hold the curve's content. Closing it needs either a device profile that " +
-		"stores frequency-watt breakpoints or a decision to re-scope the row; it cannot be closed by " +
-		"asserting something weaker against 711, which is a different function. It IS closed on the other " +
-		"generation: the LEGACY set carries model 134, which stores frequency-watt breakpoints, so this " +
-		"row is a decided FAIL on a 7xx DER and a real measurement on a legacy one — see " +
-		"mappingFreqWattLegacy"
+		"the axis at all. So the BREAKPOINTS are authored northbound — that half is real evidence about " +
+		"what the DUT was offered — and nothing southbound on a 7xx DER can hold them. This is NOT closed " +
+		"by asserting something weaker against 711, which is a different function; it stays open, and it " +
+		"IS closed on the other generation, where model 134 stores frequency-watt breakpoints (see " +
+		"mappingFreqWattLegacy)"
 )
 
 // Suite is this suite's short name, used for -suite selection and printed in
@@ -527,19 +578,36 @@ func inverterControlRows() []inverterControlRow {
 			// it translates to DeptRef 2 on 705 (0-based) and DeptRef 3 on 126
 			// (1-based). The row states neither code; the referee derives each
 			// from the standards text for the model it resolved to.
-			YRefType:      derUnitRefStatVarAvail,
+			YRefType: derUnitRefStatVarAvail,
+			// openLoopTms 5, Figure 6's own Test Value against its own default
+			// of 10 — hundredths of a second, per sep 2.0.4's DERCurve.
+			//
+			// It USED TO BE A MATERIAL GAP, and holding this row at FAIL for it
+			// was correct while it lasted: a run that left the element off sent
+			// the DUT the procedure's DEFAULT timing while the report claimed
+			// the test condition. Curve plan #32 built the lever
+			// (sim/gridsim/curve.go's OpenLoopTms), so the row now AUTHORS it
+			// and holds only if the serve itself fails. What it does NOT gain is
+			// a southbound assertion: no SunSpec curve bank on either generation
+			// has a register for it (noOpenLoopTmsRegister), so the element is
+			// named on every verdict as served-and-not-device-mappable rather
+			// than quietly dropped between the wire and the oracle.
+			OpenLoopTms:   ptr(uint16(5)),
 			Prescribed:    "CSIP CTP v1.3 BASIC-006, Figure 6 Volt-VAr Settings, Test Values column",
 			Model7xx:      sunspec.ModelDERVoltVar,
 			Mapping7xx:    mappingVoltVar,
 			ModelLegacy:   sunspec.ModelVoltVarLegacy,
 			MappingLegacy: mappingVoltVarLegacy,
 			Gaps: []curveGap{
-				{Element: "opModVoltVar.DERCurve.openLoopTms", Prescribed: "5", Default: "10",
-					Why: noCurveTimingLever, Material: true},
+				// The autonomous-Vref pair is NOT a missing lever and never was:
+				// sep 2.0.4 declares no such element on DERCurve at all, so no
+				// conformant server can send it. Immaterial besides — Figure 6
+				// prints the same value in both columns — so it is named and
+				// does not hold the row, exactly as before.
 				{Element: "opModVoltVar.DERCurve.autonomousVrefEnable", Prescribed: "false", Default: "false",
-					Why: noCurveTimingLever},
+					Why: noVrefElementInSchema},
 				{Element: "opModVoltVar.DERCurve.autonomousVrefTimeContant", Prescribed: "0", Default: "0",
-					Why: noCurveTimingLever},
+					Why: noVrefElementInSchema},
 				{Element: "DERCurve.curveType", Prescribed: "11", Default: "11", Why: curveTypeDivergence},
 			},
 		}), "a Volt-VAr curve"},
@@ -630,30 +698,72 @@ func inverterControlRows() []inverterControlRow {
 			YMult:    0,
 			YRefType: derUnitRefSetMaxW, // Figure 12 prescribes yRefType 1
 			Prescribed: "CSIP CTP v1.3 BASIC-012, Figure 12 Frequency-Watt Settings, Test Values column " +
-				"(the opModFreqWatt DERCurve half)",
+				"(BOTH halves: the opModFreqWatt DERCurve and the immediate opModFreqDroop)",
+			// FIGURE 12'S OTHER HALF, NOW AUTHORED (curve plan #32).
+			//
+			// Figure 12 prescribes a frequency-WATT curve AND an immediate
+			// frequency-DROOP control, on one DERControl ("Function =
+			// Frequency-Watt -> opModFreqWatt (Curve); Function =
+			// Frequency-Droop -> opModFreqDroop (Immediate)"), and gridsim had
+			// no lever for the second anywhere — so this row published half of
+			// its own procedure and held itself at FAIL saying so. The lever
+			// exists now (sim/gridsim/freqdroop.go), it authors the droop on the
+			// SAME control that carries the curve link, and the five values are
+			// the Figure's own Test Values column verbatim, in the wire's units.
+			//
+			// THE UNITS THE FIGURE PRINTS ARE INTERNALLY INCONSISTENT AND THIS
+			// ROW SENDS THEM ANYWAY. dBOF/dBUF are printed Default 36 / Test
+			// 60030, and the catalog's own note says so: 36 reads as a dead band
+			// of hundredths of Hz while 60030/59970 read as absolute frequencies
+			// in millihertz, and the document does not reconcile the two.
+			// sep 2.0.4 fixes the unit — thousandths of Hz — so what goes on the
+			// wire is 60.030 Hz and 59.970 Hz, which is what the Test Values
+			// column says under the schema's own unit. A bench that "corrected"
+			// the procedure's numbers would be certifying a control the
+			// procedure never asked for; the transcription question belongs to
+			// whoever owns the document, and the row's job is to send what it
+			// prints and to say what it means.
+			Droop: &droopBinding{
+				Settings: FreqDroopSettings{
+					DBOF: 60030, DBUF: 59970, KOF: 40, KUF: 40, OpenLoopTms: 600,
+				},
+				Model7xx:             sunspec.ModelDERFreqDroop,
+				Mapping7xx:           mappingFreqDroop7xx,
+				NoRegisterHomeLegacy: noFreqDroopRegisterLegacy,
+			},
 			Gaps: []curveGap{
-				// Figure 12 prescribes BOTH halves of the row: a frequency-WATT
-				// curve and an immediate frequency-DROOP control. This bench can
-				// author the first and not the second, so the row exercises half
-				// of its own procedure and says so.
-				{Element: "opModFreqDroop.dBOF", Prescribed: "60030", Default: "36",
-					Why: noFreqDroopLever, Material: true},
-				{Element: "opModFreqDroop.dBUF", Prescribed: "59970", Default: "36",
-					Why: noFreqDroopLever, Material: true},
-				{Element: "opModFreqDroop.kOF", Prescribed: "40", Default: "50",
-					Why: noFreqDroopLever, Material: true},
-				{Element: "opModFreqDroop.kUF", Prescribed: "40", Default: "50",
-					Why: noFreqDroopLever, Material: true},
-				{Element: "opModFreqDroop.openLoopTms", Prescribed: "600", Default: "500",
-					Why: noFreqDroopLever, Material: true},
 				{Element: "DERCurve.curveType", Prescribed: "0", Default: "0", Why: curveTypeDivergence},
 			},
-			// The 7xx arm names 711 as the NEAREST model and refuses to measure
-			// against it: 711 is a parametric droop with no point table, so
-			// there is nothing a published curve could be written into.
+			// THE 7xx ARM, RE-ADJUDICATED (curve plan #32).
+			//
+			// It still names 711 as the model and still refuses to grade the
+			// BREAKPOINTS against it — 711 has no point table, and asserting
+			// something weaker there is the substitution this suite exists to
+			// refuse (noFreqWattRegister, unchanged). What changed is that the
+			// breakpoints are no longer the only thing this row authors: with
+			// the droop on the wire, 711 is the EXACT register home of the other
+			// half of the same Figure, and the product has an execution path for
+			// it (the D5 landing: scheduler fan-out ModeFreqDroop ->
+			// authority/advFreqDroop -> cmd/modbus executeDroopLocked ->
+			// derbase.WriteFreqDroop). So on a 7xx DER this row is now a REAL
+			// MEASUREMENT of the droop, reported with the breakpoint half named
+			// as served-and-not-asserted, instead of a decided FAIL that could
+			// never move whatever the product did.
+			//
+			// It goes RED on the SHIPPING product and that is the point: the
+			// freq-droop axis is admitted only by AdvancedSupportedAxes, gated
+			// behind advanced_axes_enabled, and the shipping posture is
+			// `"adv":"off"` — so the DUT answers cannot-comply at receipt, model
+			// 711 keeps its factory parameters, and this row says exactly that.
+			// Stage-7 discipline: the row is honest about a product that does
+			// not execute the axis, and it can go green the day the switches
+			// open without a line of this file changing.
 			Model7xx:          sunspec.ModelDERFreqDroop,
 			NoRegisterHome7xx: noFreqWattRegister,
-			// The legacy arm is a real home. This is D2's acceptance criterion.
+			// The legacy arm is a real home for the CURVE. This is D2's
+			// acceptance criterion. The droop half has no legacy home at all
+			// (noFreqDroopRegisterLegacy), so the two generations measure
+			// opposite halves of the same row — and each says which.
 			ModelLegacy:   sunspec.ModelFreqWattLegacy,
 			MappingLegacy: mappingFreqWattLegacy,
 		}), "a frequency-droop / frequency-watt curve"},
