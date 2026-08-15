@@ -57,8 +57,32 @@ func staticVoltVarCurve0() *model.DERCurveList {
 			Description: "Volt-VAr curve",
 			CurveType:   model.CurveTypeVoltVar, // 0 (was mislabeled as 1 = FreqWatt)
 			VRef:        &vref,
-			XRefType:    1, // voltage
-			YRefType:    4, // VAr as % of VArMax
+			// yRefType 3 = %statVarAvail. It was 4, under a comment that said
+			// "VAr as % of VArMax" — and BOTH halves were wrong. sep 2.0.4's
+			// DERUnitRefType makes 4 "%setEffectiveV", a VOLTAGE reference on
+			// the VAr axis of a volt-var curve; %setMaxVar (the thing the
+			// comment described) is 2, not 4. The schema is explicit about the
+			// admissible set for this element: opModVoltVar's own documentation
+			// says "the meaning of the y value is determined by yRefType and
+			// must be one of %setMaxW, %setMaxVar, or %statVarAvail", so 4 is
+			// not merely unusual here, it is not a legal value for this curve.
+			//
+			// It became load-bearing on 2026-08-14, when the DUT began
+			// translating yRefType into the curve bank's DeptRef and REFUSING
+			// what it cannot translate (lexa-gw cmd/modbus's curveDeptRef): this
+			// fixture, served by default at /derp/0/dc, would have drawn a
+			// cannot-comply from a correct gateway for a defect in the bench.
+			//
+			// xRefType is GONE, not corrected. sep 2.0.4 declares no such
+			// element anywhere — `grep -c xRefType docs/schema/sep-2.0.4.xsd` in
+			// lexa-proto is 0 — so serving one put a non-existent element on the
+			// wire in a document this bench uses to certify conformance. (The
+			// field exists on csipmodel.DERCurve, which decodes an element the
+			// schema does not declare; that is an upstream defect recorded, not
+			// fixed, here.) The x-axis reference is fixed by the MODE at both
+			// ends and needs no carriage: a volt-var curve's x is an effective
+			// percent voltage by definition of the mode.
+			YRefType: model.RefTypeStatVarAvail,
 			CurveData: []model.DERCurveData{
 				{XValue: 92, YValue: 30}, {XValue: 98, YValue: 0},
 				{XValue: 102, YValue: 0}, {XValue: 108, YValue: -30},

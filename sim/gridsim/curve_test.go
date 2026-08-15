@@ -35,12 +35,16 @@ func TestAdminCurve_BindsVoltVarIntoServedControl(t *testing.T) {
 	s := NewServer("")
 	h := s.AdminHandler()
 
+	// y_ref_type 3 (%statVarAvail), not the 4 this body used to send: sep 2.0.4
+	// makes 4 "%setEffectiveV", a VOLTAGE reference on the VAr axis of a
+	// volt-var curve, and opModVoltVar's own documentation restricts the element
+	// to {%setMaxW, %setMaxVar, %statVarAvail}. x_ref_type is gone from the API
+	// entirely — the schema declares no such element; see TestAdminCurve_XRefTypeIsRejected.
 	body := `{
 		"program": 0,
 		"mode": "volt_var",
 		"vref": 240,
-		"x_ref_type": 1,
-		"y_ref_type": 4,
+		"y_ref_type": 3,
 		"points": [{"x":92,"y":30},{"x":98,"y":0},{"x":102,"y":0},{"x":108,"y":-30}],
 		"duration_s": 600,
 		"activate": true,
@@ -98,6 +102,15 @@ func TestAdminCurve_BindsVoltVarIntoServedControl(t *testing.T) {
 	if dc.DERCurve[0].Href != "/derp/0/dc/0" {
 		t.Errorf("curve href = %q, want /derp/0/dc/0", dc.DERCurve[0].Href)
 	}
+	if got := dc.DERCurve[0].YRefType; got != 3 {
+		t.Errorf("yRefType = %d, want 3 (%%statVarAvail) — the y-axis reference is what the DUT "+
+			"translates into the curve bank's DeptRef, so serving the wrong one commands a "+
+			"percentage of a rating nobody nominated", got)
+	}
+	if got := dc.DERCurve[0].XRefType; got != 0 {
+		t.Errorf("xRefType = %d, want 0 (element absent) — sep 2.0.4 declares no xRefType on DERCurve, "+
+			"so this server must not put one on the wire", got)
+	}
 
 	// GET /admin/status must surface the bound-curve label for the inspector.
 	st := adminStatus(t, h)
@@ -106,6 +119,28 @@ func TestAdminCurve_BindsVoltVarIntoServedControl(t *testing.T) {
 	}
 	if got := st.Programs[0].Active[0].Curve; got != "volt_var -> /derp/0/dc/0" {
 		t.Errorf("status curve label = %q, want %q", got, "volt_var -> /derp/0/dc/0")
+	}
+}
+
+// TestAdminCurve_XRefTypeIsRejected: the removed field is refused loudly, not
+// dropped quietly.
+//
+// sep 2.0.4 declares NO xRefType element on DERCurve, so this server cannot
+// serve one and used to serve one anyway. Silently ignoring a request that
+// still sets it would leave the caller believing the bench had configured
+// something, which on a conformance bench is the same class of defect as
+// serving the element in the first place.
+func TestAdminCurve_XRefTypeIsRejected(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+	body := `{"program":0,"mode":"volt_var","points":[{"x":1,"y":2}],"x_ref_type":1,"activate":true}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(body))))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /admin/curve with x_ref_type = %d, want 400; body: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "xRefType") {
+		t.Errorf("the 400 does not say why: %s", rec.Body)
 	}
 }
 

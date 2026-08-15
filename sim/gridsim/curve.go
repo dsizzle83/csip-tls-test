@@ -38,8 +38,22 @@ type adminCurveReq struct {
 	VRef        int16        `json:"vref"`       // nominal AC voltage (V) for volt curves; 0 = omit
 	XMult       int8         `json:"x_mult"`     // 10^n multiplier on x values
 	YMult       int8         `json:"y_mult"`     // 10^n multiplier on y values
-	XRefType    uint8        `json:"x_ref_type"` // physical quantity on the x axis (Table 19)
-	YRefType    uint8        `json:"y_ref_type"` // physical quantity on the y axis (Table 19)
+	// x_ref_type is GONE (2026-08-14), and a request still carrying it is
+	// REJECTED (400) rather than silently ignored — see XRefTypeGone below.
+	// sep 2.0.4 declares NO xRefType element — `grep -c xRefType
+	// docs/schema/sep-2.0.4.xsd` in lexa-proto is 0 — so this server was
+	// emitting an element the standard does not define, in documents used to
+	// certify conformance against it. (csipmodel.DERCurve has an XRefType field
+	// that decodes that non-existent element; that is an upstream defect this
+	// note records and does not fix.) The x-axis reference is fixed by the MODE
+	// at both ends and needs no carriage: volt-var and volt-watt take an
+	// effective percent voltage, freq-watt takes Hz, watt-PF takes %setMaxW.
+	YRefType uint8 `json:"y_ref_type"` // DERUnitRefType for the y axis (sep 2.0.4)
+	// XRefTypeGone traps a caller still sending the removed field. A pointer,
+	// so "absent" and "sent as 0" are distinguishable: silently accepting a
+	// request whose x_ref_type the server no longer honours would leave the
+	// caller believing it had set something.
+	XRefTypeGone *uint8 `json:"x_ref_type,omitempty"`
 	Description string       `json:"description"`
 	DurationS   int          `json:"duration_s"`     // default 300
 	StartOffset int          `json:"start_offset_s"` // seconds from now
@@ -105,6 +119,12 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "program must be 0, 1, or 2", http.StatusBadRequest)
 		return
 	}
+	if req.XRefTypeGone != nil {
+		http.Error(w, "x_ref_type is not a field of this API: sep 2.0.4 declares no xRefType element on "+
+			"DERCurve, so this server cannot serve one. Remove it from the request; the x-axis reference "+
+			"is fixed by the mode.", http.StatusBadRequest)
+		return
+	}
 	curveType, ok := curveTypeForMode(req.Mode)
 	if !ok {
 		http.Error(w, "mode must be one of volt_var|volt_watt|freq_watt|watt_pf", http.StatusBadRequest)
@@ -143,8 +163,9 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		CurveType:    curveType,
 		XMultiplier:  req.XMult,
 		YMultiplier:  req.YMult,
-		XRefType:     req.XRefType,
-		YRefType:     req.YRefType,
+		// No XRefType: see adminCurveReq. The csipmodel field stays zero and
+		// its `omitempty` keeps the element off the wire entirely.
+		YRefType: req.YRefType,
 		CurveData:    pointsToCurveData(req.Points),
 	}
 	if req.VRef != 0 {

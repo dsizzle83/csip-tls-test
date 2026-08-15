@@ -127,6 +127,20 @@ type CurveView struct {
 	// Adopted is AdoptResult == COMPLETED.
 	Adopted bool
 
+	// DeptRef is the live curve's DeptRef register — SunSpec's "curve dependent
+	// reference", the base its y values are a percentage OF. HasDeptRef is false
+	// for a model that carries no such register (711, which is parametric).
+	//
+	// It is decoded because a curve's y values are a PERCENTAGE, and a
+	// percentage is not a quantity without the thing it is a percentage of. IEEE
+	// 2030.5 names that base on every DERCurve (yRefType, minOccurs=1) and
+	// SunSpec names it per curve bank (DeptRef); a referee that read the points
+	// and not this register would grade "-30 % of setMaxVar" and "-30 % of
+	// setMaxW" as the same curve, which on a 60 kW / 26.4 kvar DER is a 2.3x
+	// error and on a 2 kvar machine a 30x one.
+	DeptRef    uint16
+	HasDeptRef bool
+
 	// ReadOnly is the live curve's own ReadOnly flag. The live curve of a
 	// conformant device is read-only; a writable "live" curve means the index-0
 	// convention does not hold on this device and the reading below is not the
@@ -165,6 +179,9 @@ func (c CurveView) Describe() string {
 		fmt.Sprintf("NPt=%d NCrv=%d", c.NPt, c.NCrv),
 		fmt.Sprintf("live curve read-only=%t", c.ReadOnly),
 	}
+	if c.HasDeptRef {
+		parts = append(parts, fmt.Sprintf("DeptRef=%d (%s)", c.DeptRef, DeptRefName(c.Axis.Model, c.DeptRef)))
+	}
 	switch {
 	case c.Axis.Pointless:
 		parts = append(parts, "no breakpoint table (parametric control): "+orNone(c.Params))
@@ -179,6 +196,43 @@ func (c CurveView) Describe() string {
 			strings.Join(pts, " ")))
 	}
 	return c.Axis.Name + " — " + strings.Join(parts, ", ")
+}
+
+// DeptRefName spells a DeptRef code out for a finding, per model, so a reader
+// sees which rating the device says its y values are a percentage of rather
+// than a bare integer.
+//
+// PROVENANCE. Transcribed from the vendored SunSpec model JSON in lexa-proto
+// (docs/schema/sunspec-models/): model_705.json and model_712.json declare
+// {0 W_MAX_PCT, 1 VAR_MAX_PCT, 2 VAR_AVAL_PCT, 3 VA_MAX_PCT}; model_706.json
+// declares {0 W_MAX_PCT, 1 W_AVAL_PCT}. Transcribed rather than bound
+// mechanically because the sunspec package declares no DeptRef constants —
+// stated plainly so the weakness is visible rather than implied. The DUT's own
+// cmd/modbus/reconcile_adv.go carries the identical transcription with the
+// identical provenance note; this referee restates it from the same source
+// rather than importing it, which is this package's whole discipline.
+func DeptRefName(model uint16, v uint16) string {
+	switch model {
+	case sunspec.ModelDERVoltVar, sunspec.ModelDERWattVar:
+		switch v {
+		case 0:
+			return "W_MAX_PCT"
+		case 1:
+			return "VAR_MAX_PCT"
+		case 2:
+			return "VAR_AVAL_PCT"
+		case 3:
+			return "VA_MAX_PCT"
+		}
+	case sunspec.ModelDERVoltWatt:
+		switch v {
+		case 0:
+			return "W_MAX_PCT"
+		case 1:
+			return "W_AVAL_PCT"
+		}
+	}
+	return "unknown for this model"
 }
 
 func enabledWord(on bool) string {
@@ -253,6 +307,7 @@ func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
 			return v
 		}
 		v.ReadOnly = c.ReadOnly
+		v.DeptRef, v.HasDeptRef = c.DeptRef, true
 		for _, p := range c.Points {
 			v.Points = append(v.Points, CurvePoint{X: p.V, Y: p.Var})
 		}
@@ -263,6 +318,7 @@ func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
 			return v
 		}
 		v.ReadOnly = c.ReadOnly
+		v.DeptRef, v.HasDeptRef = c.DeptRef, true
 		for _, p := range c.Points {
 			v.Points = append(v.Points, CurvePoint{X: p.V, Y: p.W})
 		}
@@ -273,6 +329,7 @@ func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
 			return v
 		}
 		v.ReadOnly = c.ReadOnly
+		v.DeptRef, v.HasDeptRef = c.DeptRef, true
 		for _, p := range c.Points {
 			v.Points = append(v.Points, CurvePoint{X: p.W, Y: p.Var})
 		}

@@ -73,8 +73,7 @@
       <yvalue>-30</yvalue>
     </CurveData>
     <vRef>240</vRef>
-    <xRefType>1</xRefType>
-    <yRefType>4</yRefType>
+    <yRefType>3</yRefType>
   </DERCurve>
 </DERCurveList>
 === /derp/0/dderc
