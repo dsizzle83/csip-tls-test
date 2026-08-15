@@ -153,16 +153,21 @@ func curveHeaderForTest(model uint16) (*sunspec.Layout, string, string, string) 
 	}
 }
 
-// basic006Binding is the BASIC-006 row's own binding, built from the identical
-// literals register.go registers it with — so what this file proves is a
-// property of the SHIPPING row, not of a curve invented for a test.
+// basic006Binding is the SHIPPING BASIC-006 row's own binding.
+//
+// It used to be a COPY of it — the same literals register.go registers, restated
+// here — which is the shape it exists to guard against, one file along: when
+// the row's published curve was reconciled to CSIP CTP v1.3 Figure 6 the copy
+// went on writing the old points, so this file's "green" fixture installed a
+// curve the row no longer publishes and the oracle correctly refused it. Two
+// literals one edit apart is the defect; the row itself is the single source.
 func basic006Binding() *curveBinding {
-	return &curveBinding{
-		Mode:     "volt_var",
-		Points:   []CurvePoint{{X: 92, Y: 60}, {X: 98, Y: 0}, {X: 102, Y: 0}, {X: 108, Y: -60}},
-		Model7xx: sunspec.ModelDERVoltVar, YRefType: 3, Mapping7xx: mappingVoltVar,
-		ModelLegacy: sunspec.ModelVoltVarLegacy, MappingLegacy: mappingVoltVarLegacy,
+	for _, r := range inverterControlRows() {
+		if r.id == "BASIC-006" && r.mode.Curve != nil {
+			return r.mode.Curve
+		}
 	}
+	panic("suitecsip: no BASIC-006 curve row is registered")
 }
 
 // adoptBasic006Curve drives the REAL derbase adopt handshake with exactly the
@@ -175,10 +180,29 @@ func basic006Binding() *curveBinding {
 // fixture modelled a gateway that wrote the points under a reference nobody
 // commanded — the exact defect lexa-gw's curveDeptRef landed to end, reproduced
 // inside the test that was supposed to certify the fix.
+// The POINTS likewise come from the row rather than from a literal — and are
+// cross-checked, before anything is written, against the device-engineering
+// values stated independently in curve_legacy_test.go's legacyExpectations.
+// That is the same two-independent-statements rule DeptRef already follows: the
+// row says what to publish, this file says what the DEVICE must then hold, and
+// a mis-scaled binding makes them disagree instead of agreeing wrongly.
+//
+// Model 705's V_SF/DeptRef_SF are 0 on this fixture, so Figure 6's 95.70 %VRef
+// quantises to 96 in the register. That is a real property of a coarse device
+// and is what curvePointTolerance exists to absorb (1 % of the value plus half
+// a unit); it is not a licence to publish a different curve.
 func (f *curveFixture) adoptBasic006Curve(t *testing.T) {
 	t.Helper()
-	f.adoptVoltVar(t, basic006DeptRef(t),
-		[]sunspec.VVPoint{{V: 92, Var: 60}, {V: 98, Var: 0}, {V: 102, Var: 0}, {V: 108, Var: -60}})
+	b := basic006Binding()
+	if err := crossCheckEngineering(b, sunspec.ModelDERVoltVar,
+		legacyExpectations(t, "BASIC-006")); err != nil {
+		t.Fatal(err)
+	}
+	pts := make([]sunspec.VVPoint, 0, len(b.Points))
+	for _, p := range b.wantPoints() {
+		pts = append(pts, sunspec.VVPoint{V: p.X, Var: p.Y})
+	}
+	f.adoptVoltVar(t, basic006DeptRef(t), pts)
 }
 
 // basic006DeptRef is the DeptRef a gateway executing BASIC-006 must write,
@@ -220,7 +244,10 @@ func TestOracleCurve_UnadoptedDERIsAFail(t *testing.T) {
 		t.Fatalf("an unadopted DER = %s (%s), want FAIL — a row that measured nothing must not pass",
 			got.Verdict, got.Observed)
 	}
-	for _, want := range []string{"never COMPLETED", "M705 Volt-Var", "(92, 60)"} {
+	// The published-curve rendering is taken from the ROW, not restated: this
+	// file's literals drifted out of step with register.go once already, when
+	// the row was reconciled to CSIP CTP v1.3 Figure 6.
+	for _, want := range []string{"never COMPLETED", "M705 Volt-Var", basic006Binding().describePublished()} {
 		if !strings.Contains(got.Observed, want) {
 			t.Errorf("the FAIL does not say %q; it said: %s", want, got.Observed)
 		}
@@ -253,7 +280,10 @@ func TestOracleCurve_ADifferentCurveIsStillAFail(t *testing.T) {
 	if got.Verdict != certify.Fail {
 		t.Fatalf("an unrelated adopted curve = %s (%s), want FAIL", got.Verdict, got.Observed)
 	}
-	if !strings.Contains(got.Observed, "(230, 30)") || !strings.Contains(got.Observed, "(92, 60)") {
+	// BOTH curves must appear: the device's, and the row's own — the latter
+	// rendered by the row rather than restated here.
+	if !strings.Contains(got.Observed, "(230, 30)") ||
+		!strings.Contains(got.Observed, basic006Binding().describePublished()) {
 		t.Errorf("the FAIL must show BOTH curves so a reader can see the difference; it said: %s",
 			got.Observed)
 	}
@@ -303,8 +333,14 @@ func TestOracleCurve_ExtraBreakpointIsStillAFail(t *testing.T) {
 func TestOracleCurve_RightPointsWrongDeptRefIsAFail(t *testing.T) {
 	f := newCurveFixture(t)
 	want := basic006DeptRef(t)
-	f.adoptVoltVar(t, want+1, // any OTHER reference; the points below are the row's own
-		[]sunspec.VVPoint{{V: 92, Var: 60}, {V: 98, Var: 0}, {V: 102, Var: 0}, {V: 108, Var: -60}})
+	// The points are the ROW's own, taken from its binding: the whole content of
+	// this case is "right points, wrong reference", and a stale literal here
+	// would make the content check fire first and test something else entirely.
+	pts := make([]sunspec.VVPoint, 0, len(basic006Binding().Points))
+	for _, p := range basic006Binding().wantPoints() {
+		pts = append(pts, sunspec.VVPoint{V: p.X, Var: p.Y})
+	}
+	f.adoptVoltVar(t, want+1, pts) // any OTHER reference
 	got := oracleCurve(basic006Binding())(context.Background(), f.rc)
 	if got.Verdict != certify.Fail {
 		t.Fatalf("the row's exact breakpoints under the WRONG y-axis reference = %s (%s), want FAIL — "+

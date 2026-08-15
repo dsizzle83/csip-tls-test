@@ -29,6 +29,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -195,8 +198,8 @@ func TestBASIC012ResolvesTo134OnLegacyAndStaysADecidedFailOn7xx(t *testing.T) {
 	}
 
 	legacy := newLegacyFixture(t, sim.LegacyCurveOptions{})
-	target, ok := b.resolveTarget(legacy.unitView(t))
-	if !ok {
+	target, how := b.resolveTarget(legacy.unitView(t))
+	if how != curveResolved {
 		t.Fatal("BASIC-012 resolved no southbound target on a legacy bench")
 	}
 	if target.Model != sunspec.ModelFreqWattLegacy {
@@ -218,8 +221,8 @@ func TestBASIC012ResolvesTo134OnLegacyAndStaysADecidedFailOn7xx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read the 7xx DER through the referee: %v", err)
 	}
-	target7, ok := b.resolveTarget(uv7)
-	if !ok {
+	target7, how7 := b.resolveTarget(uv7)
+	if how7 != curveResolved {
 		t.Fatal("BASIC-012 resolved no southbound target on a 7xx bench")
 	}
 	if target7.Model != sunspec.ModelDERFreqDroop || target7.NoRegisterHome == "" {
@@ -276,14 +279,26 @@ func TestBASIC015FlipsApparatusByGeneration(t *testing.T) {
 // ── GREEN: the machinery the product will gain, run for real ────────────────
 
 // legacyPlanFor builds the derbase write plan a gateway executing this row
-// would make, from the row's OWN published curve.
+// would make, and it states the DEVICE ENGINEERING VALUES as literals.
 //
-// The DeptRef is a LITERAL of the legacy standards text, cross-checked against
-// what the referee independently expects. Deriving it from the referee would
-// make this test a tautology — the oracle would be judging its own answer — and
-// stating it twice is what makes a divergence between the two visible.
+// THE INDEPENDENT SIDE IS THE POINT. Before this, the plan's points came from
+// b.wantPoints() and the oracle compared against b.wantPoints() — one function
+// on both sides of the comparison, so a MIS-SCALED binding still transitioned
+// Fail -> Pass: set BASIC-006's XMult to 1 and the writer installs breakpoints
+// at 920 %VRef (9.2x nominal, a curve no inverter could run) while the oracle
+// asks for the same 920 and reports PASS. The red-then-green shape stays
+// discriminating either way, which is why it did not show up there; what it
+// could not catch is the binding being wrong in a way both sides share.
+//
+// So the caller states what the DEVICE must physically hold — 91.00 %VRef, not
+// "whatever the multipliers work out to" — and this cross-checks that against
+// wantPoints() before writing anything. Two independent statements of the same
+// number, exactly the rule this file already applied to DeptRef. When they
+// disagree the test says which is which, instead of the representability gate
+// in lexa-proto refusing the write and the writer taking the blame for a defect
+// in the fixture.
 func legacyPlanFor(t *testing.T, b *curveBinding, model uint16, axis string,
-	deptRef uint16) derbase.LegacyCurvePlan {
+	deptRef uint16, wantEng []sunspec.LegacyCurvePoint) derbase.LegacyCurvePlan {
 	t.Helper()
 	if deptRef != 0 {
 		want, ok := b.wantDeptRef(model)
@@ -296,11 +311,79 @@ func legacyPlanFor(t *testing.T, b *curveBinding, model uint16, axis string,
 				model, deptRef, b.YRefType, want)
 		}
 	}
-	pts := make([]sunspec.LegacyCurvePoint, 0, len(b.Points))
-	for _, p := range b.wantPoints() {
-		pts = append(pts, sunspec.LegacyCurvePoint{X: p.X, Y: p.Y})
+	if err := crossCheckEngineering(b, model, wantEng); err != nil {
+		t.Fatal(err)
 	}
+	pts := append([]sunspec.LegacyCurvePoint(nil), wantEng...)
 	return derbase.LegacyCurvePlan{ModelID: model, Axis: axis, Points: pts, DeptRef: deptRef}
+}
+
+// crossCheckEngineering is legacyPlanFor's comparison, as a pure function so
+// the check itself can be shown to have teeth (see
+// TestLegacyEngineeringCrossCheck_CatchesAMisScaledBinding).
+func crossCheckEngineering(b *curveBinding, model uint16, wantEng []sunspec.LegacyCurvePoint) error {
+	got := b.wantPoints()
+	if len(got) != len(wantEng) {
+		return fmt.Errorf("M%d: this row's binding resolves to %d breakpoint(s) and the device is expected "+
+			"to hold %d — the published curve and the physical curve are not the same length",
+			model, len(got), len(wantEng))
+	}
+	// The comparison is exact to within a float round-trip and nothing wider.
+	// applyMult reaches 10^-2 by dividing by ten twice, so 98 -> 0.98 lands one
+	// ulp off the literal; a MIS-SCALING is a factor of ten or more and is
+	// nowhere near this epsilon. A percentage tolerance here would be the wrong
+	// instrument — it would start absorbing the very errors the check is for.
+	const ulp = 1e-9
+	near := func(a, b float64) bool { return math.Abs(a-b) <= ulp*math.Max(1, math.Abs(b)) }
+	for i := range wantEng {
+		if !near(got[i].X, wantEng[i].X) || !near(got[i].Y, wantEng[i].Y) {
+			return fmt.Errorf("M%d breakpoint %d: this row's binding resolves to (%g, %g) and the device "+
+				"is expected to hold (%g, %g). The published values and the axis multipliers together are "+
+				"what the DER physically receives, so a disagreement here is a MIS-SCALED BINDING — the "+
+				"920 %%VRef shape — and it must be caught here rather than by a representability refusal "+
+				"that would read as a defect in the writer",
+				model, i+1, got[i].X, got[i].Y, wantEng[i].X, wantEng[i].Y)
+		}
+	}
+	return nil
+}
+
+// legacyExpectations is the DEVICE ENGINEERING curve each row must produce, per
+// row, stated independently of the binding.
+//
+// Every number here is the catalog Figure's raw value with its own multiplier
+// applied by hand — 9100 at 10^-2 is 91.00 %VRef — so a reader can check the
+// row against the procedure without running anything, and so this file and the
+// binding are two statements that can disagree.
+func legacyExpectations(t *testing.T, id string) []sunspec.LegacyCurvePoint {
+	t.Helper()
+	switch id {
+	case "BASIC-006":
+		// Figure 6 Test Values (9100,4000) (9570,0) (10400,0) (10600,-4000),
+		// x and y at 10^-2: percent voltage against signed percent of DeptRef.
+		return []sunspec.LegacyCurvePoint{
+			{X: 91.00, Y: 40.00}, {X: 95.70, Y: 0}, {X: 104.00, Y: 0}, {X: 106.00, Y: -40.00},
+		}
+	case "BASIC-011":
+		// Figure 11 Test Values (10000,10000) (10500,10000) (10900,0) at 10^-2.
+		return []sunspec.LegacyCurvePoint{
+			{X: 100.00, Y: 100.00}, {X: 105.00, Y: 100.00}, {X: 109.00, Y: 0},
+		}
+	case "BASIC-012":
+		// Figure 12 Test Values (5900,100) (5950,80) (6050,80) (6200,0), x at
+		// 10^-2 (ABSOLUTE Hz) and y at 10^0 (percent of WRef on M134).
+		return []sunspec.LegacyCurvePoint{
+			{X: 59.00, Y: 100}, {X: 59.50, Y: 80}, {X: 60.50, Y: 80}, {X: 62.00, Y: 0},
+		}
+	case "BASIC-015":
+		// Not catalog-prescribed (BASIC-015 carries no curve Figure): this
+		// suite's own Watt-PF curve, y at 10^-2 so 95 is a power factor of 0.95.
+		return []sunspec.LegacyCurvePoint{
+			{X: 0, Y: 1.00}, {X: 50, Y: 0.98}, {X: 100, Y: 0.95},
+		}
+	}
+	t.Fatalf("no device-engineering expectation is stated for %s", id)
+	return nil
 }
 
 // TestLegacyCurveRowsTurnGreenWhenTheRealLegacyWriterRuns is the discrimination
@@ -342,7 +425,8 @@ func TestLegacyCurveRowsTurnGreenWhenTheRealLegacyWriterRuns(t *testing.T) {
 					tc.id, before.Verdict, before.Observed)
 			}
 
-			out, err := f.base.WriteLegacyCurve(legacyPlanFor(t, b, tc.model, tc.axis, tc.deptRef),
+			out, err := f.base.WriteLegacyCurve(
+				legacyPlanFor(t, b, tc.model, tc.axis, tc.deptRef, legacyExpectations(t, tc.id)),
 				"legacy-curve-test")
 			if err != nil {
 				t.Fatalf("%s: the REAL derbase legacy writer refused this row's own curve: %v", tc.id, err)
@@ -371,7 +455,8 @@ func TestLegacyWriterOnOneAxisLeavesTheOthersRed(t *testing.T) {
 	f := newLegacyFixture(t, sim.LegacyCurveOptions{})
 	vv := legacyBindingOf(t, "BASIC-006")
 	if _, err := f.base.WriteLegacyCurve(
-		legacyPlanFor(t, vv, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3), "legacy-curve-test"); err != nil {
+		legacyPlanFor(t, vv, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3, legacyExpectations(t, "BASIC-006")),
+		"legacy-curve-test"); err != nil {
 		t.Fatalf("the real derbase legacy writer refused BASIC-006's curve: %v", err)
 	}
 	if got := oracleCurve(vv)(context.Background(), f.rc); got.Verdict != certify.Pass {
@@ -462,7 +547,8 @@ func TestLegacyActCrvIgnoredKeepsTheRowRed(t *testing.T) {
 	// The writer itself should notice (it verifies its read-back); whether it
 	// errors or not, the ROW must not go green.
 	_, _ = f.base.WriteLegacyCurve(
-		legacyPlanFor(t, b, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3), "legacy-curve-test")
+		legacyPlanFor(t, b, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3, legacyExpectations(t, "BASIC-006")),
+		"legacy-curve-test")
 	got := oracleCurve(b)(context.Background(), f.rc)
 	if got.Verdict == certify.Pass {
 		t.Fatalf("BASIC-006 PASSED against a device that ignored the ActCrv commit:\n%s", got.Observed)
@@ -477,7 +563,8 @@ func TestLegacyCurveDisabledFunctionIsNotExecution(t *testing.T) {
 	f := newLegacyFixture(t, sim.LegacyCurveOptions{})
 	b := legacyBindingOf(t, "BASIC-006")
 	if _, err := f.base.WriteLegacyCurve(
-		legacyPlanFor(t, b, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3), "legacy-curve-test"); err != nil {
+		legacyPlanFor(t, b, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3, legacyExpectations(t, "BASIC-006")),
+		"legacy-curve-test"); err != nil {
 		t.Fatalf("the real derbase legacy writer refused BASIC-006's curve: %v", err)
 	}
 	if got := oracleCurve(b)(context.Background(), f.rc); got.Verdict != certify.Pass {
@@ -506,7 +593,7 @@ func TestLegacyCurveDisabledFunctionIsNotExecution(t *testing.T) {
 func TestLegacyCurveWrongDeptRefIsStillAFail(t *testing.T) {
 	f := newLegacyFixture(t, sim.LegacyCurveOptions{})
 	b := legacyBindingOf(t, "BASIC-006")
-	plan := legacyPlanFor(t, b, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3)
+	plan := legacyPlanFor(t, b, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3, legacyExpectations(t, "BASIC-006"))
 	// 2 is %VArMax on the legacy enum — and it is ALSO what a gateway that
 	// forgot the off-by-one would write for %VArAval, since %VArAval is 2 in
 	// the 7xx numbering. This is the exact mis-translation the check exists for.
@@ -533,7 +620,8 @@ func TestLegacyReadOnlyLiveBankDoesNotWarn(t *testing.T) {
 	f := newLegacyFixture(t, sim.LegacyCurveOptions{})
 	b := legacyBindingOf(t, "BASIC-006")
 	if _, err := f.base.WriteLegacyCurve(
-		legacyPlanFor(t, b, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3), "legacy-curve-test"); err != nil {
+		legacyPlanFor(t, b, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3, legacyExpectations(t, "BASIC-006")),
+		"legacy-curve-test"); err != nil {
 		t.Fatalf("the real derbase legacy writer refused BASIC-006's curve: %v", err)
 	}
 	uv := f.unitView(t)
@@ -594,6 +682,15 @@ func TestLegacyGenerationIsReadFromTheDeviceNotConfigured(t *testing.T) {
 func (f *legacyFixture) withGridSim(t *testing.T) (*Driver, *gridsim.Server, string) {
 	t.Helper()
 	gs := gridsim.NewServer(benchLFDI)
+	// Tee the standard logger into the server's log buffer, exactly as the
+	// sim/server binary does. gridsim writes its per-request lines through
+	// log.Printf, and GET /admin/logs streams that buffer — so without this the
+	// request log a Driver reads is empty on every unit test, and any check
+	// resting on "did the DUT fetch this?" would silently read zero.
+	prevLog := log.Writer()
+	log.SetOutput(io.MultiWriter(prevLog, gs.LogWriter()))
+	t.Cleanup(func() { log.SetOutput(prevLog) })
+
 	adminSrv := httptest.NewServer(gs.AdminHandler())
 	t.Cleanup(adminSrv.Close)
 	// The DATA plane too, not only the admin one: this bench has to be able to
@@ -664,8 +761,21 @@ func TestLegacyRowsAreRedEndToEndAgainstTheShippingProduct(t *testing.T) {
 					"bench does not serve, so every southbound silence on this row is unattributable",
 					href, resp.StatusCode)
 			}
+			// THE DELIVERY FACT. This fixture has no gateway process at all —
+			// nothing fetches anything — so the row's own text must say that,
+			// instead of reading as though a DUT had considered the control and
+			// declined it. The two produce identical register evidence and only
+			// this sentence separates them in the headline verdict.
+			notes := s.Notes(obs)
+			if !strings.Contains(notes, "NO fetch of this row's control was observed") {
+				t.Errorf("%s's verdict text does not say the control was never fetched, so a dead DUT and "+
+					"a refusing one read identically here:\n%s", id, notes)
+			}
+			if !strings.Contains(notes, "never received the control at all") {
+				t.Errorf("%s's verdict text does not name the ambiguity it is under:\n%s", id, notes)
+			}
 			t.Logf("%s end-to-end on a legacy bench: verdict=FAIL model=%s generation=%s curve=%s (%d)\n%s",
-				id, params[curveModelParam], params[curveGenParam], href, resp.StatusCode, s.Notes(obs))
+				id, params[curveModelParam], params[curveGenParam], href, resp.StatusCode, notes)
 		})
 	}
 }
@@ -739,5 +849,231 @@ func TestLegacyRowTeardownActuallyClearsTheBench(t *testing.T) {
 	// And the control list is back to a plain, empty one.
 	if ctrls := get("/derp/0/derc"); strings.Contains(ctrls, "opModVoltVar") {
 		t.Errorf("the admin-posted curve control survived the teardown:\n%s", ctrls)
+	}
+}
+
+// TestLegacyEngineeringCrossCheck_CatchesAMisScaledBinding is the teeth of the
+// independent side.
+//
+// The green proofs are genuinely discriminating — a row is red on an unwritten
+// bench and green after the writer runs, and a volt-var write leaves the other
+// three red — but that shape cannot see a binding that is wrong on BOTH sides
+// of the comparison. With the plan and the oracle expectation both derived from
+// wantPoints(), setting BASIC-006's XMult to 1 installs breakpoints at 920
+// %VRef — 9.2x nominal, a curve no inverter on earth could run — and the row
+// still transitions Fail -> Pass, because the oracle asks for the same 920.
+//
+// The device-engineering literals are what close it, so this proves they do.
+func TestLegacyEngineeringCrossCheck_CatchesAMisScaledBinding(t *testing.T) {
+	want := legacyExpectations(t, "BASIC-006")
+
+	good := rowByID(t, "BASIC-006").mode.Curve
+	if err := crossCheckEngineering(good, sunspec.ModelVoltVarLegacy, want); err != nil {
+		t.Fatalf("the SHIPPING BASIC-006 binding fails its own engineering cross-check: %v", err)
+	}
+
+	// The probe: the multiplier the gate demonstrated a live PASS with.
+	mis := *good
+	mis.XMult = 1
+	err := crossCheckEngineering(&mis, sunspec.ModelVoltVarLegacy, want)
+	if err == nil {
+		t.Fatal("a binding at xMultiplier 10^1 — breakpoints at 920 %VRef — passed the cross-check, so " +
+			"the plan and the oracle are still deriving the same number from the same function and a " +
+			"mis-scaled row would go green on a curve no device could run")
+	}
+	if !strings.Contains(err.Error(), "MIS-SCALED BINDING") {
+		t.Errorf("the cross-check failed for the wrong reason: %v", err)
+	}
+	t.Logf("mis-scaled binding rejected:\n  %v", err)
+
+	// A dropped breakpoint is caught too: the length arm.
+	short := *good
+	short.Points = good.Points[:2]
+	if err := crossCheckEngineering(&short, sunspec.ModelVoltVarLegacy, want); err == nil {
+		t.Error("a binding publishing two of its four prescribed breakpoints passed the cross-check")
+	}
+}
+
+// TestLegacyCaseBRewriteTurnsTheRowGreenThroughTheRealWriter exercises the
+// single-bank path, which every green run so far has missed.
+//
+// NCrv=1 is the FIELD-COMMON shape and the genuinely hard one: there is no
+// spare bank, so the writer cannot stage — it must disable the function,
+// rewrite the live bank in place and re-enable, with the device running no
+// curve for the width of that window. Case A hides every ordering mistake in
+// that sequence behind an atomic ActCrv switch, so a harness that only ever ran
+// Case A has not exercised the path a real inverter will take.
+func TestLegacyCaseBRewriteTurnsTheRowGreenThroughTheRealWriter(t *testing.T) {
+	f := newLegacyFixture(t, sim.LegacyCurveOptions{NCrv: 1})
+	b := legacyBindingOf(t, "BASIC-006")
+
+	// The device really is single-bank, or this test proves nothing.
+	uv := f.unitView(t)
+	if cv := uv.Curve(oracleSimName, sunspec.ModelVoltVarLegacy); cv.NCrv != 1 {
+		t.Fatalf("the fixture declares NCrv=%d; this test needs the single-bank shape", cv.NCrv)
+	}
+
+	before := oracleCurve(b)(context.Background(), f.rc)
+	if before.Verdict != certify.Fail {
+		t.Fatalf("BASIC-006 started %s on an unwritten single-bank bench: %s", before.Verdict, before.Observed)
+	}
+
+	out, err := f.base.WriteLegacyCurve(
+		legacyPlanFor(t, b, sunspec.ModelVoltVarLegacy, "opModVoltVar", 3, legacyExpectations(t, "BASIC-006")),
+		"legacy-curve-test")
+	if err != nil {
+		t.Fatalf("the real derbase legacy writer refused a Case-B rewrite: %v", err)
+	}
+	if !out.CaseB {
+		t.Fatalf("the writer reported caseB=false on a single-bank device (bank %d) — this test did not "+
+			"exercise the in-place rewrite it exists for", out.Bank)
+	}
+	if out.Bank != 1 {
+		t.Errorf("the Case-B rewrite landed in bank %d, and a single-bank device has only bank 1", out.Bank)
+	}
+
+	after := oracleCurve(b)(context.Background(), f.rc)
+	if after.Verdict != certify.Pass {
+		t.Fatalf("BASIC-006 after a Case-B rewrite = %s, want PASS.\n%s", after.Verdict, after.Observed)
+	}
+	t.Logf("BASIC-006 GREEN through a Case-B rewrite (bank %d, caseB=%t):\n  %s",
+		out.Bank, out.CaseB, after.Observed)
+}
+
+// TestLegacyRowDeliveryFactDistinguishesAFetchFromSilence is the discrimination
+// proof for the delivery sentence itself.
+//
+// A row that always said "no fetch observed" would be as useless as one that
+// never said it: the sentence is only worth carrying if the bench can tell the
+// two states apart. So the same row is run twice against the same bench — once
+// with nothing fetching, and once with a client that fetches the control list
+// exactly as a live DUT's walk would — and the verdict text must change.
+func TestLegacyRowDeliveryFactDistinguishesAFetchFromSilence(t *testing.T) {
+	f := newLegacyFixture(t, sim.LegacyCurveOptions{})
+	d, _, dataURL := f.withGridSim(t)
+	row := rowByID(t, "BASIC-006")
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-006")
+	ctx := context.Background()
+
+	silent := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, silent); err != nil {
+		t.Fatalf("Setup (silent): %v", err)
+	}
+	if err := s.PostWait(ctx, d, silent); err != nil {
+		t.Fatalf("PostWait (silent): %v", err)
+	}
+	if got := silent[curveDeliveryParam]; !strings.Contains(got, "NO fetch") {
+		t.Errorf("with nothing fetching, the delivery fact reads %q", got)
+	}
+
+	fetched := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, fetched); err != nil {
+		t.Fatalf("Setup (fetched): %v", err)
+	}
+	// A live DUT's walk reaches the control list. Nothing else about the run
+	// changes, so the delivery sentence is the only thing that can move.
+	resp, err := http.Get(dataURL + "/derp/0/derc")
+	if err != nil {
+		t.Fatalf("fetch the control list: %v", err)
+	}
+	_ = resp.Body.Close()
+	if err := s.PostWait(ctx, d, fetched); err != nil {
+		t.Fatalf("PostWait (fetched): %v", err)
+	}
+	got := fetched[curveDeliveryParam]
+	if !strings.Contains(got, "FETCHED this row's control") {
+		t.Fatalf("after a real control-list fetch, the delivery fact still reads %q — the sentence cannot "+
+			"tell a live peer from silence and is worth nothing", got)
+	}
+	// And the row is STILL red: delivery is context for the verdict, never a
+	// substitute for the southbound measurement.
+	if v := s.Verdict(&Observation{Params: fetched}); v != certify.Fail {
+		t.Errorf("BASIC-006 = %s once the control was fetched; a fetch is not execution", v)
+	}
+	t.Logf("delivery observed:\n  %s", got)
+}
+
+// ── The both-generations device ─────────────────────────────────────────────
+
+// bothGenerationsView is a DER serving 7xx AND legacy curve models. No bench
+// builds one and no row was written for one, which is exactly why the
+// resolution has to have an answer for it.
+func bothGenerationsView() invariant.UnitView {
+	return invariant.UnitView{Models: []uint16{
+		1, 103, 120, 121, 122, 123,
+		705, 706, 711, 712,
+		126, 129, 130, 131, 132, 134,
+	}}
+}
+
+// TestBothGenerationsDER_IsItsOwnAnswerAndNotATieBreak pins the ambiguity.
+//
+// Preferring one family silently is the worst available behaviour: it grades a
+// bank the row's author never considered, and on BASIC-015 it swaps a refusal
+// assertion for an execution one — so critRefusalAnswered, the LXR-002 catcher,
+// stops running and the 712 fingerprint is never taken. A false negative on a
+// real defect class is worse than refusing to grade.
+func TestBothGenerationsDER_IsItsOwnAnswerAndNotATieBreak(t *testing.T) {
+	uv := bothGenerationsView()
+	if got := curveGenerationOf(uv); got != genAmbiguous {
+		t.Fatalf("a DER serving both families reported generation %v, want ambiguous", got)
+	}
+	if got := curveGenerationOf(uv).String(); got != curveGenAmbiguous {
+		t.Errorf("the ambiguous generation renders as %q, want %q", got, curveGenAmbiguous)
+	}
+
+	for _, id := range []string{"BASIC-006", "BASIC-011", "BASIC-012"} {
+		b := rowByID(t, id).mode.Curve
+		if _, how := b.resolveTarget(uv); how != curveAmbiguous {
+			t.Errorf("%s resolved a target on a both-generations DER (how=%v); it must decline", id, how)
+		}
+	}
+
+	// BASIC-015 keeps its declared REFUSAL apparatus, so the LXR-002 catcher
+	// goes on running...
+	row := rowByID(t, "BASIC-015").mode
+	both := row.forGeneration(map[string]string{curveGenParam: curveGenAmbiguous})
+	if both.Refusal == nil || both.Curve != nil {
+		t.Errorf("BASIC-015 on a both-generations DER flipped to the execution arm (refusal=%v curve=%v): "+
+			"critRefusalAnswered would stop running and the 712 fingerprint would never be taken",
+			both.Refusal != nil, both.Curve != nil)
+	}
+	// ...and its southbound half declines to fingerprint a bank it cannot
+	// choose, which is the "fail with the ambiguity named" half.
+	if fp, ok := both.Refusal.fingerprint(uv); ok {
+		t.Errorf("BASIC-015's refusal fingerprinted %q on a both-generations DER; it must decline rather "+
+			"than watch a bank picked by a tie-break", fp)
+	}
+	if _, ok := curveBaselineContamination(uv, both.Refusal.Curve); ok {
+		t.Error("the contamination read resolved a bank on a both-generations DER")
+	}
+}
+
+// TestResolveTargetFallback_TieBreaksLegacyFirst pins the reconciliation.
+//
+// The two tie-breaks used to point opposite ways: generation resolution
+// preferred legacy, and this fallback preferred 7xx, so a device the first
+// function called legacy could still be graded against a 7xx bank here. Two
+// tie-breaks disagreeing inside one resolution path is a bug waiting for the
+// device that reaches both.
+func TestResolveTargetFallback_TieBreaksLegacyFirst(t *testing.T) {
+	// Neither named model is a CURVE model, so no generation is recognised and
+	// the fallback is what decides — which is the only way to observe it.
+	b := &curveBinding{
+		Mode:     "volt_var",
+		Model7xx: 707, Mapping7xx: "the 7xx arm",
+		ModelLegacy: 708, MappingLegacy: "the legacy arm",
+	}
+	uv := invariant.UnitView{Models: []uint16{707, 708}}
+	if got := curveGenerationOf(uv); got != genNone {
+		t.Fatalf("this fixture recognises generation %v; the fallback would not be reached", got)
+	}
+	target, how := b.resolveTarget(uv)
+	if how != curveResolved {
+		t.Fatalf("the fallback resolved nothing (how=%v)", how)
+	}
+	if target.Model != 708 {
+		t.Errorf("the fallback chose M%d; it must try LEGACY first, matching curveGenerationOf's own "+
+			"ordering, or one resolution path holds two tie-breaks pointing opposite ways", target.Model)
 	}
 }

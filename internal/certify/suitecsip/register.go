@@ -97,6 +97,48 @@ const (
 		"opModFreqWatt y is %setMaxW. The two are equal only when WRef == setMaxW, so this referee renders " +
 		"the device's own WRef and its SnptW snapshot-mode flag on every reading rather than assuming them"
 
+	// The bench levers that do not exist, named once so a row can cite them the
+	// way noRideThrough/noRampRate are cited.
+	noCurveTimingLever = "gridsim's POST /admin/curve (sim/gridsim/curve.go adminCurveReq) carries points, " +
+		"multipliers and a yRefType and NOTHING else: DERCurve's timing and reference-tracking elements " +
+		"(openLoopTms, rampDecTms, rampIncTms, rampPT1Tms, autonomousVrefEnable, autonomousVrefTimeConstant) " +
+		"have no field on the request and no emission site, so this bench cannot put them on the wire at all"
+
+	noFreqDroopLever = "opModFreqDroop is an INLINE struct on DERControlBase, not a curve link, and gridsim " +
+		"has no lever for it anywhere — neither adminCtrlReq nor adminCurveReq carries dBOF/dBUF/kOF/kUF/" +
+		"openLoopTms, and csipmodel's ExtendedDERControlBase is not populated with one. So the " +
+		"frequency-DROOP half of this row's Figure cannot be placed on the wire from this bench, and only " +
+		"its frequency-WATT curve half is exercised"
+
+	// The catalog's DERCurve.curveType values are CSIP-CONF v1.3's own
+	// numbering and do not agree with sep 2.0.4's DERCurveType, nor with each
+	// other: Figure 6 prints 11 for volt-var, Figure 11 prints 12 for
+	// volt-watt, and Figure 12 prints 0 for freq-watt, where sep 2.0.4 declares
+	// 0, 3 and 1. This bench emits the SCHEMA's codes.
+	//
+	// Following the catalog instead would put a value on the wire that sep
+	// 2.0.4's own enumeration does not define for the element (there is no
+	// DERCurveType 11 or 12 — the type stops at 10), inside documents used to
+	// certify conformance against that schema. The divergence is recorded
+	// upstream as a CurveSetV question (lexa-proto csipmodel, R4b) and is named
+	// on every affected row rather than silently resolved.
+	// BASIC-015 is the one curve-carrying row whose values are NOT the
+	// catalog's, and saying so is the point: CSIP CTP v1.3's BASIC-015 procedure
+	// prescribes twenty-four fixed-power-factor DERControls and carries no curve
+	// settings Figure at all. The Watt-PF curve this row publishes is therefore
+	// this suite's OWN construction, chosen to exercise the opModWattPF axis
+	// (which is what the row's refusal/execution halves are about), and the
+	// bundle must not imply a provenance it does not have.
+	basic015NoPrescribedCurve = "CSIP CTP v1.3 BASIC-015 prescribes NO curve settings figure — its " +
+		"procedure is twenty-four fixed-power-factor DERControls — so the Watt-PF curve this row " +
+		"publishes is this suite's own, chosen to exercise the opModWattPF axis the row is about. Its " +
+		"values are NOT claimed to be catalog-prescribed"
+
+	curveTypeDivergence = "this bench emits sep 2.0.4's own DERCurveType code for the mode. The catalog's " +
+		"printed value is CSIP-CONF v1.3's separate numbering, which the schema does not define for this " +
+		"element (DERCurveType stops at 10); emitting it would make the evidence non-conformant to the " +
+		"standard the evidence is about. Recorded upstream as a CurveSetV question (lexa-proto csipmodel, R4b)"
+
 	mappingWattPFLegacy = "IEEE 2030.5's opModWattPF is a power-factor curve against active power, and its " +
 		"ONE exact register home anywhere in SunSpec is legacy model 131 (Watt-PF): W<n> in %WMax against " +
 		"PF<n> as a power factor in EEI cos() notation. 131 carries NO DeptRef — the spec fixes its x axis " +
@@ -451,18 +493,55 @@ func inverterControlRows() []inverterControlRow {
 		// DER's own curve model, point for point and in order. The mode→model
 		// mapping is stated on each row because a FAIL that names a register
 		// bank has to be checkable by whoever reads the bundle.
+		//
+		// THE PUBLISHED CURVE IS THE CATALOG'S, and until 2026-08-15 it was not.
+		// This row published (92,60)(98,0)(102,0)(108,-60) with no multipliers —
+		// which is not Figure 6's curve at any scale. It is the shape of
+		// gridsim's own STATIC FIXTURE (sim/gridsim/extended.go's
+		// staticVoltVarCurve0, x 92/98/102/108, y +/-30), inherited when the row
+		// was first written and never reconciled to the procedure.
+		//
+		// The defect is PRE-EXISTING and predates the legacy-curve work; what
+		// changed is that it became REACHABLE AS A PASS. While every curve row's
+		// southbound half was a decided FAIL on every bench, publishing the
+		// wrong curve altered no verdict. With a legacy execution arm the row
+		// can go GREEN — on content the certification procedure never asked for,
+		// straight into a conformance bundle. That is the IW15-004 class
+		// BASIC-013 has carried a pinning test for since it was repaired, and
+		// no curve row had one until now
+		// (TestCurveRows_PublishTheCatalogPrescribedValues).
 		{"BASIC-006", 52, curveMode("opModVoltVar", &curveBinding{
-			Mode:   "volt_var",
-			Points: []CurvePoint{{X: 92, Y: 60}, {X: 98, Y: 0}, {X: 102, Y: 0}, {X: 108, Y: -60}},
-			// yRefType 3 = %statVarAvail, which translates to DeptRef 2 on 705
-			// (0-based) and DeptRef 3 on 126 (1-based). The two codes differ and
-			// the row states neither: the referee derives each from the standards
-			// text for the model it resolved to (curveBinding.wantDeptRef).
+			Mode: "volt_var",
+			// CSIP CTP v1.3 BASIC-006, Figure 6 Volt-VAr Settings, Test Values:
+			// (9100,4000) (9570,0) (10400,0) (10600,-4000) at 10^-2 on both axes
+			// — 91.00 %V -> +40.00 %, 95.70 %V -> 0, 104.00 %V -> 0,
+			// 106.00 %V -> -40.00 %.
+			Points: []CurvePoint{{X: 9100, Y: 4000}, {X: 9570, Y: 0}, {X: 10400, Y: 0}, {X: 10600, Y: -4000}},
+			XMult:  -2,
+			YMult:  -2,
+			// yRefType is NOT prescribed by Figure 6 — the Figure lists
+			// CurveData, openLoopTms, the autonomous-Vref pair, curveType and
+			// the two multipliers and no y reference at all. 3 (%statVarAvail)
+			// is this suite's own choice from opModVoltVar's admissible set
+			// {%setMaxW, %setMaxVar, %statVarAvail}, and it is load-bearing:
+			// it translates to DeptRef 2 on 705 (0-based) and DeptRef 3 on 126
+			// (1-based). The row states neither code; the referee derives each
+			// from the standards text for the model it resolved to.
 			YRefType:      derUnitRefStatVarAvail,
+			Prescribed:    "CSIP CTP v1.3 BASIC-006, Figure 6 Volt-VAr Settings, Test Values column",
 			Model7xx:      sunspec.ModelDERVoltVar,
 			Mapping7xx:    mappingVoltVar,
 			ModelLegacy:   sunspec.ModelVoltVarLegacy,
 			MappingLegacy: mappingVoltVarLegacy,
+			Gaps: []curveGap{
+				{Element: "opModVoltVar.DERCurve.openLoopTms", Prescribed: "5", Default: "10",
+					Why: noCurveTimingLever, Material: true},
+				{Element: "opModVoltVar.DERCurve.autonomousVrefEnable", Prescribed: "false", Default: "false",
+					Why: noCurveTimingLever},
+				{Element: "opModVoltVar.DERCurve.autonomousVrefTimeContant", Prescribed: "0", Default: "0",
+					Why: noCurveTimingLever},
+				{Element: "DERCurve.curveType", Prescribed: "11", Default: "11", Why: curveTypeDivergence},
+			},
 		}), "a Volt-VAr curve"},
 		{"BASIC-007", 53, unreachableMode("setGradW", noRampRate), "the ramp-rate settings"},
 		{"BASIC-008", 54, scalarMode("opModFixedPFInjectW", func(r *ControlRequest) {
@@ -497,13 +576,24 @@ func inverterControlRows() []inverterControlRow {
 		// answered cannot-comply. This row would have FAILED a correct DUT for a
 		// defect in its own fixture.
 		{"BASIC-011", 57, curveMode("opModVoltWatt", &curveBinding{
-			Mode:          "volt_watt",
-			Points:        []CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}},
-			YRefType:      derUnitRefSetMaxW,
+			Mode: "volt_watt",
+			// CSIP CTP v1.3 BASIC-011, Figure 11 Volt-Watt Settings, Test
+			// Values: (10000,10000) (10500,10000) (10900,0) at 10^-2 on both
+			// axes — 100.00 %V -> 100.00 %W, 105.00 %V -> 100.00 %W,
+			// 109.00 %V -> 0. THREE points, where this row published two of its
+			// own; see BASIC-006 for the provenance of the values that were here.
+			Points:        []CurvePoint{{X: 10000, Y: 10000}, {X: 10500, Y: 10000}, {X: 10900, Y: 0}},
+			XMult:         -2,
+			YMult:         -2,
+			YRefType:      derUnitRefSetMaxW, // Figure 11 prescribes yRefType 1
+			Prescribed:    "CSIP CTP v1.3 BASIC-011, Figure 11 Volt-Watt Settings, Test Values column",
 			Model7xx:      sunspec.ModelDERVoltWatt,
 			Mapping7xx:    mappingVoltWatt,
 			ModelLegacy:   sunspec.ModelVoltWattLegacy,
 			MappingLegacy: mappingVoltWattLegacy,
+			Gaps: []curveGap{
+				{Element: "DERCurve.curveType", Prescribed: "12", Default: "12", Why: curveTypeDivergence},
+			},
 		}), "a Volt-Watt curve"},
 		// yRefType 1 (%setMaxW) for the same reasons as BASIC-011: sep 2.0.4's
 		// opModFreqWatt documentation ("The y value specifies a corresponding
@@ -529,10 +619,35 @@ func inverterControlRows() []inverterControlRow {
 		// comparing 60.00 Hz against a published 6000. 6000 x 10^-2 = 60.00 Hz
 		// is what the row always meant.
 		{"BASIC-012", 58, curveMode("opModFreqWatt", &curveBinding{
-			Mode:     "freq_watt",
-			Points:   []CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}},
+			Mode: "freq_watt",
+			// CSIP CTP v1.3 BASIC-012, Figure 12 Frequency-Watt Settings, Test
+			// Values: (5900,100) (5950,80) (6050,80) (6200,0) with
+			// xMultiplier -2 and yMultiplier 0 — 59.00 Hz -> 100 %, 59.50 Hz ->
+			// 80 %, 60.50 Hz -> 80 %, 62.00 Hz -> 0. Four points; this row
+			// published two of its own.
+			Points:   []CurvePoint{{X: 5900, Y: 100}, {X: 5950, Y: 80}, {X: 6050, Y: 80}, {X: 6200, Y: 0}},
 			XMult:    -2,
-			YRefType: derUnitRefSetMaxW,
+			YMult:    0,
+			YRefType: derUnitRefSetMaxW, // Figure 12 prescribes yRefType 1
+			Prescribed: "CSIP CTP v1.3 BASIC-012, Figure 12 Frequency-Watt Settings, Test Values column " +
+				"(the opModFreqWatt DERCurve half)",
+			Gaps: []curveGap{
+				// Figure 12 prescribes BOTH halves of the row: a frequency-WATT
+				// curve and an immediate frequency-DROOP control. This bench can
+				// author the first and not the second, so the row exercises half
+				// of its own procedure and says so.
+				{Element: "opModFreqDroop.dBOF", Prescribed: "60030", Default: "36",
+					Why: noFreqDroopLever, Material: true},
+				{Element: "opModFreqDroop.dBUF", Prescribed: "59970", Default: "36",
+					Why: noFreqDroopLever, Material: true},
+				{Element: "opModFreqDroop.kOF", Prescribed: "40", Default: "50",
+					Why: noFreqDroopLever, Material: true},
+				{Element: "opModFreqDroop.kUF", Prescribed: "40", Default: "50",
+					Why: noFreqDroopLever, Material: true},
+				{Element: "opModFreqDroop.openLoopTms", Prescribed: "600", Default: "500",
+					Why: noFreqDroopLever, Material: true},
+				{Element: "DERCurve.curveType", Prescribed: "0", Default: "0", Why: curveTypeDivergence},
+			},
 			// The 7xx arm names 711 as the NEAREST model and refuses to measure
 			// against it: 711 is a parametric droop with no point table, so
 			// there is nothing a published curve could be written into.
@@ -652,10 +767,11 @@ func inverterControlRows() []inverterControlRow {
 			"the SunSpec model 712 (DER Watt-Var) curve bank",
 			refusalWattPF,
 			&curveBinding{
-				Mode:     "watt_pf",
-				Points:   []CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}},
-				YRefType: derUnitRefStatVarAvail,
-				Model7xx: sunspec.ModelDERWattVar,
+				Mode:       "watt_pf",
+				Points:     []CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}},
+				YRefType:   derUnitRefStatVarAvail,
+				Model7xx:   sunspec.ModelDERWattVar,
+				Prescribed: basic015NoPrescribedCurve,
 			},
 			// THE LEGACY ARM PUBLISHES yMultiplier = -2 where the 7xx refusal
 			// arm publishes none, and the difference is not cosmetic. A power
@@ -678,6 +794,7 @@ func inverterControlRows() []inverterControlRow {
 				Points:        []CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}},
 				YMult:         -2,
 				YRefType:      derUnitRefStatVarAvail,
+				Prescribed:    basic015NoPrescribedCurve,
 				ModelLegacy:   sunspec.ModelWattPFLegacy,
 				MappingLegacy: mappingWattPFLegacy,
 			}), "an advanced (curve-based) inverter control"},

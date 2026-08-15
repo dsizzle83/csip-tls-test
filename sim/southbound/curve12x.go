@@ -140,7 +140,13 @@ var legacyCurveSpecs = []legacyCurveSpec{
 	{
 		id: sunspec.ModelVoltVarLegacy, hdr: sunspec.L126Hdr, bank: sunspec.L126Crv,
 		blockLen: sunspec.Blk126, npt: legacyNPt,
-		sfs: map[string]int16{"V_SF": 0, "DeptRef_SF": 0, "RmpIncDec_SF": 0},
+		// V_SF / DeptRef_SF = -2. The CSIP CTP curve settings are stated in
+		// HUNDREDTHS (Figure 6's 9570 with xMultiplier -2 is 95.70 %VRef), and
+		// the legacy encoders are the CHECKED tier: a value the device's own
+		// scale factor cannot represent is REFUSED, never silently rounded. A
+		// fixture at SF 0 would therefore make every conformant curve
+		// unwritable and blame the writer for the fixture's granularity.
+		sfs: map[string]int16{"V_SF": -2, "DeptRef_SF": -2, "RmpIncDec_SF": 0},
 		seed: func(regs []uint16, bank int) error {
 			_, _, err := sunspec.EncodeLegacy126Curve(regs, bank, sunspec.LegacyVoltVarCurve{
 				DeptRef: 1, // %WMax — the legacy 1-based numbering
@@ -200,21 +206,21 @@ var legacyCurveSpecs = []legacyCurveSpec{
 	{
 		id: sunspec.ModelVoltWattLegacy, hdr: sunspec.L132Hdr, bank: sunspec.L132Crv,
 		blockLen: sunspec.Blk132, npt: legacyNPt,
-		sfs: map[string]int16{"V_SF": 0, "DeptRef_SF": 0, "RmpIncDec_SF": 0},
+		sfs: map[string]int16{"V_SF": -2, "DeptRef_SF": -2, "RmpIncDec_SF": 0},
 		seed: func(regs []uint16, bank int) error {
 			_, _, err := sunspec.EncodeLegacy132Curve(regs, bank, sunspec.LegacyVoltWattCurve{
 				DeptRef: 1, // %WMax
 				CrvNam:  "SIMVW",
-				// THREE points, where every conformance row that targets 132
-				// publishes two. The seeded default has to be distinguishable
+				// TWO points, where the conformance row that targets 132
+				// publishes three. The seeded default has to be distinguishable
 				// from a commanded curve by more than the oracle's per-point
 				// tolerance (1 % of the value plus half a unit), or a row would
 				// fail on the second breakpoint while the first "matched" a
 				// curve nobody commanded — a FAIL for very nearly the wrong
 				// reason. A different POINT COUNT cannot be absorbed by any
-				// tolerance, which is why the seeds are shaped that way.
+				// tolerance, which is why every seed is shaped that way.
 				Pts: []sunspec.LegacyCurvePoint{
-					{X: 103, Y: 100}, {X: 108, Y: 60}, {X: 114, Y: 20},
+					{X: 103, Y: 100}, {X: 114, Y: 20},
 				},
 			})
 			return err
@@ -650,7 +656,7 @@ func populateLegacyCurveModel(r *RegisterMap, cursor uint16, spec legacyCurveSpe
 			_, _, err := sunspec.EncodeLegacy134Curve(regs, bank, sunspec.LegacyFreqWattCurve{
 				CrvNam: "SIMFW",
 				// Absolute Hz, three points where the freq-watt row publishes
-				// two — see the 132 seed for why the COUNT is what differs.
+				// four — see the 132 seed for why the COUNT is what differs.
 				// Shape: flat through the deadband, then a droop above it.
 				Pts: []sunspec.LegacyCurvePoint{
 					{X: 59.5, Y: 100}, {X: 60.5, Y: 100}, {X: 62, Y: 20},

@@ -197,6 +197,12 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	// ambiguity critDERCurveResolvable was written to disambiguate and could
 	// not, because the bench always 404'd. Publish the individual resources so
 	// the link a control carries actually resolves.
+	// The clear MUST come first. An activating POST truncates the list to one
+	// entry, so republishing 0..len-1 alone would leave every /derp/{p}/dc/{i}
+	// this program had published above that index still served — a curve at an
+	// href the list no longer mentions, which is precisely the leak the
+	// teardown exists to prevent, arriving through the publish path instead.
+	s.clearCurveResourcesLocked(req.Program)
 	s.publishCurveResourcesLocked(req.Program, cl)
 
 	// Ensure the program advertises its DERCurveList so the walker discovers

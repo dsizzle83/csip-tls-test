@@ -182,6 +182,13 @@ func (m controlMode) forGeneration(params map[string]string) controlMode {
 	if m.LegacyCurve == nil || params == nil {
 		return m
 	}
+	// ONLY an unambiguous legacy DER flips the apparatus. "both generations"
+	// and "unknown" keep the row as declared, which for BASIC-015 means the
+	// REFUSAL arm goes on running — so critRefusalAnswered, the LXR-002 catcher
+	// (a DUT reporting Started for an axis nothing executed), is never silently
+	// swapped out by a device that happens to serve two families. The refusal's
+	// own southbound half then reports the ambiguity as a decided FAIL, because
+	// resolveTarget declines to pick a bank to fingerprint.
 	if params[curveGenParam] != string(invariant.FamilyLegacy) {
 		return m
 	}
@@ -671,7 +678,8 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				// refusal does, and the row would certify the DUT for something
 				// the bench caused (see critDERCurveResolvable).
 				if m.Refusal.Curve != nil {
-					crits = append(crits, critDERCurveResolvable(curveHrefOf(o)))
+					crits = append(crits, critCurvePublishedTheProcedureValues(subject, m.Refusal.Curve),
+						critDERCurveResolvable(curveHrefOf(o)))
 				}
 				// Two assertions, because a refusal has two halves and either
 				// alone lets the other's defect through: what the DUT told the
@@ -679,7 +687,8 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				crits = append(crits, critRefusalAnswered(o.Param("mrid")),
 					critRefusedAxisNoSouthboundTrace(m.Refusal, o))
 			case m.Curve != nil:
-				crits = append(crits, critDERCurveResolvable(curveHrefOf(o)),
+				crits = append(crits, critCurvePublishedTheProcedureValues(subject, m.Curve),
+					critDERCurveResolvable(curveHrefOf(o)),
 					critDEREffectViaCurveOracle(subject, m.Curve, o))
 			case m.Oracle != nil:
 				crits = append(crits, critDEREffectViaSouthboundOracle(subject, o))
@@ -741,6 +750,14 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			s.SettlePoll = true
 			s.PostWait = func(ctx context.Context, d *Driver, params map[string]string) error {
 				m := m.forGeneration(params)
+				// Read the bench's own data plane ONCE, here, and write down
+				// whether the DUT came and fetched this row's control. Every
+				// verdict below rests on what the DER does or does not hold,
+				// and an absence is only about the DUT's refusal if the DUT was
+				// there to refuse. See recordCurveDelivery.
+				if m.Curve != nil || m.Refusal != nil {
+					recordCurveDelivery(ctx, d, params, m.Program)
+				}
 				// settleOracle, not a bare judge call: AwaitWalk returns at
 				// the START of the DUT's walk, so the control the DUT is
 				// fetching may not have reached the DER's own registers yet

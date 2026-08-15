@@ -82,6 +82,31 @@ const (
 	// default of either generation: a row that guessed would attribute a
 	// verdict to a bank it never read.
 	curveGenUnknown = "unknown"
+	// curveGenAmbiguous is recorded for a DER that serves BOTH generations'
+	// curve models. It is a THIRD answer, not a tie-break: no row was written
+	// for such a device, and picking one silently would grade a bank the row's
+	// author never considered — and, on BASIC-015, would swap a refusal
+	// assertion for an execution one and stop running the LXR-002 catcher.
+	curveGenAmbiguous = "both"
+
+	// curveDeliveryParam carries what the bench's own data plane saw the DUT
+	// fetch during this row's window. It exists because a southbound ABSENCE
+	// has two causes that read identically in a verdict — the DUT refused the
+	// axis, or the DUT never received the control (it is wedged, or dead, or
+	// the bench never served it) — and the per-criterion record that already
+	// distinguishes them (critDERControlCarriesModeFrom, critDERCurveResolvable)
+	// is carried in Skip assertions, which are severity 0 and never appear in
+	// the headline verdict text a reader acts on. This makes the distinction
+	// LEGIBLE where the FAIL is stated; it does not add a mechanism.
+	curveDeliveryParam = "iw15.curve_delivery"
+	// curveDeliveryBaselineParam is the GET count Setup recorded, so PostWait
+	// reports a DELTA over this row's own window rather than the whole of the
+	// server's bounded request ring.
+	curveDeliveryBaselineParam = "iw15.curve_delivery_baseline"
+
+	// curveGenAmbiguousParam records that this row DECLINED to choose a
+	// generation, and why. Present only on a DER serving both families.
+	curveGenAmbiguousParam = "iw15.curve_generation_ambiguous"
 )
 
 // ── Curve rows: the binding ─────────────────────────────────────────────────
@@ -141,6 +166,71 @@ type curveBinding struct {
 	ModelLegacy          uint16
 	MappingLegacy        string
 	NoRegisterHomeLegacy string
+
+	// Prescribed states WHERE the breakpoints above come from — the catalog
+	// Figure and column, verbatim enough that a reader can find it — or says
+	// plainly that the procedure prescribes none and these are the suite's own.
+	//
+	// It exists because the alternative is what was here: BASIC-006 published
+	// (92,60)(98,0)(102,0)(108,-60) with no multipliers, which is not Figure 6's
+	// curve at any scale. It is the gridsim STATIC FIXTURE's shape, inherited
+	// when the row was first written and never reconciled to the procedure.
+	// That changed no verdict while every curve row's southbound half was a
+	// decided FAIL on every bench; it stopped being harmless the moment a
+	// legacy DER could execute the curve, because the row would then go GREEN
+	// on content the certification procedure never asked for — a false PASS
+	// into a conformance bundle, and the IW15-004 class BASIC-013 has a pinning
+	// test for while no curve row did.
+	Prescribed string
+
+	// Gaps are prescribed elements of this row's Figure that THIS BENCH cannot
+	// place on the wire. They are named rather than omitted, on the same rule
+	// noRideThrough/noRampRate follow: a row whose control was authored without
+	// part of what the procedure specifies has not been run to the procedure,
+	// and a bundle that did not say so would be overclaiming.
+	Gaps []curveGap
+}
+
+// curveGap is one prescribed element this bench cannot author.
+type curveGap struct {
+	// Element is the procedure's own name for it
+	// ("opModVoltVar.DERCurve.openLoopTms").
+	Element string
+	// Prescribed and Default are the Figure's two columns, as printed.
+	Prescribed, Default string
+	// Why names the missing lever, so the gap has an owner.
+	Why string
+	// Material is true when the procedure's TEST value differs from its own
+	// DEFAULT — i.e. omitting the element means the DUT was never offered the
+	// condition the row exists to create. An immaterial gap (test value equals
+	// the default, or a transcription divergence this bench deliberately does
+	// not follow) is still named, and does not hold the row.
+	Material bool
+}
+
+// materialGaps are the gaps that mean this row was not run to its procedure.
+func (b *curveBinding) materialGaps() []curveGap {
+	var out []curveGap
+	for _, g := range b.Gaps {
+		if g.Material {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// describeGaps renders every gap, material or not, for a criterion that has to
+// say what was left off the wire.
+func describeGaps(gaps []curveGap) string {
+	if len(gaps) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(gaps))
+	for _, g := range gaps {
+		parts = append(parts, fmt.Sprintf("%s (procedure: test %s, default %s) — %s",
+			g.Element, g.Prescribed, g.Default, g.Why))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // curveTarget is the southbound home this row resolved to on THIS DER.
@@ -157,16 +247,43 @@ type curveTarget struct {
 	NoRegisterHome string
 }
 
+// curveGeneration is the answer to "which SunSpec curve generation is this
+// DER?", and it has FOUR values because the question has four honest answers.
+type curveGeneration int
+
+const (
+	genNone      curveGeneration = iota // serves neither family's curve models
+	genLegacy                           // serves 12x and not 7xx
+	gen7xx                              // serves 7xx and not 12x
+	genAmbiguous                        // serves BOTH
+)
+
+func (g curveGeneration) String() string {
+	switch g {
+	case genLegacy:
+		return string(invariant.FamilyLegacy)
+	case gen7xx:
+		return string(invariant.Family7xx)
+	case genAmbiguous:
+		return curveGenAmbiguous
+	}
+	return curveGenUnknown
+}
+
 // curveGenerationOf reports which SunSpec curve generation a DER belongs to,
 // read from the models it actually serves.
 //
-// LEGACY WINS WHEN BOTH ARE PRESENT, and the ordering is deliberate rather than
-// arbitrary: the benches this suite grades serve one generation or the other by
-// construction (sim/southbound's legacy-curve profile serves no 7xx model at
-// all, precisely so this question has an answer), so a device serving both is
-// already outside what any row was written for and the tie-break only decides
-// which honest reading it gets. It never invents one.
-func curveGenerationOf(uv invariant.UnitView) (invariant.CurveFamily, bool) {
+// A DEVICE SERVING BOTH IS ITS OWN ANSWER, not a tie-break. This used to prefer
+// legacy silently, which is the worst of the available behaviours: no row in
+// this suite was written for a device carrying 705 AND 126, so a silent choice
+// grades a bank the row's author never considered — and on BASIC-015, whose
+// posture differs in KIND by generation, it would swap the refusal assertion
+// for an execution one, so critRefusalAnswered (the LXR-002 catcher: a DUT
+// reporting Started for an axis nothing executed) would never run and the 712
+// fingerprint would never be taken. A false negative on a real defect class is
+// a worse outcome than refusing to grade, so the ambiguity is reported and the
+// caller decides.
+func curveGenerationOf(uv invariant.UnitView) curveGeneration {
 	serves := func(models []uint16) bool {
 		for _, m := range models {
 			for _, have := range uv.Models {
@@ -177,20 +294,42 @@ func curveGenerationOf(uv invariant.UnitView) (invariant.CurveFamily, bool) {
 		}
 		return false
 	}
-	if serves(invariant.LegacyCurveModels()) {
-		return invariant.FamilyLegacy, true
-	}
 	var sevenXx []uint16
 	for _, m := range invariant.CurveModels() {
 		if axis, ok := invariant.CurveAxisOf(m); ok && axis.Family == invariant.Family7xx {
 			sevenXx = append(sevenXx, m)
 		}
 	}
-	if serves(sevenXx) {
-		return invariant.Family7xx, true
+	legacy, seven := serves(invariant.LegacyCurveModels()), serves(sevenXx)
+	switch {
+	case legacy && seven:
+		return genAmbiguous
+	case legacy:
+		return genLegacy
+	case seven:
+		return gen7xx
 	}
-	return "", false
+	return genNone
 }
+
+// describeGeneration renders which models put the DER in the generation it is
+// in, for a finding that has to be checkable.
+func describeGeneration(uv invariant.UnitView) string {
+	return fmt.Sprintf("generation %s; the models the DER serves are %s",
+		curveGenerationOf(uv), modelList(uv))
+}
+
+// curveResolution says how a row's southbound arm was decided, or why it could
+// not be. The three outcomes take different verdict paths and must stay
+// distinguishable: an ambiguous device and an unequipped one are not the same
+// finding and do not have the same owner.
+type curveResolution int
+
+const (
+	curveResolved   curveResolution = iota // an arm was selected
+	curveUnresolved                        // the DER has no home for this mode on either generation
+	curveAmbiguous                         // the DER serves BOTH generations; this suite refuses to choose
+)
 
 // resolveTarget picks this row's southbound arm from the DER's own model chain.
 //
@@ -202,40 +341,47 @@ func curveGenerationOf(uv invariant.UnitView) (invariant.CurveFamily, bool) {
 // to publish 711 fall through to the legacy arm and grade against a model it
 // does not serve either.
 //
-// ok=false means the DER serves neither generation's curve models, which is a
-// statement about the bench and is reported as such rather than guessed at.
-func (b *curveBinding) resolveTarget(uv invariant.UnitView) (curveTarget, bool) {
+// A device serving BOTH generations resolves to nothing. See curveGenerationOf
+// for why refusing to grade beats guessing here.
+func (b *curveBinding) resolveTarget(uv invariant.UnitView) (curveTarget, curveResolution) {
 	legacyArm := curveTarget{Model: b.ModelLegacy, Family: invariant.FamilyLegacy,
 		Mapping: b.MappingLegacy, NoRegisterHome: b.NoRegisterHomeLegacy}
 	sevenArm := curveTarget{Model: b.Model7xx, Family: invariant.Family7xx,
 		Mapping: b.Mapping7xx, NoRegisterHome: b.NoRegisterHome7xx}
 
-	if gen, ok := curveGenerationOf(uv); ok {
-		switch gen {
-		case invariant.FamilyLegacy:
-			if b.ModelLegacy != 0 || b.NoRegisterHomeLegacy != "" {
-				return legacyArm, true
-			}
-		case invariant.Family7xx:
-			if b.Model7xx != 0 || b.NoRegisterHome7xx != "" {
-				return sevenArm, true
-			}
+	switch curveGenerationOf(uv) {
+	case genAmbiguous:
+		return curveTarget{}, curveAmbiguous
+	case genLegacy:
+		if b.ModelLegacy != 0 || b.NoRegisterHomeLegacy != "" {
+			return legacyArm, curveResolved
+		}
+	case gen7xx:
+		if b.Model7xx != 0 || b.NoRegisterHome7xx != "" {
+			return sevenArm, curveResolved
 		}
 	}
 	// No generation was recognised (or the row has no arm for the one that
 	// was). Fall back to whichever named model the DER does serve, which is the
 	// only remaining fact about this device that can decide it.
-	for _, arm := range []curveTarget{sevenArm, legacyArm} {
+	//
+	// LEGACY IS TRIED FIRST, matching curveGenerationOf's own ordering. The two
+	// used to disagree — generation resolution preferred legacy, this fallback
+	// preferred 7xx — which meant a device the first function called legacy
+	// could still be graded against a 7xx bank here. Two tie-breaks pointing
+	// opposite ways in one resolution path is a bug waiting for the device that
+	// reaches both.
+	for _, arm := range []curveTarget{legacyArm, sevenArm} {
 		if arm.Model == 0 {
 			continue
 		}
 		for _, have := range uv.Models {
 			if have == arm.Model {
-				return arm, true
+				return arm, curveResolved
 			}
 		}
 	}
-	return curveTarget{}, false
+	return curveTarget{}, curveUnresolved
 }
 
 // describeTargets renders both arms, for a criterion's How and for the
@@ -469,8 +615,19 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 		// configuration, and not from a single Model the row was built with.
 		// The same catalog row therefore measures 705 on a 7xx bench and 126 on
 		// a legacy one, and says which it did.
-		target, ok := b.resolveTarget(uv)
-		if !ok {
+		target, how := b.resolveTarget(uv)
+		switch how {
+		case curveAmbiguous:
+			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+				"this row published %s northbound and the DER under test serves BOTH SunSpec curve "+
+					"generations, so which register bank this row is about has no answer: %s. This row "+
+					"declares %s. No row in this suite was written for a device carrying both families, "+
+					"and choosing one silently would grade a bank the row's author never considered — so "+
+					"the ambiguity is reported as a FAIL rather than resolved by a tie-break. REMEDY: "+
+					"grade this DER on a bench serving one generation, or extend the row with an explicit "+
+					"per-device target",
+				published, describeGeneration(uv), b.describeTargets())}
+		case curveUnresolved:
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
 				"this row published %s northbound and the DER under test serves NEITHER generation's "+
 					"register home for it (%s). The models the DER does serve are %s. With no southbound "+
@@ -523,8 +680,9 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 					"the curve this row published", cv.Bank)
 			}
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-				"the DER's %s %s: %s. This row published %s. Full register state: %s",
-				cv.Axis.Name, held, match.Reason, published, cv.Describe())}
+				"the DER's %s %s: %s. This row published %s. Full register state: %s. The models the DER "+
+					"serves are %s",
+				cv.Axis.Name, held, match.Reason, published, cv.Describe(), modelList(uv))}
 		}
 		// The y-axis REFERENCE, checked separately from the points and after
 		// them, because the two are different defects with different owners and
@@ -583,13 +741,13 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 		// handshake COMPLETED, on legacy ActCrv selects the bank the content is
 		// in. Printing "adopt handshake COMPLETED" against a device with no
 		// such register would describe evidence that does not exist.
-		how := "its adopt handshake COMPLETED and the function is enabled"
+		became := "its adopt handshake COMPLETED and the function is enabled"
 		if cv.Legacy() {
-			how = fmt.Sprintf("ActCrv selects that bank (bank %d) and ModEna bit 0 is set", cv.Bank)
+			became = fmt.Sprintf("ActCrv selects that bank (bank %d) and ModEna bit 0 is set", cv.Bank)
 		}
 		return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
 			"the DER's own %s live curve holds exactly the breakpoints this row published, %s: %s. %s",
-			cv.Axis.Name, how, match.Reason, cv.Describe())}
+			cv.Axis.Name, became, match.Reason, cv.Describe())}
 	}
 }
 
@@ -632,6 +790,7 @@ func curveSetup(ctx context.Context, d *Driver, params map[string]string, b *cur
 	params[oraclePreObservedParam] = findingObserved(pre)
 	params[curvePublishedParam] = b.describePublished()
 	recordCurveTarget(ctx, d, params, b)
+	recordCurveDeliveryBaseline(ctx, d, params, 0)
 
 	return publishCurveControl(ctx, d, params, b, mrid)
 }
@@ -648,11 +807,120 @@ func detectCurveGeneration(ctx context.Context, rc *certify.RunCtx) string {
 	if err != nil {
 		return curveGenUnknown
 	}
-	gen, ok := curveGenerationOf(uv)
-	if !ok {
-		return curveGenUnknown
+	return curveGenerationOf(uv).String()
+}
+
+// ── The delivery fact ───────────────────────────────────────────────────────
+//
+// A southbound absence has two causes and one verdict text. "The DER holds no
+// curve" is what a DUT that REFUSED the axis leaves behind, and it is also
+// exactly what a DUT that never received the control leaves behind — one that
+// is wedged, or not running, or pointed at a different server. The rows already
+// carry criteria that distinguish them (critDERControlCarriesModeFrom, and
+// critDERCurveResolvable, which returns Unavailable when the DUT issued no GET),
+// and the bundle does record it — in Skip assertions, which are severity 0 and
+// appear nowhere in the headline verdict a reader acts on.
+//
+// So this adds no mechanism. It reads the bench's own data plane once, at
+// PostWait, and makes the distinction LEGIBLE in the sentence that carries the
+// FAIL.
+
+// curveControlPaths are the resources a DUT must fetch to have received this
+// row's control at all.
+//
+// The CONTROL list, not the curve href: a DUT that refuses the axis at receipt
+// has no reason to resolve the curve link (critDERCurveResolvable's own doc
+// says so), so counting curve fetches would report every correct refusal as a
+// non-delivery. Fetching the control list is what a live DUT does whether it
+// goes on to execute the axis or refuse it.
+func curveControlPaths(program int) []string {
+	return []string{
+		fmt.Sprintf("/derp/%d/derc", program),
+		fmt.Sprintf("/derp/%d/actderc", program),
 	}
-	return string(gen)
+}
+
+// countCurveFetches totals this row's control-list GETs in a server view.
+func countCurveFetches(v ServerView, program int) int {
+	n := 0
+	for _, p := range curveControlPaths(program) {
+		n += v.GETs(p)
+	}
+	return n
+}
+
+// recordCurveDeliveryBaseline stamps the control-list GET count BEFORE the row
+// publishes, so PostWait reports a delta over this row's own window instead of
+// whatever the server's bounded request ring happens to hold.
+func recordCurveDeliveryBaseline(ctx context.Context, d *Driver, params map[string]string, program int) {
+	if d == nil || !d.Available() {
+		return
+	}
+	params[curveDeliveryBaselineParam] = strconv.Itoa(countCurveFetches(d.Snapshot(ctx), program))
+}
+
+// recordCurveDelivery states, in one sentence a verdict can quote, whether the
+// bench saw the DUT come and fetch this row's control.
+//
+// A NEGATIVE delta is reported as unknown rather than as zero. gridsim's request
+// log is a bounded ring, so a count that went down means the ring evicted the
+// baseline, not that fetches un-happened — the same trap ServerView.Since's
+// RequestLogGap exists to keep a criterion out of.
+func recordCurveDelivery(ctx context.Context, d *Driver, params map[string]string, program int) {
+	if d == nil || !d.Available() {
+		params[curveDeliveryParam] = "the bench has no admin API on this run, so whether the DUT ever " +
+			"fetched this row's control was not established"
+		return
+	}
+	base, haveBase := params[curveDeliveryBaselineParam]
+	v := d.Snapshot(ctx)
+	now := countCurveFetches(v, program)
+	if !haveBase {
+		params[curveDeliveryParam] = "no pre-publication fetch baseline was recorded, so this run cannot " +
+			"say whether the DUT fetched this row's control during its window"
+		return
+	}
+	before, err := strconv.Atoi(base)
+	if err != nil || now < before {
+		params[curveDeliveryParam] = fmt.Sprintf("the bench's request log cannot be delta'd across this "+
+			"row's window (it holds %d control-list GET(s) now against a %q baseline; the log is a bounded "+
+			"ring), so delivery is UNKNOWN and no conclusion is drawn from it", now, base)
+		return
+	}
+	if n := now - before; n > 0 {
+		at := "an unrecorded time"
+		for _, r := range v.Requests {
+			if r.Method != "GET" {
+				continue
+			}
+			for _, p := range curveControlPaths(program) {
+				if r.Path == p && !r.At.IsZero() {
+					at = r.At.Format(time.RFC3339)
+				}
+			}
+		}
+		params[curveDeliveryParam] = fmt.Sprintf("the DUT FETCHED this row's control from the bench during "+
+			"its window (%d control-list GET(s), the last at %s on the server's clock), so it was live and "+
+			"the control reached it", n, at)
+		return
+	}
+	params[curveDeliveryParam] = "NO fetch of this row's control was observed on the bench's data plane " +
+		"during its window, so this reading cannot distinguish a DUT that refused the axis from one that " +
+		"never received the control at all (not running, wedged, or pointed elsewhere)"
+}
+
+// deliveryClause appends the delivery fact to a verdict that rests on a
+// southbound absence.
+func deliveryClause(o *Observation) string {
+	if o == nil {
+		return ""
+	}
+	if s := o.Params[curveDeliveryParam]; s != "" {
+		return " DELIVERY: " + s
+	}
+	return " DELIVERY: the bench recorded no fetch observation for this row, so whether the DUT received " +
+		"the control at all is not established here (the per-criterion record — the mode-on-the-wire and " +
+		"curve-resolvable criteria — carries what was seen)."
 }
 
 // recordCurveTarget writes which generation and which model this row resolved
@@ -668,13 +936,16 @@ func recordCurveTarget(ctx context.Context, d *Driver, params map[string]string,
 		params[curveGenParam] = curveGenUnknown
 		return
 	}
-	gen, ok := curveGenerationOf(uv)
-	if !ok {
-		params[curveGenParam] = curveGenUnknown
-	} else {
-		params[curveGenParam] = string(gen)
+	gen := curveGenerationOf(uv)
+	params[curveGenParam] = gen.String()
+	if gen == genAmbiguous {
+		// The bundle has to record that a CHOICE WAS DECLINED, not merely which
+		// generation was written down. Without this a reader sees a generation
+		// field and assumes it was determined; the interesting fact is that the
+		// device made it undeterminable.
+		params[curveGenAmbiguousParam] = describeGeneration(uv)
 	}
-	if target, ok := b.resolveTarget(uv); ok && target.Model != 0 {
+	if target, how := b.resolveTarget(uv); how == curveResolved && target.Model != 0 {
 		params[curveModelParam] = strconv.FormatUint(uint64(target.Model), 10)
 	}
 }
@@ -748,12 +1019,15 @@ func curveOutcome(o *Observation) Finding {
 		return Finding{Verdict: certify.Fail, Observed: "the live phase left no southbound curve-oracle result " +
 			"behind at all — neither a verdict (" + oracleVerdictParam + ") nor a reason it could not reach " +
 			"one (" + oracleUnavailableParam + ") is recorded, so the oracle either never ran or its result " +
-			"was lost. An unrecorded criterion is not a satisfied one"}
+			"was lost. An unrecorded criterion is not a satisfied one" + deliveryClause(o)}
 	case verdict != certify.Pass:
 		if post == "" {
 			post = "the oracle recorded no observation with its " + string(verdict)
 		}
-		return Finding{Verdict: verdict, Observed: post}
+		// The delivery fact rides on every non-PASS, because every non-PASS
+		// here rests on what the DER does NOT hold — and an absence is only
+		// about the DUT's REFUSAL if the DUT was there to refuse.
+		return Finding{Verdict: verdict, Observed: post + deliveryClause(o)}
 	}
 	switch certify.Verdict(o.Params[oraclePreVerdictParam]) {
 	case certify.Fail:
@@ -858,6 +1132,60 @@ func critDERCurveResolvable(href string) criterion {
 				"not exercised (a DUT that refuses this axis at receipt has no reason to fetch the curve)", href)
 		},
 	}
+}
+
+// critCurvePublishedTheProcedureValues asserts that what went on the wire is
+// what the certification procedure prescribes.
+//
+// It is a CONSTRUCTION claim carried into the bundle, not a measurement: the
+// row's own binding is the thing under assertion, pinned against the catalog by
+// the construction tests, and this criterion restates that provenance where a
+// reader of the report will see it — together with every prescribed element
+// this bench could not place on the wire.
+//
+// It FAILs when a MATERIAL element is missing: one whose prescribed test value
+// differs from the procedure's own default, so omitting it means the DUT was
+// never offered the condition the row exists to create. That is the same rule
+// critModeUnauthorable applies one level up — an untested claim must not roll
+// up as a passing one — applied to a row that IS otherwise testable. An
+// immaterial gap is named and does not hold the row.
+func critCurvePublishedTheProcedureValues(subject string, b *curveBinding) criterion {
+	material := b.materialGaps()
+	prescribed := orText(b.Prescribed, "this row's binding records no provenance for its published values")
+	return criterion{
+		Claim: "the control this row published carries the values the certification procedure prescribes " +
+			"for " + subject,
+		How: "the row's own curve binding, pinned against the catalog's Figure by a construction test " +
+			"(TestCurveRows_PublishTheCatalogPrescribedValues) rather than restated here: " + prescribed,
+		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
+			if len(material) > 0 {
+				return Finding{Verdict: certify.Fail, Observed: "this row published " + prescribed +
+					", and the following element(s) the procedure prescribes could NOT be placed on the " +
+					"wire by this bench: " + describeGaps(material) + ". Each carries a test value that " +
+					"DIFFERS from the procedure's own default, so the DUT was never offered the condition " +
+					"this row exists to create. This is a BENCH capability gap, not a defect of the device " +
+					"under test — and it is reported as a FAIL rather than skipped, because a row that was " +
+					"not run to its procedure must not roll up as one that was. Elements omitted with no " +
+					"material effect (test value equal to the default, or a transcription divergence this " +
+					"bench deliberately does not follow): " + describeGaps(immaterialGaps(b))}
+			}
+			return Finding{Verdict: certify.Pass, Observed: "this row published " + prescribed +
+				". Elements omitted with no material effect (test value equal to the default, or a " +
+				"transcription divergence this bench deliberately does not follow): " +
+				describeGaps(immaterialGaps(b))}
+		},
+	}
+}
+
+// immaterialGaps are the named-but-not-holding gaps.
+func immaterialGaps(b *curveBinding) []curveGap {
+	var out []curveGap
+	for _, g := range b.Gaps {
+		if !g.Material {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // ── Refused-axis rows ───────────────────────────────────────────────────────
@@ -1000,11 +1328,13 @@ func (b *refusalBinding) fingerprint(uv invariant.UnitView) (string, bool) {
 	if b.Curve == nil {
 		return refusalFingerprint(uv, b.Points)
 	}
-	target, ok := b.Curve.resolveTarget(uv)
-	if !ok || target.Model == 0 {
-		// The DER has no bank of this axis at all, on either generation. That
-		// is not an absence this row can certify: it cannot tell "the DUT
-		// refused" from "there was nowhere for a write to land".
+	target, how := b.Curve.resolveTarget(uv)
+	if how != curveResolved || target.Model == 0 {
+		// Either the DER has no bank of this axis at all, or it serves both
+		// generations and this suite refuses to choose. Neither is an absence
+		// this row can certify: it cannot tell "the DUT refused" from "there
+		// was nowhere for a write to land", nor from "we watched the wrong
+		// bank". refusalOutcome turns the unavailability into a decided FAIL.
 		return "", false
 	}
 	views, truncated, ok := coveredCurveSlots(uv, target.Model)
@@ -1041,8 +1371,8 @@ func (b *refusalBinding) fingerprint(uv invariant.UnitView) (string, bool) {
 // window is informative and reporting it as contaminated would be a false
 // accusation against a clean bench.
 func curveBaselineContamination(uv invariant.UnitView, b *curveBinding) (where []string, ok bool) {
-	target, ok := b.resolveTarget(uv)
-	if !ok || target.Model == 0 {
+	target, how := b.resolveTarget(uv)
+	if how != curveResolved || target.Model == 0 {
 		return nil, false
 	}
 	views, _, ok := coveredCurveSlots(uv, target.Model)
@@ -1284,7 +1614,13 @@ func refusalOutcome(b *refusalBinding, o *Observation) Finding {
 				"for a missing fingerprint baseline"}
 		}
 	}
-	return Finding{Verdict: certify.Pass, Observed: o.Params[oracleObservedParam]}
+	// A refusal PASS is an ABSENCE, so the delivery fact is not decoration here
+	// — it is the difference between "the DUT was offered this control and left
+	// the axis alone" and "nothing ever reached the DUT". The verdict is not
+	// downgraded on it (the per-criterion record, critDERControlCarriesModeFrom
+	// and critRefusalAnswered, is what grades delivery), but a PASS that did not
+	// state it would be a PASS a reader cannot check.
+	return Finding{Verdict: certify.Pass, Observed: o.Params[oracleObservedParam] + deliveryClause(o)}
 }
 
 // critRefusedAxisNoSouthboundTrace is the refusal row's southbound criterion:
@@ -1438,6 +1774,7 @@ func refusalSetup(ctx context.Context, d *Driver, params map[string]string, b *r
 		params[curvePublishedParam] = b.Curve.describePublished()
 		recordCurveTarget(ctx, d, params, b.Curve)
 	}
+	recordCurveDeliveryBaseline(ctx, d, params, 0)
 	// ONE read of the DER answers both baseline questions, which is deliberate:
 	// they must describe the same instant, and the fingerprint and the
 	// contamination read must not be able to disagree about what the bank held.
