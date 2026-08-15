@@ -141,7 +141,8 @@ type Base struct {
 	LegacyRewriteBudget time.Duration
 
 	// legacyLockout records legacy curve models this device may no longer be
-	// written on, keyed by model ID with the reason.
+	// written on, keyed by model ID with the reason and the curve selection an
+	// operator has to restore by hand.
 	//
 	// It exists for exactly one situation: a ride-through write whose
 	// verification failed AND whose ActCrv restore also failed
@@ -149,7 +150,7 @@ type Base struct {
 	// is bounded and alarmed but must not be compounded by further attempts —
 	// so the model is refused until the device is re-admitted. It is a map so
 	// one bad model does not lock out the device's other axes.
-	legacyLockout map[uint16]string
+	legacyLockout map[uint16]legacyLock
 
 	// noGroupedM123 memoizes that this device refused a grouped (single FC16)
 	// M123 write, so later plans go straight to the element-by-element

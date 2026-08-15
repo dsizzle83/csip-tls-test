@@ -211,6 +211,20 @@ type LegacyCurveOutcome struct {
 	// so an evidence bundle can state it rather than assume it.
 	WRefW     float64
 	WRefPoint string
+	// Disabled is true when the failure arm SWITCHED THE FUNCTION OFF: the
+	// write failed after the new curve had already been selected, so the
+	// device was left with ModEna = 0 rather than running a curve the gateway
+	// cannot vouch for.
+	//
+	// It is a field rather than a detail inside the error because it is a fact
+	// about the DEVICE, not about the call: something that was providing grid
+	// support a moment ago is not providing it now, and a caller that only
+	// classifies the error would report "the control failed" while missing
+	// "and the previous one is gone too". A Case-B abort on 134 in particular
+	// leaves frequency-watt off until the next reconcile pass, which is a
+	// bounded but genuine loss of over-frequency curtailment and belongs on the
+	// retained report rather than inside a generic diverged.
+	Disabled bool
 	// Warnings are disclosures that did not stop the write.
 	Warnings []string
 }
@@ -293,21 +307,39 @@ func (b *Base) WriteLegacyCurve(p LegacyCurvePlan, tag string) (LegacyCurveOutco
 		return out, nil
 	}
 
+	var selected bool
 	if !st.caseB {
-		err = b.legacyCaseA(st, &out, tag)
+		selected, err = b.legacyCaseA(st, &out, tag)
 	} else {
 		out.CaseB = true
-		err = b.legacyCaseB(st, &out, tag)
+		selected, err = b.legacyCaseB(st, &out, tag)
 	}
-	if err != nil {
-		// §2.4.1 non-protective arm: an unverified curve is worse than no
-		// curve, because the gateway does not know what it installed.
-		if ferr := b.clearUnverifiedLegacyEnable(witness, tag); ferr != nil {
-			out.warn("fail-closed disable also failed: %v", ferr)
-		}
+	if err == nil {
+		return out, nil
+	}
+	// §2.4.1's non-protective arm, SCOPED. Fail-closed answers exactly one
+	// question — "the curve that is now selected may be one the gateway cannot
+	// vouch for" — and that question only exists once the selection has moved
+	// (Case A step 6) or the function has already been disabled to rewrite its
+	// only bank (Case B step 4).
+	//
+	// BEFORE the switch there is nothing to fail closed ABOUT. The bank being
+	// written is idle, the live bank is untouched, and the curve the device is
+	// running is the one it was running before the command. Disabling it there
+	// would switch off a working, verified, previously-commanded grid-support
+	// function because a DIFFERENT bank refused a register — punishing the
+	// device for a failure that never reached it. That is the same mistake
+	// §2.4.1 refuses to make on the protective models, one model family over.
+	if !selected {
 		return out, err
 	}
-	return out, nil
+	out.Disabled = true
+	out.warn("failed after the curve was selected: M%d was disabled (ModEna=0) rather than left "+
+		"running a curve that did not verify", st.plan.ModelID)
+	if ferr := b.clearUnverifiedLegacyEnable(witness, tag); ferr != nil {
+		out.warn("fail-closed disable also failed: %v", ferr)
+	}
+	return out, err
 }
 
 // WriteLegacyRideThrough installs a must-disconnect curve on model 129 (LVRT)
@@ -332,8 +364,9 @@ func (b *Base) WriteLegacyRideThrough(p LegacyCurvePlan, tag string) (LegacyCurv
 		return out, &UnsupportedControlError{Axis: out.Axis, Reason: fmt.Sprintf(
 			"model %d is not a legacy ride-through model", p.ModelID)}
 	}
-	if reason, locked := b.legacyLockoutReason(p.ModelID); locked {
-		return out, &LegacyTripRestoreError{Tag: tag, Model: p.ModelID, Detail: reason}
+	if lock, locked := b.legacyLockoutReason(p.ModelID); locked {
+		return out, &LegacyTripRestoreError{Tag: tag, Model: p.ModelID,
+			PriorActCrv: lock.priorActCrv, Detail: lock.reason}
 	}
 	st, err := b.legacyPreflight(p, tag, &out)
 	if err != nil {
@@ -376,26 +409,57 @@ func (b *Base) WriteLegacyRideThrough(p LegacyCurvePlan, tag string) (LegacyCurv
 // ActCrv is NEVER written, on any model. Zeroing it would additionally destroy
 // the device's own curve selection, which the gateway did not author and cannot
 // restore. The prior ActCrv is reported at engage time so an operator can.
-func (b *Base) ReleaseLegacyCurve(modelID uint16, tag string) error {
+func (b *Base) ReleaseLegacyCurve(modelID uint16, tag string) (LegacyReleaseOutcome, error) {
+	out := LegacyReleaseOutcome{Model: modelID, Axis: legacyDefaultAxis(modelID)}
 	switch modelID {
 	case sunspec.ModelVoltVarLegacy, sunspec.ModelWattPFLegacy, sunspec.ModelVoltWattLegacy:
 	case sunspec.ModelFreqWattLegacy:
-		return &UnsupportedControlError{Axis: legacyDefaultAxis(modelID), Reason: "legacy-freq-watt-release-is-no-opinion: " +
-			"releasing an opModFreqWatt control means the control no longer applies, not that frequency " +
-			"response is switched off; frequency response is a standing function this control did not author"}
+		out.NoOpinion = true
+		out.Reason = "legacy-freq-watt-release-is-no-opinion: releasing an opModFreqWatt control " +
+			"means the control no longer applies, not that frequency response is switched off; " +
+			"frequency response is a standing function this control did not author"
+		return out, nil
 	case sunspec.ModelLVRTLegacy, sunspec.ModelHVRTLegacy:
-		return &UnsupportedControlError{Axis: legacyDefaultAxis(modelID), Reason: "legacy-ride-through-release-is-no-opinion: " +
-			"ride-through is a protective trip boundary and is never stripped by a release"}
+		out.NoOpinion = true
+		out.Reason = "legacy-ride-through-release-is-no-opinion: ride-through is a protective trip " +
+			"boundary and is never stripped by a release"
+		return out, nil
 	default:
-		return &UnsupportedControlError{Axis: legacyDefaultAxis(modelID), Reason: fmt.Sprintf(
-			"model %d is not a releasable legacy curve model", modelID)}
+		return out, &UnsupportedControlError{Axis: out.Axis, Reason: fmt.Sprintf(
+			"model %d is not a legacy curve model", modelID)}
 	}
 	if !b.HasLegacyCurveModel(modelID) {
-		return &UnsupportedControlError{Axis: legacyDefaultAxis(modelID), Reason: fmt.Sprintf(
+		return out, &UnsupportedControlError{Axis: out.Axis, Reason: fmt.Sprintf(
 			"device has no M%d", modelID)}
 	}
 	hdr, _, _, _ := sunspec.LegacyCurveLayouts(modelID)
-	return b.setLegacyModEna(modelID, hdr, false, tag)
+	if err := b.setLegacyModEna(modelID, hdr, false, tag); err != nil {
+		return out, err
+	}
+	out.Released = true
+	return out, nil
+}
+
+// LegacyReleaseOutcome is what a commanded release DID.
+//
+// It is a struct with a nil error, rather than a typed refusal, because the
+// answer for 134/129/130 is not "this device cannot do that" — it is "there is
+// correctly nothing to do". Those two are different protocol answers: the first
+// is CannotComply, and the second is a control that succeeds having written
+// nothing. Returning ErrUnsupportedControl for the second would make a caller
+// that classifies errors honestly report a refusal the standard does not call
+// for, which is why the distinction lives in the RESULT rather than in the
+// error class. A caller that ignores the struct still reports success, which is
+// the right answer for a no-opinion axis; a caller that reads it can say WHY
+// nothing was written on the retained report.
+type LegacyReleaseOutcome struct {
+	Model uint16
+	Axis  string
+	// Released: ModEna's bit 0 was cleared and the clear was verified.
+	Released bool
+	// NoOpinion: nothing was written, deliberately, and Reason names the rule.
+	NoOpinion bool
+	Reason    string
 }
 
 // ── Preflight ────────────────────────────────────────────────────────────────
@@ -476,6 +540,43 @@ func (b *Base) legacyPreflight(p LegacyCurvePlan, tag string, out *LegacyCurveOu
 			"curve has %d points, device supports %d (NPt=%d)", n, max, g.NPt)}
 	}
 
+	// Model 134's percentages are % WRef, and an UNRESOLVABLE reference is a
+	// hold rather than a refusal — so it is answered here, before any bank is
+	// chosen and long before any register moves. Whether WRef must actually be
+	// WRITTEN is a per-bank question and is answered per bank below.
+	if p.ModelID == sunspec.ModelFreqWattLegacy {
+		if err := b.requireActivePowerReference(axis); err != nil {
+			return st, err
+		}
+		out.WRefW, out.WRefPoint = b.Wmax, b.WmaxPoint
+	}
+
+	// ── The live-bank no-op probe ────────────────────────────────────────────
+	//
+	// THIS RUNS BEFORE BANK SELECTION, and that ordering is the whole point.
+	// Selecting a spare bank first and asking "is this already what we want?"
+	// afterwards can never answer yes on Case A, because the spare bank is by
+	// construction not the live one — so an unchanged curve, re-commanded every
+	// reconcile pass, would ping-pong between banks forever: writing bank 2,
+	// then bank 1, then bank 2 again. Each of those passes overwrites the bank
+	// the DEVICE configured (voiding the operator-restore promise the recorded
+	// PriorActCrv makes) and churns ActCrv on a live function for no reason.
+	//
+	// So the question asked first is the only one that matters: does the curve
+	// the device is RUNNING already equal the one commanded?
+	if live := g.ActCrv; live >= 1 && live <= g.NCrv && p.RvrtTmsS == nil && p.RmpTmsS == nil {
+		liveBase, _ := g.BankOffset(live)
+		probe := append([]uint16(nil), regs...)
+		lw := b.wrefForBank(p, regs, hdr, bankL, liveBase)
+		if ls, le, perr := encodeLegacyBank(p, probe, live, lw); perr == nil &&
+			legacyRangeEqual(probe, regs, ls, le) && legacyModEnaSet(regs, hdr) {
+			st.bank, st.base, st.noOp = live, liveBase, true
+			st.start, st.end, st.want = ls, le, probe
+			out.Bank = live
+			return st, nil
+		}
+	}
+
 	bank, caseB, err := legacyChooseBank(g, bankL, regs, axis)
 	if err != nil {
 		return st, err
@@ -485,19 +586,7 @@ func (b *Base) legacyPreflight(p LegacyCurvePlan, tag string, out *LegacyCurveOu
 	st.base = base
 	out.Bank = bank
 
-	// Model 134's percentages are % WRef, so the reference must be resolved
-	// and, if necessary, written — BEFORE anything else, because an unresolved
-	// reference is a hold, not a refusal, and must not be discovered half way
-	// through a rewrite.
-	wref := math.NaN()
-	if p.ModelID == sunspec.ModelFreqWattLegacy {
-		w, point, err := b.resolveLegacyWRef(regs, hdr, bankL, base, axis)
-		if err != nil {
-			return st, err
-		}
-		wref = w
-		out.WRefW, out.WRefPoint = b.Wmax, point
-	}
+	wref := b.wrefForBank(p, regs, hdr, bankL, base)
 
 	// Encode into a PRIVATE copy: a representability refusal must leave the
 	// device untouched, and the encoders are atomic on the buffer they are
@@ -509,9 +598,10 @@ func (b *Base) legacyPreflight(p LegacyCurvePlan, tag string, out *LegacyCurveOu
 	}
 	st.start, st.end = start, end
 
-	// The no-op guard. On 7xx this is an optimisation; on legacy it is a
-	// SAFETY requirement, because the alternative — entering a Case-B rewrite
-	// that disables a live function — is strictly worse than doing nothing.
+	// The Case-B no-op: the target bank IS the live bank and already holds this
+	// curve. On 7xx this is an optimisation; here it is a SAFETY requirement,
+	// because the alternative is disabling a live function to rewrite it with
+	// content it already has.
 	if legacyRangeEqual(st.want, regs, start, end) &&
 		g.ActCrv == bank && legacyModEnaSet(regs, hdr) &&
 		p.RvrtTmsS == nil && p.RmpTmsS == nil {
@@ -528,12 +618,19 @@ func (b *Base) legacyPreflight(p LegacyCurvePlan, tag string, out *LegacyCurveOu
 // nothing is live and nothing can be disturbed.
 func legacyChooseBank(g sunspec.LegacyCurveGeometry, bankL *sunspec.Layout, regs []uint16, axis string) (bank int, caseB bool, err error) {
 	roOff := bankL.Offset("ReadOnly")
+	// WRITABLE MEANS THE DEVICE SAID READWRITE, not merely that it did not say
+	// READONLY. The spec enum is {0 READWRITE, 1 READONLY} and the point is
+	// MANDATORY on all six models, so anything else — the 0xFFFF
+	// not-implemented sentinel, a vendor's third value, a truncated read — is a
+	// device that has not granted permission to overwrite this bank. Reading
+	// "not exactly 1" as permission is the same laundering the capability gate
+	// refuses one layer up: garbage is never permission.
 	readOnly := func(i int) bool {
 		base, ok := g.BankOffset(i)
 		if !ok || base+roOff >= len(regs) {
 			return true // unreadable is not writable
 		}
-		return regs[base+roOff] == 1
+		return regs[base+roOff] != 0
 	}
 	for i := 1; i <= g.NCrv; i++ {
 		if i != g.ActCrv && !readOnly(i) {
@@ -554,28 +651,37 @@ func legacyChooseBank(g sunspec.LegacyCurveGeometry, bankL *sunspec.Layout, regs
 //
 // Returns the value to WRITE into WRef (NaN when the device already carries an
 // equal one, so the register is left alone).
-func (b *Base) resolveLegacyWRef(regs []uint16, hdr, bankL *sunspec.Layout, base int, axis string) (float64, string, error) {
+func (b *Base) requireActivePowerReference(axis string) error {
 	// Resolve through the SAME settings-first path the ceiling uses: the
 	// setting (M121 WMax / 702 WMax) before the rating. A device an installer
 	// derated answers percentages against its configuration, not its nameplate.
 	if b.WmaxPoint == "" || math.IsNaN(b.Wmax) || b.Wmax <= 0 {
-		return 0, "", &UnresolvedReferenceError{Axis: axis, Ref: "setMaxW", Reason: "the device " +
+		return &UnresolvedReferenceError{Axis: axis, Ref: "setMaxW", Reason: "the device " +
 			"publishes no usable active-power setting or rating, so the percentage the curve is " +
 			"expressed in has no denominator"}
+	}
+	return nil
+}
+
+// wrefForBank answers the per-bank half of §2.6: what, if anything, must be
+// written into THIS bank's WRef. NaN means "the device already carries an equal
+// reference, leave the register alone" — rewriting a register to the value it
+// already holds is a write that can fail for no benefit. Non-134 models have no
+// WRef at all and always answer NaN.
+func (b *Base) wrefForBank(p LegacyCurvePlan, regs []uint16, hdr, bankL *sunspec.Layout, base int) float64 {
+	if p.ModelID != sunspec.ModelFreqWattLegacy {
+		return math.NaN()
 	}
 	// The scale factor W<n>/WRef are bound to lives in the HEADER, so the view
 	// must be the header's: a bank-bound view cannot see it.
 	hdrView := hdr.View(regs)
 	cur := hdrView.ScaleUintAt(base+bankL.Offset("WRef"), legacySF(bankL, "WRef"))
 	if !math.IsNaN(cur) {
-		// Equal within one scale-factor quantum ⇒ leave it alone. Rewriting a
-		// register to the value it already holds is a write that can fail for
-		// no benefit.
 		if q := legacyQuantum(hdrView, bankL, "WRef"); math.Abs(cur-b.Wmax) <= q {
-			return math.NaN(), b.WmaxPoint, nil
+			return math.NaN()
 		}
 	}
-	return b.Wmax, b.WmaxPoint, nil
+	return b.Wmax
 }
 
 // ── Case A ───────────────────────────────────────────────────────────────────
@@ -583,20 +689,29 @@ func (b *Base) resolveLegacyWRef(regs []uint16, hdr, bankL *sunspec.Layout, base
 // legacyCaseA writes an IDLE bank, verifies it, and only then switches ActCrv
 // to it. There is no instant at which a partially-written curve is the active
 // curve, which is the entire reason Case A is preferred.
-func (b *Base) legacyCaseA(st legacyWriteState, out *LegacyCurveOutcome, tag string) error {
-	if err := b.writeAndVerifyBank(st, tag); err != nil {
-		return err
+// The bool reports whether the ActCrv SWITCH HAS HAPPENED — i.e. whether the
+// newly-written bank may now be the live one. Only after that is the
+// fail-closed disable the right answer to a failure; before it, the device is
+// still running the curve it was running before the command and there is
+// nothing to fail closed about.
+func (b *Base) legacyCaseA(st legacyWriteState, out *LegacyCurveOutcome, tag string) (selected bool, err error) {
+	if err := b.writeAndVerifyBank(st, out, tag); err != nil {
+		// The idle bank did not take the curve. The live bank is untouched and
+		// still selected: full pre-command behaviour, nothing to undo.
+		return false, err
 	}
 	// Timers are armed BEFORE the switch so the timeout is already loaded when
 	// the curve goes live.
 	b.armLegacyTimers(st, out, tag)
 	if err := b.setLegacyActCrv(st.plan.ModelID, st.hdr, st.bank, tag); err != nil {
-		return err
+		// The switch was refused and read back as the OLD selection, so the
+		// old curve is still the live one. Nothing was taken away.
+		return false, err
 	}
 	if err := b.setLegacyModEna(st.plan.ModelID, st.hdr, true, tag); err != nil {
-		return err
+		return true, err
 	}
-	return b.verifyLegacyLive(st, tag)
+	return true, b.verifyLegacyLive(st, tag)
 }
 
 // legacyRideThroughCaseA is Case A with §2.4.1's PROTECTIVE failure arm. It is
@@ -609,7 +724,7 @@ func (b *Base) legacyRideThroughCaseA(st legacyWriteState, out *LegacyCurveOutco
 	// Step 2 failure: the bank being written is IDLE, so the previously-live
 	// bank is untouched and still selected. Full pre-command protection; write
 	// nothing further.
-	if err := b.writeAndVerifyBank(st, tag); err != nil {
+	if err := b.writeAndVerifyBank(st, out, tag); err != nil {
 		return err
 	}
 	b.armLegacyTimers(st, out, tag)
@@ -633,12 +748,27 @@ func (b *Base) legacyRideThroughCaseA(st legacyWriteState, out *LegacyCurveOutco
 // permanently and the error says so — but protection is still not disabled,
 // because a known-wrong trip boundary is better than an unknown one.
 func (b *Base) legacyRideThroughFailureArm(st legacyWriteState, prior int, cause error, tag string) error {
-	if prior == st.geom.ActCrv && prior == st.bank {
-		return cause // nothing to restore: the selection never moved
+	model := st.plan.ModelID
+	// ASK THE DEVICE WHERE ITS SELECTION IS before writing anything.
+	//
+	// The restore exists for one situation: the switch landed and the curve
+	// that is now live is one this write could not verify. If the selection
+	// never moved — a transport NAK on the switch, a refused write, a device
+	// that rejected the new bank — then the previously-live curve is still
+	// selected and still running, there is nothing to restore, and a restore
+	// WRITE can only introduce a new failure. Attempting it anyway is how a NAK
+	// on a write that was never needed becomes a permanent lockout and an
+	// operator alarm over a state that does not exist.
+	if regs, err := b.Reader.ReadModel(model); err == nil {
+		if off := st.hdr.Offset("ActCrv"); off >= 0 && off < len(regs) && int(regs[off]) == prior {
+			return cause
+		}
 	}
-	if err := b.setLegacyActCrv(st.plan.ModelID, st.hdr, prior, tag); err != nil {
-		b.lockLegacyModel(st.plan.ModelID, fmt.Sprintf("ActCrv restore to %d failed: %v", prior, err))
-		return &LegacyTripRestoreError{Tag: tag, Model: st.plan.ModelID, PriorActCrv: prior,
+	// Either the selection moved, or we cannot prove it did not — and an
+	// unproven selection is one to put back.
+	if err := b.setLegacyActCrv(model, st.hdr, prior, tag); err != nil {
+		b.lockLegacyModel(model, prior, fmt.Sprintf("ActCrv restore to %d failed: %v", prior, err))
+		return &LegacyTripRestoreError{Tag: tag, Model: model, PriorActCrv: prior,
 			Detail: err.Error()}
 	}
 	return cause
@@ -649,39 +779,45 @@ func (b *Base) legacyRideThroughFailureArm(st legacyWriteState, prior int, cause
 // legacyCaseB rewrites the LIVE bank, which requires disabling the function for
 // the width of the transaction. Only the four non-protective models ever reach
 // it; ride-through refuses it outright.
-func (b *Base) legacyCaseB(st legacyWriteState, out *LegacyCurveOutcome, tag string) error {
+// The bool reports whether the function has been DISABLED to make room for the
+// rewrite. From that moment on every failure ends fail-closed, because the
+// device is already not providing the function and re-enabling a bank whose
+// content did not verify would be worse than leaving it off.
+func (b *Base) legacyCaseB(st legacyWriteState, out *LegacyCurveOutcome, tag string) (selected bool, err error) {
 	model := st.plan.ModelID
 	if err := st.deadline.check(tag, model, "disable"); err != nil {
-		return err
+		return false, err
 	}
 	// Disable FIRST, and verify the disable. If the bit will not clear, the
 	// device is still running its old curve and nothing else has been written:
 	// abort with the device exactly where it was.
 	if err := b.setLegacyModEna(model, st.hdr, false, tag); err != nil {
-		return err
+		// The bit would not clear: the device is still running its old curve
+		// and nothing else has been written. Abort exactly where we started.
+		return false, err
 	}
 	out.warn("case-B rewrite: M%d was disabled for the width of the transaction", model)
 
 	if err := st.deadline.check(tag, model, "body"); err != nil {
-		return err
+		return true, err
 	}
-	if err := b.writeAndVerifyBank(st, tag); err != nil {
-		return err
+	if err := b.writeAndVerifyBank(st, out, tag); err != nil {
+		return true, err
 	}
 	b.armLegacyTimers(st, out, tag)
 	if err := st.deadline.check(tag, model, "select"); err != nil {
-		return err
+		return true, err
 	}
 	if err := b.setLegacyActCrv(model, st.hdr, st.bank, tag); err != nil {
-		return err
+		return true, err
 	}
 	if err := b.setLegacyModEna(model, st.hdr, true, tag); err != nil {
-		return err
+		return true, err
 	}
 	if err := st.deadline.check(tag, model, "verify"); err != nil {
-		return err
+		return true, err
 	}
-	return b.verifyLegacyLive(st, tag)
+	return true, b.verifyLegacyLive(st, tag)
 }
 
 // legacyDeadline bounds the Case-B window.
@@ -718,10 +854,30 @@ func (b *Base) legacyBudget() time.Duration {
 // registers differ (two raw words can round to the same engineering value), and
 // the zero-filled unused slots have no decoded representation at all. What was
 // commanded is a specific set of words; what must be verified is those words.
-func (b *Base) writeAndVerifyBank(st legacyWriteState, tag string) error {
+func (b *Base) writeAndVerifyBank(st legacyWriteState, out *LegacyCurveOutcome, tag string) error {
 	model := st.plan.ModelID
 	if err := b.Reader.WriteModel(model, uint16(st.start), st.want[st.start:st.end]); err != nil {
-		return fmt.Errorf("%s: write M%d bank %d: %w", tag, model, st.bank, err)
+		// A whole-block write covers every register in the bank, including
+		// optional points the command never named — CrvNam, the ramp rates.
+		// A vendor that implements one of those as read-only refuses the WHOLE
+		// transaction, and the axis fails entirely over a register nobody asked
+		// to change. So a refusal is not final until the narrow write has been
+		// tried: retry with only the registers whose values actually differ,
+		// which is a subset of what the plan named and excludes every register
+		// the command leaves alone.
+		runs := legacyChangedRuns(st.want, st.regs, st.start, st.end)
+		if len(runs) == 0 {
+			return fmt.Errorf("%s: write M%d bank %d: %w", tag, model, st.bank, err)
+		}
+		for _, r := range runs {
+			if rerr := b.Reader.WriteModel(model, uint16(r[0]), st.want[r[0]:r[1]]); rerr != nil {
+				return fmt.Errorf("%s: write M%d bank %d: whole-block write refused (%v) and the "+
+					"narrowed retry was refused too at bank offset +%d: %w",
+					tag, model, st.bank, err, r[0]-st.base, rerr)
+			}
+		}
+		out.warn("whole-block write refused (%v); wrote %d changed register run(s) instead — the "+
+			"device implements some optional bank point as read-only", err, len(runs))
 	}
 	back, err := b.Reader.ReadModel(model)
 	if err != nil {
@@ -730,6 +886,25 @@ func (b *Base) writeAndVerifyBank(st legacyWriteState, tag string) error {
 	if len(back) < st.end {
 		return &VerifyError{Tag: tag, Model: model, Point: "curve",
 			Detail: fmt.Sprintf("device now declares %d registers, short of the bank's %d", len(back), st.end)}
+	}
+	// THE LIVE BANK IS RE-CHECKED HERE, not trusted from preflight.
+	//
+	// Which bank is live was decided from one read, and the device can move
+	// ActCrv on its own between that read and this one — most obviously when an
+	// armed RvrtTms expires, which is a timer THIS PACKAGE ARMS. If that
+	// happened, the bank just written is no longer idle: on a ride-through
+	// model the write landed on what had become the live trip boundary. The
+	// read-back that verifies the bank is already in hand, so checking ActCrv
+	// in the same buffer costs nothing and is the only place the race is
+	// visible.
+	if actOff := st.hdr.Offset("ActCrv"); actOff >= 0 && actOff < len(back) {
+		cur := int(back[actOff])
+		if cur != st.geom.ActCrv || (!st.caseB && cur == st.bank) {
+			return &VerifyError{Tag: tag, Model: model, Point: "ActCrv", Detail: fmt.Sprintf(
+				"the device moved its curve selection from %d to %d while bank %d was being written "+
+					"(an armed reversion timer does exactly this), so the write may have landed on "+
+					"the live curve", st.geom.ActCrv, cur, st.bank)}
+		}
 	}
 	for i := st.start; i < st.end; i++ {
 		if back[i] == st.want[i] {
@@ -933,20 +1108,28 @@ func encodeLegacyBank(p LegacyCurvePlan, regs []uint16, bank int, wref float64) 
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 
-// legacyLockout records models locked by a failed ride-through restore.
-func (b *Base) legacyLockoutReason(model uint16) (string, bool) {
-	if b.legacyLockout == nil {
-		return "", false
-	}
-	r, ok := b.legacyLockout[model]
-	return r, ok
+// legacyLock is why a model is locked, and which selection the operator has to
+// put back by hand. The prior selection travels WITH the lock: every report of
+// the lockout names the same bank the original escalation did, instead of the
+// zero value a re-raised error would otherwise carry.
+type legacyLock struct {
+	reason      string
+	priorActCrv int
 }
 
-func (b *Base) lockLegacyModel(model uint16, reason string) {
+func (b *Base) legacyLockoutReason(model uint16) (legacyLock, bool) {
 	if b.legacyLockout == nil {
-		b.legacyLockout = map[uint16]string{}
+		return legacyLock{}, false
 	}
-	b.legacyLockout[model] = reason
+	l, ok := b.legacyLockout[model]
+	return l, ok
+}
+
+func (b *Base) lockLegacyModel(model uint16, prior int, reason string) {
+	if b.legacyLockout == nil {
+		b.legacyLockout = map[uint16]legacyLock{}
+	}
+	b.legacyLockout[model] = legacyLock{reason: reason, priorActCrv: prior}
 }
 
 func legacyModEnaSet(regs []uint16, hdr *sunspec.Layout) bool {
@@ -959,6 +1142,27 @@ func legacyRegAt(regs []uint16, off int) uint16 {
 		return 0
 	}
 	return regs[off]
+}
+
+// legacyChangedRuns returns the contiguous [lo,hi) runs inside [start,end)
+// whose values actually differ from what the device already holds. Registers
+// the command leaves alone are excluded by construction, which is what makes
+// the narrowed retry narrower than the plan itself.
+func legacyChangedRuns(want, have []uint16, start, end int) [][2]int {
+	var runs [][2]int
+	i := start
+	for i < end {
+		if i >= len(want) || i >= len(have) || want[i] == have[i] {
+			i++
+			continue
+		}
+		lo := i
+		for i < end && i < len(want) && i < len(have) && want[i] != have[i] {
+			i++
+		}
+		runs = append(runs, [2]int{lo, i})
+	}
+	return runs
 }
 
 func legacyRangeEqual(a, b []uint16, start, end int) bool {
