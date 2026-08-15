@@ -281,6 +281,28 @@ type CurveView struct {
 	// opModFreqDroop's own openLoopTms rather than a curve's.
 	RspTmsS *float64
 
+	// VRefAutoEna / VRefAutoTmsS are model 705's OWN autonomous volt-reference
+	// automation: Crv.VRefAutoEna (enum16) and Crv.VRefAutoTms. nil on every
+	// model that declares neither (everything but 705).
+	//
+	// They are decoded because IEEE Std 2030.5-2018 p.252's autonomousVRefEnable
+	// clause turns on what a DER DOES, and until this wave nothing here could
+	// see it. The clause says a DER able to support Volt-Var but unable to
+	// support autonomous vRef adjustment "SHALL execute the curve without
+	// autonomous vRef adjustment" — so a gateway that accepts such a control has
+	// two obligations, and only one of them is about the breakpoints: it must
+	// execute the curve, AND it must not arm an adjustment it cannot manage.
+	//
+	// A referee reading only the point table can see the first and is blind to
+	// the second. That blindness has a specific bad outcome: a gateway that
+	// wrote VRefAutoEna=1 to "honour" the request would leave the DER tracking a
+	// reference the gateway never updates, which drifts the whole curve over
+	// time and looks, in the point table, exactly like a correct execution.
+	// These fields are what make "executed WITHOUT the adjustment" a measured
+	// claim instead of an assumed one.
+	VRefAutoEna  *bool
+	VRefAutoTmsS *float64
+
 	// Params carries a Pointless model's parameters (711's deadbands, gains and
 	// response time), rendered, since there is no point table to carry them.
 	Params string
@@ -396,6 +418,20 @@ func (c CurveView) Describe() string {
 		// model that has the register — a finding about a curve's TIMING has to
 		// show the register it read, exactly as one about its y reference does.
 		parts = append(parts, fmt.Sprintf("RspTms=%s s (open-loop response)", trimFloat(*c.RspTmsS)))
+	}
+	if c.VRefAutoEna != nil {
+		// Quoted on EVERY 705 reading, armed or not, for the reason DeptRef is:
+		// a finding that showed this register only when it was set would leave a
+		// reader unable to tell "not armed" from "not read", and the whole point
+		// of IEEE 2030.5-2018 p.252's execute-without clause is that NOT arming
+		// it is the conformant outcome — an absence that has to be visible to
+		// count as evidence.
+		state := "not armed"
+		if *c.VRefAutoEna {
+			state = "ARMED"
+		}
+		parts = append(parts, fmt.Sprintf("VRefAutoEna=%t (%s, the device's own autonomous volt-reference "+
+			"automation)", *c.VRefAutoEna, state))
 	}
 	which := "live curve"
 	switch {
@@ -588,6 +624,10 @@ func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveVie
 		// 705 declares Crv.RspTms ("Open Loop Response Time", uint32 Secs,
 		// scaled by RspTms_SF). It is where IEEE 2030.5's openLoopTms lands.
 		v.RspTmsS = &c.RspTms
+		// The autonomous-vRef arming state, for the 2018 p.252 clause. Copied
+		// into locals first: &c.Field would alias the loop-scoped parse result.
+		autoEna, autoTms := c.VRefAutoEna, c.VRefAutoTms
+		v.VRefAutoEna, v.VRefAutoTmsS = &autoEna, &autoTms
 		for _, p := range c.Points {
 			v.Points = append(v.Points, CurvePoint{X: p.V, Y: p.Var})
 		}

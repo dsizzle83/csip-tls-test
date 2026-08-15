@@ -195,6 +195,15 @@ type curveBinding struct {
 	// held would pass a device that ignored the element entirely. Both are the
 	// same defect from opposite sides, and both are what this field exists to
 	// make impossible.
+	//
+	// IT CAN ONLY SHRINK THE X AXIS, OR LEAVE IT ALONE. vRef is a PerCent, and
+	// 2018 p.167 states that type's domain as "0 to 10 000. (10 000 = 100%)" —
+	// so vRef/10 000 is at most 1 for every value the element admits, and the
+	// ceiling means "no adjustment" rather than being an exclusive bound. A
+	// fixture expecting a vRef to push breakpoints UP is expecting a document
+	// the standard does not admit; the review that opened this work made exactly
+	// that error with a 10500 example, and the bench's own domain check caught
+	// it. See TestVRef_TheDomainCeilingIsInclusiveAndAppliedExactly.
 	VRef *uint16
 
 	// Droop, when set, is an INLINE opModFreqDroop element this row authors on
@@ -1554,9 +1563,62 @@ func curveContentOutcome(b *curveBinding, uv invariant.UnitView, target curveTar
 		held += fmt.Sprintf(", at the open-loop response time it published (openLoopTms=%d hundredths of "+
 			"a second = %s s, against the device's Crv.RspTms)", *b.OpenLoopTms, trimNum(want))
 	}
+	// THE EXECUTE-WITHOUT CLAUSE, MEASURED (IEEE Std 2030.5-2018 p.252).
+	//
+	// A row that authored autonomousVRefEnable=true commanded something this
+	// gateway cannot do, and the standard says what conformance looks like then:
+	// "If a DER is able to support Volt-Var mode but is unable to support
+	// autonomous vRef adjustment, then the DER SHALL execute the curve without
+	// autonomous vRef adjustment." That is TWO obligations, and the point table
+	// only shows one of them. The other is that nothing armed an adjustment
+	// nobody can manage — a gateway that wrote VRefAutoEna=1 to look obliging
+	// would leave the DER tracking a reference the gateway never updates, which
+	// drifts the whole curve and reads, in the points, exactly like a correct
+	// execution.
+	//
+	// So a PASS is withheld when the device came back ARMED, and the failure
+	// says which half of the clause was broken.
+	if f, bad := b.autonomousArmingFinding(cv); bad {
+		return f
+	}
 	return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
 		"the DER's own %s live curve %s, %s: %s. %s",
 		cv.Axis.Name, held, became, match.Reason, cv.Describe())}
+}
+
+// autonomousArmingFinding grades the second half of IEEE Std 2030.5-2018
+// p.252's execute-without clause: the device must NOT have armed an autonomous
+// vRef adjustment this gateway has no writer for.
+//
+// It returns bad=false — no opinion — in the two cases where there is genuinely
+// nothing to say: a row that did not ask for the adjustment (an unrequested
+// register this referee has no expectation about), and a device whose model
+// carries no such register at all (everything but 705).
+//
+// THE ASYMMETRY IS DELIBERATE. enable=true and the device NOT armed is the
+// conformant outcome and needs no separate credit beyond appearing in the
+// verdict's register dump; enable=true and the device ARMED is a finding. A
+// referee that also failed an armed device on a row which never requested it
+// would be grading the DER's own configuration, which is not this row's
+// business.
+func (b *curveBinding) autonomousArmingFinding(cv invariant.CurveView) (Finding, bool) {
+	if b.AutonomousVRefEnable == nil || !*b.AutonomousVRefEnable {
+		return Finding{}, false
+	}
+	if cv.VRefAutoEna == nil || !*cv.VRefAutoEna {
+		return Finding{}, false
+	}
+	return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+		"the DER's %s holds this row's curve, but its autonomous volt-reference automation is ARMED "+
+			"(Crv.VRefAutoEna=1). This row published autonomousVRefEnable=true, and IEEE Std "+
+			"2030.5-2018 p.252 says what a DER that cannot support the adjustment must do about it: "+
+			"\"If a DER is able to support Volt-Var mode but is unable to support autonomous vRef "+
+			"adjustment, then the DER SHALL execute the curve without autonomous vRef adjustment.\" "+
+			"Executing the curve is half of that; not arming an adjustment nothing maintains is the "+
+			"other half. A gateway with no writer for VRefAutoTms that sets VRefAutoEna anyway leaves "+
+			"the DER tracking a reference nobody updates — the curve drifts, and the point table looks "+
+			"exactly like a correct execution while it does. Full register state: %s",
+		cv.Axis.Name, cv.Describe())}, true
 }
 
 // modelList renders the SunSpec models the DER actually served, so a FAIL about

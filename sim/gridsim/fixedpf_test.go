@@ -243,3 +243,107 @@ func TestFixedPF_DefaultDERControlCarriesItToo(t *testing.T) {
 		t.Errorf("a partial element on /admin/default = %d, want 400: %s", rec.Code, rec.Body)
 	}
 }
+
+// ── The deliberate-violation lever (IEEE 2030.5-2018 p.252-253) ─────────────
+
+// TestNonconformantCurve_ServesTheShapesAConformantLeverRefuses is the opt-in's
+// primary claim: a NEGATIVE row can put a malformed document on the wire, and
+// only by asking for it by name.
+//
+// This lever exists because two of this wave's rulings turn on what a DUT does
+// with a document the standard forbids, and the ordinary levers correctly refuse
+// to build one — vrefFamily enforces both SHALLs. A bench with no way to violate
+// them could not grade a refusal at all; a bench that violated them silently
+// would put non-conformant documents into ordinary evidence. Opt-in, per
+// request, named by clause.
+func TestNonconformantCurve_ServesTheShapesAConformantLeverRefuses(t *testing.T) {
+	t.Run("autonomousVRefEnable=true with NO time constant", func(t *testing.T) {
+		s := NewServer("")
+		// The conformant lever refuses this outright — that is the control.
+		if rec := postAdmin(t, s, "/admin/curve", `{
+			"program": 0, "mode": "volt_var", "points": [{"x":9100,"y":4000}],
+			"autonomous_vref_enable": true, "activate": true
+		}`); rec.Code != http.StatusBadRequest {
+			t.Fatalf("the conformant lever accepted enable=true with no time constant (%d): %s",
+				rec.Code, rec.Body)
+		}
+		// Asked for by name, it is served.
+		if rec := postAdmin(t, s, "/admin/curve", `{
+			"program": 0, "mode": "volt_var", "points": [{"x":9100,"y":4000}],
+			"nonconformant": {"autonomous_vref_without_time_constant": true}, "activate": true
+		}`); rec.Code != http.StatusCreated {
+			t.Fatalf("the opt-in did not serve the malformed shape (%d): %s", rec.Code, rec.Body)
+		}
+		raw := serveRaw(t, s, "/derp/0/dc/0")
+		if !strings.Contains(raw, "<autonomousVRefEnable>true</autonomousVRefEnable>") {
+			t.Errorf("the served curve does not carry autonomousVRefEnable=true:\n%s", raw)
+		}
+		// The violation IS the absence: 2018 p.252 makes the time constant
+		// mandatory when enabled, so a document carrying one would be
+		// conformant and would test nothing.
+		if strings.Contains(raw, "autonomousVRefTimeConstant") {
+			t.Errorf("the malformed shape carries a time constant, which makes it CONFORMANT and tests "+
+				"the opposite of what it exists for:\n%s", raw)
+		}
+	})
+
+	t.Run("vRef outside PerCent's domain", func(t *testing.T) {
+		s := NewServer("")
+		if rec := postAdmin(t, s, "/admin/curve", `{
+			"program": 0, "mode": "volt_var", "points": [{"x":9100,"y":4000}],
+			"nonconformant": {"vref": 65535}, "activate": true
+		}`); rec.Code != http.StatusCreated {
+			t.Fatalf("the opt-in did not serve the out-of-domain vRef (%d): %s", rec.Code, rec.Body)
+		}
+		if raw := serveRaw(t, s, "/derp/0/dc/0"); !strings.Contains(raw, "<vRef>65535</vRef>") {
+			t.Errorf("the served curve does not carry the out-of-domain vRef:\n%s", raw)
+		}
+	})
+
+	t.Run("the wire type is still a bound", func(t *testing.T) {
+		// The lever serves a value PerCent does not ADMIT; it cannot serve one
+		// UInt16 cannot CARRY. Those are different defects and only one of them
+		// is expressible as a document.
+		s := NewServer("")
+		rec := postAdmin(t, s, "/admin/curve", `{
+			"program": 0, "mode": "volt_var", "points": [{"x":9100,"y":4000}],
+			"nonconformant": {"vref": 70000}, "activate": true
+		}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("POST = %d, want 400: %s", rec.Code, rec.Body)
+		}
+		if !strings.Contains(rec.Body.String(), "UInt16's WIRE domain") {
+			t.Errorf("the refusal does not distinguish the wire type from the value domain: %s", rec.Body)
+		}
+	})
+
+	t.Run("only on a volt-var curve", func(t *testing.T) {
+		// On any other mode the elements are refused by the SHALL NOT, which is
+		// a different test — and letting the opt-in bypass THAT would silently
+		// widen what "nonconformant" means.
+		s := NewServer("")
+		rec := postAdmin(t, s, "/admin/curve", `{
+			"program": 0, "mode": "freq_watt", "points": [{"x":5900,"y":100}],
+			"nonconformant": {"autonomous_vref_without_time_constant": true}, "activate": true
+		}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("POST = %d, want 400: %s", rec.Code, rec.Body)
+		}
+	})
+
+	t.Run("an unarmed request is untouched", func(t *testing.T) {
+		// The opt-in must not change the ordinary path. A request with a
+		// `nonconformant` object that asks for nothing is an ordinary request.
+		s := NewServer("")
+		if rec := postAdmin(t, s, "/admin/curve", `{
+			"program": 0, "mode": "volt_var", "points": [{"x":9100,"y":4000}],
+			"vref": 9500, "nonconformant": {}, "activate": true
+		}`); rec.Code != http.StatusCreated {
+			t.Fatalf("an unarmed nonconformant object changed the ordinary path (%d): %s",
+				rec.Code, rec.Body)
+		}
+		if raw := serveRaw(t, s, "/derp/0/dc/0"); !strings.Contains(raw, "<vRef>9500</vRef>") {
+			t.Errorf("the conformant vRef did not survive an unarmed opt-in:\n%s", raw)
+		}
+	})
+}

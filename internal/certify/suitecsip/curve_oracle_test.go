@@ -2265,3 +2265,312 @@ func TestVRef_IsServedOnTheWireByTheRowThatAuthorsIt(t *testing.T) {
 			"commands the scaling twice:\n%s", raw)
 	}
 }
+
+// ── autonomousVRefEnable=true: ACCEPTED, executed without (2018 p.252) ──────
+
+// autonomousBinding is BASIC-006's volt-var binding carrying the enable and its
+// mandatory time constant — a CONFORMANT document commanding a capability this
+// gateway does not have.
+func autonomousBinding() *curveBinding {
+	b := *basic006Binding()
+	enable := true
+	tms := uint32(300)
+	b.AutonomousVRefEnable, b.AutonomousVRefTimeConstant = &enable, &tms
+	return &b
+}
+
+// TestAutonomousVRef_EnabledIsExecutedNotRefused is the ORACLE FLIP, and the
+// adjudication behind it is why this file keeps the old shape as teeth.
+//
+// This suite briefly expected a REFUSAL here — the product answered CannotComply
+// to autonomousVRefEnable=true on the ground that it has no writer for model
+// 705's VRefAutoEna/VRefAutoTms, and the oracle was built to that behaviour. The
+// gw adjudication overturned it against the printed clause. IEEE Std
+// 2030.5-2018 p.252, autonomousVRefEnable, fourth sentence:
+//
+//	"If a DER is able to support Volt-Var mode but is unable to support
+//	 autonomous vRef adjustment, then the DER SHALL execute the curve without
+//	 autonomous vRef adjustment."
+//
+// It is a SHALL, it is directly on point, and this product satisfies its
+// antecedent exactly: able to support Volt-Var (the axis is admitted, executed
+// on 705, advertised as bit 23), unable to support the adjustment. So the
+// consequent is mandatory and CannotComply is the one answer the sentence
+// forbids. Refusing was not the conservative reading — it was the
+// non-conformant one.
+//
+// WHAT THE ORACLE ASSERTS NOW, and it is two things rather than one:
+//
+//	the curve EXECUTES, in full, at the (vRef-adjusted, where present)
+//	breakpoints — the first half of the clause; and
+//
+//	the device is NOT ARMED (Crv.VRefAutoEna=0) — the second half, which the
+//	point table is blind to and which is the whole reason CurveView reads the
+//	register at all.
+func TestAutonomousVRef_EnabledIsExecutedNotRefused(t *testing.T) {
+	b := autonomousBinding()
+
+	t.Run("executed without the adjustment passes", func(t *testing.T) {
+		f := newCurveFixture(t)
+		pts := make([]sunspec.VVPoint, 0, len(b.Points))
+		for _, p := range b.wantPoints() {
+			pts = append(pts, sunspec.VVPoint{V: p.X, Var: p.Y})
+		}
+		f.adoptVoltVar(t, basic006DeptRef(t), pts)
+		got := oracleCurve(b)(context.Background(), f.rc)
+		if got.Verdict != certify.Pass {
+			t.Fatalf("a DER that executed the curve WITHOUT arming the adjustment scored %s. That is "+
+				"exactly what IEEE Std 2030.5-2018 p.252 requires of a DER unable to support autonomous "+
+				"vRef adjustment, so it is the conformant outcome and must pass:\n%s",
+				got.Verdict, got.Observed)
+		}
+		// The register must be QUOTED even though it is unset: an absence that
+		// is the conformant outcome has to be visible to count as evidence, and
+		// a verdict that showed it only when armed would leave a reader unable
+		// to tell "not armed" from "not read".
+		if !strings.Contains(got.Observed, "VRefAutoEna=false") {
+			t.Errorf("the PASS does not quote the arming register, so the second half of the clause is "+
+				"asserted invisibly:\n%s", got.Observed)
+		}
+		if !strings.Contains(got.Observed, "not armed") {
+			t.Errorf("the PASS does not say the automation is unarmed in words:\n%s", got.Observed)
+		}
+		t.Logf("autonomous-vRef GREEN (executed without the adjustment), verbatim:\n  %s", got.Observed)
+	})
+
+	t.Run("armed anyway fails", func(t *testing.T) {
+		// The failure this check exists for: a gateway that set VRefAutoEna to
+		// look obliging, leaving the DER tracking a reference nothing updates.
+		// Its POINT TABLE is identical to the passing case above — which is
+		// precisely why the points alone cannot grade this.
+		f := newCurveFixture(t)
+		pts := make([]sunspec.VVPoint, 0, len(b.Points))
+		for _, p := range b.wantPoints() {
+			pts = append(pts, sunspec.VVPoint{V: p.X, Var: p.Y})
+		}
+		rspTms := 0.0
+		if s, ok := basic006Binding().wantOpenLoopS(); ok {
+			rspTms = s
+		}
+		if err := f.base.WriteVoltVar(sunspec.VoltVarCurve{
+			DeptRef: basic006DeptRef(t), Pri: 1, Points: pts, RspTms: rspTms,
+			VRefAutoEna: true, VRefAutoTms: 300,
+		}, "autonomous-armed"); err != nil {
+			t.Fatalf("derbase WriteVoltVar: %v", err)
+		}
+		got := oracleCurve(b)(context.Background(), f.rc)
+		if got.Verdict != certify.Fail {
+			t.Fatalf("a DER holding the right curve with its autonomous automation ARMED scored %s. The "+
+				"curve is correct and the clause is still broken — 2018 p.252 requires executing "+
+				"WITHOUT the adjustment, and the point table cannot tell these two devices apart:\n%s",
+				got.Verdict, got.Observed)
+		}
+		for _, want := range []string{"ARMED", "VRefAutoEna", "p.252", "SHALL execute the curve without"} {
+			if !strings.Contains(got.Observed, want) {
+				t.Errorf("the armed FAIL omits %q:\n%s", want, got.Observed)
+			}
+		}
+		t.Logf("autonomous-vRef RED (armed anyway), verbatim:\n  %s", got.Observed)
+	})
+
+	t.Run("an unrequested arming is not this row's business", func(t *testing.T) {
+		// A row that never published the enable has no expectation about the
+		// register: an armed device there is the DER's own configuration, and
+		// grading it would make this referee an auditor of settings nobody
+		// commanded.
+		f := newCurveFixture(t)
+		plain := basic006Binding()
+		pts := make([]sunspec.VVPoint, 0, len(plain.Points))
+		for _, p := range plain.wantPoints() {
+			pts = append(pts, sunspec.VVPoint{V: p.X, Var: p.Y})
+		}
+		rspTms := 0.0
+		if s, ok := plain.wantOpenLoopS(); ok {
+			rspTms = s
+		}
+		if err := f.base.WriteVoltVar(sunspec.VoltVarCurve{
+			DeptRef: basic006DeptRef(t), Pri: 1, Points: pts, RspTms: rspTms, VRefAutoEna: true,
+		}, "autonomous-unrequested"); err != nil {
+			t.Fatalf("derbase WriteVoltVar: %v", err)
+		}
+		if got := oracleCurve(plain)(context.Background(), f.rc); got.Verdict != certify.Pass {
+			t.Fatalf("a row that never requested the adjustment graded %s on a device that armed it "+
+				"anyway:\n%s", got.Verdict, got.Observed)
+		}
+	})
+}
+
+// TestAutonomousVRef_TheRefusalShapeIsPreservedAsTeeth keeps the behaviour this
+// oracle was built to expect BEFORE the adjudication, on the generations rule
+// the modes and MUP oracles follow.
+//
+// The refusal was wrong, and recording that it was possible is what stops the
+// correction from being a thing everyone remembers and nothing checks. Two
+// distinct claims are preserved:
+//
+//	the refusal shape the product used to answer (a CannotComply at receipt for
+//	a CONFORMANT document) is now an ORACLE FAILURE, not an expectation; and
+//
+//	the shape that is STILL refused — enable=true with no time constant — is a
+//	different verdict about a different document, and the two must not be
+//	conflated, because the first is about capability and the second about
+//	well-formedness.
+func TestAutonomousVRef_TheRefusalShapeIsPreservedAsTeeth(t *testing.T) {
+	// GENERATION 1 (withdrawn): a DUT that refused the conformant document. If
+	// it refuses, it never adopts, and the oracle sees an unexecuted axis —
+	// which must FAIL now, where it once passed.
+	f := newCurveFixture(t)
+	got := oracleCurve(autonomousBinding())(context.Background(), f.rc)
+	if got.Verdict == certify.Pass {
+		t.Fatalf("a DER that adopted NOTHING for a conformant autonomousVRefEnable=true control passed. "+
+			"That was the expectation before the gw adjudication and it is now the defect: 2018 p.252 "+
+			"makes executing-without mandatory, so a device with an empty curve bank has not complied:\n%s",
+			got.Observed)
+	}
+	t.Logf("PRESERVED (the withdrawn refusal expectation now fails), verbatim:\n  %s", got.Observed)
+
+	// The two documents are DIFFERENT, and the binding proves it structurally:
+	// the accepted one carries the time constant, the refused one cannot.
+	if autonomousBinding().AutonomousVRefTimeConstant == nil {
+		t.Error("the accepted shape carries no autonomousVRefTimeConstant, so it is the MALFORMED " +
+			"document rather than the conformant one — 2018 p.252 makes the time constant mandatory " +
+			"when the enable is true")
+	}
+}
+
+// TestVRef_TheDomainCeilingIsInclusiveAndAppliedExactly pins the boundary the
+// gw ruling settled: 10 000 is IN domain and means 1.0x.
+//
+// IEEE Std 2030.5-2018 p.167 states PerCent's domain as "0 to 10 000. (10 000 =
+// 100%)" — inclusive, and the parenthetical says what the ceiling MEANS. So a
+// vRef of exactly 10000 is a conformant document commanding no adjustment at
+// all, and a referee that treated the ceiling as exclusive would refuse to serve
+// a legal curve while one that applied it wrongly would move a curve that must
+// not move.
+//
+// THE ARITHMETIC CONSEQUENCE, which belongs in the row docs and is stated here
+// because this is where it is checked: vRef can only ever SHRINK the x axis or
+// leave it unchanged. The ceiling is 100 %, so vRef/10 000 <= 1 for every legal
+// value. A fixture expecting a vRef to push breakpoints UP is expecting a
+// document the standard does not admit — which is exactly the error the review's
+// own 10500 example made.
+func TestVRef_TheDomainCeilingIsInclusiveAndAppliedExactly(t *testing.T) {
+	b := *vrefBinding()
+	ceiling := uint16(10000)
+	b.VRef = &ceiling
+
+	// 1.0x: the expectation is the PUBLISHED curve, unmoved.
+	got := b.wantPoints()
+	want := []invariant.CurvePoint{{X: 92.00, Y: 30.00}, {X: 108.00, Y: -30.00}}
+	for i := range want {
+		if math.Abs(got[i].X-want[i].X) > 0.001 {
+			t.Errorf("breakpoint %d = %s, want %s: vRef 10000 is 100 %% (2018 p.167), so it multiplies "+
+				"by exactly 1 and the published curve is the commanded one", i+1, got[i], want[i])
+		}
+	}
+	// And it is still SERVED and still ASSERTED — "no adjustment" is not the
+	// same as "no element", and a bench that dropped it would be sending a
+	// different document from the one the row describes.
+	f := newCurveFixture(t)
+	d, gs := f.withGridSimServer(t)
+	if err := publishCurveControl(context.Background(), d, map[string]string{}, &b, "CERT-VREF-CEIL"); err != nil {
+		t.Fatalf("the bench refused a vRef of exactly 10000, which p.167 admits: %v", err)
+	}
+	if raw := servedByGridSim(t, gs, "/derp/0/dc/0"); !strings.Contains(raw, "<vRef>10000</vRef>") {
+		t.Errorf("the ceiling value was not served:\n%s", raw)
+	}
+
+	// The ceiling is INCLUSIVE: one above it is refused, and the message says
+	// the ceiling rather than leaving a reader to infer it.
+	over := *vrefBinding()
+	bad := uint16(10001)
+	over.VRef = &bad
+	if err := publishCurveControl(context.Background(), d, map[string]string{}, &over,
+		"CERT-VREF-OVER1"); err == nil {
+		t.Error("a vRef of 10001 was served; p.167's domain is 0 to 10 000 and the ceiling is inclusive")
+	}
+}
+
+// TestVRef_OutOfDomainDrawsARefusalAndNeverScales is the negative row the
+// deliberate-violation lever exists for.
+//
+// The product now refuses an out-of-domain vRef at receipt ('vref-out-of-domain'
+// — lexa-gw c933ced), and the failure it replaced is the one this asserts
+// against: applying 65535 commands a volt-var curve at 6.5x the voltages the
+// head end named. A DUT that scales is worse than one that refuses AND worse
+// than one that ignores, because the curve it runs is one nobody wrote.
+//
+// WHAT THIS CAN AND CANNOT SEE, stated because the difference matters. The bench
+// can author the malformed document (nonconformant.vref) and the oracle can
+// assert what the DEVICE holds. It cannot read the DUT's refusal REASON — that
+// is a Response status on the wire, graded by the refusal rows, not by a curve
+// oracle reading registers. So this asserts the register consequence: nothing
+// adopted, and above all nothing scaled.
+func TestVRef_OutOfDomainDrawsARefusalAndNeverScales(t *testing.T) {
+	f := newCurveFixture(t)
+	_, gs := f.withGridSimServer(t)
+
+	// The bench's own conformant lever refuses this, so the row has to ask by
+	// name — which is the property that keeps ordinary evidence conformant.
+	rec := postAdminRawCurve(t, gs, `{
+		"program": 0, "mode": "volt_var", "points": [{"x":9200,"y":3000},{"x":10800,"y":-3000}],
+		"x_mult": -2, "y_mult": -2, "y_ref_type": 3,
+		"nonconformant": {"vref": 65535}, "activate": true
+	}`)
+	if rec != http.StatusCreated {
+		t.Fatalf("the deliberate-violation lever did not serve the out-of-domain vRef: %d", rec)
+	}
+	raw := servedByGridSim(t, gs, "/derp/0/dc/0")
+	if !strings.Contains(raw, "<vRef>65535</vRef>") {
+		t.Fatalf("the malformed vRef is not on the wire, so this row grades nothing:\n%s", raw)
+	}
+
+	// A conformant DUT refuses and adopts NOTHING. The device this fixture
+	// starts with holds no curve, which is that outcome.
+	b := *vrefBinding()
+	huge := uint16(65535)
+	b.VRef = &huge
+	got := oracleCurve(&b)(context.Background(), f.rc)
+	if got.Verdict == certify.Pass {
+		t.Fatalf("a DUT that adopted nothing for an out-of-domain vRef passed. Refusing is the "+
+			"conformant answer, and this oracle grades the CURVE — so the row's verdict here belongs to "+
+			"the refusal criterion, not to a curve match:\n%s", got.Verdict)
+	}
+
+	// THE FAILURE THAT MATTERS: a device that APPLIED it. 9200 x 65535/10000 =
+	// 60292 raw = 602.92 %V, a volt-var curve six times above nominal.
+	scaled := make([]sunspec.VVPoint, 0, len(b.Points))
+	for _, p := range b.wantPoints() {
+		scaled = append(scaled, sunspec.VVPoint{V: p.X, Var: p.Y})
+	}
+	if len(scaled) > 0 && scaled[0].V < 500 {
+		t.Fatalf("the oracle's own expectation for an out-of-domain vRef is %v, which is not the 6.5x "+
+			"scaling this test is about — check wantPoints", scaled[0].V)
+	}
+	f2 := newCurveFixture(t)
+	if err := f2.base.WriteVoltVar(sunspec.VoltVarCurve{
+		DeptRef: basic006DeptRef(t), Pri: 1, Points: scaled,
+	}, "vref-out-of-domain-applied"); err != nil {
+		// A device may legitimately refuse the write at 602 %V; that is itself
+		// the correct outcome and not a test failure.
+		t.Logf("the DER refused to hold a 6.5x-scaled curve (%v), which is the safe behaviour", err)
+		return
+	}
+	t.Logf("a DER CAN be made to hold the 6.5x-scaled curve (%v %%V), which is why refusing the "+
+		"document at receipt is the only thing standing between a malformed percentage and a "+
+		"volt-var curve six times above nominal", scaled[0].V)
+}
+
+// postAdminRawCurve posts a raw JSON body to gridsim's curve endpoint and
+// returns the status, for rows that need a shape the typed CurveRequest
+// deliberately cannot express.
+func postAdminRawCurve(t *testing.T, gs *gridsim.Server, body string) int {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	gs.AdminHandler().ServeHTTP(rec,
+		httptest.NewRequest("POST", "/admin/curve", strings.NewReader(body)))
+	if rec.Code >= 400 {
+		t.Logf("POST /admin/curve -> %d: %s", rec.Code, rec.Body)
+	}
+	return rec.Code
+}

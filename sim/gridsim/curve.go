@@ -112,6 +112,19 @@ type adminCurveReq struct {
 	// Values 0 — the catalog spells it "autonomousVrefTimeContant").
 	AutonomousVRefTimeConstant *int64 `json:"autonomous_vref_time_constant,omitempty"`
 
+	// Nonconformant deliberately violates a stated SHALL, for the NEGATIVE rows
+	// that grade what a DUT does with a malformed document.
+	//
+	// IT IS OPT-IN, PER REQUEST, AND NAMES THE CLAUSE. A conformance bench must
+	// not serve a non-conformant document by accident — the evidence would be
+	// about a document no conformant server produces — so the ordinary levers
+	// above enforce every SHALL they can (vrefFamily), and a row that needs the
+	// violation has to ask for it by name. That is the same reasoning the
+	// malform channel (malform.go) rests on, at per-request granularity instead
+	// of a server-wide armed mode, because these are properties of ONE curve
+	// rather than of a resource type.
+	Nonconformant *nonconformantCurve `json:"nonconformant,omitempty"`
+
 	Description string `json:"description"`
 	DurationS   int    `json:"duration_s"`     // default 300
 	StartOffset int    `json:"start_offset_s"` // seconds from now
@@ -185,6 +198,39 @@ func curveTypeForMode(mode string) (uint16, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// nonconformantCurve is the deliberate-violation opt-in. Each field names the
+// SHALL it breaks, so a reader of a request — or of a bundle carrying it — can
+// see which sentence the row is testing the DUT against.
+type nonconformantCurve struct {
+	// AutonomousVRefWithoutTimeConstant serves autonomousVRefEnable=true with
+	// NO autonomousVRefTimeConstant, violating IEEE Std 2030.5-2018 p.252's
+	// second sentence: "When enabled, the Volt-Var curve characteristic SHALL be
+	// adjusted autonomously as vRef changes and autonomousVRefTimeConstant SHALL
+	// be present."
+	//
+	// A conformant DUT REFUSES this document. It is a well-formedness verdict
+	// rather than a capability one, so it stands whether or not the DUT could
+	// ever arm the adjustment — which is exactly what makes it a different test
+	// from the ACCEPTED enable=true-with-time-constant shape beside it.
+	AutonomousVRefWithoutTimeConstant bool `json:"autonomous_vref_without_time_constant,omitempty"`
+
+	// VRef serves a vRef the PerCent type does not admit, bypassing the domain
+	// check in vrefFamily. IEEE Std 2030.5-2018 p.167 gives PerCent the domain
+	// "0 to 10 000"; a UInt16 carries six times that ceiling, so this is the
+	// lever for grading what a DUT does with, say, 65535 — apply it and command
+	// the curve at 6.5x the voltages the head end named, or refuse it.
+	//
+	// A pointer: 0 is IN domain and would be an ordinary request, so a
+	// value-typed field could not tell "no violation asked for" from "serve a
+	// zero".
+	VRef *int64 `json:"vref,omitempty"`
+}
+
+// armed reports whether any deliberate violation was requested.
+func (n *nonconformantCurve) armed() bool {
+	return n != nil && (n.AutonomousVRefWithoutTimeConstant || n.VRef != nil)
 }
 
 // voltVarOnlyMode is the mode the three vRef-family elements may be served on.
@@ -334,6 +380,39 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	// The deliberate violations, applied AFTER the conformant path has had its
+	// say — so an armed request still has to be well-formed in every respect it
+	// did not ask to break, and a typo elsewhere in the body is still a 400
+	// rather than being swallowed by the opt-in.
+	if req.Nonconformant.armed() {
+		if req.Mode != voltVarOnlyMode {
+			http.Error(w, "nonconformant vRef violations are only expressible on a "+voltVarOnlyMode+
+				" curve: the SHALLs they break (IEEE Std 2030.5-2018 p.252-253) are the ones that apply "+
+				"WHEN the curveType is opModVoltVar. On any other mode the elements are already refused "+
+				"by the SHALL NOT, which is a different test", http.StatusBadRequest)
+			return
+		}
+		if req.Nonconformant.AutonomousVRefWithoutTimeConstant {
+			enable := true
+			autoVRefEnable, autoVRefTms = &enable, nil
+		}
+		if v := req.Nonconformant.VRef; v != nil {
+			if *v < 0 || *v > 65535 {
+				http.Error(w, fmt.Sprintf("nonconformant.vref %d is outside UInt16's WIRE domain "+
+					"[0,65535]: this lever exists to serve a value PerCent does not admit, not one the "+
+					"XML type cannot carry — an element that cannot be encoded is a different defect and "+
+					"this server has no way to put it on the wire", *v), http.StatusBadRequest)
+				return
+			}
+			p := model.PerCent{Value: uint16(*v)}
+			vref = &p
+		}
+		log.Printf("[gridsim] POST /admin/curve: NONCONFORMANT BY REQUEST — program=%d mode=%s "+
+			"autonomous_vref_without_time_constant=%v vref=%v. This document deliberately violates a "+
+			"stated SHALL (IEEE Std 2030.5-2018 p.252-253) and exists to grade a DUT's refusal",
+			req.Program, req.Mode, req.Nonconformant.AutonomousVRefWithoutTimeConstant,
+			req.Nonconformant.VRef)
 	}
 	droop, err := req.FreqDroop.toModel()
 	if err != nil {
