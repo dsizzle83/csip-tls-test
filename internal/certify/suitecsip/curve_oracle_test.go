@@ -1109,29 +1109,11 @@ func TestBasic015Row_IsRedWhenTheRefusedCurveOnlyReachesStaging(t *testing.T) {
 		t.Fatal("no baseline recorded")
 	}
 
-	// Stage the refused curve at index 1 WITHOUT touching the handshake: the
-	// raw register write a gateway's curve writer makes before it would ask the
-	// device to adopt.
-	blk, err := sunspec.FindModel(f.base.Reader.Blocks(), sunspec.ModelDERWattVar)
-	if err != nil {
-		t.Fatalf("find M712: %v", err)
-	}
-	regs, err := f.base.Reader.ReadModel(sunspec.ModelDERWattVar)
-	if err != nil {
-		t.Fatalf("read M712: %v", err)
-	}
-	staged := append([]uint16(nil), regs...)
-	if _, _, err := sunspec.Encode712Curve(staged, 1, sunspec.WattVarCurve{
-		DeptRef: 2, Pri: 1,
-		Points:  []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
-	}); err != nil {
-		t.Fatalf("encode the staged watt-PF curve: %v", err)
-	}
-	for i, v := range staged {
-		if v != regs[i] {
-			f.ss.Regs.Set(blk.BaseAddr+uint16(i), v)
-		}
-	}
+	// Stage the refused curve at index 1 WITHOUT touching the handshake. Note
+	// this happens AFTER Setup: the same write BEFORE Setup is a contaminated
+	// baseline, which is a different finding —
+	// TestBasic015Row_IsRedWhenTheBaselineIsContaminatedInAStagingSlot.
+	f.stageRefusedWattPFCurve(t, 1)
 
 	// The handshake really did not move — otherwise this test is just the
 	// landed-write case again and proves nothing about staging.
@@ -1149,6 +1131,174 @@ func TestBasic015Row_IsRedWhenTheRefusedCurveOnlyReachesStaging(t *testing.T) {
 		t.Fatalf("BASIC-015's declared verdict on a refused curve written into the STAGING slot = %q, "+
 			"want FAIL: a staged write is still a write to an axis the DUT said it could not perform. "+
 			"Notes: %s", got, s.Notes(obs))
+	}
+}
+
+// stageRefusedWattPFCurve writes BASIC-015's own published breakpoints into one
+// slot of the DER's model-712 bank through the real sunspec encoder, WITHOUT
+// touching the adopt handshake — the raw register write a gateway's curve
+// writer makes before it would ask the device to adopt.
+func (f *curveFixture) stageRefusedWattPFCurve(t *testing.T, idx int) {
+	t.Helper()
+	blk, err := sunspec.FindModel(f.base.Reader.Blocks(), sunspec.ModelDERWattVar)
+	if err != nil {
+		t.Fatalf("find M712: %v", err)
+	}
+	regs, err := f.base.Reader.ReadModel(sunspec.ModelDERWattVar)
+	if err != nil {
+		t.Fatalf("read M712: %v", err)
+	}
+	staged := append([]uint16(nil), regs...)
+	if _, _, err := sunspec.Encode712Curve(staged, idx, sunspec.WattVarCurve{
+		DeptRef: 2, Pri: 1,
+		Points:  []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
+	}); err != nil {
+		t.Fatalf("encode the staged watt-PF curve at index %d: %v", idx, err)
+	}
+	for i, v := range staged {
+		if v != regs[i] {
+			f.ss.Regs.Set(blk.BaseAddr+uint16(i), v)
+		}
+	}
+}
+
+// TestBasic015Row_IsRedWhenTheBaselineIsContaminatedInAStagingSlot is the
+// reviewer's N1 probe, and it is the previous fix's own hole.
+//
+// The contamination guard asked oracleCurve, which decodes index 0 and only
+// index 0, while the fingerprint had just been widened to span the staging
+// slots. So a baseline contaminated in STAGING read as clean: the pre-verdict
+// said the bank was fine, nothing moved during the window because the content
+// was already there, and the row certified. Worse, it is self-perpetuating —
+// the first run against a stage-and-stop regression fails on MOVEMENT, but the
+// contamination branch never fires, so nobody is ever told to reset the sim and
+// every rerun from then on passes.
+//
+// The distinction from TestBasic015Row_IsRedWhenTheRefusedCurveOnlyReachesStaging
+// is WHEN the write happens: there it lands inside the window and the
+// fingerprint moves; here it is already there when the row starts, and the
+// fingerprint cannot move at all.
+func TestBasic015Row_IsRedWhenTheBaselineIsContaminatedInAStagingSlot(t *testing.T) {
+	f := newCurveFixture(t)
+	d := f.withGridSim(t)
+	row := rowByID(t, "BASIC-015")
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-015")
+
+	// Contaminate STAGING before Setup — the live curve is left untouched, so
+	// an index-0-only baseline check sees a pristine bank.
+	f.stageRefusedWattPFCurve(t, 1)
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 Setup: %v", err)
+	}
+	if got := certify.Verdict(params[oraclePreVerdictParam]); got != certify.Pass {
+		t.Fatalf("Setup recorded pre-verdict %q for a bank whose STAGING slot already holds the row's "+
+			"content, want PASS (contaminated). The contamination read must span the same slots the "+
+			"fingerprint does — an index-0-only read is what let this through", got)
+	}
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-015 PostWait: %v", err)
+	}
+
+	// The fingerprint is unchanged, which is exactly why this is dangerous: the
+	// row has nothing to fail on except the contamination.
+	if params[oracleVerdictParam] != string(certify.Pass) {
+		t.Fatalf("the fingerprint MOVED (%s: %s) — this test is about a window in which it cannot",
+			params[oracleVerdictParam], params[oracleObservedParam])
+	}
+	obs := &Observation{Params: params}
+	if got := s.Verdict(obs); got != certify.Fail {
+		t.Fatalf("BASIC-015's declared verdict against a STAGING-contaminated baseline = %q, want FAIL. "+
+			"Notes: %s", got, s.Notes(obs))
+	}
+	got := refusalOutcome(row.mode.Refusal, obs)
+	for _, want := range []string{"CONTAMINATED", "STAGING curve 1", "REMEDY"} {
+		if !strings.Contains(got.Observed, want) {
+			t.Errorf("the FAIL does not say %q — a contaminated bench must be told WHICH slot and how to "+
+				"clean it: %s", want, got.Observed)
+		}
+	}
+}
+
+// TestCoveredCurveSlots_FingerprintAndContaminationSpanTheSameSlots is the
+// structural half of N1: the defect was two functions independently deciding
+// which curves of a bank to look at, so the property that they cannot is what
+// gets pinned, not just the one instance that went wrong.
+func TestCoveredCurveSlots_FingerprintAndContaminationSpanTheSameSlots(t *testing.T) {
+	f := newCurveFixture(t)
+	uv, err := oracleUnitView(context.Background(), f.rc, oracleSimName)
+	if err != nil {
+		t.Fatalf("read the DER through the referee: %v", err)
+	}
+	b := rowByID(t, "BASIC-015").mode.Refusal
+	views, _, ok := coveredCurveSlots(uv, b.Curve.Model)
+	if !ok || len(views) < 2 {
+		t.Fatalf("the fixture's M712 bank covers %d slot(s); this test needs a live curve AND at least "+
+			"one staging slot to be able to tell the two reads apart", len(views))
+	}
+
+	// Every covered slot must be detectable by the contamination read. Written
+	// as a loop over the SLOTS rather than as "index 1 works" so a future bank
+	// with more staging curves is covered by the same assertion.
+	for i := range views {
+		f2 := newCurveFixture(t)
+		f2.stageRefusedWattPFCurve(t, i)
+		uv2, err := oracleUnitView(context.Background(), f2.rc, oracleSimName)
+		if err != nil {
+			t.Fatalf("slot %d: read the DER: %v", i, err)
+		}
+		where, ok := curveBaselineContamination(uv2, b.Curve)
+		if !ok {
+			t.Fatalf("slot %d: the contamination read could not read the bank", i)
+		}
+		if len(where) == 0 {
+			t.Errorf("slot %d holds this row's content and the contamination read did not see it — the "+
+				"fingerprint covers this slot, so a baseline contaminated here produces an "+
+				"uninformative window that nothing would report", i)
+		}
+	}
+}
+
+// TestCoveredCurveSlots_BoundIsRealAndIsFour pins N7: the bound existed and its
+// VALUE did not, so a refactor could widen it to 1000000 and leave the size of
+// this row's bundle entry in the hands of whatever NCrv a device declares.
+func TestCoveredCurveSlots_BoundIsRealAndIsFour(t *testing.T) {
+	if maxStagingCurvesFingerprinted != 4 {
+		t.Fatalf("maxStagingCurvesFingerprinted = %d, want 4. The fingerprint is a string that lands in "+
+			"a conformance bundle and the loop bound comes from the DEVICE's own NCrv, so this number is "+
+			"the only thing standing between a broken or hostile NCrv and an unbounded bundle entry. "+
+			"Changing it is a decision, not a refactor.", maxStagingCurvesFingerprinted)
+	}
+	// And the bound is REACHED rather than merely declared: a bank claiming more
+	// curves than the bound yields exactly bound+1 views and says how many it
+	// left out.
+	f := newCurveFixture(t)
+	f.setHeaderReg(t, sunspec.ModelDERWattVar, "NCrv", 12)
+	uv, err := oracleUnitView(context.Background(), f.rc, oracleSimName)
+	if err != nil {
+		t.Fatalf("read the DER: %v", err)
+	}
+	views, truncated, ok := coveredCurveSlots(uv, sunspec.ModelDERWattVar)
+	if !ok {
+		t.Fatal("the bank could not be read")
+	}
+	if len(views) != maxStagingCurvesFingerprinted+1 {
+		t.Errorf("a device declaring NCrv=12 yielded %d views, want %d (live + the bound)",
+			len(views), maxStagingCurvesFingerprinted+1)
+	}
+	if truncated != 12-maxStagingCurvesFingerprinted-1 {
+		t.Errorf("truncated = %d, want %d — a bundle must say what it left out rather than silently "+
+			"rendering a prefix", truncated, 12-maxStagingCurvesFingerprinted-1)
+	}
+	b := rowByID(t, "BASIC-015").mode.Refusal
+	fp, ok := b.fingerprint(uv)
+	if !ok {
+		t.Fatal("no fingerprint")
+	}
+	if !strings.Contains(fp, "further staging curve(s) not fingerprinted") {
+		t.Errorf("the truncated fingerprint does not say it is truncated: %s", fp)
 	}
 }
 

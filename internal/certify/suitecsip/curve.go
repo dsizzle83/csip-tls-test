@@ -619,53 +619,136 @@ type refusalBinding struct {
 	Curve *curveBinding
 }
 
+// coveredCurveSlots is THE decision about which curves of a bank this row's
+// refusal apparatus looks at, and it exists as one function because the last
+// defect here was two functions making that decision independently.
+//
+// The fingerprint spanned slots 0..maxStagingCurvesFingerprinted while the
+// contamination read called oracleCurve, which decodes index 0 and only index
+// 0. A baseline contaminated in a STAGING slot therefore read as clean: the
+// window looked informative, the run failed on movement if the write happened
+// again, nobody was ever told to reset the sim, and every subsequent rerun
+// passed — the exact "worse contamination, more reliable pass" shape the
+// contamination guard was added to close, relocated into the slot that guard
+// introduced. Both callers now iterate this, so they cannot disagree again
+// without the disagreement being a change to this function.
+//
+// ok=false is "the bank could not be read at all", which is a different answer
+// from "read it and it was empty" and must stay distinguishable: the first
+// cannot establish anything, the second establishes a clean baseline.
+func coveredCurveSlots(uv invariant.UnitView, model uint16) (views []invariant.CurveView, truncated int, ok bool) {
+	live := uv.Curve(oracleSimName, model)
+	if !live.Present {
+		return nil, 0, false
+	}
+	views = []invariant.CurveView{live}
+	for i := 1; i < live.NCrv && i <= maxStagingCurvesFingerprinted; i++ {
+		views = append(views, uv.CurveAt(oracleSimName, model, i))
+	}
+	if n := live.NCrv - maxStagingCurvesFingerprinted - 1; n > 0 {
+		truncated = n
+	}
+	return views, truncated, true
+}
+
 // fingerprint renders the state a write of this refused axis would have moved,
 // so two readings taken minutes apart can be compared for ANY movement.
 //
 // The two shapes measure different register banks because a refused axis lands
 // in different places depending on what kind of axis it is, and measuring the
 // wrong bank would report an absence that was never in question.
+//
+// For a CURVE axis the whole covered bank is rendered, not just the live curve.
+// An execution oracle reads index 0 alone on purpose — content in staging is a
+// curve the device was OFFERED, not one it adopted, and grading it as executed
+// would accept the half-completed write the adopt handshake exists to
+// distinguish. But this row asserts that NO WRITE LANDED, and a gateway that
+// stages a refused curve and never triggers the handshake has still written to
+// an axis it told the head end it could not perform. The handshake registers
+// alone do not cover it: they move when the gateway ASKS the device to adopt,
+// so they catch stage-then-adopt and are blind to stage-and-stop.
 func (b *refusalBinding) fingerprint(uv invariant.UnitView) (string, bool) {
 	if b.Curve == nil {
 		return refusalFingerprint(uv, b.Points)
 	}
-	cv := uv.Curve(oracleSimName, b.Curve.Model)
-	if !cv.Present {
+	views, truncated, ok := coveredCurveSlots(uv, b.Curve.Model)
+	if !ok {
 		// Same posture as the scalar shape's empty-points case: a bank we
 		// cannot read cannot tell a refused axis from an unreadable one.
 		return "", false
 	}
-	// The LIVE curve is not the whole bank, and a refusal row is the one caller
-	// for which that matters. An execution oracle reads index 0 alone on
-	// purpose — content in staging is a curve the device was OFFERED, not one it
-	// adopted, and grading it as executed would accept the half-completed write
-	// the adopt handshake exists to distinguish. But this row asserts that NO
-	// WRITE LANDED, and a gateway that stages a refused curve and never triggers
-	// the handshake has still written to an axis it told the head end it could
-	// not perform. Reading only index 0 would report that as an untouched
-	// device.
-	//
-	// The handshake registers alone do not cover it: they move when the gateway
-	// ASKS the device to adopt, so they catch stage-then-adopt and are blind to
-	// stage-and-stop.
-	parts := []string{cv.Describe()}
-	for i := 1; i < cv.NCrv && i <= maxStagingCurvesFingerprinted; i++ {
-		parts = append(parts, uv.CurveAt(oracleSimName, b.Curve.Model, i).Describe())
+	parts := make([]string, 0, len(views)+1)
+	for _, cv := range views {
+		parts = append(parts, cv.Describe())
 	}
-	if cv.NCrv > maxStagingCurvesFingerprinted+1 {
-		parts = append(parts, fmt.Sprintf("(%d further staging curve(s) not fingerprinted)",
-			cv.NCrv-maxStagingCurvesFingerprinted-1))
+	if truncated > 0 {
+		parts = append(parts, fmt.Sprintf("(%d further staging curve(s) not fingerprinted)", truncated))
 	}
 	return strings.Join(parts, " | "), true
 }
 
+// curveBaselineContamination reports which of the covered slots ALREADY hold
+// this row's published breakpoints, over exactly the slots the fingerprint
+// renders.
+//
+// The criterion is the row's own CONTENT, and deliberately not oracleCurve's
+// execution question (adopted AND enabled AND the right DeptRef). What makes a
+// refusal window uninformative is that a write of the refused content would not
+// move the fingerprint, and that is true of a slot already holding those
+// breakpoints whether or not the function was ever adopted or switched on — a
+// gateway that writes points and stops moves nothing at all. Requiring the
+// adopt/enable state as well would have let the points-only case through, which
+// is precisely the staging shape.
+//
+// It does NOT compare DeptRef: a slot holding the right points under a
+// different reference would still MOVE when the reference was written, so that
+// window is informative and reporting it as contaminated would be a false
+// accusation against a clean bench.
+func curveBaselineContamination(uv invariant.UnitView, b *curveBinding) (where []string, ok bool) {
+	views, _, ok := coveredCurveSlots(uv, b.Model)
+	if !ok {
+		return nil, false
+	}
+	want := b.wantPoints()
+	for _, cv := range views {
+		if len(cv.Points) == 0 {
+			continue
+		}
+		if invariant.MatchPoints(cv.Points, want, curvePointTolerance).Matched {
+			where = append(where, slotLabel(cv))
+		}
+	}
+	return where, true
+}
+
+// slotLabel names one curve of a bank for a finding.
+func slotLabel(cv invariant.CurveView) string {
+	if cv.Index == 0 {
+		return fmt.Sprintf("the LIVE curve (index 0, %s, %s)",
+			enabledLabel(cv.Enabled), adoptLabel(cv.Adopted))
+	}
+	return fmt.Sprintf("STAGING curve %d", cv.Index)
+}
+
+func adoptLabel(done bool) string {
+	if done {
+		return "adopt COMPLETED"
+	}
+	return "adopt not COMPLETED"
+}
+
 // maxStagingCurvesFingerprinted bounds how much of a curve bank the refusal
-// fingerprint renders. A device declares its own NCrv and nothing stops it
+// apparatus covers. A device declares its own NCrv and nothing stops it
 // declaring a large one; the fingerprint is a STRING that lands in a bundle, so
 // it needs a bound that does not depend on the device's honesty. Devices this
 // bench grades declare NCrv=2 (one live, one staging), so the practical cost of
 // the bound is nil — and when it does bite, the fingerprint says so rather than
 // silently truncating.
+//
+// Its VALUE is pinned by TestCoveredCurveSlots_BoundIsRealAndIsFour: a bound
+// nothing checks is a bound that can be widened to 1000000 in a refactor, at
+// which point a hostile or broken device's NCrv decides how much of a bundle
+// this row writes.
 const maxStagingCurvesFingerprinted = 4
 
 // describeAxisRegisters names what the fingerprint above covers, for the
@@ -732,8 +815,12 @@ func enabledLabel(on bool) string {
 // worse the contamination, the more reliably the row passed.
 //
 // It is now kept for the CURVE shape, where "already holds this row's content"
-// is precisely computable — oracleCurve answers exactly that question about
-// exactly these breakpoints. It is NOT kept for the scalar shape, and that is a
+// is precisely computable: curveBaselineContamination asks whether ANY slot the
+// fingerprint covers already holds this row's breakpoints. (It asked oracleCurve
+// at first, which answers the EXECUTION question about index 0 alone — so a
+// baseline contaminated in a staging slot read as clean, and the guard had the
+// hole it was written to close. coveredCurveSlots is now the single decision
+// about which slots both halves look at.) It is NOT kept for the scalar shape, and that is a
 // bounded gap rather than an oversight: refusalBinding.Commanded is prose, not a
 // value, so there is nothing to compare a baseline against, and the obvious
 // proxy — "the axis is already ENABLED" — would fail BASIC-014 in every
@@ -810,7 +897,7 @@ func refusalOutcome(b *refusalBinding, o *Observation) Finding {
 		switch certify.Verdict(o.Params[oraclePreVerdictParam]) {
 		case certify.Pass:
 			return Finding{Verdict: certify.Fail, Observed: "THE BASELINE WAS CONTAMINATED: the DER " +
-				"ALREADY held this row's own " + b.Curve.Mode + " content, adopted and enabled, BEFORE " +
+				"ALREADY held this row's own " + b.Curve.Mode + " content BEFORE " +
 				"this row published anything (" + pre + "). Nothing moved during the window (" + post +
 				") — and nothing could have, because the refused content was already there. This row " +
 				"cannot prove a refusal against a device that is executing the very thing it is supposed " +
@@ -826,8 +913,18 @@ func refusalOutcome(b *refusalBinding, o *Observation) Finding {
 			// The clean case: the DER did NOT hold this row's content before the
 			// window, and still does not. The absence means something.
 		default:
+			// Everything that is neither "clean" nor "contaminated". Unset is
+			// the ordinary case (the bank could not be read); any OTHER verdict
+			// is a shape recordCurveContamination does not produce, so it is
+			// reported as itself rather than described as a missing reading —
+			// mislabelling a present-but-unexpected verdict as "not recovered"
+			// sends whoever reads the bundle looking for the wrong fault.
+			why := "was not recovered"
+			if v := o.Params[oraclePreVerdictParam]; v != "" {
+				why = "came back " + v + ", which is not a state this row's baseline check produces"
+			}
 			return Finding{Verdict: certify.Fail, Observed: "the pre-publication reading of the " +
-				b.Curve.Mode + " bank was not recovered (" + pre + "), so this run cannot show that the " +
+				b.Curve.Mode + " bank " + why + " (" + pre + "), so this run cannot show that the " +
 				"baseline was clean. Nothing moved during the window (" + post + "), but an unchanged " +
 				"reading is only evidence of a refusal against a starting state that was established — " +
 				"an unestablished one cannot certify an absence, the same posture this row already takes " +
@@ -984,6 +1081,13 @@ func critRefusalAnswered(mridKey string) criterion {
 // publish the control the DUT is expected to refuse.
 func refusalSetup(ctx context.Context, d *Driver, params map[string]string, b *refusalBinding, mrid string) error {
 	params[refusalAxisParam] = b.Axis
+	if b.Curve != nil {
+		params[curvePublishedParam] = b.Curve.describePublished()
+		params[curveModelParam] = strconv.FormatUint(uint64(b.Curve.Model), 10)
+	}
+	// ONE read of the DER answers both baseline questions, which is deliberate:
+	// they must describe the same instant, and the fingerprint and the
+	// contamination read must not be able to disagree about what the bank held.
 	if uv, err := oracleUnitView(ctx, d.rc, oracleSimName); err == nil {
 		if fp, ok := b.fingerprint(uv); ok {
 			params[refusalBaselineParam] = fp
@@ -992,25 +1096,44 @@ func refusalSetup(ctx context.Context, d *Driver, params map[string]string, b *r
 			params[oraclePreObservedParam] = "the DER's own register image carries nothing of " +
 				b.describeAxisRegisters()
 		}
+		if b.Curve != nil {
+			recordCurveContamination(params, uv, b.Curve)
+		}
 	} else {
 		params[oraclePreObservedParam] = "the baseline reading could not be taken: " + err.Error()
+		// oraclePreVerdictParam is deliberately left UNSET on this path: with no
+		// reading there is no clean baseline to certify against, and
+		// refusalOutcome turns the unset state into a FAIL rather than a pass.
 	}
 	if b.Curve != nil {
-		params[curvePublishedParam] = b.Curve.describePublished()
-		params[curveModelParam] = strconv.FormatUint(uint64(b.Curve.Model), 10)
-		// The CONTAMINATION read, and it is a different question from the
-		// fingerprint above. The fingerprint asks "what does this bank hold?",
-		// so it can detect MOVEMENT; this asks "does it already hold the
-		// content this row is about?", which is the only thing that can tell a
-		// refusal from a device that was already executing the refused control
-		// when the row started. Recorded under the same key curveSetup uses, and
-		// read by refusalOutcome exactly as curveOutcome reads it.
-		pre := oracleCurve(b.Curve)(ctx, d.rc)
-		params[oraclePreVerdictParam] = string(pre.Verdict)
-		params[oraclePreObservedParam] = findingObserved(pre)
 		return publishCurveControl(ctx, d, params, b.Curve, mrid)
 	}
 	return b.Publish(ctx, d, mrid)
+}
+
+// recordCurveContamination answers the second baseline question — "does the
+// bank already hold the content this row is about?" — and records it under the
+// key curveOutcome already uses, in the same polarity, so refusalOutcome reads
+// it the way that function's sibling does.
+//
+// THE POLARITY IS WORTH READING TWICE because it is inverted relative to what
+// the words suggest: oraclePreVerdictParam = Pass means the DER DOES hold this
+// row's content, which for an EXECUTION row is a stale-register problem and for
+// a REFUSAL row is a contaminated baseline. Fail means it does not, which is
+// what a refusal row needs. Unset means the bank could not be read.
+func recordCurveContamination(params map[string]string, uv invariant.UnitView, b *curveBinding) {
+	where, ok := curveBaselineContamination(uv, b)
+	if !ok {
+		return // unset: refusalOutcome fails on an unestablished baseline
+	}
+	if len(where) == 0 {
+		params[oraclePreVerdictParam] = string(certify.Fail)
+		return
+	}
+	params[oraclePreVerdictParam] = string(certify.Pass)
+	params[oraclePreObservedParam] = fmt.Sprintf(
+		"%s already held this row's own %s breakpoints (%s) before this row published anything",
+		strings.Join(where, " and "), b.Mode, b.describePublished())
 }
 
 // settleRefusal is settleOracle's mirror image, and the difference is the whole

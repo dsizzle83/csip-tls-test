@@ -279,14 +279,25 @@ EOF
       # import graph, not just go.mod. vendor/ and .git are excluded (huge,
       # irrelevant, and we're about to regenerate vendor/ from scratch).
       # Also excluded: non-content scratch/output dirs that a live bench
-      # session may be writing to concurrently (logs/, cmd/dashboard/logs/)
-      # or that are just build output / fetched deps irrelevant to the go
-      # vendor comparison (bin/, cmd/dashboard/ui/node_modules/). Reading a
+      # session may be writing to concurrently (logs/, cmd/dashboard/logs/,
+      # runs/) or that are just build output / fetched deps irrelevant to the
+      # go vendor comparison (bin/, cmd/dashboard/ui/node_modules/). Reading a
       # file mid-write here makes `tar -c` report "file changed as we read
       # it" and exit non-zero, failing this check spuriously -- none of
       # these dirs are part of the vendored proto content being verified.
+      #
+      # runs/ was added to that list on 2026-08-15 and is the one whose absence
+      # HURT: it holds this bench's published evidence bundles -- pcaps,
+      # keylogs, register dumps -- and had reached 13 GB on this machine, which
+      # --verify-vendor was copying in full, twice (tar out, tar in), on every
+      # invocation. That is minutes of wall clock and 26 GB of I/O to verify a
+      # few hundred KB of vendored Go, and it is also the concurrency hazard
+      # above at its worst: a campaign writing a bundle while this runs fails
+      # the check for a reason that has nothing to do with the pin. (lexa-gw's
+      # copy of this script has a runs/ too, at 4.4 MB, and no exclusion; it
+      # should get the same one before it grows.)
       ( cd "$SELF" && tar -c --exclude=./.git --exclude=./vendor \
-          --exclude=./logs --exclude=./cmd/dashboard/logs \
+          --exclude=./logs --exclude=./cmd/dashboard/logs --exclude=./runs \
           --exclude=./bin --exclude=./cmd/dashboard/ui/node_modules \
           . ) | tar -x -C "$TMP_CONSUMER"
 

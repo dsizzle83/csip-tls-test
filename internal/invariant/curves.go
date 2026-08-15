@@ -188,26 +188,41 @@ func (c CurveView) Describe() string {
 		}
 		return fmt.Sprintf("%s is not served by this device", name)
 	}
-	parts := []string{
-		fmt.Sprintf("Ena=%d (%s)", c.EnaRaw, enabledWord(c.Enabled)),
-		fmt.Sprintf("adopt req=%d rslt=%d (%s)", c.AdoptReq, c.AdoptResult, adoptWord(c.Adopted)),
-		fmt.Sprintf("NPt=%d NCrv=%d", c.NPt, c.NCrv),
-		fmt.Sprintf("live curve read-only=%t", c.ReadOnly),
+	// Ena, the adopt handshake and NPt/NCrv belong to the MODEL, not to any one
+	// curve of it, so they are rendered ONCE — on the live curve's line. A
+	// staging line that repeated them would show the same numbers under a
+	// different heading and read as if the slot had its own enable and its own
+	// adopt state, which is exactly the confusion the live/staging distinction
+	// exists to prevent.
+	var parts []string
+	if c.Index == 0 {
+		parts = append(parts,
+			fmt.Sprintf("Ena=%d (%s)", c.EnaRaw, enabledWord(c.Enabled)),
+			fmt.Sprintf("adopt req=%d rslt=%d (%s)", c.AdoptReq, c.AdoptResult, adoptWord(c.Adopted)),
+			fmt.Sprintf("NPt=%d NCrv=%d", c.NPt, c.NCrv),
+			fmt.Sprintf("live curve read-only=%t", c.ReadOnly),
+		)
+	} else {
+		parts = append(parts, fmt.Sprintf("read-only=%t", c.ReadOnly))
 	}
 	if c.HasDeptRef {
 		parts = append(parts, fmt.Sprintf("DeptRef=%d (%s)", c.DeptRef, DeptRefName(c.Axis.Model, c.DeptRef)))
+	}
+	which := "live curve"
+	if c.Index > 0 {
+		which = "this curve"
 	}
 	switch {
 	case c.Axis.Pointless:
 		parts = append(parts, "no breakpoint table (parametric control): "+orNone(c.Params))
 	case len(c.Points) == 0:
-		parts = append(parts, "live curve holds NO points")
+		parts = append(parts, which+" holds NO points")
 	default:
 		pts := make([]string, 0, len(c.Points))
 		for _, p := range c.Points {
 			pts = append(pts, p.String())
 		}
-		parts = append(parts, fmt.Sprintf("live curve %s/%s points: %s", c.Axis.XName, c.Axis.YName,
+		parts = append(parts, fmt.Sprintf("%s %s/%s points: %s", which, c.Axis.XName, c.Axis.YName,
 			strings.Join(pts, " ")))
 	}
 	return name + " — " + strings.Join(parts, ", ")
@@ -298,8 +313,15 @@ func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
 //
 // The header fields (Ena, the adopt handshake, NPt/NCrv) belong to the MODEL and
 // are the same whatever idx is; only ReadOnly, DeptRef and the points come from
-// the indexed curve. 711 carries controls rather than curves and has no point
-// table, so a non-zero idx there decodes the same parametric control as idx 0.
+// the indexed curve.
+//
+// 711 is indexed too, and the earlier claim here that "a non-zero idx there
+// decodes the same parametric control as idx 0" was simply wrong:
+// sunspec.Parse711Ctl takes the index and reads the idx'th CONTROL of the bank
+// (711 declares NCtl controls, not NCrv curves, which is why curveHeaderOf
+// reports its count under a different field). What is true of 711 is that it
+// carries no point TABLE — its response is parametric, and Points is empty for
+// every index.
 func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveView {
 	axis, known := CurveAxisOf(model)
 	if !known {
