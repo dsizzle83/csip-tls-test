@@ -628,14 +628,21 @@ func (b *Base) legacyPreflight(p LegacyCurvePlan, tag string, out *LegacyCurveOu
 	}
 	st.start, st.end = start, end
 
-	// The Case-B no-op: the target bank IS the live bank and already holds this
-	// curve. On 7xx this is an optimisation; here it is a SAFETY requirement,
-	// because the alternative is disabling a live function to rewrite it with
-	// content it already has.
-	if legacyRangeEqual(st.want, regs, start, end) &&
-		g.ActCrv == bank && legacyModEnaSet(regs, hdr) {
-		st.noOp = true
-	}
+	// THERE IS NO SECOND NO-OP GUARD HERE, and its absence is deliberate.
+	//
+	// A Case-B no-op — "the bank I am about to rewrite is the live one and
+	// already holds this curve" — is fully answered by the live-bank probe
+	// above, which runs BEFORE selection and asks the same question of the same
+	// bank under weaker conditions: Case B is by definition the case where the
+	// selected bank IS the live bank, so any state that would satisfy a guard
+	// at this point has already returned as a no-op.
+	//
+	// A guard here would therefore be unreachable, and unreachable code that
+	// looks like a safety check is worse than no code at all: it invites a
+	// reader to believe Case B protects itself, when in fact the protection is
+	// upstream and removing the upstream probe would silently remove all of it.
+	// The Case-B no-op is covered by TestLegacyCurve_CaseB_NoOpWritesNothingAtAll,
+	// which reaches it through the probe.
 	st.deadline = newLegacyDeadline(b.legacyBudget())
 	return st, nil
 }
