@@ -9,8 +9,27 @@ import "encoding/xml"
 
 // ─── Operating-mode bitmask constants (DERCapability.ModesSupported) ──────────
 //
-// These match the DERControlType enumeration in the 2030.5 XSD (Table 21).
 // A DER device sets the corresponding bit to advertise support for each mode.
+//
+// RECORDED DIVERGENCE — these bit positions do NOT match sep 2.0.4 (R4b's
+// sibling, deliberately NOT fixed here). The vendored schema
+// (docs/schema/sep-2.0.4.xsd, complexType "DERControlType") assigns:
+//
+//	0 opModVoltVar   1 opModFreqWatt  2 opModFreqDroop  3 opModWattPF
+//	4 opModVoltWatt  5 LVRTMomCess    6 LVRTMustTrip    7 HVRTMomCess
+//	8 HVRTMustTrip   9 LFRTMustTrip  10 HFRTMustTrip   11 opModConnect
+//	12 opModEnergize 13 opModMaxLimW 14 opModFixedVar  15 opModFixedPF
+//	16 opModFixedW   17 opModTargetW 18 opModTargetVar 19 Charge
+//	20 Discharge     21 opModWattVar
+//
+// The table below is a different assignment entirely, and — unlike the
+// DERCurveType codes, which are only ever read FROM the wire — this one is
+// WRITTEN to the wire: derproducer publishes ModesSupported from it, so
+// correcting it changes what the gateway advertises to a utility server and has
+// to move together with the PICS, the harness expectations and the
+// per-generation capability work. That is scheduled as its own stage
+// (LEGACY_CURVES_RC0_2026-08-14 §10 stage 9, "modesSupported truth"); changing
+// it here would advertise a different mask than the product can honour.
 const (
 	ModeConnect                uint32 = 1 << 0  // opModConnect / opModEnergize
 	ModeMaxLimW                uint32 = 1 << 1  // opModMaxLimW
@@ -43,23 +62,76 @@ const (
 
 // ─── DERCurve curve-type codes ────────────────────────────────────────────────
 //
-// These match the DERCurveType enumeration (IEEE 2030.5-2018 Table 19).
+// Transcribed from the vendored schema: docs/schema/sep-2.0.4.xsd, complexType
+// "DERCurveType". ELEVEN values, 0..10, proven against the XSD text by
+// TestCurveTypeCodesMatchXSD.
+//
+// CORRECTED 2026-08-14 (R4b). The previous table was wrong for every code ≥ 4
+// and had fourteen entries. Most consequentially, curveType = 10 — opModWattVar
+// — decoded as "HFRTMayTrip", and the ride-through pairs were transposed (the
+// old table put HVRT before LVRT; the XSD orders LVRT first). The old table also
+// declared four MayTrip curve types that do not exist in sep 2.0.4 at all: the
+// string "MayTrip" appears ZERO times in the whole schema, and DERCurveType's
+// ride-through values are only MomentaryCessation and MustTrip. The four
+// CurveType*MayTrip constants are therefore REMOVED rather than renumbered —
+// they had no referent to renumber to.
+//
+// BLAST RADIUS, checked before the change was made. Nothing in this tree, in
+// lexa-gw or in csip-tls-test BRANCHES on a curve-type number: curve mode is
+// derived from the opMod* element a curve is linked from
+// (discovery.CurveModeLinks is the single owner of that mapping), never from
+// curveType, and every production use of the field is a verbatim pass-through.
+// The one mechanism that consumes the number, bus.CurveSetContentHash, hashes
+// the value that arrived ON THE WIRE from the server; it never reads these
+// constants, so no digest moves and no CurveSetV bump is implied. The only
+// assignments of a named constant anywhere — gridsim's curveTypeForMode and a
+// handful of tests — use codes 0..3, which the XSD leaves unchanged. The four
+// removed MayTrip constants had zero references in either consumer repo.
 const (
-	CurveTypeVoltVar                uint16 = 0
-	CurveTypeFreqWatt               uint16 = 1
-	CurveTypeWattPF                 uint16 = 2
-	CurveTypeVoltWatt               uint16 = 3
-	CurveTypeHVRTMayTrip            uint16 = 4
-	CurveTypeHVRTMomentaryCessation uint16 = 5
-	CurveTypeHVRTMustTrip           uint16 = 6
-	CurveTypeLVRTMayTrip            uint16 = 7
-	CurveTypeLVRTMomentaryCessation uint16 = 8
-	CurveTypeLVRTMustTrip           uint16 = 9
-	CurveTypeHFRTMayTrip            uint16 = 10
-	CurveTypeHFRTMustTrip           uint16 = 11
-	CurveTypeLFRTMayTrip            uint16 = 12
-	CurveTypeLFRTMustTrip           uint16 = 13
+	CurveTypeVoltVar                uint16 = 0  // opModVoltVar
+	CurveTypeFreqWatt               uint16 = 1  // opModFreqWatt (the curve-based mode)
+	CurveTypeWattPF                 uint16 = 2  // opModWattPF
+	CurveTypeVoltWatt               uint16 = 3  // opModVoltWatt
+	CurveTypeLVRTMomentaryCessation uint16 = 4  // opModLVRTMomentaryCessation
+	CurveTypeLVRTMustTrip           uint16 = 5  // opModLVRTMustTrip
+	CurveTypeHVRTMomentaryCessation uint16 = 6  // opModHVRTMomentaryCessation
+	CurveTypeHVRTMustTrip           uint16 = 7  // opModHVRTMustTrip
+	CurveTypeLFRTMustTrip           uint16 = 8  // opModLFRTMustTrip
+	CurveTypeHFRTMustTrip           uint16 = 9  // opModHFRTMustTrip
+	CurveTypeWattVar                uint16 = 10 // opModWattVar
 )
+
+// CurveTypeName maps a DERCurveType code to the opMod* element it names, and
+// returns "" for a reserved code. It exists so a log line or a defect record can
+// say what a server actually sent instead of printing a bare integer, and so the
+// mapping is assertable in both directions.
+func CurveTypeName(code uint16) string {
+	switch code {
+	case CurveTypeVoltVar:
+		return "opModVoltVar"
+	case CurveTypeFreqWatt:
+		return "opModFreqWatt"
+	case CurveTypeWattPF:
+		return "opModWattPF"
+	case CurveTypeVoltWatt:
+		return "opModVoltWatt"
+	case CurveTypeLVRTMomentaryCessation:
+		return "opModLVRTMomentaryCessation"
+	case CurveTypeLVRTMustTrip:
+		return "opModLVRTMustTrip"
+	case CurveTypeHVRTMomentaryCessation:
+		return "opModHVRTMomentaryCessation"
+	case CurveTypeHVRTMustTrip:
+		return "opModHVRTMustTrip"
+	case CurveTypeLFRTMustTrip:
+		return "opModLFRTMustTrip"
+	case CurveTypeHFRTMustTrip:
+		return "opModHFRTMustTrip"
+	case CurveTypeWattVar:
+		return "opModWattVar"
+	}
+	return "" // "All other values reserved." — sep 2.0.4, DERCurveType
+}
 
 // ─── DER status code constants ────────────────────────────────────────────────
 
@@ -174,19 +246,47 @@ type DERCurveList struct {
 // rather than a curve link. It is used for active anti-islanding and frequency
 // regulation.
 
-// FreqDroop defines frequency droop (Frequency-Droop) parameters.
-// All frequency values in mHz; all time values in hundredths of a second.
+// FreqDroop defines frequency droop (Frequency-Watt parameterized) parameters.
+//
+// Element names, types and cardinality are transcribed from the vendored
+// schema: docs/schema/sep-2.0.4.xsd, complexType "FreqDroopType". ALL FIVE
+// elements are minOccurs="1" — a conformant opModFreqDroop carries every one of
+// them, so a decode that silently zeroes four of them is not a partial decode,
+// it is a wrong one.
+//
+// CORRECTED 2026-08-14 (R4a). The previous struct declared dBuf / dF / dP /
+// openLoopTms / tResponse. Only openLoopTms exists in the schema; the other four
+// element names do not appear in sep 2.0.4 anywhere, so a conformant
+// opModFreqDroop decoded to a struct in which four of the five parameters were
+// zero — a droop control with no dead band and no gain — with no error raised.
+// Two of the four also had the wrong width: dBOF/dBUF are UInt32, not UInt16.
+//
+// UNITS, per the XSD's own documentation:
+//
+//	dBOF, dBUF     thousandths of Hz (frequency droop dead band, over/under)
+//	kOF, kUF       thousandths, unitless (per-unit frequency change per
+//	               per-unit power change, over/under)
+//	openLoopTms    hundredths of a second; 0 means "no limit"
+//
+// Note that these are NOT the same quantities the old field names implied:
+// there is no single dead-band width (there is an over- and an under-frequency
+// one) and there is no "W per Hz" gain (k is dimensionless per-unit).
 type FreqDroop struct {
-	// dBuf: frequency dead-band width above/below nominal in mHz.
-	DBuf uint16 `xml:"dBuf"`
-	// dF: frequency deviation that triggers full droop response, in mHz.
-	DF uint16 `xml:"dF"`
-	// dP: change in output power per unit frequency deviation (W per Hz × 100).
-	DP uint16 `xml:"dP"`
-	// openLoopTms: time to reach 90 % of commanded output (hundredths of a second).
+	// dBOF: frequency droop dead band for OVER-frequency conditions, in
+	// thousandths of Hz.
+	DBOF uint32 `xml:"dBOF"`
+	// dBUF: frequency droop dead band for UNDER-frequency conditions, in
+	// thousandths of Hz.
+	DBUF uint32 `xml:"dBUF"`
+	// kOF: per-unit frequency change for over-frequency conditions
+	// corresponding to a 1 per-unit power output change. Thousandths, unitless.
+	KOF uint16 `xml:"kOF"`
+	// kUF: the same for under-frequency conditions. Thousandths, unitless.
+	KUF uint16 `xml:"kUF"`
+	// openLoopTms: open-loop response time — the duration from a step change in
+	// the control input until the output has changed by 90 % of its final
+	// change, in hundredths of a second. 0 means no limit.
 	OpenLoopTms uint16 `xml:"openLoopTms"`
-	// tResponse: aggregate response time constant (hundredths of a second).
-	TResponse uint16 `xml:"tResponse"`
 }
 
 // ─── ReactivePower / WattPower — for opModTargetVar / opModTargetW ───────────
@@ -249,8 +349,25 @@ type ExtendedDERControlBase struct {
 	OpModWattPF *CurveLink `xml:"opModWattPF,omitempty"`
 	// Volt-Watt — ramp real power output as a function of voltage (§10.10.4.4).
 	OpModVoltWatt *CurveLink `xml:"opModVoltWatt,omitempty"`
+	// Watt-Var — reactive power as a function of real power output. Present in
+	// sep 2.0.4's DERControlBase (type DERCurveLink) and in DERControlType at
+	// bit 21, with its own DERCurveType code (10).
+	//
+	// ADDED 2026-08-14 (R4c): it was previously absent from this struct
+	// entirely, so a server that sent opModWattVar had it silently DISCARDED at
+	// decode — the control looked, to everything downstream, like a control that
+	// commanded nothing on that axis.
+	OpModWattVar *CurveLink `xml:"opModWattVar,omitempty"`
 
 	// High-frequency ride-through curves.
+	//
+	// NOTE on the four opMod*MayTrip fields below: they are NOT in sep 2.0.4.
+	// The schema's DERControlBase carries only MustTrip and MomentaryCessation
+	// links, and the string "MayTrip" does not occur anywhere in it. They are
+	// kept because removing them would break consumers that enumerate the link
+	// set, and they are harmless on decode — a conformant server never sends
+	// them, so they simply stay nil. Nothing may treat their presence as
+	// evidence of anything, and nothing should MARSHAL them.
 	OpModHFRTMayTrip  *CurveLink `xml:"opModHFRTMayTrip,omitempty"`
 	OpModHFRTMustTrip *CurveLink `xml:"opModHFRTMustTrip,omitempty"`
 	// High-voltage ride-through curves.

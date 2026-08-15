@@ -52,12 +52,47 @@ func (t FieldType) regs(strLen int) int {
 	return 1
 }
 
+// Access is a point's spec-declared write access.
+//
+// The vendored SunSpec model JSON declares access with a single key that is
+// EITHER "RW" or ABSENT — across all 31 vendored models there is no literal
+// "r" anywhere (checked: the only two access values present in the corpus are
+// "RW" and nothing at all). Read-only is the SunSpec default for an
+// undeclared point, so the only sound comparison is RW vs not-RW; a layout
+// that asserted the string "r" would false-fail against every read-only point
+// in the corpus. AccUnset means "this layout does not declare access" — the
+// 7xx layouts predate the annotation and are compared on geometry only.
+type Access uint8
+
+const (
+	AccUnset Access = iota // layout makes no access claim
+	AccR                   // read-only (spec: access key absent)
+	AccRW                  // read/write (spec: "access": "RW")
+)
+
+// Presence is a point's spec-declared mandatory/optional status. Same shape as
+// Access: the JSON carries "mandatory": "M" or nothing at all.
+type Presence uint8
+
+const (
+	PresUnset     Presence = iota // layout makes no mandatory/optional claim
+	PresOptional                  // spec: mandatory key absent
+	PresMandatory                 // spec: "mandatory": "M"
+)
+
 // Field describes a single point in a model layout.
 type Field struct {
 	Name string
 	Type FieldType
 	SF   string // name of this point's scale-factor field; "" if unscaled
 	Len  int    // register count for Tstring / Tpad only
+
+	// Acc and Pres carry the vendored spec's access / mandatory declarations
+	// so TestLayoutsMatchVendoredSpec can prove them against the JSON rather
+	// than against a second hand-written table. Both are optional: a layout
+	// that leaves them Unset is compared on geometry alone.
+	Acc  Access
+	Pres Presence
 }
 
 // F is a terse constructor for an unscaled field.
@@ -68,6 +103,19 @@ func FS(name string, t FieldType, sf string) Field { return Field{Name: name, Ty
 
 // FStr is a terse constructor for a fixed-length string field.
 func FStr(name string, regs int) Field { return Field{Name: name, Type: Tstring, Len: regs} }
+
+// FPad is a terse constructor for a reserved (pad) field of regs registers.
+// Tpad takes its width from Field.Len, so a pad built with F() would be zero
+// registers wide and would silently shift every point after it.
+func FPad(name string, regs int) Field { return Field{Name: name, Type: Tpad, Len: regs} }
+
+// RW / R / M / O annotate a field with the spec's access and mandatory
+// declarations. They return a copy, so they chain onto the F/FS/FStr/FPad
+// constructors: F("NCrv", Tuint16).R().M().
+func (f Field) RW() Field { f.Acc = AccRW; return f }
+func (f Field) R() Field  { f.Acc = AccR; return f }
+func (f Field) M() Field  { f.Pres = PresMandatory; return f }
+func (f Field) O() Field  { f.Pres = PresOptional; return f }
 
 // Layout is a compiled, offset-indexed model description.
 type Layout struct {
