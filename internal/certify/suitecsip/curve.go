@@ -1077,6 +1077,21 @@ func (b *curveBinding) describePublished() string {
 	if b.XMult != 0 || b.YMult != 0 {
 		s += fmt.Sprintf(" (x multiplier 10^%d, y multiplier 10^%d)", b.XMult, b.YMult)
 	}
+	// vRef makes PUBLISHED and ASSERTED two different curves, and a finding that
+	// showed only the first would be quietly wrong about what the device was
+	// required to hold. IEEE Std 2030.5-2018 p.250: "If VRef is present in
+	// DERCurve, then the x value of each pair is additionally multiplied by
+	// VRef/10 000." So the row publishes these x values AND a reference, and the
+	// device must hold their product — which is what the comparison uses.
+	if b.VRef != nil && *b.VRef != 0 {
+		want := make([]string, 0, len(b.Points))
+		for _, p := range b.wantPoints() {
+			want = append(want, fmt.Sprintf("(%s, %s)", trimNum(p.X), trimNum(p.Y)))
+		}
+		s += fmt.Sprintf(", with vRef=%d — IEEE 2030.5-2018 p.250 multiplies every x by vRef/10 000, so "+
+			"the curve the DEVICE must hold is %s and it is those values this row asserts",
+			*b.VRef, strings.Join(want, " "))
+	}
 	return s
 }
 
@@ -1522,11 +1537,22 @@ func curveContentOutcome(b *curveBinding, uv invariant.UnitView, target curveTar
 	// exactly the breakpoints" over a run that also checked Crv.RspTms would
 	// understate what was measured, exactly as one that said it over a run that
 	// did NOT check it would overstate.
+	// The two qualifications COMPOSE rather than overwrite each other, and that
+	// is not cosmetic: BASIC-006 carries both an openLoopTms and (in the vRef
+	// fixtures) a reference, and the first version of this wrote `held` twice,
+	// so the second assignment silently dropped the vRef sentence — a PASS that
+	// said "holds exactly the breakpoints this row published" over a device
+	// holding the ADJUSTED ones. That is the same words a PASS would use for a
+	// device that ignored vRef entirely, which is precisely the confusion the
+	// disclosure exists to prevent.
 	held := "holds exactly the breakpoints this row published"
+	if b.VRef != nil && *b.VRef != 0 {
+		held = fmt.Sprintf("holds exactly the vRef-ADJUSTED breakpoints this row commanded (vRef=%d, so "+
+			"IEEE 2030.5-2018 p.250 multiplies each published x by vRef/10 000)", *b.VRef)
+	}
 	if want, ok := b.wantOpenLoopS(); ok && openLoopHome(target.Model) != "" {
-		held = fmt.Sprintf("holds exactly the breakpoints this row published, at the open-loop response "+
-			"time it published (openLoopTms=%d hundredths of a second = %s s, against the device's "+
-			"Crv.RspTms)", *b.OpenLoopTms, trimNum(want))
+		held += fmt.Sprintf(", at the open-loop response time it published (openLoopTms=%d hundredths of "+
+			"a second = %s s, against the device's Crv.RspTms)", *b.OpenLoopTms, trimNum(want))
 	}
 	return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
 		"the DER's own %s live curve %s, %s: %s. %s",

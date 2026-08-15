@@ -2188,6 +2188,19 @@ func TestVRef_IsVerifiedAgainstTheDeviceAtTheSCALEDBreakpoints(t *testing.T) {
 			t.Fatalf("a DER holding the vRef-scaled curve scored %s, want PASS:\n%s",
 				got.Verdict, got.Observed)
 		}
+		// THE PASS MUST SAY WHICH CURVE IT MEANS. "holds exactly the
+		// breakpoints this row published" is the sentence a device that
+		// IGNORED vRef would also earn, so a PASS over a vRef-carrying row has
+		// to name the adjustment or it is indistinguishable from the failure it
+		// is meant to exclude. (The first version of the composing logic wrote
+		// this phrase twice and the openLoopTms branch overwrote the vRef one,
+		// which is exactly how a disclosure goes missing.)
+		for _, want := range []string{"vRef-ADJUSTED", "9500", "p.250", "open-loop response time"} {
+			if !strings.Contains(got.Observed, want) {
+				t.Errorf("the vRef PASS omits %q, so it reads like a PASS over a device that ignored the "+
+					"element:\n%s", want, got.Observed)
+			}
+		}
 		t.Logf("vRef GREEN (device at 87.40/102.60 %%V), verbatim:\n  %s", got.Observed)
 	})
 
