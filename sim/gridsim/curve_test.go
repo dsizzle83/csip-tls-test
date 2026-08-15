@@ -26,6 +26,23 @@ func getXML(t *testing.T, s *Server, path string, dst any) {
 	}
 }
 
+// rawGET returns the served document as BYTES.
+//
+// It exists because an ABSENCE is not decodable: a struct field that is zero
+// says nothing about whether the element was on the wire, which is the whole
+// reason this repository's own sep+xml reader keeps the tree instead of
+// unmarshalling (internal/certify/suitecsip/sepxml.go's doc comment). A claim
+// that the server does not emit an element has to be made against the document.
+func rawGET(t *testing.T, s *Server, path string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200; body: %s", path, rec.Code, rec.Body)
+	}
+	return rec.Body.String()
+}
+
 // A curve POST must make the served /derp/0/derc carry an ExtendedDERControl
 // whose DERControlBase links the curve (opModVoltVar → the curve href), and
 // must upsert that curve into the served /derp/0/dc with the correct
@@ -106,9 +123,24 @@ func TestAdminCurve_BindsVoltVarIntoServedControl(t *testing.T) {
 			"translates into the curve bank's DeptRef, so serving the wrong one commands a "+
 			"percentage of a rating nobody nominated", got)
 	}
-	if got := dc.DERCurve[0].XRefType; got != 0 {
-		t.Errorf("xRefType = %d, want 0 (element absent) — sep 2.0.4 declares no xRefType on DERCurve, "+
-			"so this server must not put one on the wire", got)
+	// sep 2.0.4 declares NO xRefType (and no vRef) on DERCurve, so this server
+	// must not put either on the wire.
+	//
+	// This used to read `dc.DERCurve[0].XRefType != 0` — a check against a
+	// DECODED STRUCT, which cannot tell "the element was absent" from "the
+	// element was there and said zero", and which stopped compiling the moment
+	// lexa-proto dropped the phantom fields from csipmodel.DERCurve
+	// (9856710, "four phantom DERCurve elements gone"). The claim was always
+	// about the BYTES, so it is now made against the bytes: the served document
+	// must not contain the element at all. That is strictly stronger than what
+	// it replaced and it no longer depends on the shared model carrying a field
+	// for an element the standard does not define.
+	for _, phantom := range []string{"xRefType", "vRef"} {
+		if strings.Contains(rawGET(t, s, "/derp/0/dc"), "<"+phantom) {
+			t.Errorf("the served DERCurveList contains a <%s> element; sep 2.0.4 declares no such "+
+				"element on DERCurve, so a conformance bench must not put one into a document used "+
+				"to certify against that schema", phantom)
+		}
 	}
 
 	// GET /admin/status must surface the bound-curve label for the inspector.
