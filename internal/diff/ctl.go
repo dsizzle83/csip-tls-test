@@ -724,11 +724,16 @@ func RenderControl(c model.DERControlBase) string {
 	if c.OpModConnect != nil {
 		add("opModConnect=%v", *c.OpModConnect)
 	}
-	if c.OpModFixedPFInjectW != nil {
-		add("opModFixedPFInjectW=%d", c.OpModFixedPFInjectW.Value)
+	// The three children, not a magnitude: a reader of this line has to be able
+	// to tell an over-excited 0.9 from an under-excited one, and the scalar
+	// rendering this replaced could express neither (2018 p.258).
+	if pf := c.OpModFixedPFInjectW; pf != nil {
+		add("opModFixedPFInjectW={displacement=%d,excitation=%t,multiplier=%d}",
+			pf.Displacement, pf.Excitation, pf.Multiplier)
 	}
-	if c.OpModFixedPFAbsorbW != nil {
-		add("opModFixedPFAbsorbW=%d", c.OpModFixedPFAbsorbW.Value)
+	if pf := c.OpModFixedPFAbsorbW; pf != nil {
+		add("opModFixedPFAbsorbW={displacement=%d,excitation=%t,multiplier=%d}",
+			pf.Displacement, pf.Excitation, pf.Multiplier)
 	}
 	if c.OpModFixedVar != nil {
 		add("opModFixedVar{refType=%d,value=%d}", c.OpModFixedVar.RefType, c.OpModFixedVar.Value.Value)

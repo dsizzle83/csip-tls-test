@@ -408,14 +408,34 @@ func fixedVarIntent(fv model.FixedVar, n invariant.Nameplate, meas invariant.Mea
 	return in
 }
 
-func pfIntent(mode string, spc *model.SignedPerCent) Intent {
-	// A displacement power factor is carried as a signed percentage; the
-	// magnitude is the PF and the sign is the excitation sense.
-	pf := math.Abs(float64(spc.Value)) / 10000.0
+// pfIntent renders one PowerFactorWithExcitation as this family's Intent.
+//
+// IT USED TO READ A SIGNED PERCENTAGE, under the comment "the magnitude is the
+// PF and the sign is the excitation sense" — a shape lexa-proto invented and no
+// revision of 2030.5 declares (IEEE Std 2030.5-2018 p.258 gives the element
+// three mandatory children). Two consequences, and the second is the one that
+// mattered: the PF was computed as |value|/10000, which is the -4 multiplier
+// the scalar implied rather than the one the document carries, so a conformant
+// server's {900, false, -3} would have been read as 0.09 rather than 0.9 — off
+// by a factor of ten, in the direction that looks plausible. And EXCITATION was
+// inferred from a sign, so a document asserting under-excited at a positive
+// magnitude was indistinguishable from one asserting over-excited.
+//
+// Both are now read from the element itself. PF() applies the document's own
+// multiplier and is the same arithmetic the product applies at receipt.
+//
+// A REFUSED value is still an Intent, with Binding false: a control naming an
+// unusable power factor is a fact about what the head end sent, and this family
+// exists to describe what was commanded. Dropping it would make the intent list
+// silently shorter than the control.
+func pfIntent(mode string, pf *model.PowerFactorWithExcitation) Intent {
+	v, ok := pf.PF()
 	return Intent{
-		Mode: mode, Kind: KindPowerFactor, Binding: true,
-		Raw:  invariant.Q(float64(spc.Value), invariant.UnitNone),
-		Want: invariant.Q(pf, invariant.UnitPF),
+		Mode: mode, Kind: KindPowerFactor, Binding: ok,
+		// Raw is the displacement as the wire carries it, unscaled — the
+		// number a reader finds in the pcap.
+		Raw:  invariant.Q(float64(pf.Displacement), invariant.UnitNone),
+		Want: invariant.Q(v, invariant.UnitPF),
 	}
 }
 

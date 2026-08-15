@@ -139,8 +139,18 @@ func (r ResponseRequired) MarshalXMLAttr(name xml.Name) (xml.Attr, error) {
 // readings parse and they are DIFFERENT numbers:
 //
 //	<modesSupported>1048576</modesSupported>
-//	  decimal 1048576 = 0x100000 -> bit 20 (opModMaxLimW, 2018 p.252)
-//	  hex     1048576            -> over-wide: not even a 32-bit value
+//	  decimal 1048576 = 0x100000  -> bit 20 (opModMaxLimW, 2018 p.252)
+//	  hex     1048576 = 17 073 526 -> bits 1, 2, 4, 5, 6, 8, 10, 15, 18, 24:
+//	                                 TEN completely different modes
+//
+// (That second line read "over-wide: not even a 32-bit value" until 2026-08-15,
+// which is simply false — 0x1048576 is 17 073 526, comfortably inside 32 bits —
+// and it was the WEAKER claim as well as the wrong one. An over-wide value is
+// self-announcing: a reader rejects it. A value that parses cleanly under both
+// readings into two different mode sets is the whole hazard this section is
+// about, and this example is one of its sharpest instances. Found by the
+// independent bit-position oracle, whose own ambiguity fixture asserts exactly
+// this bit list.)
 //
 //	<modesSupported>132</modesSupported>
 //	  decimal 132 = 0x84   -> bits 2 and 7 (opModConnect, opModFixedW)
@@ -439,6 +449,87 @@ type SignedPerCent struct {
 	Value int16 `xml:",chardata"`
 }
 
+// PowerFactorWithExcitation is the wire type of opModFixedPFAbsorbW and
+// opModFixedPFInjectW — IEEE Std 2030.5-2018 printed p.258, referenced from
+// DERControlBase at p.248. THREE MANDATORY sub-elements:
+//
+//	displacement (UInt16 [1])                  — the PF magnitude, scaled
+//	excitation   (boolean [1])                 — true = over-excited
+//	multiplier   (PowerOfTenMultiplierType [1]) — apply 10^multiplier
+//
+// so the displacement power factor is displacement × 10^multiplier, and 0.950
+// over-excited is {displacement 950, excitation true, multiplier -3}. Identical
+// in 2030.5-2023 p.271, which adds only a wrapper
+// (PowerFactorWithExcitationControlType) carrying the new `disabled` attribute
+// — backward compatible with this element content.
+//
+// WHY IT REPLACES *SignedPerCent, AND WHY THAT TYPING WAS NEVER RIGHT UNDER ANY
+// ANCHOR (NORMATIVE_ANCHOR.md §5.1, closed here). These two elements were typed
+// `*SignedPerCent` — a bare chardata Int16 — so a conformant document's
+//
+//	<opModFixedPFInjectW><displacement>950</displacement>
+//	  <excitation>true</excitation><multiplier>-3</multiplier></opModFixedPFInjectW>
+//
+// decoded to ZERO: encoding/xml finds no character data at the element's own
+// level and leaves the Int16 at its zero value, silently. Not a partial decode,
+// not an error — a fixed power factor of 0.0000, which is not a power factor at
+// all. The defect outranked the rest of §5 the moment the capability mask
+// started advertising DERControlType bit 5 (IW15-027): the product cannot
+// advertise a mode whose conformant wire form it decodes to nothing.
+//
+// NO DECODE TOLERANCE FOR THE OLD SHAPE, deliberately. The tempting move is to
+// also accept a bare chardata value "for compatibility". There is nothing to be
+// compatible WITH: `<opModFixedPFInjectW>9500</opModFixedPFInjectW>` is not a
+// shape 2030.5-2018 declares, not one 2030.5-2023 declares, and not one the
+// vendored SEP 2.0.4 draft declares either — the draft's single opModFixedPF is
+// typed PowerFactor, itself a two-element structure. The scalar typing was this
+// package's own invention, so no server anywhere emits it, and a tolerance arm
+// would exist solely to guess at a document no implementation produces. A
+// chardata-only element now decodes to displacement 0 and is refused by the
+// consumer's plausibility gate, which is the correct treatment of a malformed
+// document.
+//
+// THE ZERO VALUE IS NOT A POWER FACTOR and callers must not treat it as one:
+// displacement 0 means "the element was absent or malformed", which is why every
+// consumer in this family gates on a plausibility check rather than reading the
+// field raw. PF() below returns ok=false for it.
+type PowerFactorWithExcitation struct {
+	Displacement uint16 `xml:"displacement"`
+	Excitation   bool   `xml:"excitation"`
+	Multiplier   int8   `xml:"multiplier"`
+}
+
+// PF returns the displacement power factor as a float (displacement ×
+// 10^multiplier) and whether the value is a usable one.
+//
+// ok is FALSE for displacement 0 (absent/malformed — see the type doc) and for a
+// resulting magnitude outside (0, 1], which is the domain of a displacement
+// power factor: |PF| > 1 is not a power factor, and a server sending one has
+// sent a value no DER can execute. Callers answer a false with a NAMED refusal
+// rather than a clamp — clamping a power factor moves reactive power to a
+// quantity the head end did not request.
+//
+// The multiplier is applied by repeated division/multiplication by ten rather
+// than math.Pow to keep the result exact for the multipliers that actually
+// occur (-4..0 in practice): math.Pow(10, -3) is not exactly 0.001, and a PF
+// that is 0.9500000000000001 fails an equality-shaped test for no reason.
+func (p PowerFactorWithExcitation) PF() (float64, bool) {
+	if p.Displacement == 0 {
+		return 0, false
+	}
+	v := float64(p.Displacement)
+	for m := p.Multiplier; m < 0; m++ {
+		v /= 10
+	}
+	for m := p.Multiplier; m > 0; m-- {
+		v *= 10
+	}
+	if v <= 0 || v > 1 {
+		return v, false
+	}
+	return v, true
+}
+
 // ActivePower represents watts with a power-of-ten multiplier.
 type ActivePower struct {
 	Multiplier int8  `xml:"multiplier"`
@@ -521,14 +612,13 @@ type DERControlBase struct {
 	OpModConnect  *bool `xml:"opModConnect,omitempty"`  // 2018 p.248
 	OpModEnergize *bool `xml:"opModEnergize,omitempty"` // 2018 p.248
 	// 2018 p.248 declares both directions as first-class elements with their own
-	// DERControlType bits (4 and 5). See ExtendedDERControlBase for the open
-	// PowerFactorWithExcitation typing item (NORMATIVE_ANCHOR.md §5.1).
-	OpModFixedPFAbsorbW *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
-	OpModFixedPFInjectW *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
-	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"` // 2018 p.248
-	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`   // 2018 p.248. SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
-	OpModMaxLimW        *PerCent       `xml:"opModMaxLimW,omitempty"`  // 2018 p.250. PerCent of setMaxW in hundredths, not watts — IW13-001.
-	RampTms             *uint16        `xml:"rampTms,omitempty"`       // 2018 p.252 — the standard's last element
+	// DERControlType bits (4 and 5), typed PowerFactorWithExcitation (p.258).
+	OpModFixedPFAbsorbW *PowerFactorWithExcitation `xml:"opModFixedPFAbsorbW,omitempty"`
+	OpModFixedPFInjectW *PowerFactorWithExcitation `xml:"opModFixedPFInjectW,omitempty"`
+	OpModFixedVar       *FixedVar                  `xml:"opModFixedVar,omitempty"` // 2018 p.248
+	OpModFixedW         *SignedPerCent             `xml:"opModFixedW,omitempty"`   // 2018 p.248. SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
+	OpModMaxLimW        *PerCent                   `xml:"opModMaxLimW,omitempty"`  // 2018 p.250. PerCent of setMaxW in hundredths, not watts — IW13-001.
+	RampTms             *uint16                    `xml:"rampTms,omitempty"`       // 2018 p.251 — the standard's last element
 
 	// ── NOT IEEE 2030.5 ──────────────────────────────────────────────────────
 	// ExpLimW/GenLimW/ImpLimW/LoadLimW are NOT IEEE 2030.5 elements in ANY

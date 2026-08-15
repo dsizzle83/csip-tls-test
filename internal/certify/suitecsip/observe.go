@@ -1310,17 +1310,80 @@ type ControlRequest struct {
 	// TargetW is opModTargetW (genuine watts, ActivePower — §1.1, already
 	// correct) on the EXTENDED control base — added by §4.2 for BASIC-014,
 	// which has no other request-surface lever for this axis.
-	TargetW        *int64 `json:"target_W,omitempty"`
-	Connect        *bool  `json:"connect,omitempty"`
-	Energize       *bool  `json:"energize,omitempty"`
-	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
-	FixedPFAbsorbW *int64 `json:"fixed_pf_absorb_pct,omitempty"`
-	FixedVarPct    *int64 `json:"fixed_var_pct,omitempty"`
+	TargetW  *int64 `json:"target_W,omitempty"`
+	Connect  *bool  `json:"connect,omitempty"`
+	Energize *bool  `json:"energize,omitempty"`
+	// The two fixed-PF axes are STRUCTURED, not magnitudes: IEEE Std
+	// 2030.5-2018 p.258 types opModFixedPFAbsorbW and opModFixedPFInjectW as
+	// PowerFactorWithExcitation with three mandatory children. They were
+	// `*int64` "fixed_pf_*_pct" until 2026-08-15, which is a shape lexa-proto
+	// invented and no revision declares — see FixedPFSettings.
+	FixedPFInjectW *FixedPFSettings `json:"fixed_pf_inject,omitempty"`
+	FixedPFAbsorbW *FixedPFSettings `json:"fixed_pf_absorb,omitempty"`
+	FixedVarPct    *int64           `json:"fixed_var_pct,omitempty"`
 	// FreqDroop is the inline opModFreqDroop element (curve plan #32). Like
 	// TargetW it lives only on the extended control base, and gridsim widens
 	// this control's storage to carry it.
 	FreqDroop *FreqDroopSettings `json:"freq_droop,omitempty"`
 }
+
+// FixedPFSettings is IEEE 2030.5-2018's PowerFactorWithExcitation as gridsim's
+// admin API takes it: all three children, in the standard's own units, every one
+// required.
+//
+// The three are VALUES, not pointers, and the JSON tags carry no omitempty —
+// the same shape FreqDroopSettings has, for the same reason. All three children
+// are [1] (2018 p.258), gridsim answers a partial element 400 rather than
+// completing it with zeros (sim/gridsim/fixedpf.go), and 0 is a meaningful
+// value for two of them; a struct that could omit one would let a row construct
+// exactly the half-authored control the server exists to refuse. Presence of the
+// ELEMENT is carried by the pointer to this struct, not by its fields.
+//
+// THE POWER FACTOR IS displacement x 10^multiplier, so CSIP CTP v1.3's Figure 8
+// Test Values — displacement 900, excitation false, multiplier -3 — are a
+// displacement power factor of 0.900, under-excited.
+type FixedPFSettings struct {
+	Displacement int64 `json:"displacement"` // UInt16, the magnitude, scaled by Multiplier
+	Excitation   bool  `json:"excitation"`   // true = over-excited
+	Multiplier   int64 `json:"multiplier"`   // PowerOfTenMultiplierType
+}
+
+// PF is the displacement power factor these three children compute to, so a row
+// and an oracle can state the number a reader recognises without either of them
+// re-deriving the scaling.
+func (s FixedPFSettings) PF() float64 {
+	v := float64(s.Displacement)
+	for m := s.Multiplier; m < 0; m++ {
+		v /= 10
+	}
+	for m := s.Multiplier; m > 0; m-- {
+		v *= 10
+	}
+	return v
+}
+
+// figure8FixedPF is CSIP CTP v1.3's Figure 8 (Fixed Power Factor Settings),
+// TEST VALUES column, child by child:
+//
+//	opModFixedPFInjectW.displacement   Default 950   Test Values 900
+//	opModFixedPFInjectW.excitation     Default false Test Values false
+//	opModFixedPFInjectW.multiplier     Default -3    Test Values -3
+//
+// which is a displacement power factor of 0.900, UNDER-excited.
+//
+// IT REPLACED `ptr(int64(95))`, and that was two defects in one literal. The
+// field was a bare magnitude because csipmodel typed the element *SignedPerCent
+// — a shape no revision of 2030.5 declares (2018 p.258 gives it three mandatory
+// children) — so every fixed-PF control this suite published was a document a
+// conformant client decodes to ZERO. And 95 is not Figure 8's number under any
+// reading of that scalar: as hundredths of a percent it is 0.0095, as the -4
+// multiplier the scalar implied it is 0.0095 again, and the procedure prints
+// 0.900. The row was publishing neither the standard's shape nor the catalog's
+// value.
+//
+// Stated ONCE and shared, so the fixed-PF rows cannot drift apart the way they
+// could while each carried its own literal.
+var figure8FixedPF = FixedPFSettings{Displacement: 900, Excitation: false, Multiplier: -3}
 
 // PostControl publishes a DERControl and returns the mRID gridsim assigned.
 //

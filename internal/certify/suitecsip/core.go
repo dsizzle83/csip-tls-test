@@ -466,7 +466,7 @@ func coreAdvancedDERProgram(ctx context.Context, rc *certify.RunCtx) (certify.Re
 				mrid := fmt.Sprintf("CERT-CORE013-%d", p)
 				if _, err := d.PostControl(ctx, ControlRequest{
 					Program: p, MRID: mrid, Description: "CORE-013 fixed PF control",
-					StartOffset: 60 * (p + 1), DurationS: 30, FixedPFInjectW: ptr(int64(95)),
+					StartOffset: 60 * (p + 1), DurationS: 30, FixedPFInjectW: &figure8FixedPF,
 				}); err != nil {
 					return err
 				}

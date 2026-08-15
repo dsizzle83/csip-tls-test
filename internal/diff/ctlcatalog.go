@@ -235,8 +235,14 @@ func CtlCatalog() []CtlCase {
 			Title: "opModEnergize and opModFixedPFInjectW — coverage marker",
 			Spec:  Bench702(),
 			Ctrl: model.DERControlBase{
-				OpModEnergize:       boolp(true),
-				OpModFixedPFInjectW: spc(9500),
+				OpModEnergize: boolp(true),
+				// 0.950 over-excited, as IEEE Std 2030.5-2018 p.258 shapes it.
+				// This was `spc(9500)` — a bare Int16 in an element the standard
+				// gives three mandatory children, which decoded to zero on any
+				// conformant reader.
+				OpModFixedPFInjectW: &model.PowerFactorWithExcitation{
+					Displacement: 950, Excitation: true, Multiplier: -3,
+				},
 			},
 		},
 	}

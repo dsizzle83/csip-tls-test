@@ -745,7 +745,7 @@ func TestInverterControlSpec_NonOracleRowUnaffected(t *testing.T) {
 	ctx := context.Background()
 
 	m := scalarMode("opModFixedPFInjectW", func(r *ControlRequest) {
-		r.FixedPFInjectW = ptr(int64(95))
+		r.FixedPFInjectW = &figure8FixedPF
 	})
 	s := inverterControlSpec(m, "a fixed power factor while injecting", "CERT-LIFECYCLE-BASIC008")
 
@@ -975,7 +975,7 @@ func TestInverterControlSpec_OracleVerdictReachesTheCaseVerdict(t *testing.T) {
 	}
 	// Every non-oracled row is untouched: no live verdict declaration at all.
 	plain := inverterControlSpec(scalarMode("opModFixedPFInjectW", func(r *ControlRequest) {
-		r.FixedPFInjectW = ptr(int64(95))
+		r.FixedPFInjectW = &figure8FixedPF
 	}), "a fixed power factor while injecting", "CERT-VERDICT-PLAIN")
 	if plain.Verdict != nil {
 		t.Fatal("a non-oracled row declared a live verdict; this route belongs to the oracled rows alone")

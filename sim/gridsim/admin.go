@@ -164,12 +164,16 @@ type adminBaseInfo struct {
 	// TargetW is opModTargetW (genuine watts, ActivePower — §1.1) — only ever
 	// set on an ExtendedDERControlBase (extBaseToInfo, curve.go); baseToInfo's
 	// scalar DERControlBase has no such field to read at all.
-	TargetW        *int64 `json:"target_W,omitempty"`
-	Connect        *bool  `json:"connect,omitempty"`
-	Energize       *bool  `json:"energize,omitempty"`
-	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
-	FixedPFAbsorbW *int64 `json:"fixed_pf_absorb_pct,omitempty"`
-	FixedVarPct    *int64 `json:"fixed_var_pct,omitempty"`
+	TargetW  *int64 `json:"target_W,omitempty"`
+	Connect  *bool  `json:"connect,omitempty"`
+	Energize *bool  `json:"energize,omitempty"`
+	// The two fixed-PF axes are STRUCTURED elements, not magnitudes — IEEE Std
+	// 2030.5-2018 p.258, PowerFactorWithExcitation. They were `*int64`
+	// "fixed_pf_*_pct" until 2026-08-15; see fixedpf.go for why a bare number
+	// cannot carry two of the three mandatory children.
+	FixedPFInjectW *adminFixedPFInfo `json:"fixed_pf_inject,omitempty"`
+	FixedPFAbsorbW *adminFixedPFInfo `json:"fixed_pf_absorb,omitempty"`
+	FixedVarPct    *int64            `json:"fixed_var_pct,omitempty"`
 	// FreqDroop is opModFreqDroop's five inline parameters (freqdroop.go).
 	// Like TargetW it exists only on an ExtendedDERControlBase, so only
 	// extBaseToInfo and the extended DefaultDERControl ever set it; the scalar
@@ -439,14 +443,8 @@ func baseToInfo(b model.DERControlBase) adminBaseInfo {
 		v := int64(b.OpModFixedW.Value)
 		info.FixedW = &v
 	}
-	if b.OpModFixedPFInjectW != nil {
-		v := int64(b.OpModFixedPFInjectW.Value)
-		info.FixedPFInjectW = &v
-	}
-	if b.OpModFixedPFAbsorbW != nil {
-		v := int64(b.OpModFixedPFAbsorbW.Value)
-		info.FixedPFAbsorbW = &v
-	}
+	info.FixedPFInjectW = fixedPFToInfo(b.OpModFixedPFInjectW)
+	info.FixedPFAbsorbW = fixedPFToInfo(b.OpModFixedPFAbsorbW)
 	if b.OpModFixedVar != nil {
 		v := int64(b.OpModFixedVar.Value.Value)
 		info.FixedVarPct = &v
@@ -528,12 +526,21 @@ type adminCtrlReq struct {
 	// Added by §4.2 specifically for BASIC-014, which previously had no
 	// request-surface lever for this axis at all and rode the wrong FixedW
 	// field instead; mirrors ExpLimW's own watts shape.
-	TargetW        *int64 `json:"target_W,omitempty"`
-	Connect        *bool  `json:"connect,omitempty"`
-	Energize       *bool  `json:"energize,omitempty"`
-	FixedPFInjectW *int64 `json:"fixed_pf_inject_pct,omitempty"`
-	FixedPFAbsorbW *int64 `json:"fixed_pf_absorb_pct,omitempty"`
-	FixedVarPct    *int64 `json:"fixed_var_pct,omitempty"`
+	TargetW  *int64 `json:"target_W,omitempty"`
+	Connect  *bool  `json:"connect,omitempty"`
+	Energize *bool  `json:"energize,omitempty"`
+	// The two fixed-PF axes, each a PowerFactorWithExcitation with three
+	// mandatory children (IEEE Std 2030.5-2018 p.258 — see fixedpf.go for the
+	// whole-or-nothing rule and why the retired scalar is refused rather than
+	// translated).
+	FixedPFInjectW *fixedPFReq `json:"fixed_pf_inject,omitempty"`
+	FixedPFAbsorbW *fixedPFReq `json:"fixed_pf_absorb,omitempty"`
+	// The retired scalar fields, trapped so a caller still sending one is told
+	// rather than silently served a control with no PF element at all. Pointers,
+	// so "absent" and "sent as 0" stay distinguishable.
+	FixedPFInjectPctGone *int64 `json:"fixed_pf_inject_pct,omitempty"`
+	FixedPFAbsorbPctGone *int64 `json:"fixed_pf_absorb_pct,omitempty"`
+	FixedVarPct          *int64 `json:"fixed_var_pct,omitempty"`
 	// FreqDroop is opModFreqDroop's five inline parameters (curve plan #32 —
 	// freqdroop.go for units, the whole-or-nothing rule and the ordering note).
 	// Like TargetW it exists ONLY on the extended control base, so a request
@@ -634,6 +641,11 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	injectPF, absorbPF, err := req.fixedPF()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if req.DurationS <= 0 {
 		req.DurationS = 300
 	}
@@ -698,7 +710,7 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		},
 		RandomizeStart:    req.RandomizeStart,
 		RandomizeDuration: req.RandomizeDuration,
-		DERControlBase:    buildBase(req),
+		DERControlBase:    buildBase(req, injectPF, absorbPF),
 	}
 
 	// IW13-001 §4.2: opModTargetW only exists on the EXTENDED control base —
@@ -961,9 +973,46 @@ func (s *Server) adminCtrlDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// fixedPF validates BOTH fixed-PF elements of a request and renders them, or
+// returns the reason one of them cannot be authored.
+//
+// It also traps the RETIRED scalar fields. A caller still sending
+// fixed_pf_inject_pct gets a 400 naming the replacement, never a silently
+// PF-less control: the old field named a real axis, so dropping it quietly
+// would publish a control that commands nothing where the operator asked for a
+// power factor, and the row grading it would report on a condition the DUT was
+// never offered. Same rule that retired x_ref_type.
+func (req adminCtrlReq) fixedPF() (inject, absorb *model.PowerFactorWithExcitation, err error) {
+	if req.FixedPFInjectPctGone != nil {
+		return nil, nil, fixedPFScalarGone("fixed_pf_inject_pct", fixedPFInjectElement)
+	}
+	if req.FixedPFAbsorbPctGone != nil {
+		return nil, nil, fixedPFScalarGone("fixed_pf_absorb_pct", fixedPFAbsorbElement)
+	}
+	// ONE validator for both axes, so the two cannot drift into different rules
+	// about the same wire type.
+	if inject, err = req.FixedPFInjectW.toModel(fixedPFInjectElement); err != nil {
+		return nil, nil, err
+	}
+	if absorb, err = req.FixedPFAbsorbW.toModel(fixedPFAbsorbElement); err != nil {
+		return nil, nil, err
+	}
+	return inject, absorb, nil
+}
+
 // buildBase constructs a DERControlBase from an adminCtrlReq.
 // Only fields that are non-nil in the request are set.
-func buildBase(req adminCtrlReq) model.DERControlBase {
+//
+// THE TWO FIXED-PF ELEMENTS ARRIVE ALREADY VALIDATED, as parameters rather than
+// off req, and that is a type-level guarantee rather than a convention: they are
+// the one part of a control base this server can REFUSE to author (three
+// mandatory children, a domain on each, and a product that must land in (0,1] —
+// fixedpf.go), and refusing belongs in the handler where a 400 can be written.
+// Reading them off req here would let a future caller build a base from an
+// unvalidated request and serve a document the product correctly rejects, which
+// is the whole defect class this wave exists to close. Same shape as
+// opModFreqDroop, which the handlers likewise validate before the store.
+func buildBase(req adminCtrlReq, injectPF, absorbPF *model.PowerFactorWithExcitation) model.DERControlBase {
 	b := model.DERControlBase{
 		OpModConnect:  req.Connect,
 		OpModEnergize: req.Energize,
@@ -979,12 +1028,8 @@ func buildBase(req adminCtrlReq) model.DERControlBase {
 	b.OpModGenLimW = apFromWatts(req.GenLimW)
 	b.OpModLoadLimW = apFromWatts(req.LoadLimW)
 	b.OpModFixedW = signedPercentFromHundredths(req.FixedW)
-	if req.FixedPFInjectW != nil {
-		b.OpModFixedPFInjectW = &model.SignedPerCent{Value: int16(*req.FixedPFInjectW)}
-	}
-	if req.FixedPFAbsorbW != nil {
-		b.OpModFixedPFAbsorbW = &model.SignedPerCent{Value: int16(*req.FixedPFAbsorbW)}
-	}
+	b.OpModFixedPFInjectW = injectPF
+	b.OpModFixedPFAbsorbW = absorbPF
 	if req.FixedVarPct != nil {
 		b.OpModFixedVar = &model.FixedVar{
 			// DERUnitRefType 2 = %setMaxVar — see the identical correction in
@@ -1125,6 +1170,11 @@ func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	injectPF, absorbPF, err := req.Base.fixedPF()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	droop, err := req.Base.FreqDroop.toModel()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1133,7 +1183,7 @@ func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	path := fmt.Sprintf("/derp/%d/dderc", req.Program)
-	s.putDefaultBaseLocked(path, req, droop)
+	s.putDefaultBaseLocked(path, req, droop, injectPF, absorbPF)
 	s.mu.Unlock()
 
 	s.notifyChanged(path)
@@ -1173,7 +1223,8 @@ func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
 // Figure in this catalog prescribes opModTargetW on a DefaultDERControl, so no
 // lever is built for it here; closing it means giving buildBase an extended
 // sibling, not special-casing this path.
-func (s *Server) putDefaultBaseLocked(path string, req adminDefaultReq, droop *model.FreqDroop) {
+func (s *Server) putDefaultBaseLocked(path string, req adminDefaultReq, droop *model.FreqDroop,
+	injectPF, absorbPF *model.PowerFactorWithExcitation) {
 	var res model.Resource
 	var mrid, desc string
 	var version uint16
@@ -1193,12 +1244,12 @@ func (s *Server) putDefaultBaseLocked(path string, req adminDefaultReq, droop *m
 			Resource: res, MRID: mrid, Description: desc, Version: version,
 		}
 		if !req.Clear {
-			narrow.DERControlBase = buildBase(req.Base)
+			narrow.DERControlBase = buildBase(req.Base, injectPF, absorbPF)
 		}
 		s.resources[path] = narrow
 		return
 	}
-	base := scalarBaseToExtended(buildBase(req.Base))
+	base := scalarBaseToExtended(buildBase(req.Base, injectPF, absorbPF))
 	base.OpModFreqDroop = droop
 	s.resources[path] = &model.ExtendedDefaultDERControl{
 		Resource: res, MRID: mrid, Description: desc, Version: version, DERControlBase: base,

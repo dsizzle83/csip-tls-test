@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2056,4 +2057,198 @@ func unmappableClause(observed string) string {
 		return ""
 	}
 	return observed[i:]
+}
+
+// ── DERCurve.vRef, end to end ───────────────────────────────────────────────
+
+// vrefBinding is BASIC-006's volt-var binding with a vRef hung on it: 9500
+// (95.00 %) over breakpoints at 9200 and 10800, so
+// 9200 x 9500/10000 = 8740 and 10800 x 9500/10000 = 10260.
+//
+// THE REVIEW'S OWN SHAPE WAS vRef 10500, AND IT IS NOT A CONFORMANT VALUE.
+// lexa-gw's review of the downstream wave proposed "a volt-var DERCurve with
+// vRef=10500 and breakpoints at 9200/10800 ... the intended 96.6 %/113.4 %".
+// vRef is a PerCent (2018 p.253), and 2018 p.167 states that type's domain in
+// its own sentence: "Used for percentages, specified in hundredths of a percent,
+// 0 to 10 000. (10 000 = 100%)". 10500 is 105 %, outside it — so a server
+// sending it is sending a value the type does not admit, and this bench refuses
+// to serve one (sim/gridsim/curve.go's vrefFamily, which is what caught it: the
+// first draft of this test used 10500 and got a 400 quoting p.167 back).
+//
+// The arithmetic the review was demonstrating is unaffected and is exactly what
+// is asserted below; only the number moves into the domain the standard states.
+// That vRef can therefore only ever SHRINK the x axis is a property of the type,
+// not of this fixture.
+func vrefBinding() *curveBinding {
+	b := *basic006Binding() // copy: the shipping row must not gain a vRef
+	v := uint16(9500)
+	b.VRef = &v
+	b.Points = []CurvePoint{{X: 9200, Y: 3000}, {X: 10800, Y: -3000}}
+	return &b
+}
+
+// TestVRef_OutsidePerCentsDomainIsRefusedByTheBench pins what caught the
+// review's shape, so the bound is a checked rule rather than a lucky 400.
+//
+// A conformance bench must not put a value on the wire that the element's own
+// type does not admit — the evidence would be about a document no conformant
+// server produces. Note that this is a bound the BENCH enforces: lexa-gw's
+// ingest applies whatever vRef arrives (its only guard is int32 overflow), so
+// the product would scale by 6.5x for a vRef of 65535 rather than refuse it.
+// That is a finding about the product, relayed rather than acted on here.
+func TestVRef_OutsidePerCentsDomainIsRefusedByTheBench(t *testing.T) {
+	f := newCurveFixture(t)
+	d, _ := f.withGridSimServer(t)
+	b := *vrefBinding()
+	over := uint16(10500)
+	b.VRef = &over
+	err := publishCurveControl(context.Background(), d, map[string]string{}, &b, "CERT-VREF-OVER")
+	if err == nil {
+		t.Fatal("the bench published a vRef of 10500. IEEE Std 2030.5-2018 p.167 gives PerCent the " +
+			"domain 0 to 10 000, so 105 % is not a value the element admits and serving it would put a " +
+			"non-conformant document into evidence")
+	}
+	for _, want := range []string{"PerCent", "10000", "p.167"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not cite the domain (missing %q): %v", want, err)
+		}
+	}
+}
+
+// TestVRef_ScalesTheExpectedBreakpointsFromTheStandardsSentence is the
+// arithmetic, asserted against numbers written out by hand.
+//
+// It exists separately from the device-level test below because the two can
+// fail for different reasons and a reader has to be able to tell them apart:
+// this one says "the oracle expects the wrong voltages", the next says "the
+// device holds the wrong voltages".
+func TestVRef_ScalesTheExpectedBreakpointsFromTheStandardsSentence(t *testing.T) {
+	got := vrefBinding().wantPoints()
+	// XMult is -2 on this row, so the raw 9660/11340 land at 96.60/113.40 %V.
+	want := []invariant.CurvePoint{{X: 87.40, Y: 30.00}, {X: 102.60, Y: -30.00}}
+	if len(got) != len(want) {
+		t.Fatalf("wantPoints() returned %d points, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if math.Abs(got[i].X-want[i].X) > 0.001 || math.Abs(got[i].Y-want[i].Y) > 0.001 {
+			t.Errorf("breakpoint %d = %s, want %s. IEEE Std 2030.5-2018 p.250: \"If VRef is present in "+
+				"DERCurve, then the x value of each pair is additionally multiplied by VRef/10 000\" — "+
+				"9200 x 9500/10000 = 8740 and 10800 x 9500/10000 = 10260, at 10^-2",
+				i+1, got[i], want[i])
+		}
+	}
+	// THE WRONG ANSWER, NAMED. A referee that ignored vRef would expect the
+	// published 92.00/108.00, and a device that ignored it would hold them. The
+	// two failures are indistinguishable from a green run, which is why the
+	// unscaled values are asserted to be ABSENT rather than merely different.
+	for _, wrong := range []float64{92.00, 108.00} {
+		for _, p := range got {
+			if math.Abs(p.X-wrong) < 0.001 {
+				t.Errorf("wantPoints() still expects the UNSCALED x %.2f. That is the curve the head end "+
+					"published, not the curve it commanded: with vRef present the device must hold the "+
+					"multiplied values, and a referee expecting these would pass a DER that dropped the "+
+					"element on the floor", wrong)
+			}
+		}
+	}
+	// And with no vRef the same row is unscaled — so the scaling is the
+	// ELEMENT's effect and not something wantPoints does to every curve.
+	plain := *vrefBinding()
+	plain.VRef = nil
+	for i, p := range plain.wantPoints() {
+		if math.Abs(p.X-[]float64{92.00, 108.00}[i]) > 0.001 {
+			t.Errorf("without a vRef, breakpoint %d = %s; the published x values must pass through "+
+				"untouched", i+1, p)
+		}
+	}
+}
+
+// TestVRef_IsVerifiedAgainstTheDeviceAtTheSCALEDBreakpoints is the end-to-end
+// half: a DER that adopted the curve at the multiplied voltages PASSES, and one
+// that adopted it at the published voltages — the exact shape of a gateway that
+// decoded vRef and ignored it — FAILS.
+//
+// The second half is the one that matters. Before lexa-gw 675ffdf the product
+// decoded vRef into a field nothing read, so it would have written the unscaled
+// curve and reported adopted; the read-back hash could not see it, because the
+// hash carries the document's own points at both ends. This is the check that
+// can.
+func TestVRef_IsVerifiedAgainstTheDeviceAtTheSCALEDBreakpoints(t *testing.T) {
+	b := vrefBinding()
+
+	t.Run("a DER holding the scaled curve passes", func(t *testing.T) {
+		f := newCurveFixture(t)
+		pts := make([]sunspec.VVPoint, 0, len(b.Points))
+		for _, p := range b.wantPoints() {
+			pts = append(pts, sunspec.VVPoint{V: p.X, Var: p.Y})
+		}
+		f.adoptVoltVar(t, basic006DeptRef(t), pts)
+		got := oracleCurve(b)(context.Background(), f.rc)
+		if got.Verdict != certify.Pass {
+			t.Fatalf("a DER holding the vRef-scaled curve scored %s, want PASS:\n%s",
+				got.Verdict, got.Observed)
+		}
+		t.Logf("vRef GREEN (device at 87.40/102.60 %%V), verbatim:\n  %s", got.Observed)
+	})
+
+	t.Run("a DER holding the unscaled curve fails", func(t *testing.T) {
+		f := newCurveFixture(t)
+		// The published breakpoints, NOT the scaled ones: a gateway that read
+		// vRef and did nothing with it.
+		var pts []sunspec.VVPoint
+		for _, p := range b.Points {
+			pts = append(pts, sunspec.VVPoint{
+				V: applyMult(p.X, b.XMult), Var: applyMult(p.Y, b.YMult),
+			})
+		}
+		f.adoptVoltVar(t, basic006DeptRef(t), pts)
+		got := oracleCurve(b)(context.Background(), f.rc)
+		if got.Verdict != certify.Fail {
+			t.Fatalf("a DER that ignored vRef and held the PUBLISHED breakpoints scored %s, want FAIL. "+
+				"IEEE Std 2030.5-2018 p.250 makes the element multiply the x axis, so this device is "+
+				"regulating volt-var at 92/108 %%V where the head end commanded 87.4/102.6 — a 4.6 "+
+				"percentage-point error in where the curve sits, reported as adopted:\n%s",
+				got.Verdict, got.Observed)
+		}
+		// The finding must show BOTH curves, or a reader cannot see that the
+		// difference is the reference and not the shape.
+		for _, want := range []string{"87.4", "92"} {
+			if !strings.Contains(got.Observed, want) {
+				t.Errorf("the FAIL does not quote %q, so a reader cannot see the commanded curve beside "+
+					"the held one:\n%s", want, got.Observed)
+			}
+		}
+		t.Logf("vRef RED (device at the unscaled 92/108 %%V), verbatim:\n  %s", got.Observed)
+	})
+}
+
+// TestVRef_IsServedOnTheWireByTheRowThatAuthorsIt closes the loop at the other
+// end: the element the oracle assumes is on the wire actually is.
+//
+// An oracle that scaled its expectation while the bench served no vRef would
+// fail every correct device, and nothing in the two tests above would notice —
+// they both build their expectation from the same binding.
+func TestVRef_IsServedOnTheWireByTheRowThatAuthorsIt(t *testing.T) {
+	f := newCurveFixture(t)
+	d, gs := f.withGridSimServer(t)
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := publishCurveControl(context.Background(), d, params, vrefBinding(), "CERT-VREF"); err != nil {
+		t.Fatalf("publish the vRef-carrying curve: %v", err)
+	}
+	raw := servedByGridSim(t, gs, "/derp/0/dc/0")
+	if !strings.Contains(raw, "<vRef>9500</vRef>") {
+		t.Errorf("the published DERCurve carries no vRef, so the oracle would be scaling its "+
+			"expectation against a document that never asked for it:\n%s", raw)
+	}
+	// The PUBLISHED breakpoints stay unscaled on the wire: the scaling is the
+	// DEVICE's to apply, and a bench that pre-multiplied them would be sending a
+	// different curve AND a vRef, scaling twice.
+	if !strings.Contains(raw, "<xvalue>9200</xvalue>") {
+		t.Errorf("the published breakpoints are not the row's own: this bench must send the curve and "+
+			"the reference, not the product of the two:\n%s", raw)
+	}
+	if strings.Contains(raw, "<xvalue>8740</xvalue>") {
+		t.Errorf("the bench pre-multiplied the breakpoints by vRef AND served the element, which "+
+			"commands the scaling twice:\n%s", raw)
+	}
 }

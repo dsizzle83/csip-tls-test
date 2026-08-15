@@ -202,7 +202,7 @@ func (m aggMode) apply(r *ControlRequest) {
 	case modeFixedW:
 		r.FixedW = ptr(int64(50))
 	default:
-		r.FixedPFInjectW = ptr(int64(95))
+		r.FixedPFInjectW = &figure8FixedPF
 	}
 }
 
@@ -1287,7 +1287,7 @@ func utilDERRetrievalSpec(mrid string) spec {
 		Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
 			_, err := d.PostControl(ctx, ControlRequest{
 				Program: progTFA, MRID: mrid, Description: "UTIL-004 scoped control",
-				StartOffset: 120, DurationS: 120, FixedPFInjectW: ptr(int64(95)),
+				StartOffset: 120, DurationS: 120, FixedPFInjectW: &figure8FixedPF,
 			})
 			params["mrid"] = mrid
 			return err

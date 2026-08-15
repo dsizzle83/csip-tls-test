@@ -724,7 +724,7 @@ func inverterControlRows() []inverterControlRow {
 		}), "a Volt-VAr curve"},
 		{"BASIC-007", 53, unreachableMode("setGradW", noRampRate), "the ramp-rate settings"},
 		{"BASIC-008", 54, scalarMode("opModFixedPFInjectW", func(r *ControlRequest) {
-			r.FixedPFInjectW = ptr(int64(95))
+			r.FixedPFInjectW = &figure8FixedPF
 		}), "a fixed power factor while injecting"},
 		{"BASIC-009", 55, scalarMode("opModConnect", func(r *ControlRequest) {
 			r.Connect = ptr(false)

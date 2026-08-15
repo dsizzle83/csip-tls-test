@@ -179,6 +179,24 @@ type curveBinding struct {
 	AutonomousVRefEnable       *bool
 	AutonomousVRefTimeConstant *uint32
 
+	// VRef is DERCurve.vRef — PerCent, hundredths of a percent (IEEE Std
+	// 2030.5-2018 p.253), opModVoltVar-only. nil omits the element.
+	//
+	// IT IS THE ONE AUTHORED ELEMENT THAT CHANGES WHAT THE DEVICE MUST HOLD.
+	// 2018 p.250, under opModVoltVar: "If VRef is present in DERCurve, then the
+	// x value of each pair is additionally multiplied by VRef/10 000." So a row
+	// that publishes a vRef is publishing a curve at DIFFERENT VOLTAGES than
+	// its breakpoints read, and wantPoints() applies the same multiplication
+	// before the oracle compares — see there for why that is derived from the
+	// standard's sentence rather than from the product's code.
+	//
+	// A bench that served a vRef and expected the UNSCALED points would fail a
+	// correct device; one that served it and expected the unscaled points to be
+	// held would pass a device that ignored the element entirely. Both are the
+	// same defect from opposite sides, and both are what this field exists to
+	// make impossible.
+	VRef *uint16
+
 	// Droop, when set, is an INLINE opModFreqDroop element this row authors on
 	// the SAME control that carries the curve link, and the register home its
 	// five parameters must be found in per generation.
@@ -565,6 +583,23 @@ func (b *curveBinding) authored() []authoredElement {
 	// automation, written by the DER's settings rather than by a curve. Grading
 	// a DERCurve element against it would be the substitution this suite
 	// refuses, so the row says so instead.
+	if b.VRef != nil {
+		// vRef is the one member of this family with a southbound assertion, and
+		// it is the STRONGEST kind: it does not land in a register of its own,
+		// it moves the breakpoints, so wantPoints() folds it in and the ordinary
+		// point comparison measures it on BOTH generations. Saying "no register
+		// home" here would be true and misleading — a reader would take it as
+		// "not asserted", and it is asserted harder than anything else the row
+		// authors.
+		out = append(out, authoredElement{
+			Element: "DERCurve.vRef",
+			Value: fmt.Sprintf("%d (hundredths of a percent) — IEEE 2030.5-2018 p.250 multiplies every "+
+				"published x by vRef/10 000, so the breakpoints this row asserts on the device are the "+
+				"SCALED ones, not the ones printed above", *b.VRef),
+			Home7xx:    "the curve bank's own point table (the scaling is folded into the expected x values)",
+			HomeLegacy: "the curve bank's own point table (the scaling is folded into the expected x values)",
+		})
+	}
 	if b.AutonomousVRefEnable != nil {
 		out = append(out, authoredElement{
 			Element:   "DERCurve.autonomousVRefEnable",
@@ -867,11 +902,50 @@ func (b *curveBinding) wantPoints() []invariant.CurvePoint {
 	out := make([]invariant.CurvePoint, 0, len(b.Points))
 	for _, p := range b.Points {
 		out = append(out, invariant.CurvePoint{
-			X: applyMult(p.X, b.XMult),
+			X: applyMult(b.scaledX(p.X), b.XMult),
 			Y: applyMult(p.Y, b.YMult),
 		})
 	}
 	return out
+}
+
+// scaledX applies DERCurve.vRef to one published x value, which is the whole of
+// what IEEE Std 2030.5-2018 p.250 says about it:
+//
+//	"If VRef is present in DERCurve, then the x value of each pair is
+//	 additionally multiplied by VRef/10 000."
+//
+// DERIVED FROM THAT SENTENCE, not from the product. lexa-gw applies the same
+// adjustment in its authority (applyVRef, internal/authority/csipin_curves.go)
+// and this referee must not read it: an oracle that computed its expectation
+// with the product's own expression would agree with the product however wrong
+// both were, which is the IW15-011 shared-oracle blindness one arithmetic step
+// further down than the bit tables.
+//
+// ROUNDING IS NOT SPECIFIED BY THE STANDARD, and this rounds half away from
+// zero — the ordinary convention, and the one that keeps a symmetric curve
+// symmetric. A device (or a product) that rounds half-to-even instead differs by
+// at most one raw unit on a point that lands exactly on .5, which the caller's
+// own per-value tolerance absorbs; MatchPoints takes that tolerance as a
+// function precisely because a rounding step is a property of the scale in play.
+// The oracle therefore does NOT turn a rounding convention into a conformance
+// verdict, while still catching the failure that matters: a device holding the
+// UNSCALED curve, which for any vRef worth sending is off by percent, not by a
+// unit.
+//
+// Y IS UNTOUCHED. The sentence is about the x value of each pair, and a volt-var
+// curve's y axis is a reactive-power percentage whose base is yRefType — nothing
+// to do with the voltage reference. Scaling both would be a plausible-looking
+// error that no test comparing only shapes would catch.
+func (b *curveBinding) scaledX(x float64) float64 {
+	if b.VRef == nil || *b.VRef == 0 {
+		return x
+	}
+	scaled := x * float64(*b.VRef) / 10000
+	if scaled >= 0 {
+		return math.Floor(scaled + 0.5)
+	}
+	return math.Ceil(scaled - 0.5)
 }
 
 // wantDeptRef translates the yRefType this row PUBLISHES into the SunSpec
@@ -1687,6 +1761,7 @@ func publishCurveControl(ctx context.Context, d *Driver, params map[string]strin
 		// rather than quietly on the wire.
 		AutonomousVRefEnable:       b.AutonomousVRefEnable,
 		AutonomousVRefTimeConstant: b.AutonomousVRefTimeConstant,
+		VRef:                       vrefRequest(b.VRef),
 		FreqDroop:                  droopSettings(b.Droop),
 		Description:                "certify " + b.Mode,
 		// The oracled window, not curveMode's old 180 s: the PostWait oracle
@@ -2825,4 +2900,20 @@ func critEffectBlockedByAuthoringGap(subject, element string) criterion {
 			return Finding{Verdict: certify.Fail, Observed: observed}
 		},
 	}
+}
+
+// vrefRequest renders a binding's authored vRef into the admin request's own
+// width, or nil to omit the element.
+//
+// The widening is deliberate: gridsim takes a SIGNED int64 so it can refuse an
+// out-of-domain value in the standard's vocabulary (PerCent is 0..10 000, 2018
+// p.167) rather than letting encoding/json answer with a Go type name. A row
+// cannot construct an out-of-domain value — curveBinding.VRef is a *uint16 — but
+// the request type is shared with hand-written admin calls that can.
+func vrefRequest(v *uint16) *int64 {
+	if v == nil {
+		return nil
+	}
+	n := int64(*v)
+	return &n
 }

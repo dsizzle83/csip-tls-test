@@ -1005,11 +1005,26 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.requireCtrlModes("opModFixedPFInjectW", modeFixedPF); err != nil {
 			return nil, err
 		}
-		pf := math.Abs(float64(ctrl.OpModFixedPFInjectW.Value)) / 10000.0
+		// 2018 p.258: the element is PowerFactorWithExcitation — displacement x
+		// 10^multiplier for the magnitude, and a first-class `excitation`
+		// boolean for the direction. It used to be read as a SignedPerCent whose
+		// SIGN carried the excitation, which was this package's own invention:
+		// no revision of the standard encodes excitation in a sign, and a
+		// conformant document decoded to displacement 0 (see
+		// csipmodel.PowerFactorWithExcitation). PF() answers false for that zero
+		// and for any magnitude outside (0,1], and a false is refused here by
+		// name rather than clamped — clamping a power factor moves reactive
+		// power to a quantity the head end did not request.
+		pf, ok := ctrl.OpModFixedPFInjectW.PF()
+		if !ok {
+			return nil, &InvalidControlError{Axis: "opModFixedPFInjectW",
+				Reason: fmt.Sprintf("displacement %d x 10^%d = %.4f is not a displacement power factor in (0,1]",
+					ctrl.OpModFixedPFInjectW.Displacement, ctrl.OpModFixedPFInjectW.Multiplier, pf)}
+		}
 		if err := b.validatePF(pf, "opModFixedPFInjectW"); err != nil {
 			return nil, err
 		}
-		over := ctrl.OpModFixedPFInjectW.Value >= 0
+		over := ctrl.OpModFixedPFInjectW.Excitation
 		add("opModFixedPFInjectW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetFixedPF(true, pf, over, tag) })
 	}
 	if ctrl.OpModFixedPFAbsorbW != nil {
@@ -1019,11 +1034,26 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.requireCtrlModes("opModFixedPFAbsorbW", modeFixedPF); err != nil {
 			return nil, err
 		}
-		pf := math.Abs(float64(ctrl.OpModFixedPFAbsorbW.Value)) / 10000.0
+		// 2018 p.258: the element is PowerFactorWithExcitation — displacement x
+		// 10^multiplier for the magnitude, and a first-class `excitation`
+		// boolean for the direction. It used to be read as a SignedPerCent whose
+		// SIGN carried the excitation, which was this package's own invention:
+		// no revision of the standard encodes excitation in a sign, and a
+		// conformant document decoded to displacement 0 (see
+		// csipmodel.PowerFactorWithExcitation). PF() answers false for that zero
+		// and for any magnitude outside (0,1], and a false is refused here by
+		// name rather than clamped — clamping a power factor moves reactive
+		// power to a quantity the head end did not request.
+		pf, ok := ctrl.OpModFixedPFAbsorbW.PF()
+		if !ok {
+			return nil, &InvalidControlError{Axis: "opModFixedPFAbsorbW",
+				Reason: fmt.Sprintf("displacement %d x 10^%d = %.4f is not a displacement power factor in (0,1]",
+					ctrl.OpModFixedPFAbsorbW.Displacement, ctrl.OpModFixedPFAbsorbW.Multiplier, pf)}
+		}
 		if err := b.validatePF(pf, "opModFixedPFAbsorbW"); err != nil {
 			return nil, err
 		}
-		over := ctrl.OpModFixedPFAbsorbW.Value >= 0
+		over := ctrl.OpModFixedPFAbsorbW.Excitation
 		add("opModFixedPFAbsorbW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetFixedPF(false, pf, over, tag) })
 	}
 	if ctrl.OpModFixedVar != nil {

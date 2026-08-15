@@ -584,18 +584,16 @@ type ExtendedDERControlBase struct {
 	// 9856710 recorded here — were artifacts of the wrong anchor: this package
 	// was right and the draft is the outlier.
 	//
-	// OPEN, RECORDED NOT FIXED (NORMATIVE_ANCHOR.md §5.1): 2018 p.258 types
-	// PowerFactorWithExcitation as {displacement UInt16, excitation boolean,
-	// multiplier PowerOfTenMultiplierType}, all mandatory, and these fields are
-	// *SignedPerCent — a bare chardata Int16. A conformant server's
-	// <opModFixedPFAbsorbW><displacement>950</displacement>... decodes to zero.
-	// Same defect class as R4a, on a wire shape with live consumers in lexa-gw's
-	// scheduler and publish paths; filed for the follow-up wave rather than
-	// changed inside an anchor correction.
-	OpModFixedPFAbsorbW *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
-	OpModFixedPFInjectW *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
-	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"` // 2018 p.248
-	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`   // 2018 p.248. SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
+	// CLOSED (NORMATIVE_ANCHOR.md §5.1, follow-up wave): 2018 p.258 types both
+	// as PowerFactorWithExcitation — {displacement UInt16, excitation boolean,
+	// multiplier PowerOfTenMultiplierType}, all mandatory — and they were
+	// *SignedPerCent, a bare chardata Int16 that decoded a conformant
+	// <opModFixedPFInjectW><displacement>950</displacement>... to ZERO. See that
+	// type's doc for why the scalar shape gets no decode tolerance.
+	OpModFixedPFAbsorbW *PowerFactorWithExcitation `xml:"opModFixedPFAbsorbW,omitempty"`
+	OpModFixedPFInjectW *PowerFactorWithExcitation `xml:"opModFixedPFInjectW,omitempty"`
+	OpModFixedVar       *FixedVar                  `xml:"opModFixedVar,omitempty"` // 2018 p.248
+	OpModFixedW         *SignedPerCent             `xml:"opModFixedW,omitempty"`   // 2018 p.248. SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
 	// Frequency droop (inline parameters, not a curve link) — 2018 p.248, and
 	// alphabetically ahead of opModFreqWatt.
 	OpModFreqDroop *FreqDroop `xml:"opModFreqDroop,omitempty"`
@@ -631,7 +629,7 @@ type ExtendedDERControlBase struct {
 	// commanded nothing on that axis. The fix stands under the 2018 anchor; only
 	// the bit and curveType numbers moved.
 	OpModWattVar *CurveLink `xml:"opModWattVar,omitempty"`
-	RampTms      *uint16    `xml:"rampTms,omitempty"` // 2018 p.252 — the standard's last element, hundredths of a second
+	RampTms      *uint16    `xml:"rampTms,omitempty"` // 2018 p.251 — the standard's last element, hundredths of a second
 
 	// ── NOT IEEE 2030.5 — everything below this line ─────────────────────────
 	//
@@ -704,8 +702,24 @@ type DERCapabilityFull struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERCapability"`
 	Resource
 
-	// Type: 0=unknown, 1=virtual/mixed, 2=reciprocating engine, 80=PV, 81=wind,
-	// 82=running CHP, 83=storage, 84=electric vehicle, 85=EVSE, 86=combined PV+storage.
+	// Type is DERType — IEEE Std 2030.5-2018 printed p.245. That page cite was an
+	// inference when NORMATIVE_ANCHOR.md §5.3 filed this row and the
+	// citation-verification pass confirmed it exactly right, so it stands as a
+	// verified cite rather than a guess:
+	//
+	//	0 = not applicable        5 = combined heat and power
+	//	1 = virtual or mixed      6 = other generation
+	//	2 = reciprocating engine  80 = other storage
+	//	3 = fuel cell             81 = electric vehicle
+	//	4 = photovoltaic system   82 = EVSE
+	//	                          83 = combined PV and storage
+	//
+	// THE LIST THIS REPLACES WAS WRONG IN EVERY POSITION PAST 2 — it named a
+	// "wind" type 2030.5 does not declare in any revision, and put photovoltaic
+	// at 80, where the standard puts other-storage. Comment-level only: nothing
+	// in this tree branches on the value, which is precisely why it went
+	// unchecked for as long as it did. Anything that starts branching on it owes
+	// a golden decode first.
 	Type uint8 `xml:"type"`
 
 	// ModesSupported is a bitmask of the DERControlBase operating modes this

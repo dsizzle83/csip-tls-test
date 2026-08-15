@@ -9,28 +9,32 @@ package suitecsip
 //     the complementary pair, the evidenced bit, the reserved range;
 //  3. it does NOT invent facts — a claim about the installation that the wire
 //     cannot settle is disclosed and never graded, absent a PICS;
-//  4. it is RED against the product, in two distinct shapes, and each shape says
-//     which fix cures it.
+//  4. it tracks the PRODUCT across every state its registration has been in —
+//     green against what ships now, red against each preserved earlier shape,
+//     and explicit about which repository's fix closed which finding.
 //
-// # The two red proofs, and why there are two
+// # The three generations, and why each is kept
 //
-// The product's MirrorUsagePoint had TWO independent defects, and they are
-// closed by changes in two different repositories:
+// The product's MirrorUsagePoint had TWO independent defects, closed by changes
+// in two different repositories, and the oracle has now watched both close:
 //
-//	THE MISSING MANDATORY ELEMENT is cured by lexa-proto 13e9106 alone. That
-//	commit removed `omitempty` from UsagePointBase's three [1] elements, so the
-//	moment lexa-gw re-vendors, serviceCategoryKind appears on the wire with no
-//	product edit at all. TestMUPOracle_RedProofAgainstThePreservedPreFixBytes
-//	pins the OLD bytes as a literal so that cure cannot erase its own evidence.
+//	THE MISSING MANDATORY ELEMENT was cured by lexa-proto 13e9106 alone — that
+//	commit removed `omitempty` from UsagePointBase's three [1] elements, so
+//	serviceCategoryKind reappeared on the wire with no product edit at all.
 //
-//	THE WRONG roleFlags VALUE is not cured by anything upstream. 0x0002 is a
-//	number cmd/telemetry writes, and no schema change moves it; lexa-gw has to
-//	change what it MEANS to say. TestMUPOracle_RedProofAgainstTheShippedRoleFlags
-//	builds the resource with the product's CURRENT serializer and the product's
-//	pinned literal, so it is red against a re-vendored build too — which is the
-//	honest thing for a harness to be while the product wave is still in flight.
+//	THE WRONG roleFlags VALUE could not be cured by anything upstream. 0x0002 is
+//	a number cmd/telemetry writes, and no schema change moves it; lexa-gw 675ffdf
+//	changed what the product MEANS to say, to 0x0049.
 //
-// Both fixtures are PINNED rather than read from the product, on the rule the
+// So this file carries a GREEN proof against the shipped resource and TWO
+// preserved reds — the pre-proto bytes (three findings) and the pre-gw roleFlags
+// on a fixed serializer (two findings) — plus
+// TestMUPOracle_TheThreeGenerationsOfThisRegistration, which walks all three in
+// one table and asserts WHICH finding leaves at each step rather than only how
+// many. A progression that counted alone could be satisfied by two unrelated
+// defects swapping places.
+//
+// Every fixture is PINNED rather than read from the product, on the rule the
 // modes oracle's preserved masks follow: a teeth test that tracked the product
 // would go green the moment the product was fixed, taking the evidence of its
 // own teeth with it.
@@ -436,23 +440,32 @@ func TestMUPOracle_ServerTierGradesTheStoredRegistration(t *testing.T) {
 
 // ── (4) The proofs against the product ──────────────────────────────────────
 
-// shippedRoleFlags is what lexa-gw's cmd/telemetry registerMUP writes, verbatim:
+// shippedRoleFlags is what lexa-gw's cmd/telemetry registerMUP writes today:
 //
-//	RoleFlags: 0x0002,
+//	const mupRoleFlags model.HexBinary16 = 0x0049
 //
-// which is isPremisesAggregationPoint ALONE. Under IEEE Std 2030.5-2018 p.169
-// that says: this usage point is the point of delivery for a premises; the
-// server IS the measurement device (isMirror clear, on a MirrorUsagePoint); the
-// usage does NOT apply to a distributed energy resource (isDER clear, on a
-// gateway that PUTs a DERCapability to the same server); and it is not a
-// submeter.
+// isMirror | isDER | isSubmeter. Under IEEE Std 2030.5-2018 p.169 that says:
+// the server is not the measurement device (which, on a MirrorUsagePoint, it by
+// definition is not); the usage applies to a distributed energy resource; and
+// the usage point is not a premises aggregation point. Every SHALL this oracle
+// can decide is honoured, and the complementary pair holds with exactly one bit
+// set.
 //
-// PINNED, not read from the product, on the rule the modes oracle's preserved
-// masks follow: a teeth test that tracked the product would go green the moment
-// the product was fixed and take the evidence of its own teeth with it. Whoever
-// changes the shipped posture adds a green proof beside this one and leaves this
-// one alone.
-const shippedRoleFlags model.HexBinary16 = 0x0002
+// preMirrorRoleFlags is what it wrote BEFORE lexa-gw 675ffdf, preserved as the
+// teeth fixture: 0x0002, isPremisesAggregationPoint ALONE — the server IS the
+// measurement device, the usage does NOT apply to a DER, and it is not a
+// submeter. Three assertions, on a mirror registration from a DER gateway, and
+// two of them decidably false.
+//
+// BOTH ARE PINNED, not read from the product, on the rule the modes oracle's
+// preserved masks follow: a teeth test that tracked the product would go green
+// the moment the product was fixed and take the evidence of its own teeth with
+// it. Whoever changes the shipped posture again moves the first constant and
+// leaves the second alone.
+const (
+	shippedRoleFlags   model.HexBinary16 = 0x0049
+	preMirrorRoleFlags model.HexBinary16 = 0x0002
+)
 
 // productMUP builds a MirrorUsagePoint with the PRODUCT'S OWN serializer,
 // carrying the values cmd/telemetry's registerMUP sets.
@@ -481,26 +494,35 @@ func productMUP(t *testing.T, roleFlags model.HexBinary16) string {
 	return string(b)
 }
 
-// TestMUPOracle_RedProofAgainstTheShippedRoleFlags is the live red proof, and it
-// is red against a build that has ALREADY taken the upstream fix.
+// TestMUPOracle_GreenProofAgainstTheShippedMirror is the flip: the criterion
+// that had to fail now has to pass, on the same evidence and for the same
+// reason.
 //
-// lexa-proto 13e9106 cured the missing mandatory element; it did not and could
-// not change 0x0002, which is a number cmd/telemetry writes. So this fixture is
-// built with the CURRENT vendored serializer — serviceCategoryKind present, as
-// it now will be on the wire — and is still non-conformant in two places that
-// only lexa-gw can close.
-func TestMUPOracle_RedProofAgainstTheShippedRoleFlags(t *testing.T) {
+// lexa-gw 675ffdf changed cmd/telemetry's registerMUP to 0x0049 —
+// isMirror|isDER|isSubmeter — closing the two findings the proto re-vendor could
+// not. Together with lexa-proto 13e9106's omitempty removal, every claim this
+// oracle can decide about the product's MirrorUsagePoint is now honoured.
+//
+// The red shapes are not lost:
+// TestMUPOracle_RedProofAgainstThePreservedPreMirrorRoleFlags keeps the
+// roleFlags value, TestMUPOracle_RedProofAgainstThePreservedPreFixBytes keeps
+// the missing mandatory element, and
+// TestMUPOracle_TheThreeGenerationsOfThisRegistration walks all three states in
+// one place. A criterion whose only recorded behaviour is passing has been
+// demonstrated, not tested.
+func TestMUPOracle_GreenProofAgainstTheShippedMirror(t *testing.T) {
 	body := productMUP(t, shippedRoleFlags)
-	// The proto fix, asserted on the BYTES rather than assumed: with the pinned
-	// proto this element is on the wire, and if it ever leaves again this proof
-	// is about a different document and must be re-stated.
-	if !strings.Contains(body, "<serviceCategoryKind>0</serviceCategoryKind>") {
-		t.Fatalf("the product's serializer no longer emits serviceCategoryKind at value 0. That is the "+
-			"omitempty defect returning, and it changes what this proof is about:\n%s", body)
-	}
-	if !strings.Contains(body, "<roleFlags>0002</roleFlags>") {
-		t.Fatalf("the product's serializer no longer emits the shipped roleFlags as zero-padded "+
-			"hexBinary16; this proof's premise has changed:\n%s", body)
+	// The EMITTED TEXT, not the value: a round-trip through a wrong convention
+	// passes happily, so only the bytes prove the encoding and the presence.
+	for _, want := range []string{
+		"<roleFlags>0049</roleFlags>",
+		"<serviceCategoryKind>0</serviceCategoryKind>",
+		"<status>1</status>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("the product's serializer no longer emits %s; this proof's premise has changed and "+
+				"must be re-stated against what it emits now:\n%s", want, body)
+		}
 	}
 
 	tr := synthTranscript(derCapPUT(), mupPOST(body))
@@ -508,34 +530,66 @@ func TestMUPOracle_RedProofAgainstTheShippedRoleFlags(t *testing.T) {
 	if f.Unavailable != "" {
 		t.Fatalf("the oracle declined to decide against the shipped build: %s", f.Unavailable)
 	}
-	if f.Verdict != certify.Fail {
-		t.Fatalf("the shipped MirrorUsagePoint graded %s. It clears isMirror on a MIRROR usage point "+
-			"and clears isDER on a device that PUTs a DERCapability to the same server; an oracle that "+
-			"does not fail that is not grading the resource at all.\n%s", f.Verdict, f.Observed)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("the shipped MirrorUsagePoint graded %s, want PASS. It sets isMirror on a mirror, isDER "+
+			"on a device that PUTs a DERCapability, and exactly one of the complementary pair:\n%s",
+			f.Verdict, f.Observed)
 	}
+	// The PASS must SAY what it credited, or it is indistinguishable from a
+	// criterion that found nothing to check.
 	for _, want := range []string{
-		"NON-CONFORMANT in 2 place(s)",
-		"bit 0 isMirror is CLEAR",
-		"bit 3 isDER is CLEAR",
+		"0x0049", "bit 0 isMirror", "bit 3 isDER", "bit 6 isSubmeter",
+		"roleFlags=0049", "serviceCategoryKind=0", "status=1",
 	} {
 		if !strings.Contains(f.Observed, want) {
-			t.Errorf("the shipped-roleFlags red proof omits %q:\n%s", want, f.Observed)
+			t.Errorf("the green proof's PASS omits %q:\n%s", want, f.Observed)
 		}
 	}
-	// It must NOT fail for the mandatory element any more: that half IS cured by
-	// the re-vendor, and a proof that conflated the two would not tell lexa-gw
-	// what is left to do.
+	// The complementary pair is COHERENT and still disclosed: which of the two
+	// roles is the right one is a fact about the installation, and a PASS must
+	// not read as though the wire settled it.
+	if !strings.Contains(f.Observed, "COHERENT") {
+		t.Errorf("the complementary pair was not disclosed on the PASS:\n%s", f.Observed)
+	}
+	t.Logf("GREEN PROOF (shipped roleFlags 0x0049, proto fe483e7), verbatim:\n%s", f.Observed)
+}
+
+// TestMUPOracle_RedProofAgainstThePreservedPreMirrorRoleFlags keeps the teeth
+// the green proof above spends.
+//
+// The fixture is 0x0002 built with the CURRENT serializer — so the mandatory
+// element IS present and the only findings left are the two roleFlags SHALLs.
+// That isolation is the point: it is the exact state the product was in between
+// the proto re-vendor and lexa-gw 675ffdf, and it is what shows the two fixes
+// closed different things.
+func TestMUPOracle_RedProofAgainstThePreservedPreMirrorRoleFlags(t *testing.T) {
+	body := productMUP(t, preMirrorRoleFlags)
+	if !strings.Contains(body, "<roleFlags>0002</roleFlags>") {
+		t.Fatalf("the preserved pre-mirror fixture no longer emits 0002:\n%s", body)
+	}
+	tr := synthTranscript(derCapPUT(), mupPOST(body))
+	f := critMUPElementsAndRoleFlags("").Wire(nil, tr)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("the pre-675ffdf roleFlags graded %s. It clears isMirror on a MIRROR usage point and "+
+			"isDER on a device that PUTs a DERCapability to the same server; an oracle that does not "+
+			"fail that is not grading the resource at all.\n%s", f.Verdict, f.Observed)
+	}
+	for _, want := range []string{
+		"NON-CONFORMANT in 2 place(s)", "bit 0 isMirror is CLEAR", "bit 3 isDER is CLEAR",
+	} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the preserved pre-mirror red proof omits %q:\n%s", want, f.Observed)
+		}
+	}
+	// It must NOT fail for the mandatory element: this fixture is built with the
+	// fixed serializer, and conflating the two would lose the distinction the
+	// generation table below exists to draw.
 	if strings.Contains(f.Observed, "is ABSENT") {
-		t.Errorf("the shipped build is still missing a mandatory element, so the proto re-vendor did "+
-			"not take:\n%s", f.Observed)
+		t.Errorf("the pre-mirror fixture is missing a mandatory element, so it is not isolating the "+
+			"roleFlags half:\n%s", f.Observed)
 	}
-	// And the pair check must be SILENT here: 0x0002 sets exactly one of the
-	// complementary bits, which is coherent however odd the choice.
-	if strings.Contains(f.Observed, "BOTH set") || strings.Contains(f.Observed, "BOTH clear") {
-		t.Errorf("the complementary pair was reported as incoherent for a mask that sets exactly one "+
-			"of them:\n%s", f.Observed)
-	}
-	t.Logf("RED PROOF (shipped roleFlags 0x0002, current proto), verbatim:\n%s", f.Observed)
+	t.Logf("RED PROOF, PRESERVED (pre-675ffdf roleFlags 0x0002, fixed serializer), verbatim:\n%s",
+		f.Observed)
 }
 
 // preFixMUPBytes is the MirrorUsagePoint lexa-gw POSTed BEFORE lexa-proto
@@ -590,40 +644,91 @@ func TestMUPOracle_RedProofAgainstThePreservedPreFixBytes(t *testing.T) {
 	t.Logf("RED PROOF, PRESERVED (pre-13e9106 bytes), verbatim:\n%s", f.Observed)
 }
 
-// TestMUPOracle_ProtoFixAloneCuresExactlyOneOfTheThree states the division of
-// labour as an ASSERTION rather than as a paragraph, because the two waves are
-// running in parallel and a note in a commit message is not checkable.
+// TestMUPOracle_TheThreeGenerationsOfThisRegistration walks the product's
+// MirrorUsagePoint through every state it has been in, in one table, and asserts
+// the finding count at each.
 //
-// Same roleFlags, same values, two serializers: the only difference between the
-// fixtures is the `omitempty` lexa-proto removed. The failure count must drop by
-// exactly one, and the one that goes must be the mandatory element.
-func TestMUPOracle_ProtoFixAloneCuresExactlyOneOfTheThree(t *testing.T) {
-	before := critMUPElementsAndRoleFlags("").Wire(nil,
-		synthTranscript(derCapPUT(), mupPOST(preFixMUPBytes)))
-	after := critMUPElementsAndRoleFlags("").Wire(nil,
-		synthTranscript(derCapPUT(), mupPOST(productMUP(t, shippedRoleFlags))))
+// It replaced TestMUPOracle_ProtoFixAloneCuresExactlyOneOfTheThree, which
+// asserted a 3→2 step while the gw half was still in flight. That test was right
+// and is now half the story: the same three-generation shape the modes oracle
+// keeps for its bit tables applies here, and stating it as a progression is what
+// makes each fix's contribution checkable rather than remembered.
+//
+//	GENERATION 1 — pre-lexa-proto-13e9106. Three findings. serviceCategoryKind
+//	is ABSENT (a [1] element whose value is 0, deleted by an errant omitempty),
+//	and both roleFlags SHALLs are unmet. Preserved as literal bytes, because the
+//	fix is upstream and vendored so nothing in this tree can emit them any more.
+//
+//	GENERATION 2 — after the proto re-vendor, before lexa-gw 675ffdf. Two
+//	findings. The mandatory element is back with NO product edit; the roleFlags
+//	value is untouched, because no schema change can move a number
+//	cmd/telemetry writes.
+//
+//	GENERATION 3 — today. Zero findings.
+//
+// The counts are asserted, and so is WHICH finding leaves at each step: a
+// progression that only counted could be satisfied by two unrelated defects
+// swapping places.
+func TestMUPOracle_TheThreeGenerationsOfThisRegistration(t *testing.T) {
+	grade := func(body string) Finding {
+		return critMUPElementsAndRoleFlags("").Wire(nil,
+			synthTranscript(derCapPUT(), mupPOST(body)))
+	}
+	gen1 := grade(preFixMUPBytes)
+	gen2 := grade(productMUP(t, preMirrorRoleFlags))
+	gen3 := grade(productMUP(t, shippedRoleFlags))
 
-	if !strings.Contains(before.Observed, "in 3 place(s)") ||
-		!strings.Contains(after.Observed, "in 2 place(s)") {
-		t.Fatalf("the re-vendor did not close exactly one finding.\nbefore: %s\n\nafter: %s",
-			before.Observed, after.Observed)
+	for _, tc := range []struct {
+		name    string
+		f       Finding
+		verdict certify.Verdict
+		count   string
+		// present/absent are substrings that must and must not appear, which is
+		// what pins WHICH finding moved rather than only how many.
+		present, absent []string
+	}{
+		{
+			name: "generation 1 — pre-proto-fix bytes", f: gen1, verdict: certify.Fail,
+			count: "NON-CONFORMANT in 3 place(s)",
+			present: []string{
+				"<serviceCategoryKind> is ABSENT", "omitempty",
+				"bit 0 isMirror is CLEAR", "bit 3 isDER is CLEAR",
+			},
+		},
+		{
+			name: "generation 2 — proto fixed, product not", f: gen2, verdict: certify.Fail,
+			count:   "NON-CONFORMANT in 2 place(s)",
+			present: []string{"bit 0 isMirror is CLEAR", "bit 3 isDER is CLEAR"},
+			// The element the re-vendor restored, with no product edit at all.
+			absent: []string{"is ABSENT"},
+		},
+		{
+			name: "generation 3 — both fixed", f: gen3, verdict: certify.Pass,
+			present: []string{"bit 0 isMirror", "bit 3 isDER", "bit 6 isSubmeter"},
+			absent:  []string{"NON-CONFORMANT", "is ABSENT", "is CLEAR"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.f.Verdict != tc.verdict {
+				t.Fatalf("verdict = %s, want %s:\n%s", tc.f.Verdict, tc.verdict, tc.f.Observed)
+			}
+			if tc.count != "" && !strings.Contains(tc.f.Observed, tc.count) {
+				t.Errorf("finding count is not %q:\n%s", tc.count, tc.f.Observed)
+			}
+			for _, w := range tc.present {
+				if !strings.Contains(tc.f.Observed, w) {
+					t.Errorf("missing %q:\n%s", w, tc.f.Observed)
+				}
+			}
+			for _, w := range tc.absent {
+				if strings.Contains(tc.f.Observed, w) {
+					t.Errorf("still carries %q, which this generation closed:\n%s", w, tc.f.Observed)
+				}
+			}
+		})
 	}
-	// What the re-vendor cured.
-	if !strings.Contains(before.Observed, "<serviceCategoryKind> is ABSENT") ||
-		strings.Contains(after.Observed, "<serviceCategoryKind> is ABSENT") {
-		t.Errorf("the cured finding is not the missing mandatory element.\nbefore: %s\n\nafter: %s",
-			before.Observed, after.Observed)
-	}
-	// What it did NOT cure, and cannot: these are values cmd/telemetry writes.
-	for _, want := range []string{"bit 0 isMirror is CLEAR", "bit 3 isDER is CLEAR"} {
-		if !strings.Contains(after.Observed, want) {
-			t.Errorf("a roleFlags finding disappeared with the re-vendor, which no schema change can "+
-				"do (missing %q): %s", want, after.Observed)
-		}
-	}
-	t.Logf("DIVISION OF LABOUR: lexa-proto 13e9106 closes the mandatory-element finding on re-vendor; "+
-		"the two roleFlags findings need a lexa-gw change to cmd/telemetry's registerMUP.\n"+
-		"  before (3): %s\n\n  after (2): %s", before.Observed, after.Observed)
+	t.Logf("THREE GENERATIONS OF THIS REGISTRATION:\n  gen 1 (3): %s\n\n  gen 2 (2): %s\n\n  gen 3 (0): %s",
+		gen1.Observed, gen2.Observed, gen3.Observed)
 }
 
 // TestBasic029_CarriesTheMUPContentOracle pins the row placement: BASIC-029 is

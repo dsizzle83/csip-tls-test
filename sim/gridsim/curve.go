@@ -795,14 +795,8 @@ func extBaseToInfo(b model.ExtendedDERControlBase) adminBaseInfo {
 		v := apW(b.OpModTargetW)
 		info.TargetW = &v
 	}
-	if b.OpModFixedPFInjectW != nil {
-		v := int64(b.OpModFixedPFInjectW.Value)
-		info.FixedPFInjectW = &v
-	}
-	if b.OpModFixedPFAbsorbW != nil {
-		v := int64(b.OpModFixedPFAbsorbW.Value)
-		info.FixedPFAbsorbW = &v
-	}
+	info.FixedPFInjectW = fixedPFToInfo(b.OpModFixedPFInjectW)
+	info.FixedPFAbsorbW = fixedPFToInfo(b.OpModFixedPFAbsorbW)
 	if b.OpModFixedVar != nil {
 		v := int64(b.OpModFixedVar.Value.Value)
 		info.FixedVarPct = &v
