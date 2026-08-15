@@ -107,6 +107,11 @@ func (i *i1) Check(ctx context.Context, w *World) (Result, error) {
 	}
 
 	res := Result{Verdict: Pass}
+	// The identity of an I1 violation is the WITNESS and the REGISTER, never
+	// the resolved magnitude: the same over-nameplate setpoint re-read a tick
+	// later at a slightly different value is the same finding, and a chaos
+	// campaign moves that value constantly. See [keyer].
+	key := keysOf(&res)
 	var skipped []string
 
 	for _, v := range views {
@@ -121,7 +126,7 @@ func (i *i1) Check(ctx context.Context, w *World) (Result, error) {
 		}
 		for _, c := range cmds {
 			r := ResolveCommand(c, np, meas)
-			verdict, checked, facts := i.judge(v, r, np, meas)
+			verdict, checked, facts, arm := i.judge(v, r, np, meas)
 			res.Checked += checked
 			if checked == 0 && r.Unresolved != "" {
 				skipped = append(skipped, fmt.Sprintf("%s %s: %s", v.Label, r.Point, r.Unresolved))
@@ -129,6 +134,7 @@ func (i *i1) Check(ctx context.Context, w *World) (Result, error) {
 			if verdict == Pass {
 				continue
 			}
+			key.note(verdict, "%s:%s:%s", arm, v.Label, r.Point)
 			res.Verdict = Worse(res.Verdict, verdict)
 			res.Facts = append(res.Facts, facts...)
 			res.Facts = append(res.Facts, np.Facts(v.Label)...)
@@ -150,6 +156,10 @@ func (i *i1) Check(ctx context.Context, w *World) (Result, error) {
 		verdict, checked, facts, reason := i.checkSiteLimit(obs, nameplates, measurements, sv)
 		res.Checked += checked
 		if verdict != Pass {
+			// One site, one limit: the aggregate breach has no per-device
+			// identity to carry, and every tick that observes it is the same
+			// finding.
+			key.note(verdict, "site-limit")
 			res.Verdict = Worse(res.Verdict, verdict)
 			res.Facts = append(res.Facts, facts...)
 			if res.Reason == "" {
@@ -204,10 +214,18 @@ func (i *i1) ratingsFor(v devView, nps map[string]Nameplate, ms map[string]Measu
 }
 
 // judge evaluates one resolved command. It returns the verdict, how many
-// sub-claims it actually asserted (the assertion floor), and the facts.
-func (i *i1) judge(v devView, c Command, np Nameplate, meas Measurement) (Verdict, int, []Fact) {
+// sub-claims it actually asserted (the assertion floor), the facts, and the ARM
+// name — which of I1's several distinct claims this verdict falsified, so
+// [Result.Key] can say so rather than letting a fact hash guess.
+//
+// The staged and governing cases are deliberately DIFFERENT arms. "A setpoint
+// that is over the nameplate and is commanding the device" and "a setpoint that
+// is over the nameplate and is one enable-write away from commanding it" are
+// not the same ticket, and collapsing them under one identity would let a
+// campaign that escalated the second into the first report no new finding.
+func (i *i1) judge(v devView, c Command, np Nameplate, meas Measurement) (Verdict, int, []Fact, string) {
 	if c.Unresolved != "" {
-		return Pass, 0, nil
+		return Pass, 0, nil, ""
 	}
 
 	// Power factor is bounded by physics, not by a nameplate.
@@ -215,28 +233,28 @@ func (i *i1) judge(v devView, c Command, np Nameplate, meas Measurement) (Verdic
 		return i.judgePF(v, c, np)
 	}
 	if !c.Physical.Known() {
-		return Pass, 0, nil
+		return Pass, 0, nil, ""
 	}
 	limit, ok := np.Limit(c.Physical.Unit, c.Sign)
 	if !ok {
-		return Pass, 0, nil
+		return Pass, 0, nil, ""
 	}
 	over, exceeded, err := i.p.Tol.Exceeds(c.Physical, limit.Q)
 	if err != nil {
 		// A cross-unit comparison reaching this point is a defect in this
 		// package, not in the DUT, and must be surfaced as such rather than
 		// silently swallowed.
-		return Warn, 1, []Fact{F(v.Label+"."+c.Point+".compare_error", "", v.Source, "%v", err)}
+		return Warn, 1, []Fact{F(v.Label+"."+c.Point+".compare_error", "", v.Source, "%v", err)}, "compare-error"
 	}
 	if !exceeded {
-		return Pass, 1, nil
+		return Pass, 1, nil, ""
 	}
 	facts := i.facts(v, c, limit, over)
 	if !c.Enabled {
 		facts = append(facts, F(v.Label+"."+c.Point+".enabled", "", v.Source, "false (staged, not governing)"))
-		return Warn, 1, facts
+		return Warn, 1, facts, "over-nameplate-staged"
 	}
-	return Fail, 1, facts
+	return Fail, 1, facts, "over-nameplate"
 }
 
 // judgePF checks a commanded power factor. A |PF| > 1 is not a curtailment
@@ -245,10 +263,10 @@ func (i *i1) judge(v devView, c Command, np Nameplate, meas Measurement) (Verdic
 // produce is a WARN: IEEE 1547 lets a head-end command a PF the device cannot
 // meet at every operating point, and the device is expected to prioritise, so
 // calling it a safety violation would be inventing a requirement.
-func (i *i1) judgePF(v devView, c Command, np Nameplate) (Verdict, int, []Fact) {
+func (i *i1) judgePF(v devView, c Command, np Nameplate) (Verdict, int, []Fact, string) {
 	pf := c.Raw.Val
 	if !c.Raw.Known() {
-		return Pass, 0, nil
+		return Pass, 0, nil, ""
 	}
 	if math.Abs(pf) > 1.0+1e-9 {
 		return Fail, 1, []Fact{
@@ -256,20 +274,20 @@ func (i *i1) judgePF(v devView, c Command, np Nameplate) (Verdict, int, []Fact) 
 			F(v.Label+"."+c.Point+".enabled", "", v.Source, "%t", c.Enabled),
 			F(v.Label+"."+c.Point+".violation", "", v.Source,
 				"|PF| > 1 is not physically representable; the register holds a value that is not a power factor"),
-		}
+		}, "pf-unrepresentable"
 	}
 	if !c.Enabled || pf == 0 {
-		return Pass, 1, nil
+		return Pass, 1, nil, ""
 	}
 	wLimit, okW := np.Limit(UnitWatt, 1)
 	varLimit, okVar := np.Limit(UnitVar, c.Sign)
 	if !okW || !okVar {
-		return Pass, 1, nil
+		return Pass, 1, nil, ""
 	}
 	// Reactive demand at rated real power: |Q| = P·tan(acos|PF|).
 	demand := wLimit.Q.Val * math.Tan(math.Acos(math.Abs(pf)))
 	if demand <= varLimit.Q.Val*(1+i.p.Tol.Rel) {
-		return Pass, 1, nil
+		return Pass, 1, nil, ""
 	}
 	return Warn, 1, []Fact{
 		F(v.Label+"."+c.Point+".raw", "PF", v.Source, "%s", trimFloat(pf)),
@@ -278,7 +296,7 @@ func (i *i1) judgePF(v devView, c Command, np Nameplate) (Verdict, int, []Fact) 
 		F(v.Label+"."+c.Point+".note", "", v.Source,
 			"the commanded power factor cannot be met at rated real power; 1547 permits this and expects "+
 				"the device to prioritise, so it is reported rather than failed"),
-	}
+	}, "pf-demand-over-var-rating"
 }
 
 // facts renders the full unit provenance of a violation. Every number here

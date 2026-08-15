@@ -74,6 +74,12 @@ func (i *i5) Check(ctx context.Context, w *World) (Result, error) {
 	}
 
 	res := Result{Verdict: Pass}
+	// The identity is the credential, the domain pair it crossed, and the
+	// endpoint it crossed at — "this leaf authenticates against :802" and "the
+	// same leaf authenticates against the southbound port" are two separations
+	// that failed, not one. The ledger seq and the free-text detail stay out;
+	// see [keyer].
+	key := keysOf(&res)
 	pairs := map[string]int{}
 	for _, a := range auths {
 		if a.CredDomain == "" || a.TargetDomain == "" {
@@ -88,6 +94,7 @@ func (i *i5) Check(ctx context.Context, w *World) (Result, error) {
 			continue
 		}
 		res.Verdict = Fail
+		key.note(Fail, "cross-domain-auth:%s:%s->%s:%s", a.Credential, a.CredDomain, a.TargetDomain, a.Target)
 		res.Facts = append(res.Facts,
 			F("i5.credential", "", "ledger", "%s", a.Credential),
 			F("i5.cred_domain", "", "ledger", "%s", a.CredDomain),

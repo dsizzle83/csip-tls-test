@@ -162,7 +162,73 @@ type Result struct {
 	// Corroboration that comes and goes as the campaign perturbs the world is
 	// the NORMAL case, not an edge case, so a checker whose violation has a
 	// stable identity should say what it is rather than let the hash guess.
+	//
+	// IW15-031 made that "should" a MUST for I1–I10. Leaving nine of the ten on
+	// the fallback cost more than duplicate tickets: a fact list containing a
+	// wall-clock instant re-hashes on every monitor tick, so one I3 finding at
+	// SEED=4242 was reported as four distinct violations AND could never be
+	// re-identified on a re-run — which made the shrinker declare its own
+	// deterministic finding non-deterministic. Every standard invariant now
+	// names its Key with [keyer]; see that type for the naming convention.
 	Key string `json:"key,omitempty"`
+}
+
+// keyer accumulates a violation identity across the several arms of one check.
+//
+// # The convention every invariant follows
+//
+//	<arm>:<identity field>:<identity field>…
+//
+// The arm name says WHICH claim was falsified — an invariant that checks three
+// different things must not report them under one identity — and the fields
+// name the thing it was falsified ABOUT: a witness label, a register point, a
+// credential, a file path, an mRID, a fault's target and kind.
+//
+// What must NEVER go in a key is anything a chaos campaign moves underneath it,
+// because the key's whole job is to survive that. Three traps, all of them live
+// in this package:
+//
+//   - OBSERVED MAGNITUDES and counters. They are the corroboration that comes
+//     and goes; that is what drove IW15-031's fallback off the rails.
+//   - TIMESTAMPS AND ELAPSED TIMES. "The same defect one tick later" is the
+//     same defect.
+//   - LEDGER SEQUENCE NUMBERS and [Fault.ID]. Both look stable and are not:
+//     Ledger.seq is assigned in the order the campaign's per-action goroutines
+//     happen to reach it, and Fault.ID embeds the arm-order index
+//     (`target.kind#n`). Re-run the same seed, or shrink to a subset, and both
+//     renumber — so a key built from either stops matching exactly when the
+//     shrinker needs it to match. Use the credential/target/kind instead.
+//
+// # Why the WORST verdict's key wins
+//
+// A check whose Warn arm fires first and whose Fail arm fires second reports
+// verdict Fail, and its identity must be the Fail's. First-wins-overall would
+// file the P1 under the caveat's name, and two runs that reached the same P1 by
+// different Warn routes would look like different findings.
+type keyer struct {
+	// res, when set, receives the identity the instant it is noted. Writing
+	// through rather than at the end of the check is deliberate: a finalising
+	// step is a step somebody adds a `return` in front of, and the first draft
+	// of this helper lost every key it computed to exactly that — a deferred
+	// stamp cannot reach an unnamed return value.
+	res *Result
+	key string
+	at  Verdict
+}
+
+// keysOf returns a keyer that stamps res.Key as identities are noted.
+func keysOf(res *Result) *keyer { return &keyer{res: res} }
+
+// note offers an identity for a violation reached at verdict v. The first offer
+// at the most severe verdict seen wins.
+func (k *keyer) note(v Verdict, format string, args ...any) {
+	if k.key != "" && k.at.Severity() >= v.Severity() {
+		return
+	}
+	k.key, k.at = fmt.Sprintf(format, args...), v
+	if k.res != nil {
+		k.res.Key = k.key
+	}
 }
 
 // Validate enforces the honesty rules a Result must satisfy before it may be

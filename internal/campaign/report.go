@@ -59,14 +59,27 @@ func Console(res Result) string {
 		fmt.Fprintf(&b, "    %-4s %s\n", id, res.Summary.PerInvariant[id])
 	}
 
-	if len(res.Violations) == 0 {
+	// P1s and caveats are counted separately, and the heading names which it is
+	// printing. The old heading read "N distinct — every one a P1" over a list
+	// that could also contain WARNs, so a run whose only finding was a caveat
+	// printed "VIOLATIONS (0 distinct — every one a P1)" and then listed one.
+	// A reader cannot be asked to reconcile that, and IW15-031 turned it from a
+	// curiosity into the common case: I3's lying-peer exemption reports WARN.
+	fails, warns := len(res.Signatures()), countWarn(res.Violations)
+	switch {
+	case fails == 0 && warns == 0:
 		b.WriteString("\nno invariant violation observed.\n")
-	} else {
-		fmt.Fprintf(&b, "\nVIOLATIONS (%d distinct — every one a P1):\n\n", len(res.Signatures()))
-		for _, v := range res.Violations {
-			b.WriteString(indent(v.String(), "  "))
-			b.WriteString("\n")
-		}
+	case fails == 0:
+		fmt.Fprintf(&b, "\nWARNINGS (%d distinct — asserted and held, with something adjacent worth stating; "+
+			"NOT a P1):\n\n", warns)
+	case warns == 0:
+		fmt.Fprintf(&b, "\nVIOLATIONS (%d distinct — every one a P1):\n\n", fails)
+	default:
+		fmt.Fprintf(&b, "\nVIOLATIONS (%d distinct — every one a P1) and WARNINGS (%d, not P1s):\n\n", fails, warns)
+	}
+	for _, v := range res.Violations {
+		b.WriteString(indent(v.String(), "  "))
+		b.WriteString("\n")
 	}
 
 	verdict := "CAMPAIGN PASS"
@@ -77,6 +90,19 @@ func Console(res Result) string {
 	fmt.Fprintf(&b, "reproduce: -seed %d -window %s -actions %d -layers %s\n",
 		res.Plan.Seed, res.Plan.Window.Round(time.Second), len(res.Plan.Events), strings.Join(res.Plan.Layers, ","))
 	return b.String()
+}
+
+// countWarn counts the recorded violations that are WARNs rather than P1s.
+// [Result.Signatures] deliberately counts only Fails — it is the shrinker's
+// target set — so the console needs its own count for the other half.
+func countWarn(vs []invariant.Violation) int {
+	n := 0
+	for _, v := range vs {
+		if v.Verdict == invariant.Warn {
+			n++
+		}
+	}
+	return n
 }
 
 func indent(s, pad string) string {

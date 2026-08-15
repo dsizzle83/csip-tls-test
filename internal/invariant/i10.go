@@ -86,6 +86,12 @@ func (i *i10) Check(ctx context.Context, w *World) (Result, error) {
 		now = obs.At
 	}
 	res := Result{Verdict: Pass}
+	// The identity is the CONTROL — the head-end's own mRID — plus which of the
+	// three ways it went wrong. The mRID is the one field here that a chaos
+	// campaign cannot move; the applied/judgeable axis counts change on every
+	// tick as the reconciler works, which is exactly why they are corroboration
+	// and not identity. See [keyer].
+	key := keysOf(&res)
 	seen := 0
 
 	for _, prog := range obs.HeadEnd.Programs {
@@ -120,6 +126,7 @@ func (i *i10) Check(ctx context.Context, w *World) (Result, error) {
 				// Declined in full and said so. This is the good refusal path.
 			case applied > 0 && applied < judgeable:
 				res.Verdict = Fail
+				key.note(Fail, "partial-apply:%s", c.MRID)
 				res.Facts = append(res.Facts, i.facts(prog, c, applied, judgeable, unjudgeable, detail, declined, succeeded)...)
 				if res.Reason == "" {
 					res.Reason = fmt.Sprintf(
@@ -133,6 +140,7 @@ func (i *i10) Check(ctx context.Context, w *World) (Result, error) {
 					Fail, res.Reason))
 			case applied == 0 && succeeded:
 				res.Verdict = Fail
+				key.note(Fail, "success-without-effect:%s", c.MRID)
 				res.Facts = append(res.Facts, i.facts(prog, c, applied, judgeable, unjudgeable, detail, declined, succeeded)...)
 				if res.Reason == "" {
 					res.Reason = fmt.Sprintf(
@@ -142,6 +150,7 @@ func (i *i10) Check(ctx context.Context, w *World) (Result, error) {
 				}
 			case applied == 0:
 				res.Verdict = Worse(res.Verdict, Pending)
+				key.note(Pending, "unapplied-undeclined:%s", c.MRID)
 				res.Facts = append(res.Facts, i.facts(prog, c, applied, judgeable, unjudgeable, detail, declined, succeeded)...)
 				if res.Reason == "" {
 					res.Reason = fmt.Sprintf(

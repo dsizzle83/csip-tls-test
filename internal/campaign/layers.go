@@ -141,9 +141,20 @@ var lieCatalog = []struct {
 		"the same sentinel, in model 701 — the measurement block a 7xx-capable gateway actually reads, " +
 			"so this is the entry that reaches a DUT polling the advanced models. It arms only on a sim " +
 			"that serves 701; elsewhere it is an honest ARM-ERR naming the field that is missing"},
+	// This entry's rationale was wrong, and IW15-031 is the adjudication that
+	// corrected it. It used to read "I3's exact shape", which is what invited a
+	// P1 every time it armed: the value IS at the device afterwards, but the
+	// DEVICE put it there in response to this very write and then denied it, so
+	// nothing about the DUT's durable state follows. I3 now reports that run
+	// WARN with the confound named (see internal/invariant/i3.go). What the lie
+	// is genuinely worth is stated here instead — it is a read-back-and-
+	// reconcile probe, TRM-01's shape, and the gateway that trusts a write's
+	// answer over a read-back is the one it catches.
 	{"exception_on_applied_write", map[string]any{"ex_code": 4, "every": 1},
-		"the device REFUSES a write it has already applied — I3's exact shape: a refusal that must " +
-			"leave no durable state claiming it applied, and must not be re-actuated later"},
+		"the device REFUSES a write it has already applied. It is NOT a ghost-commit probe — the value's " +
+			"presence afterwards is the lie, not the DUT's durable state, and I3 says so rather than " +
+			"reporting a P1 (IW15-031). What it probes is TRM-01: a gateway that trusts the write's answer " +
+			"instead of reading back is now reporting a refusal for a limit that is in force"},
 	{"slow_poll", map[string]any{"hold_ms": 2500},
 		"the device answers, but slowly enough to stack the gateway's requests — the failure mode that " +
 			"turns into a livelock rather than an error"},
@@ -284,7 +295,51 @@ func (AuthzProbe) Describe() string {
 // inference is only sound if the value could not have arrived by another route.
 // A round number like 50 is exactly what a scheduler default would land on, so
 // these are deliberately unround and each probe gets its own.
-var probeValues = []float64{37, 63, 41, 29, 71, 53}
+//
+// # The list ran out, and the campaign lied about it
+//
+// Found while validating IW15-031, on the run that closed it. The list held SIX
+// values and the assignment was `probeValues[i%len(probeValues)]`, while the
+// bench PKI offers more than six credentials — so a `-teeth` run at seed
+// 1096004868 gave BOTH `ReadOnlySunSpec` and `oversize-role` the value 29, and
+// marked both records Distinctive. The teeth peer accepted ReadOnlySunSpec's
+// write, oversize-role's was refused 0x01, and I3 then reported a P1: "the DUT
+// REFUSED it with exception 0x01, yet dut.unit1 now reads 29 % — the refusal did
+// not prevent the value taking effect". The 29 came from the OTHER probe.
+//
+// That is precisely the failure i3.go's own distinctiveness section describes —
+// "seeing 50 at the DER proves nothing at all, and an invariant that reported
+// PASS on that basis would be lying by construction" — arriving from the FAIL
+// direction instead, and it is the campaign's fault rather than I3's: I3 is
+// entitled to believe [invariant.WriteRecord.Distinctive], because only the
+// party that issued the write knows what else it issued.
+//
+// So the list is long enough for any PKI this bench will hold, and
+// [probeValue] refuses to assert distinctiveness once it runs out rather than
+// wrapping. A SKIP naming the exhausted supply is a true statement; a repeated
+// witness value is a false one.
+var probeValues = []float64{
+	37, 63, 41, 29, 71, 53, 17, 83, 47, 23, 67, 31, 79, 43, 59, 89,
+	13, 91, 27, 61, 39, 73, 19, 87, 33, 69, 21, 77, 49, 93,
+}
+
+// probeValue returns the setpoint for the i-th credential's write probe, and
+// whether it may be asserted DISTINCTIVE — that is, whether it is a value no
+// other probe in this run also commands.
+//
+// Wrapping the list would be the obvious thing and is the bug above: two
+// credentials commanding the same witness value make every downstream
+// observation of it ambiguous, and the record that claims otherwise poisons I3
+// in both directions. Past the end of the supply the probe still runs (the
+// write itself is I4's evidence, and I4 does not depend on the value being
+// unique) but the record says the value is not a witness.
+func probeValue(i int) (float64, bool) {
+	if i < len(probeValues) {
+		return probeValues[i], true
+	}
+	// Keep probing, keep the value legal, and stop claiming distinctiveness.
+	return probeValues[i%len(probeValues)], false
+}
 
 // Explain says why the layer offered nothing, which is nearly always that no
 // served unit advertises the control model — and therefore that the campaign
@@ -319,16 +374,16 @@ func (a AuthzProbe) Plan(inv Inventory, rng *rand.Rand) []Action {
 	var out []Action
 	for i, cred := range inv.DUT.Creds {
 		c := cred
-		value := probeValues[i%len(probeValues)]
+		value, distinctive := probeValue(i)
 		if inv.DUT.Write != nil {
 			out = append(out, Action{
 				Layer: a.ID(), Kind: "write-" + credSlug(c), Target: "dut", Class: invariant.ClassTransportAbuse,
 				Oneshot: true,
 				Params:  map[string]string{"credential": c.Name, "role": c.Role, "may_write": fmt.Sprint(c.MayWrite), "pct": trim(value)},
 				Why: fmt.Sprintf("credential %q (role %s, may-write=%t) attempts WMaxLimPct=%s%%; the answer and "+
-					"everything downstream of it is the ledger record I3 and I4 judge",
-					c.Name, c.Role, c.MayWrite, trim(value)),
-				Arm: writeProbe(inv.DUT, c, value),
+					"everything downstream of it is the ledger record I3 and I4 judge%s",
+					c.Name, c.Role, c.MayWrite, trim(value), distinctiveNote(distinctive)),
+				Arm: writeProbe(inv.DUT, c, value, distinctive),
 			})
 		}
 		if inv.DUT.Present != nil {
@@ -347,8 +402,19 @@ func (a AuthzProbe) Plan(inv Inventory, rng *rand.Rand) []Action {
 	return out
 }
 
+// distinctiveNote appends the disclosure to a probe's Why when the run has more
+// credentials than distinct witness values, so the manifest a reader sees says
+// which probes I3 will decline to judge.
+func distinctiveNote(distinctive bool) string {
+	if distinctive {
+		return ""
+	}
+	return " — NOT marked distinctive: this run has more credentials than the probe value list has distinct " +
+		"entries, so seeing this value downstream would not prove it came from this write, and I3 SKIPs it"
+}
+
 // writeProbe returns the probe that attempts one write and records it.
-func writeProbe(dut DUTTarget, c Credential, value float64) func(context.Context, *Runtime) error {
+func writeProbe(dut DUTTarget, c Credential, value float64, distinctive bool) func(context.Context, *Runtime) error {
 	return func(ctx context.Context, rt *Runtime) error {
 		start := time.Now()
 		res := dut.Write(ctx, c, dut.Unit, "WMaxLimPct", value)
@@ -361,11 +427,10 @@ func writeProbe(dut DUTTarget, c Credential, value float64) func(context.Context
 			Authorized: c.MayWrite, Unit: dut.Unit, Model: 704, Point: "WMaxLimPct",
 			Value:       invariant.Quantity{Val: value, Unit: invariant.UnitPercent},
 			Ref:         invariant.RefWMax,
-			Distinctive: true,
+			Distinctive: distinctive,
 			Accepted:    res.Accepted, Refused: res.Refused, ExceptionCode: res.Exception,
 			TransportErr: res.TransportErr, ClosedConn: res.ClosedConn, RTT: rtt,
-			Note: "a deliberately unround curtailment, so seeing it downstream can only have come from " +
-				"this write and not from a scheduler default",
+			Note: probeNote(distinctive),
 		})
 		rt.Logf("PROBE   write %-24s may-write=%-5t accepted=%t refused=%t ex=0x%02X",
 			c.Name, c.MayWrite, res.Accepted, res.Refused, res.Exception)
@@ -374,6 +439,20 @@ func writeProbe(dut DUTTarget, c Credential, value float64) func(context.Context
 		// invariants decide what it means.
 		return nil
 	}
+}
+
+// probeNote is the ledger record's own account of why its value may or may not
+// be used as a witness. It is written into the record rather than left implicit
+// because I3 names the note when it SKIPs.
+func probeNote(distinctive bool) string {
+	if distinctive {
+		return "a deliberately unround curtailment, unique among this run's probes, so seeing it downstream " +
+			"can only have come from this write and not from a scheduler default or another probe"
+	}
+	return "NOT distinctive: this run has more credentials than the probe value list has distinct entries, " +
+		"so this value is also commanded by another probe and observing it downstream proves nothing about " +
+		"THIS write. The attempt is still recorded — I4 judges the ANSWER, which needs no unique value — but " +
+		"I3 must skip it rather than attribute the value to this write"
 }
 
 // presentProbe returns the probe that presents one credential and records it.

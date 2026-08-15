@@ -94,12 +94,19 @@ func (i *i6) Check(ctx context.Context, w *World) (Result, error) {
 	before := latestBefore(w.History(), last)
 
 	res := Result{Verdict: Pass}
+	// "The device came back serving garbage" and "the device came back holding
+	// a value nobody commanded" are two different defects and keep two
+	// different key prefixes. The identity carries the witness (and, for the
+	// mixture arm, the register) but NOT the before/after values — those are
+	// precisely what moves between ticks. See [keyer].
+	key := keysOf(&res)
 
 	// ── Structural arm ────────────────────────────────────────────────────
 	for _, v := range deviceViews(obs) {
 		res.Checked++
 		if why, bad := i.malformed(v); bad {
 			res.Verdict = Fail
+			key.note(Fail, "unparseable:%s", v.Label)
 			res.Facts = append(res.Facts,
 				F("i6.structure.witness", "", v.Source, "%s", v.Label),
 				F("i6.structure.problem", "", v.Source, "%s", why),
@@ -146,6 +153,7 @@ func (i *i6) Check(ctx context.Context, w *World) (Result, error) {
 					continue // a new state somebody asked for
 				}
 				res.Verdict = Fail
+				key.note(Fail, "mixture:%s:%s", v.Label, c.Point)
 				res.Facts = append(res.Facts,
 					F("i6.mixture.witness", "", v.Source, "%s", v.Label),
 					F("i6.mixture.point", "", v.Source, "%s", c.Point),

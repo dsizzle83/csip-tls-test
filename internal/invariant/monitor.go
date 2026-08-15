@@ -94,6 +94,32 @@ type Violation struct {
 // and rating; I6's file and offset) and wrong whenever they are not. The
 // fallback is the default because it is safe in the direction that matters: it
 // over-reports distinct findings rather than merging two real defects into one.
+//
+// Since IW15-031 every standard invariant names its own Key, so the fallback is
+// reached only by a checker outside I1–I10 (a test double, a future invariant
+// that has not yet been given an identity). [TestEveryStandardInvariantNamesItsKey]
+// pins that.
+//
+// # The timestamp exclusion, and why it is by VALUE and not only by key name
+//
+// The fallback used to drop a fact only when its key ended in "_at" or its unit
+// was "s". That rule was written against I2's `authority_restored_at` and it
+// silently failed to cover the DOTTED spellings I3 and I7 actually emit —
+// `i3.write.at`, `i3.observed.at`, `i7.claim.received`. Wall-clock therefore
+// entered the hash, and the consequences were not subtle: at SEED=4242 ONE I3
+// finding minted a fresh signature on every monitor tick (reported as "4
+// distinct invariant violations"), and no re-run could ever produce a signature
+// a previous run had produced — so the shrinker's confirm step failed 100% of
+// the time and labelled a perfectly deterministic finding "non-deterministic
+// and no minimal set can be claimed". The finding reproduced 6/6 fresh; it was
+// the IDENTITY FUNCTION that was not reproducible, not the defect.
+//
+// A checker that forgets to name its Key must not be able to reintroduce that,
+// so the exclusion is now the union of three rules, the last of which needs no
+// naming discipline at all: the key ends in `_at` or `.at`, the unit is `s`, or
+// THE VALUE ITSELF PARSES AS AN RFC3339 TIMESTAMP. A fact whose value is an
+// instant is an instant whatever it is called, and "the same defect one tick
+// later" has always been the same defect.
 func (v Violation) Signature() string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%s\n", v.ID)
@@ -106,7 +132,7 @@ func (v Violation) Signature() string {
 	for _, f := range v.Facts {
 		// Values that are timestamps or elapsed times are excluded: the same
 		// defect at a different second is the same defect.
-		if strings.HasSuffix(f.Key, "_at") || f.Unit == "s" {
+		if isInstantFact(f) {
 			continue
 		}
 		if _, dup := byKey[f.Key]; !dup {
@@ -119,6 +145,19 @@ func (v Violation) Signature() string {
 		fmt.Fprintf(h, "%s=%s\n", k, byKey[k])
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// isInstantFact reports whether a fact records WHEN rather than WHAT, and so
+// must not enter a violation's identity. See [Violation.Signature].
+func isInstantFact(f Fact) bool {
+	if f.Unit == "s" || strings.HasSuffix(f.Key, "_at") || strings.HasSuffix(f.Key, ".at") {
+		return true
+	}
+	// The value test is the one that needs no naming discipline. Every
+	// timestamp this package emits goes through time.Format(time.RFC3339), so
+	// parsing it back is an exact test rather than a heuristic.
+	_, err := time.Parse(time.RFC3339, f.Value)
+	return err == nil
 }
 
 // String renders the violation the way the console should print it: the finding,
@@ -538,10 +577,13 @@ func (m *Monitor) Finalize() Summary {
 		sum.Manifest = m.ticks[len(m.ticks)-1].Obs.Faults
 	}
 
-	failed := 0
+	failed, warned := 0, 0
 	for _, v := range sum.Violations {
-		if v.Verdict == Fail {
+		switch v.Verdict {
+		case Fail:
 			failed++
+		case Warn:
+			warned++
 		}
 	}
 	// The ledger half of the "this run did something" floor, captured onto the
@@ -565,8 +607,19 @@ func (m *Monitor) Finalize() Summary {
 		sum.OK, sum.Why = false, floorWhy
 	default:
 		sum.OK = true
+		// "no violation" would be a lie whenever a WARN was recorded, and since
+		// IW15-031 that is an ordinary outcome rather than a rarity: I3 reports
+		// the lying-peer exemption as a WARN. A green bottom line that silently
+		// swallowed the caveat is precisely the disclosure failure this suite
+		// exists to prevent, so the count travels with the verdict.
 		sum.Why = fmt.Sprintf("%d sub-claims asserted across %d ticks against %d armed faults, with no violation",
 			sum.Asserted, len(m.ticks), len(sum.Manifest.Faults))
+		if warned > 0 {
+			sum.Why = fmt.Sprintf("%d sub-claims asserted across %d ticks against %d armed faults, with no P1 "+
+				"violation and %d WARN(s) recorded — read them: a WARN is an asserted claim that held with "+
+				"something adjacent worth stating, not an absence of findings",
+				sum.Asserted, len(m.ticks), len(sum.Manifest.Faults), warned)
+		}
 	}
 	return sum
 }

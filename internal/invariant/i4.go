@@ -78,6 +78,12 @@ func (i *i4) Check(ctx context.Context, w *World) (Result, error) {
 	}
 
 	res := Result{Verdict: Pass}
+	// I4 was the first invariant to name its own violation identity, and
+	// IW15-031 generalised the scheme to all ten. The three arms are three
+	// different findings and keep three different key prefixes; the worst
+	// verdict's key wins, so a run whose timing WARN fires before its accepted-
+	// write FAIL still files the P1 under the P1's name. See [keyer].
+	key := keysOf(&res)
 
 	// ── Arm 1: an unauthorized credential must never get a write accepted ──
 	unauthorized := 0
@@ -102,9 +108,7 @@ func (i *i4) Check(ctx context.Context, w *World) (Result, error) {
 		// campaign perturbs the world. Whether the commanded value is still
 		// visible downstream on any given tick is corroboration; the defect is
 		// the same defect either way. See Result.Key.
-		if res.Key == "" {
-			res.Key = fmt.Sprintf("accepted:%s:%d:%d:%s", r.Credential, r.Unit, r.Model, r.Point)
-		}
+		key.note(Fail, "accepted:%s:%d:%d:%s", r.Credential, r.Unit, r.Model, r.Point)
 		if res.Reason == "" {
 			res.Reason = fmt.Sprintf("credential %q (role %s) has no write authorization but write#%d was ACCEPTED "+
 				"on unit %d point %s", r.Credential, r.Role, r.Seq, r.Unit, r.Point)
@@ -142,9 +146,7 @@ func (i *i4) Check(ctx context.Context, w *World) (Result, error) {
 				F("i4.leaked."+w+".witness", "", v.Source, "%s", v.Label),
 				F("i4.leaked."+w+".value", string(cmd.Raw.Unit), v.Source, "%s", trimFloat(cmd.Raw.Val)),
 			)
-			if res.Key == "" {
-				res.Key = fmt.Sprintf("leaked:%s:%s:%s", r.Credential, r.Point, v.Label)
-			}
+			key.note(Fail, "leaked:%s:%s:%s", r.Credential, r.Point, v.Label)
 			if res.Reason == "" {
 				res.Reason = fmt.Sprintf("credential %q was denied write#%d, but its distinctive value %s "+
 					"is now present at %s — the write happened by some other path",
@@ -154,12 +156,19 @@ func (i *i4) Check(ctx context.Context, w *World) (Result, error) {
 	}
 
 	// ── Arm 3: denial shape must not vary with cause, within a stage ──────
-	shapeV, shapeChecked, shapeFacts, shapeReason := i.indistinguishable(auths)
+	shapeV, shapeChecked, shapeFacts, shapeReason, shapeKey := i.indistinguishable(auths)
 	res.Checked += shapeChecked
 	res.Verdict = Worse(res.Verdict, shapeV)
 	res.Facts = append(res.Facts, shapeFacts...)
 	if res.Reason == "" && shapeV != Pass {
 		res.Reason = shapeReason
+	}
+	if shapeV != Pass {
+		// This arm used to name no identity at all, so a run whose ONLY finding
+		// was a distinguishable denial (or a timing WARN) fell back to hashing
+		// facts that include the observed shapes and the measured means — both
+		// of which move every tick under a chaos campaign.
+		key.note(shapeV, "%s", shapeKey)
 	}
 
 	if res.Checked == 0 {
@@ -188,8 +197,11 @@ func (s denialShape) String() string {
 }
 
 // indistinguishable groups denials by stage and asserts that within a stage,
-// every cause produced the same shape.
-func (i *i4) indistinguishable(auths []AuthRecord) (Verdict, int, []Fact, string) {
+// every cause produced the same shape. Its last return value is the arm's
+// violation identity — the STAGE that leaked, or "denial-timing" for the WARN.
+// Neither carries the observed shapes or the measured means: those are exactly
+// the corroboration a chaos campaign perturbs.
+func (i *i4) indistinguishable(auths []AuthRecord) (Verdict, int, []Fact, string, string) {
 	// stage -> cause -> shapes seen
 	byStage := map[string]map[DenialCause]map[denialShape]int{}
 	rtt := map[string][]time.Duration{}
@@ -219,6 +231,7 @@ func (i *i4) indistinguishable(auths []AuthRecord) (Verdict, int, []Fact, string
 	verdict := Pass
 	var facts []Fact
 	reason := ""
+	key := ""
 	for _, stage := range sortedKeysOf(byStage) {
 		causes := byStage[stage]
 		if len(causes) < 2 {
@@ -246,6 +259,7 @@ func (i *i4) indistinguishable(auths []AuthRecord) (Verdict, int, []Fact, string
 		if reason == "" {
 			reason = fmt.Sprintf("at the %s stage, %d distinct denial shapes were observed across %d causes — "+
 				"an attacker can tell why they were denied", stage, len(shapes), len(causes))
+			key = "denial-shape:" + stage
 		}
 	}
 
@@ -256,9 +270,12 @@ func (i *i4) indistinguishable(auths []AuthRecord) (Verdict, int, []Fact, string
 		if reason == "" {
 			reason = treason
 		}
+		if key == "" {
+			key = "denial-timing"
+		}
 		checked++
 	}
-	return verdict, checked, facts, reason
+	return verdict, checked, facts, reason, key
 }
 
 // timingSkew reports a large mean-RTT difference between denial causes as a

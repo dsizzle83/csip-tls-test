@@ -88,9 +88,16 @@ func (i *i7) Check(ctx context.Context, w *World) (Result, error) {
 	}
 
 	res := Result{Verdict: Pass}
-	i.connectivityArm(w, obs, &res)
-	i.acknowledgementArm(obs, &res)
-	i.fidelityArm(obs, &res)
+	// I7's three arms judge three different claims the DUT made northbound, so
+	// they keep three different key prefixes. The acknowledgement arm carries
+	// the control mRID — the head-end's own stable name for the thing that was
+	// claimed. Kept OUT: `i7.claim.received`, an RFC3339 instant under a key
+	// ending in neither "_at" nor unit "s", and therefore one of the two facts
+	// whose entry into the fact hash was IW15-031's root cause. See [keyer].
+	key := keysOf(&res)
+	i.connectivityArm(w, obs, &res, key)
+	i.acknowledgementArm(obs, &res, key)
+	i.fidelityArm(obs, &res, key)
 
 	if res.Checked == 0 {
 		return skipf("the DUT's claims could not be corroborated: no DER publishes a request counter and no " +
@@ -107,7 +114,7 @@ func (i *i7) Check(ctx context.Context, w *World) (Result, error) {
 
 // connectivityArm checks a claimed-connected DERStatus against the DERs' own
 // request counters.
-func (i *i7) connectivityArm(w *World, obs *Observation, res *Result) {
+func (i *i7) connectivityArm(w *World, obs *Observation, res *Result, key *keyer) {
 	report, ok := newestReport(obs.HeadEnd.Reports, "DERStatus")
 	if !ok {
 		return
@@ -137,6 +144,10 @@ func (i *i7) connectivityArm(w *World, obs *Observation, res *Result) {
 	}
 	span := window[len(window)-1].At.Sub(window[0].At)
 	res.Verdict = Fail
+	// One DUT, one connectivity claim: the finding has no per-device identity
+	// to carry, and every tick that re-reads the same uncorroborated claim is
+	// the same finding.
+	key.note(Fail, "connectivity-claim-uncorroborated")
 	res.Facts = append(res.Facts,
 		F("i7.claim.resource", "", obs.HeadEnd.Source, "DERStatus at %s", report.Path),
 		F("i7.claim.received", "", obs.HeadEnd.Source, "%s", report.Received.Format(time.RFC3339)),
@@ -161,7 +172,7 @@ func (i *i7) connectivityArm(w *World, obs *Observation, res *Result) {
 
 // acknowledgementArm checks that a success Response corresponds to something
 // observable at a DER.
-func (i *i7) acknowledgementArm(obs *Observation, res *Result) {
+func (i *i7) acknowledgementArm(obs *Observation, res *Result, key *keyer) {
 	if len(obs.HeadEnd.Responses) == 0 {
 		return
 	}
@@ -187,6 +198,7 @@ func (i *i7) acknowledgementArm(obs *Observation, res *Result) {
 			continue
 		}
 		res.Verdict = Fail
+		key.note(Fail, "success-without-effect:%s", resp.Subject)
 		res.Facts = append(res.Facts,
 			F("i7.response.subject", "", obs.HeadEnd.Source, "%s", resp.Subject),
 			F("i7.response.status", "", obs.HeadEnd.Source, "%d (%s)", resp.Status, statusName(resp.Status)),
@@ -208,7 +220,7 @@ func (i *i7) acknowledgementArm(obs *Observation, res *Result) {
 }
 
 // fidelityArm compares a reported measurement against the device's own reading.
-func (i *i7) fidelityArm(obs *Observation, res *Result) {
+func (i *i7) fidelityArm(obs *Observation, res *Result, key *keyer) {
 	report, ok := newestReport(obs.HeadEnd.Reports, "DERStatus")
 	if !ok {
 		return
@@ -233,6 +245,7 @@ func (i *i7) fidelityArm(obs *Observation, res *Result) {
 		return
 	}
 	res.Verdict = Worse(res.Verdict, Warn)
+	key.note(Warn, "telemetry-divergence")
 	res.Facts = append(res.Facts,
 		F("i7.fidelity.reported_W", "W", obs.HeadEnd.Source, "%s", trimFloat(claim.W)),
 		F("i7.fidelity.measured_W", "W", "der register images", "%s (sum of %d DERs)", trimFloat(total), counted),

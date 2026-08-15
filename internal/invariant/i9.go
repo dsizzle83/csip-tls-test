@@ -95,6 +95,13 @@ func (i *i9) Check(ctx context.Context, w *World) (Result, error) {
 	budget, hasBudget := i.p.Duration("recovery_budget")
 
 	res := Result{Verdict: Pass}
+	// The identity is the CHANNEL that did not come back, named by the fault's
+	// target and kind rather than by its [Fault.ID]. The ID looks stable and is
+	// not: it embeds the arm-order index (`target.kind#n`), which renumbers
+	// between runs of the same seed and again under every shrink subset — so an
+	// ID-keyed signature would stop matching exactly when the shrinker needs it
+	// to. The elapsed times and the witness detail stay out too. See [keyer].
+	key := keysOf(&res)
 	var blind []string
 	for _, f := range cleared {
 		state, at, detail := i.recovered(w, obs, f)
@@ -130,6 +137,7 @@ func (i *i9) Check(ctx context.Context, w *World) (Result, error) {
 		}
 		if hasBudget && elapsed > budget {
 			res.Verdict = Fail
+			key.note(Fail, "no-recovery:%s:%s", f.Target, f.Kind)
 			res.Facts = append(res.Facts, append(facts,
 				F("i9."+f.ID+".budget", "s", "-param recovery_budget", "%s", dur(budget)))...)
 			if res.Reason == "" {
@@ -143,6 +151,7 @@ func (i *i9) Check(ctx context.Context, w *World) (Result, error) {
 			continue
 		}
 		res.Verdict = Worse(res.Verdict, Pending)
+		key.note(Pending, "no-recovery:%s:%s", f.Target, f.Kind)
 		res.Facts = append(res.Facts, facts...)
 		if res.Reason == "" {
 			res.Reason = fmt.Sprintf("%s was cleared %s ago and the %s channel has not recovered yet (%s); no "+
