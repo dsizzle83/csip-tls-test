@@ -266,6 +266,57 @@ func curveNPt(hdr *Layout, regs []uint16, maxNPt int) (int, error) {
 	return npt, nil
 }
 
+
+// ── Checked scaled writes (audit finding: silent scale-factor failures) ──────
+//
+// View.SetScaledUintAt / SetScaledSignedAt / SetScaledU32At return SILENTLY
+// when the scale factor cannot be read, leaving the register untouched while
+// the encoder reports success. For a point the caller actually commanded that
+// is a control that never reached the device and never said so. These wrappers
+// raise it as a *ScaleFactorError instead.
+//
+// NaN keeps its meaning — "not commanded" — and never raises: a device may
+// legitimately not implement a scale factor for a point nobody is writing.
+//
+// This is not an over-refusal risk for conformant hardware: every scale factor
+// in every 7xx curve model is declared MANDATORY by the vendored spec, so a
+// device that publishes one of these models and cannot produce a readable scale
+// factor for it is already non-conformant, and fail-closed is the right answer
+// for it (LXR-004). Asserted by TestCurveModelScaleFactorsAreMandatory.
+
+func setScaledUint(v View, model string, o int, val float64, sfName, point string) error {
+	if math.IsNaN(val) {
+		return nil
+	}
+	if _, ok := v.SF(sfName); !ok {
+		return &ScaleFactorError{Model: model, Point: point, SFName: sfName, Value: val}
+	}
+	v.SetScaledUintAt(o, val, sfName)
+	return nil
+}
+
+func setScaledSigned(v View, model string, o int, val float64, sfName, point string) error {
+	if math.IsNaN(val) {
+		return nil
+	}
+	if _, ok := v.SF(sfName); !ok {
+		return &ScaleFactorError{Model: model, Point: point, SFName: sfName, Value: val}
+	}
+	v.SetScaledSignedAt(o, val, sfName)
+	return nil
+}
+
+func setScaledU32(v View, model string, o int, val float64, sfName, point string) error {
+	if math.IsNaN(val) {
+		return nil
+	}
+	if _, ok := v.SF(sfName); !ok {
+		return &ScaleFactorError{Model: model, Point: point, SFName: sfName, Value: val}
+	}
+	v.SetScaledU32At(o, val, sfName)
+	return nil
+}
+
 // ── Model 705: DER Volt-Var ──────────────────────────────────────────────────
 
 type VVPoint struct{ V, Var float64 }
@@ -330,23 +381,31 @@ func Encode705Curve(regs []uint16, i int, c VoltVarCurve) (start, end int, err e
 		return 0, 0, fmt.Errorf("sunspec: M705 too short for curve %d", i)
 	}
 	co := func(p string) int { return base + L705Crv.Offset(p) }
+	if err := setScaledUint(h, "M705", co("VRef"), c.VRef, "V_SF", "VRef"); err != nil {
+		return 0, 0, err
+	}
+	if err := setScaledU32(h, "M705", co("RspTms"), c.RspTms, "RspTms_SF", "RspTms"); err != nil {
+		return 0, 0, err
+	}
+	for j, p := range c.Points {
+		po := PointOffset705(i, j, npt)
+		if err := setScaledUint(h, "M705", po, p.V, "V_SF", "V"); err != nil {
+			return 0, 0, err
+		}
+		if err := setScaledSigned(h, "M705", po+1, p.Var, "DeptRef_SF", "Var"); err != nil {
+			return 0, 0, err
+		}
+	}
 	h.SetU16At(co("ActPt"), uint16(len(c.Points)))
 	h.SetU16At(co("DeptRef"), c.DeptRef)
 	h.SetU16At(co("Pri"), c.Pri)
-	h.SetScaledUintAt(co("VRef"), c.VRef, "V_SF")
 	if c.VRefAutoEna {
 		h.SetU16At(co("VRefAutoEna"), 1)
 	} else {
 		h.SetU16At(co("VRefAutoEna"), 0)
 	}
 	h.SetU16At(co("VRefAutoTms"), uint16(c.VRefAutoTms))
-	h.SetScaledU32At(co("RspTms"), c.RspTms, "RspTms_SF")
 	h.SetU16At(co("ReadOnly"), 0)
-	for j, p := range c.Points {
-		po := PointOffset705(i, j, npt)
-		h.SetScaledUintAt(po, p.V, "V_SF")
-		h.SetScaledSignedAt(po+1, p.Var, "DeptRef_SF")
-	}
 	return base, base + L705Crv.Len() + 2*npt, nil
 }
 
@@ -403,15 +462,21 @@ func Encode706Curve(regs []uint16, i int, c VoltWattCurve) (start, end int, err 
 		return 0, 0, fmt.Errorf("sunspec: M706 too short for curve %d", i)
 	}
 	co := func(p string) int { return base + L706Crv.Offset(p) }
-	h.SetU16At(co("ActPt"), uint16(len(c.Points)))
-	h.SetU16At(co("DeptRef"), c.DeptRef)
-	h.SetScaledU32At(co("RspTms"), c.RspTms, "RspTms_SF")
-	h.SetU16At(co("ReadOnly"), 0)
+	if err := setScaledU32(h, "M706", co("RspTms"), c.RspTms, "RspTms_SF", "RspTms"); err != nil {
+		return 0, 0, err
+	}
 	for j, p := range c.Points {
 		po := PointOffset706(i, j, npt)
-		h.SetScaledUintAt(po, p.V, "V_SF")
-		h.SetScaledSignedAt(po+1, p.W, "DeptRef_SF")
+		if err := setScaledUint(h, "M706", po, p.V, "V_SF", "V"); err != nil {
+			return 0, 0, err
+		}
+		if err := setScaledSigned(h, "M706", po+1, p.W, "DeptRef_SF", "W"); err != nil {
+			return 0, 0, err
+		}
 	}
+	h.SetU16At(co("ActPt"), uint16(len(c.Points)))
+	h.SetU16At(co("DeptRef"), c.DeptRef)
+	h.SetU16At(co("ReadOnly"), 0)
 	return base, base + L706Crv.Len() + 2*npt, nil
 }
 
@@ -460,14 +525,19 @@ func Parse707Set(regs []uint16, i int) (VoltageTripSet, error) {
 	}, nil
 }
 
-func encodeTripVSub(h View, i, sub, npt int, pts []TripVPoint) {
+func encodeTripVSub(h View, i, sub, npt int, pts []TripVPoint) error {
 	subOff := SubCurveOffset707(i, sub, npt)
-	h.SetU16At(subOff, uint16(len(pts)))
 	for j, p := range pts {
 		po := subOff + 1 + j*tripVPtRegs
-		h.SetScaledUintAt(po, p.V, "V_SF")
-		h.SetScaledU32At(po+1, p.Tms, "Tms_SF")
+		if err := setScaledUint(h, "M707/708", po, p.V, "V_SF", "V"); err != nil {
+			return err
+		}
+		if err := setScaledU32(h, "M707/708", po+1, p.Tms, "Tms_SF", "Tms"); err != nil {
+			return err
+		}
 	}
+	h.SetU16At(subOff, uint16(len(pts)))
+	return nil
 }
 
 // Encode707Set writes curve-set i into a 707/708 block.
@@ -486,10 +556,14 @@ func Encode707Set(regs []uint16, i int, s VoltageTripSet) (start, end int, err e
 		return 0, 0, fmt.Errorf("sunspec: M707/708 too short for set %d", i)
 	}
 	h := L707Hdr.View(regs)
+	for sub, pts := range map[int][]TripVPoint{
+		SubMustTrip: s.MustTrip, SubMayTrip: s.MayTrip, SubMomCess: s.MomCess,
+	} {
+		if err := encodeTripVSub(h, i, sub, npt, pts); err != nil {
+			return 0, 0, err
+		}
+	}
 	h.SetU16At(base, 0) // ReadOnly = RW
-	encodeTripVSub(h, i, SubMustTrip, npt, s.MustTrip)
-	encodeTripVSub(h, i, SubMayTrip, npt, s.MayTrip)
-	encodeTripVSub(h, i, SubMomCess, npt, s.MomCess)
 	return base, base + tripVSetSize(npt), nil
 }
 
@@ -535,14 +609,19 @@ func Parse709Set(regs []uint16, i int) (FreqTripSet, error) {
 	}, nil
 }
 
-func encodeTripHzSub(h View, i, sub, npt int, pts []TripHzPoint) {
+func encodeTripHzSub(h View, i, sub, npt int, pts []TripHzPoint) error {
 	subOff := SubCurveOffset709(i, sub, npt)
-	h.SetU16At(subOff, uint16(len(pts)))
 	for j, p := range pts {
 		po := subOff + 1 + j*tripHzPtRegs
-		h.SetScaledU32At(po, p.Hz, "Hz_SF")
-		h.SetScaledU32At(po+2, p.Tms, "Tms_SF")
+		if err := setScaledU32(h, "M709/710", po, p.Hz, "Hz_SF", "Hz"); err != nil {
+			return err
+		}
+		if err := setScaledU32(h, "M709/710", po+2, p.Tms, "Tms_SF", "Tms"); err != nil {
+			return err
+		}
 	}
+	h.SetU16At(subOff, uint16(len(pts)))
+	return nil
 }
 
 func Encode709Set(regs []uint16, i int, s FreqTripSet) (start, end int, err error) {
@@ -560,10 +639,14 @@ func Encode709Set(regs []uint16, i int, s FreqTripSet) (start, end int, err erro
 		return 0, 0, fmt.Errorf("sunspec: M709/710 too short for set %d", i)
 	}
 	h := L709Hdr.View(regs)
+	for sub, pts := range map[int][]TripHzPoint{
+		SubMustTrip: s.MustTrip, SubMayTrip: s.MayTrip, SubMomCess: s.MomCess,
+	} {
+		if err := encodeTripHzSub(h, i, sub, npt, pts); err != nil {
+			return 0, 0, err
+		}
+	}
 	h.SetU16At(base, 0)
-	encodeTripHzSub(h, i, SubMustTrip, npt, s.MustTrip)
-	encodeTripHzSub(h, i, SubMayTrip, npt, s.MayTrip)
-	encodeTripHzSub(h, i, SubMomCess, npt, s.MomCess)
 	return base, base + tripHzSetSize(npt), nil
 }
 
@@ -604,11 +687,21 @@ func Encode711Ctl(regs []uint16, i int, c FreqDroopCtl) (start, end int, err err
 		return 0, 0, fmt.Errorf("sunspec: M711 too short for ctl %d", i)
 	}
 	co := func(p string) int { return base + L711Ctl.Offset(p) }
-	h.SetScaledU32At(co("DbOf"), c.DbOf, "Db_SF")
-	h.SetScaledU32At(co("DbUf"), c.DbUf, "Db_SF")
-	h.SetScaledUintAt(co("KOf"), c.KOf, "K_SF")
-	h.SetScaledUintAt(co("KUf"), c.KUf, "K_SF")
-	h.SetScaledU32At(co("RspTms"), c.RspTms, "RspTms_SF")
+	if err := setScaledU32(h, "M711", co("DbOf"), c.DbOf, "Db_SF", "DbOf"); err != nil {
+		return 0, 0, err
+	}
+	if err := setScaledU32(h, "M711", co("DbUf"), c.DbUf, "Db_SF", "DbUf"); err != nil {
+		return 0, 0, err
+	}
+	if err := setScaledUint(h, "M711", co("KOf"), c.KOf, "K_SF", "KOf"); err != nil {
+		return 0, 0, err
+	}
+	if err := setScaledUint(h, "M711", co("KUf"), c.KUf, "K_SF", "KUf"); err != nil {
+		return 0, 0, err
+	}
+	if err := setScaledU32(h, "M711", co("RspTms"), c.RspTms, "RspTms_SF", "RspTms"); err != nil {
+		return 0, 0, err
+	}
 	h.SetU16At(co("PMin"), uint16(int16(c.PMin)))
 	h.SetU16At(co("ReadOnly"), 0)
 	return base, base + L711Ctl.Len(), nil
@@ -667,15 +760,19 @@ func Encode712Curve(regs []uint16, i int, c WattVarCurve) (start, end int, err e
 		return 0, 0, fmt.Errorf("sunspec: M712 too short for curve %d", i)
 	}
 	co := func(p string) int { return base + L712Crv.Offset(p) }
+	for j, p := range c.Points {
+		po := PointOffset712(i, j, npt)
+		if err := setScaledSigned(h, "M712", po, p.W, "W_SF", "W"); err != nil {
+			return 0, 0, err
+		}
+		if err := setScaledSigned(h, "M712", po+1, p.Var, "DeptRef_SF", "Var"); err != nil {
+			return 0, 0, err
+		}
+	}
 	h.SetU16At(co("ActPt"), uint16(len(c.Points)))
 	h.SetU16At(co("DeptRef"), c.DeptRef)
 	h.SetU16At(co("Pri"), c.Pri)
 	h.SetU16At(co("ReadOnly"), 0)
-	for j, p := range c.Points {
-		po := PointOffset712(i, j, npt)
-		h.SetScaledSignedAt(po, p.W, "W_SF")
-		h.SetScaledSignedAt(po+1, p.Var, "DeptRef_SF")
-	}
 	return base, base + L712Crv.Len() + 2*npt, nil
 }
 

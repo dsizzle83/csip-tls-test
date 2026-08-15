@@ -4,20 +4,27 @@ package sunspec
 // 134/160), built on the declarative layouts in legacycurve.go.
 //
 // The shape mirrors der1547.go's 7xx parsers — engineering units throughout,
-// NaN for anything the device does not implement — with three rules that are
-// not negotiable and are the reason this file exists at all:
+// NaN for anything the device does not implement — with four rules that are not
+// negotiable and are the reason this file exists at all:
 //
-//  1. Bounds are checked BEFORE any register is touched: base + BlockLen must
-//     fit inside the register slice.
-//  2. ActPt is CLAMPED to min(NPt, 20). A device reporting ActPt = 200 must not
+//  1. EVERY bank access goes through the geometry gate first. A device whose
+//     declared L, NCrv and NPt do not agree with the model's spec block length
+//     has a register map this package cannot compute offsets in, so it is
+//     unreadable AND unwritable (ErrGeometryUnknown) rather than best-effort.
+//     Bounds-checking the slice is not a substitute: a device that publishes a
+//     SHORT block sized to its own NPt passes every bounds check and every
+//     computed offset lands in the wrong register.
+//  2. Scale-factor bindings, point widths and offsets are DERIVED FROM THE
+//     LAYOUT, never restated here as string literals. The layout is the one
+//     place a binding is proven against the vendored spec; a literal repeated
+//     in a reader and a writer is a wrong binding that round-trips green.
+//  3. ActPt is CLAMPED to min(NPt, 20). A device reporting ActPt = 200 must not
 //     walk off the end of its own block.
-//  3. Point access goes through the ABSOLUTE-offset accessors (ScaleUintAt,
-//     ScaleSignedAt, U16At …) because the scale factors live in the model
-//     header and a base-shifted sub-View cannot see them.
+//  4. Point access uses the ABSOLUTE-offset accessors because the scale factors
+//     live in the model header and a base-shifted sub-View cannot see them.
 //
-// Encoders use the CHECKED scale tier (EncodeScaleUint/EncodeScaleSigned) and
-// refuse a value they cannot represent — see ErrNotRepresentable for why the
-// legacy path does not inherit the 7xx encoders' silent clamp.
+// Encoders refuse — never silently clamp and never silently round — any value
+// the device would not receive exactly. See ErrNotRepresentable.
 
 import (
 	"fmt"
@@ -194,10 +201,272 @@ type MPPTStatus struct {
 	Modules []MPPTModule
 }
 
+// ── Layout-derived accessors ─────────────────────────────────────────────────
+//
+// Everything below reads a point's OFFSET, WIDTH, SIGNEDNESS and SCALE-FACTOR
+// BINDING out of the Layout. No call site in this file names a scale factor.
+
+// readScaled reads a scaled point by name, applying the scale factor the LAYOUT
+// binds it to, with signedness taken from the layout's declared type. NaN when
+// the point is absent from the layout, unimplemented on the device, or bound to
+// a scale factor outside the sunssf domain.
+func readScaled(v View, l *Layout, base int, point string) float64 {
+	f, ok := l.FieldOf(point)
+	if !ok {
+		return math.NaN()
+	}
+	o := base + l.Offset(point)
+	switch f.Type {
+	case Tint16:
+		return v.ScaleSignedAt(o, f.SF)
+	case Tuint16, Tenum16:
+		return v.ScaleUintAt(o, f.SF)
+	case Tuint32:
+		return v.ScaleU32At(o, f.SF)
+	case Tacc32:
+		// Accumulators reserve 0, not 0xFFFFFFFF, so full scale is real data
+		// and only a bad scale factor yields NaN.
+		s, ok := v.SF(f.SF)
+		if !ok {
+			return math.NaN()
+		}
+		return float64(v.U32At(o)) * math.Pow10(int(s))
+	}
+	return math.NaN()
+}
+
+// readRaw16 reads a single unscaled register by point name.
+func readRaw16(v View, l *Layout, base int, point string) uint16 {
+	o := l.Offset(point)
+	if o < 0 {
+		return 0
+	}
+	return v.U16At(base + o)
+}
+
+// readRaw32 reads an unscaled 32-bit point by name.
+func readRaw32(v View, l *Layout, base int, point string) uint32 {
+	o := l.Offset(point)
+	if o < 0 {
+		return 0
+	}
+	return v.U32At(base + o)
+}
+
+// readLayoutString reads a fixed-length string point, taking its width from the
+// layout rather than from a second literal at the call site (the width defect
+// that already bit model 701's MnAlrmInfo).
+func readLayoutString(regs []uint16, l *Layout, base int, point string) string {
+	f, ok := l.FieldOf(point)
+	if !ok || f.Type != Tstring {
+		return ""
+	}
+	return readString(regs, base+l.Offset(point), f.Len)
+}
+
+// stringWords packs a string into the register words of a fixed-length string
+// field, so a planned write can carry it without touching the buffer.
+func stringWords(s string, regLen int) []uint16 {
+	out := make([]uint16, regLen)
+	b := []byte(s)
+	for i := 0; i < regLen; i++ {
+		var hi, lo byte
+		if 2*i < len(b) {
+			hi = b[2*i]
+		}
+		if 2*i+1 < len(b) {
+			lo = b[2*i+1]
+		}
+		out[i] = uint16(hi)<<8 | uint16(lo)
+	}
+	return out
+}
+
+// quantises reports whether val loses information when encoded at sf — i.e. the
+// scaled value is not (within float tolerance) a whole register count.
+//
+// EncodeScaleUint/Signed round silently and report EncodeExact, so this check
+// is what makes the legacy encoders' contract "the device receives the value
+// that was commanded, or the write is refused" rather than "…or something
+// close". The tolerance is relative: 0.36 Hz at Hz_SF = −2 is 36 registers in
+// exact arithmetic but 35.999999999999996 in float64.
+func quantises(val float64, sf int16) bool {
+	scaled := val / math.Pow10(int(sf))
+	diff := math.Abs(scaled - math.Round(scaled))
+	return diff > 1e-9*math.Max(1, math.Abs(scaled))
+}
+
+// regWrite is one planned register write: an absolute body offset and the word
+// to put there.
+type regWrite struct {
+	off int
+	val uint16
+}
+
+// bankWriter plans a whole bank encode and applies it only if every part of it
+// succeeded.
+//
+// THE ENCODE IS ATOMIC ON THE CALLER'S BUFFER, and that is a contract, not a
+// nicety. §2.4's preflight rule is "all of these refuse before any register
+// moves": an encoder that writes points 1-4 and then refuses point 5 has left a
+// half-written curve in a buffer whose owner believes the operation failed. The
+// current callers all discard the buffer on error, so today the damage is
+// theoretical — but "it is safe because every caller happens to throw the
+// evidence away" is exactly the reasoning that stops being true the first time
+// someone retries a write in place, or hashes the block for a read-back
+// comparison after a refusal.
+//
+// Errors are sticky: the first failure is kept and every later call is a no-op,
+// so a caller can plan a whole bank and check once.
+type bankWriter struct {
+	v       View
+	l       *Layout
+	modelID uint16
+	base    int
+	w       []regWrite
+	err     error
+}
+
+func newBankWriter(v View, l *Layout, modelID uint16, base int) *bankWriter {
+	return &bankWriter{v: v, l: l, modelID: modelID, base: base}
+}
+
+// scaled plans an engineering value into a point by NAME, taking the register
+// offset, the signedness and the scale-factor binding from the layout.
+//
+// It refuses — with a *NotRepresentableError, never a silent clamp and never a
+// silent round — any value the device would not receive exactly. A NaN value
+// means "not commanded" and plans nothing, so a read-modify-write keeps the
+// device's own setting. A point with no scale factor is encoded at SF = 0,
+// which still refuses a fractional value rather than truncating it.
+func (b *bankWriter) scaled(point string, val float64) {
+	if b.err != nil || math.IsNaN(val) {
+		return
+	}
+	f, ok := b.l.FieldOf(point)
+	if !ok {
+		b.err = fmt.Errorf("sunspec: M%d has no point %s", b.modelID, point)
+		return
+	}
+	sf := int16(0)
+	if f.SF != "" {
+		s, ok := b.v.SF(f.SF)
+		if !ok {
+			b.err = &NotRepresentableError{ModelID: b.modelID, Point: point, Value: val, Outcome: EncodeBadSF}
+			return
+		}
+		sf = s
+	}
+	var (
+		raw uint16
+		out EncodeOutcome
+	)
+	switch f.Type {
+	case Tint16:
+		raw, out = EncodeScaleSigned(val, sf)
+	case Tuint16, Tenum16:
+		raw, out = EncodeScaleUint(val, sf)
+	default:
+		b.err = fmt.Errorf("sunspec: M%d point %s is type %v, not a 16-bit scalar", b.modelID, point, f.Type)
+		return
+	}
+	if !out.Representable() {
+		b.err = &NotRepresentableError{ModelID: b.modelID, Point: point, Value: val, SF: sf, Outcome: out}
+		return
+	}
+	if quantises(val, sf) {
+		b.err = &NotRepresentableError{ModelID: b.modelID, Point: point, Value: val, SF: sf,
+			Outcome: out, Quantised: true}
+		return
+	}
+	b.plan(point, raw)
+}
+
+// raw plans an unscaled single-register write by point name.
+func (b *bankWriter) raw(point string, val uint16) {
+	if b.err == nil {
+		b.plan(point, val)
+	}
+}
+
+// bit0 plans a bitfield write that sets or clears bit 0 while PRESERVING the
+// device's reserved bits — reading the current word, never assuming it.
+func (b *bankWriter) bit0(point string, on bool) {
+	if b.err != nil {
+		return
+	}
+	o := b.l.Offset(point)
+	if o < 0 {
+		b.err = fmt.Errorf("sunspec: M%d has no point %s", b.modelID, point)
+		return
+	}
+	word := b.v.U16At(b.base+o) &^ uint16(1)
+	if on {
+		word |= 1
+	}
+	b.plan(point, word)
+}
+
+// str plans a fixed-length string write, taking the width from the layout. An
+// empty string plans nothing: "no name given" must not blank the device's.
+func (b *bankWriter) str(point, s string) {
+	if b.err != nil || s == "" {
+		return
+	}
+	f, ok := b.l.FieldOf(point)
+	if !ok || f.Type != Tstring {
+		b.err = fmt.Errorf("sunspec: M%d has no string point %s", b.modelID, point)
+		return
+	}
+	o := b.base + b.l.Offset(point)
+	for i, word := range stringWords(s, f.Len) {
+		b.w = append(b.w, regWrite{off: o + i, val: word})
+	}
+}
+
+// points plans the bank's (x,y) slots. Slots beyond len(pts) are LEFT AS READ:
+// ActPt bounds what the device uses, and rewriting the tail would change
+// registers the command says nothing about.
+func (b *bankWriter) points(pts []LegacyCurvePoint, xAxis, yAxis string) {
+	for n := 1; n <= len(pts); n++ {
+		b.scaled(ptName(xAxis, n), pts[n-1].X)
+		b.scaled(ptName(yAxis, n), pts[n-1].Y)
+	}
+}
+
+func (b *bankWriter) plan(point string, val uint16) {
+	o := b.l.Offset(point)
+	if o < 0 {
+		b.err = fmt.Errorf("sunspec: M%d has no point %s", b.modelID, point)
+		return
+	}
+	b.w = append(b.w, regWrite{off: b.base + o, val: val})
+}
+
+// apply commits the planned writes, or none of them. It returns the modified
+// range [start,end), which ends at the bank's ReadOnly register: ReadOnly is the
+// DEVICE's declaration of whether the bank may be written, not a field the
+// gateway owns. (The 7xx encoders write ReadOnly = 0; the legacy ones must not.)
+func (b *bankWriter) apply() (start, end int, err error) {
+	if b.err != nil {
+		return 0, 0, b.err
+	}
+	for _, w := range b.w {
+		b.v.SetU16At(w.off, w.val)
+	}
+	return b.base, b.base + b.l.Offset("ReadOnly"), nil
+}
+
 // ── Header ───────────────────────────────────────────────────────────────────
 
 // ParseLegacyCurveHeader decodes the ActCrv-family header of a legacy curve
 // model from its body registers.
+//
+// This is deliberately the ONE accessor that does not run the geometry gate:
+// the header is the gate's INPUT (NCrv, NPt and ActCrv all live in it), so
+// gating it would make a geometry-unknown device undiagnosable. It reads header
+// registers only and computes no bank offset, so it cannot land in the wrong
+// place. Every accessor that computes a bank offset does run the gate.
 func ParseLegacyCurveHeader(modelID uint16, regs []uint16) (LegacyCurveHeader, error) {
 	hdr, _, _, ok := LegacyCurveLayouts(modelID)
 	if !ok {
@@ -208,52 +477,56 @@ func ParseLegacyCurveHeader(modelID uint16, regs []uint16) (LegacyCurveHeader, e
 			modelID, len(regs), hdr.Len())
 	}
 	v := hdr.View(regs)
-	raw := v.U16At(hdr.Offset("ModEna"))
+	raw := readRaw16(v, hdr, 0, "ModEna")
 	return LegacyCurveHeader{
-		ActCrv: int(v.U16At(hdr.Offset("ActCrv"))),
+		ActCrv: int(readRaw16(v, hdr, 0, "ActCrv")),
 		// ModEna is a bitfield16, not an enum16: bit 0 is ENABLED. Comparing
 		// the whole word against 1 would read a device that sets any reserved
 		// bit as disabled.
 		ModEna:    raw&1 != 0,
 		ModEnaRaw: raw,
-		WinTmsS:   int(v.U16At(hdr.Offset("WinTms"))),
-		RvrtTmsS:  int(v.U16At(hdr.Offset("RvrtTms"))),
-		RmpTmsS:   int(v.U16At(hdr.Offset("RmpTms"))),
-		NCrv:      int(v.U16At(hdr.Offset("NCrv"))),
-		NPt:       int(v.U16At(hdr.Offset("NPt"))),
+		WinTmsS:   int(readRaw16(v, hdr, 0, "WinTms")),
+		RvrtTmsS:  int(readRaw16(v, hdr, 0, "RvrtTms")),
+		RmpTmsS:   int(readRaw16(v, hdr, 0, "RmpTms")),
+		NCrv:      int(readRaw16(v, hdr, 0, "NCrv")),
+		NPt:       int(readRaw16(v, hdr, 0, "NPt")),
 	}, nil
 }
 
-// bankView bounds-checks bank i (1-based) of a legacy curve model and returns a
-// header-bound View (so scale factors resolve), the bank's base offset, and the
-// clamped active-point count.
+// bankView runs the fail-closed geometry gate and returns a header-bound View
+// (so scale factors resolve), the bank's base offset, and the clamped active-
+// point count.
+//
+// regs MUST be the whole model body as ReadModel returns it, because len(regs)
+// is what the gate reads as the device's declared L. Passing a sub-slice makes
+// the geometry incoherent and is refused — the fail-closed direction.
+//
+// THE GATE IS NOT OPTIONAL AND A BOUNDS CHECK IS NOT A SUBSTITUTE. Field
+// firmware exists that publishes a curve block sized to its own NPt instead of
+// the spec's fixed 20 slots. Such a device satisfies every bounds check: the
+// slice is long enough, the offsets are inside it, and the write lands — in the
+// wrong registers, of a bank the device may currently be executing.
 func bankView(modelID uint16, regs []uint16, i int) (v View, base, actPt int, err error) {
-	hdr, bank, blockLen, ok := LegacyCurveLayouts(modelID)
+	hdr, bank, _, ok := LegacyCurveLayouts(modelID)
 	if !ok {
 		return View{}, 0, 0, fmt.Errorf("sunspec: model %d is not a legacy curve model", modelID)
 	}
-	if len(regs) < hdr.Len() {
-		return View{}, 0, 0, fmt.Errorf("sunspec: M%d too short for header (%d < %d)",
-			modelID, len(regs), hdr.Len())
+	g, err := LegacyCurveGeometryOf(modelID, len(regs), regs)
+	if err != nil {
+		return View{}, 0, 0, err
 	}
-	base, ok = LegacyCurveOffset(modelID, i)
+	base, ok = g.BankOffset(i)
 	if !ok {
-		return View{}, 0, 0, fmt.Errorf("sunspec: M%d bank index %d is not 1-based-valid", modelID, i)
+		return View{}, 0, 0, &GeometryError{ModelID: modelID, Detail: fmt.Sprintf(
+			"bank %d is not addressable: banks are 1-based and this device declares NCrv=%d", i, g.NCrv)}
 	}
-	if base+blockLen > len(regs) {
-		return View{}, 0, 0, fmt.Errorf("sunspec: M%d too short for bank %d (need %d registers, have %d)",
-			modelID, i, base+blockLen, len(regs))
+	if base+g.BlockLen > len(regs) {
+		return View{}, 0, 0, &GeometryError{ModelID: modelID, Detail: fmt.Sprintf(
+			"bank %d needs registers up to %d but only %d were read", i, base+g.BlockLen, len(regs))}
 	}
 	v = hdr.View(regs)
-	npt := int(v.U16At(hdr.Offset("NPt")))
-	if npt > LegacyCurveSlots {
-		npt = LegacyCurveSlots
-	}
-	if npt < 0 {
-		npt = 0
-	}
-	actPt = int(v.U16At(base + bank.Offset("ActPt")))
-	if actPt > npt {
+	actPt = int(readRaw16(v, bank, base, "ActPt"))
+	if npt := g.UsablePoints(); actPt > npt {
 		actPt = npt
 	}
 	if actPt < 0 {
@@ -262,12 +535,8 @@ func bankView(modelID uint16, regs []uint16, i int) (v View, base, actPt int, er
 	return v, base, actPt, nil
 }
 
-// pointOffsets returns the absolute offsets of slot n (1-based) of a bank:
-// the x register and the y register, which are adjacent and interleaved.
-func pointOffsets(bank *Layout, base, n int, xName, yName string) (xo, yo int) {
-	s := itoa(n)
-	return base + bank.Offset(xName+s), base + bank.Offset(yName+s)
-}
+// ptName is the spec point name of slot n (1-based) on an axis: "V3", "VAr12".
+func ptName(axis string, n int) string { return axis + itoa(n) }
 
 // itoa avoids pulling strconv into the hot path for 1..20.
 func itoa(n int) string {
@@ -275,6 +544,32 @@ func itoa(n int) string {
 		return string(rune('0' + n))
 	}
 	return string(rune('0'+n/10)) + string(rune('0'+n%10))
+}
+
+// readPoints decodes the first actPt slots of a bank on the two named axes.
+func readPoints(v View, l *Layout, base, actPt int, xAxis, yAxis string) []LegacyCurvePoint {
+	pts := make([]LegacyCurvePoint, actPt)
+	for n := 1; n <= actPt; n++ {
+		pts[n-1] = LegacyCurvePoint{
+			X: readScaled(v, l, base, ptName(xAxis, n)),
+			Y: readScaled(v, l, base, ptName(yAxis, n)),
+		}
+	}
+	return pts
+}
+
+// checkPointCount refuses a curve with more points than the device supports,
+// before any register moves.
+func checkPointCount(modelID uint16, regs []uint16, npts int) error {
+	g, err := LegacyCurveGeometryOf(modelID, len(regs), regs)
+	if err != nil {
+		return err
+	}
+	if npts > g.UsablePoints() {
+		return fmt.Errorf("sunspec: M%d curve has %d points, device supports %d",
+			modelID, npts, g.UsablePoints())
+	}
+	return nil
 }
 
 // ── Model 126: Static Volt-VAR ───────────────────────────────────────────────
@@ -286,24 +581,16 @@ func ParseLegacy126Curve(regs []uint16, i int) (LegacyVoltVarCurve, error) {
 		return LegacyVoltVarCurve{}, err
 	}
 	b := L126Crv
-	c := LegacyVoltVarCurve{
+	return LegacyVoltVarCurve{
 		ActPt:        actPt,
-		DeptRef:      v.U16At(base + b.Offset("DeptRef")),
-		CrvNam:       readString(regs, base+b.Offset("CrvNam"), 8),
-		RmpTmsS:      float64(v.U16At(base + b.Offset("RmpTms"))),
-		RmpDecPctMin: v.ScaleUintAt(base+b.Offset("RmpDecTmm"), "RmpIncDec_SF"),
-		RmpIncPctMin: v.ScaleUintAt(base+b.Offset("RmpIncTmm"), "RmpIncDec_SF"),
-		ReadOnly:     v.U16At(base+b.Offset("ReadOnly")) == 1,
-		Pts:          make([]LegacyCurvePoint, actPt),
-	}
-	for n := 1; n <= actPt; n++ {
-		xo, yo := pointOffsets(b, base, n, "V", "VAr")
-		c.Pts[n-1] = LegacyCurvePoint{
-			X: v.ScaleUintAt(xo, "V_SF"),
-			Y: v.ScaleSignedAt(yo, "DeptRef_SF"),
-		}
-	}
-	return c, nil
+		DeptRef:      readRaw16(v, b, base, "DeptRef"),
+		CrvNam:       readLayoutString(regs, b, base, "CrvNam"),
+		RmpTmsS:      float64(readRaw16(v, b, base, "RmpTms")),
+		RmpDecPctMin: readScaled(v, b, base, "RmpDecTmm"),
+		RmpIncPctMin: readScaled(v, b, base, "RmpIncTmm"),
+		ReadOnly:     readRaw16(v, b, base, "ReadOnly") == 1,
+		Pts:          readPoints(v, b, base, actPt, "V", "VAr"),
+	}, nil
 }
 
 // EncodeLegacy126Curve writes c into bank i (1-based) of regs and returns the
@@ -321,33 +608,18 @@ func EncodeLegacy126Curve(regs []uint16, i int, c LegacyVoltVarCurve) (start, en
 	if err != nil {
 		return 0, 0, err
 	}
-	b := L126Crv
-	if err := checkPointCount(ModelVoltVarLegacy, v, len(c.Pts)); err != nil {
+	if err := checkPointCount(ModelVoltVarLegacy, regs, len(c.Pts)); err != nil {
 		return 0, 0, err
 	}
-	if err := encU16(v, ModelVoltVarLegacy, base+b.Offset("RmpDecTmm"), "RmpDecTmm", c.RmpDecPctMin, "RmpIncDec_SF"); err != nil {
-		return 0, 0, err
-	}
-	if err := encU16(v, ModelVoltVarLegacy, base+b.Offset("RmpIncTmm"), "RmpIncTmm", c.RmpIncPctMin, "RmpIncDec_SF"); err != nil {
-		return 0, 0, err
-	}
-	for n := 1; n <= len(c.Pts); n++ {
-		p := c.Pts[n-1]
-		xo, yo := pointOffsets(b, base, n, "V", "VAr")
-		if err := encU16(v, ModelVoltVarLegacy, xo, "V"+itoa(n), p.X, "V_SF"); err != nil {
-			return 0, 0, err
-		}
-		if err := encI16(v, ModelVoltVarLegacy, yo, "VAr"+itoa(n), p.Y, "DeptRef_SF"); err != nil {
-			return 0, 0, err
-		}
-	}
-	v.SetU16At(base+b.Offset("ActPt"), uint16(len(c.Pts)))
-	v.SetU16At(base+b.Offset("DeptRef"), c.DeptRef)
-	setOptU16(v, base+b.Offset("RmpTms"), c.RmpTmsS)
-	if c.CrvNam != "" {
-		writeString(regs, base+b.Offset("CrvNam"), 8, c.CrvNam)
-	}
-	return base, base + b.Offset("ReadOnly"), nil
+	w := newBankWriter(v, L126Crv, ModelVoltVarLegacy, base)
+	w.scaled("RmpTms", c.RmpTmsS)
+	w.scaled("RmpDecTmm", c.RmpDecPctMin)
+	w.scaled("RmpIncTmm", c.RmpIncPctMin)
+	w.points(c.Pts, "V", "VAr")
+	w.raw("ActPt", uint16(len(c.Pts)))
+	w.raw("DeptRef", c.DeptRef)
+	w.str("CrvNam", c.CrvNam)
+	return w.apply()
 }
 
 // ── Models 129 / 130: LVRT / HVRT must-disconnect ────────────────────────────
@@ -357,20 +629,12 @@ func parseLegacyRideThrough(modelID uint16, bank *Layout, regs []uint16, i int) 
 	if err != nil {
 		return LegacyRideThroughCurve{}, err
 	}
-	c := LegacyRideThroughCurve{
+	return LegacyRideThroughCurve{
 		ActPt:    actPt,
-		CrvNam:   readString(regs, base+bank.Offset("CrvNam"), 8),
-		ReadOnly: v.U16At(base+bank.Offset("ReadOnly")) == 1,
-		Pts:      make([]LegacyCurvePoint, actPt),
-	}
-	for n := 1; n <= actPt; n++ {
-		xo, yo := pointOffsets(bank, base, n, "Tms", "V")
-		c.Pts[n-1] = LegacyCurvePoint{
-			X: v.ScaleUintAt(xo, "Tms_SF"),
-			Y: v.ScaleUintAt(yo, "V_SF"),
-		}
-	}
-	return c, nil
+		CrvNam:   readLayoutString(regs, bank, base, "CrvNam"),
+		ReadOnly: readRaw16(v, bank, base, "ReadOnly") == 1,
+		Pts:      readPoints(v, bank, base, actPt, "Tms", "V"),
+	}, nil
 }
 
 func encodeLegacyRideThrough(modelID uint16, bank *Layout, regs []uint16, i int, c LegacyRideThroughCurve) (start, end int, err error) {
@@ -378,24 +642,14 @@ func encodeLegacyRideThrough(modelID uint16, bank *Layout, regs []uint16, i int,
 	if err != nil {
 		return 0, 0, err
 	}
-	if err := checkPointCount(modelID, v, len(c.Pts)); err != nil {
+	if err := checkPointCount(modelID, regs, len(c.Pts)); err != nil {
 		return 0, 0, err
 	}
-	for n := 1; n <= len(c.Pts); n++ {
-		p := c.Pts[n-1]
-		xo, yo := pointOffsets(bank, base, n, "Tms", "V")
-		if err := encU16(v, modelID, xo, "Tms"+itoa(n), p.X, "Tms_SF"); err != nil {
-			return 0, 0, err
-		}
-		if err := encU16(v, modelID, yo, "V"+itoa(n), p.Y, "V_SF"); err != nil {
-			return 0, 0, err
-		}
-	}
-	v.SetU16At(base+bank.Offset("ActPt"), uint16(len(c.Pts)))
-	if c.CrvNam != "" {
-		writeString(regs, base+bank.Offset("CrvNam"), 8, c.CrvNam)
-	}
-	return base, base + bank.Offset("ReadOnly"), nil
+	w := newBankWriter(v, bank, modelID, base)
+	w.points(c.Pts, "Tms", "V")
+	w.raw("ActPt", uint16(len(c.Pts)))
+	w.str("CrvNam", c.CrvNam)
+	return w.apply()
 }
 
 // ParseLegacy129Curve decodes bank i of a 129 (LVRT must-disconnect) block.
@@ -427,23 +681,15 @@ func ParseLegacy131Curve(regs []uint16, i int) (LegacyWattPFCurve, error) {
 		return LegacyWattPFCurve{}, err
 	}
 	b := L131Crv
-	c := LegacyWattPFCurve{
+	return LegacyWattPFCurve{
 		ActPt:        actPt,
-		CrvNam:       readString(regs, base+b.Offset("CrvNam"), 8),
-		RmpPT1TmsS:   float64(v.U16At(base + b.Offset("RmpPT1Tms"))),
-		RmpDecPctMin: v.ScaleUintAt(base+b.Offset("RmpDecTmm"), "RmpIncDec_SF"),
-		RmpIncPctMin: v.ScaleUintAt(base+b.Offset("RmpIncTmm"), "RmpIncDec_SF"),
-		ReadOnly:     v.U16At(base+b.Offset("ReadOnly")) == 1,
-		Pts:          make([]LegacyCurvePoint, actPt),
-	}
-	for n := 1; n <= actPt; n++ {
-		xo, yo := pointOffsets(b, base, n, "W", "PF")
-		c.Pts[n-1] = LegacyCurvePoint{
-			X: v.ScaleSignedAt(xo, "W_SF"),
-			Y: v.ScaleSignedAt(yo, "PF_SF"),
-		}
-	}
-	return c, nil
+		CrvNam:       readLayoutString(regs, b, base, "CrvNam"),
+		RmpPT1TmsS:   float64(readRaw16(v, b, base, "RmpPT1Tms")),
+		RmpDecPctMin: readScaled(v, b, base, "RmpDecTmm"),
+		RmpIncPctMin: readScaled(v, b, base, "RmpIncTmm"),
+		ReadOnly:     readRaw16(v, b, base, "ReadOnly") == 1,
+		Pts:          readPoints(v, b, base, actPt, "W", "PF"),
+	}, nil
 }
 
 // EncodeLegacy131Curve writes c into bank i of a 131 block.
@@ -452,32 +698,17 @@ func EncodeLegacy131Curve(regs []uint16, i int, c LegacyWattPFCurve) (start, end
 	if err != nil {
 		return 0, 0, err
 	}
-	b := L131Crv
-	if err := checkPointCount(ModelWattPFLegacy, v, len(c.Pts)); err != nil {
+	if err := checkPointCount(ModelWattPFLegacy, regs, len(c.Pts)); err != nil {
 		return 0, 0, err
 	}
-	if err := encU16(v, ModelWattPFLegacy, base+b.Offset("RmpDecTmm"), "RmpDecTmm", c.RmpDecPctMin, "RmpIncDec_SF"); err != nil {
-		return 0, 0, err
-	}
-	if err := encU16(v, ModelWattPFLegacy, base+b.Offset("RmpIncTmm"), "RmpIncTmm", c.RmpIncPctMin, "RmpIncDec_SF"); err != nil {
-		return 0, 0, err
-	}
-	for n := 1; n <= len(c.Pts); n++ {
-		p := c.Pts[n-1]
-		xo, yo := pointOffsets(b, base, n, "W", "PF")
-		if err := encI16(v, ModelWattPFLegacy, xo, "W"+itoa(n), p.X, "W_SF"); err != nil {
-			return 0, 0, err
-		}
-		if err := encI16(v, ModelWattPFLegacy, yo, "PF"+itoa(n), p.Y, "PF_SF"); err != nil {
-			return 0, 0, err
-		}
-	}
-	v.SetU16At(base+b.Offset("ActPt"), uint16(len(c.Pts)))
-	setOptU16(v, base+b.Offset("RmpPT1Tms"), c.RmpPT1TmsS)
-	if c.CrvNam != "" {
-		writeString(regs, base+b.Offset("CrvNam"), 8, c.CrvNam)
-	}
-	return base, base + b.Offset("ReadOnly"), nil
+	w := newBankWriter(v, L131Crv, ModelWattPFLegacy, base)
+	w.scaled("RmpPT1Tms", c.RmpPT1TmsS)
+	w.scaled("RmpDecTmm", c.RmpDecPctMin)
+	w.scaled("RmpIncTmm", c.RmpIncPctMin)
+	w.points(c.Pts, "W", "PF")
+	w.raw("ActPt", uint16(len(c.Pts)))
+	w.str("CrvNam", c.CrvNam)
+	return w.apply()
 }
 
 // ── Model 132: Volt-Watt ─────────────────────────────────────────────────────
@@ -489,24 +720,16 @@ func ParseLegacy132Curve(regs []uint16, i int) (LegacyVoltWattCurve, error) {
 		return LegacyVoltWattCurve{}, err
 	}
 	b := L132Crv
-	c := LegacyVoltWattCurve{
+	return LegacyVoltWattCurve{
 		ActPt:        actPt,
-		DeptRef:      v.U16At(base + b.Offset("DeptRef")),
-		CrvNam:       readString(regs, base+b.Offset("CrvNam"), 8),
-		RmpPt1TmsS:   float64(v.U16At(base + b.Offset("RmpPt1Tms"))),
-		RmpDecPctMin: v.ScaleUintAt(base+b.Offset("RmpDecTmm"), "RmpIncDec_SF"),
-		RmpIncPctMin: v.ScaleUintAt(base+b.Offset("RmpIncTmm"), "RmpIncDec_SF"),
-		ReadOnly:     v.U16At(base+b.Offset("ReadOnly")) == 1,
-		Pts:          make([]LegacyCurvePoint, actPt),
-	}
-	for n := 1; n <= actPt; n++ {
-		xo, yo := pointOffsets(b, base, n, "V", "W")
-		c.Pts[n-1] = LegacyCurvePoint{
-			X: v.ScaleUintAt(xo, "V_SF"),
-			Y: v.ScaleSignedAt(yo, "DeptRef_SF"),
-		}
-	}
-	return c, nil
+		DeptRef:      readRaw16(v, b, base, "DeptRef"),
+		CrvNam:       readLayoutString(regs, b, base, "CrvNam"),
+		RmpPt1TmsS:   float64(readRaw16(v, b, base, "RmpPt1Tms")),
+		RmpDecPctMin: readScaled(v, b, base, "RmpDecTmm"),
+		RmpIncPctMin: readScaled(v, b, base, "RmpIncTmm"),
+		ReadOnly:     readRaw16(v, b, base, "ReadOnly") == 1,
+		Pts:          readPoints(v, b, base, actPt, "V", "W"),
+	}, nil
 }
 
 // EncodeLegacy132Curve writes c into bank i of a 132 block.
@@ -515,33 +738,18 @@ func EncodeLegacy132Curve(regs []uint16, i int, c LegacyVoltWattCurve) (start, e
 	if err != nil {
 		return 0, 0, err
 	}
-	b := L132Crv
-	if err := checkPointCount(ModelVoltWattLegacy, v, len(c.Pts)); err != nil {
+	if err := checkPointCount(ModelVoltWattLegacy, regs, len(c.Pts)); err != nil {
 		return 0, 0, err
 	}
-	if err := encU16(v, ModelVoltWattLegacy, base+b.Offset("RmpDecTmm"), "RmpDecTmm", c.RmpDecPctMin, "RmpIncDec_SF"); err != nil {
-		return 0, 0, err
-	}
-	if err := encU16(v, ModelVoltWattLegacy, base+b.Offset("RmpIncTmm"), "RmpIncTmm", c.RmpIncPctMin, "RmpIncDec_SF"); err != nil {
-		return 0, 0, err
-	}
-	for n := 1; n <= len(c.Pts); n++ {
-		p := c.Pts[n-1]
-		xo, yo := pointOffsets(b, base, n, "V", "W")
-		if err := encU16(v, ModelVoltWattLegacy, xo, "V"+itoa(n), p.X, "V_SF"); err != nil {
-			return 0, 0, err
-		}
-		if err := encI16(v, ModelVoltWattLegacy, yo, "W"+itoa(n), p.Y, "DeptRef_SF"); err != nil {
-			return 0, 0, err
-		}
-	}
-	v.SetU16At(base+b.Offset("ActPt"), uint16(len(c.Pts)))
-	v.SetU16At(base+b.Offset("DeptRef"), c.DeptRef)
-	setOptU16(v, base+b.Offset("RmpPt1Tms"), c.RmpPt1TmsS)
-	if c.CrvNam != "" {
-		writeString(regs, base+b.Offset("CrvNam"), 8, c.CrvNam)
-	}
-	return base, base + b.Offset("ReadOnly"), nil
+	w := newBankWriter(v, L132Crv, ModelVoltWattLegacy, base)
+	w.scaled("RmpPt1Tms", c.RmpPt1TmsS)
+	w.scaled("RmpDecTmm", c.RmpDecPctMin)
+	w.scaled("RmpIncTmm", c.RmpIncPctMin)
+	w.points(c.Pts, "V", "W")
+	w.raw("ActPt", uint16(len(c.Pts)))
+	w.raw("DeptRef", c.DeptRef)
+	w.str("CrvNam", c.CrvNam)
+	return w.apply()
 }
 
 // ── Model 134: Curve-Based Frequency-Watt ────────────────────────────────────
@@ -553,28 +761,20 @@ func ParseLegacy134Curve(regs []uint16, i int) (LegacyFreqWattCurve, error) {
 		return LegacyFreqWattCurve{}, err
 	}
 	b := L134Crv
-	c := LegacyFreqWattCurve{
+	return LegacyFreqWattCurve{
 		ActPt:         actPt,
-		CrvNam:        readString(regs, base+b.Offset("CrvNam"), 8),
-		RmpPT1TmsS:    float64(v.U16At(base + b.Offset("RmpPT1Tms"))),
-		RmpDecPctMin:  v.ScaleUintAt(base+b.Offset("RmpDecTmm"), "RmpIncDec_SF"),
-		RmpIncPctMin:  v.ScaleUintAt(base+b.Offset("RmpIncTmm"), "RmpIncDec_SF"),
-		RmpRsUpPctMin: v.ScaleUintAt(base+b.Offset("RmpRsUp"), "RmpIncDec_SF"),
-		SnptW:         v.U16At(base+b.Offset("SnptW"))&1 != 0, // bitfield16, bit 0
-		WRefW:         v.ScaleUintAt(base+b.Offset("WRef"), "W_SF"),
-		WRefStrHz:     v.ScaleUintAt(base+b.Offset("WRefStrHz"), "Hz_SF"),
-		WRefStopHz:    v.ScaleUintAt(base+b.Offset("WRefStopHz"), "Hz_SF"),
-		ReadOnly:      v.U16At(base+b.Offset("ReadOnly")) == 1,
-		Pts:           make([]LegacyCurvePoint, actPt),
-	}
-	for n := 1; n <= actPt; n++ {
-		xo, yo := pointOffsets(b, base, n, "Hz", "W")
-		c.Pts[n-1] = LegacyCurvePoint{
-			X: v.ScaleUintAt(xo, "Hz_SF"),
-			Y: v.ScaleSignedAt(yo, "W_SF"),
-		}
-	}
-	return c, nil
+		CrvNam:        readLayoutString(regs, b, base, "CrvNam"),
+		RmpPT1TmsS:    float64(readRaw16(v, b, base, "RmpPT1Tms")),
+		RmpDecPctMin:  readScaled(v, b, base, "RmpDecTmm"),
+		RmpIncPctMin:  readScaled(v, b, base, "RmpIncTmm"),
+		RmpRsUpPctMin: readScaled(v, b, base, "RmpRsUp"),
+		SnptW:         readRaw16(v, b, base, "SnptW")&1 != 0, // bitfield16, bit 0
+		WRefW:         readScaled(v, b, base, "WRef"),
+		WRefStrHz:     readScaled(v, b, base, "WRefStrHz"),
+		WRefStopHz:    readScaled(v, b, base, "WRefStopHz"),
+		ReadOnly:      readRaw16(v, b, base, "ReadOnly") == 1,
+		Pts:           readPoints(v, b, base, actPt, "Hz", "W"),
+	}, nil
 }
 
 // EncodeLegacy134Curve writes c into bank i of a 134 block.
@@ -587,49 +787,22 @@ func EncodeLegacy134Curve(regs []uint16, i int, c LegacyFreqWattCurve) (start, e
 	if err != nil {
 		return 0, 0, err
 	}
-	b := L134Crv
-	if err := checkPointCount(ModelFreqWattLegacy, v, len(c.Pts)); err != nil {
+	if err := checkPointCount(ModelFreqWattLegacy, regs, len(c.Pts)); err != nil {
 		return 0, 0, err
 	}
-	for name, val := range map[string]float64{
-		"RmpDecTmm": c.RmpDecPctMin,
-		"RmpIncTmm": c.RmpIncPctMin,
-		"RmpRsUp":   c.RmpRsUpPctMin,
-	} {
-		if err := encU16(v, ModelFreqWattLegacy, base+b.Offset(name), name, val, "RmpIncDec_SF"); err != nil {
-			return 0, 0, err
-		}
-	}
-	if err := encU16(v, ModelFreqWattLegacy, base+b.Offset("WRef"), "WRef", c.WRefW, "W_SF"); err != nil {
-		return 0, 0, err
-	}
-	if err := encU16(v, ModelFreqWattLegacy, base+b.Offset("WRefStrHz"), "WRefStrHz", c.WRefStrHz, "Hz_SF"); err != nil {
-		return 0, 0, err
-	}
-	if err := encU16(v, ModelFreqWattLegacy, base+b.Offset("WRefStopHz"), "WRefStopHz", c.WRefStopHz, "Hz_SF"); err != nil {
-		return 0, 0, err
-	}
-	for n := 1; n <= len(c.Pts); n++ {
-		p := c.Pts[n-1]
-		xo, yo := pointOffsets(b, base, n, "Hz", "W")
-		if err := encU16(v, ModelFreqWattLegacy, xo, "Hz"+itoa(n), p.X, "Hz_SF"); err != nil {
-			return 0, 0, err
-		}
-		if err := encI16(v, ModelFreqWattLegacy, yo, "W"+itoa(n), p.Y, "W_SF"); err != nil {
-			return 0, 0, err
-		}
-	}
-	v.SetU16At(base+b.Offset("ActPt"), uint16(len(c.Pts)))
-	setOptU16(v, base+b.Offset("RmpPT1Tms"), c.RmpPT1TmsS)
-	snpt := v.U16At(base+b.Offset("SnptW")) &^ uint16(1) // preserve reserved bits
-	if c.SnptW {
-		snpt |= 1
-	}
-	v.SetU16At(base+b.Offset("SnptW"), snpt)
-	if c.CrvNam != "" {
-		writeString(regs, base+b.Offset("CrvNam"), 8, c.CrvNam)
-	}
-	return base, base + b.Offset("ReadOnly"), nil
+	w := newBankWriter(v, L134Crv, ModelFreqWattLegacy, base)
+	w.scaled("RmpPT1Tms", c.RmpPT1TmsS)
+	w.scaled("RmpDecTmm", c.RmpDecPctMin)
+	w.scaled("RmpIncTmm", c.RmpIncPctMin)
+	w.scaled("RmpRsUp", c.RmpRsUpPctMin)
+	w.scaled("WRef", c.WRefW)
+	w.scaled("WRefStrHz", c.WRefStrHz)
+	w.scaled("WRefStopHz", c.WRefStopHz)
+	w.points(c.Pts, "Hz", "W")
+	w.raw("ActPt", uint16(len(c.Pts)))
+	w.bit0("SnptW", c.SnptW)
+	w.str("CrvNam", c.CrvNam)
+	return w.apply()
 }
 
 // ── Models 127 / 128 / 160: no curve bank ────────────────────────────────────
@@ -640,8 +813,10 @@ func ParseLegacy127(regs []uint16) (FreqWattParam, error) {
 		return FreqWattParam{}, fmt.Errorf("sunspec: M127 too short (%d < %d)", len(regs), L127.Len())
 	}
 	v := L127.View(regs)
-	hys := v.U16At(L127.Offset("HysEna"))
-	mod := v.U16At(L127.Offset("ModEna"))
+	hys := readRaw16(v, L127, 0, "HysEna")
+	mod := readRaw16(v, L127, 0, "ModEna")
+	// View.Float resolves each point's scale factor from the layout itself, so
+	// these are already single-sourced.
 	return FreqWattParam{
 		WGraPctPMPerHz:   v.Float("WGra"),
 		HzStrHz:          v.Float("HzStr"),
@@ -660,7 +835,7 @@ func ParseLegacy128(regs []uint16) (DynReactiveCurrent, error) {
 		return DynReactiveCurrent{}, fmt.Errorf("sunspec: M128 too short (%d < %d)", len(regs), L128.Len())
 	}
 	v := L128.View(regs)
-	mod := v.U16At(L128.Offset("ModEna"))
+	mod := readRaw16(v, L128, 0, "ModEna")
 	arGraMod, _ := v.Enum("ArGraMod")
 	return DynReactiveCurrent{
 		ArGraMod:   arGraMod,
@@ -670,9 +845,9 @@ func ParseLegacy128(regs []uint16) (DynReactiveCurrent, error) {
 		DbVMax:     v.Float("DbVMax"),
 		BlkZnV:     v.Float("BlkZnV"),
 		HysBlkZnV:  v.Float("HysBlkZnV"),
-		BlkZnTmms:  int(v.U16At(L128.Offset("BlkZnTmms"))),
-		HoldTmms:   int(v.U16At(L128.Offset("HoldTmms"))),
-		FilTms:     int(v.U16At(L128.Offset("FilTms"))),
+		BlkZnTmms:  int(readRaw16(v, L128, 0, "BlkZnTmms")),
+		HoldTmms:   int(readRaw16(v, L128, 0, "HoldTmms")),
+		FilTms:     int(readRaw16(v, L128, 0, "FilTms")),
 		ModEna:     mod&1 != 0,
 		ModEnaRaw:  mod,
 	}, nil
@@ -687,135 +862,32 @@ func ParseLegacy160(regs []uint16) (MPPTStatus, error) {
 			len(regs), L160Hdr.Len())
 	}
 	h := L160Hdr.View(regs)
-	n := int(h.U16At(L160Hdr.Offset("N")))
+	n := int(readRaw16(h, L160Hdr, 0, "N"))
 	st := MPPTStatus{
 		Evt:     h.Bitfield32("Evt"),
 		N:       n,
-		TmsPerS: int(h.U16At(L160Hdr.Offset("TmsPer"))),
+		TmsPerS: int(readRaw16(h, L160Hdr, 0, "TmsPer")),
 	}
 	for i := 0; i < n; i++ {
 		base := MPPTModuleOffset(i)
 		if base+Blk160 > len(regs) {
 			break
 		}
-		mo := func(p string) int { return base + L160Mod.Offset(p) }
+		m := L160Mod
 		st.Modules = append(st.Modules, MPPTModule{
-			ID:    int(h.U16At(mo("ID"))),
-			IDStr: readString(regs, mo("IDStr"), 8),
-			DCA:   h.ScaleUintAt(mo("DCA"), "DCA_SF"),
-			DCV:   h.ScaleUintAt(mo("DCV"), "DCV_SF"),
-			DCW:   h.ScaleUintAt(mo("DCW"), "DCW_SF"),
-			DCWH:  scaleAcc32At(h, mo("DCWH"), "DCWH_SF"),
-			TmsS:  h.U32At(mo("Tms")),
-			// Tmp is degrees C with NO scale factor in the spec.
-			TmpC:  float64(h.I16At(mo("Tmp"))),
-			DCSt:  h.U16At(mo("DCSt")),
-			DCEvt: h.U32At(mo("DCEvt")),
+			ID:    int(readRaw16(h, m, base, "ID")),
+			IDStr: readLayoutString(regs, m, base, "IDStr"),
+			DCA:   readScaled(h, m, base, "DCA"),
+			DCV:   readScaled(h, m, base, "DCV"),
+			DCW:   readScaled(h, m, base, "DCW"),
+			DCWH:  readScaled(h, m, base, "DCWH"),
+			TmsS:  readRaw32(h, m, base, "Tms"),
+			// Tmp is degrees C with NO scale factor in the spec, so it is read
+			// raw rather than through readScaled.
+			TmpC:  float64(int16(readRaw16(h, m, base, "Tmp"))),
+			DCSt:  readRaw16(h, m, base, "DCSt"),
+			DCEvt: readRaw32(h, m, base, "DCEvt"),
 		})
 	}
 	return st, nil
-}
-
-// scaleAcc32At reads an acc32 at an absolute offset and applies the named SF.
-// Accumulators reserve 0 (not 0xFFFFFFFF) as their sentinel, so the full-scale
-// value is real data and only a bad scale factor yields NaN.
-func scaleAcc32At(v View, o int, sfName string) float64 {
-	s, ok := v.SF(sfName)
-	if !ok {
-		return math.NaN()
-	}
-	return float64(v.U32At(o)) * math.Pow10(int(s))
-}
-
-// ── Checked encode helpers ───────────────────────────────────────────────────
-
-// checkPointCount refuses a curve with more points than the device supports,
-// before any register moves.
-func checkPointCount(modelID uint16, v View, npts int) error {
-	hdr, _, _, _ := LegacyCurveLayouts(modelID)
-	npt := int(v.U16At(hdr.Offset("NPt")))
-	if npt > LegacyCurveSlots {
-		npt = LegacyCurveSlots
-	}
-	if npts > npt {
-		return fmt.Errorf("sunspec: M%d curve has %d points, device supports %d", modelID, npts, npt)
-	}
-	return nil
-}
-
-// quantises reports whether val loses information when encoded at sf — i.e. the
-// scaled value is not (within float tolerance) a whole register count.
-//
-// EncodeScaleUint/Signed round silently and report EncodeExact, so this check
-// is what makes the legacy encoders' contract "the device receives the value
-// that was commanded, or the write is refused" rather than "…or something
-// close". The tolerance is relative: 0.36 Hz at Hz_SF = −2 is 36 registers in
-// exact arithmetic but 35.999999999999996 in float64.
-func quantises(val float64, sf int16) bool {
-	scaled := val / math.Pow10(int(sf))
-	diff := math.Abs(scaled - math.Round(scaled))
-	return diff > 1e-9*math.Max(1, math.Abs(scaled))
-}
-
-// encU16 encodes an engineering value into an unsigned point at an absolute
-// offset. It refuses — with a *NotRepresentableError, never a silent clamp or
-// a silent round — any value that the device would not receive exactly. A NaN
-// value means "not commanded" and leaves the register untouched, so a
-// read-modify-write keeps the device's own setting.
-func encU16(v View, modelID uint16, off int, point string, val float64, sfName string) error {
-	if math.IsNaN(val) {
-		return nil
-	}
-	sf, ok := v.SF(sfName)
-	if !ok {
-		return &NotRepresentableError{ModelID: modelID, Point: point, Value: val, Outcome: EncodeBadSF}
-	}
-	raw, out := EncodeScaleUint(val, sf)
-	if !out.Representable() {
-		return &NotRepresentableError{ModelID: modelID, Point: point, Value: val, SF: sf, Outcome: out}
-	}
-	if quantises(val, sf) {
-		return &NotRepresentableError{ModelID: modelID, Point: point, Value: val, SF: sf,
-			Outcome: out, Quantised: true}
-	}
-	v.SetU16At(off, raw)
-	return nil
-}
-
-// encI16 is encU16 for a signed point.
-func encI16(v View, modelID uint16, off int, point string, val float64, sfName string) error {
-	if math.IsNaN(val) {
-		return nil
-	}
-	sf, ok := v.SF(sfName)
-	if !ok {
-		return &NotRepresentableError{ModelID: modelID, Point: point, Value: val, Outcome: EncodeBadSF}
-	}
-	raw, out := EncodeScaleSigned(val, sf)
-	if !out.Representable() {
-		return &NotRepresentableError{ModelID: modelID, Point: point, Value: val, SF: sf, Outcome: out}
-	}
-	if quantises(val, sf) {
-		return &NotRepresentableError{ModelID: modelID, Point: point, Value: val, SF: sf,
-			Outcome: out, Quantised: true}
-	}
-	v.SetU16At(off, raw)
-	return nil
-}
-
-// setOptU16 writes an UNSCALED optional whole-second field, leaving it untouched
-// when the caller passes NaN ("not commanded") and clamping a finite value onto
-// the max-valid edge rather than onto the reserved 0xFFFF sentinel.
-func setOptU16(v View, off int, val float64) {
-	if math.IsNaN(val) {
-		return
-	}
-	r := math.Round(val)
-	if r < 0 {
-		r = 0
-	}
-	if r > maxValidU16 {
-		r = maxValidU16
-	}
-	v.SetU16At(off, uint16(r))
 }

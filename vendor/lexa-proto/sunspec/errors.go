@@ -28,6 +28,39 @@ func (e *GeometryError) Error() string {
 
 func (e *GeometryError) Unwrap() error { return ErrGeometryUnknown }
 
+// ErrScaleFactorUnavailable is the sentinel for "this point was commanded, but
+// the scale factor it is encoded against cannot be read".
+//
+// The View setters (SetScaledUintAt / SetScaledSignedAt / SetScaledU32At /
+// SetFloat) return SILENTLY when View.SF fails — the scale-factor point is
+// absent, carries the 0x8000 not-implemented sentinel, or is outside the sunssf
+// domain [−10,+10] (LXR-004). Silence is the wrong answer for a COMMANDED
+// value: the register keeps whatever it held, the encoder reports success, and
+// the read-back comparison becomes the only thing standing between that and a
+// control the operator believes is in force. The 7xx curve encoders surface it
+// instead of swallowing it.
+//
+// A value the caller did NOT command (NaN) never raises this: a device is
+// entitled not to implement a scale factor for a point nobody is writing.
+var ErrScaleFactorUnavailable = errors.New("sunspec: scale factor unreadable for a commanded point")
+
+// ScaleFactorError names the point that could not be encoded and the
+// scale-factor register that was unreadable. It unwraps to
+// ErrScaleFactorUnavailable.
+type ScaleFactorError struct {
+	Model  string  // model label, e.g. "M705"
+	Point  string  // the point being written, e.g. "VRef"
+	SFName string  // the scale-factor point that could not be read
+	Value  float64 // the engineering value that was commanded
+}
+
+func (e *ScaleFactorError) Error() string {
+	return fmt.Sprintf("sunspec: %s point %s: cannot encode %g — scale factor %s is absent, "+
+		"not implemented, or outside the sunssf domain", e.Model, e.Point, e.Value, e.SFName)
+}
+
+func (e *ScaleFactorError) Unwrap() error { return ErrScaleFactorUnavailable }
+
 // ErrNotRepresentable is the sentinel for a value that cannot be encoded at the
 // device's declared scale factor.
 //

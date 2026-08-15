@@ -161,6 +161,22 @@ func (l *Layout) Offset(name string) int {
 	return -1
 }
 
+// FieldOf returns the layout's own declaration of a named point — its type, its
+// scale-factor binding and its width.
+//
+// It exists so decode and encode can DERIVE a point's scale factor from the
+// layout instead of restating it as a string literal at each call site. A
+// restated binding is a defect class a round-trip test structurally cannot see:
+// if the reader and the writer name the same WRONG scale factor, the value
+// round-trips green and only the device receives a curve that is wrong by a
+// power of ten. The layout is the one place a binding is proven against the
+// vendored spec (TestLayoutsMatchVendoredSpec), so it is the one place a
+// binding may be stated.
+func (l *Layout) FieldOf(name string) (Field, bool) {
+	f, ok := l.typ[name]
+	return f, ok
+}
+
 // View binds a layout to a register slice for reading and writing.
 func (l *Layout) View(regs []uint16) View { return View{regs: regs, l: l, base: 0} }
 
