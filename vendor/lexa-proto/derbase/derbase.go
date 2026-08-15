@@ -133,6 +133,24 @@ type Base struct {
 	// for why the value is a policy knob and not a magic 5 (adopted D7).
 	LegacyRmpTms uint16
 
+	// LegacyRewriteBudget bounds a legacy curve Case-B rewrite — the window in
+	// which a live grid-support function is DISABLED because its only writable
+	// bank is the one being rewritten. Zero uses legacyRewriteBudgetDefault
+	// (5 s). The caller holds the per-device transport mutex for the whole
+	// window, so this is a poll-starvation bound as much as a safety one.
+	LegacyRewriteBudget time.Duration
+
+	// legacyLockout records legacy curve models this device may no longer be
+	// written on, keyed by model ID with the reason.
+	//
+	// It exists for exactly one situation: a ride-through write whose
+	// verification failed AND whose ActCrv restore also failed
+	// (LegacyTripRestoreError). An unverified trip boundary is then live, which
+	// is bounded and alarmed but must not be compounded by further attempts —
+	// so the model is refused until the device is re-admitted. It is a map so
+	// one bad model does not lock out the device's other axes.
+	legacyLockout map[uint16]string
+
 	// noGroupedM123 memoizes that this device refused a grouped (single FC16)
 	// M123 write, so later plans go straight to the element-by-element
 	// sequence instead of paying the refusal every time (adopted D8). Sticky

@@ -424,13 +424,30 @@ func (b *bankWriter) str(point, s string) {
 	}
 }
 
-// points plans the bank's (x,y) slots. Slots beyond len(pts) are LEFT AS READ:
-// ActPt bounds what the device uses, and rewriting the tail would change
-// registers the command says nothing about.
+// points plans the bank's (x,y) slots, and ZEROES every slot beyond len(pts).
+//
+// The zero-fill is a safety rule, not tidiness. A legacy bank always publishes
+// 20 slots whatever NPt says, so a bank that previously held a ten-point curve
+// keeps points 5-10 visible after a four-point curve is written into it. ActPt
+// is what bounds a CONFORMING device — but a device that ignores ActPt and
+// interpolates all 20 slots would then be running a curve made of half the new
+// command and half the old one, which is a curve nobody authored and nobody
+// can name. Zeroing makes that non-conformance fail SAFE (a degenerate curve
+// collapsing to the origin) rather than weirdly, and it makes the bank's
+// register content a function of the command alone — which is what lets the
+// read-back verification be an exact whole-range comparison.
+//
+// Zeroes are planned as RAW words rather than scaled values because raw 0 is
+// engineering 0 at every scale factor: there is no representability question to
+// answer and no scale factor that could refuse it.
 func (b *bankWriter) points(pts []LegacyCurvePoint, xAxis, yAxis string) {
 	for n := 1; n <= len(pts); n++ {
 		b.scaled(ptName(xAxis, n), pts[n-1].X)
 		b.scaled(ptName(yAxis, n), pts[n-1].Y)
+	}
+	for n := len(pts) + 1; n <= LegacyCurveSlots; n++ {
+		b.raw(ptName(xAxis, n), 0)
+		b.raw(ptName(yAxis, n), 0)
 	}
 }
 
