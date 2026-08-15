@@ -258,9 +258,22 @@ func TestBASIC012MeasuresTheCurveOnLegacyAndTheDroopOn7xx(t *testing.T) {
 		t.Errorf("BASIC-012 on a 7xx bench resolved to M%d with no-home=%q, want M711 with the "+
 			"no-register-home refusal for the BREAKPOINTS intact", target7.Model, target7.NoRegisterHome)
 	}
-	if dt := b.Droop.resolve(gen7xx); dt.Model != sunspec.ModelDERFreqDroop || dt.NoRegisterHome != "" {
+	if dt := b.Droop.resolve(invariant.Family7xx); dt.Model != sunspec.ModelDERFreqDroop ||
+		dt.NoRegisterHome != "" {
 		t.Errorf("BASIC-012's droop resolved to M%d with no-home=%q on 7xx, want M711 with a real home",
 			dt.Model, dt.NoRegisterHome)
+	}
+	// The oracle's own measurability predicate must agree with the record the
+	// bundle prints, on BOTH generations — they were two predicates once, and
+	// the disagreement was a PASS with an authored element neither compared nor
+	// disclosed.
+	if !b.Droop.hasHome(invariant.Family7xx) {
+		t.Error("BASIC-012's droop reports no 7xx home, so the oracle would skip the one half this " +
+			"generation can measure")
+	}
+	if b.Droop.hasHome(invariant.FamilyLegacy) {
+		t.Error("BASIC-012's droop claims a legacy home, so the unmappable clause would drop it from the " +
+			"legacy verdict while nothing measured it")
 	}
 	got7 := oracleCurve(b)(context.Background(), sevenXx.rc)
 	if got7.Verdict != certify.Fail {

@@ -503,6 +503,16 @@ func TestAdminCurve_ActivatingPostDropsTheCurvesItTruncated(t *testing.T) {
 			t.Fatalf("GET %s (curve %d) = %d before the truncating POST; this test cannot show a drop "+
 				"that never had anything to drop", m["curve_href"], i, got)
 		}
+		// And the timing element really IS on them, or the openLoopTms half of
+		// the leak assertion below would be vacuous: a server ignoring the field
+		// serves nil there both before and after, and "no stale openLoopTms"
+		// would pass against a bench that can author none at all.
+		var c model.DERCurve
+		getXML(t, s, m["curve_href"], &c)
+		if c.OpenLoopTms == nil || *c.OpenLoopTms != 5 {
+			t.Fatalf("curve %d at %s serves openLoopTms=%v, want 5 — the fixture never armed the element "+
+				"whose leak this test is about", i, m["curve_href"], c.OpenLoopTms)
+		}
 	}
 	if want := "/derp/1/dc/2"; minted[2]["curve_href"] != want {
 		t.Fatalf("the third append landed at %s, want %s", minted[2]["curve_href"], want)

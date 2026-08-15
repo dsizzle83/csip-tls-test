@@ -307,6 +307,89 @@ func TestOracleCurve_BothHalvesMustHoldAndTheWorseOneDecides(t *testing.T) {
 	}
 }
 
+// TestOracleCurve_MeasurabilityAndDisclosureCannotComeApart pins the invariant
+// that binds the oracle's decision to the bundle's record: an authored element
+// is either MEASURED or DISCLOSED as unmeasurable, and never neither.
+//
+// It is tested against the two droop-arm shapes that broke it while the two
+// decisions were made by two different predicates:
+//
+//   - the NEAREST-MODEL-PLUS-STATED-REFUSAL idiom the curve arms already use
+//     (BASIC-012's own 7xx curve arm is Model7xx: 711 WITH NoRegisterHome7xx
+//     set). A model IS named, so a predicate asking "is a model named?" called
+//     it measurable and dropped it from the unmappable clause, while the oracle,
+//     asking "did the resolved arm state an absence?", skipped it. Neither
+//     compared nor disclosed: a PASS covering content nothing looked at.
+//   - a row DECLARING NOTHING for the generation it is run on. That used to
+//     resolve to {Model: 0, no stated absence}, which reads as measurable, so
+//     the oracle asked the DER for SunSpec model 0 and reported "carries
+//     NOTHING for it" about a model that does not exist — beside a clause
+//     saying nothing was asserted.
+//
+// Both run through the SHIPPING oracle against a real DER, so a predicate that
+// drifts apart again fails here rather than in a bundle.
+func TestOracleCurve_MeasurabilityAndDisclosureCannotComeApart(t *testing.T) {
+	settings := FreqDroopSettings{DBOF: 60030, DBUF: 59970, KOF: 40, KUF: 40, OpenLoopTms: 600}
+	for _, tc := range []struct {
+		name  string
+		droop *droopBinding
+	}{
+		{"a nearest-model arm that refuses to grade against it", &droopBinding{
+			Settings:          settings,
+			Model7xx:          sunspec.ModelDERFreqDroop,
+			Mapping7xx:        "a synthetic binding, for this test only",
+			NoRegisterHome7xx: "a synthetic binding: this arm names its nearest model and refuses it",
+		}},
+		{"an arm this row declares nothing for", &droopBinding{Settings: settings}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCurveFixture(t)
+			b := &curveBinding{
+				Mode:       "volt_var",
+				Points:     []CurvePoint{{X: 9100, Y: 4000}, {X: 10600, Y: -4000}},
+				XMult:      -2,
+				YMult:      -2,
+				YRefType:   derUnitRefStatVarAvail,
+				Prescribed: "a synthetic binding, for this test only",
+				Model7xx:   sunspec.ModelDERVoltVar,
+				Mapping7xx: "a synthetic binding, for this test only",
+				Droop:      tc.droop,
+			}
+			// Put the CURVE half in a state that passes on its own, so what
+			// happens to the droop is the only thing left to decide the row.
+			pts := make([]sunspec.VVPoint, 0, len(b.Points))
+			for _, p := range b.wantPoints() {
+				pts = append(pts, sunspec.VVPoint{V: p.X, Var: p.Y})
+			}
+			deptRef, ok := b.wantDeptRef(sunspec.ModelDERVoltVar)
+			if !ok {
+				t.Fatal("the synthetic binding's yRefType has no DeptRef translation")
+			}
+			f.adoptVoltVar(t, deptRef, pts)
+
+			got := oracleCurve(b)(context.Background(), f.rc)
+			if b.Droop.hasHome(invariant.Family7xx) {
+				t.Fatal("this fixture's droop arm reports a register home, so it does not exercise the " +
+					"unmeasurable path it was written for")
+			}
+			// Not measured — so it MUST be disclosed, by name.
+			if !strings.Contains(got.Observed, "AUTHORED BUT NOT DEVICE-MAPPABLE") ||
+				!strings.Contains(got.Observed, droopElement) {
+				t.Errorf("the droop was neither measured nor disclosed — a verdict covering an element "+
+					"nothing looked at:\n%s", got.Observed)
+			}
+			// And nothing may claim to have READ a bank for it.
+			if strings.Contains(got.Observed, "live control holds exactly the droop parameters") {
+				t.Errorf("the verdict reports a droop measurement the oracle declined to make:\n%s",
+					got.Observed)
+			}
+			if strings.Contains(got.Observed, "M0 ") || strings.Contains(got.Observed, "model 0") {
+				t.Errorf("the verdict describes SunSpec model 0, which does not exist:\n%s", got.Observed)
+			}
+		})
+	}
+}
+
 // ── The RED case: the product's actual posture ──────────────────────────────
 
 // TestOracleCurve_UnadoptedDERIsAFail is the finding, reproduced.

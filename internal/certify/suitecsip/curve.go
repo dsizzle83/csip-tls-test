@@ -276,25 +276,63 @@ type droopTarget struct {
 	NoRegisterHome string
 }
 
-// resolveDroop picks the droop half's register home from the generation the DER
-// turned out to be, mirroring resolveTarget for the breakpoint half.
+// resolve picks the droop half's register home for a FAMILY, mirroring
+// resolveTarget for the breakpoint half.
 //
-// A generation this row declares NEITHER a model NOR a stated absence for
-// resolves to "no home, and this row does not say why" — reported as an absence
-// rather than silently skipped, because a row that authored an element and then
-// asserted nothing about it, without saying so, is the overclaim this whole
-// mechanism exists to prevent.
-func (d *droopBinding) resolve(gen curveGeneration) droopTarget {
-	switch gen {
-	case genLegacy:
-		return droopTarget{Model: d.ModelLegacy, Mapping: d.MappingLegacy,
+// IT TAKES THE FAMILY THE BREAKPOINT HALF RESOLVED TO, not the generation read
+// off the device, and the difference is not academic. resolveTarget has a
+// named-model FALLBACK: a DER whose generation is unrecognised, or one whose
+// generation the row has no arm for, can still resolve its breakpoints against
+// whichever named model the device does serve. Resolving the droop from
+// curveGenerationOf() instead would let one verdict adjudicate its two halves
+// on two different generations — the composed sentence would say "on a legacy
+// DER" about one and "on a 7xx DER" about the other, and the unmappable clause
+// would be computed for a third answer again.
+//
+// A family this row declares NEITHER a model NOR a stated absence for resolves
+// to a NAMED ABSENCE, never to a measurable-looking target with model 0. The
+// earlier version returned {Model: 0, NoRegisterHome: ""} there, which read as
+// "measurable" one caller up: the oracle then asked the device for SunSpec
+// model 0, failed to decode it, and reported "the DER's register image carries
+// nothing for it" about a model that does not exist — beside an unmappable
+// clause saying nothing was asserted. One verdict, two contradictory sentences.
+// resolveTarget guards exactly this case; this now guards it identically.
+func (d *droopBinding) resolve(fam invariant.CurveFamily) droopTarget {
+	var t droopTarget
+	switch fam {
+	case invariant.FamilyLegacy:
+		t = droopTarget{Model: d.ModelLegacy, Mapping: d.MappingLegacy,
 			NoRegisterHome: d.NoRegisterHomeLegacy}
-	case gen7xx:
-		return droopTarget{Model: d.Model7xx, Mapping: d.Mapping7xx,
+	case invariant.Family7xx:
+		t = droopTarget{Model: d.Model7xx, Mapping: d.Mapping7xx,
 			NoRegisterHome: d.NoRegisterHome7xx}
+	default:
+		return droopTarget{NoRegisterHome: "this DER's SunSpec curve generation could not be determined, " +
+			"so which register bank (if any) would hold an authored opModFreqDroop on it has no answer here"}
 	}
-	return droopTarget{NoRegisterHome: "this DER's SunSpec curve generation could not be determined, so " +
-		"which register bank (if any) would hold an authored opModFreqDroop on it has no answer here"}
+	if t.Model == 0 && t.NoRegisterHome == "" {
+		t.NoRegisterHome = "this row declares no opModFreqDroop arm for the " + string(fam) + " generation " +
+			"at all — neither a register home nor a reason there is none — so nothing southbound can be " +
+			"asserted about the droop it authored, and this run says so rather than grading a bank no row " +
+			"named"
+	}
+	return t
+}
+
+// hasHome reports whether this droop has a register home on a family, by the
+// SAME rule the oracle uses to decide whether to measure it.
+//
+// It exists because the two decisions were made in two places and disagreed.
+// authored() asked "is a Model named?" while the oracle asked "did the resolved
+// arm state an absence?", and the nearest-model-plus-stated-refusal idiom the
+// curve arms already use (BASIC-012's own 7xx curve arm is Model7xx: 711 WITH
+// NoRegisterHome7xx set) satisfies the first and not the second. A droop arm
+// written that way would have been skipped by the oracle as unmeasurable AND
+// dropped from the unmappable clause as measurable: a PASS with an authored
+// element neither compared nor disclosed, which is the exact overclaim this
+// mechanism exists to prevent.
+func (d *droopBinding) hasHome(fam invariant.CurveFamily) bool {
+	return d.resolve(fam).NoRegisterHome == ""
 }
 
 // droopSettings hands the publisher the five values, or nil for a row that
@@ -427,16 +465,22 @@ func (b *curveBinding) authored() []authoredElement {
 		})
 	}
 	if b.Droop != nil {
-		home7xx, homeLegacy := "", ""
-		if b.Droop.Model7xx != 0 {
-			home7xx = fmt.Sprintf("M%d (%s)", b.Droop.Model7xx, droopRegisterNames)
+		// The home is read through hasHome — the SAME predicate the oracle
+		// measures by — so "disclosed as unmappable" and "skipped as
+		// unmeasurable" can never come apart. Naming a model is not enough: an
+		// arm may name its NEAREST model and refuse to grade against it, which
+		// is measurable to one predicate and not the other.
+		home := func(fam invariant.CurveFamily, model uint16) string {
+			if !b.Droop.hasHome(fam) {
+				return ""
+			}
+			return fmt.Sprintf("M%d (%s)", model, droopRegisterNames)
 		}
-		if b.Droop.ModelLegacy != 0 {
-			homeLegacy = fmt.Sprintf("M%d (%s)", b.Droop.ModelLegacy, droopRegisterNames)
-		}
-		why := b.Droop.NoRegisterHomeLegacy
+		home7xx := home(invariant.Family7xx, b.Droop.Model7xx)
+		homeLegacy := home(invariant.FamilyLegacy, b.Droop.ModelLegacy)
+		why := b.Droop.resolve(invariant.FamilyLegacy).NoRegisterHome
 		if home7xx == "" {
-			why = b.Droop.NoRegisterHome7xx
+			why = b.Droop.resolve(invariant.Family7xx).NoRegisterHome
 		}
 		out = append(out, authoredElement{
 			Element:    droopElement,
@@ -955,12 +999,17 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 		}
 		cv := uv.Curve(oracleSimName, target.Model)
 
-		// The DROOP half, resolved on the SAME generation the breakpoint half
-		// was. nil for every row that authors no opModFreqDroop, so nothing
-		// that does not carry one pays for this.
+		// The DROOP half, resolved on the FAMILY THE BREAKPOINT HALF RESOLVED
+		// TO — target.Family, not the generation read off the device. The two
+		// can differ: resolveTarget falls back to a named model when the DER's
+		// generation is unrecognised or when this row has no arm for it, and a
+		// verdict that adjudicated its two halves on two different generations
+		// would describe a device that does not exist. nil for every row that
+		// authors no opModFreqDroop, so nothing that does not carry one pays
+		// for this.
 		var droop *droopTarget
 		if b.Droop != nil {
-			d := b.Droop.resolve(curveGenerationOf(uv))
+			d := b.Droop.resolve(target.Family)
 			droop = &d
 		}
 		// Whatever this row authored that THIS generation stores in no register.
@@ -1003,14 +1052,20 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 		// front of a droop FAIL (severity 3) and report the row two grades
 		// better than the DER deserves — the same absence-reads-as-success
 		// shape this file exists to remove, one composition level up.
+		//
+		// BOTH sentences are carried on EVERY outcome, not only on a double
+		// PASS. Reporting the worse half alone would leave a bundle with no
+		// trace that the other half was measured at all — which is the same
+		// "the reader cannot tell what was asserted" failure this change exists
+		// to remove, in the red direction: a row failing on its curve would look
+		// exactly like a row whose droop nobody read.
 		d := b.droopOutcome(uv, *droop, target, published)
+		worse, other := f, d
 		if d.Verdict.Severity() > f.Verdict.Severity() {
-			return withNote(d, unmapped)
+			worse, other = d, f
 		}
-		if f.Verdict == certify.Pass && d.Verdict == certify.Pass {
-			f.Observed += " AND " + d.Observed
-		}
-		return withNote(f, unmapped)
+		worse.Observed += " AND " + other.Observed
+		return withNote(worse, unmapped)
 	}
 }
 
@@ -1101,6 +1156,11 @@ func (b *curveBinding) droopOutcome(uv invariant.UnitView, target droopTarget, c
 // Every parameter is named with both numbers and the tolerance applied, because
 // a droop that missed by one register count and one that ignored the command
 // entirely must not read the same in a bundle.
+//
+// FIVE, NOT SIX: model 711's PMin is deliberately not compared. sep 2.0.4's
+// FreqDroopType has no PMin, so this row commanded no value for it and a
+// referee asserting one would be grading its own invention. See
+// invariant.DroopReading, which decodes it so a finding can quote it.
 func droopMismatch(want, got invariant.DroopReading) string {
 	for _, c := range []struct {
 		name      string

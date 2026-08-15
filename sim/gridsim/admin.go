@@ -1157,6 +1157,22 @@ func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
 // s.resources[path] would expect to type-assert. The identifying fields are
 // carried across both ways so the resource keeps its href, mRID and version:
 // re-minting them would change what the DUT sees at a stable path.
+//
+// SO DOES ANY DROOPLESS POST, and that is the same rule rather than a second
+// one. A POST REPLACES this program's DERControlBase — it always has; the
+// pre-#32 code assigned buildBase(req.Base) over whatever was there — so a
+// request naming no droop is a default that commands no droop, and the resource
+// returns to the narrow shape rather than staying widened for a base that
+// cannot carry the extended element.
+//
+// KNOWN, PRE-EXISTING GAP: opModTargetW is still dropped here. buildBase has no
+// TargetW field (only adminCtrlPost's own extended path sets one), so a
+// /admin/default carrying target_W has never served it — and now that a
+// droop-carrying default IS stored as the extended type, which CAN hold
+// opModTargetW, that drop is newly INCONSISTENT rather than newly wrong. No
+// Figure in this catalog prescribes opModTargetW on a DefaultDERControl, so no
+// lever is built for it here; closing it means giving buildBase an extended
+// sibling, not special-casing this path.
 func (s *Server) putDefaultBaseLocked(path string, req adminDefaultReq, droop *model.FreqDroop) {
 	var res model.Resource
 	var mrid, desc string

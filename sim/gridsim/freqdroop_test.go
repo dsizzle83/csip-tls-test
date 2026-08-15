@@ -14,6 +14,7 @@ package gridsim
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -278,11 +279,27 @@ func TestFreqDroop_TeardownRemovesIt(t *testing.T) {
 
 	t.Run("from the DefaultDERControl, type and all", func(t *testing.T) {
 		s := NewServer("")
-		before := serveRaw(t, s, "/derp/0/dderc")
+		// The type this server STARTS with, read the same way the assertion
+		// below reads it — so the failure message names the thing teardown was
+		// supposed to restore rather than a rendering of some XML.
+		s.mu.RLock()
+		started := fmt.Sprintf("%T", s.resources["/derp/0/dderc"])
+		s.mu.RUnlock()
+
 		if rec := postAdmin(t, s, "/admin/default", `{"program":0,"base":{`+figure12Droop+`}}`); rec.Code !=
 			http.StatusNoContent {
 			t.Fatalf("POST /admin/default = %d: %s", rec.Code, rec.Body)
 		}
+		// The fixture has to have WIDENED, or the narrowing assertion below
+		// would pass against a server that never stored an extended resource.
+		s.mu.RLock()
+		_, widened := s.resources["/derp/0/dderc"].(*model.ExtendedDefaultDERControl)
+		s.mu.RUnlock()
+		if !widened {
+			t.Fatalf("a droop-carrying default was not stored as the extended type, so this teardown "+
+				"proves nothing (it is %s)", started)
+		}
+
 		if rec := postAdmin(t, s, "/admin/default", `{"program":0,"clear":true}`); rec.Code !=
 			http.StatusNoContent {
 			t.Fatalf("POST /admin/default clear = %d: %s", rec.Code, rec.Body)
@@ -294,11 +311,11 @@ func TestFreqDroop_TeardownRemovesIt(t *testing.T) {
 		// resource with an empty base is not the tree this server starts with,
 		// and the next reader to type-assert it would find something else.
 		s.mu.RLock()
-		_, narrow := s.resources["/derp/0/dderc"].(*model.DefaultDERControl)
+		now := fmt.Sprintf("%T", s.resources["/derp/0/dderc"])
 		s.mu.RUnlock()
-		if !narrow {
-			t.Errorf("a cleared default is still stored as the EXTENDED type; teardown must leave the "+
-				"tree as it found it (it started as %T)", before)
+		if now != started {
+			t.Errorf("a cleared default is stored as %s; teardown must leave the tree as it found it, "+
+				"which was %s", now, started)
 		}
 	})
 }

@@ -290,11 +290,18 @@ type CurveView struct {
 //	DbOfHz, DbUfHz   dead bands, over/under, in Hz          (711 DbOf/DbUf ×Db_SF)
 //	KOf, KUf         droop gains, over/under, unitless      (711 KOf/KUf ×K_SF)
 //	RspTmsS          open-loop response time, in seconds    (711 RspTms ×RspTms_SF)
-//	PMin             the control's minimum power register, carried because a
-//	                 writer performs a read-modify-write on it and a referee that
-//	                 could not see it could not tell a preserved PMin from a
-//	                 zeroed one — and 0 tells the device it may curtail to zero,
-//	                 which is a different machine.
+//	PMin             the control's minimum power register
+//
+// PMIN IS REPORTED AND IS NOT A COMPARISON TARGET, which is worth stating
+// because it is easy to mistake for an omission. IEEE 2030.5's FreqDroopType
+// has no PMin — nothing a head end can send corresponds to it — so a referee
+// has no COMMANDED value to check it against, and asserting one would be
+// inventing it. What a writer does with PMin is PRESERVE it (read-modify-write;
+// writing 0 tells the device it may curtail to zero, which is a different
+// machine), so catching a writer that did not is a BEFORE-and-AFTER question
+// about one device rather than a wire-to-register one. It is decoded so that a
+// caller holding both readings can ask it, and so every finding can quote the
+// register it saw.
 type DroopReading struct {
 	DbOfHz, DbUfHz float64
 	KOf, KUf       float64
