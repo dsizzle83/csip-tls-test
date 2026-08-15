@@ -55,7 +55,7 @@
   <DERCurve xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/dc/0">
     <mRID>CURVE-VV-001</mRID>
     <description>Volt-VAr curve</description>
-    <curveType>0</curveType>
+    <creationTime>EPOCH</creationTime>
     <CurveData>
       <xvalue>92</xvalue>
       <yvalue>30</yvalue>
@@ -72,7 +72,9 @@
       <xvalue>108</xvalue>
       <yvalue>-30</yvalue>
     </CurveData>
-    <vRef>240</vRef>
+    <curveType>0</curveType>
+    <xMultiplier>0</xMultiplier>
+    <yMultiplier>0</yMultiplier>
     <yRefType>3</yRefType>
   </DERCurve>
 </DERCurveList>
@@ -80,7 +82,7 @@
 <DERCurve xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/dc/0">
   <mRID>CURVE-VV-001</mRID>
   <description>Volt-VAr curve</description>
-  <curveType>0</curveType>
+  <creationTime>EPOCH</creationTime>
   <CurveData>
     <xvalue>92</xvalue>
     <yvalue>30</yvalue>
@@ -97,7 +99,9 @@
     <xvalue>108</xvalue>
     <yvalue>-30</yvalue>
   </CurveData>
-  <vRef>240</vRef>
+  <curveType>0</curveType>
+  <xMultiplier>0</xMultiplier>
+  <yMultiplier>0</yMultiplier>
   <yRefType>3</yRefType>
 </DERCurve>
 === /derp/0/dderc

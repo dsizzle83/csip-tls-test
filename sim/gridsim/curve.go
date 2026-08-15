@@ -35,7 +35,6 @@ type adminCurveReq struct {
 	Program int          `json:"program"`
 	Mode    string       `json:"mode"` // volt_var|volt_watt|freq_watt|watt_pf|watt_var
 	Points  []curvePoint `json:"points"`
-	VRef    int16        `json:"vref"`   // nominal AC voltage (V) for volt curves; 0 = omit
 	XMult   int8         `json:"x_mult"` // 10^n multiplier on x values
 	YMult   int8         `json:"y_mult"` // 10^n multiplier on y values
 	// x_ref_type is GONE (2026-08-14), and a request still carrying it is
@@ -54,10 +53,18 @@ type adminCurveReq struct {
 	// request whose x_ref_type the server no longer honours would leave the
 	// caller believing it had set something.
 	XRefTypeGone *uint8 `json:"x_ref_type,omitempty"`
-	Description  string `json:"description"`
-	DurationS    int    `json:"duration_s"`     // default 300
-	StartOffset  int    `json:"start_offset_s"` // seconds from now
-	Activate     bool   `json:"activate"`       // true = replace curve + control lists
+	// VRefGone traps a caller still sending `vref`, which is GONE (2026-08-15)
+	// on exactly the rule that removed x_ref_type: sep 2.0.4 declares NO vRef
+	// element on DERCurve — the standard's only V-reference elements are
+	// setVRef / setVRefOfs on DERSettings — so this server was emitting an
+	// element the schema does not define, in documents used to certify
+	// conformance against it. The static fixture carried one too; see
+	// extended.go and curvexml.go, which now declines to emit it at all.
+	VRefGone    *int16 `json:"vref,omitempty"`
+	Description string `json:"description"`
+	DurationS   int    `json:"duration_s"`     // default 300
+	StartOffset int    `json:"start_offset_s"` // seconds from now
+	Activate    bool   `json:"activate"`       // true = replace curve + control lists
 	// FixedVarPct, when present, rides along as an opModFixedVar scalar overlay
 	// on the same control, mirroring adminCtrlReq. It is emitted with
 	// DERUnitRefType 2 (%setMaxVar) — a percentage of the REACTIVE nameplate;
@@ -76,9 +83,13 @@ type adminCurveReq struct {
 	// yRefType — rampDecTms/rampIncTms/rampPT1Tms/vRef appear in no Figure, so no
 	// lever is offered for them and none is claimed.
 	//
-	// A pointer: 0 is "no limit", a real value a Figure could prescribe, so
-	// "absent" and "sent as 0" must stay distinguishable.
-	OpenLoopTms *uint16 `json:"open_loop_tms,omitempty"`
+	// A pointer to a SIGNED int64, for the two reasons freqDroopReq's fields
+	// are: the pointer keeps "absent" distinguishable from "sent as 0", and the
+	// signed 64-bit width is what lets the handler refuse an out-of-domain value
+	// in the schema's own vocabulary instead of leaving encoding/json to answer
+	// with "cannot unmarshal number -1 into Go value of type uint16", which
+	// names neither the element nor its type.
+	OpenLoopTms *int64 `json:"open_loop_tms,omitempty"`
 	// FreqDroop rides along as an INLINE opModFreqDroop element on the same
 	// control that carries the curve link, which is the shape CSIP CTP v1.3's
 	// Figure 12 prescribes for BASIC-012: ONE DERControl carrying both the
@@ -160,16 +171,27 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 			"is fixed by the mode.", http.StatusBadRequest)
 		return
 	}
+	if req.VRefGone != nil {
+		http.Error(w, "vref is not a field of this API: sep 2.0.4 declares no vRef element on DERCurve "+
+			"(its only V-reference elements are setVRef and setVRefOfs, on DERSettings), so this server "+
+			"cannot serve one. Remove it from the request.", http.StatusBadRequest)
+		return
+	}
 	curveType, ok := curveTypeForMode(req.Mode)
 	if !ok {
 		http.Error(w, "mode must be one of volt_var|volt_watt|freq_watt|watt_pf|watt_var",
 			http.StatusBadRequest)
 		return
 	}
-	// The droop is validated BEFORE anything is stored: a request whose
-	// opModFreqDroop cannot be authored must publish no curve either, or a
-	// caller that asked for both halves of Figure 12 would get one half plus a
-	// 400 and could not tell which state the bench was left in.
+	// Both authored elements are validated BEFORE anything is stored: a request
+	// whose content cannot be authored must publish no curve either, or a caller
+	// that asked for both halves of a Figure would get one half plus a 400 and
+	// could not tell which state the bench was left in.
+	openLoopTms, err := curveOpenLoopTms(req.OpenLoopTms)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	droop, err := req.FreqDroop.toModel()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -217,11 +239,7 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		// (Figure 6) names it "opModVoltVar.DERCurve.openLoopTms" for that
 		// reason. A copy, so a later mutation of the request cannot reach a
 		// curve this server has already published.
-		OpenLoopTms: copyU16(req.OpenLoopTms),
-	}
-	if req.VRef != 0 {
-		v := req.VRef
-		curve.VRef = &v
+		OpenLoopTms: openLoopTms,
 	}
 	cl.DERCurve = append(cl.DERCurve, curve)
 	cl.All = uint32(len(cl.DERCurve))
@@ -352,6 +370,8 @@ func (s *Server) adminCurveDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := s.Now()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -373,7 +393,7 @@ func (s *Server) adminCurveDelete(w http.ResponseWriter, r *http.Request) {
 	// clear exists to remove.
 	dcPath := fmt.Sprintf("/derp/%d/dc", req.Program)
 	s.clearCurveResourcesLocked(req.Program)
-	reset := staticCurveList(req.Program)
+	reset := staticCurveList(req.Program, now)
 	s.resources[dcPath] = reset
 	s.publishCurveResourcesLocked(req.Program, reset)
 	s.ensureCurveListLinkLocked(req.Program, dcPath, reset.All)
@@ -463,9 +483,13 @@ func (s *Server) ensureCurveListLinkLocked(program int, dcPath string, count uin
 // staticCurveList returns the fixture curve list a DELETE restores a program
 // to: program 0's Volt-VAr curve, or an empty list for the others (which have
 // no original static curve).
-func staticCurveList(program int) *model.DERCurveList {
+//
+// The restored fixture is stamped with the CURRENT server clock rather than the
+// tree's build time: creationTime is minOccurs="1" and a teardown that restored
+// a zero would serve an invalid document (see staticVoltVarCurve0).
+func staticCurveList(program int, now int64) *model.DERCurveList {
 	if program == 0 {
-		return staticVoltVarCurve0()
+		return staticVoltVarCurve0(now)
 	}
 	path := fmt.Sprintf("/derp/%d/dc", program)
 	return &model.DERCurveList{Resource: model.Resource{Href: path}, PollRate: 300}
@@ -635,12 +659,23 @@ func extBaseToInfo(b model.ExtendedDERControlBase) adminBaseInfo {
 	return info
 }
 
-// copyU16 returns a fresh pointer to the same value, so a stored resource never
-// aliases a request struct the caller still owns.
-func copyU16(v *uint16) *uint16 {
+// curveOpenLoopTms range-checks the authored openLoopTms and renders it into the
+// model's own width, or returns the reason it cannot be served.
+//
+// It exists so this element gets the SAME error hygiene as the droop's five
+// (freqdroop.go): a caller who sends -1 or 70000 is told which element and which
+// wire type it missed, in the schema's vocabulary, instead of being handed
+// encoding/json's "cannot unmarshal number -1 into Go value of type uint16" —
+// which names neither, and which is what this field answered when it was typed
+// *uint16 on the request.
+func curveOpenLoopTms(v *int64) (*uint16, error) {
 	if v == nil {
-		return nil
+		return nil, nil
 	}
-	n := *v
-	return &n
+	if *v < 0 || *v > 65535 {
+		return nil, fmt.Errorf("DERCurve.openLoopTms %d is outside UInt16's wire domain [0,65535] "+
+			"(sep 2.0.4 DERCurve; the unit is hundredths of a second, and 0 means no limit)", *v)
+	}
+	n := uint16(*v)
+	return &n, nil
 }

@@ -247,7 +247,13 @@ func TestCurveRows_RecordWhereEachAuthoredElementCanBeReadBack(t *testing.T) {
 		// home7xx/homeLegacy: whether the element has a register home there.
 		home7xx, homeLegacy bool
 	}{
-		{"BASIC-006", "DERCurve.openLoopTms", false, false},
+		// BASIC-006's volt-var arms are 705 on 7xx and 126 on legacy. 705
+		// declares Crv.RspTms ("Open Loop Response Time") and 126 declares only
+		// a PT1 filter time, so the element is MEASURED on one generation and
+		// disclosed on the other — which is the whole distinction this test is
+		// about, and which the suite got wrong in the direction that mattered
+		// (it claimed no 7xx model had the register at all).
+		{"BASIC-006", "DERCurve.openLoopTms", true, false},
 		{"BASIC-012", "opModFreqDroop", true, false},
 	} {
 		t.Run(tc.id+" "+tc.element, func(t *testing.T) {
@@ -266,9 +272,20 @@ func TestCurveRows_RecordWhereEachAuthoredElementCanBeReadBack(t *testing.T) {
 					t.Errorf("%s's %s reports a legacy register home = %t (%q), want %t",
 						tc.id, tc.element, ok, a.HomeLegacy, tc.homeLegacy)
 				}
-				if (!tc.home7xx || !tc.homeLegacy) && a.Why == "" {
-					t.Errorf("%s's %s has no register home on one generation and records no reason, so "+
-						"the absence has no owner", tc.id, tc.element)
+				// Each generation that lacks a home must carry its OWN reason:
+				// a single shared one printed the 7xx explanation under the
+				// legacy heading and sent a reader to the wrong model.
+				for fam, has := range map[invariant.CurveFamily]bool{
+					invariant.Family7xx: tc.home7xx, invariant.FamilyLegacy: tc.homeLegacy,
+				} {
+					if has {
+						continue
+					}
+					if why := a.whyOn(fam); why == "" ||
+						strings.Contains(why, "records no reason for the absence") {
+						t.Errorf("%s's %s has no register home on %s and records no reason for THAT "+
+							"generation, so the absence has no owner", tc.id, tc.element, fam)
+					}
 				}
 				if a.Value == "" {
 					t.Errorf("%s's %s records no authored VALUE, so a bundle cannot show what was served",
@@ -284,7 +301,7 @@ func TestCurveRows_RecordWhereEachAuthoredElementCanBeReadBack(t *testing.T) {
 			for fam, want := range map[invariant.CurveFamily]bool{
 				invariant.Family7xx: !tc.home7xx, invariant.FamilyLegacy: !tc.homeLegacy,
 			} {
-				note := describeUnmappable(b.unmappableOn(fam))
+				note := describeUnmappable(fam, b.unmappableOn(fam))
 				if got := strings.Contains(note, tc.element); got != want {
 					t.Errorf("%s: the %s verdict note %s %s; want it %s", tc.id, fam,
 						map[bool]string{true: "names", false: "does not name"}[got], tc.element,

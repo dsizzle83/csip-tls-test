@@ -58,7 +58,18 @@ func defaultTreeDump(t *testing.T, s *Server) string {
 		s.mu.RLock()
 		res := s.resources[p]
 		s.mu.RUnlock()
-		data, err := xml.MarshalIndent(res, "", "  ")
+		// Through the SAME wire-shape conversion serveXML applies (curvexml.go),
+		// so this golden pins the DOCUMENT a DUT receives rather than the Go
+		// struct this server happens to store.
+		//
+		// It did not before, and that was a hole in this file's own claim.
+		// DERCurve is served through a schema-shaped local type because the
+		// vendored struct drops three minOccurs="1" elements and orders two of
+		// them out of the XSD's sequence; a golden marshalling the STORED struct
+		// would go on passing through any change to that conversion, including
+		// its removal. Every other resource marshals identically either way.
+		wire, _ := curveForWire(res)
+		data, err := xml.MarshalIndent(wire, "", "  ")
 		if err != nil {
 			t.Fatalf("marshal %s: %v", p, err)
 		}

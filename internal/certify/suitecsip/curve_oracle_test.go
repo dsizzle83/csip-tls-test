@@ -217,12 +217,79 @@ func basic006DeptRef(t *testing.T) uint16 {
 	return want
 }
 
+// adoptVoltVar installs a volt-var curve through the REAL derbase writer, with
+// the open-loop response time BASIC-006's own binding authors.
+//
+// RspTms rides along because Figure 6 prescribes openLoopTms 5 against a
+// default of 10, and a gateway that executed the row would have written BOTH
+// the shape and the timing: 705 declares Crv.RspTms for exactly this element.
+// Before the referee read that register these fixtures could leave it at the
+// device's default and still be called "the write a gateway that EXECUTED this
+// control would have made", which was not true.
 func (f *curveFixture) adoptVoltVar(t *testing.T, deptRef uint16, pts []sunspec.VVPoint) {
 	t.Helper()
-	if err := f.base.WriteVoltVar(sunspec.VoltVarCurve{DeptRef: deptRef, Pri: 1, Points: pts},
+	rspTms := 0.0
+	if s, ok := basic006Binding().wantOpenLoopS(); ok {
+		rspTms = s
+	}
+	if err := f.base.WriteVoltVar(
+		sunspec.VoltVarCurve{DeptRef: deptRef, Pri: 1, Points: pts, RspTms: rspTms},
 		"curve-oracle-test"); err != nil {
 		t.Fatalf("derbase WriteVoltVar (the real adopt handshake): %v", err)
 	}
+}
+
+// TestOracleCurve_RightCurveWrongOpenLoopTimeIsAFail is the teeth of the
+// timing check, and the reason the check exists at all.
+//
+// A device holding EXACTLY the breakpoints Figure 6 prescribes, adopted and
+// enabled, running at its own default speed rather than the openLoopTms the
+// procedure states, has executed a different command from the one this row
+// published — and every other assertion in this suite is blind to it. Figure 6
+// prints openLoopTms Default 10 / Test Values 5 precisely to create that
+// condition, so a row that could not tell the two apart was not running its
+// procedure however green it looked.
+//
+// The write goes through the real derbase writer, at the DEFAULT the Figure
+// names (10 hundredths = 0.1 s) rather than at an invented number, so what this
+// test reproduces is the exact device state the procedure is designed to
+// distinguish.
+func TestOracleCurve_RightCurveWrongOpenLoopTimeIsAFail(t *testing.T) {
+	f := newCurveFixture(t)
+	b := basic006Binding()
+	if b.OpenLoopTms == nil {
+		t.Fatal("BASIC-006 authors no openLoopTms, so there is no timing for a DER to get wrong")
+	}
+	pts := make([]sunspec.VVPoint, 0, len(b.Points))
+	for _, p := range b.wantPoints() {
+		pts = append(pts, sunspec.VVPoint{V: p.X, Var: p.Y})
+	}
+	// Figure 6's own DEFAULT column: 10 hundredths of a second.
+	if err := f.base.WriteVoltVar(
+		sunspec.VoltVarCurve{DeptRef: basic006DeptRef(t), Pri: 1, Points: pts, RspTms: 0.10},
+		"open-loop-teeth"); err != nil {
+		t.Fatalf("derbase WriteVoltVar: %v", err)
+	}
+	got := oracleCurve(b)(context.Background(), f.rc)
+	if got.Verdict != certify.Fail {
+		t.Fatalf("a DER running this row's exact curve at the procedure's DEFAULT open-loop time scored "+
+			"%s, want FAIL — that is the condition Figure 6's test value exists to create:\n%s",
+			got.Verdict, got.Observed)
+	}
+	for _, want := range []string{"RspTms", "openLoopTms", "0.1", "0.05"} {
+		if !strings.Contains(got.Observed, want) {
+			t.Errorf("the FAIL does not quote %q, so a reader cannot see which timing was commanded and "+
+				"which was held:\n%s", want, got.Observed)
+		}
+	}
+	// And it must NOT be reported as unmappable: 705 has the register, so this
+	// element is measured on this generation, not disclosed.
+	if strings.Contains(got.Observed, "AUTHORED BUT NOT DEVICE-MAPPABLE") &&
+		strings.Contains(got.Observed, "openLoopTms") {
+		t.Errorf("the verdict discloses openLoopTms as unmappable on a 705 DER, which declares "+
+			"Crv.RspTms for exactly this element:\n%s", got.Observed)
+	}
+	t.Logf("BASIC-006 RED on a device running the right curve at the wrong speed:\n  %s", got.Observed)
 }
 
 // TestOracleCurve_BothHalvesMustHoldAndTheWorseOneDecides pins the composition
@@ -259,9 +326,23 @@ func TestOracleCurve_BothHalvesMustHoldAndTheWorseOneDecides(t *testing.T) {
 		},
 	}
 
-	// Nothing written: the curve half fails, and that is what is reported.
-	if got := oracleCurve(b)(context.Background(), f.rc); got.Verdict != certify.Fail {
-		t.Fatalf("an unwritten DER scored %s, want FAIL:\n%s", got.Verdict, got.Observed)
+	// Nothing written: BOTH halves fail, and BOTH must be reported.
+	//
+	// This is the equal-severity case, and it is the one that survives a revert
+	// of the "both sentences, always" rule: with the composition returning the
+	// worse half alone, a curve FAIL and a droop FAIL report one sentence and
+	// the bundle carries no trace that the droop was measured at all. Every
+	// verdict here stays FAIL either way, so only the TEXT can catch it.
+	unwritten := oracleCurve(b)(context.Background(), f.rc)
+	if unwritten.Verdict != certify.Fail {
+		t.Fatalf("an unwritten DER scored %s, want FAIL:\n%s", unwritten.Verdict, unwritten.Observed)
+	}
+	for _, want := range []string{"M705 Volt-Var", "M711 Frequency Droop", " AND "} {
+		if !strings.Contains(unwritten.Observed, want) {
+			t.Errorf("the composed FAIL does not carry both halves' evidence (missing %q) — a reader "+
+				"cannot tell a row that failed on its curve from one whose droop nobody read:\n%s",
+				want, unwritten.Observed)
+		}
 	}
 
 	// The CURVE lands and the droop does not: the row must still FAIL, on the
@@ -390,6 +471,256 @@ func TestOracleCurve_MeasurabilityAndDisclosureCannotComeApart(t *testing.T) {
 	}
 }
 
+// TestCurveComposition_ClaimAndVerdictNameOnlyWhatWasMeasured is the same
+// invariant ONE LEVEL UP, where it was still being broken after the oracle
+// itself was fixed.
+//
+// The oracle's own Finding said the right thing about BASIC-012 on a 7xx DER —
+// "the curve half is served and NOT asserted here" — and then three sentences
+// composed on top of it said the opposite:
+//
+//   - the row-level outcome (curveOutcome) built its PASS from
+//     curvePublishedParam, so it read "the adopted curve MOVED to 4
+//     breakpoint(s) (5900, 100) ...", breakpoints nothing had compared;
+//   - the criterion's Claim said the DER holds "the curve ... carried, adopted
+//     and enabled";
+//   - its How described a point-for-point comparison of a LIVE curve's
+//     breakpoints — against M711, which declares NPt=0 and stores no points at
+//     all.
+//
+// A bundle reader sees those three, not the oracle's internal string. So the
+// composition is driven here, through the SHIPPING row, on a DER where the
+// droop lands and the breakpoints have nowhere to land.
+func TestCurveComposition_ClaimAndVerdictNameOnlyWhatWasMeasured(t *testing.T) {
+	f := newCurveFixture(t)
+	d, _ := f.withGridSimServer(t)
+	row := rowByID(t, "BASIC-012")
+	b := row.mode.Curve
+	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-012")
+
+	ctx := context.Background()
+	params := map[string]string{pollWindowParam: "20ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-012 Setup: %v", err)
+	}
+	// Stand in for a DUT that executed the half this generation can hold: the
+	// real derbase writer, the row's own translated values.
+	live, err := f.base.ReadFreqDroop("composition-test")
+	if err != nil {
+		t.Fatalf("read the DER's droop: %v", err)
+	}
+	want := b.Droop.want711()
+	if err := f.base.WriteFreqDroop(sunspec.FreqDroopCtl{
+		DbOf: want.DbOfHz, DbUf: want.DbUfHz, KOf: want.KOf, KUf: want.KUf, RspTms: want.RspTmsS,
+		PMin: live.PMin,
+	}, "composition-test"); err != nil {
+		t.Fatalf("the real derbase writer refused the row's droop: %v", err)
+	}
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("BASIC-012 PostWait: %v", err)
+	}
+	obs := &Observation{Params: params}
+
+	out := curveOutcome(b, obs)
+	if out.Verdict != certify.Pass {
+		t.Fatalf("the composed outcome on a DER holding this row's droop = %s:\n%s",
+			out.Verdict, out.Observed)
+	}
+	crit := critDEREffectViaCurveOracle(row.subject, b, obs)
+
+	// The three composed sentences must each name the DROOP and must not claim
+	// the breakpoints.
+	for _, tc := range []struct{ what, text string }{
+		{"the row-level verdict", out.Observed},
+		{"the criterion's Claim", crit.Claim},
+		{"the criterion's How", crit.How},
+	} {
+		if !strings.Contains(strings.ToLower(tc.text), "droop") {
+			t.Errorf("%s does not name the droop, which is the only half this DER could hold:\n%s",
+				tc.what, tc.text)
+		}
+		for _, forbidden := range []string{
+			"the adopted curve MOVED",
+			"hold the curve ",
+			"compared point for point",
+		} {
+			if strings.Contains(tc.text, forbidden) {
+				t.Errorf("%s claims %q, about breakpoints this run never compared (M711 stores none):\n%s",
+					tc.what, forbidden, tc.text)
+			}
+		}
+	}
+	// And each must DISCLOSE the half it did not assert — measured or
+	// disclosed, never neither, at every level a reader reads.
+	for _, tc := range []struct{ what, text string }{
+		{"the row-level verdict", out.Observed},
+		{"the criterion's Claim", crit.Claim},
+	} {
+		if !strings.Contains(tc.text, "NOTHING about") && !strings.Contains(tc.text, "NOT asserted") {
+			t.Errorf("%s does not disclose the frequency-watt breakpoints it left unasserted:\n%s",
+				tc.what, tc.text)
+		}
+	}
+	t.Logf("BASIC-012 on 7xx, composed:\n  verdict: %s\n  claim:   %s\n  how:     %s",
+		out.Observed, crit.Claim, crit.How)
+}
+
+// TestRefusalFingerprint_SeesADroopWriteOnARefusedRow closes M5: a refusal row
+// whose control carries an opModFreqDroop must be watching model 711.
+//
+// publishCurveControl sends the droop UNCONDITIONALLY — a refusal row publishes
+// through the same publisher as an execution row, deliberately, so that the two
+// controls are identical in kind — while the refusal fingerprint watched the
+// CURVE bank alone. A DUT that answered cannot-comply and then wrote the droop
+// into 711 would have moved no register the row was looking at, and the row
+// would have certified a clean refusal over a real write.
+//
+// No catalog row is in that shape today (the refusal rows author no droop),
+// which is the reason to close it now: the failure mode is silent, one binding
+// edit away, and the row would look green while it happened.
+func TestRefusalFingerprint_SeesADroopWriteOnARefusedRow(t *testing.T) {
+	f := newCurveFixture(t)
+	rb := &refusalBinding{
+		Axis:      "the SunSpec model 712 (DER Watt-Var) curve bank",
+		Why:       "a synthetic binding, for this test only",
+		Commanded: "a synthetic watt-pf curve carrying an inline droop",
+		Curve: &curveBinding{
+			Mode:       "watt_pf",
+			Points:     []CurvePoint{{X: 0, Y: 100}, {X: 100, Y: 95}},
+			YRefType:   derUnitRefStatVarAvail,
+			Model7xx:   sunspec.ModelDERWattVar,
+			Mapping7xx: "a synthetic binding, for this test only",
+			Prescribed: "a synthetic binding, for this test only",
+			Droop: &droopBinding{
+				Settings:             FreqDroopSettings{DBOF: 60030, DBUF: 59970, KOF: 40, KUF: 40, OpenLoopTms: 600},
+				Model7xx:             sunspec.ModelDERFreqDroop,
+				Mapping7xx:           "a synthetic binding, for this test only",
+				NoRegisterHomeLegacy: "a synthetic binding, for this test only",
+			},
+		},
+	}
+	uv, err := oracleUnitView(context.Background(), f.rc, oracleSimName)
+	if err != nil {
+		t.Fatalf("read the DER: %v", err)
+	}
+	before, ok := rb.fingerprint(uv)
+	if !ok {
+		t.Fatal("the refusal fingerprint could not be taken at all")
+	}
+	if !strings.Contains(before, "M711") {
+		t.Fatalf("the fingerprint of a row whose control carries an opModFreqDroop does not include the "+
+			"droop bank, so a write there would be invisible to it:\n%s", before)
+	}
+
+	// A gateway that says cannot-comply and writes the droop anyway.
+	live, err := f.base.ReadFreqDroop("refusal-fingerprint-test")
+	if err != nil {
+		t.Fatalf("read the DER's droop: %v", err)
+	}
+	want := rb.Curve.Droop.want711()
+	if err := f.base.WriteFreqDroop(sunspec.FreqDroopCtl{
+		DbOf: want.DbOfHz, DbUf: want.DbUfHz, KOf: want.KOf, KUf: want.KUf, RspTms: want.RspTmsS,
+		PMin: live.PMin,
+	}, "refusal-fingerprint-test"); err != nil {
+		t.Fatalf("the real derbase writer refused the droop: %v", err)
+	}
+
+	uv2, err := oracleUnitView(context.Background(), f.rc, oracleSimName)
+	if err != nil {
+		t.Fatalf("re-read the DER: %v", err)
+	}
+	after, ok := rb.fingerprint(uv2)
+	if !ok {
+		t.Fatal("the refusal fingerprint could not be re-taken")
+	}
+	if after == before {
+		t.Errorf("the fingerprint did not MOVE after a real WriteFreqDroop landed on M711, so this row "+
+			"would report 'no southbound trace' over a write it published:\n%s", after)
+	}
+}
+
+// TestOracleCurve_DroopResolvesOnTheArmsFamilyNotTheDevicesGeneration pins the
+// second of 077e046's unpinned fixes.
+//
+// resolveTarget has a named-model FALLBACK: when the DER's generation is
+// unrecognised, or when a row declares no arm for the generation it is running
+// on, the breakpoint half resolves against whichever named model the device
+// actually serves — and that model's FAMILY can differ from the generation
+// curveGenerationOf reports. Resolving the droop from the generation instead of
+// from that family lets ONE verdict adjudicate its two halves on two different
+// generations.
+//
+// The binding below is synthetic and built precisely to separate the two
+// answers: it declares no 7xx arm at all and a LEGACY arm naming model 704 — a
+// model this 7xx device really does serve, so the fallback selects it and
+// target.Family comes out legacy while the device's generation is 7xx. Its
+// droop has a 711 home and a stated legacy absence, so the two resolutions give
+// opposite results: from the arm's family the droop is unmeasurable and must be
+// DISCLOSED; from the device's generation it would be measured against 711.
+func TestOracleCurve_DroopResolvesOnTheArmsFamilyNotTheDevicesGeneration(t *testing.T) {
+	f := newCurveFixture(t)
+	b := &curveBinding{
+		Mode:       "volt_var",
+		Points:     []CurvePoint{{X: 9100, Y: 4000}},
+		YRefType:   derUnitRefStatVarAvail,
+		Prescribed: "a synthetic binding, for this test only",
+		// No 7xx arm; a legacy arm naming a model this 7xx device serves.
+		ModelLegacy:   sunspec.ModelDERCtlAC,
+		MappingLegacy: "a synthetic binding, for this test only",
+		Droop: &droopBinding{
+			Settings:             FreqDroopSettings{DBOF: 60030, DBUF: 59970, KOF: 40, KUF: 40, OpenLoopTms: 600},
+			Model7xx:             sunspec.ModelDERFreqDroop,
+			Mapping7xx:           "a synthetic binding, for this test only",
+			NoRegisterHomeLegacy: "a synthetic binding: no legacy home for a droop",
+		},
+	}
+	uv, err := oracleUnitView(context.Background(), f.rc, oracleSimName)
+	if err != nil {
+		t.Fatalf("read the DER: %v", err)
+	}
+	// The premise: the two answers really do differ on this fixture.
+	target, how := b.resolveTarget(uv)
+	if how != curveResolved {
+		t.Fatalf("the synthetic binding resolved no target (%v), so this test proves nothing", how)
+	}
+	if target.Family != invariant.FamilyLegacy || curveGenerationOf(uv) != gen7xx {
+		t.Fatalf("this fixture no longer separates the arm's family (%s) from the device's generation "+
+			"(%s); the test needs rebuilding to keep pinning the distinction",
+			target.Family, curveGenerationOf(uv))
+	}
+
+	// The droop is INSTALLED on 711 first, through the real writer. That is what
+	// makes this test discriminating rather than merely descriptive: with the
+	// droop landed, a run that resolved it from the device's GENERATION would
+	// find it and report a measurement, while one resolving from the arm's
+	// family must go on disclosing it as unmappable. Against an unwritten 711
+	// both paths produce a non-PASS and the distinction is invisible.
+	live, err := f.base.ReadFreqDroop("family-resolution-test")
+	if err != nil {
+		t.Fatalf("read the DER's droop: %v", err)
+	}
+	want := b.Droop.want711()
+	if err := f.base.WriteFreqDroop(sunspec.FreqDroopCtl{
+		DbOf: want.DbOfHz, DbUf: want.DbUfHz, KOf: want.KOf, KUf: want.KUf, RspTms: want.RspTmsS,
+		PMin: live.PMin,
+	}, "family-resolution-test"); err != nil {
+		t.Fatalf("the real derbase writer refused the droop: %v", err)
+	}
+
+	got := oracleCurve(b)(context.Background(), f.rc)
+	// From the ARM's family the droop has no home: disclosed, never measured.
+	if !strings.Contains(got.Observed, "AUTHORED BUT NOT DEVICE-MAPPABLE") ||
+		!strings.Contains(got.Observed, droopElement) {
+		t.Errorf("the droop was resolved on the device's GENERATION rather than the arm's family — it "+
+			"should have been disclosed as unmappable here:\n%s", got.Observed)
+	}
+	if strings.Contains(got.Observed, "live control holds exactly the droop parameters") {
+		t.Errorf("the verdict reports a droop MEASUREMENT against a generation its breakpoint half did "+
+			"not resolve to — one verdict adjudicating its two halves on two different generations:\n%s",
+			got.Observed)
+	}
+}
+
 // ── The RED case: the product's actual posture ──────────────────────────────
 
 // TestOracleCurve_UnadoptedDERIsAFail is the finding, reproduced.
@@ -433,6 +764,15 @@ func TestOracleCurve_AdoptedRowsOwnCurveIsAPass(t *testing.T) {
 	if !strings.Contains(got.Observed, "COMPLETED") || !strings.Contains(got.Observed, "ENABLED") {
 		t.Errorf("the PASS does not state the adopt/enable state it rests on: %s", got.Observed)
 	}
+	// The TIMING is part of this PASS now: 705 declares Crv.RspTms and the row
+	// authors Figure 6's openLoopTms, so a green verdict that did not say the
+	// timing matched would understate what was compared.
+	if !strings.Contains(got.Observed, "open-loop response time it published") {
+		t.Errorf("the PASS does not state that the open-loop response time was compared, though 705 "+
+			"declares the register and this row authors the element: %s", got.Observed)
+	}
+	// The verbatim reason is the deliverable, on the green side as on the red.
+	t.Logf("BASIC-006 GREEN on 7xx (breakpoints AND openLoopTms):\n  %s", got.Observed)
 }
 
 // TestOracleCurve_ADifferentCurveIsStillAFail: the device adopted A curve, just
@@ -633,7 +973,7 @@ func curveObs(params map[string]string) *Observation { return &Observation{Param
 // row published anything proves nothing, because a rerun that never re-applied
 // the control reads identically to one that did.
 func TestCurveOutcome_RequiresTheReadingToHaveMoved(t *testing.T) {
-	moved := curveOutcome(curveObs(map[string]string{
+	moved := curveOutcome(basic006Binding(), curveObs(map[string]string{
 		oraclePreVerdictParam:  string(certify.Fail),
 		oraclePreObservedParam: "the DER held its factory curve",
 		oracleVerdictParam:     string(certify.Pass),
@@ -644,7 +984,7 @@ func TestCurveOutcome_RequiresTheReadingToHaveMoved(t *testing.T) {
 		t.Fatalf("a curve that moved from absent to present = %s (%s), want PASS", moved.Verdict, moved.Observed)
 	}
 
-	stale := curveOutcome(curveObs(map[string]string{
+	stale := curveOutcome(basic006Binding(), curveObs(map[string]string{
 		oraclePreVerdictParam:  string(certify.Pass),
 		oraclePreObservedParam: "the DER already held the published curve",
 		oracleVerdictParam:     string(certify.Pass),
@@ -660,7 +1000,7 @@ func TestCurveOutcome_RequiresTheReadingToHaveMoved(t *testing.T) {
 // DER must FAIL the row. A Skip is severity 0 in the roll-up and cannot hold a
 // release, which is how a misconfigured bench used to certify a product.
 func TestCurveOutcome_UnavailableIsAFailNotASkip(t *testing.T) {
-	f := curveOutcome(curveObs(map[string]string{
+	f := curveOutcome(basic006Binding(), curveObs(map[string]string{
 		oracleUnavailableParam: "no simapi sidecar is configured for modsim",
 	}))
 	if f.Verdict != certify.Fail {
@@ -672,7 +1012,7 @@ func TestCurveOutcome_UnavailableIsAFailNotASkip(t *testing.T) {
 // a reason means the oracle never ran or its result was lost. An unrecorded
 // criterion is not a satisfied one.
 func TestCurveOutcome_NoRecordAtAllIsAFail(t *testing.T) {
-	if f := curveOutcome(curveObs(map[string]string{})); f.Verdict != certify.Fail {
+	if f := curveOutcome(basic006Binding(), curveObs(map[string]string{})); f.Verdict != certify.Fail {
 		t.Fatalf("an empty live-phase record = %s (%s), want FAIL", f.Verdict, f.Observed)
 	}
 }
@@ -1133,7 +1473,7 @@ func TestBasic006Row_GoesGreenWhenTheDERActuallyAdoptsTheCurve(t *testing.T) {
 			"(a satisfied oracle declares nothing and leaves the row to its wire criteria): %s",
 			got, s.Notes(obs))
 	}
-	if f := curveOutcome(obs); f.Verdict != certify.Pass {
+	if f := curveOutcome(rowByID(t, "BASIC-006").mode.Curve, obs); f.Verdict != certify.Pass {
 		t.Fatalf("the curve outcome on an adopting DER = %s: %s", f.Verdict, f.Observed)
 	}
 }

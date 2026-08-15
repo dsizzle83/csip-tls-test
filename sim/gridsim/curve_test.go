@@ -43,7 +43,6 @@ func TestAdminCurve_BindsVoltVarIntoServedControl(t *testing.T) {
 	body := `{
 		"program": 0,
 		"mode": "volt_var",
-		"vref": 240,
 		"y_ref_type": 3,
 		"points": [{"x":92,"y":30},{"x":98,"y":0},{"x":102,"y":0},{"x":108,"y":-30}],
 		"duration_s": 600,
@@ -141,6 +140,38 @@ func TestAdminCurve_XRefTypeIsRejected(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "xRefType") {
 		t.Errorf("the 400 does not say why: %s", rec.Body)
+	}
+}
+
+// TestAdminCurve_VRefIsRejectedAndNeverServed is the same rule for the same
+// reason, one element over — and this one the server was actually SERVING.
+//
+// sep 2.0.4 declares no vRef on DERCurve (its only V-reference elements are
+// setVRef / setVRefOfs, on DERSettings), and this simulator's static fixture
+// carried <vRef>240</vRef> — restored by every DELETE /admin/curve, so no
+// teardown cleared it either. Every DUT that walked this tree fetched a
+// DERCurve the schema rejects, and every bundle built from such a walk records
+// it. The request field is refused so a caller cannot believe it set one, and
+// the wire shape (curvexml.go) cannot emit one however the stored struct is
+// filled in.
+func TestAdminCurve_VRefIsRejectedAndNeverServed(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+	body := `{"program":0,"mode":"volt_var","points":[{"x":1,"y":2}],"vref":240,"activate":true}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(body))))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /admin/curve with vref = %d, want 400; body: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "vRef") {
+		t.Errorf("the 400 does not say why: %s", rec.Body)
+	}
+	// And the STATIC fixture — the one a DELETE restores — carries none either,
+	// on the list and on the individually-addressable curve.
+	for _, path := range []string{"/derp/0/dc", "/derp/0/dc/0"} {
+		if raw := serveRaw(t, s, path); strings.Contains(raw, "vRef") {
+			t.Errorf("%s still serves a vRef element:\n%s", path, raw)
+		}
 	}
 }
 

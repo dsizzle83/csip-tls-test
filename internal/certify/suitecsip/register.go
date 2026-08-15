@@ -128,18 +128,34 @@ const (
 	// so a row and a verdict cannot disagree about which registers were read.
 	droopRegisterNames = "DbOf/DbUf dead bands, KOf/KUf gains and RspTms response time"
 
-	// openLoopTms is AUTHORED and has no southbound register home anywhere, on
-	// either generation, and those are two separate facts about it.
-	noOpenLoopTmsRegister = "openLoopTms is a CURVE-LEVEL timing element with no register home in either " +
-		"SunSpec curve generation: the 7xx curve models (705/706/712) carry an adopt handshake, a DeptRef " +
-		"and a point table and no open-loop response register at all, and the legacy 12x banks " +
-		"(126/132/134) carry ActCrv, ModEna, DeptRef and points and no timing register either. (Model 711 " +
-		"does have RspTms — but that is opModFreqDroop's OWN openLoopTms, a different element of a " +
-		"different mode, and reading a volt-var curve's timing out of a frequency-droop control would be " +
-		"the substitution this suite exists to refuse.) So this element is SERVED northbound exactly as " +
-		"the procedure prescribes — that half is real evidence about what the DUT was offered — and no " +
-		"southbound read can show what the DUT did with it. It is named on every verdict rather than " +
-		"dropped, because an element nothing asserts about must not be mistaken for one that was measured"
+	// openLoopTms IS MEASURABLE ON 705 AND 706, and the constant that used to
+	// sit here said the opposite. It asserted that the 7xx curve models "carry
+	// an adopt handshake, a DeptRef and a point table and no open-loop response
+	// register at all" — a statement of fact, quoted verbatim into every bundle
+	// BASIC-006 appeared in, and false: model_705.json and model_706.json BOTH
+	// declare Crv.RspTms (uint32 Secs, scaled by RspTms_SF, labelled "Open Loop
+	// Response Time"), lexa-proto parses and encodes it, and the referee was
+	// simply dropping it on the floor while its 711 sibling carried the
+	// equivalent. Only 712 lacks the register.
+	//
+	// So the element is now COMPARED where a home exists, and these two
+	// constants name the absence only where there really is one.
+	noOpenLoopTmsRegister7xx = "this row's 7xx register home is a model that declares no open-loop " +
+		"response register: of the 7xx curve models only 705 (Volt-Var) and 706 (Volt-Watt) carry " +
+		"Crv.RspTms, and 712 (Watt-Var) carries none. (Model 711 does have RspTms — but that is " +
+		"opModFreqDroop's OWN openLoopTms, a different element of a different mode, and reading a curve's " +
+		"timing out of a frequency-droop control would be the substitution this suite exists to refuse.) " +
+		"The element is SERVED northbound exactly as the procedure prescribes — that half is real evidence " +
+		"about what the DUT was offered — and on this bank no southbound read can show what the DUT did " +
+		"with it"
+
+	noOpenLoopTmsRegisterLegacy = "the legacy 12x banks carry no open-loop response register: 126 " +
+		"declares Crv.RmpTms and 132/134 declare Crv.RmpPt1Tms, and BOTH are documented in their own " +
+		"model definitions as \"the time of the PT1 ... to accomplish a change of 95%\" — a PT1 FILTER " +
+		"time constant, which is sep 2.0.4's rampPT1Tms, a separate element of the same DERCurve. Writing " +
+		"an openLoopTms into it would command a different behaviour under a name that sounds alike, which " +
+		"is the substitution this suite refuses. So on this generation the element is SERVED northbound " +
+		"and nothing southbound can show what became of it"
 
 	// The droop's own homes and absences.
 	mappingFreqDroop7xx = "IEEE 2030.5's opModFreqDroop is a PARAMETRIC frequency-droop control — two dead " +
@@ -153,14 +169,22 @@ const (
 		"enters anywhere (see curveBinding.want711, which performs it independently from the standards' " +
 		"text rather than from the product's table)"
 
-	noFreqDroopRegisterLegacy = "the legacy 12x set has NO home for a frequency-droop control: the nearest " +
-		"model, 127 (Freq-Watt parameterized), is a snapshot-referenced over-frequency curtailment with a " +
-		"single hysteresis dead band and a single gain, so three of FreqDroopType's five mandatory elements " +
-		"have no register to land in and the other two mean something different. Grading the droop against " +
-		"it would be the substitution this suite refuses; the honest answer is that the element is SERVED " +
-		"northbound on this bench and that nothing on this generation's device can show what became of it. " +
-		"This product reaches the same conclusion from its own side: internal/advaxis has an ExecDroop row " +
-		"for DerGen7xx and deliberately none for DerGen12x"
+	// Stated by REGISTER rather than by adjective, because the adjectives were
+	// doing work they could not support: an earlier wording called 127
+	// "snapshot-referenced ... with a single hysteresis dead band and a single
+	// gain", which reads like a characterisation of 134 and cannot be checked
+	// against anything. What follows can be: it names the points 127 declares.
+	noFreqDroopRegisterLegacy = "the legacy 12x set has NO home for a frequency-droop control. Its nearest " +
+		"model, 127 (Freq-Watt Param), declares WGra (a curtailment slope in % PM/Hz), HzStr/HzStop (the " +
+		"frequency deviations at which a snapshot of instantaneous output is taken and released) and " +
+		"HysEna — so of FreqDroopType's five mandatory elements, dBUF, kUF and openLoopTms have NO " +
+		"register to land in at all (127 curtails on over-frequency only, and its RmpTms is a PT1 filter " +
+		"time), and the two that look close are different quantities: HzStr is a snapshot TRIGGER rather " +
+		"than a droop dead band, and WGra is % PM/Hz rather than the per-unit-per-per-unit k the standard " +
+		"defines. Grading the droop against it would be the substitution this suite refuses; the honest " +
+		"answer is that the element is SERVED northbound on this bench and that nothing on this " +
+		"generation's device can show what became of it. This product reaches the same conclusion from its " +
+		"own side: internal/advaxis has an ExecDroop row for DerGen7xx and deliberately none for DerGen12x"
 
 	// The catalog's DERCurve.curveType values are CSIP-CONF v1.3's own
 	// numbering and do not agree with sep 2.0.4's DERCurveType, nor with each

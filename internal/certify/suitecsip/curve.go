@@ -417,6 +417,14 @@ const (
 	droopDeadbandToleranceHz = 0.0005 // wire step: thousandths of Hz
 	droopGainTolerance       = 0.0005 // wire step: thousandths, unitless
 	droopResponseToleranceS  = 0.005  // wire step: hundredths of a second
+
+	// curveOpenLoopToleranceS is the same rule for DERCurve.openLoopTms, whose
+	// wire unit is likewise hundredths of a second: half the last digit the wire
+	// can carry. It is deliberately the same number as the droop's rather than a
+	// reference to it — the two are different elements of different modes that
+	// happen to share a unit, and collapsing them would make a future change to
+	// one silently change the other.
+	curveOpenLoopToleranceS = 0.005
 )
 
 // authoredElement is one element this row places on the wire BEYOND the
@@ -437,9 +445,16 @@ type authoredElement struct {
 	// Home7xx / HomeLegacy name the register home per generation, empty for a
 	// generation that has none.
 	Home7xx, HomeLegacy string
-	// Why explains the absence, for whichever generation lacks a home. Read
-	// only when one of the two homes is empty.
-	Why string
+	// Why7xx / WhyLegacy explain the absence, PER GENERATION, and each is read
+	// only where its own home is empty.
+	//
+	// They are two fields rather than one because the reasons genuinely differ
+	// and a single one printed the wrong explanation beside the wrong
+	// generation: opModFreqDroop's absence on legacy is about model 127's
+	// registers, and its (hypothetical) absence on 7xx would be about something
+	// else entirely. A bundle that gave a reader the 7xx reason under "no
+	// register home on a legacy 12x DER" would send them to the wrong model.
+	Why7xx, WhyLegacy string
 }
 
 // homeOn returns this element's register home on a family, and whether it has
@@ -452,16 +467,67 @@ func (a authoredElement) homeOn(fam invariant.CurveFamily) (string, bool) {
 	return home, home != ""
 }
 
+// whyOn returns the reason this element has no register home on a family.
+func (a authoredElement) whyOn(fam invariant.CurveFamily) string {
+	why := a.Why7xx
+	if fam == invariant.FamilyLegacy {
+		why = a.WhyLegacy
+	}
+	return orText(why, "this row records no reason for the absence")
+}
+
+// openLoopHome names the register a curve model's own open-loop response time
+// lives in, or "" for a model that declares none.
+//
+// SunSpec 705 and 706 both declare Crv.RspTms — "Open Loop Response Time",
+// uint32 seconds scaled by the model's RspTms_SF — and that is exactly what
+// IEEE 2030.5's DERCurve.openLoopTms commands. 712 declares no such register.
+//
+// NO LEGACY MODEL HAS ONE, and the near-miss is worth naming because it is what
+// a reader will check: 126 declares Crv.RmpTms and 132/134 declare
+// Crv.RmpPt1Tms, both documented as "the time of the PT1 ... to accomplish a
+// change of 95%%". A PT1 filter time constant is sep 2.0.4's rampPT1Tms, a
+// SEPARATE element of the same DERCurve, and writing an openLoopTms into it
+// would command a different behaviour under a name that sounds alike.
+func openLoopHome(model uint16) string {
+	switch model {
+	case sunspec.ModelDERVoltVar, sunspec.ModelDERVoltWatt:
+		return fmt.Sprintf("M%d Crv.RspTms (uint32 seconds x RspTms_SF, \"Open Loop Response Time\")", model)
+	}
+	return ""
+}
+
+// wantOpenLoopS is the authored openLoopTms in the DEVICE's units: hundredths
+// of a second on the wire (sep 2.0.4's own unit for the element) into the
+// seconds 705/706 store. One fixed decimal shift, performed here, once.
+func (b *curveBinding) wantOpenLoopS() (float64, bool) {
+	if b.OpenLoopTms == nil {
+		return 0, false
+	}
+	return float64(*b.OpenLoopTms) / 100, true
+}
+
 // authored is the list of elements this row places on the wire beyond the
 // breakpoints and multipliers — the positive half of the record whose negative
 // half is Gaps.
 func (b *curveBinding) authored() []authoredElement {
 	var out []authoredElement
 	if b.OpenLoopTms != nil {
+		// openLoopTms DOES have a 7xx register home on the two models that
+		// declare one, and saying otherwise was a false statement of fact
+		// quoted into every bundle this row appeared in: SunSpec 705 and 706
+		// both carry Crv.RspTms, labelled "Open Loop Response Time" in their own
+		// definitions and scaled by RspTms_SF — which is precisely where IEEE
+		// 2030.5's DERCurve.openLoopTms lands. 712 declares none, and neither
+		// does any legacy bank (their Crv.RmpTms / Crv.RmpPt1Tms is a PT1 FILTER
+		// time, sep 2.0.4's rampPT1Tms, a different element).
 		out = append(out, authoredElement{
-			Element: "DERCurve.openLoopTms",
-			Value:   fmt.Sprintf("%d (hundredths of a second)", *b.OpenLoopTms),
-			Why:     noOpenLoopTmsRegister,
+			Element:    "DERCurve.openLoopTms",
+			Value:      fmt.Sprintf("%d (hundredths of a second)", *b.OpenLoopTms),
+			Home7xx:    openLoopHome(b.Model7xx),
+			HomeLegacy: openLoopHome(b.ModelLegacy),
+			Why7xx:     noOpenLoopTmsRegister7xx,
+			WhyLegacy:  noOpenLoopTmsRegisterLegacy,
 		})
 	}
 	if b.Droop != nil {
@@ -476,18 +542,14 @@ func (b *curveBinding) authored() []authoredElement {
 			}
 			return fmt.Sprintf("M%d (%s)", model, droopRegisterNames)
 		}
-		home7xx := home(invariant.Family7xx, b.Droop.Model7xx)
-		homeLegacy := home(invariant.FamilyLegacy, b.Droop.ModelLegacy)
-		why := b.Droop.resolve(invariant.FamilyLegacy).NoRegisterHome
-		if home7xx == "" {
-			why = b.Droop.resolve(invariant.Family7xx).NoRegisterHome
-		}
 		out = append(out, authoredElement{
 			Element:    droopElement,
 			Value:      b.Droop.describeValues(),
-			Home7xx:    home7xx,
-			HomeLegacy: homeLegacy,
-			Why:        why,
+			Home7xx:    home(invariant.Family7xx, b.Droop.Model7xx),
+			HomeLegacy: home(invariant.FamilyLegacy, b.Droop.ModelLegacy),
+			// Each generation's own reason, from that generation's own arm.
+			Why7xx:    b.Droop.resolve(invariant.Family7xx).NoRegisterHome,
+			WhyLegacy: b.Droop.resolve(invariant.FamilyLegacy).NoRegisterHome,
 		})
 	}
 	return out
@@ -502,22 +564,20 @@ func describeAuthored(els []authoredElement) string {
 	}
 	parts := make([]string, 0, len(els))
 	for _, a := range els {
-		home := func(gen, h string) string {
-			if h == "" {
-				return "no register home on " + gen
+		// The REASON rides with the generation it is about, and only where
+		// there is an absence to explain. An element with a home on both has
+		// nothing to account for, and a trailing "this row records no reason"
+		// beside it would read as a defect in the row rather than the ordinary
+		// case.
+		clause := func(gen string, fam invariant.CurveFamily, h string) string {
+			if h != "" {
+				return gen + ": " + h
 			}
-			return gen + ": " + h
+			return "no register home on " + gen + " — " + a.whyOn(fam)
 		}
-		// The REASON is printed only where there is an absence to explain. An
-		// element with a home on both generations has nothing to account for,
-		// and a trailing "this row records no reason" beside it would read as a
-		// defect in the row rather than as the ordinary case.
-		why := ""
-		if a.Home7xx == "" || a.HomeLegacy == "" {
-			why = " — " + orText(a.Why, "this row records no reason for the absence")
-		}
-		parts = append(parts, fmt.Sprintf("%s = %s [%s; %s%s]", a.Element, a.Value,
-			home("a 7xx DER", a.Home7xx), home("a legacy 12x DER", a.HomeLegacy), why))
+		parts = append(parts, fmt.Sprintf("%s = %s [%s; %s]", a.Element, a.Value,
+			clause("a 7xx DER", invariant.Family7xx, a.Home7xx),
+			clause("a legacy 12x DER", invariant.FamilyLegacy, a.HomeLegacy)))
 	}
 	return strings.Join(parts, "; ")
 }
@@ -537,14 +597,13 @@ func (b *curveBinding) unmappableOn(fam invariant.CurveFamily) []authoredElement
 // describeUnmappable is the sentence an oracle verdict carries so that an
 // authored element with no device home is NAMED where the measurement is
 // reported, and never silently dropped between the two.
-func describeUnmappable(els []authoredElement) string {
+func describeUnmappable(fam invariant.CurveFamily, els []authoredElement) string {
 	if len(els) == 0 {
 		return ""
 	}
 	parts := make([]string, 0, len(els))
 	for _, a := range els {
-		parts = append(parts, fmt.Sprintf("%s = %s (%s)", a.Element, a.Value,
-			orText(a.Why, "this row records no reason")))
+		parts = append(parts, fmt.Sprintf("%s = %s (%s)", a.Element, a.Value, a.whyOn(fam)))
 	}
 	return " AUTHORED BUT NOT DEVICE-MAPPABLE: this row also placed " + strings.Join(parts, "; ") +
 		" on the wire, and this generation stores it in no register — so it was SERVED to the DUT and " +
@@ -1017,7 +1076,7 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 		// element served northbound and asserted about by nothing must be named
 		// wherever the measurement is reported, or a reader takes the verdict
 		// for a statement about it.
-		unmapped := describeUnmappable(b.unmappableOn(target.Family))
+		unmapped := describeUnmappable(target.Family, b.unmappableOn(target.Family))
 
 		if target.NoRegisterHome != "" {
 			// The BREAKPOINTS have no home here. Before this was the end of the
@@ -1268,6 +1327,39 @@ func curveContentOutcome(b *curveBinding, uv invariant.UnitView, target curveTar
 				cv.Describe())}
 		}
 	}
+	// The curve's own TIMING, checked separately from the points and after them,
+	// on the same rule as the y-axis reference: it is a different defect with a
+	// different owner and it is invisible to the point comparison. Figure 6
+	// prescribes openLoopTms 5 against a default of 10, so a device holding the
+	// right SHAPE at its own default speed executed a different command from the
+	// one this row published — and until this check existed, nothing in the
+	// suite could tell the two apart.
+	//
+	// Only where the resolved model HAS the register (705/706 do; 712 and every
+	// legacy bank do not). Where it does not, the element is disclosed as
+	// unmappable on the composed verdict instead — measured or disclosed, never
+	// neither.
+	if want, ok := b.wantOpenLoopS(); ok && openLoopHome(target.Model) != "" {
+		switch {
+		case cv.RspTmsS == nil:
+			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+				"the DER's %s holds this row's breakpoints, but its open-loop response register could not "+
+					"be read at all, so the timing this row commanded (openLoopTms=%d hundredths of a "+
+					"second = %s s) cannot be shown to have landed. Full register state: %s",
+				cv.Axis.Name, *b.OpenLoopTms, trimNum(want), cv.Describe())}
+		case math.Abs(*cv.RspTmsS-want) > curveOpenLoopToleranceS:
+			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+				"the DER's %s holds exactly the breakpoints this row published, at the WRONG open-loop "+
+					"response time: RspTms=%s s where this row published openLoopTms=%d (hundredths of a "+
+					"second) = %s s, outside the %s s tolerance. The points matching proves nothing about "+
+					"the timing — a device running the right curve at its own default speed is executing "+
+					"a different command from the one the procedure prescribes, which is exactly the "+
+					"condition Figure 6's 5-against-a-default-of-10 exists to create. Full register "+
+					"state: %s",
+				cv.Axis.Name, trimNum(*cv.RspTmsS), *b.OpenLoopTms, trimNum(want),
+				trimNum(curveOpenLoopToleranceS), cv.Describe())}
+		}
+	}
 	if !cv.Enabled {
 		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
 			"the DER's %s holds exactly the breakpoints this row published, but the function itself is "+
@@ -1300,9 +1392,20 @@ func curveContentOutcome(b *curveBinding, uv invariant.UnitView, target curveTar
 	if cv.Legacy() {
 		became = fmt.Sprintf("ActCrv selects that bank (bank %d) and ModEna bit 0 is set", cv.Bank)
 	}
+	// The PASS names the timing when the timing was part of the comparison —
+	// the counterpart of the FAIL above. A verdict that said only "holds
+	// exactly the breakpoints" over a run that also checked Crv.RspTms would
+	// understate what was measured, exactly as one that said it over a run that
+	// did NOT check it would overstate.
+	held := "holds exactly the breakpoints this row published"
+	if want, ok := b.wantOpenLoopS(); ok && openLoopHome(target.Model) != "" {
+		held = fmt.Sprintf("holds exactly the breakpoints this row published, at the open-loop response "+
+			"time it published (openLoopTms=%d hundredths of a second = %s s, against the device's "+
+			"Crv.RspTms)", *b.OpenLoopTms, trimNum(want))
+	}
 	return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
-		"the DER's own %s live curve holds exactly the breakpoints this row published, %s: %s. %s",
-		cv.Axis.Name, became, match.Reason, cv.Describe())}
+		"the DER's own %s live curve %s, %s: %s. %s",
+		cv.Axis.Name, held, became, match.Reason, cv.Describe())}
 }
 
 // modelList renders the SunSpec models the DER actually served, so a FAIL about
@@ -1564,10 +1667,142 @@ func publishCurveControl(ctx context.Context, d *Driver, params map[string]strin
 // value that moved, a curve row reports a piecewise function that was adopted
 // into an enabled register bank. Sharing the prose would make one of the two
 // bundles lie about what was measured.
-func curveOutcome(o *Observation) Finding {
+// curveHalves is which of a row's authored halves the DER that ran it could
+// actually hold — resolved from the model the LIVE phase recorded, so the
+// citation phase reaches the same answer the oracle did.
+//
+// It exists because the row-level text, the criterion's Claim and its How were
+// all written when a curve row had exactly one half, and each of them says
+// "curve" unconditionally. On a 7xx bench BASIC-012 now measures its DROOP and
+// nothing else, and those three sentences went on describing a point-for-point
+// comparison of breakpoints against a model that stores none (M711, NPt=0) —
+// a GREEN claim about the half nothing measured, which is the same
+// measured-and-disclosed violation the oracle itself was corrected for, one
+// composition level up.
+type curveHalves struct {
+	// Family is the generation the live phase resolved, and Known says whether
+	// it was resolved at all. An unknown family describes both arms rather than
+	// guessing one, exactly as curveModelLabel already does.
+	Family invariant.CurveFamily
+	Known  bool
+	// Curve / Droop are whether each half had a register home on that family.
+	Curve, Droop bool
+	// OpenLoop is whether the authored openLoopTms had a home on the resolved
+	// MODEL (705/706 declare Crv.RspTms; 712 and the legacy banks do not), so
+	// the How can say whether the timing was part of the comparison.
+	OpenLoop bool
+}
+
+// halvesFrom resolves which halves a run measured, from what Setup recorded.
+func (b *curveBinding) halvesFrom(o *Observation) curveHalves {
+	h := curveHalves{}
+	if o == nil {
+		return h
+	}
+	raw := o.Params[curveModelParam]
+	if raw == "" {
+		return h
+	}
+	n, err := strconv.ParseUint(raw, 10, 16)
+	if err != nil {
+		return h
+	}
+	model := uint16(n)
+	axis, ok := invariant.CurveAxisOf(model)
+	if !ok {
+		return h
+	}
+	h.Family, h.Known = axis.Family, true
+	switch axis.Family {
+	case invariant.FamilyLegacy:
+		h.Curve = b.NoRegisterHomeLegacy == ""
+	default:
+		h.Curve = b.NoRegisterHome7xx == ""
+	}
+	h.Droop = b.Droop != nil && b.Droop.hasHome(axis.Family)
+	h.OpenLoop = b.OpenLoopTms != nil && openLoopHome(model) != ""
+	return h
+}
+
+// measured names, in a verdict's own voice, the content this run compared.
+func (h curveHalves) measured() string {
+	switch {
+	case !h.Known:
+		return "the content this row published"
+	case h.Curve && h.Droop:
+		return "the curve's breakpoints AND the parametric frequency droop"
+	case h.Droop:
+		return "the parametric frequency droop"
+	case h.Curve && h.OpenLoop:
+		return "the curve's breakpoints and its open-loop response time"
+	case h.Curve:
+		return "the curve's breakpoints"
+	}
+	return "the content this row published"
+}
+
+// compared describes, for the How, the comparison this run actually performed —
+// a point table and a parametric control are read with different words, and a
+// bundle that printed the wrong one describes evidence that does not exist.
+func (h curveHalves) compared() string {
+	var parts []string
+	if h.Curve || !h.Known {
+		parts = append(parts, "the breakpoints of its LIVE (index 0) curve, compared point for point and "+
+			"IN ORDER against the breakpoints this row itself published — raw values as published, with "+
+			"no axis re-interpretation by this referee, and its DeptRef against the yRefType the row sent")
+	}
+	if h.OpenLoop {
+		parts = append(parts, "its Crv.RspTms open-loop response register against the openLoopTms the "+
+			"row published (hundredths of a second into the seconds the model stores)")
+	}
+	if h.Droop {
+		parts = append(parts, "its parametric droop control (DbOf/DbUf dead bands, KOf/KUf gains and "+
+			"RspTms response time) compared parameter for parameter against the five FreqDroopType "+
+			"values this row published, each translated into the model's own units by this referee from "+
+			"the two standards' unit statements")
+	}
+	if len(parts) == 0 {
+		return "whatever content the resolved register bank could hold"
+	}
+	return strings.Join(parts, "; and ")
+}
+
+// unasserted names the authored content this run did NOT compare, or "" when
+// there was none — the other half of every sentence measured() appears in.
+func (h curveHalves) unasserted(b *curveBinding) string {
+	if !h.Known {
+		return ""
+	}
+	var parts []string
+	if !h.Curve {
+		parts = append(parts, "the frequency-watt breakpoints (this generation stores none)")
+	}
+	if b.Droop != nil && !h.Droop {
+		parts = append(parts, "the opModFreqDroop parameters (this generation stores none)")
+	}
+	if b.OpenLoopTms != nil && !h.OpenLoop {
+		parts = append(parts, "the DERCurve openLoopTms (this model declares no open-loop register)")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " and ")
+}
+
+func curveOutcome(b *curveBinding, o *Observation) Finding {
 	post := o.Params[oracleObservedParam]
 	pre := o.Params[oraclePreObservedParam]
-	published := orText(o.Params[curvePublishedParam], "the breakpoints this row published")
+	// WHAT MOVED is the content this run actually compared, not the breakpoints
+	// this row published: on a bench that measured only the droop, "the adopted
+	// curve MOVED to 4 breakpoint(s) ..." is a green claim about a comparison
+	// that never ran. curvePublishedParam still records the published curve —
+	// it is what the DUT was OFFERED, and the criteria that report the wire read
+	// it — but it is not what this verdict is about.
+	halves := b.halvesFrom(o)
+	moved := halves.measured()
+	if s := halves.unasserted(b); s != "" {
+		moved += " (this run asserts NOTHING about " + s + ")"
+	}
 
 	if reason := o.Params[oracleUnavailableParam]; reason != "" {
 		return Finding{Verdict: certify.Fail, Observed: "the independent southbound oracle could not read the " +
@@ -1593,20 +1828,20 @@ func curveOutcome(o *Observation) Finding {
 	}
 	switch certify.Verdict(o.Params[oraclePreVerdictParam]) {
 	case certify.Fail:
-		return Finding{Verdict: certify.Pass, Observed: "the DER did NOT hold this row's curve before it was " +
-			"published (" + pre + ") and DOES hold it after the DUT's poll cycle (" + post + ") — the " +
-			"adopted curve MOVED to " + published + ", so the match is evidence this control was executed, " +
-			"not a curve an earlier run left in the register bank"}
+		return Finding{Verdict: certify.Pass, Observed: "the DER did NOT hold this row's content before it " +
+			"was published (" + pre + ") and DOES hold it after the DUT's poll cycle (" + post + ") — " +
+			moved + " MOVED, so the match is evidence this control was executed, not content an earlier " +
+			"run left in the register bank"}
 	case certify.Pass:
-		return Finding{Verdict: certify.Fail, Observed: "the DER holds this row's curve (" + post + ") but " +
+		return Finding{Verdict: certify.Fail, Observed: "the DER holds " + moved + " (" + post + ") but " +
 			"ALREADY held it before this row published anything (" + pre + "). A curve row has no ladder to " +
 			"depart onto — its content is the content the row is about — so nothing in this reading " +
 			"distinguishes a curve the DUT fetched and adopted from one left over from an earlier run, and " +
 			"it is not reported as a PASS"}
 	default:
-		return Finding{Verdict: certify.Warn, Observed: "the DER holds this row's curve (" + post + "), but " +
+		return Finding{Verdict: certify.Warn, Observed: "the DER holds " + moved + " (" + post + "), but " +
 			"the pre-publication baseline was not recovered (" + orText(pre, "no reading was recorded") +
-			"), so this run cannot show that the adopted curve CHANGED. The content is right; that it was " +
+			"), so this run cannot show that the adopted content CHANGED. The content is right; that it was " +
 			"THIS row's control that put it there is not established"}
 	}
 }
@@ -1617,18 +1852,28 @@ func curveOutcome(o *Observation) Finding {
 // decided verdict, because a Skip cannot dent a case verdict and so cannot hold
 // a release.
 func critDEREffectViaCurveOracle(subject string, b *curveBinding, o *Observation) criterion {
-	f := curveOutcome(o)
+	f := curveOutcome(b, o)
+	// The CLAIM and the HOW are assembled from the halves this run actually
+	// measured, for the reason curveHalves exists: a claim that the DER "holds
+	// the curve ... adopted and enabled", over a How describing a point-for-point
+	// comparison, is a false description of a run that compared a parametric
+	// droop against a model with no point table — and it is false in the
+	// direction that overclaims.
+	halves := b.halvesFrom(o)
+	claim := "the DER's own southbound registers hold " + halves.measured() + " that " + subject +
+		" carried, adopted and enabled"
+	if s := halves.unasserted(b); s != "" {
+		claim += " — this criterion asserts NOTHING about " + s
+	}
 	return criterion{
-		Claim: "the DER's own southbound registers hold the curve " + subject + " carried, adopted and enabled",
+		Claim: claim,
 		How: fmt.Sprintf("an independent read of the DER's raw SunSpec %s image (internal/invariant, which "+
 			"shares only the register-offset tables with the product and none of its CSIP/derbase "+
-			"interpretation), taken BEFORE this row published its curve and again after the DUT's poll "+
-			"cycle: the model's own adopt handshake (AdptCrvRslt), its function enable (Ena) and the "+
-			"breakpoints of its LIVE (index 0) curve, compared point for point and IN ORDER against the "+
-			"breakpoints this row itself published — raw values as published, with no axis "+
-			"re-interpretation by this referee. %s. The device sims model curve ADOPTION but no curve "+
-			"PHYSICS, so this is a register/adopt-state assertion and deliberately not an "+
-			"effect-on-output one", curveModelLabel(b, o), b.describeTargets()),
+			"interpretation), taken BEFORE this row published anything and again after the DUT's poll "+
+			"cycle: the model's own adopt handshake, its function enable (Ena), and %s. %s. The device "+
+			"sims model curve ADOPTION but no curve PHYSICS, so this is a register/adopt-state assertion "+
+			"and deliberately not an effect-on-output one",
+			curveModelLabel(b, o), halves.compared(), b.describeTargets()),
 		Tier: tierOracle,
 		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
 			return f
@@ -1920,14 +2165,56 @@ func (b *refusalBinding) fingerprint(uv invariant.UnitView) (string, bool) {
 		// cannot read cannot tell a refused axis from an unreadable one.
 		return "", false
 	}
-	parts := make([]string, 0, len(views)+1)
+	parts := make([]string, 0, len(views)+2)
 	for _, cv := range views {
 		parts = append(parts, cv.Describe())
 	}
 	if truncated > 0 {
 		parts = append(parts, fmt.Sprintf("(%d further curve slot(s) not fingerprinted)", truncated))
 	}
+	// THE DROOP BANK TOO, whenever this row's control carries an
+	// opModFreqDroop — because publishCurveControl sends it unconditionally,
+	// and a refusal row's whole claim is that NOTHING of what it published
+	// landed.
+	//
+	// Without this the fingerprint watches the curve bank alone: a DUT that
+	// answered cannot-comply and then wrote the droop into model 711 would move
+	// no register this row was looking at, and the row would certify a clean
+	// refusal over a real write. No catalog row is in that shape today — the
+	// refusal rows author no droop — which is exactly why it had to be closed
+	// before one is: the failure would be silent and the row would look green.
+	if b.Curve.Droop != nil {
+		droop := b.Curve.Droop.resolve(target.Family)
+		if droop.NoRegisterHome == "" && droop.Model != 0 {
+			for _, cv := range coveredDroopSlots(uv, droop.Model) {
+				parts = append(parts, cv.Describe())
+			}
+		}
+	}
 	return strings.Join(parts, " | "), true
+}
+
+// coveredDroopSlots are the control slots of a parametric droop model this
+// row's refusal apparatus watches: the LIVE control and the staging slots a
+// gateway would write before triggering the adopt handshake, on the same
+// bounded rule coveredCurveSlots follows for a point table.
+//
+// Staging is covered for the identical reason: a gateway that writes a refused
+// droop into a staging control and never asks for adoption has still written to
+// an axis it told the head end it could not perform, and the handshake
+// registers alone are blind to it.
+func coveredDroopSlots(uv invariant.UnitView, model uint16) []invariant.CurveView {
+	live := uv.Curve(oracleSimName, model)
+	if !live.Present {
+		// Rendered anyway: "the DER does not serve M711" is itself part of the
+		// fingerprint, and a window in which the model appeared would then MOVE.
+		return []invariant.CurveView{live}
+	}
+	out := []invariant.CurveView{live}
+	for i := 1; i < live.NCrv && i <= maxStagingCurvesFingerprinted; i++ {
+		out = append(out, uv.CurveAt(oracleSimName, model, i))
+	}
+	return out
 }
 
 // curveBaselineContamination reports which of the covered slots ALREADY hold

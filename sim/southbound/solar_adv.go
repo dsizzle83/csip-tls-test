@@ -158,14 +158,28 @@ type curveModelSpec struct {
 	sfs                 map[string]int16 // header scale factors to seed
 }
 
+// RspTms_SF IS -2 on 705/706/711, and the value is load-bearing rather than a
+// default. IEEE 2030.5 expresses BOTH open-loop response times this device can
+// be commanded with — DERCurve.openLoopTms and opModFreqDroop.openLoopTms — in
+// HUNDREDTHS of a second, so a device declaring RspTms_SF 0 has one-second
+// resolution and cannot represent most of what a conformant head end may send:
+// CSIP CTP v1.3's Figure 6 prescribes openLoopTms 5, which is 0.05 s and rounds
+// to zero on such a device.
+//
+// That was this sim's posture (SF 0) until the bench began MEASURING the
+// element, at which point it stopped being harmless: a row prescribing a
+// sub-second response would have failed on the bench DEVICE's own resolution
+// rather than on anything the product did, and the finding would have been
+// unattributable. -2 lets the device hold every value the wire can carry, which
+// is the only posture on which that measurement means anything.
 var solarCurveSpecs = []curveModelSpec{
 	{sunspec.ModelDERVoltVar, sunspec.L705Hdr, sunspec.L705Crv, advNPt, "AdptCrvReq", "AdptCrvRslt",
-		map[string]int16{"V_SF": 0, "DeptRef_SF": 0, "RspTms_SF": 0}},
+		map[string]int16{"V_SF": 0, "DeptRef_SF": 0, "RspTms_SF": -2}},
 	{sunspec.ModelDERVoltWatt, sunspec.L706Hdr, sunspec.L706Crv, advNPt, "AdptCrvReq", "AdptCrvRslt",
-		map[string]int16{"V_SF": 0, "DeptRef_SF": 0, "RspTms_SF": 0}},
+		map[string]int16{"V_SF": 0, "DeptRef_SF": 0, "RspTms_SF": -2}},
 	// 711 (Freq Droop) is point-less (npt=0) and uses the AdptCtl* handshake.
 	{sunspec.ModelDERFreqDroop, sunspec.L711Hdr, sunspec.L711Ctl, 0, "AdptCtlReq", "AdptCtlRslt",
-		map[string]int16{"Db_SF": -3, "K_SF": -2, "RspTms_SF": 0}},
+		map[string]int16{"Db_SF": -3, "K_SF": -2, "RspTms_SF": -2}},
 	{sunspec.ModelDERWattVar, sunspec.L712Hdr, sunspec.L712Crv, advNPt, "AdptCrvReq", "AdptCrvRslt",
 		map[string]int16{"W_SF": 0, "DeptRef_SF": 0}},
 }

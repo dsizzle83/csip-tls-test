@@ -261,6 +261,26 @@ type CurveView struct {
 	// empty for a Pointless axis.
 	Points []CurvePoint
 
+	// RspTmsS is this CURVE's own open-loop response time, in seconds — SunSpec
+	// 705/706 Crv.RspTms scaled by the model's RspTms_SF, labelled "Open Loop
+	// Response Time" in both model definitions. nil for a model that declares no
+	// such register: 712 has none, and the legacy banks carry a PT1 FILTER time
+	// (126 Crv.RmpTms, 132/134 Crv.RmpPt1Tms — "the time of the PT1 ... to
+	// accomplish a change of 95%"), which is IEEE 2030.5's rampPT1Tms and a
+	// different quantity.
+	//
+	// It is decoded because IEEE 2030.5's DERCurve.openLoopTms lands exactly
+	// here, and nothing was reading it: a referee that compared the breakpoints
+	// and left the timing unread cannot tell a device that executed the curve
+	// its procedure prescribes from one that executed the same SHAPE at its own
+	// default speed. CSIP CTP v1.3's Figure 6 prescribes openLoopTms 5 against a
+	// default of 10 — the timing is part of what that row commands.
+	//
+	// NOT DroopReading.RspTmsS, which is model 711's response time for the
+	// PARAMETRIC droop: a different register in a different model, carrying
+	// opModFreqDroop's own openLoopTms rather than a curve's.
+	RspTmsS *float64
+
 	// Params carries a Pointless model's parameters (711's deadbands, gains and
 	// response time), rendered, since there is no point table to carry them.
 	Params string
@@ -370,6 +390,12 @@ func (c CurveView) Describe() string {
 	}
 	if c.HasDeptRef {
 		parts = append(parts, fmt.Sprintf("DeptRef=%d (%s)", c.DeptRef, DeptRefName(c.Axis.Model, c.DeptRef)))
+	}
+	if c.RspTmsS != nil {
+		// The curve's own open-loop response time, quoted on every reading of a
+		// model that has the register — a finding about a curve's TIMING has to
+		// show the register it read, exactly as one about its y reference does.
+		parts = append(parts, fmt.Sprintf("RspTms=%s s (open-loop response)", trimFloat(*c.RspTmsS)))
 	}
 	which := "live curve"
 	switch {
@@ -559,6 +585,9 @@ func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveVie
 		}
 		v.ReadOnly = c.ReadOnly
 		v.DeptRef, v.HasDeptRef = c.DeptRef, true
+		// 705 declares Crv.RspTms ("Open Loop Response Time", uint32 Secs,
+		// scaled by RspTms_SF). It is where IEEE 2030.5's openLoopTms lands.
+		v.RspTmsS = &c.RspTms
 		for _, p := range c.Points {
 			v.Points = append(v.Points, CurvePoint{X: p.V, Y: p.Var})
 		}
@@ -570,6 +599,8 @@ func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveVie
 		}
 		v.ReadOnly = c.ReadOnly
 		v.DeptRef, v.HasDeptRef = c.DeptRef, true
+		// 706 declares the same register, with the same label and units.
+		v.RspTmsS = &c.RspTms
 		for _, p := range c.Points {
 			v.Points = append(v.Points, CurvePoint{X: p.V, Y: p.W})
 		}

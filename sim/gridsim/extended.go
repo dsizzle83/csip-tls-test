@@ -11,7 +11,7 @@ import model "lexa-proto/csipmodel"
 
 func (s *Server) buildExtended(now int64) {
 	// ── DER curve (Volt-VAr) for program 0 (/derp/0/dc) ──────────
-	s.resources["/derp/0/dc"] = staticVoltVarCurve0()
+	s.resources["/derp/0/dc"] = staticVoltVarCurve0(now)
 
 	// ── Billing (§10.7): one CustomerAccount / CustomerAgreement ──
 	s.resources["/ca"] = &model.CustomerAccountList{
@@ -46,17 +46,30 @@ func (s *Server) buildExtended(now int64) {
 // references it until POST /admin/curve binds one) and the shape DELETE
 // /admin/curve restores program 0 to. Factored out of buildExtended so the
 // admin curve endpoint can reset it (curve.go).
-func staticVoltVarCurve0() *model.DERCurveList {
-	vref := int16(240)
+// vRef IS GONE FROM THIS FIXTURE and is not coming back. sep 2.0.4 declares no
+// vRef element on DERCurve — the standard's only V-reference elements are
+// setVRef / setVRefOfs on DERSettings — so serving <vRef>240</vRef> here put an
+// element the schema does not define into the document every DUT fetches, and
+// into every bundle built from it. It was restored by every DELETE
+// /admin/curve, so no teardown could clear it either. The suite states this rule
+// about itself (suitecsip's noVrefElementInSchema, which holds BASIC-006's
+// autonomous-Vref gap); the server was breaking it. See curvexml.go, which
+// declines to emit the element at all, so a future field assignment cannot put
+// it back on the wire.
+//
+// creationTime is now SET, for the mirror-image reason: it is minOccurs="1" and
+// this fixture left it zero, which csipmodel's `omitempty` then dropped
+// entirely. A DERCurve with no creationTime is as invalid as one with a vRef.
+func staticVoltVarCurve0(now int64) *model.DERCurveList {
 	return &model.DERCurveList{
 		Resource: model.Resource{Href: "/derp/0/dc"},
 		All:      1, Results: 1, PollRate: 300,
 		DERCurve: []model.DERCurve{{
-			Resource:    model.Resource{Href: "/derp/0/dc/0"},
-			MRID:        "CURVE-VV-001",
-			Description: "Volt-VAr curve",
-			CurveType:   model.CurveTypeVoltVar, // 0 (was mislabeled as 1 = FreqWatt)
-			VRef:        &vref,
+			Resource:     model.Resource{Href: "/derp/0/dc/0"},
+			MRID:         "CURVE-VV-001",
+			Description:  "Volt-VAr curve",
+			CreationTime: now,
+			CurveType:    model.CurveTypeVoltVar, // 0 (was mislabeled as 1 = FreqWatt)
 			// yRefType 3 = %statVarAvail. It was 4, under a comment that said
 			// "VAr as % of VArMax" — and BOTH halves were wrong. sep 2.0.4's
 			// DERUnitRefType makes 4 "%setEffectiveV", a VOLTAGE reference on

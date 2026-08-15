@@ -919,10 +919,20 @@ func (s *Server) handleAdminMUPs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveXML(w http.ResponseWriter, resource interface{}) {
 	// QA: if a malform mode is armed and matches this resource, serve the
 	// deliberately non-conformant bytes instead of the well-formed marshal.
+	//
+	// The malform check runs against the STORED resource, ahead of the
+	// wire-shape conversion below, so a malform mode still selects on the same
+	// types it always has.
 	data, malformed := s.malformedXML(resource)
 	if !malformed {
 		var err error
-		data, err = xml.MarshalIndent(resource, "", "  ")
+		// DERCurve and DERCurveList marshal through a schema-shaped local type
+		// (curvexml.go): the vendored struct drops three minOccurs="1"
+		// elements, orders curveType before CurveData against the XSD's own
+		// sequence, and carries two elements sep 2.0.4 does not declare.
+		// Everything else marshals exactly as it always did.
+		out, _ := curveForWire(resource)
+		data, err = xml.MarshalIndent(out, "", "  ")
 		if err != nil {
 			log.Printf("[gridsim] marshal error: %v", err)
 			w.WriteHeader(http.StatusInternalServerError)

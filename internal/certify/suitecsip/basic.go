@@ -220,7 +220,9 @@ func (m controlMode) outcome(o *Observation) Finding {
 	case m.Refusal != nil:
 		return refusalOutcome(m.Refusal, o)
 	case m.Curve != nil:
-		return curveOutcome(o)
+		// The BINDING rides along: the row-level text says which halves of it
+		// were measured, and a bare Observation cannot know (curveHalves).
+		return curveOutcome(m.Curve, o)
 	default:
 		return oracleOutcome(o)
 	}
