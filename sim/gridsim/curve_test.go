@@ -666,14 +666,20 @@ func TestAdminCurve_ActivatingPostDropsTheCurvesItTruncated(t *testing.T) {
 	s := NewServer("")
 	h := s.AdminHandler()
 
-	post := func(body string) map[string]string {
+	// adminCurveResp, not the map[string]string this decoded into until curve
+	// plan #32: the response carries a `curves` ARRAY now that one DERControl
+	// may bind several curves (BASIC-004's Figure 4 prescribes four), and a map
+	// of strings cannot hold an array. The two fields this test reads —
+	// curve_href and curve_mrid, naming the FIRST curve — are unchanged, which
+	// is the back-compatibility promise adminCurveResp states.
+	post := func(body string) adminCurveResp {
 		t.Helper()
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(body))))
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("POST /admin/curve = %d; body: %s", rec.Code, rec.Body)
 		}
-		var got map[string]string
+		var got adminCurveResp
 		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 			t.Fatalf("decode the POST response: %v", err)
 		}
@@ -695,43 +701,43 @@ func TestAdminCurve_ActivatingPostDropsTheCurvesItTruncated(t *testing.T) {
 	// would carry forward: the breakpoints are replaced wholesale and would look
 	// right, while the timing element of a finished run went on being served
 	// under the new curve's mRID.
-	var minted []map[string]string
+	var minted []adminCurveResp
 	for _, mode := range []string{"volt_var", "volt_watt", "watt_pf"} {
 		minted = append(minted, post(`{"program":1,"mode":"`+mode+
 			`","points":[{"x":1,"y":2}],"open_loop_tms":5,"activate":false}`))
 	}
 	for i, m := range minted {
-		if got := status(m["curve_href"]); got != http.StatusOK {
+		if got := status(m.CurveHref); got != http.StatusOK {
 			t.Fatalf("GET %s (curve %d) = %d before the truncating POST; this test cannot show a drop "+
-				"that never had anything to drop", m["curve_href"], i, got)
+				"that never had anything to drop", m.CurveHref, i, got)
 		}
 		// And the timing element really IS on them, or the openLoopTms half of
 		// the leak assertion below would be vacuous: a server ignoring the field
 		// serves nil there both before and after, and "no stale openLoopTms"
 		// would pass against a bench that can author none at all.
 		var c model.DERCurve
-		getXML(t, s, m["curve_href"], &c)
+		getXML(t, s, m.CurveHref, &c)
 		if c.OpenLoopTms == nil || *c.OpenLoopTms != 5 {
 			t.Fatalf("curve %d at %s serves openLoopTms=%v, want 5 — the fixture never armed the element "+
-				"whose leak this test is about", i, m["curve_href"], c.OpenLoopTms)
+				"whose leak this test is about", i, m.CurveHref, c.OpenLoopTms)
 		}
 	}
-	if want := "/derp/1/dc/2"; minted[2]["curve_href"] != want {
-		t.Fatalf("the third append landed at %s, want %s", minted[2]["curve_href"], want)
+	if want := "/derp/1/dc/2"; minted[2].CurveHref != want {
+		t.Fatalf("the third append landed at %s, want %s", minted[2].CurveHref, want)
 	}
 
 	// Now the truncating POST: activate=true replaces the list with ONE curve.
 	fresh := post(`{"program":1,"mode":"freq_watt","points":[{"x":5900,"y":100}],"activate":true}`)
-	if want := "/derp/1/dc/0"; fresh["curve_href"] != want {
-		t.Fatalf("the activating POST landed at %s, want %s", fresh["curve_href"], want)
+	if want := "/derp/1/dc/0"; fresh.CurveHref != want {
+		t.Fatalf("the activating POST landed at %s, want %s", fresh.CurveHref, want)
 	}
 
 	// The list holds exactly the new curve...
 	var dc model.DERCurveList
 	getXML(t, s, "/derp/1/dc", &dc)
-	if len(dc.DERCurve) != 1 || dc.DERCurve[0].MRID != fresh["curve_mrid"] {
+	if len(dc.DERCurve) != 1 || dc.DERCurve[0].MRID != fresh.CurveMRID {
 		t.Fatalf("/derp/1/dc holds %d curve(s) (%+v), want only the activating POST's %s",
-			len(dc.DERCurve), dc.DERCurve, fresh["curve_mrid"])
+			len(dc.DERCurve), dc.DERCurve, fresh.CurveMRID)
 	}
 	// ...and the indices it truncated away are GONE from the resource map, not
 	// merely absent from the list.
@@ -744,8 +750,8 @@ func TestAdminCurve_ActivatingPostDropsTheCurvesItTruncated(t *testing.T) {
 	// Index 0 is republished with the NEW content, never left holding the old.
 	var live model.DERCurve
 	getXML(t, s, "/derp/1/dc/0", &live)
-	if live.MRID != fresh["curve_mrid"] {
-		t.Errorf("/derp/1/dc/0 serves %q, want the activating POST's %q", live.MRID, fresh["curve_mrid"])
+	if live.MRID != fresh.CurveMRID {
+		t.Errorf("/derp/1/dc/0 serves %q, want the activating POST's %q", live.MRID, fresh.CurveMRID)
 	}
 	if live.CurveType != model.CurveTypeFreqWatt {
 		t.Errorf("/derp/1/dc/0 serves curveType %d, want the freq_watt POST's %d",

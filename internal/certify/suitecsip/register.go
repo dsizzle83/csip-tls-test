@@ -592,11 +592,20 @@ type inverterControlRow struct {
 }
 
 // registerInverterControls binds BASIC-004..015, the twelve control-mode rows.
+//
+// TEN of them go through inverterControlRows below. BASIC-004 and BASIC-005 —
+// the two RIDE-THROUGH rows — go through registerRideThroughControls
+// (ridethrough.go) instead, because their apparatus is a LIST of curves bound
+// into ONE DERControl (Figure 4 prescribes four, Figure 5 two) and controlMode
+// has no field that can carry a list. They are registered from HERE, in the
+// same call, so a reader looking for where the twelve rows are bound finds all
+// twelve in one place.
 func registerInverterControls(reg *certify.Registry) {
 	for _, r := range inverterControlRows() {
 		reg.Register(uid(r.id), Suite, basicInverterControl(r.mode, r.subject),
 			certify.WithRequires(requiresFor(r.mode)...), certify.WithOrder(r.order))
 	}
+	registerRideThroughControls(reg)
 }
 
 // inverterControlRows is the twelve rows' one definition, factored out of the
@@ -604,13 +613,35 @@ func registerInverterControls(reg *certify.Registry) {
 // published curve, its real oracle — rather than a copy of its literals that
 // can silently drift from it (IW15-008).
 func inverterControlRows() []inverterControlRow {
-	const noRideThrough = "IEEE 2030.5's ride-through modes (opModLVRTMustTrip / opModLVRTMayTrip / " +
-		"opModLVRTMomentaryCessation and their HVRT / LFRT / HFRT counterparts) are curve-valued DERControl " +
-		"modes that the bench's 2030.5 server cannot publish: gridsim's admin control API " +
-		"(sim/gridsim/admin.go adminCtrlReq) exposes only the scalar modes, and its curve API " +
-		"(sim/gridsim/curve.go) binds only Volt-VAr, Volt-Watt, Freq-Watt and Watt-PF. With no way to put " +
-		"the mode on the wire there is nothing to observe, so nothing about this row has been tested. " +
-		"Closing this needs a ride-through curve mode in gridsim"
+	// noRideThrough IS GONE, and its deletion is curve plan #32's deliverable on
+	// this file. It read, verbatim: "IEEE 2030.5's ride-through modes
+	// (opModLVRTMustTrip / opModLVRTMayTrip / opModLVRTMomentaryCessation and
+	// their HVRT / LFRT / HFRT counterparts) are curve-valued DERControl modes
+	// that the bench's 2030.5 server cannot publish: gridsim's admin control API
+	// (sim/gridsim/admin.go adminCtrlReq) exposes only the scalar modes, and its
+	// curve API (sim/gridsim/curve.go) binds only Volt-VAr, Volt-Watt, Freq-Watt
+	// and Watt-PF. With no way to put the mode on the wire there is nothing to
+	// observe, so nothing about this row has been tested. Closing this needs a
+	// ride-through curve mode in gridsim."
+	//
+	// Every clause of that was TRUE when it was written, which is why the two
+	// rows it held were decided FAILs rather than skips. What replaced it:
+	//
+	//   the LEVER — sim/gridsim/curve.go's curveTypeForMode and setCurveLink now
+	//   carry all ten ride-through modes, and its `curves` array binds several
+	//   of them into ONE DERControl, which is the shape both Figures prescribe;
+	//
+	//   the REFEREE — internal/invariant/curves.go decodes models 707/708/709/710
+	//   with SUB-CURVE addressing, so a MomCess curve is graded against the
+	//   MomCess sub-curve and not against whichever one was non-empty;
+	//
+	//   the FIXTURE — sim/southbound/trip1547.go raised its declared NPt to 8,
+	//   because BASIC-004's own Figure 4 prescribes a SEVEN-point must-trip
+	//   curve and the sim could not hold the procedure's own values at four.
+	//
+	// The two rows are registered by registerRideThroughControls (ridethrough.go)
+	// and are NOT in the slice below: their apparatus is a list of curves, which
+	// controlMode has no field for. See registerInverterControls.
 
 	const noRampRate = "IEEE 2030.5 places the ramp rates setGradW and setSoftGradW ONLY in " +
 		"DefaultDERControl — CSIP §5.2.4 is explicit that they cannot be scheduled — and gridsim's " +
@@ -618,15 +649,15 @@ func inverterControlRows() []inverterControlRow {
 		"gradient fields. The mode therefore cannot be placed on the wire from this bench"
 
 	return []inverterControlRow{
-		// IW15-008: an unreachable mode is a row that was NOT TESTED, and it now
-		// says so in a decided FAIL (critModeUnauthorable) instead of the SKIP
-		// that let it roll up as a passing row. Nothing about the bench changed
-		// here; what changed is that the gap is visible in the verdict rather
-		// than only in the prose nobody reads on a green row.
-		{"BASIC-004", 50, unreachableMode("opModLVRTMustTrip", noRideThrough),
-			"the low/high voltage ride-through settings"},
-		{"BASIC-005", 51, unreachableMode("opModLFRTMustTrip", noRideThrough),
-			"the low/high frequency ride-through settings"},
+		// BASIC-004 (order 50) and BASIC-005 (order 51) USED TO SIT HERE as
+		// unreachableMode rows. They are real measured rows now and live in
+		// ridethrough.go — see the note on noRideThrough above.
+		//
+		// IW15-008's rule still governs everything below: an unreachable mode is
+		// a row that was NOT TESTED, and it says so in a decided FAIL
+		// (critModeUnauthorable) instead of the SKIP that let it roll up as a
+		// passing row.
+		//
 		// The curve rows carry the IW15-008 southbound curve oracle: the
 		// breakpoints they publish must be found ADOPTED and ENABLED in the
 		// DER's own curve model, point for point and in order. The mode→model
@@ -726,22 +757,74 @@ func inverterControlRows() []inverterControlRow {
 			// than reciting three withdrawn caveats.
 		}), "a Volt-VAr curve"},
 		{"BASIC-007", 53, unreachableMode("setGradW", noRampRate), "the ramp-rate settings"},
-		{"BASIC-008", 54, scalarMode("opModFixedPFInjectW", func(r *ControlRequest) {
-			r.FixedPFInjectW = &figure8FixedPF
-		}), "a fixed power factor while injecting"},
-		{"BASIC-009", 55, scalarMode("opModConnect", func(r *ControlRequest) {
-			r.Connect = ptr(false)
-			r.Energize = ptr(false)
-		}), "a connect/disconnect command"},
+		// BASIC-008 and BASIC-009 STOPPED SKIPPING on 2026-08-15. Both publish
+		// a STRUCTURE — a nested power factor with its excitation flag, a pair
+		// of booleans — which no single int64 describes, so neither fitted
+		// oracleBinding's shape and both were left with
+		// critDEREffectUnobservable's hard SKIP: the DER was never read, and a
+		// Skip is severity 0 in a roll-up that only raises. They are the last
+		// two rows of the twelve in that state, and directoracle.go is the
+		// binding shape they needed.
+		//
+		// For BASIC-008 the omission was sharper than a missing shape. The
+		// grader existed: fixedpf_oracle.go's gradeFixedPFDirection is a
+		// complete, independently-derived, fully-tested oracle for exactly this
+		// row's content — magnitude AND direction, with the 2018 p.258 negation
+		// performed once and cited — written after a real product inversion.
+		// It had no production caller. The instrument was built, proved, and
+		// never pointed at the device.
+		//
+		// The commanded value is passed IN rather than restated: figure8FixedPF
+		// is the same variable the ControlRequest publishes, so the published
+		// control and the oracle that judges it read one statement (IW14-003's
+		// rule, in the shape a structure allows).
+		{"BASIC-008", 54, directMode("opModFixedPFInjectW", oracleFixedPFInject(figure8FixedPF),
+			func(r *ControlRequest) {
+				r.FixedPFInjectW = &figure8FixedPF
+			}), "a fixed power factor while injecting"},
+		// BASIC-009's two axes have register homes on OPPOSITE generations —
+		// opModConnect only in legacy model 123's Conn point, opModEnergize
+		// only in 7xx model 703's enter-service permission — so on either bench
+		// exactly one of them is observable and the other is unobservable BY
+		// CONSTRUCTION. The oracle measures the half this DER can hold and
+		// names the half it cannot on every verdict, the same way BASIC-012
+		// handles its curve and droop halves; see oracleConnect.
+		//
+		// The legacy half is measurable at all only because this referee now
+		// transcribes model 123 itself (internal/invariant/legacyctl.go). That
+		// transcription DISAGREES with the product's at every offset, which the
+		// verdict discloses rather than resolves — see M123Divergence.
+		{"BASIC-009", 55, directMode("opModConnect", oracleConnect(false, false),
+			func(r *ControlRequest) {
+				r.Connect = ptr(false)
+				r.Energize = ptr(false)
+			}), "a connect/disconnect command"},
 		// The commanded value is written ONCE, in scalarModeOracled, and the
 		// oracle builder is handed to withOracle unapplied (IW14-003): the
 		// published control and the oracle that judges it read the same number,
 		// and the row can depart from it at run time when the DER already holds
 		// it (see oracleBinding).
-		{"BASIC-010", 56, withOracle(scalarModeOracled("opModMaxLimW", 6000,
+		//
+		// AND IT MUST STILL BE THERE (hold.go). This is the only row of the
+		// twelve that arms the persistence half, because it is the only one
+		// whose control is a standing CONSTRAINT rather than a value:
+		// opModMaxLimW is "the maximum active power generation level at which
+		// an EndDevice may operate", and a ceiling applied and then relaxed
+		// while the control is still active has not been complied with. The
+		// arrival oracle returns the instant the register matches, so on its
+		// own it cannot tell a held ceiling from one the gateway's next
+		// reconcile tick undid — which is a real failure mode of an
+		// arbitration that re-derives its desired state every pass.
+		//
+		// BASIC-013's opModFixedW is deliberately NOT armed: a setpoint the
+		// gateway may legitimately re-arbitrate against a newer input is not a
+		// standing constraint, and asserting persistence there would fail
+		// correct behaviour. Arming it is one call and is a decision about the
+		// product's contract, not about this apparatus.
+		{"BASIC-010", 56, withHold(withOracle(scalarModeOracled("opModMaxLimW", 6000,
 			func(r *ControlRequest, hundredths int64) {
 				r.MaxLimW = ptr(hundredths)
-			}), oracleMaxLimW), "a maximum active power limit"},
+			}), oracleMaxLimW), holdMaxLim), "a maximum active power limit"},
 		// yRefType 1 (%setMaxW), NOT the 3 (%statVarAvail) this row published
 		// until 2026-08-14. Three independent anchors say 1 and nothing says 3:
 		// sep 2.0.4's own opModVoltWatt documentation ("The y value specifies an
@@ -1035,8 +1118,11 @@ func inverterControlRows() []inverterControlRow {
 				MappingLegacy: mappingWattPFLegacy,
 			}), "an advanced (curve-based) inverter control"},
 
-		// TODO(curve plan #32): there is NO opModWattVar row here, and its
-		// absence is a BENCH gap rather than a scope decision.
+		// There is NO opModWattVar row here, and as of 2026-08-15 its absence is
+		// a SCOPE fact rather than a bench gap. The two halves of the note that
+		// used to stand here have swapped over, and it is rewritten rather than
+		// left as a TODO, because the blocker it named has been closed and a
+		// stale TODO reads to whoever finds it as work nobody has started.
 		//
 		// opModWattVar is the axis model 712 actually implements, and as of
 		// lexa-proto 8a65431 + lexa-gw's curve P1 wave the product decodes it,
@@ -1044,22 +1130,25 @@ func inverterControlRows() []inverterControlRow {
 		// 712 with read-back verification. It is the strongest curve axis this
 		// DUT has and nothing here exercises it.
 		//
-		// THE BLOCKER IS GRIDSIM, precisely: sim/gridsim/curve.go's
-		// curveTypeForMode and setCurveLink know four modes (volt_var,
-		// volt_watt, freq_watt, watt_pf) and there is no lever that emits an
-		// <opModWattVar> DERCurveLink at all, so the control cannot be placed on
-		// the wire. Adding one is curve plan #32's work: a "watt_var" mode
-		// mapping to csipmodel.CurveTypeWattVar (14 under IEEE 2030.5-2018
-		// p.254; this comment said 10 until IW15-027, which was the draft
-		// schema's code and is opModLVRTMustTrip under the standard) and
-		// ExtendedDERControlBase.OpModWattVar, both of which the pinned
-		// lexa-proto now provides.
+		// THE BLOCKER WAS GRIDSIM AND IS NOT ANY MORE. This note read "there is
+		// no lever that emits an <opModWattVar> DERCurveLink at all, so the
+		// control cannot be placed on the wire", and curve plan #32 built it:
+		// sim/gridsim/curve.go's curveTypeForMode carries a "watt_var" mode
+		// mapping to csipmodel.CurveTypeWattVar (14 under IEEE Std 2030.5-2018
+		// p.254; this note said 10 until IW15-027, which was the draft schema's
+		// code and is opModLVRTMustTrip under the standard) and setCurveLink
+		// sets ExtendedDERControlBase.OpModWattVar. A row that wanted the axis
+		// could publish it today with no bench change at all.
 		//
-		// It is recorded here rather than registered as an unreachableMode row
-		// because the catalog has no uid for it — CSIP-CONF-v1.3's BASIC family
-		// stops at BASIC-015 — and inventing a uid would put a row in the
-		// bundle that no document asks for. When #32 lands, the axis belongs on
-		// BASIC-015's sibling coverage or on an aggregate row, not here.
+		// What remains — and what was always the SECOND reason — is that the
+		// CATALOG HAS NO UID FOR IT. CSIP-CONF-v1.3's BASIC family stops at
+		// BASIC-015 and no procedure in this catalog prescribes an opModWattVar
+		// curve, so registering one would put a row in a conformance bundle
+		// that no document asks for and would have to invent its Test Values.
+		// This suite's rule is BASIC-006's Figure work stated in one line: a
+		// value nothing asks for is a value nothing tests. When a document does
+		// ask, the axis belongs on BASIC-015's sibling coverage or on an
+		// aggregate row, not here.
 	}
 }
 
@@ -1077,6 +1166,37 @@ func requiresFor(m controlMode) []string {
 // two DERControls in a stated overlap relationship. gridsim's three programs are
 // used as System (index 2, primacy 10), Site (index 1, primacy 5) and Service
 // Point (index 0, primacy 1), which is the priority ordering these rows turn on.
+//
+// ── OPEN: these eleven rows measure PRECEDENCE and not its OUTCOME ──────────
+//
+// Every one of them grades the DUT's Response lifecycle — which control it
+// reported Started, which it reported Superseded — and none of them reads the
+// DER. The winner's own commanded ceiling (scenarioControl.MaxLimW) is right
+// there on the fixture, the southbound instrument to check it exists and is
+// proven (oracleMaxLimW, basic.go), and the assertion that would close the
+// family is one sentence: the DER's own resolved active-power ceiling must be
+// the WINNER's value and must not be the loser's.
+//
+// It is NOT wired, deliberately, and the reason is a timing one rather than an
+// apparatus one. The southbound read happens once, at PostWait, at an instant
+// decided by when the DUT's poll cycle completed — while these scenarios are
+// SCHEDULES: BASIC-019 and BASIC-020 stage two non-overlapping controls 90 s
+// apart, BASIC-022 opens its Service Point control 30 s after its System one,
+// BASIC-023 staggers the ends. Which control is legitimately in force at the
+// read instant is therefore a function of the scenario's own timeline, and a
+// row that asserted the winner's ceiling without modelling that timeline would
+// FAIL a correct DUT whenever the read landed in the other control's window.
+// A false FAIL in a conformance bundle is worse than an unmeasured half, which
+// is the one trade this suite's rules make in that direction.
+//
+// WHAT CLOSING IT NEEDS, so the next person does not have to re-derive it:
+// evaluate each scenario's schedule at the read instant (the controls carry
+// StartOffset and DurationS already), assert the winner's ceiling only where
+// exactly one control can be in force there, and report a DECIDED
+// unavailability naming the ambiguity where more than one can. That is a
+// self-limiting design — it grades what the timeline makes unambiguous and says
+// so where it does not — and it is a wave of its own rather than a pre-flash
+// edit to eleven catalog rows on a bench nobody can re-run tonight.
 func registerEventScenarios(reg *certify.Registry, nonce string) {
 	for _, r := range eventScenarioRows(nonce) {
 		req := needGridSim

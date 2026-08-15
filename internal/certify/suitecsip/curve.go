@@ -2133,7 +2133,8 @@ func critDEREffectViaCurveOracle(subject string, b *curveBinding, o *Observation
 		claim += " — this criterion asserts NOTHING about " + s
 	}
 	return criterion{
-		Claim: claim,
+		Claim:       claim,
+		LoadBearing: true,
 		How: fmt.Sprintf("an independent read of the DER's raw SunSpec %s image (internal/invariant, which "+
 			"shares only the register-offset tables with the product and none of its CSIP/derbase "+
 			"interpretation), taken BEFORE this row published anything and again after the DUT's poll "+
@@ -2567,7 +2568,13 @@ const maxStagingCurvesFingerprinted = 4
 // criterion's How and for an unavailability message.
 func (b *refusalBinding) describeAxisRegisters(o *Observation) string {
 	if b.Curve == nil {
-		return strings.Join(b.Points, ", ")
+		// The 704 points this row named, AND the legacy scalar surface the
+		// fingerprint reads unconditionally. Naming only the first would
+		// describe a 7xx bench and misdescribe a legacy one, on which the 704
+		// points do not exist and model 123 is the whole of what was watched.
+		return strings.Join(b.Points, ", ") + " on a 7xx DER (model 704), and model 123's whole " +
+			"immediate-controls block — the connect register and the active-power ceiling with its " +
+			"enable and scale factor — on a legacy one, whichever the DER under test serves"
 	}
 	return curveModelLabel(b.Curve, o) + " (the selection/adopt state, the function enable, DeptRef, and " +
 		"the breakpoints of EVERY covered curve slot of the bank — on 7xx the live curve and its writable " +
@@ -2586,6 +2593,41 @@ func (b *refusalBinding) describeAxisRegisters(o *Observation) string {
 // to giving up — has written to an axis it told the head end it could not
 // perform, and every one of those is a landing this row must catch. Equality of
 // the whole fingerprint is the only statement that covers them.
+//
+// ── IT READS BOTH GENERATIONS (the parked BASIC-014 widening) ───────────────
+//
+// It used to read model 704 and nothing else, through invariant.UnitView's
+// Commands. On a 7xx bench that is the whole scalar control surface. On a
+// LEGACY bench there is no 704 at all — the generation puts its scalar controls
+// in model 123 (one active-power ceiling, one connect register) — so the
+// fingerprint came back with no parts, this function returned ok=false, and
+// oracleRefusal reported the axis Unavailable. BASIC-014 therefore FAILED on
+// every legacy DER for want of a register to look at, which is a bench gap
+// wearing a verdict's clothes: the row was reporting on itself, not on the DUT.
+//
+// So a reading now covers the model-123 surface too, through
+// invariant.LegacyControls (internal/invariant/legacyctl.go), whenever the
+// device serves it. A device serving neither model is still ok=false, which is
+// the honest answer: there is nowhere for a scalar write to land and therefore
+// nothing to certify an absence over.
+//
+// TWO CAUTIONS RIDE WITH THE LEGACY HALF, and both are stated on every reading
+// it produces rather than only here.
+//
+// The first is that its point names are MODEL-QUALIFIED ("M123.WMaxLimPct").
+// Model 704 has a WMaxLimPct too, meaning a different thing against a different
+// enable and a different scale factor, and this suite's own oracleMaxLimW
+// selects it by bare name — an unqualified legacy point would have been picked
+// up by that oracle and judged under 704 semantics.
+//
+// The second is [invariant.DescribeM123Divergence]: the register map SunSpec
+// publishes for model 123 and the hand-written offsets lexa-proto's writer uses
+// disagree at every point. This referee reads the PUBLISHED map, so on a legacy
+// DER it is watching different registers than the writer under test believes it
+// is moving. That does not weaken the fingerprint — LegacyControls renders the
+// WHOLE model-123 block, so a write that lands at any offset moves it — and it
+// is disclosed on the reading so a bundle cannot be read as agreeing with a
+// transcription this referee does not share.
 func refusalFingerprint(uv invariant.UnitView, points []string) (string, bool) {
 	want := map[string]bool{}
 	for _, p := range points {
@@ -2598,6 +2640,14 @@ func refusalFingerprint(uv invariant.UnitView, points []string) (string, bool) {
 		}
 		parts = append(parts, fmt.Sprintf("%s=%s %s(%s=%d)", c.Point, c.Raw,
 			enabledLabel(c.Enabled), orText(c.ModePoint, "mode"), c.ModeVal))
+	}
+	if lc := uv.LegacyCommands(oracleSimName); lc.Present {
+		if fp, ok := lc.Fingerprint(); ok {
+			parts = append(parts, "M123 (legacy scalar control surface): "+fp)
+			if d := invariant.DescribeM123Divergence(); d != "" {
+				parts = append(parts, "TRANSCRIPTION: "+d)
+			}
+		}
 	}
 	if len(parts) == 0 {
 		return "", false
@@ -2759,7 +2809,8 @@ func refusalOutcome(b *refusalBinding, o *Observation) Finding {
 func critRefusedAxisNoSouthboundTrace(b *refusalBinding, o *Observation) criterion {
 	f := refusalOutcome(b, o)
 	return criterion{
-		Claim: "no southbound write of " + b.Axis + " reached the DER while this row's refused control was live",
+		Claim:       "no southbound write of " + b.Axis + " reached the DER while this row's refused control was live",
+		LoadBearing: true,
 		How: "an independent read of the DER's own raw SunSpec image (internal/invariant, which shares only " +
 			"the register-offset tables with the product and none of its CSIP/derbase interpretation), " +
 			"taken BEFORE this row published its control and again after the DUT's poll cycle: " +
@@ -3006,7 +3057,8 @@ func critModeUnauthorable(subject, element, why string) criterion {
 		"as a FAIL rather than skipped, because an untested row must not roll up as a passing one (a SKIP " +
 		"is the lowest severity in the verdict roll-up and cannot hold a release). The gap: " + why
 	return criterion{
-		Claim: "the DUT received and applied a DERControl carrying " + subject,
+		Claim:       "the DUT received and applied a DERControl carrying " + subject,
+		LoadBearing: true,
 		How: "the presence of a <" + element + "> element inside a DERControlBase the DUT fetched — which " +
 			"this bench cannot produce; see the observation",
 		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
@@ -3024,7 +3076,8 @@ func critEffectBlockedByAuthoringGap(subject, element string) criterion {
 		"southbound oracle this suite runs for the executable modes has nothing to correlate against here; " +
 		"reporting that as anything but a FAIL would let an untested row certify itself"
 	return criterion{
-		Claim: "the DER's own southbound registers reflect " + subject,
+		Claim:       "the DER's own southbound registers reflect " + subject,
+		LoadBearing: true,
 		How: "an independent read of the DER's own SunSpec registers, correlated against the control this " +
 			"row published — which, for this row, does not exist",
 		Tier: tierOracle,

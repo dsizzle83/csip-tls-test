@@ -69,13 +69,55 @@ const (
 	// advTripNPt is the device's declared NPt for the trip models: the number
 	// of points each sub-curve can hold.
 	//
-	// Four, not advNPt's ten. The Category III defaults need two points per
-	// sub-curve, so four is real headroom for a staged adopt — and it keeps
-	// every trip block inside the 125-register Modbus single-read cap
-	// (707/708 = 87 registers, 709/710 = 111), so a gateway reads each model
-	// in one transaction. Model 701 already exercises the chunked-read path
-	// deliberately; there is nothing to gain by making four more models do it.
-	advTripNPt = 4
+	// EIGHT, RAISED FROM FOUR, and the reason is a certification procedure
+	// rather than a preference. CSIP CTP v1.3's BASIC-004 Figure 4 prescribes an
+	// opModLVRTMustTrip curve of SEVEN breakpoints —
+	// (150,0)(150,5000)(1200,5000)(1200,7000)(2200,7000)(2200,8800)(10000,8800)
+	// in the Figure's own raw units — and Encode707Set REFUSES a curve with more
+	// points than the device's declared NPt ("trip curve has %d points, device
+	// NPt=%d"). At four, this bench could not hold the certification
+	// procedure's own curve: the row would have failed on the FIXTURE's
+	// geometry and reported it as a device or product finding. Eight is seven
+	// plus one slot of headroom, which is the same margin the old four gave the
+	// two-point Category III defaults.
+	//
+	// THE STATED RATIONALE FOR FOUR NO LONGER HOLDS AND IS NOT QUIETLY DROPPED.
+	// It was: "it keeps every trip block inside the 125-register Modbus
+	// single-read cap (707/708 = 87 registers, 709/710 = 111), so a gateway
+	// reads each model in one transaction." Recomputed at NPt=8, from
+	// lexa-proto's own size functions (derlayout.go) and the 7-register
+	// L707Hdr/L709Hdr:
+	//
+	//	707/708  tripVSetSize(8)  = 1 + 3×(1 + 8×3) = 76 regs/set
+	//	         7 + 2×76         = 159 registers   (was 7 + 2×40 = 87)
+	//	709/710  tripHzSetSize(8) = 1 + 3×(1 + 8×4) = 100 regs/set
+	//	         7 + 2×100        = 207 registers   (was 7 + 2×52 = 111)
+	//
+	// So BOTH families now EXCEED the 125-register single-read cap, and this
+	// comment says so rather than leaving a reader with a superseded promise.
+	// That is a change of behaviour and it is safe for one reason, checked and
+	// not assumed: sunspec.Reader.ReadModel reads through readChunked, which
+	// splits any block wider than maxHoldingRead (125, PI-MBUS-300's 0x7D) into
+	// consecutive transactions and concatenates them. 159 becomes 125+34 and
+	// 207 becomes 125+82. Model 701 (153 registers) already takes exactly this
+	// path on every discovery walk, so it is exercised on every advanced run
+	// rather than only by these four models — see
+	// TestTripBlocksSpanTheChunkedRead, which asserts the arithmetic above and
+	// reads a trip model back through the real chunking reader.
+	//
+	// WRITES ARE STILL SINGLE-TRANSACTION and that is the half worth stating,
+	// because Reader.WriteModel does NOT chunk — it hands the whole slice to one
+	// WriteHolding. derbase's adoptCurve writes one STAGING SET at a time: 76
+	// registers for 707/708 and 100 for 709/710, both inside FC16's
+	// 123-register ceiling.
+	//
+	// THAT is the ceiling that binds this constant, not the read one. At
+	// advNPt's ten the frequency staging set would be
+	// tripHzSetSize(10) = 1 + 3×(1 + 10×4) = 124 registers — one past FC16 —
+	// and every 709/710 adopt would be refused by the transport. Eight leaves
+	// the write at 100 with room, and nine (112) would still fit; the choice of
+	// eight is Figure 4's seven points plus one, not the write ceiling.
+	advTripNPt = 8
 
 	// advNCrvSet is the number of curve-sets each trip model serves: index 0 is
 	// the live, read-only set; index 1 is the writable staging set the §3.1.2

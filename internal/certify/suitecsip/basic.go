@@ -130,9 +130,15 @@ type controlMode struct {
 	//
 	// Populated only for BASIC-010/opModMaxLimW and BASIC-013/opModFixedW —
 	// the rows §4.3 names whose axis the product genuinely executes as a
-	// SCALAR. The curve-linked and refused-axis rows carry their own
-	// apparatus below; only the fetch-only rows (BASIC-008/009) are left with
-	// critDEREffectUnobservable's SKIP.
+	// SCALAR. The curve-linked and refused-axis rows carry their own apparatus
+	// below, and BASIC-008/009 carry Direct's.
+	//
+	// THAT LAST CLAUSE USED TO READ "only the fetch-only rows (BASIC-008/009)
+	// are left with critDEREffectUnobservable's SKIP", and it was accurate for
+	// as long as it stood. It is not any more: no inverter-control row skips
+	// its southbound half now (directoracle.go), which is what makes
+	// critDEREffectUnobservable reachable from this switch's default arm alone
+	// — a row shape nothing in this suite currently builds.
 	Oracle *oracleBinding
 
 	// Curve, when set, is a CURVE-linked row's apparatus (IW15-008, curve.go):
@@ -167,6 +173,36 @@ type controlMode struct {
 	// they carry one Curve with both arms named (curveBinding's Model7xx /
 	// ModelLegacy), and the oracle resolves the bank from the DER's chain.
 	LegacyCurve *curveBinding
+
+	// Direct, when set, is the southbound oracle for a row whose commanded
+	// content is a STRUCTURE rather than a scalar (directoracle.go): a nested
+	// power factor with its excitation flag (BASIC-008), a pair of connect /
+	// energize booleans (BASIC-009).
+	//
+	// It exists because oracleBinding's value-in-one-place discipline is built
+	// around ONE int64, and the two rows that publish a structure were
+	// therefore left with critDEREffectUnobservable's hard SKIP — measurement
+	// absent, reading as success, on rows whose axis this product does execute.
+	// For BASIC-008 the grader had even been written and proved
+	// (fixedpf_oracle.go's gradeFixedPFDirection) and had no caller at all.
+	//
+	// It reuses every param and every phase the scalar oracle uses, so
+	// oracleOutcome collapses it identically; what it does not reuse is the
+	// value ladder, because a structure has none.
+	Direct *directOracle
+
+	// Hold, when set, adds the PERSISTENCE half to an ORACLED row: the value
+	// this row commanded must not merely ARRIVE in the DER's registers, it
+	// must still be there when the row reads them again (hold.go).
+	//
+	// It is a per-row decision rather than something every oracled row
+	// silently acquires, because arming it is a CLAIM. A row commanding a
+	// standing constraint — opModMaxLimW's ceiling — is entitled to assert
+	// that the constraint stood. A row commanding a setpoint the gateway may
+	// legitimately re-arbitrate against a newer input is not, and asserting it
+	// there would fail correct behaviour. Which rows make the claim is
+	// therefore visible at the registration (withHold), never implied.
+	Hold *holdBinding
 }
 
 // forGeneration resolves the apparatus this row uses on the DER that was
@@ -208,7 +244,7 @@ func (m controlMode) forObservation(o *Observation) controlMode {
 // three shapes that read the DER's own registers and carry a live verdict
 // (spec.Verdict) rather than resting on the capture.
 func (m controlMode) measured() bool {
-	return m.Oracle != nil || m.Curve != nil || m.Refusal != nil
+	return m.Oracle != nil || m.Curve != nil || m.Refusal != nil || m.Direct != nil
 }
 
 // outcome is the ONE definition of a measured row's verdict, dispatched by
@@ -224,7 +260,23 @@ func (m controlMode) outcome(o *Observation) Finding {
 		// were measured, and a bare Observation cannot know (curveHalves).
 		return curveOutcome(m.Curve, o)
 	default:
-		return oracleOutcome(o)
+		f := oracleOutcome(o)
+		if m.Hold == nil {
+			return f
+		}
+		// BOTH HALVES MUST HOLD, and the arrival half is reported first when
+		// it is the one that failed. A row that arms a hold is making two
+		// claims — the value arrived, and it stayed — and a verdict that took
+		// only the first would let exactly the defect this apparatus exists to
+		// catch roll up green: applied, then quietly relaxed.
+		if f.Verdict != certify.Pass {
+			return f
+		}
+		h := holdOutcome(m.Hold, o)
+		if h.Verdict == certify.Pass {
+			return withNote(f, holdClause(m.Hold, o))
+		}
+		return h
 	}
 }
 
@@ -594,6 +646,33 @@ func unreachableMode(element, why string) controlMode {
 	return controlMode{Element: element, Unreachable: why}
 }
 
+// withHold adds the PERSISTENCE claim to an already-oracled row: the value this
+// row commands must still be in the DER's registers when the row reads them
+// again (hold.go).
+//
+// It is a combinator at the REGISTRATION rather than a property of
+// scalarModeOracled, because arming it is a claim about the CONTROL and not
+// about the apparatus. opModMaxLimW commands a standing constraint and is
+// entitled to assert the constraint stood; a setpoint the gateway may
+// legitimately re-arbitrate against a newer input is not, and asserting it
+// there would fail correct behaviour. Making the claim visible at the row is
+// what stops it spreading by default to rows that should not make it.
+//
+// It panics on a mode with no Oracle, for the reason withOracle does: there is
+// nothing to hold and the mistake must never reach a campaign.
+func withHold(m controlMode, h holdBinding) controlMode {
+	if m.Oracle == nil {
+		panic("suitecsip: withHold on a mode with no southbound oracle — there is no arrival for a " +
+			"persistence claim to be made about")
+	}
+	if h.Why == "" {
+		panic("suitecsip: withHold with no Why — a persistence FAIL must say what the control MEANT, " +
+			"or the verdict is about the apparatus instead of about the control")
+	}
+	m.Hold = &h
+	return m
+}
+
 // withOracle attaches an independent southbound register Oracle (IW13-001
 // §4.3) to an already-built oracled controlMode — the combinator BASIC-010/013's
 // rows use so scalarMode's own construction stays untouched for every other
@@ -694,6 +773,18 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 					critDEREffectViaCurveOracle(subject, m.Curve, o))
 			case m.Oracle != nil:
 				crits = append(crits, critDEREffectViaSouthboundOracle(subject, o))
+				// The persistence half is its OWN criterion, not a stiffening
+				// of the arrival one, because a bundle has to show which of
+				// the two failed: "the gateway never applied the ceiling" and
+				// "the gateway applied it and then let it go" are different
+				// defects with different owners, and folding them together is
+				// how the second stayed unmeasured. Present only on a row that
+				// declares the claim.
+				if m.Hold != nil {
+					crits = append(crits, critDERValueRemainedAcrossTheWindow(subject, m.Hold, o))
+				}
+			case m.Direct != nil:
+				crits = append(crits, critDEREffectViaDirectOracle(subject, m.Direct, o))
 			default:
 				crits = append(crits, critDEREffectUnobservable(subject))
 			}
@@ -727,6 +818,11 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				return refusalSetup(ctx, d, params, m.Refusal, mrid)
 			case m.Oracle != nil:
 				return oracledSetup(ctx, d, params, m.Oracle, mrid)
+			case m.Direct != nil:
+				// Baseline first, then the row's ORDINARY publisher: a
+				// structured-content row sends exactly what it always sent,
+				// and only what it MEASURES has changed. See directSetup.
+				return directSetup(ctx, d, params, m.Direct, m.Publish, mrid)
 			default:
 				return m.Publish(ctx, d, mrid)
 			}
@@ -750,6 +846,15 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			// is not satisfied at once, so the budget arithmetic has to know
 			// (IW14-005 — spec.SettlePoll, waitSlots).
 			s.SettlePoll = true
+			// A row that also HOLDS spends a further, KNOWN, fixed span
+			// confirming — and it spends it AFTER the settle poll has already
+			// returned, so SettlePoll's window does not cover it. Declaring it
+			// is what stops -timeout killing the check between arrival and
+			// confirmation, which would produce no criteria at all
+			// (spec.HoldWindow).
+			if m.Hold != nil {
+				s.HoldWindow = time.Duration(m.Hold.Samples) * m.Hold.Step
+			}
 			s.PostWait = func(ctx context.Context, d *Driver, params map[string]string) error {
 				m := m.forGeneration(params)
 				// Read the bench's own data plane ONCE, here, and write down
@@ -792,10 +897,35 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 					judge := oracleCurve(m.Curve)
 					f = settleOracle(ctx, oracleSettleDeadline(params),
 						func() Finding { return judge(ctx, d.rc) })
+				case m.Direct != nil:
+					// Same settle poll as the scalar oracle, for the same
+					// reason: AwaitWalk returns at the START of the DUT's walk
+					// and the southbound write follows the reconciler's own
+					// tick, so a single read samples mid-propagation.
+					direct := m.Direct
+					f = settleOracle(ctx, oracleSettleDeadline(params),
+						func() Finding { return direct.judgeWith(ctx, d.rc) })
 				default:
 					judge := m.Oracle.Judge(commandedValue(params, m.Oracle))
-					f = settleOracle(ctx, oracleSettleDeadline(params),
-						func() Finding { return judge(ctx, d.rc) })
+					eval := func() Finding { return judge(ctx, d.rc) }
+					f = settleOracle(ctx, oracleSettleDeadline(params), eval)
+					// THE PERSISTENCE HALF (hold.go). settleOracle returns the
+					// instant the value ARRIVES, which is the right instrument
+					// for the mid-propagation race and says nothing at all
+					// about whether the value then stayed. A row that arms a
+					// hold re-reads the DER a few times more, judged by the
+					// SAME closure against the SAME commanded number, so the
+					// two halves cannot disagree about what was asked for.
+					//
+					// It runs HERE rather than as a second criterion's own
+					// live phase because PostWait is the only slot with live
+					// context, and it must run against the same control that
+					// is still active — the oracled window (690 s) is far
+					// longer than settle plus hold, so nothing the samples
+					// observe is the control expiring.
+					if m.Hold != nil {
+						recordHold(ctx, *m.Hold, params, f, eval)
+					}
 				}
 				switch {
 				case f.Unavailable != "":
@@ -1268,9 +1398,10 @@ func critDEREffectViaSouthboundOracle(subject string, o *Observation) criterion 
 		"the value this row itself commanded — not against what the DUT reports the DER received"
 	f := oracleOutcome(o)
 	return criterion{
-		Claim: claim,
-		How:   how,
-		Tier:  tierOracle,
+		Claim:       claim,
+		How:         how,
+		LoadBearing: true,
+		Tier:        tierOracle,
 		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
 			return f
 		},

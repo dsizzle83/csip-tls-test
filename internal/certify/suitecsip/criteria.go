@@ -148,6 +148,24 @@ type criterion struct {
 	// Skip is the reason recorded when no evaluator could reach a conclusion
 	// and neither produced one of its own.
 	Skip string
+
+	// LoadBearing marks a criterion that carries its ROW'S WHOLE SUBJECT — the
+	// "did the device actually do it" claim — so that a Skip on it CAPS the
+	// case below PASS instead of vanishing into a maximum-taking roll-up.
+	//
+	// doc.go's release-enforcing families are written with no Skip path at all.
+	// That is the stronger discipline, and it is why marking them changes no
+	// verdict today. This flag is the STRUCTURAL half of the same rule: the
+	// per-criterion discipline is a convention a future edit can break in
+	// silence, and this is the arithmetic that notices. See
+	// bundle.Assertion.LoadBearing for the full argument.
+	//
+	// It goes on the criteria that carry a row's subject and NEVER on the
+	// supporting wire observations. "The DUT fetched the control list" is real
+	// evidence and is not what the row is FOR; marking it would cap rows for
+	// capture gaps this suite already reports honestly through its tiering,
+	// which would make the marker mean nothing within a week.
+	LoadBearing bool
 }
 
 // mint turns a criterion list into assertions, choosing the strongest tier that
@@ -159,6 +177,13 @@ func mint(ev *certify.Evidence, obs *Observation, crits []criterion) ([]certify.
 		if err != nil {
 			return nil, err
 		}
+		// The marker travels with the assertion, set HERE rather than inside
+		// each of assert's four exit arms: every arm builds its assertion
+		// through a different certify.Evidence constructor, and a flag that had
+		// to be threaded through all four would eventually be missed on the one
+		// arm that matters — the SkipAssertion arm, which is the only one the
+		// cap ever fires on.
+		a.LoadBearing = c.LoadBearing
 		out = append(out, a)
 	}
 	return out, nil

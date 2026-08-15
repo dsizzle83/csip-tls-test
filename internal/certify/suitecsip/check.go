@@ -286,6 +286,9 @@ func liveOverhead(s spec) time.Duration {
 			over += changeSettle
 		}
 	}
+	// The persistence samples, which run AFTER the settle poll has already
+	// returned and are therefore not covered by SettlePoll's window (hold.go).
+	over += s.HoldWindow
 	return over
 }
 
@@ -381,6 +384,19 @@ type spec struct {
 	// the second window, so fetchWait trims the FIRST one to leave room for it
 	// instead of letting -timeout kill the check between them.
 	SettlePoll bool
+
+	// HoldWindow is the extra wall time this spec's PostWait spends CONFIRMING
+	// that a value it already observed is still there (hold.go), on top of
+	// whatever the settle poll spent arriving at it.
+	//
+	// It is a budget declaration for the same reason SettlePoll is, and it is a
+	// DURATION rather than a bool because it is not a poll-cycle window: a hold
+	// runs a fixed, small number of samples at a fixed spacing and knows
+	// exactly how long it will take. liveOverhead adds it, so the fetch wait is
+	// trimmed to leave room instead of -timeout killing the check between
+	// arrival and confirmation — which would produce no criteria at all, the
+	// worse bundle waitBudgetReserve's own doc argues against.
+	HoldWindow time.Duration
 
 	// Change is the mutation the procedure makes AFTER the client has taken up
 	// what Setup put there, and it exists because half the aggregator rows

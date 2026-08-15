@@ -1238,12 +1238,23 @@ func TestBothGenerationsDER_IsItsOwnAnswerAndNotATieBreak(t *testing.T) {
 func TestResolveTargetFallback_TieBreaksLegacyFirst(t *testing.T) {
 	// Neither named model is a CURVE model, so no generation is recognised and
 	// the fallback is what decides — which is the only way to observe it.
+	//
+	// 701 AND 702, not the 707/708 this used to name. Those were chosen because
+	// internal/invariant decoded no trip models, so a DER serving them belonged
+	// to no generation; curve plan #32 made 707-710 real curve models with real
+	// sub-curve decoding, so the same fixture now resolves cleanly as 7xx and
+	// the fallback is never reached. The FIXTURE moved and the assertion did
+	// not: 701 (DER AC Measurement) and 702 (DER Capacity) are read by every
+	// register-image source and are curve models on neither generation, which is
+	// exactly the property this test needs. A device serving only those is a
+	// device this suite cannot place, and the fallback's ordering is the only
+	// thing left to decide it.
 	b := &curveBinding{
 		Mode:     "volt_var",
-		Model7xx: 707, Mapping7xx: "the 7xx arm",
-		ModelLegacy: 708, MappingLegacy: "the legacy arm",
+		Model7xx: 701, Mapping7xx: "the 7xx arm",
+		ModelLegacy: 702, MappingLegacy: "the legacy arm",
 	}
-	uv := invariant.UnitView{Models: []uint16{707, 708}}
+	uv := invariant.UnitView{Models: []uint16{701, 702}}
 	if got := curveGenerationOf(uv); got != genNone {
 		t.Fatalf("this fixture recognises generation %v; the fallback would not be reached", got)
 	}
@@ -1251,7 +1262,7 @@ func TestResolveTargetFallback_TieBreaksLegacyFirst(t *testing.T) {
 	if how != curveResolved {
 		t.Fatalf("the fallback resolved nothing (how=%v)", how)
 	}
-	if target.Model != 708 {
+	if target.Model != 702 {
 		t.Errorf("the fallback chose M%d; it must try LEGACY first, matching curveGenerationOf's own "+
 			"ordering, or one resolution path holds two tie-breaks pointing opposite ways", target.Model)
 	}

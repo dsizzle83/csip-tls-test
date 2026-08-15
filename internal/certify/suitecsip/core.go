@@ -723,6 +723,11 @@ func parseInt(s string) (int64, bool) {
 	return v, true
 }
 
+// core021MRIDPrefix is the mRID stem CORE-021's three controls share, so the
+// criterion that grades them can find them on the wire without the row having
+// to hand it a list.
+const core021MRIDPrefix = "CERT-CORE021-"
+
 // coreRandomizedEvents implements CORE-021 — Randomized Events.
 func coreRandomizedEvents(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	return run(ctx, rc, spec{
@@ -731,8 +736,19 @@ func coreRandomizedEvents(ctx context.Context, rc *certify.RunCtx) (certify.Resu
 			// The procedure's three controls carry randomizeStart 0, +30 and
 			// -30 seconds. gridsim serves randomizeStart/randomizeDuration
 			// straight through, so all three are reachable.
+			//
+			// They also carry gridsim's DEFAULT responseRequired
+			// (adminDefaultResponseRequired = RespReqMessageReceived |
+			// RespReqSpecificResponse), which is what asks the DUT to announce
+			// its own start instant with a status=2 Response — the observation
+			// the second criterion below rests on. That default has existed
+			// since the admin API grew RespondableResource attributes; the
+			// Skip that used to sit on that criterion said "gridsim's admin
+			// control API does not expose responseRequired" and had been false
+			// for as long as CORE-022 has been grading Response lifecycles
+			// through the same API.
 			for i, rnd := range []int32{0, 30, -30} {
-				mrid := fmt.Sprintf("CERT-CORE021-%d", i)
+				mrid := fmt.Sprintf("%s%d", core021MRIDPrefix, i)
 				if _, err := d.PostControl(ctx, ControlRequest{
 					Program: 0, MRID: mrid, Description: "CORE-021 randomized control",
 					StartOffset: 120 + 60*i, DurationS: 60, MaxLimW: ptr(int64(5000)),
@@ -775,22 +791,7 @@ func coreRandomizedEvents(ctx context.Context, rc *certify.RunCtx) (certify.Resu
 							"%d control(s) carry randomizeStart: %s", len(vals), strings.Join(vals, " "))
 					},
 				},
-				{
-					Claim: "the DUT applied the randomization: its activation of each event is offset from " +
-						"interval/start by the event's randomizeStart",
-					How: "the capture timestamp of the DUT's status=2 (Started) Response for each control, " +
-						"compared with the control's interval start plus its randomizeStart",
-					NeedsTranscript: true,
-					Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-						return unavailable("no status=2 Response was recovered for a randomized control in " +
-							"this window")
-					},
-					Skip: "the DUT's activation instant is observable only through a status=2 (Started) " +
-						"Response POST, and only for a control whose responseRequired asks for one. " +
-						"gridsim's admin control API does not expose responseRequired, so this bench cannot " +
-						"ask the DUT to announce its start instant and cannot measure the applied " +
-						"randomization from the wire",
-				},
+				critRandomizationNotEarlierThanPermitted(core021MRIDPrefix),
 			}
 		},
 	})

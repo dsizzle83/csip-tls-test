@@ -1445,15 +1445,36 @@ func (d *Driver) PostControl(ctx context.Context, req ControlRequest) (string, e
 	return out.MRID, nil
 }
 
-// CurveRequest is the body of gridsim's POST /admin/curve: a DER curve bound
-// into an active DERControl, which is the only way a curve-based mode
-// (Volt-VAr, Volt-Watt, Freq-Watt, Watt-PF) reaches the DUT.
+// CurveRequest is the body of gridsim's POST /admin/curve: one or more DER
+// curves bound into ONE active DERControl, which is the only way a curve-based
+// mode (Volt-VAr, Volt-Watt, Freq-Watt, Watt-PF, Watt-Var, and the ten IEEE
+// 2030.5 ride-through curves) reaches the DUT.
 type CurveRequest struct {
-	Program int          `json:"program"`
-	Mode    string       `json:"mode"`
-	Points  []CurvePoint `json:"points"`
-	XMult   int8         `json:"x_mult,omitempty"`
-	YMult   int8         `json:"y_mult,omitempty"`
+	Program int `json:"program"`
+
+	// Curves publishes SEVERAL curves on ONE control, each with its own mode,
+	// breakpoints, multipliers and y reference.
+	//
+	// It exists because two certification procedures prescribe exactly that
+	// shape and neither is expressible one curve at a time. CSIP CTP v1.3's
+	// BASIC-004 requires "a DERControl instance with Low/High Voltage Ride
+	// Through values in Figure 4" — one control — and Figure 4 prints four
+	// curves; BASIC-005's Figure 5 prints two. Publishing them as separate
+	// DERControls would follow a procedure nobody wrote, and the row could then
+	// never state that the DUT had been offered the COMBINATION, which is the
+	// whole content of a ride-through test. It is the same argument openLoopTms
+	// and opModFreqDroop already ride the same request on.
+	//
+	// MUTUALLY EXCLUSIVE WITH THE SINGLE-CURVE FIELDS BELOW. gridsim answers 400
+	// to a request carrying both, because such a request has two answers to what
+	// it published. A caller sending only the single-curve fields is an implicit
+	// one-entry request and behaves exactly as it did before this field existed.
+	Curves []CurveEntry `json:"curves,omitempty"`
+
+	Mode   string       `json:"mode,omitempty"`
+	Points []CurvePoint `json:"points,omitempty"`
+	XMult  int8         `json:"x_mult,omitempty"`
+	YMult  int8         `json:"y_mult,omitempty"`
 	// No XRefType: NO revision of IEEE 2030.5 declares an xRefType element on
 	// DERCurve — not 2018 (p.252-253), not 2023 (p.265-266), not the vendored
 	// draft schema — so gridsim answers 400 to a request that carries the
@@ -1509,6 +1530,36 @@ type FreqDroopSettings struct {
 	OpenLoopTms uint16 `json:"open_loop_tms"` // open-loop response time, hundredths of a second
 }
 
+// CurveEntry is ONE curve of a multi-curve request — gridsim's
+// adminCurveEntry, mirrored field for field.
+//
+// The fields are a subset of CurveRequest's single-curve half and carry the
+// same meanings; only the per-CONTROL fields (the program, the window, the
+// inline opModFreqDroop, the fixed-var overlay) stay on the request, because
+// they are properties of the control rather than of any one curve.
+//
+// XMult/YMult/YRefType carry NO omitempty, unlike their single-curve
+// counterparts. On this struct every one of the three has a meaningful zero —
+// 10^0 is an ordinary multiplier and yRefType 0 is "N/A", which is exactly what
+// BASIC-005's Figure 5 prescribes for a curve whose y axis is an absolute
+// frequency — and a field elided at zero would be indistinguishable from one
+// the row forgot. gridsim defaults an absent field to zero either way, so the
+// wire outcome is identical; what changes is that the request this bench
+// RECORDS says what it sent.
+type CurveEntry struct {
+	Mode     string       `json:"mode"`
+	Points   []CurvePoint `json:"points"`
+	XMult    int8         `json:"x_mult"`
+	YMult    int8         `json:"y_mult"`
+	YRefType uint8        `json:"y_ref_type"`
+
+	OpenLoopTms                *uint16 `json:"open_loop_tms,omitempty"`
+	VRef                       *int64  `json:"vref,omitempty"`
+	AutonomousVRefEnable       *bool   `json:"autonomous_vref_enable,omitempty"`
+	AutonomousVRefTimeConstant *uint32 `json:"autonomous_vref_time_constant,omitempty"`
+	Description                string  `json:"description,omitempty"`
+}
+
 // CurvePoint is one (x, y) breakpoint.
 type CurvePoint struct {
 	X float64 `json:"x"`
@@ -1528,6 +1579,23 @@ type CurvePoint struct {
 // separate thing to be able to say about a failing row.
 type CurvePublication struct {
 	MRID      string `json:"mrid"`
+	CurveMRID string `json:"curve_mrid"`
+	CurveHref string `json:"curve_href"`
+	// Curves is EVERY curve the control binds, in the order the request sent
+	// them. CurveMRID/CurveHref above name the first of them and are kept for
+	// the single-curve rows written before multi-curve controls existed.
+	//
+	// A row publishing several curves must read this and not the first pair: a
+	// ride-through row recording one href as "the" curve it published would
+	// leave three more served, linked and unrecorded, and its
+	// curve-resolvability criterion would check a quarter of what it sent.
+	Curves []CurvePublishedCurve `json:"curves"`
+}
+
+// CurvePublishedCurve is one curve of a publication, as gridsim minted it.
+type CurvePublishedCurve struct {
+	Mode      string `json:"mode"`
+	CurveType uint16 `json:"curve_type"`
 	CurveMRID string `json:"curve_mrid"`
 	CurveHref string `json:"curve_href"`
 }

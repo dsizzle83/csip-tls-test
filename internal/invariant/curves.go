@@ -1,8 +1,9 @@
 package invariant
 
 // curves.go is this package's decode of the SunSpec curve/control models —
-// 705 (Volt-Var), 706 (Volt-Watt), 711 (Frequency Droop) and 712 (Watt-Var) —
-// the southbound half of every CURVE-linked IEEE 2030.5 control mode.
+// 705 (Volt-Var), 706 (Volt-Watt), 707/708 (Voltage Trip LV/HV), 709/710
+// (Frequency Trip LF/HF), 711 (Frequency Droop) and 712 (Watt-Var) — the
+// southbound half of every CURVE-linked IEEE 2030.5 control mode.
 //
 // It exists for the same reason units.go does, and under the same rule
 // (doc.go): this package shares ONLY the SunSpec register-offset tables with
@@ -60,6 +61,52 @@ package invariant
 //	   legacy row.
 //	3. DeptRef is 1-BASED on legacy against the 7xx enum's 0-based one. The two
 //	   are a translation in both directions and never a copy — see DeptRefName.
+//
+// A THIRD SHAPE: THE 1547 TRIP BANKS (707/708/709/710)
+//
+// The ride-through models are a 7xx-family idiom with one extra dimension, and
+// it is the dimension that makes them worth a separate paragraph. A trip model
+// declares NCrvSet curve-SETS (index 0 live and read-only, 1..NCrvSet-1
+// writable staging, promoted by the same AdptCrvReq/AdptCrvRslt handshake), and
+// EACH SET holds THREE SUB-CURVES laid end to end — MustTrip, MayTrip and
+// MomCess — each with its own ActPt and its own point table. So "the live
+// curve" is not a curve at all here: it is three of them.
+//
+// This referee therefore refuses to answer "what does M707 hold?" with a point
+// list. A reading of a trip bank must NAME its sub-curve (CurveView.Sub), and a
+// reading that names none carries NO Points at all — see DecodeCurveSubAt. The
+// alternative would be to pick one silently, and the two shapes a silent pick
+// produces are both wrong in the certifying direction: grading an
+// opModLVRTMomentaryCessation curve against the MustTrip sub-curve would report
+// a mismatch about a bank that holds exactly what was commanded, and grading a
+// MustTrip curve against whichever sub-curve happened to be non-empty would
+// report a match for a curve nobody commanded. Describe() renders all three
+// sub-curves on every trip reading, addressed or not, so an absence in one is
+// visible beside the content of the others.
+//
+// THE DECODED POINT ORDER IS (TIME, QUANTITY) AND THE REGISTER ORDER IS NOT.
+// This is the one place in this file where the two differ, and it is stated
+// here because a reader checking a finding against a register dump will
+// otherwise think the referee transposed the curve:
+//
+//	707/708 registers   V (uint16, VNomPct ×V_SF)  then  Tms (uint32, Secs ×Tms_SF)
+//	709/710 registers   Hz (uint32, Hz ×Hz_SF)     then  Tms (uint32, Secs ×Tms_SF)
+//	decoded CurvePoint  X = Tms (seconds)                Y = the electrical quantity
+//
+// The normalisation is done HERE, once, because it is the order IEEE 2030.5's
+// own ride-through DERCurve uses (x is a duration, y is the percent voltage or
+// the frequency — see the axis names below) and the order the LEGACY 129/130
+// blocks already store natively. One normalisation in the decoder means one
+// comparison in every caller; a swap performed in a caller's binding instead
+// would be invisible at the point a verdict is read.
+//
+// THE POINT NAMED "Tms" IS IN SECONDS. model_707.json and model_709.json both
+// give Pt.Tms the units string "Secs", scaled by Tms_SF — not milliseconds,
+// whatever the name suggests. A referee that assumed milliseconds would be
+// wrong by a factor of 1000 in the direction that certifies: a 0.16 s trip
+// commanded and 160 s read back would compare equal. It is the same class of
+// trap as the IW15-002a percent/watt pathology, one model family over, and it
+// is written down here because nothing in the register image announces it.
 
 import (
 	"fmt"
@@ -100,7 +147,67 @@ type CurveAxis struct {
 	// a curve of points. A caller correlating breakpoints must not pretend
 	// otherwise; see CurveView.Pointless.
 	Pointless bool
+	// Subcurved marks a model whose curve-SET holds THREE point tables rather
+	// than one — the IEEE 1547 trip banks 707/708/709/710, whose MustTrip,
+	// MayTrip and MomCess sub-curves are laid end to end inside a single set
+	// with a single ActPt each.
+	//
+	// It is a property of the MODEL and not of a reading, and it exists so that
+	// a caller cannot ask a trip bank for "its points" without saying which of
+	// the three it means: DecodeCurveSubAt refuses to guess, and CurveView.Sub
+	// records the answer on every reading that gave one.
+	Subcurved bool
 }
+
+// CurveSub names one sub-curve of a 1547 trip bank.
+//
+// The zero value is SubCurveNone — "this reading addresses no sub-curve" —
+// which is the value every non-trip model carries and the value a trip reading
+// carries when the caller asked for the SET rather than for one of its curves.
+// It is deliberately not an alias for MustTrip: a default that silently meant
+// "the must-trip curve" would make every unaddressed read look like a
+// measurement of the one sub-curve certification procedures care most about.
+type CurveSub int
+
+const (
+	// SubCurveNone addresses no sub-curve. A trip reading carrying it has NO
+	// Points; its three sub-curves are in SubPoints and are rendered by
+	// Describe().
+	SubCurveNone CurveSub = iota
+	// SubCurveMustTrip is the sub-curve a DER SHALL trip on — IEEE 2030.5's
+	// opModLVRTMustTrip / opModHVRTMustTrip / opModLFRTMustTrip /
+	// opModHFRTMustTrip.
+	SubCurveMustTrip
+	// SubCurveMayTrip is the manufacturer-defined region between the must-trip
+	// curve and mandatory operation — opMod*MayTrip.
+	SubCurveMayTrip
+	// SubCurveMomCess is momentary cessation — opModLVRTMomentaryCessation /
+	// opModHVRTMomentaryCessation. IT EXISTS ONLY ON THE VOLTAGE MODELS as far
+	// as IEEE 2030.5 is concerned: 2018 p.254's DERCurveType assigns codes 4 and
+	// 9 to the two VOLTAGE momentary-cessation curves and assigns none to a
+	// frequency one. SunSpec's 709/710 register geometry nevertheless carries a
+	// third sub-curve, because the trip-model layout is shared, so this package
+	// decodes and renders it on the frequency banks too — as content the device
+	// holds, never as content a 2030.5 control could have commanded.
+	SubCurveMomCess
+)
+
+func (s CurveSub) String() string {
+	switch s {
+	case SubCurveMustTrip:
+		return "MustTrip"
+	case SubCurveMayTrip:
+		return "MayTrip"
+	case SubCurveMomCess:
+		return "MomCess"
+	}
+	return "no sub-curve addressed"
+}
+
+// TripSubCurves is the fixed order every trip sub-curve is rendered and
+// iterated in — the order the register block lays them out (SubCurveOffset707's
+// 0/1/2), so a finding reads in the same order as a register dump.
+var TripSubCurves = []CurveSub{SubCurveMustTrip, SubCurveMayTrip, SubCurveMomCess}
 
 // CurveFamily is which SunSpec curve idiom a model belongs to.
 type CurveFamily string
@@ -124,9 +231,31 @@ const (
 // TIME FIRST while IEEE 2030.5's opModLVRTMustTrip curve is (x = duration,
 // y = voltage). They agree by accident of naming and not by convention, so the
 // names here describe the REGISTERS, which is what this referee reads.
+//
+// THE TRIP ROWS ARE THE ONE EXCEPTION and their names say so. 707/708/709/710
+// store the electrical quantity FIRST and the time second, and this package
+// normalises the decoded point to (time, quantity) — see the file doc — so the
+// names below describe the DECODED CurvePoint rather than the register order.
+// Naming them the other way round would be truthful about the block and would
+// mislabel every finding, because every finding quotes the decoded pair.
 var curveAxes = []CurveAxis{
 	{Model: sunspec.ModelDERVoltVar, Family: Family7xx, Name: "M705 Volt-Var", XName: "V", YName: "var"},
 	{Model: sunspec.ModelDERVoltWatt, Family: Family7xx, Name: "M706 Volt-Watt", XName: "V", YName: "W"},
+	// 707/708: Pt.V is "VNomPct" — a PER CENT OF NOMINAL VOLTAGE, scaled by
+	// V_SF — and Pt.Tms is "Secs", scaled by Tms_SF (model_707.json). Decoded
+	// as (seconds, %VNom).
+	{Model: sunspec.ModelDERTripLV, Family: Family7xx, Name: "M707 DER Trip LV",
+		XName: "s", YName: "%VNom", Subcurved: true},
+	{Model: sunspec.ModelDERTripHV, Family: Family7xx, Name: "M708 DER Trip HV",
+		XName: "s", YName: "%VNom", Subcurved: true},
+	// 709/710: Pt.Hz is "Hz" — an ABSOLUTE frequency, not a deviation and not a
+	// percentage — scaled by Hz_SF, and Pt.Tms is "Secs" (model_709.json).
+	// Decoded as (seconds, Hz). The absoluteness is why the frequency Figure
+	// prescribes no yRefType while the voltage one prescribes %setEffectiveV.
+	{Model: sunspec.ModelDERTripLF, Family: Family7xx, Name: "M709 DER Trip LF",
+		XName: "s", YName: "Hz", Subcurved: true},
+	{Model: sunspec.ModelDERTripHF, Family: Family7xx, Name: "M710 DER Trip HF",
+		XName: "s", YName: "Hz", Subcurved: true},
 	{Model: sunspec.ModelDERFreqDroop, Family: Family7xx, Name: "M711 Frequency Droop", XName: "Hz", YName: "W",
 		Pointless: true},
 	{Model: sunspec.ModelDERWattVar, Family: Family7xx, Name: "M712 Watt-Var", XName: "W", YName: "var"},
@@ -257,8 +386,31 @@ type CurveView struct {
 	// is whatever ActCrv named; on Index i>0 it is i. Zero on 7xx.
 	Bank int
 
+	// Sub is WHICH sub-curve of a trip bank this reading addressed, and
+	// SubCurveNone when it addressed none (which is every reading of every
+	// model that is not a trip bank, and a trip reading taken of the SET).
+	//
+	// It is load-bearing in a finding rather than decorative: "M707 holds
+	// (1.5 s, 50 %VNom)" is three different statements depending on whether the
+	// points came from MustTrip, MayTrip or MomCess, and only one of them
+	// answers whatever question the caller asked.
+	Sub CurveSub
+
+	// SubPoints is EVERY sub-curve of the addressed curve-SET, whether or not
+	// this reading addressed one. nil for a model that is not Subcurved.
+	//
+	// It is populated even on an addressed reading, and Describe() renders all
+	// three, because a trip bank's sub-curves are read from ONE register block
+	// and the two the caller did not ask about are free evidence: a MustTrip
+	// comparison that failed while the commanded points sit in MomCess is a
+	// specific, nameable defect, and a referee that had thrown the other two
+	// away could only report "the curve does not match".
+	SubPoints map[CurveSub][]CurvePoint
+
 	// Points is the live curve's breakpoints, device engineering units. Always
-	// empty for a Pointless axis.
+	// empty for a Pointless axis, and always empty on a Subcurved model when
+	// Sub is SubCurveNone — on a trip bank there is no such thing as "the"
+	// point table, and inventing one is the silent pick this package refuses.
 	Points []CurvePoint
 
 	// RspTmsS is this CURVE's own open-loop response time, in seconds — SunSpec
@@ -361,11 +513,22 @@ func (c CurveView) Pointless() bool { return c.Axis.Pointless }
 // that there is no adopt result to interpret.
 func (c CurveView) Legacy() bool { return c.Axis.Family == FamilyLegacy }
 
+// Subcurved reports whether this reading is of a 1547 trip bank, whose set
+// holds three sub-curves rather than one point table.
+func (c CurveView) Subcurved() bool { return c.Axis.Subcurved }
+
 // Describe renders what the device holds, for a finding that must say what it
 // read rather than only what it wanted.
 func (c CurveView) Describe() string {
 	name := c.Axis.Name
 	switch {
+	case c.Axis.Subcurved && c.Index > 0:
+		// A trip bank's non-zero index is a staging SET, and the sub-curve
+		// rides on the name because a reading that did not say which of the
+		// three it was about would be unattributable.
+		name = fmt.Sprintf("%s staging curve-set %d %s", c.Axis.Name, c.Index, c.Sub)
+	case c.Axis.Subcurved:
+		name = fmt.Sprintf("%s live curve-set %s", c.Axis.Name, c.Sub)
 	case c.Axis.Family == FamilyLegacy && c.Index > 0:
 		// "staging curve" is a 7xx word and there is no such thing here: every
 		// legacy bank is an ordinary bank and exactly one of them is selected.
@@ -399,6 +562,17 @@ func (c CurveView) Describe() string {
 				c.ActCrv, c.Bank),
 			fmt.Sprintf("NPt=%d NCrv=%d", c.NPt, c.NCrv),
 			fmt.Sprintf("bank read-only=%t", c.ReadOnly),
+		)
+	case c.Subcurved():
+		// The trip banks' own vocabulary: NCrvSet counts SETS, not curves, and
+		// each set holds three sub-curves. Rendered on every reading including
+		// the staging ones, because on this shape a reader needs the geometry to
+		// know how many sub-curves the numbers below are drawn from.
+		parts = append(parts,
+			fmt.Sprintf("Ena=%d (%s)", c.EnaRaw, enabledWord(c.Enabled)),
+			fmt.Sprintf("adopt req=%d rslt=%d (%s)", c.AdoptReq, c.AdoptResult, adoptWord(c.Adopted)),
+			fmt.Sprintf("NPt=%d NCrvSet=%d (each set holds MustTrip/MayTrip/MomCess)", c.NPt, c.NCrv),
+			fmt.Sprintf("curve-set read-only=%t", c.ReadOnly),
 		)
 	case c.Index == 0:
 		parts = append(parts,
@@ -443,6 +617,35 @@ func (c CurveView) Describe() string {
 	switch {
 	case c.Axis.Pointless:
 		parts = append(parts, "no breakpoint table (parametric control): "+orNone(c.Params))
+	case c.Subcurved():
+		// ALL THREE, always, whichever one this reading addressed.
+		//
+		// They come out of one register block, so the other two cost nothing to
+		// render and are exactly what a reader needs when an addressed
+		// comparison fails: commanded points sitting in MomCess while MustTrip
+		// is empty is a specific defect with a specific owner, and a finding
+		// that had printed only the addressed sub-curve could say nothing
+		// beyond "the curve does not match".
+		//
+		// The ADDRESSED one is marked, so a reader can tell what the verdict
+		// beside this dump is about.
+		for _, sub := range TripSubCurves {
+			mark := ""
+			if sub == c.Sub {
+				mark = " <- this reading"
+			}
+			pts := c.SubPoints[sub]
+			if len(pts) == 0 {
+				parts = append(parts, fmt.Sprintf("%s holds NO points%s", sub, mark))
+				continue
+			}
+			rendered := make([]string, 0, len(pts))
+			for _, p := range pts {
+				rendered = append(rendered, p.String())
+			}
+			parts = append(parts, fmt.Sprintf("%s %s/%s points: %s%s", sub, c.Axis.XName, c.Axis.YName,
+				strings.Join(rendered, " "), mark))
+		}
 	case len(c.Points) == 0:
 		parts = append(parts, which+" holds NO points")
 	default:
@@ -553,6 +756,22 @@ func (u UnitView) CurveAt(source string, model uint16, idx int) CurveView {
 	return DecodeCurveAt(fmt.Sprintf("%s unit %d", source, u.Unit), model, u.Regs[model], idx)
 }
 
+// TripCurve decodes ONE sub-curve of this unit's LIVE (set 0) trip bank.
+//
+// It is the only way to get Points out of a 707/708/709/710 reading, and that
+// is the point: a caller has to say which of MustTrip / MayTrip / MomCess it is
+// asking about, because a trip set holds all three and no default answer is
+// honest. See the file doc.
+func (u UnitView) TripCurve(source string, model uint16, sub CurveSub) CurveView {
+	return u.TripCurveAt(source, model, 0, sub)
+}
+
+// TripCurveAt is TripCurve for one specific curve-SET of the bank: 0 is the
+// live set, 1..NCrvSet-1 the writable staging sets the adopt handshake promotes.
+func (u UnitView) TripCurveAt(source string, model uint16, idx int, sub CurveSub) CurveView {
+	return DecodeCurveSubAt(fmt.Sprintf("%s unit %d", source, u.Unit), model, u.Regs[model], idx, sub)
+}
+
 // DecodeCurve reads a curve model's header and its LIVE (index 0) curve out of
 // that model's data registers.
 //
@@ -579,15 +798,43 @@ func DecodeCurve(source string, model uint16, regs []uint16) CurveView {
 // carries no point TABLE — its response is parametric, and Points is empty for
 // every index.
 func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveView {
+	return DecodeCurveSubAt(source, model, regs, idx, SubCurveNone)
+}
+
+// DecodeCurveSubAt is DecodeCurveAt addressing one SUB-CURVE of a 1547 trip
+// bank (707/708/709/710), whose curve-set holds MustTrip, MayTrip and MomCess
+// end to end rather than one point table.
+//
+// sub is SubCurveNone for every model that is not a trip bank, and passing
+// anything else there is a DECODE ERROR rather than an ignored argument: a
+// caller asking model 705 for its MomCess curve has confused two shapes, and
+// answering with 705's ordinary point table would hand back a curve under a
+// name it does not have.
+//
+// A TRIP READING WITH sub == SubCurveNone IS LEGAL AND CARRIES NO POINTS. It is
+// how a caller reads the SET — its enable, its adopt state, its geometry and
+// all three sub-curves' contents through SubPoints — without asserting anything
+// about a particular one. What it must never do is come back with Points, and
+// that is why the field stays empty rather than defaulting to MustTrip.
+func DecodeCurveSubAt(source string, model uint16, regs []uint16, idx int, sub CurveSub) CurveView {
 	axis, known := CurveAxisOf(model)
 	if !known {
 		return CurveView{Source: source, Axis: CurveAxis{Model: model,
 			Name: fmt.Sprintf("M%d", model), XName: "x", YName: "y"},
 			Err: fmt.Sprintf("model %d is not a curve model this referee decodes", model)}
 	}
-	v := CurveView{Source: source, Axis: axis, Index: idx}
+	v := CurveView{Source: source, Axis: axis, Index: idx, Sub: sub}
+	if sub != SubCurveNone && !axis.Subcurved {
+		v.Err = fmt.Sprintf("%s carries no sub-curves, so it cannot be read for %s: MustTrip / MayTrip / "+
+			"MomCess are sub-curves of the IEEE 1547 trip banks (707/708/709/710) and this model has a "+
+			"single point table", axis.Name, sub)
+		return v
+	}
 	if len(regs) == 0 {
 		return v
+	}
+	if axis.Subcurved {
+		return decodeTripSetAt(v, model, regs, idx)
 	}
 	if axis.Family == FamilyLegacy {
 		return decodeLegacyCurveAt(v, model, regs, idx)
@@ -675,6 +922,100 @@ func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveVie
 	}
 	v.Present = true
 	return v
+}
+
+// decodeTripSetAt is DecodeCurveSubAt's 1547-trip half: one curve-SET of a
+// 707/708/709/710 block, with all three of its sub-curves decoded and the
+// addressed one (if any) promoted into Points.
+//
+// EVERY POINT IS TRANSPOSED ON THE WAY OUT, and this is the only place in this
+// package that does it. lexa-proto hands back the register order —
+// TripVPoint{V, Tms} and TripHzPoint{Hz, Tms} — and this returns
+// CurvePoint{X: Tms, Y: the quantity}, so that the decoded pair is in the
+// (time, quantity) order IEEE 2030.5's ride-through DERCurve uses and the
+// legacy 129/130 blocks already store natively. See the file doc for why the
+// normalisation belongs here and not in a caller's binding.
+//
+// Tms IS SECONDS. Both models' JSON gives Pt.Tms the units string "Secs",
+// scaled by Tms_SF; lexa-proto's ScaleU32At has already applied the scale
+// factor, so what arrives here is seconds and nothing further is done to it.
+func decodeTripSetAt(v CurveView, model uint16, regs []uint16, idx int) CurveView {
+	hdr, reqField, rsltField, _ := curveHeaderOf(model)
+	if len(regs) < hdr.Len() {
+		v.Err = fmt.Sprintf("the %s block is %d registers, shorter than its own %d-register header",
+			v.Axis.Name, len(regs), hdr.Len())
+		return v
+	}
+	h := hdr.View(regs)
+	v.EnaRaw = h.U16At(hdr.Offset("Ena"))
+	v.Enabled = v.EnaRaw == 1
+	v.AdoptReq = h.U16At(hdr.Offset(reqField))
+	v.AdoptResult = h.U16At(hdr.Offset(rsltField))
+	v.Adopted = v.AdoptResult == sunspec.AdptCompleted
+	v.NPt = int(h.U16At(hdr.Offset("NPt")))
+	// NCrv carries NCrvSet here. The trip banks count SETS where 705/706/712
+	// count curves, and Describe() says so on every reading rather than letting
+	// the number be read as a curve count.
+	v.NCrv = int(h.U16At(hdr.Offset("NCrvSet")))
+
+	v.SubPoints = map[CurveSub][]CurvePoint{}
+	switch model {
+	case sunspec.ModelDERTripLV, sunspec.ModelDERTripHV:
+		set, err := sunspec.Parse707Set(regs, idx)
+		if err != nil {
+			v.Err = err.Error()
+			return v
+		}
+		v.ReadOnly = set.ReadOnly
+		v.SubPoints[SubCurveMustTrip] = tripVoltagePoints(set.MustTrip)
+		v.SubPoints[SubCurveMayTrip] = tripVoltagePoints(set.MayTrip)
+		v.SubPoints[SubCurveMomCess] = tripVoltagePoints(set.MomCess)
+	case sunspec.ModelDERTripLF, sunspec.ModelDERTripHF:
+		set, err := sunspec.Parse709Set(regs, idx)
+		if err != nil {
+			v.Err = err.Error()
+			return v
+		}
+		v.ReadOnly = set.ReadOnly
+		v.SubPoints[SubCurveMustTrip] = tripFreqPoints(set.MustTrip)
+		v.SubPoints[SubCurveMayTrip] = tripFreqPoints(set.MayTrip)
+		v.SubPoints[SubCurveMomCess] = tripFreqPoints(set.MomCess)
+	default:
+		v.Err = fmt.Sprintf("model %d is marked sub-curved in the axis table but has no trip decode here",
+			model)
+		return v
+	}
+	if v.Sub != SubCurveNone {
+		v.Points = v.SubPoints[v.Sub]
+	}
+	v.Present = true
+	return v
+}
+
+// tripVoltagePoints transposes 707/708's (V, Tms) register pairs into this
+// package's (seconds, %VNom) CurvePoints.
+func tripVoltagePoints(pts []sunspec.TripVPoint) []CurvePoint {
+	if len(pts) == 0 {
+		return nil
+	}
+	out := make([]CurvePoint, 0, len(pts))
+	for _, p := range pts {
+		out = append(out, CurvePoint{X: p.Tms, Y: p.V})
+	}
+	return out
+}
+
+// tripFreqPoints transposes 709/710's (Hz, Tms) register pairs into this
+// package's (seconds, Hz) CurvePoints.
+func tripFreqPoints(pts []sunspec.TripHzPoint) []CurvePoint {
+	if len(pts) == 0 {
+		return nil
+	}
+	out := make([]CurvePoint, 0, len(pts))
+	for _, p := range pts {
+		out = append(out, CurvePoint{X: p.Tms, Y: p.Hz})
+	}
+	return out
 }
 
 // decodeLegacyCurveAt is DecodeCurveAt's legacy (12x) half.
@@ -822,6 +1163,13 @@ func legacyPoints(pts []sunspec.LegacyCurvePoint) []CurvePoint {
 // curveHeaderOf returns a curve model's header layout and the names of its
 // handshake and geometry registers. 711 is the odd one: it carries CONTROLS,
 // not curves, so its handshake is AdptCtlReq/AdptCtlRslt and its count is NCtl.
+//
+// The trip banks are the other odd ones: they count SETS, so their geometry
+// register is NCrvSet rather than NCrv, and each set holds three sub-curves.
+// They are listed EXPLICITLY rather than left to the default arm — the default
+// returns 711's layout, which would have decoded a trip bank's Ena and
+// handshake at 711's offsets and reported plausible numbers read from the wrong
+// registers.
 func curveHeaderOf(model uint16) (hdr *sunspec.Layout, reqField, rsltField, nField string) {
 	switch model {
 	case sunspec.ModelDERVoltVar:
@@ -830,6 +1178,10 @@ func curveHeaderOf(model uint16) (hdr *sunspec.Layout, reqField, rsltField, nFie
 		return sunspec.L706Hdr, "AdptCrvReq", "AdptCrvRslt", "NPt"
 	case sunspec.ModelDERWattVar:
 		return sunspec.L712Hdr, "AdptCrvReq", "AdptCrvRslt", "NPt"
+	case sunspec.ModelDERTripLV, sunspec.ModelDERTripHV:
+		return sunspec.L707Hdr, "AdptCrvReq", "AdptCrvRslt", "NCrvSet"
+	case sunspec.ModelDERTripLF, sunspec.ModelDERTripHF:
+		return sunspec.L709Hdr, "AdptCrvReq", "AdptCrvRslt", "NCrvSet"
 	default:
 		return sunspec.L711Hdr, "AdptCtlReq", "AdptCtlRslt", "NCtl"
 	}

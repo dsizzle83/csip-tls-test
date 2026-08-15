@@ -37,15 +37,31 @@ import (
 // modelsOfInterest are the SunSpec models every register-image source reads.
 // 701 is the measurement I7 and I10 corroborate against, 702 the nameplate I1
 // bounds by, 703 the enter-service settings, 704 the commanded setpoints, and
-// the curve models (705/706/711/712, CurveModels) the CURVE-linked control
-// modes' own southbound landing sites — the registers a volt-var / volt-watt /
-// watt-var curve or a frequency droop is adopted into (curves.go).
+// the curve models (705/706/707/708/709/710/711/712 plus the legacy 12x banks,
+// CurveModels) the CURVE-linked control modes' own southbound landing sites —
+// the registers a volt-var / volt-watt / watt-var curve, a frequency droop or a
+// voltage/frequency ride-through trip curve is adopted into (curves.go).
+//
+// The list is DERIVED from CurveModels() rather than restated, so a curve model
+// added to curves.go's own axis table is read here without a second edit: the
+// 1547 trip banks 707-710 joined both at once, and a register-image source that
+// did not read them would have made the ride-through rows unmeasurable while
+// the referee was perfectly able to decode them.
+//
+// 123 is the LEGACY generation's entire scalar control surface — one
+// active-power ceiling and one connect register (legacyctl.go) — and it is read
+// for the same reason the curve models are. Without it a scalar REFUSAL row on
+// a legacy DER had no register to fingerprint at all: the fingerprint came back
+// empty, oracleRefusal reported Unavailable, and the row FAILED for want of
+// somewhere to look rather than for anything the DUT did. A 7xx DER does not
+// serve model 123 and pays nothing for its presence in this list.
 //
 // A model absent from the device is skipped by readUnit, so adding the curve
 // models costs a device that serves none of them nothing at all, and gives one
 // that serves them the only independent account of what a curve control
 // actually did.
-var modelsOfInterest = append([]uint16{701, 702, 703, 704}, CurveModels()...)
+var modelsOfInterest = append(
+	[]uint16{sunspec.ModelImmediateCtrl, 701, 702, 703, 704}, CurveModels()...)
 
 // readUnit reads the models of interest for one unit through a Transport,
 // returning a UnitView. A per-model read failure is recorded on the view rather

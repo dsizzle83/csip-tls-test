@@ -1,10 +1,38 @@
 package gridsim
 
-// curve.go — POST/DELETE /admin/curve: push a dynamic DER curve (Volt-VAr /
-// Volt-Watt / Freq-Watt / Watt-PF) AND bind it into an active DERControl so
-// the hub discovers and adopts it via its normal walk. The static tree serves
-// one Volt-VAr curve at /derp/0/dc but no control references it (the hub sees
-// an empty CurveSet); this endpoint is what lights the curve path up.
+// curve.go — POST/DELETE /admin/curve: push one or more dynamic DER curves
+// (Volt-VAr / Volt-Watt / Freq-Watt / Watt-PF / Watt-Var and the ten IEEE
+// 2030.5 ride-through curves) AND bind them into ONE active DERControl so the
+// hub discovers and adopts them via its normal walk. The static tree serves one
+// Volt-VAr curve at /derp/0/dc but no control references it (the hub sees an
+// empty CurveSet); this endpoint is what lights the curve path up.
+//
+// ── ONE CONTROL MAY CARRY SEVERAL CURVES, because procedures prescribe it ────
+//
+// CSIP CTP v1.3's BASIC-004 says the Service Point DERProgram "shall have a
+// DERControl instance with Low/High Voltage Ride Through values in Figure 4" —
+// singular — and Figure 4 prints FOUR curves: opModLVRTMustTrip,
+// opModLVRTMomentaryCessation, opModHVRTMustTrip and
+// opModHVRTMomentaryCessation. BASIC-005 says the same about Figure 5's TWO
+// frequency curves. A DERControlBase carries a separate CurveLink field per
+// mode, so all of them fit on one control; publishing them as four separate
+// DERControls would follow a procedure nobody wrote, and the row could then
+// never say the DUT had been offered the COMBINATION — which is the whole
+// content of a ride-through test.
+//
+// So the request takes a `curves` ARRAY, each entry carrying its own mode,
+// points, multipliers and yRefType. The pre-existing top-level single-curve
+// fields still work and are treated as an implicit one-entry request, so every
+// caller written before this keeps its exact behaviour. What is REFUSED is
+// sending both at once: a request with a top-level mode AND a curves array has
+// two answers to "what did this publish", and guessing one of them is how a
+// bundle ends up describing a control the bench never served.
+//
+// EVERY VALIDATION IS PER ENTRY. The vRef family's opModVoltVar-only SHALL NOT,
+// the x_ref_type refusal and openLoopTms's domain check are properties of ONE
+// curve, so a four-curve request gets four independent checks and a 400 names
+// which entry failed. A per-REQUEST check would have let a volt-var entry's
+// vRef authorise a ride-through entry beside it.
 //
 // The bound control is stored as an ExtendedDERControl (its DERControlBase
 // carries opMod*<curve> link hrefs). Because ExtendedDERControlList shares its
@@ -31,13 +59,56 @@ type curvePoint struct {
 	Y float64 `json:"y"`
 }
 
+// adminCurveEntry is ONE curve of a request: everything IEEE 2030.5 declares on
+// a DERCurve, plus the DERControlBase link field it hangs off.
+//
+// It exists because a DERControl may carry several curves at once (see the file
+// doc) and every one of them is an independent document with its own
+// multipliers, its own y reference and its own conformance rules. Sharing any
+// of those across entries would let one curve's settings silently govern
+// another's — the shape in which a four-curve Figure becomes one curve plus
+// three copies of it.
+type adminCurveEntry struct {
+	// Mode is the curve mode, which selects both the DERCurveType code and the
+	// DERControlBase link field. See curveTypeForMode for the vocabulary.
+	Mode   string       `json:"mode"`
+	Points []curvePoint `json:"points"`
+	XMult  int8         `json:"x_mult"` // 10^n multiplier on x values
+	YMult  int8         `json:"y_mult"` // 10^n multiplier on y values
+	// YRefType is the DERUnitRefType for the y axis (2018 p.256). Zero — "N/A"
+	// — is a legal wire value and is what a Figure prescribing no y reference
+	// produces; the ride-through FREQUENCY curves are exactly that case,
+	// because their y axis is an absolute frequency in Hz and a frequency is
+	// not a percentage of anything.
+	YRefType uint8 `json:"y_ref_type"`
+	// XRefTypeGone traps a caller still sending the removed field, per entry.
+	XRefTypeGone *uint8 `json:"x_ref_type,omitempty"`
+
+	// The opModVoltVar-only family and openLoopTms, documented on the
+	// single-curve fields below, which is where they were introduced.
+	VRef                       *int64              `json:"vref,omitempty"`
+	AutonomousVRefEnable       *bool               `json:"autonomous_vref_enable,omitempty"`
+	AutonomousVRefTimeConstant *int64              `json:"autonomous_vref_time_constant,omitempty"`
+	OpenLoopTms                *int64              `json:"open_loop_tms,omitempty"`
+	Nonconformant              *nonconformantCurve `json:"nonconformant,omitempty"`
+	// Description overrides the request's for this curve's own resource. Empty
+	// takes the request's, so a multi-curve caller that wants one label for the
+	// set does not have to repeat it.
+	Description string `json:"description,omitempty"`
+}
+
 // adminCurveReq is the JSON body for POST /admin/curve.
 type adminCurveReq struct {
-	Program int          `json:"program"`
-	Mode    string       `json:"mode"` // volt_var|volt_watt|freq_watt|watt_pf|watt_var
-	Points  []curvePoint `json:"points"`
-	XMult   int8         `json:"x_mult"` // 10^n multiplier on x values
-	YMult   int8         `json:"y_mult"` // 10^n multiplier on y values
+	Program int `json:"program"`
+	// Curves publishes SEVERAL curves on ONE control. Mutually exclusive with
+	// the single-curve fields below — see entries() for the refusal and the
+	// file doc for why a procedure needs it.
+	Curves []adminCurveEntry `json:"curves,omitempty"`
+
+	Mode   string       `json:"mode"` // volt_var|volt_watt|freq_watt|watt_pf|watt_var|<ride-through>
+	Points []curvePoint `json:"points"`
+	XMult  int8         `json:"x_mult"` // 10^n multiplier on x values
+	YMult  int8         `json:"y_mult"` // 10^n multiplier on y values
 	// x_ref_type is GONE (2026-08-14) and STAYS gone. A request still carrying
 	// it is REJECTED (400) rather than silently ignored — see XRefTypeGone
 	// below. NO revision declares an xRefType element on DERCurve: not IEEE
@@ -195,9 +266,66 @@ func curveTypeForMode(mode string) (uint16, bool) {
 		// halves of that substitution are now expressible separately, which is
 		// the only way a row can show they are different commands.
 		return model.CurveTypeWattVar, true // 2018 p.254: 14 (the draft said 10)
+
+	// ── The ten RIDE-THROUGH curves (curve plan #32) ─────────────────────────
+	//
+	// All ten are real IEEE Std 2030.5-2018 DERControlBase elements with real
+	// DERCurveType codes (p.254, cross-cited element by element on p.248-250),
+	// and until now this server could publish none of them: BASIC-004 and
+	// BASIC-005 were decided-FAIL rows held by a constant explaining that the
+	// bench had no lever. The lever is here.
+	//
+	// THE FULL TEN, not the six the two Figures prescribe. The MayTrip modes
+	// appear in no Figure of this catalog and no row authors one — a value
+	// nothing asks for is a value nothing tests, which is the suite's own rule
+	// — but the SERVER's job is to be able to serve the standard, and a
+	// vocabulary with holes in it invites a future row to reach for a mode that
+	// is missing for no reason. Every code comes from lexa-proto/csipmodel
+	// rather than being written here as a literal, for the reason the four
+	// above give: these constants were re-derived from the published standard
+	// after IW15-027 found the bench emitting the pre-publication draft's
+	// numbering.
+	//
+	// MOMENTARY CESSATION EXISTS ONLY ON THE VOLTAGE SIDE. 2018 p.254 assigns
+	// codes to opModLVRTMomentaryCessation (9) and opModHVRTMomentaryCessation
+	// (4) and assigns NONE to a frequency equivalent, so there is no
+	// lfrt_momentary_cessation / hfrt_momentary_cessation mode here and a
+	// caller asking for one gets the ordinary unknown-mode 400 rather than a
+	// curve labelled with an invented code.
+	case "lvrt_must_trip":
+		return model.CurveTypeLVRTMustTrip, true // 2018 p.254: 10, cross-cited p.250
+	case "lvrt_may_trip":
+		return model.CurveTypeLVRTMayTrip, true // 2018 p.254: 8, cross-cited p.249
+	case "lvrt_momentary_cessation":
+		return model.CurveTypeLVRTMomentaryCessation, true // 2018 p.254: 9, cross-cited p.250
+	case "hvrt_must_trip":
+		return model.CurveTypeHVRTMustTrip, true // 2018 p.254: 5, cross-cited p.249
+	case "hvrt_may_trip":
+		return model.CurveTypeHVRTMayTrip, true // 2018 p.254: 3, cross-cited p.249
+	case "hvrt_momentary_cessation":
+		return model.CurveTypeHVRTMomentaryCessation, true // 2018 p.254: 4, cross-cited p.249
+	case "lfrt_must_trip":
+		return model.CurveTypeLFRTMustTrip, true // 2018 p.254: 7, cross-cited p.249
+	case "lfrt_may_trip":
+		return model.CurveTypeLFRTMayTrip, true // 2018 p.254: 6, cross-cited p.249
+	case "hfrt_must_trip":
+		return model.CurveTypeHFRTMustTrip, true // 2018 p.254: 2, cross-cited p.249
+	case "hfrt_may_trip":
+		return model.CurveTypeHFRTMayTrip, true // 2018 p.254: 1, cross-cited p.248
 	default:
 		return 0, false
 	}
+}
+
+// curveModes is the mode vocabulary, in the order a 400 lists it. Derived from
+// nothing — it is the list, and curveTypeForMode is the switch over it — so the
+// two are kept in step by TestCurveModeVocabularyIsComplete rather than by a
+// comment asking a reader to remember.
+var curveModes = []string{
+	"volt_var", "volt_watt", "freq_watt", "watt_pf", "watt_var",
+	"lvrt_must_trip", "lvrt_may_trip", "lvrt_momentary_cessation",
+	"hvrt_must_trip", "hvrt_may_trip", "hvrt_momentary_cessation",
+	"lfrt_must_trip", "lfrt_may_trip", "hfrt_must_trip", "hfrt_may_trip",
 }
 
 // nonconformantCurve is the deliberate-violation opt-in. Each field names the
@@ -248,7 +376,12 @@ const voltVarOnlyMode = "volt_var"
 // that hangs any of them off a non-volt-var curve gets the same refusal naming
 // the same sentence, and a future fourth member of the family joins here rather
 // than growing a fourth almost-identical check somewhere else.
-func vrefFamily(req *adminCurveReq) (vref *model.PerCent, enable *bool, tms *uint32, err error) {
+//
+// IT TAKES ONE ENTRY, NOT THE REQUEST. The SHALL NOT is a property of ONE
+// curve's curveType, so a four-curve control gets four independent checks: a
+// volt-var entry may carry a vRef while the ride-through entry beside it may
+// not, and a per-request check would have let the first authorise the second.
+func vrefFamily(req *adminCurveEntry) (vref *model.PerCent, enable *bool, tms *uint32, err error) {
 	named := map[string]bool{
 		"vref":                          req.VRef != nil,
 		"autonomous_vref_enable":        req.AutonomousVRefEnable != nil,
@@ -310,6 +443,12 @@ func vrefFamily(req *adminCurveReq) (vref *model.PerCent, enable *bool, tms *uin
 
 // setCurveLink attaches the curve href to the DERControlBase link field that
 // matches the mode (volt_var→OpModVoltVar, etc.).
+//
+// It is called ONCE PER ENTRY on the SAME base, which is what puts four curves
+// on one control: each mode owns a different CurveLink field, so the four
+// assignments do not collide. Two entries of the SAME mode would collide, and
+// entries() refuses that before this is ever reached — silently overwriting
+// would publish one curve while the caller believed it had sent two.
 func setCurveLink(b *model.ExtendedDERControlBase, mode, href string) {
 	link := &model.CurveLink{Href: href}
 	switch mode {
@@ -323,7 +462,75 @@ func setCurveLink(b *model.ExtendedDERControlBase, mode, href string) {
 		b.OpModWattPF = link
 	case "watt_var":
 		b.OpModWattVar = link
+	case "lvrt_must_trip":
+		b.OpModLVRTMustTrip = link
+	case "lvrt_may_trip":
+		b.OpModLVRTMayTrip = link
+	case "lvrt_momentary_cessation":
+		b.OpModLVRTMomentaryCessation = link
+	case "hvrt_must_trip":
+		b.OpModHVRTMustTrip = link
+	case "hvrt_may_trip":
+		b.OpModHVRTMayTrip = link
+	case "hvrt_momentary_cessation":
+		b.OpModHVRTMomentaryCessation = link
+	case "lfrt_must_trip":
+		b.OpModLFRTMustTrip = link
+	case "lfrt_may_trip":
+		b.OpModLFRTMayTrip = link
+	case "hfrt_must_trip":
+		b.OpModHFRTMustTrip = link
+	case "hfrt_may_trip":
+		b.OpModHFRTMayTrip = link
 	}
+}
+
+// entries resolves a request into the list of curves it publishes, applying the
+// single-curve back-compatibility rule and refusing the ambiguous shape.
+//
+// THE REFUSAL IS THE POINT. A request carrying both a top-level `mode` and a
+// `curves` array has two answers to "what did this publish", and a server that
+// picked one would put a control on the wire that the caller's own record of
+// the request does not describe. That is the class of defect a conformance
+// bundle cannot survive: the evidence would be about a document nobody
+// intended. So it is a 400 naming both halves.
+//
+// DUPLICATE MODES ARE REFUSED for the same reason one level down. Two entries
+// of one mode write the same DERControlBase CurveLink field, so the second
+// would silently replace the first and the control would carry one curve where
+// the caller sent two — and, worse, both DERCurve resources would still be
+// published and fetchable, so the bench would be serving a curve no control
+// references.
+func (r *adminCurveReq) entries() ([]adminCurveEntry, error) {
+	singleNamed := r.Mode != "" || len(r.Points) > 0
+	switch {
+	case len(r.Curves) > 0 && singleNamed:
+		return nil, fmt.Errorf("this request carries BOTH a top-level curve (mode=%q, %d point(s)) and a "+
+			"`curves` array of %d entr(ies), and the two are alternatives: the top-level fields are the "+
+			"single-curve shape kept for callers written before multi-curve controls existed, and `curves` "+
+			"is the shape a Figure prescribing several curves on ONE DERControl needs. Sending both leaves "+
+			"no answer to what this control published. Send one or the other",
+			r.Mode, len(r.Points), len(r.Curves))
+	case len(r.Curves) == 0:
+		// The implicit one-entry request: every top-level field, unchanged.
+		return []adminCurveEntry{{
+			Mode: r.Mode, Points: r.Points, XMult: r.XMult, YMult: r.YMult,
+			YRefType: r.YRefType, XRefTypeGone: r.XRefTypeGone,
+			VRef: r.VRef, AutonomousVRefEnable: r.AutonomousVRefEnable,
+			AutonomousVRefTimeConstant: r.AutonomousVRefTimeConstant,
+			OpenLoopTms:                r.OpenLoopTms, Nonconformant: r.Nonconformant,
+		}}, nil
+	}
+	seen := map[string]int{}
+	for i, e := range r.Curves {
+		if prev, dup := seen[e.Mode]; dup {
+			return nil, fmt.Errorf("curves[%d] and curves[%d] both carry mode %q: a DERControlBase has one "+
+				"CurveLink field per mode, so the second would silently replace the first and this control "+
+				"would carry one curve where the request sent two", prev, i, e.Mode)
+		}
+		seen[e.Mode] = i
+	}
+	return r.Curves, nil
 }
 
 func (s *Server) handleAdminCurve(w http.ResponseWriter, r *http.Request) {
@@ -337,6 +544,109 @@ func (s *Server) handleAdminCurve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// validatedCurve is one entry after every check has passed, with its values
+// already rendered into the model's own widths.
+//
+// The whole list is built BEFORE anything is stored, which is the multi-curve
+// form of a rule this handler already followed: a request whose THIRD curve is
+// malformed must publish none of them, or a caller that asked for the four
+// curves of Figure 4 gets two of them plus a 400 and cannot tell what state the
+// bench was left in.
+type validatedCurve struct {
+	entry       adminCurveEntry
+	curveType   uint16
+	openLoopTms *uint16
+	vref        *model.PerCent
+	autoEnable  *bool
+	autoTms     *uint32
+}
+
+// validateCurveEntry runs every per-curve check. label prefixes the error with
+// the entry it is about ("curves[2]: ...") on a multi-curve request and is
+// empty on the single-curve shape, so a caller written before this change gets
+// character-identical error text.
+func validateCurveEntry(label string, e adminCurveEntry) (validatedCurve, error) {
+	fail := func(format string, args ...any) (validatedCurve, error) {
+		return validatedCurve{}, fmt.Errorf(label+format, args...)
+	}
+	if e.XRefTypeGone != nil {
+		return fail("x_ref_type is not a field of this API: NO revision of IEEE 2030.5 declares an " +
+			"xRefType element on DERCurve — not 2018 (p.252-253), not 2023 (p.265-266), not the " +
+			"vendored draft — so this server cannot serve one. Remove it from the request; the x-axis " +
+			"reference is fixed by the mode. (vRef, autonomousVRefEnable and autonomousVRefTimeConstant " +
+			"were refused alongside it until 2026-08-15 and are now SERVED: those three are real 2018 " +
+			"elements and the refusal was an artifact of a draft-schema anchor. xRefType is the one " +
+			"genuine phantom of the four.)")
+	}
+	curveType, ok := curveTypeForMode(e.Mode)
+	if !ok {
+		return fail("mode must be one of %s", strings.Join(curveModes, "|"))
+	}
+	// Both authored elements are validated BEFORE anything is stored: a request
+	// whose content cannot be authored must publish no curve either.
+	openLoopTms, err := curveOpenLoopTms(e.OpenLoopTms)
+	if err != nil {
+		return fail("%s", err)
+	}
+	// The vRef family, per entry: the SHALL NOT it enforces is a property of
+	// THIS curve's curveType and not of the request.
+	vref, autoEnable, autoTms, err := vrefFamily(&e)
+	if err != nil {
+		return fail("%s", err)
+	}
+	// The deliberate violations, applied AFTER the conformant path has had its
+	// say — so an armed entry still has to be well-formed in every respect it
+	// did not ask to break, and a typo elsewhere in it is still a 400 rather
+	// than being swallowed by the opt-in.
+	if e.Nonconformant.armed() {
+		if e.Mode != voltVarOnlyMode {
+			return fail("nonconformant vRef violations are only expressible on a " + voltVarOnlyMode +
+				" curve: the SHALLs they break (IEEE Std 2030.5-2018 p.252-253) are the ones that apply " +
+				"WHEN the curveType is opModVoltVar. On any other mode the elements are already refused " +
+				"by the SHALL NOT, which is a different test")
+		}
+		if e.Nonconformant.AutonomousVRefWithoutTimeConstant {
+			enable := true
+			autoEnable, autoTms = &enable, nil
+		}
+		if v := e.Nonconformant.VRef; v != nil {
+			if *v < 0 || *v > 65535 {
+				return fail("nonconformant.vref %d is outside UInt16's WIRE domain "+
+					"[0,65535]: this lever exists to serve a value PerCent does not admit, not one the "+
+					"XML type cannot carry — an element that cannot be encoded is a different defect and "+
+					"this server has no way to put it on the wire", *v)
+			}
+			p := model.PerCent{Value: uint16(*v)}
+			vref = &p
+		}
+	}
+	return validatedCurve{entry: e, curveType: curveType, openLoopTms: openLoopTms,
+		vref: vref, autoEnable: autoEnable, autoTms: autoTms}, nil
+}
+
+// adminCurvePublished is one curve this request put on the wire, as the
+// response reports it.
+type adminCurvePublished struct {
+	Mode      string `json:"mode"`
+	CurveType uint16 `json:"curve_type"`
+	CurveMRID string `json:"curve_mrid"`
+	CurveHref string `json:"curve_href"`
+}
+
+// adminCurveResp is POST /admin/curve's answer.
+//
+// CurveMRID/CurveHref name the FIRST curve and are kept for the callers that
+// read them before multi-curve controls existed. Curves is the whole list, and
+// a caller publishing a Figure with several curves must read that instead: the
+// first entry alone would let a row report one href as "the" curve it published
+// while three more went out beside it unrecorded.
+type adminCurveResp struct {
+	MRID      string                `json:"mrid"`
+	CurveMRID string                `json:"curve_mrid"`
+	CurveHref string                `json:"curve_href"`
+	Curves    []adminCurvePublished `json:"curves"`
+}
+
 func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	var req adminCurveReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -347,72 +657,25 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "program must be 0, 1, or 2", http.StatusBadRequest)
 		return
 	}
-	if req.XRefTypeGone != nil {
-		http.Error(w, "x_ref_type is not a field of this API: NO revision of IEEE 2030.5 declares an "+
-			"xRefType element on DERCurve — not 2018 (p.252-253), not 2023 (p.265-266), not the "+
-			"vendored draft — so this server cannot serve one. Remove it from the request; the x-axis "+
-			"reference is fixed by the mode. (vRef, autonomousVRefEnable and autonomousVRefTimeConstant "+
-			"were refused alongside it until 2026-08-15 and are now SERVED: those three are real 2018 "+
-			"elements and the refusal was an artifact of a draft-schema anchor. xRefType is the one "+
-			"genuine phantom of the four.)", http.StatusBadRequest)
-		return
-	}
-	curveType, ok := curveTypeForMode(req.Mode)
-	if !ok {
-		http.Error(w, "mode must be one of volt_var|volt_watt|freq_watt|watt_pf|watt_var",
-			http.StatusBadRequest)
-		return
-	}
-	// Both authored elements are validated BEFORE anything is stored: a request
-	// whose content cannot be authored must publish no curve either, or a caller
-	// that asked for both halves of a Figure would get one half plus a 400 and
-	// could not tell which state the bench was left in.
-	openLoopTms, err := curveOpenLoopTms(req.OpenLoopTms)
+	entries, err := req.entries()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	// The vRef family is validated here, with the other authored elements and
-	// BEFORE the store, for the reason above: the SHALL NOT it enforces is a
-	// property of the whole request (mode + fields), so a caller that gets it
-	// wrong must be left with the bench in the state it was in.
-	vref, autoVRefEnable, autoVRefTms, err := vrefFamily(&req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	// The deliberate violations, applied AFTER the conformant path has had its
-	// say — so an armed request still has to be well-formed in every respect it
-	// did not ask to break, and a typo elsewhere in the body is still a 400
-	// rather than being swallowed by the opt-in.
-	if req.Nonconformant.armed() {
-		if req.Mode != voltVarOnlyMode {
-			http.Error(w, "nonconformant vRef violations are only expressible on a "+voltVarOnlyMode+
-				" curve: the SHALLs they break (IEEE Std 2030.5-2018 p.252-253) are the ones that apply "+
-				"WHEN the curveType is opModVoltVar. On any other mode the elements are already refused "+
-				"by the SHALL NOT, which is a different test", http.StatusBadRequest)
+	valid := make([]validatedCurve, 0, len(entries))
+	modes := make([]string, 0, len(entries))
+	for i, e := range entries {
+		label := ""
+		if len(req.Curves) > 0 {
+			label = fmt.Sprintf("curves[%d]: ", i)
+		}
+		vc, err := validateCurveEntry(label, e)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if req.Nonconformant.AutonomousVRefWithoutTimeConstant {
-			enable := true
-			autoVRefEnable, autoVRefTms = &enable, nil
-		}
-		if v := req.Nonconformant.VRef; v != nil {
-			if *v < 0 || *v > 65535 {
-				http.Error(w, fmt.Sprintf("nonconformant.vref %d is outside UInt16's WIRE domain "+
-					"[0,65535]: this lever exists to serve a value PerCent does not admit, not one the "+
-					"XML type cannot carry — an element that cannot be encoded is a different defect and "+
-					"this server has no way to put it on the wire", *v), http.StatusBadRequest)
-				return
-			}
-			p := model.PerCent{Value: uint16(*v)}
-			vref = &p
-		}
-		log.Printf("[gridsim] POST /admin/curve: NONCONFORMANT BY REQUEST — program=%d mode=%s "+
-			"autonomous_vref_without_time_constant=%v vref=%v. This document deliberately violates a "+
-			"stated SHALL (IEEE Std 2030.5-2018 p.252-253) and exists to grade a DUT's refusal",
-			req.Program, req.Mode, req.Nonconformant.AutonomousVRefWithoutTimeConstant,
-			req.Nonconformant.VRef)
+		valid = append(valid, vc)
+		modes = append(modes, e.Mode)
 	}
 	droop, err := req.FreqDroop.toModel()
 	if err != nil {
@@ -423,7 +686,17 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		req.DurationS = 300
 	}
 	if req.Description == "" {
-		req.Description = fmt.Sprintf("Admin %s curve", req.Mode)
+		req.Description = fmt.Sprintf("Admin %s curve", strings.Join(modes, "+"))
+	}
+	for _, vc := range valid {
+		if !vc.entry.Nonconformant.armed() {
+			continue
+		}
+		log.Printf("[gridsim] POST /admin/curve: NONCONFORMANT BY REQUEST — program=%d mode=%s "+
+			"autonomous_vref_without_time_constant=%v vref=%v. This document deliberately violates a "+
+			"stated SHALL (IEEE Std 2030.5-2018 p.252-253) and exists to grade a DUT's refusal",
+			req.Program, vc.entry.Mode, vc.entry.Nonconformant.AutonomousVRefWithoutTimeConstant,
+			vc.entry.Nonconformant.VRef)
 	}
 
 	now := s.Now()
@@ -431,7 +704,7 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// ── 1. upsert the curve into the program's DERCurveList (/derp/{p}/dc) ──
+	// ── 1. upsert the curves into the program's DERCurveList (/derp/{p}/dc) ──
 	dcPath := fmt.Sprintf("/derp/%d/dc", req.Program)
 	cl, _ := s.resources[dcPath].(*model.DERCurveList)
 	if cl == nil {
@@ -439,40 +712,62 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		s.resources[dcPath] = cl
 	}
 	if req.Activate {
-		cl.DERCurve = nil // replace: this becomes the only curve (index 0)
+		cl.DERCurve = nil // replace: these become the only curves
 	}
-	idx := len(cl.DERCurve)
-	curveHref := fmt.Sprintf("/derp/%d/dc/%d", req.Program, idx)
 
-	curve := model.DERCurve{
-		Resource:     model.Resource{Href: curveHref},
-		MRID:         fmt.Sprintf("CURVE-%s-%d-%d", strings.ToUpper(req.Mode), req.Program, now),
-		Description:  req.Description,
-		CreationTime: now,
-		CurveType:    curveType,
-		XMultiplier:  req.XMult,
-		YMultiplier:  req.YMult,
-		// The opModVoltVar-only family (2018 p.252-253). Nil unless the caller
-		// authored them, and vrefFamily has already refused them on any other
-		// mode, so a non-volt-var curve cannot carry one however this struct is
-		// later edited.
-		//
-		// csipmodel has NO XRefType field any more and this server no longer
-		// has anywhere to put one: that deletion (lexa-proto 9856710) was the
-		// one of the four that survived the anchor correction.
-		VRef:                       vref,
-		AutonomousVRefEnable:       autoVRefEnable,
-		AutonomousVRefTimeConstant: autoVRefTms,
-		YRefType:                   req.YRefType,
-		CurveData:                  pointsToCurveData(req.Points),
-		// openLoopTms rides on the DERCurve, not on the control: sep 2.0.4
-		// declares it a child of DERCurve, and the Figure that prescribes it
-		// (Figure 6) names it "opModVoltVar.DERCurve.openLoopTms" for that
-		// reason. A copy, so a later mutation of the request cannot reach a
-		// curve this server has already published.
-		OpenLoopTms: openLoopTms,
+	// ── 2. build the ExtendedDERControl that binds every curve ──────────────
+	//
+	// ONE base, one link per entry. This is what makes "a DERControl instance
+	// with the values in Figure 4" a document this bench can actually serve.
+	base := model.ExtendedDERControlBase{}
+	published := make([]adminCurvePublished, 0, len(valid))
+	for _, vc := range valid {
+		e := vc.entry
+		idx := len(cl.DERCurve)
+		curveHref := fmt.Sprintf("/derp/%d/dc/%d", req.Program, idx)
+		desc := e.Description
+		if desc == "" {
+			desc = req.Description
+		}
+		curve := model.DERCurve{
+			Resource: model.Resource{Href: curveHref},
+			// The INDEX rides in the mRID as well as the mode. Two curves of one
+			// mode are already refused, so mode alone would be unique within a
+			// request — but a non-activating POST appends, and two requests in
+			// the same clock second would otherwise mint the same mRID for two
+			// resources at different hrefs.
+			MRID:         fmt.Sprintf("CURVE-%s-%d-%d-%d", strings.ToUpper(e.Mode), req.Program, idx, now),
+			Description:  desc,
+			CreationTime: now,
+			CurveType:    vc.curveType,
+			XMultiplier:  e.XMult,
+			YMultiplier:  e.YMult,
+			// The opModVoltVar-only family (2018 p.252-253). Nil unless the caller
+			// authored them, and vrefFamily has already refused them on any other
+			// mode, so a non-volt-var curve cannot carry one however this struct is
+			// later edited.
+			//
+			// csipmodel has NO XRefType field any more and this server no longer
+			// has anywhere to put one: that deletion (lexa-proto 9856710) was the
+			// one of the four that survived the anchor correction.
+			VRef:                       vc.vref,
+			AutonomousVRefEnable:       vc.autoEnable,
+			AutonomousVRefTimeConstant: vc.autoTms,
+			YRefType:                   e.YRefType,
+			CurveData:                  pointsToCurveData(e.Points),
+			// openLoopTms rides on the DERCurve, not on the control: sep 2.0.4
+			// declares it a child of DERCurve, and the Figure that prescribes it
+			// (Figure 6) names it "opModVoltVar.DERCurve.openLoopTms" for that
+			// reason. A copy, so a later mutation of the request cannot reach a
+			// curve this server has already published.
+			OpenLoopTms: vc.openLoopTms,
+		}
+		cl.DERCurve = append(cl.DERCurve, curve)
+		setCurveLink(&base, e.Mode, curveHref)
+		published = append(published, adminCurvePublished{
+			Mode: e.Mode, CurveType: vc.curveType, CurveMRID: curve.MRID, CurveHref: curveHref,
+		})
 	}
-	cl.DERCurve = append(cl.DERCurve, curve)
 	cl.All = uint32(len(cl.DERCurve))
 	cl.Results = cl.All
 
@@ -497,7 +792,7 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	// the curve (program 0 already links it; 1/2 get the link on first use).
 	s.ensureCurveListLinkLocked(req.Program, dcPath, cl.All)
 
-	// ── 2. build the ExtendedDERControl that binds the curve ──────────────
+	// ── 3. finish the control the curve links were bound into ─────────────
 	activeNow := req.StartOffset <= 0
 	var status uint8
 	if activeNow {
@@ -505,8 +800,6 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	} else {
 		status = 0 // Scheduled
 	}
-	base := model.ExtendedDERControlBase{}
-	setCurveLink(&base, req.Mode, curveHref)
 	// The inline droop, on the SAME control as the curve link. Figure 12
 	// prescribes exactly that pairing for BASIC-012 — opModFreqWatt (Curve) and
 	// opModFreqDroop (Immediate) on one DERControl — and publishing them as two
@@ -549,11 +842,11 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		DERControlBase: base,
 	}
 
-	// ── 3. store into derc (scheduled list the walker reads) ──────────────
+	// ── 4. store into derc (scheduled list the walker reads) ──────────────
 	dercPath := fmt.Sprintf("/derp/%d/derc", req.Program)
 	s.putExtendedControl(dercPath, ctrl, req.Activate)
 
-	// ── 4. mirror active into actderc (status display; active events only) ─
+	// ── 5. mirror active into actderc (status display; active events only) ─
 	actPath := fmt.Sprintf("/derp/%d/actderc", req.Program)
 	switch {
 	case req.Activate && activeNow:
@@ -573,16 +866,21 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		s.putExtendedControl(actPath, ctrl, false)
 	}
 
-	log.Printf("[gridsim] POST /admin/curve: program=%d mode=%s curve=%s control=%s active_now=%v",
-		req.Program, req.Mode, curveHref, ctrl.MRID, activeNow)
+	hrefs := make([]string, 0, len(published))
+	for _, p := range published {
+		hrefs = append(hrefs, p.Mode+"->"+p.CurveHref)
+	}
+	log.Printf("[gridsim] POST /admin/curve: program=%d curves=%d [%s] control=%s active_now=%v",
+		req.Program, len(published), strings.Join(hrefs, " "), ctrl.MRID, activeNow)
 
+	resp := adminCurveResp{MRID: ctrl.MRID, Curves: published}
+	if len(published) > 0 {
+		// The first curve, for the pre-multi-curve callers. See adminCurveResp.
+		resp.CurveMRID, resp.CurveHref = published[0].CurveMRID, published[0].CurveHref
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"mrid":       ctrl.MRID,
-		"curve_mrid": curve.MRID,
-		"curve_href": curveHref,
-	})
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // adminCurveDelete clears the program's bound control (derc + actderc) and
@@ -820,20 +1118,44 @@ func extCtrlToInfo(c model.ExtendedDERControl) adminCtrlInfo {
 	return info
 }
 
-// curveLabel renders the bound curve as "<mode> -> <href>" for the inspector,
+// curveLabel renders EVERY bound curve as "<mode> -> <href>", joined by "; ",
 // or "" when no curve link is set.
+//
+// IT USED TO RENDER THE FIRST ONE AND STOP — a switch whose arms each returned
+// — which was indistinguishable from a control carrying one curve while there
+// was only ever one to carry. A ride-through control carries four, and an
+// inspector that showed one of them would tell an operator the bench had
+// published a quarter of Figure 4. It also knew four of the fifteen modes:
+// watt_var and the ten ride-through curves rendered as "", i.e. as "no curve
+// bound at all", which is the worst answer available for a control that has
+// one.
 func curveLabel(b model.ExtendedDERControlBase) string {
-	switch {
-	case b.OpModVoltVar != nil:
-		return "volt_var -> " + b.OpModVoltVar.Href
-	case b.OpModVoltWatt != nil:
-		return "volt_watt -> " + b.OpModVoltWatt.Href
-	case b.OpModFreqWatt != nil:
-		return "freq_watt -> " + b.OpModFreqWatt.Href
-	case b.OpModWattPF != nil:
-		return "watt_pf -> " + b.OpModWattPF.Href
+	var parts []string
+	for _, l := range []struct {
+		mode string
+		link *model.CurveLink
+	}{
+		{"volt_var", b.OpModVoltVar},
+		{"volt_watt", b.OpModVoltWatt},
+		{"freq_watt", b.OpModFreqWatt},
+		{"watt_pf", b.OpModWattPF},
+		{"watt_var", b.OpModWattVar},
+		{"lvrt_must_trip", b.OpModLVRTMustTrip},
+		{"lvrt_may_trip", b.OpModLVRTMayTrip},
+		{"lvrt_momentary_cessation", b.OpModLVRTMomentaryCessation},
+		{"hvrt_must_trip", b.OpModHVRTMustTrip},
+		{"hvrt_may_trip", b.OpModHVRTMayTrip},
+		{"hvrt_momentary_cessation", b.OpModHVRTMomentaryCessation},
+		{"lfrt_must_trip", b.OpModLFRTMustTrip},
+		{"lfrt_may_trip", b.OpModLFRTMayTrip},
+		{"hfrt_must_trip", b.OpModHFRTMustTrip},
+		{"hfrt_may_trip", b.OpModHFRTMayTrip},
+	} {
+		if l.link != nil {
+			parts = append(parts, l.mode+" -> "+l.link.Href)
+		}
 	}
-	return ""
+	return strings.Join(parts, "; ")
 }
 
 // extBaseToInfo mirrors baseToInfo (admin.go) for the extended control base —

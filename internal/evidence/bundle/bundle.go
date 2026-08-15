@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/evidence/capture"
+	"csip-tls-test/internal/evidence/metricscrape"
 	"csip-tls-test/internal/evidence/pcapng"
 )
 
@@ -92,12 +93,48 @@ type Assertion struct {
 
 	// Note carries anything a reader needs in order not to over-read the claim.
 	Note string `json:"note,omitempty"`
+
+	// LoadBearing marks an assertion that carries its test case's WHOLE
+	// SUBJECT — the "did the device actually do it" claim — as opposed to a
+	// supporting observation about the wire.
+	//
+	// It exists because of an arithmetic property of this file that is easy to
+	// miss and impossible to un-see once seen. Skip is severity 0 (see
+	// Severity), and every roll-up here and in the runner takes the WORST and
+	// therefore only ever RAISES — so a Skip cannot dent a case verdict. A case
+	// whose only "did it happen" assertion skips reports exactly the same
+	// verdict as a case that measured everything and passed. Absence of
+	// measurement reads as success, and the only thing distinguishing the two
+	// is prose nobody re-reads on a green row.
+	//
+	// The suites' answer so far has been per-criterion discipline: the
+	// release-enforcing criteria are written with NO Skip path at all, so every
+	// shape they can end in is a decided verdict (see
+	// csip-tls-test/internal/certify/suitecsip/doc.go). That works, and it is
+	// unenforced — a new criterion, or an edit to an old one, can reintroduce a
+	// Skip on a load-bearing claim and nothing anywhere will say so.
+	//
+	// This flag makes the roll-up itself refuse to launder it: a Skip on a
+	// load-bearing assertion CAPS its case below PASS (see RollUp). It is
+	// deliberately a cap rather than a FAIL — "nobody measured this" is not the
+	// same statement as "the device got it wrong" — and the runner already
+	// applies exactly this WARN cap to the analogous uncited-PASS case.
+	//
+	// Marking is opt-in per criterion, and it changes NO verdict on a suite
+	// whose load-bearing criteria already have no Skip path, which is the whole
+	// set as of 2026-08-15. It is a guard against the next one, not a
+	// re-grading of this one.
+	LoadBearing bool `json:"load_bearing,omitempty"`
 }
 
 // Citable reports whether the assertion carries a digest Verify can re-check.
 // An assertion without one is still useful prose, but it is not proof, and the
 // verify report says so.
 func (a Assertion) Citable() bool { return a.BytesSHA256 != "" || a.FramesSHA256 != "" }
+
+// Unmeasured reports an assertion that carries its case's whole subject and did
+// not reach a conclusion — the shape RollUp caps a case for.
+func (a Assertion) Unmeasured() bool { return a.LoadBearing && a.Verdict == Skip }
 
 // TestCaseResult is one procedure step's outcome.
 type TestCaseResult struct {
@@ -119,13 +156,32 @@ type TestCaseResult struct {
 }
 
 // RollUp returns the worst verdict among the assertions, which is what
-// TestCaseResult.Verdict should normally be set to.
+// TestCaseResult.Verdict should normally be set to — CAPPED below PASS when a
+// LOAD-BEARING assertion skipped.
+//
+// The cap is the only place in this file where the roll-up does something other
+// than take a maximum, and it is there because taking a maximum is precisely
+// what lets an unmeasured case pass: Skip is severity 0, so a case whose
+// "did the device do it" assertion skipped rolls up to whatever its supporting
+// wire assertions said, which on a healthy bench is PASS. See
+// Assertion.LoadBearing.
+//
+// WARN rather than FAIL: the case is not evidence that the device misbehaved,
+// it is evidence that nobody looked. Those are different findings and a bundle
+// that conflated them would send a reader hunting a defect that may not exist.
 func (tc TestCaseResult) RollUp() Verdict {
 	worst := Skip
+	unmeasured := false
 	for _, a := range tc.Assertions {
 		if a.Verdict.Severity() > worst.Severity() {
 			worst = a.Verdict
 		}
+		if a.Unmeasured() {
+			unmeasured = true
+		}
+	}
+	if unmeasured && worst.Severity() < Warn.Severity() {
+		return Warn
 	}
 	return worst
 }
@@ -187,6 +243,14 @@ type Bundle struct {
 	Capture capture.Summary  `json:"capture"`
 	Files   BundleFiles      `json:"files"`
 	Cases   []TestCaseResult `json:"cases"`
+	// Metrics are the DUT metrics scrapes this run took, one record per
+	// measurement window (metrics.go, IW15-030). Omitted entirely when the run
+	// took none, so a bundle written before this channel existed and one
+	// written after it are the same document — Load's DisallowUnknownFields
+	// tolerates a MISSING field, never an unknown one, which is why the channel
+	// could be added without a schema version bump but could not have been
+	// added as an out-of-band file.
+	Metrics []metricscrape.Record `json:"metrics,omitempty"`
 }
 
 // BundleFiles records where the artefacts live inside the bundle directory,

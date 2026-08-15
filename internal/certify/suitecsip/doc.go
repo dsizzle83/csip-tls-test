@@ -101,9 +101,20 @@
 //     must hold — and NAMES, on every verdict, the authored content that
 //     generation stores nowhere, so a PASS is never read as covering something
 //     nothing looked at;
-//   - the AUTHORING-GAP criteria (IW15-008 — critModeUnauthorable,
-//     BASIC-004/005/007): this bench has no lever for the mode, so the row was
-//     not tested, and an untested row must not roll up as a passing one.
+//   - the RIDE-THROUGH southbound oracle (curve plan #32 — ridethrough.go,
+//     BASIC-004/005): one DERControl carrying the several ride-through curves
+//     its Figure prescribes, and per curve, the SUB-CURVE of the DER's own
+//     1547 trip bank that curve names — MustTrip, MayTrip or MomCess — read for
+//     the breakpoints the row published, adopted and enabled. The worst answer
+//     decides and every answer is carried, because a DUT that adopted the
+//     must-trip curves and ignored the momentary-cessation ones has executed
+//     half of one control. It carries a second, separate claim: no protective
+//     trip boundary that was up before the row published is down after it.
+//   - the AUTHORING-GAP criteria (IW15-008 — critModeUnauthorable, BASIC-007):
+//     this bench has no lever for the mode, so the row was not tested, and an
+//     untested row must not roll up as a passing one. BASIC-004 and BASIC-005
+//     were here until curve plan #32 built the ride-through lever, the 707-710
+//     decode and the sim's NPt; they are measured rows now.
 //
 // The last of those is a BENCH gap rather than a DUT defect, and its Observed
 // text says so in its first sentence; it is still a FAIL, because the

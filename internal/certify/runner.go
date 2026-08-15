@@ -1180,12 +1180,34 @@ func (r *Runner) finalise(rep *RunReport) {
 	}
 }
 
+// worstOf is the runner's roll-up: the worst verdict among a set of assertions,
+// CAPPED below PASS when a LOAD-BEARING one skipped.
+//
+// The cap mirrors bundle.TestCaseResult.RollUp exactly, and it has to: this
+// function decides the verdict the runner records and RollUp decides the one
+// the bundle carries, so the two disagreeing would put a case in a bundle whose
+// own assertions do not roll up to its stated verdict. See
+// bundle.Assertion.LoadBearing for why the cap exists at all — Skip is severity
+// 0 and a maximum-taking roll-up cannot be dented by it, so a case whose "did
+// the device do it" assertion skipped otherwise passes on its supporting wire
+// assertions alone.
+//
+// It changes no verdict on a suite whose load-bearing criteria already have no
+// Skip path, which is every one of them today; it is the structural guard
+// against the next criterion that grows one.
 func worstOf(as []Assertion) Verdict {
 	worst := Verdict("")
+	unmeasured := false
 	for _, a := range as {
 		if a.Verdict.Severity() > worst.Severity() {
 			worst = a.Verdict
 		}
+		if a.Unmeasured() {
+			unmeasured = true
+		}
+	}
+	if unmeasured && worst.Severity() < Warn.Severity() {
+		return Warn
 	}
 	return worst
 }
