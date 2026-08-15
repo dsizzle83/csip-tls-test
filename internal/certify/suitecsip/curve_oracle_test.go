@@ -282,12 +282,33 @@ func TestOracleCurve_RightCurveWrongOpenLoopTimeIsAFail(t *testing.T) {
 				"which was held:\n%s", want, got.Observed)
 		}
 	}
-	// And it must NOT be reported as unmappable: 705 has the register, so this
-	// element is measured on this generation, not disclosed.
-	if strings.Contains(got.Observed, "AUTHORED BUT NOT DEVICE-MAPPABLE") &&
-		strings.Contains(got.Observed, "openLoopTms") {
+	// And openLoopTms must NOT be reported as unmappable: 705 declares
+	// Crv.RspTms, so on this generation the element is MEASURED, not disclosed.
+	//
+	// The check reads the unmappable CLAUSE rather than the whole finding, and
+	// that precision became load-bearing on 2026-08-15. It used to be a
+	// conjunction over the entire text — "contains AUTHORED BUT NOT
+	// DEVICE-MAPPABLE" AND "contains openLoopTms" — which was exact only while
+	// openLoopTms was the sole element that could ever appear in that clause.
+	// BASIC-006 now also authors the autonomous-Vref pair (IW15-027), which
+	// genuinely has no register home on either generation and correctly appears
+	// there, while "openLoopTms" appears elsewhere in the same sentence as the
+	// timing this row FAILED on. The old guard fired on a finding that was
+	// entirely right. A test whose subject is one element has to read the clause
+	// about that element.
+	if clause := unmappableClause(got.Observed); strings.Contains(clause, "openLoopTms") {
 		t.Errorf("the verdict discloses openLoopTms as unmappable on a 705 DER, which declares "+
-			"Crv.RspTms for exactly this element:\n%s", got.Observed)
+			"Crv.RspTms for exactly this element. The unmappable clause reads:\n  %s\n\nfull verdict:\n%s",
+			clause, got.Observed)
+	}
+	// The mirror, so the check above cannot pass by the clause being absent
+	// altogether: the pair that really has no home must be IN it.
+	for _, want := range []string{"autonomousVRefEnable", "autonomousVRefTimeConstant"} {
+		if !strings.Contains(unmappableClause(got.Observed), want) {
+			t.Errorf("the verdict does not disclose %s as unmappable; it is authored northbound and no "+
+				"SunSpec bank on either generation holds it, so a reader could mistake this verdict for "+
+				"a measurement of it:\n%s", want, got.Observed)
+		}
 	}
 	t.Logf("BASIC-006 RED on a device running the right curve at the wrong speed:\n  %s", got.Observed)
 }
@@ -1360,6 +1381,39 @@ func TestCurveRows_ServeTheFigureElementsTheirBindingsAuthor(t *testing.T) {
 				"against its own default of 10, so a DUT receiving no element was offered the DEFAULT "+
 				"condition and the row would be reporting a run it did not make:\n%s", raw)
 		}
+		// Figure 6's OTHER two scalars, authored since 2026-08-15 (IW15-027).
+		// They were two declared GAPS until then, on the grounds that the
+		// elements do not exist — a citation into docs/schema/sep-2.0.4.xsd,
+		// which is the pre-publication ZigBee draft. IEEE Std 2030.5-2018
+		// declares autonomousVRefEnable at p.252 and
+		// autonomousVRefTimeConstant at p.253, both [0..1] on DERCurve, and
+		// this row's own Figure prints Test Values false and 0 for them.
+		//
+		// Asserted on the BYTES, not on a decoded struct: `false` and `0` are
+		// exactly the values a marshaller with an errant omitempty deletes, and
+		// a round-trip through Go cannot tell an absent element from a present
+		// zero. That is the same defect class as the mandatory-element sweep
+		// this wave's proto change is about, so the assertion has to be made
+		// where it can see it.
+		for _, want := range []string{
+			"<autonomousVRefEnable>false</autonomousVRefEnable>",
+			"<autonomousVRefTimeConstant>0</autonomousVRefTimeConstant>",
+		} {
+			if !strings.Contains(raw, want) {
+				t.Errorf("the DERCurve BASIC-006 published does not carry %s; Figure 6 prescribes it and "+
+					"gridsim has had a lever for it since IW15-027, so an omission here is the row "+
+					"quietly publishing less than its procedure again:\n%s", want, raw)
+			}
+		}
+		// And the sequence: DERCurve is an xs:sequence, so the two new elements
+		// have to arrive in their alphabetical slots (2018 p.252-253) ahead of
+		// creationTime, or every document this row publishes is one a validating
+		// peer rejects with every element in it legal.
+		if i, j := strings.Index(raw, "<autonomousVRefTimeConstant>"),
+			strings.Index(raw, "<creationTime>"); i < 0 || j < 0 || i > j {
+			t.Errorf("the published DERCurve has autonomousVRefTimeConstant at %d and creationTime at "+
+				"%d; the 2018 sequence puts the autonomous-Vref pair first:\n%s", i, j, raw)
+		}
 	})
 
 	t.Run("BASIC-012 serves Figure 12's opModFreqDroop", func(t *testing.T) {
@@ -1985,4 +2039,21 @@ func TestCritDERCurveResolvable_HasTeeth(t *testing.T) {
 	}
 	wantUnavailable(t, "curve never fetched", critDERCurveResolvable(href),
 		synthTranscript(get("/dcap", 200, dcapXML())))
+}
+
+// unmappableClause returns just the "AUTHORED BUT NOT DEVICE-MAPPABLE:" part of
+// a curve verdict, or "" when the verdict carries none.
+//
+// It exists because that clause lists ELEMENTS, and a test about one element
+// must not be satisfied (or tripped) by another element's entry. Substring
+// checks over a whole verdict were precise while the clause could only ever
+// hold one member; BASIC-006 now authors three elements of which two belong
+// there and one must not.
+func unmappableClause(observed string) string {
+	const marker = "AUTHORED BUT NOT DEVICE-MAPPABLE"
+	i := strings.Index(observed, marker)
+	if i < 0 {
+		return ""
+	}
+	return observed[i:]
 }

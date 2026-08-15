@@ -54,6 +54,51 @@ package gridsim
 //     already published are unaffected: they hold their own captures, and
 //     `certify -verify` re-derives assertions from those bytes, not from this
 //     fixture.
+//
+//  2. 2026-08-15, TWO lines: the static Volt-VAr curve's
+//     "<curveType>0</curveType>" -> "<curveType>11</curveType>", at
+//     /derp/0/dc (inside the list) and at /derp/0/dc/0 (the individually
+//     addressable copy of the same curve). Registry IW15-027.
+//
+//     WHY. The fixture never named a number — it sets model.CurveTypeVoltVar
+//     — and that constant moved when lexa-proto re-derived DERCurveType
+//     against the PUBLISHED standard instead of against
+//     docs/schema/sep-2.0.4.xsd, which is the pre-publication ZigBee draft.
+//     IEEE Std 2030.5-2018 p.254 assigns opModVoltVar the code 11, and p.250
+//     says it a second time in the element's own prose ("Specify DERCurveLink
+//     for curveType == 11"). The draft's 0 is opModFreqWatt's code under 2018,
+//     so this bench had been serving a volt-var curve labelled
+//     frequency-watt to every DUT that walked the tree.
+//
+//     THE CATALOG SAID 11 ALL ALONG. CSIP CTP v1.3's Figure 6 prints
+//     DERCurve.curveType 11 in both its Default and Test Values columns, and
+//     this suite carried a standing "curveTypeDivergence" note explaining why
+//     the bench deliberately did not follow it. The note was wrong and is
+//     withdrawn; the divergence was the bench's.
+//
+//     WHY THIS IS SAFE FOR PUBLISHED EVIDENCE. It is a fixture correction, not
+//     a re-measurement: bundles already published hold their own captures, and
+//     `certify -verify` re-derives every assertion from those bytes. A bundle
+//     recorded before this change shows curveType 0 because that is what the
+//     bench served that day, and it re-verifies against itself exactly as
+//     before. What changes is what the NEXT run puts on the wire.
+//
+//  3. 2026-08-15, ONE line: /tp/0's TariffProfile gains
+//     "<serviceCategoryKind>0</serviceCategoryKind>".
+//
+//     WHY. Nothing in this repository changed. lexa-proto 13e9106 removed
+//     `omitempty` from TariffProfile.serviceCategoryKind, which IEEE Std
+//     2030.5-2018 p.220-221 and Figure B.27 p.218 declare [1] — mandatory —
+//     and whose value on this fixture is 0 (electricity), which is exactly
+//     what `omitempty` deletes. So every TariffProfile this bench has ever
+//     served omitted a mandatory element, and the omission was invisible
+//     because the field was set correctly in Go and dropped on the way out.
+//     Same defect class, and the same upstream sweep, as the MirrorUsagePoint
+//     findings IW15-028 is about.
+//
+//     WHY THIS IS SAFE FOR PUBLISHED EVIDENCE. Same reasoning as (2), plus:
+//     the change only ADDS a mandatory element to a document that was missing
+//     one, so no reader that accepted the old bytes can reject the new ones.
 
 import (
 	"encoding/xml"

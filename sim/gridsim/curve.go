@@ -18,6 +18,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 
 	model "lexa-proto/csipmodel"
@@ -37,30 +38,80 @@ type adminCurveReq struct {
 	Points  []curvePoint `json:"points"`
 	XMult   int8         `json:"x_mult"` // 10^n multiplier on x values
 	YMult   int8         `json:"y_mult"` // 10^n multiplier on y values
-	// x_ref_type is GONE (2026-08-14), and a request still carrying it is
-	// REJECTED (400) rather than silently ignored — see XRefTypeGone below.
-	// sep 2.0.4 declares NO xRefType element — `grep -c xRefType
-	// docs/schema/sep-2.0.4.xsd` in lexa-proto is 0 — so this server was
-	// emitting an element the standard does not define, in documents used to
-	// certify conformance against it. (csipmodel.DERCurve has an XRefType field
-	// that decodes that non-existent element; that is an upstream defect this
-	// note records and does not fix.) The x-axis reference is fixed by the MODE
+	// x_ref_type is GONE (2026-08-14) and STAYS gone. A request still carrying
+	// it is REJECTED (400) rather than silently ignored — see XRefTypeGone
+	// below. NO revision declares an xRefType element on DERCurve: not IEEE
+	// 2030.5-2018 (p.252-253, whose thirteen attributes run
+	// autonomousVRefEnable..yRefType), not 2030.5-2023 (p.265-266), and not the
+	// vendored draft schema. It is the one genuine phantom of the four this
+	// bench once refused, and it is the only one that stayed refused when the
+	// anchor was corrected (IW15-027). The x-axis reference is fixed by the MODE
 	// at both ends and needs no carriage: volt-var and volt-watt take an
 	// effective percent voltage, freq-watt takes Hz, watt-PF takes %setMaxW.
-	YRefType uint8 `json:"y_ref_type"` // DERUnitRefType for the y axis (sep 2.0.4)
+	YRefType uint8 `json:"y_ref_type"` // DERUnitRefType for the y axis (2018 p.256)
 	// XRefTypeGone traps a caller still sending the removed field. A pointer,
 	// so "absent" and "sent as 0" are distinguishable: silently accepting a
 	// request whose x_ref_type the server no longer honours would leave the
 	// caller believing it had set something.
 	XRefTypeGone *uint8 `json:"x_ref_type,omitempty"`
-	// VRefGone traps a caller still sending `vref`, which is GONE (2026-08-15)
-	// on exactly the rule that removed x_ref_type: sep 2.0.4 declares NO vRef
-	// element on DERCurve — the standard's only V-reference elements are
-	// setVRef / setVRefOfs on DERSettings — so this server was emitting an
-	// element the schema does not define, in documents used to certify
-	// conformance against it. The static fixture carried one too; see
-	// extended.go and curvexml.go, which now declines to emit it at all.
-	VRefGone    *int16 `json:"vref,omitempty"`
+
+	// ── The Volt-Var reference family, RESTORED (IW15-027) ────────────────
+	//
+	// These three were deleted on 2026-08-15 as elements "sep 2.0.4 declares
+	// NO such element on DERCurve", and that sentence was TRUE and about the
+	// WRONG DOCUMENT. docs/schema/sep-2.0.4.xsd is the pre-publication ZigBee
+	// SEP 2.0 draft; IEEE Std 2030.5-2018 declares all three on DERCurve
+	// (p.252-253) and 2030.5-2023 declares them too (p.265-266). A bench that
+	// cannot serve them cannot put the standard's own Volt-Var curve on the
+	// wire, and BASIC-006's Figure 6 prescribes two of them by name.
+	//
+	// ALL THREE ARE opModVoltVar-ONLY, and that is a SHALL NOT rather than a
+	// convention. 2018 p.252, on each of them: "If the curveType is
+	// opModVoltVar, then this field MAY be present. If the curveType is not
+	// opModVoltVar, then this field SHALL NOT be present." So the handler
+	// refuses them on any other mode — a bench that let a caller hang a vRef
+	// off a freq-watt curve would be minting a non-conformant document into a
+	// conformance bundle, which is the same defect the deletion was trying to
+	// prevent, arriving from the other side.
+
+	// VRef is DERCurve.vRef: PerCent [0..1] (2018 p.253), "The nominal ac
+	// voltage (rms) adjustment to the voltage curve points for Volt-Var
+	// curves."
+	//
+	// It is LOAD-BEARING, not decoration. 2018 p.250, under opModVoltVar: "If
+	// VRef is present in DERCurve, then the x value of each pair is
+	// additionally multiplied by VRef/10 000." A curve served with a vRef is a
+	// different curve from the same breakpoints without one.
+	//
+	// A pointer to a SIGNED int64 for the reason OpenLoopTms is: the pointer
+	// keeps "absent" distinguishable from "sent as 0" (and 0 is a legal
+	// PerCent), and the signed 64-bit width is what lets the handler refuse an
+	// out-of-domain value in the standard's own vocabulary rather than leaving
+	// encoding/json to answer with a Go type name.
+	//
+	// NO FIGURE IN THE CATALOG PRESCRIBES IT, so no row authors one today and
+	// none claims to. The lever exists because the element is real and the
+	// bench's job is to be able to serve the standard; the moment a procedure
+	// asks for a vRef, the row can send it without a bench change.
+	VRef *int64 `json:"vref,omitempty"`
+
+	// AutonomousVRefEnable is DERCurve.autonomousVRefEnable: boolean [0..1]
+	// (2018 p.252). "Enable/disable autonomous vRef adjustment. When enabled,
+	// the Volt-Var curve characteristic SHALL be adjusted autonomously as vRef
+	// changes and autonomousVRefTimeConstant SHALL be present."
+	//
+	// CSIP CTP v1.3's Figure 6 (Volt-VAr Settings) prescribes it by name —
+	// "opModVoltVar.DERCurve.autonomousVrefEnable", Default false, Test Values
+	// false — and BASIC-006 held itself with a gap saying the element did not
+	// exist. It does; the row authors it now.
+	AutonomousVRefEnable *bool `json:"autonomous_vref_enable,omitempty"`
+
+	// AutonomousVRefTimeConstant is DERCurve.autonomousVRefTimeConstant: UInt32
+	// [0..1] (2018 p.253), "Adjustment range for vRef time constant, in
+	// hundredths of a second." Figure 6 prescribes it too (Default 0, Test
+	// Values 0 — the catalog spells it "autonomousVrefTimeContant").
+	AutonomousVRefTimeConstant *int64 `json:"autonomous_vref_time_constant,omitempty"`
+
 	Description string `json:"description"`
 	DurationS   int    `json:"duration_s"`     // default 300
 	StartOffset int    `json:"start_offset_s"` // seconds from now
@@ -78,10 +129,12 @@ type adminCurveReq struct {
 	// could not send it: CSIP CTP v1.3's Figure 6 prints openLoopTms Default 10
 	// against Test Values 5, so a BASIC-006 run without this field never offered
 	// the DUT the condition the row exists to create, and the row held itself at
-	// FAIL saying exactly that. It is the ONLY DERCurve scalar any Figure in the
-	// catalog prescribes beyond CurveData, the two multipliers, curveType and
-	// yRefType — rampDecTms/rampIncTms/rampPT1Tms/vRef appear in no Figure, so no
-	// lever is offered for them and none is claimed.
+	// FAIL saying exactly that. Figure 6 prescribes two more DERCurve scalars —
+	// autonomousVrefEnable and autonomousVrefTimeContant, above, restored to
+	// this API by IW15-027 — and beyond those four (plus CurveData, the two
+	// multipliers, curveType and yRefType) no Figure in the catalog prescribes a
+	// DERCurve element at all: rampDecTms/rampIncTms/rampPT1Tms appear in none,
+	// and neither does vRef, so no row authors them and none claims to.
 	//
 	// A pointer to a SIGNED int64, for the two reasons freqDroopReq's fields
 	// are: the pointer keeps "absent" distinguishable from "sent as 0", and the
@@ -100,30 +153,113 @@ type adminCurveReq struct {
 	FreqDroop *freqDroopReq `json:"freq_droop,omitempty"`
 }
 
-// curveTypeForMode maps the request's mode to the Table-19 DERCurveType code
-// and returns whether the mode is recognized.
+// curveTypeForMode maps the request's mode to the IEEE 2030.5-2018 DERCurveType
+// code (p.254) and returns whether the mode is recognized.
+//
+// EVERY ONE OF THESE NUMBERS MOVED on 2026-08-15 (IW15-027) and none of them is
+// written here as a literal, which is why they moved correctly: the constants
+// live in lexa-proto/csipmodel and were re-derived from the published standard
+// there. The comments below record the new value beside the draft-schema value
+// each replaced, because the CATALOG's printed curveType — 11 for volt-var, 12
+// for volt-watt, 0 for freq-watt — used to disagree with what this bench emitted
+// and now AGREES with it exactly. See suitecsip/register.go's curveTypeAgreement.
 func curveTypeForMode(mode string) (uint16, bool) {
 	switch mode {
 	case "volt_var":
-		return model.CurveTypeVoltVar, true // 0
+		return model.CurveTypeVoltVar, true // 2018 p.254: 11 (the draft said 0)
 	case "freq_watt":
-		return model.CurveTypeFreqWatt, true // 1
+		return model.CurveTypeFreqWatt, true // 2018 p.254: 0 (the draft said 1)
 	case "watt_pf":
-		return model.CurveTypeWattPF, true // 2
+		return model.CurveTypeWattPF, true // 2018 p.254: 13 (the draft said 2)
 	case "volt_watt":
-		return model.CurveTypeVoltWatt, true // 3
+		return model.CurveTypeVoltWatt, true // 2018 p.254: 12 (the draft said 3)
 	case "watt_var":
-		// opModWattVar, DERCurveType 10. It is the axis SunSpec model 712
-		// actually implements, and until now there was no lever that could put
-		// an <opModWattVar> DERCurveLink on the wire at all — so the strongest
+		// opModWattVar. It is the axis SunSpec model 712 actually implements,
+		// and until curve plan #32 there was no lever that could put an
+		// <opModWattVar> DERCurveLink on the wire at all — so the strongest
 		// curve axis the 7xx product has was the one nothing exercised, and
 		// BASIC-015's opModWattPF was graded against 712 in its place. Both
 		// halves of that substitution are now expressible separately, which is
 		// the only way a row can show they are different commands.
-		return model.CurveTypeWattVar, true // 10
+		return model.CurveTypeWattVar, true // 2018 p.254: 14 (the draft said 10)
 	default:
 		return 0, false
 	}
+}
+
+// voltVarOnlyMode is the mode the three vRef-family elements may be served on.
+//
+// IEEE Std 2030.5-2018 p.252-253 attaches the identical sentence to
+// autonomousVRefEnable, autonomousVRefTimeConstant and vRef: "If the curveType
+// is opModVoltVar, then this field MAY be present. If the curveType is not
+// opModVoltVar, then this field SHALL NOT be present."
+const voltVarOnlyMode = "volt_var"
+
+// vrefFamily validates the three opModVoltVar-only DERCurve elements and renders
+// them into the model's own widths, or returns the reason they cannot be served.
+//
+// It is ONE function for all three because the SHALL NOT is one rule: a caller
+// that hangs any of them off a non-volt-var curve gets the same refusal naming
+// the same sentence, and a future fourth member of the family joins here rather
+// than growing a fourth almost-identical check somewhere else.
+func vrefFamily(req *adminCurveReq) (vref *model.PerCent, enable *bool, tms *uint32, err error) {
+	named := map[string]bool{
+		"vref":                          req.VRef != nil,
+		"autonomous_vref_enable":        req.AutonomousVRefEnable != nil,
+		"autonomous_vref_time_constant": req.AutonomousVRefTimeConstant != nil,
+	}
+	var sent []string
+	for k, v := range named {
+		if v {
+			sent = append(sent, k)
+		}
+	}
+	sort.Strings(sent)
+	if len(sent) > 0 && req.Mode != voltVarOnlyMode {
+		return nil, nil, nil, fmt.Errorf("%s may only be served on a %s curve: IEEE Std 2030.5-2018 "+
+			"p.252-253 says of each of vRef, autonomousVRefEnable and autonomousVRefTimeConstant "+
+			"\"If the curveType is not opModVoltVar, then this field SHALL NOT be present\", and this "+
+			"request's mode is %q. Remove the field, or publish it on a volt_var curve",
+			strings.Join(sent, " and "), voltVarOnlyMode, req.Mode)
+	}
+	if v := req.VRef; v != nil {
+		// PerCent is UInt16, hundredths of a percent, 0..10000 (2018 p.167).
+		// The domain is the TYPE's, not uint16's: 10001 parses fine and means
+		// nothing.
+		if *v < 0 || *v > 10000 {
+			return nil, nil, nil, fmt.Errorf("DERCurve.vRef %d is outside PerCent's domain [0,10000] "+
+				"(IEEE Std 2030.5-2018 p.167: \"Used for percentages, specified in hundredths of a "+
+				"percent, 0 to 10 000. (10 000 = 100%%)\"). Note the UNIT: this element is a percentage, "+
+				"not volts — the 240 this bench once served on its static fixture was a volts value in a "+
+				"PerCent element, which is why the restored lever does not restore that number",
+				*v)
+		}
+		p := model.PerCent{Value: uint16(*v)}
+		vref = &p
+	}
+	if b := req.AutonomousVRefEnable; b != nil {
+		v := *b
+		enable = &v
+		// 2018 p.252: when autonomous adjustment is ENABLED, the time constant
+		// "SHALL be present". A bench that let a caller enable it without one
+		// would serve a document the standard forbids.
+		if v && req.AutonomousVRefTimeConstant == nil {
+			return nil, nil, nil, fmt.Errorf("autonomous_vref_enable is true without an " +
+				"autonomous_vref_time_constant: IEEE Std 2030.5-2018 p.252 says that when autonomous " +
+				"vRef adjustment is enabled the Volt-Var curve \"SHALL be adjusted autonomously as vRef " +
+				"changes and autonomousVRefTimeConstant SHALL be present\"")
+		}
+	}
+	if v := req.AutonomousVRefTimeConstant; v != nil {
+		if *v < 0 || *v > math.MaxUint32 {
+			return nil, nil, nil, fmt.Errorf("DERCurve.autonomousVRefTimeConstant %d is outside UInt32's "+
+				"wire domain [0,%d] (IEEE Std 2030.5-2018 p.253; the unit is hundredths of a second)",
+				*v, uint32(math.MaxUint32))
+		}
+		n := uint32(*v)
+		tms = &n
+	}
+	return vref, enable, tms, nil
 }
 
 // setCurveLink attaches the curve href to the DERControlBase link field that
@@ -166,15 +302,13 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.XRefTypeGone != nil {
-		http.Error(w, "x_ref_type is not a field of this API: sep 2.0.4 declares no xRefType element on "+
-			"DERCurve, so this server cannot serve one. Remove it from the request; the x-axis reference "+
-			"is fixed by the mode.", http.StatusBadRequest)
-		return
-	}
-	if req.VRefGone != nil {
-		http.Error(w, "vref is not a field of this API: sep 2.0.4 declares no vRef element on DERCurve "+
-			"(its only V-reference elements are setVRef and setVRefOfs, on DERSettings), so this server "+
-			"cannot serve one. Remove it from the request.", http.StatusBadRequest)
+		http.Error(w, "x_ref_type is not a field of this API: NO revision of IEEE 2030.5 declares an "+
+			"xRefType element on DERCurve — not 2018 (p.252-253), not 2023 (p.265-266), not the "+
+			"vendored draft — so this server cannot serve one. Remove it from the request; the x-axis "+
+			"reference is fixed by the mode. (vRef, autonomousVRefEnable and autonomousVRefTimeConstant "+
+			"were refused alongside it until 2026-08-15 and are now SERVED: those three are real 2018 "+
+			"elements and the refusal was an artifact of a draft-schema anchor. xRefType is the one "+
+			"genuine phantom of the four.)", http.StatusBadRequest)
 		return
 	}
 	curveType, ok := curveTypeForMode(req.Mode)
@@ -188,6 +322,15 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 	// that asked for both halves of a Figure would get one half plus a 400 and
 	// could not tell which state the bench was left in.
 	openLoopTms, err := curveOpenLoopTms(req.OpenLoopTms)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The vRef family is validated here, with the other authored elements and
+	// BEFORE the store, for the reason above: the SHALL NOT it enforces is a
+	// property of the whole request (mode + fields), so a caller that gets it
+	// wrong must be left with the bench in the state it was in.
+	vref, autoVRefEnable, autoVRefTms, err := vrefFamily(&req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -230,10 +373,19 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		CurveType:    curveType,
 		XMultiplier:  req.XMult,
 		YMultiplier:  req.YMult,
-		// No XRefType: see adminCurveReq. The csipmodel field stays zero and
-		// its `omitempty` keeps the element off the wire entirely.
-		YRefType:  req.YRefType,
-		CurveData: pointsToCurveData(req.Points),
+		// The opModVoltVar-only family (2018 p.252-253). Nil unless the caller
+		// authored them, and vrefFamily has already refused them on any other
+		// mode, so a non-volt-var curve cannot carry one however this struct is
+		// later edited.
+		//
+		// csipmodel has NO XRefType field any more and this server no longer
+		// has anywhere to put one: that deletion (lexa-proto 9856710) was the
+		// one of the four that survived the anchor correction.
+		VRef:                       vref,
+		AutonomousVRefEnable:       autoVRefEnable,
+		AutonomousVRefTimeConstant: autoVRefTms,
+		YRefType:                   req.YRefType,
+		CurveData:                  pointsToCurveData(req.Points),
 		// openLoopTms rides on the DERCurve, not on the control: sep 2.0.4
 		// declares it a child of DERCurve, and the Figure that prescribes it
 		// (Figure 6) names it "opModVoltVar.DERCurve.openLoopTms" for that

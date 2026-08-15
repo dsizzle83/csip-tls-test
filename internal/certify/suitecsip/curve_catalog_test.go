@@ -30,7 +30,30 @@ import (
 
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/internal/invariant"
+	protomodel "lexa-proto/csipmodel"
 )
+
+// curveTypeConstantFor resolves a DERControlBase element name to the curveType
+// code lexa-proto/csipmodel assigns it — which is what gridsim actually puts on
+// the wire (sim/gridsim/curve.go's curveTypeForMode returns these constants).
+//
+// It goes through the PUBLIC projection CurveTypeName rather than through the
+// constants, for the reason modes_oracle_test.go's tripwire does: it survives a
+// rename, and it is the mapping the product's own consumers see. Using the
+// product HERE is legitimate and is not the IW15-011 blindness — the product is
+// the right authority on what the product EMITS, and the assertion this feeds
+// grades that against two sources it has no access to.
+func curveTypeConstantFor(t *testing.T, element string) uint16 {
+	t.Helper()
+	for code := 0; code <= 255; code++ {
+		if protomodel.CurveTypeName(uint16(code)) == element {
+			return uint16(code)
+		}
+	}
+	t.Fatalf("lexa-proto/csipmodel resolves no curveType code to <%s>; IEEE 2030.5-2018 p.254 assigns "+
+		"it one, so the product's table is missing a value the standard defines", element)
+	return 0
+}
 
 // figurePoint matches one "(x, y)" pair as the catalog prints it, with or
 // without the space the Figures are inconsistent about.
@@ -145,6 +168,16 @@ func TestCurveRows_PublishTheCatalogPrescribedValues(t *testing.T) {
 			}
 			return int(*b.OpenLoopTms), true
 		}}
+	// autonomousVRefTimeConstant joined this table in IW15-027, when it stopped
+	// being a declared gap: it is a real IEEE 2030.5-2018 DERCurve attribute
+	// (p.253), Figure 6 prescribes it, and gridsim can serve it.
+	autonomousVRefTimeConstant := figureScalar{"opModVoltVar.DERCurve.autonomousVrefTimeContant",
+		func(b *curveBinding) (int, bool) {
+			if b.AutonomousVRefTimeConstant == nil {
+				return 0, false
+			}
+			return int(*b.AutonomousVRefTimeConstant), true
+		}}
 	droop := func(name string, read func(FreqDroopSettings) int) figureScalar {
 		return figureScalar{"opModFreqDroop." + name, func(b *curveBinding) (int, bool) {
 			if b.Droop == nil {
@@ -163,7 +196,12 @@ func TestCurveRows_PublishTheCatalogPrescribedValues(t *testing.T) {
 		// now place on the wire, checked against the catalog's own columns.
 		authored []figureScalar
 	}{
-		{"BASIC-006", false, []figureScalar{openLoopTms}},
+		// Figure 6's autonomousVrefTimeContant is spelled as the catalog prints
+		// it (missing the 's' in "Constant" — the catalog's own notes flag the
+		// typo), because this test reads the catalog's line and must match the
+		// document rather than the standard's spelling. The ENABLE is a boolean
+		// and is asserted separately below; catalogInt cannot parse "false".
+		{"BASIC-006", false, []figureScalar{openLoopTms, autonomousVRefTimeConstant}},
 		{"BASIC-011", true, nil},
 		{"BASIC-012", true, []figureScalar{
 			droop("dBOF", func(s FreqDroopSettings) int { return int(s.DBOF) }),
@@ -201,6 +239,19 @@ func TestCurveRows_PublishTheCatalogPrescribedValues(t *testing.T) {
 			if b.Prescribed == "" {
 				t.Errorf("%s records no provenance for its published values, so a bundle cannot show "+
 					"where they came from", tc.id)
+			}
+			// The one Figure-6 scalar that is a BOOLEAN, checked against the
+			// catalog's own printed word rather than through catalogInt.
+			if tc.id == "BASIC-006" {
+				want := testValues(t, figureLine(t, c, "opModVoltVar.DERCurve.autonomousVrefEnable"))
+				if b.AutonomousVRefEnable == nil {
+					t.Errorf("BASIC-006 authors no autonomousVRefEnable; Figure 6 prescribes %q and IEEE "+
+						"2030.5-2018 p.252 declares the element, so omitting it publishes less than the "+
+						"procedure", want)
+				} else if got := strconv.FormatBool(*b.AutonomousVRefEnable); got != want {
+					t.Errorf("BASIC-006 authors autonomousVRefEnable=%s, want the catalog's Test Value %q",
+						got, want)
+				}
 			}
 			// The rest of the row's Figure — the scalars and the inline element
 			// beside the breakpoints. Both were unsendable until curve plan #32
@@ -431,11 +482,25 @@ func TestCurveRows_NameEveryPrescribedElementTheyCannotAuthor(t *testing.T) {
 		// could author neither. Both levers now exist, both rows author the
 		// Figure's own values, and both rows hold only if the SERVE fails.
 		//
-		// What remains on each is immaterial and stays named: the
-		// autonomous-Vref pair (which sep 2.0.4 declares nowhere, so no
-		// conformant server can send it, and whose columns agree anyway) and
-		// the curveType divergence (the catalog's own numbering, which the
-		// schema does not define for the element).
+		// AND AS OF 2026-08-15 THERE ARE NO IMMATERIAL GAPS EITHER, on any of
+		// the three, which is IW15-027's deliverable on this file. What used to
+		// remain named on each row was:
+		//
+		//   the autonomous-Vref pair (BASIC-006), held by a citation into
+		//   docs/schema/sep-2.0.4.xsd saying no conformant server could send
+		//   the elements. IEEE Std 2030.5-2018 declares both on DERCurve
+		//   (p.252-253); the lever exists and the row authors them.
+		//
+		//   the curveType divergence (all three), which said the CATALOG's
+		//   printed number was the one the standard did not define. 2018 p.254
+		//   assigns exactly the catalog's numbers; the bench was the divergent
+		//   party. See TestCurveRows_CurveTypeAgreesWithTheCatalogAndTheStandard.
+		//
+		// Both were caveats quoted into every bundle these rows appeared in, and
+		// both were false about the standard the bundles certify against. The
+		// zero below is asserted rather than left implicit: a row that regains a
+		// gap has regained a hole in its procedure, and that must be a decision
+		// rather than a drift.
 		{"BASIC-006", nil},
 		{"BASIC-011", nil},
 		{"BASIC-012", nil},
@@ -449,6 +514,22 @@ func TestCurveRows_NameEveryPrescribedElementTheyCannotAuthor(t *testing.T) {
 			if strings.Join(got, ",") != strings.Join(tc.wantMaterial, ",") {
 				t.Errorf("%s's material authoring gaps = %v, want %v", tc.id, got, tc.wantMaterial)
 			}
+			// The whole register, material or not. Every entry in it is a
+			// sentence about this bench's limits that goes into a conformance
+			// bundle, and the two that were here until 2026-08-15 were both
+			// false about IEEE 2030.5-2018 (see the table above). A new one is
+			// allowed — but it has to be added deliberately, with its own
+			// citation, not inherited.
+			if n := len(b.Gaps); n != 0 {
+				var all []string
+				for _, g := range b.Gaps {
+					all = append(all, g.Element+" — "+g.Why)
+				}
+				t.Errorf("%s declares %d authoring gap(s), and after IW15-027 all three curve rows "+
+					"publish their whole Figure. A gap is a claim about what the STANDARD permits this "+
+					"bench to send; check it against IEEE Std 2030.5-2018 and not against the vendored "+
+					"draft schema before adding one:\n  %s", tc.id, n, strings.Join(all, "\n  "))
+			}
 			for _, g := range b.Gaps {
 				if g.Why == "" {
 					t.Errorf("%s's gap %s names no missing lever, so it has no owner", tc.id, g.Element)
@@ -458,7 +539,12 @@ func TestCurveRows_NameEveryPrescribedElementTheyCannotAuthor(t *testing.T) {
 						"whose omission changes nothing must not hold the row",
 						tc.id, g.Element, g.Prescribed)
 				}
-				if !g.Material && g.Prescribed != g.Default && !strings.Contains(g.Why, "CurveSetV") {
+				// The `&& !strings.Contains(g.Why, "CurveSetV")` exemption that
+				// used to be on this condition is gone with the curveType
+				// divergence it existed for: an element whose test value differs
+				// from its default and which this bench cannot send means the
+				// row was not run to its procedure, and no wording exempts it.
+				if !g.Material && g.Prescribed != g.Default {
 					t.Errorf("%s's gap %s has test %s against default %s and is NOT marked material — an "+
 						"element the procedure changes and this bench cannot send means the row was not "+
 						"run to its procedure", tc.id, g.Element, g.Prescribed, g.Default)
@@ -490,10 +576,11 @@ func TestCurveRows_MaterialGapsMatchTheCatalogsOwnColumns(t *testing.T) {
 	for _, id := range []string{"BASIC-006", "BASIC-012"} {
 		t.Run(id, func(t *testing.T) {
 			c := catalogCase(t, "csip-conf-v1.3::"+id)
+			// The CurveSetV escape hatch that used to sit here — "the curveType
+			// divergence is deliberate, not a gap in the Figure" — is gone with
+			// the divergence it excused. Every gap a row declares must now be a
+			// real Figure row, so a future one cannot be exempted by wording.
 			for _, g := range rowByID(t, id).mode.Curve.Gaps {
-				if strings.Contains(g.Why, "CurveSetV") {
-					continue // the curveType divergence is deliberate, not a gap in the Figure
-				}
 				line := figureLine(t, c, lastSegment(g.Element))
 				if !strings.Contains(testValues(t, line), g.Prescribed) {
 					t.Errorf("%s's gap %s claims test value %q, which the catalog's own line does not "+
@@ -611,4 +698,179 @@ func assertVerdictOf(t *testing.T, c criterion, obs *Observation) certify.Verdic
 		t.Fatalf("mint the criterion: %v", err)
 	}
 	return a.Verdict
+}
+
+// ── The curveType agreement, which used to be a recorded divergence ─────────
+
+// standard2018CurveTypes is DERCurveType HAND-TRANSCRIBED from IEEE Std
+// 2030.5-2018, PRINTED PAGE 254 ("DERCurveType object (UInt8)", fifteen values
+// 0..14, then "All other values reserved.").
+//
+// It is a third witness, and it is here rather than imported from
+// lexa-proto/csipmodel for the reason modes_oracle.go's table is hand-written:
+// the whole point of the assertion below is that three INDEPENDENT sources
+// agree, and reading the product's constants would collapse two of the three
+// into one. The source of this one is a purchased document that is not in the
+// repository, which is what independence means after IW15-027.
+//
+// 2018 states each of these a SECOND time, per element, on p.248-251 — "Specify
+// DERCurveLink for curveType == 11" under opModVoltVar (p.250), "== 0" under
+// opModFreqWatt (p.248), "== 12" under opModVoltWatt (p.250), "== 13" under
+// opModWattPF (p.251), "== 14" under opModWattVar (p.251) — so the table is
+// cross-checked inside its own document before it leaves it.
+var standard2018CurveTypes = map[string]int{
+	"opModFreqWatt":               0,  // p.254, cross-cited p.248
+	"opModHFRTMayTrip":            1,  // p.254, cross-cited p.248
+	"opModHFRTMustTrip":           2,  // p.254, cross-cited p.249
+	"opModHVRTMayTrip":            3,  // p.254, cross-cited p.249
+	"opModHVRTMomentaryCessation": 4,  // p.254, cross-cited p.249
+	"opModHVRTMustTrip":           5,  // p.254, cross-cited p.249
+	"opModLFRTMayTrip":            6,  // p.254, cross-cited p.249
+	"opModLFRTMustTrip":           7,  // p.254, cross-cited p.249
+	"opModLVRTMayTrip":            8,  // p.254, cross-cited p.249
+	"opModLVRTMomentaryCessation": 9,  // p.254, cross-cited p.250
+	"opModLVRTMustTrip":           10, // p.254, cross-cited p.250
+	"opModVoltVar":                11, // p.254, cross-cited p.250
+	"opModVoltWatt":               12, // p.254, cross-cited p.250
+	"opModWattPF":                 13, // p.254, cross-cited p.251
+	"opModWattVar":                14, // p.254, cross-cited p.251
+}
+
+// draftSchemaCurveTypes is the table this bench used to emit: sep-2.0.4.xsd's
+// DERCurveType, eleven values 0..10 in a different order.
+//
+// It is preserved for the teeth proof below, on the same rule as
+// modes_oracle_test.go's two recorded bit tables: an assertion of AGREEMENT is
+// worth exactly the evidence that it could have reported disagreement.
+var draftSchemaCurveTypes = map[string]int{
+	"opModVoltVar": 0, "opModFreqWatt": 1, "opModWattPF": 2, "opModVoltWatt": 3,
+	"opModLVRTMomentaryCessation": 4, "opModLVRTMustTrip": 5,
+	"opModHVRTMomentaryCessation": 6, "opModHVRTMustTrip": 7,
+	"opModLFRTMustTrip": 8, "opModHFRTMustTrip": 9, "opModWattVar": 10,
+}
+
+// curveModeElement maps a gridsim curve-mode name to the DERControlBase element
+// whose curveType the standard prescribes.
+var curveModeElement = map[string]string{
+	"volt_var":  "opModVoltVar",
+	"volt_watt": "opModVoltWatt",
+	"freq_watt": "opModFreqWatt",
+	"watt_pf":   "opModWattPF",
+	"watt_var":  "opModWattVar",
+}
+
+// TestCurveRows_CurveTypeAgreesWithTheCatalogAndTheStandard is the ASSERTION
+// that replaced a comment, and the inversion is the finding (IW15-027).
+//
+// Until 2026-08-15 every curve-carrying row declared a GAP on DERCurve.curveType
+// whose reason read: "this bench emits sep 2.0.4's own DERCurveType code for the
+// mode. The catalog's printed value is CSIP-CONF v1.3's separate numbering,
+// which the schema does not define for this element (DERCurveType stops at 10);
+// emitting it would make the evidence non-conformant to the standard the
+// evidence is about."
+//
+// Every clause of that is false about IEEE Std 2030.5-2018. DERCurveType does
+// not stop at 10 (it runs to 14, p.254); the catalog's 11 and 12 are the
+// standard's own codes for volt-var and volt-watt; and it was the bench, reading
+// the pre-publication ZigBee draft, that was emitting values the standard
+// assigns to other modes entirely — a volt-var curve labelled 0, which under
+// 2018 is opModFreqWatt.
+//
+// So the gap is gone and this is what stands in its place: THREE sources, agreed
+// pairwise, with no two of them derived from each other.
+//
+//	the CATALOG      — CSIP CTP v1.3's printed Figure, parsed from the
+//	                   digest-pinned catalog at run time;
+//	the STANDARD     — hand-transcribed from IEEE 2030.5-2018 p.254 above;
+//	the PRODUCT      — lexa-proto/csipmodel's CurveType* constants, which are
+//	                   what gridsim actually puts on the wire.
+func TestCurveRows_CurveTypeAgreesWithTheCatalogAndTheStandard(t *testing.T) {
+	for _, id := range []string{"BASIC-006", "BASIC-011", "BASIC-012"} {
+		t.Run(id, func(t *testing.T) {
+			b := rowByID(t, id).mode.Curve
+			if b == nil {
+				t.Fatalf("%s carries no curve binding", id)
+			}
+			element, ok := curveModeElement[b.Mode]
+			if !ok {
+				t.Fatalf("%s publishes mode %q, which maps to no DERControlBase element", id, b.Mode)
+			}
+			standard, ok := standard2018CurveTypes[element]
+			if !ok {
+				t.Fatalf("IEEE 2030.5-2018 p.254 assigns no curveType to <%s>", element)
+			}
+
+			// (a) catalog vs standard. This is the leg the withdrawn comment
+			// claimed was broken.
+			catalog := catalogInt(t, catalogCase(t, "csip-conf-v1.3::"+id), "DERCurve.curveType")
+			if catalog != standard {
+				t.Errorf("%s: the catalog's Figure prescribes curveType %d for <%s>, IEEE 2030.5-2018 "+
+					"p.254 assigns %d. These are two independent documents and a real disagreement "+
+					"between them is a finding about the CATALOG that has to be adjudicated, not "+
+					"absorbed — read them both before changing either side",
+					id, catalog, element, standard)
+			}
+
+			// (b) product vs standard. What gridsim emits comes from
+			// csipmodel.CurveType*; if the product's table drifts from the
+			// standard again, the bench silently starts serving the wrong number
+			// and no row notices — which is exactly what happened.
+			if got := int(curveTypeConstantFor(t, element)); got != standard {
+				t.Errorf("%s: lexa-proto/csipmodel assigns <%s> curveType %d, IEEE 2030.5-2018 p.254 "+
+					"assigns %d. gridsim emits the PRODUCT's constant, so this is what goes on the wire "+
+					"— and the catalog says %d too, which means the bench would be the only party out "+
+					"of step",
+					id, element, got, standard, catalog)
+			}
+		})
+	}
+}
+
+// TestCurveRows_CurveTypeAgreementWouldHaveCaughtTheDraftAnchoredTable is the
+// teeth proof for the assertion above.
+//
+// An agreement test that has only ever been seen agreeing has been demonstrated,
+// not tested — this suite's own rule (teeth_test.go's opening). This runs the
+// same comparison against the codes the bench emitted until 2026-08-15 and
+// requires it to report disagreement on every catalog-prescribed row.
+func TestCurveRows_CurveTypeAgreementWouldHaveCaughtTheDraftAnchoredTable(t *testing.T) {
+	var caught []string
+	for _, tc := range []struct {
+		id      string
+		element string
+	}{
+		{"BASIC-006", "opModVoltVar"},
+		{"BASIC-011", "opModVoltWatt"},
+		{"BASIC-012", "opModFreqWatt"},
+	} {
+		draft, ok := draftSchemaCurveTypes[tc.element]
+		if !ok {
+			t.Fatalf("the recorded draft table has no entry for <%s>", tc.element)
+		}
+		standard := standard2018CurveTypes[tc.element]
+		if draft == standard {
+			t.Errorf("<%s>: the draft schema and IEEE 2030.5-2018 both say %d, so this row's "+
+				"disagreement is not recorded and the teeth proof is incomplete", tc.element, draft)
+			continue
+		}
+		// And the number the bench used to emit must be a code the standard
+		// assigns to a DIFFERENT mode, which is what makes the old behaviour a
+		// mislabelling rather than an unknown value.
+		var meant string
+		for name, code := range standard2018CurveTypes {
+			if code == draft {
+				meant = name
+			}
+		}
+		caught = append(caught, fmt.Sprintf(
+			"%s <%s>: the bench emitted %d (the draft's code), which IEEE 2030.5-2018 p.254 assigns to "+
+				"<%s>; the standard and the catalog both say %d",
+			tc.id, tc.element, draft, orText(meant, "no mode"), standard))
+	}
+	if len(caught) != 3 {
+		t.Fatalf("the agreement assertion would have caught %d of the 3 catalog-prescribed rows against "+
+			"the draft-anchored table; a comparison that misses any of them cannot support the claim "+
+			"that the live agreement means something:\n  %s", len(caught), strings.Join(caught, "\n  "))
+	}
+	t.Logf("curveType agreement, teeth against the draft-anchored table:\n  %s", strings.Join(caught, "\n  "))
 }

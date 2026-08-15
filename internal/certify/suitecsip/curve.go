@@ -139,12 +139,11 @@ type curveBinding struct {
 	// OpenLoopTms is the DERCurve's own openLoopTms element this row authors —
 	// hundredths of a second, 0 meaning "no limit" — or nil to omit it.
 	//
-	// It is the only DERCurve scalar any Figure in this catalog prescribes
-	// beyond CurveData, the multipliers, curveType and yRefType, and until the
-	// #32 lever landed this bench could not send it at all: BASIC-006's Figure 6
-	// prints openLoopTms Default 10 / Test Values 5, so every run of that row
-	// left the DUT in the procedure's DEFAULT timing while the report claimed
-	// the test condition, and the row held itself at FAIL saying exactly that.
+	// Until the #32 lever landed this bench could not send it at all:
+	// BASIC-006's Figure 6 prints openLoopTms Default 10 / Test Values 5, so
+	// every run of that row left the DUT in the procedure's DEFAULT timing while
+	// the report claimed the test condition, and the row held itself at FAIL
+	// saying exactly that.
 	//
 	// It has NO register home on either SunSpec curve generation (see
 	// noOpenLoopTmsRegister). That does not make it droppable — the procedure
@@ -152,6 +151,29 @@ type curveBinding struct {
 	// northbound and declared, through authored() below, as an element this
 	// referee asserts nothing about southbound.
 	OpenLoopTms *uint16
+
+	// AutonomousVRefEnable / AutonomousVRefTimeConstant are DERCurve's
+	// autonomous volt-reference pair — IEEE Std 2030.5-2018 p.252 and p.253,
+	// both [0..1] and both opModVoltVar-only ("If the curveType is not
+	// opModVoltVar, then this field SHALL NOT be present"). Nil omits.
+	//
+	// They are here because Figure 6 prescribes both by name and this bench
+	// could not send either: BASIC-006 carried two GAPS asserting that "sep
+	// 2.0.4 declares NO such element on DERCurve", which is a true statement
+	// about the pre-publication draft schema and a false one about the standard
+	// the evidence is about (IW15-027). Both gaps are gone and the row authors
+	// the Figure's own values.
+	//
+	// Like openLoopTms they have NO register home on either SunSpec curve
+	// generation and are declared as such through authored(). Unlike openLoopTms
+	// they are IMMATERIAL by the catalog's own test — Figure 6 prints the same
+	// value in both its columns, and 2018 p.252 makes false the value of an
+	// ABSENT autonomousVRefEnable — so authoring them cannot change what a
+	// correct DUT does. That is exactly why it is worth doing: the row publishes
+	// its whole Figure at no risk to what it measures, and stops carrying a
+	// false sentence about the standard into every bundle.
+	AutonomousVRefEnable       *bool
+	AutonomousVRefTimeConstant *uint32
 
 	// Droop, when set, is an INLINE opModFreqDroop element this row authors on
 	// the SAME control that carries the curve link, and the register home its
@@ -528,6 +550,31 @@ func (b *curveBinding) authored() []authoredElement {
 			HomeLegacy: openLoopHome(b.ModelLegacy),
 			Why7xx:     noOpenLoopTmsRegister7xx,
 			WhyLegacy:  noOpenLoopTmsRegisterLegacy,
+		})
+	}
+	// The autonomous volt-reference pair. Authored northbound, asserted about
+	// southbound by NOTHING on either generation — and unlike openLoopTms that
+	// is not a gap in SunSpec's coverage but a difference in kind: 2030.5's
+	// autonomous vRef adjustment is an inverter-internal behaviour with no
+	// single register that holds "is it on", and the 705 VRefAutoEna/VRefAutoTms
+	// pair that looks like a home is model 705's OWN volt-var reference
+	// automation, written by the DER's settings rather than by a curve. Grading
+	// a DERCurve element against it would be the substitution this suite
+	// refuses, so the row says so instead.
+	if b.AutonomousVRefEnable != nil {
+		out = append(out, authoredElement{
+			Element:   "DERCurve.autonomousVRefEnable",
+			Value:     fmt.Sprintf("%t", *b.AutonomousVRefEnable),
+			Why7xx:    noAutonomousVRefRegister,
+			WhyLegacy: noAutonomousVRefRegister,
+		})
+	}
+	if b.AutonomousVRefTimeConstant != nil {
+		out = append(out, authoredElement{
+			Element:   "DERCurve.autonomousVRefTimeConstant",
+			Value:     fmt.Sprintf("%d (hundredths of a second)", *b.AutonomousVRefTimeConstant),
+			Why7xx:    noAutonomousVRefRegister,
+			WhyLegacy: noAutonomousVRefRegister,
 		})
 	}
 	if b.Droop != nil {
@@ -1627,8 +1674,17 @@ func publishCurveControl(ctx context.Context, d *Driver, params map[string]strin
 		// procedure prescribes one, and the row would then be unable to say the
 		// DUT was ever offered the combination.
 		OpenLoopTms: b.OpenLoopTms,
-		FreqDroop:   droopSettings(b.Droop),
-		Description: "certify " + b.Mode,
+		// The autonomous volt-reference pair rides the same request for the same
+		// reason: Figure 6 prescribes them on the SAME DERCurve as its
+		// breakpoints and its openLoopTms, and a bench that published them
+		// separately would produce two curves where the procedure prescribes
+		// one. gridsim refuses them on any mode but volt_var (2018's SHALL NOT),
+		// so a row that sets them on the wrong binding fails loudly at publish
+		// rather than quietly on the wire.
+		AutonomousVRefEnable:       b.AutonomousVRefEnable,
+		AutonomousVRefTimeConstant: b.AutonomousVRefTimeConstant,
+		FreqDroop:                  droopSettings(b.Droop),
+		Description:                "certify " + b.Mode,
 		// The oracled window, not curveMode's old 180 s: the PostWait oracle
 		// can read the DER anywhere out to wait+settle (see oracleWindow), and
 		// a control that released under that read would convert a correct

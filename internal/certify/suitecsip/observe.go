@@ -1344,18 +1344,35 @@ type CurveRequest struct {
 	Program int          `json:"program"`
 	Mode    string       `json:"mode"`
 	Points  []CurvePoint `json:"points"`
-	VRef    int16        `json:"vref,omitempty"`
 	XMult   int8         `json:"x_mult,omitempty"`
 	YMult   int8         `json:"y_mult,omitempty"`
-	// No XRefType: sep 2.0.4 declares no xRefType element on DERCurve, so
-	// gridsim no longer accepts or serves one (it answers 400 to a request that
-	// carries the field). See sim/gridsim/curve.go's adminCurveReq.
+	// No XRefType: NO revision of IEEE 2030.5 declares an xRefType element on
+	// DERCurve — not 2018 (p.252-253), not 2023 (p.265-266), not the vendored
+	// draft schema — so gridsim answers 400 to a request that carries the
+	// field. See sim/gridsim/curve.go's adminCurveReq.
 	YRefType uint8 `json:"y_ref_type,omitempty"`
 	// OpenLoopTms is the DERCurve's own openLoopTms (hundredths of a second,
 	// 0 = "no limit"). A pointer because 0 is a real value a Figure could
-	// prescribe; nil omits the element. See sim/gridsim/curve.go for why this is
-	// the only DERCurve scalar with a lever.
+	// prescribe; nil omits the element.
 	OpenLoopTms *uint16 `json:"open_loop_tms,omitempty"`
+
+	// The opModVoltVar-only volt-reference family — IEEE Std 2030.5-2018 p.252
+	// (autonomousVRefEnable), p.253 (autonomousVRefTimeConstant, vRef). gridsim
+	// refuses all three on any other mode, per the standard's own SHALL NOT.
+	//
+	// VRef WAS HERE AND WAS DEAD, which is a small lesson of its own. It sat on
+	// this struct as `VRef int16` with `omitempty` for a day after gridsim had
+	// been changed to answer 400 to any `vref` whatsoever — so the only value it
+	// could carry was the one that serialised to nothing, and nothing in the
+	// tree set it. Its TYPE was wrong too: vRef is a PerCent (UInt16,
+	// hundredths of a percent, 0 to 10 000 — 2018 p.167), and a signed 16-bit
+	// field can express values that type has no room for. It is a *int64 now,
+	// matching the server's own request field exactly, so an out-of-domain value
+	// is refused by gridsim in the standard's vocabulary instead of being
+	// silently clipped on the way out of this one.
+	VRef                       *int64  `json:"vref,omitempty"`
+	AutonomousVRefEnable       *bool   `json:"autonomous_vref_enable,omitempty"`
+	AutonomousVRefTimeConstant *uint32 `json:"autonomous_vref_time_constant,omitempty"`
 	// FreqDroop rides along as an inline opModFreqDroop on the SAME control that
 	// carries the curve link — the shape Figure 12 prescribes for BASIC-012.
 	FreqDroop   *FreqDroopSettings `json:"freq_droop,omitempty"`

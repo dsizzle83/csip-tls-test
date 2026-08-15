@@ -123,23 +123,39 @@ func TestAdminCurve_BindsVoltVarIntoServedControl(t *testing.T) {
 			"translates into the curve bank's DeptRef, so serving the wrong one commands a "+
 			"percentage of a rating nobody nominated", got)
 	}
-	// sep 2.0.4 declares NO xRefType (and no vRef) on DERCurve, so this server
-	// must not put either on the wire.
+	// xRefType is THE phantom, and it is the only one left on this list.
 	//
 	// This used to read `dc.DERCurve[0].XRefType != 0` — a check against a
 	// DECODED STRUCT, which cannot tell "the element was absent" from "the
 	// element was there and said zero", and which stopped compiling the moment
-	// lexa-proto dropped the phantom fields from csipmodel.DERCurve
-	// (9856710, "four phantom DERCurve elements gone"). The claim was always
-	// about the BYTES, so it is now made against the bytes: the served document
-	// must not contain the element at all. That is strictly stronger than what
-	// it replaced and it no longer depends on the shared model carrying a field
-	// for an element the standard does not define.
-	for _, phantom := range []string{"xRefType", "vRef"} {
+	// lexa-proto dropped the field from csipmodel.DERCurve (9856710). The claim
+	// was always about the BYTES, so it is made against the bytes: the served
+	// document must not contain the element at all.
+	//
+	// vRef LEFT THIS LIST on 2026-08-15 (IW15-027). It was here on the evidence
+	// that sep 2.0.4 declares no such element, which is true of the vendored
+	// pre-publication ZigBee draft and false of IEEE Std 2030.5-2018 (p.253).
+	// This request does not author one, so this curve carries none — but the
+	// absence is now a fact about the REQUEST, not a rule about the element, and
+	// asserting it here would re-state the wrong rule. See
+	// TestAdminCurve_VRefFamilyIsServedOnVoltVar for the element's own coverage.
+	for _, phantom := range []string{"xRefType"} {
 		if strings.Contains(rawGET(t, s, "/derp/0/dc"), "<"+phantom) {
-			t.Errorf("the served DERCurveList contains a <%s> element; sep 2.0.4 declares no such "+
-				"element on DERCurve, so a conformance bench must not put one into a document used "+
-				"to certify against that schema", phantom)
+			t.Errorf("the served DERCurveList contains a <%s> element; NO revision of IEEE 2030.5 "+
+				"declares one on DERCurve — not 2018 (p.252-253), not 2023 (p.265-266), not the "+
+				"vendored draft — so a conformance bench must not put one into a document used to "+
+				"certify against the standard", phantom)
+		}
+	}
+	// And this request authored no vRef family, so none may appear: an element
+	// the caller did not ask for is as wrong as one the standard does not
+	// declare, and the restored lever must not have made any of the three
+	// unconditional.
+	for _, unasked := range []string{"vRef", "autonomousVRefEnable", "autonomousVRefTimeConstant"} {
+		if strings.Contains(rawGET(t, s, "/derp/0/dc"), "<"+unasked) {
+			t.Errorf("the served DERCurveList contains a <%s> this request never authored; all three "+
+				"are [0..1] on IEEE 2030.5-2018 (p.252-253) and must be emitted only when asked for",
+				unasked)
 		}
 	}
 
@@ -175,35 +191,164 @@ func TestAdminCurve_XRefTypeIsRejected(t *testing.T) {
 	}
 }
 
-// TestAdminCurve_VRefIsRejectedAndNeverServed is the same rule for the same
-// reason, one element over — and this one the server was actually SERVING.
+// TestAdminCurve_VRefFamilyIsServedOnVoltVar is the REVERSAL of a test that used
+// to sit here, and the reversal is the finding (IW15-027).
 //
-// sep 2.0.4 declares no vRef on DERCurve (its only V-reference elements are
-// setVRef / setVRefOfs, on DERSettings), and this simulator's static fixture
-// carried <vRef>240</vRef> — restored by every DELETE /admin/curve, so no
-// teardown cleared it either. Every DUT that walked this tree fetched a
-// DERCurve the schema rejects, and every bundle built from such a walk records
-// it. The request field is refused so a caller cannot believe it set one, and
-// the wire shape (curvexml.go) cannot emit one however the stored struct is
-// filled in.
-func TestAdminCurve_VRefIsRejectedAndNeverServed(t *testing.T) {
+// TestAdminCurve_VRefIsRejectedAndNeverServed asserted that this server answered
+// 400 to a `vref` and could not emit the element under any circumstances, on the
+// evidence that "sep 2.0.4 declares no vRef on DERCurve". The evidence was a
+// true statement about docs/schema/sep-2.0.4.xsd — the pre-publication ZigBee
+// draft — and a false statement about IEEE Std 2030.5-2018, which declares vRef
+// (p.253), autonomousVRefEnable (p.252) and autonomousVRefTimeConstant (p.253)
+// on DERCurve. A bench that refuses them cannot serve the standard's own
+// Volt-Var curve, and CSIP CTP v1.3's Figure 6 prescribes two of the three.
+//
+// So the rule inverts: all three are ACCEPTED and SERVED on a volt_var curve, in
+// their sequence positions, with the standard's own types.
+func TestAdminCurve_VRefFamilyIsServedOnVoltVar(t *testing.T) {
 	s := NewServer("")
 	h := s.AdminHandler()
-	body := `{"program":0,"mode":"volt_var","points":[{"x":1,"y":2}],"vref":240,"activate":true}`
+	body := `{"program":0,"mode":"volt_var","points":[{"x":9200,"y":3000}],` +
+		`"x_mult":-2,"y_mult":-2,"y_ref_type":3,` +
+		`"vref":9800,"autonomous_vref_enable":false,"autonomous_vref_time_constant":0,` +
+		`"activate":true}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(body))))
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("POST /admin/curve with vref = %d, want 400; body: %s", rec.Code, rec.Body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /admin/curve with the vRef family = %d, want 201; body: %s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), "vRef") {
-		t.Errorf("the 400 does not say why: %s", rec.Body)
-	}
-	// And the STATIC fixture — the one a DELETE restores — carries none either,
-	// on the list and on the individually-addressable curve.
-	for _, path := range []string{"/derp/0/dc", "/derp/0/dc/0"} {
-		if raw := serveRaw(t, s, path); strings.Contains(raw, "vRef") {
-			t.Errorf("%s still serves a vRef element:\n%s", path, raw)
+	raw := serveRaw(t, s, "/derp/0/dc/0")
+	for _, want := range []string{
+		"<vRef>9800</vRef>",
+		"<autonomousVRefEnable>false</autonomousVRefEnable>",
+		"<autonomousVRefTimeConstant>0</autonomousVRefTimeConstant>",
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("the served curve does not carry %s:\n%s", want, raw)
 		}
+	}
+	// THE SEQUENCE, 2018 p.252-253 (case-insensitively alphabetical over the
+	// standard's attribute names). Order is load-bearing: DERCurve is an
+	// xs:sequence, so a validating peer rejects a document whose elements are
+	// all legal and out of order — the exact defect this wire shape exists to
+	// prevent, and one no Go-side round-trip can see.
+	wantOrder := []string{
+		"<autonomousVRefEnable>", "<autonomousVRefTimeConstant>", "<creationTime>",
+		"<CurveData>", "<curveType>", "<vRef>", "<xMultiplier>", "<yMultiplier>", "<yRefType>",
+	}
+	at := -1
+	for _, el := range wantOrder {
+		i := strings.Index(raw, el)
+		if i < 0 {
+			t.Fatalf("the served curve is missing %s entirely:\n%s", el, raw)
+		}
+		if i < at {
+			t.Errorf("%s is out of the 2018 sequence (p.252-253) in the served document:\n%s", el, raw)
+		}
+		at = i
+	}
+	// The STATIC fixture — the one a DELETE restores — carries no vRef, and that
+	// is now a statement about the VALUE rather than about the element. It used
+	// to serve <vRef>240</vRef>: a volts reading in a PerCent element (2018
+	// p.167, "hundredths of a percent, 0 to 10 000"), which under 2018 p.250
+	// multiplied every breakpoint by 240/10 000. Absent is legal ([0..1]) and is
+	// the ordinary unscaled curve; 240 was a mis-scaled one.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("DELETE", "/admin/curve",
+		bytes.NewReader([]byte(`{"program":0}`))))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /admin/curve = %d, want 204", rec.Code)
+	}
+	for _, path := range []string{"/derp/0/dc", "/derp/0/dc/0"} {
+		if got := serveRaw(t, s, path); strings.Contains(got, "vRef") {
+			t.Errorf("the restored static fixture serves a vRef element; the 240 it once carried was a "+
+				"volts value in a percentage element and must not come back with the element:\n%s", got)
+		}
+	}
+}
+
+// TestAdminCurve_VRefFamilyIsRefusedOffVoltVar pins the SHALL NOT, which is the
+// half a restoration could most easily have dropped.
+//
+// IEEE Std 2030.5-2018 attaches the same sentence to all three elements
+// (p.252-253): "If the curveType is opModVoltVar, then this field MAY be
+// present. If the curveType is not opModVoltVar, then this field SHALL NOT be
+// present." A bench that let a caller hang a vRef off a freq-watt curve would be
+// minting a non-conformant document into a conformance bundle — the same defect
+// the over-broad deletion was reaching for, arriving from the other side.
+func TestAdminCurve_VRefFamilyIsRefusedOffVoltVar(t *testing.T) {
+	for _, tc := range []struct{ name, field, mode string }{
+		{"vref on freq_watt", `"vref":9800`, "freq_watt"},
+		{"enable on volt_watt", `"autonomous_vref_enable":true`, "volt_watt"},
+		{"time constant on watt_var", `"autonomous_vref_time_constant":500`, "watt_var"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer("")
+			h := s.AdminHandler()
+			body := `{"program":0,"mode":"` + tc.mode + `","points":[{"x":1,"y":2}],` +
+				tc.field + `,"activate":true}`
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(body))))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST = %d, want 400; body: %s", rec.Code, rec.Body)
+			}
+			for _, want := range []string{"SHALL NOT", "opModVoltVar", "2030.5-2018"} {
+				if !strings.Contains(rec.Body.String(), want) {
+					t.Errorf("the 400 omits %q: %s", want, rec.Body)
+				}
+			}
+			// And the bench must be left untouched: a refused request publishes
+			// nothing, or a caller cannot tell which state it is in.
+			if got := rawGET(t, s, "/derp/0/dc"); strings.Contains(got, "vRef") {
+				t.Errorf("a refused request still published a vRef:\n%s", got)
+			}
+		})
+	}
+}
+
+// TestAdminCurve_VRefFamilyDomainsAreTheStandardsOwn pins the three checks that
+// keep a restored lever from being a looser one, each stated in the standard's
+// vocabulary rather than in Go's.
+func TestAdminCurve_VRefFamilyDomainsAreTheStandardsOwn(t *testing.T) {
+	for _, tc := range []struct{ name, field, want string }{
+		// PerCent is 0..10 000 (2018 p.167). 24000 fits a uint16 and means
+		// nothing, which is exactly the class of value a bare Go type accepts
+		// and a typed domain refuses.
+		{"vref above PerCent's domain", `"vref":24000`, "PerCent's domain [0,10000]"},
+		{"vref negative", `"vref":-1`, "PerCent's domain [0,10000]"},
+		// 2018 p.252: enabling autonomous adjustment makes the time constant
+		// mandatory ("autonomousVRefTimeConstant SHALL be present").
+		{"enable without a time constant", `"autonomous_vref_enable":true`, "SHALL be present"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer("")
+			h := s.AdminHandler()
+			body := `{"program":0,"mode":"volt_var","points":[{"x":1,"y":2}],` +
+				tc.field + `,"activate":true}`
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(body))))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("POST = %d, want 400; body: %s", rec.Code, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Errorf("the 400 does not state the standard's own rule (want %q): %s",
+					tc.want, rec.Body)
+			}
+		})
+	}
+	// The volts-in-a-percentage trap is named explicitly in the error, because
+	// it is the defect this bench actually shipped for months and the one a
+	// caller reaching for `"vref": 240` is about to repeat. 240 is IN domain and
+	// cannot be refused, so the out-of-domain message is where the unit gets
+	// taught.
+	s := NewServer("")
+	h := s.AdminHandler()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(
+		`{"program":0,"mode":"volt_var","points":[{"x":1,"y":2}],"vref":24000,"activate":true}`))))
+	if !strings.Contains(rec.Body.String(), "not volts") {
+		t.Errorf("the out-of-domain vRef error does not warn that the element is a percentage and not "+
+			"volts, which is the mistake the static fixture made for months: %s", rec.Body)
 	}
 }
 

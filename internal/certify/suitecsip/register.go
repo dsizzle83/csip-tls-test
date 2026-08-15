@@ -106,23 +106,41 @@ const (
 	// Figure 6's own test value and the row no longer holds itself for the
 	// omission. The remaining members of the Figure-6 timing family are a
 	// DIFFERENT KIND of gap and now say so.
-	noVrefElementInSchema = "sep 2.0.4 declares NO such element on DERCurve. The schema's DERCurve sequence " +
-		"is creationTime, CurveData, curveType, openLoopTms, rampDecTms, rampIncTms, rampPT1Tms, " +
-		"xMultiplier, yMultiplier, yRefType and nothing else — `grep -c autonomousVRef " +
-		"docs/schema/sep-2.0.4.xsd` in lexa-proto is 0 — so this element cannot be placed on the wire by " +
-		"any conformant server, and a bench that emitted it would be putting an undefined element into " +
-		"documents used to certify conformance against that schema. It is the same class as the xRefType " +
-		"this server already refuses to serve (sim/gridsim/curve.go's XRefTypeGone), and the same class of " +
-		"upstream defect: csipmodel.DERCurve carries fields that decode these non-existent elements. This " +
-		"is therefore NOT a missing bench lever — there is nothing to build — and it is immaterial besides " +
-		"(Figure 6 prints the same value in both its Default and Test Values columns)"
+	//
+	// noVrefElementInSchema USED TO BE HERE TOO, and its deletion is IW15-027's
+	// finding on this file. It read, verbatim, "sep 2.0.4 declares NO such
+	// element on DERCurve ... this is therefore NOT a missing bench lever —
+	// there is nothing to build", it held BASIC-006's two autonomous-Vref gaps,
+	// and it was quoted into every bundle that row ever appeared in.
+	//
+	// It was a TRUE statement about docs/schema/sep-2.0.4.xsd — the
+	// pre-publication ZigBee SEP 2.0 draft — and a FALSE statement about IEEE
+	// Std 2030.5-2018, which declares autonomousVRefEnable (p.252),
+	// autonomousVRefTimeConstant (p.253) and vRef (p.253) on DERCurve, and makes
+	// the last of the three multiply every breakpoint of a volt-var curve
+	// (p.250: "If VRef is present in DERCurve, then the x value of each pair is
+	// additionally multiplied by VRef/10 000"). There WAS something to build,
+	// the catalog had been asking for two of the three all along, and the row
+	// was explaining away a bench gap with a citation into the wrong document.
+	//
+	// The lever exists now (sim/gridsim/curve.go's vrefFamily), BASIC-006
+	// AUTHORS both elements Figure 6 prescribes, and the two gaps are gone
+	// rather than re-worded. vRef itself, which no Figure prescribes, falls
+	// under the rule immediately below.
 
-	// The DERCurve timing elements no Figure prescribes. Named for completeness
-	// where a row lists what it can and cannot author, and deliberately not
-	// built: a lever nothing asks for is a lever nothing tests.
-	noPrescribedCurveRampLever = "no Figure in this catalog prescribes it, so this bench offers no lever " +
-		"for it and claims none. DERCurve's rampDecTms/rampIncTms/rampPT1Tms are real sep 2.0.4 elements " +
-		"and could be added the same way openLoopTms was (curve plan #32) the moment a procedure asks for one"
+	// The DERCurve elements no Figure prescribes. Named for completeness where a
+	// row lists what it can and cannot author, and deliberately not authored: a
+	// value nothing asks for is a value nothing tests.
+	//
+	// vRef JOINED THIS LIST when it stopped being imaginary. gridsim can serve
+	// one, so this is no longer a missing lever at all — no row sends one
+	// because no procedure asks for one, which is a different sentence with a
+	// different remedy.
+	noPrescribedCurveRampLever = "no Figure in this catalog prescribes it, so no row of this suite authors " +
+		"a value for it and none claims to. DERCurve's rampDecTms/rampIncTms/rampPT1Tms and vRef are all " +
+		"real IEEE 2030.5-2018 elements (p.253); gridsim can already SERVE a vRef (POST /admin/curve's " +
+		"`vref`, opModVoltVar-only per p.252's SHALL NOT), and the ramp trio could be added the same way " +
+		"openLoopTms was (curve plan #32) the moment a procedure asks for one"
 
 	// The 711 register names the droop's five parameters land on, written once
 	// so a row and a verdict cannot disagree about which registers were read.
@@ -148,6 +166,26 @@ const (
 		"The element is SERVED northbound exactly as the procedure prescribes — that half is real evidence " +
 		"about what the DUT was offered — and on this bank no southbound read can show what the DUT did " +
 		"with it"
+
+	// The autonomous volt-reference pair's absence, on BOTH generations, and it
+	// is a different KIND of absence from openLoopTms's.
+	//
+	// openLoopTms has an exact SunSpec home on two of the curve models and none
+	// on the rest — a coverage gap. This pair has none anywhere, and the thing
+	// that looks like a home is a trap: model 705 declares VRefAuto, VRefAutoEna
+	// and VRefAutoTms, which are the DER's OWN volt-var reference automation,
+	// written from its settings. IEEE 2030.5's autonomousVRefEnable is an
+	// attribute of a CURVE, scoped to that curve, and a gateway may legitimately
+	// implement it without touching those registers at all. Grading one against
+	// the other would certify a substitution, which is what this suite exists to
+	// refuse.
+	noAutonomousVRefRegister = "no SunSpec curve bank on either generation holds this element. The nearest " +
+		"thing on a 7xx DER is model 705's VRefAutoEna / VRefAutoTms pair, and it is NOT the same " +
+		"quantity: those are the DER's own volt-var reference automation, set from its settings and " +
+		"scoped to the device, while IEEE 2030.5-2018's autonomousVRefEnable (p.252) is an attribute of " +
+		"one DERCurve, scoped to that curve, which a gateway may implement without writing them. So the " +
+		"element is SERVED northbound exactly as Figure 6 prescribes — that half is real evidence about " +
+		"what the DUT was offered — and no southbound read on either generation can show what became of it"
 
 	noOpenLoopTmsRegisterLegacy = "the legacy 12x banks carry no open-loop response register: 126 " +
 		"declares Crv.RmpTms and 132/134 declare Crv.RmpPt1Tms, and BOTH are documented in their own " +
@@ -186,18 +224,33 @@ const (
 		"generation's device can show what became of it. This product reaches the same conclusion from its " +
 		"own side: internal/advaxis has an ExecDroop row for DerGen7xx and deliberately none for DerGen12x"
 
-	// The catalog's DERCurve.curveType values are CSIP-CONF v1.3's own
-	// numbering and do not agree with sep 2.0.4's DERCurveType, nor with each
-	// other: Figure 6 prints 11 for volt-var, Figure 11 prints 12 for
-	// volt-watt, and Figure 12 prints 0 for freq-watt, where sep 2.0.4 declares
-	// 0, 3 and 1. This bench emits the SCHEMA's codes.
+	// THE curveType DIVERGENCE WAS THE BENCH'S, AND IT IS GONE (IW15-027).
 	//
-	// Following the catalog instead would put a value on the wire that sep
-	// 2.0.4's own enumeration does not define for the element (there is no
-	// DERCurveType 11 or 12 — the type stops at 10), inside documents used to
-	// certify conformance against that schema. The divergence is recorded
-	// upstream as a CurveSetV question (lexa-proto csipmodel, R4b) and is named
-	// on every affected row rather than silently resolved.
+	// This block used to say that the catalog's printed curveType values "are
+	// CSIP-CONF v1.3's own numbering and do not agree with sep 2.0.4's
+	// DERCurveType": Figure 6 prints 11 for volt-var, Figure 11 prints 12 for
+	// volt-watt, Figure 12 prints 0 for freq-watt, "where sep 2.0.4 declares 0,
+	// 3 and 1. This bench emits the SCHEMA's codes." Every affected row carried a
+	// gap saying so, and it went into the bundles.
+	//
+	// The catalog was right on all three. IEEE Std 2030.5-2018 p.254 declares
+	// FIFTEEN DERCurveType values 0..14 — opModVoltVar 11, opModVoltWatt 12,
+	// opModFreqWatt 0 — and states each of them a second time in the linking
+	// element's own prose ("Specify DERCurveLink for curveType == 11" under
+	// opModVoltVar, p.250). The 0/3/1 the bench emitted came from
+	// docs/schema/sep-2.0.4.xsd, the pre-publication ZigBee draft, whose
+	// enumeration stops at 10 in a different order. So the sentence "emitting
+	// the catalog's value would make the evidence non-conformant" was exactly
+	// backwards: emitting the DRAFT's value is what made it non-conformant, and
+	// this bench served a volt-var curve labelled frequency-watt to every DUT
+	// that walked the tree.
+	//
+	// Nothing has to be reconciled any more, so the three gaps are DELETED
+	// rather than re-worded — a gap register that lists agreements is not a gap
+	// register. The agreement is asserted instead, three ways, by
+	// TestCurveRows_CurveTypeAgreesWithTheCatalogAndTheStandard, which is where
+	// a claim of agreement belongs: a test can go red and a comment cannot.
+	//
 	// BASIC-015 is the one curve-carrying row whose values are NOT the
 	// catalog's, and saying so is the point: CSIP CTP v1.3's BASIC-015 procedure
 	// prescribes twenty-four fixed-power-factor DERControls and carries no curve
@@ -210,10 +263,18 @@ const (
 		"publishes is this suite's own, chosen to exercise the opModWattPF axis the row is about. Its " +
 		"values are NOT claimed to be catalog-prescribed"
 
-	curveTypeDivergence = "this bench emits sep 2.0.4's own DERCurveType code for the mode. The catalog's " +
-		"printed value is CSIP-CONF v1.3's separate numbering, which the schema does not define for this " +
-		"element (DERCurveType stops at 10); emitting it would make the evidence non-conformant to the " +
-		"standard the evidence is about. Recorded upstream as a CurveSetV question (lexa-proto csipmodel, R4b)"
+	// curveTypeAgreement is what replaced curveTypeDivergence, and it is a
+	// PROVENANCE line rather than a caveat: it appears in the row's Prescribed
+	// text so a bundle reader can see that the number on the wire, the number
+	// the procedure printed and the number the standard assigns are one number,
+	// and can check it. It is asserted by
+	// TestCurveRows_CurveTypeAgreesWithTheCatalogAndTheStandard.
+	curveTypeAgreement = "DERCurve.curveType is the catalog's own printed value, which is also IEEE Std " +
+		"2030.5-2018's code for the mode (p.254, cross-cited per element on p.250-251) and also what this " +
+		"bench emits: opModFreqWatt 0, opModVoltVar 11, opModVoltWatt 12, opModWattPF 13, opModWattVar 14. " +
+		"Until 2026-08-15 the bench emitted the pre-publication draft schema's codes (0, 3, 1 for the three " +
+		"catalog-prescribed modes) and every affected row carried a note saying the CATALOG diverged; the " +
+		"divergence was the bench's and the note is withdrawn (IW15-027)"
 
 	mappingWattPFLegacy = "IEEE 2030.5's opModWattPF is a power-factor curve against active power, and its " +
 		"ONE exact register home anywhere in SunSpec is legacy model 131 (Watt-PF): W<n> in %WMax against " +
@@ -616,24 +677,50 @@ func inverterControlRows() []inverterControlRow {
 			// has a register for it (noOpenLoopTmsRegister), so the element is
 			// named on every verdict as served-and-not-device-mappable rather
 			// than quietly dropped between the wire and the oracle.
-			OpenLoopTms:   ptr(uint16(5)),
-			Prescribed:    "CSIP CTP v1.3 BASIC-006, Figure 6 Volt-VAr Settings, Test Values column",
+			OpenLoopTms: ptr(uint16(5)),
+			// The autonomous-Vref pair, Figure 6's own Test Values (false, 0) —
+			// AUTHORED SINCE 2026-08-15, where they used to be two gaps saying
+			// the elements did not exist.
+			//
+			// They do exist: IEEE Std 2030.5-2018 declares autonomousVRefEnable
+			// on DERCurve at p.252 and autonomousVRefTimeConstant at p.253, both
+			// [0..1] and both opModVoltVar-only. The claim that they did not was
+			// read out of the pre-publication draft schema (see the withdrawn
+			// noVrefElementInSchema above), and it meant this row was omitting
+			// two elements its own procedure prints while explaining that there
+			// was nothing to omit.
+			//
+			// BOTH ARE IMMATERIAL BY THE ROW'S OWN TEST — Figure 6 prints the
+			// same value in the Default and Test Values columns, and 2018 p.252
+			// makes false the value of an ABSENT autonomousVRefEnable — so
+			// authoring them changes no DUT behaviour that the previous omission
+			// changed either. That is exactly why it is worth doing: the row can
+			// now publish its whole Figure at zero risk to what it measures, and
+			// the bundle stops carrying a false sentence about the standard.
+			AutonomousVRefEnable:       ptr(false),
+			AutonomousVRefTimeConstant: ptr(uint32(0)),
+			Prescribed: "CSIP CTP v1.3 BASIC-006, Figure 6 Volt-VAr Settings, Test Values column. " +
+				curveTypeAgreement,
 			Model7xx:      sunspec.ModelDERVoltVar,
 			Mapping7xx:    mappingVoltVar,
 			ModelLegacy:   sunspec.ModelVoltVarLegacy,
 			MappingLegacy: mappingVoltVarLegacy,
-			Gaps: []curveGap{
-				// The autonomous-Vref pair is NOT a missing lever and never was:
-				// sep 2.0.4 declares no such element on DERCurve at all, so no
-				// conformant server can send it. Immaterial besides — Figure 6
-				// prints the same value in both columns — so it is named and
-				// does not hold the row, exactly as before.
-				{Element: "opModVoltVar.DERCurve.autonomousVrefEnable", Prescribed: "false", Default: "false",
-					Why: noVrefElementInSchema},
-				{Element: "opModVoltVar.DERCurve.autonomousVrefTimeContant", Prescribed: "0", Default: "0",
-					Why: noVrefElementInSchema},
-				{Element: "DERCurve.curveType", Prescribed: "11", Default: "11", Why: curveTypeDivergence},
-			},
+			// NO GAPS. This row's Figure 6 has five non-breakpoint settings —
+			// openLoopTms, the autonomous-Vref pair, curveType and the two
+			// multipliers — and as of 2026-08-15 this bench places every one of
+			// them on the wire. The three entries that used to be here were:
+			//
+			//   autonomousVrefEnable / autonomousVrefTimeContant, held by a
+			//   citation into the draft schema claiming the elements do not
+			//   exist. They do (2018 p.252-253) and the row AUTHORS them now.
+			//
+			//   curveType 11, held by a note saying the CATALOG's number was
+			//   the divergent one. It was the bench's; 2018 p.254 says 11 and
+			//   p.250 says it again in opModVoltVar's own prose.
+			//
+			// A row with nothing left to disclose discloses nothing, and
+			// critCurvePublishedTheProcedureValues says so positively rather
+			// than reciting three withdrawn caveats.
 		}), "a Volt-VAr curve"},
 		{"BASIC-007", 53, unreachableMode("setGradW", noRampRate), "the ramp-rate settings"},
 		{"BASIC-008", 54, scalarMode("opModFixedPFInjectW", func(r *ControlRequest) {
@@ -674,18 +761,23 @@ func inverterControlRows() []inverterControlRow {
 			// axes — 100.00 %V -> 100.00 %W, 105.00 %V -> 100.00 %W,
 			// 109.00 %V -> 0. THREE points, where this row published two of its
 			// own; see BASIC-006 for the provenance of the values that were here.
-			Points:        []CurvePoint{{X: 10000, Y: 10000}, {X: 10500, Y: 10000}, {X: 10900, Y: 0}},
-			XMult:         -2,
-			YMult:         -2,
-			YRefType:      derUnitRefSetMaxW, // Figure 11 prescribes yRefType 1
-			Prescribed:    "CSIP CTP v1.3 BASIC-011, Figure 11 Volt-Watt Settings, Test Values column",
+			Points:   []CurvePoint{{X: 10000, Y: 10000}, {X: 10500, Y: 10000}, {X: 10900, Y: 0}},
+			XMult:    -2,
+			YMult:    -2,
+			YRefType: derUnitRefSetMaxW, // Figure 11 prescribes yRefType 1
+			Prescribed: "CSIP CTP v1.3 BASIC-011, Figure 11 Volt-Watt Settings, Test Values column. " +
+				curveTypeAgreement,
 			Model7xx:      sunspec.ModelDERVoltWatt,
 			Mapping7xx:    mappingVoltWatt,
 			ModelLegacy:   sunspec.ModelVoltWattLegacy,
 			MappingLegacy: mappingVoltWattLegacy,
-			Gaps: []curveGap{
-				{Element: "DERCurve.curveType", Prescribed: "12", Default: "12", Why: curveTypeDivergence},
-			},
+			// NO GAPS: Figure 11's only non-breakpoint settings are curveType,
+			// the two multipliers and yRefType, and this bench sends all four.
+			// The curveType 12 entry that used to sit here said the CATALOG
+			// diverged from the standard; 2018 p.254 assigns opModVoltWatt the
+			// code 12 and p.250 repeats it in the element's own prose, so the
+			// catalog and the standard agree and it was the bench (emitting the
+			// draft schema's 3) that did not.
 		}), "a Volt-Watt curve"},
 		// yRefType 1 (%setMaxW) for the same reasons as BASIC-011: sep 2.0.4's
 		// opModFreqWatt documentation ("The y value specifies a corresponding
@@ -755,9 +847,16 @@ func inverterControlRows() []inverterControlRow {
 				Mapping7xx:           mappingFreqDroop7xx,
 				NoRegisterHomeLegacy: noFreqDroopRegisterLegacy,
 			},
-			Gaps: []curveGap{
-				{Element: "DERCurve.curveType", Prescribed: "0", Default: "0", Why: curveTypeDivergence},
-			},
+			// NO GAPS: the curveType 0 entry that used to sit here said the
+			// CATALOG diverged from the standard and that this bench was right
+			// to emit something else. Both halves were wrong. IEEE 2030.5-2018
+			// p.254 assigns opModFreqWatt the code 0, p.248 repeats it under the
+			// element ("Specify DERCurveLink for curveType == 0"), and Figure
+			// 12's Test Values column prints 0 — so the gap's own "Prescribed:
+			// 0" was the conformant value all along, while the bench emitted the
+			// draft schema's 1, which under 2018 is opModHFRTMayTrip. The row
+			// disclosed a real divergence and named the wrong party for it.
+			//
 			// THE 7xx ARM, RE-ADJUDICATED (curve plan #32).
 			//
 			// It still names 711 as the model and still refuses to grade the

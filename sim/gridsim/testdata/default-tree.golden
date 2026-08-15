@@ -72,7 +72,7 @@
       <xvalue>108</xvalue>
       <yvalue>-30</yvalue>
     </CurveData>
-    <curveType>0</curveType>
+    <curveType>11</curveType>
     <xMultiplier>0</xMultiplier>
     <yMultiplier>0</yMultiplier>
     <yRefType>3</yRefType>
@@ -99,7 +99,7 @@
     <xvalue>108</xvalue>
     <yvalue>-30</yvalue>
   </CurveData>
-  <curveType>0</curveType>
+  <curveType>11</curveType>
   <xMultiplier>0</xMultiplier>
   <yMultiplier>0</yMultiplier>
   <yRefType>3</yRefType>
@@ -438,6 +438,7 @@
     <pricePowerOfTenMultiplier>-3</pricePowerOfTenMultiplier>
     <primacy>1</primacy>
     <rateCode>TOU-RES</rateCode>
+    <serviceCategoryKind>0</serviceCategoryKind>
     <RateComponentListLink href="/tp/0/rc" all="1"></RateComponentListLink>
   </TariffProfile>
 </TariffProfileList>
