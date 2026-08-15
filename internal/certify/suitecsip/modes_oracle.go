@@ -226,8 +226,9 @@ func describeMask(mask uint32) string {
 // hexadecimal digits.
 var hexBinary32 = regexp.MustCompile(`^[0-9a-fA-F]{1,8}$`)
 
-// decimalText matches a wholly decimal rendering, which is what a serializer
-// that treats modesSupported as a plain integer emits.
+// decimalText matches a wholly decimal rendering — what a serializer that
+// models the element as a plain integer emits, which is what lexa-proto did
+// until 72d91be and what the next DUT this suite grades may still do.
 var decimalText = regexp.MustCompile(`^[0-9]{1,10}$`)
 
 // modesMask is a decoded modesSupported, with the ambiguity kept rather than
@@ -238,20 +239,36 @@ var decimalText = regexp.MustCompile(`^[0-9]{1,10}$`)
 // The schema says HexBinary32 (line 3853), so the SCHEMA reading of the element
 // text is hexadecimal, and that is the reading Value carries and the reading
 // the oracle grades on. But a serializer that models the field as a bare
-// unsigned integer emits decimal — lexa-proto's own DERCapabilityFull does
-// exactly that, `ModesSupported uint32` with no hexBinary marshaller — and for
-// a text made only of the digits 0-9 both readings are lexically valid and
-// numerically different: "8192" is bit 13 read as decimal and bits 1,4,7,8,15
-// read as hex. A reader of a bundle is entitled to know when the number they
-// are being shown depended on which of the two the harness picked.
+// unsigned integer emits DECIMAL, and for a text made only of the digits 0-9
+// both readings are lexically valid and numerically different: "8192" is bit 13
+// read as decimal and bits 1,4,7,8,15 read as hex. Neither end can detect it —
+// both agree the string parsed. A reader of a bundle is entitled to know when
+// the number they are being shown depended on which of the two the harness
+// picked.
+//
+// THIS IS NOT HYPOTHETICAL, AND IT IS NOW FIXED UPSTREAM. lexa-proto's
+// DERCapabilityFull declared `ModesSupported uint32` with no hexBinary
+// marshaller, so every DERCapability this product PUT carried a decimal
+// rendering of a field the schema types HexBinary32. This oracle's ambiguity
+// disclosure is what surfaced it; lexa-proto 72d91be swept the whole class —
+// modesSupported, MirrorUsagePoint/RateComponent roleFlags, Reading localID and
+// qualityFlags — onto a HexBinary type that emits UPPERCASE, ZERO-PADDED to the
+// type's full width ("00002000", not "2000") and decodes strictly as hex.
+//
+// The disclosure stays, for two reasons that outlive the fix: this oracle grades
+// whatever DUT is in front of it, not only this one, and the next DUT may still
+// be emitting decimal; and a bundle re-verified years from now may hold a
+// document written before 72d91be, which a reader must be able to interpret
+// without knowing the product's git history.
 //
 // LEADING ZEROS SETTLE IT, and that is why this is a narrow disclosure rather
 // than a permanent caveat on every row. A HexBinary32 is conventionally written
-// to its full width, and no integer serializer emits "00002000" for two
-// thousand — it writes "2000". So a text longer than one character that starts
-// with '0' is unambiguously the schema's rendering, and Decimal stays nil.
-// Decimal is filled in only for a text that BOTH readings could plausibly have
-// produced: all decimal digits, no leading zero, and the two values differ.
+// to its full width — 72d91be's encoding does exactly that — and no integer
+// serializer emits "00002000" for two thousand; it writes "2000". So a text
+// longer than one character that starts with '0' is unambiguously the schema's
+// rendering, and Decimal stays nil. Decimal is filled in only for a text that
+// BOTH readings could plausibly have produced: all decimal digits, no leading
+// zero, and the two values differ.
 type modesMask struct {
 	// Text is the element's character data, verbatim.
 	Text string
@@ -386,7 +403,21 @@ func gatherModesEvidence(t *Transcript) modesEvidence {
 			}
 			for _, kid := range base.Kids {
 				name := kid.Local()
-				if _, ok := bitForElement(name); !ok {
+				// EVERY opMod* element, not only the ones this file's table can
+				// place. DERControlBase's own non-mode member is rampTms, so the
+				// prefix is the whole filter and it is a syntactic property of
+				// the schema's naming rather than a judgement about which modes
+				// exist.
+				//
+				// Collecting the ones with NO bit is the point. A DUT can
+				// execute a mode sep 2.0.4 gives no position for — this product
+				// ships two, opModExpLimW and opModGenLimW, the CSIP-Aus
+				// dynamic-operating-envelope elements the schema does not
+				// declare — and those are UNADVERTISABLE in this bitmap rather
+				// than missing from it. Dropping them here would have let the
+				// finding imply the mask accounted for everything the DUT ran.
+				// gradeMaskAgainstEvidence discloses them instead.
+				if !strings.HasPrefix(name, "opMod") {
 					continue
 				}
 				modesOf[mrid] = appendUnique(modesOf[mrid], name)
@@ -536,7 +567,7 @@ func gradeModesSupported(e modesEvidence) Finding {
 // gradeMaskAgainstEvidence is the decision, run on ONE reading of the mask.
 func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.Verdict, string) {
 	var overclaims, underclaims, reserved []string
-	var advertised, evidenced, silent []string
+	var advertised, evidenced, silent, unadvertisable []string
 
 	// ── Direction (b): executed but not advertised ───────────────────────
 	for _, name := range e.modeNames() {
@@ -546,6 +577,18 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 		}
 		b, ok := bitForElement(name)
 		if !ok {
+			// A mode the DUT demonstrably RAN and sep 2.0.4 gives no bit for.
+			// This is not an underclaim and grading it as one would demand a bit
+			// that does not exist — but it is not nothing either: the mask is
+			// then a strictly incomplete description of what this device does,
+			// and a reader comparing "modes supported" against a campaign
+			// transcript is entitled to know which executed modes the field
+			// COULD NOT have carried. The PICS is where they have to be
+			// declared; this says so rather than leaving a silent gap.
+			unadvertisable = append(unadvertisable, fmt.Sprintf(
+				"<%s> (executed under mRID %s; sep 2.0.4's DERControlType assigns it no bit, so no "+
+					"value of modesSupported can advertise it and the device's PICS is the only place "+
+					"it can be declared)", name, strings.Join(r.Executed, "/")))
 			continue
 		}
 		evidenced = append(evidenced, fmt.Sprintf("%s (bit %d, mRID %s)", name, b.Bit,
@@ -628,6 +671,10 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 	} else {
 		head += ". This evidence proves NO mode executed (no control drew a status 2 or 3), so the " +
 			"executed-but-not-advertised direction had nothing to test"
+	}
+	if len(unadvertisable) > 0 {
+		head += ". Executed modes this bitmap CANNOT express, so their absence from it is not an " +
+			"underclaim and their presence in it is impossible: " + strings.Join(unadvertisable, "; ")
 	}
 
 	var problems []string

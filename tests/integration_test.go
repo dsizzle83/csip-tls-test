@@ -302,9 +302,17 @@ func TestMUPPostCreate(t *testing.T) {
 	fetcher := newTestFetcher(ts)
 
 	// POST a MirrorUsagePoint to register a new measurement point.
+	//
+	// roleFlags 0x0049 = isMirror | isDER | isSubmeter (sep 2.0.4 RoleFlagsType,
+	// xsd:5826). It was the decimal 49 until lexa-proto 72d91be made hexBinary
+	// elements emit hex: the wire text was "49", every conformant reader took
+	// that as 0x49, and 0x49 is the value this fixture means. Read as decimal it
+	// would instead be isMirror | isRevenueQuality | isDC — revenue-grade DC
+	// metering, which this bench has never claimed. Full adjudication at
+	// csip_conformance_test.go's TestCSIP_BASIC024_MUPRegistration.
 	mup := model.MirrorUsagePoint{
 		MRID:                "MUP-001",
-		RoleFlags:           49,
+		RoleFlags:           0x0049,
 		ServiceCategoryKind: 0,
 		Status:              0,
 		PostRate:            900,

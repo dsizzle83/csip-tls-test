@@ -446,7 +446,7 @@
   <RateComponent xmlns="urn:ieee:std:2030.5:ns" href="/tp/0/rc/0">
     <mRID>RC-FWD-001</mRID>
     <description>Forward (consumption) rate</description>
-    <roleFlags>4</roleFlags>
+    <roleFlags>0002</roleFlags>
     <TimeTariffIntervalListLink href="/tp/0/rc/0/tti" all="2"></TimeTariffIntervalListLink>
     <ActiveTimeTariffIntervalListLink href="/tp/0/rc/0/acttti" all="1"></ActiveTimeTariffIntervalListLink>
   </RateComponent>

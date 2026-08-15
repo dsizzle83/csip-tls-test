@@ -9,56 +9,152 @@ import "encoding/xml"
 
 // ─── Operating-mode bitmask constants (DERCapability.ModesSupported) ──────────
 //
-// A DER device sets the corresponding bit to advertise support for each mode.
+// DERControlType is a HexBinary32 bitmap. A DER sets bit N to advertise that it
+// IMPLEMENTS the mode the schema assigns to N — "Bitmap indicating the DER
+// Controls implemented by the device" (sep-2.0.4.xsd:3573, DERCapability's
+// modesSupported; the companion modesEnabled on DERSettings, xsd:3372, is the
+// ENABLED subset, and the schema is explicit that a supported-but-not-enabled
+// control "will not be executed").
 //
-// RECORDED DIVERGENCE — these bit positions do NOT match sep 2.0.4 (R4b's
-// sibling, deliberately NOT fixed here). The vendored schema
-// (docs/schema/sep-2.0.4.xsd, complexType "DERControlType") assigns:
+// CORRECTED 2026-08-15 — LEGACY_CURVES_RC0_2026-08-14 §10 stage 9, the
+// "modesSupported truth" stage; registry IW15-011. The previous table was a
+// different assignment ENTIRELY: it packed the modes into bits 0..26 in its own
+// order, gave one bit to "opModConnect / opModEnergize" jointly, invented four
+// MayTrip bits for modes the schema does not define, and spent bits 23..26 on
+// the CSIP-Aus dynamic-operating-envelope quartet, which DERControlType has no
+// bit for at all. Sixteen of the twenty-two schema modes landed on the wrong
+// bit. It was LATENT rather than live — lexa-gw's derproducer hardcoded
+// ModesSupported: 0 and nothing else populated the field — and the correction
+// lands together with the code that first populates it truthfully.
 //
-//	0 opModVoltVar   1 opModFreqWatt  2 opModFreqDroop  3 opModWattPF
-//	4 opModVoltWatt  5 LVRTMomCess    6 LVRTMustTrip    7 HVRTMomCess
-//	8 HVRTMustTrip   9 LFRTMustTrip  10 HFRTMustTrip   11 opModConnect
-//	12 opModEnergize 13 opModMaxLimW 14 opModFixedVar  15 opModFixedPF
-//	16 opModFixedW   17 opModTargetW 18 opModTargetVar 19 Charge
-//	20 Discharge     21 opModWattVar
+// Every constant is transcribed from the vendored schema's own bit table:
+// docs/schema/sep-2.0.4.xsd, complexType "DERControlType" (line 3825), whose
+// xs:documentation says "Bit positions SHALL be defined as follows:" and then
+// lists bits 0..21 on lines 3828..3849 — one line per bit, cited per constant
+// below. Line 3850 closes with "All other values reserved.", so bits 22..31
+// have no meaning and this package declares none.
 //
-// The table below is a different assignment entirely, and — unlike the
-// DERCurveType codes, which are only ever read FROM the wire — this one is
-// WRITTEN to the wire: derproducer publishes ModesSupported from it, so
-// correcting it changes what the gateway advertises to a utility server and has
-// to move together with the PICS, the harness expectations and the
-// per-generation capability work. That is scheduled as its own stage
-// (LEGACY_CURVES_RC0_2026-08-14 §10 stage 9, "modesSupported truth"); changing
-// it here would advertise a different mask than the product can honour.
+// TestModeBitsMatchXSD PARSES that block and proves this table reproduces it in
+// both directions, rather than restating it — the discipline the R4a/R4b
+// corrections established, and the one that would have caught this table.
+//
+// THREE MODES THE SCHEMA NAMES AND THIS PRODUCT DOES NOT IMPLEMENT still get a
+// constant (opModFixedPF, Charge, Discharge): the table's job is to reproduce
+// the schema's assignment, and a hole in it is how a neighbouring bit gets
+// mis-numbered. Whether the product SETS a bit is a separate question, answered
+// per device by the publisher (lexa-gw internal/derproducer).
+//
+// FOUR ELEMENTS THIS PACKAGE DECODES HAVE NO BIT, and cannot be advertised in
+// this bitmap at all: opModExpLimW / opModGenLimW / opModImpLimW /
+// opModLoadLimW are the CSIP-Aus dynamic-operating-envelope quartet, absent
+// from sep 2.0.4 (see ExtendedDERControlBase). The old table gave them bits
+// 23..26, which is a claim on reserved positions. A gateway that executes them
+// must say so somewhere other than modesSupported.
 const (
-	ModeConnect                uint32 = 1 << 0  // opModConnect / opModEnergize
-	ModeMaxLimW                uint32 = 1 << 1  // opModMaxLimW
-	ModeFixedW                 uint32 = 1 << 2  // opModFixedW
-	ModeFixedVar               uint32 = 1 << 3  // opModFixedVar
-	ModeFixedPFAbsorb          uint32 = 1 << 4  // opModFixedPFAbsorbW
-	ModeFixedPFInject          uint32 = 1 << 5  // opModFixedPFInjectW
-	ModeVoltVar                uint32 = 1 << 6  // opModVoltVar (dynamic Volt-VAr)
-	ModeFreqWatt               uint32 = 1 << 7  // opModFreqWatt (Freq-Watt)
-	ModeWattPF                 uint32 = 1 << 8  // opModWattPF (Watt-PF)
-	ModeVoltWatt               uint32 = 1 << 9  // opModVoltWatt (Volt-Watt)
-	ModeHFRTMayTrip            uint32 = 1 << 10 // opModHFRTMayTrip
-	ModeHFRTMustTrip           uint32 = 1 << 11 // opModHFRTMustTrip
-	ModeHVRTMayTrip            uint32 = 1 << 12 // opModHVRTMayTrip
-	ModeHVRTMomentaryCessation uint32 = 1 << 13 // opModHVRTMomentaryCessation
-	ModeHVRTMustTrip           uint32 = 1 << 14 // opModHVRTMustTrip
-	ModeLFRTMayTrip            uint32 = 1 << 15 // opModLFRTMayTrip
-	ModeLFRTMustTrip           uint32 = 1 << 16 // opModLFRTMustTrip
-	ModeLVRTMayTrip            uint32 = 1 << 17 // opModLVRTMayTrip
-	ModeLVRTMomentaryCessation uint32 = 1 << 18 // opModLVRTMomentaryCessation
-	ModeLVRTMustTrip           uint32 = 1 << 19 // opModLVRTMustTrip
-	ModeFreqDroop              uint32 = 1 << 20 // opModFreqDroop
-	ModeTargetW                uint32 = 1 << 21 // opModTargetW
-	ModeTargetVar              uint32 = 1 << 22 // opModTargetVar
-	ModeExpLimW                uint32 = 1 << 23 // opModExpLimW
-	ModeImpLimW                uint32 = 1 << 24 // opModImpLimW
-	ModeGenLimW                uint32 = 1 << 25 // opModGenLimW
-	ModeLoadLimW               uint32 = 1 << 26 // opModLoadLimW
+	ModeVoltVar                HexBinary32 = 1 << 0  // xsd:3828 — 0 opModVoltVar (Volt-Var Mode)
+	ModeFreqWatt               HexBinary32 = 1 << 1  // xsd:3829 — 1 opModFreqWatt (Frequency-Watt Curve Mode)
+	ModeFreqDroop              HexBinary32 = 1 << 2  // xsd:3830 — 2 opModFreqDroop (Frequency-Watt Parameterized Mode)
+	ModeWattPF                 HexBinary32 = 1 << 3  // xsd:3831 — 3 opModWattPF (Watt-PowerFactor Mode)
+	ModeVoltWatt               HexBinary32 = 1 << 4  // xsd:3832 — 4 opModVoltWatt (Volt-Watt Mode)
+	ModeLVRTMomentaryCessation HexBinary32 = 1 << 5  // xsd:3833 — 5 opModLVRTMomentaryCessation
+	ModeLVRTMustTrip           HexBinary32 = 1 << 6  // xsd:3834 — 6 opModLVRTMustTrip
+	ModeHVRTMomentaryCessation HexBinary32 = 1 << 7  // xsd:3835 — 7 opModHVRTMomentaryCessation
+	ModeHVRTMustTrip           HexBinary32 = 1 << 8  // xsd:3836 — 8 opModHVRTMustTrip
+	ModeLFRTMustTrip           HexBinary32 = 1 << 9  // xsd:3837 — 9 opModLFRTMustTrip
+	ModeHFRTMustTrip           HexBinary32 = 1 << 10 // xsd:3838 — 10 opModHFRTMustTrip
+	ModeConnect                HexBinary32 = 1 << 11 // xsd:3839 — 11 opModConnect (implies galvanic isolation)
+	ModeEnergize               HexBinary32 = 1 << 12 // xsd:3840 — 12 opModEnergize (Energize / De-Energize)
+	ModeMaxLimW                HexBinary32 = 1 << 13 // xsd:3841 — 13 opModMaxLimW (Maximum Active Power)
+	ModeFixedVar               HexBinary32 = 1 << 14 // xsd:3842 — 14 opModFixedVar (Reactive Power Setpoint)
+	ModeFixedPF                HexBinary32 = 1 << 15 // xsd:3843 — 15 opModFixedPF (Fixed Power Factor Setpoint)
+	ModeFixedW                 HexBinary32 = 1 << 16 // xsd:3844 — 16 opModFixedW (Charge / Discharge Setpoint)
+	ModeTargetW                HexBinary32 = 1 << 17 // xsd:3845 — 17 opModTargetW (Target Active Power)
+	ModeTargetVar              HexBinary32 = 1 << 18 // xsd:3846 — 18 opModTargetVar (Target Reactive Power)
+	ModeCharge                 HexBinary32 = 1 << 19 // xsd:3847 — 19 Charge mode (no opMod element; a mode, not a control)
+	ModeDischarge              HexBinary32 = 1 << 20 // xsd:3848 — 20 Discharge mode (no opMod element)
+	ModeWattVar                HexBinary32 = 1 << 21 // xsd:3849 — 21 opModWattVar (Watt-Var Mode)
 )
+
+// modeBits is the element-name → bit index projection of the table above, and
+// the ONLY supported way to turn a mode NAME into a modesSupported bit.
+//
+// It exists because the consumer that needs the mapping (lexa-gw's
+// derproducer, which composes a per-device mask out of the receipt screen's
+// axis names) would otherwise keep its own copy of the assignment — and a
+// second copy of a bit table is precisely how the divergence this stage
+// corrected survived unnoticed for as long as it did. One table, parsed against
+// the schema by one test.
+//
+// Keys are the schema's own element names, verbatim, including the two bits the
+// schema names WITHOUT an element ("Charge mode" / "Discharge mode" → "Charge"
+// / "Discharge"). Bits with no mode name, and names with no bit, do not appear.
+var modeBits = map[string]HexBinary32{
+	"opModVoltVar":                ModeVoltVar,
+	"opModFreqWatt":               ModeFreqWatt,
+	"opModFreqDroop":              ModeFreqDroop,
+	"opModWattPF":                 ModeWattPF,
+	"opModVoltWatt":               ModeVoltWatt,
+	"opModLVRTMomentaryCessation": ModeLVRTMomentaryCessation,
+	"opModLVRTMustTrip":           ModeLVRTMustTrip,
+	"opModHVRTMomentaryCessation": ModeHVRTMomentaryCessation,
+	"opModHVRTMustTrip":           ModeHVRTMustTrip,
+	"opModLFRTMustTrip":           ModeLFRTMustTrip,
+	"opModHFRTMustTrip":           ModeHFRTMustTrip,
+	"opModConnect":                ModeConnect,
+	"opModEnergize":               ModeEnergize,
+	"opModMaxLimW":                ModeMaxLimW,
+	"opModFixedVar":               ModeFixedVar,
+	"opModFixedPF":                ModeFixedPF,
+	"opModFixedW":                 ModeFixedW,
+	"opModTargetW":                ModeTargetW,
+	"opModTargetVar":              ModeTargetVar,
+	"Charge":                      ModeCharge,
+	"Discharge":                   ModeDischarge,
+	"opModWattVar":                ModeWattVar,
+}
+
+// ModeBit returns the DERControlType bit for a mode named by its sep 2.0.4
+// element name, and reports whether the schema assigns that name a bit at all.
+//
+// FALSE IS A REAL ANSWER, not an error to paper over: opModExpLimW and its
+// three CSIP-Aus siblings are modes this tree decodes and (on some benches)
+// executes, and sep 2.0.4 gives them no bit — a caller composing a
+// modesSupported mask must DROP them rather than pick a spare position. The
+// same goes for the four opMod*MayTrip links, which name modes the schema does
+// not define at all.
+//
+// The two product-specific power-factor axes are folded here rather than at
+// each call site: this package implements opModFixedPF as the
+// opModFixedPFAbsorbW / opModFixedPFInjectW pair (see
+// ExtendedDERControlBase), and the schema has ONE bit for the function. A DER
+// that can hold a fixed power factor in either direction implements
+// opModFixedPF, so both names answer with bit 15.
+func ModeBit(name string) (HexBinary32, bool) {
+	switch name {
+	case "opModFixedPFAbsorbW", "opModFixedPFInjectW":
+		return ModeFixedPF, true
+	}
+	b, ok := modeBits[name]
+	return b, ok
+}
+
+// ModeBitName is ModeBit's inverse over bit POSITIONS 0..31: it returns the
+// schema's name for a position, or "" for one the schema reserves. It exists so
+// a log line, a PICS table or a defect record can print a mask as the modes it
+// claims instead of as a hex integer, and so the mapping is assertable in both
+// directions (TestModeBitsMatchXSD).
+func ModeBitName(pos int) string {
+	if pos < 0 || pos > 31 {
+		return ""
+	}
+	bit := HexBinary32(1) << uint(pos)
+	for name, b := range modeBits {
+		if b == bit {
+			return name
+		}
+	}
+	return ""
+}
 
 // ─── DERCurve curve-type codes ────────────────────────────────────────────────
 //
@@ -186,47 +282,88 @@ type DERCurveData struct {
 
 // DERCurve is a piecewise-linear inverter characteristic curve.
 // It is referenced from DERControlBase via the opMod*Link fields.
+//
+// FIELD ORDER IS THE SCHEMA'S SEQUENCE, and that is load-bearing rather than
+// cosmetic: sep 2.0.4 declares DERCurve as an xs:sequence (an ORDERED particle,
+// docs/schema/sep-2.0.4.xsd:3856-3912) extending IdentifiedObject (xsd:5141; mRID 5148, description 5153, version 5158 —
+// mRID, description, version), and Go's encoding/xml emits struct fields in
+// declaration order. Decode is order-tolerant, so the divergence was invisible
+// on every document this tree READS; it becomes a validity defect the moment a
+// document is EMITTED to a validating peer. Corrected 2026-08-15 (legacy Stage
+// 9 / IW15-021's csipmodel docket): CurveData used to be declared AFTER
+// curveType, and the ramp/multiplier block was interleaved with fields the
+// schema does not declare at all. TestDERCurveFieldOrderMatchesXSD parses the
+// sequence out of the schema and compares it to this struct.
+//
+// THREE MANDATORY ELEMENTS LOST THEIR omitempty in the same pass —
+// creationTime, xMultiplier, yMultiplier (and yRefType, found by the same
+// sweep). All four are minOccurs="1", and all four have a MEANINGFUL zero:
+// xMultiplier/yMultiplier 0 is "×10^0", the commonest multiplier there is, and
+// yRefType 0 is DERUnitRefType's "N/A". `omitempty` DROPPED the element at that
+// value, so the most ordinary curve in the standard emitted a
+// schema-invalid document with a mandatory element missing. omitempty belongs
+// on minOccurs="0" elements only.
+//
+// FOUR PHANTOM FIELDS WERE REMOVED in the same pass — autonomousVRefEnable,
+// autonomousVRefTimeConstant, vRef and xRefType. Each named an element with
+// ZERO occurrences in sep 2.0.4 (`grep -c` on the vendored schema: 0, 0, 0, 0),
+// so each would silently ACCEPT, from any server, an element the standard does
+// not define — and, being `omitempty` pointers/values, could equally have put
+// one on the wire from a struct literal. The x-axis reference in particular is
+// fixed by the MODE at both ends (a volt-var curve's x is an effective percent
+// voltage by definition) and needs no carriage; the standard's only
+// V-reference elements are setVRef / setVRefOfs on DERSettings.
+// TestDERCurveHasNoPhantomElements keeps them gone.
 type DERCurve struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns DERCurve"`
 	Resource
 
-	MRID         string `xml:"mRID,omitempty"`
-	Description  string `xml:"description,omitempty"`
-	Version      uint16 `xml:"version,omitempty"`
-	CreationTime int64  `xml:"creationTime,omitempty"`
+	// ── IdentifiedObject (xsd:5141) ──────────────────────────────────────────
+	// mRID is minOccurs="1" and keeps its omitempty: unlike the four numeric
+	// elements below it has no meaningful zero — an empty mRID is not a curve
+	// identity, and emitting `<mRID></mRID>` would be invalid in a different
+	// way (mRIDType is a 16-octet HexBinary128). A curve with no mRID is a
+	// caller defect, not an encoding one.
+	MRID        string `xml:"mRID,omitempty"`
+	Description string `xml:"description,omitempty"` // xsd:5153, minOccurs 0
+	Version     uint16 `xml:"version,omitempty"`     // xsd:5158, minOccurs 0
 
-	// CurveType identifies what this curve represents (see CurveType* constants).
-	CurveType uint16 `xml:"curveType"`
+	// ── DERCurve's own sequence (xsd:3863 onward) ────────────────────────────
 
-	// CurveData is the ordered list of (x,y) breakpoints.
+	// CreationTime — xsd:3863, minOccurs="1". NOT omitempty: see the type doc.
+	CreationTime int64 `xml:"creationTime"`
+
+	// CurveData is the ordered list of (x,y) breakpoints — xsd:3868,
+	// minOccurs="1" maxOccurs="10". It precedes curveType in the schema
+	// sequence, which is the correction this ordering carries. omitempty is a
+	// no-op on a slice (an empty slice emits nothing either way) and is kept
+	// only so a zero-value DERCurve marshals without an empty element.
 	CurveData []DERCurveData `xml:"CurveData,omitempty"`
 
-	// AutonomousVRefEnable: when true (for Volt-VAr), the device computes its own
-	// voltage reference. Enabling this implicitly enables autonomous anti-islanding.
-	AutonomousVRefEnable *bool `xml:"autonomousVRefEnable,omitempty"`
-	// AutonomousVRefTimeConstant is the filtering time constant (seconds) for the
-	// autonomous voltage reference (Volt-VAr curves only).
-	AutonomousVRefTimeConstant *uint32 `xml:"autonomousVRefTimeConstant,omitempty"`
+	// CurveType identifies what this curve represents — xsd:3869,
+	// minOccurs="1"; see the CurveType* constants.
+	CurveType uint16 `xml:"curveType"`
 
 	// OpenLoopTms: time (in hundredths of a second) to reach 90 % of the
-	// commanded output. Applies to VoltVar and VoltWatt modes.
+	// commanded output — xsd:3874, minOccurs="0".
 	OpenLoopTms *uint16 `xml:"openLoopTms,omitempty"`
 
-	// Ramp timing — all in hundredths of a second.
-	RampDecTms *uint16 `xml:"rampDecTms,omitempty"` // output decrease ramp time
-	RampIncTms *uint16 `xml:"rampIncTms,omitempty"` // output increase ramp time
-	RampPT1Tms *uint16 `xml:"rampPT1Tms,omitempty"` // first-order lag time constant
+	// Ramp timing — all minOccurs="0". rampDecTms/rampIncTms are hundredths of
+	// a percent per second (xsd:3879, 3884); rampPT1Tms is hundredths of a
+	// second (xsd:3889).
+	RampDecTms *uint16 `xml:"rampDecTms,omitempty"`
+	RampIncTms *uint16 `xml:"rampIncTms,omitempty"`
+	RampPT1Tms *uint16 `xml:"rampPT1Tms,omitempty"`
 
-	// Axis multipliers: apply 10^multiplier to all x or y values.
-	XMultiplier int8 `xml:"xMultiplier,omitempty"`
-	YMultiplier int8 `xml:"yMultiplier,omitempty"`
+	// Axis multipliers: apply 10^multiplier to all x or y values — xsd:3894 and
+	// xsd:3899, both minOccurs="1". NOT omitempty: 0 means ×10^0.
+	XMultiplier int8 `xml:"xMultiplier"`
+	YMultiplier int8 `xml:"yMultiplier"`
 
-	// VRef: nominal AC voltage reference in V for VoltVar / VoltWatt curves.
-	VRef *int16 `xml:"vRef,omitempty"`
-
-	// XRefType / YRefType indicate the physical quantity on each axis (Table 19).
-	XRefType uint8 `xml:"xRefType,omitempty"`
-	YRefType uint8 `xml:"yRefType,omitempty"`
+	// YRefType is the Y-axis units context — xsd:3904, minOccurs="1", a
+	// DERUnitRefType. NOT omitempty: 0 is that enumeration's "N/A", a value the
+	// schema admits and a server may legitimately send.
+	YRefType uint8 `xml:"yRefType"`
 }
 
 // DERCurveList is a collection of DERCurve resources belonging to one DERProgram.
@@ -315,16 +452,95 @@ type ReactivePower struct {
 // scheduler (which only ever touches scalar modes). The walker resolves curve
 // links and stores them in the schedule layer, not here.
 //
-// XML element names match the 2030.5 schema exactly (case-sensitive).
+// XML element names match the 2030.5 schema exactly (case-sensitive), and so —
+// since 2026-08-15 — does the field ORDER.
+//
+// FIELD ORDER IS THE SCHEMA'S SEQUENCE. sep 2.0.4 declares DERControlBase as an
+// xs:sequence (docs/schema/sep-2.0.4.xsd:3689-3799), which is an ORDERED
+// particle: a validating peer rejects a document whose elements arrive in a
+// different order even when every element is legal. Go's encoding/xml emits
+// struct fields in declaration order, so the struct layout IS the emitted
+// sequence. This struct used to declare rampTms in the middle, the curve links
+// after the scalars, opModFreqDroop last and the ride-through pairs grouped by
+// frequency/voltage — a shape no validator would accept. Decode is
+// order-tolerant, which is why it survived: nothing this tree READS was ever
+// affected. Recorded as IW15-021's csipmodel docket; corrected here.
+//
+// The schema's own order is ALPHABETICAL by element name, which is why the
+// grouping below looks arbitrary: opModFreqDroop sits between opModFixedW and
+// opModFreqWatt because "FreqD" < "FreqW", not because the droop belongs with
+// the setpoints. Each field cites its schema line so the sequence is checkable
+// against the anchor rather than against this comment.
+// TestDERControlBaseFieldOrderMatchesXSD parses the sequence and compares.
+//
+// THE NON-SCHEMA FIELDS ARE ALL AT THE END, after rampTms — the four
+// opMod*MayTrip links and the CSIP-Aus quartet. That is deliberate: it makes
+// the schema-declared prefix of this struct contiguous and in sequence, so a
+// control carrying only sep 2.0.4 elements marshals to a valid document. Their
+// own position among themselves has no normative meaning (sep 2.0.4 declares
+// none of them).
 type ExtendedDERControlBase struct {
-	// ── Scalar modes ─────────────────────────────────────────────────────────
-	OpModConnect        *bool          `xml:"opModConnect,omitempty"`
-	OpModEnergize       *bool          `xml:"opModEnergize,omitempty"`
+	// ── sep 2.0.4 DERControlBase, in schema sequence ─────────────────────────
+	OpModConnect  *bool `xml:"opModConnect,omitempty"`  // xsd:3694
+	OpModEnergize *bool `xml:"opModEnergize,omitempty"` // xsd:3699
+	// xsd:3704 declares ONE element here, opModFixedPF, typed PowerFactor. This
+	// package implements the opModFixedPFAbsorbW / opModFixedPFInjectW pair the
+	// product is built and certified against — a divergence that predates this
+	// work and is recorded, not resolved, here (see
+	// TestDERControlBaseMatchesXSDElementSet's wantMissing/wantExtra). They
+	// occupy opModFixedPF's sequence slot, which is where a reader looking for
+	// the fixed-PF function expects to find it.
 	OpModFixedPFAbsorbW *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
 	OpModFixedPFInjectW *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
-	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"`
-	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`  // SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
-	OpModMaxLimW        *PerCent       `xml:"opModMaxLimW,omitempty"` // PerCent of setMaxW, not watts — IW13-001.
+	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"` // xsd:3709
+	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`   // xsd:3714. SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
+	// Frequency droop (inline parameters, not a curve link) — xsd:3719, and
+	// alphabetically ahead of opModFreqWatt, which is why it is here rather
+	// than at the end of the struct where it used to sit.
+	OpModFreqDroop *FreqDroop `xml:"opModFreqDroop,omitempty"`
+	// Frequency-Watt — droop-based frequency regulation (§10.10.4.3) — xsd:3724.
+	OpModFreqWatt               *CurveLink     `xml:"opModFreqWatt,omitempty"`
+	OpModHFRTMustTrip           *CurveLink     `xml:"opModHFRTMustTrip,omitempty"`           // xsd:3729
+	OpModHVRTMomentaryCessation *CurveLink     `xml:"opModHVRTMomentaryCessation,omitempty"` // xsd:3734
+	OpModHVRTMustTrip           *CurveLink     `xml:"opModHVRTMustTrip,omitempty"`           // xsd:3739
+	OpModLFRTMustTrip           *CurveLink     `xml:"opModLFRTMustTrip,omitempty"`           // xsd:3744
+	OpModLVRTMomentaryCessation *CurveLink     `xml:"opModLVRTMomentaryCessation,omitempty"` // xsd:3749
+	OpModLVRTMustTrip           *CurveLink     `xml:"opModLVRTMustTrip,omitempty"`           // xsd:3754
+	OpModMaxLimW                *PerCent       `xml:"opModMaxLimW,omitempty"`                // xsd:3759. PerCent of setMaxW, not watts — IW13-001.
+	OpModTargetVar              *ReactivePower `xml:"opModTargetVar,omitempty"`              // xsd:3764
+	OpModTargetW                *ActivePower   `xml:"opModTargetW,omitempty"`                // xsd:3769 — nested ActivePower, watts (§1.1)
+	// Dynamic Volt-VAr — anti-islanding baseline mode (§10.10.4.2) — xsd:3774.
+	OpModVoltVar *CurveLink `xml:"opModVoltVar,omitempty"`
+	// Volt-Watt — ramp real power output as a function of voltage (§10.10.4.4) — xsd:3779.
+	OpModVoltWatt *CurveLink `xml:"opModVoltWatt,omitempty"`
+	// Watt-PF — power-factor as a function of real power output (§10.10.4.5) — xsd:3784.
+	OpModWattPF *CurveLink `xml:"opModWattPF,omitempty"`
+	// Watt-Var — reactive power as a function of real power output — xsd:3789.
+	// Present in sep 2.0.4's DERControlBase (type DERCurveLink) and in
+	// DERControlType at bit 21, with its own DERCurveType code (10).
+	//
+	// ADDED 2026-08-14 (R4c): it was previously absent from this struct
+	// entirely, so a server that sent opModWattVar had it silently DISCARDED at
+	// decode — the control looked, to everything downstream, like a control that
+	// commanded nothing on that axis.
+	OpModWattVar *CurveLink `xml:"opModWattVar,omitempty"`
+	RampTms      *uint16    `xml:"rampTms,omitempty"` // xsd:3794 — the schema's last element
+
+	// ── NOT IN sep 2.0.4 — everything below this line ────────────────────────
+	//
+	// The four opMod*MayTrip links: the schema's DERControlBase carries only
+	// MustTrip and MomentaryCessation links, and the string "MayTrip" does not
+	// occur anywhere in it. They are kept because removing them would break
+	// consumers that enumerate the link set (lexa-gw's advaxis/fanOutClasses —
+	// registry IW15-020 tracks their retirement), and they are harmless on
+	// decode: a conformant server never sends them, so they simply stay nil.
+	// Nothing may treat their presence as evidence of anything, and nothing
+	// should MARSHAL them.
+	OpModHFRTMayTrip *CurveLink `xml:"opModHFRTMayTrip,omitempty"`
+	OpModHVRTMayTrip *CurveLink `xml:"opModHVRTMayTrip,omitempty"`
+	OpModLFRTMayTrip *CurveLink `xml:"opModLFRTMayTrip,omitempty"`
+	OpModLVRTMayTrip *CurveLink `xml:"opModLVRTMayTrip,omitempty"`
+
 	// ExpLimW/GenLimW/ImpLimW/LoadLimW are NOT IEEE 2030.5 core elements:
 	// verified ABSENT from sep.xsd 2.0.4 on 2026-08-13 (IW14 review — this
 	// supersedes the earlier "no XSD on this machine" caveat). They match the
@@ -332,58 +548,12 @@ type ExtendedDERControlBase struct {
 	// ActivePower (watts) as here. The governing extension schema is not in
 	// the local standards corpus — confirm against it before any conformance
 	// claim on these axes. See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
-	OpModExpLimW   *ActivePower   `xml:"opModExpLimW,omitempty"`
-	OpModGenLimW   *ActivePower   `xml:"opModGenLimW,omitempty"`
-	OpModImpLimW   *ActivePower   `xml:"opModImpLimW,omitempty"`
-	OpModLoadLimW  *ActivePower   `xml:"opModLoadLimW,omitempty"`
-	OpModTargetW   *ActivePower   `xml:"opModTargetW,omitempty"` // already correct — nested ActivePower, watts (§1.1)
-	OpModTargetVar *ReactivePower `xml:"opModTargetVar,omitempty"`
-	RampTms        *uint16        `xml:"rampTms,omitempty"`
-
-	// ── Curve-linked modes — each holds an href to a DERCurve ────────────────
-	// Dynamic Volt-VAr — anti-islanding baseline mode (§10.10.4.2).
-	OpModVoltVar *CurveLink `xml:"opModVoltVar,omitempty"`
-	// Frequency-Watt — droop-based frequency regulation (§10.10.4.3).
-	OpModFreqWatt *CurveLink `xml:"opModFreqWatt,omitempty"`
-	// Watt-PF — power-factor as a function of real power output (§10.10.4.5).
-	OpModWattPF *CurveLink `xml:"opModWattPF,omitempty"`
-	// Volt-Watt — ramp real power output as a function of voltage (§10.10.4.4).
-	OpModVoltWatt *CurveLink `xml:"opModVoltWatt,omitempty"`
-	// Watt-Var — reactive power as a function of real power output. Present in
-	// sep 2.0.4's DERControlBase (type DERCurveLink) and in DERControlType at
-	// bit 21, with its own DERCurveType code (10).
-	//
-	// ADDED 2026-08-14 (R4c): it was previously absent from this struct
-	// entirely, so a server that sent opModWattVar had it silently DISCARDED at
-	// decode — the control looked, to everything downstream, like a control that
-	// commanded nothing on that axis.
-	OpModWattVar *CurveLink `xml:"opModWattVar,omitempty"`
-
-	// High-frequency ride-through curves.
-	//
-	// NOTE on the four opMod*MayTrip fields below: they are NOT in sep 2.0.4.
-	// The schema's DERControlBase carries only MustTrip and MomentaryCessation
-	// links, and the string "MayTrip" does not occur anywhere in it. They are
-	// kept because removing them would break consumers that enumerate the link
-	// set, and they are harmless on decode — a conformant server never sends
-	// them, so they simply stay nil. Nothing may treat their presence as
-	// evidence of anything, and nothing should MARSHAL them.
-	OpModHFRTMayTrip  *CurveLink `xml:"opModHFRTMayTrip,omitempty"`
-	OpModHFRTMustTrip *CurveLink `xml:"opModHFRTMustTrip,omitempty"`
-	// High-voltage ride-through curves.
-	OpModHVRTMayTrip            *CurveLink `xml:"opModHVRTMayTrip,omitempty"`
-	OpModHVRTMomentaryCessation *CurveLink `xml:"opModHVRTMomentaryCessation,omitempty"`
-	OpModHVRTMustTrip           *CurveLink `xml:"opModHVRTMustTrip,omitempty"`
-	// Low-frequency ride-through curves.
-	OpModLFRTMayTrip  *CurveLink `xml:"opModLFRTMayTrip,omitempty"`
-	OpModLFRTMustTrip *CurveLink `xml:"opModLFRTMustTrip,omitempty"`
-	// Low-voltage ride-through curves.
-	OpModLVRTMayTrip            *CurveLink `xml:"opModLVRTMayTrip,omitempty"`
-	OpModLVRTMomentaryCessation *CurveLink `xml:"opModLVRTMomentaryCessation,omitempty"`
-	OpModLVRTMustTrip           *CurveLink `xml:"opModLVRTMustTrip,omitempty"`
-
-	// ── Frequency droop (inline, not a curve link) ────────────────────────────
-	OpModFreqDroop *FreqDroop `xml:"opModFreqDroop,omitempty"`
+	// DERControlType has no bit for any of them either, so they cannot be
+	// advertised in modesSupported (see ModeBit).
+	OpModExpLimW  *ActivePower `xml:"opModExpLimW,omitempty"`
+	OpModGenLimW  *ActivePower `xml:"opModGenLimW,omitempty"`
+	OpModImpLimW  *ActivePower `xml:"opModImpLimW,omitempty"`
+	OpModLoadLimW *ActivePower `xml:"opModLoadLimW,omitempty"`
 }
 
 // ExtendedDERControl wraps a DERControl with the full ExtendedDERControlBase.
@@ -446,7 +616,7 @@ type DERCapabilityFull struct {
 
 	// ModesSupported is a bitmask of the DERControlBase operating modes this
 	// DER supports. See Mode* constants defined above.
-	ModesSupported uint32 `xml:"modesSupported"`
+	ModesSupported HexBinary32 `xml:"modesSupported"`
 
 	// Nameplate ratings (all use ActivePower — value × 10^multiplier in W or VA or VAr).
 	RtgMaxW              ActivePower  `xml:"rtgMaxW"`                        // nameplate peak active power

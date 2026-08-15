@@ -310,7 +310,17 @@ func TestModesOracle_DerivesItsBitsFromTheSchemaAndNotFromTheProduct(t *testing.
 // actually reaches the wire; and it survives a rename of a constant, which a
 // hand-copied constant list does not.
 func TestModesOracleBitTable_AgreesWithCsipmodelOrOneOfThemIsWrong(t *testing.T) {
-	disagreements := compareAgainstProductTable(model.ModeBitName, model.ModeBit)
+	// model.ModeBit answers in csipmodel's own HexBinary32 type — 72d91be made
+	// the Mode* constants typed, so a mask composed from them cannot be assigned
+	// to anything but the field it belongs to. Widen it to the plain uint32 this
+	// file compares in: the comparison is about BIT POSITIONS, and adopting the
+	// product's type to make it would put a second product dependency inside the
+	// one test whose whole job is to be independent of the product.
+	productBit := func(name string) (uint32, bool) {
+		b, ok := model.ModeBit(name)
+		return uint32(b), ok
+	}
+	disagreements := compareAgainstProductTable(model.ModeBitName, productBit)
 	if len(disagreements) == 0 {
 		return
 	}
@@ -788,35 +798,28 @@ func TestModesSupportedOracle_ServerTierGradesTheMaskAndSaysWhatItCannot(t *test
 	}
 }
 
-// ── The red proof against the current product build ──────────────────────────
+// ── The proofs against the product build ────────────────────────────────────
 
-// productDERCapabilityToday is the DERCapability body the CURRENT product
-// build serves, assembled by the PRODUCT'S OWN serializer.
+// productDERCapability builds a DERCapability body with the PRODUCT'S OWN
+// serializer, carrying whatever mask the caller pins.
 //
-// The type and the marshalling are lexa-proto/csipmodel's
-// (DERCapabilityFull, the same struct lexa-gw's
-// internal/northbound/derreport buildCapability fills). The ModesSupported
-// VALUE is 0 because lexa-gw's internal/derproducer/derproducer.go line 244
-// sets it so, verbatim:
+// The type and the marshalling are lexa-proto/csipmodel's (DERCapabilityFull,
+// the same struct lexa-gw's internal/northbound/derreport buildCapability
+// fills), so the TEXT these fixtures carry is the text the gateway puts on the
+// wire, encoding convention and all. Since lexa-proto 72d91be that convention
+// is uppercase hexBinary32, zero-padded to eight digits.
 //
-//	ModesSupported: 0, // conservative empty truth mask — see package doc
-//
-// Nothing else in lexa-gw writes that field, so 0 is what every DERCapability
-// this product PUTs carries today. Running this file's oracle over it, in a
-// window where the product demonstrably executed opModMaxLimW and
-// opModConnect, is the red proof: the underclaim direction has to fire, and
-// the FAIL below is captured verbatim in the handoff.
-//
-// Using csipmodel HERE — in a test, to build the DUT's side of the fixture — is
-// the opposite of the thing TestModesOracle_DerivesItsBitsFromTheSchemaAndNotFromTheProduct
-// forbids. The product's serializer is the right authority on what the product
-// emits. It has no standing whatsoever on what the bytes MEAN, and the oracle
-// path never asks it.
-func productDERCapabilityToday(t *testing.T) string {
+// Using csipmodel HERE — in a test, to build the DUT's side of a fixture — is
+// the opposite of the thing
+// TestModesOracle_DerivesItsBitsFromTheSchemaAndNotFromTheProduct forbids. The
+// product's serializer is the right authority on what the product EMITS. It has
+// no standing whatsoever on what those bytes MEAN, and the oracle path never
+// asks it.
+func productDERCapability(t *testing.T, modes model.HexBinary32) string {
 	t.Helper()
 	cap := &model.DERCapabilityFull{
 		Type:           83, // storage — the battery in the bench census
-		ModesSupported: 0,  // lexa-gw internal/derproducer/derproducer.go:244
+		ModesSupported: modes,
 		RtgMaxW:        model.ActivePower{Multiplier: 0, Value: 5000},
 	}
 	b, err := xml.Marshal(cap)
@@ -826,33 +829,57 @@ func productDERCapabilityToday(t *testing.T) string {
 	return string(b)
 }
 
-// TestModesSupportedOracle_RedProofAgainstTheCurrentProductBuild is the
-// Stage-7/9 red proof, run hermetically.
+// shippedMask is what lexa-gw 066b416 advertises under the posture it ships.
 //
-// The product PUTs modesSupported=0 while the campaign has it executing scalar
-// modes — BASIC-013 commands opModFixedW and proves it southbound, CORE-022
-// publishes an opModMaxLimW control and asserts the DUT's status=2 (Event
-// started) for it, and the inverter-control rows drive opModConnect. Every one
-// of those is a mode the DUT runs and does not advertise, and until the mask
-// becomes truthful this oracle MUST report it. A green run here would mean the
-// oracle had no teeth.
+// derproducer.ModesSupported (internal/derproducer/modes.go) composes the mask
+// from the per-device supported-axes screen, and the shipped scalar screen is
+// scheduler.ScalarSupportedAxes() = {opModConnect, opModFixedW, opModExpLimW,
+// opModMaxLimW, opModGenLimW}. Two of those five are UNADVERTISABLE: opModExpLimW
+// and opModGenLimW are CSIP-Aus dynamic-operating-envelope elements that sep
+// 2.0.4 does not declare and DERControlType has no bit for, so derproducer drops
+// them rather than folding them onto a neighbour. What survives is
 //
-// When the product's mask becomes truthful this test does not go green by
-// itself: the fixture is pinned to modesSupported=0 (the value derproducer sets
-// TODAY, cited above) so that it keeps proving the ORACLE rather than tracking
-// the product. Whoever lands the truthful mask should update the cited line and
-// keep the assertion.
-func TestModesSupportedOracle_RedProofAgainstTheCurrentProductBuild(t *testing.T) {
-	body := productDERCapabilityToday(t)
-	if !strings.Contains(body, "<modesSupported>0</modesSupported>") {
-		t.Fatalf("the product's DERCapability no longer carries modesSupported=0; this red proof's "+
-			"premise has changed and the test must be re-stated against what it carries now: %s", body)
+//	bit 11 opModConnect  | bit 13 opModMaxLimW | bit 16 opModFixedW
+//	0x00000800           | 0x00002000          | 0x00010000          = 0x00012800
+//
+// The value is written as a LITERAL rather than composed from csipmodel's Mode*
+// constants on purpose. This fixture's job is to pin the bytes the product
+// ships; composing it from the product's table would make the fixture move
+// silently with the table, and the whole point of the surrounding file is that
+// the table is a thing to be checked and not a thing to be trusted.
+const shippedMask model.HexBinary32 = 0x00012800
+
+// TestModesSupportedOracle_GreenProofAgainstTheShippedTruthfulMask is the
+// re-baselined Stage-9 proof: the same oracle, the same evidence, and the mask
+// the product now actually PUTs.
+//
+// This test WAS the red proof. lexa-gw 066b416 replaced derproducer's hardcoded
+// `ModesSupported: 0` with the receipt screen, and lexa-proto 72d91be made the
+// element emit hexBinary instead of decimal, so the DERCapability that used to
+// read "0" now reads "00012800" — and the two modes the campaign proves this DUT
+// executes, opModConnect (bit 11) and opModMaxLimW (bit 13), are both SET. The
+// criterion that had to fail now has to pass, for the same reason and on the
+// same evidence.
+//
+// The red shape is not lost: TestModesSupportedOracle_RedProofAgainstThePreservedHardcodedZero
+// keeps it as a preserved fixture, the same pattern the tripwire's
+// would-have-caught test uses. A criterion whose only recorded behaviour is
+// passing has been demonstrated, not tested.
+func TestModesSupportedOracle_GreenProofAgainstTheShippedTruthfulMask(t *testing.T) {
+	body := productDERCapability(t, shippedMask)
+	// The EMITTED TEXT, not the value: a round-trip through a wrong convention
+	// passes happily, so only the bytes can prove the encoding half.
+	if !strings.Contains(body, "<modesSupported>00012800</modesSupported>") {
+		t.Fatalf("the product's serializer no longer emits the shipped mask as zero-padded hexBinary32; "+
+			"this proof's premise has changed and must be re-stated against what it emits now:\n%s", body)
 	}
 
 	tr := synthTranscript(
 		Exchange{Req: msg(Request, "PUT", "/edev/0/der/1/dercap", 0, body),
 			Resp: msg(Response, "", "", 204, "")},
-		// The two modes the campaign proves this DUT executes.
+		// The two modes the campaign proves this DUT executes: CORE-022
+		// publishes an opModMaxLimW control and asserts the DUT's status=2, and
+		// the inverter-control rows drive opModConnect to completion.
 		controlList(
 			[2]string{"CERT-CORE-022", "opModMaxLimW"},
 			[2]string{"CERT-BASIC-011", "opModConnect"},
@@ -863,21 +890,142 @@ func TestModesSupportedOracle_RedProofAgainstTheCurrentProductBuild(t *testing.T
 
 	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, tr)
 	if f.Unavailable != "" {
-		t.Fatalf("the oracle declined to decide against the current product build: %s", f.Unavailable)
+		t.Fatalf("the oracle declined to decide against the shipped build: %s", f.Unavailable)
+	}
+	if f.Verdict != certify.Pass {
+		t.Fatalf("the shipped truthful mask graded %s, want PASS. It advertises bits 11/13/16 and the "+
+			"evidence proves it executes bits 11 and 13:\n%s", f.Verdict, f.Observed)
+	}
+	// The PASS must SAY what it credited, or it is indistinguishable from a
+	// criterion that found nothing to check.
+	for _, want := range []string{
+		"00012800", "bit 11 opModConnect", "bit 13 opModMaxLimW", "bit 16 opModFixedW",
+		"Modes this evidence PROVES the DUT executed",
+	} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the green proof's PASS omits %q:\n%s", want, f.Observed)
+		}
+	}
+	// bit 16 opModFixedW is advertised and this window did not exercise it. That
+	// is the disclosed-not-credited case, and it must be disclosed.
+	if !strings.Contains(f.Observed, "neither for nor against") {
+		t.Errorf("the advertised-but-unexercised bit 16 was not disclosed:\n%s", f.Observed)
+	}
+	// ZERO-PADDED hex is unambiguous: no serialization caveat may appear, or
+	// every conformant mask would carry noise (and lose its PASS to a WARN).
+	if strings.Contains(f.Observed, "AMBIGUOUS SERIALIZATION") {
+		t.Errorf("a zero-padded hexBinary32 mask was reported ambiguous:\n%s", f.Observed)
+	}
+	t.Logf("GREEN PROOF (shipped mask 0x00012800), verbatim:\n%s", f.Observed)
+}
+
+// TestModesSupportedOracle_RedProofAgainstThePreservedHardcodedZero is the
+// historical teeth test, and it is the reason the green proof above means
+// anything.
+//
+// The fixture is the DERCapability lexa-gw PUT before 066b416: derproducer.go
+// carried, verbatim,
+//
+//	ModesSupported: 0, // conservative empty truth mask — see package doc
+//
+// while the campaign had the DUT executing opModMaxLimW (CORE-022 asserts its
+// status=2), opModConnect and opModFixedW (BASIC-013 commands it and proves it
+// southbound). Every one of those was a mode the DUT ran and did not advertise.
+//
+// The mask is PINNED to 0 here, not read from the product, for exactly the
+// reason the tripwire's would-have-caught test pins the old bit table: a teeth
+// test that tracked the product would have gone green the moment the product
+// was fixed, taking the evidence of its own teeth with it. Whoever changes the
+// shipped posture updates the green proof above and leaves this one alone.
+func TestModesSupportedOracle_RedProofAgainstThePreservedHardcodedZero(t *testing.T) {
+	body := productDERCapability(t, 0)
+	// 0 is the one value that reads identically under both the pre-72d91be
+	// decimal emission and the hexBinary one, so this fixture is byte-faithful
+	// to the document the product actually PUT — modulo the zero padding, which
+	// carries no bits.
+	if !strings.Contains(body, "<modesSupported>00000000</modesSupported>") {
+		t.Fatalf("the preserved zero fixture no longer emits an all-zero mask:\n%s", body)
+	}
+
+	tr := synthTranscript(
+		Exchange{Req: msg(Request, "PUT", "/edev/0/der/1/dercap", 0, body),
+			Resp: msg(Response, "", "", 204, "")},
+		controlList(
+			[2]string{"CERT-CORE-022", "opModMaxLimW"},
+			[2]string{"CERT-BASIC-011", "opModConnect"},
+		),
+		responsePOST("CERT-CORE-022", 1), responsePOST("CERT-CORE-022", 2),
+		responsePOST("CERT-BASIC-011", 1), responsePOST("CERT-BASIC-011", 3),
+	)
+
+	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, tr)
+	if f.Unavailable != "" {
+		t.Fatalf("the oracle declined to decide against the preserved zero mask: %s", f.Unavailable)
 	}
 	if f.Verdict != certify.Fail {
-		t.Fatalf("the current product build graded %s. It PUTs modesSupported=0 and executes "+
-			"opModMaxLimW and opModConnect; an oracle that does not fail that has no teeth.\n%s",
-			f.Verdict, f.Observed)
+		t.Fatalf("the pre-066b416 build graded %s. It PUT modesSupported=0 and executed opModMaxLimW "+
+			"and opModConnect; an oracle that does not fail that has no teeth, and the green proof "+
+			"above would be worthless.\n%s", f.Verdict, f.Observed)
 	}
 	for _, want := range []string{
 		"opModMaxLimW", "bit 13", "opModConnect", "bit 11", "CLEAR", "INCOHERENT in 2 place(s)",
 	} {
 		if !strings.Contains(f.Observed, want) {
-			t.Errorf("the red proof's FAIL omits %q:\n%s", want, f.Observed)
+			t.Errorf("the preserved red proof's FAIL omits %q:\n%s", want, f.Observed)
 		}
 	}
-	t.Logf("RED PROOF (underclaim direction), verbatim:\n%s", f.Observed)
+	t.Logf("RED PROOF, PRESERVED (pre-066b416 hardcoded zero), verbatim:\n%s", f.Observed)
+}
+
+// TestModesSupportedOracle_ModesTheBitmapCannotExpressAreDisclosedNotGraded is
+// the third shape the shipped posture makes real.
+//
+// lexa-gw executes opModExpLimW and opModGenLimW — CSIP-Aus
+// dynamic-operating-envelope elements sep 2.0.4 does not declare, for which
+// DERControlType has no bit at all. derproducer drops them from the mask, which
+// is right: there is no position to set. But "no underclaim" is not "nothing to
+// say". A mask that cannot express two of the five axes a device runs is an
+// incomplete description of it, and a reader comparing modesSupported against a
+// campaign transcript has to be told which executed modes the field could never
+// have carried, and where they ARE declared (the PICS).
+//
+// Grading them as underclaims would demand a bit that does not exist. Dropping
+// them silently — which this oracle did until the shipped posture made it
+// matter — would let the finding imply the mask accounted for everything.
+func TestModesSupportedOracle_ModesTheBitmapCannotExpressAreDisclosedNotGraded(t *testing.T) {
+	tr := synthTranscript(
+		Exchange{Req: msg(Request, "PUT", "/edev/0/der/1/dercap", 0, productDERCapability(t, shippedMask)),
+			Resp: msg(Response, "", "", 204, "")},
+		controlList(
+			[2]string{"CERT-CORE-022", "opModMaxLimW"},
+			[2]string{"CERT-DOE-EXP", "opModExpLimW"},
+			[2]string{"CERT-DOE-GEN", "opModGenLimW"},
+		),
+		responsePOST("CERT-CORE-022", 2),
+		responsePOST("CERT-DOE-EXP", 2),
+		responsePOST("CERT-DOE-GEN", 3),
+	)
+	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, tr)
+	if f.Unavailable != "" {
+		t.Fatalf("the oracle declined to decide: %s", f.Unavailable)
+	}
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s, want PASS: a mode the schema gives no bit is not an underclaim, and "+
+			"demanding a bit that does not exist would fail every conformant CSIP-Aus device\n%s",
+			f.Verdict, f.Observed)
+	}
+	for _, want := range []string{
+		"CANNOT express", "<opModExpLimW>", "<opModGenLimW>", "assigns it no bit", "PICS",
+	} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the unadvertisable-mode disclosure omits %q:\n%s", want, f.Observed)
+		}
+	}
+	// It must NOT have been counted as an executed-and-advertised mode either.
+	if strings.Contains(f.Observed, "opModExpLimW (bit") {
+		t.Errorf("an unadvertisable mode was given a bit:\n%s", f.Observed)
+	}
+	t.Logf("UNADVERTISABLE-MODE DISCLOSURE, verbatim:\n%s", f.Observed)
 }
 
 // TestModesSupportedOracle_RedProofOverclaimDirection is the other half of the

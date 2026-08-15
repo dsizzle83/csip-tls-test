@@ -1473,7 +1473,14 @@ func firstEventMRID(tree *discovery.ResourceTree) string {
 func checkBASIC024(r *Reporter, fetcher *tlsclient.WolfSSLFetcher) {
 	r.section("BASIC-024", "MirrorUsagePoint Registration")
 	r.spec("MUP.001-003", "POST /mup → 201+Location; GET Location → 200 with the registered MUP")
-	mup := model.MirrorUsagePoint{MRID: "MUP-CONF-001", RoleFlags: 49, PostRate: 900}
+	// roleFlags 0x0049 = isMirror | isDER | isSubmeter (sep 2.0.4 RoleFlagsType,
+	// xsd:5826/5829/5832/5835). Corrected from the decimal 49 when lexa-proto
+	// 72d91be made hexBinary elements emit hex: the old wire text "49" was read
+	// as 0x49 by every conformant peer, so 0x49 is the value this fixture has
+	// always meant — decimal 49 would be isMirror | isRevenueQuality | isDC, a
+	// revenue-grade DC meter this bench does not simulate. Full adjudication at
+	// tests/csip_conformance_test.go's TestCSIP_BASIC024_MUPRegistration.
+	mup := model.MirrorUsagePoint{MRID: "MUP-CONF-001", RoleFlags: 0x0049, PostRate: 900}
 	body, _ := xml.Marshal(mup)
 	_, loc, err := fetcher.Post("/mup", body, "application/sep+xml")
 	ok := err == nil && strings.HasPrefix(loc, "/mup/")
@@ -1498,7 +1505,10 @@ func checkBASIC024(r *Reporter, fetcher *tlsclient.WolfSSLFetcher) {
 func checkBASIC025(r *Reporter, fetcher *tlsclient.WolfSSLFetcher) {
 	r.section("BASIC-025", "MUP Telemetry POST")
 	r.spec("MUP.004-005", "POST /mup/{n} with MirrorMeterReading → 204 No Content")
-	mup := model.MirrorUsagePoint{MRID: "MUP-CONF-025", RoleFlags: 49, PostRate: 300}
+	// roleFlags 0x0049 — same adjudication as checkBASIC024 above: a mirrored
+	// DER submeter, corrected from the decimal literal whose emitted text a
+	// conformant reader already took as 0x49.
+	mup := model.MirrorUsagePoint{MRID: "MUP-CONF-025", RoleFlags: 0x0049, PostRate: 300}
 	regBody, _ := xml.Marshal(mup)
 	_, loc, err := fetcher.Post("/mup", regBody, "application/sep+xml")
 	if err != nil {
@@ -1510,6 +1520,11 @@ func checkBASIC025(r *Reporter, fetcher *tlsclient.WolfSSLFetcher) {
 	mmr := model.MirrorMeterReading{
 		MRID:        "MMR-CONF-025",
 		ReadingType: &model.ReadingType{CommodityType: 1, Kind: 37, Uom: 38, FlowDirection: 19},
+		// localID is HexBinary16 in the schema but an ORDINAL here (the
+		// disambiguator for multiple readings in one set), and 1 reads as 1
+		// under both the old decimal emission and 72d91be's hex one — only the
+		// text moves, "1" -> "0001". An ordinal of 10 would NOT have survived:
+		// "10" is 0x10 = 16 to a conformant reader.
 		MirrorReadingSet: []model.MirrorReadingSet{
 			{StartTime: now - 300, Duration: 300, Reading: []model.Reading{{Value: 4500, LocalID: 1}}}},
 	}

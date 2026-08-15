@@ -20,6 +20,40 @@ package gridsim
 // Regenerate ONLY when the default tree is deliberately changed:
 //
 //	go test ./sim/gridsim -run TestDefaultTreeIsByteIdentical -update-golden
+//
+// # REGENERATIONS, and why each one was allowed
+//
+// Every entry here is a departure from the a51e13d baseline and has to justify
+// itself, because a golden that moves without a stated reason is not a golden.
+//
+//  1. 2026-08-15, ONE line: /tp/0/rc's RateComponent roleFlags,
+//     "<roleFlags>4</roleFlags>" -> "<roleFlags>0002</roleFlags>". Two
+//     independent corrections landed on the same element.
+//
+//     THE TEXT changed because lexa-proto 72d91be stopped writing hexBinary
+//     ELEMENTS in decimal. sep 2.0.4 types roleFlags as RoleFlagsType
+//     (xsd:2291 -> xsd:5826), base HexBinary16, and csipmodel had been
+//     emitting a Go integer — so a value this bench meant as N went onto the
+//     wire as a string a conformant reader parsed as 0xN. The new encoding is
+//     uppercase and zero-padded to the type's width. This alone would have
+//     turned "4" into "0004" with no change of meaning.
+//
+//     THE VALUE changed because 0x0004 was never right. RoleFlagsType bit 2 is
+//     isPEV (xsd:5831) and this is a residential time-of-use tariff; the
+//     "isPrimary (forward)" the old comment claimed is not a role the type
+//     defines at all, and the forward/reverse distinction it was reaching for
+//     lives in ReadingType.flowDirection. The rate describes a premises point
+//     of delivery, which is bit 1, isPremisesAggregationPoint (xsd:5830) — the
+//     same role the DUT's own site-meter MirrorUsagePoint declares. Full
+//     adjudication in pricing.go.
+//
+//     WHY THIS IS SAFE FOR PUBLISHED EVIDENCE. Nothing in this tree reads
+//     RateComponent.RoleFlags, and no CSIP-CONF-v1.3 row this bench runs
+//     asserts on it — the tariff fixture exists for the pricing function set,
+//     which the certified direct-DER-client rows do not exercise. Bundles
+//     already published are unaffected: they hold their own captures, and
+//     `certify -verify` re-derives assertions from those bytes, not from this
+//     fixture.
 
 import (
 	"encoding/xml"

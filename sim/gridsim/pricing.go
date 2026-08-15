@@ -30,10 +30,40 @@ func (s *Server) buildPricing(now int64) {
 		Resource: model.Resource{Href: "/tp/0/rc"},
 		All:      1, Results: 1,
 		RateComponent: []model.RateComponent{{
-			Resource:                         model.Resource{Href: "/tp/0/rc/0"},
-			MRID:                             "RC-FWD-001",
-			Description:                      "Forward (consumption) rate",
-			RoleFlags:                        0x0004, // isPrimary (forward)
+			Resource:    model.Resource{Href: "/tp/0/rc/0"},
+			MRID:        "RC-FWD-001",
+			Description: "Forward (consumption) rate",
+			// ROLEFLAGS ADJUDICATION — the canonical one for RateComponent; see
+			// pricing_dynamic.go for the second site.
+			//
+			// This was 0x0004 with the comment "isPrimary (forward)". sep 2.0.4
+			// gives RateComponent.roleFlags the type RoleFlagsType (xsd:2291 ->
+			// xsd:5826), the SAME type UsagePointBase uses, and RoleFlagsType
+			// has no isPrimary and no isReverse. Its bit 2 is isPEV — xsd:5831,
+			// "SHALL be set if the usage applies to an electric vehicle" — so
+			// this bench was serving a residential time-of-use tariff that
+			// declared itself an EV rate.
+			//
+			// The encoding sweep (lexa-proto 72d91be) is what made anyone look:
+			// the VALUE survives it unaltered — 4 reads as 4 under either
+			// convention and only the emitted text moves, "4" -> "0004" — so
+			// unlike the MirrorUsagePoint fixtures this is not a semantics
+			// rescue. It is a wrong value the sweep walked past and this commit
+			// stops walking past.
+			//
+			// The forward/reverse distinction the old comment was reaching for
+			// is not carried by roleFlags at all: it is ReadingType.flowDirection
+			// (19 forward / 20 reverse), which the fixtures that carry a
+			// ReadingType already set. The role that IS true of this rate is bit
+			// 1, isPremisesAggregationPoint — "the UsagePoint is the point of
+			// delivery for a premises" (xsd:5830) — which is also the role the
+			// product's own site-meter MirrorUsagePoint declares (lexa-gw
+			// cmd/telemetry/main.go, RoleFlags: 0x0002). Bench and DUT now
+			// describe the same point of delivery the same way.
+			//
+			// Nothing in this tree reads RateComponent.RoleFlags. The only
+			// artefact that moves is testdata/default-tree.golden.
+			RoleFlags:                        0x0002, // isPremisesAggregationPoint
 			TimeTariffIntervalListLink:       &model.ListLink{Link: model.Link{Href: "/tp/0/rc/0/tti"}, All: 2},
 			ActiveTimeTariffIntervalListLink: &model.ListLink{Link: model.Link{Href: "/tp/0/rc/0/acttti"}, All: 1},
 		}},

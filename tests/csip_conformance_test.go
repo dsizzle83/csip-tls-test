@@ -1657,10 +1657,34 @@ func TestCSIP_BASIC024_MUPRegistration(t *testing.T) {
 	logSpec(t, id, "MUP.002", "Server responds 201 Created with Location header")
 	logSpec(t, id, "MUP.003", "Client can GET the registered MUP via the Location URL")
 
+	// ROLEFLAGS ADJUDICATION (lexa-proto 72d91be) — the canonical one; the other
+	// four fixture sites in this tree cite it.
+	//
+	// This literal used to be the decimal 49, and the wire carried the TEXT
+	// "49", because csipmodel wrote hexBinary ELEMENTS in decimal. sep 2.0.4
+	// types roleFlags as RoleFlagsType (xsd:5826), base HexBinary16, so every
+	// conformant reader of that document read "49" as 0x49:
+	//
+	//	0x49 = bits 0,3,6 = isMirror | isDER | isSubmeter   (xsd:5829/5832/5835)
+	//	  49 = bits 0,4,5 = isMirror | isRevenueQuality | isDC
+	//
+	// The comment on this line has always said "generation", and isDER is the
+	// only bit in RoleFlagsType that means it — xsd:5832, "SHALL be set if the
+	// usage applies to a distributed energy resource, capable of delivering
+	// power to the grid". The decimal reading instead claims revenue-grade
+	// certification and DIRECT CURRENT metering, neither of which this fixture
+	// has ever meant nor this bench could support. So the INTENT was 0x49, the
+	// Go value was the thing that was wrong, and the decimal-emission defect
+	// happened to cancel it out on the wire.
+	//
+	// Written as 0x0049 the emitted text becomes "0049" — the same value the old
+	// "49" already meant to a conformant peer, zero-padded. The wire semantics
+	// are therefore PRESERVED across the encoding fix: this corrects the Go
+	// literal, it does not change what this bench claims.
 	mup := model.MirrorUsagePoint{
 		MRID:                "MUP-CONF-001",
-		RoleFlags:           49, // generation
-		ServiceCategoryKind: 0,  // electricity
+		RoleFlags:           0x0049, // isMirror | isDER | isSubmeter — a mirrored DER submeter
+		ServiceCategoryKind: 0,      // electricity
 		Status:              0,
 		PostRate:            900,
 	}
@@ -1702,7 +1726,11 @@ func TestCSIP_BASIC025_MUPTelemetryPost(t *testing.T) {
 	logSpec(t, id, "MUP.005", "Server responds 204 No Content on successful reading ingestion")
 
 	// Register first.
-	mup := model.MirrorUsagePoint{MRID: "MUP-CONF-002", RoleFlags: 49, PostRate: 300}
+	// roleFlags 0x0049 = isMirror | isDER | isSubmeter. Same adjudication as
+	// BASIC-024's MUP-CONF-001 above: the old decimal 49 emitted the text "49",
+	// which a conformant reader took as 0x49, and 0x49 is what a DER telemetry
+	// mirror means. The value is corrected, the wire meaning is unchanged.
+	mup := model.MirrorUsagePoint{MRID: "MUP-CONF-002", RoleFlags: 0x0049, PostRate: 300}
 	regBody, _ := xml.Marshal(mup)
 	_, location, err := env.fetcher.Post("/mup", regBody, gridsim.ContentType)
 	if err != nil {
@@ -1726,6 +1754,15 @@ func TestCSIP_BASIC025_MUPTelemetryPost(t *testing.T) {
 				StartTime: now - 300,
 				Duration:  300,
 				Reading: []model.Reading{
+					// localID is HexBinary16 in the schema (Reading, sep 2.0.4)
+					// and it is an ORDINAL here, not a bitmap — the
+					// disambiguator for multiple readings in one set. It rides
+					// through lexa-proto 72d91be's encoding fix unchanged
+					// because 1 reads as 1 under both conventions; only the text
+					// moves, "1" -> "0001". Worth stating because it would NOT
+					// have survived: an ordinal of 10 emitted the text "10",
+					// which a conformant reader takes as 0x10 = 16. This fixture
+					// never got past 1.
 					{Value: 4500, LocalID: 1},
 				},
 			},

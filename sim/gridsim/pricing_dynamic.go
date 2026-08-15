@@ -269,10 +269,16 @@ func (s *Server) writePricingTreeLocked(ivs []pricingIv) {
 		Resource: model.Resource{Href: "/tp/0/rc"},
 		All:      1, Results: 1,
 		RateComponent: []model.RateComponent{{
-			Resource:                         model.Resource{Href: "/tp/0/rc/0"},
-			MRID:                             "RC-FWD-001",
-			Description:                      "Forward (consumption) rate",
-			RoleFlags:                        0x0004, // isPrimary (forward)
+			Resource:    model.Resource{Href: "/tp/0/rc/0"},
+			MRID:        "RC-FWD-001",
+			Description: "Forward (consumption) rate",
+			// roleFlags bit 1, isPremisesAggregationPoint (sep 2.0.4 xsd:5830).
+			// Corrected from 0x0004, which RoleFlagsType defines as isPEV
+			// (xsd:5831) and not as the "isPrimary (forward)" the old comment
+			// claimed — that role does not exist in the type. The dynamic tariff
+			// must describe the same point of delivery as the static one; full
+			// adjudication in pricing.go.
+			RoleFlags:                        0x0002, // isPremisesAggregationPoint
 			TimeTariffIntervalListLink:       &model.ListLink{Link: model.Link{Href: "/tp/0/rc/0/tti"}, All: n},
 			ActiveTimeTariffIntervalListLink: &model.ListLink{Link: model.Link{Href: "/tp/0/rc/0/acttti"}, All: 1},
 		}},

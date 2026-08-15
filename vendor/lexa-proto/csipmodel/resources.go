@@ -104,6 +104,108 @@ func (r ResponseRequired) MarshalXMLAttr(name xml.Name) (xml.Attr, error) {
 	return xml.Attr{Name: name, Value: fmt.Sprintf("%02X", uint8(r))}, nil
 }
 
+// ─── hexBinary ELEMENTS ───────────────────────────────────────────────────────
+//
+// ResponseRequired above is a hexBinary8 ATTRIBUTE and has always encoded
+// correctly. The hexBinary ELEMENTS did not: they were declared as plain Go
+// integers, and Go's encoding/xml writes an integer in DECIMAL. Added
+// 2026-08-15 (legacy Stage 9), found by the independent bit-position oracle
+// while it was grading the modesSupported mask this wave makes truthful.
+//
+// WHY IT MATTERS, and it is not cosmetic. sep 2.0.4 types several bitmap
+// elements as HexBinary8/16/32 (xsd:6034-6089), each documented as "a N-bit
+// field encoded as a hex string ... bit 0, or the least significant bit, goes
+// on the right". For a value whose decimal rendering happens to contain only
+// the digits 0-9, BOTH readings parse and they are DIFFERENT numbers:
+//
+//	<modesSupported>8192</modesSupported>
+//	  decimal 8192 = 0x2000 -> bit 13 (opModMaxLimW)
+//	  hex     8192          -> bits 1, 4, 7, 8, 15 (five completely different modes)
+//
+// So a decimal-encoded mask is not merely non-canonical — it is a document that
+// says something the writer did not mean, with no way for a reader to tell.
+// Nothing detects it either: both ends of an all-decimal-digit string agree
+// that it parsed.
+//
+// THE ENCODING: uppercase, ZERO-PADDED to the type's full width. Padding is a
+// deliberate choice beyond validity (xs:hexBinary only requires an even digit
+// count): a full-width mask is unambiguous on inspection, and it is what makes
+// a conformance grader able to PASS the value rather than flag it as ambiguous.
+// Uppercase matches ResponseRequired and the 2030.5 example encodings.
+//
+// THE DECODE IS STRICTLY HEX, and that is the only defensible reading: the
+// schema says hexBinary, so "20" is 32 and not 20. A lenient "try decimal too"
+// decode cannot help — for exactly the strings where the ambiguity exists, both
+// parses succeed — and would silently pick the wrong one for the rest. A
+// malformed or over-wide value is an ERROR rather than a zero, mirroring
+// ResponseRequired and this package's silent-failure discipline (see the
+// package doc): a corrupt capability bitmap must not decode to "supports
+// nothing".
+//
+// WIRE COMPATIBILITY, adjudicated rather than assumed: the only one of these
+// this product has ever EMITTED is modesSupported, and derproducer hardcoded it
+// to 0 until this same wave — and 0 reads identically under both conventions.
+// There is no deployed decimal mask to be compatible with.
+
+// HexBinary32 is a 32-bit bitmap element encoded as sep 2.0.4's HexBinary32
+// (xsd:6050): eight uppercase hex digits, zero-padded, least-significant bit on
+// the right. DERControlType (modesSupported / modesEnabled) is its extension.
+type HexBinary32 uint32
+
+// MarshalXML writes the value as eight zero-padded uppercase hex digits.
+func (h HexBinary32) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	return e.EncodeElement(fmt.Sprintf("%08X", uint32(h)), start)
+}
+
+// UnmarshalXML parses a hexBinary32 element. Strictly hex; whitespace-trimmed;
+// an unparsable or >32-bit value is an error.
+func (h *HexBinary32) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	var s string
+	if err := d.DecodeElement(&s, &start); err != nil {
+		return err
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		*h = 0
+		return nil
+	}
+	v, err := strconv.ParseUint(s, 16, 32)
+	if err != nil {
+		return fmt.Errorf("csipmodel: %s is a hexBinary32 and %q is not one: %w", start.Name.Local, s, err)
+	}
+	*h = HexBinary32(v)
+	return nil
+}
+
+// HexBinary16 is a 16-bit bitmap element encoded as sep 2.0.4's HexBinary16
+// (xsd:6042): four uppercase hex digits, zero-padded. RoleFlagsType is its
+// extension; localID and qualityFlags are typed with it directly.
+type HexBinary16 uint16
+
+// MarshalXML writes the value as four zero-padded uppercase hex digits.
+func (h HexBinary16) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	return e.EncodeElement(fmt.Sprintf("%04X", uint16(h)), start)
+}
+
+// UnmarshalXML parses a hexBinary16 element. Strictly hex; see HexBinary32.
+func (h *HexBinary16) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	var s string
+	if err := d.DecodeElement(&s, &start); err != nil {
+		return err
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		*h = 0
+		return nil
+	}
+	v, err := strconv.ParseUint(s, 16, 16)
+	if err != nil {
+		return fmt.Errorf("csipmodel: %s is a hexBinary16 and %q is not one: %w", start.Name.Local, s, err)
+	}
+	*h = HexBinary16(v)
+	return nil
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // DeviceCapability — the root of the resource tree (GET /dcap)
 // ───────────────────────────────────────────────────────────────────────
@@ -362,16 +464,28 @@ type FixedVar struct {
 // DERControlBase contains the actual control parameters — what the DER
 // should do. This is the payload of both DERControl events and the
 // DefaultDERControl fallback.
+// FIELD ORDER IS THE SCHEMA'S SEQUENCE (docs/schema/sep-2.0.4.xsd:3689-3799),
+// for the reason spelled out on ExtendedDERControlBase in der.go: xs:sequence
+// is ordered and Go emits fields in declaration order, so the layout IS the
+// emitted sequence. The scalar prefix here was already in schema order; the
+// 2026-08-15 correction moved the four CSIP-Aus elements — which sep 2.0.4 does
+// not declare at all — from between opModMaxLimW and rampTms to AFTER rampTms,
+// so the schema-declared part of the struct is contiguous and in sequence.
 type DERControlBase struct {
-	// Operating modes — each is optional; the server sends only what it
-	// wants to control.
-	OpModConnect        *bool          `xml:"opModConnect,omitempty"`
-	OpModEnergize       *bool          `xml:"opModEnergize,omitempty"`
+	// ── sep 2.0.4 DERControlBase, in schema sequence ─────────────────────────
+	// Each mode is optional; the server sends only what it wants to control.
+	OpModConnect  *bool `xml:"opModConnect,omitempty"`  // xsd:3694
+	OpModEnergize *bool `xml:"opModEnergize,omitempty"` // xsd:3699
+	// xsd:3704's single opModFixedPF, implemented here as the AbsorbW/InjectW
+	// pair — see ExtendedDERControlBase for the recorded divergence.
 	OpModFixedPFAbsorbW *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
 	OpModFixedPFInjectW *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
-	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"`
-	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`  // SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
-	OpModMaxLimW        *PerCent       `xml:"opModMaxLimW,omitempty"` // PerCent of setMaxW, not watts — IW13-001.
+	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"` // xsd:3709
+	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`   // xsd:3714. SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
+	OpModMaxLimW        *PerCent       `xml:"opModMaxLimW,omitempty"`  // xsd:3759. PerCent of setMaxW, not watts — IW13-001.
+	RampTms             *uint16        `xml:"rampTms,omitempty"`       // xsd:3794 — the schema's last element
+
+	// ── NOT IN sep 2.0.4 ─────────────────────────────────────────────────────
 	// ExpLimW/GenLimW/ImpLimW/LoadLimW are NOT IEEE 2030.5 core elements:
 	// verified ABSENT from sep.xsd 2.0.4 on 2026-08-13 (IW14 review — this
 	// supersedes the earlier "no XSD on this machine" caveat). They match the
@@ -383,7 +497,6 @@ type DERControlBase struct {
 	OpModGenLimW  *ActivePower `xml:"opModGenLimW,omitempty"`
 	OpModImpLimW  *ActivePower `xml:"opModImpLimW,omitempty"`
 	OpModLoadLimW *ActivePower `xml:"opModLoadLimW,omitempty"`
-	RampTms       *uint16      `xml:"rampTms,omitempty"`
 }
 
 // EventStatus describes the current state of an event.
@@ -487,13 +600,13 @@ type MirrorUsagePoint struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns MirrorUsagePoint"`
 	Resource
 
-	MRID                string `xml:"mRID,omitempty"`
-	Description         string `xml:"description,omitempty"`
-	RoleFlags           uint16 `xml:"roleFlags,omitempty"`
-	ServiceCategoryKind uint8  `xml:"serviceCategoryKind,omitempty"`
-	Status              uint8  `xml:"status,omitempty"`
-	DeviceLFDI          string `xml:"deviceLFDI,omitempty"`
-	PostRate            uint32 `xml:"postRate,omitempty"`
+	MRID                string      `xml:"mRID,omitempty"`
+	Description         string      `xml:"description,omitempty"`
+	RoleFlags           HexBinary16 `xml:"roleFlags,omitempty"` // RoleFlagsType = HexBinary16 (xsd)
+	ServiceCategoryKind uint8       `xml:"serviceCategoryKind,omitempty"`
+	Status              uint8       `xml:"status,omitempty"`
+	DeviceLFDI          string      `xml:"deviceLFDI,omitempty"`
+	PostRate            uint32      `xml:"postRate,omitempty"`
 }
 
 // MirrorUsagePointList is a collection of MirrorUsagePoint resources.
@@ -536,10 +649,10 @@ type Reading struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns Reading"`
 
 	// LocalID disambiguates multiple readings in one set.
-	LocalID      uint16            `xml:"localID,omitempty"`
+	LocalID      HexBinary16       `xml:"localID,omitempty"`
 	TimePeriod   *DateTimeInterval `xml:"timePeriod,omitempty"`
 	Value        int64             `xml:"value,omitempty"`
-	QualityFlags uint16            `xml:"qualityFlags,omitempty"`
+	QualityFlags HexBinary16       `xml:"qualityFlags,omitempty"`
 }
 
 // MirrorReadingSet is a timestamped batch of readings for one reporting interval.

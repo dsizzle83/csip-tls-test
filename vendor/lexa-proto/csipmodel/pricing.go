@@ -10,9 +10,9 @@ import "encoding/xml"
 // multiplier. Used for flow rate limits in RateComponent and for energy/power
 // values in FlowReservation. Unit is an IEC 61968-9 UOM code (e.g. 38=W, 72=Wh).
 type UnitValue struct {
-	Multiplier int8   `xml:"multiplier"`
-	Unit       uint8  `xml:"unit,omitempty"`
-	Value      int64  `xml:"value"`
+	Multiplier int8  `xml:"multiplier"`
+	Unit       uint8 `xml:"unit,omitempty"`
+	Value      int64 `xml:"value"`
 }
 
 // TariffProfile is the root resource of the Pricing function set.
@@ -21,21 +21,21 @@ type TariffProfile struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns TariffProfile"`
 	Resource
 
-	Subscribable              uint8     `xml:"subscribable,attr,omitempty"`
-	MRID                      string    `xml:"mRID,omitempty"`
-	Description               string    `xml:"description,omitempty"`
-	Currency                  uint16    `xml:"currency,omitempty"` // ISO 4217 numeric code
-	PricePowerOfTenMultiplier int8      `xml:"pricePowerOfTenMultiplier,omitempty"`
-	Primacy                   uint8     `xml:"primacy"`
-	RateCode                  string    `xml:"rateCode,omitempty"`
-	ServiceCategoryKind       uint8     `xml:"serviceCategoryKind,omitempty"` // 0=electricity
+	Subscribable              uint8  `xml:"subscribable,attr,omitempty"`
+	MRID                      string `xml:"mRID,omitempty"`
+	Description               string `xml:"description,omitempty"`
+	Currency                  uint16 `xml:"currency,omitempty"` // ISO 4217 numeric code
+	PricePowerOfTenMultiplier int8   `xml:"pricePowerOfTenMultiplier,omitempty"`
+	Primacy                   uint8  `xml:"primacy"`
+	RateCode                  string `xml:"rateCode,omitempty"`
+	ServiceCategoryKind       uint8  `xml:"serviceCategoryKind,omitempty"` // 0=electricity
 
 	RateComponentListLink *ListLink `xml:"RateComponentListLink,omitempty"`
 }
 
 // TariffProfileList is a collection of TariffProfile resources.
 type TariffProfileList struct {
-	XMLName       xml.Name        `xml:"urn:ieee:std:2030.5:ns TariffProfileList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns TariffProfileList"`
 	Resource
 
 	All           uint32          `xml:"all,attr"`
@@ -60,7 +60,7 @@ type RateComponent struct {
 
 	ReadingTypeLink *Link `xml:"ReadingTypeLink,omitempty"`
 	// RoleFlags bit field: bit 2 = isPrimary (forward), bit 3 = isReverse
-	RoleFlags uint16 `xml:"roleFlags,omitempty"`
+	RoleFlags HexBinary16 `xml:"roleFlags,omitempty"`
 
 	TimeTariffIntervalListLink       *ListLink `xml:"TimeTariffIntervalListLink,omitempty"`
 	ActiveTimeTariffIntervalListLink *ListLink `xml:"ActiveTimeTariffIntervalListLink,omitempty"`
@@ -68,7 +68,7 @@ type RateComponent struct {
 
 // RateComponentList is a collection of RateComponent resources.
 type RateComponentList struct {
-	XMLName       xml.Name        `xml:"urn:ieee:std:2030.5:ns RateComponentList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns RateComponentList"`
 	Resource
 
 	All           uint32          `xml:"all,attr"`
@@ -83,14 +83,14 @@ type TimeTariffInterval struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns TimeTariffInterval"`
 	Resource
 
-	Subscribable     uint8        `xml:"subscribable,attr,omitempty"`
-	MRID             string       `xml:"mRID,omitempty"`
-	Description      string       `xml:"description,omitempty"`
-	CreationTime     int64        `xml:"creationTime,omitempty"`
-	EventStatus      *EventStatus `xml:"EventStatus,omitempty"`
-	Interval         DateTimeInterval `xml:"interval"`
-	RandomizeDuration *int32      `xml:"randomizeDuration,omitempty"`
-	RandomizeStart   *int32       `xml:"randomizeStart,omitempty"`
+	Subscribable      uint8            `xml:"subscribable,attr,omitempty"`
+	MRID              string           `xml:"mRID,omitempty"`
+	Description       string           `xml:"description,omitempty"`
+	CreationTime      int64            `xml:"creationTime,omitempty"`
+	EventStatus       *EventStatus     `xml:"EventStatus,omitempty"`
+	Interval          DateTimeInterval `xml:"interval"`
+	RandomizeDuration *int32           `xml:"randomizeDuration,omitempty"`
+	RandomizeStart    *int32           `xml:"randomizeStart,omitempty"`
 	// TouTier identifies which pricing tier this interval belongs to.
 	// Higher values = higher price (mandatory per §10.5.3.8).
 	TouTier uint8 `xml:"touTier"`
@@ -100,7 +100,7 @@ type TimeTariffInterval struct {
 
 // TimeTariffIntervalList is a collection of TimeTariffInterval resources.
 type TimeTariffIntervalList struct {
-	XMLName            xml.Name             `xml:"urn:ieee:std:2030.5:ns TimeTariffIntervalList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns TimeTariffIntervalList"`
 	Resource
 
 	All                uint32               `xml:"all,attr"`
@@ -128,7 +128,7 @@ type ConsumptionTariffInterval struct {
 
 // ConsumptionTariffIntervalList is a collection of ConsumptionTariffInterval resources.
 type ConsumptionTariffIntervalList struct {
-	XMLName                   xml.Name                    `xml:"urn:ieee:std:2030.5:ns ConsumptionTariffIntervalList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns ConsumptionTariffIntervalList"`
 	Resource
 
 	All                       uint32                      `xml:"all,attr"`
@@ -152,7 +152,7 @@ type PriceResponseCfg struct {
 
 // PriceResponseCfgList is a collection of PriceResponseCfg resources.
 type PriceResponseCfgList struct {
-	XMLName          xml.Name           `xml:"urn:ieee:std:2030.5:ns PriceResponseCfgList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns PriceResponseCfgList"`
 	Resource
 
 	All              uint32             `xml:"all,attr"`
