@@ -264,6 +264,42 @@ type CurveView struct {
 	// Params carries a Pointless model's parameters (711's deadbands, gains and
 	// response time), rendered, since there is no point table to carry them.
 	Params string
+
+	// Droop is the SAME parameters as numbers, in the device's own engineering
+	// units, for a caller that has to COMPARE them rather than print them.
+	//
+	// It exists because Params alone made 711 unassertable: a referee holding a
+	// commanded dead band of 0.03 Hz and a rendered string "DbOf=0.036 Hz ..."
+	// can only match by parsing its own prose back, which is not a measurement.
+	// A Pointless model is not an unmeasurable one — it is one whose content is
+	// parametric — and the distinction is what lets a frequency-droop control be
+	// graded on a 7xx DER at all.
+	//
+	// nil for every model that is not 711, and for a 711 whose control block did
+	// not decode. Never a zero-valued struct standing in for an unread device:
+	// zeros here are a real machine (no dead band, no gain), which is exactly
+	// the confusion the corrected csipmodel decode exists to prevent.
+	Droop *DroopReading
+}
+
+// DroopReading is model 711's parametric frequency-droop control as the
+// device's own registers report it, in the units the SunSpec model declares —
+// NOT the thousandths/hundredths IEEE 2030.5 sends. The translation between the
+// two belongs to whoever compares them, and doing it here would bury it.
+//
+//	DbOfHz, DbUfHz   dead bands, over/under, in Hz          (711 DbOf/DbUf ×Db_SF)
+//	KOf, KUf         droop gains, over/under, unitless      (711 KOf/KUf ×K_SF)
+//	RspTmsS          open-loop response time, in seconds    (711 RspTms ×RspTms_SF)
+//	PMin             the control's minimum power register, carried because a
+//	                 writer performs a read-modify-write on it and a referee that
+//	                 could not see it could not tell a preserved PMin from a
+//	                 zeroed one — and 0 tells the device it may curtail to zero,
+//	                 which is a different machine.
+type DroopReading struct {
+	DbOfHz, DbUfHz float64
+	KOf, KUf       float64
+	RspTmsS        float64
+	PMin           float64
 }
 
 // Pointless reports whether this axis carries no breakpoint table, so a caller
@@ -551,6 +587,13 @@ func DecodeCurveAt(source string, model uint16, regs []uint16, idx int) CurveVie
 		v.Params = fmt.Sprintf("DbOf=%s Hz DbUf=%s Hz KOf=%s KUf=%s RspTms=%s s PMin=%s",
 			trimFloat(c.DbOf), trimFloat(c.DbUf), trimFloat(c.KOf), trimFloat(c.KUf),
 			trimFloat(c.RspTms), trimFloat(c.PMin))
+		// The same numbers, unrendered, for a caller that must compare rather
+		// than print. Set from the SAME parse as Params so the two can never
+		// describe different registers.
+		v.Droop = &DroopReading{
+			DbOfHz: c.DbOf, DbUfHz: c.DbUf, KOf: c.KOf, KUf: c.KUf,
+			RspTmsS: c.RspTms, PMin: c.PMin,
+		}
 	}
 	v.Present = true
 	return v
