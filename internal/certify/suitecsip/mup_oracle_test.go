@@ -368,6 +368,24 @@ func TestMUPOracle_SiteFactsAreDisclosedNotInvented(t *testing.T) {
 	if !strings.Contains(f.Observed, "isPEV") || !strings.Contains(f.Observed, "own declaration disagree") {
 		t.Errorf("a declared-but-absent role was not reported: %s", f.Observed)
 	}
+
+	// ONE BYTE, ONE DEFECT. A PICS that declares a bit whose own class check has
+	// already failed must not be reported a second time: isMirror clear on a
+	// MirrorUsagePoint is one finding with one fix, and a duplicate would
+	// inflate the NON-CONFORMANT count a bundle reader judges severity by.
+	//
+	// 0x0048 = isDER | isSubmeter, isMirror CLEAR, declared in the PICS.
+	noMirror := synthTranscript(derCapPUT(), mupPOST(mupXML(
+		`<roleFlags>0048</roleFlags><serviceCategoryKind>0</serviceCategoryKind><status>1</status>`)))
+	f = wantMUPVerdict(t, "isMirror clear AND declared", noMirror, "isMirror,isDER,isSubmeter",
+		certify.Fail)
+	if !strings.Contains(f.Observed, "NON-CONFORMANT in 1 place(s)") {
+		t.Errorf("isMirror clear while the PICS declares it was reported more than once; it is one "+
+			"byte and one fix:\n%s", f.Observed)
+	}
+	if strings.Contains(f.Observed, "own declaration disagree") {
+		t.Errorf("the PICS pass re-reported a bit its own class check had already failed:\n%s", f.Observed)
+	}
 }
 
 // TestMUPOracle_ServerTierGradesTheStoredRegistration pins the tier that

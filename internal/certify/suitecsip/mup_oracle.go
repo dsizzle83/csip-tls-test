@@ -320,12 +320,21 @@ func gradeMUP(e mupEvidence) Finding {
 
 	set := func(pos uint) bool { return mask&(1<<pos) != 0 }
 
+	// reported records the bits whose OWN class check has already produced a
+	// finding, so the PICS pass at the end does not say the same thing twice.
+	// A bit like isMirror, declared in a PICS and clear on the wire, is one
+	// defect: the device did not set a bit its own resource type requires. Two
+	// findings about one byte read as two defects and inflate a count a reader
+	// uses to judge severity.
+	reported := map[uint]bool{}
+
 	for _, b := range roleFlagBits {
 		switch b.Class {
 		case roleFlagResource:
 			// isMirror. The only bit whose SHALL the resource's own identity
 			// settles, and the one this product gets wrong.
 			if !set(b.Bit) {
+				reported[b.Bit] = true
 				problems = append(problems, fmt.Sprintf(
 					"bit %d %s is CLEAR. IEEE Std 2030.5-2018 p.169: \"%s\" — and this is a "+
 						"MirrorUsagePoint, whose whole definition (p.215: \"A parallel to UsagePoint to "+
@@ -346,6 +355,7 @@ func gradeMUP(e mupEvidence) Finding {
 			}
 			switch {
 			case set(b.Bit) && set(partner.Bit):
+				reported[b.Bit], reported[partner.Bit] = true, true
 				problems = append(problems, fmt.Sprintf(
 					"bits %d %s and %d %s are BOTH set, and their conditions are complementary: "+
 						"\"%s\" against \"%s\". A usage point cannot both be a premises point of "+
@@ -353,6 +363,7 @@ func gradeMUP(e mupEvidence) Finding {
 						"reconciles this; it is incoherent on the standard's text alone",
 					b.Bit, b.Name, partner.Bit, partner.Name, b.SHALL, partner.SHALL))
 			case !set(b.Bit) && !set(partner.Bit):
+				reported[b.Bit], reported[partner.Bit] = true, true
 				problems = append(problems, fmt.Sprintf(
 					"bits %d %s and %d %s are BOTH clear, and between them the two conditions are "+
 						"exhaustive: \"%s\" against \"%s\". Every usage point either is a premises "+
@@ -379,6 +390,7 @@ func gradeMUP(e mupEvidence) Finding {
 				// Claiming it is never a failure: a DER client claiming to be a
 				// DER client is the ordinary case.
 			case e.DERClient != "":
+				reported[b.Bit] = true
 				problems = append(problems, fmt.Sprintf(
 					"bit %d %s is CLEAR. IEEE Std 2030.5-2018 p.169: \"%s\" — and this campaign has the "+
 						"premise in hand: %s. A head end that filters usage points by isDER will not "+
@@ -427,9 +439,15 @@ func gradeMUP(e mupEvidence) Finding {
 	}
 
 	// The PICS's other direction: a declared role the resource does not carry.
+	//
+	// Bits whose own class check already failed are SKIPPED. A PICS that
+	// declares isMirror on a device that leaves it clear adds nothing to
+	// "isMirror is CLEAR and this is a MirrorUsagePoint" — it is the same byte,
+	// the same fix, and one defect. Reporting it twice would inflate the
+	// NON-CONFORMANT count a bundle reader uses to judge how bad a row is.
 	for _, p := range e.PICS {
 		b, ok := roleFlagNamed(p)
-		if !ok || set(b.Bit) {
+		if !ok || set(b.Bit) || reported[b.Bit] {
 			continue
 		}
 		problems = append(problems, fmt.Sprintf(
