@@ -2335,6 +2335,25 @@ func TestAutonomousVRef_EnabledIsExecutedNotRefused(t *testing.T) {
 		if !strings.Contains(got.Observed, "not armed") {
 			t.Errorf("the PASS does not say the automation is unarmed in words:\n%s", got.Observed)
 		}
+		// THE DISCLOSURE MUST MOVE WITH THE CHECK. This element was disclosed
+		// as having no southbound assertion while nothing read Crv.VRefAutoEna;
+		// the register is read now and the read is load-bearing, so a verdict
+		// still carrying "this referee asserts nothing about it southbound"
+		// would contradict itself in one sentence — a check added without its
+		// disclosure being moved, which is the failure mode the authored /
+		// unmappable split exists to prevent.
+		unmappable := unmappableClause(got.Observed)
+		if strings.Contains(unmappable, "autonomousVRefEnable = true") {
+			t.Errorf("the verdict discloses autonomousVRefEnable as NOT device-mappable while asserting "+
+				"exactly that register. The unmappable clause reads:\n  %s", unmappable)
+		}
+		// Its partner IS still unassertable — nothing reads VRefAutoTms — and
+		// that asymmetry is the point: one of the pair gained a check and the
+		// other did not.
+		if !strings.Contains(unmappable, "autonomousVRefTimeConstant") {
+			t.Errorf("autonomousVRefTimeConstant is no longer disclosed as unassertable, but nothing "+
+				"reads VRefAutoTms:\n%s", got.Observed)
+		}
 		t.Logf("autonomous-vRef GREEN (executed without the adjustment), verbatim:\n  %s", got.Observed)
 	})
 

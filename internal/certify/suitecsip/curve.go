@@ -610,12 +610,38 @@ func (b *curveBinding) authored() []authoredElement {
 		})
 	}
 	if b.AutonomousVRefEnable != nil {
-		out = append(out, authoredElement{
+		el := authoredElement{
 			Element:   "DERCurve.autonomousVRefEnable",
 			Value:     fmt.Sprintf("%t", *b.AutonomousVRefEnable),
 			Why7xx:    noAutonomousVRefRegister,
 			WhyLegacy: noAutonomousVRefRegister,
-		})
+		}
+		// AN ENABLE OF TRUE *IS* ASSERTED SOUTHBOUND ON 705, and saying
+		// otherwise was a verdict contradicting itself.
+		//
+		// This element used to be disclosed as having no register home on either
+		// generation, which was true while nothing read Crv.VRefAutoEna. It is
+		// read now, and IEEE Std 2030.5-2018 p.252's execute-without clause makes
+		// the reading load-bearing: the device must come back NOT armed. So the
+		// verdict was carrying "this referee asserts nothing about it southbound"
+		// in the same sentence as the assertion — the exact class of false
+		// disclosure this suite's authored/unmappable split exists to prevent,
+		// arriving because a check was added and its disclosure was not moved
+		// with it.
+		//
+		// WHAT IS ASSERTED IS A NEGATIVE, and the home says so: the register must
+		// be CLEAR. An enable of FALSE keeps the old disclosure, because there is
+		// then nothing the standard requires of the register in either direction
+		// and a device that happens to be armed is running its own configuration.
+		if *b.AutonomousVRefEnable {
+			el.Home7xx = "model 705's Crv.VRefAutoEna, asserted to be CLEAR — 2018 p.252 requires a DER " +
+				"unable to support the adjustment to execute the curve WITHOUT it, so the conformant " +
+				"reading of this register is the unset one"
+			el.WhyLegacy = "the legacy 12x banks declare no autonomous volt-reference automation at all, " +
+				"so on that generation this element is served northbound and nothing southbound can " +
+				"show what became of it"
+		}
+		out = append(out, el)
 	}
 	if b.AutonomousVRefTimeConstant != nil {
 		out = append(out, authoredElement{
