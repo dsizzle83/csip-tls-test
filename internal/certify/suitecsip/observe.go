@@ -1341,12 +1341,40 @@ type ControlRequest struct {
 //
 // THE POWER FACTOR IS displacement x 10^multiplier, so CSIP CTP v1.3's Figure 8
 // Test Values — displacement 900, excitation false, multiplier -3 — are a
-// displacement power factor of 0.900, under-excited.
+// displacement power factor of 0.900, OVER-excited.
+//
+// THE EXCITATION POLARITY IS NOT THE INTUITIVE ONE. IEEE Std 2030.5-2018 p.258,
+// verbatim: "True when DER is absorbing reactive power (under-excited), false
+// when DER is injecting reactive power (over-excited)." So TRUE = absorbing =
+// UNDER-excited. "Excitation on" sounds like more field and therefore
+// over-excited, and it is the other way round — which is how this tree came to
+// state the polarity in four places and get it wrong in all four (IW15-030
+// finding 2).
+//
+// AND IT IS INDEPENDENT OF Inject/Absorb IN THE ELEMENT NAME. opModFixedPF
+// InjectW / AbsorbW select which ACTIVE-power direction the setpoint applies
+// in; excitation is the REACTIVE direction. Two similar words, two quantities,
+// one element — so {InjectW, excitation false} is "while injecting active
+// power, inject reactive power too", which is a perfectly ordinary command and
+// exactly what Figure 8 prescribes.
 type FixedPFSettings struct {
 	Displacement int64 `json:"displacement"` // UInt16, the magnitude, scaled by Multiplier
-	Excitation   bool  `json:"excitation"`   // true = over-excited
-	Multiplier   int64 `json:"multiplier"`   // PowerOfTenMultiplierType
+	// Excitation: TRUE = absorbing reactive = UNDER-excited; FALSE = injecting
+	// reactive = OVER-excited (2018 p.258). See the type doc.
+	Excitation bool  `json:"excitation"`
+	Multiplier int64 `json:"multiplier"` // PowerOfTenMultiplierType
 }
+
+// OverExcited is the excitation flag in the vocabulary the SunSpec side uses,
+// with the negation done ONCE and here.
+//
+// IEEE 2030.5's `excitation` and SunSpec's M704_Ext_OverExcited/UnderExcited
+// are opposite polarities of the same fact, and every place that converts
+// between them by hand is a place the sign can be dropped. lexa-gw's publish.go
+// converted with `OverExcited: pf.Excitation` — no negation — which is the
+// inversion IW15-030 finding 1 is about, and it survived because nothing on
+// either side of the wire asserted the resulting register.
+func (s FixedPFSettings) OverExcited() bool { return !s.Excitation }
 
 // PF is the displacement power factor these three children compute to, so a row
 // and an oracle can state the number a reader recognises without either of them
@@ -1369,7 +1397,9 @@ func (s FixedPFSettings) PF() float64 {
 //	opModFixedPFInjectW.excitation     Default false Test Values false
 //	opModFixedPFInjectW.multiplier     Default -3    Test Values -3
 //
-// which is a displacement power factor of 0.900, UNDER-excited.
+// which is a displacement power factor of 0.900, OVER-excited — excitation
+// FALSE is the injecting, over-excited direction (2018 p.258), not the
+// under-excited one this comment claimed until IW15-030.
 //
 // IT REPLACED `ptr(int64(95))`, and that was two defects in one literal. The
 // field was a bare magnitude because csipmodel typed the element *SignedPerCent

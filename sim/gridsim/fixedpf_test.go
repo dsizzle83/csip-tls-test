@@ -20,7 +20,8 @@ import (
 // what goes on the wire is IEEE Std 2030.5-2018 p.258's element.
 func TestFixedPF_ServesTheThreeChildrenInTheStandardsShape(t *testing.T) {
 	s := NewServer("")
-	// Figure 8's Test Values: 0.900 under-excited.
+	// Figure 8's Test Values: 0.900 OVER-excited (excitation FALSE — 2018 p.258:
+	// "false when DER is injecting reactive power (over-excited)").
 	if rec := postAdmin(t, s, "/admin/control", `{
 		"program": 0, "duration_s": 300, "activate": true,
 		"fixed_pf_inject": {"displacement": 900, "excitation": false, "multiplier": -3}
@@ -94,7 +95,7 @@ func TestFixedPF_StatusRendersTheChildrenAndThePowerFactor(t *testing.T) {
 			"rather than math.Pow precisely so this is not 0.9000000000000001", inj.PF)
 	}
 	// The two axes are DIFFERENT commands and must not be conflated: absorb is
-	// over-excited where inject is under-excited, which is the direction of
+	// under-excited where inject is over-excited, which is the direction of
 	// reactive power and the thing the retired scalar could not carry at all.
 	if !abs.Excitation || abs.Displacement != 950 {
 		t.Errorf("absorb children = %+v, want {950 true -3}", *abs)

@@ -1473,8 +1473,13 @@ func firstEventMRID(tree *discovery.ResourceTree) string {
 func checkBASIC024(r *Reporter, fetcher *tlsclient.WolfSSLFetcher) {
 	r.section("BASIC-024", "MirrorUsagePoint Registration")
 	r.spec("MUP.001-003", "POST /mup → 201+Location; GET Location → 200 with the registered MUP")
-	// roleFlags 0x0049 = isMirror | isDER | isSubmeter (sep 2.0.4 RoleFlagsType,
-	// xsd:5826/5829/5832/5835). Corrected from the decimal 49 when lexa-proto
+	// roleFlags 0x0049 = isMirror | isDER | isSubmeter — IEEE Std 2030.5-2018
+	// p.169, RoleFlagsType, bits 0/3/6. (The citation here was the vendored
+	// pre-publication draft's, xsd:5826/5829/5832/5835, until IW15-030. The
+	// three documents AGREE bit for bit on this type — 2030.5-2023 p.179 too,
+	// NORMATIVE_ANCHOR.md §3.9 — so the VALUE was never in question; a
+	// certifier-facing string sourcing a conformance claim to a demoted draft
+	// is the defect.) Corrected from the decimal 49 when lexa-proto
 	// 72d91be made hexBinary elements emit hex: the old wire text "49" was read
 	// as 0x49 by every conformant peer, so 0x49 is the value this fixture has
 	// always meant — decimal 49 would be isMirror | isRevenueQuality | isDC, a

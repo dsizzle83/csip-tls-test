@@ -23,11 +23,22 @@ package suitecsip
 //	ever POSTed was missing a mandatory element, correctly set in Go and dropped
 //	on the way out. The defect is revision-INDEPENDENT — the draft schema and
 //	2018 agree all three are mandatory — so it is one the wrong anchor neither
-//	caused nor excused.
+//	caused nor excused. FIXED upstream by lexa-proto 13e9106.
 //
 //	roleFlags. 2018 p.169 gives RoleFlagsType seven bits, every one of them a
-//	SHALL, and this product sends 0x0002: isPremisesAggregationPoint alone, with
-//	isMirror CLEAR on a MIRROR usage point.
+//	SHALL, and this product SENT 0x0002: isPremisesAggregationPoint alone, with
+//	isMirror CLEAR on a MIRROR usage point. FIXED by lexa-gw 675ffdf, which
+//	sends 0x0049 (isMirror | isDER | isSubmeter).
+//
+// BOTH ARE PAST TENSE NOW, and the tense is not cosmetic. This paragraph is
+// provenance prose in a file whose whole subject is what a certifier may
+// conclude about the DUT, and while it read "this product sends 0x0002" it was
+// telling a reader that the device under test violates an unconditional SHALL —
+// after the product had stopped. The ORACLE was correct throughout (it grades
+// the resource in front of it, and green-proofs 0x0049); only the narration had
+// gone stale, which is the more dangerous of the two failures because nothing
+// executes it. See TestMUPOracle_TheThreeGenerationsOfThisRegistration for the
+// state each of these sentences is now a record OF.
 //
 // # What this oracle will and will not decide
 //

@@ -9,10 +9,25 @@ package gridsim
 // PowerFactorWithExcitation with THREE MANDATORY children:
 //
 //	displacement (UInt16 [1])                   the PF magnitude, scaled
-//	excitation   (boolean [1])                  true = over-excited
+//	excitation   (boolean [1])                  see the polarity note below
 //	multiplier   (PowerOfTenMultiplierType [1]) apply 10^multiplier
 //
-// so a fixed power factor of 0.900 under-excited is
+// THE EXCITATION POLARITY, VERBATIM, because this file previously stated it
+// BOTH WAYS AND BOTH WRONG. IEEE Std 2030.5-2018 p.258, and identically at the
+// CurveData and PowerFactor sites (p.253, p.257):
+//
+//	"excitation attribute (boolean) — True when DER is absorbing reactive power
+//	 (under-excited), false when DER is injecting reactive power
+//	 (over-excited)."
+//
+// So TRUE = absorbing = UNDER-excited, FALSE = injecting = OVER-excited. It is
+// worth writing out because the intuition runs the other way — "excitation on"
+// sounds like more field, hence over-excited — and because the element sits on
+// opModFixedPF*InjectW*/*AbsorbW*, whose Inject/Absorb refers to ACTIVE power
+// and is independent of this flag's reactive direction. Two similar words,
+// two different quantities, on one element.
+//
+// So a fixed power factor of 0.900 OVER-excited (injecting reactive power) is
 // {displacement 900, excitation false, multiplier -3} — which is exactly what
 // CSIP CTP v1.3's Figure 8 (Fixed Power Factor Settings) prescribes for
 // BASIC-008, child by child, and has prescribed all along.
@@ -67,8 +82,12 @@ import (
 // and name neither the element nor its type.
 type fixedPFReq struct {
 	Displacement *int64 `json:"displacement"` // UInt16, the PF magnitude scaled by multiplier
-	Excitation   *bool  `json:"excitation"`   // true = over-excited
-	Multiplier   *int64 `json:"multiplier"`   // PowerOfTenMultiplierType, int8
+	// Excitation: TRUE = absorbing reactive power = UNDER-excited; FALSE =
+	// injecting reactive power = OVER-excited (2018 p.258, quoted in the file
+	// doc). Not the intuitive polarity, which is why it is spelled out here as
+	// well as there.
+	Excitation *bool  `json:"excitation"`
+	Multiplier *int64 `json:"multiplier"` // PowerOfTenMultiplierType, int8
 }
 
 // toModel validates the request and renders it into the csipmodel element, or
@@ -101,7 +120,8 @@ func (r *fixedPFReq) toModel(element string) (*model.PowerFactorWithExcitation, 
 		return nil, fmt.Errorf("%s is missing %v: all three children of PowerFactorWithExcitation are "+
 			"[1] (IEEE Std 2030.5-2018 p.258), and this server will not complete the element with "+
 			"zeros — displacement 0 is a power factor of ZERO, not an absent command, and excitation "+
-			"false is the assertion that the DER is under-excited, not the absence of an assertion",
+			"false is the assertion that the DER is OVER-excited (injecting reactive power, 2018 "+
+			"p.258), not the absence of an assertion",
 			element, missing)
 	}
 	if *r.Displacement < 0 || *r.Displacement > 65535 {
@@ -134,7 +154,7 @@ func (r *fixedPFReq) toModel(element string) (*model.PowerFactorWithExcitation, 
 			"displacement %d x 10^%d must land in (0,1] (IEEE Std 2030.5-2018 p.258 — the actual "+
 			"displacement SHALL be within the limits established by setMinPFOverExcited and "+
 			"setMinPFUnderExcited, and a magnitude outside (0,1] is not a power factor under any "+
-			"limits). 0.900 under-excited, which is what CSIP CTP v1.3's Figure 8 prescribes, is "+
+			"limits). 0.900 OVER-excited, which is what CSIP CTP v1.3's Figure 8 prescribes, is "+
 			"{displacement 900, excitation false, multiplier -3}",
 			element, v, *r.Displacement, *r.Multiplier)
 	}
@@ -182,7 +202,8 @@ func fixedPFScalarGone(oldField, element string) error {
 		"them — excitation has no representation in a number at all, and the multiplier the old field "+
 		"implied (-4, hundredths of a percent) is not the one any Figure prescribes (-3). Send "+
 		"%q: {\"displacement\": 900, \"excitation\": false, \"multiplier\": -3} for the 0.900 "+
-		"under-excited that CSIP CTP v1.3's Figure 8 prints. This server will not guess: a guessed "+
+		"OVER-excited (excitation FALSE — 2018 p.258 makes false the injecting, over-excited "+
+		"direction) that CSIP CTP v1.3's Figure 8 prints. This server will not guess: a guessed "+
 		"excitation reverses the direction of reactive power inside evidence",
 		oldField, element, jsonFieldFor(element))
 }

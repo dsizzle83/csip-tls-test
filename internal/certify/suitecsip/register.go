@@ -299,8 +299,11 @@ const (
 		"set has no watt-PF model at all: model 712 is DER Watt-Var, whose y axis means a signed " +
 		"percentage of a var reference (its DeptRef names %VArMax or %VArAval) rather than a signed " +
 		"power-factor displacement under the EEI convention, so writing a PF curve into it commands a " +
-		"different function. sep 2.0.4 says the same thing from the other side: opModWattVar and " +
-		"opModWattPF are separate DERControlBase elements with separate DERCurveType codes (10 and 2). " +
+		"different function. IEEE Std 2030.5-2018 says the same thing from the other side: opModWattVar " +
+		"and opModWattPF are separate DERControlBase elements (p.251) with separate DERCurveType codes, " +
+		"14 and 13 (p.254). This sentence cited the pre-publication draft and its codes (10 and 2) until " +
+		"IW15-030; the argument was always right and its authority was the wrong document, which on a " +
+		"string that lands in certification bundles is a defect of its own. " +
 		"On a 7xx DER, therefore, the honest answer is cannot-comply at receipt — which is what this row " +
 		"measures THERE, instead of grading a PF curve against a var bank and calling the substitution a " +
 		"PASS. On a LEGACY 12x DER the same row is an EXECUTION row against model 131, because that DER " +

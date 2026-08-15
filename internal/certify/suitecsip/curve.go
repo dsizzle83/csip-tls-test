@@ -976,6 +976,24 @@ func (b *curveBinding) scaledX(x float64) float64 {
 	if b.VRef == nil || *b.VRef == 0 {
 		return x
 	}
+	// vRef IS opModVoltVar-ONLY, AND SO IS THIS SCALING. IEEE Std 2030.5-2018
+	// p.253: "If the curveType is opModVoltVar, then this field MAY be present.
+	// If the curveType is not opModVoltVar, then this field SHALL NOT be
+	// present." The product refuses a vRef on any other mode at receipt
+	// ('vref-on-non-voltvar'), and this bench refuses to AUTHOR one
+	// (sim/gridsim/curve.go's vrefFamily), so a non-volt-var row carrying a
+	// vRef is not reachable through any conformant path.
+	//
+	// The guard is here anyway because "not reachable" was doing load-bearing
+	// work with nothing enforcing it: a binding is a plain struct, a future row
+	// can set VRef on a freq-watt mode in one line, and the oracle would then
+	// have silently scaled its expectation for a control the DUT is required to
+	// REFUSE — a fabricated southbound expectation for a curve that never
+	// executes. Returning x unscaled makes the oracle's expectation match what a
+	// conformant DUT does with such a row, which is nothing.
+	if b.Mode != "volt_var" {
+		return x
+	}
 	scaled := x * float64(*b.VRef) / 10000
 	if scaled >= 0 {
 		return math.Floor(scaled + 0.5)
