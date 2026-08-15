@@ -127,12 +127,25 @@ type MalformedDeviceError struct {
 }
 
 func (e *MalformedDeviceError) Error() string {
-	msg := fmt.Sprintf("%s: malformed device: model %d declares %d registers, spec layout requires %d",
-		e.Tag, e.Model, e.Declared, e.Required)
-	if e.Detail != "" {
-		msg += " (" + e.Detail + ")"
+	// The length phrasing is used only when LENGTH is the defect, which is what
+	// a zero Required says. A device can declare a perfectly coherent block
+	// length and still be malformed — a legacy curve model selecting a bank it
+	// does not have, say — and printing "declares 118 registers, spec layout
+	// requires 118" for that says nothing while looking like it does. The
+	// caller decides which kind of defect it found; this only renders it.
+	if e.Required > 0 {
+		msg := fmt.Sprintf("%s: malformed device: model %d declares %d registers, spec layout requires %d",
+			e.Tag, e.Model, e.Declared, e.Required)
+		if e.Detail != "" {
+			msg += " (" + e.Detail + ")"
+		}
+		return msg
 	}
-	return msg
+	detail := e.Detail
+	if detail == "" {
+		detail = "the device's declared SunSpec surface is not self-consistent"
+	}
+	return fmt.Sprintf("%s: malformed device: model %d: %s", e.Tag, e.Model, detail)
 }
 func (e *MalformedDeviceError) Unwrap() error { return ErrMalformedDevice }
 

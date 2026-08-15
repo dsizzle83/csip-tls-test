@@ -194,8 +194,14 @@ type LegacyCurveOutcome struct {
 	// window in which the function was disabled. PICS-disclosable (§7.2).
 	CaseB bool
 	// NoOp is true when the device already held exactly this curve, live and
-	// enabled, and NOTHING was written. On legacy that is a safety property,
-	// not an optimisation: the alternative disables a live function.
+	// enabled, so no curve register was written. On legacy that is a safety
+	// property, not an optimisation: the alternative disables a live function
+	// to rewrite it with what it already has, and on a single-bank device that
+	// is a real interruption of grid support.
+	//
+	// A no-op pass may still refresh the device-side reversion timer, because a
+	// lease is a different instruction from a curve. Rvrt/RvrtTmsS report what
+	// happened to it.
 	NoOp bool
 	// PriorActCrv is the bank that was live before the command, recorded before
 	// any register moved. It is what a ride-through restore puts back, and what
@@ -225,6 +231,13 @@ type LegacyCurveOutcome struct {
 	// bounded but genuine loss of over-frequency curtailment and belongs on the
 	// retained report rather than inside a generic diverged.
 	Disabled bool
+	// PartialBank is true when a narrowed retry stopped part way and the bank
+	// therefore holds a mixture of the commanded curve and its previous
+	// contents. It is never LIVE in that state — Case A has not selected it and
+	// Case B has already disabled the function — but it is not what was
+	// commanded either, and a caller that read only the error would think
+	// nothing had moved.
+	PartialBank bool
 	// Warnings are disclosures that did not stop the write.
 	Warnings []string
 }
@@ -303,7 +316,12 @@ func (b *Base) WriteLegacyCurve(p LegacyCurvePlan, tag string) (LegacyCurveOutco
 		return out, err
 	}
 	if st.noOp {
+		// The curve is already installed and live. The lease is not: a
+		// commanded reversion timeout is a standing instruction about how long
+		// this curve may survive without the gateway, and refreshing it is the
+		// only write a no-op pass has any business making.
 		out.NoOp = true
+		b.armLegacyTimers(st, &out, tag)
 		return out, nil
 	}
 
@@ -374,6 +392,7 @@ func (b *Base) WriteLegacyRideThrough(p LegacyCurvePlan, tag string) (LegacyCurv
 	}
 	if st.noOp {
 		out.NoOp = true
+		b.armLegacyTimers(st, &out, tag)
 		return out, nil
 	}
 	if st.caseB {
@@ -564,7 +583,17 @@ func (b *Base) legacyPreflight(p LegacyCurvePlan, tag string, out *LegacyCurveOu
 	//
 	// So the question asked first is the only one that matters: does the curve
 	// the device is RUNNING already equal the one commanded?
-	if live := g.ActCrv; live >= 1 && live <= g.NCrv && p.RvrtTmsS == nil && p.RmpTmsS == nil {
+	//
+	// The guard deliberately does NOT require the timer fields to be absent.
+	// It used to, and that made it dead on the only path the product actually
+	// produces: the gateway resolves a reversion timeout for every advanced
+	// document — an absent validUntil becomes the default cap, never nil — so
+	// every real plan carries one, every real pass skipped the guard, and the
+	// bank ping-pong this guard exists to prevent came straight back. A
+	// commanded timer is a reason to REFRESH THE LEASE, not a reason to rewrite
+	// a curve the device is already running: the no-op path arms the timers and
+	// touches nothing else.
+	if live := g.ActCrv; live >= 1 && live <= g.NCrv {
 		liveBase, _ := g.BankOffset(live)
 		probe := append([]uint16(nil), regs...)
 		lw := b.wrefForBank(p, regs, hdr, bankL, liveBase)
@@ -572,6 +601,7 @@ func (b *Base) legacyPreflight(p LegacyCurvePlan, tag string, out *LegacyCurveOu
 			legacyRangeEqual(probe, regs, ls, le) && legacyModEnaSet(regs, hdr) {
 			st.bank, st.base, st.noOp = live, liveBase, true
 			st.start, st.end, st.want = ls, le, probe
+			st.deadline = newLegacyDeadline(b.legacyBudget())
 			out.Bank = live
 			return st, nil
 		}
@@ -603,8 +633,7 @@ func (b *Base) legacyPreflight(p LegacyCurvePlan, tag string, out *LegacyCurveOu
 	// because the alternative is disabling a live function to rewrite it with
 	// content it already has.
 	if legacyRangeEqual(st.want, regs, start, end) &&
-		g.ActCrv == bank && legacyModEnaSet(regs, hdr) &&
-		p.RvrtTmsS == nil && p.RmpTmsS == nil {
+		g.ActCrv == bank && legacyModEnaSet(regs, hdr) {
 		st.noOp = true
 	}
 	st.deadline = newLegacyDeadline(b.legacyBudget())
@@ -695,10 +724,13 @@ func (b *Base) wrefForBank(p LegacyCurvePlan, regs []uint16, hdr, bankL *sunspec
 // still running the curve it was running before the command and there is
 // nothing to fail closed about.
 func (b *Base) legacyCaseA(st legacyWriteState, out *LegacyCurveOutcome, tag string) (selected bool, err error) {
-	if err := b.writeAndVerifyBank(st, out, tag); err != nil {
-		// The idle bank did not take the curve. The live bank is untouched and
-		// still selected: full pre-command behaviour, nothing to undo.
-		return false, err
+	if live, err := b.writeAndVerifyBank(st, out, tag); err != nil {
+		// Ordinarily the idle bank simply did not take the curve: the live bank
+		// is untouched and still selected, so there is nothing to undo. But if
+		// the device selected the bank being written while the write was in
+		// flight, an unverified curve is live and the fail-closed arm is the
+		// only correct answer.
+		return live, err
 	}
 	// Timers are armed BEFORE the switch so the timeout is already loaded when
 	// the curve goes live.
@@ -721,10 +753,20 @@ func (b *Base) legacyCaseA(st legacyWriteState, out *LegacyCurveOutcome, tag str
 func (b *Base) legacyRideThroughCaseA(st legacyWriteState, out *LegacyCurveOutcome, tag string) error {
 	prior := st.geom.ActCrv
 
-	// Step 2 failure: the bank being written is IDLE, so the previously-live
-	// bank is untouched and still selected. Full pre-command protection; write
-	// nothing further.
-	if err := b.writeAndVerifyBank(st, out, tag); err != nil {
+	// Step 2 failure is ordinarily benign: the bank being written is IDLE, so
+	// the previously-live bank is untouched and still selected — full
+	// pre-command protection, write nothing further.
+	//
+	// UNLESS the device selected that bank mid-write, which this very check can
+	// discover and which makes the premise false: an unverified ride-through
+	// curve would then be the live trip boundary. That is §2.4.1's step-6
+	// situation arriving early, and it takes the same answer — restore the
+	// selection recorded at engage, never disable, escalate if the restore
+	// fails.
+	if live, err := b.writeAndVerifyBank(st, out, tag); err != nil {
+		if live {
+			return b.legacyRideThroughFailureArm(st, prior, err, tag)
+		}
 		return err
 	}
 	b.armLegacyTimers(st, out, tag)
@@ -801,7 +843,9 @@ func (b *Base) legacyCaseB(st legacyWriteState, out *LegacyCurveOutcome, tag str
 	if err := st.deadline.check(tag, model, "body"); err != nil {
 		return true, err
 	}
-	if err := b.writeAndVerifyBank(st, out, tag); err != nil {
+	if _, err := b.writeAndVerifyBank(st, out, tag); err != nil {
+		// Case B has already disabled the function, so every failure from here
+		// is fail-closed regardless of where the selection sits.
 		return true, err
 	}
 	b.armLegacyTimers(st, out, tag)
@@ -854,68 +898,132 @@ func (b *Base) legacyBudget() time.Duration {
 // registers differ (two raw words can round to the same engineering value), and
 // the zero-filled unused slots have no decoded representation at all. What was
 // commanded is a specific set of words; what must be verified is those words.
-func (b *Base) writeAndVerifyBank(st legacyWriteState, out *LegacyCurveOutcome, tag string) error {
+// The bool reports whether the bank just written HAS BECOME THE LIVE ONE
+// despite the failure — see the ActCrv re-check below. The caller needs it to
+// choose between "abort, nothing moved" and its model's failure arm.
+func (b *Base) writeAndVerifyBank(st legacyWriteState, out *LegacyCurveOutcome, tag string) (liveOnWrittenBank bool, err error) {
 	model := st.plan.ModelID
 	if err := b.Reader.WriteModel(model, uint16(st.start), st.want[st.start:st.end]); err != nil {
 		// A whole-block write covers every register in the bank, including
-		// optional points the command never named — CrvNam, the ramp rates.
-		// A vendor that implements one of those as read-only refuses the WHOLE
-		// transaction, and the axis fails entirely over a register nobody asked
-		// to change. So a refusal is not final until the narrow write has been
-		// tried: retry with only the registers whose values actually differ,
-		// which is a subset of what the plan named and excludes every register
-		// the command leaves alone.
+		// optional points the command never named — CrvNam, the ramp rates. A
+		// vendor that implements one of those as read-only refuses the WHOLE
+		// transaction, and the axis then fails entirely over a register nobody
+		// asked to change. So a refusal is not final until the narrow write has
+		// been tried: retry with only the registers whose values actually
+		// differ, which is a subset of what the plan named and excludes every
+		// register the command leaves alone.
+		//
+		// THE COST, STATED PLAINLY: the narrowed retry is a SEQUENCE of writes,
+		// so unlike the single whole-block transaction it can stop half way and
+		// leave the bank holding part of the new curve and part of the old one
+		// — a curve nobody authored, of exactly the kind bankWriter's zero-fill
+		// exists to prevent.
+		//
+		// It is kept anyway, because the invariant that matters is not "the
+		// bank is never mixed" but NO PARTIALLY-AUTHORED CURVE MAY EVER BECOME
+		// LIVE, and that one is held structurally on both paths:
+		//
+		//	Case A  the bank is IDLE. ActCrv is written only after the
+		//	        whole-range comparison below passes, which a mixed bank
+		//	        cannot pass, so the mixed bank is never selected. The one
+		//	        way it could go live anyway — the device selecting it
+		//	        mid-write — is the race the ActCrv re-check now catches and
+		//	        routes to the model's failure arm.
+		//	Case B  the bank is the live one, but ModEna was cleared and
+		//	        verified clear before this write began, and every failure
+		//	        from that point ends fail-closed. A mixed bank sits behind a
+		//	        disabled function.
+		//
+		// What the alternative (revert to whole-block only) would buy is one
+		// less state to reason about; what it would cost is every device whose
+		// vendor made one optional point read-only losing the axis completely.
+		// That is a worse trade against a hazard the arms already bound. The
+		// obligation this leaves is HONESTY: the outcome must say registers
+		// moved and the bank is mixed, rather than reporting a refusal that
+		// sounds like nothing happened.
 		runs := legacyChangedRuns(st.want, st.regs, st.start, st.end)
 		if len(runs) == 0 {
-			return fmt.Errorf("%s: write M%d bank %d: %w", tag, model, st.bank, err)
+			return false, fmt.Errorf("%s: write M%d bank %d: %w", tag, model, st.bank, err)
 		}
-		for _, r := range runs {
+		out.warn("whole-block write refused (%v); narrowing to %d changed register run(s) — the "+
+			"device implements some optional bank point as read-only", err, len(runs))
+		for i, r := range runs {
 			if rerr := b.Reader.WriteModel(model, uint16(r[0]), st.want[r[0]:r[1]]); rerr != nil {
-				return fmt.Errorf("%s: write M%d bank %d: whole-block write refused (%v) and the "+
-					"narrowed retry was refused too at bank offset +%d: %w",
-					tag, model, st.bank, err, r[0]-st.base, rerr)
+				if i > 0 {
+					// Some runs landed and this one did not: the bank now holds
+					// part of the commanded curve and part of whatever it held
+					// before. Say so — the caller must not read this as "the
+					// write was refused, nothing moved".
+					out.PartialBank = true
+					out.warn("the narrowed retry stopped after %d of %d run(s): bank %d now holds a "+
+						"MIXTURE of the commanded curve and its previous contents. It is not "+
+						"selected (Case A) or not enabled (Case B), so it is not live — but it is "+
+						"not what was commanded either", i, len(runs), st.bank)
+				}
+				return false, fmt.Errorf("%s: write M%d bank %d: whole-block write refused (%v); "+
+					"the narrowed retry landed %d of %d run(s) and was then refused at bank offset "+
+					"+%d: %w", tag, model, st.bank, err, i, len(runs), r[0]-st.base, rerr)
 			}
 		}
-		out.warn("whole-block write refused (%v); wrote %d changed register run(s) instead — the "+
-			"device implements some optional bank point as read-only", err, len(runs))
 	}
 	back, err := b.Reader.ReadModel(model)
 	if err != nil {
-		return fmt.Errorf("%s: verify M%d bank %d: %w", tag, model, st.bank, err)
+		return false, fmt.Errorf("%s: verify M%d bank %d: %w", tag, model, st.bank, err)
 	}
 	if len(back) < st.end {
-		return &VerifyError{Tag: tag, Model: model, Point: "curve",
+		return false, &VerifyError{Tag: tag, Model: model, Point: "curve",
 			Detail: fmt.Sprintf("device now declares %d registers, short of the bank's %d", len(back), st.end)}
 	}
-	// THE LIVE BANK IS RE-CHECKED HERE, not trusted from preflight.
+	// THE LIVE BANK IS RE-CHECKED HERE, not trusted from preflight — and the
+	// two ways it can have moved mean OPPOSITE things about what to do next.
 	//
 	// Which bank is live was decided from one read, and the device can move
-	// ActCrv on its own between that read and this one — most obviously when an
-	// armed RvrtTms expires, which is a timer THIS PACKAGE ARMS. If that
-	// happened, the bank just written is no longer idle: on a ride-through
-	// model the write landed on what had become the live trip boundary. The
-	// read-back that verifies the bank is already in hand, so checking ActCrv
-	// in the same buffer costs nothing and is the only place the race is
-	// visible.
+	// ActCrv on its own in between — most obviously when an armed RvrtTms
+	// expires, which is a timer THIS PACKAGE ARMS.
+	//
+	//	moved ELSEWHERE     the bank just written is still idle. Nothing this
+	//	                    write did is live, so the caller aborts with the
+	//	                    device untouched.
+	//	moved ONTO st.bank  the bank just written IS NOW LIVE, and its registers
+	//	                    have not been compared yet — the device selected a
+	//	                    bank while it was being written. That is precisely
+	//	                    the "a partially-written curve is the active curve"
+	//	                    state the whole Case-A sequence exists to prevent,
+	//	                    and detecting it is worth nothing unless the caller
+	//	                    ACTS: fail closed on a non-protective model, restore
+	//	                    the prior selection on a protective one.
+	//
+	// The second case is reported as live=true even if the content would have
+	// verified. The device ran an unknown fraction of this write as its active
+	// curve for an unknown interval; that the end state happens to be right
+	// does not make the selection ours, and a gateway that shrugs at "the
+	// device picked a bank mid-write" has no basis for reporting what is
+	// running.
 	if actOff := st.hdr.Offset("ActCrv"); actOff >= 0 && actOff < len(back) {
 		cur := int(back[actOff])
-		if cur != st.geom.ActCrv || (!st.caseB && cur == st.bank) {
-			return &VerifyError{Tag: tag, Model: model, Point: "ActCrv", Detail: fmt.Sprintf(
-				"the device moved its curve selection from %d to %d while bank %d was being written "+
-					"(an armed reversion timer does exactly this), so the write may have landed on "+
-					"the live curve", st.geom.ActCrv, cur, st.bank)}
+		switch {
+		case !st.caseB && cur == st.bank:
+			return true, &VerifyError{Tag: tag, Model: model, Point: "ActCrv", Detail: fmt.Sprintf(
+				"the device selected bank %d — the bank being written — while the write was in "+
+					"flight (an expiring reversion timer does exactly this), so an unverified "+
+					"curve is now the active one", st.bank)}
+		case cur != st.geom.ActCrv:
+			return false, &VerifyError{Tag: tag, Model: model, Point: "ActCrv", Detail: fmt.Sprintf(
+				"the device moved its curve selection from %d to %d while bank %d was being "+
+					"written; bank %d is still idle, so nothing this write did is live",
+				st.geom.ActCrv, cur, st.bank, st.bank)}
 		}
 	}
 	for i := st.start; i < st.end; i++ {
 		if back[i] == st.want[i] {
 			continue
 		}
-		return &VerifyError{Tag: tag, Model: model,
+		return false, &VerifyError{Tag: tag, Model: model,
 			Point: legacyPointAt(st.bankL, i-st.base),
 			Detail: fmt.Sprintf("bank %d offset +%d: wrote %#04x, device reads back %#04x",
 				st.bank, i-st.base, st.want[i], back[i])}
 	}
-	return nil
+	return false, nil
 }
 
 // armLegacyTimers writes RvrtTms/RmpTms if the caller commanded them, and
@@ -1211,11 +1319,22 @@ func legacyQuantum(v sunspec.View, l *sunspec.Layout, point string) float64 {
 }
 
 func legacyGeometryError(tag string, model uint16, g sunspec.LegacyCurveGeometry, cause error) error {
+	// Only fill in the length pair when the LENGTH is what is wrong. Several of
+	// the geometry gate's refusals — NCrv = 0, NPt out of range, ActCrv naming
+	// a bank the device does not have — happen on a device whose declared
+	// length is entirely coherent, and reporting "declares N, requires N" for
+	// those would bury the real incoherence behind a tautology.
 	required := 0
 	if _, _, blk, ok := sunspec.LegacyCurveLayouts(model); ok && g.NCrv > 0 {
-		required = 10 + blk*g.NCrv
+		if want := 10 + blk*g.NCrv; want != g.DeclLen {
+			required = want
+		}
 	}
-	return &MalformedDeviceError{Tag: tag, Model: model, Declared: g.DeclLen, Required: required,
+	declared := 0
+	if required > 0 {
+		declared = g.DeclLen
+	}
+	return &MalformedDeviceError{Tag: tag, Model: model, Declared: declared, Required: required,
 		Detail: cause.Error()}
 }
 
