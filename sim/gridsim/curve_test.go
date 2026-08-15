@@ -446,3 +446,91 @@ func TestAdminCurve_DeleteReplacesProgramZeroCurveContent(t *testing.T) {
 			"posted curve is still fetchable at an href nothing links", after.MRID)
 	}
 }
+
+// TestAdminCurve_ActivatingPostDropsTheCurvesItTruncated is the regression for
+// the leak that arrives through the PUBLISH path rather than the teardown.
+//
+// An activating POST truncates the program's list to one entry
+// (cl.DERCurve = nil, then append), so republishing 0..len-1 alone republishes
+// only /dc/0 — and every /dc/{i} above it that a previous POST minted stays in
+// the resource map, served, at an href the list no longer mentions. A DUT that
+// remembered the old link (or a walker that had already fetched the list) goes
+// on resolving a curve from a run that is over, which is precisely the
+// contamination DELETE /admin/curve exists to prevent, one entry point along.
+//
+// The check is that the old indices are GONE, not merely that /dc/0 is right:
+// the whole failure mode is invisible from the list.
+func TestAdminCurve_ActivatingPostDropsTheCurvesItTruncated(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	post := func(body string) map[string]string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/curve", bytes.NewReader([]byte(body))))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST /admin/curve = %d; body: %s", rec.Code, rec.Body)
+		}
+		var got map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode the POST response: %v", err)
+		}
+		return got
+	}
+	status := func(path string) int {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		return rec.Code
+	}
+
+	// Program 1 has no static fixture, so every curve at /derp/1/dc/{i} got
+	// there through this endpoint and nothing else can be blamed for it.
+	// APPEND three, so the list holds indices 0, 1 and 2.
+	var minted []map[string]string
+	for _, mode := range []string{"volt_var", "volt_watt", "watt_pf"} {
+		minted = append(minted, post(`{"program":1,"mode":"`+mode+
+			`","points":[{"x":1,"y":2}],"activate":false}`))
+	}
+	for i, m := range minted {
+		if got := status(m["curve_href"]); got != http.StatusOK {
+			t.Fatalf("GET %s (curve %d) = %d before the truncating POST; this test cannot show a drop "+
+				"that never had anything to drop", m["curve_href"], i, got)
+		}
+	}
+	if want := "/derp/1/dc/2"; minted[2]["curve_href"] != want {
+		t.Fatalf("the third append landed at %s, want %s", minted[2]["curve_href"], want)
+	}
+
+	// Now the truncating POST: activate=true replaces the list with ONE curve.
+	fresh := post(`{"program":1,"mode":"freq_watt","points":[{"x":5900,"y":100}],"activate":true}`)
+	if want := "/derp/1/dc/0"; fresh["curve_href"] != want {
+		t.Fatalf("the activating POST landed at %s, want %s", fresh["curve_href"], want)
+	}
+
+	// The list holds exactly the new curve...
+	var dc model.DERCurveList
+	getXML(t, s, "/derp/1/dc", &dc)
+	if len(dc.DERCurve) != 1 || dc.DERCurve[0].MRID != fresh["curve_mrid"] {
+		t.Fatalf("/derp/1/dc holds %d curve(s) (%+v), want only the activating POST's %s",
+			len(dc.DERCurve), dc.DERCurve, fresh["curve_mrid"])
+	}
+	// ...and the indices it truncated away are GONE from the resource map, not
+	// merely absent from the list.
+	for _, href := range []string{"/derp/1/dc/1", "/derp/1/dc/2"} {
+		if got := status(href); got != http.StatusNotFound {
+			t.Errorf("GET %s = %d after an activating POST truncated the list to one entry — a curve from "+
+				"a finished run is still being served at an href nothing links", href, got)
+		}
+	}
+	// Index 0 is republished with the NEW content, never left holding the old.
+	var live model.DERCurve
+	getXML(t, s, "/derp/1/dc/0", &live)
+	if live.MRID != fresh["curve_mrid"] {
+		t.Errorf("/derp/1/dc/0 serves %q, want the activating POST's %q", live.MRID, fresh["curve_mrid"])
+	}
+	if live.CurveType != model.CurveTypeFreqWatt {
+		t.Errorf("/derp/1/dc/0 serves curveType %d, want the freq_watt POST's %d",
+			live.CurveType, model.CurveTypeFreqWatt)
+	}
+}

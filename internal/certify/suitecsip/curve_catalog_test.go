@@ -278,7 +278,7 @@ func TestCurveRows_NameEveryPrescribedElementTheyCannotAuthor(t *testing.T) {
 				}
 			}
 			// And the criterion the gaps drive says the same thing.
-			f := critCurvePublishedTheProcedureValues("the subject", b).Wire(nil, nil)
+			f := critCurvePublishedTheProcedureValues("the subject", b).Construction()
 			wantVerdict := certify.Pass
 			if len(tc.wantMaterial) > 0 {
 				wantVerdict = certify.Fail
@@ -322,3 +322,72 @@ func TestCurveRows_MaterialGapsMatchTheCatalogsOwnColumns(t *testing.T) {
 // Figure prints, so this only strips a leading namespace when the catalog uses
 // the bare form).
 func lastSegment(element string) string { return element }
+
+// TestCurvePrescribedValuesCriterion_HoldsWithoutACapture is N4: a HOLD that
+// disappears when the pcap does is not a hold.
+//
+// criterion.assert reaches Wire only when a session was recovered and Server
+// only when the bench's admin API answered. The material-gap criterion is
+// neither: it asserts what the ROW IS BUILT TO SEND, which no capture could
+// confirm or refute. Carried on Wire it landed on a severity-0 SkipAssertion on
+// a captureless run — no false PASS, because nothing turned green, but the hold
+// silently vanished in exactly the runs (a lab with no key log, a re-scored
+// bundle) where a reader most needs to be told the row was not run to its
+// procedure.
+//
+// So the criterion is asserted through the WHOLE minting path, twice: with a
+// recovered session and with none. The verdict must be identical.
+func TestCurvePrescribedValuesCriterion_HoldsWithoutACapture(t *testing.T) {
+	for _, tc := range []struct {
+		id   string
+		want certify.Verdict
+	}{
+		// BASIC-006 holds: Figure 6 prescribes openLoopTms 5 against its own
+		// default of 10 and this bench cannot send it.
+		{"BASIC-006", certify.Fail},
+		// BASIC-011 prescribes nothing this bench cannot author.
+		{"BASIC-011", certify.Pass},
+		{"BASIC-012", certify.Fail},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			crit := critCurvePublishedTheProcedureValues("the subject", rowByID(t, tc.id).mode.Curve)
+
+			// A captureless, benchless observation: no transcript, no server.
+			// This is what a run with no key log leaves behind.
+			bare := &Observation{Case: &certify.Case{UID: "csip-conf-v1.3::" + tc.id, ID: tc.id}}
+			got := assertVerdictOf(t, crit, bare)
+			if got != tc.want {
+				t.Fatalf("%s's prescribed-values criterion on a CAPTURELESS run = %s, want %s — a "+
+					"construction claim must not be able to depend on an observation it never reads",
+					tc.id, got, tc.want)
+			}
+
+			// And with a session recovered, the same answer.
+			withSession := &Observation{
+				Case:       &certify.Case{UID: "csip-conf-v1.3::" + tc.id, ID: tc.id},
+				Transcript: &Transcript{Decrypted: true},
+			}
+			if got := assertVerdictOf(t, crit, withSession); got != tc.want {
+				t.Errorf("%s's prescribed-values criterion WITH a session = %s, want %s — the two paths "+
+					"must not disagree", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
+// assertVerdictOf mints one criterion through the real assert path and returns
+// the verdict it recorded, so a test exercises the tier selection rather than
+// the evaluator alone.
+func assertVerdictOf(t *testing.T, c criterion, obs *Observation) certify.Verdict {
+	t.Helper()
+	ev := &certify.Evidence{
+		Case:  &certify.Case{UID: "csip-conf-v1.3::construction"},
+		Index: certify.NewFrameIndex(nil),
+		Set:   (&certify.Attribution{}).Set("construction"),
+	}
+	a, err := c.assert(ev, obs)
+	if err != nil {
+		t.Fatalf("mint the criterion: %v", err)
+	}
+	return a.Verdict
+}

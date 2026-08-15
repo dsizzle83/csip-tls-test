@@ -82,6 +82,14 @@ const (
 	tierServer     tier = "gridsim server-side observation (admin API)"
 	tierOracle     tier = "independent live read of the DER's own SunSpec registers (simapi sidecar), " +
 		"taken during the run and carried into this phase"
+	// tierConstruction is a claim about THIS SUITE's own configuration — the
+	// values a row is built to publish, and the elements it declares it cannot
+	// author. Nothing about the DUT, the bench or the capture is involved, and
+	// saying "cleartext TLS handshake in the capture" over such a verdict would
+	// tell a bundle reader the capture backed a fact the capture never saw —
+	// the same mis-attribution tierOracle exists to prevent one tier along.
+	tierConstruction tier = "this suite's own row construction (no observation involved)"
+
 	tierNone tier = "not observed"
 )
 
@@ -125,6 +133,18 @@ type criterion struct {
 	// Server is the tier-3 evaluator, called when Wire was unavailable.
 	Server func(v *ServerView) Finding
 
+	// Construction evaluates a claim that needs NO OBSERVATION AT ALL: it is
+	// about the row's own definition — what the row is built to publish, and
+	// which prescribed elements it declares this bench cannot author.
+	//
+	// It is tried FIRST and it is the only arm that cannot be starved. Wire runs
+	// only when a session was recovered and Server only when the admin API
+	// answered, so a construction claim wired through either of them lands on a
+	// severity-0 SkipAssertion on a captureless run — which would silently drop
+	// a HOLD that has nothing to do with the capture. A claim decidable without
+	// an observation must not be able to depend on one.
+	Construction func() Finding
+
 	// Skip is the reason recorded when no evaluator could reach a conclusion
 	// and neither produced one of its own.
 	Skip string
@@ -145,6 +165,22 @@ func mint(ev *certify.Evidence, obs *Observation, crits []criterion) ([]certify.
 }
 
 func (c criterion) assert(ev *certify.Evidence, obs *Observation) (certify.Assertion, error) {
+	// Construction — before every observational tier, because it depends on
+	// none of them and must therefore reach the same verdict whether or not the
+	// run recovered a session or reached the bench.
+	if c.Construction != nil {
+		f := c.Construction()
+		if f.Unavailable == "" {
+			a, err := ev.Narrative(c.Claim, string(tierConstruction)+" — "+c.How, f.Verdict, f.Observed,
+				"this suite's own row definition, read without touching the capture, the bench or the "+
+					"device under test")
+			if err != nil {
+				return certify.Assertion{}, err
+			}
+			return a, nil
+		}
+		obs.note(c.Claim, f.Unavailable)
+	}
 	// Tier 1 / 2.
 	if c.Wire != nil && obs.Transcript != nil {
 		switch {

@@ -1157,7 +1157,14 @@ func critCurvePublishedTheProcedureValues(subject string, b *curveBinding) crite
 			"for " + subject,
 		How: "the row's own curve binding, pinned against the catalog's Figure by a construction test " +
 			"(TestCurveRows_PublishTheCatalogPrescribedValues) rather than restated here: " + prescribed,
-		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
+		// CONSTRUCTION, not Wire. This claim is about what the ROW IS BUILT TO
+		// SEND and which prescribed elements it declares this bench cannot
+		// author — a fact about this suite's own configuration that no capture
+		// could confirm or refute. Carried on Wire it was evaluated only when a
+		// session had been recovered, so a captureless run dropped the material-
+		// gap HOLD onto a severity-0 Skip: no false PASS, but a hold that
+		// disappears when the pcap does is not a hold.
+		Construction: func() Finding {
 			if len(material) > 0 {
 				return Finding{Verdict: certify.Fail, Observed: "this row published " + prescribed +
 					", and the following element(s) the procedure prescribes could NOT be placed on the " +
