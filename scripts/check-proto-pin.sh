@@ -212,11 +212,52 @@ else
   echo "check-proto-pin: $(basename "$SELF")/proto.pin    = $SELF_SHA"
   echo "check-proto-pin: $(basename "$PRODUCT")/proto.pin = $PRODUCT_SHA"
 
-  if [[ "$SELF_SHA" != "$PRODUCT_SHA" ]]; then
+  # THE QUESTION IS "THE SAME COMMIT", NOT "THE SAME STRING" (2026-08-15).
+  #
+  # read_pin accepts 7-40 hex chars, because a proto.pin has always been
+  # allowed to hold an abbreviated SHA -- and this comparison was a literal
+  # string test, so one repo writing fe483e7 and the other writing
+  # fe483e7d40d575725d4e5365214d9a95409966d6 FAILED the gate while pinning the
+  # identical commit. That is a false alarm on the one check the release gate
+  # treats as ground truth, and a false alarm on a gate is worse than no gate:
+  # it trains the next person to wave it through.
+  #
+  # So when a local lexa-proto checkout is available, both pins are RESOLVED to
+  # full commit IDs and those are compared. That is the question AD-003 actually
+  # asks. Without a checkout (hosted CI's normal case, since lexa-proto has no
+  # remote) the strings are compared as before, with one narrow allowance: if
+  # one is a prefix of the other they are treated as naming the same commit and
+  # the fact that this was NOT verified is stated. A 7-hex prefix collision is
+  # not a realistic accident, but it is not proof either, and the difference is
+  # exactly what the (b) check below upgrades when it can run.
+  PINS_MATCH=0
+  PIN_HOW=""
+  if [[ "$SELF_SHA" == "$PRODUCT_SHA" ]]; then
+    PINS_MATCH=1
+    PIN_HOW="identical"
+  elif [[ -d "$PROTO/.git" ]] && [[ "$NO_PROTO_CHECK" -eq 0 ]]; then
+    SELF_FULL="$(git -C "$PROTO" rev-parse --verify "${SELF_SHA}^{commit}" 2>/dev/null || true)"
+    PRODUCT_FULL="$(git -C "$PROTO" rev-parse --verify "${PRODUCT_SHA}^{commit}" 2>/dev/null || true)"
+    if [[ -n "$SELF_FULL" && "$SELF_FULL" == "$PRODUCT_FULL" ]]; then
+      PINS_MATCH=1
+      PIN_HOW="different abbreviations of $SELF_FULL, resolved against $PROTO"
+    fi
+  elif [[ "$SELF_SHA" == "$PRODUCT_SHA"* || "$PRODUCT_SHA" == "$SELF_SHA"* ]]; then
+    PINS_MATCH=1
+    PIN_HOW="one is a prefix of the other, and NO lexa-proto checkout was available to resolve them --
+                            treated as the same commit, NOT verified to be"
+  fi
+
+  if [[ "$PINS_MATCH" -eq 0 ]]; then
     cat >&2 <<EOF
 
 PIN MISMATCH: $(basename "$SELF") pins lexa-proto @ $SELF_SHA
               $(basename "$PRODUCT") pins lexa-proto @ $PRODUCT_SHA
+
+These are not the same commit. (They are also not two spellings of one: this
+gate resolves abbreviated SHAs against a local lexa-proto checkout when one is
+available, and falls back to prefix equality when it is not, so a difference
+reported here is a real one.)
 
 Both consumer repos must pin the identical lexa-proto commit (AD-003).
 Version bumps ship as paired PRs (05 §11) -- bump both proto.pin files (and
@@ -225,7 +266,7 @@ session, never one side alone.
 EOF
     FAIL=1
   else
-    echo "check-proto-pin: pins match (lexa-proto @ $SELF_SHA)."
+    echo "check-proto-pin: pins match ($PIN_HOW)."
   fi
 fi
 
