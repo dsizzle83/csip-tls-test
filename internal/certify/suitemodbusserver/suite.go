@@ -60,9 +60,18 @@ func Register(reg *certify.Registry) {
 	reg.Register("ss-1547-test-v1.1::MOD-4", SuiteName, checkMOD4, needs, certify.WithOrder(60))
 	reg.Register("ss-1547-test-v1.1::2.4", SuiteName, checkSF, needs, certify.WithOrder(70))
 
-	// CRV-1 reads the same chain and writes nothing, so it belongs here rather
-	// than with its section-mates: CRV-2 and CRV-3 need a writable curve, CRV-1
-	// needs a read-only one. See checks_crv.go.
+	// CRV-1 reads the same chain and belongs here rather than with its
+	// section-mates: CRV-2 and CRV-3 need a writable curve, CRV-1 needs a
+	// read-only one. See checks_crv.go.
+	//
+	// It DOES write, from the Stage-6 legacy coverage — one FC 6 per served
+	// legacy model — and it still sits with the read-only checks rather than
+	// with the write procedures, because the ordering rule above is about state
+	// and stream health and neither is at stake. Every one of those writes
+	// carries the value the register already holds, so an accepted one changes
+	// nothing, and all of them target the legacy 12x models, which the write
+	// procedures below never touch (they work on 704). Putting CRV-1 after them
+	// would only delay the evidence.
 	reg.Register("ss-modbus-conf-v1.4::CRV-1", SuiteName, checkCRV1, needs, certify.WithOrder(75))
 
 	// Exception generation: EXC-3 first because it writes nothing.

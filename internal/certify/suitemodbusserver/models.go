@@ -19,9 +19,16 @@ package suitemodbusserver
 // transcribed: 1, 701, 702, 703, 704, 713 and the fixed header of 714. The
 // curve models 705-712 have runtime geometry (NPt / NCrv / NCrvSet / NCtl) and
 // no fixed table exists to transcribe; a check that meets one says so and
-// SKIPs its per-point sweep rather than guessing offsets.
+// SKIPs its per-point sweep rather than guessing offsets. The legacy 12x family
+// the Stage-6 read-only projection added (126-132, 134, 160) is transcribed to
+// exactly ONE point per model — see curveModels at the bottom of this file for
+// what that one point is for and why transcribing more of them would be
+// guessing.
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 // PointType is a SunSpec point data type. The set here is the subset that
 // appears in the transcribed models; the Device spec defines more.
@@ -643,6 +650,41 @@ func init() {
 				"but declares L=%d", m.ID, got, m.L))
 		}
 	}
+
+	// The curve table has to be self-consistent too, and for a sharper reason
+	// than the models above: CRV-1 WRITES to the register a legacy entry's
+	// Probe names. A probe whose key and ID disagreed, or whose offset landed
+	// in the model's [ID, L] header, or that spanned more than one register,
+	// would make this suite write somewhere it did not mean to and then report
+	// the resulting refusal as if it were about the point it named. Failing at
+	// package init is the only acceptable time to discover that.
+	for id, cm := range curveModels {
+		if cm.ID != id {
+			panic(fmt.Sprintf("suitemodbusserver: curveModels[%d] carries ID %d", id, cm.ID))
+		}
+		if !cm.HasProbe() {
+			if cm.Served && cm.Gen == curveGenLegacy {
+				panic(fmt.Sprintf("suitemodbusserver: legacy model %d is served but carries no probe point, "+
+					"so CRV-1 would report it as unverifiable for a reason that is not true", id))
+			}
+			continue
+		}
+		if !cm.Served {
+			panic(fmt.Sprintf("suitemodbusserver: model %d is not served but carries a probe point", id))
+		}
+		if cm.Probe.Off < 2 {
+			panic(fmt.Sprintf("suitemodbusserver: model %d's probe point %s sits at offset %d, inside the "+
+				"model's own [ID, L] header", id, cm.Probe.Name, cm.Probe.Off))
+		}
+		if cm.Probe.Regs() != 1 {
+			panic(fmt.Sprintf("suitemodbusserver: model %d's probe point %s is %d registers wide; CRV-1's "+
+				"write probe must be a single-register whole point so a refusal cannot be a "+
+				"partial-point refusal wearing the wrong name", id, cm.Probe.Name, cm.Probe.Regs()))
+		}
+		if cm.ProbeSource == "" {
+			panic(fmt.Sprintf("suitemodbusserver: model %d's probe point has no transcription source", id))
+		}
+	}
 }
 
 // expectedLen returns the L a conformant instance of the model must report,
@@ -668,10 +710,258 @@ func expectedLen(id uint16, geometry map[string]uint16) (int, bool) {
 	return 0, false
 }
 
-// curveModels are the runtime-geometry models this suite does not transcribe.
-// A check that meets one on the wire reports that fact rather than guessing
-// offsets.
-var curveModels = map[uint16]bool{
-	705: true, 706: true, 707: true, 708: true,
-	709: true, 710: true, 711: true, 712: true,
+// ─── The curve families ────────────────────────────────────────────────────
+//
+// curveModels is every model CRV-1 (§2.5.1) and the MOD-1..MOD-3 sweeps have
+// to reason about WITHOUT a full point-table transcription. Two generations
+// sit in it and they are not interchangeable:
+//
+//   - The 7xx family, 705-712 (DER Information Model Specification v1.2 §4).
+//     Runtime geometry: each sizes its repeating blocks from the NPt / NCrv /
+//     NCrvSet / NCtl points read out of the device, so no fixed table exists
+//     to transcribe and a check that meets one says so rather than guessing.
+//
+//   - The LEGACY 12x family — 126, 127, 128, 129, 130, 131, 132, 134 and the
+//     160 MPPT extension — which the gateway's Stage-6 read-only projection
+//     serves AS ITSELF rather than translating into a 7xx (the D4
+//     read-only-verbatim decision, lexa-gw
+//     docs/design/LEGACY_CURVES_RC0_2026-08-14.md §5.5, wired in
+//     internal/regmap/chain.go's modelLayouts at chain.go:111-119 and
+//     classChainModels at chain.go:175-179/189-193). They are chained
+//     DEVICE-CONDITIONALLY, exactly as the 7xx family is
+//     (deviceConditionalModels, chain.go:251-259), so a unit carries one if
+//     and only if its own DER serves it southbound. Their blocks are FLAT — a
+//     fixed 54/50/58-register bank repeated NCrv times, with twenty point
+//     slots whatever NPt declares — rather than runtime-sized, but this suite
+//     still carries no transcription of them, so the same "no per-point
+//     sweep" rule applies.
+//
+// # What the legacy entries carry that the 7xx entries do not
+//
+// Each served legacy entry carries a Probe: ONE transcribed point, which is
+// what lets CRV-1 verify the read-only posture on that model without knowing
+// the rest of its block. The asymmetry is a fact about the DUT, not an
+// inconsistency here.
+//
+// On the legacy family the product's posture is UNIVERSAL: not one point of
+// any of the nine has an executor, so writes.CheckExecutable refuses every
+// write to every point of every one of them BEFORE the Modbus acknowledgement
+// (lexa-gw internal/regmap/pointgroups.go:262-273, asserted there by
+// TestLegacy_EveryWriteIsRefusedBeforeTheAck). A universal claim is falsified
+// by ANY acknowledged write, so it can be probed at any register this suite
+// can name — it needs one point's offset and width, not the whole block.
+//
+// On 705-712 there is no such universal claim. Those models have a commanded
+// point group and a write path design Stage 5 will build, and CRV-1's steps 2
+// and 3 are specifically about CURVE 1's registers, which cannot be located
+// without the geometry this suite does not transcribe. So the 7xx entries
+// carry no probe and CRV-1 keeps saying, per step, that it did not reach them.
+//
+// Model 133 is in the table with Served false. SunSpec's 12x block is not
+// contiguous, and the DUT's projection does not serve 133 on any unit of any
+// class or DER: chain.go's modelLayouts has no entry for it, and the D4
+// decision's own enumeration of the family (pointgroups.go:264, "126/127/128/
+// 129/130/131/132/134/160") omits it. Carrying it here as an explicit
+// not-served entry is what lets CRV-1 report a NAMED row for it instead of
+// leaving a hole in the 126-134 range that a reader would have to notice.
+type curveGeneration int
+
+// The two curve generations.
+const (
+	// curveGen7xx is the DER Information Model Specification's 705-712.
+	curveGen7xx curveGeneration = iota
+	// curveGenLegacy is the SunSpec inverter-controls 12x family plus 160.
+	curveGenLegacy
+)
+
+// curveModel is one entry of curveModels.
+type curveModel struct {
+	// ID is the SunSpec model identifier.
+	ID uint16
+	// Name is the model definition's own name, as a reader of the SunSpec
+	// model definitions would look it up.
+	Name string
+	// Gen is which generation the model belongs to.
+	Gen curveGeneration
+	// CurveBased reports whether the model is a BREAKPOINT-CURVE model, which
+	// is the scope CTP §2.5's precondition names ("each curve-based model
+	// implemented in the device"). It is false for the members of both
+	// generations that are shaped like something else: 711 is a droop control
+	// block (NCtl control blocks, no point array), 127 is a parameterised
+	// gradient with start/stop frequencies, 128 is a dynamic reactive-current
+	// parameter block, and 160 is DC telemetry. They stay IN this table
+	// because MOD-1..MOD-3 must still report them as untranscribed and because
+	// the D4 read-only posture covers all nine legacy models; they are simply
+	// outside the procedure's own precondition, and CRV-1 says which is which
+	// rather than folding them together.
+	CurveBased bool
+	// Served reports whether the DUT's northbound projection can serve this
+	// model at all, on any unit. False only for 133 — see the block comment.
+	Served bool
+	// NotServed is why the model is not served, and is set only when Served is
+	// false.
+	NotServed string
+	// Probe is the ONE point of this model this suite transcribes, and the
+	// register CRV-1's read-only verification targets. Meaningful only for a
+	// served legacy entry; the zero value means "no probe", which is what
+	// every 7xx entry carries.
+	Probe Point
+	// ProbeSource names where the probe point's offset, type and width were
+	// transcribed from, so a reviewer can check the one number this suite's
+	// legacy verification rests on.
+	ProbeSource string
+}
+
+// HasProbe reports whether CRV-1 can verify this model's read-only posture.
+func (cm curveModel) HasProbe() bool { return cm.Probe.Name != "" }
+
+// noLayoutReason is what a check that met this model on the wire says instead
+// of sweeping its points. It names the SUITE's gap rather than anything about
+// the DUT, because a reader who mistook it for a DUT finding would be reading a
+// harness limit as a defect.
+func (cm curveModel) noLayoutReason() string {
+	switch {
+	case !cm.Served:
+		return fmt.Sprintf("model %d is not part of the DUT's northbound projection and this suite carries "+
+			"no transcription of it, so its point set cannot be checked", cm.ID)
+	case cm.Gen == curveGenLegacy:
+		return fmt.Sprintf("model %d is a legacy (12x) curve-family model. The DUT serves it flat, but its "+
+			"block is a fixed-size bank repeated NCrv times carrying twenty point slots whatever NPt "+
+			"declares, and this suite transcribes only its first data point (%s) — enough to verify the "+
+			"read-only posture CRV-1 asks about, not enough for a per-point sweep, which would be guessing",
+			cm.ID, cm.Probe.Name)
+	default:
+		return fmt.Sprintf("model %d is a runtime-geometry curve model: its register offsets depend on the "+
+			"NPt / NCrv / NCrvSet / NCtl points read from the device, and this suite carries no "+
+			"transcription of its layout, so a per-point sweep would be guessing", cm.ID)
+	}
+}
+
+// legacyProbeSource is the provenance every legacy probe point shares. The
+// point tables come from the SunSpec model definitions themselves, transcribed
+// here exactly as the rest of this file is — NOT read out of
+// lexa-proto/sunspec/legacycurve.go, which is the table the DUT encodes with.
+// The transcription is deliberately MINIMAL, one point per model, so that no
+// claim this suite makes about the legacy surface rests on a guessed offset.
+const legacyProbeSource = "the SunSpec model definition's own point table, transcribed here (not imported " +
+	"from the layout package the DUT encodes with)"
+
+// curveModels is the table itself. Its keys are the only model ids this suite
+// treats as curve-family.
+var curveModels = map[uint16]curveModel{
+	// ── The legacy 12x family ──────────────────────────────────────────────
+	//
+	// 126/129/130/131/132/134 all open their data block with ActCrv, the
+	// 1-based index of the live curve bank: one uint16 register at model
+	// offset 2 (data offset 0). It is the natural probe — a single-register
+	// whole point, so a write to it can never be refused merely for starting
+	// or ending mid-point, which would make the refusal say something other
+	// than what CRV-1 is asking.
+	126: {
+		ID: 126, Name: "volt_var (Static Volt-VAr Arrays)", Gen: curveGenLegacy,
+		CurveBased: true, Served: true,
+		Probe:       rw("ActCrv", 2, TypeUint16, ""),
+		ProbeSource: legacyProbeSource,
+	},
+	127: {
+		ID: 127, Name: "freq_watt_param (Parameterized Frequency-Watt)", Gen: curveGenLegacy,
+		CurveBased: false, Served: true,
+		// 127 has no repeating group at all; its block opens with WGra, the
+		// droop gradient in % of PM per Hz — one uint16 register.
+		Probe:       rw("WGra", 2, TypeUint16, "WGra_SF"),
+		ProbeSource: legacyProbeSource,
+	},
+	128: {
+		ID: 128, Name: "reactive_current (Dynamic Reactive Current)", Gen: curveGenLegacy,
+		CurveBased: false, Served: true,
+		// Likewise no repeating group; ArGraMod (0 EDGE, 1 CENTER) is the
+		// first point, an enum16 in one register.
+		Probe:       rw("ArGraMod", 2, TypeEnum16, ""),
+		ProbeSource: legacyProbeSource,
+	},
+	129: {
+		ID: 129, Name: "lvrt (LVRT Must Disconnect)", Gen: curveGenLegacy,
+		CurveBased: true, Served: true,
+		Probe:       rw("ActCrv", 2, TypeUint16, ""),
+		ProbeSource: legacyProbeSource,
+	},
+	130: {
+		ID: 130, Name: "hvrt (HVRT Must Disconnect)", Gen: curveGenLegacy,
+		CurveBased: true, Served: true,
+		Probe:       rw("ActCrv", 2, TypeUint16, ""),
+		ProbeSource: legacyProbeSource,
+	},
+	131: {
+		ID: 131, Name: "watt_pf (Watt-Power Factor)", Gen: curveGenLegacy,
+		CurveBased: true, Served: true,
+		Probe:       rw("ActCrv", 2, TypeUint16, ""),
+		ProbeSource: legacyProbeSource,
+	},
+	132: {
+		ID: 132, Name: "volt_watt (Volt-Watt)", Gen: curveGenLegacy,
+		CurveBased: true, Served: true,
+		Probe:       rw("ActCrv", 2, TypeUint16, ""),
+		ProbeSource: legacyProbeSource,
+	},
+	133: {
+		ID: 133, Name: "(not served)", Gen: curveGenLegacy,
+		CurveBased: false, Served: false,
+		NotServed: "the DUT's northbound projection registers no layout for model 133 (lexa-gw " +
+			"internal/regmap/chain.go's modelLayouts, chain.go:84-120), and the D4 read-only-verbatim " +
+			"decision that put the legacy family northbound enumerates it as 126/127/128/129/130/131/132/" +
+			"134/160 (internal/regmap/pointgroups.go:264) — 133 is absent from both. Its absence is " +
+			"therefore NOT the device-conditional absence the other eight can have: no unit, of any " +
+			"class, behind any DER, can carry a 133 on this build, so the procedure has no subject for " +
+			"it here and never will on this projection",
+	},
+	134: {
+		ID: 134, Name: "freq_watt (Curve-Based Frequency-Watt)", Gen: curveGenLegacy,
+		CurveBased: true, Served: true,
+		Probe:       rw("ActCrv", 2, TypeUint16, ""),
+		ProbeSource: legacyProbeSource,
+	},
+	160: {
+		ID: 160, Name: "mppt (Multiple MPPT Inverter Extension)", Gen: curveGenLegacy,
+		CurveBased: false, Served: true,
+		// 160's block opens with its four scale factors, then a bitfield32
+		// Evt, then N — the number of DC-input module blocks that follow, at
+		// data offset 6 (model offset 8). N is the probe rather than the
+		// leading DCA_SF because a refusal on a scale factor is ALSO covered
+		// by the DUT's never-write-a-scale-factor rule, so it would not be
+		// evidence about the legacy read-only posture specifically. NO point
+		// of model 160 declares an access key at all, so every one of them is
+		// read-only by the SunSpec default — which is why 160's refusal comes
+		// from the write decoder rather than from the executor gate the other
+		// eight trip (see checks_crv.go's refusal ladder).
+		Probe:       r("N", 8, TypeUint16, ""),
+		ProbeSource: legacyProbeSource,
+	},
+
+	// ── The 7xx family ─────────────────────────────────────────────────────
+	//
+	// No probes: see the block comment. 711 is marked not curve-based because
+	// it is a droop CONTROL block (NCtl blocks of gains and deadbands, no
+	// point array) rather than a breakpoint curve; CTP §2.5's precondition
+	// names curve-based models, and folding 711 in with 705/706/707-710/712
+	// would overstate what the precondition found.
+	705: {ID: 705, Name: "DERVoltVar", Gen: curveGen7xx, CurveBased: true, Served: true},
+	706: {ID: 706, Name: "DERVoltWatt", Gen: curveGen7xx, CurveBased: true, Served: true},
+	707: {ID: 707, Name: "DERTripLV", Gen: curveGen7xx, CurveBased: true, Served: true},
+	708: {ID: 708, Name: "DERTripHV", Gen: curveGen7xx, CurveBased: true, Served: true},
+	709: {ID: 709, Name: "DERTripLF", Gen: curveGen7xx, CurveBased: true, Served: true},
+	710: {ID: 710, Name: "DERTripHF", Gen: curveGen7xx, CurveBased: true, Served: true},
+	711: {ID: 711, Name: "DERFreqDroop", Gen: curveGen7xx, CurveBased: false, Served: true},
+	712: {ID: 712, Name: "DERWattVar", Gen: curveGen7xx, CurveBased: true, Served: true},
+}
+
+// curveModelIDs returns every curve-family model id, ascending. CRV-1 reports
+// in this order so a reader can check the 126-134/160 range against the report
+// without holding the table in their head.
+func curveModelIDs() []uint16 {
+	out := make([]uint16, 0, len(curveModels))
+	for id := range curveModels {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }

@@ -91,7 +91,52 @@ type deviceOpts struct {
 	ReversionUncancellable bool
 	// Unit is the Modbus unit identifier the device answers on; 0 means 1.
 	Unit uint8
+
+	// LegacyModels chains the legacy 12x family the gateway's Stage-6
+	// read-only projection serves — 126/127/128/129/130/131/132/134/160 — so
+	// CRV-1's per-model read-only verification has subjects. Model 133 is
+	// deliberately NOT in that list: the projection serves no 133 on any unit,
+	// and CRV-1 has to report that as a named row rather than a silence, which
+	// only a device that genuinely lacks it can prove.
+	LegacyModels bool
+	// LegacyOmit drops legacy models from the chain, standing in for a unit
+	// whose own DER does not serve them (the chain is device-conditional).
+	LegacyOmit []uint16
+	// LegacyAcceptWrite makes this one legacy model APPLY a write instead of
+	// refusing it — the device that acknowledges a write to a model it serves
+	// read-only, which is the defect CRV-1's write probe exists to catch. The
+	// acknowledgement is the failure whether or not the value moves, so this
+	// knob stores the value too, giving the check no easier tell.
+	LegacyAcceptWrite uint16
+	// LegacyEchoWrong makes this one legacy model APPLY a write and then answer
+	// it with a normal FC 6 response carrying a corrupted echo. It is the
+	// nastier half of LegacyAcceptWrite: the write both succeeded and came back
+	// as a protocol error, so a check that decided "refused or not" from the
+	// client library's error alone would score it a refusal. The response's
+	// function code is the only honest discriminator, and it says ACK.
+	LegacyEchoWrong uint16
+	// LegacyDenyCode overrides the exception every legacy model refuses with.
+	// Zero means the real gateway's ladder: 0x02 (the SUN-002 executor gate)
+	// for the eight models with a commanded group, 0x03 (the write decoder's
+	// defence in depth) for 160, which has none.
+	LegacyDenyCode mbap.ExCode
 }
+
+// legacyBlockLen is each legacy model's data-block length — the value its L
+// register declares — under the projection's pinned geometry: a 10-register
+// header plus NCrv=1 bank of the model's own fixed bank length (54 registers on
+// 126/131/132, 50 on 129/130, 58 on 134); 127 and 128 carry no bank at all; 160
+// is an 8-register header plus two 20-register DC-module blocks.
+var legacyBlockLen = map[uint16]uint16{
+	126: 10 + 54, 127: 10, 128: 14,
+	129: 10 + 50, 130: 10 + 50, 131: 10 + 54,
+	132: 10 + 54, 134: 10 + 58, 160: 8 + 2*20,
+}
+
+// legacyChainOrder is the order the gateway appends the legacy family in:
+// after every 7xx model, so adding them moves no register of a unit that
+// already existed (lexa-gw internal/regmap/chain.go:159-166).
+var legacyChainOrder = []uint16{126, 127, 128, 129, 130, 131, 132, 134, 160}
 
 // recSeg is one recorded TCP payload.
 type recSeg struct {
@@ -148,6 +193,17 @@ func newDevice(t *testing.T, opts deviceOpts) *device {
 	if opts.Full1547 {
 		ids = []uint16{1, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712, 713}
 	}
+	if opts.LegacyModels {
+		omit := map[uint16]bool{}
+		for _, id := range opts.LegacyOmit {
+			omit[id] = true
+		}
+		for _, id := range legacyChainOrder {
+			if !omit[id] {
+				ids = append(ids, id)
+			}
+		}
+	}
 
 	d.regs[d.base] = sunSMarker0
 	d.regs[d.base+1] = sunSMarker1
@@ -160,17 +216,23 @@ func newDevice(t *testing.T, opts deviceOpts) *device {
 			l = uint16(def.L)
 		case id == 714:
 			l = 18
+		case legacyBlockLen[id] != 0:
+			l = legacyBlockLen[id]
 		default:
 			// A curve model this suite does not transcribe: give it a plausible
 			// body so the walk has something to skip.
 			l = 24
 		}
 		d.models = append(d.models, modelRef{ID: id, Addr: addr, L: l, DataAddr: addr + 2})
-		if transcribed {
+		switch {
+		case transcribed:
 			d.seedModel(addr, def)
-		} else {
+		default:
 			for i := uint16(0); i < l; i++ {
 				d.regs[addr+2+i] = 0
+			}
+			if legacyBlockLen[id] != 0 {
+				d.seedLegacy(addr, id)
 			}
 		}
 		// The header goes in AFTER the body seed, which zero-fills every point
@@ -270,6 +332,64 @@ func (d *device) seedModel(base uint16, def *Model) {
 		put(16, 10) // WMaxLimPctRvrt
 		put(20, 0, 0)
 	}
+}
+
+// seedLegacy writes a plausible header for one legacy model. Only the points
+// this suite transcribes (each model's probe register) and the geometry a
+// reader would sanity-check are given real values; the rest of the bank stays
+// zero, which is what an untranscribed block looks like to this suite anyway.
+//
+// The values are chosen so a probe register never reads 0: an Observed field
+// saying "read 0x0000 before the write and 0x0000 after" would be true of a
+// device that had no such register at all.
+func (d *device) seedLegacy(base uint16, id uint16) {
+	put := func(off int, v uint16) { d.regs[base+uint16(off)] = v }
+	switch id {
+	case 127:
+		put(2, 40) // WGra, % PM/Hz
+	case 128:
+		put(2, 1) // ArGraMod = CENTER
+	case 160:
+		put(8, 2)  // N: two DC-input modules, matching the block length above
+		put(9, 60) // TmsPer
+	default:
+		// The six curve-bank models share a header: ActCrv selects the live
+		// bank (1-based), ModEna bit 0 switches the function on, NCrv/NPt
+		// declare the geometry.
+		put(2, 1)  // ActCrv
+		put(3, 0)  // ModEna: the function is off
+		put(7, 1)  // NCrv
+		put(8, 10) // NPt
+	}
+}
+
+// legacyModelAt reports which legacy model owns an absolute address.
+func (d *device) legacyModelAt(addr uint16) (uint16, bool) {
+	for _, m := range d.models {
+		if legacyBlockLen[m.ID] == 0 {
+			continue
+		}
+		if addr >= m.Addr && int(addr) < int(m.Addr)+m.span() {
+			return m.ID, true
+		}
+	}
+	return 0, false
+}
+
+// legacyDenyCode is the exception a legacy write is refused with, mirroring the
+// gateway's own ladder (lexa-gw internal/listener/serve.go steps 7 and 7b): a
+// point in the model's commanded group reaches writes.CheckExecutable and is
+// refused 0x02 because no executor applies it, while model 160 — which declares
+// no writable point at all, so it has no commanded group — is refused 0x03 by
+// the write decoder before the executor question is asked.
+func (d *device) legacyDenyCode(id uint16) mbap.ExCode {
+	if d.opts.LegacyDenyCode != 0 {
+		return d.opts.LegacyDenyCode
+	}
+	if id == 160 {
+		return mbap.ExIllegalValue
+	}
+	return mbap.ExIllegalAddress
 }
 
 // Addr is the device's listen address.
@@ -423,7 +543,15 @@ func (d *device) handle(req mbap.ADU) mbap.ADU {
 		if ex := d.applyWrite(addr, []uint16{val}); ex != 0 {
 			return mbap.Exception(req, ex)
 		}
-		return mbap.ADU{Header: mbap.Header{TID: req.TID, UnitID: req.UnitID}, PDU: req.PDU}
+		pdu := req.PDU
+		if id, ok := d.legacyModelAt(addr); ok && d.opts.LegacyEchoWrong == id {
+			// A NORMAL response — function code 0x06, not 0x86 — that echoes
+			// the wrong value back. Acknowledged and malformed at once.
+			bad := append([]byte(nil), req.PDU...)
+			binary.BigEndian.PutUint16(bad[3:5], val^0xFFFF)
+			pdu = bad
+		}
+		return mbap.ADU{Header: mbap.Header{TID: req.TID, UnitID: req.UnitID}, PDU: pdu}
 
 	case fcWriteMultiple:
 		if len(req.PDU) < 6 {
@@ -489,6 +617,17 @@ func (d *device) applyWrite(addr uint16, vals []uint16) mbap.ExCode {
 		if !d.inMap(addr + uint16(i)) {
 			return mbap.ExIllegalAddress
 		}
+	}
+	// The legacy family's read-only posture, refused BEFORE any acknowledgement
+	// — or, with LegacyAcceptWrite, the defect where it is not.
+	if id, ok := d.legacyModelAt(addr); ok {
+		if d.opts.LegacyAcceptWrite != id && d.opts.LegacyEchoWrong != id {
+			return d.legacyDenyCode(id)
+		}
+		for i, v := range vals {
+			d.regs[addr+uint16(i)] = v
+		}
+		return 0
 	}
 	// Read-only refusal.
 	for i := range vals {

@@ -12,10 +12,12 @@ package suitemodbusserver
 // "the test is performed once for each model implemented" means when it is
 // reported as a single row.
 //
-// A model this suite has no transcription for (the runtime-geometry curve
-// models 705-712, or a vendor model) gets an explicit SKIP naming the model and
-// the reason. It is not silently dropped, because a reader counting assertions
-// against a chain listing would otherwise never know a model went unexamined.
+// A model this suite has no transcription for — the runtime-geometry curve
+// models 705-712, the legacy 12x family the Stage-6 read-only projection serves
+// (126-132, 134, 160), or a vendor model — gets an explicit SKIP naming the
+// model and the reason, which curveModels supplies per generation. It is not
+// silently dropped, because a reader counting assertions against a chain
+// listing would otherwise never know a model went unexamined.
 
 import (
 	"context"
@@ -71,11 +73,14 @@ func sweepModels(c *client, ch *chain, label string, singlePointSweep bool) []*m
 			continue
 		}
 
+		cm, isCurve := curveModels[ref.ID]
 		switch {
-		case !transcribed && curveModels[ref.ID]:
-			rep.Skip = fmt.Sprintf("model %d is a runtime-geometry curve model: its register offsets depend on "+
-				"the NPt / NCrv / NCrvSet / NCtl points read from the device, and this suite carries no "+
-				"transcription of its layout, so a per-point sweep would be guessing", ref.ID)
+		case !transcribed && isCurve:
+			// The reason lives on the table entry because it now differs by
+			// generation: 705-712 are untranscribable because their geometry
+			// is a runtime fact, the legacy 12x family because its flat banks
+			// are simply not transcribed here beyond one probe point each.
+			rep.Skip = cm.noLayoutReason()
 		case !transcribed:
 			rep.Skip = fmt.Sprintf("this suite carries no transcription of model %d, so its point set cannot "+
 				"be checked; the model was located and its declared length was read", ref.ID)

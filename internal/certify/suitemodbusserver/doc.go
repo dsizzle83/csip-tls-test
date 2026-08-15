@@ -69,6 +69,18 @@
 // implement — has a subject. checks_crv.go says what it can assert today and
 // what it cannot.
 //
+// From the gateway's Stage-6 read-only projection, CRV-1 also covers a SECOND
+// curve generation: the legacy 12x family — 126, 127, 128, 129, 130, 131, 132,
+// 134 and the 160 MPPT extension — which that stage puts northbound as itself
+// rather than translating into a 7xx (the D4 read-only-verbatim decision). It
+// reports a named per-model sub-verdict for each of 126-134 and 160, including
+// 133, which the projection serves on no unit of any class and which is
+// therefore reported as a reasoned not-served row rather than left as a hole in
+// the range. Where the model IS served, the sub-verdict is a verification, not
+// a description: the model's whole block is read and a write to it is required
+// to come back as an exception. See checks_crv.go for what "refused before the
+// acknowledgement" resolves to on this surface.
+//
 // # The honest shape of a write test against this DUT
 //
 // Six of the fifteen applicable v1.4 rows (MB-1, MOD-3, EXC-1, REV-1, REV-2,
@@ -99,6 +111,18 @@
 // no enable is turned on with a setpoint the operator did not ask for; the
 // enumeration sweep of MOD-3 step 3, which necessarily toggles an enable, can
 // be disabled with -param modbus.no-enum-writes=1 and then reports SKIP.
+//
+// CRV-1 is a SEVENTH row that writes, and it is the one exception to the
+// control-write rule above — deliberately, because the rule would invert its
+// meaning. The control write exists so a REFUSAL cannot be mistaken for a
+// conformance result; CRV-1's whole criterion IS the refusal, so requiring a
+// refusal to be preceded by an acceptance would make the procedure
+// unsatisfiable. What it does instead is write each legacy model's probe point
+// with THE VALUE THAT REGISTER ALREADY HOLDS. That write cannot be refused for
+// being out of range, out of enumeration or mid-point, so a refusal can only be
+// about writability; and in the failing case — the DUT accepting it — the value
+// written is the value already present, so catching the defect still commands
+// nothing. Nothing needs restoring because nothing was changed.
 //
 // # Referee independence
 //
