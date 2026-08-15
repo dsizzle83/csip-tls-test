@@ -28,7 +28,13 @@ type TariffProfile struct {
 	PricePowerOfTenMultiplier int8   `xml:"pricePowerOfTenMultiplier,omitempty"`
 	Primacy                   uint8  `xml:"primacy"`
 	RateCode                  string `xml:"rateCode,omitempty"`
-	ServiceCategoryKind       uint8  `xml:"serviceCategoryKind,omitempty"` // 0=electricity
+	// ServiceCategoryKind is ServiceKind and is [1] on TariffProfile — IEEE Std
+	// 2030.5-2018 p.220-221 and Figure B.27 p.218 list it without a [0..1], and
+	// sep.xsd agrees (minOccurs="1"). NOT omitempty: 0 is "electricity" (2018
+	// p.169), which is exactly the value omitempty deletes. Same defect class as
+	// the MirrorUsagePoint elements in IW15-028; found by the same sweep. See
+	// docs/schema/NORMATIVE_ANCHOR.md §3.6.
+	ServiceCategoryKind uint8 `xml:"serviceCategoryKind"`
 
 	RateComponentListLink *ListLink `xml:"RateComponentListLink,omitempty"`
 }
@@ -59,13 +65,20 @@ type RateComponent struct {
 	FlowRateStartLimit *UnitValue `xml:"flowRateStartLimit,omitempty"`
 
 	ReadingTypeLink *Link `xml:"ReadingTypeLink,omitempty"`
-	// RoleFlags is RoleFlagsType (sep 2.0.4 xsd:5826, HexBinary16). Its bits:
-	// 0 isMirror, 1 isPremisesAggregationPoint... 2 isPEV, 3 isDER, 4
-	// isRevenueQuality, 5 isDC, 6 isSubmeter. There is NO isPrimary/isReverse
-	// anywhere in the type -- the forward/reverse distinction lives on
-	// ReadingType.flowDirection. (The previous comment invented bits 2/3 and
-	// two downstream fixtures copied the invention; corrected 2026-08-15.)
-	RoleFlags HexBinary16 `xml:"roleFlags,omitempty"`
+	// RoleFlags is RoleFlagsType, a HexBinary16 — IEEE Std 2030.5-2018 p.169.
+	// Its bits: 0 isMirror, 1 isPremisesAggregationPoint, 2 isPEV, 3 isDER, 4
+	// isRevenueQuality, 5 isDC, 6 isSubmeter, 7-15 reserved. There is NO
+	// isPrimary and NO isReverse in ANY revision (2018 p.169, 2023 p.179,
+	// sep.xsd:5826 — all three identical) — the forward/reverse distinction
+	// lives on ReadingType.flowDirection (2018 p.167). The previous comment
+	// invented bits 2/3 and two downstream fixtures copied the invention;
+	// corrected 2026-08-15 (a4498ac), and re-verified against the published
+	// standard at the same time.
+	//
+	// [1] on RateComponent — 2018 p.220 and Figure B.27 p.218, sep.xsd
+	// minOccurs="1". NOT omitempty: a RateComponent whose roles happen to be
+	// all-zero still has to say so. Found by the IW15-028 cardinality sweep.
+	RoleFlags HexBinary16 `xml:"roleFlags"`
 
 	TimeTariffIntervalListLink       *ListLink `xml:"TimeTariffIntervalListLink,omitempty"`
 	ActiveTimeTariffIntervalListLink *ListLink `xml:"ActiveTimeTariffIntervalListLink,omitempty"`

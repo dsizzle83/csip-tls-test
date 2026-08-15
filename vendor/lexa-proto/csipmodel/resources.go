@@ -1,14 +1,31 @@
 // Package csipmodel defines Go structs for the IEEE 2030.5 / CSIP XML data
-// model — the wire-format types both lexa-hub (client-side unmarshal) and
+// model — the wire-format types both the gateway (client-side unmarshal) and
 // csip-tls-test's gridsim (server-side marshal) work from (TASK-023). This is
 // the data model only: walkers, schedulers, identity, and DNS-SD stay
 // repo-local forks that merely import this package.
 //
-// Every struct uses XML tags that match the 2030.5 schema exactly,
-// including the mandatory namespace urn:ieee:std:2030.5:ns.
-// The inheritance hierarchy in the XSD (Resource → IdentifiedObject →
-// SubscribableResource, etc.) is flattened into Go structs with embedded
-// fields, because Go's encoding/xml handles embedded struct tags correctly.
+// THE NORMATIVE ANCHOR IS IEEE Std 2030.5-2018. Every wire-type, cardinality,
+// enumeration and bit-assignment claim in this package cites it by printed
+// page, and docs/schema/NORMATIVE_ANCHOR.md holds the declaration plus a
+// three-way divergence census (2018 / 2030.5-2023 / the vendored
+// docs/schema/sep-2.0.4.xsd). READ THAT DOCUMENT BEFORE CHANGING A CONSTANT.
+//
+// The vendored sep-2.0.4.xsd is a REFERENCE artifact — the pre-publication
+// ZigBee SEP 2.0 draft, five years older than the published standard, in a
+// different namespace, and divergent on the DERControlType bit table, the
+// DERCurveType enumeration, three DERCurve attributes and five DERControlBase
+// elements. Anchoring to it cost this package a whole re-derivation on
+// 2026-08-15 (registry IW15-027). A claim may cite it only where the census
+// marks the row AGREES, and then as corroboration rather than as the source.
+//
+// Every struct uses XML tags that match the standard exactly, including the
+// mandatory namespace urn:ieee:std:2030.5:ns. The inheritance hierarchy
+// (Resource → IdentifiedObject → SubscribableResource, etc.) is flattened into
+// Go structs with embedded fields, because Go's encoding/xml handles embedded
+// struct tags correctly. Element ORDER within a struct is load-bearing: the
+// standard's particles are xs:sequence, Go emits fields in declaration order,
+// and a validating peer rejects an out-of-order document even when every
+// element is legal.
 //
 // Only the resource types required by a CSIP DER client (and the gridsim
 // that serves them) are defined here. Prepayment and messaging function
@@ -112,15 +129,22 @@ func (r ResponseRequired) MarshalXMLAttr(name xml.Name) (xml.Attr, error) {
 // 2026-08-15 (legacy Stage 9), found by the independent bit-position oracle
 // while it was grading the modesSupported mask this wave makes truthful.
 //
-// WHY IT MATTERS, and it is not cosmetic. sep 2.0.4 types several bitmap
-// elements as HexBinary8/16/32 (xsd:6034-6089), each documented as "a N-bit
-// field encoded as a hex string ... bit 0, or the least significant bit, goes
-// on the right". For a value whose decimal rendering happens to contain only
-// the digits 0-9, BOTH readings parse and they are DIFFERENT numbers:
+// WHY IT MATTERS, and it is not cosmetic. IEEE Std 2030.5-2018 p.174 types
+// several bitmap elements as HexBinary8/16/32, each documented as "a N-bit
+// field encoded as a hex string ... Where applicable, bit 0, or the least
+// significant bit, goes on the right." (Identical in 2030.5-2023 and in
+// sep.xsd — NORMATIVE_ANCHOR.md §3.7 — so this whole section is
+// anchor-independent and survived the IW15-027 re-derivation untouched.) For a
+// value whose decimal rendering happens to contain only the digits 0-9, BOTH
+// readings parse and they are DIFFERENT numbers:
 //
-//	<modesSupported>8192</modesSupported>
-//	  decimal 8192 = 0x2000 -> bit 13 (opModMaxLimW)
-//	  hex     8192          -> bits 1, 4, 7, 8, 15 (five completely different modes)
+//	<modesSupported>1048576</modesSupported>
+//	  decimal 1048576 = 0x100000 -> bit 20 (opModMaxLimW, 2018 p.252)
+//	  hex     1048576            -> over-wide: not even a 32-bit value
+//
+//	<modesSupported>132</modesSupported>
+//	  decimal 132 = 0x84   -> bits 2 and 7 (opModConnect, opModFixedW)
+//	  hex     132 = 0x0132 -> bits 1, 4, 5, 8 (four completely different modes)
 //
 // So a decimal-encoded mask is not merely non-canonical — it is a document that
 // says something the writer did not mean, with no way for a reader to tell.
@@ -147,9 +171,10 @@ func (r ResponseRequired) MarshalXMLAttr(name xml.Name) (xml.Attr, error) {
 // to 0 until this same wave — and 0 reads identically under both conventions.
 // There is no deployed decimal mask to be compatible with.
 
-// HexBinary32 is a 32-bit bitmap element encoded as sep 2.0.4's HexBinary32
-// (xsd:6050): eight uppercase hex digits, zero-padded, least-significant bit on
-// the right. DERControlType (modesSupported / modesEnabled) is its extension.
+// HexBinary32 is a 32-bit bitmap element encoded as IEEE 2030.5-2018's
+// HexBinary32 (p.174): eight uppercase hex digits, zero-padded,
+// least-significant bit on the right. DERControlType (modesSupported /
+// modesEnabled) extends it (2018 p.251).
 type HexBinary32 uint32
 
 // MarshalXML writes the value as eight zero-padded uppercase hex digits.
@@ -177,9 +202,10 @@ func (h *HexBinary32) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error
 	return nil
 }
 
-// HexBinary16 is a 16-bit bitmap element encoded as sep 2.0.4's HexBinary16
-// (xsd:6042): four uppercase hex digits, zero-padded. RoleFlagsType is its
-// extension; localID and qualityFlags are typed with it directly.
+// HexBinary16 is a 16-bit bitmap element encoded as IEEE 2030.5-2018's
+// HexBinary16 (p.174): four uppercase hex digits, zero-padded. RoleFlagsType
+// extends it (2018 p.169); localID and qualityFlags are typed with it directly
+// (2018 p.210, Figure B.23).
 type HexBinary16 uint16
 
 // MarshalXML writes the value as four zero-padded uppercase hex digits.
@@ -402,7 +428,13 @@ type DateTimeInterval struct {
 	Start    int64  `xml:"start"`
 }
 
-// SignedPerCent represents a signed percentage × 100 (so 50% = 5000).
+// SignedPerCent represents a signed percentage × 100 (so 50 % = 5000).
+//
+// IEEE Std 2030.5-2018 p.170: "SignedPerCent object (Int16) — Used for signed
+// percentages, specified in hundredths of a percent, −10 000 to 10 000.
+// (10 000 = 100%)". Identical in 2030.5-2023 p.180 and in sep.xsd — see
+// docs/schema/NORMATIVE_ANCHOR.md §3.8. opModFixedW is typed with it (2018
+// p.248) and the sign selects the reference rating.
 type SignedPerCent struct {
 	Value int16 `xml:",chardata"`
 }
@@ -414,22 +446,29 @@ type ActivePower struct {
 }
 
 // PerCent represents an unsigned percentage × 100 (hundredths), used where
-// the 2030.5 XSD's PerCent type applies (opModMaxLimW). sep.xsd defines
-// PerCent as extending UInt16 (xs:unsignedShort) — UNSIGNED, unlike
-// SignedPerCent's Int16 — so the wire domain is [0,65535] and a negative
-// chardata is a schema-layer rejection the XML decoder itself makes. The
-// tighter ≤100.00% (10000) product bound is prose/table-defined (CSIP IG 2.1
-// Table 9), NOT a schema facet, so it stays an application-layer rule
-// enforced downstream at the decode/conversion boundary, not in this struct.
-// See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.
+// 2030.5's PerCent type applies (opModMaxLimW, DERCurve.vRef).
+//
+// IEEE Std 2030.5-2018 p.167: "PerCent object (UInt16) — Used for percentages,
+// specified in hundredths of a percent, 0 to 10 000. (10 000 = 100%)".
+// Identical in 2030.5-2023 p.178 and in sep.xsd — NORMATIVE_ANCHOR.md §3.8,
+// and the confirmation of IW14-002: PerCent is UNSIGNED, unlike SignedPerCent's
+// Int16. The wire domain is therefore [0,65535] and a negative chardata is a
+// schema-layer rejection the XML decoder itself makes. The tighter ≤100.00 %
+// (10000) product bound is prose/table-defined (CSIP IG 2.1 Table 9), NOT a
+// schema facet, so it stays an application-layer rule enforced downstream at
+// the decode/conversion boundary, not in this struct. See
+// docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.
 type PerCent struct {
 	Value uint16 `xml:",chardata"`
 }
 
 // ─── DERUnitRefType: what a percentage is a percentage OF ─────────────────────
 //
-// These match the DERUnitRefType enumeration in the IEEE 2030.5-2018 XSD. The
-// code is NOT decoration: a percentage without its reference is not a
+// These match the DERUnitRefType enumeration in IEEE Std 2030.5-2018 p.256
+// (0 N/A, 1 %setMaxW, 2 %setMaxVar, 3 %statVarAvail, 4 %setEffectiveV,
+// 5 %setMaxChargeRateW, 6 %setMaxDischargeRateW, 7 %statWAvail, "All other
+// values reserved."). The code is NOT decoration: a percentage without its
+// reference is not a
 // quantity, and the three reactive codes name three DIFFERENT physical
 // quantities on the same machine. On a 60 kW / 26.4 kvar DER, "80 %" is
 // 48 000 var under RefTypeSetMaxW and 21 120 var under RefTypeSetMaxVar — a
@@ -464,35 +503,41 @@ type FixedVar struct {
 // DERControlBase contains the actual control parameters — what the DER
 // should do. This is the payload of both DERControl events and the
 // DefaultDERControl fallback.
-// FIELD ORDER IS THE SCHEMA'S SEQUENCE (docs/schema/sep-2.0.4.xsd:3689-3799),
-// for the reason spelled out on ExtendedDERControlBase in der.go: xs:sequence
-// is ordered and Go emits fields in declaration order, so the layout IS the
-// emitted sequence. The scalar prefix here was already in schema order; the
-// 2026-08-15 correction moved the four CSIP-Aus elements — which sep 2.0.4 does
-// not declare at all — from between opModMaxLimW and rampTms to AFTER rampTms,
-// so the schema-declared part of the struct is contiguous and in sequence.
+// FIELD ORDER IS THE STANDARD'S SEQUENCE (IEEE Std 2030.5-2018 p.248-252 and
+// Figure B.37 p.240), for the reason spelled out on ExtendedDERControlBase in
+// der.go: xs:sequence is ordered and Go emits fields in declaration order, so
+// the layout IS the emitted sequence. These eight are a SUBSEQUENCE of the
+// standard's twenty-six — a struct that omits optional elements is still in
+// sequence as long as the ones it keeps are in order — and they are.
+//
+// The 2026-08-15 correction moved the four CSIP-Aus elements, which no revision
+// of 2030.5 declares, from between opModMaxLimW and rampTms to AFTER rampTms,
+// so the standard-declared part of the struct is contiguous and in sequence.
+// That correction stands under the re-anchoring (registry IW15-027); nothing in
+// this struct's element set differs between 2030.5-2018 and the draft schema.
 type DERControlBase struct {
-	// ── sep 2.0.4 DERControlBase, in schema sequence ─────────────────────────
-	// Each mode is optional; the server sends only what it wants to control.
-	OpModConnect  *bool `xml:"opModConnect,omitempty"`  // xsd:3694
-	OpModEnergize *bool `xml:"opModEnergize,omitempty"` // xsd:3699
-	// xsd:3704's single opModFixedPF, implemented here as the AbsorbW/InjectW
-	// pair — see ExtendedDERControlBase for the recorded divergence.
+	// ── IEEE 2030.5-2018 DERControlBase, in sequence ─────────────────────────
+	// Each mode is [0..1]; the server sends only what it wants to control.
+	OpModConnect  *bool `xml:"opModConnect,omitempty"`  // 2018 p.248
+	OpModEnergize *bool `xml:"opModEnergize,omitempty"` // 2018 p.248
+	// 2018 p.248 declares both directions as first-class elements with their own
+	// DERControlType bits (4 and 5). See ExtendedDERControlBase for the open
+	// PowerFactorWithExcitation typing item (NORMATIVE_ANCHOR.md §5.1).
 	OpModFixedPFAbsorbW *SignedPerCent `xml:"opModFixedPFAbsorbW,omitempty"`
 	OpModFixedPFInjectW *SignedPerCent `xml:"opModFixedPFInjectW,omitempty"`
-	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"` // xsd:3709
-	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`   // xsd:3714. SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
-	OpModMaxLimW        *PerCent       `xml:"opModMaxLimW,omitempty"`  // xsd:3759. PerCent of setMaxW, not watts — IW13-001.
-	RampTms             *uint16        `xml:"rampTms,omitempty"`       // xsd:3794 — the schema's last element
+	OpModFixedVar       *FixedVar      `xml:"opModFixedVar,omitempty"` // 2018 p.248
+	OpModFixedW         *SignedPerCent `xml:"opModFixedW,omitempty"`   // 2018 p.248. SignedPerCent, not watts — IW13-001. Sign selects reference: + = %setMaxW/%setMaxDischargeRateW, - = %setMaxChargeRateW.
+	OpModMaxLimW        *PerCent       `xml:"opModMaxLimW,omitempty"`  // 2018 p.250. PerCent of setMaxW in hundredths, not watts — IW13-001.
+	RampTms             *uint16        `xml:"rampTms,omitempty"`       // 2018 p.252 — the standard's last element
 
-	// ── NOT IN sep 2.0.4 ─────────────────────────────────────────────────────
-	// ExpLimW/GenLimW/ImpLimW/LoadLimW are NOT IEEE 2030.5 core elements:
-	// verified ABSENT from sep.xsd 2.0.4 on 2026-08-13 (IW14 review — this
-	// supersedes the earlier "no XSD on this machine" caveat). They match the
-	// CSIP-Aus dynamic-operating-envelope extension quartet, which types them
-	// ActivePower (watts) as here. The governing extension schema is not in
-	// the local standards corpus — confirm against it before any conformance
-	// claim on these axes. See docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
+	// ── NOT IEEE 2030.5 ──────────────────────────────────────────────────────
+	// ExpLimW/GenLimW/ImpLimW/LoadLimW are NOT IEEE 2030.5 elements in ANY
+	// revision: verified absent from 2030.5-2018 (p.248-252), 2030.5-2023, and
+	// sep.xsd 2.0.4. They match the CSIP-Aus dynamic-operating-envelope
+	// extension quartet, which types them ActivePower (watts) as here. The
+	// governing extension schema is not in the local standards corpus — confirm
+	// against it before any conformance claim on these axes. See
+	// docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §1.2.
 	OpModExpLimW  *ActivePower `xml:"opModExpLimW,omitempty"`
 	OpModGenLimW  *ActivePower `xml:"opModGenLimW,omitempty"`
 	OpModImpLimW  *ActivePower `xml:"opModImpLimW,omitempty"`
@@ -596,17 +641,54 @@ type DERList struct {
 
 // MirrorUsagePoint is used by the client to POST telemetry readings
 // back to the utility server.
+//
+// ANCHOR: IEEE Std 2030.5-2018 p.215 (Figure B.26 and the MirrorUsagePoint
+// prose) and p.217 (UsagePointBase). MirrorUsagePoint extends UsagePointBase
+// extends IdentifiedObject, so the element set is: mRID [1], description
+// [0..1], version [0..1], roleFlags [1], serviceCategoryKind [1], status [1],
+// deviceLFDI [1], MirrorMeterReading [0..*], postRate [0..1]. Corroborated by
+// 2030.5-2023 p.224 and by sep.xsd:6267/:6366, which AGREE — this row of the
+// census is revision-independent. See NORMATIVE_ANCHOR.md §3.6 and §3.10.
+//
+// THREE MANDATORY ELEMENTS LOST THEIR omitempty on 2026-08-15 (registry
+// IW15-028), and this was a LIVE defect on every POST this product has ever
+// made, not a latent one. roleFlags, serviceCategoryKind and status are all
+// [1], and this product's values for two of them are exactly the zero
+// `omitempty` deletes: serviceCategoryKind 0 is "electricity" (2018 p.169,
+// ServiceKind) and status 0 is "off" (2018 p.217). An all-zero MUP emitted none
+// of the three. Nothing noticed because the certify path grades the harness's
+// MUP fixtures, never the DUT's.
+//
+// roleFlags carries a SHALL on top of its cardinality: 2018 p.169, "Bit 0 -
+// isMirror - SHALL be set if the server is not the measurement device". On a
+// MirrorUsagePoint the server is by definition not the measurement device, so
+// bit 0 is mandatory for this product. Choosing the rest of the value
+// (isDER, isSubmeter, ...) is the caller's job — cmd/telemetry's registerMUP —
+// and a DUT-side oracle for it is on the IW15-028 worklist.
+//
+// deviceLFDI is [1] and KEEPS its omitempty, on the same reasoning as mRID: it
+// is a string with no meaningful zero, and `<deviceLFDI></deviceLFDI>` is
+// invalid in a different way (HexBinary160). A MUP with no LFDI is a caller
+// defect, not an encoding one.
 type MirrorUsagePoint struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns MirrorUsagePoint"`
 	Resource
 
-	MRID                string      `xml:"mRID,omitempty"`
-	Description         string      `xml:"description,omitempty"`
-	RoleFlags           HexBinary16 `xml:"roleFlags,omitempty"` // RoleFlagsType = HexBinary16 (xsd)
-	ServiceCategoryKind uint8       `xml:"serviceCategoryKind,omitempty"`
-	Status              uint8       `xml:"status,omitempty"`
-	DeviceLFDI          string      `xml:"deviceLFDI,omitempty"`
-	PostRate            uint32      `xml:"postRate,omitempty"`
+	MRID        string `xml:"mRID,omitempty"`
+	Description string `xml:"description,omitempty"` // 2018 p.215 — [0..1]
+
+	// RoleFlags is RoleFlagsType = HexBinary16 (2018 p.169). [1] — NOT
+	// omitempty; see the type doc. Bit 0 isMirror is a SHALL here.
+	RoleFlags HexBinary16 `xml:"roleFlags"`
+	// ServiceCategoryKind is ServiceKind (2018 p.169-170). [1] — NOT omitempty:
+	// 0 is "electricity", this product's own value.
+	ServiceCategoryKind uint8 `xml:"serviceCategoryKind"`
+	// Status is UInt8, 0 = off / 1 = on (2018 p.217). [1] — NOT omitempty:
+	// 0 is a legal, meaningful value.
+	Status uint8 `xml:"status"`
+
+	DeviceLFDI string `xml:"deviceLFDI,omitempty"` // 2018 p.215 — [1], see the type doc
+	PostRate   uint32 `xml:"postRate,omitempty"`   // 2018 p.215 — [0..1]
 }
 
 // MirrorUsagePointList is a collection of MirrorUsagePoint resources.

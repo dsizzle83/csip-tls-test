@@ -18,68 +18,84 @@ package suitecsip
 // agree with every other row, the campaign would report green, and a wrong
 // table would survive for months — which is exactly what happened to the
 // DERCurveType codes, where product and harness agreed on an assignment that
-// was wrong for every code ≥ 4 and nothing in a 282-case catalogue noticed. The
-// same csipmodel Mode* block was wrong when this oracle was designed, and said
-// so in its own doc comment ("RECORDED DIVERGENCE"): sixteen of the schema's
-// twenty-two modes on the wrong bit.
+// was wrong for every code ≥ 4 and nothing in a 282-case catalogue noticed.
 //
-// So this file HAND-TRANSCRIBES the bit positions from the schema text, cites
-// the schema line for every one of them, and imports nothing from csipmodel.
-// That is not a stylistic preference; it is the only thing that makes a green
-// row mean anything. sepxml.go's doc comment states the same rule one layer
-// down ("a model shared with the DUT's own parser would let a mutual misreading
-// of the standard pass both sides") and this is that rule applied to a bitmap
-// instead of to an element name.
+// # The independence rule, as the campaign had to learn it (IW15-027)
 //
-// The agreement between this table and csipmodel's is asserted by
-// TestModesOracleBitTable_AgreesWithCsipmodelOrOneOfThemIsWrong
-// (modes_oracle_test.go). lexa-proto 9856710 corrected the product's table
-// from the same schema, independently, while this file was being written, so
-// that test passes — and the same file proves the comparison would have gone
-// red against the table it was written for. When it does fail, its text refuses
-// to say which side is wrong: it names both values and sends the reader to the
-// schema, because a tripwire that assumed the harness was right would be the
-// same single point of trust in a nicer costume.
+// The FIRST version of this file obeyed the rule as far as CODE goes: it
+// hand-transcribed the bit table rather than importing csipmodel's, cited a
+// line of docs/schema/sep-2.0.4.xsd for every position, and imported nothing
+// from the product. Three witnesses — this transcription, csipmodel's constants,
+// and the census test that parsed the file — then agreed, and the tripwire below
+// went green.
+//
+// All three had read the SAME BOOK, and the book was the wrong one.
+// docs/schema/sep-2.0.4.xsd is the pre-publication ZigBee Smart Energy Profile
+// 2.0 draft (its own header says version 2.0.4, © 2011-2013 ZigBee Alliance, and
+// its targetNamespace is http://ieee.org/2030.5 rather than the published
+// urn:ieee:std:2030.5:ns every document on this bench carries). It assigns
+// twenty-two bits in a completely different order from the standard this product
+// is certified against.
+//
+//	A WITNESS IS INDEPENDENT ONLY IF ITS SOURCE IS. Agreement among three
+//	readers of one document is one witness wearing three coats.
+//
+// So the table below is transcribed from IEEE Std 2030.5-2018 — the PUBLISHED
+// standard, printed pages 251-252 — which is a document that does not live in
+// this repository and cannot be re-derived from anything that does. The test
+// file carries the standard's own sentence verbatim, with its page cite, and
+// rebuilds the table from that text; a reviewer compares text against text. See
+// lexa-proto docs/schema/NORMATIVE_ANCHOR.md for the full three-way census
+// (2018 vs 2023 vs the draft) and for why the draft is a reference artifact and
+// not an anchor.
+//
+// The XSD is still worth citing where it AGREES, and the divergence is itself
+// asserted (TestModesOracleBitTable_DivergesFromTheDraftExactlyAsTheCensusSays)
+// so that a re-vendored schema — or a future edit that quietly re-anchors this
+// file to the file it can reach — fails loudly instead of silently.
 //
 // # Provenance of the table below
 //
-// Source: lexa-proto docs/schema/sep-2.0.4.xsd
-//	sha256 2e0f7e22caa2cb98a85598d9ae8cb7cb5ca9ffac32f74e90377b274f688762ac
-//	(lexa-proto @ 468f8bf, read 2026-08-15)
+// Source: IEEE Std 2030.5-2018, "IEEE Standard for Smart Energy Profile
+// Application Protocol", © 2018 IEEE. Local corpus copy:
+// ~/Documents/standards/20305-2018.pdf. PAGE CITES ARE PRINTED PAGE NUMBERS,
+// which run one lower than the PDF page index.
 //
-// Two places in that file are transcribed:
+// Two places in that document are transcribed:
 //
-//   - lines 3825-3855, complexType "DERControlType" — the bit assignments
-//     themselves, twenty-two of them, 0..21, under the sentence "Bit positions
-//     SHALL be defined as follows". Line 3853 declares the type's base as
-//     HexBinary32, which is what parseModesSupported reads it as.
-//   - lines 3689-3794, complexType "DERControlBase" — the twenty opMod*
-//     ELEMENTS a DERControl actually carries on the wire, which is how a mode
-//     becomes observable in a transcript at all. Each element line is cited
-//     against the bit it corresponds to.
+//   - printed p.251-252, "DERControlType object (HexBinary32) — Control modes
+//     supported by the DER. Bit positions SHALL be defined as follows:" —
+//     twenty-seven assignments, bits 0..26, then "All other values reserved."
+//     The object's own declaration gives it the base HexBinary32, which is what
+//     parseModesSupported reads the element text as (2018 p.174).
+//   - printed p.248-251, "DERControlBase object ()" — the twenty-five opMod*
+//     ATTRIBUTES a DERControl actually carries on the wire, which is how a mode
+//     becomes observable in a transcript at all. Each is cited by page against
+//     the bit it corresponds to.
 //
-// The two lists are not the same length and that is a fact about the schema, not
-// a transcription slip: bits 19 (Charge mode) and 20 (Discharge mode) have NO
+// The two lists are not the same length and that is a fact about the standard,
+// not a transcription slip: bits 0 (Charge mode) and 1 (Discharge mode) have NO
 // DERControlBase element of their own — they are storage direction modes carried
 // through opModFixedW's sign — so no transcript can ever evidence them by
 // element name. They are in the table, marked with no element, and the oracle
 // says so rather than silently treating them as unevidenceable-therefore-fine.
 //
-// modesSupported itself is declared at line 3571 of the same file
-// (DERCapability's sequence, minOccurs=1) with type DERControlType.
+// IEEE Std 2030.5-2023 (p.274-275) is the corroborating witness: identical for
+// bits 0..26, and it DEFINES 27..31 (opModDeltaVar, opModDeltaW, opModFixedV,
+// opModGridConnectPermit, opModIslandPermit) which 2018 reserves. This oracle is
+// anchored to 2018, so it grades 27..31 as reserved and says the 2023 sentence
+// out loud when it does — a DUT built to the newer revision must not be told it
+// invented a bit.
 //
-// # One cross-document disagreement, recorded rather than absorbed
+// # A cross-document disagreement, now WITHDRAWN
 //
 // CORE-014's own observables carry the line "modesSupported bit for
-// opModMaxLimW shown as modesSupported=20 in the doc". Twenty is not
-// opModMaxLimW's bit under sep 2.0.4 — that is bit 13 (line 3841) — and 20 is
-// not the mask either, under any reading: hexadecimal 20 is bit 5
-// (opModLVRTMomentaryCessation) and decimal 20 is bits 2 and 4. Whatever
-// CSIP-CONF-v1.3 meant by the number, this oracle grades against the SCHEMA,
-// which is the document the payload is validated by and the only one with a
-// normative "Bit positions SHALL be defined as follows". The disagreement is
-// written down here so that a reader who finds it in the catalogue knows it was
-// seen and not quietly reconciled.
+// opModMaxLimW shown as modesSupported=20 in the doc". Under the draft schema
+// that number matched nothing, and this file used to record the mismatch as an
+// unreconciled disagreement with the catalog. Under the published standard it
+// is simply RIGHT: IEEE 2030.5-2018 p.252 assigns opModMaxLimW to bit 20. The
+// catalog was correct and the accusation is withdrawn — which is the shape this
+// whole wave keeps taking, and the reason the draft was worth un-anchoring from.
 
 import (
 	"fmt"
@@ -91,86 +107,112 @@ import (
 	"csip-tls-test/internal/certify"
 )
 
-// derControlTypeBit is one row of sep 2.0.4's DERControlType bit assignment,
-// hand-transcribed, with the schema line that says so.
+// derControlTypeBit is one row of IEEE 2030.5-2018's DERControlType bit
+// assignment, hand-transcribed, with the printed page that says so.
 type derControlTypeBit struct {
-	// Bit is the position, 0-based, as the schema numbers it.
+	// Bit is the position, 0-based, as the standard numbers it.
 	Bit uint
-	// Mode is the schema's own name for the mode at this position, verbatim
-	// from the DERControlType documentation line.
+	// Mode is the standard's own name for the mode at this position, verbatim
+	// from the DERControlType assignment line.
 	Mode string
 	// Element is the DERControlBase element that carries this mode on the wire,
-	// or "" for a bit the schema names but gives no element (bits 19 and 20).
+	// or "" for a bit the standard names but gives no element (bits 0 and 1).
 	Element string
-	// XSDLine is the line of sep-2.0.4.xsd carrying the bit assignment.
-	XSDLine int
-	// ElementLine is the line of sep-2.0.4.xsd declaring Element inside
-	// complexType DERControlBase, or 0 when Element is "".
-	ElementLine int
+	// Page is the PRINTED page of IEEE Std 2030.5-2018 carrying the bit
+	// assignment. Printed page = PDF page index − 1.
+	Page int
+	// ElementPage is the printed page declaring Element as an attribute of
+	// DERControlBase, or 0 when Element is "".
+	ElementPage int
 }
 
-// derControlTypeBits is the transcription. TWENTY-TWO entries, 0..21.
+// derControlTypeBits is the transcription. TWENTY-SEVEN entries, 0..26.
 //
-// Read it against the schema, not against any Go source in this tree. Every
-// XSDLine is a line you can `sed -n '<line>p'` out of lexa-proto's
-// docs/schema/sep-2.0.4.xsd and compare word for word; the test file quotes the
-// whole documentation block verbatim and rebuilds this table from the quote, so
-// a typo here cannot pass unnoticed even without the schema file present.
+// Read it against IEEE Std 2030.5-2018, not against any Go source in this tree
+// and not against the vendored draft schema. Every Page is a printed page you
+// can open and compare word for word; the test file quotes the standard's whole
+// assignment block verbatim and rebuilds this table from the quote, so a typo
+// here cannot pass unnoticed even on a machine with no copy of the standard.
 var derControlTypeBits = []derControlTypeBit{
-	// XSD 3828: "0 - opModVoltVar (Volt-Var Mode)"
-	{Bit: 0, Mode: "opModVoltVar", Element: "opModVoltVar", XSDLine: 3828, ElementLine: 3774},
-	// XSD 3829: "1 - opModFreqWatt (Frequency-Watt Curve Mode)"
-	{Bit: 1, Mode: "opModFreqWatt", Element: "opModFreqWatt", XSDLine: 3829, ElementLine: 3724},
-	// XSD 3830: "2 - opModFreqDroop (Frequency-Watt Parameterized Mode)"
-	{Bit: 2, Mode: "opModFreqDroop", Element: "opModFreqDroop", XSDLine: 3830, ElementLine: 3719},
-	// XSD 3831: "3 - opModWattPF (Watt-PowerFactor Mode)"
-	{Bit: 3, Mode: "opModWattPF", Element: "opModWattPF", XSDLine: 3831, ElementLine: 3784},
-	// XSD 3832: "4 - opModVoltWatt (Volt-Watt Mode)"
-	{Bit: 4, Mode: "opModVoltWatt", Element: "opModVoltWatt", XSDLine: 3832, ElementLine: 3779},
-	// XSD 3833: "5 - opModLVRTMomentaryCessation (Low Voltage Ride Through, Momentary Cessation Mode)"
-	{Bit: 5, Mode: "opModLVRTMomentaryCessation", Element: "opModLVRTMomentaryCessation",
-		XSDLine: 3833, ElementLine: 3749},
-	// XSD 3834: "6 - opModLVRTMustTrip (Low Voltage Ride Through, Must Trip Mode)"
-	{Bit: 6, Mode: "opModLVRTMustTrip", Element: "opModLVRTMustTrip", XSDLine: 3834, ElementLine: 3754},
-	// XSD 3835: "7 - opModHVRTMomentaryCessation (High Voltage Ride Through, Momentary Cessation Mode)"
-	{Bit: 7, Mode: "opModHVRTMomentaryCessation", Element: "opModHVRTMomentaryCessation",
-		XSDLine: 3835, ElementLine: 3734},
-	// XSD 3836: "8 - opModHVRTMustTrip (High Voltage Ride Through, Must Trip Mode)"
-	{Bit: 8, Mode: "opModHVRTMustTrip", Element: "opModHVRTMustTrip", XSDLine: 3836, ElementLine: 3739},
-	// XSD 3837: "9 - opModLFRTMustTrip (Low Frequency Ride Through, Must Trip Mode)"
-	{Bit: 9, Mode: "opModLFRTMustTrip", Element: "opModLFRTMustTrip", XSDLine: 3837, ElementLine: 3744},
-	// XSD 3838: "10 - opModHFRTMustTrip (High Frequency Ride Through, Must Trip Mode)"
-	{Bit: 10, Mode: "opModHFRTMustTrip", Element: "opModHFRTMustTrip", XSDLine: 3838, ElementLine: 3729},
-	// XSD 3839: "11 - opModConnect (Connect / Disconnect - implies galvanic isolation)"
-	{Bit: 11, Mode: "opModConnect", Element: "opModConnect", XSDLine: 3839, ElementLine: 3694},
-	// XSD 3840: "12 - opModEnergize (Energize / De-Energize)"
-	{Bit: 12, Mode: "opModEnergize", Element: "opModEnergize", XSDLine: 3840, ElementLine: 3699},
-	// XSD 3841: "13 - opModMaxLimW (Maximum Active Power)"
-	{Bit: 13, Mode: "opModMaxLimW", Element: "opModMaxLimW", XSDLine: 3841, ElementLine: 3759},
-	// XSD 3842: "14 - opModFixedVar (Reactive Power Setpoint)"
-	{Bit: 14, Mode: "opModFixedVar", Element: "opModFixedVar", XSDLine: 3842, ElementLine: 3709},
-	// XSD 3843: "15 - opModFixedPF (Fixed Power Factor Setpoint)"
-	{Bit: 15, Mode: "opModFixedPF", Element: "opModFixedPF", XSDLine: 3843, ElementLine: 3704},
-	// XSD 3844: "16 - opModFixedW (Charge / Discharge Setpoint)"
-	{Bit: 16, Mode: "opModFixedW", Element: "opModFixedW", XSDLine: 3844, ElementLine: 3714},
-	// XSD 3845: "17 - opModTargetW (Target Active Power)"
-	{Bit: 17, Mode: "opModTargetW", Element: "opModTargetW", XSDLine: 3845, ElementLine: 3769},
-	// XSD 3846: "18 - opModTargetVar (Target Reactive Power)"
-	{Bit: 18, Mode: "opModTargetVar", Element: "opModTargetVar", XSDLine: 3846, ElementLine: 3764},
-	// XSD 3847: "19 - Charge mode". No DERControlBase element: the schema names
-	// the mode and gives it no carriage of its own.
-	{Bit: 19, Mode: "Charge mode", Element: "", XSDLine: 3847},
-	// XSD 3848: "20 - Discharge mode". Likewise.
-	{Bit: 20, Mode: "Discharge mode", Element: "", XSDLine: 3848},
-	// XSD 3849: "21 - opModWattVar (Watt-Var Mode)"
-	{Bit: 21, Mode: "opModWattVar", Element: "opModWattVar", XSDLine: 3849, ElementLine: 3789},
+	// 2018 p.251: "0 = Charge mode". No DERControlBase element: the standard
+	// names the mode and gives it no carriage of its own.
+	{Bit: 0, Mode: "Charge mode", Element: "", Page: 251},
+	// 2018 p.251: "1 = Discharge mode". Likewise.
+	{Bit: 1, Mode: "Discharge mode", Element: "", Page: 251},
+	// 2018 p.251: "2 = opModConnect (connect/disconnect—implies galvanic isolation)"
+	{Bit: 2, Mode: "opModConnect", Element: "opModConnect", Page: 251, ElementPage: 248},
+	// 2018 p.251: "3 = opModEnergize (energize/de-energize)"
+	{Bit: 3, Mode: "opModEnergize", Element: "opModEnergize", Page: 251, ElementPage: 248},
+	// 2018 p.251: "4 = opModFixedPFAbsorbW (fixed power factor setpoint when absorbing active power)"
+	{Bit: 4, Mode: "opModFixedPFAbsorbW", Element: "opModFixedPFAbsorbW", Page: 251, ElementPage: 248},
+	// 2018 p.251: "5 = opModFixedPFInjectW (fixed power factor setpoint when injecting active power)"
+	{Bit: 5, Mode: "opModFixedPFInjectW", Element: "opModFixedPFInjectW", Page: 251, ElementPage: 248},
+	// 2018 p.251: "6 = opModFixedVar (reactive power setpoint)"
+	{Bit: 6, Mode: "opModFixedVar", Element: "opModFixedVar", Page: 251, ElementPage: 248},
+	// 2018 p.252: "7 = opModFixedW (charge/discharge setpoint)"
+	{Bit: 7, Mode: "opModFixedW", Element: "opModFixedW", Page: 252, ElementPage: 248},
+	// 2018 p.252: "8 = opModFreqDroop (Frequency-Watt Parameterized mode)"
+	{Bit: 8, Mode: "opModFreqDroop", Element: "opModFreqDroop", Page: 252, ElementPage: 248},
+	// 2018 p.252: "9 = opModFreqWatt (Frequency-Watt Curve mode)"
+	{Bit: 9, Mode: "opModFreqWatt", Element: "opModFreqWatt", Page: 252, ElementPage: 248},
+	// 2018 p.252: "10 = opModHFRTMayTrip (High Frequency Ride-Through, May Trip mode)"
+	{Bit: 10, Mode: "opModHFRTMayTrip", Element: "opModHFRTMayTrip", Page: 252, ElementPage: 248},
+	// 2018 p.252: "11 = opModHFRTMustTrip (High Frequency Ride-Through, Must Trip mode)"
+	{Bit: 11, Mode: "opModHFRTMustTrip", Element: "opModHFRTMustTrip", Page: 252, ElementPage: 249},
+	// 2018 p.252: "12 = opModHVRTMayTrip (High Voltage Ride-Through, May Trip mode)"
+	{Bit: 12, Mode: "opModHVRTMayTrip", Element: "opModHVRTMayTrip", Page: 252, ElementPage: 249},
+	// 2018 p.252: "13 = opModHVRTMomentaryCessation (High Voltage Ride-Through, Momentary Cessation mode)"
+	{Bit: 13, Mode: "opModHVRTMomentaryCessation", Element: "opModHVRTMomentaryCessation",
+		Page: 252, ElementPage: 249},
+	// 2018 p.252: "14 = opModHVRTMustTrip (High Voltage Ride-Through, Must Trip mode)"
+	{Bit: 14, Mode: "opModHVRTMustTrip", Element: "opModHVRTMustTrip", Page: 252, ElementPage: 249},
+	// 2018 p.252: "15 = opModLFRTMayTrip (Low Frequency Ride-Through, May Trip mode)"
+	{Bit: 15, Mode: "opModLFRTMayTrip", Element: "opModLFRTMayTrip", Page: 252, ElementPage: 249},
+	// 2018 p.252: "16 = opModLFRTMustTrip (Low Frequency Ride-Through, Must Trip mode)"
+	{Bit: 16, Mode: "opModLFRTMustTrip", Element: "opModLFRTMustTrip", Page: 252, ElementPage: 249},
+	// 2018 p.252: "17 = opModLVRTMayTrip (Low Voltage Ride-Through, May Trip mode)"
+	{Bit: 17, Mode: "opModLVRTMayTrip", Element: "opModLVRTMayTrip", Page: 252, ElementPage: 249},
+	// 2018 p.252: "18 = opModLVRTMomentaryCessation (Low Voltage Ride-Through, Momentary Cessation mode)"
+	{Bit: 18, Mode: "opModLVRTMomentaryCessation", Element: "opModLVRTMomentaryCessation",
+		Page: 252, ElementPage: 250},
+	// 2018 p.252: "19 = opModLVRTMustTrip (Low Voltage Ride-Through, Must Trip mode)"
+	{Bit: 19, Mode: "opModLVRTMustTrip", Element: "opModLVRTMustTrip", Page: 252, ElementPage: 250},
+	// 2018 p.252: "20 = opModMaxLimW (maximum active power)"
+	{Bit: 20, Mode: "opModMaxLimW", Element: "opModMaxLimW", Page: 252, ElementPage: 250},
+	// 2018 p.252: "21 = opModTargetVar (target reactive power)"
+	{Bit: 21, Mode: "opModTargetVar", Element: "opModTargetVar", Page: 252, ElementPage: 250},
+	// 2018 p.252: "22 = opModTargetW (target active power)"
+	{Bit: 22, Mode: "opModTargetW", Element: "opModTargetW", Page: 252, ElementPage: 250},
+	// 2018 p.252: "23 = opModVoltVar (Volt-Var mode)"
+	{Bit: 23, Mode: "opModVoltVar", Element: "opModVoltVar", Page: 252, ElementPage: 250},
+	// 2018 p.252: "24 = opModVoltWatt (Volt-Watt mode)"
+	{Bit: 24, Mode: "opModVoltWatt", Element: "opModVoltWatt", Page: 252, ElementPage: 250},
+	// 2018 p.252: "25 = opModWattPF (Watt-Powerfactor mode)"
+	{Bit: 25, Mode: "opModWattPF", Element: "opModWattPF", Page: 252, ElementPage: 251},
+	// 2018 p.252: "26 = opModWattVar (Watt-Var mode)"
+	{Bit: 26, Mode: "opModWattVar", Element: "opModWattVar", Page: 252, ElementPage: 251},
 }
 
-// modesSupportedReservedFrom is the first bit position sep 2.0.4 does NOT
-// assign. Line 3850: "All other values reserved." A DER that sets one is
-// advertising a mode the standard has not defined, which no evidence can ever
-// justify and which this oracle grades as an overclaim in its own right.
-const modesSupportedReservedFrom = 22
+// modesSupportedReservedFrom is the first bit position IEEE Std 2030.5-2018
+// does NOT assign. p.252: "All other values reserved." A DER that sets one is
+// advertising a mode the anchor revision has not defined, which no evidence can
+// ever justify and which this oracle grades as an overclaim in its own right.
+//
+// IT IS 27 UNDER 2018 AND ONLY UNDER 2018. IEEE Std 2030.5-2023 p.275 DEFINES
+// bits 27..31 — opModDeltaVar, opModDeltaW, opModFixedV, opModGridConnectPermit
+// and opModIslandPermit — so a device built to the newer revision can set one of
+// them honestly. The finding text says so (see reservedBitNote): a bundle reader
+// must be able to tell "this DUT invented a bit" from "this DUT is newer than
+// the revision this campaign certifies against", and those are different
+// sentences about different problems.
+const modesSupportedReservedFrom = 27
+
+// reservedBitNote is the 2023 half of a reserved-bit finding, written once so
+// every path that reports one says the same thing.
+const reservedBitNote = "IEEE Std 2030.5-2023 p.275 DEFINES bits 27-31 (opModDeltaVar, opModDeltaW, " +
+	"opModFixedV, opModGridConnectPermit, opModIslandPermit); this campaign is anchored to 2018, under " +
+	"which they are reserved, so a DUT built to the newer revision must be read as ahead of this " +
+	"anchor rather than as inventing a mode"
 
 // bitForElement resolves a DERControlBase element name to its schema bit.
 func bitForElement(element string) (derControlTypeBit, bool) {
@@ -216,14 +258,15 @@ func describeMask(mask uint32) string {
 			parts = append(parts, fmt.Sprintf("bit %d %s", p, b.Mode))
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("bit %d RESERVED by sep 2.0.4 (line 3850)", p))
+		parts = append(parts, fmt.Sprintf("bit %d RESERVED by IEEE 2030.5-2018 (p.252)", p))
 	}
 	return strings.Join(parts, ", ")
 }
 
-// hexBinary32 is the lexical space of the type modesSupported extends
-// (sep-2.0.4.xsd line 3853, `<xs:extension base="HexBinary32"/>`): up to eight
-// hexadecimal digits.
+// hexBinary32 is the lexical space of the type modesSupported extends. IEEE Std
+// 2030.5-2018 p.251 declares "DERControlType object (HexBinary32)" and p.174
+// gives HexBinary32 as "A 32-bit field encoded as a hex string (8 hex
+// characters maximum)": up to eight hexadecimal digits.
 var hexBinary32 = regexp.MustCompile(`^[0-9a-fA-F]{1,8}$`)
 
 // decimalText matches a wholly decimal rendering — what a serializer that
@@ -236,9 +279,9 @@ var decimalText = regexp.MustCompile(`^[0-9]{1,10}$`)
 //
 // # Why there are two numbers here
 //
-// The schema says HexBinary32 (line 3853), so the SCHEMA reading of the element
-// text is hexadecimal, and that is the reading Value carries and the reading
-// the oracle grades on. But a serializer that models the field as a bare
+// The standard says HexBinary32 (2018 p.251), so the STANDARD's reading of the
+// element text is hexadecimal, and that is the reading Value carries and the
+// reading the oracle grades on. But a serializer that models the field as a bare
 // unsigned integer emits DECIMAL, and for a text made only of the digits 0-9
 // both readings are lexically valid and numerically different: "8192" is bit 13
 // read as decimal and bits 1,4,7,8,15 read as hex. Neither end can detect it —
@@ -287,14 +330,14 @@ func (m modesMask) Ambiguous() bool { return m.Decimal != nil }
 func parseModesSupported(text string) (modesMask, error) {
 	t := strings.TrimSpace(text)
 	if t == "" {
-		return modesMask{}, fmt.Errorf("the <modesSupported> element is present but empty; sep 2.0.4 " +
-			"line 3571 declares it minOccurs=1 with type DERControlType, whose lexical space (line 3853, " +
-			"base HexBinary32) has no empty member")
+		return modesMask{}, fmt.Errorf("the <modesSupported> element is present but empty; IEEE Std " +
+			"2030.5-2018 p.246 declares it a mandatory [1] attribute of DERCapability with type " +
+			"DERControlType, whose lexical space (p.251, HexBinary32) has no empty member")
 	}
 	if !hexBinary32.MatchString(t) {
-		return modesMask{}, fmt.Errorf("the <modesSupported> text %q is not a HexBinary32 value; sep 2.0.4 "+
-			"line 3853 gives DERControlType the base HexBinary32, whose lexical space is one to eight "+
-			"hexadecimal digits", t)
+		return modesMask{}, fmt.Errorf("the <modesSupported> text %q is not a HexBinary32 value; IEEE Std "+
+			"2030.5-2018 p.251 declares DERControlType a HexBinary32 and p.174 gives that type's lexical "+
+			"space as one to eight hexadecimal digits", t)
 	}
 	v, err := strconv.ParseUint(t, 16, 32)
 	if err != nil {
@@ -476,8 +519,8 @@ func gatherModesEvidence(t *Transcript) modesEvidence {
 func (e *modesEvidence) readMask(doc *Node, cite *Message, where string) {
 	el := doc.Child("modesSupported")
 	if el == nil {
-		e.MaskErr = fmt.Errorf("%s carries NO <modesSupported> element at all, and sep 2.0.4 line 3571 "+
-			"declares it minOccurs=1 on DERCapability — it is not an optional field", where)
+		e.MaskErr = fmt.Errorf("%s carries NO <modesSupported> element at all, and IEEE Std 2030.5-2018 "+
+			"p.246 declares it [1] on DERCapability — it is not an optional field", where)
 		e.MaskWhere, e.MaskMsg = where, cite
 		return
 	}
@@ -547,7 +590,7 @@ func gradeModesSupported(e modesEvidence) Finding {
 	if e.Mask.Ambiguous() {
 		altVerdict, altBody := gradeMaskAgainstEvidence(e, *e.Mask.Decimal, "")
 		note := fmt.Sprintf(". AMBIGUOUS SERIALIZATION: the wire text %q is lexically valid under BOTH "+
-			"sep 2.0.4's HexBinary32 (line 3853), which this oracle graded and which reads it as 0x%08X "+
+			"IEEE 2030.5-2018's HexBinary32 (p.251), which this oracle graded and which reads it as 0x%08X "+
 			"(%s), AND under a plain-decimal serialization, which reads it as 0x%08X (%s). Under the "+
 			"decimal reading this criterion would be %s: %s. Which serialization the DUT intended is a "+
 			"question about the DUT that the wire does not answer, and it must be settled before either "+
@@ -577,18 +620,18 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 		}
 		b, ok := bitForElement(name)
 		if !ok {
-			// A mode the DUT demonstrably RAN and sep 2.0.4 gives no bit for.
-			// This is not an underclaim and grading it as one would demand a bit
-			// that does not exist — but it is not nothing either: the mask is
-			// then a strictly incomplete description of what this device does,
-			// and a reader comparing "modes supported" against a campaign
-			// transcript is entitled to know which executed modes the field
-			// COULD NOT have carried. The PICS is where they have to be
-			// declared; this says so rather than leaving a silent gap.
+			// A mode the DUT demonstrably RAN and 2030.5 gives no bit for. This
+			// is not an underclaim and grading it as one would demand a bit that
+			// does not exist — but it is not nothing either: the mask is then a
+			// strictly incomplete description of what this device does, and a
+			// reader comparing "modes supported" against a campaign transcript is
+			// entitled to know which executed modes the field COULD NOT have
+			// carried. The PICS is where they have to be declared; this says so
+			// rather than leaving a silent gap.
 			unadvertisable = append(unadvertisable, fmt.Sprintf(
-				"<%s> (executed under mRID %s; sep 2.0.4's DERControlType assigns it no bit, so no "+
-					"value of modesSupported can advertise it and the device's PICS is the only place "+
-					"it can be declared)", name, strings.Join(r.Executed, "/")))
+				"<%s> (executed under mRID %s; IEEE 2030.5-2018's DERControlType (p.251-252) assigns it "+
+					"no bit, so no value of modesSupported can advertise it and the device's PICS is the "+
+					"only place it can be declared)", name, strings.Join(r.Executed, "/")))
 			continue
 		}
 		evidenced = append(evidenced, fmt.Sprintf("%s (bit %d, mRID %s)", name, b.Bit,
@@ -596,9 +639,9 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 		if mask&(1<<b.Bit) == 0 {
 			underclaims = append(underclaims, fmt.Sprintf(
 				"%s: the DUT answered Response status 2 (Event started) or 3 (Event completed) for "+
-					"control(s) %s whose DERControlBase named <%s>, and bit %d — which sep 2.0.4 line %d "+
-					"assigns to %s — is CLEAR in the mask it advertises",
-				name, strings.Join(r.Executed, ", "), name, b.Bit, b.XSDLine, b.Mode))
+					"control(s) %s whose DERControlBase named <%s>, and bit %d — which IEEE 2030.5-2018 "+
+					"p.%d assigns to %s — is CLEAR in the mask it advertises",
+				name, strings.Join(r.Executed, ", "), name, b.Bit, b.Page, b.Mode))
 		}
 	}
 
@@ -607,16 +650,17 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 		b, ok := bitAt(pos)
 		if !ok {
 			reserved = append(reserved, fmt.Sprintf(
-				"bit %d is set and sep 2.0.4 assigns no mode to it — line 3850 of the schema says \"All "+
-					"other values reserved\" of every position above %d, so nothing the DUT could do "+
-					"would make this bit honest", pos, modesSupportedReservedFrom-1))
+				"bit %d is set and IEEE Std 2030.5-2018 assigns no mode to it — p.252 says \"All other "+
+					"values reserved\" of every position above %d, so nothing the DUT could do would make "+
+					"this bit honest under the revision this campaign certifies against. (%s.)",
+				pos, modesSupportedReservedFrom-1, reservedBitNote))
 			continue
 		}
 		advertised = append(advertised, fmt.Sprintf("bit %d %s", b.Bit, b.Mode))
 		r := e.ByMode[b.Element]
 		switch {
 		case b.Element == "":
-			silent = append(silent, fmt.Sprintf("bit %d %s (the schema gives this mode no DERControlBase "+
+			silent = append(silent, fmt.Sprintf("bit %d %s (the standard gives this mode no DERControlBase "+
 				"element, so no transcript can evidence it either way)", b.Bit, b.Mode))
 		case r == nil || (len(r.Executed) == 0 && len(r.Refused) == 0):
 			if picsDeclares(e.PICS, b) {
@@ -628,11 +672,11 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 			// Advertised and demonstrably honoured. Nothing to say.
 		default:
 			overclaims = append(overclaims, fmt.Sprintf(
-				"%s: bit %d is SET — sep 2.0.4 line %d assigns it to %s — and the DUT REFUSED every "+
+				"%s: bit %d is SET — IEEE 2030.5-2018 p.%d assigns it to %s — and the DUT REFUSED every "+
 					"control that named <%s> (mRID %s), answering a cannot-comply status and never 2 "+
 					"(Event started) or 3 (Event completed). The mask promises a utility server a mode "+
 					"the DUT declines to perform",
-				b.Element, b.Bit, b.XSDLine, b.Mode, b.Element, strings.Join(r.Refused, ", ")))
+				b.Element, b.Bit, b.Page, b.Mode, b.Element, strings.Join(r.Refused, ", ")))
 		}
 	}
 
@@ -652,16 +696,16 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 				continue
 			}
 			overclaims = append(overclaims, fmt.Sprintf(
-				"%s: bit %d is SET — sep 2.0.4 line %d — and it is neither declared by the "+
+				"%s: bit %d is SET — IEEE 2030.5-2018 p.%d — and it is neither declared by the "+
 					"operator-supplied PICS (%s) nor evidenced by anything the DUT did in this evidence. "+
 					"A bit outside the declaration is an advertisement nobody stands behind",
-				b.Mode, b.Bit, b.XSDLine, e.PICSRaw))
+				b.Mode, b.Bit, b.Page, e.PICSRaw))
 		}
 	}
 
 	// ── The sentence ─────────────────────────────────────────────────────
-	head := fmt.Sprintf("%s advertises modesSupported=%q, which sep 2.0.4 (line 3853, base HexBinary32) "+
-		"reads as 0x%08X = %s. Scope of the executed-mode half: %s",
+	head := fmt.Sprintf("%s advertises modesSupported=%q, which IEEE Std 2030.5-2018 (p.251, "+
+		"DERControlType is a HexBinary32) reads as 0x%08X = %s. Scope of the executed-mode half: %s",
 		e.MaskWhere, e.Mask.Text, mask, describeMask(mask), e.Scope)
 	if len(e.PICS) > 0 {
 		head += fmt.Sprintf(". PICS declaration supplied by the operator: %s", e.PICSRaw)
@@ -747,8 +791,10 @@ const modesScopeRowWindow = "this row's own capture window only — the executed
 //	(a) OVERCLAIM — every bit SET must be a mode the DUT stands behind. A bit
 //	    whose mode the DUT REFUSED (cannot-comply, never started/completed) is a
 //	    promise to a utility server the device declines to keep, and fails. A bit
-//	    sep 2.0.4 does not assign at all fails on the schema alone. With a PICS
-//	    supplied, a bit outside the declaration fails too.
+//	    IEEE 2030.5-2018 does not assign at all fails on the standard alone (with
+//	    the 2023 sentence quoted beside it, so "ahead of this anchor" is
+//	    distinguishable from "invented"). With a PICS supplied, a bit outside the
+//	    declaration fails too.
 //
 //	(b) UNDERCLAIM — every mode this evidence PROVES executed (a control naming
 //	    that DERControlBase element which the DUT answered status 2 or 3) must
@@ -757,9 +803,10 @@ const modesScopeRowWindow = "this row's own capture window only — the executed
 //	    reads modesSupported to decide what to send will never send it.
 //
 // The bit positions come from derControlTypeBits — this file's own hand
-// transcription of sep-2.0.4.xsd — and from nothing else. Not from
-// lexa-proto/csipmodel, whose table is wrong today and whose agreement with the
-// DUT would make every verdict below vacuous.
+// transcription of IEEE Std 2030.5-2018 p.251-252 — and from nothing else.
+// Not from lexa-proto/csipmodel, whose agreement with the DUT would make every
+// verdict below vacuous, and not from the vendored draft schema, which is what
+// made the FIRST version of this oracle agree with a wrong table (IW15-027).
 //
 // There is no SKIP path through the decision: once a DERCapability is in hand,
 // this criterion returns a verdict. The single Unavailable it can return is "no
@@ -770,13 +817,15 @@ func critModesSupportedCoherent(o *Observation, picsRaw string) criterion {
 	return criterion{
 		Claim: "every bit set in the DERCapability.modesSupported the DUT serves is a mode it stands " +
 			"behind, and every mode it demonstrably executed has its bit set",
-		How: "the modesSupported bitmap decoded against bit positions HAND-TRANSCRIBED from " +
-			"lexa-proto docs/schema/sep-2.0.4.xsd lines 3828-3849 (complexType DERControlType, \"Bit " +
-			"positions SHALL be defined as follows\") as HexBinary32 (line 3853), carrying NO dependency " +
-			"on lexa-proto/csipmodel's Mode* constants — the product's own table, which currently " +
-			"disagrees with the schema and whose agreement with the DUT would make this check vacuous " +
-			"(IW15-011) — cross-checked against the DERControlBase element each control carried " +
-			"(schema lines 3694-3789) and the Response status the DUT POSTed for it",
+		How: "the modesSupported bitmap decoded against bit positions HAND-TRANSCRIBED from IEEE Std " +
+			"2030.5-2018, printed pages 251-252 (\"DERControlType object (HexBinary32) — Control modes " +
+			"supported by the DER. Bit positions SHALL be defined as follows:\", bits 0-26), read as a " +
+			"HexBinary32, carrying NO dependency on lexa-proto/csipmodel's Mode* constants — the " +
+			"product's own table, whose agreement with the DUT would make this check vacuous (IW15-011) " +
+			"— and none on the vendored sep-2.0.4.xsd, which is the pre-publication ZigBee draft whose " +
+			"bit order differs and whose use as an anchor is the defect IW15-027 corrects; cross-checked " +
+			"against the DERControlBase element each control carried (2018 p.248-251) and the Response " +
+			"status the DUT POSTed for it",
 		NeedsTranscript: true,
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 			e := gatherModesEvidence(t)
