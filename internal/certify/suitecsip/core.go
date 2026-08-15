@@ -507,7 +507,34 @@ func coreAdvancedDERProgram(ctx context.Context, rc *certify.RunCtx) (certify.Re
 // first) — giving the DUT's NEXT walk a change to notice and re-announce,
 // which is exactly what CORE-009/CORE-014 are written to catch and what a
 // window opened long after boot otherwise cannot.
+//
+// # Why the modesSupported oracle lives here
+//
+// CORE-014 is the row whose own observables enumerate the field: "HTTP GET
+// DERCapability -> 200 OK, XML contains type ..., modesSupported bitmap, ...",
+// "modesSupported bit for opModMaxLimW shown as modesSupported=20 in the doc",
+// and "Optional-mode branches keyed off modesSupported bits opModFixedVAr,
+// opModFixedPFInjectW, opModVoltWatt, opModVoltVAr, opModWattPF". Its procedure
+// steps 6-10 are almost entirely a reading of that bitmap. Until now the suite
+// asserted that the DERCapability PUT happened and that its numbers were
+// internally consistent, and said nothing at all about the one field the row's
+// steps are written around. critModesSupportedCoherent is that missing
+// assertion, and it derives its bit positions from the SCHEMA rather than from
+// the product's own table — see modes_oracle.go for why that distinction is the
+// whole point of it existing.
+//
+// Erratum 39 is not a licence to skip it. It downgrades "modesSupported MUST
+// include X" to "MAY include X" — i.e. the suite may not demand a PARTICULAR
+// bit — and says in as many words that a capability's presence is conditional
+// on "a specific mode being supported (i.e. bit position in modesSupported)".
+// That leaves the bitmap's own COHERENCE entirely in scope: nothing in the
+// erratum permits advertising a mode the device refuses, or executing one it
+// never advertised.
 func coreDERSettings(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
+	// The operator's PICS declaration, when there is one. Read here rather than
+	// inside the criterion because the criterion is minted from the capture,
+	// long after the RunCtx's own phase is over.
+	pics, _ := rc.Param(modesSupportedPICSParam)
 	return run(ctx, rc, spec{
 		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
 			capHref, setHref, err := d.RehomeDER(ctx)
@@ -532,14 +559,21 @@ func coreDERSettings(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 				len(o.Server.PutsFor("DERCapability")), len(o.Server.PutsFor("DERSettings"))) + rehomeNote(o)
 		},
 		Criteria: func(o *Observation) []criterion {
-			return []criterion{
-				critResource("DERList", "the DUT fetched the DERList and the server answered 200", nil),
-				critDERPut("DERCapability"),
-				critDERPut("DERSettings"),
-				critNameplateConsistency(),
-			}
+			return core014Criteria(o, pics)
 		},
 	})
+}
+
+// core014Criteria is CORE-014's assertion list, named so the row's own tests
+// can ask what it mints without standing up a bench.
+func core014Criteria(o *Observation, pics string) []criterion {
+	return []criterion{
+		critResource("DERList", "the DUT fetched the DERList and the server answered 200", nil),
+		critDERPut("DERCapability"),
+		critDERPut("DERSettings"),
+		critNameplateConsistency(),
+		critModesSupportedCoherent(o, pics),
+	}
 }
 
 // critNameplateConsistency checks CORE-014's numeric relations BETWEEN the two
