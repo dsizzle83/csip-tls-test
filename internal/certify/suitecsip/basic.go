@@ -2852,87 +2852,100 @@ func basicMeterReading(ctx context.Context, rc *certify.RunCtx) (certify.Result,
 				"fresh discovery walk AND a ReadingType-bearing MUP registration (predicate satisfied: %t)",
 				o.Waited.Round(rounding), o.Satisfied)
 		},
-		Criteria: func(o *Observation) []criterion {
-			return []criterion{
-				critGET(DiscoveryRoot,
-					"the DeviceCapability the server returned carries a MirrorUsagePointListLink",
-					"the MirrorUsagePointListLink element of the DeviceCapability payload",
-					func(doc *Node) (certify.Verdict, string) {
-						if !doc.Has("MirrorUsagePointListLink") {
-							return certify.Fail, "no MirrorUsagePointListLink, so the metering mirror is " +
-								"unreachable"
+		Criteria: basicMeterReadingCriteria,
+	})
+}
+
+// basicMeterReadingCriteria is BASIC-029's criterion list, named rather than
+// written inline so a test can mint it and assert on what it contains — the same
+// shape core014Criteria has. A criterion nobody can enumerate is a criterion
+// whose placement nothing pins, and this row has just gained one (IW15-028).
+func basicMeterReadingCriteria(o *Observation) []criterion {
+	return []criterion{
+		critGET(DiscoveryRoot,
+			"the DeviceCapability the server returned carries a MirrorUsagePointListLink",
+			"the MirrorUsagePointListLink element of the DeviceCapability payload",
+			func(doc *Node) (certify.Verdict, string) {
+				if !doc.Has("MirrorUsagePointListLink") {
+					return certify.Fail, "no MirrorUsagePointListLink, so the metering mirror is " +
+						"unreachable"
+				}
+				return certify.Pass, "MirrorUsagePointListLink present"
+			}),
+		critMUPRegistered(),
+		// The CONTENT of what was registered, which nothing graded
+		// until IW15-028. critMUPRegistered above asks whether a
+		// MirrorUsagePoint POST happened and was accepted, and stops
+		// there — so a resource missing a MANDATORY element, or claiming
+		// roles its own definition contradicts, passed that check and
+		// every other one of the 282. See mup_oracle.go.
+		critMUPElementsAndRoleFlags(o.Params[mupRoleFlagsPICSParam]),
+		{
+			Claim: "the ReadingType the DUT registered carries the CSIP monitoring encoding for real " +
+				"power: uom=38 (Watts), flowDirection and powerOfTenMultiplier present",
+			How:             "the ReadingType child elements of the MirrorUsagePoint payload",
+			NeedsTranscript: true,
+			Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+				for _, e := range t.Method("POST") {
+					doc, err := e.Req.SEP()
+					if err != nil || doc.Local() != "MirrorUsagePoint" {
+						continue
+					}
+					var uoms []string
+					for _, rt := range doc.Descendants("ReadingType") {
+						if u, ok := rt.UintOf("uom"); ok {
+							uoms = append(uoms, fmt.Sprint(u))
 						}
-						return certify.Pass, "MirrorUsagePointListLink present"
-					}),
-				critMUPRegistered(),
-				{
-					Claim: "the ReadingType the DUT registered carries the CSIP monitoring encoding for real " +
-						"power: uom=38 (Watts), flowDirection and powerOfTenMultiplier present",
-					How:             "the ReadingType child elements of the MirrorUsagePoint payload",
-					NeedsTranscript: true,
-					Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-						for _, e := range t.Method("POST") {
-							doc, err := e.Req.SEP()
-							if err != nil || doc.Local() != "MirrorUsagePoint" {
-								continue
-							}
-							var uoms []string
-							for _, rt := range doc.Descendants("ReadingType") {
-								if u, ok := rt.UintOf("uom"); ok {
-									uoms = append(uoms, fmt.Sprint(u))
-								}
-							}
-							if len(uoms) == 0 {
-								return citeMessage(t, e.Req, certify.Fail,
-									"no ReadingType in the MirrorUsagePoint carries a uom")
-							}
-							for _, u := range uoms {
-								if u == "38" {
-									return citeMessage(t, e.Req, certify.Pass,
-										"ReadingType uom values %s include 38 (real power, W)",
-										strings.Join(uoms, ","))
-								}
-							}
-							return citeMessage(t, e.Req, certify.Warn,
-								"ReadingType uom values are %s; CSIP Table 11 maps real power to 38, reactive "+
-									"to 63, frequency to 33 and voltage to 29. A DER mirroring only some of the "+
-									"monitoring data set is not necessarily non-conformant, so this is reported",
+					}
+					if len(uoms) == 0 {
+						return citeMessage(t, e.Req, certify.Fail,
+							"no ReadingType in the MirrorUsagePoint carries a uom")
+					}
+					for _, u := range uoms {
+						if u == "38" {
+							return citeMessage(t, e.Req, certify.Pass,
+								"ReadingType uom values %s include 38 (real power, W)",
 								strings.Join(uoms, ","))
 						}
-						return unavailable("the recovered transcript holds no MirrorUsagePoint POST")
-					},
-				},
-				{
-					Claim: "the DUT posts MirrorMeterReadings at the postRate the server advertised",
-					How: "the spacing between successive MirrorMeterReading POSTs, measured from capture " +
-						"timestamps, compared with the MirrorUsagePoint's postRate",
-					NeedsTranscript: true,
-					Wire: func(_ *certify.Evidence, t *Transcript) Finding {
-						var times []string
-						var frames []int
-						var last *Message
-						for _, e := range t.Method("POST") {
-							doc, err := e.Req.SEP()
-							if err != nil || doc.Local() != "MirrorMeterReading" {
-								continue
-							}
-							if last != nil && !last.Time.IsZero() && !e.Req.Time.IsZero() {
-								times = append(times, e.Req.Time.Sub(last.Time).Round(rounding).String())
-							}
-							last = e.Req
-							frames = append(frames, e.Frames()...)
-						}
-						if len(times) == 0 {
-							return unavailable("the window holds fewer than two MirrorMeterReading POSTs; a "+
-								"post-rate interval needs two. The bench's telemetry default is a 300 s post "+
-								"rate, so spanning it needs -param %s=11m or more", waitParam)
-						}
-						return found(certify.Pass, dedupeInts(frames),
-							"%d inter-post interval(s) measured from capture timestamps: %s",
-							len(times), strings.Join(times, ", "))
-					},
-				},
-			}
+					}
+					return citeMessage(t, e.Req, certify.Warn,
+						"ReadingType uom values are %s; CSIP Table 11 maps real power to 38, reactive "+
+							"to 63, frequency to 33 and voltage to 29. A DER mirroring only some of the "+
+							"monitoring data set is not necessarily non-conformant, so this is reported",
+						strings.Join(uoms, ","))
+				}
+				return unavailable("the recovered transcript holds no MirrorUsagePoint POST")
+			},
 		},
-	})
+		{
+			Claim: "the DUT posts MirrorMeterReadings at the postRate the server advertised",
+			How: "the spacing between successive MirrorMeterReading POSTs, measured from capture " +
+				"timestamps, compared with the MirrorUsagePoint's postRate",
+			NeedsTranscript: true,
+			Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+				var times []string
+				var frames []int
+				var last *Message
+				for _, e := range t.Method("POST") {
+					doc, err := e.Req.SEP()
+					if err != nil || doc.Local() != "MirrorMeterReading" {
+						continue
+					}
+					if last != nil && !last.Time.IsZero() && !e.Req.Time.IsZero() {
+						times = append(times, e.Req.Time.Sub(last.Time).Round(rounding).String())
+					}
+					last = e.Req
+					frames = append(frames, e.Frames()...)
+				}
+				if len(times) == 0 {
+					return unavailable("the window holds fewer than two MirrorMeterReading POSTs; a "+
+						"post-rate interval needs two. The bench's telemetry default is a 300 s post "+
+						"rate, so spanning it needs -param %s=11m or more", waitParam)
+				}
+				return found(certify.Pass, dedupeInts(frames),
+					"%d inter-post interval(s) measured from capture timestamps: %s",
+					len(times), strings.Join(times, ", "))
+			},
+		},
+	}
 }

@@ -754,6 +754,13 @@ func (s *Server) handleMUPCreate(w http.ResponseWriter, r *http.Request, peerLFD
 		LFDI:         mup.DeviceLFDI,
 		ReadingTypes: mupReadingTypeUOMs(body),
 		CreatedAt:    s.Now(),
+		// The RAW bytes, not a re-marshal of the decoded struct. A decode
+		// cannot tell an absent mandatory element from a present zero, and
+		// that distinction is the entire subject of the MirrorUsagePoint
+		// element oracle this feeds (suitecsip's critMUPElementsAndRoleFlags).
+		// Re-marshalling here would erase the defect before anyone could grade
+		// it.
+		Body: string(body),
 	})
 	s.mupMu.Unlock()
 
@@ -804,6 +811,16 @@ type mupRecord struct {
 	ReadingTypes []uint8
 	Readings     int
 	CreatedAt    int64
+	// Body is the registration POST's sep+xml, verbatim.
+	//
+	// It is kept for the same reason AdminDERPut keeps one: a criterion that
+	// grades the CONTENT of what the DUT registered — which elements it carried,
+	// what its roleFlags said — cannot work from a summary, and registration is a
+	// ONE-TIME event that routinely predates the window of the case that grades
+	// it, so the transcript is not always available to fall back on. Summarised
+	// fields (LFDI, ReadingTypes) stay, because a reader of /admin/mups wants
+	// them without parsing; the body is what makes the store gradable.
+	Body string
 }
 
 // mupReadingTypeUOMs scans a MirrorUsagePoint or MirrorMeterReading POST body
@@ -881,6 +898,10 @@ type AdminMUP struct {
 	ReadingTypes []uint8 `json:"reading_types,omitempty"` // uom values, 2030.5 Table 11 (38 = W, real power)
 	Readings     int     `json:"readings"`                // MirrorMeterReading POSTs accepted since registration
 	CreatedAt    int64   `json:"created_at"`              // gridsim server time (Unix seconds) at POST /mup
+	// Body is the registration POST's sep+xml verbatim, exactly as AdminDERPut
+	// carries a DER self-report's. See mupRecord.Body for why a summary is not
+	// enough.
+	Body string `json:"body,omitempty"`
 }
 
 // ReceivedMUPs returns a copy of the durable MirrorUsagePoint records, in
@@ -896,6 +917,7 @@ func (s *Server) ReceivedMUPs() []AdminMUP {
 			ReadingTypes: append([]uint8(nil), m.ReadingTypes...),
 			Readings:     m.Readings,
 			CreatedAt:    m.CreatedAt,
+			Body:         m.Body,
 		})
 	}
 	return out

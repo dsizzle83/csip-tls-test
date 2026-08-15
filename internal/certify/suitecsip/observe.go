@@ -224,6 +224,21 @@ type AdminMUP struct {
 	ReadingTypes []uint8 `json:"reading_types,omitempty"` // uom values, 2030.5 Table 11 (38 = W, real power)
 	Readings     int     `json:"readings"`
 	CreatedAt    int64   `json:"created_at"`
+	// Body is the registration POST's sep+xml, verbatim, as gridsim received
+	// it — the same thing AdminDERPut.Body is for a DER self-report.
+	//
+	// It is what makes the MirrorUsagePoint CONTENT gradable off the durable
+	// store (critMUPElementsAndRoleFlags's Server tier) rather than only off a
+	// decrypted transcript. That matters more here than almost anywhere else in
+	// this suite: registration happens ONCE, at the DUT's first contact, so the
+	// window of the case that grades it has usually opened long afterwards.
+	//
+	// RAW, never a re-marshal: the oracle's first question is whether a
+	// MANDATORY element was on the wire at all, and a decode-then-re-encode
+	// cannot tell an absent element from a present zero — which is exactly the
+	// defect class (an errant omitempty on a [1] element whose value is 0) the
+	// oracle exists to catch.
+	Body string `json:"body,omitempty"`
 }
 
 // AdminNotification mirrors one entry of gridsim's GET /admin/notifications:
