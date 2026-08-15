@@ -59,7 +59,12 @@ type RateComponent struct {
 	FlowRateStartLimit *UnitValue `xml:"flowRateStartLimit,omitempty"`
 
 	ReadingTypeLink *Link `xml:"ReadingTypeLink,omitempty"`
-	// RoleFlags bit field: bit 2 = isPrimary (forward), bit 3 = isReverse
+	// RoleFlags is RoleFlagsType (sep 2.0.4 xsd:5826, HexBinary16). Its bits:
+	// 0 isMirror, 1 isPremisesAggregationPoint... 2 isPEV, 3 isDER, 4
+	// isRevenueQuality, 5 isDC, 6 isSubmeter. There is NO isPrimary/isReverse
+	// anywhere in the type -- the forward/reverse distinction lives on
+	// ReadingType.flowDirection. (The previous comment invented bits 2/3 and
+	// two downstream fixtures copied the invention; corrected 2026-08-15.)
 	RoleFlags HexBinary16 `xml:"roleFlags,omitempty"`
 
 	TimeTariffIntervalListLink       *ListLink `xml:"TimeTariffIntervalListLink,omitempty"`
