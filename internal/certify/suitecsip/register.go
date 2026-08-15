@@ -57,6 +57,53 @@ const (
 		"model 706 (DER Volt-Watt) — the same correspondence this product's southbound reconciler uses " +
 		"(lexa-gw cmd/modbus/reconcile_adv.go maps its volt-watt axis onto sunspec.ModelDERVoltWatt)"
 
+	// ── The LEGACY (12x) half of the same four mappings ─────────────────────
+	//
+	// A curve axis has a register home on BOTH SunSpec generations and they are
+	// different models with different geometry, different commit semantics and
+	// — for two of the four — a different DeptRef numbering. Naming them
+	// separately is what lets one catalog row measure whichever DER is actually
+	// on the bench and SAY which it measured, instead of carrying a single
+	// model that is right on one bench and quietly wrong on the other.
+	//
+	// Every claim below is about the STANDARDS' own carriage, like the 7xx half:
+	// the model numbers come from the vendored SunSpec model JSON
+	// (lexa-proto docs/schema/sunspec-models, pinned 7abdf89) and the axis
+	// semantics from each model's own point descriptions.
+
+	mappingVoltVarLegacy = "IEEE 2030.5's opModVoltVar is the Q(V) function, whose LEGACY SunSpec carriage " +
+		"is model 126 (Static Volt-VAR arrays): V<n> in %VRef against a signed VAr<n> in per cent of " +
+		"whatever the bank's DeptRef names. It is the same function 705 carries on the 7xx generation and " +
+		"a different register map — flat 54-register banks with the points inlined as parallel arrays, " +
+		"selected by ActCrv rather than promoted by an adopt handshake, and a DeptRef enum that is " +
+		"1-BASED where 705's is 0-based (126 declares {1 %WMax, 2 %VArMax, 3 %VArAval}). This referee " +
+		"translates yRefType into that enum independently of the product, which is the whole point of " +
+		"checking it"
+
+	mappingVoltWattLegacy = "IEEE 2030.5's opModVoltWatt is the P(V) function, whose LEGACY SunSpec " +
+		"carriage is model 132 (Volt-Watt): V<n> in %VRef against W<n> as a per cent of the bank's " +
+		"DeptRef, which 132 declares as {1 %WMax, 2 %WAvail} — again 1-based. (The vendored JSON labels " +
+		"132's W<n> units \"% VRef\", a known SunSpec erratum: the point is watts as a percentage of " +
+		"DeptRef, per the model's own DeptRef description, and this referee decodes by DeptRef and not " +
+		"by the units string)"
+
+	mappingFreqWattLegacy = "IEEE 2030.5's opModFreqWatt is a BREAKPOINT curve (frequency -> watts), and " +
+		"the LEGACY SunSpec set — unlike the 7xx one — HAS a model that stores exactly that: model 134 " +
+		"(Curve-Based Frequency-Watt, \"Ref 3: 8.9.1.2, 8.9.4.2\"), whose banks hold Hz<n> as ABSOLUTE " +
+		"frequency against W<n> as active power. This is the row's whole D2 acceptance criterion: on a 7xx " +
+		"DER the axis has no home and this row is a decided FAIL saying why, and on a legacy DER it is a " +
+		"measurement. One caution rides with it, and it is the IW15-002a pathology one model over: 134's " +
+		"W<n> are % WRef, where WRef is a REGISTER in the same block (default WMax), while CSIP's " +
+		"opModFreqWatt y is %setMaxW. The two are equal only when WRef == setMaxW, so this referee renders " +
+		"the device's own WRef and its SnptW snapshot-mode flag on every reading rather than assuming them"
+
+	mappingWattPFLegacy = "IEEE 2030.5's opModWattPF is a power-factor curve against active power, and its " +
+		"ONE exact register home anywhere in SunSpec is legacy model 131 (Watt-PF): W<n> in %WMax against " +
+		"PF<n> as a power factor in EEI cos() notation. 131 carries NO DeptRef — the spec fixes its x axis " +
+		"at %WMax and a power factor is not a percentage OF anything — so this row asserts the points and " +
+		"the selection state and deliberately asserts no y-axis reference register, which is a different " +
+		"thing from asserting a reference and finding it absent"
+
 	// BASIC-015 used to grade opModWattPF as an EXECUTION row against model 712,
 	// on a mapping that said "there being no Watt-PF model in the 7xx set". That
 	// mapping was the DEFECT, written down: 712 is DER Watt-VAr, a different
@@ -75,9 +122,11 @@ const (
 		"power-factor displacement under the EEI convention, so writing a PF curve into it commands a " +
 		"different function. sep 2.0.4 says the same thing from the other side: opModWattVar and " +
 		"opModWattPF are separate DERControlBase elements with separate DERCurveType codes (10 and 2). " +
-		"This DUT serves a 7xx DER and its legacy curve shell does not exist yet, so on both generations " +
-		"the honest answer is cannot-comply at receipt — which is what this row now measures, instead of " +
-		"grading a PF curve against a var bank and calling the substitution a PASS"
+		"On a 7xx DER, therefore, the honest answer is cannot-comply at receipt — which is what this row " +
+		"measures THERE, instead of grading a PF curve against a var bank and calling the substitution a " +
+		"PASS. On a LEGACY 12x DER the same row is an EXECUTION row against model 131, because that DER " +
+		"does have the axis; see mappingWattPFLegacy. The two halves are different KINDS of assertion, not " +
+		"one assertion against two banks, and which applies is decided by the device the bench is running"
 
 	// BASIC-012 is the row with no southbound home at all, and saying so is
 	// the whole of its southbound evidence.
@@ -91,7 +140,10 @@ const (
 		"the axis at all. So this row can author its control northbound — that half is real evidence — and " +
 		"NOTHING southbound can hold the curve's content. Closing it needs either a device profile that " +
 		"stores frequency-watt breakpoints or a decision to re-scope the row; it cannot be closed by " +
-		"asserting something weaker against 711, which is a different function"
+		"asserting something weaker against 711, which is a different function. It IS closed on the other " +
+		"generation: the LEGACY set carries model 134, which stores frequency-watt breakpoints, so this " +
+		"row is a decided FAIL on a 7xx DER and a real measurement on a legacy one — see " +
+		"mappingFreqWattLegacy"
 )
 
 // Suite is this suite's short name, used for -suite selection and printed in
@@ -399,9 +451,19 @@ func inverterControlRows() []inverterControlRow {
 		// DER's own curve model, point for point and in order. The mode→model
 		// mapping is stated on each row because a FAIL that names a register
 		// bank has to be checkable by whoever reads the bundle.
-		{"BASIC-006", 52, curveMode("opModVoltVar", "volt_var",
-			[]CurvePoint{{X: 92, Y: 60}, {X: 98, Y: 0}, {X: 102, Y: 0}, {X: 108, Y: -60}}, 3,
-			sunspec.ModelDERVoltVar, mappingVoltVar), "a Volt-VAr curve"},
+		{"BASIC-006", 52, curveMode("opModVoltVar", &curveBinding{
+			Mode:   "volt_var",
+			Points: []CurvePoint{{X: 92, Y: 60}, {X: 98, Y: 0}, {X: 102, Y: 0}, {X: 108, Y: -60}},
+			// yRefType 3 = %statVarAvail, which translates to DeptRef 2 on 705
+			// (0-based) and DeptRef 3 on 126 (1-based). The two codes differ and
+			// the row states neither: the referee derives each from the standards
+			// text for the model it resolved to (curveBinding.wantDeptRef).
+			YRefType:      derUnitRefStatVarAvail,
+			Model7xx:      sunspec.ModelDERVoltVar,
+			Mapping7xx:    mappingVoltVar,
+			ModelLegacy:   sunspec.ModelVoltVarLegacy,
+			MappingLegacy: mappingVoltVarLegacy,
+		}), "a Volt-VAr curve"},
 		{"BASIC-007", 53, unreachableMode("setGradW", noRampRate), "the ramp-rate settings"},
 		{"BASIC-008", 54, scalarMode("opModFixedPFInjectW", func(r *ControlRequest) {
 			r.FixedPFInjectW = ptr(int64(95))
@@ -434,9 +496,15 @@ func inverterControlRows() []inverterControlRow {
 		// accepts only DeptRef=W_MAX_PCT and a curve naming %statVarAvail is now
 		// answered cannot-comply. This row would have FAILED a correct DUT for a
 		// defect in its own fixture.
-		{"BASIC-011", 57, curveMode("opModVoltWatt", "volt_watt",
-			[]CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}}, derUnitRefSetMaxW,
-			sunspec.ModelDERVoltWatt, mappingVoltWatt), "a Volt-Watt curve"},
+		{"BASIC-011", 57, curveMode("opModVoltWatt", &curveBinding{
+			Mode:          "volt_watt",
+			Points:        []CurvePoint{{X: 106, Y: 100}, {X: 110, Y: 20}},
+			YRefType:      derUnitRefSetMaxW,
+			Model7xx:      sunspec.ModelDERVoltWatt,
+			Mapping7xx:    mappingVoltWatt,
+			ModelLegacy:   sunspec.ModelVoltWattLegacy,
+			MappingLegacy: mappingVoltWattLegacy,
+		}), "a Volt-Watt curve"},
 		// yRefType 1 (%setMaxW) for the same reasons as BASIC-011: sep 2.0.4's
 		// opModFreqWatt documentation ("The y value specifies a corresponding
 		// active power output in %setMaxW") and the catalog's own prescribed
@@ -449,9 +517,31 @@ func inverterControlRows() []inverterControlRow {
 		// receipt besides — but the NORTHBOUND half of this row is real evidence
 		// about what the DUT was offered, and evidence has to be conformant to
 		// be evidence.
-		{"BASIC-012", 58, curveModeNoRegisterHome("opModFreqWatt", "freq_watt",
-			[]CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}}, derUnitRefSetMaxW,
-			sunspec.ModelDERFreqDroop, noFreqWattRegister), "a frequency-droop / frequency-watt curve"},
+		//
+		// THE X MULTIPLIER IS NOW -2, AND IT WAS A FIXTURE DEFECT BEFORE.
+		// sep 2.0.4 gives opModFreqWatt's x as "a frequency in Hz", and this row
+		// published xvalue=6000 with xMultiplier absent (0) — a DERCurve
+		// declaring breakpoints at 6000 Hz and 6050 Hz. It changed no verdict
+		// while the row's southbound half was a decided FAIL on every bench, but
+		// the NORTHBOUND half is real evidence about what the DUT was offered,
+		// and it stops being harmless the moment a legacy DER can actually
+		// execute the curve: an oracle reading M134's Hz points would then be
+		// comparing 60.00 Hz against a published 6000. 6000 x 10^-2 = 60.00 Hz
+		// is what the row always meant.
+		{"BASIC-012", 58, curveMode("opModFreqWatt", &curveBinding{
+			Mode:     "freq_watt",
+			Points:   []CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}},
+			XMult:    -2,
+			YRefType: derUnitRefSetMaxW,
+			// The 7xx arm names 711 as the NEAREST model and refuses to measure
+			// against it: 711 is a parametric droop with no point table, so
+			// there is nothing a published curve could be written into.
+			Model7xx:          sunspec.ModelDERFreqDroop,
+			NoRegisterHome7xx: noFreqWattRegister,
+			// The legacy arm is a real home. This is D2's acceptance criterion.
+			ModelLegacy:   sunspec.ModelFreqWattLegacy,
+			MappingLegacy: mappingFreqWattLegacy,
+		}), "a frequency-droop / frequency-watt curve"},
 		// IW13-001 (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §4.2):
 		// BASIC-013's opModFixedW is SignedPerCent, hundredths of a percent —
 		// FixedW=6000 means 60.00%, matching the catalog's own stated value
@@ -537,16 +627,60 @@ func inverterControlRows() []inverterControlRow {
 		// becomes an execution row against model 131 on a 12x DER and stays a
 		// refusal row on a 7xx one, and the bench will need a 12x DER profile
 		// before it can grade the execution half at all.
-		{"BASIC-015", 61, curveModeRefused("opModWattPF", "watt_pf",
-			[]CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}}, derUnitRefStatVarAvail,
-			sunspec.ModelDERWattVar,
+		//
+		// IT IS NOW A PER-GENERATION ROW, and the flip on the legacy side is
+		// the second half of the same product truth the refusal recorded. The
+		// "WHAT FLIPS IT BACK" note above said this would become an execution
+		// row against model 131 on a 12x DER while staying a refusal row on a
+		// 7xx one, and that the bench would need a 12x DER profile before it
+		// could grade the execution half. That profile now exists
+		// (sim/southbound/curve12x.go), so the row carries both halves and the
+		// DEVICE decides which runs.
+		//
+		// The 7xx half is UNCHANGED — same published curve, same yRefType, same
+		// fingerprinted bank — because a 7xx DUT that refuses this axis is
+		// correct and this row already proves it does so honestly. Changing it
+		// to a decided FAIL (which the design's §6.4 table proposed) would have
+		// replaced a measurement of the product's actual behaviour with an
+		// assertion that nothing was measured, which is strictly less evidence.
+		{"BASIC-015", 61, curveModePerGeneration("opModWattPF",
 			// Kept short: it is read inside sentences like "nothing of X moved
 			// in the DER's own registers". Why this bank is the right one to
 			// watch — it is where the product used to write opModWattPF's
 			// content, and so where a regression would land — is refusalWattPF's
 			// job, and it is printed alongside this on every verdict.
 			"the SunSpec model 712 (DER Watt-Var) curve bank",
-			refusalWattPF), "an advanced (curve-based) inverter control"},
+			refusalWattPF,
+			&curveBinding{
+				Mode:     "watt_pf",
+				Points:   []CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}},
+				YRefType: derUnitRefStatVarAvail,
+				Model7xx: sunspec.ModelDERWattVar,
+			},
+			// THE LEGACY ARM PUBLISHES yMultiplier = -2 where the 7xx refusal
+			// arm publishes none, and the difference is not cosmetic. A power
+			// factor is a number near 1; model 131 stores it at the device's own
+			// PF_SF, which on any honest device is negative. The refusal arm's
+			// y values are never compared against a register — the row's claim
+			// there is that NOTHING moved — so its multiplier was free to stay
+			// 0; the execution arm's are compared point for point, so the
+			// published curve has to mean what the device holds. 95 x 10^-2 =
+			// 0.95 is the power factor this row has always been describing.
+			//
+			// yRefType stays 3 and is STILL not load-bearing, for the reason the
+			// 7xx note gives: sep 2.0.4 defines no DERUnitRefType for a power
+			// factor, DERCurve declares yRefType minOccurs=1, so some code must
+			// be sent and every choice is wrong in the same way. 131 carries no
+			// DeptRef register at all, so the referee asserts none here rather
+			// than inventing an expectation.
+			&curveBinding{
+				Mode:          "watt_pf",
+				Points:        []CurvePoint{{X: 0, Y: 100}, {X: 50, Y: 98}, {X: 100, Y: 95}},
+				YMult:         -2,
+				YRefType:      derUnitRefStatVarAvail,
+				ModelLegacy:   sunspec.ModelWattPFLegacy,
+				MappingLegacy: mappingWattPFLegacy,
+			}), "an advanced (curve-based) inverter control"},
 
 		// TODO(curve plan #32): there is NO opModWattVar row here, and its
 		// absence is a BENCH gap rather than a scope decision.

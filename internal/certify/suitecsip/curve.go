@@ -70,6 +70,18 @@ const (
 
 	refusalAxisParam     = "iw15.refusal_axis"
 	refusalBaselineParam = "iw15.refusal_baseline"
+
+	// curveGenParam records WHICH SunSpec curve generation the DER under test
+	// turned out to be, resolved live from its own model chain. It is what lets
+	// the post-hoc citation phase — which has no live context and cannot read
+	// the DER — describe the bank it measured, and what lets a row whose
+	// CORRECT posture differs by generation (BASIC-015) pick its apparatus.
+	curveGenParam = "iw15.curve_generation"
+	// curveGenUnknown is recorded when the DER serves neither generation's
+	// curve models, or could not be read at all. It is deliberately not a
+	// default of either generation: a row that guessed would attribute a
+	// verdict to a bank it never read.
+	curveGenUnknown = "unknown"
 )
 
 // ── Curve rows: the binding ─────────────────────────────────────────────────
@@ -84,7 +96,8 @@ const (
 // the publisher sends those points, and the oracle expects those points.
 type curveBinding struct {
 	// Mode is gridsim's own curve-mode name (sim/gridsim/curve.go's
-	// curveTypeForMode vocabulary): volt_var | volt_watt | freq_watt | watt_pf.
+	// curveTypeForMode vocabulary): volt_var | volt_watt | freq_watt |
+	// watt_pf | watt_var.
 	Mode string
 	// Points are the breakpoints this row publishes, in the wire's own raw
 	// units — the axis multipliers below say what power of ten they carry.
@@ -97,17 +110,153 @@ type curveBinding struct {
 	// YRefType is the Table-19 code the published curve's y axis carries.
 	YRefType uint8
 
-	// Model is the SunSpec model whose LIVE curve must hold this row's content.
+	// ── The southbound target, PER GENERATION ──
+	//
+	// A row's northbound half is one control and does not change; its
+	// southbound half is a different register bank on a 7xx DER and on a legacy
+	// 12x one, and on some rows one of the two generations has no bank for it
+	// at all. Both arms live on ONE binding, and which applies is resolved at
+	// run time FROM THE DER'S OWN MODEL CHAIN (resolveTarget) rather than from
+	// configuration — so a single catalog row runs on either bench and says
+	// which one it measured.
+	//
+	// Naming them separately is also what stops a substitution from being
+	// expressible. Before this the binding carried one Model, so "opModWattPF
+	// lands on 712" and "opModWattPF lands on 131" were the same field with
+	// different contents, and grading a PF curve against a var bank looked like
+	// configuration rather than like the defect it was.
+
+	// Model7xx is the 7xx-family model this mode's content must be found in,
+	// or the NEAREST model when NoRegisterHome7xx explains that there is none.
+	Model7xx uint16
+	// Mapping7xx records WHERE that correspondence comes from, so a FAIL naming
+	// a register bank can be checked by a reader who did not write it.
+	Mapping7xx string
+	// NoRegisterHome7xx, when non-empty, says the 7xx family has no
+	// breakpoint-carrying home for this mode, and why.
+	NoRegisterHome7xx string
+
+	// ModelLegacy / MappingLegacy / NoRegisterHomeLegacy are the same three
+	// facts for the legacy 12x family.
+	ModelLegacy          uint16
+	MappingLegacy        string
+	NoRegisterHomeLegacy string
+}
+
+// curveTarget is the southbound home this row resolved to on THIS DER.
+type curveTarget struct {
+	// Model is the SunSpec model whose live curve must hold this row's content
+	// on this DER. Zero when NoRegisterHome is set and the arm names no
+	// nearest model at all.
 	Model uint16
-	// Mapping records WHERE that mode→model correspondence comes from, so a
-	// FAIL naming a model can be checked by a reader who did not write it.
-	Mapping string
-	// NoRegisterHome, when non-empty, says this mode has no breakpoint-carrying
-	// register home on this DER at all, and why. Such a row publishes
-	// northbound (the CSIP half is still real evidence) and its southbound
-	// criterion is a decided FAIL carrying this reason — never a PASS, and
-	// never a Skip.
+	// Family is which idiom that model belongs to, which decides what "live"
+	// means and whether a writable live bank is suspicious.
+	Family invariant.CurveFamily
+	// Mapping / NoRegisterHome are the resolved arm's provenance and refusal.
+	Mapping        string
 	NoRegisterHome string
+}
+
+// curveGenerationOf reports which SunSpec curve generation a DER belongs to,
+// read from the models it actually serves.
+//
+// LEGACY WINS WHEN BOTH ARE PRESENT, and the ordering is deliberate rather than
+// arbitrary: the benches this suite grades serve one generation or the other by
+// construction (sim/southbound's legacy-curve profile serves no 7xx model at
+// all, precisely so this question has an answer), so a device serving both is
+// already outside what any row was written for and the tie-break only decides
+// which honest reading it gets. It never invents one.
+func curveGenerationOf(uv invariant.UnitView) (invariant.CurveFamily, bool) {
+	serves := func(models []uint16) bool {
+		for _, m := range models {
+			for _, have := range uv.Models {
+				if have == m {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if serves(invariant.LegacyCurveModels()) {
+		return invariant.FamilyLegacy, true
+	}
+	var sevenXx []uint16
+	for _, m := range invariant.CurveModels() {
+		if axis, ok := invariant.CurveAxisOf(m); ok && axis.Family == invariant.Family7xx {
+			sevenXx = append(sevenXx, m)
+		}
+	}
+	if serves(sevenXx) {
+		return invariant.Family7xx, true
+	}
+	return "", false
+}
+
+// resolveTarget picks this row's southbound arm from the DER's own model chain.
+//
+// It resolves by GENERATION first and by named-model presence second. The order
+// matters for the rows whose 7xx arm names a NEAREST model rather than a real
+// home (BASIC-012 points at 711, which stores no breakpoints): on a 7xx DER
+// that arm must be selected so the row can say WHY there is nothing to measure,
+// and asking "is 711 served?" first would have made a 7xx DER that happens not
+// to publish 711 fall through to the legacy arm and grade against a model it
+// does not serve either.
+//
+// ok=false means the DER serves neither generation's curve models, which is a
+// statement about the bench and is reported as such rather than guessed at.
+func (b *curveBinding) resolveTarget(uv invariant.UnitView) (curveTarget, bool) {
+	legacyArm := curveTarget{Model: b.ModelLegacy, Family: invariant.FamilyLegacy,
+		Mapping: b.MappingLegacy, NoRegisterHome: b.NoRegisterHomeLegacy}
+	sevenArm := curveTarget{Model: b.Model7xx, Family: invariant.Family7xx,
+		Mapping: b.Mapping7xx, NoRegisterHome: b.NoRegisterHome7xx}
+
+	if gen, ok := curveGenerationOf(uv); ok {
+		switch gen {
+		case invariant.FamilyLegacy:
+			if b.ModelLegacy != 0 || b.NoRegisterHomeLegacy != "" {
+				return legacyArm, true
+			}
+		case invariant.Family7xx:
+			if b.Model7xx != 0 || b.NoRegisterHome7xx != "" {
+				return sevenArm, true
+			}
+		}
+	}
+	// No generation was recognised (or the row has no arm for the one that
+	// was). Fall back to whichever named model the DER does serve, which is the
+	// only remaining fact about this device that can decide it.
+	for _, arm := range []curveTarget{sevenArm, legacyArm} {
+		if arm.Model == 0 {
+			continue
+		}
+		for _, have := range uv.Models {
+			if have == arm.Model {
+				return arm, true
+			}
+		}
+	}
+	return curveTarget{}, false
+}
+
+// describeTargets renders both arms, for a criterion's How and for the
+// unresolved FAIL — which has to name what it was looking for on each
+// generation before it says it found neither.
+func (b *curveBinding) describeTargets() string {
+	part := func(gen string, model uint16, none string) string {
+		switch {
+		case none != "":
+			if model != 0 {
+				return fmt.Sprintf("%s: no register home (nearest model M%d) — %s", gen, model, none)
+			}
+			return fmt.Sprintf("%s: no register home — %s", gen, none)
+		case model != 0:
+			return fmt.Sprintf("%s: M%d", gen, model)
+		default:
+			return gen + ": this row declares no target"
+		}
+	}
+	return part("on a 7xx DER", b.Model7xx, b.NoRegisterHome7xx) + "; " +
+		part("on a legacy 12x DER", b.ModelLegacy, b.NoRegisterHomeLegacy)
 }
 
 // wantPoints converts the published breakpoints into the device engineering
@@ -150,8 +299,8 @@ func (b *curveBinding) wantPoints() []invariant.CurvePoint {
 // ok=false is returned for any other model, and for a yRefType outside the set
 // its mode allows — those are curves a conformant DUT REFUSES, so this row has
 // no register expectation to assert and says so instead of inventing one.
-func (b *curveBinding) wantDeptRef() (uint16, bool) {
-	switch b.Model {
+func (b *curveBinding) wantDeptRef(model uint16) (uint16, bool) {
+	switch model {
 	case sunspec.ModelDERVoltVar, sunspec.ModelDERWattVar:
 		switch b.YRefType {
 		case derUnitRefSetMaxW:
@@ -165,6 +314,36 @@ func (b *curveBinding) wantDeptRef() (uint16, bool) {
 		if b.YRefType == derUnitRefSetMaxW {
 			return deptRefWMaxPct, true
 		}
+
+	// THE LEGACY CODES ARE 1-BASED and this is a second, independent
+	// transcription of the same standards text — not the 7xx answer with one
+	// added. Deriving it by arithmetic would work today and would keep working
+	// for the wrong reason: 126's admissible set happens to line up with
+	// DERUnitRefType 1/2/3 one for one, and 132's does not (its second code is
+	// %WAvail, which is DERUnitRefType 7 and not 2). A referee that added one
+	// would silently accept %setMaxVar on a volt-WATT curve.
+	case sunspec.ModelVoltVarLegacy:
+		switch b.YRefType {
+		case derUnitRefSetMaxW:
+			return legacyDeptRefWMax, true
+		case derUnitRefSetMaxVar:
+			return legacyDeptRefVArMax, true
+		case derUnitRefStatVarAvail:
+			return legacyDeptRefVArAval, true
+		}
+	case sunspec.ModelVoltWattLegacy:
+		switch b.YRefType {
+		case derUnitRefSetMaxW:
+			return legacyDeptRefWMax, true
+		case derUnitRefStatWAvail:
+			return legacyDeptRefWAvail, true
+		}
+
+		// 131 (Watt-PF) and 134 (Freq-Watt) carry NO DeptRef register. 131's y is a
+		// power factor, which is not a percentage of anything; 134's is % WRef,
+		// which is a REGISTER in the same block rather than an enum code. Returning
+		// ok=false is the honest answer: there is no reference register to check,
+		// and 134's actual base is rendered by the referee on every reading.
 	}
 	return 0, false
 }
@@ -179,9 +358,20 @@ const (
 	derUnitRefSetMaxVar    uint8 = 2
 	derUnitRefStatVarAvail uint8 = 3
 
+	derUnitRefStatWAvail uint8 = 7
+
 	deptRefWMaxPct    uint16 = 0 // 705/706/712
 	deptRefVarMaxPct  uint16 = 1 // 705/712 only
 	deptRefVarAvalPct uint16 = 2 // 705/712 only
+
+	// The LEGACY DeptRef codes are 1-based and are a different enum, not an
+	// offset of the one above. 126 declares {1 %WMax, 2 %VArMax, 3 %VArAval};
+	// 132 declares {1 %WMax, 2 %WAvail}. Transcribed from the vendored
+	// model_126.json / model_132.json enum blocks.
+	legacyDeptRefWMax    uint16 = 1
+	legacyDeptRefVArMax  uint16 = 2
+	legacyDeptRefVArAval uint16 = 3
+	legacyDeptRefWAvail  uint16 = 2
 )
 
 // applyMult applies a 2030.5 power-of-ten axis multiplier.
@@ -272,35 +462,69 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 		if err != nil {
 			return unavailable("%v", err)
 		}
-		cv := uv.Curve(oracleSimName, b.Model)
 		published := b.describePublished()
 
-		if b.NoRegisterHome != "" {
+		// WHICH register bank this row is about is a question about the DEVICE,
+		// answered here from the models it actually serves — not from
+		// configuration, and not from a single Model the row was built with.
+		// The same catalog row therefore measures 705 on a 7xx bench and 126 on
+		// a legacy one, and says which it did.
+		target, ok := b.resolveTarget(uv)
+		if !ok {
+			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
+				"this row published %s northbound and the DER under test serves NEITHER generation's "+
+					"register home for it (%s). The models the DER does serve are %s. With no southbound "+
+					"bank to read, this row's second half cannot be measured at all — which is reported as a "+
+					"FAIL rather than skipped, because an unmeasured criterion is not a satisfied one",
+				published, b.describeTargets(), modelList(uv))}
+		}
+		cv := uv.Curve(oracleSimName, target.Model)
+
+		if target.NoRegisterHome != "" {
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
 				"this row published %s northbound, and there is NO southbound register home on this DER for "+
 					"that content: %s. The row's southbound half therefore cannot be measured at all, which "+
 					"is reported as a FAIL rather than skipped — an unmeasured criterion is not a satisfied "+
 					"one. What the DER does hold on the nearest model: %s",
-				published, b.NoRegisterHome, cv.Describe())}
+				published, target.NoRegisterHome, cv.Describe())}
 		}
 		if !cv.Present {
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
 				"this row published %s northbound and the DER's own register image carries NOTHING for it: "+
 					"%s. %s The models the DER does serve are %s",
-				published, cv.Describe(), b.Mapping, modelList(uv))}
+				published, cv.Describe(), target.Mapping, modelList(uv))}
 		}
 		if !cv.Adopted {
+			// The two generations reach "not adopted" by different routes and a
+			// finding that named the wrong one would send a reader to a
+			// register that does not exist: on 7xx the adopt HANDSHAKE never
+			// COMPLETED; on legacy there is no handshake at all and the fact is
+			// that ActCrv does not select the bank this content would be in.
+			how := "adopt handshake never COMPLETED, so no curve was taken up"
+			if cv.Legacy() {
+				how = fmt.Sprintf("ActCrv selects no bank holding this row's content (ActCrv=%d) — on this "+
+					"generation there is no adopt handshake, so the SELECTION is the whole of the commit "+
+					"and a bank nobody selected commands nothing", cv.ActCrv)
+			}
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-				"this row published %s northbound and the DER's %s adopt handshake never COMPLETED, so no "+
-					"curve was taken up: %s. %s",
-				published, cv.Axis.Name, cv.Describe(), b.Mapping)}
+				"this row published %s northbound and the DER's %s %s: %s. %s",
+				published, cv.Axis.Name, how, cv.Describe(), target.Mapping)}
 		}
 		match := invariant.MatchPoints(cv.Points, b.wantPoints(), curvePointTolerance)
 		if !match.Matched {
+			// "an adopted curve" is the 7xx wording and it would be misleading
+			// here: on legacy nothing was adopted, a bank was SELECTED, and the
+			// reading is of whatever that bank happens to hold — very often the
+			// device's own factory curve, which is exactly the state a DUT that
+			// never wrote anything leaves behind.
+			held := "reports an adopted curve whose CONTENT is not the one this row published"
+			if cv.Legacy() {
+				held = fmt.Sprintf("is running the bank ActCrv selects (bank %d), and its CONTENT is not "+
+					"the curve this row published", cv.Bank)
+			}
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-				"the DER's %s reports an adopted curve whose CONTENT is not the one this row published: %s. "+
-					"This row published %s. Full register state: %s",
-				cv.Axis.Name, match.Reason, published, cv.Describe())}
+				"the DER's %s %s: %s. This row published %s. Full register state: %s",
+				cv.Axis.Name, held, match.Reason, published, cv.Describe())}
 		}
 		// The y-axis REFERENCE, checked separately from the points and after
 		// them, because the two are different defects with different owners and
@@ -310,7 +534,7 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 		// DER and a 30x one on a 2 kvar machine, in the wrong direction, with
 		// every point matching. A referee that stopped at the points would
 		// certify that.
-		if want, ok := b.wantDeptRef(); ok {
+		if want, ok := b.wantDeptRef(target.Model); ok {
 			if !cv.HasDeptRef {
 				return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
 					"the DER's %s holds this row's breakpoints but its curve bank reports no DeptRef at "+
@@ -326,8 +550,8 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 						"different base are a different command, and a read-back hash cannot see it "+
 						"because it carries the document's own yRefType at both ends. Full register "+
 						"state: %s",
-					cv.Axis.Name, cv.DeptRef, invariant.DeptRefName(b.Model, cv.DeptRef),
-					b.YRefType, derUnitRefName(b.YRefType), want, invariant.DeptRefName(b.Model, want),
+					cv.Axis.Name, cv.DeptRef, invariant.DeptRefName(target.Model, cv.DeptRef),
+					b.YRefType, derUnitRefName(b.YRefType), want, invariant.DeptRefName(target.Model, want),
 					cv.Describe())}
 			}
 		}
@@ -338,7 +562,15 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 					"this is not execution of the control. %s",
 				cv.Axis.Name, cv.EnaRaw, cv.Describe())}
 		}
-		if !cv.ReadOnly {
+		// The read-only warning is 7xx-ONLY, and suppressing it on legacy is a
+		// correctness rule rather than noise reduction. On 7xx the live curve is
+		// index 0 and a conformant device keeps it read-only, so a writable one
+		// means the index-0 convention does not hold and this reading may be of
+		// a staged curve. On legacy EVERY bank is ordinarily writable — that is
+		// how a gateway installs a curve at all, there being no staging slot —
+		// so the same warning would fire on every correct legacy device and
+		// would be telling a reader something false about it.
+		if !cv.ReadOnly && !cv.Legacy() {
 			return Finding{Verdict: certify.Warn, Observed: fmt.Sprintf(
 				"the DER's %s holds exactly the breakpoints this row published and is enabled, but its "+
 					"index-0 curve reports ReadOnly=false — on a conformant device the ACTIVE curve is "+
@@ -346,10 +578,18 @@ func oracleCurve(b *curveBinding) func(ctx context.Context, rc *certify.RunCtx) 
 					"staged curve rather than the governing one. %s",
 				cv.Axis.Name, cv.Describe())}
 		}
+		// The PASS says HOW the curve became live, per generation, because that
+		// is the fact a reader checks the bundle for: on 7xx the adopt
+		// handshake COMPLETED, on legacy ActCrv selects the bank the content is
+		// in. Printing "adopt handshake COMPLETED" against a device with no
+		// such register would describe evidence that does not exist.
+		how := "its adopt handshake COMPLETED and the function is enabled"
+		if cv.Legacy() {
+			how = fmt.Sprintf("ActCrv selects that bank (bank %d) and ModEna bit 0 is set", cv.Bank)
+		}
 		return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
-			"the DER's own %s live curve holds exactly the breakpoints this row published, its adopt "+
-				"handshake COMPLETED and the function is enabled: %s. %s",
-			cv.Axis.Name, match.Reason, cv.Describe())}
+			"the DER's own %s live curve holds exactly the breakpoints this row published, %s: %s. %s",
+			cv.Axis.Name, how, match.Reason, cv.Describe())}
 	}
 }
 
@@ -391,9 +631,52 @@ func curveSetup(ctx context.Context, d *Driver, params map[string]string, b *cur
 	params[oraclePreVerdictParam] = string(pre.Verdict)
 	params[oraclePreObservedParam] = findingObserved(pre)
 	params[curvePublishedParam] = b.describePublished()
-	params[curveModelParam] = strconv.FormatUint(uint64(b.Model), 10)
+	recordCurveTarget(ctx, d, params, b)
 
 	return publishCurveControl(ctx, d, params, b, mrid)
+}
+
+// detectCurveGeneration reads the DER and reports which SunSpec curve
+// generation it serves, or curveGenUnknown when it serves neither (or could not
+// be read at all).
+//
+// Unknown is a real answer and never a default of either generation: a row that
+// guessed would choose an apparatus on the strength of nothing, and would then
+// certify a refusal or a failure of execution against a bank it never looked at.
+func detectCurveGeneration(ctx context.Context, rc *certify.RunCtx) string {
+	uv, err := oracleUnitView(ctx, rc, oracleSimName)
+	if err != nil {
+		return curveGenUnknown
+	}
+	gen, ok := curveGenerationOf(uv)
+	if !ok {
+		return curveGenUnknown
+	}
+	return string(gen)
+}
+
+// recordCurveTarget writes which generation and which model this row resolved
+// to into the observation, so the citation phase — which has no live context —
+// can say what was measured rather than what the row was built with.
+//
+// A row whose target could not be resolved records the generation as unknown
+// rather than defaulting to one: the FAIL that follows names both arms, and a
+// default here would put a model number beside a verdict that never read it.
+func recordCurveTarget(ctx context.Context, d *Driver, params map[string]string, b *curveBinding) {
+	uv, err := oracleUnitView(ctx, d.rc, oracleSimName)
+	if err != nil {
+		params[curveGenParam] = curveGenUnknown
+		return
+	}
+	gen, ok := curveGenerationOf(uv)
+	if !ok {
+		params[curveGenParam] = curveGenUnknown
+	} else {
+		params[curveGenParam] = string(gen)
+	}
+	if target, ok := b.resolveTarget(uv); ok && target.Model != 0 {
+		params[curveModelParam] = strconv.FormatUint(uint64(target.Model), 10)
+	}
 }
 
 // publishCurveControl puts one row's curve on the wire through gridsim's curve
@@ -509,7 +792,7 @@ func critDEREffectViaCurveOracle(subject string, b *curveBinding, o *Observation
 			"breakpoints this row itself published — raw values as published, with no axis "+
 			"re-interpretation by this referee. %s. The device sims model curve ADOPTION but no curve "+
 			"PHYSICS, so this is a register/adopt-state assertion and deliberately not an "+
-			"effect-on-output one", curveModelLabel(b), b.Mapping),
+			"effect-on-output one", curveModelLabel(b, o), b.describeTargets()),
 		Tier: tierOracle,
 		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
 			return f
@@ -517,11 +800,24 @@ func critDEREffectViaCurveOracle(subject string, b *curveBinding, o *Observation
 	}
 }
 
-func curveModelLabel(b *curveBinding) string {
-	if axis, ok := invariant.CurveAxisOf(b.Model); ok {
-		return axis.Name
+// curveModelLabel names the model this row actually measured, taken from what
+// the live phase resolved (curveModelParam) rather than from the binding.
+//
+// It falls back to naming BOTH arms, which is the honest answer when nothing
+// was resolved: a criterion that printed one generation's model on a run that
+// read the other's would describe evidence that does not exist.
+func curveModelLabel(b *curveBinding, o *Observation) string {
+	if o != nil {
+		if raw := o.Params[curveModelParam]; raw != "" {
+			if n, err := strconv.ParseUint(raw, 10, 16); err == nil {
+				if axis, ok := invariant.CurveAxisOf(uint16(n)); ok {
+					return axis.Name
+				}
+				return fmt.Sprintf("M%d", n)
+			}
+		}
 	}
-	return fmt.Sprintf("M%d", b.Model)
+	return "curve model (" + b.describeTargets() + ")"
 }
 
 // critDERCurveResolvable asserts that the DERCurve resource this row's control
@@ -642,6 +938,39 @@ func coveredCurveSlots(uv invariant.UnitView, model uint16) (views []invariant.C
 		return nil, 0, false
 	}
 	views = []invariant.CurveView{live}
+
+	// WHICH SLOTS THE COVERED SET IS DIFFERS BY GENERATION, and it differs
+	// because the generations disagree about what a non-live slot IS.
+	//
+	// On 7xx there is one live curve at index 0 and the rest are STAGING slots
+	// a gateway writes before it triggers the handshake, so the covered set is
+	// index 0 plus 1..NCrv-1.
+	//
+	// On legacy there is no staging slot at all: banks are numbered from 1,
+	// ActCrv selects one of them, and a gateway installs a curve by writing
+	// whichever bank is not live. So EVERY bank 1..NCrv is a place a write can
+	// land, which makes all of them the covered set — the live view above
+	// already renders the ActCrv bank, so it is skipped in the loop rather than
+	// rendered twice under two different headings.
+	if live.Legacy() {
+		others := live.NCrv
+		if live.ActCrv >= 1 && live.ActCrv <= live.NCrv {
+			others-- // the live bank is already in views
+		}
+		shown := 0
+		for i := 1; i <= live.NCrv && shown < maxStagingCurvesFingerprinted; i++ {
+			if i == live.ActCrv {
+				continue
+			}
+			views = append(views, uv.CurveAt(oracleSimName, model, i))
+			shown++
+		}
+		if n := others - shown; n > 0 {
+			truncated = n
+		}
+		return views, truncated, true
+	}
+
 	for i := 1; i < live.NCrv && i <= maxStagingCurvesFingerprinted; i++ {
 		views = append(views, uv.CurveAt(oracleSimName, model, i))
 	}
@@ -671,7 +1000,14 @@ func (b *refusalBinding) fingerprint(uv invariant.UnitView) (string, bool) {
 	if b.Curve == nil {
 		return refusalFingerprint(uv, b.Points)
 	}
-	views, truncated, ok := coveredCurveSlots(uv, b.Curve.Model)
+	target, ok := b.Curve.resolveTarget(uv)
+	if !ok || target.Model == 0 {
+		// The DER has no bank of this axis at all, on either generation. That
+		// is not an absence this row can certify: it cannot tell "the DUT
+		// refused" from "there was nowhere for a write to land".
+		return "", false
+	}
+	views, truncated, ok := coveredCurveSlots(uv, target.Model)
 	if !ok {
 		// Same posture as the scalar shape's empty-points case: a bank we
 		// cannot read cannot tell a refused axis from an unreadable one.
@@ -682,7 +1018,7 @@ func (b *refusalBinding) fingerprint(uv invariant.UnitView) (string, bool) {
 		parts = append(parts, cv.Describe())
 	}
 	if truncated > 0 {
-		parts = append(parts, fmt.Sprintf("(%d further staging curve(s) not fingerprinted)", truncated))
+		parts = append(parts, fmt.Sprintf("(%d further curve slot(s) not fingerprinted)", truncated))
 	}
 	return strings.Join(parts, " | "), true
 }
@@ -705,7 +1041,11 @@ func (b *refusalBinding) fingerprint(uv invariant.UnitView) (string, bool) {
 // window is informative and reporting it as contaminated would be a false
 // accusation against a clean bench.
 func curveBaselineContamination(uv invariant.UnitView, b *curveBinding) (where []string, ok bool) {
-	views, _, ok := coveredCurveSlots(uv, b.Model)
+	target, ok := b.resolveTarget(uv)
+	if !ok || target.Model == 0 {
+		return nil, false
+	}
+	views, _, ok := coveredCurveSlots(uv, target.Model)
 	if !ok {
 		return nil, false
 	}
@@ -723,6 +1063,17 @@ func curveBaselineContamination(uv invariant.UnitView, b *curveBinding) (where [
 
 // slotLabel names one curve of a bank for a finding.
 func slotLabel(cv invariant.CurveView) string {
+	if cv.Legacy() {
+		// "staging curve" is a 7xx word with no legacy referent, and using it
+		// here would tell a reader the bank was a scratch slot when on this
+		// generation it is an ordinary bank one ActCrv write away from being
+		// live.
+		if cv.Index == 0 {
+			return fmt.Sprintf("the LIVE bank (bank %d, selected by ActCrv=%d, %s)",
+				cv.Bank, cv.ActCrv, enabledLabel(cv.Enabled))
+		}
+		return fmt.Sprintf("bank %d (not selected; ActCrv=%d)", cv.Index, cv.ActCrv)
+	}
 	if cv.Index == 0 {
 		return fmt.Sprintf("the LIVE curve (index 0, %s, %s)",
 			enabledLabel(cv.Enabled), adoptLabel(cv.Adopted))
@@ -753,12 +1104,14 @@ const maxStagingCurvesFingerprinted = 4
 
 // describeAxisRegisters names what the fingerprint above covers, for the
 // criterion's How and for an unavailability message.
-func (b *refusalBinding) describeAxisRegisters() string {
+func (b *refusalBinding) describeAxisRegisters(o *Observation) string {
 	if b.Curve == nil {
 		return strings.Join(b.Points, ", ")
 	}
-	return curveModelLabel(b.Curve) + " (adopt handshake, function enable, DeptRef, and the breakpoints " +
-		"of BOTH the live curve and the writable staging curves)"
+	return curveModelLabel(b.Curve, o) + " (the selection/adopt state, the function enable, DeptRef, and " +
+		"the breakpoints of EVERY covered curve slot of the bank — on 7xx the live curve and its writable " +
+		"staging slots, on legacy every bank 1..NCrv, since that generation has no staging slot and a " +
+		"write can land in any of them)"
 }
 
 // refusalFingerprint renders the exact state of the axis's registers — raw
@@ -839,7 +1192,7 @@ func oracleRefusal(b *refusalBinding, baseline string) func(ctx context.Context,
 		if !ok {
 			return unavailable("the DER's own register image carries nothing a write of %s would land on "+
 				"(%s), so this row cannot tell a refused axis from an unreadable one",
-				b.Axis, b.describeAxisRegisters())
+				b.Axis, b.describeAxisRegisters(nil))
 		}
 		if baseline == "" {
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
@@ -906,8 +1259,8 @@ func refusalOutcome(b *refusalBinding, o *Observation) Finding {
 				"the DER's curve bank before the row runs — DELETE /admin/curve (Driver.ClearCurves) " +
 				"clears only the CSIP-side control and curve, not the device's registers, so this needs a " +
 				"fresh sim (the modsim /control reset resumes the animation and does not reset the " +
-				"register image) or a bench lever that resets model " +
-				strconv.FormatUint(uint64(b.Curve.Model), 10) + ". Until then this is reported as a FAIL " +
+				"register image) or a bench lever that resets the " + curveModelLabel(b.Curve, o) +
+				" bank. Until then this is reported as a FAIL " +
 				"rather than a PASS, because an uninformative window is not an observed absence"}
 		case certify.Fail:
 			// The clean case: the DER did NOT hold this row's content before the
@@ -943,7 +1296,7 @@ func critRefusedAxisNoSouthboundTrace(b *refusalBinding, o *Observation) criteri
 		How: "an independent read of the DER's own raw SunSpec image (internal/invariant, which shares only " +
 			"the register-offset tables with the product and none of its CSIP/derbase interpretation), " +
 			"taken BEFORE this row published its control and again after the DUT's poll cycle: " +
-			b.describeAxisRegisters() + " is fingerprinted and compared for ANY movement, not only for " +
+			b.describeAxisRegisters(o) + " is fingerprinted and compared for ANY movement, not only for " +
 			"movement towards the commanded value",
 		Tier: tierOracle,
 		Wire: func(_ *certify.Evidence, _ *Transcript) Finding {
@@ -1083,7 +1436,7 @@ func refusalSetup(ctx context.Context, d *Driver, params map[string]string, b *r
 	params[refusalAxisParam] = b.Axis
 	if b.Curve != nil {
 		params[curvePublishedParam] = b.Curve.describePublished()
-		params[curveModelParam] = strconv.FormatUint(uint64(b.Curve.Model), 10)
+		recordCurveTarget(ctx, d, params, b.Curve)
 	}
 	// ONE read of the DER answers both baseline questions, which is deliberate:
 	// they must describe the same instant, and the fingerprint and the
@@ -1094,7 +1447,7 @@ func refusalSetup(ctx context.Context, d *Driver, params map[string]string, b *r
 			params[oraclePreObservedParam] = fp
 		} else {
 			params[oraclePreObservedParam] = "the DER's own register image carries nothing of " +
-				b.describeAxisRegisters()
+				b.describeAxisRegisters(nil)
 		}
 		if b.Curve != nil {
 			recordCurveContamination(params, uv, b.Curve)

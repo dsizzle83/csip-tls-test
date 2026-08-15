@@ -149,6 +149,52 @@ type controlMode struct {
 	// the DER shows no trace — which is why it is a separate field and not an
 	// Oracle with a negated judge.
 	Refusal *refusalBinding
+
+	// LegacyCurve, when set, REPLACES this row's apparatus with a curve
+	// EXECUTION binding on a DER that serves the legacy 12x curve family.
+	//
+	// It exists for the one row whose CORRECT posture is a different KIND of
+	// assertion per generation, not merely a different register bank.
+	// opModWattPF has an exact register home on legacy (model 131) and none at
+	// all on 7xx — 712 is DER Watt-Var, a different function — so the honest
+	// question is "did the DER execute it?" on one bench and "did the DUT
+	// refuse it honestly, and touch nothing?" on the other. A binding that
+	// merely swapped the model would have asked the execution question on a
+	// bench where a conformant DUT must refuse, which is the mirror image of
+	// the substitution IW15-001 closed.
+	//
+	// Rows whose posture is the same kind on both generations do NOT use this:
+	// they carry one Curve with both arms named (curveBinding's Model7xx /
+	// ModelLegacy), and the oracle resolves the bank from the DER's chain.
+	LegacyCurve *curveBinding
+}
+
+// forGeneration resolves the apparatus this row uses on the DER that was
+// actually under test, from the generation the live phase recorded.
+//
+// It is a pure function of the observation because the citation phase has no
+// live context and must not be able to reach a different answer than Setup did:
+// the generation is read from the DER once, written into Params, and every
+// later reader — Notes, Criteria, spec.Verdict — dispatches on that one record.
+// A row with no per-generation split is returned unchanged, so nothing that
+// does not declare LegacyCurve can be affected by this at all.
+func (m controlMode) forGeneration(params map[string]string) controlMode {
+	if m.LegacyCurve == nil || params == nil {
+		return m
+	}
+	if params[curveGenParam] != string(invariant.FamilyLegacy) {
+		return m
+	}
+	m.Refusal, m.Curve = nil, m.LegacyCurve
+	return m
+}
+
+// forObservation is forGeneration over an Observation.
+func (m controlMode) forObservation(o *Observation) controlMode {
+	if o == nil {
+		return m
+	}
+	return m.forGeneration(o.Params)
 }
 
 // measured reports whether this row has a southbound apparatus at all — the
@@ -162,6 +208,7 @@ func (m controlMode) measured() bool {
 // which apparatus the row carries. Notes, the criterion and spec.Verdict all
 // read it, so a bundle can never show the three disagreeing.
 func (m controlMode) outcome(o *Observation) Finding {
+	m = m.forObservation(o)
 	switch {
 	case m.Refusal != nil:
 		return refusalOutcome(m.Refusal, o)
@@ -453,28 +500,13 @@ func scalarControlRequest(element, mrid string, win scalarControlWindow) Control
 // model is the SunSpec curve model this mode's content must land in, and
 // mapping states where that correspondence comes from, because a FAIL that
 // names a register bank has to be checkable by whoever reads it.
-func curveMode(element, mode string, points []CurvePoint, yRef uint8, model uint16, mapping string) controlMode {
-	return controlMode{
-		Element: element,
-		Curve: &curveBinding{
-			Mode: mode, Points: points, YRefType: yRef, Model: model, Mapping: mapping,
-		},
-	}
-}
-
-// curveModeNoRegisterHome builds a curve row whose mode this DER has no
-// breakpoint-carrying register for at all: the control CAN be authored
-// northbound, so the CSIP half of the row is real evidence, but nothing
-// southbound can hold its content and the row says so in a decided FAIL.
-//
-// The alternative — asserting something weaker on a neighbouring model and
-// calling it a PASS — is the defect this whole change is about, one register
-// bank along.
-func curveModeNoRegisterHome(element, mode string, points []CurvePoint, yRef uint8, nearest uint16,
-	why string) controlMode {
-	m := curveMode(element, mode, points, yRef, nearest, "")
-	m.Curve.NoRegisterHome = why
-	return m
+// The binding is passed WHOLE rather than assembled from eight positional
+// arguments. Its per-generation arms have to be readable at the row where they
+// are declared — "opModWattPF lands on 131 and nowhere on 7xx" is the row's
+// substance, not a parameter — and a positional constructor for a six-field
+// target was the shape in which the 712 substitution hid.
+func curveMode(element string, b *curveBinding) controlMode {
+	return controlMode{Element: element, Curve: b}
 }
 
 // scalarModeRefused builds a row whose axis this product DELIBERATELY refuses
@@ -521,18 +553,31 @@ func scalarModeRefused(element, axis, commanded, why string, points []string,
 // supporting the axis would have executed, through the same publisher the
 // execution rows use. critDERCurveResolvable stays on the row for the same
 // reason: it is what separates "refused the axis" from "never got the curve".
-func curveModeRefused(element, mode string, points []CurvePoint, yRef uint8, model uint16,
-	axis, why string) controlMode {
+func curveModeRefused(element, axis, why string, b *curveBinding) controlMode {
 	return controlMode{
 		Element: element,
 		Refusal: &refusalBinding{
 			Axis: axis, Why: why,
-			Commanded: fmt.Sprintf("a %s curve of %d breakpoint(s) linked from <%s>", mode, len(points), element),
-			Curve: &curveBinding{
-				Mode: mode, Points: points, YRefType: yRef, Model: model,
-			},
+			Commanded: fmt.Sprintf("a %s curve of %d breakpoint(s) linked from <%s>",
+				b.Mode, len(b.Points), element),
+			Curve: b,
 		},
 	}
+}
+
+// curveModePerGeneration builds a row that is a REFUSAL row on a 7xx DER and an
+// EXECUTION row on a legacy 12x one.
+//
+// It is not a convenience: the two halves assert opposite things, and which is
+// correct is a property of the device under test rather than of the catalog.
+// Wiring one of them to both benches would either fail every conformant 7xx DUT
+// (asking it to execute an axis with no register home) or certify every legacy
+// one (asking it to refuse an axis it can perform), and the second is exactly
+// the shape a bundle must never contain.
+func curveModePerGeneration(element, axis, why string, refused, legacy *curveBinding) controlMode {
+	m := curveModeRefused(element, axis, why, refused)
+	m.LegacyCurve = legacy
+	return m
 }
 
 // unreachableMode builds a controlMode for a mode this bench cannot publish.
@@ -576,6 +621,7 @@ func basicInverterControl(m controlMode, subject string) certify.Check {
 func inverterControlSpec(m controlMode, subject, mrid string) spec {
 	s := spec{
 		Notes: func(o *Observation) string {
+			m := m.forObservation(o)
 			if m.Unreachable != "" {
 				return "the control mode this row is about cannot be published by this bench: " + m.Unreachable
 			}
@@ -593,6 +639,11 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			return notes
 		},
 		Criteria: func(o *Observation) []criterion {
+			// The apparatus this row used depends on which DER generation the
+			// live phase found (forGeneration). Resolving it HERE, from the
+			// record Setup left, is what keeps the criteria, the notes and the
+			// verdict from being able to describe three different rows.
+			m := m.forObservation(o)
 			crits := []criterion{critDiscoveryRoot(), critProgramList(0)}
 			if m.Unreachable != "" {
 				// IW15-008: a decided FAIL, not the Skip this used to be. See
@@ -650,6 +701,14 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 		s.RequiresGridSim = true
 		s.Setup = func(ctx context.Context, d *Driver, params map[string]string) error {
 			params["mrid"] = mrid
+			// Which generation this DER belongs to has to be settled BEFORE the
+			// apparatus is chosen, and it is a question only the device can
+			// answer. A row with no per-generation split skips the read
+			// entirely, so no existing row pays for this.
+			if m.LegacyCurve != nil {
+				params[curveGenParam] = detectCurveGeneration(ctx, d.rc)
+			}
+			m := m.forGeneration(params)
 			switch {
 			case m.Curve != nil:
 				return curveSetup(ctx, d, params, m.Curve, mrid)
@@ -681,6 +740,7 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			// (IW14-005 — spec.SettlePoll, waitSlots).
 			s.SettlePoll = true
 			s.PostWait = func(ctx context.Context, d *Driver, params map[string]string) error {
+				m := m.forGeneration(params)
 				// settleOracle, not a bare judge call: AwaitWalk returns at
 				// the START of the DUT's walk, so the control the DUT is
 				// fetching may not have reached the DER's own registers yet

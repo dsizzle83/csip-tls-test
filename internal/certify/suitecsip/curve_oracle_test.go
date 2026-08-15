@@ -158,9 +158,10 @@ func curveHeaderForTest(model uint16) (*sunspec.Layout, string, string, string) 
 // property of the SHIPPING row, not of a curve invented for a test.
 func basic006Binding() *curveBinding {
 	return &curveBinding{
-		Mode:   "volt_var",
-		Points: []CurvePoint{{X: 92, Y: 60}, {X: 98, Y: 0}, {X: 102, Y: 0}, {X: 108, Y: -60}},
-		Model:  sunspec.ModelDERVoltVar, YRefType: 3, Mapping: mappingVoltVar,
+		Mode:     "volt_var",
+		Points:   []CurvePoint{{X: 92, Y: 60}, {X: 98, Y: 0}, {X: 102, Y: 0}, {X: 108, Y: -60}},
+		Model7xx: sunspec.ModelDERVoltVar, YRefType: 3, Mapping7xx: mappingVoltVar,
+		ModelLegacy: sunspec.ModelVoltVarLegacy, MappingLegacy: mappingVoltVarLegacy,
 	}
 }
 
@@ -184,7 +185,7 @@ func (f *curveFixture) adoptBasic006Curve(t *testing.T) {
 // derived from the SHIPPING row's yRefType rather than restated.
 func basic006DeptRef(t *testing.T) uint16 {
 	t.Helper()
-	want, ok := basic006Binding().wantDeptRef()
+	want, ok := basic006Binding().wantDeptRef(sunspec.ModelDERVoltVar)
 	if !ok {
 		t.Fatalf("BASIC-006's yRefType has no DeptRef translation — the row publishes a curve a " +
 			"conformant DUT must refuse, which is not what this fixture is for")
@@ -370,7 +371,7 @@ func TestOracleCurve_ModelAbsentIsAFail(t *testing.T) {
 		// 707 (DERTripLV) is not served by the default advanced sim — the trip
 		// models are opt-in (NewSolarServerTrip) — and is not a model this
 		// referee decodes either, so it stands in for "no register home found".
-		Model: 707, YRefType: 3, Mapping: "a mapping onto a model this device does not serve",
+		Model7xx: 707, YRefType: 3, Mapping7xx: "a mapping onto a model this device does not serve",
 	}
 	got := oracleCurve(b)(context.Background(), f.rc)
 	if got.Verdict != certify.Fail {
@@ -389,9 +390,12 @@ func TestOracleCurve_ModelAbsentIsAFail(t *testing.T) {
 // skip, and not pass by asserting something weaker against 711.
 func TestOracleCurve_FreqWattHasNoRegisterHomeAndSaysSoAsAFail(t *testing.T) {
 	f := newCurveFixture(t)
-	m := curveModeNoRegisterHome("opModFreqWatt", "freq_watt",
-		[]CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}}, 3, sunspec.ModelDERFreqDroop, noFreqWattRegister)
-	got := oracleCurve(m.Curve)(context.Background(), f.rc)
+	b := &curveBinding{
+		Mode: "freq_watt", Points: []CurvePoint{{X: 6000, Y: 100}, {X: 6050, Y: 0}}, XMult: -2, YRefType: 1,
+		Model7xx: sunspec.ModelDERFreqDroop, NoRegisterHome7xx: noFreqWattRegister,
+		ModelLegacy: sunspec.ModelFreqWattLegacy, MappingLegacy: mappingFreqWattLegacy,
+	}
+	got := oracleCurve(b)(context.Background(), f.rc)
 	if got.Verdict != certify.Fail {
 		t.Fatalf("a mode with no southbound register home = %s (%s), want FAIL", got.Verdict, got.Observed)
 	}
@@ -931,7 +935,7 @@ func TestBasic015Row_IsARefusalRowAndItsCurveBankStaysUntouched(t *testing.T) {
 			"home is legacy model 131; grading it against model 712 (DER Watt-Var) certifies the very " +
 			"substitution the product stopped performing")
 	}
-	if row.mode.Refusal.Curve == nil || row.mode.Refusal.Curve.Model != sunspec.ModelDERWattVar {
+	if row.mode.Refusal.Curve == nil || row.mode.Refusal.Curve.Model7xx != sunspec.ModelDERWattVar {
 		t.Fatalf("BASIC-015's refusal must be measured over model 712 — the bank the product used to "+
 			"write opModWattPF into, and therefore the one a regression would land in: %+v",
 			row.mode.Refusal.Curve)
@@ -995,7 +999,7 @@ func TestBasic015Row_IsRedWhenTheWattPFCurveLandsIn712(t *testing.T) {
 	// own published breakpoints adopted into model 712.
 	if err := f.base.WriteWattVar(sunspec.WattVarCurve{
 		DeptRef: 2, Pri: 1,
-		Points:  []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
+		Points: []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
 	}, "basic015-regression-test"); err != nil {
 		t.Fatalf("derbase WriteWattVar (the substitution this row must catch): %v", err)
 	}
@@ -1037,7 +1041,7 @@ func TestBasic015Row_IsRedWhenTheBaselineAlreadyHeldTheRefusedCurve(t *testing.T
 	// makes, only earlier, which is the whole distinction being drawn.
 	if err := f.base.WriteWattVar(sunspec.WattVarCurve{
 		DeptRef: 2, Pri: 1,
-		Points:  []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
+		Points: []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
 	}, "basic015-contaminated-baseline-test"); err != nil {
 		t.Fatalf("derbase WriteWattVar (seeding the contaminated baseline): %v", err)
 	}
@@ -1151,7 +1155,7 @@ func (f *curveFixture) stageRefusedWattPFCurve(t *testing.T, idx int) {
 	staged := append([]uint16(nil), regs...)
 	if _, _, err := sunspec.Encode712Curve(staged, idx, sunspec.WattVarCurve{
 		DeptRef: 2, Pri: 1,
-		Points:  []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
+		Points: []sunspec.WVPoint{{W: 0, Var: 100}, {W: 50, Var: 98}, {W: 100, Var: 95}},
 	}); err != nil {
 		t.Fatalf("encode the staged watt-PF curve at index %d: %v", idx, err)
 	}
@@ -1233,7 +1237,7 @@ func TestCoveredCurveSlots_FingerprintAndContaminationSpanTheSameSlots(t *testin
 		t.Fatalf("read the DER through the referee: %v", err)
 	}
 	b := rowByID(t, "BASIC-015").mode.Refusal
-	views, _, ok := coveredCurveSlots(uv, b.Curve.Model)
+	views, _, ok := coveredCurveSlots(uv, b.Curve.Model7xx)
 	if !ok || len(views) < 2 {
 		t.Fatalf("the fixture's M712 bank covers %d slot(s); this test needs a live curve AND at least "+
 			"one staging slot to be able to tell the two reads apart", len(views))
@@ -1297,7 +1301,10 @@ func TestCoveredCurveSlots_BoundIsRealAndIsFour(t *testing.T) {
 	if !ok {
 		t.Fatal("no fingerprint")
 	}
-	if !strings.Contains(fp, "further staging curve(s) not fingerprinted") {
+	// "curve slot(s)", not "staging curve(s)": the wording is generation-neutral
+	// because the bound applies to both idioms and only one of them has staging
+	// slots at all. On legacy every bank 1..NCrv is a covered slot.
+	if !strings.Contains(fp, "further curve slot(s) not fingerprinted") {
 		t.Errorf("the truncated fingerprint does not say it is truncated: %s", fp)
 	}
 }
@@ -1331,7 +1338,8 @@ func TestRefusalOutcome_ScalarShapeHasNoContaminationGuardAndSaysSo(t *testing.T
 	}
 	// And the curve shape with the identical params does trip it, so the
 	// difference above is the binding and nothing else.
-	cb := &refusalBinding{Axis: "M712", Curve: &curveBinding{Mode: "watt_pf", Model: sunspec.ModelDERWattVar}}
+	cb := &refusalBinding{Axis: "M712", Curve: &curveBinding{Mode: "watt_pf",
+		Model7xx: sunspec.ModelDERWattVar}}
 	if f := refusalOutcome(cb, obs); f.Verdict != certify.Fail {
 		t.Fatalf("a curve refusal with a PASSing pre-verdict = %s (%s), want FAIL", f.Verdict, f.Observed)
 	}
