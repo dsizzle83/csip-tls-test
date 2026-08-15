@@ -142,8 +142,9 @@ func TestFixedPFDirection_RedProofAgainstTheProductsExcitationInversion(t *testi
 		t.Errorf("the FAIL does not say the magnitude was right, so it reads like an ordinary "+
 			"mismatch:\n%s", got.Observed)
 	}
-	t.Logf("RED PROOF (product generation 1 — publish.go:745's un-negated conversion), verbatim:\n%s",
-		got.Observed)
+	t.Logf("RED PROOF (product GENERATION 1 — gw cb5b89a, publish.go's un-negated `OverExcited: "+
+		"pf.Excitation`; lexa-proto's derbase carried the same missing negation at both writers until "+
+		"93d24f4), verbatim:\n%s", got.Observed)
 }
 
 // TestFixedPFDirection_GreenAgainstACorrectGateway is the other side, and it is
