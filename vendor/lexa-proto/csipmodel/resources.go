@@ -454,12 +454,42 @@ type SignedPerCent struct {
 // DERControlBase at p.248. THREE MANDATORY sub-elements:
 //
 //	displacement (UInt16 [1])                  — the PF magnitude, scaled
-//	excitation   (boolean [1])                 — true = over-excited
+//	excitation   (boolean [1])                 — see the polarity below
 //	multiplier   (PowerOfTenMultiplierType [1]) — apply 10^multiplier
 //
-// so the displacement power factor is displacement × 10^multiplier, and 0.950
-// over-excited is {displacement 950, excitation true, multiplier -3}. Identical
-// in 2030.5-2023 p.271, which adds only a wrapper
+// so the displacement power factor is displacement × 10^multiplier. p.258's own
+// worked example: "a value of 0.95 may be specified as a displacement of 950 and
+// a multiplier of −3".
+//
+// ── THE EXCITATION POLARITY, QUOTED, BECAUSE GETTING IT BACKWARDS COMMANDS
+//
+//	REACTIVE POWER IN THE OPPOSITE DIRECTION AT FULL MAGNITUDE ──────────────
+//
+// 2018 p.258, excitation attribute (boolean), verbatim and complete:
+//
+//	"True when DER is absorbing reactive power (under-excited), false when DER
+//	 is injecting reactive power (over-excited)."
+//
+// So TRUE means UNDER-excited, and 0.950 OVER-excited is {displacement 950,
+// excitation FALSE, multiplier -3}. This comment said "true = over-excited"
+// until 2026-08-15 and every production consumer agreed with the comment rather
+// than with the standard.
+//
+// THE TRAP IS THAT `excitation` READS LIKE A DEGREE, NOT A DIRECTION. "Excited"
+// sounds like more, and more excitation sounds like injecting — but the flag
+// names the ABSORBING case, which is the under-excited one. Downstream, SunSpec
+// model 704 numbers the same pair in the opposite order again
+// (M704_Ext_OverExcited = 0, M704_Ext_UnderExcited = 1), so any consumer of this
+// field crosses TWO conventions and must convert rather than copy:
+//
+//	overExcited := !p.Excitation
+//
+// A caller that assigns the boolean straight through writes PFWInj_Ext = 0
+// (over-excited) for a document that said "absorb", and the inverter injects.
+// Pinned at the writer by derbase's
+// TestSetFixedPF_ExcitationTrueWritesUnderExcited.
+//
+// Identical in 2030.5-2023 p.271, which adds only a wrapper
 // (PowerFactorWithExcitationControlType) carrying the new `disabled` attribute
 // — backward compatible with this element content.
 //

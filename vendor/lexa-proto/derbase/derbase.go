@@ -1024,7 +1024,18 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.validatePF(pf, "opModFixedPFInjectW"); err != nil {
 			return nil, err
 		}
-		over := ctrl.OpModFixedPFInjectW.Excitation
+		// NEGATED, and the negation is the entire correctness of this line.
+		// 2018 p.258: excitation is "True when DER is absorbing reactive power
+		// (under-excited), false when DER is injecting reactive power
+		// (over-excited)" — so TRUE means UNDER-excited. SetFixedPF's parameter
+		// is overExcited, and 704 numbers the pair the other way again
+		// (M704_Ext_OverExcited = 0, M704_Ext_UnderExcited = 1). This read
+		// `over := ...Excitation` from fe483e7 until 2026-08-15: the type
+		// correction carried the polarity of the invented sign convention it
+		// replaced, so a conformant 0.90-under-excited command wrote
+		// PFWInject_Ext = 0 and the inverter INJECTED — reactive power opposite
+		// the command, at full magnitude.
+		over := !ctrl.OpModFixedPFInjectW.Excitation
 		add("opModFixedPFInjectW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetFixedPF(true, pf, over, tag) })
 	}
 	if ctrl.OpModFixedPFAbsorbW != nil {
@@ -1053,7 +1064,18 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.validatePF(pf, "opModFixedPFAbsorbW"); err != nil {
 			return nil, err
 		}
-		over := ctrl.OpModFixedPFAbsorbW.Excitation
+		// NEGATED, and the negation is the entire correctness of this line.
+		// 2018 p.258: excitation is "True when DER is absorbing reactive power
+		// (under-excited), false when DER is injecting reactive power
+		// (over-excited)" — so TRUE means UNDER-excited. SetFixedPF's parameter
+		// is overExcited, and 704 numbers the pair the other way again
+		// (M704_Ext_OverExcited = 0, M704_Ext_UnderExcited = 1). This read
+		// `over := ...Excitation` from fe483e7 until 2026-08-15: the type
+		// correction carried the polarity of the invented sign convention it
+		// replaced, so a conformant 0.90-under-excited command wrote
+		// PFWAbsorb_Ext = 0 and the inverter INJECTED — reactive power opposite
+		// the command, at full magnitude.
+		over := !ctrl.OpModFixedPFAbsorbW.Excitation
 		add("opModFixedPFAbsorbW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetFixedPF(false, pf, over, tag) })
 	}
 	if ctrl.OpModFixedVar != nil {
