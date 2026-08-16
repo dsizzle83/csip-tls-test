@@ -172,9 +172,54 @@ type modelBundle struct {
 // is untouched, and any caller that was already passing -serial is unaffected.
 const defaultMbapsInverterSerial = "SN-MBAPS-001"
 
+// defaultMbapsLegacySerial is the legacy-curve model's own serial, distinct
+// from the 7xx inverter's for the reason above: two co-located sims that share
+// an identity put the referee's identity-keyed mechanisms into their degraded
+// mode (internal/invariant/i3.go's identityHolders).
+const defaultMbapsLegacySerial = "SN-MBAPS-12X-001"
+
+// ── Why this sim gained a LEGACY-CURVE model ───────────────────────────────
+//
+// suitemodbusserver's CRV-1 sweeps the legacy curve family (126-134/160) across
+// the DUT's northbound projection and asserts the D4 read-only posture on each.
+// Six of those sub-verdicts SKIPped on every bench run, and the cause was here
+// rather than in the product: the only DER this bench presents over SECURE
+// Modbus is this sim, and it could build nothing but the 7xx advanced set. The
+// gateway had no legacy curve models to project, so the check found them absent
+// and skipped — a harness gap wearing a verdict's clothes, which is exactly
+// what the LoadBearing discipline exists to stop being invisible.
+//
+// modsim has served legacy curves since the legacy-curve wave
+// (-der-models legacy-curves); it speaks PLAINTEXT Modbus, so it can be the
+// gateway's southbound DER but never reaches the mbaps surface CRV-1 measures.
+// The two sims had drifted apart in what they can present, and the suite that
+// needed the difference was the one that could not see it.
+//
+// The option is a MODEL rather than a flag on the inverter model, mirroring
+// modsim's -der-models: a device either serves the 12x family or the 7xx one,
+// not both, and a sim that pretended otherwise would present a chain no real
+// DER has.
 func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, error) {
 	const loopbackAny = "tcp://127.0.0.1:0"
 	switch kind {
+	case "inverter-legacy-curves":
+		if serial == "" {
+			serial = defaultMbapsLegacySerial
+		}
+		srv, err := sim.NewSolarServerLegacyCurves(loopbackAny, wmax, serial, sim.LegacyCurveOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("mbapsdev: new legacy-curve inverter model: %w", err)
+		}
+		return &modelBundle{
+			regs:      srv.Regs,
+			snapshot:  func() any { return srv.Snapshot() },
+			inject:    srv.Inject,
+			registers: func() any { return srv.Registers() },
+			fault:     srv.ApplyFault,
+			control:   controlFunc("inverter", srv.Server),
+			stop:      srv.Stop,
+			base:      srv.Server,
+		}, nil
 	case "inverter":
 		if serial == "" {
 			serial = defaultMbapsInverterSerial
@@ -209,7 +254,7 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 			base:      srv.Server,
 		}, nil
 	default:
-		return nil, fmt.Errorf("mbapsdev: unknown -model %q (want inverter|battery)", kind)
+		return nil, fmt.Errorf("mbapsdev: unknown -model %q (want inverter|inverter-legacy-curves|battery)", kind)
 	}
 }
 
@@ -236,7 +281,9 @@ func controlFunc(label string, base *sim.Server) func(simapi.ControlCmd) error {
 
 func main() {
 	listen := flag.String("listen", ":8021", "mbaps (secure Modbus/TLS) listen address")
-	model := flag.String("model", "inverter", "device model: inverter|battery")
+	model := flag.String("model", "inverter", "device model: inverter (7xx advanced) | "+
+		"inverter-legacy-curves (the 12x family: 126/127/128/129/130/131/132/134/160, which is what "+
+		"suitemodbusserver's CRV-1 legacy sub-verdicts measure over mbaps) | battery")
 	wmax := flag.Float64("wmax", 5000, "nameplate WMax in watts")
 	kwh := flag.Float64("kwh", 10, "battery energy capacity in kWh (battery model only)")
 	caFile := flag.String("ca", "certs/mbaps/dev-ca.pem", "CA file trusting the gateway's southbound client cert")
@@ -246,7 +293,8 @@ func main() {
 	serial := flag.String("serial", "", "SunSpec Model 1 serial number (SN) override for the inverter "+
 		"model; empty keeps this sim's own default \""+defaultMbapsInverterSerial+"\", which is distinct "+
 		"from modsim's \"SN-SOLAR-001\" so the documented two-sim bench is NOT identity-degraded before "+
-		"anyone passes a flag. Ignored for -model battery, which keeps its own default (\"SN-BAT-001\").")
+		"anyone passes a flag. -model inverter-legacy-curves has its own default too "+
+		"(\""+defaultMbapsLegacySerial+"\"); ignored for -model battery, which keeps \"SN-BAT-001\".")
 	fwVersion := flag.String("fw-version", "", "SunSpec Model 1 firmware version (Vr) override for either "+
 		"model; empty keeps the sim's built-in default. Vr is REQUIRED by the IEEE 1547-2018 profile "+
 		"\u00a73.2 Table 16, and a gateway mirroring this device northbound passes it through VERBATIM \u2014 it "+

@@ -981,14 +981,21 @@ func inverterControlRows() []inverterControlRow {
 			// as served-and-not-asserted, instead of a decided FAIL that could
 			// never move whatever the product did.
 			//
-			// It goes RED on the SHIPPING product and that is the point: the
-			// freq-droop axis is admitted only by AdvancedSupportedAxes, gated
-			// behind advanced_axes_enabled, and the shipping posture is
-			// `"adv":"off"` — so the DUT answers cannot-comply at receipt, model
-			// 711 keeps its factory parameters, and this row says exactly that.
-			// Stage-7 discipline: the row is honest about a product that does
-			// not execute the axis, and it can go green the day the switches
-			// open without a line of this file changing.
+			// It goes RED against a gateway whose advanced axes are SHUT, and
+			// that is the point: the freq-droop axis is admitted only by
+			// AdvancedSupportedAxes, gated behind advanced_axes_enabled, so
+			// with that gate closed the DUT answers cannot-comply at receipt,
+			// model 711 keeps its factory parameters, and this row says exactly
+			// that.
+			//
+			// WHICH POSTURE THE IMAGE SHIPS IS NOT THIS FILE'S CLAIM TO MAKE.
+			// `"adv":"off"` was the default when this was written; gw bd1e288
+			// flips it open. Stage-7 discipline is what makes that a non-event
+			// here: the row is honest about a product that does not execute the
+			// axis and goes green the day the switches open, without a line of
+			// this file changing — which is also why the sentence above no
+			// longer asserts a default it would have to be edited to keep
+			// true.
 			Model7xx:          sunspec.ModelDERFreqDroop,
 			NoRegisterHome7xx: noFreqWattRegister,
 			// The legacy arm is a real home for the CURVE. This is D2's

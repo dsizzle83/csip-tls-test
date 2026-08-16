@@ -382,10 +382,18 @@ func TestRideThroughRowsAreRedAgainstTheShippingProduct(t *testing.T) {
 // TestRideThroughRowsAreRedEndToEndAgainstTheShippingProduct drives the
 // SHIPPING rows through the same live-phase sequence check.go's run() uses
 // (Setup, the DUT's poll cycle, PostWait) with the DER left in exactly the
-// state the current product leaves it: nothing written, because the gateway
-// refuses every curve axis at receipt with the advanced axes OFF — the shipping
-// default (lexa-gw's AdvancedSupportedAxes behind advanced_axes_enabled,
-// facts-dut-capability.md §2.3's `"adv": "off"`).
+// state a gateway with the advanced axes SHUT leaves it: nothing written,
+// because it refuses every curve axis at receipt (lexa-gw's
+// AdvancedSupportedAxes, gated behind advanced_axes_enabled).
+//
+// THE POSTURE IS STAGED BY THIS TEST, not read from whatever image the bench
+// happens to be running, and the distinction matters now that it has moved:
+// `"adv": "off"` was the shipping default when this was written and gw bd1e288
+// flips it OPEN. The red proof is unaffected — it is a statement about what the
+// row reports when the axis is refused, which is a posture a gateway can be in
+// however the image ships — but a comment claiming "the shipping default" as
+// present tense would now be false, and this suite does not carry claims about
+// the product it cannot check from here.
 //
 // This is the ROW-level red proof. The oracle-level one above shows the
 // referee's answer; this shows the row's DECLARED VERDICT, which is what lands
