@@ -1589,8 +1589,15 @@ func (b *Base) fixedWReference(negative bool) (float64, bool, error) {
 
 // validatePFAtExcitation rejects a power factor outside [0,1], or below the
 // minimum the device declares FOR THE EXCITATION IT WILL BE HELD AT. It is the
-// only PF rated-bound check in this package; both the primary commands and the
-// reversion alternates go through it.
+// only PF rated-bound check in this package.
+//
+// EVERY PF value reaching a register goes through it, and that took two passes
+// to become true. It is called from preflightControl for the CSIP document
+// path, and from SetFixedPF for both the primary value and the reversion
+// alternate — SetFixedPF being a directly reachable entry point that lexa-gw's
+// advanced shell calls without ever entering ApplyControl. An earlier revision
+// of this comment claimed the coverage before SetFixedPF's primary had it
+// (gate #19 H1); the claim is only worth making with the call sites to back it.
 //
 // # Why the excitation, and not the axis name (gate #18 E-1, extended)
 //
@@ -1659,30 +1666,62 @@ func excitationName(overExcited bool) string {
 // ratedPFBound returns the device's declared minimum power factor at the given
 // excitation, and the name of the point it came from.
 //
-// It prefers WOvrExtRtgPF / WUndExtRtgPF over PFOvrExtRtg / PFUndExtRtg because
-// the vendored model_702.json labels the latter pair "(Unused)" and its
-// descriptions say, verbatim, "Unused. Please use WOvrExtRtgPF." and "Unused.
-// Please use WUndExtRtgPF." A device that follows that instruction publishes
-// only the replacements, and this package used to read only the deprecated
-// pair — getting NaN, applying no bound, and letting any displacement through
-// on precisely the conformant hardware the guard exists for.
+// # It reads PFOvrExtRtg / PFUndExtRtg even though model 702 calls them Unused
 //
-// The fallback is not politeness: a device that publishes only the deprecated
-// pair has still made a claim about what it can hold, and ignoring it would be
-// the same silent no-bound in the other direction. Preference order is
-// current-then-deprecated; NaN (absent or unimplemented) is what makes a point
-// unusable, and minRatingBound turns a remaining NaN into "no floor declared".
+// 13889c4 changed this to PREFER WOvrExtRtgPF / WUndExtRtgPF, on the strength
+// of the vendored model's own instruction ("Unused. Please use WOvrExtRtgPF").
+// Gate #19 sent me back to the point descriptions, and they do not support it.
+// Reading the pair together:
+//
+//	WOvrExtRtg    "Active power rating AT specified over-excited power factor,
+//	               in watts."
+//	WOvrExtRtgPF  "Specified over-excited power factor."
+//
+// That is an OPERATING-POINT CHARACTERISATION — "I am rated 5000 W at 0.95
+// over-excited" — not a limit. Nothing in it says 0.95 is the lowest power
+// factor the machine will accept, and using it as one converts a datasheet
+// figure into a refusal of every command below the point the device was
+// CHARACTERISED at. On this axis that fails in the expensive direction: an
+// inverter typically supports well below its rated operating point, so the
+// preferred-point version would have refused a large class of legitimate
+// grid-support commands, on modern hardware, on an inference.
+//
+// PFOvrExtRtg / PFUndExtRtg are named "PF ... Rating" — a rating OF the power
+// factor, which IS limit-shaped, and is what this package has always read.
+// They are deprecated, so on a current-generation device they are
+// unimplemented and this bound is INERT. That is a real gap and it is
+// reported, not papered over: inert fails OPEN, toward accepting an operator's
+// command and letting the device be the authority (derbase verifies by
+// read-back regardless), whereas the preferred-point version failed CLOSED
+// against commands the machine can hold. With no normative text establishing a
+// minimum-PF point in the current vocabulary, open-and-disclosed beats
+// closed-on-a-guess.
+//
+// OPEN QUESTION FOR THE BENCH / OWNER, not for this function: model 702 appears
+// to publish no minimum-supported-PF point at all in its current vocabulary.
+// If that is right, capability-bounding this axis needs either the (W, PF)
+// pairs interpreted properly as a curve, or a PICS disclosure that the bound
+// is not enforced. Either is a design decision with evidence attached, not a
+// register swap.
+//
+// # Why settings-first does not apply here (gate #19 LOW)
+//
+// capability.go's settingOrRatingBound doctrine — prefer the RW SETTING, fall
+// back to the RATING — governs a setting that DERATES a rating OF THE SAME
+// QUANTITY: WMax against WMaxRtg, an installer configuring the machine below
+// its nameplate. The PF points are not that. WOvrExtPF is the settings-block
+// twin of WOvrExtRtgPF and carries the identical description, "Specified
+// over-excited power factor" — the PF coordinate of a (W, PF) operating point,
+// in both blocks. There is no derate relationship between them to apply the
+// doctrine to, and PFOvrExt (the settings twin of PFOvrExtRtg) is marked
+// "Unused" exactly as its rating counterpart is. So this reads the rating
+// point only, and the doctrine is cited here to record that it was considered
+// and does not fit rather than that it was overlooked.
 func (b *Base) ratedPFBound(overExcited bool) (float64, string) {
-	current, currentName := b.Cap.WUndExtRtgPF, "WUndExtRtgPF"
-	legacy, legacyName := b.Cap.PFUndExtRtg, "PFUndExtRtg"
 	if overExcited {
-		current, currentName = b.Cap.WOvrExtRtgPF, "WOvrExtRtgPF"
-		legacy, legacyName = b.Cap.PFOvrExtRtg, "PFOvrExtRtg"
+		return b.Cap.PFOvrExtRtg, "PFOvrExtRtg"
 	}
-	if !math.IsNaN(current) {
-		return current, currentName
-	}
-	return legacy, legacyName
+	return b.Cap.PFUndExtRtg, "PFUndExtRtg"
 }
 
 // validateSetpointW rejects an active-power setpoint the device cannot hold:
@@ -2339,6 +2378,23 @@ func (b *Base) SetFixedPF(inject bool, pf float64, overExcited bool, tag string)
 	rvrtFn, err := pfRvrtAlternateWriter("SetFixedPF", pfField, extField, enaField,
 		b.DefaultPFRvrt, b.DefaultPFRvrtOverExcited, b.DefaultPFEnaRvrt)
 	if err != nil {
+		return err
+	}
+	// THE PRIMARY VALUE IS BOUNDED HERE, not only at preflightControl (gate #19
+	// H1). SetFixedPF is a DIRECTLY REACHABLE entry point — lexa-gw's advanced
+	// shell calls it straight (cmd/modbus/reconcile_adv.go), never through
+	// ApplyControl — so everything preflightControl checks for the CSIP path
+	// has to be checked again here or it is not checked at all on the live
+	// chain. Until this was added, SetFixedPF bounded the reversion
+	// DESTINATION and not the value it was actually commanding: pf=0.50 went
+	// to a device declaring a 0.95 minimum, and pf=5.0 and pf=-0.5 reached
+	// SetFloat with no domain check at all.
+	//
+	// Keyed on the command's OWN excitation, for the reason in
+	// validatePFAtExcitation: `inject` is active-power direction and the
+	// ratings are excitation-keyed. Placed before write704 so a refusal costs
+	// no wire traffic and moves no register.
+	if err := b.validatePFAtExcitation(pf, overExcited, "SetFixedPF"); err != nil {
 		return err
 	}
 	// Bounded ONLY when the alternate will actually be ARMED (gate #18 E-7).
@@ -3366,28 +3422,79 @@ func (p *m123ConnPlan) execute() (PlanOutcome, error) {
 	//
 	// So the three registers go as ONE 3-register write at offset 0 — they are
 	// adjacent in the published model precisely because they belong together.
-	// A timer the device leaves UNIMPLEMENTED (0xFFFF) is written back as its
-	// sentinel rather than zeroed: there is no timer there to defer anything,
-	// and pushing 0 into an unimplemented point is the garbage-back-to-the-
-	// device class the corrupt-read gate exists to prevent (the same rule the
-	// ceiling plan's grouping decision applies).
 	//
 	// Both DIRECTIONS get it. A residual revert timer on a connect would make
 	// this plan's own proof a lie in the other direction — echo confirms
 	// connected, device drops out minutes later — and since nothing in this
 	// stack ever sets these registers, a non-zero value in them is by
 	// definition not an intent anybody expressed.
-	win, rvrt := uint16(0), uint16(0)
-	if p.win0 == 0xFFFF {
-		win = 0xFFFF
-	}
-	if p.rvrt0 == 0xFFFF {
-		rvrt = 0xFFFF
-	}
+	//
+	// GROUPING IS CONDITIONAL, AND IT FALLS BACK (gate #19 H2). The first cut
+	// of this fix grouped unconditionally and wrote the 0xFFFF sentinel back
+	// over a timer the device leaves unimplemented. On the shape derbase
+	// elsewhere calls the ordinary shape of a real inverter — unimplemented
+	// timers, and a device that faults any write touching them — that turned a
+	// CEASE that used to succeed as a single-register write into one that
+	// faults and does not land. Loudly reported, but not landed, which on a
+	// disconnect is the one direction that must never regress. The ceiling
+	// plan on the identical device falls back and lands; this plan cited "the
+	// same rule" while doing the opposite.
+	//
+	// So: group only when there is something to group — both timers
+	// IMPLEMENTED, and no memo that this device has already refused a grouped
+	// write. Otherwise, and on any grouped failure, go element by element:
+	// each implemented timer written on its own, then Conn on its own. An
+	// unimplemented timer is then never written AT ALL, rather than written
+	// back as its sentinel — strictly better than the first cut, because there
+	// is no timer there to defer anything and the register the device rejects
+	// is never part of any request.
+	winImpl := p.win0 != 0xFFFF
+	rvrtImpl := p.rvrt0 != 0xFFFF
+	grouped := winImpl && rvrtImpl && !p.b.noGroupedM123
+
 	var writeErr error
-	if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_Conn_WinTms,
-		[]uint16{win, rvrt, p.want}); err != nil {
-		writeErr = fmt.Errorf("%s: set connect=%v: %w", p.tag, p.want == 1, err)
+	wrote := false
+	if grouped {
+		// One FC16 over offsets 0-2: WinTms, RvrtTms, Conn. No partial-state
+		// window exists inside a single transaction — the device either takes
+		// it or it does not.
+		if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_Conn_WinTms,
+			[]uint16{0, 0, p.want}); err == nil {
+			wrote = true
+		} else {
+			// D8 attempt-then-fall-back, with the memo so the next plan on
+			// this device goes straight to the sequence.
+			p.b.noGroupedM123 = true
+			out.Elements[0].Advisory = fmt.Sprintf(
+				"device refused the grouped single-write (%v); completed element by element", err)
+		}
+	}
+	if !wrote {
+		// Element by element. The timers go FIRST and Conn last, so the
+		// command that changes the plant's state is never issued before the
+		// registers that could defer or undo it have been cleared. Only
+		// implemented timers are touched.
+		if winImpl {
+			if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl,
+				sunspec.M123_Conn_WinTms, []uint16{0}); err != nil {
+				writeErr = fmt.Errorf("%s: clear connect window: %w", p.tag, err)
+			}
+		}
+		if rvrtImpl {
+			if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl,
+				sunspec.M123_Conn_RvrtTms, []uint16{0}); err != nil && writeErr == nil {
+				writeErr = fmt.Errorf("%s: clear connect revert timer: %w", p.tag, err)
+			}
+		}
+		// Conn LAST, and its error outranks a timer's: a failure to clear a
+		// timer on a disconnect that landed is a degraded success, whereas a
+		// failure to write Conn is the command not landing at all.
+		if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl,
+			sunspec.M123_Conn, []uint16{p.want}); err != nil {
+			writeErr = fmt.Errorf("%s: set connect=%v: %w", p.tag, p.want == 1, err)
+		}
+	}
+	if writeErr != nil {
 		out.Elements[0].Err = writeErr
 	}
 
@@ -3723,9 +3830,15 @@ func (p *m123LimitPlan) execute() (PlanOutcome, error) {
 	}}
 
 	if p.grouped {
-		// One FC16 over offsets 0-4: value, WinTms and RvrtTms back as read,
-		// ramp, enable. No partial-state window exists inside a single
-		// transaction — the device either takes it or it does not.
+		// One FC16 over the WMaxLimPct group — offsets 3-7 in the published
+		// model: value, WinTms and RvrtTms back as read, ramp, enable. No
+		// partial-state window exists inside a single transaction; the device
+		// either takes it or it does not.
+		//
+		// This comment said "offsets 0-4" until 2026-08-15, which was true of
+		// the mis-transcribed map and is exactly where the damage was: 0-4 is
+		// the CONNECT group, so this write was landing on Conn_WinTms,
+		// Conn_RvrtTms and Conn on every ceiling command.
 		p.attempted = [3]bool{true, true, true}
 		err := p.write(sunspec.M123_WMaxLimPct, p.raw, p.win0, p.rvrt0, p.rmp, 1)
 		if err == nil {
