@@ -568,6 +568,14 @@ func populateBatteryCore(r *RegisterMap, wmaxKwh, wmaxW float64) (BatteryBases, 
 	r.Set(m802Base+uint16(sunspec.M802_State), 2)
 	cursor += 2 + sunspec.M802Len
 
+	// Model 123's scale factors, which the battery DECODES ITS COMMANDED
+	// CEILING THROUGH (hubBatteryW and the pack's own reader both read
+	// M123_WMaxLimPct_SF): a writable SF lets a client change the meaning of
+	// every subsequent ceiling read without touching the ceiling register.
+	// The solar sim listed these by hand and was covered; every battery path
+	// protected 701/702/703/704/713 and never mentioned 123.
+	protectM123SFs(r, m123Base)
+
 	return BatteryBases{
 		M120Base: m120,
 		M121Base: m121Base,

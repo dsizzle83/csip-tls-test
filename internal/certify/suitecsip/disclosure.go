@@ -80,18 +80,25 @@ const (
 	// sound (absent, backwards, unreadable), because a negative claim built on
 	// series nobody could read is not a negative claim.
 	disclosureUnsoundParam = "iw15.disclosure_unsound"
+	// disclosureDriftParam names the reconciliation gap between the family's
+	// UNTAGGED total and the sum of the per-kind series this bench knows —
+	// content the gateway disclosed that the bench cannot attribute. See
+	// droppedContentOutcome.
+	disclosureDriftParam = "iw15.disclosure_drift"
 )
 
 // metricsTargetKey is the Targets.Extra key holding the DUT's Prometheus
-// endpoint.
+// endpoint. It is the FRAMEWORK's constant, not a local literal: the flag that
+// populates the map lives in internal/certify, and a key spelled independently
+// in the reader would fail silently — as a missing endpoint rather than an
+// error — which is exactly how this channel shipped unreachable.
 //
-// The endpoint is lexa-gw's MetricsAddr (cmd/northbound/config.go), which
-// defaults to 127.0.0.1:9102 — LOOPBACK on the DUT — and which BENCH.md binds
-// to 69.0.0.2:9102 on the bench. A desktop run against the loopback default
-// needs an ssh forward; that is an operator decision and this suite makes none,
-// which is why the endpoint is configured rather than derived from
-// Targets.GatewayHost.
-const metricsTargetKey = "metrics"
+// The endpoint is lexa-gw's MetricsAddr (cmd/northbound/config.go), whose
+// default is the LOOPBACK 127.0.0.1:9102 and which BENCH.md binds to
+// 69.0.0.2:9102 on the bench — the value certify.DefaultTargets carries, so a
+// bench run reaches this channel with no flag at all. A gateway keeping the
+// loopback default needs an ssh forward and -metrics-endpoint.
+const metricsTargetKey = certify.TargetMetrics
 
 // metricsScraper builds the scrape source for a run, or reports why there is
 // none.
@@ -106,10 +113,11 @@ func metricsScraper(rc *certify.RunCtx, sels ...metricscrape.Selector) (*metrics
 		endpoint = rc.Targets.Extra[metricsTargetKey]
 	}
 	if endpoint == "" {
-		return nil, fmt.Errorf("no %q endpoint is configured for this run (-target %s=http://host:9102/metrics), "+
-			"so the DUT's own disclosure counters were not read; lexa-gw serves them on MetricsAddr, "+
-			"default 127.0.0.1:9102, which BENCH.md binds to 69.0.0.2:9102 on the bench",
-			metricsTargetKey, metricsTargetKey)
+		return nil, fmt.Errorf("no metrics endpoint is configured for this run, so the DUT's own " +
+			"disclosure counters were not read. Pass -metrics-endpoint http://host:9102/metrics " +
+			"(certify.DefaultTargets already carries the bench's http://69.0.0.2:9102/metrics; lexa-gw " +
+			"serves it on MetricsAddr, whose own default is the loopback 127.0.0.1:9102 and needs an ssh " +
+			"forward from a desktop run)")
 	}
 	src, err := metricscrape.NewHTTPSource(endpoint)
 	if err != nil {
@@ -203,6 +211,46 @@ func recordDisclosure(ctx context.Context, d *Driver, params map[string]string) 
 	}
 	params[disclosureMovedParam] = strings.Join(moved, ", ")
 	params[disclosureUnsoundParam] = strconv.Itoa(unsound)
+
+	// ── THE DRIFT DETECTOR ────────────────────────────────────────────────
+	//
+	// The negative claim iterates the kinds THIS BENCH transcribed. If the
+	// product grows a seventh enumerated kind, its new series moves, the
+	// UNTAGGED total moves with it — and the loop above sees nothing, because
+	// it does not know to look. The row would then PASS "no content was
+	// dropped" over content that demonstrably was.
+	//
+	// The product's own other-bucket does not cover this case and it is worth
+	// being precise about why: _other_total catches a kind the PRODUCT has not
+	// enumerated, and a newly-added kind IS enumerated product-side. The gap is
+	// between the product's enumeration and the bench's transcription of it,
+	// which only the total can see.
+	//
+	// So the total is reconciled against the sum of the known series. Any
+	// excess is disclosed content this bench cannot attribute, and it is named
+	// rather than absorbed.
+	if td, ok := rec.Find(metricscrape.IgnoredContentTotal()); ok && td.Sound() {
+		known := float64(0)
+		allSound := true
+		for _, k := range metricscrape.IgnoredContentKinds() {
+			ks, _ := metricscrape.IgnoredContentKind(k)
+			kd, found := rec.Find(ks)
+			if !found || !kd.Sound() {
+				allSound = false
+				continue
+			}
+			known += kd.Delta
+		}
+		if allSound && td.Delta > known {
+			params[disclosureDriftParam] = fmt.Sprintf(
+				"the gateway's UNTAGGED ignored-content total moved by %v while the %d per-kind series "+
+					"this bench knows account for only %v. %v disclosure(s) came from a kind this bench "+
+					"does not transcribe — most likely a kind the product enumerated after "+
+					"internal/evidence/metricscrape/known.go was written, whose own series is therefore "+
+					"not scraped and whose occurrences do NOT reach the product's _other_total either",
+				td.Delta, len(metricscrape.IgnoredContentKinds()), known, td.Delta-known)
+		}
+	}
 
 	if w.kind == "" {
 		// A row with no kind under test is asserting the negative only; its
@@ -347,8 +395,8 @@ func critNothingOfThisRowsContentWasDropped(o *Observation) criterion {
 			return droppedContentOutcome(o)
 		},
 		Skip: "the DUT's own metrics endpoint was not read across this row's window, so whether any of " +
-			"this row's published content was silently dropped could not be observed (configure -target " +
-			"metrics=http://host:9102/metrics)",
+			"this row's published content was silently dropped could not be observed (pass " +
+			"-metrics-endpoint http://host:9102/metrics)",
 	}
 }
 
@@ -367,7 +415,17 @@ func droppedContentOutcome(o *Observation) Finding {
 	}
 	unsound, _ := strconv.Atoi(o.Params[disclosureUnsoundParam])
 	moved := o.Params[disclosureMovedParam]
+	drift := o.Params[disclosureDriftParam]
 	switch {
+	case drift != "":
+		// Content was disclosed and this bench cannot say of what kind. That
+		// is the same defect the negative claim is about — part of what this
+		// row published was accepted and not acted upon — reported without the
+		// attribution, and it FAILS for that reason rather than passing for
+		// lack of a series to look at.
+		return Finding{Verdict: certify.Fail, Observed: "the DUT reported IGNORED CONTENT while this " +
+			"row's control was on the wire that this bench could not attribute to a kind: " + drift +
+			". Closing the gap is a transcription update in known.go, not a product change"}
 	case moved != "":
 		return Finding{Verdict: certify.Fail, Observed: "the DUT reported IGNORED CONTENT while this " +
 			"row's control was on the wire, so part of what this row published was accepted and not " +

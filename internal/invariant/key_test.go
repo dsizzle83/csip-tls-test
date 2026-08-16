@@ -480,3 +480,536 @@ func TestMonitorReportsOneGhostOnce(t *testing.T) {
 			"the fact that it was seen four times", got)
 	}
 }
+
+// ── IW15-032: the same property, in the other direction ─────────────────────
+//
+// IW15-031 made a finding's identity survive the clock. The adversarial gate on
+// that change asked the inverse question — whether the new identity now merges
+// findings that are genuinely different — and the answer was yes, for every one
+// of the ten. [keyer] kept the FIRST identity offered at the worst verdict and
+// dropped every later one, so a tick that caught two credentials writing where
+// they may not, or two devices sitting over their nameplates, reported ONE
+// violation. The second defect had no signature at all: it could not be counted,
+// could not be re-identified on a re-run, and could not be shrunk to its own
+// minimal reproducer. The reproduction, before the fix, was three lines:
+//
+//	I4  two accepted writes (read-only/unit1/WMaxLimPct, monitor/unit2/VarSetPct)
+//	     -> "accepted:read-only:1:704:WMaxLimPct"                         [1 key]
+//	I5  two crossings (sb leaf -> :802, nb leaf -> :5020)
+//	     -> "cross-domain-auth:sb-device-leaf:sb-devices->…:69.0.0.2:802"  [1 key]
+//	I1  two devices, each over its var rating
+//	     -> "over-nameplate:der.inv-a:VarSetPct"      (36 facts, both devices) [1 key]
+//
+// Two of I1–I10 had a SECOND merge underneath that one, in their own arms: I2's
+// convergence/release arms returned the first offending device rather than every
+// one, and I8's session/host arms returned a single key string per arm. Both are
+// fixed at the source rather than papered over here.
+
+// identityCase is one invariant, its fixture, and the axis on which two of its
+// findings must differ. The fixture builds the SAME world at n = 1 and n = 2,
+// with n = 2 being n = 1 plus one more genuinely distinct defect — which is what
+// lets the test assert the strongest form of the property: the first finding's
+// identity must be BYTE-IDENTICAL whether or not the second defect is present.
+// A composite "A+B" key would satisfy "two findings, two signatures" and still
+// break every shrink attempt that reproduces A alone.
+type identityCase struct {
+	// name is the invariant and the axis its two findings differ on.
+	name string
+	// id is the invariant id, for the violations minted below.
+	id string
+	// params configures both the invariant and the world; several rows need
+	// operator-supplied thresholds before their arm asserts anything at all.
+	params Params
+	// inv builds the checker under test.
+	inv func(Params) Invariant
+	// world builds a world observed at `at` holding exactly n distinct findings.
+	world func(t *testing.T, at time.Time, n int) *World
+	// want is the verdict the fixture must reach. It is asserted, so a fixture
+	// that silently stopped tripping its invariant fails loudly instead of
+	// passing this test with zero findings in both directions.
+	want Verdict
+}
+
+// TestViolationIdentityCollapsesAndSeparates pins BOTH halves of violation
+// identity at once, per invariant, because they are one property and a fix to
+// either alone re-breaks the other:
+//
+//	COLLAPSE   the same finding, observed on three ticks seven seconds apart,
+//	           is ONE signature. (IW15-031: timestamps, magnitudes and
+//	           renumbering ids must stay out of the key.)
+//	SEPARATE   two genuinely distinct findings, observed on ONE tick, are TWO
+//	           signatures — and the first one's signature is unchanged by the
+//	           second one's presence. (IW15-032: every discriminating field must
+//	           be IN the key, and nothing else may be.)
+//
+// The violations are minted through [violationsOf], the Monitor's own code path,
+// so what is asserted here is what a campaign would actually report rather than
+// a test-local reimplementation of it.
+func TestViolationIdentityCollapsesAndSeparates(t *testing.T) {
+	t.Parallel()
+	t0 := time.Date(2026, 8, 15, 21, 4, 0, 0, time.UTC)
+
+	for _, tc := range identityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			inv := tc.inv(tc.params)
+
+			sigs := func(at time.Time, n, tick int) ([]string, Result) {
+				t.Helper()
+				res, err := inv.Check(context.Background(), tc.world(t, at, n))
+				if err != nil {
+					t.Fatalf("%s returned an error: %v", tc.id, err)
+				}
+				if res.Verdict != tc.want {
+					t.Fatalf("%s verdict = %s, want %s — the fixture no longer trips the invariant, so this "+
+						"test would pass on an empty finding set\nreason: %s", tc.id, res.Verdict, tc.want, res.Reason)
+				}
+				var out []string
+				for _, v := range violationsOf(inv, res, ManifestSnapshot{}, at, tick) {
+					out = append(out, v.Signature())
+				}
+				return out, res
+			}
+
+			// ── direction 1: one finding, three ticks, ONE signature ────────
+			var over3Ticks []string
+			for i := 0; i < 3; i++ {
+				got, res := sigs(t0.Add(time.Duration(i)*7*time.Second), 1, i+1)
+				if len(got) != 1 {
+					t.Fatalf("tick %d: one defect was reported as %d violations (keys %v)", i+1, len(got), res.Keys)
+				}
+				over3Ticks = append(over3Ticks, got[0])
+			}
+			for i := 1; i < len(over3Ticks); i++ {
+				if over3Ticks[i] != over3Ticks[0] {
+					t.Fatalf("the same finding took signature %s at tick 1 and %s at tick %d — an identity that "+
+						"moves with the clock is the IW15-031 defect, and the shrinker cannot re-identify it",
+						over3Ticks[0], over3Ticks[i], i+1)
+				}
+			}
+
+			// ── direction 2: two findings, one tick, TWO signatures ─────────
+			got, res := sigs(t0, 2, 1)
+			// The counterfactual first, so a fixture that quietly stopped
+			// exercising the merge fails here rather than passing the property
+			// for the wrong reason. legacyIdentities is the identity function
+			// EXACTLY as it stood at 2a9752b — first offer at the worst verdict
+			// wins outright — and it must report ONE finding where the fixed one
+			// reports two. If it does not, the two findings are not arriving in
+			// one Check call and this row is testing nothing.
+			if legacy := legacyIdentities(res); len(legacy) != 1 {
+				t.Fatalf("the pre-fix identity function reported %d findings (%v) for this fixture; the merge "+
+					"it is supposed to reproduce needs both findings in ONE check", len(legacy), legacy)
+			}
+			distinct := map[string]bool{}
+			for _, s := range got {
+				distinct[s] = true
+			}
+			if len(distinct) != 2 {
+				t.Fatalf("two genuinely distinct findings (%s) collapsed to %d signature(s): keys %v\n"+
+					"a campaign that found two defects would report %d — the second is not merely a duplicate "+
+					"ticket, it has no identity at all and can be neither counted nor shrunk",
+					tc.name, len(distinct), res.Keys, len(distinct))
+			}
+			if !distinct[over3Ticks[0]] {
+				t.Errorf("the first finding's signature CHANGED when a second, unrelated defect appeared "+
+					"(%s alone, %v together) — a composite identity like that fails the shrinker's confirm "+
+					"step the moment a subset reproduces one finding without the other",
+					over3Ticks[0], got)
+			}
+		})
+	}
+}
+
+// identityCases builds the table. Each fixture is written so that n = 2 differs
+// from n = 1 by exactly one added defect, on the axis named in the case name.
+func identityCases() []identityCase {
+	failsafeParams := DefaultParams()
+	failsafeParams.Values["failsafe_wmaxlimpct"] = "0"
+	failsafeParams.Values["failsafe_deadline"] = "30s"
+
+	budgetParams := DefaultParams()
+	budgetParams.Values["recovery_budget"] = "60s"
+
+	return []identityCase{{
+		// I1: two devices, each holding an absolute var count in a percent field.
+		name: "I1/two devices over their own nameplates",
+		id:   "I1", params: DefaultParams(), inv: NewI1, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			over := func() UnitView {
+				return unitFixture(1, map[uint16][]uint16{
+					701: measurementRegs(t, 40_000, 1),
+					702: nameplateRegs(t, 100_000, 2_000, 2_000, 110_000),
+					704: controlRegs(t, func(v sunspec.View) {
+						v.SetEnum("VarSetEna", 1)
+						v.SetEnum("VarSetMod", sunspec.M704_VarSetMod_VarMaxPct)
+						v.SetFloat("VarSetPct", 3000) // 3000 "vars" in a percent field
+					}),
+				})
+			}
+			w := NewWorld(Sources{}, nil, nil, DefaultParams())
+			w.Inject(obsFixture(at, ders(n, func(name string) DERView {
+				return derFixture(name, over())
+			})...))
+			return w
+		},
+	}, {
+		// I2: two devices that both sat out the convergence deadline.
+		name: "I2/two devices that never reached failsafe",
+		id:   "I2", params: failsafeParams, inv: NewI2, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			faults := NewManifest("identity", 1)
+			faults.Arm(Fault{ID: "he.outage#1", Kind: "outage", Class: ClassAuthorityLoss,
+				Target: "head-end", Armed: at.Add(-5 * time.Minute), Recoverable: true})
+			exporting := func() UnitView {
+				return unitFixture(1, map[uint16][]uint16{
+					701: measurementRegs(t, 90_000, 1),
+					702: nameplateRegs(t, 100_000, 44_000, 44_000, 110_000),
+					704: controlRegs(t, func(v sunspec.View) {
+						v.SetEnum("WMaxLimPctEna", 1)
+						v.SetFloat("WMaxLimPct", 90) // not the configured failsafe of 0
+					}),
+				})
+			}
+			w := NewWorld(Sources{}, faults, nil, failsafeParams)
+			w.Inject(obsFixture(at, ders(n, func(name string) DERView {
+				return derFixture(name, exporting())
+			})...))
+			return w
+		},
+	}, {
+		// I3: one refused write, two witnesses holding the refused value. The
+		// fix reaches I3 through the shared keyer without i3.go changing.
+		name: "I3/one refused write, two witnesses holding it",
+		id:   "I3", params: DefaultParams(), inv: NewI3, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			write := at.Add(-2 * time.Second)
+			ghost := func() UnitView {
+				return unitFixture(1, map[uint16][]uint16{
+					701: measurementRegs(t, 40_000, 1),
+					702: nameplateRegs(t, 100_000, 44_000, 44_000, 110_000),
+					704: controlRegs(t, func(v sunspec.View) {
+						v.SetEnum("WMaxLimPctEna", 0) // refused, so nothing enabled it…
+						v.SetFloat("WMaxLimPct", 63)  // …and the value is in the register
+					}),
+				})
+			}
+			led := NewLedger()
+			led.NoteWrite(WriteRecord{
+				At: write, Credential: "SuperAdministratorSunSpec", Role: "SuperAdministratorSunSpec",
+				Authorized: true, Unit: 1, Model: 704, Point: "WMaxLimPct",
+				Value: Quantity{Val: 63, Unit: UnitPercent}, Ref: RefWMax,
+				Distinctive: true, Refused: true, ExceptionCode: 0x04,
+			})
+			w := NewWorld(Sources{}, NewManifest("identity", 4242), led, DefaultParams())
+			w.Inject(obsFixture(at, ders(n, func(name string) DERView {
+				return derFixture(name, ghost())
+			})...))
+			return w
+		},
+	}, {
+		// I4: two credentials that had no business writing, and both were let in.
+		name: "I4/two credentials whose writes were accepted",
+		id:   "I4", params: DefaultParams(), inv: NewI4, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			l := NewLedger()
+			l.NoteWrite(WriteRecord{At: at, Credential: "read-only", Role: "ReadOnlySunSpec",
+				Authorized: false, Unit: 1, Model: 704, Point: "WMaxLimPct",
+				Value: Q(10, UnitPercent), Accepted: true})
+			if n > 1 {
+				l.NoteWrite(WriteRecord{At: at, Credential: "monitor", Role: "MonitorSunSpec",
+					Authorized: false, Unit: 2, Model: 704, Point: "VarSetPct",
+					Value: Q(20, UnitPercent), Accepted: true})
+			}
+			w := NewWorld(Sources{}, nil, l, DefaultParams())
+			w.Inject(obsFixture(at))
+			return w
+		},
+	}, {
+		// I4's OTHER arm, which merged one level deeper than the keyer did: a
+		// device that leaks why it denied you at the handshake AND in-session
+		// has two leaks to plug, and the arm named only the first stage.
+		name: "I4/two stages leaking their denial shape",
+		id:   "I4", params: DefaultParams(), inv: NewI4, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			l := NewLedger()
+			// handshake: two causes, two shapes — one leak.
+			l.NoteAuth(AuthRecord{At: at, Credential: "expired", CredDomain: "nb", TargetDomain: "nb",
+				Cause: CauseExpired, Stage: "handshake", ClosedConn: true, TLSAlert: "certificate_expired"})
+			l.NoteAuth(AuthRecord{At: at, Credential: "wrong-ca", CredDomain: "nb", TargetDomain: "nb",
+				Cause: CauseWrongCA, Stage: "handshake", ClosedConn: true, TLSAlert: "unknown_ca"})
+			if n > 1 {
+				// authz: two causes, two exception codes — a second, separate leak.
+				l.NoteAuth(AuthRecord{At: at, Credential: "no-role", CredDomain: "nb", TargetDomain: "nb",
+					Cause: CauseNoRole, Stage: "authz", ExceptionCode: 0x01})
+				l.NoteAuth(AuthRecord{At: at, Credential: "read-only", CredDomain: "nb", TargetDomain: "nb",
+					Cause: CauseWrongRole, Stage: "authz", ExceptionCode: 0x02})
+			}
+			w := NewWorld(Sources{}, nil, l, DefaultParams())
+			w.Inject(obsFixture(at))
+			return w
+		},
+	}, {
+		// I5: the same separation failing in both directions is two failures.
+		name: "I5/two credentials crossing two trust boundaries",
+		id:   "I5", params: DefaultParams(), inv: NewI5, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			l := NewLedger()
+			l.NoteAuth(AuthRecord{At: at, Credential: "sb-device-leaf", CredDomain: "sb-devices",
+				TargetDomain: "nb-mbaps-clients", Target: "69.0.0.2:802", Authenticated: true,
+				Detail: "the session served a read of model 702"})
+			if n > 1 {
+				l.NoteAuth(AuthRecord{At: at, Credential: "nb-client-leaf", CredDomain: "nb-mbaps-clients",
+					TargetDomain: "sb-devices", Target: "69.0.0.20:5020", Authenticated: true,
+					Detail: "the session served a read of model 701"})
+			}
+			w := NewWorld(Sources{}, nil, l, DefaultParams())
+			w.Inject(obsFixture(at))
+			return w
+		},
+	}, {
+		// I6: two devices that came back from the interruption unreadable.
+		name: "I6/two witnesses unparseable after one interruption",
+		id:   "I6", params: DefaultParams(), inv: NewI6, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			l := NewLedger()
+			l.NoteRestart(RestartRecord{At: at.Add(-2 * time.Minute), Cause: "campaign",
+				Detail: "the campaign power-cycled the gateway"})
+			w := NewWorld(Sources{}, nil, l, DefaultParams())
+			w.Inject(obsFixture(at, ders(n, func(name string) DERView {
+				return DERView{Name: name, Source: "modbus:test/" + name, Reachable: true,
+					Unit: UnitView{Unit: 1, Err: "the SunSpec model chain walked off the end of the map"}}
+			})...))
+			return w
+		},
+	}, {
+		// I7: two controls acknowledged as done, neither of them done.
+		name: "I7/two acknowledged controls with no effect",
+		id:   "I7", params: DefaultParams(), inv: NewI7, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			w := NewWorld(Sources{}, nil, nil, DefaultParams())
+			o := obsFixture(at, derFixture("inv", idleDER(t)))
+			o.HeadEnd = ackedControls(at, n)
+			w.Inject(o)
+			return w
+		},
+	}, {
+		// I8: two devices whose session tables only ever climb.
+		name: "I8/two DERs leaking sessions",
+		id:   "I8", params: DefaultParams(), inv: NewI8, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			w := NewWorld(Sources{}, nil, nil, DefaultParams())
+			for i := 0; i < 3; i++ {
+				sessions := i * 10 // 0 -> 10 -> 20: monotone, and past the leak floor
+				w.Inject(obsFixture(at.Add(time.Duration(i-2)*time.Minute), ders(n, func(name string) DERView {
+					return DERView{Name: name, Source: "simapi:test/" + name, Reachable: true,
+						Unit: unitFixture(1, nil), HasSessions: true, Sessions: sessions}
+				})...))
+			}
+			return w
+		},
+	}, {
+		// I9: two channels that were knocked down and never came back.
+		name: "I9/two channels that never recovered",
+		id:   "I9", params: budgetParams, inv: NewI9, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			cleared := at.Add(-5 * time.Minute)
+			faults := NewManifest("identity", 99)
+			for _, name := range names(n) {
+				id := faults.Arm(Fault{Kind: "outage", Class: ClassCommLoss, Target: name,
+					Armed: at.Add(-10 * time.Minute), Recoverable: true})
+				faults.Clear(id, cleared)
+			}
+			w := NewWorld(Sources{}, faults, nil, budgetParams)
+			for i := 0; i < 3; i++ {
+				w.Inject(obsFixture(cleared.Add(time.Duration(i)*time.Minute), ders(n, func(name string) DERView {
+					return DERView{Name: name, Source: "simapi:test/" + name, Reachable: true,
+						Unit: unitFixture(1, nil), HasPollCount: true, PollRequests: 900} // frozen
+				})...))
+			}
+			w.Inject(obsFixture(at, ders(n, func(name string) DERView {
+				return DERView{Name: name, Source: "simapi:test/" + name, Reachable: true,
+					Unit: unitFixture(1, nil), HasPollCount: true, PollRequests: 900}
+			})...))
+			return w
+		},
+	}, {
+		// I10: two controls each applied on one axis of two.
+		name: "I10/two controls applied in part",
+		id:   "I10", params: DefaultParams(), inv: NewI10, want: Fail,
+		world: func(t *testing.T, at time.Time, n int) *World {
+			// The device meets the watt axis (30 kW under a 40 kW limit) and
+			// ignores the var axis, for every control served.
+			uv := unitFixture(1, map[uint16][]uint16{
+				701: measurementRegs(t, 30_000, 1),
+				702: nameplateRegs(t, 100_000, 44_000, 44_000, 110_000),
+				704: controlRegs(t, func(v sunspec.View) {
+					v.SetEnum("WMaxLimPctEna", 1)
+					v.SetFloat("WMaxLimPct", 30)
+					v.SetEnum("VarSetEna", 0)
+				}),
+			})
+			w := NewWorld(Sources{}, nil, nil, DefaultParams())
+			o := obsFixture(at, derFixture("inv", uv))
+			o.HeadEnd = partialControls(at, n)
+			w.Inject(o)
+			return w
+		},
+	}}
+}
+
+// names returns the first n fixture device names. They are distinct strings
+// with a common prefix so a merged identity is obvious when a failure prints it.
+func names(n int) []string {
+	all := []string{"inv-a", "inv-b"}
+	return all[:n]
+}
+
+// ders builds one DERView per fixture name with build.
+func ders(n int, build func(name string) DERView) []DERView {
+	var out []DERView
+	for _, name := range names(n) {
+		out = append(out, build(name))
+	}
+	return out
+}
+
+// idleDER is a device that is applying nothing at all: whatever the head-end
+// claims was carried out, this device did not carry it out.
+func idleDER(t *testing.T) UnitView {
+	t.Helper()
+	return unitFixture(1, map[uint16][]uint16{
+		701: measurementRegs(t, 90_000, 1),
+		702: nameplateRegs(t, 100_000, 44_000, 44_000, 110_000),
+		704: controlRegs(t, func(v sunspec.View) {
+			v.SetEnum("WMaxLimPctEna", 0)
+			v.SetEnum("VarSetEna", 0)
+		}),
+	})
+}
+
+// ackedControls serves n active export limits and reports success for every one
+// of them — I7's acknowledgement arm, n findings deep.
+func ackedControls(at time.Time, n int) HeadEndView {
+	head := HeadEndView{Source: "gridsim-admin:test", Reachable: true, ServerTime: at,
+		Programs: []Program{{MRID: "DERP-SP-001", Primacy: 1}}}
+	for _, mrid := range []string{"CTRL-ACK-A", "CTRL-ACK-B"}[:n] {
+		lim := 40_000.0
+		head.Programs[0].Active = append(head.Programs[0].Active, Ctrl{
+			MRID: mrid, Start: at.Add(-time.Minute), Duration: 3600,
+			Base: CtrlBase{ExpLimW: &lim},
+		})
+		head.Responses = append(head.Responses, Response{Subject: mrid, Status: 2})
+	}
+	return head
+}
+
+// partialControls serves n active controls that each ask for two axes — I10's
+// partial-apply arm, n findings deep.
+func partialControls(at time.Time, n int) HeadEndView {
+	head := HeadEndView{Source: "gridsim-admin:test", Reachable: true, ServerTime: at,
+		Programs: []Program{{MRID: "DERP-SP-001", Primacy: 1}}}
+	for _, mrid := range []string{"CTRL-PARTIAL-A", "CTRL-PARTIAL-B"}[:n] {
+		lim, varPct := 40_000.0, 25.0
+		head.Programs[0].Active = append(head.Programs[0].Active, Ctrl{
+			MRID: mrid, Start: at.Add(-time.Minute), Duration: 3600,
+			Base: CtrlBase{ExpLimW: &lim, FixedVarPct: &varPct},
+		})
+	}
+	return head
+}
+
+// legacyIdentities is [Result.identities] EXACTLY as it stood at 2a9752b: one
+// check produced one identity, the first offered at the worst verdict, and
+// every later one was discarded. It survives here for the same reason
+// legacySignature does — a regression test with no before-state proves nothing,
+// and this one has to show that its fixtures really do put two findings inside
+// one Check call.
+func legacyIdentities(res Result) []string {
+	if res.Key == "" {
+		return nil
+	}
+	return []string{res.Key}
+}
+
+// TestMonitorReportsTwoDefectsTwice is the other half of
+// [TestMonitorReportsOneGhostOnce], through the same real Monitor: two distinct
+// defects observed on four consecutive ticks are TWO violations with a repeat
+// count of four each — not one violation, and not eight.
+//
+// The two claims are checked together on purpose. Dedup that merges everything
+// and dedup that merges nothing both produce a "clean" run summary, and only a
+// test that holds a run containing both shapes can tell them apart.
+func TestMonitorReportsTwoDefectsTwice(t *testing.T) {
+	t.Parallel()
+	at := time.Date(2026, 8, 15, 21, 30, 0, 0, time.UTC)
+	man := NewManifest("two-defects", 4242)
+	man.Arm(Fault{ID: "dut.rbac_flip#1", Kind: "rbac_flip", Class: ClassAuthorityLoss, Target: "dut"})
+	led := NewLedger()
+	led.NoteWrite(WriteRecord{At: at, Credential: "read-only", Role: "ReadOnlySunSpec",
+		Authorized: false, Unit: 1, Model: 704, Point: "WMaxLimPct",
+		Value: Q(10, UnitPercent), Accepted: true})
+	led.NoteWrite(WriteRecord{At: at, Credential: "monitor", Role: "MonitorSunSpec",
+		Authorized: false, Unit: 2, Model: 704, Point: "VarSetPct",
+		Value: Q(20, UnitPercent), Accepted: true})
+
+	// A plain, conformant device, so the only findings in the run are the two
+	// the ledger describes. Neither write is marked Distinctive, so I4's
+	// by-any-path arm has nothing to look for at the witness and only the
+	// accepted-write arm fires.
+	uv := unitFixture(1, map[uint16][]uint16{
+		701: measurementRegs(t, 40_000, 1),
+		702: nameplateRegs(t, 100_000, 44_000, 44_000, 110_000),
+		704: controlRegs(t, func(v sunspec.View) {
+			v.SetEnum("WMaxLimPctEna", 1)
+			v.SetFloat("WMaxLimPct", 60)
+		}),
+	})
+	views := make([]DERView, 4)
+	for i := range views {
+		views[i] = derFixture("inv", uv)
+	}
+	src := Sources{DERs: map[string]DERSource{"inv": &scriptedDER{name: "inv", views: views}}}
+	w := NewWorld(src, man, led, DefaultParams())
+	m, err := NewMonitor(MonitorConfig{World: w, Checks: []Invariant{NewI4(DefaultParams())}, Cadence: time.Millisecond})
+	if err != nil {
+		t.Fatalf("NewMonitor: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := m.Tick(context.Background()); err != nil {
+			t.Fatalf("tick %d: %v", i, err)
+		}
+	}
+	sum := m.Finalize()
+	if len(sum.Violations) != 2 {
+		keys := make([]string, 0, len(sum.Violations))
+		for _, v := range sum.Violations {
+			keys = append(keys, v.Key)
+		}
+		t.Fatalf("two credentials whose writes were ACCEPTED were reported as %d violation(s) (%v) — "+
+			"one of two P1s is missing from the count a gate reads", len(sum.Violations), keys)
+	}
+	for _, v := range sum.Violations {
+		if got := sum.Repeats[v.Signature()]; got != 4 {
+			t.Errorf("%s: repeat count %d, want 4 — each finding must collapse across ticks even while the "+
+				"two of them stay apart", v.Key, got)
+		}
+		// The shared sentence must not read as a duplicate report: the rendered
+		// violation has to name its own identity and disclose the cohort.
+		out := v.String()
+		if !strings.Contains(out, "identity: "+v.Key) {
+			t.Errorf("the rendered violation does not name its identity, so two siblings sharing one "+
+				"sentence are indistinguishable to a reader:\n%s", out)
+		}
+		if !strings.Contains(out, "cohort  : this check reported 2 distinct findings") {
+			t.Errorf("the rendered violation does not disclose that the sentence and facts are the whole "+
+				"tick's:\n%s", out)
+		}
+	}
+	if sum.Violations[0].Signature() == sum.Violations[1].Signature() {
+		t.Fatal("the two violations share a signature")
+	}
+	if !strings.Contains(sum.Why, "2 distinct invariant violations") {
+		t.Errorf("the run's bottom line does not count both P1s: %q", sum.Why)
+	}
+}

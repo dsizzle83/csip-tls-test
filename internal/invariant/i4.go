@@ -156,19 +156,20 @@ func (i *i4) Check(ctx context.Context, w *World) (Result, error) {
 	}
 
 	// ── Arm 3: denial shape must not vary with cause, within a stage ──────
-	shapeV, shapeChecked, shapeFacts, shapeReason, shapeKey := i.indistinguishable(auths)
+	//
+	// It notes THROUGH the check's keyer, one identity per leaking stage. It
+	// used to name no identity at all — so a run whose ONLY finding was a
+	// distinguishable denial (or a timing WARN) fell back to hashing facts that
+	// include the observed shapes and the measured means, both of which move
+	// every tick under a chaos campaign — and then, once it had one, it named
+	// only the FIRST stage, so a device leaking at the handshake AND in-session
+	// reported one of the two leaks (IW15-032).
+	shapeV, shapeChecked, shapeFacts, shapeReason := i.indistinguishable(auths, key)
 	res.Checked += shapeChecked
 	res.Verdict = Worse(res.Verdict, shapeV)
 	res.Facts = append(res.Facts, shapeFacts...)
 	if res.Reason == "" && shapeV != Pass {
 		res.Reason = shapeReason
-	}
-	if shapeV != Pass {
-		// This arm used to name no identity at all, so a run whose ONLY finding
-		// was a distinguishable denial (or a timing WARN) fell back to hashing
-		// facts that include the observed shapes and the measured means — both
-		// of which move every tick under a chaos campaign.
-		key.note(shapeV, "%s", shapeKey)
 	}
 
 	if res.Checked == 0 {
@@ -197,11 +198,11 @@ func (s denialShape) String() string {
 }
 
 // indistinguishable groups denials by stage and asserts that within a stage,
-// every cause produced the same shape. Its last return value is the arm's
-// violation identity — the STAGE that leaked, or "denial-timing" for the WARN.
-// Neither carries the observed shapes or the measured means: those are exactly
-// the corroboration a chaos campaign perturbs.
-func (i *i4) indistinguishable(auths []AuthRecord) (Verdict, int, []Fact, string, string) {
+// every cause produced the same shape. It notes one identity per leaking stage
+// into key, plus "denial-timing" for the WARN. Neither carries the observed
+// shapes or the measured means: those are exactly the corroboration a chaos
+// campaign perturbs.
+func (i *i4) indistinguishable(auths []AuthRecord, key *keyer) (Verdict, int, []Fact, string) {
 	// stage -> cause -> shapes seen
 	byStage := map[string]map[DenialCause]map[denialShape]int{}
 	rtt := map[string][]time.Duration{}
@@ -231,7 +232,6 @@ func (i *i4) indistinguishable(auths []AuthRecord) (Verdict, int, []Fact, string
 	verdict := Pass
 	var facts []Fact
 	reason := ""
-	key := ""
 	for _, stage := range sortedKeysOf(byStage) {
 		causes := byStage[stage]
 		if len(causes) < 2 {
@@ -248,6 +248,7 @@ func (i *i4) indistinguishable(auths []AuthRecord) (Verdict, int, []Fact, string
 			continue
 		}
 		verdict = Fail
+		key.note(Fail, "denial-shape:%s", stage)
 		for sh, cs := range shapes {
 			names := make([]string, 0, len(cs))
 			for _, c := range cs {
@@ -259,23 +260,23 @@ func (i *i4) indistinguishable(auths []AuthRecord) (Verdict, int, []Fact, string
 		if reason == "" {
 			reason = fmt.Sprintf("at the %s stage, %d distinct denial shapes were observed across %d causes — "+
 				"an attacker can tell why they were denied", stage, len(shapes), len(causes))
-			key = "denial-shape:" + stage
 		}
 	}
 
-	// Timing: report, never fail.
+	// Timing: report, never fail. It offers its identity unconditionally now —
+	// the keyer already drops a WARN's identity when a FAIL is present anywhere
+	// in the check, which is strictly better than the old "only if no stage
+	// leaked" test, because that one could not see a FAIL raised by another arm.
 	if tv, tf, treason := i.timingSkew(rtt); tv != Pass {
 		verdict = Worse(verdict, tv)
 		facts = append(facts, tf...)
 		if reason == "" {
 			reason = treason
 		}
-		if key == "" {
-			key = "denial-timing"
-		}
+		key.note(tv, "denial-timing")
 		checked++
 	}
-	return verdict, checked, facts, reason, key
+	return verdict, checked, facts, reason
 }
 
 // timingSkew reports a large mean-RTT difference between denial causes as a

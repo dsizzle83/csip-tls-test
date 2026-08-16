@@ -207,6 +207,17 @@ type DUTTarget struct {
 	// by the campaign's setup. Zero means discovery failed and the layers that
 	// need a control target plan nothing.
 	Unit uint8
+	// DERs names the downstream devices this DUT PROJECTS onto its northbound
+	// units — the devices a write through this target could reach.
+	//
+	// It exists because I3's lying-peer exemption has a TARGET clause that has
+	// to know it, and for one release nothing populated it: WriteRecord.DERs
+	// was left empty by the only production constructor, the exemption's scope
+	// check degenerated to "any device's lie excuses anything", and real ghost
+	// findings were downgraded to WARN. Empty here is still legal — a campaign
+	// that cannot enumerate the projection says so by leaving it empty — and
+	// the invariant now fails CLOSED on an unscoped exemption rather than open.
+	DERs []string
 	// UnitDetail says what happened during that discovery — which is REQUIRED
 	// reading when Unit is zero. A silent zero is the failure mode this suite
 	// exists to abolish: it makes "the gateway serves no control model", "the

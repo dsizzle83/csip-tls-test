@@ -170,7 +170,44 @@ type Result struct {
 	// re-identified on a re-run — which made the shrinker declare its own
 	// deterministic finding non-deterministic. Every standard invariant now
 	// names its Key with [keyer]; see that type for the naming convention.
+	//
+	// Key is the FIRST identity noted at the check's worst verdict. When one
+	// check falsified its claim about several different things at once, the rest
+	// are in Keys and Key is simply Keys[0].
 	Key string `json:"key,omitempty"`
+	// Keys is EVERY identity this check reported at this instant, Key first.
+	//
+	// It exists because one Check call is not one finding. A tick that observes
+	// two devices over their nameplates, two credentials whose writes were
+	// accepted, or two mRIDs applied in part has found TWO defects, and IW15-032
+	// caught the harness reporting one: [keyer] kept the first identity offered
+	// at the worst verdict and discarded every later one, so the second defect
+	// left no signature, was never counted, and could never be shrunk to its own
+	// minimal reproducer. That is the exact inverse of the defect IW15-031 fixed
+	// and it is no less serious — a run that found three violations and reported
+	// one has hidden two P1s inside a ticket somebody will close.
+	//
+	// [Monitor.record] mints one [Violation] per entry, so the run's distinct-
+	// violation count is the count of distinct findings. The three traps in
+	// [keyer] apply to every entry: a list whose members differ only by an
+	// observed magnitude or an instant is the over-report defect wearing the
+	// other hat.
+	Keys []string `json:"keys,omitempty"`
+}
+
+// identities returns the violation identities this result carries, in the order
+// the check noted them, and is what turns one Result into the right NUMBER of
+// violations. The empty string means "no identity was named": the caller mints
+// a single violation and [Violation.Signature] falls back to hashing the facts.
+func (r Result) identities() []string {
+	switch {
+	case len(r.Keys) > 0:
+		return r.Keys
+	case r.Key != "":
+		return []string{r.Key}
+	default:
+		return []string{""}
+	}
 }
 
 // keyer accumulates a violation identity across the several arms of one check.
@@ -204,30 +241,81 @@ type Result struct {
 // A check whose Warn arm fires first and whose Fail arm fires second reports
 // verdict Fail, and its identity must be the Fail's. First-wins-overall would
 // file the P1 under the caveat's name, and two runs that reached the same P1 by
-// different Warn routes would look like different findings.
+// different Warn routes would look like different findings. A worse verdict
+// therefore DISPLACES every identity noted at a lesser one: the violation the
+// harness mints carries a single verdict, and filing a WARN's identity under a
+// FAIL verdict would misdescribe it.
+//
+// # Why a check may note SEVERAL identities, and why it must
+//
+// Until IW15-032 the first offer at the worst verdict won OUTRIGHT and every
+// later one was dropped. That is correct only if a Check call can find at most
+// one thing — and none of these can. I1 loops over witnesses × registers, I4
+// over credentials, I6 over witnesses, I9 over faults, I10 over controls, I3
+// over (refused write × witness). Two devices over their nameplates in the same
+// tick is two defects; the harness recorded one, spent one shrink budget on it,
+// and printed "1 distinct invariant violation" over a fact list that plainly
+// described two. The dropped finding was not even a duplicate ticket: it had no
+// signature at all, so no re-run could match it and no shrink could reduce it.
+//
+// So identities ACCUMULATE, de-duplicated, in the order they were noted, and
+// the Monitor mints one violation per identity. The two directions are one
+// property and neither may be traded for the other:
+//
+//	COLLAPSE   the same finding on tick 1 and tick 40 is ONE finding. That is
+//	           what keeps timestamps, magnitudes and renumbering ids out of a
+//	           key (IW15-031).
+//	SEPARATE   two different findings in ONE tick are TWO findings. That is what
+//	           requires every discriminating field — the witness, the register,
+//	           the credential, the mRID, the fault target — to be IN the key
+//	           (IW15-032).
+//
+// A key built from too little merges real defects; a key built from too much
+// splits one defect into a stream. [TestViolationIdentityCollapsesAndSeparates]
+// pins both at once, per invariant, because fixing either alone re-breaks the
+// other.
 type keyer struct {
 	// res, when set, receives the identity the instant it is noted. Writing
 	// through rather than at the end of the check is deliberate: a finalising
 	// step is a step somebody adds a `return` in front of, and the first draft
 	// of this helper lost every key it computed to exactly that — a deferred
 	// stamp cannot reach an unnamed return value.
-	res *Result
-	key string
-	at  Verdict
+	res  *Result
+	keys []string
+	seen map[string]bool
+	at   Verdict
 }
 
-// keysOf returns a keyer that stamps res.Key as identities are noted.
+// keysOf returns a keyer that stamps res.Key/res.Keys as identities are noted.
 func keysOf(res *Result) *keyer { return &keyer{res: res} }
 
-// note offers an identity for a violation reached at verdict v. The first offer
-// at the most severe verdict seen wins.
+// note offers an identity for a violation reached at verdict v.
+//
+// Identities offered at the worst verdict seen are all kept, in order, without
+// duplicates; an offer at a lesser verdict is ignored, and an offer at a worse
+// one discards what came before. See [keyer] for why it is both of those things
+// at once.
 func (k *keyer) note(v Verdict, format string, args ...any) {
-	if k.key != "" && k.at.Severity() >= v.Severity() {
+	switch {
+	case len(k.keys) == 0:
+		k.at = v
+	case v.Severity() < k.at.Severity():
+		return
+	case v.Severity() > k.at.Severity():
+		k.keys, k.seen, k.at = nil, nil, v
+	}
+	key := fmt.Sprintf(format, args...)
+	if k.seen[key] {
 		return
 	}
-	k.key, k.at = fmt.Sprintf(format, args...), v
+	if k.seen == nil {
+		k.seen = map[string]bool{}
+	}
+	k.seen[key] = true
+	k.keys = append(k.keys, key)
 	if k.res != nil {
-		k.res.Key = k.key
+		k.res.Key = k.keys[0]
+		k.res.Keys = append(k.res.Keys[:0:0], k.keys...)
 	}
 }
 

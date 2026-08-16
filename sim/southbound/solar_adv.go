@@ -80,9 +80,16 @@ const (
 // the same quantity (a fault-injection state no real device reaches) prefers
 // UNDER, so the function always has one deterministic answer.
 //
-// Thresholds are set past the IEEE 1547-2018 Table 12 default Category III
-// trip points so the condition is unambiguous to a client applying the same
-// table: under-voltage trips at 0.88 pu (211.2 V of 240 V nominal) -> this
+// Thresholds are set past the IEEE 1547-2018 default trip points this sim's own
+// 707-710 blocks serve (trip1547.go), so the condition is unambiguous to a
+// client applying the same tables. TWO tables, not one: Table 13 (shall trip,
+// abnormal voltages, Category III) for the voltage pair and Table 18 (shall
+// trip, abnormal frequencies — one table for all three categories) for the
+// frequency pair. This comment cited "Table 12" for both, which is the Category
+// II voltage table and carries neither of the voltage numbers below (its UV1 is
+// 0.70 pu) and no frequency numbers at all; see trip1547.go's file comment for
+// the sweep that corrected it and the on-machine sources it was checked
+// against. Under-voltage trips at 0.88 pu (211.2 V of 240 V nominal) -> this
 // reports 205 V; over-voltage trips at 1.10 pu (264 V) -> 270 V;
 // under-frequency trips at 58.5 Hz -> 58.0 Hz; over-frequency trips at
 // 61.2 Hz -> 61.5 Hz.
@@ -194,8 +201,11 @@ func NewSolarServerAdvanced(listenURL string, wmaxW float64, serial string) (*So
 }
 
 // NewSolarServerTrip creates an advanced PV inverter simulator that ALSO serves
-// the IEEE 1547-2018 trip models 707/708/709/710 (DERTripLV/HV/LF/HF) with
-// Category III default trip curves — see trip1547.go.
+// the IEEE 1547-2018 trip models 707/708/709/710 (DERTripLV/HV/LF/HF) with the
+// standard's default trip curves: Table 13's Category III settings on the
+// voltage pair and Table 18's — one table for all three categories — on the
+// frequency pair. See trip1547.go, and note that the nameplate agrees with them
+// (populate702 declares AbnOpCatRtg = Category III).
 //
 // It is a SEPARATE constructor, not a widening of NewSolarServerAdvanced, for
 // one reason: the trip models occupy ~380 registers and would move nothing (the
@@ -425,9 +435,47 @@ func setNotImpl16(regs []uint16, l *sunspec.Layout, name string) {
 	}
 }
 
+// abnOpCat702CategoryIII is model 702 AbnOpCatRtg's enumeration value for
+// "Category III", transcribed from the vendored model definition rather than
+// remembered: lexa-proto docs/schema/sunspec-models/model_702.json gives the
+// point type enum16, static "S" (a nameplate RATING, not a setting) and symbols
+// CAT_1 = 0, CAT_2 = 1, CAT_3 = 2. lexa-proto's L702 declares it Tenum16, so it
+// is written through View.SetEnum and never SetFloat.
+const abnOpCat702CategoryIII uint16 = 2
+
 // populate702 writes a minimal model 702: WMax (so derbase reads the nameplate
-// from 702), the reactive rating used as the fixed-var convergence base, and
-// the CtrlModes capability declaration every 7xx writer now gates on.
+// from 702), the reactive rating used as the fixed-var convergence base, the
+// abnormal-operating-performance category this device claims, and the CtrlModes
+// capability declaration every 7xx writer now gates on.
+//
+// ABNOPCATRTG IS WRITTEN, AND LEAVING IT UNWRITTEN WAS NOT NEUTRAL. The trip
+// curves this same sim serves are IEEE 1547-2018 Table 13's Category III
+// defaults (trip1547.go: UV1 0.88 pu / 21 s, OV1 1.10 pu / 13 s) and are the
+// numbers of no other category — Table 11's Category I UV1 is 0.70 pu / 2.0 s
+// and Table 12's Category II UV1 is 0.70 pu / 10.0 s. Until this line the point
+// was never written at all, and an enum16's Go zero is a REAL enumeration value
+// (CAT_1 = "Category I"), not an absence: absence is the 0xFFFF sentinel
+// setNotImpl16 writes four lines below. So the device positively DECLARED
+// Category I on its nameplate while serving Category III's trip curves, and
+// anything downstream reasoning from the declared category was reasoning about
+// a value nobody chose.
+//
+// It is also a conformance gap and not only an incoherence: the SunSpec Modbus
+// IEEE 1547-2018 profile lists AbnOpCatRtg among model 702's REQUIRED points
+// (its Table 18, transcribed in this repo at
+// internal/certify/suitemodbusserver/profile1547.go's requiredPoints[702]) and
+// maps it to the standard's nameplate item "Abnormal operating performance
+// category" (profile Table 2), which 1547 §6.4.2.1 requires: "The DER shall
+// specify its abnormal operating performance category within the nameplate
+// information."
+//
+// NORCATRTG BESIDE IT IS DELIBERATELY NOT TOUCHED by the same change, and is
+// still an unwritten CAT_A. It answers a different question — normal operating
+// performance Category A vs B is about minimum reactive capability (1547 Table
+// 7: 44%/25% of nameplate apparent power for A, 44%/44% for B), not about trip
+// curves — so deciding it means reading this sim's VarMaxInjRtg/VarMaxAbsRtg
+// against that table, which this change did not do. Named rather than silently
+// fixed or silently left.
 //
 // WChaRteMaxRtg/WDisChaRteMaxRtg (and the WChaRteMax/WDisChaRteMax settings
 // alongside them) are deliberately left at the not-implemented sentinel below
@@ -478,6 +526,9 @@ func populate702(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (base,
 	v.SetFloat("VarMaxInj", varRating)
 	v.SetFloat("VarMaxAbs", varRating)
 	v.SetFloat("VNom", 240)
+	// The category the trip blocks above serve. See this function's doc comment
+	// for why the unwritten zero was a positive claim of Category I.
+	v.SetEnum("AbnOpCatRtg", abnOpCat702CategoryIII)
 	v.SetU32("CtrlModes", advSimCtrlModes)
 	setNotImpl16(regs, sunspec.L702, "WChaRteMaxRtg")
 	setNotImpl16(regs, sunspec.L702, "WDisChaRteMaxRtg")
@@ -497,9 +548,15 @@ func populate702(r *RegisterMap, cursor uint16, wmaxW, varRating float64) (base,
 // §3.5 Required Points table (Table 20) carries no conditionality clause —
 // so every advanced/full sim serves it, not just the ones a scenario opts
 // into. Every profile-required point (ES/ESVHi/ESVLo/ESHzHi/ESHzLo/
-// ESDlyTms/ESRmpTms/V_SF/Hz_SF, profile1547.go's requiredPoints[703]) plus
-// the two Table 21 optional timers (ESRndTms/ESDlyRemTms) are set explicitly
-// so none reads back as not-implemented.
+// ESDlyTms/ESRmpTms/V_SF/Hz_SF, profile1547.go's requiredPoints[703]) plus two
+// more timers are set explicitly so none reads back as not-implemented. Only
+// ONE of those two is the profile's: Table 21 (703's optional points) lists
+// ESRndTms and nothing else. ESDlyRemTms is a point of the SunSpec model that
+// the profile's §3.5 does not name at all — neither required nor optional — and
+// this comment used to file both of them under "the two Table 21 optional
+// timers". It is still populated, because a remaining-delay countdown reading
+// back as not-implemented beside a populated ESDlyTms is a state no real device
+// is in; it is simply not something the profile asks for.
 func populate703(r *RegisterMap, cursor uint16) (base, next uint16) {
 	dataLen := sunspec.L703.Len()
 	base, next = writeModelHeader(r, cursor, sunspec.ModelDEREnterService, dataLen)

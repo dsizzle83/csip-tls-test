@@ -15,17 +15,41 @@
 // It also has an evidentiary advantage: the capture is produced by a tool the
 // certification body already trusts and can run themselves, not by our code.
 //
-// # The race that destroys evidence
+// # The two races that destroy evidence
 //
-// dumpcap does not capture the instant it is exec'd. It parses arguments, opens
-// the capture handle, and writes the file header. A runner that starts dumpcap
-// and immediately opens a TLS connection can lose the ClientHello — and a
-// bundle whose first frame is the middle of a handshake is not evidence of
-// anything. Start therefore does not return until the capture file exists AND
-// its header has been written, which is the observable moment after the kernel
-// capture handle is open. A short settle delay follows for good measure. If
-// that never happens, Start fails loudly rather than letting a test run against
-// a capture that is not running.
+// A capture tool is live for less time than the process is alive, at BOTH ends,
+// and both windows have silently eaten evidence here before.
+//
+// At the start: dumpcap does not capture the instant it is exec'd. It parses
+// arguments, announces itself, opens the capture handle, and writes the file
+// header. A runner that starts dumpcap and immediately opens a TLS connection
+// can lose the ClientHello — and a bundle whose first frame is the middle of a
+// handshake is not evidence of anything. Start therefore returns only once TWO
+// things have been observed: the tool's own readiness announcement on stderr,
+// and a parseable capture-file header on disk. Neither alone is enough, and the
+// measurements are what say so rather than the reading of anyone's source:
+// against a 1 ms probe train on lo, dumpcap 4.2.2 announces "Capturing on ..."
+// about 2 ms in but does not record a packet for another 10-60 ms, while the
+// file header appears at — or 1-2 ms after — the first packet it can record.
+// The announcement proves the arguments and the permissions; the header proves
+// the capture handle. Waiting for both takes the later of the two, and no
+// duration is guessed at anywhere: what used to be a fixed 150 ms settle sleep
+// after the header was a coin flip whose bias depended on how fast the machine
+// was that day, and it is gone.
+//
+// At the stop: the tool reads its kernel ring on a poll cycle (about 250 ms for
+// dumpcap), so at any instant up to a quarter-second of already-captured frames
+// are in the ring and not yet in the file — and SIGINT ends the capture loop
+// without draining them. That is the real, long-standing flake this package had
+// (IW12-007): a capture stopped shortly after the traffic it was recording ends
+// up holding the SYN and nothing else, or nothing at all, while the tool reports
+// "0 dropped" because from the kernel's point of view nothing was dropped —
+// nobody ever asked for it. Stop therefore watches the capture file until it
+// has stopped growing for a full window (see FlushWindow) before it signals,
+// which is the observable form of "the tool has drained what it had". When that
+// window cannot be reached inside FlushTimeout, the capture is still stopped —
+// a stop is not optional — but Summary.StopWarning says so, in the bundle, so
+// that a gap at the end of a capture is a recorded fact rather than a mystery.
 //
 // # More than one interface
 //
@@ -59,6 +83,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -141,17 +166,40 @@ type Summary struct {
 	// there, and "dropped 412 packets" turns a confusing gap in a reassembled
 	// stream into a known fact.
 	Stderr string `json:"stderr,omitempty"`
+	// StopWarning is set ONLY when the capture had to be interrupted without
+	// first seeing the file go quiet, which means the tool may still have been
+	// holding frames in its kernel ring — up to one read-timeout of them, at
+	// the very end of the capture, exactly where a closing alert or a final ACK
+	// lives. It is empty on every clean stop, so a bundle written on a healthy
+	// bench is byte-for-byte what it always was, and an unexplained gap at the
+	// end of a capture is never left to be discovered by a reviewer.
+	StopWarning string `json:"stop_warning,omitempty"`
 }
 
 // Capture is one capture-tool invocation.
+//
+// Every duration below reads a zero as "use the default" and a negative value
+// as "switch this off", so a Capture built as a struct literal — which the
+// multi-interface tests and any future caller do — gets the same protection
+// New hands out instead of silently inheriting a zero-length timeout. Switching
+// one off has to be typed on purpose.
 type Capture struct {
 	// ReadyTimeout bounds the wait for the capture to become live.
 	ReadyTimeout time.Duration
-	// SettleDelay is an extra pause after the file header appears.
-	SettleDelay time.Duration
 	// StopTimeout bounds the wait for a clean shutdown after SIGINT before the
 	// process is killed.
 	StopTimeout time.Duration
+	// FlushWindow is how long the capture file must go unchanged before Stop
+	// concludes the tool has written out everything it holds. It has to exceed
+	// the tool's ring poll cycle — about 250 ms for dumpcap, and the longest
+	// file-write lag measured on this bench was 343 ms — because a shorter
+	// window can mistake the pause BETWEEN two drains for the quiet after the
+	// last one, which is the flake wearing a new hat.
+	FlushWindow time.Duration
+	// FlushTimeout bounds that wait. Reaching it is not an error: a capture on
+	// an interface with unrelated background traffic never goes quiet at all,
+	// and stopping is not optional. It is recorded in Summary.StopWarning.
+	FlushTimeout time.Duration
 	// Snaplen is the per-packet capture length; 0 means the whole packet.
 	// Truncated packets cannot support byte-range evidence, so the default is 0.
 	Snaplen int
@@ -168,13 +216,100 @@ type Capture struct {
 	filter  string
 	outPath string
 
-	cmd     *exec.Cmd
-	stderr  bytes.Buffer
-	waitErr chan error
+	cmd    *exec.Cmd
+	stderr *stderrTap
+	// exited is closed when the child has been reaped; waitErr is then readable.
+	// A channel that is CLOSED rather than one that carries the error is what
+	// lets several places ask "has it exited?" without racing each other for
+	// the one value a buffered channel would hold.
+	exited  chan struct{}
+	waitErr error
 	started time.Time
 	stopped time.Time
 	running bool
 	done    bool
+}
+
+// defaults for the durations above. They are values, not literals scattered
+// through the code, because each one is a measurement with a reason.
+const (
+	defaultReadyTimeout = 10 * time.Second
+	defaultStopTimeout  = 10 * time.Second
+	// defaultFlushWindow is ~2x dumpcap's 250 ms ring poll cycle and ~1.75x the
+	// longest write lag measured here (343 ms).
+	defaultFlushWindow  = 600 * time.Millisecond
+	defaultFlushTimeout = 10 * time.Second
+	// flushPoll is how often the file is stat'ed while waiting for quiet.
+	flushPoll = 25 * time.Millisecond
+	// readyPoll is how often the capture file is opened while waiting for its
+	// header. It costs one open+parse of a 100-byte file.
+	readyPoll = 10 * time.Millisecond
+)
+
+// orDefault applies the zero-means-default, negative-means-off rule.
+func orDefault(v, def time.Duration) time.Duration {
+	if v == 0 {
+		return def
+	}
+	return v
+}
+
+// readyMarkers are the lines the two supported tools print once they have
+// opened the device: dumpcap says "Capturing on 'Loopback: lo'", tcpdump says
+// "listening on lo, link-type EN10MB (Ethernet), snapshot length 262144 bytes".
+// Both strings are older than this repo and are not localised, but the match is
+// deliberately a lower-cased substring rather than a full-line pattern so that a
+// reworded suffix cannot turn a working bench into a hung one.
+var readyMarkers = []string{"capturing on", "listening on"}
+
+// stderrTap collects the child's stderr and watches it for the readiness line.
+//
+// It exists because os/exec copies into cmd.Stderr from its own goroutine: the
+// bare bytes.Buffer this used to be was read by Start and Stop while that
+// goroutine was still writing to it, which is a data race that -race would
+// eventually have caught in the middle of a conformance run.
+type stderrTap struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	seen bool
+}
+
+func newStderrTap() *stderrTap { return &stderrTap{} }
+
+// Write matches against the whole accumulated text rather than against this
+// chunk, because a pipe is free to deliver "Captur" and "ing on 'lo'" as two
+// writes and a line split down the middle must not read as silence.
+func (s *stderrTap) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, err := s.buf.Write(p)
+	if !s.seen && containsAny(strings.ToLower(s.buf.String()), readyMarkers) {
+		s.seen = true
+	}
+	return n, err
+}
+
+// String returns everything the tool has said so far, trimmed.
+func (s *stderrTap) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.TrimSpace(s.buf.String())
+}
+
+// Announced reports whether the readiness line has been seen.
+func (s *stderrTap) Announced() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seen
+}
+
+func containsAny(hay string, needles []string) bool {
+	for _, n := range needles {
+		if strings.Contains(hay, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // SplitInterfaces splits the comma-separated interface form into names,
@@ -262,9 +397,10 @@ func New(iface, bpfFilter, outPath string) (*Capture, error) {
 		}
 	}
 	return &Capture{
-		ReadyTimeout: 10 * time.Second,
-		SettleDelay:  150 * time.Millisecond,
-		StopTimeout:  10 * time.Second,
+		ReadyTimeout: defaultReadyTimeout,
+		StopTimeout:  defaultStopTimeout,
+		FlushWindow:  defaultFlushWindow,
+		FlushTimeout: defaultFlushTimeout,
 		tool:         tool,
 		ifaces:       ifaces,
 		filter:       bpfFilter,
@@ -350,7 +486,8 @@ func (c *Capture) Start(ctx context.Context) error {
 	}
 
 	cmd := exec.CommandContext(ctx, c.tool.Path, c.Args()...)
-	cmd.Stderr = &c.stderr
+	c.stderr = newStderrTap()
+	cmd.Stderr = c.stderr
 	// Interrupt rather than kill on context cancellation, so the capture file
 	// is still flushed and valid if the caller's context expires.
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
@@ -362,8 +499,11 @@ func (c *Capture) Start(ctx context.Context) error {
 	c.cmd = cmd
 	c.started = time.Now().UTC()
 	c.running = true
-	c.waitErr = make(chan error, 1)
-	go func() { c.waitErr <- cmd.Wait() }()
+	c.exited = make(chan struct{})
+	go func() {
+		c.waitErr = cmd.Wait()
+		close(c.exited)
+	}()
 
 	if err := c.waitUntilLive(ctx); err != nil {
 		_ = c.terminate()
@@ -373,38 +513,77 @@ func (c *Capture) Start(ctx context.Context) error {
 	return nil
 }
 
-// waitUntilLive polls for the capture file's header. Waiting for a fixed sleep
-// instead would be a coin flip: on a loaded machine dumpcap can take hundreds of
-// milliseconds to open its handle, and the packets lost in that window are
-// exactly the first ones of the test.
+// waitUntilLive returns when the capture is genuinely recording, judged by two
+// signals the tool itself produces, and never by a duration:
+//
+//  1. the readiness line on stderr — the tool's own statement that it parsed
+//     its arguments, had the privilege it needed, and opened the device;
+//  2. a parseable capture-file header on disk — which both tools write only
+//     after that device is open, and which is therefore the observable moment
+//     at or after which the kernel is queueing packets for them.
+//
+// Both are required because each is insufficient alone, as measured on this
+// bench (see the package doc): the announcement comes tens of milliseconds too
+// early, and a header with no announcement would mean believing a file we
+// cannot attribute to a healthy tool.
+//
+// Waiting for the first PACKET instead — the strongest signal there is, since
+// it proves recording rather than readiness — is not available here: Start runs
+// before the caller has generated the traffic it wants captured, the capture
+// filter is the caller's (`tcp port 802`), so no probe frame this package could
+// synthesise is guaranteed to match it, and a synthetic frame injected into an
+// evidence capture would shift the frame numbering that every citation in the
+// bundle is keyed to. The measured file-write lag of up to 343 ms would also
+// make it the slowest of the three by an order of magnitude.
 func (c *Capture) waitUntilLive(ctx context.Context) error {
-	deadline := time.Now().Add(c.ReadyTimeout)
+	timeout := orDefault(c.ReadyTimeout, defaultReadyTimeout)
+	deadline := time.Now().Add(timeout)
+	headerSeen := false
 	for {
 		select {
-		case err := <-c.waitErr:
+		case <-c.exited:
 			// The tool exited before it ever captured anything: a bad
 			// interface, a bad filter, or no permission.
-			c.waitErr <- err
 			return fmt.Errorf("capture: %s exited before the capture became live: %v\n%s",
-				c.tool.Name, err, strings.TrimSpace(c.stderr.String()))
+				c.tool.Name, c.waitErr, c.stderr.String())
 		default:
 		}
-		if c.headerWritten() {
-			// The header is written after the capture handle is open, so from
-			// here on the kernel is already queueing packets for us.
-			time.Sleep(c.SettleDelay)
+		if !headerSeen {
+			headerSeen = c.headerWritten()
+		}
+		announced := c.stderr.Announced()
+		if headerSeen && announced {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("capture: %s did not write a capture header to %s within %s\n%s",
-				c.tool.Name, c.outPath, c.ReadyTimeout, strings.TrimSpace(c.stderr.String()))
+			// A decided error naming what WAS and was NOT observed. The 14%
+			// flake this replaced was invisible for so long because the old
+			// code's answer to "is it live yet?" was a sleep, which cannot
+			// fail; whatever goes wrong here now says which half went wrong.
+			return fmt.Errorf("capture: %s never became live within %s: %s, %s. "+
+				"Capture file %s\nThe tool said:\n%s",
+				c.tool.Name, timeout,
+				describeSignal(announced, "announced itself on stderr"),
+				describeSignal(headerSeen, "wrote a parseable capture header"),
+				c.outPath, c.stderr.String())
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("capture: cancelled while waiting for the capture to start: %w", ctx.Err())
-		case <-time.After(10 * time.Millisecond):
+			return fmt.Errorf("capture: cancelled while waiting for the capture to start "+
+				"(%s, %s): %w", describeSignal(announced, "announced itself on stderr"),
+				describeSignal(headerSeen, "wrote a parseable capture header"), ctx.Err())
+		case <-time.After(readyPoll):
 		}
 	}
+}
+
+// describeSignal renders one readiness signal for an error message, in words
+// that say what was observed rather than printing a bare boolean.
+func describeSignal(ok bool, what string) string {
+	if ok {
+		return "it " + what
+	}
+	return "it never " + what
 }
 
 // headerWritten reports whether the output file exists and begins with a
@@ -422,8 +601,13 @@ func (c *Capture) headerWritten() bool {
 	return true
 }
 
-// Stop interrupts the capture, waits for it to flush, and reports what it
-// captured.
+// Stop lets the capture finish writing what it holds, interrupts it, and
+// reports what it captured.
+//
+// The waiting comes FIRST and is the whole point: SIGINT ends the tool's
+// capture loop wherever it is, and whatever is still sitting in the kernel ring
+// at that moment is gone — silently, with the tool reporting zero drops,
+// because from the kernel's side nothing was dropped. See the package doc.
 //
 // SIGINT, not SIGKILL: both dumpcap and tcpdump treat it as "finish the file
 // and exit", and a killed capture leaves a file whose last block may be half
@@ -445,11 +629,20 @@ func (c *Capture) Stop() (Summary, error) {
 		Started:     c.started,
 	}
 
+	if waited, quiet := c.waitForFlush(); !quiet {
+		sum.StopWarning = fmt.Sprintf("the capture file was still growing after %s, so %s was "+
+			"interrupted while it may still have held frames in its kernel ring: up to one "+
+			"read-timeout (~250ms) of frames at the END of this capture may be missing. This is "+
+			"normal on an interface carrying traffic unrelated to the run, and it is recorded "+
+			"rather than hidden so that a gap at the tail is a known fact",
+			waited.Round(time.Millisecond), c.tool.Name)
+	}
+
 	waitErr := c.terminate()
 	c.stopped = time.Now().UTC()
 	sum.Stopped = c.stopped
 	sum.Duration = c.stopped.Sub(c.started).Round(time.Millisecond).String()
-	sum.Stderr = strings.TrimSpace(c.stderr.String())
+	sum.Stderr = c.stderr.String()
 
 	if waitErr != nil {
 		return sum, fmt.Errorf("capture: %s exited with an error: %w\n%s", c.tool.Name, waitErr, sum.Stderr)
@@ -482,23 +675,75 @@ func (c *Capture) Stop() (Summary, error) {
 	return sum, nil
 }
 
+// waitForFlush waits until the capture file has stopped growing, which is the
+// observable form of "the tool has emptied its kernel ring into the file".
+//
+// Why file size and not something more direct: the tool tells us nothing while
+// it runs (dumpcap's live packet counter is exactly what -q turns off, and -q
+// is on because a bundle should not be paid for in stderr noise), the kernel's
+// AF_PACKET table cannot be attributed to our process (dumpcap carries file
+// capabilities, so /proc/<pid>/fd is root-owned and unreadable — verified on
+// this bench), and the file is in any case the thing the evidence is IN. A
+// write that has landed in the file cannot be lost by the SIGINT that follows;
+// bytes still in the tool's own stdio buffer are flushed by its clean exit.
+//
+// It returns how long it waited and whether quiet was actually observed.
+func (c *Capture) waitForFlush() (time.Duration, bool) {
+	window := orDefault(c.FlushWindow, defaultFlushWindow)
+	if window < 0 {
+		return 0, true // switched off on purpose
+	}
+	timeout := orDefault(c.FlushTimeout, defaultFlushTimeout)
+	if timeout < 0 {
+		timeout = defaultFlushTimeout
+	}
+	start := time.Now()
+	var lastSize int64 = -1
+	lastChange := start
+	for {
+		select {
+		case <-c.exited:
+			// Nothing can be added to the file by a process that has already
+			// gone, so there is nothing left to wait for.
+			return time.Since(start), true
+		default:
+		}
+		size := int64(-1)
+		if fi, err := os.Stat(c.outPath); err == nil {
+			size = fi.Size()
+		}
+		now := time.Now()
+		if size != lastSize {
+			lastSize, lastChange = size, now
+		}
+		if now.Sub(lastChange) >= window {
+			return time.Since(start), true
+		}
+		if now.Sub(start) >= timeout {
+			return time.Since(start), false
+		}
+		time.Sleep(flushPoll)
+	}
+}
+
 // terminate signals the child and waits for it, escalating if it does not go.
 func (c *Capture) terminate() error {
 	if c.cmd == nil || c.cmd.Process == nil {
 		return nil
 	}
+	stopTimeout := orDefault(c.StopTimeout, defaultStopTimeout)
 	_ = c.cmd.Process.Signal(os.Interrupt)
 	select {
-	case err := <-c.waitErr:
-		return exitError(err)
-	case <-time.After(c.StopTimeout):
+	case <-c.exited:
+		return exitError(c.waitErr)
+	case <-time.After(stopTimeout):
 	}
 	_ = c.cmd.Process.Kill()
 	select {
-	case <-c.waitErr:
+	case <-c.exited:
 	case <-time.After(2 * time.Second):
 	}
-	return fmt.Errorf("did not exit within %s of SIGINT and was killed", c.StopTimeout)
+	return fmt.Errorf("did not exit within %s of SIGINT and was killed", stopTimeout)
 }
 
 // exitError filters out the exit statuses that mean "interrupted as asked".

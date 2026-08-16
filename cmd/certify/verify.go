@@ -80,6 +80,27 @@ func (c *cli) runVerify(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  ✓ all %d file(s) match the manifest byte for byte\n", len(rep.Files))
 	}
 
+	// The clock, before the verdicts, because it changes what the verdicts
+	// MEAN. A run whose fixture timers were accelerated proves this harness's
+	// expiry semantics and nothing about a real device's timing; a reader who
+	// learns that after reading the tally has already misread it. A bundle that
+	// declares NOTHING is told so in as many words — "does not say" and "says
+	// wall" are different facts, and every bundle written before this channel
+	// existed is the first of them.
+	switch {
+	case rep.TimebasesAccelerated > 0:
+		fmt.Fprintf(stdout, "\n  ⏱ ACCELERATED TEST TIME — %d of %d declared fixture clock(s) in this bundle\n"+
+			"      were NOT the wall clock. Timing claims resting on them are claims about this\n"+
+			"      harness's expiry semantics, not about any real device's timing.\n",
+			rep.TimebasesAccelerated, rep.TimebasesDeclared)
+	case rep.TimebasesDeclared > 0:
+		fmt.Fprintf(stdout, "\n  ⏱ %d declared fixture clock(s), all wall-clock; every label re-derived from\n"+
+			"      the kind and scale recorded beside it.\n", rep.TimebasesDeclared)
+	case rep.TimebaseUndeclared:
+		fmt.Fprintf(stdout, "\n  ⏱ timebase NOT DECLARED — this bundle does not state what clock its fixtures'\n"+
+			"      timers ran on. That is a gap in what it tells you, not a fault in what it says.\n")
+	}
+
 	failed := 0
 	for _, a := range rep.Assertions {
 		if a.Citable && !a.OK {
@@ -93,6 +114,11 @@ func (c *cli) runVerify(stdout, stderr io.Writer) int {
 	if failed > 0 {
 		fmt.Fprintf(stdout, "  assertions that did NOT re-derive: %d\n", failed)
 	}
+	// The arithmetic on top of the citations: every case's stored verdict must
+	// follow from the assertions printed under it. A bundle can be made of
+	// nothing but true citations and still carry a headline nobody can derive
+	// from them, which is what this line reports having checked.
+	fmt.Fprintf(stdout, "  case verdicts re-derived from their own assertions: %d\n", rep.CasesRolledUp)
 	for _, p := range rep.Problems {
 		fmt.Fprintf(stdout, "\n  ⚠ %s\n", p)
 	}

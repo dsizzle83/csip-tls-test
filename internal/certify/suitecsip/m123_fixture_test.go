@@ -96,8 +96,62 @@ func TestLegacySimServesThePublishedModel123(t *testing.T) {
 		t.Errorf("the ceiling did not resolve: %s", lim.Unresolved)
 	}
 
+	// ── EVERY POINT, not the four the fixture happens to populate ─────────
+	//
+	// This test pinned Conn, WMaxLimPct and its enable and scale factor — four
+	// of twenty-four — which is the same shape of gap that let the wrong map
+	// live: a spot check passes on a block whose OTHER twenty registers are
+	// somewhere else entirely. The referee's own transcription enumerates all
+	// of them, so the whole point set is compared against what the fixture
+	// intended, by name.
+	want := map[string]uint16{
+		// The connect group: connected, no window, no reversion.
+		"Conn": 1, "Conn_WinTms": 0, "Conn_RvrtTms": 0,
+		// The active-power limit: 100.00 % at SF -2, enabled, no timers.
+		"WMaxLimPct": 10000, "WMaxLim_Ena": 1,
+		"WMaxLimPct_WinTms": 0, "WMaxLimPct_RvrtTms": 0, "WMaxLimPct_RmpTms": 0,
+		"WMaxLimPct_SF": sfWord(-2),
+		// Fixed power factor: published at unity, NOT commanded. Zero would be
+		// a legal encoding of a power factor of zero — a machine pushing pure
+		// reactive power — which is not a resting state.
+		"OutPFSet": 1000, "OutPFSet_Ena": 0, "OutPFSet_SF": sfWord(-3),
+		"OutPFSet_WinTms": 0, "OutPFSet_RvrtTms": 0, "OutPFSet_RmpTms": 0,
+		// The mode-selected reactive TRIO, all three present, with the selector
+		// that says which one applies. Collapsing these into one point is half
+		// of how a 24-point model became a 23-point one.
+		"VArWMaxPct": 0, "VArMaxPct": 0, "VArAvalPct": 0,
+		"VArPct_Mod": sim.M123VArPctModVArMax, "VArPct_Ena": 0,
+		"VArPct_WinTms": 0, "VArPct_RvrtTms": 0, "VArPct_RmpTms": 0,
+		"VArPct_SF": sfWord(-2),
+	}
+	if len(want) != invariant.M123PublishedLen {
+		t.Fatalf("this test pins %d of the model's %d points; a spot check is what let a wholly wrong "+
+			"register map live in three repos", len(want), invariant.M123PublishedLen)
+	}
+	for name, expect := range want {
+		if !sunspec.L123.Has(name) {
+			t.Errorf("sunspec.L123 declares no point named %q", name)
+			continue
+		}
+		off := sunspec.L123.Offset(name)
+		if off < 0 || off >= len(regs) {
+			t.Errorf("%s is at offset %d, outside the served block of %d", name, off, len(regs))
+			continue
+		}
+		if got := regs[off]; got != expect {
+			t.Errorf("the sim's M123 %s (offset %d) reads %d, want %d — the fixture and the published "+
+				"model disagree about this point", name, off, got, expect)
+		}
+	}
+
 	t.Logf("the referee's reading of the bench's own M123:\n  %s", strings.Join(commandLines(lc), "\n  "))
 }
+
+// sfWord packs a signed scale factor into its register word. A function because
+// a constant conversion of a negative value into uint16 does not compile — the
+// value has to travel through a variable to reach the two's-complement pattern a
+// device actually serves.
+func sfWord(v int16) uint16 { return uint16(v) }
 
 // commandLines renders a legacy reading one point per line, for a log a reader
 // can compare against the fixture by eye.

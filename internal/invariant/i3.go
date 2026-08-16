@@ -331,9 +331,41 @@ const exemptRule = "I3 infers a ghost commit from the refused value's presence, 
 //     0x04 per sim/southbound/lying.go). A refusal carrying a different code
 //     came from somewhere else — the DUT's own RBAC or range check — and is
 //     still judged.
-//   - TARGET. The lie must be armed on a device the write could reach: the
-//     witness's own device when the witness is a DER, and any in-scope DER when
-//     the witness is the DUT's projection (which is a projection OF those DERs).
+//   - TARGET. The lie must be armed on a device that can actually account for
+//     the value this witness is holding. On a DER witness that is the witness's
+//     own device. On the DUT's PROJECTION witness it is the clause below, and
+//     it is the one that was wrong.
+//
+// ── The TARGET clause on the projection witness, and why it fails closed ────
+//
+// This clause read `len(inScope) > 0 && !inScope[f.Target]`, scoping the
+// exemption to the DERs the write record named. WriteRecord.DERs is populated
+// by nobody in production — the campaign's own writeProbe never set it — so
+// len(inScope) was always 0, the clause never rejected anything, and ANY
+// apply-then-refuse lie in force on ANY device exempted a ghost seen on the
+// DUT's projection. An exemption whose narrowest clause is a no-op is not an
+// exemption; on a conformance harness it is a machine for turning FAILs into
+// WARNs, which is the precise inversion of what this one was designed to be.
+//
+// The empty-means-everything convention came from WriteRecord.DERs' own doc,
+// where it is correct FOR THE WITNESS SEARCH — "look at every observed DER" is
+// the right default for where to go looking. Read as an exemption scope the
+// same sentence says "any device's lie excuses anything", and the field is used
+// for both. That is the whole defect: one field, two questions, opposite safe
+// defaults.
+//
+// So the clause is now CAUSAL rather than nominal, and it fails closed:
+//
+//  1. If the record names a projection, the lying device must be in it.
+//  2. The lying device must ITSELF be observed holding the refused value. That
+//     is the exemption's actual claim — "the harness put that value there" — and
+//     a device that is not holding it cannot be where the DUT's projection got
+//     it. A lie on device A therefore cannot excuse a ghost projected from
+//     device B, which is the property that was missing.
+//  3. If the lying device cannot be observed at all, the exemption does NOT
+//     fire. An exemption that cannot check its own scope must not fire: the
+//     cost of failing closed is a FAIL a human adjudicates, and the cost of
+//     failing open is a silent pass.
 func (i *i3) applyThenRefuseLie(obs *Observation, r WriteRecord, v devView) (Fault, bool) {
 	inScope := map[string]bool{}
 	for _, d := range r.DERs {
@@ -358,10 +390,38 @@ func (i *i3) applyThenRefuseLie(obs *Observation, r WriteRecord, v devView) (Fau
 			if len(inScope) > 0 && !inScope[f.Target] {
 				continue
 			}
+			if !i.lyingDeviceHoldsIt(obs, r, f.Target) {
+				continue
+			}
 		}
 		return f, true
 	}
 	return Fault{}, false
+}
+
+// lyingDeviceHoldsIt reports whether the device the lie is armed on is itself
+// observed holding the refused value, in the register the write targeted.
+//
+// It is the causal half of the TARGET clause. The exemption's claim is that the
+// campaign's own fault put the value where the DUT is projecting it from; a
+// lying device that does not hold the value did not, and the ghost on the
+// projection has some other source that this invariant is entitled to report.
+//
+// It returns FALSE when the device is not in the observation, or is
+// unreachable, or serves no comparable register — every "cannot tell" answer.
+// That is deliberate and is the direction that costs a false FAIL rather than a
+// false PASS: an unexplained ghost is adjudicated by a human, an unnoticed one
+// is not.
+func (i *i3) lyingDeviceHoldsIt(obs *Observation, r WriteRecord, target string) bool {
+	d, ok := obs.DERs[target]
+	if !ok || !d.Reachable {
+		return false
+	}
+	cmd, ok := commandOf(d.Unit.Commands(d.Source), r.Point)
+	if !ok || !cmd.Raw.Known() {
+		return false
+	}
+	return i.sameValue(cmd.Raw, r.Value)
 }
 
 // lieApplyThenRefuse is sim/southbound's name for the one fault kind that

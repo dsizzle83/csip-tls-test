@@ -423,6 +423,14 @@ func populate702Pack(r *RegisterMap, cursor uint16, wmaxW, varRating float64, pk
 	v.SetFloat("AMaxRtg", wmaxW/240)
 	v.SetFloat("WMax", wmaxW)
 	v.SetFloat("VAMax", wmaxW*1.05)
+	// The abnormal-operating-performance category, DECLARED rather than left
+	// to a zero. An unset enum16 is not absence — Go's zero IS the real value
+	// CAT_1 (model_702.json: CAT_1=0, CAT_2=1, CAT_3=2), and absence is the
+	// 0xFFFF sentinel — so a pack that never wrote this was positively
+	// declaring Category I while its trip curves serve Category III's defaults
+	// (IEEE 1547-2018 Table 13 for voltage, Table 18 for frequency). The
+	// profile also lists this point as REQUIRED on model 702.
+	v.SetEnum("AbnOpCatRtg", abnOpCat702CategoryIII)
 	v.SetFloat("VarMaxInj", varRating)
 	v.SetFloat("VarMaxAbs", varRating)
 	v.SetFloat("VNom", 240)
@@ -910,7 +918,10 @@ func (bs *BatteryServer) packOnWrite(startAddr uint16) {
 	if pk.has704 && startAddr >= pk.adv.M704 && startAddr < pk.adv.M704+uint16(sunspec.L704.Len()) {
 		packBridgeSetpoint(r, b, pk.adv, bs.wmaxW)
 	}
-	if startAddr >= b.M123Base && startAddr < b.M123Base+23 && r.Get(b.M123Base+sunspec.M123_Conn) == 0 {
+	// Layout-derived bound, not a restated 23 — see the note in battery.go's
+	// own hook: the published block is 24 registers and a write landing on the
+	// last one fell outside this test entirely.
+	if startAddr >= b.M123Base && startAddr < b.M123Base+M123Len() && r.Get(b.M123Base+sunspec.M123_Conn) == 0 {
 		w, soc := 0.0, packCurrentSoC(r, b)
 		writeBatteryPhysical(r, b, bs.wmaxW, w, soc, bs.packSimTime())
 		packWriteState(r, b, pk, false, w, soc, bs.wmaxW)

@@ -139,8 +139,14 @@ func TestLegacyCurveDefaultsRoundTripThroughTheShippedParser(t *testing.T) {
 		t.Errorf("M134 WRef=%g W, want the device's WMax 5000 W", fw.WRefW)
 	}
 
-	// The ride-through banks carry the IEEE 1547-2018 Table 11 Category III
+	// The ride-through banks carry the IEEE 1547-2018 Table 13 Category III
 	// must-disconnect defaults, TIME FIRST — the legacy block's own order.
+	//
+	// TABLE 13, not Table 11: 11 is Category I and 12 is Category II; Table 13
+	// is the Category III shall-trip voltage table whose UV1/UV2 values (0.88 pu
+	// at 21 s, 0.50 pu at 2 s) are the ones below. This was the twelfth site of
+	// the same wrong citation and the last one; trip1547.go's file comment
+	// records the sweep and its two corroborating witnesses.
 	lv, err := sunspec.ParseLegacy129Curve(ss.legacyBody(t, 129), 1)
 	if err != nil {
 		t.Fatalf("parse M129 bank 1: %v", err)

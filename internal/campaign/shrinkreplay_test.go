@@ -318,3 +318,64 @@ func TestConsoleDoesNotCallAWarnAP1(t *testing.T) {
 		t.Errorf("a mixed run does not count P1s and warnings separately:\n%s", out)
 	}
 }
+
+// ── the other direction: two findings must survive to the count ─────────────
+
+// ghostEnvN is [ghostEnv] with n devices, each of which holds the value the DUT
+// refused. One refused write observed at two witnesses is TWO findings of I3 —
+// the same defect reaching two devices is two devices to go and inspect — and
+// the identity that separates them is the witness label.
+func ghostEnvN(names ...string) EnvFunc {
+	return func(context.Context) (Env, error) {
+		env := Env{Sources: invariant.Sources{DERs: map[string]invariant.DERSource{}}}
+		for _, n := range names {
+			env.Inventory.DERs = append(env.Inventory.DERs, DERTarget{Name: n})
+			env.Sources.DERs[n] = ghostDER{n}
+		}
+		return env, nil
+	}
+}
+
+// TestTwoFindingsAreCountedTwiceAndStayStable is the campaign-level statement of
+// IW15-032, and it is the number an operator actually reads: [Result.Signatures]
+// is what the console prints as "N distinct — every one a P1", what the gate
+// counts, and what the shrinker iterates.
+//
+// Before the fix this run reported ONE. The second device's ghost was inside the
+// violation's facts and inside its reason, and had no signature of its own — so
+// it was never counted, never shrunk, and would have been closed along with the
+// first. Under-reporting is the more dangerous failure of the two directions:
+// an over-report costs a duplicate ticket, an under-report ships a defect.
+//
+// The stability half is asserted in the same test rather than a neighbouring one
+// because the two properties are one property. A "fix" that separated the
+// findings by folding the tick or the observed magnitude into the key would pass
+// the count assertion and fail the repeat-run assertion, which is exactly the
+// trade IW15-031 already paid for once.
+func TestTwoFindingsAreCountedTwiceAndStayStable(t *testing.T) {
+	t.Parallel()
+	cfg := ghostConfig("two-ghosts", 4242)
+	layers := []Layer{ghostLayer{id: "ghost", n: 5}}
+	env := ghostEnvN("der-a", "der-b")
+
+	var runs [][]string
+	for i := 0; i < 2; i++ {
+		res, err := Run(context.Background(), cfg, env, layers)
+		if err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		sigs := res.Signatures()
+		if len(sigs) != 2 {
+			t.Fatalf("run %d: one refused write held by TWO devices reported %d distinct violation(s) (%v)\n%s",
+				i, len(sigs), sigs, res.Why)
+		}
+		runs = append(runs, sigs)
+	}
+	// Signatures() sorts, so a positional comparison is a set comparison.
+	for i := range runs[0] {
+		if runs[0][i] != runs[1][i] {
+			t.Fatalf("two runs of seed 4242 produced signature sets %v and %v — the shrinker compares exactly "+
+				"these, so neither finding could be confirmed on re-run", runs[0], runs[1])
+		}
+	}
+}

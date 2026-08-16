@@ -251,6 +251,14 @@ type Bundle struct {
 	// could be added without a schema version bump but could not have been
 	// added as an out-of-band file.
 	Metrics []metricscrape.Record `json:"metrics,omitempty"`
+	// Timebases are the clock declarations of the fixtures this run drove
+	// (timebase.go, IW15 H6): what clock each one's timers counted against, and
+	// whether it was the wall one. Omitted entirely when the run recorded none,
+	// on the same terms as Metrics above — a bundle written before this channel
+	// existed carries no key, still loads under DisallowUnknownFields, and
+	// still verifies, with the SILENCE disclosed by the verifier rather than
+	// treated as a fault.
+	Timebases []Timebase `json:"timebases,omitempty"`
 }
 
 // BundleFiles records where the artefacts live inside the bundle directory,

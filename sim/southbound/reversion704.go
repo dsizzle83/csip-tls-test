@@ -98,10 +98,23 @@ package sim
 // script does. That is the whole design of the knob: acceleration cannot happen
 // by accident or by configuration drift, only by a test saying so in source.
 //
-// It is also SELF-DECLARING. The timebase's Label rides on GET /state
-// (BatteryPackState.Reversion.Timebase), so an evidence bundle taken from an
-// accelerated run says "manual (ACCELERATED TEST TIME…)" instead of "wall" and
-// a reader can never mistake the two.
+// It is also SELF-DECLARING, and — since IW15 H6 — the declaration is neither
+// this file's to word nor a thing that stays on the bench. Every timebase
+// implements Declare, which returns an evidence-bundle clock declaration
+// (internal/evidence/bundle's Timebase): the KIND and the SCALE as numbers, and
+// the human label RENDERED FROM THEM by the bundle package. Two consequences,
+// and they are the two halves of what the gate found missing:
+//
+//   - the label rides on GET /state exactly as before
+//     (BatteryPackState.Reversion.Timebase) but is no longer composed here, so
+//     this file cannot spell an accelerated clock "wall" — the mutation the
+//     gate made, which left every test in the tree green because nothing
+//     asserted the string;
+//   - RecordTimebase (below) puts the declaration INTO THE EVIDENCE BUNDLE at
+//     capture time, where REPORT.md prints it as a banner and `certify -verify`
+//     re-derives the label from the numbers. Before that, the declaration
+//     existed only in a live HTTP response no bundle carried, so an accelerated
+//     bundle and a wall-clock one were the same document on their face.
 //
 // WHAT AN ACCELERATED PROOF ESTABLISHES: that THIS HARNESS's reversion state
 // machine is correct — that arming sets the remaining-time readback, that the
@@ -127,21 +140,57 @@ import (
 	"time"
 
 	"lexa-proto/sunspec"
+
+	"csip-tls-test/internal/evidence/bundle"
 )
 
 // ── The timebase ─────────────────────────────────────────────────────────────
+
+// TimebaseComponent names this fixture in a bundle's clock declaration. A
+// declaration that does not say WHOSE clock it describes cannot be acted on, so
+// the string is fixed here rather than passed in by each caller — a component
+// name a recorder chose for itself is a component name that will one day
+// disagree with another recorder's.
+const TimebaseComponent = "sim/southbound: model 704 reversion engine"
 
 // ReversionTimebase is the clock a 704 reversion engine counts its timers down
 // against. It exists so a test can prove EXPIRY BEHAVIOUR without spending the
 // seconds the register names; see this file's header for what that proves and
 // what it does not.
 //
-// Label is part of the interface, not a debugging afterthought: the label is
-// published on GET /state so a run's evidence states on its face whether the
-// device's timers ran on the wall clock or on a test one.
+// Declare is part of the interface, not a debugging afterthought. A timebase
+// must be able to state what it is in the form evidence takes — the bundle's
+// clock declaration, whose numbers a verifier can re-derive its label from — so
+// that a clock installable into this engine is by construction a clock a bundle
+// can honestly describe. Label is DERIVED from that declaration and never
+// composed independently; see this file's header for the mutation that
+// convention exists to make impossible.
 type ReversionTimebase interface {
 	Now() time.Time
+	Declare() bundle.Timebase
 	Label() string
+}
+
+// RecordTimebase writes a fixture clock's declaration into an evidence bundle
+// under construction, naming where the declaration came from.
+//
+// This is the one call a bundle-producing run makes, and it belongs at CAPTURE
+// TIME beside the code that installed the clock — that code is the only party
+// that knows, and the whole point of the channel is that the knowledge travels
+// with the evidence rather than staying in the operator's head. source is the
+// provenance: "in-process handle to the pack under test", "GET
+// http://69.0.0.11:6021/state .reversion.timebase", whatever is true.
+//
+// A nil timebase records nothing: a run that installed no clock has nothing to
+// declare about one, and inventing a wall-clock declaration on its behalf would
+// be this package asserting something it was never told.
+func RecordTimebase(b *bundle.Builder, tb ReversionTimebase, source string) {
+	if b == nil || tb == nil {
+		return
+	}
+	d := tb.Declare()
+	d.Source = source
+	b.AddTimebase(d)
 }
 
 // wallTimebase is the DEFAULT and the only timebase any shipped path uses:
@@ -149,7 +198,12 @@ type ReversionTimebase interface {
 type wallTimebase struct{}
 
 func (wallTimebase) Now() time.Time { return time.Now() }
-func (wallTimebase) Label() string  { return "wall" }
+
+// Declare states real, unscaled time.
+func (wallTimebase) Declare() bundle.Timebase { return bundle.DeclareWall(TimebaseComponent, "") }
+
+// Label is the declaration's label and nothing else — see the interface doc.
+func (tb wallTimebase) Label() string { return tb.Declare().Label }
 
 // WallTimebase returns the real-time timebase every sim starts with. Exported
 // so a test that deliberately wants the un-accelerated behaviour back can say
@@ -197,13 +251,19 @@ func (tb *ManualTimebase) Advance(d time.Duration) {
 	tb.mu.Unlock()
 }
 
-// Label names this timebase on GET /state, loudly.
-func (tb *ManualTimebase) Label() string {
+// Declare states simulated time and how far it has been advanced, taken at the
+// instant of the call: a manual clock's position is part of what it is, and a
+// declaration recorded halfway through a test says so.
+func (tb *ManualTimebase) Declare() bundle.Timebase {
 	tb.mu.Lock()
-	defer tb.mu.Unlock()
-	return fmt.Sprintf("manual (ACCELERATED TEST TIME, t+%.3fs — proves this harness's expiry "+
-		"semantics, NOT any real device's timing)", tb.now.Sub(tb.t0).Seconds())
+	elapsed := tb.now.Sub(tb.t0)
+	tb.mu.Unlock()
+	return bundle.DeclareManual(TimebaseComponent, "", elapsed)
 }
+
+// Label names this timebase on GET /state, loudly — in the evidence package's
+// words, not this file's.
+func (tb *ManualTimebase) Label() string { return tb.Declare().Label }
 
 // ScaledTimebase runs at a fixed multiple of the wall clock from the moment it
 // is constructed. It is the option for a test that must keep a real listener,
@@ -240,11 +300,28 @@ func (tb *ScaledTimebase) Now() time.Time {
 	return tb.sim0.Add(time.Duration(float64(elapsed) * tb.scale))
 }
 
-// Label names this timebase on GET /state, loudly.
-func (tb *ScaledTimebase) Label() string {
-	return fmt.Sprintf("scaled %.4g× (ACCELERATED TEST TIME — proves this harness's expiry semantics, "+
-		"NOT any real device's timing)", tb.scale)
+// Declare states the multiplier this clock runs at.
+//
+// The error DeclareScaled can return is impossible here and is therefore
+// dropped rather than plumbed: NewScaledTimebase already panics on a scale that
+// is not a positive finite multiplier, and tb.scale is immutable after
+// construction. Should that ever stop being true, the zero declaration this
+// returns fails bundle.Timebase.Check — it names no component and no kind — so
+// the bundle refuses to be written rather than shipping a clock nobody can
+// describe.
+func (tb *ScaledTimebase) Declare() bundle.Timebase {
+	d, err := bundle.DeclareScaled(TimebaseComponent, "", tb.scale)
+	if err != nil {
+		return bundle.Timebase{}
+	}
+	return d
 }
+
+// Label names this timebase on GET /state, loudly — in the evidence package's
+// words, not this file's. THIS IS THE STRING THE GATE MUTATED to the flat lie
+// "wall" with nothing going red; it is now a projection of the declaration
+// above, pinned by internal/evidence/bundle's timebase_pin_test.go.
+func (tb *ScaledTimebase) Label() string { return tb.Declare().Label }
 
 // ── The reversion groups of model 704 ────────────────────────────────────────
 

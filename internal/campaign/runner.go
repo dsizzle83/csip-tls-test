@@ -194,7 +194,14 @@ type Result struct {
 }
 
 // Signatures returns the distinct violation signatures, sorted — the shrinker's
-// target set.
+// target set, and the number the console prints as "N distinct — every one a P1".
+//
+// ONE PER FINDING, not one per failing check. A tick on which two credentials
+// were let in where they may not write is two entries here, because
+// [invariant.Result.Keys] names both and the Monitor mints a violation for each
+// (IW15-032). Before that, the second finding had no signature at all: it was
+// never counted, the shrinker never chased it, and it would have been closed
+// along with the first.
 func (r Result) Signatures() []string {
 	seen := map[string]bool{}
 	var out []string

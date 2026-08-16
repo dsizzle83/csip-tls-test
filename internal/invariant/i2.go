@@ -79,20 +79,27 @@ func (i *i2) Check(ctx context.Context, w *World) (Result, error) {
 	// setpoint are corroboration and are kept out (see [keyer]).
 	key := keysOf(&res)
 
-	convV, convChecked, convFacts, convReason, convDev := i.convergence(w, obs)
+	// EVERY offending device, not just the first. Two DERs that both sat out the
+	// convergence deadline are two devices to go and fix, and an identity that
+	// named only the first reported one of them (IW15-032).
+	convV, convChecked, convFacts, convReason, convDevs := i.convergence(w, obs)
 	res.Checked += convChecked
 	res.Verdict = Worse(res.Verdict, convV)
 	res.Facts = append(res.Facts, convFacts...)
 	if convV != Pass {
-		key.note(convV, "failsafe-not-reached:%s", convDev)
+		for _, dev := range convDevs {
+			key.note(convV, "failsafe-not-reached:%s", dev)
+		}
 	}
 
-	relV, relChecked, relFacts, relReason, relDev := i.release(w, obs)
+	relV, relChecked, relFacts, relReason, relDevs := i.release(w, obs)
 	res.Checked += relChecked
 	res.Verdict = Worse(res.Verdict, relV)
 	res.Facts = append(res.Facts, relFacts...)
 	if relV != Pass {
-		key.note(relV, "failsafe-latched:%s", relDev)
+		for _, dev := range relDevs {
+			key.note(relV, "failsafe-latched:%s", dev)
+		}
 	}
 
 	switch res.Verdict {
@@ -121,17 +128,19 @@ func (i *i2) Check(ctx context.Context, w *World) (Result, error) {
 
 // convergence checks that every DER sits at the configured failsafe once the
 // stated deadline has passed with authority still lost. Its last return value
-// is the DEVICE the finding is about — the identity half of [Result.Key].
-func (i *i2) convergence(w *World, obs *Observation) (Verdict, int, []Fact, string, string) {
+// is EVERY DEVICE the finding is about — the identity half of [Result.Keys],
+// one identity per device, because a fleet in which three DERs never converged
+// has three defects and the run must be able to count them.
+func (i *i2) convergence(w *World, obs *Observation) (Verdict, int, []Fact, string, []string) {
 	fs, okFS := i.p.Float("failsafe_wmaxlimpct")
 	deadline, okDL := i.p.Duration("failsafe_deadline")
 	if !okFS || !okDL {
 		return Pass, 0, nil, "convergence arm needs -param failsafe_wmaxlimpct and -param failsafe_deadline " +
-			"(the DUT publishes neither), so it was not asserted", ""
+			"(the DUT publishes neither), so it was not asserted", nil
 	}
 	active := obs.Faults.ActiveOf(obs.At, ClassAuthorityLoss)
 	if len(active) == 0 {
-		return Pass, 0, nil, "no authority-loss fault is in force, so convergence is not under test right now", ""
+		return Pass, 0, nil, "no authority-loss fault is in force, so convergence is not under test right now", nil
 	}
 	// The deadline runs from the EARLIEST authority-loss fault still in force:
 	// a second, later outage does not restart the clock on a device that should
@@ -144,14 +153,14 @@ func (i *i2) convergence(w *World, obs *Observation) (Verdict, int, []Fact, stri
 	}
 	elapsed := obs.At.Sub(earliest)
 	if elapsed < deadline {
-		return Pass, 0, nil, fmt.Sprintf("still inside the stated %s convergence deadline (%s elapsed)", deadline, dur(elapsed)), ""
+		return Pass, 0, nil, fmt.Sprintf("still inside the stated %s convergence deadline (%s elapsed)", deadline, dur(elapsed)), nil
 	}
 
 	checked := 0
 	var facts []Fact
 	verdict := Pass
 	reason := ""
-	device := ""
+	var devices []string
 	for _, v := range derViews(obs) {
 		cmd, ok := commandOf(v.Unit.Commands(v.Source), "WMaxLimPct")
 		if !ok || !cmd.Raw.Known() {
@@ -162,6 +171,7 @@ func (i *i2) convergence(w *World, obs *Observation) (Verdict, int, []Fact, stri
 			continue
 		}
 		verdict = Fail
+		devices = append(devices, v.Label)
 		facts = append(facts,
 			F(v.Label+".WMaxLimPct.raw", "%", v.Source, "%s", trimFloat(cmd.Raw.Val)),
 			F(v.Label+".WMaxLimPct.enabled", "", v.Source, "%t", cmd.Enabled),
@@ -174,43 +184,42 @@ func (i *i2) convergence(w *World, obs *Observation) (Verdict, int, []Fact, stri
 				"authority has been lost for %s (deadline %s) but %s is at WMaxLimPct=%s%% (enabled=%t), "+
 					"not the configured failsafe of %s%%",
 				dur(elapsed), dur(deadline), v.Label, trimFloat(cmd.Raw.Val), cmd.Enabled, trimFloat(fs))
-			device = v.Label
 		}
 	}
 	if checked == 0 {
-		return Pass, 0, nil, "no DER published a readable WMaxLimPct to compare against the failsafe", ""
+		return Pass, 0, nil, "no DER published a readable WMaxLimPct to compare against the failsafe", nil
 	}
-	return verdict, checked, facts, reason, device
+	return verdict, checked, facts, reason, devices
 }
 
 // release checks that a device which entered failsafe leaves it once authority
 // legitimately returns. It is Pending while waiting, because the product never
-// promised how fast. Its last return value is the DEVICE the finding is about —
-// the identity half of [Result.Key].
-func (i *i2) release(w *World, obs *Observation) (Verdict, int, []Fact, string, string) {
+// promised how fast. Its last return value is EVERY DEVICE the finding is about
+// — the identity half of [Result.Keys]; see convergence for why it is a list.
+func (i *i2) release(w *World, obs *Observation) (Verdict, int, []Fact, string, []string) {
 	restored, ok := obs.Faults.LatestCleared(func(f Fault) bool { return f.Class == ClassAuthorityLoss })
 	if !ok {
-		return Pass, 0, nil, "no authority-loss fault has been cleared yet, so release is not under test", ""
+		return Pass, 0, nil, "no authority-loss fault has been cleared yet, so release is not under test", nil
 	}
 	if obs.At.Before(restored) {
-		return Pass, 0, nil, "authority was restored after this observation", ""
+		return Pass, 0, nil, "authority was restored after this observation", nil
 	}
 	if !obs.HeadEnd.Reachable {
-		return Pass, 0, nil, "the head-end is unreachable, so there is no evidence authority actually returned", ""
+		return Pass, 0, nil, "the head-end is unreachable, so there is no evidence authority actually returned", nil
 	}
 	// Authority has genuinely returned only if the head-end is serving
 	// something for the device to obey.
 	wanted, wantOK := i.wantedLimit(obs)
 	if !wantOK {
 		return Pass, 0, nil, "the head-end serves no active control since authority returned, so the device is " +
-			"correct to keep doing what it was doing", ""
+			"correct to keep doing what it was doing", nil
 	}
 
 	fs, okFS := i.p.Float("failsafe_wmaxlimpct")
 	checked := 0
 	var facts []Fact
 	pendingReason := ""
-	device := ""
+	var devices []string
 	for _, v := range derViews(obs) {
 		cmd, ok := commandOf(v.Unit.Commands(v.Source), "WMaxLimPct")
 		if !ok || !cmd.Raw.Known() {
@@ -229,6 +238,7 @@ func (i *i2) release(w *World, obs *Observation) (Verdict, int, []Fact, string, 
 		if !okFS && !heldSinceRestore {
 			continue
 		}
+		devices = append(devices, v.Label)
 		facts = append(facts,
 			F(v.Label+".WMaxLimPct.raw", "%", v.Source, "%s", trimFloat(cmd.Raw.Val)),
 			F(v.Label+".authority_restored_at", "", "manifest", "%s", restored.Format(time.RFC3339)),
@@ -240,16 +250,15 @@ func (i *i2) release(w *World, obs *Observation) (Verdict, int, []Fact, string, 
 				"authority returned %s ago and the head-end is serving an active control (%s W), but %s is still "+
 					"holding WMaxLimPct=%s%% — no promptness threshold is applied; the run ending in this state is the failure",
 				dur(obs.At.Sub(restored)), trimFloat(wanted), v.Label, trimFloat(cmd.Raw.Val))
-			device = v.Label
 		}
 	}
 	if checked == 0 {
-		return Pass, 0, nil, "no DER published a readable WMaxLimPct to judge release by", ""
+		return Pass, 0, nil, "no DER published a readable WMaxLimPct to judge release by", nil
 	}
 	if pendingReason != "" {
-		return Pending, checked, facts, pendingReason, device
+		return Pending, checked, facts, pendingReason, devices
 	}
-	return Pass, checked, nil, "", ""
+	return Pass, checked, nil, "", nil
 }
 
 // wantedLimit returns the active-power limit the head-end is presently serving,

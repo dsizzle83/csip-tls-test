@@ -1149,11 +1149,26 @@ func tripOutcome(b *tripBinding, o *Observation) Finding {
 // critDEREffectViaTripOracle is the southbound criterion, carrying the live
 // phase's decided finding into the citation phase. Like every oracled
 // criterion in this suite it has NO Skip path.
+//
+// IT IS ALSO MARKED LoadBearing, and the marker was MISSING here until an
+// adversarial gate noticed — which is the exact hole doc.go warns the
+// per-criterion no-Skip discipline leaves. doc.go's release-enforcing list
+// names the ride-through southbound oracle among the three families, and its
+// siblings (critDEREffectViaSouthboundOracle, critDEREffectViaCurveOracle,
+// critRefusedAxisNoSouthboundTrace, critDERValueRemainedAcrossTheWindow,
+// critDEREffectViaDirectOracle) all carry it; this one did not, so a future
+// edit that gave BASIC-004/005's only "did the DER actually do it" criterion a
+// Skip path would have produced rows passing on their wire assertions alone
+// with nothing in the arithmetic to notice. The omission cannot recur: this
+// criterion is now in loadbearing_test.go's releaseEnforcingCriteria, whose
+// three tests assert the marker is set, that no marked criterion carries a Skip
+// reason, and that the marker reaches the minted assertion.
 func critDEREffectViaTripOracle(subject string, b *tripBinding, o *Observation) criterion {
 	f := tripOutcome(b, o)
 	return criterion{
 		Claim: "the DER's own southbound registers hold the " + strconv.Itoa(len(b.Curves)) +
 			" ride-through curve(s) " + subject + " carried, adopted and enabled",
+		LoadBearing: true,
 		How: "an independent read of the DER's raw SunSpec ride-through image (internal/invariant, which " +
 			"shares only the register-offset tables with the product and none of its CSIP/derbase " +
 			"interpretation), taken BEFORE this row published anything and again after the DUT's poll " +

@@ -9,6 +9,10 @@ package suitecsip
 
 import (
 	"context"
+	"flag"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -174,8 +178,12 @@ func TestDisclosure_AnUnconfiguredBenchIsAWarnNamingItself(t *testing.T) {
 	if why == "" {
 		t.Fatal("nothing was recorded, so the criterion cannot tell 'not configured' from 'nothing moved'")
 	}
-	if !strings.Contains(why, metricsTargetKey) || !strings.Contains(why, "9102") {
-		t.Errorf("the reason does not say how to configure it:\n  %s", why)
+	// The reason must name the REAL flag. It named a `-target metrics=…`
+	// syntax that does not exist in cmd/certify, which is worse than saying
+	// nothing: an operator following it gets a flag error and concludes the
+	// feature is broken rather than unconfigured.
+	if !strings.Contains(why, "-metrics-endpoint") || !strings.Contains(why, "9102") {
+		t.Errorf("the reason does not name the real flag:\n  %s", why)
 	}
 	// UNAVAILABLE, not a verdict. This criterion is supplementary — the row's
 	// subject is execution, and the southbound oracle carries that — so an
@@ -219,5 +227,134 @@ func TestDisclosureKindFor_FollowsWhatTheRowPublished(t *testing.T) {
 	if got := disclosureKindFor(&armed); got != metricscrape.KindAutonomousVRef {
 		t.Errorf("a row publishing autonomousVRefEnable=true derives kind %q, want %q",
 			got, metricscrape.KindAutonomousVRef)
+	}
+}
+
+// TestDisclosure_AConfiguredRunReachesTheChannelFromTheOperatorsSeat is the
+// CLOSING BAR, and the one this apparatus failed for a release.
+//
+// The channel shipped reading Targets.Extra["metrics"] with NOTHING anywhere
+// writing that key: DefaultTargets did not set it, cmd/certify had no flag for
+// it, and the operator-facing error described a `-target metrics=…` syntax that
+// does not exist. Every criterion therefore reported "not configured" forever,
+// and the feature was recorded as delivered. Unit tests of the scrape passed
+// the whole time, because they constructed the scraper themselves.
+//
+// So this test starts from the OPERATOR'S SEAT — a flag set, parsed from an
+// argv the operator could type — and requires the reading at the far end to be
+// something other than unavailable. It is hermetic: the endpoint is a local
+// httptest server serving the DUT's own exposition format.
+func TestDisclosure_AConfiguredRunReachesTheChannelFromTheOperatorsSeat(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		// The vref counter moves once between the two readings.
+		vref := 8
+		if hits > 1 {
+			vref = 9
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = io.WriteString(w, familyBody(vref, 4))
+	}))
+	defer srv.Close()
+
+	// THE OPERATOR'S SEAT: the runner's own flag set, parsed from argv.
+	opts := certify.DefaultOptions()
+	fs := flag.NewFlagSet("certify", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	opts.BindFlags(fs)
+	if err := fs.Parse([]string{"-metrics-endpoint", srv.URL}); err != nil {
+		t.Fatalf("the flag an operator would type does not parse: %v", err)
+	}
+	if got := opts.Targets.Endpoint(certify.TargetMetrics); got != srv.URL {
+		t.Fatalf("-metrics-endpoint %q did not reach Targets.Extra[%q] (got %q). The flag and the key "+
+			"the suite reads have come apart, which fails SILENTLY as a missing endpoint",
+			srv.URL, certify.TargetMetrics, got)
+	}
+
+	// …through the row's own two hooks, unchanged.
+	rc := &certify.RunCtx{Targets: opts.Targets}
+	params := map[string]string{}
+	d := &Driver{disclosure: openDisclosureWindow(context.Background(), rc, params, "", "BASIC-006")}
+	if d.disclosure == nil {
+		t.Fatalf("a CONFIGURED run opened no window: %s", params[disclosureUnavailableParam])
+	}
+	recordDisclosure(context.Background(), d, params)
+
+	if why := params[disclosureUnavailableParam]; why != "" {
+		t.Fatalf("a configured run still reported the channel unavailable: %s", why)
+	}
+	f := droppedContentOutcome(&Observation{Params: params})
+	if f.Unavailable != "" {
+		t.Fatalf("the criterion abstained on a configured run: %s", f.Unavailable)
+	}
+	// The vref counter moved, so the silent-drop claim correctly FAILS — which
+	// is a decided verdict from a real reading, the thing that was unreachable.
+	if f.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s; the fixture moves the autonomous-vref counter across the window, so the "+
+			"negative claim must fail and NAME it: %s", f.Verdict, f.Observed)
+	}
+	if len(d.metrics) != 1 || len(d.metrics[0].Series) == 0 {
+		t.Fatalf("the row recorded no re-derivable scrape material: %+v", d.metrics)
+	}
+	t.Logf("CONFIGURED RUN, reading taken end to end — %s", f.Observed)
+	t.Logf("bundle material: endpoint=%s series=%d", d.metrics[0].Endpoint, len(d.metrics[0].Series))
+}
+
+// TestDisclosure_ASeventhProductKindDoesNotPassAsQuiet is the drift detector.
+//
+// The negative claim iterates the kinds THIS BENCH transcribed. A seventh kind
+// added product-side moves its own series and the UNTAGGED total, while the
+// bench's loop sees nothing — and the row would PASS "no content was dropped"
+// over content that demonstrably was. The product's _other_total does not cover
+// it: that bucket catches a kind the PRODUCT has not enumerated, and a
+// newly-added kind is enumerated product-side.
+func TestDisclosure_ASeventhProductKindDoesNotPassAsQuiet(t *testing.T) {
+	// A gateway one version ahead of this bench: every known series flat, a
+	// seventh series moving, and the untagged total moving with it.
+	body := func(extra int) string {
+		var b strings.Builder
+		line := func(name string, v int) {
+			b.WriteString("# TYPE " + name + " counter\n" + name + " " + itoaTest(v) + "\n")
+		}
+		line("lexa_nb_ignored_control_content_total", 12+extra)
+		for _, k := range metricscrape.IgnoredContentKinds() {
+			sel, _ := metricscrape.IgnoredContentKind(k)
+			line(sel.Name, 0)
+		}
+		line("lexa_nb_ignored_control_content_some_new_kind_total", extra)
+		return b.String()
+	}
+	params := runDisclosure(t, "", body(0), body(1))
+
+	if params[disclosureMovedParam] != "" {
+		t.Fatalf("a known kind moved; this fixture must move only the unknown one: %q",
+			params[disclosureMovedParam])
+	}
+	f := droppedContentOutcome(&Observation{Params: params})
+	if f.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s. The gateway's untagged total moved while every series this bench knows "+
+			"stayed flat, so content was disclosed that the bench cannot attribute — and the row passed "+
+			"'nothing was dropped' over it: %s", f.Verdict, findingObserved(f))
+	}
+	for _, want := range []string{"could not attribute", "known.go"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the FAIL does not say %q, so nobody knows the fix is a bench transcription "+
+				"update:\n  %s", want, f.Observed)
+		}
+	}
+	t.Logf("RED (family drift) — %s", f.Observed)
+}
+
+// And the detector must not fire when the family reconciles: a known kind
+// moving accounts for the total's movement exactly.
+func TestDisclosure_AKnownKindMovingDoesNotLookLikeDrift(t *testing.T) {
+	params := runDisclosure(t, "", familyBody(8, 4), familyBody(9, 4))
+	if d := params[disclosureDriftParam]; d != "" {
+		t.Errorf("the drift detector fired on a family that reconciles exactly:\n  %s", d)
+	}
+	f := droppedContentOutcome(&Observation{Params: params})
+	if !strings.Contains(f.Observed, metricscrape.KindAutonomousVRef) {
+		t.Errorf("the FAIL should name the known kind that moved, not report drift:\n  %s", f.Observed)
 	}
 }

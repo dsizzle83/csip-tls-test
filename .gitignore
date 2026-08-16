@@ -87,3 +87,16 @@ sslkeylog.log
 runs/
 # stray root-level build output from `go build ./cmd/certify`
 /certify
+
+# Bench cert BACKUPS. certs/mbaps/ is the tracked fixture set (public certs
+# committed, *-key.pem held out by the rule above); a dated backup of it is a
+# local operational artifact of a bench reconfiguration and is not fixture
+# material anyone builds against.
+#
+# The rule exists because commit 2a9752b swept one in — 19 public certs from a
+# 2026-08-07 eth-split backup — through a `git add -A`. No private key reached
+# the index, and that was the *-key.pem rule doing its job rather than anything
+# the commit got right: the SAME directory holds 16 key files on disk. A backup
+# whose keys happened to be named differently would have gone in with them.
+certs/*.bak-*/
+certs/*.backup*/

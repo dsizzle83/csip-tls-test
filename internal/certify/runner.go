@@ -276,6 +276,9 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Targets.GridSimAdmin, "gridsim-admin", o.Targets.GridSimAdmin, "gridsim admin API base URL")
 	fs.StringVar(&o.Targets.ModSim, "modsim", o.Targets.ModSim, "plain SunSpec Modbus sim host:port")
 	fs.StringVar(&o.Targets.ModSimAPI, "modsim-api", o.Targets.ModSimAPI, "modsim simapi base URL")
+	fs.Var(endpointFlag{&o.Targets, TargetMetrics}, "metrics-endpoint",
+		"the DUT's own Prometheus endpoint URL, e.g. http://69.0.0.2:9102/metrics "+
+			"(the disclosure-counter evidence channel reads it; empty disables that channel)")
 	fs.StringVar(&o.Targets.MBAPSDev, "mbapsdev", o.Targets.MBAPSDev, "secure Modbus device sim host:port")
 	fs.StringVar(&o.Targets.MBAPSDevAPI, "mbapsdev-api", o.Targets.MBAPSDevAPI, "mbapsdev simapi base URL")
 	fs.DurationVar(&o.CheckTimeout, "timeout", o.CheckTimeout, "per-check timeout")
@@ -1364,4 +1367,24 @@ func firstSentence(s string) string {
 		return s[:160] + "…"
 	}
 	return s
+}
+
+// endpointFlag binds a flag straight into Targets.Extra, so a suite-specific
+// endpoint needs a flag and a key rather than a new Targets field and edits in
+// three files.
+type endpointFlag struct {
+	t   *Targets
+	key string
+}
+
+func (e endpointFlag) String() string {
+	if e.t == nil {
+		return ""
+	}
+	return e.t.Endpoint(e.key)
+}
+
+func (e endpointFlag) Set(v string) error {
+	e.t.WithEndpoint(e.key, v)
+	return nil
 }

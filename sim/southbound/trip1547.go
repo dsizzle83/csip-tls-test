@@ -23,36 +23,136 @@ package sim
 // duplicated: both paths call SolarServer.adoptInto, so the §3.1.2 semantics —
 // including the curve_adopt_lies fault — have one implementation.
 //
-// # The default curves
+// # The default curves, and where each number was READ from
 //
-// The trip points below are the DEFAULT settings IEEE Std 1547-2018 specifies
-// for a DER of abnormal operating performance Category III:
+// The trip points below are the DEFAULT settings IEEE Std 1547-2018 specifies.
+// They were read from the local copy of the standard —
+// ~/Documents/standards/1547-2018.pdf, the same corpus lexa-proto's
+// docs/schema/NORMATIVE_ANCHOR.md anchors its 2030.5 page cites to — and not
+// from memory:
 //
-//	Table 11 (voltage trip settings), Category III defaults —
+//	Table 13 (DER response (shall trip) to abnormal voltages, for a DER of
+//	abnormal operating performance Category III) —
 //	    UV2  0.50 pu   2 s        OV1  1.10 pu   13 s
 //	    UV1  0.88 pu  21 s        OV2  1.20 pu    0.16 s
 //
-//	Table 19 (frequency trip settings), defaults for all categories —
+//	Table 18 (DER response (shall trip) to abnormal frequencies) — ONE table
+//	serves Category I, Category II and Category III alike, which is why no
+//	category qualifies the frequency rows the way it qualifies the voltage ones —
 //	    UF2  56.5 Hz   0.16 s     OF1  61.2 Hz  300 s
 //	    UF1  58.5 Hz  300 s       OF2  62.0 Hz    0.16 s
+//
+// THE TABLE NUMBERS WERE WRONG HERE UNTIL AN ADVERSARIAL GATE CAUGHT THEM, and
+// the correction is recorded rather than quietly applied. This file (6 sites),
+// trip1547_test.go (4) and solar_adv.go (1) cited "Table 11 (voltage trip
+// settings)", "Table 12" and "Table 19 (frequency trip settings)". None of the
+// three is the table these numbers come from: Table 11 is the shall-trip
+// voltage table for Category I (UV1 0.70 pu / 2.0 s — not the row below),
+// Table 12 is the same table for Category II (UV1 0.70 pu / 10.0 s), and Table
+// 19 is a frequency RIDE-THROUGH requirements table, not a trip one. The VALUES
+// transcribed below were right the whole time; the pointers saying where they
+// came from were not, which is exactly the failure IW15-027 is named for — a
+// citation nobody re-read.
+//
+// One site of the same mistake survives OUTSIDE these files and is named rather
+// than left for the next sweep to find: curve12x_test.go's legacy 129/130 case
+// still says "Table 11 Category III" over the same 0.50 pu / 2 s and 0.88 pu /
+// 21 s pair, which is Table 13's.
+//
+// Two further on-machine witnesses agree with the corrected numbers, and are
+// named so a reviewer has something to check that is not this comment:
+//
+//   - The standard's OWN cross-references. §10.6.7's Table 35 (Voltage trip
+//     parameters, mandatory) gives the HV/LV trip curve points' range as "See
+//     Table 11 through Table 13"; §10.6.8's Table 37 (Frequency parameters)
+//     gives the HF/LF trip curve points' range as "See Table 18".
+//   - The SunSpec Modbus IEEE 1547-2018 Profile Specification and
+//     Implementation Guide v1.1 (~/Documents/standards/SunSpec-Modbus-IEEE-
+//     1547-2018-Profile-Specification-and-Implementation-Guide-v1.1-1.pdf),
+//     which says in §2.10 "Table 13 in IEEE 1547-2018 specifies ranges and
+//     default for high and low voltage trip" and in §2.12 the same sentence for
+//     "Table 18" and frequency.
 //
 // Model 707 carries the two UNDER-voltage points, 708 the two OVER-voltage
 // points, 709 the two under-frequency points and 710 the two over-frequency
 // points, which is the split the model IDs themselves name (LV/HV/LF/HF).
 //
+// # The must-trip curves are TWO points where the profile maps FIVE
+//
+// Named because it is a real divergence and a reader will otherwise find it
+// alone. The SunSpec profile's §2.10 worked example represents each 1547
+// voltage trip setting pair as a FIVE-point curve — its Table 25 requires
+// Crv.MustTrip.Pt[1-5].V/.Tms of a 707/708 — where points 2 and 4 carry the
+// UV2/UV1 (OV2/OV1) settings and the other three exist only "to provide a
+// uniform method of representing all curves". This sim serves the two points
+// that carry the settings and declares ActPt = 2.
+//
+// That is a fixture choice, and it is safe HERE for a checkable reason rather
+// than a hopeful one: every consumer on this bench reads these blocks through
+// lexa-proto's Parse707Set/Parse709Set, which honour ActPt, and nothing in this
+// repo asserts the five-point form — internal/certify/suitemodbusserver's
+// profile1547.go deliberately transcribes no point list for models 705-712. A
+// run that had to meet the profile's own representation convention would need
+// the three filler points added here, and would be a change to this file.
+//
 // # MustTrip is populated; MayTrip and MomCess declare zero points
 //
 // Only the must-trip sub-curve carries points. The other two are present —
 // they have to be, the geometry is fixed by NPt and NCrvSet — and each declares
-// ActPt = 0. That is the honest encoding, not a gap:
+// ActPt = 0. The two have DIFFERENT reasons, and only one of them is a
+// statement about the standard:
 //
-//   - IEEE 1547-2018 leaves the may-trip region between the must-trip curve and
-//     the mandatory-operation region to the manufacturer. There is no default to
-//     transcribe, and inventing one would make a fixture assert a device
-//     characteristic the standard does not specify.
-//   - Category III performs no momentary cessation (it is a Category II
-//     behaviour), so a Category III device's momentary-cessation curve is
-//     genuinely empty.
+//   - MAY-TRIP has nothing to transcribe, and that is checkable from both
+//     directions. IEEE 1547-2018's settings tables for this function are Table
+//     35 (voltage trip, mandatory) and Table 36 (momentary cessation, not
+//     mandatory); neither carries a may-trip row and no table in the standard
+//     prints may-trip curve points. The SunSpec profile agrees from the model
+//     side: its 707/708 REQUIRED points are Crv.MustTrip.* (Table 25) and its
+//     OPTIONAL points are Crv.MomCess.* (Table 26) — the string "MayTrip"
+//     occurs nowhere in the document. Inventing points here would make a
+//     fixture assert a device characteristic nothing specifies.
+//
+//   - MOMENTARY CESSATION IS A CATEGORY III BEHAVIOUR — this file used to
+//     assert the reverse, and the reverse was wrong in both halves. IEEE
+//     1547-2018 Table 16 (voltage ride-through requirements, Category III)
+//     prescribes "Momentary Cessation" as the operating mode in TWO regions:
+//     1.10 < V ≤ 1.20 pu (minimum ride-through 12 s, maximum response 0.083 s)
+//     and V < 0.50 pu (1 s, 0.083 s). Categories I and II — Tables 14 and 15 —
+//     have no momentary-cessation row at all; their only mention of it is the
+//     footnote on "Cease to Energize" saying that required cessation of current
+//     exchange "may include momentary cessation or trip", which is a permitted
+//     way of ceasing and not a prescribed operating mode. So a real Category III
+//     DER may very well hold momentary-cessation curve points, and the emptiness
+//     below is NOT a consequence of the category. The old sentence had it
+//     exactly backwards, and the justification is rewritten rather than
+//     word-swapped.
+//
+// So why IS MomCess empty? Because the SETTING is optional and this fixture
+// declines it — a bench decision, stated as one:
+//
+//   - 1547 §10.6.7 splits the two functions on exactly this line: voltage trip
+//     parameters "shall be available" for information exchange (Table 35) while
+//     the momentary cessation threshold "may be available", and Table 36's own
+//     title is "Momentary cessation parameters (not mandatory)", each of its two
+//     rows repeating "Support for this setting is not mandatory".
+//   - The SunSpec profile puts the whole Crv.MomCess group in its OPTIONAL table
+//     for 707/708 (Table 26) and says in §2.11 "Support for the adjustment of
+//     momentary cessation is optional in 1547-2018".
+//
+// AND THE PROFILE DOES PRINT DEFAULTS FOR IT, which is the fact that would make
+// a "nothing to transcribe" claim false here as it is true for may-trip: §2.11
+// gives low-voltage (V1=50, Tms1=0), (V2=50, Tms2=2) and high-voltage (V1=110,
+// Tms1=0), (V2=110, Tms2=13). This sim deliberately does not serve them. An
+// EMPTY momentary-cessation sub-curve is what makes any content found there
+// attributable to a control that was published: BASIC-004 in
+// internal/certify/suitecsip/ridethrough.go publishes opModLVRT/HVRT
+// MomentaryCessation curves and its whole evidence is a before/after read of
+// these very registers, so a fixture that shipped a default MC curve would ask
+// every reader of that bundle to know the default before they could tell
+// commanded content from resting state. A scenario that needs a DER arriving
+// WITH momentary cessation configured should seed those profile defaults into a
+// new spec rather than into these, and TestTripModelsServeCategoryIIIDefaults's
+// MomCess assertion moves with it.
 //
 // ActPt = 0 is a declaration of zero active points, which every conformant
 // reader honours; the 0xFFFF "not implemented" sentinel would instead claim the
@@ -79,7 +179,8 @@ const (
 	// procedure's own curve: the row would have failed on the FIXTURE's
 	// geometry and reported it as a device or product finding. Eight is seven
 	// plus one slot of headroom, which is the same margin the old four gave the
-	// two-point Category III defaults.
+	// two-point 1547 defaults (Table 13 on the voltage side, Table 18 on the
+	// frequency one).
 	//
 	// THE STATED RATIONALE FOR FOUR NO LONGER HOLDS AND IS NOT QUIETLY DROPPED.
 	// It was: "it keeps every trip block inside the 125-register Modbus
@@ -170,26 +271,28 @@ var solarTripSpecs = []tripModelSpec{
 	{
 		id: sunspec.ModelDERTripLV, hdr: sunspec.L707Hdr, npt: advTripNPt,
 		sfs: map[string]int16{"V_SF": -1, "Tms_SF": -2},
-		// IEEE 1547-2018 Table 11, Category III under-voltage defaults, in
+		// IEEE 1547-2018 Table 13, Category III under-voltage defaults, in
 		// ascending voltage so a reader walks the curve the way it is drawn.
 		voltPts: []sunspec.TripVPoint{{V: 50, Tms: 2}, {V: 88, Tms: 21}},
 	},
 	{
 		id: sunspec.ModelDERTripHV, hdr: sunspec.L707Hdr, npt: advTripNPt,
 		sfs: map[string]int16{"V_SF": -1, "Tms_SF": -2},
-		// IEEE 1547-2018 Table 11, Category III over-voltage defaults.
+		// IEEE 1547-2018 Table 13, Category III over-voltage defaults.
 		voltPts: []sunspec.TripVPoint{{V: 110, Tms: 13}, {V: 120, Tms: 0.16}},
 	},
 	{
 		id: sunspec.ModelDERTripLF, hdr: sunspec.L709Hdr, npt: advTripNPt,
 		sfs: map[string]int16{"Hz_SF": -3, "Tms_SF": -2},
-		// IEEE 1547-2018 Table 19, under-frequency defaults.
+		// IEEE 1547-2018 Table 18, under-frequency defaults (one table, all
+		// three abnormal-operating-performance categories).
 		freqPts: []sunspec.TripHzPoint{{Hz: 56.5, Tms: 0.16}, {Hz: 58.5, Tms: 300}},
 	},
 	{
 		id: sunspec.ModelDERTripHF, hdr: sunspec.L709Hdr, npt: advTripNPt,
 		sfs: map[string]int16{"Hz_SF": -3, "Tms_SF": -2},
-		// IEEE 1547-2018 Table 19, over-frequency defaults.
+		// IEEE 1547-2018 Table 18, over-frequency defaults (same table, same
+		// all-category scope as 709's).
 		freqPts: []sunspec.TripHzPoint{{Hz: 61.2, Tms: 300}, {Hz: 62.0, Tms: 0.16}},
 	},
 }
@@ -210,7 +313,8 @@ type tripBlock struct {
 }
 
 // populateTripModel writes one trip model: the header, a live read-only
-// curve-set at index 0 carrying the Category III defaults, and an empty
+// curve-set at index 0 carrying the 1547 defaults (Table 13's Category III
+// numbers on 707/708, Table 18's all-category numbers on 709/710), and an empty
 // writable staging set at index 1.
 //
 // The header — NPt, NCrvSet and the scale factors — is written BEFORE the

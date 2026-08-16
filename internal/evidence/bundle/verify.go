@@ -50,6 +50,20 @@ type VerifyReport struct {
 	// scrapes, which is every bundle written before the channel existed.
 	MetricsWindows int `json:"metrics_windows,omitempty"`
 	MetricsSeries  int `json:"metrics_series,omitempty"`
+	// TimebasesDeclared and TimebasesAccelerated count the clock channel's
+	// re-checks: how many fixture clock declarations the bundle carries, and
+	// how many of them were NOT the wall clock (timebase.go).
+	TimebasesDeclared    int `json:"timebases_declared,omitempty"`
+	TimebasesAccelerated int `json:"timebases_accelerated,omitempty"`
+	// TimebaseUndeclared marks a bundle that says nothing at all about the
+	// clock its fixtures ran on. It is a DISCLOSURE, never a failure: it is
+	// true of every bundle written before the channel existed, and the
+	// verifier's job there is to tell the reader the bundle is silent — not to
+	// invent a fault out of a question it was never asked.
+	TimebaseUndeclared bool `json:"timebase_undeclared,omitempty"`
+	// CasesRolledUp counts the test cases whose stored verdict was re-derived
+	// from their own printed assertions (verifyCaseVerdicts).
+	CasesRolledUp int `json:"cases_rolled_up,omitempty"`
 }
 
 // Verify re-checks a bundle directory from nothing but its own contents.
@@ -98,6 +112,15 @@ func Verify(dir string) (*VerifyReport, error) {
 	// directory, and it is re-checkable whether or not there is a pcap beside
 	// it.
 	verifyMetrics(dir, b, rep)
+
+	// Two more re-derivations that need no capture at all, and are therefore
+	// deliberately ahead of the "no capture, nothing to check" exit below: the
+	// clock each fixture declared (timebase.go) and every case's verdict
+	// against its own assertions. Both are properties of bundle.json read back
+	// against itself, and a bundle with no pcap is still entitled to be told
+	// that its verdicts do not follow from its evidence.
+	verifyTimebases(b, rep)
+	verifyCaseVerdicts(b, rep)
 
 	if b.Files.Capture == "" {
 		rep.problem("bundle declares no capture file; no assertion can be re-checked against the wire")
@@ -181,6 +204,100 @@ func verifyManifest(dir string, rep *VerifyReport) error {
 	}
 	sort.Slice(rep.Files, func(i, j int) bool { return rep.Files[i].Name < rep.Files[j].Name })
 	return nil
+}
+
+// verifyCaseVerdicts re-derives every case's verdict from the assertions
+// printed beside it in the same bundle.
+//
+// # The hole this closes
+//
+// Everything else in Verify re-checks the CITATIONS: the frames exist, the
+// bytes hash, the scrape readings follow from their exposition bodies. Nothing
+// re-checked the arithmetic ON TOP of them. A bundle whose stored case verdict
+// had been edited — FAIL rewritten to PASS in bundle.json, the manifest
+// refreshed to cover it — verified clean, with the FAIL assertion still printed
+// three lines below the PASS heading in its own REPORT.md. Every individual
+// citation in that bundle was true; the sentence a reader actually acts on was
+// not (IW15 M2). The same hole covers honest DRIFT: a case whose assertions
+// were re-graded without its verdict following them along.
+//
+// # The rule, and why it is an inequality rather than an equality
+//
+// THE STORED VERDICT MUST NEVER BE WEAKER THAN THE ROLL-UP OF ITS OWN
+// ASSERTIONS — stored.Severity() >= RollUp().Severity(). Equality is the wrong
+// rule, and asserting it would fail a large share of the honest archive,
+// because the runner deliberately records verdicts STRICTER than the raw
+// roll-up. Two places do it, both in internal/certify/runner.go:
+//
+//   - finalise's uncited-PASS rule: a case that rolled up to PASS but carries
+//     no assertion with a digest the verifier can re-derive is downgraded to
+//     WARN ("PASS downgraded to WARN: no assertion carries a digest…").
+//   - citeWithoutCapture: when the run took no capture at all, every case that
+//     expected to cite gains a SKIP assertion and any PASS becomes WARN.
+//
+// Both raise severity after the roll-up, and both are the framework being
+// honest about a weakness in its own evidence. runs/tail-fullsuite-20260801T173831
+// carries eighteen such cases — sixteen WARN over a PASS roll-up, two WARN over
+// a SKIP one — and a verifier demanding equality would call that clean archive
+// tampered.
+//
+// The direction that is never legitimate is the other one. finalise's own first
+// act is `if worst := worstOf(c.Assertions); worst.Severity() > c.Verdict.Severity()
+// { c.Verdict = worst }` — it RAISES a case to its roll-up and never lowers it —
+// so "stored is at least the roll-up" is exactly the runner's own invariant,
+// restated where a third party can check it against the document rather than
+// against the code that produced it. worstOf and TestCaseResult.RollUp
+// implement the same rule, load-bearing Skip cap included, precisely so this
+// check can be made against either.
+//
+// An unrecognised stored verdict is its own failure. Severity() maps anything
+// it does not know to 0, so a case whose verdict had been edited to "PASSED" or
+// "" would slip through the inequality against a SKIP roll-up; a bundle
+// carrying a verdict outside the four this package defines is not a bundle
+// whose arithmetic anyone can check.
+func verifyCaseVerdicts(b *Bundle, rep *VerifyReport) {
+	for _, c := range b.Cases {
+		rep.CasesRolledUp++
+		switch c.Verdict {
+		case Pass, Fail, Skip, Warn:
+		default:
+			rep.problem(fmt.Sprintf("case %s records verdict %q, which is not one of PASS/FAIL/SKIP/WARN — "+
+				"a verdict this verifier cannot place in the severity order is one it cannot re-derive",
+				c.ID, c.Verdict))
+			rep.OK = false
+			continue
+		}
+		derived := c.RollUp()
+		if c.Verdict.Severity() >= derived.Severity() {
+			continue
+		}
+		rep.problem(fmt.Sprintf("case %s records verdict %s, but its own %d printed assertion(s) (%s) "+
+			"roll up to %s. A stored verdict may be STRICTER than its assertions — the runner downgrades "+
+			"an uncited PASS, and a run with no capture, to WARN — but never weaker: this bundle's "+
+			"headline does not follow from the evidence printed under it",
+			c.ID, c.Verdict, len(c.Assertions), assertionVerdicts(c), derived))
+		rep.OK = false
+	}
+}
+
+// assertionVerdicts renders a case's assertion verdicts in order, so the
+// problem message shows the reader WHICH assertion made the roll-up what it is
+// rather than making them open bundle.json to find out.
+func assertionVerdicts(c TestCaseResult) string {
+	if len(c.Assertions) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(c.Assertions))
+	for _, a := range c.Assertions {
+		v := string(a.Verdict)
+		if a.Unmeasured() {
+			// The load-bearing cap is invisible in a bare list of verdicts —
+			// a SKIP that caps the case looks exactly like one that does not.
+			v += " (load-bearing, unmeasured)"
+		}
+		parts = append(parts, v)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // reassemble rebuilds every TCP connection GENERATION so byte-range citations
@@ -420,6 +537,22 @@ func (r *VerifyReport) String() string {
 		}
 	}
 	fmt.Fprintf(&sb, "  Assertions: %d re-checked against the capture, %d bad\n", r.Checked, badAssert)
+	fmt.Fprintf(&sb, "  Verdicts:   %d case verdict(s) re-derived from their own assertions\n", r.CasesRolledUp)
+	// The clock, stated either way round. An accelerated bundle says so on its
+	// face; a bundle that says nothing has that silence named, because "no
+	// declaration" and "declared wall" are different facts and only one of them
+	// is a statement about the run.
+	switch {
+	case r.TimebasesAccelerated > 0:
+		fmt.Fprintf(&sb, "  Timebase:   %d of %d declared fixture clock(s) are ACCELERATED TEST TIME — "+
+			"this bundle's timing claims are about the harness, not a real device\n",
+			r.TimebasesAccelerated, r.TimebasesDeclared)
+	case r.TimebasesDeclared > 0:
+		fmt.Fprintf(&sb, "  Timebase:   %d declared fixture clock(s), all wall-clock\n", r.TimebasesDeclared)
+	case r.TimebaseUndeclared:
+		fmt.Fprintf(&sb, "  Timebase:   NOT DECLARED — this bundle does not state what clock its fixtures' "+
+			"timers ran on (disclosure, not a fault)\n")
+	}
 	if r.MetricsWindows > 0 {
 		fmt.Fprintf(&sb, "  Metrics:    %d reading(s) re-derived from the exposition bodies of %d "+
 			"scrape window(s)\n", r.MetricsSeries, r.MetricsWindows)

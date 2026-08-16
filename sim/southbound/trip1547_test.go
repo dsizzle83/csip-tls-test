@@ -40,8 +40,16 @@ func (ss *SolarServer) tripByModel(t *testing.T, id uint16) tripBlock {
 func closeTo(got, want, tol float64) bool { return math.Abs(got-want) <= tol }
 
 // TestTripModelsServeCategoryIIIDefaults is the round-trip: the sim encodes the
-// IEEE 1547-2018 Category III defaults into 707/708/709/710, and lexa-proto's
-// independent parser reads back exactly those numbers.
+// IEEE 1547-2018 defaults into 707/708/709/710 — Table 13's Category III
+// numbers on the voltage pair, Table 18's (which one table gives for all three
+// categories) on the frequency pair — and lexa-proto's independent parser reads
+// back exactly those numbers.
+//
+// The test keeps its CategoryIII name because the CATEGORY-SPECIFIC half is
+// what it exists to pin: the frequency defaults would be the same whatever this
+// device declared itself, the voltage ones would not, and the device declares
+// Category III (model 702's AbnOpCatRtg — see
+// TestNameplateDeclaresTheCategoryItsTripCurvesServe).
 //
 // The expected values are written out longhand rather than read from
 // solarTripSpecs, deliberately. Asserting the block against the same table that
@@ -56,9 +64,9 @@ func TestTripModelsServeCategoryIIIDefaults(t *testing.T) {
 		name string
 		want []sunspec.TripVPoint
 	}{
-		// Table 11, Category III: UV2 0.50 pu / 2 s, UV1 0.88 pu / 21 s.
+		// Table 13, Category III: UV2 0.50 pu / 2 s, UV1 0.88 pu / 21 s.
 		{sunspec.ModelDERTripLV, "707 DERTripLV", []sunspec.TripVPoint{{V: 50, Tms: 2}, {V: 88, Tms: 21}}},
-		// Table 11, Category III: OV1 1.10 pu / 13 s, OV2 1.20 pu / 0.16 s.
+		// Table 13, Category III: OV1 1.10 pu / 13 s, OV2 1.20 pu / 0.16 s.
 		{sunspec.ModelDERTripHV, "708 DERTripHV", []sunspec.TripVPoint{{V: 110, Tms: 13}, {V: 120, Tms: 0.16}}},
 	}
 	for _, tc := range volt {
@@ -86,12 +94,24 @@ func TestTripModelsServeCategoryIIIDefaults(t *testing.T) {
 			}
 		}
 		// MayTrip and MomCess are present in the block and declare zero active
-		// points — see the honesty argument in trip1547.go's file comment.
+		// points — see the two DIFFERENT arguments in trip1547.go's file comment,
+		// and note that these two failure messages are not interchangeable.
 		if len(set.MayTrip) != 0 {
-			t.Errorf("%s: MayTrip has %d point(s); the standard specifies no default for it", tc.name, len(set.MayTrip))
+			t.Errorf("%s: MayTrip has %d point(s); no table in IEEE 1547-2018 prints may-trip curve "+
+				"points (its settings tables are 35 and 36) and the SunSpec profile names no MayTrip point "+
+				"for 707/708 at all, so there is nothing a fixture could be transcribing here",
+				tc.name, len(set.MayTrip))
 		}
 		if len(set.MomCess) != 0 {
-			t.Errorf("%s: MomCess has %d point(s); Category III performs no momentary cessation",
+			// NOT "Category III performs no momentary cessation" — it does (1547
+			// Table 16 prescribes it in two voltage regions), and this fixture's
+			// emptiness is a bench choice about an OPTIONAL setting rather than a
+			// property of the category. A device arriving with momentary cessation
+			// configured is conformant; it is just not the baseline BASIC-004's
+			// before/after oracle is written against.
+			t.Errorf("%s: MomCess has %d point(s); this fixture declines the optional momentary-cessation "+
+				"setting (1547 Table 36 \"not mandatory\", SunSpec profile Table 26 optional) so that any "+
+				"content a conformance run finds in this sub-curve is attributable to a control it published",
 				tc.name, len(set.MomCess))
 		}
 		// The staging set (index 1) exists and is writable and empty.
@@ -110,9 +130,9 @@ func TestTripModelsServeCategoryIIIDefaults(t *testing.T) {
 		name string
 		want []sunspec.TripHzPoint
 	}{
-		// Table 19: UF2 56.5 Hz / 0.16 s, UF1 58.5 Hz / 300 s.
+		// Table 18: UF2 56.5 Hz / 0.16 s, UF1 58.5 Hz / 300 s.
 		{sunspec.ModelDERTripLF, "709 DERTripLF", []sunspec.TripHzPoint{{Hz: 56.5, Tms: 0.16}, {Hz: 58.5, Tms: 300}}},
-		// Table 19: OF1 61.2 Hz / 300 s, OF2 62.0 Hz / 0.16 s.
+		// Table 18: OF1 61.2 Hz / 300 s, OF2 62.0 Hz / 0.16 s.
 		{sunspec.ModelDERTripHF, "710 DERTripHF", []sunspec.TripHzPoint{{Hz: 61.2, Tms: 300}, {Hz: 62.0, Tms: 0.16}}},
 	}
 	for _, tc := range freq {
@@ -142,6 +162,69 @@ func TestTripModelsServeCategoryIIIDefaults(t *testing.T) {
 		if len(set.MayTrip) != 0 || len(set.MomCess) != 0 {
 			t.Errorf("%s: MayTrip/MomCess declare %d/%d points; both should be empty",
 				tc.name, len(set.MayTrip), len(set.MomCess))
+		}
+	}
+}
+
+// TestNameplateDeclaresTheCategoryItsTripCurvesServe is the coherence check
+// between the two halves of this device's 1547 story: model 702's AbnOpCatRtg
+// is the DER's OWN declaration of its abnormal operating performance category,
+// and models 707/708 carry the shall-trip curves of exactly one category.
+//
+// It is written as a coherence test rather than a value test on purpose. "The
+// register holds a 2" would pass on a device serving Category I curves beside a
+// Category III nameplate, which is the state this sim was actually in until
+// populate702 grew the line: the point was never written, and an enum16's zero
+// is the real value CAT_1 rather than an absence (absence is the 0xFFFF
+// sentinel, which View.Enum reports as ok=false). So the DER positively claimed
+// Category I while serving Category III's trip curves.
+//
+// The numbers pinned below are the ones that DIFFER between the three tables of
+// IEEE Std 1547-2018 — Table 13 (Category III) gives UV1 0.88 pu / 21 s and OV1
+// 1.10 pu / 13 s, where Table 11 (Category I) gives UV1 0.70 pu / 2.0 s and
+// Table 12 (Category II) 0.70 pu / 10.0 s. The FREQUENCY models are deliberately
+// not part of this check: Table 18 gives one set of frequency trip defaults for
+// all three categories, so 709/710 can corroborate no category at all.
+func TestNameplateDeclaresTheCategoryItsTripCurvesServe(t *testing.T) {
+	ss := newAdvSolarModels(t, 6000, true)
+
+	got, ok := sunspec.L702.View(readSlice(ss.Regs, ss.adv.M702, sunspec.L702.Len())).Enum("AbnOpCatRtg")
+	if !ok {
+		t.Fatalf("702.AbnOpCatRtg reads back as not-implemented, but this device serves 707/708 trip " +
+			"curves and so HAS an abnormal operating performance category; the SunSpec 1547 profile " +
+			"requires the point (its Table 18) and 1547 §6.4.2.1 requires the nameplate to carry the " +
+			"category")
+	}
+	if got != abnOpCat702CategoryIII {
+		t.Fatalf("702.AbnOpCatRtg = %d, want %d (CAT_3): the trip curves this same sim serves are Table "+
+			"13's Category III defaults, and a nameplate naming any other category makes the device "+
+			"internally inconsistent — anything downstream reasoning from the declared category would be "+
+			"reasoning about a value nobody chose", got, abnOpCat702CategoryIII)
+	}
+
+	// The other half of the coherence claim: the curves that category names.
+	for _, tc := range []struct {
+		id   uint16
+		name string
+		want []sunspec.TripVPoint
+	}{
+		{sunspec.ModelDERTripLV, "707 DERTripLV", []sunspec.TripVPoint{{V: 50, Tms: 2}, {V: 88, Tms: 21}}},
+		{sunspec.ModelDERTripHV, "708 DERTripHV", []sunspec.TripVPoint{{V: 110, Tms: 13}, {V: 120, Tms: 0.16}}},
+	} {
+		tb := ss.tripByModel(t, tc.id)
+		set, err := sunspec.Parse707Set(readSlice(ss.Regs, tb.base, tb.dataLen), 0)
+		if err != nil {
+			t.Fatalf("%s: Parse707Set(live): %v", tc.name, err)
+		}
+		if len(set.MustTrip) != len(tc.want) {
+			t.Fatalf("%s: MustTrip has %d point(s), want %d", tc.name, len(set.MustTrip), len(tc.want))
+		}
+		for i, w := range tc.want {
+			if !closeTo(set.MustTrip[i].V, w.V, 0.05) || !closeTo(set.MustTrip[i].Tms, w.Tms, 0.005) {
+				t.Errorf("%s: MustTrip[%d] = (%.3f %%, %.3f s), want Table 13's (%.3f %%, %.3f s) — the "+
+					"nameplate declares Category III and this curve is not Category III's",
+					tc.name, i, set.MustTrip[i].V, set.MustTrip[i].Tms, w.V, w.Tms)
+			}
 		}
 	}
 }

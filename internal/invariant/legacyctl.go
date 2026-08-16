@@ -28,8 +28,8 @@ package invariant
 // framing) and none of the INTERPRETATION is. Model 123 does not have a layout
 // table. lexa-proto ships L126/L127/L128/L129/L130/L131/L132/L134/L160 and
 // L701..L714, every one of them written against the vendored SunSpec model JSON
-// — and model 123 alone is still driven by hand-written offset constants
-// (lexa-proto sunspec/models.go's M123_* block) that predate the vendoring.
+// — and when this file was written, model 123 alone was still driven by
+// hand-written offset constants that predated the vendoring.
 //
 // A hand transcription is not a wire definition. It is exactly the artefact the
 // vendoring exists to replace: lexa-proto docs/schema/sunspec-models/README.md
@@ -39,12 +39,35 @@ package invariant
 // transcribes model 123 from the vendored JSON itself, which is the only way it
 // can DISAGREE with the product about where a register is.
 //
-// ── And it does disagree. See [M123Divergence] ──────────────────────────────
+// ── Three generations, and where each one stands ───────────────────────────
 //
-// The transcription below and lexa-proto's M123_* constants do not name the
-// same registers, at any offset. That is a finding about the product, recorded
-// as data (M123Divergence) so a test can assert it and a bundle can quote it,
-// rather than as a comment nobody executes.
+// It DID disagree, at every one of the model's 24 points, and that is the
+// finding this file was written to make visible.
+//
+//	generation 1   lexa-proto's hand-written M123_* offsets. Wrong at all 24
+//	               points: the four function groups were in the wrong ORDER,
+//	               leading with WMaxLimPct where the model leads with the Conn
+//	               group, so every constant sat 1 to 9 registers from where a
+//	               conformant device holds it. The failsafe CEASE for a
+//	               704-less pack wrote VArPct_WinTms believing it wrote Conn —
+//	               and its L1 echo proof re-read the same wrong offset, so the
+//	               disconnect that never happened was reported as PROVEN. Kept
+//	               as [M123Generation1], a would-have-caught record.
+//	generation 2   lexa-proto 32150e1 (vendored here at 04a0409). L123 derived
+//	               from the JSON like every other model, the constants proven
+//	               against it by name, and the values corrected without a
+//	               rename so no consumer had to move.
+//	this referee   transcribed here, independently, from the same JSON.
+//
+// Generations 2 and 3 now AGREE at every point, which is what
+// TestM123_LexaProtoOffsetsAgreeWithThePublishedModel pins. So
+// [DescribeM123Divergence] returns the empty string and the legacy verdicts
+// carry no transcription caveat — the disclosure is COMPUTED, not restated, so
+// the product's fix withdrew it without anyone editing a verdict.
+//
+// The independent transcription STAYS. Its value was never that it disagreed
+// once; it is that two derivations maintained apart can disagree AGAIN, on the
+// run that first sees it, in the verdict a reader is already looking at.
 
 import (
 	"fmt"

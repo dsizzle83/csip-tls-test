@@ -71,9 +71,37 @@ type Targets struct {
 	MBAPSDev    string
 	MBAPSDevAPI string
 	// Extra carries suite-specific endpoints without needing a framework
-	// change every time a suite grows one.
+	// change every time a suite grows one. Read it through Endpoint, which
+	// tolerates a nil map.
 	Extra map[string]string
 }
+
+// Endpoint returns a suite-specific endpoint from Extra, or "".
+func (t Targets) Endpoint(key string) string { return t.Extra[key] }
+
+// WithEndpoint records a suite-specific endpoint, allocating Extra on first
+// use so callers need not.
+func (t *Targets) WithEndpoint(key, value string) {
+	if value == "" {
+		return
+	}
+	if t.Extra == nil {
+		t.Extra = map[string]string{}
+	}
+	t.Extra[key] = value
+}
+
+// TargetMetrics is Extra's key for the DUT's own Prometheus endpoint.
+//
+// It lives in the framework rather than in the suite that reads it because the
+// FLAG that populates it lives here (BindFlags), and a key spelled in two
+// packages is a key that will one day be spelled two ways — which for this
+// particular map fails silently, as a missing endpoint rather than an error.
+// That is not hypothetical: the disclosure channel shipped reading
+// Extra["metrics"] with nothing anywhere writing it, so the whole apparatus was
+// unreachable from the operator's seat and every row reported "not configured"
+// while the feature was recorded as delivered.
+const TargetMetrics = "metrics"
 
 // DefaultTargets is the live bench topology.
 func DefaultTargets() Targets {
@@ -86,6 +114,12 @@ func DefaultTargets() Targets {
 		ModSimAPI:    "http://69.0.0.20:6020",
 		MBAPSDev:     "69.0.0.20:8021",
 		MBAPSDevAPI:  "http://69.0.0.20:6031",
+		// The DUT's own Prometheus endpoint. lexa-gw serves it on MetricsAddr,
+		// whose default is the LOOPBACK 127.0.0.1:9102 (cmd/northbound's
+		// config) — docs/BENCH.md binds it to the LAN address below, which is
+		// what a desktop run can actually reach. A bench whose gateway keeps
+		// the loopback default needs an ssh forward and -metrics-endpoint.
+		Extra: map[string]string{TargetMetrics: "http://69.0.0.2:9102/metrics"},
 	}
 }
 

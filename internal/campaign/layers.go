@@ -425,6 +425,10 @@ func writeProbe(dut DUTTarget, c Credential, value float64, distinctive bool) fu
 		rt.Ledger.NoteWrite(invariant.WriteRecord{
 			At: start, Credential: c.Name, Role: c.Role, Domain: c.Domain,
 			Authorized: c.MayWrite, Unit: dut.Unit, Model: 704, Point: "WMaxLimPct",
+			// The devices this write could reach. Recorded so I3's lying-peer
+			// exemption can check its own TARGET clause; an empty projection
+			// makes that exemption fail closed rather than fire unscoped.
+			DERs:        dut.DERs,
 			Value:       invariant.Quantity{Val: value, Unit: invariant.UnitPercent},
 			Ref:         invariant.RefWMax,
 			Distinctive: distinctive,

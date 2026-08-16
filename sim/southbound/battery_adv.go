@@ -81,7 +81,12 @@ func NewBatteryServerAdvanced(listenURL string, wmaxKwh, wmaxW float64) (*Batter
 	// Same wiring as NewBatteryServer (hub-write hook installed before the
 	// Modbus server starts, per finding MOD-3).
 	regs.OnWrite = func(startAddr uint16) {
-		if startAddr >= bases.M123Base && startAddr < bases.M123Base+23 {
+		// The bound comes from the LAYOUT, not a restated 23. The published
+		// model has 24 data registers and this read 23, so a write starting at
+		// the block's LAST register — VArPct_SF, which is genuinely writable —
+		// fell outside the hook and the device never reacted to it. See
+		// m123.go for the register map this is the tail of.
+		if startAddr >= bases.M123Base && startAddr < bases.M123Base+M123Len() {
 			applyHubBatteryWrite(regs, bases, wmaxW, &bs.faults)
 		}
 	}

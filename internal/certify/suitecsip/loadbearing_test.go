@@ -29,6 +29,9 @@ func releaseEnforcingCriteria(t *testing.T) map[string]criterion {
 	refusal := rowByID(t, "BASIC-014").mode.Refusal
 	hold := rowByID(t, "BASIC-010").mode.Hold
 	direct := rowByID(t, "BASIC-008").mode.Direct
+	// The ride-through rows carry their apparatus outside controlMode, so this
+	// one comes from the shipping row's own binding rather than from rowByID.
+	trip := rideThroughRows()[0].row.binding
 
 	return map[string]criterion{
 		"critDEREffectViaSouthboundOracle":    critDEREffectViaSouthboundOracle("a subject", empty),
@@ -38,6 +41,7 @@ func releaseEnforcingCriteria(t *testing.T) map[string]criterion {
 		"critEffectBlockedByAuthoringGap":     critEffectBlockedByAuthoringGap("a subject", "opModX"),
 		"critDERValueRemainedAcrossTheWindow": critDERValueRemainedAcrossTheWindow("a subject", hold, empty),
 		"critDEREffectViaDirectOracle":        critDEREffectViaDirectOracle("a subject", direct, empty),
+		"critDEREffectViaTripOracle":          critDEREffectViaTripOracle("a subject", trip, empty),
 	}
 }
 

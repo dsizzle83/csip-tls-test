@@ -74,6 +74,21 @@ type Violation struct {
 	// Key is the checker's own identity for the violation, when it supplied one.
 	// See Result.Key and Signature.
 	Key string `json:"key,omitempty"`
+	// Cohort names every identity the SAME check reported at the SAME tick, when
+	// there was more than one, this violation's own included.
+	//
+	// It is a disclosure, not an identity: it is deliberately NOT in the
+	// signature, because whether a second defect happened to be visible on the
+	// same tick must not change the fingerprint of this one — a shrink subset
+	// that reproduces this finding alone has still reproduced this finding.
+	//
+	// It exists because the split into one violation per identity ([Result.Keys])
+	// gives each finding its own record but cannot give each one its own
+	// SENTENCE: an invariant composes Reason once per Check (`if res.Reason ==
+	// ""`), so siblings share the first finding's prose and the tick's whole
+	// fact list. Rather than let a reader mistake that for a duplicate report,
+	// [Violation.String] prints the cohort and says which parts are shared.
+	Cohort []string `json:"cohort,omitempty"`
 	// Resolved marks a violation produced by Finalize from a claim that was
 	// still Pending when the run ended, and says so.
 	Resolved string `json:"resolved,omitempty"`
@@ -99,6 +114,12 @@ type Violation struct {
 // reached only by a checker outside I1–I10 (a test double, a future invariant
 // that has not yet been given an identity). [TestEveryStandardInvariantNamesItsKey]
 // pins that.
+//
+// One Key is one FINDING, not one check: a check that falsified its claim about
+// two devices names two identities and the Monitor mints two violations, each
+// hashed here on its own key (IW15-032, [Result.Keys]). What a violation's
+// siblings were is deliberately not in the hash — a shrink subset that
+// reproduces this finding without the other has still reproduced this finding.
 //
 // # The timestamp exclusion, and why it is by VALUE and not only by key name
 //
@@ -165,8 +186,22 @@ func isInstantFact(f Fact) bool {
 func (v Violation) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s [%s] tick %d\n", v.Verdict, v.ID, v.Signature(), v.Tick)
+	if v.Key != "" {
+		// The identity, printed. The signature is a hash and tells a reader
+		// nothing about WHAT the finding is about; the key names the device, the
+		// register, the credential or the mRID, and it is the only thing that
+		// distinguishes two siblings that share a sentence.
+		fmt.Fprintf(&b, "  identity: %s\n", v.Key)
+	}
 	fmt.Fprintf(&b, "  claim   : %s\n", v.Statement)
 	fmt.Fprintf(&b, "  finding : %s\n", v.Reason)
+	if len(v.Cohort) > 1 {
+		fmt.Fprintf(&b, "  cohort  : this check reported %d distinct findings at this tick, each filed "+
+			"separately and each shrunk separately: %s\n"+
+			"            the sentence and facts here are the whole tick's — an invariant composes one "+
+			"sentence per check — so read them against the identity above\n",
+			len(v.Cohort), strings.Join(v.Cohort, ", "))
+	}
 	if v.Resolved != "" {
 		fmt.Fprintf(&b, "  resolved: %s\n", v.Resolved)
 	}
@@ -349,6 +384,10 @@ func (m *Monitor) Tick(ctx context.Context) (TickResult, error) {
 
 // record folds one result into the monitor's state, minting a Violation for a
 // Fail (and for a Warn, which is recorded but does not fail the run).
+//
+// ONE PER IDENTITY, not one per check. A check that falsified its claim about
+// three different devices found three defects and must produce three violations
+// — see [Result.Keys] for the report this got wrong before IW15-032.
 func (m *Monitor) record(inv Invariant, res Result, tr *TickResult, obs *Observation) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -365,27 +404,51 @@ func (m *Monitor) record(inv Invariant, res Result, tr *TickResult, obs *Observa
 		return
 	}
 
-	v := Violation{
-		ID:         inv.ID(),
-		Statement:  inv.Statement(),
-		Grounding:  inv.Grounding(),
-		Verdict:    res.Verdict,
-		At:         obs.At,
-		Tick:       tr.Tick,
-		Reason:     res.Reason,
-		Facts:      res.Facts,
-		Key:        res.Key,
-		Faults:     obs.Faults,
-		Assertions: res.Assertions,
+	for _, v := range violationsOf(inv, res, obs.Faults, obs.At, tr.Tick) {
+		sig := v.Signature()
+		if _, dup := m.bySig[sig]; !dup {
+			tr.New = append(tr.New, v)
+		}
+		m.bySig[sig]++
+		m.violations = append(m.violations, v)
 	}
-	sig := v.Signature()
-	if _, dup := m.bySig[sig]; !dup {
-		tr.New = append(tr.New, v)
-	}
-	m.bySig[sig]++
-	m.violations = append(m.violations, v)
 	delete(m.pending, inv.ID())
 	delete(m.pendingAt, inv.ID())
+}
+
+// violationsOf expands one Result into one Violation per identity it named.
+//
+// The Assertions travel with the FIRST violation only. They are the check's
+// citable claims for the run as a whole, and copying them onto every sibling
+// would multiply the same assertion through the evidence bundle — a reader
+// counting corroboration would count each one N times. Every sibling still
+// reaches the bundle in its own right: [Monitor.Cases] synthesises a
+// manifest-carrying assertion per violation, stamped with its signature.
+func violationsOf(inv Invariant, res Result, faults ManifestSnapshot, at time.Time, tick int) []Violation {
+	ids := res.identities()
+	out := make([]Violation, 0, len(ids))
+	for i, key := range ids {
+		v := Violation{
+			ID:        inv.ID(),
+			Statement: inv.Statement(),
+			Grounding: inv.Grounding(),
+			Verdict:   res.Verdict,
+			At:        at,
+			Tick:      tick,
+			Reason:    res.Reason,
+			Facts:     res.Facts,
+			Key:       key,
+			Faults:    faults,
+		}
+		if i == 0 {
+			v.Assertions = res.Assertions
+		}
+		if len(ids) > 1 {
+			v.Cohort = ids
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 // Run ticks until ctx is cancelled, then returns. A cancelled context is the
@@ -510,27 +573,22 @@ func (m *Monitor) Finalize() Summary {
 			continue
 		}
 		at := pendingAt[inv.ID()]
-		v := Violation{
-			ID:         inv.ID(),
-			Statement:  inv.Statement(),
-			Grounding:  inv.Grounding(),
-			Verdict:    Fail,
-			At:         at.At,
-			Tick:       at.Tick,
-			Reason:     res.Reason,
-			Facts:      res.Facts,
-			Key:        res.Key,
-			Assertions: res.Assertions,
-			Resolved: "the claim was still undecided when the run ended; an outstanding claim that never " +
-				"resolved is a failure, and no promptness threshold had to be invented to say so",
-		}
+		var faults ManifestSnapshot
 		if at.Obs != nil {
-			v.Faults = at.Obs.Faults
+			faults = at.Obs.Faults
 		}
-		m.mu.Lock()
-		m.violations = append(m.violations, v)
-		m.bySig[v.Signature()]++
-		m.mu.Unlock()
+		// Resolution splits per identity for the same reason recording does: a
+		// run that ended with THREE channels still unrecovered ended with three
+		// failures, and I9 names all three.
+		res.Verdict = Fail
+		for _, v := range violationsOf(inv, res, faults, at.At, at.Tick) {
+			v.Resolved = "the claim was still undecided when the run ended; an outstanding claim that never " +
+				"resolved is a failure, and no promptness threshold had to be invented to say so"
+			m.mu.Lock()
+			m.violations = append(m.violations, v)
+			m.bySig[v.Signature()]++
+			m.mu.Unlock()
+		}
 	}
 
 	m.mu.Lock()
@@ -567,11 +625,19 @@ func (m *Monitor) Finalize() Summary {
 			sum.PerInvariant[v.ID] = Fail
 		}
 	}
+	// The third key is not decoration: siblings from one check share an ID AND
+	// an instant, sort.Slice is not stable, and an evidence bundle whose
+	// REPORT.md reorders between two runs of the same seed is not reproducible.
+	// The identity breaks the tie because it is the one thing that differs.
 	sort.Slice(sum.Violations, func(i, j int) bool {
-		if sum.Violations[i].ID != sum.Violations[j].ID {
-			return sum.Violations[i].ID < sum.Violations[j].ID
+		a, b := sum.Violations[i], sum.Violations[j]
+		if a.ID != b.ID {
+			return a.ID < b.ID
 		}
-		return sum.Violations[i].At.Before(sum.Violations[j].At)
+		if !a.At.Equal(b.At) {
+			return a.At.Before(b.At)
+		}
+		return a.Key < b.Key
 	})
 	if len(m.ticks) > 0 && m.ticks[len(m.ticks)-1].Obs != nil {
 		sum.Manifest = m.ticks[len(m.ticks)-1].Obs.Faults

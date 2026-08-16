@@ -69,6 +69,12 @@ func (b *Bundle) Report() string {
 			"> lasting access to the device.\n\n", b.Files.KeyLog)
 	}
 
+	// The clock banner goes HERE — above the run note, the capture output and
+	// every tally — because it changes what the rest of the document means. A
+	// reader who learns on page three that the timers ran at 900× has already
+	// read the timing claims as if they were about a device.
+	b.timebaseReport(&sb)
+
 	if b.Run.Note != "" {
 		fmt.Fprintf(&sb, "> %s\n\n", strings.ReplaceAll(b.Run.Note, "\n", "\n> "))
 	}
@@ -135,17 +141,35 @@ func (b *Bundle) Report() string {
 	fmt.Fprintf(&sb, "\n")
 
 	fmt.Fprintf(&sb, "## Verifying this bundle\n\n")
-	fmt.Fprintf(&sb, "This directory is self-checking. Two independent checks:\n\n")
-	fmt.Fprintf(&sb, "1. `sha256sum -c %s` — every file, the capture included, is covered.\n", ManifestFile)
-	fmt.Fprintf(&sb, "2. The evidence verifier re-reads `%s` and confirms that every cited frame\n", b.Files.Capture)
-	fmt.Fprintf(&sb, "   exists and carries the exact bytes each assertion claims. It reads only this\n")
-	fmt.Fprintf(&sb, "   directory and needs nothing from the bench that produced it.\n\n")
-	if len(b.Metrics) > 0 {
-		fmt.Fprintf(&sb, "3. The DUT metrics scrapes below are re-derived from the raw exposition bodies in\n")
-		fmt.Fprintf(&sb, "   `%s/`: every value, delta and outcome must follow from the bytes shipped with\n", MetricsDir)
-		fmt.Fprintf(&sb, "   them. That proves the readings were recorded faithfully — not that the device\n")
-		fmt.Fprintf(&sb, "   was telling the truth about itself.\n\n")
+	fmt.Fprintf(&sb, "This directory is self-checking. Independent checks, in the order a sceptical reader\n")
+	fmt.Fprintf(&sb, "would run them:\n\n")
+	// Numbered by a counter rather than by literals: the list grew a channel
+	// twice, and a hand-numbered list is a list that eventually says "2." twice.
+	n := 0
+	item := func(format string, args ...any) {
+		n++
+		fmt.Fprintf(&sb, "%d. %s\n", n, fmt.Sprintf(format, args...))
 	}
+	item("`sha256sum -c %s` — every file, the capture included, is covered.", ManifestFile)
+	item("The evidence verifier re-reads `%s` and confirms that every cited frame\n"+
+		"   exists and carries the exact bytes each assertion claims. It reads only this\n"+
+		"   directory and needs nothing from the bench that produced it.", b.Files.Capture)
+	item("Every case verdict in the table above is re-derived from that case's own printed\n" +
+		"   assertions. A stored verdict may be stricter than they roll up to — an uncited PASS is\n" +
+		"   downgraded on purpose — but never weaker, so a headline cannot drift away from, or be\n" +
+		"   edited away from, the evidence underneath it.")
+	if len(b.Metrics) > 0 {
+		item("The DUT metrics scrapes below are re-derived from the raw exposition bodies in\n"+
+			"   `%s/`: every value, delta and outcome must follow from the bytes shipped with\n"+
+			"   them. That proves the readings were recorded faithfully — not that the device\n"+
+			"   was telling the truth about itself.", MetricsDir)
+	}
+	if len(b.Timebases) > 0 {
+		item("Each fixture clock declared above is re-derived: its human label must follow from the\n" +
+			"   kind and scale recorded beside it, so an accelerated run cannot be re-labelled as a\n" +
+			"   wall-clock one without the bundle ceasing to verify.")
+	}
+	fmt.Fprintf(&sb, "\n")
 	fmt.Fprintf(&sb, "Assertions marked *(no digest)* below carry no re-checkable citation: they are\n")
 	fmt.Fprintf(&sb, "narrative, not proof.\n\n")
 

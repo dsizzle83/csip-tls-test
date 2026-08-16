@@ -166,7 +166,7 @@ func (w *worldWiring) hermetic(refs aggregator.PKIRefs, negs []negative) campaig
 				Resume: func(context.Context) error { dev.Resume(); return nil },
 			}},
 		}
-		inv.DUT = w.dutTarget(ctx, lb.Addr(), refs, negs)
+		inv.DUT = w.dutTarget(ctx, lb.Addr(), refs, negs, derNames(inv.DERs))
 
 		src := invariant.Sources{
 			DUT:  w.northbound(lb.Addr(), refs),
@@ -288,7 +288,7 @@ func (w *worldWiring) live(refs aggregator.PKIRefs, negs []negative) campaign.En
 			gw := &certify.Gateway{SSH: w.GatewaySSH}
 			src.Host = invariant.NewSSHHost(gw, watchedFiles, watchedMounts)
 		}
-		inv.DUT = w.dutTarget(ctx, w.Target, refs, negs)
+		inv.DUT = w.dutTarget(ctx, w.Target, refs, negs, derNames(inv.DERs))
 		return campaign.Env{Inventory: inv, Sources: src}, nil
 	}
 }
@@ -365,7 +365,12 @@ func (w *worldWiring) northbound(addr string, refs aggregator.PKIRefs) invariant
 
 // dutTarget builds the attack half: the credentials, the write and present
 // probes, and the session flood.
-func (w *worldWiring) dutTarget(ctx context.Context, addr string, refs aggregator.PKIRefs, negs []negative) campaign.DUTTarget {
+// ders is the names of the devices the DUT projects onto its northbound units.
+// It is passed IN rather than discovered here because the inventory is the one
+// place that knows which devices this run has — and I3's lying-peer exemption
+// cannot check its own scope without it (campaign.DUTTarget.DERs).
+func (w *worldWiring) dutTarget(ctx context.Context, addr string, refs aggregator.PKIRefs, negs []negative,
+	ders []string) campaign.DUTTarget {
 	byName := make(map[string]negative, len(negs))
 	for _, n := range negs {
 		byName[n.Name] = n
@@ -373,7 +378,7 @@ func (w *worldWiring) dutTarget(ctx context.Context, addr string, refs aggregato
 	unit, detail := discoverControlUnit(ctx, addr, refs)
 	t := campaign.DUTTarget{
 		Addr: addr, Domain: trustDomain, Creds: credentials(refs, negs),
-		Unit: unit, UnitDetail: detail,
+		Unit: unit, UnitDetail: detail, DERs: ders,
 	}
 	t.Write = func(ctx context.Context, c campaign.Credential, unit uint8, point string, value float64) campaign.WriteOutcome {
 		return writeAs(addr, refs, c, byName, unit, point, value)
@@ -791,4 +796,19 @@ func probeFaultKinds(ctx context.Context, client *certify.SimClient, candidates 
 		ok = append(ok, kind)
 	}
 	return ok, refused
+}
+
+// derNames is the inventory's device names, which is the projection a write
+// through the DUT could reach. Nil in, nil out: a campaign that enumerated no
+// devices says so, and I3's exemption fails closed on it rather than firing
+// unscoped.
+func derNames(ds []campaign.DERTarget) []string {
+	if len(ds) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, d.Name)
+	}
+	return out
 }

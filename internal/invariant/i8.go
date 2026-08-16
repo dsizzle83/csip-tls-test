@@ -92,13 +92,16 @@ func (i *i8) Check(ctx context.Context, w *World) (Result, error) {
 	var skips []string
 
 	// ── Session-leak arm: no shell required ───────────────────────────────
-	sv, sChecked, sFacts, sReason, sKey := i.sessionArm(hist)
+	//
+	// Both arms note THROUGH the check's own keyer rather than returning one key
+	// string. Each of them can find several things at once — two DERs leaking
+	// sessions, three files over the ceiling — and the single returned key kept
+	// only the first, so every other leak was reported with no identity of its
+	// own and could be neither counted nor shrunk (IW15-032).
+	sv, sChecked, sFacts, sReason := i.sessionArm(hist, key)
 	res.Checked += sChecked
 	res.Verdict = Worse(res.Verdict, sv)
 	res.Facts = append(res.Facts, sFacts...)
-	if sv != Pass {
-		key.note(sv, "%s", sKey)
-	}
 	if sChecked == 0 && sReason != "" {
 		skips = append(skips, sReason)
 	}
@@ -111,13 +114,10 @@ func (i *i8) Check(ctx context.Context, w *World) (Result, error) {
 		}
 		skips = append(skips, why)
 	} else {
-		hv, hChecked, hFacts, hReason, hKey := i.hostArm(hist)
+		hv, hChecked, hFacts, hReason := i.hostArm(hist, key)
 		res.Checked += hChecked
 		res.Verdict = Worse(res.Verdict, hv)
 		res.Facts = append(res.Facts, hFacts...)
-		if hv != Pass {
-			key.note(hv, "%s", hKey)
-		}
 		if res.Reason == "" && hv != Pass {
 			res.Reason = hReason
 		}
@@ -147,18 +147,17 @@ func (i *i8) Check(ctx context.Context, w *World) (Result, error) {
 }
 
 // sessionArm looks for a southbound session leak using only what the DER sims
-// publish about themselves. Its last return value is the arm's violation
-// identity: which DER's session table is climbing, and whether the climb passed
-// the leak floor (a FAIL) or is still only suspicious (a WARN) — two different
-// tickets that must not share a signature.
-func (i *i8) sessionArm(hist []*Observation) (Verdict, int, []Fact, string, string) {
+// publish about themselves. It notes one identity per climbing DER into key:
+// which DER's session table is climbing, and whether the climb passed the leak
+// floor (a FAIL) or is still only suspicious (a WARN) — two different tickets
+// that must not share a signature, and two DERs that are two tickets.
+func (i *i8) sessionArm(hist []*Observation, key *keyer) (Verdict, int, []Fact, string) {
 	const leakFloor = 8 // below this, growth is indistinguishable from warm-up
 	last := hist[len(hist)-1]
 	checked := 0
 	verdict := Pass
 	var facts []Fact
 	reason := ""
-	key := ""
 	for _, name := range last.DERNames() {
 		if !last.DERs[name].HasSessions {
 			continue
@@ -189,27 +188,28 @@ func (i *i8) sessionArm(hist []*Observation) (Verdict, int, []Fact, string, stri
 			F("i8.sessions."+name+".last", "count", last.DERs[name].Source, "%d", latest),
 			F("i8.sessions."+name+".window", "s", "monitor", "%s", dur(hist[len(hist)-1].At.Sub(hist[0].At))),
 		)
+		if grew {
+			key.note(Fail, "session-leak:%s", name)
+		} else {
+			key.note(Warn, "session-growth:%s", name)
+		}
 		if reason == "" {
 			reason = fmt.Sprintf("the sessions %s reports the DUT holding rose monotonically from %d to %d over %s "+
 				"and never once fell — a session count that only rises is a leak, not load",
 				name, first, latest, dur(hist[len(hist)-1].At.Sub(hist[0].At)))
-			key = "session-growth:" + name
-			if grew {
-				key = "session-leak:" + name
-			}
 		}
 	}
 	if checked == 0 {
-		return Pass, 0, nil, "no DER publishes a session table, so a southbound session leak is not observable", ""
+		return Pass, 0, nil, "no DER publishes a session table, so a southbound session leak is not observable"
 	}
-	return verdict, checked, facts, reason, key
+	return verdict, checked, facts, reason
 }
 
-// hostArm checks watched files and mounts. Its last return value is the arm's
-// violation identity: the PATH or MOUNT at fault, plus which claim it broke —
-// over a declared ceiling, growing with no reclaim, or below the free-space
-// floor. The byte counts stay out; they change on every sample.
-func (i *i8) hostArm(hist []*Observation) (Verdict, int, []Fact, string, string) {
+// hostArm checks watched files and mounts. It notes one identity per offender
+// into key: the PATH or MOUNT at fault, plus which claim it broke — over a
+// declared ceiling, growing with no reclaim, or below the free-space floor. The
+// byte counts stay out; they change on every sample.
+func (i *i8) hostArm(hist []*Observation, key *keyer) (Verdict, int, []Fact, string) {
 	last := hist[len(hist)-1]
 	ceiling, hasCeiling := i.p.Float("growth_ceiling_bytes")
 	minFree, hasMinFree := i.p.Float("min_free_kb")
@@ -218,10 +218,11 @@ func (i *i8) hostArm(hist []*Observation) (Verdict, int, []Fact, string, string)
 	verdict := Pass
 	var facts []Fact
 	reason := ""
-	// A local keyer, so that a free-space FAIL discovered after a growth WARN
-	// takes the identity rather than the WARN keeping it. See [keyer].
-	var key keyer
 
+	// key is the CHECK's keyer, shared with the session arm: a free-space FAIL
+	// discovered after a growth WARN displaces the WARN's identity wherever that
+	// WARN came from, which the per-arm keyer this used to hold could not do.
+	// See [keyer].
 	for _, path := range sortedFileKeys(last.Host.FileBytes) {
 		series := make([]int64, 0, len(hist))
 		for _, o := range hist {
@@ -292,9 +293,9 @@ func (i *i8) hostArm(hist []*Observation) (Verdict, int, []Fact, string, string)
 
 	if checked == 0 {
 		return Pass, 0, nil, "gateway introspection is configured but no files or mounts are watched " +
-			"(-param growth_files / the host source's watch list is empty)", ""
+			"(-param growth_files / the host source's watch list is empty)"
 	}
-	return verdict, checked, facts, reason, key.key
+	return verdict, checked, facts, reason
 }
 
 func monotoneNonDecreasing(s []int) bool {

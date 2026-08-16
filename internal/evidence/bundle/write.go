@@ -21,10 +21,11 @@ import (
 
 // Builder accumulates a run's results and writes the bundle directory.
 type Builder struct {
-	run     RunMeta
-	capture capture.Summary
-	cases   []TestCaseResult
-	metrics []metricscrape.Record
+	run       RunMeta
+	capture   capture.Summary
+	cases     []TestCaseResult
+	metrics   []metricscrape.Record
+	timebases []Timebase
 
 	capturePath   string
 	keylogPath    string
@@ -106,11 +107,19 @@ func (b *Builder) Write(dir string) (*Bundle, error) {
 		return nil, fmt.Errorf("bundle: create %s: %w", dir, err)
 	}
 
+	// The clock declarations are validated BEFORE anything is written: a bundle
+	// whose own declaration contradicts itself must never reach a reviewer, and
+	// the authoring path is where that mistake is cheap to fix (timebase.go).
+	if err := checkTimebases(b.timebases); err != nil {
+		return nil, err
+	}
+
 	out := &Bundle{
-		Schema:  SchemaVersion,
-		Run:     b.run,
-		Capture: b.capture,
-		Cases:   b.cases,
+		Schema:    SchemaVersion,
+		Run:       b.run,
+		Capture:   b.capture,
+		Cases:     b.cases,
+		Timebases: b.timebases,
 	}
 	if out.Run.Finished.IsZero() {
 		out.Run.Finished = time.Now().UTC()

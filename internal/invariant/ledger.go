@@ -65,8 +65,23 @@ type WriteRecord struct {
 	// Distinctive asserts the value was chosen so that observing it downstream
 	// can only have come from THIS write. I3 SKIPs records without it.
 	Distinctive bool `json:"distinctive"`
-	// DERs names the downstream devices this write could reach, so I3 knows
-	// where to look. Empty means "every observed DER".
+	// DERs names the downstream devices this write could reach.
+	//
+	// IT ANSWERS TWO QUESTIONS WITH OPPOSITE SAFE DEFAULTS, and reading the
+	// second as if it were the first is how I3's lying-peer exemption came to
+	// be vacuous for a release:
+	//
+	//	WHERE TO LOOK for a ghost (i3.witnesses). Empty means "every observed
+	//	DER" — the right permissive default, because looking in more places
+	//	can only find more.
+	//
+	//	WHETHER AN EXEMPTION MAY FIRE (i3.applyThenRefuseLie's TARGET clause).
+	//	Empty must mean "scope unknown, do not fire". Read permissively it says
+	//	any device's injected lie excuses a ghost seen anywhere, which turns a
+	//	conformance FAIL into a WARN with nothing to notice it.
+	//
+	// The consumers now differ accordingly; this comment exists so a future
+	// caller cannot infer one convention from the other.
 	DERs []string `json:"ders,omitempty"`
 
 	// Outcome — exactly one of Refused / Accepted / TransportErr is meaningful.

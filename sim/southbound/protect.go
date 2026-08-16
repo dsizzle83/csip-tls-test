@@ -98,6 +98,7 @@ func protectLayoutSFs(r *RegisterMap, base uint16, l *sunspec.Layout) {
 // offsets are hand-declared constants, not Layout fields — so the cells are
 // listed explicitly; keep the list in step with models.go if a model is added.
 func protectSolarLegacySFs(r *RegisterMap, b SolarBases) {
+	protectM123SFs(r, b.M123Base)
 	r.Protect(
 		b.M120Base+sunspec.M120_W_SF,
 		b.M120Base+sunspec.M120_VARtg_SF,
@@ -122,8 +123,29 @@ func protectSolarLegacySFs(r *RegisterMap, b SolarBases) {
 		b.M103Base+sunspec.M103_DCV_SF,
 		b.M103Base+sunspec.M103_DCW_SF,
 		b.M103Base+sunspec.M103_Tmp_SF,
-		b.M123Base+sunspec.M123_WMaxLimPct_SF,
-		b.M123Base+sunspec.M123_OutPFSet_SF,
-		b.M123Base+sunspec.M123_VArPct_SF,
 	)
+}
+
+// protectM123SFs write-protects model 123's three scale factors.
+//
+// Model 123's three scale factors, layout-derived (A3 adjudication,
+// 2026-08-15).
+//
+// THE ANSWER IS YES, AND THE BATTERY HAD NO PROTECTION AT ALL. The question
+// raised was whether M123's SFs should join the layout-driven protection
+// the 7xx models get. They should, and the reason is not symmetry: the
+// battery decodes its commanded ceiling THROUGH this scale factor
+// (battery.go and battery_pack.go both read M123_WMaxLimPct_SF to turn the
+// raw register into a percentage), so a writable SF lets a client change
+// the MEANING of every subsequent ceiling read without touching the ceiling
+// register. The solar sim listed the three cells by hand and was covered;
+// the battery sims protected 701/702/703/704/713 and never mentioned 123.
+//
+// It goes through protectLayoutSFs rather than three more hand-listed cells
+// because sunspec.L123 now EXISTS (lexa-proto 32150e1). The hand-listed
+// path was only ever a workaround for a model with no layout — and a
+// hand-maintained list of a hand-transcribed map is precisely the pairing
+// that produced the wrong register map in the first place.
+func protectM123SFs(r *RegisterMap, base uint16) {
+	protectLayoutSFs(r, base, sunspec.L123)
 }
