@@ -123,6 +123,23 @@ type Layout struct {
 	off    map[string]int
 	typ    map[string]Field
 	total  int
+
+	// name is the human label this layout's refusals cite, e.g. "M704". It is
+	// metadata for error messages ONLY — nothing dispatches on it — but a
+	// refusal that cannot name its model ("cannot encode 80: scale factor
+	// WMaxLimPct_SF is unreadable") sends an operator hunting across four
+	// models for one register, and unattributed divergence is the exact
+	// failure SetFloat's error path exists to end.
+	//
+	// Set with As(). Every layout defined in THIS package is named, enforced
+	// structurally by TestEveryLayoutInThisPackageIsNamed. A layout built by a
+	// CONSUMER (lexa-gw's regmap flattens curve models into ad-hoc layouts via
+	// the exported NewLayout) may leave it empty, and ScaleFactorError then
+	// degrades to point + scale-factor register rather than printing an empty
+	// label — which is why As is a chained option and not a NewLayout
+	// parameter: a required parameter would break every consumer at re-vendor
+	// for a field that only decorates an error string.
+	name string
 }
 
 // NewLayout compiles an ordered field list into an offset-indexed Layout.
@@ -146,6 +163,14 @@ func NewLayout(fields ...Field) *Layout {
 	l.total = o
 	return l
 }
+
+// As labels a layout for the refusals it will raise ("M704", "M126Crv") and
+// returns it, so it chains onto NewLayout at the var declaration. Purely
+// cosmetic — see Layout.name.
+func (l *Layout) As(name string) *Layout { l.name = name; return l }
+
+// Name is the layout's label, or "" for a layout that was never labelled.
+func (l *Layout) Name() string { return l.name }
 
 // Len is the total register count of one instance of this layout.
 func (l *Layout) Len() int { return l.total }
@@ -513,18 +538,72 @@ func (v View) SetU32(name string, val uint32) {
 // SetFloat writes an engineering value to a scaled point, encoding it with the
 // point's scale factor (read live from the slice). A finite out-of-range value
 // clamps to the field's MAX-VALID representable edge, never onto the reserved
-// not-implemented sentinel (audit SUN-004). Unknown/NaN scale factor → no-op;
-// NaN value → no-op (nothing to write).
-func (v View) SetFloat(name string, val float64) {
+// not-implemented sentinel (audit SUN-004).
+//
+// # It REFUSES rather than silently dropping a commanded value (IW15-022)
+//
+// When the point declares a scale factor and View.SF cannot read it — the
+// register is absent, carries the 0x8000 not-implemented sentinel, or sits
+// outside the sunssf domain [−10,+10] (LXR-004) — SetFloat returns a
+// *ScaleFactorError naming the point, the model and the scale-factor register,
+// and writes NOTHING.
+//
+// It used to return silently there, which is the scalar half of the defect the
+// 7xx curve encoders closed in 11e8b7d: the register kept whatever it held, the
+// writer reported success, and the surrounding actuation proceeded as if the
+// value had landed. The independent read-back axes still caught the divergence,
+// but as a device that would not converge rather than as "your WSet_SF register
+// is unreadable" — an unattributed failure the operator cannot act on.
+//
+// The refusal happens BEFORE any register moves, so a caller's buffer is never
+// left half-written (asserted by TestSetFloatRefusalMovesNoRegister). Multi-
+// point encoders that write into a buffer they did not allocate must still plan
+// before they apply — check every point, then write — because SetFloat's own
+// atomicity says nothing about the write that preceded it; Encode703 is the
+// worked example.
+//
+// # What stays silent, deliberately
+//
+//   - A NaN value is NOT commanded — there is nothing to write and nothing to
+//     refuse. A device is entitled not to implement a scale factor for a point
+//     nobody is writing.
+//   - A name this layout does not declare is a no-op returning nil, unchanged.
+//     Consumers depend on it: lexa-gw's regmap feeds a name set spanning
+//     several model revisions into one layout and relies on the unknown ones
+//     falling away. Turning that into an error would convert a documented
+//     idiom into a flood of refusals at re-vendor, and it is not this defect —
+//     a name absent from the LAYOUT is a fact about the code, knowable without
+//     a device, whereas an unreadable scale factor is a fact about the machine
+//     that only shows up in the field.
+//   - An unscaled point (Field.SF == "") cannot fail: it never consults SF.
+//     That is why derbase's writeWRmp/writeVarRmp can never raise this.
+//
+// # Why refusing is right even though a CONFORMANT device can trip it
+//
+// IW15-022 recorded that every 7xx scale factor is declared MANDATORY, so that
+// only a non-conformant device could ever be refused. That holds for the CURVE
+// models (705-712) and is false for the scalar ones: 702, 703 and 704 declare
+// all fifteen of their scale factors OPTIONAL, measured by
+// TestScalarModelScaleFactorsAreOptionalUnlikeTheCurves. So the pre-fix silent
+// skip did not need a broken machine — a conformant 704 that does not
+// implement WSet_SF dropped every WSet written to it and reported success.
+//
+// Refusing is still the only truthful answer, because a scaled point whose
+// scale factor is unimplemented has no encoding at all: there is no register
+// content on that device that means "3500 W". A device that omits WSet_SF is
+// saying it does not do WSet, and a named refusal is what the operator can act
+// on. For a scale factor that is present but hostile or corrupt, refusing is
+// additionally the fail-closed answer LXR-004 requires.
+func (v View) SetFloat(name string, val float64) error {
 	o, f, ok := v.fieldOff(name)
 	if !ok || math.IsNaN(val) {
-		return
+		return nil
 	}
 	sf := int16(0)
 	if f.SF != "" {
 		s, ok := v.SF(f.SF)
 		if !ok {
-			return
+			return &ScaleFactorError{Model: v.l.name, Point: name, SFName: f.SF, Value: val}
 		}
 		sf = s
 	}
@@ -548,7 +627,17 @@ func (v View) SetFloat(name string, val float64) {
 		x := uint32(clamp(scaled, 0, maxValidU32))
 		v.setReg(o, uint16(x>>16))
 		v.setReg(o+1, uint16(x))
+	default:
+		// The name IS declared and the caller DID command a value, but this
+		// type has no arm above (Tuint64/Tint64/Tacc64/Tstring/Tpad) — so the
+		// write vanished. Same defect class as the scale-factor skip and
+		// refused for the same reason; it is the unknown-NAME case that stays
+		// silent, not this one. No caller in this module can reach it (every
+		// SetFloat target in 702/703/704 is 16- or 32-bit), which is precisely
+		// why it went unnoticed.
+		return &PointTypeError{Model: v.l.name, Point: name, Value: val}
 	}
+	return nil
 }
 
 func clamp(v, lo, hi float64) float64 {

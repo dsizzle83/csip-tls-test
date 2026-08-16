@@ -763,18 +763,14 @@ func Populate(r *RegisterMap, wmaxW float64) {
 	r.Set(m103Base+sunspec.M103_St, 4)
 	cursor += 2 + m103Len
 
-	// ── Model 123 (Immediate Controls) — 23 data registers ───────────────────
-	const m123Len = 23
-	r.Set(cursor+0, sunspec.ModelImmediateCtrl)
-	r.Set(cursor+1, m123Len)
-	m123Base := cursor + 2
-	// 100.00% power limit (10000 × 10^-2 = 100.00).
-	r.Set(m123Base+sunspec.M123_WMaxLimPct, 10000)
-	r.Set(m123Base+sunspec.M123_WMaxLimPct_Ena, 1)
-	r.Set(m123Base+sunspec.M123_WMaxLimPct_SF, sfN(-2))
-	// Connected.
-	r.Set(m123Base+sunspec.M123_Conn, 1)
-	cursor += 2 + m123Len
+	// ── Model 123 (Immediate Controls) ───────────────────────────────────────
+	//
+	// Laid down from sunspec.L123 by name (m123.go), which is also where the
+	// 23-vs-24 register defect this replaces is written up. Resting state:
+	// 100.00 % limit (10000 at SF -2), enabled, connected.
+	cursor += PopulateM123(r, cursor, M123Defaults{
+		WMaxLimPctRaw: 10000, WMaxLimPctSF: -2, WMaxLimEna: 1, Conn: 1,
+	})
 
 	// ── End marker ───────────────────────────────────────────────────────────
 	r.Set(cursor+0, sunspec.EndMarker)

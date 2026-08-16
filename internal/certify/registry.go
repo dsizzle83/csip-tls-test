@@ -23,6 +23,7 @@ package certify
 
 import (
 	"context"
+	"csip-tls-test/internal/evidence/metricscrape"
 	"fmt"
 	"sort"
 	"strings"
@@ -97,6 +98,17 @@ type Result struct {
 	OffWire bool
 	// OffWireReason must be set when OffWire is: it is what the bundle prints.
 	OffWireReason string
+	// Metrics are scrape records this check took across its own window — the
+	// DUT's own counters, read at two instants, with both raw exposition
+	// bodies (internal/evidence/metricscrape, IW15-030).
+	//
+	// They ride on the Result rather than being written by the check because
+	// the bundle is the runner's to assemble, and because a reading is only
+	// worth carrying if VERIFY can re-derive it: writeBundle hands these to the
+	// builder, which persists the bodies and re-computes every delta from them
+	// at verify time. A check that merely printed the numbers into a Note would
+	// be asking a reader to believe it.
+	Metrics []metricscrape.Record
 }
 
 // Passed is the common shape: a verdict plus one narrative line, with the

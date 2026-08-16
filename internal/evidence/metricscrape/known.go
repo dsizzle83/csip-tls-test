@@ -1,5 +1,7 @@
 package metricscrape
 
+import "sort"
+
 // known.go names the DUT counters this bench has a reason to read, so that a
 // criterion cites a NAME defined next to its provenance instead of a string
 // literal three packages away from any evidence that the product exports it.
@@ -44,6 +46,15 @@ const (
 	// KindUnsupportedDefaultAxis — a default-control axis the scheduler cannot
 	// support (scheduler/supported.go:954).
 	KindUnsupportedDefaultAxis = "unsupported-default-axis"
+	// KindOther is not a kind the product reports — it is the bucket a kind
+	// with no enumerated series lands in (walker.go:990,
+	// ignoredContentOtherMetric). A NON-ZERO reading here is itself a finding
+	// on the product: someone added a ReportIgnoredContent call site without
+	// adding its kind to the enumeration, so the disclosure is incomplete and
+	// whichever criterion cares about that kind is reading a series that will
+	// never move. It is named here so a bench criterion can assert it stays
+	// zero rather than having to know the string.
+	KindOther = "other"
 )
 
 // ignoredContentMetric is the exported counter's name, from the one place the
@@ -58,45 +69,88 @@ const ignoredContentMetric = "lexa_nb_ignored_control_content_total"
 // isolate a kind. Use IgnoredContentKind when the criterion is about one.
 func IgnoredContentTotal() Selector { return Sel(ignoredContentMetric) }
 
+// ignoredContentKindMetric is the per-kind series the product exports, keyed by
+// the kind string, transcribed from the ONE place the product enumerates them:
+// lexa-gw internal/northbound/discovery/walker.go:977-983
+// (ignoredContentKindMetric) plus walker.go:990's other-bucket. Read at gw
+// 49a84c6.
+//
+// ── The shape is NAMES, not a label, and that was not what this bench
+//
+//	predicted ─────────────────────────────────────────────────────────────
+//
+// The TODO this replaces said the integration would be "return
+// Sel(metric).WithLabel(\"kind\", kind)". It is not: lexa-platform/metrics has no
+// label support at all — Registry.Counter(name) takes a plain string and writeTo
+// renders `# TYPE <name> counter` verbatim — so a {kind="…"} suffix smuggled
+// into a name would emit an invalid TYPE line and fail the WHOLE scrape, taking
+// every other metric on the endpoint with it. The product put the kind in the
+// NAME instead, one counter per kind (walker.go's own note says so). The
+// prediction being wrong cost nothing because the boolean contract absorbed it:
+// every caller branches on `isolated`, not on how isolation is achieved.
+//
+// The map is explicit rather than composed from a prefix, mirroring the
+// product's own reasoning: a name derived from a caller string is one refactor
+// away from letting a DERMS document choose what appears on a /metrics
+// endpoint, and a kind with no entry must land in the other-bucket LOUDLY
+// rather than be silently renamed.
+var ignoredContentKindMetric = map[string]string{
+	KindTargetVar:              "lexa_nb_ignored_control_content_target_var_total",
+	KindUnresolvableCurve:      "lexa_nb_ignored_control_content_unresolvable_curve_total",
+	KindMalformedCurve:         "lexa_nb_ignored_control_content_malformed_curve_total",
+	KindAutonomousVRef:         "lexa_nb_ignored_control_content_autonomous_vref_total",
+	KindUnsupportedDefaultAxis: "lexa_nb_ignored_control_content_unsupported_default_axis_total",
+	KindOther:                  "lexa_nb_ignored_control_content_other_total",
+}
+
 // IgnoredContentKind selects one KIND of ignored content, and reports whether
 // the selector it returned actually ISOLATES that kind.
 //
-// The second return value is the honest half. TODAY IT IS ALWAYS false: the
-// product exports one untagged total (cmd/northbound/main.go:232 sets a plain
-// Counter from discovery.IgnoredContentTotal()), the kind reaches only the
-// slog WARN, and the internal kind|detail map behind it
-// (walker.go:925-927, ignoredContentSeen) is never exported. This was gate
-// #17's finding on the IW15-030 remediation proposal, and it is why this
-// function returns the untagged selector rather than a labelled one that would
-// match nothing and read as ABSENT — an absent series and an unisolated kind
-// are different facts, and only one of them is true here.
+// IT NOW ISOLATES, for every enumerated kind. lexa-gw 49a84c6 gave the family a
+// series per kind, so a criterion about autonomous-vref reads a counter that
+// only autonomous-vref moves — which is what IW15-030 needed and could not have
+// before: summed into one total, an ACCEPTED control whose vRef element is the
+// only unacted-upon part (2018 p.252) was indistinguishable from the kinds that
+// ARE defects, and "disclosed rather than silent" degraded to "a number went
+// up, cause unknown".
 //
-// A criterion MUST branch on the second value. With isolated == false, a
-// movement in this counter proves that the gateway disclosed SOMETHING ignored
-// inside the window, not that it disclosed this kind, and any assertion built
-// on it has to say so — which is what IgnoredContentKindCaveat is for.
+// The second return value stays, and stays load-bearing, for the kind this
+// bench does NOT know: an unenumerated kind gets the untagged family total and
+// false, because a selector naming a series the product never exports would
+// read ABSENT — and an absent series and an unisolated kind are different
+// facts. A criterion MUST still branch on it and carry
+// IgnoredContentKindCaveat when it is false.
 //
-// TODO(IW15-030 integration): when the product side lands the `kind` label on
-// lexa_nb_ignored_control_content_total, THIS FUNCTION'S BODY IS THE ONE-LINE
-// CHANGE — return `Sel(ignoredContentMetric).WithLabel("kind", kind), true`
-// instead of the untagged selector and false. Nothing else in this package or
-// in a calling suite changes: the parser already reads labels, Selector already
-// matches them, and the caveat below already keys off the boolean. Land it in
-// the same commit as the product's label, and flip
-// TestIgnoredContentKindIsNotYetIsolated (known_test.go) with it — the test
-// exists so the disclosure and the check that cites it cannot move apart, which
-// is the process rule the same wave recorded.
+// ONE THING THE ISOLATION DOES NOT BUY, and a criterion must not assume it: a
+// per-kind counter attributes the disclosure, not its CAUSE. Two controls in
+// one window that both carry autonomous vRef move it twice, and the counter
+// cannot say which. Where a row needs that, it must bound the window to one
+// control — which is what the suite's per-row Open/Close already does.
 func IgnoredContentKind(kind string) (sel Selector, isolated bool) {
-	_ = kind // the product has no per-kind series to select on yet — see the TODO above
+	if name, ok := ignoredContentKindMetric[kind]; ok {
+		return Sel(name), true
+	}
 	return Sel(ignoredContentMetric), false
 }
 
+// IgnoredContentKinds returns every kind this bench can isolate, ascending, so
+// a criterion that wants the whole family can ask for it without restating the
+// list.
+func IgnoredContentKinds() []string {
+	out := make([]string, 0, len(ignoredContentKindMetric))
+	for k := range ignoredContentKindMetric {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // IgnoredContentKindCaveat is the sentence an assertion must carry when it
-// cites IgnoredContentKind's selector while isolated is false. It is a constant
-// so that every row that leans on the unisolated total says the same thing, and
-// so that grepping for it finds every claim that has to be revisited when the
-// label lands.
-const IgnoredContentKindCaveat = "the gateway exports one UNTAGGED ignored-content total " +
-	"(lexa_nb_ignored_control_content_total), so this reading shows that ignored content was " +
-	"disclosed during the window, not that this particular kind was: any other ignorable content " +
-	"served in the same window contributes to the same counter (IW15-030)"
+// cites IgnoredContentKind's selector while isolated is false — now only for a
+// kind this bench does not enumerate. It is a constant so that every row
+// leaning on the unisolated total says the same thing, and so that grepping for
+// it finds every claim that has to be revisited.
+const IgnoredContentKindCaveat = "this kind is not one the bench can isolate, so the reading falls back " +
+	"to the gateway's UNTAGGED ignored-content total (lexa_nb_ignored_control_content_total): it shows " +
+	"that ignored content was disclosed during the window, not that this particular kind was, because " +
+	"any other ignorable content served in the same window contributes to the same counter (IW15-030)"

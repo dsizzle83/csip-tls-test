@@ -43,6 +43,7 @@ import (
 	"csip-tls-test/internal/evidence/bundle"
 	"csip-tls-test/internal/evidence/capture"
 	"csip-tls-test/internal/evidence/keylog"
+	"csip-tls-test/internal/evidence/metricscrape"
 	"csip-tls-test/internal/evidence/pcapng"
 )
 
@@ -354,6 +355,12 @@ type CaseResult struct {
 	cite          CiteFunc
 	offWire       bool
 	offWireReason string
+	// metrics are the DUT's own counter readings this case took across its own
+	// window, carried from the Result to writeBundle (IW15-030). They are on
+	// the case rather than accumulated globally so a reading is attributable to
+	// the row whose window produced it — a delta over anyone else's window is a
+	// number about a different question.
+	metrics []metricscrape.Record
 	// captureArtifacts are the file names this case's registration declared
 	// (Registration.CaptureArtifacts), carried from the plan so the citation
 	// phase can slice the run capture without re-consulting the registry.
@@ -988,6 +995,7 @@ func (r *Runner) execute(ctx context.Context, p Planned, rc *RunCtx, win *Window
 	res.cite = out.Cite
 	res.offWire = out.OffWire
 	res.offWireReason = out.OffWireReason
+	res.metrics = out.Metrics
 	return res
 }
 
@@ -1283,6 +1291,13 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 	b.AddFile(covPath)
 
 	for _, c := range rep.Cases {
+		// The DUT's own counter readings, before the case that took them, so
+		// the builder persists both raw exposition bodies and verify can
+		// re-derive every delta from them rather than trusting the numbers a
+		// check reported (IW15-030).
+		for _, m := range c.metrics {
+			b.AddMetrics(m)
+		}
 		b.AddCase(bundle.TestCaseResult{
 			ID:         c.Case.UID,
 			Doc:        fmt.Sprintf("%s %s §%s", c.Case.Doc, c.Case.DocVersion, c.Case.Section),

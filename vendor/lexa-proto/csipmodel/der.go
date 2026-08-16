@@ -703,9 +703,9 @@ type DERCapabilityFull struct {
 	Resource
 
 	// Type is DERType — IEEE Std 2030.5-2018 printed p.245. That page cite was an
-	// inference when NORMATIVE_ANCHOR.md §5.3 filed this row and the
-	// citation-verification pass confirmed it exactly right, so it stands as a
-	// verified cite rather than a guess:
+	// inference when NORMATIVE_ANCHOR.md §5.3 filed this row (CLOSED there now)
+	// and the citation-verification pass confirmed it exactly right, so it
+	// stands as a verified cite rather than a guess:
 	//
 	//	0 = not applicable        5 = combined heat and power
 	//	1 = virtual or mixed      6 = other generation

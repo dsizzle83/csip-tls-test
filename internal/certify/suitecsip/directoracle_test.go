@@ -214,20 +214,34 @@ func TestBASIC009_On7xxFailsADERStillPermittedToEnergize(t *testing.T) {
 }
 
 // GREEN on a legacy DER: connect is measured against model 123's Conn, and the
-// energize half is NAMED. The transcription divergence rides along on the
-// verdict, because this referee is reading different registers than the product
-// writes.
-func TestBASIC009_OnLegacyMeasuresConnectAndDisclosesTheTranscription(t *testing.T) {
+// energize half is NAMED.
+//
+// THIS TEST USED TO REQUIRE A TRANSCRIPTION CAVEAT and now requires its
+// ABSENCE. While lexa-proto's M123_* constants disagreed with the published
+// model at every point, this referee was reading different registers than the
+// product wrote, and every legacy verdict said so. lexa-proto 32150e1 closed
+// that and the caveat is computed rather than fixed prose
+// (invariant.DescribeM123Divergence), so it stopped printing on its own — which
+// is the heal reaching the evidence. The assertion inverts so that a
+// re-divergence is caught HERE too, at the verdict a reader actually sees,
+// rather than only in the invariant package's own pin.
+func TestBASIC009_OnLegacyMeasuresConnectAndTheTranscriptionCaveatIsGone(t *testing.T) {
 	m := rowByID(t, "BASIC-009").mode
 	got := m.Direct.Judge(unitWith(map[uint16][]uint16{sunspec.ModelImmediateCtrl: m123(t, 0)}))
 	if got.Verdict != certify.Pass {
 		t.Fatalf("BASIC-009 = %s against a legacy DER holding the commanded disconnect: %s",
 			got.Verdict, findingObserved(got))
 	}
-	for _, want := range []string{"model 123 Conn", "opModEnergize", "TRANSCRIPTION"} {
+	for _, want := range []string{"model 123 Conn", "opModEnergize"} {
 		if !strings.Contains(got.Observed, want) {
 			t.Errorf("the legacy verdict does not say %q:\n  %s", want, got.Observed)
 		}
+	}
+	if strings.Contains(got.Observed, "TRANSCRIPTION") {
+		t.Errorf("the legacy verdict still carries a transcription caveat. The referee and lexa-proto "+
+			"agree on model 123's register map since 32150e1, so a caveat here means one of the two has "+
+			"moved again — and this verdict is now describing registers the writer did not touch:\n  %s",
+			got.Observed)
 	}
 	t.Logf("GREEN on legacy —\n  %s", got.Observed)
 }
@@ -364,10 +378,16 @@ func TestRefusalFingerprint_ALegacyDERIsMeasurableAtAll(t *testing.T) {
 		t.Fatal("a legacy DER still produces no fingerprint, so a scalar refusal row on it reports " +
 			"Unavailable and FAILS for want of somewhere to look — the bench gap this widening closes")
 	}
-	for _, want := range []string{"M123", invariant.PointM123Conn, "TRANSCRIPTION"} {
+	for _, want := range []string{"M123", invariant.PointM123Conn} {
 		if !strings.Contains(fp, want) {
 			t.Errorf("the legacy fingerprint does not carry %q:\n  %s", want, fp)
 		}
+	}
+	// No transcription caveat: the referee and lexa-proto agree on the map
+	// since 32150e1, so the fingerprint is over the registers the writer
+	// actually moves. It was a required substring here until that landed.
+	if strings.Contains(fp, "TRANSCRIPTION") {
+		t.Errorf("the legacy fingerprint still carries a transcription caveat:\n  %s", fp)
 	}
 	t.Logf("the legacy reading, newly measurable:\n  %s", fp)
 }

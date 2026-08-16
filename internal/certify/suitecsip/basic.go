@@ -771,6 +771,14 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				crits = append(crits, critCurvePublishedTheProcedureValues(subject, m.Curve),
 					critDERCurveResolvable(curveHrefOf(o)),
 					critDEREffectViaCurveOracle(subject, m.Curve, o))
+				// HOOK 3 of 3 (IW15-030): what the DUT's own counters say
+				// about the content it did NOT act on. Which claim is made
+				// depends on what the row published — see disclosureKindFor.
+				if kind := disclosureKindFor(m.Curve); kind != "" {
+					crits = append(crits, critDisclosedIgnoredContent(kind, o))
+				} else {
+					crits = append(crits, critNothingOfThisRowsContentWasDropped(o))
+				}
 			case m.Oracle != nil:
 				crits = append(crits, critDEREffectViaSouthboundOracle(subject, o))
 				// The persistence half is its OWN criterion, not a stiffening
@@ -811,6 +819,15 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				params[curveGenParam] = detectCurveGeneration(ctx, d.rc)
 			}
 			m := m.forGeneration(params)
+			// HOOK 1 of 3 (IW15-030, disclosure.go): open the DUT's own
+			// ignored-content window BEFORE the control goes on the wire, so
+			// the delta is over this row's window and not over whatever the
+			// counters had been doing. Curve rows only — they are the rows
+			// whose content has parts with no register home, which is exactly
+			// the content that can be accepted and silently dropped.
+			if m.Curve != nil {
+				d.disclosure = openDisclosureWindow(ctx, d.rc, params, disclosureKindFor(m.Curve), mrid)
+			}
 			switch {
 			case m.Curve != nil:
 				return curveSetup(ctx, d, params, m.Curve, mrid)
@@ -864,6 +881,13 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				// there to refuse. See recordCurveDelivery.
 				if m.Curve != nil || m.Refusal != nil {
 					recordCurveDelivery(ctx, d, params, m.Program)
+				}
+				// HOOK 2 of 3 (IW15-030): close the ignored-content window
+				// here, at the same instant the southbound oracle reads, and
+				// for the same reason — the control has to have reached the
+				// DUT for either half to mean anything.
+				if m.Curve != nil {
+					recordDisclosure(ctx, d, params)
 				}
 				// settleOracle, not a bare judge call: AwaitWalk returns at
 				// the START of the DUT's walk, so the control the DUT is

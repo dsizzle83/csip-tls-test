@@ -886,16 +886,15 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	r.Set(m103Base+sunspec.M103_St, 4)
 	cursor += 2 + m103Len
 
-	// Model 123 (Immediate Controls) — 23 data regs
-	const m123Len = 23
-	r.Set(cursor, sunspec.ModelImmediateCtrl)
-	r.Set(cursor+1, m123Len)
+	// Model 123 (Immediate Controls). Laid down from sunspec.L123 by name, and
+	// no longer from three copies of a hand offset list — see m123.go for the
+	// map that was wrong at all 24 points and the fixture half of that finding.
+	// The solar inverter rests uncurtailed: 10000 at SF -2 = 100.00 %, with the
+	// limit ENABLED, connected.
 	m123Base := cursor + 2
-	r.Set(m123Base+sunspec.M123_WMaxLimPct, 10000)
-	r.Set(m123Base+sunspec.M123_WMaxLimPct_Ena, 1)
-	r.Set(m123Base+sunspec.M123_WMaxLimPct_SF, sfN(-2))
-	r.Set(m123Base+sunspec.M123_Conn, 1)
-	cursor += 2 + m123Len
+	cursor += PopulateM123(r, cursor, M123Defaults{
+		WMaxLimPctRaw: 10000, WMaxLimPctSF: -2, WMaxLimEna: 1, Conn: 1,
+	})
 
 	bases := SolarBases{
 		M120Base: m120,

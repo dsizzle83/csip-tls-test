@@ -89,6 +89,17 @@ const (
 	// tell a bundle reader the capture backed a fact the capture never saw —
 	// the same mis-attribution tierOracle exists to prevent one tier along.
 	tierConstruction tier = "this suite's own row construction (no observation involved)"
+	// tierMetrics is a reading of the DUT's OWN Prometheus endpoint, taken
+	// live across a row's window and recorded into the bundle with both raw
+	// exposition bodies, so certify -verify re-derives the delta rather than
+	// taking the report's word for it (IW15-030, disclosure.go).
+	//
+	// It is its own tier and not tierOracle: that one reads the DER's
+	// registers, which is an independent device, while this reads the DUT
+	// TELLING US ABOUT ITSELF. Weaker evidence, and a bundle must say which it
+	// had — the whole point of the tier being printed in the Method.
+	tierMetrics tier = "a scrape of the DUT's own metrics endpoint, taken during the run and " +
+		"recorded with its raw bodies for re-derivation"
 
 	tierNone tier = "not observed"
 )

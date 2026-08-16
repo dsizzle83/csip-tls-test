@@ -32,6 +32,7 @@ package suitecsip
 import (
 	"bufio"
 	"context"
+	"csip-tls-test/internal/evidence/metricscrape"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -929,6 +930,16 @@ type Driver struct {
 	// The map is written only from PostControl, which the live phase calls
 	// from one goroutine, and read only after the live phase has finished.
 	published map[string]time.Time
+
+	// disclosure is this row's open metrics-scrape window (disclosure.go),
+	// held here because a Window carries a live opening reading and the params
+	// carry strings. Set by Setup, consumed by PostWait, nil on a row that
+	// opened none.
+	disclosure *disclosureWindow
+
+	// metrics are the closed scrape records this row produced, handed to the
+	// Result so the runner can persist their raw bodies into the bundle.
+	metrics []metricscrape.Record
 
 	// cleanupErrs records every teardown call that did NOT do what it said.
 	//

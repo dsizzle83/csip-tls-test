@@ -115,6 +115,54 @@ type Base struct {
 	DefaultWMaxLimPctRvrt    *float64
 	DefaultWMaxLimPctEnaRvrt *bool
 
+	// DefaultVarSetPctRvrt / DefaultVarSetEnaRvrt is the same alternate for the
+	// constant-reactive-power axis (VarSetRvrtTms's missing destination). RC0
+	// owner ruling: the fixed-var axis gets DEVICE-SIDE arming, which 704
+	// supports — model_704.json declares VarSetPctRvrt (int16, RW, sf
+	// VarSetPct_SF) and VarSetEnaRvrt (enum16, RW) alongside VarSetRvrtTms.
+	//
+	// The value is PERCENT, matching SetConstantVar's own pct parameter and the
+	// VarSetPctRvrt register's own domain, and is bounded by the same declared
+	// reactive capability as the primary (checkVarWithinReactiveCapability) —
+	// a reversion destination the machine cannot hold is refused, not written.
+	//
+	// IT INHERITS VarSetMod AND VarSetPri. 704 declares no VarSetModRvrt and no
+	// VarSetPriRvrt (verified against the vendored JSON), so the percentage the
+	// device reverts to is interpreted against whatever base the PRIMARY write
+	// selected. A caller must not treat the alternate as independently
+	// meaningful: "revert to 20 %" means 20 % of the mod in force, and a later
+	// write that changes mod silently re-bases an already-armed reversion.
+	// That is a property of the register map, not a choice made here.
+	DefaultVarSetPctRvrt *float64
+	DefaultVarSetEnaRvrt *bool
+
+	// DefaultPFRvrt / DefaultPFRvrtOverExcited / DefaultPFEnaRvrt is the
+	// alternate for the constant-power-factor axis. 704 carries it as a SYNC
+	// GROUP rather than a single register: model_704.json declares groups
+	// PFWInjRvrt and PFWAbsRvrt, each {PF uint16 RW sf=PF_SF, Ext enum16 RW},
+	// which this package's layout flattens to PFWInjRvrt_PF/PFWInjRvrt_Ext and
+	// PFWAbsRvrt_PF/PFWAbsRvrt_Ext.
+	//
+	// THE EXCITATION IS PART OF THE VALUE, not a decoration on it. A
+	// displacement magnitude without the excitation that gives it a direction
+	// is not a power factor — 0.95 over-excited and 0.95 under-excited are
+	// opposite reactive commands. Supplying DefaultPFRvrt without
+	// DefaultPFRvrtOverExcited is therefore REFUSED, exactly as an arming bit
+	// with no value is: this repo has already shipped both halves of that
+	// mistake once (93d24f4 inverted the excitation boolean at both writers,
+	// fe483e7 decoded a conformant PowerFactorWithExcitation to zero), and an
+	// armed reversion is the worst place to make it a third time — nothing
+	// reads it back until the countdown fires, unattended.
+	//
+	// The alternate is written to whichever sync group the PRIMARY command
+	// selects (inject → PFWInjRvrt, absorb → PFWAbsRvrt). Arming the injecting
+	// group's reversion while commanding the absorbing one would mean "when
+	// this absorb command expires, revert the inject group", which is not
+	// something a caller can coherently want.
+	DefaultPFRvrt            *float64
+	DefaultPFRvrtOverExcited *bool
+	DefaultPFEnaRvrt         *bool
+
 	// CSIPRampTmsSeconds, when non-nil, is a CSIP-resolved per-axis ramp time
 	// (seconds) for the legacy M123 active-power ceiling that legacyRmpTms()
 	// prefers over LegacyRmpTms's fixed policy default (§3.3, closes Gap D) —
@@ -1431,13 +1479,39 @@ func importBoundUnsupported(ctrl model.DERControlBase) error {
 		"bound cannot be expressed on this device and is refused rather than misexecuted"}
 }
 
-// requireWmax rejects a percentage-of-nameplate control on a device whose
-// nameplate is unknown. Same message the writers themselves produce, so the
-// only thing that changes is WHEN a caller learns (before any axis is
-// written, instead of after).
+// requireWmax rejects a percentage-of-nameplate control on a device that
+// publishes no usable active-power base. Same message the writers themselves
+// produce — they call this rather than restating it — so the only thing that
+// changes between the preflight and the write is WHEN a caller learns (before
+// any axis is written, instead of after).
+//
+// The message was corrected here (parked IW15 follow-up). "cannot set power
+// limit: WMax unknown" was wrong twice over, and both halves misdirected
+// whoever read it:
+//
+//   - WRONG SCOPE. This gate does not guard "the power limit". Its four
+//     callers are opModMaxLimW's watt→percent conversion, the combined-ceiling
+//     min-combine, preflightActuationWatts and SetWMaxLimPctWPlan — i.e. every
+//     percent-of-nameplate control on the device, ceilings and setpoints
+//     alike. Naming one axis sent operators looking at that axis's
+//     configuration for a fault that belonged to all of them.
+//
+//   - WRONG CONDITION, AND NO REMEDY. "WMax unknown" reads as "the gateway
+//     has not been told the nameplate", which is a gateway-side configuration
+//     problem the operator would go and try to fix. It is not one: b.Wmax is
+//     resolved from the DEVICE (IW15-002 settings-first — 702's mutable WMax
+//     setting, falling back to the WMaxRtg rating), and it lands here as NaN
+//     precisely when the device declared a zero or an impossible value, which
+//     that resolution deliberately refuses to launder into a usable number.
+//     The remedy is on the machine, and the message now says so.
 func (b *Base) requireWmax(tag string) error {
 	if math.IsNaN(b.Wmax) || b.Wmax <= 0 {
-		return fmt.Errorf("%s: cannot set power limit: WMax unknown", tag)
+		return fmt.Errorf("%s: percent-of-nameplate controls refused: this device declares no "+
+			"usable active-power base — its M702 WMax setting and WMaxRtg rating are both "+
+			"absent, zero, or not implemented, so a percentage has no quantity to convert "+
+			"against and is refused rather than converted against a fabricated one. The fix "+
+			"is on the DEVICE: publish a non-zero WMax setting (or WMaxRtg rating) before "+
+			"commanding ceilings or percent setpoints", tag)
 	}
 	return nil
 }
@@ -1784,10 +1858,23 @@ func (b *Base) ReadEnterService(tag string) (sunspec.EnterService, error) {
 // SetFixedPF, which is the deny-by-default rule holding in ApplyControl and
 // nowhere else. The claim-level check is subsumed — CapAbsent and
 // CapNotImplemented both fail the per-bit test with their own reason strings.
-func (b *Base) write704(tag string, axis string, modes []ctrlMode, fn func(v sunspec.View)) error {
+func (b *Base) write704(tag string, axis string, modes []ctrlMode, fn encodeFn) error {
 	_, err := b.write704Rmp(tag, axis, modes, fn, nil)
 	return err
 }
+
+// encodeFn is a 704 whole-block encoder: it stages an axis's registers into a
+// freshly-read View and reports whether every commanded value could be encoded.
+//
+// It returns an error because View.SetFloat can now refuse (IW15-022): a point
+// whose scale-factor register is absent, sentinel-valued, or outside the sunssf
+// domain cannot carry the commanded value, and the pre-fix encoder dropped it
+// silently — leaving the axis enabled around a setpoint that never arrived and
+// reporting success. write704Rmp treats a non-nil result as "this write did not
+// happen": the staged block is discarded and NOTHING is sent to the device, so
+// the enable that a scalar writer stages next to its value can never reach the
+// inverter without it.
+type encodeFn func(v sunspec.View) error
 
 // write704Rmp is write704 plus an OPTIONAL second closure, rmpFn, that applies
 // ONLY the §3.2 WRmp/VarRmp standing-rate write (writeWRmp/writeVarRmp) on top
@@ -1853,7 +1940,14 @@ func (b *Base) write704(tag string, axis string, modes []ctrlMode, fn func(v sun
 // `return nil` this function used to produce (IW13-003 §1.3) — this function
 // itself still never fails a write that a WRmp/VarRmp rejection alone would
 // not have failed, which remains the load-bearing fail-safe property (§1.4).
-func (b *Base) write704Rmp(tag, axis string, modes []ctrlMode, fn func(v sunspec.View), rmpFn func(v sunspec.View)) (isolated bool, err error) {
+// An ENCODE refusal from fn or rmpFn (IW15-022) is returned as-is with
+// isolated==false and ZERO registers sent: the staged block is local to this
+// function, so a caller's device sees nothing at all — not the axis value, not
+// the enable beside it, not the reversion timer. That is deliberately NOT the
+// isolating retry, which exists for a device that REJECTED a ramp address
+// range; an unencodable point was never offered to the device and re-offering
+// it without the ramp would encode exactly as badly the second time.
+func (b *Base) write704Rmp(tag, axis string, modes []ctrlMode, fn encodeFn, rmpFn encodeFn) (isolated bool, err error) {
 	if !b.Has704 {
 		return false, &UnsupportedControlError{Axis: axis, Reason: "device has no M704 (DERCtlAC)"}
 	}
@@ -1865,9 +1959,13 @@ func (b *Base) write704Rmp(tag, axis string, modes []ctrlMode, fn func(v sunspec
 		return false, err
 	}
 	v := sunspec.L704.View(regs)
-	fn(v)
+	if encErr := fn(v); encErr != nil {
+		return false, encErr
+	}
 	if rmpFn != nil {
-		rmpFn(v)
+		if encErr := rmpFn(v); encErr != nil {
+			return false, encErr
+		}
 	}
 	writeErr := b.Reader.WriteModel(sunspec.ModelDERCtlAC, 0, regs[:sunspec.L704.Len()])
 	if writeErr == nil || rmpFn == nil {
@@ -1879,7 +1977,9 @@ func (b *Base) write704Rmp(tag, axis string, modes []ctrlMode, fn func(v sunspec
 	if rerr != nil {
 		return false, writeErr // cannot safely isolate — report the ORIGINAL failure
 	}
-	fn(sunspec.L704.View(regs2))
+	if encErr := fn(sunspec.L704.View(regs2)); encErr != nil {
+		return false, writeErr // fn encoded once already; a refusal now is not the device's story
+	}
 	wrmpOffset := sunspec.L704.Offset("WRmp")
 	if wrmpOffset < 0 || wrmpOffset > sunspec.L704.Len() {
 		return false, writeErr // layout invariant broken — no safe narrower range to isolate
@@ -1940,9 +2040,9 @@ func (b *Base) read704Checked(tag string) ([]uint16, error) {
 //   - *ena == false: writes the disable, and the value alongside it when
 //     supplied (harmless: an inert, disabled alternate is never applied —
 //     §2a.4's "sits armed and inert" concern only bites when enabled).
-func rvrtAlternateWriter(axis, valueField, enaField string, val *float64, ena *bool) (func(v sunspec.View), error) {
+func rvrtAlternateWriter(axis, valueField, enaField string, val *float64, ena *bool) (encodeFn, error) {
 	if ena == nil {
-		return func(sunspec.View) {}, nil
+		return func(sunspec.View) error { return nil }, nil
 	}
 	if *ena && val == nil {
 		return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf(
@@ -1950,11 +2050,76 @@ func rvrtAlternateWriter(axis, valueField, enaField string, val *float64, ena *b
 				"the device to whatever the shadow register already holds (stale/unwritten) — refused "+
 				"rather than silently armed (IW13-004a)", enaField, valueField)}
 	}
-	return func(v sunspec.View) {
+	return func(v sunspec.View) error {
+		// Value BEFORE enable, and the enable is skipped entirely when the
+		// value could not be encoded (IW15-022): arming reversion toward a
+		// destination the device never received is the same stale-shadow
+		// hazard §2a.2 refuses when the caller supplies no value at all.
 		if val != nil {
-			v.SetFloat(valueField, *val)
+			if err := v.SetFloat(valueField, *val); err != nil {
+				return fmt.Errorf("%s: reversion alternate: %w", axis, err)
+			}
 		}
 		v.SetBool(enaField, *ena)
+		return nil
+	}, nil
+}
+
+// pfRvrtAlternateWriter is rvrtAlternateWriter's sibling for the fixed-PF axis,
+// whose alternate 704 carries as a SYNC GROUP rather than a single register:
+// model_704.json declares PFWInjRvrt and PFWAbsRvrt, each {PF uint16 RW
+// sf=PF_SF, Ext enum16 RW}, flattened by this package's layout to
+// PFWInjRvrt_PF / PFWInjRvrt_Ext and PFWAbsRvrt_PF / PFWAbsRvrt_Ext.
+//
+// It is a separate function rather than a parameterisation of
+// rvrtAlternateWriter because the VALUE here is a PAIR, and that changes what
+// "no value" means. rvrtAlternateWriter refuses ena-without-value; this one
+// refuses that AND magnitude-without-excitation, because a displacement
+// magnitude with no excitation is not a power factor at all — 0.95
+// over-excited and 0.95 under-excited are opposite reactive commands. This
+// repo has shipped both halves of that confusion already (93d24f4 inverted the
+// excitation boolean at both writers, fe483e7 decoded a conformant
+// PowerFactorWithExcitation to zero); an armed reversion is the worst place to
+// make it a third time, because nothing reads it back until the countdown
+// fires, unattended, possibly weeks later.
+//
+// Write order is PF, then Ext, then the enable — the whole value before the
+// arming bit, so an unencodable PF (IW15-022) leaves the reversion DISARMED
+// rather than armed at whatever the shadow pair already held.
+func pfRvrtAlternateWriter(axis, pfField, extField, enaField string,
+	pf *float64, overExcited *bool, ena *bool) (encodeFn, error) {
+
+	if ena == nil {
+		return func(sunspec.View) error { return nil }, nil
+	}
+	if *ena && pf == nil {
+		return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf(
+			"%s=true requires a %s alternate value; arming reversion with no destination would "+
+				"revert the device to whatever the shadow register already holds "+
+				"(stale/unwritten) — refused rather than silently armed (IW13-004a)",
+			enaField, pfField)}
+	}
+	if pf != nil && overExcited == nil {
+		return nil, &InvalidControlError{Axis: axis, Reason: fmt.Sprintf(
+			"a %s alternate of %g was supplied with no excitation; a displacement magnitude "+
+				"without excitation is not a power factor (%g over-excited and %g under-excited "+
+				"are opposite reactive commands), so %s cannot be written and the pair is "+
+				"refused rather than armed against whatever excitation the shadow register "+
+				"already holds", pfField, *pf, *pf, *pf, extField)}
+	}
+	return func(v sunspec.View) error {
+		if pf != nil {
+			if err := v.SetFloat(pfField, *pf); err != nil {
+				return fmt.Errorf("%s: reversion alternate: %w", axis, err)
+			}
+			ext := uint16(sunspec.M704_Ext_OverExcited)
+			if !*overExcited {
+				ext = sunspec.M704_Ext_UnderExcited
+			}
+			v.SetEnum(extField, ext)
+		}
+		v.SetBool(enaField, *ena)
+		return nil
 	}, nil
 }
 
@@ -2011,28 +2176,71 @@ func firstRampNotApplied(out PlanOutcome) error {
 //
 // Requires the device's positive FIXED_PF claim, on a direct call exactly as
 // through ApplyControl (audit F2).
+//
+// RC0 owner ruling: this axis gets a DEVICE-SIDE reversion alternate, armed
+// from DefaultPFRvrt / DefaultPFRvrtOverExcited / DefaultPFEnaRvrt into
+// whichever sync group inject selects. A caller that supplies no alternate
+// (DefaultPFEnaRvrt nil) writes byte-identically to before.
 func (b *Base) SetFixedPF(inject bool, pf float64, overExcited bool, tag string) error {
-	return b.write704(tag, "SetFixedPF", []ctrlMode{modeFixedPF}, func(v sunspec.View) {
+	// The alternate is validated against the SAME declared rating as a primary
+	// command on this group would be — a reversion destination the machine
+	// cannot hold is refused, not armed. The axis name selects which rated-PF
+	// bound applies (PFOvrExtRtg for the injecting group, PFUndExtRtg for the
+	// absorbing one), so the alternate is bounded by the same claim the
+	// device made about the direction it is actually going to revert in.
+	rvrtAxis := "opModFixedPFAbsorbW"
+	pfField, extField, enaField := "PFWAbsRvrt_PF", "PFWAbsRvrt_Ext", "PFWAbsEnaRvrt"
+	if inject {
+		rvrtAxis = "opModFixedPFInjectW"
+		pfField, extField, enaField = "PFWInjRvrt_PF", "PFWInjRvrt_Ext", "PFWInjEnaRvrt"
+	}
+	if b.DefaultPFRvrt != nil {
+		if err := b.validatePF(*b.DefaultPFRvrt, rvrtAxis); err != nil {
+			return err
+		}
+	}
+	rvrtFn, err := pfRvrtAlternateWriter("SetFixedPF", pfField, extField, enaField,
+		b.DefaultPFRvrt, b.DefaultPFRvrtOverExcited, b.DefaultPFEnaRvrt)
+	if err != nil {
+		return err
+	}
+	return b.write704(tag, "SetFixedPF", []ctrlMode{modeFixedPF}, func(v sunspec.View) error {
 		ext := uint16(sunspec.M704_Ext_OverExcited)
 		if !overExcited {
 			ext = sunspec.M704_Ext_UnderExcited
 		}
+		// IW15-022: PF_SF first, before the enable. Both sync groups encode
+		// their magnitude against the ONE shared PF_SF register, so an
+		// unreadable PF_SF makes this axis unwritable in either direction —
+		// and an enable staged next to a PF that never landed would leave the
+		// device holding constant power factor at whatever magnitude the
+		// register happened to contain.
 		if inject {
+			if err := v.SetFloat("PFWInj_PF", pf); err != nil { // engineering value = power factor
+				return err
+			}
 			v.SetBool("PFWInjEna", true)
-			v.SetFloat("PFWInj_PF", pf) // engineering value = power factor
 			v.SetEnum("PFWInj_Ext", ext)
 			// §2.4 closes Gap A: the PFWInj write previously ignored
 			// DefaultRvrtTms entirely even though cmd/modbus's advanced shell
 			// (withRvrtTms) already threaded a value in for this call to drop.
 			v.SetU32("PFWInjRvrtTms", b.DefaultRvrtTms)
 		} else {
+			if err := v.SetFloat("PFWAbs_PF", pf); err != nil {
+				return err
+			}
 			v.SetBool("PFWAbsEna", true)
-			v.SetFloat("PFWAbs_PF", pf)
 			v.SetEnum("PFWAbs_Ext", ext)
 			v.SetU32("PFWAbsRvrtTms", b.DefaultRvrtTms)
 		}
 		// 704 has no PF ramp register of any kind (§1.2/§3.4's gap table) — no
 		// writeWRmp/writeVarRmp call here, deliberately.
+		//
+		// The reversion alternate goes to the group this command selected: its
+		// registers were resolved from the same `inject` above, so the arming
+		// bit and the value it arms toward can never belong to opposite sync
+		// groups.
+		return rvrtFn(v)
 	})
 }
 
@@ -2106,18 +2314,43 @@ func (b *Base) SetConstantVarPlan(pct float64, mod uint16, tag string) (PlanOutc
 	// started failing — a real regression, not a test-only concern). Nil
 	// here is exactly today's behavior: one write, one failure, surfaced
 	// immediately — byte-identical for the overwhelming common no-ramp case.
-	var rmpFn func(v sunspec.View)
+	var rmpFn encodeFn
 	if b.DefaultVarRmpPct != nil {
 		rmpFn = b.writeVarRmp
 	}
-	isolated, werr := b.write704Rmp(tag, "SetConstantVar", []ctrlMode{modeFixedVar}, func(v sunspec.View) {
+	// RC0 owner ruling: device-side reversion alternate for this axis
+	// (VarSetPctRvrt / VarSetEnaRvrt), bounded by the SAME declared reactive
+	// capability as the primary and against the SAME mod — 704 declares no
+	// VarSetModRvrt, so the alternate percentage is interpreted against
+	// whatever base this write selects, and validating it under a different
+	// mod than it will be applied under would be checking the wrong quantity.
+	if b.DefaultVarSetPctRvrt != nil {
+		if err := b.checkVarWithinReactiveCapability("SetConstantVar.VarSetPctRvrt",
+			mod, *b.DefaultVarSetPctRvrt); err != nil {
+			return out, err
+		}
+	}
+	rvrtFn, err := rvrtAlternateWriter("SetConstantVar", "VarSetPctRvrt", "VarSetEnaRvrt",
+		b.DefaultVarSetPctRvrt, b.DefaultVarSetEnaRvrt)
+	if err != nil {
+		return out, err
+	}
+	isolated, werr := b.write704Rmp(tag, "SetConstantVar", []ctrlMode{modeFixedVar}, func(v sunspec.View) error {
+		// IW15-022: the percentage first. VarSetEna with an unencodable
+		// VarSetPct would hold the device at the previous reactive setpoint
+		// under a new mode/priority, which is a control nobody commanded.
+		if err := v.SetFloat("VarSetPct", pct); err != nil {
+			return err
+		}
 		v.SetBool("VarSetEna", true)
 		v.SetEnum("VarSetMod", mod)
 		v.SetEnum("VarSetPri", sunspec.M704_VarSetPri_Reactive)
-		v.SetFloat("VarSetPct", pct)
 		// §2.4 closes Gap A (the other half — SetFixedPF above is the first):
 		// VarSet previously ignored DefaultRvrtTms entirely.
 		v.SetU32("VarSetRvrtTms", b.DefaultRvrtTms)
+		// The alternate rides the same VarSetMod written just above — 704 has
+		// no VarSetModRvrt to give it one of its own.
+		return rvrtFn(v)
 	}, rmpFn)
 	if werr != nil {
 		return out, werr
@@ -2190,8 +2423,13 @@ func (b *Base) SetActivePowerWatts(w float64, tag string) error {
 // UnsupportedControlError the write would have produced, with zero registers
 // touched.
 func (b *Base) ReleaseActivePowerSetpoint(tag string) error {
-	return b.write704(tag, "opModFixedW", []ctrlMode{modeFixedW}, func(v sunspec.View) {
+	return b.write704(tag, "opModFixedW", []ctrlMode{modeFixedW}, func(v sunspec.View) error {
+		// Nothing here can raise IW15-022: WSetEna is Tenum16 with no scale
+		// factor, and a withdrawal deliberately writes no value (see above).
+		// A release must stay writable on a device whose WSet_SF is broken —
+		// that device is exactly the one an operator most needs to disarm.
 		v.SetBool("WSetEna", false)
+		return nil
 	})
 }
 
@@ -2217,7 +2455,7 @@ func (b *Base) SetActivePowerWattsPlan(w float64, tag string) (PlanOutcome, erro
 	// SetConstantVarPlan's identical comment for why unconditional b.writeWRmp
 	// was reverted (it corrupted ApplyControlPlan's document-level re-attempt
 	// budget accounting for every 704 write, not just WRmp-bearing ones).
-	var rmpFn func(v sunspec.View)
+	var rmpFn encodeFn
 	if b.DefaultWRmpPct != nil {
 		rmpFn = b.writeWRmp
 	}
@@ -2235,12 +2473,18 @@ func (b *Base) SetActivePowerWattsPlan(w float64, tag string) (PlanOutcome, erro
 	if err != nil {
 		return out, err
 	}
-	isolated, werr := b.write704Rmp(tag, "SetActivePowerWatts", []ctrlMode{modeFixedW}, func(v sunspec.View) {
+	isolated, werr := b.write704Rmp(tag, "SetActivePowerWatts", []ctrlMode{modeFixedW}, func(v sunspec.View) error {
+		// IW15-022: WSet before WSetEna. This is the axis where the silent
+		// skip bit hardest — WSetEna=1 over a stale WSet is a live dispatch
+		// at the PREVIOUS setpoint, indistinguishable at the head end from
+		// the one that was actually commanded.
+		if err := v.SetFloat("WSet", w); err != nil {
+			return err
+		}
 		v.SetBool("WSetEna", true)
 		v.SetEnum("WSetMod", sunspec.M704_WSetMod_Watts)
-		v.SetFloat("WSet", w)
 		v.SetU32("WSetRvrtTms", b.DefaultRvrtTms)
-		rvrtFn(v)
+		return rvrtFn(v)
 	}, rmpFn)
 	if werr != nil {
 		return out, werr
@@ -2297,8 +2541,11 @@ func (b *Base) SetWMaxLimPctW(w float64, tag string) error {
 // DefaultWRmpPct is in play, both call this).
 func (b *Base) SetWMaxLimPctWPlan(w float64, tag string) (PlanOutcome, error) {
 	out := PlanOutcome{Tag: tag, Plan: "SetWMaxLimPctW"}
-	if math.IsNaN(b.Wmax) || b.Wmax <= 0 {
-		return out, fmt.Errorf("%s: cannot set power limit: WMax unknown", tag)
+	// requireWmax rather than a second copy of its condition and message: the
+	// preflight and the write must refuse for the same reason in the same
+	// words, and a duplicated literal is how they drift.
+	if err := b.requireWmax(tag); err != nil {
+		return out, err
 	}
 	if w < 0 || math.IsNaN(w) {
 		return out, &InvalidControlError{Axis: "SetWMaxLimPctW", Reason: fmt.Sprintf(
@@ -2311,7 +2558,7 @@ func (b *Base) SetWMaxLimPctWPlan(w float64, tag string) (PlanOutcome, error) {
 	pct := w / b.Wmax * 100.0
 	// Defect 2: see SetActivePowerWattsPlan's identical comment — rmpFn only
 	// when a WRmp value is actually in play.
-	var rmpFn func(v sunspec.View)
+	var rmpFn encodeFn
 	if b.DefaultWRmpPct != nil {
 		rmpFn = b.writeWRmp
 	}
@@ -2338,11 +2585,17 @@ func (b *Base) SetWMaxLimPctWPlan(w float64, tag string) (PlanOutcome, error) {
 	if err != nil {
 		return out, err
 	}
-	isolated, werr := b.write704Rmp(tag, "SetWMaxLimPctW", []ctrlMode{modeMaxW}, func(v sunspec.View) {
+	isolated, werr := b.write704Rmp(tag, "SetWMaxLimPctW", []ctrlMode{modeMaxW}, func(v sunspec.View) error {
+		// IW15-022: the ceiling before its enable. WMaxLimPctEna=1 over a
+		// stale WMaxLimPct is a curtailment at the WRONG percentage — and
+		// because a ceiling only bites when production reaches it, a wrong
+		// one can sit unnoticed until the day it matters.
+		if err := v.SetFloat("WMaxLimPct", pct); err != nil {
+			return err
+		}
 		v.SetBool("WMaxLimPctEna", true)
-		v.SetFloat("WMaxLimPct", pct)
 		v.SetU32("WMaxLimPctRvrtTms", b.DefaultRvrtTms)
-		rvrtFn(v)
+		return rvrtFn(v)
 	}, rmpFn)
 	if werr != nil {
 		return out, werr
@@ -2373,23 +2626,32 @@ func (b *Base) wRmpRefEnum() uint16 {
 // value whenever the caller has a rate to assert (§3.2's "written every
 // write cycle" discipline, cheap because write704 is already a whole-block
 // RMW), and a complete no-op — byte-identical to today — when it does not.
-func (b *Base) writeWRmp(v sunspec.View) {
+//
+// IW15-022: this is an encodeFn and propagates SetFloat's error, but it can
+// never actually raise one — 704 declares WRmp, VarRmp and WRmpRef as UNSCALED
+// points (F, not FS, in derlayout.go), so no scale factor is consulted and
+// there is nothing to refuse. The plumbing is here so that a future layout
+// revision which gives WRmp a scale factor cannot reintroduce the silent skip
+// through the one 704 writer that was exempt from it;
+// TestRampPointsAreUnscaled is what turns that "can never" into a checked fact
+// rather than a comment.
+func (b *Base) writeWRmp(v sunspec.View) error {
 	if b.DefaultWRmpPct == nil {
-		return
+		return nil
 	}
 	v.SetEnum("WRmpRef", b.wRmpRefEnum())
-	v.SetFloat("WRmp", *b.DefaultWRmpPct)
+	return v.SetFloat("WRmp", *b.DefaultWRmpPct)
 }
 
 // writeVarRmp is writeWRmp's VarSet-axis sibling (DefaultVarRmpPct → VarRmp).
 // Shares WRmpRef with writeWRmp since 704 carries only the one reference
-// register for both rate points.
-func (b *Base) writeVarRmp(v sunspec.View) {
+// register for both rate points, and shares its unscaled-points reasoning.
+func (b *Base) writeVarRmp(v sunspec.View) error {
 	if b.DefaultVarRmpPct == nil {
-		return
+		return nil
 	}
 	v.SetEnum("WRmpRef", b.wRmpRefEnum())
-	v.SetFloat("VarRmp", *b.DefaultVarRmpPct)
+	return v.SetFloat("VarRmp", *b.DefaultVarRmpPct)
 }
 
 func (b *Base) ReadDERCtlAC(tag string) (sunspec.ACControls, error) {
@@ -2418,6 +2680,13 @@ func (b *Base) ReadDERCapacity(tag string) (sunspec.Capacity, error) {
 
 // SetCapacityWMax overrides the nameplate active-power rating with an operator
 // setting (702 WMax). Demonstrates the writable rating-override path (§4.2).
+//
+// IW15-022: refuses rather than writing back a block in which WMax never
+// changed. This one is the SETTING every percent-of-capacity control on the
+// device converts against (IW15-002 settings-first), so a silently-skipped
+// write here is not one wrong register — it is a gateway that believes it
+// derated the plant and a device still converting every subsequent
+// WMaxLimPct against the old number. Nothing is sent on refusal.
 func (b *Base) SetCapacityWMax(w float64, tag string) error {
 	if !b.Has702 {
 		return fmt.Errorf("%s: device has no M702", tag)
@@ -2430,7 +2699,27 @@ func (b *Base) SetCapacityWMax(w float64, tag string) error {
 		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelDERCapacity,
 			Declared: len(regs), Required: sunspec.L702.Len(), Detail: "read returned short block"}
 	}
-	sunspec.L702.View(regs).SetFloat("WMax", w)
+	// NO whole-block ReadLooksCorrupt() guard here, unlike write704Rmp and
+	// SetEnterService (audit E2) — deliberately, and this is the one place in
+	// the package where that asymmetry is correct rather than an oversight.
+	//
+	// ReadLooksCorrupt calls a block corrupt when ANY sunssf in it is outside
+	// the valid domain, and the 0x8000 that an UNIMPLEMENTED scale factor
+	// carries is outside the valid domain. Model 702 declares all seven of its
+	// scale factors OPTIONAL (measured: TestScalarModelScaleFactorsAreOptional-
+	// UnlikeTheCurves), and they span ratings a given machine may genuinely not
+	// have — S_SF for reactive susceptance, A_SF, VA_SF. So a perfectly
+	// conformant inverter that simply does not publish those would have every
+	// WMax override refused as a "corrupt read", forever, on the strength of
+	// registers this write never touches.
+	//
+	// The precise guard is the one below: SetFloat refuses exactly when
+	// W_SF — the scale factor THIS value is encoded against — cannot be read,
+	// names it, and leaves the path open otherwise. That is IW15-022's fix
+	// doing the job a whole-block heuristic would do worse here.
+	if err := sunspec.L702.View(regs).SetFloat("WMax", w); err != nil {
+		return fmt.Errorf("%s: set M702 WMax: %w", tag, err)
+	}
 	return b.Reader.WriteModel(sunspec.ModelDERCapacity, 0, regs[:sunspec.L702.Len()])
 }
 

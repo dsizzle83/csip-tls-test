@@ -105,7 +105,11 @@ func NewBatteryServer(listenURL string, wmaxKwh, wmaxW float64) (*BatteryServer,
 	// Install the hub-write hook before the Modbus server starts so the
 	// assignment is never concurrent with a handler reading it (finding MOD-3).
 	regs.OnWrite = func(startAddr uint16) {
-		if startAddr >= bases.M123Base && startAddr < bases.M123Base+23 {
+		// The bound comes from the LAYOUT, not from a restated 23. It was 23,
+		// and the published model has 24 data registers — so a write landing on
+		// the block's last register (VArPct_SF) fell outside this hook and the
+		// battery never reacted to it. See m123.go.
+		if startAddr >= bases.M123Base && startAddr < bases.M123Base+M123Len() {
 			applyHubBatteryWrite(regs, bases, wmaxW, &bs.faults)
 		}
 	}
@@ -526,16 +530,13 @@ func populateBatteryCore(r *RegisterMap, wmaxKwh, wmaxW float64) (BatteryBases, 
 	r.Set(m103Base+sunspec.M103_St, 8)
 	cursor += 2 + m103Len
 
-	// Model 123 (Immediate Controls) — 23 data regs
-	const m123Len = 23
-	r.Set(cursor, sunspec.ModelImmediateCtrl)
-	r.Set(cursor+1, m123Len)
+	// Model 123 (Immediate Controls), from sunspec.L123 by name — see m123.go.
+	// The battery rests with the limit CLEAR and DISABLED: the gateway's first
+	// write is what takes control of the axis.
 	m123Base := cursor + 2
-	r.Set(m123Base+sunspec.M123_WMaxLimPct, 0)
-	r.Set(m123Base+sunspec.M123_WMaxLimPct_Ena, 0) // hub sets Ena=1 when it takes control
-	r.Set(m123Base+sunspec.M123_WMaxLimPct_SF, sfN(-2))
-	r.Set(m123Base+sunspec.M123_Conn, 1)
-	cursor += 2 + m123Len
+	cursor += PopulateM123(r, cursor, M123Defaults{
+		WMaxLimPctRaw: 0, WMaxLimPctSF: -2, WMaxLimEna: 0, Conn: 1,
+	})
 
 	// Model 802 (Li-Ion Battery Base) — 26 data regs
 	r.Set(cursor, sunspec.ModelLithiumBattery)

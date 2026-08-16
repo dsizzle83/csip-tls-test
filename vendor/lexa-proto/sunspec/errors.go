@@ -31,14 +31,21 @@ func (e *GeometryError) Unwrap() error { return ErrGeometryUnknown }
 // ErrScaleFactorUnavailable is the sentinel for "this point was commanded, but
 // the scale factor it is encoded against cannot be read".
 //
-// The View setters (SetScaledUintAt / SetScaledSignedAt / SetScaledU32At /
-// SetFloat) return SILENTLY when View.SF fails — the scale-factor point is
-// absent, carries the 0x8000 not-implemented sentinel, or is outside the sunssf
-// domain [−10,+10] (LXR-004). Silence is the wrong answer for a COMMANDED
-// value: the register keeps whatever it held, the encoder reports success, and
-// the read-back comparison becomes the only thing standing between that and a
-// control the operator believes is in force. The 7xx curve encoders surface it
-// instead of swallowing it.
+// The OFFSET-ADDRESSED View setters (SetScaledUintAt / SetScaledSignedAt /
+// SetScaledU32At) return SILENTLY when View.SF fails — the scale-factor point
+// is absent, carries the 0x8000 not-implemented sentinel, or is outside the
+// sunssf domain [−10,+10] (LXR-004). Silence is the wrong answer for a
+// COMMANDED value: the register keeps whatever it held, the encoder reports
+// success, and the read-back comparison becomes the only thing standing
+// between that and a control the operator believes is in force. Those three
+// are reachable ONLY through der1547.go's setScaledUint/setScaledSigned/
+// setScaledU32 wrappers, which pre-check the scale factor and raise this
+// error, so the silent tier has no caller that can drop a commanded value.
+//
+// View.SetFloat — the NAME-addressed setter derbase's scalar writers use —
+// raises it directly rather than through a wrapper (IW15-022): it can resolve
+// the point's scale-factor binding, and the model label, from the layout
+// itself, so there is nothing for a wrapper to supply.
 //
 // A value the caller did NOT command (NaN) never raises this: a device is
 // entitled not to implement a scale factor for a point nobody is writing.
@@ -48,18 +55,57 @@ var ErrScaleFactorUnavailable = errors.New("sunspec: scale factor unreadable for
 // scale-factor register that was unreadable. It unwraps to
 // ErrScaleFactorUnavailable.
 type ScaleFactorError struct {
-	Model  string  // model label, e.g. "M705"
+	Model  string  // model label, e.g. "M705"; "" for an unlabelled layout
 	Point  string  // the point being written, e.g. "VRef"
 	SFName string  // the scale-factor point that could not be read
 	Value  float64 // the engineering value that was commanded
 }
 
 func (e *ScaleFactorError) Error() string {
-	return fmt.Sprintf("sunspec: %s point %s: cannot encode %g — scale factor %s is absent, "+
-		"not implemented, or outside the sunssf domain", e.Model, e.Point, e.Value, e.SFName)
+	return fmt.Sprintf("sunspec: %spoint %s: cannot encode %g — scale factor %s is absent, "+
+		"not implemented, or outside the sunssf domain",
+		modelPrefix(e.Model), e.Point, e.Value, e.SFName)
 }
 
 func (e *ScaleFactorError) Unwrap() error { return ErrScaleFactorUnavailable }
+
+// ErrPointNotEncodable is the sentinel for a commanded value whose point has no
+// scaled-float encoding at all.
+//
+// View.SetFloat encodes the 16- and 32-bit numeric types. A 64-bit point, a
+// string or a pad has no arm in its type switch, so before IW15-022 a caller
+// that named one had its value silently discarded — the same "commanded value
+// dropped, success reported" shape as the scale-factor skip, reached by a
+// different route. No caller inside this module can produce it (every SetFloat
+// target in models 702/703/704 is 16- or 32-bit, and 64-bit points are written
+// through their own helpers), which is exactly why it survived unnoticed.
+var ErrPointNotEncodable = errors.New("sunspec: point type has no scaled-float encoding")
+
+// PointTypeError names a declared point whose type SetFloat cannot encode. It
+// unwraps to ErrPointNotEncodable.
+type PointTypeError struct {
+	Model string  // model label, e.g. "M802"; "" for an unlabelled layout
+	Point string  // the point being written
+	Value float64 // the engineering value that was commanded
+}
+
+func (e *PointTypeError) Error() string {
+	return fmt.Sprintf("sunspec: %spoint %s: cannot encode %g — SetFloat covers the 16- and "+
+		"32-bit numeric types only; 64-bit, string and pad points need their own writer",
+		modelPrefix(e.Model), e.Point, e.Value)
+}
+
+func (e *PointTypeError) Unwrap() error { return ErrPointNotEncodable }
+
+// modelPrefix renders a layout label for an error message, or nothing at all
+// when the layout was never labelled — a consumer-built layout should read
+// "sunspec: point Crv1.Pt1.V: ..." rather than "sunspec:  point ...".
+func modelPrefix(model string) string {
+	if model == "" {
+		return ""
+	}
+	return model + " "
+}
 
 // ErrNotRepresentable is the sentinel for a value that cannot be encoded at the
 // device's declared scale factor.

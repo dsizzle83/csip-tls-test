@@ -613,6 +613,12 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (res certify.Result, r
 	return certify.Result{
 		Verdict: declared,
 		Notes:   notes,
+		// The DUT's own counter readings this row took across its own window
+		// (IW15-030, disclosure.go). They travel on the Result so the runner
+		// persists their RAW exposition bodies into the bundle and verify
+		// re-derives every delta from them — a number a check merely printed
+		// into a note would be a claim a reader has to take on trust.
+		Metrics: d.metrics,
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			t, rerr := RecoverSession(ev, target)
 			if rerr != nil {

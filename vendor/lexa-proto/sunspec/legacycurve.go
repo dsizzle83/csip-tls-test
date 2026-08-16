@@ -108,7 +108,7 @@ var L126Hdr = NewLayout(
 	F("V_SF", Tsunssf).R().M(),
 	F("DeptRef_SF", Tsunssf).R().M(),
 	F("RmpIncDec_SF", Tsunssf).R().O(),
-)
+).As("M126Hdr")
 
 // L129Hdr is model 129's (LVRT Must Disconnect) header. 129 and 130 carry a
 // Pad in the slot 126 uses for RmpIncDec_SF — they have no ramp points.
@@ -123,7 +123,7 @@ var L129Hdr = NewLayout(
 	F("Tms_SF", Tsunssf).R().M(),
 	F("V_SF", Tsunssf).R().M(),
 	FPad("Pad", 1).R().O(),
-)
+).As("M129Hdr")
 
 // L130Hdr is model 130's (HVRT Must Disconnect) header — identical in shape to
 // 129's, declared separately so the two models never share a mutable binding.
@@ -138,7 +138,7 @@ var L130Hdr = NewLayout(
 	F("Tms_SF", Tsunssf).R().M(),
 	F("V_SF", Tsunssf).R().M(),
 	FPad("Pad", 1).R().O(),
-)
+).As("M130Hdr")
 
 // L131Hdr is model 131's (Watt-PF) header.
 var L131Hdr = NewLayout(
@@ -152,7 +152,7 @@ var L131Hdr = NewLayout(
 	F("W_SF", Tsunssf).R().M(),
 	F("PF_SF", Tsunssf).R().M(),
 	F("RmpIncDec_SF", Tsunssf).R().O(),
-)
+).As("M131Hdr")
 
 // L132Hdr is model 132's (Volt-Watt) header.
 var L132Hdr = NewLayout(
@@ -166,7 +166,7 @@ var L132Hdr = NewLayout(
 	F("V_SF", Tsunssf).R().M(),
 	F("DeptRef_SF", Tsunssf).R().M(),
 	F("RmpIncDec_SF", Tsunssf).R().O(),
-)
+).As("M132Hdr")
 
 // L134Hdr is model 134's (Curve-Based Frequency-Watt) header.
 var L134Hdr = NewLayout(
@@ -180,7 +180,7 @@ var L134Hdr = NewLayout(
 	F("Hz_SF", Tsunssf).R().M(),
 	F("W_SF", Tsunssf).R().M(),
 	F("RmpIncDec_SF", Tsunssf).R().O(),
-)
+).As("M134Hdr")
 
 // ── Curve banks ──────────────────────────────────────────────────────────────
 
@@ -231,7 +231,7 @@ var L126Crv = NewLayout(joinFields(
 		FS("RmpIncTmm", Tuint16, "RmpIncDec_SF").RW().O(),
 		F("ReadOnly", Tenum16).R().M(), // 0 READWRITE, 1 READONLY
 	},
-)...)
+)...).As("M126Crv")
 
 // L129Crv is one 129 curve bank (50 registers). The pair is (Tms<n>, V<n>) —
 // TIME FIRST, the opposite of the CSIP ride-through curve convention, which
@@ -245,7 +245,7 @@ var L129Crv = NewLayout(joinFields(
 		FStr("CrvNam", 8).RW().O(),
 		F("ReadOnly", Tenum16).R().M(),
 	},
-)...)
+)...).As("M129Crv")
 
 // L130Crv is one 130 curve bank (50 registers) — same shape as 129's.
 var L130Crv = NewLayout(joinFields(
@@ -255,7 +255,7 @@ var L130Crv = NewLayout(joinFields(
 		FStr("CrvNam", 8).RW().O(),
 		F("ReadOnly", Tenum16).R().M(),
 	},
-)...)
+)...).As("M130Crv")
 
 // L131Crv is one 131 curve bank (54 registers). No DeptRef: the x-axis
 // reference is fixed at %WMax by the spec. Note the trailing Pad — 131 is the
@@ -273,7 +273,7 @@ var L131Crv = NewLayout(joinFields(
 		F("ReadOnly", Tenum16).R().M(),
 		FPad("Pad", 1).R().O(),
 	},
-)...)
+)...).As("M131Crv")
 
 // L132Crv is one 132 curve bank (54 registers).
 //
@@ -295,7 +295,7 @@ var L132Crv = NewLayout(joinFields(
 		FS("RmpIncTmm", Tuint16, "RmpIncDec_SF").RW().O(),
 		F("ReadOnly", Tenum16).R().M(),
 	},
-)...)
+)...).As("M132Crv")
 
 // L134Crv is one 134 curve bank (58 registers) — the longest in the family.
 //
@@ -326,7 +326,7 @@ var L134Crv = NewLayout(joinFields(
 		FS("WRefStopHz", Tuint16, "Hz_SF").RW().O(),
 		F("ReadOnly", Tenum16).R().M(),
 	},
-)...)
+)...).As("M134Crv")
 
 // ── Models with no repeating group ───────────────────────────────────────────
 
@@ -346,7 +346,7 @@ var L127 = NewLayout(
 	F("HzStrStop_SF", Tsunssf).R().O(),
 	F("RmpIncDec_SF", Tsunssf).R().O(),
 	FPad("Pad", 1).R().O(),
-)
+).As("M127")
 
 // L128 is model 128, Dynamic Reactive Current (body length 14, L = 14).
 //
@@ -371,7 +371,7 @@ var L128 = NewLayout(
 	F("ArGra_SF", Tsunssf).R().M(),
 	F("VRefPct_SF", Tsunssf).R().O(),
 	FPad("Pad", 1).R().O(),
-)
+).As("M128")
 
 // ── Model 160: Multiple MPPT ─────────────────────────────────────────────────
 
@@ -389,7 +389,7 @@ var L160Hdr = NewLayout(
 	F("Evt", Tbitfield32).R().O(),
 	F("N", Tuint16).R().O(), // JSON type "count"
 	F("TmsPer", Tuint16).R().O(),
-)
+).As("M160Hdr")
 
 // L160Mod is one 160 module block (20 registers) at body offset 8 + 20·i,
 // i 0-based. DCWH is an acc32: its not-implemented sentinel is 0, not
@@ -405,7 +405,7 @@ var L160Mod = NewLayout(
 	F("Tmp", Tint16).R().O(), // degrees C, UNSCALED (no sf in the spec)
 	F("DCSt", Tenum16).R().O(),
 	F("DCEvt", Tbitfield32).R().O(),
-)
+).As("M160Mod")
 
 // ── Model registry ───────────────────────────────────────────────────────────
 

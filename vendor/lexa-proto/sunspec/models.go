@@ -297,30 +297,152 @@ const (
 	M203_PF_SF   = 35
 )
 
-// ── Model 123 (Immediate Controls) register offsets ───────────────────────────
+// ── Model 123 (Immediate Controls) ───────────────────────────────────────────
+//
 // Writes to these registers take immediate effect on the inverter.
+//
+// # This map was WRONG at every one of its 24 points until 2026-08-15
+//
+// Model 123 was the last register map in this package still driven by
+// hand-written offset constants: it never got the NewLayout-against-vendored-
+// JSON treatment every other legacy model (126-134, 160) received, so nothing
+// ever compared it to the standard. The hand transcription put the four
+// function groups in the wrong ORDER — it leads with WMaxLimPct where the
+// published model leads with the Conn group — so every constant was off by
+// between 1 and 9 registers. Two of those are load-bearing for safety on a
+// conformant legacy DER:
+//
+//   - The failsafe CEASE for a 704-less pack wrote offset 16 believing it was
+//     Conn. A conformant device holds VArPct_WinTms there, so the pack STAYED
+//     ENERGIZED — and because the plan's L1 echo proof re-reads the same offset
+//     it just wrote, the read-back matched and the gateway reported a PROVEN
+//     disconnect that never happened. A safety proof cannot be built out of an
+//     echo of the writer's own belief.
+//   - A commanded curtailment wrote the percentage to offset 0 believing it was
+//     WMaxLimPct. A conformant device holds Conn_WinTms there, in SECONDS: a
+//     60.00 % ceiling at SF −2 encodes to raw 6000 and became a 6000-second
+//     connect window, curtailing nothing.
+//
+// Nothing caught it because the bench sim built its model-123 block from these
+// same constants, so fixture and product agreed with each other and both
+// disagreed with the standard — the shared-oracle blindness this package keeps
+// re-learning (11e8b7d's width oracle was the previous instance).
+//
+// L123 is now derived from docs/schema/sunspec-models/model_123.json like every
+// other model, and TestLayoutsMatchVendoredSpec compares it against the JSON's
+// own names, types, widths and accumulated offsets.
+var L123 = NewLayout(
+	F("Conn_WinTms", Tuint16).RW().O(),
+	F("Conn_RvrtTms", Tuint16).RW().O(),
+	F("Conn", Tenum16).RW().M(),
+	FS("WMaxLimPct", Tuint16, "WMaxLimPct_SF").RW().M(),
+	F("WMaxLimPct_WinTms", Tuint16).RW().O(),
+	F("WMaxLimPct_RvrtTms", Tuint16).RW().O(),
+	F("WMaxLimPct_RmpTms", Tuint16).RW().O(),
+	F("WMaxLim_Ena", Tenum16).RW().M(),
+	FS("OutPFSet", Tint16, "OutPFSet_SF").RW().M(),
+	F("OutPFSet_WinTms", Tuint16).RW().O(),
+	F("OutPFSet_RvrtTms", Tuint16).RW().O(),
+	F("OutPFSet_RmpTms", Tuint16).RW().O(),
+	F("OutPFSet_Ena", Tenum16).RW().M(),
+	FS("VArWMaxPct", Tint16, "VArPct_SF").RW().O(),
+	FS("VArMaxPct", Tint16, "VArPct_SF").RW().O(),
+	FS("VArAvalPct", Tint16, "VArPct_SF").RW().O(),
+	F("VArPct_WinTms", Tuint16).RW().O(),
+	F("VArPct_RvrtTms", Tuint16).RW().O(),
+	F("VArPct_RmpTms", Tuint16).RW().O(),
+	F("VArPct_Mod", Tenum16).RW().O(),
+	F("VArPct_Ena", Tenum16).RW().M(),
+	F("WMaxLimPct_SF", Tsunssf).R().M(),
+	F("OutPFSet_SF", Tsunssf).R().M(),
+	F("VArPct_SF", Tsunssf).R().O(),
+).As("M123")
+
+// M123 register offsets. The VALUES below are the published model's; the names
+// are unchanged from the wrong-valued originals ON PURPOSE. Every consumer
+// references them by name (swept: lexa-proto, lexa-gw, csip-tls-test — no site
+// hard-codes a model-123 offset independently), so correcting the values here
+// heals the failsafe path, the curtailment path, the reconcilers and all three
+// repos' fixtures at re-vendor with no call-site edits. A rename would have
+// turned a precise data fix into a wide diff nobody could review as one.
+//
+// # Why these are restated constants and not L123.Offset(...) calls
+//
+// Deriving them was tried first and reverted. L123.Offset returns int, so
+// derived offsets become typed `int` vars — and that breaks the two things
+// untyped constants currently do for every caller in three repos: implicit
+// conversion at a uint16 parameter (Reader.WriteModel takes a uint16 offset,
+// used at 8 sites in this package alone and more in lexa-gw) and comparison
+// against len(regs), which is int. There is no single Go type that does both;
+// only an untyped constant does. Breaking every consumer's call sites to
+// enforce single-sourcing would have cost more than the drift it prevents,
+// especially in a fix whose entire value is that consumers need not be touched.
+//
+// The drift is prevented instead by TestM123ConstantsMatchTheLayout, which
+// asserts every constant below equals its layout offset by NAME. That closes
+// the loop three ways: constants are proven against L123, L123 is proven
+// against the vendored JSON (TestLayoutsMatchVendoredSpec), and the JSON is the
+// standard. The old map had none of those links, which is why it was wrong for
+// as long as it was.
 const (
-	M123_WMaxLimPct      = 0  // active power limit as % of WMax (uint16, WMaxLimPct_SF)
-	M123_WMaxLimPct_WinTms  = 1  // ramp window (uint16, seconds)
-	M123_WMaxLimPct_RvrtTms = 2  // revert time (uint16, seconds)
-	M123_WMaxLimPct_RmpTms  = 3  // ramp time (uint16, seconds)
-	M123_WMaxLimPct_Ena  = 4  // enable WMaxLimPct (uint16: 0=disabled 1=enabled)
-	M123_OutPFSet        = 5  // output power factor (int16, OutPFSet_SF)
-	M123_OutPFSet_WinTms = 6
-	M123_OutPFSet_RvrtTms = 7
-	M123_OutPFSet_RmpTms = 8
-	M123_OutPFSet_Ena    = 9  // enable OutPFSet (uint16)
-	M123_VArPct_Mod      = 10 // VAr percent mode (uint16)
-	M123_VArPct          = 11 // VAr command as % of nameplate (int16, VArPct_SF)
-	M123_VArPct_WinTms   = 12
-	M123_VArPct_RvrtTms  = 13
-	M123_VArPct_RmpTms   = 14
-	M123_VArPct_Ena      = 15 // enable VArPct (uint16)
-	M123_Conn            = 16 // connect/disconnect (uint16: 0=disconnect 1=connect)
-	M123_Conn_WinTms     = 17 // connect window time (uint16, seconds)
-	M123_Conn_RvrtTms    = 18 // revert time (uint16, seconds)
-	M123_Conn_RmpTms     = 19 // ramp time (uint16, seconds)
-	M123_WMaxLimPct_SF   = 20 // WMaxLimPct scale factor (int16)
-	M123_OutPFSet_SF     = 21 // OutPFSet scale factor (int16)
-	M123_VArPct_SF       = 22 // VArPct scale factor (int16)
+	M123_Conn_WinTms  = 0
+	M123_Conn_RvrtTms = 1
+	M123_Conn         = 2 // 0=disconnect 1=connect
+
+	M123_WMaxLimPct         = 3 // % of WMax (uint16, WMaxLimPct_SF)
+	M123_WMaxLimPct_WinTms  = 4
+	M123_WMaxLimPct_RvrtTms = 5
+	M123_WMaxLimPct_RmpTms  = 6
+	// The published point is spelled WMaxLim_Ena, with no "Pct". The constant
+	// keeps the old spelling because every consumer names it; the LAYOUT
+	// carries the spec's spelling, which is what the spec test compares.
+	M123_WMaxLimPct_Ena = 7
+
+	M123_OutPFSet         = 8 // int16, OutPFSet_SF
+	M123_OutPFSet_WinTms  = 9
+	M123_OutPFSet_RvrtTms = 10
+	M123_OutPFSet_RmpTms  = 11
+	M123_OutPFSet_Ena     = 12
+
+	// THE REACTIVE VALUE IS A MODE-SELECTED TRIO, not one register. The old map
+	// collapsed all three into a single "M123_VArPct", which is half of how a
+	// 24-point model became a 23-point one. VArPct_Mod names which of the three
+	// the device applies, and the JSON's own symbols pair them 1:1:
+	//   VArPct_Mod = 1 (WMax)    → VArWMaxPct
+	//   VArPct_Mod = 2 (VArMax)  → VArMaxPct
+	//   VArPct_Mod = 3 (VArAval) → VArAvalPct
+	M123_VArWMaxPct = 13
+	M123_VArMaxPct  = 14
+	M123_VArAvalPct = 15
+
+	// M123_VArPct is a COMPATIBILITY ALIAS for VArMaxPct, correct only for a
+	// caller that writes VArPct_Mod = 2 (VArMax). That is what the sole
+	// consumer does today — lexa-gw cmd/modbus/reconcile_adv.go writes
+	// varPctModVArMax = 2 immediately before the value — so the alias makes
+	// that path correct at re-vendor with no call-site edit. A caller writing
+	// any other mode MUST name the matching register above: the alias cannot
+	// follow the mode, and a mode/value mismatch commands a reactive setpoint
+	// against a base the device did not select.
+	M123_VArPct = M123_VArMaxPct
+
+	M123_VArPct_WinTms  = 16
+	M123_VArPct_RvrtTms = 17
+	M123_VArPct_RmpTms  = 18
+	M123_VArPct_Mod     = 19
+	M123_VArPct_Ena     = 20
+
+	M123_WMaxLimPct_SF = 21
+	M123_OutPFSet_SF   = 22
+	M123_VArPct_SF     = 23
 )
+
+// M123_Conn_RmpTms is DELETED, not corrected: model 123 declares no ramp
+// register for the Conn group at all. The old map invented one at offset 19,
+// where the published model holds VArPct_Mod — so a caller "setting the connect
+// ramp time" was rewriting the reactive-power mode selector. Inventing that
+// point is the other half of how the block came out 23 long: one register
+// invented, two lost to the merged VAr trio.
+//
+// Deleted rather than left as a wrong-but-compiling constant. The only
+// remaining reference anywhere is csip-tls-test's divergence-record test, which
+// exists precisely to be rewritten when this lands.

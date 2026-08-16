@@ -168,19 +168,69 @@ func Parse703(regs []uint16) EnterService {
 
 // Encode703 writes the writable model 703 fields into a freshly-read register
 // slice. Scale factors must already be present in regs (read the model first).
+//
+// PLAN, THEN APPLY (IW15-022). regs is the CALLER's buffer — unlike derbase's
+// 704 writers, which encode into a slice their own read allocated and throw
+// away on any error — so a mid-encode refusal here would hand the caller a
+// half-written block: enter-service ENABLED with the voltage window it is
+// supposed to be enabled under still at the device's previous values. That is
+// worse than either outcome the refusal is choosing between. So every scaled
+// point is checked against the block's live scale factors BEFORE the first
+// register moves, and a refusal leaves regs byte-identical
+// (TestEncode703RefusalLeavesTheCallerBufferUntouched).
+//
+// A NaN field is "not commanded" and is neither checked nor written: Parse703
+// returns NaN for a point the device does not implement, so a read-modify-write
+// round trip must not turn an absent point into a refusal.
 func Encode703(regs []uint16, s EnterService) error {
 	if len(regs) < L703.Len() {
 		return fmt.Errorf("sunspec: M703 slice too short (%d < %d)", len(regs), L703.Len())
 	}
 	v := L703.View(regs)
+	// Plan: every scaled point, resolved against the live block, no writes.
+	scaled := []struct {
+		point string
+		val   float64
+	}{
+		{"ESVHi", s.VHi}, {"ESVLo", s.VLo}, {"ESHzHi", s.HzHi}, {"ESHzLo", s.HzLo},
+	}
+	for _, p := range scaled {
+		if err := checkScaled(v, p.point, p.val); err != nil {
+			return err
+		}
+	}
+	// Apply: nothing below can fail — the scaled points were just proven
+	// encodable, and SetBool/SetU32 consult no scale factor.
 	v.SetBool("ES", s.Enabled)
-	v.SetFloat("ESVHi", s.VHi)
-	v.SetFloat("ESVLo", s.VLo)
-	v.SetFloat("ESHzHi", s.HzHi)
-	v.SetFloat("ESHzLo", s.HzLo)
+	for _, p := range scaled {
+		if err := v.SetFloat(p.point, p.val); err != nil {
+			return err // unreachable; a changed plan/apply pair must not go silent
+		}
+	}
 	v.SetU32("ESDlyTms", s.DelayS)
 	v.SetU32("ESRndTms", s.RandomS)
 	v.SetU32("ESRmpTms", s.RampS)
+	return nil
+}
+
+// checkScaled asks whether View.SetFloat would refuse this point, without
+// writing anything — the "plan" half of a plan-then-apply encoder. It answers
+// with the same error SetFloat itself would raise, so the two cannot drift in
+// what they refuse or in how they name it.
+func checkScaled(v View, point string, val float64) error {
+	if math.IsNaN(val) {
+		return nil // not commanded
+	}
+	f, ok := v.l.FieldOf(point)
+	if !ok {
+		return nil // not declared by this layout — SetFloat's documented no-op
+	}
+	if f.SF == "" {
+		return nil // unscaled: SetFloat consults no scale factor
+	}
+	if _, ok := v.SF(f.SF); !ok {
+		return &ScaleFactorError{Model: v.l.name, Point: point, SFName: f.SF, Value: val}
+	}
 	return nil
 }
 

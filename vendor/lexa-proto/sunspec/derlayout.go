@@ -75,7 +75,7 @@ var L701 = NewLayout(
 	// in the chain 16 registers low. See derlayout_test.go's
 	// TestModel701LengthMatchesSunSpecDefinition for the full derivation.
 	FStr("MnAlrmInfo", 32),
-)
+).As("M701")
 
 // ── Model 701: PF is SIGNED (int16), and Table 4 is wrong ────────────────────
 //
@@ -160,7 +160,7 @@ var L702 = NewLayout(
 	// Scale factors
 	F("W_SF", Tsunssf), F("PF_SF", Tsunssf), F("VA_SF", Tsunssf), F("Var_SF", Tsunssf),
 	F("V_SF", Tsunssf), F("A_SF", Tsunssf), F("S_SF", Tsunssf),
-)
+).As("M702")
 
 // Model 702 CtrlModes bitfield32 — "supported control mode functions".
 // Bit values transcribed from the canonical model_702.json symbols array
@@ -191,7 +191,7 @@ var L703 = NewLayout(
 	F("ESDlyTms", Tuint32), F("ESRndTms", Tuint32), F("ESRmpTms", Tuint32),
 	F("ESDlyRemTms", Tuint32),
 	F("V_SF", Tsunssf), F("Hz_SF", Tsunssf),
-)
+).As("M703")
 
 // ── Model 704: DER AC Controls ───────────────────────────────────────────────
 // Spec Table 7 — full model including reversion timers, Set Active Power,
@@ -221,7 +221,7 @@ var L704 = NewLayout(
 	FS("PFWInjRvrt_PF", Tuint16, "PF_SF"), F("PFWInjRvrt_Ext", Tenum16),
 	FS("PFWAbs_PF", Tuint16, "PF_SF"), F("PFWAbs_Ext", Tenum16),
 	FS("PFWAbsRvrt_PF", Tuint16, "PF_SF"), F("PFWAbsRvrt_Ext", Tenum16),
-)
+).As("M704")
 
 // 704 enum values (CSIP↔SunSpec mapping helpers).
 const (
@@ -248,13 +248,13 @@ var L705Hdr = NewLayout(
 	F("NPt", Tuint16), F("NCrv", Tuint16),
 	F("RvrtTms", Tuint32), F("RvrtRem", Tuint32), F("RvrtCrv", Tuint16),
 	F("V_SF", Tsunssf), F("DeptRef_SF", Tsunssf), F("RspTms_SF", Tsunssf),
-)
+).As("M705Hdr")
 var L705Crv = NewLayout(
 	F("ActPt", Tuint16), F("DeptRef", Tenum16), F("Pri", Tenum16),
 	FS("VRef", Tuint16, "V_SF"), FS("VRefAuto", Tuint16, "V_SF"),
 	F("VRefAutoEna", Tenum16), F("VRefAutoTms", Tuint16),
 	FS("RspTms", Tuint32, "RspTms_SF"), F("ReadOnly", Tenum16),
-) // followed by NPt × {V uint16 V_SF, Var int16 DeptRef_SF}
+).As("M705Crv") // followed by NPt × {V uint16 V_SF, Var int16 DeptRef_SF}
 
 // Model 706 (DER Volt-Watt) — P(V). Spec Table 9.
 var L706Hdr = NewLayout(
@@ -262,11 +262,11 @@ var L706Hdr = NewLayout(
 	F("NPt", Tuint16), F("NCrv", Tuint16),
 	F("RvrtTms", Tuint32), F("RvrtRem", Tuint32), F("RvrtCrv", Tuint16),
 	F("V_SF", Tsunssf), F("DeptRef_SF", Tsunssf), F("RspTms_SF", Tsunssf),
-)
+).As("M706Hdr")
 var L706Crv = NewLayout(
 	F("ActPt", Tuint16), F("DeptRef", Tenum16),
 	FS("RspTms", Tuint32, "RspTms_SF"), F("ReadOnly", Tenum16),
-) // followed by NPt × {V uint16 V_SF, W int16 DeptRef_SF}
+).As("M706Crv") // followed by NPt × {V uint16 V_SF, W int16 DeptRef_SF}
 
 // Models 707/708 (DER Trip LV/HV). Spec Table 10/11. Three curves per set:
 // MustTrip, MayTrip, MomCess — each {ActPt + NPt×(V uint16 V_SF, Tms uint32 Tms_SF)}.
@@ -274,7 +274,7 @@ var L707Hdr = NewLayout(
 	F("Ena", Tenum16), F("AdptCrvReq", Tuint16), F("AdptCrvRslt", Tenum16),
 	F("NPt", Tuint16), F("NCrvSet", Tuint16),
 	F("V_SF", Tsunssf), F("Tms_SF", Tsunssf),
-)
+).As("M707Hdr")
 
 // Models 709/710 (DER Trip LF/HF). Spec Table 12/13. Frequency points are
 // uint32, so each point is {Hz uint32 Hz_SF, Tms uint32 Tms_SF}.
@@ -282,7 +282,7 @@ var L709Hdr = NewLayout(
 	F("Ena", Tenum16), F("AdptCrvReq", Tuint16), F("AdptCrvRslt", Tenum16),
 	F("NPt", Tuint16), F("NCrvSet", Tuint16),
 	F("Hz_SF", Tsunssf), F("Tms_SF", Tsunssf),
-)
+).As("M709Hdr")
 
 // Model 711 (DER Frequency Droop). Spec Table 14.
 var L711Hdr = NewLayout(
@@ -290,12 +290,12 @@ var L711Hdr = NewLayout(
 	F("NCtl", Tuint16),
 	F("RvrtTms", Tuint32), F("RvrtRem", Tuint32), F("RvrtCtl", Tuint16),
 	F("Db_SF", Tsunssf), F("K_SF", Tsunssf), F("RspTms_SF", Tsunssf),
-)
+).As("M711Hdr")
 var L711Ctl = NewLayout(
 	FS("DbOf", Tuint32, "Db_SF"), FS("DbUf", Tuint32, "Db_SF"),
 	FS("KOf", Tuint16, "K_SF"), FS("KUf", Tuint16, "K_SF"),
 	FS("RspTms", Tuint32, "RspTms_SF"), F("PMin", Tint16), F("ReadOnly", Tenum16),
-)
+).As("M711Ctl")
 
 // Model 712 (DER Watt-Var) — Q(P). Spec Table 15.
 var L712Hdr = NewLayout(
@@ -303,10 +303,10 @@ var L712Hdr = NewLayout(
 	F("NPt", Tuint16), F("NCrv", Tuint16),
 	F("RvrtTms", Tuint32), F("RvrtRem", Tuint32), F("RvrtCrv", Tuint16),
 	F("W_SF", Tsunssf), F("DeptRef_SF", Tsunssf),
-)
+).As("M712Hdr")
 var L712Crv = NewLayout(
 	F("ActPt", Tuint16), F("DeptRef", Tenum16), F("Pri", Tenum16), F("ReadOnly", Tenum16),
-) // followed by NPt × {W int16 W_SF, Var int16 DeptRef_SF}
+).As("M712Crv") // followed by NPt × {W int16 W_SF, Var int16 DeptRef_SF}
 
 // ── Model 713: DER Storage Capacity ──────────────────────────────────────────
 // Spec Table 16 — the small operational-SoC model (corrected from the prior
@@ -316,7 +316,7 @@ var L713 = NewLayout(
 	FS("SoC", Tuint16, "Pct_SF"), FS("SoH", Tuint16, "Pct_SF"),
 	F("Sta", Tenum16),
 	F("WH_SF", Tsunssf), F("Pct_SF", Tsunssf),
-)
+).As("M713")
 
 // ── Model 714: DER DC Measurement ────────────────────────────────────────────
 // Spec Table 17. Fixed header followed by NPrt repeating port groups.
@@ -326,13 +326,13 @@ var L714Hdr = NewLayout(
 	FS("DCWhInj", Tuint64, "DCWH_SF"), FS("DCWhAbs", Tuint64, "DCWH_SF"),
 	F("DCA_SF", Tsunssf), F("DCV_SF", Tsunssf), F("DCW_SF", Tsunssf),
 	F("DCWH_SF", Tsunssf), F("Tmp_SF", Tsunssf),
-)
+).As("M714Hdr")
 var L714Prt = NewLayout(
 	F("PrtTyp", Tenum16), F("ID", Tuint16), FStr("IDStr", 8),
 	FS("DCA", Tint16, "DCA_SF"), FS("DCV", Tuint16, "DCV_SF"), FS("DCW", Tint16, "DCW_SF"),
 	FS("DCWhInj", Tuint64, "DCWH_SF"), FS("DCWhAbs", Tuint64, "DCWH_SF"),
 	FS("Tmp", Tint16, "Tmp_SF"), F("DCSta", Tenum16), F("DCAlrm", Tbitfield32),
-)
+).As("M714Prt")
 
 // ── Curve/port offset helpers ────────────────────────────────────────────────
 // These return the absolute (0-based) register offset of repeating sub-groups
