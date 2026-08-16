@@ -152,10 +152,33 @@ type modelBundle struct {
 // SolarServer/BatteryServer register images" T06.3 asks for: Regs is already
 // an exported field (no new accessor needed) and ApplyFault/Snapshot/Inject/
 // Registers are already public methods.
+// defaultMbapsInverterSerial is this sim's own SunSpec Model 1 serial.
+//
+// It is NOT modsim's "SN-SOLAR-001", and the difference is the point. Both sims
+// took that default, so the pairing their own -serial help text names as the
+// collision hazard — "modsim plus this mbapsdev" — collided BY DEFAULT, and the
+// help put the burden on an operator to notice and pass a flag.
+//
+// That mattered more than a duplicated string usually does. A gateway keying
+// device identity on manufacturer|model|serial dedupes two identical sims into
+// one device, and csip-tls-test's own referee now keys two mechanisms on that
+// same identity (internal/invariant/i3.go): with a collision it declines to
+// pair, which is SAFE but degraded — the ghost de-duplication and the
+// lying-peer exemption both switch off. A bench whose default configuration
+// silently disables a referee's mechanisms is a bench that reports less than it
+// could and says nothing about it.
+//
+// A distinct default costs nothing: -serial still overrides, the battery model
+// is untouched, and any caller that was already passing -serial is unaffected.
+const defaultMbapsInverterSerial = "SN-MBAPS-001"
+
 func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, error) {
 	const loopbackAny = "tcp://127.0.0.1:0"
 	switch kind {
 	case "inverter":
+		if serial == "" {
+			serial = defaultMbapsInverterSerial
+		}
 		srv, err := sim.NewSolarServerAdvanced(loopbackAny, wmax, serial)
 		if err != nil {
 			return nil, fmt.Errorf("mbapsdev: new inverter model: %w", err)
@@ -221,10 +244,9 @@ func main() {
 	keyFile := flag.String("key", "certs/mbaps/dev-server-key.pem", "device server private key")
 	apiPort := flag.Int("api-port", 6031, "HTTP API port (0 to disable)")
 	serial := flag.String("serial", "", "SunSpec Model 1 serial number (SN) override for the inverter "+
-		"model; empty keeps the default \"SN-SOLAR-001\" — set this so two co-located sims (e.g. modsim "+
-		"plus this mbapsdev) present distinct device identity to a downstream gateway that keys identity "+
-		"on manufacturer|model|serial. Ignored for -model battery, which keeps its own default "+
-		"(\"SN-BAT-001\") unchanged.")
+		"model; empty keeps this sim's own default \""+defaultMbapsInverterSerial+"\", which is distinct "+
+		"from modsim's \"SN-SOLAR-001\" so the documented two-sim bench is NOT identity-degraded before "+
+		"anyone passes a flag. Ignored for -model battery, which keeps its own default (\"SN-BAT-001\").")
 	fwVersion := flag.String("fw-version", "", "SunSpec Model 1 firmware version (Vr) override for either "+
 		"model; empty keeps the sim's built-in default. Vr is REQUIRED by the IEEE 1547-2018 profile "+
 		"\u00a73.2 Table 16, and a gateway mirroring this device northbound passes it through VERBATIM \u2014 it "+

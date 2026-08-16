@@ -500,3 +500,145 @@ func TestI3_WithoutIdentitiesTheWitnessesDoNotFold(t *testing.T) {
 			"is a lost finding", len(res.Keys), res.Keys)
 	}
 }
+
+// ── F1: an identity that names two devices names none ─────────────────────
+//
+// Both identity-keyed mechanisms assumed the identity picks out ONE device. On
+// real hardware it does; on this bench it need not — sim.go's static Populate
+// hardcodes SN-0001 with no override, and the animated sims' own -serial help
+// says co-located sims collide unless an operator sets them apart. The probes
+// below are the two ways that assumption fails, and they fail in opposite
+// mechanisms and the same direction: toward a finding nobody sees.
+
+// PROBE 1 (control). Distinct identities: two ghosts on two devices are two
+// findings, as they always were.
+func TestI3_DistinctIdentitiesKeepTwoGhostsSeparate(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	w := projectionWorld(t, obs, write, []DERView{
+		identified("der-a", "SunSpec Sim CSIP-Dev-5000 sn=SN-A", ghostRegs(t, 63)),
+		identified("der-b", "SunSpec Sim CSIP-Dev-5000 sn=SN-B", ghostRegs(t, 63)),
+	}, nil, "SunSpec Sim CSIP-Dev-5000 sn=SN-A", nil)
+
+	res := i3Verdict(t, w)
+	if res.Verdict != Fail {
+		t.Fatalf("I3 = %s, want FAIL: %s", res.Verdict, res.Reason)
+	}
+	if len(res.Keys) != 2 {
+		t.Fatalf("two ghosts on two distinctly-identified devices produced %d finding(s): %v",
+			len(res.Keys), res.Keys)
+	}
+	t.Logf("control — two devices, two findings: %v", res.Keys)
+}
+
+// PROBE 2. COLLIDING identities must still yield two findings.
+//
+// Folding on an identity two machines share would merge two genuinely distinct
+// ghosts into one key: one finding reported and one LOST — IW15-031's crime
+// through the very key that fixed it.
+func TestI3_CollidingIdentitiesDoNotMergeTwoGhosts(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	// The bench's own default, twice — sim.go:718's hardcoded SN-0001.
+	const collided = "SunSpec Sim CSIP-Dev-5000 sn=SN-0001"
+	w := projectionWorld(t, obs, write, []DERView{
+		identified("der-a", collided, ghostRegs(t, 63)),
+		identified("der-b", collided, ghostRegs(t, 63)),
+	}, nil, collided, nil)
+
+	res := i3Verdict(t, w)
+	if len(res.Keys) < 2 {
+		t.Fatalf("two ghosts on two devices sharing an identity produced %d finding(s): %v. Folding on "+
+			"an identity that names more than one machine MERGES distinct findings — one is reported and "+
+			"the other is lost, which is the crime the fold was introduced to stop",
+			len(res.Keys), res.Keys)
+	}
+	// And the degraded mode DISCLOSES ITSELF. A bundle whose de-duplication
+	// silently switched off looks exactly like one that had nothing to
+	// de-duplicate; the difference has to be in the evidence, not inferred.
+	var ambiguous, effect bool
+	for _, f := range res.Facts {
+		switch f.Key {
+		case "i3.identity.ambiguous":
+			ambiguous = true
+		case "i3.identity.effect":
+			effect = true
+		}
+	}
+	if !ambiguous || !effect {
+		t.Errorf("the colliding-identity run records no disclosure (ambiguous=%t effect=%t); a reader "+
+			"cannot tell a run whose mechanisms were OFF from one that had nothing to fold",
+			ambiguous, effect)
+	}
+	t.Logf("colliding identities — findings stay separate: %v", res.Keys)
+}
+
+// PROBE 3. A lie on der-a must not excuse a ghost der-b caused, when the two
+// share an identity.
+//
+// This is the worst of the three: der-a is lying AND holds the value, so the
+// identity "matches" the projection only because der-b's is identical. Pre-fix
+// the exemption fires and a real FAIL becomes the lying-peer-confound WARN —
+// gate #18's and #19's end-state, reached through the mechanism that closed
+// them.
+func TestI3_ACollidingIdentityDoesNotLetALieExcuseAnotherDevice(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	const collided = "SunSpec Sim CSIP-Dev-5000 sn=SN-0001"
+	w := projectionWorld(t, obs, write, []DERView{
+		identified("der-a-lying", collided, ghostRegs(t, 63)), // armed, and holds it
+		identified("der-b-ghost", collided, ghostRegs(t, 63)), // NOT armed, holds it too
+	}, nil, collided, armOn("der-a-lying", write.Add(-9*time.Second)))
+
+	res := i3Verdict(t, w)
+	if res.Verdict != Fail {
+		t.Fatalf("I3 = %s, want FAIL: %s", res.Verdict, res.Reason)
+	}
+	// THE RUN VERDICT DOES NOT DISCRIMINATE HERE, and the first draft of this
+	// test rested on it and proved nothing. der-b's OWN witness fails through
+	// the DER branch (`f.Target != v.Device`), which was always sound, so the
+	// run is FAIL whatever the projection branch decides — the same masking
+	// that made gate #19's first framing vacuous.
+	//
+	// The discriminating signal is whether the DUT'S PROJECTION was exempted.
+	// Pre-fix it folds onto the shared identity, der-a's lie "explains" it, and
+	// it contributes no finding at all. Post-fix the collision refuses both the
+	// fold and the exemption, so it stands as its own ghost.
+	var sawProjection bool
+	for _, k := range res.Keys {
+		if strings.Contains(k, "dut.unit1") {
+			sawProjection = true
+		}
+	}
+	if !sawProjection {
+		t.Fatalf("the DUT's projection contributed no finding: %v. der-a's lie was allowed to explain a "+
+			"value der-b also holds, because the two share an identity — a ghost with an independent "+
+			"cause silently downgraded to a WARN about the campaign's own fault. An identity that cannot "+
+			"uniquely pair cannot causally explain", res.Keys)
+	}
+	t.Logf("colliding identities — the projection is NOT exempted: %v", res.Keys)
+}
+
+// And the exemption is not broken in general: with a UNIQUE identity it still
+// fires, so the guard narrowed the mechanism rather than retiring it.
+func TestI3_AUniqueIdentityStillExemptsAfterTheCollisionGuard(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	w := projectionWorld(t, obs, write, []DERView{
+		identified("der-a-lying", "SunSpec Sim CSIP-Dev-5000 sn=SN-A", ghostRegs(t, 63)),
+		identified("der-b-quiet", "SunSpec Sim CSIP-Dev-5000 sn=SN-B", cleanRegs(t)),
+	}, nil, "SunSpec Sim CSIP-Dev-5000 sn=SN-A", armOn("der-a-lying", write.Add(-9*time.Second)))
+
+	if res := i3Verdict(t, w); res.Verdict != Warn {
+		t.Fatalf("I3 = %s, want WARN: the lying device is uniquely identified and holds the value, so "+
+			"the ruling still applies.\n  reason: %s", res.Verdict, res.Reason)
+	}
+}

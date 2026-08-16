@@ -10,14 +10,47 @@ demo-pis.txt
 dashboard.log
 text_reader.txt
 
-# Root-level binaries (arm64 builds dropped here by cross-compile workflow)
-/evsim
-/metersim
-/modsim-conformance
-
-# Desktop binaries built locally (make build / go build) — never commit
+# Root-level binaries — arm64 cross-compiles, and anything a bare
+# `go build ./cmd/x` or `./sim/x` drops in the working directory.
+#
+# THIS LIST WAS HAND-MAINTAINED AND INCOMPLETE, which is how a 30 MB mbapsdev
+# ELF reached commit c7e4b84 through a `git add -A`. Enumerating a few names and
+# trusting future edits to extend it is the same pattern that produced this
+# repo's worst register-map defect one directory over; the list is now derived
+# from what the tree can actually build (`ls -d cmd/*/ sim/*/`), which is a thing
+# a reader can re-derive in one command rather than a set somebody remembered.
+#
+# Each entry is anchored with a leading slash so it hits the repo ROOT only —
+# these names are also legitimate SOURCE directories (cmd/certify/, sim/modsim/)
+# and an unanchored pattern would ignore the code as well as the binary.
+/aggregator
+/batsim
+/certify
+/client
+/client-http
+/conformance
 /dashboard
+/evsim
+/gen-mbaps-certs
+/gridsim
+/gw-campaign
+/gw-diff
+/gw-mayhem
 /httpsim
+/mbapsdev
+/metersim
+/modsim
+/modsim-client
+/modsim-conformance
+/mqttproxy
+/nbdiag
+/server
+/server-http
+/simapi
+/southbound
+/ssm-conformance
+/tlsserver
+/vtnsim
 
 # Python virtual environment
 gui/.venv/

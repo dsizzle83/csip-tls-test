@@ -24,6 +24,12 @@ func twoBandMargin(lo, hi float64, tol invariant.Tolerance) float64 {
 	return (hi - lo) - (slack(lo) + slack(hi))
 }
 
+// NOTE ON SCOPE: this pins the shipping list against DefaultTolerance(), which
+// is what a campaign uses today because nothing overrides it. Params.Tol is
+// settable, and probeValues is built once at init from the default — so a
+// caller that set a looser Tol at run time would not move this list. See
+// probeValueSpacing's doc for what closing that would take; the companion test
+// below demonstrates what a looser tolerance would cost.
 func TestProbeValuesOutrunTheComparisonTolerance(t *testing.T) {
 	tol := invariant.DefaultTolerance()
 	vals := probeValues

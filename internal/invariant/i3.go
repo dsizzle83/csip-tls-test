@@ -436,10 +436,17 @@ func (i *i3) lyingDeviceExplains(obs *Observation, r WriteRecord, v devView, tar
 		return false
 	}
 	// The lying device must be the one this witness projects. Identity is the
-	// only pairing either side actually measures.
+	// only pairing either side actually measures — and it pairs only when it
+	// picks out ONE device. Two devices sharing an identity (this bench's sims
+	// can, by construction: see identityHolders) would let a lie on der-a
+	// excuse a ghost der-b caused, which is exactly the false PASS every other
+	// clause here is shaped to avoid.
 	lyingID := strings.TrimSpace(d.Unit.Identity)
 	witnessID := strings.TrimSpace(v.Unit.Identity)
 	if lyingID == "" || witnessID == "" || lyingID != witnessID {
+		return false
+	}
+	if identityHolders(obs, witnessID) != 1 {
 		return false
 	}
 	cmd, ok := i.commandUnderTest(d.Unit, d.Source, r)
@@ -517,31 +524,84 @@ func (i *i3) commandUnderTest(uv UnitView, source string, r WriteRecord) (Comman
 func (i *i3) ghostSubject(obs *Observation, v devView) string {
 	if v.Witness == witnessDER {
 		// A DER witness is already the device. Prefer its identity so it folds
-		// with the DUT's projection of it.
-		if id := strings.TrimSpace(v.Unit.Identity); id != "" {
+		// with the DUT's projection of it — but only when that identity picks
+		// out ONE device, for the reason uniqueIdentityHolder gives.
+		id := strings.TrimSpace(v.Unit.Identity)
+		if id != "" && identityHolders(obs, id) == 1 {
 			return "device:" + id
 		}
 		return v.Label
 	}
 	// A DUT projection: fold onto the DER it is a projection OF, when that can
-	// be established from what both sides measured.
+	// be established from what both sides measured AND the pairing is
+	// unambiguous.
 	witnessID := strings.TrimSpace(v.Unit.Identity)
 	if witnessID == "" {
 		return v.Label
 	}
+	switch identityHolders(obs, witnessID) {
+	case 1:
+		return "device:" + witnessID
+	default:
+		// Zero holders: identified, but no DER here carries that identity, so
+		// this projection is not a second reading of any device present — the
+		// pure projection ghost, its own finding.
+		//
+		// Two or more: the identity does not pick out a device at all, so
+		// folding onto it would merge findings from DIFFERENT machines under
+		// one key. Keep them separate.
+		return v.Label
+	}
+}
+
+// identityHolders counts the reachable DERs in an observation carrying an
+// identity, and it is the guard both of this file's identity-keyed mechanisms
+// consult before trusting one.
+//
+// ── Why a uniqueness check, when the identity is a serial number ───────────
+//
+// UnitView.Identity is "<Mn> <Md> sn=<SN>" read from model 1, and the whole
+// argument for using it — that a DUT projecting a device projects its identity
+// with it — quietly assumes the identity names ONE device. On real hardware it
+// does. On this bench it does not have to: sim.go's static Populate hardcodes
+// SN-0001 with no override at all, and the animated sims' own -serial help says
+// in as many words that co-located sims collide unless an operator sets them
+// apart. A harness whose fixtures can be identical by construction must not
+// build inferences that assume they are not.
+//
+// Both mechanisms fail in the WORST direction when the assumption breaks, and
+// they fail differently, which is why the guard is here rather than in one of
+// them:
+//
+//	the FOLD (ghostSubject) merges two genuinely distinct ghosts, on two
+//	different machines, into one key — one finding reported, one LOST. That is
+//	IW15-031's crime committed through the very key that fixed it.
+//
+//	the EXEMPTION (lyingDeviceExplains) lets a lie armed on der-a excuse a
+//	ghost that der-b caused independently: der-a holds the value, der-a's
+//	identity "matches" the projection because der-b's is identical, and a real
+//	FAIL becomes the lying-peer-confound WARN. That is gate #18's and #19's
+//	end-state reached through the mechanism that closed them.
+//
+// So an identity held by more than one device is treated as NO pairing: the
+// findings stay separate and the exemption does not fire. An identity that
+// cannot uniquely pair cannot causally explain, and this file's whole family of
+// clauses costs a false FAIL rather than a false PASS.
+func identityHolders(obs *Observation, identity string) int {
+	if strings.TrimSpace(identity) == "" {
+		return 0
+	}
+	n := 0
 	for _, name := range obs.DERNames() {
 		d := obs.DERs[name]
 		if !d.Reachable {
 			continue
 		}
-		if strings.TrimSpace(d.Unit.Identity) == witnessID {
-			return "device:" + witnessID
+		if strings.TrimSpace(d.Unit.Identity) == identity {
+			n++
 		}
 	}
-	// Identified, but no DER in this observation carries that identity — so
-	// this projection is NOT a second reading of any device here, and it is its
-	// own finding. This is the pure projection ghost.
-	return v.Label
+	return n
 }
 
 // lieApplyThenRefuse is sim/southbound's name for the one fault kind that
@@ -571,7 +631,7 @@ func faultExceptionCode(f Fault) (uint8, bool) {
 // the two verdicts rest on exactly the same observation, and a reader comparing
 // them must not have to reconcile two differently-shaped records.
 func (i *i3) factsFor(r WriteRecord, v devView, cmd Command, obs *Observation) []Fact {
-	return []Fact{
+	facts := []Fact{
 		F("i3.write.seq", "", "ledger", "%d", r.Seq),
 		F("i3.write.at", "", "ledger", "%s", r.At.Format(time.RFC3339)),
 		F("i3.write.credential", "", "ledger", "%s (role %s)", r.Credential, r.Role),
@@ -583,6 +643,31 @@ func (i *i3) factsFor(r WriteRecord, v devView, cmd Command, obs *Observation) [
 		F("i3.observed.enabled", "", v.Source, "%t", cmd.Enabled),
 		F("i3.observed.at", "", v.Source, "%s", obs.At.Format(time.RFC3339)),
 	}
+	// THE DEGRADED MODE DISCLOSES ITSELF. When the witness's identity is held
+	// by more than one reachable device, both identity-keyed mechanisms decline
+	// to act: findings that would have folded stay separate, and a lying-peer
+	// exemption that would have fired does not. That is the SAFE direction, and
+	// it is quieter than the alternative in a way a reader must not have to
+	// infer — a bundle whose de-duplication silently switched off looks exactly
+	// like a bundle that had nothing to de-duplicate.
+	//
+	// It rides in the facts rather than a startup log because a log scrolls
+	// past and a fact is evidence. The bench's own sims can collide by
+	// construction (sim.go's static Populate hardcodes SN-0001 with no
+	// override), so this is a condition a real run can be in.
+	if id := strings.TrimSpace(v.Unit.Identity); id != "" {
+		if n := identityHolders(obs, id); n > 1 {
+			facts = append(facts,
+				F("i3.identity.ambiguous", "count", v.Source, "%d", n),
+				F("i3.identity.value", "", v.Source, "%s", id),
+				F("i3.identity.effect", "", "invariant", "%s",
+					"this identity is held by more than one reachable device, so it pairs nothing: "+
+						"findings at these witnesses are NOT folded onto one device and the lying-peer "+
+						"exemption cannot fire for them. Both mechanisms are OFF for this witness, which "+
+						"is safe and is narrower than a run with distinct identities would be"))
+		}
+	}
+	return facts
 }
 
 // witnesses returns the register images a refused write could show up in: the

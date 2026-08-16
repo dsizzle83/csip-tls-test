@@ -350,7 +350,8 @@ func (AuthzProbe) Describe() string {
 // factor quantises further, and Tol is a floor-and-relative rule whose floor
 // (0.5) dominates at small values. Three leaves the property true through all
 // of that, and it is cheap: the bench needs about ten values and the range
-// holds fourteen at this spacing.
+// holds fifteen at this spacing, against the twelve credentials the bench
+// presents.
 const probeSpacingSafetyFactor = 3
 
 // probeValueRange is the percent window the probes live in.
@@ -380,6 +381,22 @@ const (
 // It takes the tolerance rather than reading a package default so a test can
 // drive it with a LOOSENED one and watch the requirement grow — which is how
 // the pinning test proves it is really coupled.
+// ── What the coupling test does and does not pin ──────────────────────────
+//
+// TestProbeValuesOutrunTheComparisonTolerance checks the shipping list against
+// invariant.DefaultTolerance() — the tolerance a campaign uses today, because
+// nothing overrides it. Params.Tol IS settable (world.go fills it from
+// DefaultTolerance only when the caller left it zero), so a future caller could
+// hand I3 a looser tolerance at run time and the pinned margin would not follow
+// it: probeValues is a package-level var built once, at init, from the default.
+//
+// That is a bounded gap and it is named rather than papered over. Closing it
+// means either building the probe values from the RUN's tolerance (they are
+// chosen before the World exists today) or refusing a Params.Tol looser than
+// the list was built for. Until a caller actually sets Tol, the sound statement
+// is the one the test makes — and TestProbeSpacingFollowsTheToleranceItIsDerivedFrom
+// demonstrates what a looser tolerance would cost, which is the warning a
+// future caller needs.
 func probeValueSpacing(tol invariant.Tolerance) float64 {
 	// The widest band any value in the range can carry, by I3's own rule.
 	widest := math.Max(probeValueMax*tol.Rel, 0.5)
@@ -399,8 +416,8 @@ func probeValueSpacing(tol invariant.Tolerance) float64 {
 // (11, 17, 23, 29, 35 …), and with a step that is a multiple of ten the range
 // only holds nine values. So the generator advances by at least the required
 // spacing and then keeps advancing until it lands on a value that is odd AND
-// not a multiple of five — which yields gaps of 6 or 8, thirteen values, and
-// no round number anywhere.
+// not a multiple of five — which yields gaps of 6 or 8, fifteen values, and no
+// round number anywhere.
 func buildProbeValues(tol invariant.Tolerance) []float64 {
 	step := math.Ceil(probeValueSpacing(tol))
 	var out []float64
