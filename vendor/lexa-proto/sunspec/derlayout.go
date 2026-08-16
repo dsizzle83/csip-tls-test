@@ -196,6 +196,30 @@ var L703 = NewLayout(
 // ── Model 704: DER AC Controls ───────────────────────────────────────────────
 // Spec Table 7 — full model including reversion timers, Set Active Power,
 // ramp rates, anti-islanding, and the four PF sync groups.
+//
+// # THE PF ALTERNATES STRADDLE WRmp — do not assume alternates come first
+//
+// derbase's write704Rmp isolating retry re-writes a NARROWED range, regs[:WRmp]
+// (offset 47), so a device that rejected the ramp address range still gets the
+// axis value without it. That narrowing is only sound for an axis whose
+// alternate registers all sit BEFORE WRmp, and three of the four do:
+//
+//	WMaxLimPctRvrt 14, WMaxLimPctEnaRvrt 15   before 47  ok
+//	WSetRvrt       24, WSetEnaRvrt       28   before 47  ok
+//	VarSetPctRvrt  41, VarSetEnaRvrt     42   before 47  ok
+//
+// The FIXED-PF alternate does not. Its enables sit early (PFWInjEnaRvrt 1,
+// PFWAbsEnaRvrt 7) but its VALUES are in the sync groups at the end of the
+// block — PFWInjRvrt_PF/_Ext at 59/60, PFWAbsRvrt_PF/_Ext at 63/64 — so a
+// narrowed retry would land the ARMING BIT and drop the destination it arms
+// toward: exactly the stale-shadow reversion IW13-004a exists to prevent,
+// reintroduced by the recovery path rather than by the writer.
+//
+// It is latent, not live: SetFixedPF calls write704 (rmpFn == nil), 704 carries
+// no PF ramp register to isolate, so the narrowed retry never runs on this
+// axis. TestReversionAlternatesPrecedeTheRampNarrowing (derbase) is what keeps
+// it latent — it fails if any axis whose writer passes a non-nil rmpFn has an
+// alternate register at or after WRmp.
 var L704 = NewLayout(
 	F("PFWInjEna", Tenum16), F("PFWInjEnaRvrt", Tenum16),
 	F("PFWInjRvrtTms", Tuint32), F("PFWInjRvrtRem", Tuint32),

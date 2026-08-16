@@ -523,10 +523,98 @@ type SignedPerCent struct {
 // displacement 0 means "the element was absent or malformed", which is why every
 // consumer in this family gates on a plausibility check rather than reading the
 // field raw. PF() below returns ok=false for it.
+// ── ABSENT IS NOT FALSE (gate #18 E-5) ──────────────────────────────────────
+//
+// All three sub-elements are MANDATORY [1], and Excitation is a plain bool, so
+// a document that omits <excitation> decoded to false — which this very type
+// documents as OVER-EXCITED, injecting reactive power. A missing direction
+// therefore became a confident command in one specific direction, at whatever
+// magnitude the displacement carried. The "no decode tolerance" and "the zero
+// value is not a power factor" arguments above hold at the GO TYPE level and
+// say nothing about the XML boundary, where absence is the failure mode.
+//
+// UnmarshalXML below records which mandatory sub-elements were missing, so
+// absent and false stop being the same fact. It does NOT return an error: one
+// malformed element must not fail the whole DERControlList and take every
+// well-formed control in it down with it. The axis is refused instead, by name,
+// through Command() — the same shape as PF()'s existing ok=false gate.
+//
+// The struct FIELDS are unchanged, deliberately. Making Excitation a *bool
+// would be tidier Go and would break roughly twenty construction sites across
+// three repositories for a fact that exists only at the decode boundary. A
+// Go-constructed literal is complete BY CONSTRUCTION — it never passes through
+// UnmarshalXML — so the zero value of `missing` means "complete", and every
+// hand-built value keeps working untouched.
 type PowerFactorWithExcitation struct {
 	Displacement uint16 `xml:"displacement"`
 	Excitation   bool   `xml:"excitation"`
 	Multiplier   int8   `xml:"multiplier"`
+
+	// missing names the mandatory sub-elements UnmarshalXML did not find, in
+	// document order. nil means complete (or Go-constructed).
+	missing []string
+}
+
+// UnmarshalXML decodes the three mandatory sub-elements through POINTERS, so
+// absent is distinguishable from the zero value, and records the absentees.
+func (p *PowerFactorWithExcitation) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	// A shadow struct with the same tags and no UnmarshalXML of its own, so
+	// this does not recurse.
+	var raw struct {
+		Displacement *uint16 `xml:"displacement"`
+		Excitation   *bool   `xml:"excitation"`
+		Multiplier   *int8   `xml:"multiplier"`
+	}
+	if err := d.DecodeElement(&raw, &start); err != nil {
+		return err
+	}
+	*p = PowerFactorWithExcitation{}
+	if raw.Displacement != nil {
+		p.Displacement = *raw.Displacement
+	} else {
+		p.missing = append(p.missing, "displacement")
+	}
+	if raw.Excitation != nil {
+		p.Excitation = *raw.Excitation
+	} else {
+		p.missing = append(p.missing, "excitation")
+	}
+	if raw.Multiplier != nil {
+		p.Multiplier = *raw.Multiplier
+	} else {
+		p.missing = append(p.missing, "multiplier")
+	}
+	return nil
+}
+
+// Missing returns the mandatory sub-elements the decoder did not find, for a
+// refusal message. Empty for a complete document and for any Go-constructed
+// value.
+func (p PowerFactorWithExcitation) Missing() []string { return p.missing }
+
+// Command returns the commanded displacement power factor together with its
+// excitation direction — overExcited = injecting reactive power, i.e. the
+// NEGATION of the wire flag — and whether both are usable.
+//
+// This is the accessor anything actuating on this element should use, because
+// here the magnitude and the direction are not separable facts: 0.95
+// over-excited and 0.95 under-excited are opposite reactive commands, so a
+// magnitude with an unknown direction is not a power factor at all. PF() gates
+// only the magnitude and is kept for callers that genuinely want just that.
+//
+// ok is false when any mandatory sub-element was absent from the document, or
+// when PF() itself refuses the magnitude. The caller answers false with a NAMED
+// refusal — never with a default direction, which is exactly the failure this
+// gate found.
+func (p PowerFactorWithExcitation) Command() (pf float64, overExcited bool, ok bool) {
+	if len(p.missing) > 0 {
+		return 0, false, false
+	}
+	v, vok := p.PF()
+	if !vok {
+		return v, false, false
+	}
+	return v, !p.Excitation, true
 }
 
 // PF returns the displacement power factor as a float (displacement ×

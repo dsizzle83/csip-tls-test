@@ -1063,27 +1063,45 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		// and for any magnitude outside (0,1], and a false is refused here by
 		// name rather than clamped — clamping a power factor moves reactive
 		// power to a quantity the head end did not request.
-		pf, ok := ctrl.OpModFixedPFInjectW.PF()
+		// Command(), not PF(): the magnitude and the excitation are ONE fact
+		// on this element, and Command refuses a document that omitted any
+		// mandatory sub-element (gate #18 E-5). Before that, an absent
+		// <excitation> decoded to false — which this element defines as
+		// OVER-excited — so a missing direction became a confident command to
+		// inject reactive power at full magnitude.
+		pf, over, ok := ctrl.OpModFixedPFInjectW.Command()
 		if !ok {
+			if missing := ctrl.OpModFixedPFInjectW.Missing(); len(missing) > 0 {
+				return nil, &InvalidControlError{Axis: "opModFixedPFInjectW",
+					Reason: fmt.Sprintf("document omits mandatory sub-element(s) %v; a power "+
+						"factor without its excitation is not a direction anything may guess at",
+						missing)}
+			}
 			return nil, &InvalidControlError{Axis: "opModFixedPFInjectW",
 				Reason: fmt.Sprintf("displacement %d x 10^%d = %.4f is not a displacement power factor in (0,1]",
 					ctrl.OpModFixedPFInjectW.Displacement, ctrl.OpModFixedPFInjectW.Multiplier, pf)}
 		}
-		if err := b.validatePF(pf, "opModFixedPFInjectW"); err != nil {
+		// Bounded at the excitation the command ITSELF carries, not at one
+		// inferred from the axis name (gate #18 addendum). Since fe483e7 this
+		// element has carried a mandatory excitation sub-element, so `over`
+		// above is authoritative data and the axis name selects only the 704
+		// sync group.
+		if err := b.validatePFAtExcitation(pf, over, "opModFixedPFInjectW"); err != nil {
 			return nil, err
 		}
-		// NEGATED, and the negation is the entire correctness of this line.
-		// 2018 p.258: excitation is "True when DER is absorbing reactive power
-		// (under-excited), false when DER is injecting reactive power
-		// (over-excited)" — so TRUE means UNDER-excited. SetFixedPF's parameter
-		// is overExcited, and 704 numbers the pair the other way again
-		// (M704_Ext_OverExcited = 0, M704_Ext_UnderExcited = 1). This read
-		// `over := ...Excitation` from fe483e7 until 2026-08-15: the type
-		// correction carried the polarity of the invented sign convention it
-		// replaced, so a conformant 0.90-under-excited command wrote
-		// PFWInject_Ext = 0 and the inverter INJECTED — reactive power opposite
-		// the command, at full magnitude.
-		over := !ctrl.OpModFixedPFInjectW.Excitation
+		// `over` comes from Command(), which performs the NEGATION that is the
+		// entire correctness of this axis. 2018 p.258: excitation is "True when
+		// DER is absorbing reactive power (under-excited), false when DER is
+		// injecting reactive power (over-excited)" — so TRUE means
+		// UNDER-excited, while SetFixedPF's parameter is overExcited and 704
+		// numbers the pair the other way again (M704_Ext_OverExcited = 0,
+		// M704_Ext_UnderExcited = 1). This line read `over := ...Excitation`
+		// from fe483e7 until 2026-08-15: the type correction carried the
+		// polarity of the invented sign convention it replaced, so a conformant
+		// 0.90-under-excited command wrote PFWInject_Ext = 0 and the inverter
+		// INJECTED — reactive power opposite the command, at full magnitude.
+		// Doing the negation ONCE, on the type, next to the quoted sentence
+		// that justifies it, is why it no longer lives at each call site.
 		add("opModFixedPFInjectW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetFixedPF(true, pf, over, tag) })
 	}
 	if ctrl.OpModFixedPFAbsorbW != nil {
@@ -1103,27 +1121,45 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		// and for any magnitude outside (0,1], and a false is refused here by
 		// name rather than clamped — clamping a power factor moves reactive
 		// power to a quantity the head end did not request.
-		pf, ok := ctrl.OpModFixedPFAbsorbW.PF()
+		// Command(), not PF(): the magnitude and the excitation are ONE fact
+		// on this element, and Command refuses a document that omitted any
+		// mandatory sub-element (gate #18 E-5). Before that, an absent
+		// <excitation> decoded to false — which this element defines as
+		// OVER-excited — so a missing direction became a confident command to
+		// inject reactive power at full magnitude.
+		pf, over, ok := ctrl.OpModFixedPFAbsorbW.Command()
 		if !ok {
+			if missing := ctrl.OpModFixedPFAbsorbW.Missing(); len(missing) > 0 {
+				return nil, &InvalidControlError{Axis: "opModFixedPFAbsorbW",
+					Reason: fmt.Sprintf("document omits mandatory sub-element(s) %v; a power "+
+						"factor without its excitation is not a direction anything may guess at",
+						missing)}
+			}
 			return nil, &InvalidControlError{Axis: "opModFixedPFAbsorbW",
 				Reason: fmt.Sprintf("displacement %d x 10^%d = %.4f is not a displacement power factor in (0,1]",
 					ctrl.OpModFixedPFAbsorbW.Displacement, ctrl.OpModFixedPFAbsorbW.Multiplier, pf)}
 		}
-		if err := b.validatePF(pf, "opModFixedPFAbsorbW"); err != nil {
+		// Bounded at the excitation the command ITSELF carries, not at one
+		// inferred from the axis name (gate #18 addendum). Since fe483e7 this
+		// element has carried a mandatory excitation sub-element, so `over`
+		// above is authoritative data and the axis name selects only the 704
+		// sync group.
+		if err := b.validatePFAtExcitation(pf, over, "opModFixedPFAbsorbW"); err != nil {
 			return nil, err
 		}
-		// NEGATED, and the negation is the entire correctness of this line.
-		// 2018 p.258: excitation is "True when DER is absorbing reactive power
-		// (under-excited), false when DER is injecting reactive power
-		// (over-excited)" — so TRUE means UNDER-excited. SetFixedPF's parameter
-		// is overExcited, and 704 numbers the pair the other way again
-		// (M704_Ext_OverExcited = 0, M704_Ext_UnderExcited = 1). This read
-		// `over := ...Excitation` from fe483e7 until 2026-08-15: the type
-		// correction carried the polarity of the invented sign convention it
-		// replaced, so a conformant 0.90-under-excited command wrote
-		// PFWAbsorb_Ext = 0 and the inverter INJECTED — reactive power opposite
-		// the command, at full magnitude.
-		over := !ctrl.OpModFixedPFAbsorbW.Excitation
+		// `over` comes from Command(), which performs the NEGATION that is the
+		// entire correctness of this axis. 2018 p.258: excitation is "True when
+		// DER is absorbing reactive power (under-excited), false when DER is
+		// injecting reactive power (over-excited)" — so TRUE means
+		// UNDER-excited, while SetFixedPF's parameter is overExcited and 704
+		// numbers the pair the other way again (M704_Ext_OverExcited = 0,
+		// M704_Ext_UnderExcited = 1). This line read `over := ...Excitation`
+		// from fe483e7 until 2026-08-15: the type correction carried the
+		// polarity of the invented sign convention it replaced, so a conformant
+		// 0.90-under-excited command wrote PFWAbsorb_Ext = 0 and the inverter
+		// INJECTED — reactive power opposite the command, at full magnitude.
+		// Doing the negation ONCE, on the type, next to the quoted sentence
+		// that justifies it, is why it no longer lives at each call site.
 		add("opModFixedPFAbsorbW", sunspec.ModelDERCtlAC, rankLimit, func() error { return b.SetFixedPF(false, pf, over, tag) })
 	}
 	if ctrl.OpModFixedVar != nil {
@@ -1551,41 +1587,102 @@ func (b *Base) fixedWReference(negative bool) (float64, bool, error) {
 	return 0, false, nil
 }
 
-// validatePF rejects a power-factor request outside the physically meaningful
-// [0,1] domain, or below the device's own declared minimum rated PF (702
-// PFOvrExtRtg/PFUndExtRtg) when the device implements those ratings.
+// validatePFAtExcitation rejects a power factor outside [0,1], or below the
+// minimum the device declares FOR THE EXCITATION IT WILL BE HELD AT. It is the
+// only PF rated-bound check in this package; both the primary commands and the
+// reversion alternates go through it.
 //
-// The rated-PF guard used to read `minRated > 0 && minRated <= 1`, which
-// silently DROPPED the bound for every implemented rating outside that
-// window — a device declaring a rated PF of 1.5, or of 0, had its own claim
-// discarded and got commanded to any PF at all. An implemented claim that
-// cannot be true is not a bound to relax; see ratingBound in capability.go.
-func (b *Base) validatePF(pf float64, axis string) error {
+// # Why the excitation, and not the axis name (gate #18 E-1, extended)
+//
+// Model 702 rates power factor BY EXCITATION, and says so in its own labels:
+// "Specified Over-Excited PF" and "Specified Under-Excited PF". The CSIP axis
+// names opModFixedPFInjectW / opModFixedPFAbsorbW are about ACTIVE-POWER
+// DIRECTION, which is orthogonal — a DER can absorb active power while
+// over-excited and inject while under-excited, and all four combinations are
+// physical. Selecting the rating from the axis name therefore bounds a command
+// against a rating that has nothing to do with it.
+//
+// On the asymmetric ratings real machines publish that was wrong in BOTH
+// directions: a displacement the device declared it cannot hold could be
+// accepted against the other excitation's looser rating, and a perfectly valid
+// one could be refused against the stricter one. For the reversion alternate
+// the second case also killed the primary command riding with it, because
+// validation precedes write704.
+//
+// The PRIMARY path was left axis-keyed when E-1 was fixed, on the argument that
+// it was a long-standing CSIP-axis convention. That argument does not survive
+// its own premise: fe483e7 retyped opModFixedPF{Inject,Absorb}W as
+// PowerFactorWithExcitation, whose excitation sub-element is MANDATORY, so
+// since then the primary command has carried its OWN authoritative excitation
+// and there is nothing left to infer from the axis name. No revision of 2030.5
+// or of model 702 ties these ratings to active-power direction. The axis name
+// now selects only the 704 sync group, which is all it was ever competent to
+// decide.
+//
+// # The ratings it consults, and why not the obvious two
+//
+// PFOvrExtRtg / PFUndExtRtg are what this package bounded against, and the
+// vendored model_702.json labels BOTH of them "(Unused)" with the description
+// "Unused. Please use WOvrExtRtgPF." / "...WUndExtRtgPF." A device that follows
+// that instruction publishes the replacements and leaves the deprecated pair
+// unimplemented — whereupon minRatingBound saw NaN and applied NO BOUND AT ALL.
+// The guard was silently inert on exactly the conformant, current-generation
+// hardware it most needed to protect. ratedPFBound prefers the current points
+// and falls back to the deprecated pair for a device that publishes only those.
+func (b *Base) validatePFAtExcitation(pf float64, overExcited bool, axis string) error {
 	if math.IsNaN(pf) || pf < 0 || pf > 1 {
 		return &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("power factor %g outside [0,1]", pf)}
 	}
-	if b.HasCap {
-		// The rated PF is the MINIMUM the device supports (e.g. 0.85); a
-		// request below it is outside declared capability (LXR-005).
-		minRated, point := math.NaN(), ""
-		switch axis {
-		case "opModFixedPFInjectW":
-			minRated, point = b.Cap.PFOvrExtRtg, "PFOvrExtRtg"
-		case "opModFixedPFAbsorbW":
-			minRated, point = b.Cap.PFUndExtRtg, "PFUndExtRtg"
-		}
-		if point != "" {
-			bound, ok, err := minRatingBound(axis, point, minRated, 1)
-			if err != nil {
-				return err
-			}
-			if ok && pf < bound {
-				return &UnsupportedControlError{Axis: axis,
-					Reason: fmt.Sprintf("requested PF %.4f below device rated minimum %.4f", pf, bound)}
-			}
-		}
+	if !b.HasCap {
+		return nil
+	}
+	minRated, point := b.ratedPFBound(overExcited)
+	bound, ok, err := minRatingBound(axis, point, minRated, 1)
+	if err != nil {
+		return err
+	}
+	if ok && pf < bound {
+		return &UnsupportedControlError{Axis: axis, Reason: fmt.Sprintf(
+			"PF %.4f %s is below the device's rated minimum %.4f (%s)",
+			pf, excitationName(overExcited), bound, point)}
 	}
 	return nil
+}
+
+func excitationName(overExcited bool) string {
+	if overExcited {
+		return "over-excited"
+	}
+	return "under-excited"
+}
+
+// ratedPFBound returns the device's declared minimum power factor at the given
+// excitation, and the name of the point it came from.
+//
+// It prefers WOvrExtRtgPF / WUndExtRtgPF over PFOvrExtRtg / PFUndExtRtg because
+// the vendored model_702.json labels the latter pair "(Unused)" and its
+// descriptions say, verbatim, "Unused. Please use WOvrExtRtgPF." and "Unused.
+// Please use WUndExtRtgPF." A device that follows that instruction publishes
+// only the replacements, and this package used to read only the deprecated
+// pair — getting NaN, applying no bound, and letting any displacement through
+// on precisely the conformant hardware the guard exists for.
+//
+// The fallback is not politeness: a device that publishes only the deprecated
+// pair has still made a claim about what it can hold, and ignoring it would be
+// the same silent no-bound in the other direction. Preference order is
+// current-then-deprecated; NaN (absent or unimplemented) is what makes a point
+// unusable, and minRatingBound turns a remaining NaN into "no floor declared".
+func (b *Base) ratedPFBound(overExcited bool) (float64, string) {
+	current, currentName := b.Cap.WUndExtRtgPF, "WUndExtRtgPF"
+	legacy, legacyName := b.Cap.PFUndExtRtg, "PFUndExtRtg"
+	if overExcited {
+		current, currentName = b.Cap.WOvrExtRtgPF, "WOvrExtRtgPF"
+		legacy, legacyName = b.Cap.PFOvrExtRtg, "PFOvrExtRtg"
+	}
+	if !math.IsNaN(current) {
+		return current, currentName
+	}
+	return legacy, legacyName
 }
 
 // validateSetpointW rejects an active-power setpoint the device cannot hold:
@@ -1795,11 +1892,14 @@ func (b *Base) SetEnterService(s sunspec.EnterService, tag string) error {
 		return &MalformedDeviceError{Tag: tag, Model: sunspec.ModelDEREnterService,
 			Declared: len(regs), Required: sunspec.L703.Len(), Detail: "read returned short block"}
 	}
-	// Same corrupt-read guard as write704 (audit E2): never write a
-	// sentinel-corrupt read of the enter-service block back to the device.
-	if sunspec.L703.View(regs).ReadLooksCorrupt() {
-		return &CorruptReadError{Tag: tag, Model: sunspec.ModelDEREnterService,
-			Detail: "read block is sentinel-corrupt (partial/failed read)"}
+	// Same narrowed audit-E2 guard as the 704 writers (gate #18 F-1 —
+	// refuseUnwritableBlock). 703 declares BOTH its scale factors optional, so
+	// the old whole-block fence refused every enter-service write to a device
+	// that implements the voltage window but not the frequency one; Encode703
+	// already refuses the individual points that need it, by name, and only
+	// when they are actually commanded.
+	if err := refuseUnwritableBlock(tag, sunspec.ModelDEREnterService, sunspec.L703.View(regs)); err != nil {
+		return err
 	}
 	if err := sunspec.Encode703(regs, s); err != nil {
 		return err
@@ -2007,17 +2107,55 @@ func (b *Base) read704Checked(tag string) ([]uint16, error) {
 		return nil, &MalformedDeviceError{Tag: tag, Model: sunspec.ModelDERCtlAC,
 			Declared: len(regs), Required: sunspec.L704.Len(), Detail: "read returned short block"}
 	}
-	// Refuse to write back a corrupt read (audit E2): this whole-block
-	// read-modify-write would otherwise persist a sentinel-saturated read (a
-	// device rebooting mid-poll, or a fault-injected all-0x8000 read) into the
-	// inverter's control registers — garbage setpoints and spurious sync-group
-	// enables. A healthy 704 always carries valid scale factors (and never an
-	// out-of-domain one — LXR-004).
-	if sunspec.L704.View(regs).ReadLooksCorrupt() {
-		return nil, &CorruptReadError{Tag: tag, Model: sunspec.ModelDERCtlAC,
-			Detail: "read block is sentinel-corrupt (partial/failed read)"}
+	if err := refuseUnwritableBlock(tag, sunspec.ModelDERCtlAC, sunspec.L704.View(regs)); err != nil {
+		return nil, err
 	}
 	return regs, nil
+}
+
+// refuseUnwritableBlock is the audit-E2 gate for a whole-block
+// read-modify-write, NARROWED (gate #18 F-1) to the two shapes that actually
+// make a block unwritable.
+//
+// It used to be View.ReadLooksCorrupt, which calls a block corrupt when any
+// scale factor is outside the sunssf domain — INCLUDING the 0x8000
+// not-implemented sentinel. Every scale factor in models 702/703/704 is
+// declared OPTIONAL by the vendored spec, so that gate refused every write to
+// a perfectly conformant DER that merely declined to implement one axis: a
+// machine with no reactive capability publishes VarSetPct_SF = 0x8000, and
+// from then on its ACTIVE-power setpoints, its ceiling, and its power factor
+// were all refused as a "corrupt read" — blaming the transport for a device
+// that was answering correctly, and taking healthy axes down with an
+// unhealthy-sounding error nobody could act on. That was live.
+//
+// The two surviving signals:
+//
+//  1. A scale factor the device IMPLEMENTS carrying a value outside the domain.
+//     No conformant device publishes one, so it is real corruption — and it is
+//     now reported BY NAME, where the old fence said only "corrupt read".
+//  2. The block is saturated with the 0x8000 sentinel. This is what keeps E2
+//     closed: once an unimplemented scale factor is no longer corruption, an
+//     all-0x8000 failed read would otherwise look like a device that merely
+//     implements nothing, and the read-modify-write would program that garbage
+//     back into its control registers.
+//
+// What is deliberately NOT here any more is the unimplemented scale factor of
+// a point the write actually touches. That is not a property of the BLOCK, it
+// is a property of the WRITE, and it belongs to View.SetFloat — which refuses
+// it point-by-point with the model, the point and the scale-factor register
+// named (IW15-022). One unwritable axis no longer makes the block unwritable.
+func refuseUnwritableBlock(tag string, modelID uint16, v sunspec.View) error {
+	if name, bad := v.CorruptScaleFactor(); bad {
+		return &CorruptReadError{Tag: tag, Model: modelID, Detail: fmt.Sprintf(
+			"scale factor %s is implemented but carries a value outside the sunssf "+
+				"domain [-10,+10] — no conformant device publishes that, so this block "+
+				"is not safe to write back", name)}
+	}
+	if v.ReadLooksSaturated() {
+		return &CorruptReadError{Tag: tag, Model: modelID,
+			Detail: "read block is saturated with the 0x8000 sentinel (partial/failed read)"}
+	}
+	return nil
 }
 
 // rvrtAlternateWriter validates a Default*Rvrt/Default*EnaRvrt pair
@@ -2182,27 +2320,38 @@ func firstRampNotApplied(out PlanOutcome) error {
 // whichever sync group inject selects. A caller that supplies no alternate
 // (DefaultPFEnaRvrt nil) writes byte-identically to before.
 func (b *Base) SetFixedPF(inject bool, pf float64, overExcited bool, tag string) error {
-	// The alternate is validated against the SAME declared rating as a primary
-	// command on this group would be — a reversion destination the machine
-	// cannot hold is refused, not armed. The axis name selects which rated-PF
-	// bound applies (PFOvrExtRtg for the injecting group, PFUndExtRtg for the
-	// absorbing one), so the alternate is bounded by the same claim the
-	// device made about the direction it is actually going to revert in.
-	rvrtAxis := "opModFixedPFAbsorbW"
+	// `inject` selects only WHICH SYNC GROUP the alternate is written to —
+	// arming the injecting group's reversion while commanding absorb would be
+	// incoherent. It does NOT select the rating the alternate is bounded by:
+	// that comes from the alternate's own excitation (gate #18 E-1), because
+	// 702 rates power factor by excitation and active-power direction is an
+	// orthogonal axis. See validatePFAtExcitation.
+	rvrtAxis := "SetFixedPF.PFWAbsRvrt"
 	pfField, extField, enaField := "PFWAbsRvrt_PF", "PFWAbsRvrt_Ext", "PFWAbsEnaRvrt"
 	if inject {
-		rvrtAxis = "opModFixedPFInjectW"
+		rvrtAxis = "SetFixedPF.PFWInjRvrt"
 		pfField, extField, enaField = "PFWInjRvrt_PF", "PFWInjRvrt_Ext", "PFWInjEnaRvrt"
 	}
-	if b.DefaultPFRvrt != nil {
-		if err := b.validatePF(*b.DefaultPFRvrt, rvrtAxis); err != nil {
-			return err
-		}
-	}
+	// Writer FIRST: it is what refuses the unpaired shapes (arming bit with no
+	// value, magnitude with no excitation), so by the time the bound is checked
+	// below, a non-nil value is guaranteed to carry the excitation the bound
+	// has to be selected by.
 	rvrtFn, err := pfRvrtAlternateWriter("SetFixedPF", pfField, extField, enaField,
 		b.DefaultPFRvrt, b.DefaultPFRvrtOverExcited, b.DefaultPFEnaRvrt)
 	if err != nil {
 		return err
+	}
+	// Bounded ONLY when the alternate will actually be ARMED (gate #18 E-7).
+	// ena==nil writes nothing at all, and ena==false writes an inert, disabled
+	// alternate the device can never apply (IW13-004a §2a.4). Refusing either
+	// on a rating bound would manufacture a refusal from a value that cannot
+	// reach the plant — and because this validation precedes write704, it
+	// would take the PRIMARY command down with it.
+	if b.DefaultPFEnaRvrt != nil && *b.DefaultPFEnaRvrt &&
+		b.DefaultPFRvrt != nil && b.DefaultPFRvrtOverExcited != nil {
+		if err := b.validatePFAtExcitation(*b.DefaultPFRvrt, *b.DefaultPFRvrtOverExcited, rvrtAxis); err != nil {
+			return err
+		}
 	}
 	return b.write704(tag, "SetFixedPF", []ctrlMode{modeFixedPF}, func(v sunspec.View) error {
 		ext := uint16(sunspec.M704_Ext_OverExcited)
@@ -2324,7 +2473,11 @@ func (b *Base) SetConstantVarPlan(pct float64, mod uint16, tag string) (PlanOutc
 	// VarSetModRvrt, so the alternate percentage is interpreted against
 	// whatever base this write selects, and validating it under a different
 	// mod than it will be applied under would be checking the wrong quantity.
-	if b.DefaultVarSetPctRvrt != nil {
+	// Armed-only, for the reason spelled out at SetFixedPF's identical guard
+	// (gate #18 E-7): a disarmed or absent alternate cannot reach the plant, so
+	// a capability refusal manufactured from it would only serve to kill the
+	// primary command riding with it.
+	if b.DefaultVarSetEnaRvrt != nil && *b.DefaultVarSetEnaRvrt && b.DefaultVarSetPctRvrt != nil {
 		if err := b.checkVarWithinReactiveCapability("SetConstantVar.VarSetPctRvrt",
 			mod, *b.DefaultVarSetPctRvrt); err != nil {
 			return out, err
@@ -3057,8 +3210,15 @@ const (
 
 	ElemM123RmpTms     = "WMaxLimPct_RmpTms"
 	ElemM123WMaxLimPct = "WMaxLimPct"
-	ElemM123Ena        = "WMaxLimPct_Ena"
-	ElemM123Conn       = "Conn"
+	// ElemM123Ena carries the PUBLISHED point name, WMaxLim_Ena — model 123
+	// spells the enable without the "Pct" its value and timers all carry
+	// (verified against model_123.json; gate #18). It read "WMaxLimPct_Ena"
+	// until 2026-08-15, so an operator grepping a journal entry or a metric
+	// label for the register the standard names found nothing. The Go CONSTANT
+	// keeps its identifier because consumers reference it by name; only the
+	// string an operator actually reads has changed.
+	ElemM123Ena  = "WMaxLim_Ena"
+	ElemM123Conn = "Conn"
 )
 
 // Element indexes within m123LimitPlan's PlanOutcome.Elements, in write order.
@@ -3116,6 +3276,11 @@ type m123ConnPlan struct {
 	tag    string
 	want   uint16
 	before float64 // measured pre-state (NaN = unknown)
+
+	// win0 / rvrt0 are the pre-states of Conn_WinTms and Conn_RvrtTms, carried
+	// so execute can decide per register whether to ZERO the timer or write
+	// its not-implemented sentinel back untouched (H3 — see execute).
+	win0, rvrt0 uint16
 }
 
 // SetConnect connects (true) or disconnects (false) the DER through M123 Conn
@@ -3166,7 +3331,10 @@ func (b *Base) newM123ConnPlan(connect bool, tag string) (*m123ConnPlan, error) 
 		return nil, &UnsupportedControlError{Axis: "opModConnect",
 			Reason: "device leaves M123 Conn unimplemented (0xFFFF): the connect state can never be proven"}
 	}
-	p := &m123ConnPlan{b: b, tag: tag, want: 0, before: float64(regs[sunspec.M123_Conn])}
+	p := &m123ConnPlan{b: b, tag: tag, want: 0, before: float64(regs[sunspec.M123_Conn]),
+		win0:  regs[sunspec.M123_Conn_WinTms],
+		rvrt0: regs[sunspec.M123_Conn_RvrtTms],
+	}
 	if connect {
 		p.want = 1
 	}
@@ -3177,8 +3345,48 @@ func (p *m123ConnPlan) execute() (PlanOutcome, error) {
 	out := PlanOutcome{Tag: p.tag, Plan: PlanM123Connect, Elements: []ElementOutcome{{
 		Name: ElemM123Conn, Model: sunspec.ModelImmediateCtrl, Before: p.before, After: math.NaN(),
 	}}}
+	// H3: the connect command CARRIES ITS OWN TIMERS TO ZERO.
+	//
+	// Model 123 gates a Conn write with two registers immediately before it:
+	// Conn_WinTms (0), a window the device may randomise the change over, and
+	// Conn_RvrtTms (1), after which the change SELF-REVERTS. This plan used to
+	// write Conn alone, leaving both at whatever the block already held — and
+	// nothing anywhere in this package has ever written them.
+	//
+	// That was survivable only by accident. Before the M123 offset correction
+	// the curtailment plan's grouped 5-register write started at what it
+	// believed was WMaxLimPct and actually landed on offsets 0-4, so it
+	// incidentally rewrote Conn_WinTms and Conn_RvrtTms on every ceiling
+	// command. With the offsets corrected that write moved to 3-7, where it
+	// belongs, and the accident stopped happening — leaving a residual window
+	// able to defer a CEASE, and a residual revert timer able to undo one.
+	// A 60.00 % ceiling written by a pre-fix gateway leaves Conn_WinTms=6000:
+	// a commanded disconnect deferred up to 100 minutes, with the L1 echo
+	// proof below confirming a Conn value the device has not acted on yet.
+	//
+	// So the three registers go as ONE 3-register write at offset 0 — they are
+	// adjacent in the published model precisely because they belong together.
+	// A timer the device leaves UNIMPLEMENTED (0xFFFF) is written back as its
+	// sentinel rather than zeroed: there is no timer there to defer anything,
+	// and pushing 0 into an unimplemented point is the garbage-back-to-the-
+	// device class the corrupt-read gate exists to prevent (the same rule the
+	// ceiling plan's grouping decision applies).
+	//
+	// Both DIRECTIONS get it. A residual revert timer on a connect would make
+	// this plan's own proof a lie in the other direction — echo confirms
+	// connected, device drops out minutes later — and since nothing in this
+	// stack ever sets these registers, a non-zero value in them is by
+	// definition not an intent anybody expressed.
+	win, rvrt := uint16(0), uint16(0)
+	if p.win0 == 0xFFFF {
+		win = 0xFFFF
+	}
+	if p.rvrt0 == 0xFFFF {
+		rvrt = 0xFFFF
+	}
 	var writeErr error
-	if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_Conn, []uint16{p.want}); err != nil {
+	if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl, sunspec.M123_Conn_WinTms,
+		[]uint16{win, rvrt, p.want}); err != nil {
 		writeErr = fmt.Errorf("%s: set connect=%v: %w", p.tag, p.want == 1, err)
 		out.Elements[0].Err = writeErr
 	}

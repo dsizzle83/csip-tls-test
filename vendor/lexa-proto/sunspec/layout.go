@@ -347,6 +347,69 @@ func (v View) ReadLooksCorrupt() bool {
 		return false // scale factors present and sane ⇒ the read is real
 	}
 	// No SF fields — fall back to whole-block sentinel saturation.
+	return v.ReadLooksSaturated()
+}
+
+// CorruptScaleFactor returns the name of the first scale factor this block
+// IMPLEMENTS that carries a value outside the legal sunssf domain [-10,+10],
+// and whether one was found.
+//
+// # Why this is not ReadLooksCorrupt (gate #18 F-1)
+//
+// ReadLooksCorrupt treats ANY out-of-domain scale factor as corruption,
+// including the 0x8000 not-implemented sentinel. For a READ heuristic that is
+// a reasonable, low-false-positive signal. As the gate on a WRITE it was
+// catastrophically over-broad, because every scale factor in models 702, 703
+// and 704 is declared OPTIONAL by the vendored spec
+// (TestScalarModelScaleFactorsAreOptionalUnlikeTheCurves): a conformant DER
+// that simply does not implement one axis — say VarSetPct_SF on a machine with
+// no reactive capability — published 0x8000 there and had EVERY M704 write
+// refused as a corrupt read, blaming the transport, taking perfectly healthy
+// axes down with it, forever.
+//
+// The distinction this function draws is the one that actually separates a
+// device's honest "I do not implement this" from a broken read: an
+// UNIMPLEMENTED scale factor carries exactly the sentinel, and anything else
+// outside the domain — 500, −20, a half-shifted word — is a value no
+// conformant device publishes at all. The first is the writer's business
+// point-by-point (View.SetFloat refuses the points that need it, by name); the
+// second is a block nobody should write back.
+//
+// Returning the NAME rather than a bool is what makes the surviving fence
+// attributable: "scale factor VarSetPct_SF is implemented but reads 500" is
+// actionable where "corrupt read" sent an operator to the cabling.
+func (v View) CorruptScaleFactor() (string, bool) {
+	for _, f := range v.l.Fields {
+		if f.Type != Tsunssf || !v.Present(f.Name) {
+			continue
+		}
+		w := v.reg(v.l.off[f.Name])
+		if w == sentI16 {
+			continue // legitimately unimplemented — not this function's business
+		}
+		if !ValidSF(int16(w)) {
+			return f.Name, true
+		}
+	}
+	return "", false
+}
+
+// ReadLooksSaturated reports whether at least half this block's registers carry
+// the int16 0x8000 sentinel — the shape of a failed or partial read.
+//
+// It is the OTHER half of the write-side gate, and it is what keeps audit E2
+// closed once CorruptScaleFactor stops treating unimplemented scale factors as
+// corruption: a read that came back all-0x8000 (a device rebooting mid-poll, a
+// fault-injected read) would otherwise look like a device that merely
+// implements nothing, and a whole-block read-modify-write would program that
+// garbage straight back into its control registers.
+//
+// Half is a deliberate threshold rather than "all": a partial read is still a
+// failed read. It does not fire on a legitimately sparse device, because the
+// 0x8000 sentinel belongs only to the int16/sunssf/int32-high-word points — the
+// enum and uint families use 0xFFFF — so even a 704 implementing nothing at all
+// reaches roughly a fifth of its registers, not half.
+func (v View) ReadLooksSaturated() bool {
 	n := v.l.Len()
 	if n == 0 {
 		return false

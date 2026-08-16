@@ -49,6 +49,28 @@ func (e *GeometryError) Unwrap() error { return ErrGeometryUnknown }
 //
 // A value the caller did NOT command (NaN) never raises this: a device is
 // entitled not to implement a scale factor for a point nobody is writing.
+//
+// # CLASSIFICATION CONTRACT — this is a REFUSAL, not a device failure
+//
+// This sentinel is STABLE and exported for consumers to match on with
+// errors.Is, and it carries three guarantees a retry/session layer can rely on:
+//
+//	DETERMINISTIC   the same block and the same commanded value raise it again,
+//	                every time. Re-attempting cannot help, and nothing about the
+//	                link or the session is in question.
+//	LOCAL           it is decided entirely from a block already in hand. No
+//	                request goes out to raise it.
+//	ZERO REGISTERS  the refusal precedes the encode, and every derbase writer
+//	                discards its staged block on it, so the device is exactly
+//	                where it was.
+//
+// A consumer that sorts errors into "the session is bad, tear it down" versus
+// "the device answered fine and we declined to write" must put this in the
+// SECOND class. Sorting it into the first produces the page-forever pathology
+// inverted: a healthy device, a healthy link, a deterministic local refusal,
+// and a Modbus session rebuilt on every poll for as long as the condition
+// lasts. lexa-gw's cmd/modbus/session_class.go zeroWriteRefusal is that
+// classifier and must match this sentinel.
 var ErrScaleFactorUnavailable = errors.New("sunspec: scale factor unreadable for a commanded point")
 
 // ScaleFactorError names the point that could not be encoded and the
@@ -79,6 +101,11 @@ func (e *ScaleFactorError) Unwrap() error { return ErrScaleFactorUnavailable }
 // different route. No caller inside this module can produce it (every SetFloat
 // target in models 702/703/704 is 16- or 32-bit, and 64-bit points are written
 // through their own helpers), which is exactly why it survived unnoticed.
+//
+// CLASSIFICATION CONTRACT: identical to ErrScaleFactorUnavailable above — a
+// STABLE exported sentinel naming a DETERMINISTIC, LOCAL, ZERO-REGISTER
+// refusal. Consumers sorting session health from write refusals must treat the
+// two the same way, and for the same reason.
 var ErrPointNotEncodable = errors.New("sunspec: point type has no scaled-float encoding")
 
 // PointTypeError names a declared point whose type SetFloat cannot encode. It
