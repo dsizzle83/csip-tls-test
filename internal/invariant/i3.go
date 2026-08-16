@@ -117,7 +117,10 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
+
+	"lexa-proto/sunspec"
 )
 
 type i3 struct{ p Params }
@@ -182,7 +185,7 @@ func (i *i3) Check(ctx context.Context, w *World) (Result, error) {
 			continue
 		}
 		for _, v := range i.witnesses(obs, r) {
-			cmd, ok := commandOf(v.Unit.Commands(v.Source), r.Point)
+			cmd, ok := i.commandUnderTest(v.Unit, v.Source, r)
 			if !ok || !cmd.Raw.Known() {
 				continue
 			}
@@ -199,7 +202,7 @@ func (i *i3) Check(ctx context.Context, w *World) (Result, error) {
 			if f, confounded := i.applyThenRefuseLie(obs, r, v); confounded {
 				res.Verdict = Worse(res.Verdict, Warn)
 				key.note(Warn, "lying-peer-confound:%s:%d:%s:%s:%s",
-					r.Credential, r.Unit, r.Point, trimFloat(r.Value.Val), v.Label)
+					r.Credential, r.Unit, r.Point, trimFloat(r.Value.Val), i.ghostSubject(obs, v))
 				res.Facts = append(res.Facts, i.factsFor(r, v, cmd, obs)...)
 				res.Facts = append(res.Facts,
 					F("i3.exempt.fault", "", "manifest", "%s", f),
@@ -240,7 +243,7 @@ func (i *i3) Check(ctx context.Context, w *World) (Result, error) {
 			}
 			res.Verdict = Fail
 			key.note(Fail, "ghost:%s:%d:%s:%s:%s",
-				r.Credential, r.Unit, r.Point, trimFloat(r.Value.Val), v.Label)
+				r.Credential, r.Unit, r.Point, trimFloat(r.Value.Val), i.ghostSubject(obs, v))
 			res.Facts = append(res.Facts, i.factsFor(r, v, cmd, obs)...)
 			ghostWhy := fmt.Sprintf(
 				"write#%d set %s=%s on unit %d and the DUT REFUSED it with exception 0x%02X, "+
@@ -390,7 +393,7 @@ func (i *i3) applyThenRefuseLie(obs *Observation, r WriteRecord, v devView) (Fau
 			if len(inScope) > 0 && !inScope[f.Target] {
 				continue
 			}
-			if !i.lyingDeviceHoldsIt(obs, r, f.Target) {
+			if !i.lyingDeviceExplains(obs, r, v, f.Target) {
 				continue
 			}
 		}
@@ -399,29 +402,146 @@ func (i *i3) applyThenRefuseLie(obs *Observation, r WriteRecord, v devView) (Fau
 	return Fault{}, false
 }
 
-// lyingDeviceHoldsIt reports whether the device the lie is armed on is itself
-// observed holding the refused value, in the register the write targeted.
+// lyingDeviceExplains reports whether the device the lie is armed on can
+// account for the value THIS witness is holding.
 //
-// It is the causal half of the TARGET clause. The exemption's claim is that the
-// campaign's own fault put the value where the DUT is projecting it from; a
-// lying device that does not hold the value did not, and the ghost on the
-// projection has some other source that this invariant is entitled to report.
+// ── Two questions, and the first fix only answered one ─────────────────────
 //
-// It returns FALSE when the device is not in the observation, or is
-// unreachable, or serves no comparable register — every "cannot tell" answer.
-// That is deliberate and is the direction that costs a false FAIL rather than a
-// false PASS: an unexplained ghost is adjudicated by a human, an unnoticed one
-// is not.
-func (i *i3) lyingDeviceHoldsIt(obs *Observation, r WriteRecord, target string) bool {
+// Gate #18 replaced a nominal scope check with a causal one: the lying device
+// must itself hold the refused value. That is necessary and it is not
+// sufficient, because it establishes only that SOME in-scope device holds the
+// value — not that the device holding it is the one this projection is OF.
+//
+// On a multi-DER bench that gap is the whole defect back again. The campaign
+// populates the write record's projection with EVERY device in the inventory
+// (cmd/gw-campaign's derNames), so the nominal clause rejects nothing, and a
+// lying der-a serving unit 7 would excuse a ghost on dut.unit1 — a value der-a
+// cannot have put there. The run then reports OK and the ghost lands green,
+// which is gate #18's end-state reached by another route.
+//
+// So the device must ALSO be the one the witness is a projection of, and the
+// evidence for that is on both sides already: sources.go reads model 1 into
+// UnitView.Identity for every unit it scans, on the DER's own channel and on
+// the DUT's northbound alike. A DUT faithfully projecting a device projects its
+// identity with it, so identity equality is the pairing — measured, not
+// configured, and not inferred from a unit number the campaign never mapped.
+//
+// EITHER SIDE EMPTY DOES NOT FIRE. An unidentified device cannot be shown to be
+// the one the projection is of, and this exemption does not fire on what it
+// cannot show. Same direction as every other clause here: a false FAIL is
+// adjudicated by a human, a false PASS is not.
+func (i *i3) lyingDeviceExplains(obs *Observation, r WriteRecord, v devView, target string) bool {
 	d, ok := obs.DERs[target]
 	if !ok || !d.Reachable {
 		return false
 	}
-	cmd, ok := commandOf(d.Unit.Commands(d.Source), r.Point)
+	// The lying device must be the one this witness projects. Identity is the
+	// only pairing either side actually measures.
+	lyingID := strings.TrimSpace(d.Unit.Identity)
+	witnessID := strings.TrimSpace(v.Unit.Identity)
+	if lyingID == "" || witnessID == "" || lyingID != witnessID {
+		return false
+	}
+	cmd, ok := i.commandUnderTest(d.Unit, d.Source, r)
 	if !ok || !cmd.Raw.Known() {
 		return false
 	}
 	return i.sameValue(cmd.Raw, r.Value)
+}
+
+// commandUnderTest decodes the point a write RECORD targeted, from the model
+// the record itself names.
+//
+// Both readings in this file used UnitView.Commands unconditionally, which
+// decodes model 704 and only model 704 — so a refused write recorded against
+// model 123 was judged against M704's WMaxLimPct, a different register on a
+// different generation that happens to share a point name.
+//
+// It is latent today (only 704 records are constructed) and it stopped being
+// safely latent the moment model 123 entered modelsOfInterest: the legacy
+// scalar surface is now READ, so a legacy write record is one constructor away
+// and would have been judged against a register the device may not even serve.
+// A silent cross-model comparison is the shape this invariant exists to catch,
+// arriving inside the invariant.
+//
+// A model this decoder has no reader for returns false — the honest answer, and
+// the one that costs a skipped witness rather than a judgement against the
+// wrong bank.
+func (i *i3) commandUnderTest(uv UnitView, source string, r WriteRecord) (Command, bool) {
+	switch r.Model {
+	case 0, 704:
+		// 0 is the historical default: every record this campaign builds names
+		// 704 explicitly, and a record that names nothing is treated as the
+		// generation it was written for rather than refused.
+		return commandOf(uv.Commands(source), r.Point)
+	case sunspec.ModelImmediateCtrl:
+		return commandOf(uv.LegacyCommands(source).Commands, r.Point)
+	}
+	return Command{}, false
+}
+
+// ghostSubject is what a ghost finding is ABOUT: the physical register, not the
+// channel it was read through.
+//
+// ── M9: one ghost at two witnesses ─────────────────────────────────────────
+//
+// A ghost is normally visible twice — in the DER's own register image, and in
+// the DUT's projection of that DER — and keying on the witness LABEL made that
+// two findings, two shrinks, two entries in the count. That is IW15-031's
+// over-count at N = 2, and IW15-031's whole lesson is that an identity carrying
+// something other than the finding's substance inflates the count.
+//
+// BUT FOLDING UNCONDITIONALLY WOULD BE WRONG, and this is why the answer is not
+// simply "always one". The two witnesses can carry genuinely DIFFERENT findings:
+// the DUT's projection may hold the refused value while the DER does not, which
+// is durable state in the DUT ITSELF — a different defect, with a different
+// owner, from a device that took a write it refused. Merging those would hide
+// one behind the other, which is the same crime in the other direction and the
+// one gate #19 caught in the shrinker's keyer.
+//
+// So the rule is neither: FOLD WHEN THE TWO WITNESSES ARE LOOKING AT THE SAME
+// PHYSICAL REGISTER, and not otherwise. The relation that decides it is the one
+// H3 already needed — a DUT projecting a device projects its model-1 identity
+// with it, so identity equality is what makes "der.X" and "dut.unitN" two
+// readings of one thing rather than two things.
+//
+// When the identity cannot be established the subject falls back to the witness
+// label, which is the pre-M9 behaviour: an unidentified bench keeps its
+// findings separate rather than folding everything into one key on the strength
+// of a pairing nobody measured. Over-counting is a reporting defect; merging
+// two real findings is a lost one.
+//
+// The witness set is NOT lost by folding — it goes where it belongs, in the
+// facts (i3.observed.witness, one per witness, appended for every witness that
+// saw it), so a reader of the finding sees both readings under one identity.
+func (i *i3) ghostSubject(obs *Observation, v devView) string {
+	if v.Witness == witnessDER {
+		// A DER witness is already the device. Prefer its identity so it folds
+		// with the DUT's projection of it.
+		if id := strings.TrimSpace(v.Unit.Identity); id != "" {
+			return "device:" + id
+		}
+		return v.Label
+	}
+	// A DUT projection: fold onto the DER it is a projection OF, when that can
+	// be established from what both sides measured.
+	witnessID := strings.TrimSpace(v.Unit.Identity)
+	if witnessID == "" {
+		return v.Label
+	}
+	for _, name := range obs.DERNames() {
+		d := obs.DERs[name]
+		if !d.Reachable {
+			continue
+		}
+		if strings.TrimSpace(d.Unit.Identity) == witnessID {
+			return "device:" + witnessID
+		}
+	}
+	// Identified, but no DER in this observation carries that identity — so
+	// this projection is NOT a second reading of any device here, and it is its
+	// own finding. This is the pure projection ghost.
+	return v.Label
 }
 
 // lieApplyThenRefuse is sim/southbound's name for the one fault kind that

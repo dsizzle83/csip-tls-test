@@ -133,9 +133,54 @@ func (c *cli) runVerify(stdout, stderr io.Writer) int {
 		return exitOK
 	}
 	fmt.Fprintf(stdout, "✗ BUNDLE DOES NOT VERIFY — do not submit or cite it until the findings above\n"+
-		"  are explained. A hash mismatch means the capture and the report disagree.\n")
+		"  are explained. %s\n", verifyFailureCause(rep))
 	fmt.Fprintf(stdout, "%s\n", strings.Repeat("═", 78))
 	return exitFail
+}
+
+// verifyFailureCause explains what actually failed, rather than asserting a
+// cause the report may not support.
+//
+// This line used to read "A hash mismatch means the capture and the report
+// disagree" on EVERY failure. Verification has several independent legs now —
+// file digests, assertion citations, the metrics channel, the fixture timebase,
+// and the case-verdict re-derivation — and most of them can fail with every
+// byte matching. A campaign bundle that declares no capture is the common case:
+// its files hash correctly, and a reader chasing a phantom hash mismatch is
+// being sent to look at the one thing that is fine.
+//
+// It reads the report's STRUCTURED results rather than its prose, so the
+// attribution follows what was checked and not what the strings happen to say.
+func verifyFailureCause(rep *bundle.VerifyReport) string {
+	digests := 0
+	for _, f := range rep.Files {
+		if !f.OK {
+			digests++
+		}
+	}
+	citations := 0
+	for _, a := range rep.Assertions {
+		if a.Citable && !a.OK {
+			citations++
+		}
+	}
+	switch {
+	case digests > 0 && citations > 0:
+		return fmt.Sprintf("%d manifest file(s) and %d cited assertion(s) hash to something other than "+
+			"the report records: the capture and the report disagree.", digests, citations)
+	case digests > 0:
+		return fmt.Sprintf("%d manifest file(s) hash to something other than the report records: the "+
+			"bundle's own contents have changed since it was written.", digests)
+	case citations > 0:
+		return fmt.Sprintf("%d cited assertion(s) do not hash to the value the report records: the "+
+			"capture and the report disagree.", citations)
+	default:
+		// Every digest matched. The failure is one of the structural legs, and
+		// saying "hash mismatch" here would point a reader at the only part of
+		// the bundle that is demonstrably intact.
+		return "every file and citation hashes correctly, so this is NOT a hash mismatch — the finding(s) " +
+			"above are about what the bundle CLAIMS rather than about its bytes."
+	}
 }
 
 // orNone renders an absent digest as something a reader will not mistake for a

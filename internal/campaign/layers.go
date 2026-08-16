@@ -38,6 +38,7 @@ package campaign
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"time"
 
@@ -318,10 +319,104 @@ func (AuthzProbe) Describe() string {
 // [probeValue] refuses to assert distinctiveness once it runs out rather than
 // wrapping. A SKIP naming the exhausted supply is a true statement; a repeated
 // witness value is a false one.
-var probeValues = []float64{
-	37, 63, 41, 29, 71, 53, 17, 83, 47, 23, 67, 31, 79, 43, 59, 89,
-	13, 91, 27, 61, 39, 73, 19, 87, 33, 69, 21, 77, 49, 93,
+// ── The spacing is DERIVED FROM THE TOLERANCE, not chosen ──────────────────
+//
+// The list used to be thirty hand-picked unround numbers, and gate #19 measured
+// what that actually bought: the closest pair, 91 and 93, cleared I3's
+// comparison by 0.16 PERCENTAGE POINTS.
+//
+// The arithmetic is the part worth writing down, because "they are all
+// different numbers" hides it. I3 compares with a slack of
+// max(|refused| * Tol.Rel, 0.5) — at Rel = 0.01 that is 0.93 at 93 and 0.91 at
+// 91 — and BOTH values carry their own band: the refused one, and the accepted
+// neighbour that actually landed on the device. Two bands 0.93 and 0.91 wide
+// inside a gap of 2 leave 0.16 to spare. A device that rounds, a scale factor
+// one step coarser, or anyone loosening Tol by a hair, and an ACCEPTED
+// neighbour value satisfies sameValue for a REFUSED one — manufacturing
+// exactly the false P1 the exhausted-list fix above was written to stop, from
+// the other end. Distinctiveness was being asserted on a property nobody had
+// checked against the comparison that consumes it.
+//
+// So the spacing is computed from the tolerance rather than eyeballed, and the
+// two are pinned together by a test that fails when EITHER side moves against
+// the other (TestProbeValuesOutrunTheComparisonTolerance).
+
+// probeSpacingSafetyFactor is how many times the two-band width the spacing
+// must be.
+//
+// THREE, and the reason it is not "greater than 1" is that 1 only guarantees
+// the bands do not overlap AT THESE EXACT VALUES. The device is entitled to
+// round to its own register granularity, a percent register at a coarser scale
+// factor quantises further, and Tol is a floor-and-relative rule whose floor
+// (0.5) dominates at small values. Three leaves the property true through all
+// of that, and it is cheap: the bench needs about ten values and the range
+// holds fourteen at this spacing.
+const probeSpacingSafetyFactor = 3
+
+// probeValueRange is the percent window the probes live in.
+//
+// It is sized for HEADROOM over what the bench presents. The campaign builds
+// twelve credentials today — five role certs plus seven negative fixtures — and
+// probeValue stops asserting distinctiveness once the list runs out (honestly,
+// with a disclosure, but a non-distinctive probe is one I3 will SKIP). A list
+// that merely matched the credential count would silently lose coverage the
+// first time somebody added a fixture, which is the exhausted-list failure
+// above wearing a smaller number.
+//
+// The slack GROWS with the value, so the top of the range is where the margin
+// is thinnest — 91 and 93 were the pair gate #19 caught — and the generator
+// below spaces for the WIDEST band in the range, so including the top costs
+// nothing at the bottom. The floor stays above zero because a percentage near
+// zero is a curtailment a scheduler default could plausibly land on.
+const (
+	probeValueMin = 7
+	probeValueMax = 99
+)
+
+// probeValueSpacing is the minimum separation two probe values must have for
+// I3's comparison to be unable to confuse them, given the tolerance it will
+// actually use.
+//
+// It takes the tolerance rather than reading a package default so a test can
+// drive it with a LOOSENED one and watch the requirement grow — which is how
+// the pinning test proves it is really coupled.
+func probeValueSpacing(tol invariant.Tolerance) float64 {
+	// The widest band any value in the range can carry, by I3's own rule.
+	widest := math.Max(probeValueMax*tol.Rel, 0.5)
+	return probeSpacingSafetyFactor * 2 * widest
 }
+
+// buildProbeValues lays out as many values as the range holds at the required
+// spacing, offset so none of them is round.
+//
+// Unroundness still matters for the reason the doc above gives — a scheduler
+// default lands on 50, not on 47 — and it is a CONSTRUCTION property now
+// rather than thirty literals somebody keeps unround by hand.
+//
+// The step is a MINIMUM, not a stride, and that is what lets both requirements
+// hold at once. A uniform stride cannot: with any step coprime to five the
+// sequence walks every residue and hits a multiple of five every fifth term
+// (11, 17, 23, 29, 35 …), and with a step that is a multiple of ten the range
+// only holds nine values. So the generator advances by at least the required
+// spacing and then keeps advancing until it lands on a value that is odd AND
+// not a multiple of five — which yields gaps of 6 or 8, thirteen values, and
+// no round number anywhere.
+func buildProbeValues(tol invariant.Tolerance) []float64 {
+	step := math.Ceil(probeValueSpacing(tol))
+	var out []float64
+	for v := float64(probeValueMin); v <= probeValueMax; {
+		out = append(out, v)
+		// At LEAST the required spacing, then on to the next value that is
+		// neither even nor a multiple of five.
+		for v += step; math.Mod(v, 2) == 0 || math.Mod(v, 5) == 0; v++ {
+		}
+	}
+	return out
+}
+
+// probeValues are the distinctive setpoints the probes command, spaced so that
+// I3's own comparison cannot mistake one for another.
+var probeValues = buildProbeValues(invariant.DefaultTolerance())
 
 // probeValue returns the setpoint for the i-th credential's write probe, and
 // whether it may be asserted DISTINCTIVE — that is, whether it is a value no

@@ -59,13 +59,28 @@ func cleanRegs(t *testing.T) UnitView {
 	})
 }
 
+// identified is derFixture plus the model-1 identity a real scan reads
+// (sources.go populates UnitView.Identity for every unit it reads, on the DER's
+// own channel and on the DUT's northbound alike).
+//
+// The identity is what pairs a DER with the DUT's projection OF that DER, and
+// it is measured rather than configured — which is why the exemption uses it
+// instead of a unit number the campaign never mapped to a device.
+func identified(name, identity string, uv UnitView) DERView {
+	d := derFixture(name, uv)
+	d.Unit.Identity = identity
+	return d
+}
+
 // projectionWorld builds a world with a DUT PROJECTION witness holding the
 // refused value, plus whatever DER views the caller supplies.
 //
 // The projection is the witness the campaign actually judges and the one the
-// vacuous clause guarded, so every test here goes through it.
+// vacuous clause guarded, so every test here goes through it. dutIdentity is
+// the identity the DUT projects on that unit — empty models a DUT (or a scan)
+// that produced none, which the exemption must treat as un-pairable.
 func projectionWorld(t *testing.T, at, writeAt time.Time, ders []DERView,
-	scope []string, arm func(*FaultManifest)) *World {
+	scope []string, dutIdentity string, arm func(*FaultManifest)) *World {
 
 	t.Helper()
 	man := NewManifest("i3-scope", 4242)
@@ -83,9 +98,11 @@ func projectionWorld(t *testing.T, at, writeAt time.Time, ders []DERView,
 	w := NewWorld(Sources{}, man, led, DefaultParams())
 	o := obsFixture(at, ders...)
 	// The DUT's own projection, holding the refused value: the ghost.
+	projected := ghostRegs(t, 63)
+	projected.Identity = dutIdentity
 	o.DUT = DUTView{
 		Source: "mbaps:dut", Reachable: true,
-		Units: map[uint8]UnitView{1: ghostRegs(t, 63)},
+		Units: map[uint8]UnitView{1: projected},
 	}
 	o.Faults = man.Snapshot()
 	w.Inject(o)
@@ -132,9 +149,9 @@ func TestI3_ALieOnOneDeviceDoesNotExemptAProjectionGhost(t *testing.T) {
 	obs := write.Add(2 * time.Second)
 
 	w := projectionWorld(t, obs, write, []DERView{
-		derFixture("der-a-lying", cleanRegs(t)), // armed, holds nothing
-		derFixture("der-b-quiet", cleanRegs(t)), // not armed, holds nothing
-	}, nil, armOn("der-a-lying", write.Add(-9*time.Second)))
+		identified("der-a-lying", "acme inv sn=A", cleanRegs(t)), // armed, holds nothing
+		identified("der-b-quiet", "acme inv sn=B", cleanRegs(t)), // not armed, holds nothing
+	}, nil, "acme inv sn=A", armOn("der-a-lying", write.Add(-9*time.Second)))
 
 	res := i3Verdict(t, w)
 	if res.Verdict != Fail {
@@ -157,9 +174,9 @@ func TestI3_ADeviceHoldingItFailsThroughItsOwnWitnessRegardless(t *testing.T) {
 	obs := write.Add(2 * time.Second)
 
 	w := projectionWorld(t, obs, write, []DERView{
-		derFixture("der-a-lying", cleanRegs(t)),
-		derFixture("der-b-ghost", ghostRegs(t, 63)),
-	}, nil, armOn("der-a-lying", write.Add(-9*time.Second)))
+		identified("der-a-lying", "acme inv sn=A", cleanRegs(t)),
+		identified("der-b-ghost", "acme inv sn=B", ghostRegs(t, 63)),
+	}, nil, "acme inv sn=A", armOn("der-a-lying", write.Add(-9*time.Second)))
 
 	if res := i3Verdict(t, w); res.Verdict != Fail {
 		t.Fatalf("I3 = %s, want FAIL through der-b-ghost's own witness.\n  reason: %s",
@@ -175,8 +192,8 @@ func TestI3_ALieOnTheDeviceHoldingItStillExempts(t *testing.T) {
 	obs := write.Add(2 * time.Second)
 
 	w := projectionWorld(t, obs, write, []DERView{
-		derFixture("loopback-der", ghostRegs(t, 63)),
-	}, nil, armOn("loopback-der", write.Add(-9*time.Second)))
+		identified("loopback-der", "acme inv sn=LB", ghostRegs(t, 63)),
+	}, nil, "acme inv sn=LB", armOn("loopback-der", write.Add(-9*time.Second)))
 
 	res := i3Verdict(t, w)
 	if res.Verdict != Warn {
@@ -207,12 +224,13 @@ func TestI3_AnUnobservableLyingDeviceDoesNotExempt(t *testing.T) {
 		{"the lying device is not in the observation at all", nil},
 		{"the lying device is present but unreachable", []DERView{{
 			Name: "gone-der", Source: "modbus:test/gone-der", Reachable: false,
+			Unit: UnitView{Identity: "acme inv sn=GONE"},
 		}}},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			w := projectionWorld(t, obs, write, tc.ders, nil,
+			w := projectionWorld(t, obs, write, tc.ders, nil, "acme inv sn=GONE",
 				armOn("gone-der", write.Add(-9*time.Second)))
 			if res := i3Verdict(t, w); res.Verdict != Fail {
 				t.Fatalf("I3 = %s, want FAIL. The exemption fired without being able to check that the "+
@@ -234,8 +252,8 @@ func TestI3_TheRecordedProjectionStillNarrowsTheExemption(t *testing.T) {
 	// der-out holds the value AND is lying — but the write could not reach it,
 	// so it cannot be what the DUT projected from.
 	w := projectionWorld(t, obs, write,
-		[]DERView{derFixture("der-out", ghostRegs(t, 63))},
-		[]string{"der-in"},
+		[]DERView{identified("der-out", "acme inv sn=OUT", ghostRegs(t, 63))},
+		[]string{"der-in"}, "acme inv sn=OUT",
 		armOn("der-out", write.Add(-9*time.Second)))
 
 	if res := i3Verdict(t, w); res.Verdict != Fail {
@@ -253,12 +271,232 @@ func TestI3_AnInScopeLyingDeviceHoldingItStillExempts(t *testing.T) {
 	obs := write.Add(2 * time.Second)
 
 	w := projectionWorld(t, obs, write,
-		[]DERView{derFixture("der-in", ghostRegs(t, 63))},
-		[]string{"der-in"},
+		[]DERView{identified("der-in", "acme inv sn=IN", ghostRegs(t, 63))},
+		[]string{"der-in"}, "acme inv sn=IN",
 		armOn("der-in", write.Add(-9*time.Second)))
 
 	if res := i3Verdict(t, w); res.Verdict != Warn {
 		t.Fatalf("I3 = %s, want WARN: the lying device is in scope AND holds the value.\n  reason: %s",
 			res.Verdict, res.Reason)
+	}
+}
+
+// ── H3: the causal clause must be about THIS witness's device ──────────────
+//
+// Gate #18's fix established that the lying device holds the value. Gate #19
+// found that this proves only that SOME in-scope device holds it — not that the
+// device holding it is the one the projection is OF. The three probes below are
+// that finding, pinned.
+
+// PROBE 1. A lying device that HOLDS the value but is a different device from
+// the one this projection is of must NOT excuse the ghost.
+//
+// This is the multi-DER bench shape and it is not hypothetical: the campaign
+// populates the write record's projection with EVERY device in the inventory
+// (cmd/gw-campaign's derNames), so the nominal scope clause rejects nothing and
+// everything rests on this one. der-a is lying AND holding 63 — but the DUT's
+// unit projects der-b, so der-a cannot be where that value came from.
+func TestI3_ALyingDeviceHoldingItOnAnotherUnitDoesNotExempt(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	w := projectionWorld(t, obs, write, []DERView{
+		// Lying, and holding the refused value — but a DIFFERENT machine.
+		identified("der-a-lying", "acme inv sn=A", ghostRegs(t, 63)),
+		// The device this unit actually projects, holding nothing.
+		identified("der-b-projected", "acme inv sn=B", cleanRegs(t)),
+	}, nil, "acme inv sn=B", armOn("der-a-lying", write.Add(-9*time.Second)))
+
+	res := i3Verdict(t, w)
+	if res.Verdict != Fail {
+		t.Fatalf("I3 = %s, want FAIL. der-a is lying and holds 63, but the DUT's unit projects der-b "+
+			"(sn=B) — so der-a cannot be where that value came from and its lie cannot excuse it. "+
+			"Accepting it proves only that SOME in-scope device holds the value, which on a multi-DER "+
+			"bench is the vacuous clause again: the ghost lands as a GREEN run.\n  reason: %s",
+			res.Verdict, res.Reason)
+	}
+	t.Logf("FAIL (correct) — %s", res.Reason)
+}
+
+// PROBE 2. When the identities DO match, the exemption still fires — the fix
+// must not retire the ruling it is narrowing.
+func TestI3_AnIdentityMatchedLyingDeviceStillExempts(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	w := projectionWorld(t, obs, write, []DERView{
+		identified("der-a-lying", "acme inv sn=A", ghostRegs(t, 63)),
+		identified("der-b-quiet", "acme inv sn=B", cleanRegs(t)),
+	}, nil, "acme inv sn=A", armOn("der-a-lying", write.Add(-9*time.Second)))
+
+	res := i3Verdict(t, w)
+	if res.Verdict != Warn {
+		t.Fatalf("I3 = %s, want WARN: the lying device holds the value AND is the device this unit "+
+			"projects (sn=A on both sides), so the campaign's own fault explains it.\n  reason: %s",
+			res.Verdict, res.Reason)
+	}
+	t.Logf("WARN (correct exemption) — %s", res.Reason)
+}
+
+// PROBE 3. Identity absent on either side: the exemption cannot show the
+// pairing and does not fire.
+//
+// An unidentified device might be the one the projection is of. "Might" is not
+// what an exemption runs on — the whole family of clauses here costs a false
+// FAIL rather than a false PASS, because the first is adjudicated by a human
+// and the second is not.
+func TestI3_AnUnidentifiedDeviceCannotBePairedAndDoesNotExempt(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	for _, tc := range []struct {
+		name  string
+		derID string
+		dutID string
+	}{
+		{"the DER served no model 1", "", "acme inv sn=A"},
+		{"the DUT's projection served no model 1", "acme inv sn=A", ""},
+		{"neither side is identified", "", ""},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			w := projectionWorld(t, obs, write, []DERView{
+				identified("der-a-lying", tc.derID, ghostRegs(t, 63)),
+			}, nil, tc.dutID, armOn("der-a-lying", write.Add(-9*time.Second)))
+
+			if res := i3Verdict(t, w); res.Verdict != Fail {
+				t.Fatalf("I3 = %s, want FAIL. The exemption fired without being able to show the lying "+
+					"device is the one this projection is OF.\n  reason: %s", res.Verdict, res.Reason)
+			}
+		})
+	}
+}
+
+// ── M8: the judgement follows the record's own model ───────────────────────
+
+// TestI3_JudgesTheModelTheRecordNames pins that a write recorded against model
+// 123 is not judged against model 704's register of the same point name.
+//
+// Latent today — only 704 records are constructed — and it stopped being safely
+// latent when model 123 entered modelsOfInterest, because the legacy scalar
+// surface is now READ and a legacy write record is one constructor away.
+func TestI3_JudgesTheModelTheRecordNames(t *testing.T) {
+	t.Parallel()
+	i := &i3{p: DefaultParams()}
+
+	// A unit whose 704 holds the refused value and whose 123 does not.
+	uv := ghostRegs(t, 63)
+	uv.Regs[sunspec.ModelImmediateCtrl] = m123Block(nil)
+
+	if _, ok := i.commandUnderTest(uv, "src", WriteRecord{Model: 704, Point: "WMaxLimPct"}); !ok {
+		t.Error("a model-704 record did not resolve against the 704 image")
+	}
+	// The legacy point is MODEL-QUALIFIED, so a 123 record naming the bare 704
+	// point name resolves to nothing rather than to the 704 register.
+	if _, ok := i.commandUnderTest(uv, "src",
+		WriteRecord{Model: sunspec.ModelImmediateCtrl, Point: "WMaxLimPct"}); ok {
+		t.Error("a model-123 record resolved against model 704's WMaxLimPct — a different register on a " +
+			"different generation that happens to share a point name")
+	}
+	// Its own point does resolve.
+	if _, ok := i.commandUnderTest(uv, "src",
+		WriteRecord{Model: sunspec.ModelImmediateCtrl, Point: PointM123Conn}); !ok {
+		t.Error("a model-123 record did not resolve against the 123 image")
+	}
+	// A model this decoder has no reader for is refused, not guessed.
+	if _, ok := i.commandUnderTest(uv, "src", WriteRecord{Model: 705, Point: "WMaxLimPct"}); ok {
+		t.Error("a model-705 record resolved against something; an unreadable model must skip the " +
+			"witness rather than be judged against the wrong bank")
+	}
+}
+
+// ── M9: one ghost at two witnesses ────────────────────────────────────────
+
+// TestI3_OneGhostAtTwoWitnessesIsOneFinding is the fold, and the argument for
+// it: a DER's own image and the DUT's projection OF that DER are two readings
+// of one physical register, so a ghost visible in both is one finding — with
+// both readings in its facts.
+func TestI3_OneGhostAtTwoWitnessesIsOneFinding(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	// The device holds the ghost AND the DUT projects it, same identity, no
+	// lie armed anywhere.
+	w := projectionWorld(t, obs, write, []DERView{
+		identified("inv-plain", "acme inv sn=A", ghostRegs(t, 63)),
+	}, nil, "acme inv sn=A", nil)
+
+	res := i3Verdict(t, w)
+	if res.Verdict != Fail {
+		t.Fatalf("I3 = %s, want FAIL: %s", res.Verdict, res.Reason)
+	}
+	if len(res.Keys) != 1 {
+		t.Fatalf("one ghost, visible at the DER and at the DUT's projection of that same DER, produced "+
+			"%d findings: %v. That is IW15-031's over-count at N=2 — two shrinks and two entries in the "+
+			"count for one physical register holding one value", len(res.Keys), res.Keys)
+	}
+	// The witness set is not lost by folding — it is in the facts.
+	var witnesses []string
+	for _, f := range res.Facts {
+		if f.Key == "i3.observed.witness" {
+			witnesses = append(witnesses, f.Value)
+		}
+	}
+	if len(witnesses) < 2 {
+		t.Errorf("the folded finding records %d witness fact(s) (%v); folding must move the witness set "+
+			"into the facts, not discard it", len(witnesses), witnesses)
+	}
+	t.Logf("one finding, key %q, witnesses %v", res.Keys[0], witnesses)
+}
+
+// And the fold must NOT merge findings that are genuinely different. A ghost in
+// the DUT's projection with NO device behind it holding the value is durable
+// state in the DUT itself — a different defect, a different owner — and it
+// stays its own finding.
+func TestI3_AProjectionGhostWithNoDeviceBehindItStaysItsOwn(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	// Device A holds the ghost. The DUT projects an identity NO device here
+	// carries — so its ghost is not a second reading of A.
+	w := projectionWorld(t, obs, write, []DERView{
+		identified("inv-a", "acme inv sn=A", ghostRegs(t, 63)),
+	}, nil, "acme inv sn=UNKNOWN", nil)
+
+	res := i3Verdict(t, w)
+	if res.Verdict != Fail {
+		t.Fatalf("I3 = %s, want FAIL: %s", res.Verdict, res.Reason)
+	}
+	if len(res.Keys) != 2 {
+		t.Fatalf("a device ghost and an unrelated projection ghost produced %d finding(s): %v. Folding "+
+			"must key on the physical register, and these are two — merging them hides one behind the "+
+			"other, which is the lost-finding crime the shrinker keyer was just fixed for",
+			len(res.Keys), res.Keys)
+	}
+	t.Logf("two findings, correctly: %v", res.Keys)
+}
+
+// An UNIDENTIFIED bench keeps the pre-M9 behaviour rather than folding
+// everything onto one key on the strength of a pairing nobody measured.
+func TestI3_WithoutIdentitiesTheWitnessesDoNotFold(t *testing.T) {
+	t.Parallel()
+	write := time.Date(2026, 8, 15, 18, 45, 5, 0, time.UTC)
+	obs := write.Add(2 * time.Second)
+
+	w := projectionWorld(t, obs, write, []DERView{
+		derFixture("inv-plain", ghostRegs(t, 63)), // no identity
+	}, nil, "", nil)
+
+	res := i3Verdict(t, w)
+	if len(res.Keys) != 2 {
+		t.Fatalf("with no identity on either side the witnesses folded anyway (%d key(s): %v). "+
+			"Over-counting is a reporting defect; merging two findings that were never shown to be one "+
+			"is a lost finding", len(res.Keys), res.Keys)
 	}
 }
