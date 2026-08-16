@@ -1626,16 +1626,26 @@ func (b *Base) fixedWReference(negative bool) (float64, bool, error) {
 // now selects only the 704 sync group, which is all it was ever competent to
 // decide.
 //
-// # The ratings it consults, and why not the obvious two
+// # The rating it consults, and the gap that leaves
 //
-// PFOvrExtRtg / PFUndExtRtg are what this package bounded against, and the
-// vendored model_702.json labels BOTH of them "(Unused)" with the description
-// "Unused. Please use WOvrExtRtgPF." / "...WUndExtRtgPF." A device that follows
-// that instruction publishes the replacements and leaves the deprecated pair
-// unimplemented — whereupon minRatingBound saw NaN and applied NO BOUND AT ALL.
-// The guard was silently inert on exactly the conformant, current-generation
-// hardware it most needed to protect. ratedPFBound prefers the current points
-// and falls back to the deprecated pair for a device that publishes only those.
+// ratedPFBound reads PFOvrExtRtg / PFUndExtRtg — the LIMIT-shaped pair ("PF ...
+// Rating") — and deliberately not WOvrExtRtgPF / WUndExtRtgPF, which are the PF
+// coordinate of a (W, PF) operating-point characterisation and not a minimum
+// anything. An earlier revision of this comment described the opposite
+// preference, because an earlier revision of the CODE had it; both are
+// corrected. See ratedPFBound for the point descriptions the decision rests on
+// and for why capability.go's settings-first doctrine does not apply.
+//
+// The consequence is stated plainly rather than left to be discovered: the pair
+// this reads is marked "Unused" by the vendored model, so on a device
+// publishing only the current vocabulary THIS BOUND DOES NOT FIRE AT ALL
+// (TestRatedPFIsInertOnCurrentVocabularyOnly). Inert fails OPEN — the command
+// goes to the device, which is the final authority, and derbase verifies by
+// read-back regardless. That is the safer direction to be wrong in while the
+// question is open, and the open question is real: model 702 appears to publish
+// no minimum-supported-PF point in its current vocabulary at all, so bounding
+// this axis properly needs the (W, PF) pairs read as a curve or a PICS
+// disclosure that the bound is not enforced.
 func (b *Base) validatePFAtExcitation(pf float64, overExcited bool, axis string) error {
 	if math.IsNaN(pf) || pf < 0 || pf > 1 {
 		return &InvalidControlError{Axis: axis, Reason: fmt.Sprintf("power factor %g outside [0,1]", pf)}
@@ -3275,6 +3285,11 @@ const (
 	// string an operator actually reads has changed.
 	ElemM123Ena  = "WMaxLim_Ena"
 	ElemM123Conn = "Conn"
+	// The connect group's timers, elements in their own right since gate #20
+	// F3 so a timer that would defer or revert the command cannot land as a
+	// silent success.
+	ElemM123ConnWinTms  = "Conn_WinTms"
+	ElemM123ConnRvrtTms = "Conn_RvrtTms"
 )
 
 // Element indexes within m123LimitPlan's PlanOutcome.Elements, in write order.
@@ -3452,6 +3467,25 @@ func (p *m123ConnPlan) execute() (PlanOutcome, error) {
 	rvrtImpl := p.rvrt0 != 0xFFFF
 	grouped := winImpl && rvrtImpl && !p.b.noGroupedM123
 
+	// Each timer this plan is RESPONSIBLE for becomes an element of the
+	// outcome (gate #20 F3). Before this they were invisible: the plan carried
+	// one element, Conn, so a timer that NAK'd while Conn landed produced
+	// State=Applied, a nil error, and a Degraded() of false — a commanded
+	// disconnect reported as clean success with a 6000 s window still armed
+	// to defer it. PlanOutcome.Degraded() walks Elements, so making them
+	// elements is what makes that state classifiable by every caller that
+	// already reads the outcome; nothing has to walk Elements[].Sub for it.
+	type timerWrite struct {
+		name string
+		off  int
+		impl bool
+		errp error
+	}
+	timers := []timerWrite{
+		{ElemM123ConnWinTms, sunspec.M123_Conn_WinTms, winImpl, nil},
+		{ElemM123ConnRvrtTms, sunspec.M123_Conn_RvrtTms, rvrtImpl, nil},
+	}
+
 	var writeErr error
 	wrote := false
 	if grouped {
@@ -3465,8 +3499,8 @@ func (p *m123ConnPlan) execute() (PlanOutcome, error) {
 			// D8 attempt-then-fall-back, with the memo so the next plan on
 			// this device goes straight to the sequence.
 			p.b.noGroupedM123 = true
-			out.Elements[0].Advisory = fmt.Sprintf(
-				"device refused the grouped single-write (%v); completed element by element", err)
+			p.advise(&out, fmt.Sprintf(
+				"device refused the grouped single-write (%v); completed element by element", err))
 		}
 	}
 	if !wrote {
@@ -3474,20 +3508,17 @@ func (p *m123ConnPlan) execute() (PlanOutcome, error) {
 		// command that changes the plant's state is never issued before the
 		// registers that could defer or undo it have been cleared. Only
 		// implemented timers are touched.
-		if winImpl {
-			if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl,
-				sunspec.M123_Conn_WinTms, []uint16{0}); err != nil {
-				writeErr = fmt.Errorf("%s: clear connect window: %w", p.tag, err)
+		for i := range timers {
+			if !timers[i].impl {
+				continue
 			}
-		}
-		if rvrtImpl {
 			if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl,
-				sunspec.M123_Conn_RvrtTms, []uint16{0}); err != nil && writeErr == nil {
-				writeErr = fmt.Errorf("%s: clear connect revert timer: %w", p.tag, err)
+				uint16(timers[i].off), []uint16{0}); err != nil {
+				timers[i].errp = fmt.Errorf("%s: clear %s: %w", p.tag, timers[i].name, err)
 			}
 		}
 		// Conn LAST, and its error outranks a timer's: a failure to clear a
-		// timer on a disconnect that landed is a degraded success, whereas a
+		// timer on a disconnect that landed is a DEGRADED success, whereas a
 		// failure to write Conn is the command not landing at all.
 		if err := p.b.Reader.WriteModel(sunspec.ModelImmediateCtrl,
 			sunspec.M123_Conn, []uint16{p.want}); err != nil {
@@ -3496,6 +3527,46 @@ func (p *m123ConnPlan) execute() (PlanOutcome, error) {
 	}
 	if writeErr != nil {
 		out.Elements[0].Err = writeErr
+	}
+
+	// Append the timer elements, each measured by read-back like the headline
+	// point is — an ACK is not proof here either.
+	residual := []string{}
+	for _, tw := range timers {
+		if !tw.impl {
+			continue // not implemented: this plan never owned it
+		}
+		before := p.win0
+		if tw.off == sunspec.M123_Conn_RvrtTms {
+			before = p.rvrt0
+		}
+		el := ElementOutcome{Name: tw.name, Model: sunspec.ModelImmediateCtrl,
+			Before: float64(before), After: math.NaN(), Err: tw.errp}
+		switch got, ok := p.b.readM123Point(tw.off); {
+		case !ok:
+			el.State = ElementUnverified
+		default:
+			el.After = float64(got)
+			if got == 0 {
+				el.State = ElementApplied
+			} else {
+				el.State = ElementFailed
+				residual = append(residual, fmt.Sprintf("%s=%d", tw.name, got))
+			}
+		}
+		out.Elements = append(out.Elements, el)
+	}
+	// A CEASE whose timers did not clear may be deferred or undone by them, so
+	// the plant can be LESS restricted than the command intended even though
+	// Conn itself echoes back correctly. That is exactly what this flag means,
+	// and it is the signal the existing consumer already understands.
+	if len(residual) > 0 {
+		p.advise(&out, fmt.Sprintf(
+			"the commanded state landed but %s still armed: the device may defer or revert it",
+			strings.Join(residual, ", ")))
+		if p.want == 0 {
+			out.LessRestrictiveThanIntended = true
+		}
 	}
 
 	// L1 proof: the echo, never the ACK.
@@ -3518,7 +3589,7 @@ func (p *m123ConnPlan) execute() (PlanOutcome, error) {
 		// does not need.
 		out.Elements[0].State = ElementApplied
 		if writeErr != nil {
-			out.Elements[0].Advisory = "write returned an error but the device measurably holds the commanded state"
+			p.advise(&out, "write returned an error but the device measurably holds the commanded state")
 		}
 		return out, nil
 	}
@@ -4094,4 +4165,19 @@ func ReadWMaxFrom702(r *sunspec.Reader) (float64, error) {
 		return 0, fmt.Errorf("sunspec: Model 702 WMaxRtg is %g (invalid)", wmax)
 	}
 	return wmax, nil
+}
+
+// advise appends to the headline element's advisory instead of replacing it.
+//
+// Gate #20 F3: the grouped-refusal note and the landed-despite-an-error note
+// both wrote Elements[0].Advisory, so whichever ran second erased the first —
+// and the second was the generic success text, which is exactly the sentence a
+// reader least needs when a specific one was already there. Advisories on this
+// plan are cumulative facts about one write sequence, not a single verdict.
+func (p *m123ConnPlan) advise(out *PlanOutcome, msg string) {
+	if out.Elements[0].Advisory == "" {
+		out.Elements[0].Advisory = msg
+		return
+	}
+	out.Elements[0].Advisory += "; " + msg
 }
