@@ -696,3 +696,120 @@ func TestSolarReversionRowHasTeeth(t *testing.T) {
 	t.Logf("RED PROOF: the pre-engine solar sim stores RvrtTms=%d, reports RvrtRem=0 and never lapses "+
 		"— precisely what the RC0 §9.5 battery recorded for row 10", revBenchTmsS)
 }
+
+// ── Row 8: the same 123 timers, on the image the bench actually runs ─────────
+
+// TestSolarM123ThrottleReversionLapsesOnTheADVANCEDImageToo is the row the
+// legacy-only version of it could not have caught.
+//
+// GATE FINDING F1. TestSolarM123ReversionLapsesTheThrottleAndReconnects runs on
+// newRevSolarLegacyCurves, which serves no 704 and therefore no 704→123 bridge.
+// `modsim -advanced` — the image the RC0 battery ran — serves both, and
+// reversionStep's own advSync calls advBridgeCeiling, which resurrected the
+// WMaxLim_Ena the revert had just cleared and overwrote the value the revert had
+// deliberately left in place. Engine, /state and the log all said "lapsed"; the
+// wire said Ena=1. That is a fixture telling a bench two different things about
+// one function, which is the failure mode the whole engine exists to avoid.
+//
+// So this row asserts the ENGINE and the WIRE together, on the advanced image,
+// and it asserts BOTH register views of the one physical axis.
+func TestSolarM123ThrottleReversionLapsesOnTheADVANCEDImageToo(t *testing.T) {
+	ss, tb := newRevSolarAdvanced(t, 8000)
+	r, m123, m704 := ss.Regs, ss.bases.M123Base, ss.adv.M704
+
+	// A 704 ceiling is in force — the precondition for the bridge to run at
+	// all, and the ordinary state of an advanced device under CSIP control.
+	regs := mbReadMap(t, r, m704, uint16(sunspec.L704.Len()))
+	sunspec.L704.View(regs).SetEnum("WMaxLimPctEna", 1)
+	mbWriteMap(t, r, m704, regs...)
+
+	// A legacy client arms the 123 throttle with a timeout.
+	m123regs := mbReadMap(t, r, m123, uint16(sunspec.L123.Len()))
+	v := sunspec.L123.View(m123regs)
+	v.SetEnum("WMaxLim_Ena", 1)
+	v.SetU16At(sunspec.L123.Offset("WMaxLimPct"), 6000) // 60.00 %
+	v.SetU16At(sunspec.L123.Offset("WMaxLimPct_RvrtTms"), 90)
+	mbWriteMap(t, r, m123, m123regs...)
+
+	tb.Advance(90 * time.Second)
+	if expired := ss.reversionStep(); len(expired) != 1 || expired[0] != "123.WMaxLimPct" {
+		t.Fatalf("expired timers = %v, want exactly [123.WMaxLimPct]", expired)
+	}
+
+	// THE ENGINE's account.
+	for _, g := range ss.reversionSnapshot().Groups {
+		if g.Name == "123.WMaxLimPct" && g.Armed {
+			t.Error("/state still reports 123.WMaxLimPct armed after its expiry")
+		}
+	}
+	// THE WIRE's account — the half that was wrong.
+	if got := revU16(t, r, m123, sunspec.L123, "WMaxLim_Ena"); got != 0 {
+		t.Errorf("123 WMaxLim_Ena = %d on the wire after the timeout, want 0. The engine reverted it and "+
+			"the 704→123 ceiling bridge set it straight back to 1 — a device that reports a lapse on "+
+			"/state and a live throttle on Modbus", got)
+	}
+	if got := revU16(t, r, m123, sunspec.L123, "WMaxLimPct"); got != 6000 {
+		t.Errorf("123 WMaxLimPct = %d after the timeout, want the commanded 6000 LEFT IN PLACE; the "+
+			"bridge overwrote it with 704's own percent", got)
+	}
+	// AND the other view of the same physical axis. 123's throttle and 704's
+	// WMaxLimPct are one function on this device — that is why the bridge
+	// exists — so a lapse that left 704 enabled would put the two views into
+	// exactly the disagreement the model-qualified timer names exist to name.
+	if got := revU16(t, r, m704, sunspec.L704, "WMaxLimPctEna"); got != 0 {
+		t.Errorf("704 WMaxLimPctEna = %d after the 123 throttle lapsed, want 0: one physical axis "+
+			"cannot be off in one register view and on in the other", got)
+	}
+	// The physics is the referee: the curtailment must actually be gone.
+	if got := solarCeilingW(r, ss.bases, ss.wmaxW, &ss.faults); got != 8000 {
+		t.Errorf("the device is still curtailed to %.0f W after the throttle lapsed, want the full 8000 W", got)
+	}
+}
+
+// TestSolar704CeilingReversionToDisabledReleasesTheLegacyMirror is F1's sibling,
+// found while fixing it and fixed with it.
+//
+// The bridge is ONE-WAY and only ever WRITES: it mirrors while 704's ceiling is
+// enabled and simply stops when it is not, leaving whatever it last wrote
+// standing in 123. So a 704 ceiling that lapsed to DISABLED (the head end's own
+// WMaxLimPctEnaRvrt = 0, the adjudicated lapse posture) left the legacy mirror
+// holding the last commanded percent — and solarCeilingW reads 123, so the
+// device went on curtailing for ever on a control whose lease had expired. That
+// is the exact failure a reversion timer exists to prevent.
+func TestSolar704CeilingReversionToDisabledReleasesTheLegacyMirror(t *testing.T) {
+	ss, tb := newRevSolarAdvanced(t, 8000)
+	r, m123, m704 := ss.Regs, ss.bases.M123Base, ss.adv.M704
+
+	regs := mbReadMap(t, r, m704, uint16(sunspec.L704.Len()))
+	v := sunspec.L704.View(regs)
+	v.SetEnum("WMaxLimPctEna", 1)
+	v.SetFloat("WMaxLimPct", 60)
+	v.SetEnum("WMaxLimPctEnaRvrt", 0) // lapse at expiry, not revert-to-a-value
+	v.SetU32("WMaxLimPctRvrtTms", 60)
+	mbWriteMap(t, r, m704, regs...)
+
+	// The bridge has mirrored it: the device is genuinely curtailed before the
+	// timer runs out, or the row after this proves nothing.
+	if got := revU16(t, r, m123, sunspec.L123, "WMaxLim_Ena"); got != 1 {
+		t.Fatalf("123 WMaxLim_Ena = %d before expiry, want 1 (the bridge should have mirrored)", got)
+	}
+	if got := solarCeilingW(r, ss.bases, ss.wmaxW, &ss.faults); got != 4800 {
+		t.Fatalf("the device is limited to %.0f W before expiry, want 4800 (60%% of 8000)", got)
+	}
+
+	tb.Advance(60 * time.Second)
+	if expired := ss.reversionStep(); len(expired) != 1 || expired[0] != "704.WMaxLimPct" {
+		t.Fatalf("expired timers = %v, want exactly [704.WMaxLimPct]", expired)
+	}
+
+	if got := revU16(t, r, m704, sunspec.L704, "WMaxLimPctEna"); got != 0 {
+		t.Fatalf("704 WMaxLimPctEna = %d after expiry, want 0 (WMaxLimPctEnaRvrt was 0)", got)
+	}
+	if got := revU16(t, r, m123, sunspec.L123, "WMaxLim_Ena"); got != 0 {
+		t.Errorf("123 WMaxLim_Ena = %d after the 704 ceiling lapsed, want 0: the bridge only ever writes, "+
+			"so a lapse nobody withdraws from the legacy mirror is a curtailment that outlived its lease", got)
+	}
+	if got := solarCeilingW(r, ss.bases, ss.wmaxW, &ss.faults); got != 8000 {
+		t.Errorf("the device is still curtailed to %.0f W after its ceiling lapsed, want the full 8000 W", got)
+	}
+}

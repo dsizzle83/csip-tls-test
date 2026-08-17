@@ -43,17 +43,24 @@ import (
 	"lexa-proto/sunspec"
 )
 
-// legacyRegionDump renders every non-zero register of the served legacy-curve
-// region as one comparable string, so a row can assert that clearing the lever
-// restored the image BYTE FOR BYTE rather than merely restoring its shape.
+// legacyRegionDump renders every non-zero register from the start of the served
+// legacy-curve region up to `to` as one comparable string, so a row can assert
+// that clearing the lever restored the image BYTE FOR BYTE rather than merely
+// restoring its shape.
+//
+// `to` IS AN EXPLICIT HIGH-WATER MARK, not the current geometry's end, and that
+// is gate finding F4. Walking to the live geom.end made the dump blind to the
+// one thing a re-lay can get wrong in the shrinking direction: debris left
+// PAST a shortened end marker, which a chain walker that overruns will read as
+// a model. With the bound taken from the LONGEST geometry a row has seen, both
+// "clear only as far as the new end" and "do not clear at all" become visible.
 //
 // The region only — not the whole map — because the animation owns the
 // measurement registers ahead of it, and a whole-map comparison would be
 // asserting that time had not passed.
-func legacyRegionDump(ss *SolarServer) string {
-	geom := ss.legacy.layout()
+func legacyRegionDump(ss *SolarServer, to uint16) string {
 	var b strings.Builder
-	for a := uint32(ss.legacy.start); a <= uint32(geom.end); a++ {
+	for a := uint32(ss.legacy.start); a <= uint32(to); a++ {
 		if v := ss.Regs.Get(uint16(a)); v != 0 {
 			fmt.Fprintf(&b, "%d=%d;", a, v)
 		}
@@ -101,7 +108,10 @@ func TestLegacyShortBlockLeverRelaysTheImageAtRuntime(t *testing.T) {
 	r := ss.Regs
 
 	before := walkChain(t, r)
-	beforeImage := legacyRegionDump(ss)
+	// The spec-geometry image is the LONGEST this row will see, so its end is
+	// the high-water mark every comparison below is taken against.
+	fullEnd := ss.legacy.layout().end
+	beforeImage := legacyRegionDump(ss, fullEnd)
 
 	// The device starts coherent: (L − hdr) / NCrv IS model 126's spec block
 	// length, which is what makes every offset a gateway computes correct.
@@ -168,6 +178,23 @@ func TestLegacyShortBlockLeverRelaysTheImageAtRuntime(t *testing.T) {
 				"model may be short", m.ID, got, bl)
 		}
 	}
+	// NOTHING SURVIVES PAST THE NEW END MARKER. A shortened image ends earlier
+	// than the one it replaced, and every register between the two ends must
+	// have been cleared — debris there is indistinguishable from a model to a
+	// walker that reads one header too many, and it is exactly what a re-lay
+	// that cleared only as far as its own new end would leave behind.
+	newEnd := ss.legacy.layout().end
+	if newEnd >= fullEnd {
+		t.Fatalf("the short-block image ends at %d, not before the spec image's %d — this row's "+
+			"debris check assumes the image SHRANK", newEnd, fullEnd)
+	}
+	for a := uint32(newEnd) + 1; a <= uint32(fullEnd); a++ {
+		if v := r.Get(uint16(a)); v != 0 {
+			t.Errorf("register %d past the new end marker still reads %d; the re-lay must clear as far "+
+				"as the LONGER of the two images reaches", a, v)
+		}
+	}
+
 	moved := 0
 	for _, b := range before {
 		for _, a := range after {
@@ -187,7 +214,7 @@ func TestLegacyShortBlockLeverRelaysTheImageAtRuntime(t *testing.T) {
 	if err := ss.ApplyFault([]byte(`{"kind":"legacy_short_block","clear":true}`)); err != nil {
 		t.Fatalf("clear legacy_short_block: %v", err)
 	}
-	if got := legacyRegionDump(ss); got != beforeImage {
+	if got := legacyRegionDump(ss, fullEnd); got != beforeImage {
 		t.Errorf("clearing the lever did not restore the served image:\n before: %s\n  after: %s",
 			beforeImage, got)
 	}

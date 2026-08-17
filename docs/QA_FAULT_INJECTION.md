@@ -848,6 +848,22 @@ curl -s -XPOST localhost:6020/control -d '{"reversion_scale":60}'
 curl -s -XPOST localhost:6020/control -d '{"reversion_scale":1}'
 ```
 
+| value | effect | armed countdowns |
+|---|---|---|
+| omitted / `0` | unchanged | **kept** — the only value that leaves a live timer running |
+| `1` | real time, declared `wall` | **dropped** (it installs a clock like any other) |
+| `N` up to `3600` | `N`x acceleration | **dropped** |
+| above `3600` | **refused, with a reason** | unchanged |
+
+The ceiling is a correctness bound, not taste: the clock holds its instant in an
+int64 of nanoseconds, so past a certain multiplier it stops tracking. Without
+the bound, `1e9x` froze the clock after 9.2 s of real time and `86400x` after
+29.7 h — the register then reads its armed value for ever, which is exactly the
+inert countdown row 10 was blocked by. At `3600x` ("an hour a second") that
+point is ~29.6 days away, and if a clock ever does reach it the sim fails
+**forward**: it releases every armed control rather than holding one it can no
+longer time, and the declaration on `/state` says `SATURATED`.
+
 Same body on `mbapsdev`'s simapi for both inverter models; the battery model
 refuses it by name (its clock stays a Go-source-only knob).
 

@@ -40,8 +40,8 @@ func TestParseBoolFieldLine(t *testing.T) {
 
 func TestAdvCurveSetContentHash_Deterministic(t *testing.T) {
 	pts := advCurveTestPoints()
-	h1 := advCurveSetContentHash("volt_var", advCurveTypeTest, advCurveXMult, advCurveYMult, 0, pts)
-	h2 := advCurveSetContentHash("volt_var", advCurveTypeTest, advCurveXMult, advCurveYMult, 0, pts)
+	h1 := advCurveSetContentHash("volt_var", advCurveTypeTest, advCurveXMult, advCurveYMult, 0, advCurveVRefNone, advCurveOpenLoopTmsNone, pts)
+	h2 := advCurveSetContentHash("volt_var", advCurveTypeTest, advCurveXMult, advCurveYMult, 0, advCurveVRefNone, advCurveOpenLoopTmsNone, pts)
 	if h1 != h2 {
 		t.Fatalf("advCurveSetContentHash is not deterministic: %s != %s", h1, h2)
 	}
@@ -51,21 +51,21 @@ func TestAdvCurveSetContentHash_Deterministic(t *testing.T) {
 }
 
 func TestAdvCurveSetContentHash_SensitiveToContent(t *testing.T) {
-	base := advCurveSetContentHash("volt_var", 1, 0, 0, 0, [][2]int32{{100, 50}, {200, -50}})
+	base := advCurveSetContentHash("volt_var", 1, 0, 0, 0, advCurveVRefNone, advCurveOpenLoopTmsNone, [][2]int32{{100, 50}, {200, -50}})
 	cases := [][][2]int32{
 		{{101, 50}, {200, -50}},           // x moved
 		{{100, 51}, {200, -50}},           // y moved
 		{{100, 50}, {200, -50}, {300, 0}}, // extra point
 	}
 	for _, pts := range cases {
-		if got := advCurveSetContentHash("volt_var", 1, 0, 0, 0, pts); got == base {
+		if got := advCurveSetContentHash("volt_var", 1, 0, 0, 0, advCurveVRefNone, advCurveOpenLoopTmsNone, pts); got == base {
 			t.Errorf("advCurveSetContentHash(%v) unexpectedly equals the base hash", pts)
 		}
 	}
-	if got := advCurveSetContentHash("watt_var", 1, 0, 0, 0, [][2]int32{{100, 50}, {200, -50}}); got == base {
+	if got := advCurveSetContentHash("watt_var", 1, 0, 0, 0, advCurveVRefNone, advCurveOpenLoopTmsNone, [][2]int32{{100, 50}, {200, -50}}); got == base {
 		t.Error("advCurveSetContentHash: changing mode did not change the hash")
 	}
-	if got := advCurveSetContentHash("volt_var", 2, 0, 0, 0, [][2]int32{{100, 50}, {200, -50}}); got == base {
+	if got := advCurveSetContentHash("volt_var", 2, 0, 0, 0, advCurveVRefNone, advCurveOpenLoopTmsNone, [][2]int32{{100, 50}, {200, -50}}); got == base {
 		t.Error("advCurveSetContentHash: changing curveType did not change the hash")
 	}
 }
@@ -107,8 +107,14 @@ func TestDesiredAdvVoltVarPayload_Valid(t *testing.T) {
 	if err := json.Unmarshal([]byte(payload), &doc); err != nil {
 		t.Fatalf("desiredAdvVoltVarPayload produced invalid JSON: %v\npayload: %s", err, payload)
 	}
-	if doc.V != 1 {
-		t.Errorf("v = %d, want 1", doc.V)
+	// The envelope version, NOT a literal 1. This assertion pinned the defect
+	// rather than the contract: it held "v = 1" green through three platform
+	// bumps while every injected document was being refused at a floor of 4.
+	// mayhem_adv_platform_test.go now checks desiredAdvancedV against the
+	// platform's own constant, so this row asserts consistency with the stamp
+	// and that row asserts the stamp is current.
+	if doc.V != desiredAdvancedV {
+		t.Errorf("v = %d, want %d", doc.V, desiredAdvancedV)
 	}
 	if doc.DeviceClass != "solar" || doc.DeviceID != "inverter-0" {
 		t.Errorf("device_class/device_id = %q/%q, want solar/inverter-0", doc.DeviceClass, doc.DeviceID)
@@ -131,7 +137,7 @@ func TestDesiredAdvVoltVarPayload_Valid(t *testing.T) {
 	}
 	// Cross-check the hash matches what a re-derivation from the same points
 	// would produce — the property WP-10's readback verification depends on.
-	wantHash := advCurveSetContentHash("volt_var", advCurveTypeTest, advCurveXMult, advCurveYMult, 0, advCurveTestPoints())
+	wantHash := advCurveSetContentHash("volt_var", advCurveTypeTest, advCurveXMult, advCurveYMult, 0, advCurveVRefNone, advCurveOpenLoopTmsNone, advCurveTestPoints())
 	if c.Hash != wantHash {
 		t.Errorf("curve.hash = %q, want %q", c.Hash, wantHash)
 	}
@@ -253,7 +259,7 @@ func TestDiagnoseAdvShadowNoWrites_Inconclusive_NoSamples(t *testing.T) {
 func TestDiagnoseCurveAdoptDivergence_PassOnDiverged(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
 	rep := advReportMsg{Axis: "volt_var", AdoptState: "diverged"}
-	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", true, rep, nil)
+	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", advReportPresent, rep, nil)
 	if f.Verdict != "PASS" {
 		t.Fatalf("verdict = %s, want PASS (%s)", f.Verdict, f.Headline)
 	}
@@ -262,7 +268,7 @@ func TestDiagnoseCurveAdoptDivergence_PassOnDiverged(t *testing.T) {
 func TestDiagnoseCurveAdoptDivergence_FailOnAdopted(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
 	rep := advReportMsg{Axis: "volt_var", AdoptState: "adopted", CurveHash: "deadbeef"}
-	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", true, rep, nil)
+	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", advReportPresent, rep, nil)
 	if f.Verdict != "FAIL" {
 		t.Fatalf("verdict = %s, want FAIL when the reconciler trusted the handshake (%s)", f.Verdict, f.Headline)
 	}
@@ -270,7 +276,7 @@ func TestDiagnoseCurveAdoptDivergence_FailOnAdopted(t *testing.T) {
 
 func TestDiagnoseCurveAdoptDivergence_InconclusiveOnMissingReport(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
-	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", false, advReportMsg{}, errFakeSSH)
+	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", advReportUnreadable, advReportMsg{}, errFakeSSH)
 	if f.Verdict != "INCONCLUSIVE" {
 		t.Fatalf("verdict = %s, want INCONCLUSIVE (%s)", f.Verdict, f.Headline)
 	}
@@ -279,7 +285,7 @@ func TestDiagnoseCurveAdoptDivergence_InconclusiveOnMissingReport(t *testing.T) 
 func TestDiagnoseCurveAdoptDivergence_InconclusiveOnWrongAxis(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
 	rep := advReportMsg{Axis: "fixed_pf", AdoptState: "adopted"}
-	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", true, rep, nil)
+	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", advReportPresent, rep, nil)
 	if f.Verdict != "INCONCLUSIVE" {
 		t.Fatalf("verdict = %s, want INCONCLUSIVE for a mismatched axis (%s)", f.Verdict, f.Headline)
 	}
@@ -288,7 +294,7 @@ func TestDiagnoseCurveAdoptDivergence_InconclusiveOnWrongAxis(t *testing.T) {
 func TestDiagnoseCurveAdoptDivergence_DegradedOnPending(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
 	rep := advReportMsg{Axis: "volt_var", AdoptState: "pending"}
-	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", true, rep, nil)
+	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", advReportPresent, rep, nil)
 	if f.Verdict != "DEGRADED" {
 		t.Fatalf("verdict = %s, want DEGRADED (%s)", f.Verdict, f.Headline)
 	}
@@ -297,7 +303,7 @@ func TestDiagnoseCurveAdoptDivergence_DegradedOnPending(t *testing.T) {
 func TestDiagnoseCurveAdoptDivergence_InconclusiveOnUnsupported(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
 	rep := advReportMsg{Axis: "volt_var", AdoptState: "unsupported"}
-	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", true, rep, nil)
+	f := diagnoseCurveAdoptDivergence(scFor("curve-adopt-readback-divergence"), s, "volt_var", advReportPresent, rep, nil)
 	if f.Verdict != "INCONCLUSIVE" {
 		t.Fatalf("verdict = %s, want INCONCLUSIVE (%s)", f.Verdict, f.Headline)
 	}
@@ -308,7 +314,7 @@ func TestDiagnoseCurveAdoptDivergence_InconclusiveOnUnsupported(t *testing.T) {
 func TestDiagnosePFVarMeasuredConvergence_PassOnDiverged(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
 	rep := advReportMsg{Axis: "fixed_pf", AdoptState: "diverged"}
-	f := diagnosePFVarMeasuredConvergence(scFor("pf-var-measured-convergence"), s, 0.9, true, rep, nil, true, 2, 3, true, 0.6, 0.61)
+	f := diagnosePFVarMeasuredConvergence(scFor("pf-var-measured-convergence"), s, 0.9, advReportPresent, rep, nil, true, 2, 3, true, 0.6, 0.61)
 	if f.Verdict != "PASS" {
 		t.Fatalf("verdict = %s, want PASS (%s)", f.Verdict, f.Headline)
 	}
@@ -317,7 +323,7 @@ func TestDiagnosePFVarMeasuredConvergence_PassOnDiverged(t *testing.T) {
 func TestDiagnosePFVarMeasuredConvergence_FailOnAdopted(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
 	rep := advReportMsg{Axis: "fixed_pf", AdoptState: "adopted"}
-	f := diagnosePFVarMeasuredConvergence(scFor("pf-var-measured-convergence"), s, 0.9, true, rep, nil, true, 0, 0, true, 0.6, 0.6)
+	f := diagnosePFVarMeasuredConvergence(scFor("pf-var-measured-convergence"), s, 0.9, advReportPresent, rep, nil, true, 0, 0, true, 0.6, 0.6)
 	if f.Verdict != "FAIL" {
 		t.Fatalf("verdict = %s, want FAIL when the reconciler trusted the ACK over measurement (%s)", f.Verdict, f.Headline)
 	}
@@ -333,7 +339,7 @@ func TestDiagnosePFVarMeasuredConvergence_FailOnAdopted(t *testing.T) {
 func TestDiagnosePFVarMeasuredConvergence_EnergizePremiseActionable(t *testing.T) {
 	s := mkSamples(85, func(i int, smp *maySample) {})
 	rep := advReportMsg{Axis: "energize", AdoptState: "adopted"}
-	f := diagnosePFVarMeasuredConvergence(scFor("pf-var-measured-convergence"), s, 0.9, true, rep, nil, false, 0, 0, false, 0, 0)
+	f := diagnosePFVarMeasuredConvergence(scFor("pf-var-measured-convergence"), s, 0.9, advReportPresent, rep, nil, false, 0, 0, false, 0, 0)
 	if f.Verdict != "INCONCLUSIVE" {
 		t.Fatalf("verdict = %s, want INCONCLUSIVE when the reconciler is on the hub-authored energize axis (%s)", f.Verdict, f.Headline)
 	}
@@ -350,7 +356,7 @@ func TestDiagnosePFVarMeasuredConvergence_DegradedOnInconsistentMetric(t *testin
 	rep := advReportMsg{Axis: "fixed_pf", AdoptState: "diverged"}
 	// Report says diverged but the divergence counter never moved — flagged,
 	// not silently trusted.
-	f := diagnosePFVarMeasuredConvergence(scFor("pf-var-measured-convergence"), s, 0.9, true, rep, nil, true, 5, 5, true, 0.6, 0.6)
+	f := diagnosePFVarMeasuredConvergence(scFor("pf-var-measured-convergence"), s, 0.9, advReportPresent, rep, nil, true, 5, 5, true, 0.6, 0.6)
 	if f.Verdict != "DEGRADED" {
 		t.Fatalf("verdict = %s, want DEGRADED on inconsistent report/metric evidence (%s)", f.Verdict, f.Headline)
 	}

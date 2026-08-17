@@ -1291,8 +1291,17 @@ type BatteryPackState struct {
 
 // PackReversionState and PackReversionGroupState now live in reversion.go as
 // ReversionState / ReversionGroupState, because the engine that fills them is
-// shared with the solar sims. They are ALIASES there, not new types, so this
-// document's JSON — and anything decoding it — is unchanged.
+// shared with the solar sims. They are ALIASES there, not new types, so the
+// Go API and this document's JSON SHAPE are unchanged.
+//
+// Two VALUES in it did move, and the claim is scoped to say so: the group names
+// gained a model prefix ("WSet" → "704.WSet", and likewise for the other four),
+// because the engine's armed set is keyed by name and now spans models — an
+// advanced solar sim serves both 123's and 704's WMaxLimPct families. Two
+// fields were also ADDED, "model" and "rem_on_wire". Nothing in this repo or in
+// lexa-gw consumes either the names or the document, so no consumer breaks;
+// what would break is a hand-written comparison against a captured /state from
+// before this change.
 
 type packSetpointState struct {
 	Ena    bool    `json:"ena"`

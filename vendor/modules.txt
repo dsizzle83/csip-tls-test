@@ -89,6 +89,9 @@ golang.org/x/sys/windows
 # gopkg.in/go-playground/validator.v9 v9.30.0
 ## explicit
 gopkg.in/go-playground/validator.v9
+# lexa-platform v0.0.0 => ../lexa-platform
+## explicit; go 1.26
+lexa-platform/bus
 # lexa-proto v0.0.0 => ../lexa-proto
 ## explicit; go 1.26
 lexa-proto/csipmodel
@@ -98,3 +101,4 @@ lexa-proto/modbus
 lexa-proto/ocppserver
 lexa-proto/sunspec
 # lexa-proto => ../lexa-proto
+# lexa-platform => ../lexa-platform

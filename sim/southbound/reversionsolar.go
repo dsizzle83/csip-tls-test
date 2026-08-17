@@ -156,10 +156,18 @@ func (ss *SolarServer) solarReversionTimers() []rvrtTimer {
 	var out []rvrtTimer
 
 	// Model 123 is on every solar image, legacy and advanced alike.
-	out = append(out, rvrt123Timers(ss.bases.M123Base)...)
+	t123 := rvrt123Timers(ss.bases.M123Base)
+	if ss.advanced {
+		// On an advanced image 123's throttle and 704's WMaxLimPct are ONE
+		// PHYSICAL AXIS in two register views — see coupleCeilingViews.
+		coupleTimer(t123, "123.WMaxLimPct", ss.clearAdvCeilingView)
+	}
+	out = append(out, t123...)
 
 	if ss.advanced {
-		out = append(out, rvrt704Timers(ss.adv.M704)...)
+		t704 := rvrt704Timers(ss.adv.M704)
+		coupleTimer(t704, "704.WMaxLimPct", ss.releaseLegacyCeilingMirrorIfLapsed)
+		out = append(out, t704...)
 		for _, cb := range ss.adv.Curves {
 			out = append(out, ss.rvrtCurve7xxTimer(cb))
 		}
@@ -170,6 +178,97 @@ func (ss *SolarServer) solarReversionTimers() []rvrtTimer {
 		}
 	}
 	return out
+}
+
+// ── The one active-power ceiling, in two register views ─────────────────────
+//
+// On an ADVANCED image, model 123's throttle (WMaxLimPct / WMaxLim_Ena) and
+// model 704's WMaxLimPct are not two functions. They are ONE physical axis
+// published twice, and advBridgeCeiling exists precisely to keep them that way:
+// it mirrors an enabled 704 ceiling into 123, because 123 is what the physics
+// (solarCeilingW) reads.
+//
+// That bridge is ONE-WAY AND WRITE-ONLY, and until gate finding F1 that made a
+// reversion on this axis a lie in one of the two directions, whichever way it
+// ran:
+//
+//	123 lapses   the revert cleared WMaxLim_Ena, then reversionStep's own
+//	             advSync ran advBridgeCeiling, which — seeing 704's ceiling
+//	             still enabled — set WMaxLim_Ena straight back to 1 and
+//	             overwrote the value the revert had deliberately left in place.
+//	             Engine, /state and the log all said "lapsed"; the wire said
+//	             Ena=1 at 100 %. A bench recording either surface would have
+//	             recorded the opposite of the other.
+//	704 lapses   the revert set WMaxLimPctEna to WMaxLimPctEnaRvrt = 0 — the
+//	             adjudicated lapse posture — and the bridge then simply STOPPED
+//	             mirroring, leaving 123 holding the last commanded percent. The
+//	             physics reads 123, so the device went on curtailing for ever on
+//	             a control whose lease had expired: exactly the failure the
+//	             timer exists to prevent.
+//
+// Both are fixed by stating the axis's unity at the two places a reversion can
+// break it, rather than by rewriting the bridge. The two functions below are
+// deliberately DIRECTIONAL — each says which view just lapsed and what follows
+// — instead of one "if either view is disabled, disable both" rule, which would
+// infer the situation from register state that the bridge may not have refreshed
+// yet, and would be wrong in a way no test would show.
+//
+// WHAT IS NOT FIXED HERE, stated so it is not mistaken for coverage: a PLAIN
+// CLIENT WRITE that disables 704's ceiling still leaves the legacy mirror
+// standing, because the bridge has no memory of having written it and giving it
+// one means ownership state in a hot path this change does not otherwise touch.
+// It is a pre-existing limitation, not one this wave introduced, and it is not
+// the product's release shape — a hub release writes 100 % with Ena still 1
+// (advBridgeCeiling's own doc), which mirrors through as full output.
+
+// coupleTimer wraps the named timer's revert with an additional step, run
+// immediately after it and on the same register map.
+//
+// A wrapper rather than an edit to the family tables because the fact being
+// expressed is not a property of model 123 or of model 704 — it is a property
+// of THIS IMAGE serving both. rvrt123Timers is also built for the legacy image,
+// where there is no 704 to keep in step, and rvrt704Timers is shared with the
+// battery pack, which bridges a different axis entirely.
+func coupleTimer(timers []rvrtTimer, name string, after func(*RegisterMap)) {
+	for i := range timers {
+		if timers[i].Name != name {
+			continue
+		}
+		inner := timers[i].Revert
+		timers[i].Revert = func(r *RegisterMap) {
+			if inner != nil {
+				inner(r)
+			}
+			after(r)
+		}
+	}
+}
+
+// clearAdvCeilingView withdraws the 704 view of the ceiling after the 123 view
+// has lapsed. Without it the bridge re-enables the axis on the very next
+// advSync — which reversionStep itself performs.
+func (ss *SolarServer) clearAdvCeilingView(r *RegisterMap) {
+	if off := sunspec.L704.Offset("WMaxLimPctEna"); off >= 0 {
+		r.Set(ss.adv.M704+uint16(off), 0)
+	}
+}
+
+// releaseLegacyCeilingMirrorIfLapsed withdraws the 123 view after the 704 view
+// has lapsed — and ONLY then. A 704 timer whose WMaxLimPctEnaRvrt is 1 has
+// reverted to an ENABLED ceiling at its *Rvrt percent, and the bridge will
+// mirror that value on the advSync that follows; clearing 123 there would
+// cancel a control the head end explicitly asked the device to fall back to.
+//
+// Only the ENABLE is cleared. §3.3 makes the enable, not the value, the thing
+// that stops a setting taking effect, and solarCeilingW agrees — with
+// WMaxLimPct_Ena at 0 it resolves the ceiling to the full WMax setting and the
+// stale percent is inert. That is the same rule the 123 timers' own reverts
+// follow, so the two cannot drift.
+func (ss *SolarServer) releaseLegacyCeilingMirrorIfLapsed(r *RegisterMap) {
+	if off := sunspec.L704.Offset("WMaxLimPctEna"); off < 0 || r.Get(ss.adv.M704+uint16(off)) == 1 {
+		return
+	}
+	r.Set(ss.bases.M123Base+sunspec.M123_WMaxLimPct_Ena, 0)
 }
 
 // rvrt123Family names one of model 123's four reversion timers and the enable
@@ -369,14 +468,21 @@ func (ss *SolarServer) ReversionTimebase() ReversionTimebase {
 //
 // The three values that mean something specific:
 //
-//	0    UNCHANGED. Matches POST /control's existing "speed" convention, so an
-//	     operator who omits the key does not silently reset the clock — and,
-//	     more importantly, so a body sent for some other purpose ({"cmd":
-//	     "pause"}) cannot reset it either.
-//	1    THE WALL CLOCK, installed as WallTimebase and not as a 1× scaled one,
-//	     so the declaration on /state reads "wall". A bundle that said "scaled"
-//	     would be describing an acceleration that is not happening.
-//	N>0  N× acceleration.
+//	0     UNCHANGED, and the ONLY value that leaves armed countdowns alone.
+//	      Matches POST /control's existing "speed" convention, so an operator
+//	      who omits the key does not silently reset the clock — and, more
+//	      importantly, so a body sent for some other purpose ({"cmd":"pause"})
+//	      cannot reset it either.
+//	1     THE WALL CLOCK, installed as WallTimebase and not as a 1× scaled one,
+//	      so the declaration on /state reads "wall". A bundle that said "scaled"
+//	      would be describing an acceleration that is not happening. It INSTALLS
+//	      a clock, so like every other non-zero value it DISARMS every running
+//	      countdown — "back to real time" is not a way to leave a live timer
+//	      running at 1×, and a row that wants that must simply not send the key.
+//	N>0   N× acceleration, up to MaxReversionScale. Also disarms.
+//	>Max  REFUSED (see MaxReversionScale): past the bound the clock stops
+//	      tracking its own multiplier, which is the failure gate finding F2
+//	      measured.
 //
 // A non-positive or non-finite multiplier is REFUSED here rather than passed to
 // NewScaledTimebase, which panics on one: an operator typo on a bench must be a
@@ -395,6 +501,16 @@ func (ss *SolarServer) SetReversionScale(scale float64) error {
 	case math.IsNaN(scale) || math.IsInf(scale, 0) || scale < 0:
 		return fmt.Errorf("reversion_scale %v: a device clock multiplier must be a positive finite "+
 			"number (1 = real time)", scale)
+	case scale > MaxReversionScale:
+		// Refused rather than clamped. A bench that asked for 86400× and
+		// silently got 3600× would read its countdown at a rate it did not
+		// choose; a bench that asked for 86400× and got it would, past 29.7 h,
+		// be reading a clock that had stopped — which is gate finding F2 and
+		// the reason for the bound. See MaxReversionScale.
+		return fmt.Errorf("reversion_scale %v: the largest multiplier this device clock can count at is "+
+			"%d× (past it the clock stops tracking, which is the failure this bound exists to make "+
+			"unreachable); a reversion window is seconds to minutes, so %d× turns a 258 s window into 72 ms",
+			scale, MaxReversionScale, MaxReversionScale)
 	case scale == 1:
 		ss.rvrt.setTimebase(WallTimebase(), ss.Regs)
 	default:

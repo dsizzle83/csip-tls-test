@@ -338,23 +338,80 @@ func reconcileAdvReportTopic(device string) string {
 }
 
 // advCurveSetContentHash mirrors bus.CurveSetContentHash's canonicalization
-// EXACTLY (curves.go, WP-8, pinned by lexa-hub's own
-// TestCurveSetContentHash_Pinned): a single-entry line
-// "mode|curveType|xMult|yMult|yRefType|x1,y1;x2,y2;...;\n", SHA-256, lowercase
-// hex. This MUST match bit-for-bit: the hub's own reconciler shell
-// (reconcile_adv.go's readbackHashVV) recomputes this same hash from the
-// device's readback plus the doc's own CurveType/XMult/YMult/YRefType — for
-// an actually-adopted curve, that recomputed hash must equal the "hash" field
-// this function stamps into the injected doc.
-func advCurveSetContentHash(mode string, curveType uint16, xMult, yMult int8, yRefType uint8, points [][2]int32) string {
+// (lexa-platform bus/curves.go — THAT function owns the form; this is a
+// deliberate independent re-implementation, see below): a single-entry line
+//
+//	"mode|curveType|xMult|yMult|yRefType|vRef|openLoopTms|x1,y1;x2,y2;...;\n"
+//
+// SHA-256, lowercase hex, with openLoopTms rendered "-" when absent so that
+// "no limit" (0) and "no opinion" (absent) stay distinct inputs to the digest.
+//
+// It MUST match bit-for-bit: the gateway's reconciler shell recomputes this
+// same hash from the device's readback plus the document's own fields, and for
+// an actually-adopted curve that recomputed hash must equal the "hash" field
+// this function stamps into the injected document.
+//
+// # It was TWO GENERATIONS STALE, and that is why the mirror is now pinned
+//
+// This function had FIVE tokens — no vRef, no openLoopTms — against the
+// platform's seven. Two volt-var curves differing only in vRef canonicalized
+// identically, and openLoopTms was invisible to the digest entirely. Combined
+// with the version defect fixed alongside it (the injected documents stamped
+// v=1 against a DesiredAdvancedMinV of 4, so the gateway refused them at the
+// version gate before any of this was read), the adv mayhem drives had been
+// injecting documents the DUT rejects.
+//
+// # Why this is still a MIRROR and not an import of bus.CurveSetContentHash
+//
+// Because the check would otherwise be vacuous. The gateway RECOMPUTES this
+// hash and compares; a harness that computed it with the gateway's own function
+// would make a canonicalization bug cancel on both sides and the drive would
+// pass on a wrong digest. That is the shared-oracle blindness lexa-proto's own
+// model-123 comment records ("the bench sim built its block from these same
+// constants, so fixture and product agreed with each other and both disagreed
+// with the standard").
+//
+// The drift that independence costs is bought back in the TEST rather than in
+// the driver: TestAdvCurveSetContentHashMatchesThePlatform runs both
+// implementations over a vector table and requires them to agree, so the next
+// move in bus.CurveSetContentHash fails THIS repo's suite instead of silently
+// splitting identity — while the digest a drive actually injects is still
+// computed by code that does not share a line with the code under test.
+func advCurveSetContentHash(mode string, curveType uint16, xMult, yMult int8, yRefType uint8,
+	vRef uint16, openLoopTms *uint16, points [][2]int32) string {
+
+	olt := "-"
+	if openLoopTms != nil {
+		olt = strconv.FormatUint(uint64(*openLoopTms), 10)
+	}
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%d|%d|%d|%d|", mode, curveType, xMult, yMult, yRefType)
+	fmt.Fprintf(h, "%s|%d|%d|%d|%d|%d|%s|", mode, curveType, xMult, yMult, yRefType, vRef, olt)
 	for _, p := range points {
 		fmt.Fprintf(h, "%d,%d;", p[0], p[1])
 	}
 	h.Write([]byte("\n"))
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+// The envelope versions the injected documents are stamped with. They mirror
+// lexa-platform bus.DesiredAdvancedV, and TestDesiredAdvVersionTracksThePlatform
+// fails if the platform moves without this following.
+//
+// They are LITERALS rather than an import for the same reason the hash is a
+// mirror: a driver that took its version from the gateway's own constant could
+// never inject a document the gateway would refuse, and refusing stale
+// documents is a behaviour a mayhem drive may one day need to provoke on
+// purpose. What must not happen is stamping a stale version by ACCIDENT, which
+// is what happened here — v=1 against a floor of 4.
+const desiredAdvancedV = 4
+
+// advCurveVRefNone / advCurveOpenLoopTmsNone are the "server sent none" values
+// for the two tokens this mirror gained. Named rather than inlined so a reader
+// of a payload builder can see that the absence is deliberate and is what the
+// digest was computed over.
+const advCurveVRefNone uint16 = 0
+
+var advCurveOpenLoopTmsNone *uint16 = nil
 
 // Test curve/PF constants shared by the payload builders below. XMult/YMult
 // are 0 so advRaw's readback round-trip (reconcile_adv.go) is exact — no
@@ -382,13 +439,14 @@ func advCurvePointsJSON(points [][2]int32) string {
 // adv-shadow-no-writes drive.
 func desiredAdvVoltVarPayload(device, mrid string, issuedAt int64) string {
 	pts := advCurveTestPoints()
-	hash := advCurveSetContentHash("volt_var", advCurveTypeTest, advCurveXMult, advCurveYMult, 0, pts)
+	hash := advCurveSetContentHash("volt_var", advCurveTypeTest, advCurveXMult, advCurveYMult, 0,
+		advCurveVRefNone, advCurveOpenLoopTmsNone, pts)
 	return fmt.Sprintf(
-		`{"v":1,"device_class":"solar","device_id":%q,`+
+		`{"v":%d,"device_class":"solar","device_id":%q,`+
 			`"reactive_mode":{"kind":"volt_var","curve":{"curve_type":%d,"x_mult":%d,"y_mult":%d,"points":[%s],"hash":%q}},`+
 			`"volt_watt":null,"freq_watt":null,"freq_droop":null,"trips":null,"energize":null,`+
 			`"source":"csip-event","mrid":%q,"issued_at":%d,"seq":1}`,
-		device, advCurveTypeTest, advCurveXMult, advCurveYMult, advCurvePointsJSON(pts), hash, mrid, issuedAt)
+		desiredAdvancedV, device, advCurveTypeTest, advCurveXMult, advCurveYMult, advCurvePointsJSON(pts), hash, mrid, issuedAt)
 }
 
 // desiredAdvFixedPFPayload builds a DesiredAdvanced doc commanding a fixed
@@ -396,11 +454,11 @@ func desiredAdvVoltVarPayload(device, mrid string, issuedAt int64) string {
 // drives.
 func desiredAdvFixedPFPayload(device, mrid string, pf float64, overExcited bool, issuedAt int64) string {
 	return fmt.Sprintf(
-		`{"v":1,"device_class":"solar","device_id":%q,`+
+		`{"v":%d,"device_class":"solar","device_id":%q,`+
 			`"reactive_mode":{"kind":"fixed_pf","fixed_pf":{"pf":%g,"over_excited":%t}},`+
 			`"volt_watt":null,"freq_watt":null,"freq_droop":null,"trips":null,"energize":null,`+
 			`"source":"csip-event","mrid":%q,"issued_at":%d,"seq":1}`,
-		device, pf, overExcited, mrid, issuedAt)
+		desiredAdvancedV, device, pf, overExcited, mrid, issuedAt)
 }
 
 // desiredAdvReleasePayload builds the all-null release doc used at teardown
@@ -411,10 +469,10 @@ func desiredAdvFixedPFPayload(device, mrid string, pf float64, overExcited bool,
 // next in this file.
 func desiredAdvReleasePayload(device string, issuedAt int64) string {
 	return fmt.Sprintf(
-		`{"v":1,"device_class":"solar","device_id":%q,`+
+		`{"v":%d,"device_class":"solar","device_id":%q,`+
 			`"reactive_mode":null,"volt_watt":null,"freq_watt":null,"freq_droop":null,"trips":null,"energize":null,`+
 			`"source":"none","issued_at":%d,"seq":2}`,
-		device, issuedAt)
+		desiredAdvancedV, device, issuedAt)
 }
 
 // ── Reconciler report readback (SSH mosquitto_sub, retained topic) ──────────
@@ -463,23 +521,74 @@ func (d *mayhemDriver) advReconcileReport(device string) (msg advReportMsg, pres
 // readback verification SYNCHRONOUSLY within one setDesired() call (bounded by
 // derbase.Base.AdoptPollTimeout, ~3s) — this is a small robustness margin
 // against MQTT/SSH round-trip jitter, not a wait for a slow convergence.
-func advReportWithRetry(d *mayhemDriver, device string, attempts int, wait time.Duration) (advReportMsg, bool, error) {
+func advReportWithRetry(d *mayhemDriver, device string, attempts int, wait time.Duration) (advReportMsg, advReportOutcome, error) {
 	var lastErr error
+	outcome := advReportUnreadable
 	for i := 0; i < attempts; i++ {
 		msg, present, ok := d.advReconcileReport(device)
 		if ok && present {
-			return msg, true, nil
+			return msg, advReportPresent, nil
 		}
 		if !ok {
+			outcome = advReportUnreadable
 			lastErr = fmt.Errorf("mosquitto_sub read of %s failed (SSH unreachable or qa-inject creds not provisioned)", reconcileAdvReportTopic(device))
 		} else {
+			outcome = advReportSilent
 			lastErr = fmt.Errorf("no retained report yet on %s", reconcileAdvReportTopic(device))
 		}
 		if i < attempts-1 {
 			time.Sleep(wait)
 		}
 	}
-	return advReportMsg{}, false, lastErr
+	return advReportMsg{}, outcome, lastErr
+}
+
+// advReportOutcome is the THREE-WAY result of looking for the reconciler's
+// retained report, and the three-way-ness is the point.
+//
+// It used to be a bool, and that collapsed two completely different situations
+// into one INCONCLUSIVE headline: "could not read the retained reconciler
+// report over SSH ... this is a detection gap, not a compliance finding". One
+// of them really is an SSH/credentials problem. The other is THE DUT NEVER
+// ACTED ON THE INJECTED DOCUMENT — read succeeded, topic empty — and that is
+// the shape a document refused at the bus version gate leaves behind.
+//
+// It is not hypothetical. Every adv drive in this file stamped DesiredAdvanced
+// v=1 against a gateway floor of 4, so every one of them injected a document
+// the DUT discards before the reconciler ever sees it, and every one of them
+// reported the resulting silence as an SSH detection gap. Separating the two is
+// the INJECTION-ACCEPTED WITNESS: a drive can no longer mistake "we never
+// exercised anything" for "we could not observe".
+type advReportOutcome int
+
+const (
+	// advReportUnreadable: the read itself failed. A detection gap.
+	advReportUnreadable advReportOutcome = iota
+	// advReportSilent: the read worked and nothing is retained. The injected
+	// document produced NO reconciler activity at all.
+	advReportSilent
+	// advReportPresent: a report was read.
+	advReportPresent
+)
+
+// advInjectionNotWitnessed builds the finding for advReportSilent, naming the
+// version gate as the first thing to check because it is the failure this
+// outcome was split out to expose.
+func advInjectionNotWitnessed(f mayFinding, device string) mayFinding {
+	f.Verdict = "INCONCLUSIVE"
+	f.Headline = "the DUT never acted on the injected desired-adv document — this drive exercised nothing"
+	f.Diagnosis = []string{
+		fmt.Sprintf("The retained topic %s was READ SUCCESSFULLY and is EMPTY, which is different from "+
+			"being unable to read it: the reconciler produced no report, so the document did not reach "+
+			"it.", reconcileAdvReportTopic(device)),
+		fmt.Sprintf("FIRST SUSPECT: the bus envelope version gate. This drive stamps DesiredAdvanced "+
+			"v=%d; the gateway discards anything below its own floor before the reconciler sees it, and "+
+			"a stale stamp here is exactly how these drives silently injected nothing for three "+
+			"platform bumps. cmd/dashboard/mayhem_adv_platform_test.go pins the stamp against "+
+			"lexa-platform's own constant — if it is green, look next at the device name and at whether "+
+			"the reconciler is running.", desiredAdvancedV),
+	}
+	return f
 }
 
 // ── lexa-modbus :9103 metrics (TASK-044) ─────────────────────────────────────
@@ -716,7 +825,7 @@ func diagnoseAdvShadowNoWrites(sc *mayScenario, s []maySample,
 func curveAdoptReadbackDivergenceScenario() *mayScenario {
 	const device = advTargetDevice
 	var (
-		haveReport bool
+		reportOutcome advReportOutcome
 		report     advReportMsg
 		reportErr  error
 	)
@@ -752,14 +861,14 @@ func curveAdoptReadbackDivergenceScenario() *mayScenario {
 			// WP-10 executes the write+readback synchronously on doc arrival
 			// (bounded by ~3s AdptCrvRslt polling); a small retry margin covers
 			// MQTT/SSH round-trip jitter, not a wait for slow convergence.
-			report, haveReport, reportErr = advReportWithRetry(d, device, 3, 3*time.Second)
+			report, reportOutcome, reportErr = advReportWithRetry(d, device, 3, 3*time.Second)
 
 			release := desiredAdvReleasePayload(device, time.Now().Unix())
 			_ = d.mqttInject(desiredAdvTopic(device), release, true)
 			_ = d.clearSolarAdvFault("curve_adopt_lies")
 		},
 		evaluate: func(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
-			return diagnoseCurveAdoptDivergence(sc, s, "volt_var", haveReport, report, reportErr)
+			return diagnoseCurveAdoptDivergence(sc, s, "volt_var", reportOutcome, report, reportErr)
 		},
 	}
 }
@@ -768,14 +877,17 @@ func curveAdoptReadbackDivergenceScenario() *mayScenario {
 // reconciler must report adopt_state=diverged (never adopted) for wantAxis
 // while curve_adopt_lies is armed. Shared with a future watt_var/volt_watt
 // variant if one is ever added, hence the explicit wantAxis parameter.
-func diagnoseCurveAdoptDivergence(sc *mayScenario, s []maySample, wantAxis string, haveReport bool, report advReportMsg, reportErr error) mayFinding {
+func diagnoseCurveAdoptDivergence(sc *mayScenario, s []maySample, wantAxis string, reportOutcome advReportOutcome, report advReportMsg, reportErr error) mayFinding {
 	f := baseFinding(sc)
 	if len(s) == 0 {
 		f.Verdict = "INCONCLUSIVE"
 		f.Headline = "no samples collected (aborted before any reading)"
 		return f
 	}
-	if !haveReport {
+	if reportOutcome == advReportSilent {
+		return advInjectionNotWitnessed(f, advTargetDevice)
+	}
+	if reportOutcome != advReportPresent {
 		f.Verdict = "INCONCLUSIVE"
 		f.Headline = "could not read the retained reconciler report over SSH"
 		f.Diagnosis = []string{
@@ -834,7 +946,7 @@ func pfVarMeasuredConvergenceScenario() *mayScenario {
 	const device = advTargetDevice
 	const commandedPF = 0.90
 	var (
-		haveReport                bool
+		reportOutcome             advReportOutcome
 		report                    advReportMsg
 		reportErr                 error
 		divBefore, divAfter       float64
@@ -885,7 +997,7 @@ func pfVarMeasuredConvergenceScenario() *mayScenario {
 			_ = d.post("solar", "/inject", map[string]any{"W_W": 3000})
 		},
 		teardown: func(d *mayhemDriver) {
-			report, haveReport, reportErr = advReportWithRetry(d, device, 3, 3*time.Second)
+			report, reportOutcome, reportErr = advReportWithRetry(d, device, 3, 3*time.Second)
 			if v, ok := d.readAdvModbusMetric("lexa_mb_adv_divergences_total"); ok && divMetricsAvail {
 				divAfter = v
 			} else {
@@ -902,7 +1014,7 @@ func pfVarMeasuredConvergenceScenario() *mayScenario {
 		},
 		evaluate: func(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
 			return diagnosePFVarMeasuredConvergence(sc, s, commandedPF,
-				haveReport, report, reportErr,
+				reportOutcome, report, reportErr,
 				divMetricsAvail, divBefore, divAfter,
 				havePFBefore && havePFAfter, pfBefore, pfAfter)
 		},
@@ -910,7 +1022,7 @@ func pfVarMeasuredConvergenceScenario() *mayScenario {
 }
 
 func diagnosePFVarMeasuredConvergence(sc *mayScenario, s []maySample, commandedPF float64,
-	haveReport bool, report advReportMsg, reportErr error,
+	reportOutcome advReportOutcome, report advReportMsg, reportErr error,
 	divMetricsAvail bool, divBefore, divAfter float64,
 	havePF bool, pfBefore, pfAfter float64,
 ) mayFinding {
@@ -920,7 +1032,10 @@ func diagnosePFVarMeasuredConvergence(sc *mayScenario, s []maySample, commandedP
 		f.Headline = "no samples collected (aborted before any reading)"
 		return f
 	}
-	if !haveReport {
+	if reportOutcome == advReportSilent {
+		return advInjectionNotWitnessed(f, advTargetDevice)
+	}
+	if reportOutcome != advReportPresent {
 		f.Verdict = "INCONCLUSIVE"
 		f.Headline = "could not read the retained reconciler report over SSH"
 		f.Diagnosis = []string{fmt.Sprintf("Reading lexa/reconcile/adv/%s/report failed: %v.", advTargetDevice, reportErr)}

@@ -1,0 +1,293 @@
+// Promoted from lexa-hub@5218e6a (2026-07-17)
+
+package bus
+
+// Intent message types (TASK-082, docs/DEVICE_ROADMAP.md §1.2): the bus
+// contract for cloud/app/CLI-originated goals flowing into lexa-hub, and the
+// hub's own mode/status state flowing back out. Every type here follows the
+// house rules already established for DesiredState/ActiveControl: Envelope
+// embedded by value (the "v" schema-version key), *float64 for optional
+// quantities (never NaN on the wire — see finite.go's Finite() additions for
+// this file), and no field colliding with the embedded "v" key (see
+// Measurement's doc comment in messages.go for why that collision is a live
+// landmine, not a hypothetical one).
+//
+// IntentMeta is embedded (not a named field) in every request-kind intent —
+// ModeIntent, EVGoalIntent, BackupReserveIntent, SolarForecastIntent,
+// LoadProfileIntent, TariffIntent, ChargeNowIntent — so ID/Origin/Actor/
+// IssuedAt/TTLS ride inline on each one's wire shape. IntentResult and
+// ModeStatus are hub-authored REPLIES, not requests, so they carry their own
+// ID/Ts fields directly rather than embedding IntentMeta.
+
+// IntentMeta is common to every intent kind. Origin/Actor make the journal
+// audit trail meaningful; ID makes retained redelivery idempotent; TTLS is
+// mandatory for edge kinds (chargenow) and ignored for state kinds.
+type IntentMeta struct {
+	ID       string `json:"id"`              // caller-generated, unique
+	Origin   string `json:"origin"`          // "cloud" | "app" | "cli"
+	Actor    string `json:"actor,omitempty"` // user email / token id / "root"
+	IssuedAt int64  `json:"issued_at"`       // Unix seconds at the source
+	TTLS     int    `json:"ttl_s,omitempty"` // edge intents only
+}
+
+// ModeIntent — lexa/intent/mode (retained). Requests a switch between the
+// hub's optimizer and gateway plan authors (§3.5).
+type ModeIntent struct {
+	Envelope
+	IntentMeta
+	Mode string `json:"mode"` // "optimizer" | "gateway"
+}
+
+// EVGoalIntent — lexa/intent/evgoal (retained). kWh terms: the app/cloud
+// resolves per-weekday defaults and %→kWh before publishing; the hub stays
+// unit-simple (PlannerParams already works in kWh).
+type EVGoalIntent struct {
+	Envelope
+	IntentMeta
+	StationID     string   `json:"station_id,omitempty"` // empty = the single/default station
+	TargetSocKwh  *float64 `json:"target_soc_kwh"`
+	DepartureUnix int64    `json:"departure_unix"`
+	InitialSocKwh *float64 `json:"initial_soc_kwh,omitempty"` // user estimate at plug-in ("estimated" in UI)
+	CapacityKwh   *float64 `json:"capacity_kwh,omitempty"`    // user-stated vehicle pack size
+}
+
+// BackupReserveIntent — lexa/intent/reserve (retained). The hub clamps to
+// >= the configured safety floor; intents can only RAISE the reserve.
+type BackupReserveIntent struct {
+	Envelope
+	IntentMeta
+	ReservePct *float64 `json:"reserve_pct"`
+}
+
+// SolarForecastIntent — lexa/intent/solarforecast (retained). StepKw is on
+// the planner's 5-min grid starting at WindowStart (<=288 entries; shorter
+// is zero-filled by the planner, same rule as SolarForecastKw today).
+type SolarForecastIntent struct {
+	Envelope
+	IntentMeta
+	WindowStart int64     `json:"window_start"` // Unix seconds, 5-min aligned
+	StepKw      []float64 `json:"step_kw"`
+	SourceTs    int64     `json:"source_ts"` // when the weather model ran (staleness input)
+}
+
+// LoadProfileIntent — lexa/intent/loadprofile (retained). Same grid rules.
+type LoadProfileIntent struct {
+	Envelope
+	IntentMeta
+	StepKw []float64 `json:"step_kw"`
+}
+
+// TariffIntent — lexa/intent/tariff (retained). Compiled on the hub into a
+// TOUCostModel; CSIP-published pricing (SetPrices arrays) still wins when
+// present, by the planner's existing nil-slice fallback rule.
+type TariffIntent struct {
+	Envelope
+	IntentMeta
+	Tariff TariffSpec `json:"tariff"`
+}
+
+// TariffSpec is the compiled-from-intent tariff shape (a user/cloud-supplied
+// counterpart to PricingUpdate's CSIP-derived schedule).
+type TariffSpec struct {
+	Currency string         `json:"currency"` // "USD"
+	Periods  []TariffPeriod `json:"periods"`
+	// FixedDailyCharge is a flat daily connection/service charge ($/day),
+	// separate from any per-kWh rate above (PR-C, additive). nil = not
+	// specified — the compiling caller (cmd/hub, later PR) treats absence as
+	// zero rather than "unknown", same convention as ExportPerKwh below.
+	FixedDailyCharge *float64 `json:"fixed_daily_charge,omitempty"`
+}
+
+// TariffPeriod is one recurring rate window within a TariffSpec.
+type TariffPeriod struct {
+	Label        string   `json:"label"`    // "peak", "off-peak", …
+	Days         []int    `json:"days"`     // 0=Sun … 6=Sat
+	StartHH      int      `json:"start_hh"` // local tariff-zone hour, inclusive
+	EndHH        int      `json:"end_hh"`   // exclusive
+	ImportPerKwh float64  `json:"import_per_kwh"`
+	ExportPerKwh *float64 `json:"export_per_kwh,omitempty"`
+	// DeliveryPerKwh is the per-period volumetric delivery/distribution
+	// charge ($/kWh), added on top of ImportPerKwh's supply rate to form the
+	// all-in import price (PR-C, additive). nil = not specified (no delivery
+	// component modeled for this period), matching ExportPerKwh's optional
+	// convention.
+	DeliveryPerKwh *float64 `json:"delivery_per_kwh,omitempty"`
+}
+
+// ChargeNowIntent — lexa/intent/chargenow (NOT retained; TTLS mandatory).
+type ChargeNowIntent struct {
+	Envelope
+	IntentMeta
+	StationID string `json:"station_id,omitempty"`
+}
+
+// IntentResult — lexa/intent/result (not retained). One per received intent.
+type IntentResult struct {
+	Envelope
+	ID      string `json:"id"`      // echoes IntentMeta.ID
+	Kind    string `json:"kind"`    // "mode" | "evgoal" | …
+	Outcome string `json:"outcome"` // "applied" | "clamped" | "rejected" | "expired" | "duplicate"
+	Detail  string `json:"detail,omitempty"`
+	Ts      int64  `json:"ts"`
+}
+
+// ModeStatus — lexa/hub/mode (retained). Authoritative mode state; also the
+// hub's own restart re-seed (subscribe-own-retained, like breach snapshots).
+type ModeStatus struct {
+	Envelope
+	Mode     string `json:"mode"`
+	Since    int64  `json:"since"`
+	Actor    string `json:"actor,omitempty"`
+	IntentID string `json:"intent_id,omitempty"`
+	Ts       int64  `json:"ts"`
+}
+
+// HubSettings — lexa/hub/settings (retained, GAP-8 read-back). The hub's
+// EFFECTIVE reserve floor and ACTIVE tariff, published so the app's reserve
+// slider and tariff viewer render hub truth instead of a locally-persisted
+// last-submitted value (which is all they had while the hub exposed neither).
+// Published by cmd/hub (settings.go) on every reserve/tariff change, once at
+// startup as a seed, and whenever the effective reserve pct moves after a
+// re-plan; folded into lexa-api's /status as "reserve" + "tariff".
+type HubSettings struct {
+	Envelope
+	Reserve ReserveSettings `json:"reserve"`
+	Tariff  TariffSettings  `json:"tariff"`
+	Ts      int64           `json:"ts"`
+}
+
+// ReserveSettings is HubSettings' backup-reserve read-back block.
+type ReserveSettings struct {
+	// EffectivePct is the reserve floor (percent of battery capacity) the most
+	// recent plan actually resolved to — the config floor RAISED by any reserve
+	// intent (Engine.EffectiveReservePct). nil before the hub's first plan (the
+	// engine's -1 sentinel), which is exactly why applyReserve could not report
+	// "clamped" before this existed.
+	EffectivePct *float64 `json:"effective_pct"`
+	// FloorPct is the configured safety floor (percent) a reserve intent may
+	// only raise above, never below — the value EffectivePct clamps against.
+	FloorPct *float64 `json:"floor_pct"`
+	// Source is where the standing reserve came from: "default" (no intent yet —
+	// the config floor governs), or a reserve intent's origin ("app" | "cloud" |
+	// "lexactl").
+	Source string `json:"source"`
+}
+
+// TariffSettings is HubSettings' active-tariff read-back block.
+type TariffSettings struct {
+	// Source is "manual" once a tariff intent has set Spec, else "csip" (no
+	// manual override — utility CSIP pricing or the built-in default TOU
+	// governs). NOTE: "csip" here means only "not manually overridden"; the hub
+	// does not yet distinguish an ACTIVE CSIP price feed from the default TOU,
+	// nor detect a CSIP feed overriding a manual tariff — that live-CSIP-override
+	// detection is a documented follow-up (needs a pricing-source signal the
+	// engine does not expose today).
+	Source string `json:"source"`
+	// UpdatedAt is when the tariff last changed on the hub (Unix seconds); 0
+	// before any tariff intent.
+	UpdatedAt int64 `json:"updated_at"`
+	// Spec is the last tariff intent's TariffSpec, echoed verbatim so the app's
+	// tariff viewer renders exactly what it submitted. nil before any tariff
+	// intent (the app then shows no manual tariff).
+	Spec *TariffSpec `json:"spec,omitempty"`
+}
+
+// HubSchedule — lexa/hub/schedule (retained, GAP-7 plan/forecast series). The
+// hub's most recent 24-hour plan projected into three per-slot series the app's
+// forecast/plan charts consume: the solar forecast the optimizer used, the
+// planned battery setpoint + SOC, and the EV charge plan. Published by cmd/hub
+// (schedule.go) on each replan (deduped on the plan's build time), consumed by
+// lexa-api which projects it into GET /plan.
+//
+// All three series share ONE uniform 5-minute grid: slot i starts at
+// WindowStart + i*SlotMinutes*60 (Unix s); lexa-api renders that as the RFC3339
+// "t" of each app-shaped entry. Powers are watts, with the house sign
+// convention (+ discharge/generation, − charge/load): SolarForecastW is +gen,
+// BatterySetpointW is + discharge / − charge, and EVPlanW is − (charging is a
+// load). Never NaN on the wire (the builder guarantees finite; HubSchedule.
+// Finite() is decode-side defense in depth) — an unknown per-slot SOC is a nil
+// *float64 (JSON null), and an absent series is an empty/nil slice.
+type HubSchedule struct {
+	Envelope
+	// GeneratedAt is the plan's build time (Unix s) — the dedupe key cmd/hub
+	// uses so an unchanged plan is not republished, and the app's "as of".
+	GeneratedAt int64 `json:"generated_at"`
+	// WindowStart is the Unix second of slot 0; SlotMinutes/HorizonH describe
+	// the grid (5 / 24 today). t of slot i = WindowStart + i*SlotMinutes*60.
+	WindowStart int64 `json:"window_start"`
+	SlotMinutes int   `json:"slot_minutes"`
+	HorizonH    int   `json:"horizon_h"`
+	// SolarForecastW is the per-slot solar-generation forecast (W, + gen) the
+	// optimizer actually planned against. Empty when no forecast was available.
+	SolarForecastW []float64 `json:"solar_forecast_w"`
+	// BatterySetpointW / BatterySocPct are the planned per-slot battery dispatch
+	// (W, + discharge − charge) and the planned SOC (percent of capacity) at the
+	// START of each slot. Parallel slices (same length); a nil SOC entry means
+	// the slot's SOC is unknown. Both empty when no battery was modelled.
+	BatterySetpointW []float64  `json:"battery_setpoint_w"`
+	BatterySocPct    []*float64 `json:"battery_soc_pct"`
+	// EVPlanW maps station id → per-slot EV power (W, − charge/load). The daily
+	// planner models a single logical EV today, so this normally holds one
+	// series keyed by the configured station id. Empty when no EV was modelled.
+	EVPlanW map[string][]float64 `json:"ev_plan_w"`
+
+	// LoadForecastW is the per-slot site-load forecast the plan served (W), a
+	// POSITIVE consumption magnitude — the demand the battery/EV/grid dispatch is
+	// planned around. Unlike BatterySetpointW/GridW/EVPlanW (signed bus flows),
+	// this is a forecast magnitude like SolarForecastW (its generation dual):
+	// +consumption, never negative. Empty on a hub that predates this field
+	// (back-compat: GET /plan then renders an empty load_forecast series).
+	LoadForecastW []float64 `json:"load_forecast_w,omitempty"`
+
+	// --- Plan economics (PR-C, additive) ---
+	// The fields below surface the $ economics the DP already computes
+	// internally so GET /plan can render them; populated by a later PR
+	// (cmd/hub/schedule.go). All default to nil/zero, which is harmless: an
+	// empty Currency/slice or zero TotalCost/FixedDailyCharge simply means
+	// "not yet populated," identical to today's wire shape before this PR.
+	// Same uniform 5-minute grid as SolarForecastW/BatterySetpointW above —
+	// index-aligned, one entry per slot.
+
+	// Currency is the ISO-ish code the $ fields below are denominated in,
+	// e.g. "USD". Empty = not populated.
+	Currency string `json:"currency,omitempty"`
+	// ImportPriceKwh is the per-slot ALL-IN import price (supply + delivery),
+	// $/kWh — what the household actually pays per kWh imported in that
+	// slot.
+	ImportPriceKwh []float64 `json:"import_price_kwh,omitempty"`
+	// DeliveryPriceKwh is the per-slot delivery/distribution component alone,
+	// $/kWh, so the app can annotate how much of ImportPriceKwh is delivery
+	// vs. supply.
+	DeliveryPriceKwh []float64 `json:"delivery_price_kwh,omitempty"`
+	// ExportPriceKwh is the per-slot export/feed-in credit, $/kWh.
+	ExportPriceKwh []float64 `json:"export_price_kwh,omitempty"`
+	// GridW is the per-slot planned grid flow, watts, house sign convention:
+	// + import, − export.
+	GridW []float64 `json:"grid_w,omitempty"`
+	// MarginalCost is the per-slot net $ cost implied by GridW at that slot's
+	// price (negative = earning, e.g. net export at a positive export
+	// credit).
+	MarginalCost []float64 `json:"marginal_cost,omitempty"`
+	// TotalCost is the 24h total $ for the plan, INCLUDING FixedDailyCharge
+	// below (not just the sum of MarginalCost).
+	TotalCost float64 `json:"total_cost,omitempty"`
+	// FixedDailyCharge is the flat daily connection/service charge ($/day)
+	// this plan's TotalCost included — the plan-side echo of TariffSpec's
+	// field of the same name above.
+	FixedDailyCharge float64 `json:"fixed_daily_charge,omitempty"`
+
+	Ts int64 `json:"ts"` // publish wall-clock (Unix s)
+}
+
+// CloudlinkStatus — lexa/cloudlink/status (retained). Folded into lexa-api's
+// /status as "cloud_link" and uplinked as part of the health stream.
+type CloudlinkStatus struct {
+	Envelope
+	Connected     bool   `json:"connected"`
+	Endpoint      string `json:"endpoint,omitempty"`
+	SpoolBytes    int64  `json:"spool_bytes"`
+	SpoolOldestTs int64  `json:"spool_oldest_ts,omitempty"`
+	LastUplinkTs  int64  `json:"last_uplink_ts,omitempty"`
+	CertDaysLeft  int    `json:"cert_days_left,omitempty"`
+	Ts            int64  `json:"ts"`
+}

@@ -6,6 +6,8 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -620,5 +622,72 @@ func TestApplyExplicitNil_UnarmedReturnsTheSameBytes(t *testing.T) {
 	}
 	if !bytes.Equal(out, doc) {
 		t.Errorf("an unarmed overlay rewrote the document:\n%s", out)
+	}
+}
+
+// TestExplicitNil_AStaleMarkerCannotResurrectOntoARecycledMRID is the row that
+// PINS the orphan sweep, and it exists because the sweep was previously pinned
+// by nothing.
+//
+// GATE FINDING F3. TestExplicitNil_DoesNotSurviveTheControlsRemoval re-POSTS the
+// same mRID WITHOUT null_axes to show the marker is gone — but a re-POST through
+// POST /admin/control disarms the marker itself (setExplicitNilLocked deletes
+// the key when a request names no axes), so that row stays green with
+// forgetOrphanedExplicitNilLocked deleted. It proved the disarm, not the sweep.
+//
+// The unmasked path is a RECYCLED mRID, and it is not hypothetical: POST
+// /admin/curve mints "DERC-<prog>-CURVE-<unix seconds>" (curve.go), so two
+// writes in the same second get the SAME mRID by construction. Without the
+// sweep the sequence below leaves a marker keyed to an mRID whose control was
+// deleted, a new curve control reclaims that mRID carrying a VALUED
+// opModVoltVar, and the overlay is then asked to insert an xsi:nil element for
+// an axis the document already carries — which baseSplices correctly refuses,
+// so serveXML answers 500 and /derp/0/derc becomes UNFETCHABLE FOR EVERY
+// CLIENT, not merely wrong for one.
+//
+// Mutation-proved: with the two forgetOrphanedExplicitNilLocked calls on the
+// control paths removed, this row fails on the 500.
+func TestExplicitNil_AStaleMarkerCannotResurrectOntoARecycledMRID(t *testing.T) {
+	s := newTestServer()
+
+	// The mRID POST /admin/curve will mint THIS SECOND. Computed from the
+	// server's own clock and the same format string the minting site uses, so
+	// the row collides by construction rather than by racing.
+	recycled := fmt.Sprintf("DERC-%s-CURVE-%d", progPrefixes[0], s.Now())
+
+	// Arm a marker on it, then take its control away.
+	postControlOK(t, s, `{"program":0,"activate":true,"mrid":"`+recycled+`",`+
+		`"connect":true,"null_axes":["opModVoltVar"]}`)
+	deleteAdmin(t, s, "/admin/control", `{"program":0}`)
+
+	// A curve control minted in the same second RECLAIMS that mRID, and it
+	// carries a valued opModVoltVar curve link.
+	if rec := postAdmin(t, s, "/admin/curve", `{
+		"program": 0, "mode": "volt_var", "x_mult": -2, "y_mult": 0,
+		"points": [{"x":9570,"y":30},{"x":10430,"y":-30}], "activate": true
+	}`); rec.Code != http.StatusCreated {
+		t.Fatalf("POST /admin/curve = %d: %s", rec.Code, rec.Body)
+	}
+
+	// 1. The list is still SERVABLE. This is the assertion the missing sweep
+	//    breaks, and it breaks it for every client of the program at once.
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/derp/0/derc", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /derp/0/derc = %d, want 200: a marker armed on a DELETED control was still "+
+			"registered when a new control reclaimed its mRID, and the overlay was asked to nil an "+
+			"element the document already carries. Body: %s", rec.Code, rec.Body)
+	}
+
+	// 2. And the recycled control did not inherit a release nobody armed on it:
+	//    its opModVoltVar is the VALUED curve link the curve request authored.
+	kids := controlBases(t, rec.Body.String())[recycled]
+	vv, ok := childNamed(kids, "opModVoltVar")
+	if !ok {
+		t.Fatalf("the recycled control carries no opModVoltVar at all; document:\n%s", rec.Body.String())
+	}
+	if vv.nilMark {
+		t.Errorf("the recycled control's opModVoltVar is xsi:nil-marked — it inherited a release armed " +
+			"on the DIFFERENT control that previously held this mRID")
 	}
 }

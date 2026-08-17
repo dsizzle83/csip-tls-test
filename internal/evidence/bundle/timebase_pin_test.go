@@ -39,7 +39,7 @@ import (
 const (
 	wallLabel     = "wall"
 	scaled900     = "scaled 900× (ACCELERATED TEST TIME — proves this harness's expiry semantics, NOT any real device's timing)"
-	scaled10000   = "scaled 1e+04× (ACCELERATED TEST TIME — proves this harness's expiry semantics, NOT any real device's timing)"
+	scaled3600    = "scaled 3600× (ACCELERATED TEST TIME — proves this harness's expiry semantics, NOT any real device's timing)"
 	manualAtStart = "manual (ACCELERATED TEST TIME, t+0.000s — proves this harness's expiry semantics, NOT any real device's timing)"
 	manualAt1500  = "manual (ACCELERATED TEST TIME, t+1.500s — proves this harness's expiry semantics, NOT any real device's timing)"
 )
@@ -57,8 +57,8 @@ func TestFixtureTimebaseLabelsArePinned(t *testing.T) {
 	// 10 000× is the scale sim/southbound's own reversion-loop test uses, and
 	// it pins the %.4g rendering, which is the one part of this sentence a
 	// reader could mistake for a typo.
-	if got := sim.NewScaledTimebase(10000).Label(); got != scaled10000 {
-		t.Errorf("a 10 000× clock labels itself\n  %q\nwant\n  %q", got, scaled10000)
+	if got := sim.NewScaledTimebase(3600).Label(); got != scaled3600 {
+		t.Errorf("a 3600× clock labels itself\n  %q\nwant\n  %q", got, scaled3600)
 	}
 
 	man := sim.NewManualTimebase()
@@ -69,7 +69,7 @@ func TestFixtureTimebaseLabelsArePinned(t *testing.T) {
 	if got := man.Label(); got != manualAt1500 {
 		t.Errorf("a manual clock advanced 1.5 s labels itself\n  %q\nwant\n  %q", got, manualAt1500)
 	}
-	for _, l := range []string{scaled900, scaled10000, manualAtStart, manualAt1500} {
+	for _, l := range []string{scaled900, scaled3600, manualAtStart, manualAt1500} {
 		if !strings.Contains(l, "ACCELERATED TEST TIME") {
 			t.Errorf("%q does not warn the reader it is not real time", l)
 		}

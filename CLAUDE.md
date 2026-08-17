@@ -24,6 +24,19 @@ discipline (see `docs/BENCH.md`). A local `go.work` (`go work init . ../lexa-pro
 gitignored, never committed) is still the normal way to develop against a live
 `lexa-proto` checkout.
 
+`lexa-platform` is pinned the same way (`platform.pin`, `replace lexa-platform =>
+../lexa-platform`), but for a DIFFERENT and narrower reason: this repo does not build
+against its bus contract, it MIRRORS two pieces of it by hand — `bus.CurveSetContentHash`'s
+canonicalization and the `DesiredAdvanced` envelope version, both in
+`cmd/dashboard/mayhem_adv.go`. The mirror is deliberate (a harness that computed the
+gateway's hash with the gateway's own function could not catch a canonicalization bug —
+both sides would cancel), so the dependency exists ONLY so the TESTS can be differential:
+`cmd/dashboard/mayhem_adv_platform_test.go` runs both implementations over a vector table
+and fails when they disagree. That is what makes a platform move break this repo's suite
+instead of silently splitting identity — which is how the mirror came to be two
+generations stale while every adv mayhem drive injected documents the DUT refused at the
+version gate. When `platform.pin` moves, expect those rows to be the ones that speak.
+
 ## Stack
 Go 1.26 · wolfSSL cgo (`internal/wolfssl` only) · lorenzodonini/ocpp-go · simonvetter/modbus · grandcat/zeroconf
 

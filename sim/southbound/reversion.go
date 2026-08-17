@@ -173,8 +173,10 @@ package sim
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lexa-proto/sunspec"
@@ -318,25 +320,84 @@ type ScaledTimebase struct {
 	scale float64
 	real0 time.Time
 	sim0  time.Time
+	// saturated latches once this clock has outrun the range its instant is
+	// held in. Read by Declare, so the fact travels into evidence.
+	saturated atomic.Bool
 }
 
+// MaxReversionScale is the largest multiplier this fixture will run a device
+// clock at, and it is a CORRECTNESS bound rather than a taste one.
+//
+// A ScaledTimebase holds its instant in a time.Duration — an int64 of
+// nanoseconds — so scaled elapsed time is representable only up to
+// 2^63 ns ~ 292 years. Past that the product no longer fits and the clock stops
+// tracking its multiplier. The bound is chosen so that saturation is
+// unreachable in any plausible session:
+//
+//	at 3600x ("an hour a second"), 2^63 ns of simulated time is spent only
+//	after 2^63/3600 ns ~ 29.6 DAYS of real time.
+//
+// GATE FINDING F2 measured what its absence cost. There was no bound, and the
+// conversion did not saturate — on amd64 an out-of-range float-to-int64
+// conversion yields INT64_MIN, so the clock jumped ~292 years INTO THE PAST and
+// stayed there. At 1e9x that happened after 9.2 s, at 86400x ("a day a second")
+// after 29.7 h, and at 1e18x immediately: RvrtRem then read its armed value for
+// ever while /state went on declaring the multiplier and never said the clock
+// had stopped. That is verbatim the inert-register observation RC0 §9.5 row 10
+// was blocked by, reproduced through the very lever built to unblock it.
+//
+// No reversion row needs more: a head end's windows are seconds to minutes, so
+// 3600x turns the battery's 258 s window into 72 ms.
+const MaxReversionScale = 3600
+
 // NewScaledTimebase returns a timebase running scale× faster than the wall
-// clock. scale must be > 0; anything else is a programming error rather than
-// something to silently coerce to 1, because a caller that asked for
-// acceleration and got real time would sit in a 900-second test wondering why.
+// clock. scale must be > 0 and at most MaxReversionScale; anything else is a
+// programming error rather than something to silently coerce, because a caller
+// that asked for acceleration and got real time would sit in a 900-second test
+// wondering why — and one that asked for a multiplier the clock cannot count at
+// would sit watching a countdown that had quietly stopped.
 func NewScaledTimebase(scale float64) *ScaledTimebase {
 	if !(scale > 0) || math.IsInf(scale, 0) {
 		panic(fmt.Sprintf("sim: NewScaledTimebase(%v): scale must be a positive, finite multiplier", scale))
+	}
+	if scale > MaxReversionScale {
+		panic(fmt.Sprintf("sim: NewScaledTimebase(%v): the largest multiplier this clock can count at is "+
+			"%d× — see MaxReversionScale for the arithmetic", scale, MaxReversionScale))
 	}
 	now := time.Now()
 	return &ScaledTimebase{scale: scale, real0: now, sim0: now}
 }
 
-// Now reports the accelerated instant.
+// Now reports the accelerated instant, SATURATING FORWARD rather than wrapping.
+//
+// The direction is the whole point. A reversion timer is a dead-man switch: its
+// clock may stop, but it must never run BACKWARDS, because a clock that runs
+// backwards means no deadline is ever reached and every armed control is held
+// for ever. Saturating forward makes every armed control fire instead — early,
+// which is the safe end of wrong for a dead-man switch — and the saturation is
+// declared (Declare/Label), so a bundle cannot carry a stopped clock silently.
+//
+// The range check is done in float64 BEFORE the conversion, because the
+// conversion is where the information is lost: Go leaves the result of
+// converting an out-of-range float to an integer type implementation-defined,
+// and on amd64 it is INT64_MIN — the largest possible step in exactly the
+// forbidden direction.
 func (tb *ScaledTimebase) Now() time.Time {
-	elapsed := time.Since(tb.real0)
-	return tb.sim0.Add(time.Duration(float64(elapsed) * tb.scale))
+	ns := float64(time.Since(tb.real0)) * tb.scale
+	switch {
+	case ns >= float64(math.MaxInt64):
+		tb.saturated.Store(true)
+		return tb.sim0.Add(math.MaxInt64)
+	case ns < 0:
+		// Only reachable if the wall clock itself stepped backwards under us.
+		// Same rule, same reason.
+		return tb.sim0
+	}
+	return tb.sim0.Add(time.Duration(ns))
 }
+
+// Saturated reports whether this clock has stopped tracking its multiplier.
+func (tb *ScaledTimebase) Saturated() bool { return tb.saturated.Load() }
 
 // Declare states the multiplier this clock runs at.
 //
@@ -348,7 +409,7 @@ func (tb *ScaledTimebase) Now() time.Time {
 // the bundle refuses to be written rather than shipping a clock nobody can
 // describe.
 func (tb *ScaledTimebase) Declare() bundle.Timebase {
-	d, err := bundle.DeclareScaled(TimebaseComponent, "", tb.scale)
+	d, err := bundle.DeclareScaledState(TimebaseComponent, "", tb.scale, tb.Saturated())
 	if err != nil {
 		return bundle.Timebase{}
 	}
@@ -648,12 +709,23 @@ func (t rvrtTimer) covers(start uint16, n int) bool {
 // and the timer is restarted."
 //
 // A write elsewhere in the block — the controlled point, a ramp rate, the
-// anti-islanding enable — deliberately does NOT restart an armed countdown.
-// derbase writes the whole 704 block read-modify-write, so its RvrtTms lands in
-// the same transaction as its setpoint and the refresh happens anyway; making
-// any 704 write refresh every timer would additionally mean that writing
-// AntiIslEna silently extended a WSet dead-man switch, which is a device
-// behaviour nobody would be able to justify to a reviewer.
+// anti-islanding enable — does NOT restart an armed countdown, and THIS IS A
+// DEVIATION FROM §3.2's LETTER, not a reading of it. §3.2 says "if a SETTING is
+// updated while the reversion timer is active ... the reversion timer SHALL be
+// reinitialized", and a write to the controlled point is a setting update.
+//
+// It is deviated from deliberately, and the justification is a property of the
+// product rather than of the standard: derbase writes the whole 704 block
+// read-modify-write, so its RvrtTms lands in the same transaction as its
+// setpoint and the refresh happens anyway — the deviation is unobservable
+// against the writer this fixture exists to test. Refreshing on ANY write in
+// the block would additionally mean that writing AntiIslEna silently extended a
+// WSet dead-man switch, which is a device behaviour nobody could justify.
+//
+// What that costs, stated so a row does not lean on it: a head end that wrote a
+// controlled point ALONE, in its own transaction, would get no refresh here
+// where a conforming device gives one — so this fixture must not be cited as
+// evidence about §3.2's re-arm-on-setting-update clause for such a writer.
 //
 // ARMING IS NOT GATED ON THE FUNCTION'S ENABLE, and that is a deliberate reading
 // of §3.2 rather than an oversight. §3.2's Disabled state is "the function SHALL
@@ -723,16 +795,39 @@ func (e *rvrtEngine) step(r *RegisterMap) []string {
 	}
 	e.mu.Lock()
 	now := e.tb.Now()
+	// A STOPPED CLOCK RELEASES EVERY CONTROL IT IS HOLDING.
+	//
+	// Saturating forward (ScaledTimebase.Now) keeps a clock from running
+	// BACKWARDS, but a saturated clock is CONSTANT — so a timer armed after it
+	// stopped has a deadline the clock can never reach, and its register would
+	// sit at the armed value for ever. That is precisely the inert-countdown
+	// symptom gate finding F2 measured, and it is the one outcome a dead-man
+	// switch may never produce: a device that cannot tell whether a lease has
+	// expired must assume it has. Every armed timer is therefore expired here,
+	// loudly, rather than held.
+	//
+	// Unreachable through any supported path — MaxReversionScale bounds the
+	// multiplier so that saturation needs ~29.6 days of real time — so this is
+	// the backstop, not the defence.
+	dead := false
+	if s, ok := e.tb.(interface{ Saturated() bool }); ok && s.Saturated() {
+		dead = len(e.armed) > 0
+	}
 	var expired []rvrtTimer
 	for _, t := range e.timers {
 		deadline, ok := e.armed[t.Name]
-		if !ok || now.Before(deadline) {
+		if !ok || (!dead && now.Before(deadline)) {
 			continue
 		}
 		delete(e.armed, t.Name)
 		expired = append(expired, t)
 	}
 	e.mu.Unlock()
+	if dead {
+		log.Printf("[sim] reversion: the device clock has SATURATED and stopped advancing — releasing "+
+			"every armed control rather than holding it on a clock that can no longer measure its lease "+
+			"(timebase: %s)", e.timebaseLabel())
+	}
 
 	names := make([]string, 0, len(expired))
 	for _, t := range expired {

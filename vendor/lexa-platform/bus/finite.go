@@ -1,0 +1,480 @@
+// Promoted from lexa-hub@5218e6a (2026-07-17)
+
+package bus
+
+import (
+	"fmt"
+	"math"
+)
+
+// finite reports whether p is a safe bus value: nil (the absent-value
+// convention — TASK-017/nan_test.go — always passes) or a finite float64. A
+// non-nil NaN/±Inf is the case this file exists to catch: it should never
+// happen from a lexa publisher (json.Marshal already fails on a *float64
+// pointing to NaN, per nan_test.go's TestBusMessagesNaNPointerIsInvalid) and
+// json.Unmarshal already rejects bare/quoted "NaN"/"Infinity" into a typed
+// float64/*float64 field (GAP-09 review §9's crux). This is defense in
+// depth for the residual: a lax future decoder (UseNumber, interface{},
+// map[string]any, a third-party JSON lib) that lets a non-finite value
+// through as something a later ParseFloat turns into a live NaN/Inf before
+// it reaches a Finite() call. name is folded into the returned error so a
+// caller — and the alarm log in mqttutil.Subscribe — can name the offending
+// field.
+func finite(name string, p *float64) error {
+	if p == nil {
+		return nil
+	}
+	return finiteVal(name, *p)
+}
+
+// finiteVal is finite's counterpart for message fields that are plain
+// float64 (not pointers) — e.g. ComplianceAlert's always-present limit/
+// measured/shortfall watts, which have no "absent value" convention to begin
+// with, so there is no nil case to skip.
+func finiteVal(name string, v float64) error {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return fmt.Errorf("bus: field %q is non-finite (%v)", name, v)
+	}
+	return nil
+}
+
+// Finite reports whether every numeric field is nil (absent) or finite.
+// Called by mqttutil.Subscribe (via an interface{ Finite() error } type
+// assertion) immediately after a successful json.Unmarshal, so a value that
+// slipped past the decoder as something other than a rejected-outright
+// bare/quoted NaN/Inf token is still caught before it reaches handler —
+// belt-and-suspenders on top of stdlib's existing rejection, not a
+// replacement for it.
+func (m Measurement) Finite() error {
+	if err := finite("w", m.W); err != nil {
+		return err
+	}
+	if err := finite("voltage_v", m.VoltageV); err != nil {
+		return err
+	}
+	if err := finite("hz", m.Hz); err != nil {
+		return err
+	}
+	if err := finite("var_w", m.VarW); err != nil {
+		return err
+	}
+	if err := finite("va", m.VA); err != nil {
+		return err
+	}
+	if err := finite("pf", m.PF); err != nil {
+		return err
+	}
+	if err := finite("wh_imp_total", m.WhImpTotal); err != nil {
+		return err
+	}
+	if err := finite("wh_exp_total", m.WhExpTotal); err != nil {
+		return err
+	}
+	// Per-phase / line-to-line voltage carriage: every new *float64 joins the
+	// check, same GAP-09 discipline as the WP-2 fields above.
+	if err := finite("llv", m.LLV); err != nil {
+		return err
+	}
+	if err := finite("vl1l2", m.VL1L2); err != nil {
+		return err
+	}
+	if err := finite("vl1", m.VL1); err != nil {
+		return err
+	}
+	if err := finite("vl2l3", m.VL2L3); err != nil {
+		return err
+	}
+	if err := finite("vl2", m.VL2); err != nil {
+		return err
+	}
+	if err := finite("vl3l1", m.VL3L1); err != nil {
+		return err
+	}
+	if err := finite("vl3", m.VL3); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is BattMetrics' counterpart to Measurement.Finite.
+func (b BattMetrics) Finite() error {
+	if err := finite("soc_pct", b.SOC); err != nil {
+		return err
+	}
+	if err := finite("soh_pct", b.SOH); err != nil {
+		return err
+	}
+	if err := finite("capacity_wh", b.CapacityWh); err != nil {
+		return err
+	}
+	if err := finite("max_charge_w", b.MaxChargeW); err != nil {
+		return err
+	}
+	if err := finite("max_discharge_w", b.MaxDischargeW); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is ActiveControl's counterpart to Measurement.Finite. This is the
+// safety-critical case (GAP-09's payoff): ExpLimW/ImpLimW/MaxLimW/FixedW are
+// exactly the values cmd/hub's optimizer treats as authoritative export/
+// import/generation/dispatch caps — a NaN here must never be adopted as a
+// live limit, only ever cause the whole message to be dropped (fail-closed,
+// last-known-good control holds).
+func (a ActiveControl) Finite() error {
+	if err := finite("exp_lim_w", a.ExpLimW); err != nil {
+		return err
+	}
+	if err := finite("imp_lim_w", a.ImpLimW); err != nil {
+		return err
+	}
+	if err := finite("max_lim_w_pct", a.MaxLimWPct); err != nil {
+		return err
+	}
+	if err := finite("fixed_w_pct", a.FixedWPct); err != nil {
+		return err
+	}
+	// WP-8 additive advanced-control scalars (architecture §2.2): every new
+	// *float64 joins the check, same GAP-09 discipline as the four above.
+	if err := finite("gen_lim_w", a.GenLimW); err != nil {
+		return err
+	}
+	if err := finite("load_lim_w", a.LoadLimW); err != nil {
+		return err
+	}
+	if err := finite("target_w", a.TargetW); err != nil {
+		return err
+	}
+	if err := finite("fixed_var_pct", a.FixedVarPct); err != nil {
+		return err
+	}
+	if err := finite("set_grad_w", a.SetGradW); err != nil {
+		return err
+	}
+	if err := finite("set_soft_grad_w", a.SetSoftGradW); err != nil {
+		return err
+	}
+	if a.FixedPFInject != nil {
+		if err := finiteVal("fixed_pf_inject.pf", a.FixedPFInject.PF); err != nil {
+			return err
+		}
+	}
+	if a.FixedPFAbsorb != nil {
+		if err := finiteVal("fixed_pf_absorb.pf", a.FixedPFAbsorb.PF); err != nil {
+			return err
+		}
+	}
+	// H5/ED-3: a NaN in the carried default-fallback must drop the whole retained
+	// message (fail-closed), not seed a NaN cap once the event expires.
+	if d := a.DefaultFallback; d != nil {
+		for _, f := range []struct {
+			name string
+			v    *float64
+		}{
+			{"default_fallback.exp_lim_w", d.ExpLimW},
+			{"default_fallback.imp_lim_w", d.ImpLimW},
+			{"default_fallback.max_lim_w_pct", d.MaxLimWPct},
+			{"default_fallback.gen_lim_w", d.GenLimW},
+			{"default_fallback.load_lim_w", d.LoadLimW},
+			{"default_fallback.fixed_w_pct", d.FixedWPct},
+			// The reversion alternate's own numbers (R-PF/Var). A NaN here is
+			// worse than a NaN in a primary limit, not better: it is a value
+			// nothing reads back until the countdown fires, unattended.
+			{"default_fallback.rvrt_var_set_pct", d.RvrtVarSetPct},
+		} {
+			if err := finite(f.name, f.v); err != nil {
+				return err
+			}
+		}
+		if d.RvrtPF != nil {
+			if err := finiteVal("default_fallback.rvrt_pf.pf", d.RvrtPF.PF); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Finite is ComplianceAlert's counterpart to Measurement.Finite. Unlike the
+// other types here, ComplianceAlert's numeric fields are plain float64 (no
+// absent-value convention — a compliance alert always carries real limit/
+// measured/shortfall wattage), so finiteVal is used directly rather than
+// finite's nil-skip wrapper.
+func (c ComplianceAlert) Finite() error {
+	if err := finiteVal("limit_w", c.LimitW); err != nil {
+		return err
+	}
+	if err := finiteVal("measured_w", c.MeasuredW); err != nil {
+		return err
+	}
+	if err := finiteVal("shortfall_w", c.ShortfallW); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is EVSEState's counterpart to Measurement.Finite.
+func (e EVSEState) Finite() error {
+	if err := finite("current_a", e.CurrentA); err != nil {
+		return err
+	}
+	if err := finite("max_current_a", e.MaxCurrentA); err != nil {
+		return err
+	}
+	if err := finite("voltage_v", e.VoltageV); err != nil {
+		return err
+	}
+	if err := finite("power_w", e.PowerW); err != nil {
+		return err
+	}
+	if err := finite("soc_pct", e.SOC); err != nil {
+		return err
+	}
+	if err := finite("energy_wh", e.EnergyWh); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is DERScheduleSlot's counterpart to Measurement.Finite. Only the
+// scalar operating-mode fields are checked; the curve-linked fields
+// (VoltVar, FreqWatt, ...) carry int32 breakpoints (CurvePoint), not
+// *float64, so they are outside this task's scope (GAP-09 is about *float64
+// bus fields).
+func (s DERScheduleSlot) Finite() error {
+	if err := finite("max_lim_w_pct", s.MaxLimWPct); err != nil {
+		return err
+	}
+	if err := finite("fixed_w_pct", s.FixedWPct); err != nil {
+		return err
+	}
+	if err := finite("exp_lim_w", s.ExpLimW); err != nil {
+		return err
+	}
+	if err := finite("imp_lim_w", s.ImpLimW); err != nil {
+		return err
+	}
+	if err := finite("gen_lim_w", s.GenLimW); err != nil {
+		return err
+	}
+	if err := finite("load_lim_w", s.LoadLimW); err != nil {
+		return err
+	}
+	if err := finite("target_w", s.TargetW); err != nil {
+		return err
+	}
+	if err := finite("fixed_var_pct", s.FixedVarPct); err != nil {
+		return err
+	}
+	if err := finite("fixed_pf_absorb", s.FixedPFAbsorb); err != nil {
+		return err
+	}
+	if err := finite("fixed_pf_inject", s.FixedPFInject); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is DERScheduleMsg's counterpart to Measurement.Finite. DERScheduleMsg
+// itself has no bare *float64 fields — its numeric payload lives in Slots —
+// so this walks the slots and delegates to DERScheduleSlot.Finite. This
+// matters because mqttutil.Subscribe's Finite() type assertion runs against
+// the top-level decoded type (T = DERScheduleMsg for
+// bus.TopicNorthboundSchedule), not the nested slice element; without this
+// method a non-finite value in a slot would never be checked.
+func (d DERScheduleMsg) Finite() error {
+	for i, s := range d.Slots {
+		if err := s.Finite(); err != nil {
+			return fmt.Errorf("slots[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// Finite is EVGoalIntent's counterpart to Measurement.Finite (TASK-082).
+func (g EVGoalIntent) Finite() error {
+	if err := finite("target_soc_kwh", g.TargetSocKwh); err != nil {
+		return err
+	}
+	if err := finite("initial_soc_kwh", g.InitialSocKwh); err != nil {
+		return err
+	}
+	if err := finite("capacity_kwh", g.CapacityKwh); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is BackupReserveIntent's counterpart to Measurement.Finite (TASK-082).
+func (r BackupReserveIntent) Finite() error {
+	return finite("reserve_pct", r.ReservePct)
+}
+
+// Finite is SolarForecastIntent's counterpart to Measurement.Finite
+// (TASK-082). StepKw is a plain []float64 (no absent-value convention for a
+// slice element — an entry that shouldn't carry an opinion is simply not in
+// the slice), so each entry is checked with finiteVal rather than finite's
+// nil-skip wrapper, same reasoning as DERScheduleMsg's slot walk above.
+func (f SolarForecastIntent) Finite() error {
+	for i, v := range f.StepKw {
+		if err := finiteVal("step_kw", v); err != nil {
+			return fmt.Errorf("step_kw[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// Finite is LoadProfileIntent's counterpart to Measurement.Finite (TASK-082),
+// following SolarForecastIntent.Finite's per-entry StepKw walk.
+func (l LoadProfileIntent) Finite() error {
+	for i, v := range l.StepKw {
+		if err := finiteVal("step_kw", v); err != nil {
+			return fmt.Errorf("step_kw[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// Finite is TariffPeriod's counterpart to Measurement.Finite (TASK-082;
+// extended PR-C for DeliveryPerKwh): ImportPerKwh is always present (checked
+// via finiteVal); ExportPerKwh/DeliveryPerKwh are optional (finite's nil-skip
+// wrapper). Factored out of TariffIntent.Finite/HubSettings.Finite (which
+// both walk a []TariffPeriod) so the two callers below share one check.
+func (p TariffPeriod) Finite() error {
+	if err := finiteVal("import_per_kwh", p.ImportPerKwh); err != nil {
+		return err
+	}
+	if err := finite("export_per_kwh", p.ExportPerKwh); err != nil {
+		return err
+	}
+	if err := finite("delivery_per_kwh", p.DeliveryPerKwh); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is TariffSpec's counterpart to Measurement.Finite (PR-C): walks
+// Periods (delegating to TariffPeriod.Finite) and checks the optional
+// FixedDailyCharge.
+func (t TariffSpec) Finite() error {
+	for i, p := range t.Periods {
+		if err := p.Finite(); err != nil {
+			return fmt.Errorf("periods[%d]: %w", i, err)
+		}
+	}
+	if err := finite("fixed_daily_charge", t.FixedDailyCharge); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is TariffIntent's counterpart to Measurement.Finite (TASK-082):
+// delegates to Tariff.Finite (TariffSpec.Finite above), which walks Periods
+// and checks FixedDailyCharge.
+func (t TariffIntent) Finite() error {
+	if err := t.Tariff.Finite(); err != nil {
+		return fmt.Errorf("tariff: %w", err)
+	}
+	return nil
+}
+
+// Finite is HubSettings' counterpart to Measurement.Finite (GAP-8): it checks
+// the reserve percents (both optional/*float64) and, when a tariff spec is
+// present, delegates to TariffSpec.Finite (the same check TariffIntent.Finite
+// uses).
+func (h HubSettings) Finite() error {
+	if err := finite("reserve.effective_pct", h.Reserve.EffectivePct); err != nil {
+		return err
+	}
+	if err := finite("reserve.floor_pct", h.Reserve.FloorPct); err != nil {
+		return err
+	}
+	if h.Tariff.Spec != nil {
+		if err := h.Tariff.Spec.Finite(); err != nil {
+			return fmt.Errorf("tariff.spec.%w", err)
+		}
+	}
+	return nil
+}
+
+// finiteSlice walks a plain []float64 series and returns the first non-finite
+// entry's error, wrapped with the series name and index — the shared helper
+// HubSchedule.Finite uses for each of its several parallel per-slot series
+// (PR-C), replacing what would otherwise be five copies of the same
+// for/finiteVal/wrap loop already visible in the SolarForecastW/
+// BatterySetpointW/EVPlanW walks below.
+func finiteSlice(name string, s []float64) error {
+	for i, v := range s {
+		if err := finiteVal(name, v); err != nil {
+			return fmt.Errorf("%s[%d]: %w", name, i, err)
+		}
+	}
+	return nil
+}
+
+// Finite is HubSchedule's counterpart to Measurement.Finite (GAP-7): it walks
+// the three per-slot series and checks every value. SolarForecastW /
+// BatterySetpointW / each EVPlanW series are plain []float64 (finiteVal per
+// entry); BatterySocPct is []*float64, so a nil (unknown-SOC) entry is skipped
+// via finite's nil wrapper. Defense in depth: the builder already guarantees
+// finite, and the bus decode layer rejects bare/quoted NaN into float64 fields.
+//
+// PR-C additive fields: ImportPriceKwh/DeliveryPriceKwh/ExportPriceKwh/GridW/
+// MarginalCost are plain []float64 series on the same grid, checked via the
+// same finiteSlice helper now used for the original series too; TotalCost/
+// FixedDailyCharge are always-present plain float64 (no absent-value
+// convention, like ComplianceAlert's fields), checked via finiteVal directly.
+func (h HubSchedule) Finite() error {
+	if err := finiteSlice("solar_forecast_w", h.SolarForecastW); err != nil {
+		return err
+	}
+	if err := finiteSlice("battery_setpoint_w", h.BatterySetpointW); err != nil {
+		return err
+	}
+	for i := range h.BatterySocPct {
+		if err := finite("battery_soc_pct", h.BatterySocPct[i]); err != nil {
+			return fmt.Errorf("battery_soc_pct[%d]: %w", i, err)
+		}
+	}
+	for station, series := range h.EVPlanW {
+		for i, v := range series {
+			if err := finiteVal("ev_plan_w", v); err != nil {
+				return fmt.Errorf("ev_plan_w[%q][%d]: %w", station, i, err)
+			}
+		}
+	}
+	if err := finiteSlice("import_price_kwh", h.ImportPriceKwh); err != nil {
+		return err
+	}
+	if err := finiteSlice("delivery_price_kwh", h.DeliveryPriceKwh); err != nil {
+		return err
+	}
+	if err := finiteSlice("export_price_kwh", h.ExportPriceKwh); err != nil {
+		return err
+	}
+	if err := finiteSlice("grid_w", h.GridW); err != nil {
+		return err
+	}
+	if err := finiteSlice("marginal_cost", h.MarginalCost); err != nil {
+		return err
+	}
+	if err := finiteVal("total_cost", h.TotalCost); err != nil {
+		return err
+	}
+	if err := finiteVal("fixed_daily_charge", h.FixedDailyCharge); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Finite is ScanResult's counterpart to Measurement.Finite (TASK-082): it
+// walks Devices and checks each hit's NameplateW.
+func (s ScanResult) Finite() error {
+	for i, d := range s.Devices {
+		if err := finite("nameplate_w", d.NameplateW); err != nil {
+			return fmt.Errorf("devices[%d]: %w", i, err)
+		}
+	}
+	return nil
+}

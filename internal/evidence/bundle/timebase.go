@@ -129,6 +129,20 @@ type Timebase struct {
 	// provenance is weaker but not inconsistent, and the report says "—" rather
 	// than inventing one.
 	Source string `json:"source,omitempty"`
+	// Saturated says a SCALED clock has stopped tracking its own multiplier.
+	//
+	// A scaled clock computes its instant as an int64 of nanoseconds, so at a
+	// large enough multiplier — or after long enough at a modest one — the
+	// product exceeds what that can hold and the clock stops advancing at the
+	// declared rate. The fixture fails FORWARD when that happens (a dead-man
+	// timer's clock may stop, but it may never run backwards), and it says so
+	// HERE, because the alternative is a bundle whose clock declaration is
+	// indistinguishable from a healthy accelerated one while every timing in it
+	// was taken from a clock that had quietly stopped.
+	//
+	// False on every healthy clock, so nothing about an ordinary declaration
+	// changes — including its rendered label.
+	Saturated bool `json:"saturated,omitempty"`
 }
 
 // Accelerated reports whether this clock was anything other than real time.
@@ -154,6 +168,11 @@ func (t Timebase) Render() string {
 	case TimebaseWall:
 		return "wall"
 	case TimebaseScaled:
+		if t.Saturated {
+			return fmt.Sprintf("scaled %.4g× — SATURATED: this clock exceeded the range its instant is "+
+				"held in and STOPPED ADVANCING at the declared rate, so every timing taken under it is "+
+				"a lower bound and nothing here is evidence about any real device's timing", t.Scale)
+		}
 		return fmt.Sprintf("scaled %.4g× (ACCELERATED TEST TIME — proves this harness's expiry semantics, "+
 			"NOT any real device's timing)", t.Scale)
 	case TimebaseManual:
@@ -175,6 +194,10 @@ func (t Timebase) Check() error {
 	}
 	switch t.Kind {
 	case TimebaseWall:
+		if t.Saturated {
+			return fmt.Errorf("declares the wall clock as saturated; only a SCALED clock can outrun the " +
+				"range its instant is held in, because only a scaled clock multiplies elapsed time")
+		}
 		if t.Scale != 1 {
 			return fmt.Errorf("declares the WALL clock at scale %v; real time is 1× by definition, and a "+
 				"scaled clock must declare kind %q", t.Scale, TimebaseScaled)
@@ -192,6 +215,10 @@ func (t Timebase) Check() error {
 				"manual clock has", t.ElapsedS)
 		}
 	case TimebaseManual:
+		if t.Saturated {
+			return fmt.Errorf("declares a manual clock as saturated; a manual clock advances only by " +
+				"explicit steps and has no multiplier to outrun")
+		}
 		if t.Scale != 0 {
 			return fmt.Errorf("declares a manual clock at scale %v; manual time advances only when a test "+
 				"advances it and has no rate, so its scale is 0", t.Scale)
@@ -225,7 +252,15 @@ func DeclareWall(component, source string) Timebase {
 // coercing it: a declaration nobody can re-derive is worse than no declaration,
 // because it looks like one.
 func DeclareScaled(component, source string, scale float64) (Timebase, error) {
-	t := Timebase{Component: component, Kind: TimebaseScaled, Scale: scale, Source: source}
+	return DeclareScaledState(component, source, scale, false)
+}
+
+// DeclareScaledState is DeclareScaled with the clock's health stated: saturated
+// says it has stopped tracking its multiplier (see Timebase.Saturated). It is a
+// separate entry point so that the ordinary call cannot silently declare a
+// broken clock healthy by omission — a caller that knows has to say.
+func DeclareScaledState(component, source string, scale float64, saturated bool) (Timebase, error) {
+	t := Timebase{Component: component, Kind: TimebaseScaled, Scale: scale, Source: source, Saturated: saturated}
 	t.Label = t.Render()
 	if err := t.Check(); err != nil {
 		return Timebase{}, fmt.Errorf("bundle: refusing a timebase declaration that %w", err)

@@ -547,7 +547,10 @@ func TestPack704ReversionSurvivesNothingAcrossAPowerCycle(t *testing.T) {
 // bank would make "paused" a way to hold a curtailment past its lease.
 func TestPack704ReversionLoopFiresOnAScaledTimebase(t *testing.T) {
 	bs := newTestPack(t, PackShapeSetpoint)
-	if err := bs.SetReversionTimebase(NewScaledTimebase(10000)); err != nil {
+	// MaxReversionScale, the fastest this clock is allowed to count (gate
+	// finding F2). A 900 s window lands in 250 ms, still two orders of
+	// magnitude inside the deadline below.
+	if err := bs.SetReversionTimebase(NewScaledTimebase(MaxReversionScale)); err != nil {
 		t.Fatalf("SetReversionTimebase: %v", err)
 	}
 	bs.Pause()
@@ -567,9 +570,9 @@ func TestPack704ReversionLoopFiresOnAScaledTimebase(t *testing.T) {
 			break // reverted to the seeded 0 W destination
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the pack's own reversion loop did not apply a %d s timer on a 10000× timebase "+
-				"within 10 real seconds (expected ≈0.1 s); commanded %.1f W, WSetRvrtRem %d s",
-				revTestTmsS, packCommandedW(bs), readRvrtU32(t, bs, "WSetRvrtRem"))
+			t.Fatalf("the pack's own reversion loop did not apply a %d s timer on a %d× timebase "+
+				"within 10 real seconds (expected ≈0.25 s); commanded %.1f W, WSetRvrtRem %d s",
+				revTestTmsS, MaxReversionScale, packCommandedW(bs), readRvrtU32(t, bs, "WSetRvrtRem"))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -691,5 +694,143 @@ func TestReversionArmingIgnoresWritesOutsideTheTimer(t *testing.T) {
 	if got := readRvrtU32(t, bs, "WSetRvrtRem"); got != half {
 		t.Errorf("writing AntiIslEna moved WSetRvrtRem from %d s to %d s — an unrelated 704 write restarted "+
 			"the WSet dead-man timer", half, got)
+	}
+}
+
+// ── The accelerated clock's own failure mode (gate finding F2) ───────────────
+
+// TestScaledTimebaseSaturatesFORWARDAndSaysSo is the row for the defect the
+// lever built to fix RC0 row 10 could itself reproduce.
+//
+// ScaledTimebase.Now() multiplies the elapsed wall duration by the scale and
+// converts to a time.Duration, which is an int64 of nanoseconds. Past MaxInt64
+// that conversion is not defined to saturate — on amd64 it pins to INT64_MIN —
+// so a large enough multiplier made Now() jump BACKWARDS and stay there. The
+// measured consequence: at 1e9× the clock froze after 9.2 s of real time, at
+// 86400× after 29.7 h, and at 1e18× it never moved at all — RvrtRem reading its
+// armed value for ever while /state went on declaring the scale and never said
+// the clock had stopped. That is verbatim the observation row 10 was blocked by,
+// reachable through the lever built to unblock it.
+//
+// Two properties are asserted, and the first is the one that matters: a
+// dead-man timer's clock may stop, but it may NEVER run backwards. Saturating
+// FORWARD makes every armed timer fire; pinning backwards makes none of them
+// ever fire, and only one of those two is the safe direction to fail in.
+func TestScaledTimebaseSaturatesFORWARDAndSaysSo(t *testing.T) {
+	// Built field-wise on purpose: NewScaledTimebase now refuses a multiplier
+	// this large, and this row is about what happens if saturation is reached
+	// anyway — which the accepted maximum still permits after ~29.6 days.
+	now := time.Now()
+	tb := &ScaledTimebase{scale: 1e18, real0: now, sim0: now}
+
+	got := tb.Now()
+	if got.Before(tb.sim0) {
+		t.Fatalf("an overflowing scaled clock reports %v, which is BEFORE its own epoch %v — the "+
+			"int64 nanosecond conversion pinned to INT64_MIN and the clock now runs backwards",
+			got, tb.sim0)
+	}
+	// Monotone across calls, too: a clock that saturates must stay saturated.
+	if second := tb.Now(); second.Before(got) {
+		t.Errorf("a saturated clock went backwards between two reads: %v then %v", got, second)
+	}
+
+	// And it must SAY so, in the declaration a bundle carries — otherwise an
+	// accelerated bundle and a frozen one are the same document on their face,
+	// which is the exact failure the declaration channel exists to prevent.
+	d := tb.Declare()
+	if err := d.Check(); err != nil {
+		t.Fatalf("the saturated clock's declaration is not self-consistent: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(d.Label), "saturat") {
+		t.Errorf("the saturated clock labels itself %q, which does not say the clock stopped tracking "+
+			"its multiplier", d.Label)
+	}
+}
+
+// TestSaturatedClockStillExpiresItsTimers is the consequence of failing forward
+// rather than backwards, measured through the registers.
+func TestSaturatedClockStillExpiresItsTimers(t *testing.T) {
+	bs := newTestPack(t, PackShapeSetpoint)
+	now := time.Now()
+	if err := bs.SetReversionTimebase(&ScaledTimebase{scale: 1e18, real0: now, sim0: now}); err != nil {
+		t.Fatalf("SetReversionTimebase: %v", err)
+	}
+	armWSetWithReversion(t, bs, revTestHeldW, 300)
+	if fired := bs.packReversionStep(); len(fired) != 1 || fired[0] != "704.WSet" {
+		t.Fatalf("a timer on a saturated clock fired %v, want [704.WSet]. A clock pinned to INT64_MIN "+
+			"never reaches any deadline, so RvrtRem reads its armed value for ever — which is exactly "+
+			"the inert register RC0 row 10 was blocked by", fired)
+	}
+	if got := readRvrtU32(t, bs, "WSetRvrtRem"); got != 0 {
+		t.Errorf("WSetRvrtRem = %d after the timer fired on a saturated clock, want 0", got)
+	}
+}
+
+// TestReversionScaleRefusesAMultiplierThatCannotBeCountedOn bounds the operator
+// lever, which is the other half of the fix: saturation is unreachable in any
+// plausible bench session at an accepted multiplier, so the loudness above is a
+// backstop rather than the defence.
+func TestReversionScaleRefusesAMultiplierThatCannotBeCountedOn(t *testing.T) {
+	ss, _ := newRevSolarAdvanced(t, 8000)
+	for _, scale := range []float64{3601, 86400, 1e9, 1e18, math.Inf(1), math.NaN()} {
+		if err := ss.SetReversionScale(scale); err == nil {
+			t.Errorf("reversion_scale %v was accepted; past the bound the device clock stops tracking "+
+				"and a bench sits watching a countdown that has quietly stopped", scale)
+		}
+	}
+	// The bound itself is usable, or the refusal is worse than the gap.
+	if err := ss.SetReversionScale(3600); err != nil {
+		t.Errorf("reversion_scale 3600 was refused: %v", err)
+	}
+	// NewScaledTimebase refuses it too, so no Go-source path can install one
+	// either — the lever is not the only door.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("NewScaledTimebase accepted a multiplier past the bound")
+			}
+		}()
+		NewScaledTimebase(1e9)
+	}()
+}
+
+// TestRemainingTimeIsCEILEDNotTruncated pins the rounding of the remaining-time
+// readback, on a FRACTIONAL remainder.
+//
+// GATE FINDING F5: every other hermetic row advances the manual clock by whole
+// seconds, so the remainder is always integral and Ceil, Floor and Round are
+// indistinguishable — changing publish's math.Ceil to math.Floor left the suite
+// green. The choice is not cosmetic. RvrtRem is what a client polls to decide
+// whether its control has reverted, so truncation reports 0 for the whole last
+// second of a LIVE timer: a conforming controller would be told its control had
+// already reverted while the device was still holding it, which is the one
+// direction of rounding error that produces a wrong action rather than a late
+// one.
+func TestRemainingTimeIsCEILEDNotTruncated(t *testing.T) {
+	bs, tb := newRevTestPack(t)
+	armWSetWithReversion(t, bs, revTestHeldW, 10)
+
+	// 5.5 s left: Ceil says 6, Floor says 5, Round says 6 — so the assertion
+	// separates Floor from the other two, which is the mutation that matters.
+	tb.Advance(4500 * time.Millisecond)
+	bs.packReversionStep()
+	if got := readRvrtU32(t, bs, "WSetRvrtRem"); got != 6 {
+		t.Errorf("WSetRvrtRem = %d with 5.5 s left, want 6 (ceiling). Truncation would publish 5 and, in "+
+			"the last second, 0 — telling a controller its control had reverted while the device still "+
+			"held it", got)
+	}
+
+	// One nanosecond left is still a LIVE timer, and this is where truncation
+	// does its damage: it would publish 0 here, which is the value that means
+	// "expired".
+	tb.Advance(5500*time.Millisecond - 1)
+	bs.packReversionStep()
+	if got := readRvrtU32(t, bs, "WSetRvrtRem"); got != 1 {
+		t.Errorf("WSetRvrtRem = %d with 1 ns left, want 1: a timer that has not fired must never publish "+
+			"the value that means it has", got)
+	}
+	if got := packCommandedW(bs); math.Abs(got-revTestHeldW) > packWTol {
+		t.Errorf("commanded %.1f W with 1 ns left, want the still-held %.1f — the row must be asserting "+
+			"the readback of a LIVE timer", got, revTestHeldW)
 	}
 }

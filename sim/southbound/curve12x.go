@@ -1014,6 +1014,15 @@ func (ss *SolarServer) SetLegacyShortBlock(model uint16) error {
 	//
 	// A lost write during a deliberate geometry change is honest; a write that
 	// lands in the wrong model is not.
+	//
+	// THIS NARROWS THE WINDOW, IT DOES NOT CLOSE IT. A write that resolved its
+	// address under the OLD geometry and lands after the splice — one already
+	// past the map lock and descheduled across both operations — still writes
+	// to an address the new image gives to another model, and nothing here can
+	// prevent that without a lock the interceptor is deliberately not holding.
+	// The re-lay is an operator action on a bench, not a concurrent-traffic
+	// path, so the exposure is a write in flight at the instant the lever is
+	// pulled; a row that cares should quiesce the gateway first.
 	l.geom.Store(geom)
 	ss.Regs.spliceRegion(l.start, clearTo, scratch)
 	ss.rebuildSolarReversionTimers(ss.Regs)
