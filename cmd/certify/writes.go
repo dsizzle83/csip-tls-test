@@ -25,6 +25,7 @@ func (c *cli) runWrites(stdout, stderr io.Writer) int {
 		Path:       c.writes,
 		KeyLogPath: c.opts.KeyLogPath,
 		MRID:       c.writesMRID,
+		UntilMRID:  c.writesUntil,
 		Settle:     c.writesSettle,
 	})
 	if err != nil {
@@ -38,8 +39,12 @@ func (c *cli) runWrites(stdout, stderr io.Writer) int {
 	// evidence, not a summary line that happens to be adjacent to them.
 	n := len(res.Attributed())
 	if res.Window != nil {
-		fmt.Fprintf(stderr, "%d write(s) attributed to %s; %d excluded as outside the window\n",
-			n, res.MRID, res.Excluded)
+		note := ""
+		if res.Confounded() {
+			note = " — ATTRIBUTION CONFOUNDED, see the report banner"
+		}
+		fmt.Fprintf(stderr, "%d write(s) attributed to %s; %d excluded as outside the window%s\n",
+			n, res.MRID, res.Excluded, note)
 	} else {
 		fmt.Fprintf(stderr, "%d write(s) in %s\n", n, res.Capture)
 	}

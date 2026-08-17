@@ -257,16 +257,50 @@ Two things are **derived from the capture**, not configured, because a tool that
 had to be told them could be told them wrongly:
 
 - **the model chain** — the gateway's own two-register header reads are in the
-  capture, and the sequence of them *is* the device's chain. A write outside
-  every discovered block reports `model=unknown` and its address stands alone,
-  which is still a checkable claim.
-- **the mRID's window** — `[first frame mentioning the mRID .. last such frame +
-  settle]`. The rule is printed with every report, because "attributed" is a
-  claim about a rule and a reader must be able to disagree with it.
+  capture, and the sequence of them *is* the device's chain. Candidate headers
+  are rejected unless the id and length are plausible (id 0 is the high word of
+  any `uint32` under 65536 — the shape of every reversion-timer poll), and any
+  two blocks that **overlap** are *both* dropped, because an overlap proves one
+  is a phantom and there is no honest way to choose. A write outside every
+  surviving block reports `model=unknown` and its address stands alone, which is
+  still a checkable claim — a confidently wrong axis is not.
+- **the mRID's window** — the **union of per-mention intervals**: a write is
+  attributed when it falls within the settle margin of *some* mention. Not
+  "first to last": on a polled protocol a control is re-served every poll cycle
+  until it expires, so first-to-last is how long it was **offered**, not how
+  long it was acting. Every mention is printed with its own covering interval,
+  and any inter-mention **gap** longer than the settle margin is flagged.
 
 `-writes-settle` (default 10 s) exists because registers are written *after* the
-control is fetched: a window ending at the mRID's last mention would exclude the
-very writes the claim is about.
+control is fetched: a window ending at a mention would exclude the very writes
+the claim is about.
+
+#### When the tool cannot tell two controls apart — and says so
+
+A supersession pair is normally served in **one `DERControlList` document**, so
+both mRIDs appear in the same frame, get identical mention sets, and each is
+credited with the other's writes. No time rule can decompose that, so the report
+**incriminates itself**:
+
+```
+# confounded=YES
+#
+# !! CONFOUNDED ATTRIBUTION — THE WRITES BELOW MAY NOT ALL BE THIS CONTROL'S.
+# !!   DERC-…-999 is in the SAME FRAME(S) as this control: [5]. One document, two controls:
+# !!   they have identical mention sets, so NO time rule can tell their writes apart.
+# !!   Re-run with -writes-until naming the superseding mRID to cut at the supersession boundary.
+```
+
+A clean extraction prints `# confounded=no` and carries no `!!` lines, so the
+two are distinguishable at a glance rather than by comparing mention lists.
+
+`-writes-until <mRID>` is the cut that **can** separate them: the window ends at
+the first mention of the superseding control. The capture cannot know which
+control supersedes which; the caller making the claim does.
+
+```sh
+bin/certify -writes runs/<dir>/ -writes-mrid <superseded> -writes-until <supersessor>
+```
 
 Every line carries **timestamp, frame number and register address** — a claim
 without addresses is not a claim in this campaign — and the format is stable
@@ -278,8 +312,12 @@ An mRID that does not appear in the capture is an **error**, not an empty
 report: "this control wrote nothing" is the strongest claim available and must
 never be made on the strength of having looked in the wrong file.
 
-TLS legs (`:802`, `:8021`) are decrypted with the bundle's own key log. Without
-one, the report says so per stream rather than reporting an empty write set.
+**TLS.** Southbound legs (`:802`, `:8021`) are decrypted with the bundle's own
+key log and decoded as Modbus. Northbound legs (`:443`, `:8443`, `:11113`) are
+decrypted too — **the mRID lives there**, so attribution depends on it — but are
+never decoded as Modbus. A northbound port that turns out to carry plaintext is
+still searched; a southbound leg that cannot be decrypted has its writes
+excluded and says so per stream, rather than reporting an empty write set.
 
 ### Local extensions — coverage without a conformance claim
 

@@ -414,6 +414,19 @@ must span the supersession window, and the leg's key log must be the shared one
 labels come from the gateway's own discovery reads, so the capture should
 include a discovery walk — on a leg captured from bring-up it will.
 
+**For a supersession pair, pass both mRIDs.** The pair is normally served in one
+`DERControlList`, so both appear in the same frame and no time rule can tell
+their writes apart. The report says so loudly (`# confounded=YES` and `!!`
+lines); `-writes-until` naming the *superseding* mRID cuts at the supersession
+boundary and separates them:
+
+```sh
+bin/certify -writes runs/<dir>/ -writes-mrid <superseded> -writes-until <supersessor>
+```
+
+A report with `# confounded=no` and no `!!` lines is safe to cite as it stands.
+One with `!!` lines is not — read the banner before quoting any line from it.
+
 Full output format and the attribution rule: `docs/CONFORMANCE_TOOL.md`.
 
 ### How long the CSIP leg now takes — read this before the night

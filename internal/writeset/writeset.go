@@ -51,6 +51,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -68,9 +69,25 @@ import (
 // stated rather than invented.
 var DefaultPlainPorts = mbapref.DefaultModbusPorts
 
-// DefaultTLSPorts are the ports whose Modbus rides inside TLS. 802 is Secure
-// SunSpec Modbus; 8021 is where the unprivileged mbapsdev binds.
+// DefaultTLSPorts are the SOUTHBOUND ports whose Modbus rides inside TLS. 802 is
+// Secure SunSpec Modbus; 8021 is where the unprivileged mbapsdev binds. Streams
+// on these are decrypted AND decoded as Modbus.
 var DefaultTLSPorts = []uint16{802, 8021}
+
+// DefaultNorthboundTLSPorts are the ports the CSIP traffic rides on. They are
+// decrypted but NOT decoded as Modbus: nothing writes registers over them, and
+// the reason to decrypt them is that THE mRID LIVES THERE.
+//
+// GATE FINDING D4. Only the southbound ports were decrypted, so a northbound
+// leg on 443 was searched as CIPHERTEXT — the mRID was never going to be found
+// — and the "no usable key log" error implied a key log would fix it. It would
+// not have: 443 was in neither list, so no key log could have been applied to
+// it. The mRID search is the whole basis of attribution, so the port it lives
+// on has to be decrypted.
+//
+// 11113 is where this bench's gridsim listens (docs/BENCH.md §b); 443 and 8443
+// are the ordinary HTTPS pair a different deployment would use.
+var DefaultNorthboundTLSPorts = []uint16{443, 8443, 11113}
 
 // DefaultSettle is how far past the last mention of an mRID a write is still
 // attributed to it.
@@ -90,13 +107,20 @@ type Options struct {
 	Path string
 	// KeyLogPath overrides the key log discovered beside the capture.
 	KeyLogPath string
-	// PlainPorts / TLSPorts override the port sets.
-	PlainPorts, TLSPorts []uint16
+	// PlainPorts / TLSPorts override the southbound port sets; NorthboundTLSPorts
+	// overrides the ports decrypted for the mRID search only.
+	PlainPorts, TLSPorts, NorthboundTLSPorts []uint16
 	// MRID, when set, restricts the report to writes attributed to that control.
 	MRID string
-	// Settle extends the mRID window past its last mention. Zero uses
-	// DefaultSettle.
+	// Settle extends the mRID window past EACH mention. Zero uses DefaultSettle.
 	Settle time.Duration
+	// UntilMRID cuts the window at the first mention of a superseding control.
+	//
+	// It is the honest cut for a supersession pair, and the caller knows the
+	// pair: two controls delivered in one list document cannot be told apart by
+	// time (see coResident), so the boundary has to come from the claim being
+	// made rather than from the capture.
+	UntilMRID string
 }
 
 // Write is one register-writing Modbus request, as it appeared on the wire.
@@ -148,14 +172,85 @@ func (b Block) Contains(addr uint16) bool {
 	return addr >= b.Base && int(addr) < int(b.Base)+int(b.Length)
 }
 
-// Window is the interval an mRID's writes were attributed over.
+// end is the first register past this block.
+func (b Block) end() int { return int(b.Base) + int(b.Length) }
+
+// overlaps reports whether two blocks claim any register in common.
+func (b Block) overlaps(o Block) bool {
+	return int(b.Base) < o.end() && int(o.Base) < b.end()
+}
+
+// Mention is one appearance of an mRID in the capture.
+type Mention struct {
+	Frame int
+	Time  time.Time
+}
+
+// Window is what an mRID's writes were attributed over.
+//
+// GATE FINDING D2. This used to be ONE interval, [first mention .. last mention
+// + settle], and on a polled protocol that is the wrong shape entirely: a
+// DERControl stays in /derp/0/derc until it expires or is superseded, and the
+// DUT re-fetches the list every pollRate — so "first to last mention" is THE
+// WHOLE TIME THE CONTROL WAS SERVED, not the time it acted. A retained
+// re-delivery ten minutes on pulled an unrelated write in with excluded=0: the
+// same wrong answer the fixture's ninth frame exists to prevent, reached by
+// another route.
+//
+// The window is now the UNION OF PER-MENTION INTERVALS: a write is attributed
+// when it falls within settle of SOME mention, not merely between the first and
+// the last. A ten-minute gap between two mentions no longer swallows the ten
+// minutes.
 type Window struct {
-	First, Last time.Time // first and last frame mentioning the mRID
-	Until       time.Time // Last + settle: the attribution bound
-	Settle      time.Duration
-	FirstFrame  int
-	LastFrame   int
-	Mentions    int
+	Mentions []Mention
+	Settle   time.Duration
+
+	// Gaps are the inter-mention intervals longer than Settle — the places
+	// where the old span-shaped rule would have attributed writes that this one
+	// excludes. Printed, because a reader deciding whether to trust an
+	// extraction needs to see that the control's mentions were DISCONTINUOUS.
+	Gaps []Gap
+
+	// Bound, when set, truncates the window: no write at or after it is
+	// attributed. It is the supersession cut — see Options.UntilMRID.
+	Bound     *time.Time
+	BoundMRID string
+}
+
+// Gap is a discontinuity between consecutive mentions.
+type Gap struct {
+	AfterFrame, BeforeFrame int
+	Duration                time.Duration
+}
+
+// First returns the earliest mention time.
+func (w *Window) First() time.Time {
+	if len(w.Mentions) == 0 {
+		return time.Time{}
+	}
+	return w.Mentions[0].Time
+}
+
+// Last returns the latest mention time.
+func (w *Window) Last() time.Time {
+	if len(w.Mentions) == 0 {
+		return time.Time{}
+	}
+	return w.Mentions[len(w.Mentions)-1].Time
+}
+
+// covers reports whether t falls within settle of some mention, and before any
+// supersession bound.
+func (w *Window) covers(t time.Time) bool {
+	if w.Bound != nil && !t.Before(*w.Bound) {
+		return false
+	}
+	for _, m := range w.Mentions {
+		if !t.Before(m.Time) && !t.After(m.Time.Add(w.Settle)) {
+			return true
+		}
+	}
+	return false
 }
 
 // Result is one extraction.
@@ -167,7 +262,24 @@ type Result struct {
 	MRID     string
 	Window   *Window // nil when no mRID was given
 	Excluded int     // writes outside the window, when an mRID was given
-	Notes    []string
+	CoResidents []CoResident
+	Notes       []string
+}
+
+// Confounded reports whether anything in this extraction makes its attribution
+// unsafe to cite without qualification: another control in the same document,
+// or another control's mentions inside this one's window.
+//
+// It is the field the report's banner is driven from, so a clean extraction and
+// a confounded one are visually distinct at a glance rather than only to a
+// reader who compares mention lists.
+func (r *Result) Confounded() bool {
+	for _, c := range r.CoResidents {
+		if len(c.SharedFrames) > 0 || c.MentionsInWindow > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Attributed returns the writes inside the mRID window, or all writes when no
@@ -178,7 +290,7 @@ func (r *Result) Attributed() []Write {
 	}
 	var out []Write
 	for _, w := range r.Writes {
-		if !w.Time.Before(r.Window.First) && !w.Time.After(r.Window.Until) {
+		if r.Window.covers(w.Time) {
 			out = append(out, w)
 		}
 	}
@@ -227,16 +339,28 @@ func Extract(opts Options) (*Result, error) {
 	if tlsPorts == nil {
 		tlsPorts = DefaultTLSPorts
 	}
+	northPorts := opts.NorthboundTLSPorts
+	if northPorts == nil {
+		northPorts = DefaultNorthboundTLSPorts
+	}
 
 	// Every application-layer byte stream in the capture, paired into Modbus
 	// conversations (which the chain derivation needs, since the request
 	// carries the address and the response carries what is at it).
-	convs, streams := collectStreams(asm, plain, tlsPorts, kl, res)
+	convs, streams := collectStreams(asm, plain, tlsPorts, northPorts, kl, res)
 
 	for _, c := range convs {
 		res.Chain = append(res.Chain, discoverBlocks(c, frameTime)...)
 	}
 	res.Chain = dedupeBlocks(res.Chain)
+	var droppedOverlaps int
+	res.Chain, droppedOverlaps = rejectOverlaps(res.Chain)
+	if droppedOverlaps > 0 {
+		res.Notes = append(res.Notes, fmt.Sprintf(
+			"%d discovered block(s) overlapped another and were ALL dropped — an overlap proves at least "+
+				"one is a phantom and there is no honest way to choose, so the writes they would have "+
+				"labelled report model=unknown with their address instead", droppedOverlaps))
+	}
 
 	for _, c := range convs {
 		if c.toDevice == nil {
@@ -256,13 +380,17 @@ func Extract(opts Options) (*Result, error) {
 		if settle == 0 {
 			settle = DefaultSettle
 		}
-		w := findWindow(streams, frameTime, opts.MRID, settle)
+		w, err := findWindow(streams, frameTime, opts.MRID, opts.UntilMRID, settle)
+		if err != nil {
+			return nil, err
+		}
 		if w == nil {
 			return nil, fmt.Errorf("writeset: the mRID %q does not appear anywhere in %s — "+
-				"either the control was not carried on this leg's capture, or the northbound traffic "+
+				"either the control was not carried on this leg's capture, or the traffic carrying it "+
 				"is TLS and no usable key log was supplied", opts.MRID, capPath)
 		}
 		res.Window = w
+		res.CoResidents = coResident(streams, frameTime, opts.MRID, w)
 		res.Excluded = len(res.Writes) - len(res.Attributed())
 	}
 	return res, nil
@@ -341,12 +469,16 @@ func (a *appStream) frameAt(off int) int {
 
 // collectStreams gathers the Modbus conversations and, separately, every
 // readable application stream (which the mRID search scans).
-func collectStreams(asm *netdis.Assembler, plain, tlsPorts []uint16, kl *keylog.Log, res *Result) ([]*conv, []*appStream) {
+func collectStreams(asm *netdis.Assembler, plain, tlsPorts, northPorts []uint16, kl *keylog.Log, res *Result) ([]*conv, []*appStream) {
 	var convs []*conv
 	var out []*appStream
 	seen := map[string]bool{}
 
-	add := func(port uint16, isTLS bool) {
+	// modbus says whether this port's plaintext is decoded as Modbus. A
+	// northbound port is decrypted for the mRID search and never decoded: a
+	// DERControlList is not an MBAP stream, and running the ADU walker over one
+	// would resynchronise its way into inventing frames.
+	add := func(port uint16, isTLS, modbus bool) {
 		for _, s := range asm.FindPort(port) {
 			c := &conv{}
 			for _, d := range s.Dirs {
@@ -361,19 +493,41 @@ func collectStreams(asm *netdis.Assembler, plain, tlsPorts []uint16, kl *keylog.
 				toDevice := d.Flow.Dst.Port == port
 				as := &appStream{
 					flow: d.Flow.String(), sb: d.Bytes, tls: isTLS,
-					modbus: true, toDevice: toDevice,
+					modbus: modbus, toDevice: toDevice,
 				}
-				if !isTLS {
+				switch {
+				case !isTLS:
 					as.bytes = d.Bytes.Bytes()
-				} else if kl == nil {
+				case kl == nil, decryptInto(as, s, d, kl) != nil:
+					// A NORTHBOUND port is only a GUESS about where TLS is: the
+					// list names the ports CSIP usually rides, and a bench that
+					// serves it in the clear (or a capture whose handshake is
+					// not in the window) must still be searchable for the mRID.
+					// So the plaintext is kept and the search runs over it —
+					// which finds nothing if the bytes really are ciphertext,
+					// and that is the honest outcome rather than a dropped
+					// stream nobody is told about.
+					//
+					// A SOUTHBOUND port is different: undecryptable there means
+					// its writes are genuinely unreadable, and pretending the
+					// ciphertext is an MBAP stream would have the ADU walker
+					// resynchronising its way into inventing frames.
+					if modbus {
+						res.Notes = append(res.Notes, fmt.Sprintf(
+							"%s is TLS and could not be decrypted (no usable key log) — its writes are "+
+								"NOT in this report", as.flow))
+						continue
+					}
+					as.tls = false
+					as.bytes = d.Bytes.Bytes()
 					res.Notes = append(res.Notes, fmt.Sprintf(
-						"%s is TLS and no key log was available — its writes are not in this report", as.flow))
-					continue
-				} else if err := decryptInto(as, s, d, kl); err != nil {
-					res.Notes = append(res.Notes, fmt.Sprintf("%s: %v", as.flow, err))
-					continue
+						"%s was not decrypted; it is searched for the mRID as raw bytes, which finds "+
+							"nothing if it is genuinely ciphertext", as.flow))
 				}
 				out = append(out, as)
+				if !modbus {
+					continue
+				}
 				if toDevice {
 					c.toDevice = as
 				} else {
@@ -386,10 +540,13 @@ func collectStreams(asm *netdis.Assembler, plain, tlsPorts []uint16, kl *keylog.
 		}
 	}
 	for _, p := range plain {
-		add(p, false)
+		add(p, false, true)
 	}
 	for _, p := range tlsPorts {
-		add(p, true)
+		add(p, true, true)
+	}
+	for _, p := range northPorts {
+		add(p, true, false)
 	}
 
 	// Every OTHER stream, plaintext only, so an mRID carried on a northbound
@@ -588,8 +745,7 @@ func discoverBlocks(c *conv, frameTime map[int]time.Time) []Block {
 			continue
 		}
 		id, length := pdu.Values[0], pdu.Values[1]
-		// 0xFFFF is the SunSpec end marker and length 0 is not a block.
-		if id == 0xFFFF || length == 0 {
+		if !plausibleHeader(id, length) {
 			continue
 		}
 		out = append(out, Block{
@@ -605,6 +761,78 @@ func discoverBlocks(c *conv, frameTime map[int]time.Time) []Block {
 type conv struct {
 	toDevice   *appStream
 	fromDevice *appStream
+}
+
+// maxModelLen is the largest declared model length this tool will believe.
+//
+// It is a SANITY BOUND, not a claim about the standard: SunSpec sets no such
+// limit, and the point is only that a two-register read whose second word is
+// enormous is far more likely to be the low half of a uint32 than a model
+// length. The largest model this bench serves is 701 at 153 registers, and the
+// trip models at ~380; 1024 leaves room and still rejects the register values
+// that produce phantoms. A genuine model longer than this is DROPPED and
+// counted, never silently mislabelled — its writes then read model=unknown with
+// their address, which is honest.
+const maxModelLen = 1024
+
+// plausibleHeader reports whether a two-register read result can be a SunSpec
+// model header at all.
+//
+// GATE FINDING D1. This used to reject only id==0xFFFF and length==0, which
+// left id==0 UNGUARDED — and id==0 is exactly what the high word of a uint32
+// below 65536 looks like. The reversion work made polling RvrtTms/RvrtRem
+// ROUTINE, so a poll of WSetRvrtTms=300 read back as the header "model 0,
+// length 300" and manufactured a block at the polled address. Not a corner
+// case: a phantom with a lower base SHADOWED a real block, because the chain is
+// sorted by base and the matcher takes the first containing block — so a write
+// got the wrong axis AND the wrong offset, printed as discovered structure.
+//
+//	id 0        the high word of any uint32 under 65536 — the shape of every
+//	            reversion-timer poll on this bench
+//	id 0xFFFF   the SunSpec end marker
+//	id > 799 and below the vendor range
+//	            not a model number; standard models stop well short and vendor
+//	            blocks start at 64000
+//	length 0    not a block
+//	length > maxModelLen
+//	            see above
+func plausibleHeader(id, length uint16) bool {
+	if id == 0 || id == 0xFFFF {
+		return false
+	}
+	if id > 799 && (id < 64000 || id > 65533) {
+		return false
+	}
+	return length >= 1 && length <= maxModelLen
+}
+
+// rejectOverlaps drops every block that overlaps another, and reports how many
+// went.
+//
+// This is the rule that makes SHADOWING IMPOSSIBLE, which is why it exists
+// separately from plausibleHeader rather than being folded into it: a real
+// SunSpec chain does not overlap itself, so an overlap proves at least one of
+// the pair is a phantom — and there is no honest way to pick which. Keeping the
+// earlier-discovered one would be a guess printed as structure. Dropping both
+// costs a label and keeps the address, and an unlabelled address is still a
+// checkable claim while a confidently wrong axis is not.
+func rejectOverlaps(in []Block) (kept []Block, dropped int) {
+	bad := make([]bool, len(in))
+	for i := range in {
+		for j := i + 1; j < len(in); j++ {
+			if in[i].overlaps(in[j]) {
+				bad[i], bad[j] = true, true
+			}
+		}
+	}
+	for i, b := range in {
+		if bad[i] {
+			dropped++
+			continue
+		}
+		kept = append(kept, b)
+	}
+	return kept, dropped
 }
 
 // dedupeBlocks keeps one entry per (model, base), lowest frame first.
@@ -624,31 +852,125 @@ func dedupeBlocks(in []Block) []Block {
 	return out
 }
 
-// findWindow locates the mRID in any readable stream and returns its window.
-func findWindow(streams []*appStream, frameTime map[int]time.Time, mrid string, settle time.Duration) *Window {
-	needle := []byte(mrid)
+// mentionsOf finds every frame in which a literal appears, deduplicated and in
+// frame order.
+func mentionsOf(streams []*appStream, frameTime map[int]time.Time, lit string) []Mention {
+	needle := []byte(lit)
+	seen := map[int]bool{}
 	var frames []int
 	for _, s := range streams {
-		for off := 0; ; {
+		for off := 0; off < len(s.bytes); {
 			i := bytes.Index(s.bytes[off:], needle)
 			if i < 0 {
 				break
 			}
-			frames = append(frames, s.frameAt(off+i))
+			f := s.frameAt(off + i)
+			if !seen[f] {
+				seen[f] = true
+				frames = append(frames, f)
+			}
 			off += i + len(needle)
 		}
 	}
-	if len(frames) == 0 {
-		return nil
-	}
 	sort.Ints(frames)
-	first, last := frames[0], frames[len(frames)-1]
-	w := &Window{
-		First: frameTime[first], Last: frameTime[last],
-		Settle: settle, FirstFrame: first, LastFrame: last, Mentions: len(frames),
+	out := make([]Mention, 0, len(frames))
+	for _, f := range frames {
+		out = append(out, Mention{Frame: f, Time: frameTime[f]})
 	}
-	w.Until = w.Last.Add(settle)
-	return w
+	return out
+}
+
+// findWindow builds the mRID's window: its mentions, the discontinuities
+// between them, and any supersession bound.
+func findWindow(streams []*appStream, frameTime map[int]time.Time, mrid, until string, settle time.Duration) (*Window, error) {
+	ms := mentionsOf(streams, frameTime, mrid)
+	if len(ms) == 0 {
+		return nil, nil
+	}
+	w := &Window{Mentions: ms, Settle: settle}
+	for i := 1; i < len(ms); i++ {
+		if d := ms[i].Time.Sub(ms[i-1].Time); d > settle {
+			w.Gaps = append(w.Gaps, Gap{
+				AfterFrame: ms[i-1].Frame, BeforeFrame: ms[i].Frame, Duration: d,
+			})
+		}
+	}
+	if until != "" {
+		bs := mentionsOf(streams, frameTime, until)
+		if len(bs) == 0 {
+			return nil, fmt.Errorf("writeset: the superseding mRID %q does not appear in this capture, "+
+				"so there is no supersession boundary to cut at", until)
+		}
+		t := bs[0].Time
+		w.Bound, w.BoundMRID = &t, until
+	}
+	return w, nil
+}
+
+// mridPattern matches the <mRID> elements a control document carries. It is how
+// co-residency is detected: two mRIDs in ONE frame are two controls in one
+// served list.
+var mridPattern = regexp.MustCompile(`<mRID>([^<]{1,128})</mRID>`)
+
+// coResident finds the OTHER mRIDs the capture carries and says how each
+// relates to the target's window.
+//
+// GATE FINDING D3, and it is the headline use case. A supersession pair is
+// normally in exactly ONE DERControlList document: both mRIDs appear in the
+// same frame, so both get identical mention sets, so each is credited with the
+// other's writes — which is precisely the distinction PC-001 is about. No
+// tightening of a time rule can separate two controls delivered in one frame,
+// so the tool's obligation is to SAY SO, loudly, and to offer the cut that can
+// separate them (Options.UntilMRID).
+func coResident(streams []*appStream, frameTime map[int]time.Time, target string, w *Window) []CoResident {
+	inFrame := map[string]map[int]bool{}
+	for _, s := range streams {
+		for _, m := range mridPattern.FindAllSubmatchIndex(s.bytes, -1) {
+			id := string(s.bytes[m[2]:m[3]])
+			if id == target {
+				continue
+			}
+			f := s.frameAt(m[0])
+			if inFrame[id] == nil {
+				inFrame[id] = map[int]bool{}
+			}
+			inFrame[id][f] = true
+		}
+	}
+	targetFrames := map[int]bool{}
+	for _, m := range w.Mentions {
+		targetFrames[m.Frame] = true
+	}
+	var out []CoResident
+	for id, frames := range inFrame {
+		c := CoResident{MRID: id}
+		for f := range frames {
+			if targetFrames[f] {
+				c.SharedFrames = append(c.SharedFrames, f)
+			}
+			if t := frameTime[f]; w.covers(t) {
+				c.MentionsInWindow++
+			}
+		}
+		if len(c.SharedFrames) == 0 && c.MentionsInWindow == 0 {
+			continue
+		}
+		sort.Ints(c.SharedFrames)
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].MRID < out[j].MRID })
+	return out
+}
+
+// CoResident is another control whose delivery overlaps the target's window.
+type CoResident struct {
+	MRID string
+	// SharedFrames are frames carrying BOTH mRIDs — one document, two controls,
+	// and therefore writes this tool cannot tell apart by time at all.
+	SharedFrames []int
+	// MentionsInWindow counts this control's own mentions inside the target's
+	// attribution window.
+	MentionsInWindow int
 }
 
 // Render writes the report. The format is line-oriented and stable: one write
@@ -676,13 +998,56 @@ func (r *Result) Render(out io.Writer) {
 	writes := r.Writes
 	if r.Window != nil {
 		w := r.Window
-		fmt.Fprintf(out, "# mrid=%s mentions=%d window=[%s .. %s] settle=%s bound=%s frames=%d..%d\n",
-			r.MRID, w.Mentions, ts(w.First), ts(w.Last), w.Settle, ts(w.Until), w.FirstFrame, w.LastFrame)
-		fmt.Fprintf(out, "# attribution rule: a write is attributed to this mRID when its frame time is "+
-			"at or after the FIRST frame mentioning the mRID and at or before the LAST such frame plus "+
-			"the settle margin. Writes outside that interval are excluded and counted below.\n")
+		fmt.Fprintf(out, "# mrid=%s mentions=%d span=[%s .. %s]\n",
+			r.MRID, len(w.Mentions), ts(w.First()), ts(w.Last()))
+		fmt.Fprintf(out, "# attribution rule: a write is attributed when its frame time falls within the "+
+			"settle margin (%s) of SOME mention of this mRID — NOT merely between the first and last. "+
+			"On a polled protocol a control is re-served every poll cycle, so the span above is how long "+
+			"it was OFFERED, not how long it was acting.\n", w.Settle)
+		for _, m := range w.Mentions {
+			fmt.Fprintf(out, "#   mention frame=%d ts=%s covers=[%s .. %s]\n",
+				m.Frame, ts(m.Time), ts(m.Time), ts(m.Time.Add(w.Settle)))
+		}
+		for _, g := range w.Gaps {
+			fmt.Fprintf(out, "#   GAP %s between frame=%d and frame=%d — longer than the settle margin, "+
+				"so nothing in it is attributed; a span-shaped rule would have swallowed it\n",
+				g.Duration, g.AfterFrame, g.BeforeFrame)
+		}
+		if w.Bound != nil {
+			fmt.Fprintf(out, "# bound: cut at %s, the first mention of the superseding mRID %s — no write "+
+				"at or after that instant is attributed to %s\n", ts(*w.Bound), w.BoundMRID, r.MRID)
+		}
 		writes = r.Attributed()
 		fmt.Fprintf(out, "# excluded=%d (writes in this capture outside the window)\n", r.Excluded)
+
+		// THE BANNER. A clean extraction and a confounded one must not have to
+		// be told apart by comparing mention lists.
+		if !r.Confounded() {
+			fmt.Fprintf(out, "# confounded=no — no other control shares a frame with this one or is "+
+				"mentioned inside its window\n")
+		} else {
+			fmt.Fprintf(out, "# confounded=YES\n")
+			fmt.Fprintf(out, "#\n")
+			fmt.Fprintf(out, "# !! CONFOUNDED ATTRIBUTION — THE WRITES BELOW MAY NOT ALL BE THIS CONTROL'S.\n")
+			for _, c := range r.CoResidents {
+				if len(c.SharedFrames) > 0 {
+					cut := "Re-run with -writes-until naming the superseding mRID to cut at the " +
+						"supersession boundary."
+					if w.BoundMRID == c.MRID {
+						cut = "THE BOUND ABOVE CUTS AT THIS CONTROL, so the writes below are the ones " +
+							"before it arrived — the co-residency is disclosed because it is a fact " +
+							"about the capture, not because the cut failed to address it."
+					}
+					fmt.Fprintf(out, "# !!   %s is in the SAME FRAME(S) as this control: %v. One document, "+
+						"two controls: they have identical mention sets, so NO time rule can tell their "+
+						"writes apart. %s\n", c.MRID, c.SharedFrames, cut)
+					continue
+				}
+				fmt.Fprintf(out, "# !!   %s is mentioned %d time(s) inside this control's window; writes "+
+					"in those intervals could be either control's\n", c.MRID, c.MentionsInWindow)
+			}
+			fmt.Fprintf(out, "#\n")
+		}
 	}
 
 	byAxis := map[string][]Write{}

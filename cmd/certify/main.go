@@ -130,6 +130,7 @@ type cli struct {
 	report string
 	writes string
 	writesMRID string
+	writesUntil string
 	writesSettle time.Duration
 	// trr names the evidence bundles a Test Results Report package is built
 	// from, each optionally narrowed to some of its documents as `dir=<doc-key>`.
@@ -229,6 +230,10 @@ func (c *cli) bindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.writesMRID, "writes-mrid", "",
 		"-writes: report only the writes attributed to this control mRID. The window is [first frame "+
 			"mentioning the mRID .. last such frame + -writes-settle]; the rule is printed with the report")
+	fs.StringVar(&c.writesUntil, "writes-until", "",
+		"-writes: cut the window at the first mention of this SUPERSEDING mRID. Two controls delivered in "+
+			"one DERControlList have identical mention sets, so no time rule can separate their writes — "+
+			"this is the cut that can, and the caller is the one who knows the pair")
 	fs.DurationVar(&c.writesSettle, "writes-settle", writeset.DefaultSettle,
 		"-writes: how far past the mRID's last mention a write is still attributed to it (registers are "+
 			"written after the control is fetched, so a window ending at the last mention would exclude "+

@@ -295,9 +295,9 @@ func TestExtract_AttributesOnlyTheWritesInsideTheMRIDWindow(t *testing.T) {
 	if res.Window == nil {
 		t.Fatal("no window was derived for the mRID")
 	}
-	if res.Window.Mentions < 2 {
+	if len(res.Window.Mentions) < 2 {
 		t.Errorf("the mRID was found %d time(s), want at least 2 (the control and its Response)",
-			res.Window.Mentions)
+			len(res.Window.Mentions))
 	}
 	got := res.Attributed()
 	if len(got) != 2 {
@@ -345,7 +345,9 @@ func TestRender_IsStableAndGreppable(t *testing.T) {
 		"# writeset capture=",
 		"# chain (derived from this capture's own header reads): M705@40072+30 M712@40106+20",
 		"# mrid=" + fixtureMRID,
+		"# confounded=no",
 		"# attribution rule:",
+		"#   mention frame=5",
 		"# excluded=1",
 		"axis M705 writes=1",
 		"axis M712 writes=1",
