@@ -51,11 +51,17 @@ import (
 const XMLNamespace = "urn:ieee:std:2030.5:ns"
 
 // ───────────────────────────────────────────────────────────────────────
-// Base types — these model the XSD inheritance chain
+// Base types — these model 2030.5's inheritance chain. The vendored
+// sep-2.0.4.xsd is used below only as the machine-readable REFERENCE for
+// element STRUCTURE, which is what §1.2 of NORMATIVE_ANCHOR.md keeps it for;
+// it is never the authority for a semantic requirement.
 // ───────────────────────────────────────────────────────────────────────
 
 // Link is the base type for all link elements (EndDeviceListLink, TimeLink, etc.).
-// In the XSD every *Link type has an href attribute.
+// Every *Link type carries an href attribute — IEEE Std 2030.5-2018 p.155:
+// "Link object () — Links provide a reference, via URI, to another resource."
+// with "href attribute (anyURI) «XSDattribute»". The reference XSD agrees on
+// the structure.
 type Link struct {
 	Href string `xml:"href,attr"`
 }
@@ -72,8 +78,9 @@ type Resource struct {
 	Href string `xml:"href,attr,omitempty"`
 }
 
-// ResponseRequired is the IEEE 2030.5 Event-base `responseRequired` bitmap
-// (XSD type hexBinary8), carried as an XML attribute on Event-derived
+// ResponseRequired is the IEEE 2030.5 Event-base `responseRequired` bitmap —
+// HexBinary8, IEEE Std 2030.5-2018 p.174 ("An 8-bit field encoded as a hex
+// string (2 hex characters)") — carried as an XML attribute on Event-derived
 // resources such as DERControl. It tells the client which Response
 // acknowledgements the server wants for that event (Table 27 / §D.2.2
 // RespondableResource semantics):
@@ -168,7 +175,8 @@ func (r ResponseRequired) MarshalXMLAttr(name xml.Name) (xml.Attr, error) {
 // Uppercase matches ResponseRequired and the 2030.5 example encodings.
 //
 // THE DECODE IS STRICTLY HEX, and that is the only defensible reading: the
-// schema says hexBinary, so "20" is 32 and not 20. A lenient "try decimal too"
+// standard types these elements hexBinary (2018 p.174, quoted above), so "20"
+// is 32 and not 20. A lenient "try decimal too"
 // decode cannot help — for exactly the strings where the ambiguity exists, both
 // parses succeed — and would silently pick the wrong one for the rest. A
 // malformed or over-wide value is an ERROR rather than a zero, mirroring

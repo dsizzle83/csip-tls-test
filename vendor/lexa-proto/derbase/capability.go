@@ -360,11 +360,24 @@ func outOfDomainRating(axis, point string, v float64) error {
 // sibling and delegates to it for the rating half, so the two can never drift.
 //
 // THE SETTING WINS OVER THE RATING when both are published. That is not a
-// preference, it is what the documents say: IEEE 2030.5-2018's DERSettings
-// setMaxW/setMaxChargeRateW/setMaxDischargeRateW each "default to" their rtg*
-// counterpart (sep.xsd 2.0.4, elements 3457/3429/3439), which makes the rating
-// the FALLBACK for an absent setting rather than the reference; and
-// DERControlBase.opModMaxLimW is "a percentage of set capacity (%setMaxW)".
+// preference, it is what the standard says. IEEE Std 2030.5-2018 states the
+// whole rating/setting family as ONE normative rule in §10.10.4.4.3, printed
+// p.124: "Each rating value in a DER's DERCapability instance MAY have a
+// corresponding setting value in its DERSettings instance (which equals the
+// rating value by default). A modified rating SHALL have a corresponding
+// setting." The per-attribute sentences on p.244 say the same thing three
+// times — setMaxW "Defaults to rtgMaxW.", setMaxChargeRateW "Defaults to
+// rtgMaxChargeRateW.", setMaxDischargeRateW "Defaults to
+// rtgMaxDischargeRateW." — which makes the rating the FALLBACK for an absent
+// setting rather than the reference; and DERControlBase.opModMaxLimW is "a
+// percentage of set capacity (%setMaxW, in hundredths)" (2018 p.250).
+//
+// The cite above named sep.xsd 2.0.4 elements 3457/3429/3439 until IW15-027
+// demoted that draft. Same verdict, same watts, published anchor — and the
+// upgrade is real rather than cosmetic: the draft states the three attribute
+// defaults and nothing else, while §10.10.4.4.3 is also the normative home of
+// the setting-above-its-rating bound this function applies below ("subject to
+// the maximum limit by rtgMaxW", same page), which the draft states nowhere.
 // A control is answered by the machine AS CONFIGURED — a device an installer
 // derated to 6 kW answers "60 %" with 3.6 kW, not 6 kW. derbase already
 // reasoned exactly this way on the reactive axis (reactiveCapability,
@@ -388,12 +401,13 @@ func outOfDomainRating(axis, point string, v float64) error {
 //	                         a live configuration with a physical capability the
 //	                         machine has been told not to use. Same rule
 //	                         maxRatingBound already applies to a rated zero.
-//	setting absent/garbage   the rating, through maxRatingBound — the sep.xsd
-//	                         default. "Absent" is the not-implemented sentinel
-//	                         (NaN); "garbage" is a non-finite or negative value,
-//	                         which is IGNORED here rather than denied, because
-//	                         unlike a rating a setting has a defined fallback the
-//	                         standard itself names. defect=true reports it.
+//	setting absent/garbage   the rating, through maxRatingBound — the 2018
+//	                         §10.10.4.4.3 p.124 / p.244 default. "Absent" is
+//	                         the not-implemented sentinel (NaN); "garbage" is a
+//	                         non-finite or negative value, which is IGNORED
+//	                         here rather than denied, because unlike a rating a
+//	                         setting has a defined fallback the standard itself
+//	                         names. defect=true reports it.
 //
 // point names whichever input the bound came from, for evidence. ok=false with
 // a nil error is honest unknown (neither published) — no bound, exactly as
@@ -402,7 +416,8 @@ func settingOrRatingBound(axis, setPoint string, setting float64, rtgPoint strin
 	switch {
 	case math.IsNaN(setting):
 		// Absent / not implemented / unusable scale factor — fall through to
-		// the rating, which is what sep.xsd says an absent setting defaults to.
+		// the rating, which is what IEEE Std 2030.5-2018 says an absent setting
+		// defaults to (§10.10.4.4.3 p.124; per-attribute on p.244).
 	case math.IsInf(setting, 0) || setting < 0:
 		// An implemented setting that cannot be true. Unlike a garbage RATING
 		// (which denies — see outOfDomainRating), a garbage SETTING has a

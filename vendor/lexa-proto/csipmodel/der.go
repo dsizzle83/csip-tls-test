@@ -93,8 +93,10 @@ const (
 // derproducer, which composes a per-device mask out of the receipt screen's
 // axis names) would otherwise keep its own copy of the assignment — and a
 // second copy of a bit table is precisely how the divergence this stage
-// corrected survived unnoticed for as long as it did. One table, parsed against
-// the schema by one test.
+// corrected survived unnoticed for as long as it did. One table, checked
+// against the verbatim 2018 p.251-252 quote by one test
+// (TestModeBitsMatch2018 — which replaced a test that parsed the draft schema
+// and passed on a table matching 2018 on zero of twenty-two positions).
 //
 // Keys are the standard's own element names, verbatim, including the two bits
 // 2030.5-2018 names WITHOUT an element ("Charge mode" / "Discharge mode" →
@@ -520,8 +522,15 @@ type ReactivePower struct {
 // ─── Expanded DERControlBase ──────────────────────────────────────────────────
 //
 // The DERControlBase in resources.go holds the scalar modes. This file extends
-// it with the curve-linked and droop modes that are defined elsewhere in the
-// 2030.5 XSD.
+// it with the curve-linked and droop modes declared elsewhere in IEEE Std
+// 2030.5-2018's DERControlBase (Annex B prose, p.248-252).
+//
+// This used to read "defined elsewhere in the 2030.5 XSD", which named an
+// artifact this repository does not hold: 2030.5-2018 prints no schema in its
+// text, and the XSD it names as supplemental material (§2, "sep.xsd in the
+// supplemental material of IEEE Std 2030.5") is not the ZigBee draft vendored
+// here (NORMATIVE_ANCHOR §1.4) — so the phrase could only have resolved to
+// the one document that is not the anchor. ANNULLED and re-anchored (IW15-027).
 //
 // We cannot embed two structs with overlapping XML element names in Go's
 // encoding/xml, so we extend DERControlBase directly with additional fields.

@@ -333,8 +333,20 @@ func Init(r *sunspec.Reader, tag string) (Base, error) {
 // IW15-002: SETTINGS-FIRST. b.Wmax is the quantity every percent-of-capacity
 // control on this device converts against, so it must be the one the STANDARD
 // names — 2030.5's setMaxW, i.e. 702's mutable WMax setting, with WMaxRtg as
-// the fallback sep.xsd itself defines for an absent setting ("Defaults to
-// rtgW"). Before this, the 7xx path read WMaxRtg unconditionally while the
+// the fallback IEEE Std 2030.5-2018 itself defines for an absent setting:
+// "Set limit for maximum active power capability of the DER (in watts).
+// Defaults to rtgMaxW." (printed p.244), stated generally at §10.10.4.4.3
+// p.124 — "which equals the rating value by default".
+//
+// THAT QUOTE USED TO READ "Defaults to rtgW", AND 2018 NEVER WROTE THAT
+// SENTENCE. It is sep.xsd 2.0.4:3459's wording, and rtgW is a DRAFT-ONLY
+// element name — it occurs ZERO times in the published standard, which names
+// the active-power rating rtgMaxW (2018 p.247, "rtgMaxW attribute
+// (ActivePower)"). Re-quoted from 2018 rather than re-attributed to it
+// (IW15-027). No behaviour follows from the name: this resolver keys on
+// SunSpec 702 points, never on 2030.5 element names.
+//
+// Before this, the 7xx path read WMaxRtg unconditionally while the
 // legacy path read M121's WMax — the mutable SETTING — so the two device
 // families disagreed about what a percent meant, and the 7xx one disagreed
 // with what the gateway advertises northbound as setMaxW.
@@ -634,9 +646,10 @@ func wattsChecked(ap *model.ActivePower, axis string) (float64, error) {
 // pctChecked converts a CSIP SignedPerCent/PerCent hundredths value to a
 // percent float, range-checked against the product's ≤100.00% rule
 // (docs/design/IW13_ACTIVE_POWER_UNITS_2026-08-12.md §2.4): signed axes
-// (opModFixedW, XSD Int16) to [-10000,10000] hundredths, unsigned axes
-// (opModMaxLimW, XSD UInt16) to [0,10000]. The parameter is int32 so BOTH
-// wire domains widen into it losslessly — narrowing a uint16 to int16 here
+// (opModFixedW, SignedPerCent = Int16, IEEE Std 2030.5-2018 p.170) to
+// [-10000,10000] hundredths, unsigned axes (opModMaxLimW, PerCent = UInt16,
+// 2018 p.167) to [0,10000]. The parameter is int32 so BOTH wire domains widen
+// into it losslessly — narrowing a uint16 to int16 here
 // would silently wrap 32768..65535 into negatives and turn an out-of-range
 // value into an in-range one. IW13-001 — opModFixedW/opModMaxLimW are
 // percent, not watts.
@@ -1764,8 +1777,9 @@ func (b *Base) validateSetpointW(w float64, axis string) error {
 	}
 	// IW15-002: bound against the SAME quantity fixedWReference resolves the
 	// percent against (settingOrRatingBound — setting first, rating as the
-	// sep.xsd default), naming whichever point bound it. The two must move
-	// together: a percent resolved against the setting and then validated
+	// IEEE Std 2030.5-2018 §10.10.4.4.3 p.124 default), naming whichever point
+	// bound it. The two must move together: a percent resolved against the
+	// setting and then validated
 	// against the rating would refuse nothing it should, but the reverse —
 	// which is what this file did before IW15-002 — refuses a command the
 	// device could execute, and kills the whole document with it.

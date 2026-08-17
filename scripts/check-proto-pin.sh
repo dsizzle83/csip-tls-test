@@ -347,6 +347,19 @@ EOF
       sed -i.bak "s#^replace lexa-proto => .*#replace lexa-proto => $TMP_PROTO#" "$TMP_CONSUMER/go.mod"
       rm -f "$TMP_CONSUMER/go.mod.bak"
 
+      # Since the D4 mirror wave this module also replaces lexa-platform =>
+      # ../lexa-platform, which resolves to nothing under $TMP_ROOT and fails
+      # `go mod vendor` before it can trace the proto graph. Point it at the
+      # REAL checkout by absolute path: this gate verifies vendor/lexa-proto
+      # only — the platform tree just has to resolve so the import graph can
+      # be walked (vendor/lexa-platform is regenerated in the scratch but
+      # never diffed here; platform coherence is the differential test's and
+      # platform.pin's job, not this script's).
+      if grep -q '^replace lexa-platform => ' "$TMP_CONSUMER/go.mod"; then
+        sed -i.bak "s#^replace lexa-platform => .*#replace lexa-platform => $SELF/../lexa-platform#" "$TMP_CONSUMER/go.mod"
+        rm -f "$TMP_CONSUMER/go.mod.bak"
+      fi
+
       if ! ( cd "$TMP_CONSUMER" && GOWORK=off GOFLAGS=-mod=mod go mod vendor ) >"$TMP_ROOT/vendor.log" 2>&1; then
         echo "check-proto-pin: 'go mod vendor' failed while regenerating from the pinned SHA:" >&2
         cat "$TMP_ROOT/vendor.log" >&2
