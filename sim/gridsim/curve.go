@@ -866,6 +866,12 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 		s.putExtendedControl(actPath, ctrl, false)
 	}
 
+	// This endpoint mints its own mRIDs and can REPLACE the whole list
+	// (activate), so it can retire a control an operator had armed an
+	// explicit-nil marker on. Sweep the orphans for the same reason
+	// /admin/control does — see explicitnil.go.
+	s.forgetOrphanedExplicitNilLocked(req.Program)
+
 	hrefs := make([]string, 0, len(published))
 	for _, p := range published {
 		hrefs = append(hrefs, p.Mode+"->"+p.CurveHref)
@@ -914,6 +920,9 @@ func (s *Server) adminCurveDelete(w http.ResponseWriter, r *http.Request) {
 			Resource: model.Resource{Href: path}, PollRate: s.controlListPollRateLocked(),
 		}
 	}
+	// A teardown that leaves a marker behind is the same contamination as one
+	// that leaves a fetchable curve behind (explicitnil.go).
+	s.forgetOrphanedExplicitNilLocked(req.Program)
 
 	// Reset the curve list to the original static fixture — and with it the
 	// INDIVIDUAL curve resources, or a cleared program would go on serving the

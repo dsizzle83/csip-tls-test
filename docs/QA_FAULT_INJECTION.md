@@ -80,6 +80,13 @@ stalls `hang_s` before the 503: a wedged server / black-holing middlebox);
 `duration_s` auto-clears so an aborted run can never leave the bench
 northbound-dead.
 
+Not a fault, but the same serve-time seam and documented here beside its
+neighbours: **explicit-null `DERControlBase` elements** (gridsim
+`POST /admin/control` `null_axes`) serve an element that is *present and
+explicitly null* rather than omitted — RC0 §9.5 row 9's release shape. See the
+section at the end of this document for the curl bodies and for what it
+deliberately does not claim.
+
 The write layer (`RegisterMap.OnWriteAttempt` → `faultController.intercept`)
 decides what lands in the control register; the effect layer
 (`faultController.effectiveCeilW` for solar slew, `shapeBatteryW` for the battery)
@@ -683,3 +690,110 @@ anti-fold pin, `WSetMod` default, write-time coherence, power-on reset, the
 120/121 split — a 50 % ceiling against a 4000 W setting on an 8000 W panel is
 2000 W, and the key-vs-model refusals), `battery_pack_test.go` (the live rate
 setting, the rating mirror, sentinel fallback, refusal without a 702).
+
+## Explicit-null DERControlBase elements (2026-08-16) — RC0 §9.5 row 9
+
+### The gap
+
+RC0 §9.5's bench battery, row 9, grades what the gateway does when a head end
+**releases** an axis by sending the element **present and explicitly null**
+rather than by leaving it out:
+
+> Release: explicit-null `volt_var` ⇒ `ModEna` = 0, `ActCrv` untouched;
+> explicit-null `freq_watt` ⇒ no write at all.
+
+It was recorded **SKIP — structurally unavailable on this harness**. Every
+release gridsim could author was an *absence* (omit the field) or a
+*cancellation* (`current_status: 6`, `DELETE /admin/control`,
+`POST /admin/default {"clear":true}`), and those are exactly the conditions the
+row exists to distinguish an explicit null **from**. A skip recorded for a
+harness limitation reads, in a bundle, like a skip recorded for a product one.
+
+`POST /admin/control` now takes a `null_axes` list. It is off by default: a
+request that does not name it serves byte-for-byte what it always did.
+
+### Author a release
+
+```bash
+# Explicit-null volt-var. activate:true replaces the program's control list, so
+# this control IS the release — nothing else is commanded.
+curl -X POST 127.0.0.1:11113/admin/control -d '{
+  "program": 0, "activate": true, "mrid": "REL-VV-1",
+  "null_axes": ["opModVoltVar"]
+}'
+
+# Explicit-null frequency-watt.
+curl -X POST 127.0.0.1:11113/admin/control -d '{
+  "program": 0, "activate": true, "mrid": "REL-FW-1",
+  "null_axes": ["opModFreqWatt"]
+}'
+
+# Both axes on one control, and other axes still commanded by value — the
+# three-way document the row needs: valued, explicitly null, and omitted.
+curl -X POST 127.0.0.1:11113/admin/control -d '{
+  "program": 0, "activate": true, "mrid": "REL-BOTH-1",
+  "connect": true, "max_lim_W": 5000,
+  "null_axes": ["opModVoltVar", "opModFreqWatt"]
+}'
+```
+
+What `GET /derp/0/derc` then serves for the last one — note the markers in
+**their own sequence positions**, not appended at the end:
+
+```xml
+<DERControlBase>
+  <opModConnect>true</opModConnect>
+  <opModFreqWatt xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:nil="true"/>
+  <opModMaxLimW>5000</opModMaxLimW>
+  <opModVoltVar xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:nil="true"/>
+</DERControlBase>
+```
+
+The full row-9 procedure is: `POST /admin/curve` to arm the volt-var curve, let
+the gateway adopt it, then `POST /admin/control` with `activate: true` and
+`null_axes` to release it. The marker lands on `/derp/{p}/derc` **and**
+`/derp/{p}/actderc`.
+
+### Vocabulary, and what is refused
+
+The axis names are `csipmodel`'s own **element names** — `opModVoltVar`,
+`opModFreqWatt`, `opModConnect`, … — read off the model by reflection, so the
+list cannot drift from what the server can actually emit. Curve-mode spellings
+(`volt_var`) are **not** accepted. The endpoint answers 400, before storing
+anything, to:
+
+* an axis no `DERControlBase` declares (a typo would otherwise be served as
+  silence, and the release simply would not happen);
+* the same axis twice;
+* an axis that the same request also gives a value (`{"connect": true,
+  "null_axes": ["opModConnect"]}`) — one element cannot be both
+  present-with-a-value and present-and-nil;
+* `null_axes` on `POST /admin/default`, which shares the request struct: a
+  `DefaultDERControl` is not an event and has no release to grade, so the lever
+  is refused there rather than accepted and ignored.
+
+### Teardown
+
+`DELETE /admin/control`, `DELETE /admin/curve`, and any later `POST` that
+replaces or re-posts the control all drop the marker. Nothing has to be cleared
+by hand, and a marker cannot outlive its control into a later run's document.
+
+### What this does NOT claim
+
+**IEEE Std 2030.5-2018 says nothing about explicit nil.** It declares every
+`DERControlBase` element `[0..1]` (p.248–251) and stops there; the words
+"nillable", "xsi:nil" and "null" do not occur in the document, and the only use
+of the XML Schema Instance namespace anywhere in the standard is `xsi:type`
+(§4.7 resource design rules, p.24; Annex C example, p.278). `xsi:nil` is a W3C
+XML Schema facility, available to elements a schema declares
+`nillable="true"` — a question about a schema document, not about the standard.
+
+So this lever does not make gridsim "more conformant", and a DUT that ignores
+the marker is not thereby non-conformant under 2030.5-2018. What it does is let
+the bench **present** a document whose distinction the *product* claims to act
+on, so that claim can be graded against bytes instead of against a skip.
+Anything written into a bundle from this lever must say the same thing. The
+guarantee the harness gives is well-formedness and sequence position, which the
+tests in `sim/gridsim/explicitnil_test.go` assert, and nothing more.
+
+Mechanism and adjudication: `sim/gridsim/explicitnil.go`.

@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	model "lexa-proto/csipmodel"
@@ -547,6 +548,22 @@ type adminCtrlReq struct {
 	// carrying it forces this control into extended storage exactly as TargetW
 	// already does; buildBase's narrow DERControlBase cannot hold it at all.
 	FreqDroop *freqDroopReq `json:"freq_droop,omitempty"`
+
+	// NullAxes names DERControlBase elements this control serves as PRESENT
+	// AND EXPLICITLY NULL — `<opModVoltVar xsi:nil="true"/>` — rather than by
+	// value or by leaving them out. The vocabulary is the model's own element
+	// names, and nothing else is accepted; explicitnil.go holds the mechanism,
+	// what IEEE Std 2030.5-2018 does and does not say about it (it says
+	// nothing), and why a document-level lever rather than a struct field is
+	// the only way to author one.
+	//
+	// A NAMED OPT-IN, like curve.go's `nonconformant`, because the shape it
+	// authors is one the standard neither requires nor describes: a reader of
+	// a request — or of the bundle carrying it — has to be able to see that
+	// the document was deliberate. Unlike the other fields here it does not
+	// go through buildBase at all; it never reaches the stored resource,
+	// because no csipmodel field could hold it.
+	NullAxes []string `json:"null_axes,omitempty"`
 }
 
 func (s *Server) handleAdminControl(w http.ResponseWriter, r *http.Request) {
@@ -646,6 +663,11 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	nullAxes, err := req.explicitNilAxes()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if req.DurationS <= 0 {
 		req.DurationS = 300
 	}
@@ -732,6 +754,34 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		e.DERControlBase.OpModTargetW = apFromWatts(req.TargetW)
 		e.DERControlBase.OpModFreqDroop = droop
 		extCtrl = &e
+	}
+
+	// The explicit-nil conflict is checked HERE and not with the other
+	// validation above because it is the only rule that needs the control this
+	// request will actually serve rather than the request itself: an axis is
+	// "valued" if the built base carries it, whichever of the two bases ends up
+	// holding it. Still ahead of every store — nothing below this point can be
+	// reached without passing it.
+	var conflictBases []any
+	if extCtrl != nil {
+		conflictBases = append(conflictBases, extCtrl.DERControlBase)
+	}
+	conflictBases = append(conflictBases, ctrl.DERControlBase)
+	if err := explicitNilValueConflict(nullAxes, conflictBases...); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(nullAxes) > 0 {
+		// The same self-documenting audit line POST /admin/curve writes for a
+		// deliberately non-conformant curve, and for the same reason: the log
+		// beside a capture has to say what the document was MEANT to be. This
+		// one names what the standard does not say, because a reader who finds
+		// xsi:nil in a bundle will reasonably assume it does.
+		log.Printf("[gridsim] POST /admin/control: EXPLICIT xsi:nil BY REQUEST — program=%d mrid=%s "+
+			"axes=%s. These elements are served PRESENT AND NULL rather than omitted. IEEE Std "+
+			"2030.5-2018 declares them [0..1] (p.248-251) and says nothing about explicit nil — the "+
+			"distinction this document draws is the PRODUCT's claim, not the standard's requirement",
+			req.Program, mrid, strings.Join(nullAxes, ","))
 	}
 
 	// An explicit mRID that already exists is an UPDATE-in-place (the flip a
@@ -844,6 +894,14 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 			actList.Results = actList.All
 		}
 	}
+
+	// The explicit-nil marker is armed AFTER the writes, and the orphan sweep
+	// runs after it, so both decide against the list as it now stands rather
+	// than as the request described it — an activate:true POST, for instance,
+	// has just discarded every other control in the program, and their markers
+	// go with them. See explicitnil.go.
+	s.setExplicitNilLocked(req.Program, ctrl.MRID, nullAxes)
+	s.forgetOrphanedExplicitNilLocked(req.Program)
 	s.mu.Unlock()
 
 	s.notifyControlChange(req.Program)
@@ -963,6 +1021,10 @@ func (s *Server) adminCtrlDelete(w http.ResponseWriter, r *http.Request) {
 			list.Results = 0
 		}
 	}
+	// Every control just went; so does every explicit-nil marker armed on one.
+	// A marker that outlived its control re-attaches to whatever control next
+	// claims that mRID (explicitnil.go).
+	s.forgetOrphanedExplicitNilLocked(req.Program)
 	s.mu.Unlock()
 
 	// Clearing a list is a change to it too. A subscriber that heard about the
@@ -1178,6 +1240,19 @@ func (s *Server) adminDefaultPost(w http.ResponseWriter, r *http.Request) {
 	droop, err := req.Base.FreqDroop.toModel()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// REFUSED, not ignored. This endpoint shares adminCtrlReq with
+	// POST /admin/control, so null_axes decodes here too and would otherwise be
+	// silently dropped — the operator would get a 204, believe a
+	// DefaultDERControl was authored with an explicitly-null axis, and grade
+	// the DUT on a document that was never sent. The overlay deliberately does
+	// not reach DefaultDERControl (explicitnil.go's scope note), so saying so
+	// is the honest answer. Same rule as the retired fixed_pf_*_pct scalars.
+	if len(req.Base.NullAxes) > 0 {
+		http.Error(w, "null_axes is a DERControl lever and does not apply to DefaultDERControl: a default "+
+			"is not an event and has no release to grade. Use POST /admin/control.",
+			http.StatusBadRequest)
 		return
 	}
 

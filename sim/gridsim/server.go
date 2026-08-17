@@ -124,6 +124,14 @@ type Server struct {
 	// POST /admin/malform). Guarded by mu. See malform.go.
 	malformKind string
 
+	// explicitNil maps a control to the DERControlBase elements it serves as
+	// PRESENT AND EXPLICITLY NULL (xsi:nil) rather than by value or by
+	// omission — RC0 §9.5 row 9's release shape, armed per control by
+	// POST /admin/control null_axes. Empty on a server nobody armed, and an
+	// empty map is what makes the document byte-identical to the pre-lever
+	// one. Guarded by mu. See explicitnil.go.
+	explicitNil map[explicitNilKey][]string
+
 	// Northbound outage injection (QA fault injection via POST /admin/outage).
 	// outageMode "" = healthy; see outage.go. outageSeq invalidates a pending
 	// auto-clear when a newer arm/clear supersedes it. Guarded by mu.
@@ -970,6 +978,27 @@ func (s *Server) serveXML(w http.ResponseWriter, resource interface{}) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+	}
+	// Explicit-nil overlay (QA, default off): a DERControlBase element the
+	// operator armed as PRESENT AND NULL is spliced into the marshalled bytes
+	// at its sequence position, because encoding/xml cannot express xsi:nil
+	// from any struct. Applied to whatever the branches above produced —
+	// malformed bytes included — since both are wire-layer overlays and the
+	// marker is keyed by mRID, so a document carrying no armed control is
+	// returned unchanged. See explicitnil.go.
+	//
+	// A failure here is NOT served. The overlay only fails when the document
+	// would otherwise go out silently missing the marker the run is about, or
+	// carrying one element twice; either makes a bundle that has to be
+	// withdrawn, and a 500 makes the bench stop instead.
+	if overlay := s.explicitNilOverlay(resource); len(overlay) > 0 {
+		spliced, err := applyExplicitNil(data, overlay)
+		if err != nil {
+			log.Printf("[gridsim] %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		data = spliced
 	}
 	xmlDecl := []byte(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 	body := append(xmlDecl, data...)
