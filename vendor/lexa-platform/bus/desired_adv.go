@@ -2,6 +2,8 @@
 
 package bus
 
+import "sort"
+
 // DesiredAdvanced bus contract (WP-9, standards-buildout C1/C3/C4 —
 // architecture D6, NORMATIVE): the hub's advanced-DER author (cmd/hub/adv.go,
 // gated behind hub.json `advanced_der:"on"`) publishes ONE retained document
@@ -84,6 +86,111 @@ type DesiredAdvanced struct {
 	// key, so a new author's release is simply not executed (today's behavior).
 	// Neither direction can invent a release that was not authored.
 	ReleaseFreqDroop bool `json:"release_freq_droop,omitempty"`
+
+	// ReleaseCurveAxes names the curve axes this document explicitly WITHDRAWS
+	// (P4). Values come from the AdvAxis* vocabulary and are constrained to the
+	// axes whose null CANNOT already carry a release — today that is freq_watt
+	// alone; see ReleasableCurveAxes for the closed set and for why the other
+	// three legacy curve axes are deliberately out of it. Absent or empty means
+	// no explicit release.
+	//
+	// THE DEFECT BEHIND IT. A bench sweep of all four legacy DERCurveLink axes
+	// with a clean explicit-null lever (xsi:nil, no activate, so no lapse
+	// confound) found that none of them honours it: every one decodes xsi:nil as
+	// a DERCurveLink with an EMPTY HREF, drops it on the ignored-content channel,
+	// re-affirms the curve it was asked to release ("NO-OP — already held this
+	// curve, live and enabled"), and answers Applied. The head end is told a
+	// withdrawal landed that never did.
+	//
+	// THE FIX FOR THREE OF THE FOUR AXES IS ENTIRELY UPSTREAM OF THIS FIELD, and
+	// saying so is the point of this paragraph. The primary defect is that the
+	// AUTHORITY never learned of the release, because the decode dropped the nil;
+	// repairing that (lexa-proto's marker, plus the authority nulling the axis)
+	// is what closes it. Once the axis arrives null, THE NULL IS ALREADY A
+	// RELEASE COMMAND on those three — this type's own doc says so twenty lines
+	// above: "an un-commanded axis is an EXPLICIT null (a release command: 'no
+	// <axis> in force'), never an absent key". The consumer implements exactly
+	// that: volt_var and watt_pf DEFAULT to release() and are overridden only by
+	// content, volt_watt is release() on null, and release() is executed —
+	// executeReleaseLocked verifies-then-disables the axis function (Ena=0).
+	//
+	// SO A FLAG ON THOSE THREE WOULD BE A SECOND CHANNEL THAT CAN DISAGREE WITH
+	// THE FIRST, in the ordinary direction rather than an exotic one: a null
+	// volt_watt with no flag set still releases, while ReleasesCurveAxis would
+	// answer false for it. A consumer that read the flag INSTEAD of the null
+	// would silently regress three working axes. The narrowest contract that
+	// closes the real gap is the correct one.
+	//
+	// WHY freq_watt IS DIFFERENT, and the only member today. Its null is
+	// DELIBERATELY no-opinion, and that is ratified rather than incidental — the
+	// consumer's own branch cites LEGACY_CURVES_RC0_2026-08-14.md §2.8's
+	// three-state table, which puts model 134 in the "no write" column for a
+	// commanded release and says "Only 126, 131 and 132 are releasable on
+	// legacy", on the ground that "the release of an opModFreqWatt control means
+	// 'this control no longer applies', which is not the same instruction as
+	// 'turn frequency response off'. Frequency response is a standing
+	// grid-support function the head end did not author and a released control
+	// does not repeal." Because that axis's null is reserved for no-opinion, the
+	// null channel is UNAVAILABLE to it, and a flag is the only way to say "the
+	// server withdrew this" as distinct from "nothing commanded it".
+	//
+	// WHAT THE FLAG IS WORTH ON IT, stated plainly because it is not a register.
+	// The ratified execution of a freq_watt release is to WRITE NOTHING. The
+	// value is the honest RESPONSE: the gateway can answer the head end truthfully
+	// about a control it has genuinely released, instead of the false Applied the
+	// bench caught. An instruction whose correct execution is "no write" still
+	// has to be distinguishable from one that was never given.
+	//
+	// AND IT STILL HAS TO BE A FLAG RATHER THAN AN INFERENCE, for the reason
+	// ReleaseFreqDroop states under "WHY A FLAG AND NOT A RULE THE CONSUMER COULD
+	// INFER": the consumer "sees one document at a time and cannot tell 'the
+	// gateway wrote this droop under the event that just ended' from 'this droop
+	// was configured on the DER by an installer and no document ever mentioned
+	// it'. Only the AUTHOR knows, because only the author remembers what it
+	// authored." On freq_watt that is exactly the ambiguity a null leaves, which
+	// is why the author must state the conclusion here.
+	//
+	// A SLICE, NOT A BOOLEAN, even at cardinality one. The set is closed today
+	// and not closed forever: an axis that acquires freq_watt-like semantics
+	// joins it WITH ITS ARGUMENT (see ReleasableCurveAxes), and a list absorbs
+	// that without a wire change or a second key to forget.
+	//
+	// UNKNOWN NAMES ARE IGNORED, NOT REFUSED, and the argument is this family's
+	// own decode path rather than a general preference. mqttutil's Subscribe
+	// calls Finite() and, on any error, DROPS THE WHOLE MESSAGE before a handler
+	// sees it so last-known-good holds. So "refuse" here would not mean "refuse
+	// this axis" — it would mean destroying every OTHER axis's command in the
+	// document over one unrecognized string, on a family where the other axes
+	// include live protection settings. Worse, it would invert the skew rule
+	// below: a future author that releases a newly-qualifying axis would take an
+	// older consumer's ENTIRE control down, when the documented safe direction is
+	// that its release is "simply not executed". Ignoring leaves the axis exactly
+	// where a silent document would have. ReleasesCurveAxis is therefore the only
+	// question a consumer should ask; the raw slice is preserved verbatim so a
+	// reader (and any log line) still sees what the author actually said —
+	// narrowing what is EXECUTED is not licence to rewrite what was SAID.
+	//
+	// AN AXIS THIS DOCUMENT ALSO COMMANDS IS NOT RELEASED. A document naming an
+	// axis whose curve it is simultaneously carrying is malformed, and
+	// ReleasesCurveAxis resolves it in the non-destructive direction: content
+	// wins. A curve present is an assertion, a release is a withdrawal, and
+	// executing both is impossible — honouring the withdrawal would withdraw an
+	// axis the same document is actively commanding. The author's invariant is
+	// the one ReleaseFreqDroop states ("only ever set on a document whose
+	// FreqDroop is null"); this makes a violation harmless instead of trusting
+	// it. It guards one axis today and the principle is what generalises.
+	//
+	// Additive at DesiredAdvancedV=4 (AD-006) — no bump, no floor, exactly as
+	// ReleaseFreqDroop and the reactive reversion pair landed. This family's three
+	// bumps were all NON-additive: each rebound the MEANING of existing wire
+	// content, which is the one thing an older document cannot survive. This adds
+	// a key no previous document carries and changes the meaning of nothing.
+	// Additive in the SAFE direction under either skew, and neither direction can
+	// invent a release that was not authored: an old author never sets it, so a
+	// new consumer reads no-opinion (today's behavior); an old consumer ignores
+	// the key, so a new author's release is simply not executed (today's
+	// behavior).
+	ReleaseCurveAxes []string `json:"release_curve_axes,omitempty"`
 
 	// Trips carries the trip/ride-through curve sets. Highest 1547 priority:
 	// always passes through arbitration (D7 rule 3). Explicit null when the
@@ -334,6 +441,162 @@ type AdvCurve struct {
 	// — the per-axis no-op re-adoption key (D6), echoed back on the WP-10
 	// ReconcileReport as curve_hash.
 	Hash string `json:"hash"`
+}
+
+// releasableCurveAxes is the CLOSED SET DesiredAdvanced.ReleaseCurveAxes may
+// name. Membership is not "is this a curve axis" — it is a much narrower
+// question: IS THIS AN AXIS WHOSE NULL CANNOT ALREADY CARRY A RELEASE? Today
+// exactly one axis qualifies.
+//
+// freq_watt IS IN, because its null is deliberately reserved for no-opinion. The
+// consumer's own branch cites LEGACY_CURVES_RC0_2026-08-14.md §2.8's three-state
+// table, which puts model 134 in the "no write" column for a commanded release
+// and says "Only 126, 131 and 132 are releasable on legacy": "the release of an
+// opModFreqWatt control means 'this control no longer applies', which is not the
+// same instruction as 'turn frequency response off'. Frequency response is a
+// standing grid-support function the head end did not author and a released
+// control does not repeal." With the null spoken for, a flag is the only channel
+// left, and its ratified execution is to write nothing — the flag buys an honest
+// Response, not a register write.
+//
+// volt_var, watt_pf AND volt_watt ARE DELIBERATELY OUT, and this paragraph
+// exists so a future reader cannot re-add them without meeting the argument.
+// THEIR NULL IS ALREADY THEIR RELEASE. DesiredAdvanced's type doc states the
+// rule — "an un-commanded axis is an EXPLICIT null (a release command: 'no
+// <axis> in force'), never an absent key" — and the consumer implements it:
+// volt_var and watt_pf default to release() and are overridden only by content,
+// volt_watt is release() on null, and release() is executed by
+// executeReleaseLocked, which verifies-then-disables the axis function (Ena=0).
+// Adding them here would create a SECOND channel able to disagree with the first
+// in the ordinary direction: a null volt_watt with no flag set still releases,
+// while ReleasesCurveAxis would answer false. A consumer that read the flag
+// instead of the null would silently regress three working axes. P4's defect on
+// those three was that the AUTHORITY never learned of the release (the decode
+// dropped the nil); that is fixed upstream, not here.
+//
+// Nothing else is a candidate either: watt_var's home is 712, a 7xx model
+// outside the legacy family; the trip axes are protection boundaries, where
+// withdrawal is a different decision with a different owner; fixed_pf, fixed_var
+// and energize are not curve axes; and freq_droop already has ReleaseFreqDroop.
+//
+// ADDING A NAME HERE IS NOT A FREE ACTION. It asserts two things: that the
+// axis's null is genuinely unavailable as a release channel (or the flag is a
+// duplicate), and that an older consumer ignoring the name — leaving that axis
+// standing — is an acceptable outcome for it. That is why this is a closed
+// literal pinned by a test rather than a filter over AdvAxis*.
+var releasableCurveAxes = map[string]bool{
+	AdvAxisFreqWatt: true,
+}
+
+// withdrawableCurveAxes is the closed set ActiveControl.ReleasedCurveAxes may
+// name: the four curve axes whose DERCurveLink a nil marker can arrive on —
+// volt_var (legacy model 126), watt_pf (131), volt_watt (132), freq_watt (134).
+//
+// IT IS DELIBERATELY WIDER THAN releasableCurveAxes, AND THE TWO MUST NOT BE
+// MERGED. This set answers "what can the wire carry" — a decoder question, fixed
+// by which links 2030.5 lets a server nil. releasableCurveAxes answers "what does
+// the gateway act on with a FLAG rather than a null" — a policy question, whose
+// answer is freq_watt alone because the other three are already released by their
+// own null. Merging them breaks whichever side moves: narrow this one and the
+// disclosure is lost at the only layer that can see it; widen that one and a flag
+// becomes a second release channel able to disagree with the null. See
+// ActiveControl.ReleasedCurveAxes for the carriage/policy division, and
+// TestWithdrawableAndReleasableAreDeliberatelyDifferentSets for the guard.
+//
+// watt_var is absent for the same reason it is absent from the releasable set:
+// its home is 712, a 7xx model outside the legacy curve family. The trip axes
+// carry ride-through curves, not DERCurveLink control curves, and freq_droop is
+// not a curve link at all.
+var withdrawableCurveAxes = map[string]bool{
+	AdvAxisVoltVar:  true,
+	AdvAxisVoltWatt: true,
+	AdvAxisWattPF:   true,
+	AdvAxisFreqWatt: true,
+}
+
+// WithdrawableCurveAxes returns the closed set of axis names
+// ActiveControl.ReleasedCurveAxes may carry, as a fresh slice the caller may
+// keep or sort. Order is not significant and is not guaranteed.
+func WithdrawableCurveAxes() []string {
+	out := make([]string, 0, len(withdrawableCurveAxes))
+	for axis := range withdrawableCurveAxes {
+		out = append(out, axis)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// IsWithdrawableCurveAxis reports whether axis is one a curve-link nil marker
+// can name on the wire. This is the CARRIAGE question; IsReleasableCurveAxis is
+// the POLICY one, and they deliberately differ.
+func IsWithdrawableCurveAxis(axis string) bool { return withdrawableCurveAxes[axis] }
+
+// ReleasableCurveAxes returns the closed set of axis names
+// DesiredAdvanced.ReleaseCurveAxes may name, as a fresh slice the caller may
+// keep or sort. Order is not significant and is not guaranteed.
+func ReleasableCurveAxes() []string {
+	out := make([]string, 0, len(releasableCurveAxes))
+	for axis := range releasableCurveAxes {
+		out = append(out, axis)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// IsReleasableCurveAxis reports whether axis is one this flag may withdraw.
+func IsReleasableCurveAxis(axis string) bool { return releasableCurveAxes[axis] }
+
+// ReleasesCurveAxis reports whether this document EXPLICITLY WITHDRAWS the named
+// curve axis. It is the only question a consumer should ask about
+// ReleaseCurveAxes, and it is deliberately total — every rejection case answers
+// false rather than erroring, because "not released" is the safe, no-opinion
+// posture in all of them:
+//
+//   - the axis is not named: no opinion, the no-strip default;
+//   - the axis is named but is not a releasable curve axis (an unrecognized
+//     name, or a real axis outside the closed set): ignored, per the field doc's
+//     refuse-vs-ignore argument;
+//   - the axis is named AND this same document carries content for it: content
+//     wins, because honouring a withdrawal of an axis the document is actively
+//     commanding is the strip the no-strip rule forbids.
+//
+// A consumer must never infer a release from a null axis. That is the whole
+// point of the flag; see the field doc and, above it, ReleaseFreqDroop's "WHY A
+// FLAG AND NOT A RULE THE CONSUMER COULD INFER".
+func (d DesiredAdvanced) ReleasesCurveAxis(axis string) bool {
+	if !releasableCurveAxes[axis] {
+		return false
+	}
+	named := false
+	for _, a := range d.ReleaseCurveAxes {
+		if a == axis {
+			named = true
+			break
+		}
+	}
+	if !named {
+		return false
+	}
+	return !d.commandsCurveAxis(axis)
+}
+
+// commandsCurveAxis reports whether this document carries curve CONTENT for the
+// named axis — the contradiction guard behind ReleasesCurveAxis. The two
+// reactive-carried axes are read through ReactiveMode, which is one field by
+// design (mutual exclusivity is structural, see the type doc), so at most one of
+// them can ever be commanded at a time.
+func (d DesiredAdvanced) commandsCurveAxis(axis string) bool {
+	switch axis {
+	case AdvAxisVoltWatt:
+		return d.VoltWatt != nil
+	case AdvAxisFreqWatt:
+		return d.FreqWatt != nil
+	case AdvAxisVoltVar:
+		return d.ReactiveMode != nil && d.ReactiveMode.Kind == AdvReactiveVoltVar && d.ReactiveMode.Curve != nil
+	case AdvAxisWattPF:
+		return d.ReactiveMode != nil && d.ReactiveMode.Kind == AdvReactiveWattPF && d.ReactiveMode.Curve != nil
+	}
+	return false
 }
 
 // AdvFreqDroop carries frequency-droop parameters in SunSpec model 711 Ctl

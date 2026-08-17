@@ -412,6 +412,93 @@ type ActiveControl struct {
 	// resolvable curves.
 	CurveSetID string `json:"curve_set_id,omitempty"`
 
+	// ReleasedCurveAxes names the curve axes the head end EXPLICITLY WITHDREW on
+	// this control — the axes whose DERCurveLink arrived as a nil marker rather
+	// than as a resolvable href. Values are AdvAxis* names drawn from
+	// WithdrawableCurveAxes; absent or empty means nothing was explicitly
+	// withdrawn.
+	//
+	// WHY THE DOCUMENT NEEDED IT AT ALL. The gateway authority consumes THIS
+	// message and CurveSet — never a decoded CurveLink — and CurveSet carries
+	// only PRESENT curves ("a mode absent from Curves is not commanded, or its
+	// href did not resolve", see bus/curves.go). So a withdrawn axis and an
+	// un-mentioned one arrived at the authority identically, and
+	// DesiredAdvanced.ReleaseCurveAxes was unpopulatable from the wire: the
+	// shell's freq_watt release branch was correct, tested, and unreachable in
+	// production. This field is the only place the nil marker's existence
+	// survives past the decoder.
+	//
+	// ── THE INTERPLAY WITH ABSENCE-FROM-CurveSet, which is the whole of why
+	// this field is NECESSARY for one axis and REDUNDANT-BUT-FAITHFUL for three ──
+	//
+	// Ask the question directly: does an axis's ABSENCE from CurveSet already
+	// carry its release? For three of the four, YES, and by this chain —
+	//
+	//   1. CurveSet carries only resolvable, present curves, so a withdrawn axis
+	//      has no entry;
+	//   2. the authority authors a NULL axis on DesiredAdvanced for any axis with
+	//      no entry;
+	//   3. on volt_var, watt_pf and volt_watt a null axis IS the release —
+	//      DesiredAdvanced's type doc ("an un-commanded axis is an EXPLICIT null
+	//      (a release command: 'no <axis> in force')") and the consumer's
+	//      release() defaults, executed by executeReleaseLocked.
+	//
+	// Note what step 3 means: on those axes the release lands IDENTICALLY whether
+	// the head end withdrew the axis or never mentioned it. That is not a defect
+	// this field repairs — it is the documented semantics, where both cases are
+	// the same instruction. So for those three this field changes no behavior; it
+	// is DISCLOSURE, and it is carried anyway because this layer's job is faithful
+	// carriage (below) and because the decoder is the only component that will
+	// ever be able to tell the two apart.
+	//
+	// freq_watt is the exception and the reason the field exists. Its null is
+	// DELIBERATELY no-opinion (LEGACY_CURVES_RC0_2026-08-14.md §2.8: "Only 126,
+	// 131 and 132 are releasable on legacy"), so steps 1-2 still happen and step 3
+	// does not — absence carries nothing, and "withdrawn" must be told apart from
+	// "never mentioned". This field is the only channel that can, and it is what
+	// makes bus.DesiredAdvanced.ReleaseCurveAxes populatable.
+	//
+	// ── CARRIAGE HERE, POLICY AT THE AUTHORITY ──
+	//
+	// This set admits all FOUR markable curve axes; the authority's
+	// ReleasableCurveAxes admits freq_watt ALONE. That divergence is deliberate
+	// and load-bearing in both directions. The northbound decoder knows which
+	// axes carried a nil marker and does NOT know which generation the target DER
+	// is, so it cannot apply the policy; the authority knows the target and
+	// narrows — setting the freq_watt flag and simply nulling the rest. Narrowing
+	// HERE would discard a disclosure nothing downstream could recover, since the
+	// decoder is the only thing that ever sees the marker. Widening THERE would
+	// re-create the second-channel defect the previous wave closed: on the three
+	// null-releasing axes a flag can disagree with the null that already releases
+	// them. TestWithdrawableAndReleasableAreDeliberatelyDifferentSets guards both.
+	//
+	// A CONTRADICTORY CONTROL — an axis named here whose curve is also present in
+	// the matching CurveSet — cannot be resolved on this struct, because
+	// ActiveControl does not carry curve content (only CurveSetID). The producer
+	// must not author one, and the AUTHORITY resolves any it sees the way
+	// DesiredAdvanced.ReleasesCurveAxis does: content wins. Stated rather than
+	// faked — a guard this type cannot actually enforce would be worse than none.
+	//
+	// UNKNOWN NAMES ARE IGNORED, NOT REFUSED, for this family's own decode-path
+	// reason: mqttutil's Subscribe drops the WHOLE message when Finite() errors,
+	// and lexa/csip/control is the document every limit and mode rides on.
+	// Refusing over one unrecognized string would discard a live control.
+	// WithdrewCurveAxis is the question to ask; the raw slice is preserved
+	// verbatim so a reader still sees what the head end actually said.
+	//
+	// Additive at ActiveControlV=1 (AD-006), exactly as every field this family
+	// has ever gained — the WP-8 advanced-control scalars, FreqDroop,
+	// RampTmsRequested, CurveSetID. This family has never bumped and does not
+	// bump here: an old subscriber ignores the unknown key, a new subscriber
+	// reading an old publisher sees it absent. Neither skew can invent a
+	// withdrawal, and neither can LOSE the three null-releasing axes' release,
+	// because that release does not ride this field at all — it rides absence
+	// from CurveSet, which is unchanged. The one thing an old subscriber does
+	// lose is freq_watt's withdrawal, which is the pre-existing behavior this
+	// field exists to end: not yet fixed, not regressed.
+	ReleasedCurveAxes []string `json:"released_curve_axes,omitempty"`
+	// (WithdrewCurveAxis, below the struct, is the accessor.)
+
 	// DefaultFallback carries the highest-priority program's DefaultDERControl
 	// ALONGSIDE an active event, so the hub can degrade to it — IEEE 2030.5
 	// event-end revert-to-default — instead of to UNCONSTRAINED when the event
@@ -465,6 +552,35 @@ type ActiveControl struct {
 	ModeProvenance map[string]ModeProvenance `json:"mode_provenance,omitempty"`
 
 	Ts int64 `json:"ts"`
+}
+
+// WithdrewCurveAxis reports whether the head end EXPLICITLY WITHDREW the named
+// curve axis on this control — the axis's DERCurveLink arrived as a nil marker.
+// It is the only question a consumer should ask about ReleasedCurveAxes, and it
+// is deliberately total: every rejection answers false, because "not explicitly
+// withdrawn" is the correct reading in all of them.
+//
+//   - the axis is not named: nothing was withdrawn for it here. NOTE this is not
+//     the same as "the axis is commanded" — on volt_var, watt_pf and volt_watt an
+//     axis absent from the matching CurveSet is released by that absence, with or
+//     without this flag. See the field doc's interplay section before treating a
+//     false here as "keep whatever is running".
+//   - the axis is named but is not a markable curve axis: ignored, per the field
+//     doc's refuse-vs-ignore argument.
+//
+// It answers the CARRIAGE question only. Whether a withdrawal should become a
+// gateway-side release FLAG is the authority's decision, and its answer is
+// narrower — see DesiredAdvanced.ReleaseCurveAxes and ReleasableCurveAxes.
+func (a ActiveControl) WithdrewCurveAxis(axis string) bool {
+	if !withdrawableCurveAxes[axis] {
+		return false
+	}
+	for _, x := range a.ReleasedCurveAxes {
+		if x == axis {
+			return true
+		}
+	}
+	return false
 }
 
 // FreqDroopIntent is opModFreqDroop as IEEE 2030.5 states it — sep 2.0.4's

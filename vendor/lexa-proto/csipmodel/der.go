@@ -311,11 +311,150 @@ const (
 
 // ─── Curve types ──────────────────────────────────────────────────────────────
 
+// XSINilNamespace is the W3C XML Schema instance namespace, the URI that
+// qualifies the xsi:nil attribute.
+//
+// THE MARKER IS THIS URI, NEVER THE PREFIX. "xsi" is only a convention; a
+// document may bind this URI to any prefix it likes, and may bind the prefix
+// "xsi" to something else entirely. Both happen, and both are handled — see
+// XSINil.UnmarshalXMLAttr and the fixtures in xsinil_test.go.
+const XSINilNamespace = "http://www.w3.org/2001/XMLSchema-instance"
+
+// XSINil is the decoded xsi:nil="true" explicit-null marker.
+//
+// WHAT IT IS FOR. A head end releases a control axis by sending the element
+// with an explicit null rather than omitting it — omission means "no opinion",
+// explicit null means "stop doing this". Without a marker the two collapse at
+// decode and the release cannot be acted on. See CurveLink.
+//
+// NOT A 2030.5 REQUIREMENT, and this must not be misremembered later.
+// Verified against the local corpus on 2026-08-17:
+//
+//	xsi:nil / nillable   ZERO occurrences in IEEE Std 2030.5-2018
+//	                     ZERO in IEEE Std 2030.5-2023
+//	                     ZERO in CSIP Implementation Guide 2.1
+//	                     ZERO in SunSpec CSIP CTP v1.3
+//	                     ZERO in the vendored sep-2.0.4.xsd, which declares
+//	                     nothing nillable and never binds the namespace
+//
+// So this type implements no clause and satisfies no conformance criterion.
+// It exists so the product can ACT on a distinction the CSIP ecosystem uses in
+// practice and that our own release contract requires. Nothing here may be
+// cited as a conformance obligation in either direction: a server that never
+// sends xsi:nil is not non-conformant, and honouring it is not a conformance
+// claim.
+//
+// THE NAMESPACE ITSELF, HOWEVER, IS 2030.5's OWN. The standard requires it by
+// name — 2018 p.24: "All subordinate resources of list resources that support
+// multiple types, for example, NotificationList, SHALL include an xsi:type
+// attribute. In this case, the XML Schema Instance Namespace must also be
+// declared." — and its Clause 16 example (p.278) binds exactly this URI as
+// xmlns:xsi. It is xsi:NIL that 2030.5 never mentions, not the namespace. A
+// 2030.5 implementation is therefore already obliged to understand
+// schema-instance qualification; we are borrowing a known namespace for an
+// attribute the standard did not define, not inventing one.
+//
+// THE INTEROP CAVEAT, stated because it is the real risk. xsi:nil is only
+// schema-VALID on an element declared nillable="true", and nothing in the
+// corpus declares these elements nillable. A peer that validates against a
+// strict schema could reject a document carrying this marker. That is a risk
+// the AUTHORING side owns (the harness's gridsim, which splices it); the
+// receiving side handled here is safe either way, because a document without
+// the marker simply does not release.
+type XSINil bool
+
+// UnmarshalXMLAttr decodes the xsi:nil attribute value.
+//
+// THE NAMESPACE GUARD IS THE STRUCT TAG, NOT THIS FUNCTION. encoding/xml
+// matches an attribute to a field by the tag's namespace-qualified name before
+// calling this hook, so a bare nil="true" (no binding) and an xsi: prefix bound
+// to some other URI never reach here at all. That is the half a plain
+// xml:"nil,attr" tag gets wrong: Go falls back to LOCAL-NAME matching when the
+// tag names no namespace, so it would accept both impostors while also looking
+// correct in the ordinary case.
+//
+// THE VALUE IS AN xs:boolean, whose lexical space is exactly {true, false, 1,
+// 0}. Only "true" and "1" mark a release.
+//
+// AN UNRECOGNISED VALUE IS NEITHER A MARKER NOR AN ERROR, deliberately.
+// Returning an error here would fail the ENTIRE document over one junk
+// attribute, letting a single malformed byte destroy an otherwise valid
+// DERControl. Treating junk as a marker would RELEASE an axis the head end
+// never asked to release. Declining to recognise it leaves the consumer on its
+// existing refuse path, which is the fail-safe direction: the worst outcome is
+// a release that is not honoured, never a release that is invented.
+func (x *XSINil) UnmarshalXMLAttr(attr xml.Attr) error {
+	*x = attr.Value == "true" || attr.Value == "1"
+	return nil
+}
+
 // CurveLink is a reference to a DERCurve resource, embedded in DERControlBase.
 // The server populates the href attribute; the client resolves the curve from
 // its local DERCurveList cache.
+//
+// THREE STATES, and they must stay three (registry P4). A *CurveLink field
+// distinguishes:
+//
+//	nil pointer                     the element was ABSENT — no opinion
+//	&CurveLink{Href: "/c/vv"}       VALUED — use this curve
+//	&CurveLink{XSINil: true}        EXPLICITLY NULL — release this axis
+//
+// and a fourth, malformed shape — &CurveLink{} from a bare <opModVoltVar/> —
+// which is none of the three and must not be mistaken for the release.
+//
+// Until 2026-08-17 this struct carried only Href, so encoding/xml produced an
+// identical &CurveLink{Href: ""} for the explicit null AND the bare element.
+// The distinction died at decode, which made the release contract
+// unimplementable no matter what the consumer did: it could only refuse both.
+// The gateway's refusal was honest but the axis was unreleasable.
 type CurveLink struct {
 	Href string `xml:"href,attr,omitempty"`
+
+	// XSINil is set when the element carried a genuine xsi:nil="true". The tag
+	// is namespace-QUALIFIED, which is what makes the marker prefix-agnostic
+	// (any prefix bound to XSINilNamespace matches) while rejecting a bare
+	// nil="true" and a familiar prefix bound to the wrong URI.
+	XSINil XSINil `xml:"http://www.w3.org/2001/XMLSchema-instance nil,attr,omitempty"`
+}
+
+// IsExplicitNull reports whether the head end explicitly released this axis, as
+// opposed to leaving it alone (absent), setting it (valued), or sending
+// something malformed.
+func (c *CurveLink) IsExplicitNull() bool {
+	return c != nil && bool(c.XSINil)
+}
+
+// MarshalXML emits the link, and emits a GENUINE xsi:nil for an explicitly-null
+// one — the local name "nil" qualified by XSINilNamespace through a binding
+// carried in the document itself.
+//
+// WHY THIS IS HAND-ROLLED. encoding/xml can emit a namespace-qualified
+// attribute from the struct tag alone, but it invents the prefix, producing
+// `xmlns:_XMLSchema-instance="…" _XMLSchema-instance:nil="true"`. That is
+// well-formed and it does resolve to the right URI — it is not counterfeit —
+// but it is not what any other implementation writes, and a conformance
+// capture full of it invites exactly the "is this really xsi:nil?" argument
+// this marker exists to settle. Writing the binding and the attribute directly
+// produces the conventional spelling.
+//
+// The valued and empty cases emit byte-for-byte what they emitted before this
+// method existed; TestCurveLink_ValuedAndAbsentEmitUnchanged pins that, because
+// an "additive" change that moves every golden capture is not additive.
+func (c CurveLink) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	start.Attr = nil
+	switch {
+	case bool(c.XSINil):
+		start.Attr = []xml.Attr{
+			{Name: xml.Name{Local: "xmlns:xsi"}, Value: XSINilNamespace},
+			{Name: xml.Name{Local: "xsi:nil"}, Value: "true"},
+		}
+	case c.Href != "":
+		start.Attr = []xml.Attr{{Name: xml.Name{Local: "href"}, Value: c.Href}}
+	}
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+	return e.EncodeToken(xml.EndElement{Name: start.Name})
 }
 
 // DERCurveData is one (x, y) point in a piecewise-linear DERCurve.
