@@ -127,6 +127,12 @@ var DocCertType = map[string]string{
 //     behaviour, and the one this map corrects — would misattribute a 2030.5
 //     identity-profile finding to a submission that says nothing about it.
 var NoCertificationBasis = map[string]string{
+	"local-ext-v1": "LOCAL-EXT-v1 is not a specification: it is this bench's own family of supplementary " +
+		"product-evidence rows, for behaviour no published procedure covers (its cases carry " +
+		"certifiable=false, and the runner already keeps them out of every applicable-FAIL tally). Its " +
+		"rows have no `Test <ID>` home in any submitted Summary Test Results because there is no " +
+		"certification for them to be a result OF — the same reason SSM-CONF-v0.8's rows have none, one " +
+		"step further along: that document at least is a specification",
 	"ss-modbus-client-conf-v1.1": "SunSpec offers no Modbus CLIENT certification: this document's rows carry " +
 		"no Test Description token and no Certificate Type in either Results Reporting specification's " +
 		"§3.1.1 key table, so they have no `Test <ID>` row to be in any SUMMARY.csv",

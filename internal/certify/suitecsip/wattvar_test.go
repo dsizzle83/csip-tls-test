@@ -43,57 +43,6 @@ import (
 	"lexa-proto/sunspec"
 )
 
-// mappingWattVarStaged is the provenance sentence the row would carry. It lives
-// here rather than beside mappingVoltVar in register.go because nothing
-// registered uses it yet, and a provenance constant with no row is a claim with
-// no claimant.
-const mappingWattVarStaged = "IEEE 2030.5's opModWattVar is the Q(P) function, whose SunSpec/IEEE-1547 " +
-	"carriage is model 712 (DER Watt-Var) — the correspondence this product's southbound reconciler " +
-	"uses, and the one BASIC-015 proves NEGATIVELY by requiring that opModWattPF never reach it"
-
-// noLegacyWattVarRegister records why the 12x arm is empty. The legacy curve
-// family has no Q(P) bank at all: 126 is Q(V), 132 is P(V), 134 is P(f), 131 is
-// PF(P). A binding that named one of them would be repeating exactly the
-// substitution BASIC-015 exists to refuse.
-const noLegacyWattVarRegister = "the legacy 12x curve family defines no Q(P) bank — 126 is Q(V), 131 is " +
-	"PF(P), 132 is P(V), 134 is P(f) — so on a legacy DER this axis has no register home to be measured in"
-
-// wattVarStagedBinding is the curveBinding a registered opModWattVar row would
-// carry.
-//
-// THE BREAKPOINTS ARE THIS HARNESS'S OWN and the Prescribed text says so. No
-// Figure prescribes them, and claiming otherwise would be the invented
-// provenance this file exists to avoid — basic015NoPrescribedCurve is the
-// established precedent for saying it plainly.
-//
-// They are deliberately NOT the sim's seeded default curve ((100,5),(200,-5) at
-// SF 0 — solar_adv.go populateCurveModel), because a row whose published points
-// match what the device already holds cannot tell an adopt from a no-op.
-//
-// No OpenLoopTms: model 712 declares NO RspTms register (verified against the
-// vendored model_712.json, whose Crv group is exactly {ActPt, DeptRef, Pri,
-// ReadOnly}), which is why openLoopHome(712) is empty and the oracle skips the
-// timing assertion for this model. Authoring one would put an element on the
-// wire that this referee could assert nothing about southbound.
-func wattVarStagedBinding() *curveBinding {
-	return &curveBinding{
-		Mode: "watt_var",
-		// Q(P): as active power rises, absorb increasing reactive power.
-		Points: []CurvePoint{{X: 0, Y: 0}, {X: 5000, Y: 0}, {X: 10000, Y: -3000}},
-		XMult:  -2, // x in hundredths of a percent of rated W
-		YMult:  -2, // y in hundredths of a percent of the y reference
-		// %statVarAvail — the reference 712's DeptRef enumerates as 2, through
-		// the same wantDeptRef translation 705 uses.
-		YRefType:             derUnitRefStatVarAvail,
-		Model7xx:             sunspec.ModelDERWattVar,
-		Mapping7xx:           mappingWattVarStaged,
-		NoRegisterHomeLegacy: noLegacyWattVarRegister,
-		Prescribed: "no figure in CSIP-CONF-v1.3 prescribes an opModWattVar curve; these breakpoints are " +
-			"this harness's own, chosen to be distinguishable from the device's seeded default, and this " +
-			"row carries no catalog provenance because there is none to carry",
-	}
-}
-
 // adoptWattVar drives the REAL derbase adopt handshake with exactly the
 // breakpoints the binding publishes — the write a gateway that EXECUTED this
 // control would make.
@@ -103,7 +52,7 @@ func wattVarStagedBinding() *curveBinding {
 // that wrote the points under a reference nobody commanded.
 func (f *curveFixture) adoptWattVar(t *testing.T) {
 	t.Helper()
-	b := wattVarStagedBinding()
+	b := wattVarBinding()
 	deptRef, ok := b.wantDeptRef(sunspec.ModelDERWattVar)
 	if !ok {
 		t.Fatalf("the binding's yRefType %d has no DeptRef translation for model 712", b.YRefType)
@@ -129,7 +78,7 @@ func (f *curveFixture) adoptWattVar(t *testing.T) {
 func TestWattVar_PublishesTheAxisAndTheServedDocumentCarriesIt(t *testing.T) {
 	f := newCurveFixture(t)
 	d, gs := f.withGridSimServer(t)
-	spec := inverterControlSpec(curveMode("opModWattVar", wattVarStagedBinding()),
+	spec := inverterControlSpec(curveMode("opModWattVar", wattVarBinding()),
 		"a Watt-Var curve", "CERT-WATTVAR")
 
 	params := map[string]string{pollWindowParam: "20ms"}
@@ -167,7 +116,7 @@ func TestWattVar_PublishesTheAxisAndTheServedDocumentCarriesIt(t *testing.T) {
 func TestWattVar_GoesGreenWhenTheDERAdoptsTheCurve(t *testing.T) {
 	f := newCurveFixture(t)
 	d := f.withGridSim(t)
-	spec := inverterControlSpec(curveMode("opModWattVar", wattVarStagedBinding()),
+	spec := inverterControlSpec(curveMode("opModWattVar", wattVarBinding()),
 		"a Watt-Var curve", "CERT-WATTVAR")
 
 	ctx := context.Background()
@@ -186,7 +135,7 @@ func TestWattVar_GoesGreenWhenTheDERAdoptsTheCurve(t *testing.T) {
 		t.Fatalf("the declared verdict on a DER that adopted this row's own Q(P) curve = %q, want \"\": %s",
 			got, spec.Notes(obs))
 	}
-	if fnd := curveOutcome(wattVarStagedBinding(), obs); fnd.Verdict != certify.Pass {
+	if fnd := curveOutcome(wattVarBinding(), obs); fnd.Verdict != certify.Pass {
 		t.Fatalf("the curve outcome on an adopting DER = %s: %s", fnd.Verdict, fnd.Observed)
 	}
 }
@@ -197,7 +146,7 @@ func TestWattVar_GoesGreenWhenTheDERAdoptsTheCurve(t *testing.T) {
 func TestWattVar_IsRedAgainstADERThatIgnoresTheAxis(t *testing.T) {
 	f := newCurveFixture(t)
 	d := f.withGridSim(t)
-	spec := inverterControlSpec(curveMode("opModWattVar", wattVarStagedBinding()),
+	spec := inverterControlSpec(curveMode("opModWattVar", wattVarBinding()),
 		"a Watt-Var curve", "CERT-WATTVAR")
 
 	ctx := context.Background()
@@ -210,7 +159,7 @@ func TestWattVar_IsRedAgainstADERThatIgnoresTheAxis(t *testing.T) {
 		t.Fatalf("watt-var PostWait: %v", err)
 	}
 	obs := &Observation{Params: params}
-	if fnd := curveOutcome(wattVarStagedBinding(), obs); fnd.Verdict == certify.Pass {
+	if fnd := curveOutcome(wattVarBinding(), obs); fnd.Verdict == certify.Pass {
 		t.Fatalf("the curve outcome PASSED against a DER that never adopted the curve: %s", fnd.Observed)
 	}
 }

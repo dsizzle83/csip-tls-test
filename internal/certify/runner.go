@@ -494,7 +494,7 @@ func (v VerdictCounts) Total() int { return v.Pass + v.Fail + v.Skip + v.Warn }
 // are grouped for reporting.
 func (r *RunReport) CountsByClaim() (applicable, informative VerdictCounts) {
 	for _, c := range r.Cases {
-		if c.Case != nil && c.Case.Applicable {
+		if c.Case.BearsOnClaim() {
 			applicable.add(c.Verdict)
 		} else {
 			informative.add(c.Verdict)
@@ -512,11 +512,27 @@ func (r *RunReport) Unaddressed() []CoverageEntry {
 	return out
 }
 
-// OK reports a clean run: every applicable selected case addressed, no FAIL,
-// no orphaned registration, no capture-integrity problem.
+// OK reports a clean run: every applicable selected case addressed, no FAIL
+// THAT BEARS ON THE CLAIM, no orphaned registration, no capture-integrity
+// problem. It is the zero-FAIL exit criterion, and the process exit code.
+//
+// It counts the CLAIM-BEARING failures, not every failure, and that distinction
+// is deliberate. A row the catalog marks non-certifiable measures behaviour no
+// published procedure covers (see Case.Certifiable): its verdict is evidence
+// about the product and cannot be a conformance result, so letting it turn a
+// campaign red would make an exit criterion stated over a specification depend
+// on a row that specification does not contain. Bundle.OK's doc names this a
+// policy call for the owner of the claim; this is that call, made narrowly —
+// only non-certifiable rows are excluded, and their FAILs stay fully visible in
+// Counts(), in the informative half of CountsByClaim, in the console summary and
+// in the bundle.
+//
+// An INAPPLICABLE-but-certifiable row (an aggregator procedure under a
+// DER-Client claim) is excluded by the same reading, which is the behaviour the
+// claim split was introduced for.
 func (r *RunReport) OK() bool {
-	_, fail, _, _ := r.Counts()
-	return fail == 0 && r.Coverage.Complete() && len(r.CaptureProblems) == 0
+	app, _ := r.CountsByClaim()
+	return app.Fail == 0 && r.Coverage.Complete() && len(r.CaptureProblems) == 0
 }
 
 // Runner executes a run.
@@ -1362,6 +1378,9 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 			Title:      c.Case.Title,
 			Verdict:    c.Verdict,
 			Applicable: c.Case.Applicable,
+			// Written only when the case is NON-certifiable, so a bundle from a
+			// campaign of published procedures is byte-identical to before.
+			NonCertifiable: c.Case.Certifiable != nil && !*c.Case.Certifiable,
 			Notes:      caseNotes(c),
 			Assertions: c.Assertions,
 		})

@@ -150,8 +150,17 @@ type TestCaseResult struct {
 	// and the headline tally — can separate a FAIL that bears on the claim from
 	// one that is merely informative. It is always emitted (no omitempty): a
 	// false is a fact about the row, not an absent one.
-	Applicable bool        `json:"applicable"`
-	Notes      string      `json:"notes,omitempty"`
+	Applicable bool `json:"applicable"`
+	// Certifiable records whether ANY published procedure covers this case. It
+	// is a fact about the SPECIFICATION, where Applicable is a fact about the
+	// product: a case can apply to the product and be covered by nothing, which
+	// is what a local-extension row is. Absent in a bundle written before this
+	// field existed, which decodes to false — so it is written only when the
+	// case is NON-certifiable, and read through BearsOnClaim below, which
+	// treats an absent marker as "certifiable" and therefore leaves every older
+	// bundle's meaning unchanged.
+	NonCertifiable bool   `json:"non_certifiable,omitempty"`
+	Notes          string `json:"notes,omitempty"`
 	Assertions []Assertion `json:"assertions"`
 }
 
@@ -286,15 +295,23 @@ func (b *Bundle) Counts() (pass, fail, skip, warn int) {
 	return
 }
 
-// OK reports whether the run is a clean pass: at least one case, and no FAIL.
+// OK reports whether the run is a clean pass: at least one case, and no FAIL
+// THAT BEARS ON THE CLAIM.
 //
-// It deliberately aggregates EVERY failure, informative rows included. Whether
-// an informative FAIL should stop a run being called clean is a policy call for
-// the owner of the claim; grouping it separately in the report — see
-// CountsByClaim — is a reporting question and is answered there.
+// It used to aggregate EVERY failure, saying that whether an informative FAIL
+// should stop a run being called clean was "a policy call for the owner of the
+// claim". THAT CALL HAS BEEN MADE, and narrowly: a row the catalog marks
+// non-certifiable measures behaviour no published procedure covers, so its
+// verdict cannot be a conformance result and must not decide whether a campaign
+// was clean. Every failure remains in Counts() and in the informative half of
+// CountsByClaim, and REPORT.md prints both — nothing is hidden, only
+// re-attributed.
+//
+// certify.RunReport.OK applies the identical rule, so the live run and the
+// bundle written from it cannot disagree.
 func (b *Bundle) OK() bool {
-	_, fail, _, _ := b.Counts()
-	return len(b.Cases) > 0 && fail == 0
+	app, _ := b.CountsByClaim()
+	return len(b.Cases) > 0 && app.Fail == 0
 }
 
 // VerdictCounts is a per-verdict tally of test cases.
@@ -334,7 +351,7 @@ func (v VerdictCounts) Total() int { return v.Pass + v.Fail + v.Skip + v.Warn }
 // No verdict changes here. This is the grouping, and only the grouping.
 func (b *Bundle) CountsByClaim() (applicable, informative VerdictCounts) {
 	for _, c := range b.Cases {
-		if c.Applicable {
+		if c.BearsOnClaim() {
 			applicable.add(c.Verdict)
 		} else {
 			informative.add(c.Verdict)
@@ -342,6 +359,13 @@ func (b *Bundle) CountsByClaim() (applicable, informative VerdictCounts) {
 	}
 	return
 }
+
+// BearsOnClaim reports whether this case's verdict can count toward a
+// certification claim: it must apply to the product AND be covered by some
+// published procedure. It mirrors certify.Case.BearsOnClaim, which is what the
+// runner grades with, so the bundle and the run cannot disagree about which
+// failures were certification failures.
+func (c TestCaseResult) BearsOnClaim() bool { return c.Applicable && !c.NonCertifiable }
 
 // ByteSource is the part of a reassembled TCP direction an assertion needs.
 // internal/evidence/netdis.StreamBytes satisfies it; declaring it as an

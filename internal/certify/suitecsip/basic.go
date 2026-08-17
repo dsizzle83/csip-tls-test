@@ -694,9 +694,24 @@ func withOracle(m controlMode, judge func(hundredths int64) func(ctx context.Con
 }
 
 // basicInverterControl builds one of the BASIC-004..015 rows.
-func basicInverterControl(m controlMode, subject string) certify.Check {
+// basicInverterControl builds one of the BASIC-004..015 rows' certify.Check.
+//
+// THE mRID CARRIES THE PER-RUN NONCE, for the same reason CORE-022/023's do
+// (core.go's coreResponsesSpec): lexa-gw's Response tracker dedupes Received(1)
+// on the bare mRID string, and it retains that record for the process's whole
+// lifetime AND persists it to disk. A row whose control is always
+// "CERT-BASIC-008" therefore earns its status=1 Response exactly ONCE per DUT,
+// ever — so the second campaign against a long-lived gateway would see no fresh
+// receipt and the Response criteria would FAIL on the harness's own reuse of an
+// identifier rather than on anything the DUT did.
+//
+// The curve rows are already immune (gridsim mints them an epoch-stamped mRID
+// per publish and ignores the one offered), but they take the nonce anyway: a
+// row whose identity depends on which publisher happened to run is a row nobody
+// can reason about from its registration.
+func basicInverterControl(m controlMode, subject, nonce string) certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-		mrid := "CERT-" + strings.ToUpper(rc.Case.ID)
+		mrid := withRunNonce("CERT-"+strings.ToUpper(rc.Case.ID), nonce)
 		return run(ctx, rc, inverterControlSpec(m, subject, mrid))
 	}
 }
@@ -707,6 +722,18 @@ func basicInverterControl(m controlMode, subject string) certify.Check {
 // gridsimDriver pattern) without booting the whole certify.Check machinery,
 // which needs a live capture window run() cannot fake.
 func inverterControlSpec(m controlMode, subject, mrid string) spec {
+	// publishedMRID is the mRID the control REALLY went out under, which for a
+	// curve row is the one gridsim minted rather than the synthetic one above
+	// (publishCurveControl overwrites params["mrid"]). Setup fills it; the Want
+	// predicate below reads it.
+	//
+	// A captured variable rather than a params lookup because spec.Want is handed
+	// only the baseline ServerView, not the params map — and run() builds the
+	// predicate strictly AFTER Setup has returned (check.go: Setup at 504,
+	// specWant at 528), so by the time it is read it is always set. This is the
+	// same within-one-invocation sharing critResponseStarted uses for its
+	// notRequested reason.
+	var publishedMRID string
 	s := spec{
 		Notes: func(o *Observation) string {
 			m := m.forObservation(o)
@@ -767,6 +794,17 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				// head end, and what it did to the device.
 				crits = append(crits, critRefusalAnswered(o.Param("mrid")),
 					critRefusedAxisNoSouthboundTrace(m.Refusal, o))
+				// The RECEIPT half, which critRefusalAnswered does not cover: it
+				// requires a refusal STATUS to be present, and is satisfied by a
+				// DUT that answers the refusal without ever acknowledging the
+				// message. The RC0 battery's FINDING 6 is exactly that shape —
+				// "a refused control is refused SILENTLY: opModTargetW touched
+				// no register and no Response was ever posted to the head end".
+				//
+				// Started(2) is deliberately NOT asserted here: critRefusalAnswered
+				// requires it to be ABSENT, and a row claiming both would be
+				// unpassable either way.
+				crits = append(crits, critResponsePosted(1, "Event received", o.Param("mrid")))
 			case m.Curve != nil:
 				crits = append(crits, critCurvePublishedTheProcedureValues(subject, m.Curve),
 					critDERCurveResolvable(curveHrefOf(o)),
@@ -795,6 +833,38 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				crits = append(crits, critDEREffectViaDirectOracle(subject, m.Direct, o))
 			default:
 				crits = append(crits, critDEREffectUnobservable(subject))
+			}
+			// ── The northbound lifecycle, on every row that PUT A CONTROL ON
+			// THE WIRE and expects it to execute.
+			//
+			// Until this landed, every execution row in this family graded
+			// SOUTHBOUND REGISTERS AND NOTHING ELSE. A DUT that adopted each
+			// curve perfectly and told the head end nothing passed them all,
+			// while the campaign's Started(2) wire citations — the CORE-022/023
+			// precedent — had no automated criterion on this family at all.
+			//
+			// The refusal branch above adds its own receipt half and must not
+			// get Started(2); the unauthorable branch published nothing, so
+			// there is no question for the DUT to have answered. Both are
+			// excluded here rather than inside the criteria, because "no control
+			// was sent" and "a control was sent and not answered" are different
+			// findings and only the second is the DUT's.
+			//
+			// Keyed to o.Param("mrid"), which for a curve row is the mRID
+			// GRIDSIM MINTED (publishCurveControl overwrites the row's synthetic
+			// one) — the same key critDERControlCarriesModeFrom already matches
+			// on, and the only one a Response's <subject> can carry.
+			//
+			// critResponseStarted grades against the control's OWN wire
+			// responseRequired, so it reports "not requested" rather than FAIL
+			// when the bench did not ask. That path is no longer the normal one
+			// for curve rows: POST /admin/curve used to build its control with
+			// no responseRequired at all, and now carries the same default
+			// POST /admin/control does.
+			if m.Unreachable == "" && m.Refusal == nil && m.publishable() {
+				crits = append(crits,
+					critResponsePosted(1, "Event received", o.Param("mrid")),
+					critResponseStarted(o.Param("mrid")))
 			}
 			return crits
 		},
@@ -828,20 +898,57 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			if m.Curve != nil {
 				d.disclosure = openDisclosureWindow(ctx, d.rc, params, disclosureKindFor(m.Curve), mrid)
 			}
+			var err error
 			switch {
 			case m.Curve != nil:
-				return curveSetup(ctx, d, params, m.Curve, mrid)
+				err = curveSetup(ctx, d, params, m.Curve, mrid)
 			case m.Refusal != nil:
-				return refusalSetup(ctx, d, params, m.Refusal, mrid)
+				err = refusalSetup(ctx, d, params, m.Refusal, mrid)
 			case m.Oracle != nil:
-				return oracledSetup(ctx, d, params, m.Oracle, mrid)
+				err = oracledSetup(ctx, d, params, m.Oracle, mrid)
 			case m.Direct != nil:
 				// Baseline first, then the row's ORDINARY publisher: a
 				// structured-content row sends exactly what it always sent,
 				// and only what it MEASURES has changed. See directSetup.
-				return directSetup(ctx, d, params, m.Direct, m.Publish, mrid)
+				err = directSetup(ctx, d, params, m.Direct, m.Publish, mrid)
 			default:
-				return m.Publish(ctx, d, mrid)
+				err = m.Publish(ctx, d, mrid)
+			}
+			// AFTER the publisher, because a curve publisher replaces this with
+			// the server's minted mRID and the Want predicate must wait on the
+			// identifier the DUT will actually put in <subject>.
+			publishedMRID = params["mrid"]
+			return err
+		}
+		// Wait for the DUT to ANSWER, not merely to walk.
+		//
+		// Without this the row takes the AwaitWalk path, which is satisfied by
+		// one GET /dcap after baseline — often within seconds, and always long
+		// before a control published at StartOffset 30 has even begun. The
+		// Response criteria below would then be grading a window that
+		// structurally could not contain their evidence, which is a FAIL
+		// belonging to the harness and not to the DUT. WantResponseAtLeast's own
+		// doc is about exactly this bug, and CORE-022/023 already wait this way.
+		//
+		// Refusal rows want the RECEIPT only (a refusal must never report
+		// started), so they wait for status>=1; execution rows wait for the
+		// started signal their criteria assert.
+		//
+		// THE WAIT IS STILL BOUNDED by -param csip.wait and waitCap, so a DUT
+		// that never answers ends the window on the timeout and the criteria
+		// FAIL on the evidence — honestly, and without hanging. Rows that need
+		// a longer budget than the default can now be given one WITHOUT paying
+		// for it on all seventy-nine cases: -param BASIC-006:csip.wait=8m.
+		if m.publishable() && m.Unreachable == "" {
+			wantStatus := uint8(2)
+			if m.Refusal != nil {
+				wantStatus = 1
+			}
+			s.Want = func(base ServerView) func(ServerView) bool {
+				if publishedMRID == "" {
+					return nil // nothing was published; fall back to AwaitWalk
+				}
+				return base.WantResponseAtLeast(publishedMRID, wantStatus)
 			}
 		}
 		// PostWait, NOT Setup, is where the independent southbound oracle

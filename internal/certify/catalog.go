@@ -105,6 +105,22 @@ type ProfileConformance struct {
 	MatrixRowFor                string `json:"matrix_row_for"`
 }
 
+// BearsOnClaim reports whether a verdict on this case can count toward a
+// certification claim. It is the ONE definition; every tally that separates
+// claim-bearing rows from informative ones reads it rather than testing the
+// fields itself, so the several places that would otherwise have to agree
+// cannot drift apart.
+//
+// A case bears on the claim when it is applicable to the product AND some
+// published procedure covers it. Either being false makes the row informative:
+// run, reported, bundled and verified, but never counted in an applicable FAIL.
+func (c *Case) BearsOnClaim() bool {
+	if c == nil {
+		return false
+	}
+	return c.Applicable && (c.Certifiable == nil || *c.Certifiable)
+}
+
 // Erratum is one published correction to a procedure. A check MUST honour the
 // errata for the case it implements — running the uncorrected step and calling
 // the result a conformance failure would be our bug, not the DUT's.
@@ -161,6 +177,33 @@ type Case struct {
 	// the reader exactly what was excluded and why.
 	Applicable          bool   `json:"applicable"`
 	ApplicabilityReason string `json:"applicability_reason"`
+	// Certifiable records whether a verdict on this case can bear on a
+	// CERTIFICATION CLAIM at all. Absent (nil) means yes, which is what every
+	// case extracted from a published procedure document is.
+	//
+	// IT IS A STATEMENT ABOUT THE SPECIFICATION, NOT ABOUT THE PRODUCT, and
+	// that is what distinguishes it from Applicable. Applicable=false says the
+	// case does not apply to THIS product (an aggregator-profile row under a
+	// DER-Client claim). Certifiable=false says NO PUBLISHED PROCEDURE COVERS
+	// THIS CASE — the bench measures it because the behaviour matters, and
+	// there is no standard for its verdict to be a result OF.
+	//
+	// A case may be applicable and non-certifiable at once: the axis genuinely
+	// applies to the product, and no document prescribes how to test it.
+	//
+	// The runner and the bundle both keep such a case's verdict OUT of the
+	// applicable-FAIL tallies and out of the zero-FAIL exit criterion (see
+	// RunReport.OK, Bundle.OK, CountsByClaim). Its evidence is captured,
+	// bundled and re-verified exactly like any other case's — verification is
+	// claim-blind by design, and a row nobody certifies is still a row whose
+	// citations must hold up.
+	//
+	// The precedent is report.NoCertificationBasis, which says the same thing
+	// one layer out for whole documents SunSpec issues no certificate against
+	// (the v0.8 TEST-status Secure SunSpec Modbus specification among them).
+	// This field carries that posture down to the run's own exit criteria,
+	// which NoCertificationBasis never reached.
+	Certifiable *bool `json:"certifiable,omitempty"`
 	// Automatable is validated on load, so a check can switch on it without
 	// worrying about a fourth spelling appearing.
 	Automatable Automatable `json:"automatable"`

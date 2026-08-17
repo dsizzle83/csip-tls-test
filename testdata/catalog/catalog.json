@@ -18408,5 +18408,47 @@
    "SSM-CONF-v0.8-shard-2.json"
   ],
   "page_boundary_merged": false
+ },
+ {
+  "uid": "local-ext-v1::EXT-001",
+  "id": "EXT-001",
+  "doc": "LOCAL-EXT-v1",
+  "doc_version": "v1 (local extension family; not a published specification)",
+  "section": "1.1 EXT-001 - opModWattVar curve execution (under 1 Local product-evidence extensions)",
+  "title": "EXT-001 - opModWattVar curve execution against SunSpec model 712",
+  "purpose": "Measures that a DERControl carrying an opModWattVar DERCurveLink is executed by the DUT onto SunSpec model 712 (DER Watt-Var), and that the DUT reports the control's lifecycle northbound. The axis is routed end to end by the product and nothing in the certifiable catalog exercises it: CSIP-CONF-v1.3's BASIC family stops at BASIC-015, and BASIC-015 measures model 712 only as an ABSENCE (it is a refusal row asserting that opModWattPF never reaches that bank). This row is the positive half of that distinction.",
+  "applies_to": "client",
+  "dut_role": "csip-client",
+  "applicable": true,
+  "applicability_reason": "The axis applies to this product — it is a DER client that routes opModWattVar to model 712. What does not apply is any certification: see certifiable=false and the notes.",
+  "certifiable": false,
+  "automatable": "full",
+  "evidence": "the served DERControl carrying <opModWattVar href=...> and the DERCurve it resolves to (curveType 14, IEEE Std 2030.5-2018 p.254); the DUT's model 712 curve bank read back over Modbus; and the DERControlResponse POSTs the DUT made for the control's own mRID",
+  "preconditions": [
+   "The DUT is adopted against a 7xx-generation DER serving SunSpec model 712.",
+   "gridsim is reachable on its admin API so the row can publish a watt_var curve."
+  ],
+  "steps": [
+   "Publish a DERControl carrying an opModWattVar DERCurveLink whose DERCurve holds the breakpoints below.",
+   "Wait for the DUT to fetch the control and act on it.",
+   "Read model 712's live curve bank back from the DER.",
+   "Read the DERControlResponse POSTs the DUT made for this control."
+  ],
+  "expected": [
+   "The DUT writes the published breakpoints into model 712's live curve, under the DeptRef the row's yRefType names.",
+   "The DUT POSTs a DERControlResponse with status=1 (Event received) for this control.",
+   "The DUT POSTs a DERControlResponse with status=2 (Event started) for this control."
+  ],
+  "observables": [
+   "GET /derp/0/derc returning a DERControl whose DERControlBase carries <opModWattVar href=\"/derp/0/dc/0\">",
+   "GET /derp/0/dc/0 returning a DERCurve with <curveType>14</curveType>",
+   "model 712 live curve registers holding the published (W, Var) breakpoints",
+   "POST of a DERControlResponse with <status>1</status> for this control's mRID",
+   "POST of a DERControlResponse with <status>2</status> for this control's mRID"
+  ],
+  "requirement_refs": [],
+  "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 procedure covers this axis; this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim.",
+  "source_shards": [],
+  "page_boundary_merged": false
  }
 ]

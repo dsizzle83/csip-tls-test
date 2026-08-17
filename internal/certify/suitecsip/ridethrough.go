@@ -1202,9 +1202,10 @@ type rideThroughRow struct {
 // rather than adding a fifth field to a file this change does not own. Every
 // criterion and every live-phase helper it uses is the shared one; what is
 // local is the assembly.
-func basicRideThrough(r rideThroughRow) certify.Check {
+func basicRideThrough(r rideThroughRow, nonce string) certify.Check {
 	return func(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-		mrid := "CERT-" + strings.ToUpper(rc.Case.ID)
+		// Nonced for the same reason basicInverterControl's is — see its doc.
+		mrid := withRunNonce("CERT-"+strings.ToUpper(rc.Case.ID), nonce)
 		return run(ctx, rc, rideThroughSpec(r.binding, r.subject, mrid))
 	}
 }
@@ -1245,6 +1246,19 @@ func rideThroughSpec(b *tripBinding, subject, mrid string) spec {
 				critDEREffectViaTripOracle(subject, b, o),
 				critProtectiveBoundaryHeld(o),
 				critProtectiveBoundaryStructure())
+			// The northbound lifecycle, for the same reason the other execution
+			// rows carry it (basic.go's inverterControlSpec): a ride-through row
+			// graded the four curves southbound and asserted NOTHING about
+			// whether the DUT ever told the head end it had received or started
+			// the control carrying them.
+			//
+			// This row publishes through publishTripControl, which posts to
+			// gridsim's /admin/curve — the same path whose control now carries
+			// responseRequired, so the Started(2) claim grades a question that
+			// was actually put rather than reporting "not requested".
+			crits = append(crits,
+				critResponsePosted(1, "Event received", o.Param("mrid")),
+				critResponseStarted(o.Param("mrid")))
 			return crits
 		},
 		// A MEASURED row's verdict does not depend on the capture (IW14-003 —
@@ -1370,9 +1384,9 @@ type rideThroughRegistration struct {
 }
 
 // registerRideThroughControls binds BASIC-004 and BASIC-005.
-func registerRideThroughControls(reg *certify.Registry) {
+func registerRideThroughControls(reg *certify.Registry, nonce string) {
 	for _, r := range rideThroughRows() {
-		reg.Register(uid(r.id), Suite, basicRideThrough(r.row),
+		reg.Register(uid(r.id), Suite, basicRideThrough(r.row, nonce),
 			certify.WithRequires(needGridSim...), certify.WithOrder(r.order))
 	}
 }

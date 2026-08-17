@@ -334,6 +334,18 @@ const Suite = "csip"
 // uid builds a catalog uid for this document.
 func uid(id string) string { return "csip-conf-v1.3::" + id }
 
+// extUID addresses the LOCAL EXTENSION family: rows this bench measures because
+// the behaviour matters, for which NO PUBLISHED PROCEDURE EXISTS.
+//
+// It is a separate document key rather than an invented CSIP-CONF id, and that
+// is the whole point. A row filed under csip-conf-v1.3 claims to be a procedure
+// of a published specification; these are not, their Test Values are the
+// harness's own, and the catalog marks them certifiable=false so no tally that
+// bears on a certification claim can ever count one. See the family's own
+// catalog record (LOCAL-EXT-v1) for the posture, stated where a reader of a
+// bundle will meet it.
+func extUID(id string) string { return "local-ext-v1::" + id }
+
 // needs are the capability tags a row's check requires. Everything in this
 // suite needs the bench and a capture; the rows that create their precondition
 // through the simulator also need gridsim.
@@ -426,7 +438,8 @@ func Register(reg *certify.Registry) {
 		certify.WithRequires(needGridSim...), certify.WithOrder(40))
 	reg.Register(uid("CORE-013"), Suite, coreAdvancedDERProgram,
 		certify.WithRequires(needGridSim...), certify.WithOrder(41))
-	registerInverterControls(reg)
+	registerInverterControls(reg, nonce)
+	registerLocalExtensions(reg, nonce)
 
 	// ── Event precedence scenarios (order 80–99) ─────────────────────────
 	registerEventScenarios(reg, nonce)
@@ -600,12 +613,12 @@ type inverterControlRow struct {
 // has no field that can carry a list. They are registered from HERE, in the
 // same call, so a reader looking for where the twelve rows are bound finds all
 // twelve in one place.
-func registerInverterControls(reg *certify.Registry) {
+func registerInverterControls(reg *certify.Registry, nonce string) {
 	for _, r := range inverterControlRows() {
-		reg.Register(uid(r.id), Suite, basicInverterControl(r.mode, r.subject),
+		reg.Register(uid(r.id), Suite, basicInverterControl(r.mode, r.subject, nonce),
 			certify.WithRequires(requiresFor(r.mode)...), certify.WithOrder(r.order))
 	}
-	registerRideThroughControls(reg)
+	registerRideThroughControls(reg, nonce)
 }
 
 // inverterControlRows is the twelve rows' one definition, factored out of the

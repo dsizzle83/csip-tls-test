@@ -225,6 +225,37 @@ not evidence** and must not be submitted.
 | `-require-coverage` | fail the run if an applicable case has no implementation |
 | `-operator` `-note` `-dut-*` | recorded in the bundle |
 
+### Local extensions — coverage without a conformance claim
+
+Some behaviour matters and no published procedure covers it. Those rows live in
+the **`LOCAL-EXT-v1`** family (uids `local-ext-v1::EXT-nnn`), and the family is a
+posture, not a loophole:
+
+- they **run** in the ordinary campaign, and their evidence lands in the bundle;
+- `certify -verify` re-derives their citations from the capture exactly as it
+  does for a conformance row — a row nobody certifies is still a row whose
+  citations must hold up;
+- their verdicts are **excluded from every applicable-FAIL tally and from the
+  clean-run criterion**, so an extension FAIL can never turn a campaign red or
+  change the process exit code;
+- the failure stays fully visible: `Counts()` still reports it, the console and
+  `REPORT.md` print it in the *informative* half, and the bundle row is tagged
+  `local-ext`;
+- they earn **no `Test <ID>` row** in any submitted Summary Test Results
+  (`report.NoCertificationBasis`), because there is no certification for them to
+  be a result of.
+
+The exclusion is carried by the catalog record's `certifiable: false`, read
+through `Case.BearsOnClaim()` — not by any code that inspects a uid prefix. A row
+cannot opt *itself* out of a claim it was registered under, and a reader meets
+the posture in the case's own record.
+
+`certify -list` names the non-certifiable families under the document table.
+
+This is the same posture the campaign already carried for the v0.8 TEST-status
+Secure SunSpec Modbus specification, taken one step further: that document at
+least *is* a specification.
+
 ### Per-case parameters
 
 `-param <case>:<key>=<value>` applies a parameter to **one case only**; the

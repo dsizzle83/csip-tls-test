@@ -181,7 +181,15 @@ func (b *Bundle) Report() string {
 		// An informative row says so on its own heading, not only in a column
 		// forty lines up. A reader who lands here from a search for "FAIL"
 		// must not have to reconstruct whether anyone is certifying against it.
-		if !c.Applicable {
+		switch {
+		case c.NonCertifiable:
+			fmt.Fprintf(&sb, "**LOCAL EXTENSION — certifiable under no standard.** No published procedure "+
+				"covers this case: its Test Values are the harness's own and its verdict is supplementary "+
+				"PRODUCT EVIDENCE, not a conformance result. It is run, bundled and re-verified like any "+
+				"other row, and it is excluded from every applicable-FAIL tally and from the clean-run "+
+				"criterion. A FAIL here is a finding about the implementation; it is not a certification "+
+				"failure.\n\n")
+		case !c.Applicable:
 			fmt.Fprintf(&sb, "**Informative row — NOT applicable to the certification claim.** The catalog "+
 				"marks this case out of scope for the claimed profile; it is run and reported because its "+
 				"verdict is evidence about the implementation, but it does not bear on the claim.\n\n")
@@ -230,9 +238,18 @@ func (b *Bundle) Report() string {
 // informativeTag marks a row nobody is certifying against, in the index table.
 const informativeTag = "info"
 
+// localExtTag marks a row no published procedure covers, in the index table. It
+// is distinct from informativeTag because the two mean different things: "info"
+// is a real procedure that does not apply to this product, "local-ext" is a
+// measurement no procedure exists for at all.
+const localExtTag = "local-ext"
+
 // claimTag renders one case's bearing on the certification claim.
 func claimTag(c TestCaseResult) string {
-	if c.Applicable {
+	switch {
+	case c.NonCertifiable:
+		return localExtTag
+	case c.Applicable:
 		return "yes"
 	}
 	return informativeTag

@@ -73,6 +73,15 @@ func (c *cli) runList(stdout, stderr io.Writer) int {
 		"TOTAL", "", total, applicable, implemented, missing, naTotal)
 	fmt.Fprintf(stdout, "SEL selected · APPL applicable to this product · IMPL has a check · "+
 		"GAP applicable with none · N/A inapplicable, no check\n")
+	// Name the non-certifiable families explicitly. APPL says a case applies to
+	// THIS PRODUCT, which a local-extension row does — so a reader scanning this
+	// table would otherwise reasonably read its APPL count as claim-bearing,
+	// which is exactly what it is not.
+	if ext := nonCertifiableDocs(cat); len(ext) > 0 {
+		fmt.Fprintf(stdout, "NOT CERTIFIABLE: %s — no published procedure covers these rows. They run and "+
+			"are bundled as product evidence; their verdicts are excluded from every applicable-FAIL "+
+			"tally and from the clean-run criterion.\n", strings.Join(ext, ", "))
+	}
 	// The three columns do not add up, and the reason is a deliberate
 	// engineering choice rather than an arithmetic slip: a case the extraction
 	// marked inapplicable may STILL carry a check, when exercising the row is
@@ -283,4 +292,19 @@ func firstSentence(s string) string {
 		return s[:i+1]
 	}
 	return s
+}
+
+// nonCertifiableDocs names the documents whose cases the catalog marks as
+// covered by no published procedure, in catalog order and without repeats.
+func nonCertifiableDocs(cat *certify.Catalog) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, c := range cat.All() {
+		if c.Certifiable == nil || *c.Certifiable || seen[c.Doc] {
+			continue
+		}
+		seen[c.Doc] = true
+		out = append(out, c.Doc)
+	}
+	return out
 }

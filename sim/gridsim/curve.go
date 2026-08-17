@@ -100,6 +100,16 @@ type adminCurveEntry struct {
 // adminCurveReq is the JSON body for POST /admin/curve.
 type adminCurveReq struct {
 	Program int `json:"program"`
+	// ResponseRequired overrides the responseRequired bitmap this control
+	// carries. Nil takes adminDefaultResponseRequired — the same default
+	// POST /admin/control applies — so a curve control ASKS the DUT for the
+	// Response lifecycle exactly as a scalar one does.
+	//
+	// It exists for the same one reason /admin/control's does: a scenario
+	// proving the DUT correctly WITHHOLDS a Response nobody asked for has to be
+	// able to ask for nothing (0), and 0 is a request for nothing, which is a
+	// different document from the attribute being absent.
+	ResponseRequired *uint8 `json:"response_required,omitempty"`
 	// Curves publishes SEVERAL curves on ONE control. Mutually exclusive with
 	// the single-curve fields below — see entries() for the refusal and the
 	// file doc for why a procedure needs it.
@@ -826,11 +836,27 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 			Value:   model.SignedPerCent{Value: int16(math.Round(*req.FixedVarPct))},
 		}
 	}
+	// The RespondableResource attributes, which this path used to omit entirely.
+	//
+	// A curve-bound control is a DERControl like any other and the DUT must
+	// answer it — but IEEE 2030.5 does not have a client volunteer a Response
+	// nobody asked for, so without these a spec-honest DUT answering with
+	// SILENCE is correct, and any criterion grading the Response lifecycle on a
+	// curve row would be grading the bench's own omission. That is the same
+	// false reading toExtendedControl's doc records for the scalar-onto-widened
+	// -program path; this path had the identical hole, and nothing caught it
+	// because no curve row graded Responses until now.
+	responseRequired := model.ResponseRequired(adminDefaultResponseRequired)
+	if req.ResponseRequired != nil {
+		responseRequired = model.ResponseRequired(*req.ResponseRequired)
+	}
 	ctrl := model.ExtendedDERControl{
-		Resource:     model.Resource{Href: fmt.Sprintf("/derp/%d/derc/curve", req.Program)},
-		MRID:         fmt.Sprintf("DERC-%s-CURVE-%d", progPrefixes[req.Program], now),
-		Description:  req.Description,
-		CreationTime: now,
+		Resource:         model.Resource{Href: fmt.Sprintf("/derp/%d/derc/curve", req.Program)},
+		ReplyTo:          adminResponseReplyTo,
+		ResponseRequired: &responseRequired,
+		MRID:             fmt.Sprintf("DERC-%s-CURVE-%d", progPrefixes[req.Program], now),
+		Description:      req.Description,
+		CreationTime:     now,
 		EventStatus: &model.EventStatus{
 			CurrentStatus: status,
 			DateTime:      now,
