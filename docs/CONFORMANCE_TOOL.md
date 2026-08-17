@@ -212,11 +212,43 @@ not evidence** and must not be submitted.
 | `-no-capture` | logic-only run; no wire citation is then possible |
 | `-capture-settle` | pause before stopping the capture so it flushes (default 750 ms — see §5) |
 | `-guard` | frame-attribution guard at each end of a check's window |
-| `-param k=v` | procedure parameters, e.g. `-param modbus.transport=plain`, `-param pics.mn="Acme"` |
+| `-param k=v` | procedure parameters, e.g. `-param modbus.transport=plain`, `-param pics.mn="Acme"`. Scope one to a single case with `-param <case>:<k>=<v>` — see below |
 | `-cap TAG` | assert a capability the runner cannot detect (e.g. `root`) |
 | `-timeout` | per-check timeout (default 3 m) |
 | `-require-coverage` | fail the run if an applicable case has no implementation |
 | `-operator` `-note` `-dut-*` | recorded in the bundle |
+
+### Per-case parameters
+
+`-param <case>:<key>=<value>` applies a parameter to **one case only**; the
+unscoped form is the default for every other case. `<case>` is the globally
+unique uid or the bare in-document id — the same two spellings `-uid` accepts.
+
+```sh
+# The three cases that need a long wait get one; the other 76 do not pay for it.
+certify -suite csip -param csip.wait=30s \
+        -param BASIC-029:csip.wait=8m \
+        -param CORE-022:csip.wait=8m \
+        -param CORE-023:csip.wait=8m
+```
+
+This exists because a global `csip.wait` is one case's budget charged to every
+case: the RC0 §9.5 battery recorded that setting it globally "turned a 2 h
+campaign into 25 h", and the alternative — separate single-`-uid` invocations —
+produces separate bundles and separate captures for a row whose criterion is
+stated over one suite run. That battery therefore ran `BASIC-029`, `CORE-022`
+and `CORE-023` without the parameter and noted that "neither verdict is the
+certifiable one".
+
+Two rules worth knowing:
+
+- a scope **wins even when its value is empty**, which is how a parameter is
+  turned off for one case (checks that require a parameter treat empty as
+  absent);
+- a scope naming a case the catalog does not have is **refused before the run
+  starts**, like a bad `-doc`, `-uid` or `-suite`. A typo would otherwise leave
+  the case on the global value while the bundle recorded a verdict the operator
+  believed was measured under another.
 
 ### Exit status
 

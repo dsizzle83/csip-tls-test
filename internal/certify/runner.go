@@ -227,6 +227,53 @@ func (k keyValue) Set(v string) error {
 	return nil
 }
 
+// validateParamScopes refuses a per-case -param whose scope names no case in
+// the catalog.
+//
+// A key is SCOPED when it contains a colon, and the scope is everything before
+// the LAST one — which is what makes both spellings work, since a globally
+// unique uid contains a "::" of its own ("csip-conf-v1.3::BASIC-029:csip.wait"
+// scopes csip.wait to that case). No parameter name in the vocabulary contains
+// a colon, so nothing unscoped is caught by that rule; a key that does contain
+// one and resolves to no case is a typo, not a global, and is refused rather
+// than silently treated as either.
+func validateParamScopes(cat *Catalog, params map[string]string) error {
+	var bad []string
+	for key := range params {
+		i := strings.LastIndex(key, ":")
+		if i < 0 {
+			continue // unscoped: an ordinary global parameter
+		}
+		scope, name := key[:i], key[i+1:]
+		if scope == "" || name == "" {
+			bad = append(bad, key)
+			continue
+		}
+		if !catalogHasCase(cat, scope) {
+			bad = append(bad, key)
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	sort.Strings(bad)
+	return fmt.Errorf("certify: -param %s is scoped to a case this catalog does not have "+
+		"(the scope is everything before the last colon, and must be a case uid or its bare "+
+		"in-document id, e.g. -param BASIC-029:csip.wait=8m)", strings.Join(bad, ", "))
+}
+
+// catalogHasCase reports whether name identifies a case by uid or by bare
+// in-document id, matched fold-insensitively — the same two spellings and the
+// same case-insensitivity Filter.Matches accepts for -uid.
+func catalogHasCase(cat *Catalog, name string) bool {
+	for _, c := range cat.All() {
+		if strings.EqualFold(c.UID, name) || strings.EqualFold(c.ID, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // BindFlags registers the runner's command-line surface. A suite binary calls
 // it, parses, and hands the Options to New.
 func (o *Options) BindFlags(fs *flag.FlagSet) {
@@ -501,6 +548,14 @@ func New(reg *Registry, cat *Catalog, opts Options) (*Runner, error) {
 	if unknown := unknownSuites(reg, opts.Suites); len(unknown) > 0 {
 		return nil, fmt.Errorf("certify: no suite named %s (have: %s)",
 			strings.Join(unknown, ", "), strings.Join(reg.Suites(), ", "))
+	}
+	// A -param scoped to a case the catalog does not have would silently leave
+	// that case on the global value, and the bundle would then record a verdict
+	// the operator believes was measured under a budget that was never applied.
+	// Same silent-typo failure the two refusals above exist to prevent, refused
+	// here for the same reason. See RunCtx.Param for what a scope is.
+	if err := validateParamScopes(cat, opts.Params); err != nil {
+		return nil, err
 	}
 	if opts.CheckTimeout <= 0 {
 		opts.CheckTimeout = DefaultCheckTimeout

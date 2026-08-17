@@ -457,8 +457,61 @@ func (rc *RunCtx) Sim(name string) (*SimClient, error) {
 	return s, nil
 }
 
-// Param returns an operator-supplied parameter.
+// Param returns an operator-supplied parameter, PREFERRING one scoped to the
+// case now running.
+//
+// A scoped parameter is written `-param <case>:<key>=<value>`, where <case> is
+// the globally unique uid or the bare in-document id — the same two spellings
+// -uid accepts (Filter.Matches), because two flags on one command line
+// disagreeing about what a case is called is a trap nobody deserves.
+//
+// # Why the scope exists
+//
+// -param was a flat global map, so one case's budget was every case's cost. The
+// RC0 §9.5 battery hit that squarely on row 12: BASIC-029, CORE-022 and
+// CORE-023 need a long `csip.wait`, "the preflight doc records that setting
+// csip.wait globally turned a 2 h campaign into 25 h", and so the recorded
+// driver runs those three as separate single--uid invocations — which produces
+// separate bundles and separate captures for a row whose criterion is stated
+// over ONE suite run. The battery therefore ran them without the parameter and
+// recorded, correctly, that "neither verdict is the certifiable one".
+//
+// # Precedence, including the awkward case
+//
+// A scope WINS whenever it is present, even when its value is empty. An empty
+// scoped value is an operator explicitly turning a parameter off for one case,
+// and since RequireParam treats empty as absent, falling back to the global
+// there would make "off for this case" inexpressible.
+//
+// A scope naming no case in the catalog is refused by New before the run
+// starts, so a typo cannot quietly leave every case on the global value while
+// the bundle records verdicts the operator believes were measured under
+// another.
 func (rc *RunCtx) Param(key string) (string, bool) {
+	if rc.Case != nil {
+		// Exact first: the two canonical spellings, no scan.
+		for _, scope := range [2]string{rc.Case.UID, rc.Case.ID} {
+			if scope == "" {
+				continue
+			}
+			if v, ok := rc.Params[scope+":"+key]; ok {
+				return v, true
+			}
+		}
+		// Then fold-insensitively, matching -uid's own containsFold matching.
+		// Only reached when the exact lookups miss, so the scan costs nothing
+		// on the common path.
+		suffix := ":" + key
+		for k, v := range rc.Params {
+			scope, ok := strings.CutSuffix(k, suffix)
+			if !ok {
+				continue
+			}
+			if strings.EqualFold(scope, rc.Case.UID) || strings.EqualFold(scope, rc.Case.ID) {
+				return v, true
+			}
+		}
+	}
 	v, ok := rc.Params[key]
 	return v, ok
 }
@@ -466,8 +519,12 @@ func (rc *RunCtx) Param(key string) (string, bool) {
 // RequireParam returns a parameter or an error naming it, so a check that needs
 // an un-discoverable value fails with an actionable message instead of testing
 // against a zero value.
+//
+// It goes through Param rather than reading rc.Params directly, so a per-case
+// scope reaches the checks that DEMAND a parameter and not only the ones that
+// merely accept one — the half of the surface it would be easiest to forget.
 func (rc *RunCtx) RequireParam(key string) (string, error) {
-	if v, ok := rc.Params[key]; ok && v != "" {
+	if v, ok := rc.Param(key); ok && v != "" {
 		return v, nil
 	}
 	return "", fmt.Errorf("certify: %s needs -param %s=<value>", rc.Case.UID, key)
