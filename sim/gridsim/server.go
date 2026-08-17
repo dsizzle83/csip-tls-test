@@ -1288,22 +1288,77 @@ func (s *Server) buildResourceTree() {
 	}
 }
 
+// defaultConnectEnergizeAbsent records why none of the three built-in
+// DefaultDERControls carries opModConnect or opModEnergize, and how a row that
+// wants either one turns it on.
+//
+// # What they used to do, and what it cost
+//
+// All three shipped opModConnect=true AND opModEnergize=true, unconditionally.
+// A DefaultDERControl is not an event: it is what the DER falls back to whenever
+// no control is active, so those two elements were a CONTINUOUS STANDING COMMAND
+// to connect and energize, underneath every row any bench ever ran. Two rows
+// were confounded by it in two successive campaigns (Wave-I and Leg-B) and would
+// have been again:
+//
+//	BENCH-000 row (j)     a DER pre-disconnected at the cabinet, which a gateway
+//	                      holding no ownership record must LEAVE ALONE. It cannot
+//	                      be left alone while the head end says "energize" on
+//	                      every poll cycle.
+//	BASIC-009's ES half   commands connect=false/energize=false and grades model
+//	                      123 Conn and model 703 ES. With the default commanding
+//	                      the opposite underneath, the row measured which of the
+//	                      two won — not whether the DUT honoured the control.
+//
+// # ABSENT, not false
+//
+// An absent element and a false element are DIFFERENT DOCUMENTS to a 2030.5
+// client, and the difference is the whole point. `false` is still a command — it
+// says DISCONNECT — so a row that needs the axis merely NOT ENGAGED would get
+// the opposite of what it asked for. Only absence leaves the axis unspoken and
+// the DER holding whatever state the row put it in.
+//
+// The catalog's own procedure table agrees for connect: BASIC-009's Figure 9 row
+// records "opmodConnect: Default (blank/not specified)" — blank, not false.
+// (It prints "Default true" for opModEnergize, which is a statement about the
+// PROCEDURE's starting conditions, not about what a fixture must serve
+// unprompted; a row that wants that shape now asks for it and gets it recorded
+// in its own request.)
+//
+// # The lever
+//
+// POST /admin/default's `base` is the same adminCtrlReq POST /admin/control
+// takes, and it has carried `connect` and `energize` all along (buildBase). So
+// engaging either axis is one admin call and needs no new surface:
+//
+//	POST /admin/default
+//	{"program":0,"base":{"connect":true,"energize":true,"exp_lim_W":5000}}
+//
+// RESTATE exp_lim_W as shown. A POST REPLACES THE WHOLE BASE
+// (putDefaultBaseLocked), so a body naming only connect would silently drop the
+// export cap that several mayhem scenarios reason about by name.
+//
+// The fleet's own program nodes (fleet.go fleetProgramLocked) have always built
+// their defaults with neither element, so this change makes programs 0-2 agree
+// with the fleet rather than diverge from it.
+
 // buildProgram0 builds the Service Point program (primacy=1) with a rich
 // set of DERControls that exercise overlapping/superseded, cancelled,
 // randomized, and actively-executing scenarios.
 func (s *Server) buildProgram0(now int64) {
-	boolTrue := true
 	ptrue := true
 
 	// ── DefaultDERControl (/derp/0/dderc) ─────────────────────
+	//
+	// THE CONNECT AND ENERGIZE AXES ARE DELIBERATELY ABSENT — see
+	// defaultConnectEnergizeAbsent below for why, and for the lever that
+	// engages them when a row wants them.
 	s.resources["/derp/0/dderc"] = &model.DefaultDERControl{
 		Resource:    model.Resource{Href: "/derp/0/dderc"},
 		MRID:        "DDERC-SP-001",
-		Description: "Default: export limit 5kW, connect and energize",
+		Description: "Default: export limit 5kW",
 		DERControlBase: model.DERControlBase{
-			OpModExpLimW:  &model.ActivePower{Multiplier: 0, Value: 5000},
-			OpModConnect:  &boolTrue,
-			OpModEnergize: &boolTrue,
+			OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 5000},
 		},
 	}
 
@@ -1434,16 +1489,13 @@ func (s *Server) buildProgram0(now int64) {
 
 // buildProgram1 builds the Site-Level program (primacy=5).
 func (s *Server) buildProgram1(now int64) {
-	boolTrue := true
-
+	// Connect/energize absent — see defaultConnectEnergizeAbsent.
 	s.resources["/derp/1/dderc"] = &model.DefaultDERControl{
 		Resource:    model.Resource{Href: "/derp/1/dderc"},
 		MRID:        "DDERC-SITE-001",
 		Description: "Site default: export limit 7kW",
 		DERControlBase: model.DERControlBase{
-			OpModExpLimW:  &model.ActivePower{Multiplier: 0, Value: 7000},
-			OpModConnect:  &boolTrue,
-			OpModEnergize: &boolTrue,
+			OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 7000},
 		},
 	}
 
@@ -1502,16 +1554,13 @@ func (s *Server) buildProgram1(now int64) {
 
 // buildProgram2 builds the System-Level program (primacy=10, lowest priority).
 func (s *Server) buildProgram2(now int64) {
-	boolTrue := true
-
+	// Connect/energize absent — see defaultConnectEnergizeAbsent.
 	s.resources["/derp/2/dderc"] = &model.DefaultDERControl{
 		Resource:    model.Resource{Href: "/derp/2/dderc"},
 		MRID:        "DDERC-SYS-001",
 		Description: "System default: export limit 9kW (utility-wide baseline)",
 		DERControlBase: model.DERControlBase{
-			OpModExpLimW:  &model.ActivePower{Multiplier: 0, Value: 9000},
-			OpModConnect:  &boolTrue,
-			OpModEnergize: &boolTrue,
+			OpModExpLimW: &model.ActivePower{Multiplier: 0, Value: 9000},
 		},
 	}
 

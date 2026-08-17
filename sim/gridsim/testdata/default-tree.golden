@@ -107,10 +107,8 @@
 === /derp/0/dderc
 <DefaultDERControl xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/dderc">
   <mRID>DDERC-SP-001</mRID>
-  <description>Default: export limit 5kW, connect and energize</description>
+  <description>Default: export limit 5kW</description>
   <DERControlBase>
-    <opModConnect>true</opModConnect>
-    <opModEnergize>true</opModEnergize>
     <opModExpLimW>
       <multiplier>0</multiplier>
       <value>5000</value>
@@ -209,8 +207,6 @@
   <mRID>DDERC-SITE-001</mRID>
   <description>Site default: export limit 7kW</description>
   <DERControlBase>
-    <opModConnect>true</opModConnect>
-    <opModEnergize>true</opModEnergize>
     <opModExpLimW>
       <multiplier>0</multiplier>
       <value>7000</value>
@@ -267,8 +263,6 @@
   <mRID>DDERC-SYS-001</mRID>
   <description>System default: export limit 9kW (utility-wide baseline)</description>
   <DERControlBase>
-    <opModConnect>true</opModConnect>
-    <opModEnergize>true</opModEnergize>
     <opModExpLimW>
       <multiplier>0</multiplier>
       <value>9000</value>

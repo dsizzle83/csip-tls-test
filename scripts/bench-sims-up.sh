@@ -133,19 +133,39 @@ else
   GRIDSIM_FLEET="${GRIDSIM_FLEET:-0}"
   GRIDSIM_SUBSCRIPTION="${GRIDSIM_SUBSCRIPTION:-0}"
 fi
-# DER_MODELS: which SunSpec DER model set the modsims serve. Empty (default)
-# passes nothing and every modsim starts with -advanced exactly as it always
-# has, so the register image on a running bench does not change under anyone.
-# Set DER_MODELS=full to add the IEEE 1547-2018 trip models 707/708/709/710
-# (DERTripLV/HV/LF/HF, Category III default curves) — the fixture the gateway's
-# Stage-4 northbound 1547 mirror needs something to mirror FROM, and the reason
-# MOD-4 keeps 707-710 in its missing set. Adding them lengthens the SunSpec
-# chain every scenario walks, which is why it is opt-in rather than the default.
+# DER_MODELS: which SunSpec DER model set the modsims serve. It overrides BOTH
+# defaults below when set; leave it unset for the intended posture.
 #
-# build_if_missing below will NOT rebuild an existing bin/modsim, so after
-# pulling this change run `rm -f bin/modsim` (or `make build-modsim`) once, or
-# DER_MODELS=full silently starts a binary that does not know the flag.
+# THE CENSUS DEVICE NOW DEFAULTS TO "full" — 707/708/709/710 (DERTripLV/HV/LF/HF,
+# Category III default curves) on top of the 7xx set. It used to default to the
+# reduced fixture, and that reduction was being measured as a product gap:
+# MOD-4's ten not-implemented points were the SIM'S missing models, not the
+# gateway's, and the ruling on it is re-run-with-the-full-fixture. Every suite in
+# this repo already expects the trip models to be there —
+# suitemodbusserver/models.go marks 707-710 `Served: true` and its unit rows list
+# them in the served chain — so the reduced fixture was the outlier, not the
+# default.
+#
+# Adding them lengthens the SunSpec chain a scenario walks, and that is the whole
+# cost: they are APPENDED after every other model (populateSolar7xx), so no
+# existing block moves and no register address changes. sim/southbound's
+# TestTripModelsDoNotDisturbTheDefaultAdvancedImage pins exactly that.
+#
+# THE FLEET SIMS (modsim2/modsim3, SIM_FLEET=4) DELIBERATELY DO NOT FOLLOW. They
+# exist to make the CTP's four-device fleet, where what is under test is device
+# identity and fan-out rather than any one device's model set, and lengthening
+# three chain walks to fix a ruling about one device would be paying the cost
+# three times over for nothing. Set DER_MODELS=full to bring them along.
+#
+# build_if_missing below will NOT rebuild an existing bin/modsim. A binary
+# predating -der-models now fails AT STARTUP (Go's flag package rejects the
+# unknown flag and exits) rather than quietly serving something else — but it
+# still fails, so after pulling this change run `rm -f bin/modsim` (or
+# `make build-modsim`) once.
 DER_MODELS="${DER_MODELS:-}"
+# The census device: the single configured southbound DER a bench battery
+# measures. Full fixture unless DER_MODELS overrides it.
+CENSUS_DER_MODELS="${DER_MODELS:-full}"
 WITH_AGG="${WITH_AGG:-1}"
 AGG_ROLE="${AGG_ROLE:-GridServiceSunSpec}"
 AGG_CAMPAIGN="${AGG_CAMPAIGN:-$HERE/qa/aggregator/curtail-solar-50.json}"
@@ -244,7 +264,7 @@ MODSIM3_SERIAL="${MODSIM3_SERIAL:-BENCH-MODSIM-03}"
 echo "Bringing up sims (logs in $LOG, fleet size $SIM_FLEET):"
 MODSIM_ARGS=()
 [ -n "$MODSIM_BIND" ] && MODSIM_ARGS+=(-bind "$MODSIM_BIND")
-start modsim   "$MODSIM_PORT"  "$MODSIM_BIND" ./bin/modsim   -port "$MODSIM_PORT" -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM_SERIAL" \
+start modsim   "$MODSIM_PORT"  "$MODSIM_BIND" ./bin/modsim   -port "$MODSIM_PORT" -advanced -der-models "$CENSUS_DER_MODELS" -wmax 8000 -serial "$MODSIM_SERIAL" \
                  ${MODSIM_ARGS+"${MODSIM_ARGS[@]}"}
 # MBAPS_NO_TICKETS=1 forces every gateway southbound dial to be a FULL mTLS
 # handshake (mbapsdev -no-tickets). Leave it OFF for resumption-behaviour runs

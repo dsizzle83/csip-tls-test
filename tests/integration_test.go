@@ -143,11 +143,28 @@ func TestFullDiscoveryOverHTTP(t *testing.T) {
 	if ps.DefaultControl.DERControlBase.OpModExpLimW.Value != 5000 {
 		t.Errorf("Default OpModExpLimW = %d, want 5000", ps.DefaultControl.DERControlBase.OpModExpLimW.Value)
 	}
-	if ps.DefaultControl.DERControlBase.OpModConnect == nil || !*ps.DefaultControl.DERControlBase.OpModConnect {
-		t.Error("DefaultDERControl.OpModConnect should be true")
+	// THE CONNECT/ENERGIZE AXES ARE ABSENT, and this row now pins that rather
+	// than the opposite.
+	//
+	// It used to require both to be present and true. That was pinning a
+	// FIXTURE POSTURE which turned out to be a bench confound: a
+	// DefaultDERControl is the DER's fallback whenever no control is active, so
+	// those elements were a continuous standing command to connect and energize
+	// underneath every row — BENCH-000 row (j) and BASIC-009's ES half were both
+	// mis-measured because of it, twice. gridsim now leaves the axes unspoken
+	// and a row that wants either asks for it (sim/gridsim/server.go's
+	// defaultConnectEnergizeAbsent).
+	//
+	// Absent, not false: false is still a command, and a row that needs the axis
+	// NOT ENGAGED would get a disconnect instead of silence.
+	if ps.DefaultControl.DERControlBase.OpModConnect != nil {
+		t.Errorf("DefaultDERControl.OpModConnect = %v, want ABSENT — a default that commands connect "+
+			"stands underneath every row and re-confounds BENCH-000 row (j)",
+			*ps.DefaultControl.DERControlBase.OpModConnect)
 	}
-	if ps.DefaultControl.DERControlBase.OpModEnergize == nil || !*ps.DefaultControl.DERControlBase.OpModEnergize {
-		t.Error("DefaultDERControl.OpModEnergize should be true")
+	if ps.DefaultControl.DERControlBase.OpModEnergize != nil {
+		t.Errorf("DefaultDERControl.OpModEnergize = %v, want ABSENT — likewise for BASIC-009's ES half",
+			*ps.DefaultControl.DERControlBase.OpModEnergize)
 	}
 
 	// ── Validate DERControlList (4 controls in SP program) ────

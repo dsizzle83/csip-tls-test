@@ -939,3 +939,60 @@ The startup flag still works and reaches the same geometry through the
 constructor.
 
 Mechanism: `SolarServer.SetLegacyShortBlock` in `sim/southbound/curve12x.go`.
+
+## The default control no longer connects and energizes (2026-08-17)
+
+### The precondition
+
+gridsim's three built-in `DefaultDERControl`s shipped `opModConnect=true` **and**
+`opModEnergize=true`, unconditionally. A DefaultDERControl is not an event — it
+is what the DER falls back to whenever no control is active — so those two
+elements were a **continuous standing command** underneath every row any bench
+ran. Two rows were mis-measured by it in two successive campaigns:
+
+- **BENCH-000 row (j)** — a DER pre-disconnected at the cabinet, which a gateway
+  holding no ownership record must *leave alone*. It cannot be left alone while
+  the head end says "energize" on every poll cycle.
+- **BASIC-009's ES half** — commands `connect=false`/`energize=false` and grades
+  M123 `Conn` and M703 `ES`. With the default commanding the opposite
+  underneath, the row measured which of the two won.
+
+All three programs now leave both axes **absent**.
+
+### Absent, not false
+
+An absent element and a false element are different documents to a 2030.5
+client. `false` is still a command — it says *disconnect* — so a row that needs
+the axis merely **not engaged** would get the opposite of what it asked for.
+Only absence leaves the axis unspoken and the DER holding whatever state the row
+put it in. The catalog agrees for connect: BASIC-009's Figure 9 row prints
+`opmodConnect: Default (blank/not specified)`.
+
+### Engaging either axis
+
+The lever is `POST /admin/default`'s existing `base` — the same body
+`POST /admin/control` takes — so no new surface was needed:
+
+```sh
+# The historical shape, now on request rather than by default.
+curl -s -XPOST localhost:11114/admin/default -d \
+  '{"program":0,"base":{"connect":true,"energize":true,"exp_lim_W":5000}}'
+
+# One axis only — energize spoken, connect left unspoken.
+curl -s -XPOST localhost:11114/admin/default -d \
+  '{"program":0,"base":{"energize":true,"exp_lim_W":5000}}'
+
+# An explicit disconnect command, which is NOT the same as absence.
+curl -s -XPOST localhost:11114/admin/default -d \
+  '{"program":0,"base":{"connect":false,"exp_lim_W":5000}}'
+```
+
+**Restate `exp_lim_W`.** A POST replaces the *whole* base, so a body naming only
+`connect` silently drops the 5 kW export cap that several mayhem scenarios
+(`suppress_default`, `armAfterCapAdopted`) reason about by name.
+
+`GET /admin/default?program=0` reads the posture back, and reports neither key
+until one is engaged.
+
+Mechanism and adjudication: `defaultConnectEnergizeAbsent` in
+`sim/gridsim/server.go`; rows in `sim/gridsim/defaultengage_test.go`.

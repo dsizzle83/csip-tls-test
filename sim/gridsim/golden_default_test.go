@@ -114,6 +114,46 @@ package gridsim
 //     the change only ADDS a mandatory element to a document that was missing
 //     one, so no reader that accepted the old bytes can reject the new ones.
 
+//  4. 2026-08-17, SEVEN lines: all three DefaultDERControls lose
+//     "<opModConnect>true</opModConnect>" and
+//     "<opModEnergize>true</opModEnergize>" (/derp/0/dderc, /derp/1/dderc,
+//     /derp/2/dderc), and program 0's description loses ", connect and
+//     energize".
+//
+//     WHY. A DefaultDERControl is not an event — it is what the DER falls back
+//     to whenever no control is active — so those two elements were a
+//     CONTINUOUS STANDING COMMAND to connect and energize underneath every row
+//     any bench ran, and they confounded two rows in two successive campaigns:
+//     BENCH-000 row (j) (a pre-disconnected DER a gateway must leave alone,
+//     which it cannot while the head end says "energize" every poll cycle) and
+//     BASIC-009's ES half (which commands connect=false/energize=false and
+//     therefore measured which of the two commands won, not whether the DUT
+//     honoured the control). They are ABSENT rather than false because absence
+//     and false are different documents: false is still a command, and the rows
+//     this serves need the axis unspoken. See server.go's
+//     defaultConnectEnergizeAbsent for the lever that engages either axis when
+//     a row wants it, and note that the catalog's own BASIC-009 Figure 9 row
+//     prints "opmodConnect: Default (blank/not specified)".
+//
+//     The description moved in the same breath because it named a command the
+//     document no longer carries, and it is served on the wire — a stale claim
+//     a reader of a captured bundle has no way to check.
+//
+//     WHAT DID NOT MOVE, deliberately: line 194's
+//     "<opModConnect>true</opModConnect>" inside /derp/0/derc is DERControl
+//     SP-004, an EVENT that commands connect for its interval. It is untouched,
+//     and the fact that exactly one such line survives is the cheapest available
+//     proof that this change reached the defaults and nothing else.
+//
+//     WHY THIS IS SAFE FOR PUBLISHED EVIDENCE. The change only REMOVES optional
+//     elements (both are minOccurs="0" on DERControlBase), so no reader that
+//     accepted the old bytes can reject the new ones, and no bundle's claims
+//     rest on the fixture having commanded connect: the rows that grade those
+//     axes command them on a DERControl of their own. Bundles captured before
+//     this date were taken against a fixture that DID assert the axes, which is
+//     precisely the confound this entry removes — so old and new evidence must
+//     not be compared on the connect/energize axes without accounting for it.
+
 import (
 	"encoding/xml"
 	"flag"

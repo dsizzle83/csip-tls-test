@@ -1046,19 +1046,27 @@ func diagnosePFVarMeasuredConvergence(sc *mayScenario, s []maySample, commandedP
 		f.Headline = fmt.Sprintf("retained report is for axis %q, not fixed_pf — cannot judge this fault from it", report.Axis)
 		// The common cause is a PREMISE conflict, not a stale topic: this
 		// scenario isolates WP-10's shell by injecting a synthetic fixed_pf
-		// desired doc while BYPASSING cmd/hub's WP-9 adv author. But when the
-		// hub runs with advanced_der="on" AND a CSIP default control
-		// (DDERC-SP-001) that energizes the DER, that author continuously
-		// re-publishes its OWN retained lexa/desired/adv/<dev> doc
-		// (energize:true) to the same topic — overwriting the injection every
-		// author cycle, so the reconciler stays adopted on "energize" and never
-		// sees fixed_pf. Clearing the retained topic does NOT help; it is
-		// re-authored immediately. Say so, so the run is actionable rather than
-		// read as flakiness.
+		// desired doc while BYPASSING cmd/hub's WP-9 adv author. When the hub
+		// runs with advanced_der="on" AND something is commanding energize,
+		// that author continuously re-publishes its OWN retained
+		// lexa/desired/adv/<dev> doc (energize:true) to the same topic —
+		// overwriting the injection every author cycle, so the reconciler stays
+		// adopted on "energize" and never sees fixed_pf. Clearing the retained
+		// topic does NOT help; it is re-authored immediately.
+		//
+		// THE USUAL SOURCE OF THAT ENERGIZE IS NO LONGER gridsim's OWN DEFAULT.
+		// DDERC-SP-001 used to ship opModEnergize=true unconditionally and was
+		// named here as the cause; it now leaves the axis absent
+		// (sim/gridsim/server.go's defaultConnectEnergizeAbsent), so against a
+		// stock bench this conflict should not arise at all. If it still does,
+		// look for a DERControl commanding energize, or a default a row engaged
+		// deliberately through POST /admin/default — not for the fixture's
+		// built-in posture.
 		if report.Axis == "energize" && report.AdoptState == "adopted" {
 			f.Diagnosis = []string{
-				"The reconciler is stably adopted on axis \"energize\" — the signature of cmd/hub's live WP-9 adv author (advanced_der=\"on\" + a CSIP default control energizing the DER) continuously re-publishing its own retained lexa/desired/adv/" + advTargetDevice + " doc, which OVERWRITES this scenario's synthetic fixed_pf injection every author cycle.",
-				"This scenario can only isolate WP-10's reconciler shell when the WP-9 author is quiesced. Re-run under a bench profile with advanced_der=\"off\" (or with no default control driving energize) so the synthetic injection is the sole author on that topic. This is the bench-deferred adv-shell / PF-mismatch drill, not a hub or oracle defect — H9's excitation-direction fix is covered by the unit test TestAdvShell_FixedPFWrongExcitationDiverges.",
+				"The reconciler is stably adopted on axis \"energize\" — the signature of cmd/hub's live WP-9 adv author (advanced_der=\"on\" + something commanding energize) continuously re-publishing its own retained lexa/desired/adv/" + advTargetDevice + " doc, which OVERWRITES this scenario's synthetic fixed_pf injection every author cycle.",
+				"gridsim's built-in DefaultDERControl no longer commands energize (it leaves the axis absent), so on a stock bench this should not happen. Look for a DERControl commanding energize, or a default a row engaged through POST /admin/default.",
+				"This scenario can only isolate WP-10's reconciler shell when the WP-9 author is quiesced. Re-run under a bench profile with advanced_der=\"off\" (or with nothing driving energize) so the synthetic injection is the sole author on that topic. This is the bench-deferred adv-shell / PF-mismatch drill, not a hub or oracle defect — H9's excitation-direction fix is covered by the unit test TestAdvShell_FixedPFWrongExcitationDiverges.",
 			}
 		}
 		return f

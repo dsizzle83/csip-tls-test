@@ -293,3 +293,65 @@ Use the **keylog build** (`make certify-keylog`, separate
 `~/.local/wolfssl-amd64-keylog` sysroot) or the encrypted payload claims report
 as unmeasured rather than asserting on ciphertext. The DUT's mbedTLS is
 unmodified — the key log is gridsim's and the sims', never the product's.
+
+### `-keylog` is PER LEG, and on the CSIP leg a private file decrypts nothing
+
+`-keylog` does **two jobs at once**, and that is the whole trap:
+
+1. it is where `certify`'s own wolfSSL **exports** the secrets of sessions
+   `certify` is a party to (`internal/wolfssl/keylog.go:100`), and
+2. it is the file the citation phase **reads back to decrypt the capture**
+   (`internal/certify/runner.go:1122`, `keylog.Open`).
+
+Whether those are the same secrets depends on **who is the TLS client on the leg
+under test**, so the correct value is different per leg:
+
+| leg | who handshakes | correct `-keylog` |
+|---|---|---|
+| **mbaps / SSM** (`-suite ssm`, `modbus-server`) | `certify` dials the DUT — it IS a party | either: its own file works, but use the shared one anyway |
+| **CSIP** (`-suite csip`) | **the DUT is the client; gridsim is the server.** `certify` is not a party to any session under test | **the sims' shared file — `/tmp/bench-shared.keylog`** |
+
+On the CSIP leg a private per-run file is not merely suboptimal, it is **empty**:
+`certify` never handshakes with anything, so it exports nothing, and the citation
+phase then opens a 0-byte key log and can decrypt none of the capture. The
+symptom is a run of consecutive `COMM-*` **SKIPs** — the RC0 §9.5 battery lost an
+aborted six-minute run and six such SKIPs to exactly this before relaunching
+against the shared file.
+
+The shared file is the one `docs/BENCH.md` §b already tells the sims to write
+(`SIMS_KEYLOG=/tmp/bench-shared.keylog`), so the secrets that decrypt the DUT↔
+gridsim sessions are the ones **gridsim** appended there.
+
+**Sharing it is safe, by construction:** the export path opens the file
+`fopen(path, "a")` — append, never truncate — so `certify` adds its own lines to
+gridsim's rather than replacing them. One file therefore decrypts a capture taken
+on either interface, which is why `BENCH.md` prescribes it for the sims in the
+first place.
+
+```bash
+# Bring the sims up writing the SHARED key log (docs/BENCH.md §b).
+GRIDSIM_BIN=./bin/server-keylog MBAPS_BIN=./bin/mbapsdev-keylog \
+  SIMS_KEYLOG=/tmp/bench-shared.keylog scripts/bench-sims-up.sh
+
+# CSIP leg — the DUT is the client, so point -keylog at the SIMS' file.
+bin/certify-keylog -suite csip \
+    -target 69.0.0.2:802 -iface wlp2s0 \
+    -pki certs/mbaps -gridsim-admin http://192.168.0.188:11114 \
+    -keylog /tmp/bench-shared.keylog \
+    -out runs/csip-$(date -u +%Y%m%dT%H%M%SZ)/ \
+    -operator "your name" -dut-name lexa-gw -dut-build <build-id>
+
+# mbaps / modbus-server leg — same file, deliberately. certify's own secrets
+# land beside the sims' and the one capture decrypts whole.
+bin/certify-keylog -suite modbus-server \
+    -target 69.0.0.2:802 -iface wlp2s0 \
+    -pki certs/mbaps -gridsim-admin http://192.168.0.188:11114 \
+    -keylog /tmp/bench-shared.keylog \
+    -out runs/mbserver-$(date -u +%Y%m%dT%H%M%SZ)/ \
+    -operator "your name" -dut-name lexa-gw -dut-build <build-id>
+```
+
+**Check it before you spend the window:** a few seconds after the run starts,
+`wc -l /tmp/bench-shared.keylog` must be non-zero and growing. A key log that is
+still empty once traffic is flowing means nothing will decrypt, and the run is
+better aborted at minute one than adjudicated at minute ninety.

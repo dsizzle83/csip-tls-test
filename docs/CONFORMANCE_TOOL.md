@@ -162,11 +162,18 @@ bin/certify -list [-doc SSM-CONF-v0.8] [-details] [-json]
 # What would this selection run, and what would it skip, and why?
 bin/certify -doc SSM-CONF-v0.8 -dry-run
 
-# A real run.
+# A real run. NOTE the key log: it is the SIMS' SHARED file, not a per-run
+# private one. -keylog is both where certify EXPORTS its own TLS secrets and the
+# file the citation phase READS BACK to decrypt the capture — so on a leg where
+# certify is not a party to the sessions under test (the CSIP leg: the DUT is the
+# client and gridsim the server) a private file is exported-to by nobody and
+# decrypts nothing. The export opens the file in APPEND mode, so sharing it adds
+# certify's secrets to the sims' rather than replacing them. See the per-leg
+# table in docs/PREFLIGHT_2026-08-05_flashed-image-campaign.md.
 bin/certify-keylog \
     -target 69.0.0.2:802 -iface enp1s0 \
     -pki certs/mbaps -gridsim-admin http://69.0.0.20:11114 \
-    -keylog runs/2026-07-26/run.keylog \
+    -keylog /tmp/bench-shared.keylog \
     -out runs/2026-07-26/ \
     -operator "your name" -dut-name lexa-gw -dut-build <fw version>
 
