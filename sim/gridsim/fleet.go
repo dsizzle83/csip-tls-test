@@ -514,7 +514,8 @@ func (s *Server) buildFleetProgramsLocked(_ int64) {
 // TASK-024) and this is a bench FIXTURE concern: the DUT never sends an
 // EndDevice, it only reads one. The element order matches model.EndDevice's
 // with SubscriptionListLink appended, which is the same ordering liberty the
-// shared type already takes with the sep.xsd sequence.
+// shared type already takes with IEEE Std 2030.5-2018's EndDevice sequence
+// (p.178).
 type fleetEndDevice struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns EndDevice"`
 

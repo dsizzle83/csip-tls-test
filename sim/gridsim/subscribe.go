@@ -118,8 +118,10 @@ const (
 
 // sepNotification is the resource the server POSTs to a notificationURI.
 //
-// The payload element is <Resource xsi:type="…">, which is how sep.xsd carries
-// a polymorphic subscribed resource. Its children are written verbatim from the
+// The payload element is <Resource xsi:type="…">, which is how IEEE Std
+// 2030.5-2018 carries a polymorphic subscribed resource — §4.7's resource
+// design rules (p.24) require the xsi:type on a list's subordinate resources,
+// and the Annex C Notification example (p.278) shows this exact shape. Its children are written verbatim from the
 // marshalled resource (see newNotification): re-encoding them through a typed
 // field would mean teaching this file about every resource that can be
 // subscribed to.

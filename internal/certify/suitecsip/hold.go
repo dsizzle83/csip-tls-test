@@ -108,8 +108,17 @@ var holdDefaults = holdBinding{Samples: 3, Step: 4 * time.Second}
 var holdMaxLim = holdBinding{
 	Samples: holdDefaults.Samples,
 	Step:    holdDefaults.Step,
-	Why: "opModMaxLimW commands a CONSTRAINT rather than a value — sep 2.0.4: \"the maximum active " +
-		"power generation level at which an EndDevice may operate\" — and a ceiling that is applied and " +
+	// THE QUOTE WAS THE DRAFT'S AND THE DRAFT'S WORDING IS NOT THE STANDARD'S.
+	// This cited sep 2.0.4 for "the maximum active power generation level at
+	// which an EndDevice may operate" — a sentence IEEE Std 2030.5-2018 does not
+	// contain. 2018 p.250 defines the same function differently and more
+	// precisely, naming the measurement point and the reference the percentage
+	// is OF, both of which the draft's phrasing leaves out. Re-quoted from the
+	// standard rather than re-attributed, because re-attributing a sentence the
+	// standard never wrote would have been the worse error (IW15-027).
+	Why: "opModMaxLimW commands a CONSTRAINT rather than a value — IEEE Std 2030.5-2018 p.250: \"sets " +
+		"the maximum active power generation level at the electrical coupling point as a percentage of " +
+		"set capacity (%setMaxW, in hundredths)\" — and a ceiling that is applied and " +
 		"then relaxed while the control is still active has not been complied with. The arrival oracle " +
 		"returns the instant the register matches (settleOracle), so on its own it cannot tell a held " +
 		"ceiling from one the gateway's next reconcile tick undid",

@@ -211,7 +211,8 @@ type curveBinding struct {
 	// five parameters must be found in per generation.
 	//
 	// It is a separate structure from the breakpoints because it is a separate
-	// KIND of content — sep 2.0.4's one DERControlBase mode that carries its
+	// KIND of content — IEEE Std 2030.5-2018's one DERControlBase mode (p.248-251)
+	// that carries its
 	// parameters inline rather than behind a DERCurve link — and because its
 	// register home and the curve's are on OPPOSITE generations: a 7xx DER
 	// stores frequency response parametrically in model 711 and has no
@@ -294,8 +295,8 @@ type curveGap struct {
 	Material bool
 }
 
-// droopBinding is the inline opModFreqDroop half of a row: the five sep 2.0.4
-// FreqDroopType values it authors, and the register home those values must be
+// droopBinding is the inline opModFreqDroop half of a row: the five
+// FreqDroopType values it authors (IEEE Std 2030.5-2018 p.242), and the register home those values must be
 // found in on each SunSpec generation.
 //
 // THE FIVE VALUES ARE THE PROCEDURE'S, in the wire's own units, and nothing in
@@ -426,7 +427,7 @@ const droopElement = "opModFreqDroop"
 // same rule wantDeptRef follows and for the same reason. Both sentences are
 // quoted here so a reader can check the arithmetic without either codebase:
 //
-//	sep-2.0.4.xsd FreqDroopType   SunSpec model 711 Ctl      conversion
+//	2018 p.242 FreqDroopType     SunSpec model 711 Ctl      conversion
 //	──────────────────────────    ─────────────────────      ──────────
 //	dBOF "in thousandths of Hz"   DbOf, scaled by Db_SF      / 1000 -> Hz
 //	dBUF "in thousandths of Hz"   DbUf, scaled by Db_SF      / 1000 -> Hz
@@ -438,7 +439,8 @@ const droopElement = "opModFreqDroop"
 //
 // NO NOMINAL FREQUENCY ENTERS, and that is the property that makes the mapping
 // exact rather than interpretive: kOF/kUF are already per-unit frequency change
-// per per-unit power change, and sep 2.0.4 and the 711 spec state that in
+// per per-unit power change, and IEEE Std 2030.5-2018 (p.242) and the 711 spec
+// state that in
 // verbatim identical words, so nothing here needs to know whether the grid is
 // 50 or 60 Hz. A referee that had to assume one would be grading its own
 // assumption.
@@ -539,7 +541,8 @@ func (a authoredElement) whyOn(fam invariant.CurveFamily) string {
 // NO LEGACY MODEL HAS ONE, and the near-miss is worth naming because it is what
 // a reader will check: 126 declares Crv.RmpTms and 132/134 declare
 // Crv.RmpPt1Tms, both documented as "the time of the PT1 ... to accomplish a
-// change of 95%%". A PT1 filter time constant is sep 2.0.4's rampPT1Tms, a
+// change of 95%%". A PT1 filter time constant is rampPT1Tms (IEEE Std
+// 2030.5-2018 p.253), a
 // SEPARATE element of the same DERCurve, and writing an openLoopTms into it
 // would command a different behaviour under a name that sounds alike.
 func openLoopHome(model uint16) string {
@@ -551,7 +554,8 @@ func openLoopHome(model uint16) string {
 }
 
 // wantOpenLoopS is the authored openLoopTms in the DEVICE's units: hundredths
-// of a second on the wire (sep 2.0.4's own unit for the element) into the
+// of a second on the wire (IEEE Std 2030.5-2018 p.253, the standard's own unit
+// for the element) into the
 // seconds 705/706 store. One fixed decimal shift, performed here, once.
 func (b *curveBinding) wantOpenLoopS() (float64, bool) {
 	if b.OpenLoopTms == nil {
@@ -573,7 +577,7 @@ func (b *curveBinding) authored() []authoredElement {
 		// definitions and scaled by RspTms_SF — which is precisely where IEEE
 		// 2030.5's DERCurve.openLoopTms lands. 712 declares none, and neither
 		// does any legacy bank (their Crv.RmpTms / Crv.RmpPt1Tms is a PT1 FILTER
-		// time, sep 2.0.4's rampPT1Tms, a different element).
+		// time, rampPT1Tms — IEEE Std 2030.5-2018 p.253, a different element).
 		out = append(out, authoredElement{
 			Element:    "DERCurve.openLoopTms",
 			Value:      fmt.Sprintf("%d (hundredths of a second)", *b.OpenLoopTms),
@@ -1016,7 +1020,8 @@ func (b *curveBinding) scaledX(x float64) float64 {
 // OWN yRefType at both ends and so can only ever confirm that the POINTS round
 // tripped. This oracle reads the register.
 //
-// The mapping, from sep 2.0.4's own element documentation:
+// The mapping, from IEEE Std 2030.5-2018's own element documentation
+// (opModVoltVar p.250, opModVoltWatt p.250, opModWattVar p.251):
 //
 //	opModVoltVar / opModWattVar   y is "one of %setMaxW, %setMaxVar, or
 //	                              %statVarAvail" -> W_MAX_PCT / VAR_MAX_PCT /
@@ -1076,8 +1081,8 @@ func (b *curveBinding) wantDeptRef(model uint16) (uint16, bool) {
 	return 0, false
 }
 
-// DERUnitRefType codes (sep 2.0.4, "Specifies context for interpreting percent
-// values") and the SunSpec DeptRef codes they translate to. Named here so the
+// DERUnitRefType codes (IEEE Std 2030.5-2018 p.256, "Specifies context for
+// interpreting percent values") and the SunSpec DeptRef codes they translate to. Named here so the
 // rows and the oracle read one vocabulary; see wantDeptRef for the provenance
 // of the translation and invariant.DeptRefName for the DeptRef enums'.
 const (
@@ -1409,8 +1414,8 @@ func (b *curveBinding) droopOutcome(uv invariant.UnitView, target droopTarget, c
 // a droop that missed by one register count and one that ignored the command
 // entirely must not read the same in a bundle.
 //
-// FIVE, NOT SIX: model 711's PMin is deliberately not compared. sep 2.0.4's
-// FreqDroopType has no PMin, so this row commanded no value for it and a
+// FIVE, NOT SIX: model 711's PMin is deliberately not compared. IEEE Std
+// 2030.5-2018's FreqDroopType (p.242) has no PMin, so this row commanded no value for it and a
 // referee asserting one would be grading its own invention. See
 // invariant.DroopReading, which decodes it so a finding can quote it.
 func droopMismatch(want, got invariant.DroopReading) string {

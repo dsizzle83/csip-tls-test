@@ -294,7 +294,13 @@ Use the **keylog build** (`make certify-keylog`, separate
 as unmeasured rather than asserting on ciphertext. The DUT's mbedTLS is
 unmodified — the key log is gridsim's and the sims', never the product's.
 
-### Four traps that cost a window if you meet them at minute ninety
+## 8. Running the legs: the traps, the clock, and the key log
+
+Everything below is about the invocation itself. It sits after the bundle rules
+because it is what you do BEFORE you have a bundle — and because every item here
+was learned by losing a window to it.
+
+### Six traps that cost a window if you meet them at minute ninety
 
 **1. `-timeout` must be raised alongside any scoped `csip.wait`.** No csip
 registration carries `WithTimeout`, so every check runs under the GLOBAL
@@ -312,6 +318,42 @@ bin/certify-keylog -suite csip -timeout 10m     -param csip.wait=30s     -param 
 This matters more than it used to: the BASIC-004..015 rows now wait for the DUT's
 Response rather than for a discovery walk, so their windows are governed by
 `csip.wait` where they previously ended in seconds.
+
+**1b. `-metrics-endpoint` on EVERY leg, with the SSH forward declared (W2-006).**
+The disclosure channel — the DUT's own ignored-content counters — is read over
+HTTP from the gateway's Prometheus endpoint. It is **not reachable off-box**:
+every `metrics_addr` in the shipped RC config binds `127.0.0.1` (`northbound.json`
+`"metrics_addr": "127.0.0.1:9102"`, and the same for all eight services), which is
+the product's deliberate posture per AD-008 and not a misconfiguration to fix on
+the board. `certify`'s compiled-in default is `http://69.0.0.2:9102/metrics`,
+which therefore **cannot connect**.
+
+So the sanctioned bench path is an SSH forward, and it must be **declared in the
+run's method** — a forward that is not written down is an undisclosed deviation
+in the evidence.
+
+```sh
+# One forward, for the whole campaign. Leave it up across both legs.
+ssh -N -L 19102:127.0.0.1:9102 cc93 &
+
+# EVERY leg passes it. Omitting it on ONE leg is what cost the last battery.
+bin/certify-keylog -suite csip ... -metrics-endpoint http://127.0.0.1:19102/metrics
+bin/certify-keylog -suite modbus-server ... -metrics-endpoint http://127.0.0.1:19102/metrics
+```
+
+**What omitting it costs, measured:** the 7xx leg of the RC0 battery left it off
+and the six `lexa_nb_ignored_control_content_*` series came back UNREADABLE. That
+is not a cosmetic loss — the disclosure criteria cannot assert "nothing of this
+row's content was dropped" over counters they could not read, so it produced
+**BASIC-011's applicable WARN as sole cause**, plus the sub-assertion WARNs on
+BASIC-006 and BASIC-012. Three rows degraded by a missing flag.
+
+State the forward in the bundle's `-note` as well, so a reader of the evidence
+knows the channel was a forward rather than the bench network:
+
+```sh
+-note "metrics disclosure read over ssh -L 19102:127.0.0.1:9102 (loopback bind is product posture, AD-008)"
+```
 
 **2. `rm -f bin/modsim` before the battery.** `bench-sims-up.sh` does NOT rebuild
 an existing binary, and the census device now defaults to `-der-models full`. A
@@ -348,6 +390,60 @@ criterion, and it earns no `Test <ID>` row in a submission.
 > does not block the zero-applicable-FAIL exit criterion and must not be reported
 > as a conformance result. `certify -list` names the family under the document
 > table; REPORT.md tags the row `local-ext` and prints the posture above it.
+
+### How long the CSIP leg now takes — read this before the night
+
+Eleven rows now WAIT FOR THE DUT'S RESPONSE rather than for a discovery walk
+(BASIC-004/005/006/008/009/010/011/012/013 wait for `status=2`; BASIC-014/015
+wait for `status=1`). A row that waits for an answer costs its full wait when the
+answer never comes, where the old walk-wait was satisfied by the first `/dcap`.
+That is the point — a row that closed its window before the evidence could arrive
+was not measuring anything — but it is time you must budget.
+
+**The numbers this arithmetic uses**, all from the code and the bench's own
+advertisement:
+
+| quantity | value | where from |
+|---|---|---|
+| advertised `pollRate` | 60 s | gridsim's `DERControlList` |
+| derived wait | 2 × 60 + 30 = **150 s** | `waitPeriods`/`waitSlack`, `check.go` |
+| wait floor / cap | 90 s / 5 min | `defaultWait`, `waitCap` |
+| per-check timeout | **3 min** default | `DefaultCheckTimeout` |
+| measured baseline | **1 h 47 m** | RC0 battery 7xx CSIP leg, 21:53Z→23:40Z, 79 rows |
+
+**Recommended invocation.** Do NOT scope the eleven Response rows: their derived
+150 s already fits under a 3-minute timeout, and raising them buys nothing
+against a healthy DUT. Scope only the three rows that genuinely need a long
+window, and raise `-timeout` to cover the largest of them:
+
+```sh
+bin/certify-keylog -suite csip -timeout 10m     -param BASIC-029:csip.wait=8m     -param CORE-022:csip.wait=8m     -param CORE-023:csip.wait=8m     -keylog /tmp/bench-shared.keylog     -metrics-endpoint http://127.0.0.1:19102/metrics     ...
+```
+
+**Worst case, stated as an upper bound.** Every waiting row times out — i.e. the
+DUT answers nothing at all:
+
+```
+  baseline (measured, 3 long rows NOT waited on)     107 min
++ 11 Response rows × (150 s − ~60 s walk) ≈ 90 s ea   +17 min
++ 3 scoped rows × (8 min − ~2.5 min before)           +17 min
+                                                     ────────
+  worst case                                         ≈141 min  (2 h 21 m)
+```
+
+**A healthy DUT lands near the baseline, not near this number.** Every one of
+those waits ends the moment the Response arrives; the upper bound is what you pay
+only if the gateway posts nothing, which is itself the finding. Budget the 2 h 21
+m so the window is not the thing that ends the run, and expect ~1 h 50 m.
+
+**Two things that would blow the estimate, and are not in it:**
+
+- `-timeout` **below** the largest scoped wait. Then those three rows die at the
+  timeout instead of finishing — you pay the time AND lose the verdict. See trap 1.
+- A DUT advertising a slower `pollRate`. The derived wait is 2 periods + 30 s and
+  is capped at 5 min, so a 15-minute advertisement (the §10.2.3 maximum) puts
+  every waiting row at the 5-minute cap: 11 × 5 min = 55 min of waiting alone.
+  Check the advertised rate before you start.
 
 ### `-keylog` is PER LEG, and on the CSIP leg a private file decrypts nothing
 

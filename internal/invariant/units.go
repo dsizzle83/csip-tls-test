@@ -165,9 +165,12 @@ type Nameplate struct {
 	//
 	// WChaRteMax / WDisChaRteMax are their SETTABLE counterparts — what the
 	// operator has configured the device to do, which is what a percentage is a
-	// percentage OF (IW15-002; sep-2.0.4.xsd: DERSettings setMaxChargeRateW
-	// "Defaults to rtgMaxChargeRateW", setMaxDischargeRateW "Defaults to
-	// rtgMaxDischargeRateW"). Without these fields the rate axis was the ONE
+	// percentage OF (IW15-002; IEEE Std 2030.5-2018 p.244: DERSettings
+	// setMaxChargeRateW "Defaults to rtgMaxChargeRateW", setMaxDischargeRateW
+	// "Defaults to rtgMaxDischargeRateW" — re-anchored from sep-2.0.4.xsd under
+	// IW15-027, which cost nothing here because the STANDARD carries the same
+	// two sentences word for word; only the authority named was wrong).
+	// Without these fields the rate axis was the ONE
 	// place in this struct where a rating stood in for a setting, and
 	// [Nameplate.wRteMax] could only ever answer with the hardware number.
 	WChaRteMaxRtg, WChaRteMax       Quantity `json:"-"`
@@ -400,8 +403,15 @@ func (n Nameplate) Base(r RefBase, sign int, meas Measurement) (LimitRef, error)
 // configured one. Everywhere else — Base's own pick — already resolves a
 // percentage against the SETTING ("80% of WMax means 80% of what the device is
 // configured to do"), and IEEE 2030.5 says the same thing about this very axis:
-// sep-2.0.4.xsd defines DERSettings setMaxChargeRateW/setMaxDischargeRateW as
-// the commanded quantity's reference and says each "Defaults to" its rating.
+// IEEE Std 2030.5-2018 p.244 defines DERSettings setMaxChargeRateW /
+// setMaxDischargeRateW as the commanded quantity's reference and says each
+// "Defaults to" its rating.
+//
+// The citation used to name sep-2.0.4.xsd. It was re-anchored under IW15-027 —
+// that file is a pre-publication ZigBee SEP 2.0 draft and is reference-only —
+// and the re-anchoring changed nothing but the authority: 2018 p.244 states both
+// definitions in the same words the draft did, so the rule this chain implements
+// was right all along and was merely sourced to the wrong book.
 // The chain below is that rule, and it mirrors what the product's own register
 // layer must do (lexa-proto derbase settingOrRatingBound), so referee and
 // product cannot disagree about what a commanded percent is a percent of:
@@ -411,7 +421,9 @@ func (n Nameplate) Base(r RefBase, sign int, meas Measurement) (LimitRef, error)
 //	    rating here silently over-commands a device the operator derated)
 //	setting present and EQUAL                   -> the setting, named as such
 //	setting ABSENT (SunSpec sentinel -> NaN)    -> the rating, named
-//	    "rating-default", which is what the XSD prescribes — this is the ONE
+//	    "rating-default", which is what IEEE Std 2030.5-2018 p.244 prescribes
+//	    ("Defaults to rtgMaxChargeRateW" / "... rtgMaxDischargeRateW") — this
+//	    is the ONE
 //	    permitted rating fallback, and it is recorded rather than assumed
 //	setting present and ZERO                    -> declared incapacity, never
 //	    overruled by the rating: an operator who configured a zero charge rate

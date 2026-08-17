@@ -217,7 +217,8 @@ type adminCurveReq struct {
 	FixedVarPct *float64 `json:"fixed_var_pct,omitempty"`
 	// OpenLoopTms is the DERCurve's own openLoopTms element: the time to reach
 	// 90 % of the commanded output after a step change, in HUNDREDTHS of a
-	// second, 0 meaning "no limit" (sep-2.0.4.xsd DERCurve, minOccurs=0).
+	// second, 0 meaning "no limit" (IEEE Std 2030.5-2018 p.253,
+	// DERCurve.openLoopTms, [0..1]).
 	//
 	// It is here because a certification Figure prescribes it and this server
 	// could not send it: CSIP CTP v1.3's Figure 6 prints openLoopTms Default 10
@@ -765,8 +766,9 @@ func (s *Server) adminCurvePost(w http.ResponseWriter, r *http.Request) {
 			AutonomousVRefTimeConstant: vc.autoTms,
 			YRefType:                   e.YRefType,
 			CurveData:                  pointsToCurveData(e.Points),
-			// openLoopTms rides on the DERCurve, not on the control: sep 2.0.4
-			// declares it a child of DERCurve, and the Figure that prescribes it
+			// openLoopTms rides on the DERCurve, not on the control: IEEE Std
+			// 2030.5-2018 p.253 declares it a child of DERCurve, and the Figure
+			// that prescribes it
 			// (Figure 6) names it "opModVoltVar.DERCurve.openLoopTms" for that
 			// reason. A copy, so a later mutation of the request cannot reach a
 			// curve this server has already published.
@@ -1256,7 +1258,8 @@ func curveOpenLoopTms(v *int64) (*uint16, error) {
 	}
 	if *v < 0 || *v > 65535 {
 		return nil, fmt.Errorf("DERCurve.openLoopTms %d is outside UInt16's wire domain [0,65535] "+
-			"(sep 2.0.4 DERCurve; the unit is hundredths of a second, and 0 means no limit)", *v)
+			"(IEEE Std 2030.5-2018 p.253, DERCurve.openLoopTms: the unit is hundredths of a "+
+				"second, and a value of 0 means no limit)", *v)
 	}
 	n := uint16(*v)
 	return &n, nil

@@ -1661,17 +1661,26 @@ func TestCSIP_BASIC024_MUPRegistration(t *testing.T) {
 	// four fixture sites in this tree cite it.
 	//
 	// This literal used to be the decimal 49, and the wire carried the TEXT
-	// "49", because csipmodel wrote hexBinary ELEMENTS in decimal. sep 2.0.4
-	// types roleFlags as RoleFlagsType (xsd:5826), base HexBinary16, so every
-	// conformant reader of that document read "49" as 0x49:
+	// "49", because csipmodel wrote hexBinary ELEMENTS in decimal. IEEE Std
+	// 2030.5-2018 p.169 types roleFlags as RoleFlagsType, base HexBinary16, so
+	// every conformant reader read "49" as 0x49:
 	//
-	//	0x49 = bits 0,3,6 = isMirror | isDER | isSubmeter   (xsd:5829/5832/5835)
+	//	0x49 = bits 0,3,6 = isMirror | isDER | isSubmeter   (2018 p.169)
 	//	  49 = bits 0,4,5 = isMirror | isRevenueQuality | isDC
 	//
 	// The comment on this line has always said "generation", and isDER is the
-	// only bit in RoleFlagsType that means it — xsd:5832, "SHALL be set if the
-	// usage applies to a distributed energy resource, capable of delivering
-	// power to the grid". The decimal reading instead claims revenue-grade
+	// only bit in RoleFlagsType that means it — 2018 p.169, "SHALL be set if
+	// the usage applies to a distributed energy resource, capable of delivering
+	// power to the grid".
+	//
+	// RE-ANCHORED UNDER IW15-027, and this site mattered more than most: the
+	// citations here were bare sep-2.0.4.xsd LINE NUMBERS (xsd:5826/5829/5832/
+	// 5835) carrying quoted definitions, and sim/conformance/main.go — which
+	// WAS corrected to "IEEE Std 2030.5-2018 p.169" — points at this comment as
+	// the full adjudication. A corrected site deferring to an uncorrected one
+	// is the worst shape the residue could take: it reads as though the anchor
+	// had been checked. The bit numbers and the quoted sentence survive the
+	// move unchanged; 2018 states them in the same words. The decimal reading instead claims revenue-grade
 	// certification and DIRECT CURRENT metering, neither of which this fixture
 	// has ever meant nor this bench could support. So the INTENT was 0x49, the
 	// Go value was the thing that was wrong, and the decimal-emission defect
@@ -1754,7 +1763,7 @@ func TestCSIP_BASIC025_MUPTelemetryPost(t *testing.T) {
 				StartTime: now - 300,
 				Duration:  300,
 				Reading: []model.Reading{
-					// localID is HexBinary16 in the schema (Reading, sep 2.0.4)
+					// localID is HexBinary16 (Reading.localID, IEEE Std 2030.5-2018 p.211)
 					// and it is an ORDINAL here, not a bitmap — the
 					// disambiguator for multiple readings in one set. It rides
 					// through lexa-proto 72d91be's encoding fix unchanged

@@ -453,10 +453,15 @@ func gatherModesEvidence(t *Transcript) modesEvidence {
 				// exist.
 				//
 				// Collecting the ones with NO bit is the point. A DUT can
-				// execute a mode sep 2.0.4 gives no position for — this product
-				// ships two, opModExpLimW and opModGenLimW, the CSIP-Aus
-				// dynamic-operating-envelope elements the schema does not
-				// declare — and those are UNADVERTISABLE in this bitmap rather
+				// execute a mode DERControlType gives no position for — IEEE
+				// Std 2030.5-2018 p.251-252 assigns bits 0..26 and reserves the
+				// rest — and this product ships two such modes, opModExpLimW and
+				// opModGenLimW, the CSIP-Aus dynamic-operating-envelope elements
+				// the standard does not declare. (This cited sep 2.0.4 until
+				// IW15-027: anchoring an unadvertisability claim to the draft was
+				// the very defect this file's own header renounces, restated four
+				// hundred lines below it.) Those modes are UNADVERTISABLE in this
+				// bitmap rather
 				// than missing from it. Dropping them here would have let the
 				// finding imply the mask accounted for everything the DUT ran.
 				// gradeMaskAgainstEvidence discloses them instead.
@@ -580,7 +585,8 @@ func gradeModesSupported(e modesEvidence) Finding {
 	}
 	if e.MaskErr != nil {
 		return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-			"%s could not be decoded as the schema's own type: %v. An advertisement a conformance reader "+
+			"%s could not be decoded as IEEE Std 2030.5-2018's HexBinary32 (p.251): %v. An advertisement a "+
+				"conformance reader "+
 				"cannot decode is not a weaker advertisement, it is an undecidable one, and this oracle "+
 				"grades it as a failure of the payload rather than reporting the DUT as unmeasured",
 			e.MaskWhere, e.MaskErr)}
@@ -754,7 +760,7 @@ func picsDeclares(pics []string, b derControlTypeBit) bool {
 }
 
 // modesSupportedPICSParam is how an operator supplies the vendor's PICS
-// declaration to this oracle: a comma-separated list of sep 2.0.4 mode names
+// declaration to this oracle: a comma-separated list of IEEE Std 2030.5-2018 mode names (p.251-252)
 // (opModMaxLimW), DERControlBase element names, or bit numbers.
 //
 // Without it, a set bit that the evidence neither proves nor refutes is

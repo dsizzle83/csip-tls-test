@@ -1635,7 +1635,10 @@ func critNotifiedHrefRefetched(o *Observation) criterion {
 // the server served for the same href, and returns "" when they agree.
 //
 // It compares the CHILD ELEMENTS rather than the bytes, and the reason is in
-// sep.xsd: a Notification carries the subscribed resource as
+// the standard's Notification shape (IEEE Std 2030.5-2018 — the Annex C
+// Notification example, p.278, is the one this bench already cites for the same
+// construction in sim/gridsim/explicitnil.go): a Notification carries the
+// subscribed resource as
 // <Resource xsi:type="DERControlList"> — a differently-named element with the
 // same children — so a byte comparison would report every conformant server as
 // non-conformant. What the procedure means by "identical" is the resource, and

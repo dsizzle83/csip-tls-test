@@ -62,8 +62,9 @@ func (s *Server) buildPricing(now int64) {
 			// is not carried by roleFlags at all: it is ReadingType.flowDirection
 			// (19 forward / 20 reverse), which the fixtures that carry a
 			// ReadingType already set. The role that IS true of this rate is bit
-			// 1, isPremisesAggregationPoint — "the UsagePoint is the point of
-			// delivery for a premises" (xsd:5830) — which is also the role the
+			// 1, isPremisesAggregationPoint — "SHALL be set if the UsagePoint is
+			// the point of delivery for a premises" (IEEE Std 2030.5-2018 p.169,
+			// RoleFlagsType) — which is also the role the
 			// product's own site-meter MirrorUsagePoint declares (lexa-gw
 			// cmd/telemetry/main.go, RoleFlags: 0x0002). Bench and DUT now
 			// describe the same point of delivery the same way.

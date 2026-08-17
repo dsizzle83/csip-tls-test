@@ -1522,8 +1522,16 @@ type CurveRequest struct {
 	Activate    bool               `json:"activate"`
 }
 
-// FreqDroopSettings is sep 2.0.4's FreqDroopType as gridsim's admin API takes
-// it: all five children, in the schema's own units, every one required.
+// FreqDroopSettings is IEEE Std 2030.5-2018's FreqDroopType (p.240 for the
+// type, p.242 for the five definitions) as gridsim's admin API takes it: all
+// five children, in the standard's own units, every one required.
+//
+// Re-anchored from sep 2.0.4 under IW15-027. The claim did not move: 2018's
+// FreqDroopType carries dBOF, dBUF, kOF, kUF and openLoopTms with NO [0..1]
+// qualifier on any of them — required, exactly as this struct assumes — and
+// states dBOF/dBUF in thousandths of hertz and kOF/kUF in thousandths unitless.
+// Only the authority named was wrong, which is the whole of what IW15-027 was
+// about on this line.
 //
 // The five are VALUES, not pointers, and the JSON tags carry no omitempty —
 // which is the opposite of every other optional field on these requests and is

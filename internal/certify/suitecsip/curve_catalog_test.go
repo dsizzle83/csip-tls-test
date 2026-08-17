@@ -400,8 +400,8 @@ func TestBASIC012_PublishesTheFigureUnitsVerbatimAndDoesNotCorrectThem(t *testin
 		}
 	}
 	// The referee's own translation, which is what a verdict compares against:
-	// thousandths of Hz -> Hz and hundredths of a second -> s, per the schema's
-	// own sentences.
+	// thousandths of Hz -> Hz and hundredths of a second -> s, per IEEE Std
+	// 2030.5-2018's own sentences (FreqDroopType, p.242).
 	if got := b.Droop.want711().DbOfHz; got != 60.03 {
 		t.Errorf("the referee translates dBOF=%d to %v Hz on model 711, want 60.03",
 			b.Droop.Settings.DBOF, got)

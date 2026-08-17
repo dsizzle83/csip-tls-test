@@ -1817,10 +1817,16 @@ func commandSummary(uv invariant.UnitView) string {
 // MINE and it was wrong, and it is deleted rather than narrowed.
 //
 // The two are different IEEE 2030.5 functions with different registers and
-// different meanings, and the schema says so in its own words
-// (sep-2.0.4.xsd): opModFixedW "specifies a requested charge or discharge mode
-// SETPOINT", while opModMaxLimW "sets the MAXIMUM active power GENERATION
-// LEVEL". A setpoint says produce this; a ceiling says do not exceed this. They
+// different meanings, and the STANDARD says so in its own words: opModFixedW
+// "specifies a requested charge or discharge mode SETPOINT" (IEEE Std
+// 2030.5-2018 p.248), while opModMaxLimW "sets the MAXIMUM active power
+// GENERATION LEVEL at the electrical coupling point as a percentage of set
+// capacity" (p.250).
+//
+// The citation used to read "(sep-2.0.4.xsd)". Re-anchored under IW15-027; both
+// quoted phrases survive the move because 2018 states them in the same words,
+// and the opModMaxLimW half gains the measurement point and the reference the
+// percentage is OF, which the draft's phrasing left out. A setpoint says produce this; a ceiling says do not exceed this. They
 // coincide only in the single case where the device happens to be able to
 // produce its ceiling and chooses to — under any cloud, at night, on a
 // curtailing inverter, or on any device that can absorb, a ceiling permits

@@ -351,13 +351,13 @@ func TestOpenLoopTms_IsServedOnTheCurveAndClearedByTeardown(t *testing.T) {
 	if *curve.OpenLoopTms != 5 {
 		t.Errorf("the served openLoopTms = %d, want 5", *curve.OpenLoopTms)
 	}
-	// Position, against the XSD's sequence: openLoopTms falls after curveType
-	// and before the multipliers.
+	// Position, against IEEE Std 2030.5-2018's DERCurve sequence (p.252-253):
+	// openLoopTms falls after curveType and before the multipliers.
 	raw := serveRaw(t, s, "/derp/0/dc/0")
 	olt, xm := strings.Index(raw, "<openLoopTms>"), strings.Index(raw, "<xMultiplier>")
 	if olt < 0 || xm < 0 || olt > xm {
-		t.Errorf("openLoopTms is not emitted before xMultiplier as the schema's DERCurve sequence "+
-			"requires:\n%s", raw)
+		t.Errorf("openLoopTms is not emitted before xMultiplier as IEEE Std 2030.5-2018's DERCurve "+
+			"sequence (p.252-253) requires:\n%s", raw)
 	}
 	// 0 is "no limit" — a real value, distinguishable from absence.
 	s2 := NewServer("")

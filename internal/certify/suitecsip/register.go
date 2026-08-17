@@ -190,7 +190,9 @@ const (
 	noOpenLoopTmsRegisterLegacy = "the legacy 12x banks carry no open-loop response register: 126 " +
 		"declares Crv.RmpTms and 132/134 declare Crv.RmpPt1Tms, and BOTH are documented in their own " +
 		"model definitions as \"the time of the PT1 ... to accomplish a change of 95%\" — a PT1 FILTER " +
-		"time constant, which is sep 2.0.4's rampPT1Tms, a separate element of the same DERCurve. Writing " +
+		"time constant, which is IEEE Std 2030.5-2018's rampPT1Tms (p.253: \"the configuration parameter "+
+		"for a low-pass filter, PT1 is a time ... in which the filter will settle to 95% of a step "+
+		"change\"), a SEPARATE element of the same DERCurve from openLoopTms (p.253). Writing " +
 		"an openLoopTms into it would command a different behaviour under a name that sounds alike, which " +
 		"is the substitution this suite refuses. So on this generation the element is SERVED northbound " +
 		"and nothing southbound can show what became of it"
@@ -200,9 +202,10 @@ const (
 		"bands, two per-unit gains and an open-loop response time — and its exact register home is SunSpec " +
 		"model 711 (DER Frequency Droop), whose Ctl block carries precisely those five quantities: " +
 		"DbOf/DbUf (scaled by Db_SF), KOf/KUf (scaled by K_SF) and RspTms (scaled by RspTms_SF). The " +
-		"correspondence is EXACT and needs no interpretation: sep 2.0.4 states dBOF/dBUF in thousandths of " +
-		"Hz and kOF/kUF in thousandths unitless as 'per-unit frequency change ... corresponding to 1 " +
-		"per-unit power output change', and model 711's own documentation states the same quantity in the " +
+		"correspondence is EXACT and needs no interpretation: IEEE Std 2030.5-2018's FreqDroopType (p.242) " +
+		"states dBOF/dBUF in thousandths of hertz and kOF/kUF in thousandths unitless as 'per-unit " +
+		"frequency change ... corresponding to one per-unit power output change', and model 711's own " +
+		"documentation states the same quantity in the " +
 		"same words, so the translation is five fixed decimal shifts and no nominal-frequency assumption " +
 		"enters anywhere (see curveBinding.want711, which performs it independently from the standards' " +
 		"text rather than from the product's table)"
@@ -734,7 +737,8 @@ func inverterControlRows() []inverterControlRow {
 			// from the standards text for the model it resolved to.
 			YRefType: derUnitRefStatVarAvail,
 			// openLoopTms 5, Figure 6's own Test Value against its own default
-			// of 10 — hundredths of a second, per sep 2.0.4's DERCurve.
+			// of 10 — hundredths of a second, per DERCurve.openLoopTms
+			// (IEEE Std 2030.5-2018 p.253).
 			//
 			// It USED TO BE A MATERIAL GAP, and holding this row at FAIL for it
 			// was correct while it lasted: a run that left the element off sent
@@ -862,8 +866,8 @@ func inverterControlRows() []inverterControlRow {
 			}), oracleMaxLimW), holdMaxLim), "a maximum active power limit"},
 		// yRefType 1 (%setMaxW), NOT the 3 (%statVarAvail) this row published
 		// until 2026-08-14. Three independent anchors say 1 and nothing says 3:
-		// sep 2.0.4's own opModVoltWatt documentation ("The y value specifies an
-		// active power output in %setMaxW"), the catalog's own prescribed value
+		// IEEE Std 2030.5-2018's own opModVoltWatt documentation (p.250, "The y
+		// value specifies an active power output in %setMaxW"), the catalog's own prescribed value
 		// for this row (Figure 11 Volt-Watt Settings — DERCurve.yRefType:
 		// Default 1; Test Values 1), and the physics — a volt-WATT curve's y
 		// axis is active power, and %statVarAvail is a REACTIVE reference.
@@ -871,7 +875,7 @@ func inverterControlRows() []inverterControlRow {
 		// It became load-bearing rather than merely wrong when the product
 		// started translating yRefType into the curve bank's DeptRef and
 		// REFUSING what it cannot translate (lexa-gw cmd/modbus's curveDeptRef):
-		// %setMaxW is the only y reference sep 2.0.4 gives volt-watt, so 706
+		// %setMaxW is the only y reference 2018 gives volt-watt (p.250), so 706
 		// accepts only DeptRef=W_MAX_PCT and a curve naming %statVarAvail is now
 		// answered cannot-comply. This row would have FAILED a correct DUT for a
 		// defect in its own fixture.
@@ -900,9 +904,9 @@ func inverterControlRows() []inverterControlRow {
 			// catalog and the standard agree and it was the bench (emitting the
 			// draft schema's 3) that did not.
 		}), "a Volt-Watt curve"},
-		// yRefType 1 (%setMaxW) for the same reasons as BASIC-011: sep 2.0.4's
-		// opModFreqWatt documentation ("The y value specifies a corresponding
-		// active power output in %setMaxW") and the catalog's own prescribed
+		// yRefType 1 (%setMaxW) for the same reasons as BASIC-011: IEEE Std
+		// 2030.5-2018's opModFreqWatt documentation (p.248, "The y value specifies
+		// a corresponding active power output in %setMaxW") and the catalog's own prescribed
 		// value (Figure 12 Frequency-Watt Settings — DERCurve.yRefType: Test
 		// Values 1). Freq-watt's y axis is active power; the 3 this row carried
 		// was a reactive reference on an active-power curve.
@@ -914,7 +918,7 @@ func inverterControlRows() []inverterControlRow {
 		// be evidence.
 		//
 		// THE X MULTIPLIER IS NOW -2, AND IT WAS A FIXTURE DEFECT BEFORE.
-		// sep 2.0.4 gives opModFreqWatt's x as "a frequency in Hz", and this row
+		// 2018 p.248 gives opModFreqWatt's x as "a frequency in Hz", and this row
 		// published xvalue=6000 with xMultiplier absent (0) — a DERCurve
 		// declaring breakpoints at 6000 Hz and 6050 Hz. It changed no verdict
 		// while the row's southbound half was a decided FAIL on every bench, but
@@ -1085,8 +1089,9 @@ func inverterControlRows() []inverterControlRow {
 		// and the row must be able to tell the two apart.
 		//
 		// yRefType stays 3 (%statVarAvail) and is NOT load-bearing here, which
-		// is worth stating because every other curve row's just became so. sep
-		// 2.0.4 gives Watt-PF's y as a signed power-factor displacement under
+		// is worth stating because every other curve row's just became so. IEEE
+		// Std 2030.5-2018 (p.251) gives Watt-PF's y as a signed power-factor
+		// displacement under
 		// the EEI convention and defines NO DERUnitRefType for a power factor —
 		// none of the eight codes names one — while DERCurve declares yRefType
 		// minOccurs=1, so SOME code must be sent and every choice is wrong in
@@ -1145,8 +1150,8 @@ func inverterControlRows() []inverterControlRow {
 			// 0.95 is the power factor this row has always been describing.
 			//
 			// yRefType stays 3 and is STILL not load-bearing, for the reason the
-			// 7xx note gives: sep 2.0.4 defines no DERUnitRefType for a power
-			// factor, DERCurve declares yRefType minOccurs=1, so some code must
+			// 7xx note gives: IEEE Std 2030.5-2018 defines no DERUnitRefType for a
+			// power factor (p.256), DERCurve declares yRefType minOccurs=1 (p.253), so some code must
 			// be sent and every choice is wrong in the same way. 131 carries no
 			// DeptRef register at all, so the referee asserts none here rather
 			// than inventing an expectation.

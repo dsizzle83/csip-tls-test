@@ -51,8 +51,11 @@ package gridsim
 // ── Element ORDER, and the divergence this lever does NOT introduce ─────────
 //
 // csipmodel.FreqDroop's field order is dBOF, dBUF, kOF, kUF, openLoopTms —
-// the XSD's sequence exactly, so the ELEMENT this lever emits is conformant in
-// name, type, cardinality and internal order.
+// IEEE Std 2030.5-2018's FreqDroopType sequence exactly (p.242, Figure B.37
+// p.240), so the ELEMENT this lever emits is conformant in name, type,
+// cardinality and internal order. The citation named the XSD until IW15-027;
+// the paragraph below already anchored DERControlBase's order to 2018, which
+// made the omission on this one conspicuous once anybody looked.
 //
 // Its POSITION inside DERControlBase is not, and that is a PRE-EXISTING
 // upstream divergence rather than anything added here. IEEE 2030.5-2018
