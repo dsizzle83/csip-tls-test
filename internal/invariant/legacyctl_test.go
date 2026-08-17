@@ -421,15 +421,22 @@ func TestUnitView_LegacyCommands_ReadsTheModel123Slot(t *testing.T) {
 		t.Errorf("the reading's source is %q; it must name the unit and the model it came from", lc.Source)
 	}
 	// The 704 decoder must be untouched by this: a unit serving only model 123
-	// has no 704 commands, and a caller selecting "WMaxLimPct" by bare name
-	// (oracleMaxLimW does) must not pick up the legacy point.
+	// has no 704 commands.
+	//
+	// The namespacing below is now MORE load-bearing, not less. suitecsip's
+	// ceiling oracle reads BOTH generations (ceilingHomeOf, H-B 2026-08-17), and
+	// it distinguishes them by exactly this: it resolves a home — a point name
+	// AND the command slice that name is selected from — and a legacy ceiling
+	// named bare "WMaxLimPct" would let a 7xx selection match a legacy register
+	// (or the reverse) whenever a device served both, which the advanced sims
+	// do. Two readings, two names, no accidental match.
 	if cmds := uv.Commands("src"); len(cmds) != 0 {
 		t.Errorf("a 123-only unit decoded %d model-704 command(s); the two surfaces must stay separate", len(cmds))
 	}
 	for _, c := range lc.Commands {
 		if c.Point == "WMaxLimPct" {
-			t.Error("the legacy ceiling is named WMaxLimPct unqualified — oracleMaxLimW selects that " +
-				"bare name and would judge it under model 704's semantics")
+			t.Error("the legacy ceiling is named WMaxLimPct unqualified — the 7xx arm of the ceiling " +
+				"oracle selects that bare name and would judge this register under model 704's semantics")
 		}
 	}
 }

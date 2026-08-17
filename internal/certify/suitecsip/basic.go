@@ -1523,10 +1523,14 @@ func critDEREffectUnobservable(subject string) criterion {
 // criterion is stamped with and this one was mislabelled as.
 func critDEREffectViaSouthboundOracle(subject string, o *Observation) criterion {
 	claim := "the DER's own southbound registers hold the value " + subject + " commanded"
-	how := "an independent read of the DER's raw SunSpec 704 image (internal/invariant, which shares only " +
-		"the register-offset tables with the product and none of its CSIP/derbase interpretation), taken " +
-		"BEFORE this row published its control and again after the DUT's poll cycle, and compared against " +
-		"the value this row itself commanded — not against what the DUT reports the DER received"
+	how := "an independent read of the DER's raw SunSpec register image (internal/invariant, which shares " +
+		"only the register-offset tables with the product and none of its CSIP/derbase interpretation), " +
+		"taken BEFORE this row published its control and again after the DUT's poll cycle, and compared " +
+		"against the value this row itself commanded — not against what the DUT reports the DER received. " +
+		"WHICH registers is resolved from the DER's OWN model chain: the IEEE 1547-2018 models 704/702 on a " +
+		"7xx DER, the legacy models 123/121/120 on a 12x one. Every verdict names the home it read, because " +
+		"an oracle hardcoded to one generation reports the OTHER generation's device as a product failure — " +
+		"which is exactly what the 2026-08-17 battery's legacy leg recorded before this was fixed"
 	f := oracleOutcome(o)
 	return criterion{
 		Claim:       claim,
@@ -1697,42 +1701,141 @@ func settleOracleWindow(ctx context.Context, window, step time.Duration, eval fu
 // active window (oracleWindow) as insurance — NOT a defect in which register
 // the board writes: live 2026-08-13 the board wrote WMaxLimPct correctly, as
 // a percent of nameplate, and held the commanded 4800 W cap for the window.
+// ── THE ORACLE WAS 7xx-ONLY, AND THAT MISATTRIBUTED A WHOLE LEG ──────────────
+//
+// Until 2026-08-17 this function reached model 704 and model 702 by name and
+// stopped there. A LEGACY 12x DER serves neither: its ceiling lives in model
+// 123's WMaxLimPct/WMaxLim_Ena pair and its active-power reference in models
+// 120/121. So on the legacy leg the oracle read nothing, reported
+//
+//	"the DER serves no M702, so its own WMax has no value to resolve the
+//	 commanded ceiling against"
+//
+// and — because settleOracle retries everything that is not a Pass — burned the
+// whole poll window before returning a load-bearing FAIL under the criterion
+// claim "the DER's own southbound registers hold the value ... commanded". The
+// bench battery's own summary then wrote that up as "the register never holds
+// the commanded limit ... a pure southbound-execution failure", which is a
+// statement about the product. Nothing had read a limit register. The gateway's
+// readback-derived Started(2) on the same run says the ceiling landed.
+//
+// So the register home is now resolved from the DER's OWN model chain, per
+// generation, through the referee's existing decoders — uv.Commands for 704 and
+// uv.LegacyCommands for 123 (internal/invariant/legacyctl.go), with the
+// denominator from uv.Nameplate (702) or uv.LegacyNameplate (120/121). No offset
+// and no model id is chosen by this file; both come from what the chain walk
+// found. A DER serving NEITHER generation's ceiling is still a decided FAIL, and
+// now says which two homes it looked in.
 func oracleMaxLimW(wantHundredths int64) func(ctx context.Context, rc *certify.RunCtx) Finding {
 	return func(ctx context.Context, rc *certify.RunCtx) Finding {
 		uv, err := oracleUnitView(ctx, rc, oracleSimName)
 		if err != nil {
 			return unavailable("%v", err)
 		}
-		np := uv.Nameplate(oracleSimName)
-		if !np.Present {
-			return unavailable("the DER serves no M702, so its own WMax has no value to resolve the " +
-				"commanded ceiling against")
+		home, why := ceilingHomeOf(uv)
+		if why != "" {
+			return Finding{Verdict: certify.Fail, Observed: why}
 		}
 		meas := uv.Measurement(oracleSimName)
-		base, err := np.Base(invariant.RefWMax, 1, meas)
+		base, err := home.NP.Base(invariant.RefWMax, 1, meas)
 		if err != nil {
-			return unavailable("cannot resolve the DER's own WMax: %v", err)
+			return unavailable("cannot resolve the DER's own WMax from %s: %v", home.NPWhere, err)
 		}
 		wantPct := float64(wantHundredths) / 100.0
 		wantW := wantPct / 100 * base.Q.Val
-		for _, c := range uv.Commands(oracleSimName) {
-			if c.Point != "WMaxLimPct" || !c.Enabled {
+		for _, c := range home.Cmds {
+			if c.Point != home.Point || !c.Enabled {
 				continue
 			}
-			r := invariant.ResolveCommand(c, np, meas)
+			r := invariant.ResolveCommand(c, home.NP, meas)
 			if !r.Physical.Known() || r.Physical.Unit != invariant.UnitWatt {
 				continue
 			}
 			gotW := r.Physical.Val
-			observed := fmt.Sprintf("the DER's own WMaxLimPct resolves to a %.1f W active-power ceiling "+
-				"(commanded %.2f%% of its own %.1f W WMax = %.1f W)", gotW, wantPct, base.Q.Val, wantW)
+			observed := fmt.Sprintf("the DER's own %s resolves to a %.1f W active-power ceiling "+
+				"(commanded %.2f%% of its own %.1f W %s, read from %s = %.1f W)",
+				home.Point, gotW, wantPct, base.Q.Val, base.Name, home.NPWhere, wantW)
+			if home.Note != "" {
+				observed += ". " + home.Note
+			}
 			if math.Abs(gotW-wantW) <= oracleTolerance(wantW, 1) {
 				return Finding{Verdict: certify.Pass, Observed: observed}
 			}
 			return Finding{Verdict: certify.Fail, Observed: observed}
 		}
-		return noEnabledAxis("WMaxLimPct", wantPct, base.Name, base.Q.Val, wantW, uv)
+		f := noEnabledAxis(home.Point, wantPct, base.Name, base.Q.Val, wantW, uv)
+		if home.Note != "" {
+			f.Observed += ". " + home.Note
+		}
+		return f
 	}
+}
+
+// ceilingHome is where an active-power CEILING lives on the generation the DER
+// under test actually serves, together with the reference a percent resolves
+// against there. Every field is derived from the model chain the referee walked
+// — nothing in this file picks a model id or a register offset.
+type ceilingHome struct {
+	// Point is the decoded command name the ceiling arrives under: "WMaxLimPct"
+	// on 704, invariant.PointM123WMaxLimPct on the legacy block. They are
+	// deliberately DIFFERENT names (legacyctl.go) so no caller can select one
+	// believing it selected the other.
+	Point string
+	// Cmds is the decoded control surface the point is selected from.
+	Cmds []invariant.Command
+	// NP is the active-power reference, and NPWhere names the models it came
+	// from so a verdict cites the denominator it used.
+	NP      invariant.Nameplate
+	NPWhere string
+	// Note is a caveat every verdict off this home must carry — the legacy
+	// transcription divergence, or a short model-123 block.
+	Note string
+}
+
+// ceilingHomeOf resolves the ceiling's register home from the DER's own chain.
+// The second return is non-empty when there is no home at all, and IS the
+// verdict text: "this DER serves neither generation's ceiling register" is a
+// decided fact about the device, not an unavailability of the bench.
+//
+// The 7xx generation is preferred where both are served, because a 1547-2018 DER
+// that also lays down a legacy 123 block (the advanced sims do) actuates through
+// 704 — judging it on the legacy mirror would grade a shadow of the real write.
+func ceilingHomeOf(uv invariant.UnitView) (ceilingHome, string) {
+	if cmds := uv.Commands(oracleSimName); len(cmds) > 0 {
+		np := uv.Nameplate(oracleSimName)
+		if !np.Present {
+			return ceilingHome{}, "the DER serves model 704 but no M702, so the ceiling it holds is a " +
+				"percentage of nothing this referee can resolve"
+		}
+		return ceilingHome{Point: "WMaxLimPct", Cmds: cmds, NP: np, NPWhere: "its own M702"}, ""
+	}
+
+	lc := uv.LegacyCommands(oracleSimName)
+	if !lc.Present {
+		return ceilingHome{}, "this DER serves NEITHER register home an active-power ceiling can have: " +
+			"no model 704 (the IEEE 1547-2018 generation's WMaxLimPct) and no model 123 (the legacy " +
+			"generation's). There is nowhere on this device for the commanded limit to have landed, so " +
+			"the claim that its registers hold it cannot be supported"
+	}
+	np := uv.LegacyNameplate(oracleSimName)
+	if !np.Present {
+		return ceilingHome{}, "the DER serves the legacy model 123 ceiling but publishes no active-power " +
+			"reference for it — neither M121's WMax setting nor M120's WRtg rating — so the percent it " +
+			"holds cannot be resolved into the commanded watts"
+	}
+	note := "READ ON THE LEGACY GENERATION: model 123's WMaxLimPct/WMaxLim_Ena, decoded through this " +
+		"referee's own transcription of the published model (internal/invariant/legacyctl.go), against " +
+		"the M121/M120 active-power reference — this DER serves no 704 and no 702"
+	if d := invariant.DescribeM123Divergence(); d != "" {
+		note += ". TRANSCRIPTION: " + d
+	}
+	if lc.Note != "" {
+		note += ". " + lc.Note
+	}
+	return ceilingHome{
+		Point: invariant.PointM123WMaxLimPct, Cmds: lc.Commands,
+		NP: np, NPWhere: "its own M121/M120", Note: note,
+	}, ""
 }
 
 // noEnabledAxis is the terminal both effect-based oracles reach when the DER's
@@ -1757,6 +1860,32 @@ func noEnabledAxis(axis string, wantPct float64, baseName string, baseW, wantW f
 		"the DER reports NO enabled %s in its own 704 image, so nothing there holds the commanded "+
 			"%.2f%% of its own %.1f W %s (= %.1f W); its 704 setpoints read: %s",
 		axis, wantPct, baseW, baseName, wantW, commandSummary(uv))}
+}
+
+// legacyCommandSummary renders the LEGACY control surface the same way
+// commandSummary renders the 704 one, so a FAIL on a legacy DER names what it
+// read there instead of only what it wanted. It prints the RAW decoded values;
+// resolving them needs a nameplate the caller may not have, and a summary that
+// silently skipped the points it could not resolve would be the same blindness
+// this whole change removes.
+func legacyCommandSummary(lc invariant.LegacyControls) string {
+	if len(lc.Commands) == 0 {
+		return "no decodable control points at all (" + lc.Note + ")"
+	}
+	parts := make([]string, 0, len(lc.Commands))
+	for _, c := range lc.Commands {
+		state := "disabled"
+		if c.Enabled {
+			state = "enabled"
+		}
+		if c.Unresolved != "" {
+			parts = append(parts, fmt.Sprintf("%s=%s (%s, %s)", c.Point, c.Raw, state, c.Unresolved))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s (%s)", c.Point, c.Raw, state))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ", ")
 }
 
 // commandSummary renders what the DER's own 704 image actually held, so a FAIL
@@ -1870,6 +1999,27 @@ func oracleFixedW(wantHundredths int64) func(ctx context.Context, rc *certify.Ru
 		}
 		np := uv.Nameplate(oracleSimName)
 		if !np.Present {
+			// SAY WHICH DEVICE THIS IS. "No M702" was the only thing this
+			// branch used to report, and on the 2026-08-17 legacy leg that
+			// turned a generation fact into what read as a product failure.
+			// A legacy 12x DER has no set-active-power register ANYWHERE —
+			// model 123 carries a ceiling (WMaxLimPct) and a power factor
+			// (OutPFSet) and nothing that means "produce this many watts" —
+			// so the missing nameplate is not the problem and finding one
+			// would not help. It is still a decided FAIL rather than an
+			// Unavailable, on oracleConnect's rule: a row whose every axis is
+			// unobservable on this DER cannot support its claim, and routing
+			// that into a Skip is what let the gap stand.
+			if lc := uv.LegacyCommands(oracleSimName); lc.Present {
+				return Finding{Verdict: certify.Fail, Observed: "this DER is of the LEGACY 12x " +
+					"generation (it serves model 123 and no model 704), and that generation declares " +
+					"no set-active-power register at all: model 123 carries a ceiling (WMaxLimPct) and " +
+					"a power factor (OutPFSet), neither of which is a setpoint — IEEE Std 2030.5-2018 " +
+					"p.248 defines opModFixedW as a charge/discharge SETPOINT and p.250 opModMaxLimW as " +
+					"a maximum generation LEVEL, and a ceiling can never satisfy a setpoint (IW15-001). " +
+					"There is nowhere on this device for the commanded setpoint to have landed. Its " +
+					"model 123 reads: " + legacyCommandSummary(lc)}
+			}
 			return unavailable("the DER serves no M702, so it declares neither a rate rating nor a WMax to " +
 				"resolve the commanded percent against")
 		}

@@ -56,12 +56,26 @@ import (
 // somewhere to look rather than for anything the DUT did. A 7xx DER does not
 // serve model 123 and pays nothing for its presence in this list.
 //
+// 120 and 121 are the LEGACY generation's active-power REFERENCE — the rating
+// (M120 WRtg) and the setting (M121 WMax) that a percent-of-active-power control
+// is a percent OF. They are here for the same reason 123 is, and they close the
+// same class of defect one model further up: 123 gave a legacy DER's ceiling a
+// register to be read from, but the number read is a PERCENT, and with no 702 on
+// the device there was nothing to resolve it against. Every percent-resolving
+// oracle therefore reported "the DER serves no M702" on a legacy DER and the row
+// FAILED for want of a denominator — three rows of the 2026-08-17 battery's
+// legacy leg, written up in that run's own summary as a southbound-execution
+// failure of the product (see legacynameplate.go).
+//
 // A model absent from the device is skipped by readUnit, so adding the curve
 // models costs a device that serves none of them nothing at all, and gives one
 // that serves them the only independent account of what a curve control
 // actually did.
 var modelsOfInterest = append(
-	[]uint16{sunspec.ModelImmediateCtrl, 701, 702, 703, 704}, CurveModels()...)
+	[]uint16{
+		sunspec.ModelNameplate, sunspec.ModelBasicSettings, sunspec.ModelImmediateCtrl,
+		701, 702, 703, 704,
+	}, CurveModels()...)
 
 // readUnit reads the models of interest for one unit through a Transport,
 // returning a UnitView. A per-model read failure is recorded on the view rather
