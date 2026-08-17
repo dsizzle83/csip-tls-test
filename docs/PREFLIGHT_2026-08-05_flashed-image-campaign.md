@@ -391,6 +391,48 @@ criterion, and it earns no `Test <ID>` row in a submission.
 > as a conformance result. `certify -list` names the family under the document
 > table; REPORT.md tags the row `local-ext` and prints the posture above it.
 
+**5. The legacy leg's scalar oracles read the legacy registers now — bundles
+before 2026-08-17 do not.** `oracleMaxLimW` (BASIC-010) reached models 704 and
+702 by name, and a legacy 12x DER serves neither: its ceiling is model 123's
+`WMaxLimPct`/`WMaxLim_Ena` and its active-power reference is models 121/120. On
+the legacy leg the oracle therefore read nothing, returned *"the DER serves no
+M702, so its own WMax has no value to resolve the commanded ceiling against"*,
+and the row FAILed under a criterion whose claim is about what the DER's
+registers hold. The 2026-08-17 battery's summary wrote that up as *"the register
+never holds the commanded limit … a pure southbound-execution failure"* — a
+product statement about a read that never happened.
+
+The register home is now resolved from the DER's own model chain, per
+generation, and every verdict names the home it read. Three consequences on the
+night:
+
+- **A legacy-leg `BASIC-010` FAIL now means the ceiling really is wrong.** Read
+  the observed line: it prints `M123.WMaxLimPct`, the M121/M120 reference it
+  resolved against, and both the read and the commanded watts.
+- **`BASIC-013` still FAILs on a legacy DER, and now says why**: that generation
+  declares no set-active-power register at all — model 123 carries a ceiling and
+  a power factor, neither of which is a setpoint (IW15-001; IEEE Std 2030.5-2018
+  p.248 vs p.250). No nameplate would have helped. Whether the row belongs on
+  that leg at all is a scoping decision, not a bench fault.
+- **`BASIC-008` is still ungraded on a legacy DER** and says so: the axis lands
+  on model 123's `OutPFSet`, which the referee does not yet decode. That is a
+  known gap, not a product finding — do not tally it as one.
+
+Re-comparing a legacy leg against a pre-2026-08-17 bundle must account for all
+three; the older run's leg-B `BASIC-008/010/013` FAILs are one harness cause,
+not three product defects.
+
+**6. `modsim -der-curve-vsf` picks the curve models' voltage resolution.** The
+7xx curve models 705/706 now declare `V_SF = -2` (hundredths of `%VNom`), which
+is what the CSIP CTP's own Figure-6 test values need — 95.70 `%VNom` is one of
+them, and the previous whole-percent device stored it as 96, making a BASIC-006
+row a measurement of the fixture's granularity. `-der-curve-vsf 0` brings the
+whole-percent device back deliberately; it is an equally conformant field shape
+and the one whose quantum a gateway must tolerate, so keep exercising it. The
+accepted range is `[-2,+2]` (a curve point is a `uint16`: finer cannot reach a
+100 `%VNom` breakpoint, coarser rounds it away), and an out-of-range or
+misspelled value stops the sim rather than starting a different device.
+
 ### Extracting the supersession write set, afterwards
 
 PC-001's claims are about which axes a supersession wrote. Capture the window on
