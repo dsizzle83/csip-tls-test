@@ -283,15 +283,35 @@ func MapVerdict(c bundle.TestCaseResult, na CaseApplicability, source string) (*
 			Kind: kind, Reason: reason, Source: source,
 		}
 	}
+	// NO-CERTIFICATION-BASIS IS CHECKED FIRST, ahead of both the routing test
+	// and the verdict switch. A document with no certification basis earns no
+	// `Test <ID>` row no matter what the bench observed — a PASS included — and
+	// the REASON it earns none is a deliberate posture that a reviewer needs to
+	// read.
+	//
+	// The order matters because the two conditions are not exclusive and the
+	// wrong one used to win. A document that is BOTH unrouted and
+	// no-certification-basis is the second thing, not the first: "no Results
+	// Reporting specification governs this document" reads as a harness
+	// misconfiguration — a gap somebody should close — while the truth is that
+	// nobody certifies these rows and nobody was ever meant to. LOCAL-EXT-v1 is
+	// exactly that document, and under the previous order its posture text was
+	// unreachable: every extension verdict filed as GapUnrouted and the family's
+	// whole point was invisible in the TRR.
+	//
+	// This is BEHAVIOUR-PRESERVING for every other document, which was checked
+	// rather than assumed. The two maps are NOT disjoint — ss-modbus-client-
+	// conf-v1.1, ss-test-pki and ssm-conf-v0.8 are in both — but on all three
+	// NoCertificationBasis already won under the old order too (they are routed,
+	// so the routing test fell through to it). The only key whose result moves
+	// is local-ext-v1, the one key that is in NoCertificationBasis and not in
+	// DocCertType. See TestMapVerdict_NoCertBasisOutranksUnrouted.
+	if reason, excluded := NoCertificationBasis[doc]; excluded {
+		return gap(GapNoCertBasis, reason)
+	}
 	if _, routed := DocCertType[doc]; !routed {
 		return gap(GapUnrouted, fmt.Sprintf(
 			"no Results Reporting specification governs document %q, so its verdict has no report to go in", doc))
-	}
-	// Checked ahead of the verdict switch, and unconditionally of it: a
-	// document with no certification basis earns no `Test <ID>` row no matter
-	// what the bench observed — a PASS included. See NoCertificationBasis.
-	if reason, excluded := NoCertificationBasis[doc]; excluded {
-		return gap(GapNoCertBasis, reason)
 	}
 	switch c.Verdict {
 	case bundle.Pass:

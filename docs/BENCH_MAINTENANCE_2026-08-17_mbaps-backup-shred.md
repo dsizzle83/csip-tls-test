@@ -80,6 +80,41 @@ negative/oversize-role-cert.pem  negative/two-role-cert.pem
 negative/wrong-ca-cert.pem
 ```
 
+## The two duplicated live keys: DO NOT ROTATE before the re-battery
+
+`ca-key.pem` and `intermediate-key.pem` in the backup were byte-identical to the
+live ones, i.e. copies of key material that is **still in use**. The obvious
+follow-on question is whether those two should now be rotated on hygiene grounds.
+
+**Adjudicated: no — not before the re-battery.** Adopted 2026-08-17.
+
+- **There was no exposure event.** The copies were on the same workstation, in a
+  gitignored directory, and never left it by any path this record can find.
+  Rotation answers a compromise; none is claimed.
+- **It would cost LFDI stability and bundle comparability.** The bench PKI's CA
+  is what the DUT's southbound identity chains to; rotating it mid-campaign
+  changes what every captured handshake shows and breaks comparison against the
+  bundles the re-battery is measured against. That is a real evidentiary cost
+  paid for a hygiene benefit that is not urgent.
+
+**If the owner wants the hygiene anyway, rotate ALL SIXTEEN together, after the
+re-battery** — `make gen-mbaps-certs` regenerates the tree as a set. Rotating two
+keys out of a coherent PKI leaves a tree whose parts were minted at different
+times for no stated reason, which is worse than either end state.
+
+### The residual, stated rather than implied
+
+This record proves the private keys were **never in git**, on any branch. It says
+**nothing about workstation-level copies** — a Time Machine/rsync/Dropbox-class
+backup, an editor's swap directory, or a snapshotted filesystem could hold the
+shredded bytes, and `shred -u` does not reach any of them. `shred` also gives no
+guarantee on a copy-on-write or log-structured filesystem, where the overwrite
+may land in new blocks and leave the old ones intact.
+
+**Whether such copies exist on this workstation is the owner's determination to
+make; it was not made here, and nothing in this note should be read as having
+made it.**
+
 ## If this backup is ever wanted again
 
 It is not recoverable, by design. Regenerate the fixture PKI instead:

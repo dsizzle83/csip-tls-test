@@ -294,6 +294,61 @@ Use the **keylog build** (`make certify-keylog`, separate
 as unmeasured rather than asserting on ciphertext. The DUT's mbedTLS is
 unmodified — the key log is gridsim's and the sims', never the product's.
 
+### Four traps that cost a window if you meet them at minute ninety
+
+**1. `-timeout` must be raised alongside any scoped `csip.wait`.** No csip
+registration carries `WithTimeout`, so every check runs under the GLOBAL
+per-check ceiling — `-timeout`, default **3 minutes**. A scoped
+`-param BASIC-006:csip.wait=8m` therefore does nothing useful on its own: the
+check is killed at 3 m, long before the wait it was granted expires, and the row
+reports a timeout rather than the evidence it was waiting for.
+
+> **The rule: `-timeout` ≥ the largest scoped wait in the invocation.**
+
+```sh
+bin/certify-keylog -suite csip -timeout 10m     -param csip.wait=30s     -param BASIC-029:csip.wait=8m -param CORE-022:csip.wait=8m -param CORE-023:csip.wait=8m
+```
+
+This matters more than it used to: the BASIC-004..015 rows now wait for the DUT's
+Response rather than for a discovery walk, so their windows are governed by
+`csip.wait` where they previously ended in seconds.
+
+**2. `rm -f bin/modsim` before the battery.** `bench-sims-up.sh` does NOT rebuild
+an existing binary, and the census device now defaults to `-der-models full`. A
+modsim predating that flag fails AT STARTUP — loudly, which is the good case —
+but it still fails, and it fails after you have brought the rest of the bench up.
+
+```sh
+rm -f bin/modsim && make build-modsim     # or just: rm -f bin/modsim
+```
+
+**3. Bundles captured before 2026-08-17 are not comparable on the
+connect/energize axes.** gridsim's three built-in `DefaultDERControl`s used to
+ship `opModConnect=true` and `opModEnergize=true` unconditionally — a standing
+command underneath every row — and they now leave both axes ABSENT. Any
+comparison of a new run against an older bundle must account for that on those
+axes; BENCH-000 row (j) and BASIC-009's ES half are precisely the rows the old
+default confounded.
+
+A row that WANTS the axes engaged asks for them, and must **restate the whole
+base** — a POST replaces it, so a body naming only `connect` silently drops the
+5 kW export cap several mayhem scenarios reason about by name:
+
+```sh
+curl -s -XPOST localhost:11114/admin/default -d   '{"program":0,"base":{"connect":true,"energize":true,"exp_lim_W":5000}}'
+```
+
+**4. `EXT-001` is not a conformance row.** It measures `opModWattVar` end to end
+because the product routes it and no published procedure covers it. It runs, it
+is bundled, and `certify -verify` checks its citations like any other row — but
+its verdict is excluded from every applicable-FAIL tally and from the clean-run
+criterion, and it earns no `Test <ID>` row in a submission.
+
+> **A FAIL on `EXT-001` is a PRODUCT FINDING, not a certification failure.** It
+> does not block the zero-applicable-FAIL exit criterion and must not be reported
+> as a conformance result. `certify -list` names the family under the document
+> table; REPORT.md tags the row `local-ext` and prints the posture above it.
+
 ### `-keylog` is PER LEG, and on the CSIP leg a private file decrypts nothing
 
 `-keylog` does **two jobs at once**, and that is the whole trap:

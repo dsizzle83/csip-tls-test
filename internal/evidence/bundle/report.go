@@ -118,12 +118,28 @@ func (b *Bundle) Report() string {
 	if split {
 		fmt.Fprintf(&sb, "- **Applicable to the claim:** %d PASS · %d FAIL · %d SKIP · %d WARN "+
 			"(%d case(s))\n", app.Pass, app.Fail, app.Skip, app.Warn, app.Total())
-		fmt.Fprintf(&sb, "- **Informative** — implemented, not claimed, marked `%s` in the table below: "+
-			"%d PASS · %d FAIL · %d SKIP · %d WARN (%d case(s))\n\n",
-			informativeTag, inf.Pass, inf.Fail, inf.Skip, inf.Warn, inf.Total())
+		fmt.Fprintf(&sb, "- **Informative** — implemented but not bearing on the claim, marked `%s` "+
+			"(not applicable to the claimed profile) or `%s` (covered by no published procedure) in the "+
+			"table below: %d PASS · %d FAIL · %d SKIP · %d WARN (%d case(s))\n\n",
+			informativeTag, localExtTag, inf.Pass, inf.Fail, inf.Skip, inf.Warn, inf.Total())
 	}
+	// THE BANNER MEANS WHAT IT SAYS, so it is gated on the RAW failure count and
+	// not on b.OK().
+	//
+	// Those were the same thing until OK() was narrowed to claim-bearing
+	// failures. After that, `case b.OK()` fired while an informative FAIL
+	// existed and printed "✓ No failures." over a report whose own headline two
+	// lines above says otherwise — shadowing the split branch below, whose
+	// wording is exactly right and which became unreachable whenever the only
+	// failures were non-certifiable.
+	//
+	// It is the mirror image of the defect the split was introduced for.
+	// certfix-validate-20260729T192416 OVERSTATED, printing "✗ 8 test case(s)
+	// FAILED" for failures that did not bear on the claim; this UNDERSTATED,
+	// which is the worse direction: a reader who trusts the banner never reaches
+	// the row.
 	switch {
-	case b.OK():
+	case fail == 0:
 		fmt.Fprintf(&sb, "✓ No failures.\n\n")
 	case fail > 0 && split:
 		fmt.Fprintf(&sb, "✗ %d test case(s) FAILED — %d applicable to the claim, %d informative. Only the "+
