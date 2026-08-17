@@ -59,18 +59,33 @@ package sim
 // different one.
 //
 // THE FIXTURE'S SCALE-FACTOR CONVENTION, STATED SO IT IS NOT MISTAKEN FOR A
-// CLAIM ABOUT FIELD DEVICES. Curve-point scale factors are seeded so that the
-// device's ENGINEERING value equals the number a conformance row publishes on
-// the wire: V_SF = 0 (%VRef in whole percent), DeptRef_SF = 0, W_SF = 0,
-// PF_SF = −2 (a power factor of 0.95 is register 95), Hz_SF = −2 (60.00 Hz is
-// register 6000). populateCurveModel already makes the same choice for
-// 705/706/712 and for the same reason: the southbound referee compares raw
-// published values against device engineering values with NO axis
-// re-interpretation of its own (see suitecsip's critDEREffectViaCurveOracle),
-// so a fixture whose units disagreed with the wire would make every curve row
-// fail for a reason that is about the fixture. A real 126 with V_SF = −1 is a
-// perfectly conformant device and this file's geometry handles it; it is the
-// scale-factor VALUES that are a fixture choice, not the plumbing.
+// CLAIM ABOUT FIELD DEVICES. Curve-point scale factors are seeded so the device
+// can hold, EXACTLY, the number a conformance row publishes on the wire — the
+// southbound referee compares raw published values against device engineering
+// values with NO axis re-interpretation of its own (see suitecsip's
+// critDEREffectViaCurveOracle), so a fixture whose resolution disagreed with the
+// wire would make every curve row fail for a reason that is about the fixture.
+//
+// Which scale factor that IS depends on the axis, and per-model detail lives in
+// legacyCurveSpecs below. The two families of choice:
+//
+//   - HUNDREDTHS where CSIP states hundredths: V_SF = −2 on the 126 volt-var
+//     voltage axis (Figure 6's 9570 at xMultiplier −2 is 95.70 %VRef),
+//     DeptRef_SF = −2 beside it, PF_SF = −2 (a power factor of 0.95 is register
+//     95), Hz_SF = −2 (60.00 Hz is register 6000), Tms_SF = −2 on the
+//     ride-through durations (0.16 s is register 16).
+//   - WHOLE UNITS where every value the standards use is a whole unit: W_SF = 0,
+//     RmpIncDec_SF = 0, and V_SF = 0 on 129/130, whose IEEE 1547-2018 Table 11
+//     boundaries (50/88/110/120 %VRef) are integers.
+//
+// solar_adv.go's populateCurveModel makes the same call on the 7xx family for
+// the same reason, and it did NOT always: 705/706 declared V_SF = 0 until the
+// 2026-08-17 bench battery showed a Figure-6 row storing 95.70 %VNom as 96. See
+// advCurveVoltageSF, which also carries the lever back to the coarse device.
+//
+// A real 126 with V_SF = −1 is a perfectly conformant device and this file's
+// geometry handles it; it is the scale-factor VALUES that are a fixture choice,
+// not the plumbing.
 
 import (
 	"encoding/json"

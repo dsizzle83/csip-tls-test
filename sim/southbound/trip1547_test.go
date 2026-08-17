@@ -310,9 +310,9 @@ func TestTripModelAdoptPromotesTheStagedCurve(t *testing.T) {
 // sits where the chain ends.
 func TestTripModelsDoNotDisturbTheDefaultAdvancedImage(t *testing.T) {
 	plain := &RegisterMap{regs: make(map[uint16]uint16)}
-	_, plainAdv := populateSolarAdvanced(plain, 6000, 6000*0.44, "", false)
+	_, plainAdv := populateSolarAdvanced(plain, 6000, 6000*0.44, "", AdvancedOptions{})
 	full := &RegisterMap{regs: make(map[uint16]uint16)}
-	_, fullAdv := populateSolarAdvanced(full, 6000, 6000*0.44, "", true)
+	_, fullAdv := populateSolarAdvanced(full, 6000, 6000*0.44, "", AdvancedOptions{Trip: true})
 
 	if len(plainAdv.Trips) != 0 {
 		t.Fatalf("the default advanced image serves %d trip model(s); it must serve none", len(plainAdv.Trips))

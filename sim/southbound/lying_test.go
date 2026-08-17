@@ -941,7 +941,7 @@ func newLyingSolarAdvanced(t *testing.T, wmax float64) *SolarServer {
 	t.Helper()
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	varRating := wmax * 0.44
-	bases, adv := populateSolarAdvanced(regs, wmax, varRating, "", false)
+	bases, adv := populateSolarAdvanced(regs, wmax, varRating, "", AdvancedOptions{})
 	ss := &SolarServer{
 		Server: &Server{Regs: regs}, bases: bases, wmaxW: wmax,
 		advanced: true, adv: adv, varRating: varRating,

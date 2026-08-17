@@ -29,9 +29,17 @@ func newAdvSolar(t *testing.T, wmax float64) *SolarServer {
 // explicit, so a test can build either image without a listener.
 func newAdvSolarModels(t *testing.T, wmax float64, withTrip bool) *SolarServer {
 	t.Helper()
+	return newAdvSolarOpts(t, wmax, AdvancedOptions{Trip: withTrip})
+}
+
+// newAdvSolarOpts builds a listener-less advanced sim under an explicit
+// construction posture — the entry point for the curve-axis tests, which have
+// to compare two devices that differ only in a declared scale factor.
+func newAdvSolarOpts(t *testing.T, wmax float64, opts AdvancedOptions) *SolarServer {
+	t.Helper()
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
 	varRating := wmax * 0.44
-	bases, adv := populateSolarAdvanced(r, wmax, varRating, "", withTrip)
+	bases, adv := populateSolarAdvanced(r, wmax, varRating, "", opts)
 	ss := &SolarServer{
 		Server: &Server{Regs: r}, bases: bases, wmaxW: wmax,
 		advanced: true, adv: adv, varRating: varRating,
@@ -631,7 +639,7 @@ func TestAdv701VoltagePointsCoherentBeforeFirstTick(t *testing.T) {
 // so it belongs in the unconditional chain, not behind an opt-in flag.
 func TestModel703Served(t *testing.T) {
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
-	_, adv := populateSolarAdvanced(r, 6000, 6000*0.44, "", false)
+	_, adv := populateSolarAdvanced(r, 6000, 6000*0.44, "", AdvancedOptions{})
 
 	reader, err := sunspec.NewReader(&regMapTransport{r: r})
 	if err != nil {
@@ -750,7 +758,7 @@ func TestModel703ServedByBothSimInstances(t *testing.T) {
 // test.
 func TestPopulate702RateRatingsNotImplemented(t *testing.T) {
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
-	_, adv := populateSolarAdvanced(r, 6000, 6000*0.44, "", false)
+	_, adv := populateSolarAdvanced(r, 6000, 6000*0.44, "", AdvancedOptions{})
 
 	regs := readSlice(r, adv.M702, sunspec.L702.Len())
 	v := sunspec.L702.View(regs)

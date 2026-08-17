@@ -37,6 +37,7 @@ package sim
 // never moves).
 
 import (
+	"fmt"
 	"math"
 	"time"
 
@@ -163,6 +164,31 @@ type curveModelSpec struct {
 	npt                 int
 	reqField, rsltField string
 	sfs                 map[string]int16 // header scale factors to seed
+	// xSF/ySF name the scale factors the per-point axes are encoded against —
+	// 705/706 measure x in %VNom (V_SF), 712 in %W (W_SF). They exist so the
+	// default live curve can be seeded in ENGINEERING units (see
+	// populateCurveModel): a seed written as a raw register word silently
+	// changes meaning the moment a scale factor moves, which is precisely the
+	// bug this table's V_SF now carries a comment about. Empty on the
+	// point-less 711 control block.
+	xSF, ySF string
+}
+
+// withVoltageSF returns the spec with its VOLTAGE axis scale factor overridden.
+// Specs whose x axis is not a voltage (712, whose x is %W; 711, which has no
+// points) are returned unchanged — the lever is about the voltage axis and must
+// not silently re-scale a watt axis that shares no argument with it.
+func (s curveModelSpec) withVoltageSF(sf int16) curveModelSpec {
+	if s.xSF != "V_SF" {
+		return s
+	}
+	sfs := make(map[string]int16, len(s.sfs))
+	for k, v := range s.sfs {
+		sfs[k] = v
+	}
+	sfs["V_SF"] = sf
+	s.sfs = sfs
+	return s
 }
 
 // RspTms_SF IS -2 on 705/706/711, and the value is load-bearing rather than a
@@ -179,16 +205,149 @@ type curveModelSpec struct {
 // rather than on anything the product did, and the finding would have been
 // unattributable. -2 lets the device hold every value the wire can carry, which
 // is the only posture on which that measurement means anything.
+//
+// V_SF IS -2 ON 705/706 FOR EXACTLY THE SAME REASON, and it took a bench
+// finding to get there. model_705.json declares the curve voltage point as
+//
+//	{"name":"V","type":"uint16","units":"VNomPct","sf":"V_SF","static":"S"}
+//
+// — a %VNom magnitude whose resolution is whatever the DEVICE declares, and
+// nothing else. This sim declared V_SF 0, i.e. WHOLE PERCENT, so the only
+// voltage breakpoints it could hold were integers. CSIP CTP v1.3's Figure 6
+// Volt-VAr Settings prescribes (9100, 4000) (9570, 0) (10400, 0) (10600,
+// -4000) at xMultiplier -2 — 95.70 %VNom is one of the certification suite's
+// OWN test values, and on a whole-percent device it lands in the register as
+// 96. The bench proved it: the 2026-08-17 battery's BASIC-006 readback came
+// back [[91,40],[96,0],[104,0],[106,-40]] and the row could not verify its own
+// Figure. Two separate costs, both real:
+//
+//  1. the CTP's own curve was UNREPRESENTABLE on the bench device, so a
+//     Figure-6 row was measuring the fixture's granularity, not the product;
+//  2. sub-unit voltage breakpoints were never exercised AT ALL, on any row.
+//
+// -2 fixes both and costs nothing: sunssf's legal domain is [-10,+10]
+// (vendor/lexa-proto/sunspec/scale.go, LXR-004), and at -2 a uint16 point
+// spans 0.00..655.34 %VNom — every voltage any curve in this catalog or in
+// IEEE 1547-2018 Table 11/13 uses, with room to spare. The legacy 12x fixture
+// (curve12x.go, model 126) already made this exact choice, citing this exact
+// Figure; the 7xx family was simply left behind.
+//
+// THE COARSE DEVICE IS ALSO A REAL FLEET SHAPE AND STAYS TESTABLE. A field
+// inverter declaring V_SF 0 is perfectly conformant, and the product's
+// tolerance for the device's declared quantum is a path that must keep being
+// exercised — so the axis is a CONSTRUCTOR LEVER, not a constant:
+// AdvancedOptions.CurveVoltageSF (modsim -der-curve-vsf) puts any legal sunssf
+// on it, and -der-curve-vsf 0 restores the whole-percent device verbatim. It
+// is a constructor posture and not a runtime fault because model_705.json
+// declares V_SF "static":"S" — a device does not re-scale its own axis while
+// serving, and a sim that did would be modelling no real machine.
+const advCurveVoltageSF int16 = -2
+
+// The default LIVE curve every point-carrying curve model rests on, in
+// engineering units (x = %VNom on 705/706, %W on 712; y = %DeptRef). Arbitrary
+// and flat-ish by design — no row commands it — but named, because the axis
+// lever has to be able to ask whether a proposed scale factor can still hold
+// them (AdvancedOptions.Validate). A device whose declared resolution cannot
+// represent its own resting curve is not a coarse device, it is an incoherent
+// one.
+const (
+	advCurveSeedX0 = 100.0
+	advCurveSeedY0 = 5.0
+	advCurveSeedX1 = 200.0
+	advCurveSeedY1 = -5.0
+)
+
+// sfHolds reports whether v survives a round trip through a uint16 register at
+// scale factor sf — encoded and decoded back to the same engineering value.
+//
+// It is deliberately STRICTER than EncodeOutcome.Representable(), which reports
+// only that no clamp occurred: EncodeScaleUint(200, 10) rounds to register 0 and
+// calls it EncodeExact, so representability alone would wave through a scale
+// factor that erases the value entirely.
+func sfHolds(v float64, sf int16) bool {
+	raw, outcome := sunspec.EncodeScaleUint(v, sf)
+	if outcome != sunspec.EncodeExact {
+		return false
+	}
+	return math.Abs(float64(raw)*math.Pow10(int(sf))-v) < 1e-9
+}
+
 var solarCurveSpecs = []curveModelSpec{
 	{sunspec.ModelDERVoltVar, sunspec.L705Hdr, sunspec.L705Crv, advNPt, "AdptCrvReq", "AdptCrvRslt",
-		map[string]int16{"V_SF": 0, "DeptRef_SF": 0, "RspTms_SF": -2}},
+		map[string]int16{"V_SF": advCurveVoltageSF, "DeptRef_SF": 0, "RspTms_SF": -2}, "V_SF", "DeptRef_SF"},
 	{sunspec.ModelDERVoltWatt, sunspec.L706Hdr, sunspec.L706Crv, advNPt, "AdptCrvReq", "AdptCrvRslt",
-		map[string]int16{"V_SF": 0, "DeptRef_SF": 0, "RspTms_SF": -2}},
+		map[string]int16{"V_SF": advCurveVoltageSF, "DeptRef_SF": 0, "RspTms_SF": -2}, "V_SF", "DeptRef_SF"},
 	// 711 (Freq Droop) is point-less (npt=0) and uses the AdptCtl* handshake.
 	{sunspec.ModelDERFreqDroop, sunspec.L711Hdr, sunspec.L711Ctl, 0, "AdptCtlReq", "AdptCtlRslt",
-		map[string]int16{"Db_SF": -3, "K_SF": -2, "RspTms_SF": -2}},
+		map[string]int16{"Db_SF": -3, "K_SF": -2, "RspTms_SF": -2}, "", ""},
 	{sunspec.ModelDERWattVar, sunspec.L712Hdr, sunspec.L712Crv, advNPt, "AdptCrvReq", "AdptCrvRslt",
-		map[string]int16{"W_SF": 0, "DeptRef_SF": 0}},
+		map[string]int16{"W_SF": 0, "DeptRef_SF": 0}, "W_SF", "DeptRef_SF"},
+}
+
+// AdvancedOptions is the construction-time posture of the advanced (7xx) PV
+// inverter sim. The zero value is the historical default image, so every
+// existing call site keeps the device it has always had.
+type AdvancedOptions struct {
+	// Trip appends the IEEE 1547-2018 trip models 707/708/709/710 — see
+	// NewSolarServerTrip for why they are opt-in.
+	Trip bool
+
+	// CurveVoltageSF overrides the V_SF that the curve models 705/706 DECLARE
+	// for their voltage axis; nil keeps advCurveVoltageSF (-2). Set it to 0 to
+	// serve the whole-percent device — a conformant field shape whose quantum
+	// the product must tolerate — or to any other legal sunssf ([-10,+10]) to
+	// stage a device with a different declared resolution. It does NOT touch
+	// 712's watt axis, which shares no argument with the voltage one.
+	//
+	// It is a pointer because 0 is a MEANINGFUL value here (it is the coarse
+	// device the lever exists to reach), so it cannot double as "unset".
+	CurveVoltageSF *int16
+}
+
+// CurveVoltageSFOrDefault resolves the declared voltage-axis scale factor,
+// applying the default. Exported so a caller can LOG the device it is about to
+// serve without re-deriving the default (modsim does); an out-of-domain
+// override is rejected by the constructor before it can reach a register (see
+// Validate).
+func (o AdvancedOptions) CurveVoltageSFOrDefault() int16 {
+	if o.CurveVoltageSF == nil {
+		return advCurveVoltageSF
+	}
+	return *o.CurveVoltageSF
+}
+
+// Validate refuses a posture that cannot be served honestly. Exported so a
+// front end can reject a bad invocation at FLAG-PARSE time, next to its other
+// argument checks, instead of discovering it as a construction failure three
+// decisions later — and so the rule has exactly one home. A scale factor
+// outside the sunssf domain does not produce a "wrong" device — it produces a
+// device whose every curve point encodes to the NOT_IMPLEMENTED sentinel
+// (EncodeBadSF, LXR-004), i.e. a fixture that answers a different question than
+// the one asked. Fail at construction, where the operator sees it.
+// A LEGAL scale factor is also not automatically a SERVABLE one. The curve
+// point is a uint16 (model_705.json), so a very fine axis cannot reach a high
+// voltage — at V_SF -3 the register tops out at 65.534 %VNom, below every
+// ride-through boundary and below this sim's own resting curve, which would
+// collapse to two identical saturated breakpoints. A very coarse one erases the
+// value in the other direction. Both are refused for the same reason the
+// out-of-domain case is: the operator would get a device that answers a
+// different question, and the run would be attributed to the product.
+func (o AdvancedOptions) Validate() error {
+	if o.CurveVoltageSF == nil {
+		return nil
+	}
+	sf := *o.CurveVoltageSF
+	if !sunspec.ValidSF(sf) {
+		return fmt.Errorf("southbound: curve V_SF %d is outside the legal sunssf domain [-10,+10]", sf)
+	}
+	for _, v := range []float64{advCurveSeedX0, advCurveSeedX1} {
+		if !sfHolds(v, sf) {
+			return fmt.Errorf("southbound: curve V_SF %d cannot hold this device's own resting curve "+
+				"(%g %%VNom does not survive a uint16 round trip at that resolution; the axis spans "+
+				"0..%g %%VNom there)", sf, v, float64(65534)*math.Pow10(int(sf)))
+		}
+	}
+	return nil
 }
 
 // NewSolarServerAdvanced creates an animated PV inverter simulator that ALSO
@@ -197,7 +356,16 @@ var solarCurveSpecs = []curveModelSpec{
 // overrides the SunSpec Model 1 serial (SN) register when non-empty; empty
 // keeps the historical "SN-SOLAR-001" default (see solarSerialOrDefault).
 func NewSolarServerAdvanced(listenURL string, wmaxW float64, serial string) (*SolarServer, error) {
-	return newSolarServerAdvanced(listenURL, wmaxW, serial, false)
+	return NewSolarServerAdvancedOpts(listenURL, wmaxW, serial, AdvancedOptions{})
+}
+
+// NewSolarServerAdvancedOpts is NewSolarServerAdvanced with an explicit
+// construction posture — the entry point for the levers that cannot be runtime
+// faults because they describe STATIC declarations of the served device (the
+// curve voltage axis; the trip models' presence in the chain).
+func NewSolarServerAdvancedOpts(listenURL string, wmaxW float64, serial string,
+	opts AdvancedOptions) (*SolarServer, error) {
+	return newSolarServerAdvanced(listenURL, wmaxW, serial, opts)
 }
 
 // NewSolarServerTrip creates an advanced PV inverter simulator that ALSO serves
@@ -216,13 +384,17 @@ func NewSolarServerAdvanced(listenURL string, wmaxW float64, serial string) (*So
 // image is byte-identical to what it has always been —
 // TestTripModelsDoNotDisturbTheDefaultAdvancedImage proves it.
 func NewSolarServerTrip(listenURL string, wmaxW float64, serial string) (*SolarServer, error) {
-	return newSolarServerAdvanced(listenURL, wmaxW, serial, true)
+	return NewSolarServerAdvancedOpts(listenURL, wmaxW, serial, AdvancedOptions{Trip: true})
 }
 
-func newSolarServerAdvanced(listenURL string, wmaxW float64, serial string, withTrip bool) (*SolarServer, error) {
+func newSolarServerAdvanced(listenURL string, wmaxW float64, serial string,
+	opts AdvancedOptions) (*SolarServer, error) {
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	varRating := wmaxW * 0.44
-	bases, adv := populateSolarAdvanced(regs, wmaxW, varRating, serial, withTrip)
+	bases, adv := populateSolarAdvanced(regs, wmaxW, varRating, serial, opts)
 
 	ss := &SolarServer{bases: bases, wmaxW: wmaxW, advanced: true, adv: adv, varRating: varRating}
 	ss.faults.label = "solar"
@@ -247,10 +419,11 @@ func newSolarServerAdvanced(listenURL string, wmaxW float64, serial string, with
 
 // ── Populate ─────────────────────────────────────────────────────────────────
 
-func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial string, withTrip bool) (SolarBases, solarAdvBases) {
+func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial string,
+	opts AdvancedOptions) (SolarBases, solarAdvBases) {
 	bases, cursor := populateSolarCore(r, wmaxW, serial)
 	seedLineToLineVoltage(r, bases)
-	adv, cursor := populateSolar7xx(r, cursor, wmaxW, varRating, withTrip)
+	adv, cursor := populateSolar7xx(r, cursor, wmaxW, varRating, opts)
 	// The ONE physics has to see the two advanced blocks that BIND OUTPUT: 702
 	// carries the WMax setting every percent resolves against, 704 the WSet
 	// setpoint. Copied from adv (single source) into SolarBases, which is what
@@ -297,12 +470,17 @@ func seedLineToLineVoltage(r *RegisterMap, bases SolarBases) {
 // populateSolar7xx appends the advanced models after the legacy layout (before
 // the end marker) and returns their bases plus the next cursor.
 //
-// withTrip appends models 707/708/709/710 LAST. Appending rather than
+// opts.Trip appends models 707/708/709/710 LAST. Appending rather than
 // interleaving is deliberate and load-bearing: every block before them keeps
 // the address it has always had, so a trip-capable sim and a plain advanced sim
 // answer identically for models 1/103/120/121/122/123/701/702/703/704/705/706/
 // 711/712, and only the end marker moves.
-func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64, withTrip bool) (solarAdvBases, uint16) {
+//
+// opts.CurveVoltageSF changes only the VALUE in 705/706's V_SF register and the
+// encoding of the points seeded against it — never a length, never an address —
+// so the chain geometry is identical at every scale factor.
+func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64,
+	opts AdvancedOptions) (solarAdvBases, uint16) {
 	var adv solarAdvBases
 
 	adv.M701, adv.M701Len, cursor = populate701(r, cursor)
@@ -311,10 +489,10 @@ func populateSolar7xx(r *RegisterMap, cursor uint16, wmaxW, varRating float64, w
 	adv.M704, cursor = populate704(r, cursor)
 	for _, spec := range solarCurveSpecs {
 		var cb curveBlock
-		cb, cursor = populateCurveModel(r, cursor, spec)
+		cb, cursor = populateCurveModel(r, cursor, spec.withVoltageSF(opts.CurveVoltageSFOrDefault()))
 		adv.Curves = append(adv.Curves, cb)
 	}
-	if withTrip {
+	if opts.Trip {
 		for _, spec := range solarTripSpecs {
 			var tb tripBlock
 			tb, cursor = populateTripModel(r, cursor, spec)
@@ -639,13 +817,22 @@ func populateCurveModel(r *RegisterMap, cursor uint16, spec curveModelSpec) (cur
 		if spec.crv.Has("Pri") {
 			h.SetU16At(live+spec.crv.Offset("Pri"), 1)
 		}
-		// Two arbitrary flat-ish points (raw, since curve SFs are 0).
+		// Two arbitrary flat-ish points, seeded in ENGINEERING units against
+		// the axis scale factors this spec just declared.
+		//
+		// They used to be written as raw register words (100, 200) on the
+		// stated assumption that "curve SFs are 0". That assumption stopped
+		// being true when the voltage axis moved to -2 (see solarCurveSpecs),
+		// and a raw seed would have silently turned the default 100/200 %VNom
+		// curve into a 1.00/2.00 %VNom one — a device resting on a physically
+		// absurd curve, changed by an edit that never mentioned it. Encoding
+		// through the SF keeps the MEANING pinned and lets the representation
+		// follow the declaration, which is the whole point of a scale factor.
 		pt := live + spec.crv.Len()
-		y0, y1 := int16(5), int16(-5)
-		h.SetU16At(pt+0, 100)        // x0
-		h.SetU16At(pt+1, uint16(y0)) // y0
-		h.SetU16At(pt+2, 200)        // x1
-		h.SetU16At(pt+3, uint16(y1)) // y1
+		h.SetScaledUintAt(pt+0, advCurveSeedX0, spec.xSF)
+		h.SetScaledSignedAt(pt+1, advCurveSeedY0, spec.ySF)
+		h.SetScaledUintAt(pt+2, advCurveSeedX1, spec.xSF)
+		h.SetScaledSignedAt(pt+3, advCurveSeedY1, spec.ySF)
 	} else {
 		// Freq-droop control block (711): seed default droop parameters.
 		h.SetScaledU32At(live+spec.crv.Offset("DbOf"), 0.05, "Db_SF")

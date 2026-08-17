@@ -18,6 +18,13 @@
 // sim/southbound/trip1547.go. It is opt-in because it lengthens the SunSpec
 // model chain every existing scenario walks.
 //
+// -der-curve-vsf sets the resolution 705/706 declare for their VOLTAGE axis.
+// The default (-2, hundredths of %VNom) is the one that can hold the CSIP CTP's
+// own Figure-6 test values — 95.70 %VNom among them. -der-curve-vsf 0 serves the
+// whole-percent device instead, which is an equally conformant field shape and
+// the one whose quantum a gateway has to tolerate. See advCurveVoltageSF in
+// sim/southbound/solar_adv.go.
+//
 // API (default :6020):
 //
 //	GET  /state      — JSON snapshot of all decoded measurements + controls
@@ -51,6 +58,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"csip-tls-test/sim/simapi"
@@ -91,6 +99,18 @@ func main() {
 		"served device is internally coherent — header, declared L and stride all agree — and its geometry "+
 		"is WRONG in exactly the one way L arithmetic can catch: (L-10)/NCrv is a whole number and is not "+
 		"the model's spec block length. It is the fail-closed geometry gate's test target; 0 = off")
+	curveVSF := flag.String("der-curve-vsf", "", "the V_SF that the 7xx curve models 705/706 DECLARE for "+
+		"their voltage axis, i.e. the resolution of every curve breakpoint this device can hold. Empty = the "+
+		"built-in -2 (hundredths of %VNom), which is what the CSIP CTP's own Figure-6 test values need: "+
+		"95.70 %VNom is one of them, and a device declaring 0 stores it as 96. Set \"0\" to serve the "+
+		"WHOLE-PERCENT device instead — an equally conformant field shape whose quantum a gateway must "+
+		"tolerate, and the posture this sim shipped with until 2026-08-17. The accepted range is [-2,+2]: a "+
+		"curve point is a uint16, so a finer axis cannot reach a 100 %VNom breakpoint (at -3 it tops out at "+
+		"65.534) and a coarser one rounds it away — both are refused rather than served. It moves no "+
+		"address and no block length, only the declared resolution. Applies to the "+
+		"advanced/full model sets ONLY — combining it with -der-models legacy or legacy-curves, neither of "+
+		"which serves 705/706, is REFUSED rather than ignored (the 12x family carries its own scale "+
+		"factors, seeded in sim/southbound/curve12x.go)")
 	cloudPct := flag.Float64("cloud-pct", 0, "initial cloud cover percent (0=clear sky .. 100=full overcast); "+
 		"deterministically attenuates the running irradiance and is injectable live via POST /inject {\"Cloud_pct\":N}")
 	serial := flag.String("serial", "", "SunSpec Model 1 serial number (SN) override; empty keeps the "+
@@ -137,6 +157,19 @@ func main() {
 		log.Fatalf("modsim: %v", err)
 	}
 
+	advOpts, err := resolveCurveVSF(*curveVSF)
+	if err != nil {
+		log.Fatalf("modsim: %v", err)
+	}
+	if advOpts.CurveVoltageSF != nil && models != modelsAdvanced && models != modelsFull {
+		// Refuse rather than ignore. An operator who typed the lever expects a
+		// device with that resolution; silently serving one without it is how a
+		// run gets attributed to the product instead of to the invocation.
+		log.Fatalf("modsim: -der-curve-vsf applies to the 7xx curve models (705/706) and this invocation "+
+			"serves none of them (-der-models %s); drop the flag or ask for advanced/full",
+			modelsName(models))
+	}
+
 	var srv *sim.SolarServer
 	switch models {
 	case modelsLegacyCurves:
@@ -147,11 +180,14 @@ func main() {
 			ShortBlockModel: uint16(*legacyShortBlock),
 		})
 	case modelsFull:
-		log.Printf("modsim: starting FULL (7xx + 707-710 trip) PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
-		srv, err = sim.NewSolarServerTrip(listenURL, *wmax, *serial)
+		log.Printf("modsim: starting FULL (7xx + 707-710 trip) PV inverter on %s (WMax=%.0f W, curve V_SF=%d)",
+			listenURL, *wmax, advOpts.CurveVoltageSFOrDefault())
+		srv, err = sim.NewSolarServerAdvancedOpts(listenURL, *wmax, *serial,
+			sim.AdvancedOptions{Trip: true, CurveVoltageSF: advOpts.CurveVoltageSF})
 	case modelsAdvanced:
-		log.Printf("modsim: starting ADVANCED (7xx) PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
-		srv, err = sim.NewSolarServerAdvanced(listenURL, *wmax, *serial)
+		log.Printf("modsim: starting ADVANCED (7xx) PV inverter on %s (WMax=%.0f W, curve V_SF=%d)",
+			listenURL, *wmax, advOpts.CurveVoltageSFOrDefault())
+		srv, err = sim.NewSolarServerAdvancedOpts(listenURL, *wmax, *serial, advOpts)
 	default:
 		log.Printf("modsim: starting animated PV inverter on %s (WMax=%.0f W)", listenURL, *wmax)
 		srv, err = sim.NewSolarServer(listenURL, *wmax, *serial)
@@ -383,4 +419,51 @@ func resolveDERModels(flagValue string, advanced bool) (derModelSet, error) {
 		return modelsLegacy, fmt.Errorf("-der-models %q is not one of legacy, advanced, full, legacy-curves",
 			flagValue)
 	}
+}
+
+// modelsName is the -der-models spelling of a resolved set, for diagnostics
+// that have to quote the invocation back to the operator.
+func modelsName(m derModelSet) string {
+	switch m {
+	case modelsAdvanced:
+		return "advanced"
+	case modelsFull:
+		return "full"
+	case modelsLegacyCurves:
+		return "legacy-curves"
+	default:
+		return "legacy"
+	}
+}
+
+// resolveCurveVSF parses -der-curve-vsf into the sim's construction posture.
+//
+// EMPTY IS NOT ZERO. The whole point of the lever is that 0 — the whole-percent
+// device — is a value an operator deliberately asks for, so it cannot double as
+// "unset"; the flag is a string and the option a pointer for exactly that
+// reason. A malformed or out-of-domain value is an error rather than a
+// fall-back to the default, on resolveDERModels' rule: a typo must not quietly
+// serve a device with a different declared resolution than the one asked for,
+// because every curve row's verdict then reads as a product finding.
+func resolveCurveVSF(flagValue string) (sim.AdvancedOptions, error) {
+	if flagValue == "" {
+		return sim.AdvancedOptions{}, nil
+	}
+	n, err := strconv.ParseInt(flagValue, 10, 16)
+	if err != nil {
+		return sim.AdvancedOptions{}, fmt.Errorf("-der-curve-vsf %q is not an integer", flagValue)
+	}
+	sf := int16(n)
+	if !sunspec.ValidSF(sf) {
+		return sim.AdvancedOptions{}, fmt.Errorf(
+			"-der-curve-vsf %d is outside the legal sunssf domain [-10,+10]", sf)
+	}
+	opts := sim.AdvancedOptions{CurveVoltageSF: &sf}
+	// The SERVABLE check lives with the sim, not restated here: a uint16 %VNom
+	// point cannot span the device's own curve at every legal sunssf, and there
+	// must be exactly one statement of which ones it can.
+	if err := opts.Validate(); err != nil {
+		return sim.AdvancedOptions{}, fmt.Errorf("-der-curve-vsf %d: %w", sf, err)
+	}
+	return opts, nil
 }
