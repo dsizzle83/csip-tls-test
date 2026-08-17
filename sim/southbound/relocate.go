@@ -68,6 +68,61 @@ func (r *RegisterMap) shiftAll(delta int32) {
 	}
 }
 
+// spliceRegion replaces everything this map holds in [start, clearTo] with the
+// contents of src — registers AND write-protected addresses — in ONE
+// transaction under the map's own lock, so an in-flight Modbus request sees the
+// whole old region or the whole new one and never a half-laid chain. Same
+// guarantee shiftAll gives, for the same reason.
+//
+// It exists because one lever genuinely re-lays a region of the served image at
+// run time: SolarServer.SetLegacyShortBlock, which changes a curve model's bank
+// stride and therefore moves every model after it and the chain's end marker.
+// Building the new region into a DETACHED map first and splicing it here is
+// what lets that lever reuse the ordinary populate* path — a second,
+// "in-place" layout writer would be a second opinion about the geometry, and
+// the geometry is the thing under test.
+//
+// The clear is inclusive of clearTo and must be given the further of the two
+// ends: a region that SHRANK would otherwise leave stale registers past its new
+// end marker, which is exactly the debris a chain walker that overruns would
+// pick up.
+//
+// Write protection is REMOVED for the cleared range before src's is applied,
+// because Protect is add-only (protect.go) and a re-lay that only added would
+// leave the old geometry's scale-factor cells protected at addresses that now
+// hold something else.
+func (r *RegisterMap) spliceRegion(start, clearTo uint16, src *RegisterMap) {
+	if src == nil || clearTo < start {
+		return
+	}
+	src.mu.RLock()
+	regs := make(map[uint16]uint16, len(src.regs))
+	for k, v := range src.regs {
+		regs[k] = v
+	}
+	protected := make(map[uint16]bool, len(src.protected))
+	for k, v := range src.protected {
+		protected[k] = v
+	}
+	src.mu.RUnlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for a := uint32(start); a <= uint32(clearTo); a++ {
+		delete(r.regs, uint16(a))
+		delete(r.protected, uint16(a))
+	}
+	for k, v := range regs {
+		r.regs[k] = v
+	}
+	if len(protected) > 0 && r.protected == nil {
+		r.protected = make(map[uint16]bool, len(protected))
+	}
+	for k, v := range protected {
+		r.protected[k] = v
+	}
+}
+
 // Relocator re-homes a *RegisterMap's SunSpec map to an arbitrary starting
 // base address. It is a THIN piece of state layered OUTSIDE *RegisterMap
 // (a wrapper, not a new field on the struct) precisely so relocation never

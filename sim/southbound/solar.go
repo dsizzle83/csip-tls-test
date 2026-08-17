@@ -113,6 +113,14 @@ type SolarServer struct {
 	// and on one every per-generation conformance binding would be ambiguous.
 	// See curve12x.go.
 	legacy *legacyCurveLayer
+
+	// rvrt is the DEVICE-SIDE REVERSION-TIMER engine (reversion.go), carrying
+	// every reversion timer THIS image serves — model 123 always, model 704 and
+	// the 7xx curve models on an advanced sim, the 12x curve models on a
+	// legacy-curve one (reversionsolar.go's solarReversionTimers). It counts
+	// down on the WALL CLOCK unless an operator or a test explicitly installs
+	// another timebase; see SetReversionScale.
+	rvrt *rvrtEngine
 }
 
 // solarFaultKinds is the set of POST /fault kinds the solar sim advertises.
@@ -155,6 +163,8 @@ func NewSolarServer(listenURL string, wmaxW float64, serial string) (*SolarServe
 	regs.OnWriteAttempt = ss.interceptWrite
 	regs.OnRead = ss.faults.transportRead
 	ss.installLies() // the lying-device layer, in front of the fault hooks (lying.go)
+	ss.initSolarReversion(regs)
+	go ss.reversionLoop(srv.stop)
 	return ss, nil
 }
 
@@ -268,6 +278,32 @@ func (ss *SolarServer) ApplyFault(body []byte) error {
 	if handled, err := ss.lies.apply(body); handled {
 		return err
 	}
+	// legacy_short_block is a legacy-curve kind that is NOT a boolean toggle:
+	// it re-lays the served register image, so it is applied by the server
+	// rather than by the fault-flag layer below. Offered on a legacy-curve sim
+	// and REFUSED BY NAME on any other, never silently passed on as an unknown
+	// kind, so a scenario can report SKIP-with-reason instead of mistaking "we
+	// never asked" for "the device passed" — the same discipline modsim's relay
+	// layers use for their own kinds.
+	if spec, ok := parseShortBlockFault(body); ok {
+		if ss.legacy == nil {
+			return fmt.Errorf("legacy_short_block: this device serves no legacy curve models")
+		}
+		if spec.Clear {
+			return ss.SetLegacyShortBlock(0)
+		}
+		// An ARM must NAME a model. The Go API spells "restore" as model 0, but
+		// on the wire 0 is also what a misspelt or omitted key decodes to, and a
+		// bench whose {"kind":"legacy_short_block","modle":126} quietly restored
+		// the spec geometry would run the whole row against a device carrying no
+		// fault and report that the geometry gate had PASSED.
+		if spec.Model == 0 {
+			return fmt.Errorf("legacy_short_block: name the model to shorten " +
+				`({"kind":"legacy_short_block","model":126}), or ask for the spec geometry back ` +
+				`({"kind":"legacy_short_block","clear":true})`)
+		}
+		return ss.SetLegacyShortBlock(spec.Model)
+	}
 	// LEGACY curve kinds (curve12x.go) — consulted before the faultController
 	// for the same reason the lying kinds are: a kind that controller does not
 	// know would be reported as unknown rather than handled.
@@ -367,6 +403,14 @@ type SolarState struct {
 	// that does not serve it so /state stays byte-identical for every existing
 	// scenario. See curve12x.go.
 	LegacyCurves *SolarLegacyCurveState `json:"legacy_curves,omitempty"`
+
+	// Reversion is the device-side reversion-timer engine's own account of
+	// itself (reversionsolar.go). Present on every solar sim, armed or not,
+	// because the TIMEBASE is what has to be on the record: a capture that
+	// simply omitted the section could not be told apart from one taken before
+	// the engine existed. It is also the ONLY place a model 123 or 12x
+	// countdown is visible, those models declaring no remaining-time point.
+	Reversion *ReversionState `json:"reversion,omitempty"`
 }
 
 // Snapshot reads the current register state and returns a decoded SolarState.
@@ -429,6 +473,7 @@ func (ss *SolarServer) Snapshot() SolarState {
 		st.Advanced = ss.advSnapshot()
 	}
 	st.LegacyCurves = ss.legacySnapshot()
+	st.Reversion = ss.reversionSnapshot()
 
 	return st
 }
@@ -444,8 +489,8 @@ func (ss *SolarServer) Registers() map[string]uint16 {
 	if ss.advanced && ss.adv.End > end {
 		end = ss.adv.End
 	}
-	if ss.legacy != nil && ss.legacy.end > end {
-		end = ss.legacy.end
+	if ss.legacy != nil && ss.legacy.layout().end > end {
+		end = ss.legacy.layout().end
 	}
 	for addr := base; addr <= end; addr++ {
 		v := ss.Regs.Get(addr)

@@ -1289,31 +1289,10 @@ type BatteryPackState struct {
 	Reversion *PackReversionState `json:"reversion,omitempty"`
 }
 
-// PackReversionState is the pack's model 704 reversion engine on GET /state.
-type PackReversionState struct {
-	// Timebase names the clock the timers counted down against. It reads
-	// "wall" on every production and bench path. ANYTHING ELSE means the run
-	// was ACCELERATED and its timings are evidence about this harness's state
-	// machine only — never about a real device. It is published rather than
-	// merely documented so an evidence bundle cannot be misread later.
-	Timebase string `json:"timebase"`
-	// Groups lists every reversion timer that is configured (RvrtTms non-zero)
-	// or running. A group that is neither is omitted rather than reported as a
-	// row of zeros, so what is present on /state is what a reader must account
-	// for.
-	Groups []PackReversionGroupState `json:"groups,omitempty"`
-}
-
-// PackReversionGroupState is one reversion timer: what it was programmed for,
-// whether the engine is counting it, and what the register bank is telling a
-// Modbus client is left. Armed and RemS come from the two different places on
-// purpose — the engine and the wire — so a row can prove they agree.
-type PackReversionGroupState struct {
-	Name  string `json:"name"`
-	Armed bool   `json:"armed"`
-	TmsS  uint32 `json:"tms_s"`
-	RemS  uint32 `json:"rem_s"`
-}
+// PackReversionState and PackReversionGroupState now live in reversion.go as
+// ReversionState / ReversionGroupState, because the engine that fills them is
+// shared with the solar sims. They are ALIASES there, not new types, so this
+// document's JSON — and anything decoding it — is unchanged.
 
 type packSetpointState struct {
 	Ena    bool    `json:"ena"`

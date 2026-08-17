@@ -797,3 +797,129 @@ guarantee the harness gives is well-formedness and sequence position, which the
 tests in `sim/gridsim/explicitnil_test.go` assert, and nothing more.
 
 Mechanism and adjudication: `sim/gridsim/explicitnil.go`.
+
+## Device-side reversion timers (2026-08-16) — RC0 §9.5 row 10
+
+### The gap
+
+The RC0 §9.5 battery ran row 10 ("Reversion: `RvrtTms` armed, read back, and
+**actual expiry observed**") against `modsim -advanced` and had to record it
+PARTIAL:
+
+> the sim never decremented `PFWInjRvrtTms` (pinned at 258 s for 6½ minutes) and
+> reports `PFWInjRvrtRem = 0`, i.e. it implements no reversion countdown. The
+> `PFWInjEna` 1 → 0 transition that did occur was the **gateway** releasing the
+> axis at the CSIP control's expiry, not the timer lapsing — so it must not be
+> recorded as satisfying the row.
+
+A reversion engine existed but was wired into the **battery pack only**. Every
+solar sim served its reversion registers as inert storage, so the device half of
+`RC0-ENARVRT` and `RC0-PFVAR-REVERSION-ALTERNATE` was unexercisable.
+
+### What the sims do now
+
+Every solar image counts its own reversion timers down in real time and applies
+its model's own alternate set at expiry. The timer set is **derived** from the
+vendored model definitions, not listed from memory, and
+`TestEveryServedReversionTimerIsEngineManaged` fails if the two ever disagree:
+
+| model | timers | remaining-time readback | alternate set at expiry |
+|---|---|---|---|
+| 704 | 5 (`PFWInj` `PFWAbs` `WMaxLimPct` `WSet` `VarSet`) | yes (`*RvrtRem`) | the `*Rvrt` values **and** the `*EnaRvrt` enable — the only family that can express the *lapse* posture |
+| 705 / 706 / 711 / 712 | 1 each | yes (`RvrtRem`) | the default curve/control index (`RvrtCrv` / `RvrtCtl`), re-adopted through the model's own §3.1.2 handshake |
+| 123 | 4 (`Conn` `WMaxLimPct` `OutPFSet` `VArPct`) | **no** — the model declares none | the disabled state (the family's own `*_Ena` cleared, value left in place); `Conn` returns to CONNECT |
+| 126/129/130/131/132/134 | 1 each | **no** — the models declare none | `ActCrv = 0` ("no active curve") and `ModEna` cleared |
+
+`WinTms` and `RmpTms` are **not** reversion timers and are deliberately not
+implemented here — a start window and a slew rate, respectively. On model 123
+and the 12x family the countdown is not observable on the wire at all, only the
+expiry transition is; `GET /state` carries it with `rem_on_wire: false`.
+
+### The clock lever
+
+A reversion window a head end programs is minutes long and a bench window is
+not unbounded, so the clock is accelerable — the mechanism stays real, only time
+moves faster. It is **never** a default and cannot be reached by configuration:
+
+```sh
+# Run the device's reversion timers 60x the wall clock.
+curl -s -XPOST localhost:6020/control -d '{"reversion_scale":60}'
+# Back to real time (declared as "wall", not as "scaled 1x").
+curl -s -XPOST localhost:6020/control -d '{"reversion_scale":1}'
+```
+
+Same body on `mbapsdev`'s simapi for both inverter models; the battery model
+refuses it by name (its clock stays a Go-source-only knob).
+
+Three properties make it safe to expose, and a bench row must rely on all three:
+
+- **it disarms.** Installing a clock drops every armed countdown, so set the
+  scale **before** arming anything.
+- **it declares itself.** `GET /state` `.reversion.timebase` reads `wall` on an
+  un-accelerated sim and names the multiplier on an accelerated one, derived
+  from the timebase's own bundle declaration rather than composed by hand.
+- **it logs.** The sim writes one line naming the multiplier when the clock
+  changes.
+
+**An accelerated run is evidence about the simulator's state machine and about
+nothing else.** It says nothing about whether real firmware honours `RvrtTms`,
+about clock drift, or about behaviour across a comms outage. A conformance
+claim that a DER's reversion timer fires on time can only come from a
+wall-clock run against that DER.
+
+Mechanism and adjudication: `sim/southbound/reversion.go` (engine, timebases)
+and `sim/southbound/reversionsolar.go` (the model families, the wiring, the
+lever).
+
+## Runtime short-block geometry (2026-08-16) — RC0 §9.5 row 8
+
+### The gap
+
+Row 8's five legacy-curve fault injections included the short block, and the
+battery recorded the structural obstacle:
+
+> **short block has no runtime lever** — `-der-legacy-shortblock 126` is a
+> startup flag only, so that sub-case needs its own modsim restart.
+
+A restart is not neutral: it drops the southbound session and re-runs adoption,
+so it cannot produce the situation under test — a device presenting an
+incoherent geometry **mid-session, to a gateway that has already adopted it**.
+
+### The lever
+
+```sh
+# Arm: model 126's banks are re-laid at an NPt-sized block length.
+curl -s -XPOST localhost:6020/fault -d '{"kind":"legacy_short_block","model":126}'
+# Restore the spec geometry.
+curl -s -XPOST localhost:6020/fault -d '{"kind":"legacy_short_block","clear":true}'
+```
+
+Valid targets are 126/129/130/131/132/134. An arm that names no model is
+refused rather than treated as a clear, because a misspelt key would otherwise
+quietly restore the spec geometry and the row would report that the geometry
+gate passed. It is offered on a legacy-curve sim and refused **by name**
+anywhere else, so a scenario can report SKIP-with-reason instead of mistaking
+"we never asked" for "the device passed". Reachable on both `modsim
+-der-models legacy-curves` and `mbapsdev -model inverter-legacy-curves`.
+
+What the lever does, and what a reader of the capture should expect:
+
+- it **re-lays the whole legacy-curve region**, so every model after the named
+  one moves and so does the chain's end marker. Nothing before the region moves
+  (models 1/103/120/121/122/123 are laid down ahead of it), which is why the
+  fault controller's configured addresses stay valid.
+- the served device stays **internally coherent** — header, declared `L` and
+  stride all agree — and is wrong in exactly the one way `L` arithmetic can
+  catch: `(L − hdr) / NCrv` is a whole number and is not the model's spec block
+  length.
+- **client-written curve content in the region is not preserved.** A re-lay is
+  the device re-publishing its model map; carrying a bank across a stride change
+  would need a correspondence between the two geometries that does not exist.
+- **every armed reversion timer is dropped**, because a timer descriptor
+  carries a base address.
+- `GET /state` reports `legacy_curves.short_block_model` while it is armed.
+
+The startup flag still works and reaches the same geometry through the
+constructor.
+
+Mechanism: `SolarServer.SetLegacyShortBlock` in `sim/southbound/curve12x.go`.

@@ -216,7 +216,7 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 			inject:    srv.Inject,
 			registers: func() any { return srv.Registers() },
 			fault:     srv.ApplyFault,
-			control:   controlFunc("inverter", srv.Server),
+			control:   controlFunc("inverter-legacy-curves", srv.Server, srv),
 			stop:      srv.Stop,
 			base:      srv.Server,
 		}, nil
@@ -234,7 +234,7 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 			inject:    srv.Inject,
 			registers: func() any { return srv.Registers() },
 			fault:     srv.ApplyFault,
-			control:   controlFunc("inverter", srv.Server),
+			control:   controlFunc("inverter", srv.Server, srv),
 			stop:      srv.Stop,
 			base:      srv.Server,
 		}, nil
@@ -249,7 +249,7 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 			inject:    srv.Inject,
 			registers: func() any { return srv.Registers() },
 			fault:     srv.ApplyFault,
-			control:   controlFunc("battery", srv.Server),
+			control:   controlFunc("battery", srv.Server, nil),
 			stop:      srv.Stop,
 			base:      srv.Server,
 		}, nil
@@ -261,7 +261,13 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 // controlFunc builds the simapi POST /control handler shared by both models
 // (pause/resume/speed act on the embedded *sim.Server identically —
 // mirrors modsim/batsim's inline closures).
-func controlFunc(label string, base *sim.Server) func(simapi.ControlCmd) error {
+//
+// accel is the model's DEVICE-SIDE REVERSION CLOCK, or nil on a model that has
+// none. A non-zero reversion_scale against a nil accel is REFUSED BY NAME: an
+// operator who asked an mbaps battery to accelerate its reversion timers and
+// got a silent 204 would spend the rest of the row waiting for an expiry that
+// nothing was counting down.
+func controlFunc(label string, base *sim.Server, accel sim.ReversionAccelerator) func(simapi.ControlCmd) error {
 	return func(cmd simapi.ControlCmd) error {
 		switch cmd.Cmd {
 		case "pause":
@@ -274,6 +280,13 @@ func controlFunc(label string, base *sim.Server) func(simapi.ControlCmd) error {
 		if cmd.Speed > 0 {
 			base.SetSpeed(cmd.Speed)
 			log.Printf("[mbapsdev] %s: animation speed set to %.1f×", label, cmd.Speed)
+		}
+		if cmd.ReversionScale != 0 {
+			if accel == nil {
+				return fmt.Errorf("reversion_scale: the %q model has no runtime device-reversion clock "+
+					"(both inverter models do; the battery pack's clock stays a Go-source-only knob)", label)
+			}
+			return accel.SetReversionScale(cmd.ReversionScale)
 		}
 		return nil
 	}

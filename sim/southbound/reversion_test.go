@@ -264,9 +264,14 @@ func TestPack704WSetReversionHoldsThenRevertsInAcceleratedTime(t *testing.T) {
 	// ── Cross the boundary ──
 	tb.Advance(2 * time.Second)
 	fired := bs.packReversionStep()
-	if len(fired) != 1 || fired[0] != "WSet" {
-		t.Fatalf("the reversion engine fired %v crossing the deadline, want exactly [WSet] — the other four "+
-			"704 timers were never armed and must not fire", fired)
+	// "704.WSet", not "WSet": the engine's armed set is keyed by timer name and
+	// it now spans models. An advanced SOLAR sim serves both 123's
+	// WMaxLimPct_RvrtTms and 704's WMaxLimPctRvrtTms, so a bare family name
+	// would have made those one timer that two different writes armed and one
+	// expiry reverted. The pack serves only 704 and could never have shown it.
+	if len(fired) != 1 || fired[0] != "704.WSet" {
+		t.Fatalf("the reversion engine fired %v crossing the deadline, want exactly [704.WSet] — the other "+
+			"four 704 timers were never armed and must not fire", fired)
 	}
 	obs.CommandedAfter = packCommandedW(bs)
 	obs.RemAfter = readRvrtU32(t, bs, "WSetRvrtRem")
@@ -478,8 +483,8 @@ func TestPack704ReversionRewriteRestartsAndZeroCancels(t *testing.T) {
 		// ... and the NEW deadline still fires, so the rewrite extended the
 		// timer rather than disabling it.
 		tb.Advance(revTestTmsS * time.Second)
-		if fired := bs.packReversionStep(); len(fired) != 1 || fired[0] != "WSet" {
-			t.Fatalf("the extended timer fired %v at its new deadline, want [WSet]", fired)
+		if fired := bs.packReversionStep(); len(fired) != 1 || fired[0] != "704.WSet" {
+			t.Fatalf("the extended timer fired %v at its new deadline, want [704.WSet]", fired)
 		}
 	})
 

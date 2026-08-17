@@ -40,9 +40,7 @@ func newLegacyCurveSim(t *testing.T, wmax float64, opt LegacyCurveOptions) *Sola
 	t.Helper()
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
 	bases, cursor := populateSolarCore(r, wmax, "")
-	layer, cursor := populateLegacyCurves(r, cursor, wmax, opt)
-	r.Set(cursor, sunspec.EndMarker)
-	r.Set(cursor+1, 0)
+	layer := newLegacyCurveLayer(r, cursor, wmax, opt)
 	ss := &SolarServer{Server: &Server{Regs: r}, bases: bases, wmaxW: wmax, legacy: layer}
 	ss.faults.label = "solar-legacy-curves"
 	// The same two write hooks the constructor installs. Without them a test
@@ -56,7 +54,7 @@ func newLegacyCurveSim(t *testing.T, wmax float64, opt LegacyCurveOptions) *Sola
 // legacyBlockOf returns the served descriptor for a model id.
 func (ss *SolarServer) legacyBlockOf(t *testing.T, id uint16) legacyBankBlock {
 	t.Helper()
-	for _, b := range ss.legacy.blocks {
+	for _, b := range ss.legacy.layout().blocks {
 		if b.id == id {
 			return b
 		}
@@ -393,7 +391,7 @@ func TestLegacyCurvesDoNotDisturbTheLegacyBaseImage(t *testing.T) {
 func TestLegacyCurvesServeNo7xxModel(t *testing.T) {
 	ss := newLegacyCurveSim(t, 5000, LegacyCurveOptions{})
 	for _, m := range []uint16{701, 702, 703, 704, 705, 706, 711, 712} {
-		if ss.Regs.Get(ss.legacy.end) == m {
+		if ss.Regs.Get(ss.legacy.layout().end) == m {
 			t.Fatalf("the legacy-curve profile serves 7xx model %d", m)
 		}
 	}

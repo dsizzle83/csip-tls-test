@@ -26,6 +26,14 @@
 //	                   (sim/southbound/modelsplice.go); {"unimplemented":[{"addr":40190,
 //	                   "type":"int16"}]} / {"clear_unimplemented":true} (sim/southbound/sentinel.go)
 //	POST /control    — {"cmd":"pause"}, {"cmd":"resume"}, {"speed":10.0}
+//	                   {"reversion_scale":60.0} — run the DEVICE-SIDE reversion
+//	                   timers 60× the wall clock, so a bench row can observe an
+//	                   actual RvrtTms expiry inside a bench window without the
+//	                   fixture faking the transition. 1 = back to real time; the
+//	                   clock in force is declared on GET /state (.reversion.timebase)
+//	                   and every armed countdown is dropped by the change, so
+//	                   set it BEFORE arming. See sim/southbound/reversion.go for
+//	                   what an accelerated run does and does not establish.
 //	POST /fault      — arm/clear a fault; also: {"kind":"relocate","base":N} / {"clear":true}
 //	                   (sim/southbound/relocate.go, always available); {"kind":"exception_code",
 //	                   "code":1,"on_fc":3,"on_addr":[a,b]} (targeted scoping of the existing
@@ -256,7 +264,12 @@ func main() {
 					srv.SetSpeed(cmd.Speed)
 					log.Printf("modsim: animation speed set to %.1f×", cmd.Speed)
 				}
-				return nil
+				// The DEVICE-SIDE REVERSION CLOCK, which is not the animation
+				// clock above and must not be moved by it — see
+				// simapi.ControlCmd.ReversionScale. The sim logs the change and
+				// declares the resulting clock on GET /state, so a capture taken
+				// afterwards says on its face that it was accelerated.
+				return srv.SetReversionScale(cmd.ReversionScale)
 			},
 		)
 		// Fault injection: POST /fault {"kind":"ack_before_effect","delay_s":30}.

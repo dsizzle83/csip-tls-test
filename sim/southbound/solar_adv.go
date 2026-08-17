@@ -240,6 +240,8 @@ func newSolarServerAdvanced(listenURL string, wmaxW float64, serial string, with
 	regs.OnWrite = ss.solarOnWrite // 704 write-time coherence (see solarOnWrite)
 	regs.OnRead = ss.faults.transportRead
 	ss.installLies() // the lying-device layer, in front of the fault hooks (lying.go)
+	ss.initSolarReversion(regs)
+	go ss.reversionLoop(srv.stop)
 	return ss, nil
 }
 
@@ -255,6 +257,12 @@ func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial stri
 	// solarStep/solarCeilingW/solarSetpointW already receive — see SolarBases'
 	// own doc for why the plumbing goes this way instead of widening signatures.
 	bases.M702Base, bases.M704Base = adv.M702, adv.M704
+	// A device with reversion timers has FACTORY DEFAULT destinations for them.
+	// Seeded after populate704 rather than inside it, because the battery images
+	// build their own 704 through a different path and declare a different
+	// fail-safe (seedPackReversionDestinations) — see that function's doc for
+	// why a PV inverter's and a battery pack's safe states are not the same.
+	seedSolarReversionDestinations(r, adv.M704)
 	r.Set(cursor, sunspec.EndMarker)
 	r.Set(cursor+1, 0)
 	return bases, adv

@@ -1,8 +1,17 @@
 package sim
 
-// reversion704.go — the DEVICE-SIDE REVERSION TIMER for SunSpec model 704, and
-// the accelerated test timebase that lets a row prove ACTUAL EXPIRY without
-// spending the wall-clock seconds the register nominally counts.
+// reversion.go — the DEVICE-SIDE REVERSION TIMER ENGINE these simulators count
+// down, and the accelerated timebase that lets a row prove ACTUAL EXPIRY
+// without spending the wall-clock seconds the register nominally counts.
+//
+// The engine is family-generic: ONE countdown implementation, driven by a table
+// of rvrtTimer descriptors that each say where a timer's registers live and
+// what "the alternate set of function settings" means for the model that owns
+// it. Model 704's five groups are defined here because this is where the engine
+// was born; every other family the sims serve — the 7xx curve models, model 123
+// and the legacy 12x curve family — is defined in reversionsolar.go, derived
+// from the vendored model definitions rather than listed from memory, and
+// pinned by TestEveryServedReversionTimerIsEngineManaged.
 //
 // # What was here before: nothing at all
 //
@@ -15,7 +24,7 @@ package sim
 // expired, and no control ever returned to its reversion value. The registers
 // were storage, not a timer.
 //
-// Two consequences, both of them the reason this file exists:
+// Three consequences, all of them the reason this file exists:
 //
 //   - sim/gw-mayhem's control-reversion-timer scenario says so in its own doc:
 //     "NeedsBench: the register-echo loopback has no reversion engine, so this
@@ -28,6 +37,12 @@ package sim
 //     register that readback is 0 for the whole countdown, so every sample
 //     drifts by the full reversion time and the procedure cannot pass — not
 //     because the DUT is non-conformant but because the fixture has no timer.
+//   - the RC0 §9.5 bench battery could not run row 10 at all. It armed a
+//     fixed-PF control with a window against `modsim -advanced`, watched
+//     PFWInjRvrtTms sit at 258 s for six and a half minutes and PFWInjRvrtRem
+//     read 0 throughout, and correctly REFUSED to record the gateway's own
+//     release of the axis as the device timer lapsing. The engine reached the
+//     battery pack and no solar sim; reversionsolar.go closes that.
 //
 // # WMaxLimPctRvrtTms: units, scale, and the value that means "no reversion"
 //
@@ -91,25 +106,47 @@ package sim
 // # The accelerated timebase — and what it does NOT prove
 //
 // The engine reads the current instant from a ReversionTimebase. The default is
-// WallTimebase: time.Now, 1×, no scaling of any kind. There is no environment
-// variable, no flag, and no simapi route that can change it — the ONLY way to
-// accelerate a timer is for Go code holding the *BatteryServer to call
-// SetReversionTimebase, which no production path, no sim binary and no bench
-// script does. That is the whole design of the knob: acceleration cannot happen
-// by accident or by configuration drift, only by a test saying so in source.
+// WallTimebase: time.Now, 1×, no scaling of any kind, on every sim, every
+// binary and every bench invocation. Nothing in the environment and no flag
+// changes it.
 //
-// It is also SELF-DECLARING, and — since IW15 H6 — the declaration is neither
-// this file's to word nor a thing that stays on the bench. Every timebase
-// implements Declare, which returns an evidence-bundle clock declaration
-// (internal/evidence/bundle's Timebase): the KIND and the SCALE as numbers, and
-// the human label RENDERED FROM THEM by the bundle package. Two consequences,
-// and they are the two halves of what the gate found missing:
+// It CAN now be changed at run time, on the solar sims only, by an explicit
+// operator request: POST /control {"reversion_scale":N} (simapi ControlCmd →
+// SolarServer.SetReversionScale, reversionsolar.go). That route did not exist
+// when this file was written, and the reason it does now is §9.5 row 10: a
+// reversion window a head end programs is minutes long, a bench window is not
+// unbounded, and the alternative — a fixture that FAKES the expiry transition
+// on a short timer — would prove nothing about the state machine under test.
+// Accelerating the clock keeps the whole mechanism real: the same arm, the same
+// countdown, the same publication, the same revert.
 //
-//   - the label rides on GET /state exactly as before
-//     (BatteryPackState.Reversion.Timebase) but is no longer composed here, so
-//     this file cannot spell an accelerated clock "wall" — the mutation the
-//     gate made, which left every test in the tree green because nothing
-//     asserted the string;
+// What keeps that safe to expose is that it is IMPOSSIBLE TO DO SILENTLY:
+//
+//   - it is never a default and never configuration. A sim starts on the wall
+//     clock and stays there unless a request says otherwise, so no bench script
+//     or unit file can drift into it.
+//   - the request is logged by the sim at the moment it lands, naming the
+//     multiplier.
+//   - the resulting clock is SELF-DECLARING on GET /state and in any evidence
+//     bundle that records it (below), and the label is derived from the
+//     declaration rather than composed by hand — so an accelerated sim cannot
+//     spell itself "wall".
+//   - installing a clock DISARMS every running countdown (setTimebase), so a
+//     mid-countdown acceleration cannot silently produce a meaningless
+//     measurement.
+//
+// The declaration is — since IW15 H6 — neither this file's to word nor a thing
+// that stays on the bench. Every timebase implements Declare, which returns an
+// evidence-bundle clock declaration (internal/evidence/bundle's Timebase): the
+// KIND and the SCALE as numbers, and the human label RENDERED FROM THEM by the
+// bundle package. Two consequences, and they are the two halves of what the
+// gate found missing:
+//
+//   - the label rides on GET /state (BatteryPackState.Reversion.Timebase, and
+//     SolarState.Reversion.Timebase on the solar sims) but is not composed
+//     here, so this file cannot spell an accelerated clock "wall" — the
+//     mutation the gate made, which left every test in the tree green because
+//     nothing asserted the string;
 //   - RecordTimebase (below) puts the declaration INTO THE EVIDENCE BUNDLE at
 //     capture time, where REPORT.md prints it as a banner and `certify -verify`
 //     re-derives the label from the numbers. Before that, the declaration
@@ -118,10 +155,11 @@ package sim
 //
 // WHAT AN ACCELERATED PROOF ESTABLISHES: that THIS HARNESS's reversion state
 // machine is correct — that arming sets the remaining-time readback, that the
-// countdown reaches zero, that expiry copies the *Rvrt destination into the
-// controlled point and *EnaRvrt into the enable, that a re-write restarts the
-// countdown and a write of 0 cancels it, and that the pack's physics then
-// follows the reverted setpoint.
+// countdown reaches zero, that expiry applies the model's own alternate set
+// (the *Rvrt destination and *EnaRvrt enable on 704; the default curve index on
+// the 7xx curve models; the disabled state on 123 and the 12x family), that a
+// re-write restarts the countdown and a write of 0 cancels it, and that the
+// device's physics then follows the reverted command.
 //
 // WHAT IT DOES NOT ESTABLISH, AND MUST NEVER BE CITED FOR: anything about a
 // real device's TIMING. It says nothing about whether real firmware honours
@@ -323,6 +361,57 @@ func (tb *ScaledTimebase) Declare() bundle.Timebase {
 // above, pinned by internal/evidence/bundle's timebase_pin_test.go.
 func (tb *ScaledTimebase) Label() string { return tb.Declare().Label }
 
+// ── One reversion timer ──────────────────────────────────────────────────────
+
+// rvrtTimer is ONE reversion timer as the engine sees it: where its registers
+// live, how to read the programmed timeout, where (if anywhere) the model can
+// publish the remaining time, and what "the alternate set of function settings"
+// (SunSpec DER Information Model V1.2 §3.2) means for the model that owns it.
+//
+// The descriptor is per-TIMER, not per-model, because both shapes occur: model
+// 704 carries five independent timers in one block and model 705 carries one.
+type rvrtTimer struct {
+	// Name is this timer's label on /state, in the log line an expiry writes,
+	// and in the value step returns. The convention is the model id, plus a dot
+	// and the point family when the model carries more than one timer:
+	// "704.WSet", "123.Conn", "705", "126".
+	//
+	// The model id is part of it because the engine's armed set is keyed by
+	// Name and TWO SERVED MODELS SHARE A FAMILY NAME: an advanced solar sim
+	// serves both 123's WMaxLimPct_RvrtTms and 704's WMaxLimPctRvrtTms, and a
+	// bare "WMaxLimPct" would have made those one timer that two different
+	// writes armed and one expiry reverted.
+	Name string
+	// Model is the owning SunSpec model id, used to key the derivation pin
+	// (timerPoints) so a timer cannot claim a point of a model the image does
+	// not serve.
+	Model uint16
+	// Base is the model's DATA-BLOCK base address (past the id/length header).
+	Base uint16
+	// L is the layout Tms/Rem resolve against. On the block-structured models
+	// (123, 704) it is the whole model; on the curve models (705/706/711/712
+	// and the 12x family) it is the HEADER layout, which is where the reversion
+	// points live.
+	L *sunspec.Layout
+	// Tms is the reversion timeout point: RW, whole seconds, unscaled.
+	Tms string
+	// Rem is the remaining-time readback, or "" on a model that DEFINES NONE.
+	// Model 123 and the whole 12x curve family are in the second class — they
+	// declare a timeout and no countdown — so on those models the countdown is
+	// not observable through the registers at all, only the expiry transition
+	// is. That is a property of the models, not an omission here; /state
+	// carries what the wire cannot.
+	Rem string
+	// Revert applies this model's alternate set of function settings. It runs
+	// OUTSIDE the engine's lock, exactly like every other register write the
+	// sims do, and is called at most once per expiry.
+	Revert func(r *RegisterMap)
+}
+
+// key is the (model, timeout point) identity used by the derivation pin. Name
+// is for humans and may be shortened; this may not.
+func (t rvrtTimer) key() string { return fmt.Sprintf("%d.%s", t.Model, t.Tms) }
+
 // ── The reversion groups of model 704 ────────────────────────────────────────
 
 // rvrt704Group names one reversion timer's registers. Field names are L704
@@ -383,188 +472,39 @@ var rvrt704Groups = []rvrt704Group{
 	},
 }
 
-// ── The engine ───────────────────────────────────────────────────────────────
-
-// rvrt704Engine is the device-side reversion timer set for one model 704 block.
+// rvrt704Timers turns the five groups above into engine timers for the model
+// 704 block at base.
 //
-// The DEADLINE lives in Go, not in a register, because RvrtRem is a whole-second
-// uint32 and a countdown stored only there would quantise its own expiry to the
-// second and drift by one every time it was republished. The register is the
-// PUBLICATION of the deadline (ceil of the remaining seconds, which is what a
-// client polling it must see), never the state of record. Everything a Modbus
-// client can observe still comes out of the register bank.
-type rvrt704Engine struct {
-	mu   sync.Mutex
-	tb   ReversionTimebase
-	base uint16 // model 704 data-block base address
-
-	// armed maps group name -> deadline in the timebase's own frame. Absent
-	// means disarmed, which is also what RvrtTms==0 means on the wire.
-	armed map[string]time.Time
-}
-
-func newRvrt704Engine(base uint16) *rvrt704Engine {
-	return &rvrt704Engine{tb: WallTimebase(), base: base, armed: make(map[string]time.Time, len(rvrt704Groups))}
-}
-
-// setTimebase swaps the clock the timers count against and disarms everything,
-// because a deadline computed in one frame is meaningless in another: a
-// wall-clock deadline of 15:04:05 read against a manual clock parked in the
-// year 2000 is 26 years in the future, and a test that swapped the clock
-// mid-countdown without this would silently prove nothing.
-func (e *rvrt704Engine) setTimebase(tb ReversionTimebase, r *RegisterMap) {
-	if tb == nil {
-		tb = WallTimebase()
-	}
-	e.mu.Lock()
-	e.tb = tb
-	clear(e.armed)
-	e.mu.Unlock()
-	e.publish(r)
-}
-
-// timebaseLabel names the current clock for GET /state.
-func (e *rvrt704Engine) timebaseLabel() string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.tb.Label()
-}
-
-// covers reports whether a Modbus write of n registers starting at start
-// touched any register of a point at layout offset off. Any overlap counts: a
-// single-register FC6 into the low word of a uint32 timer is still a write to
-// that timer, and the engine re-reads the full point from the bank afterwards
-// rather than trusting the fragment it saw.
-func (e *rvrt704Engine) covers(start uint16, n int, off int, width uint16) bool {
-	if n <= 0 || off < 0 {
-		return false
-	}
-	pt := uint32(e.base) + uint32(off)
-	wr := uint32(start)
-	return wr < pt+uint32(width) && pt < wr+uint32(n)
-}
-
-// observeWrite is the write hook: a Modbus write that LANDED on a group's
-// RvrtTms registers arms, re-arms or cancels that group's timer.
-//
-// THE TRIGGER IS THE WRITE, NOT A VALUE CHANGE, and that is load-bearing:
-// SS-MODBUS-CONF v1.4 REV-2 (Reversion Time Update) rewrites the timer register
-// with THE SAME reversion time after half the countdown has elapsed and
-// requires the countdown to restart from there. An engine that re-armed only on
-// a changed value would leave REV-2's countdown running out at the original
-// instant and fail a conforming procedure.
-//
-// A write elsewhere in the block — the controlled point, a ramp rate, the
-// anti-islanding enable — deliberately does NOT restart an armed countdown.
-// derbase writes the whole 704 block read-modify-write, so its RvrtTms lands in
-// the same transaction as its setpoint and the refresh happens anyway; making
-// any 704 write refresh every timer would additionally mean that writing
-// AntiIslEna silently extended a WSet dead-man switch, which is a device
-// behaviour nobody would be able to justify to a reviewer.
-func (e *rvrt704Engine) observeWrite(r *RegisterMap, start uint16, n int) {
-	if e == nil || r == nil || n <= 0 {
-		return
-	}
-	regs := readSlice(r, e.base, sunspec.L704.Len())
-	v := sunspec.L704.View(regs)
-
-	e.mu.Lock()
-	now := e.tb.Now()
+// Model 704 is the ONLY family in this repo whose alternate set includes an
+// ENABLE (*EnaRvrt). That is what makes the adjudicated "lapse" posture
+// expressible on it and only on it: a head end that arms a window with
+// *EnaRvrt = 0 is stating that at expiry this axis's function is simply not
+// enabled — §3.2's "alternate set of function settings" combined with §3.3's
+// "when the enable field is set to 0, any changes made to the setting will not
+// take effect". Every other family's alternate is a curve index or nothing at
+// all; see reversionsolar.go.
+func rvrt704Timers(base uint16) []rvrtTimer {
+	out := make([]rvrtTimer, 0, len(rvrt704Groups))
 	for _, g := range rvrt704Groups {
-		if !e.covers(start, n, sunspec.L704.Offset(g.Tms), layoutFieldWidth(sunspec.L704, g.Tms)) {
-			continue
-		}
-		// ok=false is the 0xFFFFFFFF not-implemented sentinel (or an absent
-		// point) — a device saying it has no such timer, which is disarmed for
-		// the same reason zero is but for a different reason on the wire.
-		switch tms, ok := v.U32(g.Tms); {
-		case !ok || tms == 0:
-			delete(e.armed, g.Name)
-		default:
-			e.armed[g.Name] = now.Add(time.Duration(tms) * time.Second)
-		}
+		g := g
+		out = append(out, rvrtTimer{
+			Name:  "704." + g.Name,
+			Model: sunspec.ModelDERCtlAC,
+			Base:  base, L: sunspec.L704,
+			Tms: g.Tms, Rem: g.Rem,
+			Revert: func(r *RegisterMap) { revert704Group(r, base, g) },
+		})
 	}
-	e.mu.Unlock()
-
-	// Republish every group's remaining-time readback, not just the ones this
-	// write armed. RvrtRem is read-only in the model but the register bank does
-	// not enforce that (protecting it would make every derbase whole-block
-	// read-modify-write during a live countdown log a masked-write rejection,
-	// since the value it read a moment ago is no longer the value it is writing
-	// back). Republishing after every write is the cheaper and quieter way to
-	// keep the engine, not the client, authoritative over the countdown.
-	e.publish(r)
+	return out
 }
 
-// step advances every armed timer against the current timebase instant: it
-// republishes the remaining-time readbacks and applies the reversion of any
-// timer that has reached zero. It returns the names of the groups that expired
-// on THIS call, so the caller can give the revert its physical consequences
-// exactly once.
-//
-// Called from the pack's own reversion loop in production and directly by unit
-// tests — the same split batteryPackStep already uses, and the reason an
-// accelerated proof needs no ticker and no sleep.
-func (e *rvrt704Engine) step(r *RegisterMap) []string {
-	if e == nil || r == nil {
-		return nil
-	}
-	e.mu.Lock()
-	now := e.tb.Now()
-	var expired []string
-	for _, g := range rvrt704Groups {
-		deadline, ok := e.armed[g.Name]
-		if !ok || now.Before(deadline) {
-			continue
-		}
-		delete(e.armed, g.Name)
-		expired = append(expired, g.Name)
-	}
-	e.mu.Unlock()
-
-	for _, name := range expired {
-		e.applyRevert(r, name)
-	}
-	e.publish(r)
-	return expired
-}
-
-// disarmAll cancels every timer without reverting anything — what a POWER CYCLE
-// does. A reversion timer is volatile control state: a device that came back
-// from a rail drop still counting down a timer a controller armed before the
-// drop would be honouring an instruction it has no other memory of. This is
-// packPowerOnReset's counterpart for the 704 block, and it deliberately does
-// NOT apply the reversion values: the power-on reset already returns the
-// controls to their own defaults, and reverting on top of that would let a
-// controller's stale *Rvrt destination survive a power cycle that erased
-// everything else it wrote.
-func (e *rvrt704Engine) disarmAll(r *RegisterMap) {
-	if e == nil {
-		return
-	}
-	e.mu.Lock()
-	clear(e.armed)
-	e.mu.Unlock()
-	e.publish(r)
-}
-
-// applyRevert copies one group's reversion destination over its controlled
+// revert704Group copies one group's reversion destination over its controlled
 // points and its enable. The value copy is RAW, register for register: a
 // controlled point and its *Rvrt sibling are declared with the same scale
 // factor, so decoding and re-encoding could only lose precision (or, on a
 // mis-typed pair, silently rescale) and could never add anything.
-func (e *rvrt704Engine) applyRevert(r *RegisterMap, name string) {
-	var g rvrt704Group
-	for _, cand := range rvrt704Groups {
-		if cand.Name == name {
-			g = cand
-			break
-		}
-	}
-	if g.Name == "" {
-		return
-	}
-	regs := readSlice(r, e.base, sunspec.L704.Len())
+func revert704Group(r *RegisterMap, base uint16, g rvrt704Group) {
+	regs := readSlice(r, base, sunspec.L704.Len())
 	for _, pair := range g.Values {
 		to, from := sunspec.L704.Offset(pair[0]), sunspec.L704.Offset(pair[1])
 		width := int(layoutFieldWidth(sunspec.L704, pair[0]))
@@ -576,75 +516,430 @@ func (e *rvrt704Engine) applyRevert(r *RegisterMap, name string) {
 	if to, from := sunspec.L704.Offset(g.Ena), sunspec.L704.Offset(g.EnaRvrt); to >= 0 && from >= 0 {
 		regs[to] = regs[from]
 	}
-	writeSlice(r, e.base, regs)
+	writeSlice(r, base, regs)
 }
 
-// publish writes every group's remaining-time readback from the engine's own
+// ── The engine ───────────────────────────────────────────────────────────────
+
+// rvrtEngine is a set of device-side reversion timers over one register map.
+//
+// The DEADLINE lives in Go, not in a register, because RvrtRem is a whole-second
+// integer and a countdown stored only there would quantise its own expiry to the
+// second and drift by one every time it was republished. The register is the
+// PUBLICATION of the deadline (ceil of the remaining seconds, which is what a
+// client polling it must see), never the state of record. Everything a Modbus
+// client can observe still comes out of the register bank.
+type rvrtEngine struct {
+	mu     sync.Mutex
+	tb     ReversionTimebase
+	timers []rvrtTimer
+
+	// armed maps timer Name -> deadline in the timebase's own frame. Absent
+	// means disarmed, which is also what RvrtTms==0 means on the wire.
+	armed map[string]time.Time
+}
+
+// newRvrtEngine builds an engine over an explicit timer table, on the wall
+// clock.
+func newRvrtEngine(timers []rvrtTimer) *rvrtEngine {
+	return &rvrtEngine{tb: WallTimebase(), timers: timers, armed: make(map[string]time.Time, len(timers))}
+}
+
+// newRvrt704Engine is the battery pack's engine: model 704's five groups and
+// nothing else, because that is the only reversion-bearing model the pack
+// serves.
+func newRvrt704Engine(base uint16) *rvrtEngine { return newRvrtEngine(rvrt704Timers(base)) }
+
+// timerPoints reports every timer's (model, timeout point) identity, for the
+// derivation pin that requires the table to cover exactly what the image
+// serves. Exists so a test can ask the engine what it manages instead of
+// re-deriving the answer from the same table it is checking.
+func (e *rvrtEngine) timerPoints() []string {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, 0, len(e.timers))
+	for _, t := range e.timers {
+		out = append(out, t.key())
+	}
+	return out
+}
+
+// setTimers replaces the timer table — what a device whose MODEL MAP was
+// RE-LAID at run time needs, since a descriptor carries a base address — and
+// disarms everything, for the same reason setTimebase does: a deadline armed
+// against a register that has since moved is a deadline against someone else's
+// register.
+func (e *rvrtEngine) setTimers(timers []rvrtTimer, r *RegisterMap) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	e.timers = timers
+	clear(e.armed)
+	e.mu.Unlock()
+	e.publish(r)
+}
+
+// setTimebase swaps the clock the timers count against and disarms everything,
+// because a deadline computed in one frame is meaningless in another: a
+// wall-clock deadline of 15:04:05 read against a manual clock parked in the
+// year 2000 is 26 years in the future, and a test that swapped the clock
+// mid-countdown without this would silently prove nothing.
+func (e *rvrtEngine) setTimebase(tb ReversionTimebase, r *RegisterMap) {
+	if tb == nil {
+		tb = WallTimebase()
+	}
+	e.mu.Lock()
+	e.tb = tb
+	clear(e.armed)
+	e.mu.Unlock()
+	e.publish(r)
+}
+
+// timebase returns the clock currently installed, so a bundle-producing run can
+// record its declaration (RecordTimebase) without holding a second copy of it.
+func (e *rvrtEngine) timebase() ReversionTimebase {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.tb
+}
+
+// timebaseLabel names the current clock for GET /state.
+func (e *rvrtEngine) timebaseLabel() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.tb.Label()
+}
+
+// covers reports whether a Modbus write of n registers starting at start
+// touched any register of the point named on t. Any overlap counts: a single
+// register FC6 into the low word of a uint32 timer is still a write to that
+// timer, and the engine re-reads the full point from the bank afterwards rather
+// than trusting the fragment it saw.
+func (t rvrtTimer) covers(start uint16, n int) bool {
+	off := t.L.Offset(t.Tms)
+	if n <= 0 || off < 0 {
+		return false
+	}
+	pt := uint32(t.Base) + uint32(off)
+	width := uint32(layoutFieldWidth(t.L, t.Tms))
+	wr := uint32(start)
+	return wr < pt+width && pt < wr+uint32(n)
+}
+
+// observeWrite is the write hook: a Modbus write that LANDED on a timer's
+// RvrtTms registers arms, re-arms or cancels that timer.
+//
+// THE TRIGGER IS THE WRITE, NOT A VALUE CHANGE, and that is load-bearing twice
+// over. SS-MODBUS-CONF v1.4 REV-2 (Reversion Time Update) rewrites the timer
+// register with THE SAME reversion time after half the countdown has elapsed
+// and requires the countdown to restart from there; an engine that re-armed
+// only on a changed value would leave REV-2's countdown running out at the
+// original instant and fail a conforming procedure. SunSpec DER Information
+// Model V1.2 §3.2 states the same rule in general terms: "If a setting is
+// updated while the reversion timer is active or the function is re-enabled,
+// the reversion timer SHALL be reinitialized with the reversion timeout value,
+// and the timer is restarted."
+//
+// A write elsewhere in the block — the controlled point, a ramp rate, the
+// anti-islanding enable — deliberately does NOT restart an armed countdown.
+// derbase writes the whole 704 block read-modify-write, so its RvrtTms lands in
+// the same transaction as its setpoint and the refresh happens anyway; making
+// any 704 write refresh every timer would additionally mean that writing
+// AntiIslEna silently extended a WSet dead-man switch, which is a device
+// behaviour nobody would be able to justify to a reviewer.
+//
+// ARMING IS NOT GATED ON THE FUNCTION'S ENABLE, and that is a deliberate reading
+// of §3.2 rather than an oversight. §3.2's Disabled state is "the function SHALL
+// be either not enabled or the reversion timeout value SHALL be set to zero" —
+// which would make a timer written against a disabled function inert. But
+// SS-MODBUS-CONF v1.4 §2.6's REV-1 procedure arms by writing THE TIMER REGISTER
+// ALONE and then requires the remaining-time readback to count down, and a
+// fixture that refused to count for a conforming procedure would be failing the
+// procedure on the fixture's opinion. So: RvrtTms > 0 arms, and the enable
+// decides only what the expiry's alternate set means.
+func (e *rvrtEngine) observeWrite(r *RegisterMap, start uint16, n int) {
+	if e == nil || r == nil || n <= 0 {
+		return
+	}
+	e.mu.Lock()
+	now := e.tb.Now()
+	for _, t := range e.timers {
+		if !t.covers(start, n) {
+			continue
+		}
+		// ok=false is the type's not-implemented sentinel (or an absent point)
+		// — a device saying it has no such timer, which is disarmed for the
+		// same reason zero is but for a different reason on the wire.
+		switch tms, ok := t.readTms(r); {
+		case !ok || tms == 0:
+			delete(e.armed, t.Name)
+		default:
+			e.armed[t.Name] = now.Add(time.Duration(tms) * time.Second)
+		}
+	}
+	e.mu.Unlock()
+
+	// Republish every timer's remaining-time readback, not just the ones this
+	// write armed. RvrtRem is read-only in the models but the register bank does
+	// not enforce that (protecting it would make every derbase whole-block
+	// read-modify-write during a live countdown log a masked-write rejection,
+	// since the value it read a moment ago is no longer the value it is writing
+	// back). Republishing after every write is the cheaper and quieter way to
+	// keep the engine, not the client, authoritative over the countdown.
+	e.publish(r)
+}
+
+// readTms reads a timer's programmed timeout out of the register bank, at
+// whatever width the model declares it (uint32 on 704 and the 7xx curve models,
+// uint16 on 123 and the 12x family). ok=false means absent or not-implemented.
+func (t rvrtTimer) readTms(r *RegisterMap) (uint64, bool) {
+	regs := readSlice(r, t.Base, t.L.Len())
+	return t.L.View(regs).Raw(t.Tms)
+}
+
+// step advances every armed timer against the current timebase instant: it
+// republishes the remaining-time readbacks and applies the reversion of any
+// timer that has reached zero. It returns the names of the timers that expired
+// on THIS call, so the caller can give the revert its physical consequences
+// exactly once.
+//
+// Expiry moves a timer to §3.2's Stopped state — it is REMOVED from the armed
+// set and only a fresh write may restart it — so a second step with no
+// intervening write reverts nothing.
+//
+// Called from the sim's own reversion loop in production and directly by unit
+// tests — the same split batteryPackStep already uses, and the reason an
+// accelerated proof needs no ticker and no sleep.
+func (e *rvrtEngine) step(r *RegisterMap) []string {
+	if e == nil || r == nil {
+		return nil
+	}
+	e.mu.Lock()
+	now := e.tb.Now()
+	var expired []rvrtTimer
+	for _, t := range e.timers {
+		deadline, ok := e.armed[t.Name]
+		if !ok || now.Before(deadline) {
+			continue
+		}
+		delete(e.armed, t.Name)
+		expired = append(expired, t)
+	}
+	e.mu.Unlock()
+
+	names := make([]string, 0, len(expired))
+	for _, t := range expired {
+		if t.Revert != nil {
+			t.Revert(r)
+		}
+		names = append(names, t.Name)
+	}
+	e.publish(r)
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// disarmAll cancels every timer without reverting anything — what a POWER CYCLE
+// does. A reversion timer is volatile control state: a device that came back
+// from a rail drop still counting down a timer a controller armed before the
+// drop would be honouring an instruction it has no other memory of. This is
+// packPowerOnReset's counterpart, and it deliberately does NOT apply the
+// reversion values: the power-on reset already returns the controls to their own
+// defaults, and reverting on top of that would let a controller's stale *Rvrt
+// destination survive a power cycle that erased everything else it wrote.
+func (e *rvrtEngine) disarmAll(r *RegisterMap) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	clear(e.armed)
+	e.mu.Unlock()
+	e.publish(r)
+}
+
+// publish writes every timer's remaining-time readback from the engine's own
 // state: the CEILING of the seconds left on an armed timer, and zero on a
-// disarmed one.
+// disarmed one. Timers whose model defines no remaining-time point are skipped
+// — there is nowhere on the wire to publish them (see rvrtTimer.Rem).
 //
 // Ceiling rather than round or truncate, because the readback is what a client
 // polls to decide whether the timer has fired: truncation would report 0 for
 // the last full second of a live timer, telling a conforming controller its
 // control had already reverted while the device was still holding it.
-func (e *rvrt704Engine) publish(r *RegisterMap) {
+func (e *rvrtEngine) publish(r *RegisterMap) {
 	if e == nil || r == nil {
 		return
 	}
+	// The timer table itself is snapshotted under the lock, not just the
+	// remaining times: setTimers can replace it from another goroutine, and a
+	// publish that iterated the live slice would be writing a countdown into
+	// the register bank of a model that has moved.
 	e.mu.Lock()
 	now := e.tb.Now()
-	rem := make(map[string]uint32, len(rvrt704Groups))
-	for _, g := range rvrt704Groups {
-		deadline, ok := e.armed[g.Name]
+	timers := append([]rvrtTimer(nil), e.timers...)
+	rem := make(map[string]uint64, len(timers))
+	for _, t := range timers {
+		deadline, ok := e.armed[t.Name]
 		if !ok {
-			rem[g.Name] = 0
+			rem[t.Name] = 0
 			continue
 		}
 		left := deadline.Sub(now)
 		if left <= 0 {
 			// Reached zero but not yet stepped: report 0 rather than a negative
 			// wrap. The expiry itself lands on the next step.
-			rem[g.Name] = 0
+			rem[t.Name] = 0
 			continue
 		}
-		rem[g.Name] = uint32(math.Ceil(left.Seconds()))
+		rem[t.Name] = uint64(math.Ceil(left.Seconds()))
 	}
 	e.mu.Unlock()
 
-	for _, g := range rvrt704Groups {
-		off := sunspec.L704.Offset(g.Rem)
-		if off < 0 {
+	for _, t := range timers {
+		if t.Rem == "" {
 			continue
 		}
-		setU32Reg(r, e.base+uint16(off), rem[g.Name])
+		setLayoutUint(r, t.Base, t.L, t.Rem, rem[t.Name])
 	}
 }
 
-// armedGroups reports the live countdowns for GET /state, newest state first
-// read from the engine and the register bank together so the two can be
-// compared by a reader rather than taken on trust.
-func (e *rvrt704Engine) armedGroups(r *RegisterMap) []PackReversionGroupState {
+// armedGroups reports the live countdowns for GET /state, read from the engine
+// and the register bank together so the two can be compared by a reader rather
+// than taken on trust.
+//
+// RemS on a model that publishes no remaining-time point is the ENGINE's
+// number, because there is no register to read it from — and it is exactly why
+// this section exists for those models: it is the only place the countdown of a
+// 123 or 12x timer is visible at all.
+func (e *rvrtEngine) armedGroups(r *RegisterMap) []ReversionGroupState {
 	if e == nil || r == nil {
 		return nil
 	}
-	regs := readSlice(r, e.base, sunspec.L704.Len())
-	v := sunspec.L704.View(regs)
-
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	var out []PackReversionGroupState
-	for _, g := range rvrt704Groups {
-		tms, tmsOK := v.U32(g.Tms)
-		rem, _ := v.U32(g.Rem)
-		_, armed := e.armed[g.Name]
-		if !armed && (!tmsOK || tms == 0) {
+	now := e.tb.Now()
+	type live struct {
+		armed bool
+		rem   uint64
+	}
+	timers := append([]rvrtTimer(nil), e.timers...)
+	state := make(map[string]live, len(timers))
+	for _, t := range timers {
+		deadline, ok := e.armed[t.Name]
+		l := live{armed: ok}
+		if ok {
+			if left := deadline.Sub(now); left > 0 {
+				l.rem = uint64(math.Ceil(left.Seconds()))
+			}
+		}
+		state[t.Name] = l
+	}
+	e.mu.Unlock()
+
+	var out []ReversionGroupState
+	for _, t := range timers {
+		tms, tmsOK := t.readTms(r)
+		l := state[t.Name]
+		if !l.armed && (!tmsOK || tms == 0) {
 			continue // neither configured nor running: nothing to say about it
 		}
-		out = append(out, PackReversionGroupState{
-			Name: g.Name, Armed: armed, TmsS: tms, RemS: rem,
+		rem := l.rem
+		if t.Rem != "" {
+			regs := readSlice(r, t.Base, t.L.Len())
+			if v, ok := t.L.View(regs).Raw(t.Rem); ok {
+				rem = v // the wire's own answer, so /state and Modbus can be compared
+			}
+		}
+		out = append(out, ReversionGroupState{
+			Name: t.Name, Model: t.Model, Armed: l.armed,
+			TmsS: uint32(tms), RemS: uint32(rem), RemOnWire: t.Rem != "",
 		})
 	}
 	return out
+}
+
+// ── /state ───────────────────────────────────────────────────────────────────
+
+// ReversionState is a sim's reversion engine on GET /state.
+type ReversionState struct {
+	// Timebase names the clock the timers counted down against. It reads
+	// "wall" on every production and bench path that has not explicitly asked
+	// for acceleration. ANYTHING ELSE means the run was ACCELERATED and its
+	// timings are evidence about this harness's state machine only — never
+	// about a real device. It is published rather than merely documented so an
+	// evidence bundle cannot be misread later.
+	Timebase string `json:"timebase"`
+	// Groups lists every reversion timer that is configured (RvrtTms non-zero)
+	// or running. A timer that is neither is omitted rather than reported as a
+	// row of zeros, so what is present on /state is what a reader must account
+	// for.
+	Groups []ReversionGroupState `json:"groups,omitempty"`
+}
+
+// ReversionGroupState is one reversion timer: what it was programmed for,
+// whether the engine is counting it, and what is left. Armed and RemS come from
+// two different places on purpose — the engine and the wire — so a row can prove
+// they agree.
+type ReversionGroupState struct {
+	Name  string `json:"name"`
+	Model uint16 `json:"model"`
+	Armed bool   `json:"armed"`
+	TmsS  uint32 `json:"tms_s"`
+	RemS  uint32 `json:"rem_s"`
+	// RemOnWire says whether rem_s can also be read from a register. It is
+	// FALSE for model 123 and the legacy 12x curve family, which declare a
+	// reversion timeout and no remaining-time point at all — on those models
+	// this JSON is the only countdown there is, and a reader who assumed
+	// otherwise would go looking for a register that does not exist.
+	RemOnWire bool `json:"rem_on_wire"`
+}
+
+// PackReversionState / PackReversionGroupState are the names the battery pack's
+// /state document was written against, kept as aliases so that document — and
+// anything decoding it — is unchanged by the engine becoming family-generic.
+type (
+	PackReversionState      = ReversionState
+	PackReversionGroupState = ReversionGroupState
+)
+
+// ── Register helpers ─────────────────────────────────────────────────────────
+
+// setLayoutUint writes an unsigned value into a named point of a
+// layout-described block, at the width the layout declares (one register or
+// two). It exists because the reversion engine spans models that declare their
+// time points at different widths — uint32 on 704/705/706/711/712, uint16 on
+// 123 and the 12x family — and a helper that assumed one of them would silently
+// write half a value on the other.
+//
+// A value too wide for the declared field is clamped one below the type's
+// not-implemented sentinel rather than truncated: reporting 0xFFFF ("this
+// device has no such point") for a live countdown would be a lie of a
+// completely different kind from reporting a saturated one.
+func setLayoutUint(r *RegisterMap, base uint16, l *sunspec.Layout, name string, val uint64) {
+	off := l.Offset(name)
+	if off < 0 {
+		return
+	}
+	switch layoutFieldWidth(l, name) {
+	case 1:
+		if val > 0xFFFE {
+			val = 0xFFFE
+		}
+		r.Set(base+uint16(off), uint16(val))
+	case 2:
+		if val > 0xFFFFFFFE {
+			val = 0xFFFFFFFE
+		}
+		setU32Reg(r, base+uint16(off), uint32(val))
+	}
 }
 
 // setU32Reg writes a big-endian uint32 across two holding registers, the

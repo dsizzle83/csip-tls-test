@@ -70,13 +70,14 @@ type BatteryServer struct {
 	// faults.go vocabulary alone exactly as they always have.
 	lies *lieController
 
-	// rvrt is the model 704 REVERSION-TIMER engine (reversion704.go),
-	// installed by the pack constructors on the 704-capable shape only. Nil
-	// everywhere else, which is what keeps the historical images' 704 block
-	// exactly the inert register store it has always been. It counts down on
-	// the WALL CLOCK unless a test explicitly installs another timebase — see
-	// SetReversionTimebase.
-	rvrt *rvrt704Engine
+	// rvrt is the REVERSION-TIMER engine (reversion.go), installed by the pack
+	// constructors on the 704-capable shape only and carrying model 704's five
+	// groups and nothing else — 704 is the only reversion-bearing model this
+	// image serves. Nil everywhere else, which is what keeps the historical
+	// images' 704 block exactly the inert register store it has always been. It
+	// counts down on the WALL CLOCK unless a test explicitly installs another
+	// timebase — see SetReversionTimebase.
+	rvrt *rvrtEngine
 }
 
 // batteryFaultKinds is the set of POST /fault kinds the battery sim advertises.

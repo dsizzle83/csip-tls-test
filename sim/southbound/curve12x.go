@@ -77,6 +77,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	modbuslib "github.com/simonvetter/modbus"
 
@@ -357,6 +358,21 @@ var solarLegacyCurveFaultKinds = func() map[FaultKind]bool {
 	return m
 }()
 
+// parseShortBlockFault recognises a legacy_short_block body. It is separate
+// from legacyFaults.apply because that layer holds BOOLEAN flags consulted on
+// the write path, and this kind is not one: it re-lays the served register
+// image, which only the SolarServer can do. Returning ok=true for a body of
+// this kind — whatever else is wrong with it — is what lets ApplyFault refuse
+// it BY NAME on a sim that serves no legacy curves, instead of letting it fall
+// through to the fault controller and be reported as an unknown kind.
+func parseShortBlockFault(body []byte) (FaultSpec, bool) {
+	var spec FaultSpec
+	if err := json.Unmarshal(body, &spec); err != nil {
+		return FaultSpec{}, false // not ours to reject; the next layer will report it
+	}
+	return spec, spec.Kind == FaultLegacyShortBlock
+}
+
 // apply arms or clears a legacy fault. handled is false for a kind this layer
 // does not own, so ApplyFault can pass it on rather than calling it unknown.
 func (f *legacyFaults) apply(body []byte) (handled bool, err error) {
@@ -386,21 +402,54 @@ func (f *legacyFaults) apply(body []byte) (handled bool, err error) {
 
 // ── The legacy curve layer ───────────────────────────────────────────────────
 
-// legacyCurveLayer is the served legacy curve family plus its fault state. It
-// hangs off SolarServer and is nil on every sim that does not serve the family,
-// so nothing here can change the behaviour of an existing profile.
-type legacyCurveLayer struct {
+// legacyLayout is the CURRENT geometry of the served legacy-curve region:
+// which model sits where, how wide its banks are, and where the region ends.
+//
+// It is a value that gets REPLACED WHOLE rather than a set of fields that get
+// mutated, and it is read through an atomic pointer, because the runtime
+// short-block lever re-lays the region while the Modbus goroutine is resolving
+// writes against it. A reader that had picked up the old block table and the
+// new base addresses would write into the gap between two models.
+type legacyLayout struct {
 	blocks []legacyBankBlock
-	faults legacyFaults
 
 	m127, m128, m160 uint16 // data-block bases, 0 when not served
 	m160N            int
 	end              uint16 // last register the legacy curve models occupy
+
+	// shortBlockModel is the model whose banks are laid out short, or 0. It
+	// rides on the geometry rather than beside it so that "which image is
+	// served" is one atomically-swapped fact.
+	shortBlockModel uint16
 }
+
+// legacyCurveLayer is the served legacy curve family plus its fault state. It
+// hangs off SolarServer and is nil on every sim that does not serve the family,
+// so nothing here can change the behaviour of an existing profile.
+type legacyCurveLayer struct {
+	faults legacyFaults
+
+	// geom is the live geometry (see legacyLayout). Never nil after
+	// construction.
+	geom atomic.Pointer[legacyLayout]
+
+	// The construction inputs a re-lay has to reproduce. Immutable after
+	// construction, so they need no lock.
+	start uint16  // first register of the legacy-curve region
+	wmaxW float64 // model 134's WRef
+	ncrv  int     // resolved bank count
+
+	// relay serialises re-lays against each other. The atomic pointer makes a
+	// re-lay invisible to READERS; this makes two concurrent re-lays impossible.
+	relay sync.Mutex
+}
+
+// layout returns the live geometry.
+func (l *legacyCurveLayer) layout() *legacyLayout { return l.geom.Load() }
 
 // blockAt returns the block containing addr.
 func (l *legacyCurveLayer) blockAt(addr uint16) (legacyBankBlock, bool) {
-	for _, b := range l.blocks {
+	for _, b := range l.layout().blocks {
 		if addr >= b.base && addr < b.base+uint16(b.dataLen) {
 			return b, true
 		}
@@ -519,9 +568,7 @@ func NewSolarServerLegacyCurves(listenURL string, wmaxW float64, serial string,
 	opt LegacyCurveOptions) (*SolarServer, error) {
 	regs := &RegisterMap{regs: make(map[uint16]uint16)}
 	bases, cursor := populateSolarCore(regs, wmaxW, serial)
-	layer, cursor := populateLegacyCurves(regs, cursor, wmaxW, opt)
-	regs.Set(cursor, sunspec.EndMarker)
-	regs.Set(cursor+1, 0)
+	layer := newLegacyCurveLayer(regs, cursor, wmaxW, opt)
 
 	ss := &SolarServer{bases: bases, wmaxW: wmaxW, legacy: layer}
 	ss.faults.label = "solar-legacy-curves"
@@ -539,6 +586,8 @@ func NewSolarServerLegacyCurves(listenURL string, wmaxW float64, serial string,
 	regs.OnRead = ss.faults.transportRead
 	ss.installLies() // the lying-device layer, in front of the fault hooks
 	ss.chainLegacyWriteError(regs)
+	ss.initSolarReversion(regs)
+	go ss.reversionLoop(srv.stop)
 	return ss, nil
 }
 
@@ -569,11 +618,26 @@ func (ss *SolarServer) chainLegacyWriteError(regs *RegisterMap) {
 	}
 }
 
-// populateLegacyCurves appends the legacy curve family after the legacy solar
-// layout and returns the layer plus the next cursor.
+// newLegacyCurveLayer lays the legacy-curve region down at cursor and returns
+// the layer that owns it, END MARKER INCLUDED.
+//
+// The end marker is written here rather than by the caller because a re-lay
+// (SetLegacyShortBlock) MOVES it — shortening a model's banks shortens the
+// whole region — and a marker written at one call site and moved at another is
+// a marker that will one day be left at the old address, which is a chain that
+// never terminates.
+func newLegacyCurveLayer(r *RegisterMap, cursor uint16, wmaxW float64,
+	opt LegacyCurveOptions) *legacyCurveLayer {
+	l := &legacyCurveLayer{start: cursor, wmaxW: wmaxW, ncrv: opt.NCrvOrDefault()}
+	l.geom.Store(populateLegacyCurves(r, cursor, wmaxW, opt))
+	return l
+}
+
+// populateLegacyCurves appends the legacy curve family at cursor, writes the
+// chain's end marker after it, and returns the resulting geometry.
 func populateLegacyCurves(r *RegisterMap, cursor uint16, wmaxW float64,
-	opt LegacyCurveOptions) (*legacyCurveLayer, uint16) {
-	l := &legacyCurveLayer{}
+	opt LegacyCurveOptions) *legacyLayout {
+	l := &legacyLayout{shortBlockModel: opt.ShortBlockModel}
 	ncrv := opt.NCrvOrDefault()
 
 	for _, spec := range legacyCurveSpecs {
@@ -584,6 +648,8 @@ func populateLegacyCurves(r *RegisterMap, cursor uint16, wmaxW float64,
 	l.m127, cursor = populate127(r, cursor)
 	l.m128, cursor = populate128(r, cursor)
 	l.m160, l.m160N, cursor = populate160(r, cursor, wmaxW)
+	r.Set(cursor, sunspec.EndMarker)
+	r.Set(cursor+1, 0)
 	l.end = cursor + 1
 
 	// Scale factors are read-only device constants (protect.go). Curve-model
@@ -594,7 +660,7 @@ func populateLegacyCurves(r *RegisterMap, cursor uint16, wmaxW float64,
 	protectLayoutSFs(r, l.m127, sunspec.L127)
 	protectLayoutSFs(r, l.m128, sunspec.L128)
 	protectLayoutSFs(r, l.m160, sunspec.L160Hdr)
-	return l, cursor
+	return l
 }
 
 // populateLegacyCurveModel writes one legacy curve model: the ten-register
@@ -821,7 +887,7 @@ func (ss *SolarServer) SetLegacyBankReadOnly(model uint16, bank int, ro bool) er
 	if ss.legacy == nil {
 		return fmt.Errorf("sim: this device serves no legacy curve models")
 	}
-	for _, b := range ss.legacy.blocks {
+	for _, b := range ss.legacy.layout().blocks {
 		if b.id != model {
 			continue
 		}
@@ -836,6 +902,132 @@ func (ss *SolarServer) SetLegacyBankReadOnly(model uint16, bank int, ro bool) er
 		return nil
 	}
 	return fmt.Errorf("sim: this device does not serve M%d", model)
+}
+
+// SetLegacyShortBlock RE-LAYS the served legacy-curve region so that model
+// `model`'s banks are sized to its own NPt instead of the SunSpec fixed twenty
+// point slots — the geometry pathology the fail-closed gate exists to refuse —
+// or, with model = 0, restores the spec layout.
+//
+// # Why this is a re-lay and not a patched header
+//
+// LegacyCurveOptions.ShortBlockModel's doc records why the posture was
+// constructor-only, and it is right about the constraint: "the pathology is a
+// whole-image property: a device that publishes short blocks declares an L that
+// matches them, and every register after that model moves. Arming it at run
+// time would either leave the chain incoherent (an L that lies about a
+// full-size layout, which is a DIFFERENT defect) or require re-laying the image
+// under a live Modbus server."
+//
+// This takes the second option, because the first is a different defect and the
+// bench needs THIS one. §9.5 row 8 asks for a device that presents the fault
+// MID-SESSION — to a gateway that has already adopted it — and the only other
+// way to get there is a modsim restart, which drops the southbound session and
+// re-runs adoption, i.e. does not produce the situation under test.
+//
+// # How it stays atomic
+//
+// The new region is built into a DETACHED register map first, so every
+// populate* function runs exactly as it does at construction, and is then
+// spliced into the live map under the map's own write lock (spliceRegion). A
+// Modbus request therefore sees the whole old image or the whole new one, never
+// a half-laid chain — the same guarantee relocate.go's shiftAll gives, for the
+// same reason.
+//
+// # What moves, and what deliberately does not
+//
+// Everything from this region's start to the end marker is rewritten, so five
+// of the six curve models plus 127/128/160 and the marker itself move. NOTHING
+// BEFORE THE REGION MOVES — models 1/103/120/121/122/123 are laid down by
+// populateSolarCore ahead of it — which is why SolarBases and the fault
+// controller's configured gate/scale addresses (both computed against 123 and
+// 103) stay valid. That is the property that makes a partial re-lay safe here
+// and would not make one safe in relocate.go, whose own doc records the same
+// limitation from the other side.
+//
+// The reversion timer table IS rebuilt, because a timer descriptor carries a
+// base address; every armed countdown is dropped with it. See
+// rebuildSolarReversionTimers.
+//
+// Client-written curve content in the region is NOT preserved: a re-lay is the
+// device re-publishing its model map, and carrying a bank across a stride change
+// would mean deciding which registers of the old geometry correspond to which of
+// the new — a mapping that does not exist, which is exactly what makes the
+// pathology worth testing.
+func (ss *SolarServer) SetLegacyShortBlock(model uint16) error {
+	l := ss.legacy
+	if l == nil {
+		return fmt.Errorf("sim: this device serves no legacy curve models, so it has no curve block to "+
+			"shorten (%s serves the 7xx generation)", ss.faults.label)
+	}
+	if model != 0 {
+		known := false
+		for _, spec := range legacyCurveSpecs {
+			if spec.id == model {
+				known = true
+			}
+		}
+		if !known {
+			return fmt.Errorf("sim: M%d is not a legacy curve model this device serves; the short-block "+
+				"target must be one of 126/129/130/131/132/134", model)
+		}
+	}
+
+	l.relay.Lock()
+	defer l.relay.Unlock()
+	old := l.layout()
+	if old.shortBlockModel == model {
+		return nil // idempotent, like Relocator.Relocate
+	}
+
+	scratch := &RegisterMap{regs: make(map[uint16]uint16)}
+	geom := populateLegacyCurves(scratch, l.start, l.wmaxW, LegacyCurveOptions{
+		NCrv: l.ncrv, ShortBlockModel: model,
+	})
+
+	// Clear as far as the LONGER of the two images reaches, so a shrink leaves
+	// no stale registers past the new end marker for a walker that overruns it
+	// to find.
+	clearTo := old.end
+	if geom.end > clearTo {
+		clearTo = geom.end
+	}
+
+	// GEOMETRY FIRST, THEN CONTENT, and the order is the whole of what makes the
+	// crossover safe.
+	//
+	// The two cannot be swapped atomically against a concurrent Modbus write:
+	// HandleHoldingRegisters releases the map lock BEFORE calling the write
+	// interceptor (deliberately, so an interceptor may call Get/Set), so no lock
+	// this function could take would serialise the descriptor swap against a
+	// write already in the interceptor. What is available is the CHOICE OF
+	// FAILURE, and the two orders differ:
+	//
+	//	geometry first  a write in the window resolves NEW bases against OLD
+	//	                content, lands in the region, and is then overwritten by
+	//	                the splice — the write is LOST, which is what a re-lay
+	//	                does to client-written curve content anyway.
+	//	content first   a write in the window resolves OLD bases against NEW
+	//	                content, lands at an address that now belongs to a
+	//	                different model, and SURVIVES — silent corruption of a
+	//	                model nobody wrote to.
+	//
+	// A lost write during a deliberate geometry change is honest; a write that
+	// lands in the wrong model is not.
+	l.geom.Store(geom)
+	ss.Regs.spliceRegion(l.start, clearTo, scratch)
+	ss.rebuildSolarReversionTimers(ss.Regs)
+
+	if model == 0 {
+		log.Printf("[fault] legacy_short_block: cleared — the legacy curve region was re-laid at the "+
+			"spec block lengths (M%d's banks are full-size again); every armed reversion timer was dropped",
+			old.shortBlockModel)
+		return nil
+	}
+	log.Printf("[fault] legacy_short_block: M%d's banks re-laid SHORT (NPt-sized, not the twenty spec "+
+		"slots) — the chain is internally coherent and every model after M%d has moved; every armed "+
+		"reversion timer was dropped", model, model)
+	return nil
 }
 
 // ── Snapshot ─────────────────────────────────────────────────────────────────
@@ -879,6 +1071,12 @@ type SolarLegacyCurveState struct {
 	Curves []legacyCurveState `json:"curves"`
 	// MPPT is model 160's per-module telemetry.
 	MPPT []legacyMPPTState `json:"mppt,omitempty"`
+	// ShortBlockModel names the curve model currently laid out at a short block
+	// length, or is omitted when the image is at spec geometry. It is on /state
+	// because the pathology is otherwise only visible as arithmetic a reader
+	// has to do on the declared L — and a bench that armed the lever needs its
+	// evidence to say so without that step.
+	ShortBlockModel uint16 `json:"short_block_model,omitempty"`
 }
 
 type legacyMPPTState struct {
@@ -900,7 +1098,12 @@ func (ss *SolarServer) legacySnapshot() *SolarLegacyCurveState {
 	}
 	r := ss.Regs
 	out := &SolarLegacyCurveState{}
-	for _, b := range ss.legacy.blocks {
+	// ONE geometry read for the whole snapshot: a re-lay swaps the pointer, and
+	// a snapshot that re-loaded it per model could describe half of one image
+	// and half of another.
+	geom := ss.legacy.layout()
+	out.ShortBlockModel = geom.shortBlockModel
+	for _, b := range geom.blocks {
 		regs := readSlice(r, b.base, b.dataLen)
 		cs := legacyCurveState{Model: b.id, DeclLen: b.dataLen, Geometry: "ok"}
 		hdr, err := sunspec.ParseLegacyCurveHeader(b.id, regs)
@@ -923,9 +1126,9 @@ func (ss *SolarServer) legacySnapshot() *SolarLegacyCurveState {
 		}
 		out.Curves = append(out.Curves, cs)
 	}
-	if ss.legacy.m160 != 0 {
-		regs := readSlice(r, ss.legacy.m160,
-			sunspec.L160Hdr.Len()+ss.legacy.m160N*sunspec.Blk160)
+	if geom.m160 != 0 {
+		regs := readSlice(r, geom.m160,
+			sunspec.L160Hdr.Len()+geom.m160N*sunspec.Blk160)
 		if st, err := sunspec.ParseLegacy160(regs); err == nil {
 			for _, m := range st.Modules {
 				out.MPPT = append(out.MPPT, legacyMPPTState{

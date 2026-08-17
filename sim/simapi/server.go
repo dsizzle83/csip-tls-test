@@ -43,6 +43,25 @@ type RegistersFunc func() any
 type ControlCmd struct {
 	Cmd   string  `json:"cmd"`   // "pause" | "resume" | "reset"
 	Speed float64 `json:"speed"` // animation speed multiplier (0 = unchanged)
+
+	// ReversionScale multiplies the rate of the DEVICE-SIDE REVERSION CLOCK —
+	// the clock a SunSpec reversion timer (704 *RvrtTms, 705/706/711/712
+	// RvrtTms, 123's four, the 12x family's) counts down against. 0 leaves it
+	// unchanged, matching Speed's convention, so a body sent for any other
+	// purpose cannot reset it; 1 is real time; N > 0 is N× acceleration.
+	//
+	// It is DELIBERATELY SEPARATE FROM Speed. Speed scales the animation — the
+	// irradiance model, the measurements, the physics — and a reversion timer
+	// is not part of the animation; it is the device's dead-man switch, and it
+	// keeps running while the animation is paused. Folding the two together
+	// would make "run the weather faster" silently expire live controls.
+	//
+	// A simulator that has no reversion engine REFUSES a non-zero value rather
+	// than ignoring it, so a bench that asked for acceleration and did not get
+	// it finds out at the request instead of at the end of the row. See
+	// sim/southbound/reversion.go for what an accelerated run does and does not
+	// establish.
+	ReversionScale float64 `json:"reversion_scale"`
 }
 
 // ControlFunc applies a control command to the simulator.

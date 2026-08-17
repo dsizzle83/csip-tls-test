@@ -210,6 +210,27 @@ const (
 	// writer that does not write SnptW=0 AND read it back cannot tell.
 	FaultLegacySnptWStuck FaultKind = "legacy_snptw_stuck"
 
+	// FaultLegacyShortBlock lays a NAMED legacy curve model's banks out at a
+	// block length sized to its own NPt instead of the SunSpec fixed twenty
+	// point slots. The served device stays internally coherent — header,
+	// declared L and stride all agree — and its geometry is wrong in exactly
+	// the one way L arithmetic can catch: (L − hdr) / NCrv is a whole number
+	// and is not the model's spec block length.
+	//
+	// It is the ONLY legacy-curve kind that is not a boolean flag on the write
+	// path: it RE-LAYS the served region, because the pathology is a whole-image
+	// property (every model after the named one moves) and a lever that patched
+	// one header would be arming a DIFFERENT defect — an L that lies about a
+	// full-size layout. Applied by SolarServer.SetLegacyShortBlock; body is
+	// {"kind":"legacy_short_block","model":126} to arm and
+	// {"kind":"legacy_short_block","clear":true} to restore.
+	//
+	// The startup flag modsim -der-legacy-shortblock remains, and reaches the
+	// same geometry through the constructor. This kind exists because §9.5
+	// row 8 needs the fault presented MID-SESSION to an already-adopted device,
+	// which a restart cannot produce.
+	FaultLegacyShortBlock FaultKind = "legacy_short_block"
+
 	// ── Server/transport-plumbing faults — act BELOW the register hooks. ──
 	//
 	// Unlike every fault above (which the faultController shapes on the read or
@@ -269,6 +290,7 @@ type FaultSpec struct {
 	MaxRampWPerS float64   `json:"max_ramp_w_per_s,omitempty"` // ramp_limit: output slew rate (W/s)
 	LatencyMs    int       `json:"latency_ms,omitempty"`       // latency: per-read delay (ms)
 	Bits         uint32    `json:"bits,omitempty"`             // raise_alarm: 701 Alrm bitfield to set
+	Model        uint16    `json:"model,omitempty"`            // legacy_short_block: which curve model to shorten
 	Clear        bool      `json:"clear,omitempty"`            // when true, disarm this Kind
 }
 
