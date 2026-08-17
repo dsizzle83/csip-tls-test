@@ -90,6 +90,7 @@ import (
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/internal/certify/suites"
 	"csip-tls-test/internal/evidence/bundle"
+	"csip-tls-test/internal/writeset"
 )
 
 // Exit codes. See the package doc for why 1 and 2 are distinct.
@@ -127,6 +128,9 @@ type cli struct {
 	list   bool
 	verify string
 	report string
+	writes string
+	writesMRID string
+	writesSettle time.Duration
 	// trr names the evidence bundles a Test Results Report package is built
 	// from, each optionally narrowed to some of its documents as `dir=<doc-key>`.
 	trr      []string
@@ -205,6 +209,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return c.runVerify(stdout, stderr)
 	case c.report != "":
 		return c.runReport(stdout, stderr)
+	case c.writes != "":
+		return c.runWrites(stdout, stderr)
 	case len(c.trr) > 0:
 		return c.runTRR(stdout, stderr)
 	default:
@@ -216,6 +222,17 @@ func (c *cli) bindFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.list, "list", false, "list the catalog and what this tool implements, then exit")
 	fs.StringVar(&c.verify, "verify", "", "re-verify an evidence bundle directory standalone, then exit")
 	fs.StringVar(&c.report, "report", "", "generate the SunSpec submission report from an evidence bundle directory, then exit")
+	fs.StringVar(&c.writes, "writes", "",
+		"extract the southbound REGISTER WRITE SET from an evidence bundle directory (or a bare capture "+
+			"file), then exit. Offline and read-only: it reads capture/*.pcapng and capture/*.keylog and "+
+			"touches nothing else, so it can run against a bundle while a battery is still going")
+	fs.StringVar(&c.writesMRID, "writes-mrid", "",
+		"-writes: report only the writes attributed to this control mRID. The window is [first frame "+
+			"mentioning the mRID .. last such frame + -writes-settle]; the rule is printed with the report")
+	fs.DurationVar(&c.writesSettle, "writes-settle", writeset.DefaultSettle,
+		"-writes: how far past the mRID's last mention a write is still attributed to it (registers are "+
+			"written after the control is fetched, so a window ending at the last mention would exclude "+
+			"the writes the claim is about)")
 	fs.Var(repeatFlag{&c.trr}, "trr",
 		"build a Test Results Report package from an evidence bundle: `dir[=doc-key,…]` (repeat for more bundles)")
 	fs.StringVar(&c.trrOut, "trr-out", "", "where -trr writes the Test Results Report package (required)")
@@ -298,6 +315,9 @@ func (c *cli) resolve() error {
 	}
 	if c.report != "" {
 		modes = append(modes, "-report")
+	}
+	if c.writes != "" {
+		modes = append(modes, "-writes")
 	}
 	if len(c.trr) > 0 {
 		modes = append(modes, "-trr")

@@ -153,7 +153,7 @@ A `CGO_ENABLED=0` build also works and is not a lie — `-list`, `-dry-run`,
 `-verify` and `-report` are fully functional and every plaintext-transport check
 runs; only the mbaps transport is absent, and the checks that need it say so.
 
-### The six modes
+### The seven modes
 
 ```bash
 # What does the tool cover?
@@ -182,6 +182,12 @@ bin/certify -verify runs/2026-07-26/
 
 # Turn a bundle into a SunSpec submission.
 bin/certify -report runs/2026-07-26/ -config lab.json
+
+# Extract the southbound REGISTER WRITE SET a captured leg holds. Offline and
+# read-only — it reads capture/*.pcapng (+ capture/*.keylog) and nothing else,
+# so it is safe to run against a bundle while a battery is still going.
+bin/certify -writes runs/2026-07-26/                       # full timeline, by axis
+bin/certify -writes runs/2026-07-26/ -writes-mrid DERC-SP-CURVE-1786940036
 
 # Turn a whole campaign into the Test Results Report package: BOTH Results
 # Reporting specifications, from as many bundles as it took.
@@ -224,6 +230,56 @@ not evidence** and must not be submitted.
 | `-timeout` | per-check timeout (default 3 m) |
 | `-require-coverage` | fail the run if an applicable case has no implementation |
 | `-operator` `-note` `-dut-*` | recorded in the bundle |
+
+### `-writes`: what the gateway actually wrote
+
+PC-001's supersession claims are of the form *"a supersession over
+byte-identical curves writes ONLY the admitted axes"*. Nothing could produce the
+artefact that settles one: `mbapref` is library-only and builds a deduplicated
+fuzz **corpus** rather than a timeline, and the reconciler's logs are the
+gateway's account of its own writes rather than the wire.
+
+`-writes` reads the write set off the capture the bundle already carries.
+
+```
+# writeset capture=runs/…/capture/run-20260817.pcapng
+# chain (derived from this capture's own header reads): M705@40072+30 M712@40106+20
+# mrid=DERC-SP-CURVE-… mentions=2 window=[…12:00:01Z .. …12:00:04Z] settle=10s bound=…12:00:14Z frames=5..8
+# attribution rule: a write is attributed to this mRID when its frame time is at or after the FIRST
+#   frame mentioning the mRID and at or before the LAST such frame plus the settle margin.
+# excluded=1 (writes in this capture outside the window)
+# axes=2 writes=2
+axis M705 writes=1
+  write axis=M705 ts=2026-08-17T12:00:02.000000Z frame=6 addr=40072 count=3 fc=0x10 unit=1 off=0 values=1,2,3 flow=… tls=false
+```
+
+Two things are **derived from the capture**, not configured, because a tool that
+had to be told them could be told them wrongly:
+
+- **the model chain** — the gateway's own two-register header reads are in the
+  capture, and the sequence of them *is* the device's chain. A write outside
+  every discovered block reports `model=unknown` and its address stands alone,
+  which is still a checkable claim.
+- **the mRID's window** — `[first frame mentioning the mRID .. last such frame +
+  settle]`. The rule is printed with every report, because "attributed" is a
+  claim about a rule and a reader must be able to disagree with it.
+
+`-writes-settle` (default 10 s) exists because registers are written *after* the
+control is fetched: a window ending at the mRID's last mention would exclude the
+very writes the claim is about.
+
+Every line carries **timestamp, frame number and register address** — a claim
+without addresses is not a claim in this campaign — and the format is stable
+across runs so a bundle manifest can cite a line by content. stdout is the
+report only; the summary count goes to stderr, so a manifest quoting the tool is
+quoting evidence.
+
+An mRID that does not appear in the capture is an **error**, not an empty
+report: "this control wrote nothing" is the strongest claim available and must
+never be made on the strength of having looked in the wrong file.
+
+TLS legs (`:802`, `:8021`) are decrypted with the bundle's own key log. Without
+one, the report says so per stream rather than reporting an empty write set.
 
 ### Local extensions — coverage without a conformance claim
 

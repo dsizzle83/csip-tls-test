@@ -391,6 +391,31 @@ criterion, and it earns no `Test <ID>` row in a submission.
 > as a conformance result. `certify -list` names the family under the document
 > table; REPORT.md tags the row `local-ext` and prints the posture above it.
 
+### Extracting the supersession write set, afterwards
+
+PC-001's claims are about which axes a supersession wrote. Capture the window on
+the night; extract it whenever:
+
+```sh
+# Everything the leg wrote, grouped by SunSpec model.
+bin/certify -writes runs/<dir>/
+
+# Just the writes attributed to one control.
+bin/certify -writes runs/<dir>/ -writes-mrid DERC-SP-CURVE-1786940036
+```
+
+It is **offline and read-only** — it reads `capture/*.pcapng` and
+`capture/*.keylog` and touches nothing else — so it is safe to run against a
+bundle while the battery is still going, and it needs no bench access at all.
+
+Nothing extra is required on the night beyond what you already do: the capture
+must span the supersession window, and the leg's key log must be the shared one
+(see the `-keylog` section below) if the southbound leg is mbaps. The model
+labels come from the gateway's own discovery reads, so the capture should
+include a discovery walk — on a leg captured from bring-up it will.
+
+Full output format and the attribution rule: `docs/CONFORMANCE_TOOL.md`.
+
 ### How long the CSIP leg now takes — read this before the night
 
 Eleven rows now WAIT FOR THE DUT'S RESPONSE rather than for a discovery walk
