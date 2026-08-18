@@ -792,7 +792,7 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				// Two assertions, because a refusal has two halves and either
 				// alone lets the other's defect through: what the DUT told the
 				// head end, and what it did to the device.
-				crits = append(crits, critRefusalAnswered(o.Param("mrid")),
+				crits = append(crits, critRefusalAnswered(o.Param("mrid"), m.Refusal.LegacyCannotComply),
 					critRefusedAxisNoSouthboundTrace(m.Refusal, o))
 				// The RECEIPT half, which critRefusalAnswered does not cover: it
 				// requires a refusal STATUS to be present, and is satisfied by a
@@ -865,6 +865,17 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				crits = append(crits,
 					critResponsePosted(1, "Event received", o.Param("mrid")),
 					critResponseStarted(o.Param("mrid")))
+			}
+			// SD-02 class backstop, on every row that put a control on the wire
+			// under an mRID a Response can name — refusal rows included (double
+			// coverage of the same defect shape critRefusalAnswered's forbidden
+			// set already catches at receipt is deliberate, not redundant: this
+			// criterion catches status 8/10 arriving at ANY early point, not
+			// only at the specific receipt moment critRefusalAnswered's Response
+			// scan happens to observe first). See criteria_2030.go's
+			// critNoEarlyEndOfEventStatus doc.
+			if m.Unreachable == "" && m.publishable() {
+				crits = append(crits, critNoEarlyEndOfEventStatus(o.Param("mrid")))
 			}
 			return crits
 		},

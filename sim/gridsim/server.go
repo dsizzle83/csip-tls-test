@@ -142,10 +142,12 @@ type Server struct {
 	// Response log (CORE-022: client POSTs Response on event transitions)
 	responseMu sync.Mutex
 	responses  []model.Response
-	// complianceAlerts records CannotComply (status ≥ alertStatusFloor)
-	// Responses with the server receive time, surfaced via GET /admin/alerts so
-	// the dashboard can show when the hub reports it cannot meet a control.
-	// Guarded by responseMu.
+	// complianceAlerts records every Response classifyResponseStatus judges
+	// worth an operator's attention — the legacy extension (status ==
+	// alertStatusFloor, 0xF0 exactly, F10) and the SD-02 Table 27 classes
+	// (4/5/8/10/252/253/254) — with the server receive time, surfaced via GET
+	// /admin/alerts so the dashboard can show when the hub reports it cannot
+	// meet a control. Guarded by responseMu.
 	complianceAlerts []ComplianceAlert
 
 	// logBuf feeds GET /admin/logs (SSE). The sim/server binary tees the
@@ -1615,8 +1617,9 @@ func (s *Server) handleResponsePost(w http.ResponseWriter, r *http.Request, path
 	}
 	// WP-7 (D5): accept BOTH the legacy LEXA 0xF0 extension AND the IEEE 2030.5
 	// Table 27 CannotComply-family codes the hub now sends by default, and
-	// record which vocabulary arrived so a test can assert the flip.
-	alert, vocab := classifyResponseStatus(resp.Status)
+	// record which vocabulary AND which SD-02 class arrived so a test can
+	// assert the flip and the corrected taxonomy.
+	alert, vocab, class := classifyResponseStatus(resp.Status)
 	s.responseMu.Lock()
 	s.responses = append(s.responses, resp)
 	if alert {
@@ -1624,14 +1627,15 @@ func (s *Server) handleResponsePost(w http.ResponseWriter, r *http.Request, path
 			Subject:    resp.Subject,
 			Status:     resp.Status,
 			Vocab:      vocab,
+			Class:      class,
 			LFDI:       resp.EndDeviceLFDI,
 			ReceivedAt: s.Now(),
 		})
 	}
 	s.responseMu.Unlock()
 	if alert {
-		log.Printf("[gridsim] ALERT: client reports CANNOT-COMPLY (status=%d vocab=%s) for subject=%s — DER is resource-limited",
-			resp.Status, vocab, resp.Subject)
+		log.Printf("[gridsim] ALERT: client reports status=%d (vocab=%s class=%s) for subject=%s",
+			resp.Status, vocab, class, resp.Subject)
 	} else {
 		log.Printf("[gridsim] POST %s → Response accepted: subject=%s status=%d",
 			path, resp.Subject, resp.Status)
@@ -1643,55 +1647,121 @@ func (s *Server) handleResponsePost(w http.ResponseWriter, r *http.Request, path
 // so tests can assert the hub's default code-flip from the LEXA extension to
 // the IEEE 2030.5 Table 27 codes.
 const (
-	VocabLegacy  = "legacy"  // the LEXA 0xF0–0xFF manufacturer extension
+	VocabLegacy  = "legacy"  // the LEXA extension, wire value 0xF0 exactly (F10 — no manufacturer range)
 	VocabTable27 = "table27" // IEEE 2030.5 Table 27 standard status codes
 )
 
-// classifyResponseStatus reports whether a Response status is a
-// CannotComply / non-compliance signal that GET /admin/alerts should surface,
-// and under which wire vocabulary. Before WP-7 the hub reported "cannot
-// comply" exclusively via the LEXA 0xF0 extension; WP-7 flips the default to
-// IEEE 2030.5 Table 27, where the onset signal is 8 (partial opt-out), a
-// receipt rejection is 252/253/254, and an event elapsing with no
-// participation is 10. gridsim now recognises both so the bench keeps
-// observing breaches across the flip.
+// SD-02 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw) Class
+// values: the taxonomy classifyResponseStatus assigns WITHIN VocabTable27, so
+// a caller that cares WHICH KIND of Table 27 signal arrived — a lifecycle
+// opt-out/opt-in acknowledgement, an EffectiveEndTime-only partial, or a
+// receipt-time rejection — does not have to re-derive it from the raw status
+// a second time. Empty for a legacy-vocab (0xF0) alert and for a non-alert
+// plain lifecycle status (1/2/3/6/7).
+const (
+	ClassOptOut            = "opt-out"              // 4  — preference-driven opt-out; may precede EffectiveStartTime
+	ClassOptIn             = "opt-in"               // 5  — preference-driven opt-in / recovery
+	ClassEndOfEventPartial = "end-of-event-partial" // 8/10 — EffectiveEndTime-only
+	ClassReceiptRejection  = "receipt-rejection"    // 252/253/254 — sent at receipt
+)
+
+// classifyResponseStatus reports whether a Response status is one gridsim's
+// GET /admin/alerts should surface, under which wire vocabulary, and (within
+// VocabTable27) which SD-02 class.
 //
-// The normal lifecycle acks (1 received / 2 started / 3 completed) and the
-// server-driven event-lifecycle acks (6 cancelled / 7 superseded) are NOT
+// Before WP-7 the hub reported "cannot comply" exclusively via the LEXA 0xF0
+// extension; WP-7 flipped the default to IEEE 2030.5 Table 27. Until SD-02
+// corrected it, BOTH this classifier and the product read Table 27's own
+// EffectiveEndTime-only partial (8, and 10 alongside it) as the onset
+// "cannot comply" signal, and neither recognised 4/5 at all — lexa-proto's
+// csipmodel constants for those two were themselves transposed at the time,
+// so nothing in this codebase ever exercised them. SD-02
+// (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw)
+// established, from the licensed IEEE 2030.5-2018 text (Table 27, p.74-76),
+// the taxonomy this function now applies:
+//
+//	4/5   (OptOut/OptIn)                — lifecycle acknowledgements of a
+//	                                       preference-driven opt-out/opt-in;
+//	                                       send-time "at time user actively
+//	                                       chose … or when device
+//	                                       automatically opts out/in due to
+//	                                       user preference", which MAY
+//	                                       precede EffectiveStartTime.
+//	8/10  (PartialOptOut/NoParticipation) — EffectiveEndTime-ONLY partials for
+//	                                       an ADMITTED, (partially) executed
+//	                                       event. Never onset, never receipt.
+//	252/253/254                         — receipt-time rejections.
+//
+// All three classes are recognised as alerts: gridsim's /admin/alerts exists
+// to surface anything beyond a plain lifecycle acknowledgement an operator
+// would want visibility into, and a preference-driven opt-out is exactly that
+// under the corrected reading — the hub admitting a curtailment is no less
+// operator-relevant for arriving via Table 27's own lifecycle-ack vocabulary
+// (4) instead of the former non-conformant onset-8 shape. A caller built
+// against the PRE-SD-02 reading — alert only on 8/10/252/253/254, nothing on
+// 4/5 — would silently stop observing a corrected product's opt-out
+// admissions and misreport them as silent non-compliance; this is exactly the
+// "your own suites go red for the wrong reason" failure SD-02 warns about, so
+// every caller of this function (dashboards included) must key on Class, not
+// on the pre-SD-02 assumption that 8 is the onset signal.
+//
+// The normal PLAIN lifecycle acks (1 received / 2 started / 3 completed) and
+// the server-driven event-lifecycle acks (6 cancelled / 7 superseded) are NOT
 // alerts — they are recorded in ReceivedResponses like every other Response,
 // but they do not raise a compliance alert. (In this codebase the hub emits 3
 // at a *clean* end-of-event, so treating 3 as an alert would fire on every
 // normal completion.)
-func classifyResponseStatus(status uint8) (alert bool, vocab string) {
+func classifyResponseStatus(status uint8) (alert bool, vocab, class string) {
 	// Table 27 codes are checked FIRST: the rejection codes 252/253/254 fall
-	// numerically inside the 0xF0–0xFF (240–255) LEXA range but are standard
-	// IEEE codes, so they must resolve to table27, not legacy.
+	// numerically inside Table 27's own RESERVED range (15-251 and 255 — the
+	// standard defines no manufacturer range at all, F10) but are standard
+	// IEEE codes of their own, so they must resolve to table27, not legacy.
 	switch status {
-	case model.ResponsePartialOptOut, // 8  — breach onset / degraded execution
-		model.ResponseNoParticipation, // 10 — interval elapsed, no participation
-		model.ResponseRejectedParam,   // 252 — rejected (param not applicable)
+	case model.ResponseOptOut: // 4
+		return true, VocabTable27, ClassOptOut
+	case model.ResponseOptIn: // 5
+		return true, VocabTable27, ClassOptIn
+	case model.ResponsePartialOptOut, // 8  — EffectiveEndTime-only partial
+		model.ResponseNoParticipation: // 10 — EffectiveEndTime-only partial
+		return true, VocabTable27, ClassEndOfEventPartial
+	case model.ResponseRejectedParam, // 252 — rejected (param not applicable)
 		model.ResponseRejectedInvalid, // 253 — receipt reject (invalid content)
 		model.ResponseRejectedExpired: // 254 — rejected (already expired)
-		return true, VocabTable27
+		return true, VocabTable27, ClassReceiptRejection
 	}
-	if status >= alertStatusFloor { // 0xF0–0xFF LEXA extension (0xF0 in practice)
-		return true, VocabLegacy
+	if status == alertStatusFloor { // 0xF0 EXACTLY — the only value the LEXA extension ever used (F10)
+		return true, VocabLegacy, ""
 	}
-	return false, ""
+	// 0xF1-0xFB and 0xFF: Table 27's own RESERVED range (15-251, 255) that
+	// this product has never assigned any meaning to — NOT the legacy
+	// extension (which only ever spoke 0xF0) and not a standard code either.
+	// Before F10 this fell through the `>=` range check below and was
+	// misclassified as legacy; an unassigned reserved value is unclassified,
+	// not silently absorbed into the one wire mode this product actually
+	// speaks.
+	return false, "", ""
 }
 
-// alertStatusFloor is the lowest Response status in the LEXA 0xF0–0xFF
-// manufacturer range (see model.ResponseCannotComply in lexa-hub). It is the
-// legacy CannotComply floor; classifyResponseStatus additionally recognises
-// the WP-7 IEEE 2030.5 Table 27 codes (8/10/252/253/254) as alerts.
+// alertStatusFloor is the Response status the LEXA legacy CannotComply
+// extension uses (see model.ResponseCannotComply). Despite the name, this is
+// now an EXACT match, not a floor of a range: F10 tightened
+// classifyResponseStatus from "status >= alertStatusFloor" (which
+// misclassified the WHOLE 0xF0–0xFF span, including Table 27's own reserved
+// values 0xF1-0xFB/0xFF that this product has never used, as the legacy
+// extension) to "status == alertStatusFloor", since 0xF0 is the only value
+// the extension has ever spoken. classifyResponseStatus additionally
+// recognises the SD-02-corrected Table 27 codes (4/5/8/10/252/253/254) as
+// alerts, entirely independently of this constant.
 const alertStatusFloor uint8 = 0xF0
 
-// ComplianceAlert is a CannotComply Response recorded with the server receive
-// time, returned by GET /admin/alerts.
+// ComplianceAlert is a Response recorded with the server receive time,
+// returned by GET /admin/alerts, that classifyResponseStatus judged worth an
+// operator's attention (beyond a plain lifecycle acknowledgement).
 type ComplianceAlert struct {
-	Subject    string `json:"subject"`     // DERControl mRID the DER cannot meet
+	Subject    string `json:"subject"`     // DERControl mRID the alert is about
 	Status     uint8  `json:"status"`      // 2030.5 Response status (the raw wire code)
 	Vocab      string `json:"vocab"`       // "legacy" (0xF0) or "table27" (WP-7 default)
+	Class      string `json:"class"`       // SD-02 class within table27: opt-out/opt-in/end-of-event-partial/receipt-rejection; empty for legacy
 	LFDI       string `json:"lfdi"`        // responding device
 	ReceivedAt int64  `json:"received_at"` // gridsim server time (Unix seconds)
 }

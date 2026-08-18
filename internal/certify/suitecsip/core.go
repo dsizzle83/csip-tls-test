@@ -535,6 +535,11 @@ func coreDERSettings(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 	// inside the criterion because the criterion is minted from the capture,
 	// long after the RunCtx's own phase is over.
 	pics, _ := rc.Param(modesSupportedPICSParam)
+	// This run's own legacy-CannotComply declaration (F11,
+	// docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw) — same
+	// read-here-not-in-the-criterion reason as pics above.
+	legacyRaw, _ := rc.Param(modesSupportedLegacyParam)
+	legacy := legacyRaw == "true"
 	return run(ctx, rc, spec{
 		Change: func(ctx context.Context, d *Driver, params map[string]string) error {
 			capHref, setHref, err := d.RehomeDER(ctx)
@@ -559,20 +564,20 @@ func coreDERSettings(ctx context.Context, rc *certify.RunCtx) (certify.Result, e
 				len(o.Server.PutsFor("DERCapability")), len(o.Server.PutsFor("DERSettings"))) + rehomeNote(o)
 		},
 		Criteria: func(o *Observation) []criterion {
-			return core014Criteria(o, pics)
+			return core014Criteria(o, pics, legacy)
 		},
 	})
 }
 
 // core014Criteria is CORE-014's assertion list, named so the row's own tests
 // can ask what it mints without standing up a bench.
-func core014Criteria(o *Observation, pics string) []criterion {
+func core014Criteria(o *Observation, pics string, legacy bool) []criterion {
 	return []criterion{
 		critResource("DERList", "the DUT fetched the DERList and the server answered 200", nil),
 		critDERPut("DERCapability"),
 		critDERPut("DERSettings"),
 		critNameplateConsistency(),
-		critModesSupportedCoherent(o, pics),
+		critModesSupportedCoherent(o, pics, legacy),
 	}
 }
 
@@ -1048,8 +1053,39 @@ func coreResponsesSpec(nonce string) spec {
 						"3 (completed), and 6 (cancelled) for an event the server cancels",
 					How: "the set of Response statuses received for a control this check lets run its full " +
 						"natural lifecycle, and separately for a second control this check cancels server-side " +
-						"mid-flight (audit 2026-08-01 — see coreResponsesSpec's doc)",
+						"mid-flight (audit 2026-08-01 — see coreResponsesSpec's doc), each status gated against " +
+						"its own control's responseRequired (#17/F2)",
 					Server: func(v *ServerView) Finding {
+						// #17/F2: this is the "CORE-022 lifecycle inline" the
+						// hoist names — it demands FOUR statuses (1/2/3 for the
+						// completing control, 6 for the cancelled one) in one
+						// criterion, unlike critResponsePosted/critResponseStarted's
+						// one-status-per-criterion shape. o.Transcript is
+						// available directly in this outer closure (unlike the
+						// Wire/Server split criteria elsewhere in this file,
+						// which need a closure variable to carry Wire's gating
+						// into Server) because Criteria(o) itself runs after
+						// the observation phase, so the gate is computed once,
+						// here, rather than per evaluator. o.Transcript may be
+						// nil (no session recovered) — respReqFilterStatuses
+						// treats that as "not found", i.e. ungated (every
+						// status still demanded), the safe default matching
+						// this criterion's behavior before #17.
+						wantComplete := respReqFilterStatuses(o.Transcript, mrid, []int{1, 2, 3})
+						wantCancel := respReqFilterStatuses(o.Transcript, cancelMRID, []int{6})
+						if len(wantComplete) == 0 && len(wantCancel) == 0 {
+							return unavailable("neither control's own responseRequired asked for any of the " +
+								"statuses this claim is about (bit 0x01/0x02 not requested) — nothing here was " +
+								"ever requested")
+						}
+						wants := func(list []int, s int) bool {
+							for _, w := range list {
+								if w == s {
+									return true
+								}
+							}
+							return false
+						}
 						gotComplete := v.ResponseStatuses(mrid)
 						gotCancel := v.ResponseStatuses(cancelMRID)
 						if len(gotComplete) == 0 && len(gotCancel) == 0 {
@@ -1068,23 +1104,28 @@ func coreResponsesSpec(nonce string) spec {
 							return false
 						}
 						var missing []string
-						if !has(gotComplete, 1) {
+						if wants(wantComplete, 1) && !has(gotComplete, 1) {
 							missing = append(missing, "1 (received) for the completing control")
 						}
-						if !has(gotComplete, 2) {
+						if wants(wantComplete, 2) && !has(gotComplete, 2) {
 							missing = append(missing, "2 (started) for the completing control")
 						}
-						if !has(gotComplete, 3) {
+						if wants(wantComplete, 3) && !has(gotComplete, 3) {
 							missing = append(missing, "3 (completed) for the completing control")
 						}
-						if !has(gotCancel, 6) {
+						if wants(wantCancel, 6) && !has(gotCancel, 6) {
 							missing = append(missing, "6 (cancelled) for the server-cancelled control")
 						}
 						observed := fmt.Sprintf("completing control %s: statuses %v; server-cancelled control "+
 							"%s: statuses %v", mrid, gotComplete, cancelMRID, gotCancel)
 						if len(missing) == 0 {
-							return Finding{Verdict: certify.Pass,
-								Observed: observed + " — the full 1/2/3/6 event lifecycle was observed"}
+							full := "the full 1/2/3/6 event lifecycle was observed"
+							if len(wantComplete) < 3 || len(wantCancel) < 1 {
+								full = fmt.Sprintf("every requested status was observed (requested: completing "+
+									"%v, cancelled %v — the rest were not asked for, per responseRequired)",
+									wantComplete, wantCancel)
+							}
+							return Finding{Verdict: certify.Pass, Observed: observed + " — " + full}
 						}
 						// Graceful degradation (never a false FAIL for a gap
 						// that is a WINDOW-TIMING fact, not necessarily a DUT
@@ -1230,7 +1271,8 @@ func coreSupersedingSpec(nonce string) spec {
 					Claim: "the DUT reports status 7 (Superseded) or 14 (Aborted due to alternate program " +
 						"event) for the losing control of an overlapping pair",
 					How: "the Response statuses received for the lower-priority control of the two the check " +
-						"published with identical intervals",
+						"published with identical intervals, gated against its own responseRequired (#17/F2 " +
+						"— 7 and 14 share Table27RequiredBit's bit 0x02, so either is representative)",
 					Server: func(v *ServerView) Finding {
 						got := v.ResponseStatuses(loser)
 						if len(got) == 0 {
@@ -1246,6 +1288,17 @@ func coreSupersedingSpec(nonce string) spec {
 									Observed: fmt.Sprintf("gridsim received status %d for %s, the statuses "+
 										"IEEE 2030.5 Table 27 defines for a superseded event", s, loser)}
 							}
+						}
+						// #17/F2: neither 7 nor 14 appeared — before blaming
+						// the DUT, check whether the loser's own
+						// responseRequired asked for either at all (o is the
+						// outer Criteria(o) closure's Observation, available
+						// directly here — see the CORE-022 lifecycle
+						// criterion above for why no Wire/Server closure
+						// variable is needed).
+						if reason := respReqNotRequested(o.Transcript, 7, loser); reason != "" {
+							return Finding{Unavailable: fmt.Sprintf("gridsim received statuses %v for the "+
+								"superseded control %s, neither 7 nor 14 among them, but %s", got, loser, reason)}
 						}
 						return Finding{Verdict: certify.Fail,
 							Observed: fmt.Sprintf("gridsim received statuses %v for the superseded control %s; "+

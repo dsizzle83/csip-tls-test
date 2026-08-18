@@ -156,7 +156,7 @@ type mayFinding struct {
 	Category   string     `json:"category"`
 	Hypothesis string     `json:"hypothesis"` // the real-world fault this represents
 	Expected   string     `json:"expected"`   // the oracle: what a correct hub does
-	Verdict    string     `json:"verdict"`    // PASS|DEGRADED|FAIL|BLIND|INCONCLUSIVE
+	Verdict    string     `json:"verdict"`    // PASS|DEGRADED|FAIL|BLIND|INCONCLUSIVE|INFRA|NOT_APPLICABLE
 	Headline   string     `json:"headline"`
 	Diagnosis  []string   `json:"diagnosis"` // bullet points: exactly what went wrong
 	Fix        string     `json:"fix"`       // where in the product to look
@@ -179,9 +179,14 @@ type maySummary struct {
 	// dead at the pre-scenario probe or died during the hold — a test-bench
 	// fault, never a hub verdict (audit MAY-6, hardening plan Q8). mayhem.py
 	// exits 2 on any INFRA: the run is untrustworthy, not failing.
-	Infra        int     `json:"infra"`
-	TotalBreachS float64 `json:"total_breach_seconds"`
-	WorstPeakW   float64 `json:"worst_peak_breach_W"`
+	Infra int `json:"infra"`
+	// NotApplicable counts scenarios skipped via mayScenario.NotApplicable —
+	// a disclosed, reasoned, permanent skip for this release (F2), distinct
+	// from Inconclusive ("not judged, re-run it") and Infra ("bench broke").
+	// mayhem.py does not gate exit code on this count.
+	NotApplicable int     `json:"not_applicable"`
+	TotalBreachS  float64 `json:"total_breach_seconds"`
+	WorstPeakW    float64 `json:"worst_peak_breach_W"`
 }
 
 type mayhemStatus struct {
@@ -304,6 +309,23 @@ type mayScenario struct {
 	// caller opts in via IncludeExtended (nightly / release-gate campaigns).
 	// See filterExtended.
 	Extended bool
+
+	// NotApplicable, when non-empty, marks this scenario's onset predicate as
+	// having a permanently EMPTY intersection with a correct implementation
+	// for the current release — a structural fact about what the product is
+	// allowed to do, not a bench precondition a re-run could satisfy (that's
+	// INCONCLUSIVE, "setup failed") and not test infrastructure breaking
+	// (that's INFRA). run() skips setup/hold/teardown entirely for a
+	// NotApplicable scenario and appends a single NOT_APPLICABLE finding
+	// whose Diagnosis carries this string verbatim, so the row is never
+	// silently dropped from a run's output, its summary counts, or its
+	// markdown report (F2, docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md,
+	// lexa-gw, adjudication #3). This is a short-term, per-scenario escape
+	// hatch, not a verdict on the underlying hypothesis — clear the field
+	// (and update or delete the reason) the moment the real gap it names is
+	// closed; do not repurpose it for a scenario that is merely flaky or
+	// unimplemented (use INCONCLUSIVE/a documented precondition for those).
+	NotApplicable string
 
 	setup    func(d *mayhemDriver) (*activeConstraint, error)
 	perTick  func(d *mayhemDriver, i int)
@@ -517,6 +539,24 @@ func (d *mayhemDriver) run(ctx context.Context, scenarios []*mayScenario, sample
 
 		d.setPhase(i, sc, "setup")
 		log.Printf("mayhem: [%d/%d] %s — %s", i+1, len(scenarios), sc.ID, sc.Name)
+
+		// A scenario whose onset predicate cannot occur against a correct
+		// implementation right now (sc.NotApplicable) is judged before it
+		// touches the bench at all — there is no fault to arm and no hold
+		// worth sampling, only a disclosed, reasoned skip (F2). This must
+		// stay ahead of resetForScenario/benchUnhealthy: an N/A row is not a
+		// bench-health question and must never be misreported as one.
+		if sc.NotApplicable != "" {
+			d.appendFinding(mayFinding{
+				ID: sc.ID, Name: sc.Name, Category: sc.Category,
+				Hypothesis: sc.Hypothesis, Expected: sc.Expected,
+				Verdict:   "NOT_APPLICABLE",
+				Headline:  "not applicable for this release — see diagnosis",
+				Diagnosis: []string{sc.NotApplicable},
+				Fix:       sc.Fix,
+			})
+			continue
+		}
 
 		// Isolate each scenario from the previous one's device/fault state.
 		d.resetForScenario()
@@ -2307,6 +2347,8 @@ func (d *mayhemDriver) appendFinding(f mayFinding) {
 		d.status.Summary.Blind++
 	case "INFRA":
 		d.status.Summary.Infra++
+	case "NOT_APPLICABLE":
+		d.status.Summary.NotApplicable++
 	default:
 		d.status.Summary.Inconclusive++
 	}
@@ -2347,8 +2389,8 @@ func (d *mayhemDriver) finish(aborted bool, errMsg string) {
 	d.status.ReportPath = path
 	sum := d.status.Summary
 	d.mu.Unlock()
-	log.Printf("mayhem: done (aborted=%v) — %d pass, %d degraded, %d fail, %d blind, %d inconclusive; worst breach %.0f W; report %s",
-		aborted, sum.Pass, sum.Degraded, sum.Fail, sum.Blind, sum.Inconclusive, sum.WorstPeakW, path)
+	log.Printf("mayhem: done (aborted=%v) — %d pass, %d degraded, %d fail, %d blind, %d inconclusive, %d not-applicable; worst breach %.0f W; report %s",
+		aborted, sum.Pass, sum.Degraded, sum.Fail, sum.Blind, sum.Inconclusive, sum.NotApplicable, sum.WorstPeakW, path)
 }
 
 func (d *mayhemDriver) fail(msg string) {
@@ -2379,8 +2421,8 @@ func (d *mayhemDriver) writeReport() string {
 	path := filepath.Join(mayReportDir, fmt.Sprintf("qa-mayhem-%s.md", time.Now().Format("20060102-150405")))
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Mayhem QA report\n\n")
-	fmt.Fprintf(&b, "Run started %s. %d pass · %d degraded · **%d fail** · **%d blind** · %d inconclusive · %d infra.\n",
-		st.StartedAt.Format(time.RFC3339), st.Summary.Pass, st.Summary.Degraded, st.Summary.Fail, st.Summary.Blind, st.Summary.Inconclusive, st.Summary.Infra)
+	fmt.Fprintf(&b, "Run started %s. %d pass · %d degraded · **%d fail** · **%d blind** · %d inconclusive · %d infra · %d not-applicable.\n",
+		st.StartedAt.Format(time.RFC3339), st.Summary.Pass, st.Summary.Degraded, st.Summary.Fail, st.Summary.Blind, st.Summary.Inconclusive, st.Summary.Infra, st.Summary.NotApplicable)
 	fmt.Fprintf(&b, "Worst breach: %.0f W. Total time out of limit: %.0fs.\n\n", st.Summary.WorstPeakW, st.Summary.TotalBreachS)
 	if st.ChaosSeed != 0 {
 		fmt.Fprintf(&b, "Chaos run — replay this exact sequence with `--chaos --seed %d`.\n\n", st.ChaosSeed)
@@ -2482,16 +2524,48 @@ func (d *mayhemDriver) deleteControls(program int) {
 	}
 }
 
-// cannotComplyCount returns how many CannotComply Response POSTs gridsim has
-// recorded for mrid (WS-4.5, docs/refactor/HANDOFF.md §8) — the ground-truth
-// count backing maySample.CannotComplyCount. Returns -1, not 0, when gridsim
-// is unreachable: a caller distinguishing "confirmed zero" from "unknown"
-// (e.g. a scenario proving no duplicate POST landed) must not treat a probe
-// failure as a clean reading.
+// isCannotComplyOnset reports whether an /admin/alerts entry's (vocab, class)
+// is a CannotComply ONSET signal — the legacy 0xF0 extension, or SD-02's
+// OptOut(4) class (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md,
+// lexa-gw) — as opposed to a recovery (OptIn/5, class=opt-in), a
+// receipt-time rejection (252/253/254, class=receipt-rejection), or an
+// EffectiveEndTime-only partial (8/10, class=end-of-event-partial).
+// sim/gridsim/server.go's classifyResponseStatus is the source of these
+// vocab/class strings; mirrored here as literals rather than imported
+// because cmd/dashboard talks to gridsim over its admin HTTP API, not as a
+// Go package (see gridsimAlertVocabsFor's own "table27"/"legacy" literals,
+// mayhem_reporting.go).
+//
+// F5: every counter this file derives from gridsim's alert log — the
+// duplicate-POST detector (diagnoseNorthboundRestartMidBreach,
+// mayhem_world.go, via maySample.CannotComplyCount below) and the
+// excuse-a-violation checks (reportedCannotComply here and in replay.go) —
+// means "the DUT told the head end it physically cannot meet this control",
+// which is the ONSET signal alone. Counting a same-episode OptIn(5) recovery
+// here would let a clean breach→recover pair either masquerade as TWO onset
+// POSTs (a false "duplicate re-post" FAIL blaming AD-016) or, in the excuse
+// path, forgive a genuine violation that arrived AFTER the device had
+// already told the head end it recovered.
+func isCannotComplyOnset(vocab, class string) bool {
+	return vocab == "legacy" || class == "opt-out"
+}
+
+// cannotComplyCount returns how many CannotComply ONSET Response POSTs
+// gridsim has recorded for mrid (WS-4.5, docs/refactor/HANDOFF.md §8) — the
+// ground-truth count backing maySample.CannotComplyCount. Returns -1, not 0,
+// when gridsim is unreachable: a caller distinguishing "confirmed zero" from
+// "unknown" (e.g. a scenario proving no duplicate POST landed) must not treat
+// a probe failure as a clean reading.
+//
+// Onset-only (isCannotComplyOnset) since F5: counting every alert regardless
+// of SD-02 class let a legitimate breach→recover pair (OptOut(4) then
+// OptIn(5) for the SAME mRID) inflate this to 2 and read as a duplicate POST.
 func (d *mayhemDriver) cannotComplyCount(mrid string) int {
 	var out struct {
 		Alerts []struct {
 			Subject string `json:"subject"`
+			Vocab   string `json:"vocab"`
+			Class   string `json:"class"`
 		} `json:"alerts"`
 	}
 	if err := d.getJSON("gridsim", "/admin/alerts", &out); err != nil {
@@ -2499,7 +2573,7 @@ func (d *mayhemDriver) cannotComplyCount(mrid string) int {
 	}
 	n := 0
 	for _, a := range out.Alerts {
-		if a.Subject == mrid {
+		if a.Subject == mrid && isCannotComplyOnset(a.Vocab, a.Class) {
 			n++
 		}
 	}
@@ -2507,7 +2581,7 @@ func (d *mayhemDriver) cannotComplyCount(mrid string) int {
 }
 
 // reportedCannotComply is cannotComplyCount's presence-only view, used by
-// every existing diagnoser that only cares WHETHER a CannotComply was
+// every existing diagnoser that only cares WHETHER a CannotComply ONSET was
 // posted, not how many times.
 func (d *mayhemDriver) reportedCannotComply(mrid string) bool {
 	return d.cannotComplyCount(mrid) > 0

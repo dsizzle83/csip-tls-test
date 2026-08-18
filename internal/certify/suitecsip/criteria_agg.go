@@ -241,16 +241,35 @@ func fleetLeverGap(missing []string) string {
 //     measurement that stopped early is not a finding about the DUT.
 func critResponseFanOut(o *Observation, f aggFanOut) criterion {
 	byLFDI, missing := deviceLFDIs(o, f.Names)
+	// #17/F2: filter f.Statuses down to the ones the event's own
+	// responseRequired actually asked for (respReqFilterStatuses, per
+	// status), computed once by Wire and cached — Wire always runs before
+	// Server within one assert() call (criteria.go), so sharing it here is
+	// safe, the same pattern critResponseStarted established before this
+	// hoist. Defaults to f.Statuses unfiltered (ungated — today's behavior,
+	// and the safe fallback when Wire never runs). f.Forbidden is NOT
+	// filtered: a DUT volunteering a forbidden status is a real defect
+	// whether or not the server asked for it.
+	gatedStatuses := f.Statuses
 	decide := func(recs []respRec, frames []int, src string) Finding {
-		return fanOutFinding(f, byLFDI, missing, recs, frames, src)
+		if len(f.Statuses) > 0 && len(gatedStatuses) == 0 {
+			return unavailable("the event's own responseRequired did not ask for any of the status(es) %v this "+
+				"row requires for %s (bit 0x02 not requested) — a spec-compliant DUT is not obliged to report "+
+				"any of them", f.Statuses, f.Devices)
+		}
+		gf := f
+		gf.Statuses = gatedStatuses
+		return fanOutFinding(gf, byLFDI, missing, recs, frames, src)
 	}
 	return criterion{
 		Claim: fmt.Sprintf("for %s, %s", f.Devices, f.What),
 		How: "the <endDeviceLFDI> and <status> elements of the Response POSTs whose <subject> is the event's " +
 			"mRID, grouped by device and matched against the LFDIs gridsim derived for the CTP's named " +
-			"EndDevices (GET /admin/fleet)",
+			"EndDevices (GET /admin/fleet), with the required statuses gated per event against the control's " +
+			"own responseRequired (#17/F2)",
 		NeedsTranscript: true,
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+			gatedStatuses = respReqFilterStatuses(t, f.MRID, f.Statuses)
 			recs, frames := wireResponses(t, f.MRID)
 			return decide(recs, frames, "the recovered transcript")
 		},
@@ -887,15 +906,29 @@ func critDefaultControlFetched(o *Observation, which, devices string, names []st
 // established and, when it cannot be, printed as a limitation instead of a
 // verdict.
 func critEventLifecycle(o *Observation, mrid, label string, spanS int) criterion {
+	// #17/F2: statuses 1/2/3 map onto Table27RequiredBit(1)=0x01 and
+	// Table27RequiredBit(2)==Table27RequiredBit(3)=0x02 — the SAME shared
+	// per-status gate critResponsePosted now applies, hoisted here because
+	// this criterion grades all three at once instead of one status per
+	// criterion. required1/required23 default true (ungated — today's
+	// behavior, and the safe default when Wire never runs, e.g. an
+	// undecrypted transcript) and are set by Wire, which always runs before
+	// Server within one assert() call (criteria.go), so sharing them across
+	// the two closures is safe — the same pattern critResponseStarted
+	// established before this hoist.
+	required1, required23 := true, true
 	return criterion{
 		Claim: fmt.Sprintf("the DUT reports the %s event's lifecycle to the server: Response status 1 "+
 			"(Event Received) on discovery, 2 (Event Started) at the interval start and 3 (Event Completed) "+
 			"after the duration elapses", label),
 		How: "the <status> elements of the Response POSTs whose <subject> is the event's mRID, in the order " +
 			"the capture carries them, weighed against where this check's own observation window sits " +
-			"relative to the moment the event was created",
+			"relative to the moment the event was created, and gated per status against the control's own " +
+			"responseRequired (#17/F2)",
 		NeedsTranscript: true,
 		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
+			required1 = respReqNotRequested(t, 1, mrid) == ""
+			required23 = respReqNotRequested(t, 2, mrid) == ""
 			got, frames := lifecycleStatuses(t, mrid)
 			// The one absence the capture must not adjudicate at all: gridsim
 			// recorded a status 1 for this event INSIDE this check's window and
@@ -909,12 +942,12 @@ func critEventLifecycle(o *Observation, mrid, label string, spanS int) criterion
 					"instead", label, mrid)
 			}
 			return lifecycleFinding(got, frames, mrid, label, spanS, "the capture",
-				o.lifecycleReach(frameFloor(ev), "this case's capture window opened", mrid))
+				o.lifecycleReach(frameFloor(ev), "this case's capture window opened", mrid), required1, required23)
 		},
 		Server: func(v *ServerView) Finding {
 			got := statusesOf(v.ResponsesFor(mrid))
 			f := lifecycleFinding(got, nil, mrid, label, spanS, "gridsim's Response log",
-				o.lifecycleReach(o.baselineAt(), "this check took its server-side baseline", mrid))
+				o.lifecycleReach(o.baselineAt(), "this check took its server-side baseline", mrid), required1, required23)
 			f.Frames = nil
 			return f
 		},
@@ -1040,8 +1073,21 @@ func frameFloor(ev *certify.Evidence) time.Time {
 	return ev.Set.Start
 }
 
-func lifecycleFinding(got, frames []int, mrid, label string, spanS int, src string, reach lifecycleReach) Finding {
+// lifecycleFinding grades the 1/2/3 sequence. required1/required23 are the
+// #17/F2 responseRequired gate, one bool per Table27RequiredBit group (status
+// 1 shares bit 0x01; 2 and 3 share bit 0x02) — critEventLifecycle computes
+// them once via respReqNotRequested and threads them through both its Wire
+// and Server calls. Both default true (ungated, i.e. still demanded), which
+// is the pre-#17 behavior and the safe fallback whenever the gate could not
+// be computed (no decrypted transcript this window).
+func lifecycleFinding(got, frames []int, mrid, label string, spanS int, src string, reach lifecycleReach,
+	required1, required23 bool) Finding {
 	if len(got) == 0 {
+		if !required1 && !required23 {
+			return unavailable("%s recorded no Response for the %s event %s, and the control's own "+
+				"responseRequired asked for neither the receipt (bit 0x01) nor the lifecycle (bit 0x02) "+
+				"statuses this claim is about — nothing here was ever requested", src, label, mrid)
+		}
 		return unavailable("%s holds no Response POST for the %s event %s", src, label, mrid)
 	}
 	has := func(s int) bool { return containsInt(got, s) }
@@ -1062,27 +1108,42 @@ func lifecycleFinding(got, frames []int, mrid, label string, spanS int, src stri
 	// [2,3,1] on a window that opened late is a DUT whose whole lifecycle is
 	// present plus a retried acknowledgment, and reporting that as anything
 	// but a Pass would be a second way of grading window placement.
-	if after, ok := receivedAfterStart(got); ok && reach.spans {
-		return found(certify.Fail, frames,
-			"the DUT POSTed status 1 (Event Received) for the %s event %s only AFTER status %d, in the order "+
-				"%s carries them (%v). Event Received acknowledges DISCOVERY, so it cannot follow the event's "+
-				"start or completion — and %s, so this order is the DUT's and not this window's",
-			label, mrid, after, src, got, reach.because)
-	}
-	if !has(1) {
-		if !reach.spans {
-			return found(certify.Warn, frames,
-				"the DUT POSTed status(es) %v for the %s event %s and no status 1 (Event Received) inside this "+
-					"window. That absence is NOT adjudicable here: %s. What the window does show is consistent "+
-					"with a status 1 POSTed below its floor — the statuses that did appear are in lifecycle "+
-					"order and none of them follows a 1 — so this is reported as a window limitation rather "+
-					"than as a finding about the DUT. Close it out by re-running the case with a window that "+
-					"spans the event's discovery, against a fresh mRID",
-				got, label, mrid, reach.limit)
+	// #17/F2: the whole ordering/missing-1 claim below is about status 1's
+	// own required bit (0x01) — a control whose responseRequired explicitly
+	// excludes it is not obliged to send one at all, in any order, so
+	// neither the inversion FAIL nor the missing-1 FAIL/WARN applies.
+	if required1 {
+		if after, ok := receivedAfterStart(got); ok && reach.spans {
+			return found(certify.Fail, frames,
+				"the DUT POSTed status 1 (Event Received) for the %s event %s only AFTER status %d, in the order "+
+					"%s carries them (%v). Event Received acknowledges DISCOVERY, so it cannot follow the event's "+
+					"start or completion — and %s, so this order is the DUT's and not this window's",
+				label, mrid, after, src, got, reach.because)
 		}
-		return found(certify.Fail, frames,
-			"the DUT POSTed status(es) %v for the %s event %s but never status 1 (Event Received), which the "+
-				"procedure requires on discovery — and %s", got, label, mrid, reach.because)
+		if !has(1) {
+			if !reach.spans {
+				return found(certify.Warn, frames,
+					"the DUT POSTed status(es) %v for the %s event %s and no status 1 (Event Received) inside this "+
+						"window. That absence is NOT adjudicable here: %s. What the window does show is consistent "+
+						"with a status 1 POSTed below its floor — the statuses that did appear are in lifecycle "+
+						"order and none of them follows a 1 — so this is reported as a window limitation rather "+
+						"than as a finding about the DUT. Close it out by re-running the case with a window that "+
+						"spans the event's discovery, against a fresh mRID",
+					got, label, mrid, reach.limit)
+			}
+			return found(certify.Fail, frames,
+				"the DUT POSTed status(es) %v for the %s event %s but never status 1 (Event Received), which the "+
+					"procedure requires on discovery — and %s", got, label, mrid, reach.because)
+		}
+	}
+	// #17/F2: the 2/3 half is gated on bit 0x02, independently of the 1
+	// half above — a control asking only for receipts (rr=0x01) demands
+	// nothing more once status 1's own claim (if required1) is settled.
+	if !required23 {
+		return found(certify.Pass, frames,
+			"the DUT POSTed status(es) %v for the %s event %s; the control's own responseRequired did not ask "+
+				"for the lifecycle statuses (bit 0x02), so 2 (Started)/3 (Completed) are not demanded here",
+			got, label, mrid)
 	}
 	if has(2) && has(3) {
 		return found(certify.Pass, frames,

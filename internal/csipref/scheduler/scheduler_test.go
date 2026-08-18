@@ -264,7 +264,9 @@ func TestEvaluate_RandomizeStartCached(t *testing.T) {
 }
 
 func TestEvaluate_RandomizeStartWithinBounds(t *testing.T) {
-	// Run many schedulers to verify the randomized offset stays in [-30, +30].
+	// §10.2.4.2.2: a POSITIVE randomizeStart is delay-only. Run many
+	// schedulers to verify the randomized offset stays in [0, +30] — never
+	// negative, which the old symmetric [-30,+30] reading would have allowed.
 	window := int32(30)
 	for i := 0; i < 100; i++ {
 		s := New()
@@ -281,8 +283,34 @@ func TestEvaluate_RandomizeStartWithinBounds(t *testing.T) {
 		if !ok {
 			t.Fatal("randOffsets not populated after randomizedStart")
 		}
-		if offset < -window || offset > window {
-			t.Errorf("randomized offset %d out of bounds [-%d, +%d]", offset, window, window)
+		if offset < 0 || offset > window {
+			t.Errorf("positive randomizeStart produced offset %d, want [0, +%d] (delay-only, §10.2.4.2.2)", offset, window)
+		}
+	}
+}
+
+// TestEvaluate_RandomizeStartWithinBounds_Negative is the #17 regression
+// counterpart: a NEGATIVE randomizeStart is early-only per §10.2.4.2.2, so
+// the draw must stay in [-30, 0] — never positive, which the old
+// |randomizeStart| symmetric reading would have allowed.
+func TestEvaluate_RandomizeStartWithinBounds_Negative(t *testing.T) {
+	window := int32(-30)
+	for i := 0; i < 100; i++ {
+		s := New()
+		evt := scheduledEvent("E1", epoch-600, epoch, 600, 3000)
+		evt.RandomizeStart = &window
+
+		_ = s.randomizedStart(&evt)
+
+		s.mu.Lock()
+		offset, ok := s.randOffsets["E1"]
+		s.mu.Unlock()
+
+		if !ok {
+			t.Fatal("randOffsets not populated after randomizedStart")
+		}
+		if offset < window || offset > 0 {
+			t.Errorf("negative randomizeStart produced offset %d, want [%d, 0] (early-only, §10.2.4.2.2)", offset, window)
 		}
 	}
 }

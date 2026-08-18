@@ -260,8 +260,8 @@ func TestAdminClock_SkewsServerTimeAndControlStart(t *testing.T) {
 }
 
 // TestAdminAlerts_RecordsCannotComply verifies that only CannotComply Responses
-// (status ≥ alertStatusFloor) register as compliance alerts, and that
-// GET /admin/alerts surfaces them for the dashboard.
+// (status == alertStatusFloor, 0xF0 exactly — F10) register as compliance
+// alerts, and that GET /admin/alerts surfaces them for the dashboard.
 func TestAdminAlerts_RecordsCannotComply(t *testing.T) {
 	s := NewServer("")
 

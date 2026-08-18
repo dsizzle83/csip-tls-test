@@ -365,8 +365,29 @@ type modeControlEvidence struct {
 	// 3 (Event completed) — the statuses that assert the control ran.
 	Executed []string
 	// Refused are the mRIDs the DUT answered with a cannot-comply status
-	// (refusalStatuses, curve.go) and never with 2 or 3.
+	// (252, 253, or 0xF0 legacy — see refusalAcceptedStatus, curve.go, for the
+	// per-row conformance-verdict gate this DESCRIPTIVE sweep does not apply)
+	// and never with 2 or 3.
 	Refused []string
+	// Unhonoured are the mRIDs of a control that named this mode, was ADOPTED
+	// (carried in a DERControlList the DUT fetched, and never rejected at
+	// receipt — i.e. not in Refused) but by end of window answered with
+	// neither an execution status (2/3) nor a refusal status (252/253/0xF0):
+	// no lifecycle progression at all, or stuck at Received(1) and nothing
+	// past it.
+	//
+	// F6: this bucket restores the overclaim detection dropping status 8 from
+	// refusalStatuses removed. Under the PRE-SD-02 reading, an admitted mode
+	// the DUT never honoured answered 8 (PartialOptOut) at receipt — a
+	// defective shape, but one gradeMaskAgainstEvidence could still see AS a
+	// refusal and flag if the mode was also advertised. SD-02
+	// (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw,
+	// adjudication #3) now has the product's fault-class producers answer
+	// such a control with NO invented lifecycle status at all — Received,
+	// maybe Started if actually confirmed, then silence — so the SAME
+	// admitted-then-unhonoured defect now leaves no refusal status to catch
+	// it on. Unhonoured is what gradeMaskAgainstEvidence reads instead.
+	Unhonoured []string
 }
 
 // modesEvidence is everything the oracle knows before it grades.
@@ -393,6 +414,26 @@ type modesEvidence struct {
 	PICS []string
 	// PICSRaw is what the operator actually typed, for the finding.
 	PICSRaw string
+
+	// LegacyDeclared is this run's own declaration (modesSupportedLegacyParam)
+	// that its DUT/case configuration runs the LEXA profile's legacy
+	// CannotComply wire (0xF0) — the same meaning curve.go's
+	// refusalBinding.LegacyCannotComply carries per-row, but CORE-014 grades
+	// the WHOLE mask in one criterion, so this is a run-wide declaration
+	// rather than a per-control one. Every run defaults this false: the
+	// product's default and the certification profile are both standard-mode
+	// (F11, docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw).
+	LegacyDeclared bool
+	// LegacyWireMRIDs are the mRIDs gatherModesEvidence saw answered with the
+	// LEXA legacy extension (status=0xF0), collected REGARDLESS of
+	// LegacyDeclared — gathering evidence and grading it against a
+	// declaration are different steps, and this file's own long-standing
+	// discipline (see gatherModesEvidence's refused sweep) is that the
+	// DESCRIPTIVE half never conditions on a verdict-time flag. What
+	// LegacyDeclared decides is what gradeMaskAgainstEvidence does with a
+	// non-empty list: legacyDisclaimer'd non-conformance evidence when
+	// declared, a finding in its own right when not (F11).
+	LegacyWireMRIDs []string
 }
 
 // gatherModesEvidence reads a transcript for everything the oracle needs.
@@ -501,11 +542,29 @@ func gatherModesEvidence(t *Transcript) modesEvidence {
 	for mrid, modes := range modesOf {
 		sts := statusesOf[mrid]
 		executed := sts[2] || sts[3]
-		refused := false
-		for _, s := range refusalStatuses {
-			if sts[uint64(s)] {
-				refused = true
-			}
+		// This is a DESCRIPTIVE sweep across the whole transcript, not a
+		// per-row certification verdict, so it recognises the standard
+		// receipt rejections (252, 253) AND the LEXA legacy wire (0xF0) as
+		// evidence of a refusal regardless of any one row's own legacy
+		// declaration (contrast curve.go's critRefusalAnswered/
+		// refusalAcceptedStatus, which gate 0xF0 on a row's
+		// LegacyCannotComply flag for a conformance VERDICT — and gate on 252
+		// alone, not 253, because that criterion only ever grades the
+		// specific "structurally unsupported axis" refusal shape). Status
+		// 254 (rejected — already expired) is deliberately NOT counted as a
+		// refusal here: it says the event arrived too late to matter, not
+		// that the DUT declines the mode, so treating it as refusal evidence
+		// would be its own misattribution. Status 8/10 are deliberately NOT
+		// checked here any more (SD-02): they are Table 27's
+		// EffectiveEndTime-only partials for an ADMITTED event, not a
+		// refusal, and counting them here would misclassify an executing
+		// control's late partial as a refused one.
+		refused := sts[252] || sts[253] || sts[0xF0]
+		if sts[0xF0] {
+			// F11: gathered regardless of this run's own legacy declaration —
+			// see LegacyWireMRIDs' doc. gradeMaskAgainstEvidence is where the
+			// declaration is consulted.
+			e.LegacyWireMRIDs = appendUnique(e.LegacyWireMRIDs, mrid)
 		}
 		for _, m := range modes {
 			switch {
@@ -513,6 +572,12 @@ func gatherModesEvidence(t *Transcript) modesEvidence {
 				e.mode(m).Executed = appendUnique(e.mode(m).Executed, mrid)
 			case refused:
 				e.mode(m).Refused = appendUnique(e.mode(m).Refused, mrid)
+			default:
+				// F6: ADOPTED (carried, not rejected at receipt) but by end of
+				// window neither executed nor refused — no invented lifecycle
+				// status, which under SD-02's fault posture is itself the wire
+				// signal (case 6/11) rather than an absence of evidence.
+				e.mode(m).Unhonoured = appendUnique(e.mode(m).Unhonoured, mrid)
 			}
 		}
 	}
@@ -546,7 +611,9 @@ func (e *modesEvidence) sortRecords() {
 		sort.Strings(r.Carried)
 		sort.Strings(r.Executed)
 		sort.Strings(r.Refused)
+		sort.Strings(r.Unhonoured)
 	}
+	sort.Strings(e.LegacyWireMRIDs)
 }
 
 // modeNames lists the element names in the evidence, sorted, for stable prose.
@@ -668,21 +735,40 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 		case b.Element == "":
 			silent = append(silent, fmt.Sprintf("bit %d %s (the standard gives this mode no DERControlBase "+
 				"element, so no transcript can evidence it either way)", b.Bit, b.Mode))
-		case r == nil || (len(r.Executed) == 0 && len(r.Refused) == 0):
+		case r == nil || (len(r.Executed) == 0 && len(r.Refused) == 0 && len(r.Unhonoured) == 0):
 			if picsDeclares(e.PICS, b) {
 				continue
 			}
-			silent = append(silent, fmt.Sprintf("bit %d %s (no control naming <%s> drew an execution or a "+
-				"refusal in this evidence)", b.Bit, b.Mode, b.Element))
+			silent = append(silent, fmt.Sprintf("bit %d %s (no control naming <%s> drew an execution, a "+
+				"refusal, or an unhonoured-adoption in this evidence)", b.Bit, b.Mode, b.Element))
 		case len(r.Executed) > 0:
 			// Advertised and demonstrably honoured. Nothing to say.
-		default:
+		case len(r.Refused) > 0:
 			overclaims = append(overclaims, fmt.Sprintf(
 				"%s: bit %d is SET — IEEE 2030.5-2018 p.%d assigns it to %s — and the DUT REFUSED every "+
 					"control that named <%s> (mRID %s), answering a cannot-comply status and never 2 "+
 					"(Event started) or 3 (Event completed). The mask promises a utility server a mode "+
 					"the DUT declines to perform",
 				b.Element, b.Bit, b.Page, b.Mode, b.Element, strings.Join(r.Refused, ", ")))
+		default:
+			// F6: r.Unhonoured > 0, Executed and Refused both empty — a control
+			// naming this mode was ADOPTED (not rejected at receipt) but by end
+			// of window told the head end neither that it ran nor that it could
+			// not. Under SD-02's fault posture (docs/design/
+			// SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw, adjudication
+			// #3) that silence is the wire signal itself, not an absence of
+			// evidence — and a mask bit whose ONLY standing evidence is that
+			// silence is exactly the admitted-then-unhonoured overclaim this
+			// bucket exists to restore detection for (parity with the
+			// pre-SD-02 8-as-refusal reading this file relied on before status
+			// 8 was retired from refusal evidence).
+			overclaims = append(overclaims, fmt.Sprintf(
+				"%s: bit %d is SET — IEEE 2030.5-2018 p.%d assigns it to %s — and every control that named "+
+					"<%s> (mRID %s) was ADOPTED but by end of window carries neither an execution status "+
+					"(2/3) nor a refusal status (252/253/0xF0): under SD-02 that silence is itself the wire "+
+					"signal for a fault/structural non-honour, and the mask has promised a utility server a "+
+					"mode the evidence shows the DUT adopted and never made good on",
+				b.Element, b.Bit, b.Page, b.Mode, b.Element, strings.Join(r.Unhonoured, ", ")))
 		}
 	}
 
@@ -727,10 +813,31 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 			"underclaim and their presence in it is impossible: " + strings.Join(unadvertisable, "; ")
 	}
 
+	// F11 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw):
+	// 0xF0 evidence gathered with NO legacy declaration on this run is a
+	// finding in its own right — Table 27 reserves 0xF0 (15-251, 255; there
+	// is no manufacturer range), so a DUT that spoke it in what this run
+	// believes is standard mode has spoken a retired extension outside its
+	// config-gated fallback. This is independent of the overclaim/underclaim
+	// sweep above: a mode can be perfectly coherent (correctly refused via
+	// 252, say, on every OTHER control) while a DIFFERENT control for it
+	// still answered 0xF0 undeclared.
+	var legacyProblems []string
+	if len(e.LegacyWireMRIDs) > 0 && !e.LegacyDeclared {
+		legacyProblems = append(legacyProblems, fmt.Sprintf(
+			"control(s) %s answered with the LEXA legacy extension (status=0xF0) and this run's own "+
+				"case/DUT configuration does not declare legacy CannotComply mode: IEEE 2030.5-2018 Table 27 "+
+				"reserves 0xF0 (15-251, 255 — the standard defines no manufacturer range at all), so a DUT "+
+				"speaking it in what this run believes is standard mode has spoken a retired extension "+
+				"outside its config-gated fallback",
+			strings.Join(e.LegacyWireMRIDs, ", ")))
+	}
+
 	var problems []string
 	problems = append(problems, underclaims...)
 	problems = append(problems, overclaims...)
 	problems = append(problems, reserved...)
+	problems = append(problems, legacyProblems...)
 	if len(problems) > 0 {
 		return certify.Fail, fmt.Sprintf("%s. INCOHERENT in %d place(s): %s", head, len(problems),
 			strings.Join(problems, " | "))
@@ -744,6 +851,13 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 	if len(silent) > 0 {
 		tail += ". Bits set that this evidence can say nothing about, neither for nor against: " +
 			strings.Join(silent, "; ")
+	}
+	if len(e.LegacyWireMRIDs) > 0 && e.LegacyDeclared {
+		// F11: a PASS whose refusal evidence includes 0xF0 is not conformance
+		// evidence — see curve.go's legacyDisclaimer, reused verbatim here so
+		// a bundle reader sees the identical stamp regardless of which
+		// criterion the 0xF0 evidence surfaced through.
+		tail += legacyDisclaimer
 	}
 	return certify.Pass, head + tail
 }
@@ -770,6 +884,17 @@ func picsDeclares(pics []string, b derControlTypeBit) bool {
 // executes but the declaration omits is a disagreement between the device and
 // its own paperwork.
 const modesSupportedPICSParam = "csip.pics_modes_supported"
+
+// modesSupportedLegacyParam is how an operator declares that THIS RUN's
+// DUT/case configuration runs the LEXA profile's legacy CannotComply wire
+// (0xF0) rather than the standard Table 27 answer — the run-wide counterpart
+// of curve.go's per-row refusalBinding.LegacyCannotComply, needed because
+// CORE-014 grades modesSupported as one whole-mask criterion rather than
+// per-control (F11, docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md,
+// lexa-gw). "true" declares legacy mode; anything else (including absent,
+// the default) does not — matching every row in the current RC0 catalog,
+// which is standard-mode by default.
+const modesSupportedLegacyParam = "csip.legacy_cannot_comply"
 
 // parsePICSModes splits the operator's declaration.
 func parsePICSModes(raw string) []string {
@@ -818,7 +943,17 @@ const modesScopeRowWindow = "this row's own capture window only — the executed
 // this criterion returns a verdict. The single Unavailable it can return is "no
 // DERCapability was observed at all", which hands the question to the next tier
 // rather than to nobody.
-func critModesSupportedCoherent(o *Observation, picsRaw string) criterion {
+//
+// legacy is this run's own declaration that its DUT/case configuration runs
+// the LEXA legacy CannotComply wire (0xF0) — modesSupportedLegacyParam,
+// threaded from coreDERSettings the same way picsRaw is. F11
+// (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw): without
+// it, 0xF0 evidence still counts toward the refusal/overclaim sweep (that
+// half is unconditional — see gatherModesEvidence's refused sweep), but a
+// PASS earned partly on undeclared 0xF0 evidence would say nothing about it,
+// and this run's own OWN speaking of a retired extension outside its
+// config-gated fallback would go unflagged entirely.
+func critModesSupportedCoherent(o *Observation, picsRaw string, legacy bool) criterion {
 	pics := parsePICSModes(picsRaw)
 	return criterion{
 		Claim: "every bit set in the DERCapability.modesSupported the DUT serves is a mode it stands " +
@@ -835,7 +970,7 @@ func critModesSupportedCoherent(o *Observation, picsRaw string) criterion {
 		NeedsTranscript: true,
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 			e := gatherModesEvidence(t)
-			e.Scope, e.PICS, e.PICSRaw = modesScopeRowWindow, pics, picsRaw
+			e.Scope, e.PICS, e.PICSRaw, e.LegacyDeclared = modesScopeRowWindow, pics, picsRaw, legacy
 			if e.MaskWhere == "" {
 				// The transcript had no DERCapability. Before giving up on the
 				// tier, try what the server stored for THIS RUN — the DER
@@ -852,7 +987,8 @@ func critModesSupportedCoherent(o *Observation, picsRaw string) criterion {
 			return citeMessage(t, e.MaskMsg, f.Verdict, "%s", f.Observed)
 		},
 		Server: func(v *ServerView) Finding {
-			e := modesEvidence{ByMode: map[string]*modeControlEvidence{}, PICS: pics, PICSRaw: picsRaw}
+			e := modesEvidence{ByMode: map[string]*modeControlEvidence{}, PICS: pics, PICSRaw: picsRaw,
+				LegacyDeclared: legacy}
 			e.Scope = "NOTHING — this run graded the mask from gridsim's stored DER self-report, and " +
 				"gridsim records Responses as (subject, status, LFDI) and controls as (mRID, " +
 				"description): neither carries the DERControlBase element that says which MODE a " +

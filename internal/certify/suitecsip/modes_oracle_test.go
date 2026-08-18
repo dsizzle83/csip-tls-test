@@ -905,7 +905,7 @@ func controlList(controls ...[2]string) Exchange {
 func wantModesVerdict(t *testing.T, name string, tr *Transcript, pics string, want certify.Verdict) Finding {
 	t.Helper()
 	o := &Observation{Params: map[string]string{}}
-	f := critModesSupportedCoherent(o, pics).Wire(nil, tr)
+	f := critModesSupportedCoherent(o, pics, false).Wire(nil, tr)
 	if f.Unavailable != "" {
 		t.Fatalf("%s: the oracle declined to decide: %s", name, f.Unavailable)
 	}
@@ -959,11 +959,11 @@ func TestModesSupportedOracle_HasTeethBothDirections(t *testing.T) {
 
 	// ── (a) OVERCLAIM: advertised but refused ────────────────────────────
 	// opModVoltVar is bit 23. The DUT advertises it and answers the control
-	// with the cannot-comply status this product uses (8, partial opt-out).
+	// with the standard Table 27 rejection (252, at receipt — SD-02).
 	over := synthTranscript(
 		capPUT(maskVoltVar),
 		controlList([2]string{"M-VV", "opModVoltVar"}),
-		responsePOST("M-VV", 1), responsePOST("M-VV", 8),
+		responsePOST("M-VV", 1), responsePOST("M-VV", 252),
 	)
 	f = wantModesVerdict(t, "advertised but refused", over, "", certify.Fail)
 	for _, want := range []string{"opModVoltVar", "bit 23", "REFUSED", "M-VV"} {
@@ -985,7 +985,7 @@ func TestModesSupportedOracle_HasTeethBothDirections(t *testing.T) {
 	honest := synthTranscript(
 		capPUT(maskNone),
 		controlList([2]string{"M-VV", "opModVoltVar"}),
-		responsePOST("M-VV", 8),
+		responsePOST("M-VV", 252),
 	)
 	wantModesVerdict(t, "refused and not advertised", honest, "", certify.Pass)
 
@@ -1048,14 +1048,14 @@ func TestModesSupportedOracle_MalformedAndAbsentMasks(t *testing.T) {
 			`<DERCapability xmlns="`+Namespace+`"><type>83</type></DERCapability>`),
 		Resp: msg(Response, "", "", 204, ""),
 	})
-	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, noField)
+	f := critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, noField)
 	if f.Verdict != certify.Fail || !strings.Contains(f.Observed, "p.246") {
 		t.Errorf("a DERCapability with no modesSupported = %s: %s", f.Verdict, f.Observed)
 	}
 
 	// Text outside HexBinary32's lexical space.
 	bad := synthTranscript(capPUT("zz"))
-	f = critModesSupportedCoherent(&Observation{}, "").Wire(nil, bad)
+	f = critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, bad)
 	if f.Verdict != certify.Fail || !strings.Contains(f.Observed, "HexBinary32") {
 		t.Errorf("a non-HexBinary32 mask = %s: %s", f.Verdict, f.Observed)
 	}
@@ -1064,7 +1064,7 @@ func TestModesSupportedOracle_MalformedAndAbsentMasks(t *testing.T) {
 	// the DUT. The row's own critDERPut("DERCapability") is where the absence
 	// becomes a failure.
 	none := synthTranscript(get("/dcap", 200, dcapXML()))
-	f = critModesSupportedCoherent(&Observation{}, "").Wire(nil, none)
+	f = critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, none)
 	if f.Unavailable == "" {
 		t.Errorf("a window with no DERCapability produced a verdict (%s) instead of unavailable: %s",
 			f.Verdict, f.Observed)
@@ -1083,7 +1083,7 @@ func TestModesSupportedOracle_AmbiguousSerializationIsDisclosed(t *testing.T) {
 		controlList([2]string{"M-LIM", "opModMaxLimW"}),
 		responsePOST("M-LIM", 2),
 	)
-	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, tr)
+	f := critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, tr)
 	if f.Unavailable != "" {
 		t.Fatalf("the oracle declined to decide: %s", f.Unavailable)
 	}
@@ -1108,9 +1108,9 @@ func TestModesSupportedOracle_AmbiguousSerializationIsDisclosed(t *testing.T) {
 	warnCase := synthTranscript(
 		capPUT("20"),
 		controlList([2]string{"M-CONN", "opModConnect"}),
-		responsePOST("M-CONN", 8),
+		responsePOST("M-CONN", 252),
 	)
-	f = critModesSupportedCoherent(&Observation{}, "").Wire(nil, warnCase)
+	f = critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, warnCase)
 	if f.Verdict != certify.Warn {
 		t.Errorf("verdict = %s, want WARN where only the standard's reading passes: %s",
 			f.Verdict, f.Observed)
@@ -1152,7 +1152,7 @@ func TestModesSupportedOracle_AmbiguousSerializationIsDisclosed(t *testing.T) {
 // the transcript — and the finding must SAY that rather than reporting a
 // vacuous pass on the executed-mode direction.
 func TestModesSupportedOracle_ServerTierGradesTheMaskAndSaysWhatItCannot(t *testing.T) {
-	c := critModesSupportedCoherent(&Observation{}, "")
+	c := critModesSupportedCoherent(&Observation{}, "", false)
 
 	// Nothing stored at all: undecidable.
 	if f := c.Server(&ServerView{Available: true}); f.Unavailable == "" {
@@ -1280,7 +1280,7 @@ func TestModesSupportedOracle_GreenProofAgainstTheShippedTruthfulMask(t *testing
 		responsePOST("CERT-BASIC-011", 1), responsePOST("CERT-BASIC-011", 3),
 	)
 
-	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, tr)
+	f := critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, tr)
 	if f.Unavailable != "" {
 		t.Fatalf("the oracle declined to decide against the shipped build: %s", f.Unavailable)
 	}
@@ -1344,7 +1344,7 @@ func TestModesSupportedOracle_RedProofAgainstThePreservedDraftAnchoredMask(t *te
 		responsePOST("CERT-BASIC-011", 1), responsePOST("CERT-BASIC-011", 3),
 	)
 
-	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, tr)
+	f := critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, tr)
 	if f.Unavailable != "" {
 		t.Fatalf("the oracle declined to decide against the draft-anchored mask: %s", f.Unavailable)
 	}
@@ -1406,7 +1406,7 @@ func TestModesSupportedOracle_RedProofAgainstThePreservedHardcodedZero(t *testin
 		responsePOST("CERT-BASIC-011", 1), responsePOST("CERT-BASIC-011", 3),
 	)
 
-	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, tr)
+	f := critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, tr)
 	if f.Unavailable != "" {
 		t.Fatalf("the oracle declined to decide against the preserved zero mask: %s", f.Unavailable)
 	}
@@ -1468,7 +1468,7 @@ func TestModesSupportedOracle_ModesTheBitmapCannotExpressAreDisclosedNotGraded(t
 		responsePOST("CERT-DOE-EXP", 2),
 		responsePOST("CERT-DOE-GEN", 3),
 	)
-	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, tr)
+	f := critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, tr)
 	if f.Unavailable != "" {
 		t.Fatalf("the oracle declined to decide: %s", f.Unavailable)
 	}
@@ -1504,6 +1504,14 @@ func TestModesSupportedOracle_ModesTheBitmapCannotExpressAreDisclosedNotGraded(t
 // rows (curve.go's refusalBinding) assert exactly that. A mask that advertised
 // opModVoltVar alongside those refusals would be promising a utility server a
 // mode the device declines to perform, and that is the shape below.
+//
+// CERT-BASIC-005's refusal answers the LEXA legacy wire (0xF0) rather than
+// the standard 252 — the corpus entry PRESERVED from before F11
+// (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw), now under
+// a DECLARED-legacy shape: this run passes legacy=true, so the 0xF0 evidence
+// is accepted as non-conformance-evidence refusal rather than ALSO drawing
+// F11's own "spoke a retired extension undeclared" finding — see
+// TestModesSupportedOracle_LegacyDeclaration below for that half.
 func TestModesSupportedOracle_RedProofOverclaimDirection(t *testing.T) {
 	// bit 23 opModVoltVar | bit 24 opModVoltWatt = 0x01800000
 	tr := synthTranscript(
@@ -1512,10 +1520,10 @@ func TestModesSupportedOracle_RedProofOverclaimDirection(t *testing.T) {
 			[2]string{"CERT-BASIC-004", "opModVoltVar"},
 			[2]string{"CERT-BASIC-005", "opModVoltWatt"},
 		),
-		responsePOST("CERT-BASIC-004", 1), responsePOST("CERT-BASIC-004", 8),
+		responsePOST("CERT-BASIC-004", 1), responsePOST("CERT-BASIC-004", 252),
 		responsePOST("CERT-BASIC-005", 1), responsePOST("CERT-BASIC-005", 0xF0),
 	)
-	f := critModesSupportedCoherent(&Observation{}, "").Wire(nil, tr)
+	f := critModesSupportedCoherent(&Observation{}, "", true).Wire(nil, tr)
 	if f.Unavailable != "" {
 		t.Fatalf("the oracle declined to decide: %s", f.Unavailable)
 	}
@@ -1530,6 +1538,106 @@ func TestModesSupportedOracle_RedProofOverclaimDirection(t *testing.T) {
 	t.Logf("RED PROOF (overclaim direction), verbatim:\n%s", f.Observed)
 }
 
+// TestModesSupportedOracle_UnhonouredIsOverclaim is F6's proof: an advertised
+// bit whose only standing evidence is a control the DUT ADOPTED (carried,
+// never rejected at receipt) and then said nothing further about — no 2/3,
+// no 252/253/0xF0 — must FAIL as an overclaim, the same as an outright
+// refusal does. This is the parity SD-02's fault posture (no invented
+// lifecycle status on a fault/structural non-honour) requires: dropping
+// status 8 from refusal evidence would otherwise have let this exact shape
+// go undetected, since there is no longer ANY status on the wire to catch it
+// by.
+func TestModesSupportedOracle_UnhonouredIsOverclaim(t *testing.T) {
+	// bit 20 opModMaxLimW, advertised. The control that names it is carried
+	// (adopted) but drew only a Received(1) — no execution, no refusal.
+	stuckAtReceived := synthTranscript(
+		capPUT(maskMaxLimW),
+		controlList([2]string{"M-SILENT", "opModMaxLimW"}),
+		responsePOST("M-SILENT", 1),
+	)
+	f := wantModesVerdict(t, "advertised, adopted, stuck at Received", stuckAtReceived, "", certify.Fail)
+	for _, want := range []string{"opModMaxLimW", "bit 20", "ADOPTED", "M-SILENT", "never made good on"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the unhonoured-overclaim FAIL omits %q: %s", want, f.Observed)
+		}
+	}
+
+	// The complete-silence case: the control was carried but drew NO Response
+	// at all in this window. Still unhonoured, not a vacuous "nothing to
+	// grade" — the mode was ADVERTISED and a control naming it WAS adopted.
+	zeroResponses := synthTranscript(
+		capPUT(maskMaxLimW),
+		controlList([2]string{"M-VOID", "opModMaxLimW"}),
+	)
+	wantModesVerdict(t, "advertised, adopted, zero Responses", zeroResponses, "", certify.Fail)
+
+	// Contrast: a control the DUT actually REFUSED (252) still takes the
+	// pre-existing refused-overclaim path, not the new unhonoured one — F6
+	// adds a bucket, it does not change what an outright refusal reports as.
+	refused := synthTranscript(
+		capPUT(maskMaxLimW),
+		controlList([2]string{"M-REFUSED", "opModMaxLimW"}),
+		responsePOST("M-REFUSED", 1), responsePOST("M-REFUSED", 252),
+	)
+	f = wantModesVerdict(t, "advertised, refused (contrast)", refused, "", certify.Fail)
+	if !strings.Contains(f.Observed, "REFUSED") {
+		t.Errorf("a refused control must still take the REFUSED overclaim path, not the unhonoured one: %s",
+			f.Observed)
+	}
+
+	// Contrast: a control that DID execute is not unhonoured, whatever else
+	// is true about it.
+	honoured := synthTranscript(
+		capPUT(maskMaxLimW),
+		controlList([2]string{"M-RAN", "opModMaxLimW"}),
+		responsePOST("M-RAN", 1), responsePOST("M-RAN", 2),
+	)
+	wantModesVerdict(t, "advertised, executed (contrast)", honoured, "", certify.Pass)
+}
+
+// TestModesSupportedOracle_LegacyDeclaration is F11's proof: gatherModesEvidence
+// keeps accepting 0xF0 as refusal evidence unconditionally (that half is
+// unchanged — SD-02's descriptive sweep owes nothing to a per-run flag), but
+// what critModesSupportedCoherent DOES with that evidence now depends on
+// whether this run declares legacy mode.
+func TestModesSupportedOracle_LegacyDeclaration(t *testing.T) {
+	// bit 20 is NOT advertised (maskNone), so direction (a)'s overclaim sweep
+	// has nothing to say about the bit itself — isolating exactly the
+	// legacy-declaration behaviour under test.
+	tr := synthTranscript(
+		capPUT(maskNone),
+		controlList([2]string{"M-LEGACY", "opModMaxLimW"}),
+		responsePOST("M-LEGACY", 0xF0),
+	)
+
+	// Declared: PASS, but stamped non-conformance evidence — the same
+	// disclaimer curve.go's critRefusalAnswered uses for the identical shape
+	// on a per-row refusal.
+	f := critModesSupportedCoherent(&Observation{}, "", true).Wire(nil, tr)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("legacy declared = %s, want PASS: %s", f.Verdict, f.Observed)
+	}
+	for _, want := range []string{"LEGACY WIRE MODE", "NOT conformance evidence"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("a legacy-declared PASS resting on 0xF0 evidence must be stamped non-conformance-"+
+				"evidence: %s", f.Observed)
+		}
+	}
+
+	// Undeclared: the SAME 0xF0 evidence is now itself a finding — the DUT
+	// spoke the retired extension in what this run believes is standard
+	// mode, which is exactly what F11 exists to catch (previously silent).
+	f = critModesSupportedCoherent(&Observation{}, "", false).Wire(nil, tr)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("legacy undeclared = %s, want FAIL: %s", f.Verdict, f.Observed)
+	}
+	for _, want := range []string{"M-LEGACY", "0xF0", "does not declare legacy CannotComply", "reserves 0xF0"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the undeclared-legacy FAIL omits %q: %s", want, f.Observed)
+		}
+	}
+}
+
 // TestCORE014_CarriesTheModesSupportedOracle pins the row placement. CORE-014
 // is the only catalog row whose observables name modesSupported at all, and the
 // criterion has to be in the list it mints or the oracle is dead code.
@@ -1541,7 +1649,7 @@ func TestModesSupportedOracle_RedProofOverclaimDirection(t *testing.T) {
 func TestCORE014_CarriesTheModesSupportedOracle(t *testing.T) {
 	o := &Observation{Params: map[string]string{}}
 	var found bool
-	for _, c := range core014Criteria(o, "") {
+	for _, c := range core014Criteria(o, "", false) {
 		if strings.Contains(c.Claim, "modesSupported") {
 			found = true
 			if c.Skip == "" {

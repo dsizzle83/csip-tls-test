@@ -480,6 +480,16 @@ func diagnoseMeterInversion(sc *mayScenario, cons *activeConstraint, s []maySamp
 		f.Diagnosis = []string{
 			"The grid meter reported every flow with its sign flipped, and the hub still kept the site inside the cap — its device-side telemetry cross-check did not let the backwards CT drive control.",
 		}
+	// F2/SD-02 adjudication #3 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md,
+	// lexa-gw): only the `flagged` half of this OR is currently reachable
+	// against a correct RC0 gateway. ReportedCannot is onset-only and its only
+	// live producer (the preference-class bus.ComplianceAlert publisher) is
+	// INERT in this product, so a correct gateway never sets it for this
+	// scenario's fault-class inversion — the meter-distrust flag is doing all
+	// the real work here today. Do not delete the ReportedCannot half; it is
+	// correct once a real producer exists (a registry item, not implemented
+	// this wave). This scenario is not marked NotApplicable because the
+	// `flagged` half keeps a genuine, currently-reachable PASS/DEGRADED path.
 	case f.Metrics.ReportedCannot || flagged:
 		f.Verdict = "DEGRADED"
 		f.Headline = "breach stood, but the hub distrusted the meter / admitted noncompliance"
@@ -833,6 +843,14 @@ func diagnoseConsumerRestartAfterQuiescence(sc *mayScenario, cons *activeConstra
 // directly (maySample.CannotComplyCount) rather than SSH-grepping the
 // northbound journal, since the admin API already exposes exactly what's
 // needed (checked first, per this scenario's own launch brief).
+//
+// CannotComplyCount counts ONSET signals only (mayhem.go's
+// isCannotComplyOnset — legacy 0xF0 or SD-02's OptOut(4) class,
+// docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw), not every
+// /admin/alerts entry for this mRID (F5): a genuine breach→recover pair
+// (OptOut(4) then OptIn(5) for the same episode) is two DIFFERENT lifecycle
+// signals, not two onset POSTs, and must not read as the duplicate-repost
+// defect this scenario exists to catch.
 const (
 	// nbRestartBreachDeadlineS bounds how long perTick waits for
 	// lexa_hub_breach_active==1 before restarting lexa-northbound anyway —
@@ -899,10 +917,10 @@ func diagnoseNorthboundRestartMidBreach(sc *mayScenario, cons *activeConstraint,
 		f.Headline = "no CannotComply was ever posted for an unmeetable import cap"
 		f.Diagnosis = []string{
 			fmt.Sprintf("The cap (%.0f W, battery at SOC reserve) is physically unmeetable — battery-empty-import-cap already proves the hub detects and reports this with no restart in the mix. Here it never reached gridsim's /admin/alerts. %s.", cons.LimW, restartNote),
-			"Either the compliance-alert edge (non-retained MQTT, cmd/hub/main.go's emitAlerts) fired while lexa-northbound was down and nothing recovered it, or the breach itself never formed this run; check the hub's own lexa_hub_breach_active / journal evidence against gridsim's alert log to tell the two apart.",
-			"AD-016 (lexa-hub docs/refactor/02_ARCHITECTURE_DECISIONS.md) persists northbound's posted/alerted dedupe state across a restart, which prevents a DUPLICATE re-post — it does not, by itself, recover a ComplianceAlert message northbound was never connected to receive (that message is not retained and the MQTT session is not persistent). A reproducible zero here is a real gap in the restart-safety guarantee, not an artifact of this harness.",
+			"Either the compliance-alert edge (non-retained MQTT, bus.TopicCSIPComplianceAlert → internal/northbound/responses/tracker.go's AlertCannotComply — NOT cmd/hub/main.go's emitAlerts, the abandoned lexa-hub's mechanism) fired while lexa-northbound was down and nothing recovered it, or the breach itself never formed this run; check the hub's own lexa_hub_breach_active / journal evidence against gridsim's alert log to tell the two apart. AS OF SD-02 adjudication #3 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw) a reproducible zero here is the EXPECTED outcome for RC0, not evidence of a lost message: the only live publisher of that edge is preference-class and does not exist in this product — see this scenario's NotApplicable field, which is why this FAIL branch is not currently reachable in a real run.",
+			"AD-016 (lexa-gw docs/refactor/02_ARCHITECTURE_DECISIONS.md) persists northbound's posted/alerted dedupe state across a restart, which prevents a DUPLICATE re-post — it does not, by itself, recover a ComplianceAlert message northbound was never connected to receive (that message is not retained and the MQTT session is not persistent). A reproducible zero here is a real gap in the restart-safety guarantee, not an artifact of this harness — PROVIDED the compliance-alert edge is actually live, which it currently is not (see above).",
 		}
-		f.Fix = "internal/northbound/responses/persist.go + tracker.go (lexa-hub): confirm response_state_path is configured (not \"off\") and LoadState actually runs at Tracker construction (cmd/northbound/main.go). If persistence is wired correctly and this still reproduces, the gap is upstream of AD-016's scope — northbound needs a way to reconcile a currently-open breach episode on startup, not only react to the edge-triggered MQTT alert."
+		f.Fix = "internal/northbound/responses/persist.go + tracker.go (lexa-gw): confirm response_state_path is configured (not \"off\") and LoadState actually runs at Tracker construction (cmd/northbound/main.go). If persistence is wired correctly and this still reproduces, the gap is upstream of AD-016's scope — northbound needs a way to reconcile a currently-open breach episode on startup, not only react to the edge-triggered MQTT alert. This scenario is NOT-APPLICABLE-FOR-RC0 pending the row-7 LogEvent/preference-producer fix (SD-02 adjudication #3), so this Fix pointer is for when it is re-enabled."
 		forceBlindOnConstraintProbeGap(&f, cons, s)
 		return f
 	case maxCount > 1:
@@ -1340,11 +1358,12 @@ func (d *mayhemDriver) worldScenarios() []*mayScenario {
 			restartAtS := -1.0
 			return &mayScenario{
 				ID: "northbound-restart-mid-breach", Name: "lexa-northbound restarts between the breach edge and its CannotComply POST (WS-4)",
-				Category:   "Hub resilience (restart safety, AD-016)",
-				Hypothesis: "The hub's compliance-alert MQTT publish is non-retained and fires exactly once per breach onset (cmd/hub/main.go's emitAlerts). A lexa-northbound restart landing near that edge risks either never seeing the alert (a lost, un-recorded CannotComply the utility was owed) or, on recovery, re-posting a duplicate for an episode it already acknowledged before the restart.",
-				Expected:   "AD-016's persisted responseTracker dedupe state (internal/northbound/responses/persist.go, lexa-hub) makes the restart a no-op from the utility's point of view: gridsim's own Response record (/admin/alerts) shows exactly ONE CannotComply for the episode, never zero and never more than one.",
-				HoldS:      nbRestartHoldS,
-				Fix:        "internal/northbound/responses/tracker.go + persist.go (lexa-hub, AD-016): a duplicate means the persisted alerted-map dedupe isn't surviving the restart (response_state_path misconfigured, or not loaded at Tracker construction); a missing CannotComply means the compliance-alert edge was never recovered — see the diagnoser's own Fix text for the split.",
+				Category:      "Hub resilience (restart safety, AD-016)",
+				Hypothesis:    "The hub's compliance-alert MQTT publish (bus.ComplianceAlert on bus.TopicCSIPComplianceAlert) is non-retained and, when a live publisher exists, fires once per breach onset — consumed in this product by internal/northbound/responses/tracker.go's AlertCannotComply (NOT cmd/hub/main.go's emitAlerts, which was the abandoned lexa-hub's mechanism, retired 2026-08-03). A lexa-northbound restart landing near that edge risks either never seeing the alert (a lost, un-recorded CannotComply the utility was owed) or, on recovery, re-posting a duplicate for an episode it already acknowledged before the restart.",
+				Expected:      "AD-016's persisted responseTracker dedupe state (internal/northbound/responses/persist.go, lexa-gw) makes the restart a no-op from the utility's point of view: gridsim's own Response record (/admin/alerts) shows exactly ONE CannotComply for the episode, never zero and never more than one.",
+				HoldS:         nbRestartHoldS,
+				Fix:           "internal/northbound/responses/tracker.go + persist.go (lexa-gw, AD-016): a duplicate means the persisted alerted-map dedupe isn't surviving the restart (response_state_path misconfigured, or not loaded at Tracker construction); a missing CannotComply means the compliance-alert edge was never recovered — see the diagnoser's own Fix text for the split. NOT-APPLICABLE-FOR-RC0 below explains why that second case is now the ONLY reachable one.",
+				NotApplicable: "F2/SD-02 adjudication #3 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw): this scenario's setup forces battery-empty-import-cap's fault-class breach (empty battery, zero import cap — no user preference in the loop), and its oracle demands gridsim record exactly one CannotComply (the 4/5/8/10 status family) for that breach. The ONLY live producer of that arc is the preference-class bus.ComplianceAlert publisher on bus.TopicCSIPComplianceAlert, and it is INERT in this product — it was the abandoned lexa-hub's orchestrator's topic (lexa-hub-abandoned.md, 2026-08-03). A correct RC0 gateway posts NO onset/end-of-event status for a fault-class breach (SD-02 rows 6/11), so gridsim's alert count for this scenario's breach is always 0 against a correct implementation — the restart-timing question this scenario actually means to test (does AD-016's dedupe survive a restart?) never gets exercised, because there is never a first POST to duplicate or lose. Real fix: a gateway-originated LogEvent producer for control faults (SD-02 rows 6/11's alarm half) is a registry item, not implemented this wave; once it lands, re-point this scenario's oracle at that journal/LogEvent evidence (not gridsim's CannotComply Response log) and re-enable it.",
 				setup: func(d *mayhemDriver) (*activeConstraint, error) {
 					// SSH probe first, same discipline as hub-restart-mid-cap/
 					// disk-full/consumer-restart-after-quiescence: without bench SSH

@@ -450,6 +450,202 @@ func TestResponseCriterionHasTeeth(t *testing.T) {
 	}
 }
 
+// TestNoEarlyEndOfEventStatusHasTeeth exercises critNoEarlyEndOfEventStatus
+// (criteria_2030.go), the SD-02 class backstop
+// (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw): no
+// Response may carry status 8 or 10 before the EARLIEST EffectiveEndTime the
+// control's own randomizeStart/randomizeDuration (§10.2.3.2 definitions,
+// §10.2.4.2.2/.3 signed application) permit — not
+// before the SPECIFIED End Time (<interval><start>+<duration>) alone, which
+// is only correct for a control that carries no randomization at all.
+func TestNoEarlyEndOfEventStatusHasTeeth(t *testing.T) {
+	respBody := func(status int, subject string) string {
+		return `<DERControlResponse xmlns="urn:ieee:std:2030.5:ns"><createdDateTime>1</createdDateTime>` +
+			`<endDeviceLFDI>ab</endDeviceLFDI><status>` + itoa(int64(status)) + `</status>` +
+			`<subject>` + subject + `</subject></DERControlResponse>`
+	}
+	postAt := func(status int, subject string, at time.Time) Exchange {
+		req := msg(Request, "POST", "/rsps/0/r", 0, respBody(status, subject))
+		req.Time = at
+		return Exchange{Req: req, Resp: msg(Response, "", "", 201, "")}
+	}
+	controlListWithInterval := func(mrid string, start, dur int64) Exchange {
+		body := `<DERControlList xmlns="` + Namespace + `" all="1" results="1">` +
+			`<DERControl replyTo="/rsps/0/r" responseRequired="03"><mRID>` + mrid + `</mRID>` +
+			`<interval><start>` + itoa(start) + `</start><duration>` + itoa(dur) + `</duration></interval>` +
+			`<DERControlBase><opModMaxLimW>1</opModMaxLimW></DERControlBase></DERControl></DERControlList>`
+		return get("/derp/0/derc", 200, body)
+	}
+	// controlListWithRandomizedInterval is controlListWithInterval plus this
+	// control's own randomizeStart/randomizeDuration (§10.2.3.2 definitions,
+	// §10.2.4.2.2/.3 signed application) — gridsim seeds RandomizeStart on
+	// some controls (server.go:1451, admin.go:504), so this is a live wire
+	// shape, not a hypothetical one.
+	controlListWithRandomizedInterval := func(mrid string, start, dur, randStart, randDur int64) Exchange {
+		body := `<DERControlList xmlns="` + Namespace + `" all="1" results="1">` +
+			`<DERControl replyTo="/rsps/0/r" responseRequired="03"><mRID>` + mrid + `</mRID>` +
+			`<interval><start>` + itoa(start) + `</start><duration>` + itoa(dur) + `</duration></interval>` +
+			`<randomizeStart>` + itoa(randStart) + `</randomizeStart>` +
+			`<randomizeDuration>` + itoa(randDur) + `</randomizeDuration>` +
+			`<DERControlBase><opModMaxLimW>1</opModMaxLimW></DERControlBase></DERControl></DERControlList>`
+		return get("/derp/0/derc", 200, body)
+	}
+
+	const mrid = "M-TIMING"
+	const start, dur = 1000, 100 // no randomization: band collapses to the single instant 1100
+
+	// No 8/10 at all: this criterion has nothing to grade — RRS forbids an
+	// unfalsifiable Pass, so this is a disclosed non-verdict, not a Pass
+	// (F16: the old default arm returned Pass here).
+	wantUnavailable(t, "no partial status at all", critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithInterval(mrid, start, dur), postAt(1, mrid, time.Unix(start, 0))))
+
+	// SEEDED NEGATIVE: status 8 arriving BEFORE EffectiveEndTime — the former
+	// product defect this criterion exists to catch class-wide, wherever an
+	// executing (not outright-refused) control's Response stream carries it.
+	// This is a permanent oracle-bite test: if this ever passes again, the
+	// class backstop has regressed.
+	f := wantVerdict(t, "SEEDED NEGATIVE: 8 before EffectiveEndTime", critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithInterval(mrid, start, dur), postAt(8, mrid, time.Unix(start+50, 0))),
+		certify.Fail)
+	if !strings.Contains(f.Observed, "before the earliest EffectiveEndTime") {
+		t.Errorf("the FAIL does not name the timing defect: %s", f.Observed)
+	}
+
+	// The same status, arriving AT EffectiveEndTime, is exactly Table 27's own
+	// prescribed send-time and must PASS: with no randomization on this
+	// control, the band is a single point and the boundary is closed.
+	wantVerdict(t, "8 at EffectiveEndTime", critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithInterval(mrid, start, dur), postAt(8, mrid, time.Unix(start+dur, 0))),
+		certify.Pass)
+	// 10, after EffectiveEndTime, is the same class of statement and must also
+	// PASS.
+	wantVerdict(t, "10 after EffectiveEndTime", critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithInterval(mrid, start, dur), postAt(10, mrid, time.Unix(start+dur+100, 0))),
+		certify.Pass)
+
+	// A status 8/10 with no recoverable interval for its own mRID: the
+	// boundary cannot be established, so the criterion must decline rather
+	// than guess at the DUT's intent.
+	wantUnavailable(t, "8 with no DERControlList interval recovered", critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(postAt(8, mrid, time.Unix(start+50, 0))))
+
+	// ── RANDOMIZED control: the bound logic bites both ways ─────────────────
+	//
+	// randomizeStart=-30, randomizeDuration=+20 against start=1000, dur=100
+	// (SpecifiedEndTime=1100): earliest = 1000 + min(0,-30) + 100 + min(0,20)
+	// = 1070; latest = 1000 + max(0,-30) + 100 + max(0,20) = 1120. Band =
+	// [1070, 1120).
+	const rStart, rDur, randStart, randDur = 1000, 100, -30, 20
+
+	// Bite #1 — still catches a genuinely early post even with randomization
+	// live: 1050 is before EARLIEST (1070) under any permitted draw.
+	f = wantVerdict(t, "RANDOMIZED: still FAILs a post before the band's earliest edge",
+		critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithRandomizedInterval(mrid, rStart, rDur, randStart, randDur),
+			postAt(8, mrid, time.Unix(rStart+50, 0))), // 1050
+		certify.Fail)
+	if !strings.Contains(f.Observed, "before the earliest EffectiveEndTime") {
+		t.Errorf("the RANDOMIZED FAIL does not name the timing defect: %s", f.Observed)
+	}
+
+	// Bite #2 — a post that lands inside the legitimate randomization band is
+	// a disclosed non-verdict, not a FAIL: 1080 is before SpecifiedEndTime
+	// (1100) but at/after EARLIEST (1070), so it is undecidable, not a
+	// violation. critNoEarlyEndOfEventStatus was introduced in the SD-02
+	// remediation; the Specified-vs-Effective distinction it implements —
+	// that a control's own randomization moves its EffectiveEndTime away
+	// from the fixed SpecifiedEndTime — was a finding against the first
+	// draft, not a fix to code that ever compared against 1100 on this repo.
+	wantUnavailable(t, "RANDOMIZED: a post inside the band is a disclosed non-verdict, not a FAIL",
+		critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithRandomizedInterval(mrid, rStart, rDur, randStart, randDur),
+			postAt(8, mrid, time.Unix(rStart+80, 0)))) // 1080
+
+	// A post at/after LATEST (1120) is unconditionally not early, band or no
+	// band, and must PASS.
+	wantVerdict(t, "RANDOMIZED: a post at/after the band's latest edge PASSes",
+		critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithRandomizedInterval(mrid, rStart, rDur, randStart, randDur),
+			postAt(10, mrid, time.Unix(rStart+120, 0))), // 1120
+		certify.Pass)
+
+	// ── EFFECTIVE-DURATION FLOOR ─────────────────────────────────────────────
+	//
+	// start=1000, dur=10, randomizeDuration=-30: |randomizeDuration| exceeds
+	// the control's own duration. Unfloored, earliest's duration contribution
+	// would be 10+min(0,-30) = -20, pulling EARLIEST to 980 — 20s before the
+	// control's own start, which is nonsense. Floored at 0, EARLIEST is 1000
+	// (the start itself). A post at 990 is inside the UNFLOORED (wrong) band
+	// but before the FLOORED (correct) one, so it must FAIL only once the
+	// floor is applied.
+	f = wantVerdict(t, "FLOOR: negative randomizeDuration larger than duration doesn't pull EARLIEST before start",
+		critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithRandomizedInterval(mrid, 1000, 10, 0, -30),
+			postAt(8, mrid, time.Unix(990, 0))),
+		certify.Fail)
+	if !strings.Contains(f.Observed, "before the earliest EffectiveEndTime") {
+		t.Errorf("the FLOOR FAIL does not name the timing defect: %s", f.Observed)
+	}
+
+	// ── OneHourRangeType VALIDATION ──────────────────────────────────────────
+	//
+	// randomizeStart/randomizeDuration are both OneHourRangeType, bounded to
+	// [-3600,+3600]. A control carrying a value outside that is malformed —
+	// this criterion must FAIL the row and name the illegal value, not widen
+	// the band to match a number the standard never permits on the wire.
+	f = wantVerdict(t, "MALFORMED: randomizeStart outside OneHourRangeType FAILs, not widens",
+		critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithRandomizedInterval(mrid, 1000, 100, 4000, 0),
+			postAt(8, mrid, time.Unix(1050, 0))),
+		certify.Fail)
+	for _, want := range []string{"OneHourRangeType", "4000", "malformed"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the MALFORMED randomizeStart FAIL does not say %q: %s", want, f.Observed)
+		}
+	}
+	f = wantVerdict(t, "MALFORMED: randomizeDuration outside OneHourRangeType FAILs, not widens",
+		critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithRandomizedInterval(mrid, 1000, 100, 0, -3601),
+			postAt(8, mrid, time.Unix(1050, 0))),
+		certify.Fail)
+	for _, want := range []string{"OneHourRangeType", "-3601", "malformed"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the MALFORMED randomizeDuration FAIL does not say %q: %s", want, f.Observed)
+		}
+	}
+
+	// ── BAND-WIDTH DISCLOSURE ────────────────────────────────────────────────
+	//
+	// randomizeStart=-40, randomizeDuration=-40 against start=1000, dur=200:
+	// earliest = 1000+min(0,-40)+floor(200+min(0,-40)) = 960+160 = 1120;
+	// latest = 1000+max(0,-40)+200+max(0,-40) = 1000+200 = 1200. Band width
+	// 80s, and |rs|+|rd| = 80s clears the 60s poll-cadence disclosure floor —
+	// the in-band non-verdict must name the band width and warn that the
+	// check's power is reduced, not silently absorb it the way a narrow band
+	// (the 50s Bite #2 case above) correctly does.
+	why := wantUnavailable(t, "WIDE BAND: an in-band post discloses reduced power",
+		critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithRandomizedInterval(mrid, 1000, 200, -40, -40),
+			postAt(8, mrid, time.Unix(1150, 0)))) // inside [1120,1200)
+	for _, want := range []string{"REDUCED POWER", "1m20s"} {
+		if !strings.Contains(why, want) {
+			t.Errorf("the wide-band non-verdict does not say %q: %s", want, why)
+		}
+	}
+	// The narrow 50s band above (Bite #2) must NOT trip the disclosure — the
+	// warning is for bands that have actually crossed the cadence floor, not
+	// every in-band non-verdict.
+	narrow := wantUnavailable(t, "NARROW BAND: no disclosure below the cadence floor",
+		critNoEarlyEndOfEventStatus(mrid),
+		synthTranscript(controlListWithRandomizedInterval(mrid, rStart, rDur, randStart, randDur),
+			postAt(8, mrid, time.Unix(rStart+80, 0)))) // 1080, band [1070,1120) width 50s
+	if strings.Contains(narrow, "REDUCED POWER") {
+		t.Errorf("a 50s band tripped the reduced-power disclosure, which exists only for bands at/beyond "+
+			"the %s cadence floor: %s", bandDisclosureCadence, narrow)
+	}
+}
+
 // TestResponseStartedCriterionHasTeeth exercises critResponseStarted, which
 // CORE-022 and CORE-023 both now use for their status=2 (Event started)
 // claim. It must grade Pass/Fail exactly like critResponsePosted(2, ...) when
@@ -508,16 +704,34 @@ func TestResponseStartedCriterionHasTeeth(t *testing.T) {
 		t.Errorf("the unavailable reason does not name the captured responseRequired: %q", reason)
 	}
 
-	// The control carried NO responseRequired attribute at all — the same
-	// degraded outcome as an explicit value lacking bit 0x02.
-	wantUnavailable(t, "status=2 (responseRequired absent)", critResponseStarted("M1"),
-		synthTranscript(get("/derp/0/derc", 200, dercWithRR(""))))
+	// F5 (2026-08-17): the control carried NO responseRequired attribute at
+	// all — "no server instruction", which reads as "grade normally", NOT as
+	// the same degraded outcome an explicit value lacking bit 0x02 produces
+	// (that comment described the PRE-F5 bug: absent and explicit-0 used to
+	// collapse onto the same rr=0 and were gated identically). With the
+	// status actually posted, this must grade a real PASS.
+	wantVerdict(t, "status=2 (responseRequired absent, posted)", critResponseStarted("M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercWithRR("")), post(2)), certify.Pass)
 
-	// The control itself was never recovered in this window's transcript.
+	// Absent + NOT posted is still Unavailable — but for the ORDINARY "no
+	// Response POST recovered" reason critResponsePosted has always given,
+	// not the "not requested" reason: absent means this gate has nothing to
+	// say either way, so the underlying scan (which found nothing) decides.
+	reason = wantUnavailable(t, "status=2 (responseRequired absent, not posted)", critResponseStarted("M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercWithRR(""))))
+	if !strings.Contains(reason, "holds no Response POST") {
+		t.Errorf("the unavailable reason for an absent (not gated) responseRequired should be the ordinary "+
+			"no-Response-POST reason, not a not-requested ruling: %q", reason)
+	}
+
+	// The control itself was never recovered in this window's transcript —
+	// same "ungated, fall through to the ordinary scan" path as absent,
+	// which here also finds nothing.
 	reason = wantUnavailable(t, "status=2 (control not recovered)", critResponseStarted("M1"),
 		synthTranscript(get("/dcap", 200, dcapXML())))
-	if !strings.Contains(reason, "not recovered") {
-		t.Errorf("the unavailable reason does not say the control was never recovered: %q", reason)
+	if !strings.Contains(reason, "holds no Response POST") {
+		t.Errorf("the unavailable reason for an unrecovered control should fall through to the ordinary "+
+			"no-Response-POST reason (ungated, not a not-requested ruling): %q", reason)
 	}
 
 	// Tier 3 (gridsim admin API) has no visibility into a control's own wire
@@ -546,6 +760,79 @@ func TestResponseStartedCriterionHasTeeth(t *testing.T) {
 	}
 	if f := notReqCrit.Server(sv); f.Unavailable == "" {
 		t.Errorf("tier 3 re-graded a control tier 2 already ruled not-requested: verdict=%s observed=%s",
+			f.Verdict, f.Observed)
+	}
+}
+
+// TestResponseRequiredGateAppliesPerStatusNotJustStarted proves #17/F2's
+// hoist: the SAME responseRequired gate now applies to every
+// critResponsePosted-built criterion by status, not only critResponseStarted's
+// former hand-built status=2 case. A control serving rr=0x01 (message-received
+// only) must grade status=1 (Received) NORMALLY — bit 0x01 IS requested —
+// while a status=2 (Started) demand on the SAME control goes Unavailable,
+// never FAIL, because bit 0x02 was not requested.
+//
+// This is also the "one new test serving rr=0x01" the fix requires: every
+// shipping row today serves rr=0x03 (sim/gridsim/admin.go's
+// adminDefaultResponseRequired, both bits set) — soon 0x07 (F7/#18) — so this
+// is the suite's first coverage of a server that narrows the bitmap to just
+// one bit, proving the per-status gate actually discriminates rather than
+// gating (or not gating) everything alike.
+func TestResponseRequiredGateAppliesPerStatusNotJustStarted(t *testing.T) {
+	respBody := func(status int, subject string) string {
+		return `<DERControlResponse xmlns="urn:ieee:std:2030.5:ns"><createdDateTime>1</createdDateTime>` +
+			`<endDeviceLFDI>ab</endDeviceLFDI><status>` + itoa(int64(status)) + `</status>` +
+			`<subject>` + subject + `</subject></DERControlResponse>`
+	}
+	post := func(status int) Exchange {
+		return Exchange{Req: msg(Request, "POST", "/rsps/0/r", 0, respBody(status, "M1")),
+			Resp: msg(Response, "", "", 201, "")}
+	}
+	dercRR01 := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<DERControlList xmlns="urn:ieee:std:2030.5:ns" href="/derp/0/derc" all="1" results="1">` +
+		`<DERControl href="/derp/0/derc/0" responseRequired="01">` +
+		`<mRID>M1</mRID><description>test</description><creationTime>100</creationTime>` +
+		`<EventStatus><currentStatus>1</currentStatus><dateTime>100</dateTime></EventStatus>` +
+		`<interval><duration>120</duration><start>200</start></interval>` +
+		`<DERControlBase><opModExpLimW><multiplier>0</multiplier><value>3000</value></opModExpLimW></DERControlBase>` +
+		`</DERControl></DERControlList>`
+
+	// Received (status=1, required bit 0x01): rr=01 DOES request it — normal
+	// grading, and the DUT posted it, so a real PASS.
+	wantVerdict(t, "status=1 under rr=01 (requested, posted)", critResponsePosted(1, "Event received", "M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercRR01), post(1)), certify.Pass)
+
+	// Received under rr=01, but the DUT posted a DIFFERENT status instead — a
+	// real FAIL, not a gate: this is the "normal grading" half of the fix, on
+	// the SAME control whose bit 0x02 (below) IS gated. (A window with NO
+	// Response POST at all is Unavailable regardless of gating — that is
+	// critResponsePosted's pre-existing "nothing to judge" behavior, proven
+	// by TestResponseStartedCriterionHasTeeth, not what this case is about.)
+	wantVerdict(t, "status=1 under rr=01 (requested, wrong status posted)", critResponsePosted(1, "Event received", "M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercRR01), post(3)), certify.Fail)
+
+	// Started (status=2, required bit 0x02): rr=01 does NOT carry it —
+	// Unavailable, never FAIL, even though nothing was posted.
+	reason := wantUnavailable(t, "status=2 under rr=01 (not requested)", critResponseStarted("M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercRR01)))
+	if !strings.Contains(reason, "responseRequired=01") || !strings.Contains(reason, "0x02") {
+		t.Errorf("the unavailable reason does not name the captured responseRequired: %q", reason)
+	}
+
+	// critResponseStarted's Server (tier-3) fallback honours the SAME gate
+	// through the shared closure critResponsePosted now builds, exactly as
+	// TestResponseStartedCriterionHasTeeth already proves for the bit-0x02
+	// literal case — this repeats it under a real rr=01 server bitmap rather
+	// than a synthetic single-bit-missing one, to close the loop on the hoist.
+	notReqCrit := critResponseStarted("M1")
+	notReqTr := synthTranscript(get("/derp/0/derc", 200, dercRR01))
+	if f := notReqCrit.Wire(nil, notReqTr); f.Unavailable == "" {
+		t.Fatalf("setup: Wire did not rule bit 0x02 not-requested under rr=01: verdict=%s observed=%s",
+			f.Verdict, f.Observed)
+	}
+	sv := &ServerView{Available: true, Responses: []AdminResponse{{Subject: "M1", Status: 2, LFDI: "ab"}}}
+	if f := notReqCrit.Server(sv); f.Unavailable == "" {
+		t.Errorf("tier 3 re-graded a control tier 2 already ruled not-requested under rr=01: verdict=%s observed=%s",
 			f.Verdict, f.Observed)
 	}
 }

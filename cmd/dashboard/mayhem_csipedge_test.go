@@ -145,6 +145,24 @@ func TestDiagnoseRandomizeDuration_FailOutOfBand(t *testing.T) {
 	}
 }
 
+// TestDiagnoseRandomizeDuration_FailLengthenedWhenToldToShorten is the #17
+// regression: rdRand=-60 is NEGATIVE, which §10.2.4.2.3 grants as
+// shorten-only — the legal signed band is [180,250] (lo=240-60-10,
+// hi=240+0+10), never [170,310]. honored=300 (1300-1000) sat comfortably
+// inside the OLD, wrong |rand| union band [170,310] and would have PASSed
+// there; a hub that lengthens an event it was told only to shorten must FAIL
+// under the signed band this fix enforces.
+func TestDiagnoseRandomizeDuration_FailLengthenedWhenToldToShorten(t *testing.T) {
+	f := diagnoseRandomizeDuration(scFor("rd-lengthened"), adoptedSamples(1300), randCtrl(), nil, rdBase, rdRand)
+	if f.Verdict != "FAIL" {
+		t.Fatalf("verdict = %s, want FAIL (a lengthened window on a shorten-only randomizeDuration must not "+
+			"pass just because it falls inside the old symmetric |rand| band): %s", f.Verdict, f.Headline)
+	}
+	if !containsFold(f.Headline, "outside") {
+		t.Errorf("headline = %q, want it to flag the out-of-band window", f.Headline)
+	}
+}
+
 func TestDiagnoseRandomizeDuration_FailNeverAdopted(t *testing.T) {
 	s := mkSamples(75, func(i int, smp *maySample) { smp.HubReachable = true }) // no AdoptedMRID/ValidUntil
 	f := diagnoseRandomizeDuration(scFor("rd-noadopt"), s, randCtrl(), nil, rdBase, rdRand)

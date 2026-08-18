@@ -177,9 +177,15 @@ func (s *Scheduler) activeEvent(ps *discovery.ProgramState, serverNow int64) *Ac
 }
 
 // randomizedStart returns the effective start time for ctrl, applying the
-// randomizeStart offset per IEEE 2030.5 §11.10.4.2. The per-MRID offset is
-// computed once and cached so that successive Evaluate calls produce the same
-// effective timing for the same event.
+// randomizeStart offset per IEEE 2030.5-2018 §10.2.4.2.2: "If the value is
+// negative, randomization SHALL be applied before [the scheduled time] ...
+// if positive ... delay" — SIGNED and ONE-SIDED, not a symmetric ± band (that
+// reading, and the §11.10.4.2 citation it used to carry, was wrong: clause 11
+// is manufacturer extensions, not this). A negative randomizeStart draws from
+// [randomizeStart, 0] (early only); a positive one draws from
+// [0, randomizeStart] (delay only). The per-MRID offset is computed once and
+// cached so that successive Evaluate calls produce the same effective timing
+// for the same event.
 func (s *Scheduler) randomizedStart(ctrl *model.DERControl) int64 {
 	base := ctrl.Interval.Start
 	if ctrl.RandomizeStart == nil || *ctrl.RandomizeStart == 0 {
@@ -190,11 +196,13 @@ func (s *Scheduler) randomizedStart(ctrl *model.DERControl) int64 {
 	offset, ok := s.randOffsets[ctrl.MRID]
 	if !ok {
 		window := *ctrl.RandomizeStart
+		lo, hi := int32(0), window
 		if window < 0 {
-			window = -window // spec says the value is the magnitude
+			lo, hi = window, 0
 		}
-		// Uniform random integer in [-window, +window].
-		offset = int32(s.rng.Int63n(int64(2*window+1))) - window
+		// Uniform random integer in [lo, hi] — the one-sided draw
+		// §10.2.4.2.2 grants, never the symmetric [-|window|, +|window|].
+		offset = int32(s.rng.Int63n(int64(hi-lo+1))) + lo
 		s.randOffsets[ctrl.MRID] = offset
 	}
 	s.mu.Unlock()

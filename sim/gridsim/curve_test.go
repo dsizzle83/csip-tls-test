@@ -537,7 +537,7 @@ func TestAdminControl_ScalarPostOntoExtendedProgramKeepsResponseAttrs(t *testing
 	if !strings.Contains(body, `replyTo="`+adminResponseReplyTo+`"`) {
 		t.Errorf("raw /derp/0/derc body carries no replyTo attribute: %s", body)
 	}
-	if !strings.Contains(body, `responseRequired="03"`) {
+	if !strings.Contains(body, `responseRequired="07"`) {
 		t.Errorf("raw /derp/0/derc body carries no responseRequired attribute: %s", body)
 	}
 }

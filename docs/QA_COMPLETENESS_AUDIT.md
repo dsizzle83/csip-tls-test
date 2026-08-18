@@ -160,7 +160,9 @@ Priority reflects **field-risk × correctness**, re-scored after verification.
 **P1-3 · randomizeDuration — hub consumes+unit-tests it, no e2e scenario.**
 - **Severity:** Medium (conformance CORE-021).
 - **Recon claim REFUTED at unit level:** consumed at `scheduler/scheduler.go:625-647`
-  (`randomizedDuration`, cached per-MRID `randDurs`, §11.10.4.2), asserted by
+  (`randomizedDuration`, cached per-MRID `randDurs`, §10.2.4.2.3 — corrected from the
+  fabricated §11.10.4.2 this note originally carried; clause 11 is manufacturer
+  extensions), asserted by
   `scheduler_test.go:454,478`.
 - **Actual gap:** csip-tls-test CORE-021 drives the *independent referee*
   `internal/csipref/scheduler`, not the real hub; gridsim never serves

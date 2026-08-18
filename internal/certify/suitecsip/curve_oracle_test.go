@@ -1200,41 +1200,83 @@ func responseExchange(status int, subject string) Exchange {
 }
 
 // TestCritRefusalAnswered_HasTeeth walks every answer a DUT can give a control
-// whose axis it cannot execute.
+// whose axis it cannot execute, against the SD-02 corrected table
+// (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw): the
+// standard answer to a structurally unsupported control is 252 at receipt,
+// before any write; 8/10 (Table 27's EffectiveEndTime-only partials) and 4/5
+// (lifecycle acknowledgements of an ADOPTED control) are all now forbidden
+// here, not accepted.
 func TestCritRefusalAnswered_HasTeeth(t *testing.T) {
 	const row = "CERT-BASIC-014"
 
-	// The honest refusal: received, then the partial-opt-out code this product
-	// posts at receipt for an unsupported axis.
-	wantVerdict(t, "received + partial-opt-out", critRefusalAnswered(row),
-		synthTranscript(responseExchange(1, row), responseExchange(8, row)), certify.Pass)
+	// The honest, standard-mode refusal: received, then the receipt-time
+	// rejection Table 27 actually defines for this shape.
+	wantVerdict(t, "received + rejected(252)", critRefusalAnswered(row, false),
+		synthTranscript(responseExchange(1, row), responseExchange(252, row)), certify.Pass)
 
-	// The LEXA legacy code means the same thing on the wire and must not be
-	// graded as a missing refusal.
-	wantVerdict(t, "received + LEXA 0xF0", critRefusalAnswered(row),
+	// THE SEEDED NEGATIVE SD-02 REQUIRES: a DUT that posts the FORMER product
+	// behavior — 8 (PartialOptOut) at receipt — must now be REJECTED by the
+	// corrected oracle. This is a permanent oracle-bite test: if this ever
+	// passes again, the oracle has regressed to the pre-SD-02 defect
+	// (curve.go's refusalStatuses used to accept {8, 0xF0} unconditionally).
+	f := wantVerdict(t, "SEEDED NEGATIVE: 8 at receipt (former product defect)", critRefusalAnswered(row, false),
+		synthTranscript(responseExchange(1, row), responseExchange(8, row)), certify.Fail)
+	if !strings.Contains(f.Observed, "PartialOptOut") {
+		t.Errorf("the FAIL does not name the forbidden status: %s", f.Observed)
+	}
+
+	// The LEXA legacy 0xF0 wire is accepted ONLY when this row's own
+	// case/DUT configuration declares legacy mode.
+	f = wantVerdict(t, "received + LEXA 0xF0, legacy declared", critRefusalAnswered(row, true),
 		synthTranscript(responseExchange(1, row), responseExchange(0xF0, row)), certify.Pass)
+	if !strings.Contains(f.Observed, "LEGACY WIRE MODE") || !strings.Contains(f.Observed, "NOT conformance evidence") {
+		t.Errorf("a legacy-mode 0xF0 PASS must be stamped non-conformance-evidence: %s", f.Observed)
+	}
+
+	// The SAME 0xF0 wire, with no legacy declaration on this row, is not an
+	// honest answer — 0xF0 occupies Table 27's RESERVED range and is not the
+	// standard 252 this row's control demands.
+	wantVerdict(t, "received + LEXA 0xF0, legacy NOT declared", critRefusalAnswered(row, false),
+		synthTranscript(responseExchange(1, row), responseExchange(0xF0, row)), certify.Fail)
 
 	// THE defect: an execution signal for an axis nothing executed. This is
 	// LXR-002 verbatim, and it must fail even when the refusal was also sent —
 	// a DUT that says both has still told the head end the control ran.
-	f := wantVerdict(t, "started for a refused axis", critRefusalAnswered(row),
+	f = wantVerdict(t, "started for a refused axis", critRefusalAnswered(row, false),
 		synthTranscript(responseExchange(1, row), responseExchange(2, row)), certify.Fail)
 	if !strings.Contains(f.Observed, "Event started") {
 		t.Errorf("the FAIL does not name the forbidden status: %s", f.Observed)
 	}
-	wantVerdict(t, "started AND refused", critRefusalAnswered(row),
-		synthTranscript(responseExchange(8, row), responseExchange(2, row)), certify.Fail)
-	wantVerdict(t, "completed for a refused axis", critRefusalAnswered(row),
+	wantVerdict(t, "started AND rejected", critRefusalAnswered(row, false),
+		synthTranscript(responseExchange(252, row), responseExchange(2, row)), certify.Fail)
+	wantVerdict(t, "completed for a refused axis", critRefusalAnswered(row, false),
 		synthTranscript(responseExchange(3, row)), certify.Fail)
+
+	// 4/5 (OptOut/OptIn) are lifecycle acknowledgements of an ADOPTED
+	// control's preference-driven curtailment — this row's control was
+	// refused outright, never adopted, so neither is an honest answer.
+	f = wantVerdict(t, "OptOut(4) for a refused axis", critRefusalAnswered(row, false),
+		synthTranscript(responseExchange(1, row), responseExchange(4, row)), certify.Fail)
+	if !strings.Contains(f.Observed, "OptOut") {
+		t.Errorf("the FAIL does not name the forbidden status: %s", f.Observed)
+	}
+	wantVerdict(t, "OptIn(5) for a refused axis", critRefusalAnswered(row, false),
+		synthTranscript(responseExchange(1, row), responseExchange(5, row)), certify.Fail)
+
+	// 10 (NoParticipation) is Table 27's OTHER EffectiveEndTime-only partial
+	// for an ADMITTED event — the same defect shape as 8, forbidden the same
+	// way.
+	wantVerdict(t, "NoParticipation(10) for a refused axis", critRefusalAnswered(row, false),
+		synthTranscript(responseExchange(1, row), responseExchange(10, row)), certify.Fail)
 
 	// An acknowledgement alone is not a refusal: the head end is left believing
 	// the control was accepted.
-	wantVerdict(t, "received only", critRefusalAnswered(row),
+	wantVerdict(t, "received only", critRefusalAnswered(row, false),
 		synthTranscript(responseExchange(1, row)), certify.Fail)
 
 	// Another control's refusal says nothing about this row.
-	wantUnavailable(t, "another control's refusal", critRefusalAnswered(row),
-		synthTranscript(responseExchange(8, "SOMEBODY-ELSE")))
+	wantUnavailable(t, "another control's refusal", critRefusalAnswered(row, false),
+		synthTranscript(responseExchange(252, "SOMEBODY-ELSE")))
 }
 
 // TestCritRefusalAnswered_ServerTierAgrees: the tier-3 fallback must reach the
@@ -1242,11 +1284,18 @@ func TestCritRefusalAnswered_HasTeeth(t *testing.T) {
 // same DUT differently.
 func TestCritRefusalAnswered_ServerTierAgrees(t *testing.T) {
 	const row = "CERT-BASIC-014"
-	c := critRefusalAnswered(row)
+	c := critRefusalAnswered(row, false)
 	ok := &ServerView{Available: true, Responses: []AdminResponse{
-		{Subject: row, Status: 1}, {Subject: row, Status: 8}}}
+		{Subject: row, Status: 1}, {Subject: row, Status: 252}}}
 	if f := c.Server(ok); f.Verdict != certify.Pass {
-		t.Errorf("server-side honest refusal = %s: %s", f.Verdict, f.Observed)
+		t.Errorf("server-side honest refusal(252) = %s: %s", f.Verdict, f.Observed)
+	}
+	// SEEDED NEGATIVE, tier-3 mirror of the wire-tier one above: the former
+	// product's onset-8 answer must FAIL server-side too.
+	formerDefect := &ServerView{Available: true, Responses: []AdminResponse{
+		{Subject: row, Status: 1}, {Subject: row, Status: 8}}}
+	if f := c.Server(formerDefect); f.Verdict != certify.Fail {
+		t.Errorf("server-side SEEDED NEGATIVE 8-at-receipt = %s, want FAIL: %s", f.Verdict, f.Observed)
 	}
 	started := &ServerView{Available: true, Responses: []AdminResponse{
 		{Subject: row, Status: 1}, {Subject: row, Status: 2}}}
@@ -1260,6 +1309,18 @@ func TestCritRefusalAnswered_ServerTierAgrees(t *testing.T) {
 	none := &ServerView{Available: true, Requests: []ServerRequest{{Method: "GET", Path: "/dcap"}}}
 	if f := c.Server(none); f.Verdict != certify.Fail {
 		t.Errorf("server-side no Response at all = %s: %s", f.Verdict, f.Observed)
+	}
+	// Legacy 0xF0: FAIL without the row's legacy declaration, PASS (as
+	// non-conformance evidence) with it.
+	legacyWire := &ServerView{Available: true, Responses: []AdminResponse{
+		{Subject: row, Status: 1}, {Subject: row, Status: 0xF0}}}
+	if f := c.Server(legacyWire); f.Verdict != certify.Fail {
+		t.Errorf("server-side 0xF0 with no legacy declaration = %s, want FAIL: %s", f.Verdict, f.Observed)
+	}
+	cLegacy := critRefusalAnswered(row, true)
+	if f := cLegacy.Server(legacyWire); f.Verdict != certify.Pass || !strings.Contains(f.Observed, "LEGACY WIRE MODE") {
+		t.Errorf("server-side 0xF0 WITH legacy declaration = %s: %s, want PASS stamped non-conformance-evidence",
+			f.Verdict, f.Observed)
 	}
 }
 

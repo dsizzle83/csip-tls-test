@@ -587,7 +587,7 @@ Authentication is a single static bearer token, constant-time compared, from a t
 
 The protocol implementations are correct on the hard, safety-relevant parts (Part III §3.5, Part IV) but carry a set of documented rough edges that a conformance engineer should know about before an external interop test:
 
-- **CannotComply uses a non-standard status `0xF0`** — a deliberate LEXA extension in the spec's reserved manufacturer range, but non-conformant to a strict reader.
+- **CannotComply uses a non-standard status `0xF0`** — a deliberate LEXA extension squatting on Table 27's RESERVED range (15-251, 255; the spec defines no manufacturer range at all), but non-conformant to a strict reader.
 - **The advertised `ResponseSetPath` is discovered but never used** — the client always POSTs responses to the config-default path. This works against gridsim (which matches) and would break against a real server that advertises a different path.
 - **No sanity bound on the clock offset** from `/tm` — a garbage `CurrentTime` would skew every window and expiry. This is the one adopted value with no guard.
 - **One malformed program aborts the entire walk** — a single program's required-control fetch failure stops discovery, rather than skipping and continuing as the DER sub-resource fetches do.
@@ -719,7 +719,7 @@ The shared protocol module: ~8.3k lines across five packages, consumed by hub an
 
 **`sunspec`** (~3.9k lines) — the strongest package in the module and arguably in the system. A declarative register-layout engine (`Field`/`Layout`/`View` with sentinel-aware typed accessors) transcribes SunSpec model tables 701–714 point-for-point, eliminating the hand-computed-offset bug class entirely. `scale.go` is the codec at the center of the system's most safety-relevant numeric invariant (GS-1/MTR-1): SunSpec watt fields are int16 and wrap at ±32,767, so all conversions must scale into the multiplier register, never raw-cast. That invariant is defended by an exported generative sweep (`sweep.go` — deliberately *not* a `_test.go` file, so both consumers can run the identical property contract against their own vendored copy in their own CI; the bench does exactly this via `internal/southbound/sunspecsweep`). The commit that landed it reports 65M fuzz executions, zero crashers, and one pinned fix ("FIX-B": a raw `0x8000` at a normal scale factor is an ordinary −32,768, *not* a not-implemented sentinel — documented in three places against the plausible-looking "fix" that would reintroduce the bug). Newest additions serve the hub's commissioning wizard: a Model-1 identity reader and a bus sweep that is **read-only by construction** — there is no write call in the file to misuse, a better guarantee than a runtime guard when probing unknown energized hardware.
 
-**`csipmodel`** (~2.2k lines) — pure IEEE 2030.5 XML structs, zero logic. Encodes the system's XML invariant: every 2030.5 root element carries an explicit namespaced `XMLName`, because `encoding/xml` silently yields zero-value structs otherwise; 18 round-trip tests pin it. Includes one documented LEXA extension (`ResponseCannotComply = 0xF0`, placed in the spec's reserved manufacturer range). Design wart: `DERControlBase` (scalar-only) and `ExtendedDERControlBase` (scalar + curves + droop) overlap with only a doc comment steering callers to the right one.
+**`csipmodel`** (~2.2k lines) — pure IEEE 2030.5 XML structs, zero logic. Encodes the system's XML invariant: every 2030.5 root element carries an explicit namespaced `XMLName`, because `encoding/xml` silently yields zero-value structs otherwise; 18 round-trip tests pin it. Includes one documented LEXA extension (`ResponseCannotComply = 0xF0`, squatting on Table 27's RESERVED range — 15-251, 255; the spec defines no manufacturer range at all). Design wart: `DERControlBase` (scalar-only) and `ExtendedDERControlBase` (scalar + curves + droop) overlap with only a doc comment steering callers to the right one.
 
 **`derbase`** (~1k lines) — the CSIP-to-SunSpec bridge: fans a `DERControlBase` out to Model 704 (or legacy 123) register writes, and implements the SunSpec curve-adopt handshake correctly (write staging curve → request adoption by 1-based index → poll `AdptCrvRslt` → enable). Also owns the `Measurements` type both consumers re-export via a Go type alias — the "option-a alias" extraction pattern from TASK-023 that moved a shared type with zero call-site churn, and which the bench replicated independently from the docs alone (good evidence the docs are usable).
 
@@ -3865,30 +3865,31 @@ Every field is a pointer, and every field is `omitempty` — this is what lets `
 
 **`ExtendedDERControlBase`** (`der.go:219-263`) is the full-spec superset, adding the curve-linked modes (`OpModVoltVar *CurveLink`, `OpModVoltWatt`, ride-through curves) and the inline `OpModFreqDroop *FreqDroop` that `DERControlBase` doesn't carry. The two are **not** related by embedding — the package comment explains why (`der.go:207-217`): "We cannot embed two structs with overlapping XML element names in Go's `encoding/xml`," so `ExtendedDERControlBase` duplicates every scalar field from `DERControlBase` and adds the curve-linked ones on top. `derbase.ApplyControl` only ever consumes the narrower `DERControlBase` — the curve links are resolved and applied through the typed curve writers (`WriteVoltVar` etc.), not through `ApplyControl`'s opMode fan-out.
 
-**`ResponseCannotComply`** (`resources.go:462-470`) — a LEXA profile extension, not part of IEEE 2030.5 Table 27:
+**`ResponseCannotComply`** (`resources.go:462-470`) — a LEXA profile extension, not part of IEEE 2030.5 Table 27. SD-02 (`docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md`, lexa-gw) corrected two defects in this block against the licensed IEEE 2030.5-2018 text: `ResponseOptIn`/`ResponseOptOut` had their values transposed (4 is opt-OUT, 5 is opt-IN, not the reverse), and the extension's own doc comment claimed a "manufacturer range" the standard does not define:
 
 ```go
 const (
 	ResponseEventReceived   uint8 = 1
 	ResponseEventStarted    uint8 = 2
 	ResponseEventCompleted  uint8 = 3
-	ResponseOptIn           uint8 = 4
-	ResponseOptOut          uint8 = 5
+	ResponseOptOut          uint8 = 4 // user opts out, or device auto-opts out per preference; may precede event start
+	ResponseOptIn           uint8 = 5 // user opts back in after a prior opt-out; may precede event start
 	ResponseEventCancelled  uint8 = 6
 	ResponseEventSuperseded uint8 = 7
 
 	// ResponseCannotComply is a LEXA profile extension (NOT an IEEE 2030.5
 	// Table 27 status). It alerts the server that the DER physically cannot meet
 	// an active control limit — e.g. an import cap that would require battery
-	// discharge below its SOC reserve. Chosen in the 0xF0–0xFF manufacturer
-	// range so it never collides with a standard status (1–7); the gridsim
-	// server treats any status ≥ 0xF0 as a resource-limited non-compliance
-	// alert rather than a lifecycle acknowledgement.
+	// discharge below its SOC reserve. Value 0xF0 (240) sits inside Table 27's
+	// RESERVED range (15-251, 255) — the standard defines no manufacturer
+	// range at all. Retained at 0xF0 only for legacy wire compatibility: this
+	// is a Lexa profile extension, config-gated to legacy mode only, and MUST
+	// NOT be advertised or used as IEEE 2030.5/CSIP conformance behavior.
 	ResponseCannotComply uint8 = 0xF0 // 240 — LEXA: DER unable to honour the control
 )
 ```
 
-The `0xF0` value is deliberately chosen far from the standard `1-7` range specifically so a future spec revision adding more standard status codes can never collide with it.
+`0xF0` is the only value the extension has ever spoken; gridsim's classifier (`sim/gridsim/server.go`) recognises it as an exact match, not as the floor of a range — the 0xF1-0xFB/0xFF neighbourhood is Table 27's own reserved space, unclaimed by this product and not to be folded into the legacy wire by a loose `>=` comparison.
 
 ### 7. `ocppserver` — the minimal OCPP 2.0.1 CSMS test double
 

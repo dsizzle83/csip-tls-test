@@ -95,6 +95,72 @@ func TestRun_PreflightDeadSim_INFRASkipsScenario(t *testing.T) {
 	}
 }
 
+// F2 (2026-08-17, cross-repo lockstep audit): a scenario marked NotApplicable
+// must be judged before it ever touches the bench — no setup, no hold, no
+// teardown — and must still surface a single, disclosed NOT_APPLICABLE
+// finding carrying the reason verbatim, counted in its own summary bucket,
+// never silently dropped from the run. This is the "row-level N/A" mechanism
+// F2 asks for, proven the same way this file proves INFRA's preflight skip
+// (TestRun_PreflightDeadSim_INFRASkipsScenario above): against a bench that
+// is otherwise perfectly healthy, so a false INFRA/INCONCLUSIVE reclassification
+// cannot masquerade as the NotApplicable path firing.
+func TestRun_NotApplicableScenario_SkipsBenchAndReportsDisclosed(t *testing.T) {
+	var dead atomic.Bool // never set true: the bench stays healthy throughout
+	d := newInfraTestDriver(t, &dead)
+
+	const reason = "F2/SD-02 adjudication #3: the onset predicate this row demands has an empty " +
+		"intersection with a correct RC0 gateway — see docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md."
+	setupCalled, teardownCalled := false, false
+	sc := &mayScenario{
+		ID: "na-probe-test", Name: "n", Category: "c", Hypothesis: "h", Expected: "e",
+		HoldS:         5,
+		Fix:           "fix pointer",
+		NotApplicable: reason,
+		setup: func(d *mayhemDriver) (*activeConstraint, error) {
+			setupCalled = true
+			return nil, nil
+		},
+		perTick: func(d *mayhemDriver, i int) { t.Error("perTick must not run for a NotApplicable scenario") },
+		evaluate: func(sc *mayScenario, cons *activeConstraint, s []maySample) mayFinding {
+			t.Fatal("evaluate must not run for a NotApplicable scenario")
+			return mayFinding{}
+		},
+		teardown: func(d *mayhemDriver) { teardownCalled = true },
+	}
+
+	d.run(context.Background(), []*mayScenario{sc}, time.Millisecond)
+
+	if setupCalled {
+		t.Error("setup must not run for a NotApplicable scenario — there is no fault to arm")
+	}
+	if teardownCalled {
+		t.Error("teardown must not run for a NotApplicable scenario — setup never armed anything to tear down")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if n := len(d.status.Findings); n != 1 {
+		t.Fatalf("findings = %d, want 1 (never silently dropped)", n)
+	}
+	f := d.status.Findings[0]
+	if f.Verdict != "NOT_APPLICABLE" {
+		t.Fatalf("verdict = %q, want NOT_APPLICABLE", f.Verdict)
+	}
+	if f.ID != sc.ID || f.Fix != sc.Fix {
+		t.Errorf("finding lost its scenario identity: id=%q fix=%q", f.ID, f.Fix)
+	}
+	if len(f.Diagnosis) != 1 || f.Diagnosis[0] != reason {
+		t.Errorf("diagnosis = %v, want exactly the NotApplicable reason string verbatim", f.Diagnosis)
+	}
+	want := maySummary{NotApplicable: 1}
+	if d.status.Summary != want {
+		t.Errorf("summary = %+v, want %+v (NOT_APPLICABLE must not blend into Pass/Fail/Inconclusive/Infra)",
+			d.status.Summary, want)
+	}
+	if !d.status.Finished {
+		t.Error("a NotApplicable scenario must not stop the run from finishing cleanly")
+	}
+}
+
 // A sim that dies DURING the scenario invalidates the verdict in both
 // directions — even a PASS must be reclassified INFRA, with the original
 // verdict preserved for the operator.

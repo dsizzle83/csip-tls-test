@@ -71,6 +71,26 @@
 // injection might not exist yet; it does, and these two scenarios test the
 // real enforcement path rather than scoping down to shadow-only.
 //
+// CORRECTION (2026-08-17, F2): the paragraph above was true when written but
+// is now STALE for the LOAD half only. Since the 2026-08-11 GFEMS
+// single-point-actuation decision, internal/northbound/scheduler/supported.go's
+// ScalarSupportedAxes no longer includes ModeLoadLimW — opModLoadLimW (and
+// opModImpLimW) are refused BY CONSTRUCTION at receipt (DERBASE-IMPORT-AS-
+// SETPOINT: no device model this product speaks expresses an import bound),
+// so unsupportedAxesOf strips the axis (a single-axis event is rejected
+// whole, SD-02 row 2/252) before publish.go ever runs — OpModLoadLimW never
+// reaches bus.ActiveControl.LoadLimW today. opModGenLimW is UNAFFECTED —
+// ModeGenLimW is still in ScalarSupportedAxes and still combines into the
+// site ceiling via internal/authority/csipin.go's minCeilingW(ExpLimW,
+// GenLimW) — so aus-gen-cap's end-to-end path remains real, just not through
+// "internal/orchestrator/auslimits.go" (see that scenario's own Fix text).
+// "internal/orchestrator/auslimits.go" never existed in lexa-gw at all — the
+// CSIP-AUS multi-lever cascade this whole file's prose describes (both gen
+// and load) was lexa-hub territory (abandoned 2026-08-03). aus-load-cap is
+// marked NotApplicable in ausLoadCapScenario() below for both reasons (the
+// axis refusal above, and separately SD-02 adjudication #3's dormant
+// CannotComply arc); aus-gen-cap is not, since its curtailment path is real.
+//
 // One observability gap surfaced while building this: lexa-api's GET /status
 // (cmd/api/handlers.go's csipControlInfo/adminBaseInfo-equivalent) does not
 // surface GenLimW/LoadLimW at all — only ExpLimW/MaxLimW/ImpLimW/Connect/
@@ -826,8 +846,8 @@ func curveAdoptReadbackDivergenceScenario() *mayScenario {
 	const device = advTargetDevice
 	var (
 		reportOutcome advReportOutcome
-		report     advReportMsg
-		reportErr  error
+		report        advReportMsg
+		reportErr     error
 	)
 	return &mayScenario{
 		ID:         "curve-adopt-readback-divergence",
@@ -1415,13 +1435,14 @@ func ausLoadCapScenario() *mayScenario {
 	var shadowDivBefore, shadowDivAfter float64
 	var shadowDivAvail bool
 	return &mayScenario{
-		ID:         "aus-load-cap",
-		Name:       "CSIP-AUS gross-load cap (opModLoadLimW) holds home+EV+battery-charge load",
-		Category:   "CSIP-AUS dynamic envelope (INV-AUS)",
-		Hypothesis: fmt.Sprintf("PRECONDITION: bench hub.json has \"enforce_aus_limits\": true (same WP-11 gate as aus-gen-cap). Symmetric to aus-gen-cap: gridsim's /admin/control already accepts load_lim_W end-to-end (sim/gridsim/admin.go → northbound → bus.ActiveControl.LoadLimW), so this needs no bus-injection bypass either. Low sun + a heavy meter load + an actively-charging EV session gives the site more gross load than the posted %.0fW cap allows; applyAusLoadLimitRule's two levers (battery-charge shed first, then a sticky EVSE current ceiling) must bring gross load (home + EV + battery charge, from the site energy balance grossLoad = solar + batteryDischarge + netW) under the cap, with checkAusLoadConvergence's measured-effect backstop posting CannotComply if the remaining load is not sheddable.", ausLoadCapLimW),
-		Expected:   "Gross load (ground truth) settles at or under the cap within the settling deadline and stays there, evidenced by a \"csip-aus/load-limit\" plan decision; a sustained breach with no CannotComply admission is a FAIL. NOTE: unlike a generation cap (always satisfiable by curtailing PV), a load cap can be genuinely unmeetable if home load alone exceeds it — CannotComply is a legitimate, correct outcome here, not just an acceptable one (see checkAusLoadConvergence's doc comment).",
-		HoldS:      ausCapHoldS,
-		Fix:        "internal/orchestrator/auslimits.go's applyAusLoadLimitRule / checkAusLoadConvergence.",
+		ID:            "aus-load-cap",
+		Name:          "CSIP-AUS gross-load cap (opModLoadLimW) holds home+EV+battery-charge load",
+		Category:      "CSIP-AUS dynamic envelope (INV-AUS)",
+		Hypothesis:    fmt.Sprintf("PRECONDITION: bench hub.json has \"enforce_aus_limits\": true (same WP-11 gate as aus-gen-cap). Symmetric to aus-gen-cap: gridsim's /admin/control already accepts load_lim_W end-to-end (sim/gridsim/admin.go → northbound → bus.ActiveControl.LoadLimW), so this needs no bus-injection bypass either. Low sun + a heavy meter load + an actively-charging EV session gives the site more gross load than the posted %.0fW cap allows; applyAusLoadLimitRule's two levers (battery-charge shed first, then a sticky EVSE current ceiling) must bring gross load (home + EV + battery charge, from the site energy balance grossLoad = solar + batteryDischarge + netW) under the cap, with checkAusLoadConvergence's measured-effect backstop posting CannotComply if the remaining load is not sheddable.", ausLoadCapLimW),
+		Expected:      "Gross load (ground truth) settles at or under the cap within the settling deadline and stays there, evidenced by a \"csip-aus/load-limit\" plan decision; a sustained breach with no CannotComply admission is a FAIL. NOTE: unlike a generation cap (always satisfiable by curtailing PV), a load cap can be genuinely unmeetable if home load alone exceeds it — CannotComply is a legitimate, correct outcome here, not just an acceptable one (see checkAusLoadConvergence's doc comment).",
+		HoldS:         ausCapHoldS,
+		Fix:           "There is no internal/orchestrator/auslimits.go, applyAusLoadLimitRule, or checkAusLoadConvergence in lexa-gw — that CSIP-AUS multi-lever load-shedding cascade was lexa-hub territory (abandoned 2026-08-03, lexa-hub-abandoned.md). In the current one-DER GFEMS gateway, opModLoadLimW is refused BY CONSTRUCTION at receipt (internal/northbound/scheduler/supported.go's ScalarSupportedAxes omits ModeLoadLimW; DERBASE-IMPORT-AS-SETPOINT — no device model this product speaks expresses an import bound) — there is no adoption, no cascade, and nothing here to fix. See NotApplicable below.",
+		NotApplicable: "F2/SD-02 adjudication #3 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw) plus a second, independent reason: (1) opModLoadLimW is refused BY CONSTRUCTION at receipt in the current one-DER GFEMS gateway (internal/northbound/scheduler/supported.go's ScalarSupportedAxes omits ModeLoadLimW; DERBASE-IMPORT-AS-SETPOINT), so this scenario's own control is never adopted and the applyAusLoadLimitRule/checkAusLoadConvergence cascade its Hypothesis/Fix describe does not exist in this product — that cascade was lexa-hub territory (abandoned 2026-08-03). (2) Even setting that aside, the ONLY live producer of the CannotComply 4/5/8/10 status arc this oracle's PASS path (reportedCannot && cannotComplyLegit) depends on is the preference-class bus.ComplianceAlert publisher, which is INERT (same abandoned-hub gap). Either reason alone makes this row constant-non-PASS against a correct implementation; together, marked NOT-APPLICABLE-FOR-RC0 rather than carried as a permanent FAIL. Real fix: not a code fix at all unless a future release re-adds multi-DER load-limit enforcement — at that point this scenario needs a full rewrite against whatever replaces the orchestrator, not a re-enable.",
 		setup: func(d *mayhemDriver) (*activeConstraint, error) {
 			if err := requireEnforceAusLimits(d, "aus-load-cap"); err != nil {
 				return nil, err

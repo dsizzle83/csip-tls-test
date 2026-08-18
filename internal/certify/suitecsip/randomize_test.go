@@ -102,8 +102,10 @@ func TestCORE021_PassesWhenNoEventStartedEarlierThanPermitted(t *testing.T) {
 	tr := core021Transcript(serverStart, map[string]time.Duration{
 		// randomizeStart 0: permitted from serverStart. Announced 5 s later.
 		core021MRIDPrefix + "0": 5 * time.Second,
-		// randomizeStart +30 on a start 60 s later: permitted from
-		// serverStart+30 under the union bound. Announced a poll cycle late.
+		// randomizeStart +30 on a start 60 s later: POSITIVE randomizeStart
+		// delays only (§10.2.4.2.2), so the earliest edge is serverStart+60 —
+		// the interval start itself, not serverStart+30. Announced a poll
+		// cycle late.
 		core021MRIDPrefix + "1": 120 * time.Second,
 		// randomizeStart -30 on a start 120 s later: permitted from
 		// serverStart+90. Announced at +95.
@@ -137,6 +139,36 @@ func TestCORE021_FailsAnEventAnnouncedBeforeItWasPermittedToStart(t *testing.T) 
 	f := wantVerdict(t, "CORE-021 randomization bound", c, tr, certify.Fail)
 	t.Logf("RED — an event started before it was allowed to:\n  %s", f.Observed)
 	for _, want := range []string{"EARLY", core021MRIDPrefix + "0", "Poll quantisation cannot produce this"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the FAIL does not say %q:\n  %s", want, f.Observed)
+		}
+	}
+}
+
+// RED (#16 regression): a POSITIVE randomizeStart control announced started
+// early. Under the old |randomizeStart| (union) reading this control's
+// earliest edge was serverStart+30 — a bound the standard never granted, since
+// §10.2.4.2.2 gives a positive randomizeStart as delay-only. The signed fix
+// puts the earliest edge back at the interval's own start (serverStart+60),
+// and a Response inside the stale union band but before that real one must
+// now FAIL.
+func TestCORE021_FailsPositiveRandomizeStartControlAnnouncedEarly(t *testing.T) {
+	const serverStart = 1_800_000_000
+	tr := core021Transcript(serverStart, map[string]time.Duration{
+		core021MRIDPrefix + "0": 5 * time.Second,
+		// randomizeStart +30, interval start serverStart+60: the stale |r|
+		// reading permitted as early as serverStart+30, and this Response at
+		// serverStart+50 would have PASSed under it. §10.2.4.2.2 grants this
+		// control no early edge at all, so serverStart+50 is 10s before the
+		// only earliest instant it is actually entitled to (serverStart+60).
+		core021MRIDPrefix + "1": 50 * time.Second,
+		core021MRIDPrefix + "2": 95 * time.Second,
+	})
+
+	c := critRandomizationNotEarlierThanPermitted(core021MRIDPrefix)
+	f := wantVerdict(t, "CORE-021 positive randomizeStart control started early", c, tr, certify.Fail)
+	t.Logf("RED — positive randomizeStart control started early:\n  %s", f.Observed)
+	for _, want := range []string{"EARLY", core021MRIDPrefix + "1"} {
 		if !strings.Contains(f.Observed, want) {
 			t.Errorf("the FAIL does not say %q:\n  %s", want, f.Observed)
 		}

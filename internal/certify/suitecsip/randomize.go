@@ -32,7 +32,7 @@ package suitecsip
 // The Skip's replacement is not "measure the randomization", because the
 // randomization's FULL magnitude is genuinely not recoverable from this
 // observation and saying otherwise would be the same error pointing the other
-// way. Two independent reasons:
+// way. The reason that survives:
 //
 //	POLL QUANTISATION. The DUT posts its status=2 Response on its own cadence,
 //	not at the instant it activates. gridsim advertises a 60 s DERControlList
@@ -42,12 +42,19 @@ package suitecsip
 //	instant would be reporting the DUT's poll phase as if it were the DUT's
 //	randomization.
 //
-//	THE SIGN CONVENTION. IEEE 2030.5 gives randomizeStart as a "number of
-//	seconds boundary inside which a random value must be selected to be applied
-//	to the associated start time", and which side of the start time a NEGATIVE
-//	value selects is a clause this repo has no on-machine copy of. This suite
-//	does not pin a convention it cannot cite (IW15-027 is what happens when it
-//	does), so the bound below is the UNION of both readings.
+// THE SIGN CONVENTION IS NOT a second such reason. A prior version of this
+// file claimed "which side of the start time a negative value selects is a
+// clause this repo has no on-machine copy of" and computed the bound from
+// |randomizeStart| — the UNION of both readings. That claim was false: IEEE
+// 2030.5-2018 §10.2.4.2.2 states it outright ("If the value is negative,
+// randomization SHALL be applied before [the scheduled time] ... if
+// positive ... delay"), and §10.2.3.2's own Earliest Effective Start Time
+// definition ("minimum of Start Time or Start Time plus the Start
+// Randomization") gives the identical rule as a formula: Start +
+// min(0, randomizeStart). The convention is SIGNED and ONE-SIDED, not
+// symmetric — and taking |randomizeStart| let a control with a POSITIVE
+// randomizeStart (delay-only, by the clause above) admit an early start the
+// standard forbids outright. See #16.
 //
 // ── What IS measurable, and rigorously ─────────────────────────────────────
 //
@@ -57,14 +64,14 @@ package suitecsip
 // quantisation in the direction that matters:
 //
 //	an activation announced BEFORE the earliest instant the event's own
-//	randomization permits is a violation under any poll cadence and under
-//	either sign convention.
+//	randomization permits — Start + min(0, randomizeStart), per §10.2.4.2.2
+//	and §10.2.3.2 — is a violation under any poll cadence.
 //
 // For CORE-021's randomizeStart=0 control that bound is the interval start
-// itself, and it is the sharpest assertion of the three: the server explicitly
-// commanded NO randomization, so an event announced started before its own
-// interval opened is a plain scheduling violation. For the +/-30 controls the
-// bound is start-30 s, which is the union of the two sign readings.
+// itself. For a POSITIVE randomizeStart it is ALSO the interval start: the
+// clause grants delay only, never an early edge, so the bound does not widen
+// just because the field is nonzero. Only a NEGATIVE randomizeStart moves the
+// bound earlier, and by exactly its own magnitude.
 //
 // That is a decided PASS/FAIL over a real wire observation, and the half it
 // cannot reach — "was the randomization actually APPLIED, and how much" — is
@@ -170,21 +177,24 @@ func randomizedControlsFrom(t *Transcript, mridPrefix string) []randomizedContro
 // earliestPermitted is the earliest instant, on the SERVER's clock, at which
 // this control's own randomization permits it to start.
 //
-// The magnitude is taken ABSOLUTE deliberately. See the file doc: which side of
-// the start time a negative randomizeStart selects is a clause this repo cannot
-// cite, so the bound is the union of both readings and is therefore correct
-// under either. A bound that assumed the forward reading would FAIL a DUT that
-// applied the backward one, on the strength of a convention nobody here has
-// checked — which is precisely the IW15-027 shape.
+// IEEE 2030.5-2018 §10.2.4.2.2: "If the value is negative, randomization
+// SHALL be applied before [the scheduled time] ... if positive ... delay" —
+// SIGNED and ONE-SIDED, not a symmetric ± band. §10.2.3.2's own Earliest
+// Effective Start Time definition ("minimum of Start Time or Start Time plus
+// the Start Randomization") gives the same rule as a formula: Start +
+// min(0, randomizeStart). A POSITIVE randomizeStart can only push the start
+// LATER; it grants no permission to start early, and this bound must not
+// manufacture one. A NEGATIVE randomizeStart is the only case that moves the
+// earliest edge before Start, and by exactly its own magnitude.
 func (rc randomizedControl) earliestPermitted() int64 {
 	if !rc.Has {
 		return rc.Start
 	}
 	w := rc.Randomize
-	if w < 0 {
-		w = -w
+	if w > 0 {
+		w = 0
 	}
-	return rc.Start - w
+	return rc.Start + w
 }
 
 // startedAt finds the capture timestamp of the status=2 (Started) Response the
@@ -218,15 +228,16 @@ func startedAt(t *Transcript, mrid string) (time.Time, bool) {
 func critRandomizationNotEarlierThanPermitted(mridPrefix string) criterion {
 	return criterion{
 		Claim: "no randomized event was announced STARTED before the earliest instant its own " +
-			"randomizeStart permits — the one-sided bound a status=2 Response can establish",
+			"randomizeStart permits — Start + min(0, randomizeStart) per §10.2.4.2.2/§10.2.3.2, the " +
+			"signed, one-sided bound a status=2 Response can establish",
 		How: "the capture timestamp of the DUT's status=2 (Started) Response for each control, compared " +
 			"against that control's own interval/start and randomizeStart AS THE DUT FETCHED THEM, with " +
 			"the server's epoch placed on the capture clock through the skew measured from the Time " +
 			"resource (the same computation CORE-005 reports). The bound is EARLIEST-only, because the " +
 			"DUT announces its start on its own poll cadence and that quantisation can only make a " +
-			"Response late, never early; and it takes |randomizeStart| rather than its signed value, " +
-			"because which side of the start time a negative randomization selects is a clause this " +
-			"suite has no on-machine copy of and will not assume",
+			"Response late, never early; and it takes the SIGNED randomizeStart per §10.2.4.2.2 ('if " +
+			"negative, applied before ... if positive, delay') rather than its magnitude, so a positive " +
+			"randomizeStart is never read as permitting an early start",
 		NeedsTranscript: true,
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 			controls := randomizedControlsFrom(t, mridPrefix)

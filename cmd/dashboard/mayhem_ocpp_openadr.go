@@ -251,6 +251,18 @@ func diagnoseOCPP16Obey(sc *mayScenario, cons *activeConstraint, s []maySample, 
 	}
 
 	settled := m.BreachSeconds == 0 || (m.TailClean && m.ConvergedAtS >= 0 && m.ConvergedAtS <= mayConvergeDeadlineS)
+	// F2/SD-02 adjudication #3 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md,
+	// lexa-gw): m.ReportedCannot is onset-only, and its only live producer (the
+	// preference-class bus.ComplianceAlert publisher) is INERT in this
+	// product, so against a correct RC0 gateway it is always false — the
+	// `&& !m.ReportedCannot` guard below cannot currently suppress this FAIL
+	// for a genuinely unmeetable, fault-class pre-release condition (an honest
+	// CannotComply admission would have earned the same FAIL a silent one
+	// does). This scenario's own precondition (evsim on OCPP 1.6) makes an
+	// unmeetable pre-release window unlikely in practice, but do not seed one
+	// for an unattended soak expecting this excuse until a gateway-originated
+	// LogEvent/CannotComply producer for control faults lands; do not delete
+	// the guard — it is correct once a real producer exists.
 	if !settled && !m.ReportedCannot {
 		f.Verdict = "FAIL"
 		f.Headline = fmt.Sprintf("%s never held before release — the 1.6J charger did not obey SetChargingProfile", capStr)

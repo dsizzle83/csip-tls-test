@@ -78,6 +78,23 @@ func invExport(cons *activeConstraint, s []maySample) []invViolation {
 // limit); a sustained breach with no admission is the closed-loop gap this
 // invariant exists to catch (the device ACKed but lagged or ignored the write,
 // and the hub trusted the ACK).
+//
+// F2/SD-02 adjudication #3 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md,
+// lexa-gw): the `smp.CannotComply` excuse below fires only for the onset-class
+// CannotComply (legacy 0xF0 / standard-mode OptOut(4)), whose only live
+// producer — the preference-class bus.ComplianceAlert publisher — is INERT in
+// this product (the abandoned lexa-hub's topic). A correct RC0 gateway posts
+// NO onset status for a fault-caused breach, so against a correct
+// implementation this excuse arm currently CANNOT fire for a fault-class
+// unmeetable condition — a scenario that seeds one and expects the excuse
+// will always FAIL instead. This is by design per SD-02 rows 6/11 (silent
+// fault handling via LogEvent, not a wire admission) and is NOT a bug in this
+// function; do not delete the arm — it is correct for the still-live
+// preference-class producer once one exists, and the fix is a gateway-
+// originated LogEvent producer for control faults (a registry item, not
+// implemented this wave), not a change here. Any scenario that seeds a
+// physically-unmeetable, fault-class condition and relies on this excuse must
+// not be armed for an unattended soak until that producer lands.
 func invConverge(cons *activeConstraint, s []maySample) []invViolation {
 	breaches := invExport(cons, s)
 	if len(breaches) == 0 {

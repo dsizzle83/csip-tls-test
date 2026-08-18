@@ -13,9 +13,13 @@
 //	                   scheduler.SupersededMRIDs — verified in the audit); this
 //	                   track's seams (widened /admin/control + /admin/responses)
 //	                   let a bench scenario prove it end-to-end on the wire.
-//	INV-RANDOMIZE    — the hub honors randomizeDuration (§11.10.4.2): its adopted
-//	                   window length lands inside the legal [dur-|rand|, dur+|rand|]
-//	                   band, not the raw dur and not something out of range.
+//	INV-RANDOMIZE    — the hub honors randomizeDuration (§10.2.4.2.3, SIGNED and
+//	                   one-sided — IEEE 2030.5-2018 clause 11 is manufacturer
+//	                   extensions, not this): its adopted window length lands
+//	                   inside the legal band [dur+min(0,rand), dur+max(0,rand)],
+//	                   never the raw dur, never LENGTHENED when rand is
+//	                   negative (shorten-only) or SHORTENED when rand is
+//	                   positive (lengthen-only), and never out of range.
 //	INV-SURVIVE      — a hostile/sick CSIP server edge (410 Gone on a served
 //	                   resource, a per-path serve delay, or a byte-slow
 //	                   slow-loris body) must never unseat the safe control or
@@ -278,17 +282,23 @@ func diagnoseCancelledSuperseded(sc *mayScenario, s []maySample, resps []gridRes
 
 func randomizeDurationScenario() *mayScenario {
 	const baseDurS = 240
-	const randDurS = -60 // magnitude 60s (the value's sign is irrelevant; §11.10.4.2)
+	const randDurS = -60 // NEGATIVE: §10.2.4.2.3 grants shorten-only — the hub must never lengthen
+	loDurS, hiDurS := baseDurS, baseDurS
+	if randDurS < 0 {
+		loDurS = baseDurS + randDurS
+	} else {
+		hiDurS = baseDurS + randDurS
+	}
 	var ctrl gridControl
 	var ctrlErr error
 	return &mayScenario{
 		ID:         "randomize-duration-honored",
 		Name:       "Hub honors randomizeDuration within the legal window band (CORE-021)",
 		Category:   "CSIP events (INV-RANDOMIZE)",
-		Hypothesis: "Utilities set randomizeDuration to stagger DER event windows and avoid a synchronised fleet edge. Per §11.10.4.2 the client jitters the event's duration by a per-event random offset in [-|rand|, +|rand|]. The hub consumes it (scheduler.randomizedDuration, cached per mRID — audit P1-3) but no bench scenario ever served a nonzero randomizeDuration to prove it end-to-end.",
-		Expected:   fmt.Sprintf("The hub adopts %s and its reported validUntil implies an honored window length inside the legal band [%d, %d] s (base %d ± |rand| %d) — never the raw %d with no jitter possibility exceeded, and never an out-of-band/negative window.", randomizeMRID, baseDurS-60, baseDurS+60, baseDurS, 60, baseDurS),
+		Hypothesis: "Utilities set randomizeDuration to stagger DER event windows and avoid a synchronised fleet edge. Per §10.2.4.2.3 the client jitters the event's duration by a per-event random offset that is SIGNED and one-sided: [rand,0] when randomizeDuration is negative (shorten-only), [0,rand] when positive (lengthen-only) — never the symmetric [-|rand|,+|rand|] band a value's magnitude alone would suggest. The hub consumes it (scheduler.randomizedDuration, cached per mRID — audit P1-3) but no bench scenario ever served a nonzero randomizeDuration to prove it end-to-end.",
+		Expected:   fmt.Sprintf("The hub adopts %s and its reported validUntil implies an honored window length inside the legal, SIGNED band [%d, %d] s (base %d, randomizeDuration %+d s — shorten-only since it is negative, per §10.2.4.2.3) — never the raw %d with no jitter applied, and never LENGTHENED past base: a hub that lengthens an event it was told only to shorten must FAIL here even though |rand| alone would have called it in-band.", randomizeMRID, loDurS, hiDurS, baseDurS, randDurS, baseDurS),
 		HoldS:      75,
-		Fix:        "internal/northbound/scheduler.go's randomizedDuration (§11.10.4.2 duration jitter, clamped ≥0, cached per mRID).",
+		Fix:        "internal/northbound/scheduler.go's randomizedDuration (§10.2.4.2.3 duration jitter, signed one-sided, clamped ≥0, cached per mRID).",
 		setup: func(d *mayhemDriver) (*activeConstraint, error) {
 			_ = d.post("battery", "/inject", map[string]any{"SoC_pct": 100, "Conn": 1})
 			d.injectEnv(1500, 250) // cap non-binding: the hub adopts it without needing to curtail
@@ -362,27 +372,31 @@ func diagnoseRandomizeDuration(sc *mayScenario, s []maySample, ctrl gridControl,
 		return f
 	}
 
-	mag := int64(randDurS)
-	if mag < 0 {
-		mag = -mag
-	}
+	// SIGNED, one-sided band per §10.2.4.2.3 — never the symmetric ±|rand|
+	// union a magnitude-only reading would produce. randDurS negative grants
+	// shorten-only (legal band's high edge sits AT base, not base+|rand|), so
+	// a hub that LENGTHENS an event it was told to shorten lands outside this
+	// band even though it would have been comfortably inside the old ±|rand|
+	// one — that is exactly the defect this signed band exists to catch.
+	rd := int64(randDurS)
 	const tolS = 10 // clock-derivation slop between gridsim server time and the hub's /tm-derived view
-	lo := int64(baseDurS) - mag - tolS
-	hi := int64(baseDurS) + mag + tolS
+	lo := int64(baseDurS) + min(int64(0), rd) - tolS
+	hi := int64(baseDurS) + max(int64(0), rd) + tolS
 	if honored < lo || honored > hi {
 		f.Verdict = "FAIL"
-		f.Headline = fmt.Sprintf("honored window %ds is outside the legal randomizeDuration band [%d, %d]s", honored, int64(baseDurS)-mag, int64(baseDurS)+mag)
+		f.Headline = fmt.Sprintf("honored window %ds is outside the legal, signed randomizeDuration band [%d, %d]s", honored, lo, hi)
 		f.Diagnosis = []string{
-			fmt.Sprintf("Served base duration %ds, randomizeDuration ±%ds ⇒ the hub's effective window must land in [%d, %d]s; it reported %ds (validUntil − start). Off-band means randomizeDuration was mishandled (e.g. treated as an absolute window, applied twice, or produced a negative/clamped-wrong length).", baseDurS, mag, int64(baseDurS)-mag, int64(baseDurS)+mag, honored),
+			fmt.Sprintf("Served base duration %ds, randomizeDuration %+ds (§10.2.4.2.3: signed, one-sided — %s) ⇒ the hub's effective window must land in [%d, %d]s; it reported %ds (validUntil − start). Outside that band means randomizeDuration was mishandled (e.g. treated as an unsigned/symmetric jitter, treated as an absolute window, applied twice, or produced a negative/clamped-wrong length).",
+				baseDurS, randDurS, map[bool]string{true: "shorten-only", false: "lengthen-only"}[randDurS < 0], lo, hi, honored),
 			decisionLine(s),
 		}
 		return f
 	}
 
 	f.Verdict = "PASS"
-	f.Headline = "hub's honored window respects the randomizeDuration band"
+	f.Headline = "hub's honored window respects the signed randomizeDuration band"
 	diag := []string{
-		fmt.Sprintf("INV-RANDOMIZE: the hub adopted %s and honored a %ds window — inside the legal band [%d, %d]s for base %ds ± %ds.", randomizeMRID, honored, int64(baseDurS)-mag, int64(baseDurS)+mag, baseDurS, mag),
+		fmt.Sprintf("INV-RANDOMIZE: the hub adopted %s and honored a %ds window — inside the legal, signed band [%d, %d]s for base %ds, randomizeDuration %+ds (§10.2.4.2.3).", randomizeMRID, honored, lo, hi, baseDurS, randDurS),
 	}
 	if honored == int64(baseDurS) {
 		diag = append(diag, "The offset this run rounded to ~0 (the hub's per-mRID random draw) or randomizeDuration was not applied; either way the window is legal. The band check cannot distinguish those two — a nonzero offset on another run positively confirms consumption.")

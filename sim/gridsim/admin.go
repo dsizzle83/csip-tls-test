@@ -584,29 +584,42 @@ var progPrefixes = []string{"SP", "SITE", "SYS"}
 // csipmodel/resources.go's ResponseRequired doc, which this mirrors) an
 // admin-created event control carries unless a request overrides it:
 //
-//	bit 0 (0x01, RespReqMessageReceived)  — the DUT shall POST a Response
-//	                                        acknowledging the event was
-//	                                        received;
-//	bit 1 (0x02, RespReqSpecificResponse) — the DUT shall ALSO POST the
-//	                                        specific-outcome Response
-//	                                        (started/completed/superseded/
-//	                                        etc.) as the event's lifecycle
-//	                                        proceeds.
+//	bit 0 (0x01, RespReqMessageReceived)   — the DUT shall POST a Response
+//	                                         acknowledging the event was
+//	                                         received;
+//	bit 1 (0x02, RespReqSpecificResponse)  — the DUT shall ALSO POST the
+//	                                         specific-outcome Response
+//	                                         (started/completed/superseded/
+//	                                         etc.) as the event's lifecycle
+//	                                         proceeds;
+//	bit 2 (0x04, RespReqCustomerResponse)  — the DUT shall ALSO POST status
+//	                                         11 (User acknowledged) on a
+//	                                         customer's own acknowledgment.
 //
-// Both are set. Without bit 1 a spec-compliant client has nothing obliging it
-// to ever report status=2 (Event started) — IEEE 2030.5 does not have a
-// client volunteer a Response nobody asked for — so CORE-022/CORE-023 could
-// never observe the started/completed/superseded lifecycle from any DUT that
-// actually implements that "do not respond unless asked" rule. (lexa-gw's
-// northbound tracker — internal/northbound/responses/tracker.go,
-// postResponseAt — is currently lenient about this: absent responseRequired
-// still gets posted as usual, and bit-level subsetting of WHICH status per
-// bit is a documented future refinement there, so any non-zero value already
-// worked against today's lexa-gw. Bit 0/1 here is chosen to be the
-// spec-honest request regardless of which DUT is on the other end.) Bit 2
-// (0x04, RespReqCustomerResponse) is left unset: nothing in this bench
-// simulates a customer-facing UI to answer it.
-const adminDefaultResponseRequired = model.RespReqMessageReceived | model.RespReqSpecificResponse
+// All three are set (F7/#18, 2026-08-17: raised from 0x03 — bit 0/1 only —
+// to 0x07 to match the catalog procedures' own responseRequired=7, catalog
+// fidelity this bench was previously short of). Without bit 1 a
+// spec-compliant client has nothing obliging it to ever report status=2
+// (Event started) — IEEE 2030.5 does not have a client volunteer a Response
+// nobody asked for — so CORE-022/CORE-023 could never observe the
+// started/completed/superseded lifecycle from any DUT that actually
+// implements that "do not respond unless asked" rule.
+//
+// Bit 2 is a no-op on this bench: nothing in it simulates a customer-facing
+// UI, so status 11 (User acknowledged, gated on bit 2 by
+// csipmodel.Table27RequiredBit) is neither posted by lexa-gw nor demanded by
+// any criterion in this suite — setting the bit only widens what a DUT is
+// PERMITTED to answer, and #17/F2's per-bit criterion gating (criteria_2030.go's
+// respReqNotRequested) means a bit being SET can never SUPPRESS grading of a
+// status that bit doesn't govern, so this change is catalog-fidelity-only:
+// TestResponseRequiredMatchesCatalogFidelity below proves no criterion
+// regresses under it. (lexa-gw's northbound tracker —
+// internal/northbound/responses/tracker.go's postResponse — now does its own
+// PER-BIT gating keyed by the same csipmodel.Table27RequiredBit table, SD-02;
+// the "currently lenient, bit-level subsetting is a future refinement" this
+// comment used to carry described the pre-SD-02 gateway and is no longer
+// true of either side.)
+const adminDefaultResponseRequired = model.RespReqMessageReceived | model.RespReqSpecificResponse | model.RespReqCustomerResponse
 
 // adminResponseReplyTo is the Response POST target an admin-created control's
 // replyTo attribute points at: gridsim's own advertised default ResponseSet

@@ -473,6 +473,19 @@ func (d *replayDriver) sampleTick(t int, hour float64, simLabel string, constrai
 		// control) is a resource limit, not a control failure — excuse it from the
 		// violation count. A silent miss still counts. Checked only on a miss, so
 		// the extra gridsim call is rare.
+		//
+		// F2/SD-02 adjudication #3 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md,
+		// lexa-gw): d.reportedCannotComply is onset-only (isCannotComplyOnset —
+		// legacy 0xF0 / standard-mode OptOut(4)), whose only live producer is the
+		// preference-class bus.ComplianceAlert publisher, which is INERT in this
+		// product. A correct RC0 gateway posts NO onset status for a fault-caused
+		// miss, so this excuse currently CANNOT fire for that class — a replay
+		// window that seeds a genuinely unmeetable, fault-class condition will
+		// count every sample as a violation instead of an excused resource limit.
+		// This mirrors mayhem's invConverge (invariants.go) and is not a bug here;
+		// do not delete the excuse — it is correct once a real producer exists.
+		// Do not run an unattended replay over a physically-unmeetable, fault-
+		// class window expecting this excuse until that producer lands.
 		if sample.Violation && d.reportedCannotComply(constraint.mrid) {
 			sample.Violation = false
 			sample.Excused = true
@@ -641,11 +654,18 @@ func (d *replayDriver) postControl(body map[string]any) (string, error) {
 }
 
 // reportedCannotComply reports whether the hub has POSTed a CannotComply
-// Response for the given control mRID — i.e. it told the grid server it is
-// physically unable to meet that limit (battery at its SOC reserve). Such
+// ONSET Response for the given control mRID — i.e. it told the grid server it
+// is physically unable to meet that limit (battery at its SOC reserve). Such
 // misses are excused from the violation count: a reported resource limit is an
 // acceptable outcome, not a control failure. A silent miss (no alert) still
 // counts. Empty mrid never matches.
+//
+// Onset-only (isCannotComplyOnset, mayhem.go — legacy 0xF0 or SD-02's
+// OptOut(4) class, docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md,
+// lexa-gw) since F5: matching on Subject alone let a RECOVERY notice
+// (OptIn/5, class=opt-in) excuse a violation it had nothing to do with — a
+// sample after the device told the head end it had already recovered must
+// not be forgiven on the strength of that same recovery post.
 func (d *replayDriver) reportedCannotComply(mrid string) bool {
 	if mrid == "" {
 		return false
@@ -653,13 +673,15 @@ func (d *replayDriver) reportedCannotComply(mrid string) bool {
 	var out struct {
 		Alerts []struct {
 			Subject string `json:"subject"`
+			Vocab   string `json:"vocab"`
+			Class   string `json:"class"`
 		} `json:"alerts"`
 	}
 	if err := d.getJSON("gridsim", "/admin/alerts", &out); err != nil {
 		return false
 	}
 	for _, a := range out.Alerts {
-		if a.Subject == mrid {
+		if a.Subject == mrid && isCannotComplyOnset(a.Vocab, a.Class) {
 			return true
 		}
 	}

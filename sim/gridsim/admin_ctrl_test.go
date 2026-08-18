@@ -130,9 +130,12 @@ func TestAdminControl_ResponseRequiredDefaultsOn(t *testing.T) {
 	if ctrl.ResponseRequired == nil {
 		t.Fatal("ResponseRequired is nil, want present by default")
 	}
-	if got := uint8(*ctrl.ResponseRequired); got != uint8(model.RespReqMessageReceived|model.RespReqSpecificResponse) {
-		t.Errorf("ResponseRequired = %#02x, want %#02x (message-received | specific-response)",
-			got, uint8(model.RespReqMessageReceived|model.RespReqSpecificResponse))
+	// F7/#18: compares against the constant, not a re-typed literal, so this
+	// stays correct across a bump (0x03 -> 0x07) without drifting like the
+	// raw-wire "03" string below once did.
+	if got := uint8(*ctrl.ResponseRequired); got != uint8(adminDefaultResponseRequired) {
+		t.Errorf("ResponseRequired = %#02x, want %#02x (adminDefaultResponseRequired)",
+			got, uint8(adminDefaultResponseRequired))
 	}
 
 	// It must also reach the wire: GET the list and confirm both attributes serve.
@@ -142,8 +145,8 @@ func TestAdminControl_ResponseRequiredDefaultsOn(t *testing.T) {
 	if !strings.Contains(body, `replyTo="/rsps/0/r"`) {
 		t.Errorf("served /derp/0/derc XML has no replyTo attribute:\n%s", body)
 	}
-	if !strings.Contains(body, `responseRequired="03"`) {
-		t.Errorf("served /derp/0/derc XML has no responseRequired=\"03\" attribute:\n%s", body)
+	if !strings.Contains(body, `responseRequired="07"`) {
+		t.Errorf("served /derp/0/derc XML has no responseRequired=\"07\" attribute:\n%s", body)
 	}
 }
 

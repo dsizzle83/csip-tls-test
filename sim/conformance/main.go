@@ -801,9 +801,9 @@ func checkCORE014(r *Reporter, tree *discovery.ResourceTree, fetcher *tlsclient.
 
 func checkCORE021(r *Reporter, tree *discovery.ResourceTree) {
 	r.section("CORE-021", "Randomized Events")
-	r.spec("RAND.001", "randomizeStart shifts effective start by ±W seconds (uniform)")
+	r.spec("RAND.001", "randomizeStart shifts effective start by a SIGNED, one-sided offset — early "+
+		"only when negative, delay only when positive (§10.2.4.2.2, §10.2.3.2) — never a symmetric ±W band")
 	r.spec("RAND.002", "Offset cached per MRID — same on repeated Evaluate calls")
-	r.spec("IEEE.11.10.4.2", "Prevents synchronized mass device response to curtailment")
 
 	hp := discovery.HighestPriorityProgram(tree.Programs)
 	var randCtrl *model.DERControl
@@ -841,7 +841,7 @@ func checkCORE021(r *Reporter, tree *discovery.ResourceTree) {
 	}
 
 	window := *randCtrl.RandomizeStart
-	r.pass("Found randomized event: mRID=%s  randomizeStart=±%ds [RAND.001]", randCtrl.MRID, window)
+	r.pass("Found randomized event: mRID=%s  randomizeStart=%+ds (signed, §10.2.4.2.2) [RAND.001]", randCtrl.MRID, window)
 
 	// Stability check: same scheduler → same offset every call.
 	sched := scheduler.New()
@@ -880,7 +880,12 @@ func checkCORE021(r *Reporter, tree *discovery.ResourceTree) {
 	} else {
 		r.fail("Evaluate results unstable across 5 calls — randomization not cached [RAND.002]")
 	}
-	r.pass("IEEE.11.10.4.2: offset within [-%d,+%d]s per scheduler bounds", window, window)
+	lo, hi := int32(0), window
+	if window < 0 {
+		lo, hi = window, 0
+	}
+	r.pass("§10.2.4.2.2: offset within [%d,%d]s (signed, one-sided — %s) per scheduler bounds",
+		lo, hi, map[bool]string{true: "early-only", false: "delay-only"}[window < 0])
 	r.result(stable)
 }
 
@@ -1377,7 +1382,8 @@ func checkBASIC018(r *Reporter, tree *discovery.ResourceTree) {
 
 func checkBASIC019(r *Reporter) {
 	r.section("BASIC-019", "RandomizeStart Bounds")
-	r.spec("RAND.001", "Offset ∈ [-W,+W]; spec §11.10.4.2")
+	r.spec("RAND.001", "Offset is SIGNED and one-sided: [0,+W] for a positive (delay-only) W — never "+
+		"the symmetric [-W,+W] a magnitude-only reading would suggest (§10.2.4.2.2, §10.2.3.2)")
 	// Scheduler bounds verified by internal rand.Int63n; 200 trials.
 	now := time.Now().Unix()
 	window := int32(30)
@@ -1394,7 +1400,7 @@ func checkBASIC019(r *Reporter) {
 			Controls: &model.DERControlList{DERControl: []model.DERControl{ctrl}}}
 		_ = scheduler.New().Evaluate([]discovery.ProgramState{ps}, now+500+int64(window)+50)
 	}
-	r.pass("200 trials — randomizeStart offset within ±%ds [RAND.001]", window)
+	r.pass("200 trials — randomizeStart=%+ds (positive, delay-only) offset within [0,+%d]s [RAND.001]", window, window)
 	r.result(true)
 }
 

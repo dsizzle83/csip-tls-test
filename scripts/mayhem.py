@@ -18,6 +18,8 @@ Usage:
 
 Exit code (audit MAY-1: an unjudged scenario must never look like success):
     0  run complete, every selected scenario judged, no FAIL/BLIND/INCONCLUSIVE
+       (NOT_APPLICABLE rows do not block a 0 — they are a disclosed, reasoned,
+       permanent skip for this release, not an unjudged scenario; see F2)
     1  any FAIL or BLIND
     2  run/connection error, incomplete run (finished!=true, aborted, or fewer
        verdicts than scenarios — e.g. a dashboard restart mid-run), or any
@@ -47,6 +49,7 @@ import urllib.request
 COLORS = {
     "PASS": "\033[32m", "DEGRADED": "\033[33m", "FAIL": "\033[31m",
     "BLIND": "\033[35m", "INCONCLUSIVE": "\033[90m", "INFRA": "\033[36m",
+    "NOT_APPLICABLE": "\033[34m",
 }
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -279,6 +282,8 @@ def _print_report(status):
     )
     if s.get("infra"):
         line += f"   {c('INFRA', COLORS['INFRA'])} {s['infra']}"
+    if s.get("not_applicable"):
+        line += f"   {c('NOT_APPLICABLE', COLORS['NOT_APPLICABLE'])} {s['not_applicable']}"
     print(line)
     print(f"Worst breach: {s.get('worst_peak_breach_W',0):.0f} W   "
           f"Total time out of limit: {s.get('total_breach_seconds',0):.0f} s")
@@ -294,6 +299,16 @@ def _print_report(status):
         print(f"\n⚠ {len(not_judged)} scenario(s) were NOT judged — re-run these:")
         for f in not_judged:
             print(f"    {f.get('id',''):28s} [{f.get('verdict')}] {f.get('headline','')}")
+
+    # NOT_APPLICABLE is a DIFFERENT thing from "not judged": it is a disclosed,
+    # reasoned, permanent skip for this release (F2) — re-running it changes
+    # nothing, so it gets its own call-out rather than joining the "re-run
+    # these" list above.
+    not_applicable = [f for f in findings if f.get("verdict") == "NOT_APPLICABLE"]
+    if not_applicable:
+        print(f"\nℹ {len(not_applicable)} scenario(s) marked NOT-APPLICABLE for this release:")
+        for f in not_applicable:
+            print(f"    {f.get('id',''):28s} {f.get('diagnosis', [''])[0] if f.get('diagnosis') else ''}")
 
     for f in findings:
         m = f.get("metrics", {})

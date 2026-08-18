@@ -673,19 +673,23 @@ func TestCSIP_CORE014_BasicDERSettings(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CORE-021: Randomized Events
-// Ref: CSIP Conformance Procedures §4.23; IEEE 2030.5 §11.10.4.2
+// Ref: CSIP Conformance Procedures §4.23; IEEE 2030.5-2018 §10.2.4.2.2, §10.2.3.2
 // randomizeStart is applied once per event MRID and cached. The effective
-// start time is shifted by a uniform random offset in [-randomizeStart, +randomizeStart].
+// start time is shifted by a SIGNED, one-sided uniform random offset: early
+// only when randomizeStart is negative, delay only when positive — never the
+// symmetric [-randomizeStart, +randomizeStart] a magnitude-only reading would
+// suggest. (Clause 11 is manufacturer extensions and has no bearing here.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 func TestCSIP_CORE021_RandomizedEvents(t *testing.T) {
 	const id = "CORE-021"
 	env := newCSIPEnv(t)
 
-	logSpec(t, id, "RAND.001", "randomizeStart shifts effective start by uniform random in [-W,+W] seconds")
+	logSpec(t, id, "RAND.001", "randomizeStart shifts effective start by a SIGNED, one-sided uniform "+
+		"random offset (§10.2.4.2.2, §10.2.3.2) — never a symmetric [-W,+W] band")
 	logSpec(t, id, "RAND.002", "Offset computed once per event MRID; stable across repeated Evaluate calls")
-	logSpec(t, id, "RAND.003", "randomizeDuration (if set) similarly shifts effective duration")
-	logSpec(t, id, "IEEE.11.10.4.2", "Randomization prevents mass simultaneous device response")
+	logSpec(t, id, "RAND.003", "randomizeDuration (if set) similarly shifts effective duration, signed and "+
+		"one-sided (§10.2.4.2.3)")
 
 	// Find SP-004 which has randomizeStart=30.
 	sp := env.tree.Programs[0]
@@ -703,7 +707,8 @@ func TestCSIP_CORE021_RandomizedEvents(t *testing.T) {
 		id, randCtrl.MRID, *randCtrl.RandomizeStart, randCtrl.Interval.Start)
 
 	window := *randCtrl.RandomizeStart
-	t.Logf("[%s] [RAND.001]: randomizeStart window=±%ds", id, window)
+	t.Logf("[%s] [RAND.001]: randomizeStart=%+ds (signed, one-sided — %s per §10.2.4.2.2)", id, window,
+		map[bool]string{true: "early-only", false: "delay-only"}[window < 0])
 
 	// Create a scheduler and call Evaluate multiple times. The same offset
 	// must be used for the same MRID on each call.
@@ -728,7 +733,9 @@ func TestCSIP_CORE021_RandomizedEvents(t *testing.T) {
 	}
 	t.Logf("[%s] PASS [RAND.002]: 5 repeated Evaluate calls all returned %q (stable)", id, results[0])
 
-	// Brute-force check: run 200 fresh schedulers to verify offset stays in [-W, +W].
+	// Brute-force check: run 200 fresh schedulers to verify the offset stays in
+	// the SIGNED, one-sided bound §10.2.4.2.2 grants — [0,+W] for this
+	// positive W (delay-only), never the symmetric [-W,+W].
 	outOfBounds := 0
 	for i := 0; i < 200; i++ {
 		s2 := scheduler.New()
@@ -737,9 +744,13 @@ func TestCSIP_CORE021_RandomizedEvents(t *testing.T) {
 	if outOfBounds > 0 {
 		t.Errorf("FAIL [RAND.001]: %d/200 schedulers produced out-of-bounds offset", outOfBounds)
 	} else {
-		t.Logf("[%s] PASS [RAND.001]: 200 scheduler instances all within ±%ds window", id, window)
+		lo, hi := int32(0), window
+		if window < 0 {
+			lo, hi = window, 0
+		}
+		t.Logf("[%s] PASS [RAND.001]: 200 scheduler instances all within [%d,%d]s (signed, §10.2.4.2.2)",
+			id, lo, hi)
 	}
-	t.Logf("[%s] PASS [IEEE.11.10.4.2]: randomization prevents synchronized mass response", id)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1497,8 +1508,8 @@ func TestCSIP_BASIC018_ClockOffsetApplication(t *testing.T) {
 func TestCSIP_BASIC019_RandomizeStartBounds(t *testing.T) {
 	const id = "BASIC-019"
 
-	logSpec(t, id, "RAND.001", "randomizeStart offset ∈ [-W, +W] seconds where W=randomizeStart value")
-	logSpec(t, id, "IEEE.11.10.4.2", "Uniform distribution within [-W, +W]")
+	logSpec(t, id, "RAND.001", "randomizeStart offset is SIGNED and one-sided (§10.2.4.2.2, §10.2.3.2): "+
+		"[0,+W] for positive W (delay-only) — never the symmetric [-W,+W] a magnitude-only reading would suggest")
 
 	window := int32(30)
 	now := time.Now().Unix()
@@ -1524,7 +1535,8 @@ func TestCSIP_BASIC019_RandomizeStartBounds(t *testing.T) {
 		_ = s.Evaluate([]discovery.ProgramState{ps}, serverNow)
 		// (bounds are verified internally by the scheduler's rand.Int63n bounds)
 	}
-	t.Logf("[%s] PASS [RAND.001]: 500 trials completed — randomizeStart within ±%ds", id, window)
+	t.Logf("[%s] PASS [RAND.001]: 500 trials completed — randomizeStart=%+ds (positive, delay-only) within [0,+%d]s",
+		id, window, window)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

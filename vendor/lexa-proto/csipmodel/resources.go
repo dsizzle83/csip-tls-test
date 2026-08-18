@@ -984,31 +984,69 @@ const (
 	ResponseEventReceived   uint8 = 1 // event text received and understood
 	ResponseEventStarted    uint8 = 2 // event interval began
 	ResponseEventCompleted  uint8 = 3 // event interval ended
-	ResponseOptIn           uint8 = 4 // client opted in (for opt-in programs)
-	ResponseOptOut          uint8 = 5 // client opted out
+	ResponseOptOut          uint8 = 4 // user actively chose to opt out, or device auto-opts out per user preference; sent at the time of opt-out, which may precede event start — IEEE 2030.5-2018 Table 27
+	ResponseOptIn           uint8 = 5 // user chose to opt back in after a prior opt-out; sent at the time of opt-in, which may precede event start — IEEE 2030.5-2018 Table 27
 	ResponseEventCancelled  uint8 = 6 // event cancelled by the server (CORE-022)
 	ResponseEventSuperseded uint8 = 7 // event superseded by an overlapping event (CORE-023)
 
 	// Remaining Table 27 lifecycle / rejection statuses (CORE-022/023 code
 	// discipline — the standard vocabulary the LEXA 0xF0 extension below is
 	// being migrated onto; see the responses tracker's D5 mapping).
-	ResponsePartialOptOut   uint8 = 8   // event partially completed (user/DER opt-out during the interval)
-	ResponseNoParticipation uint8 = 10  // event interval elapsed with no participation
-	ResponseAbortedServer   uint8 = 13  // event aborted — server cancelled/deleted it
-	ResponseAbortedProgram  uint8 = 14  // event aborted — superseding program change
-	ResponseRejectedParam   uint8 = 252 // rejected — parameter not applicable to this DER
-	ResponseRejectedInvalid uint8 = 253 // rejected — invalid/out-of-range event content
-	ResponseRejectedExpired uint8 = 254 // rejected — event already expired at receipt
+	ResponsePartialOptOut    uint8 = 8   // event partially completed (user/DER opt-out during the interval); sent at EffectiveEndTime only — never at onset/receipt
+	ResponsePartialOptIn     uint8 = 9   // "Event partially completed due to user opt-in" — user opted back in after a prior opt-out partway through the interval; sent at EffectiveEndTime only — never at onset/receipt — IEEE 2030.5-2018 Table 27
+	ResponseNoParticipation  uint8 = 10  // event interval elapsed with no participation; sent at EffectiveEndTime only — never at onset/receipt
+	ResponseUserAcknowledged uint8 = 11  // "User has acknowledged the event" — user actively acknowledged the event, distinct from a device-generated Received/Started/Completed; requires responseRequired bit 2 (RespReqCustomerResponse, 0x04) — IEEE 2030.5-2018 Table 27
+	ResponseAbortedServer    uint8 = 13  // event aborted — server cancelled/deleted it
+	ResponseAbortedProgram   uint8 = 14  // event aborted — superseding program change
+	ResponseRejectedParam    uint8 = 252 // rejected — parameter not applicable to this DER
+	ResponseRejectedInvalid  uint8 = 253 // rejected — invalid/out-of-range event content
+	ResponseRejectedExpired  uint8 = 254 // rejected — event already expired at receipt
 
 	// ResponseCannotComply is a LEXA profile extension (NOT an IEEE 2030.5
 	// Table 27 status). It alerts the server that the DER physically cannot meet
 	// an active control limit — e.g. an import cap that would require battery
-	// discharge below its SOC reserve. Chosen in the 0xF0–0xFF manufacturer
-	// range so it never collides with a standard status (1–7); the gridsim
-	// server treats any status ≥ 0xF0 as a resource-limited non-compliance
-	// alert rather than a lifecycle acknowledgement.
+	// discharge below its SOC reserve. Value 0xF0 (240) sits inside Table 27's
+	// RESERVED range (15-251, 255) — the standard defines no manufacturer
+	// range at all. Retained at 0xF0 only for legacy wire compatibility: this
+	// is a Lexa profile extension, config-gated to legacy mode only, and MUST
+	// NOT be advertised or used as IEEE 2030.5/CSIP conformance behavior.
 	ResponseCannotComply uint8 = 0xF0 // 240 — LEXA: DER unable to honour the control
 )
+
+// Table27RequiredBit returns the IEEE 2030.5-2018 Table 27 "Response
+// required" bit — the single ResponseRequired bit (see above) a server must
+// have set on an Event's responseRequired attribute before a client is
+// expected to send a Response carrying the given status. Per Table 27's
+// "Response required" column:
+//
+//	status 1  (ResponseEventReceived)     -> RespReqMessageReceived  (0x01)
+//	status 11 (ResponseUserAcknowledged)   -> RespReqCustomerResponse (0x04)
+//	every other defined lifecycle/rejection status (2-10, 13, 14, 252-254)
+//	                                        -> RespReqSpecificResponse (0x02)
+//	anything else — undefined, reserved, or the 0xF0 Lexa extension -> 0:
+//	this table has no opinion and a caller must not gate on it.
+//
+// This exists so the gateway's per-bit response gating reads this one table
+// instead of re-deriving — or worse, re-typing — Table 27's response-required
+// column a second time; duplicating it in two repos invites exactly the kind
+// of silent drift this package's other Table 27 constants have already had
+// (values 4/5 were once transposed). Keep it in lockstep with the status
+// constants above; TestTable27RequiredBit is the drift check.
+func Table27RequiredBit(status uint8) uint8 {
+	switch {
+	case status == ResponseEventReceived:
+		return uint8(RespReqMessageReceived)
+	case status == ResponseUserAcknowledged:
+		return uint8(RespReqCustomerResponse)
+	case (status >= ResponseEventStarted && status <= ResponseNoParticipation) ||
+		status == 12 || // "Cannot be displayed" — Messaging-only, bit 1 per Table 27; no named constant because this DER product never posts it
+		status == ResponseAbortedServer || status == ResponseAbortedProgram ||
+		(status >= ResponseRejectedParam && status <= ResponseRejectedExpired):
+		return uint8(RespReqSpecificResponse)
+	default:
+		return 0
+	}
+}
 
 // IEEE 2030.5 UomType codes (Table for ReadingType.uom) used by MUP telemetry.
 const (

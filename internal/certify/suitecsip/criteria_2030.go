@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/certify"
+	csipmodel "lexa-proto/csipmodel"
 )
 
 // critResource is the general "the DUT fetched resource X and the server
@@ -563,12 +564,26 @@ func critDERControlCarriesModeFrom(mode, claim, mrid string, want *int64) criter
 func critResponsePosted(status uint8, meaning string, mridKey string) criterion {
 	claim := fmt.Sprintf("the DUT POSTed a DERControlResponse with status=%d (%s) for the control under test",
 		status, meaning)
+	// #17/F2: hoisted from critResponseStarted's original status=2-only gate.
+	// notRequested is set by Wire ONLY in the one case respReqNotRequested
+	// has positive evidence for (see its doc); every other case (not found,
+	// absent attribute, Table27RequiredBit==0) leaves it "" and Wire falls
+	// straight through to the unchanged scan below, so a shipping row
+	// serving rr=0x03/0x07 (every currently-used bit set) grades identically
+	// to before this hoist. Wire always runs before Server within one
+	// assert() call (criteria.go), so sharing this across the two closures
+	// is safe — the same pattern critResponseStarted established.
+	var notRequested string
 	return criterion{
 		Claim: claim,
 		How: "the sep+xml body of a POST in the session whose root element is a Response family member, " +
 			"matched on <subject> and <status>",
 		NeedsTranscript: true,
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+			if reason := respReqNotRequested(t, status, mridKey); reason != "" {
+				notRequested = reason
+				return Finding{Unavailable: reason}
+			}
 			var seen []string
 			for _, e := range t.Method("POST") {
 				if e.Req == nil || len(e.Req.Body) == 0 {
@@ -599,6 +614,15 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 				len(seen), mridKey, status, strings.Join(seen, ", "))
 		},
 		Server: func(v *ServerView) Finding {
+			// #17/F2: honour a not-requested ruling Wire already made — tier 3
+			// has no visibility into a control's own wire responseRequired, so
+			// left to re-decide on bare Response presence it could turn the
+			// exact false-FAIL this gate exists to prevent right back into one
+			// (assert() always tries tier 3 once tier 2 answers Unavailable,
+			// for ANY reason, including this one).
+			if notRequested != "" {
+				return Finding{Unavailable: notRequested}
+			}
 			got := v.ResponsesFor(mridKey)
 			if len(got) == 0 {
 				if !v.SessionEstablished() {
@@ -623,23 +647,323 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 	}
 }
 
-// respReqSpecificResponse is IEEE 2030.5's responseRequired bit 1 (0x02) —
-// RespReqSpecificResponse in lexa-proto csipmodel/resources.go — the
-// server's request for the specific-outcome Response family (started/
-// completed/superseded/etc.), as distinct from bit 0 (0x01, message
-// received) and bit 2 (0x04, customer response). See
-// sim/gridsim/admin.go's adminDefaultResponseRequired for the bench side of
-// this bit.
-const respReqSpecificResponse = 0x02
+// controlEffectiveEndTimeBand reads mridKey's own DERControl <interval> —
+// start and duration, both IEEE 2030.5 TimeType (seconds since epoch) — AND
+// its own randomizeStart/randomizeDuration (§10.2.3.2/§10.2.4.2.2/.3), from every
+// DERControlList the DUT fetched in this window, the same "read it off the
+// wire the DUT actually saw" discipline controlResponseRequired uses for the
+// responseRequired attribute. found is false only when the control itself
+// never appeared in the recovered transcript.
+//
+// It returns a BAND, not an instant, because client-applied randomization
+// (§10.2.3.2/§10.2.4.2.2/.3) means a control's own EffectiveEndTime is not a fixed point:
+//
+//	earliest = start + min(0,randomizeStart) + duration + min(0,randomizeDuration)
+//	latest   = start + max(0,randomizeStart) + duration + max(0,randomizeDuration)
+//
+// A control that carries neither element permits no randomization on that
+// axis — IntOf reports 0 for an absent element, and min(0,0)==max(0,0)==0
+// leaves that axis's contribution untouched — so for a control gridsim did
+// not randomize, earliest==latest==SpecifiedEndTime (start+duration) and the
+// caller's FAIL/PASS split below collapses to a single-instant comparison,
+// exactly where randomization was never in play.
+//
+// This function was introduced in the SD-02 remediation. The distinction it
+// implements — that a control's own randomization moves its EffectiveEndTime
+// away from the fixed SpecifiedEndTime (start+duration, Table 27's own term
+// for the no-randomization case), and that grading a POSTed status against
+// the wrong one of the two produces a false FAIL — was a finding against the
+// first draft of that remediation, not a rename of code that predated it.
+//
+// oneHourRangeMax is IEEE 2030.5's OneHourRangeType bound — the type
+// randomizeStart and randomizeDuration are both declared as — a signed count
+// of seconds no wire value may exceed in magnitude. A control whose
+// randomizeStart or randomizeDuration falls outside
+// [-oneHourRangeMax, oneHourRangeMax] is not a device applying an unusually
+// wide jitter; it is a malformed control, and the criterion built on this
+// band says so rather than silently widening the band to match.
+const oneHourRangeMax = 3600
+
+// bandDisclosureCadence is the DERControlList poll cadence this suite already
+// reasons from elsewhere (core.go's core022CompletionDurationS comment,
+// randomize.go's CORE-021 disclaimer, both citing gridsim's 60 s
+// defaultControlListPollRate). It does not size the band below — the band is
+// fixed by the control's own randomizeStart/randomizeDuration — it only marks
+// the point past which an in-band non-verdict must say so loudly: a band this
+// wide can hide a real violation anywhere inside it, not just graze the
+// boundary, so the criterion's resolving power there has genuinely dropped
+// and must never be silently absorbed into an ordinary-looking Unavailable.
+const bandDisclosureCadence = 60 * time.Second
+
+// effectiveEndBand is controlEffectiveEndTimeBand's result: either the window
+// a control's own randomization permits its EffectiveEndTime to occupy, or
+// (Malformed != "") the reason the control's wire values cannot fix one at
+// all.
+type effectiveEndBand struct {
+	Earliest, Latest time.Time
+	// RawSpan is |randomizeStart| + |randomizeDuration| in seconds, BEFORE
+	// the earliest-edge duration floor below — the figure the band-width
+	// disclosure names, since it is what the control itself commanded, not
+	// what the floor happened to leave of it.
+	RawSpan time.Duration
+	// Malformed names the out-of-range value when one of randomizeStart/
+	// randomizeDuration falls outside OneHourRangeType. Earliest/Latest/
+	// RawSpan are zero when this is set.
+	Malformed string
+}
+
+func controlEffectiveEndTimeBand(t *Transcript, mridKey string) (band effectiveEndBand, found bool) {
+	for _, e := range t.ByResource("DERControlList") {
+		doc, err := e.Resp.SEP()
+		if err != nil {
+			continue
+		}
+		for _, c := range doc.Children("DERControl") {
+			m, _ := c.TextOf("mRID")
+			if m != mridKey {
+				continue
+			}
+			iv := c.Path("interval")
+			start, sok := iv.IntOf("start")
+			dur, dok := iv.IntOf("duration")
+			if !sok || !dok {
+				continue
+			}
+			randStart, _ := c.IntOf("randomizeStart")       // 0 when absent — permits no randomization
+			randDuration, _ := c.IntOf("randomizeDuration") // 0 when absent — permits no randomization
+			if randStart < -oneHourRangeMax || randStart > oneHourRangeMax {
+				return effectiveEndBand{Malformed: fmt.Sprintf(
+					"randomizeStart=%d is outside OneHourRangeType [-%d,+%d]", randStart, oneHourRangeMax, oneHourRangeMax)}, true
+			}
+			if randDuration < -oneHourRangeMax || randDuration > oneHourRangeMax {
+				return effectiveEndBand{Malformed: fmt.Sprintf(
+					"randomizeDuration=%d is outside OneHourRangeType [-%d,+%d]", randDuration, oneHourRangeMax, oneHourRangeMax)}, true
+			}
+			// EffectiveDuration cannot be negative: a randomizeDuration whose
+			// magnitude exceeds the control's own duration would otherwise
+			// pull the earliest edge before the control's own (randomized)
+			// start — a band edge before the event's own start is nonsense,
+			// so the effective duration contributing to EARLIEST is floored
+			// at 0. LATEST never needs the floor: max(0,randDuration) >= 0
+			// always.
+			effDurEarliest := dur + min64(0, randDuration)
+			if effDurEarliest < 0 {
+				effDurEarliest = 0
+			}
+			found = true
+			band.Earliest = time.Unix(start+min64(0, randStart)+effDurEarliest, 0)
+			band.Latest = time.Unix(start+max64(0, randStart)+dur+max64(0, randDuration), 0)
+			band.RawSpan = time.Duration(abs64(randStart)+abs64(randDuration)) * time.Second
+		}
+	}
+	return band, found
+}
+
+func abs64(a int64) int64 {
+	if a < 0 {
+		return -a
+	}
+	return a
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// critNoEarlyEndOfEventStatus is the SD-02 class rule
+// (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md, lexa-gw): IEEE
+// 2030.5-2018 Table 27 confines status 8 (PartialOptOut) and 10
+// (NoParticipation) to EffectiveEndTime — never onset, never receipt (Table
+// 27, p.74-76; "3/8/10 at EffectiveEndTime only"). This is the class rule
+// that catches a DUT posting either status early WHEREVER in the catalog that
+// DUT's control appears, backstopping — not replacing — a row's own
+// refusal/degradation criteria (curve.go's critRefusalAnswered forbids 8/10
+// outright on a structurally-refused control; this criterion additionally
+// catches the same defect on an ADMITTED, executing control, which
+// critRefusalAnswered is never attached to).
+//
+// It only has work to do on a Response that actually carries 8 or 10: a row
+// whose transcript holds neither status trivially satisfies the claim, so
+// attaching this to every Response-bearing row is cheap. When one IS
+// present, the control's own <interval> plus randomizeStart/randomizeDuration
+// — read from the DERControlList the DUT itself fetched, so this owes
+// nothing to what the row's Setup THOUGHT it published — fixes the band
+// §10.2.3.2/§10.2.4.2.2/.3 permits its EffectiveEndTime to land in, and the offending
+// Response's own capture timestamp (Message.Time — "the defensible clock for
+// every timing criterion in this suite", httpdis.go) is compared against it.
+//
+// # Why a band, and what a verdict inside it means
+//
+// gridsim seeds RandomizeStart on some controls (server.go:1451, admin.go:504)
+// — this is live, not hypothetical — and a client that applies it moves its
+// own EffectiveEndTime somewhere inside [earliest, latest] rather than sitting
+// at SpecifiedEndTime (start+duration). This criterion can only be as precise
+// as that band lets it be:
+//
+//   - a Response strictly before EARLIEST is early under EVERY random draw
+//     §10.2.3.2/§10.2.4.2.2/.3 permits, so it FAILs — this is the one shape no reading of the
+//     randomization can excuse, and it is exactly the defective onset-8 shape
+//     SD-02 exists to catch;
+//   - a Response at or after LATEST is not early under ANY permitted draw, so
+//     it PASSes unconditionally;
+//   - a Response landing INSIDE the band is genuinely undecidable from the
+//     wire: this suite cannot recover which point in that band the DUT's own
+//     random draw actually selected as its EffectiveEndTime, so whether the
+//     Response is early relative to THAT instant (as opposed to
+//     SpecifiedEndTime) is not answerable from what was recovered. Guessing
+//     either verdict here would be exactly the error this rewrite exists to
+//     retire, just relocated a few lines down — so this is reported as a
+//     disclosed non-verdict (unavailable), naming the band, rather than
+//     guessed at.
+//
+// randomizeGuardBand (randomize.go) — already the suite's own small tolerance
+// for the wall-clock (Message.Time) vs TimeType (server epoch) domain mix —
+// is subtracted from EARLIEST before the FAIL comparison, so a capture-clock
+// vs server-clock skew of a couple of seconds cannot manufacture a false FAIL
+// out of a Response that landed exactly on the boundary. It is deliberately
+// NOT added to LATEST: doing so would misclassify an exact-boundary,
+// zero-randomization control's on-time Response (band width zero) as
+// "inside the band" and downgrade an honest PASS to a non-verdict.
+//
+// A status 8/10 seen with no recoverable band for its own mRID is reported
+// Unavailable rather than guessed at: this suite's absence/inability
+// discipline is that an unestablished boundary cannot certify a timing
+// violation any more than an unestablished baseline can certify a refusal
+// (curve.go's refusalOutcome contamination-baseline path takes the same
+// position). The same discipline governs the case where NO status 8/10 was
+// ever seen for this mRID at all: that is not a fact this criterion can
+// falsify (RRS — a row whose control never drew a partial status has nothing
+// for this claim to grade), so it too is unavailable rather than a vacuous
+// Pass.
+func critNoEarlyEndOfEventStatus(mridKey string) criterion {
+	return criterion{
+		Claim: "no DERControlResponse the DUT POSTed for this control carries status 8 (PartialOptOut) or " +
+			"10 (NoParticipation) before the EARLIEST EffectiveEndTime the control's own randomizeStart/" +
+			"randomizeDuration (§10.2.3.2/§10.2.4.2.2/.3) permit",
+		How: "every Response-family POST in the session whose <subject> is this row's own mRID, filtered to " +
+			"<status> in {8,10}, each one's own capture timestamp compared against the BAND of EffectiveEndTime " +
+			"values this control's own randomizeStart/randomizeDuration (§10.2.3.2/§10.2.4.2.2/.3) permit its SpecifiedEndTime " +
+			"(<interval><start> + <interval><duration>) to move to: FAIL only strictly before the band's " +
+			"earliest edge (IEEE 2030.5-2018 Table 27 p.74-76 — SD-02); a Response landing inside the band is " +
+			"reported as a disclosed non-verdict rather than guessed at, since which point in it the DUT's own " +
+			"random draw selected is not recoverable from the wire",
+		NeedsTranscript: true,
+		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+			var early []string
+			var ambiguous []string
+			var clear []string
+			for _, e := range t.Method("POST") {
+				if e.Req == nil || len(e.Req.Body) == 0 {
+					continue
+				}
+				doc, err := e.Req.SEP()
+				if err != nil || !strings.HasSuffix(doc.Local(), "Response") {
+					continue
+				}
+				subj, _ := doc.TextOf("subject")
+				if subj != mridKey {
+					continue
+				}
+				st, _ := doc.UintOf("status")
+				if st != 8 && st != 10 {
+					continue
+				}
+				band, ok := controlEffectiveEndTimeBand(t, mridKey)
+				if !ok {
+					return unavailable("a status=%d Response was POSTed for subject %s, but no DERControl "+
+						"carrying that mRID's own <interval> appears in the recovered transcript, so this "+
+						"row's own control cannot fix a band to check the timing against", st, mridKey)
+				}
+				if band.Malformed != "" {
+					return found(certify.Fail, allFrames(t.Method("POST")),
+						"subject %s's own DERControl carries a randomizeStart/randomizeDuration value this "+
+							"suite cannot honor: %s — IEEE 2030.5's OneHourRangeType bounds both to "+
+							"[-%d,+%d] s (§10.2.3.2/§10.2.4.2.2/.3). This is a malformed control, not an "+
+							"unusually wide legitimate jitter, so the row FAILs rather than widening the band "+
+							"to match it",
+						mridKey, band.Malformed, oneHourRangeMax, oneHourRangeMax)
+				}
+				earliest, latest := band.Earliest, band.Latest
+				at := e.Req.Time
+				switch {
+				case at.Before(earliest.Add(-randomizeGuardBand)):
+					early = append(early, fmt.Sprintf("status=%d at %s, %s before the band's earliest edge "+
+						"%s (band [%s, %s), permitted by this control's own randomizeStart/randomizeDuration)",
+						st, at.Format(time.RFC3339), earliest.Sub(at).Round(time.Second),
+						earliest.Format(time.RFC3339), earliest.Format(time.RFC3339), latest.Format(time.RFC3339)))
+				case at.Before(latest):
+					warn := ""
+					if band.RawSpan >= bandDisclosureCadence {
+						warn = fmt.Sprintf(" REDUCED POWER: this control's own randomizeStart/randomizeDuration "+
+							"span %s, at or beyond the %s poll cadence this suite grades against — a band this "+
+							"wide can hide a real onset-8/10 violation anywhere inside it, not just graze the "+
+							"boundary, so this check's ability to catch one here is substantially reduced",
+							band.RawSpan, bandDisclosureCadence)
+					}
+					ambiguous = append(ambiguous, fmt.Sprintf("status=%d at %s falls inside the randomization "+
+						"band [%s, %s), width %s, this control's own randomizeStart/randomizeDuration "+
+						"(§10.2.3.2/§10.2.4.2.2/.3) permit its EffectiveEndTime to occupy — which point in it "+
+						"the DUT's own random draw actually selected is not recoverable from the wire.%s",
+						st, at.Format(time.RFC3339), earliest.Format(time.RFC3339), latest.Format(time.RFC3339),
+						latest.Sub(earliest), warn))
+				default:
+					clear = append(clear, fmt.Sprintf("status=%d at %s, at or after the band's latest edge %s",
+						st, at.Format(time.RFC3339), latest.Format(time.RFC3339)))
+				}
+			}
+			switch {
+			case len(early) > 0:
+				return found(certify.Fail, allFrames(t.Method("POST")),
+					"the DUT POSTed a Response for subject %s carrying status 8 or 10 before the earliest "+
+						"EffectiveEndTime its own randomization permits: %s. This is early under EVERY random "+
+						"draw §10.2.3.2/§10.2.4.2.2/.3 permits — exactly the defective onset-8 shape SD-02 exists to catch",
+					mridKey, strings.Join(early, "; "))
+			case len(ambiguous) > 0:
+				return unavailable("subject %s POSTed status 8/10 Response(s) landing inside the control's own "+
+					"randomization band, so whether they are early relative to the DUT's OWN actual "+
+					"EffectiveEndTime (as opposed to its SpecifiedEndTime) cannot be established from the "+
+					"wire: %s", mridKey, strings.Join(ambiguous, "; "))
+			case len(clear) > 0:
+				return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
+					"every status-8/10 Response for subject %s arrived at or after the latest EffectiveEndTime "+
+						"its own randomization permits: %s", mridKey, strings.Join(clear, "; "))}
+			default:
+				return unavailable("no Response for subject %s carried status 8 or 10 in this window, so this "+
+					"criterion has nothing to grade", mridKey)
+			}
+		},
+	}
+}
 
 // controlResponseRequired reads the responseRequired bitmap recovered for
 // mridKey's DERControl across every DERControlList the DUT fetched in this
-// window. found is false only when the control itself never appeared in the
-// transcript; a control that DID appear but omitted the attribute decodes to
-// rr=0 (IEEE 2030.5: an absent hexBinary8 attribute is "no server
-// instruction", which for this criterion's purposes reads the same as an
-// explicit 00 — neither requests a specific response).
-func controlResponseRequired(t *Transcript, mridKey string) (rr uint8, found bool) {
+// window.
+//
+// found is false only when the control itself never appeared in the
+// transcript. present is the F5 fix (2026-08-17): it distinguishes an
+// EXPLICIT responseRequired="00" from the attribute being ABSENT altogether.
+// IEEE 2030.5's hexBinary8 responseRequired is optional, and an absent
+// attribute is "no server instruction" — which the standard, and this
+// gateway (internal/northbound/responses/tracker.go's postResponse: `if
+// addr.responseRequired != nil { ...gate... }`, the whole gate skipped
+// entirely when the pointer is nil), both read as "post/grade normally", NOT
+// as if the server had explicitly asked for nothing. Only an EXPLICIT rr=0
+// means "the server asked for nothing" and gates a status-specific criterion
+// to Unavailable (see respReqNotRequested). Before this fix both readings
+// collapsed onto rr=0 (present was not tracked at all) and were treated
+// identically, which silently mis-gated the absent case exactly like an
+// explicit deny — the opposite of the gateway's own behavior.
+func controlResponseRequired(t *Transcript, mridKey string) (rr uint8, found, present bool) {
 	for _, e := range t.ByResource("DERControlList") {
 		doc, err := e.Resp.SEP()
 		if err != nil {
@@ -652,79 +976,94 @@ func controlResponseRequired(t *Transcript, mridKey string) (rr uint8, found boo
 			}
 			found = true
 			if v, ok := c.Attr("responseRequired"); ok {
+				present = true
 				if parsed, perr := strconv.ParseUint(v, 16, 8); perr == nil {
 					rr = uint8(parsed)
 				}
 			}
 		}
 	}
-	return rr, found
+	return rr, found, present
+}
+
+// respReqNotRequested is the #17/F2 shared gate every criterion that demands
+// a specific DERControlResponse status must check first — hoisted out of
+// critResponseStarted's original bit-0x02-only version so every status gets
+// the same per-bit treatment (via the vendored csipmodel.Table27RequiredBit,
+// IEEE 2030.5-2018 Table 27's "Response required" column), not just
+// status=2. It names WHY a status is not expected on the wire, or returns ""
+// when it IS expected (grade normally).
+//
+// It returns "" — ungated — in every case except the ONE where this bench
+// has POSITIVE evidence the status was not asked for: the control appeared
+// in the transcript AND its responseRequired attribute was PRESENT AND
+// explicit AND did not carry the required bit. The other three cases stay
+// ungated on purpose, matching the gateway's own fallbacks:
+//
+//   - the control was never recovered in this window (found=false): unknown,
+//     not "not requested" — a caller's ORIGINAL grading path (e.g. a
+//     Response POST found directly in the transcript, independent of
+//     whether the DERControlList that carries the mRID's responseRequired
+//     was itself captured) still applies.
+//   - the attribute was ABSENT (found && !present, F5): "no server
+//     instruction" reads as "post/grade normally", never as an implicit
+//     deny — see controlResponseRequired's doc.
+//   - Table27RequiredBit(status)==0 (an extension/undefined status, e.g. the
+//     legacy 0xF0): the table has no opinion, so there is nothing to gate
+//     on — matches tracker.go's own "EXTENSION AND UNDEFINED STATUSES keep
+//     the old behaviour verbatim" fallback.
+func respReqNotRequested(t *Transcript, status uint8, mridKey string) string {
+	bit := csipmodel.Table27RequiredBit(status)
+	if bit == 0 {
+		return ""
+	}
+	rr, found, present := controlResponseRequired(t, mridKey)
+	if !found || !present {
+		return ""
+	}
+	if rr&bit != 0 {
+		return ""
+	}
+	return fmt.Sprintf("the DERControl mRID=%s carried responseRequired=%02X, which does not request status=%d "+
+		"(required bit 0x%02X per IEEE 2030.5 Table 27) — a spec-compliant DUT is not obliged to report one",
+		mridKey, rr, status, bit)
+}
+
+// respReqFilterStatuses is respReqNotRequested applied across a whole set of
+// demanded statuses at once — the shape critResponseFanOut, critEventLifecycle
+// and the CORE-022 inline lifecycle criterion need (they each grade several
+// statuses for one mRID in a single criterion), rather than one status per
+// criterion the way critResponsePosted/critResponseStarted do. Returns the
+// subset of demanded that IS still expected (ungated); a status dropped from
+// it has positive evidence — respReqNotRequested's — that it was not asked
+// for.
+func respReqFilterStatuses(t *Transcript, mridKey string, demanded []int) []int {
+	var kept []int
+	for _, s := range demanded {
+		if respReqNotRequested(t, uint8(s), mridKey) == "" {
+			kept = append(kept, s)
+		}
+	}
+	return kept
 }
 
 // critResponseStarted asserts a DERControlResponse with status=2 (Event
-// started) for the control under test — the same claim critResponsePosted(2,
-// ...) makes, refined to grade against what the control's OWN wire
-// responseRequired attribute actually asked for (IEEE 2030.5 Table 27 /
+// started) for the control under test, graded against what the control's OWN
+// wire responseRequired attribute actually asked for (IEEE 2030.5 Table 27 /
 // RespondableResource: a client is never told to volunteer a Response nobody
 // requested).
 //
-// A control whose captured responseRequired does not carry bit 0x02
-// (RespReqSpecificResponse) makes status=2 unobservable by construction, not
-// a DUT failure — grading that FAIL would blame the DUT for the control's
-// own omission, exactly the false-FAIL gridsim's PRIOR admin-created
-// controls (which never set responseRequired at all) used to produce here.
-// So: Unavailable/Skip when the wire shows the bit was never asked for
-// (matching the old blanket reason this bench used before it could set the
-// bit at all), Pass/Fail exactly like critResponsePosted when it was.
-//
-// The tier-3 (gridsim admin API) fallback has no visibility into a
-// DERControl's own wire attributes — gridsim's admin API records Responses
-// received, not the control's own responseRequired — so on its own it cannot
-// tell "not requested" from "requested but the DUT failed to answer". Left to
-// delegate blindly to critResponsePosted's Server evaluator, it would
-// re-grade Pass/Fail on bare Response presence and could turn the exact
-// false-FAIL this criterion exists to prevent right back into one, any time
-// gridsim's admin API happens to be reachable alongside a transcript that
-// already ruled the claim not-requested (assert() in criteria.go always
-// tries tier 3 once tier 2 answers Unavailable, for ANY reason). notRequested
-// closes that gap: the Wire evaluator records when IT was the one that ruled
-// the bit not requested, and the Server evaluator honours that verdict
-// instead of re-deciding. A single criterion instance is built fresh per
-// Observation (check.go's s.Criteria(obs)) and asserted exactly once, with
-// Wire always attempted before Server within that one assert() call, so
-// sharing this across the two closures is safe.
+// #17/F2 (2026-08-17): this used to be the ONLY criterion with this gate,
+// hand-built around a hardcoded bit 0x02. The gate is now hoisted into
+// critResponsePosted itself (respReqNotRequested, keyed per status by the
+// vendored csipmodel.Table27RequiredBit), so this function is a thin,
+// self-documenting alias — status=2's own required bit happens to be 0x02,
+// exactly what this hand-built version checked, so nothing about its grading
+// changes. Keep the named wrapper: CORE-022/CORE-023 and every other caller
+// read "critResponseStarted(mrid)" at the call site, and the historical name
+// carries the "Event started" meaning without repeating it everywhere.
 func critResponseStarted(mridKey string) criterion {
-	const status = 2
-	const meaning = "Event started"
-	inner := critResponsePosted(status, meaning, mridKey)
-	var notRequested string
-	return criterion{
-		Claim: fmt.Sprintf("the DUT POSTs a DERControlResponse with status=%d (%s) for the control under "+
-			"test, which its responseRequired asked for", status, meaning),
-		How: "the control's own responseRequired attribute (bit 0x02, specific response) recovered from the " +
-			"transcript, gating whether a status=2 Response POST can be expected at all; when it is, " + inner.How,
-		NeedsTranscript: true,
-		Wire: func(ev *certify.Evidence, t *Transcript) Finding {
-			rr, found := controlResponseRequired(t, mridKey)
-			switch {
-			case !found:
-				return unavailable("the DERControl mRID=%s was not recovered in this window's transcript, so "+
-					"its responseRequired cannot be read", mridKey)
-			case rr&respReqSpecificResponse == 0:
-				notRequested = fmt.Sprintf("the DERControl mRID=%s carried responseRequired=%02X, which does "+
-					"not request a specific (status=2) response (bit 0x02) — a spec-compliant DUT is not "+
-					"obliged to report one", mridKey, rr)
-				return Finding{Unavailable: notRequested}
-			}
-			return inner.Wire(ev, t)
-		},
-		Server: func(v *ServerView) Finding {
-			if notRequested != "" {
-				return Finding{Unavailable: notRequested}
-			}
-			return inner.Server(v)
-		},
-	}
+	return critResponsePosted(2, "Event started", mridKey)
 }
 
 // gradeDERPutExchange grades ONE PUT exchange whose body's root element is

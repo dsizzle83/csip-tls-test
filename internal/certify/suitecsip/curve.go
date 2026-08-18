@@ -2336,6 +2336,22 @@ type refusalBinding struct {
 	// rows and why critDERCurveResolvable still runs on this row: it separates
 	// "refused the axis" from "could not fetch the curve".
 	Curve *curveBinding
+
+	// LegacyCannotComply declares that THIS ROW's own DUT/case configuration
+	// runs the LEXA profile's legacy CannotComply wire (the config-gated 0xF0
+	// extension), rather than the standard Table 27 answer (252 at receipt).
+	//
+	// It is NOT about DER generation (contrast the file's other "legacy" —
+	// the 12x-vs-7xx register-bank distinction elsewhere in this file, an
+	// unrelated meaning of the same word). Every row in the current RC0
+	// catalog leaves this false: the product's default and the certification
+	// profile are both standard-mode, and a false-by-default posture is what
+	// makes a corrected oracle reject the product's former 8-at-receipt
+	// defect instead of grandfathering it in. A row that DOES set this is
+	// exercising the config-gated fallback wire on purpose, and
+	// critRefusalAnswered marks any PASS it earns as non-conformance evidence
+	// (SD-02).
+	LegacyCannotComply bool
 }
 
 // coveredCurveSlots is THE decision about which curves of a bank this row's
@@ -2828,28 +2844,83 @@ func critRefusedAxisNoSouthboundTrace(b *refusalBinding, o *Observation) criteri
 	}
 }
 
-// refusalStatuses are the Response statuses that constitute an honest refusal.
+// refusalAcceptedStatus reports whether status is an honest "cannot comply"
+// answer for a row whose control the DUT REFUSES OUTRIGHT — the control names
+// an axis the product does not/cannot execute at all — under this row's own
+// legacy-wire declaration.
 //
-// IEEE 2030.5 Table 27 has no "cannot comply" status; a client that cannot
-// perform a control has to say so in the vocabulary that exists. This product
-// answers 8 (event partially completed / opted out) at receipt, and keeps a
-// legacy mode that answers the manufacturer-range 0xF0 the LEXA profile
-// defined for the same meaning (lexa-proto csipmodel's ResponseCannotComply,
-// and lexa-gw's responses tracker: `code := model.ResponsePartialOptOut; if
-// rt.legacyCannotComply { code = model.ResponseCannotComply }`). BOTH are
-// accepted here, because which one is on the wire is a configuration of the
-// DUT and not a conformance property of the refusal.
-var refusalStatuses = []uint8{8, 0xF0}
+// IEEE 2030.5-2018 Table 27, p.74-76 DOES define a receipt-time rejection for
+// exactly this shape: 252 ("rejected — parameter not applicable to this DER"),
+// sent at first receipt, before any southbound write — this is the RC0
+// decision table's case 2 (docs/design/SD02_RESPONSE_SEMANTICS_RC0_2026-08-17.md,
+// lexa-gw), and it corrects this file's own former claim that "Table 27 has no
+// cannot-comply status": it has one, at 252, and this product's prior 8/0xF0
+// answer was reaching for a status Table 27 reserves for a DIFFERENT, later
+// event (an ADMITTED control that only PARTIALLY executes — see
+// refusalForbiddenStatuses below).
+//
+// The LEXA profile's 0xF0 (manufacturer-range squatting on Table 27's
+// RESERVED range — 15-251 and 255; the standard defines no manufacturer range
+// at all) remains an acceptable wire ONLY when this row's own DUT/case
+// configuration explicitly declares legacy mode (refusalBinding.
+// LegacyCannotComply). It is a config-gated fallback, never a conformance
+// behavior and never in PICS — a row that passes on this path is stamped
+// non-conformance-evidence in its Observed text (see legacyDisclaimer below)
+// so a bundle reader cannot mistake it for the standard answer.
+func refusalAcceptedStatus(status uint64, legacy bool) bool {
+	if status == 252 {
+		return true
+	}
+	return legacy && status == 0xF0
+}
 
-// refusalForbiddenStatuses are the answers that make a refusal dishonest: an
-// execution signal for a control the DUT did not (and must not) execute.
+// legacyDisclaimer is appended to a refusal Finding's Observed text whenever
+// the accepted status was the config-gated 0xF0 wire, so a bundle reader
+// cannot read this row's PASS as conformance evidence (SD-02).
+const legacyDisclaimer = " — LEGACY WIRE MODE (0xF0, config-gated): this row's DUT/case declares legacy " +
+	"CannotComply and this PASS is NOT conformance evidence; the standard answer is 252"
+
+// refusalForbiddenStatuses are the answers that make a refusal dishonest for a
+// row whose control is refused OUTRIGHT — an axis the product never admits at
+// all, so nothing about the event's lifecycle is this row's to report.
+//
+//   - 2/3 (Started/Completed) are EXECUTION signals for a control nothing ever
+//     executed — the LXR-002 defect verbatim.
+//   - 8/10 (PartialOptOut/NoParticipation) are Table 27's OWN EffectiveEndTime-
+//     only statuses for an event that WAS admitted and PARTIALLY honoured.
+//     This row's control was never admitted, so nothing was ever partially
+//     honoured — posting either here is both the wrong send-time (receipt, not
+//     EffectiveEndTime) and the wrong shape (this is a rejection, not a
+//     partial), which is exactly the defective former product behavior SD-02
+//     corrects.
+//   - 4/5 (OptOut/OptIn) are lifecycle acknowledgements of a preference-driven
+//     curtailment on a control the DUT DID adopt into its control loop. A
+//     structurally unsupported control was never adopted, so it cannot have
+//     opted in or out of anything.
+//
+// None of the five is an honest answer to "I cannot perform this control at
+// all".
 var refusalForbiddenStatuses = map[uint64]string{
-	2: "Event started",
-	3: "Event completed",
+	2: "Event started — an EXECUTION signal for an axis this product does not execute",
+	3: "Event completed — an EXECUTION signal for an axis this product does not execute",
+	8: "PartialOptOut — Table 27's EffectiveEndTime-only partial for an ADMITTED, partially-honoured " +
+		"event; this row's control was never admitted, so nothing was ever partially honoured (SD-02: the " +
+		"defective former onset-8 shape)",
+	10: "NoParticipation — Table 27's EffectiveEndTime-only partial for an ADMITTED event observed " +
+		"breaching throughout; this row's control was never admitted at all",
+	4: "OptOut — a lifecycle acknowledgement of an ADOPTED control's preference-driven curtailment; this " +
+		"row's control was refused outright, never adopted",
+	5: "OptIn — a lifecycle acknowledgement this row's outright-refused control never earns",
 }
 
 // critRefusalAnswered asserts the DUT told the head end it could not comply
-// with this row's control — and did NOT tell it the event started or completed.
+// with this row's control — and did NOT tell it the event started or completed
+// (or any of Table 27's other lifecycle/partial statuses this outright-refused
+// control never earns).
+//
+// legacy threads refusalBinding.LegacyCannotComply: only when the row's own
+// DUT/case configuration declares legacy wire mode is the LEXA profile's 0xF0
+// accepted, and then only as non-conformance evidence (legacyDisclaimer).
 //
 // The forbidden half is the load-bearing half. A DUT that silently drops an
 // axis it cannot execute and reports Started is the LXR-002 defect verbatim:
@@ -2857,17 +2928,33 @@ var refusalForbiddenStatuses = map[uint64]string{
 // executed. That is the shape this criterion has to be able to catch, and a
 // criterion that only looked for the refusal status would grade a DUT that sent
 // BOTH as compliant.
-func critRefusalAnswered(mridKey string) criterion {
+func critRefusalAnswered(mridKey string, legacy bool) criterion {
+	accepted := "252 (rejected — parameter not applicable to this DER), sent at receipt before any write"
+	if legacy {
+		accepted += ", or — this row's case declares legacy wire mode — the LEXA profile's 0xF0 " +
+			"(non-conformance evidence only)"
+	}
+	// #17/F2: 252/253/254 share Table27RequiredBit's bit 0x02
+	// (RespReqSpecificResponse) — same as 253/254 — so 252 is representative
+	// for the gate; 0xF0 (legacy) has no Table 27 entry (Table27RequiredBit
+	// returns 0) and is never gated, matching the gateway's own "extension
+	// statuses keep the old behaviour" fallback. Only the POSITIVE "must
+	// report a rejection" half is gated: the forbidden-status half (2, 3, 4,
+	// 5, 8, 10 must NOT appear) is a claim about what the DUT volunteered,
+	// which Table 27 does not excuse just because nobody asked for it.
+	var notRequested string
 	return criterion{
 		Claim: "the DUT answered this row's control with a cannot-comply Response, and never reported it " +
-			"started or completed",
+			"started, completed, or any other Table 27 lifecycle/partial status",
 		How: "the sep+xml body of every Response-family POST in the session whose <subject> is this row's " +
-			"own mRID, and the <status> each carried: a refusal status (8 partial-opt-out, or the LEXA " +
-			"profile's 0xF0) must be present and neither 2 (Event started) nor 3 (Event completed) may be",
+			"own mRID, and the <status> each carried: a rejection status (" + accepted + ") must be present " +
+			"and none of 2, 3, 4, 5, 8, or 10 may be (the rejection requirement gated per #17/F2 against " +
+			"the control's own responseRequired)",
 		NeedsTranscript: true,
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 			var seen []string
 			var refused, forbidden *Message
+			var refusedStatus, forbiddenStatus uint64
 			var forbiddenWhat string
 			for _, e := range t.Method("POST") {
 				if e.Req == nil || len(e.Req.Body) == 0 {
@@ -2884,37 +2971,51 @@ func critRefusalAnswered(mridKey string) criterion {
 				st, _ := doc.UintOf("status")
 				seen = append(seen, fmt.Sprintf("status=%d", st))
 				if what, bad := refusalForbiddenStatuses[st]; bad && forbidden == nil {
-					forbidden, forbiddenWhat = e.Req, what
+					forbidden, forbiddenStatus, forbiddenWhat = e.Req, st, what
 				}
-				for _, ok := range refusalStatuses {
-					if st == uint64(ok) && refused == nil {
-						refused = e.Req
-					}
+				if refusalAcceptedStatus(st, legacy) && refused == nil {
+					refused, refusedStatus = e.Req, st
 				}
 			}
 			switch {
 			case forbidden != nil:
 				return citeMessage(t, forbidden, certify.Fail,
-					"the DUT reported <status>%s</status> for this row's control (mRID=%s) — an EXECUTION "+
-						"signal for an axis this product does not execute. The head end has been told the "+
-						"control ran. Every Response this row's control drew: %s",
-					forbiddenWhat, mridKey, strings.Join(seen, ", "))
+					"the DUT reported <status>%d</status> for this row's control (mRID=%s), which this row's "+
+						"outright refusal must never carry: %s. Every Response this row's control drew: %s",
+					forbiddenStatus, mridKey, forbiddenWhat, strings.Join(seen, ", "))
 			case refused != nil:
-				return citeMessage(t, refused, certify.Pass,
-					"the DUT answered this row's control (mRID=%s) with a cannot-comply Response and "+
-						"reported neither started nor completed; the Responses it sent were: %s",
-					mridKey, strings.Join(seen, ", "))
+				obs := fmt.Sprintf("the DUT answered this row's control (mRID=%s) with a cannot-comply "+
+					"Response (status=%d) and reported neither started, completed, nor any other Table 27 "+
+					"lifecycle/partial status; the Responses it sent were: %s",
+					mridKey, refusedStatus, strings.Join(seen, ", "))
+				if refusedStatus == 0xF0 {
+					obs += legacyDisclaimer
+				}
+				return citeMessage(t, refused, certify.Pass, "%s", obs)
 			case len(seen) > 0:
+				if reason := respReqNotRequested(t, 252, mridKey); reason != "" {
+					notRequested = reason
+					return Finding{Unavailable: fmt.Sprintf("the DUT POSTed %d Response(s) for this row's "+
+						"control (mRID=%s) and none of them says it cannot comply, but %s — a spec-compliant "+
+						"DUT is not obliged to report the rejection status on this claim", len(seen), mridKey, reason)}
+				}
 				return found(certify.Fail, allFrames(t.Method("POST")),
 					"the DUT POSTed %d Response(s) for this row's control (mRID=%s) and none of them says it "+
-						"cannot comply: %s. A control whose axis the DUT cannot execute has to be answered, "+
-						"not left on an acknowledgement",
+						"cannot comply: %s. A structurally unsupported control must be rejected at receipt "+
+						"(status 252), not left on an acknowledgement",
 					len(seen), mridKey, strings.Join(seen, ", "))
 			default:
 				return unavailable("the recovered transcript holds no Response POST for subject %s", mridKey)
 			}
 		},
 		Server: func(v *ServerView) Finding {
+			// #17/F2: honour a not-requested ruling Wire already made — tier 3
+			// has no visibility into a control's own wire responseRequired, so
+			// left to re-decide on bare Response presence it could turn the
+			// exact false-FAIL this gate exists to prevent right back into one.
+			if notRequested != "" {
+				return Finding{Unavailable: notRequested}
+			}
 			got := v.ResponsesFor(mridKey)
 			if len(got) == 0 {
 				if !v.SessionEstablished() {
@@ -2926,28 +3027,32 @@ func critRefusalAnswered(mridKey string) criterion {
 			}
 			var statuses []string
 			var refused bool
+			var refusedStatus uint8
 			for _, r := range got {
 				statuses = append(statuses, fmt.Sprintf("status=%d", r.Status))
 				if what, bad := refusalForbiddenStatuses[uint64(r.Status)]; bad {
 					return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-						"gridsim received a Response reporting %q for this row's control (mRID=%s) — an "+
-							"execution signal for an axis this product does not execute. All: %s",
+						"gridsim received a Response reporting %q for this row's control (mRID=%s), which "+
+							"this row's outright refusal must never carry. All: %s",
 						what, mridKey, strings.Join(statuses, ", "))}
 				}
-				for _, ok := range refusalStatuses {
-					if r.Status == ok {
-						refused = true
-					}
+				if refusalAcceptedStatus(uint64(r.Status), legacy) {
+					refused, refusedStatus = true, r.Status
 				}
 			}
 			if refused {
-				return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
-					"gridsim received a cannot-comply Response for this row's control (mRID=%s) and no "+
-						"started/completed: %s", mridKey, strings.Join(statuses, ", "))}
+				obs := fmt.Sprintf("gridsim received a cannot-comply Response (status=%d) for this row's "+
+					"control (mRID=%s) and no started/completed/lifecycle status: %s",
+					refusedStatus, mridKey, strings.Join(statuses, ", "))
+				if refusedStatus == 0xF0 {
+					obs += legacyDisclaimer
+				}
+				return Finding{Verdict: certify.Pass, Observed: obs}
 			}
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
 				"gridsim received %d Response(s) for this row's control (mRID=%s), none saying it cannot "+
-					"comply: %s", len(got), mridKey, strings.Join(statuses, ", "))}
+					"comply: %s. The standard answer to a structurally unsupported control is 252 at receipt",
+				len(got), mridKey, strings.Join(statuses, ", "))}
 		},
 	}
 }

@@ -13,6 +13,16 @@
 # lexa-gw's own scripts/check-proto-pin.sh already applies to its --peer
 # array).
 #
+# NOTE 2026-08-17: that graceful skip made the CI job that ALWAYS passes
+# --product explicitly (the checked-out peer's path) go green by vacuity too,
+# not just by lockstep: if the checkout step silently produced an empty/
+# missing directory (bad token, renamed repo, checkout-step typo — none of
+# which are pin mismatches), PRODUCT_FOUND=0 and the job passed anyway,
+# reporting nothing but an informational note nobody in CI reads. --require-
+# peer (below) turns that specific case into a hard failure. It changes
+# nothing for local/dev use, where a missing sibling checkout is still a
+# legitimate, silent skip by default.
+#
 # Replaces TASK-004's raw-diff lockstep gate (scripts/ci/lockstep-check.sh,
 # now deleted): that script byte-diffed internal/southbound/sunspec and
 # internal/ocppserver between this repo and lexa-hub while both trees still
@@ -71,8 +81,26 @@
 # knows which side is which regardless of which repo it's physically running
 # in.
 #
+# DIRTY-PEER GATE (2026-08-17, F2/cross-repo lockstep audit): a clean pin
+# match (proto.pin strings/SHAs agree) says the two repos NAME the same
+# lexa-proto commit -- it says NOTHING about whether the peer checkout's OWN
+# files, in the paths this gate actually reads or ships (proto.pin itself,
+# go.mod/go.sum's require/replace lines, vendor/lexa-proto/), are what is
+# actually COMMITTED there. The audit's root cause was exactly this:
+# uncommitted source in a peer checkout, certified clean by a pin-match PASS
+# that never looked at `git status`. A local edit to proto.pin, go.mod, or a
+# hand-patched vendor/lexa-proto file -- made and never committed -- is
+# invisible to every check above (they all read the peer's WORKING TREE
+# files directly, not its git-committed blobs) and would sail through as a
+# "PASS" that a fresh CI checkout of the same peer could never reproduce.
+# --allow-dirty is the escape hatch for local/dev use (mid-edit on the peer,
+# deliberately), off by default so hosted CI (which always checks out the
+# peer fresh, and should therefore never legitimately see this fire) treats
+# it as a real failure.
+#
 # Usage:
 #   scripts/check-proto-pin.sh [--self <path>] [--product <path>]
+#                               [--require-peer] [--allow-dirty]
 #                               [--proto <path-to-lexa-proto>]
 #                               [--no-proto-check] [--verify-vendor]
 #
@@ -86,7 +114,19 @@
 #                       original other peer, was abandoned 2026-08-03 — see
 #                       the note atop this file). CI always passes this
 #                       explicitly (the checked-out subdirectory). A missing
-#                       peer is an informational skip, not a failure.
+#                       peer is an informational skip, not a failure --
+#                       unless --require-peer is given (below).
+#   --require-peer     A missing/empty --product peer is a FAILURE, not an
+#                       informational skip (2026-08-17, see the NOTE above).
+#                       CI passes this: a hosted job that always checks out a
+#                       specific peer path has no legitimate "no peer"
+#                       case, so a missing checkout there is a checkout-step
+#                       problem, not a normal configuration, and should not
+#                       go green. Off by default for local/dev use, where a
+#                       bare checkout with no sibling repo is legitimate.
+#   --allow-dirty      Downgrade the dirty-peer gate (see the NOTE above)
+#                       from a FAILURE to a printed warning. Off by default;
+#                       intended for local/dev use only -- CI never passes it.
 #   --proto <path>     Path to a local lexa-proto checkout, for the (b)/(c)
 #                       checks. Default: ../lexa-proto relative to --self.
 #   --no-proto-check   Skip (b)/(c) entirely even if --proto exists (fast
@@ -95,11 +135,14 @@
 #                       `go` toolchain and a real --proto checkout. Slow;
 #                       intended for desktop/local runs, not every CI job.
 #
-# Exit codes: 0 = pins match, or no peer was found to compare against (an
-# informational skip, 2026-08-03 -- see the note atop this file), and, unless
-# skipped/unavailable, (b) and any requested (c) check pass too. 1 = pin
-# mismatch, malformed proto.pin (self or a found peer), (b) mismatch, or (c)
-# diff found. 2 = usage error.
+# Exit codes: 0 = pins match, or no peer was found to compare against and
+# --require-peer was not given (an informational skip, 2026-08-03 -- see the
+# note atop this file), and, unless skipped/unavailable, (b) and any
+# requested (c) check pass too. 1 = pin mismatch, malformed proto.pin (self
+# or a found peer), no peer found with --require-peer set, the peer's
+# checkout is dirty in the consumed module paths and --allow-dirty was not
+# given (see the DIRTY-PEER GATE note above), (b) mismatch, or (c) diff
+# found. 2 = usage error.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,6 +153,8 @@ PRODUCT=""
 PROTO=""
 NO_PROTO_CHECK=0
 VERIFY_VENDOR=0
+REQUIRE_PEER=0
+ALLOW_DIRTY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -119,6 +164,10 @@ while [[ $# -gt 0 ]]; do
     --product)
       [[ $# -ge 2 ]] || { echo "check-proto-pin: --product needs a path argument" >&2; exit 2; }
       PRODUCT="$2"; shift 2 ;;
+    --require-peer)
+      REQUIRE_PEER=1; shift ;;
+    --allow-dirty)
+      ALLOW_DIRTY=1; shift ;;
     --proto)
       [[ $# -ge 2 ]] || { echo "check-proto-pin: --proto needs a path argument" >&2; exit 2; }
       PROTO="$2"; shift 2 ;;
@@ -127,7 +176,7 @@ while [[ $# -gt 0 ]]; do
     --verify-vendor)
       VERIFY_VENDOR=1; shift ;;
     -h|--help)
-      sed -n '2,75p' "${BASH_SOURCE[0]}"
+      sed -n '2,145p' "${BASH_SOURCE[0]}"
       exit 0 ;;
     *)
       echo "check-proto-pin: unknown argument: $1" >&2
@@ -170,8 +219,6 @@ read_pin() {
     echo "check-proto-pin: no proto.pin at $file ($label)" >&2
     exit 1
   fi
-  local n
-  n="$(wc -l < "$file" | tr -d '[:space:]')"
   # Allow a file with or without a trailing newline (both count as "one line"
   # of content); reject anything with more than one non-empty line.
   local nonblank
@@ -195,7 +242,21 @@ FAIL=0
 
 if [[ "$PRODUCT_FOUND" -eq 0 ]]; then
   echo "check-proto-pin: $(basename "$SELF")/proto.pin = $SELF_SHA"
-  cat <<EOF
+  if [[ "$REQUIRE_PEER" -eq 1 ]]; then
+    cat >&2 <<EOF
+check-proto-pin: --require-peer set, but no peer consumer repo found at
+'$PRODUCT'. Treating this as a FAILURE, not an informational skip.
+
+lexa-hub, the original second peer, was abandoned 2026-08-03 and its
+checkout archived off-disk; the remaining peer is lexa-gw. A caller that
+passed --require-peer expects a peer checkout to exist at this path --
+check the checkout step (bad token, wrong repo/path, checkout-step failure)
+before assuming this is an actual pin mismatch: it isn't one, there was
+nothing to compare against.
+EOF
+    FAIL=1
+  else
+    cat <<EOF
 check-proto-pin: no peer consumer repo found at '$PRODUCT' -- skipping the
 peer pin comparison (informational only, not a failure).
 
@@ -204,13 +265,58 @@ checkout archived off-disk; the remaining peer is lexa-gw. If this is CI:
 pass --product explicitly with the checked-out peer path (as the proto-pin
 job does). If this is local dev: check out lexa-gw as a sibling (../lexa-gw),
 or pass --product <path-to-peer-repo>. $(basename "$SELF")'s own proto.pin
-is well-formed regardless of whether a peer was found.
+is well-formed regardless of whether a peer was found. (Pass --require-peer
+to make a missing peer a failure instead — CI does.)
 EOF
+  fi
 else
   PRODUCT_SHA="$(read_pin "$PRODUCT" "product: $(basename "$PRODUCT")")"
 
   echo "check-proto-pin: $(basename "$SELF")/proto.pin    = $SELF_SHA"
   echo "check-proto-pin: $(basename "$PRODUCT")/proto.pin = $PRODUCT_SHA"
+
+  # ── DIRTY-PEER GATE (2026-08-17) ──────────────────────────────────────────
+  # A pin match above is a claim about two proto.pin FILES; it says nothing
+  # about whether the peer's own COMMITTED state is what its disk holds. Scope
+  # to the paths this gate's own conclusions actually depend on: proto.pin
+  # (what "PRODUCT_SHA" above just read), go.mod/go.sum (the require/replace
+  # lines that make that pin binding for a build), and vendor/lexa-proto
+  # (what a build actually consumes, AD-003(e)). Anything else uncommitted in
+  # the peer is that peer's own business and out of scope for a PROTO pin
+  # gate. Only meaningful when the peer is a real git checkout -- a tarball
+  # extract or similar (no .git) has no "uncommitted" concept and is skipped,
+  # same graceful-degradation posture the rest of this script uses for a
+  # missing local lexa-proto checkout below.
+  if [[ ! -d "$PRODUCT/.git" ]]; then
+    echo "check-proto-pin: $(basename "$PRODUCT") is not a git checkout (no .git) -- skipping the dirty-peer gate."
+  else
+    DIRTY_OUT="$(git -C "$PRODUCT" status --porcelain -- proto.pin go.mod go.sum vendor/lexa-proto 2>&1 || true)"
+    if [[ -n "$DIRTY_OUT" ]]; then
+      if [[ "$ALLOW_DIRTY" -eq 1 ]]; then
+        cat <<EOF
+check-proto-pin: WARNING -- $(basename "$PRODUCT")'s working tree is dirty in
+the consumed module paths (--allow-dirty set, not failing):
+$DIRTY_OUT
+The proto.pin comparison above reflects what is ON DISK there right now,
+which is NOT necessarily what a fresh checkout of $(basename "$PRODUCT")
+(e.g. a CI runner) would see. Do not treat this PASS as CI-equivalent.
+EOF
+      else
+        cat >&2 <<EOF
+check-proto-pin: FAIL -- $(basename "$PRODUCT")'s working tree is dirty in
+the consumed module paths (proto.pin, go.mod, go.sum, vendor/lexa-proto):
+$DIRTY_OUT
+A pin match against uncommitted peer state is not a real pin match: a fresh
+checkout of $(basename "$PRODUCT") (what hosted CI actually builds) would
+not see these changes, so this PASS would not reproduce there. This is the
+audit's root-cause shape (uncommitted source certified by a clean-pin PASS)
+-- commit or stash the changes above in $(basename "$PRODUCT"), or pass
+--allow-dirty if this is deliberate local/dev mid-edit state.
+EOF
+        FAIL=1
+      fi
+    fi
+  fi
 
   # THE QUESTION IS "THE SAME COMMIT", NOT "THE SAME STRING" (2026-08-15).
   #
@@ -230,22 +336,40 @@ else
   # the fact that this was NOT verified is stated. A 7-hex prefix collision is
   # not a realistic accident, but it is not proof either, and the difference is
   # exactly what the (b) check below upgrades when it can run.
+  # FINDING 7 (2026-08-17): the prefix-equality fallback below is only a
+  # legitimate substitute for checkout-based resolution when at least one
+  # side is a genuinely abbreviated (short) pin -- if BOTH sides are already
+  # full 40-hex SHAs, there is nothing left to abbreviate, so two distinct
+  # full SHAs must never be waved through as "maybe the same commit." (In
+  # practice bash's `==` glob on two equal-length 40-char strings can only
+  # match on exact equality anyway -- branch 1 below already catches that --
+  # but the explicit guard makes the invariant readable instead of relying on
+  # that incidental fact, and the logged PIN_HOW records which mode decided.)
+  SELF_IS_FULL=0; [[ ${#SELF_SHA} -eq 40 ]] && SELF_IS_FULL=1
+  PRODUCT_IS_FULL=0; [[ ${#PRODUCT_SHA} -eq 40 ]] && PRODUCT_IS_FULL=1
+
   PINS_MATCH=0
   PIN_HOW=""
   if [[ "$SELF_SHA" == "$PRODUCT_SHA" ]]; then
     PINS_MATCH=1
-    PIN_HOW="identical"
+    PIN_HOW="identical (mode: exact string match)"
   elif [[ -d "$PROTO/.git" ]] && [[ "$NO_PROTO_CHECK" -eq 0 ]]; then
     SELF_FULL="$(git -C "$PROTO" rev-parse --verify "${SELF_SHA}^{commit}" 2>/dev/null || true)"
     PRODUCT_FULL="$(git -C "$PROTO" rev-parse --verify "${PRODUCT_SHA}^{commit}" 2>/dev/null || true)"
     if [[ -n "$SELF_FULL" && "$SELF_FULL" == "$PRODUCT_FULL" ]]; then
       PINS_MATCH=1
-      PIN_HOW="different abbreviations of $SELF_FULL, resolved against $PROTO"
+      PIN_HOW="different abbreviations of $SELF_FULL, resolved against $PROTO (mode: checkout-resolved)"
     fi
+  elif [[ "$SELF_IS_FULL" -eq 1 && "$PRODUCT_IS_FULL" -eq 1 ]]; then
+    : # Both are full SHAs and unequal (branch 1 above already ruled out
+      # equality) and no checkout was available to resolve further -- a real
+      # mismatch. PINS_MATCH stays 0; falls through to the report below.
+      # Deliberately NOT eligible for the prefix-fallback branch next: that
+      # branch exists only for the short-pin case.
   elif [[ "$SELF_SHA" == "$PRODUCT_SHA"* || "$PRODUCT_SHA" == "$SELF_SHA"* ]]; then
     PINS_MATCH=1
     PIN_HOW="one is a prefix of the other, and NO lexa-proto checkout was available to resolve them --
-                            treated as the same commit, NOT verified to be"
+                            treated as the same commit, NOT verified to be (mode: prefix fallback, unverified)"
   fi
 
   if [[ "$PINS_MATCH" -eq 0 ]]; then
@@ -367,16 +491,41 @@ EOF
       else
         # go mod vendor drops _test.go files and non-build sources; ignore
         # the same categories here so we compare what actually ships.
-        DIFF_OUT="$(diff -rq \
-          -x '*_test.go' \
-          "$TMP_CONSUMER/vendor/lexa-proto" "$SELF/vendor/lexa-proto" || true)"
-        if [[ -n "$DIFF_OUT" ]]; then
-          echo "check-proto-pin: committed vendor/lexa-proto does NOT match a fresh 'go mod vendor' at the pinned SHA:" >&2
-          echo "$DIFF_OUT" >&2
-          echo "Regenerate: (cd $SELF && GOWORK=off go mod vendor) with ../lexa-proto checked out at $SELF_SHA, then commit." >&2
+        #
+        # FINDING 1 (2026-08-17, adversarial pin-gate review): the old
+        # `diff -rq ... || true` captured stdout only -- diff's "No such
+        # file or directory" (rc=2) goes to stderr, so a MISSING compared
+        # tree (e.g. `go mod vendor` silently producing nothing under
+        # vendor/lexa-proto, or a bogus $SELF/vendor/lexa-proto path) left
+        # DIFF_OUT empty and this step PASSED. Proven: a planted
+        # vendor/lexa-platform/bus/backdoor.go was certified as matching the
+        # pin because the comparison directory was absent, not because it
+        # matched. Fixed: verify both compared directories exist BEFORE
+        # diffing, then test diff's exit status directly (rc=0 match, rc=1
+        # mismatch, rc>=2 error) instead of discarding it with `|| true`.
+        # ANY nonzero rc is now a FAILURE, not just rc=1.
+        if [[ ! -d "$TMP_CONSUMER/vendor/lexa-proto" ]]; then
+          echo "check-proto-pin: --verify-vendor: regenerated tree missing at $TMP_CONSUMER/vendor/lexa-proto ('go mod vendor' did not produce it) -- treating as FAILURE, not a pass." >&2
+          FAIL=1
+        elif [[ ! -d "$SELF/vendor/lexa-proto" ]]; then
+          echo "check-proto-pin: --verify-vendor: committed tree missing at $SELF/vendor/lexa-proto -- treating as FAILURE, not a pass." >&2
           FAIL=1
         else
-          echo "check-proto-pin: committed vendor/lexa-proto matches a fresh regeneration from the pinned SHA."
+          DIFF_RC=0
+          DIFF_OUT="$(diff -rq -x '*_test.go' \
+            "$TMP_CONSUMER/vendor/lexa-proto" "$SELF/vendor/lexa-proto" 2>&1)" || DIFF_RC=$?
+          if [[ "$DIFF_RC" -ne 0 ]]; then
+            if [[ "$DIFF_RC" -ge 2 ]]; then
+              echo "check-proto-pin: --verify-vendor: 'diff' itself failed (exit $DIFF_RC), not merely found a difference -- treating as FAILURE, not a pass:" >&2
+            else
+              echo "check-proto-pin: committed vendor/lexa-proto does NOT match a fresh 'go mod vendor' at the pinned SHA:" >&2
+            fi
+            echo "$DIFF_OUT" >&2
+            echo "Regenerate: (cd $SELF && GOWORK=off go mod vendor) with ../lexa-proto checked out at $SELF_SHA, then commit." >&2
+            FAIL=1
+          else
+            echo "check-proto-pin: committed vendor/lexa-proto matches a fresh regeneration from the pinned SHA."
+          fi
         fi
       fi
 

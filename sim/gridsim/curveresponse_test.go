@@ -45,11 +45,12 @@ func TestAdminCurve_ControlAsksForTheResponseLifecycle(t *testing.T) {
 
 	raw := serveRaw(t, s, "/derp/0/derc")
 
-	// responseRequired: bit 0 (message received) and bit 1 (specific response).
-	// Without bit 1 nothing obliges a conformant client to ever report status=2,
-	// which is the citation the campaign's curve evidence leans on.
-	if !strings.Contains(raw, `responseRequired="03"`) {
-		t.Errorf("the curve-bound control does not carry responseRequired=03; a DUT that answers it with "+
+	// responseRequired: bit 0 (message received), bit 1 (specific response),
+	// and (F7/#18, catalog fidelity) bit 2 (customer response) — 0x07.
+	// Without bit 1 nothing obliges a conformant client to ever report
+	// status=2, which is the citation the campaign's curve evidence leans on.
+	if !strings.Contains(raw, `responseRequired="07"`) {
+		t.Errorf("the curve-bound control does not carry responseRequired=07; a DUT that answers it with "+
 			"silence is behaving CORRECTLY and every Response criterion on a curve row would be "+
 			"grading the bench's own omission:\n%s", raw)
 	}
@@ -99,7 +100,7 @@ func TestAdminCurve_MatchesWhatAdminControlSends(t *testing.T) {
 	curveRaw := serveRaw(t, curve, "/derp/0/derc")
 
 	for _, attr := range []string{
-		`responseRequired="03"`,
+		`responseRequired="07"`,
 		`replyTo="` + adminResponseReplyTo + `"`,
 	} {
 		if strings.Contains(scalarRaw, attr) != strings.Contains(curveRaw, attr) {
@@ -108,7 +109,7 @@ func TestAdminCurve_MatchesWhatAdminControlSends(t *testing.T) {
 		}
 	}
 	// And the default really is the constant, not a literal that drifted.
-	if want := model.ResponseRequired(adminDefaultResponseRequired); uint8(want) != 0x03 {
-		t.Fatalf("adminDefaultResponseRequired = %#x; this row's literals assume 0x03", uint8(want))
+	if want := model.ResponseRequired(adminDefaultResponseRequired); uint8(want) != 0x07 {
+		t.Fatalf("adminDefaultResponseRequired = %#x; this row's literals assume 0x07", uint8(want))
 	}
 }

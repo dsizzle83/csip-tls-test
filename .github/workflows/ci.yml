@@ -102,18 +102,98 @@ name: CI
 #     to check-proto-pin.sh, so a stale/hand-edited vendor/lexa-proto tree
 #     fails the job, not just a proto.pin SHA mismatch (closes the gap in
 #     that script's own header comment: "(a) can pass with a stale vendor
-#     tree"). It is a no-op today: --verify-vendor needs a local lexa-proto
-#     checkout to regenerate-and-diff against, and lexa-proto has no hosted
-#     remote yet (AD-003(f), open human item, HANDOFF §6) — no hosted runner
-#     can fetch it, so the script's own graceful-degrade path ("no local
-#     lexa-proto checkout -- skipping") is what actually runs. This is wired
-#     and ready: the day lexa-proto gets hosted and a checkout step is added
-#     here, --verify-vendor starts enforcing with no further script changes.
+#     tree"). AS WRITTEN AT THE TIME THIS BULLET WAS FIRST ADDED it was a
+#     no-op: --verify-vendor needs a local lexa-proto checkout to
+#     regenerate-and-diff against, and no hosted runner had one, so the
+#     script's own graceful-degrade path ("no local lexa-proto checkout --
+#     skipping") ran silently instead — see FINDING 3 below (2026-08-17):
+#     that gap is now closed, the peer clone steps make --verify-vendor
+#     actually run on hosted runners.
+#
+# 2026-08-17: `proto-pin` retargeted from lexa-hub (ABANDONED 2026-08-03,
+# product decision: single-product focus on lexa-gw — see
+# scripts/check-proto-pin.sh's NOTE 2026-08-03) to lexa-gw, and made
+# non-vacuous:
+#   - The second checkout is now `dsizzle83/lexa-gw` (path `lexa-gw`), via a
+#     NEW fine-grained PAT secret, `LEXA_GW_RO_TOKEN` (same shape as the old
+#     LEXA_HUB_RO_TOKEN above: read-only, Contents-only, restricted to
+#     dsizzle83/lexa-gw, expiry set at creation) — this secret does not exist
+#     yet and must be created by the repo owner before this job can pass its
+#     checkout step; until then it fails there, not on an actual pin
+#     mismatch. LEXA_HUB_RO_TOKEN can be retired once this is confirmed
+#     working (left alone here, not this task's job).
+#   - The check step passes `--product lexa-gw` (was `--product lexa-hub`)
+#     and now also `--require-peer`: check-proto-pin.sh's --product default
+#     already pointed at ../lexa-gw and a missing peer was only an
+#     informational skip (2026-08-03 note in that script), which made THIS
+#     job — the one that always passes --product explicitly — green by
+#     vacuity if the checkout step above ever silently produced an empty
+#     directory. --require-peer turns that specific case into a real
+#     failure; see the script's own 2026-08-17 note for the full rationale.
+#   - A second check step now runs scripts/check-platform-pin.sh
+#     --self . --product lexa-gw --require-peer --verify-vendor, the
+#     platform.pin analogue of the proto.pin check above (same script-header
+#     rationale: nothing checked platform.pin against the peer before this,
+#     even though csip-tls-test commits its own platform.pin and vendors
+#     lexa-platform exactly like it does lexa-proto). See that script's
+#     header for a documented real mismatch this closes the vacuity gap on:
+#     as of this writing csip-tls-test pins lexa-platform @ 71bb2d5 and
+#     lexa-gw pins @ 0a61b0d (71bb2d5's immediate parent) — genuine drift,
+#     not a mismatch this task introduced or fixed.
+#
+# 2026-08-17 (second wave, adversarial pin-gate review): three more HIGH
+# findings against the wave above, all in the `proto-pin` job:
+#   - FINDING 2: the lexa-gw peer checkout pinned no `ref:`, so it always
+#     resolved to lexa-gw's default branch (main) — the gate compared THIS
+#     repo's pins against lexa-gw@main regardless of which lexa-gw branch/SHA
+#     was actually under review. Fixed: the checkout now takes
+#     `ref: ${{ vars.LEXA_GW_PIN_REF || 'main' }}`, plus a log step that
+#     prints the resolved peer HEAD so a wrong-ref comparison is at least
+#     diagnosable. OWNER ACTION: set repository variable
+#     `LEXA_GW_PIN_REF=remediation/rc0-failsafe-core` for the duration of
+#     this remediation (Settings > Secrets and variables > Actions >
+#     Variables); reset to `main`/delete once that branch merges.
+#   - FINDING 3: --verify-vendor was unreachable on every hosted run (see the
+#     WS-7 bullet above, now corrected) — the step names claimed vendor
+#     verification while the script's own no-checkout skip path is what
+#     always actually ran. Fixed the same way lexa-gw's own ci.yml
+#     `pin-check` job (~lines 352-419 there) already does it: authenticated
+#     PAT clones of lexa-proto and lexa-platform into the sibling paths
+#     (../lexa-proto, ../lexa-platform) the scripts already default to.
+#     OWNER ACTION (new secret): create repository secret
+#     `LEXA_PIN_VERIFY_TOKEN` — a fine-grained PAT, read-only Contents,
+#     scoped to dsizzle83/lexa-proto and dsizzle83/lexa-platform. The exact
+#     same token lexa-gw's repo already uses under that name for its own
+#     `pin-check` job works unchanged here; it just needs adding as a secret
+#     under THIS repo's Settings too (Actions secrets don't cross repos even
+#     under one owner). Job fails loud at a dedicated check step if unset,
+#     rather than silently skipping verification.
+#   - FINDING 5: the proto-pin job had no `actions/setup-go` step at all,
+#     even though --verify-vendor runs `go mod vendor`. Added, matching the
+#     other jobs' `go-version-file: go.mod` / `cache: true`.
+#
+# FINDING 7 (2026-08-17, same review, hygiene + one more HIGH-adjacent item):
+#   (a) scripts/check-proto-pin.sh and scripts/check-platform-pin.sh's
+#       prefix-equality fallback (used only when no local checkout is
+#       available to resolve abbreviated SHAs) now explicitly refuses to
+#       treat two full 40-hex SHAs as a possible prefix match — only
+#       eligible when at least one side is a genuinely short pin — and logs
+#       which resolution mode decided the result.
+#   (b) `remediation/**` added to the `push:` branch list above (a
+#       remediation branch pushed to directly, with no PR against main, never
+#       triggered this workflow before).
+#   (c) the dead `n=$(wc -l ...)` in check-proto-pin.sh's read_pin() removed
+#       (unused; nonblank-line count already does the real validation).
 
 on:
   pull_request:
   push:
-    branches: [main]
+    # FINDING 7 (2026-08-17, adversarial pin-gate review): `remediation/**`
+    # added so pushes to a remediation branch (not just PRs targeting main)
+    # run CI directly -- pin-gate fixes have been landing and getting
+    # verified on remediation/* branches without ever opening a PR against
+    # main, which meant `push:` alone never triggered a run on them.
+    branches: [main, remediation/**]
   schedule:
     - cron: '17 4 * * *' # nightly vuln scan (UTC); see `vulncheck` job below
 
@@ -352,19 +432,127 @@ jobs:
       - name: Checkout csip-tls-test (bench, this repo)
         uses: actions/checkout@v4
 
-      - name: Checkout lexa-hub (product) read-only
+      - uses: actions/setup-go@v5
+        # FINDING 5 (2026-08-17): this job had no Go toolchain at all, even
+        # though --verify-vendor below runs `go mod vendor` -- it could only
+        # ever have hit the script's own "no go toolchain" style failure once
+        # a real vendor regeneration was reachable (see FINDING 3). Matches
+        # the pure-go/cgo-fast/vulncheck jobs' Go version above.
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Checkout lexa-gw (product) read-only, at the pinned review ref
+        # FINDING 2 (2026-08-17): this checkout previously pinned no ref, so
+        # it always resolved to lexa-gw's default branch (main) regardless of
+        # which lexa-gw branch/SHA was actually under review -- the gate
+        # compared THIS repo's pins against lexa-gw@main forever, even on a
+        # PR meant to validate against a specific lexa-gw remediation branch.
+        # scripts/check-proto-pin.sh / check-platform-pin.sh read the peer's
+        # proto.pin/platform.pin from whatever this checkout's HEAD is, so
+        # the ref landed here IS the peer side of the comparison.
+        #
+        # Fix: pin the checkout to the `LEXA_GW_PIN_REF` repository variable,
+        # falling back to `main` when it is unset (keeps today's default
+        # behavior for normal operation). OWNER ACTION: set the repository
+        # variable LEXA_GW_PIN_REF to the release/remediation branch under
+        # test (currently remediation/rc0-failsafe-core) for the duration of
+        # this remediation -- Settings > Secrets and variables > Actions >
+        # Variables > New repository variable. Reset it to `main` (or delete
+        # it) once that branch has merged.
         uses: actions/checkout@v4
         with:
-          repository: dsizzle83/lexa-hub
-          token: ${{ secrets.LEXA_HUB_RO_TOKEN }}
-          path: lexa-hub
+          repository: dsizzle83/lexa-gw
+          token: ${{ secrets.LEXA_GW_RO_TOKEN }}
+          path: lexa-gw
+          ref: ${{ vars.LEXA_GW_PIN_REF || 'main' }}
+
+      - name: log resolved lexa-gw peer ref + HEAD (diagnose a wrong-ref comparison)
+        # FINDING 2, continued: pinning the ref removes the silent-main
+        # failure mode, but a wrong LEXA_GW_PIN_REF (typo, stale branch name)
+        # is still possible -- print what was actually requested and what it
+        # actually resolved to so a bad comparison is at least diagnosable
+        # from the job log instead of silently comparing the wrong lexa-gw
+        # state.
+        run: |
+          echo "proto-pin: LEXA_GW_PIN_REF = '${{ vars.LEXA_GW_PIN_REF || '(unset, defaulted to main)' }}'"
+          echo "proto-pin: lexa-gw peer checkout resolved HEAD = $(git -C lexa-gw rev-parse HEAD)"
+          git -C lexa-gw log -1 --oneline
+
+      # FINDING 3 (2026-08-17): --verify-vendor below has been unreachable on
+      # every hosted run since it was added -- no hosted runner has a local
+      # lexa-proto or lexa-platform checkout (neither module is hosted with
+      # an ordinary fetchable remote), so check-proto-pin.sh's own graceful
+      # degrade path ("no local lexa-proto checkout -- skipping") is what
+      # actually ran every time, silently, while the step name ("... + vendor
+      # content verify") claimed verification happened. lexa-gw's own
+      # .github/workflows/ci.yml `pin-check` job (~lines 352-419) already
+      # solves this exact shape: clone both private modules directly with an
+      # authenticated PAT clone (not a hosted "remote fetch") into the sibling
+      # layout the scripts default to (../lexa-proto, ../lexa-platform
+      # relative to $GITHUB_WORKSPACE, i.e. --self's parent). Ported here
+      # verbatim (same clone_pinned shape, same auth pattern) so
+      # --verify-vendor actually runs instead of quietly no-op'ing.
+      - name: require sibling-repo access token (lexa-proto, lexa-platform)
+        # The secrets context is not available in step `if:` conditionals, so
+        # the emptiness check lives in bash (same pattern lexa-gw's ci.yml
+        # uses for the equivalent check).
+        env:
+          PIN_VERIFY_TOKEN: ${{ secrets.LEXA_PIN_VERIFY_TOKEN }}
+        run: |
+          if [ -z "$PIN_VERIFY_TOKEN" ]; then
+            echo "::error::proto-pin needs read access to the private dsizzle83/lexa-proto and dsizzle83/lexa-platform repos to actually run --verify-vendor (FINDING 3), and the LEXA_PIN_VERIFY_TOKEN repository secret is not set."
+            echo "::error::OWNER ACTION: create a fine-grained PAT scoped to read-only Contents on dsizzle83/lexa-proto and dsizzle83/lexa-platform (or a classic PAT with repo scope on both -- the SAME token lexa-gw's own ci.yml already uses as LEXA_PIN_VERIFY_TOKEN works unchanged here, it only needs adding as a secret under THIS repo's Settings too, since Actions secrets do not cross repos even under one owner), then add it as the LEXA_PIN_VERIFY_TOKEN secret under this repo's Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: clone pinned lexa-proto + lexa-platform (read-only, siblings of the checkout)
+        # Clone both pinned repos as siblings of the csip-tls-test checkout
+        # (../lexa-proto, ../lexa-platform relative to $GITHUB_WORKSPACE) --
+        # the exact layout scripts/check-proto-pin.sh's --proto and
+        # scripts/check-platform-pin.sh's --checkout already default to
+        # (relative to --self, passed as "." below), so no override flag is
+        # needed on the check steps. Same clone-then-checkout-pin shape as
+        # lexa-gw's own ci.yml pin-check job; auth follows the same
+        # http.extraheader pattern actions/checkout itself uses (bearer
+        # credential via git config, never embedded in a printable/loggable
+        # URL).
+        env:
+          PIN_VERIFY_TOKEN: ${{ secrets.LEXA_PIN_VERIFY_TOKEN }}
+        run: |
+          set -euo pipefail
+          AUTH_HEADER="$(printf 'x-access-token:%s' "$PIN_VERIFY_TOKEN" | base64 -w0)"
+          clone_pinned() {
+            local repo="$1" pin_file="$2" dest="$3" sha
+            sha="$(tr -d '[:space:]' < "$pin_file")"
+            git -c http.extraheader="AUTHORIZATION: basic ${AUTH_HEADER}" \
+              clone --filter=blob:none "https://github.com/dsizzle83/${repo}.git" "$dest"
+            # Blobless clone => `checkout <pinned sha>` lazy-fetches any blob
+            # not on the default branch HEAD from the promisor remote. A `-c`
+            # on the clone command alone does not persist, so once the
+            # sibling's HEAD advances past the pin that lazy fetch would run
+            # unauthenticated and die -- persist the header in the clone's
+            # local config so every later fetch in this tree is authed too.
+            git -C "$dest" config http.extraheader "AUTHORIZATION: basic ${AUTH_HEADER}"
+            git -C "$dest" checkout --quiet "$sha"
+          }
+          clone_pinned lexa-proto    proto.pin    ../lexa-proto
+          clone_pinned lexa-platform platform.pin ../lexa-platform
 
       - name: proto.pin version-pin check + vendor content verify (fails on mismatch — no allowlist)
-        # --verify-vendor (WS-7) replaces --no-proto-check: today it still
-        # degrades to a no-op (no lexa-proto sibling checkout exists on this
-        # runner — see the WS-7 note above `on:`), but the pin-vs-pin compare
-        # (the part that actually enforces today) is unchanged.
-        run: bash scripts/check-proto-pin.sh --self . --product lexa-hub --verify-vendor
+        # --verify-vendor is now LIVE (FINDING 3): ../lexa-proto and
+        # ../lexa-platform are real clones checked out at their respective
+        # pins (previous step), so check-proto-pin.sh's (b)/(c) checks run
+        # for real instead of degrading to the "no local checkout" skip.
+        # --require-peer (2026-08-17, prior wave) turns a missing/empty
+        # lexa-gw checkout above into a hard failure instead of the
+        # informational skip the script defaults to for local/dev use.
+        run: bash scripts/check-proto-pin.sh --self . --product lexa-gw --require-peer --verify-vendor
+
+      - name: platform.pin version-pin check + vendor content verify (fails on mismatch — no allowlist)
+        # Platform.pin analogue of the proto.pin step above. --verify-vendor
+        # is now LIVE for the same reason (FINDING 3).
+        run: bash scripts/check-platform-pin.sh --self . --product lexa-gw --require-peer --verify-vendor
 
   # TASK-048: nightly go-native fuzzing of the client-side IEEE 2030.5 XML
   # unmarshal entry points in internal/csipref/discovery — this repo's own
