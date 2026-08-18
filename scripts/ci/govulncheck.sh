@@ -35,6 +35,18 @@ cd "$REPO_ROOT"
 # and re-running the triage in docs/refactor/VULN_BASELINE_*.md.
 GOVULNCHECK_VERSION="v1.5.0"
 
+# The stdlib the scan grades against is the toolchain that loads the
+# packages, and govulncheck's loader does not reliably honor go.mod's
+# toolchain directive through GOTOOLCHAIN=auto (observed 2026-08-18:
+# directive go1.26.6 present, scan still graded the PATH toolchain's
+# 1.26.5 stdlib and reported six already-fixed advisories). Derive the
+# pin from go.mod so local runs and CI grade the same stdlib.
+MOD_TOOLCHAIN="$(awk '/^toolchain /{print $2}' go.mod)"
+if [ -n "$MOD_TOOLCHAIN" ]; then
+  export GOTOOLCHAIN="$MOD_TOOLCHAIN"
+  echo "== GOTOOLCHAIN=$MOD_TOOLCHAIN (from go.mod toolchain directive) =="
+fi
+
 ALLOWLIST_FILE="$HERE/vuln-allowlist.txt"
 
 GOBIN_DIR="$(go env GOPATH)/bin"

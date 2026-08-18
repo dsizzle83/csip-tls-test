@@ -353,6 +353,9 @@ jobs:
           version: v2.12.2
           only-new-issues: true
 
+      - name: generate gitignored test certs (sim/tlsserver + internal/tlsclient testdata)
+        run: make gen-test-certs
+
       - name: make test-fast (cgo compiles; TLS-handshake tests inside stay integration-tagged)
         run: make test-fast WOLFSSL_SYSROOT="$WOLFSSL_SYSROOT"
 

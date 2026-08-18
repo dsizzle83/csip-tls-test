@@ -2,6 +2,8 @@ module csip-tls-test
 
 go 1.26
 
+toolchain go1.26.6
+
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/grandcat/zeroconf v1.0.0
