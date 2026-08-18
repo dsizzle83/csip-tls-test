@@ -311,7 +311,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.WOLFSSL_SYSROOT }}
-          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v2
+          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v3
 
       - name: Install wolfSSL build toolchain
         if: steps.cache-wolfssl.outputs.cache-hit != 'true'
@@ -332,11 +332,13 @@ jobs:
           "/tmp/wolfssl-${WOLFSSL_VERSION}/configure" \
             --prefix="$WOLFSSL_SYSROOT" \
             --enable-tls13 --enable-aesccm --enable-tlsx \
-            --enable-maxfragment --enable-secure-renegotiation \
-            --enable-session-ticket \
             --enable-certgen --enable-opensslall \
+            --enable-maxfragment --enable-secure-renegotiation \
+            --enable-session-ticket --enable-cryptocb \
+            --enable-sessioncerts --enable-ticket-nonce-malloc \
             --enable-static --disable-shared \
-            --disable-examples --disable-crypttests
+            --disable-examples --disable-crypttests \
+            --enable-reproducible-build
           make -j"$(nproc)"
           make install prefix="$WOLFSSL_SYSROOT"
 
@@ -385,7 +387,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.WOLFSSL_SYSROOT }}
-          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v2
+          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v3
 
       - name: Install wolfSSL build toolchain
         if: steps.cache-wolfssl.outputs.cache-hit != 'true'
@@ -406,11 +408,13 @@ jobs:
           "/tmp/wolfssl-${WOLFSSL_VERSION}/configure" \
             --prefix="$WOLFSSL_SYSROOT" \
             --enable-tls13 --enable-aesccm --enable-tlsx \
-            --enable-maxfragment --enable-secure-renegotiation \
-            --enable-session-ticket \
             --enable-certgen --enable-opensslall \
+            --enable-maxfragment --enable-secure-renegotiation \
+            --enable-session-ticket --enable-cryptocb \
+            --enable-sessioncerts --enable-ticket-nonce-malloc \
             --enable-static --disable-shared \
-            --disable-examples --disable-crypttests
+            --disable-examples --disable-crypttests \
+            --enable-reproducible-build
           make -j"$(nproc)"
           make install prefix="$WOLFSSL_SYSROOT"
 
