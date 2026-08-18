@@ -47,7 +47,7 @@ func caseOf(t *testing.T, cat *Catalog, uid string, params map[string]string) *R
 func TestParamScopedToACaseBeatsTheGlobalOne(t *testing.T) {
 	cat := loadTestCatalog(t)
 	params := map[string]string{
-		"csip.wait":           "30s",
+		"csip.wait":              "30s",
 		"doc-a::A-001:csip.wait": "8m",
 	}
 

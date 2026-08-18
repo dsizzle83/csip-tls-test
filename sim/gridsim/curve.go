@@ -1259,7 +1259,7 @@ func curveOpenLoopTms(v *int64) (*uint16, error) {
 	if *v < 0 || *v > 65535 {
 		return nil, fmt.Errorf("DERCurve.openLoopTms %d is outside UInt16's wire domain [0,65535] "+
 			"(IEEE Std 2030.5-2018 p.253, DERCurve.openLoopTms: the unit is hundredths of a "+
-				"second, and a value of 0 means no limit)", *v)
+			"second, and a value of 0 means no limit)", *v)
 	}
 	n := uint16(*v)
 	return &n, nil

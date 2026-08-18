@@ -159,9 +159,9 @@ type TestCaseResult struct {
 	// case is NON-certifiable, and read through BearsOnClaim below, which
 	// treats an absent marker as "certifiable" and therefore leaves every older
 	// bundle's meaning unchanged.
-	NonCertifiable bool   `json:"non_certifiable,omitempty"`
-	Notes          string `json:"notes,omitempty"`
-	Assertions []Assertion `json:"assertions"`
+	NonCertifiable bool        `json:"non_certifiable,omitempty"`
+	Notes          string      `json:"notes,omitempty"`
+	Assertions     []Assertion `json:"assertions"`
 }
 
 // RollUp returns the worst verdict among the assertions, which is what

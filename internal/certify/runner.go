@@ -1381,8 +1381,8 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 			// Written only when the case is NON-certifiable, so a bundle from a
 			// campaign of published procedures is byte-identical to before.
 			NonCertifiable: c.Case.Certifiable != nil && !*c.Case.Certifiable,
-			Notes:      caseNotes(c),
-			Assertions: c.Assertions,
+			Notes:          caseNotes(c),
+			Assertions:     c.Assertions,
 		})
 	}
 	out, err := b.Write(dir)

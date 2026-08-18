@@ -125,12 +125,12 @@ type cli struct {
 	opts certify.Options
 
 	// Mode selectors.
-	list   bool
-	verify string
-	report string
-	writes string
-	writesMRID string
-	writesUntil string
+	list         bool
+	verify       string
+	report       string
+	writes       string
+	writesMRID   string
+	writesUntil  string
 	writesSettle time.Duration
 	// trr names the evidence bundles a Test Results Report package is built
 	// from, each optionally narrowed to some of its documents as `dir=<doc-key>`.

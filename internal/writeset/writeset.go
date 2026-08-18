@@ -125,14 +125,14 @@ type Options struct {
 
 // Write is one register-writing Modbus request, as it appeared on the wire.
 type Write struct {
-	Time  time.Time
-	Frame int    // 1-based capture frame index that delivered the ADU's first byte
-	Flow  string // "src > dst"
-	TLS   bool   // recovered from inside TLS
-	Unit  uint8
-	FC    uint8
-	Addr  uint16
-	Count uint16
+	Time   time.Time
+	Frame  int    // 1-based capture frame index that delivered the ADU's first byte
+	Flow   string // "src > dst"
+	TLS    bool   // recovered from inside TLS
+	Unit   uint8
+	FC     uint8
+	Addr   uint16
+	Count  uint16
 	Values []uint16
 
 	// Model / ModelBase are the SunSpec block this address falls in, derived
@@ -255,13 +255,13 @@ func (w *Window) covers(t time.Time) bool {
 
 // Result is one extraction.
 type Result struct {
-	Capture  string
-	KeyLog   string
-	Chain    []Block
-	Writes   []Write // every write found, in wire order
-	MRID     string
-	Window   *Window // nil when no mRID was given
-	Excluded int     // writes outside the window, when an mRID was given
+	Capture     string
+	KeyLog      string
+	Chain       []Block
+	Writes      []Write // every write found, in wire order
+	MRID        string
+	Window      *Window // nil when no mRID was given
+	Excluded    int     // writes outside the window, when an mRID was given
 	CoResidents []CoResident
 	Notes       []string
 }

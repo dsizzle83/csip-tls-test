@@ -27,7 +27,6 @@ import (
 	"time"
 )
 
-
 // seqr hands out correct running TCP sequence numbers per direction. Hardcoding
 // them leaves holes in the reassembled stream, and a stream with a hole is a
 // stream the ADU walker cannot finish — which looks exactly like "the tool
@@ -361,12 +360,12 @@ func runTLS(t *testing.T, clientSays, serverSays []byte) tlsFixture {
 		t.Fatal(err)
 	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "localhost"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-		DNSNames:     []string{"localhost"},
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		DNSNames:              []string{"localhost"},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		BasicConstraintsValid: true, IsCA: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)

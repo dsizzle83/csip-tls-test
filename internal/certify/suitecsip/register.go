@@ -190,8 +190,8 @@ const (
 	noOpenLoopTmsRegisterLegacy = "the legacy 12x banks carry no open-loop response register: 126 " +
 		"declares Crv.RmpTms and 132/134 declare Crv.RmpPt1Tms, and BOTH are documented in their own " +
 		"model definitions as \"the time of the PT1 ... to accomplish a change of 95%\" — a PT1 FILTER " +
-		"time constant, which is IEEE Std 2030.5-2018's rampPT1Tms (p.253: \"the configuration parameter "+
-		"for a low-pass filter, PT1 is a time ... in which the filter will settle to 95% of a step "+
+		"time constant, which is IEEE Std 2030.5-2018's rampPT1Tms (p.253: \"the configuration parameter " +
+		"for a low-pass filter, PT1 is a time ... in which the filter will settle to 95% of a step " +
 		"change\"), a SEPARATE element of the same DERCurve from openLoopTms (p.253). Writing " +
 		"an openLoopTms into it would command a different behaviour under a name that sounds alike, which " +
 		"is the substitution this suite refuses. So on this generation the element is SERVED northbound " +

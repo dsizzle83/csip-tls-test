@@ -89,10 +89,10 @@ func TestDefaultDERControlDoesNotEngageConnectOrEnergize(t *testing.T) {
 // gets exactly that value, rather than inheriting one nobody chose.
 func TestDefaultDERControlConnectEnergizeLever(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		body          string
-		wantConnect   string // "" = element must be absent
-		wantEnergize  string
+		name         string
+		body         string
+		wantConnect  string // "" = element must be absent
+		wantEnergize string
 	}{
 		{
 			name: "absent by default (no POST at all)",

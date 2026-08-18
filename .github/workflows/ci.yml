@@ -89,7 +89,7 @@ name: CI
 #     CGO_ENABLED=0 to keep proving the pure-Go build is actually pure.
 #   - `cgo-fast` gains a golangci-lint step (basic/default preset — no
 #     .golangci.yml, so just errcheck/govet/ineffassign/staticcheck/unused —
-#     pinned golangci-lint v2.1.6 via the pinned golangci-lint-action, reusing
+#     pinned golangci-lint v2.12.2 via the pinned golangci-lint-action, reusing
 #     this job's already-built wolfSSL sysroot so the whole module lints
 #     cleanly including the cgo packages). `only-new-issues: true`: a
 #     full-repo baseline run today surfaces ~73 pre-existing issues (mostly
@@ -311,7 +311,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.WOLFSSL_SYSROOT }}
-          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v1
+          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v2
 
       - name: Install wolfSSL build toolchain
         if: steps.cache-wolfssl.outputs.cache-hit != 'true'
@@ -332,6 +332,8 @@ jobs:
           "/tmp/wolfssl-${WOLFSSL_VERSION}/configure" \
             --prefix="$WOLFSSL_SYSROOT" \
             --enable-tls13 --enable-aesccm --enable-tlsx \
+            --enable-maxfragment --enable-secure-renegotiation \
+            --enable-session-ticket \
             --enable-certgen --enable-opensslall \
             --enable-static --disable-shared \
             --disable-examples --disable-crypttests
@@ -346,7 +348,7 @@ jobs:
       - name: golangci-lint (basic preset, new issues only — WS-7, see note above `on:`)
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.1.6
+          version: v2.12.2
           only-new-issues: true
 
       - name: make test-fast (cgo compiles; TLS-handshake tests inside stay integration-tagged)
@@ -383,7 +385,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.WOLFSSL_SYSROOT }}
-          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v1
+          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v2
 
       - name: Install wolfSSL build toolchain
         if: steps.cache-wolfssl.outputs.cache-hit != 'true'
@@ -404,6 +406,8 @@ jobs:
           "/tmp/wolfssl-${WOLFSSL_VERSION}/configure" \
             --prefix="$WOLFSSL_SYSROOT" \
             --enable-tls13 --enable-aesccm --enable-tlsx \
+            --enable-maxfragment --enable-secure-renegotiation \
+            --enable-session-ticket \
             --enable-certgen --enable-opensslall \
             --enable-static --disable-shared \
             --disable-examples --disable-crypttests
