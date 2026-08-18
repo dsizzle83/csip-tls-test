@@ -193,7 +193,7 @@ on:
     # run CI directly -- pin-gate fixes have been landing and getting
     # verified on remediation/* branches without ever opening a PR against
     # main, which meant `push:` alone never triggered a run on them.
-    branches: [main, remediation/**]
+    branches: [main, remediation/**, qa/**]
   schedule:
     - cron: '17 4 * * *' # nightly vuln scan (UTC); see `vulncheck` job below
 
