@@ -311,7 +311,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.WOLFSSL_SYSROOT }}
-          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v3
+          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v4
 
       - name: Install wolfSSL build toolchain
         if: steps.cache-wolfssl.outputs.cache-hit != 'true'
@@ -335,7 +335,7 @@ jobs:
             --enable-certgen --enable-opensslall \
             --enable-maxfragment --enable-secure-renegotiation \
             --enable-session-ticket --enable-cryptocb \
-            --enable-sessioncerts --enable-ticket-nonce-malloc \
+            --enable-sessioncerts \
             --enable-static --disable-shared \
             --disable-examples --disable-crypttests \
             --enable-reproducible-build
@@ -387,7 +387,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.WOLFSSL_SYSROOT }}
-          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v3
+          key: wolfssl-${{ env.WOLFSSL_VERSION }}-${{ runner.os }}-v4
 
       - name: Install wolfSSL build toolchain
         if: steps.cache-wolfssl.outputs.cache-hit != 'true'
@@ -411,7 +411,7 @@ jobs:
             --enable-certgen --enable-opensslall \
             --enable-maxfragment --enable-secure-renegotiation \
             --enable-session-ticket --enable-cryptocb \
-            --enable-sessioncerts --enable-ticket-nonce-malloc \
+            --enable-sessioncerts \
             --enable-static --disable-shared \
             --disable-examples --disable-crypttests \
             --enable-reproducible-build
