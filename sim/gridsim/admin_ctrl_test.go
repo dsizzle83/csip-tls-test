@@ -279,3 +279,80 @@ func TestAdminControl_PercentDomainRejected(t *testing.T) {
 		t.Fatalf("derc grew from %d to %d controls, want exactly the one accepted (20000)", seeded, len(list.DERControl))
 	}
 }
+
+// IEEE Std 2030.5-2018 §10.2.3.3 c) — "Editing Events SHALL NOT be allowed
+// except for updating status. Service providers SHALL cancel Events that they
+// wish clients to not act upon and/or provide new superseding Events."
+//
+// The server-cancel two-step above is exactly that edit, and every field of the
+// re-POSTed control used to be re-derived from the CURRENT clock: creationTime
+// jumped to now, and interval/start re-anchored to it. Both are load-bearing to
+// a conformant client — creationTime is rule f)'s supersession tiebreak,
+// interval is what rules m)/n)/o) reason about — so a status-only flip silently
+// made the cancelled event newer and later-starting than everything it had been
+// arbitrated against.
+//
+// Reproduced on the wire in runs/verify-796fbc3-20260819T203800Z:
+// CERT-CORE022-CANCEL-893ce120 was served creationTime/start 1787171378 before
+// the cancel and 1787171532 after it, with only currentStatus meant to move.
+func TestAdminControl_StatusUpdatePreservesCreationTimeAndInterval(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","gen_lim_W":2000,"duration_s":600,"activate":true}`)
+	before := derc0(t, s).DERControl[0]
+
+	// Advance the server's own clock so a re-stamp cannot hide inside a
+	// same-second re-POST.
+	s.SetClockSkew(600)
+	t.Cleanup(func() { s.SetClockSkew(0) })
+
+	// The cancel: currentStatus 6, and a request that would otherwise author a
+	// completely different window (start 300s out, 900s long).
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","current_status":6,"gen_lim_W":2000,"duration_s":900,"start_offset_s":300}`)
+
+	list := derc0(t, s)
+	if len(list.DERControl) != 1 {
+		t.Fatalf("in-place cancel added a control: derc has %d, want 1", len(list.DERControl))
+	}
+	after := list.DERControl[0]
+	if es := after.EventStatus; es == nil || es.CurrentStatus != 6 {
+		t.Fatalf("cancel flip: EventStatus = %+v, want CurrentStatus 6", es)
+	}
+	if after.CreationTime != before.CreationTime {
+		t.Errorf("creationTime moved on a status-only update: %d -> %d; §10.2.3.3 c) allows only the status to change",
+			before.CreationTime, after.CreationTime)
+	}
+	if after.Interval != before.Interval {
+		t.Errorf("interval moved on a status-only update: %+v -> %+v; §10.2.3.3 c) allows only the status to change",
+			before.Interval, after.Interval)
+	}
+	// The control base still comes from the request — this rule freezes the
+	// event's IDENTITY, not everything about it.
+	if after.DERControlBase.OpModGenLimW == nil {
+		t.Fatalf("after cancel: DERControlBase = %+v, want opModGenLimW carried through", after.DERControlBase)
+	}
+}
+
+// The escape hatch stays open: a caller that explicitly asks for a creationTime
+// (creation_offset_s — how the deterministic-winner scenarios author their
+// pairs) still gets the one it asked for, on an existing mRID as on a new one.
+// Only the SILENT re-stamp is closed.
+func TestAdminControl_ExplicitCreationOffsetStillMovesCreationTime(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-REDATE","gen_lim_W":2000,"duration_s":600,"activate":true}`)
+	before := derc0(t, s).DERControl[0]
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-REDATE","gen_lim_W":2000,"duration_s":600,"creation_offset_s":120}`)
+	after := derc0(t, s).DERControl[0]
+
+	if after.CreationTime <= before.CreationTime {
+		t.Errorf("explicit creation_offset_s=120: creationTime %d -> %d, want it to move later",
+			before.CreationTime, after.CreationTime)
+	}
+	if after.Interval != before.Interval {
+		t.Errorf("interval moved: %+v -> %+v; only creationTime was asked for", before.Interval, after.Interval)
+	}
+}

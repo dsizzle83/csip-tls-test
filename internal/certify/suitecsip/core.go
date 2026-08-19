@@ -878,6 +878,68 @@ const core022CompletionDurationS = 120
 // control that simply finished, which is why this margin matters.
 const core022CancelDurationS = 600
 
+// core022CancelGenLimW is the AXIS the server-cancel target commands, and the
+// value it commands on it. It exists as a named constant because the CHOICE OF
+// AXIS — not the value — is what makes this row able to observe status 6 at
+// all.
+//
+// ── THE FIXTURE DEFECT THIS CLOSES (bench 2026-08-19) ─────────────────────────
+//
+// The cancel target used to carry opModMaxLimW, the SAME axis as the completing
+// control, with an interval that deliberately spans it. IEEE Std 2030.5-2018
+// §10.2.3.3 n) then decides the pair before the cancel is ever served: two
+// Overlapping Events commanding one axis cannot both execute (rule d)), the
+// higher-primacy program wins (rule f)'s creationTime tiebreak applies only
+// BETWEEN EQUAL PRIMACY, and gridsim serves program 0 at primacy 1 against
+// program 1 at primacy 5 — so the cancel target was fully displaced on the very
+// walk it was received, and a conformant DUT owes Table 27's status for THAT:
+// 7 same-program, 14 cross-program. Both runs of
+// runs/verify-796fbc3-20260819T203800Z saw exactly that and nothing else —
+// `[1 14]`, never 6 — and the DUT was right: by the time the server flipped
+// currentStatus to 6 (confirmed on the wire, that bundle's frame 1281), the
+// event it was cancelling had already been reported ceased, and §10.2.3.3 i)
+// keeps a superseded event superseded. No wait budget could have fixed it; the
+// fixture was asking the DUT to answer for a cancellation of an event the
+// fixture itself had already killed.
+//
+// The catalog's own fixture never had this problem and is the best evidence
+// that the overlap was the bench's invention rather than the procedure's: CORE-022's
+// preconditions schedule its three DERControls at +3m/2m, +6m/1m and +9m/3m —
+// strictly SUCCESSIVE, never overlapping — and only DERControl#1 is cancelled
+// (steps 6-7, expected result 6: "Status=1 (received), Status=2 (started),
+// Status = 6 (cancellation) at the correct times"). Nothing in the row is about
+// supersession at all; CORE-023 is the row for that.
+//
+// §10.2.3.3 t) is the lever that restores the catalog's intent inside this
+// bench's two-control partial fixture: "For DERControls, differing controls
+// (e.g., opModTargetVar, opModTargetW) within DERControl Events are independent
+// and are allowed to overlap or nest without superseding." So the cancel target
+// gets an axis of its OWN. The two events then coexist — each governs what it
+// commands, each earns its own 1/2 — and when the server cancels one, the DUT
+// is being asked the question this row is actually about: does a LIVE, executing
+// event that the server cancels earn Table 27 status 6 ("The event has been
+// cancelled … when the device first receives the cancellation").
+//
+// WHY opModGenLimW specifically, out of the axes the request surface offers:
+//   - It is a genuine-watts site limit (IW13-001 §1.2), so the value below reads
+//     as watts and needs no percent encoding.
+//   - It is in the SCALAR supported set every posture of the gateway executes,
+//     not the advanced overlay, so this row does not silently become a test of
+//     whether `advanced_axes_enabled` happens to be open on the bench — an
+//     unsupported axis is refused at receipt with 252 and would replace the
+//     missing 6 with a missing 1/2 as well.
+//   - It is a BOUND, not a setpoint: the worst it can do to the DER under test
+//     is hold it lower than it already was, which is the safe direction for a
+//     row whose subject is response bookkeeping rather than actuation.
+//
+// 2000 W is deliberately BINDING against the completing control's own ceiling
+// (opModMaxLimW 4000 = 40.00% of the bench inverter's 8000 W = 3200 W): the two
+// combine as their minimum, so the cancel target's arrival visibly moves the
+// commanded ceiling and its cancellation visibly releases it. A non-binding
+// value would leave the composed document unchanged on the walk that receives
+// it, which is a needless way to make an event's own execution unobservable.
+const core022CancelGenLimW = 2000
+
 // coreResponsesSpec builds CORE-022's spec for a given per-run nonce. It is
 // factored out of coreResponses so a test can drive its Setup/Want directly
 // against a fake gridsim (see nonce_test.go) without booting the whole check,
@@ -910,9 +972,18 @@ func coreResponsesSpec(nonce string) spec {
 			// pair does (coreSupersedingSpec) — two controls Activate:true on
 			// the SAME program would each replace the other's active-list
 			// entry.
+			//
+			// AND ON A DIFFERENT AXIS, which is the part that makes the row
+			// answerable: two programs of unequal primacy commanding ONE axis
+			// over one interval is a supersession by §10.2.3.3 n), not a pair
+			// of coexisting events, and the loser is terminally reported 7/14
+			// before any cancellation can reach it. §10.2.3.3 t) keeps
+			// differing controls independent. See core022CancelGenLimW for the
+			// bench evidence and the full argument.
 			cancelID, err := d.PostControl(ctx, ControlRequest{
 				Program: 1, MRID: cancelMRID, Description: "CORE-022 cancellation control",
-				StartOffset: 0, DurationS: core022CancelDurationS, MaxLimW: ptr(int64(3000)), Activate: true,
+				StartOffset: 0, DurationS: core022CancelDurationS,
+				GenLimW: ptr(int64(core022CancelGenLimW)), Activate: true,
 			})
 			if err != nil {
 				return err
@@ -963,10 +1034,16 @@ func coreResponsesSpec(nonce string) spec {
 			// gridsim seam, sim/gridsim/admin.go's adminCtrlReq doc). The
 			// control's own base fields are carried through unchanged so this
 			// really is "the same event, status updated" rather than a
-			// content change riding along with the cancel.
+			// content change riding along with the cancel — and since the
+			// 2026-08-19 fix gridsim ENFORCES the other half of that (§10.2.3.3
+			// c): a matched in-place update inherits the stored copy's
+			// creationTime and interval instead of re-stamping both from the
+			// clock, which is how the cancelled event used to become newer and
+			// later-starting than everything it had been arbitrated against.
 			_, err := d.PostControl(ctx, ControlRequest{
 				Program: 1, MRID: cancelMRID, Description: "CORE-022 cancellation control",
-				StartOffset: 0, DurationS: core022CancelDurationS, MaxLimW: ptr(int64(3000)),
+				StartOffset: 0, DurationS: core022CancelDurationS,
+				GenLimW:       ptr(int64(core022CancelGenLimW)),
 				CurrentStatus: ptr(uint8(6)),
 			})
 			return err
@@ -984,9 +1061,12 @@ func coreResponsesSpec(nonce string) spec {
 			_ = d.ClearControls(ctx, 1)
 		},
 		Notes: func(o *Observation) string {
-			return fmt.Sprintf("published an immediate DERControl (%s) and waited %s for its natural 1/2/3 "+
-				"lifecycle; statuses received: %v. A second control (%s) was published alongside it on a "+
-				"different program and then CANCELLED server-side mid-flight; statuses received: %v",
+			return fmt.Sprintf("published an immediate DERControl (%s, opModMaxLimW) and waited %s for "+
+				"its natural 1/2/3 lifecycle; statuses received: %v. A second control (%s) was published "+
+				"alongside it on a different program AND A DIFFERENT AXIS (opModGenLimW — IEEE Std "+
+				"2030.5-2018 §10.2.3.3 t) keeps differing controls independent, so the two coexist instead "+
+				"of one superseding the other, which is what leaves a live event for the server to cancel) "+
+				"and then CANCELLED server-side mid-flight; statuses received: %v",
 				mrid, o.Waited.Round(rounding), o.Server.ResponseStatuses(mrid),
 				cancelMRID, o.Server.ResponseStatuses(cancelMRID))
 		},
@@ -1135,6 +1215,31 @@ func coreResponsesSpec(nonce string) spec {
 						// exactly that — a gap this window did not capture —
 						// with the -param that would close it, not as
 						// certainty the DUT never would have sent it.
+						//
+						// ONE GAP IS NOT A TIMING FACT AND MUST NOT BE REPORTED AS ONE.
+						// A missing 6 whose control was answered 7 or 14 instead
+						// is NOT a timing fact and no wait budget will close it:
+						// the DUT reported that event ceased before the cancel
+						// reached it, and IEEE Std 2030.5-2018 §10.2.3.3 i) keeps a
+						// superseded event superseded — a second, contradictory
+						// terminal status for one event is not owed. That is a defect
+						// in THIS FIXTURE (two events contending for one axis over one
+						// interval — see core022CancelGenLimW), and it cost the
+						// 2026-08-19 bench two 8-minute waits before it was named, so
+						// it is named here rather than left to the next reader.
+						for _, ceased := range []int{7, 14} {
+							if wants(wantCancel, 6) && !has(gotCancel, 6) && has(gotCancel, ceased) {
+								return Finding{Verdict: certify.Warn,
+									Observed: fmt.Sprintf("%s; missing %s — but the server-cancelled control was "+
+										"answered %d, so the DUT had already reported it ceased before the "+
+										"cancellation was served. IEEE Std 2030.5-2018 §10.2.3.3 i) keeps a "+
+										"superseded event superseded, so status 6 is not owed here and no wait "+
+										"budget will produce it: this is a FIXTURE fault (the two controls are "+
+										"contending for one axis instead of being kept independent by "+
+										"§10.2.3.3 t) — see core022CancelGenLimW), not a DUT fault",
+										observed, strings.Join(missing, ", "), ceased)}
+							}
+						}
 						return Finding{Verdict: certify.Warn,
 							Observed: fmt.Sprintf("%s; missing %s. Raise -param %s to give both phases their "+
 								"full room (the completing control's own %ds interval plus one more poll cycle, "+

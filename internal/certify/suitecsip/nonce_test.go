@@ -38,6 +38,7 @@ package suitecsip
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -771,5 +772,169 @@ func TestUtilDERRetrievalSpecPublishesItsOwnNoncedMRID(t *testing.T) {
 	}
 	if want1(ServerView{Responses: []AdminResponse{{Subject: p2["mrid"], Status: 1}}}) {
 		t.Error("UTIL-004's Want was satisfied by a Response for the OTHER construction's mrid")
+	}
+}
+
+// gridsimDriverWithAdmin is gridsimDriver plus the admin base URL, so a test
+// can read back the tree gridsim actually serves rather than only the mRIDs the
+// Driver reports.
+func gridsimDriverWithAdmin(t *testing.T) (*Driver, string) {
+	t.Helper()
+	s := gridsim.NewServer(benchLFDI)
+	srv := httptest.NewServer(s.AdminHandler())
+	t.Cleanup(srv.Close)
+	rc := &certify.RunCtx{
+		Case:    &certify.Case{UID: "csip-conf-v1.3::CORE-022"},
+		GridSim: certify.NewAdminClient(srv.URL, http.DefaultClient),
+		Targets: certify.Targets{GridSimAdmin: srv.URL},
+	}
+	return NewDriver(rc), srv.URL
+}
+
+// adminScheduled reads one program's SCHEDULED control list back out of
+// gridsim, keyed by mRID.
+func adminScheduled(t *testing.T, adminURL string, program int) map[string]struct {
+	MRID      string `json:"mrid"`
+	Start     int64  `json:"start"`
+	DurationS int    `json:"duration_s"`
+	Status    int    `json:"status"`
+	Base      struct {
+		MaxLimW *int64 `json:"max_lim_W"`
+		GenLimW *int64 `json:"gen_lim_W"`
+		ExpLimW *int64 `json:"exp_lim_W"`
+		FixedW  *int64 `json:"fixed_W"`
+	} `json:"base"`
+} {
+	t.Helper()
+	type ctrl = struct {
+		MRID      string `json:"mrid"`
+		Start     int64  `json:"start"`
+		DurationS int    `json:"duration_s"`
+		Status    int    `json:"status"`
+		Base      struct {
+			MaxLimW *int64 `json:"max_lim_W"`
+			GenLimW *int64 `json:"gen_lim_W"`
+			ExpLimW *int64 `json:"exp_lim_W"`
+			FixedW  *int64 `json:"fixed_W"`
+		} `json:"base"`
+	}
+	resp, err := http.Get(adminURL + "/admin/status")
+	if err != nil {
+		t.Fatalf("GET /admin/status: %v", err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Programs []struct {
+			ID        int    `json:"id"`
+			Scheduled []ctrl `json:"scheduled"`
+		} `json:"programs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode /admin/status: %v", err)
+	}
+	out := map[string]ctrl{}
+	for _, p := range got.Programs {
+		if p.ID != program {
+			continue
+		}
+		for _, c := range p.Scheduled {
+			out[c.MRID] = c
+		}
+	}
+	return out
+}
+
+// TestCoreResponsesSpec_CancelTargetIsAxisIndependent is CORE-022's
+// server-cancel fixture lock, and it exists because the fixture — not the DUT —
+// was what made status 6 unobservable on the 2026-08-19 bench
+// (runs/verify-796fbc3-20260819T203800Z, both runs: the cancel target was
+// answered [1 14] and never 6, identically, at an 8-minute wait budget).
+//
+// The cancel target used to command opModMaxLimW, the same axis as the
+// completing control, over an interval that spans it. IEEE Std 2030.5-2018
+// §10.2.3.3 d) forbids a client from executing both, n) hands the axis to the
+// higher-primacy program (gridsim: program 0 primacy 1 beats program 1 primacy
+// 5 — rule f)'s creationTime tiebreak never gets a turn), and Table 27 rows
+// 7/14 are what the loser is owed. The event was therefore terminally reported
+// ceased on the walk it arrived, and the cancellation the check served
+// afterwards had nothing live left to cancel: §10.2.3.3 i) keeps a superseded
+// event superseded.
+//
+// §10.2.3.3 t) is the rule that makes the row answerable — "differing controls
+// … within DERControl Events are independent and are allowed to overlap or nest
+// without superseding" — so the two controls must command DIFFERENT axes. That
+// is what this test pins, at the only place it can be checked without a DUT:
+// the documents gridsim actually serves.
+func TestCoreResponsesSpec_CancelTargetIsAxisIndependent(t *testing.T) {
+	d, adminURL := gridsimDriverWithAdmin(t)
+	ctx := context.Background()
+
+	s := coreResponsesSpec("axisnonce")
+	params := map[string]string{}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	completing := adminScheduled(t, adminURL, 0)[params["mrid"]]
+	cancelling := adminScheduled(t, adminURL, 1)[params["cancelMrid"]]
+	if completing.MRID == "" {
+		t.Fatalf("completing control %q was not served on program 0", params["mrid"])
+	}
+	if cancelling.MRID == "" {
+		t.Fatalf("cancel target %q was not served on program 1", params["cancelMrid"])
+	}
+
+	if completing.Base.MaxLimW == nil {
+		t.Errorf("completing control commands no opModMaxLimW: base = %+v", completing.Base)
+	}
+	if cancelling.Base.GenLimW == nil {
+		t.Errorf("cancel target commands no opModGenLimW: base = %+v", cancelling.Base)
+	}
+	// The load-bearing assertion: no axis in common. Two controls sharing one
+	// axis over one interval is a supersession by §10.2.3.3 n), and the loser is
+	// answered 7/14 rather than left alive for the server to cancel.
+	shares := func(name string, a, b *int64) {
+		t.Helper()
+		if a != nil && b != nil {
+			t.Errorf("the completing control and the server-cancel target BOTH command %s — §10.2.3.3 n) "+
+				"makes that a supersession, which terminally reports the cancel target before any "+
+				"cancellation can reach it (see core022CancelGenLimW)", name)
+		}
+	}
+	shares("opModMaxLimW", completing.Base.MaxLimW, cancelling.Base.MaxLimW)
+	shares("opModGenLimW", completing.Base.GenLimW, cancelling.Base.GenLimW)
+	shares("opModExpLimW", completing.Base.ExpLimW, cancelling.Base.ExpLimW)
+	shares("opModFixedW", completing.Base.FixedW, cancelling.Base.FixedW)
+
+	// Both must be LIVE and overlapping, or the cancel is not "mid-flight":
+	// the cancel target's window has to still be open when the completing
+	// control's own lifecycle has run out.
+	if cancelling.DurationS <= completing.DurationS {
+		t.Errorf("cancel target duration %ds does not outlast the completing control's %ds — the cancel would "+
+			"land on an event that had already elapsed on its own", cancelling.DurationS, completing.DurationS)
+	}
+
+	// Phase 2: the cancel itself. It must flip status to 6 on the SAME event —
+	// same mRID, same axis, and (§10.2.3.3 c), gridsim's own guard) the same
+	// creationTime and interval it was already being served with.
+	if err := s.Change(ctx, d, params); err != nil {
+		t.Fatalf("Change: %v", err)
+	}
+	after := adminScheduled(t, adminURL, 1)[params["cancelMrid"]]
+	if after.MRID == "" {
+		t.Fatalf("cancel target %q vanished from program 1 — a cancel is a status update, not a removal "+
+			"(§10.2.3.3 c) and s))", params["cancelMrid"])
+	}
+	if after.Status != 6 {
+		t.Errorf("after the cancel, currentStatus = %d, want 6 (Cancelled)", after.Status)
+	}
+	if after.Base.GenLimW == nil || cancelling.Base.GenLimW == nil ||
+		*after.Base.GenLimW != *cancelling.Base.GenLimW {
+		t.Errorf("the cancel changed the control base: %+v -> %+v", cancelling.Base, after.Base)
+	}
+	if after.Start != cancelling.Start || after.DurationS != cancelling.DurationS {
+		t.Errorf("the cancel moved the event's interval: start/duration %d/%ds -> %d/%ds; §10.2.3.3 c) "+
+			"allows an update to change the STATUS and nothing else",
+			cancelling.Start, cancelling.DurationS, after.Start, after.DurationS)
 	}
 }

@@ -712,6 +712,65 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	if req.CreationOffsetS != nil {
 		creationTime = now + int64(*req.CreationOffsetS)
 	}
+	interval := model.DateTimeInterval{
+		Duration: uint32(req.DurationS),
+		Start:    now + int64(req.StartOffset),
+	}
+
+	// ── §10.2.3 c): AN UPDATE-IN-PLACE MAY CHANGE STATUS AND NOTHING ELSE ─────
+	//
+	// IEEE Std 2030.5-2018 §10.2.3.3 rule c) is unconditional: "Editing Events
+	// SHALL NOT be allowed except for updating status. Service providers SHALL
+	// cancel Events that they wish clients to not act upon and/or provide new
+	// superseding Events." An explicit mRID that already exists is precisely
+	// that edit (the server-cancel two-step this endpoint was built for), and
+	// until this guard every such re-POST also re-stamped creationTime from the
+	// CURRENT clock and re-anchored interval/start to it, because both were
+	// derived from `now` with no reference to the copy already being served.
+	//
+	// That is not a cosmetic drift. creationTime is the tiebreak rule f) uses
+	// to decide which of two same-primacy Overlapping Events supersedes the
+	// other, and interval/start is the window rules m)/n)/o) reason about — so
+	// a status-only flip silently made the cancelled event both NEWER and
+	// LATER-STARTING than everything it had been arbitrated against, and a DUT
+	// that re-arbitrates on the edited copy is being graded against a fixture
+	// that moved under it. Reproduced in
+	// runs/verify-796fbc3-20260819T203800Z: CERT-CORE022-CANCEL-893ce120 was
+	// served creationTime/start 1787171378 before the cancel and
+	// creationTime/start 1787171532 after it, with only currentStatus meant to
+	// change (frames 1143 vs 1281 of that bundle's capture).
+	//
+	// So a matched in-place update inherits the stored copy's creationTime and
+	// interval. A caller that genuinely wants a different creationTime still
+	// gets one by asking for it explicitly (CreationOffsetS), which is how the
+	// deterministic-winner scenarios author their pairs; a caller that wants a
+	// different WINDOW must publish a different mRID, which is what rule c)
+	// leaves it. Deliberately does not consult ActiveDERControlList: derc is the
+	// scheduled list and the authority for an event's own identity, and the two
+	// lists' copies may diverge (finding #4, first-copy-wins).
+	if req.MRID != "" {
+		s.mu.RLock()
+		prior, hadPrior := s.controlIdentityLocked(req.Program, mrid)
+		s.mu.RUnlock()
+		if hadPrior {
+			if req.CreationOffsetS == nil {
+				creationTime = prior.creationTime
+			}
+			interval = prior.interval
+			// The default status below is derived from the window, so it has to
+			// be re-derived from the window this update actually serves rather
+			// than from the request's own offset. An explicit CurrentStatus
+			// (the server-cancel's whole point) still overrides it.
+			activeNow = interval.Start <= now
+			status = 0
+			if activeNow {
+				status = 1
+			}
+			if req.CurrentStatus != nil {
+				status = *req.CurrentStatus
+			}
+		}
+	}
 	// responseRequired defaults ON (adminDefaultResponseRequired — see its doc
 	// for the bit semantics) so the DUT is actually asked for the Response
 	// lifecycle CORE-022/CORE-023 grade; ResponseRequired lets a scenario
@@ -739,10 +798,7 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 			DateTime:              now,
 			PotentiallySuperseded: req.PotentiallySuperseded != nil && *req.PotentiallySuperseded,
 		},
-		Interval: model.DateTimeInterval{
-			Duration: uint32(req.DurationS),
-			Start:    now + int64(req.StartOffset),
-		},
+		Interval:          interval,
 		RandomizeStart:    req.RandomizeStart,
 		RandomizeDuration: req.RandomizeDuration,
 		DERControlBase:    buildBase(req, injectPF, absorbPF),
@@ -922,6 +978,42 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]string{"mrid": ctrl.MRID})
+}
+
+// controlIdentity is the part of a stored DERControl that IEEE Std 2030.5-2018
+// §10.2.3.3 c) forbids an update from editing: the event's creationTime (rule
+// f)'s supersession tiebreak) and its interval (the window rules m)/n)/o) all
+// reason about). Only these two — description, responseRequired, randomization
+// and the control base are re-authored from the request as before, because a
+// scenario re-POSTing the same mRID is expected to carry them through
+// unchanged and nothing in the campaign depends on gridsim policing that.
+type controlIdentity struct {
+	creationTime int64
+	interval     model.DateTimeInterval
+}
+
+// controlIdentityLocked returns the stored identity of program's control with
+// this mRID, from the SCHEDULED list (/derp/N/derc) in whichever storage width
+// that list currently has. ok is false when no such control is stored, which is
+// the ordinary "this POST is an add, not an edit" case.
+//
+// Must be called with s.mu held (read is enough).
+func (s *Server) controlIdentityLocked(program int, mrid string) (controlIdentity, bool) {
+	switch list := s.resources[fmt.Sprintf("/derp/%d/derc", program)].(type) {
+	case *model.DERControlList:
+		for i := range list.DERControl {
+			if list.DERControl[i].MRID == mrid {
+				return controlIdentity{list.DERControl[i].CreationTime, list.DERControl[i].Interval}, true
+			}
+		}
+	case *model.ExtendedDERControlList:
+		for i := range list.DERControl {
+			if list.DERControl[i].MRID == mrid {
+				return controlIdentity{list.DERControl[i].CreationTime, list.DERControl[i].Interval}, true
+			}
+		}
+	}
+	return controlIdentity{}, false
 }
 
 // upsertScalarControl adds ctrl to a scalar DERControl list, or — when
