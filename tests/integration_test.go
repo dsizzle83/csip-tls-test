@@ -320,8 +320,10 @@ func TestMUPPostCreate(t *testing.T) {
 
 	// POST a MirrorUsagePoint to register a new measurement point.
 	//
-	// roleFlags 0x0049 = isMirror | isDER | isSubmeter (IEEE Std 2030.5-2018 p.169 RoleFlagsType,
-	// xsd:5826). It was the decimal 49 until lexa-proto 72d91be made hexBinary
+	// roleFlags 0x0049 = isMirror | isDER | isSubmeter (IEEE Std 2030.5-2018 p.169,
+	// RoleFlagsType; the draft schema at xsd:5826 agrees bit-for-bit but is a
+	// reference artifact, not the normative anchor). It was the decimal 49 until
+	// lexa-proto 72d91be made hexBinary
 	// elements emit hex: the wire text was "49", every conformant reader took
 	// that as 0x49, and 0x49 is the value this fixture means. Read as decimal it
 	// would instead be isMirror | isRevenueQuality | isDC — revenue-grade DC
