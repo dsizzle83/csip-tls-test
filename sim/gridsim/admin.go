@@ -1452,6 +1452,16 @@ type adminDefaultReq struct {
 	Program int          `json:"program"`
 	Base    adminCtrlReq `json:"base"`
 	Clear   bool         `json:"clear,omitempty"`
+
+	// SetGradW / SetSoftGradW are IEEE 2030.5-2018's ramp-rate defaults, which
+	// live on the DefaultDERControl itself and NOT inside DERControlBase — so
+	// they sit here beside Base rather than in it. Units are the standard's own:
+	// hundredths of a percent of setMaxW per second (PerCent). They are the only
+	// route by which a DER client can be told a soft-start ramp, so without this
+	// lever the 703 ESRmpTms write path (SetEnergizeWithRamp) is unreachable from
+	// a bench. See softgrad.go for why they are carried on a local wrapper type.
+	SetGradW     *uint16 `json:"set_grad_w,omitempty"`
+	SetSoftGradW *uint16 `json:"set_soft_grad_w,omitempty"`
 }
 
 func (s *Server) handleAdminDefault(w http.ResponseWriter, r *http.Request) {
@@ -1491,6 +1501,8 @@ func (s *Server) adminDefaultGet(w http.ResponseWriter, r *http.Request) {
 // path. Caller must hold s.mu (read or write).
 func (s *Server) defaultBaseInfoLocked(path string) (adminBaseInfo, bool) {
 	switch d := s.resources[path].(type) {
+	case *defaultDERControlRamps:
+		return baseToInfo(d.DERControlBase), true
 	case *model.DefaultDERControl:
 		return baseToInfo(d.DERControlBase), true
 	case *model.ExtendedDefaultDERControl:
@@ -1585,6 +1597,8 @@ func (s *Server) putDefaultBaseLocked(path string, req adminDefaultReq, droop *m
 	var mrid, desc string
 	var version uint16
 	switch d := s.resources[path].(type) {
+	case *defaultDERControlRamps:
+		res, mrid, desc, version = d.Resource, d.MRID, d.Description, d.Version
 	case *model.DefaultDERControl:
 		res, mrid, desc, version = d.Resource, d.MRID, d.Description, d.Version
 	case *model.ExtendedDefaultDERControl:
@@ -1601,6 +1615,17 @@ func (s *Server) putDefaultBaseLocked(path string, req adminDefaultReq, droop *m
 		}
 		if !req.Clear {
 			narrow.DERControlBase = buildBase(req.Base, injectPF, absorbPF)
+		}
+		// The ramp-rate defaults ride the wrapper shape (softgrad.go) and ONLY
+		// when asked for, so a default naming neither is stored as the plain
+		// narrow type it has always been.
+		if req.wantsRamps() {
+			s.resources[path] = &defaultDERControlRamps{
+				DefaultDERControl: *narrow,
+				SetGradW:          req.SetGradW,
+				SetSoftGradW:      req.SetSoftGradW,
+			}
+			return
 		}
 		s.resources[path] = narrow
 		return
