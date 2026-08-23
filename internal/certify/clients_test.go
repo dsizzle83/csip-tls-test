@@ -20,6 +20,9 @@ func TestGatewayIsReadOnly(t *testing.T) {
 		{"systemctl", "is-active", "lexa-gw"},
 		{"systemctl", "--no-pager", "show", "lexa-gw"},
 		{"openssl", "x509", "-in", "/etc/ssl/dev.pem", "-noout", "-text"},
+		{"wget", "-qO-", "http://127.0.0.1:9102/metrics"},
+		{"wget", "-O-", "http://127.0.0.1:9102/metrics"},
+		{"wget", "--output-document=-", "http://127.0.0.1:9102/metrics"},
 	}
 	for _, args := range allowed {
 		if err := CheckReadOnly(args); err != nil {
@@ -34,6 +37,14 @@ func TestGatewayIsReadOnly(t *testing.T) {
 		{"reboot"},
 		{"sh", "-c", "echo x > /etc/config"},
 		{"fw_setenv", "bootcount", "0"},
+		// wget's one caller is a plain GET to stdout (IW27-004); anything else
+		// on the allowed head token must still be refused (comment-only
+		// invariants don't hold a second caller to the same shape).
+		{"wget", "http://127.0.0.1:9102/metrics"},                                 // no -O at all: wget defaults to writing a file
+		{"wget", "--post-data=x", "http://127.0.0.1:9102/metrics"},                // verb change
+		{"wget", "-qO", "/tmp/exfil", "http://127.0.0.1:9102/metrics"},            // writes to a file, not stdout
+		{"wget", "-O", "/etc/lexa/modbus.json", "http://127.0.0.1:9102/metrics"},  // writes to a file, not stdout
+		{"wget", "--output-document=/tmp/exfil", "http://127.0.0.1:9102/metrics"}, // writes to a file, not stdout
 	}
 	for _, args := range refused {
 		err := CheckReadOnly(args)

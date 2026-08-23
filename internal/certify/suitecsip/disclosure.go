@@ -94,10 +94,18 @@ const (
 // error — which is exactly how this channel shipped unreachable.
 //
 // The endpoint is lexa-gw's MetricsAddr (cmd/northbound/config.go), whose
-// default is the LOOPBACK 127.0.0.1:9102 and which BENCH.md binds to
-// 69.0.0.2:9102 on the bench — the value certify.DefaultTargets carries, so a
-// bench run reaches this channel with no flag at all. A gateway keeping the
-// loopback default needs an ssh forward and -metrics-endpoint.
+// default AND ONLY posture is the LOOPBACK 127.0.0.1:9102 — lexa-gw's
+// docs/METRICS_CATALOG.md §13.3 states plainly that this is deliberate ("no
+// scraper is packaged... every endpoint above is loopback by design") and must
+// not be defeated. IW27-004: this package used to dial the DUT's LAN address
+// directly (certify.DefaultTargets carried "http://69.0.0.2:9102/metrics",
+// following a since-stale BENCH.md note that a bench build rebound
+// metrics_addr to the LAN IP — that note described the abandoned lexa-hub
+// product, not this one), which is unreachable in every case against the real
+// posture: connection refused, always. certify.DefaultTargets now carries the
+// true loopback URL, and metricsScraper reaches it by asking the DUT to fetch
+// its own endpoint over the -gateway-ssh introspection channel (see
+// metricscrape.NewSSHSource) rather than dialing loopback from off-box.
 const metricsTargetKey = certify.TargetMetrics
 
 // metricsScraper builds the scrape source for a run, or reports why there is
@@ -107,6 +115,21 @@ const metricsTargetKey = certify.TargetMetrics
 // caller records; it is never substituted with a guess at the DUT's address.
 // Scraping something that merely answers on :9102 would be worse than not
 // scraping: the reading would look sound and be about a different process.
+//
+// Two transports are supported, chosen by whether -gateway-ssh is configured:
+//   - WITH -gateway-ssh (the normal bench posture — every real run already
+//     sets it for other read-only introspection): the endpoint is fetched BY
+//     THE DUT ITSELF over that SSH connection (metricscrape.NewSSHSource),
+//     which is the only way to reach a loopback-bound port from outside the
+//     device. This is the path IW27-004 fixes: previously the endpoint was
+//     dialed directly from the harness host regardless of -gateway-ssh, which
+//     silently produced UNREACHABLE on every run against the real posture.
+//   - WITHOUT -gateway-ssh: the endpoint is dialed directly
+//     (metricscrape.NewHTTPSource), which only ever succeeds against something
+//     actually reachable off-box — an operator's own manual `ssh -L` forward of
+//     the loopback port, or (in this package's own tests) a local httptest
+//     server standing in for the DUT. Direct dialing a real DUT's loopback
+//     port this way still fails, honestly, as StatusUnreachable.
 func metricsScraper(rc *certify.RunCtx, sels ...metricscrape.Selector) (*metricscrape.Scraper, error) {
 	endpoint := ""
 	if rc != nil && rc.Targets.Extra != nil {
@@ -114,14 +137,20 @@ func metricsScraper(rc *certify.RunCtx, sels ...metricscrape.Selector) (*metrics
 	}
 	if endpoint == "" {
 		return nil, fmt.Errorf("no metrics endpoint is configured for this run, so the DUT's own " +
-			"disclosure counters were not read. Pass -metrics-endpoint http://host:9102/metrics " +
-			"(certify.DefaultTargets already carries the bench's http://69.0.0.2:9102/metrics; lexa-gw " +
-			"serves it on MetricsAddr, whose own default is the loopback 127.0.0.1:9102 and needs an ssh " +
-			"forward from a desktop run)")
+			"disclosure counters were not read. Pass -metrics-endpoint http://127.0.0.1:9102/metrics " +
+			"(certify.DefaultTargets already carries this — lexa-gw's loopback-only default, MetricsAddr in " +
+			"cmd/northbound/config.go) and -gateway-ssh so the fetch can run ON the DUT, which is loopback-only " +
+			"by design and unreachable any other way")
 	}
-	src, err := metricscrape.NewHTTPSource(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("the configured %q endpoint %q is unusable: %w", metricsTargetKey, endpoint, err)
+	var src metricscrape.Source
+	if rc != nil && rc.Gateway.Available() {
+		src = metricscrape.NewSSHSource(rc.Gateway.Run, endpoint)
+	} else {
+		s, err := metricscrape.NewHTTPSource(endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("the configured %q endpoint %q is unusable: %w", metricsTargetKey, endpoint, err)
+		}
+		src = s
 	}
 	return metricscrape.New(src, sels...)
 }

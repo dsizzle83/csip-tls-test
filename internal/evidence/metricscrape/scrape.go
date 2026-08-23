@@ -158,6 +158,53 @@ func (f FuncSource) Describe() string { return f.Description }
 // Fetch calls the function.
 func (f FuncSource) Fetch(ctx context.Context) (Fetch, error) { return f.Fn(ctx) }
 
+// Runner executes one read-only command on the DUT over whatever introspection
+// channel the caller already holds (an SSH connection, most often) and returns
+// its stdout. It is spelled as a plain func type rather than an interface so
+// that a method value — certify's *Gateway.Run, in particular — is directly
+// assignable to it with no adapter and no import of this package's caller by
+// this package (certify already imports metricscrape; the reverse would be a
+// cycle).
+type Runner func(ctx context.Context, args ...string) ([]byte, error)
+
+// NewSSHSource builds a Source for an endpoint that is loopback-bound on the
+// DUT by design (IW27-004; see docs/METRICS_CATALOG.md §13.3 in the lexa-gw
+// sibling repo — "no scraper is packaged. Every endpoint above is loopback by
+// design", and that is a deliberate security choice this harness must not
+// defeat). Dialing such a URL from off-box is not merely inconvenient, it is
+// unreachable in every case: connection refused, always. This Source instead
+// asks the DUT to fetch its own endpoint, via run — e.g. an SSH exec — and
+// treats the stdout as the exposition body, the same way a human would type
+// `ssh dut wget -qO- http://127.0.0.1:PORT/metrics`.
+//
+// wget is used (rather than curl) because it is the HTTP client this project's
+// other DUT introspection already assumes is present on the image — see the
+// soak driver's qa_block() and authority() shelling out to `wget -qO-` for the
+// same reason.
+//
+// Caveat, stated rather than hidden: wget's exit status does not distinguish a
+// transport failure (no route, connection refused, timeout) from a non-200 HTTP
+// response — both come back as a non-zero exit and empty/partial stdout. A
+// failure here is therefore always recorded as StatusUnreachable, never
+// StatusHTTPStatus, even on the rare DUT that answers the port with something
+// other than 200. That collapses two of scrape.go's outcome vocabulary's
+// distinctions into one, which is an honest loss of resolution rather than a
+// silent one: run's error text (wget's own stderr) is preserved in the
+// resulting ScrapeResult.Error either way.
+func NewSSHSource(run Runner, url string) *FuncSource {
+	return &FuncSource{
+		Description: fmt.Sprintf("ssh wget -qO- %s", url),
+		Fn: func(ctx context.Context) (Fetch, error) {
+			out, err := run(ctx, "wget", "-qO-", url)
+			if err != nil {
+				return Fetch{}, err
+			}
+			// wget only returns here on a 2xx; see the caveat above.
+			return Fetch{Body: out, HTTPStatus: http.StatusOK}, nil
+		},
+	}
+}
+
 // Status is how one READING went — the transport half of the outcome.
 type Status string
 

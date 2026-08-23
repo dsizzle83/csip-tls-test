@@ -421,3 +421,47 @@ func TestFuncSourceCarriesAnArbitraryTransport(t *testing.T) {
 		t.Errorf("a non-HTTP source must record no HTTP status, got %d", rec.Open.HTTPStatus)
 	}
 }
+
+// TestNewSSHSource_FetchesThroughTheRunner is IW27-004's unit-level proof: the
+// Source built by NewSSHSource must read its body from the Runner's stdout, by
+// running wget against the given URL, and must record the URL (not a bare
+// "ssh" description) so a bundle reader can see what was actually asked for.
+func TestNewSSHSource_FetchesThroughTheRunner(t *testing.T) {
+	const url = "http://127.0.0.1:9102/metrics"
+	var gotArgs []string
+	run := func(_ context.Context, args ...string) ([]byte, error) {
+		gotArgs = append([]string(nil), args...)
+		return []byte(body("# TYPE "+ignored+" counter", ignored+" 3")), nil
+	}
+	src := NewSSHSource(run, url)
+	if !strings.Contains(src.Describe(), url) {
+		t.Errorf("Describe() = %q, want it to name the endpoint %q", src.Describe(), url)
+	}
+	f, err := src.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(gotArgs) != 3 || gotArgs[0] != "wget" || gotArgs[2] != url {
+		t.Errorf("runner args = %v, want [wget -qO- %s]", gotArgs, url)
+	}
+	if !strings.Contains(string(f.Body), ignored) {
+		t.Errorf("Fetch body = %q, want the runner's stdout", f.Body)
+	}
+	if f.HTTPStatus != http.StatusOK {
+		t.Errorf("HTTPStatus = %d, want 200 (wget only returns on success — see the doc comment's caveat)",
+			f.HTTPStatus)
+	}
+}
+
+// A Runner failure (wget exits non-zero: connection refused, timeout, ssh
+// itself failing, or the DUT answering non-200) must come back as a Fetch
+// error, so scrape.go's read() classifies it StatusUnreachable rather than a
+// panic or a fabricated empty-but-OK reading.
+func TestNewSSHSource_RunnerFailureIsAFetchError(t *testing.T) {
+	wantErr := errors.New("ssh: connect to host cc93 port 22: Connection refused")
+	run := func(context.Context, ...string) ([]byte, error) { return nil, wantErr }
+	src := NewSSHSource(run, "http://127.0.0.1:9102/metrics")
+	if _, err := src.Fetch(context.Background()); !errors.Is(err, wantErr) {
+		t.Errorf("Fetch err = %v, want %v", err, wantErr)
+	}
+}

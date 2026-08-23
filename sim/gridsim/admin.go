@@ -459,6 +459,45 @@ func apW(ap *model.ActivePower) int64 {
 
 // ── Control POST/DELETE ───────────────────────────────────────────────────────
 
+// nonconformantControlEdit is the deliberate-violation opt-in for a POST that
+// reuses an EXISTING mRID and wants to author more than IEEE Std
+// 2030.5-2018 §10.2.3.3 c) permits: "Editing Events SHALL NOT be allowed
+// except for updating status. Service providers SHALL cancel Events that
+// they wish clients to not act upon and/or provide new superseding Events."
+//
+// Same shape as curve.go's nonconformantCurve — each field names the
+// specific SHALL it breaks, so a reader of a request, or of the bundle
+// carrying it, can see that the edit was deliberate rather than a gap in
+// this server's own policing. Without either field set, an update to an
+// existing mRID may change only EventStatus (current_status,
+// potentially_superseded); see adminCtrlPost's guard and
+// (adminCtrlReq).nonStatusEdits.
+type nonconformantControlEdit struct {
+	// AllowContentEdit permits an update to re-author anything §10.2.3.3(c)
+	// reserves to a NEW Event: description, response_required,
+	// randomize_start/randomize_duration, null_axes, and every
+	// DERControlBase-bearing field buildBase reads (exp_lim_W, max_lim_W,
+	// imp_lim_W, gen_lim_W, load_lim_W, fixed_W, target_W, connect,
+	// energize, fixed_pf_inject/absorb, fixed_var_pct, freq_droop). Without
+	// it, an update carrying any of these is refused (400) before anything
+	// is stored — this is the lever that used to be gridsim's unconditional
+	// default and let a fixture author server behaviour no conformant
+	// service provider could produce.
+	AllowContentEdit bool `json:"allow_content_edit,omitempty"`
+	// AllowCreationTimeMove permits creation_offset_s to move creationTime on
+	// an update to an EXISTING mRID. creationTime is rule f)'s supersession
+	// tiebreak — exactly as load-bearing to an event's identity as the
+	// interval/window, which is unconditionally protected (controlIdentity)
+	// — so moving it is just as much an edit as authoring new content, and
+	// gets its own named lever rather than riding AllowContentEdit's.
+	AllowCreationTimeMove bool `json:"allow_creation_time_move,omitempty"`
+}
+
+// armed reports whether either deliberate violation was requested.
+func (n *nonconformantControlEdit) armed() bool {
+	return n != nil && (n.AllowContentEdit || n.AllowCreationTimeMove)
+}
+
 // adminCtrlReq is the JSON body for POST /admin/control.
 // All OpMod fields are optional (nil = not included in the control).
 type adminCtrlReq struct {
@@ -564,6 +603,50 @@ type adminCtrlReq struct {
 	// go through buildBase at all; it never reaches the stored resource,
 	// because no csipmodel field could hold it.
 	NullAxes []string `json:"null_axes,omitempty"`
+
+	// Nonconformant is the named opt-in for a same-mRID update that
+	// deliberately breaks IEEE Std 2030.5-2018 §10.2.3.3 c) — see
+	// nonconformantControlEdit. Every update that does not set it is held to
+	// the rule: only EventStatus may change.
+	Nonconformant *nonconformantControlEdit `json:"nonconformant,omitempty"`
+}
+
+// nonStatusEdits names every element of req that would author content
+// §10.2.3.3 c) reserves to a NEW Event, for a POST that reuses an EXISTING
+// mRID. explicitDescription is whether the caller actually sent a
+// description, taken BEFORE adminCtrlPost substitutes the "Admin control"
+// default — a caller who simply omitted it on a status-only update is not
+// authoring anything and must not be flagged for the default's own text.
+// droop/nullAxes are the already-validated derived values (droop from
+// req.FreqDroop.toModel(), nullAxes from req.explicitNilAxes()) rather than
+// the raw request fields, so this reads the same "did this request actually
+// ask for one of these" question buildBase and its siblings answer.
+func (req adminCtrlReq) nonStatusEdits(explicitDescription bool, droop *model.FreqDroop, nullAxes []string) []string {
+	var edits []string
+	add := func(present bool, name string) {
+		if present {
+			edits = append(edits, name)
+		}
+	}
+	add(explicitDescription, "description")
+	add(req.ResponseRequired != nil, "response_required")
+	add(req.RandomizeStart != nil, "randomize_start")
+	add(req.RandomizeDuration != nil, "randomize_duration")
+	add(req.ExpLimW != nil, "exp_lim_W")
+	add(req.MaxLimW != nil, "max_lim_W")
+	add(req.ImpLimW != nil, "imp_lim_W")
+	add(req.GenLimW != nil, "gen_lim_W")
+	add(req.LoadLimW != nil, "load_lim_W")
+	add(req.FixedW != nil, "fixed_W")
+	add(req.TargetW != nil, "target_W")
+	add(req.Connect != nil, "connect")
+	add(req.Energize != nil, "energize")
+	add(req.FixedPFInjectW != nil, "fixed_pf_inject")
+	add(req.FixedPFAbsorbW != nil, "fixed_pf_absorb")
+	add(req.FixedVarPct != nil, "fixed_var_pct")
+	add(droop != nil, "freq_droop")
+	add(len(nullAxes) > 0, "null_axes")
+	return edits
 }
 
 func (s *Server) handleAdminControl(w http.ResponseWriter, r *http.Request) {
@@ -681,6 +764,10 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Captured BEFORE the "Admin control" default below is substituted, so
+	// nonStatusEdits can tell "this request authored a description" from
+	// "this request just left it out" — the two must not be flagged alike.
+	explicitDescription := req.Description != ""
 	if req.DurationS <= 0 {
 		req.DurationS = 300
 	}
@@ -723,36 +810,70 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// SHALL NOT be allowed except for updating status. Service providers SHALL
 	// cancel Events that they wish clients to not act upon and/or provide new
 	// superseding Events." An explicit mRID that already exists is precisely
-	// that edit (the server-cancel two-step this endpoint was built for), and
-	// until this guard every such re-POST also re-stamped creationTime from the
-	// CURRENT clock and re-anchored interval/start to it, because both were
-	// derived from `now` with no reference to the copy already being served.
+	// that edit (the server-cancel two-step this endpoint was built for).
 	//
-	// That is not a cosmetic drift. creationTime is the tiebreak rule f) uses
-	// to decide which of two same-primacy Overlapping Events supersedes the
-	// other, and interval/start is the window rules m)/n)/o) reason about — so
-	// a status-only flip silently made the cancelled event both NEWER and
-	// LATER-STARTING than everything it had been arbitrated against, and a DUT
-	// that re-arbitrates on the edited copy is being graded against a fixture
-	// that moved under it. Reproduced in
+	// IW27-005: this used to stop at protecting creationTime/interval (the
+	// history immediately below) while leaving Description, ResponseRequired,
+	// RandomizeStart/RandomizeDuration and the ENTIRE DERControlBase (via
+	// buildBase(req, ...)) unconditionally re-authored from whatever the
+	// update's request body said — which is precisely the edit rule c)
+	// forbids, just of different elements than the ones the original guard
+	// covered. A test fixture could author server behaviour no conformant
+	// service provider could ever produce (re-describe an event, flip its
+	// content, even move its creationTime via creation_offset_s) and grade a
+	// DUT against a moving target while believing it was testing the DUT.
+	// The guard below closes that: by DEFAULT, an update to an existing mRID
+	// may change only what EventStatus holds (current_status,
+	// potentially_superseded) plus the two ALREADY-protected identity fields;
+	// everything else is refused (400) before anything is stored, unless the
+	// caller explicitly opts into authoring it as a NAMED non-conformant
+	// negative test (nonconformantControlEdit).
+	//
+	// creationTime is the tiebreak rule f) uses to decide which of two
+	// same-primacy Overlapping Events supersedes the other, and
+	// interval/start is the window rules m)/n)/o) reason about — so a
+	// status-only flip that silently re-stamped either made the cancelled
+	// event both NEWER and LATER-STARTING than everything it had been
+	// arbitrated against, and a DUT that re-arbitrates on the edited copy is
+	// being graded against a fixture that moved under it. Reproduced in
 	// runs/verify-796fbc3-20260819T203800Z: CERT-CORE022-CANCEL-893ce120 was
 	// served creationTime/start 1787171378 before the cancel and
 	// creationTime/start 1787171532 after it, with only currentStatus meant to
 	// change (frames 1143 vs 1281 of that bundle's capture).
 	//
 	// So a matched in-place update inherits the stored copy's creationTime and
-	// interval. A caller that genuinely wants a different creationTime still
-	// gets one by asking for it explicitly (CreationOffsetS), which is how the
-	// deterministic-winner scenarios author their pairs; a caller that wants a
-	// different WINDOW must publish a different mRID, which is what rule c)
-	// leaves it. Deliberately does not consult ActiveDERControlList: derc is the
-	// scheduled list and the authority for an event's own identity, and the two
-	// lists' copies may diverge (finding #4, first-copy-wins).
+	// interval, and refuses any request that would move either without the
+	// nonconformant.allow_creation_time_move escape hatch (a caller that wants
+	// a different WINDOW publishes a different mRID, which is what rule c)
+	// leaves it). Deliberately does not consult ActiveDERControlList: derc is
+	// the scheduled list and the authority for an event's own identity, and
+	// the two lists' copies may diverge (finding #4, first-copy-wins).
+	var prior controlIdentity
+	var hadPrior bool
 	if req.MRID != "" {
 		s.mu.RLock()
-		prior, hadPrior := s.controlIdentityLocked(req.Program, mrid)
+		prior, hadPrior = s.controlIdentityLocked(req.Program, mrid)
 		s.mu.RUnlock()
 		if hadPrior {
+			nc := req.Nonconformant
+			if edits := req.nonStatusEdits(explicitDescription, droop, nullAxes); len(edits) > 0 && !(nc.armed() && nc.AllowContentEdit) {
+				http.Error(w, fmt.Sprintf("mrid %q already exists: IEEE Std 2030.5-2018 §10.2.3.3 c) — "+
+					"\"Editing Events SHALL NOT be allowed except for updating status. Service providers "+
+					"SHALL cancel Events that they wish clients to not act upon and/or provide new "+
+					"superseding Events\" — so this update may change only EventStatus (current_status, "+
+					"potentially_superseded), not %s. Publish a NEW mrid instead, or set "+
+					"nonconformant.allow_content_edit:true to deliberately author the illegal edit for a "+
+					"negative test", mrid, strings.Join(edits, ", ")), http.StatusBadRequest)
+				return
+			}
+			if req.CreationOffsetS != nil && !(nc.armed() && nc.AllowCreationTimeMove) {
+				http.Error(w, fmt.Sprintf("mrid %q already exists: creation_offset_s would move "+
+					"creationTime, which IEEE Std 2030.5-2018 §10.2.3.3 c) reserves to a NEW Event (rule "+
+					"f)'s supersession tiebreak runs on it) — omit creation_offset_s on this update, or set "+
+					"nonconformant.allow_creation_time_move:true to deliberately author the illegal redate "+
+					"for a negative test", mrid), http.StatusBadRequest)
+				return
+			}
 			if req.CreationOffsetS == nil {
 				creationTime = prior.creationTime
 			}
@@ -780,28 +901,63 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	if req.ResponseRequired != nil {
 		responseRequired = model.ResponseRequired(*req.ResponseRequired)
 	}
-	ctrl := model.DERControl{
-		// Href keyed by mRID so distinct admin controls are distinct addressable
-		// resources (a re-post of the same mRID — the server-cancel update — keeps
-		// the same href and upserts). A shared href would collapse two controls
-		// into one for any client that de-duplicates a paged list by href.
-		Resource: model.Resource{Href: fmt.Sprintf("/derp/%d/derc/%s", req.Program, mrid)},
-		// ReplyTo/ResponseRequired: IEEE 2030.5 Event-base (RespondableResource)
-		// attributes — see adminResponseReplyTo/adminDefaultResponseRequired.
-		ReplyTo:          adminResponseReplyTo,
-		ResponseRequired: &responseRequired,
-		MRID:             mrid,
-		Description:      req.Description,
-		CreationTime:     creationTime,
-		EventStatus: &model.EventStatus{
-			CurrentStatus:         status,
-			DateTime:              now,
-			PotentiallySuperseded: req.PotentiallySuperseded != nil && *req.PotentiallySuperseded,
-		},
-		Interval:          interval,
-		RandomizeStart:    req.RandomizeStart,
-		RandomizeDuration: req.RandomizeDuration,
-		DERControlBase:    buildBase(req, injectPF, absorbPF),
+	newStatus := &model.EventStatus{
+		CurrentStatus:         status,
+		DateTime:              now,
+		PotentiallySuperseded: req.PotentiallySuperseded != nil && *req.PotentiallySuperseded,
+	}
+
+	// inheritStored is true for a matched update that passed the guard above
+	// WITHOUT an armed content edit — i.e. an ordinary status-only flip. Such
+	// a request's content fields are now guaranteed empty (the guard already
+	// rejected anything else), so building a fresh DERControlBase from req
+	// via buildBase would author an EMPTY one and WIPE every axis this event
+	// was carrying — exactly the kind of edit rule c) forbids, just arrived at
+	// by omission instead of by re-authoring. So this path does not call
+	// buildBase (or even read the content fields of req) at all: it clones
+	// the STORED resource — scalar or extended, whichever it actually is —
+	// and swaps in only the new EventStatus.
+	inheritStored := hadPrior && len(req.nonStatusEdits(explicitDescription, droop, nullAxes)) == 0
+	var ctrl model.DERControl
+	var extCtrl *model.ExtendedDERControl
+	switch {
+	case inheritStored && prior.extended != nil:
+		e := *prior.extended
+		e.EventStatus = newStatus
+		// creationTime is NOT necessarily prior.creationTime unchanged: the
+		// guard above already applied nonconformant.allow_creation_time_move
+		// (or left it at prior.creationTime when that lever was not armed) —
+		// this local var, not the clone's own stamp, is the one place that
+		// decision landed.
+		e.CreationTime = creationTime
+		extCtrl = &e
+		// ctrl itself is not the stored resource in this case (extCtrl is) —
+		// MRID is the only field of it anything downstream still reads.
+		ctrl.MRID = mrid
+	case inheritStored && prior.scalar != nil:
+		ctrl = *prior.scalar
+		ctrl.EventStatus = newStatus
+		ctrl.CreationTime = creationTime // see the extended case's comment above
+	default:
+		ctrl = model.DERControl{
+			// Href keyed by mRID so distinct admin controls are distinct addressable
+			// resources (a re-post of the same mRID — the server-cancel update — keeps
+			// the same href and upserts). A shared href would collapse two controls
+			// into one for any client that de-duplicates a paged list by href.
+			Resource: model.Resource{Href: fmt.Sprintf("/derp/%d/derc/%s", req.Program, mrid)},
+			// ReplyTo/ResponseRequired: IEEE 2030.5 Event-base (RespondableResource)
+			// attributes — see adminResponseReplyTo/adminDefaultResponseRequired.
+			ReplyTo:           adminResponseReplyTo,
+			ResponseRequired:  &responseRequired,
+			MRID:              mrid,
+			Description:       req.Description,
+			CreationTime:      creationTime,
+			EventStatus:       newStatus,
+			Interval:          interval,
+			RandomizeStart:    req.RandomizeStart,
+			RandomizeDuration: req.RandomizeDuration,
+			DERControlBase:    buildBase(req, injectPF, absorbPF),
+		}
 	}
 
 	// IW13-001 §4.2: opModTargetW only exists on the EXTENDED control base —
@@ -817,7 +973,11 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	// may ride the SAME control — a request carrying TargetW and FreqDroop
 	// produces one control carrying both, which is what a caller who asked for
 	// both would expect and what a second `if` would have quietly broken.
-	var extCtrl *model.ExtendedDERControl
+	//
+	// Not reached when extCtrl is already set by the inheritStored branch
+	// above (that branch's req.TargetW/droop are guaranteed nil — both are
+	// content fields nonStatusEdits gates — so this condition is false and
+	// the cloned extCtrl stands untouched).
 	if req.TargetW != nil || droop != nil {
 		e := toExtendedControl(ctrl)
 		e.DERControlBase.OpModTargetW = apFromWatts(req.TargetW)
@@ -983,13 +1143,27 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 // controlIdentity is the part of a stored DERControl that IEEE Std 2030.5-2018
 // §10.2.3.3 c) forbids an update from editing: the event's creationTime (rule
 // f)'s supersession tiebreak) and its interval (the window rules m)/n)/o) all
-// reason about). Only these two — description, responseRequired, randomization
-// and the control base are re-authored from the request as before, because a
-// scenario re-POSTing the same mRID is expected to carry them through
-// unchanged and nothing in the campaign depends on gridsim policing that.
+// reason about). These two are protected unconditionally, inherited from the
+// stored copy on every matched update. IW27-005: description, responseRequired,
+// randomization and the control base used to be re-authored from the request
+// unconditionally too, on the premise that a scenario re-POSTing the same mRID
+// is expected to carry them through unchanged — but "expected to" is not
+// enforced, and adminCtrlPost's guard (nonStatusEdits) now refuses a request
+// that would author any of them, by default; nonconformantControlEdit is the
+// opt-in for a fixture that deliberately wants the old behaviour back.
+//
+// scalar/extended carry the FULL stored resource (exactly one of them set,
+// matching whichever storage width the program's list actually has), not just
+// creationTime/interval: a default-path status-only update clones one of
+// these and swaps in only the new EventStatus (see adminCtrlPost), rather than
+// re-deriving a DERControlBase from a request the guard has already forced to
+// carry no content — which would author an EMPTY one and wipe every axis the
+// event was carrying.
 type controlIdentity struct {
 	creationTime int64
 	interval     model.DateTimeInterval
+	scalar       *model.DERControl
+	extended     *model.ExtendedDERControl
 }
 
 // controlIdentityLocked returns the stored identity of program's control with
@@ -1003,13 +1177,15 @@ func (s *Server) controlIdentityLocked(program int, mrid string) (controlIdentit
 	case *model.DERControlList:
 		for i := range list.DERControl {
 			if list.DERControl[i].MRID == mrid {
-				return controlIdentity{list.DERControl[i].CreationTime, list.DERControl[i].Interval}, true
+				c := list.DERControl[i]
+				return controlIdentity{creationTime: c.CreationTime, interval: c.Interval, scalar: &c}, true
 			}
 		}
 	case *model.ExtendedDERControlList:
 		for i := range list.DERControl {
 			if list.DERControl[i].MRID == mrid {
-				return controlIdentity{list.DERControl[i].CreationTime, list.DERControl[i].Interval}, true
+				c := list.DERControl[i]
+				return controlIdentity{creationTime: c.CreationTime, interval: c.Interval, extended: &c}, true
 			}
 		}
 	}

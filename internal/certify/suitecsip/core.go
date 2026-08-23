@@ -1031,19 +1031,24 @@ func coreResponsesSpec(nonce string) spec {
 			// coreAdvancedEndDevice/coreDERSettings' RehomeDER Change uses,
 			// this time flipping EventStatus.currentStatus to 6 (Cancelled)
 			// on the SAME mRID rather than moving a resource's href (same
-			// gridsim seam, sim/gridsim/admin.go's adminCtrlReq doc). The
-			// control's own base fields are carried through unchanged so this
-			// really is "the same event, status updated" rather than a
-			// content change riding along with the cancel — and since the
-			// 2026-08-19 fix gridsim ENFORCES the other half of that (§10.2.3.3
-			// c): a matched in-place update inherits the stored copy's
-			// creationTime and interval instead of re-stamping both from the
-			// clock, which is how the cancelled event used to become newer and
-			// later-starting than everything it had been arbitrated against.
+			// gridsim seam, sim/gridsim/admin.go's adminCtrlReq doc).
+			//
+			// IW27-005: this used to resend Description/GenLimW alongside
+			// current_status, on the premise that gridsim would carry them
+			// through unchanged. That premise was never enforced — gridsim
+			// re-authored the control base from EXACTLY this request every
+			// time — so this call was only ever correct because it happened
+			// to resend the same values it first posted. gridsim's admin API
+			// now enforces IEEE Std 2030.5-2018 §10.2.3.3 c) ("Editing Events
+			// SHALL NOT be allowed except for updating status") on its
+			// default path and refuses a same-mRID update that carries a
+			// content field at all, so this cancel now sends ONLY the mRID
+			// and the status flip; gridsim inherits everything else —
+			// including gen_lim_W and creationTime/interval — from the
+			// control Setup already posted. This is the CONFORMANT shape of
+			// the two-step server-cancel, not a workaround for the guard.
 			_, err := d.PostControl(ctx, ControlRequest{
-				Program: 1, MRID: cancelMRID, Description: "CORE-022 cancellation control",
-				StartOffset: 0, DurationS: core022CancelDurationS,
-				GenLimW:       ptr(int64(core022CancelGenLimW)),
+				Program: 1, MRID: cancelMRID,
 				CurrentStatus: ptr(uint8(6)),
 			})
 			return err

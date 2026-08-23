@@ -36,6 +36,13 @@ func derc0(t *testing.T, s *Server) *model.DERControlList {
 // flip its currentStatus→6 on the SAME mRID. The seam must UPDATE in place
 // (one control, new status), not add a second control — otherwise the hub sees
 // an already-cancelled new event and drops it silently (never posts 6).
+//
+// IW27-005: the second POST no longer re-sends exp_lim_W — a conformant
+// server-cancel changes EventStatus and nothing else (IEEE Std 2030.5-2018
+// §10.2.3.3 c)), and this is the DEFAULT (non-nonconformant) path, so a
+// content field alongside current_status is refused by adminCtrlPost's guard.
+// The control base's own persistence across the flip is covered separately by
+// TestAdminControl_StatusUpdatePreservesCreationTimeAndInterval.
 func TestAdminControl_ExplicitMRIDUpdatesInPlace(t *testing.T) {
 	s := NewServer("")
 	h := s.AdminHandler()
@@ -45,14 +52,19 @@ func TestAdminControl_ExplicitMRIDUpdatesInPlace(t *testing.T) {
 		t.Fatalf("after first post: derc = %+v, want single DERC-CANCEL-ME", list.DERControl)
 	}
 
-	// Flip the SAME mRID to Cancelled(6).
-	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","current_status":6,"exp_lim_W":4000,"duration_s":300}`)
+	// Flip the SAME mRID to Cancelled(6) — status only.
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","current_status":6,"duration_s":300}`)
 	list := derc0(t, s)
 	if len(list.DERControl) != 1 {
 		t.Fatalf("in-place cancel added a control: derc has %d, want 1", len(list.DERControl))
 	}
 	if es := list.DERControl[0].EventStatus; es == nil || es.CurrentStatus != 6 {
 		t.Fatalf("cancel flip: EventStatus = %+v, want CurrentStatus 6", es)
+	}
+	if list.DERControl[0].DERControlBase.OpModExpLimW == nil {
+		t.Fatalf("cancel flip: DERControlBase = %+v, want opModExpLimW still carried through from the "+
+			"ORIGINAL post (it is inherited, not re-authored — buildBase is not even reached on this path)",
+			list.DERControl[0].DERControlBase)
 	}
 }
 
@@ -284,32 +296,67 @@ func TestAdminControl_PercentDomainRejected(t *testing.T) {
 // except for updating status. Service providers SHALL cancel Events that they
 // wish clients to not act upon and/or provide new superseding Events."
 //
-// The server-cancel two-step above is exactly that edit, and every field of the
-// re-POSTed control used to be re-derived from the CURRENT clock: creationTime
-// jumped to now, and interval/start re-anchored to it. Both are load-bearing to
-// a conformant client — creationTime is rule f)'s supersession tiebreak,
-// interval is what rules m)/n)/o) reason about — so a status-only flip silently
-// made the cancelled event newer and later-starting than everything it had been
-// arbitrated against.
+// IW27-005: this test used to be TestAdminControl_StatusUpdatePreservesCreationTimeAndInterval
+// and asserted the OPPOSITE of what it is named here — that gen_lim_W
+// accompanying a status flip on an EXISTING mRID was silently carried
+// through, re-authored from the update's own request body. Preserving
+// creationTime/interval while still letting the control BASE be re-authored
+// from the request is only half of rule c): the base is just as much an
+// "Event" element as the window is, and a fixture that could freely
+// re-describe one could author server behaviour no conformant service
+// provider could ever produce. The DEFAULT path now refuses the whole
+// request — before anything is stored — the moment it carries a content
+// field alongside an existing mRID.
 //
-// Reproduced on the wire in runs/verify-796fbc3-20260819T203800Z:
-// CERT-CORE022-CANCEL-893ce120 was served creationTime/start 1787171378 before
-// the cancel and 1787171532 after it, with only currentStatus meant to move.
-func TestAdminControl_StatusUpdatePreservesCreationTimeAndInterval(t *testing.T) {
+// TestAdminControl_ExplicitMRIDUpdatesInPlace (above) covers the conformant
+// replacement: a status-only flip that carries NO content gets the ORIGINAL
+// control's content back, unchanged, by inheritance rather than
+// re-authorship. TestAdminControl_NonconformantContentEditReauthorsExistingMRID
+// (below) covers the deliberate-violation escape hatch this test used to
+// exercise unconditionally.
+func TestAdminControl_ContentEditOnExistingMRIDIsRejectedByDefault(t *testing.T) {
 	s := NewServer("")
 	h := s.AdminHandler()
 
 	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","gen_lim_W":2000,"duration_s":600,"activate":true}`)
 	before := derc0(t, s).DERControl[0]
 
-	// Advance the server's own clock so a re-stamp cannot hide inside a
-	// same-second re-POST.
-	s.SetClockSkew(600)
-	t.Cleanup(func() { s.SetClockSkew(0) })
+	// The cancel: currentStatus 6, alongside gen_lim_W — a request that, pre-fix,
+	// would otherwise also author a completely different window (start 300s
+	// out, 900s long) on the same mRID.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/admin/control", bytes.NewReader([]byte(
+		`{"program":0,"mrid":"DERC-CANCEL-ME","current_status":6,"gen_lim_W":2000,"duration_s":900,"start_offset_s":300}`)))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /admin/control (status flip + gen_lim_W on an existing mRID) = %d, want 400: %s",
+			rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "gen_lim_W") {
+		t.Errorf("the 400 does not name the offending field:\n%s", rec.Body)
+	}
 
-	// The cancel: currentStatus 6, and a request that would otherwise author a
-	// completely different window (start 300s out, 900s long).
-	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","current_status":6,"gen_lim_W":2000,"duration_s":900,"start_offset_s":300}`)
+	// The rejected request must not have changed the stored control in any
+	// respect — not even the parts it was not, itself, complaining about.
+	after := derc0(t, s).DERControl[0]
+	if after != before {
+		t.Errorf("a rejected update still changed the stored control:\nbefore: %+v\nafter:  %+v", before, after)
+	}
+}
+
+// The nonconformant escape hatch is what this test used to exercise
+// unconditionally, on every same-mRID update: a caller that explicitly opts
+// in still gets the OLD behaviour — the control base re-authored from the
+// request — so a scenario testing a DUT's handling of a non-conformant
+// server that re-describes its own events loses no coverage.
+func TestAdminControl_NonconformantContentEditReauthorsExistingMRID(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","gen_lim_W":2000,"duration_s":600,"activate":true}`)
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","current_status":6,"gen_lim_W":3000,"duration_s":600,`+
+		`"nonconformant":{"allow_content_edit":true}}`)
 
 	list := derc0(t, s)
 	if len(list.DERControl) != 1 {
@@ -319,40 +366,74 @@ func TestAdminControl_StatusUpdatePreservesCreationTimeAndInterval(t *testing.T)
 	if es := after.EventStatus; es == nil || es.CurrentStatus != 6 {
 		t.Fatalf("cancel flip: EventStatus = %+v, want CurrentStatus 6", es)
 	}
-	if after.CreationTime != before.CreationTime {
-		t.Errorf("creationTime moved on a status-only update: %d -> %d; §10.2.3.3 c) allows only the status to change",
-			before.CreationTime, after.CreationTime)
-	}
-	if after.Interval != before.Interval {
-		t.Errorf("interval moved on a status-only update: %+v -> %+v; §10.2.3.3 c) allows only the status to change",
-			before.Interval, after.Interval)
-	}
-	// The control base still comes from the request — this rule freezes the
-	// event's IDENTITY, not everything about it.
-	if after.DERControlBase.OpModGenLimW == nil {
-		t.Fatalf("after cancel: DERControlBase = %+v, want opModGenLimW carried through", after.DERControlBase)
+	if after.DERControlBase.OpModGenLimW == nil || after.DERControlBase.OpModGenLimW.Value != 3000 {
+		t.Fatalf("nonconformant.allow_content_edit: DERControlBase = %+v, want the re-authored "+
+			"opModGenLimW=3000 from THIS request, not the original 2000", after.DERControlBase)
 	}
 }
 
 // The escape hatch stays open: a caller that explicitly asks for a creationTime
 // (creation_offset_s — how the deterministic-winner scenarios author their
-// pairs) still gets the one it asked for, on an existing mRID as on a new one.
-// Only the SILENT re-stamp is closed.
-func TestAdminControl_ExplicitCreationOffsetStillMovesCreationTime(t *testing.T) {
+// pairs) still gets the one it asked for, on an existing mRID as on a new one,
+// PROVIDED it is named as the deliberate violation it is
+// (nonconformant.allow_creation_time_move) — IW27-005 closed the SILENT path
+// this used to take by default; see
+// TestAdminControl_CreationOffsetOnExistingMRIDIsRejectedByDefault below for
+// that half.
+func TestAdminControl_NonconformantCreationOffsetMovesCreationTimeOnExistingMRID(t *testing.T) {
 	s := NewServer("")
 	h := s.AdminHandler()
 
 	postCtrl(t, h, `{"program":0,"mrid":"DERC-REDATE","gen_lim_W":2000,"duration_s":600,"activate":true}`)
 	before := derc0(t, s).DERControl[0]
 
-	postCtrl(t, h, `{"program":0,"mrid":"DERC-REDATE","gen_lim_W":2000,"duration_s":600,"creation_offset_s":120}`)
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-REDATE","creation_offset_s":120,`+
+		`"nonconformant":{"allow_creation_time_move":true}}`)
 	after := derc0(t, s).DERControl[0]
 
 	if after.CreationTime <= before.CreationTime {
-		t.Errorf("explicit creation_offset_s=120: creationTime %d -> %d, want it to move later",
+		t.Errorf("explicit creation_offset_s=120 (nonconformant, armed): creationTime %d -> %d, want it to move later",
 			before.CreationTime, after.CreationTime)
 	}
 	if after.Interval != before.Interval {
 		t.Errorf("interval moved: %+v -> %+v; only creationTime was asked for", before.Interval, after.Interval)
+	}
+	// The rest of the control's content still comes through by inheritance —
+	// the nonconformant flag armed here is ONLY allow_creation_time_move, not
+	// allow_content_edit, so gen_lim_W (omitted from this request) must still
+	// read as the ORIGINAL value, not vanish.
+	if after.DERControlBase.OpModGenLimW == nil || after.DERControlBase.OpModGenLimW.Value != before.DERControlBase.OpModGenLimW.Value {
+		t.Errorf("DERControlBase = %+v, want opModGenLimW unchanged from before: %+v",
+			after.DERControlBase, before.DERControlBase)
+	}
+}
+
+// The DEFAULT path half of the creationTime rule: without the nonconformant
+// escape hatch, creation_offset_s on an EXISTING mRID is refused outright
+// (400) rather than silently ignored — a caller who asked for a specific
+// creationTime and got a different one with no complaint would have no way to
+// notice the request did not do what it asked.
+func TestAdminControl_CreationOffsetOnExistingMRIDIsRejectedByDefault(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-REDATE2","gen_lim_W":2000,"duration_s":600,"activate":true}`)
+	before := derc0(t, s).DERControl[0]
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/admin/control", bytes.NewReader([]byte(
+		`{"program":0,"mrid":"DERC-REDATE2","creation_offset_s":120}`)))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /admin/control (creation_offset_s on an existing mRID, no nonconformant flag) = %d, "+
+			"want 400: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "creation_offset_s") {
+		t.Errorf("the 400 does not name creation_offset_s:\n%s", rec.Body)
+	}
+
+	after := derc0(t, s).DERControl[0]
+	if after != before {
+		t.Errorf("a rejected update still changed the stored control:\nbefore: %+v\nafter:  %+v", before, after)
 	}
 }

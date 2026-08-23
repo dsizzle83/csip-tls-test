@@ -287,19 +287,75 @@ func (s *SimClient) Raw(ctx context.Context, method, path string, body any) ([]b
 // readOnlyCommands is the allowlist of gateway commands a check may run. Every
 // one of them observes; none of them changes anything. `systemctl` is admitted
 // only for its reporting subcommands, checked separately.
+//
+// `wget` (IW27-004) is here so metricscrape.NewSSHSource can fetch the DUT's
+// own loopback-bound /metrics endpoint by asking the DUT to fetch it itself —
+// only ever invoked as `wget -qO- <url>`, a plain GET, never with
+// `--post-data`/`--method` or any other verb-changing flag.
 var readOnlyCommands = map[string]bool{
 	"cat": true, "head": true, "tail": true, "ls": true, "stat": true,
 	"grep": true, "journalctl": true, "uname": true, "hostname": true,
 	"date": true, "uptime": true, "df": true, "ss": true, "ip": true,
 	"openssl": true, "sha256sum": true, "md5sum": true, "readlink": true,
 	"find": true, "wc": true, "id": true, "env": true, "true": true,
-	"systemctl": true, "fw_printenv": true, "bootcount": true,
+	"systemctl": true, "fw_printenv": true, "bootcount": true, "wget": true,
 }
 
 // systemctlReadOnly is the set of systemctl subcommands that only report.
 var systemctlReadOnly = map[string]bool{
 	"show": true, "status": true, "is-active": true, "is-enabled": true,
 	"is-failed": true, "list-units": true, "list-unit-files": true, "cat": true,
+}
+
+// wgetMutatingFlagPrefixes are wget flags that turn a fetch into a write to
+// the DUT (a differently-verbed request, a body upload) — checked as
+// prefixes because wget accepts both "--post-data=x" and "--post-data x"
+// forms. This exists because readOnlyCommands' doc comment asserts wget is
+// "only ever invoked as `wget -qO- <url>`... never with --post-data" as an
+// invariant of its one caller (metricscrape.NewSSHSource) — true today, but
+// not enforced by the allowlist itself the way systemctl's subcommand is. A
+// second caller added later without reading that comment would silently
+// inherit an unrestricted wget.
+var wgetMutatingFlagPrefixes = []string{
+	"--post-data", "--post-file", "--method", "--body-data", "--body-file",
+}
+
+// wgetStdoutTokens are the exact argument spellings this repo's one caller
+// (metricscrape.NewSSHSource, "wget -qO- <url>") and its reasonable variants
+// use to send the fetched body to stdout instead of wget's own default of
+// writing a same-named file to the DUT's filesystem. Matched exactly, not by
+// prefix/suffix, so an unanticipated combined short-flag spelling is treated
+// as unsafe rather than guessed at.
+var wgetStdoutTokens = map[string]bool{
+	"-O-": true, "-qO-": true, "-nvO-": true, "--output-document=-": true,
+}
+
+// wgetReadOnly reports whether a wget invocation is the plain-GET-to-stdout
+// shape this allowlist exists to permit, rejecting anything else even though
+// the command's head token is allowed.
+func wgetReadOnly(args []string) error {
+	sawStdoutOutput := false
+	for _, a := range args {
+		for _, bad := range wgetMutatingFlagPrefixes {
+			if strings.HasPrefix(a, bad) {
+				return fmt.Errorf("%w: wget %q is a verb-changing flag; only a plain GET is permitted",
+					ErrNotReadOnly, a)
+			}
+		}
+		if wgetStdoutTokens[a] {
+			sawStdoutOutput = true
+			continue
+		}
+		if strings.HasPrefix(a, "-O") || strings.HasPrefix(a, "--output-document") {
+			return fmt.Errorf("%w: wget %q writes to a file instead of stdout; only -O- (or -qO-) is permitted",
+				ErrNotReadOnly, a)
+		}
+	}
+	if !sawStdoutOutput {
+		return fmt.Errorf("%w: wget invocation does not fetch to stdout (-O-/-qO-/--output-document=-); refusing an ambiguous form that would default to writing a file on the DUT",
+			ErrNotReadOnly)
+	}
+	return nil
 }
 
 // ErrNotReadOnly is returned when a check tries to run a mutating command on
@@ -349,6 +405,11 @@ func CheckReadOnly(args []string) error {
 		if !systemctlReadOnly[sub] {
 			return fmt.Errorf("%w: systemctl %q changes service state; only %s are permitted",
 				ErrNotReadOnly, sub, strings.Join(sortedKeys(systemctlReadOnly), "/"))
+		}
+	}
+	if head == "wget" {
+		if err := wgetReadOnly(args[1:]); err != nil {
+			return err
 		}
 	}
 	return nil

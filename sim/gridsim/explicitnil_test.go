@@ -263,7 +263,13 @@ func TestExplicitNil_IsOffByDefaultAndChangesNoByte(t *testing.T) {
 	armed := newTestServer()
 	postControlOK(t, armed, `{"program":0,"activate":true,"mrid":"M-SAME","connect":true,`+
 		`"max_lim_W":5000,"null_axes":["opModVoltVar"]}`)
-	postControlOK(t, armed, plainBody) // same mRID, no null_axes: the release of the release
+	// The release: same mRID, no null_axes, and — IW27-005 — no content fields
+	// either. §10.2.3.3 c) permits only an EventStatus edit on an existing
+	// mRID, so this update no longer resends connect/max_lim_W to keep them;
+	// it omits them and lets adminCtrlPost inherit the STORED control
+	// (including connect/max_lim_W from the post above) unchanged, dropping
+	// only the marker. That is the release this test is actually about.
+	postControlOK(t, armed, `{"program":0,"mrid":"M-SAME"}`)
 	after := string(unixSeconds.ReplaceAll([]byte(dercDoc(t, armed, 0)), []byte("EPOCH")))
 
 	if after != baseline {

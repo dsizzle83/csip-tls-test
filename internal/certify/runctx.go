@@ -115,11 +115,18 @@ func DefaultTargets() Targets {
 		MBAPSDev:     "69.0.0.20:8021",
 		MBAPSDevAPI:  "http://69.0.0.20:6031",
 		// The DUT's own Prometheus endpoint. lexa-gw serves it on MetricsAddr,
-		// whose default is the LOOPBACK 127.0.0.1:9102 (cmd/northbound's
-		// config) — docs/BENCH.md binds it to the LAN address below, which is
-		// what a desktop run can actually reach. A bench whose gateway keeps
-		// the loopback default needs an ssh forward and -metrics-endpoint.
-		Extra: map[string]string{TargetMetrics: "http://69.0.0.2:9102/metrics"},
+		// whose default AND ONLY posture is the LOOPBACK 127.0.0.1:9102
+		// (cmd/northbound's config) — deliberately, per lexa-gw's
+		// docs/METRICS_CATALOG.md §13.3, and never dialed directly from
+		// off-box (IW27-004; this used to read "http://69.0.0.2:9102/metrics",
+		// the DUT's LAN address, following a stale docs/BENCH.md note about a
+		// bench-only LAN rebind that described the abandoned lexa-hub product
+		// and does not apply here — every such dial was UNREACHABLE against
+		// the real posture). suitecsip's metricsScraper reaches this URL by
+		// asking the DUT to fetch it over -gateway-ssh; a run with no
+		// -gateway-ssh falls back to dialing it directly, which only works
+		// behind an operator's own manual ssh -L forward.
+		Extra: map[string]string{TargetMetrics: "http://127.0.0.1:9102/metrics"},
 	}
 }
 

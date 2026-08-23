@@ -207,6 +207,74 @@ func TestDisclosure_AnUnconfiguredBenchIsAWarnNamingItself(t *testing.T) {
 	t.Logf("WARN (bench did not look) — %s", why)
 }
 
+// TestDisclosure_GatewaySSHConfiguredReachesTheChannelOverSSH is IW27-004's
+// closing bar: a run with -gateway-ssh configured (the normal bench posture —
+// every real run already sets it for other read-only introspection) must
+// fetch the DUT's loopback-bound metrics endpoint BY ASKING THE DUT ITSELF,
+// not by dialing the endpoint's host directly from the harness's own seat.
+// Before the fix, metricsScraper always built an HTTPSource and dialed
+// Targets.Extra["metrics"] straight off the network — which, against the
+// endpoint's real loopback-only posture (lexa-gw docs/METRICS_CATALOG.md
+// §13.3), is unreachable in every case: connection refused, always. This test
+// substitutes a fake Runner for the DUT's ssh command execution (the same
+// substitution point core005_test.go and observe_test.go use) so the
+// assertion is "the scraper used the SSH runner", not "an httptest server
+// happened to answer" — which is indistinguishable, over 127.0.0.1, from the
+// exact bug this closes.
+func TestDisclosure_GatewaySSHConfiguredReachesTheChannelOverSSH(t *testing.T) {
+	var gotArgs []string
+	rc := &certify.RunCtx{
+		Targets: certify.Targets{Extra: map[string]string{
+			metricsTargetKey: "http://127.0.0.1:9102/metrics",
+		}},
+		Gateway: &certify.Gateway{SSH: "cc93", Runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			gotArgs = append([]string(nil), args...)
+			return []byte(familyBody(8, 4)), nil
+		}},
+	}
+	params := map[string]string{}
+	d := &Driver{disclosure: openDisclosureWindow(context.Background(), rc, params, "", "TEST")}
+	if d.disclosure == nil {
+		t.Fatalf("a run with -gateway-ssh configured opened no window: %s", params[disclosureUnavailableParam])
+	}
+	recordDisclosure(context.Background(), d, params)
+	if why := params[disclosureUnavailableParam]; why != "" {
+		t.Fatalf("a configured run still reported the channel unavailable: %s", why)
+	}
+	if len(gotArgs) == 0 {
+		t.Fatal("the ssh Runner was never invoked — the scraper dialled the network directly instead of " +
+			"asking the DUT to fetch its own loopback endpoint")
+	}
+	// gotArgs is what Gateway.Run hands its ssh Runner AFTER the "ssh" argv[0]
+	// (which the Runner signature drops) — that is "-o BatchMode=yes", the
+	// destination, and then the remote command NewSSHSource asked for, in that
+	// order (certify/clients.go's Run). So "wget" need not be gotArgs[0]; it
+	// must simply appear, immediately followed by the fetch flag and the URL.
+	wantTail := []string{"wget", "-qO-", "http://127.0.0.1:9102/metrics"}
+	if len(gotArgs) < len(wantTail) {
+		t.Fatalf("ssh command = %v, too short to carry %v", gotArgs, wantTail)
+	}
+	gotTail := gotArgs[len(gotArgs)-len(wantTail):]
+	for i := range wantTail {
+		if gotTail[i] != wantTail[i] {
+			t.Errorf("ssh command tail = %v, want %v (metricscrape.NewSSHSource)", gotTail, wantTail)
+			break
+		}
+	}
+	found := false
+	for _, a := range gotArgs {
+		if a == "http://127.0.0.1:9102/metrics" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ssh command = %v, want it to name the configured endpoint", gotArgs)
+	}
+	if len(d.metrics) != 1 || len(d.metrics[0].Series) == 0 {
+		t.Fatalf("the row recorded no re-derivable scrape material: %+v", d.metrics)
+	}
+}
+
 // The kind a row asserts is DERIVED from what it published, so a row cannot
 // claim a disclosure it never asked for.
 func TestDisclosureKindFor_FollowsWhatTheRowPublished(t *testing.T) {

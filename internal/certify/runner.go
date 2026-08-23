@@ -324,8 +324,9 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Targets.ModSim, "modsim", o.Targets.ModSim, "plain SunSpec Modbus sim host:port")
 	fs.StringVar(&o.Targets.ModSimAPI, "modsim-api", o.Targets.ModSimAPI, "modsim simapi base URL")
 	fs.Var(endpointFlag{&o.Targets, TargetMetrics}, "metrics-endpoint",
-		"the DUT's own Prometheus endpoint URL, e.g. http://69.0.0.2:9102/metrics "+
-			"(the disclosure-counter evidence channel reads it; empty disables that channel)")
+		"the DUT's own Prometheus endpoint URL, e.g. http://127.0.0.1:9102/metrics — loopback-only by "+
+			"design, so also pass -gateway-ssh to fetch it on the DUT (the disclosure-counter evidence "+
+			"channel reads it; empty disables that channel)")
 	fs.StringVar(&o.Targets.MBAPSDev, "mbapsdev", o.Targets.MBAPSDev, "secure Modbus device sim host:port")
 	fs.StringVar(&o.Targets.MBAPSDevAPI, "mbapsdev-api", o.Targets.MBAPSDevAPI, "mbapsdev simapi base URL")
 	fs.DurationVar(&o.CheckTimeout, "timeout", o.CheckTimeout, "per-check timeout")
