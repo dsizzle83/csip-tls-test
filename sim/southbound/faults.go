@@ -107,10 +107,14 @@ type faultController struct {
 	// ARMS the raw bits, the physical coupling is the mirror's job.
 	// curveAdoptLies makes the curve-adopt handshake report COMPLETED without
 	// updating the live curve. pfAckIgnore makes 704 PF/var writes ACK without
-	// moving measured PF/var. See raise_alarm / curve_adopt_lies / pf_ack_ignore.
+	// moving measured PF/var. lyingConnSt forces 701 ConnSt to report 0 while
+	// W/VA/possible_W stay at their genuine, currently-exporting level — the
+	// device lying about being disconnected rather than about a limit or a
+	// curve. See raise_alarm / curve_adopt_lies / pf_ack_ignore / lying_connst.
 	raiseAlarmBits uint32
 	curveAdoptLies bool
 	pfAckIgnore    bool
+	lyingConnSt    bool
 }
 
 // alarmBits returns the model 701 Alrm bitfield the raise_alarm fault set
@@ -135,6 +139,16 @@ func (fc *faultController) pfIgnored() bool {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	return fc.pfAckIgnore
+}
+
+// connStLying reports whether lying_connst is armed (701 ConnSt reads 0 while
+// W/VA/possible_W stay at their genuine exporting level). Read every time
+// advMirror701 stamps 701, so the override applies to every tick and every
+// write-time re-derivation exactly the way raiseAlarmBits does.
+func (fc *faultController) connStLying() bool {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	return fc.lyingConnSt
 }
 
 // transportRead is the RegisterMap.OnRead hook. It applies the armed transport
@@ -485,6 +499,10 @@ func (fc *faultController) apply(body []byte, supported map[FaultKind]bool) erro
 	case FaultPFAckIgnore:
 		fc.pfAckIgnore = !spec.Clear
 		log.Printf("[fault] pf_ack_ignore: %s armed=%v", fc.label, fc.pfAckIgnore)
+
+	case FaultLyingConnSt:
+		fc.lyingConnSt = !spec.Clear
+		log.Printf("[fault] lying_connst: %s armed=%v", fc.label, fc.lyingConnSt)
 	}
 	return nil
 }

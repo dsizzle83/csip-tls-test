@@ -114,13 +114,14 @@ func advCoupledVoltHz(bits uint32, volt, hz float64) (float64, float64) {
 // legacy solar kind plus the three 7xx kinds. Built from solarFaultKinds so the
 // two never drift.
 var solarAdvFaultKinds = func() map[FaultKind]bool {
-	m := make(map[FaultKind]bool, len(solarFaultKinds)+3)
+	m := make(map[FaultKind]bool, len(solarFaultKinds)+4)
 	for k := range solarFaultKinds {
 		m[k] = true
 	}
 	m[FaultRaiseAlarm] = true
 	m[FaultCurveAdoptLies] = true
 	m[FaultPFAckIgnore] = true
+	m[FaultLyingConnSt] = true
 	return m
 }()
 
@@ -1186,7 +1187,11 @@ func advBridgeSetpoint(r *RegisterMap, bases SolarBases, wmaxW float64) {
 // to PF/Var and stamping the current raise_alarm bits into Alrm — deriving
 // the voltage/frequency points those bits claim from advCoupledVoltHz first
 // (see its doc), so a voltage or frequency alarm bit is never left backed by
-// a nominal reading.
+// a nominal reading. It also applies lying_connst LAST, after ConnSt has
+// already been derived correctly from the real conn/st103 state below: every
+// other point this function writes (W, VA, Var, PF, the voltages) is left
+// genuine, so the fault is a single false claim on an otherwise-normal
+// export rather than a second, fully-disconnected device model.
 //
 // THE MIRROR MUST NOT BE LOSSY. This model declares ACType = THREE_PHASE, and
 // the 103 it mirrors from is a genuinely three-phase animation: it writes
@@ -1266,6 +1271,18 @@ func advMirror701(r *RegisterMap, bases SolarBases, adv solarAdvBases, wmaxW, va
 	} else {
 		v.SetEnum("St", 1)
 		v.SetEnum("ConnSt", 1)
+	}
+	// lying_connst (IW16-001's bench fixture): overwrite ONLY ConnSt, after
+	// everything above has been derived normally from the real physical
+	// state. St, W, VA, Var, PF and every other 701 point this function writes
+	// are left exactly as the genuine (connected, exporting) machine computed
+	// them — this is not a second disconnected-device model, it is one claim
+	// on an otherwise-normal export going false. A genuinely disconnected
+	// device (conn==0) already reads ConnSt=0 honestly above; forcing it again
+	// there is a harmless no-op, so this check does not need to special-case
+	// that branch.
+	if fc.connStLying() {
+		v.SetEnum("ConnSt", 0)
 	}
 	v.SetEnum("InvSt", uint16(st103))
 	v.SetU32("Alrm", alrm)

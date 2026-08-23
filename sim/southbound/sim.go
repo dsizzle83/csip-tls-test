@@ -169,6 +169,33 @@ const (
 	// verification (not the write ACK) catches it.
 	FaultPFAckIgnore FaultKind = "pf_ack_ignore"
 
+	// FaultLyingConnSt makes the SunSpec model 701 ConnSt point report 0 (not
+	// connected) while the device CONTINUES to physically export real power —
+	// W, VA, possible_W and every other 701 measurement stay at their genuine,
+	// commanded level. It is the exact opposite of every other fault in this
+	// section: those make a claim outlive the physics that used to back it
+	// (an alarm bit, a completed adopt, an accepted PF); this one makes ONE
+	// claim go false while the physics it is supposed to summarize keeps
+	// telling the truth right next to it.
+	//
+	// It exists to drive lexa-gw's cease-to-energize convergence check
+	// (cmd/modbus/reconcile_adv.go synthesizeLocked, IW16-001): before that
+	// fix, a DER latching ConnSt=0 while still exporting would have a
+	// cease-to-energize command wrongly confirmed Converged on the register
+	// claim alone, with the uncontrolled export never reported. No sim in this
+	// harness could previously produce that condition — populate701/
+	// advMirror701 always derived ConnSt FROM the same physical state (the
+	// M123 Conn register and M103 St) that also drives W, so the two could
+	// never disagree. This fault forces exactly that disagreement, on demand,
+	// on an otherwise-normal export.
+	//
+	// Persistent until cleared (like raise_alarm / curve_adopt_lies /
+	// pf_ack_ignore, and unlike the one-shot transport faults): a DER that
+	// latches a false ConnSt is realistically a STUCK condition, not a single
+	// bad sample, and the divergence check this exists to exercise is a
+	// sustained-mismatch check, not an edge-triggered one.
+	FaultLyingConnSt FaultKind = "lying_connst"
+
 	// ── LEGACY curve family (12x) faults — see curve12x.go. ──
 	//
 	// The legacy generation has NO adopt handshake, so curve_adopt_lies has no

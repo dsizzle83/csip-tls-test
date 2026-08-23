@@ -538,11 +538,123 @@ func setFixedPF(r *RegisterMap, adv solarAdvBases, pf float64, overExcited bool)
 	writeSlice(r, adv.M704, regs)
 }
 
+// ── lying_connst (IW16-001's bench fixture) ──────────────────────────────────
+
+// TestAdvLyingConnStKeepsExportWhileClaimingDisconnected is the fixture
+// lexa-gw's IW16-001 fix (cmd/modbus/reconcile_adv.go synthesizeLocked) needed
+// and no sim in this harness could previously produce: a DER whose 701 ConnSt
+// reads 0 (not connected) while it continues to physically export real power.
+//
+// Before IW16-001, synthesizeLocked's cease-to-energize arm consulted the
+// DER's own ConnSt register FIRST and returned Converged the instant it read
+// 0, before ever checking measured power. A device latching exactly this
+// condition — ConnSt=0 while still exporting — would have had a
+// cease-to-energize command wrongly confirmed Applied/Started(2) while the
+// uncontrolled export went unreported. Every existing 7xx fault in this file
+// makes ConnSt drift from the truth by changing the truth (raise_alarm,
+// curve_adopt_lies, pf_ack_ignore all make some OTHER claim outlive the
+// physics); none of them can produce a false ConnSt on an otherwise-genuine
+// export, because advMirror701 has always derived ConnSt FROM the same
+// conn/st103 state that also drives W (solar_adv.go's populate701/
+// advMirror701).
+//
+// This test proves the SIMULATOR, not the gateway: with lying_connst armed,
+// ConnSt genuinely reads 0 while W, 701's own measurement, and possible_W all
+// stay at their real, commanded, non-zero level. It is the necessary
+// precondition for the bench proof IW16-001's fix was committed without
+// (docs/known_issues.json) — this fault is what finally lets that proof run
+// against real hardware instead of staying owed.
+//
+// MUTATION PROOF: remove the fc.connStLying() override in advMirror701 (or
+// move it BEFORE the genuine conn/st103 derivation instead of after) and this
+// test fails — either ConnSt reads 1 (no lie), or W/possible_W read 0 (a
+// second disconnected-device model instead of one false claim on a real one).
+func TestAdvLyingConnStKeepsExportWhileClaimingDisconnected(t *testing.T) {
+	const wmax = 8000.0
+	ss := newAdvSolar(t, wmax)
+
+	setSolarPotential(ss, 6000)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-6000) > 1 {
+		t.Fatalf("fixture: pre-fault measured = %.0f W, want 6000 W", got)
+	}
+	m701 := sunspec.Parse701(readSlice(ss.Regs, ss.adv.M701, ss.adv.M701Len))
+	if m701.ConnSt != 1 {
+		t.Fatalf("fixture: pre-fault ConnSt = %d, want 1 (connected) or this test proves nothing", m701.ConnSt)
+	}
+
+	if err := ss.ApplyFault([]byte(`{"kind":"lying_connst"}`)); err != nil {
+		t.Fatalf("arm lying_connst: %v", err)
+	}
+	stepSolarHeld(ss)
+
+	m701 = sunspec.Parse701(readSlice(ss.Regs, ss.adv.M701, ss.adv.M701Len))
+	if m701.ConnSt != 0 {
+		t.Errorf("ConnSt under lying_connst = %d, want 0 (the lie)", m701.ConnSt)
+	}
+	if m701.St != 1 {
+		t.Errorf("St under lying_connst = %d, want 1 (still running) — only ConnSt is the lie", m701.St)
+	}
+	if math.Abs(m701.W-6000) > 1 {
+		t.Errorf("701 W under lying_connst = %.0f, want ≈6000 (genuine export, NOT zeroed)", m701.W)
+	}
+	if got := solarMeasuredW(ss); math.Abs(got-6000) > 1 {
+		t.Errorf("103 measured W under lying_connst = %.0f, want ≈6000 (physics untouched)", got)
+	}
+	if av := ss.Snapshot().Measurements.Possible_W; math.Abs(av-6000) > 1 {
+		t.Errorf("possible_W under lying_connst = %v, want ≈6000 — this is a lying register, not a cease", av)
+	}
+
+	// Clearing restores the honest reading without touching physics: the
+	// export never moved, only the claim about it did.
+	if err := ss.ApplyFault([]byte(`{"kind":"lying_connst","clear":true}`)); err != nil {
+		t.Fatalf("clear lying_connst: %v", err)
+	}
+	stepSolarHeld(ss)
+	m701 = sunspec.Parse701(readSlice(ss.Regs, ss.adv.M701, ss.adv.M701Len))
+	if m701.ConnSt != 1 {
+		t.Errorf("ConnSt after clear = %d, want 1 (honest again)", m701.ConnSt)
+	}
+	if math.Abs(m701.W-6000) > 1 {
+		t.Errorf("W after clear = %.0f, want ≈6000 (unchanged by the clear)", m701.W)
+	}
+}
+
+// TestAdvLyingConnStGenuineDisconnectIsUnaffected is the control: a REAL
+// disconnect (M123 Conn=0) already reads ConnSt=0 honestly with lying_connst
+// armed too — the fault does not need to special-case that branch (it
+// overwrites ConnSt to 0 either way), but the genuine cease behaviour
+// (W→0, possible_W→0 via permit-service/Conn) must still hold so this fault
+// cannot be mistaken for a way to fake the OTHER direction (a device that
+// looks disconnected because it actually is).
+func TestAdvLyingConnStGenuineDisconnectIsUnaffected(t *testing.T) {
+	const wmax = 8000.0
+	ss := newAdvSolar(t, wmax)
+
+	setSolarPotential(ss, 6000)
+	stepSolarHeld(ss)
+	if err := ss.ApplyFault([]byte(`{"kind":"lying_connst"}`)); err != nil {
+		t.Fatalf("arm lying_connst: %v", err)
+	}
+	// Withdraw permit service — a GENUINE cease, independent of the fault.
+	ss.Regs.Set(ss.bases.M703Base+uint16(sunspec.L703.Offset("ES")), 0)
+	stepSolarHeld(ss)
+
+	m701 := sunspec.Parse701(readSlice(ss.Regs, ss.adv.M701, ss.adv.M701Len))
+	if m701.ConnSt != 0 {
+		t.Errorf("ConnSt after a genuine cease = %d, want 0", m701.ConnSt)
+	}
+	if m701.W != 0 {
+		t.Errorf("W after a genuine cease (with lying_connst armed) = %v, want 0 — a real cease still "+
+			"really ceases; lying_connst only forges the claim, it does not disable the real one", m701.W)
+	}
+}
+
 // TestAdvFaultSet verifies the advanced sim advertises the 7xx fault kinds while
 // a legacy sim rejects them, and that the legacy kinds still work on both.
 func TestAdvFaultSet(t *testing.T) {
 	adv := newAdvSolar(t, 5000)
-	for _, k := range []string{"raise_alarm", "curve_adopt_lies", "pf_ack_ignore"} {
+	for _, k := range []string{"raise_alarm", "curve_adopt_lies", "pf_ack_ignore", "lying_connst"} {
 		if err := adv.ApplyFault([]byte(`{"kind":"` + k + `","clear":true}`)); err != nil {
 			t.Errorf("advanced sim rejected %q: %v", k, err)
 		}
@@ -550,7 +662,7 @@ func TestAdvFaultSet(t *testing.T) {
 	// A legacy solar sim must NOT advertise the 7xx kinds.
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
 	legacy := &SolarServer{Server: &Server{Regs: r}, bases: populateSolar(r, 5000, ""), wmaxW: 5000}
-	for _, k := range []string{"raise_alarm", "curve_adopt_lies", "pf_ack_ignore"} {
+	for _, k := range []string{"raise_alarm", "curve_adopt_lies", "pf_ack_ignore", "lying_connst"} {
 		if err := legacy.ApplyFault([]byte(`{"kind":"` + k + `"}`)); err == nil {
 			t.Errorf("legacy sim accepted advanced kind %q (should reject)", k)
 		}
