@@ -424,12 +424,13 @@ func populateSolarAdvanced(r *RegisterMap, wmaxW, varRating float64, serial stri
 	bases, cursor := populateSolarCore(r, wmaxW, serial)
 	seedLineToLineVoltage(r, bases)
 	adv, cursor := populateSolar7xx(r, cursor, wmaxW, varRating, opts)
-	// The ONE physics has to see the two advanced blocks that BIND OUTPUT: 702
-	// carries the WMax setting every percent resolves against, 704 the WSet
-	// setpoint. Copied from adv (single source) into SolarBases, which is what
+	// The ONE physics has to see the three advanced blocks that BIND OUTPUT:
+	// 702 carries the WMax setting every percent resolves against, 704 the WSet
+	// setpoint, and 703 the PERMIT-SERVICE enable (solarPermitService). Copied
+	// from adv (single source) into SolarBases, which is what
 	// solarStep/solarCeilingW/solarSetpointW already receive — see SolarBases'
 	// own doc for why the plumbing goes this way instead of widening signatures.
-	bases.M702Base, bases.M704Base = adv.M702, adv.M704
+	bases.M702Base, bases.M703Base, bases.M704Base = adv.M702, adv.M703, adv.M704
 	// A device with reversion timers has FACTORY DEFAULT destinations for them.
 	// Seeded after populate704 rather than inside it, because the battery images
 	// build their own 704 through a different path and declare a different
@@ -1014,14 +1015,34 @@ func (ss *SolarServer) advSync() {
 // (battery_pack.go) and, like it, sets the command rather than the whole
 // physical image — see advBridgeSetpoint.
 //
-// Gated on the 704 block: every other write reaches the physics through the
-// animation tick exactly as before, so this hook cannot change the behaviour of
-// any scenario that never writes 704.
+// Gated on the 704 and 703 blocks: every other write reaches the physics
+// through the animation tick exactly as before, so this hook cannot change the
+// behaviour of any scenario that writes neither.
+//
+// 703 JOINED 704 HERE WITH IW16-002, and it needs one thing 704 does not. A
+// permit-service withdrawal must be visible in the MEASUREMENT the instant it
+// lands, because the gateway's cease-to-energize verdict is measured (it
+// refuses to treat its own write's ACK as convergence) and its poll can arrive
+// well inside one 5 s animation tick. advSync alone would not do it: advSync
+// re-derives 701 FROM the 103 image, and nothing has zeroed 103 yet — the
+// mirror would faithfully republish the pre-write export. So the cease is
+// applied to 103 first, exactly as solarStep would have applied it on the next
+// tick, and the mirror then carries it into 701. Restoring permit service needs
+// no counterpart: raising output is the animation's business (advBridgeSetpoint
+// makes the same split for the same reason).
 func (ss *SolarServer) solarOnWrite(startAddr uint16) {
-	if !ss.advanced || ss.adv.M704 == 0 {
+	if !ss.advanced {
 		return
 	}
-	if startAddr < ss.adv.M704 || startAddr >= ss.adv.M704+uint16(sunspec.L704.Len()) {
+	switch {
+	case ss.adv.M704 != 0 &&
+		startAddr >= ss.adv.M704 && startAddr < ss.adv.M704+uint16(sunspec.L704.Len()):
+	case ss.adv.M703 != 0 &&
+		startAddr >= ss.adv.M703 && startAddr < ss.adv.M703+uint16(sunspec.L703.Len()):
+		if !solarPermitService(ss.Regs, ss.bases) {
+			solarZeroOutput(ss.Regs, ss.bases)
+		}
+	default:
 		return
 	}
 	// advSync, not a hand-rolled subset: the write path and the /inject path
@@ -1087,6 +1108,38 @@ func solarSetpointW(r *RegisterMap, bases SolarBases, wmaxW float64) (float64, b
 		return 0, false
 	}
 	return math.Max(0, math.Min(ref, w)), true
+}
+
+// solarPermitService reports whether the DER is PERMITTED to energize — model
+// 703's ES point, IEEE 1547-2018 §4.10.3's permit-service enable.
+//
+// A LEGACY SIM (no 703 at all) IS ALWAYS PERMITTED, so every non-advanced
+// scenario is byte-identical to before this function existed; so is every
+// advanced one that never writes ES, because populate703 seeds it TRUE.
+// Only an explicit ES=0 changes anything, and only on a sim that publishes the
+// model it wrote.
+//
+// WHY THIS EXISTS (IW16-002). 703 was populated and then never read: an ES
+// write was ACK'd by the Modbus server, stored verbatim, read back correctly by
+// /registers — and PHYSICALLY IGNORED, so a gateway commanding cease-to-
+// energize watched the inverter keep exporting. On the bench that turned a
+// correct gateway verdict into an unexplained one: lexa-gw judges this axis by
+// MEASURED cessation and never by the write's own ACK (its synthesizeLocked
+// says so in as many words), so it read the still-exporting device as diverged,
+// re-wrote ES every backoff, opened a non-converged episode and finally
+// answered the head end cannot-comply — all of it TRUE about this simulator and
+// none of it a gateway defect. It is the IW15-001 shape (WSet ACK'd and
+// ignored) on the one remaining advanced control register that had it.
+//
+// ES is Tenum16 in the SunSpec layout (0 = disabled, 1 = enabled), so it is
+// read through the layout View rather than by treating the raw word as a bool:
+// any nonzero value is a permit, which is the reading that survives a device
+// or a test writing 2 for "enabled".
+func solarPermitService(r *RegisterMap, bases SolarBases) bool {
+	if bases.M703Base == 0 {
+		return true // legacy sim: no enter-service model, nothing to withdraw
+	}
+	return r.Get(bases.M703Base+uint16(sunspec.L703.Offset("ES"))) != 0
 }
 
 // advBridgeSetpoint gives a 704 WSet write its IMMEDIATE physical consequence,

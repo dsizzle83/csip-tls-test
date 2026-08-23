@@ -66,6 +66,17 @@ type SolarBases struct {
 	// legacy sim leaves both zero and every new branch is skipped.
 	M702Base uint16 // Model 702 (DER Capacity)   data start — 0 on a legacy sim
 	M704Base uint16 // Model 704 (DER AC Controls) data start — 0 on a legacy sim
+
+	// M703Base rides here for the SAME reason, and it was the last inert
+	// advanced control register in this sim (IW16-002). 703 ES is PERMIT
+	// SERVICE — IEEE 1547-2018 §4.10.3's enable, and the register a
+	// 2030.5/CSIP opModEnergize lands on. Until this field existed the sim
+	// ACK'd an ES write, stored it verbatim and read it back correctly, and
+	// the physics never looked at it: a commanded cease-to-energize left the
+	// inverter exporting. That is the ack_no_apply fault permanently armed on
+	// the axis the BASIC-009 conformance rows are written against — the exact
+	// shape IW15-001 closed for WSet, one model over.
+	M703Base uint16 // Model 703 (DER Enter Service) data start — 0 on a legacy sim
 }
 
 // SolarServer is an animated PV inverter simulator with a built-in API.
@@ -1039,20 +1050,39 @@ func cloudTransmittance(simTime int64, cloud float64) float64 {
 // existing jitter with no change here; TmpCab's ambient-jitter override below
 // is the one addition night needs to keep its slow-class point visibly alive
 // too, rather than pinned at exactly 35.0 forever.
+// solarZeroOutput is the CEASED image: no real power, no apparent power, no
+// reactive power, no available power, and St=OFF. It is factored out of
+// solarStep because two independent commands reach it — the M123 contactor and
+// the M703 permit-service enable — and a second hand-rolled copy would be a
+// second chance for the two cease paths to leave the device in different
+// states (the 701 mirror derives its own St/ConnSt from M103 St, so an
+// incomplete zeroing shows up on the wire as a device that is off in one model
+// and on in another).
+func solarZeroOutput(r *RegisterMap, bases SolarBases) {
+	r.Set(bases.M103Base+sunspec.M103_W, 0)
+	r.Set(bases.M103Base+sunspec.M103_VA, 0)
+	r.Set(bases.M103Base+sunspec.M103_VAr, 0)
+	r.Set(bases.M103Base+sunspec.M103_St, 1) // off
+	r.Set(bases.M122Base+sunspec.M122_WAval, 0)
+}
+
 func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, simTime float64, cloud float64, night bool, fc *faultController, whAcc *uint16) {
 	m103Base := bases.M103Base
 	m122Base := bases.M122Base
 	m123Base := bases.M123Base
 
-	// Disconnect (M123 Conn=0) zeroes output in BOTH running and paused modes: a
-	// cease-to-energize command must take effect even when the environment
-	// animation is frozen (replay injects PV each tick with the sim paused).
-	if r.Get(m123Base+sunspec.M123_Conn) == 0 {
-		r.Set(m103Base+sunspec.M103_W, 0)
-		r.Set(m103Base+sunspec.M103_VA, 0)
-		r.Set(m103Base+sunspec.M103_VAr, 0)
-		r.Set(m103Base+sunspec.M103_St, 1) // off
-		r.Set(m122Base+sunspec.M122_WAval, 0)
+	// TWO cease paths, one consequence. Disconnect (M123 Conn=0) is the
+	// contactor; permit-service withdrawn (M703 ES=0, advanced sims only) is
+	// IEEE 1547-2018 §4.10.3's enable, which a DER that loses it must answer by
+	// ceasing to energize — it is the register a 2030.5 opModEnergize=false
+	// lands on, and honouring only the contactor is what left it inert
+	// (solarPermitService, IW16-002).
+	//
+	// Both zero output in BOTH running and paused modes: a cease-to-energize
+	// command must take effect even when the environment animation is frozen
+	// (replay injects PV each tick with the sim paused).
+	if r.Get(m123Base+sunspec.M123_Conn) == 0 || !solarPermitService(r, bases) {
+		solarZeroOutput(r, bases)
 		return
 	}
 

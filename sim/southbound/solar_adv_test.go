@@ -1241,3 +1241,112 @@ func TestSolarStateMarshalsWithUnimplementedCapacityPoints(t *testing.T) {
 		}
 	}
 }
+
+// ── Model 703: permit service (IW16-002) ─────────────────────────────────────
+
+// TestSolarPermitServiceCeasesEnergization is the IW16-002 row: withdrawing
+// permit service (M703 ES=0) must actually STOP the inverter.
+//
+// Before the fix, 703 was populated at startup and never read again: an ES
+// write was ACK'd, stored, and read back correctly by /registers while the
+// physics ignored it entirely. That is the ack_no_apply fault permanently armed
+// on the exact axis a 2030.5 opModEnergize=false lands on, and it is what made
+// the BASIC-009 bench row look like a gateway defect — lexa-gw judges
+// cease-to-energize by MEASURED cessation, never by its own write's ACK, so it
+// correctly read a still-exporting device as diverged and answered the head end
+// cannot-comply. The DUT was wrong, not the gateway.
+//
+// MUTATION PROOF: delete the solarPermitService term from solarStep's cease
+// fence (or make the function return true unconditionally) and this test fails
+// with the inverter still exporting its full potential.
+func TestSolarPermitServiceCeasesEnergization(t *testing.T) {
+	const wmax = 8000.0
+	ss := newAdvSolar(t, wmax)
+
+	setSolarPotential(ss, 6000)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-6000) > 1 {
+		t.Fatalf("fixture: pre-cease measured = %.0f W, want 6000 W", got)
+	}
+	if !solarPermitService(ss.Regs, ss.bases) {
+		t.Fatal("fixture: populate703 must seed ES=permitted, or the test proves nothing")
+	}
+
+	// Withdraw permit service exactly as derbase does — a single-register write
+	// to 703 ES, not a whole-block RMW (SetEnterServiceEnabled).
+	ss.Regs.Set(ss.bases.M703Base+uint16(sunspec.L703.Offset("ES")), 0)
+	stepSolarHeld(ss)
+
+	if got := solarMeasuredW(ss); got != 0 {
+		t.Errorf("measured = %.0f W after permit service was withdrawn, want 0 — "+
+			"IEEE 1547-2018 §4.10.3: a DER that loses permit service ceases to energize", got)
+	}
+	m701 := sunspec.Parse701(readSlice(ss.Regs, ss.adv.M701, ss.adv.M701Len))
+	if m701.W != 0 || m701.St != 0 || m701.ConnSt != 0 {
+		t.Errorf("701 after the cease: W=%v St=%d ConnSt=%d, want 0/0/0 — the model the "+
+			"gateway prefers must not still report a running, connected, exporting device",
+			m701.W, m701.St, m701.ConnSt)
+	}
+	if av := ss.Snapshot().Measurements.Possible_W; av != 0 {
+		t.Errorf("possible_W = %v after the cease, want 0 — a de-energized inverter offers "+
+			"no available power (this is a cease, not a curtailment)", av)
+	}
+
+	// Restoring permit service lets the animation bring it back: the cease is a
+	// STANDING condition, not a latch the sim can never leave.
+	ss.Regs.Set(ss.bases.M703Base+uint16(sunspec.L703.Offset("ES")), 1)
+	setSolarPotential(ss, 6000)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-6000) > 1 {
+		t.Errorf("measured = %.0f W after permit service was restored, want 6000 W", got)
+	}
+}
+
+// TestSolarPermitServiceCeasesAtWriteTime is the timing half. The gateway's
+// verdict on this axis is MEASURED and its poll can land well inside one 5 s
+// animation tick, so a cease that only takes effect on the next tick is still a
+// window in which the device reports itself exporting against a command it has
+// already accepted. The 703 write must move 103 AND the 701 mirror immediately
+// — advSync alone cannot do it, because it re-derives 701 from a 103 image
+// nothing has zeroed yet.
+func TestSolarPermitServiceCeasesAtWriteTime(t *testing.T) {
+	const wmax = 8000.0
+	ss := newAdvSolar(t, wmax)
+	ss.Regs.OnWrite = ss.solarOnWrite // wired by newSolarServerAdvanced in production
+
+	setSolarPotential(ss, 6000)
+	stepSolarHeld(ss)
+	if got := solarMeasuredW(ss); math.Abs(got-6000) > 1 {
+		t.Fatalf("fixture: pre-write measured = %.0f W, want 6000 W", got)
+	}
+
+	esAddr := ss.bases.M703Base + uint16(sunspec.L703.Offset("ES"))
+	if _, err := ss.Regs.HandleHoldingRegisters(&modbuslib.HoldingRegistersRequest{
+		UnitId: 1, Addr: esAddr, Quantity: 1, IsWrite: true, Args: []uint16{0},
+	}); err != nil {
+		t.Fatalf("modbus 703 ES write: %v", err)
+	}
+
+	if got := solarMeasuredW(ss); got != 0 {
+		t.Errorf("measured right after the ES=0 write = %.0f W, want 0 (no tick in between)", got)
+	}
+	m701 := sunspec.Parse701(readSlice(ss.Regs, ss.adv.M701, ss.adv.M701Len))
+	if m701.W != 0 || m701.ConnSt != 0 {
+		t.Errorf("701 right after the ES=0 write: W=%v ConnSt=%d, want 0/0", m701.W, m701.ConnSt)
+	}
+}
+
+// TestSolarPermitServiceLegacySimIsAlwaysPermitted pins the no-op guarantee: a
+// legacy (703-less) image has no permit-service register to withdraw, so the
+// fence must never fire there. Without the M703Base==0 guard every legacy
+// scenario would read address 0 — outside any model — and cease permanently.
+func TestSolarPermitServiceLegacySimIsAlwaysPermitted(t *testing.T) {
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	bases, _ := populateSolarCore(r, 8000, "")
+	if bases.M703Base != 0 {
+		t.Fatalf("fixture: legacy bases must carry no 703, got %d", bases.M703Base)
+	}
+	if !solarPermitService(r, bases) {
+		t.Fatal("a legacy sim has no enter-service model and must always be permitted")
+	}
+}
