@@ -66,6 +66,19 @@ Starts `modsim` :5020/:6020 (`-advanced -wmax 8000`), `mbapsdev` :8021/:6031
 the aggregator loop against `69.0.0.2:802`. `SIM_FLEET=4` is the CTP Figure-15
 fixture for the DER-Aggregator-Client rows and is **not** this campaign's shape.
 
+**CORRECTION (2026-08-25, BASIC-010-WMAXLIMPCT-RESOLVES-TO-ZERO, closed):**
+`mbapsdev`'s (inv-secure's) nameplate is no longer `-wmax 6000` — that value,
+declared against the site's DERP-SP-001 default 5000W ceiling, made
+`internal/authority`'s LXR-013 worst-case reservation (correctly) reserve more
+than the whole site ceiling for this uncontrollable fixture alone and zero
+every controllable device's budget, including inv-plain's — which is exactly
+what BASIC-010 measures. `scripts/bench-sims-up.sh` now starts it at
+`-wmax "$MBAPS_WMAX"` (default **2000**, override via `MBAPS_WMAX`), which
+leaves headroom under the 5000W default. Everything else in this document that
+depends only on inv-secure's *identity* (serial, model, port) is unaffected;
+anything that assumed the old 6000W rating specifically should be re-checked
+against the current default.
+
 1. **One gridsim pid must hold BOTH ports.** `ss -ltnp | grep -E '11113|11114'`
    must show a single pid. An orphan on :11114 beside a new process on :11113
    makes every server-side observation a fact about the wrong server. Preflight

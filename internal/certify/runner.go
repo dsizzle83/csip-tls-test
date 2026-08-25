@@ -730,6 +730,16 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		return rep, err
 	}
 
+	// Same discipline, one row over: the RBAC/mbaps-authority cluster's own
+	// precondition is the DUT's live Authority posture, and nothing upstream
+	// of this loop otherwise checked it before RBAC-002-MODEL704-REG40298-
+	// WRITE-DENIED-ALL-ROLES (lexa-gw/docs/known_issues.json) shipped a
+	// battery that could measure a lock-screen it never knew was engaged.
+	if err := r.preflightAuthority(ctx, reporter, rep.Plan); err != nil {
+		rep.Finished = time.Now().UTC()
+		return rep, err
+	}
+
 	pki, pkiErr := (*PKI)(nil), error(nil)
 	if r.opts.PKIDir != "" {
 		pki, pkiErr = LoadPKI(r.opts.PKIDir)

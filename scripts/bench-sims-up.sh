@@ -261,6 +261,24 @@ MODSIM_SERIAL="${MODSIM_SERIAL:-BENCH-MODSIM-01}"
 MBAPS_SERIAL="${MBAPS_SERIAL:-BENCH-MBAPS-01}"
 MODSIM2_SERIAL="${MODSIM2_SERIAL:-BENCH-MODSIM-02}"
 MODSIM3_SERIAL="${MODSIM3_SERIAL:-BENCH-MODSIM-03}"
+
+# BASIC-010-WMAXLIMPCT-RESOLVES-TO-ZERO (lexa-gw/docs/known_issues.json,
+# closed 2026-08-25): mbapsdev is inv-secure, this leg's SECOND fixture device
+# (controllable:false — the SD-04-excluded, non-CSIP-controlled DER). Its
+# declared nameplate used to be 6000W against the site's DERP-SP-001 default
+# ceiling of 5000W: internal/authority's LXR-013 worst-case reservation
+# correctly reserves an uncontrollable device's FULL nameplate out of the site
+# ceiling before dividing the remainder among controllable devices, so a
+# 6000W nameplate alone exceeded the whole 5000W ceiling and zeroed every
+# controllable device's budget — including inv-plain's, which is what
+# BASIC-010 measures. That is LXR-013 working exactly as designed against a
+# fixture whose own topology guaranteed it would fire; it was never a product
+# defect. 2000W is a realistic nameplate for a second, smaller inverter/
+# battery sharing the site (not one that alone dominates the whole site's
+# budget) and leaves 3000W of headroom under the 5000W default for the
+# reservation math to divide among the controllable fleet instead of zeroing
+# it (override via MBAPS_WMAX).
+MBAPS_WMAX="${MBAPS_WMAX:-2000}"
 echo "Bringing up sims (logs in $LOG, fleet size $SIM_FLEET):"
 MODSIM_ARGS=()
 [ -n "$MODSIM_BIND" ] && MODSIM_ARGS+=(-bind "$MODSIM_BIND")
@@ -275,7 +293,7 @@ start modsim   "$MODSIM_PORT"  "$MODSIM_BIND" ./bin/modsim   -port "$MODSIM_PORT
 MBAPS_ARGS=()
 [ -n "${MBAPS_NO_TICKETS:-}" ] && [ "${MBAPS_NO_TICKETS}" != "0" ] && MBAPS_ARGS+=(-no-tickets)
 [ -n "$SIMS_KEYLOG" ] && MBAPS_ARGS+=(-keylog "$SIMS_KEYLOG")
-start mbapsdev "$MBAPS_PORT"   "$MBAPS_BIND" "$MBAPS_BIN" -listen "$MBAPS_BIND:$MBAPS_PORT" -model inverter -wmax 6000 -serial "$MBAPS_SERIAL" \
+start mbapsdev "$MBAPS_PORT"   "$MBAPS_BIND" "$MBAPS_BIN" -listen "$MBAPS_BIND:$MBAPS_PORT" -model inverter -wmax "$MBAPS_WMAX" -serial "$MBAPS_SERIAL" \
                  -ca "$M/dev-ca.pem" -cert "$M/dev-server-cert.pem" -key "$M/dev-server-key.pem" \
                  ${MBAPS_ARGS+"${MBAPS_ARGS[@]}"}
 
