@@ -56,10 +56,15 @@ func checkINFO1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
-	device := defaultDeviceName
-	if v, ok := rc.Param(paramDevice); ok && v != "" {
-		device = v
+	device := deviceName(rc)
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
 	}
+	if err := d.begin(ctx, nil); err != nil {
+		return certify.Result{}, err
+	}
+	defer d.restore(ctx)
 
 	// Freeze the server's world so the registers the DUT reads and the value it
 	// reports are the same instant. Without this the sim's animation moves
@@ -105,8 +110,14 @@ func checkINFO1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	}
 
 	journalBefore, _ := o.journal(ctx, 200)
-	forced := o.forceReconnect(ctx)
-	if err := o.watch(ctx, 2); err != nil {
+	disc, err := rediscover(ctx, d, "INFO-1")
+	if err != nil {
+		return certify.Result{}, err
+	}
+	// One COMPLETE poll cycle after the rediscovery, so the coverage assertion
+	// is about a whole cycle's reads rather than whatever a fixed wait caught.
+	cycle, cycleSeen, err := d.awaitPoll(ctx, 1)
+	if err != nil {
 		return certify.Result{}, err
 	}
 	journalAfter, _ := o.journal(ctx, 400)
@@ -114,18 +125,22 @@ func checkINFO1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("the DUT's read coverage and its scale-factor interpretation were asserted; "+
-			"the per-datatype rendering criteria (a)–(i) are about the client's own log and are not wire "+
-			"facts. %s", o.injectionNote()),
+		Notes: fmt.Sprintf("the DUT's read coverage and its scale-factor interpretation were asserted "+
+			"over a forced rediscovery and one complete poll cycle, both held on the simulator rather "+
+			"than on a clock; the per-datatype rendering criteria (a)-(i) are about the client's own "+
+			"log and are not wire facts. %s", o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT read every model in the server's chain, scale-factor registers included"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre, info1RenderingSkips()...)), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
+				fs = append(fs, evalModelCoverage(c, disc.Err))
+				fs = append(fs, evalScaleFactor(frozenRegisters(c, frozen, resumeAt, ev), device,
+					reported, haveReported, frozen))
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalModelCoverage(c, forced))
-			fs = append(fs, evalScaleFactor(frozenRegisters(c, frozen, resumeAt, ev), device, reported, haveReported, frozen))
+			fs = append(fs, evalRediscovery(disc, d))
+			fs = append(fs, evalREAD2Cycle(cycle, cycleSeen, d))
 			fs = append(fs, info1RenderingSkips()...)
 			return emit(ev, c, fs), nil
 		},
@@ -318,22 +333,66 @@ func info1RenderingSkips() []finding {
 
 // ── INFO-2 — Unimplemented Point Interpretations ──────────────────────────────
 
-// infoSentinelAddr/infoSentinelType are the single, always-present point
-// INFO-2#2 seeds with its OWN type's not-implemented sentinel: the Common
-// Model's DA (device address) field, offset 64 from the body — a
-// SunSpec-STANDARD offset (see CommonModel above), not this bench's own
-// invention — at the server's steady-state default base 40000
-// (StandardBases[0]). DA's SunSpec datatype is uint16; sentinel.go's
-// sentinelWords table independently gives uint16's not-implemented value as
-// 0xFFFF, mirrored here as infoSentinelWant so this check does not have to
-// import the sim package to know what it just asked the sim to seed.
-const (
-	infoSentinelBase = 40000
-	infoSentinelAddr = infoSentinelBase + 2 + 64 // Model 1 body + DA's offset
-	infoSentinelType = "uint16"
-)
+// infoDatatypes is every datatype §2.7.2 step 2 is about: "for all the data
+// types present in the PICS models, update Server 1 to configure at least one
+// of these points to the unimplemented value".
+//
+// The list is the catalog's own — CLI-1's preconditions enumerate exactly these
+// twenty-two as the types a test engineer must have captured from the PICS —
+// and the not-implemented VALUES are the SunSpec Device Information Model
+// Specification's, held independently on each side: this suite's Sentinels
+// table (sunspec.go) is what an assertion checks against, and the simulator's
+// own table (sim/southbound/sentinel.go) is what serves them. Two tables
+// derived from one published spec is not two witnesses, and the suite does not
+// claim otherwise — but it does mean a typo in either shows up as a failure
+// rather than as agreement.
+var infoDatatypes = []string{
+	"int16", "uint16", "count", "acc16", "enum16", "bitfield16", "sunssf", "pad",
+	"int32", "uint32", "acc32", "enum32", "bitfield32", "ipaddr", "float32", "eui48",
+	"int64", "uint64", "acc64", "float64",
+	"string", "ipv6addr",
+}
 
-const infoSentinelWant uint16 = 0xFFFF
+// seeded records one datatype's seed: where it went and what words the server
+// was asked to serve there.
+type seeded struct {
+	Type  string
+	Addr  uint16
+	Words []uint16
+}
+
+// infoSentinelWidth is how many registers a datatype's sentinel occupies for
+// the purposes of laying the sweep out. It mirrors this suite's own Sentinels
+// table and defaults the two variable-width types.
+func infoSentinelWidth(typ string) int {
+	switch typ {
+	case "string":
+		return 4 // four registers is a plausible short string field
+	case "ipv6addr":
+		return 8
+	}
+	for _, s := range Sentinels {
+		if s.Type == typ {
+			return len(s.Words)
+		}
+	}
+	return 1
+}
+
+// infoSentinelWords is the words this suite expects the server to serve for a
+// datatype, from ITS OWN table.
+func infoSentinelWords(typ string) []uint16 {
+	switch typ {
+	case "string", "ipv6addr":
+		return make([]uint16, infoSentinelWidth(typ))
+	}
+	for _, s := range Sentinels {
+		if s.Type == typ {
+			return append([]uint16(nil), s.Words...)
+		}
+	}
+	return nil
+}
 
 func checkINFO2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	o, why := newObserver(rc)
@@ -347,86 +406,262 @@ func checkINFO2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 		return certify.Skipped("this procedure requires the server to serve not-implemented sentinel "+
 			"values, and %s", r), nil
 	}
-	device := defaultDeviceName
-	if v, ok := rc.Param(paramDevice); ok && v != "" {
-		device = v
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
 	}
-
-	// INFO-2#1 (census compliance-fullsuite-2-20260802T020946): a bare
-	// arm-watch(3)-clear sequence still occasionally missed the DUT's poll
-	// entirely (0 frames attributed) on a bench shared with other agents'
-	// suites. A full baseline cycle BEFORE arming — the same pattern
-	// checkERR2 already uses — gives the DUT's ~10s poll loop a confirmed
-	// live moment near the window's start, so a reader can tell "the DUT
-	// never polled during this window at all" (a bench problem) from "the
-	// sentinel just wasn't in force yet" if it ever recurs.
-	if err := o.watch(ctx, 1); err != nil {
+	device := deviceName(rc)
+	if err := d.begin(ctx, nil); err != nil {
 		return certify.Result{}, err
 	}
+	defer d.restore(ctx)
 
+	// PHASE 1 — the whole-bank blanket: every register reads as the int16
+	// not-implemented sentinel. It proves the client recognises "this device
+	// has nothing to report", which is the coarse half of §2.7.2.
 	journalBefore, _ := o.journal(ctx, 200)
-	armed := o.fault(ctx, map[string]any{"kind": "nan_sentinel"},
-		"make every register read return the SunSpec not-implemented sentinel 0x8000 (int16 −32768), "+
+	blanket, err := d.meet(ctx, map[string]any{"kind": "nan_sentinel"},
+		"make every register read return the SunSpec not-implemented sentinel 0x8000 (int16 -32768), "+
 			"which is §2.7.2 step 2's 'configure points to the unimplemented value' applied to the "+
-			"whole register bank")
-	if armed != nil {
-		return certify.Skipped("the not-implemented sentinel could not be armed on the server: %v", armed), nil
-	}
-	// INFO-2#1 (census 20260731T234821, widened further above): hold the
-	// sentinel for at least one full poll interval beyond what a bare
-	// 2-cycle wait guarantees before clearing it — now 4, one more than the
-	// previous fix, consistent with the fix applied to READ-1/WR-1/WR-2 for
-	// the same symptom.
-	watchErr := o.watch(ctx, 4)
-	o.clearFault("nan_sentinel")
-	if watchErr != nil {
-		return certify.Result{}, watchErr
+			"whole register bank",
+		"nan_sentinel", 1)
+	if err != nil {
+		return certify.Result{}, err
 	}
 	journalDuring, _ := o.journal(ctx, 400)
-	if err := o.settle(ctx); err != nil {
-		return certify.Result{}, err
-	}
 	duringLines := journalSince(journalBefore, journalDuring)
 
-	// INFO-2#2: the per-point TYPED sentinel (modsim's sentinel verb,
-	// sim/southbound/sentinel.go), a separate, later phase so it is never
-	// confused with the whole-bank int16 reading above — same register
-	// count either way (one), but a DIFFERENT datatype and mechanism (a
-	// direct register poke, not a read-path rewrite), and armed only after
-	// the whole-bank fault has been fully cleared and settled.
-	typedArmed := fmt.Errorf("modsim's simapi is not configured")
-	if o.simAvailable() {
-		typedArmed = o.injectValue(ctx, map[string]any{
-			"unimplemented": []map[string]any{{"addr": infoSentinelAddr, "type": infoSentinelType}},
-		}, fmt.Sprintf("seed the Common Model's DA field (address %d) with its own %s not-implemented "+
-			"sentinel, per §2.7.2 step 2's per-datatype reading", infoSentinelAddr, infoSentinelType))
+	// PHASE 2 — the per-datatype sweep, which is what §2.7.2 step 2 actually
+	// asks for. Every datatype gets its own point, seeded with ITS OWN
+	// not-implemented value.
+	//
+	// WHERE it is seeded matters, and the answer comes from the DUT rather
+	// than from a model directory this suite deliberately does not hold: the
+	// simulator's poll anchor IS "the block the client reads every cycle",
+	// learned from the client's own traffic. Seeding inside it guarantees the
+	// DUT reads what was seeded; seeding at an address chosen from a model
+	// definition would be this suite consulting the table ERR-3's independence
+	// forbids it to hold.
+	warm, haveAnchor, err := d.warmUp(ctx)
+	if err != nil {
+		return certify.Result{}, err
 	}
-	if typedArmed == nil {
-		defer o.clearInject(map[string]any{"clear_unimplemented": true}, "the typed sentinel")
-		if err := o.watch(ctx, 2); err != nil {
-			return certify.Result{}, err
+	var sweep []seeded
+	var sweepMeet meeting
+	var sweepErr error
+	if !haveAnchor {
+		sweepErr = fmt.Errorf("the simulator has not identified the block the DUT reads every poll "+
+			"cycle (%s), so there is nowhere to seed a sentinel the DUT is certain to read",
+			pollRuleNote(warm))
+	} else {
+		// The animation would overwrite a seeded measurement register on its
+		// next tick, so the device is frozen for the sweep. It is resumed
+		// unconditionally, and the reset in the defer restores the register
+		// image whatever happens.
+		if cerr := o.sim.Control(ctx, map[string]any{"cmd": "pause"}, nil); cerr == nil {
+			o.injected = append(o.injected, fmt.Sprintf("POST %s/control {\"cmd\":\"pause\"} (freeze "+
+				"the animation so a seeded sentinel is not overwritten before the DUT reads it)",
+				o.sim.BaseURL))
+			defer func() {
+				cctx, cancel := context.WithTimeout(withoutCancel(ctx), 20*time.Second)
+				defer cancel()
+				_ = o.sim.Control(cctx, map[string]any{"cmd": "resume"}, nil)
+			}()
+		}
+		a := warm.Poll.Anchor
+		// Lay the types out from the far end of the anchor block backwards, so
+		// the sweep occupies the block's tail rather than its head — the head
+		// carries the model's ID and length headers on many layouts, and a
+		// sentinel there would break the chain walk rather than test a point.
+		addr := a.Addr + 2
+		var entries []map[string]any
+		for _, typ := range infoDatatypes {
+			w := infoSentinelWidth(typ)
+			if uint32(addr)+uint32(w) > uint32(a.Addr)+uint32(max16(a.Count, 1)) {
+				break // the block is not long enough for the rest of the sweep
+			}
+			sweep = append(sweep, seeded{Type: typ, Addr: addr, Words: infoSentinelWords(typ)})
+			e := map[string]any{"addr": int(addr), "type": typ}
+			if typ == "string" || typ == "ipv6addr" {
+				e["len"] = w
+			}
+			entries = append(entries, e)
+			addr += uint16(w)
+		}
+		if len(entries) == 0 {
+			sweepErr = fmt.Errorf("the block the DUT reads (%s) is too short to hold even one seeded "+
+				"point after its header", a)
+		} else {
+			sweepMeet, err = d.meetInject(ctx, map[string]any{"unimplemented": entries},
+				fmt.Sprintf("seed %d point(s) — one per SunSpec datatype — inside %s, the block the "+
+					"simulator observed the DUT reading every poll cycle, each with its OWN "+
+					"not-implemented value per the Device Information Model", len(entries), a), 1)
+			if err != nil {
+				return certify.Result{}, err
+			}
+			defer func() {
+				cctx, cancel := context.WithTimeout(withoutCancel(ctx), 20*time.Second)
+				defer cancel()
+				_, _ = d.inject(cctx, map[string]any{"clear_unimplemented": true},
+					"restore every seeded point")
+			}()
 		}
 	}
 
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("the int16 not-implemented sentinel was served for every register, and (when "+
-			"modsim's simapi is available) the Common Model's DA field was separately seeded with its own "+
-			"uint16 sentinel; the DUT's interpretation of both was observed. %s", o.injectionNote()),
+		Notes: fmt.Sprintf("the int16 not-implemented sentinel was served for every register, and then "+
+			"%d point(s) — one per SunSpec datatype — were seeded with their OWN not-implemented values "+
+			"inside the block the simulator observed the DUT reading every cycle. Both phases were held "+
+			"on the simulator's transaction ledger rather than on a poll interval. %s",
+			len(sweep), o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the server returned the not-implemented sentinel and the DUT did not report it as " +
 				"a measurement"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre, evalINFO2TypedSentinel(nil, typedArmed))), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
+				fs = append(fs, evalINFO2(c, o.injectionNote())...)
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalINFO2(c, o.injectionNote())...)
+			fs = append(fs, evalINFO2Blanket(blanket, d))
 			fs = append(fs, info2Interpretation(duringLines, device))
-			fs = append(fs, evalINFO2TypedSentinel(c, typedArmed))
+			fs = append(fs, evalINFO2Sweep(sweep, sweepMeet, sweepErr, d))
+			fs = append(fs, info2RenderingGap())
 			return emit(ev, c, fs), nil
 		},
 	}, nil
+}
+
+// evalINFO2Blanket grades the whole-bank phase from the sim's own record.
+func evalINFO2Blanket(m meeting, d *determinism) finding {
+	claim := "the server served the not-implemented sentinel for every register and the DUT read it"
+	method := "arm the whole-bank sentinel at a named epoch, then read from the simulator's ledger what " +
+		"the DUT was actually served under it"
+	if !m.ok() {
+		return skipf(claim, method, "%s", m.reason())
+	}
+	for _, e := range m.Page.Reads() {
+		vals, ok := e.Values()
+		if !ok || len(vals) == 0 {
+			continue
+		}
+		n := 0
+		for _, v := range vals {
+			if len(SentinelTypesFor(v)) > 0 {
+				n++
+			}
+		}
+		if n == len(vals) {
+			return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+				"with the whole-bank sentinel armed at epoch %d, the DUT read %d register(s) at %d and "+
+					"every one of them carried a not-implemented value. Transaction: %s",
+				m.Epoch, len(vals), e.Addr, e)
+		}
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+		"the whole-bank sentinel was armed at epoch %d and the DUT read %d transaction(s) under it, but "+
+			"none came back entirely sentinel-valued: %s", m.Epoch, m.Page.Total, m.Page.Summary())
+}
+
+// evalINFO2Sweep is §2.7.2 step 2's real criterion on the SERVER side: one
+// point of every datatype present, set to its own unimplemented value, and read
+// back by the client.
+func evalINFO2Sweep(sweep []seeded, m meeting, sweepErr error, d *determinism) finding {
+	claim := "at least one point of EVERY SunSpec datatype was configured to its own not-implemented " +
+		"value and the DUT read it back"
+	method := "seed one point per datatype inside the block the simulator observed the DUT reading " +
+		"every poll cycle, each with the Device Information Model's value for that type, then confirm " +
+		"from the simulator's ledger that the DUT's own read returned exactly those words"
+	if sweepErr != nil {
+		return skipf(claim, method, "the sweep could not be laid out: %v", sweepErr)
+	}
+	if !m.ok() {
+		return skipf(claim, method, "%s", m.reason())
+	}
+	// Reconstruct the register image from the DUT's own reads under the fence.
+	image := map[uint16]uint16{}
+	for _, e := range m.Page.Reads() {
+		vals, ok := e.Values()
+		if !ok {
+			continue
+		}
+		for i, v := range vals {
+			image[e.Addr+uint16(i)] = v
+		}
+	}
+	var confirmed, unread, wrong []string
+	for _, sd := range sweep {
+		got := make([]uint16, 0, len(sd.Words))
+		complete := true
+		for i := range sd.Words {
+			v, ok := image[sd.Addr+uint16(i)]
+			if !ok {
+				complete = false
+				break
+			}
+			got = append(got, v)
+		}
+		switch {
+		case !complete:
+			unread = append(unread, fmt.Sprintf("%s@%d", sd.Type, sd.Addr))
+		case !sameWords(got, sd.Words):
+			wrong = append(wrong, fmt.Sprintf("%s@%d served %v, wanted %v", sd.Type, sd.Addr, got, sd.Words))
+		default:
+			confirmed = append(confirmed, fmt.Sprintf("%s@%d", sd.Type, sd.Addr))
+		}
+	}
+	switch {
+	case len(wrong) > 0:
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"%d of %d datatype(s) were confirmed on the wire, and %d came back with values other than "+
+				"the ones seeded: %s. That is a disagreement between this suite's sentinel table and "+
+				"the simulator's — a bench defect, not a DUT finding. Confirmed: %s",
+			len(confirmed), len(sweep), len(wrong), strings.Join(wrong, "; "),
+			joinOr(confirmed, "none"))
+	case len(unread) > 0:
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"%d of %d datatype(s) were seeded and read back by the DUT with exactly their "+
+				"not-implemented values — %s — while %d fell outside the registers the DUT read in this "+
+				"window: %s. Every type the client's own poll covers is demonstrated; the rest need a "+
+				"longer block, or a client that reads more of the chain per cycle",
+			len(confirmed), len(sweep), joinOr(confirmed, "none"), len(unread), strings.Join(unread, ", "))
+	default:
+		return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+			"all %d datatype(s) were seeded inside the block the DUT reads every cycle and read back by "+
+				"the DUT with exactly the Device Information Model's not-implemented value for each: %s",
+			len(sweep), strings.Join(confirmed, ", "))
+	}
+}
+
+// info2RenderingGap is the half of §2.7.2 that lives in the client's own log
+// and cannot be a wire fact.
+func info2RenderingGap() finding {
+	return skipf(
+		"the DUT logged each unimplemented point AS unimplemented rather than reporting its sentinel "+
+			"as a value",
+		"inspection of the client's own per-point output",
+		"§2.7.2's criterion is about the CLIENT'S RENDERING, and this DUT has no per-point output to "+
+			"inspect: it journals reconciler decisions and a decoded measurement, not a point browser. "+
+			"The wire half — that the server really did serve each datatype's not-implemented value and "+
+			"that the DUT really did read it — is asserted above from the simulator's own record. "+
+			"Closing the rest needs a point-browser diagnostic on the DUT, and no sim work promotes it. "+
+			"Note also that the specification makes three of these types genuinely ambiguous: acc16, "+
+			"acc32, acc64, ipaddr and string all have ZERO as their not-implemented value, which is "+
+			"also an ordinary reading, so even a perfect client cannot distinguish them on the wire — "+
+			"that ambiguity is the Information Model's, not this bench's")
+}
+
+func sameWords(a, b []uint16) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // evalINFO2 asserts, from the wire, that the sentinel really was served.
@@ -496,56 +731,4 @@ func info2Interpretation(lines []string, device string) finding {
 			"measurement — but it did report SOME value, which may be a held last-known-good rather "+
 			"than a recognition of the sentinel. Distinguishing the two needs a DUT-side "+
 			"point-availability signal this suite cannot read", v, device)
-}
-
-// evalINFO2TypedSentinel is INFO-2#2: modsim's per-point typed sentinel verb
-// (sim/southbound/sentinel.go) seeds ONE point (the Common Model's DA
-// field) with ITS OWN uint16 not-implemented sentinel, distinct from
-// nan_sentinel's whole-bank int16 blanket that evalINFO2/info2Interpretation
-// above evidence. This closes the "no verb exists at all" gap the row used
-// to report, but not the row's FULL claim: §2.7.2 step 2 wants every
-// datatype the server's models carry demonstrated this way, and this suite
-// deliberately holds no model definition directory (see sunspec.go's doc
-// comment) to enumerate which OTHER datatypes are even present — so this
-// stays a WARN, reporting real, wire-confirmed progress on one datatype
-// rather than claiming the row complete.
-func evalINFO2TypedSentinel(c *Conversation, armed error) finding {
-	claim := "at least one unimplemented point was logged for every datatype present in the server's models"
-	method := fmt.Sprintf("seed one point (address %d, type %s) with its own not-implemented sentinel via "+
-		"modsim's typed sentinel verb (sim/southbound/sentinel.go), then confirm the DUT read back exactly "+
-		"that value over the wire", infoSentinelAddr, infoSentinelType)
-	if armed != nil {
-		return skipf(claim, method, "the typed sentinel could not be seeded on the server: %v", armed)
-	}
-	if c == nil {
-		return skipf(claim, method,
-			"the typed sentinel was seeded, but no capture frame was attributed to this test case, so the "+
-				"served value could not be confirmed on the wire")
-	}
-	ref, ok := c.Registers.Ref(infoSentinelAddr)
-	if !ok {
-		return skipf(claim, method,
-			"the server's per-point sentinel verb was armed for this test case (address %d, type %s), but "+
-				"no read of that register was attributed to this test case's frames, so the served value "+
-				"could not be confirmed on the wire", infoSentinelAddr, infoSentinelType)
-	}
-	v, _ := c.Registers.Get(infoSentinelAddr)
-	if v != infoSentinelWant {
-		return bytesf(claim, method, certify.Warn, fromServer, ref.start, ref.end,
-			"register %d was read as 0x%04x, not the seeded %s not-implemented sentinel 0x%04x — the "+
-				"server may have overwritten the point (e.g. the animation loop) before the DUT's read "+
-				"landed. The per-point verb itself is confirmed reachable and working (the capability every "+
-				"prior run of this row lacked); full per-datatype coverage still needs every OTHER datatype "+
-				"seeded, and this suite has no model definition directory to enumerate which ones the "+
-				"server's models even carry (a deliberate omission — see sunspec.go)",
-			infoSentinelAddr, v, infoSentinelType, infoSentinelWant)
-	}
-	return bytesf(claim, method, certify.Warn, fromServer, ref.start, ref.end,
-		"modsim's per-point sentinel verb is now wired: register %d (the Common Model's DA field) was "+
-			"seeded with its own %s not-implemented sentinel 0x%04x and the DUT was observed reading "+
-			"exactly that value back. This demonstrates the capability for one datatype; the row's full "+
-			"claim spans every datatype the server's models carry, and this suite deliberately holds no "+
-			"model definition directory to enumerate them (see sunspec.go) — promoting further needs that "+
-			"directory, not more sim capability",
-		infoSentinelAddr, infoSentinelType, infoSentinelWant)
 }

@@ -36,25 +36,46 @@ package suitemodbusclient
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"csip-tls-test/internal/certify"
 )
 
-// latencyMs is the read delay armed for PROT-1's timeout phase. It is well
-// beyond any plausible per-read timeout for a 10-second poll loop, so a client
-// that bounds its reads will abandon the transaction and one that does not will
-// block visibly.
-const latencyMs = 9000
+// oneShotDelayMS is the hold PROT-1's delay reading applies. It is comfortably
+// beyond lexa-gw's own 5-second per-request I/O deadline
+// (cmd/modbus/transport_factory.go:52, applied by the vendored client's
+// SetDeadline on every transaction), so a client that bounds its reads
+// abandons the transaction and one that does not blocks visibly.
+const oneShotDelayMS = 9000
 
-// shortResponseTruncateBytes is the number of PDU bytes modsim's
-// short_response fault actually writes (sim/southbound/protorelay.go): the
-// function code and byte count survive, the register data does not, which
-// is the smallest truncation that still leaves the MBAP length field lying
-// about a plausible-looking response.
+// shortResponseTruncateBytes is how much of the PDU the truncated reading
+// actually delivers: the function code and the byte count survive, the register
+// data does not. It is the smallest truncation that still leaves the MBAP
+// length field lying about a plausible-looking response.
 const shortResponseTruncateBytes = 2
 
 // ── PROT-1 — Partial Response ─────────────────────────────────────────────────
+
+// partialReading is one of §2.8.1's three readings of "partial response",
+// driven as a ONE-SHOT against a named transaction.
+type partialReading struct {
+	// Name is what the assertion calls this reading.
+	Name string
+	// Action is the sim's one-shot action, and Outcome is what the ledger must
+	// record for a transaction it shaped.
+	Action, Outcome string
+	// Extra carries the action's own parameter.
+	Extra map[string]any
+	// Doc is why this counts as "partial" under a document that never defines
+	// the word.
+	Doc string
+
+	M meeting
+	// Recovery is the DUT's next transaction after the reading, and Recovered
+	// says it happened.
+	Recovery  LedgerPage
+	Recovered bool
+	Fence     uint64
+}
 
 func checkPROT1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	o, why := newObserver(rc)
@@ -68,327 +89,232 @@ func checkPROT1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 		return certify.Skipped("this procedure requires the server to return an incomplete response, "+
 			"and %s", r), nil
 	}
-	device := defaultDeviceName
-	if v, ok := rc.Param(paramDevice); ok && v != "" {
-		device = v
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
 	}
 
-	// Baseline, so the capture holds a normal exchange before the provocation.
-	if err := o.watch(ctx, 1); err != nil {
+	if err := d.begin(ctx, nil); err != nil {
 		return certify.Result{}, err
 	}
+	defer d.restore(ctx)
 
-	// live-run finding (runs/warnmeas-mc-ssm-20260802T134537, assertions
-	// 2/4/5): a bare 2-cycle hold routinely finished before the DUT's own
-	// ~10s poll ever met the armed fault, and the same for the recovery
-	// wait afterward. Phase (b) below now holds until the DUT's journal
-	// shows it reacted (or 4 cycles elapse), not a fixed guess.
-	journalBeforeLatency, _ := o.journal(ctx, 200)
-
-	// Phase (b): the response that arrives too late.
-	latencyArmed := o.fault(ctx, map[string]any{"kind": "latency", "latency_ms": latencyMs},
-		fmt.Sprintf("delay every register read by %d ms, far beyond any plausible client read timeout, "+
-			"so a client that bounds its reads abandons the transaction", latencyMs))
-	if latencyArmed == nil {
-		_, _ = o.awaitJournalEvidence(ctx, journalBeforeLatency, 2, 4,
-			func(delta []string) bool { return deviceErrorish(delta, device) })
-		o.clearFault("latency")
-	}
-
-	// Phase (a): the transaction severed mid-flight.
-	severed := o.fault(ctx, map[string]any{"kind": "tcp_drop"},
-		"sever the DUT's live southbound connection so a request in flight never receives a complete "+
-			"Modbus response — this suite's chosen reading of §2.8.1's undefined 'partial response'")
-	if err := o.watch(ctx, 2); err != nil {
+	// Aim at the block the DUT reads every cycle. The anchor IS "the model the
+	// client reads", learned by the sim from the client's own traffic — so the
+	// one-shot lands on a transaction the DUT was always going to issue, and
+	// this suite consults no model definition directory to find it (the same
+	// independence ERR-3 rests on).
+	warm, haveAnchor, err := d.warmUp(ctx)
+	if err != nil {
 		return certify.Result{}, err
 	}
-	if err := o.settle(ctx); err != nil {
-		return certify.Result{}, err
+	scope := map[string]any{"on_fc": 3}
+	aim := "any FC 0x03 read"
+	if haveAnchor {
+		a := warm.Poll.Anchor
+		scope["on_addr"] = []int{int(a.Addr), int(a.Addr) + int(max16(a.Count, 1))}
+		aim = fmt.Sprintf("the DUT's own measurement read at %d×%d — the block the sim observed it "+
+			"repeating every poll cycle", a.Addr, a.Count)
 	}
 
-	// Phase (c): the structurally truncated response — PROT-1#5 (census
-	// compliance-fullsuite-2-20260802T020946). Deliberately LAST, and
-	// deliberately on the SAME connection tcp_drop's recovery just
-	// confirmed (no further reconnect is forced here): shortArmedAt is the
-	// cutoff evalPROT1/evalPROT1ShortResponse use to keep this phase's own
-	// unanswered read from being misattributed to phase (a)'s "severed
-	// mid-flight" reading, or vice versa, when both land in the one
-	// conversation citeConversation selects for this test case. Needs
-	// modsim started with -protofault (sim/southbound/protorelay.go); the
-	// sim refuses the fault BY NAME when it was not, so this reports
-	// SKIP-with-reason rather than folding into "cannot be served at all".
-	//
-	// Held (arm) and recovered (clear) the same poll-cadence-aware way as
-	// phase (b): the live run showed both the hold AND the post-clear
-	// recovery window closing before the DUT's own ~10s cadence caught up.
-	var shortArmedAt time.Time
-	journalBeforeShort, _ := o.journal(ctx, 200)
-	shortArmed := o.fault(ctx, map[string]any{"kind": "short_response", "truncate_bytes": shortResponseTruncateBytes},
-		fmt.Sprintf("write a response with a well-formed MBAP header promising the full PDU but stop the "+
-			"socket write after %d bytes of it, leaving the connection open — the structurally truncated "+
-			"reading of §2.8.1's undefined 'partial response'", shortResponseTruncateBytes))
-	if shortArmed == nil {
-		shortArmedAt = time.Now().UTC()
-		_, _ = o.awaitJournalEvidence(ctx, journalBeforeShort, 2, 4,
-			func(delta []string) bool { return deviceErrorish(delta, device) })
-		o.clearFault("short_response")
-		journalBeforeRecovery, _ := o.journal(ctx, 400)
-		if err := o.settle(ctx); err != nil {
+	readings := []*partialReading{
+		{
+			Name: "a response the server never sent", Action: "drop", Outcome: outcomeDropped,
+			Doc: "the server received the request, composed an answer, and delivered none of it while " +
+				"leaving the connection OPEN. This is the reading closest to §2.8.1's words: the client " +
+				"is left holding an incomplete transaction rather than a dead socket, so its own read " +
+				"timeout is what has to save it",
+		},
+		{
+			Name: "a structurally truncated response", Action: "short", Outcome: outcomeTruncated,
+			Extra: map[string]any{"truncate_bytes": shortResponseTruncateBytes},
+			Doc: "the MBAP header promises the full PDU and the socket write stops after " +
+				"the function code and byte count. A client that frames by length waits for bytes that " +
+				"are not coming; one that reads whatever is next splices the following response onto " +
+				"this value and decodes a number that was never sent",
+		},
+		{
+			Name: "a response too late to be an answer", Action: "delay", Outcome: outcomeDelayed,
+			Extra: map[string]any{"delay_ms": oneShotDelayMS},
+			Doc: "the answer is complete and correct and arrives after the client's own per-request " +
+				"deadline. lexa-gw bounds every transaction at 5 s (cmd/modbus/transport_factory.go:52), " +
+				"so a 9 s hold is decided by the client's timeout rather than by this bench's patience",
+		},
+	}
+
+	for _, r := range readings {
+		spec := map[string]any{"kind": "next_response", "action": r.Action}
+		for k, v := range scope {
+			spec[k] = v
+		}
+		for k, v := range r.Extra {
+			spec[k] = v
+		}
+		// NO clear kind: a one-shot is consumed by the request that matches
+		// it, which is the whole reason this row can now say WHICH transaction
+		// its provocation landed in. The previous version armed a blanket and
+		// hoped the DUT walked into it before the window closed.
+		m, err := d.meet(ctx, spec,
+			fmt.Sprintf("%s — %s, aimed at %s", r.Name, r.Doc, aim), "", 1)
+		if err != nil {
 			return certify.Result{}, err
 		}
-		_, _ = o.awaitJournalEvidence(ctx, journalBeforeRecovery, 1, 3,
-			func(delta []string) bool { return freshReadback(delta, device) })
+		r.M = m
+
+		// Recovery, per reading: §2.8.1 steps 4-7 restore the server and read
+		// again. The one-shot has already disarmed itself, so the fence is
+		// simply the next epoch and the barrier waits for the DUT's next
+		// transaction — however long its reconnect-with-backoff takes.
+		fence, ferr := d.arm(ctx, map[string]any{"kind": "next_response", "clear": true},
+			fmt.Sprintf("confirm no one-shot is left armed after the %s reading, and fence the DUT's "+
+				"recovery from it", r.Name))
+		if ferr != nil {
+			continue
+		}
+		r.Fence = fence
+		page, ok, err := d.awaitLedger(ctx, fence, 1)
+		if err != nil {
+			return certify.Result{}, err
+		}
+		r.Recovery, r.Recovered = page, ok
 	}
 
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("three readings of §2.8.1's undefined 'partial response' were driven — a "+
-			"severed transaction, an over-long response delay, and (when modsim is started with "+
-			"-protofault) a structurally truncated response — each held until the DUT's own journal "+
-			"confirmed a reaction (not a fixed guess), and the DUT's recovery observed the same way. %s",
-			o.injectionNote()),
+		Notes: fmt.Sprintf("all three readings of §2.8.1's undefined 'partial response' were driven as "+
+			"ONE-SHOTS armed against the next matching request, so each landed inside a transaction this "+
+			"bundle can name rather than in the gap between two of them — which is where a blanket fault "+
+			"spent every previous campaign. The DUT's recovery from each was held on the simulator's own "+
+			"transaction ledger, not on a clock. %s", o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT remained functional after a Modbus response failed to complete"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre, evalPROT1ShortResponse(nil, nil, shortArmed, shortArmedAt))), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalPROT1(c, timeFn(ev), severed == nil, latencyArmed == nil, shortArmedAt)...)
-			fs = append(fs, evalPROT1ShortResponse(c, timeFn(ev), shortArmed, shortArmedAt))
+			for _, r := range readings {
+				fs = append(fs, evalPartialReading(c, r, d))
+				fs = append(fs, evalPartialRecovery(r, d))
+			}
+			fs = append(fs, prot1CommonModelGap())
 			return emit(ev, c, fs), nil
 		},
 	}, nil
 }
 
-// timeFn adapts the frame index to a timestamp lookup for the eval functions,
-// so their decision logic can be driven from a synthetic table in a unit test.
-func timeFn(ev *certify.Evidence) func(frame int) (time.Time, bool) {
-	return func(frame int) (time.Time, bool) {
-		p, ok := ev.Index.Packet(frame)
-		if !ok {
-			return time.Time{}, false
-		}
-		return p.Time, true
+// evalPartialReading grades one reading from the sim's own record of what it
+// delivered, and cites the request in the capture when this test case owns it.
+func evalPartialReading(c *Conversation, r *partialReading, d *determinism) finding {
+	claim := fmt.Sprintf("the DUT received %s and did not hang on it", r.Name)
+	method := fmt.Sprintf("a one-shot armed against the NEXT matching request (%s), so the "+
+		"provocation lands inside a transaction the bench can name; graded from the simulator's own "+
+		"record of what it delivered for that transaction", r.M.Spec)
+	if !r.M.ok() {
+		return skipf(claim, method, "%s", r.M.reason())
 	}
+	shaped := r.M.Page.WithOutcome(r.Outcome)
+	if len(shaped) == 0 {
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"the one-shot was armed at epoch %d and the DUT issued %d transaction(s) under it, but the "+
+				"simulator recorded none resolved as %q: %s. That is a disagreement between the "+
+				"one-shot's contract and its wire behaviour — a bench defect, not a DUT finding",
+			r.M.Epoch, r.M.Page.Total, r.Outcome, r.M.Page.Summary())
+	}
+	hit := shaped[0]
+
+	// The request that walked into it is the DUT's own, and the capture
+	// normally carries it. Cite the request rather than the response: for the
+	// dropped reading there IS no response to cite, and citing the request is
+	// the honest evidence in all three cases.
+	if c != nil {
+		for _, ex := range c.Reads() {
+			start, qty, ok := ex.Request.ReadRequest()
+			if !ok || start != hit.Addr || qty != hit.Count {
+				continue
+			}
+			return bytesf(claim, method, certify.Pass, fromDUT, ex.Request.Start, ex.Request.End,
+				"the DUT issued %s and the server, under the one-shot armed at epoch %d, delivered %s. "+
+					"The simulator's own ledger records the transaction as %s. %s. Request cited in "+
+					"full: [%s]",
+				ex.Request.String(), r.M.Epoch, deliveredDescription(r.Outcome, hit), hit, r.Doc,
+				ex.Request.Hex())
+		}
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"the DUT issued a read at %d×%d and the server, under the one-shot armed at epoch %d, delivered "+
+			"%s: %s. %s. No frame carrying that request was attributed to this test case, so this rests "+
+			"on the simulator's record rather than on a citation into the capture",
+		hit.Addr, hit.Count, r.M.Epoch, deliveredDescription(r.Outcome, hit), hit, r.Doc)
 }
 
-// evalPROT1 is PROT-1's decision logic. shortArmedAt, when non-zero, is the
-// moment phase (c)'s short_response fault was armed — everything this
-// function evaluates about phase (a)'s severed transaction is scoped to
-// BEFORE that instant, so a later, structurally-truncated-but-still-open
-// exchange (evaluated separately by evalPROT1ShortResponse) is never
-// misattributed here as "the server reset/closed the connection", which it
-// did not.
-func evalPROT1(c *Conversation, at func(int) (time.Time, bool), severed, latency bool,
-	shortArmedAt time.Time) []finding {
-	var out []finding
-
-	// (1) The incomplete response itself.
-	claim := "a Modbus response the DUT requested did not complete"
-	method := "a request in the reassembled DUT→server direction with no matching response, in a " +
-		"conversation the server closed"
-	unanswered := unansweredReadsBefore(c, at, shortArmedAt)
-	switch {
-	case !severed:
-		out = append(out, skipf(claim, method,
-			"the connection could not be severed on the server, so no incomplete response was produced"))
-	case len(unanswered) == 0:
-		out = append(out, skipf(claim, method,
-			"the server's connection was severed, but every request this test case observed was "+
-				"answered — the severance fell between transactions rather than during one. The DUT's "+
-				"reconnect is still asserted below"))
+// deliveredDescription says, in words, what the client actually got.
+func deliveredDescription(outcome string, e LedgerEntry) string {
+	switch outcome {
+	case outcomeDropped:
+		return "nothing at all, with the connection left open"
+	case outcomeTruncated:
+		return fmt.Sprintf("a %d-byte prefix of the response with the MBAP length field left promising "+
+			"the rest", len(e.Response)/2)
+	case outcomeDelayed:
+		return fmt.Sprintf("the complete response %.0f ms later", e.LatencyMS)
 	default:
-		q := unanswered[len(unanswered)-1].Request
-		closedBy := "the conversation ended"
-		switch {
-		case c.RSTSeen:
-			closedBy = "the server reset the connection (RST)"
-		case c.FINSeen:
-			closedBy = "the server closed the connection (FIN)"
-		}
-		out = append(out, bytesf(claim, method, certify.Pass, fromDUT, q.Start, q.End,
-			"the DUT issued %s and received no response: %s. %d request(s) in this window went "+
-				"unanswered. Request cited in full: [%s]",
-			q.String(), closedBy, len(unanswered), q.Hex()))
-	}
-
-	// (2) The recovery criterion — the row's actual SHALL.
-	claim = "the DUT remained functional and read the Common Model successfully after the failure"
-	method = "a complete FC 0x03 exchange, covering model 1's body, occurring after the unanswered request"
-	after := 0
-	if len(unanswered) > 0 {
-		after = unanswered[len(unanswered)-1].Request.End
-	}
-	if ex, ok := firstSuccessfulReadAfter(c, after); ok {
-		_, models, _, _ := c.ModelChain()
-		common := ""
-		if m, ok := findModel(models, CommonModelID); ok && m.BodyRead {
-			common = fmt.Sprintf(" The Common Model (ID 1, header at %d) was among the blocks read "+
-				"after the failure.", m.HeaderAddr)
-		}
-		out = append(out, bytesf(claim, method, certify.Pass, fromServer, ex.Response.Start, ex.Response.End,
-			"after the failure the DUT issued %s and the server answered it normally — the client "+
-				"neither hung nor stopped polling.%s Recovery response cited in full: [%s]",
-			ex.Request.String(), common, ex.Response.Hex()))
-	} else {
-		out = append(out, skipf(claim, method,
-			"no successful read followed the failure within this test case's frames. The DUT may have "+
-				"reconnected after the observation window closed; a longer window is needed to assert "+
-				"the recovery"))
-	}
-
-	// (3) The timeout/retry path.
-	out = append(out, evalTimeoutBehaviour(c, at, latency))
-	return out
-}
-
-// evalTimeoutBehaviour asserts that the DUT bounds its reads: with the server
-// delayed far beyond any sane timeout, a conformant client abandons the
-// transaction rather than blocking its control loop on it.
-func evalTimeoutBehaviour(c *Conversation, at func(int) (time.Time, bool), armed bool) finding {
-	claim := "the DUT bounded its read with a timeout rather than blocking on a response that did not arrive"
-	method := "elapsed capture time between a request frame and its response frame, with the server's " +
-		"read path delayed"
-	if !armed {
-		return skipf(claim, method,
-			"the read-delay fault could not be armed on the server, so no over-long response was produced")
-	}
-	if at == nil {
-		return skipf(claim, method, "no frame timestamps are available for this test case")
-	}
-	var worst time.Duration
-	var worstEx Exchange
-	abandoned := 0
-	for _, ex := range c.Reads() {
-		if len(ex.Request.Frames) == 0 {
-			continue
-		}
-		qt, ok := at(ex.Request.Frames[0])
-		if !ok {
-			continue
-		}
-		if ex.Response == nil || len(ex.Response.Frames) == 0 {
-			abandoned++
-			continue
-		}
-		rt, ok := at(ex.Response.Frames[len(ex.Response.Frames)-1])
-		if !ok {
-			continue
-		}
-		if d := rt.Sub(qt); d > worst {
-			worst, worstEx = d, ex
-		}
-	}
-	threshold := time.Duration(latencyMs) * time.Millisecond
-	switch {
-	case abandoned > 0:
-		return framesf(claim, method, certify.Pass, aduFrames(c.Requests...),
-			"with the server's read path delayed by %d ms, %d request(s) received no response at all "+
-				"within this test case's frames — the DUT gave up on them rather than waiting out the "+
-				"delay, and kept issuing new requests", latencyMs, abandoned)
-	case worst >= threshold:
-		return bytesf(claim, method, certify.Warn, fromDUT, worstEx.Request.Start, worstEx.Request.End,
-			"the DUT waited %s for a response — at or beyond the %s the server was delayed by — and "+
-				"accepted it. The client did not abandon the over-long read, so its read bound (if any) "+
-				"is longer than the injected delay", worst.Round(time.Millisecond), threshold)
-	case worst > 0:
-		return bytesf(claim, method, certify.Skip, fromDUT, worstEx.Request.Start, worstEx.Request.End,
-			"the slowest exchange in this test case's frames completed in %s, well under the %s delay "+
-				"armed on the server, so the delay was not in force for the frames observed and the "+
-				"timeout path was not exercised", worst.Round(time.Millisecond), threshold)
-	default:
-		return skipf(claim, method, "no request/response pair with usable frame timestamps was observed")
+		return "an answer"
 	}
 }
 
-// unansweredReadsBefore returns unansweredReads(c), restricted to requests
-// issued strictly before cutoff. A zero cutoff — no later phase needs
-// excluding — returns every unanswered read, unfiltered (evalPROT1's
-// original, single-phase behaviour). An exchange whose timestamp cannot be
-// resolved is KEPT rather than dropped, so a timestamp gap here never
-// silently hides a real severance.
-func unansweredReadsBefore(c *Conversation, at func(int) (time.Time, bool), cutoff time.Time) []Exchange {
-	all := unansweredReads(c)
-	if cutoff.IsZero() || at == nil {
-		return all
+// evalPartialRecovery is §2.8.1's actual SHALL: the client remains functional.
+func evalPartialRecovery(r *partialReading, d *determinism) finding {
+	claim := fmt.Sprintf("the DUT remained functional after %s and transacted normally again", r.Name)
+	method := "a transaction with the server AFTER the one-shot was spent, held on the simulator's " +
+		"transaction ledger rather than on a clock, so the DUT's own reconnect-with-backoff has as long " +
+		"as it needs"
+	if !r.M.Armed {
+		return skipf(claim, method, "the reading was never delivered, so there is nothing to recover from")
 	}
-	var out []Exchange
-	for _, ex := range all {
-		if len(ex.Request.Frames) == 0 {
-			out = append(out, ex)
-			continue
-		}
-		t, ok := at(ex.Request.Frames[0])
-		if !ok || t.Before(cutoff) {
-			out = append(out, ex)
-		}
+	if r.Fence == 0 {
+		return skipf(claim, method, "the recovery fence could not be taken on the sim")
 	}
-	return out
+	if !r.Recovered {
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"after %s (armed at epoch %d, fenced for recovery at epoch %d) the DUT issued no transaction "+
+				"at all to this server within the barrier's budget — it was not seen to resume polling",
+			r.Name, r.M.Epoch, r.Fence)
+	}
+	good := r.Recovery.WithOutcome(outcomeAnswered)
+	if len(good) == 0 {
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"after %s the DUT did transact again, but none of its %d transaction(s) completed normally "+
+				"within the window: %s", r.Name, r.Recovery.Total, r.Recovery.Summary())
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"after %s the DUT issued %d transaction(s) that completed normally — first: %s. The client "+
+			"neither hung on the incomplete answer nor stopped polling", r.Name, len(good), good[0])
 }
 
-// unansweredReadsFrom is unansweredReadsBefore's complement: requests issued
-// at or after cutoff, used to isolate a LATER phase's own provocation
-// (short_response) from an earlier one already accounted for by
-// unansweredReadsBefore (tcp_drop). A zero cutoff or nil at, meaning the
-// later phase never ran, correctly yields nothing.
-func unansweredReadsFrom(c *Conversation, at func(int) (time.Time, bool), cutoff time.Time) []Exchange {
-	if cutoff.IsZero() || at == nil {
-		return nil
-	}
-	var out []Exchange
-	for _, ex := range unansweredReads(c) {
-		if len(ex.Request.Frames) == 0 {
-			continue
-		}
-		t, ok := at(ex.Request.Frames[0])
-		if ok && !t.Before(cutoff) {
-			out = append(out, ex)
-		}
-	}
-	return out
+// prot1CommonModelGap records the one part of §2.8.1 this bench cannot reach,
+// and why it is a DUT capability gap rather than a bench one.
+func prot1CommonModelGap() finding {
+	return skipf(
+		"the DUT logged the Common Model read values as expected after the server returned to normal",
+		"§2.8.1 steps 6-7: read the Common Model again once the server is behaving, and check the "+
+			"decoded values",
+		"lexa-gw reads model 1's BODY exactly once, during admission, on a separate short-lived "+
+			"connection at boot (internal/southbound/admission/identify.go's identifyNow → "+
+			"sunspec.ReadCommon). Its steady-state poll and its post-reconnect rediscovery read the "+
+			"model chain's HEADERS and then only the measurement model — lexa-proto/sunspec/reader.go "+
+			"caches the block layout per session and never re-reads model 1's body. So no provocation "+
+			"available to this bench can make the DUT re-read the Common Model inside a test case's "+
+			"window: it would take a process restart, which a shared-bench conformance run must not "+
+			"perform. This is a DUT-side observability gap, not a missing sim verb, and it is the same "+
+			"gap CLI-1..CLI-4 report against the identical criterion")
 }
 
-// evalPROT1ShortResponse is PROT-1#5: the structurally truncated reading of
-// §2.8.1's undefined "partial response" — an MBAP length field promising
-// more bytes than the server actually wrote, with the connection left open
-// rather than closed (contrast tcp_drop's severed-mid-flight reading,
-// evalPROT1's phase (a)). Needs modsim started with -protofault
-// (sim/southbound/protorelay.go); without it the sim refuses the fault BY
-// NAME and this SKIPs saying so.
-func evalPROT1ShortResponse(c *Conversation, at func(int) (time.Time, bool), armed error,
-	armedAt time.Time) finding {
-	claim := "the DUT recovered from a response whose MBAP length field promised more bytes than were delivered"
-	method := "serve a structurally truncated Modbus response (a well-formed MBAP length field, fewer PDU " +
-		"bytes actually written, connection left open) via modsim's short_response fault (needs -protofault), " +
-		"then look for a complete, successful exchange afterward"
-	if armed != nil {
-		return skipf(claim, method, "the short_response fault could not be armed on the server: %v", armed)
+func max16(a, b uint16) uint16 {
+	if a > b {
+		return a
 	}
-	if c == nil {
-		return skipf(claim, method,
-			"the short_response fault was armed, but no capture frame was attributed to this test case, "+
-				"so the DUT's reaction to it cannot be observed")
-	}
-	unanswered := unansweredReadsFrom(c, at, armedAt)
-	if len(unanswered) == 0 {
-		return skipf(claim, method,
-			"the short_response fault was armed, but no request in this test case's frames was left "+
-				"without a complete response while it was in force — the truncated write may have fallen "+
-				"outside the observed window, or landed on a connection this test case does not cite "+
-				"bytes from (see the note on multiple attributed conversations)")
-	}
-	q := unanswered[len(unanswered)-1].Request
-	if ex, ok := firstSuccessfulReadAfter(c, q.End); ok {
-		return bytesf(claim, method, certify.Pass, fromServer, ex.Response.Start, ex.Response.End,
-			"the DUT issued %s while the server was serving a truncated response (MBAP length promising "+
-				"more PDU bytes than were written, connection left open) and received no complete answer "+
-				"to it; the client recovered — %s issued afterward and answered normally. Recovery "+
-				"response cited in full: [%s]", q.String(), ex.Request.String(), ex.Response.Hex())
-	}
-	return skipf(claim, method,
-		"the short_response fault was armed and left a request unanswered, but no successful read "+
-			"followed within this test case's frames to evidence recovery")
+	return b
 }
 
 // ── PROT-2 — TCP Segmentation ─────────────────────────────────────────────────
@@ -401,29 +327,136 @@ func checkPROT2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
-	// A forced reconnect brings the discovery burst into the window: many
-	// responses in quick succession, which is where a segmented or coalesced
-	// delivery is most likely to occur naturally.
-	forced := o.forceReconnect(ctx)
-	if err := o.watch(ctx, 2); err != nil {
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
+	}
+	if err := d.begin(ctx, nil); err != nil {
 		return certify.Result{}, err
 	}
+	defer d.restore(ctx)
+
+	// §2.8.2 step 1: "preconfigure Server 1 to respond with a TCP-segmented
+	// Modbus response." modsim can do exactly that — one ADU written to the
+	// socket in two writes — but only with a second relay interposed
+	// (-protofault). When it was not, the sim refuses the kind BY NAME, and
+	// that refusal is reported as the row's gap rather than folded into "TCP
+	// segmentation cannot be compelled", which is what this row used to say.
+	seg, segErr := d.meet(ctx,
+		map[string]any{"kind": "segment_response", "split_after": mbapHeaderBytes},
+		"write each response ADU to the socket in two writes, splitting after the MBAP header, so the "+
+			"client must reassemble one Modbus message from more than one segment",
+		"segment_response", 1)
+	if segErr != nil {
+		return certify.Result{}, segErr
+	}
+
+	// A forced reconnect brings the discovery burst into the window: many
+	// responses in quick succession, which is where a segmented or coalesced
+	// delivery is most likely to occur even without the relay.
+	reconnFence, forced := d.reconnect(ctx,
+		"sever the DUT's southbound connection so its reconnect's discovery burst — many responses in "+
+			"quick succession — falls inside this test case's window")
+	var burst LedgerPage
+	var sawBurst bool
+	if forced == nil {
+		var err error
+		burst, sawBurst, err = d.awaitLedger(ctx, reconnFence, 3)
+		if err != nil {
+			return certify.Result{}, err
+		}
+	}
+
 	return certify.Result{
-		Notes: fmt.Sprintf("the DUT's MBAP-length framing of the server's byte stream was asserted%s; "+
-			"whether a response ADU happened to span TCP segments is not something this bench can "+
-			"compel. %s", reconnectNote(forced), o.injectionNote()),
+		Notes: fmt.Sprintf("the DUT's MBAP-length framing of the server's byte stream was asserted over "+
+			"a reconnect's discovery burst, held on the simulator's own transaction ledger rather than "+
+			"on a clock; a genuinely segmented ADU was %s. %s",
+			segmentationOutcome(seg), o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT parsed a Modbus response delivered across more than one TCP segment"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, pre), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalPROT2(c, forced == nil)...)
-			fs = append(fs, evalFraming(c)...)
+			fs = append(fs, evalPROT2Segmentation(seg, d))
+			if c != nil {
+				fs = append(fs, evalPROT2(c, forced == nil)...)
+				fs = append(fs, evalFraming(c)...)
+			}
+			fs = append(fs, evalPROT2Burst(burst, sawBurst, reconnFence, forced, d))
 			return emit(ev, c, fs), nil
 		},
 	}, nil
+}
+
+// segmentationOutcome renders, for the note, whether the sim could be made to
+// segment at all.
+func segmentationOutcome(m meeting) string {
+	switch {
+	case m.ArmErr != nil:
+		return fmt.Sprintf("NOT compelled (%v)", m.ArmErr)
+	case m.ok():
+		return fmt.Sprintf("compelled at epoch %d and met by %d transaction(s)", m.Epoch, m.Page.Total)
+	default:
+		return "compelled but not met inside this window"
+	}
+}
+
+// evalPROT2Segmentation reports the deliberate segmentation attempt. The
+// criterion — "the CUT parses the data correctly from the TCP-segmented
+// response" — is evidenced by the DUT continuing to transact normally through
+// the segmented interval, which the ledger records directly.
+func evalPROT2Segmentation(m meeting, d *determinism) finding {
+	claim := "the server delivered a Modbus response across more than one TCP segment and the DUT " +
+		"parsed it correctly"
+	method := "arm modsim's segment_response fault (one ADU, two socket writes, split after the MBAP " +
+		"header) and confirm from the simulator's own ledger that the DUT's transactions under it " +
+		"completed normally"
+	if m.ArmErr != nil {
+		return skipf(claim, method,
+			"the server could not be made to segment: %v. modsim serves this fault only with a second "+
+				"framing relay interposed (-protofault); it refuses the kind BY NAME when that flag was "+
+				"not given, which is why this reads as a launch-flag gap rather than as 'segmentation "+
+				"cannot be compelled'. Add -protofault to the bench's modsim invocation and this row's "+
+				"headline criterion becomes drivable", m.ArmErr)
+	}
+	if !m.ok() {
+		return skipf(claim, method, "%s", m.reason())
+	}
+	good := m.Page.WithOutcome(outcomeAnswered)
+	if len(good) == 0 {
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"with every response split across two socket writes from epoch %d, none of the DUT's %d "+
+				"transaction(s) completed normally: %s. A client that cannot reassemble an ADU spanning "+
+				"segments is exactly what §2.8.2 exists to catch", m.Epoch, m.Page.Total, m.Page.Summary())
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"with every response split across two socket writes from epoch %d, %d of the DUT's %d "+
+			"transaction(s) completed normally — first: %s. The client reassembled the ADU from more "+
+			"than one segment rather than retrying or resetting",
+		m.Epoch, len(good), m.Page.Total, good[0])
+}
+
+// evalPROT2Burst asserts the reconnect's discovery burst reached the server,
+// which is what makes the framing assertions above about a real conversation.
+func evalPROT2Burst(page LedgerPage, saw bool, fence uint64, forced error, d *determinism) finding {
+	claim := "the DUT re-established its connection and issued a discovery burst the framing assertions " +
+		"above are drawn from"
+	method := "the transactions the simulator recorded after the DUT's connection was severed at a " +
+		"named epoch"
+	if forced != nil {
+		return skipf(claim, method, "the DUT's connection could not be severed: %v", forced)
+	}
+	if !saw {
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"the DUT's connection was severed at epoch %d and it issued only %d transaction(s) "+
+				"afterwards within the barrier's budget", fence, page.Total)
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"after its connection was severed at epoch %d the DUT reconnected and issued %d transaction(s) "+
+			"— %s — over %d session(s) as the simulator counted them",
+		fence, page.Total, page.Summary(), page.Poll.Sessions)
 }
 
 // evalPROT2 is PROT-2's decision logic. selfSevered is true when THIS test

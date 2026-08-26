@@ -76,12 +76,25 @@ func TestSentinelTypesAreManyToOneAndSaySo(t *testing.T) {
 	if len(types) < 4 {
 		t.Fatalf("0xFFFF maps to %v; it is the sentinel for several 16-bit types", types)
 	}
-	// 0x8000 is the LEADING word of int16, sunssf, int32 and int64 alike, and
-	// the lookup must say all four rather than pick one: without a point map
-	// there is no way to know which type a register belongs to, and a check
+	// 0x8000 is the LEADING word of int16, sunssf, pad, int32 and int64 alike,
+	// and the lookup must say all of them rather than pick one: without a point
+	// map there is no way to know which type a register belongs to, and a check
 	// that named one would be inventing precision.
-	if got := SentinelTypesFor(0x8000); len(got) != 4 {
-		t.Errorf("0x8000 = %v, want int16, int32, int64 and sunssf", got)
+	want8000 := []string{"int16", "int32", "int64", "pad", "sunssf"}
+	got := SentinelTypesFor(0x8000)
+	if len(got) != len(want8000) {
+		t.Errorf("0x8000 = %v, want %v", got, want8000)
+	}
+	for i := range got {
+		if i < len(want8000) && got[i] != want8000[i] {
+			t.Errorf("0x8000 = %v, want %v", got, want8000)
+			break
+		}
+	}
+	// 0x0000 is the widest of all — five types whose not-implemented value is
+	// indistinguishable from an ordinary reading of zero.
+	if got := SentinelTypesFor(0x0000); len(got) < 5 {
+		t.Errorf("0x0000 = %v, want at least acc16/acc32/acc64/ipaddr/string/ipv6addr", got)
 	}
 	if got := SentinelTypesFor(0x1234); len(got) != 0 {
 		t.Errorf("0x1234 is not any type's sentinel, got %v", got)
