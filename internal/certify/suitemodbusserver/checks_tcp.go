@@ -355,7 +355,13 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		return certify.Result{}, err
 	}
 
-	sameConnOK, staleTID := false, false
+	// Three distinguishable same-connection outcomes, kept apart because they
+	// are different findings about different criteria: the follow-up answered
+	// correctly; a response under the TRUNCATED frame's id (the splice §2.7.7
+	// names); and a response under some third id (the response stream no longer
+	// aligned with the requests). Only the second is evidence against the
+	// no-stale-response criterion; all three decide the recovery criterion.
+	sameConnOK, staleTID, misframed := false, false, false
 	var sameConnText string
 	followTID, adu, ferr := s.client.doTolerant(follow, "TCP-2 step 2: complete request on the same connection")
 	switch {
@@ -371,7 +377,7 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 			"request MIS-PARSED, which §2.7.7 names as the failure",
 			adu.TID, adu.PDU, followTID, wait.Pause)
 	case ferr == nil:
-		staleTID = true
+		misframed = true
 		sameConnText = fmt.Sprintf("the DUT answered with pdu % x under transaction id 0x%04x, which is "+
 			"neither the follow-up's 0x%04x nor the truncated frame's 0x%04x — the response stream is no "+
 			"longer aligned with the request that produced it",
@@ -383,15 +389,16 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	}
 	sameTIDs := tidsSince(s.client, before)
 
-	// Recovery on a fresh connection. Not attempted after a stale-transaction-id
-	// answer: the DUT already answered, wrongly, and the criterion is settled.
-	// Opening a second connection there would only add a successful exchange
-	// beside a failure and invite it to be read as recovery.
+	// Recovery on a fresh connection. Not attempted after the DUT has ALREADY
+	// ANSWERED, wrongly — a stale-id or misframed response settles the
+	// criterion, and opening a second connection there would only put a
+	// successful exchange beside a failure and invite it to be read as
+	// recovery.
 	var s2 *session
 	newConnOK := false
 	var newConnText string
 	var newTIDs []uint16
-	if !sameConnOK && !staleTID {
+	if !sameConnOK && !staleTID && !misframed {
 		s2, err = openSession(ctx, rc, "TCP-2 recovery connection")
 		if err != nil {
 			newConnText = "a fresh connection could not be established after the truncated request: " + err.Error()
@@ -419,15 +426,13 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		"long the harness should wait — the catalog's own note directs that the connection-close behaviour " +
 		"be recorded as an OBSERVATION rather than as a failure, and it is recorded here as one"
 
-	verdict := certify.Fail
+	recovered := sameConnOK || newConnOK
+	verdict := verdictIf(recovered)
 	notes := sameConnText
 	switch {
-	case sameConnOK:
-		verdict = certify.Pass
-	case staleTID:
-		// verdict stays Fail; sameConnText already says why.
+	case sameConnOK, staleTID, misframed:
+		// sameConnText already says what happened, on its own connection.
 	case newConnOK:
-		verdict = certify.Pass
 		notes = sameConnText + "; " + newConnText
 	default:
 		if newConnText != "" {
@@ -497,7 +502,9 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 			// for the truncated frame's transaction id. This is the assertion
 			// that separates a device which recovered from one which spliced the
 			// follow-up onto the partial frame, and it is stated separately so a
-			// reader sees WHICH of the two failed.
+			// reader sees WHICH of the two failed. A MISFRAMED response — under
+			// neither id — is not evidence against this claim and is graded on
+			// the recovery criterion below, where it belongs.
 			staleClaim := "no Modbus response was returned under the truncated frame's transaction " +
 				"identifier: the DUT did not mis-parse the following request as that frame's missing tail"
 			staleMethod := fmt.Sprintf("the transaction identifier of the response read back after the "+
@@ -512,7 +519,7 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 			}
 			out = append(out, a)
 
-			// The criterion.
+			// The criterion, and the one every outcome lands on.
 			claim := "after an incomplete request the DUT recovers, and a following complete, well-formed " +
 				"request receives a successful response"
 			method := "a complete FC 3 request issued after the truncated one — on the same connection " +
@@ -550,7 +557,7 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 				a2.Note = joinNote(a2.Note, observation)
 				out = append(out, a2)
 			default:
-				a, err := c.frames(claim, method, certify.Fail, notes, sameTIDs)
+				a, err := c.frames(claim, method, verdictIf(recovered), notes, sameTIDs)
 				if err != nil {
 					return nil, err
 				}
