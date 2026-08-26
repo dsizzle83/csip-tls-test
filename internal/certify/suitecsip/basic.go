@@ -403,6 +403,18 @@ const (
 	oracleDefaultWindowParam    = "iw15.oracle_default_window"
 	oracleDefaultVerdictParam   = "iw15.oracle_default_verdict"
 	oracleDefaultObservedParam  = "iw15.oracle_default_observed"
+
+	// oracleDefaultProvenanceParam names WHERE the default-first step's value
+	// comes from, for the rows whose "default" is not the procedure's own.
+	// BASIC-013's default IS Figure 13's Default column, so it leaves this
+	// empty and prescribedDefaultShortfall/Credit speak of "the procedure's
+	// own" default. BASIC-007's ramp baseline is instead a DISTINGUISHABLE
+	// value this row invents (a WRmp Figure 7 does not name) purely to make the
+	// move to the Test Value observable regardless of the register's prior
+	// state (CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION). Setting this makes
+	// the shortfall and credit prose say exactly that, so a bundle reader is
+	// never told Figure 7 prescribed a value it does not.
+	oracleDefaultProvenanceParam = "iw15.oracle_default_provenance"
 )
 
 // defaultControlMRIDSuffix distinguishes the prescribed default's control from
@@ -1407,13 +1419,18 @@ func prescribedDefaultShortfall(o *Observation) (Finding, bool) {
 		return Finding{}, false
 	}
 	observed := orText(o.Params[oracleDefaultObservedParam], "no reading was recorded")
+	prescribes := fmt.Sprintf("this row's procedure prescribes that the DER be put into a %s DEFAULT",
+		pctFromParam(want))
+	if prov := o.Params[oracleDefaultProvenanceParam]; prov != "" {
+		prescribes = "this row first drives the DER into " + prov
+	}
 	return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
-		"this row's procedure prescribes that the DER be put into a %s DEFAULT before the test value is "+
-			"commanded, and that default was NOT confirmed to reach the DER's own registers within %s "+
+		"%s before the test value is "+
+			"commanded, and that starting state was NOT confirmed to reach the DER's own registers within %s "+
 			"(published as %s; the oracle's last reading was %s). The DER may hold the commanded value now, "+
-			"but with the prescribed starting state unestablished nothing distinguishes a DER the DUT MOVED "+
+			"but with the starting state unestablished nothing distinguishes a DER the DUT MOVED "+
 			"from one that was already there — which is exactly the reading this row must not certify",
-		pctFromParam(want), orText(o.Params[oracleDefaultWindowParam], "the settle window"),
+		prescribes, orText(o.Params[oracleDefaultWindowParam], "the settle window"),
 		orText(o.Params[oracleDefaultMRIDParam], "a separate mRID"), observed)}, true
 }
 
@@ -1424,6 +1441,13 @@ func prescribedDefaultCredit(o *Observation) string {
 	want := o.Params[oracleDefaultCommandedParam]
 	if want == "" || certify.Verdict(o.Params[oracleDefaultVerdictParam]) != certify.Pass {
 		return ""
+	}
+	if prov := o.Params[oracleDefaultProvenanceParam]; prov != "" {
+		return fmt.Sprintf(". The starting state was established, not assumed: the DER was first driven "+
+			"into %s and that landing was CONFIRMED in the DER's own registers (%s) before the commanded "+
+			"value was published, so the reading that follows is a MOVE the DUT made from a known "+
+			"non-target state, not a register an earlier run left behind", prov,
+			o.Params[oracleDefaultObservedParam])
 	}
 	return fmt.Sprintf(". The starting state was the procedure's own: the DER was first driven into its "+
 		"prescribed %s default and that default was CONFIRMED in the DER's own registers (%s) before the "+

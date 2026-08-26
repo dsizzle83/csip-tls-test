@@ -63,13 +63,17 @@ func TestParseRequestLogReadsGridsimsLines(t *testing.T) {
 func TestServerViewBaselineExcludesPriorEvidence(t *testing.T) {
 	base := ServerView{
 		Responses: []AdminResponse{{Subject: "OLD", Status: 1}},
-		DERPuts:   []AdminDERPut{{Resource: "DERStatus"}},
-		Requests:  []ServerRequest{{Method: "GET", Path: "/dcap"}},
+		// Real DER PUTs carry the resource PATH gridsim keyed them under; the
+		// baseline difference is by (path, received time), so the fixtures must
+		// too (the same DERStatus persists from base into now, at the same href).
+		DERPuts:  []AdminDERPut{{Path: "/edev/2/der/0/derstat", Resource: "DERStatus"}},
+		Requests: []ServerRequest{{Method: "GET", Path: "/dcap"}},
 	}
 	now := ServerView{
 		Available: true,
 		Responses: []AdminResponse{{Subject: "OLD", Status: 1}, {Subject: "NEW", Status: 2}},
-		DERPuts:   []AdminDERPut{{Resource: "DERStatus"}, {Resource: "DERSettings"}},
+		DERPuts: []AdminDERPut{{Path: "/edev/2/der/0/derstat", Resource: "DERStatus"},
+			{Path: "/edev/2/der/0/derset", Resource: "DERSettings"}},
 		Requests: []ServerRequest{{Method: "GET", Path: "/dcap"}, {Method: "GET", Path: "/dcap"},
 			{Method: "GET", Path: "/edev"}},
 	}

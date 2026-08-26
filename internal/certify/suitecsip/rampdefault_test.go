@@ -6,10 +6,18 @@ package suitecsip
 // second run is the one that matters.
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/diff"
 	"lexa-proto/sunspec"
 )
 
@@ -291,5 +299,213 @@ func TestBASIC007_IsNotInTheUniformInverterControlRows(t *testing.T) {
 				"panicking (e.g. a Register() change tolerating duplicates), this row's own apparatus " +
 				"would be shadowed by the uniform machinery's unreachableMode shape")
 		}
+	}
+}
+
+// ── register-state-independence: the whole point of the self-baselining fix ──
+//
+// CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION: in a full campaign a prior
+// ramp row left WRmp already at the Figure-7 target (90), and the old row read
+// that as "already held" and refused a clean product. These tests drive the row
+// end-to-end against a SCRIPTED fake DUT whose WRmp starts at 0, at 90, and at
+// 50, and prove all three PASS — because the row now drives a distinguishable
+// baseline first and certifies the MOVE, not the match.
+
+// rampFakeBench is a scripted fake DUT for BASIC-007: a fake gridsim admin whose
+// POST /admin/default applies the setGradW it is handed to the DER's model-704
+// WRmp (a perfectly-responsive gateway), and a simapi sidecar serving that DER's
+// registers plus the 1.1.0 poll barrier so the row's epoch fence has something
+// real to wait on. The DER's WRmp starts at `start` — the prior-register state
+// the row must be independent of. No board, no product: the "DUT" is this
+// handler applying whatever ramp default the row last commanded.
+func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver) {
+	t.Helper()
+	dev := diff.NewDevice(diff.Bench702())
+	var mu sync.Mutex
+	var poll uint64
+	applyWRmp := func(v uint16) { // caller holds mu
+		regs, ok := dev.Model(704)
+		if !ok {
+			t.Fatal("the Bench702 fixture serves no model 704")
+		}
+		sunspec.L704.View(regs).SetEnum("WRmp", v)
+		off := sunspec.L704.Offset("WRmp")
+		if off < 0 || off >= len(regs) {
+			t.Fatal("the 704 layout has no WRmp point")
+		}
+		if err := dev.WriteHolding(dev.Bases[704]+uint16(off), []uint16{regs[off]}); err != nil {
+			t.Fatalf("write WRmp=%d: %v", v, err)
+		}
+	}
+	mu.Lock()
+	applyWRmp(start)
+	mu.Unlock()
+
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("/admin/default", func(w http.ResponseWriter, r *http.Request) {
+		var req DefaultRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.SetGradW != nil {
+			mu.Lock()
+			applyWRmp(*req.SetGradW / 100) // the responsive DUT tracks the commanded default
+			poll++                          // and it took a fresh poll cycle to do it
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	adminSrv := httptest.NewServer(adminMux)
+	t.Cleanup(adminSrv.Close)
+
+	pollBody := func() []byte {
+		mu.Lock()
+		defer mu.Unlock()
+		b, _ := json.Marshal(map[string]any{
+			"api_version": "1.1.0", "reached": true,
+			"poll": map[string]any{"completed": poll},
+		})
+		return b
+	}
+	simMux := http.NewServeMux()
+	simMux.HandleFunc("/registers", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		snap := dev.Snapshot()
+		mu.Unlock()
+		out := make(map[string]uint16, len(snap))
+		for a, v := range snap {
+			out[strconv.Itoa(int(a))] = v
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	})
+	simMux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"paused": false, "sessions": []any{}})
+	})
+	simMux.HandleFunc("/poll", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(pollBody())
+	})
+	simMux.HandleFunc("/poll/wait", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(pollBody())
+	})
+	simSrv := httptest.NewServer(simMux)
+	t.Cleanup(simSrv.Close)
+
+	rc := &certify.RunCtx{
+		Case:    &certify.Case{UID: "csip-conf-v1.3::BASIC-007", ID: "BASIC-007"},
+		GridSim: certify.NewAdminClient(adminSrv.URL, http.DefaultClient),
+		Targets: certify.Targets{GridSimAdmin: adminSrv.URL},
+		Sims: map[string]*certify.SimClient{
+			oracleSimName: certify.NewSimClient(oracleSimName, simSrv.URL, http.DefaultClient),
+		},
+	}
+	return rc, NewDriver(rc)
+}
+
+// driveRampRow runs BASIC-007's Setup then PostWait against a bench, exactly the
+// two live-phase calls run() makes, and returns the Observation the citation
+// phase (oracleOutcome / spec.Verdict) reads.
+func driveRampRow(t *testing.T, rc *certify.RunCtx, d *Driver) *Observation {
+	t.Helper()
+	ctx := context.Background()
+	s := rampRatesSpec()
+	// Bound the settle/confirm windows so a run whose value never lands (a dead
+	// DUT, or the baseline-disabled mutation) FAILs promptly instead of burning
+	// the multi-minute pollCycleWait fallback. A healthy fake applies
+	// synchronously and PASSes on the first read, so this never gates a PASS.
+	params := map[string]string{pollWindowParam: "300ms"}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := s.PostWait(ctx, d, params); err != nil {
+		t.Fatalf("PostWait: %v", err)
+	}
+	return &Observation{Params: params}
+}
+
+// TestBASIC007_PassesRegardlessOfPriorRegisterState is the fix's deliverable:
+// the row PASSes whether the DER's WRmp started at 0, at 90 (the exact
+// contamination that reconciled the clean product to FAIL), or at anything else.
+func TestBASIC007_PassesRegardlessOfPriorRegisterState(t *testing.T) {
+	for _, start := range []uint16{0, 90, 50} {
+		t.Run(fmt.Sprintf("WRmp_starts_at_%d", start), func(t *testing.T) {
+			rc, d := rampFakeBench(t, start)
+			obs := driveRampRow(t, rc, d)
+
+			// The baseline was confirmed and the pre-read of the target FAILed
+			// (the DER did not hold 90 once the distinguishable 50 landed).
+			if got := obs.Params[oracleDefaultVerdictParam]; got != string(certify.Pass) {
+				t.Fatalf("the distinguishable baseline was not confirmed (%s=%q): %s", oracleDefaultVerdictParam,
+					got, obs.Params[oracleDefaultObservedParam])
+			}
+			if got := obs.Params[oraclePreVerdictParam]; got != string(certify.Fail) {
+				t.Fatalf("after the baseline landed, the pre-read of the target = %q, want %q — the DER "+
+					"should NOT hold WRmp=90 while it holds the 50 baseline: %s", got, certify.Fail,
+					obs.Params[oraclePreObservedParam])
+			}
+			f := oracleOutcome(obs)
+			if f.Verdict != certify.Pass {
+				t.Fatalf("verdict = %s from a DER whose WRmp started at %d: %s", f.Verdict, start,
+					findingObserved(f))
+			}
+			if !strings.Contains(f.Observed, "MOVE") {
+				t.Errorf("the PASS does not cite the MOVE it certifies (it must not read as a bare match): %s",
+					f.Observed)
+			}
+			t.Logf("start=%d -> %s: %s", start, f.Verdict, f.Observed)
+		})
+	}
+}
+
+// TestBASIC007_FailsWhenTheBaselineNeverLands proves the shortfall has teeth: a
+// DUT that ignores the distinguishable baseline (its WRmp never becomes 50)
+// cannot certify the transition, whatever the post-read shows — the row FAILs on
+// the unestablished starting state rather than certifying a stale register.
+func TestBASIC007_FailsWhenTheBaselineNeverLands(t *testing.T) {
+	// Record a run whose baseline confirmation FAILed (the fake DUT never moved
+	// to 50) but whose post-read matched 90 — the exact "the register holds it,
+	// but we never proved it moved" shape the fix must refuse.
+	obs := &Observation{Params: map[string]string{
+		oracleDefaultCommandedParam:  strconv.Itoa(int(rampBaselineSetGradW)),
+		oracleDefaultProvenanceParam: "a DISTINGUISHABLE setGradW=5000 baseline",
+		oracleDefaultVerdictParam:    string(certify.Fail),
+		oracleDefaultObservedParam:   "the DER's own model 704 WRmp register reads 90 against a commanded 50",
+		oracleDefaultWindowParam:     "2m30s",
+		oracleDefaultMRIDParam:       "gridsim program-0's DefaultDERControl (setGradW=5000)",
+		oraclePreVerdictParam:        string(certify.Fail),
+		oraclePreObservedParam:       "WRmp reads 90 against a commanded 90 — wait, still 90",
+		oracleVerdictParam:           string(certify.Pass),
+		oracleObservedParam:          "the DER's own model 704 WRmp register reads 90",
+	}}
+	f := oracleOutcome(obs)
+	if f.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s when the distinguishable baseline never landed: a post-read that matches "+
+			"cannot certify a transition whose starting state was never established: %s", f.Verdict,
+			findingObserved(f))
+	}
+	if !strings.Contains(f.Observed, "distinguishable") && !strings.Contains(f.Observed, "DISTINGUISHABLE") {
+		t.Errorf("the shortfall FAIL does not name the harness-chosen baseline (its provenance): %s", f.Observed)
+	}
+}
+
+// TestBASIC007_PassCreditIsHonestAboutTheBaselineProvenance pins that a bundle
+// reader is never told Figure 7 prescribed the 50 baseline: the credit prose
+// names it as a distinguishing value this row invents, not the catalog's Default
+// column.
+func TestBASIC007_PassCreditIsHonestAboutTheBaselineProvenance(t *testing.T) {
+	rc, d := rampFakeBench(t, 90)
+	obs := driveRampRow(t, rc, d)
+	f := oracleOutcome(obs)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s: %s", f.Verdict, findingObserved(f))
+	}
+	if strings.Contains(f.Observed, "the procedure's own") || strings.Contains(f.Observed, "the procedure prescribes") {
+		t.Errorf("the ramp PASS claims the procedure prescribed its baseline, which Figure 7 does not: %s",
+			f.Observed)
+	}
+	if !strings.Contains(obs.Params[oracleDefaultProvenanceParam], "Figure 7 does not name") {
+		t.Errorf("the recorded provenance does not disclaim Figure 7: %q",
+			obs.Params[oracleDefaultProvenanceParam])
 	}
 }

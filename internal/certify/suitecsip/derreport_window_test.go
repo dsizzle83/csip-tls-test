@@ -198,3 +198,47 @@ func TestPutsForInRunFallsBackToWindow(t *testing.T) {
 		t.Errorf("PutsForInRun with no RunDERPuts should fall back to the window, got %v", got)
 	}
 }
+
+// TestServerViewSince_CreditsAReHomedPUTThatReSortedTheMap is the server-tier
+// half of CSIP-BENCH-CORE014-REHOME-WINDOW-TIMING. gridsim keeps the LAST DER
+// PUT per resource PATH in a map, ordered into a slice by ReceivedAt. A routine
+// cadence DERStatus re-PUT updates that entry's ReceivedAt and re-sorts the
+// slice, so a genuinely new re-homed /g2/dercap PUT can land at an index BELOW
+// the baseline length — where the old slice-index delta dropped it. That is the
+// exact "0 DERCapability, 1 DERSettings" the CORE-014 live phase reported for
+// two re-PUTs the capture proved BOTH landed. The identity delta must credit
+// both.
+func TestServerViewSince_CreditsAReHomedPUTThatReSortedTheMap(t *testing.T) {
+	// Baseline: the four start-up self-reports, all at the same second.
+	base := ServerView{Available: true, DERPuts: []AdminDERPut{
+		{Path: "/edev/2/der/0/dercap", Resource: "DERCapability", ReceivedAt: 100},
+		{Path: "/edev/2/der/0/derset", Resource: "DERSettings", ReceivedAt: 100},
+		{Path: "/edev/2/der/0/derstat", Resource: "DERStatus", ReceivedAt: 100},
+		{Path: "/edev/2/der/0/deravail", Resource: "DERAvailability", ReceivedAt: 100},
+	}}
+	// After the re-home, in ReceivedAt order (as sortedDERPuts would serve it):
+	// the re-homed dercap re-PUT at 101 sorts BEFORE the cadence DERStatus
+	// update at 102, i.e. at index 3 — below len(base)=4 — so the old
+	// [len(base):] delta returned [derstat@102, g2/derset@103] and never saw the
+	// dercap re-PUT.
+	now := ServerView{Available: true, DERPuts: []AdminDERPut{
+		{Path: "/edev/2/der/0/dercap", Resource: "DERCapability", ReceivedAt: 100},
+		{Path: "/edev/2/der/0/derset", Resource: "DERSettings", ReceivedAt: 100},
+		{Path: "/edev/2/der/0/deravail", Resource: "DERAvailability", ReceivedAt: 100},
+		{Path: "/edev/2/der/0/g2/dercap", Resource: "DERCapability", ReceivedAt: 101},
+		{Path: "/edev/2/der/0/derstat", Resource: "DERStatus", ReceivedAt: 102},
+		{Path: "/edev/2/der/0/g2/derset", Resource: "DERSettings", ReceivedAt: 103},
+	}}
+	d := now.Since(base)
+	if got := len(d.PutsFor("DERCapability")); got != 1 {
+		t.Fatalf("the re-homed DERCapability re-PUT was not credited in the window: PutsFor(DERCapability)=%d, "+
+			"want 1 — this is the '0 dercap' the slice-index delta produced", got)
+	}
+	if got := len(d.PutsFor("DERSettings")); got != 1 {
+		t.Fatalf("the re-homed DERSettings re-PUT was not credited: PutsFor(DERSettings)=%d, want 1", got)
+	}
+	// And the re-homed hrefs are the ones credited, not the vacated start-up ones.
+	if p := d.PutsFor("DERCapability")[0].Path; p != "/edev/2/der/0/g2/dercap" {
+		t.Errorf("credited the wrong DERCapability PUT: %s, want the re-homed /g2/dercap", p)
+	}
+}

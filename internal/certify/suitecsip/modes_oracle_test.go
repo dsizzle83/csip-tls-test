@@ -888,13 +888,25 @@ func capPUT(modes string) Exchange {
 }
 
 // controlList builds the DERControlList the DUT fetches, one control per
-// (mRID, DERControlBase element) pair.
+// (mRID, DERControlBase element) pair, each served ACTIVE (currentStatus=1).
+// Active is the shape these coherence fixtures mean: a control the DUT was
+// actually handed to execute, so its silence IS an overclaim. A row exercising
+// a NOT-DUE control (the CSIP-BENCH-CORE014 case — Scheduled/Cancelled, where
+// silence is coherent) uses controlListStatus with an explicit status.
 func controlList(controls ...[2]string) Exchange {
+	return controlListStatus(eventStatusActive, controls...)
+}
+
+// controlListStatus is controlList with an explicit EventStatus.currentStatus
+// on every control, so a test can build the not-due shapes (Scheduled(0),
+// Cancelled) whose silence gatherModesEvidence must NOT read as an overclaim.
+func controlListStatus(status int, controls ...[2]string) Exchange {
 	var b strings.Builder
 	b.WriteString(`<DERControlList xmlns="` + Namespace + `" all="` +
 		strconv.Itoa(len(controls)) + `" results="` + strconv.Itoa(len(controls)) + `">`)
 	for _, c := range controls {
 		b.WriteString(`<DERControl replyTo="/rsps/0/r" responseRequired="03"><mRID>` + c[0] + `</mRID>` +
+			`<EventStatus><currentStatus>` + strconv.Itoa(status) + `</currentStatus></EventStatus>` +
 			`<DERControlBase><` + c[1] + `>1</` + c[1] + `></DERControlBase></DERControl>`)
 	}
 	b.WriteString(`</DERControlList>`)
@@ -1593,6 +1605,80 @@ func TestModesSupportedOracle_UnhonouredIsOverclaim(t *testing.T) {
 		responsePOST("M-RAN", 1), responsePOST("M-RAN", 2),
 	)
 	wantModesVerdict(t, "advertised, executed (contrast)", honoured, "", certify.Pass)
+}
+
+// TestModesSupportedOracle_NotDueControlIsNotAnOverclaim is the
+// CSIP-BENCH-CORE014-REHOME-WINDOW-TIMING fix: a mode advertised in the mask and
+// named ONLY by a control the DUT fetched while it was NOT DUE — SCHEDULED for a
+// future interval, or CANCELLED — and never responded to must be COHERENT, not
+// an overclaim. This is the exact shape that reconciled the clean f7950fc
+// product to FAIL: gridsim's DERC-SP-004 is a scheduled future event carrying
+// opModConnect, and a DUT correctly draws no execution or refusal for a control
+// that is not yet (or no longer) active.
+func TestModesSupportedOracle_NotDueControlIsNotAnOverclaim(t *testing.T) {
+	// opModConnect (bit 2) advertised, named only by a SCHEDULED control
+	// (currentStatus=0) with zero Responses — DERC-SP-004's exact shape.
+	scheduled := synthTranscript(
+		capPUT(maskConnect),
+		controlListStatus(0, [2]string{"DERC-SP-004", "opModConnect"}),
+	)
+	f := wantModesVerdict(t, "advertised, scheduled, zero Responses", scheduled, "", certify.Pass)
+	if strings.Contains(f.Observed, "INCOHERENT") {
+		t.Fatalf("a scheduled control the DUT correctly left alone was graded INCOHERENT: %s", f.Observed)
+	}
+	for _, want := range []string{"opModConnect", "not active", "DERC-SP-004"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the coherent PASS does not disclose WHY the bit is silent (%q): %s", want, f.Observed)
+		}
+	}
+
+	// A CANCELLED control (gridsim's currentStatus=6, DERC-SP-003's shape) the
+	// DUT must DROP is likewise coherent silence.
+	cancelled := synthTranscript(
+		capPUT(maskConnect),
+		controlListStatus(6, [2]string{"DERC-SP-003", "opModConnect"}),
+	)
+	if f := wantModesVerdict(t, "advertised, cancelled, zero Responses", cancelled, "", certify.Pass); strings.Contains(f.Observed, "INCOHERENT") {
+		t.Errorf("a cancelled control was graded INCOHERENT: %s", f.Observed)
+	}
+}
+
+// TestModesSupportedOracle_ReceiptOnANotDueControlIsStillCoherent pins the
+// robustness half of the fix: a Received(1) the DUT POSTed for a control that
+// is NOT active does not make its silence an overclaim. A receipt acknowledges
+// a not-yet-due control; the promise to EXECUTE is owed only once the interval
+// is underway. This matters because the real f7950fc DUT may well have
+// acknowledged the scheduled DERC-SP-004 earlier — the fix must not fail CORE-014
+// on that acknowledgement.
+func TestModesSupportedOracle_ReceiptOnANotDueControlIsStillCoherent(t *testing.T) {
+	tr := synthTranscript(
+		capPUT(maskConnect),
+		controlListStatus(0, [2]string{"DERC-ADM", "opModConnect"}),
+		responsePOST("DERC-ADM", 1), // Received a SCHEDULED control — an ack, not a promise to run now
+	)
+	f := wantModesVerdict(t, "scheduled, received, then silent", tr, "", certify.Pass)
+	if strings.Contains(f.Observed, "INCOHERENT") {
+		t.Errorf("a receipt on a not-due control was graded as an overclaim: %s", f.Observed)
+	}
+}
+
+// TestModesSupportedOracle_ActiveThenSilentStaysUnhonoured proves the fix did
+// NOT blunt the SD-02 fault check: a control served ACTIVE that the DUT
+// Received(1) and then went silent on — no 2/3, no refusal — is still an
+// overclaim, because an active control is one the DUT is supposed to be
+// executing now.
+func TestModesSupportedOracle_ActiveThenSilentStaysUnhonoured(t *testing.T) {
+	tr := synthTranscript(
+		capPUT(maskConnect),
+		controlListStatus(eventStatusActive, [2]string{"DERC-ACT", "opModConnect"}),
+		responsePOST("DERC-ACT", 1), // Received an ACTIVE control, then silence: the SD-02 fault shape
+	)
+	f := wantModesVerdict(t, "active, received, then silent", tr, "", certify.Fail)
+	for _, want := range []string{"opModConnect", "bit 2", "ADOPTED", "DERC-ACT"} {
+		if !strings.Contains(f.Observed, want) {
+			t.Errorf("the unhonoured FAIL omits %q: %s", want, f.Observed)
+		}
+	}
 }
 
 // TestModesSupportedOracle_LegacyDeclaration is F11's proof: gatherModesEvidence
