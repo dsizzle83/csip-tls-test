@@ -222,6 +222,27 @@ type adminStatusResp struct {
 	// makes the question answerable in one GET.
 	Fleet        AdminFleetStatus        `json:"fleet"`
 	Subscription AdminSubscriptionStatus `json:"subscription"`
+
+	// TLS is the evidence-grade posture of this process's TLS data plane, or
+	// ABSENT when the embedding binary never declared one. The two are
+	// different facts — an old gridsim versus a misconfigured bench — and a
+	// fail-closed caller must be able to tell them apart, which is why this is
+	// a pointer with omitempty rather than a struct that would report false.
+	// See Server.SetTLSPosture.
+	TLS *AdminTLSPosture `json:"tls,omitempty"`
+}
+
+// AdminTLSPosture is the pair of launch flags that decide whether a conformance
+// run's certificate evidence can exist at all. See Server.SetTLSPosture.
+type AdminTLSPosture struct {
+	// NoTickets reports -no-tickets: no session tickets issued and no session
+	// cache, so every dial is a FULL mTLS handshake with the certificates on
+	// the wire.
+	NoTickets bool `json:"no_tickets"`
+	// IdleTimeoutS reports -idle-timeout-s: an idle connection is closed after
+	// this many seconds, so each poll cycle opens its own observable session.
+	// Zero means disabled — one connection may span the whole run.
+	IdleTimeoutS int `json:"idle_timeout_s"`
 }
 
 // AdminFleetStatus is the CTP Figure-15 topology's state, in /admin/status.
@@ -278,6 +299,12 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	var tlsPosture *AdminTLSPosture
+	if s.tlsPosture != nil {
+		cp := *s.tlsPosture
+		tlsPosture = &cp
+	}
 
 	fleetStatus := AdminFleetStatus{Enabled: s.fleet != nil}
 	if s.fleet != nil {
@@ -338,6 +365,7 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 
 		Fleet:        fleetStatus,
 		Subscription: subStatus,
+		TLS:          tlsPosture,
 	})
 }
 

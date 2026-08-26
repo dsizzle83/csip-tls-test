@@ -546,6 +546,11 @@ func usage(w io.Writer, fs *flag.FlagSet) {
                                                  docs/LAB_LOOP.md); -preset local fills in its
                                                  addresses
 
+  certify -campaign csip -evidence -manifest configs/candidate.json -keylog /tmp/bench.keylog \
+          -param report.comm004=csip-conf-v1.3::COMM-004,csip-conf-v1.3::COMM-004A -gateway-ssh cc93
+                                                 an EVIDENCE campaign: the bench preconditions the
+                                                 submission artefacts depend on are proven before case 1
+
   certify -no-capture -suite modbus-server -target 127.0.0.1:5020 -param modbus.transport=plain
                                                  EXPLORATORY (non-gating) logic-only run against a
                                                  loopback sim

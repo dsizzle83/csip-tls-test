@@ -290,6 +290,81 @@ func looksLikeHTTP(b []byte) bool {
 	return false
 }
 
+// evidenceCriteria prepends the EVIDENCE run's per-scenario handshake
+// precondition to a COMM-004 row's criteria.
+//
+// It is a no-op outside an evidence run, and that restraint is the point: an
+// ordinary run measures a DEVICE, and "this window's session was resumed" is a
+// fact about the bench that must not be charged to the DUT. The certificate
+// criteria are right to report it as unavailable there.
+//
+// An EVIDENCE run is a different claim. It says this bundle will carry a
+// submission artefact — SS-CSIP-RESULTS v1.1 Chapter 5's raw TLS packet trace
+// per COMM-004 certificate scenario — and that artefact cannot be cut from a
+// resumed session, because TLS deliberately does not send the certificates
+// twice. So under -evidence the precondition is graded, on the scenario's own
+// row, where a reader can see WHICH scenario had no handshake and why.
+//
+// The alternative is what actually happened (audit LAB29-011): eight scenarios
+// each reporting "unavailable — resumed session" as a shrug, and RPT-060 failing
+// at the very end of the campaign with the aggregate. By then the bench is gone.
+// preflight_evidence.go now refuses such a bench before case 1; this is the
+// second line, for the resumption a correctly-posed bench can still produce —
+// the DUT reconnecting inside a window, an idle timeout that did not fire in
+// time — and it is the one that names the scenario.
+func evidenceCriteria(rc *certify.RunCtx, crits ...criterion) []criterion {
+	if !rc.Posture().Evidence {
+		return crits
+	}
+	return append([]criterion{critEvidenceFullHandshake()}, crits...)
+}
+
+// critEvidenceFullHandshake is that precondition.
+//
+// A REJECTED handshake satisfies it. The D/E/F/G fixtures are refused by the
+// DUT after the server's Certificate message, and that message is exactly what
+// Chapter 5's trace must contain — the artefact evidences the rejection, so a
+// trace that stops at a fatal alert is a complete artefact and this criterion
+// passes on it. What it fails is a window with no certificate exchange in it at
+// all.
+func critEvidenceFullHandshake() criterion {
+	return criterion{
+		Claim: "this COMM-004 scenario ran on a FULL TLS handshake, so the raw packet trace SS-CSIP-" +
+			"RESULTS v1.1 Chapter 5 requires for it can be cut from this window",
+		How: "the handshake attributed to this test case: a server Certificate message present in the " +
+			"clear, and RFC 5077 §3.1 abbreviated-flight detection negative",
+		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
+			ht, note := handshakeOf(t)
+			h := &ht.Handshake
+			switch {
+			case h.CarriesCertificates():
+				return annotate(found(certify.Pass, h.ServerCertFrames,
+					"a full handshake: the server presented %d certificate(s) in the clear (%s), so this "+
+						"scenario's trace carries its own certificate exchange",
+					len(h.ServerChain), chainDescription(h.ServerChain)), note)
+			case h.Resumed:
+				return annotate(found(certify.Fail, h.ClientHelloFrames,
+					"this scenario's session was RESUMED from a ticket (%s), so no certificates were sent "+
+						"on this wire and the Chapter 5 trace exported from this window would contain no "+
+						"certificate exchange. The bench posture that prevents this was proven before case "+
+						"1 (gridsim -no-tickets, -idle-timeout-s below the poll cadence), so a resumption "+
+						"HERE means the DUT reused a session established before this window opened — "+
+						"lengthen the window, or let the idle timeout expire between scenarios",
+					h.ResumptionSummary()), note)
+			case h.ServerHello == nil:
+				return annotate(found(certify.Fail, h.ClientHelloFrames,
+					"this window's capture holds no ServerHello for the scenario's session, so there is "+
+						"no handshake to export as this scenario's Chapter 5 trace"), note)
+			default:
+				return annotate(found(certify.Fail, h.ServerCertFrames,
+					"this window's handshake carries no server Certificate message and is not a detected "+
+						"resumption — the capture most likely began mid-session. A trace cut from it would "+
+						"not show this scenario's certificate exchange"), note)
+			}
+		},
+	}
+}
+
 // commAdvancedSecurity implements COMM-004 — the parent Advanced Security row.
 //
 // It asserts the part of the row the bench can reach today (the chain the
@@ -306,13 +381,13 @@ func commAdvancedSecurity(ctx context.Context, rc *certify.RunCtx) (certify.Resu
 				"rows — see COMM-004D..G"
 		},
 		Criteria: func(o *Observation) []criterion {
-			return []criterion{
+			return evidenceCriteria(rc,
 				critServerChainObserved(),
 				critCipherNegotiated(),
 				critHandshakeComplete(),
 				critDUTChainProfile(),
 				critRejectionUnexercised(),
-			}
+			)
 		},
 	})
 }
@@ -471,11 +546,11 @@ func commChainDepth(depth int, shape string) certify.Check {
 				return fmt.Sprintf("certificate chain length %d (%s)", depth, shape)
 			},
 			Criteria: func(o *Observation) []criterion {
-				return []criterion{
+				return evidenceCriteria(rc,
 					chainDepthCriterion(depth, shape)(o),
 					critCipherNegotiated(),
 					critDiscoveryRoot(),
-				}
+				)
 			},
 		})
 	}
@@ -581,8 +656,8 @@ func commChainRejection(what string, defect suitepki.MICADefect) certify.Check {
 					cs.installed.ChainLen, o.Waited.Round(rounding))
 			},
 			Criteria: func(o *Observation) []criterion {
-				return []criterion{
-					{
+				return evidenceCriteria(rc,
+					criterion{
 						Claim: "the DUT rejects a peer presenting " + what + " and establishes no 2030.5 session",
 						How: "a fatal TLS alert from the DUT, or a TCP disconnect, or an HTTP 403 SENT BY THE " +
 							"DUT — the three signals the procedure's published erratum (Annex A, seq 7) admits, " +
@@ -603,7 +678,7 @@ func commChainRejection(what string, defect suitepki.MICADefect) certify.Check {
 						Skip: cs.skipReason(),
 					},
 					cs.restoreCriterion(),
-				}
+				)
 			},
 		})
 	}

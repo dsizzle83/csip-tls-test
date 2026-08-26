@@ -65,6 +65,10 @@ func (r *Reporter) Header(run *Runner, rep *RunReport) {
 	if run != nil && run.campaign.Name != "" {
 		r.printf("Campaign:     %s — %s\n", run.campaign.Name, run.campaign.Summary)
 		r.printf("              suites %s · %s\n", strings.Join(run.campaign.Suites, " + "), gatingWord(rep))
+		if run.opts.Evidence {
+			r.printf("              EVIDENCE POSTURE (-evidence): the bench preconditions this bundle's\n")
+			r.printf("              submission artefacts depend on are proven before case 1\n")
+		}
 		// A closed selection says what it closed out. See Runner.OutOfClaim:
 		// these rows are not SKIPs and not N/A — they were never selected —
 		// and their reasons ride along in the catalog the bundle archives.

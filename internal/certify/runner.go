@@ -321,6 +321,11 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 		o.Campaign = Campaign(strings.TrimSpace(v))
 		return nil
 	})
+	fs.BoolVar(&o.Evidence, "evidence", o.Evidence,
+		"EVIDENCE POSTURE: this campaign must produce a submission-grade artefact, so every bench "+
+			"precondition that artefact depends on is proven before case 1. Requires -campaign, a capture "+
+			"and a -keylog; -campaign csip additionally requires -param report.comm004 and a 2030.5 "+
+			"server posed so each COMM-004 scenario begins with a new ClientHello (see docs/CAMPAIGNS.md)")
 	fs.StringVar(&o.ManifestPath, "manifest", o.ManifestPath,
 		"the candidate manifest (the DUT's own declaration of what it is; it installs one at "+
 			manifest.DefaultDUTPath+"). Scope decisions are made against it and it is copied into the "+
@@ -1004,6 +1009,16 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 	// After the authority preflight because it uses the same channel, and
 	// before the capture for the same reason everything else here is.
 	if err := r.preflightManifest(ctx, reporter); err != nil {
+		rep.Finished = time.Now().UTC()
+		return rep, err
+	}
+
+	// And, for an EVIDENCE run, the preconditions the submission ARTEFACTS
+	// depend on: a bench posed so the frames those artefacts are cut from can
+	// exist at all. See preflight_evidence.go — this is the check that would
+	// have caught the whole campaign whose COMM-004 windows held resumed
+	// sessions, on its first second instead of on its last row.
+	if err := r.preflightEvidence(ctx, reporter, rep.Plan); err != nil {
 		rep.Finished = time.Now().UTC()
 		return rep, err
 	}

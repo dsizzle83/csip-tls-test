@@ -475,6 +475,109 @@ the DUT-as-client legs are Layer-3 (board) evidence.
 
 ---
 
+## 7a. `-evidence` — the campaign that must produce a submission artefact
+
+    certify -campaign csip -evidence -manifest configs/candidate.json \
+            -param report.comm004=csip-conf-v1.3::COMM-004,…COMM-004A,…COMM-004B,…COMM-004C \
+            -gateway-ssh cc93 -iface wlp2s0 -keylog /tmp/bench-shared.keylog \
+            -out runs/csip-evidence-$(date -u +%Y%m%dT%H%M%SZ)/
+
+`-evidence` is a **modifier on a campaign**, never a selection of its own — an
+exploratory run is marked NOT GATING whatever its bench looked like, so there
+would be nothing for the claim to attach to, and `-evidence` without
+`-campaign` is refused (exit **2**).
+
+It says: *this bundle will carry a submission-grade artefact.* Every bench
+precondition that artefact depends on is therefore **proven before case 1**, and
+the run ends there if any of them cannot be established — the same fail-closed
+discipline as the `-gridsim`/`-gridsim-admin` pairing preflight and the
+control-authority preflight it sits beside. A precondition that could not be met
+exits **1**.
+
+### Why it exists (LAB29-011)
+
+SS-CSIP-RESULTS v1.1 Chapter 5 requires a raw TLS packet trace per COMM-004
+certificate scenario, containing that scenario's whole handshake. `RPT-060`
+exports them from the run's own capture — and it **failed**, because not one
+COMM-004 scenario had an attributable fresh handshake: every session had been
+resumed from a ticket.
+
+Everything about that failure was late and indirect. The COMM-004 rows
+themselves passed. Their certificate criteria correctly report *"this window's
+session is a RESUMED TLS 1.2 session, so the chain cannot be read from it"* as
+UNAVAILABLE rather than as a device fault — which is the right answer for a row
+measuring a **device**. So the run looked clean until the last row of the last
+document tried to assemble a submission out of eight windows with no certificate
+exchange in them, and reported the aggregate as its own failure. By then the
+bench was hours gone.
+
+The cause was a **launch flag**. gridsim issues session tickets unless started
+with `-no-tickets`, and holds a connection open forever unless started with
+`-idle-timeout-s`. Neither is observable from the traffic — the absence of a
+handshake in a window looks identical whether tickets were on or the DUT simply
+had nothing to say.
+
+### What it proves, before case 1
+
+| Requirement | Refusal if unmet |
+|---|---|
+| a capture (`-no-capture` is refused) | the artefacts ARE the capture |
+| a `-keylog` | without the secrets, every transcript-borne citation is lost |
+| `-param report.comm004=<uid>[,<uid>…]` | RPT-060 traces the scenarios named here; unnamed, none is written |
+| each named uid will actually RUN in this plan | a scenario that does not run produces no frames, so no trace can be cut for it |
+| each named uid is a COMM-004 row | another row's conversation under a Chapter 5 filename misdescribes the artefact |
+| gridsim publishes a TLS posture at all | **absent ≠ false**: an old simulator, or another server entirely — either way UNPROVEN |
+| `tls.no_tickets == true` | a resumed session carries no Certificate message (RFC 5077 §3.1; RFC 8446 §2.2 for 1.3) |
+| `0 < tls.idle_timeout_s` | otherwise one connection spans every poll cycle and only the first scenario's window holds a ClientHello |
+| `tls.idle_timeout_s < poll_rate_s` | the timeout must fire INSIDE the poll cadence, which is the boundary between one scenario's session and the next |
+| `poll_rate_s != 0` | with the built-ins (300 `/dcap`, 900 `/tm`, 60 control lists) there is no single boundary to hold the timeout against — and a `poll_rate_mode=honor` DUT paces its whole walk at 900 s |
+
+The posture comes from gridsim's own `GET /admin/status`, which now carries:
+
+```json
+"tls": {"no_tickets": true, "idle_timeout_s": 30}
+```
+
+The key is **omitted** when the embedding binary never declared one
+(`gridsim.Server.SetTLSPosture`), because "unreported" and "reported false" are
+different facts and a fail-closed caller has to tell them apart. Reading it from
+`/admin/status` is deliberate: the pairing preflight has already proven that
+response belongs to the process serving the data plane, so the posture is *that
+process's* posture and not some other gridsim's.
+
+The preflight is **read-only**. It does not start, restart or reconfigure the
+simulator: this harness must not mutate the bench it is measuring, and a
+simulator restarted mid-campaign invalidates the evidence of every case before
+it. An operator who sees it fail relaunches gridsim with the flags the message
+names and re-runs.
+
+### The second line: per-scenario grading
+
+A correctly posed bench can still produce a resumption — the DUT reconnecting
+inside a window, an idle timeout that did not fire in time. So under `-evidence`
+each COMM-004 row (the parent and A–G) gains one criterion, **first** in its
+list:
+
+> *this COMM-004 scenario ran on a FULL TLS handshake, so the raw packet trace
+> SS-CSIP-RESULTS v1.1 Chapter 5 requires for it can be cut from this window*
+
+It **FAILS the scenario, on the scenario's own row, with the reason** — instead
+of going unavailable and leaving RPT-060 to report the aggregate later. A
+**rejected** handshake satisfies it: COMM-004 D/E/F/G exist to make the DUT
+refuse a chain, so the handshake does not complete, and the server's Certificate
+message — which is exactly what the trace must contain — is on the wire all the
+same.
+
+Outside an evidence run the criterion is not added at all. An ordinary run
+measures a **device**, and "this window's session was resumed" is a fact about
+the bench that must not be charged to the DUT.
+
+The `-evidence` flag itself is recorded in the bundle: `run.command` carries the
+invocation, redacted (`bundle.RedactCommand`), so a reader can see the claim was
+made rather than infer it.
+
+---
+
 ## 8. What the bundle records
 
 `bundle.json` → `run.campaign`:

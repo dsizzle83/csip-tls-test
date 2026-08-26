@@ -386,6 +386,66 @@ so leave the selection rather than earning an N/A), `modbus-client` 15.
 Full reference — the fail-closed rules, N/A semantics, the local-exec runner and
 `-preset local` — is **`docs/CAMPAIGNS.md`**.
 
+### b3. The EVIDENCE campaign — COMM-004 traces (LAB29-011)
+
+`RPT-060` exports SS-CSIP-RESULTS v1.1 Chapter 5's raw TLS packet trace per
+COMM-004 certificate scenario, and it **failed** once because not one scenario
+had an attributable fresh handshake: gridsim had been started without
+`GRIDSIM_NO_TICKETS=1`, so every session was resumed from a ticket and carried
+no Certificate message. Nothing in the run said so until the last row of the
+last document tried to assemble the submission, hours after the bench had gone
+home.
+
+`-evidence` moves that whole class of failure to **before case 1**. Exact
+invocation, split bench:
+
+```bash
+# 1. Sims, evidence posture (§b above). The three knobs -evidence PROVES:
+GRIDSIM_BIN=./bin/server-keylog MBAPS_BIN=./bin/mbapsdev-keylog SIMS_KEYLOG=/tmp/bench-shared.keylog \
+GRIDSIM_NO_TICKETS=1 GRIDSIM_IDLE_S=30 GRIDSIM_POLL_S=60 MBAPS_NO_TICKETS=1 \
+GW_HOST=192.168.0.69 GRIDSIM_BIND=192.168.0.188 MBAPS_BIND=69.0.0.20 \
+scripts/bench-sims-up.sh
+
+# 2. Confirm the simulator PUBLISHES that posture (a gridsim built before
+#    Server.SetTLSPosture answers no `tls` key at all, and -evidence refuses it):
+curl -s http://192.168.0.188:11114/admin/status | jq '{tls, poll_rate_s, pid, data_plane}'
+#   {"tls": {"no_tickets": true, "idle_timeout_s": 30}, "poll_rate_s": 60, …}
+
+# 3. Park the DUT in the csip authority posture, then run the campaign.
+bin/certify-keylog -campaign csip -evidence \
+  -manifest ../lexa-gw/configs/candidate.json \
+  -param report.comm004=csip-conf-v1.3::COMM-004,csip-conf-v1.3::COMM-004A,csip-conf-v1.3::COMM-004B,csip-conf-v1.3::COMM-004C,csip-conf-v1.3::COMM-004D,csip-conf-v1.3::COMM-004E,csip-conf-v1.3::COMM-004F,csip-conf-v1.3::COMM-004G \
+  -gateway-ssh cc93 \
+  -target 192.168.0.69:802 \
+  -gridsim 192.168.0.188:11113 -gridsim-admin http://192.168.0.188:11114 \
+  -iface wlp2s0 -keylog /tmp/bench-shared.keylog \
+  -out runs/csip-evidence-$(date -u +%Y%m%dT%H%M%SZ)/
+```
+
+Note `bin/certify-keylog`, not `bin/certify`: a `-keylog` against a binary built
+without `-tags keylog` is a hard error, and `-evidence` requires `-keylog`.
+
+Name in `-param report.comm004` exactly the scenarios this run will execute —
+`-evidence` refuses a uid the plan will not run (mistyped, out of scope, or
+skipped for a missing capability), because a scenario that does not run produces
+no frames and its trace cannot be written.
+
+What it refuses, each with the bench command that fixes it: no capture · no
+`-keylog` · no `report.comm004` · a named scenario that will not run · a named
+row that is not COMM-004 · a gridsim publishing no `tls` posture · `no_tickets`
+false · `idle_timeout_s` 0 · `idle_timeout_s` ≥ `poll_rate_s` · `poll_rate_s` 0.
+It is **read-only** — it never restarts the simulator, because a simulator
+restarted mid-campaign invalidates the evidence of every case before it.
+
+Second line of defence, in the run itself: under `-evidence` every COMM-004 row
+gains a first criterion asserting that ITS window carried a full handshake, so a
+resumption the posture did not prevent fails **that scenario, by name**, instead
+of surfacing as an RPT-060 aggregate at the end. A rejected handshake (D/E/F/G)
+satisfies it — the Certificate message is on the wire, which is what the trace
+must contain.
+
+Full reference: `docs/CAMPAIGNS.md` §7a.
+
 ### c. Leg flag deltas (`bin/certify`)
 
 Flat-bench legs dial the ethernet addresses; split-bench legs dial the WiFi
