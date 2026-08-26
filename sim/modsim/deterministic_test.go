@@ -575,3 +575,87 @@ func TestStack_WithoutATapTheEndpointsRefuseByName(t *testing.T) {
 		t.Errorf("POST /fault next_response without a tap = %d %q, want a 400 naming the tap", code, raw)
 	}
 }
+
+// TestStack_TCPDropSeversTheClientThroughTheTap is the property every
+// discovery row rests on, and the one the tap could most plausibly have
+// broken.
+//
+// tcp_drop bounces the DEVICE's listener. With the tap interposed the client is
+// not connected to that listener — it is connected to the tap — so the
+// severance only reaches it if the tap propagates its upstream's death to the
+// downstream socket. If it did not, every row that forces a rediscovery would
+// silently observe a client that never reconnected.
+func TestStack_TCPDropSeversTheClientThroughTheTap(t *testing.T) {
+	s := newStack(t)
+	c := s.dial()
+	c.mustRead(40070, 4)
+
+	s.ack(http.MethodPost, "/fault", `{"kind":"tcp_drop"}`)
+
+	// The client's next read on the OLD socket must fail: the connection it
+	// held is gone.
+	deadline := time.Now().Add(5 * time.Second)
+	severed := false
+	for time.Now().Before(deadline) {
+		if _, err := c.read(40070, 4, 500*time.Millisecond); err != nil {
+			severed = true
+			break
+		}
+	}
+	if !severed {
+		t.Fatal("the client's connection survived a tcp_drop; with the tap interposed the severance " +
+			"must be propagated downstream, or every forced-rediscovery row observes a client that " +
+			"never reconnected")
+	}
+
+	// And a fresh dial works: the device rebound its listener and the tap
+	// forwards to it again.
+	c2 := s.dial()
+	c2.mustRead(40070, 4)
+
+	// The reconnect is visible in the ledger without a capture, which is what
+	// the discovery rows grade.
+	page := s.ledgerSince(0)
+	conns := map[uint64]bool{}
+	for _, e := range page.Entries {
+		conns[e.Conn] = true
+	}
+	if len(conns) < 2 {
+		t.Fatalf("the ledger reports %d connection(s) across a reconnect, want at least 2", len(conns))
+	}
+	if st := s.tap.Polls().Snapshot(); st.Sessions < 2 {
+		t.Errorf("the poll tracker counted %d session(s), want at least 2", st.Sessions)
+	}
+}
+
+// TestStack_LedgerBarrierAnswersThroughSimapi covers the endpoint the
+// exception and truncation rows wait on — the one the poll barrier cannot
+// answer for them.
+func TestStack_LedgerBarrierAnswersThroughSimapi(t *testing.T) {
+	s := newStack(t)
+	c := s.dial()
+	fence := s.ack(http.MethodPost, "/reset", `{}`).Epoch
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.mustRead(40070, 4)
+		c.mustRead(40074, 4)
+	}()
+
+	var body ledgerEnvelope
+	code, raw := s.do(http.MethodGet,
+		fmt.Sprintf("/ledger?since_epoch=%d&min_entries=2&timeout=10s", fence), "", &body)
+	if code != http.StatusOK {
+		t.Fatalf("GET /ledger?min_entries= = %d: %s", code, raw)
+	}
+	<-done
+	if body.Total < 2 {
+		t.Fatalf("the barrier returned %d transaction(s), want the 2 it waited for", body.Total)
+	}
+	for _, e := range body.Entries {
+		if e.Outcome == "" {
+			t.Fatalf("transaction seq %d has no outcome; the barrier returned with one in flight", e.Seq)
+		}
+	}
+}

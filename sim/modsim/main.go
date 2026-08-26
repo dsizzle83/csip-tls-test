@@ -5,6 +5,7 @@
 //
 //	modsim [-port 5020] [-bind ""] [-wmax 5000] [-api-port 6020] [-cloud-pct 0] [-serial SN-...]
 //	       [-advanced | -der-models legacy|advanced|full] [-base 40000] [-mangle] [-protofault]
+//	       [-tap=false] [-ledger-capacity 20000]
 //
 // Models exposed by the default (legacy) image: 1 (Common), 120 (Nameplate),
 // 121 (Basic Settings), 122 (Extended Status), 103 (Three-Phase Inverter),
@@ -45,10 +46,33 @@
 //	                   (sim/southbound/relocate.go, always available); {"kind":"exception_code",
 //	                   "code":1,"on_fc":3,"on_addr":[a,b]} (targeted scoping of the existing
 //	                   exception_code fault, sim/southbound/exception_target.go, always available);
+//	                   {"kind":"next_response","action":"drop|short|delay","on_fc":3,"on_addr":[a,b]}
+//	                   and {"kind":"unit_id","unit_id":N} (sim/southbound/tap.go, needs the tap);
 //	                   {"kind":"segment_response","split_after":N} / {"kind":"short_response",
 //	                   "truncate_bytes":N} (sim/southbound/protorelay.go, needs -protofault)
+//	POST /reset      — restore a named baseline register image: {"baseline":"as-built"}
 //	GET  /registers  — raw Modbus register dump
+//	GET  /ledger     — the sim's own append-only Modbus transaction record
+//	                   (?since_epoch=N fences it; ?min_entries=M&timeout=D blocks until M match)
+//	GET  /poll       — the client's poll-cycle accounting, as the sim counts it
+//	GET  /poll/wait  — block until a given poll cycle has completed
 //	GET  /ws         — WebSocket; pushes /state every 2 s
+//
+// # The deterministic control plane
+//
+// -tap (ON by default) interposes an MBAP-aware pass-through relay in front of
+// the Modbus server. It is what serves /ledger, /poll, /poll/wait and the two
+// one-shot fault kinds, and it is what makes every accepted mutation
+// acknowledge with the CONTROL-PLANE EPOCH it is in force from — the fence a
+// conformance row uses instead of sleeping through the client's poll interval.
+//
+// It is on by default, unlike -mangle and -protofault, because it is a WITNESS
+// rather than an adversary: with nothing armed it forwards every byte of every
+// frame verbatim in both directions, which sim/southbound/tap_test.go pins
+// byte-for-byte against the device's own copy of what it received and sent.
+// -tap=false restores the pre-LAB29-010 byte path exactly, at the cost of
+// /ledger and /poll[/wait] answering 501 and the tap's fault kinds being
+// refused by name. See sim/simapi/API.md for the whole contract.
 package main
 
 import (
