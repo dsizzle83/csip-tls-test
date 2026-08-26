@@ -23,23 +23,36 @@ import (
 
 // ── ERR-2 — Exception Tests ───────────────────────────────────────────────────
 
-// exceptionPhase records one armed fault and what it was expected to produce.
+// err2Codes is the full exception set §2.9.2 is about: the four the procedure
+// names in step 2 (decimal 1,2,3,4) plus 0x0B, which its own §2.9.2 step 1
+// examples reach through a Modbus gateway that cannot deliver to a unit.
+//
+// Every one of them is provoked SERVER-SIDE, on the client's own legitimate
+// FC 0x03 reads, and the row says so. §2.9.2 step 1's examples ("requesting
+// illegal function code 0x88", "writing a read-only register") describe an
+// operator console making a bad request; the DUT is an autonomous gateway that
+// never makes one, and a bench that made it would be testing a client it had
+// modified. The criterion is "the CUT appropriately interprets, logs, manages,
+// and recovers from Modbus Exceptions" — a fact about how the client HANDLES a
+// code, not about how the code was elicited — and the catalog's own note on
+// this row records that the doc never maps its examples to codes anyway.
+var err2Codes = []struct {
+	Code uint8
+	Why  string
+}{
+	{0x01, "ILLEGAL FUNCTION — the server declines the function code entirely"},
+	{0x02, "ILLEGAL DATA ADDRESS — the register range is not one the server serves"},
+	{0x03, "ILLEGAL DATA VALUE — the request's own parameters are refused"},
+	{0x04, "SERVER DEVICE FAILURE — the right device, internally broken"},
+	{0x0B, "GATEWAY TARGET DEVICE FAILED TO RESPOND — the addressing failure, which " +
+		"is what a Modbus gateway answers for a unit it cannot reach"},
+}
+
+// exceptionPhase records one armed class and what the DUT met.
 type exceptionPhase struct {
-	Kind string
-	// WantCode is the exception code the sim's documentation says this fault
-	// produces. It is recorded so the assertion can report a MISMATCH between
-	// the fault's contract and the wire, which would be a bench defect worth
-	// knowing about — not silently accept whatever arrived.
-	WantCode uint8
-	Why      string
-	Armed    bool
-	Err      error
-	// Confirmed records whether awaitJournalEvidence saw the DUT react
-	// while this phase was held — a live-phase diagnostic quoted into the
-	// SKIP text when the wire nonetheless shows nothing, distinguishing
-	// "confirmed on the DUT's own journal but missed by the capture" from
-	// "never reached the DUT at all".
-	Confirmed bool
+	Code uint8
+	Why  string
+	M    meeting
 }
 
 func checkERR2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
@@ -53,288 +66,277 @@ func checkERR2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	if r := o.injectionReason(); r != "" {
 		return certify.Skipped("this procedure requires the server to return Modbus exceptions, and %s", r), nil
 	}
-	device := defaultDeviceName
-	if v, ok := rc.Param(paramDevice); ok && v != "" {
-		device = v
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
 	}
+	device := deviceName(rc)
 
 	journalBefore, _ := o.journal(ctx, 200)
-
-	// Baseline: one clean poll cycle, so the capture contains a normal
-	// transaction before the provocation as well as after it.
-	if err := o.watch(ctx, 1); err != nil {
+	if err := d.begin(ctx, nil); err != nil {
 		return certify.Result{}, err
 	}
+	defer d.restore(ctx)
 
-	// live-run finding (runs/warnmeas-mc-ssm-20260802T134537): the DUT is an
-	// autonomous gateway polling modsim on its OWN ~10s cadence (measured:
-	// two consecutive reads exactly one interval apart). Arming a class,
-	// waiting a FIXED couple of cycles, then immediately clearing and
-	// moving to the next class routinely finished before the DUT's next
-	// poll even started — every class but whichever one happened to still
-	// be armed when the DUT finally did poll came back "observed: none",
-	// and the recovery window closed before the DUT's reconnect-with-
-	// backoff (it drops the session on a Modbus exception and reconnects
-	// "on next poll") could complete, which is what turned this row's
-	// FAIL. Two fixes below: (1) hold each phase until the DUT's OWN
-	// journal confirms it reacted (awaitJournalEvidence), not a fixed
-	// guess, and (2) hold the recovery wait the same way afterward.
+	// Every class in turn. Each is armed with an epoch, held until the sim's
+	// OWN ledger shows the DUT met it, then cleared — no cycle count, no sleep,
+	// and no dependence on the DUT's journal to decide when to stop looking.
 	//
-	// §2.9.2 step 1 itself names exactly two classes — 0x04 SERVER DEVICE
-	// FAILURE ("right device, internally broken") and 0x0B GATEWAY TARGET
-	// DEVICE FAILED TO RESPOND ("the addressing failure") — and reliably
-	// confirming even those two, PLUS a properly held recovery, already
-	// spends a generous share of a per-check budget. The three additional
-	// FC-targeted classes this suite can ALSO provoke now (modsim's
-	// exception_target scoping, sim/southbound/exception_target.go) are
-	// reported as an honest time-budget SKIP (err2TargetedCodesSkip)
-	// instead of squeezed in here at the cost of the two classes and the
-	// recovery observation this row's PASS actually turns on.
-	phases := []*exceptionPhase{
-		{Kind: "exception_code", WantCode: 0x04,
-			Why: "make every register read return exception code 0x04 SERVER DEVICE FAILURE, the " +
-				"'right device, internally broken' class of §2.9.2 step 1"},
-		{Kind: "unit_id_confusion", WantCode: 0x0B,
-			Why: "make every register read return exception code 0x0B GATEWAY TARGET DEVICE FAILED TO " +
-				"RESPOND, a second and distinct exception class — the addressing failure"},
-	}
-	for _, p := range phases {
-		journalBeforePhase, _ := o.journal(ctx, 200)
-		if err := o.fault(ctx, map[string]any{"kind": p.Kind}, p.Why); err != nil {
-			p.Err = err
-			rc.Logf("could not arm %s: %v", p.Kind, err)
-			continue
+	// The LEDGER barrier rather than the poll barrier, deliberately: lexa-gw
+	// drops its southbound session on a Modbus exception and reconnects on the
+	// next poll (cmd/modbus/main.go:1303-1307), so under a persistent
+	// exception it is met once per session and completes no poll cycle at all.
+	// Waiting for a cycle here is waiting for something the provocation itself
+	// prevents — which is exactly how the previous version of this row spent
+	// its budget and then reported "observed: none".
+	phases := make([]*exceptionPhase, 0, len(err2Codes))
+	for _, c := range err2Codes {
+		p := &exceptionPhase{Code: c.Code, Why: c.Why}
+		m, err := d.meet(ctx,
+			map[string]any{"kind": "exception_code", "code": int(c.Code), "on_fc": 3},
+			fmt.Sprintf("answer every FC 0x03 read with exception 0x%02x %s (%s)",
+				c.Code, ExceptionName(c.Code), c.Why),
+			"exception_code", 1)
+		if err != nil {
+			return certify.Result{}, err
 		}
-		p.Armed = true
-		// Hold at least 2 full poll cycles (margin over the measured ~10s
-		// cadence), up to 4, returning early as soon as the DUT's journal
-		// shows it hit an error while this class was armed.
-		p.Confirmed, _ = o.awaitJournalEvidence(ctx, journalBeforePhase, 2, 4,
-			func(delta []string) bool { return deviceErrorish(delta, device) })
-		o.clearFault(p.Kind)
+		p.M = m
+		phases = append(phases, p)
 	}
 
 	// Recovery: "the CUT continues to operate normally after each Modbus
-	// Exception" needs the DUT's OWN reconnect-with-backoff to complete.
-	// settle()'s bare extra cycle was the FAIL in the live run: hold up to
-	// 4 more cycles for the DUT's journal to show it recognises the
-	// failure and is retrying (lexa-modbus's documented "will reconnect on
-	// next poll" pattern) before closing the window, giving the wire
-	// recovery evalERR2 prefers a real chance to land, and giving the
-	// journal-narrative fallback real evidence when it does not.
-	if err := o.settle(ctx); err != nil {
-		return certify.Result{}, err
+	// Exception". With every class cleared, the DUT must transact again — and
+	// its reconnect-with-backoff is allowed to take its own time, because the
+	// barrier waits for the transaction rather than for a clock.
+	recoveryFence, ferr := d.arm(ctx, map[string]any{"kind": "exception_code", "clear": true},
+		"clear every exception class so the DUT's recovery can be observed")
+	if ferr != nil {
+		recoveryFence = 0
 	}
-	journalMid, _ := o.journal(ctx, 400)
-	_, _ = o.awaitJournalEvidence(ctx, journalMid, 1, 4,
-		func(delta []string) bool { return journalShowsRecoveryIntent(delta, device) })
-	journalAfter, _ := o.journal(ctx, 400)
+	var recovery LedgerPage
+	var recovered bool
+	if recoveryFence > 0 {
+		var err error
+		recovery, recovered, err = d.awaitLedger(ctx, recoveryFence, 1)
+		if err != nil {
+			return certify.Result{}, err
+		}
+	}
+	journalAfter, _ := o.journal(ctx, 600)
 	newLines := journalSince(journalBefore, journalAfter)
 
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("the two exception classes §2.9.2 step 1 names were provoked for real, each "+
-			"held until the DUT's own journal confirmed it reacted (not a fixed guess), and observed on "+
-			"the wire; recovery was held the same way, through the DUT's reconnect-with-backoff. Three "+
-			"more FC-targeted classes this suite can ALSO provoke (modsim's exception_target scoping) are "+
-			"reported as an honest time-budget SKIP rather than risking the reliability of these two plus "+
-			"recovery. %s", o.injectionNote()),
+		Notes: fmt.Sprintf("all five exception classes §2.9.2 is about — 0x01, 0x02, 0x03, 0x04 and "+
+			"0x0B — were provoked on the server in turn, each armed at a named epoch and held until the "+
+			"SIMULATOR'S OWN transaction ledger showed the DUT had met it, then cleared. Recovery was "+
+			"held the same way. No step of this row waits on a clock. %s", o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT received Modbus exception responses and continued to operate normally"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre, err2TargetedCodesSkip()...)), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalERR2(c, phases, newLines, device, o.injectionNote())...)
-			fs = append(fs, err2Journal(newLines))
-			fs = append(fs, err2TargetedCodesSkip()...)
+			fs = append(fs, evalERR2(c, phases, d)...)
+			fs = append(fs, evalERR2Recovery(c, recovery, recovered, recoveryFence, d))
+			fs = append(fs, err2Journal(newLines, device))
 			return emit(ev, c, fs), nil
 		},
 	}, nil
 }
 
-// evalERR2 is ERR-2's decision logic over the observed conversation.
-// recoveryLines is the DUT's own journal excerpt spanning the extended
-// recovery wait (see checkERR2): when the wire itself does not show a clean
-// post-fault exchange within the window, a recovery-intent line there
-// downgrades the "continued normally" claim to WARN instead of the FAIL an
-// absence of ANY recovery signal still rightly is — a truthful floor for a
-// DUT whose own reconnect backoff can outrun even an extended window (the
-// live-run regression this rework fixes,
-// runs/warnmeas-mc-ssm-20260802T134537).
-func evalERR2(c *Conversation, phases []*exceptionPhase, recoveryLines []string, device, injected string) []finding {
+// evalERR2 grades each class from the sim's own ledger, and cites the matching
+// exception response in the capture when this test case owns it.
+//
+// The two sources are deliberately not interchangeable. The LEDGER decides
+// whether the class was delivered — it is the server's own record and cannot
+// miss a transaction that happened. The CAPTURE is what a third party
+// re-derives the claim from, so where a frame is available the assertion is
+// byte-cited; where the DUT met the fault outside this test case's frames the
+// assertion is a Narrative naming the ledger, at WARN, rather than a SKIP
+// pretending nothing happened.
+func evalERR2(c *Conversation, phases []*exceptionPhase, d *determinism) []finding {
 	var out []finding
-	exceptions := c.Exceptions()
-
-	byCode := map[uint8][]Exchange{}
-	for _, ex := range exceptions {
-		if code, ok := ex.Response.ExceptionCode(); ok {
-			byCode[code] = append(byCode[code], ex)
+	var wireByCode map[uint8][]Exchange
+	if c != nil {
+		wireByCode = map[uint8][]Exchange{}
+		for _, ex := range c.Exceptions() {
+			if code, ok := ex.Response.ExceptionCode(); ok {
+				wireByCode[code] = append(wireByCode[code], ex)
+			}
 		}
 	}
 
 	for _, p := range phases {
 		claim := fmt.Sprintf("the DUT received exception code 0x%02x %s from the server",
-			p.WantCode, ExceptionName(p.WantCode))
-		method := "exception-bit function code and exception code of a response in the reassembled " +
-			"server→DUT direction, after the fault named in Observed was armed on the server and held " +
-			"until the DUT's own journal confirmed it reacted"
-		if !p.Armed {
-			out = append(out, skipf(claim, method,
-				"the %q fault could not be armed on the server: %v", p.Kind, p.Err))
-			continue
-		}
-		hits := byCode[p.WantCode]
-		if len(hits) == 0 {
-			confirmedNote := "the DUT's own journal never confirmed it reacted while this class was held, " +
-				"either — it may simply not have polled inside this test case's window at all"
-			if p.Confirmed {
-				confirmedNote = "the DUT's own journal DID confirm it reacted while this class was held, " +
-					"but the corresponding wire exchange fell outside the frames attributed to this test case"
-			}
-			out = append(out, skipf(claim, method,
-				"the %q fault was armed on the server (%s) but no response carrying exception code "+
-					"0x%02x was attributed to this test case. Observed exception codes: %s. %s. %s",
-				p.Kind, p.Why, p.WantCode, describeCodes(byCode), confirmedNote, injected))
-			continue
-		}
-		r := hits[0].Response
-		out = append(out, bytesf(claim, method, certify.Pass, fromServer, r.Start, r.End,
-			"%d response(s) carried function code 0x%02x (request FC 0x%02x with the exception bit set) "+
-				"and exception code 0x%02x %s, after the server was made to produce them by %s. "+
-				"First exception response cited in full: [%s]",
-			len(hits), r.FC, hits[0].Request.FC, p.WantCode, ExceptionName(p.WantCode),
-			injected, r.Hex()))
-	}
+			p.Code, ExceptionName(p.Code))
+		method := "the exception code of the response the server returned to the DUT's own FC 0x03 read, " +
+			"after that class was armed at a named control-plane epoch and held until the simulator's " +
+			"transaction ledger recorded the DUT meeting it"
 
-	// The DUT's side of the criterion: it kept transacting.
-	claim := "the DUT continued to operate normally after each Modbus exception"
-	method := "a complete, non-exception FC 0x03 exchange occurring after the last exception response in " +
-		"this test case's frames, or (when the wire does not show one within the window) the DUT's own " +
-		"journal confirming it recognised the failure and is retrying"
-	source := "journalctl -u lexa-modbus on the device under test"
-	switch {
-	case len(exceptions) == 0:
-		out = append(out, skipf(claim, method,
-			"no exception response was observed, so there is nothing for the DUT to have recovered from"))
-	default:
-		last := exceptions[len(exceptions)-1].Response
-		ex, wireRecovered := firstSuccessfulReadAfter(c, last.End)
-		switch {
-		case wireRecovered:
-			out = append(out, bytesf(claim, method, certify.Pass, fromServer,
-				ex.Response.Start, ex.Response.End,
-				"after %d exception response(s), the DUT issued %s and the server answered it normally — "+
-					"the client neither abandoned the connection nor stopped polling. Recovery response "+
-					"cited: %s", len(exceptions), ex.Request.String(), ex.Response.String()))
-		case journalShowsRecoveryIntent(recoveryLines, device):
-			out = append(out, narrativef(claim, method, source, certify.Warn,
-				"no complete post-fault exchange was attributed to this test case's frames within the "+
-					"(extended) window, but the DUT's own journal shows it recognised the failure and is "+
-					"retrying: lexa-modbus drops the southbound session on a Modbus exception and "+
-					"reconnects 'on next poll' with backoff, which can trail the fault clear by more than "+
-					"this window's margin. %d exception response(s) were observed on the wire and the "+
-					"DUT's journal confirms the retry intent — recovery is journal-confirmed, not "+
-					"wire-cited, so this is reported at WARN rather than PASS", len(exceptions)))
-		default:
-			out = append(out, framesf(claim, method, certify.Fail, aduFrames(*last),
-				"the last %d Modbus message(s) this test case observed were exception responses, no "+
-					"successful read followed within the window, and the DUT's own journal shows no "+
-					"recovery intent either — the client was not seen to resume normal operation after "+
-					"the fault was cleared", len(exceptions)))
+		if !p.M.ok() {
+			out = append(out, skipf(claim, method, "%s", p.M.reason()))
+			continue
 		}
+		hits := p.M.Page.Exceptions()[p.Code]
+		if len(hits) == 0 {
+			// The DUT transacted under the fence and got something other than
+			// the armed class. That is a BENCH defect — the fault's contract
+			// and the wire disagree — and it is reported as one rather than as
+			// a DUT finding.
+			out = append(out, narrativef(claim, method, d.ledgerSource(), certify.Warn,
+				"the class was armed at epoch %d and the DUT issued %d transaction(s) under it, but none "+
+					"was answered with 0x%02x. What the server actually returned: %s. That is a "+
+					"disagreement between the sim's fault contract and its wire behaviour — a bench "+
+					"defect, not a DUT finding",
+				p.M.Epoch, p.M.Page.Total, p.Code, p.M.Page.Summary()))
+			continue
+		}
+		if ex := wireByCode[p.Code]; len(ex) > 0 {
+			r := ex[0].Response
+			out = append(out, bytesf(claim, method, certify.Pass, fromServer, r.Start, r.End,
+				"%d response(s) in this test case's frames carried function code 0x%02x (the request's "+
+					"FC with the exception bit set) and exception code 0x%02x %s. The server was made to "+
+					"produce them by %s, armed at epoch %d; the simulator's own ledger independently "+
+					"records %d such transaction(s) — first: %s. Response cited in full: [%s]",
+				len(ex), r.FC, p.Code, ExceptionName(p.Code), p.M.Spec, p.M.Epoch,
+				len(hits), hits[0], r.Hex()))
+			continue
+		}
+		// No frame for it in this test case. The claim still HOLDS — the
+		// server's own record of what it delivered establishes it completely,
+		// and the ledger is not the DUT's log — so this is a Narrative PASS
+		// naming its source, exactly as ERR-3's inventory assertion is. What
+		// it is not is third-party re-derivable from the capture, which the
+		// Observed text says and the framework's own uncited-PASS handling
+		// weighs.
+		out = append(out, narrativef(claim, method, d.ledgerSource(), certify.Pass,
+			"the server delivered %d exception 0x%02x %s to the DUT while the class was armed at epoch "+
+				"%d — first: %s. No frame carrying one was attributed to this test case, so this rests "+
+				"on the simulator's record rather than on a citation into the capture; the DUT's own "+
+				"reconnect-with-backoff can place the exchange outside this window even when the "+
+				"provocation lands perfectly",
+			len(hits), p.Code, ExceptionName(p.Code), p.M.Epoch, hits[0]))
 	}
 	return out
 }
 
-// err2TargetedCodesSkip records, per code, why the three FC-targeted
-// exception classes (0x01 ILLEGAL FUNCTION, 0x02 ILLEGAL DATA ADDRESS, 0x03
-// ILLEGAL DATA VALUE) were not provoked in THIS run. Unlike the original
-// "the DUT never emits a bad request of its own choosing" gap, the
-// CAPABILITY to provoke these now exists — modsim's exception_target
-// scoping (sim/southbound/exception_target.go, landed 9e35da6) can target
-// any of them at FC 0x03, traffic the DUT already emits — but a live bench
-// run (runs/warnmeas-mc-ssm-20260802T134537) showed that reliably
-// confirming even the TWO classes §2.9.2 step 1 itself names, plus a
-// properly held recovery, already needs the DUT's own ~10s poll cadence
-// respected at every step; serializing three more classes the same way
-// multiplies that further and risks the exact FAIL this rework exists to
-// fix, for rows the procedure's own criteria do not require.
-func err2TargetedCodesSkip() []finding {
-	codes := []uint8{0x01, 0x02, 0x03}
-	out := make([]finding, 0, len(codes))
-	for _, code := range codes {
-		out = append(out, skipf(
-			fmt.Sprintf("the DUT received and logged exception code 0x%02x %s", code, ExceptionName(code)),
-			"provocation of the named exception class on the server, per §2.9.2 step 1",
-			"modsim can now target this exact code at FC 0x03 (exception_target scoping, "+
-				"sim/southbound/exception_target.go) — the capability gap that used to block this row is "+
-				"closed. What is not exercised in THIS run is a time-budget choice: reliably confirming "+
-				"the two classes §2.9.2 step 1 itself requires (0x04, 0x0B), each held until the DUT's own "+
-				"~10s poll cadence confirms it reacted, plus a properly held recovery, already spends a "+
-				"generous share of a per-check budget; adding this class serialized the same way risks "+
-				"the timing regression a live run already exposed elsewhere in this suite. Promoting it "+
-				"needs either a materially longer per-check budget or its own dedicated test case so a "+
-				"slow DUT poll cannot cascade delay across unrelated classes"))
+// evalERR2Recovery is the row's actual SHALL: the client keeps working.
+func evalERR2Recovery(c *Conversation, page LedgerPage, recovered bool, fence uint64,
+	d *determinism) finding {
+
+	claim := "the DUT continued to operate normally after each Modbus exception"
+	method := "a complete, non-exception transaction with the server AFTER every exception class was " +
+		"cleared, held on the simulator's transaction ledger rather than on a clock so the DUT's own " +
+		"reconnect-with-backoff has as long as it needs"
+	if fence == 0 {
+		return skipf(claim, method, "the exception classes could not be cleared, so there is no recovery "+
+			"interval to observe")
 	}
-	return out
+	if !recovered {
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"with every exception class cleared at epoch %d, the DUT issued no transaction at all to "+
+				"this server within the barrier's budget. The client was not seen to resume normal "+
+				"operation after the fault was cleared", fence)
+	}
+	good := page.WithOutcome(outcomeAnswered)
+	if len(good) == 0 {
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"with every exception class cleared at epoch %d the DUT did transact again, but not one of "+
+				"its %d transaction(s) completed normally: %s", fence, page.Total, page.Summary())
+	}
+	// Prefer a byte citation into the capture; fall back to the ledger.
+	if c != nil {
+		if ex, ok := firstSuccessfulReadAfter(c, 0); ok {
+			return bytesf(claim, method, certify.Pass, fromServer, ex.Response.Start, ex.Response.End,
+				"after every exception class was cleared at epoch %d the DUT issued %s and the server "+
+					"answered it normally — the client neither abandoned the connection nor stopped "+
+					"polling. The simulator's own ledger independently records %d completed "+
+					"transaction(s) after that epoch, first: %s. Recovery response cited: %s",
+				fence, ex.Request.String(), len(good), good[0], ex.Response.String())
+		}
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"after every exception class was cleared at epoch %d the DUT issued %d transaction(s) that "+
+			"completed normally — first: %s — so the client resumed normal operation. No frame carrying "+
+			"one was attributed to this test case, so this rests on the simulator's record rather than "+
+			"on a citation into the capture", fence, len(good), good[0])
 }
 
 // err2Journal reports whether the DUT logged the exceptions. It can only ever
 // be a Narrative: a client-side log is not a wire fact.
-func err2Journal(lines []string) finding {
+func err2Journal(lines []string, device string) finding {
 	claim := "the DUT logged each Modbus exception it received"
 	method := "the DUT's own lexa-modbus journal, read over the read-only gateway client, restricted " +
-		"to lines added after the fault was armed"
+		"to lines added after the first class was armed"
 	source := "journalctl -u lexa-modbus on the device under test"
 	if len(lines) == 0 {
 		return skipf(claim, method,
 			"no journal lines could be read from the DUT (gateway introspection unavailable, or no new "+
 				"lines appeared), so the client-side logging criterion is unevidenced here")
 	}
-	hits := grepJournal(lines, "inv-plain")
 	var errs []string
-	for _, l := range hits {
+	for _, l := range grepJournal(lines, device) {
 		low := strings.ToLower(l)
 		if strings.Contains(low, "verdict=match") {
 			continue // the routine per-poll reconciler line
 		}
+		// lexa-gw's own documented pattern for a southbound session loss is
+		// "device session dropped — will reconnect on next poll", which names
+		// neither an error nor a failure; a filter that missed it would report
+		// a silent client where there is a talkative one.
 		if strings.Contains(low, "err") || strings.Contains(low, "fail") ||
 			strings.Contains(low, "exception") || strings.Contains(low, "unavailable") ||
-			strings.Contains(low, "down") || strings.Contains(low, "warn") {
+			strings.Contains(low, "down") || strings.Contains(low, "warn") ||
+			strings.Contains(low, "drop") || strings.Contains(low, "reconnect") {
 			errs = append(errs, l)
 		}
 	}
 	if len(errs) == 0 {
 		return narrativef(claim, method, source, certify.Warn,
-			"%d journal line(s) were added while the server was returning exceptions, but none of them "+
-				"names an error, an exception or an unavailable device for the affected server. The "+
-				"DUT may log exceptions at a level this journal read did not capture; as observed, the "+
-				"'accurately log all exception codes' criterion is not met", len(lines))
+			"%d journal line(s) were added while the server was returning exceptions, but none names an "+
+				"error, an exception or an unavailable device for %q. As observed, the 'accurately log "+
+				"all exception codes' criterion is not met", len(lines), device)
+	}
+	named := 0
+	for _, l := range errs {
+		low := strings.ToLower(l)
+		for _, code := range err2Codes {
+			if strings.Contains(low, strings.ToLower(ExceptionName(code.Code))) {
+				named++
+				break
+			}
+		}
 	}
 	shown := errs
 	if len(shown) > 3 {
 		shown = shown[:3]
 	}
+	if named == 0 {
+		return narrativef(claim, method, source, certify.Warn,
+			"%d journal line(s) added during the fault report the failure of %q, so the DUT does log "+
+				"that something went wrong — but none of them NAMES an exception class. §2.9.2's "+
+				"criterion is 'accurately log all exception codes', and a line that says a device is "+
+				"unavailable does not say which code it received. First: %s. THE GAP IS DUT-SIDE: the "+
+				"product maps Modbus exception codes to opaque transport errors and journals no per-code "+
+				"event (see this row's report entry)",
+			len(errs), device, strings.Join(shown, " | "))
+	}
 	return narrativef(claim, method, source, certify.Pass,
-		"%d journal line(s) added during the fault report the failure of the affected server. First: %s",
-		len(errs), strings.Join(shown, " | "))
-}
-
-func describeCodes(byCode map[uint8][]Exchange) string {
-	if len(byCode) == 0 {
-		return "none"
-	}
-	var parts []string
-	for code, ex := range byCode {
-		parts = append(parts, fmt.Sprintf("0x%02x %s ×%d", code, ExceptionName(code), len(ex)))
-	}
-	sortStrings(parts)
-	return strings.Join(parts, ", ")
+		"%d journal line(s) added during the fault report the failure of %q, %d of them naming an "+
+			"exception class by name. First: %s", len(errs), device, named, strings.Join(shown, " | "))
 }
 
 // ── ERR-1 — Noncompliant Server ───────────────────────────────────────────────
+
+// noncompliantBase is §2.9.1 step 1's deliberately noncompliant map base: one
+// register off the legal 40000. The catalog's note on this row records the
+// document's own ambiguity about whether "40001" means the data-model address
+// or the 1-based holding-register convention in which 40001 IS address 0; the
+// intent from CLI-4, which uses 0/40000/50000, is that it is off-by-one from a
+// valid base, and that is what this serves.
+const noncompliantBase = 40001
 
 func checkERR1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	o, why := newObserver(rc)
@@ -344,68 +346,240 @@ func checkERR1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
-	forced := o.forceReconnect(ctx)
-	if err := o.watch(ctx, 1); err != nil {
+	if r := o.injectionReason(); r != "" {
+		return certify.Skipped("this procedure requires the server's SunSpec map to be moved off a legal "+
+			"base, and %s", r), nil
+	}
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
+	}
+	device := deviceName(rc)
+
+	journalBefore, _ := o.journal(ctx, 200)
+	if err := d.begin(ctx, nil); err != nil {
 		return certify.Result{}, err
 	}
-	return certify.Result{
-		Verdict: certify.Skip,
-		Notes: "the server cannot be made noncompliant on this bench: its SunSpec map is fixed at base " +
-			"40000 and it has no verb for relocating it to the deliberately off-by-one 40001 the " +
-			"procedure calls for. The adjacent fact the wire CAN show — that the DUT probes only legal " +
-			"base addresses — is cited, carrying SKIP so it cannot be mistaken for the criterion.",
-		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
-			claim := "the DUT logged the server as noncompliant when its SunSpec map was at holding " +
-				"register 40001"
-			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre, err1Skips()...)), nil
+	defer d.restore(ctx)
+
+	// §2.9.1 step 1: the map starts one register off a legal base. modsim's
+	// relocate verb moves the register CONTENT, so the same listener, the same
+	// tcp_drop bounce and the same everything keep behaving as they do —
+	// only WHERE the model chain starts changes.
+	badEpoch, armErr := d.relocate(ctx, noncompliantBase,
+		fmt.Sprintf("re-home the server's SunSpec map to holding register %d — one register off the "+
+			"legal 40000, which is §2.9.1's noncompliant server", noncompliantBase))
+
+	// §2.9.1 step 2: "attempt to connect the CUT to Server 1". The DUT has
+	// been connected for hours, and a client that is already connected never
+	// repeats its base probe (lexa-proto/sunspec/reader.go caches the block
+	// layout per SESSION), so the connection is severed to make it try.
+	var reconnErr error
+	var page LedgerPage
+	var met bool
+	if armErr == nil {
+		if _, reconnErr = d.reconnect(ctx,
+			"sever the DUT's southbound connection so its reconnect performs the base probe against "+
+				"the noncompliant map, inside this test case's window"); reconnErr == nil {
+			// Three transactions: the DUT probes all three standard bases
+			// (40000, then 0, then 50000 — sunspec/scanner.go's probeBases)
+			// before concluding there is no SunSpec map here.
+			var err error
+			page, met, err = d.awaitLedger(ctx, badEpoch, 3)
+			if err != nil {
+				return certify.Result{}, err
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, err1Skips()...)
-			fs = append(fs, evalERR1Observation(c, forced))
+		}
+	}
+
+	// Recovery: put the map back and watch the DUT find it again. "The CUT
+	// recovers (does not hang or crash)" is exactly this — it kept probing and
+	// succeeded the moment the server became compliant.
+	restoreEpoch, restoreErr := d.relocate(ctx, 40000,
+		"put the server's SunSpec map back at the legal base 40000 so the DUT's recovery can be observed")
+	var recovery LedgerPage
+	var recovered bool
+	if restoreErr == nil {
+		var err error
+		recovery, recovered, err = d.awaitLedger(ctx, restoreEpoch, 1)
+		if err != nil {
+			return certify.Result{}, err
+		}
+	}
+
+	journalAfter, _ := o.journal(ctx, 600)
+	newLines := journalSince(journalBefore, journalAfter)
+
+	return certify.Result{
+		Verdict: certify.Warn,
+		Notes: fmt.Sprintf("the server's SunSpec map was moved to holding register %d — the "+
+			"deliberately noncompliant off-by-one base §2.9.1 calls for — and the DUT's reconnect was "+
+			"observed against it, then against the restored legal map. This row previously reported "+
+			"'the server cannot be made noncompliant on this bench'; modsim's relocate verb closes "+
+			"that, and no step of it waits on a clock. %s", noncompliantBase, o.injectionNote()),
+		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
+			claim := "the DUT connected to a server whose SunSpec map begins one register off a legal base"
+			c, pre, ok := citeConversation(ev, o, claim)
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
+			}
+			fs = append(fs, evalERR1Probes(c, page, met, badEpoch, armErr, reconnErr, d))
+			fs = append(fs, err1Journal(newLines, device))
+			fs = append(fs, evalERR1Recovery(recovery, recovered, restoreEpoch, restoreErr, d))
 			return emit(ev, c, fs), nil
 		},
 	}, nil
 }
 
-func err1Skips() []finding {
-	return []finding{
-		skipf("the DUT logged the server as noncompliant when its SunSpec map was at holding register 40001",
-			"connect the DUT to a server whose SunSpec map begins one register off a legal base, per §2.9.1 step 1",
-			"the bench's plain-text SunSpec server serves its map at base 40000 and exposes no verb for "+
-				"relocating it, so the deliberately noncompliant 40001 map this row is built on cannot "+
-				"be presented to the DUT at all. Promoting this row to full requires the same sim "+
-				"capability CLI-4 needs — a settable map base (`modsim -base 40001`, or POST /control "+
-				"{\"cmd\":\"relocate\",\"base\":40001}) — plus a DUT device entry pointing at that instance"),
-		skipf("the DUT recovered — did not hang or crash — after connecting to a noncompliant server",
-			"process liveness and continued polling after the noncompliant server was presented",
-			"the provocation could not be applied (see the previous assertion), so there is no recovery "+
-				"to observe. Note that ERR-2 does evidence the DUT's recovery from a server that answers "+
-				"every read with an exception, which is a different fault of the same family"),
+// evalERR1Probes is the row's first half: presented with a map at 40001, the
+// DUT probed the legal bases, found no identifier, and did NOT go looking at
+// the noncompliant offset.
+func evalERR1Probes(c *Conversation, page LedgerPage, met bool, epoch uint64,
+	armErr, reconnErr error, d *determinism) finding {
+
+	claim := "the DUT probed only legal SunSpec base addresses against a server whose map begins at " +
+		"holding register 40001, and found no identifier at any of them"
+	method := fmt.Sprintf("the start address of every read the DUT issued after the server's map was "+
+		"re-homed to %d, from the simulator's own transaction ledger, cross-checked against the "+
+		"identifier registers the responses actually carried", noncompliantBase)
+	switch {
+	case armErr != nil:
+		return skipf(claim, method, "the server's map could not be re-homed to %d: %v",
+			noncompliantBase, armErr)
+	case reconnErr != nil:
+		return skipf(claim, method, "the server's map was re-homed to %d at epoch %d, but the DUT's "+
+			"connection could not be severed (%v), and a client already connected does not repeat its "+
+			"base probe — lexa-proto/sunspec/reader.go caches the block layout for the life of the "+
+			"session", noncompliantBase, epoch, reconnErr)
+	case !met:
+		return skipf(claim, method, "the server's map was re-homed to %d at epoch %d and the DUT's "+
+			"connection was severed, but the DUT issued only %d transaction(s) to this server "+
+			"afterwards — fewer than the three base probes a rediscovery makes",
+			noncompliantBase, epoch, page.Total)
+	}
+
+	reads := page.Reads()
+	var illegal []uint16
+	probed := map[uint16]bool{}
+	foundIdentifier := false
+	for _, e := range reads {
+		if !IsStandardBase(e.Addr) {
+			// A read that is not at a standard base is only interesting if it
+			// is a PROBE — a chain walk after a successful discovery reads all
+			// sorts of addresses. Against a noncompliant map there is no
+			// successful discovery, so any read here is a probe.
+			illegal = append(illegal, e.Addr)
+			continue
+		}
+		probed[e.Addr] = true
+		if vals, ok := e.Values(); ok && len(vals) >= 2 && vals[0] == SunSHigh && vals[1] == SunSLow {
+			foundIdentifier = true
+		}
+	}
+	var bases []uint16
+	for b := range probed {
+		bases = append(bases, b)
+	}
+	sortUint16(bases)
+
+	switch {
+	case len(illegal) > 0:
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"with the map at %d, the DUT read at %v — address(es) outside the legal SunSpec base set %v. "+
+				"A client that hunts for a map at a noncompliant offset would find one there, which is "+
+				"precisely the behaviour §2.9.1 exists to rule out", noncompliantBase, illegal, StandardBases)
+	case foundIdentifier:
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"with the map at %d, one of the DUT's probes at a legal base nonetheless returned the "+
+				"SunSpec identifier — the sim did not actually serve a noncompliant map, so this row's "+
+				"provocation did not hold. That is a bench defect, not a DUT finding", noncompliantBase)
+	case len(bases) == 0:
+		return skipf(claim, method, "the DUT issued %d transaction(s) after the relocation but none at a "+
+			"standard base address, so no base probe was observed: %s", page.Total, page.Summary())
+	default:
+		v := certify.Pass
+		tail := ""
+		if len(bases) < len(StandardBases) {
+			v = certify.Warn
+			tail = fmt.Sprintf(" It probed %d of the %d standard bases within this window; a client that "+
+				"stops at the first failure is conformant, so this is reported rather than failed.",
+				len(bases), len(StandardBases))
+		}
+		return narrativef(claim, method, d.ledgerSource(), v,
+			"with the server's map at holding register %d, the DUT issued %d read(s), at standard base "+
+				"address(es) %v and nowhere else. None returned the SunSpec identifier 0x%04x 0x%04x, so "+
+				"discovery correctly failed rather than finding a map at the noncompliant offset.%s "+
+				"First transaction: %s",
+			noncompliantBase, len(reads), bases, SunSHigh, SunSLow, tail, reads[0])
 	}
 }
 
-// evalERR1Observation cites the DUT's base-probing behaviour with a SKIP
-// verdict: it is adjacent evidence, not the criterion, and the verdict says so.
-func evalERR1Observation(c *Conversation, forced error) finding {
-	claim := "the DUT probed for the SunSpec identifier only at legal base addresses"
-	method := "start addresses of the DUT's FC 0x03 requests, compared against the legal base set"
-	probes := c.BaseProbes()
-	if len(probes) == 0 {
-		return skipf(claim, method,
-			"no base-address probe was observed in this test case's frames (forced reconnect: %v)", forced)
+// err1Journal is §2.9.1's first criterion, "the Client SHALL accurately log the
+// noncompliant server". It is about the client's OWN output and can only ever
+// be a Narrative.
+func err1Journal(lines []string, device string) finding {
+	claim := "the DUT logged the noncompliant server"
+	method := "the DUT's own lexa-modbus journal, read over the read-only gateway client, restricted to " +
+		"lines added after the server's map was moved off a legal base"
+	source := "journalctl -u lexa-modbus on the device under test"
+	if len(lines) == 0 {
+		return skipf(claim, method, "no journal lines could be read from the DUT (gateway introspection "+
+			"unavailable, or no new lines appeared), so the client-side logging criterion is unevidenced "+
+			"here")
 	}
-	var addrs []uint16
-	for _, p := range probes {
-		addrs = append(addrs, p.Start)
+	var hits []string
+	for _, l := range grepJournal(lines, device) {
+		low := strings.ToLower(l)
+		if strings.Contains(low, "sunspec") || strings.Contains(low, "identif") ||
+			strings.Contains(low, "discover") || strings.Contains(low, "scan") ||
+			strings.Contains(low, "no such device") || strings.Contains(low, "err") ||
+			strings.Contains(low, "fail") {
+			hits = append(hits, l)
+		}
 	}
-	ex := c.Exchanges[probes[0].Exchange]
-	return bytesf(claim, method, certify.Skip, fromDUT, ex.Request.Start, ex.Request.End,
-		"observation only, not the criterion: the DUT probed base address(es) %v, all drawn from the "+
-			"legal set %v, and none at 40001. This shows the DUT would not accidentally find a map at "+
-			"the noncompliant offset — it does NOT show what the DUT logs when it fails to find one. "+
-			"First probe cited: [%s]", addrs, StandardBases, ex.Request.Hex())
+	if len(hits) == 0 {
+		return narrativef(claim, method, source, certify.Warn,
+			"%d journal line(s) were added for %q while the server served a map at holding register %d, "+
+				"and none of them reports a discovery or identification failure. As observed, the "+
+				"'accurately log the noncompliant server' criterion is not met",
+			len(lines), device, noncompliantBase)
+	}
+	shown := hits
+	if len(shown) > 3 {
+		shown = shown[:3]
+	}
+	return narrativef(claim, method, source, certify.Pass,
+		"%d journal line(s) added while the server's map sat at holding register %d report the failure "+
+			"to identify %q. First: %s", len(hits), noncompliantBase, device, strings.Join(shown, " | "))
+}
+
+// evalERR1Recovery is §2.9.1's second criterion: the CUT recovers.
+func evalERR1Recovery(page LedgerPage, recovered bool, epoch uint64, err error, d *determinism) finding {
+	claim := "the DUT recovered — did not hang or crash — after being connected to the noncompliant server"
+	method := "a transaction with the server AFTER its map was restored to the legal base 40000, held on " +
+		"the simulator's transaction ledger rather than on a clock"
+	if err != nil {
+		return skipf(claim, method, "the server's map could not be restored to base 40000 (%v), so there "+
+			"is no recovery interval to observe", err)
+	}
+	if !recovered {
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"with the server's map restored to the legal base 40000 at epoch %d, the DUT issued no "+
+				"transaction at all to this server within the barrier's budget — it did not resume "+
+				"polling after meeting a noncompliant server", epoch)
+	}
+	good := page.WithOutcome(outcomeAnswered)
+	if len(good) == 0 {
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"with the map restored at epoch %d the DUT did transact again — %s — but no transaction "+
+				"completed normally within the window", epoch, page.Summary())
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"with the server's map restored to the legal base 40000 at epoch %d, the DUT issued %d "+
+			"transaction(s) that completed normally — it kept probing through the noncompliant interval "+
+			"and resumed discovery the moment the server became compliant. First: %s",
+		epoch, len(good), good[0])
 }
 
 // ── ERR-3 — Unknown Model ID Test ─────────────────────────────────────────────
@@ -442,28 +616,31 @@ func checkERR3(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		device = v
 	}
 
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
+	}
+	if err := d.begin(ctx, nil); err != nil {
+		return certify.Result{}, err
+	}
+	defer d.restore(ctx)
+
 	journalBefore, journalBeforeErr := o.admissionJournal(ctx)
 
-	// ERR-3#4 (census compliance-fullsuite-2-20260802T020946): splice a
-	// model with an ID unknown to any client into the chain, per §2.9.3
-	// step 1, before forcing the reconnect whose discovery walk this row
+	// §2.9.3 step 1: splice a model with an ID unknown to any client into the
+	// chain, BEFORE forcing the reconnect whose discovery walk this row
 	// evidences.
 	var spliceErr error
-	if r := o.injectionReason(); r != "" {
-		spliceErr = fmt.Errorf("%s", r)
-	} else {
-		spliceErr = o.injectValue(ctx, map[string]any{
-			"insert_model": map[string]any{"id": unregisteredModelID, "len": unregisteredModelLen},
-		}, fmt.Sprintf("splice a model with an unregistered ID (%d) into the server's chain immediately "+
-			"before the end marker, per §2.9.3 step 1", unregisteredModelID))
+	if _, err := d.inject(ctx, map[string]any{
+		"insert_model": map[string]any{"id": unregisteredModelID, "len": unregisteredModelLen},
+	}, fmt.Sprintf("splice a model with an unregistered ID (%d) into the server's chain immediately "+
+		"before the end marker, per §2.9.3 step 1", unregisteredModelID)); err != nil {
+		spliceErr = err
 	}
 	spliced := spliceErr == nil
-	if spliced {
-		defer o.clearInject(map[string]any{"clear_insert_model": true}, "the spliced model")
-	}
 
-	forced := o.forceReconnect(ctx)
-	if err := o.watch(ctx, 2); err != nil {
+	disc, err := rediscover(ctx, d, "ERR-3")
+	if err != nil {
 		return certify.Result{}, err
 	}
 	journalAfter, journalAfterErr := o.admissionJournal(ctx)
@@ -471,18 +648,18 @@ func checkERR3(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	return certify.Result{
 		Verdict: certify.Warn,
 		Notes: fmt.Sprintf("a model with an ID unknown to any client (%d) was spliced into the server's "+
-			"chain immediately before the end marker (spliced=%v), and the DUT's discovery walk over it "+
-			"was observed. %s", unregisteredModelID, spliced, o.injectionNote()),
+			"chain immediately before the end marker (spliced=%v), and the DUT's rediscovery over it "+
+			"was held on the simulator's transaction ledger rather than on a poll interval%s. %s",
+			unregisteredModelID, spliced, disc.note(), o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT connected without issue to a server carrying a model with an unknown ID"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre,
-					evalERR3InsertedModel(nil, spliced, spliceErr),
-					err3Inventory(nil, nil, journalBeforeErr, journalAfterErr, device))), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
+				fs = append(fs, evalERR3StepOver(c, disc.Err))
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalERR3StepOver(c, forced))
+			fs = append(fs, evalRediscovery(disc, d))
 			fs = append(fs, err3Inventory(journalBefore, journalAfter, journalBeforeErr, journalAfterErr, device))
 			fs = append(fs, evalERR3InsertedModel(c, spliced, spliceErr))
 			return emit(ev, c, fs), nil

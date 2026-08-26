@@ -26,22 +26,102 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 )
 
 // sentinelWords are the words of the SunSpec "not implemented" value for
-// each datatype this fault knows, in the order written starting at the
-// point's address. Widths and bit patterns are the Information Model's own
-// table, not invented here. "string" is handled separately in Seed (it has
-// no fixed width).
+// each datatype, in the order written starting at the point's address.
+//
+// The widths and bit patterns are the SunSpec Device Information Model
+// Specification's own table, not invented here — SS-MODBUS-CLIENT-CONF-v1.1
+// §2.7.2 INFO-2 requires a point of EVERY datatype present in the server's
+// models to be set to its unimplemented value, and (per the catalog's own note
+// on that row) the procedure declines to print the table it depends on.
+//
+// The variable-width types are handled in Seed rather than here, because they
+// have no fixed word count:
+//
+//	string     n registers of zero — a leading NUL, i.e. the empty string
+//	ipv6addr   8 registers of zero
+//
+// eui48 is 3 registers of all-ones. SunSpec lays eui48 out in 4 registers with
+// the first as padding; the sentinel this table writes covers the six value
+// bytes, which is the part a client decodes, and Seed's caller addresses the
+// value rather than the pad.
+//
+// A note on the zero-valued sentinels (acc16/acc32/acc64, ipaddr, string): for
+// those types the not-implemented value is genuinely 0, which is also a
+// perfectly ordinary reading. That ambiguity is the SPECIFICATION'S, not this
+// file's, and it is the reason INFO-2's criterion is about the client's
+// RENDERING rather than about the wire alone.
 var sentinelWords = map[string][]uint16{
 	"int16":      {0x8000},
 	"uint16":     {0xFFFF},
+	"count":      {0xFFFF},
+	"acc16":      {0x0000},
 	"enum16":     {0xFFFF},
+	"bitfield16": {0xFFFF},
+	"sunssf":     {0x8000},
+	"pad":        {0x8000},
 	"int32":      {0x8000, 0x0000},
 	"uint32":     {0xFFFF, 0xFFFF},
 	"acc32":      {0x0000, 0x0000},
+	"enum32":     {0xFFFF, 0xFFFF},
 	"bitfield32": {0xFFFF, 0xFFFF},
+	"ipaddr":     {0x0000, 0x0000},
+	"float32":    {0x7FC0, 0x0000}, // canonical quiet NaN
+	"eui48":      {0xFFFF, 0xFFFF, 0xFFFF},
+	"int64":      {0x8000, 0x0000, 0x0000, 0x0000},
+	"uint64":     {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF},
+	"acc64":      {0x0000, 0x0000, 0x0000, 0x0000},
+	"float64":    {0x7FF8, 0x0000, 0x0000, 0x0000}, // canonical quiet NaN
+}
+
+// variableWidthSentinels are the datatypes whose not-implemented value is a
+// run of zero registers whose LENGTH the point's declaration fixes rather than
+// the type. The value is the default register count Seed uses when the caller
+// gives no len.
+var variableWidthSentinels = map[string]int{
+	"string":   1, // a leading NUL is the whole of the empty string
+	"ipv6addr": 8, // 128 bits
+}
+
+// SentinelTypes lists every datatype Seed knows, sorted — for the error a
+// caller gets when it names one this table does not carry, and for a bench
+// that wants to sweep the lot.
+func SentinelTypes() []string {
+	out := make([]string, 0, len(sentinelWords)+len(variableWidthSentinels))
+	for t := range sentinelWords {
+		out = append(out, t)
+	}
+	for t := range variableWidthSentinels {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SentinelWordsFor returns the register words that Seed writes for typ at the
+// given declared length (len is used only by the variable-width types), and
+// whether typ is known.
+//
+// It is exported so a caller that seeds a sentinel can state, in its own
+// evidence, exactly which words it asked the device to serve — rather than
+// asserting that the sim wrote the right thing and leaving a reader to take
+// that on trust.
+func SentinelWordsFor(typ string, strLen int) ([]uint16, bool) {
+	if w, ok := sentinelWords[typ]; ok {
+		return append([]uint16(nil), w...), true
+	}
+	if def, ok := variableWidthSentinels[typ]; ok {
+		n := strLen
+		if n <= 0 {
+			n = def
+		}
+		return make([]uint16, n), true
+	}
+	return nil, false
 }
 
 // SentinelInjector pokes a chosen register's "not implemented" pattern
@@ -63,21 +143,13 @@ func NewSentinelInjector(regs *RegisterMap) *SentinelInjector {
 	return &SentinelInjector{regs: regs, prior: make(map[uint16]uint16)}
 }
 
-// Seed writes typ's not-implemented sentinel at addr: fixed width for every
-// type in sentinelWords, or strLen (default 1, a leading NUL = an empty
-// string) registers of zero for "string".
+// Seed writes typ's not-implemented sentinel at addr. strLen sets the register
+// count for the variable-width types (string, ipv6addr) and is ignored for
+// every other type, whose width its datatype fixes.
 func (si *SentinelInjector) Seed(addr uint16, typ string, strLen int) error {
-	words, ok := sentinelWords[typ]
-	if typ == "string" {
-		n := strLen
-		if n <= 0 {
-			n = 1
-		}
-		words = make([]uint16, n) // all-zero: a leading NUL, the empty string
-		ok = true
-	}
+	words, ok := SentinelWordsFor(typ, strLen)
 	if !ok {
-		return fmt.Errorf("sentinel: unknown type %q (want one of int16, uint16, enum16, int32, uint32, acc32, bitfield32, string)", typ)
+		return fmt.Errorf("sentinel: unknown type %q (want one of %v)", typ, SentinelTypes())
 	}
 	si.mu.Lock()
 	defer si.mu.Unlock()

@@ -282,6 +282,21 @@ MBAPS_WMAX="${MBAPS_WMAX:-2000}"
 echo "Bringing up sims (logs in $LOG, fleet size $SIM_FLEET):"
 MODSIM_ARGS=()
 [ -n "$MODSIM_BIND" ] && MODSIM_ARGS+=(-bind "$MODSIM_BIND")
+# THE DETERMINISTIC WIRE TAP is ON by default in modsim (-tap), and this script
+# deliberately does not turn it off. It is what serves GET /ledger, GET /poll
+# and GET /poll/wait — the epoch fence and poll barrier the SunSpec Modbus
+# CLIENT conformance rows use instead of sleeping through the gateway's poll
+# interval. With nothing armed it forwards every byte verbatim (pinned in
+# sim/southbound/tap_test.go); pass MODSIM_NO_TAP=1 to take it out of the path
+# and get the pre-LAB29-010 byte path back, at the cost of every deterministic
+# endpoint answering 501.
+[ -n "${MODSIM_NO_TAP:-}" ] && [ "${MODSIM_NO_TAP}" != "0" ] && MODSIM_ARGS+=(-tap=false)
+# MODSIM_PROTOFAULT=1 additionally interposes the proto-fault relay, which is
+# what §2.8.2 PROT-2 needs to compel a TCP-segmented response (segment_response).
+# OFF by default: it is an adversary relay, not a witness, and a shared bench is
+# never silently reframed. Turn it on for a conformance capture that has to
+# drive PROT-2's headline criterion rather than report it as a launch-flag gap.
+[ -n "${MODSIM_PROTOFAULT:-}" ] && [ "${MODSIM_PROTOFAULT}" != "0" ] && MODSIM_ARGS+=(-protofault)
 start modsim   "$MODSIM_PORT"  "$MODSIM_BIND" ./bin/modsim   -port "$MODSIM_PORT" -advanced -der-models "$CENSUS_DER_MODELS" -wmax 8000 -serial "$MODSIM_SERIAL" \
                  ${MODSIM_ARGS+"${MODSIM_ARGS[@]}"}
 # MBAPS_NO_TICKETS=1 forces every gateway southbound dial to be a FULL mTLS

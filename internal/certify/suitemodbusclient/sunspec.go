@@ -193,10 +193,19 @@ type Sentinel struct {
 	Words []uint16
 }
 
-// Sentinels is the per-datatype not-implemented table. eui48 and the string
-// types are represented by their leading word: a string point is unimplemented
-// when its first byte is 0x00, and eui48's sentinel is all-ones across its
-// registers.
+// Sentinels is the per-datatype not-implemented table, covering every datatype
+// the catalog's own preconditions enumerate — which is what §2.7.2 INFO-2's
+// "for all the data types present in the PICS models" requires an assertion to
+// be able to recognise.
+//
+// eui48 and the string types are represented by their leading word: a string
+// point is unimplemented when its first byte is 0x00, and eui48's sentinel is
+// all-ones across its registers.
+//
+// Five of these — acc16, acc32, acc64, ipaddr and string — have ZERO as their
+// not-implemented value, which is also a perfectly ordinary reading. That
+// ambiguity is the SPECIFICATION'S, not this table's, and it is why INFO-2's
+// criterion is about the client's rendering rather than about the wire alone.
 var Sentinels = []Sentinel{
 	{"int16", []uint16{0x8000}},
 	{"uint16", []uint16{0xFFFF}},
@@ -205,6 +214,8 @@ var Sentinels = []Sentinel{
 	{"enum16", []uint16{0xFFFF}},
 	{"bitfield16", []uint16{0xFFFF}},
 	{"sunssf", []uint16{0x8000}},
+	{"pad", []uint16{0x8000}},
+	{"string", []uint16{0x0000}},
 	{"int32", []uint16{0x8000, 0x0000}},
 	{"uint32", []uint16{0xFFFF, 0xFFFF}},
 	{"acc32", []uint16{0x0000, 0x0000}},
@@ -215,7 +226,9 @@ var Sentinels = []Sentinel{
 	{"int64", []uint16{0x8000, 0x0000, 0x0000, 0x0000}},
 	{"uint64", []uint16{0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF}},
 	{"acc64", []uint16{0x0000, 0x0000, 0x0000, 0x0000}},
+	{"float64", []uint16{0x7FF8, 0x0000, 0x0000, 0x0000}}, // canonical quiet NaN
 	{"eui48", []uint16{0xFFFF, 0xFFFF, 0xFFFF}},
+	{"ipv6addr", []uint16{0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000}},
 }
 
 // SentinelTypesFor returns the datatypes whose not-implemented sentinel begins

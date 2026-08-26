@@ -5,6 +5,7 @@
 //
 //	modsim [-port 5020] [-bind ""] [-wmax 5000] [-api-port 6020] [-cloud-pct 0] [-serial SN-...]
 //	       [-advanced | -der-models legacy|advanced|full] [-base 40000] [-mangle] [-protofault]
+//	       [-tap=false] [-ledger-capacity 20000]
 //
 // Models exposed by the default (legacy) image: 1 (Common), 120 (Nameplate),
 // 121 (Basic Settings), 122 (Extended Status), 103 (Three-Phase Inverter),
@@ -45,10 +46,33 @@
 //	                   (sim/southbound/relocate.go, always available); {"kind":"exception_code",
 //	                   "code":1,"on_fc":3,"on_addr":[a,b]} (targeted scoping of the existing
 //	                   exception_code fault, sim/southbound/exception_target.go, always available);
+//	                   {"kind":"next_response","action":"drop|short|delay","on_fc":3,"on_addr":[a,b]}
+//	                   and {"kind":"unit_id","unit_id":N} (sim/southbound/tap.go, needs the tap);
 //	                   {"kind":"segment_response","split_after":N} / {"kind":"short_response",
 //	                   "truncate_bytes":N} (sim/southbound/protorelay.go, needs -protofault)
+//	POST /reset      — restore a named baseline register image: {"baseline":"as-built"}
 //	GET  /registers  — raw Modbus register dump
+//	GET  /ledger     — the sim's own append-only Modbus transaction record
+//	                   (?since_epoch=N fences it; ?min_entries=M&timeout=D blocks until M match)
+//	GET  /poll       — the client's poll-cycle accounting, as the sim counts it
+//	GET  /poll/wait  — block until a given poll cycle has completed
 //	GET  /ws         — WebSocket; pushes /state every 2 s
+//
+// # The deterministic control plane
+//
+// -tap (ON by default) interposes an MBAP-aware pass-through relay in front of
+// the Modbus server. It is what serves /ledger, /poll, /poll/wait and the two
+// one-shot fault kinds, and it is what makes every accepted mutation
+// acknowledge with the CONTROL-PLANE EPOCH it is in force from — the fence a
+// conformance row uses instead of sleeping through the client's poll interval.
+//
+// It is on by default, unlike -mangle and -protofault, because it is a WITNESS
+// rather than an adversary: with nothing armed it forwards every byte of every
+// frame verbatim in both directions, which sim/southbound/tap_test.go pins
+// byte-for-byte against the device's own copy of what it received and sent.
+// -tap=false restores the pre-LAB29-010 byte path exactly, at the cost of
+// /ledger and /poll[/wait] answering 501 and the tap's fault kinds being
+// refused by name. See sim/simapi/API.md for the whole contract.
 package main
 
 import (
@@ -126,6 +150,18 @@ func main() {
 		"server binds loopback and a framing-level relay binds -port instead, enabling the wire-lie fault kinds "+
 		"(truncate_response, mbap_length_lie, wrong_unit_id, txn_id_swap, stack_responses) that cannot be "+
 		"expressed above the framing layer. OFF by default — a shared live bench is never silently reframed")
+	tapOn := flag.Bool("tap", true, "interpose the DETERMINISTIC WIRE TAP (sim/southbound/tap.go): an "+
+		"MBAP-aware pass-through relay that writes the transaction ledger (GET /ledger), counts the "+
+		"client's poll cycles (GET /poll, GET /poll/wait) and serves the one-shot response faults "+
+		"(next_response) and the unit-id gate (unit_id). ON by default, unlike -mangle/-protofault, "+
+		"because it is a WITNESS rather than an adversary: with nothing armed it forwards every byte of "+
+		"every frame verbatim in both directions (sim/southbound/tap_test.go pins that), and the whole "+
+		"point of it is that a conformance row need not guess when the client polled. -tap=false restores "+
+		"the pre-LAB29-010 byte path exactly, at the cost of every deterministic endpoint answering 501")
+	ledgerCap := flag.Int("ledger-capacity", sim.DefaultLedgerCapacity, "how many resolved Modbus "+
+		"transactions the tap's append-only ledger retains before the oldest age out. A query whose "+
+		"window reaches past the surviving entries is answered with truncated=true rather than with a "+
+		"silently short list")
 	protofault := flag.Bool("protofault", false, "interpose a second, independent framing-level relay "+
 		"(sim/southbound/protorelay.go), enabling segment_response and short_response — kept separate from "+
 		"-mangle's relay for change isolation. OFF by default, mirroring -mangle: a shared live bench is never "+
@@ -141,16 +177,22 @@ func main() {
 			"combining them is not yet supported)")
 	}
 
-	// With -mangle OR -protofault the device binds a loopback port and the
-	// relay takes the public one, so a client dials exactly the address it
-	// always did and the interposition is invisible until a fault is armed.
-	// With NEITHER, nothing about the sim's listening behaviour changes.
-	listenURL := "tcp://" + listenAddr(*bind, *port)
-	upstreamAddr := ""
-	if *mangle || *protofault {
-		upstreamAddr = fmt.Sprintf("127.0.0.1:%d", *port+10000)
-		listenURL = "tcp://" + upstreamAddr
-	}
+	// THE RELAY CHAIN. Whatever is interposed, the client dials exactly the
+	// address it always did; each relay binds the port in front of it and
+	// forwards inward, so the interposition is invisible until something is
+	// armed. Innermost is always the Modbus server itself.
+	//
+	//	client → [tap :port] → [mangler|protorelay :port+10000] → device :port+20000
+	//
+	// The tap goes CLOSEST TO THE CLIENT deliberately: its ledger is the
+	// record of what the device under test actually received, mangling
+	// included, not of what the sim originally composed. An adversary relay
+	// downstream of the witness is a lie the witness can see; upstream, it
+	// would be one the witness could not.
+	chain := relayChain(*bind, *port, *tapOn, *mangle || *protofault)
+	publicAddr, relayAddr, deviceAddr := chain.Public, chain.Relay, chain.Device
+	relayUpstream, tapUpstream := chain.RelayUpstream, chain.TapUpstream
+	listenURL := "tcp://" + deviceAddr
 
 	models, err := resolveDERModels(*derModels, *advanced)
 	if err != nil {
@@ -238,25 +280,66 @@ func main() {
 
 	var mangler *sim.Mangler
 	if *mangle {
-		mangler, err = sim.NewMangler(listenAddr(*bind, *port), upstreamAddr)
+		mangler, err = sim.NewMangler(relayAddr, relayUpstream)
 		if err != nil {
 			log.Fatalf("modsim: %v", err)
 		}
 		defer mangler.Close()
-		log.Printf("modsim: MBAP wire mangler interposed on :%d → %s (framing-level fault kinds enabled)",
-			*port, upstreamAddr)
+		log.Printf("modsim: MBAP wire mangler interposed on %s → %s (framing-level fault kinds enabled)",
+			relayAddr, relayUpstream)
 	}
 
 	var protoRelay *sim.ProtoRelay
 	if *protofault {
-		protoRelay, err = sim.NewProtoRelay(listenAddr(*bind, *port), upstreamAddr)
+		protoRelay, err = sim.NewProtoRelay(relayAddr, relayUpstream)
 		if err != nil {
 			log.Fatalf("modsim: %v", err)
 		}
 		defer protoRelay.Close()
-		log.Printf("modsim: proto-fault relay interposed on :%d → %s (segment_response, short_response enabled)",
-			*port, upstreamAddr)
+		log.Printf("modsim: proto-fault relay interposed on %s → %s (segment_response, short_response enabled)",
+			relayAddr, relayUpstream)
 	}
+
+	// THE DETERMINISTIC LAYER (LAB29-010). The epoch is the fence every other
+	// piece stamps against, so it is constructed first and shared: one counter
+	// in the process, never two that have to be kept in step.
+	epoch := sim.NewEpoch()
+	baselines := sim.NewBaselineStore(srv.Regs)
+	poke := sim.NewRegisterPoke(srv.Regs)
+	var tap *sim.Tap
+	if *tapOn {
+		tap, err = sim.NewTap(publicAddr, tapUpstream, epoch, sim.NewLedger(*ledgerCap), sim.NewPollTracker())
+		if err != nil {
+			log.Fatalf("modsim: %v", err)
+		}
+		defer tap.Close()
+		log.Printf("modsim: deterministic wire tap interposed on %s → %s (ledger, poll barrier, one-shot "+
+			"response faults; nothing armed, every byte forwarded verbatim)", publicAddr, tapUpstream)
+	} else {
+		log.Printf("modsim: deterministic wire tap DISABLED (-tap=false) — GET /ledger, GET /poll and " +
+			"GET /poll/wait will answer 501 and the next_response/unit_id fault kinds are refused by name")
+	}
+
+	// The as-built baseline is captured AFTER every construction-time lever
+	// (-base, -wmax-setting, the model set, the serial/firmware overrides) has
+	// been applied and BEFORE any client can dial in, so POST /reset restores
+	// the device this invocation actually asked for rather than some canonical
+	// one. Restoring is a coordinated operation: every fault layer clears
+	// first — one that owns registers puts them back as it clears, and doing
+	// that after the image was rewritten would land on top of it — and the
+	// image is written back last.
+	startupBase := uint16(*baseFlag)
+	baselines.OnReset("relocation → base "+strconv.Itoa(int(startupBase)), func() { reloc.Relocate(startupBase) })
+	baselines.OnReset("targeted exception", targetedExc.Clear)
+	baselines.OnReset("not-implemented sentinels", sentinels.Clear)
+	baselines.OnReset("spliced model", splicer.Clear)
+	baselines.OnReset("poked registers", poke.Clear)
+	baselines.OnReset("device faults (register, lying, legacy-curve, reversion timers)", srv.ClearFaults)
+	if tap != nil {
+		baselines.OnReset("wire-tap faults (next_response, unit_id)", tap.ClearFaults)
+		baselines.OnReset("poll-cycle accounting", tap.Polls().Reset)
+	}
+	baselines.Capture(sim.BaselineName)
 
 	// Seed the initial cloud cover (0 = clear = today's byte-identical behavior);
 	// srv.Inject already handles the live "Cloud_pct" key, so no wrapper is needed.
@@ -276,6 +359,15 @@ func main() {
 				return err
 			}
 			if handled, err := splicer.ApplyInject(body); handled {
+				return err
+			}
+			// Raw register poke (sim/southbound/poke.go): the caller names an
+			// ADDRESS rather than a field, which is what the write rows need —
+			// the register the client owns is learned from the client's own
+			// traffic (the ledger records its FC 0x10 writes, address and
+			// all), so a divergence lands on the exact cell the product
+			// re-asserts instead of on a legacy mirror the sim re-derives.
+			if handled, err := poke.ApplyInject(body); handled {
 				return err
 			}
 			return srv.Inject(body)
@@ -329,6 +421,18 @@ func main() {
 			if handled, err := reloc.ApplyFault(body); handled {
 				return err
 			}
+			// The wire tap's own kinds (one-shot next_response, the unit-id
+			// gate) — offered when the tap is interposed and refused BY NAME
+			// when it is not, the same discipline the two adversary relays
+			// use, so a row reports SKIP-with-reason instead of mistaking "we
+			// never asked" for "the client passed".
+			if tap != nil {
+				if handled, err := tap.ApplyFault(body); handled {
+					return err
+				}
+			} else if sim.TapFaultRequested(body) {
+				return sim.ErrNoTap
+			}
 			if handled, err := targetedExc.ApplyFault(body); handled {
 				return err
 			}
@@ -348,6 +452,12 @@ func main() {
 			}
 			return srv.ApplyFault(body)
 		})
+
+		// The deterministic control plane (LAB29-010) — one call, shared with
+		// the integration test, so what the bench runs and what the test
+		// exercises cannot drift apart.
+		wireDeterministic(api, epoch, baselines, tap)
+
 		// Tee logs into the API ring so the dashboard's Logs tab can stream them.
 		log.SetOutput(io.MultiWriter(os.Stderr, api.LogWriter()))
 	}
