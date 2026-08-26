@@ -3,32 +3,55 @@ package suitemodbusclient
 // checks_write.go implements §2.6, the Write Tests: WR-1 (FC 0x06) and WR-2
 // (FC 0x10).
 //
-// # Why these two rows are structurally hard on this DUT
+// # WR-1 has no subject on this client, and that is a judgement either way
 //
-// §2.6 is written for an operator console: the test engineer hands the CUT a
-// list of five values per adjustable point and watches it write each one. The
-// DUT is not an operator console. It is an autonomous gateway whose southbound
-// writes are a CONSEQUENCE — its reconcilers emit a register write only when a
-// northbound command (a CSIP DERControl, or an aggregator's mbaps write) gives
-// them something to enforce. There is no interface, on the device or off it,
-// that says "write 0x1234 to register 40230".
+// §2.6.1's purpose is verbatim:
 //
-// So a write sweep has to be driven indirectly, and this suite offers exactly
-// two levers, in increasing order of blast radius:
+//	"Validates that all implemented adjustable points in the model can be
+//	 written individually using Modbus Function Code 0x06."
 //
-//	1. Divergence. Move the server's control register out from under the DUT
-//	   and see whether an active reconciler puts it back. Costs nothing and
-//	   touches nothing but the sim; provokes a write only if a standing setpoint
-//	   exists to re-assert.
-//	2. A northbound command. Post a short, self-expiring DERControl to the
-//	   bench's 2030.5 server so the DUT's CSIP client adopts a limit and its
-//	   solar reconciler writes it southbound. This reaches outside this suite's
-//	   own surface — it makes the DUT do something it was not doing — so it is
-//	   OFF by default and enabled with -param modbus-client.dercontrol=on.
+// The DUT has no FC 0x06 path at all. Every register write it can emit goes
+// through sunspec.Reader.WriteModel → the transport's WriteHolding → the
+// vendored client's writeRegisters, which hardcodes
+// `functionCode: fcWriteMultipleRegisters` (client.go:1162-1164) — so even a
+// single-register write leaves as FC 0x10 with quantity 1. There is no branch,
+// no configuration and no code path that produces an FC 0x06 request.
 //
-// When neither lever produces a write, the rows SKIP with that stated, and with
-// the exact command that would produce one. They do not pass on the strength of
-// having tried.
+// So the row's subject — "all implemented adjustable points … using Modbus
+// function code 0x06" — is the empty set on this client, and this suite
+// records WR-1 as NOT APPLICABLE with that as the reason. The judgement is
+// stated in full in wr1NotApplicable below, INCLUDING the reading that argues
+// against it, because it is a judgement and a certifying lab may weigh it
+// differently. What this suite will not do is add an FC 0x06 write path to the
+// product to make a row green: a conformance tool that changes the device to
+// suit the test has stopped measuring anything.
+//
+// # WR-2's difficulty, and what fixed it
+//
+// §2.6 is written for an operator console: the test engineer hands the CUT five
+// values per adjustable point and watches it write each one. The DUT is not an
+// operator console. It is an autonomous gateway whose southbound writes are a
+// CONSEQUENCE — its reconcilers emit a register write only when a northbound
+// command gives them something to enforce — and there is no interface, on the
+// device or off it, that says "write 0x1234 to register 40230".
+//
+// A write therefore has to be provoked, and the only provocation available is
+// DIVERGENCE: move the control register out from under the DUT and see whether
+// an active reconciler puts it back. That failed for a specific and now-fixed
+// reason. The lever was `POST /inject {"WMaxLimPct_pct": N}`, which writes the
+// LEGACY model 123 ceiling — and on an advanced sim the model 123 ceiling is a
+// MIRROR the sim re-derives from model 704 on its next animation tick, while
+// the DUT reads and writes 704. The provocation was being restored under itself
+// before the DUT ever saw it, and both write rows SKIPped for want of a write
+// in every campaign to date.
+//
+// The fix is not a bigger hammer. It is to stop guessing which register the
+// product owns and to LEARN it from the product: the simulator's transaction
+// ledger records the DUT's own FC 0x10 write, address and values and all, so
+// this row diverges exactly the cell the DUT just wrote. No model definition
+// directory is consulted on either side — the same independence ERR-3 rests on
+// — and the divergence cannot land on a mirror, because the DUT does not write
+// mirrors.
 
 import (
 	"context"
@@ -46,151 +69,135 @@ const paramDERControl = "modbus-client.dercontrol"
 const derControlWatts = 4000
 
 // derControlSeconds bounds the posted control so it expires on its own even if
-// this check is killed mid-run.
-const derControlSeconds = 120
+// this check is killed mid-run. It outlasts the barrier budget the row can
+// spend waiting for a write, so the standing setpoint is still standing when
+// the divergence is applied.
+const derControlSeconds = 300
 
-// divergePct and restorePct are the two ceilings the divergence lever writes.
-//
-// RMD-046 (fixed): `POST /inject {"WMaxLimPct_pct": N}` on both the solar and
-// battery sims used to encode `RawFromScaleSigned(N*100, SF)` against SF = −2
-// — that is N × 10000 — so the M123 register SATURATED at 32767 for any N
-// above ~3.27. The 50 and 100 this file wants to pass therefore used to encode
-// the SAME saturated word: the "50 % curtail" was actually a 327.67 % ceiling,
-// and the restore that followed it wrote the identical value, so the teardown
-// restored nothing and the SECOND write row's divergence — WR-2, running
-// after WR-1 has already left the register at 32767 — moved the register by
-// zero. Two rows whose whole provocation is divergence were provoking with a
-// no-op, and both SKIPped for want of a write in every campaign to date. The
-// workaround (passing X/100 so the double-scale cancelled itself out) is gone
-// now that the sims encode N directly: 50 means 50 %.
-//
-// 100 is also the sim's own power-on ceiling: SolarServer.powerOnReset writes
-// raw 10000 to that register and calls it "100.00 %".
-const (
-	divergePct = 50  // → raw 5000  = 50.00 %
-	restorePct = 100 // → raw 10000 = 100.00 %
-)
-
-// bridgedMirrorCaveat is the second half of what an operator needs to read a
-// SKIP from these two rows correctly.
-//
-// On an ADVANCED sim the M123 ceiling this lever writes is a DERIVED MIRROR:
-// the sim's own bridge copies an enabled 704 WMaxLimPct into the legacy 123
-// convention on its animation tick (sim/southbound advBridgeCeiling, and see
-// installLies' comment, which makes the same point about revert_after — "the
-// next animation tick would put it straight back, so the lie would be
-// invisible"). The DUT reads and writes 704. So on the bench's advanced
-// inverters this lever can be restored under itself before the DUT ever sees
-// it, and a SKIP from these rows must not be read as "the DUT declined to
-// re-assert" when it may be "the DUT was never shown a divergence". The sims
-// expose no /inject key for 704's ceiling, so this cannot be provoked from
-// here today; the northbound lever (-param modbus-client.dercontrol=on) is the
-// one that reaches the register the DUT actually writes.
-const bridgedMirrorCaveat = "NOTE: on an advanced sim the M123 ceiling this lever writes is a mirror the " +
-	"sim's own bridge re-derives from 704 on its next animation tick, and the DUT writes 704, not the " +
-	"mirror — so an absent write here may mean the divergence never reached the DUT rather than that the " +
-	"DUT declined to re-assert. The simapi exposes no 704-ceiling inject; -param " + paramDERControl +
-	"=on is the lever that moves the register the DUT owns"
-
-// writeProvocation records what was done to try to make the DUT write.
-type writeProvocation struct {
-	Divergence   string
-	DERControl   string
-	DERAttempt   bool
-	DERErr       error
-	DivergeErr   error
-	NorthboundOn bool
-}
-
-// provokeWrites applies the levers and returns what it did.
-func provokeWrites(ctx context.Context, rc *certify.RunCtx, o *observer) (*writeProvocation, error) {
-	p := &writeProvocation{}
-	if v, ok := rc.Param(paramDERControl); ok && strings.EqualFold(strings.TrimSpace(v), "on") {
-		p.NorthboundOn = true
-	}
-
-	// Lever 1: divergence on the sim's control register.
-	body := map[string]any{"WMaxLimPct_pct": divergePct}
-	if err := o.injectValue(ctx, body,
-		"move the server's WMaxLimPct control register to 50.00 % — away from the value the DUT last "+
-			"wrote — so an active reconciler that holds a standing setpoint re-asserts it with a register "+
-			"write. "+bridgedMirrorCaveat); err != nil {
-		p.DivergeErr = err
-	} else {
-		p.Divergence = jsonish(body)
-	}
-
-	// Lever 2: a bounded northbound command, opt-in.
-	if p.NorthboundOn && rc.GridSim != nil && rc.GridSim.Available() {
-		p.DERAttempt = true
-		ctrl := map[string]any{
-			"program":    0,
-			"gen_lim_W":  derControlWatts,
-			"duration_s": derControlSeconds,
-			"activate":   true,
-		}
-		if err := rc.GridSim.Control(ctx, ctrl, nil); err != nil {
-			p.DERErr = err
-		} else {
-			p.DERControl = fmt.Sprintf("POST %s/admin/control %s — a %d W generation limit lasting %d s, "+
-				"posted so the DUT's CSIP client adopts it and its solar reconciler writes the "+
-				"corresponding SunSpec control register southbound. It expires on its own",
-				rc.GridSim.BaseURL, jsonish(ctrl), derControlWatts, derControlSeconds)
-			o.injected = append(o.injected, p.DERControl)
-		}
-	}
-
-	// Two poll cycles for the reconciler to act, one for the readback it
-	// performs after writing, and one more margin cycle — WR-1#1/WR-2#1
-	// (census 20260731T234821) both landed zero attributed frames at 3
-	// cycles, consistent with the DUT's southbound client still settling
-	// from whatever the preceding test case injected when this check's own
-	// (unforced) window opened.
-	if err := o.watch(ctx, 4); err != nil {
-		return p, err
-	}
-	return p, nil
-}
-
-// reason renders why no write may have appeared.
-func (p *writeProvocation) reason() string {
-	var parts []string
-	if p.Divergence != "" {
-		parts = append(parts, "the server's control register was moved out from under the DUT ("+
-			p.Divergence+" = a 50.00 % ceiling; "+bridgedMirrorCaveat+")")
-	} else if p.DivergeErr != nil {
-		parts = append(parts, fmt.Sprintf("the control register could not be diverged (%v)", p.DivergeErr))
-	}
-	switch {
-	case p.DERControl != "":
-		parts = append(parts, "and a bounded northbound DERControl was posted to give the reconciler a "+
-			"setpoint to enforce")
-	case p.DERAttempt && p.DERErr != nil:
-		parts = append(parts, fmt.Sprintf("and the northbound DERControl could not be posted (%v)", p.DERErr))
-	case !p.NorthboundOn:
-		parts = append(parts, fmt.Sprintf("and the northbound lever was NOT used: the DUT emits a "+
-			"southbound write only when a northbound command gives its reconciler something to "+
-			"enforce, and posting one reaches outside this suite's surface, so it is opt-in "+
-			"(-param %s=on)", paramDERControl))
-	}
-	return joinOr(parts, "no provocation was applied")
-}
+// divergeDelta is how far the poked register is moved from the value the DUT
+// last wrote. It is a RAW register delta, not a scaled quantity: this row does
+// not decode the point (it holds no model directory), it simply moves the word
+// far enough that any reconciler comparing its commanded value against the
+// read-back sees a difference.
+const divergeDelta = -500
 
 // ── WR-1 — Write Single Point (FC 0x06) ───────────────────────────────────────
 
 func checkWR1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	return writeCheck(ctx, rc, FCWriteSingleRegister)
+	o, why := newObserver(rc)
+	if o == nil {
+		return certify.Skipped("%s", why), nil
+	}
+	if err := o.claimServer(); err != nil {
+		return certify.Result{}, err
+	}
+	// Registered rather than omitted, for the reason register.go states: an
+	// unregistered uid is indistinguishable from an oversight, while a
+	// registered row carrying its reasoning is a judgement a reviewer can
+	// weigh and disagree with.
+	return certify.Result{
+		Verdict: certify.Skip,
+		Notes: "NOT APPLICABLE to this client. §2.6.1's subject is 'all implemented adjustable points " +
+			"in the model … using Modbus Function Code 0x06', and this client implements no FC 0x06 " +
+			"write path: every register write it can emit is FC 0x10, hardcoded in the Modbus client it " +
+			"is built on, so the row's subject is the empty set. The sibling row WR-2 exercises the " +
+			"same adjustable points through the function code this client does use. The full reasoning, " +
+			"including the reading that would make this a product gap instead, is in the assertion.",
+		OffWire: true,
+		OffWireReason: "the row's observables are FC 0x06 requests, and this client emits none — not " +
+			"because the bench failed to provoke one, but because no code path in it produces that " +
+			"function code. The row is recorded as addressed and not executed, not as passed.",
+		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
+			c, _, _ := citeConversation(ev, o, "the DUT wrote an adjustable point using FC 0x06")
+			return emit(ev, c, []finding{wr1NotApplicable(c)}), nil
+		},
+	}, nil
+}
+
+// wr1NotApplicable states the judgement, the evidence for it, and the argument
+// against it.
+//
+// It is one assertion rather than four SKIPs because the row does not have four
+// separate gaps: it has one fact about the client, from which everything else
+// follows.
+func wr1NotApplicable(c *Conversation) finding {
+	claim := "§2.6.1 applies to this client"
+	method := "the client's own write path, and the function codes it was observed to emit"
+
+	observed := "no write of any kind was attributed to this test case"
+	if c != nil {
+		fc06, fc10 := 0, 0
+		for _, ex := range c.Writes() {
+			switch ex.Request.FC {
+			case FCWriteSingleRegister:
+				fc06++
+			case FCWriteMultipleRegisters:
+				fc10++
+			}
+		}
+		if fc06+fc10 > 0 {
+			observed = fmt.Sprintf("this test case's frames carry %d FC 0x06 write(s) and %d FC 0x10 "+
+				"write(s)", fc06, fc10)
+		}
+	}
+
+	return skipf(claim, method,
+		"NOT APPLICABLE, on the client's own construction. §2.6.1 reads: \"Validates that all "+
+			"implemented adjustable points in the model can be written individually using Modbus "+
+			"Function Code 0x06\", and its step 1: \"Verify all implemented adjustable points can be "+
+			"written to the minimum value, maximum value, and three intermediate values as defined in "+
+			"the Server 1 PICS using Modbus function code 0x06.\" This client has no FC 0x06 write "+
+			"path: every register write it can emit reaches the wire through one function, which "+
+			"hardcodes FC 0x10 (the vendored Modbus client's writeRegisters, "+
+			"functionCode: fcWriteMultipleRegisters), so even a single-register write leaves as FC 0x10 "+
+			"with quantity 1. There is no branch, no setting and no code path that produces FC 0x06. "+
+			"The set of \"implemented adjustable points … using Modbus function code 0x06\" is "+
+			"therefore empty, and a sweep over an empty set is vacuous rather than failed. %s. "+
+			"THE READING THAT WOULD MAKE THIS A PRODUCT GAP, stated so a reviewer can take it: §2.6.1 "+
+			"carries no explicit \"if the CUT supports FC 0x06\" clause, where its own step 3 does "+
+			"carry one for RTU (\"If the CUT supports RTU server interfaces as indicated in the "+
+			"PICS\"). A lab reading §2.6.1 as unconditional would call this a product gap closable only "+
+			"by adding an FC 0x06 write path to the client — which this suite will not do to make a row "+
+			"green. The counter-argument, and the one recorded here: §2.6.2 is explicit that FC 0x10 is "+
+			"a complete per-point alternative (\"This test does not require that multiple points are "+
+			"written at once, just that the 0x10 function code can be used to write each of the "+
+			"points\"), so WR-2 already covers every adjustable point this client can write, by the "+
+			"function code it uses. Resolving the ambiguity is a PICS question for the certifying lab, "+
+			"not a bench capability", observed)
 }
 
 // ── WR-2 — Write Multiple Points (FC 0x10) ────────────────────────────────────
 
-func checkWR2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	return writeCheck(ctx, rc, FCWriteMultipleRegisters)
+// writeRun is what one learn-diverge-reassert-readback attempt produced.
+type writeRun struct {
+	// Northbound records the command posted to give the reconciler something
+	// to enforce, and why it was or was not.
+	Northbound string
+	NorthErr   error
+	NorthOn    bool
+
+	// First is the DUT's own write, from which this row LEARNS the register
+	// the product owns.
+	First     LedgerEntry
+	HaveFirst bool
+	FirstPage LedgerPage
+
+	// DivergeAddr is the register moved out from under the DUT, DivergeEpoch
+	// the fence it moved at, and DivergeErr why it could not be.
+	DivergeAddr  uint16
+	DivergeEpoch uint64
+	DivergeErr   error
+
+	// Reassert is the write the DUT issued in response, and ReadBack the DUT's
+	// own later read of the block showing the value took.
+	Reassert     LedgerEntry
+	HaveReassert bool
+	ReassertPage LedgerPage
+	ReadBack     LedgerEntry
+	HaveReadBack bool
 }
 
-// writeCheck is WR-1 and WR-2: the two rows differ only in the function code
-// their criterion names, and their criteria text is verbatim identical.
-func writeCheck(ctx context.Context, rc *certify.RunCtx, fc uint8) (certify.Result, error) {
+func checkWR2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	o, why := newObserver(rc)
 	if o == nil {
 		return certify.Skipped("%s", why), nil
@@ -201,153 +208,360 @@ func writeCheck(ctx context.Context, rc *certify.RunCtx, fc uint8) (certify.Resu
 	if r := o.injectionReason(); r != "" {
 		return certify.Skipped("this procedure requires the DUT to be made to write, and %s", r), nil
 	}
-	prov, err := provokeWrites(ctx, rc, o)
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
+	}
+	if err := d.begin(ctx, nil); err != nil {
+		return certify.Result{}, err
+	}
+	defer d.restore(ctx)
+
+	run := &writeRun{}
+	if v, ok := rc.Param(paramDERControl); ok && strings.EqualFold(strings.TrimSpace(v), "on") {
+		run.NorthOn = true
+	}
+
+	// STEP 1 — give the reconciler something to enforce, so it has a standing
+	// setpoint to re-assert. This is the only lever that reaches outside this
+	// suite's own surface, so it is opt-in.
+	fence := d.baselineEpoch
+	if run.NorthOn && rc.GridSim != nil && rc.GridSim.Available() {
+		ctrl := map[string]any{
+			"program":    0,
+			"gen_lim_W":  derControlWatts,
+			"duration_s": derControlSeconds,
+			"activate":   true,
+		}
+		if err := rc.GridSim.Control(ctx, ctrl, nil); err != nil {
+			run.NorthErr = err
+		} else {
+			run.Northbound = fmt.Sprintf("POST %s/admin/control %s — a %d W generation limit lasting "+
+				"%d s, posted so the DUT's CSIP client adopts it and its reconciler writes the "+
+				"corresponding SunSpec control register southbound. It expires on its own",
+				rc.GridSim.BaseURL, jsonish(ctrl), derControlWatts, derControlSeconds)
+			o.injected = append(o.injected, run.Northbound)
+		}
+	}
+
+	// STEP 2 — LEARN the register the product owns, from the product. The
+	// ledger records the DUT's own FC 0x10 write, address and values and all;
+	// nothing here guesses which model or which offset that is.
+	page, saw, err := d.awaitMatch(ctx, fence, "issue a register write",
+		func(p LedgerPage) bool { return len(p.Writes()) > 0 })
 	if err != nil {
 		return certify.Result{}, err
 	}
-	// Put the server's control register back where the DUT expects it, whatever
-	// happened, so the next test case starts from a coherent device.
-	if prov.Divergence != "" {
-		_ = o.injectValue(ctx, map[string]any{"WMaxLimPct_pct": restorePct},
-			"restore the server's control register to 100.00 % after the divergence probe")
+	run.FirstPage = page
+	if saw {
+		run.First, run.HaveFirst = page.Writes()[0], true
 	}
-	if err := o.settle(ctx); err != nil {
-		return certify.Result{}, err
+
+	// STEP 3 — diverge exactly that register, and watch the reconciler put it
+	// back.
+	if run.HaveFirst {
+		run.DivergeAddr = run.First.Addr
+		epoch, ierr := d.inject(ctx, map[string]any{
+			"registers": []map[string]any{{"addr": int(run.DivergeAddr), "delta": divergeDelta}},
+		}, fmt.Sprintf("move register %d — the exact cell the DUT itself wrote at ledger seq %d — by %d "+
+			"raw units, so a reconciler comparing its commanded value against the read-back sees a "+
+			"divergence and re-asserts", run.DivergeAddr, run.First.Seq, divergeDelta))
+		if ierr != nil {
+			run.DivergeErr = ierr
+		} else {
+			run.DivergeEpoch = epoch
+			rpage, sawRe, rerr := d.awaitMatch(ctx, epoch, "re-assert the diverged register",
+				func(p LedgerPage) bool { return writeCovering(p, run.DivergeAddr) != nil })
+			if rerr != nil {
+				return certify.Result{}, rerr
+			}
+			run.ReassertPage = rpage
+			if sawRe {
+				if w := writeCovering(rpage, run.DivergeAddr); w != nil {
+					run.Reassert, run.HaveReassert = *w, true
+				}
+			}
+		}
+	}
+
+	// STEP 4 — the read-back. §2.6's "server write operations SHALL be
+	// validated by the test engineer" is, on the wire, the DUT's own later read
+	// of the block showing the value it wrote.
+	if run.HaveReassert {
+		bpage, sawB, berr := d.awaitMatch(ctx, run.Reassert.Epoch, "read the written block back",
+			func(p LedgerPage) bool {
+				return readCoveringAfter(p, run.DivergeAddr, run.Reassert.Seq) != nil
+			})
+		if berr != nil {
+			return certify.Result{}, berr
+		}
+		if sawB {
+			if r := readCoveringAfter(bpage, run.DivergeAddr, run.Reassert.Seq); r != nil {
+				run.ReadBack, run.HaveReadBack = *r, true
+			}
+		}
 	}
 
 	return certify.Result{
-		Verdict: certify.Skip,
-		Notes: fmt.Sprintf("the DUT was provoked into writing rather than commanded to: %s. %s",
-			prov.reason(), o.injectionNote()),
+		Verdict: certify.Warn,
+		Notes: fmt.Sprintf("the DUT was provoked into writing rather than commanded to, and the register "+
+			"diverged was LEARNED from the DUT's own write in the simulator's transaction ledger rather "+
+			"than guessed — so the provocation reached the cell the product owns instead of a legacy "+
+			"mirror the sim re-derives each tick, which is why every previous campaign's divergence "+
+			"lever produced nothing. %s. %s", run.summary(), o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
-			claim := fmt.Sprintf("the DUT wrote an adjustable point using Modbus function code 0x%02x", fc)
+			claim := "the DUT wrote an adjustable point using Modbus function code 0x10"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre, writeSkips(fc, prov)...)), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalWrites(c, fc, prov)...)
-			fs = append(fs, writeSkips(fc, prov)...)
+			fs = append(fs, evalWR2Write(c, run, d))
+			fs = append(fs, evalWR2Reassert(run, d))
+			fs = append(fs, evalWR2ReadBack(run, d))
+			fs = append(fs, wr2Skips()...)
 			return emit(ev, c, fs), nil
 		},
 	}, nil
 }
 
-// evalWrites asserts on whatever writes the provocation produced. If the DUT
-// did write, the framing of those writes is fully assertable — which is the
-// half of WR-1/WR-2 the wire genuinely owns.
-func evalWrites(c *Conversation, fc uint8, prov *writeProvocation) []finding {
-	claim := fmt.Sprintf("the DUT wrote an adjustable point using Modbus function code 0x%02x (%s)",
-		fc, FunctionName(fc))
-	method := "function code, address, quantity, byte count and values of every write request in the " +
-		"reassembled DUT→server direction"
-
-	var mine []Exchange
-	var others int
-	for _, ex := range c.Writes() {
-		if ex.Request.FC == fc {
-			mine = append(mine, ex)
-		} else {
-			others++
+// writeCovering returns the first write on the page covering addr.
+func writeCovering(p LedgerPage, addr uint16) *LedgerEntry {
+	for _, w := range p.Writes() {
+		if w.Covers(addr) {
+			return &w
 		}
 	}
-	if len(mine) == 0 {
-		note := ""
-		if others > 0 {
-			note = fmt.Sprintf(" The DUT DID issue %d write(s) with the other function code in this "+
-				"window, so it writes — just not with this one; see the sibling row", others)
-		}
-		return []finding{skipf(claim, method,
-			"no FC 0x%02x request was observed. %s.%s", fc, prov.reason(), note)}
-	}
-
-	var out []finding
-	ex := mine[0]
-	// Framing of the write itself.
-	switch fc {
-	case FCWriteSingleRegister:
-		addr, val, ok := ex.Request.WriteSingle()
-		if !ok {
-			out = append(out, bytesf(claim, method, certify.Fail, fromDUT, ex.Request.Start, ex.Request.End,
-				"an FC 0x06 request was malformed: its payload is %d byte(s), not the 4 the function "+
-					"code requires. Request cited in full: [%s]", len(ex.Request.Payload), ex.Request.Hex()))
-		} else {
-			out = append(out, bytesf(claim, method, certify.Pass, fromDUT, ex.Request.Start, ex.Request.End,
-				"%d FC 0x06 request(s); the first wrote value %d (0x%04x) to register %d (0x%04x). "+
-					"Request cited in full: [%s]", len(mine), int16(val), val, addr, addr, ex.Request.Hex()))
-		}
-	case FCWriteMultipleRegisters:
-		addr, qty, bc, vals, ok := ex.Request.WriteMultipleRequest()
-		switch {
-		case !ok:
-			out = append(out, bytesf(claim, method, certify.Fail, fromDUT, ex.Request.Start, ex.Request.End,
-				"an FC 0x10 request was malformed: byte count %d does not match the %d payload byte(s) "+
-					"after it. Request cited in full: [%s]", bc, len(ex.Request.Payload)-5, ex.Request.Hex()))
-		case int(qty)*2 != int(bc):
-			out = append(out, bytesf(claim, method, certify.Fail, fromDUT, ex.Request.Start, ex.Request.End,
-				"an FC 0x10 request declared quantity %d but byte count %d — a register quantity and a "+
-					"byte count that disagree. Request cited in full: [%s]", qty, bc, ex.Request.Hex()))
-		case qty > MaxWriteQuantity:
-			out = append(out, bytesf(claim, method, certify.Fail, fromDUT, ex.Request.Start, ex.Request.End,
-				"an FC 0x10 request asked to write %d registers, over the %d-register maximum",
-				qty, MaxWriteQuantity))
-		default:
-			out = append(out, bytesf(claim, method, certify.Pass, fromDUT, ex.Request.Start, ex.Request.End,
-				"%d FC 0x10 request(s); the first wrote %d register(s) (byte count %d, matching the "+
-					"quantity) at %d (0x%04x), values %v. Request cited in full: [%s]",
-				len(mine), qty, bc, addr, addr, vals, ex.Request.Hex()))
-		}
-	}
-
-	// The server's acknowledgement — WR-1/WR-2's "server write operations SHALL
-	// be validated by the test engineer", as far as the wire carries it.
-	ackClaim := fmt.Sprintf("the server acknowledged the DUT's FC 0x%02x write", fc)
-	ackMethod := "the response matching the write request, by transaction id"
-	switch {
-	case ex.Response == nil:
-		out = append(out, skipf(ackClaim, ackMethod, "the write request was not answered within this "+
-			"test case's frames"))
-	case ex.Response.IsException():
-		code, _ := ex.Response.ExceptionCode()
-		out = append(out, bytesf(ackClaim, ackMethod, certify.Warn, fromServer,
-			ex.Response.Start, ex.Response.End,
-			"the server rejected the write with exception 0x%02x %s. That is the server's verdict on "+
-				"the write, not the client's conformance; it is reported here because a bundle that "+
-				"showed only the request would misrepresent the outcome", code, ExceptionName(code)))
-	default:
-		out = append(out, bytesf(ackClaim, ackMethod, certify.Pass, fromServer,
-			ex.Response.Start, ex.Response.End,
-			"the server echoed the write: %s. Response cited in full: [%s]",
-			ex.Response.String(), ex.Response.Hex()))
-	}
-	return out
+	return nil
 }
 
-// writeSkips records the parts of §2.6 that no provocation on this bench can
-// reach, each with its own reason.
-func writeSkips(fc uint8, prov *writeProvocation) []finding {
-	f := fmt.Sprintf("0x%02x", fc)
+// readCoveringAfter returns the first read on the page covering addr that
+// happened strictly after seq — the read-back, as distinct from whatever the
+// DUT read before it wrote.
+func readCoveringAfter(p LedgerPage, addr uint16, seq uint64) *LedgerEntry {
+	for _, r := range p.Reads() {
+		if r.Seq > seq && r.Covers(addr) {
+			return &r
+		}
+	}
+	return nil
+}
+
+// summary renders the run for the note.
+func (r *writeRun) summary() string {
+	switch {
+	case !r.HaveFirst && !r.NorthOn:
+		return fmt.Sprintf("the DUT issued no write, and the northbound lever was NOT used (-param %s=on)",
+			paramDERControl)
+	case !r.HaveFirst:
+		return "the DUT issued no write to learn a register from"
+	case !r.HaveReassert:
+		return fmt.Sprintf("the DUT wrote register %d, which was then diverged; no re-assert followed",
+			r.First.Addr)
+	default:
+		return fmt.Sprintf("the DUT wrote register %d, the register was diverged at epoch %d, and the "+
+			"DUT re-asserted it", r.First.Addr, r.DivergeEpoch)
+	}
+}
+
+// evalWR2Write asserts the framing of the DUT's own FC 0x10 write — the half of
+// §2.6.2 the wire genuinely owns.
+func evalWR2Write(c *Conversation, r *writeRun, d *determinism) finding {
+	claim := "the DUT wrote an adjustable point using Modbus function code 0x10 (Write Multiple " +
+		"Registers), with a quantity and byte count that agree"
+	method := "the function code, address, quantity, byte count and values of the DUT's own write " +
+		"request, taken from the simulator's transaction ledger and cited into the capture where this " +
+		"test case owns the frame"
+	if !r.HaveFirst {
+		return skipf(claim, method, "%s", r.noWriteReason())
+	}
+	w := r.First
+	vals, decoded := w.WriteValues()
+	switch {
+	case !decoded:
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"the DUT issued an FC 0x10 request the independent decoder could not parse: its byte count "+
+				"does not match the payload that follows it. Transaction: %s (request bytes: %s)",
+			w, w.Request)
+	case int(w.Count) != len(vals):
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"the DUT's FC 0x10 request declared quantity %d but carried %d register value(s) — a "+
+				"quantity and a byte count that disagree. Transaction: %s", w.Count, len(vals), w)
+	case w.Count > MaxWriteQuantity:
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"the DUT asked to write %d registers, over the %d-register maximum for FC 0x10. "+
+				"Transaction: %s", w.Count, MaxWriteQuantity, w)
+	}
+	// Prefer a byte citation into the capture.
+	if c != nil {
+		for _, ex := range c.Writes() {
+			if ex.Request.FC != FCWriteMultipleRegisters {
+				continue
+			}
+			addr, qty, bc, cvals, ok := ex.Request.WriteMultipleRequest()
+			if !ok || addr != w.Addr {
+				continue
+			}
+			return bytesf(claim, method, certify.Pass, fromDUT, ex.Request.Start, ex.Request.End,
+				"the DUT wrote %d register(s) (byte count %d, matching the quantity) at %d (0x%04x), "+
+					"values %v, and %s. The simulator's own ledger independently records the same "+
+					"transaction as %s. Request cited in full: [%s]",
+				qty, bc, addr, addr, cvals, ackNote(ex), w, ex.Request.Hex())
+		}
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"the DUT wrote %d register(s) at %d, values %v, and the server resolved the transaction as %q. "+
+			"Transaction: %s. No frame carrying it was attributed to this test case, so this rests on "+
+			"the simulator's record rather than on a citation into the capture",
+		w.Count, w.Addr, vals, w.Outcome, w)
+}
+
+// ackNote renders the server's verdict on a write, which §2.6.2 wants reported
+// even though it is the server's answer and not the client's conformance.
+func ackNote(ex Exchange) string {
+	switch {
+	case ex.Response == nil:
+		return "the server did not answer it within this test case's frames"
+	case ex.Response.IsException():
+		code, _ := ex.Response.ExceptionCode()
+		return fmt.Sprintf("the server REFUSED it with exception 0x%02x %s", code, ExceptionName(code))
+	default:
+		return "the server echoed it: " + ex.Response.String()
+	}
+}
+
+// evalWR2Reassert is the divergence half: the register the DUT owns was moved,
+// and the DUT put it back.
+func evalWR2Reassert(r *writeRun, d *determinism) finding {
+	claim := "the server's write operation was validated: a control register the DUT had written was " +
+		"moved out from under it and the DUT re-asserted the value"
+	method := "move the EXACT register the DUT was observed writing (learned from the simulator's " +
+		"ledger, not from any model definition directory), then wait on the ledger for a write covering " +
+		"that address"
+	switch {
+	case !r.HaveFirst:
+		return skipf(claim, method, "no write was observed to learn a register from, so nothing could "+
+			"be diverged. %s", r.noWriteReason())
+	case r.DivergeErr != nil:
+		return skipf(claim, method, "register %d could not be moved on the server: %v",
+			r.DivergeAddr, r.DivergeErr)
+	case !r.HaveReassert:
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"register %d — the exact cell the DUT wrote at ledger seq %d — was moved by %d raw units at "+
+				"epoch %d, and the DUT issued no write covering it within the barrier's budget (%s). "+
+				"Either its reconciler holds no standing setpoint for this axis, or it verifies by "+
+				"trusting its own last write rather than by reading back. Distinguishing the two needs "+
+				"a standing northbound command: this run %s",
+			r.DivergeAddr, r.First.Seq, divergeDelta, r.DivergeEpoch, r.ReassertPage.Summary(),
+			r.northboundState())
+	}
+	vals, _ := r.Reassert.WriteValues()
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"register %d — the exact cell the DUT wrote at ledger seq %d — was moved by %d raw units at "+
+			"epoch %d, and the DUT re-asserted it: %s, values %v. The device changed its mind and the "+
+			"client corrected it, which is the only direction from which this bench can validate a "+
+			"server write operation",
+		r.DivergeAddr, r.First.Seq, divergeDelta, r.DivergeEpoch, r.Reassert, vals)
+}
+
+// evalWR2ReadBack is §2.6's "server write operations SHALL be validated" as the
+// wire carries it: the DUT's own later read of the block it wrote.
+func evalWR2ReadBack(r *writeRun, d *determinism) finding {
+	claim := "the value the DUT wrote was present in the server's register image when the DUT read the " +
+		"block back"
+	method := "the DUT's own next read covering the written address, from the simulator's ledger, " +
+		"decoded against the values its write carried"
+	if !r.HaveReassert {
+		return skipf(claim, method, "no re-assert was observed, so there is no written value to read back")
+	}
+	if !r.HaveReadBack {
+		return skipf(claim, method,
+			"the DUT wrote register %d at ledger seq %d and did not read that block again within the "+
+				"barrier's budget. lexa-gw verifies its model 704 writes on a LATER poll rather than "+
+				"in-band (cmd/modbus/reconcile_solar.go's applied-ceiling read), so this is a matter of "+
+				"the window rather than of the client skipping verification",
+			r.DivergeAddr, r.Reassert.Seq)
+	}
+	wrote, okW := r.Reassert.WriteValues()
+	read, okR := r.ReadBack.Values()
+	if !okW || !okR {
+		return skipf(claim, method, "the write or the read-back could not be decoded independently "+
+			"(write %s; read %s)", r.Reassert, r.ReadBack)
+	}
+	widx := int(r.DivergeAddr) - int(r.Reassert.Addr)
+	ridx := int(r.DivergeAddr) - int(r.ReadBack.Addr)
+	if widx < 0 || widx >= len(wrote) || ridx < 0 || ridx >= len(read) {
+		return skipf(claim, method, "register %d falls outside the decoded extent of the write (%d, %d "+
+			"value(s)) or of the read-back (%d, %d value(s))", r.DivergeAddr,
+			r.Reassert.Addr, len(wrote), r.ReadBack.Addr, len(read))
+	}
+	if wrote[widx] != read[ridx] {
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"the DUT wrote 0x%04x to register %d and its own next read of that block returned 0x%04x. "+
+				"The write was acknowledged and did not take", wrote[widx], r.DivergeAddr, read[ridx])
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"the DUT wrote 0x%04x to register %d (ledger seq %d) and its own next read of that block "+
+			"(seq %d) returned 0x%04x — the value it wrote, in the server's image, read back over the "+
+			"wire by the client itself",
+		wrote[widx], r.DivergeAddr, r.Reassert.Seq, r.ReadBack.Seq, read[ridx])
+}
+
+// noWriteReason explains an absent write.
+func (r *writeRun) noWriteReason() string {
+	switch {
+	case r.NorthErr != nil:
+		return fmt.Sprintf("no write was observed, and the northbound DERControl that would have given "+
+			"the DUT's reconciler something to enforce could not be posted: %v", r.NorthErr)
+	case !r.NorthOn:
+		return fmt.Sprintf("no write was observed, and the northbound lever was NOT used: the DUT emits "+
+			"a southbound write only when a northbound command gives its reconciler something to "+
+			"enforce, and posting one reaches outside this suite's surface, so it is opt-in. Re-run "+
+			"with -param %s=on", paramDERControl)
+	default:
+		return fmt.Sprintf("a bounded northbound DERControl was posted (%s) and the DUT still issued no "+
+			"register write within the barrier's budget: %s", r.Northbound, r.FirstPage.Summary())
+	}
+}
+
+// northboundState renders whether the opt-in lever was used, for a SKIP text.
+func (r *writeRun) northboundState() string {
+	switch {
+	case r.Northbound != "":
+		return "posted one (" + r.Northbound + ")"
+	case r.NorthErr != nil:
+		return fmt.Sprintf("could not post one (%v)", r.NorthErr)
+	default:
+		return fmt.Sprintf("did not (-param %s=on enables it)", paramDERControl)
+	}
+}
+
+// wr2Skips records the parts of §2.6.2 no provocation on this bench can reach,
+// each with its own reason.
+func wr2Skips() []finding {
 	return []finding{
 		skipf(
 			"every implemented adjustable point was written to its minimum, maximum and three "+
-				"intermediate values using FC "+f,
+				"intermediate values using FC 0x10",
 			"a five-value sweep per adjustable point, driven from the server's PICS",
 			"the procedure assumes an operator console the test engineer can hand five values per point "+
 				"to. The DUT has no such interface: its southbound writes are emitted by reconcilers "+
-				"acting on a northbound command, so the value written is a function of the command, not "+
+				"acting on a northbound command, so the VALUE written is a function of the command, not "+
 				"of anything this suite can dictate, and only the points its reconcilers drive are "+
-				"reachable at all. Promoting this row to full requires either a diagnostic write verb on "+
-				"the DUT's Modbus client, or a driver that sweeps five northbound setpoints per "+
-				"reconciled axis and correlates each with the resulting register write — the latter is "+
-				"buildable on this bench (it is what -param %s=on begins) but it is a campaign, not a "+
-				"single test case", paramDERControl),
+				"reachable at all. What IS now demonstrated is that the client can write a point with "+
+				"FC 0x10 and re-assert it against a diverging device — the mechanism the sweep would "+
+				"repeat. Promoting the row to full needs either a diagnostic write verb on the DUT's "+
+				"Modbus client, or a driver that sweeps five northbound setpoints per reconciled axis "+
+				"and correlates each with the resulting register write. The latter is buildable on this "+
+				"bench now — the ledger already correlates a northbound command with the exact register "+
+				"the DUT writes — but it is a campaign, not a single test case"),
 		skipf(
-			"every supported value of each adjustable enumerated point was written using FC "+f,
+			"every supported value of each adjustable enumerated point was written using FC 0x10",
 			"a per-enumerated-value sweep, driven from the server's PICS",
 			"same constraint as the five-value sweep: the DUT chooses the enumerated values it writes "+
-				"from the northbound command it is enforcing. %s", prov.reason()),
+				"from the northbound command it is enforcing"),
 		skipf(
-			"the write sweep was repeated with unit id 0, the broadcast address, using FC "+f,
+			"the write sweep was repeated with unit id 0, the broadcast address, using FC 0x10",
 			"repeat §2.6 step 3 over an RTU server interface with unit id 0",
 			"§2.6 step 3 is explicitly conditional on the CUT supporting RTU SERVER interfaces, and unit "+
 				"id 0 is the RTU broadcast address — it has no meaning over Modbus/TCP, where every "+
@@ -358,7 +572,8 @@ func writeSkips(fc uint8, prov *writeProvocation) []finding {
 			"the DUT logged every write operation, with the log data represented as hex strings",
 			"inspection of the client's own log output",
 			"the same client-side-log criterion as READ-1/READ-2: the DUT journals reconciler decisions, "+
-				"not per-write hex. Where a write DID occur, this bundle quotes the request ADU verbatim "+
-				"in hex — but that is the bench's rendering of the bytes, not the DUT's log"),
+				"not per-write hex. Where a write DID occur this bundle quotes the request ADU verbatim "+
+				"in hex — but that is the bench's rendering of the bytes, not the DUT's log. This is a "+
+				"DUT diagnostic gap, not a bench gap: no sim work promotes it"),
 	}
 }

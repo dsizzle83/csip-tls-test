@@ -54,15 +54,90 @@ func TestSentinelInjector_StringType(t *testing.T) {
 }
 
 // TestSentinelInjector_UnknownType errors and leaves the register untouched.
+//
+// The type named here is not a SunSpec datatype at all. Every datatype the
+// Information Model defines IS now seedable (LAB29-010 widened the table from
+// the eight the verb originally shipped with to the whole set), so a test that
+// pinned "this real type is out of scope" would now be pinning the gap rather
+// than the refusal.
 func TestSentinelInjector_UnknownType(t *testing.T) {
 	r := &RegisterMap{regs: make(map[uint16]uint16)}
 	r.Set(40300, 42)
 	si := NewSentinelInjector(r)
-	if err := si.Seed(40300, "float64", 0); err == nil {
-		t.Fatal("an unscoped type (float64 was not in verb 6's scope) must error")
+	if err := si.Seed(40300, "decimal128", 0); err == nil {
+		t.Fatal("a type that is not in the SunSpec Information Model must error")
 	}
 	if got := r.Get(40300); got != 42 {
 		t.Fatalf("register 40300 = %d after a rejected Seed, want the untouched 42", got)
+	}
+}
+
+// TestSentinelInjector_EveryDatatype seeds one point of EVERY datatype the
+// table knows and reads each back, which is the capability §2.7.2 INFO-2 step
+// 2 turns on: "for all the data types present in the PICS models, update
+// Server 1 to configure at least one of these points to the unimplemented
+// value". Before LAB29-010 only eight of the twenty-two were expressible, and
+// INFO-2 could demonstrate exactly one.
+func TestSentinelInjector_EveryDatatype(t *testing.T) {
+	types := SentinelTypes()
+	if len(types) < 20 {
+		t.Fatalf("SentinelTypes returned %d datatypes (%v) — the Information Model's list is longer, "+
+			"and INFO-2 needs every one of them", len(types), types)
+	}
+	// Every datatype the catalog's own precondition list for CLI-1 enumerates
+	// must be seedable, quoted here so a future narrowing of the table fails
+	// this test rather than quietly re-opening INFO-2's gap.
+	want := []string{
+		"int16", "uint16", "count", "acc16", "enum16", "bitfield16", "pad",
+		"int32", "uint32", "acc32", "enum32", "bitfield32", "ipaddr",
+		"int64", "uint64", "acc64", "ipv6addr", "float32", "float64",
+		"string", "sunssf", "eui48",
+	}
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	si := NewSentinelInjector(r)
+	addr := uint16(41000)
+	for _, typ := range want {
+		words, ok := SentinelWordsFor(typ, 0)
+		if !ok {
+			t.Fatalf("datatype %q has no not-implemented sentinel; INFO-2 cannot seed it", typ)
+		}
+		// Pre-fill with a value no sentinel uses, so "the seed landed" cannot
+		// be confused with "the register was already zero".
+		for i := range words {
+			r.Set(addr+uint16(i), 0x1234)
+		}
+		if err := si.Seed(addr, typ, 0); err != nil {
+			t.Fatalf("Seed(%q): %v", typ, err)
+		}
+		for i, w := range words {
+			if got := r.Get(addr + uint16(i)); got != w {
+				t.Errorf("%s: register %d = %#04x, want %#04x", typ, addr+uint16(i), got, w)
+			}
+		}
+		addr += uint16(len(words)) + 1
+	}
+	si.Clear()
+	for a := uint16(41000); a < addr; a++ {
+		if got := r.Get(a); got != 0x1234 && got != 0 {
+			t.Errorf("register %d = %#04x after Clear, want the pre-seed 0x1234", a, got)
+		}
+	}
+}
+
+// TestSentinelWordsFor_VariableWidth pins the two datatypes whose width their
+// point's declaration fixes rather than their type.
+func TestSentinelWordsFor_VariableWidth(t *testing.T) {
+	if w, _ := SentinelWordsFor("string", 0); len(w) != 1 {
+		t.Errorf("string with no declared length = %d register(s), want 1 (a leading NUL)", len(w))
+	}
+	if w, _ := SentinelWordsFor("string", 8); len(w) != 8 {
+		t.Errorf("string len=8 = %d register(s), want 8", len(w))
+	}
+	if w, _ := SentinelWordsFor("ipv6addr", 0); len(w) != 8 {
+		t.Errorf("ipv6addr = %d register(s), want 8 (128 bits)", len(w))
+	}
+	if _, ok := SentinelWordsFor("nope", 0); ok {
+		t.Error("an unknown datatype must not resolve to a sentinel")
 	}
 }
 

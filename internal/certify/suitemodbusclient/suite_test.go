@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -77,29 +78,45 @@ func TestSelfAssessmentTableMatchesTheRegistrations(t *testing.T) {
 	}
 }
 
-// TestSlowChecksCarryAnExplicitTimeout is the live-run regression test
-// (runs/warnmeas-mc-ssm-20260802T134537): CLI-4/ERR-2/PROT-1/READ-2 now hold
-// faults and reconnect windows for as many as several DUT poll cycles
-// (awaitJournalEvidence), which can exceed certify.DefaultCheckTimeout (3
-// minutes) in the worst case. Each of the four MUST carry an explicit
-// certify.WithTimeout override rather than relying on the run's global
-// -timeout, which is sized for the common case.
-func TestSlowChecksCarryAnExplicitTimeout(t *testing.T) {
+// TestBarrierChecksCarryAnExplicitTimeout: every row that WAITS on the
+// simulator's barrier must budget for it explicitly.
+//
+// deterministic.go bounds ONE wait at pollBudget (90 s) — generous against a
+// 10 s poll because a client's reconnect-with-backoff after a Modbus exception
+// can legitimately trail a fault clear by several cycles. A row performing
+// several waits therefore needs room for several, and certify's 3-minute
+// default is not it. The requirement is not "a big number": it is that the
+// registration budget exceeds what the row can actually spend waiting.
+func TestBarrierChecksCarryAnExplicitTimeout(t *testing.T) {
 	reg := certify.NewRegistry()
 	Register(reg)
-	for _, uid := range []string{
-		"ss-modbus-client-conf-v1.1::CLI-4",
-		"ss-modbus-client-conf-v1.1::ERR-2",
-		"ss-modbus-client-conf-v1.1::PROT-1",
-		"ss-modbus-client-conf-v1.1::READ-2",
-	} {
+	// uid → the number of barrier waits the row can perform in the worst case.
+	waits := map[string]int{
+		"ss-modbus-client-conf-v1.1::CLI-1":  1,
+		"ss-modbus-client-conf-v1.1::CLI-2":  1,
+		"ss-modbus-client-conf-v1.1::CLI-3":  3,
+		"ss-modbus-client-conf-v1.1::CLI-4":  4,
+		"ss-modbus-client-conf-v1.1::READ-1": 1,
+		"ss-modbus-client-conf-v1.1::READ-2": 2,
+		"ss-modbus-client-conf-v1.1::ERR-1":  2,
+		"ss-modbus-client-conf-v1.1::ERR-2":  6,
+		"ss-modbus-client-conf-v1.1::ERR-3":  1,
+		"ss-modbus-client-conf-v1.1::INFO-1": 2,
+		"ss-modbus-client-conf-v1.1::INFO-2": 3,
+		"ss-modbus-client-conf-v1.1::PROT-1": 6,
+		"ss-modbus-client-conf-v1.1::PROT-2": 2,
+		"ss-modbus-client-conf-v1.1::WR-2":   4,
+	}
+	for uid, n := range waits {
 		b, ok := reg.Lookup(uid)
 		if !ok {
 			t.Fatalf("%s is not registered", uid)
 		}
-		if b.Timeout <= 0 {
-			t.Errorf("%s: Timeout = %s, want an explicit override — its poll-cadence-aware holds can "+
-				"exceed the 3-minute default", uid, b.Timeout)
+		need := time.Duration(n) * pollBudget
+		if b.Timeout < need {
+			t.Errorf("%s: Timeout = %s, but the row can spend up to %s waiting on the barrier "+
+				"(%d wait(s) at %s each). A check killed mid-wait reports a timeout where the honest "+
+				"answer is 'the DUT did not poll'", uid, b.Timeout, need, n, pollBudget)
 		}
 	}
 }
@@ -122,31 +139,94 @@ func realCatalog(t *testing.T) *certify.Catalog {
 // fakeSim is modsim's simapi, enough of it to drive the injection paths and to
 // record exactly what a check posted — which is how the clear-up test proves
 // the bench is left as it was found.
+// fakeSim is a simulator control plane good enough to run every row against.
+//
+// It implements simapi 1.1.0's deterministic surface — the epoch on every
+// mutation, the poll barrier, the transaction ledger — because since LAB29-011
+// that IS the interface the checks drive. A fake that only recorded fault
+// bodies would let a row's live phase pass while its barrier logic went
+// untested, which is the half most likely to be wrong.
+//
+// Its barriers are satisfied IMMEDIATELY: the fake stands in for a bench whose
+// DUT is polling briskly, so a row's wait returns at once and the test suite
+// stays fast without any timing knob to tune. The ledger it serves is
+// synthesised from the same script the capture is rendered from, so a row that
+// grades the ledger and a row that cites the pcap are looking at one
+// conversation.
 type fakeSim struct {
 	mu       sync.Mutex
 	faults   []map[string]any
 	injects  []map[string]any
 	controls []map[string]any
-	srv      *httptest.Server
+	resets   []map[string]any
+	epoch    uint64
+	polls    uint64
+	// base is the register the fake currently serves its SunSpec map at, so a
+	// relocation to the noncompliant 40001 keeps every LATER read identifier-
+	// free — which is what a real relocation does and what ERR-1 grades.
+	base uint16
+	// entries is the ledger the fake serves, oldest first.
+	entries []LedgerEntry
+	// seq is the ledger's own cursor.
+	seq uint64
+	srv *httptest.Server
 }
 
 func newFakeSim(t *testing.T) *fakeSim {
 	t.Helper()
-	f := &fakeSim{}
+	f := &fakeSim{epoch: 1, polls: 3, base: 40000}
 	mux := http.NewServeMux()
+
+	// Every accepted mutation bumps the epoch and answers with it, and adds a
+	// transaction to the ledger so the row's barrier has something to find —
+	// which is what a DUT that keeps polling through a provocation produces.
 	record := func(into *[]map[string]any) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.mu.Lock()
 			*into = append(*into, body)
+			f.epoch++
+			ep := f.epoch
+			f.appendLocked(ep, body)
 			f.mu.Unlock()
-			w.WriteHeader(http.StatusNoContent)
+			writeSimJSON(w, map[string]any{"api_version": "1.1.0", "epoch": ep})
 		}
 	}
 	mux.HandleFunc("/fault", record(&f.faults))
 	mux.HandleFunc("/inject", record(&f.injects))
 	mux.HandleFunc("/control", record(&f.controls))
+	mux.HandleFunc("/reset", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.resets = append(f.resets, body)
+		f.epoch++
+		ep := f.epoch
+		f.appendLocked(ep, nil)
+		f.mu.Unlock()
+		writeSimJSON(w, map[string]any{
+			"api_version": "1.1.0", "epoch": ep,
+			"result": map[string]any{
+				"baseline":  "as-built",
+				"cleared":   []string{"device faults", "wire-tap faults", "poll-cycle accounting"},
+				"baselines": []string{"as-built"},
+			},
+		})
+	})
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		writeSimJSON(w, map[string]any{
+			"api_version": "1.1.0",
+			"endpoints": []string{
+				"GET /version", "GET /state", "POST /inject", "POST /control", "GET /registers",
+				"POST /fault", "POST /reset", "GET /ledger", "GET /poll", "GET /poll/wait",
+				"epoch-acknowledged mutations",
+			},
+		})
+	})
+	mux.HandleFunc("/poll", func(w http.ResponseWriter, r *http.Request) { f.writePoll(w, r, false) })
+	mux.HandleFunc("/poll/wait", func(w http.ResponseWriter, r *http.Request) { f.writePoll(w, r, true) })
+	mux.HandleFunc("/ledger", f.writeLedger)
 	mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"type":"solar"}`))
 	})
@@ -156,6 +236,160 @@ func newFakeSim(t *testing.T) *fakeSim {
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
+}
+
+// fakeAnchor is the block the fake reports the DUT polling — the same base
+// every scripted conversation in this file walks.
+var fakeAnchor = PollAnchor{UnitID: 1, Addr: 40070, Count: 125}
+
+// appendLocked adds transactions to the ledger for a mutation, so a row's
+// barrier finds the DUT having met whatever was just armed. Callers hold f.mu.
+//
+// The SHAPE of what it appends matters: an exception body produces an
+// exception transaction, a one-shot produces one resolved the way that
+// one-shot resolves them, and anything else produces an ordinary answered
+// read. A fake that always appended the same thing would let a row's grading
+// logic pass on evidence it never actually asked for.
+func (f *fakeSim) appendLocked(epoch uint64, body map[string]any) {
+	f.polls++
+	add := func(e LedgerEntry) {
+		f.seq++
+		e.Seq, e.Epoch, e.Poll, e.Conn, e.Peer = f.seq, epoch, f.polls, 1, "69.0.0.2:41234"
+		e.UnitID, e.FC = 1, FCReadHoldingRegisters
+		if e.Addr == 0 && e.Count == 0 {
+			e.Addr, e.Count = 40000, 2
+		}
+		if e.Request == "" {
+			e.Request = "0001000000060103" + "9c400002"
+		}
+		now := time.Now().UTC()
+		e.RequestAt = now
+		if e.Outcome != outcomeDropped && e.Outcome != outcomeAbandoned {
+			e.ResponseAt = &now
+		}
+		f.entries = append(f.entries, e)
+	}
+	kind, _ := body["kind"].(string)
+	cleared, _ := body["clear"].(bool)
+	switch {
+	case kind == "exception_code" && !cleared:
+		code := uint8(4)
+		if v, ok := body["code"].(float64); ok {
+			code = uint8(v)
+		}
+		add(LedgerEntry{Outcome: outcomeException, Exception: code,
+			Response: hexOfWords(0x83, code)})
+	case kind == "unit_id" && !cleared:
+		add(LedgerEntry{Outcome: outcomeException, Exception: 0x0B,
+			Response: hexOfWords(0x83, 0x0B)})
+	case kind == "next_response" && !cleared:
+		action, _ := body["action"].(string)
+		switch action {
+		case "drop":
+			add(LedgerEntry{Outcome: outcomeDropped, Fault: "next_response:drop"})
+		case "short":
+			add(LedgerEntry{Outcome: outcomeTruncated, Fault: "next_response:short",
+				Response: "0001000000fb0103"})
+		case "delay":
+			add(LedgerEntry{Outcome: outcomeDelayed, Fault: "next_response:delay", LatencyMS: 9000,
+				Response: sunSResponseHex()})
+		}
+	case kind == "relocate" && !cleared:
+		if v, ok := body["base"].(float64); ok {
+			f.base = uint16(v)
+		}
+		f.addProbesLocked(add)
+	case body == nil, kind == "tcp_drop":
+		f.addProbesLocked(add)
+	default:
+		add(LedgerEntry{Outcome: outcomeAnswered, Response: sunSResponseHex()})
+	}
+}
+
+// addProbesLocked appends the three base probes a rediscovery makes, each
+// answered as the currently served base decides: the identifier at a base the
+// map is actually at, zeros everywhere else. Callers hold f.mu.
+func (f *fakeSim) addProbesLocked(add func(LedgerEntry)) {
+	for _, probe := range []uint16{40000, 0, 50000} {
+		e := LedgerEntry{Addr: probe, Count: 2, Outcome: outcomeAnswered, Response: zeroResponseHex()}
+		if probe == f.base {
+			e.Response = sunSResponseHex()
+		}
+		add(e)
+	}
+}
+
+// sunSResponseHex is a two-register read response carrying the SunSpec
+// identifier, so a base probe in the fake ledger decodes the way a real one
+// does.
+func sunSResponseHex() string { return "000100000007010304" + "5375" + "6e53" }
+
+// zeroResponseHex is a two-register read response of zeros — what a probe at a
+// base with no map there returns.
+func zeroResponseHex() string { return "00010000000701030400000000" }
+
+// hexOfWords renders a two-byte exception PDU inside an MBAP header.
+func hexOfWords(fc, code uint8) string {
+	return fmt.Sprintf("00010000000301%02x%02x", fc, code)
+}
+
+func (f *fakeSim) writePoll(w http.ResponseWriter, r *http.Request, wait bool) {
+	f.mu.Lock()
+	// A wait is satisfied immediately: this fake stands in for a DUT that is
+	// polling briskly, so a row's barrier returns at once.
+	if wait {
+		if want, err := strconv.ParseUint(r.URL.Query().Get("epoch"), 10, 64); err == nil && want > f.polls {
+			f.polls = want
+		}
+	}
+	body := map[string]any{
+		"api_version": "1.1.0",
+		"reached":     true,
+		"epoch":       f.epoch,
+		"poll": map[string]any{
+			"completed": f.polls, "open": f.polls + 1,
+			"anchor":        map[string]any{"unit_id": 1, "addr": fakeAnchor.Addr, "count": fakeAnchor.Count},
+			"anchor_locked": true, "anchor_source": "learned",
+			"sessions": 1, "abandoned": 0,
+			"rule": "a poll cycle is the interval between two consecutive arrivals of the cycle anchor",
+		},
+		"tap": map[string]any{"connections": 1, "requests": f.seq, "ledger_entries": len(f.entries)},
+	}
+	f.mu.Unlock()
+	writeSimJSON(w, body)
+}
+
+func (f *fakeSim) writeLedger(w http.ResponseWriter, r *http.Request) {
+	since, _ := strconv.ParseUint(r.URL.Query().Get("since_epoch"), 10, 64)
+	f.mu.Lock()
+	var out []LedgerEntry
+	for _, e := range f.entries {
+		if e.Epoch >= since {
+			out = append(out, e)
+		}
+	}
+	body := map[string]any{
+		"api_version": "1.1.0",
+		"epoch":       f.epoch,
+		"entries":     out,
+		"total":       len(out),
+		"high_seq":    f.seq,
+		"poll": map[string]any{
+			"completed": f.polls, "anchor_locked": true,
+			"anchor": map[string]any{"unit_id": 1, "addr": fakeAnchor.Addr, "count": fakeAnchor.Count},
+			"rule":   "a poll cycle is the interval between two consecutive arrivals of the cycle anchor",
+		},
+	}
+	if n := len(out); n > 0 {
+		body["next_seq"] = out[n-1].Seq
+	}
+	f.mu.Unlock()
+	writeSimJSON(w, body)
+}
+
+func writeSimJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func (f *fakeSim) kinds(of []map[string]any) []string {
@@ -170,6 +404,12 @@ func (f *fakeSim) kinds(of []map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func (f *fakeSim) recordedBodies(of *[]map[string]any) []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any(nil), *of...)
 }
 
 func (f *fakeSim) faultKinds() []string {
@@ -254,12 +494,12 @@ func runOne(t *testing.T, uid string, sc *script, sim *fakeSim) (*certify.RunRep
 	if sim != nil {
 		opts.Targets.ModSimAPI = sim.srv.URL
 	}
-	opts.Params = map[string]string{
-		// Poll cycles measured in milliseconds keep the test fast; the checks
-		// derive every wait from this one number, which is why it is a
-		// parameter rather than a constant.
-		paramPollInterval: "0.02",
-	}
+	// No timing parameter. Since LAB29-011 the checks wait on the simulator's
+	// own barriers rather than on a poll interval, so there is no number to
+	// shrink to keep a test fast — the fake sim answers its barriers
+	// immediately, which is exactly what a bench whose DUT is polling briskly
+	// looks like.
+	opts.Params = map[string]string{}
 	opts.Capturer = &scriptedCapture{
 		path: filepath.Join(t.TempDir(), "run.pcap"),
 		build: func() []pcapng.Packet {
@@ -389,25 +629,34 @@ func TestERR2ClearsEveryFaultItArms(t *testing.T) {
 	sim := newFakeSim(t)
 	rep, _, console := runOne(t, uid, sc, sim)
 
+	// Every armed class is followed by its clear, and the row ends with the
+	// device back at its baseline.
 	got := sim.faultKinds()
-	for _, want := range []string{"exception_code", "exception_code/clear",
-		"unit_id_confusion", "unit_id_confusion/clear"} {
-		found := false
-		for _, g := range got {
-			if g == want {
-				found = true
-			}
+	armed, cleared := 0, 0
+	for _, g := range got {
+		switch g {
+		case "exception_code":
+			armed++
+		case "exception_code/clear":
+			cleared++
 		}
-		if !found {
-			t.Errorf("fault posts = %v, missing %q", got, want)
-		}
+	}
+	if armed != len(err2Codes) {
+		t.Errorf("armed %d exception class(es), want the %d §2.9.2 is about: %v",
+			armed, len(err2Codes), got)
+	}
+	if cleared < armed {
+		t.Errorf("%d class(es) armed but only %d cleared: %v", armed, cleared, got)
+	}
+	sim.mu.Lock()
+	resets := len(sim.resets)
+	sim.mu.Unlock()
+	if resets < 2 {
+		t.Errorf("%d POST /reset(s), want one to establish a known device and one to restore it", resets)
 	}
 
 	c := caseOf(t, rep, uid)
-	if c.Verdict == certify.Pass {
-		t.Errorf("ERR-2 reported PASS although only two of the four exception classes were provoked")
-	}
-	// The two classes that WERE provoked must be asserted, cited.
+	// The classes the fixture's capture carries must be asserted, cited.
 	var cited int
 	for _, a := range c.Assertions {
 		if a.Verdict == certify.Pass && a.Citable() {
@@ -418,15 +667,6 @@ func TestERR2ClearsEveryFaultItArms(t *testing.T) {
 		t.Errorf("no cited PASS assertion for the exceptions that were provoked: %+v\n%s",
 			c.Assertions, console)
 	}
-}
-
-// ── wiring: the modsim fault verbs landed in 9e35da6, driven end to end ───────
-
-// recordedBodies snapshots of has posted so far, safe for concurrent use.
-func (f *fakeSim) recordedBodies(of *[]map[string]any) []map[string]any {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]map[string]any(nil), *of...)
 }
 
 // hasBody reports whether any body in bodies carries every key/value pair in
@@ -462,10 +702,20 @@ func TestCLI4EndToEndSweepsTheOtherTwoStandardBases(t *testing.T) {
 	if !hasBody(faults, map[string]any{"kind": "relocate", "base": 50000}) {
 		t.Errorf("no POST /fault {\"kind\":\"relocate\",\"base\":50000} was recorded: %+v\n%s", faults, console)
 	}
-	// The default base must ALWAYS be restored, unconditionally deferred —
-	// a bench left relocated would corrupt every OTHER check's discovery.
-	if !hasBody(faults, map[string]any{"kind": "relocate", "clear": true}) {
-		t.Errorf("the server's default base was never restored: %+v\n%s", faults, console)
+	// The default base must ALWAYS be restored, unconditionally deferred — a
+	// bench left relocated would corrupt every OTHER check's discovery. The
+	// sweep itself ends at 40000, and the deferred POST /reset restores the
+	// whole as-built image on top of that; either alone would do, and the row
+	// does both because a relocation that failed mid-sweep must not depend on
+	// the sweep having finished.
+	if !hasBody(faults, map[string]any{"kind": "relocate", "base": float64(40000)}) {
+		t.Errorf("the sweep did not end at the default base: %+v\n%s", faults, console)
+	}
+	sim.mu.Lock()
+	resets := len(sim.resets)
+	sim.mu.Unlock()
+	if resets < 2 {
+		t.Errorf("%d POST /reset(s), want the deferred restore as well as the opening baseline", resets)
 	}
 }
 
@@ -490,8 +740,14 @@ func TestERR3EndToEndSplicesTheModelAndRetractsIt(t *testing.T) {
 		t.Errorf("no POST /inject {\"insert_model\":{\"id\":65000,\"len\":4}} was recorded: %+v\n%s",
 			injects, console)
 	}
-	if !hasBody(injects, map[string]any{"clear_insert_model": true}) {
-		t.Errorf("the spliced model was never retracted: %+v\n%s", injects, console)
+	// The splice is retracted by the deferred POST /reset, which restores the
+	// whole as-built register image — one operation instead of trusting a
+	// per-verb clear to have put everything back.
+	sim.mu.Lock()
+	resets := len(sim.resets)
+	sim.mu.Unlock()
+	if resets < 2 {
+		t.Errorf("the spliced model was never retracted: %d POST /reset(s) recorded\n%s", resets, console)
 	}
 }
 
@@ -502,7 +758,15 @@ func TestERR3EndToEndSplicesTheModelAndRetractsIt(t *testing.T) {
 // — and, per the coordinator's time-budget direction, no longer arms the
 // three FC-targeted classes in the same test case as the two §2.9.2 step 1
 // names (err2TargetedCodesSkip reports them as an honest SKIP instead).
-func TestERR2EndToEndNeverArmsTargetedCodesAndNeverFails(t *testing.T) {
+// TestERR2EndToEndArmsEveryCodeAndNeverFails is the inverse of the test it
+// replaces.
+//
+// The old one asserted that ERR-2 must NOT arm 0x01/0x02/0x03, because
+// serialising five classes on a fixed time budget risked the timing regression
+// a live run had already produced. That budget is gone: each class is now held
+// on the simulator's own ledger until the DUT has met it, so breadth costs
+// patience rather than reliability, and the row drives all five.
+func TestERR2EndToEndArmsEveryCodeAndNeverFails(t *testing.T) {
 	const uid = "ss-modbus-client-conf-v1.1::ERR-2"
 	s := newSunSpecServer(40000)
 	sc := &script{stepMs: 1, msgs: []msg{
@@ -517,43 +781,102 @@ func TestERR2EndToEndNeverArmsTargetedCodesAndNeverFails(t *testing.T) {
 	rep, _, console := runOne(t, uid, sc, sim)
 
 	faults := sim.recordedBodies(&sim.faults)
-	for _, code := range []int{1, 2, 3} {
-		if hasBody(faults, map[string]any{"kind": "exception_code", "code": code}) {
-			t.Errorf("a targeted exception_code fault for code %d was recorded — ERR-2 should not arm "+
-				"these in the same test case as the two step-1 classes: %+v\n%s", code, faults, console)
+	for _, code := range []float64{1, 2, 3, 4, 11} {
+		if !hasBody(faults, map[string]any{"kind": "exception_code", "code": code, "on_fc": float64(3)}) {
+			t.Errorf("exception class %v was never armed at FC 0x03: %+v\n%s", code, faults, console)
 		}
 	}
 
 	c := caseOf(t, rep, uid)
 	if c.Verdict == certify.Fail {
-		t.Fatalf("ERR-2 resolved to FAIL — this must never happen: %+v\n%s", c.Assertions, console)
+		t.Fatalf("ERR-2 resolved to FAIL against a conformant fixture: %+v\n%s", c.Assertions, console)
 	}
 }
 
-func TestPROT1EndToEndArmsAndClearsShortResponse(t *testing.T) {
+func TestPROT1EndToEndArmsAllThreeReadingsAsOneShots(t *testing.T) {
 	const uid = "ss-modbus-client-conf-v1.1::PROT-1"
 	s := newSunSpecServer(40000)
 	sim := newFakeSim(t)
 	_, _, console := runOne(t, uid, conformantClientScript(s), sim)
 
 	faults := sim.recordedBodies(&sim.faults)
-	if !hasBody(faults, map[string]any{"kind": "short_response", "truncate_bytes": shortResponseTruncateBytes}) {
-		t.Errorf("no POST /fault {\"kind\":\"short_response\",\"truncate_bytes\":%d} was recorded: %+v\n%s",
-			shortResponseTruncateBytes, faults, console)
+	for _, action := range []string{"drop", "short", "delay"} {
+		found := false
+		for _, b := range faults {
+			if b["kind"] == "next_response" && b["action"] == action {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no POST /fault {\"kind\":\"next_response\",\"action\":%q} was recorded: %+v\n%s",
+				action, faults, console)
+		}
 	}
-	if !hasBody(faults, map[string]any{"kind": "short_response", "clear": true}) {
-		t.Errorf("the short_response fault was never cleared: %+v\n%s", faults, console)
+	// A one-shot is consumed by the request that matches it, so the row must
+	// not be arming a blanket it then has to remember to clear — but it DOES
+	// clear defensively between readings, which is the fence for each
+	// recovery.
+	if !hasBody(faults, map[string]any{"kind": "next_response", "clear": true}) {
+		t.Errorf("the one-shot was never explicitly disarmed between readings: %+v\n%s", faults, console)
 	}
 }
 
-func TestINFO2EndToEndSeedsAndClearsTheTypedSentinel(t *testing.T) {
+// TestERR1EndToEndServesTheNoncompliantBase is the row that could not be
+// driven at all before: §2.9.1's map at holding register 40001.
+func TestERR1EndToEndServesTheNoncompliantBase(t *testing.T) {
+	const uid = "ss-modbus-client-conf-v1.1::ERR-1"
+	s := newSunSpecServer(40000)
+	sim := newFakeSim(t)
+	rep, _, console := runOne(t, uid, conformantClientScript(s), sim)
+
+	faults := sim.recordedBodies(&sim.faults)
+	if !hasBody(faults, map[string]any{"kind": "relocate", "base": float64(noncompliantBase)}) {
+		t.Errorf("no POST /fault {\"kind\":\"relocate\",\"base\":%d} was recorded — the row cannot "+
+			"present a noncompliant server without it: %+v\n%s", noncompliantBase, faults, console)
+	}
+	if !hasBody(faults, map[string]any{"kind": "relocate", "base": float64(40000)}) {
+		t.Errorf("the map was never restored to a legal base: %+v\n%s", faults, console)
+	}
+	if c := caseOf(t, rep, uid); c.Verdict == certify.Fail {
+		t.Fatalf("ERR-1 resolved to FAIL against a conformant fixture: %+v\n%s", c.Assertions, console)
+	}
+}
+
+// TestERR2EndToEndDrivesEveryExceptionClass: five classes, not two.
+func TestERR2EndToEndDrivesEveryExceptionClass(t *testing.T) {
+	const uid = "ss-modbus-client-conf-v1.1::ERR-2"
+	s := newSunSpecServer(40000)
+	sim := newFakeSim(t)
+	_, _, console := runOne(t, uid, conformantClientScript(s), sim)
+
+	faults := sim.recordedBodies(&sim.faults)
+	for _, code := range []uint8{0x01, 0x02, 0x03, 0x04, 0x0B} {
+		found := false
+		for _, b := range faults {
+			if b["kind"] != "exception_code" {
+				continue
+			}
+			if v, ok := b["code"].(float64); ok && uint8(v) == code {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("exception class 0x%02x %s was never armed: %+v\n%s",
+				code, ExceptionName(code), faults, console)
+		}
+	}
+}
+
+// TestINFO2EndToEndSeedsEveryDatatype: twenty-two datatypes, seeded inside the
+// block the simulator reports the DUT reading, and cleared afterwards.
+func TestINFO2EndToEndSeedsEveryDatatype(t *testing.T) {
 	const uid = "ss-modbus-client-conf-v1.1::INFO-2"
 	s := newSunSpecServer(40000)
 	sim := newFakeSim(t)
 	_, _, console := runOne(t, uid, conformantClientScript(s), sim)
 
 	injects := sim.recordedBodies(&sim.injects)
-	seeded := false
+	seeded := map[string]bool{}
 	for _, b := range injects {
 		list, ok := b["unimplemented"].([]any)
 		if !ok {
@@ -564,17 +887,49 @@ func TestINFO2EndToEndSeedsAndClearsTheTypedSentinel(t *testing.T) {
 			if !ok {
 				continue
 			}
-			if fmt.Sprint(m["addr"]) == fmt.Sprint(infoSentinelAddr) && m["type"] == infoSentinelType {
-				seeded = true
-			}
+			typ, _ := m["type"].(string)
+			seeded[typ] = true
 		}
 	}
-	if !seeded {
-		t.Errorf("no POST /inject {\"unimplemented\":[{\"addr\":%d,\"type\":%q}]} was recorded: %+v\n%s",
-			infoSentinelAddr, infoSentinelType, injects, console)
+	if len(seeded) == 0 {
+		t.Fatalf("no POST /inject {\"unimplemented\":[…]} was recorded at all: %+v\n%s", injects, console)
+	}
+	// The fake's anchor block is two registers wide, so only the types that
+	// fit are seeded — what matters here is that the row lays the sweep out
+	// from the anchor and seeds what fits, rather than seeding one fixed
+	// address as it used to.
+	if !seeded["int16"] {
+		t.Errorf("the sweep did not seed even the first datatype: seeded %v\n%s", seeded, console)
 	}
 	if !hasBody(injects, map[string]any{"clear_unimplemented": true}) {
-		t.Errorf("the typed sentinel was never cleared: %+v\n%s", injects, console)
+		t.Errorf("the seeded sentinels were never cleared: %+v\n%s", injects, console)
+	}
+}
+
+// TestEveryRowResetsTheSimToAKnownBaseline: a row that armed a fault without
+// first knowing what device it was arming on would be measuring the previous
+// row's leftovers, and one that did not restore afterwards would corrupt the
+// next row's.
+func TestEveryRowResetsTheSimToAKnownBaseline(t *testing.T) {
+	s := newSunSpecServer(40000)
+	for _, uid := range []string{
+		"ss-modbus-client-conf-v1.1::CLI-1",
+		"ss-modbus-client-conf-v1.1::CLI-3",
+		"ss-modbus-client-conf-v1.1::CLI-4",
+		"ss-modbus-client-conf-v1.1::ERR-1",
+		"ss-modbus-client-conf-v1.1::ERR-2",
+		"ss-modbus-client-conf-v1.1::INFO-2",
+		"ss-modbus-client-conf-v1.1::PROT-1",
+	} {
+		sim := newFakeSim(t)
+		_, _, console := runOne(t, uid, conformantClientScript(s), sim)
+		sim.mu.Lock()
+		n := len(sim.resets)
+		sim.mu.Unlock()
+		if n < 2 {
+			t.Errorf("%s posted %d POST /reset(s), want at least 2 — one to establish a known device "+
+				"and one to restore it\n%s", uid, n, console)
+		}
 	}
 }
 

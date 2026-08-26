@@ -52,127 +52,197 @@ type Row struct {
 }
 
 // Rows is the suite's self-assessment, in catalog order.
+//
+// It was rewritten for LAB29-011, and the shape of the rewrite is worth
+// stating: almost every "Gap" that used to read "the sim cannot do X" now
+// reads either "done" or "the DUT cannot be asked to do X from a read-only
+// run". The bench stopped being the limiting factor. What remains is three
+// kinds of thing, and they are not interchangeable:
+//
+//	a DUT OBSERVABILITY gap   the client does something the bench cannot see
+//	                          (it reads model 1's body only at boot; it maps
+//	                          Modbus exception codes to opaque transport
+//	                          errors and journals no per-code event)
+//	a DUT CONTROL gap         the client cannot be reconfigured from inside a
+//	                          conformance run, because it reads its config once
+//	                          at start and this harness's gateway client is
+//	                          read-only by construction
+//	a PROCEDURE gap           the row asks for something an autonomous gateway
+//	                          has no analogue of (a five-value operator sweep,
+//	                          an RTU broadcast)
 var Rows = []Row{
 	{ID: "CLI-1", UID: "ss-modbus-client-conf-v1.1::CLI-1", Depth: DepthPartial,
-		Demonstrated: "discovery against a server at a named IPv4 address: identifier probe, full model-chain walk, complete Common Model read, MBAP framing",
-		Gap:          "a SECOND server at a DIFFERENT IPv4 address — both of the DUT's southbound servers are on the capture host's single address",
-		Capability:   "a second modsim instance on a second address plus a matching device entry in the DUT's /etc/lexa/modbus.json, prepared before the run"},
+		Demonstrated: "discovery against a server at a named IPv4 address — identifier probe, model-chain " +
+			"walk, MBAP framing — driven by a forced rediscovery at a named control-plane epoch and held " +
+			"on the simulator's own transaction ledger rather than on a poll interval, so the window " +
+			"contains the traffic the row cites by construction",
+		Gap: "the SECOND server at a DIFFERENT IPv4 address. The bench half is ready (modsim -bind " +
+			"presents the device at any address); the DUT half is not — it reads its southbound endpoint " +
+			"from /etc/lexa/modbus.json once at process start, has no SIGHUP handler, no config watch " +
+			"and no dev API, so changing it means an operator config write plus `systemctl restart " +
+			"lexa-modbus`, and this harness's gateway client is read-only by construction. Also " +
+			"unreachable: the Common Model's BODY, which the DUT reads only during boot admission",
+		Capability: "an operator procedure, not a bench capability: prepare the second address's modsim " +
+			"and the matching device entry before the run and record the two discoveries as two runs of " +
+			"this row correlated in the bundle's DUT metadata. (The config-write API additionally " +
+			"refuses once /etc/lexa/commissioned exists.)"},
 	{ID: "CLI-2", UID: "ss-modbus-client-conf-v1.1::CLI-2", Depth: DepthFull,
-		Demonstrated: "two servers on two distinct non-502 ports, full discovery on the plain one, connection-level evidence on the secure one",
-		Gap:          "the second server's model discovery is inside TLS and not decodable here",
-		Capability:   "none needed for the criterion; the second server's payload would need the DUT's client-side key log"},
+		Demonstrated: "two servers on two distinct non-502 ports, full discovery on the plain one held " +
+			"on the simulator's ledger, connection-level evidence on the secure one",
+		Gap:        "the second server's model discovery is inside TLS and not decodable here",
+		Capability: "none needed for the criterion; the second server's payload would need the DUT's client-side key log"},
 	{ID: "CLI-3", UID: "ss-modbus-client-conf-v1.1::CLI-3", Depth: DepthPartial,
-		Demonstrated: "every request carries the configured unit id, in 1..247, echoed by every response",
-		Gap:          "two servers with DIFFERENT unit ids — both configured devices declare unit id 1",
-		Capability:   "a second modsim started with a different unit id plus a matching DUT device entry"},
+		Demonstrated: "every request carries one unit id in 1..247, echoed by every response — asserted " +
+			"both from the capture and from the simulator's own ledger, which cannot miss a request that " +
+			"fell outside the window. AND the served device is now RE-ADDRESSED at runtime (modsim's " +
+			"unit_id gate): with the device answering unit 247, the DUT's requests to its configured id " +
+			"come back 0x0B GATEWAY TARGET DEVICE FAILED TO RESPOND and the device never sees them, " +
+			"which shows the DUT genuinely uses the unit-id field; the DUT then recovers when the gate " +
+			"clears. Both are cited under SKIP as observations, because neither is the row's criterion",
+		Gap: "the criterion itself — the CUT DISCOVERING a server whose unit id differs — needs the DUT " +
+			"told the new id. devices[].unit_id is read once at process start and applied with a single " +
+			"SetUnitID at connect; there is no runtime path to change it, and this run must not restart " +
+			"the service",
+		Capability: "an operator procedure: prepare the second unit id in the DUT's config before the " +
+			"run and record the two discoveries as two correlated runs. The SIM capability this row used " +
+			"to need is closed"},
 	{ID: "CLI-4", UID: "ss-modbus-client-conf-v1.1::CLI-4", Depth: DepthPartial,
-		Demonstrated: "the DUT probes only legal base addresses and reads the map from the one that answers, " +
-			"at the default base 40000 and — modsim's relocate verb (sim/southbound/relocate.go) landed and " +
-			"is now driven at runtime, no launch flag needed — after the map is re-homed to base 0 and to " +
-			"base 50000 in turn, each with its own forced reconnect. A live-hardware run confirmed the " +
-			"DUT genuinely rediscovers the map at each relocated base (runs/warnmeas-mc-ssm-20260802T134537); " +
-			"each reconnect is now HELD until the DUT's own journal confirms a complete poll cycle " +
-			"(awaitJournalEvidence), not a fixed cycle count, since the DUT polls on its own independent " +
-			"~10s cadence",
-		Gap: "the SAME live run also showed the Common Model's full-body read specifically (as opposed to " +
-			"the header-only chain walk) can still miss a fixed-length window even when the base-relocation " +
-			"itself succeeds — the hold above is this row's fix for that; full confidence still wants " +
-			"another live run's bundle to confirm the body-coverage assertion PASSes at every base, not " +
-			"just the base-probe one",
-		Capability: "none further on the sim side; promoting to full needs a real-bench run whose bundle " +
-			"shows all three bases' discovery AND full Common Model body coverage complete"},
+		Demonstrated: "discovery at all three canonical starting registers — 0, 40000 and 50000 — each " +
+			"leg relocating the map, severing the connection at a named epoch, and grading THAT LEG'S " +
+			"OWN ledger page. The previous version had to match a reconnect back to a base by hunting " +
+			"for a probe at that address among several attributed conversations, which breaks the moment " +
+			"one leg fails; fencing on the epoch cannot",
+		Gap: "the 'contents of all the Common Model points' criterion. The DUT reads model 1's BODY " +
+			"exactly once, during boot admission on a separate short-lived connection; its steady-state " +
+			"poll and its post-reconnect rediscovery walk the chain's headers and then read only the " +
+			"measurement model",
+		Capability: "a DUT re-identify diagnostic a read-only client can trigger, or a capture that " +
+			"begins before the DUT's own boot. This is a DUT observability gap, not a sim verb"},
 	{ID: "CLI-5", UID: "ss-modbus-client-conf-v1.1::CLI-5", Depth: DepthNotApplicable,
 		Demonstrated: "nothing; the row is the optional Modbus RTU baud-rate sweep",
 		Gap:          "there is no RS-485 SunSpec server on the bench and no serial line to capture",
 		Capability:   "an RS-485 SunSpec server on the DUT's /dev/lexa/rs485-1 and a line analyser — evidence that would not live in a pcap at all"},
 	{ID: "READ-1", UID: "ss-modbus-client-conf-v1.1::READ-1", Depth: DepthObservationOnly,
-		Demonstrated: "the DUT's actual read granularity, cited under SKIP",
-		Gap:          "one FC 0x03 request per point — the DUT reads whole model blocks and exposes no way to request a single point",
-		Capability:   "a diagnostic point-read mode on the DUT's Modbus client. This is a device capability gap, not a bench gap: no sim work promotes it"},
+		Demonstrated: "the DUT's actual read granularity, cited under SKIP, observed over one COMPLETE " +
+			"poll cycle held on the simulator's poll barrier — so the pattern graded is a whole cycle's " +
+			"rather than whatever a fixed sleep happened to catch",
+		Gap:        "one FC 0x03 request per point — the DUT reads whole model blocks and exposes no way to request a single point",
+		Capability: "a diagnostic point-read mode on the DUT's Modbus client. This is a device capability gap, not a bench gap: no sim work promotes it"},
 	{ID: "READ-2", UID: "ss-modbus-client-conf-v1.1::READ-2", Depth: DepthFull,
-		Demonstrated: "the 125-register ceiling on every read, the Common Model body in one request, and a " +
-			">125-register model read in maximal chunks — graded against the DUT's FIRST complete sweep " +
-			"of a long model's body (firstSweep) since a window spanning more than one of the DUT's own " +
-			"~10s poll cycles legitimately observes the same maximal-chunk pattern several times over " +
-			"(a live-hardware finding, runs/warnmeas-mc-ssm-20260802T134537)",
+		Demonstrated: "the 125-register ceiling on every read, the Common Model body in one request " +
+			"where the window contains one, and a >125-register model read in maximal chunks — graded " +
+			"over a forced rediscovery followed by one COMPLETE poll cycle, both held on the simulator. " +
+			"The bundle records what a cycle IS (the barrier's own rule) beside the number",
 		Gap:        "the client-side 'log every point as hex strings' criterion",
 		Capability: "a diagnostic dump mode on the DUT; the bytes themselves are already in the bundle"},
-	{ID: "WR-1", UID: "ss-modbus-client-conf-v1.1::WR-1", Depth: DepthObservationOnly,
-		Demonstrated: "the framing of any FC 0x06 write the provocation elicits — function code, address, value, and the server's echo",
-		Gap:          "the five-values-per-point sweep, the enumerated-value sweep, and the RTU broadcast step",
-		Capability:   "a driver that sweeps northbound setpoints per reconciled axis and correlates each with the resulting register write (-param modbus-client.dercontrol=on is its first step); the broadcast step is RTU-only and out of scope for a TCP DUT"},
-	{ID: "WR-2", UID: "ss-modbus-client-conf-v1.1::WR-2", Depth: DepthObservationOnly,
-		Demonstrated: "the framing of any FC 0x10 write the provocation elicits — quantity, byte count, values, and the server's acknowledgement",
-		Gap:          "as WR-1",
-		Capability:   "as WR-1"},
+	{ID: "WR-1", UID: "ss-modbus-client-conf-v1.1::WR-1", Depth: DepthNotApplicable,
+		Demonstrated: "the judgement itself, with the procedure text quoted and the counter-argument " +
+			"stated: §2.6.1's subject is 'all implemented adjustable points … using Modbus Function Code " +
+			"0x06', and this client has no FC 0x06 write path at all — every register write it can emit " +
+			"leaves as FC 0x10, hardcoded in the Modbus client it is built on, even for a single " +
+			"register. The row's subject is the empty set",
+		Gap: "§2.6.1 carries no explicit 'if the CUT supports FC 0x06' clause where its own step 3 does " +
+			"carry one for RTU, so a lab could read it as unconditional and call this a product gap. The " +
+			"counter-argument recorded in the assertion: §2.6.2 states FC 0x10 is a complete per-point " +
+			"alternative, so WR-2 covers every adjustable point this client can write",
+		Capability: "a PICS question for the certifying lab. NOT a bench capability, and deliberately " +
+			"not closed by adding an FC 0x06 write path to the product to green a row"},
+	{ID: "WR-2", UID: "ss-modbus-client-conf-v1.1::WR-2", Depth: DepthPartial,
+		Demonstrated: "an FC 0x10 write by the DUT with quantity and byte count agreeing, the server's " +
+			"acknowledgement, AND — the part every previous campaign missed — a divergence-and-reassert " +
+			"round trip plus a read-back. The register diverged is LEARNED from the DUT's own write in " +
+			"the simulator's ledger rather than guessed, which is why it now reaches the cell the " +
+			"product owns (model 704) instead of the legacy model 123 mirror the sim re-derives on its " +
+			"next animation tick — the reason both write rows SKIPped for want of a write in every " +
+			"campaign to date",
+		Gap: "the five-value and per-enumerated-value sweeps. The DUT has no operator console: the VALUE " +
+			"it writes is a function of the northbound command it is enforcing. A write only happens at " +
+			"all when -param modbus-client.dercontrol=on gives its reconciler a standing setpoint",
+		Capability: "a driver that sweeps five northbound setpoints per reconciled axis and correlates " +
+			"each with the resulting register write. That is now BUILDABLE on this bench — the ledger " +
+			"already correlates a northbound command with the exact register the DUT writes — but it is " +
+			"a campaign, not a single test case. The alternative is a diagnostic write verb on the DUT"},
 	{ID: "INFO-1", UID: "ss-modbus-client-conf-v1.1::INFO-1", Depth: DepthPartial,
-		Demonstrated: "model-block read coverage including the scale-factor registers, and that the value the DUT reports is the value its raw reads decode to under the scale-factor convention (with the server's animation frozen so both refer to one instant)",
-		Gap:          "the per-datatype rendering criteria (a)–(i), which exist only in the client's own log",
-		Capability:   "a point-browser diagnostic on the DUT, and a server whose models span every datatype in §2.3's list — nine of them do not occur in this server's models at all"},
+		Demonstrated: "model-block read coverage including the scale-factor registers, and that the " +
+			"value the DUT reports is the value its raw reads decode to under the scale-factor " +
+			"convention (with the server's animation frozen so both refer to one instant) — over a " +
+			"forced rediscovery and one COMPLETE poll cycle, both held on the simulator",
+		Gap: "the per-datatype rendering criteria (a)-(i), which exist only in the client's own log",
+		Capability: "a point-browser diagnostic on the DUT. The 'a server whose models span every " +
+			"datatype' half of this gap is CLOSED — see INFO-2"},
 	{ID: "INFO-2", UID: "ss-modbus-client-conf-v1.1::INFO-2", Depth: DepthPartial,
-		Demonstrated: "the server serving the int16 not-implemented sentinel for every register and whether " +
-			"the DUT reported it as a measurement; and — modsim's per-point sentinel verb " +
-			"(sim/southbound/sentinel.go) landed — the Common Model's DA field separately seeded with its " +
-			"own uint16 not-implemented sentinel and confirmed read back over the wire",
-		Gap: "every OTHER datatype present in the server's models: this suite deliberately holds no model " +
-			"definition directory (see sunspec.go's doc comment — ERR-3 would be testing the DUT's table " +
-			"against itself if it had one), so only one datatype (uint16, via DA) is demonstrated this way",
-		Capability: "a model definition directory this suite can safely consult for INJECTION addressing " +
-			"without compromising ERR-3's independence, so every other present datatype can be seeded and " +
-			"confirmed the same way the per-point verb now demonstrates for one"},
+		Demonstrated: "the whole-bank int16 sentinel, AND — the row's real criterion on the server side " +
+			"— one point of EVERY SunSpec datatype seeded with its own not-implemented value and read " +
+			"back by the DUT over the wire. Twenty-two datatypes, up from one. They are seeded INSIDE " +
+			"the block the simulator observed the DUT reading every cycle, so the DUT is certain to read " +
+			"them, and the address comes from the client's own traffic rather than from a model " +
+			"definition directory this suite deliberately does not hold",
+		Gap: "the client's RENDERING of an unimplemented point, which is not a wire fact. Also inherent: " +
+			"acc16/acc32/acc64, ipaddr and string all have ZERO as their not-implemented value, which is " +
+			"also an ordinary reading — that ambiguity is the Information Model's, not this bench's",
+		Capability: "a point-availability signal or point browser on the DUT. The sim-side gap this row " +
+			"carried — 'a model definition directory so every other datatype can be seeded' — is closed, " +
+			"and closed WITHOUT one: the anchor the simulator learns from the DUT's own polling is the " +
+			"block to seed"},
 	{ID: "PROT-1", UID: "ss-modbus-client-conf-v1.1::PROT-1", Depth: DepthPartial,
-		Demonstrated: "three readings of the document's undefined 'partial response' — a severed " +
-			"transaction, an over-long response delay, and (modsim's protorelay verb, " +
-			"sim/southbound/protorelay.go, landed) a structurally truncated response — each now HELD until " +
-			"the DUT's own journal confirms a reaction (awaitJournalEvidence, not a fixed cycle count, " +
-			"per a live-hardware finding — runs/warnmeas-mc-ssm-20260802T134537 — that a bare 2-cycle hold " +
-			"routinely missed the DUT's ~10s poll), and the DUT's recovery held the same way afterward. " +
-			"Attribution also now accepts conversations that overlap in time, not just sequential ones: " +
-			"modsim's endpoint is dedicated and single-client regardless of how a reconnect's teardown/SYN " +
-			"race falls",
-		Gap: "the structurally truncated reading needs modsim STARTED with -protofault (it interposes a " +
-			"second relay); without that launch flag the sim refuses the fault by name and this row falls " +
-			"back to two readings",
-		Capability: "modsim -protofault at launch; the fault verb itself needs no further sim work"},
+		Demonstrated: "all three readings of §2.8.1's undefined 'partial response' — a response never " +
+			"sent, a structurally truncated one, and one too late to be an answer — each armed as a " +
+			"ONE-SHOT against the NEXT MATCHING REQUEST, so it lands inside a transaction this bundle " +
+			"can name. That is the fix for this row's standing failure: the provocation used to be a " +
+			"blanket that kept landing between requests. Each reading's recovery is held on the " +
+			"simulator's ledger, so the DUT's reconnect-with-backoff has as long as it needs",
+		Gap: "§2.8.1 steps 6-7's 'the CUT logs the Common Model read values as expected' — the DUT " +
+			"re-reads model 1's body only at boot admission",
+		Capability: "the same DUT re-identify diagnostic CLI-1..CLI-4 name. No sim work remains for this " +
+			"row: -protofault is no longer needed for it either, because the truncated reading is now a " +
+			"tap one-shot rather than a second relay's blanket"},
 	{ID: "PROT-2", UID: "ss-modbus-client-conf-v1.1::PROT-2", Depth: DepthPartial,
-		Demonstrated: "that the DUT frames its peer's stream by MBAP length with no leftover bytes, and neither retries nor resets; a genuinely segmented ADU is asserted when the capture contains one",
-		Gap:          "segmentation cannot be compelled — the sim writes each response once and every response is well under the path MTU",
-		Capability:   "POST /fault {\"kind\":\"segment_response\",\"split_after\":N}, or a path MTU small enough to force it"},
-	{ID: "ERR-1", UID: "ss-modbus-client-conf-v1.1::ERR-1", Depth: DepthObservationOnly,
-		Demonstrated: "that the DUT probes only legal base addresses and never 40001, cited under SKIP",
-		Gap:          "the noncompliant server itself — a SunSpec map at holding register 40001",
-		Capability:   "the same settable map base CLI-4 needs, plus a DUT device entry pointing at that instance"},
+		Demonstrated: "that the DUT frames its peer's stream by MBAP length with no leftover bytes, and " +
+			"neither retries nor resets, over a rediscovery burst held on the simulator's ledger; and — " +
+			"when modsim is started with -protofault — every response deliberately split across two " +
+			"socket writes, with the DUT's transactions under it completing normally",
+		Gap: "the deliberate segmentation needs modsim STARTED with -protofault (it interposes a second " +
+			"relay). Without that flag the sim refuses the fault by name and this row falls back to " +
+			"asserting framing over whatever the path happened to deliver",
+		Capability: "add -protofault to the bench's modsim invocation. The fault verb itself needs no " +
+			"further sim work"},
+	{ID: "ERR-1", UID: "ss-modbus-client-conf-v1.1::ERR-1", Depth: DepthFull,
+		Demonstrated: "the row, for the first time. The server's SunSpec map is re-homed to holding " +
+			"register 40001 — §2.9.1's deliberately noncompliant off-by-one base — the DUT's connection " +
+			"is severed so it re-probes, and the simulator's ledger shows it probing ONLY the legal " +
+			"bases, finding no identifier at any of them, and never hunting at the noncompliant offset. " +
+			"The map is then restored and the DUT's recovery is held on the ledger. The client-side " +
+			"'accurately log the noncompliant server' criterion is read from the DUT's journal as a " +
+			"Narrative, which is the most any client-log criterion can be",
+		Gap:        "",
+		Capability: ""},
 	{ID: "ERR-2", UID: "ss-modbus-client-conf-v1.1::ERR-2", Depth: DepthPartial,
-		Demonstrated: "the two exception classes §2.9.2 step 1 itself names — 0x04 SERVER DEVICE FAILURE " +
-			"and 0x0B GATEWAY TARGET DEVICE FAILED TO RESPOND — each HELD until the DUT's own journal " +
-			"confirms it reacted (awaitJournalEvidence, not a fixed cycle count) and observed on the wire, " +
-			"with recovery held the same way through the DUT's reconnect-with-backoff. This is a rework " +
-			"of an earlier version that armed FIVE classes on a fixed schedule: a live-hardware run " +
-			"(runs/warnmeas-mc-ssm-20260802T134537) showed the DUT's own independent ~10s poll cadence — " +
-			"it drops the session on a Modbus exception and reconnects 'on next poll' with backoff — meant " +
-			"a fixed arm/clear pace routinely finished before the DUT ever polled, and the recovery " +
-			"assertion FAILed outright when the window closed before the backoff completed. Reliability for " +
-			"the two REQUIRED classes plus recovery now takes priority over breadth",
-		Gap: "modsim's exception_target scoping (sim/southbound/exception_target.go) CAN target 0x01 " +
-			"ILLEGAL FUNCTION, 0x02 ILLEGAL DATA ADDRESS and 0x03 ILLEGAL DATA VALUE at FC 0x03 — the " +
-			"capability gap that used to block them is closed — but serializing three more held-and-" +
-			"confirmed classes into the same test case as the two REQUIRED ones risks the exact timing " +
-			"regression this rework fixes, for classes the procedure's own criteria do not require",
-		Capability: "either a materially longer per-check budget than CheckTimeout=6m already grants this " +
-			"row, or moving each additional class into its own dedicated test case so a slow DUT poll " +
-			"cannot cascade delay across unrelated classes"},
+		Demonstrated: "ALL FIVE exception classes — 0x01, 0x02, 0x03, 0x04 and 0x0B — each armed at a " +
+			"named epoch and held until the simulator's own ledger showed the DUT had met it, then " +
+			"cleared; plus a recovery held the same way. The previous version drove two classes on a " +
+			"time budget and reported the other three as a budget SKIP. The barrier used here is the " +
+			"LEDGER's, not the poll barrier's, and that is load-bearing: the DUT drops its southbound " +
+			"session on a Modbus exception and reconnects on the next poll, so under a persistent " +
+			"exception it completes no poll cycle at all — a row waiting for one would time out while " +
+			"its provocation landed perfectly on every session",
+		Gap: "'the Client SHALL accurately log all exception codes'. The DUT maps Modbus exception codes " +
+			"to opaque transport errors (the vendored client returns a string, and nothing in the " +
+			"product branches on the code) and journals no per-code event, so its log can say a device " +
+			"failed but not which exception it received. The assertion reports that distinction rather " +
+			"than accepting an error line as though it named a code",
+		Capability: "a DUT-side per-exception-code journal event. This is a product observability gap, " +
+			"not a bench gap — the wire half is fully driven"},
 	{ID: "ERR-3", UID: "ss-modbus-client-conf-v1.1::ERR-3", Depth: DepthPartial,
 		Demonstrated: "the behaviour the criterion turns on — the DUT steps over a model it does not " +
-			"consume using the length header and continues the chain walk — now demonstrated against a " +
-			"GENUINELY unregistered ID (modsim's insert_model verb, sim/southbound/modelsplice.go, splices " +
-			"one into the chain), plus the DUT's own admission journal read for the MUST that it not appear " +
-			"in the client's discovered-model list",
+			"consume using the length header and continues the chain walk — against a GENUINELY " +
+			"unregistered ID spliced into the chain, with the rediscovery held on the simulator's ledger",
 		Gap: "lexa-modbus admits a device — and journals its model inventory — once, at first " +
-			"identification; a tcp_drop reconnect resumes polling from the already-known block list without " +
-			"re-scanning or re-journaling, so the journal-based assertion SKIPs unless a fresh admission " +
-			"event happens to be journaled during this test case's window",
-		Capability: "a DUT re-identify diagnostic this suite can trigger without a full device restart, " +
-			"or the splice being in place before the device's very first admission"},
+			"identification; a reconnect resumes polling from the already-known block list without " +
+			"re-scanning or re-journaling, so the MUST that the unknown ID not appear in the discovered- " +
+			"model list SKIPs unless a fresh admission event happens to be journaled during the window",
+		Capability: "a DUT re-identify diagnostic this suite can trigger without a full service restart, " +
+			"or the splice being in place before the device's very first admission. The same DUT-side " +
+			"gap CLI-1..CLI-4 name for the Common Model body"},
 }
 
 // Counts summarises the self-assessment.

@@ -7,10 +7,12 @@ service binaries on the developer's own host, as the product's own uids, so a
 single conformance case takes tens of seconds instead of a rebuild/flash cycle.
 This script is the simulator half of that: gridsim, modsim and mbapsdev on
 loopback, in the **evidence-grade posture**, on a port block that does not
-collide with the bench.
+collide with the bench — plus the aggregator loop, a northbound mbaps CLIENT
+that drives the DUT's own `:802` the way a utility head-end would.
 
 ```sh
 scripts/lab/lab-sims-up.sh up
+#   aggregator -> mbaps://127.0.0.2:802   (role GridServiceSunSpec, every 20s)
 #   gridsim   https://127.0.0.20:21113   admin http://127.0.0.20:21114
 #   modsim    tcp://127.0.0.20:15020     api   http://127.0.0.20:16020
 #   mbapsdev  mbaps://127.0.0.20:18021   api   http://127.0.0.20:16031
@@ -50,7 +52,7 @@ of verdicts to SKIP or FAIL.
 | `DER_MODELS` | `full` | 707–710 trip models on top of the 7xx set; the reduced fixture was being measured as a product gap it never was |
 | `MBAPS_WMAX` | `2000` | LXR-013 reserves an uncontrollable device's full nameplate out of the site ceiling; a 6000 W second device alone exceeds the 5000 W default and zeroes every controllable device's budget |
 | `SIM_FLEET` | `2` | one configured DER — RC0's frozen single-DER scope and the audit's one-to-one topology |
-| aggregator | **off** | the lab's DUT is on the product's own `:802`, so the old wrong-port reason is gone — but the loop is a SECOND northbound controller writing the same DER a case is measuring, and every register observed under two writers is a fact about two writers. Its `GW_HOST` also defaults to the bench board |
+| aggregator | **on** (`AGG_ENABLED=1`) | mirrors the bench's northbound mbaps CLIENT loop (utility/VPP role `GridServiceSunSpec`) against the lab DUT's own `127.0.0.2:802`. This used to be off because the lab listener was thought to be on `8802` — it is not: the lab DUT binds `:802` exactly like the bench (see Addresses below). `AGG_ENABLED=0` turns it off; `AGG_ROLE`/`AGG_CAMPAIGN`/`AGG_PERIOD` are the bench's own knobs, unchanged |
 
 ## Addresses
 
@@ -60,6 +62,10 @@ comparing its source against the DUT's, and on 127.0.0.1-for-everything every
 frame looks like it came from the DUT. (Linux still sources *outbound* loopback
 connections from 127.0.0.1 regardless of destination, so the DUT-as-client legs
 remain undecidable in the lab — see `lexa-gw/docs/LAB_LOOP.md` §5.)
+
+The aggregator loop's target is the DUT address above, not the sim block:
+`GW_HOST:802` (default `127.0.0.2:802`) — the same `:802` the DUT's northbound
+mbaps server binds for everything else that talks to it.
 
 ## `reset`
 
@@ -71,4 +77,7 @@ certain of that is a fresh process, not an admin poke.
 
 By **pid file only**, never `pkill` by name: this host runs the same simulator
 binaries for the bench and for other agents' worktrees, and a name-matched kill
-in a shared environment eventually kills the wrong one.
+in a shared environment eventually kills the wrong one. The aggregator loop's
+own foreground child (one `bin/aggregator` run, or the sleep between attempts)
+is reaped the same way — by its exact pid (`pgrep -P` on the wrapper's own
+recorded pid), never by matching its name either.

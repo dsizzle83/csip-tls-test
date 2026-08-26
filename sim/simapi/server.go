@@ -4,19 +4,41 @@
 //
 // Endpoints:
 //
+//	GET  /version  — this API's version and the endpoints this sim implements
 //	GET  /state    — JSON snapshot of current simulator state (decoded values)
 //	POST /inject   — inject field overrides; body: {"W_W": 4500.0, ...}
 //	POST /control  — animation control; body: {"cmd":"pause"|"resume"|"reset", "speed":N}
 //	POST /fault    — arm/clear a fault injector; body: {"kind":"ack_before_effect","delay_s":30}
+//	POST /reset    — restore a named baseline register image; body: {"baseline":"as-built"}
 //	GET  /registers — raw Modbus register dump (Modbus sims only; 404 if unsupported)
+//	GET  /ledger   — the sim's own append-only Modbus transaction record
+//	                 (?min_entries=N&timeout=D blocks until N match)
+//	GET  /poll     — the client's poll-cycle accounting, as the sim counts it
+//	GET  /poll/wait — block until a given poll cycle has completed
 //	GET  /ws       — WebSocket: pushes /state JSON every 2 seconds
 //	GET  /logs     — SSE stream of the simulator's log lines (backlog replayed)
 //
 // All endpoints add Access-Control-Allow-Origin: * so a browser-based GUI
 // running on a desktop can talk to a Pi simulator without a proxy.
+//
+// # The epoch, and why the mutating endpoints answer with a body
+//
+// /inject, /control, /fault and /reset each acknowledge with
+// {"api_version":"…","epoch":N} when the sim has registered an epoch counter,
+// and with the historic 204 No Content when it has not. N is the sim's
+// CONTROL-PLANE STATE VERSION after the change: the fence a caller passes to
+// GET /ledger?since_epoch=N to select exactly the transactions its own
+// provocation could have touched. See sim/southbound/epoch.go for what does
+// and does not move it — deliberately, the free-running animation does not.
+//
+// The change is backward compatible by construction: a 200 with a JSON body is
+// as acceptable to every existing caller as the 204 was (the harness's
+// SimClient decodes into a nil destination and ignores it), and a sim that
+// registers no epoch counter is byte-identical to before.
 package simapi
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -68,6 +90,50 @@ type ControlCmd struct {
 // May be nil to disable POST /control.
 type ControlFunc func(cmd ControlCmd) error
 
+// ResetFunc restores a named baseline from the raw POST /reset body and
+// returns whatever the sim wants to report about what it did (the baseline
+// applied, the clear-up steps it ran). Registered via SetResetFn; nil (the
+// default) makes POST /reset return 501.
+type ResetFunc func(body []byte) (any, error)
+
+// LedgerFunc answers GET /ledger for a parsed query. When q.MinEntries > 0 it
+// must BLOCK until the query matches that many transactions or ctx is done,
+// and must never block on a timer of its own. Registered via SetLedgerFn; nil
+// makes the endpoint return 501.
+type LedgerFunc func(ctx context.Context, q LedgerQuery) (any, error)
+
+// LedgerQuery is GET /ledger's parsed query string.
+type LedgerQuery struct {
+	// SinceEpoch keeps transactions stamped at or after this control-plane
+	// epoch — the fence form, and the reason the mutating endpoints hand an
+	// epoch back.
+	SinceEpoch uint64
+	// SinceSeq keeps transactions after this ledger sequence number — the
+	// paging form.
+	SinceSeq uint64
+	// Limit caps the number of entries returned; 0 means no cap.
+	Limit int
+	// MinEntries, when > 0, turns the request into a bounded WAIT: answer once
+	// this many transactions match, or when the request's own timeout elapses.
+	// It exists because a provocation can be met without a poll cycle ever
+	// completing — a client that drops its session on a Modbus exception is met
+	// once per session and finishes no cycle — so "has the client issued a
+	// request under my fence" is a question the poll barrier cannot answer.
+	MinEntries int
+}
+
+// PollFunc answers GET /poll (want == 0, non-blocking) and GET /poll/wait
+// (want > 0, blocking until that many cycles have completed or ctx is done).
+// It must never block on a timer of its own. Registered via SetPollFn; nil
+// makes both endpoints return 501.
+type PollFunc func(ctx context.Context, want uint64) (any, error)
+
+// EpochFunc advances the sim's control-plane state version and returns the new
+// value. The server calls it exactly once after each ACCEPTED mutation, so one
+// bump corresponds to one request a caller issued. Registered via SetEpochFn;
+// nil (the default) keeps the historic 204 No Content acknowledgements.
+type EpochFunc func() uint64
+
 // FaultFunc arms or clears a fault injector from the raw POST /fault body.
 // Each sim parses the body (a sim.FaultSpec) and applies the kinds it
 // supports, returning an error (→ 400) for unsupported kinds or bad params.
@@ -82,9 +148,13 @@ type Server struct {
 	controlFn   ControlFunc
 	logBuf      *LogBuffer
 
-	mu      sync.Mutex
-	clients map[chan []byte]struct{}
-	faultFn FaultFunc // guarded by mu; set via SetFaultFn, may be nil
+	mu       sync.Mutex
+	clients  map[chan []byte]struct{}
+	faultFn  FaultFunc  // guarded by mu; set via SetFaultFn, may be nil
+	resetFn  ResetFunc  // guarded by mu; set via SetResetFn, may be nil
+	ledgerFn LedgerFunc // guarded by mu; set via SetLedgerFn, may be nil
+	pollFn   PollFunc   // guarded by mu; set via SetPollFn, may be nil
+	epochFn  EpochFunc  // guarded by mu; set via SetEpochFn, may be nil
 }
 
 var wsUpgrader = websocket.Upgrader{
@@ -104,7 +174,12 @@ func New(addr string, stateFn StateFunc, injectFn InjectFunc, registersFn Regist
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/version", s.handleVersion)
 	mux.HandleFunc("/state", s.handleState)
+	mux.HandleFunc("/reset", s.handleReset)
+	mux.HandleFunc("/ledger", s.handleLedger)
+	mux.HandleFunc("/poll", s.handlePoll)
+	mux.HandleFunc("/poll/wait", s.handlePollWait)
 	mux.HandleFunc("/inject", s.handleInject)
 	mux.HandleFunc("/control", s.handleControl)
 	mux.HandleFunc("/fault", s.handleFault)
@@ -113,7 +188,8 @@ func New(addr string, stateFn StateFunc, injectFn InjectFunc, registersFn Regist
 	mux.Handle("/logs", s.logBuf)
 
 	go func() {
-		log.Printf("[simapi] API server on %s  (GET /state  POST /inject  POST /control  GET /ws  GET /logs)", addr)
+		log.Printf("[simapi] API server v%s on %s  (GET /state  POST /inject  POST /control  POST /fault  "+
+			"POST /reset  GET /registers  GET /ledger  GET /poll[/wait]  GET /ws  GET /logs)", APIVersion, addr)
 		if err := http.ListenAndServe(addr, cors(mux)); err != nil {
 			log.Printf("[simapi] server error on %s: %v", addr, err)
 		}
@@ -127,6 +203,37 @@ func New(addr string, stateFn StateFunc, injectFn InjectFunc, registersFn Regist
 func (s *Server) SetFaultFn(fn FaultFunc) {
 	s.mu.Lock()
 	s.faultFn = fn
+	s.mu.Unlock()
+}
+
+// SetResetFn registers the baseline-restore handler wired to POST /reset.
+func (s *Server) SetResetFn(fn ResetFunc) {
+	s.mu.Lock()
+	s.resetFn = fn
+	s.mu.Unlock()
+}
+
+// SetLedgerFn registers the transaction-record handler wired to GET /ledger.
+func (s *Server) SetLedgerFn(fn LedgerFunc) {
+	s.mu.Lock()
+	s.ledgerFn = fn
+	s.mu.Unlock()
+}
+
+// SetPollFn registers the poll-accounting handler wired to GET /poll and
+// GET /poll/wait.
+func (s *Server) SetPollFn(fn PollFunc) {
+	s.mu.Lock()
+	s.pollFn = fn
+	s.mu.Unlock()
+}
+
+// SetEpochFn registers the control-plane epoch counter. Once registered, every
+// accepted mutation acknowledges with {"api_version":…,"epoch":N} instead of
+// 204 No Content.
+func (s *Server) SetEpochFn(fn EpochFunc) {
+	s.mu.Lock()
+	s.epochFn = fn
 	s.mu.Unlock()
 }
 
@@ -158,7 +265,7 @@ func (s *Server) handleInject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	s.ackMutation(w, nil)
 }
 
 func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
@@ -179,7 +286,7 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	s.ackMutation(w, nil)
 }
 
 func (s *Server) handleFault(w http.ResponseWriter, r *http.Request) {
@@ -203,7 +310,7 @@ func (s *Server) handleFault(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	s.ackMutation(w, nil)
 }
 
 func (s *Server) handleRegisters(w http.ResponseWriter, r *http.Request) {

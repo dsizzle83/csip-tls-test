@@ -37,13 +37,15 @@
 #                     the audit's one-to-one topology. mbapsdev still runs: the
 #                     DUT does not dial it in this profile, but certify's own
 #                     -mbapsdev rows do.
-#   no aggregator     the lab's DUT listens on the product's own :802 (the host
-#                     sysctl grants it; see lexa-gw scripts/lab/lib.sh), so the
-#                     old "wrong port" reason is gone — but the loop is still
-#                     NOT started here. It is a second northbound controller
-#                     writing the same DER a case is measuring, and every
-#                     register observed under two writers is a fact about two
-#                     writers. Its GW_HOST also defaults to the bench board.
+#   AGG_ENABLED=1     mirrors the bench's northbound mbaps CLIENT loop (the
+#                     utility/VPP role, GridServiceSunSpec) against the lab
+#                     DUT's own :802. THIS USED TO BE OFF because the lab
+#                     listener was thought to be on 8802 — it is not: the lab
+#                     DUT binds 127.0.0.2:802 exactly like the bench (the
+#                     host's ip_unprivileged_port_start sysctl is lowered to
+#                     802, and the candidate manifest fails closed on any
+#                     other port — lexa-gw/docs/LAB_LOOP.md §5).
+#                     AGG_ENABLED=0 turns it off.
 #
 # ── ADDRESSES ──────────────────────────────────────────────────────────────
 # sims 127.0.0.20, DUT 127.0.0.2, harness 127.0.0.1. Distinct addresses are not
@@ -63,6 +65,7 @@ cd "$HERE"
 
 LAB="${LAB:-$HOME/.lexa-lab}"
 SIM_ADDR="${LAB_SIM_ADDR:-127.0.0.20}"
+GW_HOST="${GW_HOST:-127.0.0.2}"
 LOG="${LAB_SIMS_LOG:-$LAB/log/sims}"
 
 # The lab port block. Deliberately disjoint from the bench's (5020/6020/8021/
@@ -93,6 +96,16 @@ MBAPS_WMAX="${MBAPS_WMAX:-2000}"
 MODSIM_SERIAL="${MODSIM_SERIAL:-LAB-MODSIM-01}"
 MBAPS_SERIAL="${MBAPS_SERIAL:-LAB-MBAPS-01}"
 
+# The aggregator loop: bench-sims-up.sh's WITH_AGG/AGG_ROLE/AGG_CAMPAIGN/
+# AGG_PERIOD, knob for knob (AGG_ENABLED is this script's name for bench's
+# WITH_AGG; everything downstream — role, campaign, period — is the bench's
+# own default, unchanged). A northbound mbaps CLIENT loop playing the
+# utility/VPP, driving the DUT's own :802 the way a real head-end would.
+AGG_ENABLED="${AGG_ENABLED:-1}"
+AGG_ROLE="${AGG_ROLE:-GridServiceSunSpec}"
+AGG_CAMPAIGN="${AGG_CAMPAIGN:-$HERE/qa/aggregator/curtail-solar-50.json}"
+AGG_PERIOD="${AGG_PERIOD:-20}"
+
 WOLFSSL_SYSROOT="${WOLFSSL_SYSROOT:-$HOME/.local/wolfssl-amd64}"
 WOLFSSL_KEYLOG_SYSROOT="${WOLFSSL_KEYLOG_SYSROOT:-$HOME/.local/wolfssl-amd64-keylog}"
 export CGO_CFLAGS="${CGO_CFLAGS:--I$WOLFSSL_SYSROOT/include}"
@@ -106,6 +119,7 @@ fail() { printf 'FATAL %s\n' "$*" >&2; exit 1; }
 
 build_sims() {
 	[ -x bin/modsim ] || { note "building bin/modsim"; go build -o bin/modsim ./sim/modsim; }
+	[ -x bin/aggregator ] || { note "building bin/aggregator"; go build -o bin/aggregator ./sim/aggregator; }
 	if [ -d "$WOLFSSL_KEYLOG_SYSROOT/include" ]; then
 		[ -x bin/server-keylog ] || { note "building bin/server-keylog"; make -s server-keylog; }
 		[ -x bin/mbapsdev-keylog ] || { note "building bin/mbapsdev-keylog"; make -s mbapsdev-keylog; }
@@ -154,6 +168,35 @@ start() { # name port cmd...
 	fi
 }
 
+# agg_up starts the aggregator loop: bin/aggregator, in an infinite retry loop
+# against ${GW_HOST}:802 — bench-sims-up.sh's own loop, unchanged (same
+# command, same tolerance of a DUT that is not up yet: a failed run just logs
+# and the loop retries after AGG_PERIOD seconds; no readiness wait is added
+# here any more than it is there). Not built on start(): that helper checks a
+# LOCAL port for a conflicting listener and expects one exec argv, neither of
+# which fits an outbound retry loop with no port of its own to bind.
+agg_up() {
+	if [ "$AGG_ENABLED" = 0 ]; then
+		note "= aggregator loop disabled (AGG_ENABLED=0)"
+		return 0
+	fi
+	local pf="$LOG/aggregator.pid"
+	if [ -f "$pf" ] && kill -0 "$(cat "$pf" 2>/dev/null || echo 0)" 2>/dev/null; then
+		note "= aggregator loop already running (pid $(cat "$pf"))"
+		return 0
+	fi
+	( trap 'exit 0' TERM INT
+		while :; do
+			echo "=== $(date -u +%FT%TZ) aggregator run vs ${GW_HOST}:802 (role $AGG_ROLE) ==="
+			./bin/aggregator -target "${GW_HOST}:802" -role "$AGG_ROLE" \
+				-campaign "$AGG_CAMPAIGN" -json -out "$LOG/agg" ||
+				echo "  (aggregator run rc=$? — gw not ready? retrying)"
+			sleep "$AGG_PERIOD"
+		done ) >>"$LOG/aggregator.log" 2>&1 &
+	echo $! >"$pf"
+	note "+ started aggregator loop  pid=$!  log=$LOG/aggregator.log  (-> ${GW_HOST}:802)"
+}
+
 sims_up() {
 	for f in "$M/ca-cert.pem" "$M/dev-ca.pem" "$M/dev-server-cert.pem" "$M/dev-server-key.pem"; do
 		[ -r "$f" ] || fail "missing $f — run 'make gen-mbaps-certs' ONCE (regenerating invalidates every gateway leaf already issued)"
@@ -181,6 +224,8 @@ sims_up() {
 	if [ "$SIM_FLEET" = 4 ]; then grid_args+=(-fleet 4 -subscription); fi
 	start gridsim "$GRIDSIM_PORT" "$GRIDSIM_BIN" "${grid_args[@]}"
 
+	agg_up
+
 	sims_status
 	cat <<EOS
 
@@ -192,13 +237,25 @@ EOS
 }
 
 sims_down() {
-	local name pf pid
+	local name pf pid cpid
 	echo "lab-sims: down"
-	for name in gridsim mbapsdev modsim; do
+	for name in aggregator gridsim mbapsdev modsim; do
 		pf="$LOG/$name.pid"
 		[ -f "$pf" ] || continue
 		pid="$(cat "$pf" 2>/dev/null || true)"
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			if [ "$name" = aggregator ]; then
+				# The wrapper's foreground child (one aggregator run, or the
+				# inter-attempt sleep) does not die with it: bash defers a
+				# trapped signal until the foreground command it is waiting on
+				# returns, so TERM to the wrapper alone can leave that child
+				# running for up to AGG_PERIOD more seconds. Reap it by its
+				# exact pid (pgrep -P, scoped to this one parent) — never by
+				# name; see the header note on why.
+				for cpid in $(pgrep -P "$pid" 2>/dev/null || true); do
+					kill "$cpid" 2>/dev/null || true
+				done
+			fi
 			kill "$pid" 2>/dev/null || true
 			for _ in $(seq 1 25); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
 			if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null || true; fi
@@ -211,10 +268,11 @@ sims_down() {
 sims_status() {
 	local name pf pid
 	printf '   %-10s %-8s %s\n' SIM PID ENDPOINT
-	for name in gridsim mbapsdev modsim; do
+	for name in aggregator gridsim mbapsdev modsim; do
 		pf="$LOG/$name.pid"; pid="-"
 		if [ -f "$pf" ] && kill -0 "$(cat "$pf" 2>/dev/null || echo 0)" 2>/dev/null; then pid="$(cat "$pf")"; fi
 		case "$name" in
+		aggregator) printf '   %-10s %-8s -> mbaps://%s:802   (role %s, every %ss)\n' "$name" "$pid" "$GW_HOST" "$AGG_ROLE" "$AGG_PERIOD" ;;
 		gridsim) printf '   %-10s %-8s https://%s:%s   admin http://%s:%s\n' "$name" "$pid" "$SIM_ADDR" "$GRIDSIM_PORT" "$SIM_ADDR" "$GRIDSIM_ADMIN" ;;
 		modsim) printf '   %-10s %-8s tcp://%s:%s   api http://%s:%s\n' "$name" "$pid" "$SIM_ADDR" "$MODSIM_PORT" "$SIM_ADDR" "$MODSIM_API" ;;
 		mbapsdev) printf '   %-10s %-8s mbaps://%s:%s   api http://%s:%s\n' "$name" "$pid" "$SIM_ADDR" "$MBAPS_PORT" "$SIM_ADDR" "$MBAPSDEV_API" ;;
@@ -227,6 +285,6 @@ up) sims_up ;;
 down) sims_down ;;
 status) sims_status ;;
 reset) sims_down; sims_up ;;
--h | --help) sed -n '2,55p' "${BASH_SOURCE[0]}" ;;
+-h | --help) sed -n '2,61p' "${BASH_SOURCE[0]}" ;;
 *) echo "usage: $0 [up|down|status|reset]" >&2; exit 2 ;;
 esac

@@ -157,71 +157,77 @@ func checkCLI1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
-	forced := o.forceReconnect(ctx)
-	// CLI-1#5 (census 20260731T234821): 2 cycles caught the header-only chain
-	// walk but not model 1's separate full-body read that follows it — see
-	// the extended-window note on checkCLI3/checkCLI4 for the same fix.
-	if err := o.watch(ctx, 3); err != nil {
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
+	}
+	if err := d.begin(ctx, nil); err != nil {
+		return certify.Result{}, err
+	}
+	defer d.restore(ctx)
+
+	// A severed connection is the only way this bench can make a client that
+	// has been connected for hours perform its discovery sequence again inside
+	// a test case's window — lexa-proto/sunspec/reader.go caches the block
+	// layout for the life of a session. The wait afterwards is held on the
+	// simulator's own record of the rediscovery, not on a poll interval.
+	disc, err := rediscover(ctx, d, "CLI-1")
+	if err != nil {
 		return certify.Result{}, err
 	}
 
-	// The bench's two southbound servers share one IPv4 address, so the
-	// procedure's "two servers at different IP addresses" cannot be provided
-	// without editing the DUT's configuration. The check runs anyway, because
-	// the half it CAN demonstrate — that the DUT connects to a server at a
-	// named IPv4 address and completes discovery there — is real evidence, and
-	// the missing half becomes an explicit SKIP rather than an absence.
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("discovery against server 1 at %s was observed; a SECOND server at a "+
-			"different IPv4 address could not be provided (see the assertion for why). %s",
-			o.server, o.injectionNote()),
+		Notes: fmt.Sprintf("discovery against server 1 at %s was observed after a forced rediscovery, "+
+			"held on the simulator's transaction ledger rather than on a poll interval; a SECOND server "+
+			"at a different IPv4 address needs a DUT configuration change this read-only run must not "+
+			"make (see the assertion). %s", o.server, o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT performed SunSpec discovery against a server at a given IPv4 address"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre, cli1SecondAddressSkip(o))), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
+				fs = append(fs, framesf(claim,
+					"destination IPv4 address of the DUT's southbound TCP connection, from the capture",
+					certify.Pass, aduFrames(c.Requests...),
+					"the DUT dialled %s from %s and exchanged %d Modbus message(s) there%s",
+					c.Server, c.Client, len(c.Requests)+len(c.Responses), disc.note()))
+				fs = append(fs, evalDiscovery(c)...)
+				fs = append(fs, evalFraming(c)...)
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, framesf(claim,
-				"destination IPv4 address of the DUT's southbound TCP connection, from the capture",
-				certify.Pass, aduFrames(c.Requests...),
-				"the DUT dialled %s from %s and exchanged %d Modbus message(s) there%s",
-				c.Server, c.Client, len(c.Requests)+len(c.Responses), reconnectNote(forced)))
-			fs = append(fs, evalDiscovery(c)...)
-			fs = append(fs, evalFraming(c)...)
-			fs = append(fs, cli1SecondAddressSkip(o))
+			fs = append(fs, evalRediscovery(disc, d))
+			fs = append(fs, commonModelBodyGap())
+			fs = append(fs, cli1SecondAddress(o))
 			return emit(ev, c, fs), nil
 		},
 	}, nil
 }
 
-// cli1SecondAddressSkip states, once, why the second server cannot be provided.
-func cli1SecondAddressSkip(o *observer) finding {
-	second := "the bench's second southbound server (the mbaps device sim)"
-	if o.hasSecure {
-		second = fmt.Sprintf("the bench's second southbound server, %s,", o.secure)
-	}
+// cli1SecondAddress states, once, exactly what a second server at a second
+// address would take.
+func cli1SecondAddress(o *observer) finding {
 	return skipf(
 		"the DUT performed SunSpec discovery against a second server at a DIFFERENT IPv4 address",
-		"comparison of the destination addresses of the DUT's southbound connections",
-		"%s shares the IPv4 address %s with server 1 — both sims run on the capture host. Providing a "+
-			"server at a second address means adding a device to the DUT's own southbound configuration, "+
-			"which this run must not do: the bench is shared, and a DUT whose configuration changed "+
-			"mid-run is not the DUT the rest of this bundle describes. Promoting this row to full "+
-			"requires a second modsim instance bound to a second address and a corresponding entry in "+
-			"the DUT's /etc/lexa/modbus.json, made once before the run and recorded in the bundle's DUT "+
-			"metadata", second, o.server.Addr())
-}
-
-func reconnectNote(err error) string {
-	if err == nil {
-		return " after its southbound connection was severed so that its reconnect would perform " +
-			"discovery inside this test case's window"
-	}
-	return fmt.Sprintf(" (no reconnect was forced — %v — so only the DUT's steady-state polling was "+
-		"observed; a client that connected before the capture began does not repeat its discovery "+
-		"sequence)", err)
+		"present the single simulated device at a second IPv4 address and have the DUT discover it "+
+			"there, per §2.4.1 steps 1-3",
+		"THE BENCH HALF IS READY AND THE DUT HALF IS NOT. modsim binds one address with -bind, so "+
+			"presenting the same device at a second IPv4 address is a launch argument. What cannot be "+
+			"done from inside a conformance run is the other half of §2.4.1 step 2 — 'share the server "+
+			"IP addresses … with the CUT operator' — because this DUT reads its southbound endpoint "+
+			"from /etc/lexa/modbus.json EXACTLY ONCE, at process start, and offers no runtime path to "+
+			"change it: no SIGHUP handler (it installs SIGINT/SIGTERM only), no config file watch, and "+
+			"its only HTTP listener serves /metrics. The supported change is an operator write to "+
+			"lexa-api's POST /config/modbus, which stages the file and then requests `systemctl restart "+
+			"lexa-modbus` — and this harness's gateway client is READ-ONLY BY CONSTRUCTION (its "+
+			"allowlist admits observation commands only and restricts systemctl to reporting "+
+			"subcommands), because the bench is shared and a conformance run must not change the DUT it "+
+			"is measuring. PROMOTING THIS ROW therefore takes an operator procedure rather than a bench "+
+			"capability: prepare the second address's modsim and the matching device entry BEFORE the "+
+			"run, and record the two discoveries as two runs of this row correlated in the bundle's DUT "+
+			"metadata. Note also that the DUT is not commissioned-locked for this to work: the config "+
+			"write API refuses outright once /etc/lexa/commissioned exists. Server 1 in this run was %s",
+		o.server)
 }
 
 // ── CLI-2 — General Discovery for SunSpec Servers at Different Ports ──────────
@@ -235,29 +241,40 @@ func checkCLI2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		return certify.Result{}, err
 	}
 	haveSecure := o.hasSecure && o.claimSecureServer() == nil
-	forced := o.forceReconnect(ctx)
-	if err := o.watch(ctx, 2); err != nil {
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
+	}
+	if err := d.begin(ctx, nil); err != nil {
+		return certify.Result{}, err
+	}
+	defer d.restore(ctx)
+	disc, err := rediscover(ctx, d, "CLI-2")
+	if err != nil {
 		return certify.Result{}, err
 	}
 
 	return certify.Result{
-		Notes: fmt.Sprintf("the DUT's two southbound servers are on non-standard ports %d and %s. %s",
-			o.server.Port(), secureDesc(o, haveSecure), o.injectionNote()),
+		Notes: fmt.Sprintf("the DUT's two southbound servers are on non-standard ports %d and %s; the "+
+			"rediscovery this row observes was held on the simulator's transaction ledger rather than "+
+			"on a poll interval. %s", o.server.Port(), secureDesc(o, haveSecure), o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT connected to a SunSpec server on a non-standard TCP port and completed discovery"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, pre), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
+				fs = append(fs, framesf(claim,
+					"destination TCP port of the DUT's southbound connection, from the capture",
+					certify.Pass, aduFrames(c.Requests...),
+					"the DUT dialled %s — destination port %d, which is not the Modbus default 502 — and "+
+						"exchanged %d Modbus message(s) there%s",
+					c.Server, c.Server.Port(), len(c.Requests)+len(c.Responses), disc.note()))
+				fs = append(fs, evalDiscovery(c)...)
+				fs = append(fs, evalFraming(c)...)
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, framesf(claim,
-				"destination TCP port of the DUT's southbound connection, from the capture",
-				certify.Pass, aduFrames(c.Requests...),
-				"the DUT dialled %s — destination port %d, which is not the Modbus default 502 — and "+
-					"exchanged %d Modbus message(s) there%s",
-				c.Server, c.Server.Port(), len(c.Requests)+len(c.Responses), reconnectNote(forced)))
-			fs = append(fs, evalDiscovery(c)...)
-			fs = append(fs, evalFraming(c)...)
+			fs = append(fs, evalRediscovery(disc, d))
+			fs = append(fs, commonModelBodyGap())
 			fs = append(fs, cli2SecondPort(ev, o, haveSecure))
 			return emit(ev, c, fs), nil
 		},
@@ -304,6 +321,13 @@ func cli2SecondPort(ev *certify.Evidence, o *observer, have bool) finding {
 
 // ── CLI-3 — General Discovery for SunSpec Servers with Different Unit IDs ─────
 
+// cli3AltUnitID is the unit id the server is re-addressed to. It must differ
+// from whatever the DUT is configured with, and 1..247 is the legal range
+// (§2.4.3 step 1); 247 is chosen because a device configured at the top of the
+// range is vanishingly unlikely, so the row does not have to negotiate with
+// the bench's own configuration to be sure it changed something.
+const cli3AltUnitID = 247
+
 func checkCLI3(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	o, why := newObserver(rc)
 	if o == nil {
@@ -312,34 +336,206 @@ func checkCLI3(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
-	forced := o.forceReconnect(ctx)
-	// CLI-3#5 (census 20260731T234821): one more full poll interval so the
-	// post-reconnect chain walk's separate full read of model 1's body — not
-	// just its header — lands inside this test case's window. See
-	// evalCommonModel, the assertion this extension is for.
-	if err := o.watch(ctx, 3); err != nil {
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
+	}
+	if err := d.begin(ctx, nil); err != nil {
+		return certify.Result{}, err
+	}
+	defer d.restore(ctx)
+
+	disc, err := rediscover(ctx, d, "CLI-3")
+	if err != nil {
 		return certify.Result{}, err
 	}
 	want, haveWant := rc.Param(paramUnitID)
 
+	// §2.4.3 step 1 — "run Server 1 … with different Unit IDs". modsim can now
+	// re-address the served device at runtime, and the row drives it: the
+	// device answers only cli3AltUnitID and returns 0x0B GATEWAY TARGET DEVICE
+	// FAILED TO RESPOND to every other, which is what a Modbus gateway does
+	// for a unit it does not front.
+	//
+	// That demonstrates the BENCH half of the procedure. The DUT half — being
+	// told the new unit id — needs a configuration change this read-only run
+	// must not make, and cli3DifferentUnitIDs says so precisely.
+	alt, err := d.meet(ctx,
+		map[string]any{"kind": "unit_id", "unit_id": cli3AltUnitID},
+		fmt.Sprintf("re-address the served device to unit id %d, so a client still addressing its "+
+			"previously configured id is answered 0x%02x GATEWAY TARGET DEVICE FAILED TO RESPOND — "+
+			"§2.4.3 step 1's 'different Unit IDs', as a runtime lever", cli3AltUnitID, 0x0B),
+		"unit_id", 1)
+	if err != nil {
+		return certify.Result{}, err
+	}
+
+	// Recovery: with the gate cleared the device answers the DUT's configured
+	// id again, and the DUT resumes. Held on the ledger like everything else.
+	recFence, rerr := d.arm(ctx, map[string]any{"kind": "unit_id", "clear": true},
+		"restore the device's original addressing so the DUT's recovery can be observed")
+	var recovery LedgerPage
+	var recovered bool
+	if rerr == nil {
+		recovery, recovered, err = d.awaitLedger(ctx, recFence, 1)
+		if err != nil {
+			return certify.Result{}, err
+		}
+	}
+
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("the DUT's unit-id handling on server 1 was observed%s; two servers with "+
-			"DIFFERENT unit ids could not be provided. %s", reconnectNote(forced), o.injectionNote()),
+		Notes: fmt.Sprintf("the DUT's unit-id handling was observed against server 1%s, and the served "+
+			"device was then RE-ADDRESSED at runtime to unit id %d — a capability this bench did not "+
+			"have before — to show what the DUT does when a server's unit id changes under it. Two "+
+			"servers with different unit ids, both of which the DUT is configured for, still needs a "+
+			"DUT configuration change this run must not make. %s",
+			disc.note(), cli3AltUnitID, o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "every Modbus request the DUT emitted carried the server's configured unit identifier"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre, cli3DifferentUnitIDs())), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
+				fs = append(fs, evalUnitIDs(c, want, haveWant))
+				fs = append(fs, evalDiscovery(c)...)
+				fs = append(fs, evalFraming(c)...)
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalUnitIDs(c, want, haveWant))
-			fs = append(fs, evalDiscovery(c)...)
-			fs = append(fs, evalFraming(c)...)
+			fs = append(fs, evalRediscovery(disc, d))
+			fs = append(fs, evalUnitIDsFromLedger(disc, want, haveWant, d))
+			fs = append(fs, evalCLI3Readdressed(alt, d))
+			fs = append(fs, evalCLI3Recovery(recovery, recovered, recFence, rerr, d))
+			fs = append(fs, commonModelBodyGap())
 			fs = append(fs, cli3DifferentUnitIDs())
 			return emit(ev, c, fs), nil
 		},
 	}, nil
+}
+
+// evalUnitIDsFromLedger asserts the unit-id discipline from the SERVER's own
+// record, which — unlike the capture — cannot miss a request that fell outside
+// the window.
+func evalUnitIDsFromLedger(disc rediscovery, want string, haveWant bool, d *determinism) finding {
+	claim := "every Modbus request the DUT emitted carried one unit identifier, in the legal range " +
+		"1..247, and the server echoed it"
+	method := "the MBAP unit identifier of every request in the simulator's own transaction ledger " +
+		"since the DUT's connection was severed"
+	if !disc.Observed || disc.Page.Total == 0 {
+		return skipf(claim, method, "no transaction was recorded to read a unit id from")
+	}
+	seen := map[uint8]int{}
+	for _, e := range disc.Page.Entries {
+		seen[e.UnitID]++
+	}
+	ids := make([]int, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, int(id))
+	}
+	sortInts(ids)
+	switch {
+	case len(ids) > 1:
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"the DUT addressed %d distinct unit ids on this server: %v. That is legal — a Modbus "+
+				"gateway fronts several units — but it means this row is watching more than one device",
+			len(ids), ids)
+	case ids[0] == 0 || ids[0] > 247:
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"the DUT addressed unit id %d, outside the legal 1..247 range (0 is the RTU broadcast "+
+				"address and has no meaning over Modbus/TCP)", ids[0])
+	case haveWant && want != fmt.Sprint(ids[0]):
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"the DUT addressed unit id %d; the operator declared the server's unit id as %q (-param %s)",
+			ids[0], want, paramUnitID)
+	default:
+		return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+			"all %d transaction(s) the simulator recorded addressed unit id %d, in the legal range "+
+				"1..247. First: %s", disc.Page.Total, ids[0], disc.Page.Entries[0])
+	}
+}
+
+// evalCLI3Readdressed reports what happened when the served device's unit id
+// changed under the DUT.
+//
+// It carries SKIP, not PASS, and the text says why: it is an OBSERVATION
+// adjacent to §2.4.3's criterion, not the criterion. The criterion is that the
+// CUT can DISCOVER a server whose unit id differs, which needs the DUT told
+// about it; what this shows is that the DUT genuinely uses the unit-id field
+// rather than ignoring it, and that the bench can now present the variation.
+func evalCLI3Readdressed(m meeting, d *determinism) finding {
+	claim := "the served device was re-addressed to a different unit id and the DUT's requests to its " +
+		"previously configured id were answered as a gateway-target failure"
+	method := fmt.Sprintf("arm modsim's unit_id gate at unit %d and read, from the simulator's own "+
+		"ledger, how the DUT's requests were resolved", cli3AltUnitID)
+	if m.ArmErr != nil {
+		return skipf(claim, method, "the served device could not be re-addressed: %v", m.ArmErr)
+	}
+	if !m.ok() {
+		return skipf(claim, method, "%s", m.reason())
+	}
+	refused := m.Page.Exceptions()[0x0B]
+	if len(refused) == 0 {
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"the device was re-addressed to unit id %d at epoch %d and the DUT's %d transaction(s) "+
+				"under it were resolved as %s — none as a gateway-target failure. Either the DUT was "+
+				"already addressing unit %d, or the gate did not take",
+			cli3AltUnitID, m.Epoch, m.Page.Total, m.Page.Summary(), cli3AltUnitID)
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Skip,
+		"OBSERVATION, not the criterion: with the served device re-addressed to unit id %d at epoch %d, "+
+			"%d of the DUT's request(s) — still carrying unit id %d — were answered 0x0B GATEWAY TARGET "+
+			"DEVICE FAILED TO RESPOND, and the device behind the gate never saw them. First: %s. This "+
+			"shows the DUT genuinely ADDRESSES the unit id it is configured with rather than ignoring "+
+			"the field, and that this bench can now present a server at a different unit id at all — "+
+			"neither of which is §2.4.3's criterion, which is that the CUT DISCOVERS a server whose "+
+			"unit id differs. That needs the DUT told the new id; see the assertion below",
+		cli3AltUnitID, m.Epoch, len(refused), refused[0].UnitID, refused[0])
+}
+
+// evalCLI3Recovery: with the gate cleared, the DUT's own unit id works again.
+func evalCLI3Recovery(page LedgerPage, recovered bool, fence uint64, err error, d *determinism) finding {
+	claim := "the DUT resumed normal operation once the server answered its configured unit id again"
+	method := "a transaction that completed normally AFTER the unit-id gate was cleared, held on the " +
+		"simulator's transaction ledger rather than on a clock"
+	if err != nil {
+		return skipf(claim, method, "the unit-id gate could not be cleared (%v), so there is no "+
+			"recovery interval to observe", err)
+	}
+	if !recovered {
+		return narrativef(claim, method, d.ledgerSource(), certify.Fail,
+			"with the device's original addressing restored at epoch %d, the DUT issued no transaction "+
+				"at all to this server within the barrier's budget", fence)
+	}
+	good := page.WithOutcome(outcomeAnswered)
+	if len(good) == 0 {
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"with the device's original addressing restored at epoch %d the DUT did transact again, but "+
+				"none of its %d transaction(s) completed normally: %s", fence, page.Total, page.Summary())
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"with the device's original addressing restored at epoch %d, %d of the DUT's transaction(s) "+
+			"completed normally — first: %s. The client recovered from a server that stopped answering "+
+			"its unit id", fence, len(good), good[0])
+}
+
+func cli3DifferentUnitIDs() finding {
+	return skipf(
+		"the DUT interacted with two servers carrying DIFFERENT unit identifiers",
+		"present the single simulated device at a second unit id and have the DUT discover it there, "+
+			"per §2.4.3 steps 1-3",
+		"THE BENCH HALF IS READY AND THE DUT HALF IS NOT. modsim can re-address the served device at "+
+			"runtime — the preceding assertion drove it — so a server at a different unit id is no "+
+			"longer something this bench lacks. What cannot be done from inside a conformance run is "+
+			"§2.4.3 step 2, sharing the new unit id with the CUT: this DUT reads devices[].unit_id from "+
+			"/etc/lexa/modbus.json EXACTLY ONCE, at process start, applies it to the session with a "+
+			"single SetUnitID at connect, and offers no runtime path to change it — no SIGHUP handler "+
+			"(it installs SIGINT/SIGTERM only), no config watch, and its only HTTP listener serves "+
+			"/metrics. The supported change is an operator write to lexa-api's POST /config/modbus "+
+			"followed by `systemctl restart lexa-modbus`, and this harness's gateway client is "+
+			"READ-ONLY BY CONSTRUCTION (its allowlist admits observation commands only and restricts "+
+			"systemctl to reporting subcommands) because the bench is shared and a conformance run must "+
+			"not change the DUT it is measuring. PROMOTING THIS ROW takes an operator procedure, not a "+
+			"bench capability: prepare the second unit id in the DUT's config before the run and record "+
+			"the two discoveries as two runs of this row correlated in the bundle's DUT metadata")
 }
 
 // evalUnitIDs asserts the MBAP unit identifier discipline.
@@ -384,26 +580,18 @@ func evalUnitIDs(c *Conversation, want string, haveWant bool) finding {
 	}
 }
 
-func cli3DifferentUnitIDs() finding {
-	return skipf(
-		"the DUT interacted with two servers carrying DIFFERENT unit identifiers",
-		"comparison of the unit identifiers across the DUT's southbound connections",
-		"both of the DUT's configured southbound devices declare unit id 1, so no unit-id VARIATION "+
-			"exists on this bench to observe. Providing it means changing a device's unit id in the "+
-			"DUT's own /etc/lexa/modbus.json and restarting its Modbus client — a DUT configuration "+
-			"change this shared-bench run must not make. Promoting this row to full requires a second "+
-			"modsim instance started with a different unit id and a matching device entry, prepared "+
-			"before the run")
-}
-
 // ── CLI-4 — General Discovery for SunSpec Servers with Different Base Registers ─
 
-// baseSweepAttempt records one relocate+reconnect attempt for a non-default
-// standard base — CLI-4#8's sweep of bases 0 and 50000.
-type baseSweepAttempt struct {
-	base         uint16
-	relocateErr  error
-	reconnectErr error
+// cli4Bases are §2.4.4's three canonical starting registers, in the order the
+// procedure walks them (steps 1, 4, 6). The sweep ends at 40000 so the bench is
+// left where every other row expects it even before the deferred restore runs.
+var cli4Bases = []uint16{0, 50000, 40000}
+
+// baseAttempt is one relocate-and-rediscover leg of the sweep.
+type baseAttempt struct {
+	Base        uint16
+	RelocateErr error
+	Disc        rediscovery
 }
 
 func checkCLI4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
@@ -414,57 +602,44 @@ func checkCLI4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
-	device := defaultDeviceName
-	if v, ok := rc.Param(paramDevice); ok && v != "" {
-		device = v
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
 	}
+	if err := d.begin(ctx, nil); err != nil {
+		return certify.Result{}, err
+	}
+	// The default base is ALWAYS restored, unconditionally deferred: a bench
+	// left relocated would corrupt every other row's discovery, not just this
+	// one's.
+	defer d.restore(ctx)
 
-	// CLI-4#5 (census 20260731T234821) / assertion 5 (census
-	// compliance-fullsuite-2-20260802T020946 as re-run live,
-	// runs/warnmeas-mc-ssm-20260802T134537): a bare N-cycle wait after
-	// reconnecting caught the (fast) header-only chain walk but missed the
-	// SLOWER, separate full-body read of the Common Model — which only
-	// happens on the DUT's own steady-state poll, not as part of the
-	// initial identify burst, and that poll can itself trail the reconnect
-	// by more than a bare cycle or two once the DUT's reconnect-with-
-	// backoff is in play. Hold until a fresh readback line proves at least
-	// one COMPLETE poll cycle happened post-reconnect, not a fixed guess.
-	journalBeforeInitial, _ := o.journal(ctx, 200)
-	forced := o.forceReconnect(ctx)
-	if forced == nil {
-		_, _ = o.awaitJournalEvidence(ctx, journalBeforeInitial, 3, 6,
-			func(delta []string) bool { return freshReadback(delta, device) })
-	} else if err := o.watch(ctx, 3); err != nil {
+	// The device's own base first, so the row has a baseline discovery from
+	// the map where every other row expects it.
+	initial, err := rediscover(ctx, d, "CLI-4 (default base)")
+	if err != nil {
 		return certify.Result{}, err
 	}
 
-	// CLI-4#8 (census compliance-fullsuite-2-20260802T020946): modsim's
-	// relocate verb (sim/southbound/relocate.go, landed 9e35da6) can now
-	// re-home the server's SunSpec map at runtime — always available, no
-	// modsim launch flag needed. Sweep the two non-default standard bases,
-	// forcing a fresh reconnect (and so a fresh discovery sequence) after
-	// each relocation, and — same fix as the initial reconnect above —
-	// hold each one until a fresh readback proves a complete poll cycle
-	// happened at the new base, not a fixed guess. The default base is
-	// ALWAYS restored afterward, unconditionally deferred: a bench left
-	// relocated would corrupt every OTHER check's discovery, not just this
-	// row's.
-	defer o.clearFault("relocate")
-	var sweep []baseSweepAttempt
+	// Then each of the other two standard bases in turn. Each leg relocates,
+	// severs the connection, and waits ON THE SIMULATOR'S LEDGER for the
+	// rediscovery — so the evidence for a base is the traffic that happened
+	// after that base was in force, by construction, instead of being matched
+	// back to a conversation by guessing which reconnect was which.
+	var sweep []baseAttempt
 	if o.injectionReason() == "" {
-		for _, b := range []uint16{0, 50000} {
-			att := baseSweepAttempt{base: b}
-			if err := o.relocate(ctx, b); err != nil {
-				att.relocateErr = err
-			} else {
-				journalBeforeBase, _ := o.journal(ctx, 200)
-				att.reconnectErr = o.forceReconnect(ctx)
-				if att.reconnectErr == nil {
-					_, _ = o.awaitJournalEvidence(ctx, journalBeforeBase, 3, 6,
-						func(delta []string) bool { return freshReadback(delta, device) })
-				} else if err := o.watch(ctx, 3); err != nil {
-					return certify.Result{}, err
-				}
+		for _, b := range cli4Bases {
+			att := baseAttempt{Base: b}
+			if _, rerr := d.relocate(ctx, b, fmt.Sprintf("re-home the server's SunSpec map to base %d, "+
+				"one of §2.4.4's three canonical starting registers, so discovery can be observed "+
+				"there too", b)); rerr != nil {
+				att.RelocateErr = rerr
+				sweep = append(sweep, att)
+				continue
+			}
+			att.Disc, err = rediscover(ctx, d, fmt.Sprintf("CLI-4 (base %d)", b))
+			if err != nil {
+				return certify.Result{}, err
 			}
 			sweep = append(sweep, att)
 		}
@@ -472,100 +647,101 @@ func checkCLI4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 
 	return certify.Result{
 		Verdict: certify.Warn,
-		Notes: fmt.Sprintf("the DUT's base-address probing was observed against the server's default "+
-			"SunSpec base 40000%s, and a sweep relocating the map to bases 0 and 50000 in turn was "+
-			"attempted. %s", reconnectNote(forced), o.injectionNote()),
+		Notes: fmt.Sprintf("the server's SunSpec map was re-homed to each of §2.4.4's three canonical "+
+			"starting registers in turn — %v — and the DUT's rediscovery at each was held on the "+
+			"simulator's own transaction ledger rather than on a poll interval, so each base's evidence "+
+			"is the traffic that happened while THAT base was in force. %s",
+			cli4Bases, o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT located the SunSpec map by probing a standard base address"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, append(pre, evalOtherBases(nil, sweep, o.injectionNote()))), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
+				fs = append(fs, evalBaseProbes(c, initial.Err))
+				fs = append(fs, evalDiscovery(c)...)
+				fs = append(fs, evalFraming(c)...)
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalBaseProbes(c, forced))
-			fs = append(fs, evalDiscovery(c)...)
-			fs = append(fs, evalFraming(c)...)
-			// evalOtherBases needs EVERY conversation this check owns with the
-			// server, not just citeConversation's single newest one (which, by
-			// the time the sweep above has run, is whichever relocation
-			// happened last — not necessarily base 0's) — see conversationsWith's
-			// doc for why folding them into one register image would be wrong.
-			cs, csErr := conversationsWith(ev, o.server)
-			if csErr != nil {
-				cs = nil
-			}
-			fs = append(fs, evalOtherBases(cs, sweep, o.injectionNote()))
+			fs = append(fs, evalRediscovery(initial, d))
+			fs = append(fs, evalBaseSweep(sweep, o.injectionReason(), d))
+			fs = append(fs, commonModelBodyGap())
 			return emit(ev, c, fs), nil
 		},
 	}, nil
 }
 
-// evalOtherBases is CLI-4#8: having relocated the server's SunSpec map to
-// each of the two non-default standard bases in turn, did the DUT complete
-// discovery there too? Each attempted base is matched to its OWN
-// conversation by which base it actually probed (findConversationProbing),
-// never by ordinal position — a position-based guess breaks the moment any
-// one relocation or reconnect in the sweep fails, which is exactly the kind
-// of partial result this row needs to report honestly rather than hide.
-func evalOtherBases(cs []*Conversation, sweep []baseSweepAttempt, injected string) finding {
-	claim := "the DUT completed discovery with the server's SunSpec map relocated to base 0 and to base 50000"
-	method := "repetition of the discovery sequence with the server's map at each of the three standard bases"
+// evalBaseSweep is CLI-4's headline criterion: discovery works at every
+// canonical base.
+//
+// Each leg is graded from the simulator's own ledger, fenced at the epoch that
+// leg's reconnect happened at. That is what makes the evidence unambiguous:
+// the previous version had to match a reconnect back to a base by looking for
+// a probe at that address among several attributed conversations, and a
+// position-based or address-based guess breaks the moment one leg of the sweep
+// fails — which is exactly the partial result this row has to report honestly.
+func evalBaseSweep(sweep []baseAttempt, injectionReason string, d *determinism) finding {
+	claim := "the DUT completed SunSpec discovery with the server's map at each of the three canonical " +
+		"starting registers 0, 40000 and 50000"
+	method := "re-home the server's map to each base, sever the DUT's connection, and read from the " +
+		"simulator's ledger — fenced at that leg's own epoch — whether the DUT probed the new base and " +
+		"read the identifier there"
 	if len(sweep) == 0 {
-		return skipf(claim, method,
-			"the server's relocate fault could not be attempted for this run (%s), so bases 0 and 50000 "+
-				"could not be presented to the DUT", injected)
+		return skipf(claim, method, "the server's map could not be relocated for this run (%s), so the "+
+			"other bases could not be presented to the DUT", injectionReason)
 	}
 	var parts []string
-	var frames []int
 	ok := 0
 	for _, att := range sweep {
-		if att.relocateErr != nil {
-			parts = append(parts, fmt.Sprintf("base %d: the server's map could not be relocated: %v",
-				att.base, att.relocateErr))
+		switch {
+		case att.RelocateErr != nil:
+			parts = append(parts, fmt.Sprintf("base %d: the map could not be re-homed: %v",
+				att.Base, att.RelocateErr))
+			continue
+		case att.Disc.Err != nil:
+			parts = append(parts, fmt.Sprintf("base %d: the map moved, but the DUT's connection could "+
+				"not be severed to make it re-probe: %v", att.Base, att.Disc.Err))
+			continue
+		case !att.Disc.Observed:
+			parts = append(parts, fmt.Sprintf("base %d: the map moved and the connection was severed at "+
+				"epoch %d, but the DUT issued only %d transaction(s) afterwards",
+				att.Base, att.Disc.Fence, att.Disc.Page.Total))
 			continue
 		}
-		cb := findConversationProbing(cs, att.base)
-		if cb == nil {
-			reason := "no read at that base was observed in this test case's frames"
-			if att.reconnectErr != nil {
-				reason = fmt.Sprintf("the reconnect meant to re-probe it could not be forced: %v",
-					att.reconnectErr)
-			}
-			parts = append(parts, fmt.Sprintf("base %d: %s", att.base, reason))
-			continue
+		probed, found := probeAt(att.Disc.Page, att.Base)
+		switch {
+		case !probed:
+			parts = append(parts, fmt.Sprintf("base %d: the DUT read at %v after the relocation and "+
+				"never at %d itself", att.Base, att.Disc.Page.Addresses(), att.Base))
+		case !found:
+			parts = append(parts, fmt.Sprintf("base %d: the DUT probed it, but no response carried the "+
+				"SunSpec identifier — the relocation did not take", att.Base))
+		default:
+			ok++
+			parts = append(parts, fmt.Sprintf("base %d: probed and the identifier read back, then %d "+
+				"further transaction(s) walking the map", att.Base, att.Disc.Page.Total-1))
 		}
-		base, models, complete, why := cb.ModelChain()
-		if base != att.base || !complete {
-			parts = append(parts, fmt.Sprintf("base %d: the chain walk did not complete: %s", att.base, why))
-			continue
-		}
-		ok++
-		parts = append(parts, fmt.Sprintf("base %d: %d model(s) read, chain complete", att.base, len(models)))
-		frames = append(frames, aduFrames(cb.Responses...)...)
-	}
-	if len(frames) == 0 {
-		return skipf(claim, method, "%s", strings.Join(parts, "; "))
 	}
 	v := certify.Pass
 	if ok < len(sweep) {
 		v = certify.Warn
 	}
-	return framesf(claim, method, v, frames, "%s", strings.Join(parts, "; "))
+	return narrativef(claim, method, d.ledgerSource(), v,
+		"%d of %d base(s) completed: %s", ok, len(sweep), strings.Join(parts, "; "))
 }
 
-// findConversationProbing returns the first conversation in cs (as returned
-// by conversationsWith, oldest first) whose observed reads include a probe
-// at base — i.e. the specific reconnect that followed relocating the
-// server's map to that base.
-func findConversationProbing(cs []*Conversation, base uint16) *Conversation {
-	for _, c := range cs {
-		for _, p := range c.BaseProbes() {
-			if p.Start == base {
-				return c
-			}
+// probeAt reports whether the page shows a read AT base, and whether one of
+// them returned the SunSpec identifier.
+func probeAt(p LedgerPage, base uint16) (probed, found bool) {
+	for _, e := range p.Reads() {
+		if e.Addr != base {
+			continue
+		}
+		probed = true
+		if vals, ok := e.Values(); ok && len(vals) >= 2 && vals[0] == SunSHigh && vals[1] == SunSLow {
+			found = true
 		}
 	}
-	return nil
+	return probed, found
 }
 
 // evalBaseProbes asserts which of the three standard bases the DUT probed, and

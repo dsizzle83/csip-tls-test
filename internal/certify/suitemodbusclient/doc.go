@@ -23,8 +23,17 @@
 //
 //   - the sims' published simapi control plane, which can make a server behave
 //     the way a procedure's setup step calls for (return exceptions, serve
-//     not-implemented sentinels, delay its reads, sever the connection); and
-//   - time, waiting for the DUT's ten-second poll loop to come round.
+//     not-implemented sentinels, re-home its register map, re-address its unit
+//     id, drop or truncate or delay one named response, sever the connection);
+//     and
+//   - the same control plane's BARRIERS, which say when the DUT has met any of
+//     that — a poll-cycle barrier and a transaction ledger, both fenced on a
+//     control-plane epoch the sim hands back with every change.
+//
+// The second used to be "time, waiting for the DUT's ten-second poll loop to
+// come round", and every row's reliability rested on that guess. It does not
+// any more: nothing in this suite sleeps for a poll interval, and no verdict is
+// decided by elapsed time. See deterministic.go.
 //
 // Three consequences run through the whole package. Frame attribution rests on
 // an endpoint claim rather than a 4-tuple, and the citation phase re-derives
@@ -78,8 +87,11 @@
 //	                 the not-implemented sentinel table
 //	conversation.go  frames → messages, plus the finding/emit vocabulary that
 //	                 keeps decision logic pure and testable
-//	observe.go       the live phase: endpoint claims, fault injection with
-//	                 mandatory clear-up, poll-cycle waits, DUT journal reads
+//	observe.go       the live phase's identity half: endpoint claims, what was
+//	                 done to the bench, DUT journal reads
+//	deterministic.go the live phase's timing half: arm at an epoch, wait on the
+//	                 simulator's barrier, grade its transaction ledger
+//	ledger.go        this suite's independent reader for that ledger
 //	common.go        the assertions every wire row shares: attribution
 //	                 soundness, MBAP framing, transaction discipline, the
 //	                 125-register ceiling
@@ -91,7 +103,6 @@
 //
 // # Parameters
 //
-//	modbus-client.poll-interval-s   the DUT's southbound poll period (default 10)
 //	modbus-client.inject            "off" disables all fault injection
 //	modbus-client.device            the DUT's device name for the plain server
 //	                                (default "inv-plain"), for journal correlation

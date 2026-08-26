@@ -31,44 +31,70 @@ func checkREAD2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
-	device := defaultDeviceName
-	if v, ok := rc.Param(paramDevice); ok && v != "" {
-		device = v
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
 	}
-	// A steady-state poll is enough for READ-2: the DUT re-reads every model it
-	// consumes on every cycle. Forcing a reconnect additionally brings the
-	// discovery-time reads of models it does NOT consume into the window, which
-	// is what makes the model-by-model coverage assertion complete.
-	//
-	// live-run finding (runs/warnmeas-mc-ssm-20260802T134537, assertion 3): a
-	// bare 2-cycle wait caught model 701's steady-state re-reads but missed
-	// the Common Model's own full-body read, which the DUT does not repeat
-	// every cycle the same way — same root cause and same fix as CLI-4:
-	// hold until a fresh readback proves at least one complete poll cycle
-	// happened post-reconnect, rather than guessing a fixed cycle count.
-	journalBeforeReconnect, _ := o.journal(ctx, 200)
-	forced := o.forceReconnect(ctx)
-	if forced == nil {
-		_, _ = o.awaitJournalEvidence(ctx, journalBeforeReconnect, 2, 5,
-			func(delta []string) bool { return freshReadback(delta, device) })
-	} else if err := o.watch(ctx, 2); err != nil {
+	if err := d.begin(ctx, nil); err != nil {
 		return certify.Result{}, err
 	}
+	defer d.restore(ctx)
+
+	// A steady-state poll is enough for READ-2's headline criterion: the DUT
+	// re-reads the model it consumes on every cycle. Forcing a reconnect
+	// additionally brings the discovery-time reads of models it does NOT
+	// consume into the window, which is what makes the model-by-model coverage
+	// assertion complete.
+	disc, err := rediscover(ctx, d, "READ-2")
+	if err != nil {
+		return certify.Result{}, err
+	}
+	// Then one COMPLETE poll cycle. This is the row that genuinely wants the
+	// poll barrier rather than the ledger one: its criterion is about the
+	// SHAPE of a whole read cycle, so a window that caught half of one would
+	// grade a pattern the DUT never emitted. The barrier returns only once the
+	// cycle is closed and every one of its transactions is in the ledger.
+	cycle, cycleSeen, err := d.awaitPoll(ctx, 1)
+	if err != nil {
+		return certify.Result{}, err
+	}
+
 	return certify.Result{
-		Notes: fmt.Sprintf("the DUT's southbound read pattern was observed over at least one full poll "+
-			"cycle post-reconnect%s. %s", reconnectNote(forced), o.injectionNote()),
+		Notes: fmt.Sprintf("the DUT's southbound read pattern was observed over a forced rediscovery "+
+			"and then one COMPLETE poll cycle, both held on the simulator rather than on a clock%s. %s",
+			disc.note(), o.injectionNote()),
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT read model bodies in whole-block requests bounded by the Modbus 125-register limit"
 			c, pre, ok := citeConversation(ev, o, claim)
-			if !ok {
-				return emit(ev, c, pre), nil
+			fs := append([]finding(nil), pre...)
+			if ok {
+				fs = []finding{assertAttributionSound(ev, o)}
+				fs = append(fs, evalREAD2(c)...)
+				fs = append(fs, evalFraming(c)...)
 			}
-			fs := []finding{assertAttributionSound(ev, o)}
-			fs = append(fs, evalREAD2(c)...)
-			fs = append(fs, evalFraming(c)...)
+			fs = append(fs, evalRediscovery(disc, d))
+			fs = append(fs, evalREAD2Cycle(cycle, cycleSeen, d))
 			return emit(ev, c, fs), nil
 		},
 	}, nil
+}
+
+// evalREAD2Cycle reports the complete poll cycle this row's evidence is drawn
+// from, and the rule the simulator counted it by. A bundle asserting something
+// about "one read cycle" must record what a cycle IS.
+func evalREAD2Cycle(rep PollReport, seen bool, d *determinism) finding {
+	claim := "the read pattern asserted above was observed over a COMPLETE poll cycle, not a fragment " +
+		"of one"
+	method := "the simulator's poll barrier: it counts the client's cycles from the server side of the " +
+		"wire and returns only once a cycle has closed and every transaction of it has resolved"
+	if !seen {
+		return narrativef(claim, method, d.ledgerSource(), certify.Warn,
+			"the DUT did not complete a poll cycle within the barrier's budget, so the read pattern "+
+				"above may be a fragment of one. %s", pollRuleNote(rep))
+	}
+	return narrativef(claim, method, d.ledgerSource(), certify.Pass,
+		"a complete poll cycle closed inside this test case's window before any read assertion was "+
+			"graded. %s", pollRuleNote(rep))
 }
 
 // evalREAD2 is READ-2's decision logic, pure over the observed conversation.
@@ -293,24 +319,31 @@ func checkREAD1(ctx context.Context, rc *certify.RunCtx) (certify.Result, error)
 	if err := o.claimServer(); err != nil {
 		return certify.Result{}, err
 	}
-	// READ-1#1 (census 20260731T234821): one more full poll interval than the
-	// original 2-cycle wait — this check forces no reconnect of its own, so
-	// it depends entirely on the DUT's steady-state cadence, and a window
-	// sized only for that cadence left it with zero attributed frames when a
-	// preceding test case's fault injection was still settling.
-	if err := o.watch(ctx, 3); err != nil {
+	// This check provokes nothing: it reports the DUT's steady-state read
+	// granularity. Its only requirement is that its window CONTAIN some of
+	// that steady state — and a fixed sleep is how a previous version of it
+	// ended up with zero attributed frames when a preceding test case's fault
+	// injection was still settling. One complete poll cycle, held on the
+	// simulator's barrier, is both a stronger guarantee and a shorter wait.
+	d, derr := o.determinism(ctx)
+	if derr != nil {
+		return certify.Skipped("%s", deterministicSkip(derr)), nil
+	}
+	cycle, cycleSeen, err := d.awaitPoll(ctx, 1)
+	if err != nil {
 		return certify.Result{}, err
 	}
 	return certify.Result{
 		Verdict: certify.Skip,
 		Notes: "the DUT exposes no way to request an individual SunSpec point, so the one-request-" +
 			"per-point pattern this row requires cannot be provoked. What the DUT does instead was " +
-			"observed and is cited.",
+			"observed over one complete poll cycle — held on the simulator's own poll barrier, not on " +
+			"a sleep — and is cited.",
 		Cite: func(_ context.Context, ev *certify.Evidence) ([]certify.Assertion, error) {
 			claim := "the DUT read every point of the Common Model individually, one request per point"
 			c, pre, ok := citeConversation(ev, o, claim)
 			if !ok {
-				return emit(ev, c, pre), nil
+				return emit(ev, c, append(pre, evalREAD2Cycle(cycle, cycleSeen, d))), nil
 			}
 			fs := []finding{assertAttributionSound(ev, o)}
 			fs = append(fs, evalREAD1(c)...)
