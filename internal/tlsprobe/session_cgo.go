@@ -167,6 +167,10 @@ func Dial(ctx context.Context, spec Spec) (*Session, error) {
 			Target: spec.Target, Requested: spec.Suite, Offered: offered,
 			Local: s.local, Remote: s.remote, Err: err,
 		}
+		// Read the alert history while the session still lives — the deferred
+		// FreeSSL has not run yet. A peer that refused us with a fatal alert
+		// left it here; a peer that merely closed the socket left it empty.
+		he.RxAlert, he.TxAlert, _ = wolfssl.AlertHistory(ssl)
 		he.classify()
 		return nil, he
 	}
@@ -296,6 +300,14 @@ type HandshakeError struct {
 	// a cipher-suite procedure must not report the two the same way.
 	PeerRejectedByUs bool
 	Diagnosis        string
+
+	// RxAlert and TxAlert are the last TLS alerts wolfSSL recorded on the
+	// session — captured from wolfSSL_get_alert_history the instant the
+	// handshake failed, before the session is torn down. RxAlert is the PEER's
+	// stated reason for aborting, when it sent a fatal alert rather than simply
+	// closing the socket; the difference is what turns a bare SOCKET_ERROR_E
+	// (-308) into a real diagnosis. See wolfssl.AlertHistory.
+	RxAlert, TxAlert wolfssl.Alert
 }
 
 func (e *HandshakeError) Error() string {
@@ -306,6 +318,18 @@ func (e *HandshakeError) Error() string {
 	tail := e.Err.Error()
 	if e.Reason != "" {
 		tail += " (" + e.Reason + ")"
+	}
+	// Turn the bare reason code into what actually happened on the wire: the
+	// peer's fatal alert when it sent one, or a plain statement that it aborted
+	// at the transport layer when it did not. This is the instrumentation the
+	// bench's -308 needed — "the DUT said bad_certificate" and "the DUT dropped
+	// the connection" are different findings and must not read the same.
+	if a := alertText(e.RxAlert); a != "" {
+		tail += "; the peer sent a " + a + " — its stated reason for aborting the handshake"
+	} else if e.transportClosed() {
+		tail += "; the peer closed or reset the TCP connection during the handshake WITHOUT sending a TLS " +
+			"alert — it aborted at the transport layer, not with a protocol rejection (so the cause is a " +
+			"socket/record-level mismatch, not a cipher or certificate the peer named)"
 	}
 	if e.PeerRejectedByUs {
 		return fmt.Sprintf("tlsprobe: the handshake to %s offering %s did not complete because THIS SIDE "+
