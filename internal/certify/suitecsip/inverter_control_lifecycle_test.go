@@ -1031,3 +1031,31 @@ func TestOracleOutcome_WarnsWhenTheBaselineIsMissing(t *testing.T) {
 		t.Fatalf("spec.Verdict with no baseline = %q, want WARN carried to the case", v)
 	}
 }
+
+// TestStartedGradedWindows_OutlastThePollCadence is
+// CSIP-ORACLE-BASIC008-STARTED-RESPONSE-TIMING's guard. Every inverterControlSpec
+// row grades a Started(2), and the DUT posts Started only for an event it
+// fetched WHILE STILL SCHEDULED and then watched go Active. The bench paces the
+// DUT at a 1m0s pollRate with a 1m0s discovery floor, so 60s is the longest gap
+// between two polls; an event whose start offset does not EXCEED that can be
+// fetched already-active (past its start) on an unlucky phase and draw no
+// Started — the race that flipped BASIC-008 when BASIC-007's baseline step
+// shifted the campaign clock. Both windows the Started-graded rows use must open
+// their event strictly after one poll interval so the DUT's next poll always
+// finds it Scheduled, regardless of upstream row timing.
+func TestStartedGradedWindows_OutlastThePollCadence(t *testing.T) {
+	const maxPollIntervalS = 60 // bench pollRate and discovery-interval floor
+	for _, w := range []struct {
+		name string
+		win  scalarControlWindow
+	}{
+		{"scalarWindow", scalarWindow},
+		{"oracleWindow", oracleWindow},
+	} {
+		if w.win.startOffsetS <= maxPollIntervalS {
+			t.Errorf("%s opens its event at +%ds, not past the %ds poll cadence — the DUT can fetch it "+
+				"ALREADY ACTIVE on an unlucky phase and never post Started(2) "+
+				"(CSIP-ORACLE-BASIC008-STARTED-RESPONSE-TIMING)", w.name, w.win.startOffsetS, maxPollIntervalS)
+		}
+	}
+}

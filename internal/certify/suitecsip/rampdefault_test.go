@@ -323,6 +323,14 @@ func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver) {
 	dev := diff.NewDevice(diff.Bench702())
 	var mu sync.Mutex
 	var poll uint64
+	// pending is the ramp default gridsim last accepted but the DUT has not yet
+	// fetched. A real DUT applies it only when it next POLLS — so this fake
+	// applies it on /poll/wait (a completed poll), NOT synchronously on the
+	// admin POST. That is what makes the row's poll-fences load-bearing in these
+	// tests: an unfenced read samples the DER before the poll that applies the
+	// value (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S).
+	var pending uint16
+	var havePending bool
 	applyWRmp := func(v uint16) { // caller holds mu
 		regs, ok := dev.Model(704)
 		if !ok {
@@ -347,8 +355,7 @@ func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.SetGradW != nil {
 			mu.Lock()
-			applyWRmp(*req.SetGradW / 100) // the responsive DUT tracks the commanded default
-			poll++                          // and it took a fresh poll cycle to do it
+			pending, havePending = *req.SetGradW/100, true // accepted; the DUT applies it on its next poll
 			mu.Unlock()
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -386,6 +393,12 @@ func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver) {
 		_, _ = w.Write(pollBody())
 	})
 	simMux.HandleFunc("/poll/wait", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		poll++ // a poll cycle completed
+		if havePending {
+			applyWRmp(pending) // and the DUT reconciled the default it fetched
+		}
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(pollBody())
 	})
