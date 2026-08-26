@@ -269,11 +269,31 @@ type clientHalf struct {
 	Armed bool
 	// Why records the reason when it is not armed.
 	Why string
+	// OutOfScope reports that the candidate does not claim the Secure SunSpec
+	// CLIENT direction at all, so there was nothing here to observe — as
+	// opposed to Armed==false, which means the bench could not observe it.
+	//
+	// The two must not be conflated. An unobservable client half is an evidence
+	// gap a re-run might close and a check reports it with a WARN caveat; an
+	// UNCLAIMED one is a fact about the candidate that no re-run changes, and
+	// its assertions become NOT APPLICABLE in roles.go. Keeping the flag here
+	// is also what stops the check paying for it: an out-of-scope half claims
+	// no endpoint, arms no fault on the device sim, and waits out none of the
+	// gateway's poll interval.
+	OutOfScope bool
 }
 
 // watchClientHalf claims the southbound mbaps device-sim endpoint and waits.
 func watchClientHalf(ctx context.Context, rc *certify.RunCtx) *clientHalf {
 	c := &clientHalf{}
+	if !rc.RoleClaimed("client") {
+		c.OutOfScope = true
+		c.Why = "the candidate manifest does not claim the Secure SunSpec CLIENT direction, so this " +
+			"row's [C] half is out of scope and was not observed (see roles.go)"
+		rc.Logf("client half NOT observed: the candidate claims no Secure SunSpec client direction; " +
+			"skipping the observation wait entirely")
+		return c
+	}
 	target := rc.Targets.MBAPSDev
 	if target == "" {
 		c.Why = "no southbound mbaps device sim is configured (-mbapsdev host:port), so the gateway's " +
@@ -359,6 +379,13 @@ const forcedReconnectFault = "drop_session"
 // configuration surface (rc.Targets.MBAPSDevAPI) watchClientHalf itself is
 // fed the mbaps endpoint from — never a hardcoded host:port.
 func watchClientHalfForced(ctx context.Context, rc *certify.RunCtx) *clientHalf {
+	// An unclaimed client direction is decided before anything is armed: this
+	// function's whole purpose is to make the DUT reconnect, and provoking a
+	// reconnect to observe a direction nobody claims is a write to the bench in
+	// exchange for nothing.
+	if !rc.RoleClaimed("client") {
+		return watchClientHalf(ctx, rc)
+	}
 	sim, err := rc.Sim("mbapsdev")
 	if err != nil {
 		// No mbapsdev simapi is configured: fall back to the plain passive

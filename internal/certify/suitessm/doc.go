@@ -55,15 +55,26 @@
 //     server's answer is read straight off the socket and parsed by
 //     internal/evidence/tlsdis.
 //
-// The one place this costs something is honesty about completion: Go's
-// crypto/tls cannot complete TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8 (0xC0AE) or
-// TLS_AES_128_CCM_SHA256 (0x1304), and does not implement RFC 6066
-// max_fragment_length. Where a procedure's criterion needs one of those, the
-// suite asserts exactly what it did observe — the ServerHello selecting the
-// suite, the server's full flight through ServerHelloDone, the ServerHello
-// echoing the MFL code — and records a SKIP naming the sub-criterion it could
-// not reach and why. It never rounds "the server selected CCM-8 and sent its
-// certificate" up to "a CCM-8 session was established".
+// The one place this costs something is completion. Go's crypto/tls implements
+// no AES-CCM cipher, so it cannot complete
+// TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8 (0xC0AE) or TLS_AES_128_CCM_SHA256
+// (0x1304), and it does not implement RFC 6066 max_fragment_length. Where a
+// procedure's criterion needs one of those, the suite asserts exactly what it
+// did observe — the ServerHello selecting the suite, the server's full flight
+// through ServerHelloDone, the ServerHello echoing the MFL code — and records a
+// SKIP naming the sub-criterion it could not reach and why. It never rounds
+// "the server selected CCM-8 and sent its certificate" up to "a CCM-8 session
+// was established".
+//
+// For the CIPHER-SUITE rows that is no longer where it stops. SSM-CONF-v0.8
+// §2.5.1.3 asks that the EUT-S "successfully establishes a secure session using
+// each of the mandatory TLS v1.2 cipher suites", and a selection is not a
+// session. CRYP-001 and CRYP-002 therefore reach for a FOURTH client —
+// internal/tlsprobe, a small wolfSSL client that can be pinned to one suite,
+// completes the mTLS handshake, and carries a SunSpec Model 1 read inside the
+// tunnel — for every mandated suite including the two that use CCM. See
+// ccmsession.go for the bridge and internal/tlsprobe's package doc for why it
+// is neither internal/mbtls nor the product's stack.
 //
 // # The two halves of most procedures
 //
@@ -82,6 +93,16 @@
 //     the client half is a SKIP naming the wait and the poll schedule. The
 //     framework marks every assertion built on an endpoint claim with the
 //     reduced attribution precision, so a reader knows.
+//
+// A candidate need not have both halves. The catalog's dut_role is one scalar
+// per case, which takes a whole mbaps-client ROW out of scope for a server-only
+// candidate (internal/certify/scope.go) and can say nothing about the [C]
+// assertion sitting inside an mbaps-server row. roles.go supplies that finer
+// grain: every assertion this suite mints carries a declared direction, and a
+// client-direction one is reported NOT APPLICABLE — with the manifest key that
+// decided it — when the candidate does not claim that direction. Those rows
+// then roll up on their server assertions instead of carrying a SKIP that reads
+// like unfinished work.
 //
 // # TLS 1.2 on purpose
 //

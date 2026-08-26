@@ -74,7 +74,12 @@ func Register(reg *certify.Registry) {
 			id = after
 		}
 		opts = append(opts, certify.WithCaptureArtifacts(CaptureNames(id)...))
-		reg.Register(uid, suiteName, check, opts...)
+		// roleScoped wraps EVERY registration, so a check inherits the
+		// per-assertion direction rule without having to know it exists: a
+		// client-procedure assertion on a run whose candidate does not claim
+		// the Secure SunSpec client direction becomes NOT APPLICABLE rather
+		// than a SKIP that reads like unfinished work. See roles.go.
+		reg.Register(uid, suiteName, roleScoped(uid, check), opts...)
 	}
 
 	// §2.4 TLS Fundamentals.

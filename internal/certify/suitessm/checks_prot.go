@@ -271,7 +271,12 @@ func prot003(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	}
 
 	half := watchClientHalf(ctx, rc)
-	if !half.Armed {
+	// OutOfScope is unreachable on this row in practice — PROT-003's catalog
+	// dut_role is mbaps-client, so a server-only manifest takes the WHOLE case
+	// out of scope before the check runs (internal/certify/scope.go). The guard
+	// is here anyway so that the one place this suite turns an unobserved [C]
+	// half into a WARN reads the same way everywhere.
+	if !half.Armed && !half.OutOfScope {
 		t.caveat("the [C] half — the procedure's actual criterion — was not observed: %s", half.Why)
 	}
 

@@ -87,7 +87,10 @@ func tlsf001(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	}
 
 	half := watchClientHalf(ctx, rc)
-	if !half.Armed {
+	// A half the candidate does not CLAIM is not a caveat: its assertion is
+	// declared not applicable in roles.go, and a WARN here would hold the row
+	// down for a direction that is out of scope.
+	if !half.Armed && !half.OutOfScope {
 		t.caveat("the [C] half was not observed: %s", half.Why)
 	}
 
@@ -263,7 +266,10 @@ func tlsf002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 	}
 
 	half := watchClientHalf(ctx, rc)
-	if !half.Armed {
+	// A half the candidate does not CLAIM is not a caveat: its assertion is
+	// declared not applicable in roles.go, and a WARN here would hold the row
+	// down for a direction that is out of scope.
+	if !half.Armed && !half.OutOfScope {
 		t.caveat("the [C] half was not observed: %s", half.Why)
 	}
 

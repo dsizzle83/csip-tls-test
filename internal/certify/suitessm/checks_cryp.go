@@ -53,25 +53,32 @@ func cryp001(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		t.add(v, "%s → %s", label, obs)
 	}
 
-	// Two of the three suites can be taken all the way to an established
-	// session by this bench, and are: a selection is not a session.
-	completed := 0
-	for _, suite := range []uint16{suiteECDHE_ECDSA_AES128_GCM_SHA256, suiteECDHE_ECDSA_CHACHA20_POLY1305} {
-		s, err := completingSuiteSession(ctx, rc, pf, suite)
+	// A selection is not a session, and §2.5.1.1 asks for a session: after each
+	// single-suite hello the document says "[S] EUT-S accepts the connection
+	// and completes the handshake", and §2.5.1.3's criterion is that the EUT-S
+	// "successfully establishes a secure session using each of the mandatory
+	// TLS v1.2 cipher suites". So all THREE are taken to a completed session
+	// here, 0xC0AE included — see ccmsession.go for why that needs a client
+	// other than Go's.
+	sessions := make([]*completedSession, len(mandated12))
+	for i, want := range mandated12 {
+		note := fmt.Sprintf("CRYP-001 completing session on 0x%04X %s", want, tlsdis.CipherSuiteName(want))
+		s, err := completeOnSuite(ctx, rc, pf, want, note)
 		if err != nil {
+			if why, bench := benchObstacle(err); bench {
+				t.caveat("no session was established on 0x%04X %s, and the obstacle is THIS BENCH's, not "+
+					"the DUT's — %s. The DUT's selection of the suite is asserted from the capture below; "+
+					"its certificate is measured on the PKI rows, not here",
+					want, tlsdis.CipherSuiteName(want), why)
+				continue
+			}
 			t.add(certify.Fail, "no session could be established on 0x%04X %s: %v",
-				suite, tlsdis.CipherSuiteName(suite), err)
+				want, tlsdis.CipherSuiteName(want), err)
 			continue
 		}
-		completed++
-		t.add(certify.Pass, "an mbaps session was established and closed on 0x%04X %s",
-			suite, tlsdis.CipherSuiteName(suite))
-		s.Close()
+		sessions[i] = s
+		t.add(certify.Pass, "%s", s.Describe())
 	}
-	t.caveat("0x%04X %s: the DUT's SELECTION of the suite and its full server flight are asserted from the "+
-		"capture, but this bench's TLS stack (Go crypto/tls) implements no CCM cipher, so no session was "+
-		"established on it and none is claimed",
-		suiteECDHE_ECDSA_AES128_CCM_8, tlsdis.CipherSuiteName(suiteECDHE_ECDSA_AES128_CCM_8))
 
 	// CRYP-001#7 (census 20260731T234821): forced, not passive — see
 	// watchClientHalfForced's doc for why a plain wait almost never catches
@@ -105,6 +112,17 @@ func cryp001(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 						verdict, obs := serverFlightVerdict(v.ServerFlight())
 						return verdict, obs, v.Frames
 					})
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, a)
+
+				// §2.5.1.3's own criterion, cited on the session's own frames:
+				// the DUT did not merely name the suite, it completed a
+				// handshake on it.
+				a, err = establishedSessionFact(ev, sessions[i],
+					fmt.Sprintf("SunSpecTCP-17 / §2.5.1.3: the EUT-S ESTABLISHED a secure session on 0x%04X %s — the handshake completed, not merely the selection",
+						want, tlsdis.CipherSuiteName(want)))
 				if err != nil {
 					return nil, err
 				}
@@ -173,9 +191,29 @@ func cryp002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 		v, obs := normalResponseVerdict(m1.Response)
 		t.add(v, "Model 1 read on unit %d (chain models %v): %s", chain.Unit, chain.IDs(), obs)
 	}
-	t.caveat("0x%04X %s: selection is asserted from the capture; this bench's TLS stack implements no CCM "+
-		"cipher, so no TLS 1.3 CCM session was established and none is claimed",
-		suiteTLS13_AES128_CCM_SHA256, tlsdis.CipherSuiteName(suiteTLS13_AES128_CCM_SHA256))
+	// §2.5.2.1 steps 3–8 walk the three mandated TLS 1.3 suites and require the
+	// EUT-S to "accept the connection and complete the handshake" on each. All
+	// three are taken to a completed session here, 0x1304 included — see
+	// ccmsession.go. The TLS 1.3 session above stays: it is the one whose
+	// records the key log can decrypt, and step 5's Model 1 read is asserted
+	// from that plaintext rather than from this side's word for it.
+	sessions := make([]*completedSession, len(mandated13))
+	for i, want := range mandated13 {
+		note := fmt.Sprintf("CRYP-002 completing session on 0x%04X %s", want, tlsdis.CipherSuiteName(want))
+		cs, cerr := completeOnSuite(ctx, rc, pf, want, note)
+		if cerr != nil {
+			if why, bench := benchObstacle(cerr); bench {
+				t.caveat("no TLS 1.3 session was established on 0x%04X %s, and the obstacle is THIS "+
+					"BENCH's, not the DUT's — %s", want, tlsdis.CipherSuiteName(want), why)
+				continue
+			}
+			t.add(certify.Fail, "no TLS 1.3 session could be established on 0x%04X %s: %v",
+				want, tlsdis.CipherSuiteName(want), cerr)
+			continue
+		}
+		sessions[i] = cs
+		t.add(certify.Pass, "%s", cs.Describe())
+	}
 
 	// CRYP-002#6 (census 20260731T234821): see watchClientHalfForced's doc.
 	half := watchClientHalfForced(ctx, rc)
@@ -198,6 +236,14 @@ func cryp002(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 						}
 						return v, obs
 					})
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, a)
+
+				a, err = establishedSessionFact(ev, sessions[i],
+					fmt.Sprintf("SunSpecTCP-18 / §2.5.2.3: the EUT-S ESTABLISHED a TLS 1.3 session on 0x%04X %s — the handshake completed, not merely the selection",
+						want, tlsdis.CipherSuiteName(want)))
 				if err != nil {
 					return nil, err
 				}
@@ -823,25 +869,6 @@ func ops001(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
 }
 
 // ── shared bits of this family ──────────────────────────────────────────────
-
-// completingSuiteSession establishes a session pinned to one TLS 1.2 suite, for
-// the "a session was actually established on this suite" half of CRYP-001.
-func completingSuiteSession(ctx context.Context, rc *certify.RunCtx, pf preflight, suite uint16) (*Session, error) {
-	roots, err := rootPool(pf.PKI)
-	if err != nil {
-		return nil, err
-	}
-	cert, err := roleCert(pf.PKI, "grid-service")
-	if err != nil {
-		return nil, err
-	}
-	return dial(ctx, rc, pf.Target, dialOpts{
-		Cert: cert, Roots: roots,
-		MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12,
-		CipherSuites: []uint16{suite},
-		Note:         fmt.Sprintf("CRYP-001 completing session on 0x%04X", suite),
-	})
-}
 
 // missingSuites returns the members of want that are absent from got.
 func missingSuites(got, want []uint16) []uint16 {
