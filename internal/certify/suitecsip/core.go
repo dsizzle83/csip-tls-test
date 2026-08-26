@@ -1269,7 +1269,7 @@ func coreResponsesSpec(nonce string) spec {
 // pair's loser to Superseded(7) at ARBITRATION time, which happens the first
 // walk after Setup and is independent of either control's own StartOffset —
 // so the loser typically earns its Response within one poll cycle. The
-// winner's own interval (StartOffset 30s, DurationS 120s here) does not even
+// winner's own interval (StartOffset scheduledStartedStartOffsetS, DurationS 120s here) does not even
 // END until Setup+150s. A Want keyed on the loser alone therefore reports
 // satisfied, and with it ends the live phase — and the capture shortly after
 // — while the winner has posted nothing at all: the cited run's capture
@@ -1340,14 +1340,19 @@ func coreSupersedingSpec(nonce string) spec {
 			older := -60
 			if _, err := d.PostControl(ctx, ControlRequest{
 				Program: 2, MRID: loser, Description: "CORE-023 superseded control",
-				StartOffset: 30, DurationS: 120, MaxLimW: ptr(int64(3000)),
+				// scheduledStartedStartOffsetS, not 30: CORE-023 grades the winner's
+				// Started(2), which needs the DUT to fetch the pair while Scheduled —
+				// the same fetch-before-start discipline as inverterControlSpec
+				// (CSIP-ORACLE-BASIC008-STARTED-RESPONSE-TIMING). Both controls move
+				// together, so the supersession (by primacy/creationTime) is unchanged.
+				StartOffset: scheduledStartedStartOffsetS, DurationS: 120, MaxLimW: ptr(int64(3000)),
 				CreationOffsetS: &older, PotentiallySuperseded: ptr(true),
 			}); err != nil {
 				return err
 			}
 			if _, err := d.PostControl(ctx, ControlRequest{
 				Program: 0, MRID: winner, Description: "CORE-023 superseding control",
-				StartOffset: 30, DurationS: 120, MaxLimW: ptr(int64(2000)),
+				StartOffset: scheduledStartedStartOffsetS, DurationS: 120, MaxLimW: ptr(int64(2000)),
 			}); err != nil {
 				return err
 			}

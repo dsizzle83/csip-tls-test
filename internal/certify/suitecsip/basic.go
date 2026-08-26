@@ -433,6 +433,26 @@ type scalarControlWindow struct {
 	durationS    int
 }
 
+// pollCadenceS is the longest interval between two of the DUT's discovery polls
+// on this bench: the 2030.5 server advertises pollRate 1m0s and the product's
+// own discovery-interval floor is 1m0s, and a client in poll_rate_mode "honor"
+// paces at the slower of the two, so 60s bounds the gap. Any Started(2)-graded
+// SCHEDULED control whose start does not exceed it can be fetched already-active
+// on an unlucky phase and draw no Started (CSIP-ORACLE-BASIC008-STARTED-RESPONSE-
+// TIMING).
+const pollCadenceS = 60
+
+// scheduledStartedStartOffsetS is the start offset every Started(2)-graded
+// SCHEDULED control opens at: past pollCadenceS so the DUT's next poll ALWAYS
+// finds it still Scheduled and can witness the transition to Active, and under
+// defaultWait (90s) so an oracled row's first read still lands on an active
+// control. The one Started-graded row that does NOT use it is CORE-022
+// (coreResponses), whose control is published Activate:true / StartOffset:0 —
+// already Active, so there is no Scheduled->Active transition to miss and no
+// race. Every other Started-graded control — inverterControlSpec's
+// scalar/oracleWindow and CORE-023's superseding pair — takes this offset.
+const scheduledStartedStartOffsetS = 75
+
 // scalarWindow is the default scalar control window. Its start offset is set
 // LONGER THAN THE DUT'S POLL CADENCE deliberately
 // (CSIP-ORACLE-BASIC008-STARTED-RESPONSE-TIMING): every inverterControlSpec row
@@ -445,7 +465,7 @@ type scalarControlWindow struct {
 // exceeds one poll interval, so the DUT's next poll (<=60s out) ALWAYS fetches
 // the control while Scheduled, whatever the upstream timing; it still sits under
 // the +150s observation window so the Started that follows is captured.
-var scalarWindow = scalarControlWindow{startOffsetS: 75, durationS: 120}
+var scalarWindow = scalarControlWindow{startOffsetS: scheduledStartedStartOffsetS, durationS: 120}
 
 // oracleWindow widens the window for the ORACLED scalar rows (BASIC-010/013) so
 // the control stays active across the ENTIRE span in which the PostWait oracle
@@ -471,7 +491,7 @@ var scalarWindow = scalarControlWindow{startOffsetS: 75, durationS: 120}
 // at the other edge. [+75s, +765s] contains the whole span with margin;
 // TestOracledScalarWindow_ContainsEveryPostWaitRead pins the arithmetic against
 // waitCap so a later change to either bound fails there rather than on a board.
-var oracleWindow = scalarControlWindow{startOffsetS: 75, durationS: 690}
+var oracleWindow = scalarControlWindow{startOffsetS: scheduledStartedStartOffsetS, durationS: 690}
 
 // oracleDefaultWindow is the window the PRESCRIBED default is published in
 // (IW15-004 — oracleBinding.Prescribed).

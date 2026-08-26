@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1044,7 +1045,20 @@ func TestOracleOutcome_WarnsWhenTheBaselineIsMissing(t *testing.T) {
 // their event strictly after one poll interval so the DUT's next poll always
 // finds it Scheduled, regardless of upstream row timing.
 func TestStartedGradedWindows_OutlastThePollCadence(t *testing.T) {
-	const maxPollIntervalS = 60 // bench pollRate and discovery-interval floor
+	// The single source of truth every Started(2)-graded SCHEDULED control uses.
+	if scheduledStartedStartOffsetS <= pollCadenceS {
+		t.Errorf("scheduledStartedStartOffsetS is +%ds, not past the %ds poll cadence — a scheduled control "+
+			"opened at it can be fetched ALREADY ACTIVE and never post Started(2) "+
+			"(CSIP-ORACLE-BASIC008-STARTED-RESPONSE-TIMING)", scheduledStartedStartOffsetS, pollCadenceS)
+	}
+	// It must also stay UNDER defaultWait, or an oracled row's earliest read can
+	// land before its control is active (the pinned oracleWindow invariant).
+	if time.Duration(scheduledStartedStartOffsetS)*time.Second >= defaultWait {
+		t.Errorf("scheduledStartedStartOffsetS (+%ds) is at/after defaultWait (%s) — an oracled read could "+
+			"land before the control is active", scheduledStartedStartOffsetS, defaultWait)
+	}
+	// The inverterControl windows must carry it (a literal that drifted below the
+	// cadence would race).
 	for _, w := range []struct {
 		name string
 		win  scalarControlWindow
@@ -1052,10 +1066,144 @@ func TestStartedGradedWindows_OutlastThePollCadence(t *testing.T) {
 		{"scalarWindow", scalarWindow},
 		{"oracleWindow", oracleWindow},
 	} {
-		if w.win.startOffsetS <= maxPollIntervalS {
+		if w.win.startOffsetS <= pollCadenceS {
 			t.Errorf("%s opens its event at +%ds, not past the %ds poll cadence — the DUT can fetch it "+
 				"ALREADY ACTIVE on an unlucky phase and never post Started(2) "+
-				"(CSIP-ORACLE-BASIC008-STARTED-RESPONSE-TIMING)", w.name, w.win.startOffsetS, maxPollIntervalS)
+				"(CSIP-ORACLE-BASIC008-STARTED-RESPONSE-TIMING)", w.name, w.win.startOffsetS, pollCadenceS)
+		}
+	}
+}
+
+// TestAggregatorLifecycleControls_OutlastThePollCadence enumerates the
+// aggregator scenarios MECHANICALLY (aggScenarios(), no hardcoded row list) and
+// asserts that every control a Lifecycle grades a 1/2/3 sequence for — i.e.
+// every Started(2)-graded control — opens past the poll cadence. A superseded or
+// non-lifecycle control (e.g. CERT-AGG009SY at +60s) is not graded on Started
+// and is deliberately exempt. These rows are the DER-AGGREGATOR-CLIENT profile's
+// and do NOT run for this DER-Client candidate, but the invariant keeps them
+// from racing if a future profile ever selects that column.
+func TestAggregatorLifecycleControls_OutlastThePollCadence(t *testing.T) {
+	scenarios := aggScenarios()
+	if len(scenarios) == 0 {
+		t.Fatal("aggScenarios() is empty — the enumeration would vacuously pass")
+	}
+	// Documented exceptions (guardrail: a row whose lifecycle arithmetic cannot
+	// take the bump without breaking a downstream assertion is left and named,
+	// not silently changed). CERT-AGG012SY's +60s start is COUPLED to
+	// CERT-AGG012TFA's LateAfterS:75 — AGG-012's whole premise is "the TFA event
+	// is created only AFTER the SY event has STARTED" (the independent-mode
+	// counterpart of AGG-009), so raising SY past +75 collapses that ordering and
+	// the "no status 7" discriminator it sets up. It sits AT the cadence (a
+	// boundary, not a clear miss), and AGG-012 is a DER-AGGREGATOR-CLIENT profile
+	// row NOT selected for this DER-Client candidate — so it never runs here and
+	// the bounded boundary risk cannot be re-verified on the board. Revisit with
+	// a coupled LateAfterS bump IF a profile ever selects the aggregator column.
+	exceptions := map[string]string{
+		"CERT-AGG012SY": "start coupled to CERT-AGG012TFA LateAfterS (AGG-012 'TFA after SY started'); " +
+			"aggregator-profile, not selected for the DER-Client candidate",
+	}
+	checked := 0
+	for id, sc := range scenarios {
+		byMRID := map[string]aggControl{}
+		for _, c := range sc.Controls {
+			byMRID[c.MRID] = c
+		}
+		for _, lc := range sc.Lifecycles {
+			c, ok := byMRID[lc.MRID]
+			if !ok {
+				continue // a Lifecycle may name a control published by a sibling row
+			}
+			checked++
+			if c.StartOffset <= pollCadenceS {
+				if reason, ok := exceptions[lc.MRID]; ok {
+					t.Logf("%s: DOCUMENTED EXCEPTION — Started-graded control %s at +%ds (<= %ds cadence): %s",
+						id, lc.MRID, c.StartOffset, pollCadenceS, reason)
+					continue
+				}
+				t.Errorf("%s: Started-graded control %s opens at +%ds, not past the %ds poll cadence — it "+
+					"can be fetched already-active and never post Started(2); if it genuinely cannot take "+
+					"the bump, add it to exceptions with a reason", id, lc.MRID, c.StartOffset, pollCadenceS)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no aggregator Lifecycle controls were checked — the enumeration is not reaching them")
+	}
+}
+
+// recordingControlDriver backs a Driver with a fake admin that records every
+// ControlRequest a spec's Setup publishes, so a test can inspect the actual
+// StartOffset/Activate the row puts on the wire — mechanical, not a re-declared
+// literal.
+func recordingControlDriver(t *testing.T) (*Driver, *[]ControlRequest) {
+	t.Helper()
+	var mu sync.Mutex
+	var recorded []ControlRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("/admin/control", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var req ControlRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		recorded = append(recorded, req)
+		mu.Unlock()
+		mrid := req.MRID
+		if mrid == "" {
+			mrid = "MINTED-" + req.Description
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"mrid": mrid})
+	})
+	mux.HandleFunc("/admin/status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, AdminStatus{Programs: []AdminProgram{{ID: 0, MRID: "P0", Primacy: 1}}, ServerTime: 1})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	d := &Driver{rc: &certify.RunCtx{Case: &certify.Case{UID: "invariant"}}, Admin: certify.NewAdminClient(srv.URL, nil)}
+	return d, &recorded
+}
+
+// TestStartedGradedCoreSpecs_ScheduleControlsPastTheCadence drives the two core
+// Started(2)-graded specs' Setup and inspects the controls they ACTUALLY publish
+// (not a re-declared offset): every SCHEDULED control — a future StartOffset the
+// DUT must fetch while still Scheduled to witness its start — must open past the
+// poll cadence. CORE-022 (coreResponses) publishes only Activate:true /
+// StartOffset:0 controls (already active, no Scheduled->Active transition to
+// miss), so it is correctly exempt; CORE-023 (coreSuperseding) publishes a
+// scheduled winner+loser pair that MUST clear the cadence.
+func TestStartedGradedCoreSpecs_ScheduleControlsPastTheCadence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec spec
+	}{
+		{"CORE-022 coreResponses", coreResponsesSpec("inv")},
+		{"CORE-023 coreSuperseding", coreSupersedingSpec("inv")},
+	} {
+		d, recorded := recordingControlDriver(t)
+		if tc.spec.Setup == nil {
+			t.Fatalf("%s has no Setup to drive", tc.name)
+		}
+		if err := tc.spec.Setup(context.Background(), d, map[string]string{}); err != nil {
+			t.Fatalf("%s Setup: %v", tc.name, err)
+		}
+		if len(*recorded) == 0 {
+			t.Fatalf("%s published no control — the inspection is vacuous", tc.name)
+		}
+		for _, req := range *recorded {
+			// A control that is Activate:true, or opens at/before now (StartOffset
+			// <= 0), is ALREADY active when fetched — there is no Scheduled->Active
+			// transition for the DUT to miss, so it is not subject to the race.
+			if req.Activate || req.StartOffset <= 0 {
+				continue
+			}
+			if req.StartOffset <= pollCadenceS {
+				t.Errorf("%s: scheduled control %q opens at +%ds, not past the %ds poll cadence — it can be "+
+					"fetched already-active and never post Started(2)", tc.name, req.MRID, req.StartOffset,
+					pollCadenceS)
+			}
 		}
 	}
 }
