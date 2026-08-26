@@ -380,6 +380,48 @@ func ErrString(code int) string {
 	return C.GoString(&buf[0])
 }
 
+// Alert is one TLS alert wolfSSL recorded on a session: its level (1 = warning,
+// 2 = fatal; RFC 5246 §7.2) and its description code.
+type Alert struct {
+	Level int
+	Code  int
+}
+
+// Present reports whether this is a REAL alert. A TLS alert level is 1
+// (warning) or 2 (fatal) per RFC 5246 §7.2; wolfSSL leaves an unrecorded slot
+// at its own sentinel — 0 or -1 depending on the direction — and neither of
+// those is an alert. Testing the level rather than "non-zero" is what keeps the
+// tx sentinel {-1,-1} from reading as a warning nobody sent.
+func (a Alert) Present() bool { return a.Level == 1 || a.Level == 2 }
+
+// AlertHistory returns the last alert wolfSSL received (rx) and the last it sent
+// (tx) on this session.
+//
+// It is the detail a bare "wolfSSL_connect failed: err=-308" throws away, and
+// the difference it recovers is the whole diagnosis: a peer that aborts a
+// handshake by sending a fatal alert — bad_certificate, handshake_failure,
+// unknown_ca — leaves it in rx here, whereas a peer that simply closes or resets
+// the TCP connection leaves rx empty and SOCKET_ERROR_E is all the transport
+// reports. "The DUT refused us, and said why" and "the DUT dropped the
+// connection" are different findings, and SOCKET_ERROR_E alone cannot tell them
+// apart.
+//
+// ok is false only when wolfSSL declined to report the history at all (a nil or
+// unusable session); a live session with no alert returns ok=true and two
+// zero-valued, not-Present alerts.
+func AlertHistory(ssl unsafe.Pointer) (rx, tx Alert, ok bool) {
+	if ssl == nil {
+		return Alert{}, Alert{}, false
+	}
+	var h C.WOLFSSL_ALERT_HISTORY
+	if int(C.wolfSSL_get_alert_history((*C.WOLFSSL)(ssl), &h)) != Success {
+		return Alert{}, Alert{}, false
+	}
+	rx = Alert{Level: int(h.last_rx.level), Code: int(h.last_rx.code)}
+	tx = Alert{Level: int(h.last_tx.level), Code: int(h.last_tx.code)}
+	return rx, tx, true
+}
+
 // Read reads from an SSL session. Returns the number of bytes read, or an
 // *IOError carrying the wolfSSL reason code — callers MUST consult
 // IOError.Retryable before concluding anything about the peer.

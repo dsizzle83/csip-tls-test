@@ -413,6 +413,28 @@ func withManifest(t *testing.T, frameBudgetMS int) func(*certify.Options) {
 	return func(o *certify.Options) { o.ManifestPath = path }
 }
 
+// withCandidate writes a full, valid candidate manifest declaring the given DER
+// role and served model list, and points the run at it. It is how the MOD-4
+// storage-conditional tests state "this candidate declares itself a battery"
+// versus "a solar inverter" in one line.
+func withCandidate(t *testing.T, role, models string) func(*certify.Options) {
+	t.Helper()
+	body := fmt.Sprintf(`{
+  "profile": "one-to-one-7xx-tcp",
+  "topology": {"configured_der": 1, "role": %q, "northbound_units": [1]},
+  "csip": {"role": "der-client", "end_devices": 1, "der_resources": 1},
+  "secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802},
+  "modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx"},
+  "authority_profiles": ["csip", "mbaps"],
+  "models": [%s]
+}`, role, models)
+	path := filepath.Join(t.TempDir(), "candidate.json")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return func(o *certify.Options) { o.ManifestPath = path }
+}
+
 // OUTCOME 1 — the follow-up answered on the SAME connection.
 //
 // The device has a frame budget and resynchronises when it expires. The check
@@ -705,6 +727,63 @@ func TestMOD4PassesAChainCarryingTheWholeProfile(t *testing.T) {
 	if a.Verdict != certify.Pass {
 		t.Fatalf("a complete profile chain did not pass: %s", a.Observed)
 	}
+}
+
+// TestMOD4PassesASolarInverterMissingOnlyStorageModel713 is the bench case the
+// registry filed (runs/f7950fc-mbaps): the DUT serves [1,701-712], model 713 is
+// absent, and the candidate is a solar inverter with no storage. Model 713 is
+// conditionally optional for a non-storage implementation, so MOD-4 must PASS.
+// No -manifest is supplied, which is the pre-manifest shape a plain bench run
+// gets — storage is not assumed, and the inverter is not failed for a model it
+// legitimately does not have.
+func TestMOD4PassesASolarInverterMissingOnlyStorageModel713(t *testing.T) {
+	dev := newDevice(t, deviceOpts{Full1547: true, NoStorageModel: true})
+	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
+	if a.Verdict != certify.Pass {
+		t.Fatalf("a solar chain [1,701-712] failed MOD-4 on the absent storage model: %s", a.Observed)
+	}
+	if !contains(a.Observed, "713") {
+		t.Errorf("the assertion does not account for model 713's conditional absence: %q", a.Observed)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+// TestMOD4PassesASolarInverterThatDeclaresItselfInAManifest is the same chain
+// with the declaration present (topology.role=inverter). It must still PASS: an
+// inverter that says so is no more required to serve a storage model than one
+// that says nothing.
+func TestMOD4PassesASolarInverterThatDeclaresItselfInAManifest(t *testing.T) {
+	dev := newDevice(t, deviceOpts{Full1547: true, NoStorageModel: true})
+	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil,
+		withCandidate(t, "inverter", "1, 701, 702, 703, 704, 705, 706, 711, 712"))
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
+	if !contains(a.Note+a.Observed, "role=\"inverter\"") {
+		t.Errorf("the evidence does not record the manifest storage signal it acted on:\n  note=%q\n  obs=%q",
+			a.Note, a.Observed)
+	}
+}
+
+// TestMOD4FailsAStorageCandidateMissingModel713 is the other half of the
+// conditional, and the reason it is a conditional rather than a blanket
+// exemption. The SAME [1,701-712] chain, but the candidate DECLARES storage
+// (topology.role=battery). A storage-capable candidate MUST serve model 713, so
+// its absence is a FAIL that names the model.
+func TestMOD4FailsAStorageCandidateMissingModel713(t *testing.T) {
+	dev := newDevice(t, deviceOpts{Full1547: true, NoStorageModel: true})
+	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil,
+		withCandidate(t, "battery", "1, 701, 702, 703, 704, 705, 706, 711, 712"))
+	o.wantVerdict(t, certify.Fail)
+	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
+	if a.Verdict != certify.Fail {
+		t.Fatalf("a storage candidate missing model 713 passed MOD-4: %s", a.Observed)
+	}
+	if !contains(a.Observed, "713") {
+		t.Errorf("the failing assertion does not name the absent model 713: %q", a.Observed)
+	}
+	o.wantVerifiableBundle(t)
 }
 
 func TestMOD4RecordsAnOperatorScopedRequirementListAsAnOverride(t *testing.T) {

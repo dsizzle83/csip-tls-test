@@ -44,14 +44,47 @@ package tlsprobe
 // the coupling cannot rot silently.
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 
+	"csip-tls-test/internal/evidence/tlsdis"
 	"csip-tls-test/internal/wolfssl"
 )
 
 // wolfReasonPattern matches internal/wolfssl's Connect/Accept failure tail.
 var wolfReasonPattern = regexp.MustCompile(`err=(-?\d+)`)
+
+// wolfSSL transport-layer reason codes, transcribed from the bench sysroot's
+// wolfssl/error-ssl.h. These are what a peer that ABORTED THE CONNECTION —
+// rather than rejecting a cipher or a certificate with a named alert — surfaces
+// as; the board's bare -308 (SOCKET_ERROR_E) was the first of them.
+const (
+	codeSocketError      = -308 // SOCKET_ERROR_E       — error state on socket
+	codeFatalAlert       = -313 // FATAL_ERROR          — a fatal alert was RECEIVED
+	codeSocketPeerClosed = -397 // SOCKET_PEER_CLOSED_E — underlying transport closed
+)
+
+// alertText renders a wolfSSL-recorded TLS alert the way an error message
+// should: level, code, and the RFC 5246 description name. It returns "" for the
+// zero (no-alert) value.
+func alertText(a wolfssl.Alert) string {
+	if !a.Present() {
+		return ""
+	}
+	return fmt.Sprintf("%s alert %d (%s)",
+		tlsdis.AlertLevelName(uint8(a.Level)), a.Code, tlsdis.AlertDescriptionName(uint8(a.Code)))
+}
+
+// transportClosed reports that the handshake failed because the peer closed or
+// reset the TCP connection rather than sending a TLS alert — the shape a bare
+// SOCKET_ERROR_E takes when no alert accompanied it.
+func (e *HandshakeError) transportClosed() bool {
+	if e.RxAlert.Present() {
+		return false
+	}
+	return e.Code == codeSocketError || e.Code == codeSocketPeerClosed
+}
 
 // peerRejectedCodes are the wolfSSL reasons that mean THIS side refused the
 // peer's certificate chain. Transcribed from the bench sysroot's

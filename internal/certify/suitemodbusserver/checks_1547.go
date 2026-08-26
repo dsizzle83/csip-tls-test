@@ -33,6 +33,52 @@ import (
 	"csip-tls-test/internal/certify"
 )
 
+// storageCapability decides whether the profile's storage requirements — model
+// 713 (DERStorageCapacity) and model 702's charge-rate ratings — apply to this
+// candidate, and returns the signal it used so the evidence bundle names it.
+//
+// Model 713 is "conditionally optional ... for an implementation that does not
+// support storage" (profile §3, Table 30 note; ProfileModelConditional). Read
+// the other way, that same sentence REQUIRES it of an implementation that DOES
+// support storage. The signals, in order of authority:
+//
+//   - the DUT serving model 713 on the wire is the profile's own marker for
+//     storage support, so a DUT that serves it is storage-capable (and, being
+//     present, is not among the missing models this governs);
+//   - otherwise the candidate manifest's declaration: topology.role == "battery"
+//     is storage, and a manifest that lists model 713 among the models it serves
+//     is claiming storage even where its role does not;
+//   - otherwise — no manifest, and no 713 on the wire — the candidate is treated
+//     as NON-storage. This is the pre-manifest behaviour, and the right default
+//     for the RC0 candidate: a solar 7xx inverter must not be failed for
+//     omitting a storage model it does not have (advertising one it lacks would
+//     be the opposite defect — a false capability claim).
+func storageCapability(rc *certify.RunCtx, present map[uint16]bool) (bool, string) {
+	if present[storageModel] {
+		return true, fmt.Sprintf(
+			"the DUT serves model %d on the wire, the profile's own marker for storage support", storageModel)
+	}
+	if rc != nil {
+		if m := rc.Manifest(); m != nil {
+			if strings.EqualFold(m.Role, "battery") {
+				return true, fmt.Sprintf("the candidate manifest declares topology.role=%q (%s)", m.Role, m.Path())
+			}
+			for _, id := range m.Models {
+				if id == int(storageModel) {
+					return true, fmt.Sprintf(
+						"the candidate manifest lists model %d among its served models (%s)", storageModel, m.Path())
+				}
+			}
+			return false, fmt.Sprintf(
+				"the candidate manifest declares topology.role=%q and lists no model %d, so it does not "+
+					"support storage (%s)", m.Role, storageModel, m.Path())
+		}
+	}
+	return false, fmt.Sprintf(
+		"no candidate manifest was supplied and the DUT serves no model %d, so storage is not assumed "+
+			"(the pre-manifest behaviour)", storageModel)
+}
+
 // checkMOD4 implements SS-1547-TEST-v1.1 MOD-4, Mandatory Points.
 //
 // Steps: for each model, read the points; compare them against the list of
@@ -59,7 +105,12 @@ func checkMOD4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		}
 	}
 	present := ch.PresentSet()
-	hardMissing, condMissing := missingModels(present, required)
+	// Whether the profile's storage requirements — model 713 and model 702's
+	// charge-rate ratings — apply to this candidate. A storage-capable
+	// candidate must serve model 713; a non-storage inverter must not be failed
+	// for omitting a storage model it does not have.
+	storageCapable, storageSignal := storageCapability(rc, present)
+	hardMissing, condMissing := missingModels(present, required, storageCapable)
 
 	// The DUT's own AC topology decides which of model 701's six voltage points
 	// the profile actually requires of it.
@@ -114,7 +165,7 @@ func checkMOD4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		block := blocks[id]
 		var bad, excused []string
 		for _, name := range reqNames {
-			need, excuse := pointRequired(id, name, acType, acTypeKnown, present[storageModel])
+			need, excuse := pointRequired(id, name, acType, acTypeKnown, storageCapable)
 			if !need {
 				excused = append(excused, fmt.Sprintf("%s (%s)", name, excuse))
 				continue
@@ -157,6 +208,7 @@ func checkMOD4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	if len(condMissing) > 0 {
 		notes += fmt.Sprintf("; conditionally optional and absent: %v", condMissing)
 	}
+	notes += "; storage support: " + storageSignal
 	if override != "" {
 		notes += "; the required-model list was overridden by -param " + param1547Models + "=" + override
 	}
@@ -188,6 +240,10 @@ func checkMOD4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 			for _, id := range condMissing {
 				obs += fmt.Sprintf("; model %d absent — %s", id, ProfileModelConditional[id])
 			}
+			// Model 713's classification above turns on whether the candidate
+			// supports storage; the signal is recorded so a reviewer sees WHY a
+			// missing 713 was a shrug or a failure on this run.
+			obs += "; storage support: " + storageSignal
 			a, err := c.frames(
 				"every SunSpec model the IEEE 1547-2018 profile requires is implemented in the device",
 				"the complete SunSpec discovery walk, terminated on the end model, compared against the "+
