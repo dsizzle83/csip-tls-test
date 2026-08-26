@@ -183,10 +183,11 @@ var requiredScaleFactors = map[uint16][]string{
 
 // pointRequired reports whether the profile requires the named point of the
 // model, given the DUT's own ACType (which only matters for model 701) and
-// whether the DUT declares storage by serving model 713 (which only matters
-// for model 702's charge-rate ratings). The second result carries the
+// whether the candidate is storageCapable (which only matters for model 702's
+// charge-rate ratings; see storageCapability for how that is derived from the
+// served chain and the candidate manifest). The second result carries the
 // applicability qualifier when the point is excused.
-func pointRequired(model uint16, name string, acType uint16, acTypeKnown, servesStorage bool) (bool, string) {
+func pointRequired(model uint16, name string, acType uint16, acTypeKnown, storageCapable bool) (bool, string) {
 	req, ok := requiredPoints[model]
 	if !ok {
 		return false, ""
@@ -201,13 +202,13 @@ func pointRequired(model uint16, name string, acType uint16, acTypeKnown, serves
 	if !found {
 		return false, ""
 	}
-	if model == 702 && storageConditional[name] && !servesStorage {
+	if model == 702 && storageConditional[name] && !storageCapable {
 		return false, "INTERPRETATION (profile1547.go's storageConditional, NOT a qualifier printed in " +
-			"Table 18): this point rates a charge axis, and the DUT serves no model 713 — the profile's " +
-			"own marker for storage support, which it already makes conditional on exactly that. A DER " +
-			"with no storage behind it has no charge-rate rating to declare, and the not-implemented " +
-			"sentinel is the honest encoding of that; a zero here would be the device positively " +
-			"declaring a rated charge maximum of 0 W"
+			"Table 18): this point rates a charge axis, and this candidate declares no storage — it serves " +
+			"no model 713, the profile's own marker for storage support, and its manifest (if any) claims no " +
+			"battery role. A DER with no storage behind it has no charge-rate rating to declare, and the " +
+			"not-implemented sentinel is the honest encoding of that; a zero here would be the device " +
+			"positively declaring a rated charge maximum of 0 W"
 	}
 	if model != 701 {
 		return true, ""
@@ -241,12 +242,28 @@ func acTypeName(v uint16) string {
 
 // missingModels returns the profile-required models absent from the DUT's
 // chain, split into unconditionally required and conditionally optional.
-func missingModels(present map[uint16]bool, required []uint16) (hard, conditional []uint16) {
+//
+// A model the profile marks conditional (ProfileModelConditional) lands in the
+// conditional bucket ONLY for a candidate the condition actually excuses. Model
+// 713's condition is storage support: the profile makes DERStorageCapacity
+// optional "for an implementation that does not support storage", which is the
+// same sentence read the other way — an implementation that DOES support
+// storage must serve it. So for a storageCapable candidate a missing 713 is a
+// HARD failure, not a shrug, which is what keeps the exemption from being a
+// blanket hole a storage device could omit a required model behind.
+// storageCapable is derived from the candidate's declaration and the served
+// chain by storageCapability(); a run with no manifest that serves no 713 gets
+// storageCapable=false and the pre-manifest behaviour unchanged.
+func missingModels(present map[uint16]bool, required []uint16, storageCapable bool) (hard, conditional []uint16) {
 	for _, id := range required {
 		if present[id] {
 			continue
 		}
 		if _, ok := ProfileModelConditional[id]; ok {
+			if id == storageModel && storageCapable {
+				hard = append(hard, id)
+				continue
+			}
 			conditional = append(conditional, id)
 			continue
 		}

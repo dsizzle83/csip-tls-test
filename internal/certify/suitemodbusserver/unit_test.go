@@ -237,13 +237,70 @@ func TestBaseProbeRecognisesTheSunSpecIdentifier(t *testing.T) {
 
 func TestMissingModelsSeparatesRequiredFromConditional(t *testing.T) {
 	present := map[uint16]bool{1: true, 701: true, 702: true, 704: true}
-	hard, cond := missingModels(present, ProfileModels)
+	hard, cond := missingModels(present, ProfileModels, false)
 	want := []uint16{703, 705, 706, 707, 708, 709, 710, 711, 712}
 	if !reflect.DeepEqual(hard, want) {
 		t.Errorf("hard-missing = %v, want %v", hard, want)
 	}
 	if !reflect.DeepEqual(cond, []uint16{713}) {
 		t.Errorf("conditionally-missing = %v, want [713] (storage capacity is optional without storage)", cond)
+	}
+}
+
+// TestMissingModels713IsConditionalOnlyForANonStorageCandidate is the MOD-4
+// mutation proof, at the level where the verdict is decided.
+//
+// A solar 7xx inverter serves the whole profile except model 713. That chain
+// PASSES the model-presence criterion because 713 is conditionally optional for
+// a candidate with no storage — and this test proves that PASS is exactly what
+// the storage conditional buys, by flipping the ONE input (storageCapable) and
+// watching the same chain become a hard failure. Remove the conditional (treat
+// 713 as unconditionally required, i.e. storageCapable always true) and the
+// solar case fails; that is the mutation the check exists to survive.
+func TestMissingModels713IsConditionalOnlyForANonStorageCandidate(t *testing.T) {
+	// The solar bench chain: model 1 and 701-712, no 713.
+	present := map[uint16]bool{}
+	for _, id := range []uint16{1, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712} {
+		present[id] = true
+	}
+
+	// Non-storage candidate: 713 is conditionally optional, so nothing is
+	// hard-missing and the model-presence criterion passes.
+	hard, cond := missingModels(present, ProfileModels, false)
+	if len(hard) != 0 {
+		t.Fatalf("a non-storage solar chain [1,701-712] has hard-missing models %v; model 713 must be "+
+			"conditional for a candidate with no storage, or the inverter is failed for a model it does "+
+			"not have", hard)
+	}
+	if !reflect.DeepEqual(cond, []uint16{713}) {
+		t.Fatalf("conditionally-missing = %v, want [713]", cond)
+	}
+
+	// Storage-capable candidate, SAME chain: model 713 is now hard-missing and
+	// the criterion fails. This is the mutation — a blanket exemption could not
+	// tell these two apart, and would let a storage device omit 713 silently.
+	hard, cond = missingModels(present, ProfileModels, true)
+	if !reflect.DeepEqual(hard, []uint16{713}) {
+		t.Fatalf("a storage-capable candidate missing model 713 has hard-missing %v, want [713] — the "+
+			"exemption is a blanket hole, not a storage conditional", hard)
+	}
+	if len(cond) != 0 {
+		t.Fatalf("model 713 is still merely conditional for a storage-capable candidate: cond=%v", cond)
+	}
+}
+
+// TestStorageCapabilityPrefersTheWireThenFallsToNonStorage covers the two
+// signals reachable without a full RunCtx; the manifest-role and
+// manifest-models signals are exercised end to end by the checkMOD4 tests that
+// run a real candidate through the runner.
+func TestStorageCapabilityPrefersTheWireThenFallsToNonStorage(t *testing.T) {
+	if ok, why := storageCapability(nil, map[uint16]bool{storageModel: true}); !ok {
+		t.Errorf("a DUT serving model 713 must be storage-capable; got %q", why)
+	} else if !strings.Contains(why, "713") {
+		t.Errorf("the wire signal does not name model 713: %q", why)
+	}
+	if ok, why := storageCapability(nil, map[uint16]bool{1: true, 701: true}); ok {
+		t.Errorf("no model 713 and no manifest must not assume storage; got storage-capable (%q)", why)
 	}
 }
 

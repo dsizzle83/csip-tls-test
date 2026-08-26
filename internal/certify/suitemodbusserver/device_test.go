@@ -36,6 +36,10 @@ type deviceOpts struct {
 	// Full1547 adds the models the IEEE 1547-2018 profile requires beyond the
 	// gateway's v1 set, so MOD-4's model-presence criterion can pass.
 	Full1547 bool
+	// NoStorageModel, with Full1547, drops model 713 (DERStorageCapacity) from
+	// the chain — the shape a solar 7xx inverter serves: the whole profile
+	// except the storage model it does not have.
+	NoStorageModel bool
 	// EndModelLen makes the end model declare a nonzero length (DEV-1).
 	EndModelLen uint16
 	// BlankManufacturer leaves model 1's Mn reading all zeros, its string
@@ -209,7 +213,12 @@ func newDevice(t *testing.T, opts deviceOpts) *device {
 
 	ids := []uint16{1, 701, 702, 704}
 	if opts.Full1547 {
-		ids = []uint16{1, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712, 713}
+		ids = []uint16{1, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712}
+		// Model 713 (DERStorageCapacity) is the storage marker. A solar 7xx
+		// inverter serves the chain WITHOUT it; NoStorageModel reproduces that.
+		if !opts.NoStorageModel {
+			ids = append(ids, 713)
+		}
 	}
 	if opts.LegacyModels {
 		omit := map[uint16]bool{}
