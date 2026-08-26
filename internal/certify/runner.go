@@ -820,6 +820,15 @@ func (r *Runner) Plan() []Planned {
 			plan = append(plan, p)
 			continue
 		}
+		// Row-level requirement, same reasoning, narrower grain: see
+		// RequirementScope. Checked here too, ahead of the registration
+		// lookup, so a row stays out of scope regardless of whether a suite
+		// happens to implement it.
+		if d, ok := RequirementScope(r.manifest, c); ok {
+			p.Scope = &d
+			plan = append(plan, p)
+			continue
+		}
 		reg, ok := r.reg.Lookup(c.UID)
 		if !ok {
 			// An inapplicable row nobody implements is OUT OF SCOPE, not

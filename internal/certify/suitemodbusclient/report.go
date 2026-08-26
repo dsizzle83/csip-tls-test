@@ -118,10 +118,12 @@ var Rows = []Row{
 			"measurement model",
 		Capability: "a DUT re-identify diagnostic a read-only client can trigger, or a capture that " +
 			"begins before the DUT's own boot. This is a DUT observability gap, not a sim verb"},
-	{ID: "CLI-5", UID: "ss-modbus-client-conf-v1.1::CLI-5", Depth: DepthNotApplicable,
-		Demonstrated: "nothing; the row is the optional Modbus RTU baud-rate sweep",
-		Gap:          "there is no RS-485 SunSpec server on the bench and no serial line to capture",
-		Capability:   "an RS-485 SunSpec server on the DUT's /dev/lexa/rs485-1 and a line analyser — evidence that would not live in a pcap at all"},
+	// CLI-5 is intentionally absent — this table is the suite's OWN account of
+	// what ITS code can drive, and CLI-5 has no code here to account for: the
+	// catalog marks it inapplicable and nothing implements it, which is now a
+	// framework-level bundle.VerdictNotApplicable (source catalog-
+	// applicability) rather than a row this suite's self-assessment owns. See
+	// register.go's file doc and TestSuiteRegistersEveryCatalogUIDOfItsDocument.
 	{ID: "READ-1", UID: "ss-modbus-client-conf-v1.1::READ-1", Depth: DepthObservationOnly,
 		Demonstrated: "the DUT's actual read granularity, cited under SKIP, observed over one COMPLETE " +
 			"poll cycle held on the simulator's poll barrier — so the pattern graded is a whole cycle's " +
@@ -136,17 +138,20 @@ var Rows = []Row{
 		Gap:        "the client-side 'log every point as hex strings' criterion",
 		Capability: "a diagnostic dump mode on the DUT; the bytes themselves are already in the bundle"},
 	{ID: "WR-1", UID: "ss-modbus-client-conf-v1.1::WR-1", Depth: DepthNotApplicable,
-		Demonstrated: "the judgement itself, with the procedure text quoted and the counter-argument " +
-			"stated: §2.6.1's subject is 'all implemented adjustable points … using Modbus Function Code " +
-			"0x06', and this client has no FC 0x06 write path at all — every register write it can emit " +
-			"leaves as FC 0x10, hardcoded in the Modbus client it is built on, even for a single " +
-			"register. The row's subject is the empty set",
+		Demonstrated: "for the candidate this campaign runs against (write_function_codes = [6] required, " +
+			"[16] declared — PICS_SUNSPEC_MODBUS.md §4.2 rev g), the framework excludes the row Plan-time " +
+			"(scope.go's RequirementScope, source manifest) before this check ever runs. When it DOES run " +
+			"— no manifest, or one that claims FC 6 — it states the judgement itself, with the procedure " +
+			"text quoted and the counter-argument stated: §2.6.1's subject is 'all implemented adjustable " +
+			"points … using Modbus Function Code 0x06', and this client has no FC 0x06 write path at all " +
+			"— every register write it can emit leaves as FC 0x10, even for a single register",
 		Gap: "§2.6.1 carries no explicit 'if the CUT supports FC 0x06' clause where its own step 3 does " +
 			"carry one for RTU, so a lab could read it as unconditional and call this a product gap. The " +
 			"counter-argument recorded in the assertion: §2.6.2 states FC 0x10 is a complete per-point " +
 			"alternative, so WR-2 covers every adjustable point this client can write",
-		Capability: "a PICS question for the certifying lab. NOT a bench capability, and deliberately " +
-			"not closed by adding an FC 0x06 write path to the product to green a row"},
+		Capability: "a PICS/manifest question for the certifying lab, now expressed as the catalog's own " +
+			"requires clause against modbus_client.write_function_codes. NOT a bench capability, and " +
+			"deliberately not closed by adding an FC 0x06 write path to the product to green a row"},
 	{ID: "WR-2", UID: "ss-modbus-client-conf-v1.1::WR-2", Depth: DepthPartial,
 		Demonstrated: "an FC 0x10 write by the DUT with quantity and byte count agreeing, the server's " +
 			"acknowledgement, AND — the part every previous campaign missed — a divergence-and-reassert " +

@@ -182,6 +182,66 @@ func TestParseRefusesEmptySecureSunSpecRoles(t *testing.T) {
 	}
 }
 
+// The one OPTIONAL key. Three properties, mirroring the shape every optional
+// key in this document must have: absent parses and records NOTHING (so a
+// caller cannot mistake a zero-length claim for a declaration of zero codes),
+// present records exactly the declared list, and present-but-impossible is
+// refused rather than carried into a scope decision nobody actually declared.
+func TestWriteFunctionCodesIsOptionalAndBounded(t *testing.T) {
+	// Absent.
+	m := mustParse(t, valid)
+	if m.ModbusClient.WriteFunctionCodesDeclared() {
+		t.Error("WriteFunctionCodesDeclared() = true with the key absent")
+	}
+	if m.ModbusClient.ClaimsWriteFunctionCode(16) {
+		t.Error("ClaimsWriteFunctionCode(16) = true with the key absent; an undeclared list claims nothing")
+	}
+
+	// Present.
+	withCodes := strings.Replace(valid,
+		`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx"}`,
+		`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx", "write_function_codes": [16]}`, 1)
+	m = mustParse(t, withCodes)
+	if !m.ModbusClient.WriteFunctionCodesDeclared() {
+		t.Fatal("WriteFunctionCodesDeclared() = false with the key present")
+	}
+	if len(m.ModbusClient.WriteFunctionCodes) != 1 || m.ModbusClient.WriteFunctionCodes[0] != 16 {
+		t.Errorf("WriteFunctionCodes = %v, want [16]", m.ModbusClient.WriteFunctionCodes)
+	}
+	if !m.ModbusClient.ClaimsWriteFunctionCode(16) {
+		t.Error("ClaimsWriteFunctionCode(16) = false with 16 declared")
+	}
+	if m.ModbusClient.ClaimsWriteFunctionCode(6) {
+		t.Error("ClaimsWriteFunctionCode(6) = true; the manifest declares only [16]")
+	}
+
+	// Out of range and duplicated.
+	for _, tc := range []struct{ codes, want string }{
+		{`[0]`, "not a Modbus function code"},
+		{`[128]`, "not a Modbus function code"},
+		{`[6, 6]`, "more than once"},
+	} {
+		bad := strings.Replace(valid,
+			`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx"}`,
+			`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx", "write_function_codes": `+tc.codes+`}`, 1)
+		_, err := Parse([]byte(bad), "candidate.json")
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("Parse(write_function_codes: %s) = %v, want a refusal naming %q", tc.codes, err, tc.want)
+		}
+	}
+}
+
+// The optional key does not open the door: everything else stays strict, and a
+// key nobody models is still an error.
+func TestWriteFunctionCodesDoesNotMakeTheReaderTolerant(t *testing.T) {
+	bad := strings.Replace(valid,
+		`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx"}`,
+		`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx", "write_fn_codes": [16]}`, 1)
+	if _, err := Parse([]byte(bad), "candidate.json"); err == nil || !strings.Contains(err.Error(), "write_fn_codes") {
+		t.Fatalf("Parse(misspelled optional key) = %v, want a refusal naming it", err)
+	}
+}
+
 func TestLoadReadsAFile(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "candidate.json")
 	if err := os.WriteFile(p, []byte(valid), 0o644); err != nil {

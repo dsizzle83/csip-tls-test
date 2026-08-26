@@ -3,7 +3,7 @@ package suitemodbusclient
 // checks_write.go implements §2.6, the Write Tests: WR-1 (FC 0x06) and WR-2
 // (FC 0x10).
 //
-// # WR-1 has no subject on this client, and that is a judgement either way
+// # WR-1's subject is a claim the CANDIDATE makes, not a fact this suite hides
 //
 // §2.6.1's purpose is verbatim:
 //
@@ -16,15 +16,33 @@ package suitemodbusclient
 // `functionCode: fcWriteMultipleRegisters` (client.go:1162-1164) — so even a
 // single-register write leaves as FC 0x10 with quantity 1. There is no branch,
 // no configuration and no code path that produces an FC 0x06 request.
+// PICS_SUNSPEC_MODBUS.md §4.2 (rev g) records the same fact as the candidate's
+// own declaration: "WR-2 (Write Multiple Points) — CLAIMED. WR-1 (Write
+// Single Point) — NOT CLAIMED."
 //
-// So the row's subject — "all implemented adjustable points … using Modbus
-// function code 0x06" — is the empty set on this client, and this suite
-// records WR-1 as NOT APPLICABLE with that as the reason. The judgement is
-// stated in full in wr1NotApplicable below, INCLUDING the reading that argues
-// against it, because it is a judgement and a certifying lab may weigh it
-// differently. What this suite will not do is add an FC 0x06 write path to the
-// product to make a row green: a conformance tool that changes the device to
-// suit the test has stopped measuring anything.
+// The row's subject — "all implemented adjustable points … using Modbus
+// function code 0x06" — is therefore the empty set on THIS CANDIDATE, and
+// that is exactly the shape CAMPAIGNS.md §5's row-level Requires exists for:
+// the catalog's WR-1 entry states `requires: {modbus_client.write_function_
+// codes: [6]}`, and scope.go's RequirementScope excludes the row, Plan()-time,
+// WITH SOURCE manifest, whenever the running candidate's own manifest
+// contradicts that — which the RC0 candidate's does (write_function_codes =
+// [16] only). That is a fact about the candidate, not about this suite, so it
+// is decided centrally rather than by this check declaring its own row out of
+// scope (see registry.go's Check doc for why a check must not do that).
+//
+// This check therefore only RUNS at all for a candidate whose manifest either
+// says nothing about the axis, or specifically claims FC 6 — and for either of
+// those it still needs to say something honest, because "excluded" is not the
+// only reading available: §2.6.1 carries no explicit "if the CUT supports FC
+// 0x06" clause the way its own step 3 does for RTU, so a lab could read it as
+// unconditional. wr1NotApplicable below states that judgement in full,
+// INCLUDING the reading that argues against it, because a certifying lab may
+// weigh it differently, and cites the DUT's own frames (there are none at FC
+// 0x06) as the wire-level confirmation. What this suite will not do, either
+// way, is add an FC 0x06 write path to the product to make a row green: a
+// conformance tool that changes the device to suit the test has stopped
+// measuring anything.
 //
 // # WR-2's difficulty, and what fixed it
 //

@@ -167,6 +167,84 @@ func TestConsoleDistinguishesNotApplicableFromSkip(t *testing.T) {
 	}
 }
 
+// wr1RequirementRun builds a run whose selection is just WR-1, against a
+// manifest that contradicts its catalog Requires — RequirementScope's own
+// axis, and a different shape from clientDirectionRun's: that one is
+// DUTRole-keyed (ManifestScope); this one is keyed off one catalog row's own
+// requires clause.
+func wr1RequirementRun(t *testing.T) (*Runner, string) {
+	t.Helper()
+	const uid = "ss-modbus-client-conf-v1.1::WR-1"
+	opts, out := baseOptions(t, nil)
+	opts.UIDs = []string{uid}
+	opts.ManifestPath = writeManifest(t, withWriteFunctionCodes("[16]"))
+	opts.Out = &bytes.Buffer{}
+	opts.SkipPreflight = true
+	reg := NewRegistry()
+	reg.Register(uid, "modbus-client", func(ctx context.Context, rc *RunCtx) (Result, error) {
+		t.Fatal("the check ran despite a manifest that contradicts its catalog Requires")
+		return Result{}, nil
+	})
+	r, err := New(reg, realCatalog(t), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r, out
+}
+
+// The same round trip TestNotApplicableRoundTripsThroughTheBundleAndVerifies
+// pins for ManifestScope, pinned again for RequirementScope: a different
+// producer of ScopeDecision feeding the identical downstream pipeline
+// (naRecord, bundle.Verify) — worth proving directly rather than assumed from
+// the other axis sharing code.
+func TestRequirementNotApplicableRoundTripsThroughTheBundleAndVerifies(t *testing.T) {
+	r, dir := wr1RequirementRun(t)
+	rep, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() = %v", err)
+	}
+	if len(rep.Cases) != 1 {
+		t.Fatalf("Run() produced %d case(s), want 1", len(rep.Cases))
+	}
+	c := rep.Cases[0]
+	if c.Verdict != NotApplicable {
+		t.Fatalf("Verdict = %s, want %s", c.Verdict, NotApplicable)
+	}
+	if c.Scope == nil || c.Scope.Source != bundle.NASourceManifest {
+		t.Fatalf("Scope = %+v, want a manifest-sourced decision", c.Scope)
+	}
+
+	loaded, err := bundle.Load(dir)
+	if err != nil {
+		t.Fatalf("bundle.Load() = %v", err)
+	}
+	if len(loaded.Cases) != 1 || loaded.Cases[0].Verdict != bundle.VerdictNotApplicable {
+		t.Fatalf("bundle.json cases = %+v", loaded.Cases)
+	}
+	na := loaded.Cases[0].NotApplicable
+	if na == nil {
+		t.Fatal("bundle.json carries an N/A with no record")
+	}
+	if na.Source != bundle.NASourceManifest {
+		t.Errorf("source = %q, want %q", na.Source, bundle.NASourceManifest)
+	}
+	for _, want := range []string{"write_function_codes", "PICS_SUNSPEC_MODBUS.md", "candidate.json"} {
+		if !strings.Contains(na.Detail, want) {
+			t.Errorf("detail does not carry %q: %q", want, na.Detail)
+		}
+	}
+
+	vr, err := bundle.Verify(dir)
+	if err != nil {
+		t.Fatalf("bundle.Verify() = %v", err)
+	}
+	for _, p := range vr.Problems {
+		if strings.Contains(p, "N/A") || strings.Contains(p, "not-applicable") {
+			t.Errorf("Verify objected to a not-applicable row: %s", p)
+		}
+	}
+}
+
 // The campaign acceptance criterion: an unselected protocol contributes NEITHER
 // a FAIL NOR A SKIP — it contributes no row at all.
 func TestACampaignCarriesNoRowFromAnotherProtocol(t *testing.T) {

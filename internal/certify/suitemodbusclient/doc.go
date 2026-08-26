@@ -63,6 +63,15 @@
 //     wire facts under SKIP for exactly that reason, and say so in the text.
 //   - A row whose procedure was only partly run declares WARN as a floor, with
 //     the unexercised part named in the notes.
+//   - A row that is not about anything THIS CANDIDATE is gets
+//     bundle.VerdictNotApplicable, N/A — never a SKIP whose text happens to say
+//     "not applicable". N/A is decided centrally, before this suite's checks
+//     ever run (certify's scope.go), not by a check declaring its own row out
+//     of scope: CLI-5 (the catalog itself marks it inapplicable — no RS-485
+//     SunSpec server on this bench) and WR-1 (the CANDIDATE's manifest
+//     contradicts the catalog's requires clause — see checks_write.go and
+//     register.go) are this document's two, and neither has SKIP+OffWire code
+//     in this suite pretending to make that call itself any more.
 //
 // The three dishonesty modes the framework's own doc.go warns about all have a
 // specific shape in this suite, and each has a specific defence:

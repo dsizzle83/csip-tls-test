@@ -30,6 +30,14 @@
 // rather than silently decoding to a zero that then reads as a genuine
 // declaration of "zero DERs" or "port 0".
 //
+// One key is OPTIONAL — modbus_client.write_function_codes — and the two
+// rules above do not soften for it. Absent, it is silence and NOTHING is
+// recorded, and the certify/scope.go axis that reads it is INERT; present, it
+// is validated the same as everything else (1..127, no repeats). "Optional"
+// here means the DOCUMENT may omit it, never that a reader may invent one —
+// see ModbusClient.WriteFunctionCodesDeclared for why a caller must ask
+// whether the candidate said anything before asking what it said.
+//
 // That distinction is the reason this file has two types for one document.
 // [raw] decodes with pointers, where absent and zero are different; [Manifest]
 // is what everything else consumes, with plain values that are known to have
@@ -101,6 +109,41 @@ type ModbusClient struct {
 	DeviceCount int
 	// Generation is the SunSpec model generation the devices serve, e.g. "7xx".
 	Generation string
+	// WriteFunctionCodes are the Modbus WRITE function codes (1..127) this
+	// southbound client claims it can emit — e.g. [16] for "every write is FC
+	// 16 (Write Multiple Registers), never FC 06".
+	//
+	// OPTIONAL, one of two keys in this document that are (see
+	// SecureSunSpec.FrameBudgetMS for the other, and the same rule holds
+	// here): absent, nothing is recorded and the scope axis that reads it is
+	// INERT — see ClaimsWriteFunctionCode and WriteFunctionCodesDeclared, and
+	// certify's scope.go for what "inert" means to a row's verdict. Present,
+	// it is exactly what the candidate's own PICS declares for this axis
+	// (PICS_SUNSPEC_MODBUS.md §4.2), and a catalog row may state a
+	// requirement against it.
+	WriteFunctionCodes []int
+}
+
+// WriteFunctionCodesDeclared reports whether the candidate declared this key
+// at all. An absent declaration excludes NOTHING — see ClaimsWriteFunctionCode
+// — this is what a caller deciding a row's SCOPE from it must check FIRST.
+func (mc ModbusClient) WriteFunctionCodesDeclared() bool { return len(mc.WriteFunctionCodes) > 0 }
+
+// ClaimsWriteFunctionCode reports whether the candidate's declared southbound
+// write function codes include fc.
+//
+// FALSE means one of two different things, and a caller deciding a row's scope
+// from it must not conflate them: "the candidate declared a list and fc is not
+// on it" is a scope decision waiting to be made; "the candidate declared
+// nothing" is silence, and silence is not a disclaimer (see
+// WriteFunctionCodesDeclared).
+func (mc ModbusClient) ClaimsWriteFunctionCode(fc int) bool {
+	for _, v := range mc.WriteFunctionCodes {
+		if v == fc {
+			return true
+		}
+	}
+	return false
 }
 
 // Manifest is the candidate's declaration, validated.
@@ -209,6 +252,9 @@ type raw struct {
 		Transport   *string `json:"transport"`
 		DeviceCount *int    `json:"device_count"`
 		Generation  *string `json:"generation"`
+		// OPTIONAL — see ModbusClient.WriteFunctionCodes. Absent is a legal
+		// manifest; present-and-out-of-range, or present-with-a-repeat, is not.
+		WriteFunctionCodes []int `json:"write_function_codes"`
 	} `json:"modbus_client"`
 	AuthorityProfiles []string `json:"authority_profiles"`
 	Models            []int    `json:"models"`
@@ -318,6 +364,25 @@ func Parse(data []byte, path string) (*Manifest, error) {
 		m.ModbusClient.Transport = p.reqString(r.ModbusClient.Transport, "modbus_client.transport", knownMBTransports)
 		m.ModbusClient.DeviceCount = p.reqInt(r.ModbusClient.DeviceCount, "modbus_client.device_count", 0)
 		m.ModbusClient.Generation = p.reqString(r.ModbusClient.Generation, "modbus_client.generation", knownDERGenerations)
+		// OPTIONAL: see ModbusClient.WriteFunctionCodes. Absent is silence, not
+		// a claim of zero codes, and nothing is recorded; present, every entry
+		// must be a function code the Modbus protocol actually has (1..127,
+		// RFC-fixed by the one-byte PDU field) and the list must not repeat one
+		// — a repeat is not a shape this reader half-understands, it is a typo.
+		if len(r.ModbusClient.WriteFunctionCodes) > 0 {
+			seenFC := map[int]bool{}
+			for _, fc := range r.ModbusClient.WriteFunctionCodes {
+				switch {
+				case fc < 1 || fc > 127:
+					p.addf("modbus_client.write_function_codes contains %d, which is not a Modbus function "+
+						"code (1..127)", fc)
+				case seenFC[fc]:
+					p.addf("modbus_client.write_function_codes lists function code %d more than once", fc)
+				}
+				seenFC[fc] = true
+			}
+			m.ModbusClient.WriteFunctionCodes = r.ModbusClient.WriteFunctionCodes
+		}
 	}
 
 	m.AuthorityProfiles = r.AuthorityProfiles

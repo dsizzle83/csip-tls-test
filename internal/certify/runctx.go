@@ -580,8 +580,17 @@ func (rc *RunCtx) RequireParam(key string) (string, error) {
 }
 
 // Logf writes to the run log, prefixed with the test case.
+//
+// Case is nil-checked because Logf is reachable before a check has a case to
+// attribute to (and from tests driving the RunCtx directly) — a diagnostic
+// helper that panics for want of the thing it is diagnosing is worse than one
+// that just omits the prefix it cannot form.
 func (rc *RunCtx) Logf(format string, v ...any) {
 	if rc.Log == nil {
+		return
+	}
+	if rc.Case == nil {
+		rc.Log.Printf(format, v...)
 		return
 	}
 	rc.Log.Printf("[%s] "+format, append([]any{rc.Case.UID}, v...)...)

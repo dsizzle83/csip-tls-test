@@ -5,6 +5,7 @@ package certify
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -205,5 +206,157 @@ func TestUnimplementedInapplicableRowsBecomeNotApplicable(t *testing.T) {
 		t.Errorf("%d row(s) still carry a SKIP whose text says 'not applicable' — the right words on "+
 			"the wrong verdict, counted in the same number as a genuine evidence gap",
 			skipReadingNotApplicable)
+	}
+}
+
+// ── row-level requirements (RequirementScope) ───────────────────────────────
+
+// withWriteFunctionCodes returns validManifestJSON with modbus_client.
+// write_function_codes set to codes, e.g. "[16]" or "[6, 16]".
+func withWriteFunctionCodes(codes string) string {
+	return strings.Replace(validManifestJSON,
+		`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx"}`,
+		`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx", "write_function_codes": `+codes+`}`, 1)
+}
+
+func wr1Fixture() *Case {
+	return &Case{
+		UID: "ss-modbus-client-conf-v1.1::WR-1", DUTRole: RoleModbusClient, Applicable: true,
+		Requires: map[string]json.RawMessage{"modbus_client.write_function_codes": json.RawMessage("[6]")},
+	}
+}
+
+func TestRequirementScopeExcludesAnUnsatisfiedRequirement(t *testing.T) {
+	m := loadManifest(t, withWriteFunctionCodes("[16]"))
+	d, ok := RequirementScope(m, wr1Fixture())
+	if !ok {
+		t.Fatal("a row whose requirement the manifest contradicts survived RequirementScope")
+	}
+	if d.Source != bundle.NASourceManifest {
+		t.Errorf("Source = %q, want %q", d.Source, bundle.NASourceManifest)
+	}
+	if !strings.Contains(d.Reason, "FC 6") || !strings.Contains(d.Reason, "write_function_codes") {
+		t.Errorf("Reason does not name the missing code or the field that decided it: %q", d.Reason)
+	}
+	for _, want := range []string{"candidate.json", "FC 16", "PICS_SUNSPEC_MODBUS.md", "§4.2"} {
+		if !strings.Contains(d.Detail, want) {
+			t.Errorf("Detail does not carry %q, so a reader cannot go and check it: %q", want, d.Detail)
+		}
+	}
+}
+
+// A requirement the manifest DOES claim must not exclude the row — the check
+// still has to run and cite the wire, for a candidate that says it does this.
+func TestRequirementScopeKeepsASatisfiedRequirement(t *testing.T) {
+	m := loadManifest(t, withWriteFunctionCodes("[6, 16]"))
+	if _, ok := RequirementScope(m, wr1Fixture()); ok {
+		t.Error("a row whose requirement the manifest DOES claim was excluded")
+	}
+}
+
+// Silence is not a disclaimer: a manifest that never mentions the field has
+// not withdrawn the claim, so the row must still run — ManifestScope's own
+// rule, for the same reason (CAMPAIGNS.md §5, "No manifest means assert
+// everything").
+func TestRequirementScopeWithNoDeclarationExcludesNothing(t *testing.T) {
+	if _, ok := RequirementScope(serverOnly(t), wr1Fixture()); ok {
+		t.Error("an UNDECLARED field excluded a row; silence is not a disclaimer")
+	}
+	if _, ok := RequirementScope(nil, wr1Fixture()); ok {
+		t.Error("a nil manifest excluded a row with a Requires clause")
+	}
+}
+
+// A row with no Requires at all is untouched by this axis, whatever the
+// manifest says.
+func TestRequirementScopeWithNoRequiresExcludesNothing(t *testing.T) {
+	m := loadManifest(t, withWriteFunctionCodes("[16]"))
+	plain := &Case{UID: "ss-modbus-client-conf-v1.1::READ-1", DUTRole: RoleModbusClient, Applicable: true}
+	if _, ok := RequirementScope(m, plain); ok {
+		t.Error("a row with no Requires at all was excluded")
+	}
+	if _, ok := RequirementScope(m, nil); ok {
+		t.Error("RequirementScope(m, nil) reported a case out of scope")
+	}
+}
+
+// Coherence: every declared field must actually be usable, and the lookup
+// helpers catalog.go's loader depends on must agree with the registry — the
+// same property TestScopeAxesAreDeclaredCoherently holds the DUTRole axes to.
+func TestRequirementFieldsAreDeclaredCoherently(t *testing.T) {
+	if len(requirementFields) == 0 {
+		t.Fatal("requirementFields is empty; WR-1's Requires would have nothing to evaluate it")
+	}
+	for field, rf := range requirementFields {
+		if rf.Decode == nil || rf.Satisfied == nil {
+			t.Errorf("requirement field %q is incompletely declared: %+v", field, rf)
+		}
+		if !RequirementFieldKnown(field) {
+			t.Errorf("RequirementFieldKnown(%q) = false for a field requirementFields defines", field)
+		}
+	}
+	if !containsFold(RequirementFieldNames(), "modbus_client.write_function_codes") {
+		t.Errorf("RequirementFieldNames() = %v, missing the write-function-codes field", RequirementFieldNames())
+	}
+}
+
+// The end-to-end path a manifest-driven exclusion has to survive: Plan() must
+// mark WR-1 out of scope on THIS axis, read off the REAL catalog's own
+// Requires declaration — not a synthetic fixture — so a change that drops the
+// Plan() call site, or the catalog's requires entry, fails a test rather than
+// silently widening the campaign.
+func TestPlanExcludesTheRealWR1AgainstAContradictingManifest(t *testing.T) {
+	const uid = "ss-modbus-client-conf-v1.1::WR-1"
+	cat := realCatalog(t)
+	tc, ok := cat.ByUID(uid)
+	if !ok {
+		t.Fatalf("the real catalog has no %s; the fixture has drifted", uid)
+	}
+	if len(tc.Requires) == 0 {
+		t.Fatalf("%s carries no Requires in the real catalog; RequirementScope has nothing to read", uid)
+	}
+
+	reg := NewRegistry()
+	reg.Register(uid, "modbus-client", func(ctx context.Context, rc *RunCtx) (Result, error) {
+		return Skipped("fixture — should not run when the manifest contradicts the row's Requires"), nil
+	})
+
+	opts, _ := baseOptions(t, nil)
+	opts.ManifestPath = writeManifest(t, withWriteFunctionCodes("[16]"))
+	opts.UIDs = []string{uid}
+	r, err := New(reg, cat, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := r.Plan()
+	if len(plan) != 1 {
+		t.Fatalf("Plan() selected %d row(s) for -uid %s, want 1", len(plan), uid)
+	}
+	p := plan[0]
+	if !p.OutOfScope() {
+		t.Fatal("WR-1 was not marked out of scope against a manifest declaring write_function_codes=[16]")
+	}
+	if p.Scope.Source != bundle.NASourceManifest {
+		t.Errorf("Source = %q, want %q", p.Scope.Source, bundle.NASourceManifest)
+	}
+
+	// And the manifest that DOES claim FC 6 must still reach the check —
+	// keeping WR-1 registered is only honest if a claiming candidate can still
+	// exercise it.
+	claiming, err := New(reg, cat, func() Options {
+		o, _ := baseOptions(t, nil)
+		o.ManifestPath = writeManifest(t, withWriteFunctionCodes("[6, 16]"))
+		o.UIDs = []string{uid}
+		return o
+	}())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cplan := claiming.Plan()
+	if len(cplan) != 1 || cplan[0].OutOfScope() {
+		t.Fatalf("a manifest claiming FC 6 still left WR-1 out of scope: %+v", cplan)
+	}
+	if !cplan[0].Implemented {
+		t.Error("a manifest claiming FC 6 did not leave WR-1 implemented and reachable")
 	}
 }

@@ -12164,6 +12164,7 @@
   "dut_role": "modbus-client",
   "applicable": true,
   "applicability_reason": "facts-dut-capability.md §2.1-§2.4: cmd/modbus is a SunSpec Modbus client over tcp://, rtu://, rtuovertcp://, bus:// and mbaps://, it probes all three standard bases (admission/identify.go:106 — 40000/0/50000), classifies by model (801/802 battery, 201-203 meter, 101-103 or 701-714 inverter) and reads/writes the 1547 profile models — the CUT role this procedure needs. CAVEAT: the DUT is a gateway, not an operator console — southbound writes are emitted only as the reconcilers act on a northbound command, so the write sweep must be driven indirectly (mbaps aggregator campaign or a CSIP DERControl) and covers only the executed point set of §1.5 / the reconcile_adv axes of §2.3.",
+  "requires": {"modbus_client.write_function_codes": [6]},
   "automatable": "partial",
   "evidence": "pcap on the desktop nic, filter `tcp port 5020` — southbound plain Modbus/TCP is fully decodable in Wireshark: MBAP transaction id + unit id and FC=0x03/0x04/0x06/0x10 request+response frames issued BY the DUT; source observables to assert verbatim: Modbus FC=0x06 (Write Single Register) requests, one per value, targeting each adjustable point's register address / Five distinct FC=0x06 writes per adjustable point: min, max, and three intermediate values from the Server 1 PICS (or all possible values if fewer than 5 exist)",
   "preconditions": [

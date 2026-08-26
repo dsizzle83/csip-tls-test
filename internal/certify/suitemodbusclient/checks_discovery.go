@@ -779,23 +779,10 @@ func evalBaseProbes(c *Conversation, forced error) finding {
 		len(probes), addrs, StandardBases, found, ex.Request.Hex())
 }
 
-// ── CLI-5 — Different Baud Rates (Optional, serial) ───────────────────────────
-
-func checkCLI5(_ context.Context, _ *certify.RunCtx) (certify.Result, error) {
-	// Registered although the catalog marks it inapplicable: a registered SKIP
-	// carrying its reason is an engineering judgement a reviewer can weigh,
-	// while an unregistered uid is indistinguishable from an oversight.
-	return certify.Result{
-		Verdict: certify.Skip,
-		Notes: "not applicable to this bench. The procedure is the optional Modbus RTU baud-rate sweep. " +
-			"The DUT does expose a southbound RS-485 client, but every SunSpec server on this bench is " +
-			"Modbus TCP, so there is no serial peer to sweep baud rates against and no serial line to " +
-			"capture. Promoting this row requires an RS-485 SunSpec server wired to the DUT's " +
-			"/dev/lexa/rs485-1 and a line analyser, neither of which is a packet capture — the evidence " +
-			"would not live in this bundle's pcap at all.",
-		OffWire: true,
-		OffWireReason: "the procedure is serial-only: its observables are Modbus RTU frames on an " +
-			"RS-485 line, which no Ethernet capture can contain. The row is recorded as addressed and " +
-			"not executed, not as passed.",
-	}, nil
-}
+// CLI-5 — Different Baud Rates (Optional, serial) — has no check here on
+// purpose. The catalog marks it inapplicable (no RS-485 SunSpec server exists
+// on this bench to sweep baud rates against), and the framework now turns an
+// UNREGISTERED, catalog-inapplicable row into a reasoned bundle.
+// VerdictNotApplicable on its own — see certify's scope.go (CatalogScope) and
+// register.go's file doc. A suite-authored SKIP repeating that same fact
+// would be exactly the "old idiom" N/A exists to retire (CAMPAIGNS.md §5).

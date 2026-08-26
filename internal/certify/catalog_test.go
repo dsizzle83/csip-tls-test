@@ -1,6 +1,7 @@
 package certify
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -140,6 +141,62 @@ func TestLoadRejectsBadRecords(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A Requires key or value this loader cannot evaluate must refuse the
+// catalog rather than sit silently inert forever — see scope.go's file doc.
+func TestLoadValidatesRequirementFields(t *testing.T) {
+	withRequires := func(req string) string {
+		return strings.Replace(testCatalog,
+			`"source_shards":["s3"],"page_boundary_merged":false,`,
+			`"source_shards":["s3"],"page_boundary_merged":false,"requires":`+req+`,`, 1)
+	}
+
+	t.Run("unrecognised field", func(t *testing.T) {
+		bad := withRequires(`{"modbus_client.bogus_field":[6]}`)
+		_, err := LoadBytes([]byte(bad), "x")
+		if err == nil || !strings.Contains(err.Error(), "modbus_client.bogus_field") {
+			t.Fatalf("err = %v, want a complaint naming the unrecognised field", err)
+		}
+	})
+
+	t.Run("malformed value", func(t *testing.T) {
+		bad := withRequires(`{"modbus_client.write_function_codes":[999]}`)
+		_, err := LoadBytes([]byte(bad), "x")
+		if err == nil || !strings.Contains(err.Error(), "not a Modbus function code") {
+			t.Fatalf("err = %v, want a complaint about the out-of-range code", err)
+		}
+	})
+
+	t.Run("empty list", func(t *testing.T) {
+		bad := withRequires(`{"modbus_client.write_function_codes":[]}`)
+		_, err := LoadBytes([]byte(bad), "x")
+		if err == nil || !strings.Contains(err.Error(), "at least one") {
+			t.Fatalf("err = %v, want a complaint about the empty list", err)
+		}
+	})
+
+	t.Run("well-formed", func(t *testing.T) {
+		good := withRequires(`{"modbus_client.write_function_codes":[6]}`)
+		cat, err := LoadBytes([]byte(good), "x")
+		if err != nil {
+			t.Fatalf("LoadBytes: %v", err)
+		}
+		c, ok := cat.ByID("DOC-B", "B-001")
+		if !ok {
+			t.Fatal("ByID missed B-001")
+		}
+		if len(c.Requires) != 1 {
+			t.Fatalf("Requires = %v, want one key", c.Requires)
+		}
+		var codes []int
+		if err := json.Unmarshal(c.Requires["modbus_client.write_function_codes"], &codes); err != nil {
+			t.Fatalf("Requires value does not decode: %v", err)
+		}
+		if len(codes) != 1 || codes[0] != 6 {
+			t.Errorf("codes = %v, want [6]", codes)
+		}
+	})
 }
 
 func TestLoadRejectsUnknownDUTRole(t *testing.T) {

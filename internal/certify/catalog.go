@@ -229,6 +229,26 @@ type Case struct {
 	// literal quotation of a step.
 	SourceShards       []string `json:"source_shards"`
 	PageBoundaryMerged bool     `json:"page_boundary_merged"`
+
+	// Requires states what this row needs the CANDIDATE's manifest to have
+	// claimed for the row to be IN SCOPE, evaluated by scope.go's
+	// RequirementScope alongside — and independently of — the DUTRole-keyed
+	// axes ManifestScope already carries.
+	//
+	// Keys are manifest field paths ("modbus_client.write_function_codes") and
+	// MUST be one scope.go's requirementFields recognises: validateCase
+	// refuses an unrecognised key at load, because a requirement this loader
+	// cannot evaluate would sit silently inert forever, which is
+	// indistinguishable from the axis nobody wrote. Values are the
+	// REQUIREMENT — deferred as raw JSON because the field decides the shape
+	// (an integer list for a function-code claim, a string list for a
+	// transport claim) — and are decoded once here, at load, so a malformed
+	// requirement is refused before any run starts.
+	//
+	// Empty for every row except the handful whose in-scope-ness depends on a
+	// fact narrower than their whole dut_role: what the candidate specifically
+	// claims to implement, not just which profile surface it claims to be.
+	Requires map[string]json.RawMessage `json:"requires,omitempty"`
 }
 
 // Ref is a short reference to the case, for logs and citations.
@@ -360,6 +380,26 @@ func validateCase(tc *Case, i int) error {
 	case autoRankKnown(tc.Automatable) == false:
 		return fmt.Errorf("record %d (%s) has automatable %q, want full|partial|manual",
 			i, tc.UID, tc.Automatable)
+	}
+	// Requires keys and values are validated at load, exactly like every other
+	// field here: a key scope.go's requirementFields does not recognise, or a
+	// value it cannot decode, would otherwise sit inert forever rather than
+	// refuse the catalog that carries it — see scope.go's file doc.
+	if len(tc.Requires) > 0 {
+		fields := make([]string, 0, len(tc.Requires))
+		for f := range tc.Requires {
+			fields = append(fields, f)
+		}
+		sort.Strings(fields)
+		for _, field := range fields {
+			if !RequirementFieldKnown(field) {
+				return fmt.Errorf("record %d (%s) requires[%q], which this loader does not recognise (know: %s)",
+					i, tc.UID, field, strings.Join(RequirementFieldNames(), ", "))
+			}
+			if err := DecodeRequirement(field, tc.Requires[field]); err != nil {
+				return fmt.Errorf("record %d (%s) requires[%q]: %w", i, tc.UID, field, err)
+			}
+		}
 	}
 	return nil
 }

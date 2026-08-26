@@ -3,13 +3,27 @@ package suitemodbusclient
 // register.go binds this suite's checks to their catalog uids.
 //
 // Every applicable uid in SS-MODBUS-CLIENT-CONF-v1.1 is registered, including
-// the ones this bench can only SKIP, and CLI-5 which the catalog marks
-// inapplicable. That is deliberate: the framework's coverage report cannot tell
-// the difference between "nobody got to this row" and "an engineer looked at
-// this row and concluded it cannot be driven here", and those two things must
-// not read the same in a conformance bundle. A registered check that returns a
-// SKIP carrying its reason is a judgement a reviewer can weigh and disagree
-// with; an unregistered uid is a hole.
+// the ones this bench can only SKIP. That is deliberate: the framework's
+// coverage report cannot tell the difference between "nobody got to this row"
+// and "an engineer looked at this row and concluded it cannot be driven here",
+// and those two things must not read the same in a conformance bundle. A
+// registered check that returns a SKIP carrying its reason is a judgement a
+// reviewer can weigh and disagree with; an unregistered uid is a hole.
+//
+// CLI-5 is the one exception, and it is an exception now for a reason that did
+// not exist when this file was written: the catalog marks it inapplicable
+// (facts-dut-capability.md §6.2 — no RS-485 SunSpec server exists on this
+// bench), and bundle.VerdictNotApplicable now gives that fact its own
+// verdict, with its own reason and source, on every row nothing implements —
+// see certify's scope.go (CatalogScope) and CAMPAIGNS.md §5. A row in that
+// shape is no longer "a hole distinguishable only by omission": it is a
+// reasoned, citable N/A the runner produces on its own from the catalog's own
+// applicability record, and a suite-authored SKIP repeating the same fact
+// would be the "old idiom" this campaign's N/A verdict exists to retire —
+// see checks_write.go's header for WR-1, which stays registered for the
+// opposite reason: its exclusion is CANDIDATE-specific (a manifest fact), not
+// catalog-wide, so the row must stay reachable for a candidate that claims
+// otherwise.
 //
 // # Ordering
 //
@@ -37,18 +51,18 @@ func Register(reg *certify.Registry) {
 		cli2 = "ss-modbus-client-conf-v1.1::CLI-2"
 		cli3 = "ss-modbus-client-conf-v1.1::CLI-3"
 		cli4 = "ss-modbus-client-conf-v1.1::CLI-4"
-		cli5 = "ss-modbus-client-conf-v1.1::CLI-5"
-		rd1  = "ss-modbus-client-conf-v1.1::READ-1"
-		rd2  = "ss-modbus-client-conf-v1.1::READ-2"
-		wr1  = "ss-modbus-client-conf-v1.1::WR-1"
-		wr2  = "ss-modbus-client-conf-v1.1::WR-2"
-		in1  = "ss-modbus-client-conf-v1.1::INFO-1"
-		in2  = "ss-modbus-client-conf-v1.1::INFO-2"
-		pr1  = "ss-modbus-client-conf-v1.1::PROT-1"
-		pr2  = "ss-modbus-client-conf-v1.1::PROT-2"
-		er1  = "ss-modbus-client-conf-v1.1::ERR-1"
-		er2  = "ss-modbus-client-conf-v1.1::ERR-2"
-		er3  = "ss-modbus-client-conf-v1.1::ERR-3"
+		// CLI-5 is intentionally absent — see the file doc.
+		rd1 = "ss-modbus-client-conf-v1.1::READ-1"
+		rd2 = "ss-modbus-client-conf-v1.1::READ-2"
+		wr1 = "ss-modbus-client-conf-v1.1::WR-1"
+		wr2 = "ss-modbus-client-conf-v1.1::WR-2"
+		in1 = "ss-modbus-client-conf-v1.1::INFO-1"
+		in2 = "ss-modbus-client-conf-v1.1::INFO-2"
+		pr1 = "ss-modbus-client-conf-v1.1::PROT-1"
+		pr2 = "ss-modbus-client-conf-v1.1::PROT-2"
+		er1 = "ss-modbus-client-conf-v1.1::ERR-1"
+		er2 = "ss-modbus-client-conf-v1.1::ERR-2"
+		er3 = "ss-modbus-client-conf-v1.1::ERR-3"
 	)
 
 	// Wire-observing rows. "bench" because the suite needs the bench's
@@ -98,10 +112,12 @@ func Register(reg *certify.Registry) {
 	reg.Register(in2, Suite, checkINFO2, append(wire, certify.WithOrder(43), certify.WithTimeout(8*time.Minute))...)
 	reg.Register(pr1, Suite, checkPROT1, append(wire, certify.WithOrder(44), certify.WithTimeout(12*time.Minute))...)
 
-	// Pass 3 — the rows that may reach the northbound surface.
+	// Pass 3 — the rows that may reach the northbound surface. WR-1 stays
+	// registered although it is N/A for the CANDIDATE this campaign runs
+	// against today (see checks_write.go's header): scope.go's
+	// RequirementScope excludes it Plan()-time only when the manifest
+	// contradicts its Requires, so a manifest that DOES claim FC 6 still
+	// reaches this check and its wire citation.
 	reg.Register(wr1, Suite, checkWR1, append(wire, certify.WithOrder(50))...)
 	reg.Register(wr2, Suite, checkWR2, append(wire, certify.WithOrder(51), certify.WithTimeout(10*time.Minute))...)
-
-	// Inapplicable, registered so it is accounted for rather than missing.
-	reg.Register(cli5, Suite, checkCLI5, certify.WithOrder(60))
 }

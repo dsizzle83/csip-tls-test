@@ -53,9 +53,19 @@ func TestSuiteRegistersEveryCatalogUIDOfItsDocument(t *testing.T) {
 	if len(doc.Unimplemented) != 0 {
 		t.Errorf("unimplemented rows in %s: %v", Doc, doc.Unimplemented)
 	}
-	if doc.Total != len(Rows) {
-		t.Errorf("the catalog has %d rows for %s but the suite's self-assessment table has %d",
-			doc.Total, Doc, len(Rows))
+	// Rows is this suite's own account of what ITS CODE can drive, so it
+	// tracks the IMPLEMENTED rows, not the catalog's raw total: CLI-5 is
+	// applicable:false and unregistered on purpose (see register.go's file
+	// doc), which Coverage places in Inapplicable rather than Unimplemented —
+	// the len(doc.Unimplemented) check above already caught it if that were
+	// wrong — and Rows has nothing to self-assess for a row it does not
+	// implement.
+	if len(doc.Implemented) != len(Rows) {
+		t.Errorf("the catalog has %d IMPLEMENTED row(s) for %s but the suite's self-assessment table has %d",
+			len(doc.Implemented), Doc, len(Rows))
+	}
+	if len(doc.Inapplicable) == 0 {
+		t.Error("no row in this document is Inapplicable; the CLI-5 fixture this test relies on has drifted")
 	}
 }
 
@@ -933,14 +943,40 @@ func TestEveryRowResetsTheSimToAKnownBaseline(t *testing.T) {
 	}
 }
 
-func TestCLI5IsRecordedAsAddressedAndNotExecuted(t *testing.T) {
+// CLI-5 is deliberately unregistered (see register.go's file doc): the
+// catalog marks it inapplicable, and the framework's own CatalogScope turns
+// that into a reasoned bundle.VerdictNotApplicable, sourced from the
+// catalog's own applicability record, before this suite is ever asked to run
+// anything for it — runOne cannot even drive it any more, which is itself
+// part of what this test pins.
+func TestCLI5IsUnregisteredAndTheFrameworkDeclaresItNotApplicable(t *testing.T) {
 	const uid = "ss-modbus-client-conf-v1.1::CLI-5"
-	rep, _, _ := runOne(t, uid, nil, nil)
-	c := caseOf(t, rep, uid)
-	if c.Verdict != certify.Skip {
-		t.Errorf("verdict = %s, want SKIP", c.Verdict)
+	cat := realCatalog(t)
+	reg := certify.NewRegistry()
+	Register(reg)
+	if _, ok := reg.Lookup(uid); ok {
+		t.Fatalf("%s is still registered; the old skip idiom was supposed to be retired so the catalog "+
+			"axis reaches it instead", uid)
 	}
-	if !strings.Contains(c.Notes, "RS-485") {
-		t.Errorf("the SKIP does not say what is missing: %s", c.Notes)
+
+	opts := certify.DefaultOptions()
+	opts.UIDs = []string{uid}
+	r, err := certify.New(reg, cat, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := r.Plan()
+	if len(plan) != 1 {
+		t.Fatalf("Plan() selected %d row(s) for -uid %s, want 1", len(plan), uid)
+	}
+	p := plan[0]
+	if !p.OutOfScope() {
+		t.Fatal("CLI-5 was not marked out of scope; an unregistered, catalog-inapplicable row should be N/A automatically")
+	}
+	if p.Scope.Source != bundle.NASourceCatalog {
+		t.Errorf("Source = %q, want %q", p.Scope.Source, bundle.NASourceCatalog)
+	}
+	if !strings.Contains(strings.ToLower(p.Scope.Reason), "baud") {
+		t.Errorf("Reason does not carry the catalog's own applicability text: %q", p.Scope.Reason)
 	}
 }
