@@ -377,8 +377,36 @@ type FunctionSetAssignments struct {
 	Subscribable uint8 `xml:"subscribable,attr,omitempty"`
 
 	// Links to assigned function set resource lists.
-	DERProgramListLink      *ListLink `xml:"DERProgramListLink,omitempty"`
-	TimeLink                *Link     `xml:"TimeLink,omitempty"`
+	DERProgramListLink *ListLink `xml:"DERProgramListLink,omitempty"`
+	TimeLink           *Link     `xml:"TimeLink,omitempty"`
+
+	// ResponseSetListLink is this FSA's OWN Response function set — the head
+	// of the chain a client follows to find where undirected Responses for
+	// events discovered under THIS FSA are POSTed (ResponseSetList → the
+	// selected ResponseSet → ResponseListLink → ResponseList).
+	//
+	// It is inherited, not FSA-specific. IEEE Std 2030.5-2018 Annex B §B.2.5
+	// (Figure B.11, printed p.180) hangs `ResponseSetListLink` at multiplicity
+	// [0..1] off `FunctionSetAssignmentsBase`, and declares
+	// "FunctionSetAssignments object (FunctionSetAssignmentsBase)" immediately
+	// below it — the same base `DeviceCapability` derives from (Figure B.2,
+	// printed p.154, whose own note explains the arrangement: "Making
+	// DeviceCapability inherit from FunctionSetAssignments allows those group
+	// resources to be published with or without use of FunctionSetAssignments").
+	// §B.2.7 (Figure B.13, printed p.183) draws the Response package rooted at
+	// `FunctionSetAssignmentsBase` for exactly that reason. So a server may
+	// publish the Response chain at /dcap, per FSA, or both, and a client that
+	// models the link on only one of the two subclasses cannot even SEE the
+	// per-FSA advertisement — it is dropped at decode, before any walker gets a
+	// chance to follow it. That was this type's state until registry
+	// FSA-LEVEL-RESPONSE-SET-LINK-UNDECODABLE.
+	//
+	// Declared identically to DeviceCapability's field above — same Go type,
+	// same element name, same (inherited default) namespace — because it is
+	// literally the same inherited link, and a client resolving one chain must
+	// not have to care which resource advertised it.
+	ResponseSetListLink *ListLink `xml:"ResponseSetListLink,omitempty"`
+
 	TariffProfileListLink   *ListLink `xml:"TariffProfileListLink,omitempty"`
 	CustomerAccountListLink *ListLink `xml:"CustomerAccountListLink,omitempty"`
 	MRID                    string    `xml:"mRID,omitempty"`

@@ -14,6 +14,14 @@
 // frame-aligned — callers must close the connection, never resynchronize by
 // guessing. A clean peer close between frames surfaces as bare io.EOF; that
 // is the only condition under which errors.Is(err, io.EOF) holds.
+//
+// Direction matters for one rule and one rule only, so there are two entry
+// points. Decode is direction-agnostic and is what a CLIENT uses to read
+// responses. DecodeRequest is Decode plus the request-side length rule: for
+// the function codes whose request size the protocol fixes, a declared Length
+// the function code cannot have is rejected before the promised body is read.
+// Servers must use DecodeRequest — see its doc for what that buys and, just
+// as importantly, what it cannot buy.
 package mbap
 
 import (
@@ -100,15 +108,92 @@ func Encode(a ADU) ([]byte, error) {
 // failures (e.g. deadline expiry on a net.Conn) are returned wrapped —
 // the stream position is then unknown, so those also warrant a close.
 func Decode(r io.Reader) (ADU, error) {
+	h, err := decodeHeader(r)
+	if err != nil {
+		return ADU{}, err
+	}
+	pdu := make([]byte, h.Length-1)
+	if err := readBody(r, pdu); err != nil {
+		return ADU{}, err
+	}
+	return ADU{Header: h, PDU: pdu}, nil
+}
+
+// DecodeRequest reads exactly one MBAP frame from r, applying every rule
+// Decode applies PLUS the request-direction length rule of checkRequestLength:
+// for the function codes whose request size the MODBUS Application Protocol
+// FIXES, the declared MBAP Length must be one the function code can actually
+// have. Servers must use this; Decode stays the direction-agnostic codec the
+// Client uses for responses (whose sizes differ — an FC 03 reply is 2+2*count
+// bytes, not 5).
+//
+// Why a server needs it. A TCP stream carries no frame boundaries: the only
+// thing that tells a receiver where a frame ends is the Length field the
+// SENDER declared. A peer that sends a header promising more bytes than it
+// then delivers therefore turns whatever arrives NEXT into the missing tail —
+// the following request's bytes are silently spliced onto the stalled frame
+// and answered under the stalled frame's transaction id (LAB29-008 /
+// ss-modbus-conf-v1.4::TCP-2). The damage scales with the lie: a header
+// declaring Length 254 behind FC 03 swallows 253 following bytes — up to
+// twenty complete 12-byte ADUs — and on a write function code those swallowed
+// bytes become register VALUES, i.e. a fabricated actuation of a DER.
+//
+// The declared length is the one part of that lie a receiver can catch with
+// certainty and with no timing assumption whatsoever, because the protocol
+// fixes the request size for these function codes. So the check is applied at
+// the earliest moment it CAN be: after reading exactly one body byte (the
+// function code) and BEFORE reading any of the bytes the header asked for.
+// The offending peer is refused having cost us 8 bytes, never 260.
+//
+// It is deliberately not a whitelist of the function codes this gateway
+// implements: an unimplemented but well-formed request must still be read in
+// full and answered with exception 01 (SunSpecTCP-40), so function codes whose
+// request size the protocol does not fix are left entirely alone here and
+// travel on to the ladder.
+//
+// What it does NOT do — stated plainly because the boundary matters. When the
+// declared length IS consistent with the function code (an FC 03 header that
+// says Length 6 and then delivers only part of its five PDU bytes), the bytes
+// that follow are indistinguishable, at the byte level, from that same request
+// arriving in two TCP segments — which SS-MODBUS-CONF-v1.4 §2.7.8 (TCP-3)
+// REQUIRES a conformant server to reassemble. No codec can separate those two
+// cases; only elapsed time can, which is why the frame-assembly deadline lives
+// in the listener (which owns the connection and its deadlines) and not here.
+func DecodeRequest(r io.Reader) (ADU, error) {
+	h, err := decodeHeader(r)
+	if err != nil {
+		return ADU{}, err
+	}
+	pdu := make([]byte, h.Length-1)
+	// One byte — the function code — then judge the declared length against
+	// it before committing to read the rest.
+	if err := readBody(r, pdu[:1]); err != nil {
+		return ADU{}, err
+	}
+	if err := checkRequestLength(pdu[0], len(pdu)); err != nil {
+		return ADU{}, err
+	}
+	if err := readBody(r, pdu[1:]); err != nil {
+		return ADU{}, err
+	}
+	return ADU{Header: h, PDU: pdu}, nil
+}
+
+// decodeHeader reads and validates the 7-byte MBAP header. The error contract
+// is Decode's: bare io.EOF for a clean close BEFORE any header byte, a
+// *FrameError for a malformed or out-of-range header, and a wrapped read error
+// otherwise (including a deadline expiry, after which the stream position is
+// unknown and the caller must close).
+func decodeHeader(r io.Reader) (Header, error) {
 	var hdr [headerLen]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		switch err {
 		case io.EOF:
-			return ADU{}, io.EOF // clean close between frames
+			return Header{}, io.EOF // clean close between frames
 		case io.ErrUnexpectedEOF:
-			return ADU{}, &FrameError{Reason: "truncated header"}
+			return Header{}, &FrameError{Reason: "truncated header"}
 		default:
-			return ADU{}, fmt.Errorf("mbap: read header: %w", err)
+			return Header{}, fmt.Errorf("mbap: read header: %w", err)
 		}
 	}
 	h := Header{
@@ -118,19 +203,87 @@ func Decode(r io.Reader) (ADU, error) {
 		UnitID: hdr[6],
 	}
 	if h.PID != 0 {
-		return ADU{}, &FrameError{Reason: fmt.Sprintf("protocol id 0x%04x, want 0", h.PID)}
+		return Header{}, &FrameError{Reason: fmt.Sprintf("protocol id 0x%04x, want 0", h.PID)}
 	}
 	if h.Length < minLength || h.Length > maxLength {
-		return ADU{}, &FrameError{Reason: fmt.Sprintf("length %d out of range [%d,%d]", h.Length, minLength, maxLength)}
+		return Header{}, &FrameError{Reason: fmt.Sprintf("length %d out of range [%d,%d]", h.Length, minLength, maxLength)}
 	}
-	pdu := make([]byte, h.Length-1)
-	if _, err := io.ReadFull(r, pdu); err != nil {
+	return h, nil
+}
+
+// readBody fills buf from r, mapping a short read to the *FrameError the
+// truncated-body contract promises. A zero-length buf is a no-op, so it is
+// safe to call for the tail of a 2-byte PDU.
+func readBody(r io.Reader, buf []byte) error {
+	if len(buf) == 0 {
+		return nil
+	}
+	if _, err := io.ReadFull(r, buf); err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return ADU{}, &FrameError{Reason: fmt.Sprintf("truncated frame body: got fewer than %d pdu bytes", len(pdu))}
+			return &FrameError{Reason: fmt.Sprintf("truncated frame body: got fewer than %d pdu bytes", len(buf))}
 		}
-		return ADU{}, fmt.Errorf("mbap: read frame body: %w", err)
+		return fmt.Errorf("mbap: read frame body: %w", err)
 	}
-	return ADU{Header: h, PDU: pdu}, nil
+	return nil
+}
+
+// requestPDUShape reports the PDU-length constraint the MODBUS Application
+// Protocol Specification fixes for a REQUEST carrying function code fc:
+// lo..hi bytes, and whether the length must additionally be even. ok is false
+// for every function code whose request size the protocol does NOT fix, which
+// this package leaves unconstrained.
+func requestPDUShape(fc uint8) (lo, hi int, even, ok bool) {
+	switch fc {
+	case 0x01, 0x02, FCReadHolding, FCReadInput, 0x05, FCWriteSingle:
+		// Read Coils / Read Discrete Inputs / Read Holding Registers / Read
+		// Input Registers / Write Single Coil / Write Single Register are all
+		// fc(1) + address(2) + quantity-or-value(2): exactly 5 bytes.
+		return 5, 5, false, true
+	case 0x0F:
+		// Write Multiple Coils: fc(1) + address(2) + quantity(2) +
+		// byteCount(1) + byteCount data bytes, with byteCount = ceil(qty/8)
+		// for qty 1..1968, i.e. 1..246.
+		return 1 + 2 + 2 + 1 + 1, 1 + 2 + 2 + 1 + 246, false, true
+	case FCWriteMultiple:
+		// Write Multiple Registers: the same head, with byteCount = 2*qty for
+		// qty 1..MaxWriteCount. byteCount is therefore EVEN, 2..246 — and the
+		// whole PDU is even too, which rejects a further half of the
+		// otherwise-in-range lengths.
+		return 1 + 2 + 2 + 1 + 2, 1 + 2 + 2 + 1 + 2*MaxWriteCount, true, true
+	}
+	return 0, 0, false, false
+}
+
+// checkRequestLength judges a request's declared MBAP Length (expressed here
+// as the pduLen it implies, Length-1) against its function code. See
+// DecodeRequest for why this is the one framing lie a receiver can catch
+// without a timing assumption.
+func checkRequestLength(fc uint8, pduLen int) error {
+	lo, hi, even, ok := requestPDUShape(fc)
+	if !ok {
+		return nil // size not fixed by the protocol — not ours to judge
+	}
+	if pduLen < lo || pduLen > hi {
+		return &FrameError{Reason: fmt.Sprintf(
+			"declared length %d impossible for request function 0x%02x: pdu %d bytes, want %s",
+			pduLen+1, fc, pduLen, describeRange(lo, hi, even))}
+	}
+	if even && pduLen%2 != 0 {
+		return &FrameError{Reason: fmt.Sprintf(
+			"declared length %d impossible for request function 0x%02x: pdu %d bytes is odd, want %s",
+			pduLen+1, fc, pduLen, describeRange(lo, hi, even))}
+	}
+	return nil
+}
+
+func describeRange(lo, hi int, even bool) string {
+	if lo == hi {
+		return fmt.Sprintf("exactly %d", lo)
+	}
+	if even {
+		return fmt.Sprintf("an even %d..%d", lo, hi)
+	}
+	return fmt.Sprintf("%d..%d", lo, hi)
 }
 
 // ExCode is a Modbus exception code as carried in an exception-response PDU.
