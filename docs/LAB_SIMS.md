@@ -50,7 +50,7 @@ of verdicts to SKIP or FAIL.
 | `DER_MODELS` | `full` | 707–710 trip models on top of the 7xx set; the reduced fixture was being measured as a product gap it never was |
 | `MBAPS_WMAX` | `2000` | LXR-013 reserves an uncontrollable device's full nameplate out of the site ceiling; a 6000 W second device alone exceeds the 5000 W default and zeroes every controllable device's budget |
 | `SIM_FLEET` | `2` | one configured DER — RC0's frozen single-DER scope and the audit's one-to-one topology |
-| aggregator | **off** | the bench loop targets `${GW_HOST}:802` with the port hardcoded, and the lab's listener is on 8802 |
+| aggregator | **off** | the lab's DUT is on the product's own `:802`, so the old wrong-port reason is gone — but the loop is a SECOND northbound controller writing the same DER a case is measuring, and every register observed under two writers is a fact about two writers. Its `GW_HOST` also defaults to the bench board |
 
 ## Addresses
 

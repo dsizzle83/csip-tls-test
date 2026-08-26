@@ -304,25 +304,60 @@ actually owns it:
 
 ## 7. `-preset local`
 
-Fills in the loopback lab's addresses for every target flag you did **not**
-type. Explicit flags always win — including one that happens to equal the
-default, because the preset is applied from the flags the parser actually
+Fills in the **host-native lab**'s addresses for every target flag you did
+**not** type. Explicit flags always win — including one that happens to equal
+the default, because the preset is applied from the flags the parser actually
 visited.
+
+The lab is lexa-gw's `docs/LAB_LOOP.md`: the production binaries running on this
+host inside a rootless user namespace, with the simulators from
+`scripts/lab/lab-sims-up.sh` beside them. The two files that OWN these addresses
+are `lexa-gw scripts/lab/lib.sh` and `csip-tls-test scripts/lab/lab-sims-up.sh`;
+the table below is transcribed from them and `TestPresetLocalFillsInTheLoopbackBench`
+holds it there.
 
 | Flag | Value |
 |---|---|
-| `-gateway` | `127.0.0.1:8802` (the field port is 802, which is privileged; 8802 is the unprivileged lab mirror) |
-| `-gridsim` / `-gridsim-admin` | `127.0.0.1:11113` / `http://127.0.0.1:11114` |
-| `-modsim` / `-modsim-api` | `127.0.0.1:5020` / `http://127.0.0.1:6020` |
-| `-mbapsdev` / `-mbapsdev-api` | `127.0.0.1:8021` / `http://127.0.0.1:6031` |
+| `-gateway` | `127.0.0.2:802` |
+| `-gridsim` / `-gridsim-admin` | `127.0.0.20:21113` / `http://127.0.0.20:21114` |
+| `-modsim` / `-modsim-api` | `127.0.0.20:15020` / `http://127.0.0.20:16020` |
+| `-mbapsdev` / `-mbapsdev-api` | `127.0.0.20:18021` / `http://127.0.0.20:16031` |
 | `-metrics-endpoint` | `http://127.0.0.1:9102/metrics` |
 | `-dev-api` | `https://127.0.0.1:9100` |
 | `-iface` | `lo` |
 
-Every port except the gateway's is the default `scripts/bench-sims-up.sh`
-already uses. `-iface lo` matters: loopback traffic crosses `lo` and nothing
-else, and leaving the bench NIC here produces a capture with zero frames and a
-bundle full of PASSes downgraded "for want of a citation".
+**Three addresses, on purpose.** certify decides a captured frame's direction by
+comparing its source against the DUT's, so on `127.0.0.1`-for-everything every
+frame reads as the DUT's. `127.0.0.2` is the product, `127.0.0.20` the
+simulators, `127.0.0.1` this harness — the same mnemonic split as the bench's
+`69.0.0.2` / `69.0.0.20`.
+
+**`802`, not a lab mirror.** `cmd/mbaps` refuses to start on any port the
+candidate manifest does not claim (`secure_sunspec.port = 802`,
+`Config.validateCandidate`, the LAB29-004 fail-closed shape rule), and the lab
+installs `configs/candidate.json` **byte-identically** because its sha256 is a
+load-time fact every bundle cites — a lab manifest edited to say `8802` would be
+a different product shape wearing the same name. So the lab grants the port
+instead of moving the listener: the host sysctl
+`net.ipv4.ip_unprivileged_port_start`, a one-time owner prerequisite that
+`lab.sh preflight` checks hard. There is deliberately no high-port fallback.
+
+**The sim ports are the lab's own block, disjoint from the bench's.**
+`sim/simapi` binds the wildcard address, so a lab reusing `11113/11114`,
+`5020/6020` or `8021/6031` could not be separated from the bench set by address
+— it would silently attach the local loop to the simulators a live bench
+campaign is grading. `TestPresetLocalDoesNotCollideWithTheBenchPorts` holds the
+two blocks apart.
+
+**`-iface lo` matters**: loopback traffic crosses `lo` and nothing else, and
+leaving the bench NIC here produces a capture with zero frames and a bundle full
+of PASSes downgraded "for want of a citation".
+
+One limit the lab cannot remove, and does not pretend to: Linux sources every
+outbound loopback connection from `127.0.0.1` regardless of destination, so the
+DUT's OWN client sockets (CSIP → gridsim, Modbus → modsim/mbapsdev) appear as
+`127.0.0.1` rather than as the DUT's address. Direction-sensitive assertions on
+the DUT-as-client legs are Layer-3 (board) evidence.
 
 ---
 

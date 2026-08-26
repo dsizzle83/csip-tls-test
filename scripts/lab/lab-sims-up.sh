@@ -37,9 +37,13 @@
 #                     the audit's one-to-one topology. mbapsdev still runs: the
 #                     DUT does not dial it in this profile, but certify's own
 #                     -mbapsdev rows do.
-#   no aggregator     the bench aggregator loop targets ${GW_HOST}:802 with the
-#                     port hardcoded, and the lab's listener is on 8802 (an
-#                     unprivileged user namespace cannot bind 802).
+#   no aggregator     the lab's DUT listens on the product's own :802 (the host
+#                     sysctl grants it; see lexa-gw scripts/lab/lib.sh), so the
+#                     old "wrong port" reason is gone — but the loop is still
+#                     NOT started here. It is a second northbound controller
+#                     writing the same DER a case is measuring, and every
+#                     register observed under two writers is a fact about two
+#                     writers. Its GW_HOST also defaults to the bench board.
 #
 # ── ADDRESSES ──────────────────────────────────────────────────────────────
 # sims 127.0.0.20, DUT 127.0.0.2, harness 127.0.0.1. Distinct addresses are not

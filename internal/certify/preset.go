@@ -15,30 +15,63 @@ package certify
 //
 // So the set is named once, here, and -preset local expands it.
 //
+// # THE ADDRESSES ARE THE LAB'S OWN, NOT A SECOND SET THAT RESEMBLES IT
+//
+// The block below is transcribed from the two files that OWN the lab's
+// topology, and from nowhere else:
+//
+//	lexa-gw   scripts/lab/lib.sh          the DUT, its port, the metrics and
+//	                                      dev-API ports, and the lab port block
+//	csip-tls-test scripts/lab/lab-sims-up.sh  the simulators' half of that block
+//
+// A preset that "looked about right" would be worse than no preset: every flag
+// it filled in wrongly would still produce a run, and the run would measure
+// nothing while reporting a device.
+//
+// Three addresses, on purpose (lib.sh's topology note). certify tells a captured
+// frame's direction by comparing its source against the DUT's, and on
+// 127.0.0.1-for-everything every frame looks like it came from the DUT:
+//
+//	127.0.0.2    the DUT (mnemonic for the bench's 69.0.0.2)
+//	127.0.0.20   the simulators (mnemonic for the bench's 69.0.0.20)
+//	127.0.0.1    this harness, and the DUT's own loopback-bound services
+//
 // # The ports, and where they come from
 //
-// Every port below is the DEFAULT the bench's own launcher already uses
-// (csip-tls-test scripts/bench-sims-up.sh), so a preset run and a bench run
-// address the same simulators and a value learned in one place is true in the
-// other. The single exception is the gateway's own mbaps listener, and it is
-// called out rather than buried:
-//
-//	gateway :8802   the DUT's Secure SunSpec Modbus server. THE FIELD PORT IS
-//	                802, which is privileged; a gateway running unprivileged on a
-//	                developer's host cannot bind it, so the lab mirror is 8802.
-//	                Nothing about the protocol depends on the number, and the
-//	                bundle records the address that was actually dialled.
-//	gridsim :11113 / admin :11114
-//	                bench-sims-up.sh's defaults. NOT 11111/11112: those belong to
-//	                a Production-PKI demo gridsim, and this bench's gateway
-//	                presents an mbaps-PKI leaf.
-//	modsim :5020 / simapi :6020
-//	mbapsdev :8021 / simapi :6031
+//	gateway 127.0.0.2:802     THE PRODUCT'S OWN PORT. Not a lab mirror: cmd/mbaps
+//	                          REFUSES TO START on any port the candidate manifest
+//	                          does not claim (configs/candidate.json
+//	                          secure_sunspec.port = 802, enforced by
+//	                          Config.validateCandidate — the LAB29-004 fail-closed
+//	                          shape rule), and the lab runs that manifest
+//	                          BYTE-IDENTICALLY because its sha256 is a load-time
+//	                          fact every bundle cites. A lab manifest edited to
+//	                          say 8802 would be a different shape with a different
+//	                          digest. The lab's rootless user namespace shares the
+//	                          host's network namespace, so binding 802 needs the
+//	                          host sysctl net.ipv4.ip_unprivileged_port_start —
+//	                          a one-time owner prerequisite `lab.sh preflight`
+//	                          checks hard. There is deliberately no high-port
+//	                          fallback.
+//	gridsim 127.0.0.20:21113 / admin :21114
+//	modsim  127.0.0.20:15020 / simapi :16020
+//	mbapsdev 127.0.0.20:18021 / simapi :16031
+//	                          lab-sims-up.sh's defaults. The block is DISJOINT
+//	                          from the bench's (11113/11114, 5020/6020,
+//	                          8021/6031) because this desktop serves the bench
+//	                          board from those ports and sim/simapi binds the
+//	                          wildcard address — a lab that reused them would
+//	                          silently attach the local loop to the simulators a
+//	                          live bench campaign is grading.
 //	metrics http://127.0.0.1:9102/metrics
-//	                lexa-northbound's endpoint, loopback-only by product design.
+//	                          lexa-northbound's endpoint. The lab does NOT
+//	                          rewrite metrics_addr, and the shared network
+//	                          namespace makes the product's own loopback address
+//	                          reachable from here.
 //	dev API https://127.0.0.1:9100
-//	                lexa-api. HTTPS with a per-device self-signed leaf, bearer
-//	                token from /etc/lexa/api.token.
+//	                          lexa-api. genconfig.sh writes listen_addr
+//	                          127.0.0.1:$LAB_API_PORT (9100) and leaves tls=true,
+//	                          so this is the shipped DefaultDevAPI unchanged.
 //
 // # Explicit flags always win
 //
@@ -60,7 +93,9 @@ type Preset string
 
 // The presets.
 const (
-	// PresetLocal is the loopback lab: the DUT and every simulator on this host.
+	// PresetLocal is the host-native lab of lexa-gw's docs/LAB_LOOP.md: the
+	// production binaries in a rootless user namespace on THIS host, the DUT on
+	// 127.0.0.2 and the simulators on 127.0.0.20.
 	PresetLocal Preset = "local"
 )
 
@@ -76,15 +111,19 @@ type presetSpec struct {
 
 var presets = []presetSpec{{
 	Name:    PresetLocal,
-	Summary: "the loopback lab: DUT and simulators on this host (127.0.0.1)",
+	Summary: "the host-native lab: DUT on 127.0.0.2, simulators on 127.0.0.20 (lexa-gw scripts/lab)",
 	Flags: map[string]string{
-		"gateway":          "127.0.0.1:8802",
-		"gridsim":          "127.0.0.1:11113",
-		"gridsim-admin":    "http://127.0.0.1:11114",
-		"modsim":           "127.0.0.1:5020",
-		"modsim-api":       "http://127.0.0.1:6020",
-		"mbapsdev":         "127.0.0.1:8021",
-		"mbapsdev-api":     "http://127.0.0.1:6031",
+		// THE PRODUCT'S OWN PORT, not a lab mirror. See the file doc: cmd/mbaps
+		// fail-closes on any port the byte-identical candidate manifest does not
+		// claim, so the lab grants 802 through the host sysctl instead of moving
+		// the listener.
+		"gateway":          "127.0.0.2:802",
+		"gridsim":          "127.0.0.20:21113",
+		"gridsim-admin":    "http://127.0.0.20:21114",
+		"modsim":           "127.0.0.20:15020",
+		"modsim-api":       "http://127.0.0.20:16020",
+		"mbapsdev":         "127.0.0.20:18021",
+		"mbapsdev-api":     "http://127.0.0.20:16031",
 		"metrics-endpoint": "http://127.0.0.1:9102/metrics",
 		"dev-api":          DefaultDevAPI,
 		// Loopback traffic crosses lo and nothing else. Leaving the bench NIC
