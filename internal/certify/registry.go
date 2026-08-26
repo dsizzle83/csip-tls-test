@@ -34,16 +34,23 @@ import (
 )
 
 // Verdict is re-exported so a suite needs exactly one import for the whole
-// result vocabulary. It is bundle.Verdict: PASS / FAIL / SKIP / WARN, the same
-// four values sim/ssm-conformance uses.
+// result vocabulary. It is bundle.Verdict: PASS / FAIL / SKIP / WARN — the four
+// values sim/ssm-conformance uses — plus N/A, which this engine needs and that
+// vocabulary has no word for.
 type Verdict = bundle.Verdict
 
-// The four verdicts, re-exported for the same reason.
+// The verdicts, re-exported for the same reason.
 const (
 	Pass = bundle.Pass
 	Fail = bundle.Fail
 	Skip = bundle.Skip
 	Warn = bundle.Warn
+	// NotApplicable is the RUNNER's spelling of bundle.VerdictNotApplicable: the
+	// row is not in scope for this candidate, so no outcome about it exists.
+	// A check must NOT return it — scope is decided from declarations, before
+	// the plan runs, and a check that could declare its own row out of scope
+	// could declare its way out of a failure. See scope.go.
+	NotApplicable = bundle.VerdictNotApplicable
 )
 
 // Assertion is re-exported: one checkable claim about the capture.

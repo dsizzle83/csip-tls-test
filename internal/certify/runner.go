@@ -40,6 +40,7 @@ import (
 	"strings"
 	"time"
 
+	"csip-tls-test/internal/certify/manifest"
 	"csip-tls-test/internal/evidence/bundle"
 	"csip-tls-test/internal/evidence/capture"
 	"csip-tls-test/internal/evidence/keylog"
@@ -71,6 +72,22 @@ type Options struct {
 	Roles          []DUTRole
 	ApplicableOnly bool
 	MinAutomatable Automatable
+
+	// Campaign, when set, replaces the selection with a named CLOSED one and
+	// arms that campaign's control-authority precondition. It is the only way
+	// to produce a GATING bundle; everything else is exploratory. See
+	// campaign.go.
+	Campaign Campaign
+	// ManifestPath is the candidate manifest (-manifest): the DUT's own
+	// declaration of what it is, against which scope decisions are made.
+	// REQUIRED with Campaign, optional otherwise, and a run without one makes
+	// no manifest-derived scope decision at all.
+	ManifestPath string
+	// Preset names a bench topology whose target addresses fill in the flags
+	// the operator did not set (preset.go). It is applied at the flag layer,
+	// before the runner sees Options, so the runner has no notion of it beyond
+	// this record of what was asked for.
+	Preset string
 
 	// DryRun lists what would run and writes no bundle.
 	DryRun bool
@@ -119,10 +136,19 @@ type Options struct {
 	CaptureSettle time.Duration
 
 	// Bench.
-	Targets    Targets
-	PKIDir     string
-	GatewaySSH string
-	HTTP       HTTPClient
+	Targets Targets
+	PKIDir  string
+	// GatewaySSH and GatewayExec are the two READ-ONLY introspection
+	// transports, and exactly one may be set: ssh to a remote DUT, or a local
+	// command prefix for a DUT on this host. See Gateway.
+	GatewaySSH  string
+	GatewayExec string
+	// DevAPI is the DUT's dev API base URL, reached THROUGH the introspection
+	// transport (it is loopback-bound on the device). Empty means
+	// DefaultDevAPI. The live control-authority reading comes from its GET
+	// /mode; the topology preflight reads its /status and /southbound/inventory.
+	DevAPI string
+	HTTP   HTTPClient
 
 	// SkipPreflight bypasses the bench cross-checks Runner.preflight makes —
 	// principally that -gridsim and -gridsim-admin name one live process. It
@@ -280,7 +306,22 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.CatalogPath, "catalog", o.CatalogPath, "path to catalog.json (default: nearest "+CatalogFile+")")
 	fs.Var(stringList{&o.Docs}, "doc", "only run cases from these catalog documents (repeatable, comma-separated)")
 	fs.Var(stringList{&o.UIDs}, "uid", "only run these catalog uids or ids (repeatable, comma-separated)")
-	fs.Var(stringList{&o.Suites}, "suite", "only run these suites (repeatable, comma-separated)")
+	fs.Var(stringList{&o.Suites}, "suite", "only run these suites (repeatable, comma-separated). "+
+		"EXPLORATORY: a -suite selection produces a non-gating bundle — see -campaign")
+	fs.Func("campaign", "run a named GATING campaign: "+strings.Join(CampaignNames(), "|")+
+		". Expands to that campaign's suites, requires -manifest and the matching LIVE DUT control "+
+		"authority (proven before case 1, not assumed), and records both in the bundle. Cannot be "+
+		"combined with -suite", func(v string) error {
+		o.Campaign = Campaign(strings.TrimSpace(v))
+		return nil
+	})
+	fs.StringVar(&o.ManifestPath, "manifest", o.ManifestPath,
+		"the candidate manifest (the DUT's own declaration of what it is; it installs one at "+
+			manifest.DefaultDUTPath+"). Scope decisions are made against it and it is copied into the "+
+			"bundle beside its digest. REQUIRED with -campaign")
+	fs.StringVar(&o.DevAPI, "dev-api", o.DevAPI,
+		"the DUT's dev API base URL, fetched ON the DUT through -gateway-ssh/-gateway-exec because it is "+
+			"loopback-bound (default "+DefaultDevAPI+")")
 	fs.Func("role", "only run cases for these DUT roles (repeatable, comma-separated)", func(v string) error {
 		for _, part := range strings.Split(v, ",") {
 			part = strings.TrimSpace(part)
@@ -318,6 +359,10 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Note, "note", o.Note, "free-text note recorded in the bundle")
 	fs.StringVar(&o.PKIDir, "pki", o.PKIDir, "mbaps certificate fixture directory")
 	fs.StringVar(&o.GatewaySSH, "gateway-ssh", o.GatewaySSH, "ssh destination for READ-ONLY gateway introspection")
+	fs.StringVar(&o.GatewayExec, "gateway-exec", o.GatewayExec,
+		"command PREFIX for READ-ONLY introspection of a gateway on THIS host, e.g. \"docker exec c\" or "+
+			"\"scripts/lab/lab-exec\". The same read-only allowlist is enforced before the prefix runs. "+
+			"Mutually exclusive with -gateway-ssh")
 	fs.StringVar(&o.Targets.Gateway, "gateway", o.Targets.Gateway, "DUT mbaps address host:port")
 	fs.StringVar(&o.Targets.GridSim, "gridsim", o.Targets.GridSim, "2030.5 server simulator host:port")
 	fs.StringVar(&o.Targets.GridSimAdmin, "gridsim-admin", o.Targets.GridSimAdmin, "gridsim admin API base URL")
@@ -335,7 +380,12 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&o.RequireCoverage, "require-coverage", o.RequireCoverage, "fail the run if an applicable test case has no implementation")
 	fs.BoolVar(&o.SkipPreflight, "skip-preflight", o.SkipPreflight,
 		"do not verify that -gridsim and -gridsim-admin are one live process (for topologies where they "+
-			"legitimately differ; the bundle records that the check was skipped)")
+			"legitimately differ; the bundle records that the check was skipped). It does NOT wave "+
+			"through a WRONG control-authority reading: its only effect there is to let an EXPLORATORY "+
+			"run with no gateway transport proceed, non-gating")
+	fs.StringVar(&o.Preset, "preset", o.Preset,
+		"fill in the bench addresses for a named topology — "+PresetSummary()+
+			". Flags given explicitly always win")
 }
 
 // Filter builds the catalog filter from the selection options.
@@ -356,9 +406,17 @@ type Planned struct {
 	// Implemented is false when no suite registered a check for this uid.
 	Implemented bool
 	// Skip, when non-empty, is why the case will not be executed: no
-	// implementation, a missing capability, a suite filter.
+	// implementation, a missing capability, a suite filter. It means "this run
+	// could not measure it" and nothing more.
 	Skip string
+	// Scope, when set, is why the case is NOT IN SCOPE for this candidate at
+	// all — a different statement from Skip, carried on a different verdict.
+	// See scope.go and bundle.VerdictNotApplicable.
+	Scope *ScopeDecision
 }
+
+// OutOfScope reports whether this row is not applicable to the candidate.
+func (p Planned) OutOfScope() bool { return p.Scope != nil }
 
 // CaseResult is one test case's outcome.
 type CaseResult struct {
@@ -366,6 +424,10 @@ type CaseResult struct {
 	Suite   string
 	Verdict Verdict
 	Notes   string
+	// Scope, when set, is why this row was declared NOT APPLICABLE. It is
+	// present exactly when Verdict is NotApplicable — bundle.Verify refuses a
+	// bundle where the two disagree.
+	Scope *ScopeDecision
 	// Assertions are the live-phase assertions plus whatever the citation
 	// phase produced.
 	Assertions []Assertion
@@ -448,10 +510,25 @@ type RunReport struct {
 	Started          time.Time
 	Finished         time.Time
 	DryRun           bool
+	// Campaign is the campaign this run declared, zero when exploratory.
+	Campaign CampaignSpec
+	// Authority is what the control-authority preflight established, or why it
+	// could not.
+	Authority authorityOutcome
+	// Exploratory, when non-empty, is why this run is NOT GATING — a run that
+	// may not decide anything. It is recorded in the bundle so a reader never
+	// has to reconstruct it from a command line.
+	Exploratory string
 }
 
-// Counts tallies the cases by verdict.
-func (r *RunReport) Counts() (pass, fail, skip, warn int) {
+// Gating reports whether this run's result may decide anything: it declared a
+// campaign, and nothing weakened it.
+func (r *RunReport) Gating() bool { return r.Campaign.Name != "" && r.Exploratory == "" }
+
+// Counts tallies the cases by verdict. N/A is returned separately from skip for
+// the reason bundle.Bundle.Counts gives: folded together, the rows nobody can
+// act on bury the ones somebody must.
+func (r *RunReport) Counts() (pass, fail, skip, warn, na int) {
 	for _, c := range r.Cases {
 		switch c.Verdict {
 		case Pass:
@@ -462,13 +539,16 @@ func (r *RunReport) Counts() (pass, fail, skip, warn int) {
 			skip++
 		case Warn:
 			warn++
+		case NotApplicable:
+			na++
 		}
 	}
 	return
 }
 
-// VerdictCounts is a per-verdict tally.
-type VerdictCounts struct{ Pass, Fail, Skip, Warn int }
+// VerdictCounts is a per-verdict tally. It mirrors bundle.VerdictCounts exactly,
+// so the live run and the bundle written from it cannot report different shapes.
+type VerdictCounts struct{ Pass, Fail, Skip, Warn, NotApplicable int }
 
 func (v *VerdictCounts) add(k Verdict) {
 	switch k {
@@ -480,11 +560,17 @@ func (v *VerdictCounts) add(k Verdict) {
 		v.Skip++
 	case Warn:
 		v.Warn++
+	case NotApplicable:
+		v.NotApplicable++
 	}
 }
 
 // Total returns the number of cases in the tally.
-func (v VerdictCounts) Total() int { return v.Pass + v.Fail + v.Skip + v.Warn }
+func (v VerdictCounts) Total() int { return v.Pass + v.Fail + v.Skip + v.Warn + v.NotApplicable }
+
+// InScope is the total less the rows declared not applicable — what a
+// completion figure must be taken over.
+func (v VerdictCounts) InScope() int { return v.Total() - v.NotApplicable }
 
 // CountsByClaim splits the verdict tally in two: the cases that bear on the
 // certification CLAIM (catalog `applicable`), and the INFORMATIVE cases the
@@ -531,8 +617,15 @@ func (r *RunReport) Unaddressed() []CoverageEntry {
 // An INAPPLICABLE-but-certifiable row (an aggregator procedure under a
 // DER-Client claim) is excluded by the same reading, which is the behaviour the
 // claim split was introduced for.
+// A NOT-APPLICABLE row is neither a pass nor a failure: it contributes to no
+// FAIL count, and it is excluded from the "did this run establish anything at
+// all" floor, so a selection every row of which was out of scope cannot report
+// itself clean.
 func (r *RunReport) OK() bool {
-	app, _ := r.CountsByClaim()
+	app, inf := r.CountsByClaim()
+	if app.InScope()+inf.InScope() == 0 && len(r.Cases) > 0 {
+		return false
+	}
 	return app.Fail == 0 && r.Coverage.Complete() && len(r.CaptureProblems) == 0
 }
 
@@ -543,7 +636,26 @@ type Runner struct {
 	opts Options
 	log  Logger
 	out  io.Writer
+
+	// campaign is the resolved -campaign, zero when the run is exploratory.
+	campaign CampaignSpec
+	// manifest is the loaded candidate manifest, nil when none was given.
+	manifest *manifest.Manifest
+	// gatewayExec is -gateway-exec split into an argv, once, at construction —
+	// so a malformed prefix is a startup error rather than a failure on the
+	// first introspection call, forty minutes in.
+	gatewayExec []string
 }
+
+// gateway builds the READ-ONLY introspection client for this run. One
+// constructor, so the two transports cannot diverge between the preflight and
+// the checks.
+func (r *Runner) gateway() *Gateway {
+	return &Gateway{SSH: r.opts.GatewaySSH, Exec: r.gatewayExec}
+}
+
+// Manifest returns the candidate manifest this run was measured against, or nil.
+func (r *Runner) Manifest() *manifest.Manifest { return r.manifest }
 
 // New builds a runner. It validates the selection against the catalog up front,
 // so a typo in -doc fails immediately instead of producing a clean report of
@@ -555,6 +667,36 @@ func New(reg *Registry, cat *Catalog, opts Options) (*Runner, error) {
 	if cat == nil {
 		return nil, fmt.Errorf("certify: no catalog")
 	}
+	// The campaign expands the selection BEFORE anything is validated against
+	// the catalog, so everything below sees one selection whether the operator
+	// named suites or a campaign — and the -suite/-campaign conflict, and the
+	// missing -manifest, are refused here rather than surfacing later as a
+	// puzzling row count.
+	spec, err := resolveCampaign(&opts)
+	if err != nil {
+		return nil, err
+	}
+	// Two introspection transports naming two different devices is refused at
+	// the flag layer rather than resolved at the call site: see Gateway.Run.
+	if opts.GatewaySSH != "" && opts.GatewayExec != "" {
+		return nil, fmt.Errorf("certify: -gateway-ssh %s and -gateway-exec %q are mutually exclusive — "+
+			"they name different devices, and a run that read some facts from one and some from the "+
+			"other would be evidence about neither", opts.GatewaySSH, opts.GatewayExec)
+	}
+	var gatewayExec []string
+	if opts.GatewayExec != "" {
+		gatewayExec, err = SplitCommandPrefix(opts.GatewayExec)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var cand *manifest.Manifest
+	if opts.ManifestPath != "" {
+		cand, err = manifest.Load(opts.ManifestPath)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := cat.Validate(opts.Filter()); err != nil {
 		return nil, err
 	}
@@ -563,6 +705,15 @@ func New(reg *Registry, cat *Catalog, opts Options) (*Runner, error) {
 	// Catalog.Validate exists to prevent for -doc and -uid. Refuse instead, and
 	// name what IS available.
 	if unknown := unknownSuites(reg, opts.Suites); len(unknown) > 0 {
+		if spec.Name != "" {
+			// The campaign table names a suite this binary does not link. That
+			// is a defect in the table or a renamed suite, never the operator's
+			// mistake, and it must not be reported as one.
+			return nil, &CampaignError{Campaign: string(spec.Name), Reason: fmt.Sprintf(
+				"expands to suite(s) %s, which this binary does not have (have: %s). The campaign table "+
+					"and the linked suites have diverged", strings.Join(unknown, ", "),
+				strings.Join(reg.Suites(), ", "))}
+		}
 		return nil, fmt.Errorf("certify: no suite named %s (have: %s)",
 			strings.Join(unknown, ", "), strings.Join(reg.Suites(), ", "))
 	}
@@ -589,17 +740,29 @@ func New(reg *Registry, cat *Catalog, opts Options) (*Runner, error) {
 	// frame directions against 69.0.0.2.
 	opts.Targets.Normalise()
 	r := &Runner{
-		reg:  reg,
-		cat:  cat,
-		opts: opts,
-		log:  opts.Log,
-		out:  opts.Out,
+		reg:         reg,
+		cat:         cat,
+		opts:        opts,
+		log:         opts.Log,
+		out:         opts.Out,
+		campaign:    spec,
+		manifest:    cand,
+		gatewayExec: gatewayExec,
 	}
 	if r.log == nil {
 		r.log = DiscardLogger
 	}
 	if r.out == nil {
 		r.out = os.Stdout
+	}
+	// LAST, because it needs the resolved filter: a selection that matches
+	// nothing is refused rather than run. Catalog.Validate above catches a
+	// selector that names nothing AT ALL; this catches the INTERSECTION that
+	// does — `-suite modbus-server -uid ssm-conf-v0.8::RBAC-002`, where every
+	// selector is valid and no case is in all of them. See
+	// explainEmptySelection for why an empty run is worse than a refused one.
+	if len(cat.Select(r.filter())) == 0 {
+		return nil, explainEmptySelection(cat, reg, &opts)
 	}
 	return r, nil
 }
@@ -646,12 +809,28 @@ func (r *Runner) Plan() []Planned {
 	plan := make([]Planned, 0, len(cases))
 	for _, c := range cases {
 		p := Planned{Case: c}
+		// SCOPE FIRST, and before the registration lookup, because "this row is
+		// not about anything this candidate is" is decided by declarations, not
+		// by whether a suite happens to implement it. The candidate's own
+		// manifest outranks the catalog here: it is the narrower and more
+		// specific statement, and ManifestScope flags the disagreement when the
+		// two contradict rather than resolving it silently.
+		if d, ok := ManifestScope(r.manifest, c); ok {
+			p.Scope = &d
+			plan = append(plan, p)
+			continue
+		}
 		reg, ok := r.reg.Lookup(c.UID)
 		if !ok {
-			p.Skip = "no implementation registered"
-			if !c.Applicable {
-				p.Skip = "not applicable to this product: " + firstSentence(c.ApplicabilityReason)
+			// An inapplicable row nobody implements is OUT OF SCOPE, not
+			// unmeasured. An APPLICABLE row nobody implements is a genuine gap
+			// and stays a Skip, which is what the coverage report counts.
+			if d, na := CatalogScope(c); na {
+				p.Scope = &d
+				plan = append(plan, p)
+				continue
 			}
+			p.Skip = "no implementation registered"
 			plan = append(plan, p)
 			continue
 		}
@@ -688,7 +867,11 @@ func (r *Runner) capabilities() map[string]bool {
 	caps["capture"] = !r.opts.NoCapture
 	caps["keylog"] = r.opts.KeyLogPath != ""
 	caps["gridsim"] = r.opts.Targets.GridSimAdmin != ""
-	caps["gateway"] = r.opts.GatewaySSH != ""
+	// EITHER introspection transport satisfies the "gateway" capability. Tying
+	// it to -gateway-ssh alone would make every check that reads a
+	// config-derived fact skip on a local-exec run that can read them perfectly
+	// well.
+	caps["gateway"] = r.gateway().Available()
 	caps["pki"] = r.opts.PKIDir != ""
 	caps["bench"] = r.opts.Targets.Gateway != ""
 	return caps
@@ -702,9 +885,29 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		Plan:     r.Plan(),
 		Started:  time.Now().UTC(),
 		DryRun:   r.opts.DryRun,
+		Campaign: r.campaign,
+	}
+	// A run that declared no campaign is exploratory by construction, and says
+	// so from the first line rather than being discovered to be non-gating by
+	// a reader of the bundle much later.
+	if r.campaign.Name == "" {
+		rep.Exploratory = "no -campaign was declared: this is an EXPLORATORY selection, and its result " +
+			"is evidence about the implementation rather than a campaign anything may rest on"
 	}
 	reporter := NewReporter(r.out)
 	reporter.Header(r, rep)
+	if contested := contestedScope(rep.Plan); len(contested) > 0 {
+		// The candidate's manifest and the conformance catalog disagree about
+		// whether a row is in the claim. The manifest wins — it is the
+		// candidate's own statement about itself — but the disagreement is
+		// SHOUTED rather than applied quietly, because one of the two documents
+		// is wrong and only the owner of the claim can say which.
+		reporter.Line("SCOPE CONFLICT: %d row(s) are marked APPLICABLE by the catalog and OUT OF SCOPE by "+
+			"the candidate manifest (%s). The manifest stands and those rows are recorded N/A with it "+
+			"named as the source — but one of the two documents needs correcting: either the candidate "+
+			"under-declares what it is, or the catalog over-claims for this profile",
+			len(contested), firstUIDs(contested, 6))
+	}
 
 	if len(rep.Coverage.Orphans) > 0 {
 		// A registration for a uid the catalog does not contain means the suite
@@ -730,12 +933,28 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		return rep, err
 	}
 
-	// Same discipline, one row over: the RBAC/mbaps-authority cluster's own
-	// precondition is the DUT's live Authority posture, and nothing upstream
-	// of this loop otherwise checked it before RBAC-002-MODEL704-REG40298-
-	// WRITE-DENIED-ALL-ROLES (lexa-gw/docs/known_issues.json) shipped a
-	// battery that could measure a lock-screen it never knew was engaged.
-	if err := r.preflightAuthority(ctx, reporter, rep.Plan); err != nil {
+	// Same discipline, one row over: a control row's own precondition is the
+	// DUT's live control-authority posture, and nothing upstream of this loop
+	// otherwise checked it before RBAC-002-MODEL704-REG40298-WRITE-DENIED-
+	// ALL-ROLES (lexa-gw/docs/known_issues.json) shipped a battery that could
+	// measure a lock-screen it never knew was engaged. This FAILS CLOSED: an
+	// unprovable precondition ends the run here, before case 1, rather than
+	// forty minutes later as a bundle full of findings about the arbitration
+	// layer.
+	auth, err := r.preflightAuthority(ctx, reporter, rep.Plan)
+	rep.Authority = auth
+	if auth.Unchecked != "" && rep.Exploratory == "" {
+		rep.Exploratory = auth.Unchecked
+	}
+	if err != nil {
+		rep.Finished = time.Now().UTC()
+		return rep, err
+	}
+
+	// The candidate's declared topology, against the topology the DUT reports.
+	// After the authority preflight because it uses the same channel, and
+	// before the capture for the same reason everything else here is.
+	if err := r.preflightManifest(ctx, reporter); err != nil {
 		rep.Finished = time.Now().UTC()
 		return rep, err
 	}
@@ -779,7 +998,7 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		}
 	}
 	gridsim := NewAdminClient(r.opts.Targets.GridSimAdmin, r.opts.HTTP)
-	gw := &Gateway{SSH: r.opts.GatewaySSH}
+	gw := r.gateway()
 
 	var windows []*Window
 	runErr := error(nil)
@@ -789,6 +1008,28 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 			runErr = err
 			reporter.Line("run cancelled: %v — %d case(s) not reached", err, len(rep.Plan)-len(rep.Cases))
 			break
+		}
+		if p.OutOfScope() {
+			// NOT a Skip. Nothing about this row was measurable because there
+			// was nothing here to measure, and the record says who decided
+			// that. One assertion carries the same statement so the case's
+			// stored verdict follows from its own printed evidence and
+			// bundle.Verify's roll-up agrees with it.
+			res := CaseResult{
+				Case: p.Case, Suite: p.Registration.Suite,
+				Verdict: NotApplicable, Notes: p.Scope.Reason, Scope: p.Scope,
+				Started: time.Now().UTC(),
+				Assertions: []Assertion{{
+					Claim:    "the test case is in scope for the candidate under test",
+					Method:   "scope declaration (" + string(p.Scope.Source) + ")",
+					Verdict:  NotApplicable,
+					Observed: p.Scope.Reason,
+					Note:     p.Scope.Detail,
+				}},
+			}
+			rep.Cases = append(rep.Cases, res)
+			reporter.Case(res)
+			continue
 		}
 		if !p.Implemented || p.Skip != "" {
 			res := CaseResult{
@@ -807,6 +1048,7 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 			Case: p.Case, Suite: p.Registration.Suite, Registration: p.Registration,
 			Targets: r.opts.Targets, PKI: pki, GridSim: gridsim, Sims: sims,
 			Gateway: gw, Capture: captureRef, Params: r.opts.Params, Log: r.log,
+			candidate: r.manifest,
 		}
 		// Cannot fail on a freshly built context; AttachWindow only refuses a
 		// SECOND window, which is the invariant it exists to hold.
@@ -882,6 +1124,19 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		}
 	}
 	return rep, runErr
+}
+
+// contestedScope lists the rows whose manifest-derived scope decision
+// contradicts the catalog. See ScopeDecision.Contested.
+func contestedScope(plan []Planned) []string {
+	var out []string
+	for _, p := range plan {
+		if p.Scope != nil && p.Scope.Contested && p.Case != nil {
+			out = append(out, p.Case.UID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // unknownSuites returns the requested suite names no registration uses.
@@ -1328,6 +1583,15 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 	if r.opts.SkipPreflight {
 		note = joinNote(note, SkipPreflightNote)
 	}
+	if rep.Exploratory != "" {
+		note = joinNote(note, "EXPLORATORY, NOT GATING: "+rep.Exploratory)
+	}
+	if contested := contestedScope(rep.Plan); len(contested) > 0 {
+		note = joinNote(note, fmt.Sprintf("SCOPE CONFLICT: %d row(s) the catalog marks applicable were "+
+			"recorded N/A on the candidate manifest's declaration (%s). The manifest is the candidate's "+
+			"own statement and stands, but the two documents disagree and one of them needs correcting",
+			len(contested), firstUIDs(contested, 8)))
+	}
 
 	b := bundle.NewBuilder(bundle.RunMeta{
 		Tool: ToolName, ToolVersion: rep.Catalog.SHA256[:12],
@@ -1341,6 +1605,36 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 		Started: rep.Started, Finished: time.Now().UTC(),
 		DUT: r.opts.DUT,
 	})
+	// The campaign record: what this bundle is evidence FOR, and whether it may
+	// decide anything. Written on every run, exploratory ones included — "this
+	// bundle is not gating" is a fact a CI gate must be able to read directly
+	// rather than infer from a missing key.
+	campaign := bundle.CampaignRecord{
+		Name:        string(rep.Campaign.Name),
+		Suites:      append([]string(nil), rep.Campaign.Suites...),
+		Gating:      rep.Gating(),
+		Exploratory: rep.Exploratory,
+	}
+	if rep.Authority.Required != AuthorityAny {
+		campaign.Authority = string(rep.Authority.Required)
+	}
+	if rep.Authority.Reading != nil {
+		campaign.AuthorityObserved = string(rep.Authority.Reading.Live)
+	}
+	b.SetCampaign(campaign)
+	// The candidate manifest travels WITH its digest and WITH the file, so a
+	// reader can hash the copy in front of them and confirm the scope decisions
+	// in this bundle were made against it.
+	if r.manifest != nil {
+		b.SetCandidate(bundle.CandidateRef{
+			Path:    r.manifest.Path(),
+			SHA256:  r.manifest.SHA256(),
+			Profile: r.manifest.Profile,
+		})
+		if _, err := os.Stat(r.manifest.Path()); err == nil {
+			b.AddFile(r.manifest.Path())
+		}
+	}
 	if capr != nil {
 		b.SetCapture(rep.Capture, capr.Path())
 	}
@@ -1370,7 +1664,7 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 	}
 	defer func() { _ = os.RemoveAll(staging) }()
 	covPath := filepath.Join(staging, "COVERAGE.md")
-	if err := os.WriteFile(covPath, []byte(CoverageMarkdown(rep.Coverage)), 0o644); err != nil {
+	if err := os.WriteFile(covPath, []byte(CoverageMarkdown(rep.Coverage, rep.Plan)), 0o644); err != nil {
 		return nil, "", fmt.Errorf("certify: write coverage: %w", err)
 	}
 	b.AddFile(covPath)
@@ -1392,8 +1686,11 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 			// Written only when the case is NON-certifiable, so a bundle from a
 			// campaign of published procedures is byte-identical to before.
 			NonCertifiable: c.Case.Certifiable != nil && !*c.Case.Certifiable,
-			Notes:          caseNotes(c),
-			Assertions:     c.Assertions,
+			// Present exactly when the verdict is N/A: bundle.Verify refuses a
+			// bundle where the two disagree in either direction.
+			NotApplicable: naRecord(c),
+			Notes:         caseNotes(c),
+			Assertions:    c.Assertions,
 		})
 	}
 	out, err := b.Write(dir)
@@ -1401,6 +1698,14 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 		return nil, "", fmt.Errorf("certify: write bundle: %w", err)
 	}
 	return out, dir, nil
+}
+
+// naRecord renders a case's scope decision for the bundle, or nil.
+func naRecord(c CaseResult) *bundle.NotApplicable {
+	if c.Verdict != NotApplicable || c.Scope == nil {
+		return nil
+	}
+	return c.Scope.Record()
 }
 
 // caseNotes assembles the prose the bundle records for a case: the check's own

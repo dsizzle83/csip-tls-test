@@ -62,8 +62,20 @@ func (r *Reporter) Header(run *Runner, rep *RunReport) {
 		rep.Catalog.SHA256, rep.Catalog.Cases, len(rep.Catalog.Docs))
 	r.printf("Selected:     %d case(s) — %d applicable, %d implemented, %d unimplemented\n",
 		total, applicable, implemented, missing)
+	if run != nil && run.campaign.Name != "" {
+		r.printf("Campaign:     %s — %s\n", run.campaign.Name, run.campaign.Summary)
+		r.printf("              suites %s · %s\n", strings.Join(run.campaign.Suites, " + "), gatingWord(rep))
+	} else {
+		r.printf("Campaign:     (none) — EXPLORATORY, this run is NOT GATING\n")
+	}
+	if run != nil && run.manifest != nil {
+		r.printf("Candidate:    %s\n", run.manifest.Summary())
+	}
 	if run != nil {
 		r.printf("DUT:          %s\n", orNone(run.opts.Targets.Gateway))
+		if gw := run.gateway(); gw.Available() {
+			r.printf("Introspect:   %s (READ-ONLY)\n", gw.Describe())
+		}
 		if !run.opts.NoCapture {
 			r.printf("Capture:      %s%s\n", ifaceLabel(run.opts.Iface), filterSuffix(run.opts.BPF))
 		}
@@ -97,20 +109,32 @@ func orNone(s string) string {
 func (r *Reporter) PlanListing(plan []Planned) {
 	r.printf("\n%s\nPLAN — %d case(s) in execution order\n%s\n", strings.Repeat("─", rule), len(plan), strings.Repeat("─", rule))
 	doc := ""
+	run, skipped, na := 0, 0, 0
 	for _, p := range plan {
 		if p.Case.Doc != doc {
 			doc = p.Case.Doc
 			r.printf("\n[%s]\n", doc)
 		}
 		switch {
+		case p.OutOfScope():
+			na++
+			r.printf("  — n/a      %-14s %-52s  %s [%s]\n", p.Case.ID, trunc(p.Case.Title, 52),
+				trunc(oneLine(p.Scope.Reason), 52), p.Scope.Source)
 		case !p.Implemented:
+			skipped++
 			r.printf("  ·          %-14s %-52s  %s\n", p.Case.ID, trunc(p.Case.Title, 52), p.Skip)
 		case p.Skip != "":
+			skipped++
 			r.printf("  · skip     %-14s %-52s  %s\n", p.Case.ID, trunc(p.Case.Title, 52), p.Skip)
 		default:
+			run++
 			r.printf("  → run      %-14s %-52s  [%s]\n", p.Case.ID, trunc(p.Case.Title, 52), p.Registration.Suite)
 		}
 	}
+	// The three numbers a dry run exists to produce, stated rather than left to
+	// be counted off a wall of lines.
+	r.printf("\n  %d to RUN · %d to SKIP (unmeasurable here) · %d NOT APPLICABLE (out of scope, never run)\n",
+		run, skipped, na)
 	r.printf("\n")
 }
 
@@ -153,6 +177,10 @@ func (r *Reporter) Case(res CaseResult) {
 	if res.FrameSet != nil && len(res.FrameSet.Frames) > 0 {
 		frames = fmt.Sprintf(" frames %s", res.FrameSet.Span())
 	}
+	// The running tally stays FOUR numbers. N/A is deliberately outside it: the
+	// tally is "how is this run going", and a row that was never in scope is not
+	// part of how it is going. Its own line still prints, with the — glyph, so
+	// nothing is hidden — only kept out of a count it would distort.
 	r.printf("  %s~ %-32s %-46s [%d/%d/%d/%d]%s\n",
 		Glyph(res.Verdict), res.Case.UID, trunc(oneLine(detail), 46), pass, fail, skip, warn, frames)
 }
@@ -204,9 +232,34 @@ func Glyph(v Verdict) string {
 		return "⚠ WARN"
 	case Skip:
 		return "· SKIP"
+	case NotApplicable:
+		// Five characters wide like the rest, so the columns line up and a
+		// reader scanning for the shape of a run sees N/A as its own kind
+		// rather than as an oddly-worded skip.
+		return "— N/A "
 	default:
 		return "? ????"
 	}
+}
+
+// gatingWord says, in one word, whether a run's result may decide anything.
+func gatingWord(rep *RunReport) string {
+	if rep.Gating() {
+		return "GATING"
+	}
+	return "NOT GATING"
+}
+
+// outOfScopeRows returns the planned rows the candidate declared out of scope,
+// in plan order.
+func outOfScopeRows(plan []Planned) []Planned {
+	var out []Planned
+	for _, p := range plan {
+		if p.OutOfScope() && p.Case != nil {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // CoverageListing prints the coverage of the standard.
@@ -232,22 +285,35 @@ func (r *Reporter) CoverageListing(cov Coverage) {
 // the run is clean: every applicable case addressed, no failures, no
 // capture-integrity problem.
 func (r *Reporter) Summary(rep *RunReport) bool {
-	pass, fail, skip, warn := rep.Counts()
+	pass, fail, skip, warn, na := rep.Counts()
 	missing := rep.Unaddressed()
 
 	r.printf("\n%s\nCONFORMANCE RUN SUMMARY\n%s\n", strings.Repeat("═", rule), strings.Repeat("═", rule))
 	r.printf("  Catalog:      %s (sha256 %s)\n", rep.Catalog.Source, short(rep.Catalog.SHA256, 16))
-	r.printf("  Test cases:   %d\n", len(rep.Cases))
+	if rep.Campaign.Name != "" {
+		r.printf("  Campaign:     %s (%s)\n", rep.Campaign.Name, strings.Join(rep.Campaign.Suites, " + "))
+	}
+	if rep.Authority.Reading != nil {
+		r.printf("  Authority:    %s\n", rep.Authority.Reading.String())
+	}
+	r.printf("  Test cases:   %d in scope\n", len(rep.Cases)-na)
 	r.printf("  PASS:         %d\n", pass)
 	r.printf("  FAIL:         %d\n", fail)
 	r.printf("  SKIP:         %d  (addressed, not assertable here — see the reason on each)\n", skip)
 	r.printf("  WARN:         %d\n", warn)
+	if na > 0 {
+		// Outside the four, and labelled as not-a-verdict. See
+		// bundle.VerdictNotApplicable: a row nobody claimed is not an
+		// unfinished one, and printing it in the same column is how a complete
+		// campaign comes to look half-done.
+		r.printf("  N/A:          %d  (NOT a verdict: out of scope for this candidate, never run)\n", na)
+	}
 	// Split the tally by whether a row bears on the CLAIM. An informative FAIL is
 	// a finding about a row the product does not claim conformance to, and folding
 	// it into the same headline number as a claim-relevant FAIL overstates the
 	// run. Shown only when informative rows are present, so a claim-only run stays
 	// quiet. No verdict changes — only the grouping.
-	if app, inf := rep.CountsByClaim(); inf.Total() > 0 {
+	if app, inf := rep.CountsByClaim(); inf.InScope() > 0 {
 		r.printf("     ├─ applicable to the claim:      %d PASS / %d FAIL / %d SKIP / %d WARN\n",
 			app.Pass, app.Fail, app.Skip, app.Warn)
 		r.printf("     └─ informative (implemented, not claimed): %d PASS / %d FAIL / %d SKIP / %d WARN\n",
@@ -310,7 +376,15 @@ func (r *Reporter) Summary(rep *RunReport) bool {
 
 // CoverageMarkdown renders COVERAGE.md: the "coverage of the standard"
 // deliverable, per document, naming what is implemented and what is not.
-func CoverageMarkdown(cov Coverage) string {
+//
+// plan is the run's plan, or nil for a coverage report taken outside a run. It
+// is here for one section: the rows this CANDIDATE put out of scope. Coverage is
+// otherwise a fact about the STANDARD and the tool, identical for every device —
+// but a COVERAGE.md sealed into a bundle that listed a row under "Implemented"
+// while bundle.json recorded it N/A would be two documents in one directory
+// disagreeing about the same row, which is exactly the kind of drift this
+// deliverable exists to make impossible.
+func CoverageMarkdown(cov Coverage, plan []Planned) string {
 	var b strings.Builder
 	total, applicable, implemented, missing := cov.Totals()
 	fmt.Fprintf(&b, "# Coverage of the conformance catalog\n\n")
@@ -356,6 +430,18 @@ func CoverageMarkdown(cov Coverage) string {
 			fmt.Fprintf(&b, "\n")
 		}
 	}
+	if na := outOfScopeRows(plan); len(na) > 0 {
+		fmt.Fprintf(&b, "## Not applicable to this candidate\n\n")
+		fmt.Fprintf(&b, "%d row(s) were NOT RUN because they are out of scope for the candidate under "+
+			"test. This is not an evidence gap and not a skip: there is nothing here to measure. Each "+
+			"row names the declaration that decided it, so a reader who disputes a scope decision knows "+
+			"whose document to take it up with.\n\n", len(na))
+		fmt.Fprintf(&b, "| Case | Declared by | Reason |\n|------|-------------|--------|\n")
+		for _, p := range na {
+			fmt.Fprintf(&b, "| `%s` | %s | %s |\n", p.Case.UID, p.Scope.Source, md(oneLine(p.Scope.Reason)))
+		}
+		fmt.Fprintf(&b, "\n")
+	}
 	if len(cov.Orphans) > 0 {
 		fmt.Fprintf(&b, "## Orphaned registrations\n\n")
 		fmt.Fprintf(&b, "These uids have an implementation but no catalog record. The suite and the "+
@@ -373,8 +459,19 @@ func CoverageMarkdown(cov Coverage) string {
 // cleanly.
 func MarkdownSection(rep *RunReport) string {
 	var b strings.Builder
-	pass, fail, skip, warn := rep.Counts()
+	pass, fail, skip, warn, na := rep.Counts()
 	fmt.Fprintf(&b, "## CSIP / SunSpec conformance evidence — %s\n\n", rep.Started.UTC().Format("2006-01-02"))
+	if rep.Campaign.Name != "" {
+		fmt.Fprintf(&b, "**Campaign:** `%s` (%s), %s — %s.\n", rep.Campaign.Name,
+			strings.Join(rep.Campaign.Suites, " + "), gatingWord(rep), rep.Campaign.Summary)
+		if rep.Authority.Reading != nil {
+			fmt.Fprintf(&b, "**DUT control authority:** %s, proven before case 1.\n",
+				md(rep.Authority.Reading.String()))
+		}
+	} else {
+		fmt.Fprintf(&b, "**Exploratory run — NOT GATING.** No campaign was declared, so this section is "+
+			"evidence about the implementation and not a conformance campaign result.\n")
+	}
 	fmt.Fprintf(&b, "**Tool:** `%s` (internal/certify) driving the bench's own independent stacks — "+
 		"the referee never uses the product's implementations (PN-1/C9/AD-003(f)).\n", ToolName)
 	fmt.Fprintf(&b, "**Catalog:** `%s`, sha256 `%s`, %d extracted test cases.\n",
@@ -390,13 +487,17 @@ func MarkdownSection(rep *RunReport) string {
 		fmt.Fprintf(&b, "**Bundle:** `%s` (verify with `sha256sum -c MANIFEST.sha256` plus the "+
 			"evidence verifier).\n", rep.BundleDir)
 	}
-	fmt.Fprintf(&b, "\nResult: **%d PASS / %d FAIL / %d SKIP / %d WARN** across %d test case(s).\n",
-		pass, fail, skip, warn, len(rep.Cases))
+	fmt.Fprintf(&b, "\nResult: **%d PASS / %d FAIL / %d SKIP / %d WARN** across %d in-scope test case(s).\n",
+		pass, fail, skip, warn, len(rep.Cases)-na)
+	if na > 0 {
+		fmt.Fprintf(&b, "\n%d further case(s) are NOT APPLICABLE to this candidate and were not run; "+
+			"each carries its reason and the declaration it rests on in the bundle.\n", na)
+	}
 	// Split the headline by whether a row bears on the certification CLAIM. An
 	// informative FAIL (a row the suite implements but the product does not claim)
 	// must not be read as a claim failure — see RunReport.CountsByClaim. Emitted
 	// only when informative rows are present; no verdict is changed.
-	if app, inf := rep.CountsByClaim(); inf.Total() > 0 {
+	if app, inf := rep.CountsByClaim(); inf.InScope() > 0 {
 		fmt.Fprintf(&b, "\n- Applicable to the claim: **%d PASS / %d FAIL / %d SKIP / %d WARN**\n",
 			app.Pass, app.Fail, app.Skip, app.Warn)
 		fmt.Fprintf(&b, "- Informative (implemented, not claimed): **%d PASS / %d FAIL / %d SKIP / %d WARN**\n",

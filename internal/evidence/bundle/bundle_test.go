@@ -264,7 +264,7 @@ func TestWriteAndVerify(t *testing.T) {
 	if b.Cases[0].Verdict != Pass || b.Cases[2].Verdict != Skip {
 		t.Errorf("verdicts = %s / %s", b.Cases[0].Verdict, b.Cases[2].Verdict)
 	}
-	pass, fail, skip, warn := b.Counts()
+	pass, fail, skip, warn, _ := b.Counts()
 	if pass != 2 || fail != 0 || skip != 1 || warn != 0 {
 		t.Errorf("counts = %d/%d/%d/%d", pass, fail, skip, warn)
 	}

@@ -21,6 +21,23 @@
 // operator wanted is exactly the sort of helpfulness that produces evidence
 // nobody can explain.
 //
+// # Campaigns, and what a bundle is allowed to decide
+//
+// A run is one of two things, and the bundle now says which.
+//
+// A CAMPAIGN (-campaign csip|mbaps|modbus-client) is a named, CLOSED selection
+// whose DUT precondition — which control-arbitration lane must own the DER — is
+// PROVEN before case 1 and recorded. It requires -manifest, refuses -suite, and
+// is the only shape whose result may gate anything.
+//
+// Everything else is EXPLORATORY: still captured, bundled and self-verified, and
+// marked NOT GATING. A whole-catalog run cannot be anything else — it selects
+// rows needing both control-authority postures at once, which no device can
+// hold, and it says so rather than quietly measuring the arbitration layer.
+//
+// See docs/CAMPAIGNS.md for the campaign table, the fail-closed rules, the N/A
+// verdict's semantics, the local-exec introspection runner and -preset local.
+//
 // # Why this binary links every suite
 //
 // It imports internal/certify/suites, which links all six. Two consequences are
@@ -196,6 +213,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		usage(stderr, fs)
 		return exitUsage
 	}
+	// The preset fills in the bench addresses the operator did NOT type, and it
+	// has to happen here because "did not type" is knowable only from the
+	// parser: fs.Visit reports the flags that actually appeared on the command
+	// line, which is the one thing a comparison against defaults cannot
+	// reconstruct. See certify.ApplyPreset.
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if err := certify.ApplyPreset(fs, c.opts.Preset, set); err != nil {
+		fatal(stderr, err)
+		return exitUsage
+	}
 	if err := c.resolve(); err != nil {
 		fatal(stderr, err)
 		return exitUsage
@@ -332,6 +360,14 @@ func (c *cli) resolve() error {
 	}
 	if len(modes) > 1 {
 		return fmt.Errorf("%s select different modes; pick one", strings.Join(modes, " and "))
+	}
+	// A campaign RUNS a bench; it has no meaning attached to -verify, -report,
+	// -writes, -trr or -list, all of which read a directory that already exists.
+	// Accepting it silently there would let an operator believe a campaign had
+	// been run when nothing was.
+	if c.opts.Campaign != "" && len(modes) == 1 {
+		return fmt.Errorf("-campaign %s runs a conformance campaign against the bench, and %s reads an "+
+			"artefact that already exists; they cannot be combined", c.opts.Campaign, modes[0])
 	}
 
 	if c.target != "" {
@@ -501,8 +537,15 @@ func usage(w io.Writer, fs *flag.FlagSet) {
                                                  Results Reporting specifications, from several
                                                  bundles, with the verdict mapping stated in it
 
+  certify -campaign mbaps -manifest configs/candidate.json -gateway-ssh cc93 -iface enp1s0 -out runs/mbaps/
+                                                 a GATING campaign: closed selection, live DUT control
+                                                 authority proven before case 1, recorded in the bundle
+  certify -campaign csip -manifest c.json -preset local -gateway-exec "docker exec gw" -dry-run
+                                                 the same, against a gateway on this host
+
   certify -no-capture -suite modbus-server -target 127.0.0.1:5020 -param modbus.transport=plain
-                                                 logic-only run against a loopback sim
+                                                 EXPLORATORY (non-gating) logic-only run against a
+                                                 loopback sim
 
 Exit status: 0 clean · 1 a negative result (FAIL, gap, unverifiable bundle) · 2 bad invocation
 

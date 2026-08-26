@@ -15,7 +15,7 @@ import (
 // evidence is "see bundle.json" is a claim nobody checks.
 func (b *Bundle) Report() string {
 	var sb strings.Builder
-	pass, fail, skip, warn := b.Counts()
+	pass, fail, skip, warn, na := b.Counts()
 
 	fmt.Fprintf(&sb, "# Conformance evidence bundle\n\n")
 	if b.Run.DUT.Name != "" || b.Run.DUT.Address != "" {
@@ -106,8 +106,19 @@ func (b *Bundle) Report() string {
 	split := inf.Total() > 0
 
 	fmt.Fprintf(&sb, "## Result\n\n")
-	fmt.Fprintf(&sb, "**%d PASS · %d FAIL · %d SKIP · %d WARN** across %d test case(s).\n\n",
-		pass, fail, skip, warn, len(b.Cases))
+	fmt.Fprintf(&sb, "**%d PASS · %d FAIL · %d SKIP · %d WARN** across %d in-scope test case(s).\n\n",
+		pass, fail, skip, warn, len(b.Cases)-na)
+	// N/A is stated on its own line, outside the headline, because it is not an
+	// outcome. A row this candidate never claimed has no verdict to average in,
+	// and printing it beside the four that do is how a campaign comes to look
+	// mostly-unfinished when it is in fact complete — LAB29-001's whole
+	// complaint. The reasons are one table away, per row, so a reader who
+	// disputes a scope decision can see exactly whose declaration made it.
+	if na > 0 {
+		fmt.Fprintf(&sb, "%d further case(s) are **NOT APPLICABLE** to this candidate and were not run: "+
+			"each carries a reason and the declaration it rests on, in its own section below. They are "+
+			"neither passes nor failures and bear on nothing.\n\n", na)
+	}
 	// Split the headline by whether a row bears on the certification CLAIM. A
 	// row the product does not claim conformance to still runs and its verdict
 	// is still evidence — but folding its FAIL into the same number as a
@@ -117,11 +128,13 @@ func (b *Bundle) Report() string {
 	// present, so a claim-only bundle stays quiet.
 	if split {
 		fmt.Fprintf(&sb, "- **Applicable to the claim:** %d PASS · %d FAIL · %d SKIP · %d WARN "+
-			"(%d case(s))\n", app.Pass, app.Fail, app.Skip, app.Warn, app.Total())
+			"(%d in-scope case(s)%s)\n", app.Pass, app.Fail, app.Skip, app.Warn, app.InScope(),
+			naSuffix(app.NotApplicable))
 		fmt.Fprintf(&sb, "- **Informative** — implemented but not bearing on the claim, marked `%s` "+
 			"(not applicable to the claimed profile) or `%s` (covered by no published procedure) in the "+
-			"table below: %d PASS · %d FAIL · %d SKIP · %d WARN (%d case(s))\n\n",
-			informativeTag, localExtTag, inf.Pass, inf.Fail, inf.Skip, inf.Warn, inf.Total())
+			"table below: %d PASS · %d FAIL · %d SKIP · %d WARN (%d in-scope case(s)%s)\n\n",
+			informativeTag, localExtTag, inf.Pass, inf.Fail, inf.Skip, inf.Warn, inf.InScope(),
+			naSuffix(inf.NotApplicable))
 	}
 	// THE BANNER MEANS WHAT IT SAYS, so it is gated on the RAW failure count and
 	// not on b.OK().
@@ -139,6 +152,11 @@ func (b *Bundle) Report() string {
 	// which is the worse direction: a reader who trusts the banner never reaches
 	// the row.
 	switch {
+	case fail == 0 && len(b.Cases) == na:
+		// Every row out of scope. There is no failure to report and no result
+		// either; announcing "no failures" over it would be true and useless.
+		fmt.Fprintf(&sb, "⚠ Nothing was measured: every case in this bundle is out of scope for the "+
+			"candidate.\n\n")
 	case fail == 0:
 		fmt.Fprintf(&sb, "✓ No failures.\n\n")
 	case fail > 0 && split:
@@ -209,6 +227,18 @@ func (b *Bundle) Report() string {
 			fmt.Fprintf(&sb, "**Informative row — NOT applicable to the certification claim.** The catalog "+
 				"marks this case out of scope for the claimed profile; it is run and reported because its "+
 				"verdict is evidence about the implementation, but it does not bear on the claim.\n\n")
+		}
+		// The scope declaration, stated where the reader meets the row rather
+		// than only in bundle.json. Printed for a not-applicable case whatever
+		// else is true of it, so "why is this row not measured?" is answered on
+		// the spot and with an attributable source.
+		if c.Verdict == VerdictNotApplicable && c.NotApplicable != nil {
+			fmt.Fprintf(&sb, "**NOT APPLICABLE — not run.** %s\n\n", mdEscape(c.NotApplicable.Reason))
+			fmt.Fprintf(&sb, "- Declared by: `%s`\n", c.NotApplicable.Source)
+			if c.NotApplicable.Detail != "" {
+				fmt.Fprintf(&sb, "- Declaration: %s\n", mdEscape(c.NotApplicable.Detail))
+			}
+			fmt.Fprintf(&sb, "\n")
 		}
 		if c.Doc != "" {
 			fmt.Fprintf(&sb, "Reference: %s\n\n", mdEscape(c.Doc))
@@ -286,9 +316,24 @@ func glyph(v Verdict) string {
 		return "✗"
 	case Warn:
 		return "⚠"
+	case VerdictNotApplicable:
+		// A dash, not the SKIP dot: at a glance down the report a reader must be
+		// able to tell "nobody measured this" from "there was nothing here to
+		// measure" without reading the word beside it.
+		return "—"
 	default:
 		return "·"
 	}
+}
+
+// naSuffix renders the out-of-scope count as a parenthetical addition to an
+// in-scope tally, or nothing at all when there is none — so a bundle with
+// nothing out of scope reads exactly as it did before this verdict existed.
+func naSuffix(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(", plus %d not applicable", n)
 }
 
 // frameList renders frame numbers so they can be pasted straight into a
