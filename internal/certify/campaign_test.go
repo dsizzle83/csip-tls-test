@@ -10,6 +10,7 @@ package certify
 // is the one package that can import both.
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -251,5 +252,48 @@ func TestNonEmptySelectionStillConstructs(t *testing.T) {
 	opts.UIDs = []string{"ssm-conf-v0.8::RBAC-002"}
 	if _, err := New(suitesForCampaigns(t), realCatalog(t), opts); err != nil {
 		t.Fatalf("New() = %v for a selection that DOES match", err)
+	}
+}
+
+// A campaign narrowed by -uid is a legitimate triage run and must still enforce
+// the campaign's preconditions — but its bundle must NOT go on claiming to be
+// the campaign, or one row stamped `gating: true` gets read as the whole thing.
+func TestANarrowedCampaignIsNotTheCampaign(t *testing.T) {
+	cases := map[string]func(*Options){
+		"-uid":         func(o *Options) { o.UIDs = []string{"ssm-conf-v0.8::RBAC-002"} },
+		"-doc":         func(o *Options) { o.Docs = []string{"SSM-CONF-v0.8"} },
+		"-role":        func(o *Options) { o.Roles = []DUTRole{RoleMBAPSServer} },
+		"-automatable": func(o *Options) { o.MinAutomatable = AutoFull },
+	}
+	for name, narrow := range cases {
+		t.Run(name, func(t *testing.T) {
+			opts := campaignOptions(t, CampaignMBAPS)
+			opts.Out = &bytes.Buffer{}
+			opts.SkipPreflight = true
+			narrow(&opts)
+			r, err := New(suitesForCampaigns(t), realCatalog(t), opts)
+			if err != nil {
+				t.Fatalf("New() = %v; narrowing a campaign is a legitimate triage run", err)
+			}
+			if got := campaignNarrowed(&r.opts); got == "" {
+				t.Fatalf("campaignNarrowed() = %q, want it to name %s", got, name)
+			}
+			rep := &RunReport{Campaign: r.campaign}
+			if !rep.Gating() {
+				t.Fatal("the fixture is wrong: an un-narrowed campaign should gate")
+			}
+		})
+	}
+}
+
+// And the whole campaign, un-narrowed, still gates.
+func TestAnUnnarrowedCampaignGates(t *testing.T) {
+	opts := campaignOptions(t, CampaignMBAPS)
+	r, err := New(suitesForCampaigns(t), realCatalog(t), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := campaignNarrowed(&r.opts); got != "" {
+		t.Errorf("campaignNarrowed() = %q for a whole campaign, want empty", got)
 	}
 }

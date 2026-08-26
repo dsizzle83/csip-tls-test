@@ -34,6 +34,12 @@ contains some other set of rows is worse than one that claims nothing.
 
 `-campaign` **requires `-manifest`.** See §4.
 
+A campaign **narrowed** by `-uid`, `-doc`, `-role` or `-automatable` is allowed —
+re-running one row against a parked DUT is a real need, and the campaign's
+preconditions still bite in full. But the bundle is marked **NOT GATING** and
+says why: it contains *part of* the campaign, not the campaign, and one row
+stamped `gating: true` would be read as the whole thing.
+
 The three campaigns are **disjoint**: no catalog row belongs to two of them.
 An unselected protocol therefore contributes neither a FAIL nor a SKIP to a
 campaign — it contributes no row at all. `internal/certify/suites/campaign_test.go`

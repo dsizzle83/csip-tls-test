@@ -890,9 +890,19 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 	// A run that declared no campaign is exploratory by construction, and says
 	// so from the first line rather than being discovered to be non-gating by
 	// a reader of the bundle much later.
-	if r.campaign.Name == "" {
+	switch {
+	case r.campaign.Name == "":
 		rep.Exploratory = "no -campaign was declared: this is an EXPLORATORY selection, and its result " +
 			"is evidence about the implementation rather than a campaign anything may rest on"
+	case campaignNarrowed(&r.opts) != "":
+		// A campaign NARROWED by -uid/-doc/-role/-automatable is a legitimate
+		// triage run — same closed suites, same proven precondition, fewer rows
+		// — and it must not be refused. But it is no longer the campaign, and a
+		// bundle stamped `gating: true` over one row would be read as one. So
+		// the preconditions still bite and the claim does not.
+		rep.Exploratory = "the " + string(r.campaign.Name) + " campaign was NARROWED by " +
+			campaignNarrowed(&r.opts) + ", so this bundle contains part of that campaign rather than " +
+			"the campaign. Its preconditions were enforced in full; its result is not the campaign's"
 	}
 	reporter := NewReporter(r.out)
 	reporter.Header(r, rep)
@@ -1124,6 +1134,33 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		}
 	}
 	return rep, runErr
+}
+
+// campaignNarrowed names the selectors that cut a campaign down, or "".
+//
+// A campaign is a closed selection: its content is the whole point of the name.
+// Narrowing it is useful (re-run one row against a parked DUT) and harmless as
+// long as the resulting bundle does not go on claiming to BE the campaign — see
+// Run, which downgrades it to non-gating rather than refusing it.
+func campaignNarrowed(o *Options) string {
+	var by []string
+	if len(o.UIDs) > 0 {
+		by = append(by, "-uid "+strings.Join(o.UIDs, ","))
+	}
+	if len(o.Docs) > 0 {
+		by = append(by, "-doc "+strings.Join(o.Docs, ","))
+	}
+	if len(o.Roles) > 0 {
+		roles := make([]string, len(o.Roles))
+		for i, r := range o.Roles {
+			roles[i] = string(r)
+		}
+		by = append(by, "-role "+strings.Join(roles, ","))
+	}
+	if o.MinAutomatable != "" {
+		by = append(by, "-automatable "+string(o.MinAutomatable))
+	}
+	return strings.Join(by, " ")
 }
 
 // contestedScope lists the rows whose manifest-derived scope decision
