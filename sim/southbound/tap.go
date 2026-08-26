@@ -140,11 +140,16 @@ type oneShotSpec struct {
 
 	TruncateBytes int `json:"truncate_bytes,omitempty"`
 	DelayMS       int `json:"delay_ms,omitempty"`
-
-	// ArmedAt is the control-plane epoch at which this one-shot was armed —
-	// the number POST /fault hands back so a caller can fence the ledger on it.
-	ArmedAt uint64 `json:"armed_at"`
 }
+
+// NOTE ON THE ARMED EPOCH. A one-shot deliberately does NOT record the epoch it
+// was armed at. It is tempting — the tap holds the counter and could read
+// epoch.Load()+1 — but that is a PREDICTION of the bump simapi performs after
+// this handler returns, and two mutations in flight at once would make it
+// wrong. The authoritative number is the one POST /fault hands the caller, and
+// there must be exactly one authority for a fence. Everything a row needs is
+// already there: the ack's epoch bounds the query, and the ledger stamps the
+// transaction the one-shot shaped with the fault's own name.
 
 func (s *oneShotSpec) matches(fc uint8, addr, count uint16) bool {
 	if s.OnFC != 0 && s.OnFC != fc {
@@ -735,7 +740,6 @@ func (t *Tap) applyNextResponse(spec tapSpec) error {
 		return fmt.Errorf("fault %q: on_addr must have 0 (any), 1 (a single register) or 2 ([start,end)) "+
 			"elements", spec.Kind)
 	}
-	s.ArmedAt = t.epoch.Load() + 1 // the epoch simapi will assign to this call
 	t.mu.Lock()
 	t.oneShot = s
 	t.mu.Unlock()
