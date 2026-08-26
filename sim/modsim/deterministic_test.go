@@ -659,3 +659,80 @@ func TestStack_LedgerBarrierAnswersThroughSimapi(t *testing.T) {
 		}
 	}
 }
+
+// TestRelayChainTopology pins the port arithmetic. A chain whose middle layer
+// forwards to itself, or whose device binds the public port, still starts up
+// and still serves — it just serves the wrong topology, and the first symptom
+// is a conformance row reporting a device that never answered.
+func TestRelayChainTopology(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		tap, adversary bool
+		public, relay  string
+		device, tapUp  string
+		relayUp        string
+	}{
+		{
+			name:   "nothing interposed — the pre-LAB29-010 byte path",
+			public: "0.0.0.0:5020", relay: "", device: "0.0.0.0:5020",
+			tapUp: "0.0.0.0:5020", relayUp: "0.0.0.0:5020",
+		},
+		{
+			name:   "the tap alone, which is the default",
+			tap:    true,
+			public: "0.0.0.0:5020", relay: "", device: "127.0.0.1:15020",
+			tapUp: "127.0.0.1:15020", relayUp: "127.0.0.1:15020",
+		},
+		{
+			name:      "an adversary relay alone (-tap=false -mangle)",
+			adversary: true,
+			public:    "0.0.0.0:5020", relay: "0.0.0.0:5020", device: "127.0.0.1:15020",
+			tapUp: "0.0.0.0:5020", relayUp: "127.0.0.1:15020",
+		},
+		{
+			name: "both, chained client → tap → relay → device",
+			tap:  true, adversary: true,
+			public: "0.0.0.0:5020", relay: "127.0.0.1:15020", device: "127.0.0.1:25020",
+			tapUp: "127.0.0.1:15020", relayUp: "127.0.0.1:25020",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := relayChain("", 5020, tc.tap, tc.adversary)
+			if c.Public != tc.public {
+				t.Errorf("public = %q, want %q — the client must dial the same address whatever is "+
+					"interposed", c.Public, tc.public)
+			}
+			if c.Relay != tc.relay {
+				t.Errorf("relay = %q, want %q", c.Relay, tc.relay)
+			}
+			if c.Device != tc.device {
+				t.Errorf("device = %q, want %q", c.Device, tc.device)
+			}
+			if c.TapUpstream != tc.tapUp {
+				t.Errorf("tap upstream = %q, want %q", c.TapUpstream, tc.tapUp)
+			}
+			if c.RelayUpstream != tc.relayUp {
+				t.Errorf("relay upstream = %q, want %q", c.RelayUpstream, tc.relayUp)
+			}
+			// Nothing may ever forward to itself: that is a loop, and it
+			// serves for exactly as long as it takes to fill a socket buffer.
+			if tc.tap && c.TapUpstream == c.Public {
+				t.Errorf("the tap forwards to its own listener %q", c.Public)
+			}
+			if tc.adversary && c.RelayUpstream == c.Relay {
+				t.Errorf("the relay forwards to its own listener %q", c.Relay)
+			}
+		})
+	}
+
+	// -bind pins the public listener to one segment and leaves the inner
+	// layers on loopback, which is what a split WAN/LAN bench needs.
+	c := relayChain("192.168.0.188", 5020, true, false)
+	if c.Public != "192.168.0.188:5020" {
+		t.Errorf("public = %q, want the bound address", c.Public)
+	}
+	if !strings.HasPrefix(c.Device, "127.0.0.1:") {
+		t.Errorf("device = %q, want a loopback address — the inner layers are never reachable "+
+			"off-box", c.Device)
+	}
+}

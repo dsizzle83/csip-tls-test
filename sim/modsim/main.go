@@ -189,25 +189,9 @@ func main() {
 	// included, not of what the sim originally composed. An adversary relay
 	// downstream of the witness is a lie the witness can see; upstream, it
 	// would be one the witness could not.
-	publicAddr := listenAddr(*bind, *port)
-	relayAddr := "" // the mangler/protorelay's own listener, when interposed
-	deviceAddr := publicAddr
-	switch {
-	case (*mangle || *protofault) && *tapOn:
-		relayAddr = fmt.Sprintf("127.0.0.1:%d", *port+10000)
-		deviceAddr = fmt.Sprintf("127.0.0.1:%d", *port+20000)
-	case *mangle || *protofault:
-		relayAddr = publicAddr
-		deviceAddr = fmt.Sprintf("127.0.0.1:%d", *port+10000)
-	case *tapOn:
-		deviceAddr = fmt.Sprintf("127.0.0.1:%d", *port+10000)
-	}
-	// What the mangler/protorelay forwards to, and what the tap forwards to.
-	relayUpstream := deviceAddr
-	tapUpstream := deviceAddr
-	if relayAddr != "" {
-		tapUpstream = relayAddr
-	}
+	chain := relayChain(*bind, *port, *tapOn, *mangle || *protofault)
+	publicAddr, relayAddr, deviceAddr := chain.Public, chain.Relay, chain.Device
+	relayUpstream, tapUpstream := chain.RelayUpstream, chain.TapUpstream
 	listenURL := "tcp://" + deviceAddr
 
 	models, err := resolveDERModels(*derModels, *advanced)

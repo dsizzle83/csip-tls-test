@@ -146,3 +146,56 @@ func wireDeterministic(api *simapi.Server, epoch *sim.Epoch, baselines *sim.Base
 		return pollBody(tap.Report(reached, want, st)), nil
 	})
 }
+
+// ── The relay chain ───────────────────────────────────────────────────────────
+
+// chainAddrs is where each layer of the serving chain binds and forwards.
+//
+// Whatever is interposed, the client dials exactly the address it always did:
+// each relay binds the port in front of it and forwards inward, so the
+// interposition is invisible until something is armed. Innermost is always the
+// Modbus server itself.
+//
+//	client → [tap :port] → [mangler|protorelay :port+10000] → device :port+20000
+//
+// The TAP GOES CLOSEST TO THE CLIENT deliberately: its ledger is the record of
+// what the device under test actually received, mangling included, not of what
+// the sim originally composed. An adversary relay downstream of the witness is
+// a lie the witness can see; upstream, it would be one the witness could not.
+type chainAddrs struct {
+	// Public is the address a client dials — always the same, whatever is
+	// interposed behind it.
+	Public string
+	// Relay is the mangler/protorelay's own listener, empty when neither is
+	// interposed; Device is the Modbus server's.
+	Relay, Device string
+	// RelayUpstream and TapUpstream are what each forwards to.
+	RelayUpstream, TapUpstream string
+}
+
+// relayChain computes the chain for one invocation.
+//
+// It is a function rather than eight lines inside main because the port
+// arithmetic is exactly the kind of thing that breaks silently: a chain whose
+// middle layer forwards to itself, or whose device binds the public port, still
+// starts up and still serves — it just serves the wrong topology, and the first
+// symptom is a conformance row reporting a device that never answered.
+func relayChain(bind string, port int, tap, adversary bool) chainAddrs {
+	c := chainAddrs{Public: listenAddr(bind, port)}
+	inner := func(offset int) string { return fmt.Sprintf("127.0.0.1:%d", port+offset) }
+	switch {
+	case adversary && tap:
+		c.Relay, c.Device = inner(10000), inner(20000)
+	case adversary:
+		c.Relay, c.Device = c.Public, inner(10000)
+	case tap:
+		c.Device = inner(10000)
+	default:
+		c.Device = c.Public
+	}
+	c.RelayUpstream, c.TapUpstream = c.Device, c.Device
+	if c.Relay != "" {
+		c.TapUpstream = c.Relay
+	}
+	return c
+}
