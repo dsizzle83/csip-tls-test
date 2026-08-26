@@ -386,7 +386,26 @@ func rampRatesSpec() spec {
 		// currently stored the instant the DUT asks.
 		SettlePoll: true,
 		PostWait: func(ctx context.Context, d *Driver, params map[string]string) error {
-			f := settleOracle(ctx, oracleSettleDeadline(params),
+			// Fence the FINAL read on a poll STRICTLY LATER than the Figure-7
+			// PUT, the same fresh-poll discipline the baseline confirm uses
+			// (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S). Without it, run()'s
+			// AwaitWalk can return at the very START of the DUT's post-Setup
+			// walk (o.Waited ~0s) and settleOracle then samples the DER before
+			// it has fetched the 9000 — the mid-propagation register the board
+			// read as WRmp=0. rampTargetPollParam is the poll ordinal captured
+			// at the moment of the Figure-7 PUT; waiting for that ordinal+1 to
+			// COMPLETE means the DUT has run a poll cycle since the PUT before
+			// the register is graded. The fence and the settle share one
+			// deadline (the row's poll-cycle window), so PostWait still fits the
+			// SettlePoll budget: the fence returns as soon as a fresh poll lands
+			// and settleOracle spends the remainder confirming WRmp=90.
+			deadline := time.Now().Add(oracleSettleDeadline(params))
+			if s, ok := params[rampTargetPollParam]; ok {
+				if tp, perr := strconv.ParseUint(s, 10, 64); perr == nil {
+					awaitFreshDERPoll(ctx, d, tp, time.Until(deadline))
+				}
+			}
+			f := settleOracle(ctx, time.Until(deadline),
 				func() Finding { return target.judgeWith(ctx, d.rc) })
 			switch {
 			case f.Unavailable != "":
@@ -494,8 +513,20 @@ func rampDefaultFirstSetup(ctx context.Context, d *Driver, params map[string]str
 	params[oraclePreObservedParam] = findingObserved(pre)
 
 	// ── 3. Command Figure 7's Test Values ──────────────────────────────────
+	// Capture the DUT's poll ordinal at the MOMENT of the Figure-7 PUT, so
+	// PostWait can fence the final read on a poll strictly later than this
+	// publish (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S) rather than reading
+	// the DER mid-fetch.
+	if tp, ok := derPollOrdinal(ctx, d); ok {
+		params[rampTargetPollParam] = strconv.FormatUint(tp, 10)
+	}
 	return d.PostDefault(ctx, rampDefaultRequest(figure7RampTestSetGradW, figure7RampTestSetSoftGradW))
 }
+
+// rampTargetPollParam carries the DUT poll ordinal captured at the Figure-7
+// PUT, so PostWait fences the final read on a strictly-later poll — see its use
+// (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S).
+const rampTargetPollParam = "iw15.ramp_target_poll"
 
 // rampPollWaitSlice bounds ONE /poll/wait request, kept under the framework's
 // HTTP client timeout so a caller's transport never decides anything — the same

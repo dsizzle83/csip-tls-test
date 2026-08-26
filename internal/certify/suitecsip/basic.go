@@ -433,9 +433,19 @@ type scalarControlWindow struct {
 	durationS    int
 }
 
-// scalarWindow is the default scalar control window: a control the DUT only has
-// to FETCH, so a short window is enough and nothing reads the DER during it.
-var scalarWindow = scalarControlWindow{startOffsetS: 30, durationS: 120}
+// scalarWindow is the default scalar control window. Its start offset is set
+// LONGER THAN THE DUT'S POLL CADENCE deliberately
+// (CSIP-ORACLE-BASIC008-STARTED-RESPONSE-TIMING): every inverterControlSpec row
+// grades a Started(2) Response, and the DUT posts Started only when it observes
+// an event it fetched WHILE STILL SCHEDULED transition to Active. The bench
+// paces the DUT at a 1m0s pollRate, so a +30s start was a ~50/50 race — a row
+// whose publish landed >30s before the DUT's next poll was fetched already-
+// active and drew no Started, and BASIC-008 flipped exactly that way when an
+// upstream row (BASIC-007's baseline step) shifted the campaign clock. +75s
+// exceeds one poll interval, so the DUT's next poll (<=60s out) ALWAYS fetches
+// the control while Scheduled, whatever the upstream timing; it still sits under
+// the +150s observation window so the Started that follows is captured.
+var scalarWindow = scalarControlWindow{startOffsetS: 75, durationS: 120}
 
 // oracleWindow widens the window for the ORACLED scalar rows (BASIC-010/013) so
 // the control stays active across the ENTIRE span in which the PostWait oracle
@@ -443,7 +453,9 @@ var scalarWindow = scalarControlWindow{startOffsetS: 30, durationS: 120}
 // AwaitWalk returns (the DUT's first GET /dcap after Setup, plus the settle
 // poll below) out to ~fetchWait — waitPeriods*cadence + waitSlack, capped at
 // waitCap (5m) (check.go) — when the DUT is slow to poll and AwaitWalk waits
-// the full window. The default [+30s, +150s] window ended at +150s, which the
+// the full window. The default [+75s, +195s] window (its start offset raised past the poll
+// cadence for the Started-response reason scalarWindow's own doc gives) ended
+// where the
 // bench's 60s cadence read (2*60+30 = 150s) sits right on and a slower cadence
 // overruns entirely. The harness never waits DurationS (it waits fetchWait), so
 // a longer window costs no runtime — Cleanup clears the control when the row is
@@ -456,10 +468,10 @@ var scalarWindow = scalarControlWindow{startOffsetS: 30, durationS: 120}
 // as late as wait + settle ≈ 2 x waitCap = 10m after Setup. A control that
 // released at +360s would have expired under exactly the slow-bench read this
 // widening exists to protect, converting the settle fix into a new false FAIL
-// at the other edge. [+30s, +720s] contains the whole span with margin;
+// at the other edge. [+75s, +765s] contains the whole span with margin;
 // TestOracledScalarWindow_ContainsEveryPostWaitRead pins the arithmetic against
 // waitCap so a later change to either bound fails there rather than on a board.
-var oracleWindow = scalarControlWindow{startOffsetS: 30, durationS: 690}
+var oracleWindow = scalarControlWindow{startOffsetS: 75, durationS: 690}
 
 // oracleDefaultWindow is the window the PRESCRIBED default is published in
 // (IW15-004 — oracleBinding.Prescribed).
