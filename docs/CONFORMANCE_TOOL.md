@@ -220,7 +220,7 @@ not evidence** and must not be submitted.
 | `-pki` | mbaps certificate fixtures (`make gen-mbaps-certs` → `certs/mbaps`) |
 | `-gridsim` `-gridsim-admin` | the 2030.5 server the DUT's CSIP client dials, and its admin API |
 | `-modsim` `-modsim-api` `-mbapsdev` `-mbapsdev-api` | southbound sims and their simapi sidecars |
-| `-iface` `-bpf` | capture interface and filter. **Empty filter is the safe default**: a frame a filter excluded is not recoverable afterwards. |
+| `-iface` `-bpf` | capture interface and filter. **Empty filter is the safe default**: a frame a filter excluded is not recoverable afterwards. A non-empty filter must be one the tool can re-apply to the captured frames afterwards (§3, *The capture is filtered twice*); anything else is refused before the run starts, not after it. |
 | `-keylog` | NSS key-log path (keylog build only) |
 | `-no-capture` | logic-only run; no wire citation is then possible |
 | `-capture-settle` | pause before stopping the capture so it flushes (default 750 ms — see §5) |
@@ -421,6 +421,52 @@ method, the verdict, what was observed — and a citation:
 An assertion with no citation is counted separately everywhere and is never
 described as verified.
 
+### The capture is filtered twice
+
+`-bpf` is passed to the capture tool, and then applied **again**, in this
+process, to the frames the tool actually wrote. The second pass is not
+redundancy for its own sake: a multi-interface `dumpcap` can leave its kernel
+filter unarmed on the first-listed interface for an entire capture while arming
+it correctly on the rest (§5, *The filter that was never armed*). Every readiness
+signal is genuinely true while it happens, so nothing can wait it out.
+
+What the second pass does, at capture stop, before anything has read the file:
+
+* every frame that **provably** does not match the requested filter is dropped,
+  and the capture file is rewritten without it. The rewrite copies blocks — the
+  section header, every interface description, name-resolution and
+  decryption-secrets blocks, and each surviving frame — byte for byte, so a
+  filtered capture is a strict subsequence of the tool's own output, not a
+  re-encoding of it. When nothing is dropped the file is not touched at all;
+* a frame it **cannot decide** — a header the dissector rejects, the first
+  fragment of a fragmented datagram, a transport it does not dissect — is
+  **kept** and counted separately. The pass can add redaction; it can never
+  destroy evidence;
+* the per-interface accounting is recorded in `bundle.json` under
+  `capture.interfaces[]` — `{id, name, captured, kept, dropped, undecided,
+  filter_unarmed_suspected}` — and printed in `REPORT.md`, with a banner naming
+  the interface when `dropped > 0`. A bundle written before this accounting
+  existed carries no `interfaces` key; absent means *this bundle does not say*,
+  and is never rendered as "0 dropped".
+
+Because it runs at capture stop, every frame number in the bundle already counts
+over the filtered file: citations, per-case pcap slices and `capture.packets` are
+all derived from it afterwards, and `-verify` re-reads the same file.
+
+**The filter must therefore be re-appliable, and an expression this tool cannot
+re-apply is refused** — at `capture.New`, before a single frame is captured,
+rather than at stop after a run's worth of traffic. Refusing is the point: a
+filter form nobody has thought about must not be able to silently switch the
+hygiene pass off. The accepted grammar is `and`/`or`/`not`, parentheses, the
+protocols `ip ip6 tcp udp icmp icmp6 arp`, and `[src|dst] host <ip>`,
+`net <ip>/<bits>`, `net <ip> mask <ip>`, `port <n>`, `portrange <a>-<b>`, with a
+leading protocol qualifier where libpcap allows one (`tcp port 802`). Numeric
+ports and literal addresses only — service names and hostnames resolve through
+the machine's `/etc/services` and DNS, which is not a re-appliable filter.
+Everything every run driver in `runs/` has ever passed is inside it; byte-offset
+expressions (`tcp[13] & 2 != 0`), link-layer primitives (`ether`, `vlan`) and
+length tests (`greater`) are not, and say so.
+
 ### The three ways this tool could lie, and what stops each
 
 1. **A PASS it never asserted.** After the citation phase every PASS is
@@ -539,6 +585,21 @@ to WARN for "want of a citation", which reads like sloppy checks rather than
 discarded evidence. There is now a settle interval (`-capture-settle`, default
 750 ms), and a capture that records zero frames while checks executed is
 recorded as a capture-integrity finding that makes the run unclean.
+
+**The filter that was never armed.** `dumpcap -i A -i B -f '<bpf>'` can leave its
+kernel filter off the FIRST-listed interface for the whole capture — reproduced
+here with plain `dumpcap -i lo -i lo -f 'tcp port N'` (2446 unfiltered frames on
+tap 1, none on tap 2), and 4 times out of 4 with two real NICs. Both signals the
+runner waits on are genuinely true when it happens, the tool announces itself
+normally, writes a valid file and reports zero drops, and the pcapng header is
+there — so there is no signal to wait for and nothing in the capture's own
+output to notice. The damage is not lost evidence but lost **redaction**: a
+bundle handed to a laboratory containing thousands of frames of somebody's mDNS,
+DNS-SD and HTTP, from a run that asked for `tcp port 802`. The filter is now
+re-applied in-process at capture stop and the non-matching frames are dropped
+from the artefact, with the per-interface counts recorded in `bundle.json` and
+`REPORT.md` so the race is a disclosed fact rather than an invisible one (§3,
+*The capture is filtered twice*).
 
 **The bundle that ate its own capture.** The natural invocation is
 `-out runs/<ts>/`, and the runner writes its capture to

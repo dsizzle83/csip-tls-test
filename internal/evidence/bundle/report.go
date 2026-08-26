@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"csip-tls-test/internal/evidence/capture"
 )
 
 // Report renders REPORT.md: the human-readable half of the bundle, in the same
@@ -49,6 +51,7 @@ func (b *Bundle) Report() string {
 	row("Capture tool", strings.TrimSpace(b.Capture.Tool+" "+b.Capture.ToolVersion))
 	row("Interface", b.Capture.Interface)
 	row("Capture filter", b.Capture.Filter)
+	row("Capture hygiene", captureHygieneLine(b.Capture))
 	row("Key log", b.Files.KeyLog)
 	fmt.Fprintf(&sb, "\n")
 
@@ -68,6 +71,11 @@ func (b *Bundle) Report() string {
 			"> with an assessor, not publicly. The secrets are per-session and grant no\n"+
 			"> lasting access to the device.\n\n", b.Files.KeyLog)
 	}
+
+	// The capture-hygiene disclosure goes with the capture rows it qualifies,
+	// for the same reason: it says what is and is not in the pcap the frame
+	// numbers below count over.
+	b.captureHygieneReport(&sb)
 
 	// The clock banner goes HERE — above the run note, the capture output and
 	// every tally — because it changes what the rest of the document means. A
@@ -387,4 +395,96 @@ func orDash(s string) string {
 func mdEscape(s string) string {
 	s = strings.ReplaceAll(s, "|", "\\|")
 	return strings.ReplaceAll(s, "\n", " ")
+}
+
+// captureHygieneLine is the one-line summary of the post-capture re-filter for
+// the run table.
+//
+// It is empty — so the row disappears entirely — for a bundle whose capture
+// summary carries no per-interface accounting, which is every bundle written
+// before that accounting existed. Absent is not "zero frames captured"; it is
+// "this bundle does not say", and inventing a reassuring "0 dropped" for it
+// would be the report asserting something nobody measured.
+func captureHygieneLine(sum capture.Summary) string {
+	if len(sum.Interfaces) == 0 {
+		return ""
+	}
+	captured := 0
+	for _, in := range sum.Interfaces {
+		captured += in.Captured
+	}
+	switch dropped := sum.RefilterDropped(); {
+	case sum.Filter == "":
+		return fmt.Sprintf("%d frame(s) captured; no filter was requested, so every frame the "+
+			"tool wrote is in this bundle", captured)
+	case dropped == 0:
+		return fmt.Sprintf("the capture filter was re-applied to all %d captured frame(s) after "+
+			"the capture; none had to be dropped", captured)
+	default:
+		return fmt.Sprintf("the capture filter was re-applied to all %d captured frame(s) after "+
+			"the capture; %d did not match and were dropped — see below", captured, dropped)
+	}
+}
+
+// captureHygieneReport prints the per-interface frame accounting, and the
+// banner that has to go with it when the capture tool's kernel filter was not
+// doing its job.
+//
+// # Why a report section and not just a number in bundle.json
+//
+// The failure it discloses is invisible from anywhere else. dumpcap given more
+// than one -i can leave its kernel filter unarmed on the first-listed
+// interface for a whole capture; it announces itself normally, writes a valid
+// file, reports no drops, and delivers every frame on that NIC. The capture
+// tool's own output — printed further down this report — says nothing. Without
+// this section the only trace would be a packet count that looks large, and an
+// operator who never learns that a leg of their run ran with no filter at all.
+//
+// The frames themselves are NOT in the bundle: they are traffic the run did not
+// ask for and could not be handed to a laboratory unredacted, which is the
+// whole point of asking for a filter. What is here is the count of what went,
+// per interface, so nothing is hidden by removing it.
+func (b *Bundle) captureHygieneReport(sb *strings.Builder) {
+	ifs := b.Capture.Interfaces
+	if len(ifs) == 0 {
+		return
+	}
+	dropped := b.Capture.RefilterDropped()
+	// One interface, nothing dropped, nothing undecided: the table row above
+	// already said everything there is to say.
+	if len(ifs) < 2 && dropped == 0 && b.Capture.RefilterUndecided() == 0 {
+		return
+	}
+
+	if b.Capture.FilterUnarmed() {
+		fmt.Fprintf(sb, "> **The capture tool's kernel filter was not armed on every interface.** `%s` was\n"+
+			"> given the filter `%s`, and %s still delivered %d frame(s) that do not match it. This is a\n"+
+			"> known defect of a multi-interface capture: the tool announces itself, writes a valid\n"+
+			"> file and reports no drops while one of its taps runs unfiltered. Those frames were\n"+
+			"> re-filtered out of this bundle's capture before it was written, so the pcap holds only\n"+
+			"> traffic the run asked for and every frame number in this report counts over the\n"+
+			"> filtered file. The counts below are what was removed.\n\n",
+			mdEscape(b.Capture.Tool), mdEscape(b.Capture.Filter),
+			mdEscape(strings.Join(b.Capture.UnarmedInterfaces(), " and ")), dropped)
+	}
+
+	fmt.Fprintf(sb, "| Capture interface | Frames captured | In this bundle | Re-filtered out | Undecided |\n")
+	fmt.Fprintf(sb, "|---|---:|---:|---:|---:|\n")
+	for _, in := range ifs {
+		name := in.Name
+		if name == "" {
+			name = fmt.Sprintf("interface %d", in.ID)
+		}
+		fmt.Fprintf(sb, "| %s | %d | %d | %d | %d |\n",
+			mdEscape(name), in.Captured, in.Kept, in.Dropped, in.Undecided)
+	}
+	fmt.Fprintf(sb, "\n")
+
+	if n := b.Capture.RefilterUndecided(); n > 0 {
+		fmt.Fprintf(sb, "%d frame(s) were KEPT although the re-filter could not decide them against `%s` — a\n"+
+			"header the dissector rejects, the first fragment of a fragmented datagram, or a transport\n"+
+			"this tool does not dissect. The re-filter only ever removes a frame it can prove does not\n"+
+			"match, so it can add redaction but never destroy evidence.\n\n",
+			n, mdEscape(b.Capture.Filter))
+	}
 }

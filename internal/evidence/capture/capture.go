@@ -71,6 +71,28 @@
 // tool. The obvious workaround — capture 'any' — is worse than refusing: the
 // Linux cooked link type it yields discards the Ethernet header the dissector
 // needs, so it would trade missing frames for undissectable ones.
+//
+// # The third race, which destroys hygiene rather than evidence
+//
+// A multi-interface dumpcap can leave its kernel filter UNARMED on the
+// first-listed interface for the entire capture while arming it correctly on
+// the rest — reproduced here with plain `dumpcap -i lo -i lo -f 'tcp port N'`
+// (2446 unfiltered frames on tap 1, none on tap 2) and 4 times out of 4 with
+// two real NICs. Both readiness signals Start waits on are genuinely true when
+// it happens, and the tool says nothing, so unlike the two races above this one
+// cannot be waited out or detected while it runs.
+//
+// What it costs is not evidence but redaction: an evidence bundle carrying
+// thousands of frames of unrelated mDNS, DNS-SD and HTTP from a run that asked
+// for `tcp port 802` — exactly the traffic Promiscuous:false and the filter
+// exist to keep out, and exactly what a laboratory would have to redact before
+// the bundle could be handed over. So the filter is applied a SECOND time,
+// here, to the frames the tool actually wrote: Stop drops every captured frame
+// that provably does not match, records how many went per interface, and
+// replaces the capture file with the frames that survive (filter.go,
+// refilter.go). A filter this package cannot re-apply is refused by New and by
+// Start rather than silently skipped, so no new filter form can turn the
+// hygiene pass off by accident.
 package capture
 
 import (
@@ -166,6 +188,15 @@ type Summary struct {
 	// there, and "dropped 412 packets" turns a confusing gap in a reassembled
 	// stream into a known fact.
 	Stderr string `json:"stderr,omitempty"`
+	// Interfaces is the per-interface frame accounting: how many frames the
+	// tool wrote for each -i, how many survived the post-capture re-filter, and
+	// whether that re-filter had to drop anything — which is the only
+	// observable sign that the tool's kernel filter was never armed on that
+	// interface. See refilter.go. It is omitted entirely for a capture that
+	// recorded no frames, and a bundle written before this accounting existed
+	// simply has no key: absent reads back as zero counts, which is what it
+	// means.
+	Interfaces []InterfaceFrames `json:"interfaces,omitempty"`
 	// StopWarning is set ONLY when the capture had to be interrupted without
 	// first seeing the file go quiet, which means the tool may still have been
 	// holding frames in its kernel ring — up to one read-timeout of them, at
@@ -174,6 +205,55 @@ type Summary struct {
 	// bench is byte-for-byte what it always was, and an unexplained gap at the
 	// end of a capture is never left to be discovered by a reviewer.
 	StopWarning string `json:"stop_warning,omitempty"`
+}
+
+// RefilterDropped is how many frames the post-capture re-filter removed, across
+// every interface. Zero — including for a bundle that predates the accounting —
+// means the capture file holds exactly what the tool wrote.
+func (s Summary) RefilterDropped() int {
+	n := 0
+	for _, in := range s.Interfaces {
+		n += in.Dropped
+	}
+	return n
+}
+
+// RefilterUndecided is how many frames the re-filter KEPT without being able to
+// decide them (a rejected header, a first IP fragment, an SCTP association).
+func (s Summary) RefilterUndecided() int {
+	n := 0
+	for _, in := range s.Interfaces {
+		n += in.Undecided
+	}
+	return n
+}
+
+// FilterUnarmed reports whether any interface delivered frames that do not
+// match the filter the capture tool was given — the observable form of the
+// tool's kernel filter never having been armed there.
+func (s Summary) FilterUnarmed() bool {
+	for _, in := range s.Interfaces {
+		if in.FilterUnarmedSuspected {
+			return true
+		}
+	}
+	return false
+}
+
+// UnarmedInterfaces names the interfaces that showed it, for a report line.
+func (s Summary) UnarmedInterfaces() []string {
+	var out []string
+	for _, in := range s.Interfaces {
+		if !in.FilterUnarmedSuspected {
+			continue
+		}
+		if in.Name != "" {
+			out = append(out, in.Name)
+			continue
+		}
+		out = append(out, fmt.Sprintf("interface %d", in.ID))
+	}
+	return out
 }
 
 // Capture is one capture-tool invocation.
@@ -391,6 +471,13 @@ func New(iface, bpfFilter, outPath string) (*Capture, error) {
 	if err := checkToolInterfaces(tool.Name, ifaces); err != nil {
 		return nil, err
 	}
+	// Refused HERE, before a single frame is captured. The filter has to be
+	// re-appliable after the capture (see the package doc's third race), and an
+	// expression this package cannot re-apply costs an operator one command if
+	// it is caught now and a whole run's evidence if it is caught at Stop.
+	if _, err := compileFilter(bpfFilter); err != nil {
+		return nil, err
+	}
 	if dir := filepath.Dir(outPath); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("capture: create output directory: %w", err)
@@ -477,6 +564,12 @@ func (c *Capture) Start(ctx context.Context) error {
 	// the one thing that must never happen is running it: tcpdump would exit 0
 	// having captured one of the two interfaces.
 	if err := checkToolInterfaces(c.tool.Name, c.ifaces); err != nil {
+		return err
+	}
+	// Same reason, and the same "New refuses this, but a Capture can be built
+	// directly" argument: a filter that cannot be re-applied afterwards must
+	// stop the run before it captures anything, not after.
+	if _, err := compileFilter(c.filter); err != nil {
 		return err
 	}
 	// A stale file from a previous run would make the readiness check pass
@@ -648,31 +741,103 @@ func (c *Capture) Stop() (Summary, error) {
 		return sum, fmt.Errorf("capture: %s exited with an error: %w\n%s", c.tool.Name, waitErr, sum.Stderr)
 	}
 
+	// Reading the file back is both the packet count and a validity check: a
+	// bundle should never ship a capture that its own reader cannot parse.
+	pkts, err := c.describeFile(&sum)
+	if err != nil {
+		return sum, err
+	}
+
+	// The hygiene pass, LAST, because it may replace the file the lines above
+	// just described — and when it does, they are re-run over what it wrote.
+	if err := c.refilter(&sum, pkts); err != nil {
+		return sum, err
+	}
+	c.done = true
+	return sum, nil
+}
+
+// describeFile fills in what the capture file on disk holds — its format, its
+// frames and the span they cover — and returns the frames.
+//
+// It reports the FILE, never the intent: everything here is read back from the
+// bytes that will be hashed into the bundle's manifest, which is why refilter
+// calls it a second time after replacing them.
+func (c *Capture) describeFile(sum *Summary) ([]pcapng.Packet, error) {
 	fi, err := os.Stat(c.outPath)
 	if err != nil {
-		return sum, fmt.Errorf("capture: output file is missing after the capture: %w", err)
+		return nil, fmt.Errorf("capture: output file is missing after the capture: %w", err)
 	}
 	sum.FileBytes = fi.Size()
 
-	// Reading the file back is both the packet count and a validity check: a
-	// bundle should never ship a capture that its own reader cannot parse.
 	r, err := pcapng.Open(c.outPath)
 	if err != nil {
-		return sum, fmt.Errorf("capture: capture file does not parse: %w", err)
+		return nil, fmt.Errorf("capture: capture file does not parse: %w", err)
 	}
-	defer func() { _ = r.Close() }()
 	sum.Format = string(r.Format())
 	pkts, err := pcapng.ReadAll(r)
+	// Closed here rather than deferred: the caller may replace this file, and
+	// holding the old inode open across that is a needless thing to reason
+	// about. pcapng.Reader.Close is idempotent.
+	_ = r.Close()
+
 	sum.Packets = len(pkts)
+	sum.FirstPacket = time.Time{}
+	sum.LastPacket = time.Time{}
 	if len(pkts) > 0 {
 		sum.FirstPacket = pkts[0].Time
 		sum.LastPacket = pkts[len(pkts)-1].Time
 	}
 	if err != nil {
-		return sum, fmt.Errorf("capture: capture file is damaged after %d packets: %w", len(pkts), err)
+		return nil, fmt.Errorf("capture: capture file is damaged after %d packets: %w", len(pkts), err)
 	}
-	c.done = true
-	return sum, nil
+	return pkts, nil
+}
+
+// refilter re-applies the requested capture filter to the frames the tool
+// wrote, drops the ones that provably do not match, and records the per-
+// interface accounting in sum.
+//
+// See refilter.go for why this is here and not in the bundle writer: every
+// frame citation in the engine is a frame NUMBER into this file, and this is
+// the last moment before anything has read it.
+func (c *Capture) refilter(sum *Summary, pkts []pcapng.Packet) error {
+	f, err := compileFilter(c.filter)
+	if err != nil {
+		// New and Start both refuse an unsupported filter, so reaching this is
+		// a bug in this package rather than an operator's mistake — and it
+		// still must not be swallowed, because swallowing it is precisely the
+		// silent pass-through the hygiene pass exists to prevent.
+		return fmt.Errorf("capture: the filter this capture ran with cannot be re-applied to its own "+
+			"frames, so the capture cannot be certified as filtered: %w", err)
+	}
+	res := classify(f, pkts, c.ifaces)
+	sum.Interfaces = res.interfaces
+	if res.dropped == 0 {
+		return nil
+	}
+	if err := rewriteFiltered(c.outPath, res.kept); err != nil {
+		return err
+	}
+	// Re-describe from the file that will actually ship: Summary.Packets is
+	// what bundle.Verify re-checks against the pcap in the bundle.
+	if _, err := c.describeFile(sum); err != nil {
+		return err
+	}
+	// The accounting and the file have to agree, because the bundle presents
+	// them as two views of one thing. Checking it costs nothing and it is the
+	// only place a rewrite that quietly kept or lost a frame would show up
+	// before a reviewer found it.
+	kept := 0
+	for _, in := range sum.Interfaces {
+		kept += in.Kept
+	}
+	if kept != sum.Packets {
+		return fmt.Errorf("capture: after re-applying the filter, the capture file holds %d frames "+
+			"but the per-interface accounting adds up to %d; the two would contradict each other in "+
+			"the bundle", sum.Packets, kept)
+	}
+	return nil
 }
 
 // waitForFlush waits until the capture file has stopped growing, which is the

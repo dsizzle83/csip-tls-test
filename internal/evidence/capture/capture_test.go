@@ -525,6 +525,48 @@ func TestCaptureRepeatedInterfaceFlag(t *testing.T) {
 	if mine == 0 {
 		t.Fatalf("none of the %d captured frames belong to this test's own connection on port %d", len(pkts), port)
 	}
+
+	// The live proof of the hygiene pass, on the real tool, on the construction
+	// that reproduces the race.
+	//
+	// The paragraph above says the FILE may hold traffic that is not this
+	// probe's, because the tap's kernel filter may never have been armed. That
+	// is true of what dumpcap WRITES, and it is exactly why Stop re-applies the
+	// filter to what it wrote. So the file this test just read back must hold
+	// nothing the filter would have excluded: every frame either matches
+	// `tcp port <port>`, or is one the re-filter could not decide and therefore
+	// kept on purpose (refilter.go). A frame that is neither means the hygiene
+	// pass did not run, and the bundle would carry somebody else's traffic.
+	flt, err := ParseFilter(c.filter)
+	if err != nil {
+		t.Fatalf("the filter this capture ran with does not parse: %v", err)
+	}
+	for _, p := range pkts {
+		matched, decided := flt.Match(p)
+		if !matched && decided {
+			t.Errorf("frame %d (interface %d) survived Stop but does not match %q; the capture in a "+
+				"bundle would carry traffic the run never asked for", p.Index, p.Interface, c.filter)
+		}
+	}
+
+	// And the accounting that makes the race visible to an operator: one row
+	// per -i, and the flag on any tap that delivered frames the filter excludes.
+	if len(sum.Interfaces) != 2 {
+		t.Fatalf("Summary.Interfaces = %+v, want one row per -i flag", sum.Interfaces)
+	}
+	total := 0
+	for _, in := range sum.Interfaces {
+		total += in.Kept
+	}
+	if total != sum.Packets {
+		t.Errorf("per-interface kept counts total %d but the file holds %d frames", total, sum.Packets)
+	}
+	if sum.FilterUnarmed() {
+		// Not a failure: it is the defect happening, caught, and disclosed.
+		t.Logf("the tool's kernel filter was unarmed on %v; %d unrelated frame(s) were re-filtered "+
+			"out of the capture and recorded in the summary",
+			sum.UnarmedInterfaces(), sum.RefilterDropped())
+	}
 	if len(byIface) < 2 {
 		t.Fatalf("this connection's frames landed on %d interface id(s) (%v); the second -i had no "+
 			"effect, so a split-bench run would silently capture only one side", len(byIface), byIface)
