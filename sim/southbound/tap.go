@@ -854,3 +854,15 @@ func (t *Tap) LedgerReportFor(q LedgerQuery) LedgerReport {
 		LedgerPage: t.ledger.Since(q),
 	}
 }
+
+// LedgerReportWaiting is LedgerReportFor, blocked until the query matches at
+// least min transactions or ctx is done. See Ledger.WaitFor for why a row
+// sometimes needs this rather than the poll barrier.
+func (t *Tap) LedgerReportWaiting(ctx context.Context, q LedgerQuery, min int) LedgerReport {
+	page := t.ledger.WaitFor(ctx, q, min)
+	return LedgerReport{
+		Epoch:      t.epoch.Load(),
+		Poll:       t.polls.Snapshot(),
+		LedgerPage: page,
+	}
+}

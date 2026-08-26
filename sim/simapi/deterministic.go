@@ -53,7 +53,8 @@ import (
 //
 //	1.0.0  the original surface: /state /inject /control /fault /registers
 //	       /ws /logs, all mutations answering 204 No Content.
-//	1.1.0  LAB29-010: /version /reset /ledger /poll /poll/wait; mutations
+//	1.1.0  LAB29-010: /version /reset /ledger (with a bounded min_entries
+//	       wait) /poll /poll/wait; mutations
 //	       answer {"api_version","epoch"}; POST /fault gains the tap kinds
 //	       next_response and unit_id; POST /inject gains registers /
 //	       clear_registers, and the unimplemented verb covers every SunSpec
@@ -199,7 +200,31 @@ func (s *Server) handleLedger(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "limit: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	page, err := fn(LedgerQuery{SinceEpoch: sinceEpoch, SinceSeq: sinceSeq, Limit: int(limit)})
+	minEntries, err := uintParam(q.Get("min_entries"))
+	if err != nil {
+		http.Error(w, "min_entries: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	// min_entries turns this into a bounded wait, with the same contract
+	// /poll/wait has: the request bounds ITSELF, always answers 200, and the
+	// body says what it found. A caller that needs longer loops on it.
+	if minEntries > 0 {
+		d, err := durationParam(q.Get("timeout"))
+		if err != nil {
+			http.Error(w, "timeout: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		var cancel func()
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+	page, err := fn(ctx, LedgerQuery{
+		SinceEpoch: sinceEpoch,
+		SinceSeq:   sinceSeq,
+		Limit:      int(limit),
+		MinEntries: int(minEntries),
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

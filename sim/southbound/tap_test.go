@@ -962,3 +962,106 @@ func stalled(err error) bool {
 	}
 	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
 }
+
+// TestLedger_WaitForBlocksOnTheAppend is the OTHER barrier, and the one a row
+// needs when its provocation prevents a poll cycle from ever completing.
+func TestLedger_WaitForBlocksOnTheAppend(t *testing.T) {
+	l := NewLedger(0)
+	q := LedgerQuery{SinceEpoch: 5}
+
+	done := make(chan LedgerPage, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		done <- l.WaitFor(ctx, q, 2)
+	}()
+
+	// A transaction BELOW the fence must not satisfy it.
+	l.Append(LedgerEntry{Epoch: 4, Outcome: OutcomeAnswered})
+	l.Append(LedgerEntry{Epoch: 5, Outcome: OutcomeException})
+	select {
+	case p := <-done:
+		t.Fatalf("WaitFor(min 2) returned with %d matching entry(ies)", p.Total)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	l.Append(LedgerEntry{Epoch: 6, Outcome: OutcomeAnswered})
+	select {
+	case p := <-done:
+		if p.Total != 2 {
+			t.Fatalf("WaitFor returned %d entries, want the 2 at or above the fence", p.Total)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("WaitFor did not return once two transactions matched")
+	}
+}
+
+// TestLedger_WaitForHonoursItsContext: the caller's cancellation is the only
+// bound, and it returns what it has rather than an error.
+func TestLedger_WaitForHonoursItsContext(t *testing.T) {
+	l := NewLedger(0)
+	l.Append(LedgerEntry{Epoch: 9, Outcome: OutcomeAnswered})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	page := l.WaitFor(ctx, LedgerQuery{SinceEpoch: 9}, 5)
+	if page.Total != 1 {
+		t.Fatalf("WaitFor returned %d entries on timeout, want the 1 that matched", page.Total)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("WaitFor took %s to honour a 30ms context", d)
+	}
+}
+
+// TestLedger_WaitForAlreadySatisfied returns immediately.
+func TestLedger_WaitForAlreadySatisfied(t *testing.T) {
+	l := NewLedger(0)
+	l.Append(LedgerEntry{Epoch: 1, Outcome: OutcomeAnswered})
+	l.Append(LedgerEntry{Epoch: 1, Outcome: OutcomeAnswered})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if page := l.WaitFor(ctx, LedgerQuery{}, 2); page.Total != 2 {
+		t.Fatalf("WaitFor returned %d entries, want 2", page.Total)
+	}
+}
+
+// TestTap_LedgerBarrierSurvivesASessionThatNeverCompletesACycle is the case
+// the ledger barrier exists for: the client is met once per session and
+// reconnects, so no poll cycle ever finishes, and a row waiting on the POLL
+// barrier would time out while its provocation landed perfectly.
+func TestTap_LedgerBarrierSurvivesASessionThatNeverCompletesACycle(t *testing.T) {
+	r := newTapRig(t)
+	r.dev.exceptAt(40070, 0x04)
+	fence := r.epoch.Next()
+
+	go func() {
+		// Three sessions, each one measurement read then a disconnect — the
+		// shape lexa-gw produces when the device answers its measurement read
+		// with an exception (cmd/modbus/main.go:1303-1307 drops the session).
+		for i := 0; i < 3; i++ {
+			conn, err := net.DialTimeout("tcp", r.tap.Addr(), 2*time.Second)
+			if err != nil {
+				return
+			}
+			c := &scriptedClient{t: t, conn: conn, unit: 1}
+			_, _ = c.read(40070, 125, time.Second)
+			_ = conn.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	page := r.tap.Ledger().WaitFor(ctx, LedgerQuery{SinceEpoch: fence}, 3)
+	if page.Total < 3 {
+		t.Fatalf("the ledger barrier saw %d transaction(s), want 3", page.Total)
+	}
+	for _, e := range page.Entries {
+		if e.Outcome != OutcomeException || e.Exception != 0x04 {
+			t.Fatalf("transaction %d resolved as %q/%#02x, want an exception 0x04", e.Seq, e.Outcome, e.Exception)
+		}
+	}
+	if st := r.tap.Polls().Snapshot(); st.Completed != 0 {
+		t.Fatalf("the POLL barrier counted %d completed cycle(s); a row waiting on it here would have "+
+			"timed out while its provocation was landing on every session", st.Completed)
+	}
+}

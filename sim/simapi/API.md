@@ -21,7 +21,7 @@ existing endpoint's meaning changes.
 | version | what landed |
 |---|---|
 | 1.0.0 | `/state` `/inject` `/control` `/fault` `/registers` `/ws` `/logs`; every mutation answered `204 No Content` |
-| 1.1.0 | `/version` `/reset` `/ledger` `/poll` `/poll/wait`; mutations answer `{"api_version","epoch"}`; `POST /fault` gains `next_response` and `unit_id`; `POST /inject` gains `registers` / `clear_registers`, and `unimplemented` covers every SunSpec datatype |
+| 1.1.0 | `/version` `/reset` `/ledger` (with a bounded `min_entries` wait) `/poll` `/poll/wait`; mutations answer `{"api_version","epoch"}`; `POST /fault` gains `next_response` and `unit_id`; `POST /inject` gains `registers` / `clear_registers`, and `unimplemented` covers every SunSpec datatype |
 
 ---
 
@@ -307,6 +307,7 @@ that can exist.
 GET /ledger
 GET /ledger?since_epoch=8
 GET /ledger?since_seq=412&limit=100
+GET /ledger?since_epoch=8&min_entries=1&timeout=8s     block until one matches
 ```
 
 ```jsonc
@@ -381,6 +382,28 @@ a reset clears provocations, not evidence.
 the query's own cursor when nothing matched, so a polling caller never rewinds.
 `high_seq` is the highest sequence ever assigned, so a caller can tell "nothing
 happened" from "nothing that matched happened".
+
+### `min_entries` — the other barrier
+
+`?min_entries=N` turns the request into a bounded **wait**: it answers once N
+transactions match the query, or when its own `timeout` elapses. Same contract
+as `/poll/wait` — the request bounds itself, always answers `200`, and `total`
+carries the answer. It holds no timer of its own: it blocks on an append or on
+the request context.
+
+It exists because `/poll/wait` answers the wrong question for some rows.
+`/poll/wait` asks *has the client finished a poll cycle*, which is right for a
+row grading a whole cycle's traffic — and unanswerable for a row whose
+provocation **prevents** a cycle from finishing. lexa-gw drops its southbound
+session on any Modbus exception and reconnects on the next poll
+(`cmd/modbus/main.go:1303-1307`), so a device answering every measurement read
+with an exception is met once per session and completes no cycle at all. A row
+that waited for a cycle there would time out while its provocation landed
+perfectly on every session.
+
+`min_entries` asks the other question — *has the client issued a request under
+my fence* — which is answerable in both cases, and is what the exception,
+truncation and drop rows actually grade.
 
 ---
 

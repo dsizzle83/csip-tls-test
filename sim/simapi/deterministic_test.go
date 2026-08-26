@@ -136,7 +136,7 @@ func TestVersionListsWhatThisSimImplements(t *testing.T) {
 		t.Errorf("/version advertises /ledger on a sim with no ledger handler: %v", v.Endpoints)
 	}
 
-	r.srv.SetLedgerFn(func(LedgerQuery) (any, error) { return nil, nil })
+	r.srv.SetLedgerFn(func(context.Context, LedgerQuery) (any, error) { return nil, nil })
 	r.srv.SetEpochFn(func() uint64 { return 1 })
 	_, body = r.get(t, "/version")
 	_ = json.Unmarshal(body, &v)
@@ -241,7 +241,7 @@ func TestResetCarriesItsResult(t *testing.T) {
 func TestLedgerQueryParsing(t *testing.T) {
 	r := newRig(t)
 	var got LedgerQuery
-	r.srv.SetLedgerFn(func(q LedgerQuery) (any, error) {
+	r.srv.SetLedgerFn(func(_ context.Context, q LedgerQuery) (any, error) {
 		got = q
 		return map[string]any{"entries": []any{}}, nil
 	})
@@ -262,7 +262,7 @@ func TestLedgerQueryParsing(t *testing.T) {
 		t.Fatalf("parsed %+v from an empty query, want the zero value", got)
 	}
 
-	for _, bad := range []string{"?since_epoch=twelve", "?since_seq=-1", "?limit=x"} {
+	for _, bad := range []string{"?since_epoch=twelve", "?since_seq=-1", "?limit=x", "?min_entries=n"} {
 		code, body := r.get(t, "/ledger"+bad)
 		if code != http.StatusBadRequest {
 			t.Errorf("GET /ledger%s = %d, want 400 — a fence that silently became 'everything' would "+
@@ -271,6 +271,50 @@ func TestLedgerQueryParsing(t *testing.T) {
 		if !strings.Contains(string(body), "integer") {
 			t.Errorf("GET /ledger%s said %q, want a reason", bad, body)
 		}
+	}
+}
+
+// TestLedgerMinEntriesBoundsItselfAndAnswers200 is the ledger's own barrier: a
+// row whose provocation prevents a poll cycle from completing still needs to
+// know whether the client issued a request under its fence.
+func TestLedgerMinEntriesBoundsItselfAndAnswers200(t *testing.T) {
+	r := newRig(t)
+	var sawMin int
+	r.srv.SetLedgerFn(func(ctx context.Context, q LedgerQuery) (any, error) {
+		sawMin = q.MinEntries
+		if q.MinEntries > 0 {
+			<-ctx.Done() // nothing ever matches
+		}
+		return map[string]any{"entries": []any{}, "total": 0}, nil
+	})
+
+	start := time.Now()
+	code, body := r.get(t, "/ledger?since_epoch=5&min_entries=1&timeout=120ms")
+	if code != http.StatusOK {
+		t.Fatalf("GET /ledger?min_entries= = %d (%s), want 200 — 'the client has not asked yet' is an "+
+			"observation, not an endpoint failure", code, body)
+	}
+	if sawMin != 1 {
+		t.Fatalf("min_entries reached the handler as %d, want 1", sawMin)
+	}
+	if d := time.Since(start); d < 100*time.Millisecond || d > 5*time.Second {
+		t.Fatalf("the request took %s; it must honour its own 120ms timeout", d)
+	}
+
+	// Without min_entries the request must NOT block, and must not install a
+	// deadline the handler could mistake for one.
+	r.srv.SetLedgerFn(func(ctx context.Context, q LedgerQuery) (any, error) {
+		if _, has := ctx.Deadline(); has {
+			t.Error("a plain GET /ledger installed a deadline; only the min_entries form bounds itself")
+		}
+		return map[string]any{"entries": []any{}}, nil
+	})
+	start = time.Now()
+	if code, _ := r.get(t, "/ledger?since_epoch=5"); code != http.StatusOK {
+		t.Fatal("a plain GET /ledger was refused")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("a plain GET /ledger took %s; it must not block", d)
 	}
 }
 
@@ -399,7 +443,7 @@ func TestPollWaitCancelsWhenTheCallerGoesAway(t *testing.T) {
 func TestMethodDiscipline(t *testing.T) {
 	r := newRig(t)
 	r.srv.SetResetFn(func([]byte) (any, error) { return nil, nil })
-	r.srv.SetLedgerFn(func(LedgerQuery) (any, error) { return nil, nil })
+	r.srv.SetLedgerFn(func(context.Context, LedgerQuery) (any, error) { return nil, nil })
 	r.srv.SetPollFn(func(context.Context, uint64) (any, error) { return nil, nil })
 
 	if code, _ := r.get(t, "/reset"); code != http.StatusMethodNotAllowed {

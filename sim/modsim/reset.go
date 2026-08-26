@@ -130,12 +130,12 @@ func wireDeterministic(api *simapi.Server, epoch *sim.Epoch, baselines *sim.Base
 	if tap == nil {
 		return
 	}
-	api.SetLedgerFn(func(q simapi.LedgerQuery) (any, error) {
-		return ledgerBody(tap.LedgerReportFor(sim.LedgerQuery{
-			SinceEpoch: q.SinceEpoch,
-			SinceSeq:   q.SinceSeq,
-			Limit:      q.Limit,
-		})), nil
+	api.SetLedgerFn(func(ctx context.Context, q simapi.LedgerQuery) (any, error) {
+		lq := sim.LedgerQuery{SinceEpoch: q.SinceEpoch, SinceSeq: q.SinceSeq, Limit: q.Limit}
+		if q.MinEntries > 0 {
+			return ledgerBody(tap.LedgerReportWaiting(ctx, lq, q.MinEntries)), nil
+		}
+		return ledgerBody(tap.LedgerReportFor(lq)), nil
 	})
 	api.SetPollFn(func(ctx context.Context, want uint64) (any, error) {
 		// want == 0 is GET /poll: report now, block on nothing.

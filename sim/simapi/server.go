@@ -12,6 +12,7 @@
 //	POST /reset    — restore a named baseline register image; body: {"baseline":"as-built"}
 //	GET  /registers — raw Modbus register dump (Modbus sims only; 404 if unsupported)
 //	GET  /ledger   — the sim's own append-only Modbus transaction record
+//	                 (?min_entries=N&timeout=D blocks until N match)
 //	GET  /poll     — the client's poll-cycle accounting, as the sim counts it
 //	GET  /poll/wait — block until a given poll cycle has completed
 //	GET  /ws       — WebSocket: pushes /state JSON every 2 seconds
@@ -95,9 +96,11 @@ type ControlFunc func(cmd ControlCmd) error
 // default) makes POST /reset return 501.
 type ResetFunc func(body []byte) (any, error)
 
-// LedgerFunc answers GET /ledger for a parsed query. Registered via
-// SetLedgerFn; nil makes the endpoint return 501.
-type LedgerFunc func(q LedgerQuery) (any, error)
+// LedgerFunc answers GET /ledger for a parsed query. When q.MinEntries > 0 it
+// must BLOCK until the query matches that many transactions or ctx is done,
+// and must never block on a timer of its own. Registered via SetLedgerFn; nil
+// makes the endpoint return 501.
+type LedgerFunc func(ctx context.Context, q LedgerQuery) (any, error)
 
 // LedgerQuery is GET /ledger's parsed query string.
 type LedgerQuery struct {
@@ -110,6 +113,13 @@ type LedgerQuery struct {
 	SinceSeq uint64
 	// Limit caps the number of entries returned; 0 means no cap.
 	Limit int
+	// MinEntries, when > 0, turns the request into a bounded WAIT: answer once
+	// this many transactions match, or when the request's own timeout elapses.
+	// It exists because a provocation can be met without a poll cycle ever
+	// completing — a client that drops its session on a Modbus exception is met
+	// once per session and finishes no cycle — so "has the client issued a
+	// request under my fence" is a question the poll barrier cannot answer.
+	MinEntries int
 }
 
 // PollFunc answers GET /poll (want == 0, non-blocking) and GET /poll/wait

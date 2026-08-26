@@ -51,6 +51,7 @@ package sim
 // could not tell them apart would report the wrong one.
 
 import (
+	"context"
 	"encoding/hex"
 	"sync"
 	"time"
@@ -172,6 +173,10 @@ type Ledger struct {
 	cap  int
 	seq  uint64
 	ring []LedgerEntry
+	// waiters are broadcast-woken on every append, so WaitFor can block on the
+	// client's own behaviour rather than on a tick.
+	waiters map[chan struct{}]struct{}
+
 	// evicted counts entries dropped off the front of the ring, and
 	// evictedMaxEpoch is the highest epoch among them, so a query can say
 	// whether ITS window may be incomplete rather than warning every caller
@@ -186,7 +191,11 @@ func NewLedger(capacity int) *Ledger {
 	if capacity <= 0 {
 		capacity = DefaultLedgerCapacity
 	}
-	return &Ledger{cap: capacity, ring: make([]LedgerEntry, 0, capacity)}
+	return &Ledger{
+		cap:     capacity,
+		ring:    make([]LedgerEntry, 0, capacity),
+		waiters: make(map[chan struct{}]struct{}),
+	}
 }
 
 // Append records a resolved transaction and returns its assigned sequence
@@ -205,6 +214,10 @@ func (l *Ledger) Append(e LedgerEntry) uint64 {
 		l.evicted++
 	}
 	l.ring = append(l.ring, e)
+	for ch := range l.waiters {
+		close(ch)
+		delete(l.waiters, ch)
+	}
 	return e.Seq
 }
 
@@ -248,7 +261,11 @@ type LedgerPage struct {
 func (l *Ledger) Since(q LedgerQuery) LedgerPage {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.sinceLocked(q)
+}
 
+// sinceLocked is Since with the lock already held.
+func (l *Ledger) sinceLocked(q LedgerQuery) LedgerPage {
 	page := LedgerPage{
 		NextSeq: q.SinceSeq,
 		HighSeq: l.seq,
@@ -292,6 +309,53 @@ func (l *Ledger) Since(q LedgerQuery) LedgerPage {
 		page.NextSeq = matched[n-1].Seq
 	}
 	return page
+}
+
+// WaitFor blocks until the query matches at least min entries, then answers
+// it. It returns early — with whatever matches so far — when ctx is done.
+//
+// # Why this exists alongside the poll barrier
+//
+// PollTracker.Wait answers "has the client FINISHED a poll cycle", which is
+// what a row grading a whole cycle's traffic needs. It is the wrong question
+// for a row whose provocation PREVENTS a cycle from finishing, and several do:
+// lexa-gw drops its southbound session on any Modbus exception and reconnects
+// on the next poll (cmd/modbus/main.go:1303-1307), so a device answering every
+// measurement read with an exception is met once per session and never
+// completes a cycle at all. A row that waited for a cycle there would time out
+// while its provocation was landing perfectly.
+//
+// This asks the other question — "has the client ISSUED a request under my
+// fence" — which is answerable in both cases and is what an exception,
+// truncation or drop row actually grades.
+//
+// Like the poll barrier it holds no timer of its own: it blocks on an append
+// or on the caller's context, and nothing else.
+func (l *Ledger) WaitFor(ctx context.Context, q LedgerQuery, min int) LedgerPage {
+	if min < 1 {
+		min = 1
+	}
+	for {
+		l.mu.Lock()
+		page := l.sinceLocked(q)
+		if page.Total >= min {
+			l.mu.Unlock()
+			return page
+		}
+		ch := make(chan struct{})
+		l.waiters[ch] = struct{}{}
+		l.mu.Unlock()
+
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			l.mu.Lock()
+			delete(l.waiters, ch)
+			page = l.sinceLocked(q)
+			l.mu.Unlock()
+			return page
+		}
+	}
 }
 
 // Len returns how many entries the ring currently holds.
