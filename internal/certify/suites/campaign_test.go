@@ -262,6 +262,20 @@ func TestAuthorityClassificationResidueIsAcknowledged(t *testing.T) {
 
 	// The other direction: an acknowledgement for a row no campaign runs is
 	// stale, and a stale list is one nobody trusts.
+	//
+	// With ONE tolerance, symmetric with TestClassifiedRowsAreRunBySomeCampaign
+	// below: a row the CATALOG places outside the claimed profile is not
+	// selected by any campaign, and its acknowledgement is not stale — it is
+	// exactly as live as a classification on such a row, and it starts guarding
+	// again the day the claim widens. Deleting it would mean re-deciding the
+	// question from scratch at the moment the row came back, which is the worst
+	// moment to be deciding it.
+	outOfClaim := map[string]bool{}
+	for _, c := range cat.All() {
+		if !c.Applicable {
+			outOfClaim[c.UID] = true
+		}
+	}
 	inCampaign := map[string]bool{}
 	for _, spec := range certify.Campaigns() {
 		for _, c := range cat.All() {
@@ -277,9 +291,16 @@ func TestAuthorityClassificationResidueIsAcknowledged(t *testing.T) {
 		}
 	}
 	for uid := range unclassified {
-		if !inCampaign[uid] {
-			t.Errorf("%s is acknowledged unclassified but no campaign runs it; drop the entry", uid)
+		if inCampaign[uid] {
+			continue
 		}
+		if outOfClaim[uid] {
+			t.Logf("note: %s is acknowledged unclassified and the catalog marks it inapplicable, so no "+
+				"campaign selects it — the acknowledgement is kept and starts guarding again if the "+
+				"claim widens", uid)
+			continue
+		}
+		t.Errorf("%s is acknowledged unclassified but no campaign runs it; drop the entry", uid)
 	}
 }
 

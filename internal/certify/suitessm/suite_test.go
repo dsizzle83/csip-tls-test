@@ -92,13 +92,29 @@ func TestInapplicableCasesAreDeliberatelyUnregistered(t *testing.T) {
 
 	// And nothing ELSE in the document may be inapplicable-and-unregistered
 	// without appearing in InapplicableUIDs, so the two lists cannot drift.
+	//
+	// INAPPLICABLE-AND-IMPLEMENTED IS A DIFFERENT THING and is not required to
+	// appear here. The framework's standing treatment of a row the catalog puts
+	// outside the claimed profile but a suite implements is to keep it
+	// REGISTERED and report it as informative in an exploratory run (see
+	// certify.CatalogScope and docs/CAMPAIGNS.md §5); suitecsip's twenty-two
+	// DER-Aggregator-Client rows are the same shape. LAB29-011 brought three of
+	// this document's rows into it — PKI-009, PROT-003 and RBAC-011, the Secure
+	// SunSpec CLIENT-direction rows the candidate does not claim — and the
+	// answer is emphatically NOT to delete three working checks: the client
+	// role is "present in source, unreachable under the candidate profile", and
+	// a check that still runs is what makes that statement testable if the
+	// claim ever widens.
 	for _, c := range cat.Select(certify.Filter{Docs: []string{doc}}) {
 		if c.Applicable {
 			continue
 		}
+		if _, registered := reg.Lookup(c.UID); registered {
+			continue // informative, by the framework's standing rule
+		}
 		if _, ok := InapplicableUIDs[c.UID]; !ok {
-			t.Errorf("the catalog marks %s inapplicable but this suite's InapplicableUIDs does not "+
-				"record a reason for skipping it", c.UID)
+			t.Errorf("the catalog marks %s inapplicable, no suite implements it, and this suite's "+
+				"InapplicableUIDs does not record a reason for skipping it", c.UID)
 		}
 	}
 }

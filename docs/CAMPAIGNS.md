@@ -45,14 +45,35 @@ An unselected protocol therefore contributes neither a FAIL nor a SKIP to a
 campaign — it contributes no row at all. `internal/certify/suites/campaign_test.go`
 holds that property against the linked suites on every test run.
 
-### Dry-run selections (catalog sha256 `e1de6743…`, 283 rows)
+### Dry-run selections (catalog sha256 `adfe1f2a…`, 283 rows)
 
     certify -campaign csip          -manifest c.json -dry-run   →  52 to RUN ·  0 SKIP ·  0 N/A
-    certify -campaign mbaps         -manifest c.json -dry-run   →  56 to RUN ·  2 SKIP ·  3 N/A
+    certify -campaign mbaps         -manifest c.json -dry-run   →  56 to RUN ·  2 SKIP ·  0 N/A
     certify -campaign modbus-client -manifest c.json -dry-run   →  15 to RUN ·  0 SKIP ·  0 N/A
 
-(the three N/A rows under `mbaps` are the Secure SunSpec **client**-direction
-rows against a server-only manifest — see §5.)
+`mbaps` selects **58** rows to get those 58 outcomes: 56 to run, 2 skipped for a
+missing `gateway` capability, and no N/A at all. It reported **3 N/A** until
+2026-08-26, when the catalog stopped marking the three Secure SunSpec
+**client**-direction rows applicable — see §5's scope-conflict note. Since a
+campaign implies `-applicable`, agreeing with the manifest moves those rows out
+of the SELECTION rather than into an N/A verdict.
+
+### What a campaign closed out
+
+A campaign is a closed selection, so it prints what it closed:
+
+    Campaign:     mbaps — …
+                  suites ssm + modbus-server + pki · GATING
+                  7 row(s) in those suites are OUTSIDE the claimed profile and are not
+                  selected (catalog applicable=false; the reason travels in the bundle's
+                  archived catalog.json): ssm-conf-v0.8::PKI-009, … and 3 more
+
+These are **not** SKIPs and **not** N/A. Both of those are for rows a run
+examined and decided about; these were never selected. Their reasons travel
+anyway: every bundle archives the `catalog.json` it ran against, beside the
+digest `bundle.json` records, and `applicable: false` plus its
+`applicability_reason` is in there for each of them. `-trr` reads that archived
+catalog for exactly this purpose.
 
 ---
 
@@ -334,8 +355,32 @@ stands — it is the candidate's own statement about itself — but the
 disagreement is printed prominently and recorded in the bundle note. One of the
 two documents is wrong, and only the owner of the claim can say which.
 
-With the manifest above, `-campaign mbaps` reports exactly this for
-`ssm-conf-v0.8::PKI-009`, `PROT-003` and `RBAC-011`.
+`-campaign mbaps` reported exactly this for `ssm-conf-v0.8::PKI-009`,
+`PROT-003` and `RBAC-011`, and **the catalog was the document that was wrong**
+(LAB29-011, closed 2026-08-26). All three carry `dut_role: mbaps-client`; the
+candidate claims `secure_sunspec.roles = ["server"]` under the profile
+`one-to-one-7xx-tcp`, and the regenerated PICS states the negative outright —
+`PICS.md`'s `pics-claims` block carries
+`secure_sunspec_roles_not_claimed: ["client"]`, and `PICS_SUNSPEC_MODBUS.md`
+§5.1 rev. g reads *"mbaps client … NOT CLAIMED — present in source, unreachable
+under the candidate profile"*, with *"every case written against the EUT-C is
+out of the claim"* as the stated consequence. Three independent layers keep the
+southbound mbaps client unreachable (a fatal non-`tcp` scheme check, an empty
+`devices` list, and a refusal rather than a downgrade when the TLS identity is
+unwired), so this is **present in source, out of the claim** — not
+unimplemented.
+
+The three rows are now `applicable: false` with that citation as their
+`applicability_reason`. Two things follow, and the second one surprises people:
+
+* the SCOPE CONFLICT no longer fires — the two documents agree;
+* the rows leave the mbaps campaign's **selection** (58 rows, not 61) instead of
+  becoming N/A. A campaign implies `-applicable`, and `-applicable` is applied
+  during `Catalog.Select`, before the plan is built — so `CatalogScope` never
+  sees them. That is the same standing treatment the twenty-two
+  DER-Aggregator-Client rows already get under `-campaign csip`, and the run
+  names the rows it closed out (§1). Run them without `-applicable` and they
+  execute and report as **informative**, unchanged.
 
 ### For suite authors
 

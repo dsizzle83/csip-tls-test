@@ -379,7 +379,9 @@ Three consequences at the bench:
   empty bundle.
 
 Dry-run selections against the committed catalog: `csip` 52 rows, `mbaps` 56
-(+2 SKIP, +3 N/A), `modbus-client` 15.
+(+2 SKIP, 0 N/A — the three Secure SunSpec CLIENT-direction rows the candidate
+does not claim left the catalog's applicable set on 2026-08-26, LAB29-011, and
+so leave the selection rather than earning an N/A), `modbus-client` 15.
 
 Full reference — the fail-closed rules, N/A semantics, the local-exec runner and
 `-preset local` — is **`docs/CAMPAIGNS.md`**.

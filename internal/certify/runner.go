@@ -808,6 +808,39 @@ func (r *Runner) filter() Filter {
 // Coverage returns the coverage of the selected cases.
 func (r *Runner) Coverage() Coverage { return r.reg.Coverage(r.cat, r.filter()) }
 
+// OutOfClaim returns the rows this campaign's SUITES contain that the catalog
+// places outside the claimed profile, and which -applicable therefore removed
+// from the selection before the plan was built.
+//
+// A campaign is a CLOSED selection, so it should be able to say what it closed
+// out. Without this the only visible trace of a row leaving the claim is the
+// selection count going down — three fewer rows than last week, with nothing in
+// the run to say which three or why, which is indistinguishable at a glance
+// from a suite that quietly stopped registering them.
+//
+// It is NOT a verdict and NOT an N/A. Those are for rows a run examined and
+// decided about; these were never in the selection. The REASON travels anyway,
+// in the catalog the bundle archives beside its evidence: `applicable: false`
+// plus its applicability_reason, in the same file whose digest bundle.json
+// records. This method just points at them while the run is in front of you.
+//
+// Empty for an exploratory run, which does not imply -applicable and therefore
+// removes nothing: its informative rows RUN.
+func (r *Runner) OutOfClaim() []*Case {
+	if r.campaign.Name == "" {
+		return nil
+	}
+	f := r.filter()
+	f.ApplicableOnly = false
+	var out []*Case
+	for _, c := range r.cat.Select(f) {
+		if !c.Applicable {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // Plan returns what would run, in execution order.
 func (r *Runner) Plan() []Planned {
 	caps := r.capabilities()

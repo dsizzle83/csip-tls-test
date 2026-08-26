@@ -151,6 +151,76 @@ func TestCampaignExpandsToItsSuitesAndImpliesApplicable(t *testing.T) {
 	}
 }
 
+// A closed selection says what it closed out. The three Secure SunSpec
+// CLIENT-direction rows (LAB29-011) and the SS-TEST-PKI rows outside the
+// claimed profile leave the mbaps campaign entirely, because a campaign implies
+// -applicable — and the only other trace of that is the selection count going
+// down, which is indistinguishable from a suite that stopped registering them.
+func TestCampaignNamesTheRowsItClosedOut(t *testing.T) {
+	opts := campaignOptions(t, CampaignMBAPS)
+	r, err := New(suitesForCampaigns(t), realCatalog(t), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := r.OutOfClaim()
+	if len(outside) == 0 {
+		t.Fatal("OutOfClaim() is empty for the mbaps campaign, which the catalog does place rows outside")
+	}
+	have := map[string]bool{}
+	for _, c := range outside {
+		if c.Applicable {
+			t.Errorf("%s is applicable and must not be reported as outside the claim", c.UID)
+		}
+		if suite := docSuites[c.Doc]; suite != "ssm" && suite != "modbus-server" && suite != "pki" {
+			t.Errorf("%s is from suite %q, which this campaign does not own", c.UID, docSuites[c.Doc])
+		}
+		have[c.UID] = true
+	}
+	// The three the audit closed. If any of them comes back into the selection
+	// the SCOPE CONFLICT against the server-only manifest comes back with it.
+	for _, uid := range []string{
+		"ssm-conf-v0.8::PKI-009", "ssm-conf-v0.8::PROT-003", "ssm-conf-v0.8::RBAC-011",
+	} {
+		if !have[uid] {
+			t.Errorf("%s is not reported outside the claim; the candidate does not claim the Secure "+
+				"SunSpec client role and the catalog must agree", uid)
+		}
+	}
+	// And it is a fact about a CAMPAIGN. An exploratory run does not imply
+	// -applicable, so it removes nothing and its informative rows run.
+	explor, _ := baseOptions(t, nil)
+	explor.Suites = []string{"ssm"}
+	er, err := New(suitesForCampaigns(t), realCatalog(t), explor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := er.OutOfClaim(); len(got) != 0 {
+		t.Errorf("OutOfClaim() = %d rows for an exploratory run, want 0", len(got))
+	}
+}
+
+// The three client-direction rows must no longer contest the manifest: the
+// catalog now agrees with it, so nothing is printed as a SCOPE CONFLICT and the
+// mbaps campaign's plan carries no N/A at all.
+func TestMBAPSCampaignHasNoScopeConflictAgainstAServerOnlyCandidate(t *testing.T) {
+	opts := campaignOptions(t, CampaignMBAPS)
+	r, err := New(suitesForCampaigns(t), realCatalog(t), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := r.Plan()
+	if got := contestedScope(plan); len(got) != 0 {
+		t.Errorf("SCOPE CONFLICT on %v: the catalog and the candidate manifest disagree about rows the "+
+			"audit closed", got)
+	}
+	for _, p := range plan {
+		if p.OutOfScope() {
+			t.Errorf("%s is N/A in the mbaps campaign; a campaign implies -applicable, so a row outside "+
+				"the claim leaves the SELECTION rather than earning a verdict", p.Case.UID)
+		}
+	}
+}
+
 func TestCampaignRefusesToBeCombinedWithSuite(t *testing.T) {
 	opts := campaignOptions(t, CampaignCSIP)
 	opts.Suites = []string{"ssm"}
