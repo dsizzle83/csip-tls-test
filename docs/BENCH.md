@@ -337,6 +337,53 @@ silently degrades some fraction of verdicts to SKIP/FAIL:
 | `GRIDSIM_BIND=192.168.0.188` | pins gridsim (northbound) to the desktop's WiFi address, matching the device's WAN segment. |
 | `MBAPS_BIND=69.0.0.20` | pins mbapsdev (southbound) to the desktop's ethernet address, matching the device's LAN segment. |
 
+### b2. Campaigns — which leg is EVIDENCE and which is a look around
+
+Since LAB29-001 `bin/certify` distinguishes two kinds of run, and the bundle
+says which one it is holding.
+
+A **campaign** is a named closed selection whose DUT precondition is PROVEN
+before case 1. It is the only shape whose result may gate anything:
+
+```bash
+bin/certify -campaign mbaps -manifest configs/candidate.json \
+            -gateway-ssh cc93 -iface enp1s0 -out runs/mbaps-$(date -u +%Y%m%dT%H%M%SZ)/
+```
+
+| `-campaign` | Suites | Required LIVE control authority |
+|---|---|---|
+| `csip` | `csip` | `csip` |
+| `mbaps` | `ssm` + `modbus-server` + `pki` | `mbaps` |
+| `modbus-client` | `modbus-client` | any posture the manifest claims |
+
+Everything else — `-suite`, `-doc`, `-uid`, a whole-catalog sweep — is an
+**exploratory** run: still captured, bundled and self-verified, and marked NOT
+GATING in `bundle.json`, `REPORT.md` and on the console. A whole-catalog run
+cannot be anything else: it selects rows needing BOTH control-authority
+postures at once, which no device can hold, and the run says so.
+
+Three consequences at the bench:
+
+- **The authority precondition fails closed.** A campaign whose DUT is in the
+  wrong posture, or whose live and configured postures disagree, or that has no
+  `-gateway-ssh`/`-gateway-exec` to read them with, ENDS BEFORE CASE 1. The live
+  posture is read from the dev API's `GET /mode` (fetched on the DUT, since
+  `:9100` is loopback-bound HTTPS) and cross-checked against
+  `/var/lib/lexa/mode-overlay.json` or `/etc/lexa/mode.json`. `-skip-preflight`
+  does NOT wave a wrong reading through.
+- **`-manifest` is required for a campaign** — `configs/candidate.json` on the
+  DUT at `/etc/lexa/candidate.json`. Scope decisions are made against it, it is
+  copied into the bundle with its digest, and its observable topology claims are
+  held against the DUT's `GET /southbound/inventory`.
+- **A selection that matches nothing is refused**, instead of exiting 0 over an
+  empty bundle.
+
+Dry-run selections against the committed catalog: `csip` 52 rows, `mbaps` 56
+(+2 SKIP, +3 N/A), `modbus-client` 15.
+
+Full reference — the fail-closed rules, N/A semantics, the local-exec runner and
+`-preset local` — is **`docs/CAMPAIGNS.md`**.
+
 ### c. Leg flag deltas (`bin/certify`)
 
 Flat-bench legs dial the ethernet addresses; split-bench legs dial the WiFi
