@@ -336,13 +336,23 @@ type ServerView struct {
 // Since returns the view's entries that are new relative to a baseline taken
 // earlier in the same run. Baselines are how a check avoids passing on evidence
 // another agent's test case produced.
-// The Responses/DERPuts/LogEvents endpoints serve unbounded append-only
-// arrays, so a length delta is exact for those. The REQUEST LOG is a bounded
-// ring and is delta'd by absolute sequence instead — see rawFirstSeq.
+//
+// The Responses/LogEvents/Notifications endpoints serve unbounded append-only
+// arrays, so a length delta is exact for those. DERPuts is NOT one of them: it
+// is gridsim's per-resource-path map (derput.go stores the LAST PUT per path),
+// which sortedDERPuts orders by ReceivedAt — so a routine per-path update (the
+// cadence-driven DERStatus re-PUT) re-sorts the slice, and a genuinely new
+// entry (a re-homed /g2/dercap PUT — CSIP-BENCH-CORE014-REHOME-WINDOW-TIMING)
+// can sort to an index BELOW len(base), where a slice-index delta silently
+// drops it. That is exactly the "0 DERCapability, 1 DERSettings" the CORE-014
+// live phase reported for two re-PUTs the capture proved both landed. The
+// DERPut delta is therefore taken by IDENTITY (path + received time), which is
+// insensitive to the map's re-sorting. The REQUEST LOG is a bounded ring and is
+// delta'd by absolute sequence instead — see rawFirstSeq.
 func (v ServerView) Since(base ServerView) ServerView {
 	out := v
 	out.Responses = v.Responses[min(len(base.Responses), len(v.Responses)):]
-	out.DERPuts = v.DERPuts[min(len(base.DERPuts), len(v.DERPuts)):]
+	out.DERPuts = derPutsSince(v.DERPuts, base.DERPuts)
 	out.LogEvents = v.LogEvents[min(len(base.LogEvents), len(v.LogEvents)):]
 	out.Notifications = v.Notifications[min(len(base.Notifications), len(v.Notifications)):]
 
@@ -351,6 +361,34 @@ func (v ServerView) Since(base ServerView) ServerView {
 	if gap != "" {
 		out.RequestLogGap = gap
 		out.Errors = append(out.Errors, gap)
+	}
+	return out
+}
+
+// derPutKey identifies one recorded DER report PUT for a set-difference that
+// does not depend on slice position. Path plus server-second ReceivedAt is
+// enough: a re-PUT to a NEW href (the re-home case) has a new path, and a
+// re-PUT to the SAME href (the DERStatus cadence) has a newer ReceivedAt, so
+// both read as new against a baseline that holds neither.
+type derPutKey struct {
+	path string
+	at   int64
+}
+
+// derPutsSince returns the DER report PUTs in now that are not already in base,
+// preserving now's ReceivedAt order. It replaces the slice-index delta that
+// assumed DERPuts was append-only — see Since's doc for why that assumption
+// broke on a re-home.
+func derPutsSince(now, base []AdminDERPut) []AdminDERPut {
+	seen := make(map[derPutKey]bool, len(base))
+	for _, p := range base {
+		seen[derPutKey{p.Path, p.ReceivedAt}] = true
+	}
+	var out []AdminDERPut
+	for _, p := range now {
+		if !seen[derPutKey{p.Path, p.ReceivedAt}] {
+			out = append(out, p)
+		}
 	}
 	return out
 }
@@ -785,48 +823,61 @@ func putsFor(puts []AdminDERPut, resource string) []AdminDERPut {
 
 // The run baseline in the DER self-report log.
 //
-// gridsim's der_puts log is append-only and NOT reset between campaigns, so the
-// whole log is "since gridsim booted", which is broader than "this run". A
-// campaign is one process, so the number of PUTs the log already held when this
-// run first looked is the run's start line: everything after it is this run's.
-// Captured once, on the first snapshot; see markRunBaseline / derPutsInRun.
+// gridsim's der_puts store is NOT reset between campaigns, so the whole thing is
+// "since gridsim booted", which is broader than "this run". A campaign is one
+// process, so the PUTs the store already held when this run first looked are the
+// run's start line: everything not among them is this run's. Captured once, on
+// the first snapshot; see markRunBaseline / derPutsInRun.
+//
+// The split is by IDENTITY, not by count: gridsim keeps the LAST PUT per
+// resource path in a map (derput.go), so a COUNT split — the old baseline —
+// silently mis-attributed a re-homed /g2/dercap PUT that re-sorted below the
+// baseline length, the run-scoped twin of the window bug Since's doc describes.
 var (
-	runDERBaselineMu  sync.Mutex
-	runDERBaselineSet bool
-	runDERBaselineN   int
+	runDERBaselineMu   sync.Mutex
+	runDERBaselineSet  bool
+	runDERBaselineKeys map[derPutKey]bool
 )
 
-// markRunBaseline records, once per process, how many DER PUTs the server's log
+// markRunBaseline records, once per process, WHICH DER PUTs the server's store
 // already held — the split between a previous campaign's reports and this run's.
 func markRunBaseline(v ServerView) {
 	runDERBaselineMu.Lock()
 	defer runDERBaselineMu.Unlock()
 	if !runDERBaselineSet && v.Available {
-		runDERBaselineN = len(v.DERPuts)
+		runDERBaselineKeys = make(map[derPutKey]bool, len(v.DERPuts))
+		for _, p := range v.DERPuts {
+			runDERBaselineKeys[derPutKey{p.Path, p.ReceivedAt}] = true
+		}
 		runDERBaselineSet = true
 	}
 }
 
-// derPutsInRun returns the DER PUTs recorded since the run baseline. The log is
-// append-only, so the baseline COUNT is the split point. If the log is somehow
-// shorter than the baseline (gridsim restarted mid-run and its log truncated)
-// the whole current log is returned rather than nothing: under-reporting the
-// run would resurrect the false-FAIL this scoping exists to prevent.
+// derPutsInRun returns the DER PUTs recorded since the run baseline — those in v
+// whose (path, received time) was not already in the store when this run first
+// looked. Keying by identity rather than by a slice split is what keeps a
+// re-homed PUT that re-sorted the map from being dropped (see markRunBaseline).
 func derPutsInRun(v ServerView) []AdminDERPut {
 	runDERBaselineMu.Lock()
-	n, set := runDERBaselineN, runDERBaselineSet
+	keys, set := runDERBaselineKeys, runDERBaselineSet
 	runDERBaselineMu.Unlock()
-	if !set || n > len(v.DERPuts) {
+	if !set {
 		return v.DERPuts
 	}
-	return v.DERPuts[n:]
+	var out []AdminDERPut
+	for _, p := range v.DERPuts {
+		if !keys[derPutKey{p.Path, p.ReceivedAt}] {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // resetRunBaseline clears the process-wide run baseline. It exists for tests
 // that exercise the baseline directly; the runner never calls it.
 func resetRunBaseline() {
 	runDERBaselineMu.Lock()
-	runDERBaselineSet, runDERBaselineN = false, 0
+	runDERBaselineSet, runDERBaselineKeys = false, nil
 	runDERBaselineMu.Unlock()
 }
 

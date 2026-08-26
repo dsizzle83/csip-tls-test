@@ -76,9 +76,13 @@ package suitecsip
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/internal/invariant"
@@ -117,19 +121,53 @@ const rampDefaultFixtureExpLimW = int64(5000)
 // reader (internal/northbound/discovery/walker.go's
 // extendedDefaultDERControlDoc) take.
 //
-// This row drives straight to the Test Values column rather than proving a
-// transition through the printed Default column first (the IW15-004
-// discipline BASIC-013 uses via scalarModeOracledDefaultFirst). That
-// strengthening is not implemented here for the same reason BASIC-008/009's
-// directOracle rows do not carry it either: it would need a SECOND
-// publish-and-settle cycle inside one Setup, which this suite's spec shape
-// does not have a lever for yet (Setup/wait/PostWait is built for one
-// publication). What IS carried is the single pre/post baseline directSetup
-// already established — the same "did the reading MOVE, not just match"
-// discipline BASIC-008/009 rely on.
+// This row now proves a TRANSITION into the Test Value rather than merely
+// matching it: rampDefaultFirstSetup drives the DER through a distinguishable
+// baseline first (the IW15-004 default-first discipline BASIC-013 uses via
+// scalarModeOracledDefaultFirst, applied to the ramp), so the post-read is
+// evidence the DUT MOVED the register rather than a value an earlier row left
+// behind. Unlike BASIC-013 the baseline is NOT the catalog's Default column
+// (Figure 7's Default is setGradW=10000, WRmp=100); it is a harness-chosen
+// distinguishing value (rampBaselineSetGradW) — see that constant's doc for why
+// a distinct-from-target value is what register-state-independence requires, and
+// CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION for the campaign FAIL it fixes.
 const (
 	figure7RampTestSetGradW     = uint16(9000)
 	figure7RampTestSetSoftGradW = uint16(400)
+)
+
+// rampBaselineSetGradW / rampBaselineSetSoftGradW are the DISTINGUISHABLE
+// baseline this row drives the DER into BEFORE it commands Figure 7's Test
+// Value — the register-state-independent starting point that fixes
+// CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION.
+//
+// The registered failure: in a FULL campaign a prior ramp-commanding row leaves
+// the DER's model-704 WRmp already at the Figure-7 target (90), so a
+// post-publication read of 90 is satisfied by the DUT doing nothing at all, and
+// the oracle — correctly refusing to certify a stale register — reconciled this
+// clean product to FAIL. In isolation the same row PASSES, because there the
+// register started elsewhere and the move to 90 was real.
+//
+// The fix is the IW15-004 default-first discipline (basic.go's prescribedSetup,
+// which BASIC-013 uses) applied to the ramp: drive the DER into a value it
+// provably does NOT already hold, confirm that landing in its own registers on
+// a fresh DUT poll, THEN command Figure 7's value and prove the register MOVED
+// there. "Moved from a confirmed 50 to 90" is a transition only a live DUT
+// tracking gridsim's DefaultDERControl can produce, whatever WRmp held when the
+// row began.
+//
+// 5000 is chosen for the one property that matters: setGradW=5000 resolves to
+// WRmp=50 (5000/100), which differs from the Figure-7 target (90) and from the
+// absent-ramp fixture default (0) by far more than the oracle's ±1 register
+// tolerance — so the baseline is always a value the DER did not already hold,
+// on any nameplate, and the confirmed move to 90 is always observable. Unlike
+// BASIC-013's default, this value is NOT the catalog's own (Figure 7's Default
+// column is setGradW=10000, WRmp=100); it is a harness-chosen distinguishing
+// value, and every verdict says so (oracleDefaultProvenanceParam) so a bundle
+// reader is never told Figure 7 prescribed a 50 it does not.
+const (
+	rampBaselineSetGradW     = uint16(5000) // 50.00% of setMaxW/s -> model 704 WRmp=50
+	rampBaselineSetSoftGradW = uint16(400)
 )
 
 // DefaultBaseRequest is the "base" object inside DefaultRequest — a minimal
@@ -309,27 +347,36 @@ func critDefaultDERControlCarriesRamp(setGradW, setSoftGradW uint16) criterion {
 // basicIdentification/basicGroupManagement already use for a shape
 // inverterControlSpec's uniform machinery does not fit.
 func basicRampRates(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
-	oracle := rampGradientOracle(figure7RampTestSetGradW, figure7RampTestSetSoftGradW)
+	return run(ctx, rc, rampRatesSpec())
+}
+
+// rampRatesSpec is BASIC-007's spec, factored out so its own tests can drive
+// Setup/PostWait/Verdict against a scripted fake DER without standing up run().
+//
+// The two oracles differ only in the setGradW they judge: `target` grades the
+// Figure-7 Test Value (WRmp=90), `baseline` grades the distinguishable
+// register-state-independent baseline (WRmp=50, rampBaselineSetGradW). Setup
+// drives the baseline first, confirms it, then commands the target; PostWait
+// and every criterion grade the target.
+func rampRatesSpec() spec {
+	target := rampGradientOracle(figure7RampTestSetGradW, figure7RampTestSetSoftGradW)
+	baseline := rampGradientOracle(rampBaselineSetGradW, rampBaselineSetSoftGradW)
 	s := spec{
 		Notes: func(o *Observation) string {
-			notes := fmt.Sprintf("posted a DefaultDERControl on gridsim program %d (CSIP CTP v1.3 Figure 3's "+
-				"Service Point program) carrying setGradW=%d and setSoftGradW=%d — Figure 7's Test Values "+
-				"column — and waited %s for the DUT's poll cycle to fetch it. This row's own printed "+
-				"procedure is Default-Only: it schedules no DERControl event and requires no "+
-				"DERControlResponse",
-				rampDefaultProgram, figure7RampTestSetGradW, figure7RampTestSetSoftGradW, o.Waited.Round(rounding))
+			notes := fmt.Sprintf("drove gridsim program %d's DefaultDERControl (CSIP CTP v1.3 Figure 3's "+
+				"Service Point program) first to a DISTINGUISHABLE setGradW=%d baseline (WRmp=%d — a value "+
+				"Figure 7 does not name, commanded only so the move to the Test Value is observable from "+
+				"any prior register state), confirmed that landing in the DER's own registers, then "+
+				"commanded Figure 7's Test Values setGradW=%d/setSoftGradW=%d and waited %s for the DUT's "+
+				"poll cycle. This row's own printed procedure is Default-Only: it schedules no DERControl "+
+				"event and requires no DERControlResponse",
+				rampDefaultProgram, rampBaselineSetGradW, rampBaselineSetGradW/100,
+				figure7RampTestSetGradW, figure7RampTestSetSoftGradW, o.Waited.Round(rounding))
 			return notes + "; " + oracleNotes(controlMode{}, o)
 		},
 		RequiresGridSim: true,
 		Setup: func(ctx context.Context, d *Driver, params map[string]string) error {
-			pre := oracle.judgeWith(ctx, d.rc)
-			params[oraclePreVerdictParam] = string(pre.Verdict)
-			params[oraclePreObservedParam] = findingObserved(pre)
-			req := DefaultRequest{Program: rampDefaultProgram}
-			req.Base.ExpLimW = ptr(rampDefaultFixtureExpLimW)
-			req.SetGradW = ptr(figure7RampTestSetGradW)
-			req.SetSoftGradW = ptr(figure7RampTestSetSoftGradW)
-			return d.PostDefault(ctx, req)
+			return rampDefaultFirstSetup(ctx, d, params, baseline, target)
 		},
 		// Want is left nil (AwaitWalk): the POST above completes, synchronously,
 		// before fetchWait even runs, so any walk AwaitWalk detects after the
@@ -340,7 +387,7 @@ func basicRampRates(ctx context.Context, rc *certify.RunCtx) (certify.Result, er
 		SettlePoll: true,
 		PostWait: func(ctx context.Context, d *Driver, params map[string]string) error {
 			f := settleOracle(ctx, oracleSettleDeadline(params),
-				func() Finding { return oracle.judgeWith(ctx, d.rc) })
+				func() Finding { return target.judgeWith(ctx, d.rc) })
 			switch {
 			case f.Unavailable != "":
 				params[oracleUnavailableParam] = f.Unavailable
@@ -356,7 +403,7 @@ func basicRampRates(ctx context.Context, rc *certify.RunCtx) (certify.Result, er
 				critProgramList(0),
 				critDefaultDERControl(),
 				critDefaultDERControlCarriesRamp(figure7RampTestSetGradW, figure7RampTestSetSoftGradW),
-				critDEREffectViaDirectOracle("the ramp-rate settings", oracle, o),
+				critDEREffectViaDirectOracle("the ramp-rate settings", target, o),
 			}
 		},
 	}
@@ -375,7 +422,147 @@ func basicRampRates(ctx context.Context, rc *certify.RunCtx) (certify.Result, er
 			Base:    DefaultBaseRequest{ExpLimW: ptr(rampDefaultFixtureExpLimW)},
 		})
 	}
-	return run(ctx, rc, s)
+	return s
+}
+
+// rampDefaultRequest builds the POST /admin/default body for one ramp value,
+// carrying the fixture's own export limit forward (rampDefaultFixtureExpLimW)
+// so the precondition ADDS the ramp settings rather than erasing what
+// buildProgram0 seeded.
+func rampDefaultRequest(setGradW, setSoftGradW uint16) DefaultRequest {
+	req := DefaultRequest{Program: rampDefaultProgram}
+	req.Base.ExpLimW = ptr(rampDefaultFixtureExpLimW)
+	req.SetGradW = ptr(setGradW)
+	req.SetSoftGradW = ptr(setSoftGradW)
+	return req
+}
+
+// rampDefaultFirstSetup is BASIC-007's Setup: the IW15-004 default-first
+// discipline (basic.go's prescribedSetup) applied to the ramp, and the whole
+// answer to CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION.
+//
+//	1. Drive the DER into the DISTINGUISHABLE baseline (WRmp=50) and CONFIRM it
+//	   reached the DER's own registers — on a FRESH DUT poll, not a stale
+//	   register. The confirmation is recorded into the oracleDefault* keys, so
+//	   oracleOutcome FAILs the row (prescribedDefaultShortfall) if the baseline
+//	   never landed: a starting state that was not established cannot anchor a
+//	   transition claim.
+//	2. Take the pre-publication baseline for the TARGET, AFTER the distinguishable
+//	   default landed — so "the DER did not hold WRmp=90 before" is a statement
+//	   about the DER at a known non-target 50, whatever it held when the row began.
+//	3. Command Figure 7's Test Values. PostWait then proves WRmp moved to 90, and
+//	   oracleOutcome credits the move (prescribedDefaultCredit) from the confirmed
+//	   baseline.
+//
+// The move 50->90 is a transition only a live DUT tracking gridsim's
+// DefaultDERControl can produce, so the row PASSes whether WRmp started at 0, at
+// 90, or at anything else — and a DUT that ignores the control fails, at the
+// baseline confirmation if it started at 90, at the post-read otherwise.
+func rampDefaultFirstSetup(ctx context.Context, d *Driver, params map[string]string,
+	baseline, target *directOracle) error {
+	// ── 1. The distinguishable baseline, confirmed on a fresh poll ──────────
+	params[oracleDefaultCommandedParam] = strconv.Itoa(int(rampBaselineSetGradW))
+	params[oracleDefaultMRIDParam] = fmt.Sprintf("gridsim program-%d's DefaultDERControl (setGradW=%d)",
+		rampDefaultProgram, rampBaselineSetGradW)
+	params[oracleDefaultProvenanceParam] = fmt.Sprintf("a DISTINGUISHABLE setGradW=%d baseline (WRmp=%d), "+
+		"a value Figure 7 does not name that this row commands ONLY so the register has a known non-target "+
+		"state to move away from — not the catalog's Default column", rampBaselineSetGradW,
+		rampBaselineSetGradW/100)
+
+	startPoll, havePoll := derPollOrdinal(ctx, d)
+	if err := d.PostDefault(ctx, rampDefaultRequest(rampBaselineSetGradW, rampBaselineSetSoftGradW)); err != nil {
+		return fmt.Errorf("publish the distinguishable setGradW=%d ramp baseline: %w", rampBaselineSetGradW, err)
+	}
+	window := prescribedDefaultDeadline(ctx, d.rc, params)
+	params[oracleDefaultWindowParam] = window.String()
+	// Fence on the DUT's own poll cycle (LAB29-010, sim/simapi/API.md) so the
+	// confirmation below reads a poll the DUT ran AFTER this publish, never the
+	// pre-publish register a stale value would match. Best-effort: a sim without
+	// the 1.1.0 barrier leans on the settleOracle value-poll, which — with a
+	// baseline distinct from the target — still fails a dead DUT at the target
+	// read. Never a false PASS.
+	if havePoll {
+		awaitFreshDERPoll(ctx, d, startPoll, window)
+	}
+	landed := settleOracle(ctx, window, func() Finding { return baseline.judgeWith(ctx, d.rc) })
+	params[oracleDefaultVerdictParam] = string(landed.Verdict)
+	params[oracleDefaultObservedParam] = findingObserved(landed)
+
+	// ── 2. The pre-publication baseline for the TARGET, taken after step 1 ──
+	pre := target.judgeWith(ctx, d.rc)
+	params[oraclePreVerdictParam] = string(pre.Verdict)
+	params[oraclePreObservedParam] = findingObserved(pre)
+
+	// ── 3. Command Figure 7's Test Values ──────────────────────────────────
+	return d.PostDefault(ctx, rampDefaultRequest(figure7RampTestSetGradW, figure7RampTestSetSoftGradW))
+}
+
+// rampPollWaitSlice bounds ONE /poll/wait request, kept under the framework's
+// HTTP client timeout so a caller's transport never decides anything — the same
+// reason suitemodbusclient's pollWaitSlice is 8s.
+const rampPollWaitSlice = 8 * time.Second
+
+// derPollState is the narrow slice of simapi's GET /poll and GET /poll/wait this
+// row reads: the completed-cycle ordinal and the reached flag are all the ramp
+// baseline's fence needs. It mirrors suitemodbusclient's PollReport (ledger.go)
+// but stays local, the same way that suite keeps the deterministic endpoints
+// behind SimClient.Raw so the shared client grows no endpoint set.
+type derPollState struct {
+	Reached bool `json:"reached"`
+	Poll    struct {
+		Completed uint64 `json:"completed"`
+	} `json:"poll"`
+}
+
+// derPollOrdinal reads the DER-side sim's completed poll-cycle count without
+// blocking (GET /poll). ok is false — never fatal — when the sim does not
+// publish the 1.1.0 barrier (an older sim, or -tap=false); the caller then
+// relies on the settleOracle value-poll, which still confirms the landing.
+func derPollOrdinal(ctx context.Context, d *Driver) (uint64, bool) {
+	sim, err := d.rc.Sim(oracleSimName)
+	if err != nil || !sim.Available() {
+		return 0, false
+	}
+	raw, err := sim.Raw(ctx, http.MethodGet, "/poll", nil)
+	if err != nil {
+		return 0, false
+	}
+	var st derPollState
+	if json.Unmarshal(raw, &st) != nil {
+		return 0, false
+	}
+	return st.Poll.Completed, true
+}
+
+// awaitFreshDERPoll blocks until the DER-side sim has completed at least one
+// poll cycle beyond `start` — one the DUT ran AFTER the caller's publish — or
+// until `window`/the context runs out. It is LAB29-010's poll barrier reached
+// through SimClient.Raw, and it NEVER decides a verdict: a barrier that times
+// out just hands off to the settleOracle value-poll the caller runs next. Its
+// only job is to keep the baseline confirmation from reading the pre-publish
+// register a stale value would match.
+func awaitFreshDERPoll(ctx context.Context, d *Driver, start uint64, window time.Duration) {
+	sim, err := d.rc.Sim(oracleSimName)
+	if err != nil || !sim.Available() {
+		return
+	}
+	want := start + 1
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) && ctx.Err() == nil {
+		slice := time.Until(deadline)
+		if slice > rampPollWaitSlice {
+			slice = rampPollWaitSlice
+		}
+		raw, err := sim.Raw(ctx, http.MethodGet,
+			fmt.Sprintf("/poll/wait?epoch=%d&timeout=%s", want, slice), nil)
+		if err != nil {
+			return
+		}
+		var st derPollState
+		if json.Unmarshal(raw, &st) == nil && (st.Reached || st.Poll.Completed >= want) {
+			return
+		}
+	}
 }
 
 // registerRampRates binds BASIC-007, order 53 — the same slot it held as an

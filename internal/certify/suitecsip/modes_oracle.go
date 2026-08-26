@@ -369,12 +369,24 @@ type modeControlEvidence struct {
 	// per-row conformance-verdict gate this DESCRIPTIVE sweep does not apply)
 	// and never with 2 or 3.
 	Refused []string
-	// Unhonoured are the mRIDs of a control that named this mode, was ADOPTED
-	// (carried in a DERControlList the DUT fetched, and never rejected at
-	// receipt — i.e. not in Refused) but by end of window answered with
+	// Unhonoured are the mRIDs of a control that named this mode, was served
+	// ACTIVE (EventStatus.currentStatus = 1, its interval underway) and never
+	// rejected at receipt (not in Refused), but by end of window answered with
 	// neither an execution status (2/3) nor a refusal status (252/253/0xF0):
 	// no lifecycle progression at all, or stuck at Received(1) and nothing
 	// past it.
+	//
+	// The ACTIVE qualifier is load-bearing (CSIP-BENCH-CORE014-REHOME-WINDOW-
+	// TIMING): a control the DUT MERELY FETCHED while NOT active — a
+	// SCHEDULED-future, CANCELLED, SUPERSEDED or already-expired one it
+	// correctly does nothing about yet — is NOT unhonoured, even if it POSTed a
+	// Received acknowledging it. Its silence is a fact about the control's
+	// lifecycle, not about the DUT's honour, and grading it as an overclaim
+	// FAILs a conformant DUT for not executing a control that was never due.
+	// Those land in Pending instead, which gradeMaskAgainstEvidence discloses
+	// rather than grades. The SD-02 fault posture this bucket exists for is
+	// about a control the DUT is SUPPOSED to be executing NOW going silent, and
+	// only an active control is that.
 	//
 	// F6: this bucket restores the overclaim detection dropping status 8 from
 	// refusalStatuses removed. Under the PRE-SD-02 reading, an admitted mode
@@ -388,7 +400,20 @@ type modeControlEvidence struct {
 	// admitted-then-unhonoured defect now leaves no refusal status to catch
 	// it on. Unhonoured is what gradeMaskAgainstEvidence reads instead.
 	Unhonoured []string
+	// Pending are the mRIDs of a control that named this mode but was NOT
+	// admitted in this window — fetched in a list while SCHEDULED, CANCELLED,
+	// SUPERSEDED or expired, and never responded to. Silence on such a control
+	// is coherent, so these are DISCLOSED (they explain why a bit is otherwise
+	// silent) and never graded as an overclaim. See Unhonoured.
+	Pending []string
 }
+
+// eventStatusActive is IEEE 2030.5 EventStatus.currentStatus = 1: the
+// control's interval is currently underway. Every other value — Scheduled(0),
+// Cancelled(2/3, and gridsim's 6), Superseded(4) — means the control is not
+// executing now, so a DUT that FETCHED it and did nothing has not overclaimed
+// the mode it names; it has correctly left a not-due control alone.
+const eventStatusActive = 1
 
 // modesEvidence is everything the oracle knows before it grades.
 type modesEvidence struct {
@@ -469,8 +494,14 @@ func gatherModesEvidence(t *Transcript) modesEvidence {
 		}
 	}
 
-	// mRID -> modes, over every DERControlList the DUT fetched.
+	// mRID -> modes, over every DERControlList the DUT fetched, and mRID ->
+	// whether that control was served ACTIVE (its interval underway). A control
+	// served in any other lifecycle state — Scheduled, Cancelled, Superseded,
+	// expired — is not DUE, so a DUT that fetched it and drew no Response has
+	// not overclaimed the mode; it correctly left a not-due control alone
+	// (CSIP-BENCH-CORE014-REHOME-WINDOW-TIMING).
 	modesOf := map[string][]string{}
+	activeOf := map[string]bool{}
 	for _, ex := range t.ByResource("DERControlList") {
 		doc, err := ex.Resp.SEP()
 		if err != nil {
@@ -480,6 +511,14 @@ func gatherModesEvidence(t *Transcript) modesEvidence {
 			mrid, _ := ctrl.TextOf("mRID")
 			if mrid == "" {
 				continue
+			}
+			if es := ctrl.Child("EventStatus"); es != nil {
+				if st, ok := es.IntOf("currentStatus"); ok && st == eventStatusActive {
+					// A DUT may fetch the same mRID more than once (a re-walk, a
+					// list plus the active-list); ANY sighting as Active makes it
+					// due, so this only ever latches true.
+					activeOf[mrid] = true
+				}
 			}
 			base := ctrl.Child("DERControlBase")
 			if base == nil {
@@ -566,18 +605,37 @@ func gatherModesEvidence(t *Transcript) modesEvidence {
 			// declaration is consulted.
 			e.LegacyWireMRIDs = appendUnique(e.LegacyWireMRIDs, mrid)
 		}
+		// DUE = the control was served ACTIVE, its interval underway. Only a
+		// due control that then falls silent is an overclaim: under SD-02 the
+		// silence of a control the DUT is SUPPOSED to be executing is itself
+		// the fault signal (Received, maybe Started, then nothing). A control
+		// the DUT merely fetched while it was NOT active — Scheduled-future,
+		// Cancelled, Superseded or expired — is not due; the DUT correctly
+		// neither executes nor refuses it, and even a Received it may have
+		// POSTed is an acknowledgement of a not-yet-due control, not a promise
+		// to run it now. Those are coherent silence and go to Pending, which
+		// gradeMaskAgainstEvidence discloses rather than grades. This is the
+		// whole of CSIP-BENCH-CORE014-REHOME-WINDOW-TIMING: gridsim's DERC-SP-004
+		// is a scheduled event carrying opModConnect that no row drives, and the
+		// clean product was reconciled to FAIL for correctly leaving it alone.
+		due := activeOf[mrid]
 		for _, m := range modes {
 			switch {
 			case executed:
 				e.mode(m).Executed = appendUnique(e.mode(m).Executed, mrid)
 			case refused:
 				e.mode(m).Refused = appendUnique(e.mode(m).Refused, mrid)
-			default:
-				// F6: ADOPTED (carried, not rejected at receipt) but by end of
-				// window neither executed nor refused — no invented lifecycle
-				// status, which under SD-02's fault posture is itself the wire
-				// signal (case 6/11) rather than an absence of evidence.
+			case due:
+				// F6: DUE (served Active) but by end of window neither executed
+				// nor refused — no invented lifecycle status, which under
+				// SD-02's fault posture is itself the wire signal (case 6/11)
+				// rather than an absence of evidence.
 				e.mode(m).Unhonoured = appendUnique(e.mode(m).Unhonoured, mrid)
+			default:
+				// Fetched but never active in this window: a not-yet/no-longer
+				// due control the DUT correctly left alone. Disclosed, not
+				// graded.
+				e.mode(m).Pending = appendUnique(e.mode(m).Pending, mrid)
 			}
 		}
 	}
@@ -612,6 +670,7 @@ func (e *modesEvidence) sortRecords() {
 		sort.Strings(r.Executed)
 		sort.Strings(r.Refused)
 		sort.Strings(r.Unhonoured)
+		sort.Strings(r.Pending)
 	}
 	sort.Strings(e.LegacyWireMRIDs)
 }
@@ -737,6 +796,18 @@ func gradeMaskAgainstEvidence(e modesEvidence, mask uint32, _ string) (certify.V
 				"element, so no transcript can evidence it either way)", b.Bit, b.Mode))
 		case r == nil || (len(r.Executed) == 0 && len(r.Refused) == 0 && len(r.Unhonoured) == 0):
 			if picsDeclares(e.PICS, b) {
+				continue
+			}
+			if r != nil && len(r.Pending) > 0 {
+				// The mode WAS carried, but only by control(s) that were not due
+				// in this window — Scheduled, Cancelled, Superseded or expired,
+				// and never responded to. Silence there is coherent, so the bit
+				// is disclosed as unspoken-to rather than graded (the whole
+				// point of CSIP-BENCH-CORE014-REHOME-WINDOW-TIMING).
+				silent = append(silent, fmt.Sprintf("bit %d %s (the only control(s) naming <%s> in this "+
+					"window were not active — %s — so the DUT correctly drew no execution or refusal for "+
+					"them; a not-due control cannot evidence the mask either way)",
+					b.Bit, b.Mode, b.Element, strings.Join(r.Pending, ", ")))
 				continue
 			}
 			silent = append(silent, fmt.Sprintf("bit %d %s (no control naming <%s> drew an execution, a "+
