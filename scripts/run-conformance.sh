@@ -1,6 +1,15 @@
 #!/bin/bash
 # run-conformance.sh — one-command CSIP conformance proof for the DER hub.
 #
+# STATUS 2026-08-26: LEGACY / NON-EVIDENCE. This script predates cmd/certify
+# and the evidence-bundle pipeline (runs/<id>/bundle.json, MANIFEST.sha256,
+# certify -verify). Its layer-4 capture below shells out to dumpcap directly
+# into a temp file to prove one cipher on the wire and is discarded; it does
+# NOT pass through internal/evidence/capture, so it gets neither the
+# per-interface hygiene re-filter nor accounting, and nothing it produces may
+# be submitted as evidence. Use `certify -campaign ...` (docs/CAMPAIGNS.md)
+# for anything a lab will see; keep this only as a quick local smoke.
+#
 # Runs every layer of evidence that maps to the SunSpec CSIP Conformance
 # Test Procedures v1.3 (the EUT is the DER *client* — the hub northbound):
 #
