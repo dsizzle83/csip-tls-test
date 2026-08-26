@@ -185,6 +185,18 @@ func (e *CampaignError) Error() string {
 // own doc explains at length.
 func resolveCampaign(opts *Options) (CampaignSpec, error) {
 	if opts.Campaign == "" {
+		// -evidence is a MODIFIER on a campaign, never a selection of its own.
+		// An exploratory run is marked NOT GATING whatever else it does, so
+		// "evidence" applied to one would be a word with no consequence — and a
+		// word with no consequence in a bundle is worse than no word, because a
+		// reader will act on it.
+		if opts.Evidence {
+			return CampaignSpec{}, &CampaignError{Reason: "-evidence requires -campaign. It says this run " +
+				"must produce a SUBMISSION-GRADE artefact and proves the bench preconditions that artefact " +
+				"depends on before case 1; an exploratory run is marked NOT GATING whatever its bench " +
+				"looked like, so there is nothing for the claim to attach to (have: " +
+				strings.Join(CampaignNames(), ", ") + ")"}
+		}
 		return CampaignSpec{}, nil
 	}
 	spec, ok := LookupCampaign(string(opts.Campaign))

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // valid is the shape LAB29-003 specifies, verbatim. Every test below starts
@@ -231,6 +232,47 @@ func TestWriteFunctionCodesIsOptionalAndBounded(t *testing.T) {
 	}
 }
 
+// The one OPTIONAL key. Three properties, and each has bitten a schema
+// somewhere: absent parses and records NOTHING (so a caller cannot mistake a
+// zero for a declaration), present records the value, and present-but-absurd is
+// refused rather than carried into a TCP-2 pause nobody would sit through.
+func TestFrameBudgetIsOptionalAndBounded(t *testing.T) {
+	// Absent.
+	m := mustParse(t, valid)
+	if d, ok := m.SecureSunSpec.FrameBudget(); ok || d != 0 {
+		t.Errorf("FrameBudget() = %v, %v with the key absent; want 0, false — an undeclared budget must "+
+			"not be reachable as a duration", d, ok)
+	}
+
+	// Present.
+	withBudget := strings.Replace(valid,
+		`"secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802}`,
+		`"secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802, "frame_budget_ms": 2000}`, 1)
+	m = mustParse(t, withBudget)
+	if m.SecureSunSpec.FrameBudgetMS != 2000 {
+		t.Errorf("FrameBudgetMS = %d, want 2000", m.SecureSunSpec.FrameBudgetMS)
+	}
+	if d, ok := m.SecureSunSpec.FrameBudget(); !ok || d != 2*time.Second {
+		t.Errorf("FrameBudget() = %v, %v, want 2s, true", d, ok)
+	}
+
+	// Out of range, both ends. The upper bound mirrors cmd/mbaps's own
+	// maxFrameBudgetMS, so a manifest this reader accepts is one the DUT would.
+	for _, tc := range []struct{ body, want string }{
+		{`"frame_budget_ms": 0`, "at least 1 ms"},
+		{`"frame_budget_ms": -1`, "at least 1 ms"},
+		{`"frame_budget_ms": 60001`, "above the 60000 ms"},
+	} {
+		bad := strings.Replace(valid,
+			`"secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802}`,
+			`"secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802, `+tc.body+`}`, 1)
+		_, err := Parse([]byte(bad), "candidate.json")
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("Parse(%s) = %v, want a refusal naming %q", tc.body, err, tc.want)
+		}
+	}
+}
+
 // The optional key does not open the door: everything else stays strict, and a
 // key nobody models is still an error.
 func TestWriteFunctionCodesDoesNotMakeTheReaderTolerant(t *testing.T) {
@@ -238,6 +280,19 @@ func TestWriteFunctionCodesDoesNotMakeTheReaderTolerant(t *testing.T) {
 		`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx"}`,
 		`"modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx", "write_fn_codes": [16]}`, 1)
 	if _, err := Parse([]byte(bad), "candidate.json"); err == nil || !strings.Contains(err.Error(), "write_fn_codes") {
+		t.Fatalf("Parse(misspelled optional key) = %v, want a refusal naming it", err)
+	}
+}
+
+// The optional key does not open the door: everything else stays strict, and a
+// key nobody models is still an error. This is the pairing that has to hold —
+// "we added an optional field" is the usual way a strict reader stops being one.
+func TestAnOptionalKeyDoesNotMakeTheReaderTolerant(t *testing.T) {
+	bad := strings.Replace(valid,
+		`"secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802}`,
+		`"secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802, "frame_budget_msec": 2000}`, 1)
+	if _, err := Parse([]byte(bad), "candidate.json"); err == nil ||
+		!strings.Contains(err.Error(), "frame_budget_msec") {
 		t.Fatalf("Parse(misspelled optional key) = %v, want a refusal naming it", err)
 	}
 }

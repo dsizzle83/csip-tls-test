@@ -45,14 +45,35 @@ An unselected protocol therefore contributes neither a FAIL nor a SKIP to a
 campaign — it contributes no row at all. `internal/certify/suites/campaign_test.go`
 holds that property against the linked suites on every test run.
 
-### Dry-run selections (catalog sha256 `e1de6743…`, 283 rows)
+### Dry-run selections (catalog sha256 `adfe1f2a…`, 283 rows)
 
     certify -campaign csip          -manifest c.json -dry-run   →  52 to RUN ·  0 SKIP ·  0 N/A
-    certify -campaign mbaps         -manifest c.json -dry-run   →  56 to RUN ·  2 SKIP ·  3 N/A
+    certify -campaign mbaps         -manifest c.json -dry-run   →  56 to RUN ·  2 SKIP ·  0 N/A
     certify -campaign modbus-client -manifest c.json -dry-run   →  15 to RUN ·  0 SKIP ·  0 N/A
 
-(the three N/A rows under `mbaps` are the Secure SunSpec **client**-direction
-rows against a server-only manifest — see §5.)
+`mbaps` selects **58** rows to get those 58 outcomes: 56 to run, 2 skipped for a
+missing `gateway` capability, and no N/A at all. It reported **3 N/A** until
+2026-08-26, when the catalog stopped marking the three Secure SunSpec
+**client**-direction rows applicable — see §5's scope-conflict note. Since a
+campaign implies `-applicable`, agreeing with the manifest moves those rows out
+of the SELECTION rather than into an N/A verdict.
+
+### What a campaign closed out
+
+A campaign is a closed selection, so it prints what it closed:
+
+    Campaign:     mbaps — …
+                  suites ssm + modbus-server + pki · GATING
+                  7 row(s) in those suites are OUTSIDE the claimed profile and are not
+                  selected (catalog applicable=false; the reason travels in the bundle's
+                  archived catalog.json): ssm-conf-v0.8::PKI-009, … and 3 more
+
+These are **not** SKIPs and **not** N/A. Both of those are for rows a run
+examined and decided about; these were never selected. Their reasons travel
+anyway: every bundle archives the `catalog.json` it ran against, beside the
+digest `bundle.json` records, and `applicable: false` plus its
+`applicability_reason` is in there for each of them. `-trr` reads that archived
+catalog for exactly this purpose.
 
 ---
 
@@ -179,14 +200,16 @@ declaration of what the DUT claims to be. The product installs it at
   "profile": "one-to-one-7xx-tcp",
   "topology": {"configured_der": 1, "role": "inverter", "northbound_units": [1]},
   "csip": {"role": "der-client", "end_devices": 1, "der_resources": 1},
-  "secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802},
+  "secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802,
+                     "frame_budget_ms": 2000},
   "modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx"},
   "authority_profiles": ["csip", "mbaps"],
   "models": [1, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712]
 }
 ```
 
-Every key is required. Vocabularies: `topology.role` ∈ inverter|battery|meter ·
+Every key is required **except `secure_sunspec.frame_budget_ms`** (§4.1).
+Vocabularies: `topology.role` ∈ inverter|battery|meter ·
 `csip.role` ∈ der-client|der-aggregator-client · `secure_sunspec.roles` ⊆
 server|client · `secure_sunspec.transport` ∈ tls-tcp · `modbus_client.transport`
 ∈ tcp|rtu|rtuovertcp · `modbus_client.generation` ∈ 1xx|7xx|8xx ·
@@ -203,6 +226,73 @@ refuses a manifest that contradicts itself (`configured_der` vs
 The manifest file is copied into the bundle beside its sha256, so a reader can
 hash the copy in front of them and confirm the scope decisions were made against
 it.
+
+### 4.1 `secure_sunspec.frame_budget_ms` — the one optional key, and why it exists
+
+The DUT's **MBAP frame budget**: how long its northbound listener holds a
+connection open waiting for the rest of a frame whose MBAP header has already
+promised a length, before it gives up and closes. On the product side it is
+`limits.frame_budget_ms` in `configs/mbaps.json` (`cmd/mbaps` Config,
+`internal/listener` `Server.FrameBudget`); the deployed value and the default
+are both **2000**.
+
+It is here because **SS-MODBUS-CONF v1.4 TCP-2 and TCP-3 put the same bytes on
+the wire, and only the pause tells them apart.** Both send part of an MBAP frame,
+pause, then send more bytes on the same connection:
+
+| | pause | what the second write is |
+|---|---|---|
+| **TCP-3** §2.7.8 | 20 ms — *inside* any budget | the rest of ONE request; reassembling it is the pass criterion |
+| **TCP-2** §2.7.7 | budget + margin — *past* the budget | a NEW request; splicing it onto the first is the failure |
+
+Neither section specifies any timing at all. The harness used to pause 200 ms,
+which is shorter than any deployed budget — so a conformant server still
+assembling the first frame (exactly what TCP-3 *requires* it to do) spliced the
+second write on and answered under the first frame's transaction id, and the
+harness recorded that as a defect. The number has to come from the device, and
+this is where the device states it.
+
+`certify` adds a **≥ 500 ms margin** on top (`suitemodbusserver.TCP2Margin`).
+The budget is when the DUT *decides*; the margin is the slack between that
+decision and the harness observing it, and a pause of exactly the budget races
+the transition it is trying to observe.
+
+**Absent, the two run kinds answer differently, on purpose:**
+
+* a **campaign** refuses to run TCP-2 — the row FAILs naming the key. Guessing
+  the budget would publish the guess as a measurement, and the guess decides the
+  verdict.
+* an **exploratory** run falls back to 2000 ms + the margin and says so loudly —
+  in the notes, in the assertion's note, and in the run log — because that
+  assumption is about a *different* device than the one on the socket. An
+  exploratory bundle is marked NOT GATING anyway.
+
+Present, it is validated against the same `[1, 60000]` ms range `cmd/mbaps`
+itself enforces, so a manifest this reader accepts is one the DUT would accept.
+Strictness is unchanged elsewhere: a misspelling of the optional key is still an
+unknown key, and still an error.
+
+### 4.2 TCP-2's three outcomes
+
+§2.7.7's criteria are that the device RECOVERS from the incomplete request — it
+does not hang and does not mis-parse the following one — and that the following
+complete request receives a successful response. It is silent on whether the
+second request may go on the same connection and on whether the DUT may close
+the connection after the partial one, and the catalog's own note directs that
+the close be recorded as an **observation rather than a failure**.
+
+| observed | verdict |
+|---|---|
+| the follow-up answered on the **same connection**, echoing its own transaction id | **PASS** — the server discarded the partial frame and resynchronised. Also conformant to the literal text, and the stricter reading. |
+| the DUT **closed the connection** at its budget, and a complete request on a **fresh connection** was answered normally | **PASS**, with the close carried as the §2.7.7 observation. This is lexa-gw's shape, and it was previously graded WARN — a device doing exactly what the procedure permits, published as a partial result. |
+| a response under the **truncated frame's** transaction id | **FAIL** — the DUT spliced the follow-up onto the partial frame: the following request was MIS-PARSED. Past the DUT's own budget this can no longer be confused with TCP-3's reassembly. |
+| no answer on either connection | **FAIL** — the following complete request received no successful response. |
+
+A stale-id answer is **not** followed by a fresh-connection attempt: the DUT has
+already answered, wrongly, and opening a second connection there would only put a
+successful exchange beside a failure and invite it to be read as recovery.
+
+TCP-3 is untouched: its 20 ms split is safe under every budget by construction.
 
 ### Topology preflight
 
@@ -265,8 +355,32 @@ stands — it is the candidate's own statement about itself — but the
 disagreement is printed prominently and recorded in the bundle note. One of the
 two documents is wrong, and only the owner of the claim can say which.
 
-With the manifest above, `-campaign mbaps` reports exactly this for
-`ssm-conf-v0.8::PKI-009`, `PROT-003` and `RBAC-011`.
+`-campaign mbaps` reported exactly this for `ssm-conf-v0.8::PKI-009`,
+`PROT-003` and `RBAC-011`, and **the catalog was the document that was wrong**
+(LAB29-011, closed 2026-08-26). All three carry `dut_role: mbaps-client`; the
+candidate claims `secure_sunspec.roles = ["server"]` under the profile
+`one-to-one-7xx-tcp`, and the regenerated PICS states the negative outright —
+`PICS.md`'s `pics-claims` block carries
+`secure_sunspec_roles_not_claimed: ["client"]`, and `PICS_SUNSPEC_MODBUS.md`
+§5.1 rev. g reads *"mbaps client … NOT CLAIMED — present in source, unreachable
+under the candidate profile"*, with *"every case written against the EUT-C is
+out of the claim"* as the stated consequence. Three independent layers keep the
+southbound mbaps client unreachable (a fatal non-`tcp` scheme check, an empty
+`devices` list, and a refusal rather than a downgrade when the TLS identity is
+unwired), so this is **present in source, out of the claim** — not
+unimplemented.
+
+The three rows are now `applicable: false` with that citation as their
+`applicability_reason`. Two things follow, and the second one surprises people:
+
+* the SCOPE CONFLICT no longer fires — the two documents agree;
+* the rows leave the mbaps campaign's **selection** (58 rows, not 61) instead of
+  becoming N/A. A campaign implies `-applicable`, and `-applicable` is applied
+  during `Catalog.Select`, before the plan is built — so `CatalogScope` never
+  sees them. That is the same standing treatment the twenty-two
+  DER-Aggregator-Client rows already get under `-campaign csip`, and the run
+  names the rows it closed out (§1). Run them without `-applicable` and they
+  execute and report as **informative**, unchanged.
 
 ### For suite authors
 
@@ -304,25 +418,163 @@ actually owns it:
 
 ## 7. `-preset local`
 
-Fills in the loopback lab's addresses for every target flag you did **not**
-type. Explicit flags always win — including one that happens to equal the
-default, because the preset is applied from the flags the parser actually
+Fills in the **host-native lab**'s addresses for every target flag you did
+**not** type. Explicit flags always win — including one that happens to equal
+the default, because the preset is applied from the flags the parser actually
 visited.
+
+The lab is lexa-gw's `docs/LAB_LOOP.md`: the production binaries running on this
+host inside a rootless user namespace, with the simulators from
+`scripts/lab/lab-sims-up.sh` beside them. The two files that OWN these addresses
+are `lexa-gw scripts/lab/lib.sh` and `csip-tls-test scripts/lab/lab-sims-up.sh`;
+the table below is transcribed from them and `TestPresetLocalFillsInTheLoopbackBench`
+holds it there.
 
 | Flag | Value |
 |---|---|
-| `-gateway` | `127.0.0.1:8802` (the field port is 802, which is privileged; 8802 is the unprivileged lab mirror) |
-| `-gridsim` / `-gridsim-admin` | `127.0.0.1:11113` / `http://127.0.0.1:11114` |
-| `-modsim` / `-modsim-api` | `127.0.0.1:5020` / `http://127.0.0.1:6020` |
-| `-mbapsdev` / `-mbapsdev-api` | `127.0.0.1:8021` / `http://127.0.0.1:6031` |
+| `-gateway` | `127.0.0.2:802` |
+| `-gridsim` / `-gridsim-admin` | `127.0.0.20:21113` / `http://127.0.0.20:21114` |
+| `-modsim` / `-modsim-api` | `127.0.0.20:15020` / `http://127.0.0.20:16020` |
+| `-mbapsdev` / `-mbapsdev-api` | `127.0.0.20:18021` / `http://127.0.0.20:16031` |
 | `-metrics-endpoint` | `http://127.0.0.1:9102/metrics` |
 | `-dev-api` | `https://127.0.0.1:9100` |
 | `-iface` | `lo` |
 
-Every port except the gateway's is the default `scripts/bench-sims-up.sh`
-already uses. `-iface lo` matters: loopback traffic crosses `lo` and nothing
-else, and leaving the bench NIC here produces a capture with zero frames and a
-bundle full of PASSes downgraded "for want of a citation".
+**Three addresses, on purpose.** certify decides a captured frame's direction by
+comparing its source against the DUT's, so on `127.0.0.1`-for-everything every
+frame reads as the DUT's. `127.0.0.2` is the product, `127.0.0.20` the
+simulators, `127.0.0.1` this harness — the same mnemonic split as the bench's
+`69.0.0.2` / `69.0.0.20`.
+
+**`802`, not a lab mirror.** `cmd/mbaps` refuses to start on any port the
+candidate manifest does not claim (`secure_sunspec.port = 802`,
+`Config.validateCandidate`, the LAB29-004 fail-closed shape rule), and the lab
+installs `configs/candidate.json` **byte-identically** because its sha256 is a
+load-time fact every bundle cites — a lab manifest edited to say `8802` would be
+a different product shape wearing the same name. So the lab grants the port
+instead of moving the listener: the host sysctl
+`net.ipv4.ip_unprivileged_port_start`, a one-time owner prerequisite that
+`lab.sh preflight` checks hard. There is deliberately no high-port fallback.
+
+**The sim ports are the lab's own block, disjoint from the bench's.**
+`sim/simapi` binds the wildcard address, so a lab reusing `11113/11114`,
+`5020/6020` or `8021/6031` could not be separated from the bench set by address
+— it would silently attach the local loop to the simulators a live bench
+campaign is grading. `TestPresetLocalDoesNotCollideWithTheBenchPorts` holds the
+two blocks apart.
+
+**`-iface lo` matters**: loopback traffic crosses `lo` and nothing else, and
+leaving the bench NIC here produces a capture with zero frames and a bundle full
+of PASSes downgraded "for want of a citation".
+
+One limit the lab cannot remove, and does not pretend to: Linux sources every
+outbound loopback connection from `127.0.0.1` regardless of destination, so the
+DUT's OWN client sockets (CSIP → gridsim, Modbus → modsim/mbapsdev) appear as
+`127.0.0.1` rather than as the DUT's address. Direction-sensitive assertions on
+the DUT-as-client legs are Layer-3 (board) evidence.
+
+---
+
+## 7a. `-evidence` — the campaign that must produce a submission artefact
+
+    certify -campaign csip -evidence -manifest configs/candidate.json \
+            -param report.comm004=csip-conf-v1.3::COMM-004,…COMM-004A,…COMM-004B,…COMM-004C \
+            -gateway-ssh cc93 -iface wlp2s0 -keylog /tmp/bench-shared.keylog \
+            -out runs/csip-evidence-$(date -u +%Y%m%dT%H%M%SZ)/
+
+`-evidence` is a **modifier on a campaign**, never a selection of its own — an
+exploratory run is marked NOT GATING whatever its bench looked like, so there
+would be nothing for the claim to attach to, and `-evidence` without
+`-campaign` is refused (exit **2**).
+
+It says: *this bundle will carry a submission-grade artefact.* Every bench
+precondition that artefact depends on is therefore **proven before case 1**, and
+the run ends there if any of them cannot be established — the same fail-closed
+discipline as the `-gridsim`/`-gridsim-admin` pairing preflight and the
+control-authority preflight it sits beside. A precondition that could not be met
+exits **1**.
+
+### Why it exists (LAB29-011)
+
+SS-CSIP-RESULTS v1.1 Chapter 5 requires a raw TLS packet trace per COMM-004
+certificate scenario, containing that scenario's whole handshake. `RPT-060`
+exports them from the run's own capture — and it **failed**, because not one
+COMM-004 scenario had an attributable fresh handshake: every session had been
+resumed from a ticket.
+
+Everything about that failure was late and indirect. The COMM-004 rows
+themselves passed. Their certificate criteria correctly report *"this window's
+session is a RESUMED TLS 1.2 session, so the chain cannot be read from it"* as
+UNAVAILABLE rather than as a device fault — which is the right answer for a row
+measuring a **device**. So the run looked clean until the last row of the last
+document tried to assemble a submission out of eight windows with no certificate
+exchange in them, and reported the aggregate as its own failure. By then the
+bench was hours gone.
+
+The cause was a **launch flag**. gridsim issues session tickets unless started
+with `-no-tickets`, and holds a connection open forever unless started with
+`-idle-timeout-s`. Neither is observable from the traffic — the absence of a
+handshake in a window looks identical whether tickets were on or the DUT simply
+had nothing to say.
+
+### What it proves, before case 1
+
+| Requirement | Refusal if unmet |
+|---|---|
+| a capture (`-no-capture` is refused) | the artefacts ARE the capture |
+| a `-keylog` | without the secrets, every transcript-borne citation is lost |
+| `-param report.comm004=<uid>[,<uid>…]` | RPT-060 traces the scenarios named here; unnamed, none is written |
+| each named uid will actually RUN in this plan | a scenario that does not run produces no frames, so no trace can be cut for it |
+| each named uid is a COMM-004 row | another row's conversation under a Chapter 5 filename misdescribes the artefact |
+| gridsim publishes a TLS posture at all | **absent ≠ false**: an old simulator, or another server entirely — either way UNPROVEN |
+| `tls.no_tickets == true` | a resumed session carries no Certificate message (RFC 5077 §3.1; RFC 8446 §2.2 for 1.3) |
+| `0 < tls.idle_timeout_s` | otherwise one connection spans every poll cycle and only the first scenario's window holds a ClientHello |
+| `tls.idle_timeout_s < poll_rate_s` | the timeout must fire INSIDE the poll cadence, which is the boundary between one scenario's session and the next |
+| `poll_rate_s != 0` | with the built-ins (300 `/dcap`, 900 `/tm`, 60 control lists) there is no single boundary to hold the timeout against — and a `poll_rate_mode=honor` DUT paces its whole walk at 900 s |
+
+The posture comes from gridsim's own `GET /admin/status`, which now carries:
+
+```json
+"tls": {"no_tickets": true, "idle_timeout_s": 30}
+```
+
+The key is **omitted** when the embedding binary never declared one
+(`gridsim.Server.SetTLSPosture`), because "unreported" and "reported false" are
+different facts and a fail-closed caller has to tell them apart. Reading it from
+`/admin/status` is deliberate: the pairing preflight has already proven that
+response belongs to the process serving the data plane, so the posture is *that
+process's* posture and not some other gridsim's.
+
+The preflight is **read-only**. It does not start, restart or reconfigure the
+simulator: this harness must not mutate the bench it is measuring, and a
+simulator restarted mid-campaign invalidates the evidence of every case before
+it. An operator who sees it fail relaunches gridsim with the flags the message
+names and re-runs.
+
+### The second line: per-scenario grading
+
+A correctly posed bench can still produce a resumption — the DUT reconnecting
+inside a window, an idle timeout that did not fire in time. So under `-evidence`
+each COMM-004 row (the parent and A–G) gains one criterion, **first** in its
+list:
+
+> *this COMM-004 scenario ran on a FULL TLS handshake, so the raw packet trace
+> SS-CSIP-RESULTS v1.1 Chapter 5 requires for it can be cut from this window*
+
+It **FAILS the scenario, on the scenario's own row, with the reason** — instead
+of going unavailable and leaving RPT-060 to report the aggregate later. A
+**rejected** handshake satisfies it: COMM-004 D/E/F/G exist to make the DUT
+refuse a chain, so the handshake does not complete, and the server's Certificate
+message — which is exactly what the trace must contain — is on the wire all the
+same.
+
+Outside an evidence run the criterion is not added at all. An ordinary run
+measures a **device**, and "this window's session was resumed" is a fact about
+the bench that must not be charged to the DUT.
+
+The `-evidence` flag itself is recorded in the bundle: `run.command` carries the
+invocation, redacted (`bundle.RedactCommand`), so a reader can see the claim was
+made rather than infer it.
 
 ---
 

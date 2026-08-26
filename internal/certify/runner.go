@@ -78,6 +78,12 @@ type Options struct {
 	// to produce a GATING bundle; everything else is exploratory. See
 	// campaign.go.
 	Campaign Campaign
+	// Evidence arms the EVIDENCE POSTURE (-evidence): the run must produce a
+	// submission-grade artefact, so every bench precondition that artefact
+	// depends on is PROVEN before case 1 instead of being discovered missing
+	// when the artefact is assembled. It is a modifier on -campaign, never a
+	// selection of its own. See preflight_evidence.go.
+	Evidence bool
 	// ManifestPath is the candidate manifest (-manifest): the DUT's own
 	// declaration of what it is, against which scope decisions are made.
 	// REQUIRED with Campaign, optional otherwise, and a run without one makes
@@ -315,6 +321,11 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 		o.Campaign = Campaign(strings.TrimSpace(v))
 		return nil
 	})
+	fs.BoolVar(&o.Evidence, "evidence", o.Evidence,
+		"EVIDENCE POSTURE: this campaign must produce a submission-grade artefact, so every bench "+
+			"precondition that artefact depends on is proven before case 1. Requires -campaign, a capture "+
+			"and a -keylog; -campaign csip additionally requires -param report.comm004 and a 2030.5 "+
+			"server posed so each COMM-004 scenario begins with a new ClientHello (see docs/CAMPAIGNS.md)")
 	fs.StringVar(&o.ManifestPath, "manifest", o.ManifestPath,
 		"the candidate manifest (the DUT's own declaration of what it is; it installs one at "+
 			manifest.DefaultDUTPath+"). Scope decisions are made against it and it is copied into the "+
@@ -802,6 +813,39 @@ func (r *Runner) filter() Filter {
 // Coverage returns the coverage of the selected cases.
 func (r *Runner) Coverage() Coverage { return r.reg.Coverage(r.cat, r.filter()) }
 
+// OutOfClaim returns the rows this campaign's SUITES contain that the catalog
+// places outside the claimed profile, and which -applicable therefore removed
+// from the selection before the plan was built.
+//
+// A campaign is a CLOSED selection, so it should be able to say what it closed
+// out. Without this the only visible trace of a row leaving the claim is the
+// selection count going down — three fewer rows than last week, with nothing in
+// the run to say which three or why, which is indistinguishable at a glance
+// from a suite that quietly stopped registering them.
+//
+// It is NOT a verdict and NOT an N/A. Those are for rows a run examined and
+// decided about; these were never in the selection. The REASON travels anyway,
+// in the catalog the bundle archives beside its evidence: `applicable: false`
+// plus its applicability_reason, in the same file whose digest bundle.json
+// records. This method just points at them while the run is in front of you.
+//
+// Empty for an exploratory run, which does not imply -applicable and therefore
+// removes nothing: its informative rows RUN.
+func (r *Runner) OutOfClaim() []*Case {
+	if r.campaign.Name == "" {
+		return nil
+	}
+	f := r.filter()
+	f.ApplicableOnly = false
+	var out []*Case
+	for _, c := range r.cat.Select(f) {
+		if !c.Applicable {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // Plan returns what would run, in execution order.
 func (r *Runner) Plan() []Planned {
 	caps := r.capabilities()
@@ -978,6 +1022,16 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		return rep, err
 	}
 
+	// And, for an EVIDENCE run, the preconditions the submission ARTEFACTS
+	// depend on: a bench posed so the frames those artefacts are cut from can
+	// exist at all. See preflight_evidence.go — this is the check that would
+	// have caught the whole campaign whose COMM-004 windows held resumed
+	// sessions, on its first second instead of on its last row.
+	if err := r.preflightEvidence(ctx, reporter, rep.Plan); err != nil {
+		rep.Finished = time.Now().UTC()
+		return rep, err
+	}
+
 	pki, pkiErr := (*PKI)(nil), error(nil)
 	if r.opts.PKIDir != "" {
 		pki, pkiErr = LoadPKI(r.opts.PKIDir)
@@ -1072,6 +1126,13 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		// Cannot fail on a freshly built context; AttachWindow only refuses a
 		// SECOND window, which is the invariant it exists to hold.
 		if err := rc.AttachWindow(win); err != nil {
+			panic(err)
+		}
+		// Likewise: SetPosture only refuses a SECOND posture. What the run
+		// CLAIMS to be is part of what a check is handed, because a few rows
+		// are graded to a stricter standard under a campaign or an evidence
+		// run — see Posture.
+		if err := rc.SetPosture(Posture{Campaign: r.campaign.Name, Evidence: r.opts.Evidence}); err != nil {
 			panic(err)
 		}
 		res := r.execute(ctx, p, rc, win)

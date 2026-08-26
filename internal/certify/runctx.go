@@ -370,6 +370,15 @@ type RunCtx struct {
 	// could scope its own row out of a failure.
 	candidate *manifest.Manifest
 
+	// posture is what the RUN is: the campaign it declares and whether
+	// evidence-grade preconditions were demanded. Unexported for the same
+	// reason candidate is — a check able to tell itself "this is only an
+	// exploratory run" could relax its own grading, which is precisely the
+	// grading a campaign exists to make non-negotiable. Read it with Posture,
+	// set it once with SetPosture.
+	posture    Posture
+	postureSet bool
+
 	// win is this check's frame window. It is not exported: the claiming
 	// methods below are the whole intended surface, and a check that could
 	// rewrite the window's interval could make its citations mean anything.
@@ -408,6 +417,65 @@ func (rc *RunCtx) RoleClaimed(role string) bool {
 		return true
 	}
 	return rc.candidate.SecureSunSpec.HasRole(role)
+}
+
+// Posture is what the RUN a check belongs to is.
+//
+// It exists because a handful of checks must GRADE DIFFERENTLY depending on what
+// the run claims to be, and the difference is not a matter of taste:
+//
+//   - a campaign is a closed, gating selection, so a precondition the row cannot
+//     be decided without is a FAIL of the claim rather than a shrug. TCP-2
+//     cannot be timed without the DUT's declared frame budget, and a campaign
+//     that guessed one would publish its guess as a measurement.
+//   - an EVIDENCE run additionally demands that the bench was posed so the
+//     required artefact can exist at all — for COMM-004, a full handshake per
+//     scenario — and a scenario that begins on a resumed session must fail on
+//     its own row with that reason, not silently later on RPT-060.
+//
+// Neither is a knob a check may reach for on its own: both are stated by the
+// operator on the command line and recorded in the bundle.
+type Posture struct {
+	// Campaign is the named campaign this run declares, or "" when the run is
+	// EXPLORATORY. Note that a campaign narrowed by -uid is still a campaign
+	// here: its preconditions bite in full, only its CLAIM is reduced.
+	Campaign Campaign
+	// Evidence reports that -evidence was given: the run must produce a
+	// submission-grade artefact, and every precondition that artefact depends
+	// on is proven before case 1 rather than discovered afterwards.
+	Evidence bool
+}
+
+// InCampaign reports whether this run declares a named campaign.
+func (p Posture) InCampaign() bool { return p.Campaign != "" }
+
+// Posture returns what the run this check belongs to is. The zero value —
+// exploratory, not evidence — is what a check built outside the runner gets,
+// which is the same posture such a check has always had.
+func (rc *RunCtx) Posture() Posture {
+	if rc == nil {
+		return Posture{}
+	}
+	return rc.posture
+}
+
+// SetPosture records the run's posture on a check context, ONCE.
+//
+// The runner calls it when it builds the context. It is exported so a suite's
+// own tests can drive the strict path — the grading that only a campaign or an
+// evidence run demands — without standing up a whole run behind it.
+//
+// It refuses to REPLACE a posture rather than overwriting one, for the same
+// reason AttachWindow does: a check that could restate the run's posture could
+// declare itself exploratory and grade itself accordingly, and the one place
+// that must not be reachable from inside a check is the standard it is held to.
+func (rc *RunCtx) SetPosture(p Posture) error {
+	if rc.postureSet {
+		return fmt.Errorf("certify: %s already has a run posture; replacing one would let a check "+
+			"restate the standard it is graded against", rc.Case.UID)
+	}
+	rc.posture, rc.postureSet = p, true
+	return nil
 }
 
 // Window returns the check's frame window. Prefer the ClaimConn / DialTCP

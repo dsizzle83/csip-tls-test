@@ -69,7 +69,7 @@
 package wolfssl
 
 /*
-#cgo LDFLAGS: -lwolfssl
+#cgo LDFLAGS: -lwolfssl -lm
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
 #include <stdio.h>

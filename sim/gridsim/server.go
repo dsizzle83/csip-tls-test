@@ -74,6 +74,9 @@ type Server struct {
 	// the embedding binary read it back from the kernel. Guarded by mu. See
 	// SetDataPlaneAddr for why a process has to publish which sockets are its.
 	dataPlaneAddr string
+	// tlsPosture is the evidence-grade posture of the embedding binary's TLS
+	// data plane, or nil when it never declared one. See SetTLSPosture.
+	tlsPosture *AdminTLSPosture
 
 	// chain is the runtime certificate-chain lever behind /admin/chain, wired
 	// by the embedding binary via SetChainSwapper. It carries its OWN mutex —
@@ -452,6 +455,55 @@ func (s *Server) DataPlaneAddr() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.dataPlaneAddr
+}
+
+// SetTLSPosture records the EVIDENCE-GRADE posture of the embedding binary's
+// TLS data plane, so GET /admin/status can answer it.
+//
+// # Why this is published at all
+//
+// Two of gridsim's launch flags decide whether a conformance run's evidence CAN
+// exist, and neither is observable from outside the process:
+//
+//	-no-tickets      a RESUMED TLS session carries no Certificate message (RFC
+//	                 5077 §3.1, RFC 8446 §2.2 for 1.3). A capture window that
+//	                 catches one therefore has NO certificate exchange to cite —
+//	                 which is exactly how csip-tls-test's RPT-060 came to fail
+//	                 with no attributable fresh handshake in any COMM-004
+//	                 scenario, long after the bench that produced it had gone
+//	                 home (audit LAB29-011).
+//	-idle-timeout-s  without it a 2030.5 client holds ONE connection across
+//	                 every poll cycle, so the whole run is one session and no
+//	                 per-scenario window begins with a ClientHello to observe.
+//
+// A harness cannot infer either from the traffic: the absence of a handshake in
+// a window looks the same whether tickets were enabled or the DUT simply had
+// nothing to say. So the launch posture is published, and a run that DEPENDS on
+// it proves it before case 1 rather than discovering it at report time.
+//
+// A gridsim whose embedding binary never calls this reports NO tls object at
+// all — not a false one. "Unreported" and "reported false" are different facts
+// and a fail-closed caller must be able to tell them apart: the first is an old
+// binary, the second is a misconfigured bench.
+func (s *Server) SetTLSPosture(noTickets bool, idle time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tlsPosture = &AdminTLSPosture{
+		NoTickets:    noTickets,
+		IdleTimeoutS: int(idle / time.Second),
+	}
+}
+
+// TLSPosture returns the posture recorded by SetTLSPosture, or nil when the
+// embedding binary never declared one.
+func (s *Server) TLSPosture() *AdminTLSPosture {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.tlsPosture == nil {
+		return nil
+	}
+	cp := *s.tlsPosture
+	return &cp
 }
 
 // rebuildEndDeviceList reconstructs the /edev resource with the current

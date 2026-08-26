@@ -170,6 +170,12 @@ func main() {
 	}
 	srv.Handler = sim.Handler()
 	srv.IdleTimeout = time.Duration(*idleTimeoutS) * time.Second
+	// Publish the two flags a conformance run's certificate evidence depends on,
+	// so a harness can PROVE the posture before case 1 instead of discovering at
+	// report time that every window held a resumed session. See
+	// gridsim.Server.SetTLSPosture; a gridsim that never calls this reports no
+	// tls object at all, which a fail-closed caller reads as unproven.
+	sim.SetTLSPosture(*noTickets, srv.IdleTimeout)
 	srv.OnHandshake = func(version, cipher string) {
 		log.Printf("✓ mTLS handshake: version=%s cipher=%s", version, cipher)
 	}

@@ -540,8 +540,16 @@ func usage(w io.Writer, fs *flag.FlagSet) {
   certify -campaign mbaps -manifest configs/candidate.json -gateway-ssh cc93 -iface enp1s0 -out runs/mbaps/
                                                  a GATING campaign: closed selection, live DUT control
                                                  authority proven before case 1, recorded in the bundle
-  certify -campaign csip -manifest c.json -preset local -gateway-exec "docker exec gw" -dry-run
-                                                 the same, against a gateway on this host
+  certify -campaign csip -manifest configs/candidate.json -preset local \
+          -gateway-exec ../lexa-gw/scripts/lab/lab-exec -dry-run
+                                                 the same, against the host-native lab (lexa-gw
+                                                 docs/LAB_LOOP.md); -preset local fills in its
+                                                 addresses
+
+  certify -campaign csip -evidence -manifest configs/candidate.json -keylog /tmp/bench.keylog \
+          -param report.comm004=csip-conf-v1.3::COMM-004,csip-conf-v1.3::COMM-004A -gateway-ssh cc93
+                                                 an EVIDENCE campaign: the bench preconditions the
+                                                 submission artefacts depend on are proven before case 1
 
   certify -no-capture -suite modbus-server -target 127.0.0.1:5020 -param modbus.transport=plain
                                                  EXPLORATORY (non-gating) logic-only run against a

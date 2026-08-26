@@ -17,6 +17,7 @@ package suitemodbusserver
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -78,6 +79,23 @@ type deviceOpts struct {
 	// NoReassembly closes the connection when a read does not deliver a whole
 	// ADU — the server that assumes one segment is one PDU (TCP-3, TCP-2).
 	NoReassembly bool
+	// FrameBudget, when nonzero, is how long this device waits for the REST of
+	// a frame whose MBAP header has already promised a length. On expiry it
+	// DISCARDS the partial accumulation and resynchronises on whatever arrives
+	// next, answering it normally on the SAME connection.
+	//
+	// It is the knob that makes TCP-2's timing testable, and it is a real frame
+	// budget rather than a switch: with it set, whether the check passes
+	// depends on whether the check actually WAITED. A harness that pauses less
+	// than this hands the device a follow-up while it is still assembling, and
+	// gets the spliced answer under the stale transaction id — which is the
+	// misreading TCP-2's pause exists to avoid, reproduced here on demand.
+	//
+	// The device with a budget and the device without are both conformant
+	// shapes; a device with NO budget (the zero value here) is the one that
+	// waits forever, and after a pause past any real budget its splice is a
+	// genuine mis-parse.
+	FrameBudget time.Duration
 	// NoReversionReadback makes the remaining-time point read its
 	// not-implemented value (REV-1).
 	NoReversionReadback bool
@@ -415,12 +433,27 @@ func (d *device) session(conn net.Conn) {
 	buf := make([]byte, 4096)
 	var acc []byte
 	for {
+		// The frame budget only runs while a frame is PART-ASSEMBLED: an idle
+		// connection with nothing accumulated is not mid-frame, and a device
+		// that closed one would be testing a different property.
+		if d.opts.FrameBudget > 0 && len(acc) > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(d.opts.FrameBudget))
+		} else {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
 		n, err := conn.Read(buf)
 		if n > 0 {
 			d.record(true, peer, buf[:n])
 			acc = append(acc, buf[:n]...)
 		}
 		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() && len(acc) > 0 {
+				// Budget expired mid-frame: drop the partial frame and
+				// resynchronise, rather than splicing the next bytes onto it.
+				acc = acc[:0]
+				continue
+			}
 			return
 		}
 		progressed := false

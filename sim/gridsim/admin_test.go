@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	model "lexa-proto/csipmodel"
 )
@@ -464,5 +465,64 @@ func TestAdminStatus_IdentifiesItsOwnProcessAndDataPlane(t *testing.T) {
 	}
 	if after.DataPlane != "0.0.0.0:11113" {
 		t.Errorf("data_plane = %q, want the published listener address", after.DataPlane)
+	}
+}
+
+// TestAdminStatus_PublishesTheEvidenceTLSPosture pins the distinction the whole
+// field exists for: ABSENT and FALSE are different facts.
+//
+// A gridsim whose embedding binary never declared a posture is an OLD binary; a
+// gridsim reporting no_tickets:false is a MISCONFIGURED bench. A harness whose
+// evidence depends on a full handshake per window has to refuse both, and has
+// to say which it found — so the key is omitted rather than defaulted.
+func TestAdminStatus_PublishesTheEvidenceTLSPosture(t *testing.T) {
+	s := NewServer("")
+
+	type statusTLS struct {
+		TLS *AdminTLSPosture `json:"tls"`
+	}
+	read := func() statusTLS {
+		t.Helper()
+		var st statusTLS
+		rec := httptest.NewRecorder()
+		s.AdminHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/admin/status", nil))
+		if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+
+	if got := read(); got.TLS != nil {
+		t.Errorf("tls = %+v before any posture was published; an undeclared posture must be ABSENT, "+
+			"not reported as false — the two mean different things to a fail-closed caller", got.TLS)
+	}
+	if s.TLSPosture() != nil {
+		t.Error("TLSPosture() invented a posture nobody declared")
+	}
+
+	s.SetTLSPosture(true, 30*time.Second)
+	got := read()
+	if got.TLS == nil {
+		t.Fatal("tls is absent after SetTLSPosture")
+	}
+	if !got.TLS.NoTickets || got.TLS.IdleTimeoutS != 30 {
+		t.Errorf("tls = %+v, want {no_tickets:true idle_timeout_s:30}", *got.TLS)
+	}
+
+	// The negative posture is REPORTED, not withheld: a bench running with
+	// tickets enabled must be refusable with that reason, which needs the fact
+	// on the wire.
+	s.SetTLSPosture(false, 0)
+	got = read()
+	if got.TLS == nil || got.TLS.NoTickets || got.TLS.IdleTimeoutS != 0 {
+		t.Errorf("tls = %+v, want a declared-but-negative posture", got.TLS)
+	}
+
+	// The accessor hands back a COPY: a caller that mutated it would rewrite
+	// what every later reader is told the bench was posed as.
+	p := s.TLSPosture()
+	p.NoTickets = true
+	if s.TLSPosture().NoTickets {
+		t.Error("TLSPosture() returned the live struct; a caller can rewrite the recorded posture")
 	}
 }

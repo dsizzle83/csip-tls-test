@@ -15,6 +15,27 @@ package suitemodbusserver
 // and asserts what the WIRE shows, and reports SKIP when the manipulation did
 // not survive to the wire rather than claiming a property it did not
 // demonstrate.
+//
+// # The two procedures differ only in a pause, so the pause is load-bearing
+//
+// On the wire, TCP-2 and TCP-3 send the SAME THING: part of an MBAP frame, a
+// pause, more bytes, on one connection. What separates them is entirely the
+// interval, because a Modbus/TCP server holds an incomplete frame for its own
+// FRAME BUDGET while it waits for the rest — that is what TCP-3 requires it to
+// do — and only afterwards may it treat what arrives next as a new request.
+//
+//	TCP-3   pause 20 ms      INSIDE any budget: the two writes are one request,
+//	                         and reassembling them is the pass criterion.
+//	TCP-2   pause budget+margin   PAST the budget: the second write is a new
+//	                         request, and splicing it onto the first is the
+//	                         failure.
+//
+// §2.7.7 and §2.7.8 both specify no timing at all, so the number cannot come
+// from the documents. TCP-3's 20 ms is safe under every budget; TCP-2's comes
+// from the candidate manifest's secure_sunspec.frame_budget_ms, which is the
+// DUT's own declaration of its budget. See tcp2WaitFor for what happens when
+// the candidate declares none — the answer differs between a campaign and an
+// exploratory run, and it differs on purpose.
 
 import (
 	"context"
@@ -154,21 +175,154 @@ func checkTCP3(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	}, nil
 }
 
+// TCP2Margin is what checkTCP2 adds to the DUT's frame budget before sending
+// the follow-up ADU.
+//
+// It is not politeness. The budget is when the DUT DECIDES; the margin is the
+// slack between that decision and the harness observing it — a scheduler tick,
+// a TLS record boundary, a loaded bench. A pause of exactly the budget races
+// the very transition the procedure is trying to observe, and the race is
+// SILENT: the losing side looks like a mis-parse.
+const TCP2Margin = 500 * time.Millisecond
+
+// TCP2FallbackBudget is the frame budget an EXPLORATORY run assumes when the
+// candidate declared none. It is lexa-gw's own default and deployed value
+// (configs/mbaps.json limits.frame_budget_ms = 2000, cmd/mbaps Config), which
+// makes it a documented number rather than a guess — but it is still a number
+// about a DIFFERENT device than whatever is on the other end of the socket, so
+// a run that uses it says so loudly and a CAMPAIGN refuses to use it at all.
+const TCP2FallbackBudget = 2000 * time.Millisecond
+
+// tcp2Wait is how long checkTCP2 waits between the truncated frame and the
+// follow-up ADU, and where that number came from.
+type tcp2Wait struct {
+	// Pause is the wait itself.
+	Pause time.Duration
+	// Source is the sentence the bundle records about it.
+	Source string
+	// Refuse, when non-empty, is why this row cannot be decided at all.
+	Refuse string
+}
+
+// tcp2WaitFor decides the pause from the CANDIDATE'S OWN declaration.
+//
+// # Why this is not a constant
+//
+// It was one — 200 ms — and 200 ms is shorter than any deployed frame budget,
+// which makes the stimulus this check sends BYTE-FOR-BYTE INDISTINGUISHABLE
+// from TCP-3's:
+//
+//	TCP-3  write part of an ADU, pause 20 ms, write the rest   -> one request
+//	TCP-2  write part of an ADU, pause 200 ms, write another   -> two requests
+//
+// Both are two writes on one connection inside one frame budget. A server that
+// is still assembling the first frame — which is exactly what §2.7.7 gives it
+// its budget to do, and exactly what TCP-3 REQUIRES it to do — splices the
+// second write onto the first and answers under the first frame's transaction
+// id. That is conformant behaviour for the interval it was measured in, and the
+// old check recorded it as a defect.
+//
+// The procedure cannot settle this: §2.7.7 specifies no timing whatsoever, and
+// its own note says only that the connection state after the partial request
+// should be recorded. So the number has to come from the device, and the
+// candidate manifest is where the device states it
+// (secure_sunspec.frame_budget_ms; lexa-gw configs/mbaps.json
+// limits.frame_budget_ms is the same value on the product side).
+//
+// # Absent, and the two different answers
+//
+// A CAMPAIGN refuses. Guessing a budget would publish the guess as a
+// measurement, and the guess decides the verdict — the whole finding above.
+// An EXPLORATORY run falls back to TCP2FallbackBudget with the fallback named
+// in the notes, in the assertion, and in the run log, because an exploratory
+// run's job is to tell you something and it is marked NOT GATING anyway.
+func tcp2WaitFor(rc *certify.RunCtx) tcp2Wait {
+	if m := rc.Manifest(); m != nil {
+		if budget, ok := m.SecureSunSpec.FrameBudget(); ok {
+			return tcp2Wait{
+				Pause: budget + TCP2Margin,
+				Source: fmt.Sprintf("%s after the truncated frame (the candidate's declared MBAP frame "+
+					"budget %s, from %s secure_sunspec.frame_budget_ms, plus a %s margin), so the DUT's "+
+					"budget has certainly expired before the follow-up is written and the follow-up "+
+					"cannot be read as the continuation of the truncated frame",
+					budget+TCP2Margin, budget, m.Path(), TCP2Margin),
+			}
+		}
+	}
+	if rc.Posture().InCampaign() {
+		return tcp2Wait{Refuse: fmt.Sprintf(
+			"this row cannot be decided without the DUT's MBAP FRAME BUDGET, and the candidate manifest "+
+				"declares none (secure_sunspec.frame_budget_ms). SS-MODBUS-CONF v1.4 §2.7.7 specifies no "+
+				"timing, so the pause between the truncated frame and the follow-up is the whole "+
+				"experiment: shorter than the budget, the follow-up is indistinguishable from TCP-3's "+
+				"required segment reassembly and a CONFORMANT server is recorded as mis-parsing. A "+
+				"campaign will not guess it — add \"frame_budget_ms\" to the manifest's secure_sunspec "+
+				"object (lexa-gw configs/mbaps.json limits.frame_budget_ms is the value; the deployed "+
+				"default is %d)", int(TCP2FallbackBudget/time.Millisecond))}
+	}
+	return tcp2Wait{
+		Pause: TCP2FallbackBudget + TCP2Margin,
+		Source: fmt.Sprintf("%s after the truncated frame — the candidate manifest declares no "+
+			"secure_sunspec.frame_budget_ms, so this EXPLORATORY run assumed the product default of %s "+
+			"and added a %s margin. THAT ASSUMPTION IS ABOUT A DIFFERENT DEVICE than the one measured "+
+			"here: a DUT whose budget exceeds it would still have been mid-frame when the follow-up "+
+			"arrived, and would be recorded as mis-parsing something it was conformantly reassembling. A "+
+			"campaign refuses to run this row without the declaration",
+			TCP2FallbackBudget+TCP2Margin, TCP2FallbackBudget, TCP2Margin),
+	}
+}
+
 // checkTCP2 implements SS-MODBUS-CONF-v1.4 TCP-2, Partial Request.
 //
 // Steps: send an incomplete partial Modbus request; send a different complete
 // Modbus request; verify the successful response to the second one.
 //
-// The document is silent on two things that decide how this reads, and the
-// catalog's extraction flags both: it does not say whether the second request
-// may go on the same connection, and it does not say whether the DUT may close
-// the connection after the partial one. This check therefore tries the
-// same-connection case first — the strict reading — and, if that fails, opens a
-// second connection and tries again. Same-connection recovery is a PASS;
-// recovery only after a reconnect is a WARN with the connection-close behaviour
-// recorded as an observation rather than a failure; no recovery at all is a
-// FAIL.
+// # The timing, which the document does not give
+//
+// See tcp2WaitFor. The pause between the two writes is the experiment, and it
+// comes from the candidate's declared frame budget rather than from a constant
+// in this file.
+//
+// # The three outcomes, and why two of them are a PASS
+//
+// §2.7.7's pass criteria are that the device RECOVERS from the incomplete
+// request — it does not hang and does not mis-parse the following one — and
+// that the following complete request receives a successful response. The
+// document is silent on whether the second request may go on the same
+// connection and on whether the DUT may close the connection after the partial
+// one, and the catalog's own note says the connection-close behaviour is to be
+// recorded as an OBSERVATION rather than as a failure.
+//
+//	the follow-up answered on the SAME connection, echoing its own
+//	transaction id                                                     PASS
+//	    the server discarded the partial frame and resynchronised. Also
+//	    conformant to the literal text, and the stricter reading — it is
+//	    what a device with no frame budget at all would have to do.
+//
+//	the DUT closed the connection at its frame budget, and a complete
+//	request on a FRESH connection was answered normally                PASS
+//	    with the close recorded as the observation §2.7.7 asks for. This is
+//	    the shape a device with a frame budget takes, and the shape lexa-gw
+//	    takes. Grading it WARN — as this check did — published a device
+//	    doing exactly what the procedure permits as a partial result.
+//
+//	a response under the TRUNCATED frame's transaction id              FAIL
+//	    the DUT spliced the follow-up onto the partial frame: it MIS-PARSED
+//	    the following request, which is the failure §2.7.7 names. After a
+//	    pause longer than the DUT's own budget this can no longer be
+//	    confused with TCP-3's reassembly.
+//
+// No answer on either connection is a FAIL for the plain reason: the following
+// complete request received no successful response.
 func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) {
+	// FIRST, before a socket is opened: a row that cannot be decided must not
+	// spend a connection, and its refusal must not be confusable with a bench
+	// that was merely unreachable.
+	wait := tcp2WaitFor(rc)
+	if wait.Refuse != "" {
+		return certify.Failed("%s", wait.Refuse), nil
+	}
+
 	s, res, err := open(ctx, rc, "TCP-2 partial request")
 	if s == nil {
 		return res, err
@@ -196,24 +350,38 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	if terr != nil {
 		return certify.Result{}, fmt.Errorf("write the truncated request: %w", terr)
 	}
-	// Give the DUT a moment to react to the partial frame before the follow-up,
-	// so a server that resets on a malformed request has done so by now.
-	if err := rc.Sleep(ctx, 200*time.Millisecond); err != nil {
+	rc.Logf("TCP-2: pausing %s before the follow-up — %s", wait.Pause, wait.Source)
+	if err := rc.Sleep(ctx, wait.Pause); err != nil {
 		return certify.Result{}, err
 	}
 
-	sameConnOK := false
+	// Three distinguishable same-connection outcomes, kept apart because they
+	// are different findings about different criteria: the follow-up answered
+	// correctly; a response under the TRUNCATED frame's id (the splice §2.7.7
+	// names); and a response under some third id (the response stream no longer
+	// aligned with the requests). Only the second is evidence against the
+	// no-stale-response criterion; all three decide the recovery criterion.
+	sameConnOK, staleTID, misframed := false, false, false
 	var sameConnText string
 	followTID, adu, ferr := s.client.doTolerant(follow, "TCP-2 step 2: complete request on the same connection")
 	switch {
 	case ferr == nil && adu.TID == followTID && len(adu.PDU) > 0 && adu.PDU[0] == fcReadHolding:
 		sameConnOK = true
-		sameConnText = fmt.Sprintf("the DUT answered the follow-up request on the same connection: pdu % x, "+
-			"transaction id 0x%04x", adu.PDU, adu.TID)
+		sameConnText = fmt.Sprintf("the DUT discarded the partial frame and answered the follow-up request "+
+			"on the same connection: pdu % x, transaction id 0x%04x", adu.PDU, adu.TID)
+	case ferr == nil && adu.TID == truncTID:
+		staleTID = true
+		sameConnText = fmt.Sprintf("the DUT answered under the TRUNCATED frame's transaction id 0x%04x "+
+			"(pdu % x), not the follow-up's 0x%04x: %s after the truncated frame it was still assembling "+
+			"it, and the follow-up's bytes were consumed as its missing tail. That is the following "+
+			"request MIS-PARSED, which §2.7.7 names as the failure",
+			adu.TID, adu.PDU, followTID, wait.Pause)
 	case ferr == nil:
-		sameConnText = fmt.Sprintf("the DUT answered on the same connection but with pdu % x under transaction "+
-			"id 0x%04x, not the follow-up's 0x%04x — the truncated frame's promised bytes were consumed from "+
-			"the follow-up request", adu.PDU, adu.TID, followTID)
+		misframed = true
+		sameConnText = fmt.Sprintf("the DUT answered with pdu % x under transaction id 0x%04x, which is "+
+			"neither the follow-up's 0x%04x nor the truncated frame's 0x%04x — the response stream is no "+
+			"longer aligned with the request that produced it",
+			adu.PDU, adu.TID, followTID, truncTID)
 	case errors.Is(ferr, io.EOF):
 		sameConnText = "the DUT closed the connection after the truncated request; no response to the follow-up"
 	default:
@@ -221,12 +389,16 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	}
 	sameTIDs := tidsSince(s.client, before)
 
-	// Recovery on a fresh connection, when the same-connection attempt failed.
+	// Recovery on a fresh connection. Not attempted after the DUT has ALREADY
+	// ANSWERED, wrongly — a stale-id or misframed response settles the
+	// criterion, and opening a second connection there would only put a
+	// successful exchange beside a failure and invite it to be read as
+	// recovery.
 	var s2 *session
 	newConnOK := false
 	var newConnText string
 	var newTIDs []uint16
-	if !sameConnOK {
+	if !sameConnOK && !staleTID && !misframed {
 		s2, err = openSession(ctx, rc, "TCP-2 recovery connection")
 		if err != nil {
 			newConnText = "a fresh connection could not be established after the truncated request: " + err.Error()
@@ -245,20 +417,29 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 		}
 	}
 
-	verdict := certify.Fail
+	// The connection-state observation §2.7.7's own note asks for, carried on
+	// the criterion rather than asserted separately: it is not a pass/fail
+	// property, and giving it a verdict of its own would put a number in the
+	// tally for something the document declines to judge.
+	const observation = "SS-MODBUS-CONF v1.4 §2.7.7 does not state whether the second request may be sent " +
+		"on the same connection, whether the DUT may close the connection after a partial request, or how " +
+		"long the harness should wait — the catalog's own note directs that the connection-close behaviour " +
+		"be recorded as an OBSERVATION rather than as a failure, and it is recorded here as one"
+
+	recovered := sameConnOK || newConnOK
+	verdict := verdictIf(recovered)
 	notes := sameConnText
 	switch {
-	case sameConnOK:
-		verdict = certify.Pass
+	case sameConnOK, staleTID, misframed:
+		// sameConnText already says what happened, on its own connection.
 	case newConnOK:
-		verdict = certify.Warn
 		notes = sameConnText + "; " + newConnText
 	default:
-		notes = sameConnText
 		if newConnText != "" {
 			notes += "; " + newConnText
 		}
 	}
+	notes = joinNote(notes, "waited "+wait.Pause.String()+" between the two writes")
 
 	return certify.Result{
 		Verdict: verdict,
@@ -312,61 +493,75 @@ func checkTCP2(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 					if err != nil {
 						return nil, err
 					}
+					a.Note = joinNote(a.Note, wait.Source)
 					out = append(out, a)
 				}
 			}
 
-			// The criterion.
+			// The catalog's FIRST observable, and its own criterion: no response
+			// for the truncated frame's transaction id. This is the assertion
+			// that separates a device which recovered from one which spliced the
+			// follow-up onto the partial frame, and it is stated separately so a
+			// reader sees WHICH of the two failed. A MISFRAMED response — under
+			// neither id — is not evidence against this claim and is graded on
+			// the recovery criterion below, where it belongs.
+			staleClaim := "no Modbus response was returned under the truncated frame's transaction " +
+				"identifier: the DUT did not mis-parse the following request as that frame's missing tail"
+			staleMethod := fmt.Sprintf("the transaction identifier of the response read back after the "+
+				"follow-up request, compared against the truncated frame's 0x%04x", truncTID)
+			staleObserved := fmt.Sprintf("no response arrived under 0x%04x", truncTID)
+			if staleTID {
+				staleObserved = sameConnText
+			}
+			a, err := c.frames(staleClaim, staleMethod, verdictIf(!staleTID), staleObserved, sameTIDs)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, a)
+
+			// The criterion, and the one every outcome lands on.
 			claim := "after an incomplete request the DUT recovers, and a following complete, well-formed " +
 				"request receives a successful response"
-			method := "a complete FC 3 request issued on the same connection after the truncated one; its " +
-				"response is read back out of the capture and matched by transaction identifier"
+			method := "a complete FC 3 request issued after the truncated one — on the same connection " +
+				"first, and on a fresh connection when the DUT closed that one — with its response read " +
+				"back out of the capture and matched by transaction identifier"
 			switch {
 			case sameConnOK:
 				a, err := c.frames(claim, method, certify.Pass, sameConnText, sameTIDs)
 				if err != nil {
 					return nil, err
 				}
+				a.Note = joinNote(a.Note, observation)
 				out = append(out, a)
 			case newConnOK:
-				a, err := c.frames(claim, method, certify.Warn, sameConnText, sameTIDs)
-				if err != nil {
-					return nil, err
-				}
-				a.Note = joinNote(a.Note, "the procedure does not state whether the second request may be sent "+
-					"on the same connection, nor whether the DUT may close the connection after a partial "+
-					"request; recovery was demonstrated on a fresh connection and the connection-close "+
-					"behaviour is recorded as an observation rather than a failure")
-				out = append(out, a)
-				// The recovery itself happened on a SECOND connection, whose
-				// frames are attributed to this same test case but belong to a
+				// The recovery happened on a SECOND connection, whose frames
+				// are attributed to this same test case but belong to a
 				// different conversation. Citing them needs its own citer over
 				// that session, or the citation would silently be scoped to the
-				// wrong stream.
-				recoveryClaim := "the DUT answers a complete, well-formed request on a connection opened " +
-					"after the partial one"
+				// wrong stream — so the criterion is cited THERE, where the
+				// successful exchange actually is, and the closed connection is
+				// the observation carried beside it.
 				recoveryMethod := "FC 3 request on a second session established after the truncated frame; " +
 					"its own conversation is reconstructed from the capture and cited separately"
-				if s2 == nil {
-					out = append(out, ev.SkipAssertion(recoveryClaim, recoveryMethod, newConnText))
-					break
-				}
 				c2, reason2 := newCiter(ev, s2, false)
 				if c2 == nil {
-					out = append(out, ev.SkipAssertion(recoveryClaim, recoveryMethod,
+					out = append(out, ev.SkipAssertion(claim, recoveryMethod,
 						newConnText+" — but the capture does not corroborate it: "+reason2))
 					break
 				}
-				a2, err := c2.frames(recoveryClaim, recoveryMethod, certify.Pass, newConnText, newTIDs)
+				a2, err := c2.frames(claim, recoveryMethod, certify.Pass,
+					joinNote(sameConnText, newConnText), newTIDs)
 				if err != nil {
 					return nil, err
 				}
+				a2.Note = joinNote(a2.Note, observation)
 				out = append(out, a2)
 			default:
-				a, err := c.frames(claim, method, certify.Fail, notes, sameTIDs)
+				a, err := c.frames(claim, method, verdictIf(recovered), notes, sameTIDs)
 				if err != nil {
 					return nil, err
 				}
+				a.Note = joinNote(a.Note, observation)
 				out = append(out, a)
 			}
 			return out, nil
