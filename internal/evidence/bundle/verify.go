@@ -255,15 +255,62 @@ func verifyManifest(dir string, rep *VerifyReport) error {
 // "" would slip through the inequality against a SKIP roll-up; a bundle
 // carrying a verdict outside the four this package defines is not a bundle
 // whose arithmetic anyone can check.
+//
+// # The not-applicable verdict is checked, not merely tolerated
+//
+// VerdictNotApplicable is the one verdict that carries no measurement at all, so
+// it is the one an editor could most cheaply use to make an inconvenient row
+// disappear. Three rules close that: it is refused outright in a bundle
+// declaring a schema older than the one that introduced it; it must carry a
+// NotApplicable record naming a reason and a source this package defines; and no
+// OTHER verdict may carry that record, so "explained as out of scope" and
+// "graded" cannot both be claimed about one row.
 func verifyCaseVerdicts(b *Bundle, rep *VerifyReport) {
 	for _, c := range b.Cases {
 		rep.CasesRolledUp++
 		switch c.Verdict {
 		case Pass, Fail, Skip, Warn:
+			if c.NotApplicable != nil {
+				rep.problem(fmt.Sprintf("case %s records verdict %s but also carries a not-applicable "+
+					"record (%q, source %q). A row is either out of scope or graded; a bundle that says "+
+					"both leaves a reader no way to know which sentence to act on",
+					c.ID, c.Verdict, c.NotApplicable.Reason, c.NotApplicable.Source))
+				rep.OK = false
+				continue
+			}
+		case VerdictNotApplicable:
+			if !schemaAtLeast2(b.Schema) {
+				rep.problem(fmt.Sprintf("case %s records verdict %s, a verdict introduced in schema %s, "+
+					"but this bundle declares schema %s. A bundle carrying vocabulary its own declared "+
+					"layout does not contain was not written by the engine it claims to have been",
+					c.ID, c.Verdict, SchemaVersion, b.Schema))
+				rep.OK = false
+				continue
+			}
+			switch {
+			case c.NotApplicable == nil:
+				rep.problem(fmt.Sprintf("case %s records verdict %s with no not-applicable record. An "+
+					"unexplained N/A is indistinguishable from a row that was quietly dropped, which is "+
+					"the one thing this verdict must never be usable for", c.ID, c.Verdict))
+				rep.OK = false
+				continue
+			case strings.TrimSpace(c.NotApplicable.Reason) == "":
+				rep.problem(fmt.Sprintf("case %s records verdict %s with an EMPTY reason. The reason is "+
+					"the whole content of this verdict", c.ID, c.Verdict))
+				rep.OK = false
+				continue
+			case !c.NotApplicable.Source.Valid():
+				rep.problem(fmt.Sprintf("case %s records verdict %s on source %q, which is not one this "+
+					"verifier recognises (%s). An N/A whose authority is unstated is an assertion, not a "+
+					"citation", c.ID, c.Verdict, c.NotApplicable.Source,
+					strings.Join([]string{string(NASourceCatalog), string(NASourceManifest), string(NASourcePICS)}, ", ")))
+				rep.OK = false
+				continue
+			}
 		default:
-			rep.problem(fmt.Sprintf("case %s records verdict %q, which is not one of PASS/FAIL/SKIP/WARN — "+
+			rep.problem(fmt.Sprintf("case %s records verdict %q, which is not one of PASS/FAIL/SKIP/WARN/%s — "+
 				"a verdict this verifier cannot place in the severity order is one it cannot re-derive",
-				c.ID, c.Verdict))
+				c.ID, c.Verdict, VerdictNotApplicable))
 			rep.OK = false
 			continue
 		}

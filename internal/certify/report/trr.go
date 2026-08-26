@@ -23,16 +23,26 @@ package report
 //	   \"PASS\" or \"FAIL\" or \"NOT SUPPORTED\""
 //	SS-CSIP-RESULTS-v1.1 §3.1.1 prints the identical row.
 //
-// This bench has four: PASS, FAIL, SKIP, WARN. Two map straight through. The
-// other two do not map, and the temptation to make them is the whole reason
-// this file is written down rather than inlined:
+// This bench has five: PASS, FAIL, SKIP, WARN and N/A. Three map straight
+// through. The other two do not map, and the temptation to make them is the
+// whole reason this file is written down rather than inlined:
 //
 //	PASS  → PASS
 //	FAIL  → FAIL
+//	N/A   → NOT SUPPORTED, carrying the row's own not-applicable reason
 //	SKIP, where the CATALOG marks the case inapplicable to this product
 //	      → NOT SUPPORTED, carrying the catalog's applicability_reason
 //	SKIP, for any other reason  → NO ROW, recorded as a gap
 //	WARN                        → NO ROW, recorded as a gap
+//
+// The N/A line and the SKIP-inapplicable line below it say the same thing in two
+// vocabularies, because the archive contains both. Before bundle schema /2 the
+// only way to record "this row is out of scope" was a SKIP the catalog's
+// applicable:false explained from the side; since /2 the row carries its own
+// bundle.NotApplicable record, with a SOURCE — and the source is exactly the
+// PICS-backed fact §3.1.1 is pointing at, so it is carried into the note rather
+// than dropped. Both paths must keep working: a re-run of an old bundle through
+// a new tool has to produce the same TRR it always did.
 //
 // The third line is the one that needs its citation. "NOT SUPPORTED" is a
 // statement about the IMPLEMENTATION — the feature is not there — and the only
@@ -318,6 +328,23 @@ func MapVerdict(c bundle.TestCaseResult, na CaseApplicability, source string) (*
 		return &TestVerdict{ID: id, Verdict: "PASS"}, nil
 	case bundle.Fail:
 		return &TestVerdict{ID: id, Verdict: "FAIL"}, nil
+	case bundle.VerdictNotApplicable:
+		// The row declared itself out of scope and said on whose authority.
+		// That IS the "NOT SUPPORTED" claim the format wants, stated by the
+		// party entitled to state it, so it goes in with its source attached
+		// rather than being reduced to a gap.
+		note := ""
+		if c.NotApplicable != nil {
+			note = fmt.Sprintf("%s (declared by %s)", firstSentence(c.NotApplicable.Reason), c.NotApplicable.Source)
+		}
+		if note == "" {
+			// bundle.Verify refuses such a bundle, so reaching here means an
+			// unverified one was fed straight in. Do not invent a claim about
+			// the device from a record that is not there.
+			return gap(GapEvidence, "the case is recorded N/A with no reason, so no NOT SUPPORTED claim "+
+				"can be attributed")
+		}
+		return &TestVerdict{ID: id, Verdict: "NOT SUPPORTED", Note: note}, nil
 	case bundle.Skip:
 		if reason, inapplicable := na[c.ID]; inapplicable {
 			return &TestVerdict{ID: id, Verdict: "NOT SUPPORTED", Note: reason}, nil

@@ -204,7 +204,11 @@ func main() {
 	if err != nil {
 		fatal(2, "write the evidence bundle: %v", err)
 	}
-	pass, fail, skip, warn := b.Counts()
+	// na is discarded deliberately: a gw-campaign bundle records mayhem
+	// scenarios, which have no catalog applicability and therefore never carry
+	// the not-applicable verdict. Printing a permanent "0 n/a" would invite a
+	// reader to look for a distinction this tool does not make.
+	pass, fail, skip, warn, _ := b.Counts()
 	fmt.Printf("\nevidence bundle: %s  (%d pass, %d fail, %d skip, %d warn)\n", dir, pass, fail, skip, warn)
 	// The manifest check is what a campaign bundle can honestly offer, and the
 	// hint says exactly that. `certify -verify` also tries to re-derive every

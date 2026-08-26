@@ -50,7 +50,7 @@ func TestCountsByClaimBucketsAggregatorRowsAsInformative(t *testing.T) {
 		t.Errorf("totals = %d applicable / %d informative, want 8 / 6", app.Total(), inf.Total())
 	}
 	// The split regroups; it must never lose or invent a case.
-	pass, fail, skip, warn := derClientRun().Counts()
+	pass, fail, skip, warn, _ := derClientRun().Counts()
 	if app.Pass+inf.Pass != pass || app.Fail+inf.Fail != fail ||
 		app.Skip+inf.Skip != skip || app.Warn+inf.Warn != warn {
 		t.Error("the split does not add back up to the flat tally")
@@ -60,8 +60,8 @@ func TestCountsByClaimBucketsAggregatorRowsAsInformative(t *testing.T) {
 func TestReportSeparatesTheInformativeFailures(t *testing.T) {
 	report := derClientRun().Report()
 	for _, want := range []string{
-		"**Applicable to the claim:** 1 PASS · 5 FAIL · 1 SKIP · 1 WARN (8 case(s))",
-		"1 PASS · 3 FAIL · 1 SKIP · 1 WARN (6 case(s))",
+		"**Applicable to the claim:** 1 PASS · 5 FAIL · 1 SKIP · 1 WARN (8 in-scope case(s))",
+		"1 PASS · 3 FAIL · 1 SKIP · 1 WARN (6 in-scope case(s))",
 		"✗ 8 test case(s) FAILED — 5 applicable to the claim, 3 informative",
 		"Only the applicable failures bear on the certification claim",
 		"| AGG-009 | AGG-009 title | info | FAIL |",

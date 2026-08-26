@@ -20,6 +20,8 @@ import (
 	"log"
 	"net"
 	"net/netip"
+
+	"csip-tls-test/internal/certify/manifest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -362,10 +364,50 @@ type RunCtx struct {
 	// Log is the run log.
 	Log Logger
 
+	// candidate is the run's candidate manifest, or nil. It is unexported and
+	// reached through Manifest / RoleClaimed so a check reads the declaration
+	// and cannot edit it: a suite able to rewrite what the candidate claims
+	// could scope its own row out of a failure.
+	candidate *manifest.Manifest
+
 	// win is this check's frame window. It is not exported: the claiming
 	// methods below are the whole intended surface, and a check that could
 	// rewrite the window's interval could make its citations mean anything.
 	win *Window
+}
+
+// Manifest returns the candidate manifest this run was measured against, or nil
+// when none was supplied.
+//
+// It is READ-ONLY by construction (the type has no setters) and it is the
+// supported way for a check to ask what the candidate claims about itself.
+// CASE-level scope — a whole row that is not about anything this candidate is —
+// is decided before the plan runs and never reaches a check; see scope.go. What
+// this is for is the finer grain a check can see and the planner cannot: an
+// ASSERTION inside a row that only bears on a direction, a transport or a model
+// the candidate does not claim.
+//
+// A nil manifest means no declaration was supplied, which excludes NOTHING. A
+// check must treat nil as "assert everything" rather than as "assert nothing" —
+// silence is not a disclaimer, and a run with no -manifest must behave exactly
+// as it did before manifests existed.
+func (rc *RunCtx) Manifest() *manifest.Manifest { return rc.candidate }
+
+// RoleClaimed reports whether the candidate claims a Secure SunSpec Modbus
+// DIRECTION role — "server" or "client".
+//
+// It is sugar over Manifest().SecureSunSpec.HasRole with the nil case decided
+// the safe way: NO MANIFEST MEANS TRUE. A check reads it to split a criterion
+// that only applies in one direction, e.g.
+//
+//	if !rc.RoleClaimed("client") { ... assert only the server half ... }
+//
+// and gets the pre-manifest behaviour unchanged when nobody supplied one.
+func (rc *RunCtx) RoleClaimed(role string) bool {
+	if rc == nil || rc.candidate == nil {
+		return true
+	}
+	return rc.candidate.SecureSunSpec.HasRole(role)
 }
 
 // Window returns the check's frame window. Prefer the ClaimConn / DialTCP

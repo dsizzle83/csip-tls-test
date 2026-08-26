@@ -149,6 +149,13 @@ func runCheck(t *testing.T, uid string, check certify.Check, dev *device, params
 		Gateway:     dev.Addr(),
 		GatewayHost: "127.0.0.1",
 	}
+	// The DUT here is a loopback SunSpec device with no arbitration layer at
+	// all, so the write rows' control-authority precondition (certify's
+	// authority.go) has nothing to be read off and no posture to be in. That
+	// check fails closed with no gateway transport, correctly, and this is the
+	// documented escape: an EXPLORATORY run that says out loud it is not gating —
+	// which a loopback suite test is.
+	opts.SkipPreflight = true
 	opts.Params = map[string]string{
 		paramTransport:   "plain",
 		paramUnit:        "1",

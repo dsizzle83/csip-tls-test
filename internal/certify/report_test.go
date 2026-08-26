@@ -182,7 +182,7 @@ func TestCoverageMarkdownNamesTheGaps(t *testing.T) {
 	cat := loadTestCatalog(t)
 	reg := NewRegistry()
 	reg.Register("doc-a::A-001", "tls", noopCheck)
-	md := CoverageMarkdown(reg.Coverage(cat, Filter{}))
+	md := CoverageMarkdown(reg.Coverage(cat, Filter{}), nil)
 
 	for _, want := range []string{
 		cat.Ref().SHA256,
@@ -206,7 +206,7 @@ func TestCoverageMarkdownCleanRun(t *testing.T) {
 	for _, c := range cat.All() {
 		reg.Register(c.UID, "all", noopCheck)
 	}
-	md := CoverageMarkdown(reg.Coverage(cat, Filter{}))
+	md := CoverageMarkdown(reg.Coverage(cat, Filter{}), nil)
 	if !strings.Contains(md, "✓ Every applicable selected test case has an implementation") {
 		t.Errorf("clean coverage not reported:\n%s", md)
 	}

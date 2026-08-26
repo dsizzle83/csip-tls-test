@@ -67,7 +67,7 @@ func TestNonCertifiableFailDoesNotFlipTheExitCriterion(t *testing.T) {
 
 	// …and the failure is still fully visible, or the exclusion would be a
 	// silent one.
-	_, fail, _, _ := withExtFail.Counts()
+	_, fail, _, _, _ := withExtFail.Counts()
 	if fail != 1 {
 		t.Errorf("Counts() reports %d FAIL, want 1: the exclusion must re-attribute the failure, not hide it", fail)
 	}

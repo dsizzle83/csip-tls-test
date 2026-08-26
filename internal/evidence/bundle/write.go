@@ -55,6 +55,15 @@ func (b *Builder) SetCapture(sum capture.Summary, path string) {
 	}
 }
 
+// SetCampaign records the campaign this run is evidence for, and whether it
+// gates. See RunMeta.Campaign.
+func (b *Builder) SetCampaign(c CampaignRecord) { b.run.Campaign = &c }
+
+// SetCandidate records the candidate manifest this run was measured against.
+// The manifest FILE should be added with AddFile beside it, so the digest
+// recorded here is re-derivable from the bundle rather than taken on trust.
+func (b *Builder) SetCandidate(c CandidateRef) { b.run.Candidate = &c }
+
 // SetKeyLog records the NSS key log to copy into the bundle.
 //
 // The key log belongs in the bundle because without it the claims about
@@ -327,9 +336,25 @@ func Load(dir string) (*Bundle, error) {
 	if err := dec.Decode(&b); err != nil {
 		return nil, fmt.Errorf("bundle: parse %s: %w", BundleFile, err)
 	}
-	if b.Schema != SchemaVersion {
-		return nil, fmt.Errorf("bundle: %s declares schema %q, this verifier understands %q",
-			BundleFile, b.Schema, SchemaVersion)
+	if !knownSchema(b.Schema) {
+		return nil, fmt.Errorf("bundle: %s declares schema %q, this verifier understands %s",
+			BundleFile, b.Schema, strings.Join(knownSchemas, " and "))
 	}
 	return &b, nil
+}
+
+// knownSchema reports whether this package reads a bundle declaring this layout.
+//
+// Every layout ever written is listed, not just the current one. A verifier that
+// only understood the newest would make the whole archive unverifiable the day a
+// field was added, which is the opposite of what a self-checking bundle is for:
+// the point of the version is to let an OLD reader refuse a NEW bundle cleanly,
+// never to let a new reader disown an old one.
+func knownSchema(s string) bool {
+	for _, k := range knownSchemas {
+		if s == k {
+			return true
+		}
+	}
+	return false
 }

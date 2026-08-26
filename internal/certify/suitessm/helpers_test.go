@@ -115,6 +115,11 @@ func TestWatchClientHalfForcedArmsAndClearsDropSession(t *testing.T) {
 		MBAPSDev:    "127.0.0.1:1",
 		MBAPSDevAPI: srv.URL,
 	}
+	// RBAC-011 carries the mbaps control-authority precondition, and there is no
+	// DUT here to read a posture off — the "gateway" above answers nothing by
+	// design. The check fails closed without a transport, correctly, and this is
+	// the documented escape: an exploratory run that records itself non-gating.
+	opts.SkipPreflight = true
 
 	run, err := certify.New(registry(t), loadCatalog(t), opts)
 	if err != nil {
@@ -173,6 +178,9 @@ func TestWatchClientHalfForcedFallsBackWithoutMBAPSDevAPI(t *testing.T) {
 		GatewayHost: "127.0.0.1",
 		MBAPSDev:    "127.0.0.1:1",
 	}
+	// Same reason as the sibling test above: RBAC-011 carries the mbaps
+	// control-authority precondition and there is no DUT here to read one off.
+	opts.SkipPreflight = true
 
 	run, err := certify.New(registry(t), loadCatalog(t), opts)
 	if err != nil {

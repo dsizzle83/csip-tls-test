@@ -368,18 +368,50 @@ var ErrNotReadOnly = errors.New("certify: the gateway client is read-only")
 // configuration (which certificates are installed, which build is running) that
 // no amount of packet capture will show. Those facts become Narrative
 // assertions with "gateway introspection" as the source — never citations.
+// # Two transports, one allowlist
+//
+// The DUT is not always across an ssh hop. A gateway under test on the same host
+// as the harness — a lab container, a namespace, a locally-running build — is
+// reached by prefixing a command instead of by dialling ("docker exec c",
+// "scripts/lab/lab-exec"). Exec is that prefix. It is a DIFFERENT transport and
+// deliberately NOT a different permission model: CheckReadOnly runs before
+// either one, on the same argument vector, so nothing becomes runnable by virtue
+// of being local.
 type Gateway struct {
-	// SSH is the ssh destination or alias ("cc93", "root@69.0.0.2"). Empty
-	// disables introspection, and every call then fails with that fact.
+	// SSH is the ssh destination or alias ("cc93", "root@69.0.0.2").
 	SSH string
+	// Exec is a local command PREFIX (argv, already split) that the read-only
+	// command is appended to. Mutually exclusive with SSH; the flag layer
+	// refuses both, and Run refuses them too rather than silently preferring
+	// one.
+	Exec []string
 	// Timeout bounds one command.
 	Timeout time.Duration
-	// Runner executes the command; nil means real ssh. A test substitutes it.
+	// Runner executes the command; nil means the real transport. A test
+	// substitutes it.
 	Runner func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
-// Available reports whether gateway introspection was configured.
-func (g *Gateway) Available() bool { return g != nil && g.SSH != "" }
+// Available reports whether gateway introspection was configured, by EITHER
+// transport. Every capability gate and every "no gateway, no config-derived
+// fact" branch reads this rather than testing SSH, so a local-exec run is a
+// first-class introspection channel and not a second-class one.
+func (g *Gateway) Available() bool { return g != nil && (g.SSH != "" || len(g.Exec) > 0) }
+
+// Describe names the transport for an error message or an evidence line, in a
+// form an operator can recognise as their own flag.
+func (g *Gateway) Describe() string {
+	switch {
+	case g == nil:
+		return "(no gateway)"
+	case g.SSH != "":
+		return "-gateway-ssh " + g.SSH
+	case len(g.Exec) > 0:
+		return "-gateway-exec " + strings.Join(g.Exec, " ")
+	default:
+		return "(no gateway)"
+	}
+}
 
 // CheckReadOnly reports whether a command is on the read-only allowlist,
 // returning a descriptive error when it is not. It is exported so a suite can
@@ -427,8 +459,20 @@ func sortedKeys(m map[string]bool) []string {
 // Run executes a read-only command on the gateway and returns its stdout.
 func (g *Gateway) Run(ctx context.Context, args ...string) ([]byte, error) {
 	if !g.Available() {
-		return nil, errors.New("certify: no gateway ssh destination configured (-gateway-ssh)")
+		return nil, errors.New("certify: no gateway introspection configured " +
+			"(pass -gateway-ssh for a remote DUT, or -gateway-exec for one on this host)")
 	}
+	if g.SSH != "" && len(g.Exec) > 0 {
+		// Refused rather than resolved. Two transports configured means the
+		// operator believes they are talking to one device and may be talking
+		// to two, and every config-derived fact in the run would then be about
+		// whichever this function happened to prefer.
+		return nil, fmt.Errorf("certify: gateway has BOTH -gateway-ssh %s and -gateway-exec %s "+
+			"configured; they name different devices and this client will not choose between them",
+			g.SSH, strings.Join(g.Exec, " "))
+	}
+	// BEFORE either transport, and identically for both: the bench is shared,
+	// and a local prefix must not be a way around the read-only rule.
 	if err := CheckReadOnly(args); err != nil {
 		return nil, err
 	}
@@ -452,10 +496,127 @@ func (g *Gateway) Run(ctx context.Context, args ...string) ([]byte, error) {
 			return out, nil
 		}
 	}
-	sshArgs := append([]string{"-o", "BatchMode=yes", g.SSH}, args...)
-	out, err := run(ctx, "ssh", sshArgs...)
+
+	var name string
+	var argv []string
+	if len(g.Exec) > 0 {
+		// Local exec: the prefix and the command are ONE argument vector, passed
+		// to the OS with no shell anywhere, so nothing is re-split and nothing
+		// needs quoting.
+		name, argv = g.Exec[0], append(append([]string(nil), g.Exec[1:]...), args...)
+	} else {
+		name, argv = "ssh", append([]string{"-o", "BatchMode=yes", g.SSH}, shellQuoteArgs(args)...)
+	}
+	out, err := run(ctx, name, argv...)
 	if err != nil {
-		return out, fmt.Errorf("certify: gateway %s: %v: %w", g.SSH, args, err)
+		return out, fmt.Errorf("certify: gateway %s: %v: %w", g.Describe(), args, err)
+	}
+	return out, nil
+}
+
+// shellQuoteArgs makes an argument vector survive ssh.
+//
+// ssh does not take an argv: it CONCATENATES its trailing arguments with spaces
+// and hands the result to the remote user's shell, which splits them again. For
+// every command this client has ever run that round trip was invisible, because
+// no argument contained a shell metacharacter. The first one that does — an
+// HTTP header, a path with a space, anything carrying a quote — arrives on the
+// far side as two arguments, and the failure is a remote shell error about a
+// token nobody typed.
+//
+// Quoting only what needs it is deliberate rather than lazy: it keeps every
+// existing command byte-identical on the wire, so this fix cannot change what
+// any current caller executes, and it keeps the ssh command line readable in a
+// journal. The local-exec transport does not come through here at all, because
+// there is no shell in that path to defend against.
+func shellQuoteArgs(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = shellQuote(a)
+	}
+	return out
+}
+
+// shellSafe is the set of characters that pass through a POSIX shell word
+// unaltered. Anything outside it forces quoting.
+func shellSafe(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	}
+	return strings.ContainsRune("-_./:=@,+", r)
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range s {
+		if !shellSafe(r) {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	// Single quotes protect everything except a single quote, which is closed,
+	// escaped and reopened — the one portable form.
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// SplitCommandPrefix turns the -gateway-exec flag's value into an argv.
+//
+// It understands single and double quotes so a prefix can contain a path with a
+// space, and refuses an unterminated one rather than guessing where the operator
+// meant it to end — a prefix silently truncated at a stray quote would run a
+// DIFFERENT command against the DUT than the one on the command line, and every
+// fact read through it would be about the wrong container.
+//
+// It is deliberately NOT a shell: no expansion, no substitution, no operators.
+// The value names a program and its fixed leading arguments, and anything richer
+// than that belongs in a script the operator can read.
+func SplitCommandPrefix(s string) ([]string, error) {
+	var (
+		out   []string
+		cur   strings.Builder
+		inCur bool
+		quote rune
+	)
+	flush := func() {
+		if inCur {
+			out = append(out, cur.String())
+			cur.Reset()
+			inCur = false
+		}
+	}
+	for _, r := range s {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+				continue
+			}
+			cur.WriteRune(r)
+			inCur = true
+		case r == '\'' || r == '"':
+			quote = r
+			// An empty quoted string is still an argument.
+			inCur = true
+		case r == ' ' || r == '\t' || r == '\n':
+			flush()
+		default:
+			cur.WriteRune(r)
+			inCur = true
+		}
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("certify: -gateway-exec %q has an unterminated %c quote", s, quote)
+	}
+	flush()
+	if len(out) == 0 {
+		return nil, fmt.Errorf("certify: -gateway-exec %q names no command", s)
 	}
 	return out, nil
 }

@@ -14,10 +14,39 @@ import (
 	"csip-tls-test/internal/evidence/pcapng"
 )
 
-// SchemaVersion identifies the bundle.json layout. A verifier that does not
-// recognise it must refuse to pass the bundle rather than check what it happens
-// to understand.
-const SchemaVersion = "lexa-evidence-bundle/1"
+// SchemaVersion identifies the bundle.json layout every NEW bundle is written
+// with. A verifier that does not recognise a bundle's schema must refuse to pass
+// it rather than check what it happens to understand.
+const SchemaVersion = "lexa-evidence-bundle/2"
+
+// SchemaVersion1 is the layout every bundle in the archive up to 2026-08-26
+// carries. It is still read, and still verified, by this package.
+//
+// # Why /2 exists at all
+//
+// The bundle package's standing convention is that a purely ADDITIVE field needs
+// no version bump: Load rejects unknown fields but tolerates missing ones, so an
+// older bundle simply carries no key and an older reader of a newer bundle
+// ignores nothing it needed (see Bundle.Metrics and Bundle.Timebases, both added
+// that way). VerdictNotApplicable is the first change that convention does not
+// cover. It adds a VALUE to a vocabulary, not a key to a struct, and a /1-era
+// verifier meeting it would reject the bundle with "records verdict "N/A", which
+// is not one of PASS/FAIL/SKIP/WARN" — a true statement about that verifier
+// dressed up as a finding about the evidence. The version is what lets the old
+// reader say the honest thing instead: this bundle is newer than I am.
+const SchemaVersion1 = "lexa-evidence-bundle/1"
+
+// knownSchemas are the layouts this package reads, newest first. Writing is
+// always SchemaVersion; reading accepts any of these, and features introduced
+// after a given layout are refused in bundles declaring it (see
+// schemaAtLeast2).
+var knownSchemas = []string{SchemaVersion, SchemaVersion1}
+
+// schemaAtLeast2 reports whether a bundle's declared layout is one in which the
+// not-applicable verdict exists. A /1 bundle carrying it was not written by this
+// engine, and the verifier says so rather than accepting a vocabulary that
+// layout never had.
+func schemaAtLeast2(schema string) bool { return schema == SchemaVersion }
 
 // File names inside a bundle directory. They are fixed so that "run Verify on
 // this directory" needs no arguments and no explanation.
@@ -28,11 +57,13 @@ const (
 	CaptureDir   = "capture"
 )
 
-// Verdict is a test case's or assertion's outcome, using the same four values
-// as the rest of this bench's conformance reporting (sim/ssm-conformance).
+// Verdict is a test case's or assertion's outcome, using the same values as the
+// rest of this bench's conformance reporting (sim/ssm-conformance), plus the
+// out-of-scope verdict VerdictNotApplicable this engine needs and that
+// vocabulary has no word for.
 type Verdict string
 
-// The four verdicts.
+// The verdicts.
 const (
 	// Pass — the criterion was asserted on the wire and held.
 	Pass Verdict = "PASS"
@@ -42,9 +73,34 @@ const (
 	Skip Verdict = "SKIP"
 	// Warn — asserted with a caveat.
 	Warn Verdict = "WARN"
+	// VerdictNotApplicable — the row is NOT IN SCOPE for this candidate at all,
+	// so no outcome about it exists to report.
+	//
+	// It is deliberately a different word from Skip, and the difference is the
+	// whole point. Skip says "this run could not measure it" — a fact about the
+	// bench, an evidence gap, something an operator might fix by re-running with
+	// a capture or a -gateway-ssh. N/A says "there is nothing here to measure" —
+	// a fact about the CANDIDATE's declared scope, which no amount of re-running
+	// changes. Reporting the second as the first is how a campaign accumulates
+	// dozens of SKIP lines that look like unfinished work and bury the handful
+	// that really are (LAB29-001).
+	//
+	// A case carrying this verdict MUST also carry a NotApplicable record saying
+	// WHY and on WHOSE AUTHORITY; Verify refuses a bundle where it does not, and
+	// refuses this verdict entirely in a schema older than the one that
+	// introduced it. The spelling is an uppercase token like every other verdict,
+	// because these strings are printed verbatim into REPORT.md's tables and the
+	// console, and a lone lowercase one reads as a typo.
+	VerdictNotApplicable Verdict = "N/A"
 )
 
 // Severity orders verdicts so a test case can take the worst of its assertions.
+//
+// VerdictNotApplicable and Skip share the bottom, and neither can raise a
+// roll-up. That is correct for both: "nobody measured it" and "there was nothing
+// to measure" are each the absence of an outcome, and an absence must never
+// out-rank the observations beside it. What separates them is not severity, it
+// is what the reader is being told — see VerdictNotApplicable.
 func (v Verdict) Severity() int {
 	switch v {
 	case Fail:
@@ -53,9 +109,56 @@ func (v Verdict) Severity() int {
 		return 2
 	case Pass:
 		return 1
+	case Skip, VerdictNotApplicable:
+		return 0
 	default:
+		// An unrecognised verdict sorts at the bottom rather than panicking, and
+		// verifyCaseVerdicts refuses it separately — a value this package does
+		// not define is a bundle nobody can check, not a bundle to rank.
 		return 0
 	}
+}
+
+// NASource names WHOSE declaration put a row out of scope. It rides in the
+// bundle beside the reason because the two answer different questions for a
+// reader: the reason says what was decided, the source says who is entitled to
+// have decided it, and an N/A whose source is unstated is an assertion rather
+// than a citation.
+type NASource string
+
+// The sources a not-applicable verdict can rest on.
+const (
+	// NASourceCatalog — the conformance catalog's own `applicable` field, with
+	// `applicability_reason` as the reason. A fact about the SPECIFICATION and
+	// the claimed profile.
+	NASourceCatalog NASource = "catalog-applicability"
+	// NASourceManifest — the candidate manifest the DUT publishes
+	// (/etc/lexa/candidate.json). A fact about what this CANDIDATE claims.
+	NASourceManifest NASource = "manifest"
+	// NASourcePICS — a PICS declaration. A fact about what the vendor declared
+	// to the certifying body.
+	NASourcePICS NASource = "pics"
+)
+
+// Valid reports whether the source is one this package defines.
+func (s NASource) Valid() bool {
+	switch s {
+	case NASourceCatalog, NASourceManifest, NASourcePICS:
+		return true
+	}
+	return false
+}
+
+// NotApplicable explains a VerdictNotApplicable verdict.
+type NotApplicable struct {
+	// Reason is why the row is out of scope, in the reader's language.
+	Reason string `json:"reason"`
+	// Source is whose declaration decided it.
+	Source NASource `json:"source"`
+	// Detail carries the exact declaration the decision was read out of — the
+	// manifest key and its value, the catalog field — so a reader can go and
+	// look at it rather than take this record's word.
+	Detail string `json:"detail,omitempty"`
 }
 
 // Assertion is one checkable claim about the capture.
@@ -159,9 +262,16 @@ type TestCaseResult struct {
 	// case is NON-certifiable, and read through BearsOnClaim below, which
 	// treats an absent marker as "certifiable" and therefore leaves every older
 	// bundle's meaning unchanged.
-	NonCertifiable bool        `json:"non_certifiable,omitempty"`
-	Notes          string      `json:"notes,omitempty"`
-	Assertions     []Assertion `json:"assertions"`
+	NonCertifiable bool `json:"non_certifiable,omitempty"`
+	// NotApplicable explains a VerdictNotApplicable verdict: why this row is out
+	// of scope for the candidate, and on whose declaration. It is REQUIRED when
+	// Verdict is VerdictNotApplicable and forbidden otherwise — Verify enforces
+	// both, because an unexplained N/A is indistinguishable from a row that was
+	// quietly dropped, which is the one thing this verdict must never be usable
+	// for.
+	NotApplicable *NotApplicable `json:"not_applicable,omitempty"`
+	Notes         string         `json:"notes,omitempty"`
+	Assertions    []Assertion    `json:"assertions"`
 }
 
 // RollUp returns the worst verdict among the assertions, which is what
@@ -178,12 +288,23 @@ type TestCaseResult struct {
 // WARN rather than FAIL: the case is not evidence that the device misbehaved,
 // it is evidence that nobody looked. Those are different findings and a bundle
 // that conflated them would send a reader hunting a defect that may not exist.
+// A case whose assertions are ALL not-applicable rolls up to
+// VerdictNotApplicable rather than to Skip. Both sit at severity 0, so the
+// maximum-taking loop cannot tell them apart and would hand back its Skip seed —
+// which would then read, in the verifier's own message, as a bundle claiming
+// N/A over assertions that say SKIP. One N/A among real assertions is not the
+// same shape and does not qualify: an out-of-scope observation beside measured
+// ones is a note, not a scope declaration about the case.
 func (tc TestCaseResult) RollUp() Verdict {
 	worst := Skip
 	unmeasured := false
+	naOnly := len(tc.Assertions) > 0
 	for _, a := range tc.Assertions {
 		if a.Verdict.Severity() > worst.Severity() {
 			worst = a.Verdict
+		}
+		if a.Verdict != VerdictNotApplicable {
+			naOnly = false
 		}
 		if a.Unmeasured() {
 			unmeasured = true
@@ -191,6 +312,9 @@ func (tc TestCaseResult) RollUp() Verdict {
 	}
 	if unmeasured && worst.Severity() < Warn.Severity() {
 		return Warn
+	}
+	if naOnly && worst.Severity() == Skip.Severity() {
+		return VerdictNotApplicable
 	}
 	return worst
 }
@@ -242,6 +366,50 @@ type RunMeta struct {
 	Started  time.Time `json:"started"`
 	Finished time.Time `json:"finished"`
 	DUT      DUT       `json:"dut"`
+	// Campaign is the declared campaign this bundle is evidence FOR, and
+	// whether it is GATING. Absent on an exploratory run and on every bundle
+	// written before campaigns existed, which is the same thing said twice:
+	// a bundle with no campaign record is not evidence for any campaign.
+	//
+	// A CI gate reads this field rather than parsing Command, because the
+	// question "may this bundle decide a release?" must not be answerable only
+	// by re-lexing a shell line.
+	Campaign *CampaignRecord `json:"campaign,omitempty"`
+	// Candidate is the candidate manifest this run was measured against: the
+	// declaration of what the DUT claims to be. Absent when no manifest was
+	// supplied.
+	Candidate *CandidateRef `json:"candidate,omitempty"`
+}
+
+// CampaignRecord is the campaign a run declared, as the bundle carries it.
+type CampaignRecord struct {
+	// Name is the campaign key ("csip", "mbaps", "modbus-client"), empty on an
+	// exploratory run.
+	Name string `json:"name,omitempty"`
+	// Suites are the suites the campaign expanded to, recorded so a reader can
+	// see the selection without re-deriving it from a table that may since have
+	// changed.
+	Suites []string `json:"suites,omitempty"`
+	// Authority is the DUT arbitration posture the campaign REQUIRED, and
+	// AuthorityObserved is what was actually read off the live DUT before case
+	// one. Both present means the precondition was proven, not assumed.
+	Authority         string `json:"authority,omitempty"`
+	AuthorityObserved string `json:"authority_observed,omitempty"`
+	// Gating records whether this run may decide anything. It is written even
+	// when false — no omitempty — because "this bundle is not gating" is a fact
+	// a reader needs stated, not inferred from a missing key.
+	Gating bool `json:"gating"`
+	// Exploratory records why a run is non-gating, when it is.
+	Exploratory string `json:"exploratory,omitempty"`
+}
+
+// CandidateRef identifies the candidate manifest a run was measured against.
+// The digest is what makes it checkable: the manifest file itself is copied into
+// the bundle, so a reader can hash the copy and compare.
+type CandidateRef struct {
+	Path    string `json:"path"`
+	SHA256  string `json:"sha256"`
+	Profile string `json:"profile,omitempty"`
 }
 
 // Bundle is the machine-checkable half of an evidence bundle: exactly what
@@ -279,7 +447,13 @@ type BundleFiles struct {
 }
 
 // Counts tallies the test cases by verdict.
-func (b *Bundle) Counts() (pass, fail, skip, warn int) {
+//
+// N/A is returned SEPARATELY from skip rather than folded into it. Folding was
+// the original defect: a campaign's headline read "0 PASS / 0 FAIL / 61 SKIP"
+// over a run in which fifty-odd of those rows had never been in scope, and the
+// eleven that were genuinely unmeasured — the only ones anyone could act on —
+// were invisible inside the same number.
+func (b *Bundle) Counts() (pass, fail, skip, warn, na int) {
 	for _, c := range b.Cases {
 		switch c.Verdict {
 		case Pass:
@@ -290,6 +464,8 @@ func (b *Bundle) Counts() (pass, fail, skip, warn int) {
 			skip++
 		case Warn:
 			warn++
+		case VerdictNotApplicable:
+			na++
 		}
 	}
 	return
@@ -309,13 +485,17 @@ func (b *Bundle) Counts() (pass, fail, skip, warn int) {
 //
 // certify.RunReport.OK applies the identical rule, so the live run and the
 // bundle written from it cannot disagree.
+// A case declared NOT APPLICABLE is neither a pass nor a failure and cannot
+// decide this either way: it contributes nothing to app.Fail, and it does not
+// count towards the "at least one case" floor. A bundle whose every row was out
+// of scope has established nothing, and must not report itself clean.
 func (b *Bundle) OK() bool {
-	app, _ := b.CountsByClaim()
-	return len(b.Cases) > 0 && app.Fail == 0
+	app, inf := b.CountsByClaim()
+	return app.InScope()+inf.InScope() > 0 && app.Fail == 0
 }
 
 // VerdictCounts is a per-verdict tally of test cases.
-type VerdictCounts struct{ Pass, Fail, Skip, Warn int }
+type VerdictCounts struct{ Pass, Fail, Skip, Warn, NotApplicable int }
 
 func (v *VerdictCounts) add(k Verdict) {
 	switch k {
@@ -327,11 +507,19 @@ func (v *VerdictCounts) add(k Verdict) {
 		v.Skip++
 	case Warn:
 		v.Warn++
+	case VerdictNotApplicable:
+		v.NotApplicable++
 	}
 }
 
 // Total is the number of cases in the tally.
-func (v VerdictCounts) Total() int { return v.Pass + v.Fail + v.Skip + v.Warn }
+func (v VerdictCounts) Total() int { return v.Pass + v.Fail + v.Skip + v.Warn + v.NotApplicable }
+
+// InScope is the number of cases in the tally that were in scope at all — the
+// total less the ones declared not applicable. It is what a completion
+// percentage must be taken over: a campaign that ran every row it claimed is
+// complete whether or not the catalog also contained rows nobody claimed.
+func (v VerdictCounts) InScope() int { return v.Total() - v.NotApplicable }
 
 // CountsByClaim splits the tally into the cases that bear on the certification
 // CLAIM (TestCaseResult.Applicable) and the INFORMATIVE ones the suite

@@ -118,7 +118,7 @@ func TestBundleOK_ExcludesNonCertifiableFailures(t *testing.T) {
 			"contain cannot decide it")
 	}
 	// The failure is re-attributed, never hidden.
-	_, fail, _, _ := b.Counts()
+	_, fail, _, _, _ := b.Counts()
 	if fail != 1 {
 		t.Errorf("Counts() = %d FAIL, want 1", fail)
 	}

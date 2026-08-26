@@ -192,7 +192,7 @@ func (c *cli) runCapabilities(stdout io.Writer) int {
 		"capture": !c.opts.NoCapture,
 		"keylog":  c.opts.KeyLogPath != "",
 		"gridsim": c.opts.Targets.GridSimAdmin != "",
-		"gateway": c.opts.GatewaySSH != "",
+		"gateway": c.opts.GatewaySSH != "" || c.opts.GatewayExec != "",
 		"pki":     c.opts.PKIDir != "",
 		"bench":   c.opts.Targets.Gateway != "",
 	}
@@ -203,7 +203,7 @@ func (c *cli) runCapabilities(stdout io.Writer) int {
 		"capture": "a capture is running (off with -no-capture)",
 		"keylog":  "-keylog <path>, and a binary built with -tags keylog",
 		"gridsim": "-gridsim-admin <url>",
-		"gateway": "-gateway-ssh <dest> (READ-ONLY introspection)",
+		"gateway": "-gateway-ssh <dest> or -gateway-exec <prefix> (READ-ONLY introspection)",
 		"pki":     "-pki <dir>",
 		"bench":   "-target / -gateway <host:port>",
 	}
