@@ -123,7 +123,12 @@ func contains(s, sub string) bool {
 
 // runCheck selects exactly one catalog uid, binds it to check, and runs it
 // against dev with a synthetic capture of the exchange.
-func runCheck(t *testing.T, uid string, check certify.Check, dev *device, params map[string]string) runOutcome {
+//
+// The trailing mutators run LAST, after every default this helper sets, so a
+// test that needs one more thing about the RUN — a candidate manifest, a longer
+// timeout — states it as one line instead of forking the harness.
+func runCheck(t *testing.T, uid string, check certify.Check, dev *device, params map[string]string,
+	mut ...func(*certify.Options)) runOutcome {
 	t.Helper()
 
 	cat, err := certify.LoadDefault()
@@ -168,6 +173,9 @@ func runCheck(t *testing.T, uid string, check certify.Check, dev *device, params
 	opts.Capturer = &fakeCapture{
 		path:  filepath.Join(t.TempDir(), "run.pcap"),
 		build: dev.synthesise,
+	}
+	for _, m := range mut {
+		m(&opts)
 	}
 
 	run, err := certify.New(reg, cat, opts)

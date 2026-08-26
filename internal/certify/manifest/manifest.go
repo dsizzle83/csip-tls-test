@@ -30,6 +30,13 @@
 // rather than silently decoding to a zero that then reads as a genuine
 // declaration of "zero DERs" or "port 0".
 //
+// Exactly one key is OPTIONAL — secure_sunspec.frame_budget_ms — and the two
+// rules do not soften for it. Absent, it is silence and NOTHING is recorded;
+// present, it is validated against the same [1, 60000] ms range cmd/mbaps
+// itself enforces. "Optional" here means the DOCUMENT may omit it, never that a
+// reader may invent one: see SecureSunSpec.FrameBudget for why the default
+// belongs to the check that has to decide what an undeclared budget means.
+//
 // That distinction is the reason this file has two types for one document.
 // [raw] decodes with pointers, where absent and zero are different; [Manifest]
 // is what everything else consumes, with plain values that are known to have
@@ -52,6 +59,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 // DefaultDUTPath is where the product installs the manifest on the device. It is
@@ -91,6 +99,47 @@ type SecureSunSpec struct {
 	Transport string
 	// Port is the northbound listener's port.
 	Port int
+	// FrameBudgetMS is the DUT's MBAP FRAME BUDGET in milliseconds: how long
+	// its northbound listener will hold a connection open waiting for the rest
+	// of a frame whose MBAP header has already promised a length, before it
+	// gives up and closes (lexa-gw configs/mbaps.json limits.frame_budget_ms,
+	// cmd/mbaps Config, internal/listener Server.FrameBudget).
+	//
+	// OPTIONAL, and the only optional key in this document. It is here because
+	// SS-MODBUS-CONF v1.4 §2.7.7 (TCP-2, Partial Request) specifies NO timing
+	// at all, and a harness that guesses one measures its own guess: pause too
+	// briefly after the truncated frame and the follow-up ADU is byte-for-byte
+	// indistinguishable from TCP-3's required segment reassembly — the same two
+	// writes on the same connection, and a conformant server that reassembles
+	// them is then recorded as having mis-parsed. The budget is the DUT's own
+	// number and only the candidate can state it.
+	//
+	// ZERO MEANS NOT DECLARED. Read it through FrameBudget, which returns that
+	// as a second value rather than as a duration of nought — the whole reason
+	// this package decodes through pointers.
+	FrameBudgetMS int
+}
+
+// MaxFrameBudgetMS is the largest budget this reader accepts, mirroring
+// lexa-gw cmd/mbaps's own maxFrameBudgetMS. A manifest declaring more than a
+// minute is far likelier to be seconds written as milliseconds than a listener
+// that really waits that long, and a TCP-2 pause derived from it would stall
+// the campaign rather than measure the DUT.
+const MaxFrameBudgetMS = 60000
+
+// FrameBudget returns the declared MBAP frame budget, and whether one was
+// declared at all.
+//
+// The two-value form is the point: a caller must not be able to reach a budget
+// of zero and treat it as a real number. There is no default here on purpose —
+// what an undeclared budget means is a decision about EVIDENCE, and it belongs
+// to the check that has to decide it (see suitemodbusserver's TCP-2), not to
+// the reader of a declaration that does not contain one.
+func (s SecureSunSpec) FrameBudget() (time.Duration, bool) {
+	if s.FrameBudgetMS <= 0 {
+		return 0, false
+	}
+	return time.Duration(s.FrameBudgetMS) * time.Millisecond, true
 }
 
 // ModbusClient is the southbound (DER-facing) Modbus client declaration.
@@ -204,6 +253,9 @@ type raw struct {
 		Roles     []string `json:"roles"`
 		Transport *string  `json:"transport"`
 		Port      *int     `json:"port"`
+		// OPTIONAL — see SecureSunSpec.FrameBudgetMS. Absent is a legal
+		// manifest; present-and-out-of-range is not.
+		FrameBudgetMS *int `json:"frame_budget_ms"`
 	} `json:"secure_sunspec"`
 	ModbusClient *struct {
 		Transport   *string `json:"transport"`
@@ -309,6 +361,21 @@ func Parse(data []byte, path string) (*Manifest, error) {
 		m.SecureSunSpec.Port = p.reqInt(r.SecureSunSpec.Port, "secure_sunspec.port", 1)
 		if m.SecureSunSpec.Port > 65535 {
 			p.addf("secure_sunspec.port is %d, which is not a TCP port", m.SecureSunSpec.Port)
+		}
+		// OPTIONAL: absent is silence, not a declaration, and nothing is
+		// recorded. Present, it must be a budget the product could actually
+		// hold — the same [1, 60000] ms range cmd/mbaps validates, so a
+		// manifest this reader accepts is one the DUT would also accept.
+		if fb := r.SecureSunSpec.FrameBudgetMS; fb != nil {
+			switch {
+			case *fb < 1:
+				p.addf("secure_sunspec.frame_budget_ms is %d; it is OPTIONAL, but a declared budget must "+
+					"be at least 1 ms — omit the key to declare nothing", *fb)
+			case *fb > MaxFrameBudgetMS:
+				p.addf("secure_sunspec.frame_budget_ms is %d, above the %d ms cmd/mbaps itself accepts "+
+					"(limits.frame_budget_ms); seconds written as milliseconds is the usual cause", *fb, MaxFrameBudgetMS)
+			}
+			m.SecureSunSpec.FrameBudgetMS = *fb
 		}
 	}
 

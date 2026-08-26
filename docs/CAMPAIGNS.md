@@ -179,14 +179,16 @@ declaration of what the DUT claims to be. The product installs it at
   "profile": "one-to-one-7xx-tcp",
   "topology": {"configured_der": 1, "role": "inverter", "northbound_units": [1]},
   "csip": {"role": "der-client", "end_devices": 1, "der_resources": 1},
-  "secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802},
+  "secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802,
+                     "frame_budget_ms": 2000},
   "modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx"},
   "authority_profiles": ["csip", "mbaps"],
   "models": [1, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712]
 }
 ```
 
-Every key is required. Vocabularies: `topology.role` ∈ inverter|battery|meter ·
+Every key is required **except `secure_sunspec.frame_budget_ms`** (§4.1).
+Vocabularies: `topology.role` ∈ inverter|battery|meter ·
 `csip.role` ∈ der-client|der-aggregator-client · `secure_sunspec.roles` ⊆
 server|client · `secure_sunspec.transport` ∈ tls-tcp · `modbus_client.transport`
 ∈ tcp|rtu|rtuovertcp · `modbus_client.generation` ∈ 1xx|7xx|8xx ·
@@ -203,6 +205,73 @@ refuses a manifest that contradicts itself (`configured_der` vs
 The manifest file is copied into the bundle beside its sha256, so a reader can
 hash the copy in front of them and confirm the scope decisions were made against
 it.
+
+### 4.1 `secure_sunspec.frame_budget_ms` — the one optional key, and why it exists
+
+The DUT's **MBAP frame budget**: how long its northbound listener holds a
+connection open waiting for the rest of a frame whose MBAP header has already
+promised a length, before it gives up and closes. On the product side it is
+`limits.frame_budget_ms` in `configs/mbaps.json` (`cmd/mbaps` Config,
+`internal/listener` `Server.FrameBudget`); the deployed value and the default
+are both **2000**.
+
+It is here because **SS-MODBUS-CONF v1.4 TCP-2 and TCP-3 put the same bytes on
+the wire, and only the pause tells them apart.** Both send part of an MBAP frame,
+pause, then send more bytes on the same connection:
+
+| | pause | what the second write is |
+|---|---|---|
+| **TCP-3** §2.7.8 | 20 ms — *inside* any budget | the rest of ONE request; reassembling it is the pass criterion |
+| **TCP-2** §2.7.7 | budget + margin — *past* the budget | a NEW request; splicing it onto the first is the failure |
+
+Neither section specifies any timing at all. The harness used to pause 200 ms,
+which is shorter than any deployed budget — so a conformant server still
+assembling the first frame (exactly what TCP-3 *requires* it to do) spliced the
+second write on and answered under the first frame's transaction id, and the
+harness recorded that as a defect. The number has to come from the device, and
+this is where the device states it.
+
+`certify` adds a **≥ 500 ms margin** on top (`suitemodbusserver.TCP2Margin`).
+The budget is when the DUT *decides*; the margin is the slack between that
+decision and the harness observing it, and a pause of exactly the budget races
+the transition it is trying to observe.
+
+**Absent, the two run kinds answer differently, on purpose:**
+
+* a **campaign** refuses to run TCP-2 — the row FAILs naming the key. Guessing
+  the budget would publish the guess as a measurement, and the guess decides the
+  verdict.
+* an **exploratory** run falls back to 2000 ms + the margin and says so loudly —
+  in the notes, in the assertion's note, and in the run log — because that
+  assumption is about a *different* device than the one on the socket. An
+  exploratory bundle is marked NOT GATING anyway.
+
+Present, it is validated against the same `[1, 60000]` ms range `cmd/mbaps`
+itself enforces, so a manifest this reader accepts is one the DUT would accept.
+Strictness is unchanged elsewhere: a misspelling of the optional key is still an
+unknown key, and still an error.
+
+### 4.2 TCP-2's three outcomes
+
+§2.7.7's criteria are that the device RECOVERS from the incomplete request — it
+does not hang and does not mis-parse the following one — and that the following
+complete request receives a successful response. It is silent on whether the
+second request may go on the same connection and on whether the DUT may close
+the connection after the partial one, and the catalog's own note directs that
+the close be recorded as an **observation rather than a failure**.
+
+| observed | verdict |
+|---|---|
+| the follow-up answered on the **same connection**, echoing its own transaction id | **PASS** — the server discarded the partial frame and resynchronised. Also conformant to the literal text, and the stricter reading. |
+| the DUT **closed the connection** at its budget, and a complete request on a **fresh connection** was answered normally | **PASS**, with the close carried as the §2.7.7 observation. This is lexa-gw's shape, and it was previously graded WARN — a device doing exactly what the procedure permits, published as a partial result. |
+| a response under the **truncated frame's** transaction id | **FAIL** — the DUT spliced the follow-up onto the partial frame: the following request was MIS-PARSED. Past the DUT's own budget this can no longer be confused with TCP-3's reassembly. |
+| no answer on either connection | **FAIL** — the following complete request received no successful response. |
+
+A stale-id answer is **not** followed by a fresh-connection attempt: the DUT has
+already answered, wrongly, and opening a second connection there would only put a
+successful exchange beside a failure and invite it to be read as recovery.
+
+TCP-3 is untouched: its 20 ms split is safe under every budget by construction.
 
 ### Topology preflight
 

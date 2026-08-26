@@ -15,7 +15,12 @@ package suitemodbusserver
 // and it is tested for every check that writes.
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"csip-tls-test/internal/certify"
 )
@@ -369,19 +374,213 @@ func TestTCP3FailsADeviceThatDoesNotReassemble(t *testing.T) {
 	o.wantVerdict(t, certify.Fail)
 }
 
-func TestTCP2PassesADeviceThatRecoversOnTheSameConnection(t *testing.T) {
-	dev := newDevice(t, deviceOpts{})
-	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-2", checkTCP2, dev, nil)
-	// The loopback device consumes the truncated frame's promised bytes from
-	// the follow-up request, which is a legitimate MBAP implementation and is
-	// exactly the "no usable response on the same connection" branch. The
-	// procedure's criterion is then met on a fresh connection.
-	if o.Case.Verdict != certify.Pass && o.Case.Verdict != certify.Warn {
-		t.Fatalf("verdict = %s, want PASS or WARN\n%s", o.Case.Verdict, o.dump())
+// --- TCP-2's three outcomes, and the pause that separates them --------------
+//
+// TCP-2 and TCP-3 put the same bytes on the same connection; only the PAUSE
+// tells them apart (see checks_tcp.go's header). So the device below is given a
+// real FRAME BUDGET, and every row here turns on whether the check waited past
+// it. A test suite that only exercised the verdict mapping would pass just as
+// well against the 200 ms constant this check used to carry, which is the exact
+// defect these rows exist to hold closed.
+
+// tcp2Budget is the fake device's frame budget in these tests. It is longer
+// than TCP2Margin on purpose: that is what makes a manifest declaring a TINY
+// budget produce a pause SHORTER than the device's own, which is the mutation
+// the last test drives.
+const tcp2Budget = 1200 * time.Millisecond
+
+// withManifest writes a candidate manifest declaring frameBudgetMS (0 = the key
+// omitted) and points the run at it.
+func withManifest(t *testing.T, frameBudgetMS int) func(*certify.Options) {
+	t.Helper()
+	budget := ""
+	if frameBudgetMS > 0 {
+		budget = fmt.Sprintf(`, "frame_budget_ms": %d`, frameBudgetMS)
 	}
+	body := fmt.Sprintf(`{
+  "profile": "one-to-one-7xx-tcp",
+  "topology": {"configured_der": 1, "role": "inverter", "northbound_units": [1]},
+  "csip": {"role": "der-client", "end_devices": 1, "der_resources": 1},
+  "secure_sunspec": {"roles": ["server"], "transport": "tls-tcp", "port": 802%s},
+  "modbus_client": {"transport": "tcp", "device_count": 1, "generation": "7xx"},
+  "authority_profiles": ["csip", "mbaps"],
+  "models": [1, 701, 702, 703, 704, 705, 706, 711, 712]
+}`, budget)
+	path := filepath.Join(t.TempDir(), "candidate.json")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return func(o *certify.Options) { o.ManifestPath = path }
+}
+
+// OUTCOME 1 — the follow-up answered on the SAME connection.
+//
+// The device has a frame budget and resynchronises when it expires. The check
+// declares 2000 ms, waits 2500 ms, and the device has long since dropped the
+// partial frame — so the follow-up is a new request and is answered under its
+// own transaction id. A server that resynchronises is conformant to §2.7.7's
+// literal text, and this is the stricter of the two passing shapes.
+func TestTCP2PassesADeviceThatRecoversOnTheSameConnection(t *testing.T) {
+	dev := newDevice(t, deviceOpts{FrameBudget: tcp2Budget})
+	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-2", checkTCP2, dev, nil, withManifest(t, 2000))
+	o.wantVerdict(t, certify.Pass)
+
 	a := o.assertion(t, "incomplete Modbus request really was sent")
 	if a.Verdict != certify.Pass || !contains(a.Observed, "promises") {
 		t.Fatalf("the truncation was not evidenced on the wire: %s / %s", a.Verdict, a.Observed)
+	}
+	if !contains(a.Note, "declared MBAP frame budget") {
+		t.Errorf("the bundle does not record where the pause came from; note = %q", a.Note)
+	}
+	if b := o.assertion(t, "no Modbus response was returned under the truncated frame"); b.Verdict != certify.Pass {
+		t.Errorf("the stale-transaction-id criterion = %s / %s", b.Verdict, b.Observed)
+	}
+	c := o.assertion(t, "after an incomplete request the DUT recovers")
+	if c.Verdict != certify.Pass || !contains(c.Observed, "same connection") {
+		t.Fatalf("the criterion = %s / %s", c.Verdict, c.Observed)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+// OUTCOME 2 — the DUT closes the connection at its budget, and a FRESH
+// connection is answered normally.
+//
+// This is lexa-gw's own shape, and it was graded WARN: a device doing exactly
+// what §2.7.7 permits, published as a partial result. The catalog's own note
+// says the close is "an observation rather than a failure", so it is a PASS
+// carrying that observation.
+func TestTCP2PassesADeviceThatClosesAfterThePartialAndRecoversOnAFreshConnection(t *testing.T) {
+	dev := newDevice(t, deviceOpts{NoReassembly: true})
+	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-2", checkTCP2, dev, nil, withManifest(t, 2000))
+	o.wantVerdict(t, certify.Pass)
+
+	a := o.assertion(t, "after an incomplete request the DUT recovers")
+	if a.Verdict != certify.Pass {
+		t.Fatalf("close-after-partial + fresh-connection recovery = %s / %s\n%s", a.Verdict, a.Observed, o.dump())
+	}
+	if !contains(a.Observed, "fresh connection") {
+		t.Errorf("the recovery citation does not name the fresh connection: %q", a.Observed)
+	}
+	if !contains(a.Note, "OBSERVATION rather than as a failure") {
+		t.Errorf("the connection-close observation §2.7.7 asks for is not recorded; note = %q", a.Note)
+	}
+	if !contains(a.Observed, "closed the connection") {
+		t.Errorf("the close itself is not in the record: %q", a.Observed)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+// OUTCOME 3 — a response under the TRUNCATED frame's transaction id.
+//
+// The default device has no frame budget at all: it holds the partial frame
+// forever and splices whatever arrives next onto it. After a 2500 ms pause that
+// can no longer be confused with TCP-3's reassembly — nothing in §2.7.8 asks a
+// server to keep assembling for two and a half seconds — so it is the mis-parse
+// §2.7.7 names, and it FAILS.
+func TestTCP2FailsADeviceThatAnswersUnderTheStaleTransactionID(t *testing.T) {
+	dev := newDevice(t, deviceOpts{})
+	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-2", checkTCP2, dev, nil, withManifest(t, 2000))
+	o.wantVerdict(t, certify.Fail)
+
+	a := o.assertion(t, "no Modbus response was returned under the truncated frame")
+	if a.Verdict != certify.Fail {
+		t.Fatalf("the splice was not reported: %s / %s\n%s", a.Verdict, a.Observed, o.dump())
+	}
+	if !contains(a.Observed, "MIS-PARSED") {
+		t.Errorf("the failure does not say what went wrong: %q", a.Observed)
+	}
+	// And it must not be dressed up as recovery: a second connection is not
+	// opened after the DUT has already answered wrongly.
+	if contains(o.Case.Notes, "fresh connection") {
+		t.Errorf("a stale-id answer was followed by a fresh-connection attempt: %q", o.Case.Notes)
+	}
+}
+
+// THE PAUSE IS THE EXPERIMENT — the mutation proof.
+//
+// Same device, same budget, same everything except the DECLARED budget: 1 ms,
+// so the check waits 501 ms and the device is still assembling. The follow-up's
+// bytes are consumed as the truncated frame's missing tail and the answer comes
+// back under the stale id — a CONFORMANT, resynchronising device recorded as
+// mis-parsing, purely because the harness did not wait.
+//
+// This is what the old 200 ms constant did to every device with a frame budget,
+// and it is why the number comes from the candidate rather than from this file.
+func TestTCP2MisreadsAConformantDeviceWhenThePauseIsShorterThanItsBudget(t *testing.T) {
+	dev := newDevice(t, deviceOpts{FrameBudget: tcp2Budget})
+	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-2", checkTCP2, dev, nil, withManifest(t, 1))
+	if o.Case.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s, want FAIL — the point of this row is that too short a pause DOES "+
+			"misread a conformant device, so the pause has to come from the device's own declaration\n%s",
+			o.Case.Verdict, o.dump())
+	}
+	if !contains(o.Case.Notes, "still assembling") {
+		t.Errorf("the misreading is not explained: %q", o.Case.Notes)
+	}
+}
+
+// A CAMPAIGN refuses to guess the budget.
+//
+// Driven directly rather than through the runner: the refusal is made before a
+// socket is opened, which is the property being pinned — a row that cannot be
+// decided must not spend a connection, and its refusal must not be confusable
+// with a bench that was merely unreachable.
+func TestTCP2RefusesToRunInACampaignWithNoDeclaredFrameBudget(t *testing.T) {
+	cat, err := certify.LoadDefault()
+	if err != nil {
+		t.Skipf("no committed catalog: %v", err)
+	}
+	c, ok := cat.ByUID("ss-modbus-conf-v1.4::TCP-2")
+	if !ok {
+		t.Fatal("the committed catalog has no TCP-2")
+	}
+	// Targets deliberately point at an address nothing is listening on: if the
+	// refusal did not come first, this would be a dial failure instead.
+	rc := &certify.RunCtx{
+		Case: c, Suite: SuiteName, Log: certify.DiscardLogger,
+		Targets: certify.Targets{Gateway: "127.0.0.1:1", GatewayHost: "127.0.0.1"},
+	}
+	if err := rc.SetPosture(certify.Posture{Campaign: certify.CampaignMBAPS}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := checkTCP2(context.Background(), rc)
+	if err != nil {
+		t.Fatalf("checkTCP2 = %v, want a refusal Result rather than an error", err)
+	}
+	if res.Verdict != certify.Fail {
+		t.Fatalf("verdict = %s, want FAIL", res.Verdict)
+	}
+	for _, want := range []string{"frame_budget_ms", "§2.7.7", "TCP-3"} {
+		if !contains(res.Notes, want) {
+			t.Errorf("the refusal does not mention %q: %s", want, res.Notes)
+		}
+	}
+}
+
+// An EXPLORATORY run falls back to the documented product default, LOUDLY.
+func TestTCP2FallsBackToTheDocumentedDefaultOutsideACampaign(t *testing.T) {
+	dev := newDevice(t, deviceOpts{FrameBudget: tcp2Budget})
+	// No -manifest at all: the pre-manifest shape, which must still run.
+	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-2", checkTCP2, dev, nil)
+	o.wantVerdict(t, certify.Pass)
+
+	a := o.assertion(t, "incomplete Modbus request really was sent")
+	if !contains(a.Note, "declares no") || !contains(a.Note, "DIFFERENT DEVICE") {
+		t.Errorf("the assumed budget is not disclosed in the bundle; note = %q", a.Note)
+	}
+	o.wantVerifiableBundle(t)
+}
+
+// TCP-3 is unchanged by any of this. Its 20 ms split is safe under every frame
+// budget by construction, and it must keep passing against a device that has
+// one — the same device TCP-2 above resynchronises against.
+func TestTCP3IsUnaffectedByADeviceWithAFrameBudget(t *testing.T) {
+	dev := newDevice(t, deviceOpts{FrameBudget: tcp2Budget})
+	o := runCheck(t, "ss-modbus-conf-v1.4::TCP-3", checkTCP3, dev, nil, withManifest(t, 2000))
+	o.wantVerdict(t, certify.Pass)
+	a := o.assertion(t, "genuinely arrived at the DUT in more than one piece")
+	if a.Verdict != certify.Pass {
+		t.Fatalf("the split did not survive to the synthetic wire: %s / %s", a.Verdict, a.Observed)
 	}
 	o.wantVerifiableBundle(t)
 }

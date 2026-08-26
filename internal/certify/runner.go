@@ -78,6 +78,12 @@ type Options struct {
 	// to produce a GATING bundle; everything else is exploratory. See
 	// campaign.go.
 	Campaign Campaign
+	// Evidence arms the EVIDENCE POSTURE (-evidence): the run must produce a
+	// submission-grade artefact, so every bench precondition that artefact
+	// depends on is PROVEN before case 1 instead of being discovered missing
+	// when the artefact is assembled. It is a modifier on -campaign, never a
+	// selection of its own. See preflight_evidence.go.
+	Evidence bool
 	// ManifestPath is the candidate manifest (-manifest): the DUT's own
 	// declaration of what it is, against which scope decisions are made.
 	// REQUIRED with Campaign, optional otherwise, and a run without one makes
@@ -1063,6 +1069,13 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		// Cannot fail on a freshly built context; AttachWindow only refuses a
 		// SECOND window, which is the invariant it exists to hold.
 		if err := rc.AttachWindow(win); err != nil {
+			panic(err)
+		}
+		// Likewise: SetPosture only refuses a SECOND posture. What the run
+		// CLAIMS to be is part of what a check is handed, because a few rows
+		// are graded to a stricter standard under a campaign or an evidence
+		// run — see Posture.
+		if err := rc.SetPosture(Posture{Campaign: r.campaign.Name, Evidence: r.opts.Evidence}); err != nil {
 			panic(err)
 		}
 		res := r.execute(ctx, p, rc, win)
