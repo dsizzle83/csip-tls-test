@@ -242,6 +242,47 @@ A row can become N/A two ways, and the bundle records **which**:
 | `manifest` | the candidate does not claim what the row is about. Today the one active axis is the Secure SunSpec **direction**: a `dut_role: mbaps-client` row against a manifest whose `secure_sunspec.roles` lacks `client`. |
 | `pics` | reserved for a PICS-sourced declaration. |
 
+### The same axis, one grain finer: `N/A` on an ASSERTION
+
+The catalog's `dut_role` is one scalar per case, so it can take a whole
+`mbaps-client` row out of scope and can say nothing about the row that is
+*mostly* about the server and carries one client-procedure criterion inside it.
+SSM-CONF-v0.8 is full of those: its Table 1 marks 20 of the rows this bench
+implements **Both**, and each splits into a `2.x.y.1 Server Procedure` and a
+`2.x.y.2 Client Procedure`.
+
+Against `"secure_sunspec": {"roles": ["server"]}` those inner `[C]` criteria used
+to run anyway — waiting out the gateway's southbound poll interval for a
+ClientHello whose conformance the candidate never claimed, then recording a SKIP
+indistinguishable from an evidence gap. CRYP-001 is the worked example: six
+server assertions PASS and assertion 7 SKIPs, and the row reads as unfinished
+work about a direction the device does not have.
+
+`internal/certify/suitessm/roles.go` gives every SSM assertion an explicit
+direction (`server` / `client` / `both`) in the suite's own table, transcribed
+from Table 1's Role column and from which procedure subsection each assertion
+implements. When `RunCtx.RoleClaimed("client")` is false:
+
+* the client-direction assertions are reported `N/A`, source `manifest`, with a
+  reason naming the unclaimed role and the candidate profile — the claim and the
+  method survive so a reader sees *which* criterion was excluded, the citation
+  digest does not, because nothing was measured;
+* an observation the bench happened to make anyway is carried in the note rather
+  than discarded;
+* the check does **not** pay for the direction: no endpoint is claimed, no
+  `drop_session` fault is armed on the device sim, and no poll interval is waited
+  out;
+* the row rolls up on its remaining server assertions, so a case whose server
+  half all passes reports **PASS** rather than **WARN**.
+
+A run with **no** `-manifest` is unchanged: `RoleClaimed` answers true for every
+role, and every `[C]` half is asserted exactly as before.
+
+The table is drift-guarded. `TestEverySSMAssertionCarriesARole` parses the
+suite's own sources and fails if a claim carrying the document's `[C]:` marker
+is not accounted for by a client-direction rule of the case that mints it, or if
+a rule matches no claim that still exists.
+
 Rules the verifier enforces:
 
 * an N/A row **must** carry a reason and a recognised source — an unexplained

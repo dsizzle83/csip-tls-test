@@ -153,6 +153,38 @@ A `CGO_ENABLED=0` build also works and is not a lie — `-list`, `-dry-run`,
 `-verify` and `-report` are fully functional and every plaintext-transport check
 runs; only the mbaps transport is absent, and the checks that need it say so.
 
+**One thing the ordinary build gained a stack for.** SSM-CONF-v0.8 mandates six
+cipher suites and two of them use AES-CCM — `0xC0AE`
+`TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8` and `0x1304` `TLS_AES_128_CCM_SHA256`. Go's
+`crypto/tls` implements no CCM cipher at all, so the SSM suite could take a
+CCM handshake as far as the DUT's ServerHello and no further, and CRYP-001 and
+CRYP-002 each carried a standing `WARN` saying the selection was asserted and no
+session was. §2.5.1.3's criterion is "the EUT-S successfully **establishes a
+secure session** using each of the mandatory TLS v1.2 cipher suites", so that
+was a gap on a MUST row, published on every run.
+
+`internal/tlsprobe` closes it: a small independent wolfSSL client, pinnable to
+one suite at one version, that completes the mTLS handshake with the harness's
+`-pki certs/mbaps` fixtures and carries a SunSpec Model 1 read (FC 0x03 at the
+SunSpec base) inside the tunnel. It reports the negotiated version and suite, the
+peer leaf, and where its secrets went. CRYP-001 and CRYP-002 now assert an
+ESTABLISHED session on each mandated suite, cited from the capture on the
+conversation's own ServerHello and full handshake flight.
+
+In a `CGO_ENABLED=0` build the probe is not linked in, and the two non-CCM
+suites fall back to `crypto/tls` while the CCM ones report — precisely, and as a
+fact about the binary rather than about the device — that no session could be
+established.
+
+The probe verifies the DUT's certificate **in the library** (wolfSSL offers no
+way not to), unlike the suite's `crypto/tls` sessions, which verify in the check
+so the result is an observation. So a handshake it cannot complete is classified
+before it is reported: a failure whose wolfSSL reason says *this side refused the
+peer's certificate* (no trust anchor, an `extendedKeyUsage` naming no
+`serverAuth`, an expired leaf) is recorded as a bench-side obstacle with the
+reason named, never as "the DUT refused a mandatory cipher suite". The DUT's
+certificate is measured on PKI-003/004/007/008, where a defect belongs.
+
 ### The seven modes
 
 ```bash
