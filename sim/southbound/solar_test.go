@@ -538,6 +538,75 @@ func TestSolarStep_NightCollapsesWWithAnimationStillAlive(t *testing.T) {
 	}
 }
 
+// TestSolarStep_CeasedKeepsSlowClassAliveNotFrozen is the CEASE-path sibling of
+// the becalmed row above, and the regression for MBAPS-MOD4-701. A DER held
+// de-energized — a 2030.5 opModEnergize=false, the ordinary CSIP steady state,
+// which reaches solarStep as a withdrawn contactor (M123 Conn=0) or a withdrawn
+// permit-service — must zero its power outputs WITHOUT freezing every other
+// register. Before the fix the cease branch returned the instant it zeroed
+// output, so W/VA/VAr collapsed AND the slow (thermal) class flatlined, handing
+// a downstream gateway the exact "one frozen register block forever" signature
+// its measurement-freshness detector treats as a wedged device
+// (lexa-gw cmd/modbus/freshness.go tier B: idle is only SUSPECTED when the SLOW
+// class is ALSO frozen). The gateway then masked its northbound Secure SunSpec
+// 701 measurement block to the not-implemented sentinel and MOD-4.701 FAILed on
+// a perfectly healthy, merely-curtailed inverter. A real ceased cabinet keeps
+// drifting thermally; this pins that TmpCab stays alive across ceased ticks.
+func TestSolarStep_CeasedKeepsSlowClassAliveNotFrozen(t *testing.T) {
+	const wmax = 8000.0
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	b := populateSolar(r, wmax, "")
+	var wh uint16
+
+	// Daytime tick first, so the fixture demonstrably HAD live output and a warm
+	// cabinet before it was ceased.
+	solarStep(r, wmax, b, false, 0, 0, false, nil, &wh)
+	if w := int16(r.Get(b.M103Base + sunspec.M103_W)); w <= 0 {
+		t.Fatalf("fixture bug: daytime W = %d, want > 0", w)
+	}
+
+	// Cease via the contactor (M123 Conn=0) — the plain-sim cease trigger — then
+	// step several times at different simTimes.
+	r.Set(b.M123Base+sunspec.M123_Conn, 0)
+	var tmp, snk []float64
+	for i, st := range []float64{100, 200, 300} {
+		solarStep(r, wmax, b, false, st, 0, false, nil, &wh)
+		if w := int16(r.Get(b.M103Base + sunspec.M103_W)); w != 0 {
+			t.Errorf("tick %d: ceased W = %d, want 0 — a de-energized DER produces no power", i, w)
+		}
+		if va := int16(r.Get(b.M103Base + sunspec.M103_VA)); va != 0 {
+			t.Errorf("tick %d: ceased VA = %d, want 0", i, va)
+		}
+		tmp = append(tmp, float64(int16(r.Get(b.M103Base+sunspec.M103_TmpCab)))/10.0)
+		snk = append(snk, float64(int16(r.Get(b.M103Base+sunspec.M103_TmpSnk)))/10.0)
+	}
+
+	allSame := func(xs []float64) bool {
+		for _, x := range xs[1:] {
+			if x != xs[0] {
+				return false
+			}
+		}
+		return true
+	}
+	if allSame(tmp) {
+		t.Error("TmpCab did not move across ceased ticks — a flatlined slow-class point is " +
+			"indistinguishable from freeze_block, and a freshness-aware gateway masks the northbound 701 " +
+			"measurement block to not-implemented (MBAPS-MOD4-701)")
+	}
+	if allSame(snk) {
+		t.Error("TmpSnk did not move across ceased ticks — the derived heatsink point must track TmpCab")
+	}
+	// The paused cease must stay byte-identical to before the fix: replay freezes
+	// the environment on purpose, so a paused+ceased step must NOT drift thermal.
+	r.Set(b.M103Base+sunspec.M103_TmpCab, 999)
+	solarStep(r, wmax, b, true /*paused*/, 400, 0, false, nil, &wh)
+	if got := r.Get(b.M103Base + sunspec.M103_TmpCab); got != 999 {
+		t.Errorf("paused+ceased TmpCab = %d, want 999 (held) — a paused cease must freeze the environment "+
+			"for replay, not drift it", got)
+	}
+}
+
 // TestSolarStep_103WHAccumulatorTracksIntegratedEnergy pins the fix for bench
 // gap 4: Model 103's OWN acc32 accumulator (WH at offsets 22-23, WH_SF at 24)
 // was never written by solarStep — the shared animation step BOTH the plain

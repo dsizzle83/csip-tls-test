@@ -220,6 +220,58 @@ func TestAdv701BecalmedButLiveIsNotIndistinguishableFromFrozen(t *testing.T) {
 	}
 }
 
+// TestAdv701CeasedByPermitServiceKeepsSlowClassAlive is the exact bench shape
+// behind MBAPS-MOD4-701, read through 701. A CSIP opModEnergize=false withdraws
+// permit-service (703 ES=0) on a still-CONNECTED inverter (M123 Conn=1), which
+// solarStep answers by ceasing to energize. Its power points collapse to 0, but
+// the cabinet is still physically present and must keep drifting on its
+// slow-class 701 TmpCab — otherwise the 701 block is fully frozen, the gateway's
+// tier-B freshness check SUSPECTS it, and the northbound 701 measurement block
+// is masked to the not-implemented sentinel (the MOD-4.701 FAIL). This pins the
+// gateway-visible property: across ceased ticks W stays 0 while TmpCab moves.
+func TestAdv701CeasedByPermitServiceKeepsSlowClassAlive(t *testing.T) {
+	ss := newAdvSolar(t, 8000)
+	r, b, adv := ss.Regs, ss.bases, ss.adv
+	var whAcc uint16
+
+	// Daytime tick: permit-service is granted by default, so the inverter runs
+	// and the 701 shows live output and a warm cabinet.
+	solarStep(r, ss.wmaxW, b, false, 0, 0, false, &ss.faults, &whAcc)
+	advMirror701(r, b, adv, ss.wmaxW, ss.varRating, &ss.faults)
+	if m := sunspec.Parse701(readSlice(r, adv.M701, adv.M701Len)); m.W <= 0 {
+		t.Fatalf("fixture bug: daytime 701 W = %v, want > 0", m.W)
+	}
+
+	// Withdraw permit-service (opModEnergize=false) while leaving the contactor
+	// CLOSED — the real bench steady state (Conn=1, St=off).
+	if b.M703Base == 0 {
+		t.Fatal("fixture bug: advanced sim has no 703 model to withdraw permit-service from")
+	}
+	r.Set(b.M703Base+uint16(sunspec.L703.Offset("ES")), 0)
+	if conn := r.Get(b.M123Base + sunspec.M123_Conn); conn != 1 {
+		t.Fatalf("fixture bug: contactor Conn = %d, want 1 (cease is via permit-service, not disconnect)", conn)
+	}
+
+	var tmp []float64
+	for i, st := range []float64{100, 200, 300} {
+		solarStep(r, ss.wmaxW, b, false, st, 0, false, &ss.faults, &whAcc)
+		advMirror701(r, b, adv, ss.wmaxW, ss.varRating, &ss.faults)
+		m := sunspec.Parse701(readSlice(r, adv.M701, adv.M701Len))
+		if m.W != 0 {
+			t.Errorf("tick %d: ceased 701 W = %v, want 0", i, m.W)
+		}
+		if math.IsNaN(m.TmpCab) {
+			t.Fatalf("tick %d: 701 TmpCab reads not-implemented — the slow-class point must stay IMPLEMENTED "+
+				"while ceased, or the whole measurement block masks", i)
+		}
+		tmp = append(tmp, m.TmpCab)
+	}
+	if tmp[0] == tmp[1] && tmp[1] == tmp[2] {
+		t.Error("701 TmpCab did not move across ceased ticks — a fully frozen 701 block is exactly what the " +
+			"gateway's freshness detector masks to not-implemented, failing MOD-4.701 on a healthy DER")
+	}
+}
+
 // TestAdvRaiseAlarm verifies the raise_alarm fault sets the 701 Alrm bitfield
 // that the animation re-stamps each tick, and clearing returns it to 0 (the RTN
 // edge).

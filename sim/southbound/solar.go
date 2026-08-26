@@ -1066,6 +1066,34 @@ func solarZeroOutput(r *RegisterMap, bases SolarBases) {
 	r.Set(bases.M122Base+sunspec.M122_WAval, 0)
 }
 
+// solarAmbientTmp is the slow ambient-temperature swing a cabinet still shows
+// when the inverter has NOTHING to report — no irradiance (becalm/night) or no
+// permission to energize (a ceased DER). Small (±0.3 °C) and slow (a 360 s
+// period), it sits in the neighbourhood of the "0.1 °C / 6 min" slowest-
+// genuine-signal figure a downstream gateway's measurement-freshness design
+// rests on, so the SLOW (thermal) class stays visibly ALIVE even though W has
+// collapsed to zero. One formula, shared by the night branch and the cease
+// path, so the two "alive but idle" states present the identical slow-class
+// signal — a device with nothing to report must never be byte-indistinguishable
+// from one that has stopped reporting.
+func solarAmbientTmp(simTime float64) float64 {
+	return 35.0 + 0.3*math.Sin(2*math.Pi*simTime/360)
+}
+
+// solarDriftThermal advances ONLY the slow (thermal) class — TmpCab and its
+// derived heatsink TmpSnk — on the ambient swing, leaving every power, voltage
+// and frequency register untouched. It is what a ceased-but-present inverter
+// shows over Modbus: zeroed output, held V/Hz, and a cabinet that keeps
+// drifting. The cease path calls it (gated on !paused) so a de-energized DER
+// does not read as a fully frozen block; the running animation writes these
+// same two registers from its own w-derived formula, so nothing calls this on a
+// producing device.
+func solarDriftThermal(r *RegisterMap, bases SolarBases, simTime float64) {
+	tmp := solarAmbientTmp(simTime)
+	r.Set(bases.M103Base+sunspec.M103_TmpCab, uint16(int16(math.Round(tmp*10))))
+	r.Set(bases.M103Base+sunspec.M103_TmpSnk, uint16(int16(math.Round((tmp-5)*10))))
+}
+
 func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, simTime float64, cloud float64, night bool, fc *faultController, whAcc *uint16) {
 	m103Base := bases.M103Base
 	m122Base := bases.M122Base
@@ -1083,6 +1111,28 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 	// (replay injects PV each tick with the sim paused).
 	if r.Get(m123Base+sunspec.M123_Conn) == 0 || !solarPermitService(r, bases) {
 		solarZeroOutput(r, bases)
+		// A ceased inverter is not a WEDGED one. Its power outputs collapse to
+		// zero (solarZeroOutput above), but the physical cabinet is still there
+		// and its temperature keeps drifting with ambient — so freezing every
+		// register the instant it ceases hands a downstream gateway the exact
+		// "one frozen register block forever" signature its measurement-
+		// freshness detector is built to flag (lexa-gw cmd/modbus/freshness.go
+		// tier B: an idle device — nothing to report — is only SUSPECTED when
+		// the SLOW/thermal class is ALSO frozen for the whole run, precisely
+		// because a real idle cabinet still drifts thermally). Before this the
+		// cease path returned here without touching the slow class, so a DER
+		// held de-energized (a 2030.5 opModEnergize=false, the common CSIP
+		// steady state) went fully frozen and the gateway masked its northbound
+		// 701 measurement block to the not-implemented sentinel — the
+		// MBAPS-MOD4-701 FAIL. Keep the slow class alive on the same small, slow
+		// ambient swing the night/becalm branch already uses (solarAmbientTmp),
+		// so a ceased-but-present DER stays distinguishable from a stopped one.
+		// Gated on !paused: replay/mayhem deliberately freeze the environment
+		// (the paused branch below holds V/Hz too), and a paused cease must stay
+		// byte-identical to before.
+		if !paused {
+			solarDriftThermal(r, bases, simTime)
+		}
 		return
 	}
 
@@ -1178,7 +1228,9 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 		// TmpCab stays visibly ALIVE on its own slow-class point even though W
 		// has collapsed to zero. Gated on night so every non-becalmed scenario
 		// (the overwhelming majority) is byte-identical to before this file.
-		tmp = 35.0 + 0.3*math.Sin(2*math.Pi*simTime/360)
+		// solarAmbientTmp is the shared formula the cease path also uses, so a
+		// becalmed device and a ceased one present the identical slow-class swing.
+		tmp = solarAmbientTmp(simTime)
 	}
 	dcw := w * 1.06
 	iph := w / (v * 3)
