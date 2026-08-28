@@ -61,9 +61,9 @@ func TestIgnoredContentKindIsIsolated(t *testing.T) {
 			t.Errorf("kind %q selects %q, which is not a member of the family", kind, s.Name)
 		}
 	}
-	if len(seen) != 6 {
-		t.Errorf("the bench enumerates %d series; the product enumerates five kinds plus the "+
-			"other-bucket (walker.go:977-990)", len(seen))
+	if len(seen) != 7 {
+		t.Errorf("the bench enumerates %d series; the product enumerates six kinds plus the "+
+			"other-bucket (walker.go:977-990, incl. unsupported-event-axis at walker.go:1425)", len(seen))
 	}
 
 	// A kind the bench does NOT enumerate must fall back to the untagged total

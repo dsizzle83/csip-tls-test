@@ -1062,8 +1062,18 @@ func coreResponsesSpec(nonce string) spec {
 		// changeWaitFullCycle's doc.
 		ChangeWait: changeWaitFullCycle,
 		Cleanup: func(ctx context.Context, d *Driver) {
-			_ = d.ClearControls(ctx, 0)
-			_ = d.ClearControls(ctx, 1)
+			// CANCEL-then-DELETE both programs (teardown.go's
+			// releaseProgramControls): server-cancel each control as Cancelled(6)
+			// so a spec-correct DUT that acquired it observes the cancellation,
+			// await a fresh poll so it drops the active event, and only then
+			// DELETE — instead of the event outliving the row
+			// (CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION). The program-1
+			// control this row already server-cancelled mid-flight is skipped by
+			// the cancel (terminal status) and cleared by the delete. Best-effort
+			// recorded-not-fatal; the standing DefaultDERControl is not graded.
+			// Both programs go in ONE call so both are cancelled and both deleted
+			// in the one teardown.
+			_ = d.releaseProgramControls(ctx, 0, 1)
 		},
 		Notes: func(o *Observation) string {
 			return fmt.Sprintf("published an immediate DERControl (%s, opModMaxLimW) and waited %s for "+

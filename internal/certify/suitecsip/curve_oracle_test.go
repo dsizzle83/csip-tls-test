@@ -1084,7 +1084,7 @@ func (f *curveFixture) fingerprint(t *testing.T) string {
 func TestOracleRefusal_NothingMovedIsAPass(t *testing.T) {
 	f := newCurveFixture(t)
 	baseline := f.fingerprint(t)
-	got := oracleRefusal(basic014Binding(), baseline)(context.Background(), f.rc)
+	got := oracleRefusal(basic014Binding(), baseline, refusalLedgerFence{})(context.Background(), f.rc)
 	if got.Verdict != certify.Pass {
 		t.Fatalf("an untouched setpoint axis = %s (%s), want PASS", got.Verdict, got.Observed)
 	}
@@ -1110,7 +1110,7 @@ func TestOracleRefusal_ASouthboundWriteIsStillAFail(t *testing.T) {
 	f.ss.Regs.Set(blk.BaseAddr+uint16(sunspec.L704.Offset("WSetEna")), 1)
 	f.ss.Regs.Set(blk.BaseAddr+uint16(sunspec.L704.Offset("WSetMod")), sunspec.M704_WSetMod_Watts)
 
-	got := oracleRefusal(basic014Binding(), baseline)(context.Background(), f.rc)
+	got := oracleRefusal(basic014Binding(), baseline, refusalLedgerFence{})(context.Background(), f.rc)
 	if got.Verdict != certify.Fail {
 		t.Fatalf("a landed write on a REFUSED axis = %s (%s), want FAIL", got.Verdict, got.Observed)
 	}
@@ -1125,7 +1125,7 @@ func TestOracleRefusal_ASouthboundWriteIsStillAFail(t *testing.T) {
 // state is not an observation. It must not read as a clean refusal.
 func TestOracleRefusal_NoBaselineIsAFail(t *testing.T) {
 	f := newCurveFixture(t)
-	got := oracleRefusal(basic014Binding(), "")(context.Background(), f.rc)
+	got := oracleRefusal(basic014Binding(), "", refusalLedgerFence{})(context.Background(), f.rc)
 	if got.Verdict != certify.Fail {
 		t.Fatalf("a refusal judged with no baseline = %s (%s), want FAIL", got.Verdict, got.Observed)
 	}
@@ -1135,7 +1135,7 @@ func TestOracleRefusal_NoBaselineIsAFail(t *testing.T) {
 // must never read as "nothing was there".
 func TestOracleRefusal_UnreachableDERIsUnavailableNotAPass(t *testing.T) {
 	rc := &certify.RunCtx{Case: &certify.Case{UID: "test::refusal"}, Sims: map[string]*certify.SimClient{}}
-	got := oracleRefusal(basic014Binding(), "WSet=0 W disabled(WSetMod=0)")(context.Background(), rc)
+	got := oracleRefusal(basic014Binding(), "WSet=0 W disabled(WSetMod=0)", refusalLedgerFence{})(context.Background(), rc)
 	if got.Unavailable == "" {
 		t.Fatalf("an unreachable DER returned a verdict (%s: %s) instead of declining", got.Verdict, got.Observed)
 	}

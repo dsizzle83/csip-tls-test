@@ -2714,7 +2714,7 @@ func enabledLabel(on bool) string {
 // fingerprints (oracleFixedW reads the same two). Closing it needs a commanded
 // VALUE on the scalar binding, which is oracleBinding's shape and a separate
 // change.
-func oracleRefusal(b *refusalBinding, baseline string) func(ctx context.Context, rc *certify.RunCtx) Finding {
+func oracleRefusal(b *refusalBinding, baseline string, fence refusalLedgerFence) func(ctx context.Context, rc *certify.RunCtx) Finding {
 	return func(ctx context.Context, rc *certify.RunCtx) Finding {
 		uv, err := oracleUnitView(ctx, rc, oracleSimName)
 		if err != nil {
@@ -2725,6 +2725,17 @@ func oracleRefusal(b *refusalBinding, baseline string) func(ctx context.Context,
 			return unavailable("the DER's own register image carries nothing a write of %s would land on "+
 				"(%s), so this row cannot tell a refused axis from an unreadable one",
 				b.Axis, b.describeAxisRegisters(nil))
+		}
+		// LEDGER ATTRIBUTION (preferred): attribute a WSet-axis write to THIS
+		// control by the publish-time seq fence, so a PRIOR control's release
+		// (BASIC-013's WSet=4800 dropping its enable bit during this window) is
+		// not counted as BASIC-014's own write — the misattribution the bare
+		// fingerprint diff below made (HARNESS-TEARDOWN-CANCEL-ONLY-LEAVES-
+		// APPLIED-STATE). It declines (decided=false) when the sim has no wire
+		// tap, the axis has no mapped register span, or the ledger cannot be
+		// read now; the fingerprint diff is the fallback, never a false PASS.
+		if f, decided := refusalLedgerAttribution(ctx, rc, b, fence, uv, baseline, got); decided {
+			return f
 		}
 		if baseline == "" {
 			return Finding{Verdict: certify.Fail, Observed: fmt.Sprintf(
@@ -2737,7 +2748,8 @@ func oracleRefusal(b *refusalBinding, baseline string) func(ctx context.Context,
 					"supposed to have refused: the registers read %s before this row published its control "+
 					"and %s after the DUT's poll cycle. This row commanded %s. A gateway that answers the "+
 					"head end that it cannot comply and then writes the axis anyway has told the head end "+
-					"one thing and the device another",
+					"one thing and the device another. (No ledger fence was available to attribute the write "+
+					"to this control by seq, so this rests on the register diff alone.)",
 				b.Axis, baseline, got, b.Commanded)}
 		}
 		return Finding{Verdict: certify.Pass, Observed: fmt.Sprintf(
@@ -3090,6 +3102,15 @@ func refusalSetup(ctx context.Context, d *Driver, params map[string]string, b *r
 	if b.Curve != nil {
 		return publishCurveControl(ctx, d, params, b.Curve, mrid)
 	}
+	// SCALAR refusal only: capture the DER ledger's high-water seq at the instant
+	// BEFORE publishing, so a write the DUT issues in RESPONSE to this control is
+	// stamped seq > fence and a prior control's release (already recorded at a
+	// lower seq) is excluded. This is what lets oracleRefusal attribute a WSet
+	// write to THIS control rather than to BASIC-013's release
+	// (HARNESS-TEARDOWN-CANCEL-ONLY-LEAVES-APPLIED-STATE). Best-effort: a sim
+	// with no wire tap records no fence and the oracle falls back to the
+	// fingerprint diff. See refusalledger.go.
+	captureRefusalLedgerFence(ctx, d, params, b)
 	return b.Publish(ctx, d, mrid)
 }
 

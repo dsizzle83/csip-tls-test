@@ -1022,6 +1022,17 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		return rep, err
 	}
 
+	// The candidate's declared `models`, against the SunSpec chain the DER
+	// FIXTURE serves. Sibling to preflightManifest — that one asks the DUT what
+	// it admitted, this one asks the oracle's own sim what it serves — and fatal
+	// for the same reason: the southbound register verdicts are read from this
+	// fixture, so a fixture the manifest does not describe grades the product on
+	// the wrong instrument. See preflight_fixture.go.
+	if err := r.preflightFixture(ctx, reporter); err != nil {
+		rep.Finished = time.Now().UTC()
+		return rep, err
+	}
+
 	// And, for an EVIDENCE run, the preconditions the submission ARTEFACTS
 	// depend on: a bench posed so the frames those artefacts are cut from can
 	// exist at all. See preflight_evidence.go — this is the check that would

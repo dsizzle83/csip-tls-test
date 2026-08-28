@@ -420,10 +420,22 @@ func TestResponseCriterionHasTeeth(t *testing.T) {
 	wantVerdict(t, "Response status 1 (present)", critResponsePosted(1, "Event received", "M1"),
 		synthTranscript(post(1)), certify.Pass)
 
-	f := wantVerdict(t, "Response status 2 (absent)", critResponsePosted(2, "Event started", "M1"),
-		synthTranscript(post(1)), certify.Fail)
-	if !strings.Contains(f.Observed, "status=1") {
-		t.Errorf("the failure does not report the statuses that WERE posted: %q", f.Observed)
+	// Wire finds a Response for M1 but not the target status: it DEFERS to the
+	// Server tier (gridsim's record) rather than FAILing on a citation-window
+	// artifact — a status the window did not attribute is not a status the DUT
+	// did not post (BASIC-005's Received(1) landed outside its window while
+	// Started(2) landed inside; BASIC-004, same criteria, caught both). The FAIL
+	// teeth are at the Server tier, proven just below.
+	u := wantUnavailable(t, "Response status 2 (absent from window, other present)",
+		critResponsePosted(2, "Event started", "M1"), synthTranscript(post(1)))
+	if !strings.Contains(u, "status=1") {
+		t.Errorf("the deferral does not report the statuses that WERE posted: %q", u)
+	}
+	// TEETH: gridsim's authoritative record FAILs a status the DUT genuinely did
+	// not post — it saw status=1 for M1 but not status=2.
+	svOnly1 := &ServerView{Available: true, Responses: []AdminResponse{{Subject: "M1", Status: 1, LFDI: "ab"}}}
+	if f := critResponsePosted(2, "Event started", "M1").Server(svOnly1); f.Verdict != certify.Fail {
+		t.Errorf("server-side status 2 (gridsim has only status=1) = %s, want FAIL: %s", f.Verdict, f.Observed)
 	}
 
 	wantUnavailable(t, "Response (none posted)", critResponsePosted(1, "Event received", "M1"),
@@ -689,10 +701,19 @@ func TestResponseStartedCriterionHasTeeth(t *testing.T) {
 
 	// The control asked for it, but the DUT never posted a status=2 — a real
 	// FAIL about the DUT, not a degraded case.
-	f := wantVerdict(t, "status=2 (requested, not posted)", critResponseStarted("M1"),
-		synthTranscript(get("/derp/0/derc", 200, dercWithRR("03")), post(1)), certify.Fail)
-	if !strings.Contains(f.Observed, "status=1") {
-		t.Errorf("the failure does not report the statuses that WERE posted: %q", f.Observed)
+	// The control asked for status=2 (bit 0x02) and the window caught only a
+	// status=1: Wire DEFERS to the Server tier rather than FAILing on the window
+	// (the requested-but-absent status may have landed on an unattributed
+	// frame). The FAIL teeth are at the Server tier just below.
+	u := wantUnavailable(t, "status=2 (requested, absent from window, other present)",
+		critResponseStarted("M1"), synthTranscript(get("/derp/0/derc", 200, dercWithRR("03")), post(1)))
+	if !strings.Contains(u, "status=1") {
+		t.Errorf("the deferral does not report the statuses that WERE posted: %q", u)
+	}
+	// TEETH: gridsim saw status=1 for M1 but not status=2 → a real FAIL.
+	svStartedOnly1 := &ServerView{Available: true, Responses: []AdminResponse{{Subject: "M1", Status: 1, LFDI: "ab"}}}
+	if f := critResponseStarted("M1").Server(svStartedOnly1); f.Verdict != certify.Fail {
+		t.Errorf("server-side started (gridsim has only status=1) = %s, want FAIL: %s", f.Verdict, f.Observed)
 	}
 
 	// The control's responseRequired carried ONLY bit 0x01 (message received)
@@ -808,8 +829,21 @@ func TestResponseRequiredGateAppliesPerStatusNotJustStarted(t *testing.T) {
 	// Response POST at all is Unavailable regardless of gating — that is
 	// critResponsePosted's pre-existing "nothing to judge" behavior, proven
 	// by TestResponseStartedCriterionHasTeeth, not what this case is about.)
-	wantVerdict(t, "status=1 under rr=01 (requested, wrong status posted)", critResponsePosted(1, "Event received", "M1"),
-		synthTranscript(get("/derp/0/derc", 200, dercRR01), post(3)), certify.Fail)
+	// A REQUESTED status the window shows a DIFFERENT one instead of: Wire defers
+	// to the Server tier (the requested status may be on an unattributed frame),
+	// and the Server tier FAILs it when gridsim's record also lacks it. This is
+	// the "normal grading" half of the fix — still a real FAIL, now decided by
+	// the authoritative record rather than by which frames a window attributed.
+	uWrong := wantUnavailable(t, "status=1 under rr=01 (requested, wrong status in window)",
+		critResponsePosted(1, "Event received", "M1"),
+		synthTranscript(get("/derp/0/derc", 200, dercRR01), post(3)))
+	if !strings.Contains(uWrong, "status=3") {
+		t.Errorf("the deferral does not report the status actually posted: %q", uWrong)
+	}
+	svWrong := &ServerView{Available: true, Responses: []AdminResponse{{Subject: "M1", Status: 3, LFDI: "ab"}}}
+	if f := critResponsePosted(1, "Event received", "M1").Server(svWrong); f.Verdict != certify.Fail {
+		t.Errorf("server-side status 1 (gridsim has only status=3) = %s, want FAIL: %s", f.Verdict, f.Observed)
+	}
 
 	// Started (status=2, required bit 0x02): rr=01 does NOT carry it —
 	// Unavailable, never FAIL, even though nothing was posted.

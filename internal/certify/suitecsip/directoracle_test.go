@@ -178,90 +178,95 @@ func m123(t *testing.T, conn uint16) []uint16 {
 	return regs
 }
 
-// GREEN on a 7xx DER: energize is measured against model 703, and the connect
-// half is NAMED as having no register on this generation rather than passed
-// over.
-func TestBASIC009_On7xxMeasuresEnergizeAndNamesTheConnectAbsence(t *testing.T) {
+// judgeBASIC009 drives BASIC-009's connect oracle — now the manifest-aware
+// JudgeCtx (it grades the DECLARED connect home, model 123) — against a register
+// image. The RunCtx carries no manifest, which the oracle treats as "assert
+// everything": the grade is against model 123 regardless, and a manifest only
+// adds a disclosure line.
+func judgeBASIC009(t *testing.T, regs map[uint16][]uint16) Finding {
+	t.Helper()
 	m := rowByID(t, "BASIC-009").mode
-	if m.Direct == nil {
-		t.Fatal("BASIC-009 carries no southbound oracle")
+	if m.Direct == nil || m.Direct.JudgeCtx == nil {
+		t.Fatal("BASIC-009 carries no manifest-aware connect oracle (JudgeCtx)")
 	}
-	// The row commands energize=false, so a compliant DER holds ES clear.
-	got := m.Direct.Judge(unitWith(map[uint16][]uint16{703: es703(t, false)}))
-	if got.Verdict != certify.Pass {
-		t.Fatalf("BASIC-009 = %s against a 7xx DER holding the commanded de-energized state: %s",
-			got.Verdict, findingObserved(got))
-	}
-	for _, want := range []string{"model 703 ES", "NOT ASSERTED", "opModConnect"} {
-		if !strings.Contains(got.Observed, want) {
-			t.Errorf("the 7xx verdict does not say %q, so a reader could take the PASS for a statement "+
-				"about BOTH axes:\n  %s", want, got.Observed)
-		}
-	}
-	t.Logf("GREEN on 7xx —\n  %s", got.Observed)
+	return m.Direct.JudgeCtx(unitWith(regs), &certify.RunCtx{})
 }
 
-// RED on a 7xx DER: the row commanded energize=false and the DER's own
-// enter-service permission is still set.
-func TestBASIC009_On7xxFailsADERStillPermittedToEnergize(t *testing.T) {
-	m := rowByID(t, "BASIC-009").mode
-	got := m.Direct.Judge(unitWith(map[uint16][]uint16{703: es703(t, true)}))
-	if got.Verdict != certify.Fail {
-		t.Fatalf("BASIC-009 = %s against a DER whose 703 ES is still SET after a commanded "+
-			"energize=false: %s", got.Verdict, findingObserved(got))
+// THE HEADLINE FIX: model 703's ES is REPORTED, not graded, so a DER serving
+// BOTH 123 and 703 — the advanced fixture — passes on M123 Conn alone even when
+// 703's enter-service permission disagrees with the energize published alongside.
+// The prior oracle graded 703 and FAILed this DER on the fixture's as-built ES
+// default (the BASIC-009 leg of HARNESS-TEARDOWN-CANCEL-ONLY-LEAVES-APPLIED-STATE).
+func TestBASIC009_GradesM123ConnNotM703ES(t *testing.T) {
+	// connect=false is commanded; the DER holds M123 Conn=0 (disconnected,
+	// MATCHES) and 703 ES=SET (enter-service permitted, DISAGREES with the
+	// energize=false published alongside). The verdict must be PASS.
+	got := judgeBASIC009(t, map[uint16][]uint16{
+		sunspec.ModelImmediateCtrl: m123(t, 0),
+		703:                        es703(t, true),
+	})
+	if got.Verdict != certify.Pass {
+		t.Fatalf("BASIC-009 = %s on a DER whose M123 Conn matches but whose 703 ES disagrees — 703 was "+
+			"GRADED, the exact as-built-default FAIL this fix removes: %s", got.Verdict, findingObserved(got))
 	}
-	t.Logf("RED on 7xx —\n  %s", got.Observed)
+	for _, want := range []string{"GRADED (opModConnect via model 123", "model 123 Conn reads false",
+		"model 703 ES", "REPORTED, not graded"} {
+		if !strings.Contains(got.Observed, want) {
+			t.Errorf("the verdict does not say %q, so a reader cannot see that M123 was graded and 703 "+
+				"only reported:\n  %s", want, got.Observed)
+		}
+	}
+	t.Logf("GREEN — M123 graded, 703 reported —\n  %s", got.Observed)
 }
 
-// GREEN on a legacy DER: connect is measured against model 123's Conn, and the
-// energize half is NAMED.
-//
-// THIS TEST USED TO REQUIRE A TRANSCRIPTION CAVEAT and now requires its
-// ABSENCE. While lexa-proto's M123_* constants disagreed with the published
-// model at every point, this referee was reading different registers than the
-// product wrote, and every legacy verdict said so. lexa-proto 32150e1 closed
-// that and the caveat is computed rather than fixed prose
-// (invariant.DescribeM123Divergence), so it stopped printing on its own — which
-// is the heal reaching the evidence. The assertion inverts so that a
-// re-divergence is caught HERE too, at the verdict a reader actually sees,
-// rather than only in the invariant package's own pin.
-func TestBASIC009_OnLegacyMeasuresConnectAndTheTranscriptionCaveatIsGone(t *testing.T) {
-	m := rowByID(t, "BASIC-009").mode
-	got := m.Direct.Judge(unitWith(map[uint16][]uint16{sunspec.ModelImmediateCtrl: m123(t, 0)}))
+// A DER that does NOT serve the declared connect home (model 123) FAILs: an
+// unmeasured GRADED axis is not a pass, however many models are only REPORTED.
+func TestBASIC009_WithoutM123FailsTheDeclaredHome(t *testing.T) {
+	got := judgeBASIC009(t, map[uint16][]uint16{703: es703(t, false)})
+	if got.Verdict != certify.Fail || got.Unavailable != "" {
+		t.Fatalf("BASIC-009 = %s unavailable=%q against a DER that does not serve the declared connect "+
+			"home model 123, want a decided FAIL: %s", got.Verdict, got.Unavailable, findingObserved(got))
+	}
+	for _, want := range []string{"model 123 is NOT served", "model 703 ES", "REPORTED, not graded"} {
+		if !strings.Contains(got.Observed, want) {
+			t.Errorf("the FAIL does not say %q:\n  %s", want, got.Observed)
+		}
+	}
+	t.Logf("RED — declared home absent —\n  %s", got.Observed)
+}
+
+// GREEN when model 123's Conn holds the commanded disconnect. The transcription
+// caveat must be ABSENT (lexa-proto 32150e1 aligned the map); a re-divergence is
+// caught here, at the verdict a reader sees.
+func TestBASIC009_GradesM123ConnMatchingDisconnect(t *testing.T) {
+	got := judgeBASIC009(t, map[uint16][]uint16{sunspec.ModelImmediateCtrl: m123(t, 0)})
 	if got.Verdict != certify.Pass {
-		t.Fatalf("BASIC-009 = %s against a legacy DER holding the commanded disconnect: %s",
+		t.Fatalf("BASIC-009 = %s against a DER holding the commanded disconnect on M123 Conn: %s",
 			got.Verdict, findingObserved(got))
 	}
-	for _, want := range []string{"model 123 Conn", "opModEnergize"} {
-		if !strings.Contains(got.Observed, want) {
-			t.Errorf("the legacy verdict does not say %q:\n  %s", want, got.Observed)
-		}
+	if !strings.Contains(got.Observed, "model 123 Conn reads false") {
+		t.Errorf("the verdict does not report the graded M123 Conn read:\n  %s", got.Observed)
 	}
 	if strings.Contains(got.Observed, "TRANSCRIPTION") {
-		t.Errorf("the legacy verdict still carries a transcription caveat. The referee and lexa-proto "+
-			"agree on model 123's register map since 32150e1, so a caveat here means one of the two has "+
-			"moved again — and this verdict is now describing registers the writer did not touch:\n  %s",
-			got.Observed)
+		t.Errorf("the verdict still carries a transcription caveat — the referee and lexa-proto have "+
+			"re-diverged on model 123's map:\n  %s", got.Observed)
 	}
-	t.Logf("GREEN on legacy —\n  %s", got.Observed)
+	t.Logf("GREEN — M123 Conn matches —\n  %s", got.Observed)
 }
 
-func TestBASIC009_OnLegacyFailsADERStillConnected(t *testing.T) {
-	m := rowByID(t, "BASIC-009").mode
-	got := m.Direct.Judge(unitWith(map[uint16][]uint16{sunspec.ModelImmediateCtrl: m123(t, 1)}))
+func TestBASIC009_FailsADERStillConnected(t *testing.T) {
+	got := judgeBASIC009(t, map[uint16][]uint16{sunspec.ModelImmediateCtrl: m123(t, 1)})
 	if got.Verdict != certify.Fail {
-		t.Fatalf("BASIC-009 = %s against a legacy DER still CONNECTED after a commanded connect=false: %s",
-			got.Verdict, findingObserved(got))
+		t.Fatalf("BASIC-009 = %s against a DER still CONNECTED (M123 Conn=1) after a commanded "+
+			"connect=false: %s", got.Verdict, findingObserved(got))
 	}
-	t.Logf("RED on legacy —\n  %s", got.Observed)
+	t.Logf("RED — still connected —\n  %s", got.Observed)
 }
 
 // An unimplemented Conn (0xFFFF) is not a connect state. Reading it as 65535 !=
-// 0 would report the DER as connected and FAIL a device that simply cannot
-// answer the question.
+// 0 would report the DER as connected and FAIL a device that cannot answer.
 func TestBASIC009_AnUnimplementedConnIsNotReadAsConnected(t *testing.T) {
-	m := rowByID(t, "BASIC-009").mode
-	got := m.Direct.Judge(unitWith(map[uint16][]uint16{sunspec.ModelImmediateCtrl: m123(t, 0xFFFF)}))
+	got := judgeBASIC009(t, map[uint16][]uint16{sunspec.ModelImmediateCtrl: m123(t, 0xFFFF)})
 	if got.Verdict != certify.Fail {
 		t.Fatalf("verdict = %s, want a decided FAIL naming the unreadable point: %s",
 			got.Verdict, findingObserved(got))
@@ -271,20 +276,19 @@ func TestBASIC009_AnUnimplementedConnIsNotReadAsConnected(t *testing.T) {
 	}
 }
 
-// A DER serving NEITHER register is a decided FAIL, not an abstention: the
-// row's whole subject is what the DER holds, and a Skip there cannot dent the
-// verdict.
-func TestBASIC009_NeitherAxisObservableIsDecidedNotSkipped(t *testing.T) {
-	m := rowByID(t, "BASIC-009").mode
-	got := m.Direct.Judge(unitWith(map[uint16][]uint16{}))
+// A DER serving no model 123 is a decided FAIL, not an abstention: the declared
+// connect home is the row's whole graded subject, and a Skip there cannot dent
+// the verdict.
+func TestBASIC009_M123AbsentIsDecidedNotSkipped(t *testing.T) {
+	got := judgeBASIC009(t, map[uint16][]uint16{})
 	if got.Verdict != certify.Fail || got.Unavailable != "" {
 		t.Fatalf("verdict = %s unavailable=%q, want a decided FAIL: %s",
 			got.Verdict, got.Unavailable, got.Observed)
 	}
-	if !strings.Contains(got.Observed, "NEITHER") {
-		t.Errorf("the FAIL does not say both axes were unobservable:\n  %s", got.Observed)
+	if !strings.Contains(got.Observed, "model 123 is NOT served") {
+		t.Errorf("the FAIL does not say the declared connect home was unserved:\n  %s", got.Observed)
 	}
-	t.Logf("RED — no register for either axis:\n  %s", got.Observed)
+	t.Logf("RED — no register for the declared home:\n  %s", got.Observed)
 }
 
 // meas701 builds a minimal model 701 image with the given ConnSt.
@@ -308,22 +312,22 @@ func meas701(t *testing.T, connSt uint16) []uint16 {
 	return regs
 }
 
-// The DER's own connection status is REPORTED and must never grade. A 7xx solar
-// DER has no path to opModConnect at all, so a row that failed it for still
-// reading connected would be blaming the device for a register it does not
-// serve — which is the mirror of the defect the whole file closes.
+// The DER's own model 701 ConnSt is REPORTED and must never grade. The graded
+// axis is M123 Conn (the declared home); 701 ConnSt is the device's own account
+// of its connection state, which the connect command may reach by a path this
+// register does not reflect, so grading it would blame the device for a
+// disagreement that is not a conformance failure.
 func TestBASIC009_TheDERsOwnConnStIsReportedAndNeverGrades(t *testing.T) {
-	m := rowByID(t, "BASIC-009").mode
-	// ConnSt=1 (connected) against a commanded connect=false, on a DER whose
-	// energize half is compliant. The verdict must stay PASS.
-	got := m.Direct.Judge(unitWith(map[uint16][]uint16{
-		703: es703(t, false),
-		701: meas701(t, 1),
-	}))
+	// M123 Conn=0 (disconnected) MATCHES the commanded connect=false, while the
+	// DER's own 701 ConnSt=1 still reads connected. The verdict must stay PASS —
+	// ConnSt is reported, not graded.
+	got := judgeBASIC009(t, map[uint16][]uint16{
+		sunspec.ModelImmediateCtrl: m123(t, 0),
+		701:                        meas701(t, 1),
+	})
 	if got.Verdict != certify.Pass {
-		t.Fatalf("BASIC-009 = %s on a 7xx DER whose 701 ConnSt still reads connected — the status was "+
-			"GRADED, and this DER has no opModConnect register to have obeyed: %s",
-			got.Verdict, findingObserved(got))
+		t.Fatalf("BASIC-009 = %s on a DER whose graded M123 Conn matches but whose 701 ConnSt still reads "+
+			"connected — the status was GRADED: %s", got.Verdict, findingObserved(got))
 	}
 	if !strings.Contains(got.Observed, "ConnSt reads 1") {
 		t.Errorf("the DER's own connection status is not reported at all, so the verdict omits the one "+

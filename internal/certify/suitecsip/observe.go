@@ -1008,6 +1008,14 @@ type Driver struct {
 	// row's notes — so a failed teardown lands in the bundle instead of in a
 	// discarded return value.
 	cleanupErrs []string
+
+	// pollWindow is the row's own poll-cycle window (run()'s fetchWait), stashed
+	// here so the cancel-then-delete teardown can fence the DUT's observe-the-
+	// cancel poll on the SAME cadence the row waited for it to fetch and apply —
+	// a teardown fence bounded by a bench-appropriate poll window rather than a
+	// fixed number. Zero until run() sets it (a direct-driver unit test that
+	// never calls run() leaves it zero, and the fence falls back to its ceiling).
+	pollWindow time.Duration
 }
 
 // Published returns a copy of when this check published each control.
@@ -1790,6 +1798,69 @@ func (d *Driver) ClearControls(ctx context.Context, program int) error {
 // ClearCurves removes admin-posted curve controls from a program.
 func (d *Driver) ClearCurves(ctx context.Context, program int) error {
 	return d.adminClear(ctx, "/admin/curve", "the admin-posted curve controls", program)
+}
+
+// cancelControl issues the IEEE 2030.5-2018 §10.2.3.3 c) server-cancel of ONE
+// control on program — a status-only edit (CurrentStatus=6/Cancelled) keyed to
+// the control's OWN mrid. gridsim's adminCtrlPost matches the mrid and flips
+// only EventStatus (see its inheritStored path), leaving the control ADVERTISED
+// as Cancelled for the DUT to observe on its next poll rather than making it
+// vanish. It carries no content fields, so gridsim's edit guard treats it as a
+// pure status flip. The mrid must be one gridsim already carries (callers pass
+// mrids read back from GET /admin/status); the returned error is the caller's
+// to record, never fatal.
+func (d *Driver) cancelControl(ctx context.Context, program int, mrid string) error {
+	_, err := d.PostControl(ctx, ControlRequest{Program: program, MRID: mrid, CurrentStatus: ptr(uint8(6))})
+	return err
+}
+
+// cancelProgramControls server-cancels EVERY not-yet-terminal control gridsim
+// still advertises on program, by each control's own mrid, leaving them
+// advertised as Cancelled(6). It is the spec-correct end of an event that a
+// bare ClearControls DELETE skips: IEEE 2030.5-2018 §10.2.3.3 c) ends an event
+// by cancel or supersede, never by removing it from the list, so a spec-correct
+// DUT that has ALREADY acquired an active event keeps executing it until it
+// OBSERVES the cancellation — which it cannot do if the control simply vanished
+// (CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION: a prior row's un-cancelled
+// event stayed the DUT's effective control into the next row).
+//
+// It enumerates the live controls from GET /admin/status and skips any already
+// at a terminal status (Cancelled 6 / Superseded 7), so re-running it is a
+// no-op. A bench with no admin API, an unenumerable status (an older sim, a
+// transport hiccup), or a program with nothing live is a safe no-op returning
+// nil — the caller's own poll fence plus the settleOracle backstop still catch a
+// DUT that never quiesced. Best-effort, like ClearControls' recorded-not-fatal
+// contract; the first cancel error (if any) is returned for the caller to log.
+func (d *Driver) cancelProgramControls(ctx context.Context, program int) error {
+	if !d.Admin.Available() {
+		return nil
+	}
+	var st AdminStatus
+	if err := d.Admin.Status(ctx, &st); err != nil {
+		return nil
+	}
+	var firstErr error
+	seen := map[string]bool{}
+	for _, p := range st.Programs {
+		if p.ID != program {
+			continue
+		}
+		// Active first, then Scheduled: a control can appear in both lists
+		// (activate-published controls mirror into actderc), so dedupe by mrid.
+		for _, c := range append(append([]AdminControl{}, p.Active...), p.Scheduled...) {
+			if c.MRID == "" || seen[c.MRID] {
+				continue
+			}
+			seen[c.MRID] = true
+			if c.Status == 6 || c.Status == 7 { // already Cancelled / Superseded
+				continue
+			}
+			if err := d.cancelControl(ctx, program, c.MRID); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // adminClear is the one definition of a teardown DELETE, and it exists because

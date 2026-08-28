@@ -131,12 +131,26 @@ func (r *Runner) preflightManifest(ctx context.Context, reporter *Reporter) erro
 				m.NorthboundUnits[0], d.Device, d.NBUnit))
 		}
 		if missing := modelsMissing(m, d.Models); len(missing) > 0 {
-			// A model the DEVICE serves that the manifest does not declare is
-			// an under-declaration, and it matters: the manifest is what a
-			// reader is told the candidate implements.
-			reporter.Line("candidate: the DUT's device %q serves model(s) %v that the manifest's `models` "+
-				"list does not declare. That is an under-declaration, not a contradiction — but the "+
-				"manifest is what a reviewer is told this candidate implements", d.Device, missing)
+			// A model the DEVICE serves that the manifest does not declare is an
+			// under-declaration, and it is treated the SAME WAY preflightFixture
+			// treats the fixture serving a model the manifest omits: FATAL on the
+			// gating path, a WARN on an exploratory one. The two checks read
+			// different witnesses (this one the DUT's admitted inventory, that
+			// one the DER simulator's served chain) but reach the same judgement
+			// on a served-but-undeclared model, so a gating campaign cannot
+			// generate cert evidence against a device its own manifest does not
+			// fully describe. (The admitted-inventory caveat that made this a
+			// bare WARN before — the dev API publishes only what has finished
+			// admitting — is why it stays a WARN off the gating path.)
+			if r.gatingCampaign() {
+				problems = append(problems, fmt.Sprintf(
+					"the DUT's device %q serves model(s) %v that the manifest's `models` list does NOT "+
+						"declare (under-declaration)", d.Device, missing))
+			} else {
+				reporter.Line("candidate: the DUT's device %q serves model(s) %v that the manifest's "+
+					"`models` list does not declare. This is an EXPLORATORY run (no -campaign), so it is a "+
+					"WARNING, not a refusal; a gating campaign would stop here", d.Device, missing)
+			}
 		}
 	}
 

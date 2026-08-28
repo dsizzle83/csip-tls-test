@@ -609,9 +609,23 @@ func critResponsePosted(status uint8, meaning string, mridKey string) criterion 
 			if len(seen) == 0 {
 				return unavailable("the recovered transcript holds no Response POST for subject %s", mridKey)
 			}
-			return found(certify.Fail, allFrames(t.Method("POST")),
-				"the DUT POSTed %d Response(s) for subject %s but none with status=%d: %s",
-				len(seen), mridKey, status, strings.Join(seen, ", "))
+			// The recovered window holds Response POST(s) for this control but
+			// not the target status. That is NOT a decided FAIL: a lifecycle
+			// status can legitimately land on a frame this row's capture window
+			// did not attribute — Received(1) in particular is POSTed the instant
+			// the DUT fetches the control, often on a short-lived early
+			// connection whose frames fall just outside the attributed span,
+			// while Started(2) lands inside it. Two sibling ride-through rows
+			// with IDENTICAL criteria (BASIC-004 caught both statuses, BASIC-005
+			// caught only Started) proved this is a citation-window artifact, not
+			// a product difference. Defer to gridsim's own Response record
+			// (tier 3, ResponsesFor), which accounts for every Response gridsim
+			// received in this row's window by mRID rather than by attributed
+			// frame — and which FAILs deterministically if the status is genuinely
+			// absent there too, so nothing is weakened.
+			return unavailable("the recovered transcript holds Response POST(s) for subject %s but none "+
+				"with status=%d (%s); the status may have landed on a frame this window did not attribute, "+
+				"so this defers to gridsim's own Response record", mridKey, status, strings.Join(seen, ", "))
 		},
 		Server: func(v *ServerView) Finding {
 			// #17/F2: honour a not-requested ruling Wire already made — tier 3

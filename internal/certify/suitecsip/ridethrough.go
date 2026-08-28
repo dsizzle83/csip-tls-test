@@ -1305,8 +1305,16 @@ func rideThroughSpec(b *tripBinding, subject, mrid string) spec {
 			return nil
 		},
 		Cleanup: func(ctx context.Context, d *Driver) {
-			_ = d.ClearControls(ctx, 0)
-			_ = d.ClearCurves(ctx, 0)
+			// CANCEL-then-DELETE (teardown.go's releaseProgramControls): a bare
+			// clear made this ride-through curve-control VANISH while a
+			// spec-correct DUT kept executing the event it had acquired, so the
+			// event outlived the row (CSIP-BENCH-BASIC007-ORACLE-STATE-
+			// CONTAMINATION). Server-cancel it as Cancelled(6) so the DUT
+			// observes the cancellation, await a fresh poll so it drops the
+			// event, and only then DELETE the control and curve. Best-effort
+			// recorded-not-fatal; residual contamination is caught by the rows'
+			// own oracles, not by the teardown.
+			_ = d.releaseProgramControls(ctx, 0)
 		},
 	}
 	return s

@@ -46,6 +46,16 @@ const (
 	// KindUnsupportedDefaultAxis — a default-control axis the scheduler cannot
 	// support (scheduler/supported.go:954).
 	KindUnsupportedDefaultAxis = "unsupported-default-axis"
+	// KindUnsupportedEventAxis — a CAPABILITY-unsupported axis TRIMMED off an
+	// EVENT DERControl, the event-scoped sibling of KindUnsupportedDefaultAxis:
+	// the same axis-support gate applied to a scheduled/active event rather than
+	// to the DefaultDERControl (lexa-gw walker.go:1425,
+	// IgnoredContentUnsupportedEventAxis, series
+	// lexa_nb_ignored_control_content_unsupported_event_axis_total). Before it
+	// was enumerated here its reading fell into the untagged family total, so a
+	// criterion about a trimmed EVENT axis could not tell it apart from every
+	// other ignored-content kind — the isolation this map exists to give.
+	KindUnsupportedEventAxis = "unsupported-event-axis"
 	// KindOther is not a kind the product reports — it is the bucket a kind
 	// with no enumerated series lands in (walker.go:990,
 	// ignoredContentOtherMetric). A NON-ZERO reading here is itself a finding
@@ -100,6 +110,7 @@ var ignoredContentKindMetric = map[string]string{
 	KindMalformedCurve:         "lexa_nb_ignored_control_content_malformed_curve_total",
 	KindAutonomousVRef:         "lexa_nb_ignored_control_content_autonomous_vref_total",
 	KindUnsupportedDefaultAxis: "lexa_nb_ignored_control_content_unsupported_default_axis_total",
+	KindUnsupportedEventAxis:   "lexa_nb_ignored_control_content_unsupported_event_axis_total",
 	KindOther:                  "lexa_nb_ignored_control_content_other_total",
 }
 

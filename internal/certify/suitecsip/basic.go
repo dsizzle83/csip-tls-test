@@ -875,6 +875,14 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				}
 			case m.Direct != nil:
 				crits = append(crits, critDEREffectViaDirectOracle(subject, m.Direct, o))
+				// The connect row (and only it) carries the response-integrity
+				// gate: a Started(2) the declared connect axis (M123 Conn) does
+				// not back is a FAIL, a correct withhold is not. ConnectHome
+				// marks the connect oracle so BASIC-008's fixed-PF Direct row
+				// does not inherit an assertion about an axis it does not have.
+				if m.Direct.ConnectHome != "" {
+					crits = append(crits, critConnectStartedIntegrity(o.Param("mrid"), o))
+				}
 			default:
 				crits = append(crits, critDEREffectUnobservable(subject))
 			}
@@ -1076,7 +1084,8 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 				var f Finding
 				switch {
 				case m.Refusal != nil:
-					judge := oracleRefusal(m.Refusal, params[refusalBaselineParam])
+					judge := oracleRefusal(m.Refusal, params[refusalBaselineParam],
+						parseRefusalLedgerFence(params))
 					f = settleRefusal(ctx, oracleSettleDeadline(params), oracleSettleStep,
 						func() Finding { return judge(ctx, d.rc) })
 				case m.Curve != nil:
@@ -1145,35 +1154,25 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			}
 		}
 		s.Cleanup = func(ctx context.Context, d *Driver) {
-			_ = d.ClearControls(ctx, m.Program)
-			_ = d.ClearCurves(ctx, m.Program)
-			// This clears the CSIP-side control/curve, not the DER's own
-			// southbound registers — this bench still exposes no lever to
-			// reset those (modsim's /control takes pause/resume/reset, and
-			// its "reset" only resumes the animation, sim/modsim/main.go;
-			// /registers is GET-only; /inject writes the M123 WMaxLimPct the
-			// oracle does not read). The old note here called the residual
-			// risk "bounded, not ignored" and left it there: a row could
-			// false-PASS against its OWN prior run's identical value on a
-			// rerun that never re-applied the control. That reasoning is
-			// retired (IW14-003). A stale register is no longer waved through
-			// with prose, because the row no longer depends on Cleanup to
-			// have cleared anything:
+			// CANCEL-then-DELETE (teardown.go's releaseProgramControls): the row
+			// server-cancels its control as Cancelled(6) so a spec-correct DUT
+			// that ALREADY acquired the event OBSERVES the cancellation (IEEE
+			// 2030.5-2018 §10.2.3.3 c) ends an event by cancel, not by removal),
+			// awaits a fresh DUT poll so the DUT sees it and drops the active
+			// event, and only THEN deletes the control and curve. The DUT reverts
+			// applied EVENT state on the deletion; the board's standing
+			// DefaultDERControl (an exp_lim_W ceiling) persists by design and is
+			// neither touched nor graded.
 			//
-			//   - Setup READS the DER before it publishes (oracledSetup) and
-			//     records that reading. The post-publication read is evidence
-			//     only against that baseline — a TRANSITION — never on its own.
-			//   - When the baseline already satisfies the value this row was
-			//     about to command, the row commands a ladder alternate the
-			//     DER provably does not hold (oracleBinding.alternate), so the
-			//     post-read has something to move TO.
-			//   - When neither holds — no baseline, or no alternate available
-			//     — oracleOutcome says so in a decided verdict naming both
-			//     readings, rather than reporting a PASS it cannot support.
-			//
-			// A register-clear lever would still be the cleaner instrument and
-			// is still not in this suite's gift to add; what changed is that
-			// its absence can no longer manufacture a PASS.
+			// The original bare DELETE made a control VANISH before the DUT could
+			// observe it end, so BASIC-006's opModVoltVar outlived its row into
+			// BASIC-007's baseline (CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION);
+			// the cancel+fence in front of the delete fixes exactly that. It is
+			// best-effort recorded-not-fatal (ClearControls/ClearCurves disclose a
+			// failed clear in the row's notes); residual contamination is caught
+			// by the ROWS' OWN oracles, not by a global register gate a standing
+			// default makes unusable.
+			_ = d.releaseProgramControls(ctx, m.Program)
 		}
 	}
 	return s

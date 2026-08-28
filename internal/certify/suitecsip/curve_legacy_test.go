@@ -959,19 +959,40 @@ func TestLegacyRowsAreRedEndToEndAgainstTheShippingProduct(t *testing.T) {
 	}
 }
 
-// TestLegacyRowTeardownActuallyClearsTheBench is §10's ordering constraint,
-// checked rather than assumed.
+// TestLegacyRowTeardownCancelsTheEventItPublished is IEEE 2030.5-2018
+// §10.2.3.3 c)'s end-of-event rule, checked rather than assumed.
 //
-// The nil-body DELETE bug (gridsim reads the program from the JSON body and
-// answered 400 on the io.EOF a nil body produces, and the callers discarded the
-// error) meant every curve row leaked its control and its curve into the rest of
-// the run for as long as the teardown existed. It is fixed — and "it is fixed"
-// is a claim, so this row's own Cleanup is run and the bench is then inspected:
-// no admin-posted control, and no individually-addressable curve resource left
-// answering at the href the control linked.
-func TestLegacyRowTeardownActuallyClearsTheBench(t *testing.T) {
+// A curve row's teardown used to DELETE its control from gridsim
+// (ClearControls/ClearCurves). That made the control VANISH — which §10.2.3.3
+// c) is explicit is NOT how an event ends: "Service providers SHALL cancel
+// Events that they wish clients to not act upon and/or provide new superseding
+// Events." A spec-correct DUT that had ALREADY acquired the active event kept
+// executing it for its full Duration, because it never OBSERVED a cancellation:
+// the event simply disappeared from the list. That is CSIP-BENCH-BASIC007-
+// ORACLE-STATE-CONTAMINATION — BASIC-006's opModVoltVar outlived its row on the
+// DUT and became BASIC-007's effective control, failing that Default-Only row's
+// baseline confirm while the product was correct.
+//
+// The teardown CANCELS-THEN-DELETES (teardown.go's releaseProgramControls): it
+// server-CANCELS the control (currentStatus=6) so a spec-correct DUT observes the
+// cancellation and drops the active event, awaits a fresh poll, and only THEN
+// deletes the control so nothing is left advertised to accumulate into the next
+// row. This runs the row's own Cleanup through a recording transport and proves:
+// a Cancelled(6) edit was issued, a DELETE followed it (never preceded it), the
+// teardown recorded no error, and the control is GONE from the data plane
+// afterwards. There is deliberately NO reversion-verify — a global "any 704
+// enable is contamination" gate false-FATALs the board's standing DefaultDERControl
+// export limit; residual contamination is caught by the rows' own oracles.
+func TestLegacyRowTeardownCancelsThenCleansTheEventItPublished(t *testing.T) {
 	f := newLegacyFixture(t, sim.LegacyCurveOptions{})
-	d, _, dataURL := f.withGridSim(t)
+	_, _, dataURL := f.withGridSim(t)
+	// Re-wire the admin client through a recording transport so the teardown's
+	// request SEQUENCE — cancel before delete — is checkable, not only its end
+	// state. (withGridSim recorded the admin URL on the RunCtx.)
+	rec := &recordingRT{inner: http.DefaultTransport}
+	f.rc.GridSim = certify.NewAdminClient(f.rc.Targets.GridSimAdmin, rec)
+	d := NewDriver(f.rc)
+
 	row := rowByID(t, "BASIC-006")
 	s := inverterControlSpec(row.mode, row.subject, "CERT-BASIC-006")
 
@@ -980,19 +1001,6 @@ func TestLegacyRowTeardownActuallyClearsTheBench(t *testing.T) {
 	if err := s.Setup(ctx, d, params); err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
-	href := params[curveHrefParam]
-	mrid := params[curveResourceParam]
-	if href == "" || mrid == "" {
-		t.Fatalf("the row recorded href=%q curve mRID=%q, so there is nothing to check the teardown "+
-			"against", href, mrid)
-	}
-	// The check is on the CONTENT at the href, not on whether the href is
-	// served at all. Program 0's static fixture legitimately owns
-	// /derp/0/dc/0, so a DELETE puts the FIXTURE curve back there rather than
-	// removing the path — and "the path 404s" would therefore be the wrong
-	// assertion, passing on program 1 and failing on program 0 for a reason
-	// that is not about contamination. What must not survive is this row's own
-	// curve, identified by the mRID gridsim minted for it.
 	get := func(path string) string {
 		t.Helper()
 		resp, err := http.Get(dataURL + path)
@@ -1004,30 +1012,58 @@ func TestLegacyRowTeardownActuallyClearsTheBench(t *testing.T) {
 		n, _ := resp.Body.Read(buf)
 		return string(buf[:n])
 	}
-	if before := get(href); !strings.Contains(before, mrid) {
-		t.Fatalf("GET %s does not serve this row's own curve (%s) BEFORE the teardown; this test cannot "+
-			"show a clear that never had anything to clear:\n%s", href, mrid, before)
+	// BEFORE the teardown the row's control is live on the wire — otherwise this
+	// test cannot show a teardown that changed anything.
+	before := get("/derp/0/derc")
+	if !strings.Contains(before, "opModVoltVar") {
+		t.Fatalf("the row's opModVoltVar control is not on the wire BEFORE the teardown:\n%s", before)
 	}
 
+	// Only the teardown's own requests are graded; Setup's precede this mark.
+	teardownStart := len(rec.method)
 	s.Cleanup(ctx, d)
 
 	if got := d.CleanupErrors(); len(got) != 0 {
 		t.Errorf("the teardown recorded errors, so the next row would grade a bench this one is still "+
 			"driving: %v", got)
 	}
-	if after := get(href); strings.Contains(after, mrid) {
-		t.Errorf("GET %s still serves this row's own curve (%s) after Cleanup — the curve this row "+
-			"published is still fetchable, which is the contamination the clear exists to remove:\n%s",
-			href, mrid, after)
+
+	// The teardown must CANCEL (current_status=6) BEFORE it DELETEs: a
+	// spec-correct DUT can only drop an event it acquired by OBSERVING the
+	// cancellation, and a delete that ran first would make the control vanish
+	// before it could — the exact defect this rework closes.
+	cancelAt, deleteAt := -1, -1
+	for i := teardownStart; i < len(rec.method); i++ {
+		switch {
+		case rec.method[i] == http.MethodPost && strings.Contains(rec.body[i], `"current_status":6`):
+			if cancelAt < 0 {
+				cancelAt = i
+			}
+		case rec.method[i] == http.MethodDelete:
+			if deleteAt < 0 {
+				deleteAt = i
+			}
+		}
 	}
-	if after := get("/derp/0/dc"); strings.Contains(after, mrid) {
-		t.Errorf("the program's DERCurveList still lists this row's curve (%s) after Cleanup:\n%s",
-			mrid, after)
+	if cancelAt < 0 {
+		t.Errorf("the teardown issued no Cancelled(6) edit, so a spec-correct DUT never observes the event "+
+			"end (requests: %v)", rec.method[teardownStart:])
+	}
+	if deleteAt < 0 {
+		t.Errorf("the teardown issued no DELETE, so a cancelled control is left advertised to accumulate "+
+			"into the next row (requests: %v)", rec.method[teardownStart:])
+	}
+	if cancelAt >= 0 && deleteAt >= 0 && cancelAt > deleteAt {
+		t.Errorf("the teardown DELETED (request %d) BEFORE it CANCELLED (request %d) — deleting an "+
+			"un-observed cancel out from under the DUT reproduces the vanish defect", deleteAt, cancelAt)
 	}
 
-	// And the control list is back to a plain, empty one.
-	if ctrls := get("/derp/0/derc"); strings.Contains(ctrls, "opModVoltVar") {
-		t.Errorf("the admin-posted curve control survived the teardown:\n%s", ctrls)
+	// AFTER the teardown the control is GONE from the data plane: cancelled, then
+	// deleted — so nothing is left for the next row to inherit.
+	after := get("/derp/0/derc")
+	if strings.Contains(after, "opModVoltVar") {
+		t.Errorf("the control is STILL advertised after the teardown; cancel-and-leave-advertised "+
+			"accumulates applied state into the next row:\n%s", after)
 	}
 }
 

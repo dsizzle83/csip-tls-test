@@ -240,6 +240,32 @@ func cleanupNote(d *Driver) string {
 		"for the rows that follow and their evidence must be read with that in mind: " + strings.Join(errs, "; ")
 }
 
+// teardownCleanupBudget is how long run()'s deferred Cleanup context lives.
+//
+// It is the row's own poll-cycle window plus a settle margin, because the
+// cancel-then-delete teardown (teardown.go) waits for the DUT to fetch a
+// Cancelled(6) on its next poll — so it OBSERVES the event ending — before the
+// delete removes the control from the list. A pollWindow of 0 (a disarm-only
+// teardown, or a direct-driver unit test that never set one) floors at the
+// historic 30s so those are unchanged; the cap keeps a hung teardown from
+// holding a shared bench indefinitely while staying well clear of any real poll
+// cadence.
+func teardownCleanupBudget(pollWindow time.Duration) time.Duration {
+	const (
+		floor  = 30 * time.Second
+		margin = 45 * time.Second
+		cap    = 4 * time.Minute
+	)
+	b := pollWindow + margin
+	if b < floor {
+		b = floor
+	}
+	if b > cap {
+		b = cap
+	}
+	return b
+}
+
 // joinNotes appends a sentence to a notes string, keeping the suite's "; "
 // separator and never leaving a leading separator on an empty one.
 func joinNotes(notes, add string) string {
@@ -482,8 +508,21 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (res certify.Result, r
 	if s.Cleanup != nil {
 		// A context detached from the check's own deadline: a check killed by
 		// -timeout must still disarm the fault it armed on a shared bench.
+		//
+		// The budget is poll-window-scaled, not a fixed 30s, because the
+		// cancel-then-delete teardown (teardown.go) waits for the DUT to OBSERVE
+		// a Cancelled(6) on a fresh poll before it deletes — so a bench whose
+		// poll cadence is slower than 30s still gets its cancel observed rather
+		// than deleted out from under it. teardownCleanupBudget floors at 30s (a
+		// row with no measured window, or a disarm-only teardown, is unchanged)
+		// and caps well clear of any real cadence.
+		//
+		// Teardown is best-effort recorded-not-fatal: a failed ClearControls/
+		// ClearCurves is disclosed in the row's notes (cleanupNote), never
+		// escalated to a run error — residual contamination is caught by the
+		// ROWS' OWN oracles, not by the teardown.
 		defer func() {
-			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), teardownCleanupBudget(d.pollWindow))
 			defer cancel()
 			s.Cleanup(cctx, d)
 			if note := cleanupNote(d); note != "" {
@@ -513,6 +552,10 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (res certify.Result, r
 	wait, waitWhy := fetchWait(ctx, rc, s)
 	obs.Params[waitWhyParam] = waitWhy
 	obs.Params[pollWindowParam] = wait.String()
+	// Hand the row's own poll-cycle window to the teardown (teardown.go's
+	// cancel-then-clean waits one such window for the DUT to observe a cancel
+	// and revert), so a teardown fence tracks the bench's real cadence.
+	d.pollWindow = wait
 	rc.Logf("poll-cycle window for this check: %s", waitWhy)
 
 	var view ServerView

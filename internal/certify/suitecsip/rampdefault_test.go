@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/internal/diff"
@@ -318,11 +319,28 @@ func TestBASIC007_IsNotInTheUniformInverterControlRows(t *testing.T) {
 // real to wait on. The DER's WRmp starts at `start` — the prior-register state
 // the row must be independent of. No board, no product: the "DUT" is this
 // handler applying whatever ramp default the row last commanded.
-func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver) {
+// rampAdminProbe records what the row's Fix-B quiesce did to the fake gridsim's
+// control plane: whether it server-cancelled the seeded prior control, whether
+// that cancel arrived BEFORE the first baseline publish, and the control's last
+// advertised status. Its fields are guarded by rampFakeBench's own mu.
+type rampAdminProbe struct {
+	priorMRID            string
+	priorStatus          int  // 1 = active (masks the default); 6 = Cancelled
+	baselinePublished    bool // the first POST /admin/default arrived
+	cancelSeen           bool
+	cancelBeforeBaseline bool
+}
+
+func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver, *rampAdminProbe) {
 	t.Helper()
 	dev := diff.NewDevice(diff.Bench702())
 	var mu sync.Mutex
 	var poll uint64
+	// The stand-in for BASIC-006's un-cancelled opModVoltVar: a prior control
+	// gridsim still advertises as Active on program 0, which MASKS the
+	// DefaultDERControl (a higher-precedence active event is the effective
+	// control per IEEE 2030.5-2018 §10.2.3.3) until the row's quiesce cancels it.
+	probe := &rampAdminProbe{priorMRID: "DERC-SP-PRIOR-EVENT", priorStatus: 1}
 	// pending is the ramp default gridsim last accepted but the DUT has not yet
 	// fetched. A real DUT applies it only when it next POLLS — so this fake
 	// applies it on /poll/wait (a completed poll), NOT synchronously on the
@@ -356,9 +374,42 @@ func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver) {
 		if req.SetGradW != nil {
 			mu.Lock()
 			pending, havePending = *req.SetGradW/100, true // accepted; the DUT applies it on its next poll
+			probe.baselinePublished = true
 			mu.Unlock()
 		}
 		w.WriteHeader(http.StatusNoContent)
+	})
+	// GET /admin/status enumerates program-0's live controls so the row's
+	// cancelProgramControls can find the seeded prior event by its own mrid.
+	adminMux.HandleFunc("/admin/status", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ctrl := AdminControl{MRID: probe.priorMRID, Description: "prior VoltVar event", Status: probe.priorStatus}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(AdminStatus{
+			Programs:   []AdminProgram{{ID: 0, MRID: "P0", Primacy: 1, Active: []AdminControl{ctrl}}},
+			ServerTime: 1,
+		})
+	})
+	// POST /admin/control accepts the status-only server-cancel the quiesce
+	// issues (CurrentStatus=6 keyed to the prior control's mrid) and records the
+	// ordering: a cancel that arrives while baselinePublished is still false is
+	// the quiesce running BEFORE the baseline, which is the property Fix B owes.
+	adminMux.HandleFunc("/admin/control", func(w http.ResponseWriter, r *http.Request) {
+		var req ControlRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		if req.CurrentStatus != nil && *req.CurrentStatus == 6 && req.MRID == probe.priorMRID {
+			probe.cancelSeen = true
+			if !probe.baselinePublished {
+				probe.cancelBeforeBaseline = true
+			}
+			probe.priorStatus = 6 // now advertised as Cancelled(6), not deleted
+		}
+		mrid := req.MRID
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"mrid": mrid})
 	})
 	adminSrv := httptest.NewServer(adminMux)
 	t.Cleanup(adminSrv.Close)
@@ -395,7 +446,13 @@ func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver) {
 	simMux.HandleFunc("/poll/wait", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		poll++ // a poll cycle completed
-		if havePending {
+		// A spec-correct DUT applies the DefaultDERControl only when no
+		// higher-precedence event is in force. While the seeded prior control is
+		// still Active it MASKS the default, so the baseline lands only after the
+		// row's quiesce cancelled it (probe.priorStatus != 1) — which makes the
+		// quiesce load-bearing here, not merely asserted: strip it out and the
+		// baseline never reaches WRmp=50 for any prior register state.
+		if havePending && probe.priorStatus != 1 {
 			applyWRmp(pending) // and the DUT reconciled the default it fetched
 		}
 		mu.Unlock()
@@ -413,7 +470,7 @@ func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver) {
 			oracleSimName: certify.NewSimClient(oracleSimName, simSrv.URL, http.DefaultClient),
 		},
 	}
-	return rc, NewDriver(rc)
+	return rc, NewDriver(rc), probe
 }
 
 // driveRampRow runs BASIC-007's Setup then PostWait against a bench, exactly the
@@ -443,7 +500,7 @@ func driveRampRow(t *testing.T, rc *certify.RunCtx, d *Driver) *Observation {
 func TestBASIC007_PassesRegardlessOfPriorRegisterState(t *testing.T) {
 	for _, start := range []uint16{0, 90, 50} {
 		t.Run(fmt.Sprintf("WRmp_starts_at_%d", start), func(t *testing.T) {
-			rc, d := rampFakeBench(t, start)
+			rc, d, _ := rampFakeBench(t, start)
 			obs := driveRampRow(t, rc, d)
 
 			// The baseline was confirmed and the pre-read of the target FAILed
@@ -468,6 +525,44 @@ func TestBASIC007_PassesRegardlessOfPriorRegisterState(t *testing.T) {
 			}
 			t.Logf("start=%d -> %s: %s", start, f.Verdict, f.Observed)
 		})
+	}
+}
+
+// TestBASIC007_QuiescesTheControlPlaneBeforeTheBaseline is Fix B's first half:
+// before it publishes the distinguishable baseline, the row SERVER-CANCELS
+// whatever program-0 control a prior row left the DUT still executing, and
+// fences a DUT poll so the revert lands. The fake seeds a prior Active control
+// (the stand-in for BASIC-006's opModVoltVar) that MASKS the DefaultDERControl
+// until it is cancelled — so the row PASSes only because the quiesce ran, and
+// the cancel is proven to have been issued BEFORE the first baseline publish
+// (never after, which would confirm the baseline against a DUT still executing
+// the prior event). The prior control is left advertised as Cancelled(6), not
+// deleted, so a spec-correct DUT can observe the cancellation.
+func TestBASIC007_QuiescesTheControlPlaneBeforeTheBaseline(t *testing.T) {
+	rc, d, probe := rampFakeBench(t, 90)
+	obs := driveRampRow(t, rc, d)
+
+	if !probe.cancelSeen {
+		t.Fatal("the row never server-cancelled the seeded prior control: a spec-correct DUT would keep " +
+			"executing it and the Default-Only baseline could never become the effective control")
+	}
+	if !probe.cancelBeforeBaseline {
+		t.Error("the quiesce-cancel was issued AFTER the first baseline publish, not before — the baseline " +
+			"is then confirmed against a DUT still executing the prior event")
+	}
+	if probe.priorStatus != 6 {
+		t.Errorf("the prior control is not left advertised as Cancelled(6) after the quiesce (status=%d); a "+
+			"deleted control is one a spec-correct DUT never observes ending", probe.priorStatus)
+	}
+	// The row still PASSes on the MOVE, unweakened: baseline 50 confirmed, target
+	// 90 reached.
+	if got := obs.Params[oracleDefaultVerdictParam]; got != string(certify.Pass) {
+		t.Fatalf("the distinguishable baseline was not confirmed after the quiesce (%s=%q): %s",
+			oracleDefaultVerdictParam, got, obs.Params[oracleDefaultObservedParam])
+	}
+	f := oracleOutcome(obs)
+	if f.Verdict != certify.Pass {
+		t.Fatalf("verdict = %s after quiescing the prior event: %s", f.Verdict, findingObserved(f))
 	}
 }
 
@@ -507,7 +602,7 @@ func TestBASIC007_FailsWhenTheBaselineNeverLands(t *testing.T) {
 // names it as a distinguishing value this row invents, not the catalog's Default
 // column.
 func TestBASIC007_PassCreditIsHonestAboutTheBaselineProvenance(t *testing.T) {
-	rc, d := rampFakeBench(t, 90)
+	rc, d, _ := rampFakeBench(t, 90)
 	obs := driveRampRow(t, rc, d)
 	f := oracleOutcome(obs)
 	if f.Verdict != certify.Pass {
@@ -520,5 +615,83 @@ func TestBASIC007_PassCreditIsHonestAboutTheBaselineProvenance(t *testing.T) {
 	if !strings.Contains(obs.Params[oracleDefaultProvenanceParam], "Figure 7 does not name") {
 		t.Errorf("the recorded provenance does not disclaim Figure 7: %q",
 			obs.Params[oracleDefaultProvenanceParam])
+	}
+}
+
+// TestBASIC007_FinalFenceMustCaptureAFreshOrdinal pins
+// CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S: the final read must fence on a DER
+// poll ordinal captured FRESH at PostWait, not one carried from the Figure-7
+// PUT. run()'s AwaitWalk runs between the PUT and PostWait and advances the DER
+// poll counter, so a PUT-time ordinal's +1 predicate is ALREADY MET by the time
+// the fence reads it — awaitFreshDERPoll then returns without waiting for a
+// genuine new poll, the DUT never applies the Figure-7 value on it, and the
+// register is sampled mid-propagation (the board's WRmp=0/50, not 90).
+//
+// The fake models the REAL /poll/wait barrier: a request for an ordinal already
+// reached returns reached WITHOUT a new poll or any application (the "waited 0s"
+// case); a request for a FUTURE ordinal blocks for a genuine new poll and, on
+// it, the DUT reconciles the pending Figure-7 value (WRmp 50 -> 90).
+func TestBASIC007_FinalFenceMustCaptureAFreshOrdinal(t *testing.T) {
+	var mu sync.Mutex
+	completed := uint64(10) // AwaitWalk has already advanced the DER poll count
+	wrmp := uint16(50)      // baseline applied; the Figure-7 target (90) is pending
+	readWRmp := func() uint16 { mu.Lock(); defer mu.Unlock(); return wrmp }
+	pollBody := func() []byte {
+		mu.Lock()
+		defer mu.Unlock()
+		b, _ := json.Marshal(map[string]any{"api_version": "1.1.0", "reached": true,
+			"poll": map[string]any{"completed": completed}})
+		return b
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"paused": false, "sessions": []any{}})
+	})
+	mux.HandleFunc("/poll", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(pollBody()) })
+	mux.HandleFunc("/poll/wait", func(w http.ResponseWriter, r *http.Request) {
+		want, _ := strconv.ParseUint(r.URL.Query().Get("epoch"), 10, 64)
+		mu.Lock()
+		if want > completed {
+			// A genuine NEW poll cycle completes to satisfy the fence; the DUT
+			// reconciles the pending Figure-7 value on it.
+			completed = want
+			wrmp = 90
+		}
+		// else: the ordinal is already reached — report reached WITHOUT a new
+		// poll or any application (the "waited 0s" mid-propagation case).
+		mu.Unlock()
+		_, _ = w.Write(pollBody())
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	rc := &certify.RunCtx{
+		Case: &certify.Case{UID: "csip-conf-v1.3::BASIC-007", ID: "BASIC-007"},
+		Sims: map[string]*certify.SimClient{
+			oracleSimName: certify.NewSimClient(oracleSimName, srv.URL, http.DefaultClient),
+		},
+	}
+	d := NewDriver(rc)
+	ctx := context.Background()
+
+	// STALE: a PUT-time ordinal (5) captured BEFORE AwaitWalk advanced the
+	// counter to 10. Its +1 predicate (6) is already met, so the fence returns
+	// without a new poll and the Figure-7 value is NEVER applied — the bug.
+	awaitFreshDERPoll(ctx, d, 5, 2*time.Second)
+	if got := readWRmp(); got != 50 {
+		t.Fatalf("a stale-ordinal fence applied WRmp=%d — the test's premise (a stale fence triggers no "+
+			"genuine new poll) no longer holds", got)
+	}
+
+	// FRESH: derPollOrdinal captures the CURRENT count (10) HERE, so the fence
+	// waits for 11 — a poll that has NOT completed — and BLOCKS for a genuine new
+	// poll, on which the DUT applies WRmp=90. This is the fix.
+	fp, ok := derPollOrdinal(ctx, d)
+	if !ok {
+		t.Fatal("derPollOrdinal could not read the fake sim")
+	}
+	awaitFreshDERPoll(ctx, d, fp, 2*time.Second)
+	if got := readWRmp(); got != 90 {
+		t.Fatalf("the fresh-ordinal fence returned before a post-capture poll completed: WRmp=%d, want 90 "+
+			"— it must wait out the mid-propagation read (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S)", got)
 	}
 }

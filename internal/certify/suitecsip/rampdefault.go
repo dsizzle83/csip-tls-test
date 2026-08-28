@@ -386,24 +386,28 @@ func rampRatesSpec() spec {
 		// currently stored the instant the DUT asks.
 		SettlePoll: true,
 		PostWait: func(ctx context.Context, d *Driver, params map[string]string) error {
-			// Fence the FINAL read on a poll STRICTLY LATER than the Figure-7
-			// PUT, the same fresh-poll discipline the baseline confirm uses
-			// (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S). Without it, run()'s
-			// AwaitWalk can return at the very START of the DUT's post-Setup
-			// walk (o.Waited ~0s) and settleOracle then samples the DER before
-			// it has fetched the 9000 — the mid-propagation register the board
-			// read as WRmp=0. rampTargetPollParam is the poll ordinal captured
-			// at the moment of the Figure-7 PUT; waiting for that ordinal+1 to
-			// COMPLETE means the DUT has run a poll cycle since the PUT before
-			// the register is graded. The fence and the settle share one
-			// deadline (the row's poll-cycle window), so PostWait still fits the
-			// SettlePoll budget: the fence returns as soon as a fresh poll lands
-			// and settleOracle spends the remainder confirming WRmp=90.
+			// Fence the FINAL read on a DER poll cycle that COMPLETES after
+			// this point — captured FRESH, HERE, not carried from the Figure-7
+			// PUT (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S). The earlier
+			// version captured the poll ordinal at the moment of the PUT, inside
+			// Setup; but run()'s AwaitWalk runs BETWEEN Setup and PostWait and
+			// advances the DER's own poll counter by several cycles, so by the
+			// time this fence read that PUT-time ordinal its ordinal+1 predicate
+			// was ALREADY MET — awaitFreshDERPoll returned in ~0s and settleOracle
+			// then sampled the DER MID-PROPAGATION, the board's WRmp=0 read. A
+			// FRESH capture here is a genuine barrier: derPollOrdinal reads the
+			// count NOW, so ordinal+1 is a cycle that has not completed yet and
+			// awaitFreshDERPoll BLOCKS for it (the same deterministic /poll/wait
+			// barrier the modbus-client suite fences on), guaranteeing at least
+			// one full DER poll cycle elapses after PostWait began — strictly
+			// later than the Figure-7 PUT — before the register is graded. The
+			// fence and the settle share the row's poll-cycle-window deadline;
+			// the fence returns the instant that cycle lands and settleOracle
+			// then re-reads WRmp until it confirms 90 (a mid-propagation 0 is
+			// re-read, never returned, because WRmp only reads 90 once settled).
 			deadline := time.Now().Add(oracleSettleDeadline(params))
-			if s, ok := params[rampTargetPollParam]; ok {
-				if tp, perr := strconv.ParseUint(s, 10, 64); perr == nil {
-					awaitFreshDERPoll(ctx, d, tp, time.Until(deadline))
-				}
+			if fp, ok := derPollOrdinal(ctx, d); ok {
+				awaitFreshDERPoll(ctx, d, fp, time.Until(deadline))
 			}
 			f := settleOracle(ctx, time.Until(deadline),
 				func() Finding { return target.judgeWith(ctx, d.rc) })
@@ -460,18 +464,18 @@ func rampDefaultRequest(setGradW, setSoftGradW uint16) DefaultRequest {
 // discipline (basic.go's prescribedSetup) applied to the ramp, and the whole
 // answer to CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION.
 //
-//	1. Drive the DER into the DISTINGUISHABLE baseline (WRmp=50) and CONFIRM it
-//	   reached the DER's own registers — on a FRESH DUT poll, not a stale
-//	   register. The confirmation is recorded into the oracleDefault* keys, so
-//	   oracleOutcome FAILs the row (prescribedDefaultShortfall) if the baseline
-//	   never landed: a starting state that was not established cannot anchor a
-//	   transition claim.
-//	2. Take the pre-publication baseline for the TARGET, AFTER the distinguishable
-//	   default landed — so "the DER did not hold WRmp=90 before" is a statement
-//	   about the DER at a known non-target 50, whatever it held when the row began.
-//	3. Command Figure 7's Test Values. PostWait then proves WRmp moved to 90, and
-//	   oracleOutcome credits the move (prescribedDefaultCredit) from the confirmed
-//	   baseline.
+//  1. Drive the DER into the DISTINGUISHABLE baseline (WRmp=50) and CONFIRM it
+//     reached the DER's own registers — on a FRESH DUT poll, not a stale
+//     register. The confirmation is recorded into the oracleDefault* keys, so
+//     oracleOutcome FAILs the row (prescribedDefaultShortfall) if the baseline
+//     never landed: a starting state that was not established cannot anchor a
+//     transition claim.
+//  2. Take the pre-publication baseline for the TARGET, AFTER the distinguishable
+//     default landed — so "the DER did not hold WRmp=90 before" is a statement
+//     about the DER at a known non-target 50, whatever it held when the row began.
+//  3. Command Figure 7's Test Values. PostWait then proves WRmp moved to 90, and
+//     oracleOutcome credits the move (prescribedDefaultCredit) from the confirmed
+//     baseline.
 //
 // The move 50->90 is a transition only a live DUT tracking gridsim's
 // DefaultDERControl can produce, so the row PASSes whether WRmp started at 0, at
@@ -479,6 +483,29 @@ func rampDefaultRequest(setGradW, setSoftGradW uint16) DefaultRequest {
 // baseline confirmation if it started at 90, at the post-read otherwise.
 func rampDefaultFirstSetup(ctx context.Context, d *Driver, params map[string]string,
 	baseline, target *directOracle) error {
+	// ── 0. Quiesce program-0's control plane before establishing the baseline ─
+	// A prior row (BASIC-006's opModVoltVar; the ride-through rows BASIC-004/005)
+	// may have left an inverter-control EVENT the DUT has ALREADY acquired and is
+	// still executing. Per IEEE 2030.5-2018 §10.2.3.3 that higher-precedence
+	// active DERControl — not this row's Default-Only DefaultDERControl — is the
+	// DUT's EFFECTIVE control, so a setGradW baseline can never move WRmp while it
+	// is in force, and the confirm below would read the prior event's register
+	// (CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION). Server-cancel whatever
+	// program-0 still advertises so the DUT observes the cancellation and reverts
+	// to the DefaultDERControl, then fence a DUT poll cycle taken AFTER the cancel
+	// so the revert has landed before we publish and confirm the baseline. This
+	// makes the row self-quiescing regardless of what prior rows leave behind.
+	// Best-effort throughout: a program with nothing live is a no-op, and the
+	// settleOracle confirm below remains the backstop — this only removes an
+	// interfering event, it never decides a verdict. window is computed once here
+	// and reused for the baseline fence below.
+	window := prescribedDefaultDeadline(ctx, d.rc, params)
+	quiesceStart, quiesceHavePoll := derPollOrdinal(ctx, d)
+	_ = d.cancelProgramControls(ctx, rampDefaultProgram)
+	if quiesceHavePoll {
+		awaitFreshDERPoll(ctx, d, quiesceStart, window)
+	}
+
 	// ── 1. The distinguishable baseline, confirmed on a fresh poll ──────────
 	params[oracleDefaultCommandedParam] = strconv.Itoa(int(rampBaselineSetGradW))
 	params[oracleDefaultMRIDParam] = fmt.Sprintf("gridsim program-%d's DefaultDERControl (setGradW=%d)",
@@ -492,7 +519,6 @@ func rampDefaultFirstSetup(ctx context.Context, d *Driver, params map[string]str
 	if err := d.PostDefault(ctx, rampDefaultRequest(rampBaselineSetGradW, rampBaselineSetSoftGradW)); err != nil {
 		return fmt.Errorf("publish the distinguishable setGradW=%d ramp baseline: %w", rampBaselineSetGradW, err)
 	}
-	window := prescribedDefaultDeadline(ctx, d.rc, params)
 	params[oracleDefaultWindowParam] = window.String()
 	// Fence on the DUT's own poll cycle (LAB29-010, sim/simapi/API.md) so the
 	// confirmation below reads a poll the DUT ran AFTER this publish, never the
@@ -513,20 +539,13 @@ func rampDefaultFirstSetup(ctx context.Context, d *Driver, params map[string]str
 	params[oraclePreObservedParam] = findingObserved(pre)
 
 	// ── 3. Command Figure 7's Test Values ──────────────────────────────────
-	// Capture the DUT's poll ordinal at the MOMENT of the Figure-7 PUT, so
-	// PostWait can fence the final read on a poll strictly later than this
-	// publish (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S) rather than reading
-	// the DER mid-fetch.
-	if tp, ok := derPollOrdinal(ctx, d); ok {
-		params[rampTargetPollParam] = strconv.FormatUint(tp, 10)
-	}
+	// PostWait fences the final read on a DER poll captured FRESH at PostWait
+	// (after run()'s AwaitWalk), NOT on a poll ordinal captured here — a PUT-time
+	// ordinal is stale by the time PostWait runs, which is exactly what made the
+	// final fence "wait 0s" and read the DER mid-propagation
+	// (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S). See rampRatesSpec's PostWait.
 	return d.PostDefault(ctx, rampDefaultRequest(figure7RampTestSetGradW, figure7RampTestSetSoftGradW))
 }
-
-// rampTargetPollParam carries the DUT poll ordinal captured at the Figure-7
-// PUT, so PostWait fences the final read on a strictly-later poll — see its use
-// (CSIP-ORACLE-BASIC007-FINAL-FENCE-WAITED-0S).
-const rampTargetPollParam = "iw15.ramp_target_poll"
 
 // rampPollWaitSlice bounds ONE /poll/wait request, kept under the framework's
 // HTTP client timeout so a caller's transport never decides anything — the same
