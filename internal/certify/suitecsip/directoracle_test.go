@@ -440,7 +440,7 @@ func TestResolveConnectHome_KeysOffDeclaredModelsAndSelector(t *testing.T) {
 	}{
 		{"123 alone -> M123", mani(1, 123, 704), noParam, connectHomeM123},
 		{"703 alone -> M703", mani(1, 703, 704), noParam, connectHomeM703},
-		{"BOTH declared -> DECLINE (needs selector)", mani(1, 123, 703, 704), noParam, connectHomeUnset},
+		{"BOTH declared -> M123-first default (connect is M123-only in the product)", mani(1, 123, 703, 704), noParam, connectHomeM123},
 		{"NEITHER declared -> DECLINE", mani(1, 704), noParam, connectHomeUnset},
 		{"nil manifest -> M123 default", nil, noParam, connectHomeM123},
 		{"selector M703 beats a 123-only manifest", mani(1, 123), sel("M703"), connectHomeM703},

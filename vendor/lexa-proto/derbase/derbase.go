@@ -224,6 +224,25 @@ type Base struct {
 	Has701, Has702, Has703, Has704, Has705, Has706 bool
 	Has707, Has708, Has709, Has710, Has711, Has712 bool
 	Has713, Has714                                 bool
+
+	// PreferM123Ceiling is a per-device CONFIGURATION flag — NOT a measured
+	// capability like the Has7xx flags above. When true AND the device serves
+	// model 123, the opModMaxLimW power-limit ceiling is written to the M123
+	// WMaxLimPct register even on a device that ALSO serves model 704. The
+	// default (false) is 704-FIRST — byte-identical to the behaviour before
+	// this field existed — and a device that serves only one of the two
+	// surfaces is unaffected either way (the ceiling has exactly one register
+	// it can land on).
+	//
+	// It is set from the candidate manifest's control_precedence declaration
+	// (lexa-gw internal/candidate) — the operator's explicit choice of
+	// actuation surface for the OVERLAPPING control axes on a device that
+	// serves both. The register SELECTION itself still lives in the one switch
+	// preflightControl/preflightActuationWatts share (the only code that knows
+	// a device's 704-vs-M123 power-limit surface, with its requireWmax /
+	// requireCtrlModes preflight guards intact), so the choice is never
+	// re-derived off this seam. It breaks ONLY the both-served tie.
+	PreferM123Ceiling bool
 }
 
 const adoptPollDefault = 3 * time.Second
@@ -1231,8 +1250,18 @@ func (b *Base) preflightControl(ctrl model.DERControlBase, tag string) ([]applyS
 		if err := b.requireWmax(tag); err != nil {
 			return nil, err
 		}
+		// opModMaxLimW register SELECTION (704 WMaxLimPct vs M123 WMaxLimPct).
+		// 704-FIRST by default; M123-first ONLY when the device is CONFIGURED to
+		// prefer M123 (PreferM123Ceiling) AND actually serves model 123. A device
+		// serving just one of the two surfaces is unaffected either way. With the
+		// flag false (the default) preferM123 is always false — short-circuiting
+		// before HasModel is even called — so `case b.Has704 && !preferM123`
+		// reduces to `case b.Has704`, byte-identical to before this field.
+		// This is the ONE place the 704-vs-M123 power-limit choice is made; see
+		// PreferM123Ceiling's doc.
+		preferM123 := b.PreferM123Ceiling && b.Reader.HasModel(sunspec.ModelImmediateCtrl)
 		switch {
-		case b.Has704:
+		case b.Has704 && !preferM123:
 			if err := b.requireCtrlModes(bind.axis, modeMaxW); err != nil {
 				return nil, err
 			}
@@ -1404,8 +1433,13 @@ func (b *Base) preflightActuationWatts(fixedW, maxLimW *float64, connect *bool, 
 		if err := b.requireWmax(tag); err != nil {
 			return nil, err
 		}
+		// opModMaxLimW register SELECTION — see preflightControl's identical
+		// switch and PreferM123Ceiling's doc. 704-FIRST by default; M123-first
+		// only when CONFIGURED to prefer M123 AND the device serves model 123.
+		// Flag false (default) ⇒ preferM123 false ⇒ `case b.Has704`, byte-identical.
+		preferM123 := b.PreferM123Ceiling && b.Reader.HasModel(sunspec.ModelImmediateCtrl)
 		switch {
-		case b.Has704:
+		case b.Has704 && !preferM123:
 			if err := b.requireCtrlModes("opModMaxLimW", modeMaxW); err != nil {
 				return nil, err
 			}

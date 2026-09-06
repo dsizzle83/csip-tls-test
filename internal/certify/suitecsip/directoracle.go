@@ -275,8 +275,15 @@ func resolveConnectHome(m *manifest.Manifest, param func(string) (string, bool))
 	case has703 && !has123:
 		return connectHomeM703, "the candidate manifest declares model 703 and not model 123"
 	case has123 && has703:
-		return connectHomeUnset, "the candidate manifest declares BOTH model 123 and model 703, either of " +
-			"which can be the connect home; pass -param " + connectHomeParam + "=M123|M703 to choose"
+		// M123-FIRST precedence (owner ruling 2026-09-06): opModConnect actuates
+		// through model 123 Conn ONLY in the product today — 703 EnterService is a
+		// documented FUTURE connect home — so when both are declared BASIC-009
+		// grades model 123 Conn by default rather than declining. The selector
+		// (-param connect-home=M703) still forces the 703 path for readiness testing.
+		return connectHomeM123, "the candidate manifest declares BOTH model 123 and model 703; per the " +
+			"product's M123-first precedence (opModConnect actuates model 123 Conn only; 703 EnterService " +
+			"is a future home) BASIC-009 grades model 123 Conn — pass -param " + connectHomeParam +
+			"=M703 to grade the 703 enter-service path instead"
 	default:
 		return connectHomeUnset, "the candidate manifest declares neither model 123 nor model 703, so it " +
 			"names no connect home; pass -param " + connectHomeParam + "=M123|M703"
