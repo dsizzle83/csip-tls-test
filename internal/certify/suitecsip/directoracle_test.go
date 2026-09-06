@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/certify/manifest"
 	"csip-tls-test/internal/invariant"
 	"lexa-proto/sunspec"
 )
@@ -338,6 +339,207 @@ func TestBASIC009_TheDERsOwnConnStIsReportedAndNeverGrades(t *testing.T) {
 			got.Observed)
 	}
 	t.Logf("REPORTED, not graded —\n  %s", got.Observed)
+}
+
+// ── BASIC-009: EITHER connect home (M123 Conn or M703 ES) ───────────────────
+
+// judgeBASIC009Home drives BASIC-009's connect oracle with an explicit -param
+// connect-home selector, so a test can grade the connect transition via M123 OR
+// via M703 ES on the bench simulator that serves both.
+func judgeBASIC009Home(t *testing.T, home string, regs map[uint16][]uint16) Finding {
+	t.Helper()
+	m := rowByID(t, "BASIC-009").mode
+	if m.Direct == nil || m.Direct.JudgeCtx == nil {
+		t.Fatal("BASIC-009 carries no manifest-aware connect oracle (JudgeCtx)")
+	}
+	rc := &certify.RunCtx{Params: map[string]string{connectHomeParam: home}}
+	return m.Direct.JudgeCtx(unitWith(regs), rc)
+}
+
+// GRADE VIA M703 ES: with -param connect-home=M703 the enter-service permission
+// is the GRADED home, judged against the energize published alongside. The row
+// commands energize=false, so ES=cleared is the PASS and ES=set is the FAIL —
+// the mirror of the M123 Conn grade, on the axis a pure-7xx candidate declares.
+func TestBASIC009_GradesM703ESViaSelector(t *testing.T) {
+	// ES cleared MATCHES the commanded energize=false -> PASS.
+	got := judgeBASIC009Home(t, "M703", map[uint16][]uint16{703: es703(t, false)})
+	if got.Verdict != certify.Pass {
+		t.Fatalf("BASIC-009 via M703 = %s on a DER whose 703 ES matches the commanded energize=false: %s",
+			got.Verdict, findingObserved(got))
+	}
+	for _, want := range []string{"GRADED (opModEnergize via model 703 ES", "model 703 ES", "reads false"} {
+		if !strings.Contains(got.Observed, want) {
+			t.Errorf("the M703 verdict does not say %q:\n  %s", want, got.Observed)
+		}
+	}
+	t.Logf("GREEN — M703 ES graded —\n  %s", got.Observed)
+
+	// ES SET disagrees with the commanded energize=false -> FAIL.
+	red := judgeBASIC009Home(t, "M703", map[uint16][]uint16{703: es703(t, true)})
+	if red.Verdict != certify.Fail {
+		t.Fatalf("BASIC-009 via M703 = %s on a DER whose 703 ES is SET against a commanded energize=false: %s",
+			red.Verdict, findingObserved(red))
+	}
+	t.Logf("RED — M703 ES set against commanded energize=false —\n  %s", red.Observed)
+}
+
+// GRADE VIA M703 but the DER serves no 703: a decided FAIL, not an abstention —
+// an unmeasured GRADED axis is not a pass, the same rule the M123 home holds.
+func TestBASIC009_M703SelectedButUnserved_IsDecidedFail(t *testing.T) {
+	got := judgeBASIC009Home(t, "M703", map[uint16][]uint16{sunspec.ModelImmediateCtrl: m123(t, 0)})
+	if got.Verdict != certify.Fail || got.Unavailable != "" {
+		t.Fatalf("BASIC-009 via M703 with no model 703 = %s unavailable=%q, want a decided FAIL: %s",
+			got.Verdict, got.Unavailable, findingObserved(got))
+	}
+	if !strings.Contains(got.Observed, "model 703 is NOT served") {
+		t.Errorf("the FAIL does not name the unserved graded home:\n  %s", got.Observed)
+	}
+}
+
+// GRADE VIA M123 by explicit selector, even where the DER also serves 703: the
+// selector wins and 703 is REPORTED, not graded.
+func TestBASIC009_GradesM123ViaSelector(t *testing.T) {
+	got := judgeBASIC009Home(t, "M123", map[uint16][]uint16{
+		sunspec.ModelImmediateCtrl: m123(t, 0),
+		703:                        es703(t, true),
+	})
+	if got.Verdict != certify.Pass {
+		t.Fatalf("BASIC-009 via M123 = %s on a DER whose M123 Conn matches and whose 703 ES disagrees: %s",
+			got.Verdict, findingObserved(got))
+	}
+	for _, want := range []string{"GRADED (opModConnect via model 123", "model 123 Conn reads false",
+		"model 703 ES", "REPORTED, not graded"} {
+		if !strings.Contains(got.Observed, want) {
+			t.Errorf("the M123-via-selector verdict does not say %q:\n  %s", want, got.Observed)
+		}
+	}
+}
+
+// TestResolveConnectHome_KeysOffDeclaredModelsAndSelector proves the whole
+// decision tree: the -param selector wins, else a single declared connect-home
+// model decides, else — BOTH declared or NEITHER — it DECLINES rather than guess.
+// A nil manifest defaults to M123 (the pre-manifest behaviour), the one case
+// that is not a guess because silence is not an ambiguous declaration.
+func TestResolveConnectHome_KeysOffDeclaredModelsAndSelector(t *testing.T) {
+	noParam := func(string) (string, bool) { return "", false }
+	sel := func(v string) func(string) (string, bool) {
+		return func(k string) (string, bool) {
+			if k == connectHomeParam {
+				return v, true
+			}
+			return "", false
+		}
+	}
+	mani := func(ids ...int) *manifest.Manifest { return &manifest.Manifest{Models: ids} }
+
+	cases := []struct {
+		name  string
+		m     *manifest.Manifest
+		param func(string) (string, bool)
+		want  connectHome
+	}{
+		{"123 alone -> M123", mani(1, 123, 704), noParam, connectHomeM123},
+		{"703 alone -> M703", mani(1, 703, 704), noParam, connectHomeM703},
+		{"BOTH declared -> DECLINE (needs selector)", mani(1, 123, 703, 704), noParam, connectHomeUnset},
+		{"NEITHER declared -> DECLINE", mani(1, 704), noParam, connectHomeUnset},
+		{"nil manifest -> M123 default", nil, noParam, connectHomeM123},
+		{"selector M703 beats a 123-only manifest", mani(1, 123), sel("M703"), connectHomeM703},
+		{"selector M123 beats a 703-only manifest", mani(1, 703), sel("M123"), connectHomeM123},
+		{"selector resolves the both-present ambiguity", mani(1, 123, 703), sel("M703"), connectHomeM703},
+		{"bogus selector -> DECLINE, never guess", mani(1, 123), sel("bogus"), connectHomeUnset},
+		{"empty selector falls through to the manifest", mani(1, 703), sel("  "), connectHomeM703},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, why := resolveConnectHome(tc.m, tc.param)
+			if got != tc.want {
+				t.Fatalf("resolveConnectHome = %v, want %v (reason: %s)", got, tc.want, why)
+			}
+			if got == connectHomeUnset && !strings.Contains(why, connectHomeParam) {
+				t.Errorf("a DECLINE does not point the operator at -param %s: %s", connectHomeParam, why)
+			}
+		})
+	}
+}
+
+// BOTH-PRESENT NEEDS A SELECTOR, at the row: a run that cannot resolve the home
+// (here a bogus selector standing in for the unresolvable both-present manifest
+// the resolver test covers directly) DECLINES — Unavailable — rather than grade
+// an axis nobody chose. Through the gating direct-oracle path that Unavailable
+// becomes a FAIL (oracleOutcome), which is the fail-closed answer.
+func TestBASIC009_UnresolvableHomeDeclines(t *testing.T) {
+	got := judgeBASIC009Home(t, "M999", map[uint16][]uint16{
+		sunspec.ModelImmediateCtrl: m123(t, 0),
+		703:                        es703(t, false),
+	})
+	if got.Unavailable == "" {
+		t.Fatalf("an unresolvable connect home produced verdict %s instead of DECLINING: %s",
+			got.Verdict, got.Observed)
+	}
+	for _, want := range []string{"cannot decide which connect home", connectHomeParam} {
+		if !strings.Contains(got.Unavailable, want) {
+			t.Errorf("the DECLINE does not say %q:\n  %s", want, got.Unavailable)
+		}
+	}
+	t.Logf("DECLINE —\n  %s", got.Unavailable)
+}
+
+// THE COMPOSITE — the exact product bug the harness must catch independently:
+// the DUT reports the machine went off (model 701 ConnSt=0, and it POSTs a
+// DERControlResponse Started(2)) while the GRADED connect home, model 123 Conn,
+// still reads connected after a commanded connect=false. A referee that trusted
+// the device's own ConnSt would PASS; grading the declared home FAILs, and the
+// Started(2) the graded home does not back is withheld (a response-integrity
+// FAIL). This is the lexa-gw defect, reproduced with no bench.
+func TestBASIC009_Composite_M123RefusesWhileConnStClaimsDisconnected(t *testing.T) {
+	const mrid = "CERT-BASIC-009"
+	regs := map[uint16][]uint16{
+		sunspec.ModelImmediateCtrl: m123(t, 1),   // STILL connected — the disconnect did not take
+		701:                        meas701(t, 0), // the DER's own status claims disconnected
+	}
+
+	// 1) The connect oracle grades the declared home (M123 Conn), not ConnSt.
+	post := judgeBASIC009Home(t, "M123", regs)
+	if post.Verdict != certify.Fail {
+		t.Fatalf("connect oracle = %s, want FAIL: the graded M123 Conn still reads connected after a "+
+			"commanded disconnect, whatever ConnSt claims: %s", post.Verdict, findingObserved(post))
+	}
+	if !strings.Contains(post.Observed, "model 123 Conn reads true") {
+		t.Errorf("the FAIL does not report the graded home still reading connected:\n  %s", post.Observed)
+	}
+	if !strings.Contains(post.Observed, "ConnSt reads 0") ||
+		!strings.Contains(post.Observed, "REPORTED and not graded") {
+		t.Errorf("the verdict does not report ConnSt=0 as reported-not-graded, so a reader cannot see the "+
+			"device's own claim was disregarded for grading:\n  %s", post.Observed)
+	}
+
+	// 2) The response-integrity gate, fed that FAIL post-verdict: a Started(2)
+	//    the graded home does not back is a FAIL — the Started is withheld.
+	o := &Observation{Params: map[string]string{
+		"mrid":              mrid,
+		oracleVerdictParam:  string(post.Verdict),
+		oracleObservedParam: post.Observed,
+	}}
+	c := critConnectStartedIntegrity(mrid, o)
+	started := &ServerView{Responses: []AdminResponse{{Subject: mrid, Status: 2}}}
+	gate := c.Server(started)
+	if gate.Verdict != certify.Fail {
+		t.Fatalf("started-integrity gate = %s, want FAIL: a Started(2) the graded connect home did not "+
+			"reach is a response-integrity defect: %s", gate.Verdict, gate.Observed)
+	}
+	if !strings.Contains(gate.Observed, "response-integrity") {
+		t.Errorf("the gate FAIL does not name the response-integrity defect:\n  %s", gate.Observed)
+	}
+
+	// 3) And a CORRECT withhold (no Started(2)) against the same FAIL is a PASS:
+	//    the gate fires only on the false Started, never on a device that told
+	//    the truth by staying silent.
+	withheld := &ServerView{Responses: []AdminResponse{{Subject: mrid, Status: 1}, {Subject: mrid, Status: 252}}}
+	if ok := c.Server(withheld); ok.Verdict != certify.Pass {
+		t.Fatalf("a correct CannotComply withhold = %s, want PASS: %s", ok.Verdict, ok.Observed)
+	}
+	t.Logf("composite RED — oracle FAIL + false Started withheld:\n  oracle: %s\n  gate: %s",
+		post.Observed, gate.Observed)
 }
 
 // ── The legacy widening's blast radius, bounded ─────────────────────────────

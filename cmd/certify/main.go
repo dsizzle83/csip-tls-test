@@ -284,7 +284,10 @@ func (c *cli) bindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.dutName, "dut-name", "", "device under test, recorded in the bundle")
 	fs.StringVar(&c.dutIdentity, "dut-identity", "", "DUT credential recorded in the bundle: LFDI, cert fingerprint, serial")
 	fs.StringVar(&c.dutRole, "dut-role", "", "DUT role recorded in the bundle")
-	fs.StringVar(&c.dutBuild, "dut-build", "", "DUT firmware/build version recorded in the bundle")
+	fs.StringVar(&c.dutBuild, "dut-build", "",
+		"DUT firmware/build version. Recorded in the bundle, and — on a GATING campaign reachable over a "+
+			"gateway transport — VERIFIED against the DUT's own reported build (GET /status fw/build_id): a "+
+			"mismatch, or a build that cannot be read, stops the run before case 1")
 
 	fs.Var(listFlag{&c.caps}, "cap",
 		"assert a capability tag the runner cannot detect, e.g. root (repeatable, comma-separated)")

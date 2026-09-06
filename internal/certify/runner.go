@@ -164,6 +164,16 @@ type Options struct {
 	// evidence of a slightly different kind.
 	SkipPreflight bool
 
+	// AllowDirty is the off-by-default escape hatch for the provenance
+	// preflight: a GATING campaign refuses a DIRTY harness worktree (or one
+	// whose HEAD cannot be determined), because cert evidence must be
+	// reproducible from a named commit, and a bundle built from uncommitted
+	// changes cannot be. -allow-dirty lets a developer run a gating campaign
+	// against a work-in-progress tree anyway; its use, and the harness HEAD it
+	// was used over, are recorded in the bundle so a reader knows the evidence
+	// came from a tree that was not clean. See preflight_provenance.go.
+	AllowDirty bool
+
 	// Command is the argument vector that started this process. The runner
 	// records it in the bundle with credential-shaped values replaced (see
 	// bundle.RedactCommand); what is stored HERE is what the caller passed,
@@ -394,6 +404,11 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 			"legitimately differ; the bundle records that the check was skipped). It does NOT wave "+
 			"through a WRONG control-authority reading: its only effect there is to let an EXPLORATORY "+
 			"run with no gateway transport proceed, non-gating")
+	fs.BoolVar(&o.AllowDirty, "allow-dirty", o.AllowDirty,
+		"let a GATING campaign run against a DIRTY harness worktree (or one whose HEAD cannot be "+
+			"determined). Off by default: cert evidence must be reproducible from a named commit, so a "+
+			"gating run normally refuses an uncommitted tree. Its use and the harness HEAD are recorded "+
+			"in the bundle")
 	fs.StringVar(&o.Preset, "preset", o.Preset,
 		"fill in the bench addresses for a named topology — "+PresetSummary()+
 			". Flags given explicitly always win")
@@ -526,6 +541,10 @@ type RunReport struct {
 	// Authority is what the control-authority preflight established, or why it
 	// could not.
 	Authority authorityOutcome
+	// Provenance is what the provenance preflight established about the harness
+	// tree this evidence was produced from and the DUT build it was produced
+	// against. See preflight_provenance.go.
+	Provenance provenanceOutcome
 	// Exploratory, when non-empty, is why this run is NOT GATING — a run that
 	// may not decide anything. It is recorded in the bundle so a reader never
 	// has to reconstruct it from a command line.
@@ -656,13 +675,18 @@ type Runner struct {
 	// so a malformed prefix is a startup error rather than a failure on the
 	// first introspection call, forty minutes in.
 	gatewayExec []string
+	// gwRunner overrides the gateway command transport; nil means the real
+	// ssh/exec transport. It is the one seam the gateway-reading preflights
+	// (manifest, provenance) need to run against a fake DUT in a test, mirroring
+	// the Gateway.Runner the authority preflight's own tests inject directly.
+	gwRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
 // gateway builds the READ-ONLY introspection client for this run. One
 // constructor, so the two transports cannot diverge between the preflight and
 // the checks.
 func (r *Runner) gateway() *Gateway {
-	return &Gateway{SSH: r.opts.GatewaySSH, Exec: r.gatewayExec}
+	return &Gateway{SSH: r.opts.GatewaySSH, Exec: r.gatewayExec, Runner: r.gwRunner}
 }
 
 // Manifest returns the candidate manifest this run was measured against, or nil.
@@ -992,6 +1016,19 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 	// minutes of findings about a device that was behaving perfectly. The dry
 	// run above is exempt because it touches no bench at all.
 	if err := r.preflight(ctx, reporter); err != nil {
+		rep.Finished = time.Now().UTC()
+		return rep, err
+	}
+
+	// Before anything the bundle will later be cited for: can this evidence be
+	// traced to the code that produced it and the build it was produced against?
+	// A gating campaign built from a dirty tree, or against a DUT running a build
+	// other than the one -dut-build names, is evidence about an artefact nobody
+	// can reconstruct — and this catches it in the first second, not in the
+	// bundle's DUT record months later. See preflight_provenance.go.
+	prov, err := r.preflightProvenance(ctx, reporter)
+	rep.Provenance = prov
+	if err != nil {
 		rep.Finished = time.Now().UTC()
 		return rep, err
 	}
@@ -1700,6 +1737,15 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 	// a reader of the findings needs.
 	if r.opts.SkipPreflight {
 		note = joinNote(note, SkipPreflightNote)
+	}
+	// Provenance the reader of the findings needs stated, not inferred: the DUT
+	// build this evidence was measured against (recorded whenever it was read,
+	// verified or not), and whether -allow-dirty let a gating run be built from a
+	// tree that was not clean. The harness HEAD and dirty flag themselves ride
+	// RunMeta.GitCommit/GitDirty, set just above from the same reader. See
+	// preflight_provenance.go.
+	if note2 := provenanceNote(rep.Provenance); note2 != "" {
+		note = joinNote(note, note2)
 	}
 	if rep.Exploratory != "" {
 		note = joinNote(note, "EXPLORATORY, NOT GATING: "+rep.Exploratory)

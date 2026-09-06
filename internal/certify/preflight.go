@@ -61,6 +61,38 @@ const SkipPreflightNote = "preflight SKIPPED (-skip-preflight): the run did not 
 	"-gridsim-admin name one live process, so any claim resting on gridsim's server-side observations " +
 	"assumes a pairing this bundle does not evidence"
 
+// unprovable renders a preflight precondition that could NOT be established —
+// the one shape every candidate/bench preflight has more than one of, spelled
+// ONE way so a reader meets the same words wherever the gap is.
+//
+// The split is the fixture preflight's, generalised: on a GATING campaign it is
+// FATAL and this returns an error the caller aborts the run on, because a
+// certification bundle may not rest on a precondition the run never proved — a
+// bundle whose scope decisions ride an UNVERIFIED topology records this tool's
+// unproven assumption as the product's own claim. On an exploratory run (no
+// -campaign) it is a WARN: the check names the gap, the run continues, and a
+// quick poke is not blocked by a precondition only a cert campaign must have.
+//
+// This is the SAME posture split preflightFixture already applied to a served-
+// but-undeclared model and preflightManifest to an under-declaration; before
+// this helper the two files each answered "the DUT could not be asked at all"
+// with a bare warn-and-continue on BOTH paths, so a gating campaign would
+// generate cert evidence for a topology nothing in the run had established.
+//
+// `what` names, in a few words, exactly what could not be proven (it leads both
+// the fatal error and the warn line); `detail` is the full sentence — the
+// consequence and, where there is one, the flag that would close the gap.
+func (r *Runner) unprovable(reporter *Reporter, what, detail string) error {
+	if r.gatingCampaign() {
+		return fmt.Errorf("certify: preflight: %s could not be proven, and this is a GATING campaign "+
+			"(-campaign %s): a certification bundle may not rest on a precondition this run did not "+
+			"establish. %s", what, r.campaign.Name, detail)
+	}
+	reporter.Line("preflight: %s could not be proven — %s. This is an EXPLORATORY run (no -campaign), so "+
+		"it is a WARNING, not a refusal; a gating campaign would stop here", what, detail)
+	return nil
+}
+
 // preflight verifies that the bench the flags describe is the bench that
 // exists. It returns an error the caller should abandon the run on.
 func (r *Runner) preflight(ctx context.Context, reporter *Reporter) error {

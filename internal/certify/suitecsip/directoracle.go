@@ -52,6 +52,7 @@ import (
 	"strings"
 
 	"csip-tls-test/internal/certify"
+	"csip-tls-test/internal/certify/manifest"
 	"csip-tls-test/internal/invariant"
 	"lexa-proto/sunspec"
 )
@@ -207,144 +208,293 @@ func oracleFixedPFInject(want FixedPFSettings) *directOracle {
 // a step of 0.001.
 const fixedPFTolerance = 0.0015
 
-// ── BASIC-009: connect, graded against the DECLARED connect home ───────────
+// ── BASIC-009: connect, graded against EITHER declared connect home ─────────
 
-// oracleConnect grades BASIC-009's connect command against the model the
-// CANDIDATE declares as its connect home, and REPORTS — never grades — the
-// energize (M703 ES) and connection-status (M701 ConnSt) registers alongside it.
+// connectHome names which SunSpec model BASIC-009 grades its connect transition
+// against. The two are the OPPOSITE-generation register homes of the row's two
+// axes: opModConnect lands on model 123's Conn point (the legacy connect home),
+// opModEnergize on model 703's enter-service permission (the 7xx home). A DER
+// implements one, the other, or — the advanced bench fixture — both, so which
+// one this row GRADES is a property of the candidate, not of the wire image.
+type connectHome int
+
+const (
+	connectHomeUnset connectHome = iota // ambiguous / undeclared: DECLINE, never guess
+	connectHomeM123                     // opModConnect  -> model 123 Conn
+	connectHomeM703                     // opModEnergize -> model 703 ES (enter-service)
+)
+
+// connectHomeParam is the -param that names the connect home explicitly. It is
+// what lets the bench simulator — which serves BOTH 123 and 703 and so cannot
+// be disambiguated from the register image alone — be driven through EITHER
+// mode: a run can grade the connect transition via M123 on one pass and via
+// M703 ES on the next. It ALWAYS wins over the manifest, because an operator
+// exercising one home of a both-home fixture has said which.
+const connectHomeParam = "connect-home"
+
+// resolveConnectHome decides which model BASIC-009 grades its connect transition
+// against, and DECLINES rather than guess when the choice is genuinely ambiguous.
 //
-// ── Why this stopped grading both M703 and M123 ─────────────────────────────
+// Order:
+//  1. the -param connect-home selector, when set — the explicit override.
+//  2. otherwise the candidate manifest's declared models: model 123 alone -> M123,
+//     model 703 alone -> M703 ES. A candidate that declares exactly one of the two
+//     connect-home models has named its home.
+//  3. BOTH declared (the advanced-fixture candidate) or NEITHER (a manifest that
+//     named no connect home): no unambiguous home and no selector, so it DECLINES
+//     (connectHomeUnset) rather than grade an axis the candidate has not chosen.
 //
-// The prior oracle graded opModEnergize against model 703's ES on any DER that
+// A NIL manifest is the one case that DEFAULTS rather than declines, and that is
+// deliberate: RunCtx.Manifest()'s contract is that a run with no -manifest must
+// behave exactly as the harness did before manifests existed, and before this
+// generalisation BASIC-009 graded M123 (derbase's SetConnectPlan -> newM123ConnPlan;
+// the owner-confirmed OEM connect home). Silence is NOT an ambiguous declaration
+// — it is no declaration — so it takes the historical default; an AMBIGUOUS
+// declaration is where "never guess" has teeth. Gating campaigns REQUIRE a
+// manifest, so the fail-closed path always reaches step 2 or 3, never the default.
+func resolveConnectHome(m *manifest.Manifest, param func(string) (string, bool)) (connectHome, string) {
+	if v, ok := param(connectHomeParam); ok && strings.TrimSpace(v) != "" {
+		switch strings.ToUpper(strings.TrimSpace(v)) {
+		case "M123", "123":
+			return connectHomeM123, "the -param " + connectHomeParam + "=M123 selector"
+		case "M703", "703", "ES":
+			return connectHomeM703, "the -param " + connectHomeParam + "=M703 selector"
+		default:
+			return connectHomeUnset, fmt.Sprintf("the -param %s=%q selector is neither M123 nor M703",
+				connectHomeParam, v)
+		}
+	}
+	if m == nil {
+		return connectHomeM123, "no candidate manifest was supplied, so BASIC-009 grades its historical " +
+			"default connect home model 123 Conn (the pre-manifest behaviour RunCtx.Manifest() preserves)"
+	}
+	has123, has703 := m.HasModel(123), m.HasModel(703)
+	switch {
+	case has123 && !has703:
+		return connectHomeM123, "the candidate manifest declares model 123 and not model 703"
+	case has703 && !has123:
+		return connectHomeM703, "the candidate manifest declares model 703 and not model 123"
+	case has123 && has703:
+		return connectHomeUnset, "the candidate manifest declares BOTH model 123 and model 703, either of " +
+			"which can be the connect home; pass -param " + connectHomeParam + "=M123|M703 to choose"
+	default:
+		return connectHomeUnset, "the candidate manifest declares neither model 123 nor model 703, so it " +
+			"names no connect home; pass -param " + connectHomeParam + "=M123|M703"
+	}
+}
+
+// oracleConnect grades BASIC-009's connect command against whichever connect
+// home resolveConnectHome names for this run — model 123's Conn (opModConnect)
+// or model 703's enter-service permission (opModEnergize) — and REPORTS, never
+// grades, the OTHER home and the DER's own model 701 ConnSt alongside it.
+//
+// ── Why the home is chosen, not fixed ───────────────────────────────────────
+//
+// The prior oracle graded opModEnergize against model 703 ES on any DER that
 // served 703, on the assumption that a bench serves EITHER 703 (7xx) OR 123
 // (legacy) but not both. That is false for the advanced fixture, which serves
-// the whole chain — 703 AND 123 (sim/modsim, -der-models advanced). So a connect
-// row that commanded energize=false was FAILed because model 703's ES read its
-// as-built default (enter-service permitted), even though the CANDIDATE
-// implements connect via model 123's Conn — not enter-service via 703 (the owner
-// confirmed the OEM inverter's connect home is M123, and the candidate manifest
-// declares model 123). Grading a model the candidate does not claim for this
-// axis FAILed a conforming DUT on the fixture's own default (the BASIC-009 leg of
-// HARNESS-TEARDOWN-CANCEL-ONLY-LEAVES-APPLIED-STATE, RUN-3).
-//
-// So the connect axis is now graded against M123's Conn — the DECLARED home —
-// and M703 ES and M701 ConnSt are REPORTED, not graded, exactly as BASIC-012
-// names the half it cannot hold. The verdict is Pass if and only if M123 Conn
-// measurably reached the commanded connect state; an M123 that is absent (the
-// declared home unserved — a fixture/candidate mismatch preflightFixture also
-// catches) or unreadable is a FAIL, because an unmeasured graded axis is not a
-// pass. derbase agrees the home is M123 (SetConnectPlan -> newM123ConnPlan) and
-// lexa-gw's supported.go names it "opModConnect (M123 Conn)".
+// the whole chain — 703 AND 123 — so a connect row commanding energize=false was
+// FAILed on 703's as-built default (enter-service permitted) even where the
+// candidate's connect home was M123 (HARNESS-TEARDOWN-CANCEL-ONLY-LEAVES-APPLIED-
+// STATE, RUN-3). The fix then hard-pinned the home to M123, which is right for a
+// candidate that declares 123 and wrong for one that declares only 703 (the
+// common one-to-one-7xx manifest): it graded a model the candidate does not
+// claim. So the home is now the candidate's OWN — its declared models, or an
+// explicit -param connect-home for the both-home bench — and the verdict is Pass
+// iff the GRADED home measurably reached the commanded state. An absent graded
+// home (the declared home unserved — a fixture/candidate mismatch preflightFixture
+// also catches) or an unreadable one is a FAIL: an unmeasured graded axis is not
+// a pass. An UNRESOLVABLE home (ambiguous declaration, no selector) DECLINES —
+// which the gating direct-oracle path turns into a FAIL (oracleOutcome), the
+// fail-closed answer — rather than grade an axis nobody chose.
 func oracleConnect(wantConnect, wantEnergize bool) *directOracle {
 	return &directOracle{
-		Axis:        "opModConnect",
-		ConnectHome: "M123",
+		Axis: "opModConnect",
+		// A marker that this is THE connect row, so basic.go attaches the
+		// response-integrity gate; the GRADED home is chosen per run (see
+		// resolveConnectHome), not named here.
+		ConnectHome: "connect",
 		Commanded:   fmt.Sprintf("connect=%t (energize=%t published alongside)", wantConnect, wantEnergize),
-		Registers: "opModConnect's register home is model 123's Conn point — the model the candidate " +
-			"declares as its connect home, read here through this referee's own transcription of the " +
-			"published model (internal/invariant's legacyctl.go), not through the product's. Model 703's ES " +
-			"enter-service permission and model 701's ConnSt are REPORTED alongside the graded axis, never " +
-			"graded: the candidate implements connect via M123, not enter-service via 703.",
+		Registers: "opModConnect's register home is model 123's Conn point and opModEnergize's is model 703's " +
+			"enter-service permission (ES) — the OPPOSITE-generation homes of a legacy and a 7xx DER. Which one " +
+			"this row GRADES is chosen from the candidate manifest's declared models (123-only -> M123 Conn, " +
+			"703-only -> M703 ES) or an explicit -param connect-home, read here through this referee's own " +
+			"transcription of the published models (internal/invariant's legacyctl.go, lexa-proto's Parse703), " +
+			"not through the product's; the OTHER home and model 701's ConnSt are REPORTED alongside the graded " +
+			"axis, never graded.",
 		JudgeCtx: func(uv invariant.UnitView, rc *certify.RunCtx) Finding {
-			var graded, reported []string
-			verdict := certify.Pass
-
-			// ── GRADE: opModConnect -> model 123 Conn (the DECLARED home) ──
-			lc := uv.LegacyCommands(oracleSimName)
-			switch {
-			case !lc.Present:
-				// The candidate's declared connect home is not served by this
-				// DER. That is a fixture/candidate mismatch (preflightFixture
-				// fails the campaign on it), and at the oracle level an unmeasured
-				// GRADED axis is a FAIL, not a silent pass on the reported ones.
-				verdict = certify.Fail
-				graded = append(graded, "opModConnect's declared home model 123 is NOT served by this DER, "+
-					"so the graded connect axis could not be measured — a fixture that does not serve the "+
-					"model the candidate declares as its connect home")
+			home, why := resolveConnectHome(rc.Manifest(), rc.Param)
+			switch home {
+			case connectHomeM123:
+				return judgeConnectHomeM123(uv, rc, wantConnect, wantEnergize, why)
+			case connectHomeM703:
+				return judgeConnectHomeM703(uv, rc, wantConnect, wantEnergize, why)
 			default:
-				got, ok := connectState(lc)
-				if !ok {
-					verdict = certify.Fail
-					graded = append(graded, "model 123's Conn point could not be read as a connect state ("+
-						lc.Note+")")
-					break
-				}
-				graded = append(graded, fmt.Sprintf("model 123 Conn reads %t against a commanded connect=%t",
-					got, wantConnect))
-				if got != wantConnect {
-					verdict = certify.Fail
-				}
-				if d := invariant.DescribeM123Divergence(); d != "" {
-					reported = append(reported, "TRANSCRIPTION: "+d)
-				}
+				return unavailable("BASIC-009 cannot decide which connect home to grade: %s. Its connect "+
+					"transition is graded via model 123 Conn OR model 703 ES, and this run established neither "+
+					"an unambiguous declared model nor a -param %s selector, so the oracle DECLINES rather than "+
+					"grade an axis the candidate has not chosen", why, connectHomeParam)
 			}
-
-			// ── REPORT (not grade): opModEnergize -> model 703 ES ──
-			if regs := uv.Regs[703]; len(regs) > 0 {
-				es := sunspec.Parse703(regs)
-				reported = append(reported, fmt.Sprintf("model 703 ES (enter-service permission) reads %t "+
-					"against the energize=%t published alongside — REPORTED, not graded: this candidate "+
-					"implements connect via model 123, not enter-service via 703, so grading 703 here would "+
-					"FAIL a conforming DUT on the fixture's as-built default", es.Enabled, wantEnergize))
-			} else {
-				reported = append(reported, "opModEnergize: this DER serves no model 703 (reported, not "+
-					"graded)")
-			}
-
-			// ── REPORT (not grade): the DER's own model 701 ConnSt ──
-			if meas := uv.Measurement(oracleSimName); meas.Present {
-				reported = append(reported, fmt.Sprintf("the DER's own model 701 ConnSt reads %d — its "+
-					"account of its connection state, REPORTED and not graded", meas.ConnSt))
-			}
-
-			// ── Manifest disclosure: is the graded home one the candidate claims? ──
-			if m := rc.Manifest(); m != nil {
-				if m.HasModel(123) {
-					reported = append(reported, "the candidate manifest declares model 123, so the graded "+
-						"connect home is one it claims")
-				} else {
-					reported = append(reported, "NOTE: the candidate manifest does NOT declare model 123, "+
-						"the model this row grades opModConnect against — the graded home is not one the "+
-						"candidate claims (preflightFixture is the campaign-level gate for this)")
-				}
-			}
-
-			obs := "GRADED (opModConnect via model 123, the declared connect home): " + joinSemis(graded)
-			if len(reported) > 0 {
-				obs += ". REPORTED, not graded: " + joinSemis(reported)
-			}
-			return Finding{Verdict: verdict, Observed: obs}
 		},
 	}
 }
 
+// judgeConnectHomeM123 grades opModConnect against model 123's Conn point (the
+// legacy connect home) and reports model 703 ES, model 701 ConnSt, and the
+// manifest disclosure alongside.
+func judgeConnectHomeM123(uv invariant.UnitView, rc *certify.RunCtx, wantConnect, wantEnergize bool, why string) Finding {
+	var graded, reported []string
+	verdict := certify.Pass
+
+	// ── GRADE: opModConnect -> model 123 Conn ──
+	lc := uv.LegacyCommands(oracleSimName)
+	switch {
+	case !lc.Present:
+		// The graded connect home is not served by this DER. That is a
+		// fixture/candidate mismatch (preflightFixture fails the campaign on
+		// it), and at the oracle level an unmeasured GRADED axis is a FAIL, not
+		// a silent pass on the reported ones.
+		verdict = certify.Fail
+		graded = append(graded, "opModConnect's declared home model 123 is NOT served by this DER, "+
+			"so the graded connect axis could not be measured — a fixture that does not serve the "+
+			"model the candidate declares as its connect home")
+	default:
+		got, ok := connectState(lc)
+		if !ok {
+			verdict = certify.Fail
+			graded = append(graded, "model 123's Conn point could not be read as a connect state ("+
+				lc.Note+")")
+			break
+		}
+		graded = append(graded, fmt.Sprintf("model 123 Conn reads %t against a commanded connect=%t",
+			got, wantConnect))
+		if got != wantConnect {
+			verdict = certify.Fail
+		}
+		if d := invariant.DescribeM123Divergence(); d != "" {
+			reported = append(reported, "TRANSCRIPTION: "+d)
+		}
+	}
+
+	// ── REPORT (not grade): opModEnergize -> model 703 ES ──
+	if regs := uv.Regs[703]; len(regs) > 0 {
+		es := sunspec.Parse703(regs)
+		reported = append(reported, fmt.Sprintf("model 703 ES (enter-service permission) reads %t "+
+			"against the energize=%t published alongside — REPORTED, not graded on this run: the connect "+
+			"home graded here is M123 Conn", es.Enabled, wantEnergize))
+	} else {
+		reported = append(reported, "opModEnergize: this DER serves no model 703 (reported, not "+
+			"graded)")
+	}
+
+	reported = reportConnStAndDisclosure(uv, rc, 123, reported)
+
+	obs := "GRADED (opModConnect via model 123, the declared connect home): " + joinSemis(graded)
+	if len(reported) > 0 {
+		obs += ". REPORTED, not graded: " + joinSemis(reported)
+	}
+	return Finding{Verdict: verdict, Observed: obs + ". Connect home: " + why}
+}
+
+// judgeConnectHomeM703 grades opModEnergize against model 703's enter-service
+// permission (the 7xx connect home) and reports model 123 Conn, model 701 ConnSt,
+// and the manifest disclosure alongside — the mirror of judgeConnectHomeM123.
+func judgeConnectHomeM703(uv invariant.UnitView, rc *certify.RunCtx, wantConnect, wantEnergize bool, why string) Finding {
+	var graded, reported []string
+	verdict := certify.Pass
+
+	// ── GRADE: opModEnergize -> model 703 ES (enter-service permission) ──
+	if regs := uv.Regs[703]; len(regs) > 0 {
+		es := sunspec.Parse703(regs)
+		graded = append(graded, fmt.Sprintf("model 703 ES (enter-service permission) reads %t against a "+
+			"commanded energize=%t", es.Enabled, wantEnergize))
+		if es.Enabled != wantEnergize {
+			verdict = certify.Fail
+		}
+	} else {
+		verdict = certify.Fail
+		graded = append(graded, "opModEnergize's declared home model 703 is NOT served by this DER, so the "+
+			"graded enter-service axis could not be measured — a fixture that does not serve the model the "+
+			"candidate declares as its connect home")
+	}
+
+	// ── REPORT (not grade): opModConnect -> model 123 Conn ──
+	lc := uv.LegacyCommands(oracleSimName)
+	switch {
+	case !lc.Present:
+		reported = append(reported, "opModConnect: this DER serves no model 123 (reported, not graded)")
+	default:
+		if got, ok := connectState(lc); ok {
+			reported = append(reported, fmt.Sprintf("model 123 Conn reads %t against the connect=%t published "+
+				"alongside — REPORTED, not graded on this run: the connect home graded here is M703 ES",
+				got, wantConnect))
+		} else {
+			reported = append(reported, "model 123's Conn point could not be read as a connect state ("+
+				lc.Note+") — REPORTED, not graded")
+		}
+	}
+
+	reported = reportConnStAndDisclosure(uv, rc, 703, reported)
+
+	obs := "GRADED (opModEnergize via model 703 ES, the declared connect home): " + joinSemis(graded)
+	if len(reported) > 0 {
+		obs += ". REPORTED, not graded: " + joinSemis(reported)
+	}
+	return Finding{Verdict: verdict, Observed: obs + ". Connect home: " + why}
+}
+
+// reportConnStAndDisclosure appends the DER's own model 701 ConnSt (its account
+// of its connection state) and the manifest's model-<gradedModel> disclosure to
+// reported — the two lines both connect homes carry unchanged: ConnSt is REPORTED
+// whichever home is graded, and the disclosure only asks whether the graded home
+// is one the candidate declared.
+func reportConnStAndDisclosure(uv invariant.UnitView, rc *certify.RunCtx, gradedModel int, reported []string) []string {
+	if meas := uv.Measurement(oracleSimName); meas.Present {
+		reported = append(reported, fmt.Sprintf("the DER's own model 701 ConnSt reads %d — its "+
+			"account of its connection state, REPORTED and not graded", meas.ConnSt))
+	}
+	if m := rc.Manifest(); m != nil {
+		if m.HasModel(gradedModel) {
+			reported = append(reported, fmt.Sprintf("the candidate manifest declares model %d, so the "+
+				"graded connect home is one it claims", gradedModel))
+		} else {
+			reported = append(reported, fmt.Sprintf("NOTE: the candidate manifest does NOT declare model %d, "+
+				"the model this row grades against — the graded home is not one the candidate claims "+
+				"(preflightFixture is the campaign-level gate for this)", gradedModel))
+		}
+	}
+	return reported
+}
+
 // critConnectStartedIntegrity is BASIC-009's response-integrity gate: the DUT
 // must NOT POST a DERControlResponse Started(2) for the connect control unless
-// the declared connect axis (model 123 Conn) measurably reached the commanded
-// state.
+// the GRADED connect home (model 123 Conn or model 703 ES, whichever this run
+// grades — see resolveConnectHome) measurably reached the commanded state.
 //
-// A Started(2) tells the head end the control is EXECUTING. If the connect axis
+// A Started(2) tells the head end the control is EXECUTING. If the graded home
 // never reached the commanded state, that report is false — the head end is told
 // the machine connected/disconnected while the device's own connect register
 // says it did not, a real product response-integrity defect (the LXR-002 shape:
 // a Started for an axis nothing executed). A CORRECT withhold — no Started(2), a
 // Received(1)+CannotComply(252) — is NOT a failure here and must not read as
-// one: this gate fires ONLY on a Started(2) the connect axis does not back.
+// one: this gate fires ONLY on a Started(2) the graded home does not back.
 //
-// "reached" is the connect oracle's OWN post verdict, recorded in params:
-// oracleConnect grades ONLY model 123 Conn, so its PASS is exactly "model 123
-// Conn holds the commanded connect state AFTER the control". But holding the
-// commanded state is not the same as MOVING to it — the DER's as-built legacy
-// default is Conn=1 (sim.go), so a connect=TRUE row's axis already matches at
-// baseline and a Started(2) would be credited against no execution at all. So a
-// Started(2) is credited only when the move is DISTINGUISHABLE: the oracle's
-// PRE verdict (directSetup's pre-publication read, oraclePreVerdictParam) shows
-// the axis did NOT hold the commanded state before the control, and the post
-// verdict shows it does now. Where the commanded state already equalled the
-// baseline (no observable move), a Started(2) is REPORTED as un-creditable
-// (WARN) rather than passed — the same distinguishable-baseline discipline
-// BASIC-007's ramp oracle uses. When the oracle could not read the DER
-// (oracleUnavailableParam set), this gate DECLINES rather than blaming the DUT.
+// The gate is home-AGNOSTIC by construction: it reads the connect oracle's own
+// recorded verdicts (oracleVerdictParam, oraclePreVerdictParam) and observations,
+// which already reflect whichever home was graded, so nothing here needs to know
+// which one — the interpolated observation names it. "reached" is that oracle's
+// post verdict: its PASS is exactly "the graded home holds the commanded state
+// AFTER the control". But holding the commanded state is not the same as MOVING
+// to it — a DER whose as-built default already equals the commanded state (the
+// legacy Conn=1 default, say) matches at baseline, and a Started(2) would then be
+// credited against no execution at all. So a Started(2) is credited only when the
+// move is DISTINGUISHABLE: the oracle's PRE verdict (directSetup's pre-publication
+// read, oraclePreVerdictParam) shows the home did NOT hold the commanded state
+// before the control and the post verdict shows it does now. Where the commanded
+// state already equalled the baseline (no observable move), a Started(2) is
+// REPORTED as un-creditable (WARN) rather than passed — the same distinguishable-
+// baseline discipline BASIC-007's ramp oracle uses. When the oracle could not read
+// the DER (oracleUnavailableParam set), this gate DECLINES rather than blame the DUT.
 func critConnectStartedIntegrity(mridKey string, o *Observation) criterion {
 	oracleDown := o.Params[oracleUnavailableParam]
 	reached := certify.Verdict(o.Params[oracleVerdictParam]) == certify.Pass
@@ -357,22 +507,21 @@ func critConnectStartedIntegrity(mridKey string, o *Observation) criterion {
 	connectObs := orText(o.Params[oracleObservedParam], "the connect oracle recorded no observation")
 	failObs := func() string {
 		return fmt.Sprintf("the DUT reported DERControlResponse Started(2) for the connect control "+
-			"(subject %s), but the declared connect axis (model 123 Conn) did NOT measurably reach the "+
-			"commanded connect state: %s. Reporting a control STARTED while the device's own connect "+
-			"register disagrees tells the head end the machine acted when it did not — a response-integrity "+
-			"defect (the LXR-002 shape: a Started for an axis nothing executed)", mridKey, connectObs)
+			"(subject %s), but the graded connect home did NOT measurably reach the commanded state: %s. "+
+			"Reporting a control STARTED while the device's own connect register disagrees tells the head "+
+			"end the machine acted when it did not — a response-integrity defect (the LXR-002 shape: a "+
+			"Started for an axis nothing executed)", mridKey, connectObs)
 	}
-	// creditStarted decides a Started(2) whose axis DID reach the commanded state:
+	// creditStarted decides a Started(2) whose home DID reach the commanded state:
 	// a PASS only when the move was distinguishable from the baseline, else a WARN
 	// that reports — rather than credits — an unbacked Started.
 	creditStarted := func() (certify.Verdict, string) {
 		if distinguishable {
 			return certify.Pass, fmt.Sprintf("the DUT reported Started(2) for the connect control AND the "+
-				"declared connect axis (model 123 Conn) MOVED to the commanded state: before, %s; after, %s",
-				preObs, connectObs)
+				"graded connect home MOVED to the commanded state: before, %s; after, %s", preObs, connectObs)
 		}
-		return certify.Warn, fmt.Sprintf("the DUT reported Started(2) for the connect control and model 123 "+
-			"Conn holds the commanded state AFTER — but it ALSO held it BEFORE the control (%s), so no "+
+		return certify.Warn, fmt.Sprintf("the DUT reported Started(2) for the connect control and the graded "+
+			"connect home holds the commanded state AFTER — but it ALSO held it BEFORE the control (%s), so no "+
 			"transition is observable and the Started cannot be credited as proof of execution. Reported, "+
 			"not passed: an indistinguishable baseline cannot certify a move (the same discipline BASIC-007's "+
 			"ramp oracle uses). Post: %s", preObs, connectObs)
@@ -380,11 +529,11 @@ func critConnectStartedIntegrity(mridKey string, o *Observation) criterion {
 
 	return criterion{
 		Claim: "the DUT did not report DERControlResponse Started(2) for the connect control unless the " +
-			"declared connect axis (model 123 Conn) measurably reached the commanded state",
+			"graded connect home (model 123 Conn or model 703 ES) measurably reached the commanded state",
 		How: "the DERControlResponse statuses the DUT POSTed for this control — recovered from the session " +
-			"(tier 2) or from gridsim's own record (tier 3) — cross-checked against the independent model " +
-			"123 Conn read the connect oracle graded: a Started(2) the connect axis does not back is a FAIL, " +
-			"and a correct withhold (no Started(2), CannotComply at receipt) is a PASS",
+			"(tier 2) or from gridsim's own record (tier 3) — cross-checked against the independent connect-" +
+			"home read the connect oracle graded: a Started(2) the graded home does not back is a FAIL, and a " +
+			"correct withhold (no Started(2), CannotComply at receipt) is a PASS",
 		Wire: func(_ *certify.Evidence, t *Transcript) Finding {
 			if oracleDown != "" {
 				return Finding{Unavailable: "the connect oracle could not read the DER (" + oracleDown +

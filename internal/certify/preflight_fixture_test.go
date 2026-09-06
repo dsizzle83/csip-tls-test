@@ -134,18 +134,64 @@ func TestPreflightFixture_ExploratoryMismatchWarns(t *testing.T) {
 	}
 }
 
-// TestPreflightFixture_NoSimIsUnprovenNotFatal proves an unconfigured DER sim is
-// UNPROVEN, not a contradiction: the run continues (silence is not fatal), even
-// on the gating path.
-func TestPreflightFixture_NoSimIsUnprovenNotFatal(t *testing.T) {
+// TestPreflightFixture_NoSimFatalOnGatingWarnsOnExploratory proves the fail-
+// closed flip: a fixture whose served chain could not be read AT ALL (no
+// -modsim-api) is now FATAL on a GATING campaign — the southbound oracle reads
+// every register verdict from that fixture, so a cert bundle may not be graded
+// on one nothing confirmed — and a WARN (continue) on an exploratory poke. A run
+// with no manifest is a no-op on either path.
+func TestPreflightFixture_NoSimFatalOnGatingWarnsOnExploratory(t *testing.T) {
 	m := loadManifest(t, validManifestJSON)
-	r := &Runner{manifest: m, campaign: CampaignSpec{Name: "csip"}, opts: Options{HTTP: http.DefaultClient}}
-	if err := r.preflightFixture(context.Background(), NewReporter(&strings.Builder{})); err != nil {
-		t.Fatalf("preflightFixture FAILed with no DER sim configured, want a quiet UNPROVEN: %v", err)
+
+	// GATING + no DER sim -> FATAL.
+	gating := &Runner{manifest: m, campaign: CampaignSpec{Name: "csip"}, opts: Options{HTTP: http.DefaultClient}}
+	err := gating.preflightFixture(context.Background(), NewReporter(&strings.Builder{}))
+	if err == nil {
+		t.Fatal("preflightFixture did not refuse a GATING run whose fixture could not be read at all " +
+			"(no -modsim-api) — a cert bundle may not be graded on an unchecked fixture")
 	}
-	// And with no manifest at all, it is a no-op.
+	for _, want := range []string{"GATING", "-modsim-api"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+
+	// EXPLORATORY + no DER sim -> WARN (continue), not a refusal.
+	explor := &Runner{manifest: m, opts: Options{HTTP: http.DefaultClient}}
+	if err := explor.preflightFixture(context.Background(), NewReporter(&strings.Builder{})); err != nil {
+		t.Fatalf("preflightFixture REFUSED an EXPLORATORY run with no DER sim, want a WARN: %v", err)
+	}
+
+	// No manifest at all -> a no-op on either path.
 	rn := gatingRunner(nil, serveModelChain(t, []uint16{1, 704}))
 	if err := rn.preflightFixture(context.Background(), NewReporter(&strings.Builder{})); err != nil {
 		t.Fatalf("preflightFixture FAILed with no manifest, want a no-op: %v", err)
+	}
+}
+
+// TestPreflightFixture_UnreadableSimFatalOnGating proves the OTHER can't-read-at-
+// all case: a DER sim that IS configured but whose /registers cannot be read
+// (here an endpoint that errors) is UNPROVEN — fatal on gating, a warn on an
+// exploratory run — exactly like the missing sim above.
+func TestPreflightFixture_UnreadableSimFatalOnGating(t *testing.T) {
+	m := loadManifest(t, validManifestJSON)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/registers", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	gating := gatingRunner(m, srv.URL)
+	err := gating.preflightFixture(context.Background(), NewReporter(&strings.Builder{}))
+	if err == nil {
+		t.Fatal("preflightFixture did not refuse a GATING run whose DER sim could not be read")
+	}
+	if !strings.Contains(err.Error(), "GATING") {
+		t.Errorf("the refusal does not name the gating posture:\n%v", err)
+	}
+	// Exploratory: the same unreadable sim is a warn, not a refusal.
+	if err := exploratoryRunner(m, srv.URL).preflightFixture(context.Background(), NewReporter(&strings.Builder{})); err != nil {
+		t.Fatalf("preflightFixture REFUSED an EXPLORATORY run whose sim could not be read, want a WARN: %v", err)
 	}
 }

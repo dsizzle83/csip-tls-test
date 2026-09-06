@@ -30,14 +30,23 @@ package certify
 // disagrees non-trivially is a contradiction. When the product grows that fact,
 // this file gains one more comparison and nothing else changes.
 //
-// # Contradiction is fatal, silence is not
+// # Contradiction is always fatal; silence is fatal only on a gating campaign
 //
-// A fact the DUT reports that CONTRADICTS the manifest ends the run: the scope
-// decisions the campaign is about to make are made from a document that has just
-// been shown to be wrong about this device. A fact the DUT cannot report is
-// stated as unproven and the run continues, because refusing to run against
-// every question the product cannot yet answer would make this check something
-// operators turn off.
+// A fact the DUT reports that CONTRADICTS the manifest ends the run on EITHER
+// path: the scope decisions the campaign is about to make are made from a
+// document that has just been shown to be wrong about this device.
+//
+// A fact the DUT could not report — no gateway to ask through, an inventory
+// endpoint that did not answer, an admitted count of zero while the manifest
+// declares devices — is UNPROVEN, and what unproven costs depends on the run.
+// On an EXPLORATORY run it is stated and the run continues, because refusing to
+// run against every question the product cannot yet answer would make this
+// check something operators turn off. On a GATING campaign it is FATAL: a
+// certification bundle may not rest on a topology this run never established,
+// and a run that discovered the gap only in its findings would record this
+// tool's unproven assumption as the product's own claim. That split is
+// unprovable's (preflight.go), the same one preflightFixture already applied to
+// a served-but-undeclared model.
 
 import (
 	"context"
@@ -84,31 +93,49 @@ func (r *Runner) preflightManifest(ctx context.Context, reporter *Reporter) erro
 
 	gw := r.gateway()
 	if !gw.Available() {
-		reporter.Line("candidate: no gateway introspection is configured, so none of the manifest's " +
-			"topology claims were checked against the device. Every scope decision in this run rests on " +
-			"the declaration alone")
-		return nil
+		// UNPROVEN. On an exploratory run every scope decision rests on the
+		// declaration alone and the run continues; on a GATING campaign that is
+		// exactly what may not be waved through — a cert bundle whose topology
+		// was never checked against the device. See unprovable.
+		return r.unprovable(reporter,
+			"the manifest's topology claims (no gateway introspection is configured)",
+			"Every scope decision in this run would rest on the declaration alone; pass -gateway-ssh (or "+
+				"-gateway-exec) so the DUT can be asked what it admitted")
 	}
 
 	inv, err := r.readInventory(ctx, gw)
 	if err != nil {
 		// UNPROVEN, not contradicted. An endpoint that did not answer says
-		// nothing about the manifest, and manufacturing a failure from it would
-		// teach operators to bypass this check.
-		reporter.Line("candidate: the DUT's southbound inventory could not be read (%v), so the "+
-			"manifest's topology claims are UNPROVEN in this run", err)
-		return nil
+		// nothing about the manifest, and manufacturing a CONTRADICTION from it
+		// would be a lie — but on a gating campaign a topology that could not be
+		// read is a precondition that was not established, which is fatal for
+		// the reason unprovable states; on an exploratory run it stays a warn.
+		return r.unprovable(reporter,
+			fmt.Sprintf("the manifest's topology claims (the DUT's southbound inventory could not be read: %v)", err),
+			"Nothing in this run would establish the declared topology; the inventory endpoint is read ON "+
+				"the DUT through the gateway transport, so a transport or dev-API fault is the usual cause")
 	}
 
 	var problems []string
 	admitted := len(inv.Devices)
 	switch {
 	case inv.Stale || admitted == 0:
-		reporter.Line("candidate: the DUT reports NO admitted southbound device (stale=%v). The manifest "+
-			"declares %d — that is not a contradiction (the dev API publishes the ADMITTED inventory, not "+
-			"the configured one, so a device that has not finished admitting looks the same as one that "+
-			"is not configured), but nothing in this run proves the declared topology",
-			inv.Stale, m.ConfiguredDER)
+		// UNPROVEN, not contradicted: the dev API publishes the ADMITTED
+		// inventory, not the configured one, so a device that has not finished
+		// admitting looks the same as one that is not configured. But when the
+		// manifest DECLARES devices and none is admitted, nothing in this run
+		// proves the declared topology — a precondition a GATING campaign may
+		// not rest on (unprovable), an exploratory run names and continues past.
+		if m.ConfiguredDER > 0 {
+			return r.unprovable(reporter,
+				fmt.Sprintf("the declared topology (the DUT reports NO admitted southbound device, stale=%v, "+
+					"while the manifest declares %d)", inv.Stale, m.ConfiguredDER),
+				"The dev API publishes the ADMITTED inventory, not the configured one, so this is not a "+
+					"contradiction — but nothing here establishes the declared topology; confirm the DER has "+
+					"finished admitting before a gating run")
+		}
+		reporter.Line("candidate: the DUT reports NO admitted southbound device (stale=%v) and the manifest "+
+			"declares %d — consistent, with no topology this run needed to prove", inv.Stale, m.ConfiguredDER)
 	case admitted != m.ConfiguredDER:
 		problems = append(problems, fmt.Sprintf(
 			"topology.configured_der declares %d DER(s); the DUT has admitted %d (%s)",

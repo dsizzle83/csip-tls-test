@@ -17,17 +17,21 @@ package certify
 // fixture does not serve is the mirror gap: rows that rest on that model read an
 // absence and blame the DUT for it.
 //
-// # Both directions are fatal, silence is not
+// # Both directions are fatal; silence is fatal only on a gating campaign
 //
 // A model the sim serves that the manifest omits, OR a model the manifest
 // declares that the sim does not serve, ends the run before the capture: the
 // oracle would spend the whole campaign reading a device the declaration does
 // not describe, and the bundle would record this tool's mis-fixtured bench as
-// the product's own model surface. A sim that cannot be read (no -modsim-api, a
-// transport hiccup, a register image that is not a SunSpec chain) is reported
-// UNPROVEN and the run continues, for the same reason preflight_manifest.go
-// degrades rather than fails: refusing to run against every question the bench
-// cannot answer teaches operators to turn the check off.
+// the product's own model surface. A sim that cannot be read at all (no
+// -modsim-api, a transport hiccup, a register image that is not a SunSpec
+// chain) is UNPROVEN, and what that costs depends on the run: an EXPLORATORY
+// poke reports it and continues, so a quick look is not blocked by a bench the
+// tool cannot reach; a GATING campaign STOPS, because the fixture every
+// southbound register verdict is read from was never confirmed to serve the
+// declared chain, and a cert bundle may not be graded on an unchecked
+// instrument. That split is unprovable's (preflight.go), the same posture
+// preflight_manifest.go now uses when the DUT cannot be asked at all.
 //
 // It lives in package certify (not suitecsip) because it is a whole-campaign
 // precondition the Runner enforces before case 1, alongside the authority and
@@ -57,19 +61,29 @@ func (r *Runner) preflightFixture(ctx context.Context, reporter *Reporter) error
 
 	sim := NewSimClient("modsim", r.opts.Targets.ModSimAPI, r.opts.HTTP)
 	if !sim.Available() {
-		reporter.Line("candidate: no DER simulator API is configured (-modsim-api), so the fixture's " +
-			"served SunSpec model chain was not checked against the manifest's `models` list")
-		return nil
+		// UNPROVEN. On a gating campaign the oracle reads EVERY southbound
+		// register verdict from this fixture, so a run that never confirmed the
+		// fixture serves the declared chain is a cert bundle graded on an
+		// unchecked instrument — fatal (unprovable); an exploratory poke says so
+		// and continues.
+		return r.unprovable(reporter,
+			"the fixture's served SunSpec model chain (no DER simulator API is configured, -modsim-api)",
+			"The southbound oracle reads every register verdict from this fixture, so nothing here would "+
+				"establish that it serves the model chain the manifest declares; pass -modsim-api")
 	}
 
 	served, err := readSimModelChain(ctx, sim)
 	if err != nil {
 		// UNPROVEN, not contradicted. A sim that could not be read says nothing
-		// about the manifest, and manufacturing a failure from it would teach
-		// operators to bypass this check (preflight_manifest.go's posture).
-		reporter.Line("candidate: the DER simulator's served model chain could not be read (%v), so the "+
-			"manifest's `models` list is UNPROVEN against the fixture in this run", err)
-		return nil
+		// about the manifest, and manufacturing a CONTRADICTION from it would be
+		// a lie — but on a gating campaign a fixture whose served chain could not
+		// be read is a precondition that was not established, which is fatal for
+		// the reason unprovable states; on an exploratory run it stays a warn
+		// (preflight_manifest.go's posture, one witness over).
+		return r.unprovable(reporter,
+			fmt.Sprintf("the fixture's served SunSpec model chain (the DER simulator could not be read: %v)", err),
+			"The southbound oracle reads every register verdict from this fixture, so nothing here would "+
+				"establish that it serves the model chain the manifest declares")
 	}
 
 	declared := dedupSortedInts(m.Models)
