@@ -1029,9 +1029,15 @@ func coreResponsesSpec(nonce string) spec {
 			// Phase 2 trigger: the server-side cancel, mid-flight, of the
 			// second control — the same update-in-place idiom
 			// coreAdvancedEndDevice/coreDERSettings' RehomeDER Change uses,
-			// this time flipping EventStatus.currentStatus to 6 (Cancelled)
-			// on the SAME mRID rather than moving a resource's href (same
-			// gridsim seam, sim/gridsim/admin.go's adminCtrlReq doc).
+			// this time flipping EventStatus.currentStatus to 2 (Cancelled —
+			// IEEE Std 2030.5-2018 Annex B, p.159-160) on the SAME mRID
+			// rather than moving a resource's href (same gridsim seam,
+			// sim/gridsim/admin.go's adminCtrlReq doc). REV0907-B1: this used
+			// to flip it to 6, Table 27's Response status for "event
+			// cancelled" transposed into the wrong (currentStatus)
+			// enumeration — gridsim's "cancel" lever now serves the correct
+			// value by construction, so the fix lives at the source rather
+			// than in this call site remembering the right number.
 			//
 			// IW27-005: this used to resend Description/GenLimW alongside
 			// current_status, on the premise that gridsim would carry them
@@ -1049,7 +1055,7 @@ func coreResponsesSpec(nonce string) spec {
 			// the two-step server-cancel, not a workaround for the guard.
 			_, err := d.PostControl(ctx, ControlRequest{
 				Program: 1, MRID: cancelMRID,
-				CurrentStatus: ptr(uint8(6)),
+				Cancel: true,
 			})
 			return err
 		},
@@ -1063,7 +1069,7 @@ func coreResponsesSpec(nonce string) spec {
 		ChangeWait: changeWaitFullCycle,
 		Cleanup: func(ctx context.Context, d *Driver) {
 			// CANCEL-then-DELETE both programs (teardown.go's
-			// releaseProgramControls): server-cancel each control as Cancelled(6)
+			// releaseProgramControls): server-cancel each control as Cancelled(2)
 			// so a spec-correct DUT that acquired it observes the cancellation,
 			// await a fresh poll so it drops the active event, and only then
 			// DELETE — instead of the event outliving the row

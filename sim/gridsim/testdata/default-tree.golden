@@ -162,7 +162,7 @@
     <description>Cancelled control (client must ignore)</description>
     <creationTime>EPOCH</creationTime>
     <EventStatus>
-      <currentStatus>6</currentStatus>
+      <currentStatus>2</currentStatus>
       <dateTime>EPOCH</dateTime>
       <potentiallySuperseded>false</potentiallySuperseded>
     </EventStatus>

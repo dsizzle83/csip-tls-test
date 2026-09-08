@@ -29,8 +29,8 @@ package suitecsip
 // releaseProgramControls does, in order, and none of it is fatal:
 //
 //	a. server-CANCEL every live control on every program (status-only
-//	   Cancelled(6)) so a spec-correct DUT OBSERVES the cancellation;
-//	b. await a STRICTLY-NEWER DUT poll, so the DUT sees the Cancelled(6) and
+//	   Cancelled(2)) so a spec-correct DUT OBSERVES the cancellation;
+//	b. await a STRICTLY-NEWER DUT poll, so the DUT sees the Cancelled(2) and
 //	   drops any active event BEFORE the delete removes it from the list — the
 //	   one thing BASIC-006 → BASIC-007 needs; and
 //	c. DELETE the control and curve (ClearControls/ClearCurves). The DUT reverts
@@ -73,7 +73,7 @@ func (d *Driver) releaseProgramControls(ctx context.Context, programs ...int) er
 
 	// (a) Capture the DUT's poll ordinal BEFORE any cancel, then server-cancel
 	//     every live control on every program. A spec-correct DUT that has
-	//     acquired an active event drops it only when it OBSERVES the Cancelled(6)
+	//     acquired an active event drops it only when it OBSERVES the Cancelled(2)
 	//     (§10.2.3.3 c); a bare delete would make the control vanish before it
 	//     could. cancelProgramControls is best-effort (recorded via its own
 	//     path); a cancel failure is not fatal — the delete still cleans up.
@@ -82,7 +82,7 @@ func (d *Driver) releaseProgramControls(ctx context.Context, programs ...int) er
 		record(d.cancelProgramControls(ctx, program))
 	}
 
-	// (b) Await a STRICTLY-NEWER DUT poll so the DUT observes the Cancelled(6)
+	// (b) Await a STRICTLY-NEWER DUT poll so the DUT observes the Cancelled(2)
 	//     and drops any active event BEFORE the delete removes it from the list.
 	//     Best-effort, exactly as the ramp baseline's own fence is: a bench that
 	//     publishes no /poll barrier degrades to skipping the wait.
@@ -104,7 +104,7 @@ func (d *Driver) releaseProgramControls(ctx context.Context, programs ...int) er
 }
 
 // teardownFenceWindow bounds how long the teardown waits for the DUT to observe
-// the Cancelled(6) on a fresh poll before it deletes. It is the teardown's own
+// the Cancelled(2) on a fresh poll before it deletes. It is the teardown's own
 // detached-context budget (check.go's teardownCleanupBudget, scaled to the
 // bench's advertised poll cadence), never a second fixed cap: awaitFreshDERPoll
 // returns the instant a fresh poll lands, so this is only the ceiling for a

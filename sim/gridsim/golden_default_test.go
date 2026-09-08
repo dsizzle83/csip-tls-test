@@ -153,6 +153,32 @@ package gridsim
 //     this date were taken against a fixture that DID assert the axes, which is
 //     precisely the confound this entry removes — so old and new evidence must
 //     not be compared on the connect/energize axes without accounting for it.
+//
+//  5. 2026-09-08, ONE line: /derp/0/derc's SP-003 (the standing "cancelled"
+//     fixture control) "<currentStatus>6</currentStatus>" ->
+//     "<currentStatus>2</currentStatus>". REV0907-B1.
+//
+//     WHY. 6 is not an IEEE Std 2030.5-2018 currentStatus value at all — Annex
+//     B (p.159-160) defines only 0 Scheduled, 1 Active, 2 Cancelled, 3
+//     Cancelled with Randomization, 4 Superseded, "all other values reserved".
+//     6 is Table 27's RESPONSE status for "event cancelled" (p.74-76), a
+//     DIFFERENT enumeration on a different resource (the DUT's Response, not
+//     the server's EventStatus), transposed into this one by mistake — and
+//     both the product and this bench's own referee (suitecsip's CORE-022)
+//     shared the defect, so every cancellation PASS graded before this fix was
+//     graded by a referee that would have accepted 6 as if it meant Cancelled.
+//     server.go's SP-003 fixture is corrected to the value the standard
+//     actually defines; sim/gridsim/admin.go's admin-cancel levers (Cancel,
+//     CancelWithRandomization, MarkSuperseded) close the same defect on the
+//     admin-driven path.
+//
+//     WHY THIS IS SAFE FOR PUBLISHED EVIDENCE. SP-003 is a static, never-active
+//     fixture control (interval already elapsed at server start) that no
+//     CSIP-CONF-v1.3 row commands or grades by name; nothing in this bench's
+//     own suite reads currentStatus=6 as meaningful. A bundle captured before
+//     this date shows 6 because that is what the bench served that day and
+//     re-verifies against itself exactly as before; what changes is what the
+//     NEXT run puts on the wire, now spec-correct.
 
 import (
 	"encoding/xml"

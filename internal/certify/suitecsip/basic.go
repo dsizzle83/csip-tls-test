@@ -1155,7 +1155,7 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 		}
 		s.Cleanup = func(ctx context.Context, d *Driver) {
 			// CANCEL-then-DELETE (teardown.go's releaseProgramControls): the row
-			// server-cancels its control as Cancelled(6) so a spec-correct DUT
+			// server-cancels its control as Cancelled(2) so a spec-correct DUT
 			// that ALREADY acquired the event OBSERVES the cancellation (IEEE
 			// 2030.5-2018 §10.2.3.3 c) ends an event by cancel, not by removal),
 			// awaits a fresh DUT poll so the DUT sees it and drops the active

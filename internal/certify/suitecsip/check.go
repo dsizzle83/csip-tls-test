@@ -244,7 +244,7 @@ func cleanupNote(d *Driver) string {
 //
 // It is the row's own poll-cycle window plus a settle margin, because the
 // cancel-then-delete teardown (teardown.go) waits for the DUT to fetch a
-// Cancelled(6) on its next poll — so it OBSERVES the event ending — before the
+// Cancelled(2) on its next poll — so it OBSERVES the event ending — before the
 // delete removes the control from the list. A pollWindow of 0 (a disarm-only
 // teardown, or a direct-driver unit test that never set one) floors at the
 // historic 30s so those are unchanged; the cap keeps a hung teardown from
@@ -511,7 +511,7 @@ func run(ctx context.Context, rc *certify.RunCtx, s spec) (res certify.Result, r
 		//
 		// The budget is poll-window-scaled, not a fixed 30s, because the
 		// cancel-then-delete teardown (teardown.go) waits for the DUT to OBSERVE
-		// a Cancelled(6) on a fresh poll before it deletes — so a bench whose
+		// a Cancelled(2) on a fresh poll before it deletes — so a bench whose
 		// poll cadence is slower than 30s still gets its cancel observed rather
 		// than deleted out from under it. teardownCleanupBudget floors at 30s (a
 		// row with no measured window, or a disarm-only teardown, is unchanged)

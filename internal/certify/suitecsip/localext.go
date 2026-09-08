@@ -44,6 +44,17 @@ func registerLocalExtensions(reg *certify.Registry, nonce string) {
 	reg.Register(extUID("EXT-001"), Suite, basicInverterControl(
 		curveMode("opModWattVar", wattVarBinding()), "a Watt-Var curve", nonce),
 		certify.WithRequires(needGridSim...), certify.WithOrder(62))
+	// EXT-002/EXT-003 (REV0907-B1, localext_eventstatus.go): no published
+	// CSIP-CONF-v1.3 procedure exercises a RESERVED currentStatus value or
+	// currentStatus=3 (Cancelled with Randomization) — CORE-022 only ever
+	// drove plain Cancelled(2) — so this is where the defect's negative
+	// check and its positive companion live. Ordered right after EXT-001
+	// and before the event-precedence scenarios (order 80+), matching
+	// EXT-001's own placement in the run sequence.
+	reg.Register(extUID("EXT-002"), Suite, reservedCurrentStatus002(nonce),
+		certify.WithRequires(needGridSim...), certify.WithOrder(63))
+	reg.Register(extUID("EXT-003"), Suite, cancelWithRandomization003(nonce),
+		certify.WithRequires(needGridSim...), certify.WithOrder(64))
 }
 
 // mappingWattVar is where the opModWattVar → model 712 correspondence comes
@@ -95,7 +106,7 @@ func wattVarBinding() *curveBinding {
 // localExtensionIDs are the in-document ids this family registers, for the tests
 // that assert the family's posture holds for every one of them rather than for
 // the one that happened to be written first.
-func localExtensionIDs() []string { return []string{"EXT-001"} }
+func localExtensionIDs() []string { return []string{"EXT-001", "EXT-002", "EXT-003"} }
 
 // NOTE ON WHERE THE EXCLUSION LIVES. Nothing in this file special-cases itself
 // at run time. The rows register, run and are graded exactly like any other; the

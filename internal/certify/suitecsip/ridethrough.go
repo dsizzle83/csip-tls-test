@@ -1309,7 +1309,7 @@ func rideThroughSpec(b *tripBinding, subject, mrid string) spec {
 			// clear made this ride-through curve-control VANISH while a
 			// spec-correct DUT kept executing the event it had acquired, so the
 			// event outlived the row (CSIP-BENCH-BASIC007-ORACLE-STATE-
-			// CONTAMINATION). Server-cancel it as Cancelled(6) so the DUT
+			// CONTAMINATION). Server-cancel it as Cancelled(2) so the DUT
 			// observes the cancellation, await a fresh poll so it drops the
 			// event, and only then DELETE the control and curve. Best-effort
 			// recorded-not-fatal; residual contamination is caught by the rows'

@@ -662,7 +662,11 @@ func checkCORE012(r *Reporter, tree *discovery.ResourceTree) {
 
 func checkCORE013(r *Reporter, tree *discovery.ResourceTree) {
 	r.section("CORE-013", "Advanced DER Program / Control")
-	r.spec("DER.010", "Events with currentStatus=6 (Cancelled) must be skipped")
+	// REV0907-B1: currentStatus=2 (Cancelled), not 6 — IEEE Std 2030.5-2018
+	// Annex B, p.159-160. 6 is Table 27's Response status for "event
+	// cancelled", a different enumeration; this harness (like the product)
+	// transposed it into currentStatus.
+	r.spec("DER.010", "Events with currentStatus=2 (Cancelled) must be skipped")
 	r.spec("DER.011", "potentiallySuperseded events filtered by newer creationTime overlap")
 	r.spec("DER.012", "Lowest primacy value = highest priority")
 	r.spec("IEEE.12.3", "Among overlapping events, latest creationTime wins; MRID is tiebreaker")
@@ -678,9 +682,9 @@ func checkCORE013(r *Reporter, tree *discovery.ResourceTree) {
 	var cancelled, superseded int
 	if hp.Controls != nil {
 		for _, ctrl := range hp.Controls.DERControl {
-			if ctrl.EventStatus != nil && ctrl.EventStatus.CurrentStatus == 6 {
+			if ctrl.EventStatus != nil && ctrl.EventStatus.IsCancelled() {
 				cancelled++
-				r.pass("Cancelled event found: mRID=%s (status=6) [DER.010]", ctrl.MRID)
+				r.pass("Cancelled event found: mRID=%s (status=%d) [DER.010]", ctrl.MRID, ctrl.EventStatus.CurrentStatus)
 			}
 			if ctrl.EventStatus != nil && ctrl.EventStatus.PotentiallySuperseded {
 				superseded++
@@ -705,7 +709,7 @@ func checkCORE013(r *Reporter, tree *discovery.ResourceTree) {
 		if ac != nil {
 			r.pass("Scheduler active event: mRID=%s  source=%s [IEEE.12.3]", ac.MRID, ac.Source)
 			for _, ctrl := range hp.Controls.DERControl {
-				if ctrl.EventStatus != nil && ctrl.EventStatus.CurrentStatus == 6 && ac.MRID == ctrl.MRID {
+				if ctrl.EventStatus != nil && ctrl.EventStatus.IsCancelled() && ac.MRID == ctrl.MRID {
 					r.fail("Scheduler returned cancelled event %s [DER.010]", ctrl.MRID)
 					ok = false
 				}
@@ -1178,7 +1182,10 @@ func checkBASIC011(r *Reporter, tree *discovery.ResourceTree, fetcher *tlsclient
 
 func checkBASIC012(r *Reporter, tree *discovery.ResourceTree) {
 	r.section("BASIC-012", "Cancelled Event Handling")
-	r.spec("DER.010", "Events with currentStatus=6 never applied by scheduler")
+	// REV0907-B1: currentStatus=2 (Cancelled) or 3 (Cancelled with
+	// Randomization) — IEEE Std 2030.5-2018 Annex B, p.159-160 — never 6,
+	// which is Table 27's Response status for "event cancelled".
+	r.spec("DER.010", "Events with currentStatus=2 (Cancelled) never applied by scheduler")
 
 	var cancelledCtrl *model.DERControl
 	for _, ps := range tree.Programs {
@@ -1187,7 +1194,7 @@ func checkBASIC012(r *Reporter, tree *discovery.ResourceTree) {
 		}
 		for i := range ps.Controls.DERControl {
 			if ps.Controls.DERControl[i].EventStatus != nil &&
-				ps.Controls.DERControl[i].EventStatus.CurrentStatus == 6 {
+				ps.Controls.DERControl[i].EventStatus.IsCancelled() {
 				cancelledCtrl = &ps.Controls.DERControl[i]
 				break
 			}

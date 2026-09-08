@@ -18451,5 +18451,82 @@
   "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 procedure covers this axis; this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim.",
   "source_shards": [],
   "page_boundary_merged": false
+ },
+ {
+  "uid": "local-ext-v1::EXT-002",
+  "id": "EXT-002",
+  "doc": "LOCAL-EXT-v1",
+  "doc_version": "v1 (local extension family; not a published specification)",
+  "section": "1.2 EXT-002 - reserved currentStatus is not treated as Cancelled (under 1 Local product-evidence extensions)",
+  "title": "EXT-002 - a RESERVED EventStatus.currentStatus value must not be treated as Cancelled",
+  "purpose": "Measures that the DUT gives no meaning to a currentStatus value IEEE Std 2030.5-2018 Annex B (p.159-160) reserves — specifically 6, which this bench (REV0907-B1) found both the product and its own CORE-022 referee transposing from Table 27's Response status \"event cancelled\" into the currentStatus enumeration, where the standard defines only 0 Scheduled, 1 Active, 2 Cancelled, 3 Cancelled with Randomization, 4 Superseded and reserves everything else. No published CSIP-CONF-v1.3 procedure exercises a reserved currentStatus value at all; this row is the negative check the defect's discovery makes necessary.",
+  "applies_to": "client",
+  "dut_role": "csip-client",
+  "applicable": true,
+  "applicability_reason": "The axis applies to this product — it is a DER client that parses EventStatus.currentStatus off every DERControl it schedules. What does not apply is any certification: see certifiable=false and the notes.",
+  "certifiable": false,
+  "automatable": "full",
+  "evidence": "the served DERControl carrying <currentStatus>6</currentStatus> after a server-side status-only update on an already-Started control; the DERControlResponse POSTs (if any) the DUT made for that mRID after the flip; gridsim's own admin record of the control's advertised status",
+  "preconditions": [
+   "The DUT has already fetched and started (status=2) a DERControl commanding a scalar axis.",
+   "gridsim is reachable on its admin API so the row can flip that control's EventStatus.currentStatus to a reserved value in place."
+  ],
+  "steps": [
+   "Publish a DERControl and wait for the DUT to report it Started (status=2).",
+   "Server-side, update the SAME control's EventStatus.currentStatus to 6 (reserved) — a status-only edit (IEEE Std 2030.5-2018 §10.2.3.3 c)), no content field changes.",
+   "Wait a full DUT poll cycle for the DUT to observe the reserved value.",
+   "Read the DERControlResponse POSTs (if any) the DUT made for this control's mRID after the flip."
+  ],
+  "expected": [
+   "The DUT does not POST a DERControlResponse with status=6 (Table 27 \"event cancelled\") reacting to the reserved currentStatus value: a value the standard reserves carries no defined client obligation, so nothing licenses treating it as Cancelled.",
+   "The control remains advertised on gridsim's scheduled/active lists — a status-only edit is not a removal (§10.2.3.3 c))."
+  ],
+  "observables": [
+   "GET /derp/2/derc returning the control with <currentStatus>6</currentStatus> after the flip",
+   "absence of a POST of a DERControlResponse with <status>6</status> for this control's mRID after the flip",
+   "GET /admin/status (gridsim) still listing the control's mRID"
+  ],
+  "requirement_refs": [],
+  "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 procedure exercises a reserved currentStatus value; this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim. REV0907-B1: this row exists because the referee that would have graded this axis (CORE-022, before this fix) shared the exact defect it is meant to catch — see sim/gridsim/admin.go's cancel/cancel_with_randomization/mark_superseded levers and IEEE Std 2030.5-2018 Annex B, p.159-160.",
+  "source_shards": [],
+  "page_boundary_merged": false
+ },
+ {
+  "uid": "local-ext-v1::EXT-003",
+  "id": "EXT-003",
+  "doc": "LOCAL-EXT-v1",
+  "doc_version": "v1 (local extension family; not a published specification)",
+  "section": "1.3 EXT-003 - Cancelled with Randomization end-randomization timing (under 1 Local product-evidence extensions)",
+  "title": "EXT-003 - a Cancelled-with-Randomization event is not withdrawn before its end randomization",
+  "purpose": "Measures the DUT's handling of currentStatus=3 (Cancelled with Randomization — IEEE Std 2030.5-2018 Annex B, p.159-160), which no published CSIP-CONF-v1.3 procedure exercises at all: the standard requires the client to wait the larger of |randomizeStart| and |randomizeDuration| seconds — the \"end randomization\" — before withdrawing, not to cancel immediately as it must for plain Cancelled (2). This row is the positive companion to EXT-002's negative reserved-value check, covering the THIRD currentStatus value (3) this bench's own referee had never driven at all before REV0907-B1.",
+  "applies_to": "client",
+  "dut_role": "csip-client",
+  "applicable": true,
+  "applicability_reason": "The axis applies to this product — it is a DER client that must honour currentStatus=3's end-randomization wait. What does not apply is any certification: see certifiable=false and the notes.",
+  "certifiable": false,
+  "automatable": "full",
+  "evidence": "the served DERControl carrying <currentStatus>3</currentStatus> and its own randomizeStart/randomizeDuration after a server-side status-only update on an already-Started control; the DERControlResponse POSTs the DUT made for that mRID, each one's own wire timestamp compared against the control's own end-randomization floor (IEEE Std 2030.5-2018 Annex B, p.159-160)",
+  "preconditions": [
+   "The DUT has already fetched and started (status=2) a DERControl carrying a randomizeDuration large enough (chosen larger than gridsim's own DERControlList pollRate) that a premature withdrawal is observably distinguishable from a timely one.",
+   "gridsim is reachable on its admin API so the row can flip that control's EventStatus.currentStatus to 3 in place."
+  ],
+  "steps": [
+   "Publish a DERControl carrying randomizeStart/randomizeDuration and wait for the DUT to report it Started (status=2).",
+   "Server-side, update the SAME control's EventStatus.currentStatus to 3 (Cancelled with Randomization) — a status-only edit (IEEE Std 2030.5-2018 §10.2.3.3 c)).",
+   "Wait for the DUT to withdraw and report the cancellation.",
+   "Read the DERControlResponse POSTs the DUT made for this control's mRID, with their own wire timestamps."
+  ],
+  "expected": [
+   "The DUT does not POST a DERControlResponse with status=6 (Table 27 \"event cancelled\") for this control before max(|randomizeStart|, |randomizeDuration|) seconds have elapsed since the currentStatus=3 flip.",
+   "The DUT eventually POSTs a DERControlResponse with status=6 for this control, at or after that floor."
+  ],
+  "observables": [
+   "GET /derp/2/derc returning the control with <currentStatus>3</currentStatus>, <randomizeStart> and <randomizeDuration> after the flip",
+   "POST of a DERControlResponse with <status>6</status> for this control's mRID, timestamped at or after the end-randomization floor"
+  ],
+  "requirement_refs": [],
+  "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 procedure exercises currentStatus=3 (Cancelled with Randomization); this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim. REV0907-B1: sim/gridsim/admin.go's cancel_with_randomization lever serves this value; the floor is IEEE Std 2030.5-2018 Annex B, p.159-160's max(|randomizeStart|,|randomizeDuration|), also carried as csipmodel.EventStatus.EndRandomizationS.",
+  "source_shards": [],
+  "page_boundary_merged": false
  }
 ]

@@ -46,6 +46,7 @@ import (
 
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/sim/gridsim"
+	csipmodel "lexa-proto/csipmodel"
 )
 
 // TestWithRunNonce pins the one-mRID building block eventScenario.withNonce
@@ -232,8 +233,8 @@ func TestCoreResponsesSpec_ChangeCancelsTheSecondControlInPlace(t *testing.T) {
 	before := d.Snapshot(ctx)
 	prog := findProgram(t, before, 1)
 	ctrl := findControl(t, prog.Scheduled, params["cancelMrid"])
-	if ctrl.Status == 6 {
-		t.Fatalf("setup: the second control already reports status=6 before Change ran")
+	if (csipmodel.EventStatus{CurrentStatus: uint8(ctrl.Status)}).IsTerminal() {
+		t.Fatalf("setup: the second control already reports a terminal status (%d) before Change ran", ctrl.Status)
 	}
 
 	if err := s.Change(ctx, d, params); err != nil {
@@ -256,17 +257,68 @@ func TestCoreResponsesSpec_ChangeCancelsTheSecondControlInPlace(t *testing.T) {
 			"in-place update, not an added control)", matches, params["cancelMrid"])
 	}
 	ctrl = findControl(t, prog.Scheduled, params["cancelMrid"])
-	if ctrl.Status != 6 {
-		t.Fatalf("after Change, the second control's currentStatus = %d, want 6 (Cancelled)", ctrl.Status)
+	// REV0907-B1: gridsim's "cancel" lever must serve currentStatus=2
+	// (Cancelled — IEEE Std 2030.5-2018 Annex B, p.159-160), NOT 6 — Table
+	// 27's Response status for "event cancelled", transposed into the wrong
+	// enumeration. This is the referee's OWN defect this task closes: before
+	// the fix, CORE-022's Change sent CurrentStatus=6, gridsim served it
+	// verbatim, and this test (like the product) treated 6 as if it meant
+	// Cancelled. A run that regresses Change back to the raw 6 override
+	// fails BOTH assertions below.
+	if ctrl.Status != int(csipmodel.EventStatusCancelled) {
+		t.Fatalf("after Change, the second control's currentStatus = %d, want %d (Cancelled)",
+			ctrl.Status, csipmodel.EventStatusCancelled)
+	}
+	if ctrl.Status == 6 {
+		t.Fatalf("after Change, the second control's currentStatus = 6 — REV0907-B1: 6 is Table 27's " +
+			"Response status for \"event cancelled\", not a currentStatus value; IEEE Std 2030.5-2018 Annex B " +
+			"reserves it, so a spec-correct DUT must NOT treat this control as cancelled")
+	}
+	if !(csipmodel.EventStatus{CurrentStatus: uint8(ctrl.Status)}).IsCancelled() {
+		t.Fatalf("after Change, csipmodel.EventStatus{CurrentStatus: %d}.IsCancelled() = false, want true — "+
+			"the served value must be one the shared model actually recognises as Cancelled", ctrl.Status)
 	}
 
 	// The FIRST (completing) control must be untouched by Change: it lives on
 	// a different program and Change only ever names cancelMrid.
 	progA := findProgram(t, after, 0)
 	ctrlA := findControl(t, progA.Scheduled, params["mrid"])
-	if ctrlA.Status == 6 {
+	if (csipmodel.EventStatus{CurrentStatus: uint8(ctrlA.Status)}).IsCancelled() {
 		t.Fatalf("Change cancelled the WRONG control: the completing control (%s, program 0) now reports "+
-			"status=6 too", params["mrid"])
+			"currentStatus=%d, which IsCancelled() too", params["mrid"], ctrlA.Status)
+	}
+}
+
+// TestCoreResponsesSpec_ChangeDoesNotServeTheLegacyMistakenSix is
+// REV0907-B1's direct mutation-verify lock: it pins that coreResponsesSpec's
+// Change hook drives gridsim's NAMED "cancel" lever (Cancel: true) rather
+// than the raw CurrentStatus override, by checking the ONE observable fact
+// that distinguishes them — the value gridsim ends up serving. Reverting
+// core.go's Change to `CurrentStatus: ptr(uint8(6))` (the pre-fix code) makes
+// this test fail with a message naming the mechanism (see the task's
+// mutation-check evidence).
+func TestCoreResponsesSpec_ChangeDoesNotServeTheLegacyMistakenSix(t *testing.T) {
+	d := gridsimDriver(t)
+	ctx := context.Background()
+
+	s := coreResponsesSpec("cancelseam2")
+	params := map[string]string{}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if err := s.Change(ctx, d, params); err != nil {
+		t.Fatalf("Change: %v", err)
+	}
+
+	after := d.Snapshot(ctx)
+	ctrl := findControl(t, findProgram(t, after, 1).Scheduled, params["cancelMrid"])
+	if ctrl.Status == 6 {
+		t.Fatalf("CORE-022's Change served currentStatus=6 — the exact REV0907-B1 defect (Table 27's "+
+			"Response status transposed into currentStatus): want %d (Cancelled)", csipmodel.EventStatusCancelled)
+	}
+	if ctrl.Status != int(csipmodel.EventStatusCancelled) {
+		t.Fatalf("CORE-022's Change served currentStatus=%d, want %d (Cancelled)",
+			ctrl.Status, csipmodel.EventStatusCancelled)
 	}
 }
 
@@ -914,8 +966,10 @@ func TestCoreResponsesSpec_CancelTargetIsAxisIndependent(t *testing.T) {
 			"land on an event that had already elapsed on its own", cancelling.DurationS, completing.DurationS)
 	}
 
-	// Phase 2: the cancel itself. It must flip status to 6 on the SAME event —
-	// same mRID, same axis, and (§10.2.3.3 c), gridsim's own guard) the same
+	// Phase 2: the cancel itself. It must flip status to 2 (Cancelled — IEEE
+	// Std 2030.5-2018 Annex B, p.159-160; REV0907-B1: NOT 6, Table 27's
+	// Response status for "event cancelled") on the SAME event — same mRID,
+	// same axis, and (§10.2.3.3 c), gridsim's own guard) the same
 	// creationTime and interval it was already being served with.
 	if err := s.Change(ctx, d, params); err != nil {
 		t.Fatalf("Change: %v", err)
@@ -925,8 +979,8 @@ func TestCoreResponsesSpec_CancelTargetIsAxisIndependent(t *testing.T) {
 		t.Fatalf("cancel target %q vanished from program 1 — a cancel is a status update, not a removal "+
 			"(§10.2.3.3 c) and s))", params["cancelMrid"])
 	}
-	if after.Status != 6 {
-		t.Errorf("after the cancel, currentStatus = %d, want 6 (Cancelled)", after.Status)
+	if after.Status != int(csipmodel.EventStatusCancelled) {
+		t.Errorf("after the cancel, currentStatus = %d, want %d (Cancelled)", after.Status, csipmodel.EventStatusCancelled)
 	}
 	if after.Base.GenLimW == nil || cancelling.Base.GenLimW == nil ||
 		*after.Base.GenLimW != *cancelling.Base.GenLimW {

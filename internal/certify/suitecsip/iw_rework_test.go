@@ -58,7 +58,9 @@ func serveDER(t *testing.T, dev *diff.Device) *certify.RunCtx {
 }
 
 // TestReleaseProgramControls_CancelsThenDeletes proves the teardown contract:
-// it server-CANCELS (currentStatus=6) so a spec-correct DUT observes the event
+// it server-CANCELS (the "cancel" lever, currentStatus=2 — IEEE Std
+// 2030.5-2018 Annex B p.159-160; REV0907-B1: not 6, Table 27's Response
+// status for "event cancelled") so a spec-correct DUT observes the event
 // ending, then DELETEs to clean the list up — cancel BEFORE delete for each
 // program, all cancels before any delete for the CORE-022 two-program case —
 // with NO reversion-verify, and it does NOT fatal when the DER holds a STANDING
@@ -93,7 +95,7 @@ func TestReleaseProgramControls_CancelsThenDeletes(t *testing.T) {
 	}
 	firstCancel := func(rec *recordingRT, from int) int {
 		for i := from; i < len(rec.method); i++ {
-			if rec.method[i] == http.MethodPost && strings.Contains(rec.body[i], `"current_status":6`) {
+			if rec.method[i] == http.MethodPost && strings.Contains(rec.body[i], `"cancel":true`) {
 				return i
 			}
 		}
@@ -102,7 +104,7 @@ func TestReleaseProgramControls_CancelsThenDeletes(t *testing.T) {
 	countCancels := func(rec *recordingRT, from int) int {
 		n := 0
 		for i := from; i < len(rec.method); i++ {
-			if rec.method[i] == http.MethodPost && strings.Contains(rec.body[i], `"current_status":6`) {
+			if rec.method[i] == http.MethodPost && strings.Contains(rec.body[i], `"cancel":true`) {
 				n++
 			}
 		}
@@ -111,14 +113,14 @@ func TestReleaseProgramControls_CancelsThenDeletes(t *testing.T) {
 	lastCancel := func(rec *recordingRT, from int) int {
 		last := -1
 		for i := from; i < len(rec.method); i++ {
-			if rec.method[i] == http.MethodPost && strings.Contains(rec.body[i], `"current_status":6`) {
+			if rec.method[i] == http.MethodPost && strings.Contains(rec.body[i], `"cancel":true`) {
 				last = i
 			}
 		}
 		return last
 	}
 
-	t.Run("single program: cancel(6) precedes delete, no fatal", func(t *testing.T) {
+	t.Run("single program: cancel precedes delete, no fatal", func(t *testing.T) {
 		clean, _ := oracleFixture(t)
 		d, rec := newBench(t, clean)
 		mark := len(rec.method)
@@ -127,7 +129,7 @@ func TestReleaseProgramControls_CancelsThenDeletes(t *testing.T) {
 		}
 		cancelAt, deleteAt := firstCancel(rec, mark), firstDelete(rec, mark)
 		if cancelAt < 0 {
-			t.Errorf("no Cancelled(6) edit was issued (requests: %v)", rec.method[mark:])
+			t.Errorf("no cancel edit was issued (requests: %v)", rec.method[mark:])
 		}
 		if deleteAt < 0 {
 			t.Errorf("no DELETE was issued, so the control is left advertised (requests: %v)", rec.method[mark:])
@@ -152,7 +154,7 @@ func TestReleaseProgramControls_CancelsThenDeletes(t *testing.T) {
 			t.Fatalf("releaseProgramControls(0,1) returned %v", err)
 		}
 		if n := countCancels(rec, mark); n < 2 {
-			t.Errorf("only %d Cancelled(6) edits for two programs, want >= 2 (requests: %v)", n, rec.method[mark:])
+			t.Errorf("only %d cancel edits for two programs, want >= 2 (requests: %v)", n, rec.method[mark:])
 		}
 		lastC, firstD := lastCancel(rec, mark), firstDelete(rec, mark)
 		if firstD < 0 {

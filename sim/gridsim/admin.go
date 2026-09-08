@@ -536,7 +536,8 @@ type adminCtrlReq struct {
 	Activate    bool   `json:"activate"`       // true = replace active list
 
 	// Event-lifecycle controls (audit P1-2/P1-3 — let a scenario drive the
-	// hub's server-side Cancelled(6)/Superseded(7) emission and its
+	// hub's server-side Response(6)/Response(7) ("event cancelled" /
+	// "event superseded", IEEE Std 2030.5-2018 Table 27) and its
 	// randomizeDuration consumption over the wire; the hub already does all
 	// three, these seams just make a bench scenario prove it e2e):
 	//
@@ -545,12 +546,44 @@ type adminCtrlReq struct {
 	//                           program's list, the POST UPDATES it in place
 	//                           rather than adding a new one — the two-step a
 	//                           server-cancel needs (post a control, let the hub
-	//                           receive it, then flip its currentStatus→6; the
-	//                           hub drops events that arrive already-cancelled).
+	//                           receive it, then flip its currentStatus to
+	//                           Cancelled; the hub drops events that arrive
+	//                           already-cancelled).
 	//   PotentiallySuperseded — sets EventStatus.potentiallySuperseded on the
 	//                           built event (the loser of an overlapping pair).
-	//   CurrentStatus         — overrides EventStatus.currentStatus (e.g. 6 =
-	//                           Cancelled); nil ⇒ the window-derived 0/1.
+	//   Cancel                — the DEFAULT admin-cancel lever: serves
+	//                           EventStatus.currentStatus = 2 (Cancelled — IEEE
+	//                           Std 2030.5-2018 Annex B, p.159-160). REV0907-B1:
+	//                           this endpoint used to be driven with the raw
+	//                           CurrentStatus override set to 6, which is not a
+	//                           currentStatus value at all — it is Table 27's
+	//                           Response status for "event cancelled",
+	//                           transposed into the wrong enumeration. Cancel is
+	//                           the named, correct-by-construction replacement;
+	//                           every caller that wants an ordinary cancel
+	//                           should use this, not CurrentStatus.
+	//   CancelWithRandomization — serves currentStatus = 3 (Cancelled with
+	//                           Randomization). The standard requires the
+	//                           client to wait max(|RandomizeStart|,
+	//                           |RandomizeDuration|) seconds — set those two
+	//                           fields on the SAME request (or on the control's
+	//                           original post) for the wait to have a nonzero
+	//                           bound.
+	//   MarkSuperseded         — the mRID of a REAL, already-scheduled
+	//                           superseding control on the SAME program; serves
+	//                           currentStatus = 4 (Superseded) on THIS control.
+	//                           Refused (400) if no such control exists —
+	//                           Annex B defines Superseded only in terms of a
+	//                           new event actually commencing, so this lever
+	//                           cannot author a supersession out of thin air.
+	//   CurrentStatus         — RAW override of EventStatus.currentStatus, for
+	//                           a NEGATIVE test that must serve a value the
+	//                           standard reserves (e.g. 6, the legacy-mistaken
+	//                           value above) and assert the DUT does NOT treat
+	//                           it as terminal. Mutually exclusive with
+	//                           Cancel/CancelWithRandomization/MarkSuperseded
+	//                           (400 if combined); nil ⇒ the window-derived
+	//                           0/1, same as before.
 	//   CreationOffsetS        — shifts creationTime by N seconds so an
 	//                           overlapping pair has a DETERMINISTIC winner (the
 	//                           later creationTime supersedes) without relying
@@ -564,13 +597,16 @@ type adminCtrlReq struct {
 	//                           proving the DUT correctly withholds a
 	//                           Response when none was asked for passes 0
 	//                           here.
-	MRID                  string `json:"mrid,omitempty"`
-	PotentiallySuperseded *bool  `json:"potentially_superseded,omitempty"`
-	CurrentStatus         *uint8 `json:"current_status,omitempty"`
-	CreationOffsetS       *int   `json:"creation_offset_s,omitempty"`
-	RandomizeStart        *int32 `json:"randomize_start,omitempty"`
-	RandomizeDuration     *int32 `json:"randomize_duration,omitempty"`
-	ResponseRequired      *uint8 `json:"response_required,omitempty"`
+	MRID                    string `json:"mrid,omitempty"`
+	PotentiallySuperseded   *bool  `json:"potentially_superseded,omitempty"`
+	Cancel                  bool   `json:"cancel,omitempty"`
+	CancelWithRandomization bool   `json:"cancel_with_randomization,omitempty"`
+	MarkSuperseded          string `json:"mark_superseded,omitempty"`
+	CurrentStatus           *uint8 `json:"current_status,omitempty"`
+	CreationOffsetS         *int   `json:"creation_offset_s,omitempty"`
+	RandomizeStart          *int32 `json:"randomize_start,omitempty"`
+	RandomizeDuration       *int32 `json:"randomize_duration,omitempty"`
+	ResponseRequired        *uint8 `json:"response_required,omitempty"`
 
 	// DERControlBase fields — only non-nil ones are included in the event.
 	//
@@ -675,6 +711,71 @@ func (req adminCtrlReq) nonStatusEdits(explicitDescription bool, droop *model.Fr
 	add(droop != nil, "freq_droop")
 	add(len(nullAxes) > 0, "null_axes")
 	return edits
+}
+
+// resolveCancelLevers folds req's named event-lifecycle levers (Cancel,
+// CancelWithRandomization, MarkSuperseded) into req.CurrentStatus, in place,
+// so every downstream read of req.CurrentStatus — both status-derivation
+// sites in adminCtrlPost — picks up the correct IEEE Std 2030.5-2018 Annex B
+// currentStatus value (p.159-160: 2 Cancelled, 3 Cancelled with
+// Randomization, 4 Superseded) without either site needing to know the
+// levers exist.
+//
+// REV0907-B1: this endpoint used to be driven for an ordinary cancel by
+// setting the raw CurrentStatus override to 6 — Table 27's Response status
+// for "event cancelled", transposed into the wrong (currentStatus)
+// enumeration. CurrentStatus stays available for a NEGATIVE test that needs
+// to serve a value the standard reserves and assert the DUT does not act on
+// it, so the two are made mutually exclusive here: a request naming a lever
+// AND a raw CurrentStatus, or more than one lever, is refused before
+// anything is stored, rather than silently letting one win.
+//
+// MarkSuperseded is validated against the SAME program's scheduled list
+// (controlIdentityLocked) because IEEE Std 2030.5-2018 Annex B defines
+// Superseded in terms of a real new event actually commencing ("commence
+// execution of the new event immediately") — a lever that could mark a
+// control Superseded with no such event on record would let a fixture
+// author a currentStatus the standard does not license, which is exactly
+// the class of defect this task closes, not one to reintroduce with a new
+// lever.
+func (s *Server) resolveCancelLevers(req *adminCtrlReq) error {
+	leverCount := 0
+	if req.Cancel {
+		leverCount++
+	}
+	if req.CancelWithRandomization {
+		leverCount++
+	}
+	if req.MarkSuperseded != "" {
+		leverCount++
+	}
+	if leverCount > 1 {
+		return fmt.Errorf("at most one of cancel, cancel_with_randomization, mark_superseded may be set on one request")
+	}
+	if leverCount == 1 && req.CurrentStatus != nil {
+		return fmt.Errorf("current_status is a raw override reserved for negative tests; it may not be " +
+			"combined with cancel, cancel_with_randomization, or mark_superseded — pick one")
+	}
+	switch {
+	case req.Cancel:
+		v := model.EventStatusCancelled
+		req.CurrentStatus = &v
+	case req.CancelWithRandomization:
+		v := model.EventStatusCancelledWithRandomization
+		req.CurrentStatus = &v
+	case req.MarkSuperseded != "":
+		s.mu.RLock()
+		_, ok := s.controlIdentityLocked(req.Program, req.MarkSuperseded)
+		s.mu.RUnlock()
+		if !ok {
+			return fmt.Errorf("mark_superseded %q: IEEE Std 2030.5-2018 Annex B currentStatus=4 (Superseded) "+
+				"requires a real superseding Event already scheduled on the SAME program — no control with "+
+				"that mrid is scheduled on program %d", req.MarkSuperseded, req.Program)
+		}
+		v := model.EventStatusSuperseded
+		req.CurrentStatus = &v
+	}
+	return nil
 }
 
 func (s *Server) handleAdminControl(w http.ResponseWriter, r *http.Request) {
@@ -792,6 +893,17 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// REV0907-B1: resolve the named event-lifecycle levers (Cancel,
+	// CancelWithRandomization, MarkSuperseded) into req.CurrentStatus before
+	// anything below reads it, so the two status-derivation sites further
+	// down (the fresh-control default and the matched-update branch) need no
+	// change at all — they already apply "CurrentStatus overrides the
+	// window-derived default" and now do so with the correct currentStatus
+	// value regardless of which lever, if any, produced it.
+	if err := s.resolveCancelLevers(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	// Captured BEFORE the "Admin control" default below is substituted, so
 	// nonStatusEdits can tell "this request authored a description" from
 	// "this request just left it out" — the two must not be flagged alike.
@@ -809,8 +921,10 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 	now := s.Now()
 	// Event status follows the IEEE 2030.5 event state machine (finding GS-2:
 	// previously always 1/Active, even for events whose window hadn't opened —
-	// a spec-correct client could have started them early). CurrentStatus
-	// overrides it directly (e.g. 6/Cancelled for a server-cancel).
+	// a spec-correct client could have started them early). req.CurrentStatus
+	// overrides it directly — by this point resolveCancelLevers has already
+	// folded Cancel/CancelWithRandomization/MarkSuperseded into it, so this is
+	// the one place both the levers and a raw negative-test override land.
 	activeNow := req.StartOffset <= 0
 	var status uint8
 	if activeNow {

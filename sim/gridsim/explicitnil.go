@@ -12,7 +12,7 @@ package gridsim
 // explicit-null freq_watt => no write at all". The row was recorded SKIP —
 // "structurally unavailable on this harness" — because every release gridsim
 // could author was an ABSENCE (omit the field) or a CANCELLATION (currentStatus
-// 6, DELETE /admin/control, POST /admin/default {"clear":true}), and those are
+// 2, DELETE /admin/control, POST /admin/default {"clear":true}), and those are
 // the conditions the row exists to distinguish an explicit null FROM. A skip
 // recorded for a harness limitation reads, in a bundle, exactly like a skip
 // recorded for a product limitation.

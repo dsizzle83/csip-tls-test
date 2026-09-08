@@ -33,9 +33,12 @@ func derc0(t *testing.T, s *Server) *model.DERControlList {
 }
 
 // A server-cancel is a two-step: post a control, let the hub receive it, then
-// flip its currentStatus→6 on the SAME mRID. The seam must UPDATE in place
-// (one control, new status), not add a second control — otherwise the hub sees
-// an already-cancelled new event and drops it silently (never posts 6).
+// flip its currentStatus to Cancelled (2, IEEE Std 2030.5-2018 Annex B,
+// p.159-160 — REV0907-B1: not 6, Table 27's Response status for "event
+// cancelled", a different enumeration) on the SAME mRID via the "cancel"
+// lever. The seam must UPDATE in place (one control, new status), not add a
+// second control — otherwise the hub sees an already-cancelled new event and
+// drops it silently (never posts Response 6).
 //
 // IW27-005: the second POST no longer re-sends exp_lim_W — a conformant
 // server-cancel changes EventStatus and nothing else (IEEE Std 2030.5-2018
@@ -52,14 +55,14 @@ func TestAdminControl_ExplicitMRIDUpdatesInPlace(t *testing.T) {
 		t.Fatalf("after first post: derc = %+v, want single DERC-CANCEL-ME", list.DERControl)
 	}
 
-	// Flip the SAME mRID to Cancelled(6) — status only.
-	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","current_status":6,"duration_s":300}`)
+	// Flip the SAME mRID to Cancelled(2) — status only, via the cancel lever.
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","cancel":true,"duration_s":300}`)
 	list := derc0(t, s)
 	if len(list.DERControl) != 1 {
 		t.Fatalf("in-place cancel added a control: derc has %d, want 1", len(list.DERControl))
 	}
-	if es := list.DERControl[0].EventStatus; es == nil || es.CurrentStatus != 6 {
-		t.Fatalf("cancel flip: EventStatus = %+v, want CurrentStatus 6", es)
+	if es := list.DERControl[0].EventStatus; es == nil || es.CurrentStatus != model.EventStatusCancelled {
+		t.Fatalf("cancel flip: EventStatus = %+v, want CurrentStatus %d (Cancelled)", es, model.EventStatusCancelled)
 	}
 	if list.DERControl[0].DERControlBase.OpModExpLimW == nil {
 		t.Fatalf("cancel flip: DERControlBase = %+v, want opModExpLimW still carried through from the "+
@@ -321,12 +324,12 @@ func TestAdminControl_ContentEditOnExistingMRIDIsRejectedByDefault(t *testing.T)
 	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","gen_lim_W":2000,"duration_s":600,"activate":true}`)
 	before := derc0(t, s).DERControl[0]
 
-	// The cancel: currentStatus 6, alongside gen_lim_W — a request that, pre-fix,
-	// would otherwise also author a completely different window (start 300s
-	// out, 900s long) on the same mRID.
+	// The cancel lever, alongside gen_lim_W — a request that, pre-fix, would
+	// otherwise also author a completely different window (start 300s out,
+	// 900s long) on the same mRID.
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/admin/control", bytes.NewReader([]byte(
-		`{"program":0,"mrid":"DERC-CANCEL-ME","current_status":6,"gen_lim_W":2000,"duration_s":900,"start_offset_s":300}`)))
+		`{"program":0,"mrid":"DERC-CANCEL-ME","cancel":true,"gen_lim_W":2000,"duration_s":900,"start_offset_s":300}`)))
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("POST /admin/control (status flip + gen_lim_W on an existing mRID) = %d, want 400: %s",
@@ -355,7 +358,7 @@ func TestAdminControl_NonconformantContentEditReauthorsExistingMRID(t *testing.T
 
 	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","gen_lim_W":2000,"duration_s":600,"activate":true}`)
 
-	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","current_status":6,"gen_lim_W":3000,"duration_s":600,`+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-CANCEL-ME","cancel":true,"gen_lim_W":3000,"duration_s":600,`+
 		`"nonconformant":{"allow_content_edit":true}}`)
 
 	list := derc0(t, s)
@@ -363,8 +366,8 @@ func TestAdminControl_NonconformantContentEditReauthorsExistingMRID(t *testing.T
 		t.Fatalf("in-place cancel added a control: derc has %d, want 1", len(list.DERControl))
 	}
 	after := list.DERControl[0]
-	if es := after.EventStatus; es == nil || es.CurrentStatus != 6 {
-		t.Fatalf("cancel flip: EventStatus = %+v, want CurrentStatus 6", es)
+	if es := after.EventStatus; es == nil || es.CurrentStatus != model.EventStatusCancelled {
+		t.Fatalf("cancel flip: EventStatus = %+v, want CurrentStatus %d (Cancelled)", es, model.EventStatusCancelled)
 	}
 	if after.DERControlBase.OpModGenLimW == nil || after.DERControlBase.OpModGenLimW.Value != 3000 {
 		t.Fatalf("nonconformant.allow_content_edit: DERControlBase = %+v, want the re-authored "+
@@ -435,5 +438,122 @@ func TestAdminControl_CreationOffsetOnExistingMRIDIsRejectedByDefault(t *testing
 	after := derc0(t, s).DERControl[0]
 	if after != before {
 		t.Errorf("a rejected update still changed the stored control:\nbefore: %+v\nafter:  %+v", before, after)
+	}
+}
+
+// ── REV0907-B1: event-lifecycle status levers ──────────────────────────────
+
+// TestAdminControl_CancelWithRandomizationServesStatusThree pins the
+// cancel_with_randomization lever: it must serve currentStatus=3 (Cancelled
+// with Randomization — IEEE Std 2030.5-2018 Annex B, p.159-160), not leave
+// the caller to type the raw number.
+func TestAdminControl_CancelWithRandomizationServesStatusThree(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-RANDCANCEL","exp_lim_W":4000,"duration_s":300,"activate":true,`+
+		`"randomize_start":0,"randomize_duration":90}`)
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-RANDCANCEL","cancel_with_randomization":true,"duration_s":300}`)
+
+	es := derc0(t, s).DERControl[0].EventStatus
+	if es == nil || es.CurrentStatus != model.EventStatusCancelledWithRandomization {
+		t.Fatalf("cancel_with_randomization flip: EventStatus = %+v, want CurrentStatus %d (Cancelled with "+
+			"Randomization)", es, model.EventStatusCancelledWithRandomization)
+	}
+}
+
+// TestAdminControl_MarkSupersededRequiresARealSupersedingControl pins the
+// mark_superseded lever's validation: IEEE Std 2030.5-2018 Annex B (p.159-160)
+// defines currentStatus=4 (Superseded) in terms of a REAL new event actually
+// commencing ("commence execution of the new event immediately"), so the
+// lever must refuse to author one when no such control is scheduled on the
+// same program — a mark_superseded that could conjure a Superseded status
+// with nothing superseding it would license exactly the kind of currentStatus
+// the standard does not, which is the class of defect REV0907-B1 closes.
+func TestAdminControl_MarkSupersededRequiresARealSupersedingControl(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-LOSER","exp_lim_W":4000,"duration_s":300,"activate":true}`)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/admin/control", bytes.NewReader([]byte(
+		`{"program":0,"mrid":"DERC-LOSER","mark_superseded":"DERC-DOES-NOT-EXIST","duration_s":300}`)))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("mark_superseded naming a non-existent control = %d, want 400: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "DERC-DOES-NOT-EXIST") {
+		t.Errorf("the 400 does not name the missing superseding mrid:\n%s", rec.Body)
+	}
+
+	// The control under test must be UNCHANGED by the rejected request.
+	es := derc0(t, s).DERControl[0].EventStatus
+	if es != nil && es.CurrentStatus == model.EventStatusSuperseded {
+		t.Errorf("a rejected mark_superseded still marked the control Superseded: %+v", es)
+	}
+}
+
+// TestAdminControl_MarkSupersededWithARealSupersedingControlServesStatusFour
+// is the positive half: naming a control that really is scheduled on the SAME
+// program serves currentStatus=4.
+func TestAdminControl_MarkSupersededWithARealSupersedingControlServesStatusFour(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-LOSER","exp_lim_W":4000,"duration_s":300,"activate":true}`)
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-WINNER","gen_lim_W":3000,"duration_s":300}`)
+
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-LOSER","mark_superseded":"DERC-WINNER","duration_s":300}`)
+
+	list := derc0(t, s)
+	var loser *model.DERControl
+	for i := range list.DERControl {
+		if list.DERControl[i].MRID == "DERC-LOSER" {
+			loser = &list.DERControl[i]
+		}
+	}
+	if loser == nil {
+		t.Fatal("DERC-LOSER vanished from the scheduled list")
+	}
+	if loser.EventStatus == nil || loser.EventStatus.CurrentStatus != model.EventStatusSuperseded {
+		t.Fatalf("mark_superseded flip: EventStatus = %+v, want CurrentStatus %d (Superseded)",
+			loser.EventStatus, model.EventStatusSuperseded)
+	}
+}
+
+// TestAdminControl_LeverAndRawOverrideAreMutuallyExclusive pins that a
+// request cannot combine a named lever with the raw current_status override:
+// CurrentStatus is reserved for a negative test serving a value the standard
+// reserves, and letting it silently coexist with a named lever would make it
+// ambiguous which value the request actually meant to test.
+func TestAdminControl_LeverAndRawOverrideAreMutuallyExclusive(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-AMBIG","exp_lim_W":4000,"duration_s":300,"activate":true}`)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/admin/control", bytes.NewReader([]byte(
+		`{"program":0,"mrid":"DERC-AMBIG","cancel":true,"current_status":6,"duration_s":300}`)))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("cancel + current_status combined = %d, want 400: %s", rec.Code, rec.Body)
+	}
+}
+
+// TestAdminControl_AtMostOneLever pins that the three levers are themselves
+// mutually exclusive — a request cannot ask gridsim to serve two different
+// currentStatus values from one POST.
+func TestAdminControl_AtMostOneLever(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+	postCtrl(t, h, `{"program":0,"mrid":"DERC-TWOLEVERS","exp_lim_W":4000,"duration_s":300,"activate":true}`)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/admin/control", bytes.NewReader([]byte(
+		`{"program":0,"mrid":"DERC-TWOLEVERS","cancel":true,"cancel_with_randomization":true,"duration_s":300}`)))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("cancel + cancel_with_randomization combined = %d, want 400: %s", rec.Code, rec.Body)
 	}
 }

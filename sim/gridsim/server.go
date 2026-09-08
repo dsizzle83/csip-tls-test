@@ -1420,7 +1420,10 @@ func (s *Server) buildProgram0(now int64) {
 	// Four controls demonstrating the full range of event states:
 	//   SP-001 — scheduled, potentiallySuperseded by SP-002 (same interval, newer)
 	//   SP-002 — scheduled, supersedes SP-001 (same start, longer duration, newer creationTime)
-	//   SP-003 — cancelled (currentStatus=6); client must drop it
+	//   SP-003 — cancelled (currentStatus=2, IEEE Std 2030.5-2018 Annex B,
+	//            p.159-160 — REV0907-B1: NOT 6, which is Table 27's Response
+	//            status for "event cancelled", a different enumeration); client
+	//            must drop it
 	//   SP-004 — scheduled future, randomizeStart=30s for device staggering
 	eventStart := now + 180 // 3 minutes from now
 
@@ -1475,7 +1478,7 @@ func (s *Server) buildProgram0(now int64) {
 				Description:  "Cancelled control (client must ignore)",
 				CreationTime: now - 600,
 				EventStatus: &model.EventStatus{
-					CurrentStatus:         6, // Cancelled
+					CurrentStatus:         model.EventStatusCancelled, // 2 — REV0907-B1: not 6
 					DateTime:              now - 60,
 					PotentiallySuperseded: false,
 				},

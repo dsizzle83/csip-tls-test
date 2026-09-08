@@ -974,11 +974,13 @@ func TestLegacyRowsAreRedEndToEndAgainstTheShippingProduct(t *testing.T) {
 // baseline confirm while the product was correct.
 //
 // The teardown CANCELS-THEN-DELETES (teardown.go's releaseProgramControls): it
-// server-CANCELS the control (currentStatus=6) so a spec-correct DUT observes the
+// server-CANCELS the control (the "cancel" lever, currentStatus=2 — IEEE Std
+// 2030.5-2018 Annex B p.159-160; REV0907-B1: not 6, Table 27's Response
+// status for "event cancelled") so a spec-correct DUT observes the
 // cancellation and drops the active event, awaits a fresh poll, and only THEN
 // deletes the control so nothing is left advertised to accumulate into the next
 // row. This runs the row's own Cleanup through a recording transport and proves:
-// a Cancelled(6) edit was issued, a DELETE followed it (never preceded it), the
+// a cancel edit was issued, a DELETE followed it (never preceded it), the
 // teardown recorded no error, and the control is GONE from the data plane
 // afterwards. There is deliberately NO reversion-verify — a global "any 704
 // enable is contamination" gate false-FATALs the board's standing DefaultDERControl
@@ -1028,14 +1030,14 @@ func TestLegacyRowTeardownCancelsThenCleansTheEventItPublished(t *testing.T) {
 			"driving: %v", got)
 	}
 
-	// The teardown must CANCEL (current_status=6) BEFORE it DELETEs: a
+	// The teardown must CANCEL (the "cancel" lever) BEFORE it DELETEs: a
 	// spec-correct DUT can only drop an event it acquired by OBSERVING the
 	// cancellation, and a delete that ran first would make the control vanish
 	// before it could — the exact defect this rework closes.
 	cancelAt, deleteAt := -1, -1
 	for i := teardownStart; i < len(rec.method); i++ {
 		switch {
-		case rec.method[i] == http.MethodPost && strings.Contains(rec.body[i], `"current_status":6`):
+		case rec.method[i] == http.MethodPost && strings.Contains(rec.body[i], `"cancel":true`):
 			if cancelAt < 0 {
 				cancelAt = i
 			}
@@ -1046,7 +1048,7 @@ func TestLegacyRowTeardownCancelsThenCleansTheEventItPublished(t *testing.T) {
 		}
 	}
 	if cancelAt < 0 {
-		t.Errorf("the teardown issued no Cancelled(6) edit, so a spec-correct DUT never observes the event "+
+		t.Errorf("the teardown issued no cancel edit, so a spec-correct DUT never observes the event "+
 			"end (requests: %v)", rec.method[teardownStart:])
 	}
 	if deleteAt < 0 {

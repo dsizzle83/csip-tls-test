@@ -19,6 +19,7 @@ import (
 
 	"csip-tls-test/internal/certify"
 	"csip-tls-test/internal/diff"
+	csipmodel "lexa-proto/csipmodel"
 	"lexa-proto/sunspec"
 )
 
@@ -325,7 +326,7 @@ func TestBASIC007_IsNotInTheUniformInverterControlRows(t *testing.T) {
 // advertised status. Its fields are guarded by rampFakeBench's own mu.
 type rampAdminProbe struct {
 	priorMRID            string
-	priorStatus          int  // 1 = active (masks the default); 6 = Cancelled
+	priorStatus          int  // 1 = active (masks the default); 2 = Cancelled (REV0907-B1: not 6, Table 27's Response status for "event cancelled")
 	baselinePublished    bool // the first POST /admin/default arrived
 	cancelSeen           bool
 	cancelBeforeBaseline bool
@@ -392,19 +393,20 @@ func rampFakeBench(t *testing.T, start uint16) (*certify.RunCtx, *Driver, *rampA
 		})
 	})
 	// POST /admin/control accepts the status-only server-cancel the quiesce
-	// issues (CurrentStatus=6 keyed to the prior control's mrid) and records the
-	// ordering: a cancel that arrives while baselinePublished is still false is
-	// the quiesce running BEFORE the baseline, which is the property Fix B owes.
+	// issues (the "cancel" lever, keyed to the prior control's mrid) and
+	// records the ordering: a cancel that arrives while baselinePublished is
+	// still false is the quiesce running BEFORE the baseline, which is the
+	// property Fix B owes.
 	adminMux.HandleFunc("/admin/control", func(w http.ResponseWriter, r *http.Request) {
 		var req ControlRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		mu.Lock()
-		if req.CurrentStatus != nil && *req.CurrentStatus == 6 && req.MRID == probe.priorMRID {
+		if req.Cancel && req.MRID == probe.priorMRID {
 			probe.cancelSeen = true
 			if !probe.baselinePublished {
 				probe.cancelBeforeBaseline = true
 			}
-			probe.priorStatus = 6 // now advertised as Cancelled(6), not deleted
+			probe.priorStatus = int(csipmodel.EventStatusCancelled) // now advertised as Cancelled(2), not deleted
 		}
 		mrid := req.MRID
 		mu.Unlock()
@@ -536,7 +538,7 @@ func TestBASIC007_PassesRegardlessOfPriorRegisterState(t *testing.T) {
 // until it is cancelled — so the row PASSes only because the quiesce ran, and
 // the cancel is proven to have been issued BEFORE the first baseline publish
 // (never after, which would confirm the baseline against a DUT still executing
-// the prior event). The prior control is left advertised as Cancelled(6), not
+// the prior event). The prior control is left advertised as Cancelled(2), not
 // deleted, so a spec-correct DUT can observe the cancellation.
 func TestBASIC007_QuiescesTheControlPlaneBeforeTheBaseline(t *testing.T) {
 	rc, d, probe := rampFakeBench(t, 90)
@@ -550,9 +552,10 @@ func TestBASIC007_QuiescesTheControlPlaneBeforeTheBaseline(t *testing.T) {
 		t.Error("the quiesce-cancel was issued AFTER the first baseline publish, not before — the baseline " +
 			"is then confirmed against a DUT still executing the prior event")
 	}
-	if probe.priorStatus != 6 {
-		t.Errorf("the prior control is not left advertised as Cancelled(6) after the quiesce (status=%d); a "+
-			"deleted control is one a spec-correct DUT never observes ending", probe.priorStatus)
+	if probe.priorStatus != int(csipmodel.EventStatusCancelled) {
+		t.Errorf("the prior control is not left advertised as Cancelled(%d) after the quiesce (status=%d); a "+
+			"deleted control is one a spec-correct DUT never observes ending",
+			csipmodel.EventStatusCancelled, probe.priorStatus)
 	}
 	// The row still PASSes on the MOVE, unweakened: baseline 50 confirmed, target
 	// 90 reached.

@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"csip-tls-test/internal/certify"
+	csipmodel "lexa-proto/csipmodel"
 )
 
 // pollInterval is how often a wait re-reads the server's view. It is short
@@ -1353,10 +1354,20 @@ type ControlRequest struct {
 
 	MRID                  string `json:"mrid,omitempty"`
 	PotentiallySuperseded *bool  `json:"potentially_superseded,omitempty"`
-	CurrentStatus         *uint8 `json:"current_status,omitempty"`
-	CreationOffsetS       *int   `json:"creation_offset_s,omitempty"`
-	RandomizeStart        *int32 `json:"randomize_start,omitempty"`
-	RandomizeDuration     *int32 `json:"randomize_duration,omitempty"`
+	// Cancel/CancelWithRandomization/MarkSuperseded are gridsim's named
+	// event-lifecycle levers (sim/gridsim/admin.go's adminCtrlReq doc,
+	// REV0907-B1): the correct-by-construction way to drive a control to
+	// IEEE Std 2030.5-2018 Annex B currentStatus 2/3/4. CurrentStatus stays
+	// as a RAW override reserved for a negative test that must serve a
+	// value the standard reserves (mutually exclusive with the three levers
+	// — gridsim refuses combining them).
+	Cancel                  bool   `json:"cancel,omitempty"`
+	CancelWithRandomization bool   `json:"cancel_with_randomization,omitempty"`
+	MarkSuperseded          string `json:"mark_superseded,omitempty"`
+	CurrentStatus           *uint8 `json:"current_status,omitempty"`
+	CreationOffsetS         *int   `json:"creation_offset_s,omitempty"`
+	RandomizeStart          *int32 `json:"randomize_start,omitempty"`
+	RandomizeDuration       *int32 `json:"randomize_duration,omitempty"`
 	// ResponseRequired overrides gridsim's default responseRequired bitmap
 	// for this control (adminDefaultResponseRequired — bit 0x01|0x02, see
 	// sim/gridsim/admin.go). A check that needs to prove graceful
@@ -1801,22 +1812,24 @@ func (d *Driver) ClearCurves(ctx context.Context, program int) error {
 }
 
 // cancelControl issues the IEEE 2030.5-2018 §10.2.3.3 c) server-cancel of ONE
-// control on program — a status-only edit (CurrentStatus=6/Cancelled) keyed to
-// the control's OWN mrid. gridsim's adminCtrlPost matches the mrid and flips
-// only EventStatus (see its inheritStored path), leaving the control ADVERTISED
-// as Cancelled for the DUT to observe on its next poll rather than making it
-// vanish. It carries no content fields, so gridsim's edit guard treats it as a
-// pure status flip. The mrid must be one gridsim already carries (callers pass
-// mrids read back from GET /admin/status); the returned error is the caller's
-// to record, never fatal.
+// control on program — a status-only edit (the "cancel" lever, which gridsim
+// serves as currentStatus=2/Cancelled — Annex B, p.159-160; REV0907-B1: NOT
+// 6, Table 27's Response status for "event cancelled", a different
+// enumeration) keyed to the control's OWN mrid. gridsim's adminCtrlPost
+// matches the mrid and flips only EventStatus (see its inheritStored path),
+// leaving the control ADVERTISED as Cancelled for the DUT to observe on its
+// next poll rather than making it vanish. It carries no content fields, so
+// gridsim's edit guard treats it as a pure status flip. The mrid must be one
+// gridsim already carries (callers pass mrids read back from GET
+// /admin/status); the returned error is the caller's to record, never fatal.
 func (d *Driver) cancelControl(ctx context.Context, program int, mrid string) error {
-	_, err := d.PostControl(ctx, ControlRequest{Program: program, MRID: mrid, CurrentStatus: ptr(uint8(6))})
+	_, err := d.PostControl(ctx, ControlRequest{Program: program, MRID: mrid, Cancel: true})
 	return err
 }
 
 // cancelProgramControls server-cancels EVERY not-yet-terminal control gridsim
 // still advertises on program, by each control's own mrid, leaving them
-// advertised as Cancelled(6). It is the spec-correct end of an event that a
+// advertised as Cancelled(2). It is the spec-correct end of an event that a
 // bare ClearControls DELETE skips: IEEE 2030.5-2018 §10.2.3.3 c) ends an event
 // by cancel or supersede, never by removing it from the list, so a spec-correct
 // DUT that has ALREADY acquired an active event keeps executing it until it
@@ -1825,8 +1838,12 @@ func (d *Driver) cancelControl(ctx context.Context, program int, mrid string) er
 // event stayed the DUT's effective control into the next row).
 //
 // It enumerates the live controls from GET /admin/status and skips any already
-// at a terminal status (Cancelled 6 / Superseded 7), so re-running it is a
-// no-op. A bench with no admin API, an unenumerable status (an older sim, a
+// at a terminal currentStatus (Cancelled 2, Cancelled with Randomization 3, or
+// Superseded 4 — IEEE Std 2030.5-2018 Annex B, p.159-160; REV0907-B1: the
+// legacy-mistaken 6/7 this check used to compare against are Table 27
+// RESPONSE codes, not currentStatus values, so it never actually recognised a
+// terminal control and re-issued the cancel every time), so re-running it is
+// a no-op. A bench with no admin API, an unenumerable status (an older sim, a
 // transport hiccup), or a program with nothing live is a safe no-op returning
 // nil — the caller's own poll fence plus the settleOracle backstop still catch a
 // DUT that never quiesced. Best-effort, like ClearControls' recorded-not-fatal
@@ -1852,7 +1869,13 @@ func (d *Driver) cancelProgramControls(ctx context.Context, program int) error {
 				continue
 			}
 			seen[c.MRID] = true
-			if c.Status == 6 || c.Status == 7 { // already Cancelled / Superseded
+			// IsTerminal is Cancelled(2)/Cancelled with Randomization(3)/
+			// Superseded(4) — IEEE Std 2030.5-2018 Annex B, p.159-160.
+			// REV0907-B1: this used to compare c.Status against 6/7, which
+			// are Table 27 RESPONSE codes, not currentStatus values, so the
+			// check never actually matched a terminal control and re-issued
+			// the cancel every call.
+			if (csipmodel.EventStatus{CurrentStatus: uint8(c.Status)}).IsTerminal() {
 				continue
 			}
 			if err := d.cancelControl(ctx, program, c.MRID); err != nil && firstErr == nil {
