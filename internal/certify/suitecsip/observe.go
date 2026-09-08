@@ -1365,9 +1365,16 @@ type ControlRequest struct {
 	CancelWithRandomization bool   `json:"cancel_with_randomization,omitempty"`
 	MarkSuperseded          string `json:"mark_superseded,omitempty"`
 	CurrentStatus           *uint8 `json:"current_status,omitempty"`
-	CreationOffsetS         *int   `json:"creation_offset_s,omitempty"`
-	RandomizeStart          *int32 `json:"randomize_start,omitempty"`
-	RandomizeDuration       *int32 `json:"randomize_duration,omitempty"`
+	// Expired is REV0907-B2's lever (sim/gridsim/admin.go's adminCtrlReq
+	// doc): forces currentStatus=0 (Scheduled) on a control whose OWN
+	// interval (start_offset_s+duration_s) has already elapsed at post
+	// time — refused by gridsim unless the window really is already in the
+	// past. Mutually exclusive with the other levers and with CurrentStatus,
+	// same as they are with each other.
+	Expired           bool   `json:"expired,omitempty"`
+	CreationOffsetS   *int   `json:"creation_offset_s,omitempty"`
+	RandomizeStart    *int32 `json:"randomize_start,omitempty"`
+	RandomizeDuration *int32 `json:"randomize_duration,omitempty"`
 	// ResponseRequired overrides gridsim's default responseRequired bitmap
 	// for this control (adminDefaultResponseRequired — bit 0x01|0x02, see
 	// sim/gridsim/admin.go). A check that needs to prove graceful

@@ -196,3 +196,184 @@ func TestCancelWithRandomizationSpec_FloorMatchesEndRandomizationS(t *testing.T)
 		t.Fatalf("EndRandomizationS(0, %d) = %d, want %d", ext003RandomizeDurationS, got, ext003RandomizeDurationS)
 	}
 }
+
+// ── EXT-004: the gridsim serve path ─────────────────────────────────────────
+
+// TestExpiredAtReceiptSpec_SetupServesAnAlreadyElapsedIntervalWithStatusZero
+// pins that EXT-004's Setup actually constructs the exact combination its own
+// claim depends on: a control whose Specified End Time (Interval.Start+
+// Interval.Duration) has ALREADY PASSED at post time, served with
+// currentStatus=0 (Scheduled) — never 1 (Active), which is what an ordinary
+// past-start control defaults to. If gridsim ever "corrected" this (e.g. by
+// defaulting to currentStatus=1 the way every other past-start control
+// does), the row would stop testing what it claims to.
+func TestExpiredAtReceiptSpec_SetupServesAnAlreadyElapsedIntervalWithStatusZero(t *testing.T) {
+	d := gridsimDriver(t)
+	ctx := context.Background()
+
+	s := expiredAtReceiptSpec("ext004nonce1")
+	params := map[string]string{}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	after := d.Snapshot(ctx)
+	ctrl := findControl(t, findProgram(t, after, 2).Scheduled, params["mrid"])
+	if ctrl.Status != int(csipmodel.EventStatusScheduled) {
+		t.Fatalf("EXT-004's Setup served currentStatus=%d, want %d (Scheduled) even though its own interval "+
+			"has already elapsed", ctrl.Status, csipmodel.EventStatusScheduled)
+	}
+	if end := ctrl.Start + int64(ctrl.DurationS); end >= after.Status.ServerTime {
+		t.Fatalf("the served interval (start=%d duration=%d, end=%d) is not actually in gridsim's past "+
+			"(server time=%d) — EXT-004 is not testing what it claims to", ctrl.Start, ctrl.DurationS, end,
+			after.Status.ServerTime)
+	}
+}
+
+// TestExpiredAtReceiptSpec_SetupRecordsACeilingBaseline pins that Setup
+// stashes SOME pre-publication ceiling snapshot into params, even when no
+// live DER is configured (gridsimDriver wires only gridsim's admin API,
+// never a sim) — readCeilingSnapshot must degrade to an Unavailable
+// snapshot rather than leaving the param unset or panicking, which is what
+// ext004CeilingStabilityCriterion needs to report the criterion as
+// Unavailable rather than crash decoding an empty string.
+func TestExpiredAtReceiptSpec_SetupRecordsACeilingBaseline(t *testing.T) {
+	d := gridsimDriver(t)
+	ctx := context.Background()
+
+	s := expiredAtReceiptSpec("ext004nonce2")
+	params := map[string]string{}
+	if err := s.Setup(ctx, d, params); err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+
+	raw, ok := params[ext004CeilingPreParam]
+	if !ok || raw == "" {
+		t.Fatalf("Setup did not record %s in params", ext004CeilingPreParam)
+	}
+	snap := decodeCeilingSnapshot(raw)
+	if snap.Available {
+		t.Fatalf("decodeCeilingSnapshot(%q) reports Available=true with no sim configured — want a graceful "+
+			"Unavailable snapshot", raw)
+	}
+	if want := params[ext004WantParam]; want == "" {
+		t.Error("Setup did not record a chosen commanded value in params")
+	}
+}
+
+// ── EXT-004: the oracle's expectation table (Response-status criterion) ────
+
+// TestExt004ResponseCriterion_Grading exercises EXT-004's primary claim
+// directly against synthetic ServerViews: exactly one status=254 and none of
+// 1/2/3 PASSes; any of 1/2/3 present FAILs (the DUT adopted or executed an
+// already-expired event); zero or more than one status=254 also FAILs (a
+// correct rejection is owed exactly once).
+func TestExt004ResponseCriterion_Grading(t *testing.T) {
+	mrid := "CERT-EXT004-EXPIRED-test"
+	c := ext004ResponseCriterion(mrid)
+	if c.Server == nil {
+		t.Fatal("ext004ResponseCriterion did not build a Server-tier evaluator")
+	}
+
+	cases := []struct {
+		name    string
+		resp    []AdminResponse
+		session bool
+		want    certify.Verdict
+	}{
+		{"exactly one 254, nothing else", []AdminResponse{{Subject: mrid, Status: 254}}, true, certify.Pass},
+		{"254 plus an unrelated mrid's response", []AdminResponse{
+			{Subject: mrid, Status: 254}, {Subject: "OTHER", Status: 1}}, true, certify.Pass},
+		{"Received(1) posted — REV0907-B2's own defect shape", []AdminResponse{
+			{Subject: mrid, Status: 1}, {Subject: mrid, Status: 254}}, true, certify.Fail},
+		{"Started(2) posted, no 254 at all", []AdminResponse{{Subject: mrid, Status: 2}}, true, certify.Fail},
+		{"Completed(3) posted alongside 254", []AdminResponse{
+			{Subject: mrid, Status: 254}, {Subject: mrid, Status: 3}}, true, certify.Fail},
+		// A session DID establish (the DUT connected and fetched the control
+		// list — a real GET is what SessionEstablished() looks for) but posted
+		// NOTHING for this mrid: silently ignoring an expired event is not the
+		// same as correctly rejecting it, so this must FAIL, not merely be
+		// Unavailable for lack of a session.
+		{"no 254 at all (silently ignored, never rejected)", nil, true, certify.Fail},
+		{"254 posted twice", []AdminResponse{
+			{Subject: mrid, Status: 254}, {Subject: mrid, Status: 254}}, true, certify.Fail},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := &ServerView{Available: true, Responses: tc.resp}
+			if tc.session {
+				v.Requests = []ServerRequest{{Method: "GET", Path: "/dcap"}}
+			}
+			f := c.Server(v)
+			if f.Verdict != tc.want {
+				t.Errorf("statuses %v -> verdict=%s (%s), want %s", tc.resp, f.Verdict, f.Observed, tc.want)
+			}
+		})
+	}
+}
+
+// TestExt004ResponseCriterion_NoSessionIsUnavailableNotFail pins that a
+// window with no TLS session at all (gridsim logged nothing because the DUT
+// never connected) is graded Unavailable, not a FAIL — the same
+// noSessionUnavailable discipline every other Server-tier criterion in this
+// suite already gets.
+func TestExt004ResponseCriterion_NoSessionIsUnavailableNotFail(t *testing.T) {
+	c := ext004ResponseCriterion("CERT-EXT004-NOSESSION")
+	f := c.Server(&ServerView{Available: true})
+	if f.Unavailable == "" {
+		t.Errorf("no session at all should be Unavailable, got verdict=%s: %s", f.Verdict, f.Observed)
+	}
+}
+
+// ── EXT-004: the ceiling-stability criterion ────────────────────────────────
+
+// TestExt004CeilingFinding_Grading is REV0907-B2's mutation-verify lock for
+// the supporting ceiling-axis check: an unmoved register PASSes, a moved one
+// FAILs, and either read being unavailable degrades the criterion to
+// Unavailable rather than a decided verdict.
+func TestExt004CeilingFinding_Grading(t *testing.T) {
+	unchanged := ceilingSnapshot{Available: true, Point: "WMaxLimPct", Enabled: true, Raw: 100}
+	moved := ceilingSnapshot{Available: true, Point: "WMaxLimPct", Enabled: true, Raw: 12.34}
+	unavailablePre := ceilingSnapshot{Note: "no sim configured"}
+
+	if f := ext004CeilingFinding(unchanged, unchanged, 1234); f.Verdict != certify.Pass {
+		t.Errorf("identical pre/post = %s, want Pass: %s", f.Verdict, f.Observed)
+	}
+	if f := ext004CeilingFinding(unchanged, moved, 1234); f.Verdict != certify.Fail {
+		t.Errorf("pre=%v post=%v = %s, want Fail: %s", unchanged, moved, f.Verdict, f.Observed)
+	}
+	if f := ext004CeilingFinding(unavailablePre, unchanged, 1234); f.Unavailable == "" {
+		t.Errorf("unavailable pre-read should be Unavailable, got verdict=%s: %s", f.Verdict, f.Observed)
+	}
+	if f := ext004CeilingFinding(unchanged, unavailablePre, 1234); f.Unavailable == "" {
+		t.Errorf("unavailable post-read should be Unavailable, got verdict=%s: %s", f.Verdict, f.Observed)
+	}
+	// An enabled flip with the SAME raw value is still a move: the axis'
+	// governing state changed even if the magnitude did not.
+	flippedEnable := ceilingSnapshot{Available: true, Point: "WMaxLimPct", Enabled: false, Raw: 100}
+	if f := ext004CeilingFinding(unchanged, flippedEnable, 1234); f.Verdict != certify.Fail {
+		t.Errorf("enabled flip with unchanged raw = %s, want Fail: %s", f.Verdict, f.Observed)
+	}
+}
+
+// TestCeilingSnapshot_EncodeDecodeRoundTrips pins the Params serialization
+// EXT-004's Setup/PostWait (encode) and its citation-phase criterion
+// (decode) must agree on — a live-phase fact that decodes back differently
+// than it was encoded is corrupted evidence, not a working ceiling read.
+func TestCeilingSnapshot_EncodeDecodeRoundTrips(t *testing.T) {
+	cases := []ceilingSnapshot{
+		{Available: true, Point: "WMaxLimPct", Enabled: true, Raw: 42.5},
+		{Available: true, Point: "M123.WMaxLimPct", Enabled: false, Raw: 0},
+		{Note: "the DER serves no model 704 and no model 123"},
+	}
+	for _, want := range cases {
+		got := decodeCeilingSnapshot(want.encode())
+		if got.Available != want.Available || got.Point != want.Point || got.Enabled != want.Enabled ||
+			got.Raw != want.Raw {
+			t.Errorf("round-trip of %+v = %+v (via %q)", want, got, want.encode())
+		}
+		if !want.Available && got.Note == "" {
+			t.Errorf("round-trip of an unavailable snapshot lost its Note: %+v -> %+v", want, got)
+		}
+	}
+}

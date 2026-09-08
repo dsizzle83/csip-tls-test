@@ -152,6 +152,7 @@ var authorityFamilies = []authorityFamily{
 			"csip-conf-v1.3::CORE-023", // Superseding Events
 			"local-ext-v1::EXT-002",    // reserved currentStatus is not a cancel (REV0907-B1)
 			"local-ext-v1::EXT-003",    // Cancelled with Randomization (currentStatus 3)
+			"local-ext-v1::EXT-004",    // expired-at-receipt draws 254, never Received/Started (REV0907-B2)
 		},
 	},
 	{

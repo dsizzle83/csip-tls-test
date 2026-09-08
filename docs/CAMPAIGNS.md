@@ -141,7 +141,18 @@ malformed `-gateway-exec` — exits **2**.
 with the reason it needs that lane. In outline:
 
 * **`csip`** — `BASIC-004…015` (inverter control), `BASIC-016…026` (event
-  precedence), `CORE-012/013/021/022/023`, `local-ext-v1::EXT-001`.
+  precedence), `CORE-012/013/021/022/023`, `local-ext-v1::EXT-001…004`.
+  `EXT-002`/`EXT-003`/`EXT-004` (REV0907-B1/B2) are LOCAL EXTENSION rows with
+  no published CSIP-CONF-v1.3 procedure behind them at all: `EXT-002` proves a
+  RESERVED `currentStatus` value (6) is never treated as Cancelled, `EXT-003`
+  proves a `currentStatus=3` (Cancelled with Randomization) event is not
+  withdrawn before its own end randomization, and `EXT-004` proves an event
+  whose Specified End Time (§10.2.3.3 l) has already passed AT FIRST SIGHTING
+  draws Response status 254 and is never Received/Started/Completed —
+  regardless of the `currentStatus` (0, Scheduled) the server advertises on
+  it. All three share `CORE-012/013/021/022/023`'s own reason for needing
+  `csip`: their subject is the DER program/control lifecycle itself, which
+  exists only while the CSIP control path owns `lexa/desired/*`.
 * **`mbaps`** — every `ssm-conf-v0.8::RBAC-*`, and the northbound **write** rows
   `MB-1`, `MOD-3`, `EXC-1`, `EXC-2`, `CRV-1`, `REV-1/2/3`.
 

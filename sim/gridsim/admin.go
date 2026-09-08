@@ -581,9 +581,30 @@ type adminCtrlReq struct {
 	//                           standard reserves (e.g. 6, the legacy-mistaken
 	//                           value above) and assert the DUT does NOT treat
 	//                           it as terminal. Mutually exclusive with
-	//                           Cancel/CancelWithRandomization/MarkSuperseded
-	//                           (400 if combined); nil ⇒ the window-derived
-	//                           0/1, same as before.
+	//                           Cancel/CancelWithRandomization/MarkSuperseded/
+	//                           Expired (400 if combined); nil ⇒ the
+	//                           window-derived 0/1, same as before.
+	//   Expired               — REV0907-B2 lever: forces currentStatus=0
+	//                           (Scheduled — IEEE Std 2030.5-2018 Annex B,
+	//                           p.159-160) on a control whose OWN interval
+	//                           (Interval.Start+Duration, the Specified End
+	//                           Time §10.2.3.3 l) refers to) has ALREADY
+	//                           ELAPSED at post time — the server keeps
+	//                           advertising the event as merely Scheduled
+	//                           while its window is already in the past, the
+	//                           exact combination §10.2.3.3 l) ("If an Event
+	//                           is received after it has expired... this
+	//                           Event SHALL be ignored") requires a client to
+	//                           reject regardless of what currentStatus says.
+	//                           Refused (400) unless start_offset_s+duration_s
+	//                           is already <= 0 relative to server time —
+	//                           same "cannot author the condition out of thin
+	//                           air" discipline MarkSuperseded's own guard
+	//                           uses: the row this lever serves has to be
+	//                           GENUINELY expired, not merely labelled so.
+	//                           Mutually exclusive with Cancel/
+	//                           CancelWithRandomization/MarkSuperseded/
+	//                           CurrentStatus.
 	//   CreationOffsetS        — shifts creationTime by N seconds so an
 	//                           overlapping pair has a DETERMINISTIC winner (the
 	//                           later creationTime supersedes) without relying
@@ -603,6 +624,7 @@ type adminCtrlReq struct {
 	CancelWithRandomization bool   `json:"cancel_with_randomization,omitempty"`
 	MarkSuperseded          string `json:"mark_superseded,omitempty"`
 	CurrentStatus           *uint8 `json:"current_status,omitempty"`
+	Expired                 bool   `json:"expired,omitempty"`
 	CreationOffsetS         *int   `json:"creation_offset_s,omitempty"`
 	RandomizeStart          *int32 `json:"randomize_start,omitempty"`
 	RandomizeDuration       *int32 `json:"randomize_duration,omitempty"`
@@ -738,6 +760,15 @@ func (req adminCtrlReq) nonStatusEdits(explicitDescription bool, droop *model.Fr
 // author a currentStatus the standard does not license, which is exactly
 // the class of defect this task closes, not one to reintroduce with a new
 // lever.
+//
+// REV0907-B2 adds Expired to the same exclusivity group: it also resolves to
+// a fixed CurrentStatus (0, Scheduled) here, but — unlike Cancel/
+// CancelWithRandomization/MarkSuperseded, whose currentStatus IS the event
+// this lever authors — Expired's defining fact is the INTERVAL, not the
+// status, so its own validation (the window really has already elapsed) is
+// checked later in adminCtrlPost once `now` and the effective interval are
+// both in hand; this function only reserves the value and the mutual
+// exclusion.
 func (s *Server) resolveCancelLevers(req *adminCtrlReq) error {
 	leverCount := 0
 	if req.Cancel {
@@ -749,12 +780,15 @@ func (s *Server) resolveCancelLevers(req *adminCtrlReq) error {
 	if req.MarkSuperseded != "" {
 		leverCount++
 	}
+	if req.Expired {
+		leverCount++
+	}
 	if leverCount > 1 {
-		return fmt.Errorf("at most one of cancel, cancel_with_randomization, mark_superseded may be set on one request")
+		return fmt.Errorf("at most one of cancel, cancel_with_randomization, mark_superseded, expired may be set on one request")
 	}
 	if leverCount == 1 && req.CurrentStatus != nil {
 		return fmt.Errorf("current_status is a raw override reserved for negative tests; it may not be " +
-			"combined with cancel, cancel_with_randomization, or mark_superseded — pick one")
+			"combined with cancel, cancel_with_randomization, mark_superseded, or expired — pick one")
 	}
 	switch {
 	case req.Cancel:
@@ -773,6 +807,9 @@ func (s *Server) resolveCancelLevers(req *adminCtrlReq) error {
 				"that mrid is scheduled on program %d", req.MarkSuperseded, req.Program)
 		}
 		v := model.EventStatusSuperseded
+		req.CurrentStatus = &v
+	case req.Expired:
+		v := model.EventStatusScheduled
 		req.CurrentStatus = &v
 	}
 	return nil
@@ -1032,6 +1069,28 @@ func (s *Server) adminCtrlPost(w http.ResponseWriter, r *http.Request) {
 			if req.CurrentStatus != nil {
 				status = *req.CurrentStatus
 			}
+		}
+	}
+	// REV0907-B2: Expired's whole claim is that the SERVER still advertises
+	// currentStatus=0 (Scheduled — forced above by resolveCancelLevers) while
+	// the event's own Specified End Time (IEEE Std 2030.5-2018 §10.2.3.3 l) —
+	// Interval.Start+Interval.Duration, no randomization) has ALREADY PASSED.
+	// A request that did not actually construct that condition — an insert
+	// whose window has not elapsed yet, or an update inheriting a
+	// not-yet-elapsed prior.interval — would author a currentStatus the
+	// interval does not support, exactly the "cannot author the condition out
+	// of thin air" rule MarkSuperseded's own guard enforces above. Checked
+	// here, after `interval` and `now` are both final for either the insert
+	// or matched-update path, rather than in resolveCancelLevers, which runs
+	// before either exists.
+	if req.Expired {
+		if end := interval.Start + int64(interval.Duration); end > now {
+			http.Error(w, fmt.Sprintf("expired requires an interval whose Specified End Time (start+duration) "+
+				"has already passed at post time (IEEE Std 2030.5-2018 §10.2.3.3 l)): got start=%d duration=%d "+
+				"(end=%d), server now=%d, %d seconds in the future — set start_offset_s/duration_s (or, on an "+
+				"update, publish a NEW mrid) so the window is already elapsed",
+				interval.Start, interval.Duration, end, now, end-now), http.StatusBadRequest)
+			return
 		}
 	}
 	// responseRequired defaults ON (adminDefaultResponseRequired — see its doc

@@ -18528,5 +18528,46 @@
   "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 procedure exercises currentStatus=3 (Cancelled with Randomization); this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim. REV0907-B1: sim/gridsim/admin.go's cancel_with_randomization lever serves this value; the floor is IEEE Std 2030.5-2018 Annex B, p.159-160's max(|randomizeStart|,|randomizeDuration|), also carried as csipmodel.EventStatus.EndRandomizationS.",
   "source_shards": [],
   "page_boundary_merged": false
+ },
+ {
+  "uid": "local-ext-v1::EXT-004",
+  "id": "EXT-004",
+  "doc": "LOCAL-EXT-v1",
+  "doc_version": "v1 (local extension family; not a published specification)",
+  "section": "1.4 EXT-004 - an event already past its own Specified End Time at first sighting draws 254 (under 1 Local product-evidence extensions)",
+  "title": "EXT-004 - an already-expired-at-receipt event is rejected (254), never received or started",
+  "purpose": "Measures the DUT's handling of an Event whose own Specified End Time (IEEE Std 2030.5-2018 §10.2.3.3 l) — Interval.Start+Interval.Duration, with NO randomization applied) has ALREADY PASSED at the moment the DUT first discovers it, while the server nonetheless keeps advertising it with currentStatus=0 (Scheduled — Annex B, p.159-160): the server saying 'merely scheduled' does not excuse the client from checking the interval itself. §10.2.3.3 l) is unconditional — 'If an Event is received after it has expired (Specified End Time has passed), this Event SHALL be ignored' — and Table 27 gives the client the vocabulary to say so: status 254, 'rejected — event already expired at receipt'. No published CSIP-CONF-v1.3 procedure exercises this combination at all; this row is the check REV0907-B2's discovery (the harness had no way to construct an already-past-start control that did not also default to currentStatus=1/Active) makes necessary.",
+  "applies_to": "client",
+  "dut_role": "csip-client",
+  "applicable": true,
+  "applicability_reason": "The axis applies to this product — it is a DER client that must resolve an Event's own Specified End Time before adopting it, independent of what currentStatus the server advertises. What does not apply is any certification: see certifiable=false and the notes.",
+  "certifiable": false,
+  "automatable": "full",
+  "evidence": "the served DERControl carrying an interval whose Start+Duration already precedes server time at post time, with <currentStatus>0</currentStatus>; the DERControlResponse POSTs the DUT made for that mRID; gridsim's own admin record of the control's advertised status; an independent before/after read of the DER's own active-power ceiling register showing it never moved",
+  "preconditions": [
+   "The DUT has never previously seen this control's mRID.",
+   "gridsim is reachable on its admin API so the row can publish a control whose interval is already elapsed at post time (the 'expired' lever, REV0907-B2)."
+  ],
+  "steps": [
+   "Publish a DERControl whose Interval.Start+Interval.Duration already precedes server time at post time, served with currentStatus=0 (Scheduled).",
+   "Wait for the DUT's discovery walk to reach the control for the first time.",
+   "Read the DERControlResponse POSTs the DUT made for this control's mRID.",
+   "Independently read the DER's own active-power ceiling register before publication and again after the wait."
+  ],
+  "expected": [
+   "The DUT POSTs exactly one DERControlResponse with status=254 (Table 27, 'rejected — event already expired at receipt') for this control.",
+   "The DUT does NOT POST status=1 (Event received), status=2 (Event started) or status=3 (Event completed) for this control at any point.",
+   "The DER's own active-power ceiling register never moves: the event is never actuated."
+  ],
+  "observables": [
+   "GET /derp/2/derc returning the control with an already-elapsed interval and <currentStatus>0</currentStatus>",
+   "POST of a DERControlResponse with <status>254</status> for this control's mRID",
+   "absence of a POST of a DERControlResponse with <status>1</status>, <status>2</status> or <status>3</status> for this control's mRID",
+   "the DER's own active-power ceiling register (WMaxLimPct or its legacy equivalent) reading the same value before and after the observation window"
+  ],
+  "requirement_refs": [],
+  "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 procedure exercises an event already past its own Specified End Time at first sighting; this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim. REV0907-B2: sim/gridsim/admin.go's 'expired' lever serves this combination; the product fix is lexa-gw a943a56 (internal/northbound/responses/tracker.go Pass 1); status 254 is IEEE Std 2030.5-2018 Table 27's own value, hard-coded in the referee rather than read off any shared constant (referee independence, CLAUDE.md / docs/ADVERSARIAL_QA_STRATEGY.md §5 PN-1/C9/AD-003(f)).",
+  "source_shards": [],
+  "page_boundary_merged": false
  }
 ]

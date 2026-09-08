@@ -557,3 +557,105 @@ func TestAdminControl_AtMostOneLever(t *testing.T) {
 		t.Fatalf("cancel + cancel_with_randomization combined = %d, want 400: %s", rec.Code, rec.Body)
 	}
 }
+
+// ── REV0907-B2: the "expired" lever ─────────────────────────────────────────
+
+// TestAdminControl_ExpiredServesStatusZeroOnAnAlreadyElapsedInterval pins the
+// expired lever's whole claim: a control whose Specified End Time (IEEE Std
+// 2030.5-2018 §10.2.3.3 l) — Interval.Start+Interval.Duration) has already
+// passed at post time is nonetheless served with currentStatus=0 (Scheduled
+// — Annex B, p.159-160), never 1 (Active) the way an ordinary past-start
+// window would default to. This is the exact combination REV0907-B2's fix
+// (lexa-gw internal/northbound/responses/tracker.go Pass 1) has to detect
+// from the interval alone, independent of what currentStatus says.
+func TestAdminControl_ExpiredServesStatusZeroOnAnAlreadyElapsedInterval(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	// Window opened 600s ago and lasted 60s: it ended 540s ago, well in the past.
+	postCtrl(t, h, `{"program":2,"mrid":"DERC-EXPIRED","gen_lim_W":2000,"start_offset_s":-600,"duration_s":60,`+
+		`"activate":true,"expired":true}`)
+
+	list := derc0Program(t, s, 2)
+	var ctrl *model.DERControl
+	for i := range list.DERControl {
+		if list.DERControl[i].MRID == "DERC-EXPIRED" {
+			ctrl = &list.DERControl[i]
+		}
+	}
+	if ctrl == nil {
+		t.Fatal("DERC-EXPIRED was not stored on program 2's scheduled list")
+	}
+	if ctrl.EventStatus == nil || ctrl.EventStatus.CurrentStatus != model.EventStatusScheduled {
+		t.Fatalf("expired lever: EventStatus = %+v, want CurrentStatus %d (Scheduled) even though the "+
+			"interval (start=%d duration=%d) has already elapsed", ctrl.EventStatus, model.EventStatusScheduled,
+			ctrl.Interval.Start, ctrl.Interval.Duration)
+	}
+	if end := ctrl.Interval.Start + int64(ctrl.Interval.Duration); end >= s.Now() {
+		t.Fatalf("the served interval (start=%d duration=%d, end=%d) is not actually in the past (server "+
+			"now=%d) — the lever is not testing what it claims to", ctrl.Interval.Start, ctrl.Interval.Duration,
+			end, s.Now())
+	}
+}
+
+// TestAdminControl_ExpiredRequiresAnAlreadyElapsedInterval pins the lever's
+// own guard: it must refuse (400) to author currentStatus=0-while-expired on
+// a window that has NOT actually elapsed yet — the same "cannot author the
+// condition out of thin air" discipline mark_superseded's own guard applies,
+// so a fixture cannot mislabel an ordinary future or in-progress control as
+// "expired" and have the row silently stop meaning what its name says.
+func TestAdminControl_ExpiredRequiresAnAlreadyElapsedInterval(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/admin/control", bytes.NewReader([]byte(
+		`{"program":2,"mrid":"DERC-NOTYETEXPIRED","gen_lim_W":2000,"start_offset_s":0,"duration_s":300,`+
+			`"activate":true,"expired":true}`)))
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expired on a window that has not elapsed = %d, want 400: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "already passed") {
+		t.Errorf("the 400 does not explain the elapsed-window requirement:\n%s", rec.Body)
+	}
+}
+
+// TestAdminControl_ExpiredMutuallyExclusiveWithOtherLevers pins that expired
+// joins the SAME exclusivity group cancel/cancel_with_randomization/
+// mark_superseded already share (resolveCancelLevers) — combined with
+// another lever, or with the raw current_status override, is refused before
+// anything is stored, for the same reason those three already refuse each
+// other: one POST cannot serve two different currentStatus stories.
+func TestAdminControl_ExpiredMutuallyExclusiveWithOtherLevers(t *testing.T) {
+	s := NewServer("")
+	h := s.AdminHandler()
+
+	for name, body := range map[string]string{
+		"expired+cancel": `{"program":2,"mrid":"DERC-EXPCANCEL","start_offset_s":-600,"duration_s":60,` +
+			`"activate":true,"expired":true,"cancel":true}`,
+		"expired+current_status": `{"program":2,"mrid":"DERC-EXPRAW","start_offset_s":-600,"duration_s":60,` +
+			`"activate":true,"expired":true,"current_status":6}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/admin/control", bytes.NewReader([]byte(body)))
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("%s combined = %d, want 400: %s", name, rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+// derc0Program is derc0 for an arbitrary program index, needed because the
+// expired lever's own row (EXT-004) shares EXT-002/EXT-003's program 2, not
+// program 0.
+func derc0Program(t *testing.T, s *Server, program int) *model.DERControlList {
+	t.Helper()
+	list, ok := s.resources[fmt.Sprintf("/derp/%d/derc", program)].(*model.DERControlList)
+	if !ok {
+		t.Fatalf("/derp/%d/derc is not a *DERControlList", program)
+	}
+	return list
+}

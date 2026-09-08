@@ -55,6 +55,12 @@ func registerLocalExtensions(reg *certify.Registry, nonce string) {
 		certify.WithRequires(needGridSim...), certify.WithOrder(63))
 	reg.Register(extUID("EXT-003"), Suite, cancelWithRandomization003(nonce),
 		certify.WithRequires(needGridSim...), certify.WithOrder(64))
+	// EXT-004 (REV0907-B2, localext_eventstatus.go): no published
+	// CSIP-CONF-v1.3 procedure exercises an event already past its own
+	// Specified End Time at first sighting either — the exact gap the
+	// product fix (lexa-gw a943a56) closes. Ordered right after EXT-003.
+	reg.Register(extUID("EXT-004"), Suite, expiredAtReceipt004(nonce),
+		certify.WithRequires(needGridSim...), certify.WithOrder(65))
 }
 
 // mappingWattVar is where the opModWattVar → model 712 correspondence comes
@@ -106,7 +112,7 @@ func wattVarBinding() *curveBinding {
 // localExtensionIDs are the in-document ids this family registers, for the tests
 // that assert the family's posture holds for every one of them rather than for
 // the one that happened to be written first.
-func localExtensionIDs() []string { return []string{"EXT-001", "EXT-002", "EXT-003"} }
+func localExtensionIDs() []string { return []string{"EXT-001", "EXT-002", "EXT-003", "EXT-004"} }
 
 // NOTE ON WHERE THE EXCLUSION LIVES. Nothing in this file special-cases itself
 // at run time. The rows register, run and are graded exactly like any other; the
