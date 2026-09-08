@@ -222,6 +222,7 @@ CERTIFY_LIVE_SET := \
 	csip-tls-test/internal/certify/suitepki \
 	csip-tls-test/internal/certify/suites \
 	csip-tls-test/internal/certify/suitessm \
+	csip-tls-test/internal/certify/sunspecgolden \
 	csip-tls-test/internal/evidence/aead \
 	csip-tls-test/internal/evidence/bundle \
 	csip-tls-test/internal/evidence/capture \

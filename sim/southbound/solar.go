@@ -36,7 +36,68 @@ import (
 	"sync/atomic"
 	"time"
 
+	"csip-tls-test/internal/certify/sunspecgolden"
+
 	"lexa-proto/sunspec"
+)
+
+// goldenOffset resolves a named point's 0-based register offset from
+// internal/certify/sunspecgolden — the independently-sourced golden — rather
+// than from lexa-proto's own M120_*/M122_* constants.
+//
+// WP4-T6 (REV0907-E8): this sim previously seeded models 120 and 122 from
+// lexa-proto/sunspec's own offset constants, which were wrong at 22 of 25
+// named M120 points and at both M122 WAval points (see
+// sunspecgolden's golden_test.go for the exact mismatches at the vendored
+// lexa-proto pin). A sim seeded from the same wrong table a conformance
+// oracle also reads from cannot expose that bug — the sim and the oracle
+// agree with each other and disagree with reality together. Every other
+// model this file seeds (121, 103, 123) already matches the golden at the
+// vendored pin (also proven in sunspecgolden's golden_test.go), so only
+// the M120/M122 register addresses below are re-sourced; lexa-proto is kept
+// for everything else here (RegisterMap plumbing, scale-factor encoding via
+// ApplyScaleUint/RawFromScaleSigned, and the model IDs/lengths, none of
+// which this finding implicates).
+//
+// A missing block or point name is a programmer error (a typo in this file,
+// or a golden block that was renamed out from under it) caught the first
+// time this sim is built or tested — never a possible runtime/data
+// condition — so it panics rather than silently seeding register 0.
+func goldenOffset(block, name string) uint16 {
+	pts, ok := sunspecgolden.Block(block)
+	if !ok {
+		panic(fmt.Sprintf("sim/southbound: golden has no block %q", block))
+	}
+	for _, p := range pts {
+		if p.Name == name {
+			return uint16(p.Offset)
+		}
+	}
+	panic(fmt.Sprintf("sim/southbound: golden block %q has no point %q", block, name))
+}
+
+// Golden-sourced M120 (Nameplate) and M122 (Extended Measurements) register
+// offsets — see goldenOffset's doc comment. Resolved once at package init
+// from the golden table rather than re-walked on every seed/animate call.
+var (
+	goldenM120DERTyp   = goldenOffset("M120", "DERTyp")
+	goldenM120WRtg     = goldenOffset("M120", "WRtg")
+	goldenM120VARtg    = goldenOffset("M120", "VARtg")
+	goldenM120VArRtgQ1 = goldenOffset("M120", "VArRtgQ1")
+	goldenM120ARtg     = goldenOffset("M120", "ARtg")
+	goldenM120PFRtgQ1  = goldenOffset("M120", "PFRtgQ1")
+	// The golden names WRtg's scale factor "WRtg_SF" (the spec's own name);
+	// lexa-proto's vendored constant for the same register is M120_W_SF.
+	goldenM120WRtgSF   = goldenOffset("M120", "WRtg_SF")
+	goldenM120VARtgSF  = goldenOffset("M120", "VARtg_SF")
+	goldenM120VArRtgSF = goldenOffset("M120", "VArRtg_SF")
+	goldenM120ARtgSF   = goldenOffset("M120", "ARtg_SF")
+	goldenM120PFRtgSF  = goldenOffset("M120", "PFRtg_SF")
+
+	goldenM122ECPConn = goldenOffset("M122", "ECPConn")
+	goldenM122PVConn  = goldenOffset("M122", "PVConn")
+	goldenM122WAval   = goldenOffset("M122", "WAval")
+	goldenM122WAvalSF = goldenOffset("M122", "WAval_SF")
 )
 
 // SolarBases holds the first data-register address of each model block
@@ -443,7 +504,7 @@ func (ss *SolarServer) Snapshot() SolarState {
 	st.Animation.Paused = ss.IsPaused()
 	st.Animation.Speed = ss.Speed()
 	st.Nameplate.WMaxW = ss.wmaxW
-	st.Nameplate.WRtgW = unsigned(b.M120Base+sunspec.M120_WRtg, b.M120Base+sunspec.M120_W_SF)
+	st.Nameplate.WRtgW = unsigned(b.M120Base+goldenM120WRtg, b.M120Base+goldenM120WRtgSF)
 	st.Nameplate.M121WMaxW = unsigned(b.M121Base+sunspec.M121_WMax, b.M121Base+sunspec.M121_WMax_SF)
 	st.Nameplate.PctReferenceW = solarWMaxRefW(r, b, ss.wmaxW)
 
@@ -452,7 +513,7 @@ func (ss *SolarServer) Snapshot() SolarState {
 	// Possible_W is the panel's pre-curtailment potential (WAval). Reading it
 	// from the same register snapshot as W_W lets a sampler compute curtailment
 	// (possible − actual) coherently, with no chance of actual > possible.
-	m.Possible_W = signed(b.M122Base+sunspec.M122_WAval, b.M122Base+sunspec.M122_WAval_SF)
+	m.Possible_W = signed(b.M122Base+goldenM122WAval, b.M122Base+goldenM122WAvalSF)
 	// Cloud cover is server state (not a register): expose it as a percent so the
 	// dashboard can display the live weather the running animation is applying.
 	m.Cloud_pct = ss.Cloud() * 100.0
@@ -579,7 +640,7 @@ func (ss *SolarServer) Inject(body []byte) error {
 			// so a paused animation re-applies WMaxLimPct curtailment to it.
 			// Replay mode pauses the sim and injects PV each tick; without this
 			// the held output would ignore the hub's curtailment commands.
-			r.Set(b.M122Base+sunspec.M122_WAval, uint16(int16(math.Round(val))))
+			r.Set(b.M122Base+goldenM122WAval, uint16(int16(math.Round(val))))
 			// Write the live output as the CURTAILED value (potential clipped by
 			// the honoured ceiling — WMaxLimPct shaped by any effect-time fault),
 			// not the raw potential.  Writing the full potential here would briefly
@@ -732,7 +793,7 @@ func (ss *SolarServer) injectSolarCapacity(key string, val float64) error {
 	case "M121_WMax_W":
 		setLegacy(b.M121Base, sunspec.M121_WMax, sunspec.M121_WMax_SF)
 	case "WMaxRtg_W":
-		setLegacy(b.M120Base, sunspec.M120_WRtg, sunspec.M120_W_SF)
+		setLegacy(b.M120Base, goldenM120WRtg, goldenM120WRtgSF)
 		if b.M702Base != 0 {
 			return set702("WMaxRtg")
 		}
@@ -852,7 +913,7 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	r.Set(cursor, sunspec.ModelNameplate)
 	r.Set(cursor+1, sunspec.M120Len)
 	m120 := cursor + 2
-	r.Set(m120+sunspec.M120_DERTyp, 4) // PV
+	r.Set(m120+goldenM120DERTyp, 4) // PV
 	// WRtg is the RATING — what this machine can physically do, immutable
 	// (IW15-002). It is seeded at the same number as the 121 WMax SETTING
 	// below, which is what a factory-configured device looks like and what
@@ -862,16 +923,16 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	// exercisable: a gateway that computes a WMaxLimPct percent against the
 	// RATING while the device applies it against a LOWER SETTING lands real
 	// watts off target, and the error does not cancel anywhere.
-	r.Set(m120+sunspec.M120_WRtg, uint16(wmaxW))
-	r.Set(m120+sunspec.M120_VARtg, uint16(wmaxW*1.05))
-	r.Set(m120+sunspec.M120_VArRtgQ1, uint16(int16(wmaxW*0.44)))
-	r.Set(m120+sunspec.M120_ARtg, uint16(wmaxW/240))
-	r.Set(m120+sunspec.M120_PFRtgQ1, uint16(int16(9500)))
-	r.Set(m120+sunspec.M120_W_SF, 0)
-	r.Set(m120+sunspec.M120_VARtg_SF, 0)
-	r.Set(m120+sunspec.M120_VArRtg_SF, 0)
-	r.Set(m120+sunspec.M120_ARtg_SF, 0)
-	r.Set(m120+sunspec.M120_PFRtg_SF, sfN(-2))
+	r.Set(m120+goldenM120WRtg, uint16(wmaxW))
+	r.Set(m120+goldenM120VARtg, uint16(wmaxW*1.05))
+	r.Set(m120+goldenM120VArRtgQ1, uint16(int16(wmaxW*0.44)))
+	r.Set(m120+goldenM120ARtg, uint16(wmaxW/240))
+	r.Set(m120+goldenM120PFRtgQ1, uint16(int16(9500)))
+	r.Set(m120+goldenM120WRtgSF, 0)
+	r.Set(m120+goldenM120VARtgSF, 0)
+	r.Set(m120+goldenM120VArRtgSF, 0)
+	r.Set(m120+goldenM120ARtgSF, 0)
+	r.Set(m120+goldenM120PFRtgSF, sfN(-2))
 	cursor += 2 + sunspec.M120Len
 
 	// Model 121 (Basic Settings) — 30 data regs
@@ -891,10 +952,10 @@ func populateSolarCore(r *RegisterMap, wmaxW float64, serial string) (SolarBases
 	r.Set(cursor, uint16(122))
 	r.Set(cursor+1, sunspec.M122Len)
 	m122Base := cursor + 2
-	r.Set(m122Base+sunspec.M122_ECPConn, 1)
-	r.Set(m122Base+sunspec.M122_PVConn, 1)
-	r.Set(m122Base+sunspec.M122_WAval, uint16(wmaxW))
-	r.Set(m122Base+sunspec.M122_WAval_SF, 0)
+	r.Set(m122Base+goldenM122ECPConn, 1)
+	r.Set(m122Base+goldenM122PVConn, 1)
+	r.Set(m122Base+goldenM122WAval, uint16(wmaxW))
+	r.Set(m122Base+goldenM122WAvalSF, 0)
 	cursor += 2 + sunspec.M122Len
 
 	// Model 103 (Three-Phase Inverter) — 50 data regs
@@ -1063,7 +1124,7 @@ func solarZeroOutput(r *RegisterMap, bases SolarBases) {
 	r.Set(bases.M103Base+sunspec.M103_VA, 0)
 	r.Set(bases.M103Base+sunspec.M103_VAr, 0)
 	r.Set(bases.M103Base+sunspec.M103_St, 1) // off
-	r.Set(bases.M122Base+sunspec.M122_WAval, 0)
+	r.Set(bases.M122Base+goldenM122WAval, 0)
 }
 
 // solarAmbientTmp is the slow ambient-temperature swing a cabinet still shows
@@ -1147,7 +1208,7 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 	//             to compute net grid).
 	var potW, v, pf float64
 	if paused {
-		potW = float64(int16(r.Get(m122Base + sunspec.M122_WAval)))
+		potW = float64(int16(r.Get(m122Base + goldenM122WAval)))
 		v = float64(r.Get(m103Base+sunspec.M103_PhVphA)) / 10.0
 		pf = float64(int16(r.Get(m103Base+sunspec.M103_PF))) / 10000.0
 	} else {
@@ -1187,7 +1248,7 @@ func solarStep(r *RegisterMap, wmaxW float64, bases SolarBases, paused bool, sim
 	}
 
 	// WAval is the available (uncurtailed) potential.
-	r.Set(m122Base+sunspec.M122_WAval, uint16(int16(math.Round(potW))))
+	r.Set(m122Base+goldenM122WAval, uint16(int16(math.Round(potW))))
 
 	// Clip the potential to the honoured ceiling — the hub's WMaxLimPct (when
 	// enabled) shaped by any effect-time fault (ramp_limit) — in both running and

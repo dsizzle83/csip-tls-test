@@ -22,7 +22,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 	// injectPotential mirrors Inject("W_W"): records the panel potential.
 	injectPotential := func(r *RegisterMap, b SolarBases, w float64) {
 		r.Set(b.M103Base+sunspec.M103_W, sunspec.RawFromScaleSigned(w, int16(r.Get(b.M103Base+sunspec.M103_W_SF))))
-		r.Set(b.M122Base+sunspec.M122_WAval, uint16(int16(w)))
+		r.Set(b.M122Base+goldenM122WAval, uint16(int16(w)))
 	}
 	// curtailTo sets WMaxLimPct to limW as a percent of nameplate (SF -2),
 	// matching how the modbus bridge writes the hub's curtailment command.
@@ -82,7 +82,7 @@ func TestSolarStep_PausedAppliesCurtailment(t *testing.T) {
 			t.Errorf("after inject, M103_W = %.0fW, want 2000W (clipped to active cap)", got)
 		}
 		// WAval still records the full potential for the animation to clip later.
-		if av := float64(int16(r.Get(b.M122Base + sunspec.M122_WAval))); av != 6000 {
+		if av := float64(int16(r.Get(b.M122Base + goldenM122WAval))); av != 6000 {
 			t.Errorf("WAval = %.0fW, want 6000W (panel potential)", av)
 		}
 	})
@@ -191,7 +191,7 @@ func TestSolarServer_AckBeforeEffectFault(t *testing.T) {
 	}
 
 	// During the delay the inverter still produces at the OLD (100%) ceiling.
-	r.Set(b.M122Base+sunspec.M122_WAval, uint16(int16(6000)))
+	r.Set(b.M122Base+goldenM122WAval, uint16(int16(6000)))
 	var wh uint16
 	solarStep(r, wmax, b, true, 0, 0, false /*night*/, nil, &wh)
 	if got := readW(); got != 6000 {
@@ -339,7 +339,7 @@ func TestSolarStep_CloudRunning(t *testing.T) {
 			var wh uint16
 			solarStep(r, wmax, b, false /*running*/, st, 0 /*cloud*/, false /*night*/, nil, &wh)
 			want := math.Round(wmax * irrClear(st))
-			if got := readReg(r, b.M122Base+sunspec.M122_WAval); got != want {
+			if got := readReg(r, b.M122Base+goldenM122WAval); got != want {
 				t.Errorf("t=%.0f cloud=0 WAval=%.0f, want %.0f (clear-sky potW)", st, got, want)
 			}
 		}
@@ -352,7 +352,7 @@ func TestSolarStep_CloudRunning(t *testing.T) {
 				var wh uint16
 				solarStep(r, wmax, b, false, st, cloud, false /*night*/, nil, &wh)
 				wantPot := math.Round(wmax * irrClear(st) * cloudTransmittance(int64(st), cloud))
-				wav := readReg(r, b.M122Base+sunspec.M122_WAval)
+				wav := readReg(r, b.M122Base+goldenM122WAval)
 				if wav != wantPot {
 					t.Errorf("cloud=%.1f t=%.0f WAval=%.0f, want %.0f (cloud-reduced potW)", cloud, st, wav, wantPot)
 				}
@@ -377,7 +377,7 @@ func TestSolarStep_CloudRunning(t *testing.T) {
 		r.Set(b.M123Base+sunspec.M123_WMaxLimPct_Ena, 1)
 		var wh uint16
 		solarStep(r, wmax, b, false, 0, 1.0, false /*night*/, nil, &wh)
-		wav := readReg(r, b.M122Base+sunspec.M122_WAval)
+		wav := readReg(r, b.M122Base+goldenM122WAval)
 		act := readReg(r, b.M103Base+sunspec.M103_W)
 		if act != 300 {
 			t.Errorf("curtailed actual=%.0f, want 300", act)
@@ -503,7 +503,7 @@ func TestSolarStep_NightCollapsesWWithAnimationStillAlive(t *testing.T) {
 		if va := int16(r.Get(b.M103Base + sunspec.M103_VA)); va != 0 {
 			t.Errorf("tick %d: night VA = %d, want 0", i, va)
 		}
-		if wav := int16(r.Get(b.M122Base + sunspec.M122_WAval)); wav != 0 {
+		if wav := int16(r.Get(b.M122Base + goldenM122WAval)); wav != 0 {
 			t.Errorf("tick %d: night WAval (possible_W) = %d, want 0 — irradiance is genuinely zero at "+
 				"night, unlike Cloud_pct's attenuation which never reaches zero", i, wav)
 		}
@@ -726,7 +726,7 @@ func TestSolarLegacyM121WMaxIsTheSettingTheCeilingResolvesAgainst(t *testing.T) 
 	}
 
 	// And the physics follows, not just the arithmetic.
-	r.Set(b.M122Base+sunspec.M122_WAval, uint16(int16(6000)))
+	r.Set(b.M122Base+goldenM122WAval, uint16(int16(6000)))
 	var wh uint16
 	solarStep(r, wmax, b, true /*paused*/, 0, 0, false, nil, &wh)
 	if got := float64(int16(r.Get(b.M103Base + sunspec.M103_W))); math.Abs(got-2000) > 1 {
@@ -770,5 +770,41 @@ func TestSolarCapacityInjectKeysMatchTheModelsServed(t *testing.T) {
 	// A negative capacity is refused rather than wrapped into an unsigned register.
 	if err := ss.Inject([]byte(`{"WMax_W":-1}`)); err == nil {
 		t.Error("negative WMax_W accepted; SunSpec capacity points are unsigned")
+	}
+}
+
+// TestM122WAvalLandsAtTheSpecOffset is WP4-T6's (REV0907-E8) regression proof
+// for the sim seeding fix: model 122's WAval/WAval_SF must land at offsets
+// 29/30 within the model's data block, per the SunSpec Alliance model_122.json
+// (github.com/sunspec/models, commit 90b4a331dcca — see
+// internal/certify/sunspecgolden/testdata/models/SOURCES.md), NOT at 21/22 —
+// the offset lexa-proto/sunspec's M122_WAval/M122_WAval_SF constants carried
+// at the vendored pin (a3eeb10), which placed WAval on top of the tail of the
+// ActVArhQ4 accumulator instead.
+//
+// 29 and 30 are hardcoded here DELIBERATELY, rather than read from
+// goldenM122WAval/goldenM122WAvalSF: this test exists to catch a regression in
+// EITHER the golden package's own generation OR this file's use of it, so it
+// must not derive its expectation from the same values the code under test
+// consumes — an oracle built from the product's own source cannot find the
+// bugs that source shares with the thing testing it (docs/CODING_PRINCIPLES.md;
+// docs/ADVERSARIAL_QA_STRATEGY.md §5, rule PN-1/C9/AD-003(f)).
+func TestM122WAvalLandsAtTheSpecOffset(t *testing.T) {
+	const wantWAvalOffset = 29
+	const wantWAvalSFOffset = 30
+
+	r := &RegisterMap{regs: make(map[uint16]uint16)}
+	const wmax = 5000.0
+	b := populateSolar(r, wmax, "")
+
+	if got := r.Get(b.M122Base + wantWAvalOffset); got != uint16(int16(wmax)) {
+		t.Errorf("register at M122Base+%d (the spec's WAval offset) = %d, want %d (WAval, seeded from WMax) — "+
+			"the sim is not seeding WAval at the SunSpec model_122.json offset",
+			wantWAvalOffset, got, uint16(int16(wmax)))
+	}
+	if got := r.Get(b.M122Base + wantWAvalSFOffset); got != 0 {
+		t.Errorf("register at M122Base+%d (the spec's WAval_SF offset) = %d, want 0 — "+
+			"the sim is not seeding WAval_SF at the SunSpec model_122.json offset",
+			wantWAvalSFOffset, got)
 	}
 }

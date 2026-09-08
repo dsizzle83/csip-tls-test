@@ -967,7 +967,7 @@ func TestPopulate702RateRatingsNotImplemented(t *testing.T) {
 // setSolarPotential seeds the panel's available power (M122 WAval), which a
 // PAUSED solarStep holds as potW — the "available" term of the three-way min.
 func setSolarPotential(ss *SolarServer, w float64) {
-	ss.Regs.Set(ss.bases.M122Base+sunspec.M122_WAval, uint16(int16(w)))
+	ss.Regs.Set(ss.bases.M122Base+goldenM122WAval, uint16(int16(w)))
 }
 
 // armSolar704Setpoint writes an ENABLED 704 setpoint in the given WSetMod.

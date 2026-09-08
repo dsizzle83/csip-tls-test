@@ -38,6 +38,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -978,5 +981,66 @@ func TestTripRowsRegisterUnderTheirCatalogIDs(t *testing.T) {
 			t.Errorf("%s is still an inverter-control row AND a ride-through row; it would be registered "+
 				"twice, and which apparatus ran would depend on registration order", r.id)
 		}
+	}
+}
+
+// TestCertifyLiveSetDoesNotImportDerbase is WP4-T6's (REV0907-E8) permanent
+// guard against the exact defect class this task closes: the SHIPPED
+// conformance tool (cmd/certify) or campaign engine (cmd/gw-campaign)
+// deriving a grading expectation from lexa-proto/derbase — the product's OWN
+// curve-writer code — rather than from an independent oracle. This file's
+// tripBinding.wantPoints (the BASIC-004/005 oracle) computes its expectation
+// from the catalog's own authored literals (tripCurve.Points/XMult/YMult),
+// never from derbase; ridethrough_test.go's use of the REAL derbase.Base is
+// confined to DRIVING the fixture's green half (a real gateway-shaped write),
+// which is legitimate and does not reach cmd/certify or cmd/gw-campaign — see
+// this file's own header comment ("THE DEVICE ENGINEERING VALUES ARE STATED
+// AS INDEPENDENT LITERALS").
+//
+// This test proves that boundary holds at the BUILD-GRAPH level, not just by
+// convention: it runs the same `go list -deps ./cmd/certify ./cmd/gw-campaign`
+// the Makefile's live-set-check uses (see scripts/check-live-set.sh) and fails
+// if lexa-proto/derbase EVER appears in it — so a future change that wires a
+// derbase call into any package either binary can reach is caught here, by
+// name, rather than discovered later as an unfalsifiable oracle.
+func TestCertifyLiveSetDoesNotImportDerbase(t *testing.T) {
+	root := repoRootForLiveSetTest(t)
+
+	cmd := exec.Command("go", "list", "-deps", "./cmd/certify", "./cmd/gw-campaign")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=-mod=vendor")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list -deps ./cmd/certify ./cmd/gw-campaign: %v\n%s", err, out)
+	}
+
+	for _, line := range strings.Split(string(out), "\n") {
+		if line == "lexa-proto/derbase" {
+			t.Fatalf("cmd/certify or cmd/gw-campaign imports lexa-proto/derbase — the shipped conformance "+
+				"tool must never derive a grading expectation from the product's own curve-writer code "+
+				"(REV0907-E8 referee independence). Full dependency list:\n%s", out)
+		}
+	}
+}
+
+// repoRootForLiveSetTest locates the csip-tls-test module root by walking up
+// from the current working directory (go test's cwd is always the package
+// directory) until it finds go.mod, so this test does not hardcode
+// internal/certify/suitecsip's depth from the root.
+func repoRootForLiveSetTest(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("repoRootForLiveSetTest: no go.mod found walking up from the package directory")
+		}
+		dir = parent
 	}
 }
