@@ -1632,7 +1632,7 @@ func TestModesSupportedOracle_NotDueControlIsNotAnOverclaim(t *testing.T) {
 		}
 	}
 
-	// A CANCELLED control (gridsim's currentStatus=6, DERC-SP-003's shape) the
+	// A CANCELLED control (gridsim's currentStatus=2, DERC-SP-003's shape) the
 	// DUT must DROP is likewise coherent silence.
 	cancelled := synthTranscript(
 		capPUT(maskConnect),

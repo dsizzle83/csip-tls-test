@@ -165,7 +165,7 @@ func TestEvaluate_EventAtExactEnd(t *testing.T) {
 func TestEvaluate_CancelledEventSkipped(t *testing.T) {
 	s := New()
 	evt := scheduledEvent("E1", epoch-600, epoch-60, 600, 3000)
-	evt.EventStatus = &model.EventStatus{CurrentStatus: 6} // Cancelled
+	evt.EventStatus = &model.EventStatus{CurrentStatus: model.EventStatusCancelled} // Cancelled (Annex B = 2)
 	programs := []discovery.ProgramState{makeProgram(1, "SP", 5000, evt)}
 
 	ac := s.Evaluate(programs, epoch)
@@ -177,7 +177,7 @@ func TestEvaluate_CancelledEventSkipped(t *testing.T) {
 func TestEvaluate_CancelledCoexistsWithActive(t *testing.T) {
 	s := New()
 	cancelled := scheduledEvent("E1", epoch-600, epoch-60, 600, 1000)
-	cancelled.EventStatus = &model.EventStatus{CurrentStatus: 6}
+	cancelled.EventStatus = &model.EventStatus{CurrentStatus: model.EventStatusCancelled}
 	active := scheduledEvent("E2", epoch-600, epoch-60, 600, 3000)
 	programs := []discovery.ProgramState{makeProgram(1, "SP", 5000, cancelled, active)}
 

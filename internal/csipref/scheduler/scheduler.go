@@ -132,8 +132,10 @@ func (s *Scheduler) activeEvent(ps *discovery.ProgramState, serverNow int64) *Ac
 	for i := range ps.Controls.DERControl {
 		ctrl := &ps.Controls.DERControl[i]
 
-		// Skip cancelled events (currentStatus=6).
-		if ctrl.EventStatus != nil && ctrl.EventStatus.CurrentStatus == 6 {
+		// Skip cancelled events: IEEE Std 2030.5-2018 Annex B currentStatus 2
+		// (Cancelled) or 3 (Cancelled with Randomization); 6 is reserved
+		// (REV0907-B1).
+		if ctrl.EventStatus != nil && ctrl.EventStatus.IsCancelled() {
 			continue
 		}
 
@@ -219,7 +221,7 @@ func (s *Scheduler) isSuperseded(ctrl *model.DERControl, controls []model.DERCon
 		if other.MRID == ctrl.MRID {
 			continue
 		}
-		if other.EventStatus != nil && other.EventStatus.CurrentStatus == 6 {
+		if other.EventStatus != nil && other.EventStatus.IsCancelled() {
 			continue
 		}
 		otherStart := s.randomizedStart(other)

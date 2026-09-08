@@ -28,7 +28,7 @@ These are non-negotiable. Internalize before writing code.
 - Pass `serverNow` to every `scheduler.Evaluate()` call. Using `time.Now().Unix()` directly silently breaks event scheduling.
 
 ## DER event rules (scheduler)
-- `currentStatus == 6` → cancelled, always skip.
+- `EventStatus.IsCancelled()` (currentStatus 2 or 3 per IEEE 2030.5-2018 Annex B) → cancelled, always skip. 6 is reserved (REV0907-B1).
 - Superseded: `potentiallySuperseded=true` + a later-created event covers the same window → later wins.
 - Primacy: program primacy 1 beats 5 beats 10. Lower number = higher priority.
 - Default fallback: no active event → use program's `DefaultDERControl`.

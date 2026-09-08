@@ -2302,13 +2302,13 @@ func (s *Scheduler) Evaluate(programs []discovery.ProgramState, serverNow int64)
 }
 ```
 
-`resolve` (`scheduler.go:170`) is the pure §12.3 precedence: pick the single **highest-priority program** (lowest primacy, mRID tiebreak — `helpers.go:30`); within it find an active event; else fall back to that program's `DefaultDERControl`. It does **not** merge across programs — absolute primacy (`scheduler.go:18-25`). `activeEvent` (`scheduler.go:346`) skips **cancelled** events (`CurrentStatus == 6`), applies **per-MRID randomization** (cached once so timing is stable across polls — `randomizedStart`/`randomizedDuration`, `:400`/`:427`), skips **superseded** events, and breaks ties by latest `CreationTime` then mRID:
+`resolve` (`scheduler.go:170`) is the pure §12.3 precedence: pick the single **highest-priority program** (lowest primacy, mRID tiebreak — `helpers.go:30`); within it find an active event; else fall back to that program's `DefaultDERControl`. It does **not** merge across programs — absolute primacy (`scheduler.go:18-25`). `activeEvent` (`scheduler.go:346`) skips **cancelled** events (`EventStatus.IsCancelled()` — Annex B currentStatus 2/3; the pre-REV0907-B1 code tested the reserved value 6), applies **per-MRID randomization** (cached once so timing is stable across polls — `randomizedStart`/`randomizedDuration`, `:400`/`:427`), skips **superseded** events, and breaks ties by latest `CreationTime` then mRID:
 
 ```go
 // internal/northbound/scheduler/scheduler.go:349
 	for i := range ps.Controls.DERControl {
 		ctrl := &ps.Controls.DERControl[i]
-		if ctrl.EventStatus != nil && ctrl.EventStatus.CurrentStatus == 6 { continue } // cancelled
+		if ctrl.EventStatus != nil && ctrl.EventStatus.IsCancelled() { continue } // cancelled (Annex B 2/3)
 		start := s.randomizedStart(ctrl)
 		end := start + s.randomizedDuration(ctrl)
 		if !utilitytime.InWindow(start, end, serverNow) { continue }

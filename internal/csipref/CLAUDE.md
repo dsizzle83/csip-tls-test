@@ -32,7 +32,7 @@ scheduler/  DER event state machine (cancelled, superseded, randomized-start, pr
 **ClockOffset**: `serverNow = time.Now().Unix() + tree.ClockOffset`. Required — CSIP §5.2.1.3 requires client within 30 s of server. Pass `serverNow` to every `scheduler.Evaluate()` call.
 
 ## Scheduler priority rules
-1. `currentStatus=6` (cancelled) → always skip.
+1. `currentStatus=2` (Cancelled) or `3` (Cancelled with Randomization) per IEEE 2030.5-2018 Annex B → always skip (use `EventStatus.IsCancelled()`; 6 is reserved — REV0907-B1).
 2. `potentiallySuperseded=true` + later event covers same window + later `creationTime` → later wins.
 3. Randomized start: apply rand offset to startTime once per MRID; cache result.
 4. Primacy: lower number wins (program primacy 1 beats 5 beats 10).

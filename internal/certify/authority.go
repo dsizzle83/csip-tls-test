@@ -150,6 +150,8 @@ var authorityFamilies = []authorityFamily{
 			"csip-conf-v1.3::CORE-021", // Randomized Events
 			"csip-conf-v1.3::CORE-022", // Responses
 			"csip-conf-v1.3::CORE-023", // Superseding Events
+			"local-ext-v1::EXT-002",    // reserved currentStatus is not a cancel (REV0907-B1)
+			"local-ext-v1::EXT-003",    // Cancelled with Randomization (currentStatus 3)
 		},
 	},
 	{

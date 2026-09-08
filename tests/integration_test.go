@@ -204,8 +204,8 @@ func TestFullDiscoveryOverHTTP(t *testing.T) {
 
 	// SP-003: cancelled — client must drop it
 	sp003 := ps.Controls.DERControl[2]
-	if sp003.EventStatus == nil || sp003.EventStatus.CurrentStatus != 6 {
-		t.Errorf("SP-003 CurrentStatus = %v, want 6 (Cancelled)", sp003.EventStatus)
+	if sp003.EventStatus == nil || !sp003.EventStatus.IsCancelled() {
+		t.Errorf("SP-003 EventStatus = %v, want currentStatus=2 (Cancelled, IEEE 2030.5-2018 Annex B)", sp003.EventStatus)
 	}
 
 	// SP-004: future control with randomizeStart

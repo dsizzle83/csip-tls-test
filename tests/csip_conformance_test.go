@@ -525,7 +525,7 @@ func TestCSIP_CORE013_AdvancedDERProgramControl(t *testing.T) {
 	const id = "CORE-013"
 	env := newCSIPEnv(t)
 
-	logSpec(t, id, "DER.010", "Cancelled events (currentStatus=6) must be skipped")
+	logSpec(t, id, "DER.010", "Cancelled events (currentStatus=2, IEEE 2030.5-2018 Annex B) must be skipped")
 	logSpec(t, id, "DER.011", "Superseded events (potentiallySuperseded=true) filtered by newer creationTime")
 	logSpec(t, id, "DER.012", "Highest-priority program (lowest primacy) wins when multiple programs active")
 	logSpec(t, id, "IEEE.12.3", "Among overlapping events, latest creationTime wins; MRID is tiebreaker")
@@ -551,13 +551,13 @@ func TestCSIP_CORE013_AdvancedDERProgramControl(t *testing.T) {
 	t.Logf("[%s] PASS [DER.012]: highest-priority program = primacy=%d mRID=%s",
 		id, hp.Program.Primacy, hp.Program.MRID)
 
-	// Verify cancellation: SP-003 has currentStatus=6.
+	// Verify cancellation: SP-003 has currentStatus=2 (Cancelled per Annex B; 6 is reserved — REV0907-B1).
 	sp := env.tree.Programs[0]
 	var cancelled, superseded int
 	for _, ctrl := range sp.Controls.DERControl {
-		if ctrl.EventStatus != nil && ctrl.EventStatus.CurrentStatus == 6 {
+		if ctrl.EventStatus != nil && ctrl.EventStatus.IsCancelled() {
 			cancelled++
-			t.Logf("[%s] PASS [DER.010]: cancelled event found: mRID=%s (status=6)", id, ctrl.MRID)
+			t.Logf("[%s] PASS [DER.010]: cancelled event found: mRID=%s (currentStatus=2, Annex B)", id, ctrl.MRID)
 		}
 		if ctrl.EventStatus != nil && ctrl.EventStatus.PotentiallySuperseded {
 			superseded++
@@ -565,7 +565,7 @@ func TestCSIP_CORE013_AdvancedDERProgramControl(t *testing.T) {
 		}
 	}
 	if cancelled == 0 {
-		t.Errorf("FAIL [DER.010]: expected at least 1 cancelled (status=6) event in SP program")
+		t.Errorf("FAIL [DER.010]: expected at least 1 cancelled (currentStatus=2, Annex B) event in SP program")
 	}
 	if superseded == 0 {
 		t.Errorf("FAIL [DER.011]: expected at least 1 potentiallySuperseded event in SP program")
@@ -1201,7 +1201,7 @@ func TestCSIP_BASIC012_CancelledEventHandling(t *testing.T) {
 	const id = "BASIC-012"
 	env := newCSIPEnv(t)
 
-	logSpec(t, id, "DER.010", "Events with currentStatus=6 (Cancelled) must be skipped")
+	logSpec(t, id, "DER.010", "Events with currentStatus=2 (Cancelled, IEEE 2030.5-2018 Annex B) must be skipped")
 	logSpec(t, id, "IEEE.12.3", "Cancelled events are never applied, regardless of their time window")
 
 	// Find and log all cancelled events.
@@ -1211,7 +1211,7 @@ func TestCSIP_BASIC012_CancelledEventHandling(t *testing.T) {
 			continue
 		}
 		for _, ctrl := range ps.Controls.DERControl {
-			if ctrl.EventStatus != nil && ctrl.EventStatus.CurrentStatus == 6 {
+			if ctrl.EventStatus != nil && ctrl.EventStatus.IsCancelled() {
 				cancelledMRIDs = append(cancelledMRIDs, ctrl.MRID)
 				t.Logf("[%s] Found cancelled event: mRID=%s program=%s",
 					id, ctrl.MRID, ps.Program.MRID)
@@ -1227,7 +1227,7 @@ func TestCSIP_BASIC012_CancelledEventHandling(t *testing.T) {
 	var cancelledCtrl *model.DERControl
 	for i := range sp.Controls.DERControl {
 		if sp.Controls.DERControl[i].EventStatus != nil &&
-			sp.Controls.DERControl[i].EventStatus.CurrentStatus == 6 {
+			sp.Controls.DERControl[i].EventStatus.IsCancelled() {
 			cancelledCtrl = &sp.Controls.DERControl[i]
 			break
 		}

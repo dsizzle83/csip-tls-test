@@ -138,7 +138,7 @@ func cancelledSupersededScenario() *mayScenario {
 		ID:         "cancelled-superseded-roundtrip",
 		Name:       "Hub POSTs Superseded(7) then Cancelled(6) over the wire (CORE-022/023)",
 		Category:   "CSIP events (INV-EVENT-ACK)",
-		Hypothesis: "A utility server routinely supersedes one event with a higher-precedence overlapping one and cancels events outright. Per GEN.044/CORE-022/023 the DER client must acknowledge both: status=7 (superseded) for the event that lost to a later-created overlapping event in the same program, and status=6 (cancelled) for an event whose currentStatus the server flips to 6 after the client already received it. The hub's responses.Tracker + scheduler.SupersededMRIDs already implement both (audit P1-2); this drives them on the wire.",
+		Hypothesis: "A utility server routinely supersedes one event with a higher-precedence overlapping one and cancels events outright. Per GEN.044/CORE-022/023 the DER client must acknowledge both: status=7 (superseded) for the event that lost to a later-created overlapping event in the same program, and status=6 (cancelled) for an event whose currentStatus the server flips to 2 (Cancelled, Annex B) after the client already received it. The hub's responses.Tracker + scheduler.SupersededMRIDs already implement both (audit P1-2); this drives them on the wire.",
 		Expected:   "gridsim's /admin/responses shows a Response with status=7 subject=" + supersedeLoserMRID + " (the superseded loser) AND a Response with status=6 subject=" + serverCancelMRID + " (the server-cancelled event the hub had already received).",
 		HoldS:      75,
 		Fix:        "internal/northbound/responses/tracker.go's Update (Cancelled + Superseded passes); internal/northbound/scheduler.go's SupersededMRIDs/isSuperseded.",
@@ -270,7 +270,7 @@ func diagnoseCancelledSuperseded(sc *mayScenario, s []maySample, resps []gridRes
 		f.Verdict = "FAIL"
 		f.Headline = "hub superseded (7) but never posted Cancelled(6)"
 		f.Diagnosis = []string{
-			"The supersede was acknowledged but the server-cancel was not — the tracker's Cancelled pass never fired for a previously-received event flipped to currentStatus=6.",
+			"The supersede was acknowledged but the server-cancel was not — the tracker's Cancelled pass never fired for a previously-received event flipped to currentStatus=2 (Cancelled).",
 			supLine, canLine,
 			respVocabLine(resps),
 		}
