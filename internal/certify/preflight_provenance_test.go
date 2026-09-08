@@ -98,6 +98,16 @@ func statusDUT(t *testing.T, fw, buildID string) *fakeDUT {
 		status: `{"fw":"` + fw + `","build_id":"` + buildID + `"}`}
 }
 
+// statusDUTWithImage is statusDUT plus the two image-identity fields
+// (REV0907-E2): GET /status's image_build_id / image_profile, exactly as
+// lexa-gw cmd/api/handlers.go stamps them when internal/buildid.ImageBuildID/
+// ImageOrigin can read the DUT's rootfs build-id file.
+func statusDUTWithImage(t *testing.T, fw, buildID, imageBuildID, imageProfile string) *fakeDUT {
+	return &fakeDUT{t: t, token: "s3cr3t\n",
+		status: `{"fw":"` + fw + `","build_id":"` + buildID + `","image_build_id":"` + imageBuildID +
+			`","image_profile":"` + imageProfile + `"}`}
+}
+
 func TestVerifyDUTBuild_MatchAndMismatch(t *testing.T) {
 	// MATCH (a short sha the operator flashed vs the DUT's longer build_id):
 	// proceeds and records the reported build.
@@ -155,16 +165,72 @@ func TestVerifyDUTBuild_UnreadableWithClaimIsFatalOnGating(t *testing.T) {
 	}
 }
 
-func TestVerifyDUTBuild_NoClaimRecordsButNeverFails(t *testing.T) {
-	// No -dut-build: nothing to verify. The DUT-reported build is still recorded,
-	// and the run is never failed on it — even on a gating campaign.
+// TestVerifyDUTBuild_NoClaimRequiredOnGating pins REV0907-E2: a GATING
+// campaign may not run at all without a declared -dut-build — before this, an
+// omitted flag silently produced a bundle whose dut.build was simply empty,
+// verified against nothing.
+func TestVerifyDUTBuild_NoClaimRequiredOnGating(t *testing.T) {
 	var out provenanceOutcome
-	if err := provRunner(t, true, "", statusDUT(t, "1.4.0", "cc93abc")).
+	err := provRunner(t, true, "", statusDUT(t, "1.4.0", "cc93abc")).
+		verifyDUTBuild(context.Background(), provReporter(), &out)
+	if err == nil {
+		t.Fatal("a GATING campaign with no -dut-build was not refused")
+	}
+	for _, want := range []string{"GATING", "-dut-build"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+}
+
+// TestVerifyDUTBuild_NoClaimRecordsButNeverFailsOnExploratory: an EXPLORATORY
+// run has nothing requiring -dut-build. The DUT-reported build (and image
+// identity) is still recorded, and the run is never failed on it.
+func TestVerifyDUTBuild_NoClaimRecordsButNeverFailsOnExploratory(t *testing.T) {
+	var out provenanceOutcome
+	if err := provRunner(t, false, "", statusDUTWithImage(t, "1.4.0", "cc93abc", "cc93abc111122", "image")).
 		verifyDUTBuild(context.Background(), provReporter(), &out); err != nil {
-		t.Fatalf("verifyDUTBuild failed a run with no -dut-build to check: %v", err)
+		t.Fatalf("verifyDUTBuild failed an EXPLORATORY run with no -dut-build to check: %v", err)
 	}
 	if out.DUTBuildFW != "1.4.0" || out.DUTBuildID != "cc93abc" {
 		t.Errorf("the DUT-reported build was not recorded for a no-claim run: %+v", out)
+	}
+	if out.DUTImageBuildID != "cc93abc111122" || out.DUTImageProfile != "image" {
+		t.Errorf("the DUT-reported image identity was not recorded for a no-claim run: %+v", out)
+	}
+}
+
+// TestVerifyDUTBuild_RecordsImageIdentity pins that a matching -dut-build
+// claim still records the DUT's IMAGE identity (image_build_id/image_profile)
+// alongside the build match — the artefact question RRS §2.1 needs answered,
+// which BuildReported alone cannot answer (REV0907-E2).
+func TestVerifyDUTBuild_RecordsImageIdentity(t *testing.T) {
+	var out provenanceOutcome
+	if err := provRunner(t, true, "212253a", statusDUTWithImage(t, "dev", "212253a1b2c3", "e230d5911111", "dev-deploy")).
+		verifyDUTBuild(context.Background(), provReporter(), &out); err != nil {
+		t.Fatalf("a matching DUT build was refused: %v", err)
+	}
+	if out.DUTImageBuildID != "e230d5911111" {
+		t.Errorf("DUTImageBuildID = %q, want %q", out.DUTImageBuildID, "e230d5911111")
+	}
+	if out.DUTImageProfile != "dev-deploy" {
+		t.Errorf("DUTImageProfile = %q, want %q", out.DUTImageProfile, "dev-deploy")
+	}
+}
+
+// TestVerifyDUTBuild_OlderDUTWithNoImageFieldsStillMatches: a DUT running a
+// lexa-gw build that predates image_build_id/image_profile on /status must
+// not be refused for lacking fields it cannot possibly report — only
+// bundle.Verify's static check (REV0907-E2) refuses a GATING bundle for that,
+// and only once the bundle is actually written.
+func TestVerifyDUTBuild_OlderDUTWithNoImageFieldsStillMatches(t *testing.T) {
+	var out provenanceOutcome
+	if err := provRunner(t, true, "212253a", statusDUT(t, "dev", "212253a1b2c3")).
+		verifyDUTBuild(context.Background(), provReporter(), &out); err != nil {
+		t.Fatalf("a matching DUT build with no image fields was refused: %v", err)
+	}
+	if out.DUTImageBuildID != "" || out.DUTImageProfile != "" {
+		t.Errorf("image identity was fabricated for a DUT that reported none: %+v", out)
 	}
 }
 
@@ -201,8 +267,17 @@ func TestProvenanceNote(t *testing.T) {
 	if note := provenanceNote(provenanceOutcome{DUTBuildFW: "1.4.0", DUTBuildID: "cc93abc"}); !strings.Contains(note, "DUT build reported") {
 		t.Errorf("the DUT build was not recorded in the note: %q", note)
 	}
+	// The DUT's image identity is recorded in the same line (REV0907-E2),
+	// even when the build fields themselves are absent — an older DUT with no
+	// build_id but a hand-set image_profile is still worth stating.
+	note := provenanceNote(provenanceOutcome{DUTImageBuildID: "e230d5911111", DUTImageProfile: "image"})
+	for _, want := range []string{"image_build_id=e230d5911111", "image_profile=image"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("the DUT image identity was not recorded in the note: %q (want %q)", note, want)
+		}
+	}
 	// -allow-dirty over a dirty tree is recorded, with the weakened footing named.
-	note := provenanceNote(provenanceOutcome{AllowDirtyUsed: true, Dirty: true, HarnessHead: "abc123"})
+	note = provenanceNote(provenanceOutcome{AllowDirtyUsed: true, Dirty: true, HarnessHead: "abc123"})
 	for _, want := range []string{"-allow-dirty USED", "DIRTY", "not reproducible"} {
 		if !strings.Contains(note, want) {
 			t.Errorf("the allow-dirty note does not say %q: %q", want, note)
@@ -215,5 +290,55 @@ func TestProvenanceNote(t *testing.T) {
 	// Nothing to say: no note.
 	if note := provenanceNote(provenanceOutcome{HarnessHead: "abc123"}); note != "" {
 		t.Errorf("a clean run produced a spurious provenance note: %q", note)
+	}
+}
+
+// ── dutRecord (writeBundle's DUT record) ────────────────────────────────────
+
+// TestDutRecord_MergesClaimWithMeasured pins that writeBundle's bundle.DUT
+// carries BOTH the operator's claims (name/address/identity/role/build) AND
+// what the provenance preflight actually measured (BuildReported/
+// ImageBuildID/ImageProfile) — never one overwriting the other, since they
+// answer different questions (REV0907-E2).
+func TestDutRecord_MergesClaimWithMeasured(t *testing.T) {
+	r := &Runner{opts: Options{DUT: bundle.DUT{
+		Name: "bench-inv-1", Address: "69.0.0.2:802", Identity: "0x1234", Role: "inverter",
+		Build: "212253a",
+	}}}
+	prov := provenanceOutcome{
+		DUTBuildFW: "dev", DUTBuildID: "212253a1b2c3",
+		DUTImageBuildID: "e230d5911111", DUTImageProfile: "image",
+	}
+
+	got := r.dutRecord(prov)
+
+	if got.Name != "bench-inv-1" || got.Address != "69.0.0.2:802" || got.Identity != "0x1234" || got.Role != "inverter" {
+		t.Errorf("the operator's DUT claims were not preserved: %+v", got)
+	}
+	if got.Build != "212253a" {
+		t.Errorf("Build = %q, want the operator's CLAIM %q untouched", got.Build, "212253a")
+	}
+	if got.BuildReported != "212253a1b2c3" {
+		t.Errorf("BuildReported = %q, want the DUT-MEASURED build_id %q", got.BuildReported, "212253a1b2c3")
+	}
+	if got.ImageBuildID != "e230d5911111" {
+		t.Errorf("ImageBuildID = %q, want %q", got.ImageBuildID, "e230d5911111")
+	}
+	if got.ImageProfile != "image" {
+		t.Errorf("ImageProfile = %q, want %q", got.ImageProfile, "image")
+	}
+}
+
+// TestDutRecord_NothingMeasuredLeavesReportedFieldsEmpty: a run that never
+// reached (or could not use) the gateway transport records no measured
+// fields — dutRecord must not fabricate one from the operator's claim.
+func TestDutRecord_NothingMeasuredLeavesReportedFieldsEmpty(t *testing.T) {
+	r := &Runner{opts: Options{DUT: bundle.DUT{Build: "212253a"}}}
+	got := r.dutRecord(provenanceOutcome{})
+	if got.BuildReported != "" || got.ImageBuildID != "" || got.ImageProfile != "" {
+		t.Errorf("dutRecord fabricated measured fields with nothing to measure from: %+v", got)
+	}
+	if got.Build != "212253a" {
+		t.Errorf("Build = %q, want the operator's claim preserved", got.Build)
 	}
 }

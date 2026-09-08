@@ -1081,3 +1081,45 @@ func TestInterfaceCoverage(t *testing.T) {
 		t.Errorf("message %q does not flag the unexpected interface id", msg)
 	}
 }
+
+// TestWriteBundle_DUTRecordCarriesMeasuredProvenance is the end-to-end proof
+// that writeBundle records dutRecord's MERGE, not the raw operator claim
+// (REV0907-E2): a real Run() with a fake DUT status must produce a
+// bundle.json whose dut.build_reported/image_build_id/image_profile carry
+// what the fake DUT reported, alongside dut.build unchanged (the operator's
+// claim). TestDutRecord_MergesClaimWithMeasured (preflight_provenance_test.go)
+// pins dutRecord's own logic in isolation; this pins that writeBundle
+// actually calls it.
+func TestWriteBundle_DUTRecordCarriesMeasuredProvenance(t *testing.T) {
+	cat := catalogFile(t)
+	reg := NewRegistry()
+	reg.Register("doc-a::A-001", "x", noopCheck)
+	opts, out := baseOptions(t, nil)
+	opts.DUT.Build = "212253a"
+	opts.GatewaySSH = "cc93"
+	run, err := New(reg, cat, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.gwRunner = statusDUTWithImage(t, "dev", "212253a1b2c3", "e230d5911111", "image").runner()
+	if _, err := run.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v\n%s", err, console(opts))
+	}
+
+	b, err := bundle.Load(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Run.DUT.Build != "212253a" {
+		t.Errorf("dut.build = %q, want the operator's claim %q preserved", b.Run.DUT.Build, "212253a")
+	}
+	if b.Run.DUT.BuildReported != "212253a1b2c3" {
+		t.Errorf("dut.build_reported = %q, want the DUT-measured %q", b.Run.DUT.BuildReported, "212253a1b2c3")
+	}
+	if b.Run.DUT.ImageBuildID != "e230d5911111" {
+		t.Errorf("dut.image_build_id = %q, want %q", b.Run.DUT.ImageBuildID, "e230d5911111")
+	}
+	if b.Run.DUT.ImageProfile != "image" {
+		t.Errorf("dut.image_profile = %q, want %q", b.Run.DUT.ImageProfile, "image")
+	}
+}

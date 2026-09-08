@@ -328,8 +328,41 @@ type DUT struct {
 	// fingerprint, a serial number.
 	Identity string `json:"identity,omitempty"`
 	Role     string `json:"role,omitempty"`
-	// Build is the firmware/build version, when the operator can supply it.
+	// Build is the firmware/build version the OPERATOR typed (-dut-build) —
+	// a CLAIM, not a measurement. See BuildReported for what the DUT itself
+	// said, and internal/certify's verifyDUTBuild for how the two are
+	// reconciled before a gating bundle is ever written.
 	Build string `json:"build,omitempty"`
+	// BuildReported is what the DUT's own GET /status said its build_id is
+	// (lexa-gw internal/buildid.Resolve), read READ-ONLY over the gateway
+	// introspection transport, independent of the operator's Build claim.
+	// Before this field existed, a gating bundle's dut.build was whatever the
+	// operator typed — verifiable only by re-running the same fallible
+	// command — and an unverified or empty -dut-build produced a bundle
+	// indistinguishable from one measured against exactly the right DUT
+	// (REV0907-E2). Verify refuses a GATING bundle whose BuildReported is
+	// empty, or that disagrees with Build (verifyDUTProvenance); an
+	// exploratory bundle may still carry an empty one when no gateway
+	// transport was configured to read it through.
+	BuildReported string `json:"build_reported,omitempty"`
+	// ImageBuildID is the DUT's own GET /status image_build_id: the ARTEFACT
+	// identity (which per-slot image produced the files the DUT is running),
+	// distinct from BuildReported (which commit the running binary is). RRS
+	// §2.1's "stamped image mandatory" rule needs this named IN the bundle —
+	// a reader with only BuildReported knows which commit answered /status,
+	// not which image was flashed to produce it. Empty on a DUT running a
+	// lexa-gw build that predates this field, or when no gateway transport
+	// was configured. See REV0907-E2.
+	ImageBuildID string `json:"image_build_id,omitempty"`
+	// ImageProfile is who produced that image — "image" (a real meta-lexa
+	// build, baked from a pinned SRCREV) or "dev-deploy" (a hand-deployed
+	// binary tree, lexa-gw's scripts/deploy-gw.sh) — from the DUT's GET
+	// /status image_profile (lexa-gw internal/buildid.ImageOrigin). A gating
+	// bundle recording "dev-deploy" here is evidence measured against a tree
+	// RRS §2.1 does not consider a stamped image; Verify does not refuse on
+	// the VALUE (a lab may still want to see it), only on ImageBuildID being
+	// empty — see verifyDUTProvenance.
+	ImageProfile string `json:"image_profile,omitempty"`
 }
 
 // RunMeta is everything about the run itself.

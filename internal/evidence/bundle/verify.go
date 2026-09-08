@@ -152,6 +152,7 @@ func Verify(dir string) (*VerifyReport, error) {
 	verifyTimebases(b, rep)
 	verifyCaseVerdicts(b, rep)
 	verifyCampaignWeakening(b, rep)
+	verifyDUTProvenance(b, rep)
 
 	if b.Files.Capture == "" {
 		rep.problem("bundle declares no capture file; no assertion can be re-checked against the wire")
@@ -502,6 +503,90 @@ func verifyCampaignWeakening(b *Bundle, rep *VerifyReport) {
 		"claim both — GATING says this evidence may decide a release, WEAKENED says a precondition that "+
 		"decision rests on was asserted rather than proven", c.Name, strings.Join(c.Weakened, ", ")))
 	rep.OK = false
+}
+
+// verifyDUTProvenance refuses a GATING bundle whose DUT record cannot name
+// the artefact its verdicts describe (REV0907-E2).
+//
+// # Why this is fatal rather than a disclosure
+//
+// Before this field existed, a gating bundle's dut.build was whatever the
+// operator typed into -dut-build — a claim nothing downstream ever checked,
+// and empty when the flag was simply omitted. internal/certify's
+// verifyDUTBuild (preflight_provenance.go) now REQUIRES -dut-build on a
+// gating campaign, reads the DUT's own GET /status build_id/image_build_id/
+// image_profile over the read-only gateway transport, and refuses the run on
+// a mismatch or an unreadable status — so a runner-produced GATING bundle
+// should never reach this check missing dut.build_reported or
+// dut.image_build_id, or carrying a build that disagrees with what the DUT
+// reported.
+//
+// "Should never" is exactly why this check exists: it is the same defensive
+// posture verifyCampaignWeakening documents just above — this package cannot
+// make every future writer of bundle.json prove it obeyed the runner's own
+// rule, and a bundle that reaches -verify with an incomplete or
+// self-contradicting DUT record is either hand-edited or written by a runner
+// version this package does not trust. Either way a reader checking only
+// campaign.gating==true must not be told "you may certify from this" without
+// also being told which artefact it is evidence for.
+//
+// Exploratory bundles are exempt: nothing requires -dut-build on a poke, and
+// an empty or partial DUT record there is simply what an operator with no
+// gateway transport configured produced — not a contradiction.
+func verifyDUTProvenance(b *Bundle, rep *VerifyReport) {
+	c := b.Run.Campaign
+	if c == nil || !c.Gating {
+		return
+	}
+	dut := b.Run.DUT
+	switch {
+	case dut.BuildReported == "":
+		rep.problem(fmt.Sprintf("campaign %q is GATING but dut.build_reported is empty: the DUT's own "+
+			"reported build was never confirmed, so this bundle cannot say which build its verdicts "+
+			"describe (REV0907-E2)", c.Name))
+		rep.OK = false
+	case dut.Build != "" && !dutBuildMatches(dut.Build, dut.BuildReported):
+		rep.problem(fmt.Sprintf("campaign %q is GATING but dut.build (%q, the operator's claim) does not "+
+			"match dut.build_reported (%q, what the DUT actually reported): a gating bundle may not carry "+
+			"a proven contradiction between the two (REV0907-E2)", c.Name, dut.Build, dut.BuildReported))
+		rep.OK = false
+	}
+	if dut.ImageBuildID == "" {
+		rep.problem(fmt.Sprintf("campaign %q is GATING but dut.image_build_id is empty: this bundle names "+
+			"which commit answered the DUT's /status but not which IMAGE produced the files it is running "+
+			"from — RRS §2.1's stamped-image rule cannot be checked from this bundle alone (REV0907-E2)",
+			c.Name))
+		rep.OK = false
+	}
+}
+
+// dutBuildMatches is a tolerant claim-vs-reported comparison, DELIBERATELY
+// duplicating internal/certify's buildIdentityMatches/buildTokenMatch rather
+// than importing them: internal/certify already imports this package
+// (bundle), so the reverse import would cycle. Keep the two predicates in
+// step — see internal/certify/preflight_provenance.go's buildIdentityMatches
+// for the full rationale (a build id is most often a git revision abbreviated
+// to DIFFERENT lengths on the two sides). If this check used strict equality
+// instead, -verify would refuse every ROUTINE, correctly-produced gating
+// bundle whose operator typed a short -dut-build against a DUT that reports a
+// longer build_id — the exact case verifyDUTBuild already treats as a MATCH
+// at preflight time. See REV0907-E2.
+func dutBuildMatches(claimed, reported string) bool {
+	if claimed == "" || reported == "" {
+		return false
+	}
+	if strings.EqualFold(claimed, reported) {
+		return true
+	}
+	lo, hi := claimed, reported
+	if len(lo) > len(hi) {
+		lo, hi = hi, lo
+	}
+	const minAbbrev = 7 // git's own default collision-safe abbreviation
+	if len(lo) < minAbbrev {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(hi), strings.ToLower(lo))
 }
 
 // reassemble rebuilds every TCP connection GENERATION so byte-range citations

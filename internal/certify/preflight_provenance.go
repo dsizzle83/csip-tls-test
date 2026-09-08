@@ -23,10 +23,24 @@ package certify
 //     product build is under test. If the DUT on the bench is actually running a
 //     different one, every verdict in the bundle is about the wrong artefact, and
 //     nothing downstream can tell — the bundle names the operator's build in its
-//     DUT record and the reader believes it. So when -dut-build is given, the
-//     DUT's own reported build is read (READ-ONLY, over the same -gateway-ssh /
-//     -gateway-exec introspection every other preflight uses) and compared, and a
-//     mismatch — or a build that could not be read at all — stops a gating run.
+//     DUT record and the reader believes it. So -dut-build is now REQUIRED on a
+//     GATING campaign (REV0907-E2; it used to be optional, and an omitted flag
+//     produced a bundle whose dut.build was simply empty, verified against
+//     nothing), the DUT's own reported build is read (READ-ONLY, over the same
+//     -gateway-ssh / -gateway-exec introspection every other preflight uses) and
+//     compared, and a mismatch — or a build that could not be read at all —
+//     stops a gating run.
+//
+//   - The UNNAMED ARTEFACT. A matching build_id names which COMMIT answered
+//     /status, not which IMAGE produced the files that binary is running from —
+//     a hand-deployed tree (lexa-gw's scripts/deploy-gw.sh) reports the same
+//     build_id a properly baked image would. RRS §2.1's "stamped image
+//     mandatory" rule used to live only in a runbook a tool could not check: the
+//     same /status read this file already made now also carries image_build_id
+//     and image_profile (lexa-gw internal/buildid.ImageBuildID/ImageOrigin),
+//     recorded into the bundle's DUT record beside BuildReported (REV0907-E2) so
+//     a lab reading the bundle later can tell which artefact the verdicts
+//     describe. bundle.Verify refuses a GATING bundle that is missing either.
 //
 // # Fail closed on gating, observe on exploratory
 //
@@ -60,6 +74,12 @@ type provenanceOutcome struct {
 	// (GET /status: buildinfo.Version and buildid.Resolve), when it was read.
 	DUTBuildFW string
 	DUTBuildID string
+	// DUTImageBuildID and DUTImageProfile are what the DUT reported about the
+	// IMAGE running it (GET /status: image_build_id and image_profile, lexa-gw
+	// internal/buildid.ImageBuildID/ImageOrigin) — the artefact identity
+	// BuildReported alone cannot carry (REV0907-E2). See the package doc.
+	DUTImageBuildID string
+	DUTImageProfile string
 }
 
 // preflightProvenance verifies that this run's evidence can be traced to a clean
@@ -120,24 +140,41 @@ func (r *Runner) checkHarnessTree(reporter *Reporter, head string, dirty bool, o
 	return nil
 }
 
-// verifyDUTBuild reads the DUT's own reported build and, when -dut-build was
-// supplied, holds it against that declaration. It always records what the DUT
-// reported (provenance worth keeping either way); it only FAILs a gating run
-// when a supplied -dut-build cannot be confirmed.
+// verifyDUTBuild reads the DUT's own reported build (and image identity) and,
+// when -dut-build was supplied, holds the build against that declaration. It
+// always records what the DUT reported (provenance worth keeping either way);
+// it FAILs a gating run when -dut-build was not supplied at all (REV0907-E2 —
+// a GATING campaign must declare which build it is measuring against) or when
+// a supplied -dut-build cannot be confirmed.
 func (r *Runner) verifyDUTBuild(ctx context.Context, reporter *Reporter, out *provenanceOutcome) error {
 	gw := r.gateway()
-	fw, buildID, readErr := r.readDUTBuild(ctx, gw)
+	fw, buildID, imageBuildID, imageProfile, readErr := r.readDUTBuild(ctx, gw)
 	out.DUTBuildFW = fw
 	out.DUTBuildID = buildID
+	out.DUTImageBuildID = imageBuildID
+	out.DUTImageProfile = imageProfile
 
 	claimed := strings.TrimSpace(r.opts.DUT.Build)
 	if claimed == "" {
-		// Nothing to verify against. Record what the DUT reported, when readable.
-		if readErr == nil && (fw != "" || buildID != "") {
-			reporter.Line("provenance: DUT reports build fw=%s build_id=%s (no -dut-build supplied to verify "+
-				"it against)", orNone(fw), orNone(buildID))
+		if !r.gatingCampaign() {
+			// Nothing to verify against, and nothing REQUIRES one on an
+			// exploratory poke. Record what the DUT reported, when readable.
+			if readErr == nil && (fw != "" || buildID != "" || imageBuildID != "") {
+				reporter.Line("provenance: DUT reports build fw=%s build_id=%s image_build_id=%s "+
+					"image_profile=%s (no -dut-build supplied to verify it against)",
+					orNone(fw), orNone(buildID), orNone(imageBuildID), orNone(imageProfile))
+			}
+			return nil
 		}
-		return nil
+		// GATING: -dut-build is REQUIRED (REV0907-E2). "which build?" must be
+		// an answerable question for every gating bundle, not merely a field
+		// that happens to be filled in when an operator remembered the flag —
+		// before this, an omitted -dut-build produced a bundle whose
+		// dut.build was simply empty, verified against nothing.
+		return r.unprovable(reporter,
+			"the DUT build identity (-dut-build was not supplied)",
+			"a gating campaign must declare which build it is measuring against so the DUT's own reported "+
+				"build can be verified against it; pass -dut-build")
 	}
 
 	if readErr != nil || (fw == "" && buildID == "") {
@@ -178,30 +215,41 @@ func (r *Runner) verifyDUTBuild(ctx context.Context, reporter *Reporter, out *pr
 	return nil
 }
 
-// dutBuildStatus is the subset of the DUT dev API's GET /status this check reads:
-// fw (lexa-platform/buildinfo.Version, the product version) and build_id
-// (lexa-gw internal/buildid.Resolve, normally the abbreviated git revision with a
-// "-dirty" suffix). lexa-gw cmd/api/handlers.go stamps both onto every /status.
+// dutBuildStatus is the subset of the DUT dev API's GET /status this check
+// reads: fw (lexa-platform/buildinfo.Version, the product version) and
+// build_id (lexa-gw internal/buildid.Resolve, normally the abbreviated git
+// revision with a "-dirty" suffix) name which COMMIT is executing;
+// image_build_id / image_profile (lexa-gw internal/buildid.ImageBuildID /
+// ImageOrigin) name which IMAGE produced the files it is executing from — see
+// this file's package doc, "The UNNAMED ARTEFACT". lexa-gw cmd/api/handlers.go
+// stamps all four onto every /status (build_id unconditionally;
+// image_build_id/image_profile only when the DUT's rootfs build-id file is
+// readable, so an older lexa-gw or a machine with no meta-lexa image at all
+// answers with those two simply absent — decoded here as "").
 type dutBuildStatus struct {
-	FW      string `json:"fw"`
-	BuildID string `json:"build_id"`
+	FW           string `json:"fw"`
+	BuildID      string `json:"build_id"`
+	ImageBuildID string `json:"image_build_id"`
+	ImageProfile string `json:"image_profile"`
 }
 
-// readDUTBuild fetches the DUT's reported build over the READ-ONLY introspection
-// transport. It is the same door preflightManifest reads /status through.
-func (r *Runner) readDUTBuild(ctx context.Context, gw *Gateway) (fw, buildID string, err error) {
+// readDUTBuild fetches the DUT's reported build AND image identity over the
+// READ-ONLY introspection transport. It is the same door preflightManifest
+// reads /status through.
+func (r *Runner) readDUTBuild(ctx context.Context, gw *Gateway) (fw, buildID, imageBuildID, imageProfile string, err error) {
 	if !gw.Available() {
-		return "", "", fmt.Errorf("no gateway introspection configured")
+		return "", "", "", "", fmt.Errorf("no gateway introspection configured")
 	}
 	body, err := r.devAPIGet(ctx, gw, "/status")
 	if err != nil {
-		return "", "", err
+		return "", "", "", "", err
 	}
 	var st dutBuildStatus
 	if jerr := json.Unmarshal(body, &st); jerr != nil {
-		return "", "", fmt.Errorf("the DUT's /status did not decode: %v", jerr)
+		return "", "", "", "", fmt.Errorf("the DUT's /status did not decode: %v", jerr)
 	}
-	return strings.TrimSpace(st.FW), strings.TrimSpace(st.BuildID), nil
+	return strings.TrimSpace(st.FW), strings.TrimSpace(st.BuildID),
+		strings.TrimSpace(st.ImageBuildID), strings.TrimSpace(st.ImageProfile), nil
 }
 
 // buildIdentityMatches reports whether an operator-supplied -dut-build names the
@@ -257,9 +305,9 @@ func atHead(head string) string {
 // from the same bundle.GitCommit reader, so they are not repeated here.
 func provenanceNote(p provenanceOutcome) string {
 	var parts []string
-	if p.DUTBuildFW != "" || p.DUTBuildID != "" {
-		parts = append(parts, fmt.Sprintf("DUT build reported fw=%s build_id=%s",
-			orNone(p.DUTBuildFW), orNone(p.DUTBuildID)))
+	if p.DUTBuildFW != "" || p.DUTBuildID != "" || p.DUTImageBuildID != "" || p.DUTImageProfile != "" {
+		parts = append(parts, fmt.Sprintf("DUT build reported fw=%s build_id=%s image_build_id=%s image_profile=%s",
+			orNone(p.DUTBuildFW), orNone(p.DUTBuildID), orNone(p.DUTImageBuildID), orNone(p.DUTImageProfile)))
 	}
 	// -allow-dirty is only worth recording when it actually waved something
 	// through: a not-clean tree. Passed over a clean tree it was inert.
@@ -275,4 +323,25 @@ func provenanceNote(p provenanceOutcome) string {
 		return ""
 	}
 	return "provenance: " + strings.Join(parts, "; ")
+}
+
+// dutRecord merges the operator's DUT claims (r.opts.DUT: name, address,
+// identity, role, and the -dut-build CLAIM) with what the provenance preflight
+// actually MEASURED from the DUT's own GET /status — BuildReported,
+// ImageBuildID, ImageProfile. writeBundle calls this instead of writing
+// r.opts.DUT straight through, because before this the bundle's only build
+// record was the operator's typed string: unverifiable from the bundle alone,
+// and silent about which image produced the files under test at all
+// (REV0907-E2).
+//
+// prov is the SAME provenanceOutcome preflightProvenance already populated
+// this run's report with (rep.Provenance) — never re-read here, so the
+// bundle's DUT record and the preflight's own refusal/warn decisions can never
+// disagree about what the DUT reported.
+func (r *Runner) dutRecord(prov provenanceOutcome) bundle.DUT {
+	d := r.opts.DUT
+	d.BuildReported = prov.DUTBuildID
+	d.ImageBuildID = prov.DUTImageBuildID
+	d.ImageProfile = prov.DUTImageProfile
+	return d
 }
