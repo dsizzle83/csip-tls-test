@@ -216,6 +216,10 @@ jobs:
     name: pure-go
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
+    # REV0907-H12: an unbounded job hangs a runner (and this branch's CI
+    # queue behind it) instead of failing loud; bounded to comfortably
+    # exceed this job's normal run time.
+    timeout-minutes: 30
     env:
       CGO_ENABLED: "0"
     steps:
@@ -295,6 +299,10 @@ jobs:
     name: cgo-fast
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
+    # REV0907-H12: bounded so a hung wolfSSL build/link or a stuck lint pass
+    # fails loud instead of hanging the runner; a cache miss (full wolfSSL
+    # build) is the slow path this job budgets for.
+    timeout-minutes: 60
     env:
       WOLFSSL_VERSION: "5.7.6-stable"
       WOLFSSL_SYSROOT: /home/runner/wolfssl-amd64
@@ -374,6 +382,10 @@ jobs:
   vulncheck:
     name: vulncheck
     runs-on: ubuntu-latest
+    # REV0907-H12: bounded so a hung wolfSSL build/link or a stuck scan fails
+    # loud instead of hanging the runner (this job also runs unattended on
+    # the nightly cron, where there is no PR waiting on it to notice a hang).
+    timeout-minutes: 30
     env:
       WOLFSSL_VERSION: "5.7.6-stable"
       WOLFSSL_SYSROOT: /home/runner/wolfssl-amd64
@@ -439,6 +451,9 @@ jobs:
     name: proto-pin
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
+    # REV0907-H12: bounded so a stuck sibling-repo clone or vendor
+    # regeneration fails loud instead of hanging the runner.
+    timeout-minutes: 30
     steps:
       - name: Checkout csip-tls-test (bench, this repo)
         uses: actions/checkout@v4
@@ -582,6 +597,10 @@ jobs:
     name: fuzz (nightly, 2030.5 XML decode)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
+    # REV0907-H12: this job budgets two 15m fuzz targets (30m) plus setup;
+    # bounded generously above that so a genuinely hung fuzz run fails loud
+    # on an unattended nightly instead of tying up a runner indefinitely.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 

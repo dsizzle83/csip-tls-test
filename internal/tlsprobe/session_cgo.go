@@ -396,8 +396,11 @@ func (s *Session) Report() *Report {
 
 // Close tears the session down exactly once, in the order the handles require:
 // TLS close-notify, the wolfSSL session, the owned context, the dup'd fd, the
-// socket.
+// socket. It reports the first of the fd/socket close errors, if either
+// fails — REV0907-H2: Complete depends on this to surface a real close
+// failure instead of checking a value that can never be non-nil.
 func (s *Session) Close() error {
+	var closeErr error
 	s.closeOnce.Do(func() {
 		if s.ssl != nil {
 			wolfssl.Shutdown(s.ssl)
@@ -409,13 +412,17 @@ func (s *Session) Close() error {
 			s.ctx = nil
 		}
 		if s.file != nil {
-			_ = s.file.Close()
+			if err := s.file.Close(); err != nil && closeErr == nil {
+				closeErr = fmt.Errorf("tlsprobe: close dup'd socket: %w", err)
+			}
 		}
 		if s.raw != nil {
-			_ = s.raw.Close()
+			if err := s.raw.Close(); err != nil && closeErr == nil {
+				closeErr = fmt.Errorf("tlsprobe: close raw connection: %w", err)
+			}
 		}
 	})
-	return nil
+	return closeErr
 }
 
 // Complete is the whole procedure step in one call: establish a session on the
@@ -426,12 +433,16 @@ func (s *Session) Close() error {
 // state is "the EUT-S successfully establishes a secure session using each of
 // the mandatory cipher suites" (SSM-CONF-v0.8 §2.5.1.3) — a completed session
 // carrying real traffic, not a ServerHello.
-func Complete(ctx context.Context, spec Spec) (*Report, error) {
-	s, err := Dial(ctx, spec)
-	if err != nil {
-		return nil, err
+func Complete(ctx context.Context, spec Spec) (report *Report, err error) {
+	s, dialErr := Dial(ctx, spec)
+	if dialErr != nil {
+		return nil, dialErr
 	}
-	defer s.Close()
+	defer func() {
+		if closeErr := s.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("tlsprobe: close session: %w", closeErr)
+		}
+	}()
 	s.ReadModel1()
 	return s.Report(), nil
 }

@@ -232,7 +232,13 @@ func newSimScript(t *testing.T) *simScript {
 		s.epoch++
 		ep := s.epoch
 		s.mu.Unlock()
-		fmt.Fprintf(w, `{"api_version":"1.1.0","epoch":%d}`, ep)
+		// REV0907-H2: the epoch response write is checked and surfaced
+		// through t, not discarded — a broken write here would otherwise
+		// silently strand a test waiting on an epoch bump that never left
+		// the wire.
+		if _, err := fmt.Fprintf(w, `{"api_version":"1.1.0","epoch":%d}`, ep); err != nil {
+			t.Errorf("mutate handler: write epoch response: %v", err)
+		}
 	}
 	mux.HandleFunc("/fault", mutate)
 	mux.HandleFunc("/inject", mutate)

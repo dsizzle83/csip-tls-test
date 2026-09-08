@@ -494,7 +494,7 @@ func TestBASIC009_UnresolvableHomeDeclines(t *testing.T) {
 func TestBASIC009_Composite_M123RefusesWhileConnStClaimsDisconnected(t *testing.T) {
 	const mrid = "CERT-BASIC-009"
 	regs := map[uint16][]uint16{
-		sunspec.ModelImmediateCtrl: m123(t, 1),   // STILL connected — the disconnect did not take
+		sunspec.ModelImmediateCtrl: m123(t, 1),    // STILL connected — the disconnect did not take
 		701:                        meas701(t, 0), // the DER's own status claims disconnected
 	}
 

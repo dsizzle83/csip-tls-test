@@ -39,6 +39,7 @@ import (
 // framer is: a test that drove the tap through the same library the tap parses
 // would not be testing the parse.
 type fakeDevice struct {
+	t  *testing.T
 	ln net.Listener
 
 	mu    sync.Mutex
@@ -55,7 +56,7 @@ func newFakeDevice(t *testing.T) *fakeDevice {
 	if err != nil {
 		t.Fatalf("fake device listen: %v", err)
 	}
-	d := &fakeDevice{ln: ln, excFC: map[uint16]uint8{}, done: make(chan struct{})}
+	d := &fakeDevice{t: t, ln: ln, excFC: map[uint16]uint8{}, done: make(chan struct{})}
 	d.wg.Add(1)
 	go d.serve()
 	t.Cleanup(d.close)
@@ -94,7 +95,14 @@ func (d *fakeDevice) serve() {
 		d.wg.Add(1)
 		go func() {
 			defer d.wg.Done()
-			defer conn.Close()
+			// d.close (t.Cleanup) waits on d.wg before returning, so this
+			// still runs within the test's active lifetime and t.Errorf
+			// here is safe.
+			defer func() {
+				if err := conn.Close(); err != nil {
+					d.t.Errorf("fakeDevice: close conn: %v", err)
+				}
+			}()
 			for {
 				frame, err := readMBAPFrame(conn)
 				if err != nil {

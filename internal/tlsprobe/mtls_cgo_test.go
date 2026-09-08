@@ -231,12 +231,20 @@ func rawWolfHandshake(t *testing.T, target, ca, cert, key string, s Suite) (rx, 
 	if err != nil {
 		t.Fatalf("dial %s: %v", target, err)
 	}
-	defer raw.Close()
+	defer func() {
+		if closeErr := raw.Close(); closeErr != nil {
+			t.Errorf("rawWolfHandshake: close raw connection: %v", closeErr)
+		}
+	}()
 	file, err := raw.(*net.TCPConn).File()
 	if err != nil {
 		t.Fatalf("dup socket: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			t.Errorf("rawWolfHandshake: close duplicated socket: %v", closeErr)
+		}
+	}()
 
 	ssl, err := wolfssl.NewSSL(ctx)
 	if err != nil {

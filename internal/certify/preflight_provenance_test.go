@@ -175,16 +175,16 @@ func TestBuildIdentityMatches(t *testing.T) {
 		claimed, fw, buildID string
 		want                 bool
 	}{
-		{"212253a", "dev", "212253a", true},            // exact against build_id
-		{"212253a", "dev", "212253a1b2c3d", true},      // claimed is a prefix of the longer build_id
-		{"212253a1b2c3d", "dev", "212253a", true},      // build_id is a prefix of the longer claim
-		{"212253a", "dev", "212253a-dirty", true},      // the -dirty suffix does not break the prefix
-		{"V1.4.0", "v1.4.0", "cc93abc", true},          // case-insensitive match against fw
-		{"212253a", "dev", "9999999", false},           // a real mismatch
-		{"212", "dev", "2123456", false},               // too short to prefix-match (avoids trivial hits)
-		{"212", "dev", "212", true},                    // but an exact short match still counts
-		{"212253a", "", "", false},                     // a DUT that reported nothing never matches
-		{"", "dev", "212253a", false},                  // an empty claim never matches
+		{"212253a", "dev", "212253a", true},       // exact against build_id
+		{"212253a", "dev", "212253a1b2c3d", true}, // claimed is a prefix of the longer build_id
+		{"212253a1b2c3d", "dev", "212253a", true}, // build_id is a prefix of the longer claim
+		{"212253a", "dev", "212253a-dirty", true}, // the -dirty suffix does not break the prefix
+		{"V1.4.0", "v1.4.0", "cc93abc", true},     // case-insensitive match against fw
+		{"212253a", "dev", "9999999", false},      // a real mismatch
+		{"212", "dev", "2123456", false},          // too short to prefix-match (avoids trivial hits)
+		{"212", "dev", "212", true},               // but an exact short match still counts
+		{"212253a", "", "", false},                // a DUT that reported nothing never matches
+		{"", "dev", "212253a", false},             // an empty claim never matches
 	}
 	for _, tc := range cases {
 		if got := buildIdentityMatches(tc.claimed, tc.fw, tc.buildID); got != tc.want {

@@ -141,7 +141,11 @@ func (s *stack) do(method, path, body string, out any) (int, string) {
 	if err != nil {
 		s.t.Fatalf("%s %s: %v", method, path, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			s.t.Errorf("%s %s: close response body: %v", method, path, closeErr)
+		}
+	}()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if out != nil && len(raw) > 0 {
 		if err := json.Unmarshal(raw, out); err != nil {

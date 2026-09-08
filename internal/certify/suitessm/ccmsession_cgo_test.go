@@ -29,6 +29,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"log"
 	"math/big"
 	"net"
 	"os"
@@ -122,7 +123,15 @@ func mbapsPeer(t *testing.T) (string, *certify.PKI) {
 
 // serveSunSpec is sim/mbapsdev's dispatch loop reduced to the read path.
 func serveSunSpec(sess *mbtls.Session, regs *sim.RegisterMap) {
-	defer sess.Close()
+	// REV0907-H2: this runs on its own accept-goroutine with no *testing.T
+	// in scope (mirrors sim/mbapsdev/dispatch.go's own dispatchSession,
+	// which reports the same class of teardown error the same way), so the
+	// close error is logged at this goroutine's edge rather than dropped.
+	defer func() {
+		if err := sess.Close(); err != nil {
+			log.Printf("[ccmsession_cgo_test] serveSunSpec: session close: %v", err)
+		}
+	}()
 	for {
 		_ = sess.Conn.SetDeadline(time.Now().Add(20 * time.Second))
 		req, err := mbap.Decode(sess.Conn)

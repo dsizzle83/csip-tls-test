@@ -20,6 +20,7 @@ package tlsprobe
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -112,7 +113,15 @@ func serve(lis *mbtls.Listener, regs *sim.RegisterMap) {
 }
 
 func dispatch(sess *mbtls.Session, regs *sim.RegisterMap) {
-	defer sess.Close()
+	// REV0907-H2: this is an accept-goroutine with no *testing.T in scope
+	// (mirrors sim/mbapsdev/dispatch.go's dispatchSession, which reports
+	// the same class of teardown error the same way), so the close error
+	// is logged at this goroutine's edge rather than dropped.
+	defer func() {
+		if err := sess.Close(); err != nil {
+			log.Printf("[loopback_cgo_test] dispatch: session close: %v", err)
+		}
+	}()
 	for {
 		_ = sess.Conn.SetDeadline(time.Now().Add(20 * time.Second))
 		// mbap.Decode rather than DecodeRequest: Decode is present in every
@@ -286,7 +295,11 @@ func TestOnConnectRunsBeforeTheHandshakeAndCanAbort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close probe session: %v", err)
+		}
+	}()
 	if seen == nil {
 		t.Fatal("OnConnect never ran, so a refused handshake would produce no citable frames")
 	}

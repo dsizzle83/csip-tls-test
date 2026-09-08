@@ -315,13 +315,25 @@ type tapConn struct {
 
 // handle relays one client connection.
 func (t *Tap) handle(id uint64, client net.Conn) {
-	defer client.Close()
+	// REV0907-H2: handle runs on its own per-connection goroutine with no
+	// caller to return a close error to, so both close errors are logged
+	// at this goroutine's edge (matching the upstream-unreachable log just
+	// below) rather than dropped.
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.Printf("[tap] conn %d: close client: %v", id, err)
+		}
+	}()
 	up, err := net.DialTimeout("tcp", t.upstream, 5*time.Second)
 	if err != nil {
 		log.Printf("[tap] upstream %s unreachable: %v", t.upstream, err)
 		return
 	}
-	defer up.Close()
+	defer func() {
+		if err := up.Close(); err != nil {
+			log.Printf("[tap] conn %d: close upstream: %v", id, err)
+		}
+	}()
 
 	c := &tapConn{
 		t:       t,

@@ -73,7 +73,11 @@ func (r *rig) get(t *testing.T, path string) (int, []byte) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Errorf("GET %s: close response body: %v", path, closeErr)
+		}
+	}()
 	buf := make([]byte, 1<<20)
 	n, _ := resp.Body.Read(buf)
 	return resp.StatusCode, buf[:n]
@@ -85,7 +89,11 @@ func (r *rig) post(t *testing.T, path, body string) (int, []byte) {
 	if err != nil {
 		t.Fatalf("POST %s: %v", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Errorf("POST %s: close response body: %v", path, closeErr)
+		}
+	}()
 	buf := make([]byte, 1<<20)
 	n, _ := resp.Body.Read(buf)
 	return resp.StatusCode, buf[:n]
