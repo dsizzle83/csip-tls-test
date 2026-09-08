@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -178,9 +179,12 @@ func TestPreflightRefusesAnUnreachableAdminAPI(t *testing.T) {
 	}
 }
 
-// A simulator too old to describe itself is reported, not refused. An unproven
-// pairing is weaker than a proven one but it is not a proven mismatch, and
-// refusing every previously-built gridsim would make -skip-preflight a habit.
+// A simulator too old to describe itself is reported, not refused, on an
+// EXPLORATORY run: an unproven pairing is weaker than a proven one but it is
+// not a proven mismatch, and refusing every previously-built gridsim would
+// make -skip-preflight a habit. (A GATING campaign refuses it outright — see
+// TestWeakeningSwitchesRefuseGatingRecordExploratory in
+// preflight_weakened_test.go.)
 func TestPreflightReportsAGridsimThatCannotDescribeItself(t *testing.T) {
 	admin := gridsimAdmin(t, 3, "")
 	r, rep, console := preflightRunner(t, func(o *Options) {
@@ -190,8 +194,11 @@ func TestPreflightReportsAGridsimThatCannotDescribeItself(t *testing.T) {
 	if err := r.preflight(context.Background(), rep); err != nil {
 		t.Fatalf("a gridsim predating the data_plane field was refused: %v", err)
 	}
-	if !strings.Contains(console.String(), "NOT established") {
+	if !strings.Contains(console.String(), "could not be proven") {
 		t.Errorf("the unproven pairing is not reported as unproven:\n%s", console)
+	}
+	if !reflect.DeepEqual(r.weakened, []string{WeakenedNoDataPlane}) {
+		t.Errorf("the unproven pairing was not recorded as weakened: %v", r.weakened)
 	}
 }
 

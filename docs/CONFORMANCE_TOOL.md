@@ -210,6 +210,15 @@ bin/certify -doc SSM-CONF-v0.8 -dry-run
 # scripts/lab/lab-sims-up.sh run every sim from $LEXA_SIM_RUNDIR (default
 # /tmp/lexa-sims), never this repo's root, so that file lands there — it
 # never reaches the repo checkout.
+#
+# Because -keylog names a file shared across every run and every leg,
+# capture/*.keylog inside the bundle is NOT a copy of it: at write time the
+# bundle keeps only the lines whose client random names a TLS session
+# capture/*.pcapng actually contains, and drops the rest (a malformed source
+# line is dropped too, counted rather than aborting the write). A bundle
+# built against 69.0.0.2:802 ships secrets for that session and no other —
+# not the CSIP leg captured five minutes earlier, not another operator's run
+# against the same shared file (REV0907-E5).
 bin/certify-keylog \
     -target 69.0.0.2:802 -iface enp1s0 \
     -pki certs/mbaps -gridsim-admin http://69.0.0.20:11114 \
@@ -269,6 +278,10 @@ not evidence** and must not be submitted.
 | `-cap TAG` | assert a capability the runner cannot detect (e.g. `root`) |
 | `-timeout` | per-check timeout (default 3 m) |
 | `-require-coverage` | fail the run if an applicable case has no implementation |
+| `-campaign` | select a CLOSED, named certification lane (`csip`, `mbaps`, `modbus-client`) instead of `-suite`/`-doc`/`-uid`. It is the only way to produce a GATING bundle (`campaign.gating` — see `-verify` below); every other invocation is EXPLORATORY and non-gating. |
+| `-require-citation` | downgrade a PASS with no re-checkable citation to WARN (default `true`). On a GATING campaign, `-require-citation=false` is **REFUSED outright** (REV0907-E3: an uncited PASS is not a claim a third party can re-check against the capture) — it is honored, and recorded in the bundle's `campaign.weakened`, only on an EXPLORATORY run. |
+| `-skip-preflight` | do not verify that `-gridsim` and `-gridsim-admin` are one live process. On a GATING campaign this is **REFUSED outright** (REV0907-E3: a certification bundle may not rest on an unproven pairing) — it is honored, and recorded in `campaign.weakened`, only on an EXPLORATORY run. |
+| `-allow-dirty` | let a GATING campaign run against a dirty harness worktree. When it actually waves one through, the bundle is recorded WEAKENED and written **NOT GATING** regardless of `-campaign` — a bundle may never claim both (`-verify` fails one that does). |
 | `-operator` `-note` `-dut-*` | recorded in the bundle |
 
 ### `-writes`: what the gateway actually wrote

@@ -33,11 +33,24 @@ package certify
 //
 // What preflight will NOT do is guess. It checks only what it can establish:
 // that the two flags name one host, and that the process answering the admin
-// port says it serves the data-plane port the flags point the DUT at. A gridsim
-// too old to answer the second question is reported and allowed — an unproven
-// pairing is a weaker position than a proven one, but it is not the same thing
-// as a proven mismatch, and refusing to run against every previously-built
-// simulator would make this check something operators disable by habit.
+// port says it serves the data-plane port the flags point the DUT at.
+//
+// # An unprovable pairing is not a merely-weaker one (REV0907-E3)
+//
+// -skip-preflight and a gridsim too old to report its own data-plane address
+// both mean the same thing: this run cannot establish that -gridsim and
+// -gridsim-admin name one live process. That used to be reported and allowed
+// unconditionally — an unproven pairing is a weaker position than a proven
+// one, but it is not the same thing as a proven mismatch, and refusing to run
+// against every previously-built simulator would make this check something
+// operators disable by habit. The gap was that this held on a GATING campaign
+// too: a certification bundle could rest on server-side observations from a
+// process nothing had confirmed was the one the DUT dialled. Both cases now go
+// through unprovable (below), which keeps exactly that WARN-and-continue
+// posture on an exploratory run and refuses a GATING one outright — a
+// certification bundle may not rest on a precondition this run did not
+// establish, and the run's use of the switch is recorded in
+// bundle.CampaignRecord.Weakened either way (see Runner.recordWeakened).
 
 import (
 	"context"
@@ -60,6 +73,44 @@ const preflightTimeout = 10 * time.Second
 const SkipPreflightNote = "preflight SKIPPED (-skip-preflight): the run did not verify that -gridsim and " +
 	"-gridsim-admin name one live process, so any claim resting on gridsim's server-side observations " +
 	"assumes a pairing this bundle does not evidence"
+
+// Weakening switch keys, exactly as they are written into
+// bundle.CampaignRecord.Weakened. Spelled once here so every recordWeakened
+// call site, this package's tests, and a reader of a bundle's JSON agree on the
+// string. See recordWeakened and REV0907-E3.
+const (
+	// WeakenedSkipPreflight is recorded whenever -skip-preflight left the
+	// -gridsim/-gridsim-admin pairing unverified.
+	WeakenedSkipPreflight = "skip-preflight"
+	// WeakenedNoDataPlane is recorded whenever the gridsim admin API answered
+	// but reported no data-plane address, leaving the pairing unprovable the
+	// same way -skip-preflight does.
+	WeakenedNoDataPlane = "no-data-plane"
+	// WeakenedRequireCitationFalse is recorded whenever -require-citation=false
+	// let an uncited PASS stand as PASS instead of being downgraded to WARN.
+	WeakenedRequireCitationFalse = "require-citation=false"
+	// WeakenedAllowDirty is recorded whenever -allow-dirty actually waved a
+	// dirty or unidentifiable harness worktree through.
+	WeakenedAllowDirty = "allow-dirty"
+)
+
+// recordWeakened appends a weakening-switch key (one of the Weakened* constants
+// above) to this run's audit trail, deduplicated, so writeBundle can carry it
+// into bundle.CampaignRecord.Weakened.
+//
+// It is called on every run where the switch was in effect, gating or not —
+// calling it before a GATING campaign's refusal is harmless, since that run
+// aborts before writeBundle is ever reached and nothing reads the entry, and
+// recording it unconditionally is simpler than threading the gating decision
+// through every call site a second time. See REV0907-E3.
+func (r *Runner) recordWeakened(key string) {
+	for _, k := range r.weakened {
+		if k == key {
+			return
+		}
+	}
+	r.weakened = append(r.weakened, key)
+}
 
 // unprovable renders a preflight precondition that could NOT be established —
 // the one shape every candidate/bench preflight has more than one of, spelled
@@ -97,9 +148,12 @@ func (r *Runner) unprovable(reporter *Reporter, what, detail string) error {
 // exists. It returns an error the caller should abandon the run on.
 func (r *Runner) preflight(ctx context.Context, reporter *Reporter) error {
 	if r.opts.SkipPreflight {
-		reporter.Line("preflight SKIPPED (-skip-preflight) — the -gridsim / -gridsim-admin pairing is " +
-			"unverified for this run, and the bundle records that")
-		return nil
+		r.recordWeakened(WeakenedSkipPreflight)
+		return r.unprovable(reporter,
+			"the -gridsim / -gridsim-admin pairing (-skip-preflight was passed)",
+			"the run did not check that -gridsim and -gridsim-admin name one live process — the orphan-"+
+				"and-replacement shape this file's own header documents. Drop -skip-preflight, or run "+
+				"exploratory (no -campaign)")
 	}
 
 	data, admin := r.opts.Targets.GridSim, r.opts.Targets.GridSimAdmin
@@ -156,10 +210,12 @@ func (r *Runner) preflight(ctx context.Context, reporter *Reporter) error {
 			"indistinguishable from a silent DUT", admin, err)
 	}
 	if st.DataPlane == "" {
-		reporter.Line("preflight: %s answers but reports no data-plane address (a gridsim built before it "+
-			"published one), so it is NOT established that it is the same process serving -gridsim %s",
-			admin, data)
-		return nil
+		r.recordWeakened(WeakenedNoDataPlane)
+		return r.unprovable(reporter,
+			fmt.Sprintf("the -gridsim / -gridsim-admin pairing (%s reports no data-plane address)", admin),
+			fmt.Sprintf("a gridsim built before it published data_plane cannot prove it is the same process "+
+				"serving -gridsim %s. Rebuild gridsim to a version that reports data_plane before running a "+
+				"gating campaign", data))
 	}
 	if err := sameListener(st.DataPlane, data); err != nil {
 		return fmt.Errorf("certify: preflight: the process answering %s (pid %d) serves its 2030.5 data "+
@@ -172,6 +228,29 @@ func (r *Runner) preflight(ctx context.Context, reporter *Reporter) error {
 	reporter.Line("preflight: gridsim pid %d serves %s and answers on %s — one process, both ports"+
 		pollRateSuffix(st.PollRateS), st.PID, st.DataPlane, admin)
 	return nil
+}
+
+// preflightCitation refuses a GATING run whose -require-citation=false would
+// let an uncited PASS stand as though it were a re-checkable claim.
+//
+// finalise's uncited-PASS rule (runner.go) is what makes a PASS in this
+// engine's bundles a claim a third party can re-derive rather than a narrated
+// one: a case that rolls up to PASS but carries no assertion bundle.Verify can
+// re-derive from the capture is downgraded to WARN. -require-citation=false
+// exists for framework development, where end-to-end digest wiring is not yet
+// complete everywhere; it has no legitimate use on a bundle meant to decide a
+// release, because it is exactly the switch that lets an unproven PASS stand
+// as PASS. See REV0907-E3.
+func (r *Runner) preflightCitation(reporter *Reporter) error {
+	if r.opts.RequireCitation {
+		return nil
+	}
+	r.recordWeakened(WeakenedRequireCitationFalse)
+	return r.unprovable(reporter,
+		"that every PASS in this run is citable (-require-citation=false was passed)",
+		"an uncited PASS is not a claim a third party can re-check against the capture, and "+
+			"-require-citation=false is exactly the switch that lets one stand as PASS instead of being "+
+			"downgraded to WARN. Drop -require-citation=false, or run exploratory (no -campaign)")
 }
 
 func pollRateSuffix(seconds uint32) string {

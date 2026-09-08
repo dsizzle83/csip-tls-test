@@ -401,6 +401,25 @@ type CampaignRecord struct {
 	Gating bool `json:"gating"`
 	// Exploratory records why a run is non-gating, when it is.
 	Exploratory string `json:"exploratory,omitempty"`
+	// Weakened lists every evidence-weakening switch that was in effect while
+	// this bundle was produced — "skip-preflight", "require-citation=false",
+	// "allow-dirty", "no-data-plane" are the ones internal/certify's runner
+	// writes today (see its Weakened* constants and Runner.recordWeakened),
+	// and any future weakening switch belongs in this same list rather than
+	// only in free prose, so a reader — human or CI gate — can see it without
+	// grepping RunMeta.Note.
+	//
+	// A GATING bundle (Gating true) must never carry a non-empty Weakened: the
+	// two claims contradict each other — one says this evidence may decide a
+	// release, the other says a precondition that decision rests on was
+	// asserted rather than proven. The runner that writes this package's
+	// bundles enforces that by construction (a GATING campaign refuses every
+	// weakening switch outright, except -allow-dirty, which instead drops the
+	// run out of Gating the moment it actually waves something through), and
+	// Verify refuses the combination defensively for every bundle this package
+	// did not itself just write — a hand-edited one, or one written by a
+	// runner version this package does not trust. See REV0907-E3.
+	Weakened []string `json:"weakened,omitempty"`
 }
 
 // CandidateRef identifies the candidate manifest a run was measured against.

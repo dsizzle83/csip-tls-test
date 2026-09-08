@@ -397,18 +397,25 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.Targets.MBAPSDevAPI, "mbapsdev-api", o.Targets.MBAPSDevAPI, "mbapsdev simapi base URL")
 	fs.DurationVar(&o.CheckTimeout, "timeout", o.CheckTimeout, "per-check timeout")
 	fs.Var(keyValue{&o.Params}, "param", "procedure parameter key=value (repeatable)")
-	fs.BoolVar(&o.RequireCitation, "require-citation", o.RequireCitation, "downgrade a PASS with no re-checkable citation to WARN")
+	fs.BoolVar(&o.RequireCitation, "require-citation", o.RequireCitation,
+		"downgrade a PASS with no re-checkable citation to WARN. On a GATING campaign, "+
+			"-require-citation=false is REFUSED outright (REV0907-E3: an uncited PASS is not a claim a "+
+			"third party can re-check); it is honored, and recorded in the bundle's campaign.weakened, "+
+			"only on an EXPLORATORY run")
 	fs.BoolVar(&o.RequireCoverage, "require-coverage", o.RequireCoverage, "fail the run if an applicable test case has no implementation")
 	fs.BoolVar(&o.SkipPreflight, "skip-preflight", o.SkipPreflight,
 		"do not verify that -gridsim and -gridsim-admin are one live process (for topologies where they "+
-			"legitimately differ; the bundle records that the check was skipped). It does NOT wave "+
-			"through a WRONG control-authority reading: its only effect there is to let an EXPLORATORY "+
-			"run with no gateway transport proceed, non-gating")
+			"legitimately differ). On a GATING campaign this is REFUSED outright (REV0907-E3: a "+
+			"certification bundle may not rest on an unproven pairing); it is honored, and recorded in "+
+			"the bundle's campaign.weakened, only on an EXPLORATORY run. It does NOT wave through a WRONG "+
+			"control-authority reading: its only effect there is to let an EXPLORATORY run with no gateway "+
+			"transport proceed, non-gating")
 	fs.BoolVar(&o.AllowDirty, "allow-dirty", o.AllowDirty,
 		"let a GATING campaign run against a DIRTY harness worktree (or one whose HEAD cannot be "+
 			"determined). Off by default: cert evidence must be reproducible from a named commit, so a "+
-			"gating run normally refuses an uncommitted tree. Its use and the harness HEAD are recorded "+
-			"in the bundle")
+			"gating run normally refuses an uncommitted tree. When it actually waves one through, the use "+
+			"and the harness HEAD are recorded in the bundle (campaign.weakened) and the bundle is written "+
+			"NOT GATING regardless of -campaign — a bundle may never claim both")
 	fs.StringVar(&o.Preset, "preset", o.Preset,
 		"fill in the bench addresses for a named topology — "+PresetSummary()+
 			". Flags given explicitly always win")
@@ -680,6 +687,16 @@ type Runner struct {
 	// (manifest, provenance) need to run against a fake DUT in a test, mirroring
 	// the Gateway.Runner the authority preflight's own tests inject directly.
 	gwRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
+
+	// weakened is the audit trail of evidence-weakening switches (the
+	// Weakened* constants in preflight.go) actually in effect for the run in
+	// progress, appended to by Runner.recordWeakened as each one is found. A
+	// GATING campaign refuses every one of them except -allow-dirty, and Run
+	// drops a run out of Gating (RunReport.Exploratory) the moment -allow-dirty
+	// actually waves something through — so a bundle this package writes never
+	// carries campaign.gating=true beside a non-empty campaign.weakened. See
+	// writeBundle and REV0907-E3.
+	weakened []string
 }
 
 // gateway builds the READ-ONLY introspection client for this run. One
@@ -1010,6 +1027,15 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 		return rep, nil
 	}
 
+	// Before anything else: -require-citation=false is a weakening switch of
+	// exactly the same shape as -skip-preflight and -allow-dirty below, and it
+	// costs nothing to check before the bench is even touched. See
+	// preflightCitation and REV0907-E3.
+	if err := r.preflightCitation(reporter); err != nil {
+		rep.Finished = time.Now().UTC()
+		return rep, err
+	}
+
 	// Before the capture, before the PKI, before anything that costs a bench:
 	// establish that the topology the flags describe is the topology that
 	// exists. A run that discovers this at the end discovers it as forty
@@ -1028,6 +1054,23 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 	// bundle's DUT record months later. See preflight_provenance.go.
 	prov, err := r.preflightProvenance(ctx, reporter)
 	rep.Provenance = prov
+	// -allow-dirty is the one weakening switch that still has a legitimate
+	// override on a GATING campaign (preflight_provenance.go's checkHarnessTree
+	// lets it through rather than refusing outright), so it is the one case
+	// this file's own refusals above do not cover. When it actually waved a
+	// dirty or unidentifiable tree through, the run is recorded WEAKENED and —
+	// same condition provenanceNote already tests, so the two cannot disagree
+	// about what "actually waved through" means — dropped out of Gating: a
+	// bundle may never claim both (see writeBundle and REV0907-E3).
+	if prov.AllowDirtyUsed && (prov.Dirty || prov.HarnessHead == "") {
+		r.recordWeakened(WeakenedAllowDirty)
+		if rep.Exploratory == "" {
+			rep.Exploratory = fmt.Sprintf("-allow-dirty waved a DIRTY or unidentifiable harness worktree "+
+				"through what -campaign %s declared: this evidence's grading logic is not reproducible "+
+				"from a named commit, so it may not decide anything regardless of what -campaign asked for",
+				r.campaign.Name)
+		}
+	}
 	if err != nil {
 		rep.Finished = time.Now().UTC()
 		return rep, err
@@ -1769,6 +1812,21 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 		Started: rep.Started, Finished: time.Now().UTC(),
 		DUT: r.opts.DUT,
 	})
+	// The evidence-weakening switches actually in effect for this run —
+	// -skip-preflight, -require-citation=false, an old gridsim's unreported
+	// data_plane, -allow-dirty when it waved something — travel in the
+	// campaign record as Weakened, from the audit trail the corresponding
+	// preflight check populated (recordWeakened, preflight.go). Sorted so two
+	// bundles built from the same flags produce byte-identical JSON. A GATING
+	// run never reaches this line carrying one: every switch above except
+	// -allow-dirty refuses a GATING campaign outright, and -allow-dirty drops
+	// the run out of Gating (rep.Exploratory) the moment it actually waves a
+	// dirty tree through — but bundle.Verify still refuses the gating+weakened
+	// combination defensively, because this package cannot make every future
+	// writer of a bundle.json prove it. See REV0907-E3.
+	weakened := append([]string(nil), r.weakened...)
+	sort.Strings(weakened)
+
 	// The campaign record: what this bundle is evidence FOR, and whether it may
 	// decide anything. Written on every run, exploratory ones included — "this
 	// bundle is not gating" is a fact a CI gate must be able to read directly
@@ -1778,6 +1836,7 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 		Suites:      append([]string(nil), rep.Campaign.Suites...),
 		Gating:      rep.Gating(),
 		Exploratory: rep.Exploratory,
+		Weakened:    weakened,
 	}
 	if rep.Authority.Required != AuthorityAny {
 		campaign.Authority = string(rep.Authority.Required)

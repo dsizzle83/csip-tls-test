@@ -64,6 +64,14 @@ type VerifyReport struct {
 	// CasesRolledUp counts the test cases whose stored verdict was re-derived
 	// from their own printed assertions (verifyCaseVerdicts).
 	CasesRolledUp int `json:"cases_rolled_up,omitempty"`
+	// Campaign carries the bundle's own campaign record forward into the
+	// verification report, so a reader — a human reading String(), or a
+	// machine reading -verify -json — sees whether this bundle claims to be
+	// GATING and what, if anything, WEAKENED it without separately opening
+	// bundle.json. Nil on a bundle that declares no campaign record at all
+	// (every bundle written before campaigns existed, and no bundle this
+	// package writes today). See verifyCampaignWeakening and REV0907-E3.
+	Campaign *CampaignRecord `json:"campaign,omitempty"`
 }
 
 // Verify re-checks a bundle directory from nothing but its own contents.
@@ -101,6 +109,7 @@ func Verify(dir string) (*VerifyReport, error) {
 		return nil, err
 	}
 	rep.Schema = b.Schema
+	rep.Campaign = b.Run.Campaign
 
 	if err := verifyManifest(dir, rep); err != nil {
 		return rep, err
@@ -121,6 +130,7 @@ func Verify(dir string) (*VerifyReport, error) {
 	// that its verdicts do not follow from its evidence.
 	verifyTimebases(b, rep)
 	verifyCaseVerdicts(b, rep)
+	verifyCampaignWeakening(b, rep)
 
 	if b.Files.Capture == "" {
 		rep.problem("bundle declares no capture file; no assertion can be re-checked against the wire")
@@ -347,6 +357,36 @@ func assertionVerdicts(c TestCaseResult) string {
 	return strings.Join(parts, ", ")
 }
 
+// verifyCampaignWeakening refuses a bundle that claims to be both GATING and
+// WEAKENED.
+//
+// # Why this is fatal rather than a disclosure
+//
+// CampaignRecord.Gating is the one field a CI gate reads to decide whether a
+// bundle may decide a release; CampaignRecord.Weakened is the audit trail of
+// evidence-weakening switches (-skip-preflight, -require-citation=false, an
+// unproven gridsim data-plane pairing, an -allow-dirty that actually waved a
+// dirty tree through…) that were in effect while it was produced. The runner
+// this package ships beside (internal/certify) never writes both fields
+// non-empty on the same record — a GATING campaign refuses every weakening
+// switch outright except -allow-dirty, and that one drops the run out of
+// Gating the instant it actually waves something through (see
+// internal/certify/runner.go's writeBundle). A bundle presenting both anyway
+// is therefore either hand-edited or written by a runner version this package
+// does not trust, and either way a reader who checks only campaign.gating==true
+// must not be told "you may certify from this" — see REV0907-E3, the finding
+// this whole file's fail-open weakening switches were closed for.
+func verifyCampaignWeakening(b *Bundle, rep *VerifyReport) {
+	c := b.Run.Campaign
+	if c == nil || !c.Gating || len(c.Weakened) == 0 {
+		return
+	}
+	rep.problem(fmt.Sprintf("campaign %q records gating=true AND weakened evidence (%s): a bundle may not "+
+		"claim both — GATING says this evidence may decide a release, WEAKENED says a precondition that "+
+		"decision rests on was asserted rather than proven", c.Name, strings.Join(c.Weakened, ", ")))
+	rep.OK = false
+}
+
 // reassemble rebuilds every TCP connection GENERATION so byte-range citations
 // can be resolved, and returns the netdis.Assembler itself rather than a
 // flattened "src > dst" -> Direction map.
@@ -565,6 +605,23 @@ func (r *VerifyReport) String() string {
 	fmt.Fprintf(&sb, "Bundle:   %s\n", r.Dir)
 	fmt.Fprintf(&sb, "Schema:   %s\n", r.Schema)
 	fmt.Fprintf(&sb, "Capture:  %d frames\n", r.Packets)
+	// The campaign posture goes ahead of every check result: whether a reader
+	// may act on anything below depends on it. WEAKENED is printed whenever it
+	// is non-empty, gating or not, so a reader sees a switch was used even on a
+	// bundle that never claimed to be gating in the first place; GATING beside
+	// a non-empty WEAKENED is the contradiction verifyCampaignWeakening already
+	// failed the run over, restated here so it is not missed among the other
+	// problems.
+	if c := r.Campaign; c != nil && c.Name != "" {
+		posture := "NOT GATING"
+		if c.Gating {
+			posture = "GATING"
+		}
+		fmt.Fprintf(&sb, "Campaign: %s — %s\n", c.Name, posture)
+		if len(c.Weakened) > 0 {
+			fmt.Fprintf(&sb, "          ⚠ WEAKENED EVIDENCE: %s\n", strings.Join(c.Weakened, ", "))
+		}
+	}
 	fmt.Fprintf(&sb, "%s\n", strings.Repeat("─", 72))
 
 	badFiles := 0
