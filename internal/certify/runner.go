@@ -30,6 +30,7 @@ package certify
 
 import (
 	"context"
+	"crypto/ed25519"
 	"flag"
 	"fmt"
 	"io"
@@ -122,6 +123,14 @@ type Options struct {
 	// KeyLogPath is where TLS secrets are exported (SSLKEYLOGFILE). Empty
 	// means encrypted payloads are not decryptable from the bundle.
 	KeyLogPath string
+	// SignKeyPath is the operator's ed25519 signing key (-sign-key), a PKCS#8
+	// PEM file as bundle.GenerateSignKey writes one. When set, the written
+	// bundle's MANIFEST.sha256 carries a detached signature
+	// (bundle.ManifestSigFile) a lab can check with -verify -pubkey. Empty
+	// means the bundle is UNSIGNED — a hash-only internal-consistency check,
+	// which a GATING campaign refuses to produce (see preflightSigning,
+	// WP7-T4, REV0907-E4).
+	SignKeyPath string
 	// Guard overrides the per-window attribution guard.
 	Guard time.Duration
 	// CaptureSettle is how long the runner waits between the last check
@@ -372,6 +381,12 @@ func (o *Options) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&o.BPF, "bpf", o.BPF, "capture filter (empty captures everything)")
 	fs.BoolVar(&o.NoCapture, "no-capture", o.NoCapture, "run without a packet capture (no wire citations are then possible)")
 	fs.StringVar(&o.KeyLogPath, "keylog", o.KeyLogPath, "NSS key log the suites export TLS secrets to")
+	fs.StringVar(&o.SignKeyPath, "sign-key", o.SignKeyPath,
+		"ed25519 signing key (PKCS#8 PEM, from certify -gen-sign-key) to sign the bundle's MANIFEST.sha256 "+
+			"with. On a GATING campaign this is REQUIRED — an unsigned manifest detects piecemeal tampering "+
+			"but not a whole-bundle rewrite that rehashes itself to agree (REV0907-E4), so a run with no "+
+			"-sign-key is refused outright rather than producing evidence that could decide a release "+
+			"unsigned; it is honored, unsigned, only on an EXPLORATORY run (no -campaign)")
 	fs.DurationVar(&o.Guard, "guard", o.Guard, "frame-attribution guard at each end of a check's window")
 	fs.DurationVar(&o.CaptureSettle, "capture-settle", o.CaptureSettle,
 		"pause before stopping the capture so it flushes the last check's frames (0 = default, <0 = none)")
@@ -678,6 +693,9 @@ type Runner struct {
 	campaign CampaignSpec
 	// manifest is the loaded candidate manifest, nil when none was given.
 	manifest *manifest.Manifest
+	// signKey is the loaded -sign-key, nil when none was given — the bundle
+	// this run writes is then unsigned. See preflightSigning.
+	signKey ed25519.PrivateKey
 	// gatewayExec is -gateway-exec split into an argv, once, at construction —
 	// so a malformed prefix is a startup error rather than a failure on the
 	// first introspection call, forty minutes in.
@@ -749,6 +767,17 @@ func New(reg *Registry, cat *Catalog, opts Options) (*Runner, error) {
 			return nil, err
 		}
 	}
+	// The signing key is loaded here, at construction, on the same terms as
+	// the manifest just above: a bad -sign-key file is a startup error, not a
+	// surprise forty minutes into a bench run when writeBundle tries to sign
+	// with it.
+	var signKey ed25519.PrivateKey
+	if opts.SignKeyPath != "" {
+		signKey, err = bundle.LoadSignKey(opts.SignKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("certify: -sign-key: %w", err)
+		}
+	}
 	if err := cat.Validate(opts.Filter()); err != nil {
 		return nil, err
 	}
@@ -799,6 +828,7 @@ func New(reg *Registry, cat *Catalog, opts Options) (*Runner, error) {
 		out:         opts.Out,
 		campaign:    spec,
 		manifest:    cand,
+		signKey:     signKey,
 		gatewayExec: gatewayExec,
 	}
 	if r.log == nil {
@@ -1032,6 +1062,15 @@ func (r *Runner) Run(ctx context.Context) (*RunReport, error) {
 	// costs nothing to check before the bench is even touched. See
 	// preflightCitation and REV0907-E3.
 	if err := r.preflightCitation(reporter); err != nil {
+		rep.Finished = time.Now().UTC()
+		return rep, err
+	}
+
+	// Same discipline, same cost (none — this is a nil check, not a bench
+	// round trip): a GATING campaign with no -sign-key would write evidence
+	// whose manifest only a hash, never a signature, speaks for. See
+	// preflightSigning and WP7-T4.
+	if err := r.preflightSigning(reporter); err != nil {
 		rep.Finished = time.Now().UTC()
 		return rep, err
 	}
@@ -1865,6 +1904,9 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 		if _, err := os.Stat(r.opts.KeyLogPath); err == nil {
 			b.SetKeyLog(r.opts.KeyLogPath)
 		}
+	}
+	if r.signKey != nil {
+		b.SetSignKey(r.signKey)
 	}
 	// The per-test captures a governing document names, under exactly those
 	// names, beside the run capture they were cut from.

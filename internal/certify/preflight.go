@@ -253,6 +253,38 @@ func (r *Runner) preflightCitation(reporter *Reporter) error {
 			"downgraded to WARN. Drop -require-citation=false, or run exploratory (no -campaign)")
 }
 
+// preflightSigning refuses a GATING run with no -sign-key.
+//
+// A hash-only MANIFEST.sha256 detects piecemeal tampering — edit one byte and
+// the digest stops agreeing — but not the shape REV0907-E4 names: rewrite the
+// WHOLE bundle, capture included, and rehash the manifest to agree with the
+// rewrite, and every check bundle.Verify runs still passes, because internal
+// consistency is all a hash ever claimed to establish (see
+// bundle.Verify's own doc). A detached ed25519 signature over the manifest
+// closes that gap — see bundle/sign.go — but only if one was actually taken,
+// which needs a key the run was given.
+//
+// This is deliberately NOT recorded in bundle.CampaignRecord.Weakened the way
+// -skip-preflight, -require-citation=false and an unprovable gridsim pairing
+// are (see recordWeakened): every one of THOSE switches has a legitimate,
+// recorded EXPLORATORY use — an operator's development run that -campaign
+// would otherwise treat the same as a certification attempt. An unsigned
+// GATING campaign has no analogous legitimate shape to disclose, because
+// unprovable's own gating branch refuses the run before writeBundle is ever
+// reached: no bundle this package writes ever carries campaign.gating=true,
+// so there is nothing for a Weakened entry to describe that a reader could
+// ever actually see.
+func (r *Runner) preflightSigning(reporter *Reporter) error {
+	if r.signKey != nil {
+		return nil
+	}
+	return r.unprovable(reporter,
+		"that this bundle's manifest will be SIGNED (-sign-key was not passed)",
+		"an unsigned MANIFEST.sha256 detects piecemeal tampering but not a whole-bundle rewrite that "+
+			"rehashes itself to agree (REV0907-E4). Pass -sign-key (see certify -gen-sign-key), or run "+
+			"exploratory (no -campaign)")
+}
+
 func pollRateSuffix(seconds uint32) string {
 	if seconds == 0 {
 		return ""

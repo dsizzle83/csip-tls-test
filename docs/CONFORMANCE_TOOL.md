@@ -457,11 +457,19 @@ runs/2026-07-26/
 ├── REPORT.md            the human-readable report, frames cited inline
 ├── COVERAGE.md          coverage of the catalog for THIS selection, gaps by name
 ├── MANIFEST.sha256      sha256 of every file — plain `sha256sum -c` format
+├── MANIFEST.sha256.sig  detached ed25519 signature over MANIFEST.sha256 (only when
+│                        the run was given -sign-key — see §4, "Signing")
 ├── catalog.json         the specification the run was measured against
 └── capture/
     ├── run-<ts>.pcapng  the packet capture
-    └── run-<ts>.keylog  NSS key log (keylog build only)
+    └── run-<ts>.keylog  NSS key log (keylog build only), FILTERED to this
+                          bundle's own capture — see "The key log is filtered
+                          to this bundle" below
 ```
+
+`bundle.json`'s `run.keylog` field (`{lines_kept, lines_dropped}`, present only
+when a key log was set) records the filtering result described below without a
+reader having to re-derive it — see "The key log is filtered to this bundle".
 
 An **assertion** is one checkable claim. It carries the claim in prose, the
 method, the verdict, what was observed — and a citation:
@@ -520,6 +528,30 @@ Everything every run driver in `runs/` has ever passed is inside it; byte-offset
 expressions (`tcp[13] & 2 != 0`), link-layer primitives (`ether`, `vlan`) and
 length tests (`greater`) are not, and say so.
 
+### The key log is filtered to this bundle
+
+The bench sims run with one shared, append-mode key log
+(`-keylog /tmp/bench-shared.keylog`), written across every run and every leg —
+the other campaign that ran an hour ago, the other leg of a split bench, a
+developer poking a sim by hand. Copying that file verbatim into a bundle would
+ship TLS secrets for sessions that have nothing to do with the evidence a
+reviewer is looking at: a bundle that let a lab decrypt traffic outside its own
+claims (REV0907-E5).
+
+So `capture/*.keylog` inside a bundle is **not** a copy of the source key log.
+At write time it keeps only the lines whose client random names a TLS session
+`capture/*.pcapng` actually contains — the client random is unencrypted on the
+wire in both TLS 1.2 and 1.3, so the capture alone tells the filter which
+sessions belong — and drops the rest; a malformed source line is dropped too,
+counted rather than aborting the write. `bundle.json`'s `run.keylog` records
+how many lines survived and how many did not (`{lines_kept, lines_dropped}`),
+so a reader sees the filtering result without re-deriving it, and `-verify`
+independently re-derives the client-random set from the shipped capture and
+refuses a bundle whose key log carries even one **orphan** — a secret for a
+session the capture does not contain — naming the orphan's client random. A
+properly filtered bundle has none; a non-empty result means the filter was
+bypassed, failed, or the bundle was hand-edited after the fact.
+
 ### The three ways this tool could lie, and what stops each
 
 1. **A PASS it never asserted.** After the citation phase every PASS is
@@ -553,9 +585,15 @@ sitting in that directory, that
 
 * every file is byte-for-byte what `MANIFEST.sha256` says (so the capture has
   not been edited since the report was written),
-* every frame an assertion cites exists in that capture, and
+* every frame an assertion cites exists in that capture,
 * the bytes at every cited stream offset hash to the value recorded in the
-  assertion.
+  assertion, and
+* the key log — when the bundle carries one — names no session outside the
+  capture it ships beside (the previous section).
+
+With `-pubkey <public key PEM>` it additionally checks `MANIFEST.sha256`'s
+ed25519 signature against that key ("Signing", below) — the one check that
+survives a rewrite of the whole bundle, not just of one file in it.
 
 Someone who does not want to run our binary at all can do most of it with
 standard tools:
@@ -566,6 +604,10 @@ wireshark capture/run-*.pcapng                        # go to the cited frame nu
 # For encrypted payloads: Preferences → Protocols → TLS → (Pre)-Master-Secret log
 # and point it at capture/run-*.keylog. The plaintext Wireshark then shows is
 # what the assertions quote.
+# To check the signature (needs openssl 3.x, which speaks ed25519 natively):
+openssl pkeyutl -verify -pubin -inkey sign-ed25519.pub -rawin \
+  -in MANIFEST.sha256 -sigfile <(python3 -c "import json,base64,sys; \
+  sys.stdout.buffer.write(base64.b64decode(json.load(open('MANIFEST.sha256.sig'))['sig']))")
 ```
 
 Or rebuild the verifier from source with nothing but a Go toolchain — the
@@ -575,19 +617,66 @@ evidence engine is pure Go, no cgo, no third-party dependencies:
 CGO_ENABLED=0 go build ./internal/evidence/...
 ```
 
-### What verification deliberately does NOT claim
+### What verification deliberately does NOT claim, without a public key
 
-**The manifest is not signed.** Verification detects corruption and piecemeal
-tampering — change a byte in the capture and the hashes stop agreeing with the
-report — but somebody who rewrites the whole bundle can rewrite the manifest
-too. What it establishes is *internal consistency*: the report's claims and the
-capture in front of you describe the same traffic. Non-repudiation needs a
-signature or a trusted timestamp over the manifest, which is a deployment
-decision this tool cannot fake.
+**A hash-only `-verify` establishes internal consistency, not who produced the
+bundle.** It detects corruption and piecemeal tampering — change a byte in the
+capture and the hashes stop agreeing with the report — but somebody who
+rewrites the *whole* bundle can rewrite the manifest to agree with the
+rewrite, and every check above still passes: internal consistency is all a
+hash ever claimed to establish. A `-verify` run with no `-pubkey` reports this
+plainly, as `Unsigned: true`, printed right under the header — a reader must
+never mistake a hash-only pass for a signed one, and this field (JSON and
+text output both) is the only thing that tells them apart.
 
-A bundle recording a **FAIL** still verifies, and must. Verification is about
-whether the cited bytes are in the capture, not about whether the device
-behaved. Conflating the two would make a failing run uncitable — precisely when
+### Signing
+
+```bash
+# Once, outside any repository:
+certify -gen-sign-key ~/keys/lexa-cert
+#   private key (mode 0600, PKCS#8 PEM): ~/keys/lexa-cert/sign-ed25519.key
+#   public key  (hand this to a lab):    ~/keys/lexa-cert/sign-ed25519.pub
+
+# Every GATING campaign (REQUIRED — see below):
+certify -campaign csip -manifest configs/candidate.json -sign-key ~/keys/lexa-cert/sign-ed25519.key ...
+
+# A lab, or anyone else, checking a bundle against the public key they were given:
+certify -verify runs/2026-07-26/ -pubkey sign-ed25519.pub
+```
+
+`-sign-key` signs `MANIFEST.sha256` with a detached ed25519 signature,
+`MANIFEST.sha256.sig` — a small JSON object (`{"alg":"ed25519","key_id":"…",
+"sig":"…"}`; `key_id` is the first 8 bytes of `sha256(public key)`, hex, so a
+report can name which key without printing it; `sig` is the raw 64-byte
+signature, base64) written over `MANIFEST.sha256`'s exact bytes, nothing else.
+It closes exactly the gap the paragraph above names: rewriting the capture and
+rehashing the manifest to agree no longer produces a manifest the *original*
+signature covers, because the attacker does not have the private key — which
+lives on the operator's own machine and this tool never writes anywhere but
+there.
+
+**A GATING campaign refuses to run with no `-sign-key`.** An unsigned
+`MANIFEST.sha256` is not a weaker version of a certification bundle, it is
+missing the one thing that makes a rewrite detectable after the fact, so
+`-campaign` treats a missing signing key the same way it treats
+`-skip-preflight` or `-require-citation=false` on a gating run: refused
+outright, before a single frame is captured. (Unlike those switches, an
+unsigned gating run has no legitimate *disclosed* shape — it is refused, full
+stop, so `"unsigned"` never appears in a written bundle's
+`campaign.weakened`.) It is honored, unsigned, only on an EXPLORATORY run (no
+`-campaign`).
+
+A signature says WHO held the key that signed this manifest, not who ran the
+test or whether the DUT behaved as recorded — it is not a certificate chain,
+and a lab still has to receive the operator's public key through a channel it
+trusts (out of band; this tool has no opinion on how). What it adds over the
+hash-only baseline is narrow and load-bearing: non-repudiation of the manifest
+bytes.
+
+A bundle recording a **FAIL** still verifies, signed or not, and must.
+Verification is about whether the cited bytes are in the capture and, when
+checked, who signed the manifest that says so — not about whether the device
+behaved. Conflating those would make a failing run uncitable, precisely when
 the evidence matters most.
 
 ---

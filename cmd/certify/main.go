@@ -153,6 +153,14 @@ type cli struct {
 	// from, each optionally narrowed to some of its documents as `dir=<doc-key>`.
 	trr      []string
 	showCaps bool
+	// genSignKey is -gen-sign-key's directory: generate a fresh ed25519
+	// signing keypair there, then exit. See bundle.GenerateSignKey.
+	genSignKey string
+
+	// pubkey is -verify's companion: the ed25519 public key (PEM) to check
+	// the bundle's MANIFEST.sha256.sig against. Empty means -verify checks
+	// only internal consistency (bundle.Verify) and reports Unsigned.
+	pubkey string
 
 	// target is an alias for -gateway, because "the target" is what an operator
 	// calls the DUT and what every other tool in this bench spells -target. It
@@ -230,6 +238,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch {
+	case c.genSignKey != "":
+		return c.runGenSignKey(stdout, stderr)
 	case c.showCaps:
 		return c.runCapabilities(stdout)
 	case c.list:
@@ -250,6 +260,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 func (c *cli) bindFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&c.list, "list", false, "list the catalog and what this tool implements, then exit")
 	fs.StringVar(&c.verify, "verify", "", "re-verify an evidence bundle directory standalone, then exit")
+	fs.StringVar(&c.pubkey, "pubkey", "",
+		"-verify: ed25519 public key (PEM, from certify -gen-sign-key) to check the bundle's "+
+			"MANIFEST.sha256.sig against. Without it -verify checks only internal consistency and reports "+
+			"the result Unsigned — a hash agreeing with itself, not a signature from a key anyone controls")
+	fs.StringVar(&c.genSignKey, "gen-sign-key", "",
+		"generate a fresh ed25519 signing keypair into this directory (private key sign-ed25519.key, mode "+
+			"0600, PKCS#8 PEM — keep it OUTSIDE any repository; public key sign-ed25519.pub, PKIX PEM, to "+
+			"hand to a certification lab), print the key id, then exit")
 	fs.StringVar(&c.report, "report", "", "generate the SunSpec submission report from an evidence bundle directory, then exit")
 	fs.StringVar(&c.writes, "writes", "",
 		"extract the southbound REGISTER WRITE SET from an evidence bundle directory (or a bare capture "+
@@ -361,8 +379,17 @@ func (c *cli) resolve() error {
 	if c.showCaps {
 		modes = append(modes, "-capabilities")
 	}
+	if c.genSignKey != "" {
+		modes = append(modes, "-gen-sign-key")
+	}
 	if len(modes) > 1 {
 		return fmt.Errorf("%s select different modes; pick one", strings.Join(modes, " and "))
+	}
+	// -pubkey checks a signature -verify re-derives; it has no meaning without
+	// a bundle to check it against, and silently ignoring it on every other
+	// mode would let an operator believe a check happened that did not.
+	if c.pubkey != "" && c.verify == "" {
+		return fmt.Errorf("-pubkey checks the signature -verify re-derives; it has no meaning without -verify")
 	}
 	// A campaign RUNS a bench; it has no meaning attached to -verify, -report,
 	// -writes, -trr or -list, all of which read a directory that already exists.
@@ -514,6 +541,25 @@ func (c *cli) runCampaign(stdout, stderr io.Writer) int {
 	return exitOK
 }
 
+// runGenSignKey is -gen-sign-key: generate a fresh ed25519 signing keypair
+// and print where the two halves landed. It touches no bench, no catalog, no
+// existing bundle — the operator runs it once, keeps the private key off any
+// repository, and hands the public key to whichever lab will run -verify
+// -pubkey against the bundles it later signs.
+func (c *cli) runGenSignKey(stdout, stderr io.Writer) int {
+	privPath, pubPath, keyID, err := bundle.GenerateSignKey(c.genSignKey)
+	if err != nil {
+		fatal(stderr, err)
+		return exitUsage
+	}
+	fmt.Fprintf(stdout, "generated ed25519 signing key %s\n", keyID)
+	fmt.Fprintf(stdout, "  private key (mode 0600 — KEEP OUTSIDE ANY REPOSITORY): %s\n", privPath)
+	fmt.Fprintf(stdout, "  public key  (hand this to a certification lab):       %s\n", pubPath)
+	fmt.Fprintf(stdout, "\nsign a campaign's bundle with:\n  certify -campaign ... -sign-key %s\n", privPath)
+	fmt.Fprintf(stdout, "check one against it with:\n  certify -verify runs/<ts>/ -pubkey %s\n", pubPath)
+	return exitOK
+}
+
 // fatal prints an error with exactly one "certify: " prefix.
 //
 // Most of what reaches here comes from internal/certify, whose errors already
@@ -533,6 +579,10 @@ func usage(w io.Writer, fs *flag.FlagSet) {
   certify -target 69.0.0.2:802 -iface enp1s0 -out runs/2026-07-26/
                                                  a real run: capture, checks, bundle
   certify -verify runs/2026-07-26/               re-verify a bundle from nothing but itself
+  certify -verify runs/2026-07-26/ -pubkey sign-ed25519.pub
+                                                 the same, and also check the manifest's ed25519
+                                                 signature — without -pubkey the report says Unsigned
+  certify -gen-sign-key ~/keys/lexa-cert         generate an ed25519 signing keypair, then exit
   certify -report runs/2026-07-26/ -config lab.json
                                                  emit the SunSpec submission report
   certify -trr runs/csip/=csip-conf-v1.3 -trr runs/full/ -trr-out runs/trr -config lab.json
@@ -540,9 +590,12 @@ func usage(w io.Writer, fs *flag.FlagSet) {
                                                  Results Reporting specifications, from several
                                                  bundles, with the verdict mapping stated in it
 
-  certify -campaign mbaps -manifest configs/candidate.json -gateway-ssh cc93 -iface enp1s0 -out runs/mbaps/
+  certify -campaign mbaps -manifest configs/candidate.json -sign-key ~/keys/lexa-cert/sign-ed25519.key \
+          -gateway-ssh cc93 -iface enp1s0 -out runs/mbaps/
                                                  a GATING campaign: closed selection, live DUT control
-                                                 authority proven before case 1, recorded in the bundle
+                                                 authority proven before case 1, MANIFEST.sha256 signed
+                                                 (required — an unsigned run is refused outright),
+                                                 recorded in the bundle
   certify -campaign csip -manifest configs/candidate.json -preset local \
           -gateway-exec ../lexa-gw/scripts/lab/lab-exec -dry-run
                                                  the same, against the host-native lab (lexa-gw

@@ -1,6 +1,7 @@
 package bundle
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -36,14 +37,16 @@ type Builder struct {
 	// (keylog.go, REV0907-E5): how many source lines were scoped into the
 	// bundle and how many were not (out-of-scope session, or malformed).
 	// Zero-valued before Write runs, and when no key log was set at all.
-	//
-	// TODO(REV0907-E5): these belong in RunMeta (bundle.go) as a proper
-	// bundle.json field — e.g. RunMeta.KeyLog *KeyLogFilterSummary with
-	// LinesKept/LinesDropped — so a reader of the bundle can see the
-	// filtering result without re-deriving it. bundle.go is out of scope for
-	// this change (owned elsewhere); until that field exists these counts
-	// are readable only via KeyLogLinesKept/KeyLogLinesDropped, post-Write.
+	// Write also mirrors these into the written Bundle's
+	// RunMeta.KeyLog (bundle.go), so a reader of the bundle back later sees
+	// the same counts a caller of this Builder saw right after Write
+	// returned.
 	keyLogKept, keyLogDropped int
+
+	// signKey is the operator's ed25519 private key (SetSignKey), or nil for
+	// an unsigned bundle. When set, Write signs MANIFEST.sha256 with it and
+	// writes MANIFEST.sha256.sig beside it. See sign.go.
+	signKey ed25519.PrivateKey
 }
 
 // KeyLogLinesKept reports how many lines of the source key log (SetKeyLog)
@@ -95,6 +98,15 @@ func (b *Builder) SetCandidate(c CandidateRef) { b.run.Candidate = &c }
 // is still a secret, and a bundle containing one should be handled as such.
 func (b *Builder) SetKeyLog(path string) { b.keylogPath = path }
 
+// SetSignKey installs the operator's ed25519 private key (WP7-T4,
+// REV0907-E4). When set, Write signs MANIFEST.sha256 with it and writes the
+// detached signature MANIFEST.sha256.sig beside it — see sign.go for the
+// format and what it establishes that a hash alone cannot. Never setting it
+// is a valid, unsigned bundle; the certify runner refuses to let a GATING
+// campaign do that (see internal/certify's preflightSigning), but this
+// package itself takes no position on who may call Write unsigned.
+func (b *Builder) SetSignKey(priv ed25519.PrivateKey) { b.signKey = priv }
+
 // AddFile copies an extra artefact into the bundle root and covers it with the
 // manifest — a run log, a configuration dump, a certificate.
 func (b *Builder) AddFile(path string) { b.extraPaths = append(b.extraPaths, path) }
@@ -127,10 +139,12 @@ func (b *Builder) Cases() []TestCaseResult { return b.cases }
 // otherwise be empty of a previous bundle's files.
 //
 // The write order matters: artefacts first, then bundle.json, then REPORT.md,
-// and the manifest LAST over everything that ended up on disk. A manifest
-// written from the in-memory file list instead of from the directory would miss
-// a file that was added out of band — which is precisely the case it exists to
-// catch.
+// then the manifest over everything that ended up on disk, and — when a
+// signing key was supplied — the detached signature over the manifest last of
+// all. A manifest written from the in-memory file list instead of from the
+// directory would miss a file that was added out of band — which is precisely
+// the case it exists to catch — and a signature computed before the manifest
+// is final would sign bytes the bundle does not actually ship.
 func (b *Builder) Write(dir string) (*Bundle, error) {
 	if dir == "" {
 		return nil, errors.New("bundle: no output directory")
@@ -179,6 +193,7 @@ func (b *Builder) Write(dir string) (*Bundle, error) {
 		}
 		b.keyLogKept, b.keyLogDropped = counts.Kept, counts.Dropped
 		out.Files.KeyLog = rel
+		out.Run.KeyLog = &KeyLogFilterSummary{LinesKept: counts.Kept, LinesDropped: counts.Dropped}
 	}
 	for _, p := range b.captureExtras {
 		rel := path.Join(CaptureDir, filepath.Base(p))
@@ -218,6 +233,17 @@ func (b *Builder) Write(dir string) (*Bundle, error) {
 	}
 	if err := WriteManifest(dir); err != nil {
 		return nil, err
+	}
+	// Signing is the LAST step, after the manifest whose bytes it signs is
+	// final on disk — see sign.go's doc for why a hash-only manifest cannot
+	// catch a whole-bundle rewrite (REV0907-E4) and a signature over it can.
+	// manifestEntries excludes ManifestSigFile from what it hashes, the same
+	// way it excludes ManifestFile itself, so writing the signature here
+	// never requires the manifest to be regenerated.
+	if b.signKey != nil {
+		if err := signManifest(filepath.Join(dir, ManifestFile), filepath.Join(dir, ManifestSigFile), b.signKey); err != nil {
+			return nil, fmt.Errorf("bundle: sign %s: %w", ManifestFile, err)
+		}
 	}
 	return out, nil
 }
@@ -263,7 +289,12 @@ func manifestEntries(dir string) ([]ManifestEntry, error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if rel == ManifestFile {
+		if rel == ManifestFile || rel == ManifestSigFile {
+			// The manifest cannot hash itself, and its detached signature
+			// exists to attest the manifest — not the other way around, and
+			// not itself. Listing it would also make WriteManifest's own
+			// output order load-bearing (sign after list, or re-list after
+			// sign), which the split below avoids entirely.
 			return nil
 		}
 		sum, err := sha256File(p)

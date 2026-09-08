@@ -1,6 +1,7 @@
 package bundle
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"csip-tls-test/internal/evidence/keylog"
 	"csip-tls-test/internal/evidence/netdis"
 	"csip-tls-test/internal/evidence/pcapng"
 )
@@ -72,6 +74,22 @@ type VerifyReport struct {
 	// (every bundle written before campaigns existed, and no bundle this
 	// package writes today). See verifyCampaignWeakening and REV0907-E3.
 	Campaign *CampaignRecord `json:"campaign,omitempty"`
+	// Unsigned records that THIS verification did not check a cryptographic
+	// signature over MANIFEST.sha256 — either because Verify was called
+	// directly (no public key was ever offered to check against) or because
+	// VerifySigned was given no key. It is written even when false — no
+	// omitempty — for the same reason CampaignRecord.Gating is: "this
+	// verification IS signed" is a fact a reader needs stated, not inferred
+	// from an absent key.
+	//
+	// It is deliberately about what THIS RUN checked, not about whether the
+	// bundle carries a signature at all — a signed bundle verified with plain
+	// Verify (no -pubkey) is reported Unsigned exactly as an unsigned one is,
+	// because neither run checked the signature, and a reader comparing two
+	// "verified" reports must not have to open bundle.json to learn that one
+	// of them proves nothing about who produced the manifest and the other
+	// does. See VerifySigned and REV0907-E4.
+	Unsigned bool `json:"unsigned"`
 }
 
 // Verify re-checks a bundle directory from nothing but its own contents.
@@ -102,7 +120,10 @@ type VerifyReport struct {
 // Verify does establish is internal consistency: the report's claims and the
 // capture in front of you describe the same traffic.
 func Verify(dir string) (*VerifyReport, error) {
-	rep := &VerifyReport{Dir: dir, OK: true}
+	// Plain Verify never has a public key to check a signature against, so
+	// every report it produces is, by construction, unsigned verification —
+	// see VerifySigned, the only path that can turn this false.
+	rep := &VerifyReport{Dir: dir, OK: true, Unsigned: true}
 
 	b, err := Load(dir)
 	if err != nil {
@@ -137,7 +158,8 @@ func Verify(dir string) (*VerifyReport, error) {
 		rep.OK = false
 		return rep, nil
 	}
-	pkts, err := pcapng.ReadFile(filepath.Join(dir, filepath.FromSlash(b.Files.Capture)))
+	capturePath := filepath.Join(dir, filepath.FromSlash(b.Files.Capture))
+	pkts, err := pcapng.ReadFile(capturePath)
 	if err != nil {
 		rep.problem(fmt.Sprintf("capture %s does not read back: %v", b.Files.Capture, err))
 		rep.OK = false
@@ -148,6 +170,13 @@ func Verify(dir string) (*VerifyReport, error) {
 		rep.problem(fmt.Sprintf("capture holds %d packets but bundle.json records %d", len(pkts), b.Capture.Packets))
 		rep.OK = false
 	}
+
+	// The key log channel needs no reassembly, only the capture's own
+	// ClientHello scan (captureClientRandoms, keylog.go) — so it runs here,
+	// ahead of reassemble, on the same terms as the metrics/timebase/verdict
+	// re-derivations above: a property of this bundle checkable without
+	// resolving a single byte range.
+	verifyKeyLog(dir, b, capturePath, rep)
 
 	byIndex := make(map[int]pcapng.Packet, len(pkts))
 	for _, p := range pkts {
@@ -172,7 +201,95 @@ func Verify(dir string) (*VerifyReport, error) {
 	return rep, nil
 }
 
+// VerifySigned re-verifies a bundle exactly as Verify does, and additionally
+// checks MANIFEST.sha256.sig against pub (VerifyManifestSignature).
+//
+// It is a separate entry point rather than an extra Verify parameter because
+// most callers of Verify — a run's own self-check right after writing its
+// bundle, -report, -trr — have no public key to check against and must not
+// be made to pass one; -verify -pubkey is the one caller that does, and it is
+// the only place a false Unsigned should ever come from.
+//
+// # Why this fails a bundle a hash-only check would pass
+//
+// A signature answers a question Verify's own file/citation checks cannot:
+// MANIFEST.sha256 says the files agree with EACH OTHER, and REV0907-E4 is
+// precisely the attack that survives that unchanged — rewrite the capture,
+// rehash the manifest to agree with the rewrite, and every internal-
+// consistency check still passes, because internal consistency is all it
+// ever claimed to establish (see Verify's doc). A signature ties the
+// manifest to a key the operator controls and this tool never had to write —
+// rewriting the capture without that key produces a manifest the ORIGINAL
+// signature no longer covers, and this function is what notices.
+//
+// Missing entirely counts as failing: a caller that supplies a public key has
+// asked, explicitly, for this bundle to prove who signed it, and a bundle
+// with no MANIFEST.sha256.sig at all has not — silently downgrading that to
+// "nothing to check" would let an unsigned bundle pass a check whose entire
+// point was to require a signature.
+func VerifySigned(dir string, pub ed25519.PublicKey) (*VerifyReport, error) {
+	rep, err := Verify(dir)
+	if err != nil {
+		return rep, err
+	}
+	rep.Unsigned = false
+	if err := VerifyManifestSignature(dir, pub); err != nil {
+		rep.problem(fmt.Sprintf("signature: %v", err))
+		rep.OK = false
+	}
+	return rep, nil
+}
+
 func (r *VerifyReport) problem(s string) { r.Problems = append(r.Problems, s) }
+
+// verifyKeyLog re-derives whether the bundle's own key log carries a secret
+// for a session its own capture does NOT contain — an ORPHAN, and precisely
+// the shape Builder.Write's filtering (keylog.go, REV0907-E5) exists to
+// prevent. The bench's shared, append-mode key log can name sessions from
+// another run or another leg entirely; shipping one of those secrets hands a
+// reader the plaintext of traffic this bundle never claims to be evidence
+// for. A filtered bundle has none; an orphan here means that filter was
+// bypassed, failed, or the bundle was hand-edited after the fact — including
+// REV0907-E4's whole-bundle-rewrite shape, since rewriting the capture
+// without re-filtering the key log leaves exactly this residue behind.
+//
+// Skipped entirely when the bundle carries no key log at all, which is most
+// bundles — a run with no -keylog has nothing for this check to say anything
+// about.
+func verifyKeyLog(dir string, b *Bundle, capturePath string, rep *VerifyReport) {
+	if b.Files.KeyLog == "" {
+		return
+	}
+	kl, err := keylog.Open(filepath.Join(dir, filepath.FromSlash(b.Files.KeyLog)))
+	if err != nil {
+		rep.problem(fmt.Sprintf("key log %s does not read back: %v", b.Files.KeyLog, err))
+		rep.OK = false
+		return
+	}
+	randoms, err := captureClientRandoms(capturePath)
+	if err != nil {
+		rep.problem(fmt.Sprintf("cannot scan the capture for TLS sessions to check the key log against: %v", err))
+		rep.OK = false
+		return
+	}
+	for _, orphan := range keylog.Orphans(kl, randoms) {
+		rep.problem(fmt.Sprintf("key log %s carries a secret for client_random %s…, a session this "+
+			"bundle's own capture does not contain — it can decrypt traffic outside what this bundle "+
+			"is evidence for", b.Files.KeyLog, orphanPrefix(orphan)))
+		rep.OK = false
+	}
+}
+
+// orphanPrefix shortens a client random for a problem message: enough to
+// distinguish sessions in a report without printing the full 32-byte value
+// beside a set of secrets that themselves stay out of the log line.
+func orphanPrefix(clientRandomHex string) string {
+	const n = 16
+	if len(clientRandomHex) <= n {
+		return clientRandomHex
+	}
+	return clientRandomHex[:n]
+}
 
 // verifyManifest re-hashes every listed file and looks for files that are on
 // disk but not listed, which is how something slipped into a bundle after the
@@ -605,6 +722,18 @@ func (r *VerifyReport) String() string {
 	fmt.Fprintf(&sb, "Bundle:   %s\n", r.Dir)
 	fmt.Fprintf(&sb, "Schema:   %s\n", r.Schema)
 	fmt.Fprintf(&sb, "Capture:  %d frames\n", r.Packets)
+	// The signature posture, right beside the schema and capture facts, for
+	// the same reason the campaign posture below is: whether a reader may
+	// treat anything under this header as non-repudiable depends on it, and
+	// it must not be discoverable only by noticing what is absent.
+	if r.Unsigned {
+		fmt.Fprintf(&sb, "Signature: NOT CHECKED — no -pubkey was supplied. This run confirms internal\n"+
+			"           consistency only; it does NOT rule out a whole-bundle rewrite that rehashed\n"+
+			"           itself to agree (REV0907-E4). Re-run with -pubkey to check the manifest's\n"+
+			"           ed25519 signature.\n")
+	} else {
+		fmt.Fprintf(&sb, "Signature: CHECKED against the supplied public key\n")
+	}
 	// The campaign posture goes ahead of every check result: whether a reader
 	// may act on anything below depends on it. WEAKENED is printed whenever it
 	// is non-empty, gating or not, so a reader sees a switch was used even on a

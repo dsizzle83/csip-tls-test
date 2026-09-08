@@ -34,7 +34,18 @@ import (
 
 func (c *cli) runVerify(stdout, stderr io.Writer) int {
 	dir := c.verify
-	rep, err := bundle.Verify(dir)
+	var rep *bundle.VerifyReport
+	var err error
+	if c.pubkey != "" {
+		pub, kerr := bundle.LoadVerifyKey(c.pubkey)
+		if kerr != nil {
+			fmt.Fprintf(stderr, "certify: -pubkey: %v\n", kerr)
+			return exitUsage
+		}
+		rep, err = bundle.VerifySigned(dir, pub)
+	} else {
+		rep, err = bundle.Verify(dir)
+	}
 	if err != nil {
 		// Verify returns an error only when the bundle cannot be read at all —
 		// a missing bundle.json, an unreadable manifest. That is not a verdict
@@ -63,8 +74,17 @@ func (c *cli) runVerify(stdout, stderr io.Writer) int {
 
 	abs, _ := filepath.Abs(dir)
 	fmt.Fprintf(stdout, "VERIFY  %s\n", abs)
-	fmt.Fprintf(stdout, "        schema %s · %d file(s) · %d packet(s) in the capture\n\n",
-		rep.Schema, len(rep.Files), rep.Packets)
+	fmt.Fprintf(stdout, "        schema %s · %d file(s) · %d packet(s) in the capture\n", rep.Schema, len(rep.Files), rep.Packets)
+	// Whether this run checked a signature is stated in as many words, right
+	// under the header — a reader must never mistake a hash-only pass for a
+	// signed one, and the only thing that tells them apart is this line. See
+	// VerifyReport.Unsigned.
+	if rep.Unsigned {
+		fmt.Fprintf(stdout, "        ⚠ UNSIGNED VERIFICATION — no -pubkey given; internal consistency only,\n"+
+			"          not a check that any particular key produced this manifest (REV0907-E4)\n\n")
+	} else {
+		fmt.Fprintf(stdout, "        ✓ signature checked against the supplied -pubkey\n\n")
+	}
 
 	// Files first: if the manifest does not agree with the bytes on disk,
 	// nothing below it means anything.

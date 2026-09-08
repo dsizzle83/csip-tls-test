@@ -303,6 +303,24 @@ func TestBundleWriteFiltersKeyLogToCapture(t *testing.T) {
 		t.Errorf("KeyLogLinesDropped() = %d, want 1", got)
 	}
 
+	// REV0907-E5's TODO: the same counts must be readable off the WRITTEN
+	// bundle itself, not only off the live Builder — so a reader of
+	// bundle.json back later (or Load(dir).Run.KeyLog) sees the filtering
+	// result without re-deriving it.
+	if bd.Run.KeyLog == nil {
+		t.Fatal("bundle.json's run.keylog is nil; the filter counts did not reach RunMeta")
+	}
+	if bd.Run.KeyLog.LinesKept != 1 || bd.Run.KeyLog.LinesDropped != 1 {
+		t.Errorf("run.keylog = %+v, want {LinesKept:1 LinesDropped:1}", *bd.Run.KeyLog)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.Run.KeyLog == nil || loaded.Run.KeyLog.LinesKept != 1 || loaded.Run.KeyLog.LinesDropped != 1 {
+		t.Errorf("bundle.json round-trips run.keylog as %+v, want {LinesKept:1 LinesDropped:1}", loaded.Run.KeyLog)
+	}
+
 	if bd.Files.KeyLog == "" {
 		t.Fatal("bundle.json records no key log file")
 	}
@@ -318,4 +336,107 @@ func TestBundleWriteFiltersKeyLogToCapture(t *testing.T) {
 	}
 
 	mustVerify(t, dir)
+}
+
+// TestBundleWriteRecordsNoKeyLogAsNilRunMeta pins the other half of the
+// nil-vs-set contract: a bundle written with NO -keylog at all — the ordinary
+// case — must carry run.keylog absent (nil), not a zero-valued
+// KeyLogFilterSummary a reader could mistake for "a key log was set and
+// nothing survived filtering".
+func TestBundleWriteRecordsNoKeyLogAsNilRunMeta(t *testing.T) {
+	work := t.TempDir()
+	capturePath := filepath.Join(work, "run.pcapng")
+	writeKeylogCapture(t, capturePath, nil)
+
+	b := NewBuilder(RunMeta{Tool: "evidence-engine-test", Operator: "bench"})
+	b.SetCapture(capture.Summary{Tool: "dumpcap", Format: "pcapng"}, capturePath)
+	b.AddCase(TestCaseResult{ID: "KL-3", Title: "no keylog fixture", Verdict: Pass})
+
+	dir := filepath.Join(work, "bundle")
+	bd, err := b.Write(dir)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if bd.Run.KeyLog != nil {
+		t.Errorf("run.keylog = %+v, want nil when no key log was set", *bd.Run.KeyLog)
+	}
+}
+
+// --- Verify: orphan key-log lines --------------------------------------------
+
+// TestVerifyFlagsOrphanKeyLogLine is REV0907-E4/E5's other half: a bundle
+// whose key log carries a secret for a session its own capture does NOT
+// contain must fail Verify, naming the orphan client_random — the shape a
+// bypassed filter, a failed one, or a hand-edited bundle produces, and
+// exactly what Builder.Write's filtering (keylog.go) exists to prevent from
+// ever reaching a lab.
+//
+// The bundle is written CLEAN (a properly filtered key log with zero
+// orphans, confirmed by mustVerify) and then an orphan line is appended to
+// the bundle's OWN key-log copy and the manifest refreshed — simulating
+// either a filter that was bypassed after the fact or a bundle rewritten to
+// agree with itself, not a defect in writeFilteredKeyLog (which
+// TestWriteFilteredKeyLogScopesToCapture already covers in isolation).
+func TestVerifyFlagsOrphanKeyLogLine(t *testing.T) {
+	work := t.TempDir()
+	inScope, orphan := randomOf(0xAA), randomOf(0xCC)
+
+	capturePath := filepath.Join(work, "run.pcapng")
+	writeKeylogCapture(t, capturePath, [][32]byte{inScope})
+
+	keylogPath := filepath.Join(work, "shared.keylog")
+	line := "CLIENT_RANDOM " + hex.EncodeToString(inScope[:]) + " " + strings.Repeat("aa", 48) + "\n"
+	if err := os.WriteFile(keylogPath, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	b := NewBuilder(RunMeta{Tool: "evidence-engine-test", Operator: "bench"})
+	b.SetCapture(capture.Summary{Tool: "dumpcap", Format: "pcapng"}, capturePath)
+	b.SetKeyLog(keylogPath)
+	b.AddCase(TestCaseResult{ID: "KL-2", Title: "orphan fixture", Verdict: Pass})
+
+	dir := filepath.Join(work, "bundle")
+	bd, err := b.Write(dir)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	mustVerify(t, dir) // the properly filtered bundle has no orphans yet
+
+	// Append a foreign session's secret directly to the bundle's own copy —
+	// what a bypassed filter or a hand edit leaves behind — then refresh the
+	// manifest the way whatever produced that edit would have to, for the
+	// bundle to pass its OWN file-hash check at all.
+	kf := filepath.Join(dir, bd.Files.KeyLog)
+	f, err := os.OpenFile(kf, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanLine := "CLIENT_RANDOM " + hex.EncodeToString(orphan[:]) + " " + strings.Repeat("bb", 48) + "\n"
+	if _, err := f.WriteString(orphanLine); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteManifest(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Verify(dir)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if rep.OK {
+		t.Fatal("Verify accepted a key log carrying a secret for a session outside its own capture")
+	}
+	wantPrefix := hex.EncodeToString(orphan[:])[:16]
+	found := false
+	for _, p := range rep.Problems {
+		if strings.Contains(p, wantPrefix) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("problems do not name the orphan client_random prefix %s: %v", wantPrefix, rep.Problems)
+	}
 }

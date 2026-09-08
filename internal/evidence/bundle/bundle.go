@@ -379,6 +379,32 @@ type RunMeta struct {
 	// declaration of what the DUT claims to be. Absent when no manifest was
 	// supplied.
 	Candidate *CandidateRef `json:"candidate,omitempty"`
+	// KeyLog summarises how Write scoped the run's key log to THIS bundle's
+	// own capture (Builder.SetKeyLog, keylog.go, REV0907-E5): how many source
+	// lines survived the filter and how many were dropped — a session outside
+	// the capture, or a malformed source line. Nil when no key log was set at
+	// all, so a bundle written with -keylog and one written without are
+	// distinguishable from bundle.json alone, without opening
+	// capture/*.keylog and counting.
+	//
+	// Before this field existed the same counts were readable only off the
+	// live Builder, post-Write (KeyLogLinesKept/KeyLogLinesDropped) — useful
+	// to the process that just wrote the bundle, useless to anyone reading it
+	// back later. See the REV0907-E5 TODO this field closes, write.go.
+	KeyLog *KeyLogFilterSummary `json:"keylog,omitempty"`
+}
+
+// KeyLogFilterSummary is how many key-log lines Builder.Write kept and
+// dropped when scoping the source key log to this bundle's own capture. See
+// RunMeta.KeyLog.
+type KeyLogFilterSummary struct {
+	// LinesKept is how many source lines named a session captureClientRandoms
+	// found in this bundle's own capture, and so were copied in.
+	LinesKept int `json:"lines_kept"`
+	// LinesDropped is how many source lines were NOT copied in — either their
+	// session is outside this bundle's own capture, or the line did not parse
+	// as a key-log entry at all.
+	LinesDropped int `json:"lines_dropped"`
 }
 
 // CampaignRecord is the campaign a run declared, as the bundle carries it.
