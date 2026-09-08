@@ -91,6 +91,48 @@ func Open(path string) (*Log, error) {
 	return l, nil
 }
 
+// IsCommentOrBlank reports whether a raw key-log line carries no entry: a '#'
+// comment or a blank line, both legal spacers between entries.
+func IsCommentOrBlank(text string) bool {
+	t := strings.TrimSpace(text)
+	return t == "" || strings.HasPrefix(t, "#")
+}
+
+// ParseEntry parses one already-trimmed, non-comment, non-blank key-log
+// line — everything Parse itself checks per line, factored out so a caller
+// that wants a DIFFERENT failure policy than Parse's ("one bad line fails the
+// whole file") is not stuck re-deriving the wire format's rules by hand.
+//
+// bundle.writeFilteredKeyLog (REV0907-E5) is that caller: the bench's shared,
+// append-mode key log can pick up a line mangled by a concurrent writer, and
+// the fix for THAT is to drop and count the one line, not to refuse the
+// whole run's evidence over it. The returned Entry has no Line set; callers
+// that track one fill it in themselves, as Parse does below.
+func ParseEntry(text string) (Entry, error) {
+	fields := strings.Fields(text)
+	if len(fields) != 3 {
+		return Entry{}, fmt.Errorf("got %d fields, want 3 (LABEL client_random secret)", len(fields))
+	}
+	label := fields[0]
+	cr, err := hex.DecodeString(fields[1])
+	if err != nil {
+		return Entry{}, fmt.Errorf("client random is not hex: %w", err)
+	}
+	secret, err := hex.DecodeString(fields[2])
+	if err != nil {
+		return Entry{}, fmt.Errorf("secret is not hex: %w", err)
+	}
+	// Every label except the legacy RSA one is keyed by the 32-byte client
+	// random; a shorter value means the log is not what it claims to be.
+	if label != LabelRSA && len(cr) != 32 {
+		return Entry{}, fmt.Errorf("client random is %d bytes, want 32", len(cr))
+	}
+	if len(secret) == 0 {
+		return Entry{}, fmt.Errorf("empty secret")
+	}
+	return Entry{Label: label, ClientRandom: cr, Secret: secret}, nil
+}
+
 // Parse reads a key log from r.
 func Parse(r io.Reader) (*Log, error) {
 	l := &Log{byRandom: make(map[string]map[string][]byte)}
@@ -100,36 +142,20 @@ func Parse(r io.Reader) (*Log, error) {
 	for sc.Scan() {
 		line++
 		text := strings.TrimSpace(sc.Text())
-		if text == "" || strings.HasPrefix(text, "#") {
+		if IsCommentOrBlank(text) {
 			continue
 		}
-		fields := strings.Fields(text)
-		if len(fields) != 3 {
-			return nil, fmt.Errorf("line %d: got %d fields, want 3 (LABEL client_random secret)", line, len(fields))
-		}
-		label := fields[0]
-		cr, err := hex.DecodeString(fields[1])
+		e, err := ParseEntry(text)
 		if err != nil {
-			return nil, fmt.Errorf("line %d: client random is not hex: %w", line, err)
+			return nil, fmt.Errorf("line %d: %w", line, err)
 		}
-		secret, err := hex.DecodeString(fields[2])
-		if err != nil {
-			return nil, fmt.Errorf("line %d: secret is not hex: %w", line, err)
-		}
-		// Every label except the legacy RSA one is keyed by the 32-byte client
-		// random; a shorter value means the log is not what it claims to be.
-		if label != LabelRSA && len(cr) != 32 {
-			return nil, fmt.Errorf("line %d: client random is %d bytes, want 32", line, len(cr))
-		}
-		if len(secret) == 0 {
-			return nil, fmt.Errorf("line %d: empty secret", line)
-		}
-		key := strings.ToLower(fields[1])
+		e.Line = line
+		key := hex.EncodeToString(e.ClientRandom)
 		if l.byRandom[key] == nil {
 			l.byRandom[key] = make(map[string][]byte, 4)
 		}
-		l.byRandom[key][label] = secret
-		l.entries = append(l.entries, Entry{Line: line, Label: label, ClientRandom: cr, Secret: secret})
+		l.byRandom[key][e.Label] = e.Secret
+		l.entries = append(l.entries, e)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("read key log: %w", err)
@@ -187,4 +213,29 @@ func (l *Log) MasterSecret(clientRandom []byte) ([]byte, bool) {
 func (l *Log) Has(clientRandom []byte) bool {
 	_, ok := l.byRandom[hex.EncodeToString(clientRandom)]
 	return ok
+}
+
+// Orphans returns the client randoms log carries that are absent from
+// captureRandoms — a set of lowercase-hex client randoms, in the same form
+// Sessions returns, typically built by scanning a bundle's own capture for
+// ClientHello.Random.
+//
+// It is empty for a key log bundle.Write already scoped to its capture
+// (REV0907-E5: the bench sims share one append-mode key log across every
+// run and leg, so the raw log can carry secrets for sessions this bundle
+// never captured, and shipping those to a certification lab is the defect
+// filtering exists to close). A non-empty result means that filter was
+// bypassed or failed, which is what the bundle verifier's orphan-keylog
+// check reports it as.
+func Orphans(log *Log, captureRandoms map[string]bool) []string {
+	if log == nil {
+		return nil
+	}
+	var out []string
+	for _, k := range log.Sessions() {
+		if !captureRandoms[k] {
+			out = append(out, k)
+		}
+	}
+	return out
 }

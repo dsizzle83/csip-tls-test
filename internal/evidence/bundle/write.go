@@ -31,7 +31,30 @@ type Builder struct {
 	keylogPath    string
 	extraPaths    []string
 	captureExtras []string
+
+	// keyLogKept / keyLogDropped are set by Write after filtering the key log
+	// (keylog.go, REV0907-E5): how many source lines were scoped into the
+	// bundle and how many were not (out-of-scope session, or malformed).
+	// Zero-valued before Write runs, and when no key log was set at all.
+	//
+	// TODO(REV0907-E5): these belong in RunMeta (bundle.go) as a proper
+	// bundle.json field — e.g. RunMeta.KeyLog *KeyLogFilterSummary with
+	// LinesKept/LinesDropped — so a reader of the bundle can see the
+	// filtering result without re-deriving it. bundle.go is out of scope for
+	// this change (owned elsewhere); until that field exists these counts
+	// are readable only via KeyLogLinesKept/KeyLogLinesDropped, post-Write.
+	keyLogKept, keyLogDropped int
 }
+
+// KeyLogLinesKept reports how many lines of the source key log (SetKeyLog)
+// survived Write's scoping to the bundle's own capture. Meaningless before
+// Write has run, and zero when no key log was set.
+func (b *Builder) KeyLogLinesKept() int { return b.keyLogKept }
+
+// KeyLogLinesDropped reports how many source key-log lines Write dropped —
+// either their session was not in the bundle's own capture, or the line did
+// not parse. See KeyLogLinesKept.
+func (b *Builder) KeyLogLinesDropped() int { return b.keyLogDropped }
 
 // NewBuilder starts a bundle.
 func NewBuilder(run RunMeta) *Builder {
@@ -146,9 +169,15 @@ func (b *Builder) Write(dir string) (*Bundle, error) {
 	}
 	if b.keylogPath != "" {
 		rel := path.Join(CaptureDir, filepath.Base(b.keylogPath))
-		if err := copyFile(b.keylogPath, filepath.Join(dir, rel)); err != nil {
-			return nil, fmt.Errorf("bundle: copy key log: %w", err)
+		// The source key log is filtered, not copied verbatim: the bench
+		// sims share one append-mode key log across every run and leg, so
+		// copying it whole would ship TLS secrets for sessions outside this
+		// bundle's own capture to whoever reads the evidence. See keylog.go.
+		counts, err := writeFilteredKeyLog(b.keylogPath, b.capturePath, filepath.Join(dir, rel))
+		if err != nil {
+			return nil, fmt.Errorf("bundle: filter key log: %w", err)
 		}
+		b.keyLogKept, b.keyLogDropped = counts.Kept, counts.Dropped
 		out.Files.KeyLog = rel
 	}
 	for _, p := range b.captureExtras {

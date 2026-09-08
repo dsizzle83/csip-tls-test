@@ -115,6 +115,61 @@ func TestParseRejectsMalformed(t *testing.T) {
 	}
 }
 
+// TestOrphans covers the check bundle.Verify hooks (REV0907-E5): a session
+// the log carries but the capture does not is reported; a session the
+// capture also has is not; and a nil log — a bundle carrying no key log at
+// all — reports no orphans rather than panicking.
+func TestOrphans(t *testing.T) {
+	l, err := Parse(strings.NewReader(sampleLog()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Orphans(l, map[string]bool{cr1: true, cr2: true}); len(got) != 0 {
+		t.Errorf("Orphans = %v, want none when the capture has every session", got)
+	}
+	if got := Orphans(l, map[string]bool{cr1: true}); len(got) != 1 || got[0] != cr2 {
+		t.Errorf("Orphans = %v, want [%s]", got, cr2)
+	}
+	if got := Orphans(l, map[string]bool{}); len(got) != 2 {
+		t.Errorf("Orphans = %v, want both sessions when the capture has neither", got)
+	}
+	if got := Orphans(nil, map[string]bool{cr1: true}); got != nil {
+		t.Errorf("Orphans(nil, ...) = %v, want nil", got)
+	}
+}
+
+// TestParseEntryAndIsCommentOrBlank covers the two helpers Parse itself
+// composes from, directly: they are exported so a tolerant caller (bundle's
+// key-log filter, REV0907-E5) can reuse the wire-format rules without
+// re-deriving them or inheriting Parse's abort-on-first-bad-line policy.
+func TestParseEntryAndIsCommentOrBlank(t *testing.T) {
+	for _, text := range []string{"", "   ", "# a comment", "  # indented comment"} {
+		if !IsCommentOrBlank(text) {
+			t.Errorf("IsCommentOrBlank(%q) = false, want true", text)
+		}
+	}
+	line := LabelClientRandom + " " + cr1 + " " + strings.Repeat("11", 48)
+	if IsCommentOrBlank(line) {
+		t.Errorf("IsCommentOrBlank(%q) = true, want false", line)
+	}
+
+	e, err := ParseEntry(line)
+	if err != nil {
+		t.Fatalf("ParseEntry: %v", err)
+	}
+	if e.Label != LabelClientRandom || hex.EncodeToString(e.ClientRandom) != cr1 {
+		t.Errorf("ParseEntry = %+v", e)
+	}
+	if e.Line != 0 {
+		t.Errorf("ParseEntry set Line = %d, want 0 (caller's job)", e.Line)
+	}
+
+	if _, err := ParseEntry(LabelClientRandom + " " + cr1); err == nil ||
+		!strings.Contains(err.Error(), "want 3") {
+		t.Errorf("ParseEntry on a short line: err = %v, want one naming 'want 3'", err)
+	}
+}
+
 // TestRSALabelKeepsItsShortKey documents the one label that is NOT keyed by a
 // 32-byte client random.
 func TestRSALabelKeepsItsShortKey(t *testing.T) {
