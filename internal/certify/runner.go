@@ -1849,7 +1849,7 @@ func (r *Runner) writeBundle(rep *RunReport, capr Capturer) (*bundle.Bundle, str
 		Command:  bundle.RedactCommand(r.opts.Command),
 		Operator: r.opts.Operator, Note: note,
 		Started: rep.Started, Finished: time.Now().UTC(),
-		DUT: r.opts.DUT,
+		DUT: r.dutRecord(rep.Provenance),
 	})
 	// The evidence-weakening switches actually in effect for this run —
 	// -skip-preflight, -require-citation=false, an old gridsim's unreported
