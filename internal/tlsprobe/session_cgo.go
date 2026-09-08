@@ -238,6 +238,33 @@ func newClientCTX(spec Spec, minV, maxV Version, cipherList string) (unsafe.Poin
 	if err := wolfssl.UseSupportedCurve(ctx, wolfssl.ECCSecp256r1); err != nil {
 		return nil, err
 	}
+	// REV0907-E7: request the RFC 6066 Maximum Fragment Length the WORKING
+	// mbaps client requests (internal/mbtls's Dial, DefaultClientProfile's
+	// MFLCode) — MFL512, wire value 1. The board's Mbed TLS server carries the
+	// SunSpec CCM MFL patches 0002-0006, and every mbaps session captured
+	// against it negotiates MFL=1 on the wire; a ClientHello that omits the
+	// extension is not the ClientHello shape that server has ever completed an
+	// mbaps session against, which is this finding's "cannot complete mTLS to
+	// the board".
+	if err := wolfssl.UseMaxFragment(ctx, wolfssl.MFL512); err != nil {
+		return nil, err
+	}
+	// REV0907-E7: arm RFC 5746 secure renegotiation on the client, matching
+	// internal/mbtls's Dial exactly (see its own comment on the same call), so
+	// this probe's ClientHello differs from the working client's ONLY in the
+	// suite list this package deliberately varies. internal/mbtls's comment on
+	// its own call states the renegotiation_info extension (0xff01) rides every
+	// ClientHello from the wolfSSL build regardless of this call; against the
+	// $WOLFSSL_SYSROOT this package is built with, that is NOT what this
+	// package's own loopback capture shows (clienthello_wire_cgo_test.go,
+	// mutation-verified) — removing this call removes the extension from this
+	// build's ClientHello entirely, empty SCSV included. Whether that is a
+	// build-config difference between sysroots or a stale claim, it makes this
+	// call load-bearing for THIS build, not merely a capability addition: it is
+	// the one knob that closes the ClientHello-shape gap this finding is about.
+	if err := wolfssl.UseSecureRenegotiation(ctx); err != nil {
+		return nil, err
+	}
 	// Every dial is a FULL handshake. A probe that silently resumed would
 	// answer "did the DUT complete a handshake on this suite?" with evidence
 	// from a session negotiated earlier, possibly on another suite entirely.
@@ -397,8 +424,12 @@ func (s *Session) Report() *Report {
 // Close tears the session down exactly once, in the order the handles require:
 // TLS close-notify, the wolfSSL session, the owned context, the dup'd fd, the
 // socket. It reports the first of the fd/socket close errors, if either
-// fails — REV0907-H2: Complete depends on this to surface a real close
-// failure instead of checking a value that can never be non-nil.
+// fails — REV0907-H2: a caller that checks Close's return value now gets a
+// real close failure instead of a value that can never be non-nil. Complete
+// (REV0907-E7) is one such caller: it records what Close reports here on the
+// Report rather than folding it into its own return error, because by the
+// time Complete calls Close the handshake-and-traffic criterion under test has
+// already been decided.
 func (s *Session) Close() error {
 	var closeErr error
 	s.closeOnce.Do(func() {
@@ -432,19 +463,39 @@ func (s *Session) Close() error {
 // It is what a cipher-suite check wants, because the criterion those procedures
 // state is "the EUT-S successfully establishes a secure session using each of
 // the mandatory cipher suites" (SSM-CONF-v0.8 §2.5.1.3) — a completed session
-// carrying real traffic, not a ServerHello.
-func Complete(ctx context.Context, spec Spec) (report *Report, err error) {
+// carrying real traffic, not a ServerHello. REV0907-E7: that criterion is
+// entirely about the handshake and the traffic carried on it, so a Close
+// failure discovered AFTER both already succeeded is recorded on the Report
+// (CloseErr) and logged, NOT returned as this function's error — returning it
+// would let a bench-teardown fact (an fd or socket that failed to close AFTER
+// the session was already proven) turn a successful probe into a reported
+// failure, which is a false negative on the actual criterion under test. A
+// Dial (connect/handshake) failure is unaffected: nothing was established, so
+// its error is exactly what a caller must see.
+func Complete(ctx context.Context, spec Spec) (*Report, error) {
 	s, dialErr := Dial(ctx, spec)
 	if dialErr != nil {
 		return nil, dialErr
 	}
-	defer func() {
-		if closeErr := s.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("tlsprobe: close session: %w", closeErr)
-		}
-	}()
 	s.ReadModel1()
-	return s.Report(), nil
+	return finishSession(s, spec), nil
+}
+
+// finishSession closes s and returns its Report, folding a teardown-only
+// failure into Report.CloseErr instead of an error return — see Complete's
+// doc comment (REV0907-E7). Split out from Complete so this fold is testable
+// on its own, without a live wolfSSL handshake: session_close_cgo_test.go
+// builds a Session whose Close is rigged to fail deterministically (the same
+// helpers REV0907-H2's tests use) and asserts the failure lands on the Report,
+// never in a returned error.
+func finishSession(s *Session, spec Spec) *Report {
+	report := s.Report()
+	if closeErr := s.Close(); closeErr != nil {
+		report.CloseErr = closeErr.Error()
+		spec.log("tlsprobe: %s <> %s: session established and the criterion under test already evaluated, "+
+			"but the teardown failed: %v", s.local, s.remote, closeErr)
+	}
+	return report
 }
 
 // versionFromName maps wolfSSL's own version string onto the wire code, so a

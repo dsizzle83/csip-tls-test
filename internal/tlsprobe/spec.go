@@ -272,6 +272,16 @@ type Report struct {
 
 	// Elapsed is how long the whole probe took.
 	Elapsed time.Duration
+
+	// CloseErr records a teardown failure that happened AFTER the handshake and
+	// the Model 1 read both succeeded — REV0907-E7's Complete fix. A cipher-suite
+	// procedure's verdict is "did the EUT-S establish a secure session and carry
+	// traffic on it" (SSM-CONF-v0.8 §2.5.1.3); a dup'd-fd or socket close that
+	// fails AFTER that already happened is a bench-teardown fact, not evidence
+	// the session was never established, so it must not turn a successful probe
+	// into a reported failure. It travels here, non-empty, so it is never a
+	// silent gap either.
+	CloseErr string
 }
 
 // Summary is the one-line description an assertion's Observed field wants.
