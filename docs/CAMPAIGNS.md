@@ -308,6 +308,36 @@ The dev API publishes the *admitted* inventory, not the *configured* one, so a
 count of zero is reported as unproven rather than as a contradiction. When the
 product grows an explicit configured-count fact, this gains one comparison.
 
+### Baseline precondition + gating reset (WP7-T6)
+
+Two closely related, but different, mechanisms close
+`QAGAMUT2-001-SIMULATOR-STATE-NOT-RESET-BETWEEN-RUNS`: residual bench state
+carried from one run into the next silently becoming a FAIL, a false PASS, or
+an unattributable SKIP.
+
+**At campaign start**, before case 1, a GATING campaign's preflight resets
+every configured southbound sim (`POST /reset` — restores the as-built
+register image and disarms every fault layer) and clears gridsim's
+program/event tree. A sim that cannot be *proven* reset — unreachable, or an
+old build that answers `501` to `POST /reset` — refuses the run exactly like
+an unprovable `-gridsim`/`-gridsim-admin` pairing does (§2's failed-closed
+rule): a certification bundle may not rest on a device this run never proved
+was clean. The reset epoch(s) are printed in the run's own console log.
+
+**Inside a campaign**, before EACH oracle-graded `csip` row publishes
+anything, it re-reads the DER's own actuator register(s) — the same ones its
+oracle grades — and compares the baseline against the value it is about to
+command. A baseline already indistinguishable from the target (a residual
+control from the row before it, or from a prior campaign a reset did not
+reach) is never reported as a PASS or a FAIL: the row publishes nothing and
+rolls up to an explicit **SKIP** naming the register, the value, and — when
+the residue came from this same campaign — which row's teardown actually left
+it there. See `internal/certify/suitecsip/basic.go`'s `oracleContaminationParam`
+and `internal/certify/suitecsip/teardown.go`'s post-teardown baseline note for
+the mechanism; `CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION` is the finding
+this closes at the row boundary, and the campaign-start reset above is the
+same finding closed at the campaign boundary.
+
 ---
 
 ## 5. `N/A` — a verdict, and not one

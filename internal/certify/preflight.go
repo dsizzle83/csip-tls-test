@@ -56,8 +56,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -147,6 +149,15 @@ func (r *Runner) unprovable(reporter *Reporter, what, detail string) error {
 // preflight verifies that the bench the flags describe is the bench that
 // exists. It returns an error the caller should abandon the run on.
 func (r *Runner) preflight(ctx context.Context, reporter *Reporter) error {
+	// The sim reset runs FIRST, ahead of every other check in this function
+	// (including -skip-preflight below, which it does not depend on): it is
+	// the answer to a DIFFERENT question — not "is the topology the flags
+	// describe the one that exists" but "does this GATING campaign's first
+	// case measure a known device" (WP7-T6, QAGAMUT2-001) — and every branch
+	// below it, early-return included, must not be able to skip it silently.
+	if err := r.preflightSimReset(ctx, reporter); err != nil {
+		return err
+	}
 	if r.opts.SkipPreflight {
 		r.recordWeakened(WeakenedSkipPreflight)
 		return r.unprovable(reporter,
@@ -370,4 +381,181 @@ func sameListener(reported, dialled string) error {
 		return fmt.Errorf("address %s is not %s", rHost, dHost)
 	}
 	return nil
+}
+
+// ── The gating sim reset (WP7-T6) ───────────────────────────────────────────
+//
+// # The gap
+//
+// certify never invoked a sim reset at campaign start
+// (QAGAMUT2-001-SIMULATOR-STATE-NOT-RESET-BETWEEN-RUNS): whatever a prior run
+// — or a prior CAMPAIGN against the same bench — left injected, faulted, or
+// applied on the southbound sims and on gridsim's program/event tree carried
+// straight into the next campaign's first case. Per-row contamination inside
+// ONE campaign is a different, narrower problem this same task closes at the
+// ROW boundary (suitecsip's directSetup/curveSetup/oracledSetup and
+// controlMode.outcome, basic.go) — this closes it at the CAMPAIGN boundary,
+// once, before case 1, which per-row detection cannot substitute for: a row's
+// own pre-read only ever sees whether ITS OWN target was already there, never
+// whether the bench as a whole is the one the flags describe.
+//
+// # The posture
+//
+// On a GATING campaign, a sim or gridsim that cannot be PROVEN reset (an
+// unreachable simapi, an old build answering 501, an admin API that will not
+// enumerate its own programs) refuses the run outright, through the SAME
+// unprovable() REV0907-E3 uses for every other precondition this file
+// establishes — a certification bundle may not rest on a precondition this
+// run did not establish.
+//
+// UNLIKE every other preflight in this file, this one does not run AT ALL on
+// an exploratory run — it returns before attempting anything, rather than
+// attempting the reset and letting unprovable() downgrade a failure to a
+// WARN. Every other precondition here is a pure READ (a pairing check, a
+// citation/signing flag), so running it unconditionally and branching the
+// CONSEQUENCE on gating is free. POST /reset is not a read: it actually
+// wipes the sim's injected/faulted register state. A quick single-uid poke
+// against a live-shared bench must not silently mutate state another agent's
+// run, or an operator's own manual poke, is relying on. So the MUTATION
+// itself, not merely its severity, is gated on gatingCampaign().
+//
+// # What "reset" means here
+//
+// Each configured southbound sim gets a real POST /reset — the sim's own
+// BaselineStore.Restore (sim/southbound/baseline.go): the as-built register
+// image, every fault layer disarmed, the injected environment cleared. gridsim
+// gets its program/event tree cleared — a bare DELETE per known program on
+// /admin/control and /admin/curve, the SAME shape cmd/dashboard/replay.go's
+// restoreBench already uses to return the demo bench to a clean state.
+//
+// It is deliberately NOT the cancel-then-fence-then-delete choreography
+// teardown.go's releaseProgramControls performs between two GRADED rows of a
+// running campaign (see that file's own doc for why a bare delete there can
+// strand an already-acquired event on the DUT). This runs BEFORE case 1: no
+// row of THIS campaign has published anything yet for the DUT to have
+// acquired, so the risk the fence exists to close has not arisen yet. A DUT
+// that walked in already executing a PRIOR run's event is a real, if rare,
+// possibility this preflight does not chase — the run's own capture and the
+// rows' own baseline preconditions (basic.go's oracleContaminationParam) are
+// what would surface it, exactly as they would surface any other bench
+// contamination.
+func (r *Runner) preflightSimReset(ctx context.Context, reporter *Reporter) error {
+	if !r.gatingCampaign() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, preflightTimeout)
+	defer cancel()
+
+	var acks []string
+
+	for _, sim := range simResetTargets(r.opts.Targets) {
+		if sim.url == "" {
+			continue
+		}
+		sc := NewSimClient(sim.name, sim.url, r.opts.HTTP)
+		var ack struct {
+			APIVersion string `json:"api_version"`
+			Epoch      uint64 `json:"epoch"`
+		}
+		if err := sc.Reset(ctx, nil, &ack); err != nil {
+			return r.unprovable(reporter,
+				fmt.Sprintf("that %s was reset to its launch state before this GATING campaign", sim.name),
+				fmt.Sprintf("POST /reset against %s (%s) did not succeed: %v. A campaign that begins "+
+					"against a sim carrying a prior run's injected faults or residual register state "+
+					"(QAGAMUT2-001) cannot tell its own findings from that run's leftovers. Build or "+
+					"restart %s at a version that answers POST /reset, or run exploratory (no -campaign)",
+					sim.name, sim.url, err, sim.name))
+		}
+		acks = append(acks, fmt.Sprintf("%s@epoch=%d", sim.name, ack.Epoch))
+	}
+
+	if admin := r.opts.Targets.GridSimAdmin; admin != "" {
+		n, err := clearGridSimPrograms(ctx, NewAdminClient(admin, r.opts.HTTP))
+		if err != nil {
+			return r.unprovable(reporter,
+				"that gridsim's program/event tree was cleared before this GATING campaign",
+				fmt.Sprintf("clearing gridsim's admin-posted controls and curves at %s failed: %v. A "+
+					"campaign that begins with a prior run's DERControl still live on a program could hand "+
+					"the DUT an event this run never authored (QAGAMUT2-001). Restart gridsim clean, or run "+
+					"exploratory (no -campaign)", admin, err))
+		}
+		acks = append(acks, fmt.Sprintf("gridsim@%s: %d program(s) cleared", admin, n))
+	}
+
+	if len(acks) == 0 {
+		reporter.Line("preflight: sim reset (QAGAMUT2-001) — no southbound sim or gridsim admin API is " +
+			"configured for this run, so there was nothing to reset")
+		return nil
+	}
+	// The reset epoch(s), recorded in the run's own transcript: the fence a
+	// reader can point to as "everything this campaign observed happened
+	// AFTER this line". A fuller wire into bundle.CampaignRecord's own notes
+	// field would need a runner.go change, which is WP7-T2's file in this
+	// task's division of labour, not this one's.
+	reporter.Line("preflight: sim reset (QAGAMUT2-001) — %s", strings.Join(acks, ", "))
+	return nil
+}
+
+// simResetTarget names one southbound sim's simapi base URL for
+// preflightSimReset.
+type simResetTarget struct {
+	name, url string
+}
+
+// simResetTargets lists every southbound sim this run is configured against.
+// ModSim/MBAPSDev are named exactly as runner.go's own `sims` map keys them
+// (Run's sims := map[string]*SimClient{"modsim": ..., "mbapsdev": ...}), so a
+// reader comparing this run's log against that map sees the same two names;
+// Extra covers a suite-specific sidecar (Targets.WithEndpoint) the same way
+// Run's own loop over Targets.Extra does.
+func simResetTargets(t Targets) []simResetTarget {
+	out := []simResetTarget{
+		{name: "modsim", url: t.ModSimAPI},
+		{name: "mbapsdev", url: t.MBAPSDevAPI},
+	}
+	names := make([]string, 0, len(t.Extra))
+	for name := range t.Extra {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		url := t.Extra[name]
+		if strings.HasPrefix(url, "http") {
+			out = append(out, simResetTarget{name: name, url: url})
+		}
+	}
+	return out
+}
+
+// clearGridSimPrograms deletes the admin-posted controls and curves from
+// every program gridsim's own /admin/status enumerates — the bare-DELETE
+// shape cmd/dashboard/replay.go's restoreBench already uses to return the
+// demo bench to a clean state (see this section's own doc for why a bare
+// delete is the right instrument HERE, before case 1, and not the fenced
+// cancel-then-delete teardown.go's mid-campaign teardown performs).
+//
+// It returns the number of programs it attempted to clear. A gridsim whose
+// /admin/status does not answer at all is reported as an error (unprovable
+// on a gating campaign, per the caller); a program whose own DELETE fails is
+// folded into that same error so the caller's refusal names it.
+func clearGridSimPrograms(ctx context.Context, admin *AdminClient) (int, error) {
+	var st struct {
+		Programs []struct {
+			ID int `json:"id"`
+		} `json:"programs"`
+	}
+	if err := admin.Status(ctx, &st); err != nil {
+		return 0, fmt.Errorf("read gridsim's program list: %w", err)
+	}
+	var firstErr error
+	for _, p := range st.Programs {
+		for _, path := range []string{"/admin/control", "/admin/curve"} {
+			if _, err := admin.Raw(ctx, http.MethodDelete, path, map[string]any{"program": p.ID}); err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("DELETE %s (program %d): %w", path, p.ID, err)
+				}
+			}
+		}
+	}
+	return len(st.Programs), firstErr
 }

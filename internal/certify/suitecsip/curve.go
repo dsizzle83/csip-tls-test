@@ -1693,9 +1693,18 @@ func modelList(uv invariant.UnitView) string {
 // oracledSetup's doc gives: "the DER holds this curve after the control was
 // published" is a fact about the DER, not about the DUT, until it is paired
 // with "and it did not hold it before". Curve rows have no ladder to fall back
-// on — a curve is the row's own published content and may not be substituted —
-// so a DER that already holds the row's curve produces a decided non-PASS
-// (curveOutcome), not a quiet pass on a stale register.
+// on — a curve is the row's own published content and may not be substituted.
+//
+// WP7-T6: before this, a DER that already held the row's curve at baseline
+// still had that curve published on top of it, and curveOutcome's `case
+// certify.Pass:` arm turned the coincidence into a decided FAIL — "ALREADY
+// held it before this row published anything ... not reported as a PASS" — a
+// bench-contamination finding graded as a DUT defect. This refuses to publish
+// at all when the pre-read already matches: nothing about the row's target is
+// touched, and oracleContaminationParam records why, which
+// inverterControlSpec turns into an honest SKIP ahead of the row's normal
+// criteria (which would otherwise grade wire delivery of a control that was
+// never sent).
 //
 // Recording the minted mRID is a correctness fix in its own right. gridsim
 // MINTS the mRID for a curve-bound control (sim/gridsim/curve.go: it is
@@ -1707,6 +1716,10 @@ func curveSetup(ctx context.Context, d *Driver, params map[string]string, b *cur
 	pre := oracleCurve(b)(ctx, d.rc)
 	params[oraclePreVerdictParam] = string(pre.Verdict)
 	params[oraclePreObservedParam] = findingObserved(pre)
+	if pre.Verdict == certify.Pass {
+		markBaselineContamination(params, pre)
+		return nil
+	}
 	params[curvePublishedParam] = b.describePublished()
 	recordCurveTarget(ctx, d, params, b)
 	recordCurveDeliveryBaseline(ctx, d, params, 0)

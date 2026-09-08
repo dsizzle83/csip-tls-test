@@ -124,6 +124,27 @@ func (f *mbapsFaults) stallInfo() (armed bool, delay time.Duration) {
 	return f.stallHandshake, f.stallDelay
 }
 
+// clear disarms every mbaps-transport fault kind (drop_session, refuse_resume,
+// stall_handshake), returning the state to its zero value — the same "fully
+// unarmed" posture a freshly constructed Device starts in (see mbapsFaults's
+// own doc). It is the BaselineStore.OnReset hook POST /reset runs for this
+// layer (WP7-T6, reset.go): the register-level faults sim.SolarServer.
+// ClearFaults already disarms have no visibility into this layer, which is
+// mbapsdev's own, so a reset that omitted this call would leave a prior
+// row's drop_session or stall_handshake armed across the campaign boundary
+// it was supposed to clear.
+func (f *mbapsFaults) clear() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// Fields only — never `*f = mbapsFaults{}`, which would overwrite f.mu
+	// itself with a fresh, unlocked Mutex out from under this very Lock and
+	// panic ("unlock of unlocked mutex") on the deferred Unlock above.
+	f.dropSession = false
+	f.refuseResume = false
+	f.stallHandshake = false
+	f.stallDelay = 0
+}
+
 // snapshot returns a JSON-serializable view of the armed mbaps-fault state,
 // folded into GET /state (see main.go's stateSnapshot) for QA visibility.
 type mbapsFaultsSnapshot struct {

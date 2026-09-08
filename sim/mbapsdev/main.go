@@ -139,6 +139,13 @@ type modelBundle struct {
 	// post-construction identity overrides (SetFirmwareVersion) reach the
 	// register image without newModel growing a parameter per field.
 	base *sim.Server
+	// clearFaults disarms every provocation the underlying model can be
+	// holding (sim.SolarServer.ClearFaults — see reset.go), or nil on a model
+	// with no such surface (WP7-T6: BatteryServer declares none today, the
+	// same gap batsim's own POST /reset — which does not exist — already
+	// carries; a reset against the battery model still restores its register
+	// IMAGE, just not any battery-specific fault state).
+	clearFaults func()
 }
 
 // newModel builds the animated SunSpec register world for -model, bound to a
@@ -211,14 +218,15 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 			return nil, fmt.Errorf("mbapsdev: new legacy-curve inverter model: %w", err)
 		}
 		return &modelBundle{
-			regs:      srv.Regs,
-			snapshot:  func() any { return srv.Snapshot() },
-			inject:    srv.Inject,
-			registers: func() any { return srv.Registers() },
-			fault:     srv.ApplyFault,
-			control:   controlFunc("inverter-legacy-curves", srv.Server, srv),
-			stop:      srv.Stop,
-			base:      srv.Server,
+			regs:        srv.Regs,
+			snapshot:    func() any { return srv.Snapshot() },
+			inject:      srv.Inject,
+			registers:   func() any { return srv.Registers() },
+			fault:       srv.ApplyFault,
+			control:     controlFunc("inverter-legacy-curves", srv.Server, srv),
+			stop:        srv.Stop,
+			base:        srv.Server,
+			clearFaults: srv.ClearFaults,
 		}, nil
 	case "inverter":
 		if serial == "" {
@@ -229,14 +237,15 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 			return nil, fmt.Errorf("mbapsdev: new inverter model: %w", err)
 		}
 		return &modelBundle{
-			regs:      srv.Regs,
-			snapshot:  func() any { return srv.Snapshot() },
-			inject:    srv.Inject,
-			registers: func() any { return srv.Registers() },
-			fault:     srv.ApplyFault,
-			control:   controlFunc("inverter", srv.Server, srv),
-			stop:      srv.Stop,
-			base:      srv.Server,
+			regs:        srv.Regs,
+			snapshot:    func() any { return srv.Snapshot() },
+			inject:      srv.Inject,
+			registers:   func() any { return srv.Registers() },
+			fault:       srv.ApplyFault,
+			control:     controlFunc("inverter", srv.Server, srv),
+			stop:        srv.Stop,
+			base:        srv.Server,
+			clearFaults: srv.ClearFaults,
 		}, nil
 	case "battery":
 		srv, err := sim.NewBatteryServerAdvanced(loopbackAny, kwh, wmax)
@@ -252,6 +261,8 @@ func newModel(kind string, wmax, kwh float64, serial string) (*modelBundle, erro
 			control:   controlFunc("battery", srv.Server, nil),
 			stop:      srv.Stop,
 			base:      srv.Server,
+			// clearFaults left nil — BatteryServer declares no fault-clear
+			// surface today (see modelBundle.clearFaults's doc).
 		}, nil
 	default:
 		return nil, fmt.Errorf("mbapsdev: unknown -model %q (want inverter|inverter-legacy-curves|battery)", kind)
@@ -421,6 +432,22 @@ func main() {
 			mb.control,
 		)
 		api.SetFaultFn(d.ApplyFault)
+
+		// WP7-T6: the as-built baseline, captured AFTER every construction-time
+		// lever (-model, -wmax, -kwh, -serial, -fw-version) has been applied and
+		// BEFORE any client can dial in, so POST /reset restores the device this
+		// invocation actually asked for — mirrors modsim's own ordering
+		// (sim/modsim/main.go), which this device's reset endpoint has lacked
+		// since it was first built.
+		epoch := sim.NewEpoch()
+		baselines := sim.NewBaselineStore(mb.regs)
+		baselines.OnReset("mbaps-transport faults (drop_session, refuse_resume, stall_handshake)", d.faults.clear)
+		if mb.clearFaults != nil {
+			baselines.OnReset("device faults (register, lying, legacy-curve, reversion timers)", mb.clearFaults)
+		}
+		baselines.Capture(sim.BaselineName)
+		wireDeterministic(api, epoch, baselines)
+
 		// Tee logs into the API ring so the dashboard's Logs tab can stream
 		// them, exactly like the plain sims.
 		log.SetOutput(io.MultiWriter(os.Stderr, api.LogWriter()))

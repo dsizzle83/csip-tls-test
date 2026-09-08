@@ -279,6 +279,19 @@ func (s *SimClient) Fault(ctx context.Context, body, out any) error {
 	return s.json(ctx, http.MethodPost, "/fault", body, out)
 }
 
+// Reset posts POST /reset — restore a named baseline register image and
+// disarm every fault layer the sim can hold, so a GATING campaign's rows
+// measure a known device rather than whatever a prior run's injections,
+// faults or applied controls left behind (WP7-T6, REV0907-E6;
+// QAGAMUT2-001-SIMULATOR-STATE-NOT-RESET-BETWEEN-RUNS). See
+// preflightSimReset, the one caller. A sim built before it supported
+// POST /reset answers 501, which s.json turns into an "HTTP 501" error —
+// preflightSimReset treats that as an unprovable precondition, never a
+// silent no-op.
+func (s *SimClient) Reset(ctx context.Context, body, out any) error {
+	return s.json(ctx, http.MethodPost, "/reset", body, out)
+}
+
 // Raw is the escape hatch.
 func (s *SimClient) Raw(ctx context.Context, method, path string, body any) ([]byte, error) {
 	return s.do(ctx, method, path, body)

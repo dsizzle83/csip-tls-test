@@ -45,7 +45,11 @@ package suitecsip
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
+
+	"csip-tls-test/internal/invariant"
 )
 
 // releaseProgramControls is the cancel-then-delete teardown for one or more
@@ -100,6 +104,15 @@ func (d *Driver) releaseProgramControls(ctx context.Context, programs ...int) er
 		record(d.ClearControls(ctx, program))
 		record(d.ClearCurves(ctx, program))
 	}
+
+	// (d) WP7-T6: log — never fail — where the DER's own ceiling axis sits
+	// once the fence and the deletes above are done. See
+	// logPostTeardownBaseline's own doc: this is what lets the NEXT row's
+	// baseline-contamination message (basic.go's markBaselineContamination)
+	// attribute a residual reading to the teardown that actually left it,
+	// instead of leaving a reader to guess which of several prior rows did.
+	logPostTeardownBaseline(ctx, d, programs)
+
 	return firstErr
 }
 
@@ -126,3 +139,101 @@ func teardownFenceWindow(ctx context.Context) time.Duration {
 // deleteHeadroom is reserved, after the poll fence, for the ClearControls +
 // ClearCurves DELETEs to complete inside the same detached context.
 const deleteHeadroom = 5 * time.Second
+
+// ── The post-teardown baseline note (WP7-T6) ────────────────────────────────
+//
+// # What this closes
+//
+// Residual applied state from row N used to be caught only by row N+1's own
+// oracle, at row N+1's Setup — by which point the contamination has already
+// happened and the only thing row N+1 can say is "residual from prior row?",
+// a question with no answer a bundle reader can chase down. This makes it an
+// answer: teardown itself, best-effort and non-fatal exactly like the
+// cancel-then-delete it follows, reads the DER's own ceiling axis (the
+// registers this file's header doc already names as "the standing
+// DefaultDERControl") right after its own fence-and-delete finishes, and
+// records what it saw. The NEXT row's markBaselineContamination (basic.go)
+// reads it back and folds it into ITS reason, so a contamination is
+// attributed to the row whose teardown actually left it — not merely
+// flagged as unexplained residue.
+//
+// # Why package-level state
+//
+// A fresh *Driver is built for every row (run(), check.go), so nothing on d
+// survives from one row's Cleanup to the next row's Setup. observe.go's own
+// runDERBaseline* (markRunBaseline/derPutsInRun) already carries a
+// process-wide fact the same way, for the same structural reason — one
+// process runs every row of a campaign in sequence, and "the last thing
+// teardown saw" is exactly that kind of fact.
+var (
+	teardownNoteMu  sync.Mutex
+	teardownNoteVal string
+)
+
+// logPostTeardownBaseline is releaseProgramControls' step (d): read the DER's
+// ceiling axis and record what it holds, for the reason given above.
+//
+// It is BEST-EFFORT, like everything else in this file — an unreadable DER,
+// no admin API, or a DER that serves neither ceiling generation all produce a
+// short, honest note rather than an error, and NOTHING here can fail the row
+// whose Cleanup is calling it. The read runs inside whatever remains of the
+// teardown's own detached context (teardownFenceWindow's caller already
+// budgeted deleteHeadroom for the deletes above; this shares that same
+// context rather than opening a new one, so it costs no additional wall time
+// budget of its own).
+func logPostTeardownBaseline(ctx context.Context, d *Driver, programs []int) {
+	if d == nil || d.rc == nil {
+		return
+	}
+	uid := "?"
+	if d.rc.Case != nil {
+		uid = d.rc.Case.UID
+	}
+	note := func(text string) {
+		teardownNoteMu.Lock()
+		teardownNoteVal = fmt.Sprintf("%s's teardown (program(s) %v) left the DER's ceiling axis reading: "+
+			"%s (observed %s)", uid, programs, text, time.Now().UTC().Format(time.RFC3339))
+		teardownNoteMu.Unlock()
+	}
+
+	uv, err := oracleUnitView(ctx, d.rc, oracleSimName)
+	if err != nil {
+		note(fmt.Sprintf("could not be read after teardown: %v", err))
+		return
+	}
+	home, why := ceilingHomeOf(uv)
+	if why != "" {
+		note("no ceiling register home on this DER: " + why)
+		return
+	}
+	meas := uv.Measurement(oracleSimName)
+	for _, c := range home.Cmds {
+		if c.Point != home.Point {
+			continue
+		}
+		r := invariant.ResolveCommand(c, home.NP, meas)
+		note(fmt.Sprintf("%s enabled=%v, resolves to %s", home.Point, c.Enabled, r.Physical))
+		return
+	}
+	note(fmt.Sprintf("%s not present in the DER's own command surface after teardown", home.Point))
+}
+
+// lastTeardownNote returns the most recent post-teardown observation
+// logPostTeardownBaseline recorded, or "" when none has run yet in this
+// process (the first row of a campaign, or a run with no gridsim admin API
+// to have driven a teardown at all). markBaselineContamination (basic.go)
+// folds this into its own reason when non-empty.
+func lastTeardownNote() string {
+	teardownNoteMu.Lock()
+	defer teardownNoteMu.Unlock()
+	return teardownNoteVal
+}
+
+// resetTeardownNote clears the process-wide teardown note. It exists for
+// tests that exercise it directly (mirrors observe.go's resetRunBaseline);
+// the runner never calls it.
+func resetTeardownNote() {
+	teardownNoteMu.Lock()
+	teardownNoteVal = ""
+	teardownNoteMu.Unlock()
+}

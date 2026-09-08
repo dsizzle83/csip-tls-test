@@ -250,7 +250,20 @@ func (m controlMode) measured() bool {
 // outcome is the ONE definition of a measured row's verdict, dispatched by
 // which apparatus the row carries. Notes, the criterion and spec.Verdict all
 // read it, so a bundle can never show the three disagreeing.
+//
+// WP7-T6: checked BEFORE the per-apparatus dispatch, because a contaminated
+// row published NOTHING (directSetup/curveSetup/oracledSetup's exhausted-
+// ladder branch all refuse rather than publish — see oracleContaminationParam)
+// — refusalOutcome/curveOutcome/oracleOutcome all assume a control went out
+// and would either find no post-read to report (Fail: "no southbound oracle
+// result") or, worse, still see the pre-existing register match and repeat
+// the exact false-FAIL this refusal exists to stop. An honest SKIP, naming
+// the register a bundle reader can attribute to the row that actually left
+// it, is the only verdict a row that measured nothing may carry.
 func (m controlMode) outcome(o *Observation) Finding {
+	if reason := o.Param(oracleContaminationParam); reason != "" {
+		return Finding{Verdict: certify.Skip, Observed: reason}
+	}
 	m = m.forObservation(o)
 	switch {
 	case m.Refusal != nil:
@@ -415,7 +428,80 @@ const (
 	// the shortfall and credit prose say exactly that, so a bundle reader is
 	// never told Figure 7 prescribed a value it does not.
 	oracleDefaultProvenanceParam = "iw15.oracle_default_provenance"
+
+	// oracleContaminationParam carries WP7-T6's precondition refusal
+	// (REV0907-E6; CSIP-BENCH-BASIC007-ORACLE-STATE-CONTAMINATION;
+	// QAGAMUT2-001-SIMULATOR-STATE-NOT-RESET-BETWEEN-RUNS): non-empty exactly
+	// when Setup's OWN pre-publication oracle read found the DER's actuator
+	// register(s) already indistinguishable from the value this row was about
+	// to command, with no ladder alternate (scalar rows) or no ladder shape at
+	// all (direct/curve rows) to depart onto.
+	//
+	// Before this existed, that state was published anyway and graded after
+	// the fact: oracleOutcome/curveOutcome's `case certify.Pass:` arm — "the
+	// DER holds the commanded value but ALREADY held it before this row
+	// published anything" — turned a bench contamination into a FAIL of a
+	// possibly-conformant DUT, on a run whose own window it consumed to
+	// produce that FAIL. This key is set INSTEAD of publishing (directSetup,
+	// curveSetup, and oracledSetup's exhausted-ladder branch), and
+	// inverterControlSpec reads it before anything else to force an honest
+	// SKIP — never a PASS, never a FAIL — naming the register and value a
+	// bundle reader can attribute to the row that actually left it.
+	oracleContaminationParam = "wp7t6.oracle_contamination"
 )
+
+// markBaselineContamination records that a row's pre-publication baseline was
+// indistinguishable from the value it was about to command, in the ONE
+// sentence shape every caller uses (WP7-T6) — so a bundle reader who greps
+// for "baseline indistinguishable" finds every row this ever fired on, in one
+// wording, regardless of which apparatus (scalar ladder, direct, curve) found
+// it.
+//
+// pre is the row's own pre-publication Finding — already a full sentence
+// naming the register and the value it read (e.g. oracleMaxLimW's "the DER's
+// own WMaxLimPct resolves to a 4800.0 W active-power ceiling ...") — so this
+// wraps it rather than re-deriving the register name a second time.
+//
+// The fixed "(residual from prior row?)" question mark is answered where it
+// can be: teardown.go's logPostTeardownBaseline records, best-effort and
+// process-wide, what the LAST row's own teardown left the DER's ceiling axis
+// reading at. When that note is present it is appended here, so the question
+// this reason asks and the answer teardown itself observed travel in the same
+// sentence instead of leaving a reader to correlate two separate log lines.
+func markBaselineContamination(params map[string]string, pre Finding) {
+	reason := fmt.Sprintf(
+		"baseline indistinguishable from target: %s (residual from prior row?)", findingObserved(pre))
+	if note := lastTeardownNote(); note != "" {
+		reason += " — " + note
+	}
+	params[oracleContaminationParam] = reason
+}
+
+// critBaselineContaminated is the ONE criterion a WP7-T6-refused row carries:
+// a load-bearing, Construction-tiered Skip naming why. It is Construction
+// rather than Wire/Server because the decision was already made, live, in
+// Setup, before any control went out — "the only arm that cannot be starved"
+// (criterion.Construction's own doc), which matters here specifically because
+// a contaminated row's capture may carry no recovered session at all (nothing
+// was published for the DUT to fetch) and a criterion gated on one would fall
+// through to an UNMARKED SkipAssertion instead of this LOAD-BEARING one.
+//
+// It is the ONLY criterion inverterControlSpec's Criteria returns on a
+// contaminated row (see its own doc): mixing it with any Pass/Fail assertion
+// would let worstOf's max-taking roll-up (runner.go) outrank this Skip and
+// the case would read as decided when nothing was ever measured.
+func critBaselineContaminated(reason string) criterion {
+	return criterion{
+		Claim: "the DER's baseline, read before this row published anything, was distinguishable from " +
+			"the value this row was about to command",
+		How: "the row's own southbound oracle (internal/invariant, via the simapi sidecar), read BEFORE " +
+			"any control was published and compared against the value this row would have commanded",
+		LoadBearing: true,
+		Construction: func() Finding {
+			return Finding{Verdict: certify.Skip, Observed: reason}
+		},
+	}
+}
 
 // defaultControlMRIDSuffix distinguishes the prescribed default's control from
 // the row's own. The two must be separately addressable: gridsim treats a
@@ -780,6 +866,13 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 	var publishedMRID string
 	s := spec{
 		Notes: func(o *Observation) string {
+			// WP7-T6: checked FIRST, ahead of Unreachable — a row can only
+			// reach the contamination refusal by first being publishable, so
+			// the two are mutually exclusive, but this ordering keeps the
+			// reason a reader sees matching whichever refusal actually fired.
+			if reason := o.Param(oracleContaminationParam); reason != "" {
+				return reason
+			}
 			m := m.forObservation(o)
 			if m.Unreachable != "" {
 				return "the control mode this row is about cannot be published by this bench: " + m.Unreachable
@@ -798,6 +891,21 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 			return notes
 		},
 		Criteria: func(o *Observation) []criterion {
+			// WP7-T6: a contaminated baseline short-circuits EVERYTHING else.
+			// Setup published nothing (directSetup/curveSetup/oracledSetup's
+			// exhausted-ladder branch all refuse rather than publish when the
+			// pre-read already matches the target), so every criterion below
+			// this point — which grades wire delivery, Response lifecycle and
+			// southbound effect of a control the DUT was never sent — would be
+			// grading evidence that cannot exist. Returning the ONE load-
+			// bearing Skip criterion here, and nothing else, is what keeps the
+			// case's roll-up (worstOf, runner.go) an honest SKIP: any Pass or
+			// Fail assertion alongside it would outrank it in the max-taking
+			// roll-up and the case would read as decided when it was never
+			// run.
+			if reason := o.Param(oracleContaminationParam); reason != "" {
+				return []criterion{critBaselineContaminated(reason)}
+			}
 			// The apparatus this row used depends on which DER generation the
 			// live phase found (forGeneration). Resolving it HERE, from the
 			// record Setup left, is what keeps the criteria, the notes and the
@@ -938,6 +1046,14 @@ func inverterControlSpec(m controlMode, subject, mrid string) spec {
 		// A criterion cannot carry a verdict past a run with no transcript
 		// (criterion.assert reaches Wire only when one was recovered), and this
 		// row's whole finding is that nothing was tested.
+		//
+		// Unreachable and WP7-T6's contamination refusal cannot both fire on
+		// the same row: publishable() (below) is false whenever Unreachable is
+		// set, which is exactly what keeps s.Setup — the only place
+		// oracleContaminationParam is ever written — from running at all. The
+		// measured rows' OWN s.Verdict (inside `if m.measured()` below) is
+		// where contamination is actually decided, through m.outcome — see its
+		// doc.
 		s.Verdict = func(*Observation) certify.Verdict { return certify.Fail }
 	}
 	if m.publishable() {
@@ -1231,9 +1347,25 @@ func oracledSetup(ctx context.Context, d *Driver, params map[string]string, b *o
 			params[oracleNoteParam] = fmt.Sprintf("the DER already held the catalog's commanded %s AND "+
 				"every alternate on the ladder (%s) was either unreadable or already held, so no value "+
 				"exists this run could have commanded and then observed the DER MOVE to. The row "+
-				"published the catalog's value anyway (the wire criteria are still worth collecting), "+
-				"but its southbound reading cannot be evidence of anything and is reported as such",
+				"published NOTHING (WP7-T6) — a value it cannot tell apart from what was already there "+
+				"is not a test of anything the DUT does",
 				pctString(want), pctList(b.Ladder))
+			// WP7-T6: the ladder is EXHAUSTED — the DER already holds every
+			// value this row could command. Before this, the row published the
+			// catalog's value anyway and oracleOutcome's `case certify.Pass:`
+			// arm FAILed it after the fact ("no ladder alternate ... was
+			// available") — a bench-contamination finding graded as a DUT
+			// defect, at the cost of the row's whole observation window. This
+			// refuses to publish instead: there is nothing left this run could
+			// command and then observe the DER MOVE to, so it commands nothing
+			// and reports why via oracleContaminationParam, which
+			// inverterControlSpec turns into an honest SKIP before the row's
+			// normal criteria run.
+			params[oracleCommandedParam] = strconv.FormatInt(want, 10)
+			params[oraclePreVerdictParam] = string(pre.Verdict)
+			params[oraclePreObservedParam] = findingObserved(pre)
+			markBaselineContamination(params, pre)
+			return nil
 		}
 	}
 	params[oracleCommandedParam] = strconv.FormatInt(want, 10)

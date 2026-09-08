@@ -129,11 +129,28 @@ func directMode(element string, d *directOracle, apply func(*ControlRequest)) co
 // evidence only against a reading that did NOT — a TRANSITION — because a DER
 // that already held this content proves nothing about the control just sent.
 // oracleOutcome reads both and says so; see its doc for the shapes.
+//
+// WP7-T6: a structured-content row has NO LADDER to depart onto (unlike
+// oracledSetup's scalar rows) — its content IS the row's subject, so there is
+// no alternate value to command instead. Before this, a pre-read that already
+// matched (Pass) published anyway and let curveOutcome's sibling,
+// oracleOutcome, FAIL the row after the fact for "no ladder alternate was
+// available" — a bench-contamination finding reported as a DUT defect,
+// consuming the row's whole observation window to reach it. This refuses to
+// publish AT ALL in that state instead: the row commands nothing it cannot
+// tell apart from what was already there, and reports why via
+// oracleContaminationParam, which inverterControlSpec turns into an honest
+// SKIP before the row's normal criteria — which would otherwise grade a
+// control that was never sent — ever run.
 func directSetup(ctx context.Context, d *Driver, params map[string]string, o *directOracle,
 	publish func(ctx context.Context, d *Driver, mrid string) error, mrid string) error {
 	pre := o.judgeWith(ctx, d.rc)
 	params[oraclePreVerdictParam] = string(pre.Verdict)
 	params[oraclePreObservedParam] = findingObserved(pre)
+	if pre.Verdict == certify.Pass {
+		markBaselineContamination(params, pre)
+		return nil
+	}
 	if publish == nil {
 		return fmt.Errorf("suitecsip: %s carries a direct oracle and no publisher", o.Axis)
 	}
