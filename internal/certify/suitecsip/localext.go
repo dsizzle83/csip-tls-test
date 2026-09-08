@@ -109,11 +109,6 @@ func wattVarBinding() *curveBinding {
 	}
 }
 
-// localExtensionIDs are the in-document ids this family registers, for the tests
-// that assert the family's posture holds for every one of them rather than for
-// the one that happened to be written first.
-func localExtensionIDs() []string { return []string{"EXT-001", "EXT-002", "EXT-003", "EXT-004"} }
-
 // NOTE ON WHERE THE EXCLUSION LIVES. Nothing in this file special-cases itself
 // at run time. The rows register, run and are graded exactly like any other; the
 // exclusion from certification tallies is carried by the CATALOG record

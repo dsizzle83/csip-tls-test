@@ -40,7 +40,7 @@ func captureClientHello(t *testing.T, spec Spec) *tlsdis.ClientHello {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	captured := make(chan []byte, 1)
 	go func() {
@@ -49,7 +49,7 @@ func captureClientHello(t *testing.T, spec Spec) *tlsdis.ClientHello {
 			captured <- nil
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var buf []byte
 		read := make([]byte, 4096)
 		for {

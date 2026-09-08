@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -201,6 +202,13 @@ func TestLoadPKIDiscoversTheBenchFixtures(t *testing.T) {
 	p, err := LoadPKI("../../certs/mbaps")
 	if err != nil {
 		t.Skipf("bench PKI fixtures not present: %v", err)
+	}
+	// The private halves (*-key.pem) are deliberately held out of git by
+	// .gitignore, so a clean clone (CI) carries the certificates but not the
+	// keys: that is "fixtures not generated", not a discovery defect.
+	// `make gen-mbaps-certs` produces the full set on a bench.
+	if _, statErr := os.Stat("../../certs/mbaps/clients/read-only-key.pem"); statErr != nil {
+		t.Skipf("bench PKI private keys not generated (run make gen-mbaps-certs): %v", statErr)
 	}
 	for _, role := range []string{"read-only", "grid-service", "net-admin", "super-admin"} {
 		if _, err := p.Role(role); err != nil {

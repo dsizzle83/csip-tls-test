@@ -552,10 +552,13 @@ func (c *cli) runGenSignKey(stdout, stderr io.Writer) int {
 		fatal(stderr, err)
 		return exitUsage
 	}
-	fmt.Fprintf(stdout, "generated ed25519 signing key %s\n", keyID)
-	fmt.Fprintf(stdout, "  private key (mode 0600 — KEEP OUTSIDE ANY REPOSITORY): %s\n", privPath)
-	fmt.Fprintf(stdout, "  public key  (hand this to a certification lab):       %s\n", pubPath)
-	fmt.Fprintf(stdout, "\nsign a campaign's bundle with:\n  certify -campaign ... -sign-key %s\n", privPath)
+	// Console output: a failed write to stdout is not something this command
+	// can act on (the key files are already on disk), so the returns are
+	// deliberately discarded rather than turned into a spurious exit code.
+	_, _ = fmt.Fprintf(stdout, "generated ed25519 signing key %s\n", keyID)
+	_, _ = fmt.Fprintf(stdout, "  private key (mode 0600 — KEEP OUTSIDE ANY REPOSITORY): %s\n", privPath)
+	_, _ = fmt.Fprintf(stdout, "  public key  (hand this to a certification lab):       %s\n", pubPath)
+	_, _ = fmt.Fprintf(stdout, "\nsign a campaign's bundle with:\n  certify -campaign ... -sign-key %s\n", privPath)
 	fmt.Fprintf(stdout, "check one against it with:\n  certify -verify runs/<ts>/ -pubkey %s\n", pubPath)
 	return exitOK
 }

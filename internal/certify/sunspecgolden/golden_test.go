@@ -2,7 +2,6 @@ package sunspecgolden_test
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
@@ -11,15 +10,10 @@ import (
 	"lexa-proto/sunspec"
 )
 
-// driftEnvVar gates the ONLY acceptable way to silence a known mismatch
-// between lexa-proto's vendored sunspec package and this package's
-// independently-sourced golden. The lead sets it for exactly one run, to
-// prove the golden finds the drift it is supposed to find (M120, M122 and
-// M802 are wrong at the pinned lexa-proto commit a3eeb10 — see
-// docs/testdata/models/SOURCES.md and the finding cited in each subtest
-// below); it is never set in CI or in a developer's normal test run, so the
-// default `go test` sees every disagreement as a hard failure.
-const driftEnvVar = "SUNSPEC_GOLDEN_EXPECT_DRIFT"
+// Every model in this file hard-fails on a mismatch: the SUNSPEC_GOLDEN_EXPECT_DRIFT
+// escape hatch that existed while lexa-proto's M120/M122/M802 layouts were
+// known-wrong (a3eeb10) was retired once the pin moved to e96853d, so a
+// disagreement between the golden and lexa-proto is always a real finding.
 
 // typeToLexa maps this package's spec-token FieldType onto lexa-proto's own
 // FieldType enum, so a Layout-backed model (701-712) can be compared without
@@ -52,23 +46,6 @@ func reportMismatches(t *testing.T, model string, mismatches []string) {
 	}
 	t.Fatalf("%s: %d point(s) disagree with the independently-sourced golden (testdata/models/SOURCES.md):\n%s",
 		model, len(mismatches), strings.Join(mismatches, "\n"))
-}
-
-// reportDrift is reportMismatches EXCEPT that a mismatch is downgraded to a
-// skip when SUNSPEC_GOLDEN_EXPECT_DRIFT=1 is set. Use ONLY for the three
-// models known-wrong at the vendored pin.
-func reportDrift(t *testing.T, model, knownUntil string, mismatches []string) {
-	t.Helper()
-	if len(mismatches) == 0 {
-		return
-	}
-	msg := fmt.Sprintf("%s: %d point(s) disagree with the independently-sourced golden (testdata/models/SOURCES.md):\n%s",
-		model, len(mismatches), strings.Join(mismatches, "\n"))
-	if os.Getenv(driftEnvVar) == "1" {
-		t.Skipf("known drift until proto pin >= %s: %s", knownUntil, msg)
-		return
-	}
-	t.Fatal(msg)
 }
 
 // compareLayout checks a lexa-proto *sunspec.Layout against a golden point
