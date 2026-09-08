@@ -52,7 +52,9 @@ Reading the 62-row output:
   Their evidence names the reason. A SKIP is not a failure.
 - The rows that print PASS against the LIVE gateway are the ones to flip `impl`→`verified`
   in `docs/requirements/secure-sunspec-modbus-traceability.md` (lexa-gw).
-- Emit the dated section with `-md`, then append it to `CONFORMANCE_REPORT.md` (root).
+- Emit the dated section with `-md`, then append it to `docs/history/CONFORMANCE_REPORT.md`
+  (WP7-T9a moved it out of the root; see `docs/history/README.md` — it is a
+  hub-era report kept for finding-id traceability, not the current one).
 
 ## 4. Pi-side full-stack (only when asked — needs the bench)
 `make conformance-pi`, `make modbus-conformance-pi` (SSH to bench, cgo wolfSSL on the Pi).
@@ -63,4 +65,5 @@ Reading the 62-row output:
   Modbus) or Secure SunSpec Modbus v1.0 (the SunSpecTCP-N rows).
 - A meter FAIL on derived registers (VA/VAR/A vs W) is usually MTR-5 class: derived values
   not refreshed on power update.
-- Record outcomes in `CONFORMANCE_REPORT.md` (root) using its existing format and date the entry.
+- Record outcomes in `docs/history/CONFORMANCE_REPORT.md` using its existing
+  format and date the entry (see the note in §3 above about its moved path).

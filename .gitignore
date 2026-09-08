@@ -39,6 +39,10 @@ text_reader.txt
 /httpsim
 /mbapsdev
 /metersim
+# commit 4645407 (2026-07-28) `git add`-ed a stale root-level build of this
+# binary despite the rule below already covering it — ignore rules stop a
+# NEW file from being tracked, they do not untrack one already in the index.
+# WP7-T9a (REV0907-E10) removed the tracked copy; this line is what keeps it out.
 /modsim
 /modsim-client
 /modsim-conformance
