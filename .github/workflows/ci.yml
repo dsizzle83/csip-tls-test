@@ -1,24 +1,38 @@
 name: CI
 
 # TASK-003: build every sim/dashboard binary, run the fast unit suites, the
-# southbound suites, the QA-harness unit gate, and the protocol/conformance
-# logic tests on every PR and push to main.
+# southbound suites, the QA-harness unit gate, and the certify referee live
+# set (cmd/certify + cmd/gw-campaign's own oracles/evidence/campaign engine —
+# see WP7-T1 below) on every PR and push to main.
 #
-# Two jobs, split on the verified cgo boundary (grep -rl 'internal/wolfssl'
-# --include='*.go' .; grep -rl 'internal/tlsclient' --include='*.go' .):
-#   - pure-go:  everything that is CGO_ENABLED=0 clean. Builds every pure-Go
-#               sim/dashboard binary, vets them, and runs the southbound,
-#               QA-harness unit-gate, and ./tests/ conformance-logic suites.
-#               Verified locally (2026-07-04): `go test ./tests/` and the
-#               qa-regression unit gate need no cert fixtures — the only
-#               tests in those packages that touch testdata/certs are all
-#               `//go:build integration`-tagged and excluded by default.
+# Three non-scheduled jobs, split on the verified cgo boundary (grep -rl
+# 'internal/wolfssl' --include='*.go' .; grep -rl 'internal/tlsclient'
+# --include='*.go' .):
+#   - pure-go:  everything that is CGO_ENABLED=0 clean. Builds and vets the
+#               whole module (WP7-T10 landed the internal/wolfssl nocgo stub
+#               that makes `go build/vet ./...` succeed without cgo — see that
+#               step for detail) and runs the southbound and QA-harness
+#               unit-gate suites.
 #   - cgo-fast: caches a wolfSSL 5.7.6-stable build (identical recipe to
 #               TASK-002 / sim_gridsim.txt Step 1), then runs `make
 #               test-fast` (needs the cgo sysroot even though the TLS
 #               handshake tests inside it are integration-tagged, because
-#               internal/tlsclient itself is a cgo package) and builds the
-#               three cgo binaries (sim/server, sim/client, sim/conformance).
+#               internal/tlsclient itself is a cgo package), `make
+#               test-certify` + a -race pass over internal/tlsprobe and
+#               internal/mbtls (WP7-T1: the cgo half of the certify referee
+#               live set), and builds the three cgo binaries (sim/server,
+#               sim/client, sim/conformance).
+#   - referee:  WP7-T1 (REV0907-E1/H8/E10): the CGO_ENABLED=0 half of the
+#               certify referee live set — internal/certify/...,
+#               internal/evidence/..., internal/invariant and cmd/certify/...
+#               — proving cmd/certify stays usable with no TLS stack present.
+#               Before this task, hosted CI never ran any of these four
+#               package trees (the 130k-LOC oracle suites, the evidence
+#               bundle verifier, the ten-invariant predicates, or the
+#               conformance tool's own CLI) at all — see the CERTIFY_LIVE_SET
+#               comment in the Makefile for the full background and
+#               `make live-set-check` for the drift gate that keeps this
+#               job's coverage honest as imports change.
 #
 # Explicitly OUT of scope for hosted CI (bench-touching / hardware-in-the-
 # loop): `make test-integration` (real mTLS handshakes), `scripts/run-
@@ -243,38 +257,48 @@ jobs:
           fi
           echo "gofmt: all tracked non-vendor .go files are formatted."
 
-      - name: Build sim + dashboard binaries (pure Go)
-        run: |
-          go build ./sim/modsim ./sim/batsim ./sim/metersim ./sim/evsim \
-            ./sim/modsim-client ./sim/modsim-conformance ./sim/httpsim \
-            ./cmd/dashboard ./cmd/mqttproxy
+      # WP7-T10 landed internal/wolfssl's CGO_ENABLED=0 stub (wolfssl_nocgo.go)
+      # for the base API, not just the keylog extras — before that, this step
+      # had to enumerate the pure-Go package set by hand (internal/mbtls,
+      # internal/tlsclient, sim/tlsserver, and everything importing them, e.g.
+      # cmd/certify, failed to typecheck under CGO_ENABLED=0 with "undefined:
+      # wolfssl.NewClientCtxTLS" and friends). Verified locally (2026-09-08):
+      # `CGO_ENABLED=0 go build ./...` now succeeds whole-module.
+      - name: Build every pure-Go-buildable binary (whole module, CGO_ENABLED=0)
+        run: go build ./...
 
-      - name: Vet (pure-Go package set + southbound)
-        run: |
-          go vet ./sim/modsim ./sim/batsim ./sim/metersim ./sim/evsim \
-            ./sim/modsim-client ./sim/modsim-conformance ./sim/httpsim \
-            ./cmd/dashboard ./cmd/mqttproxy \
-            ./sim/southbound/... ./internal/southbound/...
+      - name: Vet (whole module, CGO_ENABLED=0 — see the build step above)
+        run: go vet ./...
 
+      # WP7-T1 (REV0907-E1/H8/E10): internal/csipref's own referee unit tests
+      # (walker/scheduler + TASK-048 fuzz seeds) and the ./tests/ conformance
+      # suite that used to run here are BOTH built on internal/csipref,
+      # internal/httpclient and internal/tlsclient — none of which
+      # cmd/certify or cmd/gw-campaign (the certify live set, see the
+      # CERTIFY_LIVE_SET comment in the Makefile) can import. This job's
+      # -race budget now goes to the referee/cgo-fast jobs' actual coverage
+      # of the live set instead. internal/csipref is a deliberately
+      # independent walker (AD-003(f)), not deleted — its tests still run by
+      # hand (`go test ./internal/csipref/...`); they are simply no longer a
+      # standing per-PR CI gate, since a green run there was never evidence
+      # that cmd/certify's own oracles work. `go test ./tests/ -run
+      # TestModbusConformance -v` (Makefile's `test-southbound`) covers the
+      # one slice of ./tests/ that does touch a live-set package
+      # (sim/southbound) and was not wired into ci.yml before this change
+      # either — it stays a local/manual gate, not newly regressed by this
+      # edit (KNOWN GAP, not this task's scope to close).
+      #
+      # internal/southbound/... (a DIFFERENT package from sim/southbound —
+      # the Modbus device-driver stack sim/modsim-client uses) is not part of
+      # CERTIFY_LIVE_SET either, but its own step below is left in place: it
+      # is real, referenced coverage (TASK-053's int16/scale-factor sweep,
+      # internal/southbound/sunspecsweep) with no other CI gate exercising
+      # it, unlike csipref/tests/, so removing it would be a silent coverage
+      # loss this task was not asked to make.
       - name: Southbound unit tests
         env:
           CGO_ENABLED: "1" # -race needs cgo (gcc, not wolfSSL) — WS-7, see note above `on:`
         run: go test -race ./internal/southbound/...
-
-      - name: csipref referee unit tests (walker/scheduler + TASK-048 fuzz seeds)
-        # internal/csipref (discovery + scheduler) has never had a direct
-        # `go test` step of its own in this job — go test ./tests/ below
-        # exercises it only indirectly through the conformance suites, so
-        # its own _test.go files (walker_test.go, scheduler_test.go,
-        # helpers_test.go, and now fuzz_test.go's seed-mode cases) were not
-        # actually running in CI. Adding this step closes that gap and is
-        # what makes TASK-048's "PR-lane seed checks add <5s" acceptance
-        # criterion true rather than aspirational (seed-only mode: plain
-        # `go test`, no -fuzz, runs each Fuzz func's f.Add seeds as regular
-        # subtests — verified locally at a few ms, not seconds).
-        env:
-          CGO_ENABLED: "1" # -race needs cgo — WS-7, see note above `on:`
-        run: go test -race ./internal/csipref/...
 
       # TASK-053: the generative int16/scale-factor boundary sweep (GAP-07)
       # needs no new step here — it lands as ordinary _test.go files in
@@ -289,11 +313,6 @@ jobs:
         env:
           CGO_ENABLED: "1" # -race needs cgo — WS-7; the script's own go test now passes -race (cmd/dashboard is concurrency-heavy)
         run: bash scripts/qa-regression.sh
-
-      - name: Conformance logic tests (go test ./tests/)
-        env:
-          CGO_ENABLED: "1" # -race needs cgo — WS-7, see note above `on:`
-        run: go test -race -count=1 ./tests/
 
   cgo-fast:
     name: cgo-fast
@@ -367,8 +386,77 @@ jobs:
       - name: make test-fast (cgo compiles; TLS-handshake tests inside stay integration-tagged)
         run: make test-fast WOLFSSL_SYSROOT="$WOLFSSL_SYSROOT"
 
+      # WP7-T1 (REV0907-E1/H8/E10): the cgo half of the certify referee gate.
+      # `make test-certify` covers CERTIFY_LIVE_SET_SELFTEST (see Makefile) —
+      # every package cmd/certify or cmd/gw-campaign can import, minus
+      # internal/mbtls and internal/tlsprobe — plus the CGO_ENABLED=0 build,
+      # the keylog configuration build (skipped here: this job's sysroot is
+      # the ordinary one, not WOLFSSL_KEYLOG_SYSROOT), the loopback
+      # acceptance test, and its own live-set-check (Makefile target) so a
+      # drifted CERTIFY_LIVE_SET fails THIS job, not just a local run.
+      # internal/mbtls/internal/tlsprobe run right after with their own
+      # -race pass: a -race unit pass over their pure-Go call sites proves
+      # nothing about whether they still complete a real wolfSSL handshake,
+      # so they get the real cgo build this job already carries the sysroot
+      # for, same as make test-fast above — the referee `nocgo` job (a
+      # CGO_ENABLED=0 job) cannot run either package at all (undefined
+      # wolfssl.* symbols without cgo). Together this step and the referee
+      # job's nocgo step cover CERTIFY_LIVE_SET exactly (make live-set-check
+      # is the standing proof of that, not a one-time claim).
+      - name: make test-certify (referee live set, cgo half)
+        run: make test-certify WOLFSSL_SYSROOT="$WOLFSSL_SYSROOT"
+
+      - name: tlsprobe + mbtls -race (real wolfSSL handshakes; live-set members test-certify does not cover)
+        run: go test -race ./internal/tlsprobe/... ./internal/mbtls/...
+
       - name: Build cgo binaries (sim/server, sim/client, sim/conformance)
         run: go build ./sim/server ./sim/client ./sim/conformance
+
+  # WP7-T1 (REV0907-E1/H8/E10): the nocgo half of the certify referee gate —
+  # see the CERTIFY_LIVE_SET comment in the Makefile for the "CI never ran
+  # this" background. This job runs the four live-set package trees that are
+  # genuinely CGO_ENABLED=0-clean (`make test-certify`'s own
+  # `CGO_ENABLED=0 go build/test ./cmd/certify` step already proved that for
+  # cmd/certify specifically): internal/certify/... (the oracle suites),
+  # internal/evidence/... (the bundle writer/verifier), internal/invariant
+  # (the ten-invariant campaign predicates) and cmd/certify/... itself.
+  # internal/mbtls, internal/tlsprobe, internal/wolfssl and everything that
+  # imports them (cmd/gw-campaign, internal/aggregator, internal/campaign,
+  # sim/gw-mayhem/gwloopback, sim/southbound) need a real wolfSSL sysroot to
+  # mean anything and cannot even build under CGO_ENABLED=0 (undefined
+  # wolfssl.* symbols) — the cgo-fast job's `make test-certify` +
+  # `go test -race ./internal/tlsprobe/... ./internal/mbtls/...` steps cover
+  # those. Together the two cover CERTIFY_LIVE_SET exactly; `make
+  # live-set-check` (run at the end of `make test-certify` in cgo-fast) is
+  # the standing proof that stays true as the live set changes.
+  #
+  # No -race here deliberately: -race needs cgo (a plain C compiler), which
+  # would defeat the point of this job proving the CGO_ENABLED=0 configuration
+  # actually works — the cgo-fast job above already runs -race over the same
+  # internal/certify/... + cmd/certify/... trees (plus the rest of the live
+  # set) with a real C compiler present.
+  referee:
+    name: referee (nocgo)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    # Measured locally (2026-09-08, desktop): ~1m20s end to end (the
+    # internal/certify/suitecsip and suitemodbusserver oracle suites are the
+    # slow packages, ~45s each). Bounded generously above a cold hosted
+    # runner's module-download + compile overhead so a genuine hang fails
+    # loud instead of tying up the runner.
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: certify live set (nocgo half) — internal/certify, internal/evidence, internal/invariant, cmd/certify
+        run: go test -count=1 ./internal/certify/... ./internal/evidence/... ./internal/invariant/... ./cmd/certify/...
 
   # TASK-005: pinned govulncheck (scripts/ci/govulncheck.sh) + triage
   # allowlist (scripts/ci/vuln-allowlist.txt). Reuses the cgo-fast wolfSSL
@@ -580,27 +668,41 @@ jobs:
         # is now LIVE for the same reason (FINDING 3).
         run: bash scripts/check-platform-pin.sh --self . --product lexa-gw --require-peer --verify-vendor
 
-  # TASK-048: nightly go-native fuzzing of the client-side IEEE 2030.5 XML
+  # TASK-048 originally pointed this job at the client-side IEEE 2030.5 XML
   # unmarshal entry points in internal/csipref/discovery — this repo's own
-  # (deliberately independent, AD-003(f)) walker's decode step, into the
-  # shared lexa-proto/csipmodel types. Same job shape as lexa-hub's TASK-047
+  # (deliberately independent, AD-003(f)) walker's decode step. WP7-T1
+  # (REV0907-E1/H8/E10) retargets it: internal/csipref is not part of
+  # CERTIFY_LIVE_SET (cmd/certify and cmd/gw-campaign cannot import it — see
+  # the Makefile comment), so 30 minutes of nightly fuzz budget there proved
+  # nothing about the thing this repo ships as a conformance tool.
+  # `grep -rn '^func Fuzz'` intersected with CERTIFY_LIVE_SET finds exactly
+  # two live-set packages carrying a go-native fuzz target: internal/mbapref
+  # (the differential MBAP reader, 3 targets) and internal/evidence/pcapng
+  # (FuzzReader, the pcap/pcapng reader's no-panic-on-malformed-input
+  # guarantee) — same targets as the Makefile's `fuzz` target now runs, kept
+  # written out explicitly here (rather than `run: make fuzz`) so each
+  # target's own output still streams to $GITHUB_STEP_SUMMARY the way the
+  # csipref version did. Same job shape otherwise as lexa-hub's TASK-047
   # httpwire fuzz job and this repo's own `vulncheck` job above: nightly-only
   # (`if: github.event_name == 'schedule'`, same cron as vulncheck), no cgo
-  # needed (csipmodel/csipref import nothing beyond encoding/xml + stdlib —
-  # unlike cgo-fast above, this never touches wolfSSL). A crasher found here
-  # writes a regression file under
-  # internal/csipref/discovery/testdata/fuzz/<FuzzName>/, which every
+  # needed (both packages import nothing beyond stdlib — unlike cgo-fast
+  # above, this never touches wolfSSL). A crasher found here writes a
+  # regression file under <pkg>/testdata/fuzz/<FuzzName>/, which every
   # subsequent `go test` (no -fuzz) reruns as a normal test case; the
   # artifact upload is a convenience for grabbing that file out of a run
-  # nobody was watching live.
+  # nobody was watching live. csipref's own fuzz targets are untouched and
+  # still runnable by hand (`go test -fuzz=... ./internal/csipref/discovery/`);
+  # they are simply no longer this job's concern.
   fuzz:
-    name: fuzz (nightly, 2030.5 XML decode)
+    name: fuzz (nightly, certify live-set targets)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
-    # REV0907-H12: this job budgets two 15m fuzz targets (30m) plus setup;
-    # bounded generously above that so a genuinely hung fuzz run fails loud
-    # on an unattended nightly instead of tying up a runner indefinitely.
-    timeout-minutes: 90
+    # REV0907-H12, updated for WP7-T1: this job now budgets FOUR 15m fuzz
+    # targets (60m) plus setup, versus the original two (30m) — bounded
+    # generously above that (same ~3x headroom the original 90m/30m budgeted)
+    # so a genuinely hung fuzz run fails loud on an unattended nightly instead
+    # of tying up a runner indefinitely.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
@@ -609,16 +711,24 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: fuzz csipref XML decode (15m/target, no cgo)
+      - name: fuzz internal/mbapref (differential MBAP reader, 15m/target, no cgo)
         run: |
           set -o pipefail
-          go test -fuzz=FuzzUnmarshalDeviceCapability -fuzztime=15m ./internal/csipref/discovery/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
-          go test -fuzz=FuzzUnmarshalDERControlList   -fuzztime=15m ./internal/csipref/discovery/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -fuzz=FuzzMBAPDifferential -fuzztime=15m ./internal/mbapref/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -fuzz=FuzzMBAPExchange     -fuzztime=15m ./internal/mbapref/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          go test -fuzz=FuzzMBAPRoundTrip    -fuzztime=15m ./internal/mbapref/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: fuzz internal/evidence/pcapng (FuzzReader, 15m, no cgo)
+        run: |
+          set -o pipefail
+          go test -fuzz=FuzzReader -fuzztime=15m ./internal/evidence/pcapng/ 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: upload crashers (only present on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: csipref-fuzz-crashers
-          path: internal/csipref/discovery/testdata/fuzz/*/
+          name: certify-live-set-fuzz-crashers
+          path: |
+            internal/mbapref/testdata/fuzz/*/
+            internal/evidence/pcapng/testdata/fuzz/*/
           if-no-files-found: ignore

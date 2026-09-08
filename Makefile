@@ -1,6 +1,6 @@
 .PHONY: all build build-server build-client build-conformance build-modsim build-batsim build-vtnsim \
         build-mbapsdev build-aggregator build-ssm-conformance ssm-conformance aggregator-campaigns \
-        build-certify certify-keylog test-certify \
+        build-certify certify-keylog test-certify live-set-print live-set-committed live-set-check \
         build-modsim-client-pi build-modsim-conformance-pi deploy-modsim-conformance-pi \
         deploy-modsim-client-pi smoke-modbus-pi modbus-conformance-pi sync-pi \
         start-server conformance-pi \
@@ -179,6 +179,90 @@ TARGET ?=
 ssm-conformance: build-ssm-conformance
 	./bin/ssm-conformance $(TARGET)
 
+# === certify live-set snapshot + drift check ===============================
+#
+# WP7-T1 (REV0907-E1/H8/E10): before this, hosted CI never ran
+# ./internal/certify/... (the 130k-LOC oracle suites), ./internal/evidence/...
+# (the bundle verifier), ./internal/invariant, ./internal/tlsprobe or
+# ./cmd/certify at all -- it spent -race and a 30-minute nightly fuzz job on
+# internal/csipref and hub-era packages that cmd/certify and cmd/gw-campaign
+# (THE two things actually shipped as the conformance tool + continuous
+# adversary) cannot even import. CERTIFY_LIVE_SET below is a committed
+# snapshot of `go list -deps ./cmd/certify ./cmd/gw-campaign` (this repo's own
+# import paths only, i.e. everything those two binaries can actually reach at
+# build time) -- the thing CI now has to cover, and the thing test-certify
+# below is sized against.
+#
+# internal/mbtls and internal/tlsprobe are IN the live set but are
+# deliberately not part of test-certify's own `go test` line: a -race pass
+# over their pure-Go logic proves nothing about whether they still complete a
+# real wolfSSL handshake, so ci.yml's cgo-fast job tests them directly
+# (`go test -race ./internal/tlsprobe/... ./internal/mbtls/...`) right next to
+# `make test-certify`, and CERTIFY_LIVE_SET_SELFTEST below is the live set
+# with those two filtered out -- together the two CI commands cover
+# CERTIFY_LIVE_SET exactly, which is what live-set-check verifies.
+#
+# Regenerate after ANY import change to cmd/certify or cmd/gw-campaign:
+#   1. make live-set-print          # fresh `go list -deps`
+#   2. paste the output into CERTIFY_LIVE_SET below
+#   3. make live-set-check          # should now pass again
+#   4. re-check whether the new/removed package needs its own ci.yml wiring
+#      (e.g. a cgo package landing here needs the cgo-fast job, not referee)
+CERTIFY_LIVE_SET := \
+	csip-tls-test/cmd/certify \
+	csip-tls-test/cmd/gw-campaign \
+	csip-tls-test/internal/aggregator \
+	csip-tls-test/internal/campaign \
+	csip-tls-test/internal/certify \
+	csip-tls-test/internal/certify/manifest \
+	csip-tls-test/internal/certify/report \
+	csip-tls-test/internal/certify/suitecsip \
+	csip-tls-test/internal/certify/suitemodbusclient \
+	csip-tls-test/internal/certify/suitemodbusserver \
+	csip-tls-test/internal/certify/suitepki \
+	csip-tls-test/internal/certify/suites \
+	csip-tls-test/internal/certify/suitessm \
+	csip-tls-test/internal/evidence/aead \
+	csip-tls-test/internal/evidence/bundle \
+	csip-tls-test/internal/evidence/capture \
+	csip-tls-test/internal/evidence/keylog \
+	csip-tls-test/internal/evidence/metricscrape \
+	csip-tls-test/internal/evidence/netdis \
+	csip-tls-test/internal/evidence/pcapng \
+	csip-tls-test/internal/evidence/tlsdecrypt \
+	csip-tls-test/internal/evidence/tlsdis \
+	csip-tls-test/internal/invariant \
+	csip-tls-test/internal/mbapref \
+	csip-tls-test/internal/mbtls \
+	csip-tls-test/internal/tlsprobe \
+	csip-tls-test/internal/wolfssl \
+	csip-tls-test/internal/writeset \
+	csip-tls-test/sim/gw-mayhem/gwloopback \
+	csip-tls-test/sim/southbound
+
+CERTIFY_LIVE_SET_SELFTEST := $(filter-out csip-tls-test/internal/mbtls csip-tls-test/internal/tlsprobe,$(CERTIFY_LIVE_SET))
+
+# Fresh `go list -deps` over the two live entry points, filtered to this
+# module's own import paths and sorted -- the authoritative side of the
+# live-set-check comparison. GOWORK=off: a developer's untracked local
+# go.work (dev overlay onto a live ../lexa-proto checkout, see gen-mbaps-certs.sh)
+# must not change which packages the SHIPPED binaries resolve to.
+live-set-print:
+	@GOWORK=off GOFLAGS=-mod=vendor go list -deps ./cmd/certify ./cmd/gw-campaign | grep '^csip-tls-test/' | sort -u
+
+# The committed side of the comparison: CERTIFY_LIVE_SET as one package per
+# line, sorted the same way live-set-print is, so the two are byte-comparable.
+live-set-committed:
+	@for p in $(CERTIFY_LIVE_SET); do echo $$p; done | sort -u
+
+# CI gate: fails loud the moment CERTIFY_LIVE_SET (what test-certify /
+# ci.yml's referee + cgo-fast jobs are actually wired to run) drifts from
+# what cmd/certify and cmd/gw-campaign really import -- a new import silently
+# landing outside the certify/evidence/invariant/tlsprobe/mbtls glob shapes
+# those CI steps use would otherwise escape the gate unnoticed.
+live-set-check:
+	@bash scripts/check-live-set.sh
+
 # === certify: the conformance evidence tool ================================
 #
 # cmd/certify drives the published SunSpec/CSIP test procedures from the
@@ -249,11 +333,18 @@ mbapsdev-keylog:
 	CGO_LDFLAGS="-L$(WOLFSSL_KEYLOG_SYSROOT)/lib -lwolfssl -lm" \
 	go build -tags keylog -o bin/mbapsdev-keylog ./sim/mbapsdev
 
-# The certify gate. Four steps, and each one is load-bearing:
+# The certify gate. Five steps, and each one is load-bearing:
 #
-#   1. vet + the framework/suite unit tests under -race. Every check's decision
-#      logic is proven against synthetic inputs, so the suites have teeth with
-#      no bench in sight.
+#   1. vet + -race over CERTIFY_LIVE_SET_SELFTEST -- every package
+#      cmd/certify or cmd/gw-campaign can import, minus internal/mbtls and
+#      internal/tlsprobe (ci.yml's cgo-fast job tests those two directly
+#      alongside `make test-certify`; see the CERTIFY_LIVE_SET comment
+#      above). This is the referee live set's own regression gate: every
+#      oracle's decision logic (internal/certify/suite*), the evidence bundle
+#      writer/verifier (internal/evidence/...), the ten-invariant campaign
+#      engine (internal/campaign, internal/invariant), the mbaps aggregator
+#      emulator, and the differential MBAP reader (internal/mbapref) all run
+#      here, proven against synthetic inputs with no bench in sight.
 #   2. the CGO_ENABLED=0 build. certify must stay usable without a TLS stack —
 #      list, dry-run, verify and report all work there — and this is the gate
 #      on that, not a hope.
@@ -264,9 +355,12 @@ mbapsdev-keylog:
 #   4. the loopback acceptance test (internal/certify/suites): a real dumpcap
 #      capture on `lo` against a real SunSpec device, a real bundle, a real
 #      bundle.Verify, and a deliberately non-conformant peer that must FAIL.
+#   5. live-set-check: fails if CERTIFY_LIVE_SET has drifted from a fresh
+#      `go list -deps ./cmd/certify ./cmd/gw-campaign` -- run last so a
+#      genuine test failure above is reported before a live-set drift is.
 test-certify:
-	go vet ./cmd/certify/... ./internal/certify/...
-	go test -race ./internal/certify/... ./cmd/certify/...
+	go vet $(CERTIFY_LIVE_SET_SELFTEST)
+	go test -race $(CERTIFY_LIVE_SET_SELFTEST)
 	CGO_ENABLED=0 go build ./cmd/certify
 	CGO_ENABLED=0 go test -count=1 ./cmd/certify/
 	@if [ -d "$(WOLFSSL_KEYLOG_SYSROOT)/include" ]; then \
@@ -282,6 +376,7 @@ test-certify:
 	  echo "    build it with scripts/build-wolfssl-keylog-sysroot.sh to cover the key-export path"; \
 	fi
 	go test -race -count=1 ./internal/certify/suites/
+	$(MAKE) live-set-check
 
 # Run every committed aggregator campaign headless against a target (default a
 # loopback mbapsdev started by the caller); exits non-zero if any campaign's
@@ -618,19 +713,29 @@ sweep-sunspec:
 test-integration: $(CA_CERT)
 	go test -tags=integration -v ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/gw-mayhem/... ./sim/ssm-conformance/
 
-# TASK-048: 15 minutes per go-native fuzz target against the client-side
-# IEEE 2030.5 XML unmarshal entry points in internal/csipref/discovery
-# (DeviceCapability, DERControlList) — the mirror of lexa-hub's TASK-047
-# fuzz-job shape (pure Go, no wolfSSL sysroot needed; csipmodel/csipref
-# import nothing beyond encoding/xml + stdlib). Seed corpus loaded from
-# testdata/fuzz/shared-2030_5/ (committed identically to lexa-hub in the
-# same TASK-048 session — see that repo's Makefile `fuzz` target). Failures
-# land a crash file under internal/csipref/discovery/testdata/fuzz/<FuzzName>/
-# that plain `go test` (no -fuzz) reruns forever after as a regression case.
+# WP7-T1 (REV0907-E1/H8/E10): retargeted from internal/csipref/discovery.
+# TASK-048 originally pointed this at the client-side IEEE 2030.5 XML
+# unmarshal entry points there (DeviceCapability, DERControlList) — that
+# package is not in CERTIFY_LIVE_SET (cmd/certify and cmd/gw-campaign cannot
+# import it; internal/csipref is a deliberately independent walker/scheduler,
+# AD-003(f), not part of either shipped binary), so 15 minutes/target of
+# nightly fuzz budget was buying zero coverage of the thing this repo
+# actually ships. `grep -rn '^func Fuzz'` intersected with CERTIFY_LIVE_SET
+# finds exactly two packages with a real go-native fuzz target:
+# internal/mbapref (the differential MBAP reader — 3 targets, corpus at
+# internal/mbapref/testdata/fuzz/) and internal/evidence/pcapng (FuzzReader,
+# the pcap/pcapng reader's no-panic-on-malformed-input guarantee). Pure Go,
+# no wolfSSL sysroot needed, same as the target this replaces. Failures land
+# a crash file under <pkg>/testdata/fuzz/<FuzzName>/ that plain `go test`
+# (no -fuzz) reruns forever after as a regression case. csipref's own fuzz
+# targets are untouched (internal/csipref/discovery/fuzz_test.go) and still
+# runnable by hand; they are simply no longer this target's or ci.yml's job.
 FUZZTIME ?= 15m
 fuzz:
-	go test -fuzz=FuzzUnmarshalDeviceCapability -fuzztime=$(FUZZTIME) ./internal/csipref/discovery/
-	go test -fuzz=FuzzUnmarshalDERControlList   -fuzztime=$(FUZZTIME) ./internal/csipref/discovery/
+	go test -fuzz=FuzzMBAPDifferential -fuzztime=$(FUZZTIME) ./internal/mbapref/
+	go test -fuzz=FuzzMBAPExchange     -fuzztime=$(FUZZTIME) ./internal/mbapref/
+	go test -fuzz=FuzzMBAPRoundTrip    -fuzztime=$(FUZZTIME) ./internal/mbapref/
+	go test -fuzz=FuzzReader           -fuzztime=$(FUZZTIME) ./internal/evidence/pcapng/
 
 # Regenerate the DCAP golden file. Run after intentionally changing
 # the DCAP XML format. The -args separator is required because Go's
