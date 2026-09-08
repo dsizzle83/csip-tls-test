@@ -1,13 +1,22 @@
 # CSIP Simulation & Conformance Harness
 
-The **test bench** for the LEXA DERMS hub. The hub product itself — the IEEE 2030.5 /
-CSIP DERMS implementation that connects northbound to a utility grid management server
-over wolfSSL mTLS and controls DER assets southbound over Modbus/SunSpec and OCPP 2.0.1 —
-lives in `~/projects/lexa-hub` (separate repo). This repo provides the CSIP grid server
-simulator, the SunSpec device simulators, the OCPP EV charger simulator, the conformance
-suites, and the web dashboard used to demo and test the hub.
+The **conformance/QA harness and independent referee for `lexa-gw`** — a
+single-inverter SunSpec Modbus/TCP DER gateway (`~/projects/lexa-gw`,
+separate repo) that is an IEEE 2030.5-2018/CSIP DER client and, optionally, a
+Secure SunSpec Modbus (`mbaps`) server. This repo provides the CSIP grid
+server simulator, the SunSpec device simulators the gateway polls
+southbound, and `cmd/certify`/`cmd/gw-campaign` — the tools that drive the
+published conformance procedures and the continuous fault-injection adversary
+against it and emit third-party-verifiable evidence.
 
-Target hardware for the hub: Raspberry Pi 4/5 (development), NXP i.MX 93 (production).
+`lexa-hub` — an earlier, multi-device DERMS hub product this repo used to
+test — was **abandoned 2026-08-03 and archived off-disk**. `lexa-gw` is the
+only product; see `CLAUDE.md` for the full picture, including the packages
+left over from the hub era that are not part of the referee and are slated
+for quarantine (WP7-T9b).
+
+Target hardware for `lexa-gw`: NXP i.MX 93 (production); see `lexa-gw`'s own
+README for its build/flash/deploy instructions — this repo does not own them.
 
 ## Architecture
 
@@ -15,29 +24,20 @@ Target hardware for the hub: Raspberry Pi 4/5 (development), NXP i.MX 93 (produc
 Utility Grid Server (IEEE 2030.5)          ← this repo: sim/gridsim
         │  wolfSSL mTLS (ECDHE-ECDSA-AES128-CCM-8 / TLS 1.2)
         ▼
-   [ Hub Pi — lexa-hub ]                   ← ~/projects/lexa-hub
+   [ lexa-gw gateway ]                     ← ~/projects/lexa-gw
         │
-        ├── Modbus TCP ──► Solar inverter   (SunSpec M103/121/123)  ← sim/modsim
-        ├── Modbus TCP ──► Battery storage  (SunSpec M103/802)      ← sim/batsim
-        ├── Modbus TCP ──► Smart meter      (SunSpec M201, bi-directional) ← sim/metersim
-        └── OCPP 2.0.1 ◄── EV charger       (station connects inbound)     ← sim/evsim
+        └── Modbus TCP ──► SunSpec inverter (Model 1/103/120-123/701-712)
+                            ← sim/modsim (plain) or sim/mbapsdev (Secure Modbus)
 ```
 
-Home load is inferred from the energy balance — no separate load meter needed:
-```
-load_W = solar_W + battery_W - meter_W
-```
-
-## The Hub (product repo)
-
-Hub configuration, build, run, and systemd-service instructions live in
-`~/projects/lexa-hub`'s own README. That repo also owns `hub-example.json`,
-the device-role config schema, and the `onCSIPControl`/orchestrator logic.
-Pushing hub code: `lexa-hub`'s `scripts/deploy-hub-pi.sh` (see below).
+`lexa-gw` is a single-inverter gateway (unit 1) — there is no separate
+battery/meter/EV southbound fan-out to simulate; `sim/batsim`, `sim/metersim`
+and `sim/evsim` are hub-era leftovers (see CLAUDE.md's "Hub-era surface").
 
 ## Certificates
 
-mTLS (grid server ↔ hub, and this repo's conformance clients) requires three files:
+mTLS (grid server ↔ gateway, and this repo's conformance clients) requires
+three files:
 
 | File                    | Purpose                                   |
 |-------------------------|-------------------------------------------|
@@ -51,31 +51,28 @@ Issue a new client certificate:
 make gen-client-cert CN=csip-pi-002
 ```
 
-## Demo Network Layout
+`certs/mbaps/` is the separate Secure SunSpec Modbus PKI (`make
+gen-mbaps-certs`) — role certs + device cert + a negative-fixture matrix; see
+`certs/mbaps/README.md`.
 
-All Pis connect via Ethernet to a dedicated switch on `69.0.0.x/24`. WiFi is a separate subnet used for internet access only.
+## Bench & simulator setup
 
-| Hostname   | IP        | Binary   | Port        |
-|------------|-----------|----------|-------------|
-| ccimx93-dvk | 69.0.0.2 | hub (`root@`) | 8887 (OCPP) |
-| solar-pi   | 69.0.0.10 | modsim   | 5020        |
-| battery-pi | 69.0.0.11 | batsim   | 5021        |
-| meter-pi   | 69.0.0.12 | metersim | 5022        |
-| ev-pi      | 69.0.0.14 | evsim    | → hub:8887  |
-
-## Simulator Setup & Deployment
-
-Live topology, ports, and deploy commands: `docs/BENCH.md`. Bringing the whole
-demo up (or recovering it post-reboot): the `run-demo` skill
-(`.claude/skills/run-demo/SKILL.md`). Pushing hub code: `lexa-hub`'s
-`scripts/deploy-hub-pi.sh`; pushing sim code: `scripts/update-sim-pis.sh`.
+Live topology, ports, and deploy commands: `docs/BENCH.md` (read it before
+any deploy/SSH work — its top section documents the retired flat hub-demo
+bench, its "WAN/LAN split bench" section is the current evidence-capture
+posture). `CLAUDE.md`'s "Bench & ports" section is the quick-reference for the
+parts of that topology that are actually the referee.
 
 ## Development
 
 ```bash
 make test-fast                      # unit tests, no network
+make test-certify                   # referee live set (nocgo half)
 make test-integration               # wolfSSL mTLS handshake tests
-go test ./tests/                    # 2030.5 discovery + MUP integration
-go test ./internal/southbound/...   # Modbus/SunSpec unit tests
 make build                          # server + client binaries → bin/
+CGO_ENABLED=0 go build -o bin/certify ./cmd/certify && bin/certify -list
 ```
+
+See `docs/CONFORMANCE_TOOL.md` for how `cmd/certify` works — coverage,
+evidence bundles, and third-party verification — and `docs/CAMPAIGNS.md` for
+gating vs. exploratory runs and the three certification campaigns.

@@ -1,3 +1,7 @@
+> Status: HISTORICAL — 2026-06-10 — hub-era review (lexa-hub abandoned
+> 2026-08-03); covers the dashboard and lexa-hub-facing endpoints this repo no
+> longer treats as the referee. Kept for finding-id traceability, not current.
+
 # Simulation Harness Review & Dashboard Enhancement Plan
 
 **Date:** 2026-06-10

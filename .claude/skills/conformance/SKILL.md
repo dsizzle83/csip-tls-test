@@ -5,7 +5,8 @@ description: Run and interpret the CSIP / Modbus / meter conformance suites, and
 
 # Conformance runs
 
-The EUT is the DER **client** (the hub northbound). Evidence layers:
+The EUT is the gateway under test (`lexa-gw`), acting as a DER **client**
+northbound. Evidence layers:
 
 ## 1. CSIP logic + TLS (desktop, one command)
 ```bash

@@ -1,3 +1,8 @@
+> Status: HISTORICAL — hub-era pre-`cmd/certify` integration-test scaffolding
+> (Milestone 3 / Step D). `tests/` is not part of the live referee
+> (`CERTIFY_LIVE_SET`) and is slated for quarantine under WP7-T9b; see
+> `CLAUDE.md`'s "Hub-era surface" for the current picture.
+
 # tests/ — context for Step D
 
 ## Current state

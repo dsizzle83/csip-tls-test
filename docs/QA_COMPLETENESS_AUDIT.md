@@ -1,3 +1,7 @@
+> Status: HISTORICAL — 2026-07-15 — hub-era audit against `lexa-hub` (the
+> product; abandoned 2026-08-03) and its mayhem/dashboard QA stack. `lexa-gw`
+> is the only product now; kept for finding-id traceability, not current.
+
 # QA Completeness Audit — LEXA DERMS Bench (Phase 4)
 
 **Date:** 2026-07-15
