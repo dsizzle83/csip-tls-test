@@ -350,6 +350,18 @@ func readM103WH(regs []uint16) (float64, bool) {
 // which is exactly why 802 is a CONFIRMER and never a clearer — an 802 block
 // that has not moved proves nothing, while one that HAS moved while the
 // primary measurement block sat still proves the primary block is stale.
+//
+// Every offset here comes from the sunspec.M802_* constants, so REV0907-D3
+// (the model-802 offset table was wrong at every point it declared — a
+// 26-register table for a 62-register model) fixed this probe by
+// construction rather than requiring an edit in this file: before the fix,
+// "SoC" was reading the published model's ChaSt register, "DoD" was reading
+// LocRemCtl, "SoH" was reading CtrlHb, "ChaSt" was reading StateVnd, and
+// "State" was reading half of the Evt1 alarm bitfield — five points digesting
+// five unrelated registers under the right English names.
+// TestM802VolatileProbeOffsetsMatchL802 (liveness_test.go) is the
+// independent oracle that keeps it that way — the twin of
+// TestM122WAvalProbeOffsetMatchesL122 for this table.
 var m802Volatile = []acPoint{
 	{"SoC", sunspec.M802_SoC, false},
 	{"DoD", sunspec.M802_DoD, false},

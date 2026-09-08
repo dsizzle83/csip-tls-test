@@ -100,7 +100,7 @@ func protectLayoutSFs(r *RegisterMap, base uint16, l *sunspec.Layout) {
 func protectSolarLegacySFs(r *RegisterMap, b SolarBases) {
 	protectM123SFs(r, b.M123Base)
 	r.Protect(
-		b.M120Base+sunspec.M120_W_SF,
+		b.M120Base+sunspec.M120_WRtg_SF,
 		b.M120Base+sunspec.M120_VARtg_SF,
 		b.M120Base+sunspec.M120_VArRtg_SF,
 		b.M120Base+sunspec.M120_ARtg_SF,

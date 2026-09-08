@@ -116,89 +116,327 @@ const (
 	// Evt1/Evt2 at 38-41 (two uint32s each spanning two registers)
 )
 
-// ── Model 120 (Nameplate Ratings) register offsets ───────────────────────────
-// Source: SunSpec Model 120 specification.
-// DERTyp values: 4=PV, 80=storage, 82=storage+PV.
+// ── Model 120 (Nameplate Ratings) ────────────────────────────────────────────
+//
+// # This map was WRONG at 22 of its 25 points (REV0907-D1)
+//
+// Like M123 before it (see that section below), M120 was hand-transcribed
+// with no spec source on the machine. The transcription assumed every scale
+// factor trailed its own point immediately, which is true only for WRtg_SF —
+// every SF after it was written one point EARLY relative to the published
+// model, and the reactive-power quadruplet (VArRtgQ1..Q4) was placed one
+// register early as well, dragging every offset after it out of alignment
+// too. The worst instance: the transcription invented a point "M120_W_SF" at
+// offset 16, believing it was the power scale factor — offset 16 belongs to
+// PFRtg_SF. The real power scale factor is WRtg_SF, immediately after WRtg at
+// offset 2, exactly where the published model puts it and exactly where a
+// consumer reading WRtg needed to look.
+//
+// lexa-gw's identify.go (readNameplateW / legacyWRtg) is the sole consumer of
+// M120_WRtg and the deleted M120_W_SF; WP4-T2 repoints it at M120_WRtg_SF at
+// the next pin bump. Deleting the wrong name here rather than leaving it
+// wrong-but-compiling is the same call models.go made for M123's
+// M123_Conn_RmpTms: a name that used to point at a real register but does not
+// exist in the standard must not keep compiling silently.
+//
+// L120 is derived from docs/schema/sunspec-models/model_120.json exactly like
+// L123, and TestLayoutsMatchVendoredSpec proves it against the JSON's own
+// names, order, types, widths and access/mandatory flags.
+var L120 = NewLayout(
+	F("DERTyp", Tenum16).R().M(), // 4=PV, 82=PV_STOR
+	FS("WRtg", Tuint16, "WRtg_SF").R().M(),
+	F("WRtg_SF", Tsunssf).R().M(),
+	FS("VARtg", Tuint16, "VARtg_SF").R().M(),
+	F("VARtg_SF", Tsunssf).R().M(),
+	FS("VArRtgQ1", Tint16, "VArRtg_SF").R().M(),
+	FS("VArRtgQ2", Tint16, "VArRtg_SF").R().M(),
+	FS("VArRtgQ3", Tint16, "VArRtg_SF").R().M(),
+	FS("VArRtgQ4", Tint16, "VArRtg_SF").R().M(),
+	F("VArRtg_SF", Tsunssf).R().M(),
+	FS("ARtg", Tuint16, "ARtg_SF").R().M(),
+	F("ARtg_SF", Tsunssf).R().M(),
+	FS("PFRtgQ1", Tint16, "PFRtg_SF").R().M(),
+	FS("PFRtgQ2", Tint16, "PFRtg_SF").R().M(),
+	FS("PFRtgQ3", Tint16, "PFRtg_SF").R().M(),
+	FS("PFRtgQ4", Tint16, "PFRtg_SF").R().M(),
+	F("PFRtg_SF", Tsunssf).R().M(),
+	FS("WHRtg", Tuint16, "WHRtg_SF").R().O(),
+	F("WHRtg_SF", Tsunssf).R().O(),
+	FS("AhrRtg", Tuint16, "AhrRtg_SF").R().O(),
+	F("AhrRtg_SF", Tsunssf).R().O(),
+	FS("MaxChaRte", Tuint16, "MaxChaRte_SF").R().O(),
+	F("MaxChaRte_SF", Tsunssf).R().O(),
+	FS("MaxDisChaRte", Tuint16, "MaxDisChaRte_SF").R().O(),
+	F("MaxDisChaRte_SF", Tsunssf).R().O(),
+	FPad("Pad", 1).R().O(),
+).As("M120")
+
+// M120 register offsets, restated from L120 (REV0907-D1). M120_W_SF is
+// DELETED — no revision of model 120 declares a point by that name at any
+// offset; the power scale factor is M120_WRtg_SF, added here at the offset
+// the published model actually uses. Every surviving name is unchanged so
+// that a consumer which was already spelling the point correctly keeps
+// compiling; only the values move to match L120. Pad carries no constant:
+// nothing in this tree reads or writes it.
+//
+// TestM120ConstantsMatchTheLayout is the drift guard, the twin of
+// TestM123ConstantsMatchTheLayout: it asserts every constant below equals
+// L120's offset for the point by NAME, so a hand edit here can never again
+// disagree with the layout — and the layout is in turn proven against the
+// vendored JSON by TestLayoutsMatchVendoredSpec.
 const (
-	M120Len              = 26 // data registers
-	M120_DERTyp          = 0  // DER type (uint16)
-	M120_WRtg            = 1  // nameplate real power (uint16, M120_W_SF)
-	M120_VARtg           = 2  // nameplate apparent power (uint16, M120_VARtg_SF)
-	M120_VArRtgQ1        = 3  // max reactive power Q1 (int16, M120_VArRtg_SF)
-	M120_VArRtgQ2        = 4  // Q2 (int16)
-	M120_VArRtgQ3        = 5  // Q3 (int16)
-	M120_VArRtgQ4        = 6  // Q4 (int16)
-	M120_ARtg            = 7  // nameplate current (uint16, M120_ARtg_SF)
-	M120_PFRtgQ1         = 8  // min power factor Q1 ×100 (int16, M120_PFRtg_SF)
-	M120_PFRtgQ2         = 9
-	M120_PFRtgQ3         = 10
-	M120_PFRtgQ4         = 11
-	M120_WHRtg           = 12 // energy storage rating (uint16, M120_WHRtg_SF) — storage
-	M120_AhrRtg          = 13 // amp-hour rating (uint16, M120_AhrRtg_SF)
-	M120_MaxChaRte       = 14 // max charge rate (uint16, M120_MaxChaRte_SF) — storage
-	M120_MaxDisChaRte    = 15 // max discharge rate (uint16, M120_MaxDisChaRte_SF)
-	M120_W_SF            = 16 // power scale factor (int16)
-	M120_VARtg_SF        = 17
-	M120_VArRtg_SF       = 18
-	M120_ARtg_SF         = 19
-	M120_PFRtg_SF        = 20
-	M120_WHRtg_SF        = 21
-	M120_AhrRtg_SF       = 22
-	M120_MaxChaRte_SF    = 23
+	M120Len              = 26 // data registers — equals L120.Len(), asserted by the drift guard
+	M120_DERTyp          = 0  // DER type (uint16): 4=PV, 82=PV_STOR
+	M120_WRtg            = 1  // nameplate real power (uint16, M120_WRtg_SF)
+	M120_WRtg_SF         = 2  // power scale factor (int16) — the published home of the SF
+	M120_VARtg           = 3  // nameplate apparent power (uint16, M120_VARtg_SF)
+	M120_VARtg_SF        = 4
+	M120_VArRtgQ1        = 5 // max reactive power Q1 (int16, M120_VArRtg_SF)
+	M120_VArRtgQ2        = 6 // Q2
+	M120_VArRtgQ3        = 7 // Q3
+	M120_VArRtgQ4        = 8 // Q4
+	M120_VArRtg_SF       = 9
+	M120_ARtg            = 10 // nameplate current (uint16, M120_ARtg_SF)
+	M120_ARtg_SF         = 11
+	M120_PFRtgQ1         = 12 // min power factor Q1 ×100 (int16, M120_PFRtg_SF)
+	M120_PFRtgQ2         = 13
+	M120_PFRtgQ3         = 14
+	M120_PFRtgQ4         = 15
+	M120_PFRtg_SF        = 16
+	M120_WHRtg           = 17 // energy storage rating (uint16, M120_WHRtg_SF) — storage
+	M120_WHRtg_SF        = 18
+	M120_AhrRtg          = 19 // amp-hour rating (uint16, M120_AhrRtg_SF)
+	M120_AhrRtg_SF       = 20
+	M120_MaxChaRte       = 21 // max charge rate (uint16, M120_MaxChaRte_SF) — storage
+	M120_MaxChaRte_SF    = 22
+	M120_MaxDisChaRte    = 23 // max discharge rate (uint16, M120_MaxDisChaRte_SF)
 	M120_MaxDisChaRte_SF = 24
 )
 
-// ── Model 122 (Extended Measurements & Status) register offsets ──────────────
-// Only the registers this codebase reads or writes are named; the full model
-// is 44 registers and the sim populates unused registers as zero.
+// ── Model 122 (Extended Measurements & Status) ───────────────────────────────
+//
+// # WAval / WAval_SF were WRONG, sitting inside another point's accumulator (REV0907-D2)
+//
+// The hand table put WAval at offset 21 and WAval_SF at 22 — inside the
+// ActVArhQ3 acc64 (offsets 19-22), so a read of "available watts" actually
+// read half of a lifetime reactive-energy accumulator, reinterpreted as a
+// small int16. The published model's four lifetime accumulators (ActWh,
+// ActVAh, ActVArhQ1..Q4) are each 4 registers (acc64), not the 2 the old
+// table implicitly assumed by starting VArAval/WAval at offset 21; the real
+// WAval/WAval_SF sit at 29/30, after VArAval/VArAval_SF at 27/28.
+// derbase/liveness.go's m122Volatile reads M122_WAval as one of the last-
+// resort liveness points for a legacy device with no second AC model — it
+// was digesting the wrong register and is correct by construction once L122
+// is proven against the JSON below.
+//
+// L122 is derived from docs/schema/sunspec-models/model_122.json exactly
+// like L123 and L120, proven by TestLayoutsMatchVendoredSpec. Only the
+// registers this codebase reads or writes are given restated constants; the
+// full model is 44 registers and the sim populates the rest as zero.
+var L122 = NewLayout(
+	F("PVConn", Tbitfield16).R().M(), // bit 0 = connected
+	F("StorConn", Tbitfield16).R().M(),
+	F("ECPConn", Tbitfield16).R().M(), // bit 0 = grid-connected
+	F("ActWh", Tacc64).R().O(),        // AC lifetime active energy, Wh
+	F("ActVAh", Tacc64).R().O(),       // AC lifetime apparent energy, VAh
+	F("ActVArhQ1", Tacc64).R().O(),    // AC lifetime reactive energy Q1, varh
+	F("ActVArhQ2", Tacc64).R().O(),
+	F("ActVArhQ3", Tacc64).R().O(),
+	F("ActVArhQ4", Tacc64).R().O(),
+	FS("VArAval", Tint16, "VArAval_SF").R().O(),
+	F("VArAval_SF", Tsunssf).R().O(),
+	FS("WAval", Tuint16, "WAval_SF").R().O(),
+	F("WAval_SF", Tsunssf).R().O(),
+	F("StSetLimMsk", Tbitfield32).R().O(),
+	F("StActCtl", Tbitfield32).R().O(),
+	FStr("TmSrc", 4).R().O(),
+	F("Tms", Tuint32).R().O(),
+	F("RtSt", Tbitfield16).R().O(),
+	FS("Ris", Tuint16, "Ris_SF").R().O(),
+	F("Ris_SF", Tsunssf).R().O(),
+).As("M122")
+
+// M122 register offsets, restated from L122 (REV0907-D2). TestM122ConstantsMatchTheLayout
+// is the drift guard, the twin of TestM123ConstantsMatchTheLayout.
 const (
-	M122Len       = 44 // full model length per SunSpec spec
+	M122Len       = 44 // full model length per SunSpec spec — equals L122.Len()
 	M122_PVConn   = 0  // PV connection status bitfield (uint16): bit 0 = connected
 	M122_StorConn = 1  // storage connection status bitfield
 	M122_ECPConn  = 2  // ECP / grid connection bitfield: bit 0 = grid-connected
-	// ActWh: accumulated exported Wh, uint64 spread across offsets 3–6 (4 × uint16)
-	M122_ActWh    = 3  // high word of upper 32 bits
-	M122_WAval    = 21 // available real power (uint16, M122_WAval_SF)
-	M122_WAval_SF = 22 // scale factor (int16)
+	M122_ActWh    = 3  // AC lifetime active energy (acc64, regs 3-6), Wh
+	M122_WAval    = 29 // available real power (uint16, M122_WAval_SF)
+	M122_WAval_SF = 30 // scale factor (int16)
 )
 
-// ── Model 121 (Basic Settings) register offsets ───────────────────────────────
+// ── Model 121 (Basic Settings) ───────────────────────────────────────────────
+//
+// M121_WMax and M121_WMax_SF were already at the published offsets (0 and
+// 20) before this correction; they are restated below from L121 rather than
+// left as bare literals so TestM121ConstantsMatchTheLayout closes the same
+// loop the other legacy models now have: constant → L121 → vendored JSON →
+// standard. L121 is derived from
+// docs/schema/sunspec-models/model_121.json exactly like L120/L122/L123,
+// proven by TestLayoutsMatchVendoredSpec.
+var L121 = NewLayout(
+	FS("WMax", Tuint16, "WMax_SF").RW().M(),
+	FS("VRef", Tuint16, "VRef_SF").RW().M(),
+	FS("VRefOfs", Tint16, "VRefOfs_SF").RW().M(),
+	FS("VMax", Tuint16, "VMinMax_SF").RW().O(),
+	FS("VMin", Tuint16, "VMinMax_SF").RW().O(),
+	FS("VAMax", Tuint16, "VAMax_SF").RW().O(),
+	FS("VArMaxQ1", Tint16, "VArMax_SF").RW().O(),
+	FS("VArMaxQ2", Tint16, "VArMax_SF").RW().O(),
+	FS("VArMaxQ3", Tint16, "VArMax_SF").RW().O(),
+	FS("VArMaxQ4", Tint16, "VArMax_SF").RW().O(),
+	FS("WGra", Tuint16, "WGra_SF").RW().O(),
+	FS("PFMinQ1", Tint16, "PFMin_SF").RW().O(),
+	FS("PFMinQ2", Tint16, "PFMin_SF").RW().O(),
+	FS("PFMinQ3", Tint16, "PFMin_SF").RW().O(),
+	FS("PFMinQ4", Tint16, "PFMin_SF").RW().O(),
+	F("VArAct", Tenum16).RW().O(),   // 1=SWITCH, 2=MAINTAIN
+	F("ClcTotVA", Tenum16).RW().O(), // 1=VECTOR, 2=ARITHMETIC
+	FS("MaxRmpRte", Tuint16, "MaxRmpRte_SF").RW().O(),
+	FS("ECPNomHz", Tuint16, "ECPNomHz_SF").RW().O(),
+	F("ConnPh", Tenum16).RW().O(), // 1=A, 2=B, 3=C
+	F("WMax_SF", Tsunssf).R().M(),
+	F("VRef_SF", Tsunssf).R().M(),
+	F("VRefOfs_SF", Tsunssf).R().M(),
+	F("VMinMax_SF", Tsunssf).R().O(),
+	F("VAMax_SF", Tsunssf).R().O(),
+	F("VArMax_SF", Tsunssf).R().O(),
+	F("WGra_SF", Tsunssf).R().O(),
+	F("PFMin_SF", Tsunssf).R().O(),
+	F("MaxRmpRte_SF", Tsunssf).R().O(),
+	F("ECPNomHz_SF", Tsunssf).R().O(),
+).As("M121")
+
+// M121 register offsets — the mutable WMax setting. Values unchanged by this
+// correction (both were already right); restated from L121, proven below.
 const (
 	M121_WMax    = 0  // max active power setpoint (uint16, WMax_SF)
 	M121_WMax_SF = 20 // WMax scale factor (int16)
 )
 
-// ── Model 802 (Li-Ion Battery Base) register offsets ─────────────────────────
-// Source: SunSpec Model 802 specification.
-// ChaSt values: 1=off, 2=empty, 3=discharging, 4=charging, 5=full, 6=holding.
-// State values: 0=disconnected, 2=connected, 3=standby, 4=SoC-protection.
+// ── Model 802 (Li-Ion Battery Base) ──────────────────────────────────────────
+//
+// # The hand table was wrong at every offset it declared (REV0907-D3)
+//
+// The old M802_* table claimed a 26-register model starting WHRtg(0),
+// WHRtg_SF(1), AHRtg(2)... The published model is 62 registers and starts
+// AHRtg(0), WHRtg(1), WChaRteMax(2)... — swapped order at the very first two
+// points, and every offset after them wrong by construction. Two further
+// defects rode along with the transcription: M802_HeatCool (offset 23) named
+// a point no revision of model 802 declares — it is deleted outright, the
+// same treatment M120_W_SF got under REV0907-D1 — and the old M802_W_SF
+// (offset 6) was being used by lexa-gw and csip-tls-test as the scale factor
+// for WChaRteMax/WDisChaRteMax, which is WChaDisChaMax_SF's job (offset 52)
+// in the published model; the real W_SF (offset 61) scales W/ReqW, points
+// this tree does not yet read. That misuse is a live product defect at the
+// pin bump this change causes — see the WP4-T4 report for the consumer list.
+//
+// L802 is derived from docs/schema/sunspec-models/model_802.json exactly
+// like L120/L121/L122/L123, and proven against the JSON's own names, order,
+// types, widths and access/mandatory flags by TestLayoutsMatchVendoredSpec.
+var L802 = NewLayout(
+	FS("AHRtg", Tuint16, "AHRtg_SF").R().M(),                 // nameplate charge capacity, Ah
+	FS("WHRtg", Tuint16, "WHRtg_SF").R().M(),                 // nameplate energy capacity, Wh
+	FS("WChaRteMax", Tuint16, "WChaDisChaMax_SF").R().M(),    // max charge rate, W
+	FS("WDisChaRteMax", Tuint16, "WChaDisChaMax_SF").R().M(), // max discharge rate, W
+	FS("DisChaRte", Tuint16, "DisChaRte_SF").R().O(),         // self-discharge rate, %WHRtg/day
+	FS("SoCMax", Tuint16, "SoC_SF").R().O(),                  // manufacturer max SoC
+	FS("SoCMin", Tuint16, "SoC_SF").R().O(),                  // manufacturer min SoC
+	FS("SocRsvMax", Tuint16, "SoC_SF").RW().O(),              // max reserve setpoint (spec spells this "Soc", not "SoC")
+	FS("SoCRsvMin", Tuint16, "SoC_SF").RW().O(),              // min reserve setpoint
+	FS("SoC", Tuint16, "SoC_SF").R().M(),                     // state of charge
+	FS("DoD", Tuint16, "DoD_SF").R().O(),                     // depth of discharge
+	FS("SoH", Tuint16, "SoH_SF").R().O(),                     // state of health
+	F("NCyc", Tuint32).R().O(),                               // cycle count
+	F("ChaSt", Tenum16).R().O(),                              // 1=off .. 7=testing
+	F("LocRemCtl", Tenum16).R().M(),                          // 0=remote, 1=local
+	F("Hb", Tuint16).R().O(),                                 // battery heartbeat
+	F("CtrlHb", Tuint16).RW().O(),                            // controller heartbeat
+	F("AlmRst", Tuint16).RW().M(),                            // 1=reset latched alarms
+	F("Typ", Tenum16).R().M(),                                // battery chemistry: 4=Li-Ion
+	F("State", Tenum16).R().M(),                              // 1=disconnected .. 99=fault
+	F("StateVnd", Tenum16).R().O(),                           // vendor bank-state enum
+	F("WarrDt", Tuint32).R().O(),                             // warranty date, days since 2000-01-01
+	F("Evt1", Tbitfield32).R().M(),                           // alarm/warning bitfield 1
+	F("Evt2", Tbitfield32).R().M(),                           // reserved
+	F("EvtVnd1", Tbitfield32).R().M(),                        // vendor event bitfield 1
+	F("EvtVnd2", Tbitfield32).R().M(),                        // vendor event bitfield 2
+	FS("V", Tuint16, "V_SF").R().M(),                         // DC bus voltage
+	FS("VMax", Tuint16, "V_SF").R().O(),
+	FS("VMin", Tuint16, "V_SF").R().O(),
+	FS("CellVMax", Tuint16, "CellV_SF").R().O(),
+	F("CellVMaxStr", Tuint16).R().O(),
+	F("CellVMaxMod", Tuint16).R().O(),
+	FS("CellVMin", Tuint16, "CellV_SF").R().O(),
+	F("CellVMinStr", Tuint16).R().O(),
+	F("CellVMinMod", Tuint16).R().O(),
+	FS("CellVAvg", Tuint16, "CellV_SF").R().O(),
+	FS("A", Tint16, "A_SF").R().M(), // total DC current
+	FS("AChaMax", Tuint16, "AMax_SF").R().O(),
+	FS("ADisChaMax", Tuint16, "AMax_SF").R().O(),
+	FS("W", Tint16, "W_SF").R().M(), // total DC power
+	F("ReqInvState", Tenum16).R().O(),
+	FS("ReqW", Tint16, "W_SF").R().O(),
+	F("SetOp", Tenum16).RW().M(), // 1=connect, 2=disconnect
+	F("SetInvState", Tenum16).RW().M(),
+	F("AHRtg_SF", Tsunssf).R().M(),
+	F("WHRtg_SF", Tsunssf).R().M(),
+	F("WChaDisChaMax_SF", Tsunssf).R().M(),
+	F("DisChaRte_SF", Tsunssf).R().O(),
+	F("SoC_SF", Tsunssf).R().M(),
+	F("DoD_SF", Tsunssf).R().O(),
+	F("SoH_SF", Tsunssf).R().O(),
+	F("V_SF", Tsunssf).R().M(),
+	F("CellV_SF", Tsunssf).R().M(),
+	F("A_SF", Tsunssf).R().M(),
+	F("AMax_SF", Tsunssf).R().M(),
+	F("W_SF", Tsunssf).R().O(),
+).As("M802")
+
+// M802 register offsets, restated from L802 (REV0907-D3). Only the points
+// this codebase reads or writes are given restated constants — the full
+// model is 62 registers and the sim populates the rest as zero — matching
+// the M120/M122 precedent above. M802_HeatCool is DELETED: no revision of
+// model 802 declares a point by that name. M802_SocRsvMax is spelled to
+// match the vendored spec exactly (the model itself is inconsistent:
+// SocRsvMax vs SoCRsvMin); a caller spelling it M802_SoCRsvMax will fail to
+// compile rather than silently reading the wrong register, which is the
+// point.
+//
+// TestM802ConstantsMatchTheLayout is the drift guard, the twin of
+// TestM120ConstantsMatchTheLayout: it asserts every constant below equals
+// L802's offset for the point by NAME, so a hand edit here can never again
+// disagree with the layout — and the layout is in turn proven against the
+// vendored JSON by TestLayoutsMatchVendoredSpec.
 const (
-	M802Len            = 26 // data registers
-	M802_WHRtg         = 0  // energy rating (uint16, M802_WHRtg_SF) — Wh
-	M802_WHRtg_SF      = 1  // scale factor (int16)
-	M802_AHRtg         = 2  // capacity (uint16, M802_AHRtg_SF) — Ah
-	M802_AHRtg_SF      = 3
-	M802_WChaRteMax    = 4 // max charge rate (uint16, M802_W_SF) — W
-	M802_WDisChaRteMax = 5 // max discharge rate (uint16, M802_W_SF)
-	M802_W_SF          = 6 // power scale factor (int16)
-	M802_DisChaRte     = 7 // self-discharge rate (uint16, M802_DisChaRte_SF) — %/day
-	M802_DisChaRte_SF  = 8
-	M802_SoCMax        = 9  // max allowed SoC (uint16, M802_SoC_SF)
-	M802_SoCMin        = 10 // min allowed SoC
-	M802_SoCRsvMax     = 11 // reserve max SoC
-	M802_SoCRsvMin     = 12 // reserve min SoC
-	M802_SoC_SF        = 13 // SoC scale factor (int16): use -2 → register × 0.01 = %
-	M802_SoC           = 14 // state of charge (uint16 × SoC_SF)
-	M802_DoD           = 15 // depth of discharge (uint16, M802_DoD_SF)
-	M802_DoD_SF        = 16
-	M802_SoH           = 17 // state of health (uint16, M802_SoH_SF) — %
-	M802_SoH_SF        = 18
-	// NCyc: uint32 at offsets 19–20
-	M802_ChaSt     = 21 // charge status enum (uint16)
-	M802_LocRemCtl = 22 // 0=local, 1=remote (uint16)
-	M802_HeatCool  = 23 // thermal management enum (uint16)
-	M802_Typ       = 24 // battery chemistry: 4=Li-Ion (uint16)
-	M802_State     = 25 // operational state enum (uint16)
+	M802Len               = 62 // data registers — equals L802.Len(), asserted by the drift guard
+	M802_AHRtg            = 0  // nameplate charge capacity (uint16, M802_AHRtg_SF) — Ah
+	M802_WHRtg            = 1  // nameplate energy capacity (uint16, M802_WHRtg_SF) — Wh
+	M802_WChaRteMax       = 2  // max charge rate (uint16, M802_WChaDisChaMax_SF) — W
+	M802_WDisChaRteMax    = 3  // max discharge rate (uint16, M802_WChaDisChaMax_SF) — W
+	M802_DisChaRte        = 4  // self-discharge rate (uint16, M802_DisChaRte_SF) — %WHRtg/day
+	M802_SoCMax           = 5  // manufacturer max SoC (uint16, M802_SoC_SF)
+	M802_SoCMin           = 6  // manufacturer min SoC
+	M802_SocRsvMax        = 7  // reserve max setpoint (RW) — spec spells this "Soc", not "SoC"
+	M802_SoCRsvMin        = 8  // reserve min setpoint (RW)
+	M802_SoC              = 9  // state of charge (uint16, M802_SoC_SF)
+	M802_DoD              = 10 // depth of discharge (uint16, M802_DoD_SF)
+	M802_SoH              = 11 // state of health (uint16, M802_SoH_SF)
+	M802_ChaSt            = 14 // charge status enum: 1=off .. 7=testing
+	M802_LocRemCtl        = 15 // 0=remote, 1=local
+	M802_Typ              = 19 // battery chemistry: 4=Li-Ion
+	M802_State            = 20 // bank state enum: 1=disconnected .. 99=fault
+	M802_AHRtg_SF         = 50 // scale factor for AHRtg (int16)
+	M802_WHRtg_SF         = 51 // scale factor for WHRtg (int16)
+	M802_WChaDisChaMax_SF = 52 // scale factor for WChaRteMax/WDisChaRteMax (int16) — NOT M802_W_SF
+	M802_DisChaRte_SF     = 53
+	M802_SoC_SF           = 54 // SoC scale factor (int16): use -2 → register × 0.01 = %
+	M802_DoD_SF           = 55
+	M802_SoH_SF           = 56
+	M802_W_SF             = 61 // scale factor for W/ReqW (int16) — this tree does not read W/ReqW today
 )
 
 // ── Model 201/202/203 (AC Meter) register offsets ────────────────────────────

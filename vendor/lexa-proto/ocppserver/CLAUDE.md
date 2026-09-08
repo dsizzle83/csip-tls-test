@@ -9,9 +9,14 @@ not CSIP mTLS.
 `lexa-hub/internal/ocppserver` (the production CSMS, consumed by `cmd/ocpp` —
 the lexa-ocpp service, :8887, which bridges EVState onto MQTT) and
 `csip-tls-test/internal/ocppserver` (the bench's copy, embedded in gridsim's
-`sim/server` and exercised by `sim/evsim`'s test harness). Both consumers now
-import `lexa-proto/ocppserver` directly — there is exactly one copy. Tested
-end-to-end against `sim/evsim` in `simulator_test.go`.
+`sim/server` and exercised by `sim/evsim`'s test harness). Both consumers
+imported `lexa-proto/ocppserver` directly at the time — there was exactly one
+copy. **`lexa-hub` was abandoned 2026-08-03 and archived off-disk; the sole
+current consumer is `csip-tls-test`.** `lexa-gw`, the current product, has no
+OCPP client or server — its northbound is CSIP-only. WP6-T6 (plan of record)
+moves this package out of lexa-proto and into csip-tls-test, its only
+remaining consumer; not done yet. Tested end-to-end against `sim/evsim` in
+`simulator_test.go`.
 
 ## Security Profile 2
 TLS over WebSocket + HTTP Basic Auth (credential checked per-connection).
@@ -39,9 +44,14 @@ last_meter  {connector_id, current_A, energy_Wh}
 last_profile {connector_id, limit_A}
 last_heartbeat string
 ```
-In lexa-hub, EVState is published by `cmd/ocpp` to MQTT
-`lexa/evse/{station}/state` (inspect via `mosquitto_sub` or `lexa-api`
-`/status` on :9100).
+In lexa-hub (abandoned, archived off-disk 2026-08-03), EVState was published
+by `cmd/ocpp` to MQTT `lexa/evse/{station}/state`. That MQTT bridge went with
+it, and — separately from the lexa-hub abandonment — this `EVState` shape and
+the handler table above do not currently exist in `handlers.go`/`server.go`
+(only `OnBootNotification`/`OnNotifyReport`/`OnHeartbeat`/
+`OnStatusNotification`/`OnTransactionEvent` are implemented today); this
+section is stale relative to the code and needs its own follow-up, filed
+separately from this pass's lexa-hub cleanup.
 
 ## Driving it in tests / on the bench
 Port 6024 is **evsim's simapi sidecar** (the charging *station* sim, in

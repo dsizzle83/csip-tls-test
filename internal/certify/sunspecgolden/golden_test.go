@@ -168,8 +168,11 @@ func TestLexaProtoLayoutsMatchGolden(t *testing.T) {
 		// REV0907-E8: model 120's table was wrong at 22 of its 25 named
 		// points at lexa-proto a3eeb10 -- every value/SF pair after WRtg was
 		// laid out as "all values, then all scale factors" instead of the
-		// spec's per-quantity value+SF pairing. Fixed in lexa-proto eba7e97.
-		reportDrift(t, "M120", "eba7e97", compareConsts("M120", m120Checks(), golden))
+		// spec's per-quantity value+SF pairing. Fixed in lexa-proto eba7e97,
+		// an ancestor of the pin this repo now carries (WP4-T7) -- hard-
+		// fail like every other model, not reportDrift, so a future
+		// regression is caught without needing SUNSPEC_GOLDEN_EXPECT_DRIFT.
+		reportMismatches(t, "M120", compareConsts("M120", m120Checks(), golden))
 	})
 
 	t.Run("M121", func(t *testing.T) {
@@ -189,8 +192,9 @@ func TestLexaProtoLayoutsMatchGolden(t *testing.T) {
 		// after the four ActVArh accumulators, as if ActWh/ActVAh/ActVArhQ1-4
 		// were each a single register) instead of the spec's 29/30 (each of
 		// those six accumulators is acc64 -- 4 registers, not 1). Fixed in
-		// lexa-proto eba7e97.
-		reportDrift(t, "M122", "eba7e97", compareConsts("M122", m122Checks(), golden))
+		// lexa-proto eba7e97, an ancestor of the pin this repo now carries
+		// (WP4-T7) -- hard-fail like every other model, not reportDrift.
+		reportMismatches(t, "M122", compareConsts("M122", m122Checks(), golden))
 	})
 
 	t.Run("M123", func(t *testing.T) {
@@ -326,12 +330,14 @@ func TestLexaProtoLayoutsMatchGolden(t *testing.T) {
 		if !ok {
 			t.Fatal("golden has no M802 block")
 		}
-		// REV0907-E8: the vendored M802_* table at a3eeb10 is a hand-invented
-		// 26-register compression of the real 62-register spec model --
-		// almost every offset disagrees, and M802_HeatCool names a register
-		// the spec does not define at all. Fixed in lexa-proto b6eca4a
-		// ("vendor model 802, fix every M802_* offset").
-		reportDrift(t, "M802", "b6eca4a", compareConsts("M802", m802Checks(), golden))
+		// REV0907-E8: the vendored M802_* table at a3eeb10 was a hand-
+		// invented 26-register compression of the real 62-register spec
+		// model -- almost every offset disagreed, and M802_HeatCool named a
+		// register the spec does not define at all. Fixed in lexa-proto
+		// b6eca4a ("vendor model 802, fix every M802_* offset"), an
+		// ancestor of the pin this repo now carries (WP4-T7) -- hard-fail
+		// like every other model, not reportDrift.
+		reportMismatches(t, "M802", compareConsts("M802", m802Checks(), golden))
 	})
 }
 
@@ -395,10 +401,11 @@ func m120Checks() []constCheck {
 		{"M120_AhrRtg", sunspec.M120_AhrRtg, "AhrRtg"},
 		{"M120_MaxChaRte", sunspec.M120_MaxChaRte, "MaxChaRte"},
 		{"M120_MaxDisChaRte", sunspec.M120_MaxDisChaRte, "MaxDisChaRte"},
-		// The vendored constant is spelled M120_W_SF; the spec's own name for
-		// WRtg's scale factor is "WRtg_SF" (models.go's comment on the very
-		// next line calls it "power scale factor", i.e. WRtg's SF).
-		{"M120_W_SF", sunspec.M120_W_SF, "WRtg_SF"},
+		// REV0907-E8/WP4-T7: the vendored constant used to be spelled
+		// M120_W_SF (a name the spec doesn't use). lexa-proto eba7e97
+		// deleted it and added M120_WRtg_SF at the offset the published
+		// model actually uses for WRtg's scale factor.
+		{"M120_WRtg_SF", sunspec.M120_WRtg_SF, "WRtg_SF"},
 		{"M120_VARtg_SF", sunspec.M120_VARtg_SF, "VARtg_SF"},
 		{"M120_VArRtg_SF", sunspec.M120_VArRtg_SF, "VArRtg_SF"},
 		{"M120_ARtg_SF", sunspec.M120_ARtg_SF, "ARtg_SF"},
@@ -467,17 +474,21 @@ func m802Checks() []constCheck {
 		{"M802_AHRtg_SF", sunspec.M802_AHRtg_SF, "AHRtg_SF"},
 		{"M802_WChaRteMax", sunspec.M802_WChaRteMax, "WChaRteMax"},
 		{"M802_WDisChaRteMax", sunspec.M802_WDisChaRteMax, "WDisChaRteMax"},
-		// The vendored constant is spelled M802_W_SF; the spec names the
-		// combined charge/discharge-rate scale factor WChaDisChaMax_SF.
-		{"M802_W_SF", sunspec.M802_W_SF, "WChaDisChaMax_SF"},
+		// REV0907-E8/WP4-T7: the vendored constant used to be spelled
+		// M802_W_SF, aliasing the model's real W/ReqW scale factor (offset
+		// 61). lexa-proto b6eca4a added M802_WChaDisChaMax_SF at the
+		// offset the published model actually uses for WChaRteMax's and
+		// WDisChaRteMax's shared scale factor.
+		{"M802_WChaDisChaMax_SF", sunspec.M802_WChaDisChaMax_SF, "WChaDisChaMax_SF"},
 		{"M802_DisChaRte", sunspec.M802_DisChaRte, "DisChaRte"},
 		{"M802_DisChaRte_SF", sunspec.M802_DisChaRte_SF, "DisChaRte_SF"},
 		{"M802_SoCMax", sunspec.M802_SoCMax, "SoCMax"},
 		{"M802_SoCMin", sunspec.M802_SoCMin, "SoCMin"},
-		// The spec JSON itself spells this "SocRsvMax" (lower-case c) -- kept
-		// verbatim rather than "corrected" so the golden matches the
-		// published model exactly.
-		{"M802_SoCRsvMax", sunspec.M802_SoCRsvMax, "SocRsvMax"},
+		// The spec JSON itself spells this "SocRsvMax" (lower-case c). The
+		// vendored constant used to be spelled M802_SoCRsvMax (matching the
+		// sibling SoCRsvMin instead of the spec) -- lexa-proto b6eca4a
+		// renamed it to M802_SocRsvMax to match the published model exactly.
+		{"M802_SocRsvMax", sunspec.M802_SocRsvMax, "SocRsvMax"},
 		{"M802_SoCRsvMin", sunspec.M802_SoCRsvMin, "SoCRsvMin"},
 		{"M802_SoC_SF", sunspec.M802_SoC_SF, "SoC_SF"},
 		{"M802_SoC", sunspec.M802_SoC, "SoC"},
@@ -487,9 +498,10 @@ func m802Checks() []constCheck {
 		{"M802_SoH_SF", sunspec.M802_SoH_SF, "SoH_SF"},
 		{"M802_ChaSt", sunspec.M802_ChaSt, "ChaSt"},
 		{"M802_LocRemCtl", sunspec.M802_LocRemCtl, "LocRemCtl"},
-		// HeatCool has no counterpart anywhere in the published model 802 --
-		// the vendored table invented it.
-		{"M802_HeatCool", sunspec.M802_HeatCool, ""},
+		// M802_HeatCool had no counterpart anywhere in the published model
+		// 802 -- the old vendored table invented it. lexa-proto b6eca4a
+		// deleted the constant outright rather than leave a wrong-but-
+		// compiling name, so there is nothing left to check here.
 		{"M802_Typ", sunspec.M802_Typ, "Typ"},
 		{"M802_State", sunspec.M802_State, "State"},
 	}

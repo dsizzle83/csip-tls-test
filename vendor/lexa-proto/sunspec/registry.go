@@ -26,13 +26,13 @@ package sunspec
 //	               docs/schema/sunspec-models/model_<id>.json AND a Layout or
 //	               offset table proven against it, point for point, by
 //	               TestLayoutsMatchVendoredSpec / the per-model offset tests.
-//	               This is 31 of the 36 ids below and the only tier that grows
+//	               This is 32 of the 36 ids below and the only tier that grows
 //	               without a decision: dropping a model_*.json into the schema
 //	               directory and forgetting to register it here FAILS
 //	               TestKnownModelsCoversEveryVendoredDefinition.
 //	OFFSET-BACKED  the model has a hand-verified register offset table in
-//	               models.go but no vendored JSON yet (the meters and 802).
-//	               A definition with a weaker proof is still a definition: the
+//	               models.go but no vendored JSON yet (the meters). A
+//	               definition with a weaker proof is still a definition: the
 //	               package can decode the block.
 //	NAMED          the model has no register map here at all, and the product
 //	               nonetheless acts on its PRESENCE. Exactly one id is in this
@@ -65,9 +65,9 @@ var knownModelIDs = []uint16{
 	ModelInverterSinglePh, // 101
 	ModelInverterSplitPh,  // 102
 	ModelInverterThreePh,  // 103 — models.go's M103_* table
-	ModelNameplate,        // 120 — M120_* table (readNameplateW's legacy source)
-	ModelBasicSettings,    // 121 — M121_* table (the mutable WMax setting)
-	ModelExtendedStatus,   // 122 — M122_* table (derbase liveness)
+	ModelNameplate,        // 120 — SPEC-BACKED: L120 (M120_* restated REV0907-D1), readNameplateW's legacy source
+	ModelBasicSettings,    // 121 — SPEC-BACKED: L121 (M121_* proven against it), the mutable WMax setting
+	ModelExtendedStatus,   // 122 — SPEC-BACKED: L122 (M122_* restated REV0907-D2), derbase liveness
 	ModelImmediateCtrl,    // 123 — L123, the fail-safe cease chain
 
 	// ── Legacy curve / advanced-function family (D4 served-as-itself) ───────
@@ -106,7 +106,9 @@ var knownModelIDs = []uint16{
 
 	// ── Battery ─────────────────────────────────────────────────────────────
 	// NAMED: 801 carries no register map in this package — see the tier note
-	// above for why it is registered anyway. 802 is OFFSET-BACKED (M802_*).
+	// above for why it is registered anyway. 802 is SPEC-BACKED as of
+	// REV0907-D3 (WP4-T4): L802 (M802_* restated), proven against
+	// docs/schema/sunspec-models/model_802.json by TestLayoutsMatchVendoredSpec.
 	ModelBatteryBase,    // 801
 	ModelLithiumBattery, // 802
 }

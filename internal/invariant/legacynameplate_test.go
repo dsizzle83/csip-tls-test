@@ -12,7 +12,7 @@ import (
 func m120Block(wRtg uint16, sf int16) []uint16 {
 	regs := make([]uint16, sunspec.M120_MaxDisChaRte_SF+1)
 	regs[sunspec.M120_WRtg] = wRtg
-	regs[sunspec.M120_W_SF] = uint16(sf)
+	regs[sunspec.M120_WRtg_SF] = uint16(sf)
 	return regs
 }
 
@@ -86,7 +86,7 @@ func TestDecodeLegacyNameplate_AbsentOrIllegal(t *testing.T) {
 		m120, m121 []uint16
 	}{
 		{"neither model served", nil, nil},
-		{"120 too short", make([]uint16, sunspec.M120_W_SF), nil},
+		{"120 too short", make([]uint16, sunspec.M120_WRtg_SF), nil},
 		{"121 too short", nil, make([]uint16, sunspec.M121_WMax_SF)},
 		{"120 sf outside the domain", m120Block(5000, 11), nil},
 		{"121 sf outside the domain", nil, m121Block(5000, -11)},

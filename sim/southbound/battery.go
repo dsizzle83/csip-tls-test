@@ -10,8 +10,9 @@ package sim
 //	40098–40129: Model 121 (Basic Settings,        30 data regs)
 //	40130–40181: Model 103 (Three-Phase Inverter,  50 data regs)
 //	40182–40206: Model 123 (Immediate Controls,    23 data regs)
-//	40207–40234: Model 802 (Li-Ion Battery Base,   26 data regs)
-//	40235–40236: end marker
+//	40207–40270: Model 802 (Li-Ion Battery Base,   62 data regs — REV0907-E8/
+//	             WP4-T7 fixed from the old invented 26; sunspec.M802Len)
+//	40271–40272: end marker
 //
 // Animation runs every 5 s on a 1200-second (20-minute) sinusoidal cycle:
 //
@@ -483,7 +484,7 @@ func populateBatteryCore(r *RegisterMap, wmaxKwh, wmaxW float64) (BatteryBases, 
 	r.Set(m120+sunspec.M120_AhrRtg, uint16(wmaxKwh*1000/48))
 	r.Set(m120+sunspec.M120_MaxChaRte, uint16(wmaxW))
 	r.Set(m120+sunspec.M120_MaxDisChaRte, uint16(wmaxW))
-	r.Set(m120+sunspec.M120_W_SF, 0)
+	r.Set(m120+sunspec.M120_WRtg_SF, 0)
 	r.Set(m120+sunspec.M120_VARtg_SF, 0)
 	r.Set(m120+sunspec.M120_VArRtg_SF, 0)
 	r.Set(m120+sunspec.M120_ARtg_SF, 0)
@@ -539,7 +540,8 @@ func populateBatteryCore(r *RegisterMap, wmaxKwh, wmaxW float64) (BatteryBases, 
 		WMaxLimPctRaw: 0, WMaxLimPctSF: -2, WMaxLimEna: 0, Conn: 1,
 	})
 
-	// Model 802 (Li-Ion Battery Base) — 26 data regs
+	// Model 802 (Li-Ion Battery Base) — sunspec.M802Len data regs (62,
+	// REV0907-E8/WP4-T7 fixed from the old invented 26)
 	r.Set(cursor, sunspec.ModelLithiumBattery)
 	r.Set(cursor+1, sunspec.M802Len)
 	m802Base := cursor + 2
@@ -550,12 +552,12 @@ func populateBatteryCore(r *RegisterMap, wmaxKwh, wmaxW float64) (BatteryBases, 
 	r.Set(m802Base+uint16(sunspec.M802_AHRtg_SF), 0)
 	r.Set(m802Base+uint16(sunspec.M802_WChaRteMax), uint16(wmaxW))
 	r.Set(m802Base+uint16(sunspec.M802_WDisChaRteMax), uint16(wmaxW))
-	r.Set(m802Base+uint16(sunspec.M802_W_SF), 0)
+	r.Set(m802Base+uint16(sunspec.M802_WChaDisChaMax_SF), 0)
 	r.Set(m802Base+uint16(sunspec.M802_DisChaRte), 1)
 	r.Set(m802Base+uint16(sunspec.M802_DisChaRte_SF), 0)
 	r.Set(m802Base+uint16(sunspec.M802_SoCMax), 9500)
 	r.Set(m802Base+uint16(sunspec.M802_SoCMin), 500)
-	r.Set(m802Base+uint16(sunspec.M802_SoCRsvMax), 9000)
+	r.Set(m802Base+uint16(sunspec.M802_SocRsvMax), 9000)
 	r.Set(m802Base+uint16(sunspec.M802_SoCRsvMin), 1000)
 	r.Set(m802Base+uint16(sunspec.M802_SoC_SF), sfN(-2))
 	r.Set(m802Base+uint16(sunspec.M802_SoC), 5500)

@@ -87,7 +87,9 @@ var (
 	goldenM120ARtg     = goldenOffset("M120", "ARtg")
 	goldenM120PFRtgQ1  = goldenOffset("M120", "PFRtgQ1")
 	// The golden names WRtg's scale factor "WRtg_SF" (the spec's own name);
-	// lexa-proto's vendored constant for the same register is M120_W_SF.
+	// lexa-proto's vendored constant for the same register is now spelled
+	// the same way, M120_WRtg_SF (REV0907-E8/WP4-T7 renamed it away from
+	// the old invented M120_W_SF).
 	goldenM120WRtgSF   = goldenOffset("M120", "WRtg_SF")
 	goldenM120VARtgSF  = goldenOffset("M120", "VARtg_SF")
 	goldenM120VArRtgSF = goldenOffset("M120", "VArRtg_SF")

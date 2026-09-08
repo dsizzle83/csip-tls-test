@@ -3324,6 +3324,10 @@ const (
 
 	ElemM123RmpTms     = "WMaxLimPct_RmpTms"
 	ElemM123WMaxLimPct = "WMaxLimPct"
+	// ElemM123RvrtTms names the ceiling's reversion timer (REV0907-A4): the
+	// element this plan reports only when the device implements the point,
+	// since an unimplemented timer is never something this plan owns.
+	ElemM123RvrtTms = "WMaxLimPct_RvrtTms"
 	// ElemM123Ena carries the PUBLISHED point name, WMaxLim_Ena — model 123
 	// spells the enable without the "Pct" its value and timers all carry
 	// (verified against model_123.json; gate #18). It read "WMaxLimPct_Ena"
@@ -3341,10 +3345,14 @@ const (
 )
 
 // Element indexes within m123LimitPlan's PlanOutcome.Elements, in write order.
+// m123ElemRvrt is appended after the original three (rather than inserted in
+// write-order position) so it does not renumber Rmp/Val/Ena at every existing
+// out.Elements[...] site.
 const (
 	m123ElemRmp = iota
 	m123ElemVal
 	m123ElemEna
+	m123ElemRvrt
 )
 
 // defaultLegacyRmpTms is the ramp time (seconds) written with a legacy M123
@@ -3783,14 +3791,32 @@ type m123LimitPlan struct {
 	sf  int16
 	rmp uint16
 
-	grouped     bool
-	win0, rvrt0 uint16 // a grouped write puts these two back AS READ
+	grouped bool
+	// win0 is WMaxLimPct_WinTms's pre-state; a grouped write puts it back AS
+	// READ — this plan owns the ceiling and its ramp/enable/reversion, not the
+	// window timer.
+	win0 uint16
+	// rvrt0 is WMaxLimPct_RvrtTms's pre-state (also doubles as the 0xFFFF
+	// not-implemented probe); rvrt is the TARGET this plan arms it to.
+	//
+	// REV0907-A4 / registry CONTROL-PRECEDENCE-M123-FIRST-PER-DEVICE F1: the
+	// 704 ceiling path (SetWMaxLimPctWPlan) arms WMaxLimPctRvrtTms from
+	// b.DefaultRvrtTms on every write, so a 704-ceilinged device reverts a
+	// stale curtailment if the gateway dies. Under control_precedence="M123"
+	// this plan writes the SAME failsafe-direction ceiling (curtailment
+	// persists, never wrong-direction) but left RvrtTms untouched — so on
+	// hardware that implements the timer, a lost gateway left the ceiling
+	// latched forever instead of reverting per policy. rvrt is computed once,
+	// from the same b.DefaultRvrtTms the 704 path reads, and written whenever
+	// the device implements the point — mirroring the 704 path's
+	// DefaultRvrtTms==0 -> "no reversion armed" convention exactly.
+	rvrt0, rvrt uint16
 
 	// pre-state, measured before the first write
 	val0, ena0, rmp0 uint16
 	pct0             float64
 
-	attempted [3]bool
+	attempted [4]bool
 }
 
 // SetLegacyWMaxLimPctPlan runs the M123 ceiling plan and returns the measured
@@ -3847,7 +3873,17 @@ func (b *Base) newM123LimitPlan(w float64, tag string) (*m123LimitPlan, error) {
 			"cannot express %g W: M123 WMaxLimPct is an unsigned percent-of-WMax export ceiling "+
 				"and carries no import/charge direction", w)}
 	}
-	p := &m123LimitPlan{b: b, tag: tag, rmp: b.legacyRmpTms()}
+	// WMaxLimPct_RvrtTms is an unscaled uint16 seconds count (no _SF point —
+	// L123 declares it F(...), not FS(...), like WinTms/RmpTms). EncodeScaleUint
+	// at sf=0 is an identity conversion that ALSO gives this the same
+	// clamp-to-max-valid-and-never-the-sentinel behavior every other unscaled
+	// uint16 write in this package already gets (SUN-004): a policy value
+	// above 65534s clamps to 65534 rather than landing on 0xFFFF, which this
+	// model's own convention reads back as "not implemented" — writing it
+	// would make an implemented timer look unimplemented to the next plan
+	// that reads this block.
+	rvrt := sunspec.RawFromScaleUint(float64(b.DefaultRvrtTms), 0)
+	p := &m123LimitPlan{b: b, tag: tag, rmp: b.legacyRmpTms(), rvrt: rvrt}
 	// A ceiling ABOVE the nameplate clamps to 100 %, and that is not a silent
 	// substitution: a device bounded at its own nameplate satisfies the wider
 	// bound exactly, because it cannot exceed it either way. Contrast
@@ -3947,19 +3983,36 @@ func (p *m123LimitPlan) execute() (PlanOutcome, error) {
 		{Name: ElemM123WMaxLimPct, Model: sunspec.ModelImmediateCtrl, Before: p.pct0, After: math.NaN()},
 		{Name: ElemM123Ena, Model: sunspec.ModelImmediateCtrl, Before: float64(p.ena0), After: math.NaN()},
 	}}
+	// REV0907-A4: WMaxLimPct_RvrtTms becomes an element ONLY when this
+	// device's copy of the (optional) point is implemented — mirroring the
+	// M123 Conn plan's own WinTms/RvrtTms rule ("not implemented: this plan
+	// never owned it"), not RmpTms's unconditional element above. An
+	// unimplemented timer this plan never attempts must not read as
+	// NotAttempted-therefore-Degraded (PlanOutcome.Degraded walks every
+	// element and treats anything but Applied as degraded) when there was
+	// never anything on this device to apply. p.grouped already required
+	// every WMaxLimPct-group point implemented, so whenever the grouped
+	// branch below runs, this element is guaranteed present at index
+	// m123ElemRvrt.
+	rvrtImpl := p.rvrt0 != 0xFFFF
+	if rvrtImpl {
+		out.Elements = append(out.Elements, ElementOutcome{
+			Name: ElemM123RvrtTms, Model: sunspec.ModelImmediateCtrl, Before: float64(p.rvrt0), After: math.NaN()})
+	}
 
 	if p.grouped {
 		// One FC16 over the WMaxLimPct group — offsets 3-7 in the published
-		// model: value, WinTms and RvrtTms back as read, ramp, enable. No
-		// partial-state window exists inside a single transaction; the device
-		// either takes it or it does not.
+		// model: value, WinTms back as read, RvrtTms ARMED to policy
+		// (REV0907-A4 — it no longer goes back as read, see the m123LimitPlan
+		// field doc), ramp, enable. No partial-state window exists inside a
+		// single transaction; the device either takes it or it does not.
 		//
 		// This comment said "offsets 0-4" until 2026-08-15, which was true of
 		// the mis-transcribed map and is exactly where the damage was: 0-4 is
 		// the CONNECT group, so this write was landing on Conn_WinTms,
 		// Conn_RvrtTms and Conn on every ceiling command.
-		p.attempted = [3]bool{true, true, true}
-		err := p.write(sunspec.M123_WMaxLimPct, p.raw, p.win0, p.rvrt0, p.rmp, 1)
+		p.attempted = [4]bool{true, true, true, true}
+		err := p.write(sunspec.M123_WMaxLimPct, p.raw, p.win0, p.rvrt, p.rmp, 1)
 		if err == nil {
 			return p.classify(out)
 		}
@@ -3979,6 +4032,22 @@ func (p *m123LimitPlan) execute() (PlanOutcome, error) {
 	p.attempted[m123ElemRmp] = true
 	if err := p.write(sunspec.M123_WMaxLimPct_RmpTms, p.rmp); err != nil {
 		out.Elements[m123ElemRmp].Err = fmt.Errorf("%s: set ramp time: %w", p.tag, err)
+	}
+
+	// 1.5. Reversion timer (REV0907-A4), gated on rvrtImpl exactly as the
+	//      element above was: TestM123Row2_UnimplementedTimersSkipGrouping
+	//      pins that the sequenced path must never write to an unimplemented
+	//      WinTms/RvrtTms. Written alongside the ramp — before the value/
+	//      enable that make the ceiling live — and, like the ramp, its
+	//      failure is advisory rather than blocking: the ceiling itself is
+	//      the fail-safe direction (a curtailment that never reverts is never
+	//      LESS restrictive than commanded), so a device that refuses this
+	//      optional point still gets the primary control it asked for.
+	if rvrtImpl {
+		p.attempted[m123ElemRvrt] = true
+		if err := p.write(sunspec.M123_WMaxLimPct_RvrtTms, p.rvrt); err != nil {
+			out.Elements[m123ElemRvrt].Err = fmt.Errorf("%s: set reversion time: %w", p.tag, err)
+		}
 	}
 
 	// 2. The ceiling value, still inert while the enable is off.
@@ -4047,6 +4116,24 @@ func (p *m123LimitPlan) classify(out PlanOutcome) (PlanOutcome, error) {
 		out.Elements[m123ElemRmp].Advisory = fmt.Sprintf(
 			"device holds RmpTms=%ds, wrote %ds — this changes how fast the device walks to the ceiling, not the ceiling",
 			rmpAfter, p.rmp)
+	}
+	// REV0907-A4: the element (and thus its index m123ElemRvrt) exists only
+	// when this device implements the point — see execute()'s rvrtImpl.
+	if p.rvrt0 != 0xFFFF {
+		rvrtAfter := regs[sunspec.M123_WMaxLimPct_RvrtTms]
+		out.Elements[m123ElemRvrt].After = float64(rvrtAfter)
+		out.Elements[m123ElemRvrt].State = p.stateOf(m123ElemRvrt, rvrtAfter == p.rvrt)
+		if rvrtAfter != p.rvrt {
+			// A reversion timer that did not arm leaves the ceiling (the
+			// fail-safe direction) exactly as commanded — advisory, not a
+			// verify failure, for the identical reason RmpTms's mismatch
+			// above is advisory: this element changes what happens if comms
+			// are lost, not whether the commanded ceiling is in force.
+			out.Elements[m123ElemRvrt].Advisory = fmt.Sprintf(
+				"device holds WMaxLimPct_RvrtTms=%ds, wrote %ds — the ceiling reverts on a "+
+					"different schedule than commanded, not a different ceiling",
+				rvrtAfter, p.rvrt)
+		}
 	}
 
 	if valOK && enaOK {

@@ -1110,7 +1110,7 @@ func (bs *BatteryServer) injectPackCapacity(key string, val float64) error {
 			sunspec.RawFromScaleUint(val, int16(bs.Regs.Get(bs.bases.M120Base+sunspec.M120_MaxDisChaRte_SF))))
 	case "WMaxRtg_W":
 		bs.Regs.Set(bs.bases.M120Base+sunspec.M120_WRtg,
-			sunspec.RawFromScaleUint(val, int16(bs.Regs.Get(bs.bases.M120Base+sunspec.M120_W_SF))))
+			sunspec.RawFromScaleUint(val, int16(bs.Regs.Get(bs.bases.M120Base+sunspec.M120_WRtg_SF))))
 	}
 	return nil
 }

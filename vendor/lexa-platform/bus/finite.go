@@ -276,20 +276,40 @@ func (s DERScheduleSlot) Finite() error {
 	return nil
 }
 
-// Finite is DERScheduleMsg's counterpart to Measurement.Finite. DERScheduleMsg
-// itself has no bare *float64 fields — its numeric payload lives in Slots —
-// so this walks the slots and delegates to DERScheduleSlot.Finite. This
+// Finite is DERScheduleMsg's counterpart to Measurement.Finite. Its numeric
+// payload lives in two places — Slots and DERStatus — so this walks both and
+// delegates to DERScheduleSlot.Finite / DERStatusSummary.Finite. This
 // matters because mqttutil.Subscribe's Finite() type assertion runs against
 // the top-level decoded type (T = DERScheduleMsg for
-// bus.TopicNorthboundSchedule), not the nested slice element; without this
-// method a non-finite value in a slot would never be checked.
+// bus.TopicNorthboundSchedule), not a nested slice element; without this
+// method a non-finite value in a slot or a status entry would never be
+// checked. DERStatus joined the walk under D12/REV0907 (WP6-T7): the
+// reflective per-field test in finite_reflect_test.go found it had been
+// missing since DERStatusSummary's StateOfChargePct/EstimatedWAvail were
+// added — a NaN there would have reached lexa-hub's schedule consumer
+// unrejected.
 func (d DERScheduleMsg) Finite() error {
 	for i, s := range d.Slots {
 		if err := s.Finite(); err != nil {
 			return fmt.Errorf("slots[%d]: %w", i, err)
 		}
 	}
+	for i, s := range d.DERStatus {
+		if err := s.Finite(); err != nil {
+			return fmt.Errorf("der_status[%d]: %w", i, err)
+		}
+	}
 	return nil
+}
+
+// Finite is DERStatusSummary's counterpart to Measurement.Finite (D12/
+// REV0907): its two optional *float64 fields, same nil-skip convention as
+// every other type here.
+func (s DERStatusSummary) Finite() error {
+	if err := finite("soc_pct", s.StateOfChargePct); err != nil {
+		return err
+	}
+	return finite("estimated_w_avail", s.EstimatedWAvail)
 }
 
 // Finite is EVGoalIntent's counterpart to Measurement.Finite (TASK-082).
@@ -430,6 +450,13 @@ func (h HubSchedule) Finite() error {
 		return err
 	}
 	if err := finiteSlice("battery_setpoint_w", h.BatterySetpointW); err != nil {
+		return err
+	}
+	// D12/REV0907 (WP6-T7): load_forecast_w joined this walk after the
+	// reflective per-field test in finite_reflect_test.go found it had been
+	// missing since it was added — same PR-C-era series shape as
+	// solar_forecast_w/battery_setpoint_w above, checked via the same helper.
+	if err := finiteSlice("load_forecast_w", h.LoadForecastW); err != nil {
 		return err
 	}
 	for i := range h.BatterySocPct {

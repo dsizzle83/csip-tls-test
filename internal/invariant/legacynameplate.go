@@ -50,15 +50,15 @@ import (
 // regs are DATA registers — no id/length header — exactly as
 // sunspec.Reader.ReadModel returns them and as every other decoder here takes
 // them. The offsets come from lexa-proto's own vendored model tables
-// (sunspec.M120_WRtg / M120_W_SF / M121_WMax / M121_WMax_SF), which are pinned
+// (sunspec.M120_WRtg / M120_WRtg_SF / M121_WMax / M121_WMax_SF), which are pinned
 // against the SunSpec model JSON by that package's own tests; there is no
 // Layout for 120/121 to derive them from, and inventing a second transcription
 // of offsets that already have a checked home is how the two drift apart.
 func DecodeLegacyNameplate(source string, m120, m121 []uint16) Nameplate {
 	n := Nameplate{Source: source}
 	// The RATING (M120 WRtg).
-	if len(m120) > sunspec.M120_W_SF {
-		if sf := int16(m120[sunspec.M120_W_SF]); sunspec.ValidSF(sf) {
+	if len(m120) > sunspec.M120_WRtg_SF {
+		if sf := int16(m120[sunspec.M120_WRtg_SF]); sunspec.ValidSF(sf) {
 			n.WMaxRtg = Q(sunspec.ApplyScaleUint(m120[sunspec.M120_WRtg], sf), UnitWatt)
 			n.Present = true
 		}
