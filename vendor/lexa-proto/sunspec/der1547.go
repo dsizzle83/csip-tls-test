@@ -41,21 +41,21 @@ func readString(regs []uint16, off, regLen int) string {
 
 // ACMeasurement is the full decoded DER AC measurement (model 701).
 type ACMeasurement struct {
-	ACType  uint16  // 0=single, 1=split, 2=three-phase
-	St      uint16  // operating state (0=off,1=on)
-	InvSt   uint16  // inverter state (0..7)
-	ConnSt  uint16  // 0=disconnected, 1=connected
-	Alrm    uint32  // alarm bitfield
-	DERMode uint32  // operational characteristics bitfield
-	W, VA, Var, PF, A   float64
-	LLV, LNV, VL1, Hz   float64
+	ACType                        uint16 // 0=single, 1=split, 2=three-phase
+	St                            uint16 // operating state (0=off,1=on)
+	InvSt                         uint16 // inverter state (0..7)
+	ConnSt                        uint16 // 0=disconnected, 1=connected
+	Alrm                          uint32 // alarm bitfield
+	DERMode                       uint32 // operational characteristics bitfield
+	W, VA, Var, PF, A             float64
+	LLV, LNV, VL1, Hz             float64
 	VL2, VL3, VL1L2, VL2L3, VL3L1 float64
-	TotWhInj, TotWhAbs       float64
-	TotVarhInj, TotVarhAbs   float64
-	TmpCab  float64
-	ThrotPct float64
-	ThrotSrc uint32
-	MnAlrmInfo string
+	TotWhInj, TotWhAbs            float64
+	TotVarhInj, TotVarhAbs        float64
+	TmpCab                        float64
+	ThrotPct                      float64
+	ThrotSrc                      uint32
+	MnAlrmInfo                    string
 }
 
 // Parse701 decodes model 701 registers.
@@ -63,26 +63,26 @@ func Parse701(regs []uint16) ACMeasurement {
 	v := L701.View(regs)
 	e := func(n string) uint16 { x, _ := v.Enum(n); return x }
 	return ACMeasurement{
-		ACType:  e("ACType"),
-		St:      e("St"),
-		InvSt:   e("InvSt"),
-		ConnSt:  e("ConnSt"),
-		Alrm:    v.Bitfield32("Alrm"),
-		DERMode: v.Bitfield32("DERMode"),
-		W:       v.Float("W"),
-		VA:      v.Float("VA"),
-		Var:     v.Float("Var"),
-		PF:      v.Float("PF"), // engineering value = power factor (raw × 10^SF)
-		A:       v.Float("A"),
-		LLV:     v.Float("LLV"),
-		LNV:     v.Float("LNV"),
-		VL1:     v.Float("VL1"),
-		VL2:     v.Float("VL2"),
-		VL3:     v.Float("VL3"),
-		VL1L2:   v.Float("VL1L2"),
-		VL2L3:   v.Float("VL2L3"),
-		VL3L1:   v.Float("VL3L1"),
-		Hz:      v.Float("Hz"),
+		ACType:     e("ACType"),
+		St:         e("St"),
+		InvSt:      e("InvSt"),
+		ConnSt:     e("ConnSt"),
+		Alrm:       v.Bitfield32("Alrm"),
+		DERMode:    v.Bitfield32("DERMode"),
+		W:          v.Float("W"),
+		VA:         v.Float("VA"),
+		Var:        v.Float("Var"),
+		PF:         v.Float("PF"), // engineering value = power factor (raw × 10^SF)
+		A:          v.Float("A"),
+		LLV:        v.Float("LLV"),
+		LNV:        v.Float("LNV"),
+		VL1:        v.Float("VL1"),
+		VL2:        v.Float("VL2"),
+		VL3:        v.Float("VL3"),
+		VL1L2:      v.Float("VL1L2"),
+		VL2L3:      v.Float("VL2L3"),
+		VL3L1:      v.Float("VL3L1"),
+		Hz:         v.Float("Hz"),
 		TotWhInj:   v.Float("TotWhInj"),
 		TotWhAbs:   v.Float("TotWhAbs"),
 		TotVarhInj: v.Float("TotVarhInj"),
@@ -103,19 +103,19 @@ func Parse701(regs []uint16) ACMeasurement {
 // Capacity holds the model 702 nameplate ratings and configuration setpoints.
 // Setting fields are NaN when the device does not implement the optional block.
 type Capacity struct {
-	WMaxRtg, WOvrExtRtg, WOvrExtRtgPF, WUndExtRtg, WUndExtRtgPF float64
-	VAMaxRtg, VarMaxInjRtg, VarMaxAbsRtg                        float64
+	WMaxRtg, WOvrExtRtg, WOvrExtRtgPF, WUndExtRtg, WUndExtRtgPF        float64
+	VAMaxRtg, VarMaxInjRtg, VarMaxAbsRtg                               float64
 	WChaRteMaxRtg, WDisChaRteMaxRtg, VAChaRteMaxRtg, VADisChaRteMaxRtg float64
-	VNomRtg, VMaxRtg, VMinRtg, AMaxRtg                          float64
-	PFOvrExtRtg, PFUndExtRtg, ReactSusceptRtg                   float64
-	NorOpCatRtg, AbnOpCatRtg uint16
-	CtrlModes        uint32
-	IntIslandCatRtg  uint16
+	VNomRtg, VMaxRtg, VMinRtg, AMaxRtg                                 float64
+	PFOvrExtRtg, PFUndExtRtg, ReactSusceptRtg                          float64
+	NorOpCatRtg, AbnOpCatRtg                                           uint16
+	CtrlModes                                                          uint32
+	IntIslandCatRtg                                                    uint16
 	// Settings (RW)
-	WMax, WMaxOvrExt, WOvrExtPF, WMaxUndExt, WUndExtPF float64
-	VAMax, VarMaxInj, VarMaxAbs                        float64
+	WMax, WMaxOvrExt, WOvrExtPF, WMaxUndExt, WUndExtPF     float64
+	VAMax, VarMaxInj, VarMaxAbs                            float64
 	WChaRteMax, WDisChaRteMax, VAChaRteMax, VADisChaRteMax float64
-	VNom, VMax, VMin, AMax, PFOvrExt, PFUndExt         float64
+	VNom, VMax, VMin, AMax, PFOvrExt, PFUndExt             float64
 }
 
 // Parse702 decodes model 702 registers.
@@ -147,10 +147,10 @@ func Parse702(regs []uint16) Capacity {
 
 // EnterService holds model 703 enter-service / cease-to-energize settings.
 type EnterService struct {
-	Enabled bool
-	VHi, VLo, HzHi, HzLo float64
+	Enabled                bool
+	VHi, VLo, HzHi, HzLo   float64
 	DelayS, RandomS, RampS uint32
-	DelayRemS uint32
+	DelayRemS              uint32
 }
 
 // Parse703 decodes model 703.
@@ -160,8 +160,8 @@ func Parse703(regs []uint16) EnterService {
 	return EnterService{
 		Enabled: v.Bool("ES"),
 		VHi:     v.Float("ESVHi"), VLo: v.Float("ESVLo"),
-		HzHi:    v.Float("ESHzHi"), HzLo: v.Float("ESHzLo"),
-		DelayS:  u32("ESDlyTms"), RandomS: u32("ESRndTms"), RampS: u32("ESRmpTms"),
+		HzHi: v.Float("ESHzHi"), HzLo: v.Float("ESHzLo"),
+		DelayS: u32("ESDlyTms"), RandomS: u32("ESRndTms"), RampS: u32("ESRmpTms"),
 		DelayRemS: u32("ESDlyRemTms"),
 	}
 }
@@ -239,18 +239,18 @@ func checkScaled(v View, point string, val float64) error {
 // ACControls is a read-back snapshot of model 704. Reversion-timer and ramp
 // fields are included for completeness/diagnostics.
 type ACControls struct {
-	PFWInjEna  bool
-	PFWInjPF   float64
-	PFWInjExt  uint16
-	PFWAbsEna  bool
-	PFWAbsPF   float64
-	PFWAbsExt  uint16
+	PFWInjEna     bool
+	PFWInjPF      float64
+	PFWInjExt     uint16
+	PFWAbsEna     bool
+	PFWAbsPF      float64
+	PFWAbsExt     uint16
 	WMaxLimPctEna bool
-	WMaxLimPct float64
-	WSetEna    bool
-	WSetMod    uint16
-	WSet       float64 // watts
-	WSetPct    float64 // % of max
+	WMaxLimPct    float64
+	WSetEna       bool
+	WSetMod       uint16
+	WSet          float64 // watts
+	WSetPct       float64 // % of max
 	// WSetStepW is the device's OWN quantization of WSet in watts (10^WSet_SF)
 	// — the smallest change that register can express, which is a fact about
 	// the machine rather than a tolerance anybody chose. 0 means the device
@@ -263,15 +263,15 @@ type ACControls struct {
 	// commanded 6033.7 W reads back 6030 W forever, and any comparison
 	// tolerance tighter than one step turns that arithmetic into a permanent
 	// divergence and a corrective re-write on every poll.
-	WSetStepW float64
-	VarSetEna  bool
-	VarSetMod  uint16
-	VarSetPri  uint16
-	VarSet     float64
-	VarSetPct  float64
+	WSetStepW    float64
+	VarSetEna    bool
+	VarSetMod    uint16
+	VarSetPri    uint16
+	VarSet       float64
+	VarSetPct    float64
 	WRmp, VarRmp uint16
-	WRmpRef    uint16
-	AntiIslEna bool
+	WRmpRef      uint16
+	AntiIslEna   bool
 }
 
 // Parse704 decodes model 704.
@@ -315,7 +315,6 @@ func curveNPt(hdr *Layout, regs []uint16, maxNPt int) (int, error) {
 	}
 	return npt, nil
 }
-
 
 // ── Checked scaled writes (audit finding: silent scale-factor failures) ──────
 //
@@ -703,9 +702,9 @@ func Encode709Set(regs []uint16, i int, s FreqTripSet) (start, end int, err erro
 // ── Model 711: DER Frequency Droop ───────────────────────────────────────────
 
 type FreqDroopCtl struct {
-	ReadOnly bool
+	ReadOnly                     bool
 	DbOf, DbUf, KOf, KUf, RspTms float64
-	PMin float64
+	PMin                         float64
 }
 
 func Parse711Ctl(regs []uint16, i int) (FreqDroopCtl, error) {
@@ -721,9 +720,9 @@ func Parse711Ctl(regs []uint16, i int) (FreqDroopCtl, error) {
 	return FreqDroopCtl{
 		ReadOnly: h.U16At(co("ReadOnly")) == 1,
 		DbOf:     h.ScaleU32At(co("DbOf"), "Db_SF"), DbUf: h.ScaleU32At(co("DbUf"), "Db_SF"),
-		KOf:      h.ScaleUintAt(co("KOf"), "K_SF"), KUf: h.ScaleUintAt(co("KUf"), "K_SF"),
-		RspTms:   h.ScaleU32At(co("RspTms"), "RspTms_SF"),
-		PMin:     float64(h.I16At(co("PMin"))),
+		KOf: h.ScaleUintAt(co("KOf"), "K_SF"), KUf: h.ScaleUintAt(co("KUf"), "K_SF"),
+		RspTms: h.ScaleU32At(co("RspTms"), "RspTms_SF"),
+		PMin:   float64(h.I16At(co("PMin"))),
 	}, nil
 }
 
@@ -850,23 +849,23 @@ func Parse713(regs []uint16) StorageCapacity {
 // ── Model 714: DER DC Measurement ────────────────────────────────────────────
 
 type DCPort struct {
-	PrtTyp uint16 // 0=PV,1=ESS,2=EV,3=INJ,4=ABS,5=BIDIR,6=DC_DC
-	ID     uint16
-	IDStr  string
+	PrtTyp           uint16 // 0=PV,1=ESS,2=EV,3=INJ,4=ABS,5=BIDIR,6=DC_DC
+	ID               uint16
+	IDStr            string
 	DCA, DCV, DCW    float64
 	DCWhInj, DCWhAbs float64
-	Tmp    float64
-	DCSta  uint16 // 0=off,1=on,2=warning,3=error
-	DCAlrm uint32
+	Tmp              float64
+	DCSta            uint16 // 0=off,1=on,2=warning,3=error
+	DCAlrm           uint32
 }
 
 // DCMeasurement is the full model 714 decode (totals + per-port).
 type DCMeasurement struct {
-	PrtAlrms uint32
-	NPrt     uint16
+	PrtAlrms         uint32
+	NPrt             uint16
 	DCA, DCW         float64
 	DCWhInj, DCWhAbs float64
-	Ports    []DCPort
+	Ports            []DCPort
 }
 
 func Parse714(regs []uint16) (DCMeasurement, error) {
@@ -888,15 +887,15 @@ func Parse714(regs []uint16) (DCMeasurement, error) {
 		po := func(p string) int { return base + L714Prt.Offset(p) }
 		m.Ports = append(m.Ports, DCPort{
 			PrtTyp: h.U16At(po("PrtTyp")), ID: h.U16At(po("ID")),
-			IDStr:  readString(regs, po("IDStr"), 8),
-			DCA:    h.ScaleSignedAt(po("DCA"), "DCA_SF"),
-			DCV:    h.ScaleUintAt(po("DCV"), "DCV_SF"),
-			DCW:    h.ScaleSignedAt(po("DCW"), "DCW_SF"),
+			IDStr:   readString(regs, po("IDStr"), 8),
+			DCA:     h.ScaleSignedAt(po("DCA"), "DCA_SF"),
+			DCV:     h.ScaleUintAt(po("DCV"), "DCV_SF"),
+			DCW:     h.ScaleSignedAt(po("DCW"), "DCW_SF"),
 			DCWhInj: scaleU64At(h, po("DCWhInj"), "DCWH_SF"),
 			DCWhAbs: scaleU64At(h, po("DCWhAbs"), "DCWH_SF"),
-			Tmp:    h.ScaleSignedAt(po("Tmp"), "Tmp_SF"),
-			DCSta:  h.U16At(po("DCSta")),
-			DCAlrm: h.U32At(po("DCAlrm")),
+			Tmp:     h.ScaleSignedAt(po("Tmp"), "Tmp_SF"),
+			DCSta:   h.U16At(po("DCSta")),
+			DCAlrm:  h.U32At(po("DCAlrm")),
 		})
 	}
 	return m, nil

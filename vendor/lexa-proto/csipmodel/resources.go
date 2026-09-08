@@ -788,11 +788,131 @@ type DERControlBase struct {
 	OpModLoadLimW *ActivePower `xml:"opModLoadLimW,omitempty"`
 }
 
-// EventStatus describes the current state of an event.
+// EventStatus describes the current state of an event (IEEE 2030.5-2018
+// Annex B, "EventStatus object", p.159-160).
 type EventStatus struct {
 	CurrentStatus         uint8 `xml:"currentStatus"`
 	DateTime              int64 `xml:"dateTime"`
 	PotentiallySuperseded bool  `xml:"potentiallySuperseded"`
+}
+
+// EventStatus.currentStatus values — IEEE 2030.5-2018 Annex B,
+// "currentStatus attribute (UInt8)", p.159-160 (REV0907-B1):
+//
+//	0 = Scheduled                    — event scheduled, not yet started.
+//	1 = Active                       — event has reached its earliest
+//	                                    Effective Start Time.
+//	2 = Cancelled                    — "Client devices SHALL ... cancel the
+//	                                    event immediately if applicable."
+//	3 = Cancelled with Randomization — cancel immediately, but only after
+//	                                    the end randomization: the larger of
+//	                                    |randomizeStart| and
+//	                                    |randomizeDuration|, in seconds.
+//	                                    "SHALL NOT be used with 'regular'
+//	                                    Events, only with specializations of
+//	                                    RandomizableEvent."
+//	4 = Superseded                   — "client SHALL terminate execution of
+//	                                    the event immediately and commence
+//	                                    execution of the new event
+//	                                    immediately, unless the current time
+//	                                    is within the start randomization
+//	                                    window of the superseded event, in
+//	                                    which case the client SHALL obey the
+//	                                    start randomization of the new
+//	                                    event."
+//	"All other values reserved."
+//
+// REV0907-B1 (CRITICAL): the product tested `currentStatus == 6` at seven
+// call sites in lexa-gw. 6 is not a currentStatus value at all — it is
+// ResponseEventCancelled (see the Table 27 Response status codes below),
+// the *different, Response-object* enumeration for "event cancelled by the
+// server", transposed into this enumeration by mistake. Under the standard,
+// 6 on currentStatus is one of the reserved values above: a client MUST NOT
+// treat it as Cancelled. These constants exist so the correct values (2, 3)
+// are named and typed, and so nobody "corrects" this back to 6 — that
+// transposition is exactly the defect this task fixes. lexa-gw's call
+// sites are repointed at these constants in WP2-T2, after this module is
+// pinned to the fixed lexa-proto revision.
+const (
+	EventStatusScheduled                  uint8 = 0
+	EventStatusActive                     uint8 = 1
+	EventStatusCancelled                  uint8 = 2
+	EventStatusCancelledWithRandomization uint8 = 3
+	EventStatusSuperseded                 uint8 = 4
+)
+
+// IsCancelled reports whether s is Cancelled (2) or Cancelled with
+// Randomization (3) — IEEE 2030.5-2018 p.159-160. It does not report
+// Superseded (4): a superseded event is replaced by a new event, not
+// withdrawn, and the standard's client obligations differ (see IsSuperseded).
+// Reserved values (>4, including the legacy-mistaken 6) are never cancelled —
+// see IsReserved.
+func (s EventStatus) IsCancelled() bool {
+	return s.CurrentStatus == EventStatusCancelled || s.CurrentStatus == EventStatusCancelledWithRandomization
+}
+
+// IsSuperseded reports whether s is Superseded (4) — IEEE 2030.5-2018
+// p.159-160: the client terminates the superseded event and commences the
+// new one (subject to the new event's start randomization if still within
+// the superseded event's own start randomization window).
+func (s EventStatus) IsSuperseded() bool {
+	return s.CurrentStatus == EventStatusSuperseded
+}
+
+// IsTerminal reports whether s is a status the standard requires a client to
+// stop acting on: Cancelled (2), Cancelled with Randomization (3), or
+// Superseded (4). Scheduled (0) and Active (1) are not terminal. Reserved
+// values are not terminal either — see IsReserved.
+func (s EventStatus) IsTerminal() bool {
+	return s.IsCancelled() || s.IsSuperseded()
+}
+
+// IsReserved reports whether s.CurrentStatus falls outside the defined
+// 0-4 range — IEEE 2030.5-2018 p.160: "All other values reserved." A
+// reserved value (this includes the legacy-mistaken 6, ResponseEventCancelled
+// transposed from Table 27) is deliberately NOT cancelled and NOT terminal:
+// the standard gives a client no obligation to act on a value it reserves,
+// and treating an unknown value as if it meant something specific is exactly
+// the class of error REV0907-B1 found. A caller encountering a reserved
+// value should log it once (not per-poll) so an actual future extension of
+// the enumeration is noticed rather than silently misread.
+func (s EventStatus) IsReserved() bool {
+	return s.CurrentStatus > EventStatusSuperseded
+}
+
+// EndRandomizationS returns the end randomization, in seconds, a client must
+// wait before acting on a Cancelled with Randomization (3) event — IEEE
+// 2030.5-2018 p.159-160: "using the larger of (absolute value of
+// randomizeStart) and (absolute value of randomizeDuration) as the end
+// randomization, in seconds." randomizeStart/randomizeDuration are signed
+// (DERControl.RandomizeStart/RandomizeDuration), hence the absolute values
+// here. For every status other than 3 the standard defines no end
+// randomization, so this returns 0 — including for Cancelled (2), which the
+// standard says to cancel "immediately" with no randomization step, and for
+// reserved/other values, which carry no defined behavior at all (see
+// IsReserved).
+func (s EventStatus) EndRandomizationS(randomizeStart, randomizeDuration int32) int32 {
+	if s.CurrentStatus != EventStatusCancelledWithRandomization {
+		return 0
+	}
+	rs, rd := abs32(randomizeStart), abs32(randomizeDuration)
+	if rs > rd {
+		return rs
+	}
+	return rd
+}
+
+// abs32 returns the absolute value of v. Go's signed-integer negation wraps
+// rather than panics, so the one non-representable case (v == -2^31, whose
+// positive counterpart does not fit in int32) returns v unchanged instead of
+// trapping; EndRandomizationS's inputs are wire-derived randomizeStart/
+// randomizeDuration second offsets, for which that boundary value is not a
+// realistic input, so this stays a total function without needing "math".
+func abs32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // DERControl is a time-bound control event within a DERProgram.

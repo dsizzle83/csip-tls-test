@@ -249,19 +249,19 @@ var L704 = NewLayout(
 
 // 704 enum values (CSIP↔SunSpec mapping helpers).
 const (
-	M704_WSetMod_MaxPct = 0 // WSetMod: active power as % of max
-	M704_WSetMod_Watts  = 1 // WSetMod: active power as watts
-	M704_VarSetMod_WMaxPct  = 0
-	M704_VarSetMod_VarMaxPct = 1
+	M704_WSetMod_MaxPct        = 0 // WSetMod: active power as % of max
+	M704_WSetMod_Watts         = 1 // WSetMod: active power as watts
+	M704_VarSetMod_WMaxPct     = 0
+	M704_VarSetMod_VarMaxPct   = 1
 	M704_VarSetMod_VarAvailPct = 2
-	M704_VarSetMod_VAMaxPct = 3
-	M704_VarSetMod_Vars     = 4
-	M704_VarSetPri_Active   = 0
-	M704_VarSetPri_Reactive = 1
-	M704_Ext_OverExcited  = 0
-	M704_Ext_UnderExcited = 1
-	M704_WRmpRef_AMax = 0
-	M704_WRmpRef_WMax = 1
+	M704_VarSetMod_VAMaxPct    = 3
+	M704_VarSetMod_Vars        = 4
+	M704_VarSetPri_Active      = 0
+	M704_VarSetPri_Reactive    = 1
+	M704_Ext_OverExcited       = 0
+	M704_Ext_UnderExcited      = 1
+	M704_WRmpRef_AMax          = 0
+	M704_WRmpRef_WMax          = 1
 )
 
 // ── Curve models 705-712: fixed header + repeating sub-groups ────────────────
@@ -369,10 +369,10 @@ func CurveOffset705(i, npt int) int { return L705Hdr.Len() + i*(L705Crv.Len()+2*
 // PointOffset705 returns the offset of point j (V) within curve i of a 705 block.
 func PointOffset705(i, j, npt int) int { return CurveOffset705(i, npt) + L705Crv.Len() + 2*j }
 
-func CurveOffset706(i, npt int) int { return L706Hdr.Len() + i*(L706Crv.Len()+2*npt) }
+func CurveOffset706(i, npt int) int    { return L706Hdr.Len() + i*(L706Crv.Len()+2*npt) }
 func PointOffset706(i, j, npt int) int { return CurveOffset706(i, npt) + L706Crv.Len() + 2*j }
 
-func CurveOffset712(i, npt int) int { return L712Hdr.Len() + i*(L712Crv.Len()+2*npt) }
+func CurveOffset712(i, npt int) int    { return L712Hdr.Len() + i*(L712Crv.Len()+2*npt) }
 func PointOffset712(i, j, npt int) int { return CurveOffset712(i, npt) + L712Crv.Len() + 2*j }
 
 func CtlOffset711(i int) int { return L711Hdr.Len() + i*L711Ctl.Len() }
@@ -380,7 +380,7 @@ func CtlOffset711(i int) int { return L711Hdr.Len() + i*L711Ctl.Len() }
 // Voltage trip (707/708): one curve-set = ReadOnly(1) + 3×(ActPt(1)+NPt×(V(1)+Tms(2))).
 const tripVPtRegs = 3 // V(uint16)=1 + Tms(uint32)=2
 
-func tripVSetSize(npt int) int { return 1 + 3*(1+npt*tripVPtRegs) }
+func tripVSetSize(npt int) int      { return 1 + 3*(1+npt*tripVPtRegs) }
 func TripVSetOffset(i, npt int) int { return L707Hdr.Len() + i*tripVSetSize(npt) }
 
 // SubCurveOffset707 returns the offset of sub-curve s (0=MustTrip,1=MayTrip,
@@ -392,7 +392,7 @@ func SubCurveOffset707(i, s, npt int) int {
 // Frequency trip (709/710): point = Hz(uint32)=2 + Tms(uint32)=2 = 4 regs.
 const tripHzPtRegs = 4
 
-func tripHzSetSize(npt int) int { return 1 + 3*(1+npt*tripHzPtRegs) }
+func tripHzSetSize(npt int) int      { return 1 + 3*(1+npt*tripHzPtRegs) }
 func TripHzSetOffset(i, npt int) int { return L709Hdr.Len() + i*tripHzSetSize(npt) }
 func SubCurveOffset709(i, s, npt int) int {
 	return TripHzSetOffset(i, npt) + 1 + s*(1+npt*tripHzPtRegs)

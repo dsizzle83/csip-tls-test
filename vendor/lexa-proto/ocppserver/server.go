@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	DefaultPort       = 8887
+	DefaultPort = 8887
 	// DefaultListenPath is the gorilla/mux path template the CSMS handler is
 	// registered on.  The {id} segment captures the charging station identifier
 	// that the client appends to its URL (e.g. ws://host:8887/ocpp/cs-001).

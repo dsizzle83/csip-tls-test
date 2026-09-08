@@ -27,12 +27,12 @@ type CustomerAccount struct {
 	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns CustomerAccount"`
 	Resource
 
-	MRID                      string    `xml:"mRID,omitempty"`
-	Description               string    `xml:"description,omitempty"`
-	Currency                  uint16    `xml:"currency,omitempty"` // ISO 4217 numeric
-	CustomerAccountNumber     string    `xml:"customerAccount,omitempty"`
-	CustomerName              string    `xml:"customerName,omitempty"`
-	PricePowerOfTenMultiplier int8      `xml:"pricePowerOfTenMultiplier,omitempty"`
+	MRID                      string `xml:"mRID,omitempty"`
+	Description               string `xml:"description,omitempty"`
+	Currency                  uint16 `xml:"currency,omitempty"` // ISO 4217 numeric
+	CustomerAccountNumber     string `xml:"customerAccount,omitempty"`
+	CustomerName              string `xml:"customerName,omitempty"`
+	PricePowerOfTenMultiplier int8   `xml:"pricePowerOfTenMultiplier,omitempty"`
 
 	CustomerAgreementListLink *ListLink `xml:"CustomerAgreementListLink,omitempty"`
 	ServiceSupplierLink       *Link     `xml:"ServiceSupplierLink,omitempty"`
@@ -40,7 +40,7 @@ type CustomerAccount struct {
 
 // CustomerAccountList is a collection of CustomerAccount resources.
 type CustomerAccountList struct {
-	XMLName         xml.Name          `xml:"urn:ieee:std:2030.5:ns CustomerAccountList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns CustomerAccountList"`
 	Resource
 
 	All             uint32            `xml:"all,attr"`
@@ -71,7 +71,7 @@ type CustomerAgreement struct {
 
 // CustomerAgreementList is a collection of CustomerAgreement resources.
 type CustomerAgreementList struct {
-	XMLName           xml.Name            `xml:"urn:ieee:std:2030.5:ns CustomerAgreementList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns CustomerAgreementList"`
 	Resource
 
 	All               uint32              `xml:"all,attr"`
@@ -97,7 +97,7 @@ type BillingPeriod struct {
 
 // BillingPeriodList is a collection of BillingPeriod resources.
 type BillingPeriodList struct {
-	XMLName       xml.Name        `xml:"urn:ieee:std:2030.5:ns BillingPeriodList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns BillingPeriodList"`
 	Resource
 
 	All           uint32          `xml:"all,attr"`
@@ -128,7 +128,7 @@ type BillingReading struct {
 
 // BillingReadingList is a collection of BillingReading resources.
 type BillingReadingList struct {
-	XMLName        xml.Name         `xml:"urn:ieee:std:2030.5:ns BillingReadingList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns BillingReadingList"`
 	Resource
 
 	All            uint32           `xml:"all,attr"`
@@ -152,7 +152,7 @@ type BillingReadingSet struct {
 
 // BillingReadingSetList is a collection of BillingReadingSet resources.
 type BillingReadingSetList struct {
-	XMLName           xml.Name            `xml:"urn:ieee:std:2030.5:ns BillingReadingSetList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns BillingReadingSetList"`
 	Resource
 
 	All               uint32              `xml:"all,attr"`
@@ -176,7 +176,7 @@ type HistoricalReading struct {
 
 // HistoricalReadingList is a collection of HistoricalReading resources.
 type HistoricalReadingList struct {
-	XMLName           xml.Name            `xml:"urn:ieee:std:2030.5:ns HistoricalReadingList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns HistoricalReadingList"`
 	Resource
 
 	All               uint32              `xml:"all,attr"`
@@ -199,7 +199,7 @@ type ProjectionReading struct {
 
 // ProjectionReadingList is a collection of ProjectionReading resources.
 type ProjectionReadingList struct {
-	XMLName           xml.Name            `xml:"urn:ieee:std:2030.5:ns ProjectionReadingList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns ProjectionReadingList"`
 	Resource
 
 	All               uint32              `xml:"all,attr"`
@@ -222,7 +222,7 @@ type TargetReading struct {
 
 // TargetReadingList is a collection of TargetReading resources.
 type TargetReadingList struct {
-	XMLName       xml.Name        `xml:"urn:ieee:std:2030.5:ns TargetReadingList"`
+	XMLName xml.Name `xml:"urn:ieee:std:2030.5:ns TargetReadingList"`
 	Resource
 
 	All           uint32          `xml:"all,attr"`
