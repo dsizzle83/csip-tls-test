@@ -328,7 +328,7 @@ silently degrades some fraction of verdicts to SKIP/FAIL:
 
 | Knob | Why |
 |---|---|
-| `GRIDSIM_BIN=./bin/server-keylog`<br>`MBAPS_BIN=./bin/mbapsdev-keylog` | the **keylog builds**. Without them there is no `-keylog` flag to export TLS secrets, so captured traffic is undecryptable and every citation-dependent case has no transcript to cite from. |
+| `GRIDSIM_BIN=./bin/server-keylog`<br>`MBAPS_BIN=./bin/mbapsdev-keylog` | the **keylog builds**. Without them there is no `-keylog` flag to export TLS secrets, so captured traffic is undecryptable and every citation-dependent case has no transcript to cite from. A keylog build ALSO writes its own unsolicited `./sslkeylog.log` into its process cwd (a compile-time wolfSSL constant, independent of `-keylog`/`SIMS_KEYLOG`) — `bench-sims-up.sh` runs every sim from `$LEXA_SIM_RUNDIR` (default `/tmp/lexa-sims`), never this repo's root, so that file never lands in the checkout (REV0907-E5). |
 | `SIMS_KEYLOG=/tmp/bench-shared.keylog` | both sims append their TLS secrets to one file, so a single capture on either interface decrypts against it. |
 | `GRIDSIM_NO_TICKETS=1`<br>`MBAPS_NO_TICKETS=1` | forces a **full mTLS handshake on every gateway dial**. A resumed TLS 1.3 handshake carries no Certificate message (RFC 8446 §2.2) — without this, RBAC-011 and every other client-certificate citation is unavailable (`docs/PREFLIGHT_2026-08-05_flashed-image-campaign.md` §2 rule 3). |
 | `GRIDSIM_IDLE_S=30` | closes idle CSIP sessions, so each poll produces its own individually observable session instead of one long-lived session spanning the whole capture. |

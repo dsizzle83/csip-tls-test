@@ -71,6 +71,20 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
+# REV0907-E5 (WP0-T3): a wolfSSL sysroot built with --enable-keylog-export
+# ALSO writes its own ./sslkeylog.log into the process CWD
+# (WOLFSSL_SSLKEYLOGFILE_OUTPUT is a compile-time constant, independent of the
+# -keylog flag / SIMS_KEYLOG below — see .gitignore's note on this). Every sim
+# below is started via start(), which cd's the sim itself into a per-sim
+# scratch dir OUTSIDE this repo before exec, so a live keylog build
+# (GRIDSIM_BIN/MBAPS_BIN=*-keylog) can never again deposit a live TLS-secret
+# file at the repo root. Every path this script hands a sim is resolved
+# absolute (rooted at $HERE) BEFORE that cd, so no flag or log path moves.
+SIM_RUNDIR="${LEXA_SIM_RUNDIR:-/tmp/lexa-sims}"
+mkdir -p "$SIM_RUNDIR" && chmod 0700 "$SIM_RUNDIR"
+# abs_repo_path REL — REL resolved against $HERE unless already absolute.
+abs_repo_path(){ case "$1" in /*) printf '%s\n' "$1";; *) printf '%s\n' "$HERE/$1";; esac; }
+
 GW_HOST="${GW_HOST:-69.0.0.2}"
 LOG="${BENCH_LOG:-$HERE/logs/bench}"
 MODSIM_PORT="${MODSIM_PORT:-5020}"
@@ -109,8 +123,8 @@ MODSIM_BIND="${MODSIM_BIND:-}"
 #   SIMS_KEYLOG=<path>        append both sims' TLS secrets there (keylog builds only)
 #   GRIDSIM_NO_TICKETS=1      full mTLS handshake on every gateway dial
 #   GRIDSIM_IDLE_S=<s>        close idle CSIP sessions => one observable session per walk
-GRIDSIM_BIN="${GRIDSIM_BIN:-./bin/server}"
-MBAPS_BIN="${MBAPS_BIN:-./bin/mbapsdev}"
+GRIDSIM_BIN="$(abs_repo_path "${GRIDSIM_BIN:-./bin/server}")"
+MBAPS_BIN="$(abs_repo_path "${MBAPS_BIN:-./bin/mbapsdev}")"
 SIMS_KEYLOG="${SIMS_KEYLOG:-}"
 GRIDSIM_NO_TICKETS="${GRIDSIM_NO_TICKETS:-}"
 GRIDSIM_IDLE_S="${GRIDSIM_IDLE_S:-}"
@@ -232,7 +246,7 @@ EOF
 
 start(){ # name port bind cmd...
   local name="$1" port="$2" bind="$3"; shift 3
-  local pf="$LOG/$name.pid" holder holder_addr
+  local pf="$LOG/$name.pid" holder holder_addr rundir
   holder="$(port_holder "$port" "$bind" || true)"
   holder_addr="${holder#* }"
   holder="${holder%% *}"
@@ -243,11 +257,19 @@ start(){ # name port bind cmd...
     echo "  !! $name NOT started — :$port held by foreign pid $holder on $holder_addr ($(ps -o args= -p "$holder" 2>/dev/null | cut -c1-60)). Free it (bench-sims-down.sh / stop the csip demo) or override the port."
     FAIL=1; return
   fi
-  "$@" >"$LOG/$name.log" 2>&1 &
+  # REV0907-E5: run the sim itself from a scratch dir outside the repo — see
+  # the SIM_RUNDIR note near the top of this script — so a *-keylog build's
+  # own ./sslkeylog.log lands there, never at the repo root. "bench-$name"
+  # (not just "$name") keeps this disjoint from lab-sims-up.sh's own rundirs,
+  # which use the same $LEXA_SIM_RUNDIR base and can run on the same host at
+  # the same time (see that script's header).
+  rundir="$SIM_RUNDIR/bench-$name"
+  mkdir -p "$rundir" && chmod 0700 "$rundir"
+  ( cd "$rundir" && exec "$@" ) >"$LOG/$name.log" 2>&1 &
   echo $! > "$pf"
   sleep 0.4
   if kill -0 "$(cat "$pf")" 2>/dev/null; then
-    echo "  + started $name  pid=$(cat "$pf")  :$port  log=$LOG/$name.log"
+    echo "  + started $name  pid=$(cat "$pf")  :$port  log=$LOG/$name.log  cwd=$rundir"
   else
     echo "  !! $name exited immediately — see $LOG/$name.log:"; tail -3 "$LOG/$name.log" | sed 's/^/       /'; FAIL=1
   fi
@@ -297,7 +319,7 @@ MODSIM_ARGS=()
 # never silently reframed. Turn it on for a conformance capture that has to
 # drive PROT-2's headline criterion rather than report it as a launch-flag gap.
 [ -n "${MODSIM_PROTOFAULT:-}" ] && [ "${MODSIM_PROTOFAULT}" != "0" ] && MODSIM_ARGS+=(-protofault)
-start modsim   "$MODSIM_PORT"  "$MODSIM_BIND" ./bin/modsim   -port "$MODSIM_PORT" -advanced -der-models "$CENSUS_DER_MODELS" -wmax 8000 -serial "$MODSIM_SERIAL" \
+start modsim   "$MODSIM_PORT"  "$MODSIM_BIND" "$HERE/bin/modsim"   -port "$MODSIM_PORT" -advanced -der-models "$CENSUS_DER_MODELS" -wmax 8000 -serial "$MODSIM_SERIAL" \
                  ${MODSIM_ARGS+"${MODSIM_ARGS[@]}"}
 # MBAPS_NO_TICKETS=1 forces every gateway southbound dial to be a FULL mTLS
 # handshake (mbapsdev -no-tickets). Leave it OFF for resumption-behaviour runs
@@ -323,10 +345,10 @@ if [ "$SIM_FLEET" = 4 ]; then
   # Mapping to the CTP's names (Figure 15), for the operator reading a log:
   #   EDA1 = modsim  :5020   EDA2 = modsim2 :5030
   #   EDB1 = modsim3 :5031   EDB2 = mbapsdev :8021
-  start modsim2 "$MODSIM2_PORT" "$MODSIM_BIND" ./bin/modsim -port "$MODSIM2_PORT" -api-port "$MODSIM2_API" \
+  start modsim2 "$MODSIM2_PORT" "$MODSIM_BIND" "$HERE/bin/modsim" -port "$MODSIM2_PORT" -api-port "$MODSIM2_API" \
                  -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM2_SERIAL" \
                  ${MODSIM_ARGS+"${MODSIM_ARGS[@]}"}
-  start modsim3 "$MODSIM3_PORT" "$MODSIM_BIND" ./bin/modsim -port "$MODSIM3_PORT" -api-port "$MODSIM3_API" \
+  start modsim3 "$MODSIM3_PORT" "$MODSIM_BIND" "$HERE/bin/modsim" -port "$MODSIM3_PORT" -api-port "$MODSIM3_API" \
                  -advanced ${DER_MODELS:+-der-models "$DER_MODELS"} -wmax 8000 -serial "$MODSIM3_SERIAL" \
                  ${MODSIM_ARGS+"${MODSIM_ARGS[@]}"}
 fi

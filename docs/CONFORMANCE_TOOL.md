@@ -202,6 +202,14 @@ bin/certify -doc SSM-CONF-v0.8 -dry-run
 # decrypts nothing. The export opens the file in APPEND mode, so sharing it adds
 # certify's secrets to the sims' rather than replacing them. See the per-leg
 # table in docs/PREFLIGHT_2026-08-05_flashed-image-campaign.md.
+#
+# This -keylog path is separate from the *-keylog SIM binaries' own default
+# key log: a wolfSSL sysroot built with --enable-keylog-export also writes an
+# UNSOLICITED ./sslkeylog.log into the sim's process cwd, regardless of
+# -keylog above (REV0907-E5). scripts/bench-sims-up.sh and
+# scripts/lab/lab-sims-up.sh run every sim from $LEXA_SIM_RUNDIR (default
+# /tmp/lexa-sims), never this repo's root, so that file lands there — it
+# never reaches the repo checkout.
 bin/certify-keylog \
     -target 69.0.0.2:802 -iface enp1s0 \
     -pki certs/mbaps -gridsim-admin http://69.0.0.20:11114 \

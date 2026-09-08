@@ -63,6 +63,21 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$HERE"
 
+# REV0907-E5 (WP0-T3): a wolfSSL sysroot built with --enable-keylog-export
+# ALSO writes its own ./sslkeylog.log into the process CWD
+# (WOLFSSL_SSLKEYLOGFILE_OUTPUT is a compile-time constant, independent of the
+# explicit -keylog flag / SIMS_KEYLOG below — see .gitignore's note on this).
+# This script is the one that actually builds and launches the *-keylog sims
+# (build_sims below), so every sim it starts via start() is cd'd into a
+# per-sim scratch dir OUTSIDE this repo before exec — never $HERE — so a live
+# keylog build can never deposit a live TLS-secret file at the repo root.
+# Every path this script hands a sim is resolved absolute BEFORE that cd, so
+# no flag or log path moves.
+SIM_RUNDIR="${LEXA_SIM_RUNDIR:-/tmp/lexa-sims}"
+mkdir -p "$SIM_RUNDIR" && chmod 0700 "$SIM_RUNDIR"
+# abs_repo_path REL — REL resolved against $HERE unless already absolute.
+abs_repo_path(){ case "$1" in /*) printf '%s\n' "$1";; *) printf '%s\n' "$HERE/$1";; esac; }
+
 LAB="${LAB:-$HOME/.lexa-lab}"
 SIM_ADDR="${LAB_SIM_ADDR:-127.0.0.20}"
 GW_HOST="${GW_HOST:-127.0.0.2}"
@@ -123,16 +138,16 @@ build_sims() {
 	if [ -d "$WOLFSSL_KEYLOG_SYSROOT/include" ]; then
 		[ -x bin/server-keylog ] || { note "building bin/server-keylog"; make -s server-keylog; }
 		[ -x bin/mbapsdev-keylog ] || { note "building bin/mbapsdev-keylog"; make -s mbapsdev-keylog; }
-		GRIDSIM_BIN="${GRIDSIM_BIN:-./bin/server-keylog}"
-		MBAPS_BIN="${MBAPS_BIN:-./bin/mbapsdev-keylog}"
+		GRIDSIM_BIN="$(abs_repo_path "${GRIDSIM_BIN:-./bin/server-keylog}")"
+		MBAPS_BIN="$(abs_repo_path "${MBAPS_BIN:-./bin/mbapsdev-keylog}")"
 	else
 		echo "lab-sims: no keylog sysroot at $WOLFSSL_KEYLOG_SYSROOT — falling back to the plain sims." >&2
 		echo "          Captured TLS will NOT decrypt; every citation-dependent case loses its" >&2
 		echo "          transcript. Build it once: bash scripts/build-wolfssl-keylog-sysroot.sh" >&2
 		[ -x bin/server ] || make -s build-server
 		[ -x bin/mbapsdev ] || make -s build-mbapsdev
-		GRIDSIM_BIN="${GRIDSIM_BIN:-./bin/server}"
-		MBAPS_BIN="${MBAPS_BIN:-./bin/mbapsdev}"
+		GRIDSIM_BIN="$(abs_repo_path "${GRIDSIM_BIN:-./bin/server}")"
+		MBAPS_BIN="$(abs_repo_path "${MBAPS_BIN:-./bin/mbapsdev}")"
 	fi
 }
 
@@ -149,7 +164,7 @@ port_holder() {
 
 start() { # name port cmd...
 	local name="$1" port="$2"; shift 2
-	local pf="$LOG/$name.pid" holder
+	local pf="$LOG/$name.pid" holder rundir
 	holder="$(port_holder "$port" || true)"
 	if [ -n "$holder" ]; then
 		if [ -f "$pf" ] && [ "$holder" = "$(cat "$pf" 2>/dev/null)" ]; then
@@ -157,11 +172,19 @@ start() { # name port cmd...
 		fi
 		fail "$name NOT started — :$port is held by pid $holder ($(ps -o args= -p "$holder" 2>/dev/null | cut -c1-70)). The lab port block must be free; override with ${name^^}_PORT."
 	fi
-	"$@" >"$LOG/$name.log" 2>&1 &
+	# REV0907-E5: run the sim itself from a scratch dir outside the repo — see
+	# the SIM_RUNDIR note near the top of this script — so a *-keylog build's
+	# own ./sslkeylog.log lands there, never at the repo root. "lab-$name" (not
+	# just "$name") keeps this disjoint from bench-sims-up.sh's own rundirs,
+	# which use the same $LEXA_SIM_RUNDIR base and can run on the same host at
+	# the same time (see this script's header, "WHY THIS DOES NOT JUST CALL...").
+	rundir="$SIM_RUNDIR/lab-$name"
+	mkdir -p "$rundir" && chmod 0700 "$rundir"
+	( cd "$rundir" && exec "$@" ) >"$LOG/$name.log" 2>&1 &
 	echo $! >"$pf"
 	sleep 0.4
 	if kill -0 "$(cat "$pf")" 2>/dev/null; then
-		note "+ started $name  pid=$(cat "$pf")  :$port  log=$LOG/$name.log"
+		note "+ started $name  pid=$(cat "$pf")  :$port  log=$LOG/$name.log  cwd=$rundir"
 	else
 		note "!! $name exited immediately — $LOG/$name.log:"; tail -5 "$LOG/$name.log" | sed 's/^/       /'
 		fail "$name failed to start"
@@ -204,7 +227,7 @@ sims_up() {
 	build_sims
 	echo "lab-sims: up on $SIM_ADDR   keylog -> $SIMS_KEYLOG   logs -> $LOG"
 
-	start modsim "$MODSIM_PORT" ./bin/modsim \
+	start modsim "$MODSIM_PORT" "$HERE/bin/modsim" \
 		-port "$MODSIM_PORT" -bind "$SIM_ADDR" -api-port "$MODSIM_API" \
 		-advanced -der-models "$DER_MODELS" -wmax "$MODSIM_WMAX" -serial "$MODSIM_SERIAL"
 

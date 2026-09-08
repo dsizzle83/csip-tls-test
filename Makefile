@@ -488,8 +488,12 @@ test: $(CA_CERT) test-fast test-integration
 # for the aggregator emulator; the 62-requirement table, PRF/suite predicates,
 # minted-fixture matrix, and Reporter bookkeeping for ssm-conformance). Pulls cgo
 # for compilation but does no TLS handshakes.
+#
+# Plus check-sim-cwd.sh (REV0907-E5, WP0-T3): a static guard, not a Go test,
+# so it rides along here rather than under go test — see the script for why.
 test-fast:
 	go test ./sim/tlsserver/ ./internal/tlsclient/ ./internal/mbtls/ ./sim/mbapsdev/ ./internal/aggregator/ ./sim/gw-mayhem/... ./sim/ssm-conformance/
+	bash scripts/check-sim-cwd.sh
 
 # THE HERMETICITY GATE (audit IW8-005): the whole unit suite, run with no route
 # off this machine.
