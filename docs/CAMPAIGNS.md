@@ -143,7 +143,7 @@ malformed `-gateway-exec` — exits **2**.
 with the reason it needs that lane. In outline:
 
 * **`csip`** — `BASIC-004…015` (inverter control), `BASIC-016…026` (event
-  precedence), `CORE-012/013/021/022/023`, `local-ext-v1::EXT-001…004`.
+  precedence), `CORE-012/013/021/022/023`, `local-ext-v1::EXT-001…008`.
   `EXT-002`/`EXT-003`/`EXT-004` (REV0907-B1/B2) are LOCAL EXTENSION rows with
   no published CSIP-CONF-v1.3 procedure behind them at all: `EXT-002` proves a
   RESERVED `currentStatus` value (6) is never treated as Cancelled, `EXT-003`
@@ -155,8 +155,56 @@ with the reason it needs that lane. In outline:
   it. All three share `CORE-012/013/021/022/023`'s own reason for needing
   `csip`: their subject is the DER program/control lifecycle itself, which
   exists only while the CSIP control path owns `lexa/desired/*`.
+
+  `EXT-005…008` (REV0907-D2-IMPL P5) are the local extension family's newest
+  members: no published CSIP-CONF-v1.3 or SSM-CONF-v0.8 procedure exercises
+  CSIP and mbaps writing CONCURRENTLY at all, so
+  `docs/design/AUTHORITY_ENVELOPE_2026-09-08.md`'s envelope arbitration
+  (owner ruling D2, "CSIP is the envelope that the inverter must abide by.
+  MBAPS is allowed at the same time, but any commands must not go beyond the
+  limits set by CSIP") had no row to be caught by until now. Each opens a
+  role-bound mbaps `GridServiceSunSpec` session (`suitessm.DialEnvelopeRole`,
+  reusing suitessm's own TLS/PKI/session machinery rather than duplicating a
+  second mbaps client) *alongside* the CSIP control it drives on gridsim, and
+  grades the Modbus response — exception 01, exception 03 or a plain ack —
+  from the raw MBAP ADU, independent of both gridsim's admin log and any
+  product parser.
+  `EXT-005` proves the active-power ceiling axis: an mbaps `WMaxLimPct` write
+  ABOVE a CSIP `opModMaxLimW` envelope draws exception 03 and the DER's own
+  ceiling register does not move, while the same write WITHIN the envelope is
+  acked and lands (owner answer A — no clamp-and-ack).
+  `EXT-006` proves the Fixed PF axis is a VALUE, not a limit: while a CSIP
+  `opModFixedPFInjectW` control owns it, an mbaps `PFWInj_PF` write draws
+  exception 01 and the DER's own PF register does not move; at release the
+  register reads the DEVICE DEFAULT captured before the CSIP control was ever
+  published (owner answer B — never a prior mbaps value); after release the
+  same write is acked and lands.
+  `EXT-007` proves the fail-safe override survives the envelope model: an
+  mbaps ceiling write above zero export is still ADMITTED while fail-safe is
+  engaged (owner answer C — the single documented exception to "never beyond
+  the envelope"), while a 703 `ES=1` write stays refused. No lever in this
+  bench can DRIVE a DUT into fail-safe, so this row is IMPLEMENTED BUT
+  PRECONDITIONED: it reads the DUT's own reported `failsafe_engaged` posture
+  and SKIPs, naming that reason, when an operator has not engaged it out of
+  band.
+  `EXT-008` proves ownership TAKE: a standing mbaps `WSet` write is admitted
+  absent any CSIP contribution; once a CSIP `opModFixedW` control starts, the
+  DER's own register follows CSIP and a further mbaps write draws exception
+  01; when the control ends the register returns to the device default, not
+  to the standing mbaps value. All four share `csip` for the same reason as
+  `EXT-001…004`: a CSIP control's own limits ARE the envelope these rows
+  write an mbaps request against, so the CSIP control path must own
+  `lexa/desired/*` for there to be an envelope to measure at all.
 * **`mbaps`** — every `ssm-conf-v0.8::RBAC-*`, and the northbound **write** rows
-  `MB-1`, `MOD-3`, `EXC-1`, `EXC-2`, `CRV-1`, `REV-1/2/3`.
+  `MB-1`, `MOD-3`, `EXC-1`, `EXC-2`, `CRV-1`, `REV-1/2/3`. Under `csip`, a
+  704 limit/value write these rows drive is now ADMITTED when it is within
+  whatever CSIP allows (the envelope model above) rather than blanket-denied
+  by the old D1 lock-screen — but it can still be refused for a reason that
+  has nothing to do with the role under test (the envelope, not the role), so
+  these rows stay pinned to `mbaps`, where there is no envelope at all and
+  role-based access is the only thing that can answer their write either way.
+  `authority.go`'s MBAPS family `Because` string quotes the design doc
+  directly.
 
 Discovery, read and transport rows measure the same thing under every posture
 and are not classified. `TestAuthorityClassificationResidueIsAcknowledged` makes

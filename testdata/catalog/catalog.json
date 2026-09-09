@@ -18569,5 +18569,178 @@
   "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 procedure exercises an event already past its own Specified End Time at first sighting; this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim. REV0907-B2: sim/gridsim/admin.go's 'expired' lever serves this combination; the product fix is lexa-gw a943a56 (internal/northbound/responses/tracker.go Pass 1); status 254 is IEEE Std 2030.5-2018 Table 27's own value, hard-coded in the referee rather than read off any shared constant (referee independence, CLAUDE.md / docs/ADVERSARIAL_QA_STRATEGY.md §5 PN-1/C9/AD-003(f)).",
   "source_shards": [],
   "page_boundary_merged": false
+ },
+ {
+  "uid": "local-ext-v1::EXT-005",
+  "id": "EXT-005",
+  "doc": "LOCAL-EXT-v1",
+  "doc_version": "v1 (local extension family; not a published specification)",
+  "section": "1.5 EXT-005 - an above-envelope mbaps ceiling write draws exception 03 (under 1 Local product-evidence extensions)",
+  "title": "EXT-005 - envelope refusal: an mbaps WMaxLimPct write above the CSIP envelope draws exception 03; within it, it is acked",
+  "purpose": "Measures docs/design/AUTHORITY_ENVELOPE_2026-09-08.md's owner ruling D2 (\"CSIP is the envelope that the inverter must abide by. MBAPS is allowed at the same time, but any commands must not go beyond the limits set by CSIP\") on the active-power ceiling axis: with a CSIP DERControl imposing opModMaxLimW in effect, an mbaps GridServiceSunSpec 704 WMaxLimPct write ABOVE that limit must draw Modbus exception 03 (illegal data value, owner answer A: \"reject with exception 03\" — no clamp-and-ack) and the DER's own ceiling register must not move, while the same client's write WITHIN the limit must be acked and land. No published CSIP-CONF-v1.3 or SSM-CONF-v0.8 procedure exercises two concurrent northbound authors on one axis at all.",
+  "applies_to": "server",
+  "dut_role": "csip-client",
+  "applicable": true,
+  "applicability_reason": "The axis applies to this product — it is both a CSIP DER client and an mbaps server admitting writes on the same register. What does not apply is any certification: see certifiable=false and the notes.",
+  "certifiable": false,
+  "automatable": "full",
+  "evidence": "the raw MBAP ADU this row's own role-bound mbaps GridServiceSunSpec session received for each write (the above-envelope one and the within-envelope one), decoded with lexa-proto/mbap framing only; the DER's own active-power ceiling register (WMaxLimPct), read independently through the southbound simapi sidecar before and after each write",
+  "preconditions": [
+   "The DUT is running under control authority \"csip\" with csip_enabled=true (authority.go's AuthorityCSIP precondition).",
+   "gridsim is reachable on its admin API so this row can publish the CSIP opModMaxLimW control that is the envelope.",
+   "A role-bound mbaps certs/mbaps \"grid-service\" (GridServiceSunSpec) fixture and the DUT's mbaps listener are both configured (-pki, -gateway host:802)."
+  ],
+  "steps": [
+   "Publish a CSIP DERControl commanding opModMaxLimW at 50.00% and wait for the DUT to report it Started (status=2).",
+   "Over a role-bound mbaps GridServiceSunSpec session, write 704 WMaxLimPct to 80.00% (above the envelope) and record the Modbus response.",
+   "Independently read the DER's own WMaxLimPct register before and after that write.",
+   "Over the same session, write 704 WMaxLimPct to 30.00% (within the envelope) and record the Modbus response.",
+   "Independently read the DER's own WMaxLimPct register, polling this row's poll-cycle window, for it to come to hold 30.00%."
+  ],
+  "expected": [
+   "The above-envelope write draws Modbus exception 03 (illegal data value), and the DER's own WMaxLimPct register reads the same value before and after it.",
+   "The within-envelope write is acked (no Modbus exception), and the DER's own WMaxLimPct register comes to hold it within this row's window."
+  ],
+  "observables": [
+   "the raw MBAP response PDU to the above-envelope WMaxLimPct write, function code byte carrying the exception bit and exception code 03",
+   "the DER's own WMaxLimPct register (independent read), unchanged across the above-envelope write",
+   "the raw MBAP response PDU to the within-envelope WMaxLimPct write, a normal (non-exception) response",
+   "the DER's own WMaxLimPct register (independent read), holding the within-envelope value after the write"
+  ],
+  "requirement_refs": [],
+  "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 or SSM-CONF-v0.8 procedure exercises CSIP and mbaps writing CONCURRENTLY at all; this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim. REV0907-D2-IMPL P5: this row measures docs/design/AUTHORITY_ENVELOPE_2026-09-08.md's envelope arbitration (owner ruling D2) — the design's active-power ceiling row (§2) and its decode-time envelope check (§3.2): an above-envelope limit write is refused before anything is published, a within-envelope one is acked and applied. Modbus exception codes are IEEE Std 2030.5-2018/the Modbus specification's own values (01 illegal function, 03 illegal data value), hard-coded in the referee rather than read off any shared constant (referee independence, CLAUDE.md / docs/ADVERSARIAL_QA_STRATEGY.md §5 PN-1/C9/AD-003(f)).",
+  "source_shards": [],
+  "page_boundary_merged": false
+ },
+ {
+  "uid": "local-ext-v1::EXT-006",
+  "id": "EXT-006",
+  "doc": "LOCAL-EXT-v1",
+  "doc_version": "v1 (local extension family; not a published specification)",
+  "section": "1.6 EXT-006 - a CSIP-owned value axis refuses mbaps (01) and releases to the device default (under 1 Local product-evidence extensions)",
+  "title": "EXT-006 - CSIP-owned value axis: mbaps refused (01) while owned; acked and applied after release; release restores the device default",
+  "purpose": "Measures docs/design/AUTHORITY_ENVELOPE_2026-09-08.md §2's Fixed PF row: a VALUE axis (as opposed to a LIMIT axis) has one owner at a time. While a CSIP opModFixedPFInjectW control is in effect, an mbaps GridServiceSunSpec 704 PFWInj_PF write must draw Modbus exception 01 (illegal function) and the DER's own PF register must not move. After the control is cancelled (gridsim's admin server-cancel lever, IEEE Std 2030.5-2018 Annex B currentStatus 2), the DER's own PF register must first read the DEVICE DEFAULT — the value this row observed before it ever published anything, per owner answer B (\"device default\", never a prior mbaps value) — and the same mbaps write, retried, must then be acked and land.",
+  "applies_to": "server",
+  "dut_role": "csip-client",
+  "applicable": true,
+  "applicability_reason": "The axis applies to this product for the same reason EXT-005's does. What does not apply is any certification: see certifiable=false and the notes.",
+  "certifiable": false,
+  "automatable": "full",
+  "evidence": "the raw MBAP ADU this row's own role-bound mbaps GridServiceSunSpec session received for each of its two PFWInj_PF writes, decoded with lexa-proto/mbap framing only; the DER's own model 704 PF sync group (PFWInjEna/PFWInj_PF/PFWInj_Ext), read independently through the southbound simapi sidecar before the CSIP control was ever published, again immediately before/after the first (refused) write, and again at release and after the second (accepted) write",
+  "preconditions": [
+   "The DUT is running under control authority \"csip\" with csip_enabled=true.",
+   "gridsim is reachable on its admin API so this row can publish the CSIP opModFixedPFInjectW control and later cancel it.",
+   "A role-bound mbaps certs/mbaps \"grid-service\" fixture and the DUT's mbaps listener are both configured."
+  ],
+  "steps": [
+   "Independently read the DER's own model 704 PF sync group BEFORE publishing anything — this row's own device-default baseline.",
+   "Publish a CSIP DERControl commanding opModFixedPFInjectW (displacement 900, excitation false, multiplier -3 — CSIP CTP v1.3's own Figure 8 Test Values) and wait for the DUT to report it Started (status=2).",
+   "Over a role-bound mbaps GridServiceSunSpec session, write 704 PFWInj_PF/_Ext to a different PF (0.850, same excitation) and record the Modbus response; independently read the PF sync group before and after.",
+   "Server-side, cancel the CSIP control on the same mRID (Annex B currentStatus 2) and wait a settle window.",
+   "Independently read the DER's own PF sync group at release, before attempting any further write.",
+   "Retry the same mbaps PFWInj_PF/_Ext write and record the Modbus response; independently read the PF sync group afterward."
+  ],
+  "expected": [
+   "While the CSIP control is in effect, the mbaps write draws Modbus exception 01 (illegal function), and the DER's own PF sync group reads the same values before and after it.",
+   "At release, before any further write, the DER's own PF sync group reads the device-default baseline captured in step 1 — not the value mbaps attempted.",
+   "After release, the retried mbaps write is acked (no Modbus exception), and the DER's own PF sync group comes to hold it."
+  ],
+  "observables": [
+   "the raw MBAP response PDU to the mbaps PFWInj_PF/_Ext write made while CSIP owns the axis, exception code 01",
+   "the DER's own PFWInjEna/PFWInj_PF/PFWInj_Ext registers (independent read), unchanged across that write",
+   "the DER's own PFWInjEna/PFWInj_PF/PFWInj_Ext registers (independent read) at release, matching the pre-publication baseline",
+   "the raw MBAP response PDU to the retried mbaps write after release, a normal (non-exception) response",
+   "the DER's own PFWInj_PF/PFWInj_Ext registers (independent read), holding the mbaps-commanded value after the retried write"
+  ],
+  "requirement_refs": [],
+  "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 or SSM-CONF-v0.8 procedure exercises CSIP and mbaps writing CONCURRENTLY at all; this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim. REV0907-D2-IMPL P5: this row measures docs/design/AUTHORITY_ENVELOPE_2026-09-08.md's envelope arbitration (owner ruling D2) — the design's Fixed PF row (§2) and its release rule (owner answer B, \"device default\"): a value axis has one owner at a time, a write to an axis CSIP owns is refused (01), and release restores the default, never a standing mbaps value. Modbus exception codes are IEEE Std 2030.5-2018/the Modbus specification's own values (01 illegal function, 03 illegal data value), hard-coded in the referee rather than read off any shared constant (referee independence, CLAUDE.md / docs/ADVERSARIAL_QA_STRATEGY.md §5 PN-1/C9/AD-003(f)).",
+  "source_shards": [],
+  "page_boundary_merged": false
+ },
+ {
+  "uid": "local-ext-v1::EXT-007",
+  "id": "EXT-007",
+  "doc": "LOCAL-EXT-v1",
+  "doc_version": "v1 (local extension family; not a published specification)",
+  "section": "1.7 EXT-007 - the fail-safe override is kept for mbaps ceiling writes, and ES=1 stays refused (under 1 Local product-evidence extensions)",
+  "title": "EXT-007 - fail-safe engaged: an mbaps ceiling write above zero export is admitted (the documented override); 703 ES=1 stays refused",
+  "purpose": "Measures docs/design/AUTHORITY_ENVELOPE_2026-09-08.md §1.5/§2's single documented exception to \"never beyond the envelope\": owner answer C (\"yes: keep the override\") keeps today's fail-safe carve-out — while the DUT's fail-safe is engaged (a zero-export envelope for everything CSIP is not there to say), an mbaps GridServiceSunSpec write raising the active-power ceiling above zero export is ADMITTED, but a 703 ES=1 write stays refused (exception 01) even then. This row is IMPLEMENTED BUT PRECONDITIONED: no lever in this bench can DRIVE a DUT into fail-safe (sim/gridsim's admin API has no comm-silence/pause endpoint), so it reads the DUT's own reported failsafe_engaged posture and grades for real only when an operator has engaged it out of band; otherwise both criteria report SKIP with that reason, never a FAIL of the DUT for a precondition this bench itself could not arrange.",
+  "applies_to": "server",
+  "dut_role": "csip-client",
+  "applicable": true,
+  "applicability_reason": "The axis applies to this product — it is both a CSIP DER client with a fail-safe posture and an mbaps server. What does not apply is any certification: see certifiable=false and the notes. This row additionally requires a precondition (fail-safe engaged) this bench cannot itself drive; see the purpose and notes.",
+  "certifiable": false,
+  "automatable": "full",
+  "evidence": "the DUT's own reported control posture (GET /mode's failsafe_engaged, read the same way preflight_authority.go's precondition check does); the raw MBAP ADU this row's own role-bound mbaps GridServiceSunSpec session received for a 704 WMaxLimPct write and for a 703 ES=1 write, decoded with lexa-proto/mbap framing only; the DER's own active-power ceiling register, read independently before and after the WMaxLimPct write",
+  "preconditions": [
+   "The DUT is running under control authority \"csip\", and its own dev API reports failsafe_engaged=true — arranged out of band by the operator; this bench has no lever to arrange it itself.",
+   "A role-bound mbaps certs/mbaps \"grid-service\" fixture and the DUT's mbaps listener are both configured.",
+   "Read-only gateway introspection (-gateway-ssh or -gateway-exec) is configured so this row can read the DUT's own posture at all."
+  ],
+  "steps": [
+   "Read the DUT's own reported control posture; if it does not report failsafe_engaged=true, both criteria SKIP with that reason.",
+   "Otherwise, over a role-bound mbaps GridServiceSunSpec session, write 704 WMaxLimPct above zero export and record the Modbus response; independently read the DER's own ceiling register before and after.",
+   "Write a 703 ES=1 and record the Modbus response."
+  ],
+  "expected": [
+   "The WMaxLimPct write is admitted (no Modbus exception) and the DER's own ceiling register rises to the commanded value.",
+   "The ES=1 write draws Modbus exception 01 (illegal function) even though fail-safe is engaged."
+  ],
+  "observables": [
+   "the DUT's own GET /mode failsafe_engaged field",
+   "the raw MBAP response PDU to the fail-safe-engaged WMaxLimPct write, a normal (non-exception) response",
+   "the DER's own active-power ceiling register (independent read), rising to the commanded value",
+   "the raw MBAP response PDU to the fail-safe-engaged 703 ES=1 write, exception code 01"
+  ],
+  "requirement_refs": [],
+  "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 or SSM-CONF-v0.8 procedure exercises CSIP and mbaps writing CONCURRENTLY at all; this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim. REV0907-D2-IMPL P5: this row measures docs/design/AUTHORITY_ENVELOPE_2026-09-08.md's envelope arbitration (owner ruling D2) — the design's fail-safe override (§1.5/§2, owner answer C): the existing override that lets a local operator raise output above the fail-safe stays, and is the single documented exception to \"never beyond the envelope\"; 703 ES=1 stays refused regardless. This row is IMPLEMENTED BUT PRECONDITIONED — see purpose. Modbus exception codes are IEEE Std 2030.5-2018/the Modbus specification's own values (01 illegal function, 03 illegal data value), hard-coded in the referee rather than read off any shared constant (referee independence, CLAUDE.md / docs/ADVERSARIAL_QA_STRATEGY.md §5 PN-1/C9/AD-003(f)).",
+  "source_shards": [],
+  "page_boundary_merged": false
+ },
+ {
+  "uid": "local-ext-v1::EXT-008",
+  "id": "EXT-008",
+  "doc": "LOCAL-EXT-v1",
+  "doc_version": "v1 (local extension family; not a published specification)",
+  "section": "1.8 EXT-008 - CSIP takes a value axis mbaps held: contribution dropped, journaled, restored to default at release (under 1 Local product-evidence extensions)",
+  "title": "EXT-008 - envelope tightening / ownership take: a standing mbaps WSet stands, CSIP taking the axis drops it, release restores the device default",
+  "purpose": "Measures docs/design/AUTHORITY_ENVELOPE_2026-09-08.md §1.1/§2's setpoint row: \"one arbitrated answer per axis\" over time. An mbaps GridServiceSunSpec 704 WSet write made BEFORE any CSIP opModFixedW control is in effect stands (design §2, \"else mbaps\"). A CSIP opModFixedW control then starts: the DUT must post a Response status=2 (Started), the DER's own WSet register must come to follow CSIP's commanded value rather than the standing mbaps one, and a further mbaps WSet write must draw Modbus exception 01. When the control ends, the DER's own WSet register must return to the device default captured before this row published anything — not to the prior mbaps value (owner answer B).",
+  "applies_to": "server",
+  "dut_role": "csip-client",
+  "applicable": true,
+  "applicability_reason": "The axis applies to this product for the same reason EXT-005's does. What does not apply is any certification: see certifiable=false and the notes.",
+  "certifiable": false,
+  "automatable": "full",
+  "evidence": "the raw MBAP ADU this row's own role-bound mbaps GridServiceSunSpec session received for its standing WSet write and its further WSet write, decoded with lexa-proto/mbap framing only; the DER's own model 704 WSet register, read independently through the southbound simapi sidecar before publishing anything (the device-default baseline), after the standing write, after the CSIP control Starts, and at release",
+  "preconditions": [
+   "The DUT is running under control authority \"csip\" with csip_enabled=true.",
+   "gridsim is reachable on its admin API so this row can publish the CSIP opModFixedW control and later cancel it.",
+   "A role-bound mbaps certs/mbaps \"grid-service\" fixture and the DUT's mbaps listener are both configured."
+  ],
+  "steps": [
+   "Independently read the DER's own model 704 WSet register BEFORE publishing anything — this row's own device-default baseline.",
+   "Over a role-bound mbaps GridServiceSunSpec session, write 704 WSet to a standing value (500 W) and record the Modbus response; independently read WSet afterward.",
+   "Publish a CSIP DERControl commanding opModFixedW at 40.00% and wait for the DUT to report it Started (status=2).",
+   "Independently read the DER's own WSet register to confirm it follows the CSIP-commanded value.",
+   "Over the same mbaps session, attempt a further WSet write (-300 W) and record the Modbus response.",
+   "Server-side, cancel the CSIP control on the same mRID and wait a settle window.",
+   "Independently read the DER's own WSet register at release."
+  ],
+  "expected": [
+   "The standing mbaps write is acked and the DER's own WSet register holds it.",
+   "Once the CSIP control Starts, the DER's own WSet register follows CSIP's commanded value, and the further mbaps write draws Modbus exception 01 (illegal function).",
+   "At release, the DER's own WSet register reads the pre-publication baseline — not the prior mbaps value."
+  ],
+  "observables": [
+   "the raw MBAP response PDU to the standing mbaps WSet write, a normal (non-exception) response",
+   "the DER's own WSet register (independent read), holding the standing mbaps value before the CSIP control starts",
+   "the DER's own WSet register (independent read), holding the CSIP-commanded value once the control Starts",
+   "the raw MBAP response PDU to the further mbaps WSet write made while CSIP owns the axis, exception code 01",
+   "the DER's own WSet register (independent read) at release, matching the pre-publication baseline"
+  ],
+  "requirement_refs": [],
+  "notes": "LOCAL EXTENSION — NOT A CONFORMANCE PROCEDURE. No published CSIP-CONF-v1.3 or SSM-CONF-v0.8 procedure exercises CSIP and mbaps writing CONCURRENTLY at all; this row is supplementary product-evidence with harness-authored Test Values, certifiable under no standard. It is run, bundled and re-verified like any other case, and its verdict is excluded from every applicable-FAIL tally and from the zero-FAIL exit criterion. The posture is the one this campaign already carries for the v0.8 TEST-status Secure SunSpec Modbus specification (report.NoCertificationBasis): coverage without a conformance claim. REV0907-D2-IMPL P5: this row measures docs/design/AUTHORITY_ENVELOPE_2026-09-08.md's envelope arbitration (owner ruling D2) — the design's setpoint row (§2) and its ownership-take rule (§1.1): CSIP taking a value axis mbaps held drops the mbaps contribution and journals it, and release restores the device default, never the prior mbaps value. Modbus exception codes are IEEE Std 2030.5-2018/the Modbus specification's own values (01 illegal function, 03 illegal data value), hard-coded in the referee rather than read off any shared constant (referee independence, CLAUDE.md / docs/ADVERSARIAL_QA_STRATEGY.md §5 PN-1/C9/AD-003(f)).",
+  "source_shards": [],
+  "page_boundary_merged": false
  }
 ]

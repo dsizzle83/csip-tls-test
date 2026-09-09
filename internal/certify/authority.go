@@ -162,13 +162,48 @@ var authorityFamilies = []authorityFamily{
 		UIDs: []string{"local-ext-v1::EXT-001"},
 	},
 	{
+		Authority: AuthorityCSIP,
+		Because: "the row measures docs/design/AUTHORITY_ENVELOPE_2026-09-08.md's envelope arbitration " +
+			"itself (owner ruling D2, REV0907-D2-IMPL P5, \"CSIP is the envelope that the inverter must " +
+			"abide by. MBAPS is allowed at the same time, but any commands must not go beyond the limits " +
+			"set by CSIP\") — a CSIP DERControl's own limits ARE the envelope these rows write an mbaps " +
+			"request against, so the CSIP control path must own lexa/desired/* for there to be an " +
+			"envelope at all to measure. Under any other posture the arbitration layer imposes no " +
+			"envelope (design §1.6: \"mbaps... means no envelope, mbaps unconstrained\") and the row " +
+			"measures an mbaps write with nothing to be bounded by, not the envelope its own claim names. " +
+			"EXT-007 is this family's documented exception in shape only, not in posture: design §1.5 " +
+			"states the fail-safe engages precisely when CSIP is SILENT (a comm-loss to the CSIP server), " +
+			"so it publishes no DERControl of its own and is instead preconditioned on the DUT's own " +
+			"reported failsafe_engaged posture (localext_envelope.go) — but that posture is itself a " +
+			"sub-state of \"csip\" governance (design §1.6), not a departure from it",
+		UIDs: []string{
+			"local-ext-v1::EXT-005", // envelope refusal: an above-envelope mbaps ceiling write draws 03
+			"local-ext-v1::EXT-006", // CSIP-owned value axis: mbaps refused (01) while owned, default on release
+			"local-ext-v1::EXT-007", // fail-safe override kept (owner answer C), preconditioned
+			"local-ext-v1::EXT-008", // envelope tightening / ownership take: CSIP takes a value axis mbaps held
+		},
+	},
+	{
 		Authority: AuthorityMBAPS,
-		Because: "the row's subject is the northbound Modbus role-to-rights decision on a CONTROL write, " +
-			"so the mbaps write path must own lexa/desired/*. Under \"csip\" the D1 lock-screen overlay " +
-			"(configs/rbac/overlays.d/10-csip-mode.json) denies every model 704-712 control write for " +
-			"EVERY role — SuperAdministratorSunSpec included — by design, and the row then measures the " +
-			"lock-screen instead of its own subject. That is RBAC-002-MODEL704-REG40298-WRITE-DENIED-" +
-			"ALL-ROLES (lexa-gw/docs/known_issues.json)",
+		Because: "the row's subject is the northbound Modbus ROLE-TO-RIGHTS decision on a CONTROL write, " +
+			"and it needs a posture where that decision is the ONLY thing a refusal on the wire could be " +
+			"attributed to. Before REV0907-D2-IMPL this family's reason was the D1 lock-screen: under " +
+			"\"csip\", configs/rbac/overlays.d/10-csip-mode.json denied every model 704-712 control write " +
+			"for EVERY role — SuperAdministratorSunSpec included — regardless of who was asking, and the " +
+			"row measured the lock-screen instead of its own subject (RBAC-002-MODEL704-REG40298-WRITE-" +
+			"DENIED-ALL-ROLES, lexa-gw/docs/known_issues.json). docs/design/AUTHORITY_ENVELOPE_2026-09-08" +
+			".md (owner ruling D2) replaces that lock-screen with an envelope: under \"csip\" a 704 " +
+			"limit/value write is now ADMITTED whenever it is within whatever CSIP currently allows " +
+			"(design §1.4/§2), so RBAC-001..012's own role-to-rights answer would reach the wire again — " +
+			"but the SAME write can still be refused for a reason that has nothing to do with the role " +
+			"under test (exception 03 outside the envelope, exception 01 on an axis CSIP is actively " +
+			"commanding, design §3.2), and a row whose pass criterion turns on the exception code would " +
+			"still be measuring the envelope, not the role. So this family stays classified AuthorityMBAPS: " +
+			"under \"mbaps\" there is NO envelope at all (design §1.6, \"mbaps (CSIP disabled or not " +
+			"commissioned) means no envelope, mbaps unconstrained\"), and role-based access is the only " +
+			"thing left that can answer a write either way. (EXT-005..008 above are the envelope's OWN " +
+			"rows, and run under \"csip\" precisely because envelope interference is what THEY exist to " +
+			"measure.)",
 		UIDs: []string{
 			"ssm-conf-v0.8::RBAC-001",
 			"ssm-conf-v0.8::RBAC-002",

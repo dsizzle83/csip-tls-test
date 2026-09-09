@@ -61,6 +61,14 @@ func registerLocalExtensions(reg *certify.Registry, nonce string) {
 	// product fix (lexa-gw a943a56) closes. Ordered right after EXT-003.
 	reg.Register(extUID("EXT-004"), Suite, expiredAtReceipt004(nonce),
 		certify.WithRequires(needGridSim...), certify.WithOrder(65))
+	// EXT-005..008 (REV0907-D2-IMPL P5, localext_envelope.go): no published
+	// CSIP-CONF-v1.3 or SSM-CONF-v0.8 procedure exercises CSIP and mbaps
+	// writing CONCURRENTLY at all — every row in this bench drives exactly
+	// one control lane at a time — so
+	// docs/design/AUTHORITY_ENVELOPE_2026-09-08.md's envelope arbitration
+	// rules (owner ruling D2) have no row to be caught by until now. Ordered
+	// right after EXT-004.
+	registerLocalExtensionsEnvelope(reg, nonce)
 }
 
 // mappingWattVar is where the opModWattVar → model 712 correspondence comes

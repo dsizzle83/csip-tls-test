@@ -31,7 +31,7 @@ against `testdata/catalog/catalog.json` sha256
 | Document | Selected | Applicable | Implemented | …of which the extraction marks inapplicable | Unimplemented | Not applicable, no check |
 |---|---:|---:|---:|---:|---:|---:|
 | CSIP-CONF-v1.3 | 79 | 51 | 79 | 28 | **0** | 0 |
-| LOCAL-EXT-v1 | 4 | 4 | 4 | 0 | **0** | 0 |
+| LOCAL-EXT-v1 | 8 | 8 | 8 | 0 | **0** | 0 |
 | SS-1547-TEST-v1.0 | 2 | 2 | 2 | 0 | **0** | 0 |
 | SS-CSIP-RESULTS-v1.1 | 47 | 45 | 45 | 0 | **0** | 2 |
 | SS-MODBUS-CLIENT-CONF-v1.1 | 16 | 15 | 15 | 0 | **0** | 1 |
