@@ -41,7 +41,7 @@ Which certificate type a campaign document lands under is `report.DocCertType`:
 | `csip-conf-v1.3` | IEEE 2030.5/CSIP |
 | `ss-modbus-conf-v1.4` | SunSpec Modbus |
 | `ss-modbus-client-conf-v1.1` | SunSpec Modbus |
-| `ss-1547-test-v1.1` | SunSpec Modbus |
+| `ss-1547-test-v1.0` | SunSpec Modbus |
 | `ssm-conf-v0.8` | SunSpec Modbus |
 | `ss-test-pki` | SunSpec Modbus |
 

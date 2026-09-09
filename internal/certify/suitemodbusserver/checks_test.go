@@ -705,7 +705,7 @@ func TestREV3FailsADeviceThatIgnoresTheCancel(t *testing.T) {
 // models the IEEE 1547-2018 profile requires and the device does not serve.
 func TestMOD4FailsAChainMissingProfileModels(t *testing.T) {
 	dev := newDevice(t, deviceOpts{})
-	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil)
+	o := runCheck(t, "ss-1547-test-v1.0::MOD-4", checkMOD4, dev, nil)
 	o.wantVerdict(t, certify.Fail)
 	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
 	if a.Verdict != certify.Fail {
@@ -721,7 +721,7 @@ func TestMOD4FailsAChainMissingProfileModels(t *testing.T) {
 
 func TestMOD4PassesAChainCarryingTheWholeProfile(t *testing.T) {
 	dev := newDevice(t, deviceOpts{Full1547: true})
-	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil)
+	o := runCheck(t, "ss-1547-test-v1.0::MOD-4", checkMOD4, dev, nil)
 	o.wantVerdict(t, certify.Pass)
 	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
 	if a.Verdict != certify.Pass {
@@ -738,7 +738,7 @@ func TestMOD4PassesAChainCarryingTheWholeProfile(t *testing.T) {
 // legitimately does not have.
 func TestMOD4PassesASolarInverterMissingOnlyStorageModel713(t *testing.T) {
 	dev := newDevice(t, deviceOpts{Full1547: true, NoStorageModel: true})
-	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil)
+	o := runCheck(t, "ss-1547-test-v1.0::MOD-4", checkMOD4, dev, nil)
 	o.wantVerdict(t, certify.Pass)
 	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
 	if a.Verdict != certify.Pass {
@@ -756,7 +756,7 @@ func TestMOD4PassesASolarInverterMissingOnlyStorageModel713(t *testing.T) {
 // that says nothing.
 func TestMOD4PassesASolarInverterThatDeclaresItselfInAManifest(t *testing.T) {
 	dev := newDevice(t, deviceOpts{Full1547: true, NoStorageModel: true})
-	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil,
+	o := runCheck(t, "ss-1547-test-v1.0::MOD-4", checkMOD4, dev, nil,
 		withCandidate(t, "inverter", "1, 701, 702, 703, 704, 705, 706, 711, 712"))
 	o.wantVerdict(t, certify.Pass)
 	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
@@ -773,7 +773,7 @@ func TestMOD4PassesASolarInverterThatDeclaresItselfInAManifest(t *testing.T) {
 // its absence is a FAIL that names the model.
 func TestMOD4FailsAStorageCandidateMissingModel713(t *testing.T) {
 	dev := newDevice(t, deviceOpts{Full1547: true, NoStorageModel: true})
-	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev, nil,
+	o := runCheck(t, "ss-1547-test-v1.0::MOD-4", checkMOD4, dev, nil,
 		withCandidate(t, "battery", "1, 701, 702, 703, 704, 705, 706, 711, 712"))
 	o.wantVerdict(t, certify.Fail)
 	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
@@ -788,7 +788,7 @@ func TestMOD4FailsAStorageCandidateMissingModel713(t *testing.T) {
 
 func TestMOD4RecordsAnOperatorScopedRequirementListAsAnOverride(t *testing.T) {
 	dev := newDevice(t, deviceOpts{})
-	o := runCheck(t, "ss-1547-test-v1.1::MOD-4", checkMOD4, dev,
+	o := runCheck(t, "ss-1547-test-v1.0::MOD-4", checkMOD4, dev,
 		map[string]string{param1547Models: "1,701,702,704"})
 	o.wantVerdict(t, certify.Pass)
 	a := o.assertion(t, "every SunSpec model the IEEE 1547-2018 profile requires")
@@ -799,7 +799,7 @@ func TestMOD4RecordsAnOperatorScopedRequirementListAsAnOverride(t *testing.T) {
 
 func TestScaleFactorTestPassesConformantScaleFactors(t *testing.T) {
 	dev := newDevice(t, deviceOpts{})
-	o := runCheck(t, "ss-1547-test-v1.1::2.4", checkSF, dev, nil)
+	o := runCheck(t, "ss-1547-test-v1.0::2.4", checkSF, dev, nil)
 	o.wantVerdict(t, certify.Pass)
 	if !o.hasAssertion("does not change between two reads") {
 		t.Errorf("the static-value requirement was not asserted:\n%s", o.dump())
@@ -815,7 +815,7 @@ func TestScaleFactorTestPassesConformantScaleFactors(t *testing.T) {
 
 func TestScaleFactorTestFailsAnOutOfRangeScaleFactor(t *testing.T) {
 	dev := newDevice(t, deviceOpts{BadScaleFactor: true})
-	o := runCheck(t, "ss-1547-test-v1.1::2.4", checkSF, dev, nil)
+	o := runCheck(t, "ss-1547-test-v1.0::2.4", checkSF, dev, nil)
 	o.wantVerdict(t, certify.Fail)
 	a := o.assertion(t, "inside the sunssf type's range")
 	if a.Verdict != certify.Fail || !contains(a.Observed, "V_SF") {

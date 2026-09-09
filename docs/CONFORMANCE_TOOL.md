@@ -18,25 +18,47 @@ is the wire format.
 
 ## 1. Coverage of the standard
 
-The specification is `testdata/catalog/catalog.json` — 282 test cases extracted
-from eight published documents, committed, and hashed into every bundle so a
-reader can answer "which version of the spec was this measured against?" by
-hashing a file in front of them.
+The specification is `testdata/catalog/catalog.json` — 286 test cases extracted
+from eight published documents, plus a ninth catalog entry, `LOCAL-EXT-v1`,
+this bench's own non-certifying extension family (see "NOT CERTIFIABLE" under
+`-list`'s output) — committed, and hashed into every bundle so a reader can
+answer "which version of the spec was this measured against?" by hashing a
+file in front of them. Table regenerated from `certify -list` on 2026-09-08
+against `testdata/catalog/catalog.json` sha256
+`f84d442e31d56d1e6c9ce6ab7a4715155a1998138edab77d6beac1bfe9554677` (286 cases,
+9 documents).
 
 | Document | Selected | Applicable | Implemented | …of which the extraction marks inapplicable | Unimplemented | Not applicable, no check |
 |---|---:|---:|---:|---:|---:|---:|
 | CSIP-CONF-v1.3 | 79 | 51 | 79 | 28 | **0** | 0 |
-| SS-1547-TEST-v1.1 | 2 | 2 | 2 | 0 | **0** | 0 |
+| LOCAL-EXT-v1 | 4 | 4 | 4 | 0 | **0** | 0 |
+| SS-1547-TEST-v1.0 | 2 | 2 | 2 | 0 | **0** | 0 |
 | SS-CSIP-RESULTS-v1.1 | 47 | 45 | 45 | 0 | **0** | 2 |
-| SS-MODBUS-CLIENT-CONF-v1.1 | 16 | 15 | 16 | 1 | **0** | 0 |
+| SS-MODBUS-CLIENT-CONF-v1.1 | 16 | 15 | 15 | 0 | **0** | 1 |
 | SS-MODBUS-CONF-v1.4 | 24 | 16 | 16 | 0 | **0** | 8 |
 | SS-MODBUS-RESULTS-v1.2 | 54 | 52 | 52 | 0 | **0** | 2 |
 | SS-TEST-PKI | 21 | 6 | 10 | 4 | **0** | 11 |
-| SSM-CONF-v0.8 | 39 | 37 | 37 | 0 | **0** | 2 |
-| **TOTAL** | **282** | **224** | **257** | **33** | **0** | **25** |
+| SSM-CONF-v0.8 | 39 | 34 | 37 | 3 | **0** | 2 |
+| **TOTAL** | **286** | **225** | **260** | **35** | **0** | **26** |
 
-Of the 257 implemented cases, the extraction rates 143 fully automatable, 35
-partially, and 79 manual — a manual case still gets a check, because recording
+`SS-1547-TEST-v1.0` was `SS-1547-TEST-v1.1` until WP7-T8 (REV0907-E9,
+2026-09-08) re-keyed the catalog's doc key and uid prefix to match the source
+PDF's actual version (the prior key was a misparse of the file name
+`SunSpec-Modbus-for-1547-Test-Procedures-v1_10-8-24-1.pdf`; the `doc_version`
+field on both rows in `testdata/catalog/catalog.json` carries the full note).
+`internal/certify/suitemodbusserver/suite.go`'s `checkMOD4` / `checkSF`
+registrations were re-keyed in the same change, so both cases still show
+Implemented above rather than Unimplemented/orphaned. An evidence bundle
+minted before the migration still carries the old uid verbatim — that is
+immutable evidence and is never rewritten — and
+`testdata/catalog/uid_aliases.json` records the old-to-new mapping so a saved
+`-doc SS-1547-TEST-v1.1` / `-uid ss-1547-test-v1.1::MOD-4` and a Test Results
+Report generated from an old bundle both still resolve against the current
+catalog (`internal/certify/aliases.go`, `internal/certify/report/trr.go`'s
+`certTypeFor`/`noCertBasisFor`).
+
+Of the 260 implemented cases, the extraction rates 147 fully automatable, 35
+partially, and 78 manual — a manual case still gets a check, because recording
 an operator's observation inside a timestamped frame window is worth more than
 recording nothing.
 
@@ -74,7 +96,7 @@ Regenerate the table at any time, and gate on it:
 
 ```bash
 bin/certify -list                  # the table above, plus every gap by name
-bin/certify -list -details         # every one of the 282 cases, with its status
+bin/certify -list -details         # every one of the 286 cases, with its status
 bin/certify -list -json            # certify.Coverage, for a pipeline
 ```
 
@@ -98,17 +120,25 @@ fails a pipeline; it is not a formatting preference.
   RTU-1..5 (no northbound serial interface), CRV-2..3 (no writable second
   curve); `SS-TEST-PKI`'s PKI-2, PKI-9..10, PKI-12..18, PKI-21 (requirements on
   the SunSpec Alliance certificate *package* a lab ships, not on the device).
-* **…of which the extraction marks inapplicable** — 33 cases carry a check even
+* **…of which the extraction marks inapplicable** — 35 cases carry a check even
   though the catalog rates them inapplicable, because exercising the row is
   worth more than assuming it. They count as Implemented, not as N/A. The three
   columns therefore do not sum to the total, and `-list` says so on the totals
-  line rather than leaving a reviewer to reconcile it. Twenty-eight of the 33
+  line rather than leaving a reviewer to reconcile it. Twenty-eight of the 35
   are in CSIP-CONF-v1.3: **twenty-two** are the aggregator-only rows the DER
   Client claim excludes and the harness runs anyway, and **six** are excluded
   for reasons no profile choice can touch — CORE-001/002/004 and UTIL-001 test a
   2030.5 *server*, MAINT-002 is made optional by Annex A seq 32, and COMM-001 is
   optional for all device types by its own Purpose. All six are blank in every
-  §4 column, and those six alone are bound to the not-applicable stub.
+  §4 column, and those six alone are bound to the not-applicable stub. The
+  remaining seven are four in `SS-TEST-PKI` (`PKI-4..7`, the device
+  certificate's Subject-empty/hwType-SAN encoding, manufacturer-model-OID
+  uniqueness, IANA-PEN OID hierarchy, and serial-number ASN.1 encoding rows —
+  distinct from the PKI-2/9..10/12..18/21 rows above, which are unregistered
+  N/A) and three in `SSM-CONF-v0.8` (`PKI-009` Self-Signed Certificate
+  Support, `PROT-003` TLS Compression Method, `RBAC-011` Client Certificate
+  Role Requirement) — each runs and is reported informatively; `-list
+  -details` prints the extraction's reason for every one.
 
 ### SKIP is a runtime verdict, not a coverage number
 
@@ -895,12 +925,12 @@ internal/certify/report/      SS-CSIP-RESULTS-v1.1 + SS-MODBUS-RESULTS-v1.2 and
                               the submission generator
 internal/certify/suitecsip/          CSIP-CONF-v1.3
 internal/certify/suitemodbusclient/  SS-MODBUS-CLIENT-CONF-v1.1
-internal/certify/suitemodbusserver/  SS-MODBUS-CONF-v1.4 + SS-1547-TEST-v1.1
+internal/certify/suitemodbusserver/  SS-MODBUS-CONF-v1.4 + SS-1547-TEST-v1.0
 internal/certify/suitepki/           SS-TEST-PKI
 internal/certify/suitessm/           SSM-CONF-v0.8
 internal/evidence/            the evidence engine: capture, pcapng, dissection,
                               TLS dissection/decryption, bundles (pure Go)
-testdata/catalog/catalog.json the specification: 282 extracted test cases
+testdata/catalog/catalog.json the specification: 286 extracted test cases
 ```
 
 A new suite is added by registering its checks against catalog uids from an

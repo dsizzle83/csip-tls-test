@@ -284,6 +284,14 @@ type Catalog struct {
 	source string
 	sha256 string
 	size   int64
+
+	// aliases is the old-to-new uid/doc-key map left behind by a catalog
+	// re-key (REV0907-E9 / WP7-T8), consulted by ByUID, Doc and Select only
+	// when a direct lookup misses. Load attaches it automatically from a
+	// sibling testdata/catalog/uid_aliases.json; LoadBytes leaves it nil,
+	// which every consulting method treats as "no aliases" rather than a
+	// lookup failure — see UIDAliases' doc comment.
+	aliases *UIDAliases
 }
 
 // CatalogRef is the catalog's identity, recorded in the evidence bundle so a
@@ -310,6 +318,21 @@ func Load(path string) (*Catalog, error) {
 	c, err := LoadBytes(data, path)
 	if err != nil {
 		return nil, err
+	}
+	// A sibling uid_aliases.json is optional provenance, not part of the
+	// specification itself, so its absence is not an error (most catalogs
+	// carry no re-key history) — but if one IS committed beside this catalog
+	// file, it must parse, on the same strict terms as the catalog: a
+	// migration record this loader cannot read is indistinguishable from one
+	// that was never written down. See UIDAliases (aliases.go), REV0907-E9 /
+	// WP7-T8.
+	aliasPath := filepath.Join(filepath.Dir(path), filepath.Base(AliasesFile))
+	if _, statErr := os.Stat(aliasPath); statErr == nil {
+		a, aerr := LoadUIDAliases(aliasPath)
+		if aerr != nil {
+			return nil, fmt.Errorf("certify: catalog %s: %w", path, aerr)
+		}
+		c.aliases = a
 	}
 	return c, nil
 }
@@ -422,19 +445,32 @@ func DefaultCatalogPath() (string, error) {
 		}
 		return p, nil
 	}
+	p, err := findInAncestors(CatalogFile)
+	if err != nil {
+		return "", fmt.Errorf("certify: no %s found in any parent of the working directory; "+
+			"pass -catalog or set %s", CatalogFile, CatalogEnv)
+	}
+	return p, nil
+}
+
+// findInAncestors walks up from the working directory looking for rel,
+// returning the first match. It is the shared discovery mechanism behind
+// DefaultCatalogPath and DefaultUIDAliasesPath (aliases.go): both files are
+// committed side by side under testdata/catalog/, so both are found the same
+// way, by the same repository-root-relative walk.
+func findInAncestors(rel string) (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("certify: locate catalog: %w", err)
+		return "", fmt.Errorf("certify: locate %s: %w", rel, err)
 	}
 	for {
-		cand := filepath.Join(dir, filepath.FromSlash(CatalogFile))
+		cand := filepath.Join(dir, filepath.FromSlash(rel))
 		if _, err := os.Stat(cand); err == nil {
 			return cand, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("certify: no %s found in any parent of the working directory; "+
-				"pass -catalog or set %s", CatalogFile, CatalogEnv)
+			return "", fmt.Errorf("certify: no %s found in any parent of %s", rel, dir)
 		}
 		dir = parent
 	}
@@ -461,13 +497,20 @@ func (c *Catalog) All() []*Case {
 	return out
 }
 
-// ByUID looks a case up by its globally unique id.
+// ByUID looks a case up by its globally unique id. A uid retired by a catalog
+// re-key (testdata/catalog/uid_aliases.json) still resolves, via UIDAliases,
+// so a saved `-uid <old>` command line or a reference minted before the
+// migration keeps working against the current catalog (REV0907-E9 / WP7-T8).
 func (c *Catalog) ByUID(uid string) (*Case, bool) {
-	i, ok := c.byUID[uid]
-	if !ok {
-		return nil, false
+	if i, ok := c.byUID[uid]; ok {
+		return &c.cases[i], true
 	}
-	return &c.cases[i], true
+	if resolved := c.aliases.ResolveUID(uid); resolved != uid {
+		if i, ok := c.byUID[resolved]; ok {
+			return &c.cases[i], true
+		}
+	}
+	return nil, false
 }
 
 // ByID looks a case up by document and in-document id.
@@ -487,6 +530,13 @@ func (c *Catalog) Doc(doc string) (DocInfo, bool) {
 	for _, d := range c.docs {
 		if strings.EqualFold(d.Doc, doc) {
 			return d, true
+		}
+	}
+	if resolved := c.aliases.ResolveDoc(doc); !strings.EqualFold(resolved, doc) {
+		for _, d := range c.docs {
+			if strings.EqualFold(d.Doc, resolved) {
+				return d, true
+			}
 		}
 	}
 	return DocInfo{}, false
@@ -568,6 +618,7 @@ func (f Filter) Matches(c *Case) bool {
 
 // Select returns the matching cases in catalog order.
 func (c *Catalog) Select(f Filter) []*Case {
+	f = c.resolveFilterAliases(f)
 	var out []*Case
 	for i := range c.cases {
 		if f.Matches(&c.cases[i]) {
@@ -575,6 +626,33 @@ func (c *Catalog) Select(f Filter) []*Case {
 		}
 	}
 	return out
+}
+
+// resolveFilterAliases rewrites f.Docs/f.UIDs through the catalog's alias
+// table before selection. Filter.Matches compares a selector against a
+// Case's OWN (current) Doc/UID fields, so an old-keyed selector must be
+// translated before matching, not after — ByUID/Doc's fallback-on-miss
+// pattern would not help here, since Select never fails, it just silently
+// selects nothing. See ByUID's doc comment for the same migration.
+func (c *Catalog) resolveFilterAliases(f Filter) Filter {
+	if c.aliases == nil {
+		return f
+	}
+	if len(f.Docs) > 0 {
+		docs := make([]string, len(f.Docs))
+		for i, d := range f.Docs {
+			docs[i] = c.aliases.ResolveDoc(d)
+		}
+		f.Docs = docs
+	}
+	if len(f.UIDs) > 0 {
+		uids := make([]string, len(f.UIDs))
+		for i, u := range f.UIDs {
+			uids[i] = c.aliases.ResolveUID(u)
+		}
+		f.UIDs = uids
+	}
+	return f
 }
 
 // Validate checks a filter against the catalog and reports selectors that match

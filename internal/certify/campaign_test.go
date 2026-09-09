@@ -26,7 +26,7 @@ var docSuites = map[string]string{
 	"LOCAL-EXT-v1":               "csip",
 	"SSM-CONF-v0.8":              "ssm",
 	"SS-MODBUS-CONF-v1.4":        "modbus-server",
-	"SS-1547-TEST-v1.1":          "modbus-server",
+	"SS-1547-TEST-v1.0":          "modbus-server",
 	"SS-MODBUS-CLIENT-CONF-v1.1": "modbus-client",
 	"SS-TEST-PKI":                "pki",
 	"SS-CSIP-RESULTS-v1.1":       "results-report",

@@ -1,7 +1,7 @@
 // Package suitemodbusserver implements the SunSpec Modbus Conformance Test
 // Procedures v1.4 (catalog doc SS-MODBUS-CONF-v1.4) and the two server-side
 // procedures of SunSpec Modbus for IEEE 1547 Test Procedures (catalog doc
-// SS-1547-TEST-v1.1) against the LEXA gateway acting as a SunSpec Modbus
+// SS-1547-TEST-v1.0) against the LEXA gateway acting as a SunSpec Modbus
 // SERVER.
 //
 // # What this suite proves, and what it deliberately cannot

@@ -57,8 +57,8 @@ func Register(reg *certify.Registry) {
 
 	// The IEEE 1547 profile sweeps, which are read-only and depend on the same
 	// discovery walk.
-	reg.Register("ss-1547-test-v1.1::MOD-4", SuiteName, checkMOD4, needs, certify.WithOrder(60))
-	reg.Register("ss-1547-test-v1.1::2.4", SuiteName, checkSF, needs, certify.WithOrder(70))
+	reg.Register("ss-1547-test-v1.0::MOD-4", SuiteName, checkMOD4, needs, certify.WithOrder(60))
+	reg.Register("ss-1547-test-v1.0::2.4", SuiteName, checkSF, needs, certify.WithOrder(70))
 
 	// CRV-1 reads the same chain and belongs here rather than with its
 	// section-mates: CRV-2 and CRV-3 need a writable curve, CRV-1 needs a

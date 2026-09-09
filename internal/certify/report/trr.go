@@ -83,6 +83,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"csip-tls-test/internal/certify"
@@ -106,7 +107,7 @@ var DocCertType = map[string]string{
 	"csip-conf-v1.3":             CertTypeCSIP,
 	"ss-modbus-conf-v1.4":        CertTypeModbus,
 	"ss-modbus-client-conf-v1.1": CertTypeModbus,
-	"ss-1547-test-v1.1":          CertTypeModbus,
+	"ss-1547-test-v1.0":          CertTypeModbus,
 	"ssm-conf-v0.8":              CertTypeModbus,
 	"ss-test-pki":                CertTypeModbus,
 }
@@ -172,6 +173,68 @@ func DocKeyOf(uid string) string {
 		return before
 	}
 	return ""
+}
+
+var (
+	docKeyAliasesOnce sync.Once
+	docKeyAliases     *certify.UIDAliases
+)
+
+// resolvedDocAliases returns the live catalog's uid-alias table
+// (testdata/catalog/uid_aliases.json), loaded once and cached for the
+// process lifetime. A missing or malformed table degrades to a no-op
+// resolver rather than failing report generation over it: aliasing only
+// matters for a bundle whose case uids predate a re-key, and a report run
+// over evidence that never touches a retired key must not start depending on
+// this file's mere existence. REV0907-E9 / WP7-T8.
+func resolvedDocAliases() *certify.UIDAliases {
+	docKeyAliasesOnce.Do(func() {
+		a, err := certify.LoadDefaultUIDAliases()
+		if err != nil {
+			a = &certify.UIDAliases{}
+		}
+		docKeyAliases = a
+	})
+	return docKeyAliases
+}
+
+// certTypeFor resolves doc against DocCertType, falling back through the
+// catalog's uid-alias table so a case whose uid was baked into an OLD
+// evidence bundle under a document key a later catalog re-key retired still
+// routes to the certificate type it always has — the routing must survive
+// the rename even though the map's key does not. See UIDAliases (internal
+// /certify/aliases.go), REV0907-E9 / WP7-T8.
+//
+// DocCertType/NoCertificationBasis are keyed lower-case (they are looked up
+// with DocKeyOf's raw, already-lower-case uid prefix), but UIDAliases.
+// ResolveDoc returns the alias table's new_doc verbatim in its natural
+// mixed-case spelling ("SS-1547-TEST-v1.0", matching Case.Doc) — so the
+// resolved key is lower-cased before the second lookup, or an aliased doc
+// would resolve correctly and then still miss the map.
+func certTypeFor(doc string) (string, bool) {
+	if t, ok := DocCertType[doc]; ok {
+		return t, true
+	}
+	if resolved := strings.ToLower(resolvedDocAliases().ResolveDoc(doc)); resolved != doc {
+		if t, ok := DocCertType[resolved]; ok {
+			return t, true
+		}
+	}
+	return "", false
+}
+
+// noCertBasisFor resolves doc against NoCertificationBasis, with the same
+// alias fallback (and the same lower-casing) as certTypeFor.
+func noCertBasisFor(doc string) (string, bool) {
+	if r, ok := NoCertificationBasis[doc]; ok {
+		return r, true
+	}
+	if resolved := strings.ToLower(resolvedDocAliases().ResolveDoc(doc)); resolved != doc {
+		if r, ok := NoCertificationBasis[resolved]; ok {
+			return r, true
+		}
+	}
+	return "", false
 }
 
 // TestIDOf returns the procedure identifier a `Test <Test ID>` row must carry:
@@ -316,10 +379,10 @@ func MapVerdict(c bundle.TestCaseResult, na CaseApplicability, source string) (*
 	// so the routing test fell through to it). The only key whose result moves
 	// is local-ext-v1, the one key that is in NoCertificationBasis and not in
 	// DocCertType. See TestMapVerdict_NoCertBasisOutranksUnrouted.
-	if reason, excluded := NoCertificationBasis[doc]; excluded {
+	if reason, excluded := noCertBasisFor(doc); excluded {
 		return gap(GapNoCertBasis, reason)
 	}
-	if _, routed := DocCertType[doc]; !routed {
+	if _, routed := certTypeFor(doc); !routed {
 		return gap(GapUnrouted, fmt.Sprintf(
 			"no Results Reporting specification governs document %q, so its verdict has no report to go in", doc))
 	}
@@ -460,7 +523,7 @@ func Collate(sources []Source) (map[string]*Collated, error) {
 			if !src.covers(doc) {
 				continue
 			}
-			certType, routed := DocCertType[doc]
+			certType, routed := certTypeFor(doc)
 			if !routed {
 				certType = CertTypeModbus // only so the gap has somewhere to be reported
 			}

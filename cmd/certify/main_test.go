@@ -65,7 +65,7 @@ func TestListReportsTheWholeCatalogAndItsGaps(t *testing.T) {
 	// Every source document must appear: a coverage report that quietly omits a
 	// document is the second dishonesty mode this tool exists to prevent.
 	for _, doc := range []string{
-		"CSIP-CONF-v1.3", "SS-1547-TEST-v1.1", "SS-CSIP-RESULTS-v1.1",
+		"CSIP-CONF-v1.3", "SS-1547-TEST-v1.0", "SS-CSIP-RESULTS-v1.1",
 		"SS-MODBUS-CLIENT-CONF-v1.1", "SS-MODBUS-CONF-v1.4", "SS-MODBUS-RESULTS-v1.2",
 		"SS-TEST-PKI", "SSM-CONF-v0.8",
 	} {

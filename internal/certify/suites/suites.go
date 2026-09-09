@@ -46,7 +46,7 @@ import (
 	//	                    subject is US rather than the DUT)
 	//	suitecsip           CSIP-CONF-v1.3        (the DUT as 2030.5 client)
 	//	suitemodbusclient   SS-MODBUS-CLIENT-CONF-v1.1 (the DUT as Modbus client)
-	//	suitemodbusserver   SS-MODBUS-CONF-v1.4 + SS-1547-TEST-v1.1
+	//	suitemodbusserver   SS-MODBUS-CONF-v1.4 + SS-1547-TEST-v1.0
 	//	                    (the DUT as SunSpec Modbus server)
 	//	suitepki            SS-TEST-PKI           (certificates and identity)
 	//	suitessm            SSM-CONF-v0.8         (Secure SunSpec Modbus/TLS)

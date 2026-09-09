@@ -79,7 +79,7 @@ func storageCapability(rc *certify.RunCtx, present map[uint16]bool) (bool, strin
 			"(the pre-manifest behaviour)", storageModel)
 }
 
-// checkMOD4 implements SS-1547-TEST-v1.1 MOD-4, Mandatory Points.
+// checkMOD4 implements SS-1547-TEST-v1.0 MOD-4, Mandatory Points.
 //
 // Steps: for each model, read the points; compare them against the list of
 // mandatory points for IEEE 1547 implementation; verify all the required points
@@ -295,7 +295,7 @@ func checkMOD4(ctx context.Context, rc *certify.RunCtx) (certify.Result, error) 
 	}, nil
 }
 
-// checkSF implements SS-1547-TEST-v1.1 §2.4, the Scale Factor Test.
+// checkSF implements SS-1547-TEST-v1.0 §2.4, the Scale Factor Test.
 //
 // Steps: for each implemented point that has a scale factor, read the scale
 // factor value and verify it lies in the acceptable range for the point's data

@@ -1,0 +1,14 @@
+{
+  "_purpose": "Old-to-new uid/doc-key mapping for the WP7-T8 (REV0907-E9) catalog re-key of SS-1547-TEST-v1.1 -> SS-1547-TEST-v1.0. The prior key was a misparse of the source PDF's file name as a v1.1 document; the PDF cover page has always stated Version 1.0 (see testdata/catalog/catalog.json's doc_version text on both rows for the full note). This file exists so any bundle, script, or saved command line minted against the old key can still be resolved by name to its replacement.",
+  "_status": "WIRED as of 2026-09-08 (owner-approved same day). Loaded by certify.LoadUIDAliases/LoadDefaultUIDAliases (internal/certify/aliases.go) and consulted on every miss: Catalog.ByUID and Catalog.Doc fall back through it (internal/certify/catalog.go), and Catalog.Select/Validate inherit that via Catalog.resolveFilterAliases -- so a saved '-doc SS-1547-TEST-v1.1' or '-uid ss-1547-test-v1.1::MOD-4' still resolves against the current catalog. Separately, internal/certify/report/trr.go's certTypeFor/noCertBasisFor consult it so an OLD evidence bundle under runs/ -- whose TestCaseResult.ID carries the pre-migration uid verbatim, as immutable evidence, and is never rewritten -- still routes to CertTypeModbus when a Test Results Report is generated from it, instead of falling through to GapUnrouted now that DocCertType/NoCertificationBasis carry only the new key. bundle.Verify (cmd/certify -verify) still never consults testdata/catalog/catalog.json at all, so it needs no wiring here. Pinned by internal/certify/report/uidalias_trr_test.go (TestMapVerdict_OldSS1547UIDStillRoutes, TestCollate_OldSS1547UIDRoutesToModbus).",
+  "migrated": "2026-09-08",
+  "finding": "REV0907-E9",
+  "task": "WP7-T8",
+  "doc_aliases": [
+    { "old_doc": "SS-1547-TEST-v1.1", "new_doc": "SS-1547-TEST-v1.0" }
+  ],
+  "uid_aliases": [
+    { "old_uid": "ss-1547-test-v1.1::2.4", "new_uid": "ss-1547-test-v1.0::2.4" },
+    { "old_uid": "ss-1547-test-v1.1::MOD-4", "new_uid": "ss-1547-test-v1.0::MOD-4" }
+  ]
+}

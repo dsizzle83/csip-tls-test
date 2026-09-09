@@ -611,7 +611,7 @@ func TestEveryApplicableCaseOfBothDocumentsIsRegistered(t *testing.T) {
 	}
 	reg := certify.NewRegistry()
 	Register(reg)
-	cov := reg.Coverage(cat, certify.Filter{Docs: []string{"SS-MODBUS-CONF-v1.4", "SS-1547-TEST-v1.1"}})
+	cov := reg.Coverage(cat, certify.Filter{Docs: []string{"SS-MODBUS-CONF-v1.4", "SS-1547-TEST-v1.0"}})
 	for _, d := range cov.Docs {
 		if !d.Complete() {
 			var names []string
@@ -658,7 +658,7 @@ func TestInapplicableCasesAreDocumentedAndUnregistered(t *testing.T) {
 		}
 	}
 	// Every inapplicable row of both documents must be accounted for.
-	for _, c := range cat.Select(certify.Filter{Docs: []string{"SS-MODBUS-CONF-v1.4", "SS-1547-TEST-v1.1"}}) {
+	for _, c := range cat.Select(certify.Filter{Docs: []string{"SS-MODBUS-CONF-v1.4", "SS-1547-TEST-v1.0"}}) {
 		if c.Applicable {
 			continue
 		}

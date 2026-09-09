@@ -45,7 +45,9 @@ An unselected protocol therefore contributes neither a FAIL nor a SKIP to a
 campaign — it contributes no row at all. `internal/certify/suites/campaign_test.go`
 holds that property against the linked suites on every test run.
 
-### Dry-run selections (catalog sha256 `adfe1f2a…`, 283 rows)
+### Dry-run selections (catalog sha256 `f84d442e…`, 286 rows as of 2026-09-08 —
+the per-campaign RUN/SKIP/N/A counts below are illustrative from an earlier
+catalog snapshot and have not been re-run against the current one)
 
     certify -campaign csip          -manifest c.json -dry-run   →  52 to RUN ·  0 SKIP ·  0 N/A
     certify -campaign mbaps         -manifest c.json -dry-run   →  56 to RUN ·  2 SKIP ·  0 N/A

@@ -9664,10 +9664,10 @@
   ]
  },
  {
-  "uid": "ss-1547-test-v1.1::2.4",
+  "uid": "ss-1547-test-v1.0::2.4",
   "id": "2.4",
-  "doc": "SS-1547-TEST-v1.1",
-  "doc_version": "1.0 (Approved; Revision History: 1.0 / 07-08-2024). NOTE: the catalog's doc key 'SS-1547-TEST-v1.1' and the previous doc_version 'v1.1 (2024-10-08)' were a misparse of the file name 'SunSpec-Modbus-for-1547-Test-Procedures-v1_10-8-24-1.pdf' (= v1, 10-8-24). The PDF cover page states Status: Approved, Version: 1.0. The doc/uid keys are left unchanged to avoid breaking existing references.",
+  "doc": "SS-1547-TEST-v1.0",
+  "doc_version": "1.0 (Approved; Revision History: 1.0 / 07-08-2024). MIGRATION (WP7-T8 / REV0907-E9, 2026-09-08): the doc key and uid prefix were re-keyed from 'SS-1547-TEST-v1.1' to 'SS-1547-TEST-v1.0' to match this line. The prior key was a misparse of the file name 'SunSpec-Modbus-for-1547-Test-Procedures-v1_10-8-24-1.pdf' (= v1, 10-8-24) as a v1.1 document; the PDF cover page has always stated Status: Approved, Version: 1.0 — the doc_version text itself was correct, only the doc/uid keys lagged it. See testdata/catalog/uid_aliases.json for the old-to-new uid mapping (ss-1547-test-v1.1::2.4 -> ss-1547-test-v1.0::2.4, ss-1547-test-v1.1::MOD-4 -> ss-1547-test-v1.0::MOD-4); bundles under runs/ minted before this migration carry the old uid verbatim as immutable evidence and are not rewritten.",
   "section": "2.4 Scale Factor Test",
   "title": "Scale Factor Test",
   "purpose": "\"The scale factor test verifies the scale factors are valid and in the correct range.\" It proves each implemented scale-factored point carries a scale factor whose value keeps the point's representable range/resolution within what IEEE 1547 requires for that point's data type.",
@@ -9708,10 +9708,10 @@
   "page_boundary_merged": false
  },
  {
-  "uid": "ss-1547-test-v1.1::MOD-4",
+  "uid": "ss-1547-test-v1.0::MOD-4",
   "id": "MOD-4",
-  "doc": "SS-1547-TEST-v1.1",
-  "doc_version": "1.0 (Approved; Revision History: 1.0 / 07-08-2024). NOTE: the catalog's doc key 'SS-1547-TEST-v1.1' and the previous doc_version 'v1.1 (2024-10-08)' were a misparse of the file name 'SunSpec-Modbus-for-1547-Test-Procedures-v1_10-8-24-1.pdf' (= v1, 10-8-24). The PDF cover page states Status: Approved, Version: 1.0. The doc/uid keys are left unchanged to avoid breaking existing references.",
+  "doc": "SS-1547-TEST-v1.0",
+  "doc_version": "1.0 (Approved; Revision History: 1.0 / 07-08-2024). MIGRATION (WP7-T8 / REV0907-E9, 2026-09-08): the doc key and uid prefix were re-keyed from 'SS-1547-TEST-v1.1' to 'SS-1547-TEST-v1.0' to match this line. The prior key was a misparse of the file name 'SunSpec-Modbus-for-1547-Test-Procedures-v1_10-8-24-1.pdf' (= v1, 10-8-24) as a v1.1 document; the PDF cover page has always stated Status: Approved, Version: 1.0 — the doc_version text itself was correct, only the doc/uid keys lagged it. See testdata/catalog/uid_aliases.json for the old-to-new uid mapping (ss-1547-test-v1.1::2.4 -> ss-1547-test-v1.0::2.4, ss-1547-test-v1.1::MOD-4 -> ss-1547-test-v1.0::MOD-4); bundles under runs/ minted before this migration carry the old uid verbatim as immutable evidence and are not rewritten.",
   "section": "2.3.1 MOD-4 - Mandatory Points (under 2.3 General SunSpec Model Tests)",
   "title": "MOD-4 - Mandatory Points",
   "purpose": "\"This test validates all the points required for IEEE 1547 implementation are present in the device.\" It proves the DUT exposes every mandatory SunSpec point, and every required SunSpec model, called for by the SunSpec Modbus IEEE 1547-2018 profile.",
