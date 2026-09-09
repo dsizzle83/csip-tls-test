@@ -1,0 +1,33 @@
+{
+  "profile": "one-to-one-7xx-tcp",
+
+  "topology": {
+    "configured_der": 1,
+    "role": "inverter",
+    "northbound_units": [1]
+  },
+
+  "csip": {
+    "role": "der-client",
+    "end_devices": 1,
+    "der_resources": 1
+  },
+
+  "secure_sunspec": {
+    "roles": ["server"],
+    "transport": "tls-tcp",
+    "port": 802,
+    "frame_budget_ms": 2000
+  },
+
+  "modbus_client": {
+    "transport": "tcp",
+    "device_count": 1,
+    "generation": "7xx",
+    "write_function_codes": [16]
+  },
+
+  "authority_profiles": ["csip", "mbaps"],
+
+  "models": [1, 103, 120, 121, 122, 123, 701, 702, 703, 704, 705, 706, 707, 708, 709, 710, 711, 712]
+}

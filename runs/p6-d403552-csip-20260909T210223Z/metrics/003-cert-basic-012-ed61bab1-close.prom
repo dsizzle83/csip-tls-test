@@ -1,0 +1,68 @@
+# TYPE lexa_bus_decode_failures_total counter
+lexa_bus_decode_failures_total 0
+# TYPE lexa_mqtt_publish_failures_total counter
+lexa_mqtt_publish_failures_total 0
+# TYPE lexa_mqtt_reconnects_total counter
+lexa_mqtt_reconnects_total 0
+# TYPE lexa_nb_activation_refusals_total counter
+lexa_nb_activation_refusals_total 0
+# TYPE lexa_nb_der_instances_off_claim_total counter
+lexa_nb_der_instances_off_claim_total 0
+# TYPE lexa_nb_derreport_errors_total counter
+lexa_nb_derreport_errors_total 0
+# TYPE lexa_nb_derreport_puts_total counter
+lexa_nb_derreport_puts_total 65
+# TYPE lexa_nb_desired_withdrawals_total counter
+lexa_nb_desired_withdrawals_total 0
+# TYPE lexa_nb_ignored_control_content_autonomous_vref_total counter
+lexa_nb_ignored_control_content_autonomous_vref_total 0
+# TYPE lexa_nb_ignored_control_content_malformed_curve_total counter
+lexa_nb_ignored_control_content_malformed_curve_total 0
+# TYPE lexa_nb_ignored_control_content_other_total counter
+lexa_nb_ignored_control_content_other_total 0
+# TYPE lexa_nb_ignored_control_content_target_var_total counter
+lexa_nb_ignored_control_content_target_var_total 0
+# TYPE lexa_nb_ignored_control_content_total counter
+lexa_nb_ignored_control_content_total 1
+# TYPE lexa_nb_ignored_control_content_unresolvable_curve_total counter
+lexa_nb_ignored_control_content_unresolvable_curve_total 0
+# TYPE lexa_nb_ignored_control_content_unsupported_default_axis_total counter
+lexa_nb_ignored_control_content_unsupported_default_axis_total 0
+# TYPE lexa_nb_ignored_control_content_unsupported_event_axis_total counter
+lexa_nb_ignored_control_content_unsupported_event_axis_total 1
+# TYPE lexa_nb_implausible_rejects_total counter
+lexa_nb_implausible_rejects_total 0
+# TYPE lexa_nb_logevents_dropped_total counter
+lexa_nb_logevents_dropped_total 0
+# TYPE lexa_nb_logevents_posted_total counter
+lexa_nb_logevents_posted_total 2
+# TYPE lexa_nb_redirects_total counter
+lexa_nb_redirects_total 0
+# TYPE lexa_nb_responses_posted_total counter
+lexa_nb_responses_posted_total 18
+# TYPE lexa_nb_walk_failures_total counter
+lexa_nb_walk_failures_total 10
+# TYPE lexa_goroutines gauge
+lexa_goroutines 19
+# TYPE lexa_nb_cert_alarms gauge
+lexa_nb_cert_alarms 0
+# TYPE lexa_nb_clock_offset_seconds gauge
+lexa_nb_clock_offset_seconds 0
+# TYPE lexa_nb_commissioning_state gauge
+lexa_nb_commissioning_state 2
+# TYPE lexa_nb_der_instances gauge
+lexa_nb_der_instances 1
+# TYPE lexa_nb_gate_active gauge
+lexa_nb_gate_active 1
+# TYPE lexa_nb_pin_mismatch gauge
+lexa_nb_pin_mismatch 0
+# TYPE lexa_nb_poll_interval_seconds gauge
+lexa_nb_poll_interval_seconds 60
+# TYPE lexa_nb_walk_duration_seconds gauge
+lexa_nb_walk_duration_seconds 0.704244344
+# TYPE lexa_open_fds gauge
+lexa_open_fds 18
+# TYPE lexa_rss_bytes gauge
+lexa_rss_bytes 2.6169344e+07
+# TYPE lexa_up gauge
+lexa_up 1
