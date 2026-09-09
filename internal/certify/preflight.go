@@ -519,6 +519,13 @@ func simResetTargets(t Targets) []simResetTarget {
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		if name == TargetMetrics {
+			// The DUT's own Prometheus endpoint (-metrics-endpoint) is not a
+			// simulator and answers no POST /reset: on the first gating run
+			// after WP7-T6 (bench 2026-09-09, mbaps leg) it was swept up here
+			// and refused the whole campaign as "metrics was not reset".
+			continue
+		}
 		url := t.Extra[name]
 		if strings.HasPrefix(url, "http") {
 			out = append(out, simResetTarget{name: name, url: url})

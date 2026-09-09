@@ -204,3 +204,21 @@ func TestPreflightSimReset_RefusesWhenGridSimStatusFails(t *testing.T) {
 type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+// TestSimResetTargets_ExcludesTheMetricsEndpoint pins the 2026-09-09 bench
+// finding: -metrics-endpoint lands in Targets.Extra[TargetMetrics] and must
+// never be treated as a simulator to reset.
+func TestSimResetTargets_ExcludesTheMetricsEndpoint(t *testing.T) {
+	var tg Targets
+	tg.WithEndpoint(TargetMetrics, "http://127.0.0.1:9102/metrics")
+	tg.WithEndpoint("batsim", "http://69.0.0.11:6050")
+	var names []string
+	for _, s := range simResetTargets(tg) {
+		if s.url != "" {
+			names = append(names, s.name)
+		}
+	}
+	if len(names) != 1 || names[0] != "batsim" {
+		t.Fatalf("simResetTargets = %v, want only the sim sidecar (batsim), never %q", names, TargetMetrics)
+	}
+}
