@@ -23,7 +23,11 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$HERE"
 
 ACTUAL="$(GOWORK=off GOFLAGS=-mod=vendor go list -deps ./cmd/certify ./cmd/gw-campaign | grep '^csip-tls-test/' | sort -u)"
-COMMITTED="$(make -s live-set-committed)"
+# --no-print-directory: under a nested make (test-certify -> live-set-check),
+# make prints "make[2]: Entering/Leaving directory" lines to STDOUT even with
+# -s unless MAKEFLAGS carries it, and those lines polluted the snapshot in CI
+# (first hosted run of this gate, 2026-09-08) while passing locally.
+COMMITTED="$(make -s --no-print-directory live-set-committed)"
 
 if [[ "$ACTUAL" != "$COMMITTED" ]]; then
   echo "live-set-check: FAIL — Makefile's CERTIFY_LIVE_SET has drifted from" >&2
