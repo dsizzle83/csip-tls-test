@@ -145,10 +145,19 @@ func (c *cli) runVerify(stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "\n%s\n", strings.Repeat("═", 78))
 	if rep.OK {
+		// The closing sentence must say what was actually established:
+		// with -pubkey the MANIFEST.sha256.sig was checked against the
+		// operator's key (a claim about who produced the bundle); without
+		// it, only internal consistency. Until 2026-09-09 this line said
+		// "unsigned" unconditionally, contradicting the "✓ signature
+		// checked" line printed above it on signed bundles.
+		who := "the manifest is unsigned, so it is not\n  a claim about who produced them."
+		if !rep.Unsigned {
+			who = "the manifest's signature checked against the\n  supplied -pubkey, so it is also a claim that the holder of that key produced them."
+		}
 		fmt.Fprintf(stdout, "✓ BUNDLE VERIFIES — every cited frame and byte range is in this capture and\n"+
 			"  hashes to the value the report records. This says the report and the pcap in\n"+
-			"  front of you describe the same traffic; the manifest is unsigned, so it is not\n"+
-			"  a claim about who produced them.\n")
+			"  front of you describe the same traffic; %s\n", who)
 		fmt.Fprintf(stdout, "%s\n", strings.Repeat("═", 78))
 		return exitOK
 	}
